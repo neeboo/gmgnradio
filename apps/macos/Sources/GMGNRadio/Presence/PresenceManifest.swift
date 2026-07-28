@@ -3,6 +3,7 @@ import Foundation
 enum PresenceEngine: String, Codable, Sendable {
     case orb
     case live2D = "live2d"
+    case vrm
 }
 
 struct PresenceManifest: Codable, Equatable, Sendable {
@@ -53,6 +54,7 @@ enum PresencePackageError: Error, Equatable, LocalizedError {
     case invalidEntryPath
     case modelFileMissing
     case modelReferenceMissing
+    case invalidVRM
     case unsupportedPackage
     case alreadyInstalled
     case cannotRemoveBuiltIn
@@ -70,11 +72,13 @@ enum PresencePackageError: Error, Equatable, LocalizedError {
         case .invalidEntryPath:
             "模型入口路径不安全或格式不正确。"
         case .modelFileMissing:
-            "找不到 Live2D 模型入口文件。"
+            "找不到模型入口文件。"
         case .modelReferenceMissing:
-            "Live2D 模型引用的核心文件不存在。"
+            "模型引用的核心文件不存在。"
+        case .invalidVRM:
+            "文件不是有效的 VRM 0.x 或 VRM 1.0 模型。"
         case .unsupportedPackage:
-            "目前支持文件夹、.zip 和 .gmgnpet 包。"
+            "目前支持 Live2D 模型包和 .vrm 文件。"
         case .alreadyInstalled:
             "这个桌宠已经安装。"
         case .cannotRemoveBuiltIn:

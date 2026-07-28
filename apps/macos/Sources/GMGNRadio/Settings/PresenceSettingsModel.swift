@@ -41,7 +41,7 @@ final class PresenceSettingsModel {
         let panel = NSOpenPanel()
         panel.title = "导入桌宠模型"
         panel.prompt = "安装"
-        panel.message = "选择包含 manifest.json 的文件夹，或 .zip / .gmgnpet 模型包。"
+        panel.message = "选择 Live2D 模型包，或单个 .vrm 文件。"
         panel.canChooseDirectories = true
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = false
@@ -49,6 +49,7 @@ final class PresenceSettingsModel {
             .folder,
             .zip,
             UTType(filenameExtension: "gmgnpet") ?? .data,
+            UTType(filenameExtension: "vrm") ?? .data,
         ]
         guard panel.runModal() == .OK, let sourceURL = panel.url else { return }
         install(from: sourceURL)

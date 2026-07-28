@@ -95,7 +95,7 @@ private struct PresenceRow: View {
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.blue)
             } else if !package.rendererAvailable {
-                Text("等待 Live2D")
+                Text(waitingLabel)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else if let action {
@@ -122,7 +122,23 @@ private struct PresenceRow: View {
         if package.isBuiltIn {
             return "内置 · 呼吸球"
         }
-        return "\(package.manifest.author ?? "本地模型") · \(package.manifest.version)"
+        let source = package.manifest.author ?? engineName
+        return "\(source) · \(package.manifest.version)"
+    }
+
+    private var engineName: String {
+        switch package.manifest.engine {
+        case .live2D:
+            "Live2D"
+        case .vrm:
+            "VRM"
+        case .orb:
+            "呼吸球"
+        }
+    }
+
+    private var waitingLabel: String {
+        "等待 \(engineName) 渲染"
     }
 }
 
@@ -195,7 +211,7 @@ private struct AddPresenceSheet: View {
             VStack(alignment: .leading, spacing: 5) {
                 Text("添加桌宠模型")
                     .font(.title2.weight(.semibold))
-                Text("支持带 manifest.json 的文件夹、.zip 和 .gmgnpet。")
+                Text("支持 Live2D 模型包和单个 VRM 文件。")
                     .foregroundStyle(.secondary)
             }
 
@@ -214,7 +230,7 @@ private struct AddPresenceSheet: View {
 
             DisclosureGroup("从 HTTPS 链接下载", isExpanded: $showsDownloadField) {
                 VStack(alignment: .leading, spacing: 10) {
-                    TextField("https://example.com/model.gmgnpet", text: $model.downloadURL)
+                    TextField("https://example.com/avatar.vrm", text: $model.downloadURL)
                         .textFieldStyle(.roundedBorder)
                     HStack {
                         Spacer()

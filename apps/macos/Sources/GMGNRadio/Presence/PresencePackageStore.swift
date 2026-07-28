@@ -74,6 +74,12 @@ struct PresencePackageStore: Sendable {
         let values = try sourceURL.resourceValues(forKeys: [.isDirectoryKey])
         if values.isDirectory == true {
             try fileManager.copyItem(at: sourceURL, to: unpackedURL)
+        } else if sourceURL.pathExtension.lowercased() == "vrm" {
+            try prepareRawVRMPackage(
+                from: sourceURL,
+                at: unpackedURL,
+                fileManager: fileManager
+            )
         } else if ["zip", "gmgnpet"].contains(sourceURL.pathExtension.lowercased()) {
             try fileManager.createDirectory(at: unpackedURL, withIntermediateDirectories: true)
             try extractArchive(sourceURL, to: unpackedURL)
@@ -211,9 +217,33 @@ struct PresencePackageStore: Sendable {
         guard manifest.id.wholeMatch(of: identifierPattern) != nil else {
             throw PresencePackageError.invalidIdentifier
         }
-        guard manifest.engine == .live2D else {
+        switch manifest.engine {
+        case .live2D:
+            try validateLive2D(
+                manifest: manifest,
+                packageURL: packageURL,
+                fileManager: fileManager
+            )
+        case .vrm:
+            try validateVRM(
+                manifest: manifest,
+                packageURL: packageURL,
+                fileManager: fileManager
+            )
+        case .orb:
             throw PresencePackageError.unsupportedPackage
         }
+
+        if let thumbnail = manifest.thumbnail {
+            _ = try safeRelativeURL(thumbnail, inside: packageURL)
+        }
+    }
+
+    private func validateLive2D(
+        manifest: PresenceManifest,
+        packageURL: URL,
+        fileManager: FileManager
+    ) throws {
         let entryURL = try safeRelativeURL(manifest.entry, inside: packageURL)
         guard manifest.entry.hasSuffix(".model3.json") else {
             throw PresencePackageError.invalidEntryPath
@@ -234,10 +264,77 @@ struct PresencePackageStore: Sendable {
         guard fileManager.fileExists(atPath: mocURL.path) else {
             throw PresencePackageError.modelReferenceMissing
         }
+    }
 
-        if let thumbnail = manifest.thumbnail {
-            _ = try safeRelativeURL(thumbnail, inside: packageURL)
+    private func validateVRM(
+        manifest: PresenceManifest,
+        packageURL: URL,
+        fileManager: FileManager
+    ) throws {
+        let entryURL = try safeRelativeURL(manifest.entry, inside: packageURL)
+        guard manifest.entry.lowercased().hasSuffix(".vrm") else {
+            throw PresencePackageError.invalidEntryPath
         }
+        guard fileManager.fileExists(atPath: entryURL.path) else {
+            throw PresencePackageError.modelFileMissing
+        }
+
+        let data = try Data(contentsOf: entryURL, options: .mappedIfSafe)
+        guard
+            data.count >= 20,
+            Array(data[0 ..< 4]) == Array("glTF".utf8),
+            littleEndianUInt32(in: data, at: 4) == 2,
+            littleEndianUInt32(in: data, at: 8) == data.count,
+            littleEndianUInt32(in: data, at: 16) == 0x4E4F534A
+        else {
+            throw PresencePackageError.invalidVRM
+        }
+
+        let jsonLength = Int(littleEndianUInt32(in: data, at: 12))
+        guard jsonLength >= 2, 20 + jsonLength <= data.count else {
+            throw PresencePackageError.invalidVRM
+        }
+        guard
+            let object = try? JSONSerialization.jsonObject(
+                with: data.subdata(in: 20 ..< (20 + jsonLength))
+            ) as? [String: Any],
+            let extensions = object["extensions"] as? [String: Any],
+            extensions["VRMC_vrm"] != nil || extensions["VRM"] != nil
+        else {
+            throw PresencePackageError.invalidVRM
+        }
+    }
+
+    private func prepareRawVRMPackage(
+        from sourceURL: URL,
+        at packageURL: URL,
+        fileManager: FileManager
+    ) throws {
+        try fileManager.createDirectory(at: packageURL, withIntermediateDirectories: true)
+        let filename = sourceURL.lastPathComponent
+        try fileManager.copyItem(
+            at: sourceURL,
+            to: packageURL.appending(path: filename)
+        )
+        let manifest = PresenceManifest(
+            id: "vrm.\(UUID().uuidString.lowercased())",
+            name: sourceURL.deletingPathExtension().lastPathComponent,
+            version: "1.0.0",
+            engine: .vrm,
+            entry: filename
+        )
+        let data = try JSONEncoder().encode(manifest)
+        try data.write(
+            to: packageURL.appending(path: "manifest.json"),
+            options: .atomic
+        )
+    }
+
+    private func littleEndianUInt32(in data: Data, at offset: Int) -> UInt32 {
+        UInt32(data[offset])
+            | (UInt32(data[offset + 1]) << 8)
+            | (UInt32(data[offset + 2]) << 16)
+            | (UInt32(data[offset + 3]) << 24)
     }
 
     private func safeRelativeURL(_ path: String, inside root: URL) throws -> URL {

@@ -34,6 +34,35 @@ struct PresencePackageStoreTests {
     }
 
     @Test
+    func installsARawVRMFile() throws {
+        let fixture = try Fixture()
+        let source = try fixture.makeVRMFile(name: "Aoi")
+
+        let installed = try fixture.store.installPackage(from: source)
+
+        #expect(installed.manifest.engine == .vrm)
+        #expect(installed.manifest.name == "Aoi")
+        #expect(installed.manifest.entry == "Aoi.vrm")
+        #expect(installed.manifest.id.hasPrefix("vrm."))
+        #expect(installed.rendererAvailable == false)
+        #expect(FileManager.default.fileExists(
+            atPath: URL(filePath: installed.installPath!)
+                .appending(path: "Aoi.vrm")
+                .path
+        ))
+    }
+
+    @Test
+    func rejectsGLBFilesWithoutAVRMExtension() throws {
+        let fixture = try Fixture()
+        let source = try fixture.makeVRMFile(name: "ordinary-model", vrmExtension: nil)
+
+        #expect(throws: PresencePackageError.invalidVRM) {
+            try fixture.store.installPackage(from: source)
+        }
+    }
+
+    @Test
     func rejectsEntriesThatEscapeThePackage() throws {
         let fixture = try Fixture()
         let source = try fixture.makeLive2DPackage(
@@ -132,5 +161,55 @@ private struct Fixture {
         }
 
         return packageURL
+    }
+
+    func makeVRMFile(
+        name: String,
+        vrmExtension: String? = "VRMC_vrm"
+    ) throws -> URL {
+        let fileURL = rootURL
+            .appending(path: "fixtures", directoryHint: .isDirectory)
+            .appending(path: "\(name).vrm")
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        var json: [String: Any] = [
+            "asset": ["version": "2.0"],
+        ]
+        if let vrmExtension {
+            json["extensionsUsed"] = [vrmExtension]
+            json["extensions"] = [
+                vrmExtension: vrmExtension == "VRMC_vrm"
+                    ? ["specVersion": "1.0"]
+                    : [:],
+            ]
+        }
+        var jsonData = try JSONSerialization.data(
+            withJSONObject: json,
+            options: [.sortedKeys]
+        )
+        while !jsonData.count.isMultiple(of: 4) {
+            jsonData.append(0x20)
+        }
+
+        var data = Data("glTF".utf8)
+        data.appendUInt32LittleEndian(2)
+        data.appendUInt32LittleEndian(UInt32(20 + jsonData.count))
+        data.appendUInt32LittleEndian(UInt32(jsonData.count))
+        data.appendUInt32LittleEndian(0x4E4F534A)
+        data.append(jsonData)
+        try data.write(to: fileURL)
+        return fileURL
+    }
+}
+
+private extension Data {
+    mutating func appendUInt32LittleEndian(_ value: UInt32) {
+        var littleEndian = value.littleEndian
+        Swift.withUnsafeBytes(of: &littleEndian) {
+            append(contentsOf: $0)
+        }
     }
 }
