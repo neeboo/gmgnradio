@@ -11,11 +11,16 @@
 		2D4E0673D2067888218B2BF5 /* DJStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBB583E2AA3BD7F6DA17AED6 /* DJStateTests.swift */; };
 		330C60A11D6B3849DFAFCE65 /* WindowPlacement.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9BED59FEA722CB9CBF88096 /* WindowPlacement.swift */; };
 		35C3C8FFE3D1338719F0C54E /* OrbPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A5BF72176B81DD186790642 /* OrbPanel.swift */; };
+		4A028323AC8B8CC8BC49939F /* OrbUniformTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4C1A38CFE1FE5149D76CC08 /* OrbUniformTests.swift */; };
 		559086501216765204D4B06C /* DJState.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBAA0158B7BFF631FD685449 /* DJState.swift */; };
 		7A17C5E01AC43CD75E7C7195 /* OrbState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43F2D91E87ABAC0F51F8C126 /* OrbState.swift */; };
 		8F5213621CDE66174CBBDA8A /* ProgramDecision.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA8AFFDEBE45F4BC907FDDA1 /* ProgramDecision.swift */; };
 		936430A6AC4FF9D7B3D62C5C /* GMGNRadioApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39FC866C894AFC1D958539BF /* GMGNRadioApp.swift */; };
+		94A2BC7B04AA84C9A463CED6 /* Orb.metal in Sources */ = {isa = PBXBuildFile; fileRef = 4374B4687559AEDE957A3117 /* Orb.metal */; };
+		A812DB23EA81DBB7D2B72B1D /* OrbMetalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F934C041C38E2FBEE9EFAEB7 /* OrbMetalView.swift */; };
 		D721C4D533DAA4D461CEF6D2 /* PlaybackContext.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2457A76CBF19C18E6D386EE /* PlaybackContext.swift */; };
+		E9D4C5A74FBBB188DEC917B3 /* OrbRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF9A4902E75F2E8D7081C852 /* OrbRenderer.swift */; };
+		F1EB3984A5FF0E2D1F44DC7B /* OrbUniforms.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47876636EF21649388CE59E3 /* OrbUniforms.swift */; };
 		F83BDCD045FC0F46E849868C /* WindowPlacementTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9968CE566BC39260555871B7 /* WindowPlacementTests.swift */; };
 		F9AFBCD0A63C8A453D1F2199 /* OrbWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 38784FBC97203965A192FDAC /* OrbWindowController.swift */; };
 /* End PBXBuildFile section */
@@ -33,17 +38,22 @@
 /* Begin PBXFileReference section */
 		38784FBC97203965A192FDAC /* OrbWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbWindowController.swift; sourceTree = "<group>"; };
 		39FC866C894AFC1D958539BF /* GMGNRadioApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GMGNRadioApp.swift; sourceTree = "<group>"; };
+		4374B4687559AEDE957A3117 /* Orb.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Orb.metal; sourceTree = "<group>"; };
 		43F2D91E87ABAC0F51F8C126 /* OrbState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbState.swift; sourceTree = "<group>"; };
+		47876636EF21649388CE59E3 /* OrbUniforms.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbUniforms.swift; sourceTree = "<group>"; };
 		77166FE9E4995A36C34A2D90 /* GMGNRadioTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = GMGNRadioTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		908F400DB2F1BAA7F52A31FB /* GMGNRadio.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = GMGNRadio.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		9968CE566BC39260555871B7 /* WindowPlacementTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowPlacementTests.swift; sourceTree = "<group>"; };
 		9A5BF72176B81DD186790642 /* OrbPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbPanel.swift; sourceTree = "<group>"; };
+		A4C1A38CFE1FE5149D76CC08 /* OrbUniformTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbUniformTests.swift; sourceTree = "<group>"; };
 		AC10161C41BE8EB05A51FC8D /* AppSmokeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSmokeTests.swift; sourceTree = "<group>"; };
 		BA8AFFDEBE45F4BC907FDDA1 /* ProgramDecision.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgramDecision.swift; sourceTree = "<group>"; };
 		BBAA0158B7BFF631FD685449 /* DJState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DJState.swift; sourceTree = "<group>"; };
 		BBB583E2AA3BD7F6DA17AED6 /* DJStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DJStateTests.swift; sourceTree = "<group>"; };
+		BF9A4902E75F2E8D7081C852 /* OrbRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbRenderer.swift; sourceTree = "<group>"; };
 		C9BED59FEA722CB9CBF88096 /* WindowPlacement.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowPlacement.swift; sourceTree = "<group>"; };
 		F2457A76CBF19C18E6D386EE /* PlaybackContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackContext.swift; sourceTree = "<group>"; };
+		F934C041C38E2FBEE9EFAEB7 /* OrbMetalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbMetalView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -61,9 +71,19 @@
 				997708EE7C8D6B44BBE853C1 /* App */,
 				44022FC60EA3997DFF443D98 /* DesktopPresence */,
 				53B590FD408B0A4A739508B5 /* Domain */,
+				1A0FDB0DF3340F453EE75B6C /* VisualEngine */,
 			);
 			name = GMGNRadio;
 			path = Sources/GMGNRadio;
+			sourceTree = "<group>";
+		};
+		1A0FDB0DF3340F453EE75B6C /* VisualEngine */ = {
+			isa = PBXGroup;
+			children = (
+				ACD0081809AE14CD18CA9B01 /* Metal */,
+				FADF1993EFF32F42FB011F72 /* Shaders */,
+			);
+			path = VisualEngine;
 			sourceTree = "<group>";
 		};
 		1B68B282FA71F2A571E194DF /* Domain */ = {
@@ -101,6 +121,7 @@
 				AC10161C41BE8EB05A51FC8D /* AppSmokeTests.swift */,
 				15C93DD16DBE0908A8AEC98C /* DesktopPresence */,
 				1B68B282FA71F2A571E194DF /* Domain */,
+				BBF952DA6DD9ACDCA0DD9C71 /* VisualEngine */,
 			);
 			name = GMGNRadioTests;
 			path = Tests/GMGNRadioTests;
@@ -123,6 +144,24 @@
 			path = App;
 			sourceTree = "<group>";
 		};
+		ACD0081809AE14CD18CA9B01 /* Metal */ = {
+			isa = PBXGroup;
+			children = (
+				F934C041C38E2FBEE9EFAEB7 /* OrbMetalView.swift */,
+				BF9A4902E75F2E8D7081C852 /* OrbRenderer.swift */,
+				47876636EF21649388CE59E3 /* OrbUniforms.swift */,
+			);
+			path = Metal;
+			sourceTree = "<group>";
+		};
+		BBF952DA6DD9ACDCA0DD9C71 /* VisualEngine */ = {
+			isa = PBXGroup;
+			children = (
+				A4C1A38CFE1FE5149D76CC08 /* OrbUniformTests.swift */,
+			);
+			path = VisualEngine;
+			sourceTree = "<group>";
+		};
 		D640DB89E934CAAF4C06A243 = {
 			isa = PBXGroup;
 			children = (
@@ -130,6 +169,14 @@
 				71F07F2698B35D79C192ECA7 /* GMGNRadioTests */,
 				98A0C8D4DB11177CABB1D8F7 /* Products */,
 			);
+			sourceTree = "<group>";
+		};
+		FADF1993EFF32F42FB011F72 /* Shaders */ = {
+			isa = PBXGroup;
+			children = (
+				4374B4687559AEDE957A3117 /* Orb.metal */,
+			);
+			path = Shaders;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -214,6 +261,7 @@
 			files = (
 				1F04322C71F0C43CD2AEA3B6 /* AppSmokeTests.swift in Sources */,
 				2D4E0673D2067888218B2BF5 /* DJStateTests.swift in Sources */,
+				4A028323AC8B8CC8BC49939F /* OrbUniformTests.swift in Sources */,
 				F83BDCD045FC0F46E849868C /* WindowPlacementTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -224,8 +272,12 @@
 			files = (
 				559086501216765204D4B06C /* DJState.swift in Sources */,
 				936430A6AC4FF9D7B3D62C5C /* GMGNRadioApp.swift in Sources */,
+				94A2BC7B04AA84C9A463CED6 /* Orb.metal in Sources */,
+				A812DB23EA81DBB7D2B72B1D /* OrbMetalView.swift in Sources */,
 				35C3C8FFE3D1338719F0C54E /* OrbPanel.swift in Sources */,
+				E9D4C5A74FBBB188DEC917B3 /* OrbRenderer.swift in Sources */,
 				7A17C5E01AC43CD75E7C7195 /* OrbState.swift in Sources */,
+				F1EB3984A5FF0E2D1F44DC7B /* OrbUniforms.swift in Sources */,
 				F9AFBCD0A63C8A453D1F2199 /* OrbWindowController.swift in Sources */,
 				D721C4D533DAA4D461CEF6D2 /* PlaybackContext.swift in Sources */,
 				8F5213621CDE66174CBBDA8A /* ProgramDecision.swift in Sources */,

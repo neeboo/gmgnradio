@@ -1,5 +1,4 @@
 import AppKit
-import SwiftUI
 
 @MainActor
 final class OrbWindowController: NSWindowController, NSWindowDelegate {
@@ -13,18 +12,18 @@ final class OrbWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private let defaults: UserDefaults
+    private let orbView: OrbMetalView
     private var interactionTask: Task<Void, Never>?
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
 
         let frame = Self.initialFrame(defaults: defaults)
-        let host = NSHostingView(rootView: OrbPlaceholderView())
-        host.frame = CGRect(origin: .zero, size: Constants.size)
-        host.wantsLayer = true
-        host.layer?.backgroundColor = NSColor.clear.cgColor
+        let orbView = OrbMetalView(frame: CGRect(origin: .zero, size: Constants.size))
+        orbView.autoresizingMask = [.width, .height]
+        self.orbView = orbView
 
-        let panel = OrbPanel(frame: frame, contentView: host)
+        let panel = OrbPanel(frame: frame, contentView: orbView)
         super.init(window: panel)
         panel.delegate = self
         startInteractionTracking(panel: panel)
@@ -40,6 +39,10 @@ final class OrbWindowController: NSWindowController, NSWindowDelegate {
 
     func show() {
         window?.orderFrontRegardless()
+    }
+
+    func setState(_ state: DJState) {
+        orbView.setState(state)
     }
 
     func windowDidMove(_ notification: Notification) {
@@ -109,25 +112,5 @@ final class OrbWindowController: NSWindowController, NSWindowDelegate {
         let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
             as? NSNumber
         return number?.stringValue ?? String(describing: screen.frame)
-    }
-}
-
-private struct OrbPlaceholderView: View {
-    var body: some View {
-        Circle()
-            .fill(
-                RadialGradient(
-                    colors: [
-                        Color(red: 0.28, green: 0.50, blue: 0.72).opacity(0.48),
-                        Color(red: 0.30, green: 0.20, blue: 0.48).opacity(0.22),
-                        .clear
-                    ],
-                    center: .center,
-                    startRadius: 12,
-                    endRadius: 82
-                )
-            )
-            .padding(8)
-            .accessibilityLabel("gmgn radio")
     }
 }
