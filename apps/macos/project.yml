@@ -14,9 +14,6 @@ targets:
     platform: macOS
     sources:
       - Sources/GMGNRadio
-      - path: Resources/ControlPanel
-        type: folder
-        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.gmgn.radio

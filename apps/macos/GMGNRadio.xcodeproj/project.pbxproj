@@ -17,7 +17,6 @@
 		4A028323AC8B8CC8BC49939F /* OrbUniformTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4C1A38CFE1FE5149D76CC08 /* OrbUniformTests.swift */; };
 		4EC3D2F74514647D567B0C01 /* PresenceManifest.swift in Sources */ = {isa = PBXBuildFile; fileRef = E10077CC5B0FFD300B288B48 /* PresenceManifest.swift */; };
 		559086501216765204D4B06C /* DJState.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBAA0158B7BFF631FD685449 /* DJState.swift */; };
-		55B63B0EDA48A7006EA56F32 /* ControlPanel in Resources */ = {isa = PBXBuildFile; fileRef = E4A495808609102725D1EE65 /* ControlPanel */; };
 		6457881F70FAC522542403A5 /* PresencePackageStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6928DE615B4CCBB86C03160 /* PresencePackageStoreTests.swift */; };
 		761481871644BCC5C68DF17C /* OrbMotionModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A9A0DF149EE2164BBDE40EB /* OrbMotionModelTests.swift */; };
 		7A17C5E01AC43CD75E7C7195 /* OrbState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43F2D91E87ABAC0F51F8C126 /* OrbState.swift */; };
@@ -74,7 +73,6 @@
 		C9BED59FEA722CB9CBF88096 /* WindowPlacement.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowPlacement.swift; sourceTree = "<group>"; };
 		CE95E971E1A8C2085882DD3C /* Immersive.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Immersive.metal; sourceTree = "<group>"; };
 		E10077CC5B0FFD300B288B48 /* PresenceManifest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceManifest.swift; sourceTree = "<group>"; };
-		E4A495808609102725D1EE65 /* ControlPanel */ = {isa = PBXFileReference; lastKnownFileType = folder; name = ControlPanel; path = Resources/ControlPanel; sourceTree = SOURCE_ROOT; };
 		E6928DE615B4CCBB86C03160 /* PresencePackageStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresencePackageStoreTests.swift; sourceTree = "<group>"; };
 		F02A6D59D50F24D402CC3A91 /* ControlPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlPanelView.swift; sourceTree = "<group>"; };
 		F2457A76CBF19C18E6D386EE /* PlaybackContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackContext.swift; sourceTree = "<group>"; };
@@ -226,7 +224,6 @@
 		D640DB89E934CAAF4C06A243 = {
 			isa = PBXGroup;
 			children = (
-				E4A495808609102725D1EE65 /* ControlPanel */,
 				17C10A9A5615C80EB8EEC1E6 /* GMGNRadio */,
 				71F07F2698B35D79C192ECA7 /* GMGNRadioTests */,
 				98A0C8D4DB11177CABB1D8F7 /* Products */,
@@ -258,7 +255,6 @@
 			buildConfigurationList = 76FAB07E3F06F0E105DE73E7 /* Build configuration list for PBXNativeTarget "GMGNRadio" */;
 			buildPhases = (
 				A810C423A20A4EE28465384F /* Sources */,
-				D410DBA447E045A64664AE7B /* Resources */,
 			);
 			buildRules = (
 			);
@@ -325,17 +321,6 @@
 			);
 		};
 /* End PBXProject section */
-
-/* Begin PBXResourcesBuildPhase section */
-		D410DBA447E045A64664AE7B /* Resources */ = {
-			isa = PBXResourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				55B63B0EDA48A7006EA56F32 /* ControlPanel in Resources */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-/* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		9838C952AD10F5703F7A274B /* Sources */ = {

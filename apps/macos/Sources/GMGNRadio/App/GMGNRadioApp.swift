@@ -13,7 +13,7 @@ struct GMGNRadioApp: App {
     var body: some Scene {
         MenuBarExtra(ProductIdentity.displayName, systemImage: "waveform.circle.fill") {
             SettingsLink {
-                Text("Open Control Room")
+                Text("桌宠设置…")
             }
             Button("Exit Immersive Visuals") {
                 (NSApplication.shared.delegate as? AppDelegate)?
@@ -27,9 +27,9 @@ struct GMGNRadioApp: App {
 
         Settings {
             ControlPanelView()
-                .frame(minWidth: 960, minHeight: 700)
+                .frame(minWidth: 600, minHeight: 500)
         }
-        .defaultSize(width: 1080, height: 760)
+        .defaultSize(width: 640, height: 560)
     }
 }
 
