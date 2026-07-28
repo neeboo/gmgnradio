@@ -11,3 +11,8 @@ xcuserdata/
 
 .swiftpm/
 .build/
+
+node_modules/
+*.tsbuildinfo
+
+node_modules/

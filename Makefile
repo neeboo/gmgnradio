@@ -1,6 +1,9 @@
-.PHONY: generate test
+.PHONY: control-panel generate test
 
-generate:
+control-panel:
+	cd apps/control-panel && npm run build
+
+generate: control-panel
 	cd apps/macos && xcodegen generate
 
 test: generate

@@ -1,0 +1,101 @@
+@import "tailwindcss";
+
+:root {
+  font-family: "Avenir Next", Avenir, "Helvetica Neue", sans-serif;
+  color: #17191f;
+  background: #f3f2ed;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { min-width: 880px; min-height: 100%; margin: 0; }
+button, input { font: inherit; }
+.display-title {
+  font-family: "Iowan Old Style", Baskerville, Georgia, serif;
+  font-weight: 600;
+  letter-spacing: -.035em;
+}
+.eyebrow {
+  margin: 0;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .18em;
+  color: #8b9099;
+}
+.control-room {
+  background-image:
+    linear-gradient(rgba(23,25,31,.018) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(23,25,31,.014) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+.hero-panel::after {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  content: "";
+  background: linear-gradient(105deg, transparent 44%, rgba(24,89,255,.035));
+}
+.orb-stage {
+  display: grid;
+  place-items: center;
+  border-left: 1px solid #e1e1dd;
+  background:
+    radial-gradient(circle at 50% 50%, rgba(24,89,255,.08), transparent 48%),
+    linear-gradient(135deg, rgba(255,255,255,.75), rgba(231,237,255,.72));
+}
+.presence-orb, .mini-orb {
+  position: relative;
+  overflow: hidden;
+  border-radius: 999px;
+  background:
+    radial-gradient(circle at 34% 28%, #fff 0 13%, rgba(255,255,255,.72) 24%, transparent 42%),
+    radial-gradient(circle at 64% 70%, #1859ff 0 6%, #6f9bff 28%, #eaf0ff 62%, #fff 82%);
+  box-shadow:
+    0 24px 48px rgba(24,89,255,.18),
+    0 0 0 1px rgba(24,89,255,.14),
+    inset -15px -16px 28px rgba(24,89,255,.16),
+    inset 14px 11px 24px rgba(255,255,255,.95);
+}
+.presence-orb { width: 148px; height: 148px; animation: orb-breathe 4.6s ease-in-out infinite; }
+.presence-orb__texture {
+  position: absolute;
+  inset: -28%;
+  border-radius: 43%;
+  background: conic-gradient(
+    from 35deg,
+    transparent 0 12%,
+    rgba(18,73,230,.76) 18%,
+    rgba(132,173,255,.3) 31%,
+    transparent 44% 61%,
+    rgba(29,96,255,.48) 70%,
+    transparent 83%
+  );
+  filter: blur(5px);
+  animation: texture-drift 7s linear infinite;
+}
+.presence-orb__shine {
+  position: absolute;
+  top: 19%;
+  left: 25%;
+  width: 36%;
+  height: 19%;
+  border-radius: 50%;
+  background: rgba(255,255,255,.85);
+  filter: blur(4px);
+  transform: rotate(-22deg);
+}
+.mini-orb {
+  width: 36px;
+  height: 36px;
+  box-shadow: 0 8px 16px rgba(24,89,255,.18), inset -5px -5px 9px rgba(24,89,255,.18);
+}
+@keyframes orb-breathe {
+  0%, 100% { transform: scale(.965); filter: saturate(.94); }
+  50% { transform: scale(1.035); filter: saturate(1.12); }
+}
+@keyframes texture-drift { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .presence-orb, .presence-orb__texture { animation: none; }
+}
