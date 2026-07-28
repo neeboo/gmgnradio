@@ -26,10 +26,10 @@ struct GMGNRadioApp: App {
         }
 
         Settings {
-            ControlPanelView()
-                .frame(minWidth: 600, minHeight: 500)
+            PresenceSettingsView()
+                .frame(minWidth: 540, minHeight: 440)
         }
-        .defaultSize(width: 640, height: 560)
+        .defaultSize(width: 580, height: 500)
     }
 }
 
