@@ -17,12 +17,14 @@
 		4A028323AC8B8CC8BC49939F /* OrbUniformTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4C1A38CFE1FE5149D76CC08 /* OrbUniformTests.swift */; };
 		4EC3D2F74514647D567B0C01 /* PresenceManifest.swift in Sources */ = {isa = PBXBuildFile; fileRef = E10077CC5B0FFD300B288B48 /* PresenceManifest.swift */; };
 		559086501216765204D4B06C /* DJState.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBAA0158B7BFF631FD685449 /* DJState.swift */; };
+		55B63B0EDA48A7006EA56F32 /* ControlPanel in Resources */ = {isa = PBXBuildFile; fileRef = E4A495808609102725D1EE65 /* ControlPanel */; };
 		6457881F70FAC522542403A5 /* PresencePackageStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6928DE615B4CCBB86C03160 /* PresencePackageStoreTests.swift */; };
 		761481871644BCC5C68DF17C /* OrbMotionModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A9A0DF149EE2164BBDE40EB /* OrbMotionModelTests.swift */; };
 		7A17C5E01AC43CD75E7C7195 /* OrbState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43F2D91E87ABAC0F51F8C126 /* OrbState.swift */; };
 		8F5213621CDE66174CBBDA8A /* ProgramDecision.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA8AFFDEBE45F4BC907FDDA1 /* ProgramDecision.swift */; };
 		936430A6AC4FF9D7B3D62C5C /* GMGNRadioApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39FC866C894AFC1D958539BF /* GMGNRadioApp.swift */; };
 		94A2BC7B04AA84C9A463CED6 /* Orb.metal in Sources */ = {isa = PBXBuildFile; fileRef = 4374B4687559AEDE957A3117 /* Orb.metal */; };
+		966720FCB35C2DA9CD0439C1 /* PresenceSettingsModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07A8377E0830ED4ED8D57DB6 /* PresenceSettingsModel.swift */; };
 		A51F42242E8A5663CE0BC305 /* ImmersiveSceneController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5CF6A9DCAC8752FE6AEFD4EC /* ImmersiveSceneController.swift */; };
 		A812DB23EA81DBB7D2B72B1D /* OrbMetalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F934C041C38E2FBEE9EFAEB7 /* OrbMetalView.swift */; };
 		AA95F2ACA1E99472A1547DB9 /* Immersive.metal in Sources */ = {isa = PBXBuildFile; fileRef = CE95E971E1A8C2085882DD3C /* Immersive.metal */; };
@@ -49,6 +51,7 @@
 
 /* Begin PBXFileReference section */
 		041392633B2943749B42CDCF /* ControlPanelRequestTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlPanelRequestTests.swift; sourceTree = "<group>"; };
+		07A8377E0830ED4ED8D57DB6 /* PresenceSettingsModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceSettingsModel.swift; sourceTree = "<group>"; };
 		07DE01676AC401339B9DCC2F /* OrbMotionModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbMotionModel.swift; sourceTree = "<group>"; };
 		20C65C2BD0FD2417BAFBD387 /* PresenceCommandService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceCommandService.swift; sourceTree = "<group>"; };
 		35E621D7E364E2B9BAFF1036 /* PresenceCommandServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceCommandServiceTests.swift; sourceTree = "<group>"; };
@@ -73,6 +76,7 @@
 		C9BED59FEA722CB9CBF88096 /* WindowPlacement.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowPlacement.swift; sourceTree = "<group>"; };
 		CE95E971E1A8C2085882DD3C /* Immersive.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Immersive.metal; sourceTree = "<group>"; };
 		E10077CC5B0FFD300B288B48 /* PresenceManifest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceManifest.swift; sourceTree = "<group>"; };
+		E4A495808609102725D1EE65 /* ControlPanel */ = {isa = PBXFileReference; lastKnownFileType = folder; name = ControlPanel; path = Resources/ControlPanel; sourceTree = SOURCE_ROOT; };
 		E6928DE615B4CCBB86C03160 /* PresencePackageStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresencePackageStoreTests.swift; sourceTree = "<group>"; };
 		F02A6D59D50F24D402CC3A91 /* ControlPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlPanelView.swift; sourceTree = "<group>"; };
 		F2457A76CBF19C18E6D386EE /* PlaybackContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackContext.swift; sourceTree = "<group>"; };
@@ -198,6 +202,7 @@
 				FE66A66ABC04BB440FFFD46A /* ControlPanelRequest.swift */,
 				F02A6D59D50F24D402CC3A91 /* ControlPanelView.swift */,
 				20C65C2BD0FD2417BAFBD387 /* PresenceCommandService.swift */,
+				07A8377E0830ED4ED8D57DB6 /* PresenceSettingsModel.swift */,
 			);
 			path = Settings;
 			sourceTree = "<group>";
@@ -224,6 +229,7 @@
 		D640DB89E934CAAF4C06A243 = {
 			isa = PBXGroup;
 			children = (
+				E4A495808609102725D1EE65 /* ControlPanel */,
 				17C10A9A5615C80EB8EEC1E6 /* GMGNRadio */,
 				71F07F2698B35D79C192ECA7 /* GMGNRadioTests */,
 				98A0C8D4DB11177CABB1D8F7 /* Products */,
@@ -255,6 +261,7 @@
 			buildConfigurationList = 76FAB07E3F06F0E105DE73E7 /* Build configuration list for PBXNativeTarget "GMGNRadio" */;
 			buildPhases = (
 				A810C423A20A4EE28465384F /* Sources */,
+				D410DBA447E045A64664AE7B /* Resources */,
 			);
 			buildRules = (
 			);
@@ -322,6 +329,17 @@
 		};
 /* End PBXProject section */
 
+/* Begin PBXResourcesBuildPhase section */
+		D410DBA447E045A64664AE7B /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				55B63B0EDA48A7006EA56F32 /* ControlPanel in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		9838C952AD10F5703F7A274B /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
@@ -360,6 +378,7 @@
 				EFD2489E256D52E3C94F0E23 /* PresenceCommandService.swift in Sources */,
 				4EC3D2F74514647D567B0C01 /* PresenceManifest.swift in Sources */,
 				B7E5C80664487C1D748EF6D4 /* PresencePackageStore.swift in Sources */,
+				966720FCB35C2DA9CD0439C1 /* PresenceSettingsModel.swift in Sources */,
 				8F5213621CDE66174CBBDA8A /* ProgramDecision.swift in Sources */,
 				330C60A11D6B3849DFAFCE65 /* WindowPlacement.swift in Sources */,
 			);
