@@ -16,6 +16,7 @@
 		4A028323AC8B8CC8BC49939F /* OrbUniformTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4C1A38CFE1FE5149D76CC08 /* OrbUniformTests.swift */; };
 		4EC3D2F74514647D567B0C01 /* PresenceManifest.swift in Sources */ = {isa = PBXBuildFile; fileRef = E10077CC5B0FFD300B288B48 /* PresenceManifest.swift */; };
 		559086501216765204D4B06C /* DJState.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBAA0158B7BFF631FD685449 /* DJState.swift */; };
+		5F8E787A682533EA402207D8 /* DoubaoRTCEventMapper.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9758A4F0754760FA0AB854CA /* DoubaoRTCEventMapper.swift */; };
 		6457881F70FAC522542403A5 /* PresencePackageStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6928DE615B4CCBB86C03160 /* PresencePackageStoreTests.swift */; };
 		761481871644BCC5C68DF17C /* OrbMotionModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A9A0DF149EE2164BBDE40EB /* OrbMotionModelTests.swift */; };
 		7A17C5E01AC43CD75E7C7195 /* OrbState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43F2D91E87ABAC0F51F8C126 /* OrbState.swift */; };
@@ -34,6 +35,8 @@
 		EFD2489E256D52E3C94F0E23 /* PresenceCommandService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20C65C2BD0FD2417BAFBD387 /* PresenceCommandService.swift */; };
 		F0690A251B2C15D06A0AE304 /* RealtimeDJSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A303D7B9477D9BFF5F5544D2 /* RealtimeDJSessionTests.swift */; };
 		F1EB3984A5FF0E2D1F44DC7B /* OrbUniforms.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47876636EF21649388CE59E3 /* OrbUniforms.swift */; };
+		F7389A2ED65FC4849A86CEC4 /* BailianRealtimeEventMapper.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4E48BCF663DCFB840547923 /* BailianRealtimeEventMapper.swift */; };
+		F82CBCB8CD8F6D0BBEFC538F /* ProviderEventMapperTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA45B2F39C34F3F44A24A4FE /* ProviderEventMapperTests.swift */; };
 		F83BDCD045FC0F46E849868C /* WindowPlacementTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9968CE566BC39260555871B7 /* WindowPlacementTests.swift */; };
 		F8928F63DF1AF0D26D9D258B /* PresenceSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A98371838646D4018D596A5 /* PresenceSettingsView.swift */; };
 		F9AFBCD0A63C8A453D1F2199 /* OrbWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 38784FBC97203965A192FDAC /* OrbWindowController.swift */; };
@@ -67,16 +70,19 @@
 		77166FE9E4995A36C34A2D90 /* GMGNRadioTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = GMGNRadioTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		8A9A0DF149EE2164BBDE40EB /* OrbMotionModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbMotionModelTests.swift; sourceTree = "<group>"; };
 		908F400DB2F1BAA7F52A31FB /* GMGNRadio.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = GMGNRadio.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		9758A4F0754760FA0AB854CA /* DoubaoRTCEventMapper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DoubaoRTCEventMapper.swift; sourceTree = "<group>"; };
 		9968CE566BC39260555871B7 /* WindowPlacementTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowPlacementTests.swift; sourceTree = "<group>"; };
 		9A5BF72176B81DD186790642 /* OrbPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbPanel.swift; sourceTree = "<group>"; };
 		A303D7B9477D9BFF5F5544D2 /* RealtimeDJSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeDJSessionTests.swift; sourceTree = "<group>"; };
 		A4C1A38CFE1FE5149D76CC08 /* OrbUniformTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbUniformTests.swift; sourceTree = "<group>"; };
+		A4E48BCF663DCFB840547923 /* BailianRealtimeEventMapper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BailianRealtimeEventMapper.swift; sourceTree = "<group>"; };
 		AC10161C41BE8EB05A51FC8D /* AppSmokeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSmokeTests.swift; sourceTree = "<group>"; };
 		BA8AFFDEBE45F4BC907FDDA1 /* ProgramDecision.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgramDecision.swift; sourceTree = "<group>"; };
 		BBAA0158B7BFF631FD685449 /* DJState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DJState.swift; sourceTree = "<group>"; };
 		BBB583E2AA3BD7F6DA17AED6 /* DJStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DJStateTests.swift; sourceTree = "<group>"; };
 		BF9A4902E75F2E8D7081C852 /* OrbRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbRenderer.swift; sourceTree = "<group>"; };
 		C9BED59FEA722CB9CBF88096 /* WindowPlacement.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowPlacement.swift; sourceTree = "<group>"; };
+		CA45B2F39C34F3F44A24A4FE /* ProviderEventMapperTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderEventMapperTests.swift; sourceTree = "<group>"; };
 		CE95E971E1A8C2085882DD3C /* Immersive.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Immersive.metal; sourceTree = "<group>"; };
 		E10077CC5B0FFD300B288B48 /* PresenceManifest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceManifest.swift; sourceTree = "<group>"; };
 		E6928DE615B4CCBB86C03160 /* PresencePackageStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresencePackageStoreTests.swift; sourceTree = "<group>"; };
@@ -140,6 +146,7 @@
 			isa = PBXGroup;
 			children = (
 				216A6D94509E4915BCC18C7C /* RealtimeDJSession.swift */,
+				6C395170DC77EA0600E6DF35 /* Providers */,
 			);
 			path = VoiceSession;
 			sourceTree = "<group>";
@@ -163,6 +170,23 @@
 				BA8AFFDEBE45F4BC907FDDA1 /* ProgramDecision.swift */,
 			);
 			path = Domain;
+			sourceTree = "<group>";
+		};
+		5A2E9EA8943A906D2935AE83 /* Bailian */ = {
+			isa = PBXGroup;
+			children = (
+				A4E48BCF663DCFB840547923 /* BailianRealtimeEventMapper.swift */,
+			);
+			path = Bailian;
+			sourceTree = "<group>";
+		};
+		6C395170DC77EA0600E6DF35 /* Providers */ = {
+			isa = PBXGroup;
+			children = (
+				5A2E9EA8943A906D2935AE83 /* Bailian */,
+				AE44A01979ACE3F624F35EFE /* Doubao */,
+			);
+			path = Providers;
 			sourceTree = "<group>";
 		};
 		71F07F2698B35D79C192ECA7 /* GMGNRadioTests */ = {
@@ -219,6 +243,7 @@
 		A7FD6E0646DE35190D332163 /* VoiceSession */ = {
 			isa = PBXGroup;
 			children = (
+				CA45B2F39C34F3F44A24A4FE /* ProviderEventMapperTests.swift */,
 				A303D7B9477D9BFF5F5544D2 /* RealtimeDJSessionTests.swift */,
 			);
 			path = VoiceSession;
@@ -232,6 +257,14 @@
 				47876636EF21649388CE59E3 /* OrbUniforms.swift */,
 			);
 			path = Metal;
+			sourceTree = "<group>";
+		};
+		AE44A01979ACE3F624F35EFE /* Doubao */ = {
+			isa = PBXGroup;
+			children = (
+				9758A4F0754760FA0AB854CA /* DoubaoRTCEventMapper.swift */,
+			);
+			path = Doubao;
 			sourceTree = "<group>";
 		};
 		BBF952DA6DD9ACDCA0DD9C71 /* VisualEngine */ = {
@@ -355,6 +388,7 @@
 				4A028323AC8B8CC8BC49939F /* OrbUniformTests.swift in Sources */,
 				02C8D4C3FC22A2E5246AE573 /* PresenceCommandServiceTests.swift in Sources */,
 				6457881F70FAC522542403A5 /* PresencePackageStoreTests.swift in Sources */,
+				F82CBCB8CD8F6D0BBEFC538F /* ProviderEventMapperTests.swift in Sources */,
 				F0690A251B2C15D06A0AE304 /* RealtimeDJSessionTests.swift in Sources */,
 				B80D0EC6A0BCEBE17501EEC0 /* SettingsMenuActionTests.swift in Sources */,
 				F83BDCD045FC0F46E849868C /* WindowPlacementTests.swift in Sources */,
@@ -365,7 +399,9 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				F7389A2ED65FC4849A86CEC4 /* BailianRealtimeEventMapper.swift in Sources */,
 				559086501216765204D4B06C /* DJState.swift in Sources */,
+				5F8E787A682533EA402207D8 /* DoubaoRTCEventMapper.swift in Sources */,
 				936430A6AC4FF9D7B3D62C5C /* GMGNRadioApp.swift in Sources */,
 				AA95F2ACA1E99472A1547DB9 /* Immersive.metal in Sources */,
 				A51F42242E8A5663CE0BC305 /* ImmersiveSceneController.swift in Sources */,

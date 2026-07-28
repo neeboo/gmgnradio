@@ -87,6 +87,37 @@ struct RealtimeDJFailure: Error, Codable, Equatable, Sendable {
     let recoverable: Bool
 }
 
+struct ProviderRealtimeEvent: Equatable, Sendable {
+    let type: String
+    let text: String?
+    let callID: String?
+    let name: String?
+    let argumentsJSON: Data?
+    let errorCode: String?
+    let errorMessage: String?
+    let recoverable: Bool?
+
+    init(
+        type: String,
+        text: String? = nil,
+        callID: String? = nil,
+        name: String? = nil,
+        argumentsJSON: Data? = nil,
+        errorCode: String? = nil,
+        errorMessage: String? = nil,
+        recoverable: Bool? = nil
+    ) {
+        self.type = type
+        self.text = text
+        self.callID = callID
+        self.name = name
+        self.argumentsJSON = argumentsJSON
+        self.errorCode = errorCode
+        self.errorMessage = errorMessage
+        self.recoverable = recoverable
+    }
+}
+
 enum RealtimeDJEvent: Equatable, Sendable {
     case connectionChanged(RealtimeDJConnectionState)
     case userSpeechStarted
