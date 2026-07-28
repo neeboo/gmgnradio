@@ -8,12 +8,18 @@ settings:
     SWIFT_STRICT_CONCURRENCY: complete
     MACOSX_DEPLOYMENT_TARGET: "26.0"
     DEVELOPMENT_TEAM: ""
+packages:
+  ElevenLabs:
+    url: https://github.com/elevenlabs/elevenlabs-swift-sdk.git
+    exactVersion: 3.2.2
 targets:
   GMGNRadio:
     type: application
     platform: macOS
     sources:
       - Sources/GMGNRadio
+    dependencies:
+      - package: ElevenLabs
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.gmgn.radio

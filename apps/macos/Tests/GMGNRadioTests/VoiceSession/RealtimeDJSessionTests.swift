@@ -6,6 +6,7 @@ import Testing
 func providersExposeTheirVerifiedRealtimeCapabilities() {
     let bailian = RealtimeDJProvider.bailian.capabilities
     let doubao = RealtimeDJProvider.doubao.capabilities
+    let elevenLabs = RealtimeDJProvider.elevenLabs.capabilities
 
     #expect(bailian.transport == .streamingWebSocket)
     #expect(bailian.serverVoiceActivityDetection)
@@ -16,6 +17,14 @@ func providersExposeTheirVerifiedRealtimeCapabilities() {
     #expect(doubao.serverVoiceActivityDetection)
     #expect(doubao.nativeInterruption)
     #expect(doubao.clientTools)
+
+    #expect(elevenLabs.transport == .webRTC)
+    #expect(elevenLabs.serverVoiceActivityDetection)
+    #expect(elevenLabs.nativeInterruption)
+    #expect(elevenLabs.liveContextUpdates)
+    #expect(elevenLabs.clientTools)
+    #expect(elevenLabs.independentMicrophoneCaptureAndTransmission == false)
+    #expect(RealtimeDJProvider.elevenLabs.rawValue == "elevenlabs")
 }
 
 @Test

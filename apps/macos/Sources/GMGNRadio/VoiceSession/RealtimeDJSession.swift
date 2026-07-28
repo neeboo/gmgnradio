@@ -3,11 +3,13 @@ import Foundation
 enum RealtimeDJTransport: String, Codable, Sendable {
     case streamingWebSocket
     case rtcRoom
+    case webRTC
 }
 
 enum RealtimeDJProvider: String, Codable, CaseIterable, Sendable {
     case bailian
     case doubao
+    case elevenLabs = "elevenlabs"
 
     var capabilities: RealtimeDJCapabilities {
         switch self {
@@ -17,7 +19,8 @@ enum RealtimeDJProvider: String, Codable, CaseIterable, Sendable {
                 serverVoiceActivityDetection: true,
                 nativeInterruption: true,
                 liveContextUpdates: true,
-                clientTools: true
+                clientTools: true,
+                independentMicrophoneCaptureAndTransmission: true
             )
         case .doubao:
             RealtimeDJCapabilities(
@@ -25,7 +28,17 @@ enum RealtimeDJProvider: String, Codable, CaseIterable, Sendable {
                 serverVoiceActivityDetection: true,
                 nativeInterruption: true,
                 liveContextUpdates: true,
-                clientTools: true
+                clientTools: true,
+                independentMicrophoneCaptureAndTransmission: true
+            )
+        case .elevenLabs:
+            RealtimeDJCapabilities(
+                transport: .webRTC,
+                serverVoiceActivityDetection: true,
+                nativeInterruption: true,
+                liveContextUpdates: true,
+                clientTools: true,
+                independentMicrophoneCaptureAndTransmission: false
             )
         }
     }
@@ -37,6 +50,7 @@ struct RealtimeDJCapabilities: Codable, Equatable, Sendable {
     let nativeInterruption: Bool
     let liveContextUpdates: Bool
     let clientTools: Bool
+    let independentMicrophoneCaptureAndTransmission: Bool
 }
 
 struct RealtimeDJSessionTicket: Codable, Equatable, Sendable {

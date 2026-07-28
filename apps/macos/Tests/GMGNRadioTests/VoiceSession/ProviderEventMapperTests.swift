@@ -100,3 +100,64 @@ func providerMappersIgnoreUnknownEventsAndNormalizeErrors() {
         recoverable: true
     ))])
 }
+
+@Test
+func elevenLabsMapsConversationCallbacks() {
+    var mapper = ElevenLabsRealtimeEventMapper()
+
+    #expect(mapper.map(ProviderRealtimeEvent(
+        type: "connection.connected"
+    )) == [.connectionChanged(.connected)])
+    #expect(mapper.map(ProviderRealtimeEvent(
+        type: "speech.user_started"
+    )) == [.userSpeechStarted])
+    #expect(mapper.map(ProviderRealtimeEvent(
+        type: "transcript.user_final",
+        text: "这首放完就安静一点"
+    )) == [.userTranscriptFinal("这首放完就安静一点")])
+    #expect(mapper.map(ProviderRealtimeEvent(
+        type: "agent.state.speaking"
+    )) == [.agentResponseStarted, .agentAudioStarted])
+    #expect(mapper.map(ProviderRealtimeEvent(
+        type: "transcript.agent_final",
+        text: "好，后面留一点空间。"
+    )) == [.agentTranscriptFinal("好，后面留一点空间。")])
+    #expect(mapper.map(ProviderRealtimeEvent(
+        type: "agent.state.listening"
+    )) == [.agentAudioFinished])
+    #expect(mapper.map(ProviderRealtimeEvent(
+        type: "conversation.interrupted"
+    )) == [.interrupted])
+}
+
+@Test
+func elevenLabsMapsClientToolsWithoutChangingTheirPayload() {
+    var mapper = ElevenLabsRealtimeEventMapper()
+    let arguments = Data(#"{"trackId":"track-next"}"#.utf8)
+
+    #expect(mapper.map(ProviderRealtimeEvent(
+        type: "client_tool.call",
+        callID: "tool-11",
+        name: "play_track",
+        argumentsJSON: arguments
+    )) == [.toolCall(RealtimeDJToolCall(
+        id: "tool-11",
+        name: "play_track",
+        argumentsJSON: arguments
+    ))])
+}
+
+@Test
+func elevenLabsDisconnectClearsAgentAudioStateForReconnect() {
+    var mapper = ElevenLabsRealtimeEventMapper()
+
+    #expect(mapper.map(ProviderRealtimeEvent(
+        type: "agent.state.speaking"
+    )) == [.agentResponseStarted, .agentAudioStarted])
+    #expect(mapper.map(ProviderRealtimeEvent(
+        type: "connection.disconnected"
+    )) == [.connectionChanged(.disconnected)])
+    #expect(mapper.map(ProviderRealtimeEvent(
+        type: "agent.state.speaking"
+    )) == [.agentResponseStarted, .agentAudioStarted])
+}

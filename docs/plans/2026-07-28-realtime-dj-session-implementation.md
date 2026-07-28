@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** 在 gmgn radio macOS 客户端建立基于既有百炼与豆包实现的供应商无关实时 DJ 会话合同。
+**Goal:** 在 gmgn radio macOS 客户端建立可承载百炼、豆包与 ElevenLabs 的供应商无关实时 DJ 会话合同。
 
-**Architecture:** Swift 客户端以 `RealtimeDJSession` 表达完整实时语音会话，并用 `RealtimeDJSessionController` 管理激活、切换和过期事件隔离。百炼和豆包各自维护事件映射器，后续真实 SDK 只需实现同一合同。
+**Architecture:** Swift 客户端以 `RealtimeDJSession` 表达完整实时语音会话，并用 `RealtimeDJSessionController` 管理激活、切换和过期事件隔离。每家供应商维护独立事件映射器，真实 SDK 通过相同合同进入播放器。
 
 **Tech Stack:** Swift 6、Swift Concurrency、Swift Testing、XcodeGen、现有 gmgn radio macOS 工程。
 
@@ -18,7 +18,7 @@
 
 **Step 1: 写失败测试**
 
-测试百炼与豆包能力集合、票据不暴露供应商凭证结构，以及采集和上传状态彼此独立。
+测试供应商能力集合、票据不暴露供应商凭证结构，以及采集和上传状态彼此独立。
 
 **Step 2: 运行定向测试并确认失败**
 
@@ -106,9 +106,9 @@ Expected: `TEST SUCCEEDED`。
 - Modify: `docs/plans/2026-07-28-gmgn-radio-design.md`
 - Modify: `docs/plans/2026-07-28-gmgn-radio-implementation.md`
 
-**Step 1: 移除默认 LiveKit 与 ElevenLabs 流水线**
+**Step 1: 移除默认 LiveKit 中间层**
 
-将实时语音改为 `RealtimeDJSession`，首批供应商为百炼和豆包。
+将实时语音改为 `RealtimeDJSession`。百炼和豆包保留各自原生传输，ElevenLabs SDK 内部的 LiveKit WebRTC 只存在于该供应商适配器中。
 
 **Step 2: 运行完整测试**
 

@@ -9,6 +9,7 @@ gmgn radio 复用已经接通过的两条实时语音路径：
 
 - 阿里云百炼 `Qwen3.5-Omni-Realtime`：当前实现通过 DashScope WebSocket 发送音频、更新上下文并接收语音、字幕、VAD 与工具事件。
 - 豆包端到端实时语音：当前实现通过 ByteRTC 房间承载音频，通过 `StartVoiceChat`、`UpdateVoiceChat` 和 `StopVoiceChat` 管理模型会话、打断与工具结果。
+- ElevenLabs Agents：使用官方 Swift SDK 通过 WebRTC 连接，复用其 VAD、打断、字幕、上下文更新、音色覆盖和客户端工具调用。
 
 macOS 播放器只依赖统一的实时 DJ 会话合同。供应商 SDK、鉴权、事件名、采样率和房间生命周期留在各自适配器中。
 
@@ -24,7 +25,8 @@ RadioAudioGraph
        │
 RealtimeDJSession
 ├── BailianRealtimeSession
-└── DoubaoRTCSession
+├── DoubaoRTCSession
+└── ElevenLabsRealtimeSession
 ```
 
 `RadioAudioGraph` 负责音乐、混音、压低和设备切换。`RealtimeDJSession` 负责实时语音生命周期。DJ 节目计划通过结构化上下文更新进入会话，播放器工具通过统一工具调用返回。
@@ -64,6 +66,16 @@ RealtimeDJSession
 - RTC 字幕回调对应用户和 DJ 最终字幕；
 - 房间连接、首帧、音量与 VAD 回调归一化为共同事件。
 
+### ElevenLabs
+
+- 服务端签发的短期 conversation token 放入不透明会话票据；
+- `ConversationConfig` 的音色覆盖对应用户选择的 DJ 音色；
+- `updateContext` 对应节目计划和当前播放上下文更新；
+- `interruptAgent` 对应主动打断；
+- `onUnhandledClientToolCall` 与 `sendToolResult` 对应本地工具循环；
+- Agent 状态、用户/DJ 字幕、断线和错误回调归一化为共同事件；
+- 官方 SDK 内部使用 LiveKit WebRTC，该实现细节留在 ElevenLabs 适配器中。
+
 ## 生命周期规则
 
 1. 采集麦克风不代表上传，两个状态必须独立。
@@ -75,4 +87,4 @@ RealtimeDJSession
 
 ## 第一阶段范围
 
-本阶段实现 Swift 合同、供应商事件归一化、会话协调器与测试。网络 SDK 和真实凭证接入留在后续供应商适配任务中；ElevenLabs、LiveKit 和独立 VAD 不进入这一阶段。
+本阶段实现 Swift 合同、三家供应商的事件归一化、会话协调器与 ElevenLabs 官方 Swift SDK 适配器。真实凭证由服务端签发短期票据；百炼和豆包的网络适配继续按各自供应商任务推进。ElevenLabs 远端音轨接入自有 `AVAudioEngine` 仍需专项验收。

@@ -2,11 +2,11 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** 在 Apple Silicon 与 macOS 26 上完成 gmgn radio 的第一条原生纵向闭环：桌面呼吸球、Metal GFX、本地音乐、可切换的百炼/豆包实时语音和自主节目决策。
+**Goal:** 在 Apple Silicon 与 macOS 26 上完成 gmgn radio 的第一条原生纵向闭环：桌面呼吸球、Metal GFX、本地音乐、可切换的百炼/豆包/ElevenLabs 实时语音和自主节目决策。
 
-**Architecture:** macOS 客户端使用 Swift、AppKit、SwiftUI、Metal 与 AVAudioEngine。实时语音通过 `RealtimeDJSession` 接入供应商原生会话：百炼使用 DashScope 实时 WebSocket，豆包使用 RTC 房间与 VoiceChat 控制面。DJ 的状态、工具合同、节目规划和记忆归 gmgn radio 所有。
+**Architecture:** macOS 客户端使用 Swift、AppKit、SwiftUI、Metal 与 AVAudioEngine。实时语音通过 `RealtimeDJSession` 接入供应商原生会话：百炼使用 DashScope 实时 WebSocket，豆包使用 RTC 房间与 VoiceChat 控制面，ElevenLabs 使用官方 Swift SDK 的 WebRTC 会话。DJ 的状态、工具合同、节目规划和记忆归 gmgn radio 所有。
 
-**Tech Stack:** macOS 26、Xcode 26.6、Swift 6.3、AppKit、SwiftUI、MetalKit、AVFAudio、Accelerate、MusicKit、SQLite3、DashScope Realtime WebSocket、豆包 RTC、XcodeGen。
+**Tech Stack:** macOS 26、Xcode 26.6、Swift 6.3、AppKit、SwiftUI、MetalKit、AVFAudio、Accelerate、MusicKit、SQLite3、DashScope Realtime WebSocket、豆包 RTC、ElevenLabs Swift SDK 3.2.2、XcodeGen。
 
 ---
 
@@ -17,8 +17,8 @@
 - 官网签名与公证分发优先，暂不以 Mac App Store 沙盒为设计前提。
 - 呼吸球、窗口、音频和 GFX 使用原生实现。
 - `RealtimeDJSession` 统一连接、打断、字幕、工具调用和麦克风控制，不强行统一供应商的底层传输。
-- 百炼与豆包的凭证、房间参数和服务端字段放在不透明的 `RealtimeDJSessionTicket` 中。
-- 音色先使用各供应商实时模型原生能力；ElevenLabs 等后续供应商按同一会话协议增加适配器。
+- 百炼、豆包和 ElevenLabs 的凭证、房间参数和服务端字段放在不透明的 `RealtimeDJSessionTicket` 中。
+- 音色使用各供应商实时模型原生能力；ElevenLabs 音色通过 `TTSOverrides` 配置。
 - DJ 自主性、工具、记忆和节目策略留在 gmgn radio。
 - 本地音乐是第一条高质量播放路径，能够提供精确 PCM、压低音乐和音画同步。
 - Apple Music 先做独立可行性验证。MusicKit 不提供受保护音频的 PCM，也没有公开的每应用音量控制合同；验证不通过时，不让它影响本地音乐的招牌体验。
@@ -591,7 +591,7 @@ git commit -m "feat: add sample-timed DJ ducking and interruption"
 
 - `RealtimeDJSession` 会话协议与供应商能力声明；
 - `RealtimeDJSessionTicket`，客户端只传递不透明凭证；
-- 百炼与豆包事件归一化；
+- 百炼、豆包与 ElevenLabs 事件归一化；
 - `RealtimeDJSessionController`，负责切换会话并过滤旧连接的迟到事件；
 - 麦克风采集与上行发送分开控制。
 
@@ -618,7 +618,15 @@ git commit -m "feat: add sample-timed DJ ducking and interruption"
 - 归一化字幕、远端首帧、工具调用和连接错误；
 - 工具调用必须使用幂等键，本地播放、搜索、设置与记忆仍由 macOS 客户端执行。
 
-两种供应商共用相同 DJ 基础提示词和工具合同，提示词必须明确 DJ 自主性、话多话少偏好、场景感知与串歌职责。
+### Task 11A: 接入 ElevenLabs Agents
+
+- 固定官方 Swift SDK 版本并提交 `Package.resolved`；
+- 使用服务端签发的 conversation token 建立 WebRTC 会话；
+- 支持音色覆盖、上下文更新、打断、字幕和客户端工具回传；
+- 将 SDK 内部 LiveKit 实现限制在 ElevenLabs 适配器中；
+- 单独验证远端音轨能否进入 gmgn radio 自有混音图。
+
+三种供应商共用相同 DJ 基础提示词和工具合同，提示词必须明确 DJ 自主性、话多话少偏好、场景感知与串歌职责。
 
 ---
 
@@ -962,7 +970,7 @@ git commit -m "feat: add privacy-safe diagnostics and recovery"
 
 **Step 1: 建立本地运行入口**
 
-`scripts/run-local-stack.sh` 启动本地会话票据服务，并打印 macOS 客户端所需的本地地址。百炼与豆包密钥只留在服务端，脚本不得打印任何密钥。
+`scripts/run-local-stack.sh` 启动本地会话票据服务，并打印 macOS 客户端所需的本地地址。三家供应商的密钥只留在服务端，脚本不得打印任何密钥。
 
 **Step 2: 建立自动验证**
 
@@ -1033,6 +1041,6 @@ git commit -m "test: add deep-night radio acceptance suite"
 
 ## 实施节奏
 
-按任务顺序执行，每个任务独立提交。Task 1–8 先完成离线视觉与本地音频长板；Task 9–15 接通百炼与豆包实时 DJ；Task 16 作为 Apple Music 的独立闸门；Task 17–19 完成设置、恢复和验收。
+按任务顺序执行，每个任务独立提交。Task 1–8 先完成离线视觉与本地音频长板；Task 9–15 接通百炼、豆包和 ElevenLabs 实时 DJ；Task 16 作为 Apple Music 的独立闸门；Task 17–19 完成设置、恢复和验收。
 
 任何外部供应商的当前模型名、SDK 版本和价格都保持配置化。执行到对应任务时，先读取官方文档与 changelog，再固定版本并提交锁文件。

@@ -13,7 +13,9 @@
 		1F04322C71F0C43CD2AEA3B6 /* AppSmokeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC10161C41BE8EB05A51FC8D /* AppSmokeTests.swift */; };
 		2D4E0673D2067888218B2BF5 /* DJStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBB583E2AA3BD7F6DA17AED6 /* DJStateTests.swift */; };
 		330C60A11D6B3849DFAFCE65 /* WindowPlacement.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9BED59FEA722CB9CBF88096 /* WindowPlacement.swift */; };
+		35080BA80539BA5A8E091F8D /* ElevenLabsRealtimeEventMapper.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6ADB71DE1D4B227CC6BDDB4 /* ElevenLabsRealtimeEventMapper.swift */; };
 		35C3C8FFE3D1338719F0C54E /* OrbPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A5BF72176B81DD186790642 /* OrbPanel.swift */; };
+		3CA44B7D58C477B0301558E4 /* ElevenLabs in Frameworks */ = {isa = PBXBuildFile; productRef = C87548AD309AC59561DE9A6E /* ElevenLabs */; };
 		4A028323AC8B8CC8BC49939F /* OrbUniformTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4C1A38CFE1FE5149D76CC08 /* OrbUniformTests.swift */; };
 		4EC3D2F74514647D567B0C01 /* PresenceManifest.swift in Sources */ = {isa = PBXBuildFile; fileRef = E10077CC5B0FFD300B288B48 /* PresenceManifest.swift */; };
 		559086501216765204D4B06C /* DJState.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBAA0158B7BFF631FD685449 /* DJState.swift */; };
@@ -21,13 +23,16 @@
 		6457881F70FAC522542403A5 /* PresencePackageStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6928DE615B4CCBB86C03160 /* PresencePackageStoreTests.swift */; };
 		761481871644BCC5C68DF17C /* OrbMotionModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A9A0DF149EE2164BBDE40EB /* OrbMotionModelTests.swift */; };
 		7A17C5E01AC43CD75E7C7195 /* OrbState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43F2D91E87ABAC0F51F8C126 /* OrbState.swift */; };
+		8573E115B6C4C7AB8C10C1B8 /* ElevenLabsSDKConversationTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0F3CB58D63948E17D4EC76C /* ElevenLabsSDKConversationTransport.swift */; };
 		8F5213621CDE66174CBBDA8A /* ProgramDecision.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA8AFFDEBE45F4BC907FDDA1 /* ProgramDecision.swift */; };
 		936430A6AC4FF9D7B3D62C5C /* GMGNRadioApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39FC866C894AFC1D958539BF /* GMGNRadioApp.swift */; };
 		94A2BC7B04AA84C9A463CED6 /* Orb.metal in Sources */ = {isa = PBXBuildFile; fileRef = 4374B4687559AEDE957A3117 /* Orb.metal */; };
 		966720FCB35C2DA9CD0439C1 /* PresenceSettingsModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07A8377E0830ED4ED8D57DB6 /* PresenceSettingsModel.swift */; };
+		97DEBAA4822A0FB6CCDA187B /* ElevenLabsRealtimeSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = C37C91B042237E14E18265B7 /* ElevenLabsRealtimeSession.swift */; };
 		A51F42242E8A5663CE0BC305 /* ImmersiveSceneController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5CF6A9DCAC8752FE6AEFD4EC /* ImmersiveSceneController.swift */; };
 		A812DB23EA81DBB7D2B72B1D /* OrbMetalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F934C041C38E2FBEE9EFAEB7 /* OrbMetalView.swift */; };
 		AA95F2ACA1E99472A1547DB9 /* Immersive.metal in Sources */ = {isa = PBXBuildFile; fileRef = CE95E971E1A8C2085882DD3C /* Immersive.metal */; };
+		AC9B9EFB9BD89EE723266DA5 /* ElevenLabsRealtimeSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E442A4484F6338F0288177A4 /* ElevenLabsRealtimeSessionTests.swift */; };
 		AD473CDA80FF3D2D2D266FC6 /* RealtimeDJSessionController.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB1A15690B115ECC57F64F9E /* RealtimeDJSessionController.swift */; };
 		B7E5C80664487C1D748EF6D4 /* PresencePackageStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4BC287B276AB0F4EDFACFE51 /* PresencePackageStore.swift */; };
 		B80D0EC6A0BCEBE17501EEC0 /* SettingsMenuActionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 344E89599D7920F3C43236A7 /* SettingsMenuActionTests.swift */; };
@@ -80,19 +85,34 @@
 		A4C1A38CFE1FE5149D76CC08 /* OrbUniformTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbUniformTests.swift; sourceTree = "<group>"; };
 		A4E48BCF663DCFB840547923 /* BailianRealtimeEventMapper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BailianRealtimeEventMapper.swift; sourceTree = "<group>"; };
 		AC10161C41BE8EB05A51FC8D /* AppSmokeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSmokeTests.swift; sourceTree = "<group>"; };
+		B0F3CB58D63948E17D4EC76C /* ElevenLabsSDKConversationTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElevenLabsSDKConversationTransport.swift; sourceTree = "<group>"; };
 		BA8AFFDEBE45F4BC907FDDA1 /* ProgramDecision.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgramDecision.swift; sourceTree = "<group>"; };
 		BBAA0158B7BFF631FD685449 /* DJState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DJState.swift; sourceTree = "<group>"; };
 		BBB583E2AA3BD7F6DA17AED6 /* DJStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DJStateTests.swift; sourceTree = "<group>"; };
 		BF9A4902E75F2E8D7081C852 /* OrbRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbRenderer.swift; sourceTree = "<group>"; };
+		C37C91B042237E14E18265B7 /* ElevenLabsRealtimeSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElevenLabsRealtimeSession.swift; sourceTree = "<group>"; };
 		C9BED59FEA722CB9CBF88096 /* WindowPlacement.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowPlacement.swift; sourceTree = "<group>"; };
 		CA45B2F39C34F3F44A24A4FE /* ProviderEventMapperTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderEventMapperTests.swift; sourceTree = "<group>"; };
 		CE95E971E1A8C2085882DD3C /* Immersive.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Immersive.metal; sourceTree = "<group>"; };
+		D6ADB71DE1D4B227CC6BDDB4 /* ElevenLabsRealtimeEventMapper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElevenLabsRealtimeEventMapper.swift; sourceTree = "<group>"; };
 		E10077CC5B0FFD300B288B48 /* PresenceManifest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceManifest.swift; sourceTree = "<group>"; };
+		E442A4484F6338F0288177A4 /* ElevenLabsRealtimeSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElevenLabsRealtimeSessionTests.swift; sourceTree = "<group>"; };
 		E6928DE615B4CCBB86C03160 /* PresencePackageStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresencePackageStoreTests.swift; sourceTree = "<group>"; };
 		F2457A76CBF19C18E6D386EE /* PlaybackContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackContext.swift; sourceTree = "<group>"; };
 		F934C041C38E2FBEE9EFAEB7 /* OrbMetalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbMetalView.swift; sourceTree = "<group>"; };
 		FB1A15690B115ECC57F64F9E /* RealtimeDJSessionController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeDJSessionController.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		AAB3705DDCF6052B1B5954CC /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				3CA44B7D58C477B0301558E4 /* ElevenLabs in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
 		15C93DD16DBE0908A8AEC98C /* DesktopPresence */ = {
@@ -166,6 +186,16 @@
 			path = DesktopPresence;
 			sourceTree = "<group>";
 		};
+		529F0EBC827F175008277FA7 /* ElevenLabs */ = {
+			isa = PBXGroup;
+			children = (
+				D6ADB71DE1D4B227CC6BDDB4 /* ElevenLabsRealtimeEventMapper.swift */,
+				C37C91B042237E14E18265B7 /* ElevenLabsRealtimeSession.swift */,
+				B0F3CB58D63948E17D4EC76C /* ElevenLabsSDKConversationTransport.swift */,
+			);
+			path = ElevenLabs;
+			sourceTree = "<group>";
+		};
 		53B590FD408B0A4A739508B5 /* Domain */ = {
 			isa = PBXGroup;
 			children = (
@@ -190,6 +220,7 @@
 			children = (
 				5A2E9EA8943A906D2935AE83 /* Bailian */,
 				AE44A01979ACE3F624F35EFE /* Doubao */,
+				529F0EBC827F175008277FA7 /* ElevenLabs */,
 			);
 			path = Providers;
 			sourceTree = "<group>";
@@ -248,6 +279,7 @@
 		A7FD6E0646DE35190D332163 /* VoiceSession */ = {
 			isa = PBXGroup;
 			children = (
+				E442A4484F6338F0288177A4 /* ElevenLabsRealtimeSessionTests.swift */,
 				CA45B2F39C34F3F44A24A4FE /* ProviderEventMapperTests.swift */,
 				3559685E6AD36B0070B98424 /* RealtimeDJSessionControllerTests.swift */,
 				A303D7B9477D9BFF5F5544D2 /* RealtimeDJSessionTests.swift */,
@@ -316,6 +348,7 @@
 			buildConfigurationList = 76FAB07E3F06F0E105DE73E7 /* Build configuration list for PBXNativeTarget "GMGNRadio" */;
 			buildPhases = (
 				A810C423A20A4EE28465384F /* Sources */,
+				AAB3705DDCF6052B1B5954CC /* Frameworks */,
 			);
 			buildRules = (
 			);
@@ -323,6 +356,7 @@
 			);
 			name = GMGNRadio;
 			packageProductDependencies = (
+				C87548AD309AC59561DE9A6E /* ElevenLabs */,
 			);
 			productName = GMGNRadio;
 			productReference = 908F400DB2F1BAA7F52A31FB /* GMGNRadio.app */;
@@ -372,6 +406,9 @@
 			);
 			mainGroup = D640DB89E934CAAF4C06A243;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				D93490A94A44886318F0866A /* XCRemoteSwiftPackageReference "elevenlabs-swift-sdk" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 98A0C8D4DB11177CABB1D8F7 /* Products */;
 			projectDirPath = "";
@@ -390,6 +427,7 @@
 			files = (
 				1F04322C71F0C43CD2AEA3B6 /* AppSmokeTests.swift in Sources */,
 				2D4E0673D2067888218B2BF5 /* DJStateTests.swift in Sources */,
+				AC9B9EFB9BD89EE723266DA5 /* ElevenLabsRealtimeSessionTests.swift in Sources */,
 				761481871644BCC5C68DF17C /* OrbMotionModelTests.swift in Sources */,
 				4A028323AC8B8CC8BC49939F /* OrbUniformTests.swift in Sources */,
 				02C8D4C3FC22A2E5246AE573 /* PresenceCommandServiceTests.swift in Sources */,
@@ -409,6 +447,9 @@
 				F7389A2ED65FC4849A86CEC4 /* BailianRealtimeEventMapper.swift in Sources */,
 				559086501216765204D4B06C /* DJState.swift in Sources */,
 				5F8E787A682533EA402207D8 /* DoubaoRTCEventMapper.swift in Sources */,
+				35080BA80539BA5A8E091F8D /* ElevenLabsRealtimeEventMapper.swift in Sources */,
+				97DEBAA4822A0FB6CCDA187B /* ElevenLabsRealtimeSession.swift in Sources */,
+				8573E115B6C4C7AB8C10C1B8 /* ElevenLabsSDKConversationTransport.swift in Sources */,
 				936430A6AC4FF9D7B3D62C5C /* GMGNRadioApp.swift in Sources */,
 				AA95F2ACA1E99472A1547DB9 /* Immersive.metal in Sources */,
 				A51F42242E8A5663CE0BC305 /* ImmersiveSceneController.swift in Sources */,
@@ -670,6 +711,25 @@
 			defaultConfigurationName = Debug;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		D93490A94A44886318F0866A /* XCRemoteSwiftPackageReference "elevenlabs-swift-sdk" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/elevenlabs/elevenlabs-swift-sdk.git";
+			requirement = {
+				kind = exactVersion;
+				version = 3.2.2;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		C87548AD309AC59561DE9A6E /* ElevenLabs */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = D93490A94A44886318F0866A /* XCRemoteSwiftPackageReference "elevenlabs-swift-sdk" */;
+			productName = ElevenLabs;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 2EA5368F7E342CCC6B89784A /* Project object */;
 }
