@@ -10,20 +10,7 @@ struct PresenceSettingsView: View {
             header
 
             Form {
-                Section("当前桌宠") {
-                    if let activePackage = model.activePackage {
-                        PresenceRow(
-                            package: activePackage,
-                            action: nil,
-                            removeAction: nil
-                        )
-                    } else {
-                        Text("正在读取…")
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                Section("已安装") {
+                Section("桌宠外观") {
                     ForEach(model.packages, id: \.manifest.id) { package in
                         PresenceRow(
                             package: package,

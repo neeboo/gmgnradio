@@ -25,10 +25,6 @@ final class PresenceSettingsModel {
         }
     }
 
-    var activePackage: PresencePackage? {
-        packages.first(where: \.isActive)
-    }
-
     func load() {
         guard let service else {
             show(error: startupError)
