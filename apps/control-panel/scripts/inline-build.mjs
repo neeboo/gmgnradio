@@ -11,8 +11,9 @@ const css = await readFile(resolve(outputDirectory, stylesheet[1]), "utf8")
 const javascript = await readFile(resolve(outputDirectory, script[1]), "utf8")
 html = html
   .replace(stylesheet[0], `<style>${css.replaceAll("</style>", "<\\/style>")}</style>`)
+  .replace(script[0], "")
   .replace(
-    script[0],
-    `<script type="module">${javascript.replaceAll("</script>", "<\\/script>")}</script>`,
+    "</body>",
+    `<script>${javascript.replaceAll("</script>", "<\\/script>")}</script></body>`,
   )
 await writeFile(indexPath, html)
