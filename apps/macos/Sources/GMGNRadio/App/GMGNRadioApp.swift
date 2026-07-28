@@ -9,11 +9,32 @@ enum ProductIdentity {
 @main
 struct GMGNRadioApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @Environment(\.openSettings) private var openSettings
 
     var body: some Scene {
         MenuBarExtra(ProductIdentity.displayName, systemImage: "waveform.circle.fill") {
-            SettingsLink {
-                Text("桌宠设置…")
+            Button("桌宠设置…") {
+                SettingsMenuAction(
+                    openSettings: { openSettings() },
+                    scheduleActivation: { activation in
+                        Task { @MainActor in
+                            try? await Task.sleep(for: .milliseconds(120))
+                            activation()
+                        }
+                    },
+                    activateApplication: {
+                        NSApplication.shared.activate(ignoringOtherApps: true)
+                    },
+                    revealSettingsWindow: {
+                        guard let window = NSApplication.shared.windows.first(where: {
+                            $0.styleMask.contains(.titled)
+                        }) else {
+                            return
+                        }
+                        window.makeKeyAndOrderFront(nil)
+                        window.orderFrontRegardless()
+                    }
+                ).perform()
             }
             Button("Exit Immersive Visuals") {
                 (NSApplication.shared.delegate as? AppDelegate)?
@@ -30,6 +51,22 @@ struct GMGNRadioApp: App {
                 .frame(minWidth: 540, minHeight: 440)
         }
         .defaultSize(width: 580, height: 500)
+    }
+}
+
+@MainActor
+struct SettingsMenuAction {
+    let openSettings: () -> Void
+    let scheduleActivation: (@escaping @MainActor () -> Void) -> Void
+    let activateApplication: () -> Void
+    let revealSettingsWindow: () -> Void
+
+    func perform() {
+        openSettings()
+        scheduleActivation {
+            activateApplication()
+            revealSettingsWindow()
+        }
     }
 }
 
