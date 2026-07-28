@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gmgn.radio/contracts/dj-event.schema.json",
+  "title": "gmgn radio DJ event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "event_id",
+    "session_id",
+    "occurred_at",
+    "type",
+    "payload"
+  ],
+  "properties": {
+    "version": {
+      "const": "1"
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "type": {
+      "enum": [
+        "wake",
+        "sleep",
+        "user_speech_started",
+        "user_speech_finished",
+        "agent_thinking_started",
+        "agent_speech_started",
+        "agent_speech_finished",
+        "playback_started",
+        "playback_stopped",
+        "connection_lost",
+        "connection_restored",
+        "privacy_disabled",
+        "privacy_enabled",
+        "failure",
+        "recover"
+      ]
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "correlation_id": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}
+
