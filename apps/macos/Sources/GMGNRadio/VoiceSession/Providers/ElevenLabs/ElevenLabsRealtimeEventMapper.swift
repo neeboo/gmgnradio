@@ -28,6 +28,14 @@ struct ElevenLabsRealtimeEventMapper: Sendable {
             guard agentAudioActive else { return [] }
             agentAudioActive = false
             return [.agentAudioFinished]
+        case "audio.agent.level":
+            guard let rms = event.rms, let peak = event.peak else {
+                return []
+            }
+            return [.agentAudioLevel(RealtimeDJAudioLevel(
+                rms: rms,
+                peak: peak
+            ))]
         case "transcript.agent_final":
             return event.text.map { [.agentTranscriptFinal($0)] } ?? []
         case "conversation.interrupted":

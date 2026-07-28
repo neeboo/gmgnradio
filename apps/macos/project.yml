@@ -12,6 +12,9 @@ packages:
   ElevenLabs:
     url: https://github.com/elevenlabs/elevenlabs-swift-sdk.git
     exactVersion: 3.2.2
+  LiveKit:
+    url: https://github.com/livekit/client-sdk-swift.git
+    exactVersion: 2.15.3
 targets:
   GMGNRadio:
     type: application
@@ -20,6 +23,7 @@ targets:
       - Sources/GMGNRadio
     dependencies:
       - package: ElevenLabs
+      - package: LiveKit
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.gmgn.radio

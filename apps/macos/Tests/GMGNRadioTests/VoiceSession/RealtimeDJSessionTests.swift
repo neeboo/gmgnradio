@@ -64,3 +64,36 @@ func realtimeContextCarriesTheHostBriefWithoutProviderFields() {
     #expect(context.showPlanSummary.contains("克制"))
     #expect(context.immediateUserInstruction == "少说一点")
 }
+
+@Test
+func realtimeContextCarriesTrackFactsForTheNextHostBreak() {
+    let current = TrackReference(
+        id: "current",
+        title: "Blue Hour",
+        artist: "Example Artist"
+    )
+    let next = TrackReference(
+        id: "next",
+        title: "Night Drive",
+        artist: "Second Artist"
+    )
+    let hint = ProgramHostHint(
+        shouldTalkBefore: true,
+        maxSentenceCount: 1,
+        selectionReason: "符合深夜工作氛围",
+        currentTrack: current,
+        nextTrack: next,
+        facts: ["发行年份：2024", "风格：电子"],
+        transitionIntent: "保持相近能量，延续当前质感"
+    )
+
+    let context = RealtimeDJContext(
+        playback: PlaybackContext(currentTrack: current),
+        showPlanSummary: "深夜工作节目",
+        hostHint: hint
+    )
+
+    #expect(context.hostHint == hint)
+    #expect(context.hostHint?.nextTrack?.title == "Night Drive")
+    #expect(context.hostHint?.maxSentenceCount == 1)
+}

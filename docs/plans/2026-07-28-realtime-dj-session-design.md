@@ -74,6 +74,7 @@ RealtimeDJSession
 - `interruptAgent` 对应主动打断；
 - `onUnhandledClientToolCall` 与 `sendToolResult` 对应本地工具循环；
 - Agent 状态、用户/DJ 字幕、断线和错误回调归一化为共同事件；
+- 远端 LiveKit 音轨通过 `AudioRenderer` 输出统一 RMS 和峰值事件，供呼吸球、说话状态和后续压低音乐使用；
 - 官方 SDK 内部使用 LiveKit WebRTC，该实现细节留在 ElevenLabs 适配器中。
 
 ## 生命周期规则
@@ -87,4 +88,4 @@ RealtimeDJSession
 
 ## 第一阶段范围
 
-本阶段实现 Swift 合同、三家供应商的事件归一化、会话协调器与 ElevenLabs 官方 Swift SDK 适配器。真实凭证由服务端签发短期票据；百炼和豆包的网络适配继续按各自供应商任务推进。ElevenLabs 远端音轨接入自有 `AVAudioEngine` 仍需专项验收。
+本阶段实现 Swift 合同、三家供应商的事件归一化、会话协调器与 ElevenLabs 官方 Swift SDK 适配器。真实凭证由服务端签发短期票据；百炼和豆包的网络适配继续按各自供应商任务推进。ElevenLabs 继续使用 SDK 的低延迟播放链路，同时向 gmgn radio 输出远端语音电平；音乐与语音的完整共享混音在本地音频图任务中专项验收。

@@ -63,15 +63,18 @@ struct RealtimeDJSessionTicket: Codable, Equatable, Sendable {
 struct RealtimeDJContext: Codable, Equatable, Sendable {
     var playback: PlaybackContext
     var showPlanSummary: String
+    var hostHint: ProgramHostHint?
     var immediateUserInstruction: String?
 
     init(
         playback: PlaybackContext,
         showPlanSummary: String,
+        hostHint: ProgramHostHint? = nil,
         immediateUserInstruction: String? = nil
     ) {
         self.playback = playback
         self.showPlanSummary = showPlanSummary
+        self.hostHint = hostHint
         self.immediateUserInstruction = immediateUserInstruction
     }
 }
@@ -110,6 +113,8 @@ struct ProviderRealtimeEvent: Equatable, Sendable {
     let errorCode: String?
     let errorMessage: String?
     let recoverable: Bool?
+    let rms: Double?
+    let peak: Double?
 
     init(
         type: String,
@@ -119,7 +124,9 @@ struct ProviderRealtimeEvent: Equatable, Sendable {
         argumentsJSON: Data? = nil,
         errorCode: String? = nil,
         errorMessage: String? = nil,
-        recoverable: Bool? = nil
+        recoverable: Bool? = nil,
+        rms: Double? = nil,
+        peak: Double? = nil
     ) {
         self.type = type
         self.text = text
@@ -129,6 +136,18 @@ struct ProviderRealtimeEvent: Equatable, Sendable {
         self.errorCode = errorCode
         self.errorMessage = errorMessage
         self.recoverable = recoverable
+        self.rms = rms
+        self.peak = peak
+    }
+}
+
+struct RealtimeDJAudioLevel: Codable, Equatable, Sendable {
+    let rms: Double
+    let peak: Double
+
+    init(rms: Double, peak: Double) {
+        self.rms = min(1, max(0, rms))
+        self.peak = min(1, max(0, peak))
     }
 }
 
@@ -140,6 +159,7 @@ enum RealtimeDJEvent: Equatable, Sendable {
     case userTranscriptFinal(String)
     case agentResponseStarted
     case agentAudioStarted
+    case agentAudioLevel(RealtimeDJAudioLevel)
     case agentAudioFinished
     case agentTranscriptDelta(String)
     case agentTranscriptFinal(String)

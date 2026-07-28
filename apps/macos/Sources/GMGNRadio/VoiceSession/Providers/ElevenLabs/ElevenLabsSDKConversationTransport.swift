@@ -1,5 +1,6 @@
 import ElevenLabs
 import Foundation
+import LiveKit
 
 enum ElevenLabsSDKTransportError: Error {
     case notConnected
@@ -15,6 +16,15 @@ final class ElevenLabsSDKConversationTransport:
         AsyncStream<ProviderRealtimeEvent>.Continuation
 
     private var conversation: Conversation?
+    private var observedAudioTrack: RemoteAudioTrack?
+    private lazy var audioLevelRenderer = ElevenLabsAudioLevelRenderer {
+        [eventContinuation] level in
+        eventContinuation.yield(ProviderRealtimeEvent(
+            type: "audio.agent.level",
+            rms: level.rms,
+            peak: level.peak
+        ))
+    }
 
     init() {
         (events, eventContinuation) = AsyncStream.makeStream()
@@ -82,7 +92,7 @@ final class ElevenLabsSDKConversationTransport:
         )
 
         do {
-            conversation = try await ElevenLabs.startConversation(
+            let startedConversation = try await ElevenLabs.startConversation(
                 conversationToken: payload.conversationToken,
                 config: config,
                 onAgentReady: {
@@ -96,6 +106,11 @@ final class ElevenLabsSDKConversationTransport:
                     ))
                 }
             )
+            conversation = startedConversation
+            if let track = startedConversation.agentAudioTrack {
+                track.add(audioRenderer: audioLevelRenderer)
+                observedAudioTrack = track
+            }
         } catch {
             continuation.yield(ProviderRealtimeEvent(
                 type: "error",
@@ -148,6 +163,10 @@ final class ElevenLabsSDKConversationTransport:
     }
 
     func disconnect() async {
+        if let observedAudioTrack {
+            observedAudioTrack.remove(audioRenderer: audioLevelRenderer)
+            self.observedAudioTrack = nil
+        }
         await conversation?.endConversation()
         conversation = nil
     }
