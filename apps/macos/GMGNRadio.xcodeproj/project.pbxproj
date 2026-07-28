@@ -24,7 +24,6 @@
 		8F5213621CDE66174CBBDA8A /* ProgramDecision.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA8AFFDEBE45F4BC907FDDA1 /* ProgramDecision.swift */; };
 		936430A6AC4FF9D7B3D62C5C /* GMGNRadioApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39FC866C894AFC1D958539BF /* GMGNRadioApp.swift */; };
 		94A2BC7B04AA84C9A463CED6 /* Orb.metal in Sources */ = {isa = PBXBuildFile; fileRef = 4374B4687559AEDE957A3117 /* Orb.metal */; };
-		966720FCB35C2DA9CD0439C1 /* PresenceSettingsModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07A8377E0830ED4ED8D57DB6 /* PresenceSettingsModel.swift */; };
 		A51F42242E8A5663CE0BC305 /* ImmersiveSceneController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5CF6A9DCAC8752FE6AEFD4EC /* ImmersiveSceneController.swift */; };
 		A812DB23EA81DBB7D2B72B1D /* OrbMetalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F934C041C38E2FBEE9EFAEB7 /* OrbMetalView.swift */; };
 		AA95F2ACA1E99472A1547DB9 /* Immersive.metal in Sources */ = {isa = PBXBuildFile; fileRef = CE95E971E1A8C2085882DD3C /* Immersive.metal */; };
@@ -51,7 +50,6 @@
 
 /* Begin PBXFileReference section */
 		041392633B2943749B42CDCF /* ControlPanelRequestTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlPanelRequestTests.swift; sourceTree = "<group>"; };
-		07A8377E0830ED4ED8D57DB6 /* PresenceSettingsModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceSettingsModel.swift; sourceTree = "<group>"; };
 		07DE01676AC401339B9DCC2F /* OrbMotionModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbMotionModel.swift; sourceTree = "<group>"; };
 		20C65C2BD0FD2417BAFBD387 /* PresenceCommandService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceCommandService.swift; sourceTree = "<group>"; };
 		35E621D7E364E2B9BAFF1036 /* PresenceCommandServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceCommandServiceTests.swift; sourceTree = "<group>"; };
@@ -202,7 +200,6 @@
 				FE66A66ABC04BB440FFFD46A /* ControlPanelRequest.swift */,
 				F02A6D59D50F24D402CC3A91 /* ControlPanelView.swift */,
 				20C65C2BD0FD2417BAFBD387 /* PresenceCommandService.swift */,
-				07A8377E0830ED4ED8D57DB6 /* PresenceSettingsModel.swift */,
 			);
 			path = Settings;
 			sourceTree = "<group>";
@@ -378,7 +375,6 @@
 				EFD2489E256D52E3C94F0E23 /* PresenceCommandService.swift in Sources */,
 				4EC3D2F74514647D567B0C01 /* PresenceManifest.swift in Sources */,
 				B7E5C80664487C1D748EF6D4 /* PresencePackageStore.swift in Sources */,
-				966720FCB35C2DA9CD0439C1 /* PresenceSettingsModel.swift in Sources */,
 				8F5213621CDE66174CBBDA8A /* ProgramDecision.swift in Sources */,
 				330C60A11D6B3849DFAFCE65 /* WindowPlacement.swift in Sources */,
 			);
