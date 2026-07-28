@@ -14,6 +14,8 @@ struct OrbUniforms {
     float audioMid;
     float audioHigh;
     float transitionProgress;
+    float scale;
+    float listeningRing;
 };
 
 struct OrbVertexOut {
@@ -71,7 +73,8 @@ fragment float4 orbFragment(
     float breath = sin(uniforms.time * (0.72 + uniforms.energy * 0.8)) * 0.012;
     float contour = sin(angle * 5.0 + uniforms.time * 0.55) * 0.014;
     contour += sin(angle * 9.0 - uniforms.time * 0.36) * 0.007;
-    float sphereRadius = 0.68 + breath + contour * uniforms.deformation;
+    float sphereRadius = (0.68 + breath + contour * uniforms.deformation)
+        * uniforms.scale;
     float signedDistance = radius - sphereRadius;
 
     float body = 1.0 - smoothstep(-0.01, 0.025, signedDistance);
@@ -80,6 +83,9 @@ fragment float4 orbFragment(
     float outerGlow = exp(-max(signedDistance, 0.0) * 15.0)
         * smoothstep(0.20, -0.02, signedDistance)
         * uniforms.glow;
+    float listeningRing = exp(-abs(signedDistance - 0.09) * 80.0)
+        * uniforms.listeningRing
+        * (0.18 + 0.12 * sin(uniforms.time * 2.2));
 
     float2 flowPoint = point * 2.3;
     flowPoint += float2(uniforms.time * 0.045, -uniforms.time * 0.032);
@@ -99,10 +105,13 @@ fragment float4 orbFragment(
     float colorMix = smoothstep(-0.8, 0.8, point.x + flow * 0.3);
     float3 color = mix(cool, violet, colorMix);
     color += float3(0.34, 0.62, 0.92) * rim * uniforms.glow;
+    color += float3(0.20, 0.58, 0.82) * listeningRing;
     color += particles;
 
     float alpha = clamp(
-        (body * (0.62 + uniforms.energy * 0.18) + outerGlow * 0.28)
+        (body * (0.62 + uniforms.energy * 0.18)
+            + outerGlow * 0.28
+            + listeningRing * 0.22)
             * uniforms.opacity,
         0.0,
         1.0

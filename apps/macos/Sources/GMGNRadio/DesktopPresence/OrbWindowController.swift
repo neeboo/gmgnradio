@@ -13,17 +13,29 @@ final class OrbWindowController: NSWindowController, NSWindowDelegate {
 
     private let defaults: UserDefaults
     private let orbView: OrbMetalView
+    private let immersiveController: ImmersiveSceneController
     private var interactionTask: Task<Void, Never>?
 
-    init(defaults: UserDefaults = .standard) {
+    init(
+        defaults: UserDefaults = .standard,
+        audioFeatures: VisualAudioFeatureStore = VisualAudioFeatureStore()
+    ) {
         self.defaults = defaults
 
         let frame = Self.initialFrame(defaults: defaults)
-        let orbView = OrbMetalView(frame: CGRect(origin: .zero, size: Constants.size))
+        let orbView = OrbMetalView(
+            frame: CGRect(origin: .zero, size: Constants.size),
+            audioFeatures: audioFeatures
+        )
         orbView.autoresizingMask = [.width, .height]
         self.orbView = orbView
+        immersiveController = ImmersiveSceneController(audioFeatures: audioFeatures)
 
         let panel = OrbPanel(frame: frame, contentView: orbView)
+        if ProcessInfo.processInfo.environment["GMGN_BASELINE"] == "1" {
+            panel.backgroundColor = .black
+            panel.isOpaque = true
+        }
         super.init(window: panel)
         panel.delegate = self
         startInteractionTracking(panel: panel)
@@ -43,6 +55,17 @@ final class OrbWindowController: NSWindowController, NSWindowDelegate {
 
     func setState(_ state: DJState) {
         orbView.setState(state)
+    }
+
+    func enterImmersiveVisuals() {
+        guard let window else {
+            return
+        }
+        immersiveController.enter(from: window)
+    }
+
+    func exitImmersiveVisuals() {
+        immersiveController.exit()
     }
 
     func windowDidMove(_ notification: Notification) {

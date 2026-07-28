@@ -7,17 +7,21 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		0A24E45110C36FCF5E8A7012 /* OrbMotionModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07DE01676AC401339B9DCC2F /* OrbMotionModel.swift */; };
 		1F04322C71F0C43CD2AEA3B6 /* AppSmokeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC10161C41BE8EB05A51FC8D /* AppSmokeTests.swift */; };
 		2D4E0673D2067888218B2BF5 /* DJStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBB583E2AA3BD7F6DA17AED6 /* DJStateTests.swift */; };
 		330C60A11D6B3849DFAFCE65 /* WindowPlacement.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9BED59FEA722CB9CBF88096 /* WindowPlacement.swift */; };
 		35C3C8FFE3D1338719F0C54E /* OrbPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A5BF72176B81DD186790642 /* OrbPanel.swift */; };
 		4A028323AC8B8CC8BC49939F /* OrbUniformTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4C1A38CFE1FE5149D76CC08 /* OrbUniformTests.swift */; };
 		559086501216765204D4B06C /* DJState.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBAA0158B7BFF631FD685449 /* DJState.swift */; };
+		761481871644BCC5C68DF17C /* OrbMotionModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A9A0DF149EE2164BBDE40EB /* OrbMotionModelTests.swift */; };
 		7A17C5E01AC43CD75E7C7195 /* OrbState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43F2D91E87ABAC0F51F8C126 /* OrbState.swift */; };
 		8F5213621CDE66174CBBDA8A /* ProgramDecision.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA8AFFDEBE45F4BC907FDDA1 /* ProgramDecision.swift */; };
 		936430A6AC4FF9D7B3D62C5C /* GMGNRadioApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39FC866C894AFC1D958539BF /* GMGNRadioApp.swift */; };
 		94A2BC7B04AA84C9A463CED6 /* Orb.metal in Sources */ = {isa = PBXBuildFile; fileRef = 4374B4687559AEDE957A3117 /* Orb.metal */; };
+		A51F42242E8A5663CE0BC305 /* ImmersiveSceneController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5CF6A9DCAC8752FE6AEFD4EC /* ImmersiveSceneController.swift */; };
 		A812DB23EA81DBB7D2B72B1D /* OrbMetalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F934C041C38E2FBEE9EFAEB7 /* OrbMetalView.swift */; };
+		AA95F2ACA1E99472A1547DB9 /* Immersive.metal in Sources */ = {isa = PBXBuildFile; fileRef = CE95E971E1A8C2085882DD3C /* Immersive.metal */; };
 		D721C4D533DAA4D461CEF6D2 /* PlaybackContext.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2457A76CBF19C18E6D386EE /* PlaybackContext.swift */; };
 		E9D4C5A74FBBB188DEC917B3 /* OrbRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF9A4902E75F2E8D7081C852 /* OrbRenderer.swift */; };
 		F1EB3984A5FF0E2D1F44DC7B /* OrbUniforms.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47876636EF21649388CE59E3 /* OrbUniforms.swift */; };
@@ -36,12 +40,15 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		07DE01676AC401339B9DCC2F /* OrbMotionModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbMotionModel.swift; sourceTree = "<group>"; };
 		38784FBC97203965A192FDAC /* OrbWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbWindowController.swift; sourceTree = "<group>"; };
 		39FC866C894AFC1D958539BF /* GMGNRadioApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GMGNRadioApp.swift; sourceTree = "<group>"; };
 		4374B4687559AEDE957A3117 /* Orb.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Orb.metal; sourceTree = "<group>"; };
 		43F2D91E87ABAC0F51F8C126 /* OrbState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbState.swift; sourceTree = "<group>"; };
 		47876636EF21649388CE59E3 /* OrbUniforms.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbUniforms.swift; sourceTree = "<group>"; };
+		5CF6A9DCAC8752FE6AEFD4EC /* ImmersiveSceneController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImmersiveSceneController.swift; sourceTree = "<group>"; };
 		77166FE9E4995A36C34A2D90 /* GMGNRadioTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = GMGNRadioTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		8A9A0DF149EE2164BBDE40EB /* OrbMotionModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbMotionModelTests.swift; sourceTree = "<group>"; };
 		908F400DB2F1BAA7F52A31FB /* GMGNRadio.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = GMGNRadio.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		9968CE566BC39260555871B7 /* WindowPlacementTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowPlacementTests.swift; sourceTree = "<group>"; };
 		9A5BF72176B81DD186790642 /* OrbPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbPanel.swift; sourceTree = "<group>"; };
@@ -52,6 +59,7 @@
 		BBB583E2AA3BD7F6DA17AED6 /* DJStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DJStateTests.swift; sourceTree = "<group>"; };
 		BF9A4902E75F2E8D7081C852 /* OrbRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbRenderer.swift; sourceTree = "<group>"; };
 		C9BED59FEA722CB9CBF88096 /* WindowPlacement.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowPlacement.swift; sourceTree = "<group>"; };
+		CE95E971E1A8C2085882DD3C /* Immersive.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Immersive.metal; sourceTree = "<group>"; };
 		F2457A76CBF19C18E6D386EE /* PlaybackContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackContext.swift; sourceTree = "<group>"; };
 		F934C041C38E2FBEE9EFAEB7 /* OrbMetalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbMetalView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -80,6 +88,8 @@
 		1A0FDB0DF3340F453EE75B6C /* VisualEngine */ = {
 			isa = PBXGroup;
 			children = (
+				5CF6A9DCAC8752FE6AEFD4EC /* ImmersiveSceneController.swift */,
+				07DE01676AC401339B9DCC2F /* OrbMotionModel.swift */,
 				ACD0081809AE14CD18CA9B01 /* Metal */,
 				FADF1993EFF32F42FB011F72 /* Shaders */,
 			);
@@ -157,6 +167,7 @@
 		BBF952DA6DD9ACDCA0DD9C71 /* VisualEngine */ = {
 			isa = PBXGroup;
 			children = (
+				8A9A0DF149EE2164BBDE40EB /* OrbMotionModelTests.swift */,
 				A4C1A38CFE1FE5149D76CC08 /* OrbUniformTests.swift */,
 			);
 			path = VisualEngine;
@@ -174,6 +185,7 @@
 		FADF1993EFF32F42FB011F72 /* Shaders */ = {
 			isa = PBXGroup;
 			children = (
+				CE95E971E1A8C2085882DD3C /* Immersive.metal */,
 				4374B4687559AEDE957A3117 /* Orb.metal */,
 			);
 			path = Shaders;
@@ -261,6 +273,7 @@
 			files = (
 				1F04322C71F0C43CD2AEA3B6 /* AppSmokeTests.swift in Sources */,
 				2D4E0673D2067888218B2BF5 /* DJStateTests.swift in Sources */,
+				761481871644BCC5C68DF17C /* OrbMotionModelTests.swift in Sources */,
 				4A028323AC8B8CC8BC49939F /* OrbUniformTests.swift in Sources */,
 				F83BDCD045FC0F46E849868C /* WindowPlacementTests.swift in Sources */,
 			);
@@ -272,8 +285,11 @@
 			files = (
 				559086501216765204D4B06C /* DJState.swift in Sources */,
 				936430A6AC4FF9D7B3D62C5C /* GMGNRadioApp.swift in Sources */,
+				AA95F2ACA1E99472A1547DB9 /* Immersive.metal in Sources */,
+				A51F42242E8A5663CE0BC305 /* ImmersiveSceneController.swift in Sources */,
 				94A2BC7B04AA84C9A463CED6 /* Orb.metal in Sources */,
 				A812DB23EA81DBB7D2B72B1D /* OrbMetalView.swift in Sources */,
+				0A24E45110C36FCF5E8A7012 /* OrbMotionModel.swift in Sources */,
 				35C3C8FFE3D1338719F0C54E /* OrbPanel.swift in Sources */,
 				E9D4C5A74FBBB188DEC917B3 /* OrbRenderer.swift in Sources */,
 				7A17C5E01AC43CD75E7C7195 /* OrbState.swift in Sources */,

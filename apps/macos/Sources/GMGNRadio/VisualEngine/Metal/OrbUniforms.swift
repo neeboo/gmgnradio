@@ -11,6 +11,8 @@ struct OrbUniforms: Equatable, Sendable {
     var audioMid: Float
     var audioHigh: Float
     var transitionProgress: Float
+    var scale: Float
+    var listeningRing: Float
 
     static func forState(_ state: DJState) -> OrbUniforms {
         let parameters: (
@@ -53,7 +55,9 @@ struct OrbUniforms: Equatable, Sendable {
             audioLow: 0,
             audioMid: 0,
             audioHigh: 0,
-            transitionProgress: 1
+            transitionProgress: 1,
+            scale: 1,
+            listeningRing: 0
         )
     }
 
@@ -75,4 +79,3 @@ struct OrbUniforms: Equatable, Sendable {
         }
     }
 }
-

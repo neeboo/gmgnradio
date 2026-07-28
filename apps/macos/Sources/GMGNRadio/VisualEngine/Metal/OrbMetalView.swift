@@ -4,7 +4,10 @@
 final class OrbMetalView: MTKView {
     private var orbRenderer: OrbRenderer!
 
-    init(frame: CGRect) {
+    init(
+        frame: CGRect,
+        audioFeatures: VisualAudioFeatureStore = VisualAudioFeatureStore()
+    ) {
         guard let device = MTLCreateSystemDefaultDevice() else {
             preconditionFailure("gmgn radio requires a Metal-capable Apple Silicon Mac")
         }
@@ -23,7 +26,8 @@ final class OrbMetalView: MTKView {
         do {
             orbRenderer = try OrbRenderer(
                 device: device,
-                colorPixelFormat: colorPixelFormat
+                colorPixelFormat: colorPixelFormat,
+                audioFeatures: audioFeatures
             )
             orbRenderer.attach(to: self)
             orbRenderer.setState(.idle)

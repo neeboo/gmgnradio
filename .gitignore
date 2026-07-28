@@ -4,10 +4,10 @@
 !.env.example
 
 DerivedData/
+.derived-data/
 build/
 *.xcuserstate
 xcuserdata/
 
 .swiftpm/
 .build/
-

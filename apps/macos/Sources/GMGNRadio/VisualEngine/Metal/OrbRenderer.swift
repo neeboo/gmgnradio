@@ -10,12 +10,22 @@ enum OrbRendererError: Error {
 final class OrbRenderer: NSObject, MTKViewDelegate {
     private let commandQueue: MTLCommandQueue
     private let pipelineState: MTLRenderPipelineState
+    private let audioFeatures: VisualAudioFeatureStore
     private let clock = ContinuousClock()
     private let startedAt: ContinuousClock.Instant
     private var state: DJState = .idle
+    private var motionModel = OrbMotionModel(
+        initial: .idle,
+        seed: 0x474D474E,
+        time: 0
+    )
     private weak var view: MTKView?
 
-    init(device: MTLDevice, colorPixelFormat: MTLPixelFormat) throws {
+    init(
+        device: MTLDevice,
+        colorPixelFormat: MTLPixelFormat,
+        audioFeatures: VisualAudioFeatureStore
+    ) throws {
         guard let commandQueue = device.makeCommandQueue() else {
             throw OrbRendererError.missingCommandQueue
         }
@@ -43,6 +53,7 @@ final class OrbRenderer: NSObject, MTKViewDelegate {
         attachment?.destinationAlphaBlendFactor = .oneMinusSourceAlpha
 
         self.commandQueue = commandQueue
+        self.audioFeatures = audioFeatures
         pipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
         startedAt = clock.now
         super.init()
@@ -56,6 +67,11 @@ final class OrbRenderer: NSObject, MTKViewDelegate {
 
     func setState(_ state: DJState) {
         self.state = state
+        motionModel.transition(
+            to: state,
+            at: elapsedSeconds,
+            audio: audioFeatures.current
+        )
         updatePreferredFramesPerSecond()
     }
 
@@ -73,12 +89,25 @@ final class OrbRenderer: NSObject, MTKViewDelegate {
             return
         }
 
+        let time = elapsedSeconds
+        let motion = motionModel.frame(at: time, audio: audioFeatures.current)
         var uniforms = OrbUniforms.forState(state)
         uniforms.resolution = SIMD2<Float>(
             Float(view.drawableSize.width),
             Float(view.drawableSize.height)
         )
-        uniforms.time = elapsedSeconds
+        uniforms.time = time
+        uniforms.energy = motion.energy
+        uniforms.deformation = motion.deformation
+        uniforms.glow = motion.glow
+        uniforms.particleAmount = motion.particleAmount
+        uniforms.hue = motion.hue
+        uniforms.opacity = motion.opacity
+        uniforms.audioLow = audioFeatures.current.low
+        uniforms.audioMid = audioFeatures.current.mid
+        uniforms.audioHigh = audioFeatures.current.high
+        uniforms.scale = motion.scale
+        uniforms.listeningRing = motion.listeningRing
 
         encoder.label = "gmgn radio orb encoder"
         encoder.setRenderPipelineState(pipelineState)
