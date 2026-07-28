@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		02C8D4C3FC22A2E5246AE573 /* PresenceCommandServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35E621D7E364E2B9BAFF1036 /* PresenceCommandServiceTests.swift */; };
 		0A24E45110C36FCF5E8A7012 /* OrbMotionModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07DE01676AC401339B9DCC2F /* OrbMotionModel.swift */; };
+		1B17067E6E5406867B2F3E18 /* RealtimeDJSessionControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3559685E6AD36B0070B98424 /* RealtimeDJSessionControllerTests.swift */; };
 		1F04322C71F0C43CD2AEA3B6 /* AppSmokeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC10161C41BE8EB05A51FC8D /* AppSmokeTests.swift */; };
 		2D4E0673D2067888218B2BF5 /* DJStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBB583E2AA3BD7F6DA17AED6 /* DJStateTests.swift */; };
 		330C60A11D6B3849DFAFCE65 /* WindowPlacement.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9BED59FEA722CB9CBF88096 /* WindowPlacement.swift */; };
@@ -27,6 +28,7 @@
 		A51F42242E8A5663CE0BC305 /* ImmersiveSceneController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5CF6A9DCAC8752FE6AEFD4EC /* ImmersiveSceneController.swift */; };
 		A812DB23EA81DBB7D2B72B1D /* OrbMetalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F934C041C38E2FBEE9EFAEB7 /* OrbMetalView.swift */; };
 		AA95F2ACA1E99472A1547DB9 /* Immersive.metal in Sources */ = {isa = PBXBuildFile; fileRef = CE95E971E1A8C2085882DD3C /* Immersive.metal */; };
+		AD473CDA80FF3D2D2D266FC6 /* RealtimeDJSessionController.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB1A15690B115ECC57F64F9E /* RealtimeDJSessionController.swift */; };
 		B7E5C80664487C1D748EF6D4 /* PresencePackageStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4BC287B276AB0F4EDFACFE51 /* PresencePackageStore.swift */; };
 		B80D0EC6A0BCEBE17501EEC0 /* SettingsMenuActionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 344E89599D7920F3C43236A7 /* SettingsMenuActionTests.swift */; };
 		D721C4D533DAA4D461CEF6D2 /* PlaybackContext.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2457A76CBF19C18E6D386EE /* PlaybackContext.swift */; };
@@ -58,6 +60,7 @@
 		20C65C2BD0FD2417BAFBD387 /* PresenceCommandService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceCommandService.swift; sourceTree = "<group>"; };
 		216A6D94509E4915BCC18C7C /* RealtimeDJSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeDJSession.swift; sourceTree = "<group>"; };
 		344E89599D7920F3C43236A7 /* SettingsMenuActionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsMenuActionTests.swift; sourceTree = "<group>"; };
+		3559685E6AD36B0070B98424 /* RealtimeDJSessionControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeDJSessionControllerTests.swift; sourceTree = "<group>"; };
 		35E621D7E364E2B9BAFF1036 /* PresenceCommandServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceCommandServiceTests.swift; sourceTree = "<group>"; };
 		38784FBC97203965A192FDAC /* OrbWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbWindowController.swift; sourceTree = "<group>"; };
 		39FC866C894AFC1D958539BF /* GMGNRadioApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GMGNRadioApp.swift; sourceTree = "<group>"; };
@@ -88,6 +91,7 @@
 		E6928DE615B4CCBB86C03160 /* PresencePackageStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresencePackageStoreTests.swift; sourceTree = "<group>"; };
 		F2457A76CBF19C18E6D386EE /* PlaybackContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackContext.swift; sourceTree = "<group>"; };
 		F934C041C38E2FBEE9EFAEB7 /* OrbMetalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbMetalView.swift; sourceTree = "<group>"; };
+		FB1A15690B115ECC57F64F9E /* RealtimeDJSessionController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeDJSessionController.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -146,6 +150,7 @@
 			isa = PBXGroup;
 			children = (
 				216A6D94509E4915BCC18C7C /* RealtimeDJSession.swift */,
+				FB1A15690B115ECC57F64F9E /* RealtimeDJSessionController.swift */,
 				6C395170DC77EA0600E6DF35 /* Providers */,
 			);
 			path = VoiceSession;
@@ -244,6 +249,7 @@
 			isa = PBXGroup;
 			children = (
 				CA45B2F39C34F3F44A24A4FE /* ProviderEventMapperTests.swift */,
+				3559685E6AD36B0070B98424 /* RealtimeDJSessionControllerTests.swift */,
 				A303D7B9477D9BFF5F5544D2 /* RealtimeDJSessionTests.swift */,
 			);
 			path = VoiceSession;
@@ -389,6 +395,7 @@
 				02C8D4C3FC22A2E5246AE573 /* PresenceCommandServiceTests.swift in Sources */,
 				6457881F70FAC522542403A5 /* PresencePackageStoreTests.swift in Sources */,
 				F82CBCB8CD8F6D0BBEFC538F /* ProviderEventMapperTests.swift in Sources */,
+				1B17067E6E5406867B2F3E18 /* RealtimeDJSessionControllerTests.swift in Sources */,
 				F0690A251B2C15D06A0AE304 /* RealtimeDJSessionTests.swift in Sources */,
 				B80D0EC6A0BCEBE17501EEC0 /* SettingsMenuActionTests.swift in Sources */,
 				F83BDCD045FC0F46E849868C /* WindowPlacementTests.swift in Sources */,
@@ -421,6 +428,7 @@
 				F8928F63DF1AF0D26D9D258B /* PresenceSettingsView.swift in Sources */,
 				8F5213621CDE66174CBBDA8A /* ProgramDecision.swift in Sources */,
 				E1E72C29EB3D2A8256F43741 /* RealtimeDJSession.swift in Sources */,
+				AD473CDA80FF3D2D2D266FC6 /* RealtimeDJSessionController.swift in Sources */,
 				330C60A11D6B3849DFAFCE65 /* WindowPlacement.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
