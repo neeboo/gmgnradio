@@ -114,9 +114,9 @@ DJ 每次决策可以选择：
 - **AVAudioEngine + Core Audio：** 音乐播放、DJ 语音、混音、压低音乐、音频分析和输出设备管理。
 - **Swift Concurrency：** DJ 状态机、实时会话、搜索、队列与模型调用。
 - **SQLite：** 本地音乐索引、节目历史、用户偏好、人格配置和长期记忆。
-- **LiveKit Swift SDK + LiveKit Agents：** 实时音频传输、打断、会话管理和 Agent 运行时。
+- **RealtimeDJSession：** 统一实时 DJ 会话、打断、字幕、工具调用和连接状态；百炼与豆包各自保留供应商原生传输。
 - **OpenAI 兼容模型接口：** 通过服务端配置切换模型和端点，不把具体供应商写进客户端。
-- **ElevenLabs TTS：** 提供 DJ 的定制声线；DJ 自主性、工具和记忆仍由 gmgn radio 管理。
+- **供应商原生音色：** 第一阶段跟随百炼与豆包实时模型的音色能力，ElevenLabs 暂不接入。
 
 Rust、React、Tauri、TanStack 和 shadcn 不进入首版主程序。将来出现明确的本地推理、复杂 DSP 或跨客户端共享需求时，再抽取边界清楚的 Rust 模块。
 
@@ -142,8 +142,11 @@ GMGNApp
 ├── VoiceSession
 │   ├── WakeWord
 │   ├── MicrophoneCapture
-│   ├── LiveKitRoomClient
-│   └── RemoteAudioBridge
+│   ├── RealtimeDJSession
+│   ├── RealtimeDJSessionController
+│   └── Providers
+│       ├── Bailian
+│       └── Doubao
 ├── DJCore
 │   ├── DJStateMachine
 │   ├── IntentAndMood
@@ -175,7 +178,7 @@ DJCore 不直接依赖具体流媒体服务、模型供应商或视觉实现。�
     ↓
 语音内容 + 可选情绪特征 + 当前播放上下文
     ↓
-LiveKit Agents 调用 OpenAI 兼容模型
+RealtimeDJSession 调用当前供应商的端到端实时模型
     ↓
 DJCore 验证回应与节目决策
     ├── VoicePlayer 播放 DJ 语音
@@ -192,7 +195,7 @@ VisualEngine 按音频时间戳渲染呼吸球与 GFX
 
 音乐和 DJ 语音使用独立通道。DJ 开口时，音乐自动平滑压低；结束后按歌曲状态恢复。视觉系统读取带时间戳的分析结果，避免经过界面状态转发。
 
-LiveKit 只负责实时会话与音频传输。模型使用 OpenAI 兼容协议，ElevenLabs 只负责 DJ 声线。播放队列、工具执行、用户偏好、长期记忆和隐私状态以 macOS 客户端为权威，避免外部 Agent 平台控制核心产品行为。
+百炼适配器对接 DashScope 实时 WebSocket，豆包适配器对接 RTC 房间与 VoiceChat 控制面。两者统一输出连接、说话、字幕、工具调用和错误事件。播放队列、音乐混音、工具执行、用户偏好、长期记忆和隐私状态以 macOS 客户端为权威，供应商会话不控制核心产品行为。
 
 ## 7. 音乐来源
 

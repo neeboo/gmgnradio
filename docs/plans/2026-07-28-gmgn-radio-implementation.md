@@ -2,11 +2,11 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** 在 Apple Silicon 与 macOS 26 上完成 gmgn radio 的第一条原生纵向闭环：桌面呼吸球、Metal GFX、本地音乐、LiveKit 实时语音、OpenAI 兼容模型、ElevenLabs DJ 声线和自主节目决策。
+**Goal:** 在 Apple Silicon 与 macOS 26 上完成 gmgn radio 的第一条原生纵向闭环：桌面呼吸球、Metal GFX、本地音乐、可切换的百炼/豆包实时语音和自主节目决策。
 
-**Architecture:** macOS 客户端使用 Swift、AppKit、SwiftUI、Metal 与 AVAudioEngine。实时语音由 LiveKit Swift SDK 接入自有 LiveKit Agents 服务，服务端通过 OpenAI 兼容接口调用模型，并通过 ElevenLabs 生成 DJ 声音。DJ 的状态、工具合同和记忆归 gmgn radio 所有，模型、语音和音乐来源都放在可替换协议之后。
+**Architecture:** macOS 客户端使用 Swift、AppKit、SwiftUI、Metal 与 AVAudioEngine。实时语音通过 `RealtimeDJSession` 接入供应商原生会话：百炼使用 DashScope 实时 WebSocket，豆包使用 RTC 房间与 VoiceChat 控制面。DJ 的状态、工具合同、节目规划和记忆归 gmgn radio 所有。
 
-**Tech Stack:** macOS 26、Xcode 26.6、Swift 6.3、AppKit、SwiftUI、MetalKit、AVFAudio、Accelerate、MusicKit、SQLite3、LiveKit Swift SDK、LiveKit Agents Python、OpenAI 兼容 API、ElevenLabs TTS、Python 3.12、uv、XcodeGen。
+**Tech Stack:** macOS 26、Xcode 26.6、Swift 6.3、AppKit、SwiftUI、MetalKit、AVFAudio、Accelerate、MusicKit、SQLite3、DashScope Realtime WebSocket、豆包 RTC、XcodeGen。
 
 ---
 
@@ -16,10 +16,10 @@
 - 首版只支持 Apple Silicon 与 macOS 26。
 - 官网签名与公证分发优先，暂不以 Mac App Store 沙盒为设计前提。
 - 呼吸球、窗口、音频和 GFX 使用原生实现。
-- LiveKit 负责实时音频传输、打断、会话与 Agent 运行时。
-- 模型接口保持 OpenAI 兼容，通过服务端 `base_url`、`model` 和密钥配置切换。
-- ElevenLabs 只负责 DJ 声线与 TTS；DJ 自主性、工具、记忆和节目策略留在 gmgn radio。
-- OpenAI Realtime 保留为可选适配器；默认纵向闭环先使用 `STT / OpenAI-compatible LLM / ElevenLabs TTS` 流水线，方便控制 DJ 声线。
+- `RealtimeDJSession` 统一连接、打断、字幕、工具调用和麦克风控制，不强行统一供应商的底层传输。
+- 百炼与豆包的凭证、房间参数和服务端字段放在不透明的 `RealtimeDJSessionTicket` 中。
+- 音色先使用各供应商实时模型原生能力；ElevenLabs 等后续供应商按同一会话协议增加适配器。
+- DJ 自主性、工具、记忆和节目策略留在 gmgn radio。
 - 本地音乐是第一条高质量播放路径，能够提供精确 PCM、压低音乐和音画同步。
 - Apple Music 先做独立可行性验证。MusicKit 不提供受保护音频的 PCM，也没有公开的每应用音量控制合同；验证不通过时，不让它影响本地音乐的招牌体验。
 
@@ -461,7 +461,7 @@ git commit -m "feat: add orb motion and immersive transition"
 ```text
 LocalMusicPlayerNode ─┐
                      ├─ MusicMixer ─┐
-LiveKitRemoteNode ───┘              ├─ MainMixer ─ Output
+RealtimeDJVoiceNode ─┘              ├─ MainMixer ─ Output
                                     │
 Effects / limiter ──────────────────┘
 ```
@@ -572,7 +572,7 @@ git commit -m "feat: drive Metal visuals from audio features"
 **Step 3: 接入状态机**
 
 - 远端 DJ 音频开始：进入 `speaking` 并下压音乐；
-- 用户语音开始：停止远端语音、通知 LiveKit Agent 中断、切到 `listening`；
+- 用户语音开始：停止远端语音、通知当前 `RealtimeDJSession` 中断、切到 `listening`；
 - DJ 音频结束：根据当前节目状态恢复音乐。
 
 **Step 4: 提交**
@@ -585,194 +585,40 @@ git commit -m "feat: add sample-timed DJ ducking and interruption"
 
 ---
 
-### Task 9: 接入 LiveKit Swift SDK
+### Task 9: 建立供应商无关的实时 DJ 会话
 
-**Files:**
-- Modify: `apps/macos/project.yml`
-- Create: `apps/macos/Sources/GMGNRadio/VoiceSession/LiveKit/LiveKitRoomClient.swift`
-- Create: `apps/macos/Sources/GMGNRadio/VoiceSession/LiveKit/LiveKitTokenProvider.swift`
-- Create: `apps/macos/Sources/GMGNRadio/VoiceSession/LiveKit/RemoteAudioBridge.swift`
-- Create: `apps/macos/Tests/GMGNRadioTests/VoiceSession/LiveKitRoomClientTests.swift`
+以 `docs/plans/2026-07-28-realtime-dj-session-implementation.md` 为准，完成：
 
-**Step 1: 添加固定版本的 SPM 依赖**
-
-执行时查看 LiveKit Swift SDK 最新稳定版本，固定精确版本并提交 `Package.resolved`，不跟随 `main`。
-
-**Step 2: 写连接状态测试**
-
-使用假 TokenProvider 与假 RoomAdapter，测试：
-
-- 请求 token；
-- 连接；
-- 订阅 agent 音轨；
-- 断线重连；
-- token 失效；
-- 用户主动结束。
-
-**Step 3: 实现远端 PCM 桥接**
-
-使用 LiveKit `AudioManager` 的远端 AudioRenderer 获取 PCM。禁止让 WebRTC 音频直接绕过 gmgn radio 的混音图：
-
-```swift
-AudioManager.shared.add(remoteAudioRenderer: remoteAudioBridge)
-```
-
-`RemoteAudioBridge` 把固定格式 PCM 写入 `LiveKitRemoteNode`，同时提供语音活动事件给状态机。
-
-**Step 4: 手工验证**
-
-- 麦克风与远端音频均可选择设备；
-- 蓝牙耳机切换后恢复；
-- LiveKit 会话断开时本地音乐继续；
-- LiveKit 语音可以进入压低音乐与 GFX 分析路径。
-
-**Step 5: 提交**
-
-```bash
-git add apps/macos/project.yml apps/macos/Sources/GMGNRadio/VoiceSession \
-  apps/macos/Tests/GMGNRadioTests/VoiceSession apps/macos/Package.resolved
-git commit -m "feat: connect native client to LiveKit voice sessions"
-```
+- `RealtimeDJSession` 会话协议与供应商能力声明；
+- `RealtimeDJSessionTicket`，客户端只传递不透明凭证；
+- 百炼与豆包事件归一化；
+- `RealtimeDJSessionController`，负责切换会话并过滤旧连接的迟到事件；
+- 麦克风采集与上行发送分开控制。
 
 ---
 
-### Task 10: 建立 LiveKit Agents 服务
+### Task 10: 接入百炼实时会话
 
-**Files:**
-- Create: `services/agent/pyproject.toml`
-- Create: `services/agent/src/gmgn_agent/main.py`
-- Create: `services/agent/src/gmgn_agent/config.py`
-- Create: `services/agent/src/gmgn_agent/session.py`
-- Create: `services/agent/src/gmgn_agent/token_api.py`
-- Create: `services/agent/tests/test_config.py`
-- Create: `.env.example`
+百炼适配器沿用已验证的 DashScope 实时 WebSocket 语义：
 
-**Step 1: 初始化 Python 服务**
-
-Run:
-
-```bash
-cd services/agent
-uv init --package
-uv add "livekit-agents[openai,elevenlabs]" fastapi uvicorn pydantic-settings
-uv add --dev pytest pytest-asyncio
-```
-
-**Step 2: 写配置失败测试**
-
-```python
-def test_openai_compatible_endpoint_is_required(settings_factory):
-    settings = settings_factory(
-        llm_base_url="https://models.example.com/v1",
-        llm_model="dj-model",
-    )
-    assert settings.llm_base_url.endswith("/v1")
-    assert settings.llm_model == "dj-model"
-```
-
-配置字段：
-
-- `LIVEKIT_URL`
-- `LIVEKIT_API_KEY`
-- `LIVEKIT_API_SECRET`
-- `LLM_BASE_URL`
-- `LLM_API_KEY`
-- `LLM_MODEL`
-- `ELEVENLABS_API_KEY`
-- `ELEVENLABS_VOICE_ID`
-
-密钥不得下发到 macOS 客户端。
-
-**Step 3: 创建 AgentSession**
-
-默认使用：
-
-```python
-session = AgentSession(
-    llm=openai.LLM(
-        model=settings.llm_model,
-        base_url=settings.llm_base_url,
-        api_key=settings.llm_api_key,
-    ),
-    tts=elevenlabs.TTS(
-        voice_id=settings.elevenlabs_voice_id,
-    ),
-    # STT、VAD 与 turn detection 在下一步固定。
-)
-```
-
-ElevenLabs 模型名保持配置化，不使用已移除的 v1 TTS 模型，不使用已废弃的 `api-global-preview.elevenlabs.io`。
-
-**Step 4: 添加短期 LiveKit token 接口**
-
-FastAPI 只向已授权客户端签发短期房间 token。第一阶段允许本地开发身份，生产前必须替换成账号鉴权。
-
-**Step 5: 运行测试**
-
-```bash
-cd services/agent
-uv run pytest -q
-```
-
-Expected: 全部通过。
-
-**Step 6: 提交**
-
-```bash
-git add services/agent .env.example
-git commit -m "feat: add LiveKit agent service with configurable providers"
-```
+- 发送 `session.update` 与输入音频；
+- 使用服务端语音活动检测；
+- 映射用户/DJ 字幕、响应音频、工具调用和错误；
+- DJ 音频进入 gmgn radio 自己的混音、压低音乐和分析链路。
 
 ---
 
-### Task 11: 实现 OpenAI 兼容模型工具循环
+### Task 11: 接入豆包 RTC 会话与 DJ 工具循环
 
-**Files:**
-- Create: `services/agent/src/gmgn_agent/contracts.py`
-- Create: `services/agent/src/gmgn_agent/tools.py`
-- Create: `services/agent/src/gmgn_agent/prompts.py`
-- Create: `services/agent/tests/test_tools.py`
-- Modify: `contracts/dj-tools.schema.json`
+豆包适配器沿用已验证的 RTC 房间与 VoiceChat 控制面：
 
-**Step 1: 为每个工具写合同测试**
+- 创建 RTC 房间并调用 `StartVoiceChat`；
+- 使用 `UpdateVoiceChat` 更新节目上下文；
+- 通过 `Command=interrupt` 打断；
+- 归一化字幕、远端首帧、工具调用和连接错误；
+- 工具调用必须使用幂等键，本地播放、搜索、设置与记忆仍由 macOS 客户端执行。
 
-测试必须拒绝：
-
-- 未知工具；
-- 缺失必填参数；
-- 非法音量；
-- 无幂等键的播放修改；
-- 超过队列长度上限的替换请求。
-
-**Step 2: 实现客户端工具调用**
-
-服务端只决定工具名称与参数；本地播放、音乐搜索、设置和记忆写入由 macOS 客户端执行。工具结果按稳定 JSON 结构返回 AgentSession。
-
-**Step 3: 写 DJ 基础提示词**
-
-必须明确：
-
-- DJ 拥有自主性；
-- 用户设置表达偏好；
-- 深夜场景减少废话；
-- 不要逐条解释自己的决策；
-- 无需每次回应都调用工具；
-- 选歌失败时保留气氛并换候选；
-- 不把模型供应商、工具名或内部状态说给用户。
-
-**Step 4: 添加 OpenAI Realtime 可选适配器**
-
-建立 `VOICE_PIPELINE_MODE=pipeline|openai_realtime`。Realtime 模型名由服务端配置，不写死在客户端。Realtime 模式仍通过 LiveKit 连接，并复用相同工具合同。
-
-**Step 5: 运行测试并提交**
-
-```bash
-cd services/agent
-uv run pytest -q
-cd ../..
-git add services/agent contracts
-git commit -m "feat: add provider-neutral DJ tool loop"
-```
+两种供应商共用相同 DJ 基础提示词和工具合同，提示词必须明确 DJ 自主性、话多话少偏好、场景感知与串歌职责。
 
 ---
 
@@ -842,7 +688,7 @@ protocol WakeWordDetector: Sendable {
 
 **Step 3: 使用 SoundAnalysis/Core ML 实现本地检测**
 
-原始待机音频不离开设备。检测命中后才开启 LiveKit 会话。模型缺失或置信度过低时，快捷键必须始终可用。
+原始待机音频不离开设备。检测命中后才开启实时 DJ 会话。模型缺失或置信度过低时，快捷键必须始终可用。
 
 **Step 4: 验收**
 
@@ -1029,7 +875,7 @@ git commit -m "spike: evaluate Apple Music playback constraints"
 - 唤醒词与快捷键；
 - 默认输入输出设备；
 - 陪伴时段；
-- ElevenLabs 声线；
+- 实时语音供应商与该供应商可用的 DJ 音色；
 - 人格提示词；
 - 长期记忆查看与清除；
 - 语音情绪特征开关。
@@ -1064,9 +910,9 @@ git commit -m "feat: add native control center"
 
 覆盖：
 
-- LiveKit 断线；
-- ElevenLabs TTS 超时；
-- LLM 429/5xx；
+- 百炼实时 WebSocket 断线；
+- 豆包 RTC 或 VoiceChat 控制面断线；
+- 实时模型限流或服务端错误；
 - 本地文件消失；
 - 音频设备断开；
 - Metal drawable 暂时不可用；
@@ -1116,7 +962,7 @@ git commit -m "feat: add privacy-safe diagnostics and recovery"
 
 **Step 1: 建立本地运行入口**
 
-`scripts/run-local-stack.sh` 启动 LiveKit、Agent 服务和 token API，并打印 macOS 客户端所需的本地地址。脚本不得打印任何密钥。
+`scripts/run-local-stack.sh` 启动本地会话票据服务，并打印 macOS 客户端所需的本地地址。百炼与豆包密钥只留在服务端，脚本不得打印任何密钥。
 
 **Step 2: 建立自动验证**
 
@@ -1179,23 +1025,14 @@ git commit -m "test: add deep-night radio acceptance suite"
 
 ## 外部文档与版本检查
 
-- LiveKit Agents 支持通过 `base_url` 接入 OpenAI 兼容模型：  
-  https://docs.livekit.io/agents/models/llm/openai-compatible-llms/
-- LiveKit Swift SDK 支持 macOS，并能通过远端 AudioRenderer 获取 PCM：  
-  https://docs.livekit.io/reference/client-sdk-swift/documentation/livekit/audiomanager/
-- LiveKit 可以让 OpenAI Realtime 输出文本，再使用独立 TTS：  
-  https://docs.livekit.io/agents/models/realtime/plugins/openai/
-- ElevenLabs Swift SDK：  
-  https://elevenlabs.io/docs/agents-platform/libraries/swift
-- ElevenLabs 自定义 LLM 支持 Chat Completions 与 Responses 兼容结构：  
-  https://elevenlabs.io/docs/eleven-agents/customization/llm/custom-llm
-- ElevenLabs 已废弃 `api-global-preview.elevenlabs.io`，使用默认全球路由：  
-  https://elevenlabs.io/docs/changelog/2026/2/9
+- 百炼实时多模态模型与 DashScope WebSocket 协议；
+- 豆包 RTC SDK、VoiceChat 服务端接口与回调协议；
+- 各供应商当前可用音色、模型名、限流与计费规则；
 - MusicKit 授权与播放：  
   https://developer.apple.com/documentation/musickit
 
 ## 实施节奏
 
-按任务顺序执行，每个任务独立提交。Task 1–8 先完成离线视觉与本地音频长板；Task 9–15 接通实时 DJ；Task 16 作为 Apple Music 的独立闸门；Task 17–19 完成设置、恢复和验收。
+按任务顺序执行，每个任务独立提交。Task 1–8 先完成离线视觉与本地音频长板；Task 9–15 接通百炼与豆包实时 DJ；Task 16 作为 Apple Music 的独立闸门；Task 17–19 完成设置、恢复和验收。
 
 任何外部供应商的当前模型名、SDK 版本和价格都保持配置化。执行到对应任务时，先读取官方文档与 changelog，再固定版本并提交锁文件。
