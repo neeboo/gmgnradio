@@ -1,0 +1,407 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		1F04322C71F0C43CD2AEA3B6 /* AppSmokeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC10161C41BE8EB05A51FC8D /* AppSmokeTests.swift */; };
+		936430A6AC4FF9D7B3D62C5C /* GMGNRadioApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39FC866C894AFC1D958539BF /* GMGNRadioApp.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		964EBABEAE125C2B60AE7CC9 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 2EA5368F7E342CCC6B89784A /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 39C5E2FFAA896B112B1DD11E;
+			remoteInfo = GMGNRadio;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		39FC866C894AFC1D958539BF /* GMGNRadioApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GMGNRadioApp.swift; sourceTree = "<group>"; };
+		77166FE9E4995A36C34A2D90 /* GMGNRadioTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = GMGNRadioTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		908F400DB2F1BAA7F52A31FB /* GMGNRadio.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = GMGNRadio.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AC10161C41BE8EB05A51FC8D /* AppSmokeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSmokeTests.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		17C10A9A5615C80EB8EEC1E6 /* GMGNRadio */ = {
+			isa = PBXGroup;
+			children = (
+				997708EE7C8D6B44BBE853C1 /* App */,
+			);
+			name = GMGNRadio;
+			path = Sources/GMGNRadio;
+			sourceTree = "<group>";
+		};
+		71F07F2698B35D79C192ECA7 /* GMGNRadioTests */ = {
+			isa = PBXGroup;
+			children = (
+				AC10161C41BE8EB05A51FC8D /* AppSmokeTests.swift */,
+			);
+			name = GMGNRadioTests;
+			path = Tests/GMGNRadioTests;
+			sourceTree = "<group>";
+		};
+		98A0C8D4DB11177CABB1D8F7 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				908F400DB2F1BAA7F52A31FB /* GMGNRadio.app */,
+				77166FE9E4995A36C34A2D90 /* GMGNRadioTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		997708EE7C8D6B44BBE853C1 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				39FC866C894AFC1D958539BF /* GMGNRadioApp.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		D640DB89E934CAAF4C06A243 = {
+			isa = PBXGroup;
+			children = (
+				17C10A9A5615C80EB8EEC1E6 /* GMGNRadio */,
+				71F07F2698B35D79C192ECA7 /* GMGNRadioTests */,
+				98A0C8D4DB11177CABB1D8F7 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		39C5E2FFAA896B112B1DD11E /* GMGNRadio */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 76FAB07E3F06F0E105DE73E7 /* Build configuration list for PBXNativeTarget "GMGNRadio" */;
+			buildPhases = (
+				A810C423A20A4EE28465384F /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = GMGNRadio;
+			packageProductDependencies = (
+			);
+			productName = GMGNRadio;
+			productReference = 908F400DB2F1BAA7F52A31FB /* GMGNRadio.app */;
+			productType = "com.apple.product-type.application";
+		};
+		906231C66390D819AF8DAAB2 /* GMGNRadioTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 7BD11F20F8EB619FD4EFCD48 /* Build configuration list for PBXNativeTarget "GMGNRadioTests" */;
+			buildPhases = (
+				9838C952AD10F5703F7A274B /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				88DF3E153803F3D5DFC6725F /* PBXTargetDependency */,
+			);
+			name = GMGNRadioTests;
+			packageProductDependencies = (
+			);
+			productName = GMGNRadioTests;
+			productReference = 77166FE9E4995A36C34A2D90 /* GMGNRadioTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		2EA5368F7E342CCC6B89784A /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					39C5E2FFAA896B112B1DD11E = {
+						DevelopmentTeam = "";
+					};
+					906231C66390D819AF8DAAB2 = {
+						DevelopmentTeam = "";
+					};
+				};
+			};
+			buildConfigurationList = 69CDDE3DAA0F2F5768E69156 /* Build configuration list for PBXProject "GMGNRadio" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = D640DB89E934CAAF4C06A243;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 98A0C8D4DB11177CABB1D8F7 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				39C5E2FFAA896B112B1DD11E /* GMGNRadio */,
+				906231C66390D819AF8DAAB2 /* GMGNRadioTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		9838C952AD10F5703F7A274B /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				1F04322C71F0C43CD2AEA3B6 /* AppSmokeTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A810C423A20A4EE28465384F /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				936430A6AC4FF9D7B3D62C5C /* GMGNRadioApp.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		88DF3E153803F3D5DFC6725F /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 39C5E2FFAA896B112B1DD11E /* GMGNRadio */;
+			targetProxy = 964EBABEAE125C2B60AE7CC9 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		12A2C65297336A2F66A7865B /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = "";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		2437BD6FAA10FFA2688470FF /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGNING_ALLOWED = NO;
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				SDKROOT = macosx;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/gmgn radio.app/Contents/MacOS/gmgn radio";
+			};
+			name = Debug;
+		};
+		2CED80DB24BF0E0D6EA83957 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		EFADA15D99EEAE58FF7DAB2A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGN_ENTITLEMENTS = Resources/GMGNRadio.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				INFOPLIST_FILE = Resources/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = ai.gmgn.radio;
+				PRODUCT_MODULE_NAME = GMGNRadio;
+				PRODUCT_NAME = "gmgn radio";
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		F1FEC0F28BEBB359FE3D87B1 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGN_ENTITLEMENTS = Resources/GMGNRadio.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				INFOPLIST_FILE = Resources/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = ai.gmgn.radio;
+				PRODUCT_MODULE_NAME = GMGNRadio;
+				PRODUCT_NAME = "gmgn radio";
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		F55D1C49FD9D7896C203E161 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGNING_ALLOWED = NO;
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				SDKROOT = macosx;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/gmgn radio.app/Contents/MacOS/gmgn radio";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		69CDDE3DAA0F2F5768E69156 /* Build configuration list for PBXProject "GMGNRadio" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				2CED80DB24BF0E0D6EA83957 /* Debug */,
+				12A2C65297336A2F66A7865B /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		76FAB07E3F06F0E105DE73E7 /* Build configuration list for PBXNativeTarget "GMGNRadio" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				EFADA15D99EEAE58FF7DAB2A /* Debug */,
+				F1FEC0F28BEBB359FE3D87B1 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		7BD11F20F8EB619FD4EFCD48 /* Build configuration list for PBXNativeTarget "GMGNRadioTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				2437BD6FAA10FFA2688470FF /* Debug */,
+				F55D1C49FD9D7896C203E161 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 2EA5368F7E342CCC6B89784A /* Project object */;
+}

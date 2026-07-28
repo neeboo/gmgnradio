@@ -1,0 +1,48 @@
+name: GMGNRadio
+options:
+  deploymentTarget:
+    macOS: "26.0"
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+    DEVELOPMENT_TEAM: ""
+targets:
+  GMGNRadio:
+    type: application
+    platform: macOS
+    sources:
+      - Sources/GMGNRadio
+    resources:
+      - Resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.gmgn.radio
+        PRODUCT_MODULE_NAME: GMGNRadio
+        PRODUCT_NAME: gmgn radio
+        INFOPLIST_FILE: Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Resources/GMGNRadio.entitlements
+        CODE_SIGNING_ALLOWED: NO
+        ENABLE_HARDENED_RUNTIME: YES
+  GMGNRadioTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests/GMGNRadioTests
+    dependencies:
+      - target: GMGNRadio
+    settings:
+      base:
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        CODE_SIGNING_ALLOWED: NO
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/gmgn radio.app/Contents/MacOS/gmgn radio"
+schemes:
+  GMGNRadio:
+    build:
+      targets:
+        GMGNRadio: all
+        GMGNRadioTests: [test]
+    test:
+      targets:
+        - GMGNRadioTests
