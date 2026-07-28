@@ -129,12 +129,12 @@ struct OrbMotionModel: Sendable {
         case .idle:
             OrbMotionFrame(
                 energy: 0.18 + slowWave * 0.025,
-                deformation: 0.07 + slowWave * 0.012,
-                glow: 0.13 + slowWave * 0.018,
+                deformation: 0.10 + slowWave * 0.018,
+                glow: 0.23 + slowWave * 0.025,
                 particleAmount: 0.006,
                 hue: 0.64 + slowWave * 0.008,
-                opacity: 0.62,
-                scale: 0.98 + slowWave * 0.012,
+                opacity: 0.86,
+                scale: 1.0 + slowWave * 0.035,
                 listeningRing: 0
             )
         case .listening:

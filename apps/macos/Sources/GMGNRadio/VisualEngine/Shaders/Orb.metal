@@ -55,12 +55,6 @@ float orbNoise(float2 point) {
     return mix(mix(a, b, curve.x), mix(c, d, curve.x), curve.y);
 }
 
-float3 orbPalette(float hue, float brightness) {
-    float3 phase = float3(0.00, 0.33, 0.67);
-    float3 color = 0.5 + 0.5 * cos(6.28318 * (hue + phase));
-    return mix(float3(0.08, 0.11, 0.18), color, 0.42) * brightness;
-}
-
 fragment float4 orbFragment(
     OrbVertexOut input [[stage_in]],
     constant OrbUniforms &uniforms [[buffer(0)]]
@@ -70,7 +64,8 @@ fragment float4 orbFragment(
 
     float angle = atan2(point.y, point.x);
     float radius = length(point);
-    float breath = sin(uniforms.time * (0.72 + uniforms.energy * 0.8)) * 0.012;
+    float breath = sin(uniforms.time * (0.72 + uniforms.energy * 0.8))
+        * (0.018 + uniforms.energy * 0.008);
     float contour = sin(angle * 5.0 + uniforms.time * 0.55) * 0.014;
     contour += sin(angle * 9.0 - uniforms.time * 0.36) * 0.007;
     float sphereRadius = (0.68 + breath + contour * uniforms.deformation)
@@ -88,7 +83,7 @@ fragment float4 orbFragment(
         * (0.18 + 0.12 * sin(uniforms.time * 2.2));
 
     float2 flowPoint = point * 2.3;
-    flowPoint += float2(uniforms.time * 0.045, -uniforms.time * 0.032);
+    flowPoint += float2(uniforms.time * 0.10, -uniforms.time * 0.072);
     float flow = orbNoise(flowPoint)
         + 0.5 * orbNoise(flowPoint * 2.1 + 7.3)
         + 0.25 * orbNoise(flowPoint * 4.2 - 3.1);
@@ -99,18 +94,44 @@ fragment float4 orbFragment(
         * smoothstep(0.20, 0.0, abs(signedDistance))
         * uniforms.particleAmount;
 
-    float light = 0.32 + flow * 0.34 + rim * (0.25 + uniforms.energy * 0.34);
-    float3 cool = orbPalette(uniforms.hue, light);
-    float3 violet = orbPalette(uniforms.hue + 0.10, light * 0.86);
-    float colorMix = smoothstep(-0.8, 0.8, point.x + flow * 0.3);
-    float3 color = mix(cool, violet, colorMix);
-    color += float3(0.34, 0.62, 0.92) * rim * uniforms.glow;
-    color += float3(0.20, 0.58, 0.82) * listeningRing;
+    float normalizedRadius = radius / max(sphereRadius, 0.001);
+    float normalZ = sqrt(max(1.0 - normalizedRadius * normalizedRadius, 0.0));
+    float textureWave = 0.5 + 0.5 * sin(
+        flow * 10.0 + angle * 2.2 - uniforms.time * 0.55
+    );
+    float textureMask = smoothstep(
+        0.34,
+        0.76,
+        flow * 0.72 + textureWave * 0.28
+    );
+
+    float3 whiteBase = float3(0.96, 0.985, 1.0);
+    float3 iceBlue = float3(0.20, 0.66, 1.0);
+    float3 cobalt = float3(0.025, 0.16, 0.76);
+    float3 blueTexture = mix(iceBlue, cobalt, smoothstep(0.30, 0.82, flow));
+    float inkAmount = 0.18 + textureMask * (0.34 + uniforms.energy * 0.10);
+    float3 color = mix(whiteBase, blueTexture, inkAmount);
+
+    float sphereLight = 0.82 + normalZ * 0.24;
+    color *= sphereLight;
+    color = mix(color, float3(0.04, 0.38, 0.96), rim * 0.54);
+
+    float3 surfaceNormal = normalize(float3(
+        point / max(sphereRadius, 0.001),
+        normalZ
+    ));
+    float highlight = pow(
+        saturate(dot(surfaceNormal, normalize(float3(-0.38, 0.44, 0.82)))),
+        14.0
+    );
+    color += highlight * 0.26;
+    color += float3(0.10, 0.54, 1.0) * outerGlow * 0.38;
+    color += float3(0.08, 0.48, 1.0) * listeningRing;
     color += particles;
 
     float alpha = clamp(
-        (body * (0.62 + uniforms.energy * 0.18)
-            + outerGlow * 0.28
+        (body * (0.84 + uniforms.energy * 0.08)
+            + outerGlow * 0.34
             + listeningRing * 0.22)
             * uniforms.opacity,
         0.0,

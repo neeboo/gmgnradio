@@ -21,6 +21,36 @@ func sameSeedAndTimeProduceSameMotionFrame() {
     #expect(first == second)
 }
 
+@Test
+func idleBreathingHasVisibleScaleTravel() {
+    let frames = stride(from: Float(0), through: 12, by: 0.1).map {
+        OrbMotionModel.frame(
+            for: .idle,
+            time: $0,
+            seed: 42,
+            audio: .silent
+        )
+    }
+    let scales = frames.map(\.scale)
+
+    #expect((scales.max() ?? 0) - (scales.min() ?? 0) >= 0.06)
+}
+
+@Test
+func idleOrbKeepsReadablePresence() {
+    let frames = stride(from: Float(0), through: 12, by: 0.1).map {
+        OrbMotionModel.frame(
+            for: .idle,
+            time: $0,
+            seed: 42,
+            audio: .silent
+        )
+    }
+
+    #expect(frames.allSatisfy { $0.opacity >= 0.78 })
+    #expect(frames.allSatisfy { $0.glow >= 0.20 })
+}
+
 @Test(arguments: [
     (DJState.idle, Float(0.14), Float(0.24)),
     (DJState.listening, Float(0.64), Float(0.82)),
