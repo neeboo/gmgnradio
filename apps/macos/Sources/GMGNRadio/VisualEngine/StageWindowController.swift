@@ -7,18 +7,24 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     private let audioMonitor: (any VisualAudioMonitoring)?
     private let presentation: StagePresentationModel
     private let visualDirections: StageVisualDirectionStore
+    private let onTogglePlayback: @MainActor () -> Void
+    private var playbackState: LocalMusicPlaybackState
     private weak var stageContentView: StageContentView?
 
     init(
         audioFeatures: VisualAudioFeatureStore,
         audioMonitor: (any VisualAudioMonitoring)? = nil,
         presentation: StagePresentationModel = StagePresentationModel(),
-        visualDirections: StageVisualDirectionStore = StageVisualDirectionStore()
+        visualDirections: StageVisualDirectionStore = StageVisualDirectionStore(),
+        playbackState: LocalMusicPlaybackState = .idle,
+        onTogglePlayback: @escaping @MainActor () -> Void = {}
     ) {
         self.audioFeatures = audioFeatures
         self.audioMonitor = audioMonitor
         self.presentation = presentation
         self.visualDirections = visualDirections
+        self.playbackState = playbackState
+        self.onTogglePlayback = onTogglePlayback
         super.init(window: nil)
     }
 
@@ -28,6 +34,11 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
 
     var isPresented: Bool {
         window?.isVisible == true
+    }
+
+    func setPlaybackState(_ state: LocalMusicPlaybackState) {
+        playbackState = state
+        stageContentView?.setPlaybackState(state)
     }
 
     func show() {
@@ -103,6 +114,8 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
             audioFeatures: audioFeatures,
             presentation: presentation,
             visualDirections: visualDirections,
+            playbackState: playbackState,
+            onTogglePlayback: onTogglePlayback,
             onToggleWindowMode: { [weak window] in
                 window?.toggleFullScreen(nil)
             }
@@ -116,6 +129,7 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
 
 @MainActor
 private final class StageContentView: NSView {
+    private let playbackButton: StagePlaybackButton
     private let windowModeButton: StageWindowModeButton
 
     init(
@@ -123,8 +137,14 @@ private final class StageContentView: NSView {
         audioFeatures: VisualAudioFeatureStore,
         presentation: StagePresentationModel,
         visualDirections: StageVisualDirectionStore,
+        playbackState: LocalMusicPlaybackState,
+        onTogglePlayback: @escaping @MainActor () -> Void,
         onToggleWindowMode: @escaping @MainActor () -> Void
     ) {
+        playbackButton = StagePlaybackButton(
+            state: playbackState,
+            action: onTogglePlayback
+        )
         windowModeButton = StageWindowModeButton(
             mode: .windowed,
             action: onToggleWindowMode
@@ -154,7 +174,20 @@ private final class StageContentView: NSView {
         windowModeButton.translatesAutoresizingMaskIntoConstraints = false
         windowModeButton.layer?.zPosition = 20
         addSubview(windowModeButton)
+        playbackButton.translatesAutoresizingMaskIntoConstraints = false
+        playbackButton.layer?.zPosition = 20
+        addSubview(playbackButton)
         NSLayoutConstraint.activate([
+            playbackButton.trailingAnchor.constraint(
+                equalTo: windowModeButton.leadingAnchor,
+                constant: -12
+            ),
+            playbackButton.bottomAnchor.constraint(
+                equalTo: bottomAnchor,
+                constant: -22
+            ),
+            playbackButton.widthAnchor.constraint(equalToConstant: 48),
+            playbackButton.heightAnchor.constraint(equalToConstant: 48),
             windowModeButton.trailingAnchor.constraint(
                 equalTo: trailingAnchor,
                 constant: -22
@@ -175,12 +208,87 @@ private final class StageContentView: NSView {
     func setWindowMode(_ mode: StageWindowMode) {
         windowModeButton.setMode(mode)
     }
+
+    func setPlaybackState(_ state: LocalMusicPlaybackState) {
+        playbackButton.setState(state)
+    }
 }
 
 @MainActor
 private final class StageOverlayHostingView: NSHostingView<StageOverlayView> {
     override func hitTest(_ point: NSPoint) -> NSView? {
         nil
+    }
+}
+
+@MainActor
+private final class StagePlaybackButton: NSButton {
+    private let handler: @MainActor () -> Void
+
+    init(
+        state: LocalMusicPlaybackState,
+        action: @escaping @MainActor () -> Void
+    ) {
+        handler = action
+        super.init(frame: .zero)
+        identifier = NSUserInterfaceItemIdentifier("stage.playback-toggle")
+        target = self
+        self.action = #selector(performAction)
+        isBordered = false
+        imagePosition = .imageOnly
+        focusRingType = .none
+        contentTintColor = NSColor.white
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(
+            calibratedRed: 0.08,
+            green: 0.56,
+            blue: 1,
+            alpha: 0.9
+        ).cgColor
+        layer?.cornerRadius = 24
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor(
+            calibratedRed: 0.42,
+            green: 0.9,
+            blue: 1,
+            alpha: 0.72
+        ).cgColor
+        layer?.shadowColor = NSColor(
+            calibratedRed: 0.04,
+            green: 0.62,
+            blue: 1,
+            alpha: 0.9
+        ).cgColor
+        layer?.shadowOpacity = 1
+        layer?.shadowRadius = 16
+        layer?.shadowOffset = .zero
+        setState(state)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func setState(_ state: LocalMusicPlaybackState) {
+        let isPlaying = state == .playing
+        let label = isPlaying ? "暂停" : "播放"
+        let configuration = NSImage.SymbolConfiguration(
+            pointSize: 17,
+            weight: .bold
+        )
+        image = NSImage(
+            systemSymbolName: isPlaying ? "pause.fill" : "play.fill",
+            accessibilityDescription: label
+        )?.withSymbolConfiguration(configuration)
+        toolTip = label
+        setAccessibilityLabel(label)
+        isEnabled = state != .idle
+        alphaValue = isEnabled ? 1 : 0.44
+    }
+
+    @objc
+    private func performAction() {
+        handler()
     }
 }
 

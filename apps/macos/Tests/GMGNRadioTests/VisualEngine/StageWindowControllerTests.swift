@@ -67,6 +67,37 @@ func stageWindowControllerIncludesAWindowModeButton() {
     controller.close()
 }
 
+@Test
+@MainActor
+func stagePlaybackButtonControlsAndReflectsTheRealPlayerState() {
+    var toggleCount = 0
+    let controller = StageWindowController(
+        audioFeatures: VisualAudioFeatureStore(),
+        playbackState: .paused,
+        onTogglePlayback: { toggleCount += 1 }
+    )
+
+    controller.show()
+
+    let button = controller.window?.contentView?
+        .descendants
+        .compactMap { $0 as? NSButton }
+        .first { $0.identifier?.rawValue == "stage.playback-toggle" }
+    #expect(button?.toolTip == "播放")
+    #expect(button?.isEnabled == true)
+
+    controller.setPlaybackState(.playing)
+    #expect(button?.toolTip == "暂停")
+
+    button?.performClick(nil)
+    #expect(toggleCount == 1)
+
+    controller.setPlaybackState(.idle)
+    #expect(button?.isEnabled == false)
+
+    controller.close()
+}
+
 @MainActor
 private final class StageAudioMonitorSpy: VisualAudioMonitoring {
     private(set) var startCallCount = 0

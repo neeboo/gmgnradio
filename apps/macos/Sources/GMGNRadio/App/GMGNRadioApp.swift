@@ -273,9 +273,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         case .playing:
             localMusicPlayer.pause()
             orbWindowController?.setState(.idle)
+            stageWindowController?.setPlaybackState(.paused)
         case .ready, .paused, .finished:
-            try? localMusicPlayer.play()
-            orbWindowController?.setState(.playing)
+            do {
+                try localMusicPlayer.play()
+                orbWindowController?.setState(.playing)
+                stageWindowController?.setPlaybackState(.playing)
+            } catch {
+                presentPlaybackError(error)
+            }
         case .idle:
             break
         }
@@ -289,6 +295,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         try localMusicPlayer.load(url)
         try localMusicPlayer.play()
         orbWindowController?.setState(.playing)
+        stageWindowController?.setPlaybackState(.playing)
         showStage()
     }
 
@@ -312,6 +319,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         guard activeProgram != nil else {
             return
         }
+        stageWindowController?.setPlaybackState(.finished)
         Task { [weak self] in
             guard let self else {
                 return
@@ -326,6 +334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
                 else {
                     activeProgram = nil
                     orbWindowController?.setState(.idle)
+                    stageWindowController?.setPlaybackState(.idle)
                     return
                 }
                 try await playPreparedWithFallback(next)
@@ -461,7 +470,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
             audioFeatures: audioFeatures,
             audioMonitor: monitor,
             presentation: stagePresentation,
-            visualDirections: stageVisualDirections
+            visualDirections: stageVisualDirections,
+            playbackState: localMusicPlayer.state,
+            onTogglePlayback: { [weak self] in
+                self?.toggleLocalPlayback()
+            }
         )
 
         stagePresentationTask?.cancel()
