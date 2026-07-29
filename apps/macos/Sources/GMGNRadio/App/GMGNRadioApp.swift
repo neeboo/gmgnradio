@@ -14,12 +14,10 @@ struct GMGNRadioApp: App {
     var body: some Scene {
         MenuBarExtra(ProductIdentity.displayName, systemImage: "waveform.circle.fill") {
             Button("打开 360°舞台") {
-                (NSApplication.shared.delegate as? AppDelegate)?
-                    .showStage()
+                AppMenuAction.showStage.perform(on: appDelegate)
             }
             Button("关闭 360°舞台") {
-                (NSApplication.shared.delegate as? AppDelegate)?
-                    .closeStage()
+                AppMenuAction.closeStage.perform(on: appDelegate)
             }
             Divider()
             Button("桌宠设置…") {
@@ -46,8 +44,7 @@ struct GMGNRadioApp: App {
                 ).perform()
             }
             Button("退出桌面背景") {
-                (NSApplication.shared.delegate as? AppDelegate)?
-                    .exitImmersiveVisuals()
+                AppMenuAction.exitImmersiveVisuals.perform(on: appDelegate)
             }
             Divider()
             Button("Quit gmgn radio") {
@@ -60,6 +57,31 @@ struct GMGNRadioApp: App {
                 .frame(minWidth: 540, minHeight: 440)
         }
         .defaultSize(width: 580, height: 500)
+    }
+}
+
+@MainActor
+protocol GMGNApplicationControlling: AnyObject {
+    func showStage()
+    func closeStage()
+    func exitImmersiveVisuals()
+}
+
+enum AppMenuAction: Sendable {
+    case showStage
+    case closeStage
+    case exitImmersiveVisuals
+
+    @MainActor
+    func perform(on controller: any GMGNApplicationControlling) {
+        switch self {
+        case .showStage:
+            controller.showStage()
+        case .closeStage:
+            controller.closeStage()
+        case .exitImmersiveVisuals:
+            controller.exitImmersiveVisuals()
+        }
     }
 }
 
@@ -80,7 +102,7 @@ struct SettingsMenuAction {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControlling {
     private let audioFeatures = VisualAudioFeatureStore()
     private let stagePresentation = StagePresentationModel()
     private let realtimeDJSessionController = RealtimeDJSessionController()
