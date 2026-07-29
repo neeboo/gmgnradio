@@ -117,11 +117,14 @@ func acousticAnalysisReadsLocalAudioFilesThroughTheSamePipeline() throws {
     let analyzer = AcousticTrackAnalyzer()
     let direct = analyzer.analyze(samples: samples, sampleRate: sampleRate)
     let fromFile = try analyzer.analyze(audioAt: url)
+    let decodedFile = try AVAudioFile(forReading: url)
+    let decodedDuration = Double(decodedFile.length)
+        / decodedFile.processingFormat.sampleRate
 
     #expect(abs(fromFile.rms - direct.rms) < 0.001)
     #expect(abs(fromFile.peak - direct.peak) < 0.001)
     #expect(abs(fromFile.lowFrequencyRatio - direct.lowFrequencyRatio) < 0.01)
-    #expect(abs(fromFile.duration - 1) < 0.001)
+    #expect(abs(fromFile.duration - decodedDuration) < 0.001)
 }
 
 private func makeTone(
