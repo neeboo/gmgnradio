@@ -28,7 +28,7 @@ struct GMGNRadioApp: App {
                 AppMenuAction.closeStage.perform(on: appDelegate)
             }
             Divider()
-            Button("桌宠设置…") {
+            Button("设置…") {
                 SettingsMenuAction(
                     openSettings: { openSettings() },
                     scheduleActivation: { activation in
@@ -61,7 +61,7 @@ struct GMGNRadioApp: App {
         }
 
         Settings {
-            PresenceSettingsView()
+            GMGNSettingsView()
                 .frame(minWidth: 540, minHeight: 440)
         }
         .defaultSize(width: 580, height: 500)
@@ -123,6 +123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
     private let stagePresentation = StagePresentationModel()
     private let stageVisualDirections = StageVisualDirectionStore()
     private let realtimeDJSessionController = RealtimeDJSessionController()
+    private lazy var musicRuntime = MusicRuntime.live()
     private lazy var audioGraph = AudioGraphController(
         visualStore: audioFeatures
     )

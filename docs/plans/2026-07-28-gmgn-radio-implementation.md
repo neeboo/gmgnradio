@@ -772,6 +772,27 @@ git commit -m "feat: index and search local music"
 
 ---
 
+### Task 14A: 网易云、QQ 音乐与 Apple Music
+
+**Files:**
+- Create: `apps/macos/Sources/GMGNRadio/MusicSources/NeteaseMusicProviderClient.swift`
+- Create: `apps/macos/Sources/GMGNRadio/MusicSources/QQMusicProviderClient.swift`
+- Create: `apps/macos/Sources/GMGNRadio/MusicSources/AppleMusicSource.swift`
+- Create: `apps/macos/Sources/GMGNRadio/Settings/MusicAccountsView.swift`
+- Create: `docs/spikes/music-provider-playback.md`
+
+**要求：**
+
+- 网易云和 QQ 音乐使用用户自己的网页登录态；
+- Cookie 只保存在 macOS 钥匙串，客户端直接请求音乐服务；
+- 搜索、账号歌单和播放地址必须有固定响应测试；
+- Apple Music 使用 MusicKit 系统授权，不收集 Apple 凭证；
+- 各平台的会员、版权和地区限制原样生效；
+- 不复制第三方 GPL 实现，不使用私有 API；
+- Apple Music 无法进入自有 PCM 音频图时，只提供搜索与系统播放。
+
+---
+
 ### Task 15: DJ 自主节目规划与本地记忆
 
 **Files:**

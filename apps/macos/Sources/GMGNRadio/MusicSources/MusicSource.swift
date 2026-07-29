@@ -20,6 +20,7 @@ struct MusicProviderID:
     static let local = MusicProviderID(rawValue: "local")
     static let netease = MusicProviderID(rawValue: "netease")
     static let qqMusic = MusicProviderID(rawValue: "qq-music")
+    static let appleMusic = MusicProviderID(rawValue: "apple-music")
 }
 
 enum MusicSourceKind: String, Codable, Sendable {

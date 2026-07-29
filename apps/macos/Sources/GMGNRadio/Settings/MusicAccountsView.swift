@@ -1,0 +1,189 @@
+import SwiftUI
+
+struct MusicAccountsView: View {
+    @State private var model = MusicAccountsModel()
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+
+            Form {
+                Section("音乐服务") {
+                    MusicAccountRow(
+                        providerID: .netease,
+                        symbol: "music.note",
+                        tint: .red,
+                        model: model
+                    )
+                    MusicAccountRow(
+                        providerID: .qqMusic,
+                        symbol: "music.note.list",
+                        tint: .green,
+                        model: model
+                    )
+                    MusicAccountRow(
+                        providerID: .appleMusic,
+                        symbol: "apple.logo",
+                        tint: .pink,
+                        model: model
+                    )
+                }
+            }
+            .formStyle(.grouped)
+
+            if let message = model.message {
+                Label(
+                    message,
+                    systemImage: model.hasError
+                        ? "exclamationmark.circle.fill"
+                        : "checkmark.circle.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(model.hasError ? Color.red : Color.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 20)
+                .padding(.bottom, 14)
+            }
+        }
+        .task { await model.load() }
+        .sheet(
+            isPresented: Binding(
+                get: { model.editingProvider != nil },
+                set: {
+                    if !$0 {
+                        model.editingProvider = nil
+                        model.cookie = ""
+                    }
+                }
+            )
+        ) {
+            MusicCookieSheet(model: model)
+        }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("音乐")
+                .font(.title2.weight(.semibold))
+            Text("DJ 可以使用的账号")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 18)
+    }
+}
+
+private struct MusicAccountRow: View {
+    let providerID: MusicProviderID
+    let symbol: String
+    let tint: Color
+    @Bindable var model: MusicAccountsModel
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: symbol)
+                .font(.title3)
+                .foregroundStyle(tint)
+                .frame(width: 32, height: 32)
+                .background(tint.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(model.providerName(providerID))
+                    .fontWeight(.medium)
+                Text(statusText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            if state == .connected {
+                Button("断开") {
+                    Task { await model.disconnect(providerID) }
+                }
+                .buttonStyle(.borderless)
+            } else {
+                Button("连接") {
+                    if providerID == .appleMusic {
+                        Task { await model.authorizeAppleMusic() }
+                    } else {
+                        model.beginConnecting(providerID)
+                    }
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .padding(.vertical, 4)
+        .disabled(model.isWorking)
+    }
+
+    private var state: MusicAccountAuthorizationState {
+        model.state(for: providerID)
+    }
+
+    private var statusText: String {
+        switch state {
+        case .connected:
+            "已连接"
+        case .authorizing:
+            "正在连接"
+        case .expired:
+            "登录已过期"
+        case .denied:
+            "未授权"
+        case .unavailable:
+            "当前不可用"
+        case .disconnected:
+            "未连接"
+        }
+    }
+}
+
+private struct MusicCookieSheet: View {
+    @Bindable var model: MusicAccountsModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("连接 \(providerName)")
+                    .font(.title2.weight(.semibold))
+                Text("粘贴已登录网页的 Cookie，只保存在本机钥匙串。")
+                    .foregroundStyle(.secondary)
+            }
+
+            SecureField("Cookie", text: $model.cookie)
+                .textFieldStyle(.roundedBorder)
+
+            if let message = model.message, model.hasError {
+                Label(message, systemImage: "exclamationmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+
+            HStack {
+                Spacer()
+                Button("取消") {
+                    model.editingProvider = nil
+                    model.cookie = ""
+                }
+                .keyboardShortcut(.cancelAction)
+                Button("连接") {
+                    Task { await model.connect() }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(model.cookie.isEmpty || model.isWorking)
+            }
+        }
+        .padding(24)
+        .frame(width: 440)
+    }
+
+    private var providerName: String {
+        guard let provider = model.editingProvider else {
+            return "音乐服务"
+        }
+        return model.providerName(provider)
+    }
+}

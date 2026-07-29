@@ -26,6 +26,7 @@
     <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>gmgn radio uses the microphone so you can talk with your DJ.</string>
+    <key>NSAppleMusicUsageDescription</key>
+    <string>gmgn radio uses your Apple Music account to search and play music for your DJ program.</string>
 </dict>
 </plist>
-

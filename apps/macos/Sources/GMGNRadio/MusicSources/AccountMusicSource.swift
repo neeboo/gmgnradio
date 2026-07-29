@@ -35,6 +35,20 @@ protocol AccountMusicProviderClient: Sendable {
     func fetchUserLibrary(
         session: MusicProviderSession
     ) async throws -> MusicProviderLibrary
+
+    func playbackAsset(
+        for trackID: String,
+        session: MusicProviderSession
+    ) async throws -> MusicPlaybackAsset
+}
+
+extension AccountMusicProviderClient {
+    func playbackAsset(
+        for trackID: String,
+        session: MusicProviderSession
+    ) async throws -> MusicPlaybackAsset {
+        throw MusicProviderClientError.playbackUnavailable
+    }
 }
 
 enum MusicSourceError: Error, Equatable {
@@ -107,6 +121,18 @@ struct AccountMusicSource: MusicSource {
         )
     }
 
+    func playbackAsset(for trackID: String) async throws -> MusicPlaybackAsset {
+        let session = try await connectedSession()
+        let capabilities = try await client.capabilities(session: session)
+        guard capabilities.canPlay else {
+            throw MusicSourceError.capabilityUnavailable(id)
+        }
+        return try await client.playbackAsset(
+            for: rawTrackID(trackID),
+            session: session
+        )
+    }
+
     private func connectedSession() async throws -> MusicProviderSession {
         guard let session = try await sessions.session(for: id) else {
             throw MusicSourceError.authenticationRequired(id)
@@ -141,6 +167,14 @@ struct AccountMusicSource: MusicSource {
 
     private func namespacedTrackID(_ trackID: String) -> String {
         "\(id.rawValue):\(trackID)"
+    }
+
+    private func rawTrackID(_ trackID: String) -> String {
+        let prefix = "\(id.rawValue):"
+        guard trackID.hasPrefix(prefix) else {
+            return trackID
+        }
+        return String(trackID.dropFirst(prefix.count))
     }
 
     private func namespacedPlaylistID(_ playlistID: String) -> String {
@@ -178,6 +212,10 @@ struct NeteaseMusicSource: MusicSource {
     func fetchUserLibrary() async throws -> MusicLibrarySnapshot {
         try await source.fetchUserLibrary()
     }
+
+    func playbackAsset(for trackID: String) async throws -> MusicPlaybackAsset {
+        try await source.playbackAsset(for: trackID)
+    }
 }
 
 struct QQMusicSource: MusicSource {
@@ -209,5 +247,9 @@ struct QQMusicSource: MusicSource {
 
     func fetchUserLibrary() async throws -> MusicLibrarySnapshot {
         try await source.fetchUserLibrary()
+    }
+
+    func playbackAsset(for trackID: String) async throws -> MusicPlaybackAsset {
+        try await source.playbackAsset(for: trackID)
     }
 }
