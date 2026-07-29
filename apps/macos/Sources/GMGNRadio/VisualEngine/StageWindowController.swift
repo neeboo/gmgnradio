@@ -83,7 +83,12 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         window.title = "gmgn radio — 360°舞台"
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
-        window.backgroundColor = .white
+        window.backgroundColor = NSColor(
+            calibratedRed: 0.004,
+            green: 0.008,
+            blue: 0.025,
+            alpha: 1
+        )
         window.isOpaque = true
         window.hasShadow = true
         window.minSize = CGSize(width: 760, height: 520)
@@ -190,26 +195,31 @@ private final class StageWindowModeButton: NSButton {
         imagePosition = .imageOnly
         focusRingType = .none
         contentTintColor = NSColor(
-            calibratedRed: 0.02,
-            green: 0.18,
-            blue: 0.55,
+            calibratedRed: 0.25,
+            green: 0.88,
+            blue: 1,
             alpha: 1
         )
         wantsLayer = true
-        layer?.backgroundColor = NSColor.white.withAlphaComponent(0.78).cgColor
+        layer?.backgroundColor = NSColor(
+            calibratedRed: 0.015,
+            green: 0.035,
+            blue: 0.09,
+            alpha: 0.82
+        ).cgColor
         layer?.cornerRadius = 21
         layer?.borderWidth = 1
         layer?.borderColor = NSColor(
             calibratedRed: 0.18,
-            green: 0.44,
-            blue: 0.92,
-            alpha: 0.18
+            green: 0.82,
+            blue: 1,
+            alpha: 0.48
         ).cgColor
         layer?.shadowColor = NSColor(
-            calibratedRed: 0.05,
-            green: 0.24,
-            blue: 0.60,
-            alpha: 0.24
+            calibratedRed: 0.08,
+            green: 0.68,
+            blue: 1,
+            alpha: 0.58
         ).cgColor
         layer?.shadowOpacity = 1
         layer?.shadowRadius = 12

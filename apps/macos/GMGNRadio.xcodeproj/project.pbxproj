@@ -42,6 +42,7 @@
 		80AC6AC25FAE9E0FBCB11CDF /* AccountMusicSourceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF6190681ED5961F6C2903FE /* AccountMusicSourceTests.swift */; };
 		8573E115B6C4C7AB8C10C1B8 /* ElevenLabsSDKConversationTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0F3CB58D63948E17D4EC76C /* ElevenLabsSDKConversationTransport.swift */; };
 		8F5213621CDE66174CBBDA8A /* ProgramDecision.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA8AFFDEBE45F4BC907FDDA1 /* ProgramDecision.swift */; };
+		9246DE3D369383B977C7D339 /* StageVisualThemeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F06D6E7A72CE08FB6377C539 /* StageVisualThemeTests.swift */; };
 		936430A6AC4FF9D7B3D62C5C /* GMGNRadioApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39FC866C894AFC1D958539BF /* GMGNRadioApp.swift */; };
 		94A2BC7B04AA84C9A463CED6 /* Orb.metal in Sources */ = {isa = PBXBuildFile; fileRef = 4374B4687559AEDE957A3117 /* Orb.metal */; };
 		966720FCB35C2DA9CD0439C1 /* PresenceSettingsModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07A8377E0830ED4ED8D57DB6 /* PresenceSettingsModel.swift */; };
@@ -159,6 +160,7 @@
 		E13F2FD5A9D73C17F8A9C25F /* Stage.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Stage.metal; sourceTree = "<group>"; };
 		E442A4484F6338F0288177A4 /* ElevenLabsRealtimeSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElevenLabsRealtimeSessionTests.swift; sourceTree = "<group>"; };
 		E6928DE615B4CCBB86C03160 /* PresencePackageStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresencePackageStoreTests.swift; sourceTree = "<group>"; };
+		F06D6E7A72CE08FB6377C539 /* StageVisualThemeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageVisualThemeTests.swift; sourceTree = "<group>"; };
 		F2457A76CBF19C18E6D386EE /* PlaybackContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackContext.swift; sourceTree = "<group>"; };
 		F64257C748D0B7218B3CCDD1 /* StageParticleGeometryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageParticleGeometryTests.swift; sourceTree = "<group>"; };
 		F934C041C38E2FBEE9EFAEB7 /* OrbMetalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbMetalView.swift; sourceTree = "<group>"; };
@@ -433,6 +435,7 @@
 				BDCE4DF69A7F8E8FCB4244B2 /* StagePresentationModelTests.swift */,
 				85D5EE9963FDAFB9A0BEE96B /* StageUniformTests.swift */,
 				DF02DF3CF91DB9608D098557 /* StageVisualPresetTimelineTests.swift */,
+				F06D6E7A72CE08FB6377C539 /* StageVisualThemeTests.swift */,
 				2D6999758740371B4CC8758D /* StageWindowControllerTests.swift */,
 				1C0EE40A2A02D7B94512CC74 /* StageWindowModeTests.swift */,
 				4754EBB9C64ED51C00FF0F3C /* VisualAudioFeatureExtractorTests.swift */,
@@ -573,6 +576,7 @@
 				E81E054C1A88065C8B12E130 /* StagePresentationModelTests.swift in Sources */,
 				9820DEC74A14B5BA053ED40C /* StageUniformTests.swift in Sources */,
 				4F2F0BE39D8B500EFF5DED27 /* StageVisualPresetTimelineTests.swift in Sources */,
+				9246DE3D369383B977C7D339 /* StageVisualThemeTests.swift in Sources */,
 				E52D5016BAD977B057280529 /* StageWindowControllerTests.swift in Sources */,
 				5D57161677518A9A39EAB58C /* StageWindowModeTests.swift in Sources */,
 				343C7C4B77A94C27491DD866 /* UnifiedMusicSearchTests.swift in Sources */,

@@ -16,7 +16,7 @@ final class MetalStageView: MTKView {
         super.init(frame: frame, device: device)
         colorPixelFormat = .bgra8Unorm_srgb
         depthStencilPixelFormat = .depth32Float
-        clearColor = MTLClearColorMake(0.96, 0.98, 1.0, 1)
+        clearColor = MTLClearColorMake(0.004, 0.008, 0.025, 1)
         clearDepth = 1
         framebufferOnly = true
         enableSetNeedsDisplay = false
