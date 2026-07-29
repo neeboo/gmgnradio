@@ -60,3 +60,52 @@ func transitionTimingKeepsPeaksResponsiveAndProgramEdgesGentle() {
     #expect(cooldown.transitionDuration > build.transitionDuration)
     #expect(closer.transitionDuration > cooldown.transitionDuration)
 }
+
+@Test
+func agentVisualLanguageOverridesTheRoleAndDrivesIntensity() {
+    let track = MusicCandidate(
+        id: "track",
+        canonicalID: nil,
+        providerID: .netease,
+        source: .streaming,
+        title: "Track",
+        artist: "Artist",
+        album: nil,
+        duration: 240,
+        isPlayable: true,
+        matchScore: 1,
+        userAffinity: 1,
+        energy: 0.5,
+        moodTags: [],
+        genres: [],
+        releaseYear: nil
+    )
+    let slot = ProgramSlot(
+        track: track,
+        role: .opener,
+        hostHint: ProgramHostHint(
+            shouldTalkBefore: true,
+            maxSentenceCount: 1,
+            selectionReason: "测试",
+            currentTrack: TrackReference(
+                id: track.id,
+                title: track.title,
+                artist: track.artist
+            ),
+            nextTrack: nil,
+            facts: [],
+            transitionIntent: nil
+        ),
+        visualDirection: AgentVisualDirection(
+            mood: "高能霓虹脉冲",
+            palette: "蓝紫",
+            motion: "快速扩散",
+            intensity: 0.7
+        )
+    )
+
+    let cue = ProgramVisualDirector().cue(for: slot)
+
+    #expect(cue.mood == .pulse)
+    #expect(cue.intensity == 0.7)
+}

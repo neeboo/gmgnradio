@@ -12,7 +12,8 @@ struct StageUniforms: Sendable {
         audio: VisualAudioFeatures,
         time: Float,
         viewport: SIMD2<Float>,
-        presetWeights: SIMD3<Float>
+        presetWeights: SIMD3<Float>,
+        visualIntensity: Float = 1
     ) -> StageUniforms {
         let width = max(viewport.x, 1)
         let height = max(viewport.y, 1)
@@ -53,7 +54,7 @@ struct StageUniforms: Sendable {
                 presetWeights.x,
                 presetWeights.y,
                 presetWeights.z,
-                1
+                clamp(visualIntensity)
             )
         )
     }

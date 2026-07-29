@@ -67,11 +67,12 @@ fragment float4 stageBackgroundFragment(
     float mid = uniforms.timeAndAudio.z;
     float high = uniforms.timeAndAudio.w;
     float3 preset = uniforms.visualPreset.xyz;
+    float intensity = uniforms.visualPreset.w;
     float2 centered = uv - 0.5;
     centered.x *= aspect;
 
-    float liquidAmount = preset.y * (0.008 + mid * 0.013);
-    float pulseAmount = preset.z * (0.004 + low * 0.010);
+    float liquidAmount = preset.y * (0.008 + mid * 0.013) * intensity;
+    float pulseAmount = preset.z * (0.004 + low * 0.010) * intensity;
     centered += float2(
         sin(centered.y * 13.0 + uniforms.timeAndAudio.x * 0.38),
         cos(centered.x * 11.0 - uniforms.timeAndAudio.x * 0.31)
@@ -221,10 +222,12 @@ vertex StageParticleOut stageParticleVertex(
     float mid = uniforms.timeAndAudio.z;
     float high = uniforms.timeAndAudio.w;
     float3 preset = uniforms.visualPreset.xyz;
+    float intensity = uniforms.visualPreset.w;
 
     float radius = max(length(position), 0.001);
     float3 direction = position / radius;
-    float motion = dot(preset, float3(0.88, 1.18, 1.02));
+    float motion = dot(preset, float3(0.88, 1.18, 1.02))
+        * mix(0.72, 1.18, intensity);
     float breathing = sin(time * 1.25 + phase)
         * (0.018 + low * 0.052)
         * motion;
@@ -238,7 +241,7 @@ vertex StageParticleOut stageParticleVertex(
     float perspective = clamp(8.5 / max(clipPosition.w, 0.6), 0.55, 2.4);
     float pointSize = particle.positionAndSize.w
         * perspective
-        * (2.55 + high * 1.05)
+        * (2.25 + intensity * 0.55 + high * 1.05)
         * dot(preset, float3(1.0, 0.92, 1.12));
 
     StageParticleOut output;

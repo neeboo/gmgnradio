@@ -143,7 +143,8 @@ final class StageRenderer: NSObject, MTKViewDelegate {
                 Float(view.drawableSize.width),
                 Float(view.drawableSize.height)
             ),
-            presetWeights: presetWeights
+            presetWeights: presetWeights,
+            visualIntensity: visualDirections.currentIntensity
         )
 
         encoder.label = "gmgn radio 360 stage"
@@ -240,8 +241,11 @@ final class StageRenderer: NSObject, MTKViewDelegate {
             return displayedPresetWeights
         }
 
+        let requestedTransitionDuration = Float(
+            max(visualDirections.transitionDuration, 0.05)
+        )
         let linearProgress = min(
-            max((time - transitionStartedAt) / 2.4, 0),
+            max((time - transitionStartedAt) / requestedTransitionDuration, 0),
             1
         )
         let smoothProgress = linearProgress * linearProgress

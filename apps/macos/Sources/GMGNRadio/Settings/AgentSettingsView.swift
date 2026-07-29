@@ -121,6 +121,16 @@ struct AgentSettingsView: View {
                 let duration = plan.slots.reduce(0) {
                     $0 + $1.track.duration
                 }
+                if let title = plan.title {
+                    Text(title)
+                        .font(.headline)
+                }
+                if let direction = plan.direction {
+                    Text(direction)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
                 Text(
                     "\(plan.slots.count) 首 · 约 \(max(1, Int(duration / 60))) 分钟"
                 )
@@ -132,8 +142,12 @@ struct AgentSettingsView: View {
                     id: \.element.track.id
                 ) { index, slot in
                     HStack(spacing: 10) {
-                        Text(String(format: "%02d", index + 1))
-                            .font(.caption.monospacedDigit())
+                        Image(
+                            systemName: programStore.activeSlotIndex == index
+                                ? "play.fill"
+                                : "\(index + 1).circle"
+                        )
+                            .font(.caption)
                             .foregroundStyle(.tertiary)
                             .frame(width: 22, alignment: .leading)
                         Text(slot.track.title)

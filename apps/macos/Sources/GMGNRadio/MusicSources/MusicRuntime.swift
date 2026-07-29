@@ -11,17 +11,23 @@ final class MusicRuntime {
     private let qqMusic: QQMusicSource
     private let appleMusic: AppleMusicSource
     private let cache: any MusicAssetCaching
+    private let libraryIndex: any MusicLibraryIndexing
+    private let candidatePoolBuilder: CandidatePoolBuilder
 
     init(
         netease: NeteaseMusicSource,
         qqMusic: QQMusicSource,
         appleMusic: AppleMusicSource,
-        cache: any MusicAssetCaching
+        cache: any MusicAssetCaching,
+        libraryIndex: any MusicLibraryIndexing = InMemoryMusicLibraryIndex(),
+        candidatePoolBuilder: CandidatePoolBuilder = CandidatePoolBuilder()
     ) {
         self.netease = netease
         self.qqMusic = qqMusic
         self.appleMusic = appleMusic
         self.cache = cache
+        self.libraryIndex = libraryIndex
+        self.candidatePoolBuilder = candidatePoolBuilder
     }
 
     static func live() -> MusicRuntime {
@@ -57,16 +63,17 @@ final class MusicRuntime {
             qqMusic,
             appleMusic,
         ]
-        var candidates: [MusicCandidate] = []
         for source in sources where await source.access().isReady {
             if let library = try? await source.fetchUserLibrary() {
-                candidates.append(contentsOf: library.savedTracks)
+                await libraryIndex.ingest(
+                    library.savedTracks,
+                    origin: .saved,
+                    seenAt: Date()
+                )
             }
         }
 
-        candidates = deduplicated(candidates)
-        if candidates.count < 5 {
-            let searchResults = try await search(
+        if let searchResults = try? await search(
                 MusicSearchRequest(
                     moodTags: brief.moodTags,
                     targetEnergy: brief.energyArc.isEmpty
@@ -75,9 +82,14 @@ final class MusicRuntime {
                             / Double(brief.energyArc.count),
                     limit: 30
                 )
+        ) {
+            await libraryIndex.ingest(
+                searchResults,
+                origin: .discovery,
+                seenAt: Date()
             )
-            candidates = deduplicated(candidates + searchResults)
         }
+        let candidates = await programCandidates(for: brief)
 
         return try await AgentProgramPlanner(agent: agent).makePlan(
             brief: brief,
@@ -114,12 +126,52 @@ final class MusicRuntime {
         try await appleMusic.play(trackID: trackID)
     }
 
-    private func deduplicated(
-        _ candidates: [MusicCandidate]
-    ) -> [MusicCandidate] {
-        var seen = Set<String>()
-        return candidates.filter {
-            $0.isPlayable && seen.insert($0.deduplicationKey).inserted
+    func recordPlaybackCompleted(_ candidate: MusicCandidate) async {
+        await libraryIndex.record(
+            .played(
+                trackID: candidate.id,
+                completed: true,
+                at: Date()
+            )
+        )
+    }
+
+    private func programCandidates(
+        for brief: ProgramBrief
+    ) async -> [MusicCandidate] {
+        let knowledge = await libraryIndex.snapshot()
+        return candidatePoolBuilder.build(
+            from: knowledge,
+            request: CandidatePoolRequest(
+                moodTags: brief.moodTags,
+                targetEnergy: brief.energyArc.isEmpty
+                    ? nil
+                    : brief.energyArc.reduce(0, +)
+                        / Double(brief.energyArc.count),
+                excludedTrackIDs:
+                    brief.blockedTrackIDs
+                        .union(brief.recentlySkippedTrackIDs),
+                limit: 30
+            )
+        ).candidates
+    }
+}
+
+@MainActor
+struct MusicRuntimePlaybackPreparer: ProgramPlaybackPreparing {
+    let runtime: MusicRuntime
+
+    func preparePlayback(
+        for track: MusicCandidate
+    ) async throws -> PreparedPlaybackTarget {
+        switch try await runtime.preparePlayback(for: track) {
+        case let .pcmFile(url):
+            return .localFile(url)
+        case let .appleMusic(trackID):
+            return .providerReference(
+                providerID: .appleMusic,
+                trackID: trackID
+            )
         }
     }
 }

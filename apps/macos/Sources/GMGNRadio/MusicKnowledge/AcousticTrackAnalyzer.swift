@@ -65,7 +65,21 @@ struct AcousticTrackAnalyzer: Sendable {
 
         try file.read(into: buffer)
         let samples = try downmixedSamples(from: buffer)
-        return analyze(samples: samples, sampleRate: format.sampleRate)
+        let analyzed = analyze(
+            samples: samples,
+            sampleRate: format.sampleRate
+        )
+        return AcousticTrackFeatures(
+            duration: Double(file.length) / format.sampleRate,
+            rms: analyzed.rms,
+            peak: analyzed.peak,
+            lowFrequencyRatio: analyzed.lowFrequencyRatio,
+            midFrequencyRatio: analyzed.midFrequencyRatio,
+            highFrequencyRatio: analyzed.highFrequencyRatio,
+            energy: analyzed.energy,
+            estimatedBPM: analyzed.estimatedBPM,
+            beatConfidence: analyzed.beatConfidence
+        )
     }
 
     private func measureLevels(_ samples: [Float]) -> (rms: Float, peak: Float) {

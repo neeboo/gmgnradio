@@ -4,6 +4,17 @@ struct ProgramVisualDirector: Sendable {
     static let minimumIntensity: Float = 0.18
     static let maximumIntensity: Float = 0.78
 
+    func cue(for slot: ProgramSlot) -> ProgramVisualCue {
+        guard let visual = slot.visualDirection else {
+            return cue(for: slot.role)
+        }
+        return cue(
+            for: slot.role,
+            mood: semanticMood(for: visual),
+            intensity: Float(visual.intensity)
+        )
+    }
+
     func cue(
         for role: ProgramSlotRole,
         mood requestedMood: StageVisualMood? = nil,
@@ -32,6 +43,36 @@ struct ProgramVisualDirector: Sendable {
             max(intensity, Self.minimumIntensity),
             Self.maximumIntensity
         )
+    }
+
+    private func semanticMood(
+        for direction: AgentVisualDirection
+    ) -> StageVisualMood? {
+        let description = [
+            direction.mood,
+            direction.palette,
+            direction.motion,
+        ].joined(separator: " ").lowercased()
+
+        if description.containsOne(of: [
+            "pulse", "neon", "peak", "energetic",
+            "脉冲", "霓虹", "高能", "强烈",
+        ]) {
+            return .pulse
+        }
+        if description.containsOne(of: [
+            "liquid", "flow", "ocean", "cyan",
+            "流体", "流动", "海洋", "青蓝",
+        ]) {
+            return .liquid
+        }
+        if description.containsOne(of: [
+            "afterglow", "warm", "amber", "sunset", "calm",
+            "余晖", "温暖", "琥珀", "日落", "安静",
+        ]) {
+            return .afterglow
+        }
+        return nil
     }
 
     private func direction(for role: ProgramSlotRole) -> Direction {
@@ -67,6 +108,12 @@ struct ProgramVisualDirector: Sendable {
                 transitionDuration: 7
             )
         }
+    }
+}
+
+private extension String {
+    func containsOne(of values: [String]) -> Bool {
+        values.contains(where: contains)
     }
 }
 

@@ -144,8 +144,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
             self?.advanceProgram()
         }
     )
+    private lazy var programPlaybackQueue = ProgramPlaybackQueue(
+        preflight: PlaybackPreflight(
+            preparer: MusicRuntimePlaybackPreparer(runtime: musicRuntime)
+        )
+    )
     private var activeProgram: ProgramPlan?
-    private var activeSlotIndex = 0
     private var interruptionCoordinator: InterruptionCoordinator?
     private var orbWindowController: OrbWindowController?
     private var stageWindowController: StageWindowController?
@@ -224,9 +228,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
                     )
                 }
                 activeProgram = plan
-                activeSlotIndex = 0
                 programStore.publish(plan)
-                try await playProgramSlot(at: 0)
+                try await programPlaybackQueue.load(plan)
+                guard let prepared = programPlaybackQueue.current else {
+                    throw ProgramPlaybackQueueError.noPlayableSlots(
+                        failedTrackIDs: programPlaybackQueue.failedTrackIDs
+                    )
+                }
+                try await playPreparedWithFallback(prepared)
             } catch {
                 orbWindowController?.setState(.failed)
                 programStore.fail(error.localizedDescription)
@@ -300,13 +309,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
     }
 
     private func advanceProgram() {
-        guard let activeProgram else {
-            return
-        }
-        let nextIndex = activeSlotIndex + 1
-        guard activeProgram.slots.indices.contains(nextIndex) else {
-            self.activeProgram = nil
-            orbWindowController?.setState(.idle)
+        guard activeProgram != nil else {
             return
         }
         Task { [weak self] in
@@ -314,7 +317,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
                 return
             }
             do {
-                try await playProgramSlot(at: nextIndex)
+                if let completed = programPlaybackQueue.current?.slot.track {
+                    await musicRuntime.recordPlaybackCompleted(completed)
+                }
+                guard
+                    let next = await programPlaybackQueue
+                        .advanceAfterCompletion()
+                else {
+                    activeProgram = nil
+                    orbWindowController?.setState(.idle)
+                    return
+                }
+                try await playPreparedWithFallback(next)
             } catch {
                 programStore.fail(error.localizedDescription)
                 presentProgramError(error)
@@ -322,23 +336,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         }
     }
 
-    private func playProgramSlot(at index: Int) async throws {
-        guard
-            let activeProgram,
-            activeProgram.slots.indices.contains(index)
-        else {
+    private func playPreparedWithFallback(
+        _ initial: PreparedProgramPlayback
+    ) async throws {
+        var prepared: PreparedProgramPlayback? = initial
+        while let candidate = prepared {
+            do {
+                try await playPrepared(candidate)
+                return
+            } catch {
+                prepared = await programPlaybackQueue
+                    .replaceCurrentAfterFailure()
+            }
+        }
+        throw ProgramPlaybackQueueError.noPlayableSlots(
+            failedTrackIDs: programPlaybackQueue.failedTrackIDs
+        )
+    }
+
+    private func playPrepared(
+        _ prepared: PreparedProgramPlayback
+    ) async throws {
+        guard let activeProgram else { return }
+        let slot = prepared.slot
+        guard let index = activeProgram.slots.firstIndex(where: {
+            $0.track.id == slot.track.id
+        }) else {
             return
         }
-        let slot = activeProgram.slots[index]
-        let playback = try await musicRuntime.preparePlayback(
-            for: slot.track
+
+        programStore.activateSlot(at: index)
+        stageVisualDirections.update(
+            ProgramVisualDirector().cue(for: slot)
         )
-        activeSlotIndex = index
-        present(plan: activeProgram, slotIndex: index)
-        switch playback {
-        case let .pcmFile(url):
+        await present(plan: activeProgram, slotIndex: index)
+
+        switch prepared.target {
+        case let .localFile(url):
             try playLocalTrack(url)
-        case let .appleMusic(trackID):
+        case let .providerReference(providerID, trackID):
+            guard providerID == .appleMusic else {
+                throw MusicProviderClientError.playbackUnavailable
+            }
             try await musicRuntime.startAppleMusic(trackID: trackID)
             orbWindowController?.setState(.playing)
             showStage()
@@ -348,7 +387,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
     private func present(
         plan: ProgramPlan,
         slotIndex: Int
-    ) {
+    ) async {
         guard plan.slots.indices.contains(slotIndex) else {
             return
         }
@@ -356,25 +395,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         let upcoming = plan.slots
             .dropFirst(slotIndex + 1)
             .map(\.track.id)
-        stagePresentation.apply(
-            RealtimeDJContext(
-                playback: PlaybackContext(
-                    currentTrack: TrackReference(
-                        id: current.track.id,
-                        title: current.track.title,
-                        artist: current.track.artist
-                    ),
-                    upcomingTrackIDs: upcoming,
-                    conversationMode: plan.brief.conversationMode,
-                    programID: plan.brief.id
+        let context = RealtimeDJContext(
+            playback: PlaybackContext(
+                currentTrack: TrackReference(
+                    id: current.track.id,
+                    title: current.track.title,
+                    artist: current.track.artist
                 ),
-                showPlanSummary: "GMGN RADIO · \(plan.slots.count) 首",
-                hostHint: current.hostHint,
-                hostPreference: DJAgentPreferences().hostPrompt(),
-                immediateUserInstruction:
-                    plan.brief.immediateUserInstruction
-            )
+                upcomingTrackIDs: upcoming,
+                conversationMode: plan.brief.conversationMode,
+                programID: plan.brief.id
+            ),
+            showPlanSummary: plan.title
+                ?? "GMGN RADIO · \(plan.slots.count) 首",
+            hostHint: current.hostHint,
+            hostPreference: DJAgentPreferences().hostPrompt(),
+            immediateUserInstruction:
+                plan.brief.immediateUserInstruction
         )
+        stagePresentation.apply(context)
+        try? await realtimeDJSessionController.updateContext(context)
     }
 
     private static func currentProgramBrief(

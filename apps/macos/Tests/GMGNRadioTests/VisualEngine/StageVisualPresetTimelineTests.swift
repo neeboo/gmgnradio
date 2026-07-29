@@ -58,3 +58,20 @@ func stageVisualDirectionStoreAcceptsAndClearsDJDirection() {
     store.update(nil)
     #expect(store.currentMood == nil)
 }
+
+@Test
+@MainActor
+func stageVisualDirectionStoreKeepsTheActiveProgramCue() {
+    let store = StageVisualDirectionStore()
+    let cue = ProgramVisualDirector().cue(
+        for: .peak,
+        mood: .pulse,
+        intensity: 0.72
+    )
+
+    store.update(cue)
+
+    #expect(store.currentMood == .pulse)
+    #expect(store.currentIntensity == 0.72)
+    #expect(store.transitionDuration == 2)
+}

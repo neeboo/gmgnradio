@@ -24,9 +24,19 @@ struct StageVisualPresetFrame: Equatable, Sendable {
 @MainActor
 final class StageVisualDirectionStore {
     private(set) var currentMood: StageVisualMood?
+    private(set) var currentIntensity: Float = 1
+    private(set) var transitionDuration: TimeInterval = 2.4
 
     func update(_ mood: StageVisualMood?) {
         currentMood = mood
+        currentIntensity = 1
+        transitionDuration = 2.4
+    }
+
+    func update(_ cue: ProgramVisualCue) {
+        currentMood = cue.mood
+        currentIntensity = cue.intensity
+        transitionDuration = cue.transitionDuration
     }
 }
 
