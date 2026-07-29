@@ -53,6 +53,19 @@ struct ProgramSlot: Codable, Equatable, Sendable {
     let track: MusicCandidate
     let role: ProgramSlotRole
     let hostHint: ProgramHostHint
+    let visualDirection: AgentVisualDirection?
+
+    init(
+        track: MusicCandidate,
+        role: ProgramSlotRole,
+        hostHint: ProgramHostHint,
+        visualDirection: AgentVisualDirection? = nil
+    ) {
+        self.track = track
+        self.role = role
+        self.hostHint = hostHint
+        self.visualDirection = visualDirection
+    }
 }
 
 struct ProgramPlan: Codable, Equatable, Sendable {
@@ -61,6 +74,26 @@ struct ProgramPlan: Codable, Equatable, Sendable {
     let revision: Int
     let generatedAt: Date
     let replanAfterTrackCount: Int
+    let title: String?
+    let direction: String?
+
+    init(
+        brief: ProgramBrief,
+        slots: [ProgramSlot],
+        revision: Int,
+        generatedAt: Date,
+        replanAfterTrackCount: Int,
+        title: String? = nil,
+        direction: String? = nil
+    ) {
+        self.brief = brief
+        self.slots = slots
+        self.revision = revision
+        self.generatedAt = generatedAt
+        self.replanAfterTrackCount = replanAfterTrackCount
+        self.title = title
+        self.direction = direction
+    }
 }
 
 enum ProgramPlannerError: Error, Equatable {
@@ -75,6 +108,7 @@ struct ProgramPlanner {
         brief: ProgramBrief,
         candidates: [MusicCandidate],
         preferredTrackIDs: [String] = [],
+        showProposal: AgentShowProposal? = nil,
         revision: Int = 1,
         generatedAt: Date = Date()
     ) throws -> ProgramPlan {
@@ -104,35 +138,51 @@ struct ProgramPlanner {
             brief: brief
         )
         let quiet = prefersMinimalTalk(brief)
+        let proposedSlots = (showProposal?.slots ?? []).reduce(
+            into: [String: AgentShowSlotProposal]()
+        ) { result, slot in
+            if result[slot.trackID] == nil {
+                result[slot.trackID] = slot
+            }
+        }
 
         let slots = selected.indices.map { index in
             let track = selected[index]
+            let proposed = proposedSlots[track.id]
             let next = selected.indices.contains(index + 1)
                 ? selected[index + 1]
                 : nil
             let role = slotRole(index: index, count: selected.count)
+            let localTalkDecision = shouldTalk(
+                at: index,
+                role: role,
+                mode: brief.conversationMode,
+                quiet: quiet
+            )
             return ProgramSlot(
                 track: track,
                 role: role,
                 hostHint: ProgramHostHint(
-                    shouldTalkBefore: shouldTalk(
-                        at: index,
-                        role: role,
-                        mode: brief.conversationMode,
-                        quiet: quiet
-                    ),
+                    shouldTalkBefore: quiet
+                        ? localTalkDecision
+                        : proposed?.shouldTalkBefore ?? localTalkDecision,
                     maxSentenceCount: quiet ? 1 : 2,
-                    selectionReason: selectionReason(
-                        track: track,
-                        brief: brief
-                    ),
+                    selectionReason: proposed?.selectionReason
+                        .nilIfEmpty
+                        ?? selectionReason(
+                            track: track,
+                            brief: brief
+                        ),
                     currentTrack: track.reference,
                     nextTrack: next?.reference,
                     facts: track.hostFacts,
-                    transitionIntent: next.map {
-                        transitionIntent(from: track, to: $0)
-                    }
-                )
+                    transitionIntent: proposed.map(\.transitionIntent)
+                        .flatMap { $0.isEmpty ? nil : $0 }
+                        ?? next.map {
+                            transitionIntent(from: track, to: $0)
+                        }
+                ),
+                visualDirection: proposed?.visual
             )
         }
 
@@ -141,7 +191,9 @@ struct ProgramPlanner {
             slots: slots,
             revision: revision,
             generatedAt: generatedAt,
-            replanAfterTrackCount: min(2, slots.count)
+            replanAfterTrackCount: min(2, slots.count),
+            title: showProposal?.title.nilIfEmpty,
+            direction: showProposal?.direction.nilIfEmpty
         )
     }
 
@@ -341,5 +393,11 @@ private extension MusicCandidate {
             values.append("风格：\(genres.joined(separator: "、"))")
         }
         return values
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
     }
 }

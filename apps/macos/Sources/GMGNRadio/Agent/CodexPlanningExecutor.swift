@@ -23,8 +23,8 @@ struct CodexCLIPlanningExecutor: CodexPlanningExecuting {
     func execute(prompt: String) async throws -> String {
         let directory = FileManager.default.temporaryDirectory
             .appending(path: "gmgn-radio-codex-\(UUID().uuidString)")
-        let schemaURL = directory.appending(path: "program-ranking.schema.json")
-        let outputURL = directory.appending(path: "program-ranking.json")
+        let schemaURL = directory.appending(path: "show-proposal.schema.json")
+        let outputURL = directory.appending(path: "show-proposal.json")
 
         try FileManager.default.createDirectory(
             at: directory,
@@ -66,14 +66,48 @@ struct CodexCLIPlanningExecutor: CodexPlanningExecuting {
         {
           "type": "object",
           "properties": {
-            "track_ids": {
+            "title": { "type": "string" },
+            "direction": { "type": "string" },
+            "slots": {
               "type": "array",
-              "items": { "type": "string" },
-              "minItems": 1,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "track_id": { "type": "string" },
+                  "selection_reason": { "type": "string" },
+                  "should_talk_before": { "type": "boolean" },
+                  "transition_intent": { "type": "string" },
+                  "visual": {
+                    "type": "object",
+                    "properties": {
+                      "mood": { "type": "string" },
+                      "palette": { "type": "string" },
+                      "motion": { "type": "string" },
+                      "intensity": { "type": "number" }
+                    },
+                    "required": [
+                      "mood",
+                      "palette",
+                      "motion",
+                      "intensity"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "track_id",
+                  "selection_reason",
+                  "should_talk_before",
+                  "transition_intent",
+                  "visual"
+                ],
+                "additionalProperties": false
+              },
+              "minItems": 5,
               "maxItems": 8
             }
           },
-          "required": ["track_ids"],
+          "required": ["title", "direction", "slots"],
           "additionalProperties": false
         }
         """.utf8
