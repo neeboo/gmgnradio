@@ -7,7 +7,8 @@ final class MetalStageView: MTKView {
 
     init(
         frame: CGRect,
-        audioFeatures: VisualAudioFeatureStore
+        audioFeatures: VisualAudioFeatureStore,
+        visualDirections: StageVisualDirectionStore = StageVisualDirectionStore()
     ) {
         guard let device = MTLCreateSystemDefaultDevice() else {
             preconditionFailure("gmgn radio requires a Metal-capable Apple Silicon Mac")
@@ -29,7 +30,8 @@ final class MetalStageView: MTKView {
                 device: device,
                 colorPixelFormat: colorPixelFormat,
                 depthPixelFormat: depthStencilPixelFormat,
-                audioFeatures: audioFeatures
+                audioFeatures: audioFeatures,
+                visualDirections: visualDirections
             )
             delegate = stageRenderer
         } catch {

@@ -17,17 +17,24 @@ final class StageRenderer: NSObject, MTKViewDelegate {
     private let vertexBuffer: MTLBuffer
     private let vertexCount: Int
     private let audioFeatures: VisualAudioFeatureStore
+    private let visualDirections: StageVisualDirectionStore
     private let clock = ContinuousClock()
     private let startedAt: ContinuousClock.Instant
     private var previousFrameAt: ContinuousClock.Instant
     private var camera = StageCameraModel()
     private let presetTimeline = StageVisualPresetTimeline()
+    private var hasObservedVisualDirection = false
+    private var observedVisualMood: StageVisualMood?
+    private var presetTransitionStartedAt: Float?
+    private var presetTransitionOrigin = SIMD3<Float>(1, 0, 0)
+    private var displayedPresetWeights = SIMD3<Float>(1, 0, 0)
 
     init(
         device: MTLDevice,
         colorPixelFormat: MTLPixelFormat,
         depthPixelFormat: MTLPixelFormat,
-        audioFeatures: VisualAudioFeatureStore
+        audioFeatures: VisualAudioFeatureStore,
+        visualDirections: StageVisualDirectionStore
     ) throws {
         guard let commandQueue = device.makeCommandQueue() else {
             throw StageRendererError.missingCommandQueue
@@ -85,6 +92,7 @@ final class StageRenderer: NSObject, MTKViewDelegate {
         vertexBuffer = buffer
         vertexCount = geometry.vertices.count
         self.audioFeatures = audioFeatures
+        self.visualDirections = visualDirections
         startedAt = clock.now
         previousFrameAt = startedAt
         super.init()
@@ -126,7 +134,7 @@ final class StageRenderer: NSObject, MTKViewDelegate {
         }
 
         let elapsed = Self.seconds(startedAt.duration(to: now))
-        let preset = presetTimeline.sample(at: elapsed)
+        let presetWeights = resolvePresetWeights(at: elapsed)
         var uniforms = StageUniforms.make(
             camera: camera.frame,
             audio: audioFeatures.current,
@@ -135,7 +143,7 @@ final class StageRenderer: NSObject, MTKViewDelegate {
                 Float(view.drawableSize.width),
                 Float(view.drawableSize.height)
             ),
-            presetWeights: preset.weights
+            presetWeights: presetWeights
         )
 
         encoder.label = "gmgn radio 360 stage"
@@ -202,6 +210,48 @@ final class StageRenderer: NSObject, MTKViewDelegate {
         }
 
         return try device.makeRenderPipelineState(descriptor: descriptor)
+    }
+
+    private func resolvePresetWeights(at time: Float) -> SIMD3<Float> {
+        let automaticWeights = presetTimeline.sample(at: time).weights
+        let requestedMood = visualDirections.currentMood
+
+        if !hasObservedVisualDirection {
+            hasObservedVisualDirection = true
+            observedVisualMood = requestedMood
+            displayedPresetWeights = requestedMood.map {
+                StageVisualPresetFrame.forMood($0).weights
+            } ?? automaticWeights
+            return displayedPresetWeights
+        }
+
+        if requestedMood != observedVisualMood {
+            observedVisualMood = requestedMood
+            presetTransitionOrigin = displayedPresetWeights
+            presetTransitionStartedAt = time
+        }
+
+        let targetWeights = requestedMood.map {
+            StageVisualPresetFrame.forMood($0).weights
+        } ?? automaticWeights
+
+        guard let transitionStartedAt = presetTransitionStartedAt else {
+            displayedPresetWeights = targetWeights
+            return displayedPresetWeights
+        }
+
+        let linearProgress = min(
+            max((time - transitionStartedAt) / 2.4, 0),
+            1
+        )
+        let smoothProgress = linearProgress * linearProgress
+            * (3 - 2 * linearProgress)
+        displayedPresetWeights = presetTransitionOrigin
+            + (targetWeights - presetTransitionOrigin) * smoothProgress
+        if linearProgress >= 1 {
+            presetTransitionStartedAt = nil
+        }
+        return displayedPresetWeights
     }
 
     private static func seconds(_ duration: Duration) -> Float {

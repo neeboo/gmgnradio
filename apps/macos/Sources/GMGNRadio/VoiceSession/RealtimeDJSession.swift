@@ -65,17 +65,20 @@ struct RealtimeDJContext: Codable, Equatable, Sendable {
     var showPlanSummary: String
     var hostHint: ProgramHostHint?
     var immediateUserInstruction: String?
+    var visualMood: StageVisualMood?
 
     init(
         playback: PlaybackContext,
         showPlanSummary: String,
         hostHint: ProgramHostHint? = nil,
-        immediateUserInstruction: String? = nil
+        immediateUserInstruction: String? = nil,
+        visualMood: StageVisualMood? = nil
     ) {
         self.playback = playback
         self.showPlanSummary = showPlanSummary
         self.hostHint = hostHint
         self.immediateUserInstruction = immediateUserInstruction
+        self.visualMood = visualMood
     }
 }
 

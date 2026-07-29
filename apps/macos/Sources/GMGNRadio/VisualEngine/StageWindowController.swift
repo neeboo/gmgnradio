@@ -6,16 +6,19 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     private let audioFeatures: VisualAudioFeatureStore
     private let audioMonitor: (any VisualAudioMonitoring)?
     private let presentation: StagePresentationModel
+    private let visualDirections: StageVisualDirectionStore
     private weak var stageContentView: StageContentView?
 
     init(
         audioFeatures: VisualAudioFeatureStore,
         audioMonitor: (any VisualAudioMonitoring)? = nil,
-        presentation: StagePresentationModel = StagePresentationModel()
+        presentation: StagePresentationModel = StagePresentationModel(),
+        visualDirections: StageVisualDirectionStore = StageVisualDirectionStore()
     ) {
         self.audioFeatures = audioFeatures
         self.audioMonitor = audioMonitor
         self.presentation = presentation
+        self.visualDirections = visualDirections
         super.init(window: nil)
     }
 
@@ -99,6 +102,7 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
             frame: CGRect(origin: .zero, size: contentSize),
             audioFeatures: audioFeatures,
             presentation: presentation,
+            visualDirections: visualDirections,
             onToggleWindowMode: { [weak window] in
                 window?.toggleFullScreen(nil)
             }
@@ -118,6 +122,7 @@ private final class StageContentView: NSView {
         frame: CGRect,
         audioFeatures: VisualAudioFeatureStore,
         presentation: StagePresentationModel,
+        visualDirections: StageVisualDirectionStore,
         onToggleWindowMode: @escaping @MainActor () -> Void
     ) {
         windowModeButton = StageWindowModeButton(
@@ -129,7 +134,8 @@ private final class StageContentView: NSView {
 
         let metalView = MetalStageView(
             frame: bounds,
-            audioFeatures: audioFeatures
+            audioFeatures: audioFeatures,
+            visualDirections: visualDirections
         )
         metalView.autoresizingMask = [.width, .height]
         metalView.wantsLayer = true

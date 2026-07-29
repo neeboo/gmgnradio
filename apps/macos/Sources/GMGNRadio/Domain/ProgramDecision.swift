@@ -8,6 +8,7 @@ struct ProgramDecision: Codable, Equatable, Sendable {
         case rememberPreference(key: String, value: String)
         case forgetCurrentContext
         case setConversationMode(ConversationMode)
+        case setVisualMood(StageVisualMood)
         case enterImmersiveVisuals
         case endProgram
     }
@@ -29,4 +30,3 @@ struct ProgramDecision: Codable, Equatable, Sendable {
         self.rationale = rationale
     }
 }
-

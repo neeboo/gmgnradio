@@ -1,7 +1,33 @@
 import Foundation
 
+enum StageVisualMood: String, Codable, CaseIterable, Sendable {
+    case afterglow
+    case liquid
+    case pulse
+}
+
 struct StageVisualPresetFrame: Equatable, Sendable {
     var weights: SIMD3<Float>
+
+    static func forMood(_ mood: StageVisualMood) -> Self {
+        switch mood {
+        case .afterglow:
+            Self(weights: SIMD3<Float>(1, 0, 0))
+        case .liquid:
+            Self(weights: SIMD3<Float>(0, 1, 0))
+        case .pulse:
+            Self(weights: SIMD3<Float>(0, 0, 1))
+        }
+    }
+}
+
+@MainActor
+final class StageVisualDirectionStore {
+    private(set) var currentMood: StageVisualMood?
+
+    func update(_ mood: StageVisualMood?) {
+        currentMood = mood
+    }
 }
 
 struct StageVisualPresetTimeline: Sendable {

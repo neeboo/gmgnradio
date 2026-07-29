@@ -30,3 +30,31 @@ func visualPresetTimelineWrapsAcrossTheLastPreset() {
     #expect(blending.weights == SIMD3<Float>(0.75, 0, 0.25))
     #expect(abs(blending.weights.x + blending.weights.y + blending.weights.z - 1) < 0.000_1)
 }
+
+@Test
+func DJVisualMoodsMapToDistinctStagePresets() {
+    #expect(
+        StageVisualPresetFrame.forMood(.afterglow).weights
+            == SIMD3<Float>(1, 0, 0)
+    )
+    #expect(
+        StageVisualPresetFrame.forMood(.liquid).weights
+            == SIMD3<Float>(0, 1, 0)
+    )
+    #expect(
+        StageVisualPresetFrame.forMood(.pulse).weights
+            == SIMD3<Float>(0, 0, 1)
+    )
+}
+
+@Test
+@MainActor
+func stageVisualDirectionStoreAcceptsAndClearsDJDirection() {
+    let store = StageVisualDirectionStore()
+
+    store.update(.pulse)
+    #expect(store.currentMood == .pulse)
+
+    store.update(nil)
+    #expect(store.currentMood == nil)
+}

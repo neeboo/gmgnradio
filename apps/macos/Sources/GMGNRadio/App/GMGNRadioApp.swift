@@ -121,6 +121,7 @@ struct SettingsMenuAction {
 final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControlling {
     private let audioFeatures = VisualAudioFeatureStore()
     private let stagePresentation = StagePresentationModel()
+    private let stageVisualDirections = StageVisualDirectionStore()
     private let realtimeDJSessionController = RealtimeDJSessionController()
     private lazy var audioGraph = AudioGraphController(
         visualStore: audioFeatures
@@ -148,6 +149,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         configureStage()
 
         let environment = ProcessInfo.processInfo.environment
+        if
+            let moodName = environment["GMGN_VISUAL_MOOD"],
+            let mood = StageVisualMood(rawValue: moodName)
+        {
+            stageVisualDirections.update(mood)
+        }
         if
             let stateName = environment["GMGN_ORB_STATE"],
             let state = DJState(rawValue: stateName)
@@ -245,7 +252,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         stageWindowController = StageWindowController(
             audioFeatures: audioFeatures,
             audioMonitor: monitor,
-            presentation: stagePresentation
+            presentation: stagePresentation,
+            visualDirections: stageVisualDirections
         )
 
         stagePresentationTask?.cancel()
@@ -277,6 +285,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
 
     func updateRealtimeDJContext(_ context: RealtimeDJContext) async throws {
         stagePresentation.apply(context)
+        stageVisualDirections.update(context.visualMood)
         try await realtimeDJSessionController.updateContext(context)
     }
 }
