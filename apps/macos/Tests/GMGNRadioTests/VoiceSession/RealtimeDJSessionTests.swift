@@ -57,11 +57,13 @@ func realtimeContextCarriesTheHostBriefWithoutProviderFields() {
             programID: "late-night-1"
         ),
         showPlanSummary: "深夜工作时段，保持克制，只在必要转场出现。",
+        hostPreference: "关键转场再说话，介绍必须基于歌曲事实。",
         immediateUserInstruction: "少说一点"
     )
 
     #expect(context.playback.currentTrack?.title == "Blue Hour")
     #expect(context.showPlanSummary.contains("克制"))
+    #expect(context.hostPreference?.contains("歌曲事实") == true)
     #expect(context.immediateUserInstruction == "少说一点")
 }
 

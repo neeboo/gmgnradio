@@ -10,6 +10,7 @@ enum CodexAccountState: Equatable, Sendable {
 protocol CodexAccountServicing: AnyObject {
     func status() async -> CodexAccountState
     func login() async throws
+    func logout() async throws
 }
 
 @MainActor
@@ -53,6 +54,19 @@ final class CodexAgentAccountService: CodexAccountServicing {
         }
         let result = try await runner.run(
             arguments: ["login"],
+            standardInput: nil
+        )
+        guard result.exitCode == 0 else {
+            throw CodexCLIError.commandFailed(result.output)
+        }
+    }
+
+    func logout() async throws {
+        guard let runner else {
+            throw CodexCLIError.unavailable
+        }
+        let result = try await runner.run(
+            arguments: ["logout"],
             standardInput: nil
         )
         guard result.exitCode == 0 else {

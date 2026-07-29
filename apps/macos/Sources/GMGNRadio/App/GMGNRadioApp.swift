@@ -65,7 +65,9 @@ struct GMGNRadioApp: App {
         }
 
         Settings {
-            GMGNSettingsView()
+            GMGNSettingsView {
+                AppMenuAction.startAIProgram.perform(on: appDelegate)
+            }
                 .frame(minWidth: 540, minHeight: 440)
         }
         .defaultSize(width: 580, height: 500)
@@ -130,12 +132,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
     private let audioFeatures = VisualAudioFeatureStore()
     private let stagePresentation = StagePresentationModel()
     private let stageVisualDirections = StageVisualDirectionStore()
+    private let programStore = DJProgramStore.shared
     private let realtimeDJSessionController = RealtimeDJSessionController()
     private lazy var musicRuntime = MusicRuntime.live()
     private lazy var audioGraph = AudioGraphController(
         visualStore: audioFeatures
     )
-    private lazy var localMusicPlayer = LocalMusicPlayer(graph: audioGraph)
+    private lazy var localMusicPlayer = LocalMusicPlayer(
+        graph: audioGraph,
+        onFinished: { [weak self] in
+            self?.advanceProgram()
+        }
+    )
+    private var activeProgram: ProgramPlan?
+    private var activeSlotIndex = 0
     private var interruptionCoordinator: InterruptionCoordinator?
     private var orbWindowController: OrbWindowController?
     private var stageWindowController: StageWindowController?
@@ -194,6 +204,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
 
     func startAIProgram() {
         orbWindowController?.setState(.thinking)
+        activeProgram = nil
+        programStore.beginPlanning()
         Task { [weak self] in
             guard let self else {
                 return
@@ -205,26 +217,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
                     brief: brief,
                     agent: agent
                 )
-                guard let first = plan.slots.first else {
+                guard !plan.slots.isEmpty else {
                     throw ProgramPlannerError.insufficientPlayableCandidates(
                         required: 5,
                         available: 0
                     )
                 }
-                let playback = try await musicRuntime.preparePlayback(
-                    for: first.track
-                )
-                present(plan: plan)
-                switch playback {
-                case let .pcmFile(url):
-                    try playLocalTrack(url)
-                case let .appleMusic(trackID):
-                    try await musicRuntime.startAppleMusic(trackID: trackID)
-                    orbWindowController?.setState(.playing)
-                    showStage()
-                }
+                activeProgram = plan
+                activeSlotIndex = 0
+                programStore.publish(plan)
+                try await playProgramSlot(at: 0)
             } catch {
                 orbWindowController?.setState(.failed)
+                programStore.fail(error.localizedDescription)
                 presentProgramError(error)
             }
         }
@@ -294,25 +299,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         alert.runModal()
     }
 
-    private func present(plan: ProgramPlan) {
-        guard let first = plan.slots.first else {
+    private func advanceProgram() {
+        guard let activeProgram else {
             return
         }
-        let upcoming = plan.slots.dropFirst().map(\.track.id)
+        let nextIndex = activeSlotIndex + 1
+        guard activeProgram.slots.indices.contains(nextIndex) else {
+            self.activeProgram = nil
+            orbWindowController?.setState(.idle)
+            return
+        }
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+            do {
+                try await playProgramSlot(at: nextIndex)
+            } catch {
+                programStore.fail(error.localizedDescription)
+                presentProgramError(error)
+            }
+        }
+    }
+
+    private func playProgramSlot(at index: Int) async throws {
+        guard
+            let activeProgram,
+            activeProgram.slots.indices.contains(index)
+        else {
+            return
+        }
+        let slot = activeProgram.slots[index]
+        let playback = try await musicRuntime.preparePlayback(
+            for: slot.track
+        )
+        activeSlotIndex = index
+        present(plan: activeProgram, slotIndex: index)
+        switch playback {
+        case let .pcmFile(url):
+            try playLocalTrack(url)
+        case let .appleMusic(trackID):
+            try await musicRuntime.startAppleMusic(trackID: trackID)
+            orbWindowController?.setState(.playing)
+            showStage()
+        }
+    }
+
+    private func present(
+        plan: ProgramPlan,
+        slotIndex: Int
+    ) {
+        guard plan.slots.indices.contains(slotIndex) else {
+            return
+        }
+        let current = plan.slots[slotIndex]
+        let upcoming = plan.slots
+            .dropFirst(slotIndex + 1)
+            .map(\.track.id)
         stagePresentation.apply(
             RealtimeDJContext(
                 playback: PlaybackContext(
                     currentTrack: TrackReference(
-                        id: first.track.id,
-                        title: first.track.title,
-                        artist: first.track.artist
+                        id: current.track.id,
+                        title: current.track.title,
+                        artist: current.track.artist
                     ),
                     upcomingTrackIDs: upcoming,
                     conversationMode: plan.brief.conversationMode,
                     programID: plan.brief.id
                 ),
                 showPlanSummary: "GMGN RADIO · \(plan.slots.count) 首",
-                hostHint: first.hostHint,
+                hostHint: current.hostHint,
+                hostPreference: DJAgentPreferences().hostPrompt(),
                 immediateUserInstruction:
                     plan.brief.immediateUserInstruction
             )

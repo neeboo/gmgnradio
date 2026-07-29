@@ -1,5 +1,6 @@
 import SwiftUI
 
+@MainActor
 struct GMGNSettingsView: View {
     private enum Page: String, CaseIterable {
         case presence = "桌宠"
@@ -8,6 +9,11 @@ struct GMGNSettingsView: View {
     }
 
     @State private var page = Page.presence
+    private let startAIProgram: () -> Void
+
+    init(startAIProgram: @escaping () -> Void = {}) {
+        self.startAIProgram = startAIProgram
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -29,7 +35,9 @@ struct GMGNSettingsView: View {
                 case .music:
                     MusicAccountsView()
                 case .agent:
-                    AgentSettingsView()
+                    AgentSettingsView(
+                        startAIProgram: startAIProgram
+                    )
                 }
             }
         }

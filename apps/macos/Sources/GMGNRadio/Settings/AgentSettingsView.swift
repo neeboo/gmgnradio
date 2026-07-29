@@ -1,7 +1,18 @@
 import SwiftUI
 
+@MainActor
 struct AgentSettingsView: View {
     @State private var model = AgentSettingsModel()
+    @State private var programStore: DJProgramStore
+    private let startAIProgram: () -> Void
+
+    init(
+        programStore: DJProgramStore = .shared,
+        startAIProgram: @escaping () -> Void = {}
+    ) {
+        _programStore = State(initialValue: programStore)
+        self.startAIProgram = startAIProgram
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -33,10 +44,10 @@ struct AgentSettingsView: View {
                             ProgressView()
                                 .controlSize(.small)
                         } else if model.codexState.isSignedIn {
-                            Button("刷新") {
-                                Task { await model.refresh() }
+                            Button("退出登录", role: .destructive) {
+                                Task { await model.disconnectCodex() }
                             }
-                            .buttonStyle(.borderless)
+                            .buttonStyle(.bordered)
                         } else {
                             Button("登录") {
                                 Task { await model.connectCodex() }
@@ -55,7 +66,7 @@ struct AgentSettingsView: View {
                 Section("DJ 偏好") {
                     TextEditor(text: $model.hostPrompt)
                         .font(.body)
-                        .frame(minHeight: 76)
+                        .frame(minHeight: 150)
 
                     HStack {
                         Text("用自然语言告诉 DJ 怎么策划和主持。")
@@ -67,6 +78,10 @@ struct AgentSettingsView: View {
                         }
                         .buttonStyle(.borderedProminent)
                     }
+                }
+
+                Section("节目编排") {
+                    programPlanningContent
                 }
             }
             .formStyle(.grouped)
@@ -86,6 +101,75 @@ struct AgentSettingsView: View {
             }
         }
         .task { await model.load() }
+    }
+
+    @ViewBuilder
+    private var programPlanningContent: some View {
+        switch programStore.status {
+        case .planning:
+            HStack(spacing: 10) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("DJ 正在排节目…")
+                    .foregroundStyle(.secondary)
+            }
+        case let .failed(message):
+            Label(message, systemImage: "exclamationmark.circle.fill")
+                .foregroundStyle(.red)
+        case .idle, .ready:
+            if let plan = programStore.plan {
+                let duration = plan.slots.reduce(0) {
+                    $0 + $1.track.duration
+                }
+                Text(
+                    "\(plan.slots.count) 首 · 约 \(max(1, Int(duration / 60))) 分钟"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                ForEach(
+                    Array(plan.slots.prefix(6).enumerated()),
+                    id: \.element.track.id
+                ) { index, slot in
+                    HStack(spacing: 10) {
+                        Text(String(format: "%02d", index + 1))
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.tertiary)
+                            .frame(width: 22, alignment: .leading)
+                        Text(slot.track.title)
+                            .lineLimit(1)
+                        Spacer(minLength: 8)
+                        Text(slot.track.artist)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+
+                if plan.slots.count > 6 {
+                    Text("还有 \(plan.slots.count - 6) 首")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Text("从已连接的音乐账号里生成一档约 30 分钟的节目。")
+                    .foregroundStyle(.secondary)
+            }
+        }
+
+        Button(
+            programStore.plan == nil
+                ? "按这个偏好排节目"
+                : "重新编排"
+        ) {
+            model.savePrompt()
+            startAIProgram()
+        }
+        .buttonStyle(.borderedProminent)
+        .disabled(
+            programStore.status == .planning
+                || !model.codexState.isSignedIn
+        )
     }
 
     private var header: some View {

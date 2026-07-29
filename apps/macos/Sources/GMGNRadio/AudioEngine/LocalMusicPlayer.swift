@@ -28,13 +28,18 @@ protocol LocalMusicPlaybackGraph: AnyObject {
 @MainActor
 final class LocalMusicPlayer {
     private let graph: any LocalMusicPlaybackGraph
+    private let onFinished: @MainActor () -> Void
     private var playbackGeneration: UInt64 = 0
 
     private(set) var state: LocalMusicPlaybackState = .idle
     private(set) var track: LocalTrack?
 
-    init(graph: any LocalMusicPlaybackGraph) {
+    init(
+        graph: any LocalMusicPlaybackGraph,
+        onFinished: @escaping @MainActor () -> Void = {}
+    ) {
         self.graph = graph
+        self.onFinished = onFinished
     }
 
     func load(_ url: URL) throws {
@@ -49,6 +54,7 @@ final class LocalMusicPlayer {
                 return
             }
             state = .finished
+            onFinished()
         }
         state = .ready
     }

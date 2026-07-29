@@ -6,7 +6,11 @@ import Testing
 @MainActor
 func localMusicPlayerTracksLoadPlayPauseResumeAndCompletion() throws {
     let graph = LocalMusicPlaybackGraphSpy()
-    let player = LocalMusicPlayer(graph: graph)
+    var completionCount = 0
+    let player = LocalMusicPlayer(
+        graph: graph,
+        onFinished: { completionCount += 1 }
+    )
     let trackURL = URL(fileURLWithPath: "/tmp/blue-hour.wav")
 
     try player.load(trackURL)
@@ -27,6 +31,7 @@ func localMusicPlayerTracksLoadPlayPauseResumeAndCompletion() throws {
 
     graph.finish()
     #expect(player.state == .finished)
+    #expect(completionCount == 1)
 
     try player.play()
     #expect(player.state == .playing)

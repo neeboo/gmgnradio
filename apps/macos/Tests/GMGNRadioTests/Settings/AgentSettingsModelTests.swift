@@ -2,6 +2,17 @@ import Foundation
 import Testing
 @testable import GMGNRadio
 
+@Test
+func defaultDJPreferenceCoversACompleteRadioShow() {
+    let prompt = DJAgentPreferences.defaultHostPrompt
+
+    #expect(prompt.count > 320)
+    #expect(prompt.contains("节目结构"))
+    #expect(prompt.contains("歌曲事实"))
+    #expect(prompt.contains("重新编排"))
+    #expect(prompt.contains("长期偏好"))
+}
+
 @MainActor
 @Test
 func agentSettingsLoadsCodexLoginAndPersistsTheHostPrompt() async throws {
@@ -40,9 +51,24 @@ func agentSettingsStartsCodexLoginAndRefreshesTheState() async {
 }
 
 @MainActor
+@Test
+func agentSettingsLogsOutOfCodexAndReturnsToSignedOut() async {
+    let account = CodexAccountServiceStub(
+        state: .signedIn(method: "ChatGPT")
+    )
+    let model = AgentSettingsModel(account: account)
+
+    await model.disconnectCodex()
+
+    #expect(account.logoutCount == 1)
+    #expect(model.codexState == .signedOut)
+}
+
+@MainActor
 private final class CodexAccountServiceStub: CodexAccountServicing {
     var state: CodexAccountState
     var loginCount = 0
+    var logoutCount = 0
 
     init(state: CodexAccountState) {
         self.state = state
@@ -55,5 +81,10 @@ private final class CodexAccountServiceStub: CodexAccountServicing {
     func login() async throws {
         loginCount += 1
         state = .signedIn(method: "ChatGPT")
+    }
+
+    func logout() async throws {
+        logoutCount += 1
+        state = .signedOut
     }
 }
