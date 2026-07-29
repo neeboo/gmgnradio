@@ -44,6 +44,27 @@ func audioGraphRendersLocalMusicAndPausesToSilence() throws {
     #expect(pausedPeak < 0.001)
 }
 
+@Test
+@MainActor
+func audioGraphCompletionDispatcherIgnoresAReplacedTrackCallback() {
+    let dispatcher = AudioGraphCompletionDispatcher()
+    var firstCompletionCount = 0
+    var secondCompletionCount = 0
+
+    let first = dispatcher.prepare {
+        firstCompletionCount += 1
+    }
+    let second = dispatcher.prepare {
+        secondCompletionCount += 1
+    }
+
+    first()
+    second()
+
+    #expect(firstCompletionCount == 0)
+    #expect(secondCompletionCount == 1)
+}
+
 private func writeSineWave(to url: URL) throws {
     let format = try #require(
         AVAudioFormat(

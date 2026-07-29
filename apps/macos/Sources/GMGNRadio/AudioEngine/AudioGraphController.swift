@@ -3,6 +3,28 @@ import Foundation
 import os
 
 @MainActor
+final class AudioGraphCompletionDispatcher {
+    private var generation: UInt64 = 0
+
+    func prepare(
+        _ completion: @escaping @MainActor @Sendable () -> Void
+    ) -> @MainActor @Sendable () -> Void {
+        generation &+= 1
+        let scheduledGeneration = generation
+        return { [weak self] in
+            guard self?.generation == scheduledGeneration else {
+                return
+            }
+            completion()
+        }
+    }
+
+    func invalidate() {
+        generation &+= 1
+    }
+}
+
+@MainActor
 final class AudioGraphController: LocalMusicPlaybackGraph {
     private let engine: AVAudioEngine
     private let musicNode = AVAudioPlayerNode()
@@ -11,8 +33,8 @@ final class AudioGraphController: LocalMusicPlaybackGraph {
     private let programMixer = AVAudioMixerNode()
     private let visualBridge: PlaybackVisualFeatureBridge
     private let duckingController: SampleTimedDuckingController
+    private let completionDispatcher = AudioGraphCompletionDispatcher()
     private var currentFile: AVAudioFile?
-    private var completion: (@MainActor @Sendable () -> Void)?
     private var tapInstalled = false
     private var deviceMonitor: AudioDeviceMonitor?
 
@@ -28,6 +50,20 @@ final class AudioGraphController: LocalMusicPlaybackGraph {
 
     var isMusicPlaying: Bool {
         musicNode.isPlaying
+    }
+
+    var playbackPosition: TimeInterval {
+        guard
+            let renderTime = musicNode.lastRenderTime,
+            let playerTime = musicNode.playerTime(forNodeTime: renderTime),
+            playerTime.sampleRate > 0
+        else {
+            return 0
+        }
+        return max(
+            0,
+            Double(playerTime.sampleTime) / playerTime.sampleRate
+        )
     }
 
     init(
@@ -70,14 +106,17 @@ final class AudioGraphController: LocalMusicPlaybackGraph {
 
         let file = try AVAudioFile(forReading: url)
         currentFile = file
-        self.completion = completion
+        let scheduledCompletion = completionDispatcher.prepare(completion)
         musicNode.scheduleFile(
             file,
             at: nil,
             completionCallbackType: .dataPlayedBack
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.completion?()
+                guard self != nil else {
+                    return
+                }
+                scheduledCompletion()
             }
         }
 
@@ -104,8 +143,8 @@ final class AudioGraphController: LocalMusicPlaybackGraph {
     }
 
     func stop() {
+        completionDispatcher.invalidate()
         musicNode.stop()
-        completion = nil
         currentFile = nil
         visualBridge.reset()
         duckingController.reset()

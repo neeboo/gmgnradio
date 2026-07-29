@@ -16,6 +16,8 @@ enum LocalMusicPlaybackState: Equatable, Sendable {
 
 @MainActor
 protocol LocalMusicPlaybackGraph: AnyObject {
+    var playbackPosition: TimeInterval { get }
+
     func load(
         _ url: URL,
         completion: @escaping @MainActor @Sendable () -> Void
@@ -23,6 +25,12 @@ protocol LocalMusicPlaybackGraph: AnyObject {
     func play() throws
     func pause()
     func stop()
+}
+
+extension LocalMusicPlaybackGraph {
+    var playbackPosition: TimeInterval {
+        0
+    }
 }
 
 @MainActor

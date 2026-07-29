@@ -25,6 +25,15 @@ final class ProgramPlaybackQueue {
     private(set) var locked: [PreparedProgramPlayback] = []
     private(set) var reserve: [ProgramSlot] = []
     private(set) var failedTrackIDs: [String] = []
+    private(set) var history: [PreparedProgramPlayback] = []
+
+    var canReturnToPrevious: Bool {
+        !history.isEmpty
+    }
+
+    var canAdvance: Bool {
+        !locked.isEmpty || !reserve.isEmpty
+    }
 
     init(
         preflight: PlaybackPreflight,
@@ -39,6 +48,7 @@ final class ProgramPlaybackQueue {
         locked = []
         reserve = plan.slots
         failedTrackIDs = []
+        history = []
 
         await fillPreparedWindow()
         guard current != nil else {
@@ -50,9 +60,24 @@ final class ProgramPlaybackQueue {
 
     @discardableResult
     func advanceAfterCompletion() async -> PreparedProgramPlayback? {
+        if let current {
+            history.append(current)
+        }
         current = locked.isEmpty ? nil : locked.removeFirst()
         await fillPreparedWindow()
         return current
+    }
+
+    @discardableResult
+    func returnToPrevious() -> PreparedProgramPlayback? {
+        guard let previous = history.popLast() else {
+            return nil
+        }
+        if let current {
+            locked.insert(current, at: 0)
+        }
+        current = previous
+        return previous
     }
 
     @discardableResult
@@ -60,7 +85,9 @@ final class ProgramPlaybackQueue {
         if let failedID = current?.slot.track.id {
             failedTrackIDs.append(failedID)
         }
-        return await advanceAfterCompletion()
+        current = locked.isEmpty ? nil : locked.removeFirst()
+        await fillPreparedWindow()
+        return current
     }
 
     private func fillPreparedWindow() async {

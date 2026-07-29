@@ -98,3 +98,38 @@ func presentationModelConsumesProgramContextAndLiveDJTranscript() {
 
     #expect(model.currentCue == nil)
 }
+
+@Test
+func lrcParserExpandsSharedTextTimestampsAndSortsTheTimeline() {
+    let lines = LRCParser().parse(
+        """
+        [ar:Example]
+        [00:12.50][00:18.00]同一句
+        [00:08.20]先出现
+        [00:24.00]最后一句
+        """
+    )
+
+    #expect(lines.map(\.text) == ["先出现", "同一句", "同一句", "最后一句"])
+    #expect(lines.map(\.startsAt) == [8.2, 12.5, 18, 24])
+}
+
+@Test
+func lyricSceneKeepsTheCurrentLineClearAndNeighborsInDepth() {
+    let scene = StageLyricSceneModel(
+        lines: [
+            StageLyricLine(startsAt: 4, text: "上一句"),
+            StageLyricLine(startsAt: 8, text: "这一句"),
+            StageLyricLine(startsAt: 12, text: "下一句"),
+            StageLyricLine(startsAt: 16, text: "更远一句"),
+        ],
+        playbackTime: 10
+    )
+
+    #expect(scene.lines.map(\.text) == ["上一句", "这一句", "下一句"])
+    #expect(scene.lines.map(\.position) == [-1, 0, 1])
+    #expect(scene.lines[1].opacity == 1)
+    #expect(scene.lines[1].blurRadius == 0)
+    #expect(scene.lines[0].opacity < scene.lines[1].opacity)
+    #expect(scene.lines[2].depth < scene.lines[1].depth)
+}

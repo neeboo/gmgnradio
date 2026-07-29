@@ -196,3 +196,31 @@ func neteaseClientResolvesAPlayableURLForTheUsersAccount() async throws {
     #expect(asset.url.absoluteString == "https://m801.music.126.net/example.mp3")
     #expect(asset.requestHeaders["Referer"] == "https://music.163.com/")
 }
+
+@Test
+func neteaseClientFetchesOriginalAndTranslatedLyrics() async throws {
+    let transport = ProviderHTTPTransportStub(responses: [
+        providerResponse(
+            """
+            {
+              "code": 200,
+              "lrc": {"lyric": "[00:08.20]第一句\\n[00:12.50]第二句"},
+              "tlyric": {"lyric": "[00:08.20]First line\\n[00:12.50]Second line"}
+            }
+            """
+        ),
+    ])
+    let client = NeteaseMusicProviderClient(transport: transport)
+
+    let lyrics = try await client.lyrics(
+        for: "347230",
+        session: providerSession("MUSIC_U=user-session")
+    )
+
+    #expect(lyrics.original.contains("[00:08.20]第一句"))
+    #expect(lyrics.translation?.contains("First line") == true)
+    let request = try #require(await transport.requests.first)
+    #expect(request.url?.path == "/api/song/lyric")
+    #expect(request.url?.query?.contains("id=347230") == true)
+    #expect(request.value(forHTTPHeaderField: "Cookie") == "MUSIC_U=user-session")
+}

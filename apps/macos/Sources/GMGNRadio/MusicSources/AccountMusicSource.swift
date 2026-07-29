@@ -22,6 +22,11 @@ struct MusicProviderLibrary: Equatable, Sendable {
     let recentlyPlayedTrackIDs: [String]
 }
 
+struct MusicLyrics: Equatable, Sendable {
+    let original: String
+    let translation: String?
+}
+
 protocol AccountMusicProviderClient: Sendable {
     func capabilities(
         session: MusicProviderSession
@@ -40,6 +45,11 @@ protocol AccountMusicProviderClient: Sendable {
         for trackID: String,
         session: MusicProviderSession
     ) async throws -> MusicPlaybackAsset
+
+    func lyrics(
+        for trackID: String,
+        session: MusicProviderSession
+    ) async throws -> MusicLyrics
 }
 
 extension AccountMusicProviderClient {
@@ -47,6 +57,13 @@ extension AccountMusicProviderClient {
         for trackID: String,
         session: MusicProviderSession
     ) async throws -> MusicPlaybackAsset {
+        throw MusicProviderClientError.playbackUnavailable
+    }
+
+    func lyrics(
+        for trackID: String,
+        session: MusicProviderSession
+    ) async throws -> MusicLyrics {
         throw MusicProviderClientError.playbackUnavailable
     }
 }
@@ -128,6 +145,14 @@ struct AccountMusicSource: MusicSource {
             throw MusicSourceError.capabilityUnavailable(id)
         }
         return try await client.playbackAsset(
+            for: rawTrackID(trackID),
+            session: session
+        )
+    }
+
+    func lyrics(for trackID: String) async throws -> MusicLyrics {
+        let session = try await connectedSession()
+        return try await client.lyrics(
             for: rawTrackID(trackID),
             session: session
         )
@@ -215,6 +240,10 @@ struct NeteaseMusicSource: MusicSource {
 
     func playbackAsset(for trackID: String) async throws -> MusicPlaybackAsset {
         try await source.playbackAsset(for: trackID)
+    }
+
+    func lyrics(for trackID: String) async throws -> MusicLyrics {
+        try await source.lyrics(for: trackID)
     }
 }
 

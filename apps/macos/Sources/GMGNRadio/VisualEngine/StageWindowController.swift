@@ -7,7 +7,12 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     private let audioMonitor: (any VisualAudioMonitoring)?
     private let presentation: StagePresentationModel
     private let visualDirections: StageVisualDirectionStore
+    private let programStore: DJProgramStore
+    private let lyrics: StageLyricsStore
+    private let playbackPosition: @MainActor () -> TimeInterval
     private let onTogglePlayback: @MainActor () -> Void
+    private let onPreviousTrack: @MainActor () -> Void
+    private let onNextTrack: @MainActor () -> Void
     private var playbackState: LocalMusicPlaybackState
     private weak var stageContentView: StageContentView?
 
@@ -16,15 +21,25 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         audioMonitor: (any VisualAudioMonitoring)? = nil,
         presentation: StagePresentationModel = StagePresentationModel(),
         visualDirections: StageVisualDirectionStore = StageVisualDirectionStore(),
+        programStore: DJProgramStore = .shared,
+        lyrics: StageLyricsStore = .shared,
+        playbackPosition: @escaping @MainActor () -> TimeInterval = { 0 },
         playbackState: LocalMusicPlaybackState = .idle,
-        onTogglePlayback: @escaping @MainActor () -> Void = {}
+        onTogglePlayback: @escaping @MainActor () -> Void = {},
+        onPreviousTrack: @escaping @MainActor () -> Void = {},
+        onNextTrack: @escaping @MainActor () -> Void = {}
     ) {
         self.audioFeatures = audioFeatures
         self.audioMonitor = audioMonitor
         self.presentation = presentation
         self.visualDirections = visualDirections
+        self.programStore = programStore
+        self.lyrics = lyrics
+        self.playbackPosition = playbackPosition
         self.playbackState = playbackState
         self.onTogglePlayback = onTogglePlayback
+        self.onPreviousTrack = onPreviousTrack
+        self.onNextTrack = onNextTrack
         super.init(window: nil)
     }
 
@@ -39,6 +54,16 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     func setPlaybackState(_ state: LocalMusicPlaybackState) {
         playbackState = state
         stageContentView?.setPlaybackState(state)
+    }
+
+    func setProgramNavigation(
+        canGoPrevious: Bool,
+        canGoNext: Bool
+    ) {
+        stageContentView?.setProgramNavigation(
+            canGoPrevious: canGoPrevious,
+            canGoNext: canGoNext
+        )
     }
 
     func show() {
@@ -114,8 +139,13 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
             audioFeatures: audioFeatures,
             presentation: presentation,
             visualDirections: visualDirections,
+            programStore: programStore,
+            lyrics: lyrics,
+            playbackPosition: playbackPosition,
             playbackState: playbackState,
             onTogglePlayback: onTogglePlayback,
+            onPreviousTrack: onPreviousTrack,
+            onNextTrack: onNextTrack,
             onToggleWindowMode: { [weak window] in
                 window?.toggleFullScreen(nil)
             }
@@ -129,30 +159,54 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
 
 @MainActor
 private final class StageContentView: NSView {
-    private let transportControls: StageTransportControlsView
+    private let overlayState: StageOverlayState
+    private var programRail: StageProgramRailHostingView!
+    private var transportControls: StageTransportControlsView!
+    private var isProgramRailVisible = false
 
     init(
         frame: CGRect,
         audioFeatures: VisualAudioFeatureStore,
         presentation: StagePresentationModel,
         visualDirections: StageVisualDirectionStore,
+        programStore: DJProgramStore,
+        lyrics: StageLyricsStore,
+        playbackPosition: @escaping @MainActor () -> TimeInterval,
         playbackState: LocalMusicPlaybackState,
         onTogglePlayback: @escaping @MainActor () -> Void,
+        onPreviousTrack: @escaping @MainActor () -> Void,
+        onNextTrack: @escaping @MainActor () -> Void,
         onToggleWindowMode: @escaping @MainActor () -> Void
     ) {
+        overlayState = StageOverlayState()
+        super.init(frame: frame)
+
+        let programButton = StageProgramButton { [weak self] in
+            self?.toggleProgramRail()
+        }
         let playbackButton = StagePlaybackButton(
             state: playbackState,
             action: onTogglePlayback
+        )
+        let previousButton = StageTrackNavigationButton(
+            direction: .previous,
+            action: onPreviousTrack
+        )
+        let nextButton = StageTrackNavigationButton(
+            direction: .next,
+            action: onNextTrack
         )
         let windowModeButton = StageWindowModeButton(
             mode: .windowed,
             action: onToggleWindowMode
         )
         transportControls = StageTransportControlsView(
+            programButton: programButton,
+            previousButton: previousButton,
             playbackButton: playbackButton,
+            nextButton: nextButton,
             windowModeButton: windowModeButton
         )
-        super.init(frame: frame)
         wantsLayer = true
 
         let metalView = MetalStageView(
@@ -166,13 +220,30 @@ private final class StageContentView: NSView {
         addSubview(metalView)
 
         let overlay = StageOverlayHostingView(
-            rootView: StageOverlayView(presentation: presentation)
+            rootView: StageOverlayView(
+                presentation: presentation,
+                overlayState: overlayState,
+                lyrics: lyrics,
+                playbackPosition: playbackPosition
+            )
         )
         overlay.frame = bounds
         overlay.autoresizingMask = [.width, .height]
         overlay.wantsLayer = true
         overlay.layer?.zPosition = 10
         addSubview(overlay)
+
+        programRail = StageProgramRailHostingView(
+            rootView: StageProgramRailView(programStore: programStore)
+        )
+        programRail.identifier = NSUserInterfaceItemIdentifier(
+            "stage.program-rail"
+        )
+        programRail.translatesAutoresizingMaskIntoConstraints = false
+        programRail.wantsLayer = true
+        programRail.layer?.zPosition = 18
+        programRail.isHidden = true
+        addSubview(programRail)
 
         transportControls.translatesAutoresizingMaskIntoConstraints = false
         transportControls.layer?.zPosition = 20
@@ -186,8 +257,20 @@ private final class StageContentView: NSView {
                 equalTo: bottomAnchor,
                 constant: -22
             ),
-            transportControls.widthAnchor.constraint(equalToConstant: 104),
-            transportControls.heightAnchor.constraint(equalToConstant: 48)
+            transportControls.widthAnchor.constraint(equalToConstant: 232),
+            transportControls.heightAnchor.constraint(equalToConstant: 48),
+
+            programRail.trailingAnchor.constraint(
+                equalTo: trailingAnchor,
+                constant: -18
+            ),
+            programRail.bottomAnchor.constraint(
+                equalTo: transportControls.topAnchor,
+                constant: -10
+            ),
+            programRail.topAnchor.constraint(greaterThanOrEqualTo: topAnchor),
+            programRail.widthAnchor.constraint(equalToConstant: 350),
+            programRail.heightAnchor.constraint(equalToConstant: 430)
         ])
     }
 
@@ -202,6 +285,23 @@ private final class StageContentView: NSView {
     func setPlaybackState(_ state: LocalMusicPlaybackState) {
         transportControls.setPlaybackState(state)
     }
+
+    func setProgramNavigation(
+        canGoPrevious: Bool,
+        canGoNext: Bool
+    ) {
+        transportControls.setProgramNavigation(
+            canGoPrevious: canGoPrevious,
+            canGoNext: canGoNext
+        )
+    }
+
+    private func toggleProgramRail() {
+        isProgramRailVisible.toggle()
+        programRail.isHidden = !isProgramRailVisible
+        transportControls.setProgramRailExpanded(isProgramRailVisible)
+        overlayState.setProgramRailVisible(isProgramRailVisible)
+    }
 }
 
 @MainActor
@@ -212,15 +312,29 @@ private final class StageOverlayHostingView: NSHostingView<StageOverlayView> {
 }
 
 @MainActor
+private final class StageProgramRailHostingView:
+    NSHostingView<StageProgramRailView>
+{}
+
+@MainActor
 private final class StageTransportControlsView: NSVisualEffectView {
+    private let programButton: StageProgramButton
+    private let previousButton: StageTrackNavigationButton
     private let playbackButton: StagePlaybackButton
+    private let nextButton: StageTrackNavigationButton
     private let windowModeButton: StageWindowModeButton
 
     init(
+        programButton: StageProgramButton,
+        previousButton: StageTrackNavigationButton,
         playbackButton: StagePlaybackButton,
+        nextButton: StageTrackNavigationButton,
         windowModeButton: StageWindowModeButton
     ) {
+        self.programButton = programButton
+        self.previousButton = previousButton
         self.playbackButton = playbackButton
+        self.nextButton = nextButton
         self.windowModeButton = windowModeButton
         super.init(frame: .zero)
 
@@ -237,27 +351,92 @@ private final class StageTransportControlsView: NSVisualEffectView {
         layer?.shadowRadius = 14
         layer?.shadowOffset = CGSize(width: 0, height: -4)
 
-        let divider = NSView()
-        divider.wantsLayer = true
-        divider.layer?.backgroundColor = NSColor.white
-            .withAlphaComponent(0.12)
-            .cgColor
+        let dividers = (0 ..< 4).map { _ in
+            let divider = NSView()
+            divider.wantsLayer = true
+            divider.layer?.backgroundColor = NSColor.white
+                .withAlphaComponent(0.12)
+                .cgColor
+            return divider
+        }
 
-        [playbackButton, divider, windowModeButton].forEach {
+        (
+            [
+                programButton,
+                previousButton,
+                playbackButton,
+                nextButton,
+                windowModeButton
+            ] + dividers
+        ).forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             addSubview($0)
         }
 
         NSLayoutConstraint.activate([
-            playbackButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+            programButton.leadingAnchor.constraint(
+                equalTo: leadingAnchor,
+                constant: 4
+            ),
+            programButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            programButton.widthAnchor.constraint(equalToConstant: 44),
+            programButton.heightAnchor.constraint(equalToConstant: 44),
+
+            dividers[0].leadingAnchor.constraint(
+                equalTo: leadingAnchor,
+                constant: 48
+            ),
+            dividers[0].centerYAnchor.constraint(equalTo: centerYAnchor),
+            dividers[0].widthAnchor.constraint(equalToConstant: 1),
+            dividers[0].heightAnchor.constraint(equalToConstant: 18),
+
+            previousButton.leadingAnchor.constraint(
+                equalTo: leadingAnchor,
+                constant: 49
+            ),
+            previousButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            previousButton.widthAnchor.constraint(equalToConstant: 44),
+            previousButton.heightAnchor.constraint(equalToConstant: 44),
+
+            dividers[1].leadingAnchor.constraint(
+                equalTo: leadingAnchor,
+                constant: 93
+            ),
+            dividers[1].centerYAnchor.constraint(equalTo: centerYAnchor),
+            dividers[1].widthAnchor.constraint(equalToConstant: 1),
+            dividers[1].heightAnchor.constraint(equalToConstant: 18),
+
+            playbackButton.leadingAnchor.constraint(
+                equalTo: leadingAnchor,
+                constant: 94
+            ),
             playbackButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             playbackButton.widthAnchor.constraint(equalToConstant: 44),
             playbackButton.heightAnchor.constraint(equalToConstant: 44),
 
-            divider.centerXAnchor.constraint(equalTo: centerXAnchor),
-            divider.centerYAnchor.constraint(equalTo: centerYAnchor),
-            divider.widthAnchor.constraint(equalToConstant: 1),
-            divider.heightAnchor.constraint(equalToConstant: 18),
+            dividers[2].leadingAnchor.constraint(
+                equalTo: leadingAnchor,
+                constant: 138
+            ),
+            dividers[2].centerYAnchor.constraint(equalTo: centerYAnchor),
+            dividers[2].widthAnchor.constraint(equalToConstant: 1),
+            dividers[2].heightAnchor.constraint(equalToConstant: 18),
+
+            nextButton.leadingAnchor.constraint(
+                equalTo: leadingAnchor,
+                constant: 139
+            ),
+            nextButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            nextButton.widthAnchor.constraint(equalToConstant: 44),
+            nextButton.heightAnchor.constraint(equalToConstant: 44),
+
+            dividers[3].leadingAnchor.constraint(
+                equalTo: leadingAnchor,
+                constant: 183
+            ),
+            dividers[3].centerYAnchor.constraint(equalTo: centerYAnchor),
+            dividers[3].widthAnchor.constraint(equalToConstant: 1),
+            dividers[3].heightAnchor.constraint(equalToConstant: 18),
 
             windowModeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
             windowModeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -274,8 +453,226 @@ private final class StageTransportControlsView: NSVisualEffectView {
         playbackButton.setState(state)
     }
 
+    func setProgramNavigation(
+        canGoPrevious: Bool,
+        canGoNext: Bool
+    ) {
+        previousButton.setEnabled(canGoPrevious)
+        nextButton.setEnabled(canGoNext)
+    }
+
     func setWindowMode(_ mode: StageWindowMode) {
         windowModeButton.setMode(mode)
+    }
+
+    func setProgramRailExpanded(_ isExpanded: Bool) {
+        programButton.setExpanded(isExpanded)
+    }
+}
+
+@MainActor
+private final class StageProgramButton: NSButton {
+    private let handler: @MainActor () -> Void
+    private var pointerIsInside = false
+    private var isExpanded = false
+
+    override var alignmentRectInsets: NSEdgeInsets {
+        NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+    }
+
+    init(action: @escaping @MainActor () -> Void) {
+        handler = action
+        super.init(frame: .zero)
+        identifier = NSUserInterfaceItemIdentifier("stage.program-toggle")
+        target = self
+        self.action = #selector(performAction)
+        isBordered = false
+        imagePosition = .imageOnly
+        focusRingType = .none
+        wantsLayer = true
+        layer?.cornerRadius = 20
+        updateContent()
+        updateAppearance()
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func setExpanded(_ isExpanded: Bool) {
+        self.isExpanded = isExpanded
+        updateContent()
+        updateAppearance()
+    }
+
+    override func updateTrackingAreas() {
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(
+            NSTrackingArea(
+                rect: .zero,
+                options: [.activeInKeyWindow, .inVisibleRect, .mouseEnteredAndExited],
+                owner: self
+            )
+        )
+        super.updateTrackingAreas()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        pointerIsInside = true
+        updateAppearance()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        pointerIsInside = false
+        updateAppearance()
+    }
+
+    @objc
+    private func performAction() {
+        handler()
+    }
+
+    private func updateContent() {
+        let label = isExpanded ? "收起节目轨道" : "查看节目轨道"
+        let configuration = NSImage.SymbolConfiguration(
+            pointSize: 14,
+            weight: .medium
+        )
+        image = NSImage(
+            systemSymbolName: isExpanded ? "music.note.list" : "music.note.list",
+            accessibilityDescription: label
+        )?.withSymbolConfiguration(configuration)
+        toolTip = label
+        setAccessibilityLabel(label)
+    }
+
+    private func updateAppearance() {
+        contentTintColor = isExpanded
+            ? NSColor(
+                calibratedRed: 0.38,
+                green: 0.9,
+                blue: 1,
+                alpha: 1
+            )
+            : NSColor.white.withAlphaComponent(pointerIsInside ? 0.92 : 0.64)
+        layer?.backgroundColor = NSColor.white.withAlphaComponent(
+            isExpanded ? 0.1 : (pointerIsInside ? 0.08 : 0)
+        ).cgColor
+    }
+}
+
+@MainActor
+private final class StageTrackNavigationButton: NSButton {
+    enum Direction {
+        case previous
+        case next
+
+        var identifier: String {
+            switch self {
+            case .previous:
+                "stage.previous-track"
+            case .next:
+                "stage.next-track"
+            }
+        }
+
+        var symbolName: String {
+            switch self {
+            case .previous:
+                "backward.end.fill"
+            case .next:
+                "forward.end.fill"
+            }
+        }
+
+        var label: String {
+            switch self {
+            case .previous:
+                "上一首"
+            case .next:
+                "下一首"
+            }
+        }
+    }
+
+    private let handler: @MainActor () -> Void
+    private var pointerIsInside = false
+
+    override var alignmentRectInsets: NSEdgeInsets {
+        NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+    }
+
+    init(
+        direction: Direction,
+        action: @escaping @MainActor () -> Void
+    ) {
+        handler = action
+        super.init(frame: .zero)
+        identifier = NSUserInterfaceItemIdentifier(direction.identifier)
+        target = self
+        self.action = #selector(performAction)
+        isBordered = false
+        imagePosition = .imageOnly
+        focusRingType = .none
+        wantsLayer = true
+        layer?.cornerRadius = 20
+        let configuration = NSImage.SymbolConfiguration(
+            pointSize: 13,
+            weight: .medium
+        )
+        image = NSImage(
+            systemSymbolName: direction.symbolName,
+            accessibilityDescription: direction.label
+        )?.withSymbolConfiguration(configuration)
+        toolTip = direction.label
+        setAccessibilityLabel(direction.label)
+        setEnabled(false)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func setEnabled(_ enabled: Bool) {
+        isEnabled = enabled
+        updateAppearance()
+    }
+
+    override func updateTrackingAreas() {
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(
+            NSTrackingArea(
+                rect: .zero,
+                options: [.activeInKeyWindow, .inVisibleRect, .mouseEnteredAndExited],
+                owner: self
+            )
+        )
+        super.updateTrackingAreas()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        pointerIsInside = true
+        updateAppearance()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        pointerIsInside = false
+        updateAppearance()
+    }
+
+    @objc
+    private func performAction() {
+        handler()
+    }
+
+    private func updateAppearance() {
+        alphaValue = isEnabled ? 1 : 0.28
+        contentTintColor = NSColor.white.withAlphaComponent(
+            pointerIsInside && isEnabled ? 0.94 : 0.64
+        )
+        layer?.backgroundColor = NSColor.white.withAlphaComponent(
+            pointerIsInside && isEnabled ? 0.1 : 0
+        ).cgColor
     }
 }
 

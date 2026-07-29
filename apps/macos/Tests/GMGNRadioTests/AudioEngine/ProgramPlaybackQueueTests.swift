@@ -91,6 +91,24 @@ func programPlaybackQueueReplacesTheCurrentTrackAfterPlaybackFailure() async thr
 
 @Test
 @MainActor
+func programPlaybackQueueReturnsToThePreviousTrackWithoutLosingTheCurrentOne() async throws {
+    let queue = ProgramPlaybackQueue(
+        preflight: PlaybackPreflight(preparer: PlaybackPreparingSpy())
+    )
+    try await queue.load(playbackPlan(ids: ["1", "2", "3", "4"]))
+
+    _ = await queue.advanceAfterCompletion()
+    let previous = queue.returnToPrevious()
+
+    #expect(previous?.slot.track.id == "1")
+    #expect(queue.current?.slot.track.id == "1")
+    #expect(queue.locked.map(\.slot.track.id) == ["2", "3", "4"])
+    #expect(queue.canReturnToPrevious == false)
+    #expect(queue.canAdvance == true)
+}
+
+@Test
+@MainActor
 func programPlaybackQueueReportsWhenNoSlotCanBePrepared() async {
     let preparer = PlaybackPreparingSpy()
     preparer.failingTrackIDs = ["1", "2"]

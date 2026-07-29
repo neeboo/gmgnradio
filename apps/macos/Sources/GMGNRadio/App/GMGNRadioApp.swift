@@ -133,6 +133,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
     private let stagePresentation = StagePresentationModel()
     private let stageVisualDirections = StageVisualDirectionStore()
     private let programStore = DJProgramStore.shared
+    private let stageLyrics = StageLyricsStore.shared
     private let realtimeDJSessionController = RealtimeDJSessionController()
     private lazy var musicRuntime = MusicRuntime.live()
     private lazy var audioGraph = AudioGraphController(
@@ -209,6 +210,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
     func startAIProgram() {
         orbWindowController?.setState(.thinking)
         activeProgram = nil
+        updateStageProgramNavigation()
         programStore.beginPlanning()
         Task { [weak self] in
             guard let self else {
@@ -238,6 +240,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
                 try await playPreparedWithFallback(prepared)
             } catch {
                 orbWindowController?.setState(.failed)
+                activeProgram = nil
+                updateStageProgramNavigation()
                 programStore.fail(error.localizedDescription)
                 presentProgramError(error)
             }
@@ -262,6 +266,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         }
 
         do {
+            activeProgram = nil
+            updateStageProgramNavigation()
             try playLocalTrack(url)
         } catch {
             presentPlaybackError(error)
@@ -291,7 +297,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         orbWindowController?.exitImmersiveVisuals()
     }
 
-    private func playLocalTrack(_ url: URL) throws {
+    private func playLocalTrack(
+        _ url: URL,
+        loadSidecarLyrics: Bool = true
+    ) throws {
+        if loadSidecarLyrics {
+            publishSidecarLyrics(for: url)
+        }
         try localMusicPlayer.load(url)
         try localMusicPlayer.play()
         orbWindowController?.setState(.playing)
@@ -333,12 +345,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
                         .advanceAfterCompletion()
                 else {
                     activeProgram = nil
+                    stageLyrics.clear()
                     orbWindowController?.setState(.idle)
                     stageWindowController?.setPlaybackState(.idle)
+                    updateStageProgramNavigation()
                     return
                 }
                 try await playPreparedWithFallback(next)
             } catch {
+                programStore.fail(error.localizedDescription)
+                presentProgramError(error)
+            }
+        }
+    }
+
+    private func playPreviousProgramTrack() {
+        guard
+            activeProgram != nil,
+            let previous = programPlaybackQueue.returnToPrevious()
+        else {
+            return
+        }
+        updateStageProgramNavigation()
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+            do {
+                try await playPreparedWithFallback(previous)
+            } catch {
+                programStore.fail(error.localizedDescription)
+                presentProgramError(error)
+            }
+        }
+    }
+
+    private func playNextProgramTrack() {
+        guard activeProgram != nil else {
+            return
+        }
+        stageWindowController?.setProgramNavigation(
+            canGoPrevious: false,
+            canGoNext: false
+        )
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+            do {
+                guard
+                    let next = await programPlaybackQueue
+                        .advanceAfterCompletion()
+                else {
+                    activeProgram = nil
+                    stageLyrics.clear()
+                    orbWindowController?.setState(.idle)
+                    stageWindowController?.setPlaybackState(.idle)
+                    updateStageProgramNavigation()
+                    return
+                }
+                try await playPreparedWithFallback(next)
+            } catch {
+                updateStageProgramNavigation()
                 programStore.fail(error.localizedDescription)
                 presentProgramError(error)
             }
@@ -375,22 +443,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         }
 
         programStore.activateSlot(at: index)
+        stageLyrics.clear()
         stageVisualDirections.update(
             ProgramVisualDirector().cue(for: slot)
         )
         await present(plan: activeProgram, slotIndex: index)
+        let lyricTrackID = slot.track.id
+        Task { [weak self] in
+            guard
+                let self,
+                let lyrics = try? await musicRuntime.lyrics(for: slot.track),
+                programStore.activeSlot?.track.id == lyricTrackID
+            else {
+                return
+            }
+            stageLyrics.publish(lyrics, trackID: lyricTrackID)
+        }
 
         switch prepared.target {
         case let .localFile(url):
-            try playLocalTrack(url)
+            try playLocalTrack(url, loadSidecarLyrics: false)
         case let .providerReference(providerID, trackID):
             guard providerID == .appleMusic else {
                 throw MusicProviderClientError.playbackUnavailable
             }
             try await musicRuntime.startAppleMusic(trackID: trackID)
             orbWindowController?.setState(.playing)
+            stageWindowController?.setPlaybackState(.playing)
             showStage()
         }
+        updateStageProgramNavigation()
     }
 
     private func present(
@@ -471,11 +553,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
             audioMonitor: monitor,
             presentation: stagePresentation,
             visualDirections: stageVisualDirections,
+            programStore: programStore,
+            lyrics: stageLyrics,
+            playbackPosition: { [weak self] in
+                self?.audioGraph.playbackPosition ?? 0
+            },
             playbackState: localMusicPlayer.state,
             onTogglePlayback: { [weak self] in
                 self?.toggleLocalPlayback()
+            },
+            onPreviousTrack: { [weak self] in
+                self?.playPreviousProgramTrack()
+            },
+            onNextTrack: { [weak self] in
+                self?.playNextProgramTrack()
             }
         )
+        updateStageProgramNavigation()
 
         stagePresentationTask?.cancel()
         stagePresentationTask = Task { [weak self] in
@@ -491,6 +585,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
                 stagePresentation.consume(event)
             }
         }
+    }
+
+    private func updateStageProgramNavigation() {
+        let hasProgram = activeProgram != nil
+        stageWindowController?.setProgramNavigation(
+            canGoPrevious: hasProgram
+                && programPlaybackQueue.canReturnToPrevious,
+            canGoNext: hasProgram && programPlaybackQueue.canAdvance
+        )
+    }
+
+    private func publishSidecarLyrics(for audioURL: URL) {
+        stageLyrics.clear()
+        let lrcURL = audioURL
+            .deletingPathExtension()
+            .appendingPathExtension("lrc")
+        guard
+            let source = try? String(contentsOf: lrcURL, encoding: .utf8),
+            !source.isEmpty
+        else {
+            return
+        }
+        stageLyrics.publish(
+            MusicLyrics(original: source, translation: nil),
+            trackID: audioURL.path
+        )
     }
 
     @discardableResult

@@ -188,6 +188,44 @@ struct NeteaseMusicProviderClient: AccountMusicProviderClient {
         )
     }
 
+    func lyrics(
+        for trackID: String,
+        session: MusicProviderSession
+    ) async throws -> MusicLyrics {
+        let cookie = try session.cookieHeader()
+        var components = URLComponents(
+            url: baseURL.appending(path: "/api/song/lyric"),
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "id", value: trackID),
+            URLQueryItem(name: "lv", value: "-1"),
+            URLQueryItem(name: "kv", value: "-1"),
+            URLQueryItem(name: "tv", value: "-1"),
+        ]
+        let data = try checkedProviderResponse(
+            await transport.send(
+                providerRequest(url: components.url!, cookie: cookie)
+            )
+        )
+        let response = try JSONDecoder().decode(
+            NeteaseLyricsResponse.self,
+            from: data
+        )
+        guard
+            let original = response.lrc?.lyric,
+            !original.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            throw MusicProviderClientError.invalidResponse
+        }
+        let translation = response.tlyric?.lyric?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return MusicLyrics(
+            original: original,
+            translation: translation?.isEmpty == false ? translation : nil
+        )
+    }
+
     private func securePlaybackURL(_ url: URL) -> URL {
         guard
             url.scheme?.lowercased() == "http",
@@ -281,6 +319,15 @@ private struct NeteasePlaybackResponse: Decodable {
     struct Item: Decodable {
         let url: URL?
         let code: Int
+    }
+}
+
+private struct NeteaseLyricsResponse: Decodable {
+    let lrc: Payload?
+    let tlyric: Payload?
+
+    struct Payload: Decodable {
+        let lyric: String?
     }
 }
 

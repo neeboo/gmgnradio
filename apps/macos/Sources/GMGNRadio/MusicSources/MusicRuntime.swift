@@ -122,6 +122,15 @@ final class MusicRuntime {
         }
     }
 
+    func lyrics(for candidate: MusicCandidate) async throws -> MusicLyrics? {
+        switch candidate.providerID {
+        case .netease:
+            try await netease.lyrics(for: candidate.id)
+        default:
+            nil
+        }
+    }
+
     func startAppleMusic(trackID: String) async throws {
         try await appleMusic.play(trackID: trackID)
     }
