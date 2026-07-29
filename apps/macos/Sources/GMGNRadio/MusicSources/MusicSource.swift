@@ -1,5 +1,27 @@
 import Foundation
 
+struct MusicProviderID:
+    RawRepresentable,
+    Hashable,
+    Codable,
+    Sendable,
+    ExpressibleByStringLiteral
+{
+    let rawValue: String
+
+    init(rawValue: String) {
+        self.rawValue = rawValue
+    }
+
+    init(stringLiteral value: StringLiteralType) {
+        self.init(rawValue: value)
+    }
+
+    static let local = MusicProviderID(rawValue: "local")
+    static let netease = MusicProviderID(rawValue: "netease")
+    static let qqMusic = MusicProviderID(rawValue: "qq-music")
+}
+
 enum MusicSourceKind: String, Codable, Sendable {
     case localLibrary
     case streaming
@@ -11,6 +33,7 @@ enum MusicAccountAuthorizationState: String, Codable, Sendable {
     case connected
     case expired
     case denied
+    case unavailable
 }
 
 enum MusicSourceAccess: Equatable, Sendable {
@@ -33,15 +56,6 @@ struct MusicAccountCapabilities: Equatable, Sendable {
     let canReadPlaylists: Bool
     let canReadRecentPlays: Bool
     let canPlay: Bool
-}
-
-protocol MusicAccountSession: Sendable {
-    var providerID: String { get }
-
-    func authorizationState() async -> MusicAccountAuthorizationState
-    func connect() async throws
-    func disconnect() async
-    func capabilities() async throws -> MusicAccountCapabilities
 }
 
 struct MusicSearchRequest: Equatable, Sendable {
@@ -69,6 +83,7 @@ struct MusicSearchRequest: Equatable, Sendable {
 struct MusicCandidate: Codable, Equatable, Sendable {
     let id: String
     let canonicalID: String?
+    let providerID: MusicProviderID
     let source: MusicSourceKind
     let title: String
     let artist: String
@@ -102,15 +117,15 @@ struct MusicLibrarySnapshot: Equatable, Sendable {
 }
 
 protocol MusicSource: Sendable {
-    var id: String { get }
-    var access: MusicSourceAccess { get }
+    var id: MusicProviderID { get }
 
+    func access() async -> MusicSourceAccess
     func search(_ request: MusicSearchRequest) async throws -> [MusicCandidate]
     func fetchUserLibrary() async throws -> MusicLibrarySnapshot
 }
 
 extension MusicSource {
-    var access: MusicSourceAccess { .local }
+    func access() async -> MusicSourceAccess { .local }
 
     func fetchUserLibrary() async throws -> MusicLibrarySnapshot {
         MusicLibrarySnapshot(

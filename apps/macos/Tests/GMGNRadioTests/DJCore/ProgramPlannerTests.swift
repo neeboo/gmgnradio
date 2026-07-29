@@ -107,6 +107,7 @@ func candidate(
     canonicalID: String? = nil,
     title: String,
     artist: String = "Example Artist",
+    providerID: MusicProviderID = .local,
     source: MusicSourceKind = .localLibrary,
     duration: TimeInterval = 240,
     energy: Double = 0.5,
@@ -116,6 +117,7 @@ func candidate(
     MusicCandidate(
         id: id,
         canonicalID: canonicalID,
+        providerID: providerID,
         source: source,
         title: title,
         artist: artist,

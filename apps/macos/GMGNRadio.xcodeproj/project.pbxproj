@@ -26,9 +26,11 @@
 		583709DB2BCEF0293ECDCD8B /* UnifiedMusicSearch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 96E6D962FE7287F48210926F /* UnifiedMusicSearch.swift */; };
 		5F8E787A682533EA402207D8 /* DoubaoRTCEventMapper.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9758A4F0754760FA0AB854CA /* DoubaoRTCEventMapper.swift */; };
 		6457881F70FAC522542403A5 /* PresencePackageStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6928DE615B4CCBB86C03160 /* PresencePackageStoreTests.swift */; };
+		6663E63CBD50E0B8BE5DF04C /* MusicProviderSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 19D1AC1EED8E537124163209 /* MusicProviderSession.swift */; };
 		6F33A84A6365FF3418372AFC /* ElevenLabsAudioLevelRendererTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D61973FBC289CA1574CC7E72 /* ElevenLabsAudioLevelRendererTests.swift */; };
 		761481871644BCC5C68DF17C /* OrbMotionModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A9A0DF149EE2164BBDE40EB /* OrbMotionModelTests.swift */; };
 		7A17C5E01AC43CD75E7C7195 /* OrbState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43F2D91E87ABAC0F51F8C126 /* OrbState.swift */; };
+		80AC6AC25FAE9E0FBCB11CDF /* AccountMusicSourceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF6190681ED5961F6C2903FE /* AccountMusicSourceTests.swift */; };
 		8573E115B6C4C7AB8C10C1B8 /* ElevenLabsSDKConversationTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0F3CB58D63948E17D4EC76C /* ElevenLabsSDKConversationTransport.swift */; };
 		8F5213621CDE66174CBBDA8A /* ProgramDecision.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA8AFFDEBE45F4BC907FDDA1 /* ProgramDecision.swift */; };
 		936430A6AC4FF9D7B3D62C5C /* GMGNRadioApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39FC866C894AFC1D958539BF /* GMGNRadioApp.swift */; };
@@ -41,6 +43,7 @@
 		ABDB36FE110EDF6A739619DD /* MusicSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE207F3AFC138651AB03E8DB /* MusicSource.swift */; };
 		AC9B9EFB9BD89EE723266DA5 /* ElevenLabsRealtimeSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E442A4484F6338F0288177A4 /* ElevenLabsRealtimeSessionTests.swift */; };
 		AD473CDA80FF3D2D2D266FC6 /* RealtimeDJSessionController.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB1A15690B115ECC57F64F9E /* RealtimeDJSessionController.swift */; };
+		B6FFE9B34760DB9760F6F035 /* AccountMusicSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA2E1A48CBD8D8307D47212 /* AccountMusicSource.swift */; };
 		B7E5C80664487C1D748EF6D4 /* PresencePackageStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4BC287B276AB0F4EDFACFE51 /* PresencePackageStore.swift */; };
 		B80D0EC6A0BCEBE17501EEC0 /* SettingsMenuActionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 344E89599D7920F3C43236A7 /* SettingsMenuActionTests.swift */; };
 		D721C4D533DAA4D461CEF6D2 /* PlaybackContext.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2457A76CBF19C18E6D386EE /* PlaybackContext.swift */; };
@@ -55,6 +58,7 @@
 		F83BDCD045FC0F46E849868C /* WindowPlacementTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9968CE566BC39260555871B7 /* WindowPlacementTests.swift */; };
 		F8928F63DF1AF0D26D9D258B /* PresenceSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A98371838646D4018D596A5 /* PresenceSettingsView.swift */; };
 		F9AFBCD0A63C8A453D1F2199 /* OrbWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 38784FBC97203965A192FDAC /* OrbWindowController.swift */; };
+		FEB695324573D6CFD1F22958 /* KeychainMusicProviderSessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E040D830C5842BD73D5F5C12 /* KeychainMusicProviderSessionStore.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -72,6 +76,7 @@
 		07DE01676AC401339B9DCC2F /* OrbMotionModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbMotionModel.swift; sourceTree = "<group>"; };
 		091F9A1DA278A0DA5C8E4A4E /* ProgramPlannerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgramPlannerTests.swift; sourceTree = "<group>"; };
 		1445F76B4536834CB72C2EE3 /* ElevenLabsAudioLevelRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElevenLabsAudioLevelRenderer.swift; sourceTree = "<group>"; };
+		19D1AC1EED8E537124163209 /* MusicProviderSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicProviderSession.swift; sourceTree = "<group>"; };
 		20C65C2BD0FD2417BAFBD387 /* PresenceCommandService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceCommandService.swift; sourceTree = "<group>"; };
 		216A6D94509E4915BCC18C7C /* RealtimeDJSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeDJSession.swift; sourceTree = "<group>"; };
 		344E89599D7920F3C43236A7 /* SettingsMenuActionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsMenuActionTests.swift; sourceTree = "<group>"; };
@@ -84,6 +89,7 @@
 		43F2D91E87ABAC0F51F8C126 /* OrbState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbState.swift; sourceTree = "<group>"; };
 		47876636EF21649388CE59E3 /* OrbUniforms.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbUniforms.swift; sourceTree = "<group>"; };
 		4BC287B276AB0F4EDFACFE51 /* PresencePackageStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresencePackageStore.swift; sourceTree = "<group>"; };
+		4EA2E1A48CBD8D8307D47212 /* AccountMusicSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountMusicSource.swift; sourceTree = "<group>"; };
 		5CF6A9DCAC8752FE6AEFD4EC /* ImmersiveSceneController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImmersiveSceneController.swift; sourceTree = "<group>"; };
 		6A98371838646D4018D596A5 /* PresenceSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceSettingsView.swift; sourceTree = "<group>"; };
 		77166FE9E4995A36C34A2D90 /* GMGNRadioTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = GMGNRadioTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -98,6 +104,7 @@
 		A4E48BCF663DCFB840547923 /* BailianRealtimeEventMapper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BailianRealtimeEventMapper.swift; sourceTree = "<group>"; };
 		AC10161C41BE8EB05A51FC8D /* AppSmokeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSmokeTests.swift; sourceTree = "<group>"; };
 		AE207F3AFC138651AB03E8DB /* MusicSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicSource.swift; sourceTree = "<group>"; };
+		AF6190681ED5961F6C2903FE /* AccountMusicSourceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountMusicSourceTests.swift; sourceTree = "<group>"; };
 		B0F3CB58D63948E17D4EC76C /* ElevenLabsSDKConversationTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElevenLabsSDKConversationTransport.swift; sourceTree = "<group>"; };
 		BA8AFFDEBE45F4BC907FDDA1 /* ProgramDecision.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgramDecision.swift; sourceTree = "<group>"; };
 		BBAA0158B7BFF631FD685449 /* DJState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DJState.swift; sourceTree = "<group>"; };
@@ -110,6 +117,7 @@
 		D61973FBC289CA1574CC7E72 /* ElevenLabsAudioLevelRendererTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElevenLabsAudioLevelRendererTests.swift; sourceTree = "<group>"; };
 		D6ADB71DE1D4B227CC6BDDB4 /* ElevenLabsRealtimeEventMapper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElevenLabsRealtimeEventMapper.swift; sourceTree = "<group>"; };
 		E012C530DC089221A1FE34C1 /* ProgramPlanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgramPlanner.swift; sourceTree = "<group>"; };
+		E040D830C5842BD73D5F5C12 /* KeychainMusicProviderSessionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainMusicProviderSessionStore.swift; sourceTree = "<group>"; };
 		E10077CC5B0FFD300B288B48 /* PresenceManifest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceManifest.swift; sourceTree = "<group>"; };
 		E442A4484F6338F0288177A4 /* ElevenLabsRealtimeSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElevenLabsRealtimeSessionTests.swift; sourceTree = "<group>"; };
 		E6928DE615B4CCBB86C03160 /* PresencePackageStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresencePackageStoreTests.swift; sourceTree = "<group>"; };
@@ -159,6 +167,9 @@
 		19CC55771B2173DC737025A8 /* MusicSources */ = {
 			isa = PBXGroup;
 			children = (
+				4EA2E1A48CBD8D8307D47212 /* AccountMusicSource.swift */,
+				E040D830C5842BD73D5F5C12 /* KeychainMusicProviderSessionStore.swift */,
+				19D1AC1EED8E537124163209 /* MusicProviderSession.swift */,
 				AE207F3AFC138651AB03E8DB /* MusicSource.swift */,
 				96E6D962FE7287F48210926F /* UnifiedMusicSearch.swift */,
 			);
@@ -214,6 +225,7 @@
 		3DC07018658EA66A469705D0 /* MusicSources */ = {
 			isa = PBXGroup;
 			children = (
+				AF6190681ED5961F6C2903FE /* AccountMusicSourceTests.swift */,
 				3C5D0DADBAA7035525DDE57F /* UnifiedMusicSearchTests.swift */,
 			);
 			path = MusicSources;
@@ -482,6 +494,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				80AC6AC25FAE9E0FBCB11CDF /* AccountMusicSourceTests.swift in Sources */,
 				1F04322C71F0C43CD2AEA3B6 /* AppSmokeTests.swift in Sources */,
 				2D4E0673D2067888218B2BF5 /* DJStateTests.swift in Sources */,
 				6F33A84A6365FF3418372AFC /* ElevenLabsAudioLevelRendererTests.swift in Sources */,
@@ -504,6 +517,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B6FFE9B34760DB9760F6F035 /* AccountMusicSource.swift in Sources */,
 				F7389A2ED65FC4849A86CEC4 /* BailianRealtimeEventMapper.swift in Sources */,
 				559086501216765204D4B06C /* DJState.swift in Sources */,
 				5F8E787A682533EA402207D8 /* DoubaoRTCEventMapper.swift in Sources */,
@@ -514,6 +528,8 @@
 				936430A6AC4FF9D7B3D62C5C /* GMGNRadioApp.swift in Sources */,
 				AA95F2ACA1E99472A1547DB9 /* Immersive.metal in Sources */,
 				A51F42242E8A5663CE0BC305 /* ImmersiveSceneController.swift in Sources */,
+				FEB695324573D6CFD1F22958 /* KeychainMusicProviderSessionStore.swift in Sources */,
+				6663E63CBD50E0B8BE5DF04C /* MusicProviderSession.swift in Sources */,
 				ABDB36FE110EDF6A739619DD /* MusicSource.swift in Sources */,
 				94A2BC7B04AA84C9A463CED6 /* Orb.metal in Sources */,
 				A812DB23EA81DBB7D2B72B1D /* OrbMetalView.swift in Sources */,

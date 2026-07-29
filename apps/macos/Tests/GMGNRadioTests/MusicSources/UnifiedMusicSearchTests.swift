@@ -80,9 +80,23 @@ func unifiedSearchSkipsStreamingSourcesUntilTheirAccountIsReady() async throws {
 }
 
 private struct StubMusicSource: MusicSource {
-    let id: String
-    var access: MusicSourceAccess = .local
+    let id: MusicProviderID
+    var accessState: MusicSourceAccess = .local
     let candidates: [MusicCandidate]
+
+    init(
+        id: MusicProviderID,
+        access: MusicSourceAccess = .local,
+        candidates: [MusicCandidate]
+    ) {
+        self.id = id
+        self.accessState = access
+        self.candidates = candidates
+    }
+
+    func access() async -> MusicSourceAccess {
+        accessState
+    }
 
     func search(_ request: MusicSearchRequest) async throws -> [MusicCandidate] {
         candidates

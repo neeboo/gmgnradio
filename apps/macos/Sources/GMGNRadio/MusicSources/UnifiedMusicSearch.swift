@@ -12,9 +12,12 @@ struct UnifiedMusicSearch: Sendable {
             of: [MusicCandidate].self,
             returning: [[MusicCandidate]].self
         ) { group in
-            for source in sources where source.access.isReady {
+            for source in sources {
                 group.addTask {
-                    (try? await source.search(request)) ?? []
+                    guard await source.access().isReady else {
+                        return []
+                    }
+                    return (try? await source.search(request)) ?? []
                 }
             }
 
