@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 enum ProductIdentity {
     static let displayName = "gmgn radio"
@@ -13,6 +14,13 @@ struct GMGNRadioApp: App {
 
     var body: some Scene {
         MenuBarExtra(ProductIdentity.displayName, systemImage: "waveform.circle.fill") {
+            Button("播放本地音乐…") {
+                AppMenuAction.chooseLocalTrack.perform(on: appDelegate)
+            }
+            Button("暂停 / 继续音乐") {
+                AppMenuAction.toggleLocalPlayback.perform(on: appDelegate)
+            }
+            Divider()
             Button("打开 360°舞台") {
                 AppMenuAction.showStage.perform(on: appDelegate)
             }
@@ -64,12 +72,16 @@ struct GMGNRadioApp: App {
 protocol GMGNApplicationControlling: AnyObject {
     func showStage()
     func closeStage()
+    func chooseLocalTrack()
+    func toggleLocalPlayback()
     func exitImmersiveVisuals()
 }
 
 enum AppMenuAction: Sendable {
     case showStage
     case closeStage
+    case chooseLocalTrack
+    case toggleLocalPlayback
     case exitImmersiveVisuals
 
     @MainActor
@@ -79,6 +91,10 @@ enum AppMenuAction: Sendable {
             controller.showStage()
         case .closeStage:
             controller.closeStage()
+        case .chooseLocalTrack:
+            controller.chooseLocalTrack()
+        case .toggleLocalPlayback:
+            controller.toggleLocalPlayback()
         case .exitImmersiveVisuals:
             controller.exitImmersiveVisuals()
         }
@@ -106,6 +122,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
     private let audioFeatures = VisualAudioFeatureStore()
     private let stagePresentation = StagePresentationModel()
     private let realtimeDJSessionController = RealtimeDJSessionController()
+    private lazy var audioGraph = AudioGraphController(
+        visualStore: audioFeatures
+    )
+    private lazy var localMusicPlayer = LocalMusicPlayer(graph: audioGraph)
     private var orbWindowController: OrbWindowController?
     private var stageWindowController: StageWindowController?
     private var stageAudioMonitor: VisualAudioInputMonitor?
@@ -130,6 +150,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         if environment["GMGN_STAGE"] == "1" {
             showStage()
         }
+        if let trackPath = environment["GMGN_LOCAL_TRACK"] {
+            do {
+                try playLocalTrack(URL(fileURLWithPath: trackPath))
+            } catch {
+                presentPlaybackError(error)
+            }
+        }
     }
 
     func showStage() {
@@ -143,8 +170,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         stageWindowController?.close()
     }
 
+    func chooseLocalTrack() {
+        let panel = NSOpenPanel()
+        panel.title = "选择一首音乐"
+        panel.prompt = "播放"
+        panel.allowedContentTypes = [.audio]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else {
+            return
+        }
+
+        do {
+            try playLocalTrack(url)
+        } catch {
+            presentPlaybackError(error)
+        }
+    }
+
+    func toggleLocalPlayback() {
+        switch localMusicPlayer.state {
+        case .playing:
+            localMusicPlayer.pause()
+        case .ready, .paused, .finished:
+            try? localMusicPlayer.play()
+        case .idle:
+            break
+        }
+    }
+
     func exitImmersiveVisuals() {
         orbWindowController?.exitImmersiveVisuals()
+    }
+
+    private func playLocalTrack(_ url: URL) throws {
+        try localMusicPlayer.load(url)
+        try localMusicPlayer.play()
+        showStage()
+    }
+
+    private func presentPlaybackError(_ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "这首音乐暂时播放不了"
+        alert.informativeText = error.localizedDescription
+        alert.runModal()
     }
 
     private func configureStage() {

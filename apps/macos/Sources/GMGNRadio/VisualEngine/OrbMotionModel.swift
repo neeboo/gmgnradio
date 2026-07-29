@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 struct VisualAudioFeatures: Equatable, Sendable {
     var low: Float
@@ -8,12 +9,19 @@ struct VisualAudioFeatures: Equatable, Sendable {
     static let silent = VisualAudioFeatures(low: 0, mid: 0, high: 0)
 }
 
-@MainActor
 final class VisualAudioFeatureStore {
-    private(set) var current: VisualAudioFeatures = .silent
+    private let storage = OSAllocatedUnfairLock(
+        initialState: VisualAudioFeatures.silent
+    )
+
+    var current: VisualAudioFeatures {
+        storage.withLock { $0 }
+    }
 
     func update(_ features: VisualAudioFeatures) {
-        current = features
+        storage.withLock { current in
+            current = features
+        }
     }
 }
 
