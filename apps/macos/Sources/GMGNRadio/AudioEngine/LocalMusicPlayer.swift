@@ -28,7 +28,7 @@ protocol LocalMusicPlaybackGraph: AnyObject {
 @MainActor
 final class LocalMusicPlayer {
     private let graph: any LocalMusicPlaybackGraph
-    private let onFinished: @MainActor () -> Void
+    private var onFinished: @MainActor () -> Void
     private var playbackGeneration: UInt64 = 0
 
     private(set) var state: LocalMusicPlaybackState = .idle
@@ -39,6 +39,12 @@ final class LocalMusicPlayer {
         onFinished: @escaping @MainActor () -> Void = {}
     ) {
         self.graph = graph
+        self.onFinished = onFinished
+    }
+
+    func setCompletionHandler(
+        _ onFinished: @escaping @MainActor () -> Void
+    ) {
         self.onFinished = onFinished
     }
 

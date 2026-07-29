@@ -71,6 +71,28 @@ func completionFromAnOldTrackCannotFinishTheCurrentTrack() throws {
     #expect(player.track?.title == "second")
 }
 
+@Test
+@MainActor
+func localMusicPlayerCanReplaceItsCompletionHandlerForQueueIntegration() throws {
+    let graph = LocalMusicPlaybackGraphSpy()
+    var firstHandlerCount = 0
+    var replacementHandlerCount = 0
+    let player = LocalMusicPlayer(
+        graph: graph,
+        onFinished: { firstHandlerCount += 1 }
+    )
+    player.setCompletionHandler {
+        replacementHandlerCount += 1
+    }
+
+    try player.load(URL(fileURLWithPath: "/tmp/first.wav"))
+    try player.play()
+    graph.finish()
+
+    #expect(firstHandlerCount == 0)
+    #expect(replacementHandlerCount == 1)
+}
+
 @MainActor
 private final class LocalMusicPlaybackGraphSpy: LocalMusicPlaybackGraph {
     private var completions: [@MainActor @Sendable () -> Void] = []
