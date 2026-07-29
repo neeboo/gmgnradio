@@ -14,6 +14,10 @@ struct GMGNRadioApp: App {
 
     var body: some Scene {
         MenuBarExtra(ProductIdentity.displayName, systemImage: "waveform.circle.fill") {
+            Button("开始 AI 电台") {
+                AppMenuAction.startAIProgram.perform(on: appDelegate)
+            }
+            Divider()
             Button("播放本地音乐…") {
                 AppMenuAction.chooseLocalTrack.perform(on: appDelegate)
             }
@@ -70,6 +74,7 @@ struct GMGNRadioApp: App {
 
 @MainActor
 protocol GMGNApplicationControlling: AnyObject {
+    func startAIProgram()
     func showStage()
     func closeStage()
     func chooseLocalTrack()
@@ -78,6 +83,7 @@ protocol GMGNApplicationControlling: AnyObject {
 }
 
 enum AppMenuAction: Sendable {
+    case startAIProgram
     case showStage
     case closeStage
     case chooseLocalTrack
@@ -87,6 +93,8 @@ enum AppMenuAction: Sendable {
     @MainActor
     func perform(on controller: any GMGNApplicationControlling) {
         switch self {
+        case .startAIProgram:
+            controller.startAIProgram()
         case .showStage:
             controller.showStage()
         case .closeStage:
@@ -184,6 +192,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         stageWindowController?.show()
     }
 
+    func startAIProgram() {
+        orbWindowController?.setState(.thinking)
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+            do {
+                let agent = try CodexTrackRankingAgent.live()
+                let brief = Self.currentProgramBrief()
+                let plan = try await musicRuntime.makeProgramPlan(
+                    brief: brief,
+                    agent: agent
+                )
+                guard let first = plan.slots.first else {
+                    throw ProgramPlannerError.insufficientPlayableCandidates(
+                        required: 5,
+                        available: 0
+                    )
+                }
+                let playback = try await musicRuntime.preparePlayback(
+                    for: first.track
+                )
+                present(plan: plan)
+                switch playback {
+                case let .pcmFile(url):
+                    try playLocalTrack(url)
+                case let .appleMusic(trackID):
+                    try await musicRuntime.startAppleMusic(trackID: trackID)
+                    orbWindowController?.setState(.playing)
+                    showStage()
+                }
+            } catch {
+                orbWindowController?.setState(.failed)
+                presentProgramError(error)
+            }
+        }
+    }
+
     func closeStage() {
         stageWindowController?.close()
     }
@@ -238,6 +284,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         alert.messageText = "这首音乐暂时播放不了"
         alert.informativeText = error.localizedDescription
         alert.runModal()
+    }
+
+    private func presentProgramError(_ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "DJ 暂时排不了节目"
+        alert.informativeText = error.localizedDescription
+        alert.runModal()
+    }
+
+    private func present(plan: ProgramPlan) {
+        guard let first = plan.slots.first else {
+            return
+        }
+        let upcoming = plan.slots.dropFirst().map(\.track.id)
+        stagePresentation.apply(
+            RealtimeDJContext(
+                playback: PlaybackContext(
+                    currentTrack: TrackReference(
+                        id: first.track.id,
+                        title: first.track.title,
+                        artist: first.track.artist
+                    ),
+                    upcomingTrackIDs: upcoming,
+                    conversationMode: plan.brief.conversationMode,
+                    programID: plan.brief.id
+                ),
+                showPlanSummary: "GMGN RADIO · \(plan.slots.count) 首",
+                hostHint: first.hostHint,
+                immediateUserInstruction:
+                    plan.brief.immediateUserInstruction
+            )
+        )
+    }
+
+    private static func currentProgramBrief(
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> ProgramBrief {
+        let hour = calendar.component(.hour, from: now)
+        let moodTags: [String]
+        let energyArc: [Double]
+        switch hour {
+        case 0 ..< 6:
+            moodTags = ["深夜", "松弛", "陪伴"]
+            energyArc = [0.2, 0.35, 0.25]
+        case 6 ..< 11:
+            moodTags = ["清晨", "清醒", "明亮"]
+            energyArc = [0.35, 0.65, 0.55]
+        case 11 ..< 18:
+            moodTags = ["白天", "专注", "流动"]
+            energyArc = [0.45, 0.7, 0.55]
+        default:
+            moodTags = ["夜晚", "放松", "氛围"]
+            energyArc = [0.4, 0.7, 0.35]
+        }
+        return ProgramBrief(
+            id: "program-\(UUID().uuidString)",
+            targetDuration: 1_800,
+            moodTags: moodTags,
+            energyArc: energyArc,
+            conversationMode: .ambient
+        )
     }
 
     private func configureStage() {

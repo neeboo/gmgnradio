@@ -74,6 +74,7 @@ struct ProgramPlanner {
     func makePlan(
         brief: ProgramBrief,
         candidates: [MusicCandidate],
+        preferredTrackIDs: [String] = [],
         revision: Int = 1,
         generatedAt: Date = Date()
     ) throws -> ProgramPlan {
@@ -98,6 +99,7 @@ struct ProgramPlanner {
         )
         let selected = selectTracks(
             from: allowed,
+            preferredTrackIDs: preferredTrackIDs,
             count: min(targetCount, allowed.count),
             brief: brief
         )
@@ -145,13 +147,32 @@ struct ProgramPlanner {
 
     private func selectTracks(
         from candidates: [MusicCandidate],
+        preferredTrackIDs: [String],
         count: Int,
         brief: ProgramBrief
     ) -> [MusicCandidate] {
-        var remaining = candidates
-        var selected: [MusicCandidate] = []
+        let candidateByID = Dictionary(
+            uniqueKeysWithValues: candidates.map { ($0.id, $0) }
+        )
+        var seenIDs = Set<String>()
+        var selected: [MusicCandidate] = preferredTrackIDs.compactMap { id in
+            guard
+                seenIDs.count < count,
+                let candidate = candidateByID[id],
+                seenIDs.insert(id).inserted
+            else {
+                return nil
+            }
+            return candidate
+        }
+        if selected.count == count {
+            return selected
+        }
 
-        for index in 0 ..< count {
+        var remaining = candidates
+            .filter { !seenIDs.contains($0.id) }
+
+        for index in selected.count ..< count {
             let targetEnergy = energyTarget(
                 at: index,
                 count: count,

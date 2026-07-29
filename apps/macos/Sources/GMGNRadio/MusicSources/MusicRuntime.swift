@@ -48,6 +48,43 @@ final class MusicRuntime {
         ).search(request)
     }
 
+    func makeProgramPlan(
+        brief: ProgramBrief,
+        agent: any DJTrackRankingAgent
+    ) async throws -> ProgramPlan {
+        let sources: [any MusicSource] = [
+            netease,
+            qqMusic,
+            appleMusic,
+        ]
+        var candidates: [MusicCandidate] = []
+        for source in sources where await source.access().isReady {
+            if let library = try? await source.fetchUserLibrary() {
+                candidates.append(contentsOf: library.savedTracks)
+            }
+        }
+
+        candidates = deduplicated(candidates)
+        if candidates.count < 5 {
+            let searchResults = try await search(
+                MusicSearchRequest(
+                    moodTags: brief.moodTags,
+                    targetEnergy: brief.energyArc.isEmpty
+                        ? nil
+                        : brief.energyArc.reduce(0, +)
+                            / Double(brief.energyArc.count),
+                    limit: 30
+                )
+            )
+            candidates = deduplicated(candidates + searchResults)
+        }
+
+        return try await AgentProgramPlanner(agent: agent).makePlan(
+            brief: brief,
+            candidates: candidates
+        )
+    }
+
     func preparePlayback(
         for candidate: MusicCandidate
     ) async throws -> PreparedMusicPlayback {
@@ -75,5 +112,14 @@ final class MusicRuntime {
 
     func startAppleMusic(trackID: String) async throws {
         try await appleMusic.play(trackID: trackID)
+    }
+
+    private func deduplicated(
+        _ candidates: [MusicCandidate]
+    ) -> [MusicCandidate] {
+        var seen = Set<String>()
+        return candidates.filter {
+            $0.isPlayable && seen.insert($0.deduplicationKey).inserted
+        }
     }
 }

@@ -4,6 +4,7 @@ struct GMGNSettingsView: View {
     private enum Page: String, CaseIterable {
         case presence = "桌宠"
         case music = "音乐"
+        case agent = "DJ"
     }
 
     @State private var page = Page.presence
@@ -27,6 +28,8 @@ struct GMGNSettingsView: View {
                     PresenceSettingsView()
                 case .music:
                     MusicAccountsView()
+                case .agent:
+                    AgentSettingsView()
                 }
             }
         }

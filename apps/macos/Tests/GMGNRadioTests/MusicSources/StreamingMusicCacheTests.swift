@@ -91,6 +91,90 @@ func musicRuntimePreparesAccountTracksForThePCMPlayer() async throws {
     #expect(await cache.assets == [expectedAsset])
 }
 
+@MainActor
+@Test
+func musicRuntimeBuildsAnAgentProgramFromTheConnectedLibrary() async throws {
+    let sessions = InMemoryMusicProviderSessionStore()
+    await sessions.save(
+        providerSession("MUSIC_U=user-session"),
+        for: .netease
+    )
+    let tracks = (1 ... 5).map { index in
+        MusicProviderTrack(
+            id: String(index),
+            canonicalID: nil,
+            title: "Library Track \(index)",
+            artist: "Artist \(index)",
+            album: nil,
+            duration: 240,
+            isPlayable: true,
+            matchScore: 0.7,
+            userAffinity: 1,
+            energy: Double(index) / 10,
+            moodTags: ["夜晚"],
+            genres: [],
+            releaseYear: nil
+        )
+    }
+    let runtime = MusicRuntime(
+        netease: NeteaseMusicSource(
+            sessions: sessions,
+            client: PlaybackAccountClientStub(
+                asset: MusicPlaybackAsset(
+                    url: URL(string: "https://example.com/song.mp3")!,
+                    requestHeaders: [:]
+                ),
+                libraryTracks: tracks
+            )
+        ),
+        qqMusic: QQMusicSource(
+            sessions: InMemoryMusicProviderSessionStore(),
+            client: PlaybackAccountClientStub(
+                asset: MusicPlaybackAsset(
+                    url: URL(string: "https://example.com/song.mp3")!,
+                    requestHeaders: [:]
+                )
+            )
+        ),
+        appleMusic: AppleMusicSource(
+            client: AppleMusicClientStub(
+                authorization: .denied,
+                canPlayCatalogContent: false
+            )
+        ),
+        cache: MusicAssetCacheStub(
+            localURL: URL(fileURLWithPath: "/tmp/song.mp3")
+        )
+    )
+
+    let plan = try await runtime.makeProgramPlan(
+        brief: ProgramBrief(
+            id: "night",
+            targetDuration: 1_200,
+            moodTags: ["夜晚"],
+            energyArc: [0.2, 0.6],
+            conversationMode: .ambient
+        ),
+        agent: FixedTrackRankingAgent(
+            trackIDs: [
+                "netease:5",
+                "netease:3",
+                "netease:1",
+                "netease:4",
+                "netease:2",
+            ]
+        )
+    )
+
+    #expect(plan.slots.map(\.track.id) == [
+        "netease:5",
+        "netease:3",
+        "netease:1",
+        "netease:4",
+        "netease:2",
+    ])
+}
+
 private actor MusicAssetCacheStub: MusicAssetCaching {
     let localURL: URL
     private(set) var assets: [MusicPlaybackAsset] = []
@@ -110,6 +194,7 @@ private actor MusicAssetCacheStub: MusicAssetCaching {
 
 private struct PlaybackAccountClientStub: AccountMusicProviderClient {
     let asset: MusicPlaybackAsset
+    var libraryTracks: [MusicProviderTrack] = []
 
     func capabilities(
         session: MusicProviderSession
@@ -134,7 +219,7 @@ private struct PlaybackAccountClientStub: AccountMusicProviderClient {
         session: MusicProviderSession
     ) async throws -> MusicProviderLibrary {
         MusicProviderLibrary(
-            savedTracks: [],
+            savedTracks: libraryTracks,
             playlistIDs: [],
             recentlyPlayedTrackIDs: []
         )
@@ -145,5 +230,16 @@ private struct PlaybackAccountClientStub: AccountMusicProviderClient {
         session: MusicProviderSession
     ) async throws -> MusicPlaybackAsset {
         asset
+    }
+}
+
+private struct FixedTrackRankingAgent: DJTrackRankingAgent {
+    let trackIDs: [String]
+
+    func rankTracks(
+        brief: ProgramBrief,
+        candidates: [MusicCandidate]
+    ) async throws -> [String] {
+        trackIDs
     }
 }
