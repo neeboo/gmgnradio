@@ -126,6 +126,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         visualStore: audioFeatures
     )
     private lazy var localMusicPlayer = LocalMusicPlayer(graph: audioGraph)
+    private var interruptionCoordinator: InterruptionCoordinator?
     private var orbWindowController: OrbWindowController?
     private var stageWindowController: StageWindowController?
     private var stageAudioMonitor: VisualAudioInputMonitor?
@@ -135,6 +136,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         let controller = OrbWindowController(audioFeatures: audioFeatures)
         orbWindowController = controller
         controller.show()
+        interruptionCoordinator = InterruptionCoordinator(
+            audio: audioGraph,
+            interruptSession: { [weak self] in
+                try? await self?.realtimeDJSessionController.interrupt()
+            },
+            updateState: { [weak self] state in
+                self?.orbWindowController?.setState(state)
+            }
+        )
         configureStage()
 
         let environment = ProcessInfo.processInfo.environment
@@ -194,8 +204,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         switch localMusicPlayer.state {
         case .playing:
             localMusicPlayer.pause()
+            orbWindowController?.setState(.idle)
         case .ready, .paused, .finished:
             try? localMusicPlayer.play()
+            orbWindowController?.setState(.playing)
         case .idle:
             break
         }
@@ -208,6 +220,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
     private func playLocalTrack(_ url: URL) throws {
         try localMusicPlayer.load(url)
         try localMusicPlayer.play()
+        orbWindowController?.setState(.playing)
         showStage()
     }
 
@@ -245,6 +258,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
                 guard !Task.isCancelled else {
                     return
                 }
+                await interruptionCoordinator?.consume(event)
                 stagePresentation.consume(event)
             }
         }

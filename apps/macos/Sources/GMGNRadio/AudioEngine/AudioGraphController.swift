@@ -1,13 +1,16 @@
 import AVFoundation
 import Foundation
+import os
 
 @MainActor
 final class AudioGraphController: LocalMusicPlaybackGraph {
     private let engine: AVAudioEngine
     private let musicNode = AVAudioPlayerNode()
     private let djVoiceNode = AVAudioPlayerNode()
+    private let musicMixer = AVAudioMixerNode()
     private let programMixer = AVAudioMixerNode()
     private let visualBridge: PlaybackVisualFeatureBridge
+    private let duckingController: SampleTimedDuckingController
     private var currentFile: AVAudioFile?
     private var completion: (@MainActor @Sendable () -> Void)?
     private var tapInstalled = false
@@ -23,24 +26,33 @@ final class AudioGraphController: LocalMusicPlaybackGraph {
         set { djVoiceNode.volume = min(max(newValue, 0), 1) }
     }
 
+    var isMusicPlaying: Bool {
+        musicNode.isPlaying
+    }
+
     init(
         visualStore: VisualAudioFeatureStore,
         engine: AVAudioEngine = AVAudioEngine()
     ) {
         self.engine = engine
         visualBridge = PlaybackVisualFeatureBridge(store: visualStore)
+        duckingController = SampleTimedDuckingController(
+            mixer: musicMixer
+        )
 
         engine.attach(musicNode)
         engine.attach(djVoiceNode)
+        engine.attach(musicMixer)
         engine.attach(programMixer)
-        engine.connect(musicNode, to: programMixer, format: nil)
+        engine.connect(musicNode, to: musicMixer, format: nil)
+        engine.connect(musicMixer, to: programMixer, format: nil)
         engine.connect(djVoiceNode, to: programMixer, format: nil)
         engine.connect(programMixer, to: engine.mainMixerNode, format: nil)
+        let outputSampleRate = programMixer.outputFormat(forBus: 0).sampleRate
         visualBridge.configure(
-            sampleRate: Float(
-                programMixer.outputFormat(forBus: 0).sampleRate
-            )
+            sampleRate: Float(outputSampleRate)
         )
+        duckingController.configure(sampleRate: outputSampleRate)
         musicNode.volume = 0.92
         djVoiceNode.volume = 1
 
@@ -96,6 +108,15 @@ final class AudioGraphController: LocalMusicPlaybackGraph {
         completion = nil
         currentFile = nil
         visualBridge.reset()
+        duckingController.reset()
+    }
+
+    func setDJSpeaking(_ speaking: Bool) {
+        duckingController.setDJSpeaking(speaking)
+    }
+
+    func stopDJVoice() {
+        djVoiceNode.stop()
     }
 
     func scheduleDJVoice(_ buffer: AVAudioPCMBuffer) throws {
@@ -115,16 +136,21 @@ final class AudioGraphController: LocalMusicPlaybackGraph {
             onBus: 0,
             bufferSize: 2_048,
             format: nil,
-            block: Self.makeVisualTapBlock(bridge: visualBridge)
+            block: Self.makeProgramTapBlock(
+                visualBridge: visualBridge,
+                duckingController: duckingController
+            )
         )
         tapInstalled = true
     }
 
-    private nonisolated static func makeVisualTapBlock(
-        bridge: PlaybackVisualFeatureBridge
+    private nonisolated static func makeProgramTapBlock(
+        visualBridge: PlaybackVisualFeatureBridge,
+        duckingController: SampleTimedDuckingController
     ) -> AVAudioNodeTapBlock {
         { buffer, time in
-            bridge.consume(buffer, hostTime: time.hostTime)
+            duckingController.advance(frameCount: Int(buffer.frameLength))
+            visualBridge.consume(buffer, hostTime: time.hostTime)
         }
     }
 
@@ -140,6 +166,9 @@ final class AudioGraphController: LocalMusicPlaybackGraph {
                     programMixer.outputFormat(forBus: 0).sampleRate
                 )
             )
+            duckingController.configure(
+                sampleRate: programMixer.outputFormat(forBus: 0).sampleRate
+            )
             engine.prepare()
             try engine.start()
             if shouldResume {
@@ -150,6 +179,8 @@ final class AudioGraphController: LocalMusicPlaybackGraph {
         }
     }
 }
+
+extension AudioGraphController: DJInterruptionAudioControlling {}
 
 private final class PlaybackVisualFeatureBridge: @unchecked Sendable {
     private let store: VisualAudioFeatureStore
@@ -200,5 +231,62 @@ private final class PlaybackVisualFeatureBridge: @unchecked Sendable {
 
     func reset() {
         store.update(.silent)
+    }
+}
+
+private final class SampleTimedDuckingController: @unchecked Sendable {
+    private let mixer: AVAudioMixerNode
+    private let scheduleParameter: AUScheduleParameterBlock
+    private let outputGainAddress: AUParameterAddress?
+    private let envelope = OSAllocatedUnfairLock(
+        initialState: DuckingEnvelope(sampleRate: 48_000)
+    )
+
+    init(mixer: AVAudioMixerNode) {
+        self.mixer = mixer
+        scheduleParameter = mixer.auAudioUnit.scheduleParameterBlock
+        outputGainAddress = mixer.auAudioUnit.parameterTree?
+            .allParameters
+            .first(where: { $0.keyPath == "output.0" })?
+            .address
+    }
+
+    func configure(sampleRate: Double) {
+        envelope.withLock { state in
+            state = DuckingEnvelope(sampleRate: sampleRate)
+        }
+        apply(gain: 1)
+    }
+
+    func setDJSpeaking(_ speaking: Bool) {
+        envelope.withLock { state in
+            state.setDJSpeaking(speaking)
+        }
+    }
+
+    func advance(frameCount: Int) {
+        let gain = envelope.withLock { state in
+            state.advance(frameCount: frameCount)
+        }
+        apply(gain: gain)
+    }
+
+    func reset() {
+        envelope.withLock { state in
+            state = DuckingEnvelope(sampleRate: 48_000)
+        }
+        apply(gain: 1)
+    }
+
+    private func apply(gain: Float) {
+        guard let outputGainAddress else {
+            return
+        }
+        scheduleParameter(
+            AUEventSampleTimeImmediate,
+            0,
+            outputGainAddress,
+            gain
+        )
     }
 }
