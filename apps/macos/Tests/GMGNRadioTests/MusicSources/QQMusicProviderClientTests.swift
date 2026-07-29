@@ -46,7 +46,7 @@ func qqMusicClientSearchesTheCatalogAndKeepsTheMediaIdentifier() async throws {
 }
 
 @Test
-func qqMusicClientReadsTheUsersPlaylists() async throws {
+func qqMusicClientLoadsAndDeduplicatesTracksFromTheUsersPlaylists() async throws {
     let transport = ProviderHTTPTransportStub(responses: [
         providerResponse(
             """
@@ -61,6 +61,50 @@ func qqMusicClientReadsTheUsersPlaylists() async throws {
             }
             """
         ),
+        providerResponse(
+            """
+            {
+              "code": 0,
+              "cdlist": [{
+                "songlist": [{
+                  "songmid": "song-mid",
+                  "songname": "晴天",
+                  "interval": 269,
+                  "singer": [{"name": "周杰伦"}],
+                  "albumname": "叶惠美",
+                  "strMediaMid": "media-mid"
+                }]
+              }]
+            }
+            """
+        ),
+        providerResponse(
+            """
+            {
+              "code": 0,
+              "cdlist": [{
+                "songlist": [
+                  {
+                    "songmid": "song-mid",
+                    "songname": "晴天",
+                    "interval": 269,
+                    "singer": [{"name": "周杰伦"}],
+                    "albumname": "叶惠美",
+                    "strMediaMid": "media-mid"
+                  },
+                  {
+                    "songmid": "commute-mid",
+                    "songname": "通勤",
+                    "interval": 201,
+                    "singer": [{"name": "Example"}],
+                    "albumname": "Morning",
+                    "strMediaMid": "commute-media"
+                  }
+                ]
+              }]
+            }
+            """
+        ),
     ])
     let client = QQMusicProviderClient(transport: transport)
 
@@ -69,8 +113,65 @@ func qqMusicClientReadsTheUsersPlaylists() async throws {
     )
 
     #expect(library.playlistIDs == ["7001", "7002"])
+    #expect(library.savedTracks.map(\.id) == [
+        "song-mid@media-mid",
+        "commute-mid@commute-media",
+    ])
     let request = try #require(await transport.requests.first)
     #expect(request.url?.query?.contains("hostuin=12345") == true)
+    let detailRequests = await transport.requests.filter {
+        $0.url?.path == "/qzone/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg"
+    }
+    #expect(detailRequests.count == 2)
+    #expect(detailRequests[0].url?.query?.contains("disstid=7001") == true)
+    #expect(detailRequests[1].url?.query?.contains("disstid=7002") == true)
+}
+
+@Test
+func qqMusicClientKeepsAvailablePlaylistsWhenOneDetailRequestFails() async throws {
+    let transport = ProviderHTTPTransportStub(responses: [
+        providerResponse(
+            """
+            {
+              "code": 0,
+              "data": {
+                "disslist": [
+                  {"tid": 7001, "diss_name": "暂时失效"},
+                  {"tid": 7002, "diss_name": "仍然可用"}
+                ]
+              }
+            }
+            """
+        ),
+        providerResponse("service unavailable", statusCode: 503),
+        providerResponse(
+            """
+            {
+              "code": 0,
+              "cdlist": [{
+                "songlist": [{
+                  "songmid": "available-mid",
+                  "songname": "仍然播放",
+                  "interval": 188,
+                  "singer": [{"name": "Example"}],
+                  "albumname": "Available",
+                  "strMediaMid": "available-media"
+                }]
+              }]
+            }
+            """
+        ),
+    ])
+    let client = QQMusicProviderClient(transport: transport)
+
+    let library = try await client.fetchUserLibrary(
+        session: providerSession("uin=o12345; qm_keyst=user-key")
+    )
+
+    #expect(library.playlistIDs == ["7001", "7002"])
+    #expect(library.savedTracks.map(\.id) == [
+        "available-mid@available-media",
+    ])
 }
 
 @Test

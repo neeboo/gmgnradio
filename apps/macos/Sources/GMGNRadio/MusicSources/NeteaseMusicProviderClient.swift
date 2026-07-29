@@ -102,35 +102,49 @@ struct NeteaseMusicProviderClient: AccountMusicProviderClient {
             from: playlistsData
         )
         let playlists = playlistsResponse.playlist ?? []
-
+        let playlistIDs = playlists.map(\.id)
+        var seenTrackIDs = Set<String>()
         var savedTracks: [MusicProviderTrack] = []
-        if let likedPlaylistID = playlists.first?.id {
+        for playlistID in playlistIDs.prefix(50) {
             var detailComponents = URLComponents(
                 url: baseURL.appending(path: "/api/v6/playlist/detail"),
                 resolvingAgainstBaseURL: false
             )!
             detailComponents.queryItems = [
-                URLQueryItem(name: "id", value: String(likedPlaylistID)),
+                URLQueryItem(name: "id", value: String(playlistID)),
                 URLQueryItem(name: "n", value: "1000"),
                 URLQueryItem(name: "s", value: "0"),
             ]
-            let detailData = try checkedProviderResponse(
-                await transport.send(
-                    providerRequest(url: detailComponents.url!, cookie: cookie)
+            guard
+                let detailResponse = try? await transport.send(
+                    providerRequest(
+                        url: detailComponents.url!,
+                        cookie: cookie
+                    )
+                ),
+                let detailData = try? checkedProviderResponse(detailResponse),
+                let detail = try? JSONDecoder().decode(
+                    NeteasePlaylistDetailResponse.self,
+                    from: detailData
                 )
-            )
-            let detail = try JSONDecoder().decode(
-                NeteasePlaylistDetailResponse.self,
-                from: detailData
-            )
-            savedTracks = (detail.playlist?.tracks ?? []).map {
-                $0.providerTrack(matchScore: 0.72, userAffinity: 1)
+            else {
+                continue
+            }
+            for track in detail.playlist?.tracks ?? [] {
+                let mapped = track.providerTrack(
+                    matchScore: 0.72,
+                    userAffinity: 1
+                )
+                guard seenTrackIDs.insert(mapped.id).inserted else {
+                    continue
+                }
+                savedTracks.append(mapped)
             }
         }
 
         return MusicProviderLibrary(
             savedTracks: savedTracks,
-            playlistIDs: playlists.map { String($0.id) },
+            playlistIDs: playlistIDs.map(String.init),
             recentlyPlayedTrackIDs: []
         )
     }

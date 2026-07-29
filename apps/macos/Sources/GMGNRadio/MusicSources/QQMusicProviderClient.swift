@@ -107,9 +107,55 @@ struct QQMusicProviderClient: AccountMusicProviderClient {
             QQPlaylistsResponse.self,
             from: data
         )
+        let playlistIDs = (response.data?.disslist ?? []).map(\.id)
+        var seenTrackIDs = Set<String>()
+        var savedTracks: [MusicProviderTrack] = []
+        for playlistID in playlistIDs.prefix(50) {
+            var detailComponents = URLComponents(
+                string: "https://c.y.qq.com/qzone/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg"
+            )!
+            detailComponents.queryItems = [
+                URLQueryItem(name: "type", value: "1"),
+                URLQueryItem(name: "json", value: "1"),
+                URLQueryItem(name: "utf8", value: "1"),
+                URLQueryItem(name: "onlysong", value: "0"),
+                URLQueryItem(name: "disstid", value: playlistID),
+                URLQueryItem(name: "format", value: "json"),
+                URLQueryItem(name: "g_tk", value: "5381"),
+                URLQueryItem(name: "loginUin", value: uin),
+                URLQueryItem(name: "hostUin", value: "0"),
+                URLQueryItem(name: "inCharset", value: "utf8"),
+                URLQueryItem(name: "outCharset", value: "utf-8"),
+                URLQueryItem(name: "notice", value: "0"),
+                URLQueryItem(name: "platform", value: "yqq.json"),
+                URLQueryItem(name: "needNewCode", value: "0"),
+            ]
+            guard
+                let detailResponse = try? await transport.send(
+                    providerRequest(
+                        url: detailComponents.url!,
+                        cookie: cookie
+                    )
+                ),
+                let detailData = try? checkedProviderResponse(detailResponse),
+                let detail = try? JSONDecoder().decode(
+                    QQPlaylistDetailResponse.self,
+                    from: detailData
+                )
+            else {
+                continue
+            }
+            for track in detail.cdlist?.first?.songlist ?? [] {
+                let mapped = track.providerTrack
+                guard seenTrackIDs.insert(mapped.id).inserted else {
+                    continue
+                }
+                savedTracks.append(mapped)
+            }
+        }
         return MusicProviderLibrary(
-            savedTracks: [],
-            playlistIDs: (response.data?.disslist ?? []).map(\.id),
+            savedTracks: savedTracks,
+            playlistIDs: playlistIDs,
             recentlyPlayedTrackIDs: []
         )
     }
@@ -264,6 +310,7 @@ private struct QQTrackDTO: Decodable {
     let singer: [Singer]
     let album: Album?
     let file: FileInfo?
+    let playlistMediaMid: String?
 
     struct Singer: Decodable {
         let name: String
@@ -283,8 +330,58 @@ private struct QQTrackDTO: Decodable {
         }
     }
 
+    enum CodingKeys: String, CodingKey {
+        case mid
+        case songMid = "songmid"
+        case name
+        case songName = "songname"
+        case interval
+        case singer
+        case album
+        case albumName = "albumname"
+        case file
+        case playlistMediaMid = "strMediaMid"
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        mid = try container.decodeIfPresent(String.self, forKey: .mid)
+            ?? container.decode(String.self, forKey: .songMid)
+        name = try container.decodeIfPresent(String.self, forKey: .name)
+            ?? container.decode(String.self, forKey: .songName)
+        interval = try container.decode(Double.self, forKey: .interval)
+        singer = try container.decodeIfPresent(
+            [Singer].self,
+            forKey: .singer
+        ) ?? []
+        if let nestedAlbum = try container.decodeIfPresent(
+            Album.self,
+            forKey: .album
+        ) {
+            album = nestedAlbum
+        } else if let flatAlbum = try container.decodeIfPresent(
+            String.self,
+            forKey: .albumName
+        ) {
+            album = Album(name: flatAlbum)
+        } else {
+            album = nil
+        }
+        file = try container.decodeIfPresent(FileInfo.self, forKey: .file)
+        playlistMediaMid = try container.decodeIfPresent(
+            String.self,
+            forKey: .playlistMediaMid
+        )
+    }
+
     var providerTrack: MusicProviderTrack {
-        let mediaMid = file?.mediaMid ?? mid
+        let mediaMid = file?.mediaMid ?? playlistMediaMid ?? mid
+        let isPlayable: Bool
+        if let size = file?.size128mp3 {
+            isPlayable = size > 0
+        } else {
+            isPlayable = playlistMediaMid?.isEmpty == false
+        }
         return MusicProviderTrack(
             id: "\(mid)@\(mediaMid)",
             canonicalID: nil,
@@ -292,7 +389,7 @@ private struct QQTrackDTO: Decodable {
             artist: singer.map(\.name).joined(separator: " / "),
             album: album?.name,
             duration: interval,
-            isPlayable: (file?.size128mp3 ?? 0) > 0,
+            isPlayable: isPlayable,
             matchScore: 0.84,
             userAffinity: 0.45,
             energy: 0.5,
@@ -300,6 +397,14 @@ private struct QQTrackDTO: Decodable {
             genres: [],
             releaseYear: nil
         )
+    }
+}
+
+private struct QQPlaylistDetailResponse: Decodable {
+    let cdlist: [Playlist]?
+
+    struct Playlist: Decodable {
+        let songlist: [QQTrackDTO]?
     }
 }
 

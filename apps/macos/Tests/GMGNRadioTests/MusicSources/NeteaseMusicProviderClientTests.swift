@@ -46,7 +46,7 @@ func neteaseClientSearchesWithTheUsersCookieAndMapsTracks() async throws {
 }
 
 @Test
-func neteaseClientLoadsPlaylistsAndLikedSongsFromTheConnectedAccount() async throws {
+func neteaseClientAggregatesAndDeduplicatesTracksAcrossPlaylists() async throws {
     let transport = ProviderHTTPTransportStub(responses: [
         providerResponse(
             """
@@ -81,6 +81,33 @@ func neteaseClientLoadsPlaylistsAndLikedSongsFromTheConnectedAccount() async thr
             }
             """
         ),
+        providerResponse(
+            """
+            {
+              "code": 200,
+              "playlist": {
+                "tracks": [
+                  {
+                    "id": 1001,
+                    "name": "夜航",
+                    "dt": 201000,
+                    "fee": 0,
+                    "ar": [{"name": "Example"}],
+                    "al": {"name": "Night"}
+                  },
+                  {
+                    "id": 1002,
+                    "name": "蓝色时刻",
+                    "dt": 245000,
+                    "fee": 0,
+                    "ar": [{"name": "Another"}],
+                    "al": {"name": "Blue"}
+                  }
+                ]
+              }
+            }
+            """
+        ),
     ])
     let client = NeteaseMusicProviderClient(transport: transport)
 
@@ -89,7 +116,58 @@ func neteaseClientLoadsPlaylistsAndLikedSongsFromTheConnectedAccount() async thr
     )
 
     #expect(library.playlistIDs == ["9001", "9002"])
-    #expect(library.savedTracks.map(\.id) == ["1001"])
+    #expect(library.savedTracks.map(\.id) == ["1001", "1002"])
+
+    let detailRequests = await transport.requests.filter {
+        $0.url?.path == "/api/v6/playlist/detail"
+    }
+    #expect(detailRequests.count == 2)
+    #expect(detailRequests[0].url?.query?.contains("id=9001") == true)
+    #expect(detailRequests[1].url?.query?.contains("id=9002") == true)
+}
+
+@Test
+func neteaseClientKeepsAvailablePlaylistsWhenOneDetailRequestFails() async throws {
+    let transport = ProviderHTTPTransportStub(responses: [
+        providerResponse("{\"code\":200,\"profile\":{\"userId\":42}}"),
+        providerResponse(
+            """
+            {
+              "code": 200,
+              "playlist": [
+                {"id": 9001, "name": "暂时失效"},
+                {"id": 9002, "name": "仍然可用"}
+              ]
+            }
+            """
+        ),
+        providerResponse("service unavailable", statusCode: 503),
+        providerResponse(
+            """
+            {
+              "code": 200,
+              "playlist": {
+                "tracks": [{
+                  "id": 1002,
+                  "name": "蓝色时刻",
+                  "dt": 245000,
+                  "fee": 0,
+                  "ar": [{"name": "Another"}],
+                  "al": {"name": "Blue"}
+                }]
+              }
+            }
+            """
+        ),
+    ])
+    let client = NeteaseMusicProviderClient(transport: transport)
+
+    let library = try await client.fetchUserLibrary(
+        session: providerSession("MUSIC_U=user-session")
+    )
+
+    #expect(library.playlistIDs == ["9001", "9002"])
+    #expect(library.savedTracks.map(\.id) == ["1002"])
 }
 
 @Test
