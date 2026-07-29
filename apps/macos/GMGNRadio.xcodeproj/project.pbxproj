@@ -62,12 +62,14 @@
 		BA5164930B513A70083CCFC5 /* StagePresentationModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCF719BB745F9C7E94029828 /* StagePresentationModel.swift */; };
 		D721C4D533DAA4D461CEF6D2 /* PlaybackContext.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2457A76CBF19C18E6D386EE /* PlaybackContext.swift */; };
 		D807A54C3784A2FF10D4278D /* LiveKit in Frameworks */ = {isa = PBXBuildFile; productRef = 90774BF1A310244C65F85C37 /* LiveKit */; };
+		D8CF6A2326DE3E3C6DA2F3E4 /* VisualAudioInputPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09494436AADC40C3833A6FC5 /* VisualAudioInputPolicy.swift */; };
 		D8D0906855E8347D014683A6 /* StageWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC8DB2FC6BF5BF149BD893CC /* StageWindowController.swift */; };
 		E07CACC669D4A648231EE3A0 /* VisualAudioFeatureExtractor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36C707778632484C921F090C /* VisualAudioFeatureExtractor.swift */; };
 		E1E72C29EB3D2A8256F43741 /* RealtimeDJSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 216A6D94509E4915BCC18C7C /* RealtimeDJSession.swift */; };
 		E49527753955135A51F8363E /* Stage.metal in Sources */ = {isa = PBXBuildFile; fileRef = E13F2FD5A9D73C17F8A9C25F /* Stage.metal */; };
 		E4B42BCA37A2E6ACCFD8C3E8 /* StageWindowMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3C79DFF381CD8831FA4C433 /* StageWindowMode.swift */; };
 		E52D5016BAD977B057280529 /* StageWindowControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D6999758740371B4CC8758D /* StageWindowControllerTests.swift */; };
+		E653D78B6D3AAD7FE2AD0682 /* VisualAudioInputPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD9A423733002E2F92069AD9 /* VisualAudioInputPolicyTests.swift */; };
 		E81E054C1A88065C8B12E130 /* StagePresentationModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BDCE4DF69A7F8E8FCB4244B2 /* StagePresentationModelTests.swift */; };
 		E9D4C5A74FBBB188DEC917B3 /* OrbRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF9A4902E75F2E8D7081C852 /* OrbRenderer.swift */; };
 		EFD2489E256D52E3C94F0E23 /* PresenceCommandService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20C65C2BD0FD2417BAFBD387 /* PresenceCommandService.swift */; };
@@ -98,6 +100,7 @@
 		07A8377E0830ED4ED8D57DB6 /* PresenceSettingsModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceSettingsModel.swift; sourceTree = "<group>"; };
 		07DE01676AC401339B9DCC2F /* OrbMotionModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbMotionModel.swift; sourceTree = "<group>"; };
 		091F9A1DA278A0DA5C8E4A4E /* ProgramPlannerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgramPlannerTests.swift; sourceTree = "<group>"; };
+		09494436AADC40C3833A6FC5 /* VisualAudioInputPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VisualAudioInputPolicy.swift; sourceTree = "<group>"; };
 		11BA68B35282B593CC2E7F32 /* StageCameraModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageCameraModelTests.swift; sourceTree = "<group>"; };
 		1445F76B4536834CB72C2EE3 /* ElevenLabsAudioLevelRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElevenLabsAudioLevelRenderer.swift; sourceTree = "<group>"; };
 		19D1AC1EED8E537124163209 /* MusicProviderSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicProviderSession.swift; sourceTree = "<group>"; };
@@ -135,6 +138,7 @@
 		A4C1A38CFE1FE5149D76CC08 /* OrbUniformTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbUniformTests.swift; sourceTree = "<group>"; };
 		A4E48BCF663DCFB840547923 /* BailianRealtimeEventMapper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BailianRealtimeEventMapper.swift; sourceTree = "<group>"; };
 		AC10161C41BE8EB05A51FC8D /* AppSmokeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSmokeTests.swift; sourceTree = "<group>"; };
+		AD9A423733002E2F92069AD9 /* VisualAudioInputPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VisualAudioInputPolicyTests.swift; sourceTree = "<group>"; };
 		AE207F3AFC138651AB03E8DB /* MusicSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicSource.swift; sourceTree = "<group>"; };
 		AF6190681ED5961F6C2903FE /* AccountMusicSourceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountMusicSourceTests.swift; sourceTree = "<group>"; };
 		B0722D05FE2415482B25F659 /* StageUniforms.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageUniforms.swift; sourceTree = "<group>"; };
@@ -231,6 +235,7 @@
 				FC8DB2FC6BF5BF149BD893CC /* StageWindowController.swift */,
 				C3C79DFF381CD8831FA4C433 /* StageWindowMode.swift */,
 				36C707778632484C921F090C /* VisualAudioFeatureExtractor.swift */,
+				09494436AADC40C3833A6FC5 /* VisualAudioInputPolicy.swift */,
 				ACD0081809AE14CD18CA9B01 /* Metal */,
 				FADF1993EFF32F42FB011F72 /* Shaders */,
 			);
@@ -439,6 +444,7 @@
 				2D6999758740371B4CC8758D /* StageWindowControllerTests.swift */,
 				1C0EE40A2A02D7B94512CC74 /* StageWindowModeTests.swift */,
 				4754EBB9C64ED51C00FF0F3C /* VisualAudioFeatureExtractorTests.swift */,
+				AD9A423733002E2F92069AD9 /* VisualAudioInputPolicyTests.swift */,
 			);
 			path = VisualEngine;
 			sourceTree = "<group>";
@@ -581,6 +587,7 @@
 				5D57161677518A9A39EAB58C /* StageWindowModeTests.swift in Sources */,
 				343C7C4B77A94C27491DD866 /* UnifiedMusicSearchTests.swift in Sources */,
 				36DFD6DCAE62D1F28614ABB0 /* VisualAudioFeatureExtractorTests.swift in Sources */,
+				E653D78B6D3AAD7FE2AD0682 /* VisualAudioInputPolicyTests.swift in Sources */,
 				F83BDCD045FC0F46E849868C /* WindowPlacementTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -634,6 +641,7 @@
 				E4B42BCA37A2E6ACCFD8C3E8 /* StageWindowMode.swift in Sources */,
 				583709DB2BCEF0293ECDCD8B /* UnifiedMusicSearch.swift in Sources */,
 				E07CACC669D4A648231EE3A0 /* VisualAudioFeatureExtractor.swift in Sources */,
+				D8CF6A2326DE3E3C6DA2F3E4 /* VisualAudioInputPolicy.swift in Sources */,
 				330C60A11D6B3849DFAFCE65 /* WindowPlacement.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

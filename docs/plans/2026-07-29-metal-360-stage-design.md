@@ -56,6 +56,8 @@ Metal uniforms / particle displacement
 
 `StageCameraModel` 是与 AppKit、Metal 解耦的确定性模型，负责角度、俯仰限制、拖拽灵敏度、惯性衰减和自动环绕。`StageRenderer` 只读取相机快照与音频特征。窗口生命周期由 `StageWindowController` 管理，DJCore 无需依赖具体渲染器。
 
+`VisualAudioFeatureStore` 默认由播放器自身的 PCM 输出更新。舞台启动和关闭不申请麦克风，也不改变系统音频路由。仅在开发调试时设置 `GMGN_VISUAL_MIC_INPUT=1`，才启用麦克风响应。
+
 ## 5. 渲染方案
 
 第一版采用两个 Metal 绘制通道：

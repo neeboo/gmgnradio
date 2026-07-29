@@ -126,7 +126,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func configureStage() {
-        let monitor = VisualAudioInputMonitor(store: audioFeatures)
+        let monitor: VisualAudioInputMonitor?
+        if VisualAudioInputPolicy.usesMicrophone(
+            environment: ProcessInfo.processInfo.environment
+        ) {
+            monitor = VisualAudioInputMonitor(store: audioFeatures)
+        } else {
+            monitor = nil
+        }
         stageAudioMonitor = monitor
         stageWindowController = StageWindowController(
             audioFeatures: audioFeatures,
