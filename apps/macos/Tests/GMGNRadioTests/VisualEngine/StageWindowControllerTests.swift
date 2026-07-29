@@ -98,6 +98,39 @@ func stagePlaybackButtonControlsAndReflectsTheRealPlayerState() {
     controller.close()
 }
 
+@Test
+@MainActor
+func stageTransportActionsLiveInOneCompactControlIsland() {
+    let controller = StageWindowController(
+        audioFeatures: VisualAudioFeatureStore(),
+        playbackState: .playing
+    )
+
+    controller.show()
+    controller.window?.contentView?.layoutSubtreeIfNeeded()
+
+    let descendants = controller.window?.contentView?.descendants ?? []
+    let controls = descendants.first {
+        $0.identifier?.rawValue == "stage.transport-controls"
+    }
+    let playbackButton = descendants.first {
+        $0.identifier?.rawValue == "stage.playback-toggle"
+    }
+    let windowModeButton = descendants.first {
+        $0.identifier?.rawValue == "stage.window-mode-toggle"
+    }
+
+    #expect(controls != nil)
+    #expect(playbackButton?.superview === controls)
+    #expect(windowModeButton?.superview === controls)
+    controls?.layoutSubtreeIfNeeded()
+    #expect(controls?.frame.size == CGSize(width: 104, height: 48))
+    #expect(playbackButton?.frame.size == CGSize(width: 44, height: 44))
+    #expect(windowModeButton?.frame.size == CGSize(width: 44, height: 44))
+
+    controller.close()
+}
+
 @MainActor
 private final class StageAudioMonitorSpy: VisualAudioMonitoring {
     private(set) var startCallCount = 0

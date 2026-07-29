@@ -129,8 +129,7 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
 
 @MainActor
 private final class StageContentView: NSView {
-    private let playbackButton: StagePlaybackButton
-    private let windowModeButton: StageWindowModeButton
+    private let transportControls: StageTransportControlsView
 
     init(
         frame: CGRect,
@@ -141,13 +140,17 @@ private final class StageContentView: NSView {
         onTogglePlayback: @escaping @MainActor () -> Void,
         onToggleWindowMode: @escaping @MainActor () -> Void
     ) {
-        playbackButton = StagePlaybackButton(
+        let playbackButton = StagePlaybackButton(
             state: playbackState,
             action: onTogglePlayback
         )
-        windowModeButton = StageWindowModeButton(
+        let windowModeButton = StageWindowModeButton(
             mode: .windowed,
             action: onToggleWindowMode
+        )
+        transportControls = StageTransportControlsView(
+            playbackButton: playbackButton,
+            windowModeButton: windowModeButton
         )
         super.init(frame: frame)
         wantsLayer = true
@@ -171,33 +174,20 @@ private final class StageContentView: NSView {
         overlay.layer?.zPosition = 10
         addSubview(overlay)
 
-        windowModeButton.translatesAutoresizingMaskIntoConstraints = false
-        windowModeButton.layer?.zPosition = 20
-        addSubview(windowModeButton)
-        playbackButton.translatesAutoresizingMaskIntoConstraints = false
-        playbackButton.layer?.zPosition = 20
-        addSubview(playbackButton)
+        transportControls.translatesAutoresizingMaskIntoConstraints = false
+        transportControls.layer?.zPosition = 20
+        addSubview(transportControls)
         NSLayoutConstraint.activate([
-            playbackButton.trailingAnchor.constraint(
-                equalTo: windowModeButton.leadingAnchor,
-                constant: -12
-            ),
-            playbackButton.bottomAnchor.constraint(
-                equalTo: bottomAnchor,
-                constant: -22
-            ),
-            playbackButton.widthAnchor.constraint(equalToConstant: 48),
-            playbackButton.heightAnchor.constraint(equalToConstant: 48),
-            windowModeButton.trailingAnchor.constraint(
+            transportControls.trailingAnchor.constraint(
                 equalTo: trailingAnchor,
                 constant: -22
             ),
-            windowModeButton.bottomAnchor.constraint(
+            transportControls.bottomAnchor.constraint(
                 equalTo: bottomAnchor,
                 constant: -22
             ),
-            windowModeButton.widthAnchor.constraint(equalToConstant: 42),
-            windowModeButton.heightAnchor.constraint(equalToConstant: 42)
+            transportControls.widthAnchor.constraint(equalToConstant: 104),
+            transportControls.heightAnchor.constraint(equalToConstant: 48)
         ])
     }
 
@@ -206,11 +196,11 @@ private final class StageContentView: NSView {
     }
 
     func setWindowMode(_ mode: StageWindowMode) {
-        windowModeButton.setMode(mode)
+        transportControls.setWindowMode(mode)
     }
 
     func setPlaybackState(_ state: LocalMusicPlaybackState) {
-        playbackButton.setState(state)
+        transportControls.setPlaybackState(state)
     }
 }
 
@@ -222,8 +212,81 @@ private final class StageOverlayHostingView: NSHostingView<StageOverlayView> {
 }
 
 @MainActor
+private final class StageTransportControlsView: NSVisualEffectView {
+    private let playbackButton: StagePlaybackButton
+    private let windowModeButton: StageWindowModeButton
+
+    init(
+        playbackButton: StagePlaybackButton,
+        windowModeButton: StageWindowModeButton
+    ) {
+        self.playbackButton = playbackButton
+        self.windowModeButton = windowModeButton
+        super.init(frame: .zero)
+
+        identifier = NSUserInterfaceItemIdentifier("stage.transport-controls")
+        material = .hudWindow
+        blendingMode = .withinWindow
+        state = .active
+        wantsLayer = true
+        layer?.cornerRadius = 24
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor
+        layer?.shadowColor = NSColor.black.cgColor
+        layer?.shadowOpacity = 0.42
+        layer?.shadowRadius = 14
+        layer?.shadowOffset = CGSize(width: 0, height: -4)
+
+        let divider = NSView()
+        divider.wantsLayer = true
+        divider.layer?.backgroundColor = NSColor.white
+            .withAlphaComponent(0.12)
+            .cgColor
+
+        [playbackButton, divider, windowModeButton].forEach {
+            $0.translatesAutoresizingMaskIntoConstraints = false
+            addSubview($0)
+        }
+
+        NSLayoutConstraint.activate([
+            playbackButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+            playbackButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            playbackButton.widthAnchor.constraint(equalToConstant: 44),
+            playbackButton.heightAnchor.constraint(equalToConstant: 44),
+
+            divider.centerXAnchor.constraint(equalTo: centerXAnchor),
+            divider.centerYAnchor.constraint(equalTo: centerYAnchor),
+            divider.widthAnchor.constraint(equalToConstant: 1),
+            divider.heightAnchor.constraint(equalToConstant: 18),
+
+            windowModeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+            windowModeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            windowModeButton.widthAnchor.constraint(equalToConstant: 44),
+            windowModeButton.heightAnchor.constraint(equalToConstant: 44)
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func setPlaybackState(_ state: LocalMusicPlaybackState) {
+        playbackButton.setState(state)
+    }
+
+    func setWindowMode(_ mode: StageWindowMode) {
+        windowModeButton.setMode(mode)
+    }
+}
+
+@MainActor
 private final class StagePlaybackButton: NSButton {
     private let handler: @MainActor () -> Void
+    private var pointerIsInside = false
+
+    override var alignmentRectInsets: NSEdgeInsets {
+        NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+    }
 
     init(
         state: LocalMusicPlaybackState,
@@ -239,30 +302,9 @@ private final class StagePlaybackButton: NSButton {
         focusRingType = .none
         contentTintColor = NSColor.white
         wantsLayer = true
-        layer?.backgroundColor = NSColor(
-            calibratedRed: 0.08,
-            green: 0.56,
-            blue: 1,
-            alpha: 0.9
-        ).cgColor
-        layer?.cornerRadius = 24
-        layer?.borderWidth = 1
-        layer?.borderColor = NSColor(
-            calibratedRed: 0.42,
-            green: 0.9,
-            blue: 1,
-            alpha: 0.72
-        ).cgColor
-        layer?.shadowColor = NSColor(
-            calibratedRed: 0.04,
-            green: 0.62,
-            blue: 1,
-            alpha: 0.9
-        ).cgColor
-        layer?.shadowOpacity = 1
-        layer?.shadowRadius = 16
-        layer?.shadowOffset = .zero
+        layer?.cornerRadius = 20
         setState(state)
+        updateAppearance()
     }
 
     required init?(coder: NSCoder) {
@@ -273,8 +315,8 @@ private final class StagePlaybackButton: NSButton {
         let isPlaying = state == .playing
         let label = isPlaying ? "暂停" : "播放"
         let configuration = NSImage.SymbolConfiguration(
-            pointSize: 17,
-            weight: .bold
+            pointSize: 14,
+            weight: .semibold
         )
         image = NSImage(
             systemSymbolName: isPlaying ? "pause.fill" : "play.fill",
@@ -283,18 +325,58 @@ private final class StagePlaybackButton: NSButton {
         toolTip = label
         setAccessibilityLabel(label)
         isEnabled = state != .idle
-        alphaValue = isEnabled ? 1 : 0.44
+        updateAppearance()
+    }
+
+    override func updateTrackingAreas() {
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(
+            NSTrackingArea(
+                rect: .zero,
+                options: [.activeInKeyWindow, .inVisibleRect, .mouseEnteredAndExited],
+                owner: self
+            )
+        )
+        super.updateTrackingAreas()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        pointerIsInside = true
+        updateAppearance()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        pointerIsInside = false
+        updateAppearance()
     }
 
     @objc
     private func performAction() {
         handler()
     }
+
+    private func updateAppearance() {
+        let opacity = isEnabled ? 1.0 : 0.36
+        let backgroundOpacity = pointerIsInside && isEnabled ? 0.24 : 0.14
+        alphaValue = opacity
+        contentTintColor = NSColor.white.withAlphaComponent(0.94)
+        layer?.backgroundColor = NSColor(
+            calibratedRed: 0.08,
+            green: 0.58,
+            blue: 1,
+            alpha: backgroundOpacity
+        ).cgColor
+    }
 }
 
 @MainActor
 private final class StageWindowModeButton: NSButton {
     private let handler: @MainActor () -> Void
+    private var pointerIsInside = false
+
+    override var alignmentRectInsets: NSEdgeInsets {
+        NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+    }
 
     init(
         mode: StageWindowMode,
@@ -308,37 +390,10 @@ private final class StageWindowModeButton: NSButton {
         isBordered = false
         imagePosition = .imageOnly
         focusRingType = .none
-        contentTintColor = NSColor(
-            calibratedRed: 0.25,
-            green: 0.88,
-            blue: 1,
-            alpha: 1
-        )
         wantsLayer = true
-        layer?.backgroundColor = NSColor(
-            calibratedRed: 0.015,
-            green: 0.035,
-            blue: 0.09,
-            alpha: 0.82
-        ).cgColor
-        layer?.cornerRadius = 21
-        layer?.borderWidth = 1
-        layer?.borderColor = NSColor(
-            calibratedRed: 0.18,
-            green: 0.82,
-            blue: 1,
-            alpha: 0.48
-        ).cgColor
-        layer?.shadowColor = NSColor(
-            calibratedRed: 0.08,
-            green: 0.68,
-            blue: 1,
-            alpha: 0.58
-        ).cgColor
-        layer?.shadowOpacity = 1
-        layer?.shadowRadius = 12
-        layer?.shadowOffset = CGSize(width: 0, height: -2)
+        layer?.cornerRadius = 20
         setMode(mode)
+        updateAppearance()
     }
 
     required init?(coder: NSCoder) {
@@ -347,8 +402,8 @@ private final class StageWindowModeButton: NSButton {
 
     func setMode(_ mode: StageWindowMode) {
         let configuration = NSImage.SymbolConfiguration(
-            pointSize: 15,
-            weight: .semibold
+            pointSize: 14,
+            weight: .medium
         )
         image = NSImage(
             systemSymbolName: mode.buttonSymbolName,
@@ -358,8 +413,39 @@ private final class StageWindowModeButton: NSButton {
         setAccessibilityLabel(mode.accessibilityLabel)
     }
 
+    override func updateTrackingAreas() {
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(
+            NSTrackingArea(
+                rect: .zero,
+                options: [.activeInKeyWindow, .inVisibleRect, .mouseEnteredAndExited],
+                owner: self
+            )
+        )
+        super.updateTrackingAreas()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        pointerIsInside = true
+        updateAppearance()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        pointerIsInside = false
+        updateAppearance()
+    }
+
     @objc
     private func performAction() {
         handler()
+    }
+
+    private func updateAppearance() {
+        contentTintColor = NSColor.white.withAlphaComponent(
+            pointerIsInside ? 0.92 : 0.64
+        )
+        layer?.backgroundColor = NSColor.white
+            .withAlphaComponent(pointerIsInside ? 0.10 : 0)
+            .cgColor
     }
 }
