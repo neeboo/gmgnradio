@@ -46,6 +46,27 @@ func stageWindowControllerRunsAudioMonitoringOnlyWhilePresented() {
     #expect(monitor.stopCallCount == 1)
 }
 
+@Test
+@MainActor
+func stageWindowControllerIncludesAWindowModeButton() {
+    let controller = StageWindowController(
+        audioFeatures: VisualAudioFeatureStore()
+    )
+
+    controller.show()
+
+    let button = controller.window?.contentView?
+        .descendants
+        .compactMap { $0 as? NSButton }
+        .first { $0.identifier?.rawValue == "stage.window-mode-toggle" }
+
+    #expect(button != nil)
+    #expect(button?.toolTip == "进入全屏")
+    #expect(button?.action != nil)
+
+    controller.close()
+}
+
 @MainActor
 private final class StageAudioMonitorSpy: VisualAudioMonitoring {
     private(set) var startCallCount = 0
@@ -57,5 +78,11 @@ private final class StageAudioMonitorSpy: VisualAudioMonitoring {
 
     func stop() {
         stopCallCount += 1
+    }
+}
+
+private extension NSView {
+    var descendants: [NSView] {
+        subviews + subviews.flatMap(\.descendants)
     }
 }

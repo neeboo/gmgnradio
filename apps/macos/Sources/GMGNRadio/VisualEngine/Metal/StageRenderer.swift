@@ -21,6 +21,7 @@ final class StageRenderer: NSObject, MTKViewDelegate {
     private let startedAt: ContinuousClock.Instant
     private var previousFrameAt: ContinuousClock.Instant
     private var camera = StageCameraModel()
+    private let presetTimeline = StageVisualPresetTimeline()
 
     init(
         device: MTLDevice,
@@ -124,14 +125,17 @@ final class StageRenderer: NSObject, MTKViewDelegate {
             return
         }
 
+        let elapsed = Self.seconds(startedAt.duration(to: now))
+        let preset = presetTimeline.sample(at: elapsed)
         var uniforms = StageUniforms.make(
             camera: camera.frame,
             audio: audioFeatures.current,
-            time: Self.seconds(startedAt.duration(to: now)),
+            time: elapsed,
             viewport: SIMD2<Float>(
                 Float(view.drawableSize.width),
                 Float(view.drawableSize.height)
-            )
+            ),
+            presetWeights: preset.weights
         )
 
         encoder.label = "gmgn radio 360 stage"
@@ -208,4 +212,3 @@ final class StageRenderer: NSObject, MTKViewDelegate {
         )
     }
 }
-

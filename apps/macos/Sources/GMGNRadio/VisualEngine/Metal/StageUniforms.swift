@@ -5,12 +5,14 @@ struct StageUniforms: Sendable {
     var viewProjection: simd_float4x4
     var timeAndAudio: SIMD4<Float>
     var viewportAndMotion: SIMD4<Float>
+    var visualPreset: SIMD4<Float>
 
     static func make(
         camera: StageCameraFrame,
         audio: VisualAudioFeatures,
         time: Float,
-        viewport: SIMD2<Float>
+        viewport: SIMD2<Float>,
+        presetWeights: SIMD3<Float>
     ) -> StageUniforms {
         let width = max(viewport.x, 1)
         let height = max(viewport.y, 1)
@@ -45,6 +47,12 @@ struct StageUniforms: Sendable {
                 width,
                 height,
                 min(abs(camera.yawVelocity) + abs(camera.pitchVelocity), 2),
+                1
+            ),
+            visualPreset: SIMD4<Float>(
+                presetWeights.x,
+                presetWeights.y,
+                presetWeights.z,
                 1
             )
         )
@@ -94,4 +102,3 @@ struct StageUniforms: Sendable {
         )
     }
 }
-

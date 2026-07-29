@@ -26,14 +26,17 @@
 		49C04625C4FC1B15B33833CE /* ProgramPlannerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 091F9A1DA278A0DA5C8E4A4E /* ProgramPlannerTests.swift */; };
 		4A028323AC8B8CC8BC49939F /* OrbUniformTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4C1A38CFE1FE5149D76CC08 /* OrbUniformTests.swift */; };
 		4EC3D2F74514647D567B0C01 /* PresenceManifest.swift in Sources */ = {isa = PBXBuildFile; fileRef = E10077CC5B0FFD300B288B48 /* PresenceManifest.swift */; };
+		4F2F0BE39D8B500EFF5DED27 /* StageVisualPresetTimelineTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DF02DF3CF91DB9608D098557 /* StageVisualPresetTimelineTests.swift */; };
 		559086501216765204D4B06C /* DJState.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBAA0158B7BFF631FD685449 /* DJState.swift */; };
 		583709DB2BCEF0293ECDCD8B /* UnifiedMusicSearch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 96E6D962FE7287F48210926F /* UnifiedMusicSearch.swift */; };
+		5D57161677518A9A39EAB58C /* StageWindowModeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C0EE40A2A02D7B94512CC74 /* StageWindowModeTests.swift */; };
 		5F8E787A682533EA402207D8 /* DoubaoRTCEventMapper.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9758A4F0754760FA0AB854CA /* DoubaoRTCEventMapper.swift */; };
 		61BB35DA9B528F5AFC2CEBD6 /* StageOverlayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4F34AA02B66339224A58988 /* StageOverlayView.swift */; };
 		6457881F70FAC522542403A5 /* PresencePackageStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6928DE615B4CCBB86C03160 /* PresencePackageStoreTests.swift */; };
 		6663E63CBD50E0B8BE5DF04C /* MusicProviderSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 19D1AC1EED8E537124163209 /* MusicProviderSession.swift */; };
 		68B069C0D0B6FC9CB8D4E3B9 /* StageCameraModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B2A3586C14E9FEC3F15B9AF /* StageCameraModel.swift */; };
 		6F33A84A6365FF3418372AFC /* ElevenLabsAudioLevelRendererTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D61973FBC289CA1574CC7E72 /* ElevenLabsAudioLevelRendererTests.swift */; };
+		702843EC03BD6828068FAF56 /* StageVisualPresetTimeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0281DD4F900FFD76446F5C1C /* StageVisualPresetTimeline.swift */; };
 		761481871644BCC5C68DF17C /* OrbMotionModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A9A0DF149EE2164BBDE40EB /* OrbMotionModelTests.swift */; };
 		7A17C5E01AC43CD75E7C7195 /* OrbState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43F2D91E87ABAC0F51F8C126 /* OrbState.swift */; };
 		80AC6AC25FAE9E0FBCB11CDF /* AccountMusicSourceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF6190681ED5961F6C2903FE /* AccountMusicSourceTests.swift */; };
@@ -62,6 +65,7 @@
 		E07CACC669D4A648231EE3A0 /* VisualAudioFeatureExtractor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36C707778632484C921F090C /* VisualAudioFeatureExtractor.swift */; };
 		E1E72C29EB3D2A8256F43741 /* RealtimeDJSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 216A6D94509E4915BCC18C7C /* RealtimeDJSession.swift */; };
 		E49527753955135A51F8363E /* Stage.metal in Sources */ = {isa = PBXBuildFile; fileRef = E13F2FD5A9D73C17F8A9C25F /* Stage.metal */; };
+		E4B42BCA37A2E6ACCFD8C3E8 /* StageWindowMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3C79DFF381CD8831FA4C433 /* StageWindowMode.swift */; };
 		E52D5016BAD977B057280529 /* StageWindowControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D6999758740371B4CC8758D /* StageWindowControllerTests.swift */; };
 		E81E054C1A88065C8B12E130 /* StagePresentationModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BDCE4DF69A7F8E8FCB4244B2 /* StagePresentationModelTests.swift */; };
 		E9D4C5A74FBBB188DEC917B3 /* OrbRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF9A4902E75F2E8D7081C852 /* OrbRenderer.swift */; };
@@ -89,6 +93,7 @@
 
 /* Begin PBXFileReference section */
 		004DBF16E7B8E5F738731129 /* MetalStageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalStageView.swift; sourceTree = "<group>"; };
+		0281DD4F900FFD76446F5C1C /* StageVisualPresetTimeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageVisualPresetTimeline.swift; sourceTree = "<group>"; };
 		07A8377E0830ED4ED8D57DB6 /* PresenceSettingsModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceSettingsModel.swift; sourceTree = "<group>"; };
 		07DE01676AC401339B9DCC2F /* OrbMotionModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbMotionModel.swift; sourceTree = "<group>"; };
 		091F9A1DA278A0DA5C8E4A4E /* ProgramPlannerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgramPlannerTests.swift; sourceTree = "<group>"; };
@@ -96,6 +101,7 @@
 		1445F76B4536834CB72C2EE3 /* ElevenLabsAudioLevelRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElevenLabsAudioLevelRenderer.swift; sourceTree = "<group>"; };
 		19D1AC1EED8E537124163209 /* MusicProviderSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicProviderSession.swift; sourceTree = "<group>"; };
 		1B2A3586C14E9FEC3F15B9AF /* StageCameraModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageCameraModel.swift; sourceTree = "<group>"; };
+		1C0EE40A2A02D7B94512CC74 /* StageWindowModeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageWindowModeTests.swift; sourceTree = "<group>"; };
 		20C65C2BD0FD2417BAFBD387 /* PresenceCommandService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceCommandService.swift; sourceTree = "<group>"; };
 		216A6D94509E4915BCC18C7C /* RealtimeDJSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeDJSession.swift; sourceTree = "<group>"; };
 		2D6999758740371B4CC8758D /* StageWindowControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageWindowControllerTests.swift; sourceTree = "<group>"; };
@@ -138,6 +144,7 @@
 		BDCE4DF69A7F8E8FCB4244B2 /* StagePresentationModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StagePresentationModelTests.swift; sourceTree = "<group>"; };
 		BF9A4902E75F2E8D7081C852 /* OrbRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbRenderer.swift; sourceTree = "<group>"; };
 		C37C91B042237E14E18265B7 /* ElevenLabsRealtimeSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElevenLabsRealtimeSession.swift; sourceTree = "<group>"; };
+		C3C79DFF381CD8831FA4C433 /* StageWindowMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageWindowMode.swift; sourceTree = "<group>"; };
 		C4F34AA02B66339224A58988 /* StageOverlayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageOverlayView.swift; sourceTree = "<group>"; };
 		C9BED59FEA722CB9CBF88096 /* WindowPlacement.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowPlacement.swift; sourceTree = "<group>"; };
 		CA45B2F39C34F3F44A24A4FE /* ProviderEventMapperTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderEventMapperTests.swift; sourceTree = "<group>"; };
@@ -145,6 +152,7 @@
 		D61973FBC289CA1574CC7E72 /* ElevenLabsAudioLevelRendererTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElevenLabsAudioLevelRendererTests.swift; sourceTree = "<group>"; };
 		D6ADB71DE1D4B227CC6BDDB4 /* ElevenLabsRealtimeEventMapper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElevenLabsRealtimeEventMapper.swift; sourceTree = "<group>"; };
 		DCF719BB745F9C7E94029828 /* StagePresentationModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StagePresentationModel.swift; sourceTree = "<group>"; };
+		DF02DF3CF91DB9608D098557 /* StageVisualPresetTimelineTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageVisualPresetTimelineTests.swift; sourceTree = "<group>"; };
 		E012C530DC089221A1FE34C1 /* ProgramPlanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgramPlanner.swift; sourceTree = "<group>"; };
 		E040D830C5842BD73D5F5C12 /* KeychainMusicProviderSessionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainMusicProviderSessionStore.swift; sourceTree = "<group>"; };
 		E10077CC5B0FFD300B288B48 /* PresenceManifest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceManifest.swift; sourceTree = "<group>"; };
@@ -217,7 +225,9 @@
 				C4F34AA02B66339224A58988 /* StageOverlayView.swift */,
 				31B4ED03B824DB23844C3DB1 /* StageParticleGeometry.swift */,
 				DCF719BB745F9C7E94029828 /* StagePresentationModel.swift */,
+				0281DD4F900FFD76446F5C1C /* StageVisualPresetTimeline.swift */,
 				FC8DB2FC6BF5BF149BD893CC /* StageWindowController.swift */,
+				C3C79DFF381CD8831FA4C433 /* StageWindowMode.swift */,
 				36C707778632484C921F090C /* VisualAudioFeatureExtractor.swift */,
 				ACD0081809AE14CD18CA9B01 /* Metal */,
 				FADF1993EFF32F42FB011F72 /* Shaders */,
@@ -422,7 +432,9 @@
 				F64257C748D0B7218B3CCDD1 /* StageParticleGeometryTests.swift */,
 				BDCE4DF69A7F8E8FCB4244B2 /* StagePresentationModelTests.swift */,
 				85D5EE9963FDAFB9A0BEE96B /* StageUniformTests.swift */,
+				DF02DF3CF91DB9608D098557 /* StageVisualPresetTimelineTests.swift */,
 				2D6999758740371B4CC8758D /* StageWindowControllerTests.swift */,
+				1C0EE40A2A02D7B94512CC74 /* StageWindowModeTests.swift */,
 				4754EBB9C64ED51C00FF0F3C /* VisualAudioFeatureExtractorTests.swift */,
 			);
 			path = VisualEngine;
@@ -560,7 +572,9 @@
 				979D7A111DA0058F6F64F12A /* StageParticleGeometryTests.swift in Sources */,
 				E81E054C1A88065C8B12E130 /* StagePresentationModelTests.swift in Sources */,
 				9820DEC74A14B5BA053ED40C /* StageUniformTests.swift in Sources */,
+				4F2F0BE39D8B500EFF5DED27 /* StageVisualPresetTimelineTests.swift in Sources */,
 				E52D5016BAD977B057280529 /* StageWindowControllerTests.swift in Sources */,
+				5D57161677518A9A39EAB58C /* StageWindowModeTests.swift in Sources */,
 				343C7C4B77A94C27491DD866 /* UnifiedMusicSearchTests.swift in Sources */,
 				36DFD6DCAE62D1F28614ABB0 /* VisualAudioFeatureExtractorTests.swift in Sources */,
 				F83BDCD045FC0F46E849868C /* WindowPlacementTests.swift in Sources */,
@@ -611,7 +625,9 @@
 				BA5164930B513A70083CCFC5 /* StagePresentationModel.swift in Sources */,
 				B89E20895CA75F9F7D7F3273 /* StageRenderer.swift in Sources */,
 				F6B25B4461EF5E3DAB875AF1 /* StageUniforms.swift in Sources */,
+				702843EC03BD6828068FAF56 /* StageVisualPresetTimeline.swift in Sources */,
 				D8D0906855E8347D014683A6 /* StageWindowController.swift in Sources */,
+				E4B42BCA37A2E6ACCFD8C3E8 /* StageWindowMode.swift in Sources */,
 				583709DB2BCEF0293ECDCD8B /* UnifiedMusicSearch.swift in Sources */,
 				E07CACC669D4A648231EE3A0 /* VisualAudioFeatureExtractor.swift in Sources */,
 				330C60A11D6B3849DFAFCE65 /* WindowPlacement.swift in Sources */,
