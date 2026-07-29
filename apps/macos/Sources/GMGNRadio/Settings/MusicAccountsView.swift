@@ -46,19 +46,6 @@ struct MusicAccountsView: View {
             }
         }
         .task { await model.load() }
-        .sheet(
-            isPresented: Binding(
-                get: { model.editingProvider != nil },
-                set: {
-                    if !$0 {
-                        model.editingProvider = nil
-                        model.cookie = ""
-                    }
-                }
-            )
-        ) {
-            MusicCookieSheet(model: model)
-        }
     }
 
     private var header: some View {
@@ -99,7 +86,10 @@ private struct MusicAccountRow: View {
 
             Spacer()
 
-            if state == .connected {
+            if state == .authorizing {
+                ProgressView()
+                    .controlSize(.small)
+            } else if state == .connected {
                 Button("断开") {
                     Task { await model.disconnect(providerID) }
                 }
@@ -109,7 +99,7 @@ private struct MusicAccountRow: View {
                     if providerID == .appleMusic {
                         Task { await model.authorizeAppleMusic() }
                     } else {
-                        model.beginConnecting(providerID)
+                        Task { await model.connect(providerID) }
                     }
                 }
                 .buttonStyle(.bordered)
@@ -138,52 +128,5 @@ private struct MusicAccountRow: View {
         case .disconnected:
             "未连接"
         }
-    }
-}
-
-private struct MusicCookieSheet: View {
-    @Bindable var model: MusicAccountsModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("连接 \(providerName)")
-                    .font(.title2.weight(.semibold))
-                Text("粘贴已登录网页的 Cookie，只保存在本机钥匙串。")
-                    .foregroundStyle(.secondary)
-            }
-
-            SecureField("Cookie", text: $model.cookie)
-                .textFieldStyle(.roundedBorder)
-
-            if let message = model.message, model.hasError {
-                Label(message, systemImage: "exclamationmark.circle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            }
-
-            HStack {
-                Spacer()
-                Button("取消") {
-                    model.editingProvider = nil
-                    model.cookie = ""
-                }
-                .keyboardShortcut(.cancelAction)
-                Button("连接") {
-                    Task { await model.connect() }
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(model.cookie.isEmpty || model.isWorking)
-            }
-        }
-        .padding(24)
-        .frame(width: 440)
-    }
-
-    private var providerName: String {
-        guard let provider = model.editingProvider else {
-            return "音乐服务"
-        }
-        return model.providerName(provider)
     }
 }

@@ -7,54 +7,52 @@ final class MusicAccountsModel {
     var neteaseState: MusicAccountAuthorizationState = .disconnected
     var qqMusicState: MusicAccountAuthorizationState = .disconnected
     var appleMusicState: MusicAccountAuthorizationState = .disconnected
-    var cookie = ""
-    var editingProvider: MusicProviderID?
     var isWorking = false
     var message: String?
     var hasError = false
 
-    private let service: MusicAccountCommandService
+    private let service: any MusicAccountServicing
+    private let webLogin: any MusicProviderWebAuthenticating
     private let appleMusic: AppleMusicSource
 
     init(
-        service: MusicAccountCommandService = .live(),
+        service: any MusicAccountServicing = MusicAccountCommandService.live(),
+        webLogin: any MusicProviderWebAuthenticating = MusicProviderWebLoginController(),
         appleMusic: AppleMusicSource = AppleMusicSource()
     ) {
         self.service = service
+        self.webLogin = webLogin
         self.appleMusic = appleMusic
     }
 
     func load() async {
-        async let netease = service.status(providerID: .netease)
-        async let qqMusic = service.status(providerID: .qqMusic)
-        neteaseState = await netease
-        qqMusicState = await qqMusic
+        neteaseState = await service.status(providerID: .netease)
+        qqMusicState = await service.status(providerID: .qqMusic)
         appleMusicState = state(from: await appleMusic.access())
     }
 
-    func beginConnecting(_ providerID: MusicProviderID) {
-        cookie = ""
-        editingProvider = providerID
-        message = nil
-        hasError = false
-    }
-
-    func connect() async {
-        guard let providerID = editingProvider else {
+    func connect(_ providerID: MusicProviderID) async {
+        guard providerID == .netease || providerID == .qqMusic else {
             return
         }
         isWorking = true
         defer { isWorking = false }
+        setState(.authorizing, for: providerID)
+        show(message: "请在官方页面完成登录。")
         do {
+            let cookie = try await webLogin.login(providerID: providerID)
+            show(message: "正在同步 \(providerName(providerID))…")
             try await service.connect(
                 providerID: providerID,
                 cookie: cookie
             )
-            cookie = ""
-            editingProvider = nil
             setState(.connected, for: providerID)
             show(message: "\(providerName(providerID))已连接。")
+        } catch MusicProviderWebLoginError.cancelled {
+            setState(.disconnected, for: providerID)
+            show(message: "已取消登录。")
         } catch {
+            setState(.disconnected, for: providerID)
             show(error: error)
         }
     }
@@ -64,6 +62,7 @@ final class MusicAccountsModel {
         defer { isWorking = false }
         do {
             try await service.disconnect(providerID: providerID)
+            await webLogin.clearSession(providerID: providerID)
             setState(.disconnected, for: providerID)
             show(message: "\(providerName(providerID))已断开。")
         } catch {

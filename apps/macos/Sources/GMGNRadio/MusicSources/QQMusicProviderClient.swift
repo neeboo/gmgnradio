@@ -225,6 +225,7 @@ struct QQMusicProviderClient: AccountMusicProviderClient {
         let values = cookieValues(from: cookie)
         guard var value = values["uin"]
             ?? values["qqmusic_uin"]
+            ?? values["wxuin"]
             ?? values["p_uin"]
         else {
             return nil
@@ -240,6 +241,7 @@ struct QQMusicProviderClient: AccountMusicProviderClient {
         return values["qm_keyst"]
             ?? values["qqmusic_key"]
             ?? values["music_key"]
+            ?? values["wxskey"]
     }
 }
 

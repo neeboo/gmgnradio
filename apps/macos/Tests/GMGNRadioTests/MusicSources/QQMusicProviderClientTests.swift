@@ -115,3 +115,17 @@ func qqMusicClientResolvesVKeyPlaybackUsingTheUsersSession() async throws {
     #expect(comm["uin"] as? String == "12345")
     #expect(comm["authst"] as? String == "user-key")
 }
+
+@Test
+func qqMusicClientRecognizesWechatPlaybackSession() async throws {
+    let client = QQMusicProviderClient(
+        transport: ProviderHTTPTransportStub(responses: [])
+    )
+
+    let capabilities = try await client.capabilities(
+        session: providerSession("wxuin=12345; wxskey=playback-key")
+    )
+
+    #expect(capabilities.canReadLibrary)
+    #expect(capabilities.canPlay)
+}

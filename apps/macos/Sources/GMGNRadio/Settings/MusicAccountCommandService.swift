@@ -8,13 +8,27 @@ enum MusicAccountConnectionError: Error, Equatable, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .unsupportedProvider:
-            "这个音乐服务暂时不能用 Cookie 连接。"
+            "这个音乐服务暂时不能网页登录。"
         case .missingRequiredCookie:
-            "登录信息不完整，请重新从已登录的网页复制 Cookie。"
+            "官方登录信息不完整，请重新登录。"
         case .accountCannotPlay:
             "账号已识别，但当前登录态不能播放音乐。"
         }
     }
+}
+
+@MainActor
+protocol MusicAccountServicing {
+    func status(
+        providerID: MusicProviderID
+    ) async -> MusicAccountAuthorizationState
+
+    func connect(
+        providerID: MusicProviderID,
+        cookie: String
+    ) async throws
+
+    func disconnect(providerID: MusicProviderID) async throws
 }
 
 struct MusicAccountCommandService: Sendable {
@@ -102,9 +116,12 @@ struct MusicAccountCommandService: Sendable {
         case .qqMusic:
             let hasUIN = cookie.contains("uin=")
                 || cookie.contains("qqmusic_uin=")
+                || cookie.contains("wxuin=")
+                || cookie.contains("p_uin=")
             let hasKey = cookie.contains("qm_keyst=")
                 || cookie.contains("qqmusic_key=")
                 || cookie.contains("music_key=")
+                || cookie.contains("wxskey=")
             guard hasUIN, hasKey else {
                 throw MusicAccountConnectionError.missingRequiredCookie
             }
@@ -113,3 +130,5 @@ struct MusicAccountCommandService: Sendable {
         }
     }
 }
+
+extension MusicAccountCommandService: MusicAccountServicing {}

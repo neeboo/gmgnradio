@@ -56,6 +56,26 @@ func musicAccountServiceCanDisconnectAProvider() async throws {
     #expect(await store.session(for: .qqMusic) == nil)
 }
 
+@Test
+func musicAccountServiceAcceptsQQMusicWechatLoginCookies() async throws {
+    let store = InMemoryMusicProviderSessionStore()
+    let service = MusicAccountCommandService(
+        sessions: store,
+        neteaseClient: MusicAccountClientStub(),
+        qqMusicClient: MusicAccountClientStub()
+    )
+
+    try await service.connect(
+        providerID: .qqMusic,
+        cookie: "wxuin=12345; wxskey=playback-key"
+    )
+
+    #expect(
+        await store.session(for: .qqMusic)?.credential
+            == .cookieHeader("wxuin=12345; wxskey=playback-key")
+    )
+}
+
 private enum MusicAccountTestError: Error {
     case rejected
 }
