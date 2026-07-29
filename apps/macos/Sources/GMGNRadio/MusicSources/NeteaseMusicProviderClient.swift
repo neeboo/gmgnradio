@@ -180,12 +180,26 @@ struct NeteaseMusicProviderClient: AccountMusicProviderClient {
             throw MusicProviderClientError.playbackUnavailable
         }
         return MusicPlaybackAsset(
-            url: url,
+            url: securePlaybackURL(url),
             requestHeaders: [
                 "Cookie": cookie,
                 "Referer": "https://music.163.com/",
             ]
         )
+    }
+
+    private func securePlaybackURL(_ url: URL) -> URL {
+        guard
+            url.scheme?.lowercased() == "http",
+            var components = URLComponents(
+                url: url,
+                resolvingAgainstBaseURL: false
+            )
+        else {
+            return url
+        }
+        components.scheme = "https"
+        return components.url ?? url
     }
 
     private func providerRequest(

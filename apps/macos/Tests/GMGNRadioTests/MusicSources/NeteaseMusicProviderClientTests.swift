@@ -179,7 +179,7 @@ func neteaseClientResolvesAPlayableURLForTheUsersAccount() async throws {
               "code": 200,
               "data": [{
                 "id": 347230,
-                "url": "https://m801.music.126.net/example.mp3",
+                "url": "http://m801.music.126.net/example.mp3",
                 "code": 200
               }]
             }

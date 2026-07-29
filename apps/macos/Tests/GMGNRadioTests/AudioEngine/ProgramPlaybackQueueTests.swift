@@ -107,6 +107,18 @@ func programPlaybackQueueReportsWhenNoSlotCanBePrepared() async {
     }
 }
 
+@Test
+func programPlaybackQueueErrorExplainsTheFailureInChinese() {
+    let error = ProgramPlaybackQueueError.noPlayableSlots(
+        failedTrackIDs: ["1", "2"]
+    )
+
+    #expect(
+        error.errorDescription
+            == "这档节目里的歌曲暂时都无法播放。"
+    )
+}
+
 private func playbackPlan(ids: [String]) -> ProgramPlan {
     ProgramPlan(
         brief: ProgramBrief(

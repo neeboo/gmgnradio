@@ -1,11 +1,23 @@
 import Foundation
+import os
 
-enum ProgramPlaybackQueueError: Error, Equatable {
+enum ProgramPlaybackQueueError: Error, Equatable, LocalizedError {
     case noPlayableSlots(failedTrackIDs: [String])
+
+    var errorDescription: String? {
+        switch self {
+        case .noPlayableSlots:
+            "这档节目里的歌曲暂时都无法播放。"
+        }
+    }
 }
 
 @MainActor
 final class ProgramPlaybackQueue {
+    private let logger = Logger(
+        subsystem: "ai.gmgn.radio",
+        category: "program-playback"
+    )
     private let preflight: PlaybackPreflight
     private let lockedCapacity: Int
 
@@ -63,6 +75,11 @@ final class ProgramPlaybackQueue {
                 }
             } catch {
                 failedTrackIDs.append(slot.track.id)
+                let reason = (error as? any LocalizedError)?
+                    .errorDescription ?? String(reflecting: type(of: error))
+                logger.error(
+                    "预检失败：\(slot.track.id, privacy: .public)，\(reason, privacy: .public)"
+                )
             }
         }
     }
