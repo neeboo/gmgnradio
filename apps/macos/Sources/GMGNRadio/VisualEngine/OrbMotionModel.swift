@@ -10,7 +10,11 @@ struct VisualAudioFeatures: Equatable, Sendable {
 
 @MainActor
 final class VisualAudioFeatureStore {
-    var current: VisualAudioFeatures = .silent
+    private(set) var current: VisualAudioFeatures = .silent
+
+    func update(_ features: VisualAudioFeatures) {
+        current = features
+    }
 }
 
 struct OrbMotionFrame: Equatable, Sendable {

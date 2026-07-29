@@ -25,6 +25,24 @@ the `idle` state, so `idle.png` is also its visual baseline.
 The recording is the live Metal playing state with a neutral black comparison
 backdrop. It contains no generated or composited concept art.
 
+## 360° stage
+
+- `stage-360.png` — 1180×760 windowed stage with live DJ copy
+
+The interactive stage uses a high-contrast white and blue native Metal scene.
+It renders a deterministic particle DJ totem with head, shoulders, headphones,
+deck rings and orbital paths. The camera auto-orbits, supports pointer drag with
+inertia, and resets on double-click. Low, mid and high audio bands drive its
+motion. Program titles and host cues come from the stage presentation model.
+
+Launch it directly for visual inspection:
+
+```bash
+open -na \
+  --env GMGN_STAGE=1 \
+  'apps/macos/build/Debug/gmgn radio.app'
+```
+
 ## Reproduce
 
 Build:

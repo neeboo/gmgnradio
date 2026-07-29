@@ -13,6 +13,15 @@ struct GMGNRadioApp: App {
 
     var body: some Scene {
         MenuBarExtra(ProductIdentity.displayName, systemImage: "waveform.circle.fill") {
+            Button("打开 360°舞台") {
+                (NSApplication.shared.delegate as? AppDelegate)?
+                    .showStage()
+            }
+            Button("关闭 360°舞台") {
+                (NSApplication.shared.delegate as? AppDelegate)?
+                    .closeStage()
+            }
+            Divider()
             Button("桌宠设置…") {
                 SettingsMenuAction(
                     openSettings: { openSettings() },
@@ -36,7 +45,7 @@ struct GMGNRadioApp: App {
                     }
                 ).perform()
             }
-            Button("Exit Immersive Visuals") {
+            Button("退出桌面背景") {
                 (NSApplication.shared.delegate as? AppDelegate)?
                     .exitImmersiveVisuals()
             }
@@ -72,12 +81,19 @@ struct SettingsMenuAction {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let audioFeatures = VisualAudioFeatureStore()
+    private let stagePresentation = StagePresentationModel()
+    private let realtimeDJSessionController = RealtimeDJSessionController()
     private var orbWindowController: OrbWindowController?
+    private var stageWindowController: StageWindowController?
+    private var stageAudioMonitor: VisualAudioInputMonitor?
+    private var stagePresentationTask: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let controller = OrbWindowController()
+        let controller = OrbWindowController(audioFeatures: audioFeatures)
         orbWindowController = controller
         controller.show()
+        configureStage()
 
         let environment = ProcessInfo.processInfo.environment
         if
@@ -89,9 +105,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if environment["GMGN_BASELINE_IMMERSIVE"] == "1" {
             controller.enterImmersiveVisuals()
         }
+        if environment["GMGN_STAGE"] == "1" {
+            showStage()
+        }
+    }
+
+    func showStage() {
+        if stageWindowController == nil {
+            configureStage()
+        }
+        stageWindowController?.show()
+    }
+
+    func closeStage() {
+        stageWindowController?.close()
     }
 
     func exitImmersiveVisuals() {
         orbWindowController?.exitImmersiveVisuals()
+    }
+
+    private func configureStage() {
+        let monitor = VisualAudioInputMonitor(store: audioFeatures)
+        stageAudioMonitor = monitor
+        stageWindowController = StageWindowController(
+            audioFeatures: audioFeatures,
+            audioMonitor: monitor,
+            presentation: stagePresentation
+        )
+
+        stagePresentationTask?.cancel()
+        stagePresentationTask = Task { [weak self] in
+            guard let self else {
+                return
+            }
+            let events = await realtimeDJSessionController.eventStream()
+            for await event in events {
+                guard !Task.isCancelled else {
+                    return
+                }
+                stagePresentation.consume(event)
+            }
+        }
+    }
+
+    @discardableResult
+    func activateRealtimeDJSession(
+        _ session: any RealtimeDJSession,
+        ticket: RealtimeDJSessionTicket
+    ) async throws -> RealtimeDJSessionSnapshot {
+        try await realtimeDJSessionController.activate(
+            session,
+            ticket: ticket
+        )
+    }
+
+    func updateRealtimeDJContext(_ context: RealtimeDJContext) async throws {
+        stagePresentation.apply(context)
+        try await realtimeDJSessionController.updateContext(context)
     }
 }
