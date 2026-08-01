@@ -1,5 +1,38 @@
 import Foundation
 
+enum RealtimeVoicePlaybackAudioRoute: Equatable {
+    case connectWithoutPlaybackAudio
+    case reuseExistingPlaybackAudio
+
+    static func resolve(
+        hasExistingPlaybackAudio: Bool
+    ) -> RealtimeVoicePlaybackAudioRoute {
+        hasExistingPlaybackAudio
+            ? .reuseExistingPlaybackAudio
+            : .connectWithoutPlaybackAudio
+    }
+}
+
+enum RealtimeVoiceConnectionError: Error, Equatable, LocalizedError {
+    case timedOut
+
+    var errorDescription: String? {
+        switch self {
+        case .timedOut:
+            "连接 DJ 超时，请重试。"
+        }
+    }
+}
+
+struct RealtimeVoiceConnectionDeadline: Sendable {
+    let duration: Duration
+
+    func wait() async throws {
+        try await Task.sleep(for: duration)
+        throw RealtimeVoiceConnectionError.timedOut
+    }
+}
+
 enum RealtimeDJTransport: String, Codable, Sendable {
     case streamingWebSocket
     case rtcRoom
@@ -10,6 +43,15 @@ enum RealtimeDJProvider: String, Codable, CaseIterable, Sendable {
     case bailian
     case doubao
     case elevenLabs = "elevenlabs"
+
+    var hasLocalRuntime: Bool {
+        switch self {
+        case .bailian, .elevenLabs:
+            true
+        case .doubao:
+            false
+        }
+    }
 
     var capabilities: RealtimeDJCapabilities {
         switch self {
@@ -67,6 +109,7 @@ struct RealtimeDJContext: Codable, Equatable, Sendable {
     var hostPreference: String?
     var immediateUserInstruction: String?
     var visualMood: StageVisualMood?
+    var agentControl: DJAgentRadioState?
 
     init(
         playback: PlaybackContext,
@@ -74,7 +117,8 @@ struct RealtimeDJContext: Codable, Equatable, Sendable {
         hostHint: ProgramHostHint? = nil,
         hostPreference: String? = nil,
         immediateUserInstruction: String? = nil,
-        visualMood: StageVisualMood? = nil
+        visualMood: StageVisualMood? = nil,
+        agentControl: DJAgentRadioState? = nil
     ) {
         self.playback = playback
         self.showPlanSummary = showPlanSummary
@@ -82,6 +126,7 @@ struct RealtimeDJContext: Codable, Equatable, Sendable {
         self.hostPreference = hostPreference
         self.immediateUserInstruction = immediateUserInstruction
         self.visualMood = visualMood
+        self.agentControl = agentControl
     }
 }
 
@@ -159,6 +204,7 @@ struct RealtimeDJAudioLevel: Codable, Equatable, Sendable {
 
 enum RealtimeDJEvent: Equatable, Sendable {
     case connectionChanged(RealtimeDJConnectionState)
+    case userAudioLevel(RealtimeDJAudioLevel)
     case userSpeechStarted
     case userSpeechFinished
     case userTranscriptDelta(String)
@@ -184,6 +230,7 @@ protocol RealtimeDJSession: Sendable {
     func setMicrophoneCaptureEnabled(_ enabled: Bool) async throws
     func setMicrophoneTransmissionEnabled(_ enabled: Bool) async throws
     func interrupt() async throws
+    func requestAgentResponse(_ instruction: String) async throws
     func submitToolResult(_ result: RealtimeDJToolResult) async throws
     func disconnect() async
 }

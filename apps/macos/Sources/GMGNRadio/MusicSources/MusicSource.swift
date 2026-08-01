@@ -97,6 +97,7 @@ struct MusicCandidate: Codable, Equatable, Sendable {
     let moodTags: [String]
     let genres: [String]
     let releaseYear: Int?
+    var artworkURL: URL? = nil
 
     var deduplicationKey: String {
         if let canonicalID, !canonicalID.isEmpty {

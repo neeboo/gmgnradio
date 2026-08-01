@@ -44,6 +44,62 @@ func audioAnalyzerMapsLowMidAndHighEnergyForTheStage() {
     #expect(high.high > high.mid)
 }
 
+@Test
+func visualFeaturesPreserveBeatOnsetAndAmplitude() {
+    let frame = AudioFeatureFrame(
+        rms: 0.25,
+        peak: 0.8,
+        bands: SIMD32<Float>(repeating: 0.2),
+        spectralCentroid: 1_200,
+        lowFrequencyImpact: 0.7,
+        onset: 0.8,
+        beatPulse: 0.9,
+        dominantFrequency: 120,
+        hostTime: 42
+    )
+
+    let features = frame.visualFeatures
+
+    #expect(features.beat == 0.9)
+    #expect(features.onset == 0.8)
+    #expect(abs(features.amplitude - 0.675) < 0.001)
+}
+
+@Test
+func waveformEnvelopeKeepsTheShapeOfTheCurrentAudioFrame() {
+    var samples = [Float](repeating: 0, count: 80)
+    for index in 30 ..< 40 {
+        samples[index] = index.isMultiple(of: 2) ? 0.8 : -0.8
+    }
+
+    let waveform = samples.withUnsafeBufferPointer {
+        WaveformEnvelopeSampler.sample($0)
+    }
+
+    #expect(waveform[3] > 0.99)
+    #expect(waveform[0] == 0)
+    #expect(waveform[7] == 0)
+}
+
+@Test
+func beatPulseFiresOnTheLowFrequencyAttackAndFallsDuringASteadyTone() {
+    let analyzer = AudioAnalyzer(sampleRate: 48_000, frameSize: 2_048)
+    let silence = [Float](repeating: 0, count: 2_048)
+    let kick = makeSineSamples(
+        frequency: 90,
+        sampleRate: 48_000,
+        count: 2_048,
+        amplitude: 0.9
+    )
+
+    _ = analyzer.analyze(silence)
+    let attack = analyzer.analyze(kick)
+    let sustained = analyzer.analyze(kick)
+
+    #expect(attack.beatPulse > 0.7)
+    #expect(sustained.beatPulse < 0.2)
+}
+
 private func makeSineSamples(
     frequency: Float,
     sampleRate: Float,

@@ -3,15 +3,21 @@ import SwiftUI
 @MainActor
 struct AgentSettingsView: View {
     @State private var model = AgentSettingsModel()
-    @State private var programStore: DJProgramStore
-    private let startAIProgram: () -> Void
+    @State private var voiceStatus = RealtimeVoiceStatusStore.shared
+    private let connectRealtimeVoice:
+        (RealtimeVoiceConfiguration) -> Void
+    private let disconnectRealtimeVoice: () -> Void
+    private let agentConfigurationChanged: () -> Void
 
     init(
-        programStore: DJProgramStore = .shared,
-        startAIProgram: @escaping () -> Void = {}
+        connectRealtimeVoice:
+            @escaping (RealtimeVoiceConfiguration) -> Void = { _ in },
+        disconnectRealtimeVoice: @escaping () -> Void = {},
+        agentConfigurationChanged: @escaping () -> Void = {}
     ) {
-        _programStore = State(initialValue: programStore)
-        self.startAIProgram = startAIProgram
+        self.connectRealtimeVoice = connectRealtimeVoice
+        self.disconnectRealtimeVoice = disconnectRealtimeVoice
+        self.agentConfigurationChanged = agentConfigurationChanged
     }
 
     var body: some View {
@@ -19,7 +25,7 @@ struct AgentSettingsView: View {
             header
 
             Form {
-                Section("策划 Agent") {
+                Section("DJ 内核") {
                     HStack(spacing: 12) {
                         Image(systemName: "terminal.fill")
                             .font(.title3)
@@ -31,7 +37,7 @@ struct AgentSettingsView: View {
                             )
 
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Codex")
+                            Text("gmgn DJ")
                                 .fontWeight(.medium)
                             Text(statusText)
                                 .font(.caption)
@@ -58,12 +64,46 @@ struct AgentSettingsView: View {
                     }
                     .padding(.vertical, 4)
 
-                    Text("复用本机 Codex 登录；节目策划不会读取音乐账号凭据。")
+                    Text("Codex 提供策划和推理能力；它与下面的声音共同属于同一个 DJ。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+
+                    Toggle(
+                        isOn: Binding(
+                            get: { model.takeoverEnabled },
+                            set: { enabled in
+                                model.takeoverEnabled = enabled
+                                model.saveAgentConfiguration()
+                                agentConfigurationChanged()
+                            }
+                        )
+                    ) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("允许 DJ 自动接管")
+                            Text("可以自主切歌、暂停、继续、重排节目和调整视觉。")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    LabeledContent("策划模型") {
+                        TextField(
+                            "使用 Codex 默认模型",
+                            text: Binding(
+                                get: { model.planningModel },
+                                set: { value in
+                                    model.planningModel = value
+                                    model.saveAgentConfiguration(
+                                        showMessage: false
+                                    )
+                                }
+                            )
+                        )
+                        .frame(width: 220)
+                    }
                 }
 
-                Section("DJ 偏好") {
+                Section("DJ 人格与偏好") {
                     TextEditor(text: $model.hostPrompt)
                         .font(.body)
                         .frame(minHeight: 150)
@@ -80,9 +120,69 @@ struct AgentSettingsView: View {
                     }
                 }
 
-                Section("节目编排") {
-                    programPlanningContent
+                Section("DJ 声音") {
+                    Picker(
+                        "服务",
+                        selection: Binding(
+                            get: { model.realtimeProvider },
+                            set: { model.selectRealtimeProvider($0) }
+                        )
+                    ) {
+                        ForEach(
+                            RealtimeDJProvider.allCases,
+                            id: \.self
+                        ) { provider in
+                            Text(provider.displayName)
+                                .tag(provider)
+                        }
+                    }
+
+                    providerConfigurationFields
+
+                    LabeledContent("传输") {
+                        Text(model.realtimeProvider.transportLabel)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    HStack {
+                        Label(voiceStatusText, systemImage: voiceStatusIcon)
+                            .font(.caption)
+                            .foregroundStyle(voiceStatusColor)
+
+                        Spacer()
+
+                        if voiceStatus.state.isConversationOpen {
+                            Button("断开") {
+                                disconnectRealtimeVoice()
+                            }
+                            .buttonStyle(.bordered)
+                        } else if model.realtimeProvider.canConnectLocally {
+                            Button("连接语音") {
+                                guard
+                                    let configuration =
+                                        model.saveVoiceConfiguration()
+                                else {
+                                    return
+                                }
+                                connectRealtimeVoice(configuration)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(
+                                voiceStatus.state == .connecting
+                            )
+                        } else {
+                            Button("保存配置") {
+                                _ = model.saveVoiceConfiguration()
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+
+                    Text(providerHelpText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
+
             }
             .formStyle(.grouped)
 
@@ -104,93 +204,97 @@ struct AgentSettingsView: View {
     }
 
     @ViewBuilder
-    private var programPlanningContent: some View {
-        switch programStore.status {
-        case .planning:
-            HStack(spacing: 10) {
-                ProgressView()
-                    .controlSize(.small)
-                Text("DJ 正在排节目…")
-                    .foregroundStyle(.secondary)
-            }
-        case let .failed(message):
-            Label(message, systemImage: "exclamationmark.circle.fill")
-                .foregroundStyle(.red)
-        case .idle, .ready:
-            if let plan = programStore.plan {
-                let duration = plan.slots.reduce(0) {
-                    $0 + $1.track.duration
-                }
-                if let title = plan.title {
-                    Text(title)
-                        .font(.headline)
-                }
-                if let direction = plan.direction {
-                    Text(direction)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                }
-                Text(
-                    "\(plan.slots.count) 首 · 约 \(max(1, Int(duration / 60))) 分钟"
+    private var providerConfigurationFields: some View {
+        switch model.realtimeProvider {
+        case .elevenLabs:
+            TextField(
+                "Agent ID",
+                text: $model.elevenLabsAgentID,
+                prompt: Text("agent_...")
+            )
+            SecureField(
+                "API Key（私有 Agent）",
+                text: $model.voiceAPIKey,
+                prompt: Text("sk_...")
+            )
+            SecureField(
+                "会话令牌（可选）",
+                text: $model.elevenLabsConversationToken,
+                prompt: Text("已有短期令牌时填写")
+            )
+            TextField(
+                "音色 ID（可选）",
+                text: $model.elevenLabsVoiceID,
+                prompt: Text("留空则使用 Agent 默认音色")
+            )
+        case .bailian:
+            SecureField(
+                "API Key",
+                text: $model.voiceAPIKey,
+                prompt: Text("sk-...")
+            )
+            Picker(
+                "实时模型",
+                selection: Binding(
+                    get: { model.voiceModel },
+                    set: { model.selectBailianModel($0) }
                 )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-                ForEach(
-                    Array(plan.slots.prefix(6).enumerated()),
-                    id: \.element.track.id
-                ) { index, slot in
-                    HStack(spacing: 10) {
-                        Image(
-                            systemName: programStore.activeSlotIndex == index
-                                ? "play.fill"
-                                : "\(index + 1).circle"
-                        )
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                            .frame(width: 22, alignment: .leading)
-                        Text(slot.track.title)
-                            .lineLimit(1)
-                        Spacer(minLength: 8)
-                        Text(slot.track.artist)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
+            ) {
+                ForEach(BailianRealtimeOptions.models) { option in
+                    Text(option.title)
+                        .tag(option.id)
                 }
-
-                if plan.slots.count > 6 {
-                    Text("还有 \(plan.slots.count - 6) 首")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            } else {
-                Text("从已连接的音乐账号里生成一档约 30 分钟的节目。")
-                    .foregroundStyle(.secondary)
             }
+            Picker(
+                "音色",
+                selection: $model.voiceID
+            ) {
+                ForEach(
+                    BailianRealtimeOptions.voices(
+                        for: model.voiceModel
+                    )
+                ) { option in
+                    Text(option.title)
+                        .tag(option.id)
+                }
+            }
+        case .doubao:
+            TextField(
+                "RTC App ID",
+                text: $model.voiceAppID
+            )
+            SecureField(
+                "Access Token",
+                text: $model.voiceAccessToken
+            )
+            TextField(
+                "Resource ID",
+                text: $model.voiceResourceID
+            )
+            TextField(
+                "音色",
+                text: $model.voiceID,
+                prompt: Text("供应商音色 ID")
+            )
         }
+    }
 
-        Button(
-            programStore.plan == nil
-                ? "按这个偏好排节目"
-                : "重新编排"
-        ) {
-            model.savePrompt()
-            startAIProgram()
+    private var providerHelpText: String {
+        switch model.realtimeProvider {
+        case .elevenLabs:
+            "可填写公开 Agent ID；私有 Agent 可手工填写 API Key，密钥只保存在本机钥匙串。"
+        case .bailian:
+            "API Key 只保存在本机；连接后由百炼负责听你说话和实时主持。"
+        case .doubao:
+            "豆包凭据会保存在本机；当前客户端尚未安装 RTC 连接器。"
         }
-        .buttonStyle(.borderedProminent)
-        .disabled(
-            programStore.status == .planning
-                || !model.codexState.isSignedIn
-        )
     }
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 3) {
             Text("智能 DJ")
                 .font(.title2.weight(.semibold))
-            Text("负责排节目和主持")
+            Text("同一个 DJ 负责策划、主持和播放")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -202,11 +306,95 @@ struct AgentSettingsView: View {
     private var statusText: String {
         switch model.codexState {
         case .unavailable:
-            "未安装 Codex"
+            "策划引擎未安装"
         case .signedOut:
-            "未登录"
+            "策划引擎未登录"
         case let .signedIn(method):
-            "已使用 \(method) 登录"
+            "策划引擎已使用 \(method) 登录"
+        }
+    }
+
+    private var voiceStatusText: String {
+        switch voiceStatus.state {
+        case .disconnected:
+            "尚未连接"
+        case .connecting:
+            "正在连接麦克风和实时会话"
+        case .connected:
+            "已连接，可以直接和 DJ 说话"
+        case .listening:
+            "DJ 正在听"
+        case .speaking:
+            "DJ 正在说话"
+        case let .failed(message):
+            message
+        }
+    }
+
+    private var voiceStatusIcon: String {
+        switch voiceStatus.state {
+        case .disconnected:
+            "mic.slash"
+        case .connecting:
+            "ellipsis"
+        case .connected:
+            "waveform.circle.fill"
+        case .listening:
+            "ear.fill"
+        case .speaking:
+            "speaker.wave.2.fill"
+        case .failed:
+            "exclamationmark.circle.fill"
+        }
+    }
+
+    private var voiceStatusColor: Color {
+        switch voiceStatus.state {
+        case .connected, .listening, .speaking:
+            .cyan
+        case .failed:
+            .red
+        case .disconnected, .connecting:
+            .secondary
+        }
+    }
+}
+
+private extension RealtimeDJProvider {
+    var displayName: String {
+        switch self {
+        case .bailian:
+            "阿里云百炼"
+        case .doubao:
+            "豆包实时语音"
+        case .elevenLabs:
+            "ElevenLabs"
+        }
+    }
+
+    var transportLabel: String {
+        switch capabilities.transport {
+        case .streamingWebSocket:
+            "实时 WebSocket"
+        case .rtcRoom:
+            "RTC"
+        case .webRTC:
+            "WebRTC"
+        }
+    }
+
+    var canConnectLocally: Bool {
+        hasLocalRuntime
+    }
+}
+
+private extension RealtimeVoiceConnectionState {
+    var isConversationOpen: Bool {
+        switch self {
+        case .connected, .listening, .speaking:
+            true
+        case .disconnected, .connecting, .failed:
+            false
         }
     }
 }

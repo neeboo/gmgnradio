@@ -7,17 +7,26 @@ enum MusicProviderSessionStoreError: Error, Equatable {
 }
 
 actor KeychainMusicProviderSessionStore: MusicProviderSessionStore {
+    static let defaultService = "ai.gmgn.radio.music-providers.v2"
+
     private let service: String
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    private var loadedProviderIDs = Set<MusicProviderID>()
+    private var cachedSessions: [
+        MusicProviderID: MusicProviderSession
+    ] = [:]
 
-    init(service: String = "ai.gmgn.radio.music-providers") {
+    init(service: String = KeychainMusicProviderSessionStore.defaultService) {
         self.service = service
     }
 
     func session(
         for providerID: MusicProviderID
     ) throws -> MusicProviderSession? {
+        if loadedProviderIDs.contains(providerID) {
+            return cachedSessions[providerID]
+        }
         var query = baseQuery(for: providerID)
         query[kSecReturnData] = true
         query[kSecMatchLimit] = kSecMatchLimitOne
@@ -25,6 +34,7 @@ actor KeychainMusicProviderSessionStore: MusicProviderSessionStore {
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         if status == errSecItemNotFound {
+            loadedProviderIDs.insert(providerID)
             return nil
         }
         guard status == errSecSuccess else {
@@ -39,6 +49,8 @@ actor KeychainMusicProviderSessionStore: MusicProviderSessionStore {
         else {
             throw MusicProviderSessionStoreError.invalidStoredSession
         }
+        loadedProviderIDs.insert(providerID)
+        cachedSessions[providerID] = session
         return session
     }
 
@@ -60,12 +72,16 @@ actor KeychainMusicProviderSessionStore: MusicProviderSessionStore {
             guard addStatus == errSecSuccess else {
                 throw MusicProviderSessionStoreError.keychain(addStatus)
             }
+            loadedProviderIDs.insert(providerID)
+            cachedSessions[providerID] = session
             return
         }
 
         guard updateStatus == errSecSuccess else {
             throw MusicProviderSessionStoreError.keychain(updateStatus)
         }
+        loadedProviderIDs.insert(providerID)
+        cachedSessions[providerID] = session
     }
 
     func removeSession(
@@ -75,6 +91,8 @@ actor KeychainMusicProviderSessionStore: MusicProviderSessionStore {
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw MusicProviderSessionStoreError.keychain(status)
         }
+        loadedProviderIDs.insert(providerID)
+        cachedSessions.removeValue(forKey: providerID)
     }
 
     private func baseQuery(

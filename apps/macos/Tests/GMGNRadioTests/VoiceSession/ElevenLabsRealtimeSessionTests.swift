@@ -11,6 +11,52 @@ func liveElevenLabsSessionUsesOfficialSDKTransport() {
 }
 
 @Test
+func elevenLabsManualAPIKeyBuildsAndParsesAConversationTokenRequest()
+    throws
+{
+    let tokenRequest = ElevenLabsConversationTokenRequest()
+    let request = try tokenRequest.makeRequest(
+        agentID: "agent_radio",
+        apiKey: "sk-local"
+    )
+    let url = try #require(request.url)
+    let response = try #require(HTTPURLResponse(
+        url: url,
+        statusCode: 200,
+        httpVersion: nil,
+        headerFields: nil
+    ))
+
+    #expect(
+        request.url?.absoluteString.contains(
+            "/v1/convai/conversation/token"
+        ) == true
+    )
+    #expect(
+        request.value(forHTTPHeaderField: "xi-api-key")
+            == "sk-local"
+    )
+    #expect(
+        try tokenRequest.parse(
+            Data(#"{"token":"signed-token"}"#.utf8),
+            response: response
+        ) == "signed-token"
+    )
+}
+
+@Test
+func elevenLabsConnectionFailureKeepsTheActionableMessage() {
+    let error = ElevenLabsSDKTransportError.connectionFailed(
+        "ElevenLabs Agent ID 无效，或该 Agent 未公开。"
+    )
+
+    #expect(
+        error.errorDescription
+            == "ElevenLabs Agent ID 无效，或该 Agent 未公开。"
+    )
+}
+
+@Test
 func elevenLabsSessionDecodesOpaqueTicketAndForwardsEvents() async throws {
     let transport = RecordingElevenLabsConversationTransport()
     let session = ElevenLabsRealtimeSession(transport: transport)
@@ -84,6 +130,7 @@ func elevenLabsSessionForwardsContextInterruptAndToolResults() async throws {
     try await session.connect(ticket: elevenLabsTicket())
     try await session.updateContext(context)
     try await session.interrupt()
+    try await session.requestAgentResponse("新歌已开始，请说一句开场词。")
     try await session.submitToolResult(result)
     await session.disconnect()
 
@@ -91,6 +138,9 @@ func elevenLabsSessionForwardsContextInterruptAndToolResults() async throws {
     let updatedContext = try await transport.updatedContext()
     #expect(updatedContext == context)
     #expect(calls.contains(.interrupt))
+    #expect(calls.contains(
+        .requestAgentResponse("新歌已开始，请说一句开场词。")
+    ))
     #expect(calls.contains(.toolResult(result)))
     #expect(calls.last == .disconnect)
 }
@@ -112,6 +162,7 @@ private enum ElevenLabsTransportCall: Equatable, Sendable {
     case updateContext(Data)
     case setMuted(Bool)
     case interrupt
+    case requestAgentResponse(String)
     case toolResult(RealtimeDJToolResult)
     case disconnect
 }
@@ -145,6 +196,10 @@ private actor RecordingElevenLabsConversationTransport:
 
     func interrupt() {
         calls.append(.interrupt)
+    }
+
+    func requestAgentResponse(_ instruction: String) {
+        calls.append(.requestAgentResponse(instruction))
     }
 
     func submitToolResult(_ result: RealtimeDJToolResult) {

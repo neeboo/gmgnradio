@@ -108,4 +108,22 @@ func agentVisualLanguageOverridesTheRoleAndDrivesIntensity() {
 
     #expect(cue.mood == .pulse)
     #expect(cue.intensity == 0.7)
+    #expect(cue.palette == .indigo)
+}
+
+@Test
+func agentPaletteLanguageChangesColorWithoutChangingTheSpatialPreset() {
+    let warm = ProgramVisualDirector().palette(
+        mood: "安静陪伴",
+        description: "温暖琥珀"
+    )
+    let melancholy = ProgramVisualDirector().palette(
+        mood: "安静忧郁",
+        description: "深蓝紫"
+    )
+
+    #expect(warm == .amber)
+    #expect(melancholy == .indigo)
+    #expect(warm.primary != melancholy.primary)
+    #expect(warm.background != melancholy.background)
 }

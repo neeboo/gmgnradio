@@ -42,3 +42,35 @@ func stageParticleGeometryHasReadableDepth() {
     #expect(maximumY > 1.5)
 }
 
+@Test
+func albumParticleCanvasBuildsAnAddressableCoverGrid() {
+    let geometry = StageParticleGeometry.albumCanvas(
+        grid: 16,
+        seed: 42
+    )
+
+    #expect(geometry.vertices.count == 256)
+    #expect(geometry.regionCounts[.cover, default: 0] == 256)
+    #expect(geometry.vertices.first?.textureCoordinate.x ?? 1 < 0.04)
+    #expect(geometry.vertices.first?.textureCoordinate.y ?? 1 < 0.04)
+    #expect(geometry.vertices.last?.textureCoordinate.x ?? 0 > 0.96)
+    #expect(geometry.vertices.last?.textureCoordinate.y ?? 0 > 0.96)
+}
+
+@Test
+func ambientParticleFieldHasDustShardsAndFloorDepth() {
+    let geometry = StageParticleGeometry.ambientField(
+        count: 1_800,
+        seed: 0x4D564658
+    )
+    let sizes = geometry.vertices.map(\.positionAndSize.w)
+    let depths = geometry.vertices.map(\.positionAndSize.z)
+
+    #expect(geometry.vertices.count == 1_800)
+    #expect(geometry.regionCounts[.ambientDust, default: 0] > 900)
+    #expect(geometry.regionCounts[.ambientShard, default: 0] > 150)
+    #expect(geometry.regionCounts[.floorSpark, default: 0] > 150)
+    #expect((sizes.min() ?? 1) < 0.7)
+    #expect((sizes.max() ?? 0) > 3)
+    #expect((depths.max() ?? 0) - (depths.min() ?? 0) > 12)
+}

@@ -24,6 +24,8 @@ actor RealtimeDJSessionController {
     private var generation: UInt64 = 0
     private var activeSession: ActiveSession?
     private var forwardingTask: Task<Void, Never>?
+    private var agentResponseActive = false
+    private var pendingHostInstructions: [String] = []
 
     private let events: AsyncStream<RealtimeDJEvent>
     private let eventContinuation: AsyncStream<RealtimeDJEvent>.Continuation
@@ -60,6 +62,8 @@ actor RealtimeDJSessionController {
             activeSession = nil
             await previousSession.disconnect()
         }
+        agentResponseActive = false
+        pendingHostInstructions.removeAll(keepingCapacity: true)
 
         do {
             try await session.connect(ticket: ticket)
@@ -110,6 +114,21 @@ actor RealtimeDJSessionController {
         try await requireActiveSession().interrupt()
     }
 
+    func requestAgentResponse(_ instruction: String) async throws {
+        guard !agentResponseActive else {
+            pendingHostInstructions.append(instruction)
+            return
+        }
+        agentResponseActive = true
+        do {
+            try await requireActiveSession()
+                .requestAgentResponse(instruction)
+        } catch {
+            agentResponseActive = false
+            throw error
+        }
+    }
+
     func submitToolResult(_ result: RealtimeDJToolResult) async throws {
         try await requireActiveSession().submitToolResult(result)
     }
@@ -121,6 +140,8 @@ actor RealtimeDJSessionController {
 
         let session = activeSession?.session
         activeSession = nil
+        agentResponseActive = false
+        pendingHostInstructions.removeAll(keepingCapacity: true)
         await session?.disconnect()
     }
 
@@ -134,10 +155,46 @@ actor RealtimeDJSessionController {
     private func forward(
         _ event: RealtimeDJEvent,
         fromGeneration eventGeneration: UInt64
-    ) {
+    ) async {
         guard activeSession?.generation == eventGeneration else {
             return
         }
+        switch event {
+        case .agentResponseStarted:
+            agentResponseActive = true
+        case .agentAudioFinished:
+            agentResponseActive = false
+        case .failure, .connectionChanged(.disconnected):
+            agentResponseActive = false
+            pendingHostInstructions.removeAll(keepingCapacity: true)
+        default:
+            break
+        }
         eventContinuation.yield(event)
+        if event == .agentAudioFinished {
+            await startNextPendingHostResponse()
+        }
+    }
+
+    private func startNextPendingHostResponse() async {
+        guard
+            !agentResponseActive,
+            !pendingHostInstructions.isEmpty
+        else {
+            return
+        }
+        let instruction = pendingHostInstructions.removeFirst()
+        agentResponseActive = true
+        do {
+            try await requireActiveSession()
+                .requestAgentResponse(instruction)
+        } catch {
+            agentResponseActive = false
+            eventContinuation.yield(.failure(RealtimeDJFailure(
+                code: "host_response_failed",
+                message: error.localizedDescription,
+                recoverable: true
+            )))
+        }
     }
 }

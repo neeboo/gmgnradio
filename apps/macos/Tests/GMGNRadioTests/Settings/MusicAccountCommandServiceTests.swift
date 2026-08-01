@@ -3,6 +3,14 @@ import Testing
 @testable import GMGNRadio
 
 @Test
+func musicProviderKeychainUsesTheStableSignatureNamespace() {
+    #expect(
+        KeychainMusicProviderSessionStore.defaultService
+            == "ai.gmgn.radio.music-providers.v2"
+    )
+}
+
+@Test
 func musicAccountServiceValidatesBeforeSavingAProviderSession() async throws {
     let store = InMemoryMusicProviderSessionStore()
     let service = MusicAccountCommandService(

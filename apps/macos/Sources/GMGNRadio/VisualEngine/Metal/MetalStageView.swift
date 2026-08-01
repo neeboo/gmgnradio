@@ -1,4 +1,52 @@
+import AppKit
 @preconcurrency import MetalKit
+
+@MainActor
+final class StageArtworkStore {
+    private(set) var image: CGImage?
+    private(set) var revision: UInt64 = 0
+    private var loadingURL: URL?
+
+    func load(from url: URL?) async {
+        guard let url else {
+            clear()
+            return
+        }
+        guard url != loadingURL else {
+            return
+        }
+        loadingURL = url
+
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            guard loadingURL == url else {
+                return
+            }
+            var proposedRect = CGRect.zero
+            image = NSImage(data: data)?.cgImage(
+                forProposedRect: &proposedRect,
+                context: nil,
+                hints: nil
+            )
+            revision &+= 1
+        } catch {
+            guard loadingURL == url else {
+                return
+            }
+            image = nil
+            revision &+= 1
+        }
+    }
+
+    func clear() {
+        loadingURL = nil
+        guard image != nil else {
+            return
+        }
+        image = nil
+        revision &+= 1
+    }
+}
 
 @MainActor
 final class MetalStageView: MTKView {
@@ -8,7 +56,9 @@ final class MetalStageView: MTKView {
     init(
         frame: CGRect,
         audioFeatures: VisualAudioFeatureStore,
-        visualDirections: StageVisualDirectionStore = StageVisualDirectionStore()
+        artwork: StageArtworkStore = StageArtworkStore(),
+        visualDirections: StageVisualDirectionStore = StageVisualDirectionStore(),
+        videos: StageVideoPlaybackStore = StageVideoPlaybackStore()
     ) {
         guard let device = MTLCreateSystemDefaultDevice() else {
             preconditionFailure("gmgn radio requires a Metal-capable Apple Silicon Mac")
@@ -17,13 +67,15 @@ final class MetalStageView: MTKView {
         super.init(frame: frame, device: device)
         colorPixelFormat = .bgra8Unorm_srgb
         depthStencilPixelFormat = .depth32Float
-        clearColor = MTLClearColorMake(0.004, 0.008, 0.025, 1)
+        clearColor = MTLClearColorMake(0, 0, 0, 0)
         clearDepth = 1
         framebufferOnly = true
         enableSetNeedsDisplay = false
         isPaused = false
         preferredFramesPerSecond = 60
         autoResizeDrawable = true
+        wantsLayer = true
+        layer?.isOpaque = false
 
         do {
             stageRenderer = try StageRenderer(
@@ -31,7 +83,9 @@ final class MetalStageView: MTKView {
                 colorPixelFormat: colorPixelFormat,
                 depthPixelFormat: depthStencilPixelFormat,
                 audioFeatures: audioFeatures,
-                visualDirections: visualDirections
+                artwork: artwork,
+                visualDirections: visualDirections,
+                videos: videos
             )
             delegate = stageRenderer
         } catch {

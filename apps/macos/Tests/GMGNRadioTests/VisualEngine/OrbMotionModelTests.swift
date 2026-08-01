@@ -22,7 +22,7 @@ func sameSeedAndTimeProduceSameMotionFrame() {
 }
 
 @Test
-func idleBreathingHasVisibleScaleTravel() {
+func idleBreathingStaysCalmUntilRealActivityArrives() {
     let frames = stride(from: Float(0), through: 12, by: 0.1).map {
         OrbMotionModel.frame(
             for: .idle,
@@ -33,7 +33,7 @@ func idleBreathingHasVisibleScaleTravel() {
     }
     let scales = frames.map(\.scale)
 
-    #expect((scales.max() ?? 0) - (scales.min() ?? 0) >= 0.06)
+    #expect((scales.max() ?? 0) - (scales.min() ?? 0) <= 0.015)
 }
 
 @Test
@@ -105,6 +105,31 @@ func playingMotionRespondsToSharedAudioFeatures() {
 
     #expect(active.energy > silent.energy)
     #expect(active.deformation > silent.deformation)
+}
+
+@Test
+func speakingMotionRespondsToRealtimeVoiceLevel() {
+    let silent = OrbMotionModel.frame(
+        for: .speaking,
+        time: 4,
+        seed: 9,
+        audio: .silent
+    )
+    let active = OrbMotionModel.frame(
+        for: .speaking,
+        time: 4,
+        seed: 9,
+        audio: VisualAudioFeatures(
+            low: 0.8,
+            mid: 0.8,
+            high: 0.8,
+            amplitude: 0.8
+        )
+    )
+
+    #expect(active.energy > silent.energy)
+    #expect(active.scale > silent.scale)
+    #expect(active.glow > silent.glow)
 }
 
 @Test

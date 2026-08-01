@@ -27,6 +27,7 @@ struct TrackKnowledge: Codable, Equatable, Sendable {
     private(set) var moodTags: [String]
     private(set) var genres: [String]
     private(set) var releaseYear: Int?
+    private(set) var artworkURL: URL?
     private(set) var sources: [TrackSourceReference]
     private(set) var origins: Set<MusicLibraryOrigin>
     private(set) var firstSeenAt: Date
@@ -77,7 +78,8 @@ struct TrackKnowledge: Codable, Equatable, Sendable {
             energy: energy,
             moodTags: moodTags,
             genres: genres,
-            releaseYear: releaseYear
+            releaseYear: releaseYear,
+            artworkURL: artworkURL
         )
     }
 
@@ -104,6 +106,7 @@ struct TrackKnowledge: Codable, Equatable, Sendable {
         self.moodTags = Self.normalizedLabels(candidate.moodTags)
         self.genres = Self.normalizedLabels(candidate.genres)
         self.releaseYear = candidate.releaseYear
+        self.artworkURL = candidate.artworkURL
         self.sources = [Self.sourceReference(for: candidate)]
         self.origins = [origin]
         self.firstSeenAt = seenAt
@@ -154,6 +157,7 @@ struct TrackKnowledge: Codable, Equatable, Sendable {
         moodTags = Self.mergeLabels(moodTags, candidate.moodTags)
         genres = Self.mergeLabels(genres, candidate.genres)
         releaseYear = releaseYear ?? candidate.releaseYear
+        artworkURL = artworkURL ?? candidate.artworkURL
     }
 
     mutating func merge(knowledge other: TrackKnowledge) {
@@ -186,6 +190,7 @@ struct TrackKnowledge: Codable, Equatable, Sendable {
         moodTags = Self.mergeLabels(moodTags, other.moodTags)
         genres = Self.mergeLabels(genres, other.genres)
         releaseYear = releaseYear ?? other.releaseYear
+        artworkURL = artworkURL ?? other.artworkURL
     }
 
     mutating func recordPlayed(completed: Bool, at date: Date) {

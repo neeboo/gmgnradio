@@ -69,6 +69,7 @@ func realtimeCommandsOnlyReachTheActiveSession() async throws {
     try await controller.setMicrophoneCaptureEnabled(true)
     try await controller.setMicrophoneTransmissionEnabled(false)
     try await controller.interrupt()
+    try await controller.requestAgentResponse("新歌已开始，请说一句开场词。")
     try await controller.submitToolResult(result)
 
     #expect(await session.calls() == [
@@ -77,8 +78,43 @@ func realtimeCommandsOnlyReachTheActiveSession() async throws {
         .setCapture(true),
         .setTransmission(false),
         .interrupt,
+        .requestAgentResponse("新歌已开始，请说一句开场词。"),
         .submitToolResult(result),
     ])
+}
+
+@Test
+func systemHostRequestWaitsForTheCurrentAgentResponseToFinish() async throws {
+    let controller = RealtimeDJSessionController()
+    let session = RecordingRealtimeDJSession(provider: .bailian)
+    var events = await controller.eventStream().makeAsyncIterator()
+
+    try await controller.activate(
+        session,
+        ticket: ticket(provider: .bailian, sessionID: "bailian-queued")
+    )
+    await session.emit(.agentResponseStarted)
+    #expect(await events.next() == .agentResponseStarted)
+
+    try await controller.requestAgentResponse("下一首开始后串场")
+    #expect(
+        await session.calls()
+            == [.connect("bailian-queued")]
+    )
+
+    await session.emit(.agentAudioFinished)
+    #expect(await events.next() == .agentAudioFinished)
+    for _ in 0..<8 {
+        await Task.yield()
+    }
+
+    #expect(
+        await session.calls()
+            == [
+                .connect("bailian-queued"),
+                .requestAgentResponse("下一首开始后串场"),
+            ]
+    )
 }
 
 private func ticket(
@@ -99,6 +135,7 @@ private enum RecordingSessionCall: Equatable, Sendable {
     case setCapture(Bool)
     case setTransmission(Bool)
     case interrupt
+    case requestAgentResponse(String)
     case submitToolResult(RealtimeDJToolResult)
     case disconnect
 }
@@ -139,6 +176,10 @@ private actor RecordingRealtimeDJSession: RealtimeDJSession {
 
     func interrupt() {
         recordedCalls.append(.interrupt)
+    }
+
+    func requestAgentResponse(_ instruction: String) {
+        recordedCalls.append(.requestAgentResponse(instruction))
     }
 
     func submitToolResult(_ result: RealtimeDJToolResult) {

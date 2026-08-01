@@ -6,17 +6,25 @@ protocol CodexPlanningExecuting: Sendable {
 
 struct CodexCLIPlanningExecutor: CodexPlanningExecuting {
     private let runner: any CodexCommandRunning
+    private let model: String?
 
-    init(runner: any CodexCommandRunning) {
+    init(
+        runner: any CodexCommandRunning,
+        model: String? = nil
+    ) {
         self.runner = runner
+        self.model = model
     }
 
-    static func live() throws -> CodexCLIPlanningExecutor {
+    static func live(
+        model: String? = nil
+    ) throws -> CodexCLIPlanningExecutor {
         guard let executableURL = CodexProcessRunner.locate() else {
             throw CodexCLIError.unavailable
         }
         return CodexCLIPlanningExecutor(
-            runner: CodexProcessRunner(executableURL: executableURL)
+            runner: CodexProcessRunner(executableURL: executableURL),
+            model: model
         )
     }
 
@@ -36,8 +44,7 @@ struct CodexCLIPlanningExecutor: CodexPlanningExecuting {
             options: .atomic
         )
 
-        let result = try await runner.run(
-            arguments: [
+        var arguments = [
                 "exec",
                 "--ephemeral",
                 "--ignore-user-config",
@@ -49,7 +56,12 @@ struct CodexCLIPlanningExecutor: CodexPlanningExecuting {
                 "--output-last-message", outputURL.path,
                 "-C", directory.path,
                 "-",
-            ],
+            ]
+        if let model, !model.isEmpty {
+            arguments.insert(contentsOf: ["--model", model], at: 1)
+        }
+        let result = try await runner.run(
+            arguments: arguments,
             standardInput: prompt
         )
         guard result.exitCode == 0 else {

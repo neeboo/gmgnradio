@@ -1,10 +1,100 @@
 import AppKit
+import AVFoundation
+import os
 import SwiftUI
 import UniformTypeIdentifiers
 
 enum ProductIdentity {
     static let displayName = "gmgn radio"
     static let bundleIdentifier = "ai.gmgn.radio"
+}
+
+enum RealtimeVoiceSetupError: LocalizedError {
+    case microphoneDenied
+    case providerUnavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .microphoneDenied:
+            "没有麦克风权限，请在系统设置里允许 gmgn radio 使用麦克风。"
+        case .providerUnavailable:
+            "这个实时语音服务尚未接通。"
+        }
+    }
+}
+
+@MainActor
+final class ApplicationActivationCoordinator {
+    typealias SetPolicy = @MainActor (NSApplication.ActivationPolicy) -> Bool
+    typealias Activate = @MainActor () -> Void
+
+    private let setPolicy: SetPolicy
+    private let activate: Activate
+
+    init(
+        setPolicy: @escaping SetPolicy = {
+            NSApplication.shared.setActivationPolicy($0)
+        },
+        activate: @escaping Activate = {
+            NSApplication.shared.activate(ignoringOtherApps: true)
+        }
+    ) {
+        self.setPolicy = setPolicy
+        self.activate = activate
+    }
+
+    func promoteToForeground() {
+        _ = setPolicy(.regular)
+        activate()
+    }
+}
+
+@MainActor
+struct ApplicationIconInstaller {
+    typealias LoadIcon = @MainActor () -> NSImage?
+    typealias ApplyIcon = @MainActor (NSImage) -> Void
+
+    private let loadIcon: LoadIcon
+    private let applyIcon: ApplyIcon
+
+    init(
+        loadIcon: @escaping LoadIcon = {
+            guard let path = Bundle.main.path(
+                forResource: "AppIcon",
+                ofType: "icns"
+            ) else {
+                return nil
+            }
+            return NSImage(contentsOfFile: path)
+        },
+        applyIcon: @escaping ApplyIcon = {
+            NSApplication.shared.applicationIconImage = $0
+        }
+    ) {
+        self.loadIcon = loadIcon
+        self.applyIcon = applyIcon
+    }
+
+    @discardableResult
+    func install() -> Bool {
+        guard let icon = loadIcon() else {
+            return false
+        }
+        applyIcon(icon)
+        return true
+    }
+}
+
+@MainActor
+struct DockReopenAction {
+    let showStage: @MainActor () -> Void
+
+    func perform(hasVisibleWindows: Bool) -> Bool {
+        if !hasVisibleWindows {
+            showStage()
+        }
+        return true
+    }
 }
 
 @main
@@ -31,6 +121,9 @@ struct GMGNRadioApp: App {
             Button("关闭 360°舞台") {
                 AppMenuAction.closeStage.perform(on: appDelegate)
             }
+            Button("切换歌词视觉") {
+                AppMenuAction.toggleLyricsVisualMode.perform(on: appDelegate)
+            }
             Divider()
             Button("设置…") {
                 SettingsMenuAction(
@@ -42,7 +135,7 @@ struct GMGNRadioApp: App {
                         }
                     },
                     activateApplication: {
-                        NSApplication.shared.activate(ignoringOtherApps: true)
+                        appDelegate.promoteToForeground()
                     },
                     revealSettingsWindow: {
                         guard let window = NSApplication.shared.windows.first(where: {
@@ -65,9 +158,17 @@ struct GMGNRadioApp: App {
         }
 
         Settings {
-            GMGNSettingsView {
-                AppMenuAction.startAIProgram.perform(on: appDelegate)
-            }
+            GMGNSettingsView(
+                connectRealtimeVoice: { configuration in
+                    appDelegate.connectRealtimeVoice(configuration)
+                },
+                disconnectRealtimeVoice: {
+                    appDelegate.disconnectRealtimeVoice()
+                },
+                agentConfigurationChanged: {
+                    appDelegate.refreshAgentConfiguration()
+                }
+            )
                 .frame(minWidth: 540, minHeight: 440)
         }
         .defaultSize(width: 580, height: 500)
@@ -81,6 +182,7 @@ protocol GMGNApplicationControlling: AnyObject {
     func closeStage()
     func chooseLocalTrack()
     func toggleLocalPlayback()
+    func toggleLyricsVisualMode()
     func exitImmersiveVisuals()
 }
 
@@ -90,6 +192,7 @@ enum AppMenuAction: Sendable {
     case closeStage
     case chooseLocalTrack
     case toggleLocalPlayback
+    case toggleLyricsVisualMode
     case exitImmersiveVisuals
 
     @MainActor
@@ -105,6 +208,8 @@ enum AppMenuAction: Sendable {
             controller.chooseLocalTrack()
         case .toggleLocalPlayback:
             controller.toggleLocalPlayback()
+        case .toggleLyricsVisualMode:
+            controller.toggleLyricsVisualMode()
         case .exitImmersiveVisuals:
             controller.exitImmersiveVisuals()
         }
@@ -128,17 +233,37 @@ struct SettingsMenuAction {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControlling {
+final class AppDelegate:
+    NSObject,
+    NSApplicationDelegate,
+    GMGNApplicationControlling,
+    DJAgentRadioActions
+{
+    private let playbackLogger = Logger(
+        subsystem: ProductIdentity.bundleIdentifier,
+        category: "DJPlayback"
+    )
+    private let applicationActivation = ApplicationActivationCoordinator()
     private let audioFeatures = VisualAudioFeatureStore()
+    private let stageArtwork = StageArtworkStore()
     private let stagePresentation = StagePresentationModel()
     private let stageVisualDirections = StageVisualDirectionStore()
+    private let stageVideos = StageVideoPlaybackStore()
     private let programStore = DJProgramStore.shared
     private let stageLyrics = StageLyricsStore.shared
+    private let agentPreferences = DJAgentPreferences()
+    private let realtimeVoicePreferences = RealtimeVoicePreferences()
     private let realtimeDJSessionController = RealtimeDJSessionController()
     private lazy var musicRuntime = MusicRuntime.live()
-    private lazy var audioGraph = AudioGraphController(
-        visualStore: audioFeatures
-    )
+    private var audioGraphStorage: AudioGraphController?
+    private var audioGraph: AudioGraphController {
+        if let audioGraphStorage {
+            return audioGraphStorage
+        }
+        let graph = AudioGraphController(visualStore: audioFeatures)
+        audioGraphStorage = graph
+        return graph
+    }
     private lazy var localMusicPlayer = LocalMusicPlayer(
         graph: audioGraph,
         onFinished: { [weak self] in
@@ -156,23 +281,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
     private var stageWindowController: StageWindowController?
     private var stageAudioMonitor: VisualAudioInputMonitor?
     private var stagePresentationTask: Task<Void, Never>?
+    private var realtimeVoiceConnectionTask: Task<Void, Never>?
+    private var realtimeVoiceTimeoutTask: Task<Void, Never>?
+    private var backgroundProgramAgentTask: Task<Void, Never>?
+    private var backgroundProgramRequestID: UUID?
+    private var isStartingProgramPlayback = false
+    private var recentDirectToolName: String?
+    private var recentDirectToolDate: Date?
+    private lazy var agentToolDispatcher = DJAgentToolDispatcher(
+        takeoverEnabled: { [weak self] in
+            self?.agentPreferences.takeoverEnabled() ?? false
+        },
+        actions: self
+    )
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        ApplicationIconInstaller().install()
+        playbackLogger.info("应用启动，开始恢复节目与音频状态")
+        ProcessInfo.processInfo.disableAutomaticTermination(
+            "gmgn radio 需要保持桌宠、电台和实时语音会话在线"
+        )
         let controller = OrbWindowController(audioFeatures: audioFeatures)
         orbWindowController = controller
         controller.show()
-        interruptionCoordinator = InterruptionCoordinator(
-            audio: audioGraph,
-            interruptSession: { [weak self] in
-                try? await self?.realtimeDJSessionController.interrupt()
-            },
-            updateState: { [weak self] state in
-                self?.orbWindowController?.setState(state)
-            }
-        )
+        programStore.restoreLatest()
         configureStage()
+        restoreSavedProgramPlayback()
 
         let environment = ProcessInfo.processInfo.environment
+        if
+            let modeName = environment["GMGN_STAGE_VIDEO_MODE"],
+            let mode = StageVideoPlaybackMode(rawValue: modeName)
+        {
+            stageVideos.setMode(mode)
+        }
+        if let videoPath = environment["GMGN_STAGE_VIDEO"] {
+            stageVideos.add([URL(fileURLWithPath: videoPath)])
+        }
         if
             let moodName = environment["GMGN_VISUAL_MOOD"],
             let mood = StageVisualMood(rawValue: moodName)
@@ -200,14 +345,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         }
     }
 
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows flag: Bool
+    ) -> Bool {
+        DockReopenAction { [weak self] in
+            self?.showStage()
+        }.perform(hasVisibleWindows: flag)
+    }
+
     func showStage() {
+        promoteToForeground()
         if stageWindowController == nil {
             configureStage()
         }
         stageWindowController?.show()
     }
 
+    func promoteToForeground() {
+        applicationActivation.promoteToForeground()
+    }
+
+    func toggleLyricsVisualMode() {
+        let modes = StageLyricsVisualMode.allCases
+        let currentIndex = modes.firstIndex(of: stageLyrics.visualMode) ?? 0
+        let nextMode = modes[(currentIndex + 1) % modes.count]
+        stageLyrics.setVisualMode(nextMode)
+        showStage()
+    }
+
     func startAIProgram() {
+        startAIProgram(immediateUserInstruction: nil)
+    }
+
+    private func startAIProgram(
+        immediateUserInstruction: String?
+    ) {
         orbWindowController?.setState(.thinking)
         activeProgram = nil
         updateStageProgramNavigation()
@@ -217,18 +390,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
                 return
             }
             do {
-                let agent = try CodexTrackRankingAgent.live()
-                let brief = Self.currentProgramBrief()
-                let plan = try await musicRuntime.makeProgramPlan(
-                    brief: brief,
-                    agent: agent
+                let plan = try await makeAIProgramPlan(
+                    immediateUserInstruction:
+                        immediateUserInstruction
                 )
-                guard !plan.slots.isEmpty else {
-                    throw ProgramPlannerError.insufficientPlayableCandidates(
-                        required: 5,
-                        available: 0
-                    )
-                }
                 activeProgram = plan
                 programStore.publish(plan)
                 try await programPlaybackQueue.load(plan)
@@ -245,6 +410,238 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
                 programStore.fail(error.localizedDescription)
                 presentProgramError(error)
             }
+        }
+    }
+
+    private func makeAIProgramPlan(
+        immediateUserInstruction: String?
+    ) async throws -> ProgramPlan {
+        let agent = try CodexTrackRankingAgent.live()
+        let brief = Self.currentProgramBrief(
+            immediateUserInstruction: immediateUserInstruction
+        )
+        let plan = try await musicRuntime.makeProgramPlan(
+            brief: brief,
+            agent: agent
+        )
+        guard !plan.slots.isEmpty else {
+            throw ProgramPlannerError.insufficientPlayableCandidates(
+                required: 5,
+                available: 0
+            )
+        }
+        return plan
+    }
+
+    func connectRealtimeVoice(
+        _ configuration: RealtimeVoiceConfiguration
+    ) {
+        realtimeVoiceConnectionTask?.cancel()
+        realtimeVoiceTimeoutTask?.cancel()
+        setRealtimeVoiceState(.connecting)
+        orbWindowController?.setState(.reconnecting)
+        prepareInterruptionCoordinator()
+
+        realtimeVoiceTimeoutTask = Task { [weak self] in
+            guard let self else {
+                return
+            }
+            do {
+                try await RealtimeVoiceConnectionDeadline(
+                    duration: .seconds(12)
+                ).wait()
+            } catch is CancellationError {
+                return
+            } catch {
+                guard RealtimeVoiceStatusStore.shared.state == .connecting
+                else {
+                    return
+                }
+                realtimeVoiceConnectionTask?.cancel()
+                await realtimeDJSessionController.deactivate()
+                orbWindowController?.setVoiceLevel(0)
+                orbWindowController?.setState(.failed)
+                setRealtimeVoiceState(.failed(
+                    error.localizedDescription
+                ))
+            }
+        }
+
+        realtimeVoiceConnectionTask = Task { [weak self] in
+            guard let self else {
+                return
+            }
+            do {
+                guard await Self.requestMicrophoneAccess() else {
+                    throw RealtimeVoiceSetupError.microphoneDenied
+                }
+                guard configuration.isReadyToConnect else {
+                    throw RealtimeVoiceSetupError.providerUnavailable
+                }
+
+                let session: any RealtimeDJSession
+                let ticket: RealtimeDJSessionTicket
+                switch configuration.provider {
+                case .bailian:
+                    guard
+                        let apiKey = configuration.apiKey,
+                        let model = configuration.model,
+                        let voiceID = configuration.voiceID
+                    else {
+                        throw RealtimeVoiceSetupError.providerUnavailable
+                    }
+                    let payload = BailianSessionPayload(
+                        apiKey: apiKey,
+                        model: model,
+                        voiceID: voiceID
+                    )
+                    session = BailianRealtimeSession.live(
+                        audioGraph: audioGraph
+                    )
+                    ticket = RealtimeDJSessionTicket(
+                        provider: .bailian,
+                        sessionID: "bailian-\(UUID().uuidString)",
+                        expiresAt: Date(timeIntervalSinceNow: 86_400),
+                        providerPayload: try JSONEncoder().encode(payload)
+                    )
+                    prepareInterruptionCoordinator()
+                case .elevenLabs:
+                    let payload = ElevenLabsSessionPayload(
+                        agentID: configuration.agentID,
+                        conversationToken: configuration.conversationToken,
+                        apiKey: configuration.apiKey,
+                        voiceID: configuration.voiceID
+                    )
+                    session = ElevenLabsRealtimeSession.live()
+                    ticket = RealtimeDJSessionTicket(
+                        provider: .elevenLabs,
+                        sessionID: "elevenlabs-\(UUID().uuidString)",
+                        expiresAt: Date(timeIntervalSinceNow: 86_400),
+                        providerPayload: try JSONEncoder().encode(payload)
+                    )
+                case .doubao:
+                    throw RealtimeVoiceSetupError.providerUnavailable
+                }
+                agentToolDispatcher.resetSession()
+                _ = try await activateRealtimeDJSession(
+                    session,
+                    ticket: ticket
+                )
+                try await realtimeDJSessionController
+                    .setMicrophoneCaptureEnabled(true)
+                try await realtimeDJSessionController
+                    .setMicrophoneTransmissionEnabled(true)
+
+                try Task.checkCancellation()
+                guard
+                    RealtimeVoiceStatusStore.shared.state
+                        .canCompleteConnectionAttempt
+                else {
+                    await realtimeDJSessionController.deactivate()
+                    return
+                }
+                realtimeVoiceTimeoutTask?.cancel()
+                setRealtimeVoiceState(.connected)
+                orbWindowController?.setState(
+                    audioGraphStorage?.isMusicPlaying == true
+                        ? .playing
+                        : .idle
+                )
+                if
+                    let activeProgram,
+                    let slotIndex = programStore.activeSlotIndex
+                {
+                    await present(
+                        plan: activeProgram,
+                        slotIndex: slotIndex
+                    )
+                } else {
+                    await refreshAgentContext()
+                }
+            } catch {
+                await realtimeDJSessionController.deactivate()
+                guard RealtimeVoiceStatusStore.shared.state == .connecting
+                else {
+                    return
+                }
+                realtimeVoiceTimeoutTask?.cancel()
+                orbWindowController?.setVoiceLevel(0)
+                orbWindowController?.setState(.failed)
+                setRealtimeVoiceState(.failed(
+                    (error as? LocalizedError)?.errorDescription
+                        ?? error.localizedDescription
+                ))
+            }
+        }
+    }
+
+    private func prepareInterruptionCoordinator() {
+        let route = RealtimeVoicePlaybackAudioRoute.resolve(
+            hasExistingPlaybackAudio: audioGraphStorage != nil
+        )
+        guard
+            route == .reuseExistingPlaybackAudio,
+            interruptionCoordinator == nil,
+            let audioGraphStorage
+        else {
+            return
+        }
+        interruptionCoordinator = InterruptionCoordinator(
+            audio: audioGraphStorage,
+            interruptSession: { [weak self] in
+                try? await self?.realtimeDJSessionController.interrupt()
+            },
+            updateState: { [weak self] state in
+                self?.orbWindowController?.setState(state)
+            }
+        )
+    }
+
+    func disconnectRealtimeVoice() {
+        realtimeVoiceConnectionTask?.cancel()
+        realtimeVoiceConnectionTask = nil
+        realtimeVoiceTimeoutTask?.cancel()
+        realtimeVoiceTimeoutTask = nil
+        setRealtimeVoiceState(.disconnected)
+        orbWindowController?.setVoiceLevel(0)
+        orbWindowController?.setState(
+            audioGraphStorage?.isMusicPlaying == true
+                ? .playing
+                : .idle
+        )
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+            await realtimeDJSessionController.deactivate()
+            agentToolDispatcher.resetSession()
+        }
+    }
+
+    func toggleRealtimeVoiceFromStage() {
+        switch RealtimeVoiceStatusStore.shared.state {
+        case .connecting:
+            disconnectRealtimeVoice()
+        case .connected, .listening, .speaking:
+            disconnectRealtimeVoice()
+        case .disconnected, .failed:
+            let configuration = realtimeVoicePreferences.load()
+            guard configuration.isReadyToConnect else {
+                let alert = NSAlert()
+                alert.alertStyle = .informational
+                alert.messageText = "先设置 DJ 的声音"
+                alert.informativeText =
+                    "在“设置 → DJ”里完成当前语音服务配置，然后回到舞台开麦。"
+                alert.runModal()
+                return
+            }
+            connectRealtimeVoice(configuration)
+        }
+    }
+
+    func refreshAgentConfiguration() {
+        Task { [weak self] in
+            await self?.refreshAgentContext()
         }
     }
 
@@ -275,12 +672,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
     }
 
     func toggleLocalPlayback() {
-        switch localMusicPlayer.state {
-        case .playing:
+        let route = ProgramPlaybackToggleRoute.resolve(
+            playerState: localMusicPlayer.state,
+            hasPreparedProgram:
+                activeProgram != nil && programPlaybackQueue.current != nil
+        )
+        playbackLogger.info(
+            "底部播放按钮：player=\(String(describing: self.localMusicPlayer.state), privacy: .public)，route=\(String(describing: route), privacy: .public)，queue=\(self.programPlaybackQueue.current?.slot.track.id ?? "nil", privacy: .public)"
+        )
+        switch route {
+        case .pauseLocal:
             localMusicPlayer.pause()
             orbWindowController?.setState(.idle)
             stageWindowController?.setPlaybackState(.paused)
-        case .ready, .paused, .finished:
+        case .resumeLocal:
             do {
                 try localMusicPlayer.play()
                 orbWindowController?.setState(.playing)
@@ -288,7 +693,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
             } catch {
                 presentPlaybackError(error)
             }
-        case .idle:
+        case .startPreparedProgram:
+            startPreparedProgramPlayback()
+        case .unavailable:
             break
         }
     }
@@ -301,11 +708,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         _ url: URL,
         loadSidecarLyrics: Bool = true
     ) throws {
+        playbackLogger.info(
+            "本地播放开始：url=\(url.path, privacy: .public)，sidecar=\(loadSidecarLyrics)"
+        )
         if loadSidecarLyrics {
-            publishSidecarLyrics(for: url)
+            stageArtwork.clear()
         }
-        try localMusicPlayer.load(url)
-        try localMusicPlayer.play()
+        do {
+            try localMusicPlayer.load(url)
+            playbackLogger.info(
+                "本地音频已加载：state=\(String(describing: self.localMusicPlayer.state), privacy: .public)，duration=\(self.localMusicPlayer.track?.duration ?? 0, format: .fixed(precision: 2))"
+            )
+            prepareInterruptionCoordinator()
+            if loadSidecarLyrics {
+                publishSidecarLyrics(
+                    for: url,
+                    trackDuration: localMusicPlayer.track?.duration
+                )
+            }
+            try localMusicPlayer.play()
+        } catch {
+            playbackLogger.error(
+                "本地播放失败：url=\(url.path, privacy: .public)，error=\(error.localizedDescription, privacy: .public)"
+            )
+            throw error
+        }
+        playbackLogger.info(
+            "本地音频已启动：state=\(String(describing: self.localMusicPlayer.state), privacy: .public)"
+        )
         orbWindowController?.setState(.playing)
         stageWindowController?.setPlaybackState(.playing)
         showStage()
@@ -322,9 +752,182 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
     private func presentProgramError(_ error: Error) {
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "DJ 暂时排不了节目"
-        alert.informativeText = error.localizedDescription
+        let nsError = error as NSError
+        if
+            nsError.domain == NSURLErrorDomain,
+            nsError.code
+                == NSURLErrorAppTransportSecurityRequiresSecureConnection
+        {
+            alert.messageText = "音乐资源连接失败"
+            alert.informativeText =
+                "音乐服务返回了不安全的播放地址，应用已阻止连接。"
+        } else {
+            alert.messageText = "DJ 暂时无法完成这个操作"
+            alert.informativeText = error.localizedDescription
+        }
         alert.runModal()
+    }
+
+    private func restoreSavedProgramPlayback() {
+        guard programStore.plan != nil else {
+            playbackLogger.info("没有本地节目存档，跳过恢复")
+            return
+        }
+        playbackLogger.info(
+            "恢复节目：savedIndex=\(self.programStore.activeSlotIndex ?? -1)"
+        )
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+            do {
+                let restored = try await SavedProgramPlaybackRestorer(
+                    queue: programPlaybackQueue
+                ).restore(from: programStore)
+                guard let restored else {
+                    playbackLogger.error("节目存档存在，但恢复结果为空")
+                    return
+                }
+                activeProgram = restored.plan
+                if let restoredIndex = restored.plan.slots.firstIndex(
+                    where: {
+                        $0.track.id == restored.prepared.slot.track.id
+                    }
+                ) {
+                    programStore.activateSlot(at: restoredIndex)
+                }
+                playbackLogger.info(
+                    "节目恢复完成：track=\(restored.prepared.slot.track.id, privacy: .public)，title=\(restored.prepared.slot.track.title, privacy: .public)，state=\(String(describing: restored.playbackState), privacy: .public)"
+                )
+                stageWindowController?.setPlaybackState(
+                    restored.playbackState
+                )
+                updateStageProgramNavigation()
+            } catch {
+                playbackLogger.error(
+                    "节目恢复失败：\(error.localizedDescription, privacy: .public)"
+                )
+                activeProgram = nil
+                stageWindowController?.setPlaybackState(.idle)
+                updateStageProgramNavigation()
+                programStore.fail("上次节目暂时无法继续播放")
+            }
+        }
+    }
+
+    private func startPreparedProgramPlayback() {
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+            do {
+                try await startSelectedProgramPlayback()
+            } catch {
+                programStore.fail(error.localizedDescription)
+                presentProgramError(error)
+            }
+        }
+    }
+
+    private func startSelectedProgramPlayback(
+        requestOpening: Bool = true,
+        allowFallback: Bool = false
+    ) async throws {
+        playbackLogger.info(
+            "请求播放当前歌曲：busy=\(self.isStartingProgramPlayback)，player=\(String(describing: self.localMusicPlayer.state), privacy: .public)，store=\(self.programStore.activeSlot?.track.id ?? "nil", privacy: .public)，queue=\(self.programPlaybackQueue.current?.slot.track.id ?? "nil", privacy: .public)"
+        )
+        guard !isStartingProgramPlayback else {
+            playbackLogger.error("播放被拒绝：已有启动任务正在执行")
+            throw DJAgentRadioActionError.busy
+        }
+        guard
+            activeProgram != nil,
+            let prepared = programPlaybackQueue.current
+        else {
+            playbackLogger.error(
+                "播放被拒绝：activeProgram=\(self.activeProgram != nil)，queueCurrent=\(self.programPlaybackQueue.current != nil)"
+            )
+            throw DJAgentRadioActionError.noProgram
+        }
+
+        isStartingProgramPlayback = true
+        stageWindowController?.setPlaybackState(.idle)
+        defer {
+            isStartingProgramPlayback = false
+        }
+        do {
+            try await playPreparedWithFallback(
+                prepared,
+                requestOpening: requestOpening,
+                allowFallback: allowFallback
+            )
+        } catch {
+            playbackLogger.error(
+                "当前歌曲启动失败：track=\(prepared.slot.track.id, privacy: .public)，error=\(error.localizedDescription, privacy: .public)"
+            )
+            let canRetry = programPlaybackQueue.current != nil
+            stageWindowController?.setPlaybackState(
+                canRetry ? .ready : .idle
+            )
+            throw error
+        }
+    }
+
+    private func playProgramTrack(
+        programID: String,
+        at slotIndex: Int
+    ) {
+        guard
+            !isStartingProgramPlayback,
+            let plan = programStore.selectProgram(id: programID)
+                ?? (
+                    programStore.plan?.brief.id == programID
+                        ? programStore.plan
+                        : nil
+                ),
+            plan.slots.indices.contains(slotIndex)
+        else {
+            return
+        }
+        activeProgram = plan
+        isStartingProgramPlayback = true
+        localMusicPlayer.pause()
+        stageWindowController?.setPlaybackState(.idle)
+        stageWindowController?.setProgramNavigation(
+            canGoPrevious: false,
+            canGoNext: false
+        )
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+            defer {
+                isStartingProgramPlayback = false
+            }
+            do {
+                try await programPlaybackQueue.select(
+                    plan,
+                    at: slotIndex
+                )
+                guard let prepared = programPlaybackQueue.current else {
+                    throw ProgramPlaybackQueueError.noPlayableSlots(
+                        failedTrackIDs: programPlaybackQueue.failedTrackIDs
+                    )
+                }
+                try await playPreparedWithFallback(
+                    prepared,
+                    allowFallback: false
+                )
+            } catch {
+                let canRetry = programPlaybackQueue.current != nil
+                stageWindowController?.setPlaybackState(
+                    canRetry ? .ready : .idle
+                )
+                updateStageProgramNavigation()
+                programStore.fail(error.localizedDescription)
+                presentProgramError(error)
+            }
+        }
     }
 
     private func advanceProgram() {
@@ -414,16 +1017,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
     }
 
     private func playPreparedWithFallback(
-        _ initial: PreparedProgramPlayback
+        _ initial: PreparedProgramPlayback,
+        requestOpening: Bool = true,
+        allowFallback: Bool = true
     ) async throws {
+        playbackLogger.info(
+            "准备播放：track=\(initial.slot.track.id, privacy: .public)，title=\(initial.slot.track.title, privacy: .public)，fallback=\(allowFallback)，opening=\(requestOpening)"
+        )
         var prepared: PreparedProgramPlayback? = initial
         while let candidate = prepared {
             do {
-                try await playPrepared(candidate)
+                try await playPrepared(
+                    candidate,
+                    requestOpening: requestOpening
+                )
                 return
             } catch {
+                playbackLogger.error(
+                    "歌曲播放失败：track=\(candidate.slot.track.id, privacy: .public)，error=\(error.localizedDescription, privacy: .public)"
+                )
+                guard allowFallback else {
+                    throw error
+                }
                 prepared = await programPlaybackQueue
                     .replaceCurrentAfterFailure()
+                playbackLogger.info(
+                    "自动候补：next=\(prepared?.slot.track.id ?? "nil", privacy: .public)"
+                )
             }
         }
         throw ProgramPlaybackQueueError.noPlayableSlots(
@@ -432,20 +1052,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
     }
 
     private func playPrepared(
-        _ prepared: PreparedProgramPlayback
+        _ prepared: PreparedProgramPlayback,
+        requestOpening: Bool = true
     ) async throws {
-        guard let activeProgram else { return }
+        guard let activeProgram else {
+            playbackLogger.error("播放中止：activeProgram 为空")
+            throw DJAgentRadioActionError.noProgram
+        }
         let slot = prepared.slot
         guard let index = activeProgram.slots.firstIndex(where: {
             $0.track.id == slot.track.id
         }) else {
-            return
+            playbackLogger.error(
+                "播放中止：queue track \(slot.track.id, privacy: .public) 不在 activeProgram"
+            )
+            throw DJAgentRadioActionError.trackNotFound
         }
 
+        playbackLogger.info(
+            "执行歌曲播放：index=\(index)，track=\(slot.track.id, privacy: .public)，provider=\(slot.track.providerID.rawValue, privacy: .public)，title=\(slot.track.title, privacy: .public)，target=\(String(describing: prepared.target), privacy: .public)"
+        )
         programStore.activateSlot(at: index)
         stageLyrics.clear()
-        stageVisualDirections.update(
-            ProgramVisualDirector().cue(for: slot)
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+            let artworkURL = await musicRuntime.artworkURL(for: slot.track)
+            guard programStore.activeSlot?.track.id == slot.track.id else {
+                return
+            }
+            await stageArtwork.load(from: artworkURL)
+        }
+        let visualCue = ProgramVisualDirector().cue(for: slot)
+        stageVisualDirections.update(visualCue)
+        stageVideos.apply(
+            visualCue,
+            trackID: slot.track.id,
+            trackTitle: slot.track.title
         )
         await present(plan: activeProgram, slotIndex: index)
         let lyricTrackID = slot.track.id
@@ -457,7 +1101,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
             else {
                 return
             }
-            stageLyrics.publish(lyrics, trackID: lyricTrackID)
+            stageLyrics.publish(
+                lyrics,
+                trackID: lyricTrackID,
+                trackDuration: slot.track.duration
+            )
         }
 
         switch prepared.target {
@@ -473,6 +1121,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
             showStage()
         }
         updateStageProgramNavigation()
+        playbackLogger.info(
+            "歌曲播放链路完成：track=\(slot.track.id, privacy: .public)，player=\(String(describing: self.localMusicPlayer.state), privacy: .public)"
+        )
+        if requestOpening {
+            await requestTrackOpeningIfNeeded(
+                for: slot.hostHint,
+                forceForProgramBeat:
+                    shouldForceProgramBeat(
+                        plan: activeProgram,
+                        slot: slot
+                    )
+            )
+        }
+    }
+
+    private func requestTrackOpeningIfNeeded(
+        for hint: ProgramHostHint,
+        forceForProgramBeat: Bool = false
+    ) async {
+        guard let instruction = DJTrackOpeningRequestBuilder()
+            .instruction(
+                for: hint,
+                forceForProgramBeat: forceForProgramBeat
+            )
+        else {
+            return
+        }
+        try? await realtimeDJSessionController
+            .requestAgentResponse(instruction)
+    }
+
+    private func shouldForceProgramBeat(
+        plan: ProgramPlan,
+        slot: ProgramSlot
+    ) -> Bool {
+        guard plan.brief.conversationMode != .quiet else {
+            return false
+        }
+        let instruction = plan.brief.immediateUserInstruction?
+            .lowercased() ?? ""
+        let asksForLessTalk = [
+            "少说",
+            "安静",
+            "别说",
+            "不用介绍",
+            "quiet",
+            "less talk",
+            "no talking",
+        ].contains(where: instruction.contains)
+        guard !asksForLessTalk else {
+            return false
+        }
+        return slot.role == .peak || slot.role == .closer
     }
 
     private func present(
@@ -502,13 +1203,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
             hostHint: current.hostHint,
             hostPreference: DJAgentPreferences().hostPrompt(),
             immediateUserInstruction:
-                plan.brief.immediateUserInstruction
+                plan.brief.immediateUserInstruction,
+            agentControl: snapshot(
+                takeoverEnabled:
+                    agentPreferences.takeoverEnabled()
+            )
+        )
+        stagePresentation.apply(context)
+        try? await realtimeDJSessionController.updateContext(context)
+    }
+
+    private func refreshAgentContext() async {
+        if
+            let activeProgram,
+            let slotIndex = programStore.activeSlotIndex
+        {
+            await present(plan: activeProgram, slotIndex: slotIndex)
+            return
+        }
+        let context = RealtimeDJContext(
+            playback: PlaybackContext(),
+            showPlanSummary: programStore.plan?.title
+                ?? "当前还没有节目",
+            hostPreference: agentPreferences.hostPrompt(),
+            agentControl: snapshot(
+                takeoverEnabled:
+                    agentPreferences.takeoverEnabled()
+            )
         )
         stagePresentation.apply(context)
         try? await realtimeDJSessionController.updateContext(context)
     }
 
     private static func currentProgramBrief(
+        immediateUserInstruction: String? = nil,
         now: Date = Date(),
         calendar: Calendar = .current
     ) -> ProgramBrief {
@@ -534,7 +1262,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
             targetDuration: 1_800,
             moodTags: moodTags,
             energyArc: energyArc,
-            conversationMode: .ambient
+            conversationMode: .ambient,
+            immediateUserInstruction: immediateUserInstruction
         )
     }
 
@@ -550,23 +1279,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         stageAudioMonitor = monitor
         stageWindowController = StageWindowController(
             audioFeatures: audioFeatures,
+            artwork: stageArtwork,
             audioMonitor: monitor,
             presentation: stagePresentation,
             visualDirections: stageVisualDirections,
+            videos: stageVideos,
             programStore: programStore,
             lyrics: stageLyrics,
             playbackPosition: { [weak self] in
-                self?.audioGraph.playbackPosition ?? 0
+                self?.audioGraphStorage?.playbackPosition ?? 0
             },
-            playbackState: localMusicPlayer.state,
+            playbackState: .idle,
+            voiceState: RealtimeVoiceStatusStore.shared.state,
             onTogglePlayback: { [weak self] in
                 self?.toggleLocalPlayback()
+            },
+            onPlayProgramTrack: { [weak self] programID, slotIndex in
+                self?.playProgramTrack(
+                    programID: programID,
+                    at: slotIndex
+                )
             },
             onPreviousTrack: { [weak self] in
                 self?.playPreviousProgramTrack()
             },
             onNextTrack: { [weak self] in
                 self?.playNextProgramTrack()
+            },
+            onReplanProgram: { [weak self] in
+                self?.replanUpcomingProgramFromStage()
+            },
+            onToggleVoice: { [weak self] in
+                self?.toggleRealtimeVoiceFromStage()
             }
         )
         updateStageProgramNavigation()
@@ -581,10 +1325,254 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
                 guard !Task.isCancelled else {
                     return
                 }
+                switch event {
+                case let .userAudioLevel(level),
+                     let .agentAudioLevel(level):
+                    orbWindowController?.setVoiceLevel(level.peak)
+                case .userSpeechStarted:
+                    setRealtimeVoiceState(.listening)
+                case .userSpeechFinished:
+                    orbWindowController?.setVoiceLevel(0)
+                    setRealtimeVoiceState(.connected)
+                case .agentAudioStarted:
+                    setRealtimeVoiceState(.speaking)
+                case .agentAudioFinished:
+                    orbWindowController?.setVoiceLevel(0)
+                    setRealtimeVoiceState(.connected)
+                case let .userTranscriptFinal(text):
+                    playbackLogger.info(
+                        "用户最终转写：\(text, privacy: .public)"
+                    )
+                    await handleDirectPlaybackIntent(text)
+                    await handleDirectInsertIntent(text)
+                    await handleDirectProgramIntent(text)
+                    await handleDirectProgramSwitchIntent(text)
+                case let .connectionChanged(state):
+                    if state == .connected {
+                        setRealtimeVoiceState(.connected)
+                    } else if state == .disconnected {
+                        setRealtimeVoiceState(.disconnected)
+                        orbWindowController?.setVoiceLevel(0)
+                    }
+                case let .toolCall(call):
+                    let arguments = String(
+                        data: call.argumentsJSON,
+                        encoding: .utf8
+                    ) ?? "<invalid-json>"
+                    playbackLogger.info(
+                        "DJ 工具调用：id=\(call.id, privacy: .public)，name=\(call.name, privacy: .public)，arguments=\(arguments, privacy: .public)"
+                    )
+                    let result: RealtimeDJToolResult
+                    if consumeRecentDirectTool(named: call.name) {
+                        playbackLogger.info(
+                            "DJ 工具已由本地语音动作提前执行，跳过重复调用：\(call.name, privacy: .public)"
+                        )
+                        result = acknowledgedDirectToolResult(for: call)
+                    } else {
+                        result = await agentToolDispatcher.handle(call)
+                    }
+                    let resultJSON = String(
+                        data: result.resultJSON,
+                        encoding: .utf8
+                    ) ?? "<invalid-json>"
+                    playbackLogger.info(
+                        "DJ 工具结果：id=\(result.callID, privacy: .public)，isError=\(result.isError)，result=\(resultJSON, privacy: .public)"
+                    )
+                    do {
+                        try await realtimeDJSessionController
+                            .submitToolResult(result)
+                    } catch {
+                        playbackLogger.error(
+                            "DJ 工具结果提交失败：id=\(result.callID, privacy: .public)，error=\(error.localizedDescription, privacy: .public)"
+                        )
+                    }
+                case let .failure(failure):
+                    playbackLogger.error(
+                        "实时语音故障：code=\(failure.code, privacy: .public)，recoverable=\(failure.recoverable)，message=\(failure.message, privacy: .public)"
+                    )
+                default:
+                    break
+                }
                 await interruptionCoordinator?.consume(event)
                 stagePresentation.consume(event)
             }
         }
+    }
+
+    private func handleDirectPlaybackIntent(_ transcript: String) async {
+        let intent = DJDirectPlaybackIntent.resolve(transcript)
+        playbackLogger.info(
+            "本地播放意图：text=\(transcript, privacy: .public)，intent=\(String(describing: intent), privacy: .public)"
+        )
+        guard let intent else {
+            return
+        }
+        do {
+            let toolName: String
+            switch intent {
+            case .playCurrent:
+                toolName = "resume_music"
+                try await resumeMusic()
+            case .next:
+                toolName = "next_track"
+                try await playNextTrack()
+            case .previous:
+                toolName = "previous_track"
+                try await playPreviousTrack()
+            case .pause:
+                toolName = "pause_music"
+                try await pauseMusic()
+            }
+            recentDirectToolName = toolName
+            recentDirectToolDate = Date()
+            if
+                intent == .next,
+                let activeProgram,
+                let index = programStore.activeSlotIndex,
+                activeProgram.slots.indices.contains(index)
+            {
+                let slot = activeProgram.slots[index]
+                await requestTrackOpeningIfNeeded(
+                    for: slot.hostHint,
+                    forceForProgramBeat:
+                        shouldForceProgramBeat(
+                            plan: activeProgram,
+                            slot: slot
+                        )
+                )
+            }
+            playbackLogger.info(
+                "本地播放意图执行成功：\(toolName, privacy: .public)"
+            )
+        } catch {
+            playbackLogger.error(
+                "本地播放意图执行失败：\(error.localizedDescription, privacy: .public)"
+            )
+            presentProgramError(error)
+        }
+    }
+
+    private func handleDirectProgramIntent(_ transcript: String) async {
+        let intent = DJDirectProgramIntent.resolve(transcript)
+        playbackLogger.info(
+            "本地编排意图：text=\(transcript, privacy: .public)，intent=\(String(describing: intent), privacy: .public)"
+        )
+        guard case let .replan(instruction) = intent else {
+            return
+        }
+        do {
+            try await replanProgram(
+                immediateInstruction: instruction
+            )
+            recentDirectToolName = "replan_program"
+            recentDirectToolDate = Date()
+            playbackLogger.info("本地编排意图执行成功：replan_program")
+        } catch {
+            playbackLogger.error(
+                "本地编排意图执行失败：\(error.localizedDescription, privacy: .public)"
+            )
+            presentProgramError(error)
+        }
+    }
+
+    private func handleDirectInsertIntent(_ transcript: String) async {
+        let intent = DJDirectInsertIntent.resolve(transcript)
+        playbackLogger.info(
+            "本地插播意图：text=\(transcript, privacy: .public)，intent=\(String(describing: intent), privacy: .public)"
+        )
+        guard case let .insert(instruction) = intent else {
+            return
+        }
+        do {
+            try await insertTrack(immediateInstruction: instruction)
+            recentDirectToolName = "insert_track"
+            recentDirectToolDate = Date()
+            playbackLogger.info("本地插播意图执行成功：insert_track")
+        } catch {
+            playbackLogger.error(
+                "本地插播意图执行失败：\(error.localizedDescription, privacy: .public)"
+            )
+            presentProgramError(error)
+        }
+    }
+
+    private func handleDirectProgramSwitchIntent(
+        _ transcript: String
+    ) async {
+        let intent = DJDirectProgramSwitchIntent.resolve(
+            transcript,
+            hasPreparedProgram: programStore.pendingPlan != nil
+        )
+        playbackLogger.info(
+            "本地节目切换意图：text=\(transcript, privacy: .public)，intent=\(String(describing: intent), privacy: .public)"
+        )
+        guard intent == .activatePrepared else {
+            return
+        }
+        do {
+            try await activatePreparedProgram()
+            recentDirectToolName = "activate_prepared_program"
+            recentDirectToolDate = Date()
+            playbackLogger.info(
+                "本地节目切换意图执行成功：activate_prepared_program"
+            )
+        } catch {
+            playbackLogger.error(
+                "本地节目切换意图执行失败：\(error.localizedDescription, privacy: .public)"
+            )
+            presentProgramError(error)
+        }
+    }
+
+    private func consumeRecentDirectTool(named name: String) -> Bool {
+        guard
+            recentDirectToolName == name,
+            let recentDirectToolDate,
+            Date().timeIntervalSince(recentDirectToolDate) < 6
+        else {
+            return false
+        }
+        self.recentDirectToolName = nil
+        self.recentDirectToolDate = nil
+        return true
+    }
+
+    private func acknowledgedDirectToolResult(
+        for call: RealtimeDJToolCall
+    ) -> RealtimeDJToolResult {
+        let message: String = switch call.name {
+        case "replan_program":
+            "后台编排任务已经创建，歌单尚未完成；完成后会主动通知"
+        case "insert_track":
+            "后台找歌任务已经创建，歌曲尚未找到；完成后会自动插到下一首并主动通知"
+        case "activate_prepared_program":
+            "已经切换并开始播放准备好的新节目"
+        default:
+            "播放动作已经执行"
+        }
+        let response = DJAgentToolResponse(
+            ok: true,
+            code: nil,
+            message: message,
+            state: snapshot(
+                takeoverEnabled: agentPreferences.takeoverEnabled()
+            ),
+            tracks: nil
+        )
+        let data = (try? JSONEncoder().encode(response))
+            ?? Data(#"{"ok":true,"message":"播放动作已经执行"}"#.utf8)
+        return RealtimeDJToolResult(
+            callID: call.id,
+            resultJSON: data,
+            isError: false
+        )
+    }
+
+    private func setRealtimeVoiceState(
+        _ state: RealtimeVoiceConnectionState
+    ) {
+        RealtimeVoiceStatusStore.shared.state = state
+        stageWindowController?.setVoiceState(state)
     }
 
     private func updateStageProgramNavigation() {
@@ -596,7 +1584,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         )
     }
 
-    private func publishSidecarLyrics(for audioURL: URL) {
+    private func publishSidecarLyrics(
+        for audioURL: URL,
+        trackDuration: TimeInterval?
+    ) {
         stageLyrics.clear()
         let lrcURL = audioURL
             .deletingPathExtension()
@@ -609,8 +1600,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         }
         stageLyrics.publish(
             MusicLyrics(original: source, translation: nil),
-            trackID: audioURL.path
+            trackID: audioURL.path,
+            trackDuration: trackDuration
         )
+    }
+
+    private static func requestMicrophoneAccess() async -> Bool {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            true
+        case .notDetermined:
+            await AVCaptureDevice.requestAccess(for: .audio)
+        case .denied, .restricted:
+            false
+        @unknown default:
+            false
+        }
     }
 
     @discardableResult
@@ -628,5 +1633,499 @@ final class AppDelegate: NSObject, NSApplicationDelegate, GMGNApplicationControl
         stagePresentation.apply(context)
         stageVisualDirections.update(context.visualMood)
         try await realtimeDJSessionController.updateContext(context)
+    }
+
+    func snapshot(
+        takeoverEnabled: Bool
+    ) -> DJAgentRadioState {
+        let plan = activeProgram ?? programStore.plan
+        let tracks = plan?.slots.enumerated().map { index, slot in
+            DJAgentProgramTrack(
+                index: index,
+                id: slot.track.id,
+                title: slot.track.title,
+                artist: slot.track.artist
+            )
+        } ?? []
+        return DJAgentRadioState(
+            takeoverEnabled: takeoverEnabled,
+            playbackState: agentPlaybackState,
+            activeTrackID: programStore.activeSlot?.track.id,
+            activeSlotIndex: programStore.activeSlotIndex,
+            program: tracks
+        )
+    }
+
+    func playProgramTrack(
+        trackID: String?,
+        slotIndex: Int?
+    ) async throws {
+        guard
+            let plan = activeProgram ?? programStore.plan
+        else {
+            throw DJAgentRadioActionError.noProgram
+        }
+        let resolvedIndex: Int?
+        if let trackID {
+            resolvedIndex = plan.slots.firstIndex {
+                $0.track.id == trackID
+            }
+        } else {
+            resolvedIndex = slotIndex
+        }
+        guard
+            let resolvedIndex,
+            plan.slots.indices.contains(resolvedIndex)
+        else {
+            throw DJAgentRadioActionError.trackNotFound
+        }
+        guard !isStartingProgramPlayback else {
+            throw DJAgentRadioActionError.busy
+        }
+
+        activeProgram = plan
+        isStartingProgramPlayback = true
+        defer { isStartingProgramPlayback = false }
+        localMusicPlayer.pause()
+        stageWindowController?.setPlaybackState(.idle)
+        try await programPlaybackQueue.select(
+            plan,
+            at: resolvedIndex
+        )
+        guard let prepared = programPlaybackQueue.current else {
+            throw DJAgentRadioActionError.trackNotFound
+        }
+        try await playPreparedWithFallback(
+            prepared,
+            requestOpening: false,
+            allowFallback: false
+        )
+    }
+
+    func playNextTrack() async throws {
+        guard activeProgram != nil else {
+            throw DJAgentRadioActionError.noProgram
+        }
+        guard
+            let next = await programPlaybackQueue
+                .advanceAfterCompletion()
+        else {
+            throw DJAgentRadioActionError.trackNotFound
+        }
+        try await playPreparedWithFallback(
+            next,
+            requestOpening: false,
+            allowFallback: false
+        )
+    }
+
+    func playPreviousTrack() async throws {
+        guard
+            activeProgram != nil,
+            let previous = programPlaybackQueue.returnToPrevious()
+        else {
+            throw DJAgentRadioActionError.trackNotFound
+        }
+        try await playPreparedWithFallback(
+            previous,
+            requestOpening: false,
+            allowFallback: false
+        )
+    }
+
+    func pauseMusic() async throws {
+        guard localMusicPlayer.state == .playing else {
+            return
+        }
+        localMusicPlayer.pause()
+        orbWindowController?.setState(.idle)
+        stageWindowController?.setPlaybackState(.paused)
+    }
+
+    func resumeMusic() async throws {
+        let route = ProgramPlaybackStartRoute.resolve(
+            playerState: localMusicPlayer.state,
+            hasPreparedProgram:
+                activeProgram != nil && programPlaybackQueue.current != nil
+        )
+        playbackLogger.info(
+            "DJ 播放动作：player=\(String(describing: self.localMusicPlayer.state), privacy: .public)，route=\(String(describing: route), privacy: .public)，store=\(self.programStore.activeSlot?.track.id ?? "nil", privacy: .public)，queue=\(self.programPlaybackQueue.current?.slot.track.id ?? "nil", privacy: .public)"
+        )
+        switch route {
+        case .alreadyPlaying:
+            playbackLogger.info("DJ 播放动作完成：音乐已经在播放")
+            return
+        case .resumeLocal:
+            try localMusicPlayer.play()
+            orbWindowController?.setState(.playing)
+            stageWindowController?.setPlaybackState(.playing)
+        case .startPreparedProgram:
+            try await startSelectedProgramPlayback(
+                requestOpening: false,
+                allowFallback: false
+            )
+        case .unavailable:
+            throw DJAgentRadioActionError.noProgram
+        }
+    }
+
+    func replanProgram(
+        immediateInstruction: String?
+    ) async throws {
+        scheduleBackgroundProgramPlan(
+            immediateInstruction:
+                immediateInstruction
+                ?? "根据当前状态重新编排后续节目"
+        )
+    }
+
+    private func scheduleBackgroundProgramPlan(
+        immediateInstruction: String
+    ) {
+        backgroundProgramAgentTask?.cancel()
+        let requestID = UUID()
+        backgroundProgramRequestID = requestID
+        programStore.beginPlanning()
+        playbackLogger.info(
+            "后台编排任务已创建：id=\(requestID.uuidString, privacy: .public)，instruction=\(immediateInstruction, privacy: .public)"
+        )
+        backgroundProgramAgentTask = Task { [weak self] in
+            guard let self else {
+                return
+            }
+            do {
+                let proposal = try await makeAIProgramPlan(
+                    immediateUserInstruction: immediateInstruction
+                )
+                try Task.checkCancellation()
+                guard backgroundProgramRequestID == requestID else {
+                    return
+                }
+                programStore.publishDraft(proposal)
+                updateStageProgramNavigation()
+                playbackLogger.info(
+                    "后台编排任务完成：id=\(requestID.uuidString, privacy: .public)，title=\(proposal.title ?? "未命名节目", privacy: .public)，tracks=\(proposal.slots.count)"
+                )
+                await refreshAgentContext()
+                await notifyDJThatProgramIsReady(
+                    proposal,
+                    requestInstruction: immediateInstruction
+                )
+            } catch is CancellationError {
+                playbackLogger.info(
+                    "后台编排任务已取消：id=\(requestID.uuidString, privacy: .public)"
+                )
+            } catch {
+                guard backgroundProgramRequestID == requestID else {
+                    return
+                }
+                programStore.fail(error.localizedDescription)
+                playbackLogger.error(
+                    "后台编排任务失败：id=\(requestID.uuidString, privacy: .public)，error=\(error.localizedDescription, privacy: .public)"
+                )
+                await notifyDJThatProgramFailed(
+                    requestInstruction: immediateInstruction,
+                    error: error
+                )
+            }
+            if backgroundProgramRequestID == requestID {
+                backgroundProgramAgentTask = nil
+                backgroundProgramRequestID = nil
+            }
+        }
+    }
+
+    private func notifyDJThatProgramIsReady(
+        _ plan: ProgramPlan,
+        requestInstruction: String
+    ) async {
+        let title = plan.title ?? "新的节目单"
+        let tracks = plan.slots.prefix(4)
+            .map { "\($0.track.artist)《\($0.track.title)》" }
+            .joined(separator: "、")
+        let instruction = """
+        [gmgn radio 后台编排完成事件]
+        用户之前的要求：\(requestInstruction)
+        新歌单“\(title)”已经准备好，共 \(plan.slots.count) 首。部分歌曲：\(tracks)。
+        这是后台系统事件，不是用户的新发言。请用一到两句话自然告诉用户歌单已经准备好，并询问是否切换过去。此刻不要调用切换工具；等用户确认后再调用 activate_prepared_program。
+        """
+        do {
+            try await realtimeDJSessionController
+                .requestAgentResponse(instruction)
+        } catch {
+            playbackLogger.error(
+                "后台编排完成消息发送失败：\(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
+    private func notifyDJThatProgramFailed(
+        requestInstruction: String,
+        error: Error
+    ) async {
+        let instruction = """
+        [gmgn radio 后台编排失败事件]
+        用户之前的要求：\(requestInstruction)
+        实际错误：\(error.localizedDescription)
+        这是后台系统事件。请简短告诉用户这次编排没有完成，并说明可以重试；不要声称歌单已经准备好。
+        """
+        do {
+            try await realtimeDJSessionController
+                .requestAgentResponse(instruction)
+        } catch {
+            playbackLogger.error(
+                "后台编排失败消息发送失败：\(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
+    func activatePreparedProgram() async throws {
+        guard let proposal = programStore.pendingPlan else {
+            throw DJAgentRadioActionError.noPreparedProgram
+        }
+        playbackLogger.info(
+            "准备切换后台节目：id=\(proposal.brief.id, privacy: .public)，title=\(proposal.title ?? "未命名节目", privacy: .public)"
+        )
+        try await programPlaybackQueue.load(proposal)
+        guard let prepared = programPlaybackQueue.current else {
+            throw ProgramPlaybackQueueError.noPlayableSlots(
+                failedTrackIDs: programPlaybackQueue.failedTrackIDs
+            )
+        }
+        localMusicPlayer.pause()
+        activeProgram = proposal
+        programStore.publish(proposal)
+        updateStageProgramNavigation()
+        try await playPreparedWithFallback(
+            prepared,
+            allowFallback: false
+        )
+        await refreshAgentContext()
+    }
+
+    private func replanUpcomingProgramFromStage() {
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+            do {
+                try await replanProgram(immediateInstruction: nil)
+            } catch {
+                presentProgramError(error)
+            }
+        }
+    }
+
+    func insertTrack(
+        immediateInstruction: String
+    ) async throws {
+        scheduleBackgroundTrackInsertion(
+            immediateInstruction: immediateInstruction
+        )
+    }
+
+    private func scheduleBackgroundTrackInsertion(
+        immediateInstruction: String
+    ) {
+        backgroundProgramAgentTask?.cancel()
+        let requestID = UUID()
+        backgroundProgramRequestID = requestID
+        programStore.beginPlanning()
+        playbackLogger.info(
+            "后台插播任务已创建：id=\(requestID.uuidString, privacy: .public)，instruction=\(immediateInstruction, privacy: .public)"
+        )
+        backgroundProgramAgentTask = Task { [weak self] in
+            guard let self else {
+                return
+            }
+            do {
+                let proposal = try await makeAIProgramPlan(
+                    immediateUserInstruction:
+                        "只为下一首找一首可播歌曲。用户的插播要求：\(immediateInstruction)"
+                )
+                try Task.checkCancellation()
+                guard backgroundProgramRequestID == requestID else {
+                    return
+                }
+                guard
+                    let insertedSlot = proposal.slots.first
+                else {
+                    throw DJAgentRadioActionError.trackNotFound
+                }
+                let insertedIntoActiveProgram: Bool
+                if
+                    let current = activeProgram,
+                    let activeSlotIndex = programStore.activeSlotIndex,
+                    programPlaybackQueue.current != nil
+                {
+                    insertedIntoActiveProgram = true
+                    let revised = DJProgramEditor.revise(
+                        current: current,
+                        activeSlotIndex: activeSlotIndex,
+                        proposal: proposal,
+                        mode: .insertNext
+                    )
+                    activeProgram = revised
+                    programStore.publish(revised)
+                    programStore.activateSlot(at: activeSlotIndex)
+                    await programPlaybackQueue.replaceUpcoming(
+                        with: Array(
+                            revised.slots.dropFirst(activeSlotIndex + 1)
+                        )
+                    )
+                } else {
+                    insertedIntoActiveProgram = false
+                    programStore.publishDraft(proposal)
+                }
+                updateStageProgramNavigation()
+                await refreshAgentContext()
+                playbackLogger.info(
+                    "后台插播任务完成：id=\(requestID.uuidString, privacy: .public)，track=\(insertedSlot.track.id, privacy: .public)，title=\(insertedSlot.track.title, privacy: .public)"
+                )
+                await notifyDJThatInsertionIsReady(
+                    insertedSlot,
+                    requestInstruction: immediateInstruction,
+                    insertedIntoActiveProgram: insertedIntoActiveProgram
+                )
+            } catch is CancellationError {
+                playbackLogger.info(
+                    "后台插播任务已取消：id=\(requestID.uuidString, privacy: .public)"
+                )
+            } catch {
+                guard backgroundProgramRequestID == requestID else {
+                    return
+                }
+                programStore.fail(error.localizedDescription)
+                playbackLogger.error(
+                    "后台插播任务失败：id=\(requestID.uuidString, privacy: .public)，error=\(error.localizedDescription, privacy: .public)"
+                )
+                await notifyDJThatInsertionFailed(
+                    requestInstruction: immediateInstruction,
+                    error: error
+                )
+            }
+            if backgroundProgramRequestID == requestID {
+                backgroundProgramAgentTask = nil
+                backgroundProgramRequestID = nil
+            }
+        }
+    }
+
+    private func notifyDJThatInsertionIsReady(
+        _ slot: ProgramSlot,
+        requestInstruction: String,
+        insertedIntoActiveProgram: Bool
+    ) async {
+        let placement = insertedIntoActiveProgram
+            ? "已经插入当前节目的下一首"
+            : "已经准备为一份待播放节目"
+        let instruction = """
+        [gmgn radio 后台插播完成事件]
+        用户之前的要求：\(requestInstruction)
+        后台找到了 \(slot.track.artist)《\(slot.track.title)》，并验证可播，\(placement)。
+        这是后台系统事件。请用一句话自然告诉用户结果，不要再次调用插播、找歌或播放工具。
+        """
+        do {
+            try await realtimeDJSessionController
+                .requestAgentResponse(instruction)
+        } catch {
+            playbackLogger.error(
+                "后台插播完成消息发送失败：\(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
+    private func notifyDJThatInsertionFailed(
+        requestInstruction: String,
+        error: Error
+    ) async {
+        let instruction = """
+        [gmgn radio 后台插播失败事件]
+        用户之前的要求：\(requestInstruction)
+        实际错误：\(error.localizedDescription)
+        这是后台系统事件。请用一句话告诉用户这次没有找到可播歌曲，可以换个关键词重试。
+        """
+        do {
+            try await realtimeDJSessionController
+                .requestAgentResponse(instruction)
+        } catch {
+            playbackLogger.error(
+                "后台插播失败消息发送失败：\(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
+    func setVisualMood(
+        _ mood: StageVisualMood
+    ) async throws {
+        let cue = ProgramVisualDirector().cue(
+            for: programStore.activeSlot?.role ?? .build,
+            mood: mood
+        )
+        stageVisualDirections.update(cue)
+        stageVideos.apply(cue)
+    }
+
+    func searchMusic(
+        query: String,
+        limit: Int
+    ) async throws -> [DJAgentMusicTrack] {
+        try await musicRuntime.search(
+            MusicSearchRequest(
+                text: query,
+                limit: limit
+            )
+        ).map { candidate in
+            DJAgentMusicTrack(
+                id: candidate.id,
+                provider: candidate.providerID.rawValue,
+                title: candidate.title,
+                artist: candidate.artist,
+                album: candidate.album,
+                duration: candidate.duration,
+                isPlayable: candidate.isPlayable
+            )
+        }
+    }
+
+    func setLyricsMode(
+        _ mode: StageLyricsVisualMode
+    ) async throws {
+        stageLyrics.setVisualMode(mode)
+    }
+
+    private var agentPlaybackState: String {
+        switch localMusicPlayer.state {
+        case .idle:
+            "idle"
+        case .ready:
+            "ready"
+        case .playing:
+            "playing"
+        case .paused:
+            "paused"
+        case .finished:
+            "finished"
+        }
+    }
+}
+
+private enum DJAgentRadioActionError: LocalizedError {
+    case noProgram
+    case noPreparedProgram
+    case trackNotFound
+    case busy
+
+    var errorDescription: String? {
+        switch self {
+        case .noProgram:
+            "当前还没有可接管的节目"
+        case .noPreparedProgram:
+            "后台还没有准备好可切换的新节目"
+        case .trackNotFound:
+            "节目中找不到这首歌"
+        case .busy:
+            "播放器正在切歌，请稍后再试"
+        }
     }
 }

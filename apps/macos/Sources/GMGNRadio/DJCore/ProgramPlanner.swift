@@ -165,7 +165,10 @@ struct ProgramPlanner {
                 hostHint: ProgramHostHint(
                     shouldTalkBefore: quiet
                         ? localTalkDecision
-                        : proposed?.shouldTalkBefore ?? localTalkDecision,
+                        : (
+                            localTalkDecision
+                                || proposed?.shouldTalkBefore == true
+                        ),
                     maxSentenceCount: quiet ? 1 : 2,
                     selectionReason: proposed?.selectionReason
                         .nilIfEmpty

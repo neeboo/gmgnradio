@@ -1,9 +1,13 @@
+import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct StageOverlayView: View {
     @ObservedObject var presentation: StagePresentationModel
     @ObservedObject var overlayState: StageOverlayState
     @ObservedObject var lyrics: StageLyricsStore
+    @ObservedObject var videos: StageVideoPlaybackStore
+    let audioFeatures: VisualAudioFeatureStore
     let playbackPosition: @MainActor () -> TimeInterval
 
     var body: some View {
@@ -11,8 +15,10 @@ struct StageOverlayView: View {
             StageLyricsView(
                 lyrics: lyrics,
                 overlayState: overlayState,
+                audioFeatures: audioFeatures,
                 playbackPosition: playbackPosition
             )
+            .allowsHitTesting(false)
 
             VStack(alignment: .leading) {
                 Text(presentation.programTitle)
@@ -32,6 +38,7 @@ struct StageOverlayView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .padding(.top, 34)
             .padding(.leading, 36)
+            .allowsHitTesting(false)
 
             VStack {
                 Spacer()
@@ -45,9 +52,16 @@ struct StageOverlayView: View {
                         .foregroundStyle(
                             Color(red: 0.84, green: 0.96, blue: 1)
                         )
-                        .lineLimit(2)
+                        .lineLimit(3)
+                        .lineSpacing(5)
+                        .minimumScaleFactor(0.76)
                         .multilineTextAlignment(.center)
-                        .frame(maxWidth: 620)
+                        .frame(
+                            maxWidth: overlayState.isProgramRailVisible
+                                ? 640
+                                : 860
+                        )
+                        .fixedSize(horizontal: false, vertical: true)
                         .id(cue.id)
                         .transition(.opacity.combined(with: .scale(scale: 0.98)))
                         .shadow(
@@ -61,13 +75,98 @@ struct StageOverlayView: View {
                         .opacity(overlayState.isProgramRailVisible ? 0.72 : 1)
                 }
             }
+
+            if let prompt = videos.pendingBoundVideo {
+                VStack {
+                    HStack {
+                        Spacer()
+                        StageBoundVideoPromptView(
+                            prompt: prompt,
+                            onPlay: videos.playPendingBoundVideo,
+                            onClose: {
+                                videos.dismissBoundVideoPrompt(id: prompt.id)
+                            }
+                        )
+                    }
+                    Spacer()
+                }
+                .padding(.top, 28)
+                .padding(.trailing, 32)
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .task(id: prompt.id) {
+                    try? await Task.sleep(for: .seconds(3))
+                    videos.dismissBoundVideoPrompt(id: prompt.id)
+                }
+            }
         }
         .animation(.easeOut(duration: 0.28), value: presentation.currentCue?.id)
         .animation(
             .easeOut(duration: 0.22),
             value: overlayState.isProgramRailVisible
         )
-        .allowsHitTesting(false)
+    }
+}
+
+private struct StageBoundVideoPromptView: View {
+    let prompt: StageBoundVideoPrompt
+    let onPlay: () -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            HStack(spacing: 12) {
+                Image(systemName: "video.fill")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(Color.cyan.opacity(0.9))
+                    .frame(width: 34, height: 34)
+                    .background(Color.cyan.opacity(0.13), in: Circle())
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("这首歌有专属画面")
+                        .font(.system(
+                            size: 13,
+                            weight: .semibold,
+                            design: .rounded
+                        ))
+                    Text(prompt.asset.displayName)
+                        .font(.system(
+                            size: 11,
+                            weight: .medium,
+                            design: .rounded
+                        ))
+                        .foregroundStyle(.white.opacity(0.48))
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 4)
+
+                Button("播放", action: onPlay)
+                    .buttonStyle(.borderedProminent)
+                    .tint(.cyan.opacity(0.72))
+                    .controlSize(.small)
+            }
+            .padding(.leading, 10)
+            .padding(.trailing, 28)
+            .frame(width: 330, height: 58)
+
+            Button(action: onClose) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .bold))
+                    .frame(width: 20, height: 20)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.white.opacity(0.46))
+            .accessibilityLabel("忽略绑定视频")
+            .padding(7)
+        }
+        .foregroundStyle(.white.opacity(0.9))
+        .frame(width: 330, height: 58)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18)
+                .stroke(Color.cyan.opacity(0.24), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.44), radius: 18, y: 8)
     }
 }
 
@@ -75,43 +174,1480 @@ struct StageOverlayView: View {
 private struct StageLyricsView: View {
     @ObservedObject var lyrics: StageLyricsStore
     @ObservedObject var overlayState: StageOverlayState
+    let audioFeatures: VisualAudioFeatureStore
     let playbackPosition: @MainActor () -> TimeInterval
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 1 / 24)) { _ in
-            let scene = StageLyricSceneModel(
+        TimelineView(
+            .animation(
+                minimumInterval:
+                    StageLyricRenderPolicy.minimumFrameInterval
+            )
+        ) { context in
+            let playbackTime = playbackPosition()
+            let resolvedMode = StageLyricModeDirector.resolve(
+                configuredMode: lyrics.visualMode,
+                trackID: lyrics.trackID,
                 lines: lyrics.lines,
-                playbackTime: playbackPosition()
+                playbackTime: playbackTime
             )
-            let activeID = scene.lines.first(where: {
-                $0.position == 0
-            })?.id
-
-            ZStack {
-                ForEach(scene.lines) { line in
-                    lyricLine(line)
-                }
+            let audioMotion = StageLyricAudioMotion(
+                features: audioFeatures.current,
+                animationTime: context.date.timeIntervalSinceReferenceDate,
+                mode: resolvedMode
+            )
+            switch resolvedMode {
+            case .automatic:
+                EmptyView()
+            case .flowingLine:
+                StageFlowingLyricsFrame(
+                    scene: StageLyricFlowSceneModel(
+                        lines: lyrics.lines,
+                        playbackTime: playbackTime
+                    ),
+                    isProgramRailVisible: overlayState.isProgramRailVisible,
+                    animationTime: context.date.timeIntervalSinceReferenceDate,
+                    audio: audioMotion
+                )
+            case .depthStack:
+                StageDepthLyricsFrame(
+                    scene: StageLyricSceneModel(
+                        lines: lyrics.lines,
+                        playbackTime: playbackTime
+                    ),
+                    isProgramRailVisible: overlayState.isProgramRailVisible,
+                    audio: audioMotion
+                )
+            case .cloudSteps:
+                StageCloudStepsLyricsFrame(
+                    scene: StageLyricFlowSceneModel(
+                        lines: lyrics.lines,
+                        playbackTime: playbackTime
+                    ),
+                    isProgramRailVisible: overlayState.isProgramRailVisible,
+                    audio: audioMotion
+                )
+            case .chorusChat:
+                StageChorusChatLyricsFrame(
+                    scene: StageLyricFlowSceneModel(
+                        lines: lyrics.lines,
+                        playbackTime: playbackTime
+                    ),
+                    isProgramRailVisible: overlayState.isProgramRailVisible,
+                    audio: audioMotion
+                )
+            case .cinematicSplit:
+                StageCinematicSplitLyricsFrame(
+                    scene: StageLyricFlowSceneModel(
+                        lines: lyrics.lines,
+                        playbackTime: playbackTime
+                    ),
+                    playbackTime: playbackTime,
+                    isProgramRailVisible: overlayState.isProgramRailVisible,
+                    audio: audioMotion
+                )
+            case .orbitArc:
+                StageOrbitLyricsFrame(
+                    scene: StageLyricFlowSceneModel(
+                        lines: lyrics.lines,
+                        playbackTime: playbackTime
+                    ),
+                    isProgramRailVisible: overlayState.isProgramRailVisible,
+                    animationTime:
+                        context.date.timeIntervalSinceReferenceDate,
+                    audio: audioMotion
+                )
+            case .posterRail:
+                StagePosterRailLyricsFrame(
+                    lines: lyrics.lines,
+                    scene: StageLyricFlowSceneModel(
+                        lines: lyrics.lines,
+                        playbackTime: playbackTime
+                    ),
+                    isProgramRailVisible: overlayState.isProgramRailVisible,
+                    audio: audioMotion
+                )
+            case .editorialField:
+                StageEditorialLyricsFrame(
+                    lines: lyrics.lines,
+                    scene: StageLyricFlowSceneModel(
+                        lines: lyrics.lines,
+                        playbackTime: playbackTime
+                    ),
+                    playbackTime: playbackTime,
+                    isProgramRailVisible: overlayState.isProgramRailVisible,
+                    audio: audioMotion
+                )
+            case .pendulumWheel:
+                StagePendulumLyricsFrame(
+                    lines: lyrics.lines,
+                    scene: StageLyricFlowSceneModel(
+                        lines: lyrics.lines,
+                        playbackTime: playbackTime
+                    ),
+                    isProgramRailVisible: overlayState.isProgramRailVisible,
+                    animationTime:
+                        context.date.timeIntervalSinceReferenceDate,
+                    audio: audioMotion
+                )
+            case .dioramaStage:
+                StageDioramaLyricsFrame(
+                    scene: StageLyricFlowSceneModel(
+                        lines: lyrics.lines,
+                        playbackTime: playbackTime
+                    ),
+                    isProgramRailVisible: overlayState.isProgramRailVisible,
+                    animationTime:
+                        context.date.timeIntervalSinceReferenceDate,
+                    audio: audioMotion
+                )
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .animation(
-                .easeOut(duration: 0.26),
-                value: activeID
+        }
+        .animation(
+            .easeOut(duration: 0.22),
+            value: overlayState.isProgramRailVisible
+        )
+        .environment(
+            \.stageFoliaTheme,
+            lyrics.activeTheme ?? .gmgnDefaultDark
+        )
+        .allowsHitTesting(false)
+    }
+}
+
+private struct StageFlowingLyricsFrame: View {
+    @Environment(\.stageFoliaTheme) private var theme
+
+    let scene: StageLyricFlowSceneModel
+    let isProgramRailVisible: Bool
+    let animationTime: TimeInterval
+    let audio: StageLyricAudioMotion
+
+    var body: some View {
+        GeometryReader { proxy in
+            if let line = scene.activeLine {
+                let fontSize = resolvedFontSize(
+                    text: line.text,
+                    availableWidth: proxy.size.width
+                )
+                let railOffset = isProgramRailVisible ? -150.0 : 0
+                let breathingY = sin(animationTime * 0.72) * 2.2
+                    + audio.beatLift * 0.18
+
+                VStack(spacing: 22) {
+                    if let previousLine = scene.previousLine {
+                        contextualLine(
+                            previousLine.text,
+                            fontSize: fontSize,
+                            alignment: .leading,
+                            isUpcoming: false
+                        )
+                    }
+
+                    HStack(alignment: .firstTextBaseline, spacing: fontSize * 0.015) {
+                        ForEach(scene.glyphs) { glyph in
+                            StageFlowingLyricGlyph(
+                                glyph: glyph,
+                                fontSize: fontSize,
+                                isChorus: scene.isChorus
+                            )
+                        }
+                    }
+                    .compositingGroup()
+                    .shadow(
+                        color: scene.isChorus
+                            ? theme.secondaryColor.opacity(0.3)
+                            : theme.accentColor.opacity(0.22),
+                        radius: scene.isChorus ? 22 : 14
+                    )
+                    .shadow(color: .black.opacity(0.78), radius: 3)
+                    .frame(maxWidth: proxy.size.width * 0.82)
+                    .offset(y: breathingY)
+
+                    if let translation = scene.translation {
+                        Text(translation)
+                            .font(.system(
+                                size: max(16, fontSize * 0.22),
+                                weight: .medium,
+                                design: .rounded
+                            ))
+                            .tracking(0.7)
+                            .foregroundStyle(theme.primaryColor.opacity(0.66))
+                            .multilineTextAlignment(.center)
+                            .lineLimit(2)
+                            .frame(maxWidth: 720)
+                            .shadow(color: .black.opacity(0.9), radius: 5)
+                    }
+
+                    if let nextLine = scene.nextLine {
+                        contextualLine(
+                            nextLine.text,
+                            fontSize: fontSize,
+                            alignment: .trailing,
+                            isUpcoming: true
+                        )
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .offset(x: railOffset, y: -8)
+                .scaleEffect(audio.expansion)
+                .id(line.id)
+                .transition(
+                    .opacity.combined(
+                        with: .scale(scale: 0.94, anchor: .center)
+                    )
+                )
+                .animation(
+                    .spring(response: 0.44, dampingFraction: 0.84),
+                    value: line.id
+                )
+            }
+        }
+    }
+
+    private func resolvedFontSize(
+        text: String,
+        availableWidth: CGFloat
+    ) -> CGFloat {
+        CGFloat(StageLyricTypography.fontSize(
+            text: text,
+            availableWidth: Double(availableWidth)
+        ))
+    }
+
+    private func contextualLine(
+        _ text: String,
+        fontSize: CGFloat,
+        alignment: Alignment,
+        isUpcoming: Bool
+    ) -> some View {
+        Text(text)
+            .font(.system(
+                size: min(max(fontSize * 0.28, 15), 24),
+                weight: .semibold,
+                design: .rounded
+            ))
+            .tracking(0.5)
+            .foregroundStyle(
+                theme.primaryColor.opacity(isUpcoming ? 0.28 : 0.18)
             )
-            .animation(
-                .easeOut(duration: 0.22),
-                value: overlayState.isProgramRailVisible
+            .lineLimit(1)
+            .minimumScaleFactor(0.72)
+            .frame(maxWidth: 680, alignment: alignment)
+            .blur(radius: isUpcoming ? 0.9 : 1.5)
+            .offset(x: isUpcoming ? 42 : -42)
+    }
+}
+
+private struct StageFlowingLyricGlyph: View {
+    @Environment(\.stageFoliaTheme) private var theme
+
+    let glyph: StageLyricGlyphFrame
+    let fontSize: CGFloat
+    var isChorus = false
+
+    var body: some View {
+        let style = visualStyle
+        ZStack {
+            if StageLyricRenderPolicy.shouldRenderDynamicGlow(
+                for: glyph.phase
+            ) {
+                Text(glyph.text)
+                    .foregroundStyle(style.glowColor)
+                    .blur(radius: style.glowRadius)
+                    .opacity(style.glowOpacity)
+            }
+
+            Text(glyph.text)
+                .foregroundStyle(style.bodyColor)
+        }
+        .font(.system(
+            size: fontSize,
+            weight: .bold,
+            design: .rounded
+        ))
+        .tracking(fontSize * -0.018)
+        .fixedSize()
+        .blur(radius: style.blurRadius)
+        .scaleEffect(style.scale * glyph.restingScale)
+        .rotationEffect(.degrees(glyph.rotation * style.motionAmount))
+        .offset(
+            x: glyph.xOffset * style.motionAmount,
+            y: glyph.yOffset * style.motionAmount + style.lift
+        )
+        .opacity(style.opacity)
+    }
+
+    private var visualStyle: StageFlowingGlyphStyle {
+        switch glyph.phase {
+        case .waiting:
+            return StageFlowingGlyphStyle(
+                bodyColor:
+                    theme.primaryColor.opacity(0.26),
+                glowColor: Color.clear,
+                glowRadius: 0,
+                glowOpacity: 0,
+                opacity: 0.72,
+                scale: 0.98,
+                lift: 3,
+                motionAmount: 0.08,
+                blurRadius: 0.55
+            )
+        case .active:
+            let pulse = 1.04 + sin(glyph.progress * .pi) * 0.035
+            return StageFlowingGlyphStyle(
+                bodyColor:
+                    theme.semanticColor(for: glyph.text)
+                        ?? (isChorus
+                            ? theme.secondaryColor
+                            : theme.primaryColor),
+                glowColor:
+                    isChorus
+                        ? theme.secondaryColor
+                        : theme.accentColor,
+                glowRadius: 10 + sin(glyph.progress * .pi) * 8,
+                glowOpacity: 0.7,
+                opacity: 1,
+                scale: pulse,
+                lift: -2 - sin(glyph.progress * .pi) * 4,
+                motionAmount: 0.18,
+                blurRadius: 0
+            )
+        case .passed:
+            return StageFlowingGlyphStyle(
+                bodyColor:
+                    isChorus
+                        ? theme.secondaryColor.opacity(0.88)
+                        : theme.accentColor.opacity(0.88),
+                glowColor: Color.clear,
+                glowRadius: 0,
+                glowOpacity: 0,
+                opacity: 0.96,
+                scale: 1,
+                lift: 0,
+                motionAmount: 0.04,
+                blurRadius: 0
             )
         }
-        .allowsHitTesting(false)
+    }
+}
+
+private struct StageFlowingGlyphStyle {
+    let bodyColor: Color
+    let glowColor: Color
+    let glowRadius: Double
+    let glowOpacity: Double
+    let opacity: Double
+    let scale: Double
+    let lift: Double
+    let motionAmount: Double
+    let blurRadius: Double
+}
+
+private struct StageCinematicSplitLyricsFrame: View {
+    @Environment(\.stageFoliaTheme) private var theme
+
+    let scene: StageLyricFlowSceneModel
+    let playbackTime: TimeInterval
+    let isProgramRailVisible: Bool
+    let audio: StageLyricAudioMotion
+
+    var body: some View {
+        GeometryReader { proxy in
+            if let line = scene.activeLine {
+                let layout = StageTiltLayoutModel(line: line)
+                let fontSize = CGFloat(StageLyricTypography.fontSize(
+                    text: line.text,
+                    availableWidth: Double(proxy.size.width * 0.76)
+                ))
+                VStack(alignment: .leading, spacing: fontSize * 0.08) {
+                    ForEach(layout.segments) { segment in
+                        if playbackTime >= segment.revealAt {
+                            Text(segment.text)
+                                .font(.system(
+                                    size: segment.isTilted
+                                        ? fontSize * 1.14
+                                        : fontSize,
+                                    weight: segment.isTilted
+                                        ? .light
+                                        : .bold,
+                                    design: .rounded
+                                ))
+                                .italic(segment.isTilted)
+                                .foregroundStyle(
+                                    segment.isTilted
+                                        ? LinearGradient(
+                                            colors: [
+                                                theme.secondaryColor,
+                                                theme.accentColor,
+                                                theme.primaryColor,
+                                            ],
+                                            startPoint: .leading,
+                                            endPoint: .trailing
+                                        )
+                                        : LinearGradient(
+                                            colors: [
+                                                theme.primaryColor,
+                                                theme.primaryColor.opacity(0.76),
+                                            ],
+                                            startPoint: .top,
+                                            endPoint: .bottom
+                                        )
+                                )
+                                .shadow(
+                                    color: segment.isTilted
+                                        ? theme.accentColor.opacity(0.32)
+                                        : .black.opacity(0.72),
+                                    radius: segment.isTilted ? 18 : 5
+                                )
+                                .offset(
+                                    x: proxy.size.width * segment.xOffset,
+                                    y: audio.beatLift
+                                        * (segment.isTilted ? 0.22 : 0.08)
+                                )
+                                .rotationEffect(
+                                    .degrees(segment.isTilted ? -7 : 0),
+                                    anchor: .leading
+                                )
+                                .scaleEffect(
+                                    segment.isTilted
+                                        ? 1 + audio.mid * 0.045
+                                        : 1,
+                                    anchor: .leading
+                                )
+                                .transition(
+                                    .opacity.combined(
+                                        with: .offset(
+                                            x: segment.isTilted ? 34 : -22,
+                                            y: 0
+                                        )
+                                    )
+                                )
+                                .id(segment.id)
+                        }
+                    }
+
+                    if let translation = scene.translation {
+                        Text(translation)
+                            .font(.system(
+                                size: max(15, fontSize * 0.2),
+                                weight: .medium,
+                                design: .rounded
+                            ))
+                            .foregroundStyle(theme.primaryColor.opacity(0.56))
+                            .frame(maxWidth: 620, alignment: .leading)
+                            .padding(.top, 8)
+                    }
+                }
+                .animation(
+                    .spring(response: 0.55, dampingFraction: 0.82),
+                    value: layout.segments.filter {
+                        playbackTime >= $0.revealAt
+                    }.count
+                )
+                .frame(
+                    maxWidth: proxy.size.width * 0.78,
+                    maxHeight: .infinity,
+                    alignment: .leading
+                )
+                .padding(.leading, max(62, proxy.size.width * 0.08))
+                .offset(
+                    x: isProgramRailVisible ? -104 : 0,
+                    y: -14
+                )
+                .rotation3DEffect(
+                    .degrees(-4),
+                    axis: (x: 0.02, y: 1, z: 0),
+                    anchor: .leading,
+                    perspective: 0.76
+                )
+                .id(line.id)
+                .transition(
+                    .opacity.combined(
+                        with: .move(edge: .leading)
+                    )
+                )
+            }
+        }
+    }
+}
+
+private struct StageOrbitLyricsFrame: View {
+    let scene: StageLyricFlowSceneModel
+    let isProgramRailVisible: Bool
+    let animationTime: TimeInterval
+    let audio: StageLyricAudioMotion
+
+    var body: some View {
+        GeometryReader { proxy in
+            if let line = scene.activeLine {
+                let count = max(scene.glyphs.count, 1)
+                let fontSize = min(
+                    72,
+                    max(26, proxy.size.width * 0.7 / CGFloat(count))
+                )
+                ZStack {
+                    ForEach(
+                        Array(scene.glyphs.enumerated()),
+                        id: \.element.id
+                    ) { index, glyph in
+                        let unit = count == 1
+                            ? 0.5
+                            : Double(index) / Double(count - 1)
+                        let angle = (unit - 0.5) * 1.58
+                        StageFlowingLyricGlyph(
+                            glyph: glyph,
+                            fontSize: fontSize,
+                            isChorus: scene.isChorus
+                        )
+                        .rotation3DEffect(
+                            .degrees((unit - 0.5) * -34),
+                            axis: (x: 0.12, y: 1, z: 0),
+                            perspective: 0.7
+                        )
+                        .offset(
+                            x: sin(angle)
+                                * min(430, proxy.size.width * 0.38)
+                                * audio.expansion,
+                            y: cos(angle) * -92
+                                + sin(animationTime * 0.55 + unit * 4) * 4
+                                + audio.beatLift * (0.12 + unit * 0.1)
+                        )
+                    }
+
+                    if let translation = scene.translation {
+                        Text(translation)
+                            .font(.system(
+                                size: 17,
+                                weight: .medium,
+                                design: .rounded
+                            ))
+                            .foregroundStyle(.white.opacity(0.58))
+                            .offset(y: 78)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .offset(x: isProgramRailVisible ? -150 : 0, y: -18)
+                .id(line.id)
+                .transition(.opacity.combined(with: .scale(scale: 0.9)))
+            }
+        }
+    }
+}
+
+private struct StagePosterRailLyricsFrame: View {
+    @Environment(\.stageFoliaTheme) private var theme
+
+    let lines: [StageLyricLine]
+    let scene: StageLyricFlowSceneModel
+    let isProgramRailVisible: Bool
+    let audio: StageLyricAudioMotion
+
+    var body: some View {
+        GeometryReader { proxy in
+            if let line = scene.activeLine {
+                let rail = StageMonetRailModel(
+                    lines: lines,
+                    activeLineID: line.id
+                )
+                let fontSize = CGFloat(StageLyricTypography.fontSize(
+                    text: line.text,
+                    availableWidth: Double(proxy.size.width * 0.58)
+                ))
+
+                HStack(spacing: 28) {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    theme.accentColor.opacity(0.9),
+                                    theme.secondaryColor.opacity(0.4),
+                                    .clear,
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        )
+                        .frame(
+                            width: 3 + audio.high * 2,
+                            height: min(520, proxy.size.height * 0.7)
+                                * audio.expansion
+                        )
+
+                    VStack(alignment: .leading, spacing: 14) {
+                        ForEach(rail.entries) { entry in
+                            monetRailEntry(
+                                entry,
+                                fontSize: fontSize,
+                                maxWidth: proxy.size.width * 0.62
+                            )
+                            .offset(
+                                x: CGFloat(abs(entry.offset)) * 18
+                                    + (entry.offset > 0 ? 12 : 0)
+                            )
+                            .blur(
+                                radius: entry.status == .active
+                                    ? 0
+                                    : Double(abs(entry.offset)) * 0.34
+                            )
+                            .transition(
+                                .opacity.combined(
+                                    with: .offset(
+                                        x: 0,
+                                        y: entry.offset > 0 ? 24 : -24
+                                    )
+                                )
+                            )
+                        }
+                    }
+                }
+                .frame(
+                    maxWidth: .infinity,
+                    maxHeight: .infinity,
+                    alignment: .leading
+                )
+                .padding(.leading, max(60, proxy.size.width * 0.075))
+                .offset(x: isProgramRailVisible ? -96 : 0)
+                .id(line.id)
+                .transition(.opacity)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func monetRailEntry(
+        _ entry: StageMonetRailEntry,
+        fontSize: CGFloat,
+        maxWidth: CGFloat
+    ) -> some View {
+        if entry.status == .active {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(
+                    alignment: .firstTextBaseline,
+                    spacing: fontSize * 0.012
+                ) {
+                    ForEach(scene.glyphs) { glyph in
+                        StageFlowingLyricGlyph(
+                            glyph: glyph,
+                            fontSize: fontSize,
+                            isChorus: scene.isChorus
+                        )
+                    }
+                }
+                .fixedSize()
+                .scaleEffect(
+                    x: audio.expansion,
+                    y: 1 + audio.mid * 0.025,
+                    anchor: .leading
+                )
+
+                if let translation = scene.translation {
+                    Text(translation)
+                        .font(.system(
+                            size: max(15, fontSize * 0.2),
+                            weight: .medium,
+                            design: .rounded
+                        ))
+                        .foregroundStyle(theme.primaryColor.opacity(0.54))
+                        .lineLimit(2)
+                }
+            }
+            .frame(maxWidth: maxWidth, alignment: .leading)
+            .padding(.vertical, 10)
+            .shadow(
+                color: theme.accentColor.opacity(0.18 + audio.glow * 0.18),
+                radius: 22
+            )
+        } else {
+            Text(entry.line.text)
+                .font(.system(
+                    size: min(max(fontSize * 0.34, 17), 28),
+                    weight: entry.status == .passed ? .medium : .semibold,
+                    design: .rounded
+                ))
+                .foregroundStyle(
+                    entry.status == .passed
+                        ? theme.secondaryColor.opacity(
+                            0.16 + 0.05 / Double(abs(entry.offset))
+                        )
+                        : theme.primaryColor.opacity(
+                            0.34 - Double(abs(entry.offset) - 1) * 0.07
+                        )
+                )
+                .lineLimit(2)
+                .minimumScaleFactor(0.72)
+                .frame(maxWidth: maxWidth * 0.82, alignment: .leading)
+        }
+    }
+}
+
+private struct StageEditorialLyricsFrame: View {
+    @Environment(\.stageFoliaTheme) private var theme
+
+    let lines: [StageLyricLine]
+    let scene: StageLyricFlowSceneModel
+    let playbackTime: TimeInterval
+    let isProgramRailVisible: Bool
+    let audio: StageLyricAudioMotion
+
+    var body: some View {
+        GeometryReader { proxy in
+            if let activeLine = scene.activeLine {
+                let fontSize = CGFloat(StageLyricTypography.fontSize(
+                    text: activeLine.text,
+                    availableWidth: Double(proxy.size.width * 0.62)
+                ))
+                let article = StageFumeArticleModel(
+                    lines: lines,
+                    activeLineID: activeLine.id
+                )
+
+                ZStack {
+                    ForEach(article.blocks, id: \.lineID) { block in
+                        if block.lineID != activeLine.id {
+                            articleContextBlock(
+                                block,
+                                cameraTarget: article.cameraTarget,
+                                canvasSize: proxy.size
+                            )
+                        }
+                    }
+
+                    VStack(spacing: 16) {
+                        HStack(
+                            alignment: .firstTextBaseline,
+                            spacing: fontSize * 0.012
+                        ) {
+                            ForEach(scene.glyphs) { glyph in
+                                StageFlowingLyricGlyph(
+                                    glyph: glyph,
+                                    fontSize: fontSize,
+                                    isChorus: scene.isChorus
+                                )
+                            }
+                        }
+                        .fixedSize()
+                        .frame(maxWidth: proxy.size.width * 0.64)
+
+                        if let translation = scene.translation {
+                            Text(translation)
+                                .font(.system(
+                                    size: max(15, fontSize * 0.19),
+                                    weight: .medium,
+                                    design: .rounded
+                                ))
+                                .foregroundStyle(
+                                    theme.primaryColor.opacity(0.58)
+                                )
+                                .lineLimit(2)
+                                .frame(maxWidth: 680)
+                        }
+                    }
+                    .padding(.horizontal, 32)
+                    .padding(.vertical, 26)
+                    .background {
+                        RoundedRectangle(cornerRadius: 34)
+                            .fill(.black.opacity(0.16))
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 34)
+                                    .stroke(.white.opacity(0.08), lineWidth: 1)
+                            }
+                    }
+                    .shadow(
+                        color: scene.isChorus
+                            ? theme.secondaryColor.opacity(0.2)
+                            : theme.accentColor.opacity(0.18),
+                        radius: 32
+                    )
+                    .position(
+                        x: proxy.size.width * 0.5
+                            + (isProgramRailVisible ? -140 : 0),
+                        y: proxy.size.height * 0.5 + audio.beatLift * 0.2
+                    )
+                    .scaleEffect(audio.expansion)
+                    .id(activeLine.id)
+                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                }
+            }
+        }
+    }
+
+    private func articleContextBlock(
+        _ block: StageFumeArticleBlock,
+        cameraTarget: SIMD2<Double>,
+        canvasSize: CGSize
+    ) -> some View {
+        let distance = abs(block.position.y - cameraTarget.y)
+        let isLeading = block.position.x < 0.5
+        let fontSize = 17 + max(0, 1 - distance * 4) * 8
+        let opacity = max(0.07, 0.34 - distance * 0.72)
+        let x = canvasSize.width
+            * (0.5 + (block.position.x - cameraTarget.x) * 1.45)
+        let y = canvasSize.height
+            * (0.5 + (block.position.y - cameraTarget.y) * 2.25)
+
+        return Text(block.text)
+            .font(.system(
+                size: fontSize,
+                weight: .semibold,
+                design: .rounded
+            ))
+            .foregroundStyle(theme.primaryColor.opacity(opacity))
+            .lineLimit(3)
+            .multilineTextAlignment(isLeading ? .leading : .trailing)
+            .frame(
+                width: canvasSize.width * min(block.width, 0.42),
+                alignment: isLeading ? .leading : .trailing
+            )
+            .position(x: x, y: y)
+            .blur(radius: min(distance * 3.2, 2.2))
+    }
+}
+
+private struct StageCloudStepsLyricsFrame: View {
+    @Environment(\.stageFoliaTheme) private var theme
+
+    let scene: StageLyricFlowSceneModel
+    let isProgramRailVisible: Bool
+    let audio: StageLyricAudioMotion
+
+    var body: some View {
+        GeometryReader { proxy in
+            if let line = scene.activeLine {
+                let count = max(scene.glyphs.count, 1)
+                let layout = StagePartitaLayoutModel(
+                    glyphIDs: scene.glyphs.map(\.id),
+                    lineID: line.id,
+                    isChorus: scene.isChorus
+                )
+                let fontSize = min(
+                    68,
+                    max(25, proxy.size.width * 0.7 / CGFloat(count))
+                )
+
+                ZStack {
+                    ForEach(
+                        Array(layout.placements.enumerated()),
+                        id: \.element.glyphID
+                    ) { index, placement in
+                        let glyph = scene.glyphs[index]
+                        let x = proxy.size.width * (0.5 + placement.x)
+                            + (isProgramRailVisible ? -140 : 0)
+                        let y = proxy.size.height * (0.5 + placement.y)
+
+                        StageFlowingLyricGlyph(
+                            glyph: glyph,
+                            fontSize: fontSize,
+                            isChorus: scene.isChorus
+                        )
+                        .rotation3DEffect(
+                            .degrees(placement.rotationDegrees * 0.72),
+                            axis: (x: 0.08, y: 1, z: 0),
+                            perspective: 0.72
+                        )
+                        .rotationEffect(
+                            .degrees(placement.rotationDegrees * 0.28)
+                        )
+                        .scaleEffect(
+                            placement.scale
+                                * (1 + audio.sceneEnergy * 0.025)
+                        )
+                        .position(x: x, y: y)
+                    }
+
+                    if let translation = scene.translation {
+                        Text(translation)
+                            .font(.system(
+                                size: 15,
+                                weight: .medium,
+                                design: .rounded
+                            ))
+                            .tracking(0.8)
+                            .foregroundStyle(
+                                theme.primaryColor.opacity(0.48)
+                            )
+                            .lineLimit(2)
+                            .frame(width: min(520, proxy.size.width * 0.5))
+                            .position(
+                                x: proxy.size.width * 0.5
+                                    + (isProgramRailVisible ? -140 : 0),
+                                y: proxy.size.height * 0.84
+                            )
+                    }
+                }
+                .scaleEffect(audio.expansion)
+                .id(line.id)
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+        }
+    }
+}
+
+private struct StageChorusChatLyricsFrame: View {
+    @Environment(\.stageFoliaTheme) private var theme
+
+    let scene: StageLyricFlowSceneModel
+    let isProgramRailVisible: Bool
+    let audio: StageLyricAudioMotion
+
+    var body: some View {
+        GeometryReader { proxy in
+            if let line = scene.activeLine {
+                let fontSize = CGFloat(StageLyricTypography.fontSize(
+                    text: line.text,
+                    availableWidth: Double(proxy.size.width * 0.5)
+                ))
+                let conversation = StageCappellaConversationModel(
+                    previousLineID: scene.previousLine?.id,
+                    activeLineID: line.id,
+                    nextLineID: scene.nextLine?.id,
+                    isChorus: scene.isChorus
+                )
+                VStack(spacing: 18) {
+                    if let previous = scene.previousLine {
+                        contextBubble(
+                            previous.text,
+                            voice: conversation.previousVoice,
+                            isTrailing: true
+                        )
+                    }
+
+                    HStack(spacing: 12) {
+                        Circle()
+                            .fill(
+                                LinearGradient(
+                                    colors: [
+                                        theme.accentColor,
+                                        theme.secondaryColor,
+                                    ],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
+                            )
+                            .frame(width: 34, height: 34)
+                            .overlay {
+                                Image(
+                                    systemName:
+                                        conversation.activeVoice.symbolName
+                                )
+                                    .font(.system(size: 14, weight: .bold))
+                                    .foregroundStyle(theme.primaryColor)
+                            }
+                            .shadow(
+                                color: theme.accentColor.opacity(audio.glow),
+                                radius: 10 + audio.high * 10
+                            )
+
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack(
+                                alignment: .firstTextBaseline,
+                                spacing: fontSize * 0.012
+                            ) {
+                                ForEach(scene.glyphs) { glyph in
+                                    StageFlowingLyricGlyph(
+                                        glyph: glyph,
+                                        fontSize: fontSize,
+                                        isChorus: scene.isChorus
+                                    )
+                                }
+                            }
+                            .fixedSize()
+
+                            if let translation = scene.translation {
+                                Text(translation)
+                                    .font(.system(
+                                        size: max(14, fontSize * 0.19),
+                                        weight: .medium,
+                                        design: .rounded
+                                    ))
+                                    .foregroundStyle(
+                                        theme.primaryColor.opacity(0.56)
+                                    )
+                                    .lineLimit(2)
+                            }
+                        }
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 18)
+                        .background {
+                            UnevenRoundedRectangle(
+                                topLeadingRadius: 8,
+                                bottomLeadingRadius: 30,
+                                bottomTrailingRadius: 30,
+                                topTrailingRadius: 30
+                            )
+                            .fill(.black.opacity(0.32))
+                            .overlay {
+                                UnevenRoundedRectangle(
+                                    topLeadingRadius: 8,
+                                    bottomLeadingRadius: 30,
+                                    bottomTrailingRadius: 30,
+                                    topTrailingRadius: 30
+                                )
+                                .stroke(
+                                    scene.isChorus
+                                        ? theme.secondaryColor.opacity(0.46)
+                                        : theme.accentColor.opacity(0.34),
+                                    lineWidth: 1
+                                )
+                            }
+                        }
+                    }
+                    .scaleEffect(audio.expansion, anchor: .leading)
+                    .offset(y: audio.beatLift * 0.18)
+
+                    if let next = scene.nextLine {
+                        contextBubble(
+                            next.text,
+                            voice: conversation.nextVoice,
+                            isTrailing: false
+                        )
+                    }
+                }
+                .frame(maxWidth: min(860, proxy.size.width * 0.72))
+                .frame(
+                    maxWidth: .infinity,
+                    maxHeight: .infinity,
+                    alignment: .center
+                )
+                .offset(x: isProgramRailVisible ? -140 : 0)
+                .id(line.id)
+                .transition(.opacity.combined(with: .scale(scale: 0.96)))
+            }
+        }
+    }
+
+    private func contextBubble(
+        _ text: String,
+        voice: StageCappellaVoice,
+        isTrailing: Bool
+    ) -> some View {
+        HStack(spacing: 9) {
+            if isTrailing {
+                Spacer(minLength: 40)
+            }
+            Circle()
+                .fill(theme.secondaryColor.opacity(0.12))
+                .frame(width: 27, height: 27)
+                .overlay {
+                    Image(systemName: voice.symbolName)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(
+                            theme.secondaryColor.opacity(0.72)
+                        )
+                }
+            Text(text)
+                .font(.system(
+                    size: 18,
+                    weight: .medium,
+                    design: .rounded
+                ))
+                .foregroundStyle(theme.primaryColor.opacity(0.36))
+                .lineLimit(1)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 11)
+                .background {
+                    Capsule()
+                        .fill(theme.primaryColor.opacity(0.045))
+                        .overlay {
+                            Capsule()
+                                .stroke(
+                                    theme.primaryColor.opacity(0.08),
+                                    lineWidth: 0.8
+                                )
+                        }
+                }
+            if !isTrailing {
+                Spacer(minLength: 40)
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
+private struct StagePendulumLyricsFrame: View {
+    @Environment(\.stageFoliaTheme) private var theme
+
+    let lines: [StageLyricLine]
+    let scene: StageLyricFlowSceneModel
+    let isProgramRailVisible: Bool
+    let animationTime: TimeInterval
+    let audio: StageLyricAudioMotion
+
+    var body: some View {
+        GeometryReader { proxy in
+            if let line = scene.activeLine {
+                let wheel = StagePendoloWheelModel(
+                    lines: lines,
+                    activeLineID: line.id
+                )
+                let radius = min(proxy.size.width, proxy.size.height) * 0.48
+                    * audio.expansion
+                let center = CGPoint(
+                    x: proxy.size.width * 0.04
+                        + (isProgramRailVisible ? -140 : 0),
+                    y: proxy.size.height * 0.5
+                )
+
+                ZStack {
+                    Circle()
+                        .trim(from: 0, to: 0.5)
+                        .stroke(
+                            AngularGradient(
+                                colors: [
+                                    theme.secondaryColor.opacity(0.1),
+                                    theme.accentColor.opacity(0.58),
+                                    theme.primaryColor.opacity(0.18),
+                                    theme.secondaryColor.opacity(0.1),
+                                ],
+                                center: .center
+                            ),
+                            style: StrokeStyle(
+                                lineWidth: 1.2 + audio.high * 1.4,
+                                lineCap: .round
+                            )
+                        )
+                        .frame(width: radius * 2, height: radius * 2)
+                        .position(center)
+                        .rotationEffect(.degrees(-90))
+
+                    Circle()
+                        .trim(from: 0.04, to: 0.46)
+                        .stroke(
+                            theme.primaryColor.opacity(
+                                0.035 + audio.glow * 0.08
+                            ),
+                            lineWidth: 20 + audio.low * 10
+                        )
+                        .frame(
+                            width: radius * 1.88,
+                            height: radius * 1.88
+                        )
+                        .position(center)
+                        .rotationEffect(.degrees(-90))
+
+                    ForEach(wheel.items) { item in
+                        let point = CGPoint(
+                            x: center.x + item.x * radius,
+                            y: center.y + item.y * radius
+                        )
+
+                        pendoloLine(
+                            item,
+                            activeLine: line,
+                            maxWidth: proxy.size.width * 0.56
+                        )
+                        .rotationEffect(
+                            .degrees(item.angleDegrees * 0.16),
+                            anchor: .leading
+                        )
+                        .scaleEffect(item.scale, anchor: .leading)
+                        .opacity(item.opacity)
+                        .position(point)
+                    }
+
+                    Circle()
+                        .fill(
+                            RadialGradient(
+                                colors: [
+                                    theme.primaryColor.opacity(0.8),
+                                    theme.accentColor.opacity(0.46),
+                                    .clear,
+                                ],
+                                center: .center,
+                                startRadius: 0,
+                                endRadius: 34
+                            )
+                        )
+                        .frame(
+                            width: 28 + audio.beat * 14,
+                            height: 28 + audio.beat * 14
+                        )
+                        .position(
+                            x: center.x,
+                            y: center.y
+                        )
+                        .shadow(
+                            color: theme.accentColor.opacity(audio.glow),
+                            radius: 12 + audio.high * 10
+                        )
+                }
+                .id(line.id)
+                .transition(.opacity)
+                .animation(
+                    .spring(response: 0.72, dampingFraction: 0.86),
+                    value: line.id
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func pendoloLine(
+        _ item: StagePendoloWheelItem,
+        activeLine: StageLyricLine,
+        maxWidth: CGFloat
+    ) -> some View {
+        if item.isActive {
+            let fontSize = CGFloat(StageLyricTypography.fontSize(
+                text: activeLine.text,
+                availableWidth: Double(maxWidth)
+            ))
+            HStack(
+                alignment: .firstTextBaseline,
+                spacing: fontSize * 0.012
+            ) {
+                ForEach(scene.glyphs) { glyph in
+                    StageFlowingLyricGlyph(
+                        glyph: glyph,
+                        fontSize: fontSize,
+                        isChorus: scene.isChorus
+                    )
+                }
+            }
+            .fixedSize()
+            .shadow(
+                color: theme.accentColor.opacity(0.22 + audio.glow * 0.2),
+                radius: 18
+            )
+        } else {
+            Text(item.line.text)
+                .font(.system(
+                    size: 24,
+                    weight: .semibold,
+                    design: .rounded
+                ))
+                .foregroundStyle(
+                    item.angleDegrees < 0
+                        ? theme.secondaryColor.opacity(0.68)
+                        : theme.primaryColor.opacity(0.72)
+                )
+                .lineLimit(1)
+                .minimumScaleFactor(0.74)
+                .frame(maxWidth: maxWidth * 0.72, alignment: .leading)
+        }
+    }
+}
+
+private struct StageDioramaLyricsFrame: View {
+    @Environment(\.stageFoliaTheme) private var theme
+
+    let scene: StageLyricFlowSceneModel
+    let isProgramRailVisible: Bool
+    let animationTime: TimeInterval
+    let audio: StageLyricAudioMotion
+
+    var body: some View {
+        GeometryReader { proxy in
+            if let line = scene.activeLine {
+                let centerX = proxy.size.width * 0.5
+                    + (isProgramRailVisible ? -140 : 0)
+                ZStack {
+                    particleField(size: proxy.size)
+
+                    if let previous = scene.previousLine {
+                        dioramaPanel(
+                            previous.text,
+                            width: min(520, proxy.size.width * 0.46),
+                            opacity: 0.2
+                        )
+                        .rotation3DEffect(
+                            .degrees(34),
+                            axis: (x: 0.08, y: 1, z: 0),
+                            perspective: 0.68
+                        )
+                        .position(
+                            x: centerX - proxy.size.width * 0.27,
+                            y: proxy.size.height * 0.3
+                        )
+                        .scaleEffect(0.76)
+                    }
+
+                    if let next = scene.nextLine {
+                        dioramaPanel(
+                            next.text,
+                            width: min(520, proxy.size.width * 0.46),
+                            opacity: 0.28
+                        )
+                        .rotation3DEffect(
+                            .degrees(-38),
+                            axis: (x: 0.06, y: 1, z: 0),
+                            perspective: 0.68
+                        )
+                        .position(
+                            x: centerX + proxy.size.width * 0.28,
+                            y: proxy.size.height * 0.7
+                        )
+                        .scaleEffect(0.82)
+                    }
+
+                    activePanel(
+                        line: line,
+                        availableWidth: proxy.size.width * 0.6
+                    )
+                    .position(
+                        x: centerX,
+                        y: proxy.size.height * 0.5 + audio.beatLift * 0.22
+                    )
+                    .scaleEffect(audio.expansion)
+                    .rotation3DEffect(
+                        .degrees(sin(animationTime * 0.23) * 2.4),
+                        axis: (x: 0.04, y: 1, z: 0),
+                        perspective: 0.72
+                    )
+                }
+                .id(line.id)
+                .transition(.opacity.combined(with: .scale(scale: 0.92)))
+            }
+        }
+    }
+
+    private func activePanel(
+        line: StageLyricLine,
+        availableWidth: CGFloat
+    ) -> some View {
+        let fontSize = CGFloat(StageLyricTypography.fontSize(
+            text: line.text,
+            availableWidth: Double(availableWidth)
+        ))
+        return VStack(spacing: 14) {
+            HStack(
+                alignment: .firstTextBaseline,
+                spacing: fontSize * 0.012
+            ) {
+                ForEach(scene.glyphs) { glyph in
+                    StageFlowingLyricGlyph(
+                        glyph: glyph,
+                        fontSize: fontSize,
+                        isChorus: scene.isChorus
+                    )
+                }
+            }
+            .fixedSize()
+
+            if let translation = scene.translation {
+                Text(translation)
+                    .font(.system(
+                        size: max(15, fontSize * 0.18),
+                        weight: .medium,
+                        design: .rounded
+                    ))
+                    .foregroundStyle(theme.primaryColor.opacity(0.54))
+                    .lineLimit(2)
+            }
+        }
+        .padding(.horizontal, 34)
+        .padding(.vertical, 28)
+        .background {
+            RoundedRectangle(cornerRadius: 28)
+                .fill(.black.opacity(0.26))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 28)
+                        .stroke(
+                            LinearGradient(
+                                colors: [
+                                    theme.accentColor.opacity(0.5),
+                                    theme.secondaryColor.opacity(0.24),
+                                    theme.primaryColor.opacity(0.38),
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ),
+                            lineWidth: 1
+                        )
+                }
+        }
+        .shadow(
+            color: theme.accentColor.opacity(audio.glow * 0.7),
+            radius: 26 + audio.high * 18
+        )
+    }
+
+    private func dioramaPanel(
+        _ text: String,
+        width: CGFloat,
+        opacity: Double
+    ) -> some View {
+        Text(text)
+            .font(.system(size: 24, weight: .semibold, design: .rounded))
+            .foregroundStyle(theme.primaryColor.opacity(opacity))
+            .lineLimit(2)
+            .multilineTextAlignment(.center)
+            .frame(width: width)
+            .padding(.vertical, 22)
+            .background {
+                RoundedRectangle(cornerRadius: 24)
+                    .fill(.white.opacity(0.025))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 24)
+                            .stroke(.white.opacity(0.07), lineWidth: 0.8)
+                    }
+            }
+    }
+
+    private func particleField(size: CGSize) -> some View {
+        Canvas { context, canvasSize in
+            let energy = max(audio.particleEnergy, 0.08)
+            for index in 0 ..< 180 {
+                let seed = Double(index) * 12.9898
+                let unitX = abs(sin(seed * 0.71)) * canvasSize.width
+                let unitY = abs(cos(seed * 1.17)) * canvasSize.height
+                let drift = sin(animationTime * (0.16 + audio.mid * 0.2)
+                    + seed) * (8 + energy * 24)
+                let depth = 0.35 + abs(sin(seed * 0.33)) * 0.65
+                let diameter = 0.7 + depth * (1.5 + audio.onset * 2.4)
+                let point = CGRect(
+                    x: unitX + drift,
+                    y: unitY + cos(animationTime * 0.2 + seed) * 7,
+                    width: diameter,
+                    height: diameter
+                )
+                let color: Color = switch index % 3 {
+                case 0:
+                    theme.accentColor
+                case 1:
+                    theme.secondaryColor
+                default:
+                    theme.primaryColor
+                }
+                context.fill(
+                    Path(ellipseIn: point),
+                    with: .color(color.opacity(0.12 + energy * 0.28))
+                )
+            }
+        }
+        .frame(width: size.width, height: size.height)
+        .blur(radius: 0.2 + audio.low * 0.7)
+    }
+}
+
+private struct StageDepthLyricsFrame: View {
+    @Environment(\.stageFoliaTheme) private var theme
+
+    let scene: StageLyricSceneModel
+    let isProgramRailVisible: Bool
+    let audio: StageLyricAudioMotion
+
+    var body: some View {
+        ZStack {
+            ForEach(scene.lines) { line in
+                lyricLine(line)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .animation(
+            .easeOut(duration: 0.26),
+            value: scene.lines.first(where: { $0.position == 0 })?.id
+        )
     }
 
     private func lyricLine(_ line: StageLyricSceneLine) -> some View {
         let isCurrent = line.position == 0
-        let railOffset = overlayState.isProgramRailVisible ? -150.0 : 0
+        let railOffset = isProgramRailVisible ? -150.0 : 0
         let xOffset = railOffset + Double(line.position) * 92
         let yOffset = Double(line.position) * 96
+            + (isCurrent ? audio.beatLift * 0.24 : 0)
         let glow = isCurrent
-            ? Color.cyan.opacity(0.5)
+            ? theme.accentColor.opacity(0.5)
             : Color.black.opacity(0.72)
 
         return Text(line.text)
@@ -129,7 +1665,9 @@ private struct StageLyricsView: View {
             .shadow(color: .black.opacity(0.96), radius: 4)
             .opacity(line.opacity)
             .blur(radius: line.blurRadius)
-            .scaleEffect(line.scale)
+            .scaleEffect(
+                line.scale * (isCurrent ? audio.expansion : 1)
+            )
             .rotation3DEffect(
                 .degrees(Double(line.position) * -12),
                 axis: (x: 0.08, y: 1, z: 0),
@@ -143,12 +1681,12 @@ private struct StageLyricsView: View {
         LinearGradient(
             colors: isCurrent
                 ? [
-                    Color.white,
-                    Color(red: 0.56, green: 0.94, blue: 1),
+                    theme.primaryColor,
+                    theme.accentColor,
                 ]
                 : [
-                    Color.white.opacity(0.76),
-                    Color.cyan.opacity(0.5),
+                    theme.primaryColor.opacity(0.76),
+                    theme.accentColor.opacity(0.5),
                 ],
             startPoint: .leading,
             endPoint: .trailing
@@ -165,7 +1703,246 @@ final class StageOverlayState: ObservableObject {
     }
 }
 
+@MainActor
+struct StageVisualPickerView: View {
+    @ObservedObject var lyrics: StageLyricsStore
+    @ObservedObject var visualDirections: StageVisualDirectionStore
+    @ObservedObject var videos: StageVideoPlaybackStore
+    @Bindable var programStore: DJProgramStore
+
+    private let lyricColumns = Array(
+        repeating: GridItem(.flexible(), spacing: 6),
+        count: 6
+    )
+    private let pointCloudColumns = Array(
+        repeating: GridItem(.flexible(), spacing: 6),
+        count: 4
+    )
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            pickerHeader("字幕特效", symbol: "captions.bubble")
+
+            LazyVGrid(columns: lyricColumns, spacing: 6) {
+                ForEach(StageLyricsVisualMode.allCases, id: \.self) { mode in
+                    pickerButton(
+                        title: mode.displayName,
+                        symbol: mode.symbolName,
+                        isSelected: lyrics.visualMode == mode
+                    ) {
+                        lyrics.setVisualMode(mode)
+                    }
+                }
+            }
+
+            pickerHeader("3D 点阵", symbol: "circle.hexagongrid")
+
+            LazyVGrid(columns: pointCloudColumns, spacing: 6) {
+                ForEach(StagePointCloudChoice.allCases, id: \.self) {
+                    choice in
+                    pickerButton(
+                        title: choice.title,
+                        symbol: choice.symbolName,
+                        isSelected:
+                            visualDirections.currentPointCloudChoice == choice
+                    ) {
+                        visualDirections.selectPointCloud(choice)
+                    }
+                }
+            }
+
+            pickerHeader("MV 场景", symbol: "film.stack")
+
+            HStack(spacing: 6) {
+                pickerButton(
+                    title: "导入 MP4",
+                    symbol: "plus",
+                    isSelected: false,
+                    action: importMP4
+                )
+                ForEach(StageVideoPlaybackMode.allCases, id: \.self) {
+                    mode in
+                    pickerButton(
+                        title: mode.displayName,
+                        symbol: mode.symbolName,
+                        isSelected: videos.isActive && videos.mode == mode
+                    ) {
+                        videos.setMode(mode)
+                    }
+                }
+                pickerButton(
+                    title: "关闭",
+                    symbol: "xmark",
+                    isSelected: !videos.isActive && !videos.assets.isEmpty
+                ) {
+                    videos.stop()
+                }
+            }
+
+            if !videos.assets.isEmpty {
+                HStack(spacing: 10) {
+                    Image(systemName: "sun.min")
+                        .foregroundStyle(.white.opacity(0.46))
+                    Slider(
+                        value: Binding(
+                            get: { Double(videos.brightness) },
+                            set: { videos.setBrightness(Float($0)) }
+                        ),
+                        in: 0.15 ... 1
+                    )
+                    .tint(.cyan.opacity(0.86))
+                    .accessibilityLabel("视频亮度")
+                    Text("\(Int(videos.brightness * 100))%")
+                        .monospacedDigit()
+                        .frame(width: 38, alignment: .trailing)
+                        .foregroundStyle(.white.opacity(0.5))
+                }
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .padding(.horizontal, 10)
+                .frame(height: 24)
+
+                Menu {
+                    ForEach(videos.assets) { asset in
+                        Menu(asset.displayName) {
+                            Button(
+                                videos.isActive
+                                    && videos.activeAssetID == asset.id
+                                    ? "取消加载"
+                                    : "加载"
+                            ) {
+                                videos.toggle(asset.id)
+                            }
+
+                            if let track = programStore.activeSlot?.track {
+                                if videos.boundAsset(for: track.id)?.id == asset.id {
+                                    Button("解除当前歌曲绑定") {
+                                        videos.unbind(trackID: track.id)
+                                    }
+                                } else {
+                                    Button("绑定到当前歌曲") {
+                                        videos.bind(asset.id, to: track.id)
+                                    }
+                                }
+                            }
+
+                            Divider()
+                            Button("移出素材库", role: .destructive) {
+                                videos.remove(asset.id)
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(
+                            systemName: videos.isActive
+                                ? "video.fill"
+                                : "video.slash"
+                        )
+                        Text(videos.activeAsset?.displayName ?? "未加载视频")
+                            .lineLimit(1)
+                        Spacer()
+                        Text(
+                            videos.isActive
+                                ? "已加载"
+                                : "\(videos.assets.count) 段"
+                        )
+                            .foregroundStyle(.white.opacity(0.38))
+                    }
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.68))
+                    .padding(.horizontal, 12)
+                    .frame(height: 30)
+                    .background(Color.white.opacity(0.045), in: Capsule())
+                }
+                .menuStyle(.borderlessButton)
+            }
+        }
+        .padding(12)
+        .background {
+            RoundedRectangle(cornerRadius: 24)
+                .fill(.ultraThinMaterial)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 24)
+                        .stroke(.white.opacity(0.14), lineWidth: 1)
+                }
+        }
+        .shadow(color: .black.opacity(0.5), radius: 24, y: 10)
+        .padding(7)
+    }
+
+    private func pickerHeader(
+        _ title: String,
+        symbol: String
+    ) -> some View {
+        Label(title, systemImage: symbol)
+            .font(.system(size: 12, weight: .semibold, design: .rounded))
+            .tracking(0.7)
+            .foregroundStyle(.white.opacity(0.6))
+    }
+
+    private func pickerButton(
+        title: String,
+        symbol: String,
+        isSelected: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            VStack(spacing: 5) {
+                Image(systemName: symbol)
+                    .font(.system(size: 14, weight: .semibold))
+                Text(title)
+                    .font(.system(
+                        size: 10,
+                        weight: .semibold,
+                        design: .rounded
+                    ))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(
+                isSelected
+                    ? Color(red: 0.48, green: 0.95, blue: 1)
+                    : Color.white.opacity(0.62)
+            )
+            .frame(maxWidth: .infinity)
+            .frame(height: 40)
+            .background {
+                RoundedRectangle(cornerRadius: 13)
+                    .fill(
+                        isSelected
+                            ? Color.cyan.opacity(0.16)
+                            : Color.white.opacity(0.045)
+                    )
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 13)
+                    .stroke(
+                        isSelected
+                            ? Color.cyan.opacity(0.52)
+                            : Color.white.opacity(0.07),
+                        lineWidth: isSelected ? 1 : 0.8
+                    )
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func importMP4() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.mpeg4Movie]
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.prompt = "导入"
+        panel.message = "选择要与 3D 点阵叠加的 MP4 片段"
+        guard panel.runModal() == .OK else {
+            return
+        }
+        videos.add(panel.urls)
+    }
+}
+
 struct StageProgramRailCard: Equatable, Identifiable {
+    let slotIndex: Int
     let trackID: String
     let title: String
     let artist: String
@@ -187,8 +1964,7 @@ struct StageProgramRailModel: Equatable {
 
     init(
         plan: ProgramPlan?,
-        activeSlotIndex: Int?,
-        maximumVisibleCards: Int = 5
+        activeSlotIndex: Int?
     ) {
         title = plan?.title
         guard let plan, !plan.slots.isEmpty else {
@@ -196,105 +1972,408 @@ struct StageProgramRailModel: Equatable {
             return
         }
 
-        let firstIndex: Int
         let activeIndex: Int?
         if
             let activeSlotIndex,
             plan.slots.indices.contains(activeSlotIndex)
         {
             activeIndex = activeSlotIndex
-            let lastStart = max(
-                plan.slots.count - max(0, maximumVisibleCards),
-                plan.slots.startIndex
-            )
-            firstIndex = min(
-                max(activeSlotIndex - 2, plan.slots.startIndex),
-                lastStart
-            )
         } else {
             activeIndex = nil
-            firstIndex = plan.slots.startIndex
         }
 
-        cards = plan.slots[firstIndex...]
-            .prefix(max(0, maximumVisibleCards))
+        cards = plan.slots
             .enumerated()
-            .map { visibleIndex, slot in
-                let absoluteIndex = firstIndex + visibleIndex
+            .map { absoluteIndex, slot in
                 let relativeIndex = activeIndex.map {
                     absoluteIndex - $0
-                } ?? visibleIndex
+                } ?? absoluteIndex
                 let isCurrent = absoluteIndex == activeIndex
                 let distance = abs(relativeIndex)
+                let visualDistance = min(distance, 2)
                 return StageProgramRailCard(
+                    slotIndex: absoluteIndex,
                     trackID: slot.track.id,
                     title: slot.track.title,
                     artist: slot.track.artist,
                     energy: slot.track.energy,
                     relativeIndex: relativeIndex,
                     isCurrent: isCurrent,
-                    depth: distance * -72,
+                    depth: visualDistance * -72,
                     opacity: isCurrent
                         ? 1
                         : max(
                             relativeIndex < 0 ? 0.34 : 0.46,
-                            1 - Double(distance) * 0.16
+                            1 - Double(visualDistance) * 0.16
                         ),
                     scale: isCurrent
                         ? 1
-                        : max(0.78, 1 - Double(distance) * 0.055)
+                        : max(
+                            0.78,
+                            1 - Double(visualDistance) * 0.055
+                        )
                 )
             }
     }
 }
 
 @MainActor
+enum StageProgramRailRoute: Equatable {
+    case programs
+    case tracks(programID: String)
+}
+
+@MainActor
+final class StageProgramRailSelection: ObservableObject {
+    @Published private(set) var route = StageProgramRailRoute.programs
+    @Published private(set) var selectedProgramID: String?
+    @Published private(set) var selectedSlotIndex: Int?
+    private let onPlay: @MainActor (String, Int) -> Void
+    private let onReplan: @MainActor () -> Void
+
+    init(
+        onPlay: @escaping @MainActor (String, Int) -> Void = { _, _ in },
+        onReplan: @escaping @MainActor () -> Void = {}
+    ) {
+        self.onPlay = onPlay
+        self.onReplan = onReplan
+    }
+
+    func openProgram(_ programID: String) {
+        selectedProgramID = programID
+        selectedSlotIndex = nil
+        route = .tracks(programID: programID)
+    }
+
+    func showPrograms() {
+        selectedSlotIndex = nil
+        route = .programs
+    }
+
+    func activate(slotIndex: Int) {
+        guard let selectedProgramID else {
+            return
+        }
+        selectedSlotIndex = slotIndex
+        onPlay(selectedProgramID, slotIndex)
+    }
+
+    func replan() {
+        onReplan()
+    }
+}
+
+@MainActor
 struct StageProgramRailView: View {
     @Bindable var programStore: DJProgramStore
+    @ObservedObject var selection: StageProgramRailSelection
+    @ObservedObject var videos: StageVideoPlaybackStore
+    let audioFeatures: VisualAudioFeatureStore
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var focusedTrackID: String?
 
-    private var model: StageProgramRailModel {
-        StageProgramRailModel(
-            plan: programStore.plan,
-            activeSlotIndex: programStore.activeSlotIndex
+    private var programs: [SavedDJProgram] {
+        if !programStore.recentPrograms.isEmpty {
+            return programStore.recentPrograms
+        }
+        guard let plan = programStore.plan else {
+            return []
+        }
+        return [
+            SavedDJProgram(
+                plan: plan,
+                activeSlotIndex: programStore.activeSlotIndex,
+                updatedAt: plan.generatedAt
+            ),
+        ]
+    }
+
+    private var selectedProgram: SavedDJProgram? {
+        guard let selectedProgramID = selection.selectedProgramID else {
+            return nil
+        }
+        return programs.first {
+            $0.plan.brief.id == selectedProgramID
+        }
+    }
+
+    private var trackModel: StageProgramRailModel {
+        let selected = selectedProgram
+        let isPlayingSelectedProgram =
+            selected?.plan.brief.id == programStore.plan?.brief.id
+        return StageProgramRailModel(
+            plan: selected?.plan,
+            activeSlotIndex: isPlayingSelectedProgram
+                ? programStore.activeSlotIndex
+                : nil
         )
     }
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 8) {
-            if model.cards.isEmpty {
-                emptyState
-                    .padding(.top, 96)
-            } else {
-                HStack(spacing: 8) {
-                    if let title = model.title, !title.isEmpty {
-                        Text(title.uppercased())
-                            .lineLimit(1)
-                    }
-                    Text("· \(programStore.plan?.slots.count ?? 0)")
-                }
-                        .font(.system(
-                            size: 14,
-                            weight: .semibold,
-                            design: .rounded
-                        ))
-                        .tracking(1.2)
-                        .foregroundStyle(.white.opacity(0.62))
-                        .shadow(color: .black.opacity(0.9), radius: 4)
-                        .frame(maxWidth: .infinity, alignment: .trailing)
-                        .padding(.trailing, 14)
-
-                VStack(alignment: .trailing, spacing: -7) {
-                    ForEach(model.cards) { card in
-                        programCard(card)
-                    }
-                }
+            switch selection.route {
+            case .programs:
+                programList
+            case .tracks:
+                trackList
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
         .padding(.top, 42)
         .padding(.trailing, 10)
+        .animation(
+            reduceMotion ? nil : .easeOut(duration: 0.22),
+            value: selection.route
+        )
+    }
+
+    @ViewBuilder
+    private var programList: some View {
+        if programs.isEmpty {
+            emptyState
+                .padding(.top, 96)
+        } else {
+            railHeader(title: "节目单", count: programs.count)
+            ScrollView(.vertical, showsIndicators: false) {
+                LazyVStack(alignment: .trailing, spacing: 4) {
+                    ForEach(programs, id: \.plan.brief.id) { saved in
+                        Button {
+                            selection.openProgram(saved.plan.brief.id)
+                        } label: {
+                            HStack(spacing: 13) {
+                                Image(systemName: "radio.fill")
+                                    .font(.system(size: 17, weight: .medium))
+                                    .foregroundStyle(Color.cyan.opacity(0.88))
+                                    .frame(width: 42, height: 42)
+                                    .background(
+                                        Color.cyan.opacity(0.1),
+                                        in: Circle()
+                                    )
+
+                                VStack(alignment: .leading, spacing: 5) {
+                                    Text(
+                                        programTitle(saved.plan)
+                                    )
+                                    .font(.system(
+                                        size: 16,
+                                        weight: .semibold,
+                                        design: .rounded
+                                    ))
+                                    .foregroundStyle(.white.opacity(0.9))
+                                    .lineLimit(1)
+
+                                    Text(
+                                        "\(saved.plan.slots.count) 首"
+                                            + programDirection(saved.plan)
+                                    )
+                                    .font(.system(
+                                        size: 13,
+                                        weight: .medium,
+                                        design: .rounded
+                                    ))
+                                    .foregroundStyle(.white.opacity(0.46))
+                                    .lineLimit(1)
+                                }
+
+                                Spacer(minLength: 4)
+
+                                if
+                                    saved.plan.brief.id
+                                        == programStore.pendingPlan?.brief.id
+                                {
+                                    Image(systemName: "sparkles")
+                                        .font(.system(
+                                            size: 13,
+                                            weight: .semibold
+                                        ))
+                                        .foregroundStyle(
+                                            Color.cyan.opacity(0.9)
+                                        )
+                                        .help("后台新编排，等待切换")
+                                } else {
+                                    Image(systemName: "chevron.right")
+                                        .font(.system(
+                                            size: 12,
+                                            weight: .semibold
+                                        ))
+                                        .foregroundStyle(
+                                            .white.opacity(0.34)
+                                        )
+                                }
+                            }
+                            .padding(.horizontal, 14)
+                            .frame(width: 306, height: 74)
+                            .background(
+                                .ultraThinMaterial,
+                                in: RoundedRectangle(cornerRadius: 22)
+                            )
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 22)
+                                    .stroke(
+                                        saved.plan.brief.id
+                                            == programStore.plan?.brief.id
+                                            ? Color.cyan.opacity(0.44)
+                                            : Color.white.opacity(0.11),
+                                        lineWidth: 1
+                                    )
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .rotation3DEffect(
+                            .degrees(-7),
+                            axis: (x: 0, y: 1, z: 0),
+                            anchor: .trailing,
+                            perspective: 0.72
+                        )
+                        .shadow(color: .black.opacity(0.38), radius: 13, y: 7)
+                    }
+                }
+            }
+            .contentMargins(.vertical, 18)
+            .mask(railMask)
+        }
+    }
+
+    @ViewBuilder
+    private var trackList: some View {
+        if trackModel.cards.isEmpty {
+            emptyState
+                .padding(.top, 96)
+        } else {
+            HStack(spacing: 8) {
+                Button {
+                    selection.showPrograms()
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white.opacity(0.72))
+                .accessibilityLabel("返回节目单")
+
+                Spacer(minLength: 4)
+                if let title = trackModel.title, !title.isEmpty {
+                    Text(title.uppercased())
+                        .lineLimit(1)
+                }
+                Text("· \(trackModel.cards.count)")
+                replanButton
+            }
+            .font(.system(size: 14, weight: .semibold, design: .rounded))
+            .tracking(1.2)
+            .foregroundStyle(.white.opacity(0.62))
+            .shadow(color: .black.opacity(0.9), radius: 4)
+            .padding(.horizontal, 14)
+
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: false) {
+                    LazyVStack(alignment: .trailing, spacing: -7) {
+                        ForEach(trackModel.cards) { card in
+                            programCard(card)
+                                .id(card.slotIndex)
+                                .scrollTransition(
+                                    .interactive,
+                                    axis: .vertical
+                                ) { content, phase in
+                                    content
+                                        .opacity(
+                                            phase.isIdentity ? 1 : 0.56
+                                        )
+                                        .scaleEffect(
+                                            phase.isIdentity ? 1 : 0.9,
+                                            anchor: .trailing
+                                        )
+                                        .rotation3DEffect(
+                                            .degrees(
+                                                Double(phase.value) * -13
+                                            ),
+                                            axis: (x: 1, y: 0.16, z: 0),
+                                            anchor: .trailing,
+                                            perspective: 0.72
+                                        )
+                                }
+                        }
+                    }
+                    .scrollTargetLayout()
+                }
+                .scrollTargetBehavior(.viewAligned(limitBehavior: .always))
+                .contentMargins(.vertical, 18)
+                .mask(railMask)
+                .onAppear {
+                    scrollToActive(using: proxy, animated: false)
+                }
+                .onChange(of: programStore.activeSlotIndex) {
+                    scrollToActive(using: proxy, animated: true)
+                }
+            }
+        }
+    }
+
+    private func railHeader(title: String, count: Int) -> some View {
+        HStack(spacing: 10) {
+            replanButton
+            Spacer(minLength: 4)
+            Text("\(title.uppercased()) · \(count)")
+        }
+        .font(.system(size: 14, weight: .semibold, design: .rounded))
+        .tracking(1.2)
+        .foregroundStyle(.white.opacity(0.62))
+        .shadow(color: .black.opacity(0.9), radius: 4)
+        .padding(.horizontal, 14)
+    }
+
+    private var replanButton: some View {
+        Button {
+            selection.replan()
+        } label: {
+            Image(
+                systemName: programStore.status == .planning
+                    ? "hourglass"
+                    : "arrow.triangle.2.circlepath"
+            )
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(
+                programStore.status == .planning
+                    ? Color.orange.opacity(0.86)
+                    : Color.cyan.opacity(0.88)
+            )
+            .frame(width: 28, height: 28)
+            .background(Color.white.opacity(0.06), in: Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(programStore.status == .planning)
+        .help(
+            programStore.status == .planning
+                ? "DJ 正在重新编排"
+                : "让 DJ 重新编排后续歌曲"
+        )
+        .accessibilityLabel("重新编排后续歌曲")
+    }
+
+    private var railMask: some View {
+        LinearGradient(
+            stops: [
+                .init(color: .clear, location: 0),
+                .init(color: .black, location: 0.08),
+                .init(color: .black, location: 0.92),
+                .init(color: .clear, location: 1),
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+    }
+
+    private func programDirection(_ plan: ProgramPlan) -> String {
+        guard let direction = plan.direction, !direction.isEmpty else {
+            return ""
+        }
+        return " · \(direction)"
+    }
+
+    private func programTitle(_ plan: ProgramPlan) -> String {
+        guard let title = plan.title, !title.isEmpty else {
+            return "未命名节目"
+        }
+        return title
     }
 
     private var emptyState: some View {
@@ -319,17 +2398,22 @@ struct StageProgramRailView: View {
 
     @ViewBuilder
     private func programCard(_ card: StageProgramRailCard) -> some View {
-        let isFocused = focusedTrackID == card.trackID
-        let relative = Double(card.relativeIndex)
-        let distance = Double(abs(card.relativeIndex))
-        Button {
-            withAnimation(
-                reduceMotion ? nil : .easeOut(duration: 0.2)
-            ) {
-                focusedTrackID = isFocused ? nil : card.trackID
-            }
-        } label: {
-            HStack(spacing: 13) {
+        let isFocused = selection.selectedSlotIndex.map {
+            $0 == card.slotIndex
+        } ?? card.isCurrent
+        let relative = Double(
+            max(-2, min(2, card.relativeIndex))
+        )
+        let distance = Double(min(2, abs(card.relativeIndex)))
+        ZStack(alignment: .topTrailing) {
+            Button {
+                withAnimation(
+                    reduceMotion ? nil : .easeOut(duration: 0.2)
+                ) {
+                    selection.activate(slotIndex: card.slotIndex)
+                }
+            } label: {
+                HStack(spacing: 13) {
                 ZStack {
                     Circle()
                         .fill(
@@ -337,13 +2421,23 @@ struct StageProgramRailView: View {
                                 ? Color.cyan.opacity(0.22)
                                 : Color.white.opacity(0.06)
                         )
-                    Image(systemName: card.isCurrent ? "waveform" : "music.note")
-                        .font(.system(size: 16, weight: .semibold))
+                    if card.isCurrent {
+                        StageReactiveTrackIcon(
+                            audioFeatures: audioFeatures
+                        )
+                    } else {
+                        Image(
+                            systemName: isFocused
+                                ? "play.fill"
+                                : "music.note"
+                        )
+                        .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(
-                            card.isCurrent
-                                ? Color(red: 0.45, green: 0.94, blue: 1)
+                            isFocused
+                                ? Color(red: 0.48, green: 0.95, blue: 1)
                                 : Color.white.opacity(0.52)
                         )
+                    }
                 }
                 .frame(width: 44, height: 44)
 
@@ -372,10 +2466,10 @@ struct StageProgramRailView: View {
                         energyTrace(card.energy)
                     }
                 }
-            }
-            .padding(.horizontal, 14)
-            .frame(width: 294, height: 76)
-            .background {
+                }
+                .padding(.horizontal, 14)
+                .frame(width: 294, height: 76)
+                .background {
                 RoundedRectangle(cornerRadius: 23)
                     .fill(.ultraThinMaterial)
                     .overlay {
@@ -393,8 +2487,8 @@ struct StageProgramRailView: View {
                         )
                         .clipShape(RoundedRectangle(cornerRadius: 23))
                     }
-            }
-            .overlay {
+                }
+                .overlay {
                 RoundedRectangle(cornerRadius: 23)
                     .stroke(
                         card.isCurrent
@@ -402,21 +2496,45 @@ struct StageProgramRailView: View {
                             : Color.white.opacity(0.12),
                         lineWidth: card.isCurrent ? 1.2 : 0.8
                     )
-            }
-            .shadow(
+                }
+                .shadow(
                 color: card.isCurrent
                     ? Color.cyan.opacity(0.2)
                     : Color.black.opacity(0.42),
                 radius: card.isCurrent ? 24 : 13,
                 y: 7
+                )
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(
+                card.isCurrent
+                    ? "正在播放，\(card.title)，\(card.artist)"
+                    : "选择，\(card.title)，\(card.artist)"
             )
+            .accessibilityHint("立即播放这首歌曲")
+
+            if card.isCurrent, videos.boundAsset(for: card.trackID) != nil {
+                Button {
+                    videos.playBoundVideo(for: card.trackID)
+                } label: {
+                    Image(systemName: "video.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(
+                            videos.activeAssetID
+                                == videos.boundAsset(for: card.trackID)?.id
+                                && videos.isActive
+                                ? Color.cyan
+                                : Color.white.opacity(0.62)
+                        )
+                        .frame(width: 26, height: 26)
+                        .background(.ultraThinMaterial, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .offset(x: -9, y: 8)
+                .help("播放这首歌绑定的视频")
+                .accessibilityLabel("播放绑定视频")
+            }
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(
-            card.isCurrent
-                ? "正在播放，\(card.title)，\(card.artist)"
-                : "接下来，\(card.title)，\(card.artist)"
-        )
         .scaleEffect(
             isFocused ? card.scale + 0.055 : card.scale,
             anchor: .trailing
@@ -442,6 +2560,23 @@ struct StageProgramRailView: View {
         )
     }
 
+    private func scrollToActive(
+        using proxy: ScrollViewProxy,
+        animated: Bool
+    ) {
+        guard let activeSlotIndex = programStore.activeSlotIndex else {
+            return
+        }
+        let action = {
+            proxy.scrollTo(activeSlotIndex, anchor: .center)
+        }
+        if animated && !reduceMotion {
+            withAnimation(.easeOut(duration: 0.24), action)
+        } else {
+            action()
+        }
+    }
+
     private func energyTrace(_ energy: Double) -> some View {
         HStack(alignment: .center, spacing: 2) {
             ForEach(0 ..< 7, id: \.self) { index in
@@ -453,6 +2588,46 @@ struct StageProgramRailView: View {
             }
         }
         .frame(width: 28, height: 22)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct StageReactiveTrackIcon: View {
+    let audioFeatures: VisualAudioFeatureStore
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1 / 30)) { _ in
+            let audio = audioFeatures.current
+            HStack(alignment: .center, spacing: 2) {
+                ForEach(0 ..< 5, id: \.self) { index in
+                    let sample = abs(audio.waveform[index])
+                    let band = switch index {
+                    case 0, 1:
+                        audio.low
+                    case 2:
+                        audio.mid
+                    default:
+                        audio.high
+                    }
+                    let activity = max(
+                        sample,
+                        band * 0.72,
+                        audio.amplitude * 0.56
+                    )
+                    Capsule()
+                        .fill(Color(red: 0.48, green: 0.95, blue: 1))
+                        .frame(
+                            width: 2.4,
+                            height: 5 + CGFloat(activity) * 18
+                        )
+                }
+            }
+            .frame(width: 24, height: 25)
+            .animation(
+                .linear(duration: 1 / 30),
+                value: audio.amplitude
+            )
+        }
         .accessibilityHidden(true)
     }
 }

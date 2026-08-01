@@ -1,6 +1,57 @@
 import AppKit
+import Foundation
 import Testing
 @testable import GMGNRadio
+
+@Test
+func macOSAppBuildEnablesSigningForMicrophoneEntitlements() throws {
+    let macOSRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let projectYAML = try String(
+        contentsOf: macOSRoot.appendingPathComponent("project.yml"),
+        encoding: .utf8
+    )
+    let appTarget = try #require(
+        projectYAML.components(separatedBy: "  GMGNRadioTests:").first
+    )
+    let testTargetAndSchemes = try #require(
+        projectYAML.components(separatedBy: "  GMGNRadioTests:").dropFirst().first
+    )
+    let testTarget = try #require(
+        testTargetAndSchemes.components(separatedBy: "schemes:").first
+    )
+    let xcodeProject = try String(
+        contentsOf: macOSRoot
+            .appendingPathComponent("GMGNRadio.xcodeproj/project.pbxproj"),
+        encoding: .utf8
+    )
+
+    #expect(appTarget.contains("CODE_SIGNING_ALLOWED: YES"))
+    #expect(testTarget.contains("CODE_SIGNING_ALLOWED: YES"))
+    #expect(testTarget.contains("Apple Development"))
+    #expect(testTarget.contains("GENERATE_INFOPLIST_FILE: YES"))
+    #expect(projectYAML.contains("DEVELOPMENT_TEAM: 79J6W8QEMD"))
+    #expect(appTarget.contains("CODE_SIGN_STYLE: Manual"))
+    #expect(appTarget.contains("Apple Development"))
+    #expect(
+        xcodeProject.components(
+            separatedBy: "CODE_SIGNING_ALLOWED = YES;"
+        ).count >= 3
+    )
+    #expect(
+        xcodeProject.components(
+            separatedBy: "DEVELOPMENT_TEAM = 79J6W8QEMD;"
+        ).count >= 3
+    )
+    #expect(
+        xcodeProject.components(
+            separatedBy: "\"CODE_SIGN_IDENTITY[sdk=macosx*]\" = \"Apple Development\";"
+        ).count >= 3
+    )
+}
 
 @Test
 @MainActor
@@ -69,6 +120,77 @@ func stageWindowControllerIncludesAWindowModeButton() {
 
 @Test
 @MainActor
+func stageWindowIncludesAnExpandableVisualPicker() {
+    let controller = StageWindowController(
+        audioFeatures: VisualAudioFeatureStore()
+    )
+
+    controller.show()
+
+    let descendants = controller.window?.contentView?.descendants ?? []
+    let button = descendants
+        .compactMap { $0 as? NSButton }
+        .first { $0.identifier?.rawValue == "stage.visual-toggle" }
+    let picker = descendants.first {
+        $0.identifier?.rawValue == "stage.visual-picker"
+    }
+
+    #expect(button?.toolTip == "选择字幕、点阵与 MV")
+    #expect(picker?.isHidden == true)
+
+    button?.performClick(nil)
+
+    #expect(picker?.isHidden == false)
+
+    controller.close()
+}
+
+@Test
+@MainActor
+func stageComposesVideoBelowTheTransparentMetalParticles() throws {
+    let controller = StageWindowController(
+        audioFeatures: VisualAudioFeatureStore()
+    )
+
+    controller.show()
+    let descendants = controller.window?.contentView?.descendants ?? []
+    let video = try #require(descendants.first {
+        $0.identifier?.rawValue == "stage.video-background"
+    })
+    let particles = try #require(descendants.first {
+        $0.identifier?.rawValue == "stage.metal-particles"
+    })
+
+    #expect(video.layer?.zPosition == 0)
+    #expect(particles.layer?.zPosition == 1)
+    #expect(particles.layer?.isOpaque == false)
+    #expect(
+        video.layer?.sublayers?.contains {
+            $0.name == "stage.video-tone-overlay"
+        } == true
+    )
+
+    controller.close()
+}
+
+@Test
+func stagePointCloudPickerIncludesTheMineradioDerivedCorePresets() {
+    #expect(
+        StagePointCloudChoice.allCases.map(\.title) == [
+            "自动",
+            "流幕",
+            "星球",
+            "光带",
+            "封面",
+            "星河",
+            "滚筒",
+            "留白",
+        ]
+    )
+}
+
+@Test
+@MainActor
 func stagePlaybackButtonControlsAndReflectsTheRealPlayerState() {
     var toggleCount = 0
     let controller = StageWindowController(
@@ -128,20 +250,88 @@ func stageTransportActionsLiveInOneCompactControlIsland() {
     let nextButton = descendants.first {
         $0.identifier?.rawValue == "stage.next-track"
     }
+    let voiceButton = descendants.first {
+        $0.identifier?.rawValue == "stage.voice-toggle"
+    }
+    let visualButton = descendants.first {
+        $0.identifier?.rawValue == "stage.visual-toggle"
+    }
 
     #expect(controls != nil)
     #expect(programButton?.superview === controls)
     #expect(previousButton?.superview === controls)
     #expect(playbackButton?.superview === controls)
     #expect(nextButton?.superview === controls)
+    #expect(voiceButton?.superview === controls)
+    #expect(visualButton?.superview === controls)
     #expect(windowModeButton?.superview === controls)
     controls?.layoutSubtreeIfNeeded()
-    #expect(controls?.frame.size == CGSize(width: 232, height: 48))
+    #expect(controls?.frame.size == CGSize(width: 322, height: 48))
     #expect(programButton?.frame.size == CGSize(width: 44, height: 44))
     #expect(previousButton?.frame.size == CGSize(width: 44, height: 44))
     #expect(playbackButton?.frame.size == CGSize(width: 44, height: 44))
     #expect(nextButton?.frame.size == CGSize(width: 44, height: 44))
+    #expect(voiceButton?.frame.size == CGSize(width: 44, height: 44))
+    #expect(visualButton?.frame.size == CGSize(width: 44, height: 44))
     #expect(windowModeButton?.frame.size == CGSize(width: 44, height: 44))
+
+    controller.close()
+}
+
+@Test
+@MainActor
+func stageVoiceButtonStartsConversationAndReflectsLiveActivity() {
+    var toggleCount = 0
+    let controller = StageWindowController(
+        audioFeatures: VisualAudioFeatureStore(),
+        voiceState: .disconnected,
+        onToggleVoice: { toggleCount += 1 }
+    )
+
+    controller.show()
+
+    let button = controller.window?.contentView?
+        .descendants
+        .compactMap { $0 as? NSButton }
+        .first { $0.identifier?.rawValue == "stage.voice-toggle" }
+    #expect(button?.toolTip == "麦克风已关闭，点击开麦")
+
+    button?.performClick(nil)
+    #expect(toggleCount == 1)
+
+    controller.setVoiceState(.connecting)
+    #expect(button?.toolTip == "正在开启麦克风，点击取消")
+    #expect(button?.isEnabled == true)
+
+    controller.setVoiceState(.listening)
+    #expect(button?.toolTip == "麦克风已开启，DJ 正在听")
+
+    controller.setVoiceState(.speaking)
+    #expect(button?.toolTip == "DJ 正在说话")
+
+    controller.setVoiceState(.connected)
+    #expect(button?.toolTip == "麦克风已开启，点击关闭")
+    #expect((button?.layer?.backgroundColor?.alpha ?? 0) > 0.75)
+    #expect(
+        button?.layer?.animation(
+            forKey: "voice-active-pulse"
+        ) != nil
+    )
+
+    controller.setVoiceState(.disconnected)
+    #expect((button?.layer?.backgroundColor?.alpha ?? 1) < 0.1)
+    #expect(
+        button?.layer?.animation(
+            forKey: "voice-active-pulse"
+        ) == nil
+    )
+
+    controller.setVoiceState(.failed("连接 DJ 超时"))
+    #expect(button?.toolTip == "开麦失败：连接 DJ 超时；点击重试")
+    #expect(
+        button?.image?.accessibilityDescription
+            == "开麦失败：连接 DJ 超时；点击重试"
+    )
 
     controller.close()
 }
@@ -235,7 +425,7 @@ func stageProgramButtonRevealsAndHidesTheSpatialProgramRail() {
 
 @Test
 @MainActor
-func spatialProgramRailKeepsTheActiveTrackInsideAFiveCardWindow() {
+func spatialProgramRailKeepsTheCompleteScrollableProgram() {
     let plan = stageProgramPlan(trackCount: 8)
     let model = StageProgramRailModel(
         plan: plan,
@@ -248,12 +438,50 @@ func spatialProgramRailKeepsTheActiveTrackInsideAFiveCardWindow() {
         "stage-track-2",
         "stage-track-3",
         "stage-track-4",
+        "stage-track-5",
+        "stage-track-6",
+        "stage-track-7",
     ])
-    #expect(model.cards.map(\.relativeIndex) == [-2, -1, 0, 1, 2])
+    #expect(model.cards.map(\.slotIndex) == Array(0 ..< 8))
+    #expect(model.cards.map(\.relativeIndex) == [-2, -1, 0, 1, 2, 3, 4, 5])
     #expect(model.cards[2].isCurrent == true)
-    #expect(model.cards.map(\.depth) == [-144, -72, 0, -72, -144])
+    #expect(model.cards.map(\.depth) == [
+        -144, -72, 0, -72, -144, -144, -144, -144,
+    ])
     #expect(model.cards[2].opacity > model.cards[1].opacity)
     #expect(model.cards[2].opacity > model.cards[3].opacity)
+}
+
+@Test
+@MainActor
+func programRailUsesAPlaylistLevelBeforeItsTrackLevel() {
+    var playedSelections: [String] = []
+    var replanCount = 0
+    let selection = StageProgramRailSelection(
+        onPlay: { programID, slotIndex in
+            playedSelections.append("\(programID):\(slotIndex)")
+        },
+        onReplan: {
+            replanCount += 1
+        }
+    )
+
+    #expect(selection.route == .programs)
+    selection.openProgram("night-program")
+    #expect(selection.route == .tracks(programID: "night-program"))
+    #expect(playedSelections.isEmpty)
+
+    selection.activate(slotIndex: 4)
+
+    #expect(selection.selectedSlotIndex == 4)
+    #expect(playedSelections == ["night-program:4"])
+
+    selection.showPrograms()
+    #expect(selection.route == .programs)
+    #expect(selection.selectedProgramID == "night-program")
+
+    selection.replan()
+    #expect(replanCount == 1)
 }
 
 @MainActor

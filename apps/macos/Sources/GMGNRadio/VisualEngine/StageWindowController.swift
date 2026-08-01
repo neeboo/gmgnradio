@@ -1,45 +1,66 @@
 import AppKit
+@preconcurrency import AVFoundation
+import Combine
 import SwiftUI
 
 @MainActor
 final class StageWindowController: NSWindowController, NSWindowDelegate {
     private let audioFeatures: VisualAudioFeatureStore
+    private let artwork: StageArtworkStore
     private let audioMonitor: (any VisualAudioMonitoring)?
     private let presentation: StagePresentationModel
     private let visualDirections: StageVisualDirectionStore
+    private let videos: StageVideoPlaybackStore
     private let programStore: DJProgramStore
     private let lyrics: StageLyricsStore
     private let playbackPosition: @MainActor () -> TimeInterval
     private let onTogglePlayback: @MainActor () -> Void
+    private let onPlayProgramTrack: @MainActor (String, Int) -> Void
     private let onPreviousTrack: @MainActor () -> Void
     private let onNextTrack: @MainActor () -> Void
+    private let onReplanProgram: @MainActor () -> Void
+    private let onToggleVoice: @MainActor () -> Void
     private var playbackState: LocalMusicPlaybackState
+    private var voiceState: RealtimeVoiceConnectionState
     private weak var stageContentView: StageContentView?
 
     init(
         audioFeatures: VisualAudioFeatureStore,
+        artwork: StageArtworkStore = StageArtworkStore(),
         audioMonitor: (any VisualAudioMonitoring)? = nil,
         presentation: StagePresentationModel = StagePresentationModel(),
         visualDirections: StageVisualDirectionStore = StageVisualDirectionStore(),
+        videos: StageVideoPlaybackStore = StageVideoPlaybackStore(),
         programStore: DJProgramStore = .shared,
         lyrics: StageLyricsStore = .shared,
         playbackPosition: @escaping @MainActor () -> TimeInterval = { 0 },
         playbackState: LocalMusicPlaybackState = .idle,
+        voiceState: RealtimeVoiceConnectionState = .disconnected,
         onTogglePlayback: @escaping @MainActor () -> Void = {},
+        onPlayProgramTrack:
+            @escaping @MainActor (String, Int) -> Void = { _, _ in },
         onPreviousTrack: @escaping @MainActor () -> Void = {},
-        onNextTrack: @escaping @MainActor () -> Void = {}
+        onNextTrack: @escaping @MainActor () -> Void = {},
+        onReplanProgram: @escaping @MainActor () -> Void = {},
+        onToggleVoice: @escaping @MainActor () -> Void = {}
     ) {
         self.audioFeatures = audioFeatures
+        self.artwork = artwork
         self.audioMonitor = audioMonitor
         self.presentation = presentation
         self.visualDirections = visualDirections
+        self.videos = videos
         self.programStore = programStore
         self.lyrics = lyrics
         self.playbackPosition = playbackPosition
         self.playbackState = playbackState
+        self.voiceState = voiceState
         self.onTogglePlayback = onTogglePlayback
+        self.onPlayProgramTrack = onPlayProgramTrack
         self.onPreviousTrack = onPreviousTrack
         self.onNextTrack = onNextTrack
+        self.onReplanProgram = onReplanProgram
+        self.onToggleVoice = onToggleVoice
         super.init(window: nil)
     }
 
@@ -54,6 +75,11 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     func setPlaybackState(_ state: LocalMusicPlaybackState) {
         playbackState = state
         stageContentView?.setPlaybackState(state)
+    }
+
+    func setVoiceState(_ state: RealtimeVoiceConnectionState) {
+        voiceState = state
+        stageContentView?.setVoiceState(state)
     }
 
     func setProgramNavigation(
@@ -77,6 +103,7 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         NSApplication.shared.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
+        videos.resume()
         try? audioMonitor?.start()
     }
 
@@ -88,12 +115,14 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         window.close()
         self.window = nil
         stageContentView = nil
+        videos.pause()
         audioMonitor?.stop()
     }
 
     func windowWillClose(_ notification: Notification) {
         window = nil
         stageContentView = nil
+        videos.pause()
         audioMonitor?.stop()
     }
 
@@ -137,15 +166,21 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         let contentView = StageContentView(
             frame: CGRect(origin: .zero, size: contentSize),
             audioFeatures: audioFeatures,
+            artwork: artwork,
             presentation: presentation,
             visualDirections: visualDirections,
+            videos: videos,
             programStore: programStore,
             lyrics: lyrics,
             playbackPosition: playbackPosition,
             playbackState: playbackState,
+            voiceState: voiceState,
             onTogglePlayback: onTogglePlayback,
+            onPlayProgramTrack: onPlayProgramTrack,
             onPreviousTrack: onPreviousTrack,
             onNextTrack: onNextTrack,
+            onReplanProgram: onReplanProgram,
+            onToggleVoice: onToggleVoice,
             onToggleWindowMode: { [weak window] in
                 window?.toggleFullScreen(nil)
             }
@@ -161,21 +196,29 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
 private final class StageContentView: NSView {
     private let overlayState: StageOverlayState
     private var programRail: StageProgramRailHostingView!
+    private var visualPicker: StageVisualPickerHostingView!
     private var transportControls: StageTransportControlsView!
     private var isProgramRailVisible = false
+    private var isVisualPickerVisible = false
 
     init(
         frame: CGRect,
         audioFeatures: VisualAudioFeatureStore,
+        artwork: StageArtworkStore,
         presentation: StagePresentationModel,
         visualDirections: StageVisualDirectionStore,
+        videos: StageVideoPlaybackStore,
         programStore: DJProgramStore,
         lyrics: StageLyricsStore,
         playbackPosition: @escaping @MainActor () -> TimeInterval,
         playbackState: LocalMusicPlaybackState,
+        voiceState: RealtimeVoiceConnectionState,
         onTogglePlayback: @escaping @MainActor () -> Void,
+        onPlayProgramTrack: @escaping @MainActor (String, Int) -> Void,
         onPreviousTrack: @escaping @MainActor () -> Void,
         onNextTrack: @escaping @MainActor () -> Void,
+        onReplanProgram: @escaping @MainActor () -> Void,
+        onToggleVoice: @escaping @MainActor () -> Void,
         onToggleWindowMode: @escaping @MainActor () -> Void
     ) {
         overlayState = StageOverlayState()
@@ -184,6 +227,10 @@ private final class StageContentView: NSView {
         let programButton = StageProgramButton { [weak self] in
             self?.toggleProgramRail()
         }
+        let programSelection = StageProgramRailSelection(
+            onPlay: onPlayProgramTrack,
+            onReplan: onReplanProgram
+        )
         let playbackButton = StagePlaybackButton(
             state: playbackState,
             action: onTogglePlayback
@@ -196,6 +243,13 @@ private final class StageContentView: NSView {
             direction: .next,
             action: onNextTrack
         )
+        let voiceButton = StageVoiceButton(
+            state: voiceState,
+            action: onToggleVoice
+        )
+        let visualButton = StageVisualButton { [weak self] in
+            self?.toggleVisualPicker()
+        }
         let windowModeButton = StageWindowModeButton(
             mode: .windowed,
             action: onToggleWindowMode
@@ -205,18 +259,33 @@ private final class StageContentView: NSView {
             previousButton: previousButton,
             playbackButton: playbackButton,
             nextButton: nextButton,
+            voiceButton: voiceButton,
+            visualButton: visualButton,
             windowModeButton: windowModeButton
         )
         wantsLayer = true
 
+        let videoView = StageVideoPlayerView(frame: bounds, videos: videos)
+        videoView.identifier = NSUserInterfaceItemIdentifier(
+            "stage.video-background"
+        )
+        videoView.autoresizingMask = [.width, .height]
+        videoView.layer?.zPosition = 0
+        addSubview(videoView)
+
         let metalView = MetalStageView(
             frame: bounds,
             audioFeatures: audioFeatures,
-            visualDirections: visualDirections
+            artwork: artwork,
+            visualDirections: visualDirections,
+            videos: videos
         )
         metalView.autoresizingMask = [.width, .height]
+        metalView.identifier = NSUserInterfaceItemIdentifier(
+            "stage.metal-particles"
+        )
         metalView.wantsLayer = true
-        metalView.layer?.zPosition = 0
+        metalView.layer?.zPosition = 1
         addSubview(metalView)
 
         let overlay = StageOverlayHostingView(
@@ -224,6 +293,8 @@ private final class StageContentView: NSView {
                 presentation: presentation,
                 overlayState: overlayState,
                 lyrics: lyrics,
+                videos: videos,
+                audioFeatures: audioFeatures,
                 playbackPosition: playbackPosition
             )
         )
@@ -234,7 +305,12 @@ private final class StageContentView: NSView {
         addSubview(overlay)
 
         programRail = StageProgramRailHostingView(
-            rootView: StageProgramRailView(programStore: programStore)
+            rootView: StageProgramRailView(
+                programStore: programStore,
+                selection: programSelection,
+                videos: videos,
+                audioFeatures: audioFeatures
+            )
         )
         programRail.identifier = NSUserInterfaceItemIdentifier(
             "stage.program-rail"
@@ -244,6 +320,23 @@ private final class StageContentView: NSView {
         programRail.layer?.zPosition = 18
         programRail.isHidden = true
         addSubview(programRail)
+
+        visualPicker = StageVisualPickerHostingView(
+            rootView: StageVisualPickerView(
+                lyrics: lyrics,
+                visualDirections: visualDirections,
+                videos: videos,
+                programStore: programStore
+            )
+        )
+        visualPicker.identifier = NSUserInterfaceItemIdentifier(
+            "stage.visual-picker"
+        )
+        visualPicker.translatesAutoresizingMaskIntoConstraints = false
+        visualPicker.wantsLayer = true
+        visualPicker.layer?.zPosition = 19
+        visualPicker.isHidden = true
+        addSubview(visualPicker)
 
         transportControls.translatesAutoresizingMaskIntoConstraints = false
         transportControls.layer?.zPosition = 20
@@ -257,7 +350,7 @@ private final class StageContentView: NSView {
                 equalTo: bottomAnchor,
                 constant: -22
             ),
-            transportControls.widthAnchor.constraint(equalToConstant: 232),
+            transportControls.widthAnchor.constraint(equalToConstant: 322),
             transportControls.heightAnchor.constraint(equalToConstant: 48),
 
             programRail.trailingAnchor.constraint(
@@ -270,7 +363,18 @@ private final class StageContentView: NSView {
             ),
             programRail.topAnchor.constraint(greaterThanOrEqualTo: topAnchor),
             programRail.widthAnchor.constraint(equalToConstant: 350),
-            programRail.heightAnchor.constraint(equalToConstant: 430)
+            programRail.heightAnchor.constraint(equalToConstant: 430),
+
+            visualPicker.trailingAnchor.constraint(
+                equalTo: trailingAnchor,
+                constant: -18
+            ),
+            visualPicker.bottomAnchor.constraint(
+                equalTo: transportControls.topAnchor,
+                constant: -10
+            ),
+            visualPicker.widthAnchor.constraint(equalToConstant: 590),
+            visualPicker.heightAnchor.constraint(equalToConstant: 378)
         ])
     }
 
@@ -286,6 +390,10 @@ private final class StageContentView: NSView {
         transportControls.setPlaybackState(state)
     }
 
+    func setVoiceState(_ state: RealtimeVoiceConnectionState) {
+        transportControls.setVoiceState(state)
+    }
+
     func setProgramNavigation(
         canGoPrevious: Bool,
         canGoNext: Bool
@@ -298,9 +406,83 @@ private final class StageContentView: NSView {
 
     private func toggleProgramRail() {
         isProgramRailVisible.toggle()
+        if isProgramRailVisible {
+            isVisualPickerVisible = false
+            visualPicker.isHidden = true
+            transportControls.setVisualPickerExpanded(false)
+        }
         programRail.isHidden = !isProgramRailVisible
         transportControls.setProgramRailExpanded(isProgramRailVisible)
         overlayState.setProgramRailVisible(isProgramRailVisible)
+    }
+
+    private func toggleVisualPicker() {
+        isVisualPickerVisible.toggle()
+        if isVisualPickerVisible {
+            isProgramRailVisible = false
+            programRail.isHidden = true
+            transportControls.setProgramRailExpanded(false)
+            overlayState.setProgramRailVisible(false)
+        }
+        visualPicker.isHidden = !isVisualPickerVisible
+        transportControls.setVisualPickerExpanded(isVisualPickerVisible)
+    }
+}
+
+@MainActor
+private final class StageVideoPlayerView: NSView {
+    private let playerLayer: AVPlayerLayer
+    private let toneLayer = CAGradientLayer()
+    private var brightnessCancellable: AnyCancellable?
+
+    init(frame: CGRect, videos: StageVideoPlaybackStore) {
+        playerLayer = AVPlayerLayer(player: videos.player)
+        super.init(frame: frame)
+        wantsLayer = true
+        layer = CALayer()
+        layer?.backgroundColor = NSColor.black.cgColor
+
+        playerLayer.videoGravity = .resizeAspectFill
+        playerLayer.backgroundColor = NSColor.black.cgColor
+        playerLayer.isOpaque = true
+        playerLayer.opacity = videos.brightness
+        playerLayer.zPosition = 0
+        layer?.addSublayer(playerLayer)
+
+        toneLayer.name = "stage.video-tone-overlay"
+        toneLayer.colors = [
+            NSColor.black.withAlphaComponent(0.22).cgColor,
+            NSColor.black.withAlphaComponent(0.10).cgColor,
+            NSColor.black.withAlphaComponent(0.30).cgColor,
+        ]
+        toneLayer.locations = [0, 0.46, 1]
+        toneLayer.startPoint = CGPoint(x: 0.5, y: 1)
+        toneLayer.endPoint = CGPoint(x: 0.5, y: 0)
+        toneLayer.zPosition = 1
+        layer?.addSublayer(toneLayer)
+
+        brightnessCancellable = videos.$brightness
+            .removeDuplicates()
+            .sink { [weak playerLayer] brightness in
+                playerLayer?.opacity = brightness
+            }
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        playerLayer.frame = bounds
+        toneLayer.frame = bounds
+        CATransaction.commit()
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
     }
 }
 
@@ -317,11 +499,18 @@ private final class StageProgramRailHostingView:
 {}
 
 @MainActor
+private final class StageVisualPickerHostingView:
+    NSHostingView<StageVisualPickerView>
+{}
+
+@MainActor
 private final class StageTransportControlsView: NSVisualEffectView {
     private let programButton: StageProgramButton
     private let previousButton: StageTrackNavigationButton
     private let playbackButton: StagePlaybackButton
     private let nextButton: StageTrackNavigationButton
+    private let voiceButton: StageVoiceButton
+    private let visualButton: StageVisualButton
     private let windowModeButton: StageWindowModeButton
 
     init(
@@ -329,12 +518,16 @@ private final class StageTransportControlsView: NSVisualEffectView {
         previousButton: StageTrackNavigationButton,
         playbackButton: StagePlaybackButton,
         nextButton: StageTrackNavigationButton,
+        voiceButton: StageVoiceButton,
+        visualButton: StageVisualButton,
         windowModeButton: StageWindowModeButton
     ) {
         self.programButton = programButton
         self.previousButton = previousButton
         self.playbackButton = playbackButton
         self.nextButton = nextButton
+        self.voiceButton = voiceButton
+        self.visualButton = visualButton
         self.windowModeButton = windowModeButton
         super.init(frame: .zero)
 
@@ -351,7 +544,7 @@ private final class StageTransportControlsView: NSVisualEffectView {
         layer?.shadowRadius = 14
         layer?.shadowOffset = CGSize(width: 0, height: -4)
 
-        let dividers = (0 ..< 4).map { _ in
+        let dividers = (0 ..< 6).map { _ in
             let divider = NSView()
             divider.wantsLayer = true
             divider.layer?.backgroundColor = NSColor.white
@@ -366,6 +559,8 @@ private final class StageTransportControlsView: NSVisualEffectView {
                 previousButton,
                 playbackButton,
                 nextButton,
+                voiceButton,
+                visualButton,
                 windowModeButton
             ] + dividers
         ).forEach {
@@ -438,6 +633,38 @@ private final class StageTransportControlsView: NSVisualEffectView {
             dividers[3].widthAnchor.constraint(equalToConstant: 1),
             dividers[3].heightAnchor.constraint(equalToConstant: 18),
 
+            voiceButton.leadingAnchor.constraint(
+                equalTo: leadingAnchor,
+                constant: 184
+            ),
+            voiceButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            voiceButton.widthAnchor.constraint(equalToConstant: 44),
+            voiceButton.heightAnchor.constraint(equalToConstant: 44),
+
+            dividers[4].leadingAnchor.constraint(
+                equalTo: leadingAnchor,
+                constant: 228
+            ),
+            dividers[4].centerYAnchor.constraint(equalTo: centerYAnchor),
+            dividers[4].widthAnchor.constraint(equalToConstant: 1),
+            dividers[4].heightAnchor.constraint(equalToConstant: 18),
+
+            visualButton.leadingAnchor.constraint(
+                equalTo: leadingAnchor,
+                constant: 229
+            ),
+            visualButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            visualButton.widthAnchor.constraint(equalToConstant: 44),
+            visualButton.heightAnchor.constraint(equalToConstant: 44),
+
+            dividers[5].leadingAnchor.constraint(
+                equalTo: leadingAnchor,
+                constant: 273
+            ),
+            dividers[5].centerYAnchor.constraint(equalTo: centerYAnchor),
+            dividers[5].widthAnchor.constraint(equalToConstant: 1),
+            dividers[5].heightAnchor.constraint(equalToConstant: 18),
+
             windowModeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
             windowModeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             windowModeButton.widthAnchor.constraint(equalToConstant: 44),
@@ -451,6 +678,10 @@ private final class StageTransportControlsView: NSVisualEffectView {
 
     func setPlaybackState(_ state: LocalMusicPlaybackState) {
         playbackButton.setState(state)
+    }
+
+    func setVoiceState(_ state: RealtimeVoiceConnectionState) {
+        voiceButton.setState(state)
     }
 
     func setProgramNavigation(
@@ -467,6 +698,80 @@ private final class StageTransportControlsView: NSVisualEffectView {
 
     func setProgramRailExpanded(_ isExpanded: Bool) {
         programButton.setExpanded(isExpanded)
+    }
+
+    func setVisualPickerExpanded(_ isExpanded: Bool) {
+        visualButton.setExpanded(isExpanded)
+    }
+}
+
+@MainActor
+private final class StageVisualButton: NSButton {
+    private let handler: @MainActor () -> Void
+    private var isExpanded = false
+
+    override var alignmentRectInsets: NSEdgeInsets {
+        NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+    }
+
+    init(action: @escaping @MainActor () -> Void) {
+        handler = action
+        super.init(frame: .zero)
+        identifier = NSUserInterfaceItemIdentifier("stage.visual-toggle")
+        target = self
+        self.action = #selector(performAction)
+        isBordered = false
+        imagePosition = .imageOnly
+        focusRingType = .none
+        wantsLayer = true
+        layer?.cornerRadius = 20
+        updateContent()
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func setExpanded(_ isExpanded: Bool) {
+        self.isExpanded = isExpanded
+        updateContent()
+    }
+
+    @objc
+    private func performAction() {
+        handler()
+    }
+
+    private func updateContent() {
+        let label = isExpanded ? "收起视觉选择" : "选择字幕、点阵与 MV"
+        let configuration = NSImage.SymbolConfiguration(
+            pointSize: 14,
+            weight: .medium
+        )
+        image = NSImage(
+            systemSymbolName: isExpanded
+                ? "xmark"
+                : "circle.hexagongrid",
+            accessibilityDescription: label
+        )?.withSymbolConfiguration(configuration)
+        contentTintColor = isExpanded
+            ? NSColor(
+                calibratedRed: 0.34,
+                green: 0.9,
+                blue: 1,
+                alpha: 1
+            )
+            : NSColor.white.withAlphaComponent(0.72)
+        layer?.backgroundColor = isExpanded
+            ? NSColor(
+                calibratedRed: 0.04,
+                green: 0.3,
+                blue: 0.42,
+                alpha: 0.72
+            ).cgColor
+            : NSColor.clear.cgColor
+        toolTip = label
+        setAccessibilityLabel(label)
     }
 }
 
@@ -680,6 +985,7 @@ private final class StageTrackNavigationButton: NSButton {
 private final class StagePlaybackButton: NSButton {
     private let handler: @MainActor () -> Void
     private var pointerIsInside = false
+    private var playbackState = LocalMusicPlaybackState.idle
 
     override var alignmentRectInsets: NSEdgeInsets {
         NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
@@ -709,6 +1015,7 @@ private final class StagePlaybackButton: NSButton {
     }
 
     func setState(_ state: LocalMusicPlaybackState) {
+        playbackState = state
         let isPlaying = state == .playing
         let label = isPlaying ? "暂停" : "播放"
         let configuration = NSImage.SymbolConfiguration(
@@ -763,6 +1070,199 @@ private final class StagePlaybackButton: NSButton {
             blue: 1,
             alpha: backgroundOpacity
         ).cgColor
+    }
+}
+
+@MainActor
+private final class StageVoiceButton: NSButton {
+    private let handler: @MainActor () -> Void
+    private var pointerIsInside = false
+    private var voiceState = RealtimeVoiceConnectionState.disconnected
+
+    override var alignmentRectInsets: NSEdgeInsets {
+        NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+    }
+
+    init(
+        state: RealtimeVoiceConnectionState,
+        action: @escaping @MainActor () -> Void
+    ) {
+        handler = action
+        super.init(frame: .zero)
+        identifier = NSUserInterfaceItemIdentifier("stage.voice-toggle")
+        target = self
+        self.action = #selector(performAction)
+        isBordered = false
+        imagePosition = .imageOnly
+        focusRingType = .none
+        wantsLayer = true
+        layer?.cornerRadius = 20
+        setState(state)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func setState(_ state: RealtimeVoiceConnectionState) {
+        voiceState = state
+        let content: (symbol: String, label: String)
+        switch state {
+        case .disconnected:
+            content = ("mic.slash.fill", "麦克风已关闭，点击开麦")
+        case .connecting:
+            content = ("hourglass", "正在开启麦克风，点击取消")
+        case .connected:
+            content = ("mic.fill", "麦克风已开启，点击关闭")
+        case .listening:
+            content = ("waveform.circle.fill", "麦克风已开启，DJ 正在听")
+        case .speaking:
+            content = ("speaker.wave.2.fill", "DJ 正在说话")
+        case let .failed(message):
+            content = (
+                "exclamationmark.triangle.fill",
+                "开麦失败：\(message)；点击重试"
+            )
+        }
+        image = NSImage(
+            systemSymbolName: content.symbol,
+            accessibilityDescription: content.label
+        )?.withSymbolConfiguration(
+            NSImage.SymbolConfiguration(
+                pointSize: 14,
+                weight: .semibold
+            )
+        )
+        toolTip = content.label
+        setAccessibilityLabel(content.label)
+        isEnabled = true
+        updateAppearance()
+    }
+
+    override func updateTrackingAreas() {
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(
+            NSTrackingArea(
+                rect: .zero,
+                options: [
+                    .activeInKeyWindow,
+                    .inVisibleRect,
+                    .mouseEnteredAndExited,
+                ],
+                owner: self
+            )
+        )
+        super.updateTrackingAreas()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        pointerIsInside = true
+        updateAppearance()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        pointerIsInside = false
+        updateAppearance()
+    }
+
+    @objc
+    private func performAction() {
+        handler()
+    }
+
+    private func updateAppearance() {
+        let tint: NSColor
+        let background: NSColor
+        let isLive: Bool
+        switch voiceState {
+        case .disconnected:
+            isLive = false
+            tint = NSColor.white.withAlphaComponent(
+                pointerIsInside ? 0.9 : 0.56
+            )
+            background = NSColor.white.withAlphaComponent(
+                pointerIsInside ? 0.1 : 0
+            )
+        case .connecting:
+            isLive = false
+            tint = NSColor.systemOrange
+            background = NSColor.systemOrange.withAlphaComponent(
+                pointerIsInside ? 0.24 : 0.14
+            )
+        case .connected, .listening:
+            isLive = true
+            tint = NSColor(
+                calibratedWhite: 0.05,
+                alpha: 0.96
+            )
+            background = NSColor(
+                calibratedRed: 0.38,
+                green: 0.92,
+                blue: 1,
+                alpha: pointerIsInside ? 1 : 0.92
+            )
+        case .speaking:
+            isLive = true
+            tint = NSColor(
+                calibratedWhite: 0.04,
+                alpha: 0.96
+            )
+            background = NSColor(
+                calibratedRed: 0.58,
+                green: 0.8,
+                blue: 1,
+                alpha: pointerIsInside ? 1 : 0.92
+            )
+        case .failed:
+            isLive = false
+            tint = NSColor.systemRed
+            background = NSColor.systemRed.withAlphaComponent(
+                pointerIsInside ? 0.24 : 0.14
+            )
+        }
+        contentTintColor = tint
+        layer?.backgroundColor = background.cgColor
+        layer?.borderWidth = isLive ? 1.5 : 0
+        layer?.borderColor = isLive
+            ? NSColor.white.withAlphaComponent(0.72).cgColor
+            : nil
+        updateLivePulse(isLive)
+        alphaValue = 1
+    }
+
+    private func updateLivePulse(_ active: Bool) {
+        guard let layer else {
+            return
+        }
+        guard active else {
+            layer.removeAnimation(forKey: "voice-active-pulse")
+            layer.shadowOpacity = 0
+            return
+        }
+        layer.shadowColor = NSColor(
+            calibratedRed: 0.38,
+            green: 0.92,
+            blue: 1,
+            alpha: 1
+        ).cgColor
+        layer.shadowRadius = 9
+        layer.shadowOffset = .zero
+        layer.shadowOpacity = 0.58
+        guard
+            layer.animation(forKey: "voice-active-pulse") == nil
+        else {
+            return
+        }
+        let pulse = CABasicAnimation(keyPath: "shadowOpacity")
+        pulse.fromValue = 0.24
+        pulse.toValue = 0.82
+        pulse.duration = 1.1
+        pulse.autoreverses = true
+        pulse.repeatCount = .infinity
+        pulse.timingFunction = CAMediaTimingFunction(
+            name: .easeInEaseOut
+        )
+        layer.add(pulse, forKey: "voice-active-pulse")
     }
 }
 

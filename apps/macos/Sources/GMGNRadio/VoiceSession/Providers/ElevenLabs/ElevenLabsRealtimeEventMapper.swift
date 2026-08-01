@@ -2,6 +2,7 @@ import Foundation
 
 struct ElevenLabsRealtimeEventMapper: Sendable {
     private var agentAudioActive = false
+    private var userSpeechActive = false
 
     mutating func map(_ event: ProviderRealtimeEvent) -> [RealtimeDJEvent] {
         switch event.type {
@@ -13,10 +14,15 @@ struct ElevenLabsRealtimeEventMapper: Sendable {
             return [.connectionChanged(.recovering)]
         case "connection.disconnected":
             agentAudioActive = false
+            userSpeechActive = false
             return [.connectionChanged(.disconnected)]
+        case "audio.user.vad":
+            return userVADEvents(from: event)
         case "speech.user_started":
+            userSpeechActive = true
             return [.userSpeechStarted]
         case "speech.user_finished":
+            userSpeechActive = false
             return [.userSpeechFinished]
         case "transcript.user_final":
             return event.text.map { [.userTranscriptFinal($0)] } ?? []
@@ -48,6 +54,27 @@ struct ElevenLabsRealtimeEventMapper: Sendable {
         default:
             return []
         }
+    }
+
+    private mutating func userVADEvents(
+        from event: ProviderRealtimeEvent
+    ) -> [RealtimeDJEvent] {
+        guard let rms = event.rms else {
+            return []
+        }
+        let level = RealtimeDJAudioLevel(
+            rms: rms,
+            peak: event.peak ?? rms
+        )
+        var events: [RealtimeDJEvent] = [.userAudioLevel(level)]
+        if !userSpeechActive, level.rms >= 0.58 {
+            userSpeechActive = true
+            events.append(.userSpeechStarted)
+        } else if userSpeechActive, level.rms <= 0.32 {
+            userSpeechActive = false
+            events.append(.userSpeechFinished)
+        }
+        return events
     }
 
     private func toolCall(

@@ -3,6 +3,29 @@ import Testing
 @testable import GMGNRadio
 
 @Test
+func openingTheMicrophoneDoesNotCreateAPlaybackEngine() {
+    #expect(
+        RealtimeVoicePlaybackAudioRoute.resolve(
+            hasExistingPlaybackAudio: false
+        ) == .connectWithoutPlaybackAudio
+    )
+    #expect(
+        RealtimeVoicePlaybackAudioRoute.resolve(
+            hasExistingPlaybackAudio: true
+        ) == .reuseExistingPlaybackAudio
+    )
+}
+
+@Test
+func realtimeVoiceConnectionHasAFiniteDeadline() async {
+    await #expect(throws: RealtimeVoiceConnectionError.timedOut) {
+        try await RealtimeVoiceConnectionDeadline(
+            duration: .milliseconds(1)
+        ).wait()
+    }
+}
+
+@Test
 func providersExposeTheirVerifiedRealtimeCapabilities() {
     let bailian = RealtimeDJProvider.bailian.capabilities
     let doubao = RealtimeDJProvider.doubao.capabilities
@@ -98,4 +121,34 @@ func realtimeContextCarriesTrackFactsForTheNextHostBreak() {
     #expect(context.hostHint == hint)
     #expect(context.hostHint?.nextTrack?.title == "Night Drive")
     #expect(context.hostHint?.maxSentenceCount == 1)
+}
+
+@Test
+func realtimeContextAdvertisesTheCurrentAgentControlSurface() {
+    let control = DJAgentRadioState(
+        takeoverEnabled: true,
+        playbackState: "playing",
+        activeTrackID: "current",
+        activeSlotIndex: 0,
+        program: [
+            DJAgentProgramTrack(
+                index: 0,
+                id: "current",
+                title: "Blue Hour",
+                artist: "Example Artist"
+            ),
+        ]
+    )
+    let context = RealtimeDJContext(
+        playback: PlaybackContext(),
+        showPlanSummary: "深夜工作节目",
+        agentControl: control
+    )
+
+    #expect(context.agentControl == control)
+    #expect(context.agentControl?.takeoverEnabled == true)
+    #expect(
+        context.agentControl?.capabilities
+            .contains { $0.name == "play_program_track" } == true
+    )
 }

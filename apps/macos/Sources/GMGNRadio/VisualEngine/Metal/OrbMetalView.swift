@@ -52,4 +52,8 @@ final class OrbMetalView: MTKView {
     func setState(_ state: DJState) {
         orbRenderer.setState(state)
     }
+
+    func setVoiceLevel(_ level: Float) {
+        orbRenderer.setVoiceLevel(level)
+    }
 }

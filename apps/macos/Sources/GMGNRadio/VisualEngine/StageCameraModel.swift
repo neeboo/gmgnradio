@@ -50,13 +50,25 @@ struct StageCameraModel: Sendable {
         isDragging = false
     }
 
-    mutating func step(deltaTime: Float) {
+    mutating func enterAlbumReliefView() {
+        frame.yaw = 0
+        frame.pitch = 0.08
+        frame.yawVelocity = 0
+        frame.pitchVelocity = 0
+        isDragging = false
+    }
+
+    mutating func step(
+        deltaTime: Float,
+        autoOrbitEnabled: Bool = true
+    ) {
         let delta = min(max(deltaTime, 0), 0.1)
         guard delta > 0, !isDragging else {
             return
         }
 
-        frame.yaw += (Self.autoOrbitSpeed + frame.yawVelocity) * delta
+        let autoOrbit = autoOrbitEnabled ? Self.autoOrbitSpeed : 0
+        frame.yaw += (autoOrbit + frame.yawVelocity) * delta
         frame.pitch = min(
             max(
                 frame.pitch + frame.pitchVelocity * delta,
@@ -70,4 +82,3 @@ struct StageCameraModel: Sendable {
         frame.pitchVelocity *= decay
     }
 }
-

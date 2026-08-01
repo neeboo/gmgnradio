@@ -7,7 +7,7 @@ settings:
     SWIFT_VERSION: "6.0"
     SWIFT_STRICT_CONCURRENCY: complete
     MACOSX_DEPLOYMENT_TARGET: "26.0"
-    DEVELOPMENT_TEAM: ""
+    DEVELOPMENT_TEAM: 79J6W8QEMD
 packages:
   ElevenLabs:
     url: https://github.com/elevenlabs/elevenlabs-swift-sdk.git
@@ -21,6 +21,8 @@ targets:
     platform: macOS
     sources:
       - Sources/GMGNRadio
+      - path: Resources/AppIcon.icns
+        buildPhase: resources
     dependencies:
       - package: ElevenLabs
       - package: LiveKit
@@ -31,7 +33,10 @@ targets:
         PRODUCT_NAME: gmgn radio
         INFOPLIST_FILE: Resources/Info.plist
         CODE_SIGN_ENTITLEMENTS: Resources/GMGNRadio.entitlements
-        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_ALLOWED: YES
+        CODE_SIGN_STYLE: Manual
+        "CODE_SIGN_IDENTITY[sdk=macosx*]": Apple Development
+        DEVELOPMENT_TEAM: 79J6W8QEMD
         ENABLE_HARDENED_RUNTIME: YES
   GMGNRadioTests:
     type: bundle.unit-test
@@ -43,7 +48,11 @@ targets:
     settings:
       base:
         BUNDLE_LOADER: "$(TEST_HOST)"
-        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_ALLOWED: YES
+        CODE_SIGN_STYLE: Manual
+        "CODE_SIGN_IDENTITY[sdk=macosx*]": Apple Development
+        DEVELOPMENT_TEAM: 79J6W8QEMD
+        GENERATE_INFOPLIST_FILE: YES
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/gmgn radio.app/Contents/MacOS/gmgn radio"
 schemes:
   GMGNRadio:

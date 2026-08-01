@@ -318,6 +318,12 @@ private struct QQTrackDTO: Decodable {
 
     struct Album: Decodable {
         let name: String?
+        let mid: String?
+
+        init(name: String?, mid: String? = nil) {
+            self.name = name
+            self.mid = mid
+        }
     }
 
     struct FileInfo: Decodable {
@@ -395,7 +401,12 @@ private struct QQTrackDTO: Decodable {
             energy: 0.5,
             moodTags: [],
             genres: [],
-            releaseYear: nil
+            releaseYear: nil,
+            artworkURL: album?.mid.flatMap {
+                URL(
+                    string: "https://y.qq.com/music/photo_new/T002R500x500M000\($0).jpg"
+                )
+            }
         )
     }
 }

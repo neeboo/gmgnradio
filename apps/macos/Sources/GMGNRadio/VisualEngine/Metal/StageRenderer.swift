@@ -6,18 +6,30 @@ enum StageRendererError: Error {
     case missingShaderFunction(String)
     case missingVertexBuffer
     case missingDepthState
+    case missingArtworkTexture
 }
 
 @MainActor
 final class StageRenderer: NSObject, MTKViewDelegate {
     private let commandQueue: MTLCommandQueue
     private let backgroundPipeline: MTLRenderPipelineState
+    private let ambientParticlePipeline: MTLRenderPipelineState
+    private let particleBloomPipeline: MTLRenderPipelineState
     private let particlePipeline: MTLRenderPipelineState
     private let depthState: MTLDepthStencilState
     private let vertexBuffer: MTLBuffer
     private let vertexCount: Int
+    private let ambientVertexBuffer: MTLBuffer
+    private let ambientVertexCount: Int
     private let audioFeatures: VisualAudioFeatureStore
+    private let artwork: StageArtworkStore
     private let visualDirections: StageVisualDirectionStore
+    private let videos: StageVideoPlaybackStore
+    private let textureLoader: MTKTextureLoader
+    private let fallbackArtworkTexture: MTLTexture
+    private var artworkTexture: MTLTexture
+    private var observedArtworkRevision: UInt64 = .max
+    private var hasArtwork = false
     private let clock = ContinuousClock()
     private let startedAt: ContinuousClock.Instant
     private var previousFrameAt: ContinuousClock.Instant
@@ -25,20 +37,48 @@ final class StageRenderer: NSObject, MTKViewDelegate {
     private let presetTimeline = StageVisualPresetTimeline()
     private var hasObservedVisualDirection = false
     private var observedVisualMood: StageVisualMood?
+    private var observedVisualPalette: StageVisualPalette?
+    private var observedPointCloudChoice: StagePointCloudChoice = .automatic
     private var presetTransitionStartedAt: Float?
     private var presetTransitionOrigin = SIMD3<Float>(1, 0, 0)
     private var displayedPresetWeights = SIMD3<Float>(1, 0, 0)
+    private var compositionTransitionOrigin: Float = 0
+    private var displayedComposition: Float = 0
+    private var paletteTransitionOrigin = StageVisualPalette.amber
+    private var displayedPalette = StageVisualPalette.amber
+    private var rhythmResponse = StageRhythmResponse()
 
     init(
         device: MTLDevice,
         colorPixelFormat: MTLPixelFormat,
         depthPixelFormat: MTLPixelFormat,
         audioFeatures: VisualAudioFeatureStore,
-        visualDirections: StageVisualDirectionStore
+        artwork: StageArtworkStore,
+        visualDirections: StageVisualDirectionStore,
+        videos: StageVideoPlaybackStore
     ) throws {
         guard let commandQueue = device.makeCommandQueue() else {
             throw StageRendererError.missingCommandQueue
         }
+        let artworkDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm,
+            width: 1,
+            height: 1,
+            mipmapped: false
+        )
+        artworkDescriptor.usage = [.shaderRead]
+        guard let fallbackArtworkTexture = device.makeTexture(
+            descriptor: artworkDescriptor
+        ) else {
+            throw StageRendererError.missingArtworkTexture
+        }
+        var fallbackPixel: UInt32 = 0xFFFF_4010
+        fallbackArtworkTexture.replace(
+            region: MTLRegionMake2D(0, 0, 1, 1),
+            mipmapLevel: 0,
+            withBytes: &fallbackPixel,
+            bytesPerRow: MemoryLayout<UInt32>.stride
+        )
         guard let library = device.makeDefaultLibrary() else {
             throw StageRendererError.missingShaderLibrary
         }
@@ -51,6 +91,26 @@ final class StageRenderer: NSObject, MTKViewDelegate {
             colorPixelFormat: colorPixelFormat,
             depthPixelFormat: .invalid,
             blending: false
+        )
+        ambientParticlePipeline = try Self.makePipeline(
+            device: device,
+            library: library,
+            vertexFunction: "stageAmbientParticleVertex",
+            fragmentFunction: "stageAmbientParticleFragment",
+            colorPixelFormat: colorPixelFormat,
+            depthPixelFormat: depthPixelFormat,
+            blending: true,
+            additive: true
+        )
+        particleBloomPipeline = try Self.makePipeline(
+            device: device,
+            library: library,
+            vertexFunction: "stageParticleVertex",
+            fragmentFunction: "stageParticleBloomFragment",
+            colorPixelFormat: colorPixelFormat,
+            depthPixelFormat: depthPixelFormat,
+            blending: true,
+            additive: true
         )
         particlePipeline = try Self.makePipeline(
             device: device,
@@ -71,7 +131,10 @@ final class StageRenderer: NSObject, MTKViewDelegate {
             throw StageRendererError.missingDepthState
         }
 
-        let geometry = StageParticleGeometry.djTotem(seed: 0x474D474E)
+        let geometry = StageParticleGeometry.albumCanvas(
+            grid: 144,
+            seed: 0x474D474E
+        )
         let buffer = geometry.vertices.withUnsafeBytes { bytes in
             guard let baseAddress = bytes.baseAddress else {
                 return nil as MTLBuffer?
@@ -87,12 +150,38 @@ final class StageRenderer: NSObject, MTKViewDelegate {
         }
         buffer.label = "gmgn radio DJ particle geometry"
 
+        let ambientGeometry = StageParticleGeometry.ambientField(
+            count: 1_800,
+            seed: 0x4D564658
+        )
+        let ambientBuffer = ambientGeometry.vertices.withUnsafeBytes { bytes in
+            guard let baseAddress = bytes.baseAddress else {
+                return nil as MTLBuffer?
+            }
+            return device.makeBuffer(
+                bytes: baseAddress,
+                length: bytes.count,
+                options: .storageModeShared
+            )
+        }
+        guard let ambientBuffer else {
+            throw StageRendererError.missingVertexBuffer
+        }
+        ambientBuffer.label = "gmgn radio layered ambient particles"
+
         self.commandQueue = commandQueue
         self.depthState = depthState
         vertexBuffer = buffer
         vertexCount = geometry.vertices.count
+        ambientVertexBuffer = ambientBuffer
+        ambientVertexCount = ambientGeometry.vertices.count
         self.audioFeatures = audioFeatures
+        self.artwork = artwork
         self.visualDirections = visualDirections
+        self.videos = videos
+        textureLoader = MTKTextureLoader(device: device)
+        self.fallbackArtworkTexture = fallbackArtworkTexture
+        artworkTexture = fallbackArtworkTexture
         startedAt = clock.now
         previousFrameAt = startedAt
         super.init()
@@ -120,7 +209,11 @@ final class StageRenderer: NSObject, MTKViewDelegate {
         let now = clock.now
         let deltaTime = Self.seconds(previousFrameAt.duration(to: now))
         previousFrameAt = now
-        camera.step(deltaTime: deltaTime)
+        camera.step(
+            deltaTime: deltaTime,
+            autoOrbitEnabled:
+                visualDirections.currentPointCloudChoice.allowsAutoOrbit
+        )
 
         guard
             let drawable = view.currentDrawable,
@@ -134,18 +227,36 @@ final class StageRenderer: NSObject, MTKViewDelegate {
         }
 
         let elapsed = Self.seconds(startedAt.duration(to: now))
-        let presetWeights = resolvePresetWeights(at: elapsed)
+        let presetFrame = resolvePresetFrame(at: elapsed)
+        let presetWeights = presetFrame.weights
+        refreshArtworkTexture()
+        let reactiveAudio = rhythmResponse.update(
+            audio: audioFeatures.current,
+            deltaTime: deltaTime
+        )
+        let compositing: StageCompositingProfile = videos.isActive
+            ? .video
+            : .standard
+        let pointLayers = StagePointLayerPolicy.resolve(
+            choice: visualDirections.currentPointCloudChoice,
+            videoActive: videos.isActive
+        )
         var uniforms = StageUniforms.make(
             camera: camera.frame,
-            audio: audioFeatures.current,
+            audio: reactiveAudio,
             time: elapsed,
             viewport: SIMD2<Float>(
                 Float(view.drawableSize.width),
                 Float(view.drawableSize.height)
             ),
             presetWeights: presetWeights,
-            visualIntensity: visualDirections.currentIntensity
+            composition: presetFrame.composition,
+            palette: displayedPalette,
+            visualIntensity: visualDirections.currentIntensity,
+            compositing: compositing,
+            pointLayers: pointLayers
         )
+        uniforms.viewportAndMotion.w = hasArtwork ? 1 : 0
 
         encoder.label = "gmgn radio 360 stage"
         encoder.setRenderPipelineState(backgroundPipeline)
@@ -160,14 +271,37 @@ final class StageRenderer: NSObject, MTKViewDelegate {
             vertexCount: 3
         )
 
-        encoder.setRenderPipelineState(particlePipeline)
-        encoder.setDepthStencilState(depthState)
+        encoder.setRenderPipelineState(ambientParticlePipeline)
+        encoder.setDepthStencilState(nil)
+        encoder.setVertexBuffer(ambientVertexBuffer, offset: 0, index: 0)
+        encoder.setVertexBytes(
+            &uniforms,
+            length: MemoryLayout<StageUniforms>.stride,
+            index: 1
+        )
+        encoder.drawPrimitives(
+            type: .point,
+            vertexStart: 0,
+            vertexCount: ambientVertexCount
+        )
+
         encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
         encoder.setVertexBytes(
             &uniforms,
             length: MemoryLayout<StageUniforms>.stride,
             index: 1
         )
+        encoder.setVertexTexture(artworkTexture, index: 0)
+        encoder.setRenderPipelineState(particleBloomPipeline)
+        encoder.setDepthStencilState(nil)
+        encoder.drawPrimitives(
+            type: .point,
+            vertexStart: 0,
+            vertexCount: vertexCount
+        )
+
+        encoder.setRenderPipelineState(particlePipeline)
+        encoder.setDepthStencilState(depthState)
         encoder.drawPrimitives(
             type: .point,
             vertexStart: 0,
@@ -179,6 +313,34 @@ final class StageRenderer: NSObject, MTKViewDelegate {
         commandBuffer.commit()
     }
 
+    private func refreshArtworkTexture() {
+        guard artwork.revision != observedArtworkRevision else {
+            return
+        }
+        observedArtworkRevision = artwork.revision
+
+        guard let image = artwork.image else {
+            artworkTexture = fallbackArtworkTexture
+            hasArtwork = false
+            return
+        }
+        do {
+            artworkTexture = try textureLoader.newTexture(
+                cgImage: image,
+                options: [
+                    .SRGB: false,
+                    .textureUsage: NSNumber(
+                        value: MTLTextureUsage.shaderRead.rawValue
+                    )
+                ]
+            )
+            hasArtwork = true
+        } catch {
+            artworkTexture = fallbackArtworkTexture
+            hasArtwork = false
+        }
+    }
+
     private static func makePipeline(
         device: MTLDevice,
         library: MTLLibrary,
@@ -186,7 +348,8 @@ final class StageRenderer: NSObject, MTKViewDelegate {
         fragmentFunction: String,
         colorPixelFormat: MTLPixelFormat,
         depthPixelFormat: MTLPixelFormat,
-        blending: Bool
+        blending: Bool,
+        additive: Bool = false
     ) throws -> MTLRenderPipelineState {
         guard let vertex = library.makeFunction(name: vertexFunction) else {
             throw StageRendererError.missingShaderFunction(vertexFunction)
@@ -205,40 +368,82 @@ final class StageRenderer: NSObject, MTKViewDelegate {
         if blending, let attachment = descriptor.colorAttachments[0] {
             attachment.isBlendingEnabled = true
             attachment.sourceRGBBlendFactor = .sourceAlpha
-            attachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            attachment.destinationRGBBlendFactor = additive
+                ? .one
+                : .oneMinusSourceAlpha
             attachment.sourceAlphaBlendFactor = .one
-            attachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            attachment.destinationAlphaBlendFactor = additive
+                ? .one
+                : .oneMinusSourceAlpha
         }
 
         return try device.makeRenderPipelineState(descriptor: descriptor)
     }
 
-    private func resolvePresetWeights(at time: Float) -> SIMD3<Float> {
-        let automaticWeights = presetTimeline.sample(at: time).weights
+    private func resolvePresetFrame(
+        at time: Float
+    ) -> StageVisualPresetFrame {
+        let automaticFrame = presetTimeline.sample(at: time)
+        let automaticWeights = automaticFrame.weights
+        let automaticPalette = StageVisualPalette.blended(
+            for: automaticWeights
+        )
         let requestedMood = visualDirections.currentMood
+        let requestedPalette = visualDirections.currentPalette
+        let requestedPointCloudChoice =
+            visualDirections.currentPointCloudChoice
+        let directedFrame = requestedMood.map(
+            StageVisualPresetFrame.forMood
+        ) ?? automaticFrame
+        let resolvedFrame = requestedPointCloudChoice.resolvedPresetFrame(
+            automatic: directedFrame
+        )
 
         if !hasObservedVisualDirection {
             hasObservedVisualDirection = true
             observedVisualMood = requestedMood
-            displayedPresetWeights = requestedMood.map {
-                StageVisualPresetFrame.forMood($0).weights
-            } ?? automaticWeights
-            return displayedPresetWeights
+            observedVisualPalette = requestedPalette
+            observedPointCloudChoice = requestedPointCloudChoice
+            let initialFrame = resolvedFrame
+            displayedPresetWeights = initialFrame.weights
+            displayedComposition = initialFrame.composition
+            displayedPalette = requestedPalette ?? automaticPalette
+            return StageVisualPresetFrame(
+                weights: displayedPresetWeights,
+                composition: displayedComposition
+            )
         }
 
-        if requestedMood != observedVisualMood {
+        if requestedMood != observedVisualMood
+            || requestedPalette != observedVisualPalette
+            || requestedPointCloudChoice != observedPointCloudChoice
+        {
+            if requestedPointCloudChoice == .albumRelief,
+               requestedPointCloudChoice != observedPointCloudChoice
+            {
+                camera.enterAlbumReliefView()
+            }
             observedVisualMood = requestedMood
+            observedVisualPalette = requestedPalette
+            observedPointCloudChoice = requestedPointCloudChoice
             presetTransitionOrigin = displayedPresetWeights
+            compositionTransitionOrigin = displayedComposition
+            paletteTransitionOrigin = displayedPalette
             presetTransitionStartedAt = time
         }
 
-        let targetWeights = requestedMood.map {
-            StageVisualPresetFrame.forMood($0).weights
-        } ?? automaticWeights
+        let targetFrame = resolvedFrame
+        let targetWeights = targetFrame.weights
+        let targetPalette = requestedPalette ?? automaticPalette
 
         guard let transitionStartedAt = presetTransitionStartedAt else {
             displayedPresetWeights = targetWeights
-            return displayedPresetWeights
+            displayedComposition = targetFrame.composition
+            displayedPalette = targetPalette
+            return StageVisualPresetFrame(
+                weights: displayedPresetWeights,
+                composition: displayedComposition
+            )
         }
 
         let requestedTransitionDuration = Float(
@@ -252,10 +457,21 @@ final class StageRenderer: NSObject, MTKViewDelegate {
             * (3 - 2 * linearProgress)
         displayedPresetWeights = presetTransitionOrigin
             + (targetWeights - presetTransitionOrigin) * smoothProgress
+        displayedComposition = compositionTransitionOrigin
+            + (targetFrame.composition - compositionTransitionOrigin)
+                * smoothProgress
+        displayedPalette = StageVisualPalette.interpolated(
+            from: paletteTransitionOrigin,
+            to: targetPalette,
+            progress: smoothProgress
+        )
         if linearProgress >= 1 {
             presetTransitionStartedAt = nil
         }
-        return displayedPresetWeights
+        return StageVisualPresetFrame(
+            weights: displayedPresetWeights,
+            composition: displayedComposition
+        )
     }
 
     private static func seconds(_ duration: Duration) -> Float {

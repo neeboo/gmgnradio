@@ -62,7 +62,8 @@ final class InterruptionCoordinator {
             audio.stopDJVoice()
             audio.setDJSpeaking(false)
             updateState(.failed)
-        case .userTranscriptDelta,
+        case .userAudioLevel,
+             .userTranscriptDelta,
              .userTranscriptFinal,
              .agentAudioLevel,
              .agentTranscriptDelta,

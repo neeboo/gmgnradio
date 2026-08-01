@@ -9,10 +9,20 @@ struct GMGNSettingsView: View {
     }
 
     @State private var page = Page.presence
-    private let startAIProgram: () -> Void
+    private let connectRealtimeVoice:
+        (RealtimeVoiceConfiguration) -> Void
+    private let disconnectRealtimeVoice: () -> Void
+    private let agentConfigurationChanged: () -> Void
 
-    init(startAIProgram: @escaping () -> Void = {}) {
-        self.startAIProgram = startAIProgram
+    init(
+        connectRealtimeVoice:
+            @escaping (RealtimeVoiceConfiguration) -> Void = { _ in },
+        disconnectRealtimeVoice: @escaping () -> Void = {},
+        agentConfigurationChanged: @escaping () -> Void = {}
+    ) {
+        self.connectRealtimeVoice = connectRealtimeVoice
+        self.disconnectRealtimeVoice = disconnectRealtimeVoice
+        self.agentConfigurationChanged = agentConfigurationChanged
     }
 
     var body: some View {
@@ -36,7 +46,10 @@ struct GMGNSettingsView: View {
                     MusicAccountsView()
                 case .agent:
                     AgentSettingsView(
-                        startAIProgram: startAIProgram
+                        connectRealtimeVoice: connectRealtimeVoice,
+                        disconnectRealtimeVoice: disconnectRealtimeVoice,
+                        agentConfigurationChanged:
+                            agentConfigurationChanged
                     )
                 }
             }

@@ -13,6 +13,36 @@ func idleStageCameraCompletesAFullOrbit() {
 }
 
 @Test
+func albumReliefCameraStaysStillUntilTheUserDragsIt() {
+    var camera = StageCameraModel()
+    let initialYaw = camera.frame.yaw
+
+    for _ in 0 ..< 600 {
+        camera.step(
+            deltaTime: 1.0 / 60.0,
+            autoOrbitEnabled: false
+        )
+    }
+
+    #expect(camera.frame.yaw == initialYaw)
+}
+
+@Test
+func enteringAlbumReliefReturnsTheCameraToAStableFrontView() {
+    var camera = StageCameraModel()
+    camera.beginDrag()
+    camera.drag(deltaX: 240, deltaY: -80)
+    camera.endDrag()
+
+    camera.enterAlbumReliefView()
+
+    #expect(camera.frame.yaw == 0)
+    #expect(camera.frame.pitch == 0.08)
+    #expect(camera.frame.yawVelocity == 0)
+    #expect(camera.frame.pitchVelocity == 0)
+}
+
+@Test
 func draggingStageCameraChangesYawAndPitch() {
     var camera = StageCameraModel()
     camera.beginDrag()
@@ -48,4 +78,3 @@ func stageCameraInertiaDecaysAfterDrag() {
     #expect(camera.frame.yawVelocity > 0)
     #expect(camera.frame.yawVelocity < firstVelocity)
 }
-

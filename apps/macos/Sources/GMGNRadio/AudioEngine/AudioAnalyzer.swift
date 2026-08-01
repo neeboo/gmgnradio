@@ -11,6 +11,8 @@ final class AudioAnalyzer: @unchecked Sendable {
     private var imaginary: [Float]
     private var magnitudes: [Float]
     private var previousRMS: Float = 0
+    private var previousLowEnergy: Float = 0
+    private var adaptiveLowEnergy: Float = 0.000_1
 
     init(sampleRate: Float, frameSize: Int) {
         precondition(sampleRate > 0)
@@ -129,6 +131,27 @@ final class AudioAnalyzer: @unchecked Sendable {
         let lowImpact = totalMagnitude > 0
             ? min(max(lowMagnitude / totalMagnitude * 4, 0), 1)
             : 0
+        let lowEnergy = lowMagnitude / Float(frameSize)
+        let lowRise = max(lowEnergy - previousLowEnergy, 0)
+        let lowAttackReference = max(
+            lowEnergy * 0.32,
+            adaptiveLowEnergy * 0.22,
+            0.000_01
+        )
+        let lowAttack = min(max(lowRise / lowAttackReference, 0), 1)
+        previousLowEnergy = lowEnergy
+        adaptiveLowEnergy = max(
+            lowEnergy,
+            adaptiveLowEnergy * 0.94
+        )
+        let beatPulse = min(
+            max(
+                lowAttack * 0.78
+                    + onset * lowImpact * 0.34,
+                0
+            ),
+            1
+        )
 
         return AudioFeatureFrame(
             rms: rms,
@@ -139,7 +162,7 @@ final class AudioAnalyzer: @unchecked Sendable {
                 : 0,
             lowFrequencyImpact: lowImpact,
             onset: onset,
-            beatPulse: min(max(lowImpact * 0.65 + onset * 0.75, 0), 1),
+            beatPulse: beatPulse,
             dominantFrequency: interpolatedFrequency(around: dominantBin),
             hostTime: hostTime
         )

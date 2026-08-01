@@ -14,6 +14,7 @@ final class OrbRenderer: NSObject, MTKViewDelegate {
     private let clock = ContinuousClock()
     private let startedAt: ContinuousClock.Instant
     private var state: DJState = .idle
+    private var voiceLevel: Float = 0
     private var motionModel = OrbMotionModel(
         initial: .idle,
         seed: 0x474D474E,
@@ -75,6 +76,10 @@ final class OrbRenderer: NSObject, MTKViewDelegate {
         updatePreferredFramesPerSecond()
     }
 
+    func setVoiceLevel(_ level: Float) {
+        voiceLevel = min(max(level, 0), 1)
+    }
+
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func draw(in view: MTKView) {
@@ -90,7 +95,8 @@ final class OrbRenderer: NSObject, MTKViewDelegate {
         }
 
         let time = elapsedSeconds
-        let motion = motionModel.frame(at: time, audio: audioFeatures.current)
+        let audio = resolvedAudioFeatures
+        let motion = motionModel.frame(at: time, audio: audio)
         var uniforms = OrbUniforms.forState(state)
         uniforms.resolution = SIMD2<Float>(
             Float(view.drawableSize.width),
@@ -103,9 +109,9 @@ final class OrbRenderer: NSObject, MTKViewDelegate {
         uniforms.particleAmount = motion.particleAmount
         uniforms.hue = motion.hue
         uniforms.opacity = motion.opacity
-        uniforms.audioLow = audioFeatures.current.low
-        uniforms.audioMid = audioFeatures.current.mid
-        uniforms.audioHigh = audioFeatures.current.high
+        uniforms.audioLow = audio.low
+        uniforms.audioMid = audio.mid
+        uniforms.audioHigh = audio.high
         uniforms.scale = motion.scale
         uniforms.listeningRing = motion.listeningRing
 
@@ -129,6 +135,18 @@ final class OrbRenderer: NSObject, MTKViewDelegate {
         return Float(
             Double(components.seconds)
                 + Double(components.attoseconds) / 1_000_000_000_000_000_000
+        )
+    }
+
+    private var resolvedAudioFeatures: VisualAudioFeatures {
+        guard state == .listening || state == .speaking else {
+            return audioFeatures.current
+        }
+        return VisualAudioFeatures(
+            low: voiceLevel,
+            mid: voiceLevel,
+            high: voiceLevel * 0.72,
+            amplitude: voiceLevel
         )
     }
 

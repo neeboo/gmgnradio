@@ -57,6 +57,10 @@ final class OrbWindowController: NSWindowController, NSWindowDelegate {
         orbView.setState(state)
     }
 
+    func setVoiceLevel(_ level: Double) {
+        orbView.setVoiceLevel(Float(level))
+    }
+
     func enterImmersiveVisuals() {
         guard let window else {
             return

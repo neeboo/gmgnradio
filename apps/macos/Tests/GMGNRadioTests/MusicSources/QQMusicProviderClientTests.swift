@@ -16,7 +16,7 @@ func qqMusicClientSearchesTheCatalogAndKeepsTheMediaIdentifier() async throws {
                     "name": "晴天",
                     "interval": 269,
                     "singer": [{"name": "周杰伦"}],
-                    "album": {"name": "叶惠美"},
+                    "album": {"name": "叶惠美", "mid": "album-mid"},
                     "file": {"media_mid": "media-mid", "size_128mp3": 4317292}
                   }]
                 }
@@ -36,6 +36,10 @@ func qqMusicClientSearchesTheCatalogAndKeepsTheMediaIdentifier() async throws {
     #expect(tracks[0].title == "晴天")
     #expect(tracks[0].artist == "周杰伦")
     #expect(tracks[0].duration == 269)
+    #expect(
+        tracks[0].artworkURL?.absoluteString
+            == "https://y.qq.com/music/photo_new/T002R500x500M000album-mid.jpg"
+    )
 
     let request = try #require(await transport.requests.first)
     #expect(request.url?.host == "c.y.qq.com")

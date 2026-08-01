@@ -20,13 +20,30 @@ func codexPlanningExecutorRequestsTheStructuredShowSchema() async throws {
     #expect(schema.contains(#""additionalProperties": false"#))
 }
 
+@Test
+func codexPlanningExecutorUsesTheConfiguredModel() async throws {
+    let runner = StructuredOutputCodexRunner()
+    let executor = CodexCLIPlanningExecutor(
+        runner: runner,
+        model: "gpt-5.4"
+    )
+
+    _ = try await executor.execute(prompt: "排一档节目")
+
+    #expect(await runner.capturedArguments().contains(
+        ["--model", "gpt-5.4"]
+    ))
+}
+
 private actor StructuredOutputCodexRunner: CodexCommandRunning {
     private var schema: String?
+    private var arguments: [String] = []
 
     func run(
         arguments: [String],
         standardInput: String?
     ) async throws -> CodexCommandResult {
+        self.arguments = arguments
         let schemaIndex = try #require(arguments.firstIndex(of: "--output-schema"))
         let outputIndex = try #require(
             arguments.firstIndex(of: "--output-last-message")
@@ -44,5 +61,20 @@ private actor StructuredOutputCodexRunner: CodexCommandRunning {
 
     func capturedSchema() -> String? {
         schema
+    }
+
+    func capturedArguments() -> [String] {
+        arguments
+    }
+}
+
+private extension Array where Element == String {
+    func contains(_ sequence: [String]) -> Bool {
+        guard !sequence.isEmpty, count >= sequence.count else {
+            return false
+        }
+        return indices.dropLast(sequence.count - 1).contains { index in
+            Array(self[index ..< index + sequence.count]) == sequence
+        }
     }
 }

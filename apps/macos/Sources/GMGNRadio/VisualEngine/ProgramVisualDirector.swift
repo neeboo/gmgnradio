@@ -11,6 +11,10 @@ struct ProgramVisualDirector: Sendable {
         return cue(
             for: slot.role,
             mood: semanticMood(for: visual),
+            palette: palette(
+                mood: visual.mood,
+                description: visual.palette
+            ),
             intensity: Float(visual.intensity)
         )
     }
@@ -18,6 +22,7 @@ struct ProgramVisualDirector: Sendable {
     func cue(
         for role: ProgramSlotRole,
         mood requestedMood: StageVisualMood? = nil,
+        palette requestedPalette: StageVisualPalette? = nil,
         intensity requestedIntensity: Float? = nil
     ) -> ProgramVisualCue {
         let direction = direction(for: role)
@@ -30,8 +35,62 @@ struct ProgramVisualDirector: Sendable {
             role: role,
             mood: mood,
             frame: .forMood(mood),
+            palette: requestedPalette ?? .forMood(mood),
             intensity: intensity,
             transitionDuration: direction.transitionDuration
+        )
+    }
+
+    func palette(
+        mood: String,
+        description: String
+    ) -> StageVisualPalette {
+        let value = "\(mood) \(description)".lowercased()
+
+        if value.containsOne(of: [
+            "蓝紫", "blue violet", "indigo", "purple",
+            "忧郁", "迷幻", "梦境", "深蓝", "紫",
+        ]) {
+            return .indigo
+        }
+        if value.containsOne(of: [
+            "玫瑰", "粉红", "浪漫", "暧昧", "rose", "pink",
+        ]) {
+            return .rose
+        }
+        if value.containsOne(of: [
+            "琥珀", "金色", "橙", "日落", "温暖",
+            "amber", "gold", "orange", "sunset", "warm",
+        ]) {
+            return .amber
+        }
+        if value.containsOne(of: [
+            "青绿", "青蓝", "海洋", "冰冷", "cyan",
+            "aqua", "ocean", "teal", "cool", "蓝",
+        ]) {
+            return .aqua
+        }
+        if value.containsOne(of: [
+            "翠绿", "森林", "自然", "清新", "emerald",
+            "green", "forest", "nature",
+        ]) {
+            return .emerald
+        }
+        if value.containsOne(of: [
+            "银白", "黑白", "灰", "克制", "极简",
+            "silver", "monochrome", "grey", "gray",
+        ]) {
+            return .silver
+        }
+        return .forMood(
+            semanticMood(
+                for: AgentVisualDirection(
+                    mood: mood,
+                    palette: description,
+                    motion: "",
+                    intensity: 0.5
+                )
+            ) ?? .afterglow
         )
     }
 

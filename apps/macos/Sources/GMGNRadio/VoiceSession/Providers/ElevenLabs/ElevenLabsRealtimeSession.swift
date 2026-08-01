@@ -1,14 +1,31 @@
 import Foundation
 
 struct ElevenLabsSessionPayload: Codable, Equatable, Sendable {
-    let conversationToken: String
+    let agentID: String?
+    let conversationToken: String?
+    let apiKey: String?
     let voiceID: String?
 
     init(
         conversationToken: String,
+        apiKey: String? = nil,
         voiceID: String? = nil
     ) {
+        agentID = nil
         self.conversationToken = conversationToken
+        self.apiKey = apiKey
+        self.voiceID = voiceID
+    }
+
+    init(
+        agentID: String?,
+        conversationToken: String?,
+        apiKey: String? = nil,
+        voiceID: String? = nil
+    ) {
+        self.agentID = agentID
+        self.conversationToken = conversationToken
+        self.apiKey = apiKey
         self.voiceID = voiceID
     }
 }
@@ -19,6 +36,7 @@ protocol ElevenLabsConversationTransport: Sendable {
     func updateContext(_ context: Data) async throws
     func setMicrophoneMuted(_ muted: Bool) async throws
     func interrupt() async throws
+    func requestAgentResponse(_ instruction: String) async throws
     func submitToolResult(_ result: RealtimeDJToolResult) async throws
     func disconnect() async
 }
@@ -88,6 +106,10 @@ actor ElevenLabsRealtimeSession: RealtimeDJSession {
 
     func interrupt() async throws {
         try await transport.interrupt()
+    }
+
+    func requestAgentResponse(_ instruction: String) async throws {
+        try await transport.requestAgentResponse(instruction)
     }
 
     func submitToolResult(_ result: RealtimeDJToolResult) async throws {

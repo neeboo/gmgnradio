@@ -19,6 +19,24 @@ func audioExtractorSeparatesLowMidAndHighBands() throws {
 }
 
 @Test
+func foliaAudioBridgeExposesFiveSceneBands() throws {
+    let extractor = VisualAudioFeatureExtractor()
+
+    let bass = extractor.extract(from: try makeSineBuffer(frequency: 120))
+    let lowMid = extractor.extract(from: try makeSineBuffer(frequency: 250))
+    let mid = extractor.extract(from: try makeSineBuffer(frequency: 800))
+    let vocal = extractor.extract(from: try makeSineBuffer(frequency: 2_400))
+    let treble = extractor.extract(from: try makeSineBuffer(frequency: 7_000))
+
+    #expect(bass.bass > bass.lowMid * 2)
+    #expect(lowMid.lowMid > lowMid.bass * 2)
+    #expect(mid.sceneMid > mid.vocal * 2)
+    #expect(vocal.vocal > vocal.sceneMid * 2)
+    #expect(treble.treble > treble.vocal * 2)
+    #expect(bass.amplitude > 0)
+}
+
+@Test
 @MainActor
 func audioDeliveryGateRejectsUpdatesFromAClosedGeneration() {
     let store = VisualAudioFeatureStore()

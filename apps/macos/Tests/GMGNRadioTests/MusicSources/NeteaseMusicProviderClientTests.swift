@@ -17,7 +17,10 @@ func neteaseClientSearchesWithTheUsersCookieAndMapsTracks() async throws {
                   "status": 0,
                   "fee": 8,
                   "artists": [{"name": "Beyond"}],
-                  "album": {"name": "乐与怒"}
+                  "album": {
+                    "name": "乐与怒",
+                    "picUrl": "https://p1.music.126.net/album.jpg"
+                  }
                 }]
               }
             }
@@ -36,6 +39,10 @@ func neteaseClientSearchesWithTheUsersCookieAndMapsTracks() async throws {
     #expect(tracks[0].artist == "Beyond")
     #expect(tracks[0].album == "乐与怒")
     #expect(tracks[0].duration == 326)
+    #expect(
+        tracks[0].artworkURL?.absoluteString
+            == "https://p1.music.126.net/album.jpg"
+    )
 
     let request = try #require(await transport.requests.first)
     #expect(request.url?.path == "/api/search/get/web")
@@ -43,6 +50,61 @@ func neteaseClientSearchesWithTheUsersCookieAndMapsTracks() async throws {
     #expect(request.value(forHTTPHeaderField: "Cookie") == "MUSIC_U=user-session")
     #expect(String(data: try #require(request.httpBody), encoding: .utf8)?
         .contains("%E6%B5%B7%E9%98%94%E5%A4%A9%E7%A9%BA") == true)
+}
+
+@Test
+func neteaseClientBackfillsMissingSearchArtworkBySongID() async throws {
+    let transport = ProviderHTTPTransportStub(responses: [
+        providerResponse(
+            """
+            {
+              "code": 200,
+              "result": {
+                "songs": [{
+                  "id": 659423,
+                  "name": "プラスティック・ラヴ",
+                  "duration": 291000,
+                  "status": 0,
+                  "artists": [{"name": "竹内まりや"}],
+                  "album": {"name": "VARIETY"}
+                }]
+              }
+            }
+            """
+        ),
+        providerResponse(
+            """
+            {
+              "songs": [{
+                "id": 659423,
+                "name": "プラスティック・ラヴ",
+                "duration": 291000,
+                "status": 0,
+                "artists": [{"name": "竹内まりや"}],
+                "album": {
+                  "name": "VARIETY",
+                  "picUrl": "https://p2.music.126.net/plastic-love.jpg"
+                }
+              }]
+            }
+            """
+        ),
+    ])
+    let client = NeteaseMusicProviderClient(transport: transport)
+
+    let tracks = try await client.search(
+        MusicSearchRequest(text: "Plastic Love", limit: 5),
+        session: providerSession("MUSIC_U=user-session")
+    )
+
+    #expect(
+        tracks.first?.artworkURL?.absoluteString
+            == "https://p2.music.126.net/plastic-love.jpg"
+    )
+    let requests = await transport.requests
+    #expect(requests.count == 2)
+    #expect(requests[1].url?.path == "/api/song/detail")
+    #expect(requests[1].url?.query?.contains("659423") == true)
 }
 
 @Test
@@ -195,6 +257,100 @@ func neteaseClientResolvesAPlayableURLForTheUsersAccount() async throws {
 
     #expect(asset.url.absoluteString == "https://m801.music.126.net/example.mp3")
     #expect(asset.requestHeaders["Referer"] == "https://music.163.com/")
+    let request = try #require(await transport.requests.first)
+    #expect(request.url?.host == "interface.music.163.com")
+    #expect(request.url?.path == "/eapi/song/enhance/player/url/v1")
+    #expect(request.httpMethod == "POST")
+    #expect(request.httpBody?.isEmpty == false)
+}
+
+@Test
+func neteaseClientFallsBackToStandardQualityWhenExhighIsUnavailable() async throws {
+    let transport = ProviderHTTPTransportStub(responses: [
+        providerResponse(
+            """
+            {
+              "code": 200,
+              "data": [{
+                "id": 347230,
+                "url": null,
+                "code": 404
+              }]
+            }
+            """
+        ),
+        providerResponse(
+            """
+            {
+              "code": 200,
+              "data": [{
+                "id": 347230,
+                "url": "https://m801.music.126.net/standard.mp3",
+                "code": 200
+              }]
+            }
+            """
+        ),
+    ])
+    let client = NeteaseMusicProviderClient(transport: transport)
+
+    let asset = try await client.playbackAsset(
+        for: "347230",
+        session: providerSession("MUSIC_U=user-session")
+    )
+
+    #expect(
+        asset.url.absoluteString
+            == "https://m801.music.126.net/standard.mp3"
+    )
+    #expect(asset.requestHeaders["Cookie"] == "MUSIC_U=user-session")
+    let requests = await transport.requests
+    #expect(requests.count == 2)
+    #expect(
+        requests.allSatisfy {
+            $0.url?.path == "/eapi/song/enhance/player/url/v1"
+        }
+    )
+}
+
+@Test
+func neteaseClientDoesNotReturnTheHTMLMediaRedirectAsAudio() async throws {
+    let unavailable = providerResponse(
+        """
+        {
+          "code": 200,
+          "data": [{
+            "id": 347230,
+            "url": null,
+            "code": 404
+          }]
+        }
+        """
+    )
+    let transport = ProviderHTTPTransportStub(responses: [
+        unavailable,
+        unavailable,
+        unavailable,
+        unavailable,
+    ])
+    let client = NeteaseMusicProviderClient(transport: transport)
+
+    await #expect(
+        throws: MusicProviderClientError.playbackAddressUnavailable
+    ) {
+        try await client.playbackAsset(
+            for: "347230",
+            session: providerSession("MUSIC_U=user-session")
+        )
+    }
+
+    let requests = await transport.requests
+    #expect(requests.count == 4)
+    #expect(
+        !requests.contains {
+            $0.url?.path == "/song/media/outer/url"
+        }
+    )
 }
 
 @Test
@@ -223,4 +379,35 @@ func neteaseClientFetchesOriginalAndTranslatedLyrics() async throws {
     #expect(request.url?.path == "/api/song/lyric")
     #expect(request.url?.query?.contains("id=347230") == true)
     #expect(request.value(forHTTPHeaderField: "Cookie") == "MUSIC_U=user-session")
+}
+
+@Test
+func neteaseClientPrefersYRCWordTimingAndMatchingTranslation() async throws {
+    let transport = ProviderHTTPTransportStub(responses: [
+        providerResponse(
+            """
+            {
+              "code": 200,
+              "lrc": {"lyric": "[00:08.20]今晚慢一点"},
+              "tlyric": {"lyric": "[00:08.20]Tonight"},
+              "yrc": {
+                "lyric": "[8200,4000](8200,800,0)今(9000,700,0)晚(9700,900,0)慢(10600,700,0)一(11300,900,0)点"
+              },
+              "ytlrc": {"lyric": "[00:08.20]Slow down tonight"}
+            }
+            """
+        ),
+    ])
+    let client = NeteaseMusicProviderClient(transport: transport)
+
+    let lyrics = try await client.lyrics(
+        for: "347230",
+        session: providerSession("MUSIC_U=user-session")
+    )
+
+    #expect(lyrics.original == "[00:08.20]今晚慢一点")
+    #expect(lyrics.wordByWord?.contains("[8200,4000]") == true)
+    #expect(lyrics.translation == "[00:08.20]Slow down tonight")
+    let request = try #require(await transport.requests.first)
+    #expect(request.url?.query?.contains("yv=-1") == true)
 }

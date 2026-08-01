@@ -2,9 +2,11 @@ import AVFoundation
 import Foundation
 
 struct VisualAudioFeatureExtractor: Sendable {
-    private static let lowFrequencies: [Float] = [80, 120, 220, 320]
-    private static let midFrequencies: [Float] = [600, 1_000, 1_600, 2_400]
-    private static let highFrequencies: [Float] = [4_000, 6_000, 8_000, 12_000]
+    private static let bassFrequencies: [Float] = [50, 80, 120, 145]
+    private static let lowMidFrequencies: [Float] = [180, 250, 320, 390]
+    private static let midFrequencies: [Float] = [500, 800, 1_000, 1_150]
+    private static let vocalFrequencies: [Float] = [1_400, 2_000, 2_400, 3_200]
+    private static let trebleFrequencies: [Float] = [4_500, 7_000, 9_000, 11_000]
 
     func extract(from buffer: AVAudioPCMBuffer) -> VisualAudioFeatures {
         guard
@@ -48,29 +50,129 @@ struct VisualAudioFeatureExtractor: Sendable {
             return .silent
         }
 
-        let low = bandEnergy(
+        let bass = bandEnergy(
             samples: mono,
             sampleRate: sampleRate / Float(stride),
-            frequencies: Self.lowFrequencies
+            frequencies: Self.bassFrequencies
         )
-        let mid = bandEnergy(
+        let lowMid = bandEnergy(
+            samples: mono,
+            sampleRate: sampleRate / Float(stride),
+            frequencies: Self.lowMidFrequencies
+        )
+        let sceneMid = bandEnergy(
             samples: mono,
             sampleRate: sampleRate / Float(stride),
             frequencies: Self.midFrequencies
         )
-        let high = bandEnergy(
+        let vocal = bandEnergy(
             samples: mono,
             sampleRate: sampleRate / Float(stride),
-            frequencies: Self.highFrequencies
+            frequencies: Self.vocalFrequencies
         )
-        let strongest = max(low, mid, high, 0.000_001)
+        let treble = bandEnergy(
+            samples: mono,
+            sampleRate: sampleRate / Float(stride),
+            frequencies: Self.trebleFrequencies
+        )
+        let strongest = max(
+            bass,
+            lowMid,
+            sceneMid,
+            vocal,
+            treble,
+            0.000_001
+        )
         let amplitude = min(max(sqrt(rms) * 1.35, 0), 1)
+        let normalizedBass = normalized(
+            bass,
+            strongest: strongest,
+            amplitude: amplitude
+        )
+        let normalizedLowMid = normalized(
+            lowMid,
+            strongest: strongest,
+            amplitude: amplitude
+        )
+        let normalizedMid = normalized(
+            sceneMid,
+            strongest: strongest,
+            amplitude: amplitude
+        )
+        let normalizedVocal = normalized(
+            vocal,
+            strongest: strongest,
+            amplitude: amplitude
+        )
+        let normalizedTreble = normalized(
+            treble,
+            strongest: strongest,
+            amplitude: amplitude
+        )
 
         return VisualAudioFeatures(
-            low: min(max(low / strongest * amplitude, 0), 1),
-            mid: min(max(mid / strongest * amplitude, 0), 1),
-            high: min(max(high / strongest * amplitude, 0), 1)
+            low: max(normalizedBass, normalizedLowMid),
+            mid: legacyMid(
+                sceneMid: normalizedMid,
+                vocal: normalizedVocal,
+                treble: normalizedTreble
+            ),
+            high: normalizedTreble,
+            bass: normalizedBass,
+            lowMid: normalizedLowMid,
+            sceneMid: normalizedMid,
+            vocal: normalizedVocal,
+            treble: normalizedTreble,
+            amplitude: amplitude,
+            waveform: waveformEnvelope(mono),
+            spectrum: SIMD8<Float>(
+                normalizedBass,
+                normalizedLowMid,
+                normalizedMid,
+                normalizedVocal,
+                normalizedTreble,
+                (normalizedBass + normalizedLowMid) * 0.5,
+                (normalizedMid + normalizedVocal) * 0.5,
+                (normalizedVocal + normalizedTreble) * 0.5
+            )
         )
+    }
+
+    private func normalized(
+        _ value: Float,
+        strongest: Float,
+        amplitude: Float
+    ) -> Float {
+        min(max(value / strongest * amplitude, 0), 1)
+    }
+
+    private func legacyMid(
+        sceneMid: Float,
+        vocal: Float,
+        treble: Float
+    ) -> Float {
+        let value = max(sceneMid, vocal * 0.72)
+        return treble > value * 2 ? value * 0.72 : value
+    }
+
+    private func waveformEnvelope(_ samples: [Float]) -> SIMD8<Float> {
+        guard !samples.isEmpty else {
+            return .zero
+        }
+        var result = SIMD8<Float>(repeating: 0)
+        var strongest: Float = 0
+        for bucket in 0 ..< 8 {
+            let start = bucket * samples.count / 8
+            let end = max((bucket + 1) * samples.count / 8, start + 1)
+            let peak = samples[start ..< min(end, samples.count)]
+                .reduce(Float.zero) { max($0, abs($1)) }
+            result[bucket] = peak
+            strongest = max(strongest, peak)
+        }
+        guard strongest > 0.000_001 else {
+            return .zero
+        }
+        return result / SIMD8<Float>(repeating: strongest)
     }
 
     private func bandEnergy(

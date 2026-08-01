@@ -20,6 +20,115 @@ func programPlaybackQueueKeepsCurrentTwoLockedAndTheRestInReserve() async throws
 
 @Test
 @MainActor
+func programPlaybackQueueRestoresAtTheSavedTrack() async throws {
+    let preparer = PlaybackPreparingSpy()
+    let queue = ProgramPlaybackQueue(
+        preflight: PlaybackPreflight(preparer: preparer)
+    )
+
+    try await queue.load(
+        playbackPlan(ids: ["1", "2", "3", "4", "5", "6"]),
+        startingAt: 2
+    )
+
+    #expect(queue.current?.slot.track.id == "3")
+    #expect(queue.locked.map(\.slot.track.id) == ["4", "5"])
+    #expect(queue.reserve.map(\.track.id) == ["6"])
+    #expect(preparer.requestedTrackIDs == ["3", "4", "5"])
+}
+
+@Test
+@MainActor
+func selectingPreparedTrackReusesItWithoutAnotherPreflight() async throws {
+    let preparer = PlaybackPreparingSpy()
+    let queue = ProgramPlaybackQueue(
+        preflight: PlaybackPreflight(preparer: preparer)
+    )
+    let plan = playbackPlan(ids: ["1", "2", "3", "4", "5", "6"])
+    try await queue.load(plan)
+
+    try await queue.select(plan, at: 1)
+
+    #expect(queue.current?.slot.track.id == "2")
+    #expect(preparer.requestedTrackIDs == ["1", "2", "3"])
+}
+
+@Test
+@MainActor
+func selectingUnpreparedTrackOnlyPreparesTheRequestedSong() async throws {
+    let preparer = PlaybackPreparingSpy()
+    let queue = ProgramPlaybackQueue(
+        preflight: PlaybackPreflight(preparer: preparer)
+    )
+    let plan = playbackPlan(ids: ["1", "2", "3", "4", "5", "6"])
+    try await queue.load(plan)
+
+    try await queue.select(plan, at: 4)
+
+    #expect(queue.current?.slot.track.id == "5")
+    #expect(preparer.requestedTrackIDs == ["1", "2", "3", "5"])
+}
+
+@Test
+@MainActor
+func savedProgramRestorerReturnsAPlayableReadyState() async throws {
+    let plan = playbackPlan(ids: ["1", "2", "3", "4", "5"])
+    let store = DJProgramStore()
+    store.publish(plan)
+    store.activateSlot(at: 2)
+    let queue = ProgramPlaybackQueue(
+        preflight: PlaybackPreflight(preparer: PlaybackPreparingSpy())
+    )
+    let restorer = SavedProgramPlaybackRestorer(queue: queue)
+
+    let candidate = try await restorer.restore(from: store)
+    let restored = try #require(candidate)
+
+    #expect(restored.plan == plan)
+    #expect(restored.prepared.slot.track.id == "3")
+    #expect(restored.playbackState == .ready)
+}
+
+@Test
+func playbackToggleRoutesAnIdlePlayerToTheRestoredProgram() {
+    #expect(
+        ProgramPlaybackToggleRoute.resolve(
+            playerState: .idle,
+            hasPreparedProgram: true
+        ) == .startPreparedProgram
+    )
+    #expect(
+        ProgramPlaybackToggleRoute.resolve(
+            playerState: .idle,
+            hasPreparedProgram: false
+        ) == .unavailable
+    )
+}
+
+@Test
+func agentPlayCommandStartsTheCurrentlySelectedProgramWhenIdle() {
+    #expect(
+        ProgramPlaybackStartRoute.resolve(
+            playerState: .idle,
+            hasPreparedProgram: true
+        ) == .startPreparedProgram
+    )
+    #expect(
+        ProgramPlaybackStartRoute.resolve(
+            playerState: .paused,
+            hasPreparedProgram: true
+        ) == .resumeLocal
+    )
+    #expect(
+        ProgramPlaybackStartRoute.resolve(
+            playerState: .playing,
+            hasPreparedProgram: true
+        ) == .alreadyPlaying
+    )
+}
+
+@Test
+@MainActor
 func programPlaybackQueueUsesReserveWhenAnUpcomingTrackFailsPreflight() async throws {
     let preparer = PlaybackPreparingSpy()
     preparer.failingTrackIDs = ["2"]
@@ -105,6 +214,27 @@ func programPlaybackQueueReturnsToThePreviousTrackWithoutLosingTheCurrentOne() a
     #expect(queue.locked.map(\.slot.track.id) == ["2", "3", "4"])
     #expect(queue.canReturnToPrevious == false)
     #expect(queue.canAdvance == true)
+}
+
+@Test
+@MainActor
+func replacingUpcomingTracksKeepsTheSongThatIsPlaying() async throws {
+    let queue = ProgramPlaybackQueue(
+        preflight: PlaybackPreflight(preparer: PlaybackPreparingSpy())
+    )
+    try await queue.load(playbackPlan(ids: ["1", "2", "3", "4"]))
+    _ = await queue.advanceAfterCompletion()
+
+    await queue.replaceUpcoming(
+        with: playbackPlan(ids: ["5", "6"]).slots
+    )
+
+    #expect(queue.current?.slot.track.id == "2")
+    #expect(queue.history.map(\.slot.track.id) == ["1"])
+    #expect(queue.locked.map(\.slot.track.id) == ["5", "6"])
+
+    let next = await queue.advanceAfterCompletion()
+    #expect(next?.slot.track.id == "5")
 }
 
 @Test

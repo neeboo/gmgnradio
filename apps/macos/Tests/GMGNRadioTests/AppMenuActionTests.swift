@@ -11,6 +11,7 @@ func appMenuActionsForwardToTheAdaptedApplicationController() {
     AppMenuAction.closeStage.perform(on: controller)
     AppMenuAction.chooseLocalTrack.perform(on: controller)
     AppMenuAction.toggleLocalPlayback.perform(on: controller)
+    AppMenuAction.toggleLyricsVisualMode.perform(on: controller)
     AppMenuAction.exitImmersiveVisuals.perform(on: controller)
 
     #expect(controller.startAIProgramCallCount == 1)
@@ -18,6 +19,7 @@ func appMenuActionsForwardToTheAdaptedApplicationController() {
     #expect(controller.closeStageCallCount == 1)
     #expect(controller.chooseLocalTrackCallCount == 1)
     #expect(controller.toggleLocalPlaybackCallCount == 1)
+    #expect(controller.toggleLyricsVisualModeCallCount == 1)
     #expect(controller.exitImmersiveVisualsCallCount == 1)
 }
 
@@ -28,6 +30,7 @@ private final class ApplicationControllerSpy: GMGNApplicationControlling {
     private(set) var closeStageCallCount = 0
     private(set) var chooseLocalTrackCallCount = 0
     private(set) var toggleLocalPlaybackCallCount = 0
+    private(set) var toggleLyricsVisualModeCallCount = 0
     private(set) var exitImmersiveVisualsCallCount = 0
 
     func startAIProgram() {
@@ -48,6 +51,10 @@ private final class ApplicationControllerSpy: GMGNApplicationControlling {
 
     func toggleLocalPlayback() {
         toggleLocalPlaybackCallCount += 1
+    }
+
+    func toggleLyricsVisualMode() {
+        toggleLyricsVisualModeCallCount += 1
     }
 
     func exitImmersiveVisuals() {

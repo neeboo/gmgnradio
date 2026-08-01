@@ -14,6 +14,7 @@ struct MusicProviderTrack: Equatable, Sendable {
     let moodTags: [String]
     let genres: [String]
     let releaseYear: Int?
+    var artworkURL: URL? = nil
 }
 
 struct MusicProviderLibrary: Equatable, Sendable {
@@ -25,6 +26,17 @@ struct MusicProviderLibrary: Equatable, Sendable {
 struct MusicLyrics: Equatable, Sendable {
     let original: String
     let translation: String?
+    let wordByWord: String?
+
+    init(
+        original: String,
+        translation: String?,
+        wordByWord: String? = nil
+    ) {
+        self.original = original
+        self.translation = translation
+        self.wordByWord = wordByWord
+    }
 }
 
 protocol AccountMusicProviderClient: Sendable {
@@ -186,7 +198,8 @@ struct AccountMusicSource: MusicSource {
             energy: track.energy,
             moodTags: track.moodTags,
             genres: track.genres,
-            releaseYear: track.releaseYear
+            releaseYear: track.releaseYear,
+            artworkURL: track.artworkURL
         )
     }
 

@@ -81,7 +81,7 @@ func agentProgramPlannerAppliesShowStoryHostingAndVisualSemantics() async throws
             targetDuration: 20 * 60,
             moodTags: ["focus"],
             energyArc: [0.3, 0.7, 0.4],
-            conversationMode: .ambient
+            conversationMode: .conversational
         ),
         candidates: candidates
     )
@@ -94,6 +94,7 @@ func agentProgramPlannerAppliesShowStoryHostingAndVisualSemantics() async throws
     #expect(plan.slots[0].hostHint.transitionIntent == "一句话说明节目方向")
     #expect(plan.slots[0].visualDirection?.mood == "清醒")
     #expect(plan.slots[1].hostHint.selectionReason == "把鼓点往前推")
+    #expect(plan.slots[1].hostHint.shouldTalkBefore)
     #expect(plan.slots[1].visualDirection?.intensity == 0.7)
 }
 

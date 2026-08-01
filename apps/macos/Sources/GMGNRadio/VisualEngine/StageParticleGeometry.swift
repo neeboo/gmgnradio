@@ -7,11 +7,22 @@ enum StageParticleRegion: UInt32, CaseIterable, Hashable, Sendable {
     case deck
     case orbit
     case atmosphere
+    case cover
+    case ambientDust
+    case ambientShard
+    case floorSpark
 }
 
 struct StageParticleVertex: Equatable, Sendable {
     var positionAndSize: SIMD4<Float>
     var colorAndPhase: SIMD4<Float>
+
+    var textureCoordinate: SIMD2<Float> {
+        SIMD2<Float>(
+            positionAndSize.x / 6 + 0.5,
+            positionAndSize.y / 6 + 0.5
+        )
+    }
 }
 
 struct StageParticleGeometry: Equatable, Sendable {
@@ -73,6 +84,162 @@ struct StageParticleGeometry: Equatable, Sendable {
         return StageParticleGeometry(
             vertices: builder.vertices,
             regionCounts: builder.regionCounts
+        )
+    }
+
+    static func albumCanvas(
+        grid: Int = 144,
+        seed: UInt64
+    ) -> StageParticleGeometry {
+        let side = max(grid, 2)
+        let count = side * side
+        var random = StageSeededRandom(seed: seed)
+        var vertices: [StageParticleVertex] = []
+        vertices.reserveCapacity(count)
+
+        for row in 0 ..< side {
+            for column in 0 ..< side {
+                let u = (Float(column) + 0.5) / Float(side)
+                let v = (Float(row) + 0.5) / Float(side)
+                let fallbackColor = SIMD3<Float>(
+                    0.03 + u * 0.08,
+                    0.22 + (1 - v) * 0.50,
+                    0.72 + u * 0.28
+                )
+                vertices.append(
+                    StageParticleVertex(
+                        positionAndSize: SIMD4<Float>(
+                            (u - 0.5) * 6,
+                            (v - 0.5) * 6,
+                            0,
+                            0.82 + random.unit() * 0.42
+                        ),
+                        colorAndPhase: SIMD4<Float>(
+                            fallbackColor.x,
+                            fallbackColor.y,
+                            fallbackColor.z,
+                            random.unit() * 2 * .pi
+                        )
+                    )
+                )
+            }
+        }
+
+        return StageParticleGeometry(
+            vertices: vertices,
+            regionCounts: [.cover: count]
+        )
+    }
+
+    static func ambientField(
+        count: Int = 1_800,
+        seed: UInt64
+    ) -> StageParticleGeometry {
+        let total = max(count, 0)
+        let dustCount = Int(Float(total) * 0.65)
+        let shardCount = Int(Float(total) * 0.18)
+        let floorCount = total - dustCount - shardCount
+        var random = StageSeededRandom(seed: seed)
+        var vertices: [StageParticleVertex] = []
+        var regionCounts: [StageParticleRegion: Int] = [:]
+        vertices.reserveCapacity(total)
+
+        func color(
+            _ primary: SIMD3<Float>,
+            _ secondary: SIMD3<Float>,
+            _ amount: Float
+        ) -> SIMD3<Float> {
+            primary + (secondary - primary) * amount
+        }
+
+        func vertex(
+            position: SIMD3<Float>,
+            size: Float,
+            tint: SIMD3<Float>,
+            phase: Float
+        ) -> StageParticleVertex {
+            StageParticleVertex(
+                positionAndSize: SIMD4<Float>(
+                    position.x,
+                    position.y,
+                    position.z,
+                    size
+                ),
+                colorAndPhase: SIMD4<Float>(
+                    tint.x,
+                    tint.y,
+                    tint.z,
+                    phase
+                )
+            )
+        }
+
+        for _ in 0 ..< dustCount {
+            let depth = -10.5 + random.unit() * 14.5
+            let spread = 0.62 + (depth + 10.5) / 14.5 * 0.38
+            vertices.append(
+                vertex(
+                    position: SIMD3<Float>(
+                        (random.unit() * 2 - 1) * 9.5 * spread,
+                        (random.unit() * 2 - 1) * 5.4 * spread,
+                        depth
+                    ),
+                    size: 0.34 + random.unit() * 0.72,
+                    tint: color(
+                        SIMD3<Float>(0.28, 0.68, 1),
+                        SIMD3<Float>(0.78, 0.48, 1),
+                        random.unit()
+                    ),
+                    phase: random.unit() * 2 * .pi
+                )
+            )
+        }
+        regionCounts[.ambientDust] = dustCount
+
+        for _ in 0 ..< shardCount {
+            vertices.append(
+                vertex(
+                    position: SIMD3<Float>(
+                        (random.unit() * 2 - 1) * 7.4,
+                        (random.unit() * 2 - 1) * 4.2,
+                        -4.5 + random.unit() * 7.5
+                    ),
+                    size: 1.4 + pow(random.unit(), 1.8) * 3.3,
+                    tint: color(
+                        SIMD3<Float>(0.58, 0.86, 1),
+                        SIMD3<Float>(1, 0.68, 0.88),
+                        random.unit()
+                    ),
+                    phase: random.unit() * 2 * .pi
+                )
+            )
+        }
+        regionCounts[.ambientShard] = shardCount
+
+        for _ in 0 ..< floorCount {
+            let lane = random.unit()
+            vertices.append(
+                vertex(
+                    position: SIMD3<Float>(
+                        (random.unit() * 2 - 1) * 7.8,
+                        -2.82 + pow(lane, 2) * 0.92,
+                        -5.8 + random.unit() * 9.2
+                    ),
+                    size: 0.92 + pow(random.unit(), 1.5) * 3.1,
+                    tint: color(
+                        SIMD3<Float>(0.40, 0.78, 1),
+                        SIMD3<Float>(0.88, 0.94, 1),
+                        random.unit()
+                    ),
+                    phase: random.unit() * 2 * .pi
+                )
+            )
+        }
+        regionCounts[.floorSpark] = floorCount
+
+        return StageParticleGeometry(
+            vertices: vertices,
+            regionCounts: regionCounts
         )
     }
 }
@@ -256,4 +423,3 @@ private struct StageSeededRandom {
         return Float(value >> 40) / Float(1 << 24)
     }
 }
-

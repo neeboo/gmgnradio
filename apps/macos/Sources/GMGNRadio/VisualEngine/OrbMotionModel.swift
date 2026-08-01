@@ -5,6 +5,46 @@ struct VisualAudioFeatures: Equatable, Sendable {
     var low: Float
     var mid: Float
     var high: Float
+    var bass: Float
+    var lowMid: Float
+    var sceneMid: Float
+    var vocal: Float
+    var treble: Float
+    var beat: Float
+    var onset: Float
+    var amplitude: Float
+    var waveform: SIMD8<Float>
+    var spectrum: SIMD8<Float>
+
+    init(
+        low: Float,
+        mid: Float,
+        high: Float,
+        bass: Float? = nil,
+        lowMid: Float? = nil,
+        sceneMid: Float? = nil,
+        vocal: Float? = nil,
+        treble: Float? = nil,
+        beat: Float = 0,
+        onset: Float = 0,
+        amplitude: Float = 0,
+        waveform: SIMD8<Float> = .zero,
+        spectrum: SIMD8<Float> = .zero
+    ) {
+        self.low = low
+        self.mid = mid
+        self.high = high
+        self.bass = bass ?? low
+        self.lowMid = lowMid ?? low
+        self.sceneMid = sceneMid ?? mid
+        self.vocal = vocal ?? mid
+        self.treble = treble ?? high
+        self.beat = beat
+        self.onset = onset
+        self.amplitude = amplitude
+        self.waveform = waveform
+        self.spectrum = spectrum
+    }
 
     static let silent = VisualAudioFeatures(low: 0, mid: 0, high: 0)
 }
@@ -140,13 +180,13 @@ struct OrbMotionModel: Sendable {
             )
         case .idle:
             OrbMotionFrame(
-                energy: 0.18 + slowWave * 0.025,
-                deformation: 0.10 + slowWave * 0.018,
-                glow: 0.23 + slowWave * 0.025,
+                energy: 0.18 + slowWave * 0.008,
+                deformation: 0.10 + slowWave * 0.004,
+                glow: 0.23 + slowWave * 0.008,
                 particleAmount: 0.006,
-                hue: 0.64 + slowWave * 0.008,
+                hue: 0.64 + slowWave * 0.003,
                 opacity: 0.86,
-                scale: 1.0 + slowWave * 0.035,
+                scale: 1.0 + slowWave * 0.006,
                 listeningRing: 0
             )
         case .listening:
@@ -234,6 +274,13 @@ struct OrbMotionModel: Sendable {
             result.glow += audio.high * 0.06
             result.particleAmount += audio.high * 0.012
             result.scale += audio.low * 0.025
+        }
+        if state == .listening || state == .speaking {
+            let voice = min(max(audio.amplitude, 0), 1)
+            result.energy += voice * 0.34
+            result.deformation += voice * 0.12
+            result.glow += voice * 0.18
+            result.scale += voice * 0.055
         }
 
         return result

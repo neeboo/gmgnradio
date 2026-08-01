@@ -24,7 +24,9 @@ struct CodexTrackRankingAgent: DJShowPlanningAgent {
         preferences: DJAgentPreferences = DJAgentPreferences()
     ) throws -> CodexTrackRankingAgent {
         try CodexTrackRankingAgent(
-            executor: CodexCLIPlanningExecutor.live(),
+            executor: CodexCLIPlanningExecutor.live(
+                model: preferences.planningModel()
+            ),
             hostPrompt: preferences.hostPrompt()
         )
     }

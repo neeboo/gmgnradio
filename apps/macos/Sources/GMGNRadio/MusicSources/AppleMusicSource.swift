@@ -18,6 +18,7 @@ struct AppleMusicCatalogTrack: Equatable, Sendable {
     let isrc: String?
     let genres: [String]
     let releaseYear: Int?
+    var artworkURL: URL? = nil
 }
 
 @MainActor
@@ -104,7 +105,8 @@ struct AppleMusicSource: MusicSource {
                 energy: 0.5,
                 moodTags: [],
                 genres: $0.genres,
-                releaseYear: $0.releaseYear
+                releaseYear: $0.releaseYear,
+                artworkURL: $0.artworkURL
             )
         }
     }
@@ -178,7 +180,8 @@ final class SystemAppleMusicClient: AppleMusicClient {
                         .year,
                         from: $0
                     )
-                }
+                },
+                artworkURL: song.artwork?.url(width: 768, height: 768)
             )
         }
     }
