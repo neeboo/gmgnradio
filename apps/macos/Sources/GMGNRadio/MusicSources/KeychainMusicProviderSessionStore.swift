@@ -1,4 +1,5 @@
 import Foundation
+import LocalAuthentication
 import Security
 
 enum MusicProviderSessionStoreError: Error, Equatable {
@@ -7,7 +8,7 @@ enum MusicProviderSessionStoreError: Error, Equatable {
 }
 
 actor KeychainMusicProviderSessionStore: MusicProviderSessionStore {
-    static let defaultService = "ai.gmgn.radio.music-providers.v2"
+    static let defaultService = "ai.gmgn.radio.music-providers.stable-v1"
 
     private let service: String
     private let encoder = JSONEncoder()
@@ -30,6 +31,9 @@ actor KeychainMusicProviderSessionStore: MusicProviderSessionStore {
         var query = baseQuery(for: providerID)
         query[kSecReturnData] = true
         query[kSecMatchLimit] = kSecMatchLimitOne
+        let authenticationContext = LAContext()
+        authenticationContext.interactionNotAllowed = true
+        query[kSecUseAuthenticationContext] = authenticationContext
 
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)

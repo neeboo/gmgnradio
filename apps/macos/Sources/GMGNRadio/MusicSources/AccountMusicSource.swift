@@ -19,8 +19,57 @@ struct MusicProviderTrack: Equatable, Sendable {
 
 struct MusicProviderLibrary: Equatable, Sendable {
     let savedTracks: [MusicProviderTrack]
-    let playlistIDs: [String]
+    let playlists: [MusicProviderPlaylist]
     let recentlyPlayedTrackIDs: [String]
+
+    var playlistIDs: [String] {
+        playlists.map(\.id)
+    }
+
+    init(
+        savedTracks: [MusicProviderTrack],
+        playlists: [MusicProviderPlaylist],
+        recentlyPlayedTrackIDs: [String]
+    ) {
+        self.savedTracks = savedTracks
+        self.playlists = playlists
+        self.recentlyPlayedTrackIDs = recentlyPlayedTrackIDs
+    }
+
+    init(
+        savedTracks: [MusicProviderTrack],
+        playlistIDs: [String],
+        recentlyPlayedTrackIDs: [String]
+    ) {
+        self.init(
+            savedTracks: savedTracks,
+            playlists: playlistIDs.map {
+                MusicProviderPlaylist(
+                    id: $0,
+                    name: $0,
+                    artworkURL: nil,
+                    trackCount: 0,
+                    tracks: []
+                )
+            },
+            recentlyPlayedTrackIDs: recentlyPlayedTrackIDs
+        )
+    }
+}
+
+struct MusicProviderPlaylist: Equatable, Sendable {
+    let id: String
+    let name: String
+    let artworkURL: URL?
+    let trackCount: Int
+    let tracks: [MusicProviderTrack]
+}
+
+struct MusicProviderPlaylistPage: Equatable, Sendable {
+    let playlistID: String
+    let tracks: [MusicProviderTrack]
+    let offset: Int
+    let totalTrackCount: Int
 }
 
 struct MusicLyrics: Equatable, Sendable {
@@ -53,6 +102,13 @@ protocol AccountMusicProviderClient: Sendable {
         session: MusicProviderSession
     ) async throws -> MusicProviderLibrary
 
+    func fetchPlaylistPage(
+        playlistID: String,
+        offset: Int,
+        limit: Int,
+        session: MusicProviderSession
+    ) async throws -> MusicProviderPlaylistPage
+
     func playbackAsset(
         for trackID: String,
         session: MusicProviderSession
@@ -65,6 +121,36 @@ protocol AccountMusicProviderClient: Sendable {
 }
 
 extension AccountMusicProviderClient {
+    func fetchPlaylistPage(
+        playlistID: String,
+        offset: Int,
+        limit: Int,
+        session: MusicProviderSession
+    ) async throws -> MusicProviderPlaylistPage {
+        let library = try await fetchUserLibrary(session: session)
+        guard let playlist = library.playlists.first(where: {
+            $0.id == playlistID
+        }) else {
+            return MusicProviderPlaylistPage(
+                playlistID: playlistID,
+                tracks: [],
+                offset: max(0, offset),
+                totalTrackCount: 0
+            )
+        }
+        let safeOffset = min(max(0, offset), playlist.tracks.count)
+        let end = min(
+            safeOffset + max(1, limit),
+            playlist.tracks.count
+        )
+        return MusicProviderPlaylistPage(
+            playlistID: playlistID,
+            tracks: Array(playlist.tracks[safeOffset ..< end]),
+            offset: safeOffset,
+            totalTrackCount: playlist.trackCount
+        )
+    }
+
     func playbackAsset(
         for trackID: String,
         session: MusicProviderSession
@@ -80,9 +166,18 @@ extension AccountMusicProviderClient {
     }
 }
 
-enum MusicSourceError: Error, Equatable {
+enum MusicSourceError: Error, Equatable, LocalizedError {
     case authenticationRequired(MusicProviderID)
     case capabilityUnavailable(MusicProviderID)
+
+    var errorDescription: String? {
+        switch self {
+        case .authenticationRequired:
+            "音乐账号登录状态已失效，请重新连接。"
+        case .capabilityUnavailable:
+            "当前音乐账号不能读取歌单。"
+        }
+    }
 }
 
 struct AccountMusicSource: MusicSource {
@@ -143,10 +238,40 @@ struct AccountMusicSource: MusicSource {
         let library = try await client.fetchUserLibrary(session: session)
         return MusicLibrarySnapshot(
             savedTracks: library.savedTracks.map(candidate(from:)),
-            playlistIDs: library.playlistIDs.map(namespacedPlaylistID),
+            playlists: library.playlists.map { playlist in
+                MusicPlaylistSnapshot(
+                    id: namespacedPlaylistID(playlist.id),
+                    providerID: id,
+                    name: playlist.name,
+                    artworkURL: playlist.artworkURL,
+                    tracks: playlist.tracks.map(candidate(from:)),
+                    totalTrackCount: playlist.trackCount
+                )
+            },
             recentlyPlayedTrackIDs: library.recentlyPlayedTrackIDs.map(
                 namespacedTrackID
             )
+        )
+    }
+
+    func fetchPlaylistPage(
+        playlistID: String,
+        offset: Int,
+        limit: Int
+    ) async throws -> MusicPlaylistPage {
+        let session = try await connectedSession()
+        let rawPlaylistID = rawPlaylistID(playlistID)
+        let page = try await client.fetchPlaylistPage(
+            playlistID: rawPlaylistID,
+            offset: offset,
+            limit: limit,
+            session: session
+        )
+        return MusicPlaylistPage(
+            playlistID: namespacedPlaylistID(page.playlistID),
+            tracks: page.tracks.map(candidate(from:)),
+            offset: page.offset,
+            totalTrackCount: page.totalTrackCount
         )
     }
 
@@ -218,6 +343,14 @@ struct AccountMusicSource: MusicSource {
     private func namespacedPlaylistID(_ playlistID: String) -> String {
         "\(id.rawValue):playlist:\(playlistID)"
     }
+
+    private func rawPlaylistID(_ playlistID: String) -> String {
+        let prefix = "\(id.rawValue):playlist:"
+        guard playlistID.hasPrefix(prefix) else {
+            return playlistID
+        }
+        return String(playlistID.dropFirst(prefix.count))
+    }
 }
 
 struct NeteaseMusicSource: MusicSource {
@@ -249,6 +382,18 @@ struct NeteaseMusicSource: MusicSource {
 
     func fetchUserLibrary() async throws -> MusicLibrarySnapshot {
         try await source.fetchUserLibrary()
+    }
+
+    func fetchPlaylistPage(
+        playlistID: String,
+        offset: Int,
+        limit: Int
+    ) async throws -> MusicPlaylistPage {
+        try await source.fetchPlaylistPage(
+            playlistID: playlistID,
+            offset: offset,
+            limit: limit
+        )
     }
 
     func playbackAsset(for trackID: String) async throws -> MusicPlaybackAsset {
@@ -289,6 +434,18 @@ struct QQMusicSource: MusicSource {
 
     func fetchUserLibrary() async throws -> MusicLibrarySnapshot {
         try await source.fetchUserLibrary()
+    }
+
+    func fetchPlaylistPage(
+        playlistID: String,
+        offset: Int,
+        limit: Int
+    ) async throws -> MusicPlaylistPage {
+        try await source.fetchPlaylistPage(
+            playlistID: playlistID,
+            offset: offset,
+            limit: limit
+        )
     }
 
     func playbackAsset(for trackID: String) async throws -> MusicPlaybackAsset {

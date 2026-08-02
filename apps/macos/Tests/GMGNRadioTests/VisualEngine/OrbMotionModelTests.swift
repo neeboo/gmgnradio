@@ -104,7 +104,46 @@ func playingMotionRespondsToSharedAudioFeatures() {
     )
 
     #expect(active.energy > silent.energy)
-    #expect(active.deformation > silent.deformation)
+    #expect(active.glow > silent.glow)
+    #expect(active.deformation == 0)
+    #expect(active.scale == silent.scale)
+}
+
+@Test(arguments: [
+    DJState.idle,
+    DJState.listening,
+    DJState.thinking,
+    DJState.playing,
+    DJState.reconnecting,
+    DJState.failed,
+])
+func nonSpeakingOrbStatesKeepAStableContour(state: DJState) {
+    let first = OrbMotionModel.frame(
+        for: state,
+        time: 0,
+        seed: 42,
+        audio: VisualAudioFeatures(
+            low: 0.9,
+            mid: 0.8,
+            high: 0.7,
+            amplitude: 0.9
+        )
+    )
+    let second = OrbMotionModel.frame(
+        for: state,
+        time: 3.7,
+        seed: 42,
+        audio: VisualAudioFeatures(
+            low: 0.2,
+            mid: 0.4,
+            high: 0.8,
+            amplitude: 0.7
+        )
+    )
+
+    #expect(first.deformation == 0)
+    #expect(second.deformation == 0)
+    #expect(first.scale == second.scale)
 }
 
 @Test

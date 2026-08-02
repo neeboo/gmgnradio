@@ -306,7 +306,7 @@ struct AgentSettingsView: View {
     private var statusText: String {
         switch model.codexState {
         case .unavailable:
-            "策划引擎未安装"
+            "策划引擎当前不可用"
         case .signedOut:
             "策划引擎未登录"
         case let .signedIn(method):

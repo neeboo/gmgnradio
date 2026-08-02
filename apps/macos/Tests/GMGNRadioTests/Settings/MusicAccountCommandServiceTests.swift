@@ -6,7 +6,7 @@ import Testing
 func musicProviderKeychainUsesTheStableSignatureNamespace() {
     #expect(
         KeychainMusicProviderSessionStore.defaultService
-            == "ai.gmgn.radio.music-providers.v2"
+            == "ai.gmgn.radio.music-providers.stable-v1"
     )
 }
 

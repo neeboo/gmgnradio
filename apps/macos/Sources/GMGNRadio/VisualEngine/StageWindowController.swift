@@ -12,10 +12,14 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     private let visualDirections: StageVisualDirectionStore
     private let videos: StageVideoPlaybackStore
     private let programStore: DJProgramStore
+    private let libraryStore: SyncedMusicLibraryStore
     private let lyrics: StageLyricsStore
     private let playbackPosition: @MainActor () -> TimeInterval
     private let onTogglePlayback: @MainActor () -> Void
     private let onPlayProgramTrack: @MainActor (String, Int) -> Void
+    private let onPlayLibraryTrack: @MainActor (String, Int) -> Void
+    private let onOpenLibraryPlaylist: @MainActor (String) -> Void
+    private let onLoadMoreLibraryTracks: @MainActor (String) -> Void
     private let onPreviousTrack: @MainActor () -> Void
     private let onNextTrack: @MainActor () -> Void
     private let onReplanProgram: @MainActor () -> Void
@@ -32,6 +36,7 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         visualDirections: StageVisualDirectionStore = StageVisualDirectionStore(),
         videos: StageVideoPlaybackStore = StageVideoPlaybackStore(),
         programStore: DJProgramStore = .shared,
+        libraryStore: SyncedMusicLibraryStore = .shared,
         lyrics: StageLyricsStore = .shared,
         playbackPosition: @escaping @MainActor () -> TimeInterval = { 0 },
         playbackState: LocalMusicPlaybackState = .idle,
@@ -39,6 +44,12 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         onTogglePlayback: @escaping @MainActor () -> Void = {},
         onPlayProgramTrack:
             @escaping @MainActor (String, Int) -> Void = { _, _ in },
+        onPlayLibraryTrack:
+            @escaping @MainActor (String, Int) -> Void = { _, _ in },
+        onOpenLibraryPlaylist:
+            @escaping @MainActor (String) -> Void = { _ in },
+        onLoadMoreLibraryTracks:
+            @escaping @MainActor (String) -> Void = { _ in },
         onPreviousTrack: @escaping @MainActor () -> Void = {},
         onNextTrack: @escaping @MainActor () -> Void = {},
         onReplanProgram: @escaping @MainActor () -> Void = {},
@@ -51,12 +62,16 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         self.visualDirections = visualDirections
         self.videos = videos
         self.programStore = programStore
+        self.libraryStore = libraryStore
         self.lyrics = lyrics
         self.playbackPosition = playbackPosition
         self.playbackState = playbackState
         self.voiceState = voiceState
         self.onTogglePlayback = onTogglePlayback
         self.onPlayProgramTrack = onPlayProgramTrack
+        self.onPlayLibraryTrack = onPlayLibraryTrack
+        self.onOpenLibraryPlaylist = onOpenLibraryPlaylist
+        self.onLoadMoreLibraryTracks = onLoadMoreLibraryTracks
         self.onPreviousTrack = onPreviousTrack
         self.onNextTrack = onNextTrack
         self.onReplanProgram = onReplanProgram
@@ -171,12 +186,16 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
             visualDirections: visualDirections,
             videos: videos,
             programStore: programStore,
+            libraryStore: libraryStore,
             lyrics: lyrics,
             playbackPosition: playbackPosition,
             playbackState: playbackState,
             voiceState: voiceState,
             onTogglePlayback: onTogglePlayback,
             onPlayProgramTrack: onPlayProgramTrack,
+            onPlayLibraryTrack: onPlayLibraryTrack,
+            onOpenLibraryPlaylist: onOpenLibraryPlaylist,
+            onLoadMoreLibraryTracks: onLoadMoreLibraryTracks,
             onPreviousTrack: onPreviousTrack,
             onNextTrack: onNextTrack,
             onReplanProgram: onReplanProgram,
@@ -209,12 +228,16 @@ private final class StageContentView: NSView {
         visualDirections: StageVisualDirectionStore,
         videos: StageVideoPlaybackStore,
         programStore: DJProgramStore,
+        libraryStore: SyncedMusicLibraryStore,
         lyrics: StageLyricsStore,
         playbackPosition: @escaping @MainActor () -> TimeInterval,
         playbackState: LocalMusicPlaybackState,
         voiceState: RealtimeVoiceConnectionState,
         onTogglePlayback: @escaping @MainActor () -> Void,
         onPlayProgramTrack: @escaping @MainActor (String, Int) -> Void,
+        onPlayLibraryTrack: @escaping @MainActor (String, Int) -> Void,
+        onOpenLibraryPlaylist: @escaping @MainActor (String) -> Void,
+        onLoadMoreLibraryTracks: @escaping @MainActor (String) -> Void,
         onPreviousTrack: @escaping @MainActor () -> Void,
         onNextTrack: @escaping @MainActor () -> Void,
         onReplanProgram: @escaping @MainActor () -> Void,
@@ -229,6 +252,9 @@ private final class StageContentView: NSView {
         }
         let programSelection = StageProgramRailSelection(
             onPlay: onPlayProgramTrack,
+            onPlayPlaylist: onPlayLibraryTrack,
+            onOpenPlaylist: onOpenLibraryPlaylist,
+            onLoadMorePlaylist: onLoadMoreLibraryTracks,
             onReplan: onReplanProgram
         )
         let playbackButton = StagePlaybackButton(
@@ -307,6 +333,7 @@ private final class StageContentView: NSView {
         programRail = StageProgramRailHostingView(
             rootView: StageProgramRailView(
                 programStore: programStore,
+                libraryStore: libraryStore,
                 selection: programSelection,
                 videos: videos,
                 audioFeatures: audioFeatures

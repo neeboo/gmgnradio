@@ -1,4 +1,5 @@
 import Foundation
+import LocalAuthentication
 import Observation
 import Security
 
@@ -153,7 +154,7 @@ protocol RealtimeVoiceSecretStoring: AnyObject {
 final class KeychainRealtimeVoiceSecretStore:
     RealtimeVoiceSecretStoring
 {
-    static let defaultService = "ai.gmgn.radio.voice.v2"
+    static let defaultService = "ai.gmgn.radio.voice.stable-v1"
 
     private let service: String
 
@@ -167,6 +168,9 @@ final class KeychainRealtimeVoiceSecretStore:
         var query = baseQuery(for: key)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
+        let authenticationContext = LAContext()
+        authenticationContext.interactionNotAllowed = true
+        query[kSecUseAuthenticationContext as String] = authenticationContext
         var result: CFTypeRef?
         guard
             SecItemCopyMatching(query as CFDictionary, &result)
@@ -255,6 +259,39 @@ final class RealtimeVoicePreferences {
             .flatMap(RealtimeDJProvider.init(rawValue:))
             ?? .elevenLabs
         return load(provider: provider)
+    }
+
+    func loadMetadata() -> RealtimeVoiceConfiguration {
+        let provider = defaults.string(forKey: Self.providerKey)
+            .flatMap(RealtimeDJProvider.init(rawValue:))
+            ?? .elevenLabs
+        return loadMetadata(provider: provider)
+    }
+
+    func loadMetadata(
+        provider: RealtimeDJProvider
+    ) -> RealtimeVoiceConfiguration {
+        RealtimeVoiceConfiguration(
+            provider: provider,
+            apiKey: nil,
+            agentID: normalized(
+                defaults.string(forKey: key(provider, "agentID"))
+            ),
+            conversationToken: nil,
+            voiceID: normalized(
+                defaults.string(forKey: key(provider, "voiceID"))
+            ),
+            model: normalized(
+                defaults.string(forKey: key(provider, "model"))
+            ),
+            appID: normalized(
+                defaults.string(forKey: key(provider, "appID"))
+            ),
+            accessToken: nil,
+            resourceID: normalized(
+                defaults.string(forKey: key(provider, "resourceID"))
+            )
+        )
     }
 
     func load(
@@ -416,7 +453,7 @@ final class AgentSettingsModel {
         hostPrompt = preferences.hostPrompt()
         takeoverEnabled = preferences.takeoverEnabled()
         planningModel = preferences.planningModel() ?? ""
-        let voice = voicePreferences.load()
+        let voice = voicePreferences.loadMetadata()
         realtimeProvider = voice.provider
         let resolvedVoiceModel: String
         if voice.provider == .bailian {
@@ -545,7 +582,7 @@ final class AgentSettingsModel {
 
     func selectRealtimeProvider(_ provider: RealtimeDJProvider) {
         realtimeProvider = provider
-        apply(voicePreferences.load(provider: provider))
+        apply(voicePreferences.loadMetadata(provider: provider))
         message = nil
         hasError = false
     }

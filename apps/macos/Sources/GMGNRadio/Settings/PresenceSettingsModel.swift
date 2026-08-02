@@ -11,11 +11,15 @@ final class PresenceSettingsModel {
     var message: String?
     var hasError = false
     var isWorking = false
+    var orbAppearance: OrbAppearance
 
     private let service: PresenceCommandService?
     private let startupError: Error?
+    private let defaults: UserDefaults
 
-    init() {
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        orbAppearance = OrbAppearance.load(from: defaults)
         do {
             service = PresenceCommandService(store: try PresencePackageStore.liveStore())
             startupError = nil
@@ -23,6 +27,20 @@ final class PresenceSettingsModel {
             service = nil
             startupError = error
         }
+    }
+
+    func setOrbColor(red: Float, green: Float, blue: Float) {
+        orbAppearance.red = red
+        orbAppearance.green = green
+        orbAppearance.blue = blue
+        orbAppearance.save(to: defaults)
+        orbAppearance = OrbAppearance.load(from: defaults)
+    }
+
+    func setOrbFlowIntensity(_ value: Float) {
+        orbAppearance.flowIntensity = value
+        orbAppearance.save(to: defaults)
+        orbAppearance = OrbAppearance.load(from: defaults)
     }
 
     func load() {

@@ -16,6 +16,8 @@ struct OrbUniforms {
     float transitionProgress;
     float scale;
     float listeningRing;
+    float4 accentColor;
+    float flowIntensity;
 };
 
 struct OrbVertexOut {
@@ -42,19 +44,6 @@ float orbHash(float2 point) {
     return fract(point.x * point.y);
 }
 
-float orbNoise(float2 point) {
-    float2 cell = floor(point);
-    float2 local = fract(point);
-    float2 curve = local * local * (3.0 - 2.0 * local);
-
-    float a = orbHash(cell);
-    float b = orbHash(cell + float2(1.0, 0.0));
-    float c = orbHash(cell + float2(0.0, 1.0));
-    float d = orbHash(cell + float2(1.0, 1.0));
-
-    return mix(mix(a, b, curve.x), mix(c, d, curve.x), curve.y);
-}
-
 fragment float4 orbFragment(
     OrbVertexOut input [[stage_in]],
     constant OrbUniforms &uniforms [[buffer(0)]]
@@ -64,11 +53,13 @@ fragment float4 orbFragment(
 
     float angle = atan2(point.y, point.x);
     float radius = length(point);
+    float motionAmount = saturate(uniforms.deformation);
     float breath = sin(uniforms.time * (0.72 + uniforms.energy * 0.8))
-        * (0.018 + uniforms.energy * 0.008);
+        * 0.026
+        * motionAmount;
     float contour = sin(angle * 5.0 + uniforms.time * 0.55) * 0.014;
     contour += sin(angle * 9.0 - uniforms.time * 0.36) * 0.007;
-    float sphereRadius = (0.68 + breath + contour * uniforms.deformation)
+    float sphereRadius = (0.68 + breath + contour * motionAmount)
         * uniforms.scale;
     float signedDistance = radius - sphereRadius;
 
@@ -82,13 +73,6 @@ fragment float4 orbFragment(
         * uniforms.listeningRing
         * (0.18 + 0.12 * sin(uniforms.time * 2.2));
 
-    float2 flowPoint = point * 2.3;
-    flowPoint += float2(uniforms.time * 0.10, -uniforms.time * 0.072);
-    float flow = orbNoise(flowPoint)
-        + 0.5 * orbNoise(flowPoint * 2.1 + 7.3)
-        + 0.25 * orbNoise(flowPoint * 4.2 - 3.1);
-    flow /= 1.75;
-
     float edgeCells = orbHash(floor((point + 1.0) * 38.0));
     float particles = step(0.985 - uniforms.particleAmount * 0.08, edgeCells)
         * smoothstep(0.20, 0.0, abs(signedDistance))
@@ -96,25 +80,33 @@ fragment float4 orbFragment(
 
     float normalizedRadius = radius / max(sphereRadius, 0.001);
     float normalZ = sqrt(max(1.0 - normalizedRadius * normalizedRadius, 0.0));
-    float textureWave = 0.5 + 0.5 * sin(
-        flow * 10.0 + angle * 2.2 - uniforms.time * 0.55
+    float flowCoordinate = point.x * 4.1 + point.y * 2.2;
+    float flowCurve = sin(point.y * 3.4 - uniforms.time * 0.22) * 0.52;
+    float flowWaveA = 0.5 + 0.5 * sin(
+        flowCoordinate + flowCurve - uniforms.time * 0.48
     );
-    float textureMask = smoothstep(
-        0.34,
-        0.76,
-        flow * 0.72 + textureWave * 0.28
+    float flowWaveB = 0.5 + 0.5 * sin(
+        point.x * -2.8 + point.y * 4.6 + uniforms.time * 0.34
     );
+    float flowBand = smoothstep(0.68, 0.98, flowWaveA)
+        + smoothstep(0.78, 1.0, flowWaveB) * 0.55;
+    flowBand = saturate(flowBand) * uniforms.flowIntensity;
+    float flowSheen = pow(
+        saturate(0.28 + normalZ * 0.72),
+        2.2
+    ) * (0.16 + flowBand * 0.44);
 
     float3 whiteBase = float3(0.96, 0.985, 1.0);
-    float3 iceBlue = float3(0.20, 0.66, 1.0);
-    float3 cobalt = float3(0.025, 0.16, 0.76);
-    float3 blueTexture = mix(iceBlue, cobalt, smoothstep(0.30, 0.82, flow));
-    float inkAmount = 0.18 + textureMask * (0.34 + uniforms.energy * 0.10);
-    float3 color = mix(whiteBase, blueTexture, inkAmount);
+    float3 accent = saturate(uniforms.accentColor.rgb);
+    float3 accentSoft = mix(whiteBase, accent, 0.58);
+    float3 accentDeep = accent * 0.42;
+    float3 color = mix(whiteBase, accentSoft, 0.20 + flowBand * 0.42);
+    color = mix(color, accentDeep, smoothstep(0.86, 1.35, flowBand) * 0.18);
+    color += accentSoft * flowSheen * 0.24;
 
     float sphereLight = 0.82 + normalZ * 0.24;
     color *= sphereLight;
-    color = mix(color, float3(0.04, 0.38, 0.96), rim * 0.54);
+    color = mix(color, accent, rim * 0.48);
 
     float3 surfaceNormal = normalize(float3(
         point / max(sphereRadius, 0.001),
@@ -125,8 +117,8 @@ fragment float4 orbFragment(
         14.0
     );
     color += highlight * 0.26;
-    color += float3(0.10, 0.54, 1.0) * outerGlow * 0.38;
-    color += float3(0.08, 0.48, 1.0) * listeningRing;
+    color += accentSoft * outerGlow * 0.38;
+    color += accent * listeningRing;
     color += particles;
 
     float alpha = clamp(

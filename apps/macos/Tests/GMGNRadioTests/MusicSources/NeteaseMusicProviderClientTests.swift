@@ -27,7 +27,10 @@ func neteaseClientSearchesWithTheUsersCookieAndMapsTracks() async throws {
             """
         ),
     ])
-    let client = NeteaseMusicProviderClient(transport: transport)
+    let client = NeteaseMusicProviderClient(
+        transport: transport,
+        detailRequestConcurrency: 1
+    )
     let tracks = try await client.search(
         MusicSearchRequest(text: "海阔天空", limit: 5),
         session: providerSession("MUSIC_U=user-session")
@@ -90,7 +93,10 @@ func neteaseClientBackfillsMissingSearchArtworkBySongID() async throws {
             """
         ),
     ])
-    let client = NeteaseMusicProviderClient(transport: transport)
+    let client = NeteaseMusicProviderClient(
+        transport: transport,
+        detailRequestConcurrency: 1
+    )
 
     let tracks = try await client.search(
         MusicSearchRequest(text: "Plastic Love", limit: 5),
@@ -120,8 +126,18 @@ func neteaseClientAggregatesAndDeduplicatesTracksAcrossPlaylists() async throws 
             {
               "code": 200,
               "playlist": [
-                {"id": 9001, "name": "我喜欢的音乐"},
-                {"id": 9002, "name": "深夜"}
+                {
+                  "id": 9001,
+                  "name": "我喜欢的音乐",
+                  "coverImgUrl": "https://p1.music.126.net/liked.jpg",
+                  "trackCount": 1
+                },
+                {
+                  "id": 9002,
+                  "name": "深夜",
+                  "coverImgUrl": "https://p1.music.126.net/night.jpg",
+                  "trackCount": 2
+                }
               ]
             }
             """
@@ -171,7 +187,10 @@ func neteaseClientAggregatesAndDeduplicatesTracksAcrossPlaylists() async throws 
             """
         ),
     ])
-    let client = NeteaseMusicProviderClient(transport: transport)
+    let client = NeteaseMusicProviderClient(
+        transport: transport,
+        detailRequestConcurrency: 1
+    )
 
     let library = try await client.fetchUserLibrary(
         session: providerSession("MUSIC_U=user-session")
@@ -179,6 +198,26 @@ func neteaseClientAggregatesAndDeduplicatesTracksAcrossPlaylists() async throws 
 
     #expect(library.playlistIDs == ["9001", "9002"])
     #expect(library.savedTracks.map(\.id) == ["1001", "1002"])
+    #expect(library.playlists.map(\.name) == ["我喜欢的音乐", "深夜"])
+    #expect(
+        library.playlists[0].artworkURL?.absoluteString
+            == "https://p1.music.126.net/liked.jpg"
+    )
+    #expect(library.playlists[1].trackCount == 2)
+    #expect(library.playlists[0].tracks.map(\.id) == ["1001"])
+    #expect(library.playlists[1].tracks.map(\.id) == ["1001", "1002"])
+
+    let loginRequest = try #require(await transport.requests.first)
+    #expect(loginRequest.url?.path == "/weapi/w/nuser/account/get")
+    #expect(loginRequest.httpMethod == "POST")
+    #expect(loginRequest.value(forHTTPHeaderField: "Cookie")?
+        .contains("MUSIC_U=user-session") == true)
+    let loginBody = String(
+        data: try #require(loginRequest.httpBody),
+        encoding: .utf8
+    )
+    #expect(loginBody?.contains("params=") == true)
+    #expect(loginBody?.contains("encSecKey=") == true)
 
     let detailRequests = await transport.requests.filter {
         $0.url?.path == "/api/v6/playlist/detail"
@@ -186,6 +225,37 @@ func neteaseClientAggregatesAndDeduplicatesTracksAcrossPlaylists() async throws 
     #expect(detailRequests.count == 2)
     #expect(detailRequests[0].url?.query?.contains("id=9001") == true)
     #expect(detailRequests[1].url?.query?.contains("id=9002") == true)
+}
+
+@Test
+func neteaseClientFallsBackWhenTheNewLoginStatusHasNoProfile() async throws {
+    let transport = ProviderHTTPTransportStub(responses: [
+        providerResponse("""
+            {"code":200,"profile":null}
+            """),
+        providerResponse("""
+            {"code":200,"profile":{"userId":42}}
+            """),
+        providerResponse("""
+            {"code":200,"playlist":[]}
+            """),
+    ])
+    let client = NeteaseMusicProviderClient(
+        transport: transport,
+        detailRequestConcurrency: 1
+    )
+
+    let library = try await client.fetchUserLibrary(
+        session: providerSession("MUSIC_U=user-session")
+    )
+
+    #expect(library.playlists.isEmpty)
+    let requests = await transport.requests
+    #expect(requests.map(\.url?.path) == [
+        "/weapi/w/nuser/account/get",
+        "/api/nuser/account/get",
+        "/api/user/playlist",
+    ])
 }
 
 @Test
@@ -222,7 +292,10 @@ func neteaseClientKeepsAvailablePlaylistsWhenOneDetailRequestFails() async throw
             """
         ),
     ])
-    let client = NeteaseMusicProviderClient(transport: transport)
+    let client = NeteaseMusicProviderClient(
+        transport: transport,
+        detailRequestConcurrency: 1
+    )
 
     let library = try await client.fetchUserLibrary(
         session: providerSession("MUSIC_U=user-session")
@@ -248,7 +321,10 @@ func neteaseClientResolvesAPlayableURLForTheUsersAccount() async throws {
             """
         ),
     ])
-    let client = NeteaseMusicProviderClient(transport: transport)
+    let client = NeteaseMusicProviderClient(
+        transport: transport,
+        detailRequestConcurrency: 1
+    )
 
     let asset = try await client.playbackAsset(
         for: "347230",
@@ -292,7 +368,10 @@ func neteaseClientFallsBackToStandardQualityWhenExhighIsUnavailable() async thro
             """
         ),
     ])
-    let client = NeteaseMusicProviderClient(transport: transport)
+    let client = NeteaseMusicProviderClient(
+        transport: transport,
+        detailRequestConcurrency: 1
+    )
 
     let asset = try await client.playbackAsset(
         for: "347230",
@@ -333,7 +412,10 @@ func neteaseClientDoesNotReturnTheHTMLMediaRedirectAsAudio() async throws {
         unavailable,
         unavailable,
     ])
-    let client = NeteaseMusicProviderClient(transport: transport)
+    let client = NeteaseMusicProviderClient(
+        transport: transport,
+        detailRequestConcurrency: 1
+    )
 
     await #expect(
         throws: MusicProviderClientError.playbackAddressUnavailable
@@ -366,7 +448,10 @@ func neteaseClientFetchesOriginalAndTranslatedLyrics() async throws {
             """
         ),
     ])
-    let client = NeteaseMusicProviderClient(transport: transport)
+    let client = NeteaseMusicProviderClient(
+        transport: transport,
+        detailRequestConcurrency: 1
+    )
 
     let lyrics = try await client.lyrics(
         for: "347230",
@@ -398,7 +483,10 @@ func neteaseClientPrefersYRCWordTimingAndMatchingTranslation() async throws {
             """
         ),
     ])
-    let client = NeteaseMusicProviderClient(transport: transport)
+    let client = NeteaseMusicProviderClient(
+        transport: transport,
+        detailRequestConcurrency: 1
+    )
 
     let lyrics = try await client.lyrics(
         for: "347230",

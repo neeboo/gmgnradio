@@ -39,6 +39,9 @@ func neteaseSourceMapsTracksFromTheUsersConnectedSession() async throws {
 
     let library = try await source.fetchUserLibrary()
     #expect(library.playlistIDs == ["netease:playlist:favorites"])
+    #expect(library.playlists.count == 1)
+    #expect(library.playlists[0].name == "我喜欢的音乐")
+    #expect(library.playlists[0].tracks.map(\.id) == ["netease:2048"])
 }
 
 @Test
@@ -180,7 +183,17 @@ private struct StubAccountMusicProviderClient: AccountMusicProviderClient {
         if let error { throw error }
         return MusicProviderLibrary(
             savedTracks: tracks,
-            playlistIDs: ["favorites"],
+            playlists: [
+                MusicProviderPlaylist(
+                    id: "favorites",
+                    name: "我喜欢的音乐",
+                    artworkURL: URL(
+                        string: "https://example.com/favorites.jpg"
+                    ),
+                    trackCount: tracks.count,
+                    tracks: tracks
+                )
+            ],
             recentlyPlayedTrackIDs: tracks.map(\.id)
         )
     }

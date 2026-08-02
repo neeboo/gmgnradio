@@ -484,6 +484,92 @@ func programRailUsesAPlaylistLevelBeforeItsTrackLevel() {
     #expect(replanCount == 1)
 }
 
+@Test
+@MainActor
+func programRailOpensAndPlaysASyncedMusicPlaylist() {
+    let playlist = MusicPlaylistSnapshot(
+        id: "netease:playlist:liked",
+        providerID: .netease,
+        name: "我喜欢的音乐",
+        artworkURL: URL(string: "https://example.com/liked.jpg"),
+        tracks: [
+            stageCandidate(index: 0),
+            stageCandidate(index: 1),
+        ]
+    )
+    let libraryStore = SyncedMusicLibraryStore()
+    libraryStore.merge(playlists: [playlist])
+    var playedSelections: [String] = []
+    let selection = StageProgramRailSelection(
+        onPlayPlaylist: { playlistID, trackIndex in
+            playedSelections.append("\(playlistID):\(trackIndex)")
+        }
+    )
+
+    selection.openPlaylist(playlist.id)
+    #expect(selection.route == .playlistTracks(playlistID: playlist.id))
+
+    let model = StageProgramRailModel(
+        playlist: libraryStore.playlists[0],
+        activeTrackID: nil
+    )
+    #expect(model.title == "我喜欢的音乐")
+    #expect(model.cards.map(\.trackID) == ["stage-track-0", "stage-track-1"])
+
+    selection.activate(slotIndex: 1)
+    #expect(playedSelections == ["netease:playlist:liked:1"])
+}
+
+@Test
+func syncedPlaylistProgramKeepsTheProviderTrackOrder() {
+    let playlist = MusicPlaylistSnapshot(
+        id: "netease:playlist:liked",
+        providerID: .netease,
+        name: "我喜欢的音乐",
+        artworkURL: nil,
+        tracks: (0 ..< 12).map(stageCandidate(index:))
+    )
+
+    let plan = SyncedPlaylistProgramBuilder.makePlan(
+        from: playlist,
+        generatedAt: Date(timeIntervalSince1970: 100)
+    )
+
+    #expect(plan.brief.id == playlist.id)
+    #expect(plan.title == playlist.name)
+    #expect(plan.slots.map(\.track.id) == playlist.tracks.map(\.id))
+    #expect(plan.slots.count == 12)
+}
+
+@Test
+func syncedPlaylistDoesNotAppearTwiceAfterItStartsPlaying() {
+    let playlist = MusicPlaylistSnapshot(
+        id: "netease:playlist:liked",
+        providerID: .netease,
+        name: "我喜欢的音乐",
+        artworkURL: nil,
+        tracks: [stageCandidate(index: 0)]
+    )
+    let plan = SyncedPlaylistProgramBuilder.makePlan(from: playlist)
+    let visible = StageProgramRailCatalog.visiblePrograms(
+        [
+            SavedDJProgram(
+                plan: plan,
+                activeSlotIndex: 0,
+                updatedAt: Date()
+            ),
+            SavedDJProgram(
+                plan: stageProgramPlan(trackCount: 5),
+                activeSlotIndex: nil,
+                updatedAt: Date()
+            ),
+        ],
+        syncedPlaylists: [playlist]
+    )
+
+    #expect(visible.map(\.plan.brief.id) == ["stage-program"])
+}
+
 @MainActor
 private final class StageAudioMonitorSpy: VisualAudioMonitoring {
     private(set) var startCallCount = 0
@@ -499,25 +585,7 @@ private final class StageAudioMonitorSpy: VisualAudioMonitoring {
 }
 
 private func stageProgramPlan(trackCount: Int) -> ProgramPlan {
-    let tracks = (0 ..< trackCount).map { index in
-        MusicCandidate(
-            id: "stage-track-\(index)",
-            canonicalID: nil,
-            providerID: .netease,
-            source: .streaming,
-            title: "Track \(index)",
-            artist: "Artist \(index)",
-            album: nil,
-            duration: 240,
-            isPlayable: true,
-            matchScore: 1,
-            userAffinity: 1,
-            energy: 0.25 + Double(index) * 0.08,
-            moodTags: [],
-            genres: [],
-            releaseYear: nil
-        )
-    }
+    let tracks = (0 ..< trackCount).map(stageCandidate(index:))
     return ProgramPlan(
         brief: ProgramBrief(
             id: "stage-program",
@@ -550,6 +618,26 @@ private func stageProgramPlan(trackCount: Int) -> ProgramPlan {
         replanAfterTrackCount: 3,
         title: "Afterglow",
         direction: "夜晚的流动感"
+    )
+}
+
+private func stageCandidate(index: Int) -> MusicCandidate {
+    MusicCandidate(
+        id: "stage-track-\(index)",
+        canonicalID: nil,
+        providerID: .netease,
+        source: .streaming,
+        title: "Track \(index)",
+        artist: "Artist \(index)",
+        album: nil,
+        duration: 240,
+        isPlayable: true,
+        matchScore: 1,
+        userAffinity: 1,
+        energy: 0.25 + Double(index) * 0.08,
+        moodTags: [],
+        genres: [],
+        releaseYear: nil
     )
 }
 

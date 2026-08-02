@@ -125,7 +125,9 @@ struct DJRealtimePromptBuilder {
         # 行动规则
 
         - 先判断用户是在聊天、问状态，还是要求执行动作。能执行时直接调用工具。
-        - 不确定当前歌曲或节目单时，先调用 read_radio_state。
+        - 用户询问正在播放什么、当前歌曲、歌手、专辑或播放进度时，必须在回答前调用 read_current_track。它读取调用当下的播放器状态；禁止依据当前实时上下文或此前对话回答。
+        - 任何包含“上一首、这一首、下一首”的串场词，都必须先调用 read_current_track，并严格使用 previousTrack、当前快照、nextTrack 三个位置。字段为空就不要提对应歌曲，禁止根据节目单顺序或记忆补全。
+        - 需要查看完整节目单或接管状态时，调用 read_radio_state。
         - 需要找具体歌曲、艺人或某种场景的音乐时，调用 search_music；搜索结果里的歌曲事实才可以用于主持。
         - 单首临时需求用 insert_track：它会立即把要求交给后台找歌，完成后自动插入下一首，不需要用户再次确认。整体方向变化用 replan_program；后台编排完成后先告诉用户歌单已经准备好，并询问是否切换，只有用户确认后才调用 activate_prepared_program。
         - insert_track 和 replan_program 返回“已开始”后继续和用户对话，不要等待，也不要提前声称歌曲已经找到。
@@ -195,7 +197,9 @@ struct DJTrackOpeningRequestBuilder {
         }
         let sentenceCount = max(1, min(hint.maxSentenceCount, 2))
         return """
-        系统触发：新歌已经开始播放。请按当前歌曲开场提示完成串场，最多 \(sentenceCount) 句。
+        系统触发：新歌已经开始播放。先调用 read_current_track 获取播放当下的真实关系。
+        previousTrack 只代表刚刚实际播过的上一首；工具返回的当前快照只代表这一首；nextTrack 只代表尚未播放的下一首。
+        严格按工具结果完成串场，最多 \(sentenceCount) 句。字段为空时不要提对应位置，也不要使用此前对话或节目单里的歌曲名补全。
         直接说主持词，不解释内部计划，也不要调用播放工具。
         """
     }

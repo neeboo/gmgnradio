@@ -120,11 +120,13 @@
 		BC40F7C048A99BA508438443 /* AudioFeatureFrame.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9AE1C62891D06F5AAEE8F1BD /* AudioFeatureFrame.swift */; };
 		C10827D8D39E84E9E79DFFD9 /* DJProgramStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F0C99CC73DBA693F2E286F1 /* DJProgramStore.swift */; };
 		C3E9ADA40693BD1AB0C2F219 /* AppleMusicSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = 393199081906581B9CC18676 /* AppleMusicSource.swift */; };
+		C8AF3084ADEA152752C5EE7F /* OrbAppearance.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6B4ECE2281E5829AE3E02FE3 /* OrbAppearance.swift */; };
 		D721C4D533DAA4D461CEF6D2 /* PlaybackContext.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2457A76CBF19C18E6D386EE /* PlaybackContext.swift */; };
 		D807A54C3784A2FF10D4278D /* LiveKit in Frameworks */ = {isa = PBXBuildFile; productRef = 90774BF1A310244C65F85C37 /* LiveKit */; };
 		D8CF6A2326DE3E3C6DA2F3E4 /* VisualAudioInputPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09494436AADC40C3833A6FC5 /* VisualAudioInputPolicy.swift */; };
 		D8D0906855E8347D014683A6 /* StageWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC8DB2FC6BF5BF149BD893CC /* StageWindowController.swift */; };
 		DD34674AE84A35C15E3EB4A7 /* CodexAgentAccountService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A961113D1516220877214877 /* CodexAgentAccountService.swift */; };
+		DDDEBAB15217CC1A60061CDE /* SyncedMusicLibraryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F7B6F4B8014DFB9AD76A24A /* SyncedMusicLibraryStore.swift */; };
 		DDF647CA9001A4919EA82834 /* ProgramVisualDirector.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C25006F47A0D72758A7B6B0 /* ProgramVisualDirector.swift */; };
 		E07CACC669D4A648231EE3A0 /* VisualAudioFeatureExtractor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36C707778632484C921F090C /* VisualAudioFeatureExtractor.swift */; };
 		E0EF77C4410BA971E66381AE /* CodexTrackRankingAgentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F341732E30CC1C3F05A7532 /* CodexTrackRankingAgentTests.swift */; };
@@ -189,6 +191,7 @@
 		1B2A3586C14E9FEC3F15B9AF /* StageCameraModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageCameraModel.swift; sourceTree = "<group>"; };
 		1C0EE40A2A02D7B94512CC74 /* StageWindowModeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageWindowModeTests.swift; sourceTree = "<group>"; };
 		1F341732E30CC1C3F05A7532 /* CodexTrackRankingAgentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexTrackRankingAgentTests.swift; sourceTree = "<group>"; };
+		1F7B6F4B8014DFB9AD76A24A /* SyncedMusicLibraryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncedMusicLibraryStore.swift; sourceTree = "<group>"; };
 		20C65C2BD0FD2417BAFBD387 /* PresenceCommandService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceCommandService.swift; sourceTree = "<group>"; };
 		216A6D94509E4915BCC18C7C /* RealtimeDJSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeDJSession.swift; sourceTree = "<group>"; };
 		2598E4800DAB1870BB2DBC4A /* AudioDeviceMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioDeviceMonitor.swift; sourceTree = "<group>"; };
@@ -235,6 +238,7 @@
 		63B9090B88216BD89FF23432 /* QQMusicProviderClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QQMusicProviderClient.swift; sourceTree = "<group>"; };
 		686B5AC0FF2E46498D118088 /* DJProgramStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DJProgramStoreTests.swift; sourceTree = "<group>"; };
 		6A98371838646D4018D596A5 /* PresenceSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceSettingsView.swift; sourceTree = "<group>"; };
+		6B4ECE2281E5829AE3E02FE3 /* OrbAppearance.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbAppearance.swift; sourceTree = "<group>"; };
 		6B6117A1B853082CD0F65CBD /* InterruptionCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InterruptionCoordinatorTests.swift; sourceTree = "<group>"; };
 		6F3F12D9FCEF10F8F3B6C395 /* FoliaSceneRuntimeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FoliaSceneRuntimeTests.swift; sourceTree = "<group>"; };
 		6F9A8C301E3E7F635CC216D7 /* InterruptionCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InterruptionCoordinator.swift; sourceTree = "<group>"; };
@@ -374,6 +378,7 @@
 				D97F73949C67E2C74646A608 /* NeteaseMusicProviderClient.swift */,
 				63B9090B88216BD89FF23432 /* QQMusicProviderClient.swift */,
 				FF4EF80770D71D3EC6B0D33D /* StreamingMusicCache.swift */,
+				1F7B6F4B8014DFB9AD76A24A /* SyncedMusicLibraryStore.swift */,
 				96E6D962FE7287F48210926F /* UnifiedMusicSearch.swift */,
 			);
 			path = MusicSources;
@@ -386,6 +391,7 @@
 				CB7307989361CD9BA9432B67 /* FoliaSceneRuntime.swift */,
 				F284824D1B19778D845C9A05 /* FoliaSceneThemeEnvironment.swift */,
 				5CF6A9DCAC8752FE6AEFD4EC /* ImmersiveSceneController.swift */,
+				6B4ECE2281E5829AE3E02FE3 /* OrbAppearance.swift */,
 				07DE01676AC401339B9DCC2F /* OrbMotionModel.swift */,
 				32A231638291FF4F5DA2F049 /* ProgramVisualCue.swift */,
 				4C25006F47A0D72758A7B6B0 /* ProgramVisualDirector.swift */,
@@ -968,6 +974,7 @@
 				ABDB36FE110EDF6A739619DD /* MusicSource.swift in Sources */,
 				0A096E97516270FB01A843FE /* NeteaseMusicProviderClient.swift in Sources */,
 				94A2BC7B04AA84C9A463CED6 /* Orb.metal in Sources */,
+				C8AF3084ADEA152752C5EE7F /* OrbAppearance.swift in Sources */,
 				A812DB23EA81DBB7D2B72B1D /* OrbMetalView.swift in Sources */,
 				0A24E45110C36FCF5E8A7012 /* OrbMotionModel.swift in Sources */,
 				35C3C8FFE3D1338719F0C54E /* OrbPanel.swift in Sources */,
@@ -1003,6 +1010,7 @@
 				D8D0906855E8347D014683A6 /* StageWindowController.swift in Sources */,
 				E4B42BCA37A2E6ACCFD8C3E8 /* StageWindowMode.swift in Sources */,
 				119696923E6727DCFC6373AD /* StreamingMusicCache.swift in Sources */,
+				DDDEBAB15217CC1A60061CDE /* SyncedMusicLibraryStore.swift in Sources */,
 				5DF23352AF4CE0DD0F99380E /* TrackKnowledge.swift in Sources */,
 				583709DB2BCEF0293ECDCD8B /* UnifiedMusicSearch.swift in Sources */,
 				E07CACC669D4A648231EE3A0 /* VisualAudioFeatureExtractor.swift in Sources */,

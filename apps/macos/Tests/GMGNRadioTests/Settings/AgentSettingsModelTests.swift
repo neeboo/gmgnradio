@@ -115,6 +115,9 @@ func trackOpeningRequestOnlyTriggersForPlannedHostMoments() {
 
     #expect(builder.instruction(for: talkHint)?.contains("最多 2 句") == true)
     #expect(builder.instruction(for: talkHint)?.contains("新歌已经开始播放") == true)
+    #expect(builder.instruction(for: talkHint)?.contains("read_current_track") == true)
+    #expect(builder.instruction(for: talkHint)?.contains("previousTrack") == true)
+    #expect(builder.instruction(for: talkHint)?.contains("nextTrack") == true)
     #expect(builder.instruction(for: quietHint) == nil)
     #expect(
         builder.instruction(for: quietHint, forceForProgramBeat: true)?
@@ -314,7 +317,7 @@ func bailianModelAndVoiceUseSelectableDefaults() {
 func realtimeVoiceKeychainUsesTheStableSignatureNamespace() {
     #expect(
         KeychainRealtimeVoiceSecretStore.defaultService
-            == "ai.gmgn.radio.voice.v2"
+            == "ai.gmgn.radio.voice.stable-v1"
     )
 }
 

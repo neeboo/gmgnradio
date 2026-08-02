@@ -2,6 +2,7 @@ import Foundation
 import CommonCrypto
 import CryptoKit
 import os
+import Security
 
 struct NeteaseMusicProviderClient: AccountMusicProviderClient {
     private static let logger = Logger(
@@ -10,14 +11,17 @@ struct NeteaseMusicProviderClient: AccountMusicProviderClient {
     )
     private let transport: any MusicProviderHTTPTransport
     private let baseURL: URL
+    private let detailRequestConcurrency: Int
 
     init(
         transport: any MusicProviderHTTPTransport =
             URLSessionMusicProviderHTTPTransport(),
-        baseURL: URL = URL(string: "https://music.163.com")!
+        baseURL: URL = URL(string: "https://music.163.com")!,
+        detailRequestConcurrency: Int = 6
     ) {
         self.transport = transport
         self.baseURL = baseURL
+        self.detailRequestConcurrency = max(1, detailRequestConcurrency)
     }
 
     func capabilities(
@@ -81,18 +85,7 @@ struct NeteaseMusicProviderClient: AccountMusicProviderClient {
         session: MusicProviderSession
     ) async throws -> MusicProviderLibrary {
         let cookie = try session.cookieHeader()
-        let accountData = try checkedProviderResponse(
-            await transport.send(
-                providerRequest(path: "/api/nuser/account/get", cookie: cookie)
-            )
-        )
-        let account = try JSONDecoder().decode(
-            NeteaseAccountResponse.self,
-            from: accountData
-        )
-        guard let userID = account.profile?.userId else {
-            throw MusicProviderClientError.accountUnavailable
-        }
+        let userID = try await fetchUserID(cookie: cookie)
 
         var components = URLComponents(
             url: baseURL.appending(path: "/api/user/playlist"),
@@ -112,52 +105,232 @@ struct NeteaseMusicProviderClient: AccountMusicProviderClient {
             NeteasePlaylistsResponse.self,
             from: playlistsData
         )
-        let playlists = playlistsResponse.playlist ?? []
-        let playlistIDs = playlists.map(\.id)
-        var seenTrackIDs = Set<String>()
-        var savedTracks: [MusicProviderTrack] = []
-        for playlistID in playlistIDs.prefix(50) {
-            var detailComponents = URLComponents(
-                url: baseURL.appending(path: "/api/v6/playlist/detail"),
-                resolvingAgainstBaseURL: false
-            )!
-            detailComponents.queryItems = [
-                URLQueryItem(name: "id", value: String(playlistID)),
-                URLQueryItem(name: "n", value: "1000"),
-                URLQueryItem(name: "s", value: "0"),
-            ]
-            guard
-                let detailResponse = try? await transport.send(
-                    providerRequest(
-                        url: detailComponents.url!,
-                        cookie: cookie
-                    )
-                ),
-                let detailData = try? checkedProviderResponse(detailResponse),
-                let detail = try? JSONDecoder().decode(
-                    NeteasePlaylistDetailResponse.self,
-                    from: detailData
-                )
-            else {
-                continue
-            }
-            for track in detail.playlist?.tracks ?? [] {
-                let mapped = track.providerTrack(
-                    matchScore: 0.72,
-                    userAffinity: 1
-                )
-                guard seenTrackIDs.insert(mapped.id).inserted else {
-                    continue
-                }
-                savedTracks.append(mapped)
-            }
+        let playlists = Array((playlistsResponse.playlist ?? []).prefix(50))
+        let mappedPlaylists = playlists.map {
+            $0.providerPlaylist(tracks: [])
         }
 
         return MusicProviderLibrary(
-            savedTracks: savedTracks,
-            playlistIDs: playlistIDs.map(String.init),
+            savedTracks: [],
+            playlists: mappedPlaylists,
             recentlyPlayedTrackIDs: []
         )
+    }
+
+    func fetchPlaylistPage(
+        playlistID: String,
+        offset: Int,
+        limit: Int,
+        session: MusicProviderSession
+    ) async throws -> MusicProviderPlaylistPage {
+        let cookie = try session.cookieHeader()
+        let detail = try await playlistDetail(
+            playlistID: playlistID,
+            cookie: cookie
+        )
+        let embeddedTracks = detail.playlist?.tracks ?? []
+        let embeddedByID = Dictionary(
+            uniqueKeysWithValues: embeddedTracks.map { ($0.id, $0) }
+        )
+        let orderedIDs = detail.playlist?.trackIds?.map(\.id)
+            ?? embeddedTracks.map(\.id)
+        let totalTrackCount = max(
+            detail.playlist?.trackCount ?? 0,
+            orderedIDs.count
+        )
+        let safeOffset = min(max(0, offset), orderedIDs.count)
+        let pageIDs = Array(
+            orderedIDs.dropFirst(safeOffset).prefix(max(1, limit))
+        )
+        // 歌单详情里的内嵌歌曲经常省略专辑封面。分页时始终读取
+        // 当前 20 首的完整歌曲详情，保证每首歌都带自己的封面。
+        let hydrated = try await songDetails(
+            ids: pageIDs,
+            cookie: cookie
+        )
+        let hydratedByID = Dictionary(
+            uniqueKeysWithValues: hydrated.map { ($0.id, $0) }
+        )
+        let tracks = pageIDs.compactMap { id in
+            hydratedByID[id] ?? embeddedByID[id]
+        }.map {
+            $0.providerTrack(matchScore: 0.72, userAffinity: 1)
+        }
+        return MusicProviderPlaylistPage(
+            playlistID: playlistID,
+            tracks: tracks,
+            offset: safeOffset,
+            totalTrackCount: totalTrackCount
+        )
+    }
+
+    private func playlistDetail(
+        playlistID: String,
+        cookie: String
+    ) async throws -> NeteasePlaylistDetailResponse {
+        var components = URLComponents(
+            url: baseURL.appending(path: "/api/v6/playlist/detail"),
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "id", value: playlistID),
+            URLQueryItem(name: "n", value: "1000"),
+            URLQueryItem(name: "s", value: "0"),
+        ]
+        let data = try checkedProviderResponse(
+            await transport.send(
+                providerRequest(url: components.url!, cookie: cookie)
+            )
+        )
+        return try JSONDecoder().decode(
+            NeteasePlaylistDetailResponse.self,
+            from: data
+        )
+    }
+
+    private func songDetails(
+        ids: [Int64],
+        cookie: String
+    ) async throws -> [NeteaseTrackDTO] {
+        guard !ids.isEmpty else {
+            return []
+        }
+        var components = URLComponents(
+            url: baseURL.appending(path: "/api/song/detail/"),
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(
+                name: "ids",
+                value: "[\(ids.map(String.init).joined(separator: ","))]"
+            ),
+        ]
+        let data = try checkedProviderResponse(
+            await transport.send(
+                providerRequest(url: components.url!, cookie: cookie)
+            )
+        )
+        return try JSONDecoder().decode(
+            NeteaseSongDetailResponse.self,
+            from: data
+        ).songs
+    }
+
+    private func fetchUserID(cookie: String) async throws -> Int64 {
+        if
+            let request = try? NeteaseWeAPIRequestEncoder
+                .accountStatusRequest(cookie: cookie, baseURL: baseURL),
+            let response = try? await transport.send(request),
+            let data = try? checkedProviderResponse(response),
+            let status = try? JSONDecoder().decode(
+                NeteaseAccountResponse.self,
+                from: data
+            )
+        {
+            if let userID = status.resolvedProfile?.userId {
+                return userID
+            }
+            Self.logger.warning(
+                "网易云新登录状态没有用户资料：code=\(status.code ?? -1)，message=\(status.message ?? "nil", privacy: .public)"
+            )
+        }
+
+        let legacyData = try checkedProviderResponse(
+            await transport.send(
+                providerRequest(path: "/api/nuser/account/get", cookie: cookie)
+            )
+        )
+        let legacyStatus = try JSONDecoder().decode(
+            NeteaseAccountResponse.self,
+            from: legacyData
+        )
+        guard let userID = legacyStatus.resolvedProfile?.userId else {
+            Self.logger.error(
+                "网易云登录态已失效：code=\(legacyStatus.code ?? -1)，message=\(legacyStatus.message ?? "nil", privacy: .public)"
+            )
+            throw MusicProviderClientError.accountUnavailable
+        }
+        return userID
+    }
+
+    private func fetchPlaylistDetails(
+        _ playlists: [NeteasePlaylistsResponse.Playlist],
+        cookie: String
+    ) async -> [MusicProviderPlaylist] {
+        guard !playlists.isEmpty else {
+            return []
+        }
+        var results = Array<MusicProviderPlaylist?>(
+            repeating: nil,
+            count: playlists.count
+        )
+        await withTaskGroup(of: (Int, MusicProviderPlaylist).self) { group in
+            var nextIndex = 0
+            let initialCount = min(detailRequestConcurrency, playlists.count)
+            for index in 0 ..< initialCount {
+                group.addTask { [self] in
+                    (
+                        index,
+                        await fetchPlaylistDetail(
+                            playlists[index],
+                            cookie: cookie
+                        )
+                    )
+                }
+                nextIndex += 1
+            }
+            while let (index, playlist) = await group.next() {
+                results[index] = playlist
+                guard nextIndex < playlists.count else {
+                    continue
+                }
+                let pendingIndex = nextIndex
+                group.addTask { [self] in
+                    (
+                        pendingIndex,
+                        await fetchPlaylistDetail(
+                            playlists[pendingIndex],
+                            cookie: cookie
+                        )
+                    )
+                }
+                nextIndex += 1
+            }
+        }
+        return results.enumerated().map { index, result in
+            result ?? playlists[index].providerPlaylist(tracks: [])
+        }
+    }
+
+    private func fetchPlaylistDetail(
+        _ playlist: NeteasePlaylistsResponse.Playlist,
+        cookie: String
+    ) async -> MusicProviderPlaylist {
+        var components = URLComponents(
+            url: baseURL.appending(path: "/api/v6/playlist/detail"),
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "id", value: String(playlist.id)),
+            URLQueryItem(name: "n", value: "1000"),
+            URLQueryItem(name: "s", value: "0"),
+        ]
+        guard
+            let response = try? await transport.send(
+                providerRequest(url: components.url!, cookie: cookie)
+            ),
+            let data = try? checkedProviderResponse(response),
+            let detail = try? JSONDecoder().decode(
+                NeteasePlaylistDetailResponse.self,
+                from: data
+            )
+        else {
+            return playlist.providerPlaylist(tracks: [])
+        }
+        let tracks = (detail.playlist?.tracks ?? []).map {
+            $0.providerTrack(matchScore: 0.72, userAffinity: 1)
+        }
+        return playlist.providerPlaylist(tracks: tracks)
     }
 
     func playbackAsset(
@@ -266,17 +439,7 @@ struct NeteaseMusicProviderClient: AccountMusicProviderClient {
     }
 
     private func securePlaybackURL(_ url: URL) -> URL {
-        guard
-            url.scheme?.lowercased() == "http",
-            var components = URLComponents(
-                url: url,
-                resolvingAgainstBaseURL: false
-            )
-        else {
-            return url
-        }
-        components.scheme = "https"
-        return components.url ?? url
+        url.gmgnHTTPSURL
     }
 
     private func playbackResponse(
@@ -348,7 +511,7 @@ struct NeteaseMusicProviderClient: AccountMusicProviderClient {
                 guard let artworkURL = song.album?.picUrl ?? song.al?.picUrl else {
                     return nil
                 }
-                return (String(song.id), artworkURL)
+                return (String(song.id), artworkURL.gmgnHTTPSURL)
             }
         )
         var hydrated = tracks
@@ -436,7 +599,18 @@ private struct NeteaseSongDetailResponse: Decodable {
 }
 
 private struct NeteaseAccountResponse: Decodable {
+    let code: Int?
+    let message: String?
     let profile: Profile?
+    let data: Payload?
+
+    var resolvedProfile: Profile? {
+        profile ?? data?.profile
+    }
+
+    struct Payload: Decodable {
+        let profile: Profile?
+    }
 
     struct Profile: Decodable {
         let userId: Int64
@@ -448,6 +622,24 @@ private struct NeteasePlaylistsResponse: Decodable {
 
     struct Playlist: Decodable {
         let id: Int64
+        let name: String?
+        let coverImgUrl: URL?
+        let trackCount: Int?
+
+        func providerPlaylist(
+            tracks: [MusicProviderTrack]
+        ) -> MusicProviderPlaylist {
+            let trimmedName = name?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ) ?? ""
+            return MusicProviderPlaylist(
+                id: String(id),
+                name: trimmedName.isEmpty ? "网易云歌单" : trimmedName,
+                artworkURL: coverImgUrl?.gmgnHTTPSURL,
+                trackCount: max(trackCount ?? 0, tracks.count),
+                tracks: tracks
+            )
+        }
     }
 }
 
@@ -456,6 +648,12 @@ private struct NeteasePlaylistDetailResponse: Decodable {
 
     struct Playlist: Decodable {
         let tracks: [NeteaseTrackDTO]?
+        let trackIds: [TrackID]?
+        let trackCount: Int?
+
+        struct TrackID: Decodable {
+            let id: Int64
+        }
     }
 }
 
@@ -475,6 +673,131 @@ private struct NeteasePlaybackResponse: Decodable {
     struct Item: Decodable {
         let url: URL?
         let code: Int
+    }
+}
+
+private enum NeteaseWeAPIRequestEncoder {
+    private static let presetKey = Data("0CoJUm6Qyw8W8jud".utf8)
+    private static let secretKey = Data("gmgnRadio2026Key".utf8)
+    private static let initializationVector = Data("0102030405060708".utf8)
+    private static let publicKeyDERBase64 = "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDgtQn2JZ34ZC28NWYpAUd98iZ37BUrX/aKzmFbt7clFSs6sXqHauqKWqdtLkF2KexO40H1YTX8z2lSgBBOAxLsvaklV8k4cBFK9snQXE9/DDaFt6Rr7iVZMldczhC0JNgTz+SHXT6CBHuX3e9SdB1Ua44oncaTWz7OBGLbCiK45wIDAQAB"
+
+    static func accountStatusRequest(
+        cookie: String,
+        baseURL: URL
+    ) throws -> URLRequest {
+        let jsonData = Data("{}".utf8)
+        let firstPass = try encryptCBC(
+            jsonData,
+            key: presetKey
+        ).base64EncodedString()
+        let params = try encryptCBC(
+            Data(firstPass.utf8),
+            key: secretKey
+        ).base64EncodedString()
+        let encSecKey = try encryptedSecretKey()
+        var bodyComponents = URLComponents()
+        bodyComponents.queryItems = [
+            URLQueryItem(name: "params", value: params),
+            URLQueryItem(name: "encSecKey", value: encSecKey),
+        ]
+
+        var request = URLRequest(
+            url: baseURL.appending(path: "/weapi/w/nuser/account/get")
+        )
+        request.timeoutInterval = 12
+        request.httpMethod = "POST"
+        request.setValue(
+            "application/x-www-form-urlencoded",
+            forHTTPHeaderField: "Content-Type"
+        )
+        request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        request.setValue(
+            "https://music.163.com/",
+            forHTTPHeaderField: "Referer"
+        )
+        request.setValue(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X) gmgn-radio/0.1",
+            forHTTPHeaderField: "User-Agent"
+        )
+        request.httpBody = Data(
+            (bodyComponents.percentEncodedQuery ?? "").utf8
+        )
+        return request
+    }
+
+    private static func encryptCBC(
+        _ plaintext: Data,
+        key: Data
+    ) throws -> Data {
+        var output = Data(count: plaintext.count + kCCBlockSizeAES128)
+        let capacity = output.count
+        var outputLength = 0
+        let status = plaintext.withUnsafeBytes { inputBytes in
+            key.withUnsafeBytes { keyBytes in
+                initializationVector.withUnsafeBytes { ivBytes in
+                    output.withUnsafeMutableBytes { outputBytes in
+                        CCCrypt(
+                            CCOperation(kCCEncrypt),
+                            CCAlgorithm(kCCAlgorithmAES),
+                            CCOptions(kCCOptionPKCS7Padding),
+                            keyBytes.baseAddress,
+                            key.count,
+                            ivBytes.baseAddress,
+                            inputBytes.baseAddress,
+                            plaintext.count,
+                            outputBytes.baseAddress,
+                            capacity,
+                            &outputLength
+                        )
+                    }
+                }
+            }
+        }
+        guard status == kCCSuccess else {
+            throw MusicProviderClientError.invalidResponse
+        }
+        output.removeSubrange(outputLength ..< output.count)
+        return output
+    }
+
+    private static func encryptedSecretKey() throws -> String {
+        guard let der = Data(base64Encoded: publicKeyDERBase64) else {
+            throw MusicProviderClientError.invalidResponse
+        }
+        let attributes: [CFString: Any] = [
+            kSecAttrKeyType: kSecAttrKeyTypeRSA,
+            kSecAttrKeyClass: kSecAttrKeyClassPublic,
+            kSecAttrKeySizeInBits: 1_024,
+        ]
+        var creationError: Unmanaged<CFError>?
+        guard let publicKey = SecKeyCreateWithData(
+            der as CFData,
+            attributes as CFDictionary,
+            &creationError
+        ) else {
+            throw MusicProviderClientError.invalidResponse
+        }
+        let blockSize = SecKeyGetBlockSize(publicKey)
+        let reversedSecret = Data(secretKey.reversed())
+        guard reversedSecret.count <= blockSize else {
+            throw MusicProviderClientError.invalidResponse
+        }
+        var paddedSecret = Data(
+            repeating: 0,
+            count: blockSize - reversedSecret.count
+        )
+        paddedSecret.append(reversedSecret)
+        var encryptionError: Unmanaged<CFError>?
+        guard let encrypted = SecKeyCreateEncryptedData(
+            publicKey,
+            .rsaEncryptionRaw,
+            paddedSecret as CFData,
+            &encryptionError
+        ) as Data? else {
+            throw MusicProviderClientError.invalidResponse
+        }
+        return encrypted.map { String(format: "%02x", $0) }.joined()
     }
 }
 
@@ -694,7 +1017,23 @@ private struct NeteaseTrackDTO: Decodable {
             moodTags: [],
             genres: [],
             releaseYear: nil,
-            artworkURL: album?.picUrl ?? al?.picUrl
+            artworkURL: (album?.picUrl ?? al?.picUrl)?.gmgnHTTPSURL
         )
+    }
+}
+
+private extension URL {
+    var gmgnHTTPSURL: URL {
+        guard
+            scheme?.lowercased() == "http",
+            var components = URLComponents(
+                url: self,
+                resolvingAgainstBaseURL: false
+            )
+        else {
+            return self
+        }
+        components.scheme = "https"
+        return components.url ?? self
     }
 }

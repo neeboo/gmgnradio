@@ -1,6 +1,23 @@
 import Foundation
 import os
 
+private enum MusicLibrarySyncError: LocalizedError {
+    case timedOut
+    case unsupportedProvider
+    case emptyLibrary
+
+    var errorDescription: String? {
+        switch self {
+        case .timedOut:
+            "音乐服务在 30 秒内没有完成同步，请稍后重试。"
+        case .unsupportedProvider:
+            "这个音乐服务暂时不能同步歌单。"
+        case .emptyLibrary:
+            "音乐服务没有返回任何歌单，已保留原有本地歌单。"
+        }
+    }
+}
+
 enum PreparedMusicPlayback: Equatable, Sendable {
     case pcmFile(URL)
     case appleMusic(trackID: String)
@@ -107,6 +124,120 @@ final class MusicRuntime {
         try await UnifiedMusicSearch(
             sources: [netease, qqMusic, appleMusic]
         ).search(request)
+    }
+
+    func fetchConnectedLibraries() async -> [MusicLibrarySnapshot] {
+        let sources: [any MusicSource] = [
+            netease,
+            qqMusic,
+            appleMusic,
+        ]
+        var libraries: [MusicLibrarySnapshot] = []
+        for source in sources {
+            guard await source.access().isReady else {
+                logger.info(
+                    "跳过未连接音乐账号：provider=\(source.id.rawValue, privacy: .public)"
+                )
+                continue
+            }
+            do {
+                let library = try await source.fetchUserLibrary()
+                libraries.append(library)
+                await libraryIndex.ingest(
+                    library.savedTracks,
+                    origin: .saved,
+                    seenAt: Date()
+                )
+                logger.info(
+                    "音乐歌单同步完成：provider=\(source.id.rawValue, privacy: .public)，playlists=\(library.playlists.count)，tracks=\(library.savedTracks.count)"
+                )
+            } catch {
+                logger.error(
+                    "音乐歌单同步失败：provider=\(source.id.rawValue, privacy: .public)，error=\(String(describing: error), privacy: .public)"
+                )
+            }
+        }
+        return libraries
+    }
+
+    func fetchLibrary(
+        providerID: MusicProviderID
+    ) async throws -> MusicLibrarySnapshot {
+        let source: any MusicSource
+        switch providerID {
+        case .netease:
+            source = netease
+        case .qqMusic:
+            source = qqMusic
+        case .appleMusic:
+            source = appleMusic
+        default:
+            throw MusicLibrarySyncError.unsupportedProvider
+        }
+
+        let library = try await withThrowingTaskGroup(
+            of: MusicLibrarySnapshot.self
+        ) { group in
+            group.addTask {
+                try await source.fetchUserLibrary()
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: 30_000_000_000)
+                throw MusicLibrarySyncError.timedOut
+            }
+            defer { group.cancelAll() }
+            guard let result = try await group.next() else {
+                throw MusicLibrarySyncError.unsupportedProvider
+            }
+            return result
+        }
+        guard !library.playlists.isEmpty else {
+            throw MusicLibrarySyncError.emptyLibrary
+        }
+        await libraryIndex.ingest(
+            library.savedTracks,
+            origin: .saved,
+            seenAt: Date()
+        )
+        logger.info(
+            "音乐歌单同步完成：provider=\(providerID.rawValue, privacy: .public)，playlists=\(library.playlists.count)，tracks=\(library.savedTracks.count)"
+        )
+        return library
+    }
+
+    func fetchPlaylistPage(
+        providerID: MusicProviderID,
+        playlistID: String,
+        offset: Int,
+        limit: Int = 20
+    ) async throws -> MusicPlaylistPage {
+        switch providerID {
+        case .netease:
+            return try await netease.fetchPlaylistPage(
+                playlistID: playlistID,
+                offset: offset,
+                limit: limit
+            )
+        case .qqMusic:
+            return try await qqMusic.fetchPlaylistPage(
+                playlistID: playlistID,
+                offset: offset,
+                limit: limit
+            )
+        case .appleMusic:
+            return try await appleMusic.fetchPlaylistPage(
+                playlistID: playlistID,
+                offset: offset,
+                limit: limit
+            )
+        default:
+            return MusicPlaylistPage(
+                playlistID: playlistID,
+                tracks: [],
+                offset: max(0, offset),
+                totalTrackCount: 0
+            )
+        }
     }
 
     func artworkURL(for candidate: MusicCandidate) async -> URL? {

@@ -181,34 +181,34 @@ struct OrbMotionModel: Sendable {
         case .idle:
             OrbMotionFrame(
                 energy: 0.18 + slowWave * 0.008,
-                deformation: 0.10 + slowWave * 0.004,
+                deformation: 0,
                 glow: 0.23 + slowWave * 0.008,
                 particleAmount: 0.006,
                 hue: 0.64 + slowWave * 0.003,
                 opacity: 0.86,
-                scale: 1.0 + slowWave * 0.006,
+                scale: 1,
                 listeningRing: 0
             )
         case .listening:
             OrbMotionFrame(
                 energy: 0.72 + quickWave * 0.05,
-                deformation: 0.16 + quickWave * 0.025,
+                deformation: 0,
                 glow: 0.34 + slowWave * 0.03,
                 particleAmount: 0.012,
                 hue: 0.54 + slowWave * 0.012,
                 opacity: 0.86,
-                scale: 1.01 + quickWave * 0.012,
+                scale: 1,
                 listeningRing: 0.86 + slowWave * 0.06
             )
         case .thinking:
             OrbMotionFrame(
                 energy: 0.56 + quickWave * 0.05,
-                deformation: 0.23 + slowWave * 0.035,
+                deformation: 0,
                 glow: 0.27,
                 particleAmount: 0.014,
                 hue: 0.69 + quickWave * 0.014,
                 opacity: 0.80,
-                scale: 0.99 + slowWave * 0.01,
+                scale: 1,
                 listeningRing: 0.12
             )
         case .speaking:
@@ -225,18 +225,18 @@ struct OrbMotionModel: Sendable {
         case .playing:
             OrbMotionFrame(
                 energy: 0.58 + slowWave * 0.08,
-                deformation: 0.25 + quickWave * 0.04,
+                deformation: 0,
                 glow: 0.29 + slowWave * 0.025,
                 particleAmount: 0.022,
                 hue: 0.65 + slowWave * 0.025,
                 opacity: 0.84,
-                scale: 1.0 + slowWave * 0.018,
+                scale: 1,
                 listeningRing: 0.04
             )
         case .reconnecting:
             OrbMotionFrame(
                 energy: 0.34 + slowWave * 0.02,
-                deformation: 0.09,
+                deformation: 0,
                 glow: 0.20 + slowWave * 0.04,
                 particleAmount: 0.006,
                 hue: 0.58,
@@ -258,7 +258,7 @@ struct OrbMotionModel: Sendable {
         case .failed:
             OrbMotionFrame(
                 energy: 0.80 + quickWave * 0.04,
-                deformation: 0.14,
+                deformation: 0,
                 glow: 0.30,
                 particleAmount: 0.008,
                 hue: 0.98,
@@ -270,12 +270,10 @@ struct OrbMotionModel: Sendable {
 
         if state == .playing {
             result.energy += audio.low * 0.18
-            result.deformation += (audio.low * 0.08) + (audio.mid * 0.05)
             result.glow += audio.high * 0.06
             result.particleAmount += audio.high * 0.012
-            result.scale += audio.low * 0.025
         }
-        if state == .listening || state == .speaking {
+        if state == .speaking {
             let voice = min(max(audio.amplitude, 0), 1)
             result.energy += voice * 0.34
             result.deformation += voice * 0.12

@@ -241,19 +241,25 @@ final class StageRenderer: NSObject, MTKViewDelegate {
             choice: visualDirections.currentPointCloudChoice,
             videoActive: videos.isActive
         )
+        let viewport = SIMD2<Float>(
+            Float(view.drawableSize.width),
+            Float(view.drawableSize.height)
+        )
+        let particleSizeMultiplier = StageParticleSizing.effectiveScale(
+            viewport: viewport,
+            manualMultiplier: visualDirections.particleSizeMultiplier
+        )
         var uniforms = StageUniforms.make(
             camera: camera.frame,
             audio: reactiveAudio,
             time: elapsed,
-            viewport: SIMD2<Float>(
-                Float(view.drawableSize.width),
-                Float(view.drawableSize.height)
-            ),
+            viewport: viewport,
             presetWeights: presetWeights,
             composition: presetFrame.composition,
             palette: displayedPalette,
             visualIntensity: visualDirections.currentIntensity,
             compositing: compositing,
+            particleSizeMultiplier: particleSizeMultiplier,
             pointLayers: pointLayers
         )
         uniforms.viewportAndMotion.w = hasArtwork ? 1 : 0

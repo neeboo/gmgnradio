@@ -15,6 +15,7 @@ final class OrbRenderer: NSObject, MTKViewDelegate {
     private let startedAt: ContinuousClock.Instant
     private var state: DJState = .idle
     private var voiceLevel: Float = 0
+    private var appearance: OrbAppearance
     private var motionModel = OrbMotionModel(
         initial: .idle,
         seed: 0x474D474E,
@@ -25,7 +26,8 @@ final class OrbRenderer: NSObject, MTKViewDelegate {
     init(
         device: MTLDevice,
         colorPixelFormat: MTLPixelFormat,
-        audioFeatures: VisualAudioFeatureStore
+        audioFeatures: VisualAudioFeatureStore,
+        appearance: OrbAppearance
     ) throws {
         guard let commandQueue = device.makeCommandQueue() else {
             throw OrbRendererError.missingCommandQueue
@@ -55,6 +57,7 @@ final class OrbRenderer: NSObject, MTKViewDelegate {
 
         self.commandQueue = commandQueue
         self.audioFeatures = audioFeatures
+        self.appearance = appearance
         pipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
         startedAt = clock.now
         super.init()
@@ -78,6 +81,10 @@ final class OrbRenderer: NSObject, MTKViewDelegate {
 
     func setVoiceLevel(_ level: Float) {
         voiceLevel = min(max(level, 0), 1)
+    }
+
+    func setAppearance(_ appearance: OrbAppearance) {
+        self.appearance = appearance
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
@@ -114,6 +121,8 @@ final class OrbRenderer: NSObject, MTKViewDelegate {
         uniforms.audioHigh = audio.high
         uniforms.scale = motion.scale
         uniforms.listeningRing = motion.listeningRing
+        uniforms.accentColor = appearance.metalColor
+        uniforms.flowIntensity = appearance.flowIntensity
 
         encoder.label = "gmgn radio orb encoder"
         encoder.setRenderPipelineState(pipelineState)

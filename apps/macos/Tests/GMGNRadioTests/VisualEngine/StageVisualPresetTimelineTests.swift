@@ -232,3 +232,24 @@ func legacyVinylPreferenceRestoresAsAlbumRelief() throws {
 
     #expect(restored.currentPointCloudChoice == .albumRelief)
 }
+
+@Test
+@MainActor
+func particleSizeFineTuneIsClampedAndRestoredLocally() throws {
+    let suiteName = "gmgn-radio-particle-size-\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defaults.removePersistentDomain(forName: suiteName)
+    defer {
+        defaults.removePersistentDomain(forName: suiteName)
+    }
+
+    let first = StageVisualDirectionStore(defaults: defaults)
+    #expect(first.particleSizeMultiplier == 1)
+
+    first.setParticleSizeMultiplier(1.32)
+    let restored = StageVisualDirectionStore(defaults: defaults)
+    #expect(abs(restored.particleSizeMultiplier - 1.32) < 0.001)
+
+    restored.setParticleSizeMultiplier(3)
+    #expect(restored.particleSizeMultiplier == 1.6)
+}

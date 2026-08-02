@@ -117,6 +117,14 @@ func qqMusicClientLoadsAndDeduplicatesTracksFromTheUsersPlaylists() async throws
     )
 
     #expect(library.playlistIDs == ["7001", "7002"])
+    #expect(library.playlists.map(\.name) == ["我喜欢", "通勤"])
+    #expect(library.playlists[0].tracks.map(\.id) == [
+        "song-mid@media-mid",
+    ])
+    #expect(library.playlists[1].tracks.map(\.id) == [
+        "song-mid@media-mid",
+        "commute-mid@commute-media",
+    ])
     #expect(library.savedTracks.map(\.id) == [
         "song-mid@media-mid",
         "commute-mid@commute-media",
@@ -173,6 +181,11 @@ func qqMusicClientKeepsAvailablePlaylistsWhenOneDetailRequestFails() async throw
     )
 
     #expect(library.playlistIDs == ["7001", "7002"])
+    #expect(library.playlists.map(\.name) == ["暂时失效", "仍然可用"])
+    #expect(library.playlists[0].tracks.isEmpty)
+    #expect(library.playlists[1].tracks.map(\.id) == [
+        "available-mid@available-media",
+    ])
     #expect(library.savedTracks.map(\.id) == [
         "available-mid@available-media",
     ])

@@ -321,6 +321,12 @@ enum DJAgentCapabilityManifest {
             requiresTakeover: false
         ),
         DJAgentCapability(
+            name: "read_current_track",
+            description:
+                "调用当下读取真实播放关系：previousTrack 是刚刚实际播过的上一首，当前快照是扬声器中正在播放或暂停的歌曲，nextTrack 是队列中实际准备的下一首；查询歌曲或生成串场词时必须调用，不能使用历史上下文",
+            requiresTakeover: false
+        ),
+        DJAgentCapability(
             name: "search_music",
             description:
                 "搜索用户已连接的网易云、QQ 音乐和 Apple Music 曲库",
@@ -479,6 +485,33 @@ struct DJAgentMusicTrack: Codable, Equatable, Sendable {
     let isPlayable: Bool
 }
 
+struct DJAgentPlaybackTrack: Codable, Equatable, Sendable {
+    let id: String
+    let title: String
+    let artist: String
+}
+
+struct DJAgentCurrentTrackSnapshot: Codable, Equatable, Sendable {
+    let sampledAt: String
+    let playbackState: String
+    let isPlaying: Bool
+    let id: String
+    let provider: String
+    let source: String
+    let title: String
+    let artist: String
+    let album: String?
+    let durationSeconds: TimeInterval
+    let positionSeconds: TimeInterval
+    let remainingSeconds: TimeInterval
+    let progress: Double
+    let programID: String?
+    let programTitle: String?
+    let slotIndex: Int?
+    let previousTrack: DJAgentPlaybackTrack?
+    let nextTrack: DJAgentPlaybackTrack?
+}
+
 struct DJAgentRadioState: Codable, Equatable, Sendable {
     let takeoverEnabled: Bool
     let playbackState: String
@@ -511,11 +544,13 @@ struct DJAgentToolResponse: Codable, Equatable, Sendable {
     let message: String
     let state: DJAgentRadioState?
     let tracks: [DJAgentMusicTrack]?
+    let currentTrack: DJAgentCurrentTrackSnapshot?
 }
 
 @MainActor
 protocol DJAgentRadioActions: AnyObject {
     func snapshot(takeoverEnabled: Bool) -> DJAgentRadioState
+    func currentTrackSnapshot() -> DJAgentCurrentTrackSnapshot?
     func playProgramTrack(
         trackID: String?,
         slotIndex: Int?
@@ -638,9 +673,15 @@ final class DJAgentToolDispatcher {
         do {
             let message: String
             var tracks: [DJAgentMusicTrack]?
+            var currentTrack: DJAgentCurrentTrackSnapshot?
             switch call.name {
             case "read_radio_state":
                 message = "已读取当前电台状态"
+            case "read_current_track":
+                currentTrack = actions.currentTrackSnapshot()
+                message = currentTrack == nil
+                    ? "当前没有正在播放或暂停中的歌曲"
+                    : "已读取调用当下的歌曲信息"
             case "search_music":
                 let arguments = try decode(
                     SearchArguments.self,
@@ -752,7 +793,8 @@ final class DJAgentToolDispatcher {
                 code: nil,
                 message: message,
                 state: actions.snapshot(takeoverEnabled: enabled),
-                tracks: tracks
+                tracks: tracks,
+                currentTrack: currentTrack
             )
         } catch {
             return makeResult(
@@ -783,14 +825,16 @@ final class DJAgentToolDispatcher {
         code: String?,
         message: String,
         state: DJAgentRadioState?,
-        tracks: [DJAgentMusicTrack]?
+        tracks: [DJAgentMusicTrack]?,
+        currentTrack: DJAgentCurrentTrackSnapshot? = nil
     ) -> RealtimeDJToolResult {
         let response = DJAgentToolResponse(
             ok: ok,
             code: code,
             message: message,
             state: state,
-            tracks: tracks
+            tracks: tracks,
+            currentTrack: currentTrack
         )
         let data = (try? JSONEncoder().encode(response))
             ?? Data(#"{"ok":false,"message":"结果编码失败"}"#.utf8)

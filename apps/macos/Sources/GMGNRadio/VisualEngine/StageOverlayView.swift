@@ -1751,6 +1751,36 @@ struct StageVisualPickerView: View {
                 }
             }
 
+            HStack(spacing: 10) {
+                Image(systemName: "circle.grid.2x2.fill")
+                    .foregroundStyle(.white.opacity(0.46))
+                Slider(
+                    value: Binding(
+                        get: {
+                            Double(visualDirections.particleSizeMultiplier)
+                        },
+                        set: {
+                            visualDirections.setParticleSizeMultiplier(
+                                Float($0)
+                            )
+                        }
+                    ),
+                    in: Double(StageParticleSizing.manualRange.lowerBound)
+                        ... Double(StageParticleSizing.manualRange.upperBound)
+                )
+                .tint(.cyan.opacity(0.86))
+                .accessibilityLabel("颗粒大小")
+                Text(
+                    "\(Int(visualDirections.particleSizeMultiplier * 100))%"
+                )
+                .monospacedDigit()
+                .frame(width: 38, alignment: .trailing)
+                .foregroundStyle(.white.opacity(0.5))
+            }
+            .font(.system(size: 11, weight: .semibold, design: .rounded))
+            .padding(.horizontal, 10)
+            .frame(height: 24)
+
             pickerHeader("MV 场景", symbol: "film.stack")
 
             HStack(spacing: 6) {
@@ -1966,9 +1996,12 @@ struct StageProgramRailModel: Equatable {
         plan: ProgramPlan?,
         activeSlotIndex: Int?
     ) {
-        title = plan?.title
         guard let plan, !plan.slots.isEmpty else {
-            cards = []
+            self.init(
+                title: plan?.title,
+                tracks: [],
+                activeIndex: nil
+            )
             return
         }
 
@@ -1982,38 +2015,62 @@ struct StageProgramRailModel: Equatable {
             activeIndex = nil
         }
 
-        cards = plan.slots
-            .enumerated()
-            .map { absoluteIndex, slot in
-                let relativeIndex = activeIndex.map {
-                    absoluteIndex - $0
-                } ?? absoluteIndex
-                let isCurrent = absoluteIndex == activeIndex
-                let distance = abs(relativeIndex)
-                let visualDistance = min(distance, 2)
-                return StageProgramRailCard(
-                    slotIndex: absoluteIndex,
-                    trackID: slot.track.id,
-                    title: slot.track.title,
-                    artist: slot.track.artist,
-                    energy: slot.track.energy,
-                    relativeIndex: relativeIndex,
-                    isCurrent: isCurrent,
-                    depth: visualDistance * -72,
-                    opacity: isCurrent
-                        ? 1
-                        : max(
-                            relativeIndex < 0 ? 0.34 : 0.46,
-                            1 - Double(visualDistance) * 0.16
-                        ),
-                    scale: isCurrent
-                        ? 1
-                        : max(
-                            0.78,
-                            1 - Double(visualDistance) * 0.055
-                        )
-                )
+        self.init(
+            title: plan.title,
+            tracks: plan.slots.map(\.track),
+            activeIndex: activeIndex
+        )
+    }
+
+    init(
+        playlist: MusicPlaylistSnapshot,
+        activeTrackID: String?
+    ) {
+        self.init(
+            title: playlist.name,
+            tracks: playlist.tracks,
+            activeIndex: activeTrackID.flatMap { activeTrackID in
+                playlist.tracks.firstIndex { $0.id == activeTrackID }
             }
+        )
+    }
+
+    private init(
+        title: String?,
+        tracks: [MusicCandidate],
+        activeIndex: Int?
+    ) {
+        self.title = title
+        cards = tracks.enumerated().map { absoluteIndex, track in
+            let relativeIndex = activeIndex.map {
+                absoluteIndex - $0
+            } ?? absoluteIndex
+            let isCurrent = absoluteIndex == activeIndex
+            let distance = abs(relativeIndex)
+            let visualDistance = min(distance, 2)
+            return StageProgramRailCard(
+                slotIndex: absoluteIndex,
+                trackID: track.id,
+                title: track.title,
+                artist: track.artist,
+                energy: track.energy,
+                relativeIndex: relativeIndex,
+                isCurrent: isCurrent,
+                depth: visualDistance * -72,
+                opacity: isCurrent
+                    ? 1
+                    : max(
+                        relativeIndex < 0 ? 0.34 : 0.46,
+                        1 - Double(visualDistance) * 0.16
+                    ),
+                scale: isCurrent
+                    ? 1
+                    : max(
+                        0.78,
+                        1 - Double(visualDistance) * 0.055
+                    )
+            )
+        }
     }
 }
 
@@ -2021,28 +2078,63 @@ struct StageProgramRailModel: Equatable {
 enum StageProgramRailRoute: Equatable {
     case programs
     case tracks(programID: String)
+    case playlistTracks(playlistID: String)
+}
+
+enum StageProgramRailCatalog {
+    static func visiblePrograms(
+        _ programs: [SavedDJProgram],
+        syncedPlaylists: [MusicPlaylistSnapshot]
+    ) -> [SavedDJProgram] {
+        let syncedIDs = Set(syncedPlaylists.map(\.id))
+        return programs.filter {
+            !syncedIDs.contains($0.plan.brief.id)
+        }
+    }
 }
 
 @MainActor
 final class StageProgramRailSelection: ObservableObject {
     @Published private(set) var route = StageProgramRailRoute.programs
     @Published private(set) var selectedProgramID: String?
+    @Published private(set) var selectedPlaylistID: String?
     @Published private(set) var selectedSlotIndex: Int?
     private let onPlay: @MainActor (String, Int) -> Void
     private let onReplan: @MainActor () -> Void
+    private let onPlayPlaylist: @MainActor (String, Int) -> Void
+    private let onOpenPlaylist: @MainActor (String) -> Void
+    private let onLoadMorePlaylist: @MainActor (String) -> Void
 
     init(
         onPlay: @escaping @MainActor (String, Int) -> Void = { _, _ in },
+        onPlayPlaylist:
+            @escaping @MainActor (String, Int) -> Void = { _, _ in },
+        onOpenPlaylist:
+            @escaping @MainActor (String) -> Void = { _ in },
+        onLoadMorePlaylist:
+            @escaping @MainActor (String) -> Void = { _ in },
         onReplan: @escaping @MainActor () -> Void = {}
     ) {
         self.onPlay = onPlay
+        self.onPlayPlaylist = onPlayPlaylist
+        self.onOpenPlaylist = onOpenPlaylist
+        self.onLoadMorePlaylist = onLoadMorePlaylist
         self.onReplan = onReplan
     }
 
     func openProgram(_ programID: String) {
         selectedProgramID = programID
+        selectedPlaylistID = nil
         selectedSlotIndex = nil
         route = .tracks(programID: programID)
+    }
+
+    func openPlaylist(_ playlistID: String) {
+        selectedPlaylistID = playlistID
+        selectedProgramID = nil
+        selectedSlotIndex = nil
+        route = .playlistTracks(playlistID: playlistID)
+        onOpenPlaylist(playlistID)
     }
 
     func showPrograms() {
@@ -2051,40 +2143,57 @@ final class StageProgramRailSelection: ObservableObject {
     }
 
     func activate(slotIndex: Int) {
-        guard let selectedProgramID else {
-            return
-        }
         selectedSlotIndex = slotIndex
-        onPlay(selectedProgramID, slotIndex)
+        switch route {
+        case let .tracks(programID):
+            onPlay(programID, slotIndex)
+        case let .playlistTracks(playlistID):
+            onPlayPlaylist(playlistID, slotIndex)
+        case .programs:
+            break
+        }
     }
 
     func replan() {
         onReplan()
+    }
+
+    func loadMoreSelectedPlaylist() {
+        guard let selectedPlaylistID else {
+            return
+        }
+        onLoadMorePlaylist(selectedPlaylistID)
     }
 }
 
 @MainActor
 struct StageProgramRailView: View {
     @Bindable var programStore: DJProgramStore
+    @Bindable var libraryStore: SyncedMusicLibraryStore
     @ObservedObject var selection: StageProgramRailSelection
     @ObservedObject var videos: StageVideoPlaybackStore
     let audioFeatures: VisualAudioFeatureStore
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var programs: [SavedDJProgram] {
+        let candidates: [SavedDJProgram]
         if !programStore.recentPrograms.isEmpty {
-            return programStore.recentPrograms
+            candidates = programStore.recentPrograms
+        } else if let plan = programStore.plan {
+            candidates = [
+                SavedDJProgram(
+                    plan: plan,
+                    activeSlotIndex: programStore.activeSlotIndex,
+                    updatedAt: plan.generatedAt
+                ),
+            ]
+        } else {
+            candidates = []
         }
-        guard let plan = programStore.plan else {
-            return []
-        }
-        return [
-            SavedDJProgram(
-                plan: plan,
-                activeSlotIndex: programStore.activeSlotIndex,
-                updatedAt: plan.generatedAt
-            ),
-        ]
+        return StageProgramRailCatalog.visiblePrograms(
+            candidates,
+            syncedPlaylists: libraryStore.playlists
+        )
     }
 
     private var selectedProgram: SavedDJProgram? {
@@ -2096,7 +2205,22 @@ struct StageProgramRailView: View {
         }
     }
 
+    private var selectedPlaylist: MusicPlaylistSnapshot? {
+        guard let selectedPlaylistID = selection.selectedPlaylistID else {
+            return nil
+        }
+        return libraryStore.playlist(id: selectedPlaylistID)
+    }
+
     private var trackModel: StageProgramRailModel {
+        if let selectedPlaylist {
+            return StageProgramRailModel(
+                playlist: selectedPlaylist,
+                activeTrackID: programStore.plan?.brief.id == selectedPlaylist.id
+                    ? programStore.activeSlot?.track.id
+                    : nil
+            )
+        }
         let selected = selectedProgram
         let isPlayingSelectedProgram =
             selected?.plan.brief.id == programStore.plan?.brief.id
@@ -2115,6 +2239,8 @@ struct StageProgramRailView: View {
                 programList
             case .tracks:
                 trackList
+            case .playlistTracks:
+                trackList
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
@@ -2128,11 +2254,14 @@ struct StageProgramRailView: View {
 
     @ViewBuilder
     private var programList: some View {
-        if programs.isEmpty {
+        if programs.isEmpty && libraryStore.playlists.isEmpty {
             emptyState
                 .padding(.top, 96)
         } else {
-            railHeader(title: "节目单", count: programs.count)
+            railHeader(
+                title: "歌单",
+                count: programs.count + libraryStore.playlists.count
+            )
             ScrollView(.vertical, showsIndicators: false) {
                 LazyVStack(alignment: .trailing, spacing: 4) {
                     ForEach(programs, id: \.plan.brief.id) { saved in
@@ -2226,6 +2355,9 @@ struct StageProgramRailView: View {
                         )
                         .shadow(color: .black.opacity(0.38), radius: 13, y: 7)
                     }
+                    ForEach(libraryStore.playlists) { playlist in
+                        syncedPlaylistButton(playlist)
+                    }
                 }
             }
             .contentMargins(.vertical, 18)
@@ -2236,8 +2368,27 @@ struct StageProgramRailView: View {
     @ViewBuilder
     private var trackList: some View {
         if trackModel.cards.isEmpty {
-            emptyState
+            Group {
+                if selectedPlaylist != nil {
+                    VStack(spacing: 10) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("正在加载歌曲…")
+                            .font(.system(
+                                size: 13,
+                                weight: .medium,
+                                design: .rounded
+                            ))
+                    }
+                    .foregroundStyle(.white.opacity(0.58))
+                } else {
+                    emptyState
+                }
+            }
                 .padding(.top, 96)
+                .onAppear {
+                    selection.loadMoreSelectedPlaylist()
+                }
         } else {
             HStack(spacing: 8) {
                 Button {
@@ -2255,8 +2406,17 @@ struct StageProgramRailView: View {
                     Text(title.uppercased())
                         .lineLimit(1)
                 }
-                Text("· \(trackModel.cards.count)")
-                replanButton
+                if let selectedPlaylist {
+                    Text(
+                        "· \(selectedPlaylist.tracks.count)"
+                            + " / \(selectedPlaylist.trackCount)"
+                    )
+                } else {
+                    Text("· \(trackModel.cards.count)")
+                }
+                if selectedPlaylist == nil {
+                    replanButton
+                }
             }
             .font(.system(size: 14, weight: .semibold, design: .rounded))
             .tracking(1.2)
@@ -2270,6 +2430,16 @@ struct StageProgramRailView: View {
                         ForEach(trackModel.cards) { card in
                             programCard(card)
                                 .id(card.slotIndex)
+                                .onAppear {
+                                    guard
+                                        selectedPlaylist != nil,
+                                        card.slotIndex
+                                            >= trackModel.cards.count - 4
+                                    else {
+                                        return
+                                    }
+                                    selection.loadMoreSelectedPlaylist()
+                                }
                                 .scrollTransition(
                                     .interactive,
                                     axis: .vertical
@@ -2290,6 +2460,18 @@ struct StageProgramRailView: View {
                                             anchor: .trailing,
                                             perspective: 0.72
                                         )
+                                }
+                        }
+                        if let selectedPlaylist,
+                           selectedPlaylist.tracks.count
+                            < selectedPlaylist.trackCount
+                        {
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(.cyan.opacity(0.8))
+                                .frame(width: 306, height: 44)
+                                .onAppear {
+                                    selection.loadMoreSelectedPlaylist()
                                 }
                         }
                     }
@@ -2319,6 +2501,84 @@ struct StageProgramRailView: View {
         .foregroundStyle(.white.opacity(0.62))
         .shadow(color: .black.opacity(0.9), radius: 4)
         .padding(.horizontal, 14)
+    }
+
+    private func syncedPlaylistButton(
+        _ playlist: MusicPlaylistSnapshot
+    ) -> some View {
+        Button {
+            selection.openPlaylist(playlist.id)
+        } label: {
+            HStack(spacing: 13) {
+                AsyncImage(url: playlist.artworkURL) { image in
+                    image.resizable().scaledToFill()
+                } placeholder: {
+                    Image(systemName: "music.note.list")
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundStyle(Color.red.opacity(0.88))
+                }
+                .frame(width: 42, height: 42)
+                .background(Color.red.opacity(0.1))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(playlist.name)
+                        .font(.system(
+                            size: 16,
+                            weight: .semibold,
+                            design: .rounded
+                        ))
+                        .foregroundStyle(.white.opacity(0.9))
+                        .lineLimit(1)
+                    Text(
+                        "\(providerName(playlist.providerID)) · "
+                            + "\(playlist.trackCount) 首"
+                    )
+                    .font(.system(
+                        size: 13,
+                        weight: .medium,
+                        design: .rounded
+                    ))
+                    .foregroundStyle(.white.opacity(0.46))
+                    .lineLimit(1)
+                }
+                Spacer(minLength: 4)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.34))
+            }
+            .padding(.horizontal, 14)
+            .frame(width: 306, height: 74)
+            .background(
+                .ultraThinMaterial,
+                in: RoundedRectangle(cornerRadius: 22)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 22)
+                    .stroke(Color.white.opacity(0.11), lineWidth: 1)
+            }
+        }
+        .buttonStyle(.plain)
+        .rotation3DEffect(
+            .degrees(-7),
+            axis: (x: 0, y: 1, z: 0),
+            anchor: .trailing,
+            perspective: 0.72
+        )
+        .shadow(color: .black.opacity(0.38), radius: 13, y: 7)
+    }
+
+    private func providerName(_ providerID: MusicProviderID) -> String {
+        switch providerID {
+        case .netease:
+            "网易云"
+        case .qqMusic:
+            "QQ 音乐"
+        case .appleMusic:
+            "Apple Music"
+        default:
+            "音乐库"
+        }
     }
 
     private var replanButton: some View {

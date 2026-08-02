@@ -429,6 +429,78 @@ func musicRuntimeBuildsAnAgentProgramFromTheConnectedLibrary() async throws {
 
 @MainActor
 @Test
+func musicRuntimeReturnsNamedPlaylistsFromConnectedAccounts() async throws {
+    let sessions = InMemoryMusicProviderSessionStore()
+    await sessions.save(
+        providerSession("MUSIC_U=user-session"),
+        for: .netease
+    )
+    let track = MusicProviderTrack(
+        id: "liked-1",
+        canonicalID: nil,
+        title: "夜航",
+        artist: "Example",
+        album: nil,
+        duration: 240,
+        isPlayable: true,
+        matchScore: 0.8,
+        userAffinity: 1,
+        energy: 0.4,
+        moodTags: [],
+        genres: [],
+        releaseYear: nil
+    )
+    let runtime = MusicRuntime(
+        netease: NeteaseMusicSource(
+            sessions: sessions,
+            client: PlaybackAccountClientStub(
+                asset: MusicPlaybackAsset(
+                    url: URL(string: "https://example.com/song.mp3")!,
+                    requestHeaders: [:]
+                ),
+                libraryTracks: [track],
+                playlists: [
+                    MusicProviderPlaylist(
+                        id: "liked",
+                        name: "我喜欢的音乐",
+                        artworkURL: nil,
+                        trackCount: 1,
+                        tracks: [track]
+                    )
+                ]
+            )
+        ),
+        qqMusic: QQMusicSource(
+            sessions: InMemoryMusicProviderSessionStore(),
+            client: PlaybackAccountClientStub(
+                asset: MusicPlaybackAsset(
+                    url: URL(string: "https://example.com/song.mp3")!,
+                    requestHeaders: [:]
+                )
+            )
+        ),
+        appleMusic: AppleMusicSource(
+            client: AppleMusicClientStub(
+                authorization: .denied,
+                canPlayCatalogContent: false
+            )
+        ),
+        cache: MusicAssetCacheStub(
+            localURL: URL(fileURLWithPath: "/tmp/song.mp3")
+        )
+    )
+
+    let libraries = await runtime.fetchConnectedLibraries()
+
+    #expect(libraries.flatMap(\.playlists).map(\.name) == ["我喜欢的音乐"])
+    #expect(
+        libraries.flatMap(\.playlists).first?.tracks.map(\.id)
+            == ["netease:liked-1"]
+    )
+}
+
+@MainActor
+@Test
 func musicRuntimeUsesTheUserInstructionForDiscoveryCandidates() async throws {
     let sessions = InMemoryMusicProviderSessionStore()
     await sessions.save(
@@ -523,6 +595,7 @@ private actor MusicAssetCacheStub: MusicAssetCaching {
 private struct PlaybackAccountClientStub: AccountMusicProviderClient {
     let asset: MusicPlaybackAsset
     var libraryTracks: [MusicProviderTrack] = []
+    var playlists: [MusicProviderPlaylist] = []
     var searchTracks: [MusicProviderTrack] = []
     var expectedSearchText: String?
 
@@ -555,7 +628,7 @@ private struct PlaybackAccountClientStub: AccountMusicProviderClient {
     ) async throws -> MusicProviderLibrary {
         MusicProviderLibrary(
             savedTracks: libraryTracks,
-            playlistIDs: [],
+            playlists: playlists,
             recentlyPlayedTrackIDs: []
         )
     }

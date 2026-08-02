@@ -25,7 +25,8 @@ final class OrbWindowController: NSWindowController, NSWindowDelegate {
         let frame = Self.initialFrame(defaults: defaults)
         let orbView = OrbMetalView(
             frame: CGRect(origin: .zero, size: Constants.size),
-            audioFeatures: audioFeatures
+            audioFeatures: audioFeatures,
+            appearance: OrbAppearance.load(from: defaults)
         )
         orbView.autoresizingMask = [.width, .height]
         self.orbView = orbView
@@ -38,6 +39,12 @@ final class OrbWindowController: NSWindowController, NSWindowDelegate {
         }
         super.init(window: panel)
         panel.delegate = self
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appearanceDidChange),
+            name: .orbAppearanceDidChange,
+            object: defaults
+        )
         startInteractionTracking(panel: panel)
     }
 
@@ -47,6 +54,7 @@ final class OrbWindowController: NSWindowController, NSWindowDelegate {
 
     deinit {
         interactionTask?.cancel()
+        NotificationCenter.default.removeObserver(self)
     }
 
     func show() {
@@ -59,6 +67,10 @@ final class OrbWindowController: NSWindowController, NSWindowDelegate {
 
     func setVoiceLevel(_ level: Double) {
         orbView.setVoiceLevel(Float(level))
+    }
+
+    @objc private func appearanceDidChange() {
+        orbView.setAppearance(OrbAppearance.load(from: defaults))
     }
 
     func enterImmersiveVisuals() {

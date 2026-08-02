@@ -22,9 +22,37 @@ func musicAccountsModelUsesOfficialWebLoginBeforeSavingTheAccount() async {
 }
 
 @MainActor
+@Test
+func musicAccountsModelClearsStaleWebSessionBeforeReconnect() async {
+    let service = MusicAccountServiceSpy()
+    let webLogin = MusicProviderWebLoginStub(
+        cookie: "MUSIC_U=fresh-session"
+    )
+    let model = MusicAccountsModel(
+        service: service,
+        webLogin: webLogin
+    )
+
+    await model.connect(.netease)
+
+    #expect(
+        webLogin.events == [
+            .clear(.netease),
+            .login(.netease),
+        ]
+    )
+}
+
+private enum MusicProviderWebLoginEvent: Equatable {
+    case clear(MusicProviderID)
+    case login(MusicProviderID)
+}
+
+@MainActor
 private final class MusicProviderWebLoginStub: MusicProviderWebAuthenticating {
     let cookie: String
     var requestedProvider: MusicProviderID?
+    var events: [MusicProviderWebLoginEvent] = []
 
     init(cookie: String) {
         self.cookie = cookie
@@ -32,7 +60,12 @@ private final class MusicProviderWebLoginStub: MusicProviderWebAuthenticating {
 
     func login(providerID: MusicProviderID) async throws -> String {
         requestedProvider = providerID
+        events.append(.login(providerID))
         return cookie
+    }
+
+    func clearSession(providerID: MusicProviderID) async {
+        events.append(.clear(providerID))
     }
 }
 

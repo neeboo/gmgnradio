@@ -112,10 +112,118 @@ struct MusicCandidate: Codable, Equatable, Sendable {
     }
 }
 
+struct MusicPlaylistSnapshot: Codable, Equatable, Identifiable, Sendable {
+    let id: String
+    let providerID: MusicProviderID
+    let name: String
+    let artworkURL: URL?
+    let tracks: [MusicCandidate]
+    let totalTrackCount: Int
+
+    var trackCount: Int {
+        max(totalTrackCount, tracks.count)
+    }
+
+    init(
+        id: String,
+        providerID: MusicProviderID,
+        name: String,
+        artworkURL: URL?,
+        tracks: [MusicCandidate],
+        totalTrackCount: Int? = nil
+    ) {
+        self.id = id
+        self.providerID = providerID
+        self.name = name
+        self.artworkURL = artworkURL
+        self.tracks = tracks
+        self.totalTrackCount = max(totalTrackCount ?? tracks.count, tracks.count)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case providerID
+        case name
+        case artworkURL
+        case tracks
+        case totalTrackCount
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        providerID = try container.decode(
+            MusicProviderID.self,
+            forKey: .providerID
+        )
+        name = try container.decode(String.self, forKey: .name)
+        artworkURL = try container.decodeIfPresent(
+            URL.self,
+            forKey: .artworkURL
+        )
+        tracks = try container.decode(
+            [MusicCandidate].self,
+            forKey: .tracks
+        )
+        totalTrackCount = max(
+            try container.decodeIfPresent(
+                Int.self,
+                forKey: .totalTrackCount
+            ) ?? tracks.count,
+            tracks.count
+        )
+    }
+}
+
+struct MusicPlaylistPage: Equatable, Sendable {
+    let playlistID: String
+    let tracks: [MusicCandidate]
+    let offset: Int
+    let totalTrackCount: Int
+
+    var hasMore: Bool {
+        offset + tracks.count < totalTrackCount
+    }
+}
+
 struct MusicLibrarySnapshot: Equatable, Sendable {
     let savedTracks: [MusicCandidate]
-    let playlistIDs: [String]
+    let playlists: [MusicPlaylistSnapshot]
     let recentlyPlayedTrackIDs: [String]
+
+    var playlistIDs: [String] {
+        playlists.map(\.id)
+    }
+
+    init(
+        savedTracks: [MusicCandidate],
+        playlists: [MusicPlaylistSnapshot],
+        recentlyPlayedTrackIDs: [String]
+    ) {
+        self.savedTracks = savedTracks
+        self.playlists = playlists
+        self.recentlyPlayedTrackIDs = recentlyPlayedTrackIDs
+    }
+
+    init(
+        savedTracks: [MusicCandidate],
+        playlistIDs: [String],
+        recentlyPlayedTrackIDs: [String]
+    ) {
+        self.init(
+            savedTracks: savedTracks,
+            playlists: playlistIDs.map {
+                MusicPlaylistSnapshot(
+                    id: $0,
+                    providerID: .local,
+                    name: $0,
+                    artworkURL: nil,
+                    tracks: []
+                )
+            },
+            recentlyPlayedTrackIDs: recentlyPlayedTrackIDs
+        )
+    }
 }
 
 protocol MusicSource: Sendable {
@@ -124,6 +232,11 @@ protocol MusicSource: Sendable {
     func access() async -> MusicSourceAccess
     func search(_ request: MusicSearchRequest) async throws -> [MusicCandidate]
     func fetchUserLibrary() async throws -> MusicLibrarySnapshot
+    func fetchPlaylistPage(
+        playlistID: String,
+        offset: Int,
+        limit: Int
+    ) async throws -> MusicPlaylistPage
 }
 
 extension MusicSource {
@@ -134,6 +247,35 @@ extension MusicSource {
             savedTracks: [],
             playlistIDs: [],
             recentlyPlayedTrackIDs: []
+        )
+    }
+
+    func fetchPlaylistPage(
+        playlistID: String,
+        offset: Int,
+        limit: Int
+    ) async throws -> MusicPlaylistPage {
+        let library = try await fetchUserLibrary()
+        guard let playlist = library.playlists.first(where: {
+            $0.id == playlistID
+        }) else {
+            return MusicPlaylistPage(
+                playlistID: playlistID,
+                tracks: [],
+                offset: max(0, offset),
+                totalTrackCount: 0
+            )
+        }
+        let safeOffset = min(max(0, offset), playlist.tracks.count)
+        let end = min(
+            safeOffset + max(1, limit),
+            playlist.tracks.count
+        )
+        return MusicPlaylistPage(
+            playlistID: playlistID,
+            tracks: Array(playlist.tracks[safeOffset ..< end]),
+            offset: safeOffset,
+            totalTrackCount: playlist.trackCount
         )
     }
 }

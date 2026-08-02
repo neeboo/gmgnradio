@@ -9,6 +9,7 @@ func agentCapabilityManifestCoversEveryCoreRadioAction() {
 
     #expect(names == [
         "read_radio_state",
+        "read_current_track",
         "search_music",
         "play_program_track",
         "next_track",
@@ -29,11 +30,70 @@ func agentCapabilityManifestCoversEveryCoreRadioAction() {
     #expect(
         DJAgentCapabilityManifest.capabilities
             .filter {
-                !["read_radio_state", "search_music"]
+                !["read_radio_state", "read_current_track", "search_music"]
                     .contains($0.name)
             }
             .allSatisfy { $0.requiresTakeover }
     )
+}
+
+@MainActor
+@Test
+func currentTrackToolSamplesThePlaybackStateAtInvocationTime() async throws {
+    let actions = DJAgentRadioActionsSpy()
+    let dispatcher = DJAgentToolDispatcher(
+        takeoverEnabled: { false },
+        actions: actions
+    )
+
+    actions.currentTrack = DJAgentCurrentTrackSnapshot.fixture(
+        id: "track-1",
+        title: "First",
+        position: 12,
+        previousTrack: DJAgentPlaybackTrack(
+            id: "track-0",
+            title: "Previous",
+            artist: "Previous Artist"
+        ),
+        nextTrack: DJAgentPlaybackTrack(
+            id: "track-2",
+            title: "Second",
+            artist: "Second Artist"
+        )
+    )
+    let firstResult = await dispatcher.handle(RealtimeDJToolCall(
+        id: "current-track-1",
+        name: "read_current_track",
+        argumentsJSON: Data("{}".utf8)
+    ))
+
+    actions.currentTrack = DJAgentCurrentTrackSnapshot.fixture(
+        id: "track-2",
+        title: "Second",
+        position: 3
+    )
+    let secondResult = await dispatcher.handle(RealtimeDJToolCall(
+        id: "current-track-2",
+        name: "read_current_track",
+        argumentsJSON: Data("{}".utf8)
+    ))
+
+    let first = try JSONDecoder().decode(
+        DJAgentToolResponse.self,
+        from: firstResult.resultJSON
+    )
+    let second = try JSONDecoder().decode(
+        DJAgentToolResponse.self,
+        from: secondResult.resultJSON
+    )
+
+    #expect(first.currentTrack?.id == "track-1")
+    #expect(first.currentTrack?.positionSeconds == 12)
+    #expect(first.currentTrack?.previousTrack?.id == "track-0")
+    #expect(first.currentTrack?.nextTrack?.id == "track-2")
+    #expect(second.currentTrack?.id == "track-2")
+    #expect(second.currentTrack?.positionSeconds == 3)
+    #expect(actions.currentTrackReadCount == 2)
 }
 
 @Test
@@ -357,6 +417,12 @@ private final class DJAgentRadioActionsSpy: DJAgentRadioActions {
 
     var calls: [Call] = []
     private var activeTrackID = "track-1"
+    var currentTrack = DJAgentCurrentTrackSnapshot.fixture(
+        id: "track-1",
+        title: "First",
+        position: 12
+    )
+    private(set) var currentTrackReadCount = 0
 
     func snapshot(takeoverEnabled: Bool) -> DJAgentRadioState {
         DJAgentRadioState(
@@ -379,6 +445,11 @@ private final class DJAgentRadioActionsSpy: DJAgentRadioActions {
                 ),
             ]
         )
+    }
+
+    func currentTrackSnapshot() -> DJAgentCurrentTrackSnapshot? {
+        currentTrackReadCount += 1
+        return currentTrack
     }
 
     func playProgramTrack(
@@ -445,5 +516,36 @@ private final class DJAgentRadioActionsSpy: DJAgentRadioActions {
         _ mode: StageLyricsVisualMode
     ) async throws {
         calls.append(.lyrics(mode))
+    }
+}
+
+private extension DJAgentCurrentTrackSnapshot {
+    static func fixture(
+        id: String,
+        title: String,
+        position: TimeInterval,
+        previousTrack: DJAgentPlaybackTrack? = nil,
+        nextTrack: DJAgentPlaybackTrack? = nil
+    ) -> Self {
+        Self(
+            sampledAt: "2026-08-02T06:30:00Z",
+            playbackState: "playing",
+            isPlaying: true,
+            id: id,
+            provider: "netease",
+            source: "streaming",
+            title: title,
+            artist: "Artist",
+            album: "Album",
+            durationSeconds: 180,
+            positionSeconds: position,
+            remainingSeconds: 180 - position,
+            progress: position / 180,
+            programID: "program-1",
+            programTitle: "Program",
+            slotIndex: id == "track-1" ? 0 : 1,
+            previousTrack: previousTrack,
+            nextTrack: nextTrack
+        )
     }
 }

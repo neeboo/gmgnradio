@@ -32,7 +32,13 @@ final class CodexAgentAccountService: CodexAccountServicing {
             return .unavailable
         }
         guard result.exitCode == 0 else {
-            return .signedOut
+            let output = result.output.lowercased()
+            if output.contains("not logged in")
+                || output.contains("not signed in")
+            {
+                return .signedOut
+            }
+            return .unavailable
         }
 
         let output = result.output.lowercased()

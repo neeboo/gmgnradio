@@ -317,6 +317,7 @@ struct StageVisualPalette: Equatable, Sendable {
 @MainActor
 final class StageVisualDirectionStore: ObservableObject {
     private static let pointCloudDefaultsKey = "stage.point-cloud-choice"
+    private static let particleSizeDefaultsKey = "stage.particle-size-multiplier"
 
     private let defaults: UserDefaults
     @Published private(set) var currentMood: StageVisualMood?
@@ -325,6 +326,7 @@ final class StageVisualDirectionStore: ObservableObject {
         StagePointCloudChoice = .automatic
     @Published private(set) var currentIntensity: Float = 1
     @Published private(set) var transitionDuration: TimeInterval = 2.4
+    @Published private(set) var particleSizeMultiplier: Float = 1
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -332,6 +334,11 @@ final class StageVisualDirectionStore: ObservableObject {
             .string(forKey: Self.pointCloudDefaultsKey)
             .flatMap(StagePointCloudChoice.init(rawValue:))
             ?? .automatic
+        if defaults.object(forKey: Self.particleSizeDefaultsKey) != nil {
+            particleSizeMultiplier = Self.clampParticleSize(
+                Float(defaults.double(forKey: Self.particleSizeDefaultsKey))
+            )
+        }
     }
 
     func update(_ mood: StageVisualMood?) {
@@ -357,6 +364,21 @@ final class StageVisualDirectionStore: ObservableObject {
         } else {
             defaults.set(choice.rawValue, forKey: Self.pointCloudDefaultsKey)
         }
+    }
+
+    func setParticleSizeMultiplier(_ value: Float) {
+        particleSizeMultiplier = Self.clampParticleSize(value)
+        defaults.set(
+            particleSizeMultiplier,
+            forKey: Self.particleSizeDefaultsKey
+        )
+    }
+
+    private static func clampParticleSize(_ value: Float) -> Float {
+        min(
+            max(value, StageParticleSizing.manualRange.lowerBound),
+            StageParticleSizing.manualRange.upperBound
+        )
     }
 }
 

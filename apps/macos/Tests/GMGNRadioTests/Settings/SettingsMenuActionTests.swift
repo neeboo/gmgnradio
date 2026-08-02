@@ -17,8 +17,16 @@ func settingsMenuRevealsWindowAfterTheMenuDismisses() {
     )
 
     action.perform()
-    #expect(events == ["open", "schedule"])
+    #expect(events == ["activate", "open", "schedule"])
 
     scheduledActivation?()
-    #expect(events == ["open", "schedule", "activate", "reveal"])
+    #expect(
+        events == [
+            "activate",
+            "open",
+            "schedule",
+            "activate",
+            "reveal",
+        ]
+    )
 }

@@ -1,6 +1,24 @@
 import Foundation
 import simd
 
+enum StageParticleSizing {
+    static let referenceHeight: Float = 1_080
+    static let manualRange: ClosedRange<Float> = 0.6 ... 1.6
+
+    static func automaticScale(viewport: SIMD2<Float>) -> Float {
+        let heightScale = max(viewport.y, 1) / referenceHeight
+        return min(max(heightScale, 0.72), 2)
+    }
+
+    static func effectiveScale(
+        viewport: SIMD2<Float>,
+        manualMultiplier: Float
+    ) -> Float {
+        automaticScale(viewport: viewport)
+            * min(max(manualMultiplier, manualRange.lowerBound), manualRange.upperBound)
+    }
+}
+
 struct StageCompositingProfile: Sendable, Equatable {
     let videoOpacity: Float
     let backgroundAlpha: Float
@@ -53,6 +71,7 @@ struct StageUniforms: Sendable {
         palette: StageVisualPalette = .amber,
         visualIntensity: Float = 1,
         compositing: StageCompositingProfile = .standard,
+        particleSizeMultiplier: Float = 1,
         pointLayers: StagePointLayerPolicy = .init(
             primaryVisibility: 1,
             ambientVisibility: 0.72
@@ -155,7 +174,7 @@ struct StageUniforms: Sendable {
                 clamp(compositing.backgroundAlpha)
             ),
             compositing: SIMD4<Float>(
-                max(compositing.particleScale, 0),
+                max(compositing.particleScale * particleSizeMultiplier, 0),
                 max(compositing.particlePresence, 0),
                 max(compositing.bloomStrength, 0),
                 clamp(compositing.edgeContrast)

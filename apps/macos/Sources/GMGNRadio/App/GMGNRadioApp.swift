@@ -9,6 +9,33 @@ enum ProductIdentity {
     static let bundleIdentifier = "ai.gmgn.radio"
 }
 
+private enum MusicLibraryCacheError: LocalizedError {
+    case verificationFailed
+
+    var errorDescription: String? {
+        "歌单已返回，但本地保存校验失败；没有覆盖原有歌单。"
+    }
+}
+
+enum ApplicationLaunchPolicy {
+    private static let testEnvironmentKeys = [
+        "XCTestConfigurationFilePath",
+        "XCTestBundlePath",
+        "XCInjectBundleInto",
+    ]
+
+    static func shouldRestoreUserState(
+        environment: [String: String]
+    ) -> Bool {
+        guard environment["GMGN_DISABLE_USER_STATE_RESTORE"] != "1" else {
+            return false
+        }
+        return !testEnvironmentKeys.contains { key in
+            !(environment[key] ?? "").isEmpty
+        }
+    }
+}
+
 enum RealtimeVoiceSetupError: LocalizedError {
     case microphoneDenied
     case providerUnavailable
@@ -138,9 +165,9 @@ struct GMGNRadioApp: App {
                         appDelegate.promoteToForeground()
                     },
                     revealSettingsWindow: {
-                        guard let window = NSApplication.shared.windows.first(where: {
-                            $0.styleMask.contains(.titled)
-                        }) else {
+                        guard let window = NSApplication.shared.windows.first(
+                            where: SettingsWindowMatcher.matches
+                        ) else {
                             return
                         }
                         window.makeKeyAndOrderFront(nil)
@@ -159,6 +186,7 @@ struct GMGNRadioApp: App {
 
         Settings {
             GMGNSettingsView(
+                visualDirections: appDelegate.visualSettingsStore,
                 connectRealtimeVoice: { configuration in
                     appDelegate.connectRealtimeVoice(configuration)
                 },
@@ -224,11 +252,23 @@ struct SettingsMenuAction {
     let revealSettingsWindow: () -> Void
 
     func perform() {
+        activateApplication()
         openSettings()
         scheduleActivation {
             activateApplication()
             revealSettingsWindow()
         }
+    }
+}
+
+@MainActor
+enum SettingsWindowMatcher {
+    static func matches(_ window: NSWindow) -> Bool {
+        guard window.styleMask.contains(.titled) else {
+            return false
+        }
+        return window.title.localizedCaseInsensitiveContains("settings")
+            || window.title.contains("设置")
     }
 }
 
@@ -250,10 +290,15 @@ final class AppDelegate:
     private let stageVisualDirections = StageVisualDirectionStore()
     private let stageVideos = StageVideoPlaybackStore()
     private let programStore = DJProgramStore.shared
+    private let musicLibraryStore = SyncedMusicLibraryStore.shared
     private let stageLyrics = StageLyricsStore.shared
     private let agentPreferences = DJAgentPreferences()
     private let realtimeVoicePreferences = RealtimeVoicePreferences()
     private let realtimeDJSessionController = RealtimeDJSessionController()
+
+    var visualSettingsStore: StageVisualDirectionStore {
+        stageVisualDirections
+    }
     private lazy var musicRuntime = MusicRuntime.live()
     private var audioGraphStorage: AudioGraphController?
     private var audioGraph: AudioGraphController {
@@ -286,6 +331,8 @@ final class AppDelegate:
     private var backgroundProgramAgentTask: Task<Void, Never>?
     private var backgroundProgramRequestID: UUID?
     private var isStartingProgramPlayback = false
+    private var committedPlaybackTrack: MusicCandidate?
+    private var previousCommittedPlaybackTrack: MusicCandidate?
     private var recentDirectToolName: String?
     private var recentDirectToolDate: Date?
     private lazy var agentToolDispatcher = DJAgentToolDispatcher(
@@ -296,6 +343,7 @@ final class AppDelegate:
     )
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let environment = ProcessInfo.processInfo.environment
         ApplicationIconInstaller().install()
         playbackLogger.info("应用启动，开始恢复节目与音频状态")
         ProcessInfo.processInfo.disableAutomaticTermination(
@@ -304,11 +352,27 @@ final class AppDelegate:
         let controller = OrbWindowController(audioFeatures: audioFeatures)
         orbWindowController = controller
         controller.show()
-        programStore.restoreLatest()
         configureStage()
-        restoreSavedProgramPlayback()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(musicAccountDidChange),
+            name: .musicAccountDidChange,
+            object: nil
+        )
+        if ApplicationLaunchPolicy.shouldRestoreUserState(
+            environment: environment
+        ) {
+            programStore.restoreLatest()
+            restoreSavedProgramPresentation()
+            playbackLogger.info(
+                "已恢复本地节目；等待用户明确播放或同步后再读取音乐账号"
+            )
+        } else {
+            playbackLogger.info(
+                "测试或隔离启动：跳过真实节目、音乐账号与钥匙串恢复"
+            )
+        }
 
-        let environment = ProcessInfo.processInfo.environment
         if
             let modeName = environment["GMGN_STAGE_VIDEO_MODE"],
             let mode = StageVideoPlaybackMode(rawValue: modeName)
@@ -343,6 +407,83 @@ final class AppDelegate:
                 presentPlaybackError(error)
             }
         }
+    }
+
+    @objc private func musicAccountDidChange(_ notification: Notification) {
+        guard
+            let rawProviderID = notification.userInfo?["providerID"] as? String,
+            let connected = notification.userInfo?["connected"] as? Bool
+        else {
+            return
+        }
+        let providerID = MusicProviderID(rawValue: rawProviderID)
+        if connected {
+            refreshSyncedMusicLibrary(providerID: providerID)
+        } else {
+            musicLibraryStore.remove(providerID: providerID)
+        }
+    }
+
+    private func refreshSyncedMusicLibrary(
+        providerID: MusicProviderID
+    ) {
+        guard !musicLibraryStore.isSyncing else {
+            publishMusicLibrarySyncResult(
+                providerID: providerID,
+                errorDescription: "已有音乐同步任务正在进行。"
+            )
+            return
+        }
+        musicLibraryStore.setSyncing(true)
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+            defer { musicLibraryStore.setSyncing(false) }
+            do {
+                let library = try await musicRuntime.fetchLibrary(
+                    providerID: providerID
+                )
+                guard musicLibraryStore.mergeAndVerify(
+                    playlists: library.playlists
+                ) else {
+                    throw MusicLibraryCacheError.verificationFailed
+                }
+                publishMusicLibrarySyncResult(
+                    providerID: providerID,
+                    playlistCount: library.playlists.count
+                )
+            } catch {
+                playbackLogger.error(
+                    "音乐歌单同步失败：provider=\(providerID.rawValue, privacy: .public)，error=\(error.localizedDescription, privacy: .public)"
+                )
+                publishMusicLibrarySyncResult(
+                    providerID: providerID,
+                    errorDescription: error.localizedDescription
+                )
+            }
+        }
+    }
+
+    private func publishMusicLibrarySyncResult(
+        providerID: MusicProviderID,
+        playlistCount: Int? = nil,
+        errorDescription: String? = nil
+    ) {
+        var userInfo: [String: Any] = [
+            "providerID": providerID.rawValue,
+        ]
+        if let playlistCount {
+            userInfo["playlistCount"] = playlistCount
+        }
+        if let errorDescription {
+            userInfo["errorDescription"] = errorDescription
+        }
+        NotificationCenter.default.post(
+            name: .musicLibrarySyncDidFinish,
+            object: nil,
+            userInfo: userInfo
+        )
     }
 
     func applicationShouldHandleReopen(
@@ -1072,6 +1213,23 @@ final class AppDelegate:
         playbackLogger.info(
             "执行歌曲播放：index=\(index)，track=\(slot.track.id, privacy: .public)，provider=\(slot.track.providerID.rawValue, privacy: .public)，title=\(slot.track.title, privacy: .public)，target=\(String(describing: prepared.target), privacy: .public)"
         )
+        let previouslyCommittedTrack = committedPlaybackTrack
+
+        switch prepared.target {
+        case let .localFile(url):
+            try playLocalTrack(url, loadSidecarLyrics: false)
+        case let .providerReference(providerID, trackID):
+            guard providerID == .appleMusic else {
+                throw MusicProviderClientError.playbackUnavailable
+            }
+            try await musicRuntime.startAppleMusic(trackID: trackID)
+            orbWindowController?.setState(.playing)
+            stageWindowController?.setPlaybackState(.playing)
+            showStage()
+        }
+
+        previousCommittedPlaybackTrack = previouslyCommittedTrack
+        committedPlaybackTrack = slot.track
         programStore.activateSlot(at: index)
         stageLyrics.clear()
         Task { [weak self] in
@@ -1106,19 +1264,6 @@ final class AppDelegate:
                 trackID: lyricTrackID,
                 trackDuration: slot.track.duration
             )
-        }
-
-        switch prepared.target {
-        case let .localFile(url):
-            try playLocalTrack(url, loadSidecarLyrics: false)
-        case let .providerReference(providerID, trackID):
-            guard providerID == .appleMusic else {
-                throw MusicProviderClientError.playbackUnavailable
-            }
-            try await musicRuntime.startAppleMusic(trackID: trackID)
-            orbWindowController?.setState(.playing)
-            stageWindowController?.setPlaybackState(.playing)
-            showStage()
         }
         updateStageProgramNavigation()
         playbackLogger.info(
@@ -1187,6 +1332,26 @@ final class AppDelegate:
         let upcoming = plan.slots
             .dropFirst(slotIndex + 1)
             .map(\.track.id)
+        let queuedNext = programPlaybackQueue.locked.first?.slot.track
+        let runtimeHostHint = ProgramHostHint(
+            shouldTalkBefore: current.hostHint.shouldTalkBefore,
+            maxSentenceCount: current.hostHint.maxSentenceCount,
+            selectionReason: current.hostHint.selectionReason,
+            currentTrack: TrackReference(
+                id: current.track.id,
+                title: current.track.title,
+                artist: current.track.artist
+            ),
+            nextTrack: queuedNext.map {
+                TrackReference(
+                    id: $0.id,
+                    title: $0.title,
+                    artist: $0.artist
+                )
+            },
+            facts: current.hostHint.facts,
+            transitionIntent: current.hostHint.transitionIntent
+        )
         let context = RealtimeDJContext(
             playback: PlaybackContext(
                 currentTrack: TrackReference(
@@ -1200,7 +1365,7 @@ final class AppDelegate:
             ),
             showPlanSummary: plan.title
                 ?? "GMGN RADIO · \(plan.slots.count) 首",
-            hostHint: current.hostHint,
+            hostHint: runtimeHostHint,
             hostPreference: DJAgentPreferences().hostPrompt(),
             immediateUserInstruction:
                 plan.brief.immediateUserInstruction,
@@ -1285,6 +1450,7 @@ final class AppDelegate:
             visualDirections: stageVisualDirections,
             videos: stageVideos,
             programStore: programStore,
+            libraryStore: musicLibraryStore,
             lyrics: stageLyrics,
             playbackPosition: { [weak self] in
                 self?.audioGraphStorage?.playbackPosition ?? 0
@@ -1299,6 +1465,18 @@ final class AppDelegate:
                     programID: programID,
                     at: slotIndex
                 )
+            },
+            onPlayLibraryTrack: { [weak self] playlistID, trackIndex in
+                self?.playSyncedPlaylist(
+                    playlistID: playlistID,
+                    at: trackIndex
+                )
+            },
+            onOpenLibraryPlaylist: { [weak self] playlistID in
+                self?.loadNextSyncedPlaylistPage(playlistID: playlistID)
+            },
+            onLoadMoreLibraryTracks: { [weak self] playlistID in
+                self?.loadNextSyncedPlaylistPage(playlistID: playlistID)
             },
             onPreviousTrack: { [weak self] in
                 self?.playPreviousProgramTrack()
@@ -1395,6 +1573,73 @@ final class AppDelegate:
                 }
                 await interruptionCoordinator?.consume(event)
                 stagePresentation.consume(event)
+            }
+        }
+    }
+
+    private func restoreSavedProgramPresentation() {
+        guard let plan = programStore.plan else {
+            activeProgram = nil
+            updateStageProgramNavigation()
+            return
+        }
+        activeProgram = plan
+        stageWindowController?.setPlaybackState(.paused)
+        updateStageProgramNavigation()
+        playbackLogger.info(
+            "恢复节目界面：program=\(plan.brief.id, privacy: .public)，slots=\(plan.slots.count)，index=\(self.programStore.activeSlotIndex ?? -1)"
+        )
+    }
+
+    private func playSyncedPlaylist(
+        playlistID: String,
+        at trackIndex: Int
+    ) {
+        guard
+            let playlist = musicLibraryStore.playlist(id: playlistID),
+            playlist.tracks.indices.contains(trackIndex)
+        else {
+            return
+        }
+        let plan = SyncedPlaylistProgramBuilder.makePlan(from: playlist)
+        programStore.publish(plan)
+        playProgramTrack(programID: plan.brief.id, at: trackIndex)
+    }
+
+    private func loadNextSyncedPlaylistPage(playlistID: String) {
+        guard
+            let playlist = musicLibraryStore.playlist(id: playlistID),
+            playlist.tracks.count < playlist.trackCount,
+            musicLibraryStore.beginLoadingPage(playlistID: playlistID)
+        else {
+            return
+        }
+        let offset = playlist.tracks.count
+        let providerID = playlist.providerID
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+            defer {
+                musicLibraryStore.finishLoadingPage(
+                    playlistID: playlistID
+                )
+            }
+            do {
+                let page = try await musicRuntime.fetchPlaylistPage(
+                    providerID: providerID,
+                    playlistID: playlistID,
+                    offset: offset,
+                    limit: 20
+                )
+                musicLibraryStore.append(page)
+                playbackLogger.info(
+                    "歌单渐进加载：playlist=\(playlistID, privacy: .public)，offset=\(offset)，loaded=\(page.tracks.count)，total=\(page.totalTrackCount)"
+                )
+            } catch {
+                playbackLogger.error(
+                    "歌单渐进加载失败：playlist=\(playlistID, privacy: .public)，offset=\(offset)，error=\(error.localizedDescription, privacy: .public)"
+                )
             }
         }
     }
@@ -1557,7 +1802,8 @@ final class AppDelegate:
             state: snapshot(
                 takeoverEnabled: agentPreferences.takeoverEnabled()
             ),
-            tracks: nil
+            tracks: nil,
+            currentTrack: nil
         )
         let data = (try? JSONEncoder().encode(response))
             ?? Data(#"{"ok":true,"message":"播放动作已经执行"}"#.utf8)
@@ -1653,6 +1899,67 @@ final class AppDelegate:
             activeTrackID: programStore.activeSlot?.track.id,
             activeSlotIndex: programStore.activeSlotIndex,
             program: tracks
+        )
+    }
+
+    func currentTrackSnapshot() -> DJAgentCurrentTrackSnapshot? {
+        let playbackState = agentPlaybackState
+        guard
+            playbackState == "playing" || playbackState == "paused",
+            let current = committedPlaybackTrack
+        else {
+            return nil
+        }
+
+        let plan = activeProgram ?? programStore.plan
+        let position = max(
+            0,
+            audioGraphStorage?.playbackPosition ?? 0
+        )
+        let duration = max(current.duration, 0)
+        let boundedPosition = duration > 0
+            ? min(position, duration)
+            : position
+        let remaining = duration > 0
+            ? max(duration - boundedPosition, 0)
+            : 0
+        let progress = duration > 0
+            ? min(max(boundedPosition / duration, 0), 1)
+            : 0
+
+        return DJAgentCurrentTrackSnapshot(
+            sampledAt: ISO8601DateFormatter().string(from: Date()),
+            playbackState: playbackState,
+            isPlaying: playbackState == "playing",
+            id: current.id,
+            provider: current.providerID.rawValue,
+            source: current.source.rawValue,
+            title: current.title,
+            artist: current.artist,
+            album: current.album,
+            durationSeconds: duration,
+            positionSeconds: boundedPosition,
+            remainingSeconds: remaining,
+            progress: progress,
+            programID: plan?.brief.id,
+            programTitle: plan?.title,
+            slotIndex: plan?.slots.firstIndex {
+                $0.track.id == current.id
+            },
+            previousTrack: previousCommittedPlaybackTrack.map {
+                DJAgentPlaybackTrack(
+                    id: $0.id,
+                    title: $0.title,
+                    artist: $0.artist
+                )
+            },
+            nextTrack: programPlaybackQueue.locked.first.map {
+                DJAgentPlaybackTrack(
+                    id: $0.slot.track.id,
+                    title: $0.slot.track.title,
+                    artist: $0.slot.track.artist
+                )
+            }
         )
     }
 

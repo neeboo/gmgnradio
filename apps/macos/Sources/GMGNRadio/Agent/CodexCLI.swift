@@ -39,6 +39,9 @@ struct CodexProcessRunner: CodexCommandRunning {
             let inputPipe = Pipe()
             process.executableURL = executableURL
             process.arguments = arguments
+            process.environment = Self.commandEnvironment(
+                base: ProcessInfo.processInfo.environment
+            )
             process.standardOutput = outputPipe
             process.standardError = outputPipe
             process.standardInput = inputPipe
@@ -57,6 +60,31 @@ struct CodexProcessRunner: CodexCommandRunning {
                     .trimmingCharacters(in: .whitespacesAndNewlines)
             )
         }.value
+    }
+
+    private static func commandEnvironment(
+        base: [String: String]
+    ) -> [String: String] {
+        var environment = base
+        let requiredDirectories = [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+        ]
+        let existingDirectories = (base["PATH"] ?? "")
+            .split(separator: ":")
+            .map(String.init)
+        environment["PATH"] = (requiredDirectories + existingDirectories)
+            .reduce(into: [String]()) { result, directory in
+                if !result.contains(directory) {
+                    result.append(directory)
+                }
+            }
+            .joined(separator: ":")
+        return environment
     }
 
     static func locate(

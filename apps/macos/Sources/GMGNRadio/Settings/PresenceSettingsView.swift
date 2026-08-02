@@ -23,6 +23,35 @@ struct PresenceSettingsView: View {
                         )
                     }
                 }
+
+                Section("呼吸球样式") {
+                    ColorPicker(
+                        "流光颜色",
+                        selection: orbColorBinding,
+                        supportsOpacity: false
+                    )
+
+                    HStack(spacing: 12) {
+                        Text("流光强度")
+                        Slider(
+                            value: Binding(
+                                get: {
+                                    Double(model.orbAppearance.flowIntensity)
+                                },
+                                set: {
+                                    model.setOrbFlowIntensity(Float($0))
+                                }
+                            ),
+                            in: 0.35 ... 1.5
+                        )
+                        Text(
+                            "\(Int(model.orbAppearance.flowIntensity * 100))%"
+                        )
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .frame(width: 42, alignment: .trailing)
+                    }
+                }
             }
             .formStyle(.grouped)
 
@@ -45,6 +74,30 @@ struct PresenceSettingsView: View {
         .sheet(isPresented: $isAddingModel) {
             AddPresenceSheet(model: model, isPresented: $isAddingModel)
         }
+    }
+
+    private var orbColorBinding: Binding<Color> {
+        Binding(
+            get: {
+                Color(
+                    red: Double(model.orbAppearance.red),
+                    green: Double(model.orbAppearance.green),
+                    blue: Double(model.orbAppearance.blue)
+                )
+            },
+            set: { color in
+                guard
+                    let converted = NSColor(color).usingColorSpace(.sRGB)
+                else {
+                    return
+                }
+                model.setOrbColor(
+                    red: Float(converted.redComponent),
+                    green: Float(converted.greenComponent),
+                    blue: Float(converted.blueComponent)
+                )
+            }
+        )
     }
 
     private var header: some View {

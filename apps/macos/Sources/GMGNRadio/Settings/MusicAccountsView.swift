@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 
 struct MusicAccountsView: View {
@@ -32,20 +33,36 @@ struct MusicAccountsView: View {
             .formStyle(.grouped)
 
             if let message = model.message {
-                Label(
-                    message,
-                    systemImage: model.hasError
-                        ? "exclamationmark.circle.fill"
-                        : "checkmark.circle.fill"
-                )
+                HStack(spacing: 7) {
+                    if model.isWorking {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(
+                            systemName: model.hasError
+                                ? "exclamationmark.circle.fill"
+                                : "checkmark.circle.fill"
+                        )
+                    }
+                    Text(message)
+                }
                 .font(.caption)
-                .foregroundStyle(model.hasError ? Color.red : Color.secondary)
+                .foregroundStyle(
+                    model.hasError ? Color.red : Color.secondary
+                )
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 20)
                 .padding(.bottom, 14)
             }
         }
         .task { await model.load() }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: .musicLibrarySyncDidFinish
+            )
+        ) { notification in
+            model.handleSyncCompletion(notification)
+        }
     }
 
     private var header: some View {
@@ -90,6 +107,10 @@ private struct MusicAccountRow: View {
                 ProgressView()
                     .controlSize(.small)
             } else if state == .connected {
+                Button("同步") {
+                    Task { await model.sync(providerID) }
+                }
+                .buttonStyle(.borderless)
                 Button("断开") {
                     Task { await model.disconnect(providerID) }
                 }

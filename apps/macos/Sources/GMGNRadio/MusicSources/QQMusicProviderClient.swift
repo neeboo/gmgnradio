@@ -107,10 +107,13 @@ struct QQMusicProviderClient: AccountMusicProviderClient {
             QQPlaylistsResponse.self,
             from: data
         )
-        let playlistIDs = (response.data?.disslist ?? []).map(\.id)
+        let playlistMetadata = response.data?.disslist ?? []
+        let playlistIDs = playlistMetadata.map(\.id)
         var seenTrackIDs = Set<String>()
         var savedTracks: [MusicProviderTrack] = []
-        for playlistID in playlistIDs.prefix(50) {
+        var playlists: [MusicProviderPlaylist] = []
+        for metadata in playlistMetadata.prefix(50) {
+            let playlistID = metadata.id
             var detailComponents = URLComponents(
                 string: "https://c.y.qq.com/qzone/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg"
             )!
@@ -143,10 +146,14 @@ struct QQMusicProviderClient: AccountMusicProviderClient {
                     from: detailData
                 )
             else {
+                playlists.append(metadata.providerPlaylist(tracks: []))
                 continue
             }
-            for track in detail.cdlist?.first?.songlist ?? [] {
-                let mapped = track.providerTrack
+            let playlistTracks = (detail.cdlist?.first?.songlist ?? []).map {
+                $0.providerTrack
+            }
+            playlists.append(metadata.providerPlaylist(tracks: playlistTracks))
+            for mapped in playlistTracks {
                 guard seenTrackIDs.insert(mapped.id).inserted else {
                     continue
                 }
@@ -155,7 +162,7 @@ struct QQMusicProviderClient: AccountMusicProviderClient {
         }
         return MusicProviderLibrary(
             savedTracks: savedTracks,
-            playlistIDs: playlistIDs,
+            playlists: playlists,
             recentlyPlayedTrackIDs: []
         )
     }
@@ -428,9 +435,16 @@ private struct QQPlaylistsResponse: Decodable {
 
     struct Playlist: Decodable {
         let id: String
+        let name: String
+        let artworkURL: URL?
+        let trackCount: Int
 
         enum CodingKeys: String, CodingKey {
             case tid
+            case name = "diss_name"
+            case artwork = "diss_cover"
+            case alternateArtwork = "logo"
+            case trackCount = "song_cnt"
         }
 
         init(from decoder: any Decoder) throws {
@@ -440,6 +454,32 @@ private struct QQPlaylistsResponse: Decodable {
             } else {
                 id = String(try container.decode(Int64.self, forKey: .tid))
             }
+            name = try container.decodeIfPresent(String.self, forKey: .name)
+                ?? "QQ 音乐歌单"
+            let artwork = try container.decodeIfPresent(
+                String.self,
+                forKey: .artwork
+            ) ?? container.decodeIfPresent(
+                String.self,
+                forKey: .alternateArtwork
+            )
+            artworkURL = artwork.flatMap(URL.init(string:))
+            trackCount = try container.decodeIfPresent(
+                Int.self,
+                forKey: .trackCount
+            ) ?? 0
+        }
+
+        func providerPlaylist(
+            tracks: [MusicProviderTrack]
+        ) -> MusicProviderPlaylist {
+            MusicProviderPlaylist(
+                id: id,
+                name: name,
+                artworkURL: artworkURL,
+                trackCount: max(trackCount, tracks.count),
+                tracks: tracks
+            )
         }
     }
 }

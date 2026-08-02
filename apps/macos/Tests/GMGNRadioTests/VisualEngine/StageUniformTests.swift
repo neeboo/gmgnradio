@@ -193,6 +193,47 @@ func stageUniformsCarryATransparentVeilForVideoComposition() {
 }
 
 @Test
+func particleSizingPreservesThe1080pLookAcrossViewportHeights() {
+    #expect(
+        StageParticleSizing.automaticScale(
+            viewport: SIMD2<Float>(1_920, 1_080)
+        ) == 1
+    )
+    #expect(
+        StageParticleSizing.automaticScale(
+            viewport: SIMD2<Float>(2_560, 1_440)
+        ) > 1.3
+    )
+    #expect(
+        StageParticleSizing.automaticScale(
+            viewport: SIMD2<Float>(3_440, 1_440)
+        )
+            == StageParticleSizing.automaticScale(
+                viewport: SIMD2<Float>(2_560, 1_440)
+            )
+    )
+}
+
+@Test
+func stageUniformsCombineAutomaticSizingWithTheManualFineTune() {
+    let viewport = SIMD2<Float>(2_560, 1_440)
+    let effectiveScale = StageParticleSizing.effectiveScale(
+        viewport: viewport,
+        manualMultiplier: 1.2
+    )
+    let uniforms = StageUniforms.make(
+        camera: StageCameraModel().frame,
+        audio: .silent,
+        time: 0,
+        viewport: viewport,
+        presetWeights: SIMD3<Float>(1, 0, 0),
+        particleSizeMultiplier: effectiveScale
+    )
+
+    #expect(abs(uniforms.compositing.x - 1.6) < 0.001)
+}
+
+@Test
 func openRibbonTwistsWithoutIndependentParticleMotion() {
     let uniforms = StageUniforms.make(
         camera: StageCameraModel().frame,
