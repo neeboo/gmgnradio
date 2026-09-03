@@ -25,6 +25,7 @@ final class StageRenderer: NSObject, MTKViewDelegate {
     private let artwork: StageArtworkStore
     private let visualDirections: StageVisualDirectionStore
     private let videos: StageVideoPlaybackStore
+    private let spatialStage: SpatialStageStore
     private let textureLoader: MTKTextureLoader
     private let fallbackArtworkTexture: MTLTexture
     private var artworkTexture: MTLTexture
@@ -55,7 +56,8 @@ final class StageRenderer: NSObject, MTKViewDelegate {
         audioFeatures: VisualAudioFeatureStore,
         artwork: StageArtworkStore,
         visualDirections: StageVisualDirectionStore,
-        videos: StageVideoPlaybackStore
+        videos: StageVideoPlaybackStore,
+        spatialStage: SpatialStageStore
     ) throws {
         guard let commandQueue = device.makeCommandQueue() else {
             throw StageRendererError.missingCommandQueue
@@ -179,6 +181,7 @@ final class StageRenderer: NSObject, MTKViewDelegate {
         self.artwork = artwork
         self.visualDirections = visualDirections
         self.videos = videos
+        self.spatialStage = spatialStage
         textureLoader = MTKTextureLoader(device: device)
         self.fallbackArtworkTexture = fallbackArtworkTexture
         artworkTexture = fallbackArtworkTexture
@@ -265,17 +268,19 @@ final class StageRenderer: NSObject, MTKViewDelegate {
         uniforms.viewportAndMotion.w = hasArtwork ? 1 : 0
 
         encoder.label = "gmgn radio 360 stage"
-        encoder.setRenderPipelineState(backgroundPipeline)
-        encoder.setFragmentBytes(
-            &uniforms,
-            length: MemoryLayout<StageUniforms>.stride,
-            index: 0
-        )
-        encoder.drawPrimitives(
-            type: .triangle,
-            vertexStart: 0,
-            vertexCount: 3
-        )
+        if !spatialStage.isWorldVisible {
+            encoder.setRenderPipelineState(backgroundPipeline)
+            encoder.setFragmentBytes(
+                &uniforms,
+                length: MemoryLayout<StageUniforms>.stride,
+                index: 0
+            )
+            encoder.drawPrimitives(
+                type: .triangle,
+                vertexStart: 0,
+                vertexCount: 3
+            )
+        }
 
         encoder.setRenderPipelineState(ambientParticlePipeline)
         encoder.setDepthStencilState(nil)

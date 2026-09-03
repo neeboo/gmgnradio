@@ -437,9 +437,67 @@ enum DJAgentCapabilityManifest {
             ],
             requiredParameters: ["mode"]
         ),
-    ]
+        DJAgentCapability(
+            name: "set_spatial_environment",
+            description:
+                "切换完整的 Marble 房间或改变天气；房间中的唱机、壁炉和家具属于空间本体",
+            requiresTakeover: true,
+            parameters: [
+                "scene": DJAgentToolParameter(
+                    type: "string",
+                    description: "完整空间",
+                    allowedValues: SpatialScenePreset.allCases.map(\.rawValue)
+                ),
+                "weather": DJAgentToolParameter(
+                    type: "string",
+                    description: "天气",
+                    allowedValues: SpatialWeather.allCases.map(\.rawValue)
+                ),
+            ]
+        ),
+        DJAgentCapability(
+            name: "move_spatial_camera",
+            description:
+                "让 Marble 舞台镜头短距离移动或复位；连续探索仍交给用户的 WASD 和鼠标",
+            requiresTakeover: true,
+            parameters: [
+                "direction": DJAgentToolParameter(
+                    type: "string",
+                    description: "镜头移动方向",
+                    allowedValues: SpatialCameraCommandDirection.allCases.map(
+                        \.rawValue
+                    )
+                ),
+                "distance": DJAgentToolParameter(
+                    type: "number",
+                    description: "移动距离，0.5 到 10 米"
+                ),
+            ],
+            requiredParameters: ["direction"]
+        ),
+    ] + WorldAgentToolContract.capabilities.map { capability in
+        DJAgentCapability(
+            name: capability.name,
+            description: capability.description,
+            requiresTakeover: capability.requiresTakeover,
+            parameters: capability.parameters.mapValues { parameter in
+                DJAgentToolParameter(
+                    type: parameter.type,
+                    description: parameter.description,
+                    allowedValues: parameter.allowedValues
+                )
+            },
+            requiredParameters: capability.requiredParameters
+        )
+    }
 
     static var providerTools: [[String: Any]] {
+        providerTools(for: capabilities)
+    }
+
+    static func providerTools(
+        for capabilities: [DJAgentCapability]
+    ) -> [[String: Any]] {
         capabilities.map { capability in
             let properties = capability.parameters.mapValues { parameter in
                 var schema: [String: Any] = [
@@ -568,6 +626,14 @@ protocol DJAgentRadioActions: AnyObject {
         limit: Int
     ) async throws -> [DJAgentMusicTrack]
     func setLyricsMode(_ mode: StageLyricsVisualMode) async throws
+    func setSpatialEnvironment(
+        scene: SpatialScenePreset?,
+        weather: SpatialWeather?
+    ) async throws
+    func moveSpatialCamera(
+        direction: SpatialCameraCommandDirection,
+        distance: Float
+    ) async throws
 }
 
 @MainActor
@@ -603,21 +669,52 @@ final class DJAgentToolDispatcher {
         let mode: String
     }
 
+    private struct SpatialEnvironmentArguments: Decodable {
+        let scene: String?
+        let weather: String?
+    }
+
+    private struct SpatialCameraArguments: Decodable {
+        let direction: String
+        let distance: Float?
+    }
+
     private let takeoverEnabled: @MainActor () -> Bool
     private weak var actions: (any DJAgentRadioActions)?
+    private let worldDispatcher: @MainActor () -> WorldAgentToolDispatcher?
     private var completedCalls: [String: RealtimeDJToolResult] = [:]
 
     init(
         takeoverEnabled: @escaping @MainActor () -> Bool,
-        actions: any DJAgentRadioActions
+        actions: any DJAgentRadioActions,
+        worldDispatcher: @escaping @MainActor () -> WorldAgentToolDispatcher?
+            = { nil }
     ) {
         self.takeoverEnabled = takeoverEnabled
         self.actions = actions
+        self.worldDispatcher = worldDispatcher
+    }
+
+    var providerTools: [[String: Any]] {
+        let worldNames = Set(WorldAgentToolContract.capabilities.map(\.name))
+        let radioCapabilities = DJAgentCapabilityManifest.capabilities.filter {
+            !worldNames.contains($0.name)
+        }
+        return DJAgentCapabilityManifest.providerTools(for: radioCapabilities)
+            + (worldDispatcher()?.providerTools ?? [])
     }
 
     func handle(
         _ call: RealtimeDJToolCall
     ) async -> RealtimeDJToolResult {
+        if WorldAgentToolContract.capabilities.contains(where: {
+            $0.name == call.name
+        }) {
+            guard let dispatcher = worldDispatcher() else {
+                return worldUnavailableResult(callID: call.id)
+            }
+            return await dispatcher.handle(call)
+        }
         if let completed = completedCalls[call.id] {
             return completed
         }
@@ -629,6 +726,17 @@ final class DJAgentToolDispatcher {
 
     func resetSession() {
         completedCalls.removeAll(keepingCapacity: true)
+        worldDispatcher()?.resetSession()
+    }
+
+    private func worldUnavailableResult(callID: String) -> RealtimeDJToolResult {
+        RealtimeDJToolResult(
+            callID: callID,
+            resultJSON: Data(
+                #"{"ok":false,"code":"world_unavailable","message":"生活空间当前不可用"}"#.utf8
+            ),
+            isError: true
+        )
     }
 
     private func execute(
@@ -784,6 +892,49 @@ final class DJAgentToolDispatcher {
                 }
                 try await actions.setLyricsMode(mode)
                 message = "歌词视觉已更新"
+            case "set_spatial_environment":
+                let arguments = try decode(
+                    SpatialEnvironmentArguments.self,
+                    from: call.argumentsJSON
+                )
+                let scene = try arguments.scene.map {
+                    guard let value = SpatialScenePreset(rawValue: $0) else {
+                        throw DJAgentToolError.invalidSpatialEnvironment
+                    }
+                    return value
+                }
+                let weather = try arguments.weather.map {
+                    guard let value = SpatialWeather(rawValue: $0) else {
+                        throw DJAgentToolError.invalidSpatialEnvironment
+                    }
+                    return value
+                }
+                guard scene != nil || weather != nil else {
+                    throw DJAgentToolError.invalidSpatialEnvironment
+                }
+                try await actions.setSpatialEnvironment(
+                    scene: scene,
+                    weather: weather
+                )
+                message = scene == nil ? "空间天气已更新" : "正在切换完整空间"
+            case "move_spatial_camera":
+                let arguments = try decode(
+                    SpatialCameraArguments.self,
+                    from: call.argumentsJSON
+                )
+                guard let direction = SpatialCameraCommandDirection(
+                    rawValue: arguments.direction
+                ) else {
+                    throw DJAgentToolError.invalidSpatialCamera
+                }
+                let distance = min(max(arguments.distance ?? 2, 0.5), 10)
+                try await actions.moveSpatialCamera(
+                    direction: direction,
+                    distance: distance
+                )
+                message = direction == .reset
+                    ? "空间镜头已复位"
+                    : "空间镜头已移动"
             default:
                 throw DJAgentToolError.unknownTool
             }
@@ -853,6 +1004,8 @@ private enum DJAgentToolError: LocalizedError {
     case missingSearchQuery
     case invalidVisualMood
     case invalidLyricsMode
+    case invalidSpatialEnvironment
+    case invalidSpatialCamera
     case unknownTool
 
     var errorDescription: String? {
@@ -869,6 +1022,10 @@ private enum DJAgentToolError: LocalizedError {
             "视觉情绪只能是 afterglow、liquid 或 pulse"
         case .invalidLyricsMode:
             "歌词视觉模式无效"
+        case .invalidSpatialEnvironment:
+            "空间环境参数无效"
+        case .invalidSpatialCamera:
+            "空间镜头方向无效"
         case .unknownTool:
             "未知的 DJ 工具"
         }

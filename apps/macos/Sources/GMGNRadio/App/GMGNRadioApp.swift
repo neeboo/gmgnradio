@@ -3,6 +3,7 @@ import AVFoundation
 import os
 import SwiftUI
 import UniformTypeIdentifiers
+import WorldRuntime
 
 enum ProductIdentity {
     static let displayName = "gmgn radio"
@@ -33,6 +34,15 @@ enum ApplicationLaunchPolicy {
         return !testEnvironmentKeys.contains { key in
             !(environment[key] ?? "").isEmpty
         }
+    }
+
+    static func shouldShowDesktopPresenceOnLaunch(
+        environment: [String: String]
+    ) -> Bool {
+        guard environment["GMGN_HIDE_STAGE_ON_LAUNCH"] != "1" else {
+            return false
+        }
+        return shouldRestoreUserState(environment: environment)
     }
 }
 
@@ -114,12 +124,11 @@ struct ApplicationIconInstaller {
 
 @MainActor
 struct DockReopenAction {
-    let showStage: @MainActor () -> Void
+    let showDesktopPresence: @MainActor () -> Void
 
     func perform(hasVisibleWindows: Bool) -> Bool {
-        if !hasVisibleWindows {
-            showStage()
-        }
+        _ = hasVisibleWindows
+        showDesktopPresence()
         return true
     }
 }
@@ -127,6 +136,8 @@ struct DockReopenAction {
 @main
 struct GMGNRadioApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @StateObject private var livingActivityMenuStore =
+        LivingWorldActivityMenuStore.shared
     @Environment(\.openSettings) private var openSettings
 
     var body: some Scene {
@@ -145,8 +156,32 @@ struct GMGNRadioApp: App {
             Button("打开 360°舞台") {
                 AppMenuAction.showStage.perform(on: appDelegate)
             }
+            Button("显示 Live Cam") {
+                AppMenuAction.showLiveCam.perform(on: appDelegate)
+            }
             Button("关闭 360°舞台") {
                 AppMenuAction.closeStage.perform(on: appDelegate)
+            }
+            Divider()
+            Menu("角色动作") {
+                ForEach(appDelegate.characterMotionMenuItems) { item in
+                    Button(item.isActive ? "✓ \(item.name)" : item.name) {
+                        AppMenuAction.playCharacterMotion(id: item.id)
+                            .perform(on: appDelegate)
+                    }
+                }
+            }
+            Menu("生活活动") {
+                ForEach(livingActivityMenuStore.items) { item in
+                    Button(item.name) {
+                        AppMenuAction.runLivingActivity(id: item.id)
+                            .perform(on: appDelegate)
+                    }
+                }
+                Divider()
+                Button("停止当前活动") {
+                    AppMenuAction.stopLivingActivity.perform(on: appDelegate)
+                }
             }
             Button("切换歌词视觉") {
                 AppMenuAction.toggleLyricsVisualMode.perform(on: appDelegate)
@@ -187,6 +222,7 @@ struct GMGNRadioApp: App {
         Settings {
             GMGNSettingsView(
                 visualDirections: appDelegate.visualSettingsStore,
+                shortcutSettings: appDelegate.shortcutSettingsStore,
                 connectRealtimeVoice: { configuration in
                     appDelegate.connectRealtimeVoice(configuration)
                 },
@@ -207,17 +243,171 @@ struct GMGNRadioApp: App {
 protocol GMGNApplicationControlling: AnyObject {
     func startAIProgram()
     func showStage()
+    func showLiveCam()
+    func playCharacterMotion(id: String)
     func closeStage()
+    func runLivingWorldActivity(id: String)
+    func stopLivingWorldActivity()
     func chooseLocalTrack()
     func toggleLocalPlayback()
     func toggleLyricsVisualMode()
     func exitImmersiveVisuals()
 }
 
+enum LivingWorldAvatarPresentationMode: Equatable, Sendable {
+    case semanticActivity
+    case userIdle
+}
+
+enum LivingWorldAvatarPresentationPolicy {
+    static func phaseContract(
+        mode: LivingWorldAvatarPresentationMode,
+        authoredContract: ActivityPhaseContract?
+    ) -> ActivityPhaseContract? {
+        switch mode {
+        case .semanticActivity:
+            authoredContract
+        case .userIdle:
+            nil
+        }
+    }
+
+    static func compatibleMotions(
+        _ motions: [String: StageMotionAsset],
+        avatarFormat: StageAvatarFormat?
+    ) -> [String: StageMotionAsset] {
+        guard let avatarFormat else { return [:] }
+        return motions.filter { _, motion in
+            switch (avatarFormat, motion.format) {
+            case (.pmx, .vmd), (.vrm, .vrma), (_, .procedural):
+                true
+            default:
+                false
+            }
+        }
+    }
+}
+
+@MainActor
+struct LivingWorldStageEntryAction {
+    let requestWorldPresentation: () -> Void
+    let showStageWindow: () -> Void
+
+    func perform() {
+        requestWorldPresentation()
+        showStageWindow()
+    }
+}
+
+struct CharacterMotionMenuItem: Identifiable, Equatable, Sendable {
+    let id: String
+    let name: String
+    let isActive: Bool
+}
+
+struct LivingWorldActivityMenuItem: Identifiable, Equatable, Sendable {
+    let id: String
+    let name: String
+}
+
+@MainActor
+final class LivingWorldActivityMenuStore: ObservableObject {
+    static let shared = LivingWorldActivityMenuStore()
+
+    @Published private(set) var items: [LivingWorldActivityMenuItem] = []
+
+    func update(definitions: [LifeActivityDefinition]) {
+        items = LivingWorldActivityMenuPolicy.items(definitions: definitions)
+    }
+}
+
+enum LivingWorldActivityMenuPolicy {
+    static func items(
+        definitions: [LifeActivityDefinition]
+    ) -> [LivingWorldActivityMenuItem] {
+        definitions.map { definition in
+            LivingWorldActivityMenuItem(
+                id: definition.id,
+                name: definition.displayName ?? displayName(for: definition.activity)
+            )
+        }
+    }
+
+    private static func displayName(for activity: LifeActivity) -> String {
+        switch activity {
+        case .idle:
+            "自然待机"
+        case .turn:
+            "原地转身"
+        case .walk:
+            "走到房间中央"
+        case .sit:
+            "坐到椅子上"
+        case .gaze:
+            "看向窗外"
+        case .listenMusic:
+            "听音乐并跳舞（循环）"
+        case .interact:
+            "操作物件"
+        }
+    }
+}
+
+enum LivingWorldActivityPresentationPolicy {
+    static func shouldShowDesktopPresence(
+        fullSpaceIsPresented: Bool
+    ) -> Bool {
+        !fullSpaceIsPresented
+    }
+}
+
+enum CharacterMotionPresentationPolicy {
+    static func shouldShowDesktopPresence(
+        fullSpaceIsPresented: Bool
+    ) -> Bool {
+        !fullSpaceIsPresented
+    }
+}
+
+enum MusicPlaybackPresentationPolicy {
+    static let opensFullStageOnPlaybackStart = false
+}
+
+enum CharacterMotionMenuPolicy {
+    static let ardyJumpingJacksID = "gmgn.motion.ardy-natural-jumping-jacks"
+    static let ardyBackflipID = "gmgn.motion.ardy-backflip"
+
+    private static let productMotions: [(id: String, name: String)] = [
+        (MotionPackageStore.naturalIdleID, "待机"),
+        (MotionPackageStore.iluvSlapBassID, "Slap Bass"),
+        (ardyJumpingJacksID, "ARDY 开合跳"),
+        (ardyBackflipID, "后空翻"),
+    ]
+
+    static func items(
+        motions: [StageMotionAsset],
+        activeMotionID: String?
+    ) -> [CharacterMotionMenuItem] {
+        let motionsByID = Dictionary(uniqueKeysWithValues: motions.map { ($0.id, $0) })
+        return productMotions.compactMap { productMotion in
+            guard let motion = motionsByID[productMotion.id] else { return nil }
+            return CharacterMotionMenuItem(
+                id: motion.id,
+                name: productMotion.name,
+                isActive: motion.id == activeMotionID
+            )
+        }
+    }
+}
+
 enum AppMenuAction: Sendable {
     case startAIProgram
     case showStage
+    case showLiveCam
+    case playCharacterMotion(id: String)
     case closeStage
+    case runLivingActivity(id: String)
+    case stopLivingActivity
     case chooseLocalTrack
     case toggleLocalPlayback
     case toggleLyricsVisualMode
@@ -230,8 +420,16 @@ enum AppMenuAction: Sendable {
             controller.startAIProgram()
         case .showStage:
             controller.showStage()
+        case .showLiveCam:
+            controller.showLiveCam()
+        case let .playCharacterMotion(id):
+            controller.playCharacterMotion(id: id)
         case .closeStage:
             controller.closeStage()
+        case let .runLivingActivity(id):
+            controller.runLivingWorldActivity(id: id)
+        case .stopLivingActivity:
+            controller.stopLivingWorldActivity()
         case .chooseLocalTrack:
             controller.chooseLocalTrack()
         case .toggleLocalPlayback:
@@ -283,21 +481,49 @@ final class AppDelegate:
         subsystem: ProductIdentity.bundleIdentifier,
         category: "DJPlayback"
     )
+    private let livingWorldLogger = Logger(
+        subsystem: ProductIdentity.bundleIdentifier,
+        category: "LivingWorld"
+    )
     private let applicationActivation = ApplicationActivationCoordinator()
     private let audioFeatures = VisualAudioFeatureStore()
     private let stageArtwork = StageArtworkStore()
     private let stagePresentation = StagePresentationModel()
     private let stageVisualDirections = StageVisualDirectionStore()
     private let stageVideos = StageVideoPlaybackStore()
+    private let spatialStage = SpatialStageStore()
+    private let avatarRuntime = StageAvatarRuntimeStore.shared
+    private let motionPackageStore = try? MotionPackageStore.liveStore()
+    private lazy var marbleWorldLibrary = MarbleWorldLibrary(
+        spatialStage: spatialStage
+    )
     private let programStore = DJProgramStore.shared
     private let musicLibraryStore = SyncedMusicLibraryStore.shared
     private let stageLyrics = StageLyricsStore.shared
     private let agentPreferences = DJAgentPreferences()
     private let realtimeVoicePreferences = RealtimeVoicePreferences()
     private let realtimeDJSessionController = RealtimeDJSessionController()
+    private let shortcutSettings = GMGNShortcutSettingsStore()
+    private var shortcutCoordinator: GMGNShortcutCoordinator?
 
     var visualSettingsStore: StageVisualDirectionStore {
         stageVisualDirections
+    }
+    var shortcutSettingsStore: GMGNShortcutSettingsStore {
+        shortcutSettings
+    }
+    var characterMotionMenuItems: [CharacterMotionMenuItem] {
+        guard
+            let motionPackageStore,
+            let motions = try? motionPackageStore.listMotions()
+        else {
+            return []
+        }
+        let activeMotionID = try? motionPackageStore.activeMotion().id
+        return CharacterMotionMenuPolicy.items(
+            motions: motions,
+            activeMotionID: activeMotionID
+        )
     }
     private lazy var musicRuntime = MusicRuntime.live()
     private var audioGraphStorage: AudioGraphController?
@@ -324,6 +550,18 @@ final class AppDelegate:
     private var interruptionCoordinator: InterruptionCoordinator?
     private var orbWindowController: OrbWindowController?
     private var stageWindowController: StageWindowController?
+    private var liveCamWindowController: LiveCamWindowController?
+    private var stageRenderSurfaceController: StageRenderSurfaceController?
+    private var stageCameraCoordinator: StageCameraCoordinator?
+    private var stageAvatarActivityExecutor: StageAvatarActivityExecutor?
+    private var livingWorldApprovedMotions: [String: StageMotionAsset] = [:]
+    private var desktopPresenceObserverID: UUID?
+    private var livingWorldContext: WorldAgentContext?
+    private var worldAgentToolDispatcher: WorldAgentToolDispatcher?
+    private var livingWorldVisualTask: Task<Void, Never>?
+    private var livingWorldColliderTask: Task<Void, Never>?
+    private var livingWorldColliderFraming: MarbleSceneFraming?
+    private var sceneFramingObserverID: UUID?
     private var stageAudioMonitor: VisualAudioInputMonitor?
     private var stagePresentationTask: Task<Void, Never>?
     private var realtimeVoiceConnectionTask: Task<Void, Never>?
@@ -339,24 +577,58 @@ final class AppDelegate:
         takeoverEnabled: { [weak self] in
             self?.agentPreferences.takeoverEnabled() ?? false
         },
-        actions: self
+        actions: self,
+        worldDispatcher: { [weak self] in
+            self?.worldAgentToolDispatcher
+        }
     )
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let environment = ProcessInfo.processInfo.environment
         ApplicationIconInstaller().install()
+        let shortcuts = GMGNShortcutCoordinator(
+            settings: shortcutSettings,
+            performAction: { [weak self] action in
+                self?.performShortcutAction(action)
+            }
+        )
+        shortcutCoordinator = shortcuts
+        shortcuts.start()
         playbackLogger.info("应用启动，开始恢复节目与音频状态")
         ProcessInfo.processInfo.disableAutomaticTermination(
             "gmgn radio 需要保持桌宠、电台和实时语音会话在线"
         )
-        let controller = OrbWindowController(audioFeatures: audioFeatures)
+        let controller = OrbWindowController(
+            audioFeatures: audioFeatures,
+            isStageVisible: { [weak self] in
+                self?.stageWindowController?.isPresented ?? false
+            },
+            showStage: { [weak self] in
+                self?.showStage()
+            },
+            hideStage: { [weak self] in
+                self?.closeStage()
+            }
+        )
         orbWindowController = controller
-        controller.show()
+        configureLivingWorld()
         configureStage()
+        desktopPresenceObserverID = avatarRuntime.observe {
+            [weak self] snapshot in
+            self?.applyDesktopPresence(snapshot)
+            self?.refreshInstalledLivingWorldMotions()
+        }
+        avatarRuntime.refresh()
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(musicAccountDidChange),
             name: .musicAccountDidChange,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(manualMotionWillActivate),
+            name: .gmgnManualMotionWillActivate,
             object: nil
         )
         if ApplicationLaunchPolicy.shouldRestoreUserState(
@@ -399,6 +671,10 @@ final class AppDelegate:
         }
         if environment["GMGN_STAGE"] == "1" {
             showStage()
+        } else if ApplicationLaunchPolicy.shouldShowDesktopPresenceOnLaunch(
+            environment: environment
+        ) {
+            showLiveCam()
         }
         if let trackPath = environment["GMGN_LOCAL_TRACK"] {
             do {
@@ -407,6 +683,60 @@ final class AppDelegate:
                 presentPlaybackError(error)
             }
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        shortcutCoordinator?.stop()
+        avatarRuntime.removeObserver(desktopPresenceObserverID)
+        desktopPresenceObserverID = nil
+        livingWorldVisualTask?.cancel()
+        livingWorldColliderTask?.cancel()
+        spatialStage.removeSceneFramingObserver(sceneFramingObserverID)
+        sceneFramingObserverID = nil
+        livingWorldContext?.stopTicking()
+    }
+
+    @objc private func manualMotionWillActivate(_ notification: Notification) {
+        guard let context = livingWorldContext else { return }
+        do {
+            try context.stopActivity(reason: "用户从设置选择动作")
+        } catch {
+            livingWorldLogger.error(
+                "设置动作前停止生活活动失败：\(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
+    private func performShortcutAction(_ action: GMGNShortcutAction) {
+        switch action {
+        case .togglePlayback:
+            toggleLocalPlayback()
+        case .previousTrack:
+            playPreviousProgramTrack()
+        case .nextTrack:
+            playNextProgramTrack()
+        case .volumeUp:
+            adjustMusicVolume(by: 0.08)
+        case .volumeDown:
+            adjustMusicVolume(by: -0.08)
+        case .toggleVoice:
+            toggleRealtimeVoiceFromStage()
+        case .toggleStage:
+            if stageWindowController?.isPresented == true {
+                closeStage()
+            } else {
+                showStage()
+            }
+        case .toggleLyrics:
+            toggleLyricsVisualMode()
+        }
+    }
+
+    private func adjustMusicVolume(by delta: Float) {
+        audioGraph.musicVolume = min(
+            1,
+            max(0, audioGraph.musicVolume + delta)
+        )
     }
 
     @objc private func musicAccountDidChange(_ notification: Notification) {
@@ -491,16 +821,138 @@ final class AppDelegate:
         hasVisibleWindows flag: Bool
     ) -> Bool {
         DockReopenAction { [weak self] in
-            self?.showStage()
+            self?.showLiveCam()
         }.perform(hasVisibleWindows: flag)
     }
 
     func showStage() {
         promoteToForeground()
+        if livingWorldContext == nil {
+            configureLivingWorld()
+        }
         if stageWindowController == nil {
             configureStage()
         }
-        stageWindowController?.show()
+        LivingWorldStageEntryAction(
+            requestWorldPresentation: { [spatialStage] in
+                spatialStage.requestWorldPresentation()
+            },
+            showStageWindow: { [weak self] in
+                self?.stageWindowController?.show()
+            }
+        ).perform()
+    }
+
+    func showLiveCam() {
+        if stageWindowController?.isPresented == true {
+            stageWindowController?.close()
+            return
+        }
+        if livingWorldContext == nil {
+            configureLivingWorld()
+        }
+        if stageWindowController == nil {
+            configureStage()
+        }
+        applyDesktopPresence(avatarRuntime.snapshot)
+    }
+
+    private func applyDesktopPresence(
+        _ snapshot: StageAvatarRuntimeSnapshot
+    ) {
+        switch DesktopPresenceMode.resolve(snapshot: snapshot) {
+        case .orb:
+            liveCamWindowController?.hide()
+            orbWindowController?.show()
+        case .liveCam:
+            orbWindowController?.hide()
+            guard stageWindowController?.isPresented != true else { return }
+            liveCamWindowController?.show()
+        }
+    }
+
+    func runLivingWorldActivity(id: String) {
+        if LivingWorldActivityPresentationPolicy.shouldShowDesktopPresence(
+            fullSpaceIsPresented: stageWindowController?.isPresented == true
+        ) {
+            showLiveCam()
+        }
+        guard let context = livingWorldContext else {
+            livingWorldLogger.error("生活空间当前不可用，无法开始菜单活动")
+            return
+        }
+        guard let definition = context.manifest.activityDefinitions.first(
+            where: { $0.id == id }
+        ) else {
+            livingWorldLogger.error(
+                "示例空间未声明活动：\(id, privacy: .public)"
+            )
+            return
+        }
+        do {
+            try context.startActivity(id: definition.id)
+        } catch {
+            livingWorldLogger.error(
+                "菜单活动启动失败：id=\(id, privacy: .public)，error=\(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
+    func stopLivingWorldActivity() {
+        guard let context = livingWorldContext else {
+            livingWorldLogger.error("生活空间当前不可用，无法停止活动")
+            return
+        }
+        do {
+            try context.stopActivity()
+        } catch {
+            livingWorldLogger.error(
+                "停止生活活动失败：\(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
+    func playCharacterMotion(id: String) {
+        guard let motionPackageStore else {
+            livingWorldLogger.error("动作库当前不可用")
+            return
+        }
+        do {
+            guard let motion = try motionPackageStore.listMotions().first(
+                where: { $0.id == id }
+            ) else {
+                throw MotionPackageError.motionNotFound
+            }
+            if avatarRuntime.snapshot.avatar?.format == .pmx,
+               motion.format == .vrma
+            {
+                livingWorldLogger.error(
+                    "动作与当前 PMX 角色不兼容：motion=\(motion.name, privacy: .public)"
+                )
+                return
+            }
+
+            if livingWorldContext == nil {
+                configureLivingWorld()
+            }
+            try livingWorldContext?.stopActivity(
+                reason: "用户从菜单选择动作"
+            )
+            try motionPackageStore.activate(id: motion.id)
+            avatarRuntime.refresh()
+            if CharacterMotionPresentationPolicy.shouldShowDesktopPresence(
+                fullSpaceIsPresented: stageWindowController?.isPresented == true
+            ) {
+                showLiveCam()
+            }
+            livingWorldLogger.info(
+                "已从菜单播放角色动作：motion=\(motion.name, privacy: .public)"
+            )
+        } catch {
+            livingWorldLogger.error(
+                "菜单动作播放失败：id=\(id, privacy: .public)，error=\(error.localizedDescription, privacy: .public)"
+            )
+        }
     }
 
     func promoteToForeground() {
@@ -637,7 +1089,8 @@ final class AppDelegate:
                         voiceID: voiceID
                     )
                     session = BailianRealtimeSession.live(
-                        audioGraph: audioGraph
+                        audioGraph: audioGraph,
+                        providerTools: agentToolDispatcher.providerTools
                     )
                     ticket = RealtimeDJSessionTicket(
                         provider: .bailian,
@@ -879,7 +1332,6 @@ final class AppDelegate:
         )
         orbWindowController?.setState(.playing)
         stageWindowController?.setPlaybackState(.playing)
-        showStage()
     }
 
     private func presentPlaybackError(_ error: Error) {
@@ -1225,7 +1677,6 @@ final class AppDelegate:
             try await musicRuntime.startAppleMusic(trackID: trackID)
             orbWindowController?.setState(.playing)
             stageWindowController?.setPlaybackState(.playing)
-            showStage()
         }
 
         previousCommittedPlaybackTrack = previouslyCommittedTrack
@@ -1432,7 +1883,305 @@ final class AppDelegate:
         )
     }
 
+    private func configureLivingWorld() {
+        if stageRenderSurfaceController == nil {
+            stageRenderSurfaceController = StageRenderSurfaceController(
+                spatialStage: spatialStage,
+                library: marbleWorldLibrary,
+                avatarRuntime: avatarRuntime
+            )
+        }
+        if stageCameraCoordinator == nil {
+            stageCameraCoordinator = StageCameraCoordinator(
+                spatialStage: spatialStage
+            )
+        }
+        guard livingWorldContext == nil else { return }
+
+        do {
+            let package = try LivingWorldBootstrap.loadBundledCanary()
+            let avatarExecutor = StageAvatarActivityExecutor(
+                runtime: avatarRuntime,
+                spatialStage: spatialStage,
+                worldSpawn: package.manifest.spawn
+            )
+            var supplementalMotions: [String: StageMotionAsset] = [:]
+            let installedMotions = try motionPackageStore?.listMotions() ?? []
+            if let slapBass = installedMotions.first(where: {
+                $0.id == MotionPackageStore.iluvSlapBassID
+            }) {
+                supplementalMotions["listen.music"] = slapBass
+            }
+            supplementalMotions.merge(
+                LivingWorldBootstrap.approvedInstalledMotions(installedMotions),
+                uniquingKeysWith: { _, installed in installed }
+            )
+            livingWorldApprovedMotions = try LivingWorldBootstrap.approvedMotions(
+                resources: package.manifest.resources,
+                packageRoot: package.packageRoot,
+                supplementalMotions: supplementalMotions
+            )
+            let context = try LivingWorldBootstrap.makeContext(
+                package: package,
+                walkingSpeed: LivingWorldBootstrap.walkingSpeed(
+                    approvedMotions: livingWorldApprovedMotions
+                )
+            )
+            livingWorldContext = context
+            LivingWorldActivityMenuStore.shared.update(
+                definitions: context.manifest.activityDefinitions
+            )
+            stageAvatarActivityExecutor = avatarExecutor
+            worldAgentToolDispatcher = WorldAgentToolDispatcher(
+                takeoverEnabled: { [weak self] in
+                    self?.agentPreferences.takeoverEnabled() ?? false
+                },
+                context: context
+            )
+            context.onSnapshotChanged = { [weak self] snapshot in
+                self?.applyLivingWorldSnapshot(snapshot)
+            }
+            context.onTickError = { [weak self] error in
+                self?.livingWorldLogger.error(
+                    "生活空间推进失败：\(error.localizedDescription, privacy: .public)"
+                )
+            }
+            sceneFramingObserverID = spatialStage.observeSceneFraming {
+                [weak self] framing in
+                self?.prepareLivingWorldCollider(framing: framing)
+            }
+
+            if context.snapshot.liveCamera == nil,
+               let initialCameraID = package.manifest.cameras.first?.id
+            {
+                try context.selectCamera(id: initialCameraID)
+            } else {
+                applyLivingWorldSnapshot(context.snapshot)
+            }
+            context.startTicking()
+
+            livingWorldVisualTask?.cancel()
+            livingWorldVisualTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                let localURL = await marbleWorldLibrary.select(
+                    worldID: package.manifest.worldID
+                )
+                guard !Task.isCancelled else { return }
+                if localURL == nil {
+                    livingWorldLogger.error(
+                        "Warm Kitchen 视觉资源加载失败，保留世界控制与角色状态"
+                    )
+                }
+                spatialStage.requestWorldPresentation()
+            }
+            let stateVersionDirectory = LivingWorldBootstrap
+                .sanitizedPackageVersionDirectory(package.manifest.packageVersion)
+            livingWorldLogger.info(
+                "生活空间已启动：world=\(package.manifest.worldID, privacy: .public)，state=Application Support/LivingWorld/\(package.manifest.packageID, privacy: .public)/\(stateVersionDirectory, privacy: .public)/state.json"
+            )
+        } catch {
+            livingWorldLogger.error(
+                "生活空间启动失败：\(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
+    private func prepareLivingWorldCollider(
+        framing: MarbleSceneFraming
+    ) {
+        guard let context = livingWorldContext,
+              livingWorldColliderFraming != framing
+        else {
+            return
+        }
+        livingWorldColliderFraming = framing
+        let worldID = context.manifest.worldID
+        livingWorldColliderTask?.cancel()
+        livingWorldColliderTask = Task { @MainActor [weak self, weak context] in
+            guard let self, let context else { return }
+            do {
+                guard let (url, sourceCoordinates) = try await marbleWorldLibrary
+                    .localCollider(for: worldID)
+                else {
+                    livingWorldLogger.notice(
+                        "空间没有碰撞 GLB，继续使用包内碰撞体：world=\(worldID, privacy: .public)"
+                    )
+                    return
+                }
+                let transform = framing.colliderTransform(
+                    sourceCoordinates: sourceCoordinates
+                )
+                let prepared = try await Task.detached(priority: .utility) {
+                    let data = try Data(contentsOf: url, options: .mappedIfSafe)
+                    let triangles = try GLBColliderDecoder().decode(
+                        data: data,
+                        transform: transform
+                    )
+                    return (
+                        TriangleMeshCollisionWorld(triangles: triangles),
+                        triangles
+                    )
+                }.value
+                try Task.checkCancellation()
+                guard self.livingWorldContext === context,
+                      self.spatialStage.selectedWorldID == worldID
+                else {
+                    return
+                }
+                spatialStage.installSceneOccluderTriangles(prepared.1)
+                let correctedPosition = try context
+                    .installCollisionWorldAndReconcilePlacement(prepared.0)
+                if let correctedPosition {
+                    livingWorldLogger.notice(
+                        "碰撞 GLB 修正角色落点：x=\(correctedPosition.x, privacy: .public)，y=\(correctedPosition.y, privacy: .public)，z=\(correctedPosition.z, privacy: .public)"
+                    )
+                }
+                livingWorldLogger.notice(
+                    "碰撞与遮挡 GLB 已接管生活空间：world=\(worldID, privacy: .public)，triangles=\(prepared.1.count, privacy: .public)"
+                )
+            } catch is CancellationError {
+                return
+            } catch {
+                livingWorldColliderFraming = nil
+                livingWorldLogger.error(
+                    "碰撞 GLB 加载失败，继续使用包内碰撞体：\(error.localizedDescription, privacy: .public)"
+                )
+            }
+        }
+    }
+
+    private func applyLivingWorldSnapshot(_ snapshot: WorldAgentSnapshot) {
+        let spatialWeather: SpatialWeather = switch snapshot.weather {
+        case .clear, .cloudy:
+            .clear
+        case .rain, .snow:
+            .rain
+        }
+        if spatialStage.environment.weather != spatialWeather {
+            spatialStage.applyEnvironment(weather: spatialWeather)
+        }
+
+        if let liveCamera = snapshot.liveCamera,
+           let stageCameraCoordinator
+        {
+            let camera = Self.spatialCamera(from: liveCamera.transform)
+            if stageCameraCoordinator.savedDirectorCamera != camera {
+                stageCameraCoordinator.updateDirectorCamera(camera)
+            }
+        }
+
+        guard let stageAvatarActivityExecutor,
+              let context = livingWorldContext
+        else {
+            return
+        }
+        let activity: LifeActivity
+        let phase: LifeActivityPhase
+        let presentationMode: LivingWorldAvatarPresentationMode
+        let authoredContract: ActivityPhaseContract?
+        if let active = snapshot.activeActivity {
+            activity = active.activity
+            phase = active.phase
+            presentationMode = .semanticActivity
+            authoredContract = context.activityCatalog
+                .definition(id: active.id)?
+                .contract(for: active.phase)
+        } else if let movement = snapshot.movement {
+            activity = .walk(destinationID: movement.destinationID)
+            phase = .approach
+            presentationMode = .semanticActivity
+            authoredContract = context.activityCatalog.definitions.first(where: {
+                $0.activity.typeID == "walk"
+            })?.contract(for: .approach)
+        } else {
+            activity = .idle
+            phase = .loop
+            presentationMode = .userIdle
+            authoredContract = context.activityCatalog.definitions.first(where: {
+                $0.activity.typeID == "idle"
+            })?.contract(for: .loop)
+        }
+        let contract = LivingWorldAvatarPresentationPolicy.phaseContract(
+            mode: presentationMode,
+            authoredContract: authoredContract
+        )
+        let previousAvatarPosition = spatialStage.avatarPlacement.position
+        _ = stageAvatarActivityExecutor.apply(
+            transform: snapshot.agentTransform,
+            activity: activity,
+            phase: phase,
+            sourceRevision: snapshot.revision,
+            phaseContract: contract,
+            approvedMotions: LivingWorldAvatarPresentationPolicy
+                .compatibleMotions(
+                    livingWorldApprovedMotions,
+                    avatarFormat: avatarRuntime.snapshot.avatar?.format
+                )
+        )
+        stageCameraCoordinator?.followAvatarHorizontally(
+            from: previousAvatarPosition,
+            to: spatialStage.avatarPlacement.position
+        )
+    }
+
+    private func refreshInstalledLivingWorldMotions() {
+        guard
+            let motionPackageStore,
+            let motions = try? motionPackageStore.listMotions()
+        else {
+            return
+        }
+        let knownIDs = LivingWorldBootstrap.installedLivingMotionIDs
+        var updated = livingWorldApprovedMotions.filter {
+            !knownIDs.contains($0.key)
+        }
+        updated.merge(
+            LivingWorldBootstrap.approvedInstalledMotions(motions),
+            uniquingKeysWith: { _, installed in installed }
+        )
+        guard updated != livingWorldApprovedMotions else { return }
+        livingWorldApprovedMotions = updated
+        if let snapshot = livingWorldContext?.snapshot {
+            applyLivingWorldSnapshot(snapshot)
+        }
+    }
+
+    private static func spatialCamera(
+        from transform: WorldTransform
+    ) -> SpatialCameraState {
+        let rotation = transform.rotation
+        let yaw = atan2(
+            2 * (rotation.w * rotation.y + rotation.x * rotation.z),
+            1 - 2 * (rotation.y * rotation.y + rotation.z * rotation.z)
+        )
+        let pitchSine = min(
+            max(2 * (rotation.w * rotation.x - rotation.z * rotation.y), -1),
+            1
+        )
+        return SpatialCameraState(
+            position: SIMD3(
+                transform.position.x,
+                transform.position.y,
+                transform.position.z
+            ),
+            yaw: yaw,
+            pitch: asin(pitchSine)
+        )
+    }
+
     private func configureStage() {
+        guard stageWindowController == nil else { return }
+        if stageRenderSurfaceController == nil
+            || stageCameraCoordinator == nil
+        {
+            configureLivingWorld()
+        }
+        guard let stageRenderSurfaceController,
+              let stageCameraCoordinator
+        else {
+            livingWorldLogger.error("共享空间画面初始化失败")
+            return
+        }
         let monitor: VisualAudioInputMonitor?
         if VisualAudioInputPolicy.usesMicrophone(
             environment: ProcessInfo.processInfo.environment
@@ -1452,6 +2201,11 @@ final class AppDelegate:
             programStore: programStore,
             libraryStore: musicLibraryStore,
             lyrics: stageLyrics,
+            spatialStage: spatialStage,
+            marbleLibrary: marbleWorldLibrary,
+            avatarRuntime: avatarRuntime,
+            renderSurfaceController: stageRenderSurfaceController,
+            cameraCoordinator: stageCameraCoordinator,
             playbackPosition: { [weak self] in
                 self?.audioGraphStorage?.playbackPosition ?? 0
             },
@@ -1491,6 +2245,33 @@ final class AppDelegate:
                 self?.toggleRealtimeVoiceFromStage()
             }
         )
+        if let stageWindowController {
+            let liveCamWindowController = LiveCamWindowController(
+                renderSurfaceController: stageRenderSurfaceController,
+                cameraCoordinator: stageCameraCoordinator,
+                voiceState: RealtimeVoiceStatusStore.shared.state,
+                shouldPresent: { [weak self] in
+                    guard let self else { return false }
+                    return DesktopPresenceMode.resolve(
+                        snapshot: self.avatarRuntime.snapshot
+                    ) == .liveCam
+                },
+                onSendMessage: { [weak self] message in
+                    guard let self else { return }
+                    try await self.sendLiveCamMessage(message)
+                },
+                onToggleVoice: { [weak self] in
+                    self?.toggleRealtimeVoiceFromStage()
+                }
+            )
+            liveCamWindowController.connect(
+                to: stageWindowController,
+                onOpenFullStage: { [weak self] in
+                    self?.showStage()
+                }
+            )
+            self.liveCamWindowController = liveCamWindowController
+        }
         updateStageProgramNavigation()
 
         stagePresentationTask?.cancel()
@@ -1507,16 +2288,25 @@ final class AppDelegate:
                 case let .userAudioLevel(level),
                      let .agentAudioLevel(level):
                     orbWindowController?.setVoiceLevel(level.peak)
+                    stageWindowController?.setVoiceLevel(Float(level.peak))
                 case .userSpeechStarted:
                     setRealtimeVoiceState(.listening)
                 case .userSpeechFinished:
                     orbWindowController?.setVoiceLevel(0)
+                    stageWindowController?.setVoiceLevel(0)
                     setRealtimeVoiceState(.connected)
                 case .agentAudioStarted:
                     setRealtimeVoiceState(.speaking)
                 case .agentAudioFinished:
                     orbWindowController?.setVoiceLevel(0)
+                    stageWindowController?.setVoiceLevel(0)
                     setRealtimeVoiceState(.connected)
+                case .agentResponseStarted:
+                    liveCamWindowController?.beginAgentReply()
+                case let .agentTranscriptDelta(text):
+                    liveCamWindowController?.appendAgentReply(text)
+                case let .agentTranscriptFinal(text):
+                    liveCamWindowController?.finishAgentReply(text)
                 case let .userTranscriptFinal(text):
                     playbackLogger.info(
                         "用户最终转写：\(text, privacy: .public)"
@@ -1531,6 +2321,7 @@ final class AppDelegate:
                     } else if state == .disconnected {
                         setRealtimeVoiceState(.disconnected)
                         orbWindowController?.setVoiceLevel(0)
+                        stageWindowController?.setVoiceLevel(0)
                     }
                 case let .toolCall(call):
                     let arguments = String(
@@ -1568,6 +2359,7 @@ final class AppDelegate:
                     playbackLogger.error(
                         "实时语音故障：code=\(failure.code, privacy: .public)，recoverable=\(failure.recoverable)，message=\(failure.message, privacy: .public)"
                     )
+                    liveCamWindowController?.showChatStatus(failure.message)
                 default:
                     break
                 }
@@ -1819,6 +2611,18 @@ final class AppDelegate:
     ) {
         RealtimeVoiceStatusStore.shared.state = state
         stageWindowController?.setVoiceState(state)
+        liveCamWindowController?.setVoiceState(state)
+    }
+
+    private func sendLiveCamMessage(_ message: String) async throws {
+        switch RealtimeVoiceStatusStore.shared.state {
+        case .connecting:
+            throw LiveCamChatError.voiceSessionConnecting
+        case .connected, .listening, .speaking:
+            try await realtimeDJSessionController.requestAgentResponse(message)
+        case .disconnected, .failed:
+            throw LiveCamChatError.voiceSessionUnavailable
+        }
     }
 
     private func updateStageProgramNavigation() {
@@ -2399,6 +3203,26 @@ final class AppDelegate:
         _ mode: StageLyricsVisualMode
     ) async throws {
         stageLyrics.setVisualMode(mode)
+    }
+
+    func setSpatialEnvironment(
+        scene: SpatialScenePreset?,
+        weather: SpatialWeather?
+    ) async throws {
+        if let scene {
+            await marbleWorldLibrary.activate(preset: scene)
+            if let error = marbleWorldLibrary.errorMessage {
+                throw MarbleWorldClientError.generationFailed(error)
+            }
+        }
+        spatialStage.applyEnvironment(weather: weather)
+    }
+
+    func moveSpatialCamera(
+        direction: SpatialCameraCommandDirection,
+        distance: Float
+    ) async throws {
+        spatialStage.applyCameraCommand(direction, distance: distance)
     }
 
     private var agentPlaybackState: String {

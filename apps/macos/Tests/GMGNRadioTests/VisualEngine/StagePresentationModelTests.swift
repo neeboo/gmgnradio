@@ -4,6 +4,16 @@ import Testing
 
 @Test
 @MainActor
+func presentationModelStartsWithoutPlaceholderCopy() {
+    let model = StagePresentationModel()
+
+    #expect(model.programTitle.isEmpty)
+    #expect(model.programDetail.isEmpty)
+    #expect(model.currentCue == nil)
+}
+
+@Test
+@MainActor
 func presentationModelSelectsTheCueForTheCurrentProgramTime() {
     let model = StagePresentationModel(
         programTitle: "MIDNIGHT DRIVE",
@@ -437,7 +447,61 @@ func automaticLyricDirectorKeepsOneThemeForTheWholeTrack() {
 }
 
 @Test
-func lyricThemeContractIncludesAllTenFoliaCompositions() {
+func foldingVerseGroupsFourLinesAndAlternatesTheFoldSide() {
+    let lines = (0 ..< 8).map { index in
+        StageLyricLine(
+            id: "line-\(index)",
+            startsAt: TimeInterval(index * 2),
+            endsAt: TimeInterval(index * 2 + 2),
+            text: "第 \(index) 句"
+        )
+    }
+
+    let scene = StageLyricFoldSceneModel(
+        lines: lines,
+        playbackTime: 8.35
+    )
+
+    #expect(scene.groupIndex == 1)
+    #expect(scene.previousLines.map(\.id) == [
+        "line-0", "line-1", "line-2", "line-3",
+    ])
+    #expect(scene.currentLines.map(\.id) == [
+        "line-4", "line-5", "line-6", "line-7",
+    ])
+    #expect(scene.activeLineID == "line-4")
+    #expect(scene.foldDirection == .right)
+    #expect(scene.transitionProgress > 0)
+    #expect(scene.transitionProgress < 1)
+}
+
+@Test
+func foldingVerseStartsANewGroupAtALongLyricPause() {
+    let starts: [TimeInterval] = [0, 2, 4, 10, 12, 14]
+    let lines = starts.enumerated().map { index, start in
+        StageLyricLine(
+            id: "line-\(index)",
+            startsAt: start,
+            endsAt: start + 1.5,
+            text: "第 \(index) 句"
+        )
+    }
+
+    let scene = StageLyricFoldSceneModel(
+        lines: lines,
+        playbackTime: 10.1
+    )
+
+    #expect(scene.previousLines.map(\.id) == [
+        "line-0", "line-1", "line-2",
+    ])
+    #expect(scene.currentLines.map(\.id) == [
+        "line-3", "line-4", "line-5",
+    ])
+}
+
+@Test
+func lyricThemeContractIncludesFoldingVerse() {
     #expect(
         StageLyricsVisualMode.playbackModes.map(\.agentValue) == [
             "luminous",
@@ -450,9 +514,10 @@ func lyricThemeContractIncludesAllTenFoliaCompositions() {
             "monet_poster",
             "pendulum",
             "diorama",
+            "folding_verse",
         ]
     )
-    #expect(StageLyricsVisualMode.agentValues.count == 11)
+    #expect(StageLyricsVisualMode.agentValues.count == 12)
 }
 
 @Test

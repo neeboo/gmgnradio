@@ -1,5 +1,5 @@
 {
-  "originHash" : "c5f0a90d5d8853f60c787b94fc426567c28d23873b20be5b38fd5ebfb35e9eee",
+  "originHash" : "32d8240b892bfdba1fb86b4d14c87c0ff8da358f54327332818246aabe68a6a5",
   "pins" : [
     {
       "identity" : "client-sdk-swift",
@@ -29,12 +29,48 @@
       }
     },
     {
+      "identity" : "metalsplatter",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/scier/MetalSplatter.git",
+      "state" : {
+        "revision" : "71ff248e3016ac43c0a9271e322538421b28c360",
+        "version" : "1.0.1"
+      }
+    },
+    {
+      "identity" : "spz-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/scier/spz-swift.git",
+      "state" : {
+        "revision" : "e2410c91bceba2539c11157ad92e488ef6e16416",
+        "version" : "2.1.0"
+      }
+    },
+    {
+      "identity" : "swift-argument-parser",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-argument-parser",
+      "state" : {
+        "revision" : "6a52f3251125d74daf04fcbd5e6f08a75d074382",
+        "version" : "1.8.2"
+      }
+    },
+    {
       "identity" : "swift-protobuf",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-protobuf.git",
       "state" : {
         "revision" : "55d7a1cc5666b85c13464aea1c4b4a90feccb4c8",
         "version" : "1.38.1"
+      }
+    },
+    {
+      "identity" : "vrmmetalkit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/arkavo-org/VRMMetalKit.git",
+      "state" : {
+        "revision" : "a94531d99f9f8d744d7702595f77c615c169835e",
+        "version" : "1.0.0"
       }
     },
     {

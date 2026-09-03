@@ -22,6 +22,28 @@ struct StageParticleVertex {
     float4 colorAndPhase;
 };
 
+struct MarbleOccluderUniforms {
+    float4x4 viewProjection;
+    float4 depthConvention;
+};
+
+vertex float4 marbleOccluderVertex(
+    const device float3 *positions [[buffer(0)]],
+    constant MarbleOccluderUniforms &uniforms [[buffer(1)]],
+    uint vertexID [[vertex_id]]
+) {
+    float4 clipPosition = uniforms.viewProjection
+        * float4(positions[vertexID], 1.0);
+    if (uniforms.depthConvention.x > 0.5) {
+        clipPosition.z = clipPosition.w - clipPosition.z;
+    }
+    return clipPosition;
+}
+
+fragment float4 marbleOccluderFragment() {
+    return float4(0.0);
+}
+
 struct StageBackgroundOut {
     float4 position [[position]];
     float2 uv;

@@ -11,6 +11,7 @@ actor KeychainMusicProviderSessionStore: MusicProviderSessionStore {
     static let defaultService = "ai.gmgn.radio.music-providers.stable-v1"
 
     private let service: String
+    private let permitsKeychainAccess: Bool
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private var loadedProviderIDs = Set<MusicProviderID>()
@@ -18,13 +19,21 @@ actor KeychainMusicProviderSessionStore: MusicProviderSessionStore {
         MusicProviderID: MusicProviderSession
     ] = [:]
 
-    init(service: String = KeychainMusicProviderSessionStore.defaultService) {
+    init(
+        service: String = KeychainMusicProviderSessionStore.defaultService,
+        permitsKeychainAccess: Bool = KeychainMusicProviderSessionStore
+            .defaultKeychainAccessPolicy()
+    ) {
         self.service = service
+        self.permitsKeychainAccess = permitsKeychainAccess
     }
 
     func session(
         for providerID: MusicProviderID
     ) throws -> MusicProviderSession? {
+        guard permitsKeychainAccess else {
+            return cachedSessions[providerID]
+        }
         if loadedProviderIDs.contains(providerID) {
             return cachedSessions[providerID]
         }
@@ -62,6 +71,11 @@ actor KeychainMusicProviderSessionStore: MusicProviderSessionStore {
         _ session: MusicProviderSession,
         for providerID: MusicProviderID
     ) throws {
+        guard permitsKeychainAccess else {
+            loadedProviderIDs.insert(providerID)
+            cachedSessions[providerID] = session
+            return
+        }
         let data = try encoder.encode(session)
         let query = baseQuery(for: providerID)
         let update = [kSecValueData: data] as CFDictionary
@@ -91,6 +105,11 @@ actor KeychainMusicProviderSessionStore: MusicProviderSessionStore {
     func removeSession(
         for providerID: MusicProviderID
     ) throws {
+        guard permitsKeychainAccess else {
+            loadedProviderIDs.insert(providerID)
+            cachedSessions.removeValue(forKey: providerID)
+            return
+        }
         let status = SecItemDelete(baseQuery(for: providerID) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw MusicProviderSessionStoreError.keychain(status)
@@ -107,5 +126,18 @@ actor KeychainMusicProviderSessionStore: MusicProviderSessionStore {
             kSecAttrService: service,
             kSecAttrAccount: providerID.rawValue
         ]
+    }
+
+    private static func defaultKeychainAccessPolicy(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        let testEnvironmentKeys = [
+            "XCTestConfigurationFilePath",
+            "XCTestBundlePath",
+            "XCInjectBundleInto",
+        ]
+        return !testEnvironmentKeys.contains { key in
+            !(environment[key] ?? "").isEmpty
+        }
     }
 }

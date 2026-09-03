@@ -54,7 +54,8 @@ enum BailianRealtimeWireProtocol {
 
     static func sessionUpdateData(
         payload: BailianSessionPayload,
-        instructions: String
+        instructions: String,
+        providerTools: [[String: Any]] = DJAgentCapabilityManifest.providerTools
     ) throws -> Data {
         let vadType = payload.model.hasPrefix("qwen3.5-")
             ? "semantic_vad"
@@ -77,7 +78,7 @@ enum BailianRealtimeWireProtocol {
                     "threshold": 0.5,
                     "silence_duration_ms": 650,
                 ],
-                "tools": DJAgentCapabilityManifest.providerTools,
+                "tools": providerTools,
             ],
         ])
     }
@@ -302,6 +303,7 @@ final class BailianWebSocketRealtimeTransport:
     BailianRealtimeTransport
 {
     private let audioGraph: AudioGraphController
+    private let providerTools: [[String: Any]]
     private let promptBuilder = DJRealtimePromptBuilder()
     private let logger = Logger(
         subsystem: ProductIdentity.bundleIdentifier,
@@ -323,8 +325,12 @@ final class BailianWebSocketRealtimeTransport:
     private var agentResponseActive = false
     private var microphoneEchoGate = BailianMicrophoneEchoGate()
 
-    init(audioGraph: AudioGraphController) {
+    init(
+        audioGraph: AudioGraphController,
+        providerTools: [[String: Any]] = DJAgentCapabilityManifest.providerTools
+    ) {
         self.audioGraph = audioGraph
+        self.providerTools = providerTools
         (events, eventContinuation) = AsyncStream.makeStream()
     }
 
@@ -355,7 +361,8 @@ final class BailianWebSocketRealtimeTransport:
             try await send(
                 BailianRealtimeWireProtocol.sessionUpdateData(
                     payload: payload,
-                    instructions: try promptBuilder.build(context: nil)
+                    instructions: try promptBuilder.build(context: nil),
+                    providerTools: providerTools
                 ),
                 through: task
             )
@@ -404,7 +411,8 @@ final class BailianWebSocketRealtimeTransport:
         try await send(
             BailianRealtimeWireProtocol.sessionUpdateData(
                 payload: payload,
-                instructions: instructions
+                instructions: instructions,
+                providerTools: providerTools
             )
         )
     }
@@ -681,11 +689,13 @@ actor BailianRealtimeSession: RealtimeDJSession {
 
     @MainActor
     static func live(
-        audioGraph: AudioGraphController
+        audioGraph: AudioGraphController,
+        providerTools: [[String: Any]] = DJAgentCapabilityManifest.providerTools
     ) -> BailianRealtimeSession {
         BailianRealtimeSession(
             transport: BailianWebSocketRealtimeTransport(
-                audioGraph: audioGraph
+                audioGraph: audioGraph,
+                providerTools: providerTools
             )
         )
     }

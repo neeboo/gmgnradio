@@ -21,6 +21,8 @@ func agentCapabilityManifestCoversEveryCoreRadioAction() {
         "insert_track",
         "set_visual_mood",
         "set_lyrics_mode",
+        "set_spatial_environment",
+        "move_spatial_camera",
     ])
     #expect(
         DJAgentCapabilityManifest.capabilities
@@ -35,6 +37,41 @@ func agentCapabilityManifestCoversEveryCoreRadioAction() {
             }
             .allSatisfy { $0.requiresTakeover }
     )
+}
+
+@MainActor
+@Test
+func agentCanSwitchSpatialRoomAndWeather() async {
+    let actions = DJAgentRadioActionsSpy()
+    let dispatcher = DJAgentToolDispatcher(
+        takeoverEnabled: { true },
+        actions: actions
+    )
+
+    let environmentResult = await dispatcher.handle(RealtimeDJToolCall(
+        id: "spatial-environment-1",
+        name: "set_spatial_environment",
+        argumentsJSON: Data(
+            #"{"scene":"cosy_wood_house","weather":"thunderstorm"}"#.utf8
+        )
+    ))
+    let cameraResult = await dispatcher.handle(RealtimeDJToolCall(
+        id: "spatial-camera-1",
+        name: "move_spatial_camera",
+        argumentsJSON: Data(
+            #"{"direction":"forward","distance":3}"#.utf8
+        )
+    ))
+
+    #expect(environmentResult.isError == false)
+    #expect(cameraResult.isError == false)
+    #expect(actions.calls == [
+        .spatialEnvironment(
+            scene: .cosyWoodHouse,
+            weather: .thunderstorm,
+        ),
+        .spatialCamera(direction: .forward, distance: 3),
+    ])
 }
 
 @MainActor
@@ -413,6 +450,14 @@ private final class DJAgentRadioActionsSpy: DJAgentRadioActions {
         case visual(StageVisualMood)
         case search(query: String, limit: Int)
         case lyrics(StageLyricsVisualMode)
+        case spatialEnvironment(
+            scene: SpatialScenePreset?,
+            weather: SpatialWeather?
+        )
+        case spatialCamera(
+            direction: SpatialCameraCommandDirection,
+            distance: Float
+        )
     }
 
     var calls: [Call] = []
@@ -516,6 +561,26 @@ private final class DJAgentRadioActionsSpy: DJAgentRadioActions {
         _ mode: StageLyricsVisualMode
     ) async throws {
         calls.append(.lyrics(mode))
+    }
+
+    func setSpatialEnvironment(
+        scene: SpatialScenePreset?,
+        weather: SpatialWeather?
+    ) async throws {
+        calls.append(.spatialEnvironment(
+            scene: scene,
+            weather: weather
+        ))
+    }
+
+    func moveSpatialCamera(
+        direction: SpatialCameraCommandDirection,
+        distance: Float
+    ) async throws {
+        calls.append(.spatialCamera(
+            direction: direction,
+            distance: distance
+        ))
     }
 }
 

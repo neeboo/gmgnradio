@@ -21,17 +21,19 @@ struct StageOverlayView: View {
             .allowsHitTesting(false)
 
             VStack(alignment: .leading) {
-                Text(presentation.programTitle)
-                    .font(.system(size: 14, weight: .semibold, design: .rounded))
-                    .tracking(0.8)
-                    .foregroundStyle(
-                        Color(red: 0.42, green: 0.88, blue: 1)
-                    )
-                    .shadow(
-                        color: Color(red: 0.06, green: 0.62, blue: 1)
-                            .opacity(0.55),
-                        radius: 8
-                    )
+                if !presentation.programTitle.isEmpty {
+                    Text(presentation.programTitle)
+                        .font(.system(size: 14, weight: .semibold, design: .rounded))
+                        .tracking(0.8)
+                        .foregroundStyle(
+                            Color(red: 0.42, green: 0.88, blue: 1)
+                        )
+                        .shadow(
+                            color: Color(red: 0.06, green: 0.62, blue: 1)
+                                .opacity(0.55),
+                            radius: 8
+                        )
+                }
 
                 Spacer()
             }
@@ -301,6 +303,14 @@ private struct StageLyricsView: View {
                         context.date.timeIntervalSinceReferenceDate,
                     audio: audioMotion
                 )
+            case .foldingVerse:
+                StageFoldingVerseLyricsFrame(
+                    scene: StageLyricFoldSceneModel(
+                        lines: lyrics.lines,
+                        playbackTime: playbackTime
+                    ),
+                    isProgramRailVisible: overlayState.isProgramRailVisible
+                )
             }
         }
         .animation(
@@ -437,6 +447,190 @@ private struct StageFlowingLyricsFrame: View {
             .blur(radius: isUpcoming ? 0.9 : 1.5)
             .offset(x: isUpcoming ? 42 : -42)
     }
+}
+
+private struct StageFoldingVerseLyricsFrame: View {
+    @Environment(\.stageFoliaTheme) private var theme
+
+    let scene: StageLyricFoldSceneModel
+    let isProgramRailVisible: Bool
+
+    var body: some View {
+        GeometryReader { proxy in
+            let progress = eased(scene.transitionProgress)
+            let direction: CGFloat = scene.foldDirection == .left
+                ? -1
+                : 1
+            let railOffset = isProgramRailVisible ? -138.0 : 0
+
+            ZStack {
+                if !scene.previousLines.isEmpty {
+                    lyricGroup(
+                        lines: scene.previousLines,
+                        activeLineID: nil,
+                        availableWidth: proxy.size.width * 0.58,
+                        historical: true
+                    )
+                    .rotationEffect(
+                        .degrees(direction * 90 * progress),
+                        anchor: scene.foldDirection == .left
+                            ? .leading
+                            : .trailing
+                    )
+                    .rotation3DEffect(
+                        .degrees(direction * 7 * progress),
+                        axis: (x: 0, y: 1, z: 0),
+                        anchor: scene.foldDirection == .left
+                            ? .leading
+                            : .trailing,
+                        perspective: 0.72
+                    )
+                    .offset(
+                        x: direction * proxy.size.width * 0.29 * progress,
+                        y: -proxy.size.height * 0.07 * progress
+                    )
+                    .scaleEffect(1 - progress * 0.18)
+                    .opacity(1 - progress * 0.5)
+                }
+
+                lyricGroup(
+                    lines: scene.currentLines,
+                    activeLineID: scene.activeLineID,
+                    availableWidth: proxy.size.width * 0.68,
+                    historical: false
+                )
+                .offset(
+                    x: direction * proxy.size.width * 0.035
+                        * (1 - progress),
+                    y: proxy.size.height * 0.68 * (1 - progress)
+                )
+                .scaleEffect(
+                    0.92 + progress * 0.08,
+                    anchor: .bottom
+                )
+                .opacity(0.16 + progress * 0.84)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .offset(x: railOffset, y: -8)
+            .clipped()
+        }
+    }
+
+    private func lyricGroup(
+        lines: [StageLyricLine],
+        activeLineID: String?,
+        availableWidth: CGFloat,
+        historical: Bool
+    ) -> some View {
+        let activeIndex = activeLineID.flatMap { id in
+            lines.firstIndex(where: { $0.id == id })
+        }
+
+        return VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(lines.enumerated()), id: \.element.id) {
+                index,
+                line in
+                let state = lineState(
+                    index: index,
+                    activeIndex: activeIndex,
+                    historical: historical
+                )
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(line.text)
+                        .font(.system(
+                            size: fontSize(
+                                for: line.text,
+                                availableWidth: availableWidth
+                            ),
+                            weight: state.isActive ? .black : .bold,
+                            design: .rounded
+                        ))
+                        .tracking(state.isActive ? -1.2 : -0.6)
+                        .foregroundStyle(state.color)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.56)
+                        .shadow(
+                            color: state.isActive
+                                ? theme.accentColor.opacity(0.32)
+                                : .black.opacity(0.72),
+                            radius: state.isActive ? 18 : 4
+                        )
+
+                    if state.isActive,
+                        let translation = line.translation,
+                        !translation.isEmpty
+                    {
+                        Text(translation)
+                            .font(.system(
+                                size: 16,
+                                weight: .semibold,
+                                design: .rounded
+                            ))
+                            .foregroundStyle(
+                                theme.primaryColor.opacity(0.58)
+                            )
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
+                    }
+                }
+                .frame(maxWidth: availableWidth, alignment: .leading)
+            }
+        }
+        .frame(maxWidth: availableWidth, alignment: .leading)
+        .compositingGroup()
+    }
+
+    private func lineState(
+        index: Int,
+        activeIndex: Int?,
+        historical: Bool
+    ) -> FoldingVerseLineState {
+        if historical {
+            return FoldingVerseLineState(
+                color: theme.primaryColor.opacity(0.5),
+                isActive: false
+            )
+        }
+        guard let activeIndex else {
+            return FoldingVerseLineState(
+                color: theme.primaryColor.opacity(0.26),
+                isActive: false
+            )
+        }
+        if index == activeIndex {
+            return FoldingVerseLineState(
+                color: theme.accentColor,
+                isActive: true
+            )
+        }
+        return FoldingVerseLineState(
+            color: theme.primaryColor.opacity(
+                index < activeIndex ? 0.82 : 0.22
+            ),
+            isActive: false
+        )
+    }
+
+    private func fontSize(
+        for text: String,
+        availableWidth: CGFloat
+    ) -> CGFloat {
+        let fitted = CGFloat(StageLyricTypography.fontSize(
+            text: text,
+            availableWidth: Double(availableWidth)
+        ))
+        return min(max(fitted * 0.72, 28), 72)
+    }
+
+    private func eased(_ progress: Double) -> CGFloat {
+        let value = min(max(progress, 0), 1)
+        return CGFloat(value * value * (3 - 2 * value))
+    }
+}
+
+private struct FoldingVerseLineState {
+    let color: Color
+    let isActive: Bool
 }
 
 private struct StageFlowingLyricGlyph: View {
@@ -1709,6 +1903,8 @@ struct StageVisualPickerView: View {
     @ObservedObject var visualDirections: StageVisualDirectionStore
     @ObservedObject var videos: StageVideoPlaybackStore
     @Bindable var programStore: DJProgramStore
+    @Bindable var spatialStage: SpatialStageStore
+    @Bindable var marbleLibrary: MarbleWorldLibrary
 
     private let lyricColumns = Array(
         repeating: GridItem(.flexible(), spacing: 6),
@@ -1721,6 +1917,136 @@ struct StageVisualPickerView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            pickerHeader("舞台模式", symbol: "rectangle.3.group")
+
+            HStack(spacing: 6) {
+                stageModeButton(
+                    title: "3D 点阵",
+                    subtitle: "封面、粒子与歌词",
+                    symbol: "circle.hexagongrid.fill",
+                    isSelected: !spatialStage.isWorldPresentationRequested
+                ) {
+                    spatialStage.exitWorld()
+                }
+                stageModeButton(
+                    title: "空间舞台",
+                    subtitle: spatialStage.isWorldVisible
+                        ? "WASD 探索中"
+                        : "进入可探索场景",
+                    symbol: "cube.transparent",
+                    isSelected: spatialStage.isWorldPresentationRequested,
+                    showsProgress: spatialStage.isWorldPresentationRequested
+                        && !spatialStage.isWorldVisible
+                ) {
+                    enterSelectedWorld()
+                }
+            }
+
+            if spatialStage.isWorldPresentationRequested {
+                Menu {
+                    Section("公开空间") {
+                        ForEach(marbleLibrary.publicExampleWorlds) { world in
+                            Button {
+                                enter(worldID: world.id)
+                            } label: {
+                                if marbleLibrary.selectedWorld?.id == world.id {
+                                    Label(world.name, systemImage: "checkmark")
+                                } else {
+                                    Text(world.name)
+                                }
+                            }
+                        }
+                    }
+                    Section("生成场景") {
+                        ForEach(SpatialScenePreset.allCases) { preset in
+                            Button {
+                                activate(preset: preset)
+                            } label: {
+                                Label(preset.displayName, systemImage: preset.symbolName)
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "globe.americas.fill")
+                        Text(
+                            marbleLibrary.selectedWorld?.isPublicExample == true
+                                ? marbleLibrary.selectedWorld?.name ?? "公开空间"
+                                : "公开空间 · 无需生成"
+                        )
+                        Spacer()
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.system(size: 9, weight: .bold))
+                    }
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.68))
+                    .padding(.horizontal, 12)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 34)
+                    .background {
+                        RoundedRectangle(cornerRadius: 12)
+                            .fill(Color.white.opacity(0.045))
+                    }
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(Color.white.opacity(0.07), lineWidth: 1)
+                    }
+                }
+                .menuStyle(.borderlessButton)
+                .frame(maxWidth: .infinity)
+
+                pickerHeader("人物位置", symbol: "figure.stand")
+
+                VStack(spacing: 5) {
+                    avatarPositionSlider(
+                        axis: .x,
+                        range: -2 ... 2,
+                        accessibilityLabel: "人物左右位置"
+                    )
+                    avatarPositionSlider(
+                        axis: .y,
+                        range: -2 ... 2,
+                        accessibilityLabel: "人物上下位置"
+                    )
+                    avatarPositionSlider(
+                        axis: .z,
+                        range: -3 ... 3,
+                        accessibilityLabel: "人物前后位置"
+                    )
+                }
+
+                HStack {
+                    Text("点云空间无碰撞，坐标会按当前空间保存")
+                        .foregroundStyle(.white.opacity(0.36))
+                    Spacer()
+                    Button("重置") {
+                        spatialStage.resetAvatarPosition()
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.cyan.opacity(0.78))
+                }
+                .font(.system(size: 9, weight: .medium, design: .rounded))
+            }
+
+            if spatialStage.isWorldPresentationRequested,
+                !spatialStage.isWorldVisible
+            {
+                Label("正在载入空间，完成后自动进入…", systemImage: "cube.transparent")
+                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .foregroundStyle(.cyan.opacity(0.72))
+                    .lineLimit(1)
+            } else if let message = marbleLibrary.generationMessage {
+                Label(message, systemImage: "sparkles")
+                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .foregroundStyle(.cyan.opacity(0.72))
+                    .lineLimit(1)
+            } else if let message = marbleLibrary.errorMessage {
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .foregroundStyle(.orange.opacity(0.78))
+                    .lineLimit(1)
+            }
+
             pickerHeader("字幕特效", symbol: "captions.bubble")
 
             LazyVGrid(columns: lyricColumns, spacing: 6) {
@@ -1910,6 +2236,55 @@ struct StageVisualPickerView: View {
             .foregroundStyle(.white.opacity(0.6))
     }
 
+    private func avatarPositionSlider(
+        axis: SpatialAvatarPositionAxis,
+        range: ClosedRange<Double>,
+        accessibilityLabel: String
+    ) -> some View {
+        let value = avatarPositionValue(for: axis)
+        return HStack(spacing: 9) {
+            Text(axis.rawValue)
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.52))
+                .frame(width: 12)
+            Slider(
+                value: Binding(
+                    get: { Double(avatarPositionValue(for: axis)) },
+                    set: {
+                        spatialStage.setAvatarPosition(
+                            Float($0),
+                            axis: axis
+                        )
+                    }
+                ),
+                in: range,
+                step: 0.01
+            )
+            .tint(.cyan.opacity(0.86))
+            .accessibilityLabel(accessibilityLabel)
+            Text(value.formatted(.number.precision(.fractionLength(2))))
+                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                .monospacedDigit()
+                .foregroundStyle(.white.opacity(0.48))
+                .frame(width: 42, alignment: .trailing)
+        }
+        .frame(height: 20)
+    }
+
+    private func avatarPositionValue(
+        for axis: SpatialAvatarPositionAxis
+    ) -> Float {
+        let position = spatialStage.avatarPlacement.position
+        switch axis {
+        case .x:
+            return position.x
+        case .y:
+            return position.y
+        case .z:
+            return position.z
+        }
+    }
+
     private func pickerButton(
         title: String,
         symbol: String,
@@ -1956,6 +2331,107 @@ struct StageVisualPickerView: View {
         .buttonStyle(.plain)
     }
 
+    private func stageModeButton(
+        title: String,
+        subtitle: String,
+        symbol: String,
+        isSelected: Bool,
+        showsProgress: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                if showsProgress {
+                    ProgressView()
+                        .controlSize(.small)
+                        .frame(width: 20)
+                } else {
+                    Image(systemName: symbol)
+                        .font(.system(size: 15, weight: .semibold))
+                        .frame(width: 20)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(
+                            size: 11,
+                            weight: .bold,
+                            design: .rounded
+                        ))
+                    Text(subtitle)
+                        .font(.system(
+                            size: 9,
+                            weight: .medium,
+                            design: .rounded
+                        ))
+                        .foregroundStyle(.white.opacity(0.4))
+                }
+                Spacer()
+                if isSelected, !showsProgress {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 12, weight: .bold))
+                }
+            }
+            .foregroundStyle(
+                isSelected
+                    ? Color(red: 0.48, green: 0.95, blue: 1)
+                    : Color.white.opacity(0.68)
+            )
+            .padding(.horizontal, 12)
+            .frame(maxWidth: .infinity)
+            .frame(height: 46)
+            .background {
+                RoundedRectangle(cornerRadius: 14)
+                    .fill(
+                        isSelected
+                            ? Color.cyan.opacity(0.16)
+                            : Color.white.opacity(0.045)
+                    )
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 14)
+                    .stroke(
+                        isSelected
+                            ? Color.cyan.opacity(0.52)
+                            : Color.white.opacity(0.07),
+                        lineWidth: 1
+                    )
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func enterSelectedWorld() {
+        guard !spatialStage.isWorldPresentationRequested else {
+            return
+        }
+        let worldID = marbleLibrary.selectedWorld?.id
+            ?? marbleLibrary.publicExampleWorlds.first?.id
+        guard let worldID else {
+            return
+        }
+        enter(worldID: worldID)
+    }
+
+    private func activate(preset: SpatialScenePreset) {
+        spatialStage.requestWorldPresentation()
+        Task {
+            await marbleLibrary.activate(preset: preset)
+            if marbleLibrary.errorMessage != nil {
+                spatialStage.exitWorld()
+            }
+        }
+    }
+
+    private func enter(worldID: String) {
+        spatialStage.requestWorldPresentation()
+        Task {
+            guard await marbleLibrary.select(worldID: worldID) != nil else {
+                spatialStage.exitWorld()
+                return
+            }
+        }
+    }
+
     private func importMP4() {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.mpeg4Movie]
@@ -1985,6 +2461,18 @@ struct StageProgramRailCard: Equatable, Identifiable {
 
     var id: String {
         trackID
+    }
+}
+
+enum StageProgramRailCardLayout {
+    static func horizontalOffset(
+        relativeIndex: Int,
+        isFocused: Bool
+    ) -> Double {
+        if isFocused {
+            return -30
+        }
+        return Double(min(2, abs(relativeIndex))) * 9
     }
 }
 
@@ -2808,9 +3296,10 @@ struct StageProgramRailView: View {
             perspective: 0.72
         )
         .offset(
-            x: isFocused
-                ? -30
-                : Double(abs(card.relativeIndex)) * 9,
+            x: StageProgramRailCardLayout.horizontalOffset(
+                relativeIndex: card.relativeIndex,
+                isFocused: isFocused
+            ),
             y: 0
         )
         .zIndex(

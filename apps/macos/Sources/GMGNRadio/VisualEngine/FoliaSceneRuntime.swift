@@ -90,6 +90,8 @@ extension StageLyricsVisualMode {
             "pendolo"
         case .dioramaStage:
             "diorama"
+        case .foldingVerse:
+            "gmgn-folding-verse"
         }
     }
 
@@ -121,6 +123,8 @@ extension StageLyricsVisualMode {
             .bassAndBeat
         case .dioramaStage:
             .fullSpectrum
+        case .foldingVerse:
+            .vocalAndOnset
         }
         let durations: (TimeInterval, TimeInterval) = switch self {
         case .cloudSteps:
@@ -129,6 +133,11 @@ extension StageLyricsVisualMode {
             (0.44, 0.3)
         case .dioramaStage:
             (TimeInterval(StageDioramaTransition.duration), 0.8)
+        case .foldingVerse:
+            (
+                StageLyricFoldSceneModel.transitionDuration,
+                StageLyricFoldSceneModel.transitionDuration
+            )
         default:
             (0.4, 0.22)
         }

@@ -9,12 +9,26 @@ settings:
     MACOSX_DEPLOYMENT_TARGET: "26.0"
     DEVELOPMENT_TEAM: 79J6W8QEMD
 packages:
+  NanoemCore:
+    path: Packages/NanoemCore
+  MMDSceneKit:
+    path: Packages/MMDSceneKit
+  WorldRuntime:
+    path: Packages/WorldRuntime
+  MotionDistribution:
+    path: Packages/MotionDistribution
   ElevenLabs:
     url: https://github.com/elevenlabs/elevenlabs-swift-sdk.git
     exactVersion: 3.2.2
   LiveKit:
     url: https://github.com/livekit/client-sdk-swift.git
     exactVersion: 2.15.3
+  MetalSplatter:
+    url: https://github.com/scier/MetalSplatter.git
+    exactVersion: 1.0.1
+  VRMMetalKit:
+    url: https://github.com/arkavo-org/VRMMetalKit.git
+    exactVersion: 1.0.0
 targets:
   GMGNRadio:
     type: application
@@ -23,9 +37,28 @@ targets:
       - Sources/GMGNRadio
       - path: Resources/AppIcon.icns
         buildPhase: resources
+      - path: Resources/MMDMotions
+        buildPhase: resources
+        type: folder
+      - path: Resources/Worlds
+        buildPhase: resources
+        type: folder
     dependencies:
+      - package: NanoemCore
+        product: CNanoem
+      - package: MMDSceneKit
+        product: MMDSceneKit
+      - package: WorldRuntime
+        product: WorldRuntime
+      - package: MotionDistribution
+        product: MotionDistribution
       - package: ElevenLabs
       - package: LiveKit
+      - package: MetalSplatter
+        product: MetalSplatter
+      - package: MetalSplatter
+        product: SplatIO
+      - package: VRMMetalKit
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.gmgn.radio

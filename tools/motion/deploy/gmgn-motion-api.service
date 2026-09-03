@@ -1,0 +1,13 @@
+[Unit]
+Description=gmgn radio motion generation and download API
+After=gmgn-ardy.service
+Requires=gmgn-ardy.service
+
+[Service]
+Type=simple
+ExecStart=%h/services/gmgn-motion-service/tools/motion/deploy/run_motion_api.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

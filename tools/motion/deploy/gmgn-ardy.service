@@ -1,0 +1,13 @@
+[Unit]
+Description=gmgn radio ARDY motion engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/services/gmgn-motion-service/tools/motion/deploy/run_ardy.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

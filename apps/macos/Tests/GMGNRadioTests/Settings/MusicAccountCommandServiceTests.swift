@@ -11,6 +11,21 @@ func musicProviderKeychainUsesTheStableSignatureNamespace() {
 }
 
 @Test
+func musicProviderStoreUsesMemoryWhenKeychainAccessIsDisabled() async throws {
+    let store = KeychainMusicProviderSessionStore(
+        service: "ai.gmgn.radio.tests.never-keychain",
+        permitsKeychainAccess: false
+    )
+    let session = providerSession("MUSIC_U=test-session")
+
+    try await store.save(session, for: .netease)
+    #expect(try await store.session(for: .netease) == session)
+
+    try await store.removeSession(for: .netease)
+    #expect(try await store.session(for: .netease) == nil)
+}
+
+@Test
 func musicAccountServiceValidatesBeforeSavingAProviderSession() async throws {
     let store = InMemoryMusicProviderSessionStore()
     let service = MusicAccountCommandService(

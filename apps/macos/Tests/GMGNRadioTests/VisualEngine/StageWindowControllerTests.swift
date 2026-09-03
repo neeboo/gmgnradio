@@ -1,7 +1,381 @@
 import AppKit
 import Foundation
+import simd
 import Testing
 @testable import GMGNRadio
+
+@Test
+func marbleViewportUsesTheActualDrawableSizeBeforeItsResizeCallback() {
+    let resolved = MarbleViewportMetrics.resolve(
+        reportedSize: .zero,
+        drawableSize: CGSize(width: 1920, height: 1080)
+    )
+
+    #expect(resolved == CGSize(width: 1920, height: 1080))
+}
+
+@Test
+func marbleSceneFramingRecentersAndNormalizesTheWorld() {
+    let framing = MarbleSceneFraming(
+        positions: [
+            SIMD3<Float>(8, -6, -2),
+            SIMD3<Float>(12, -2, 8),
+        ]
+    )
+
+    #expect(framing.center == SIMD3<Float>(10, -4, 3))
+    #expect(framing.groundedOrigin == SIMD3<Float>(10, -6, 3))
+    #expect(abs(framing.uniformScale - 0.4) < 0.0001)
+}
+
+@Test
+func marbleSceneFramingProducesTheColliderTransform() {
+    let framing = MarbleSceneFraming(
+        positions: [
+            SIMD3<Float>(-2, -1, -3),
+            SIMD3<Float>(2, 3, 1),
+        ]
+    )
+    let transform = framing.colliderTransform(
+        sourceCoordinates: .worldLabsOpenCV
+    )
+
+    #expect(
+        transform.apply(SIMD3<Float>(2, 1, 3))
+            == framing.normalize([SIMD3<Float>(2, -1, -3)])[0]
+    )
+}
+
+@Test
+func marbleSceneFramingPlacesTheCameraInsideTheRoomVolume() {
+    let framing = MarbleSceneFraming(
+        positions: [
+            SIMD3<Float>(-1.1965, -0.9802, -4.1594),
+            SIMD3<Float>(1.2263, 1.1995, 1.8604),
+        ]
+    )
+
+    let home = framing.recommendedCameraHome(
+        worldID: "world-labs-example-warm-kitchen"
+    )
+
+    #expect(abs(home.position.x) < 0.0001)
+    #expect(home.position.y > 0.7)
+    #expect(home.position.y < 0.9)
+    #expect(home.position.z > 1)
+    #expect(home.position.z < 1.2)
+    #expect(home.yaw == 0)
+    #expect(home.pitch == 0)
+}
+
+@Test
+func marbleAvatarPlacementAvoidsAnOccupiedWallInFrontOfTheCamera() {
+    let camera = SpatialCameraState(
+        position: SIMD3<Float>(0, 0.8, 1.1),
+        yaw: 0,
+        pitch: 0
+    )
+    var points: [SIMD3<Float>] = []
+    for x in stride(from: Float(-0.8), through: 0.8, by: 0.08) {
+        for z in stride(from: Float(-0.3), through: 0.8, by: 0.08) {
+            points.append(SIMD3<Float>(x, 0.02, z))
+        }
+    }
+    for y in stride(from: Float(0.15), through: 1.5, by: 0.06) {
+        for x in stride(from: Float(-0.22), through: 0.22, by: 0.04) {
+            points.append(SIMD3<Float>(x, y, 0.2))
+        }
+    }
+
+    let placement = StageAvatarPlacementSolver.resolve(
+        normalizedPoints: points,
+        camera: camera,
+        scene: .cosyWoodHouse
+    )
+
+    #expect(abs(placement.position.x) >= 0.2)
+    #expect(placement.position.z > -0.3)
+    #expect(abs(placement.position.y - 0.02) < 0.001)
+}
+
+@Test
+func marbleAvatarPlacementAccountsForTheVisibleSizeOfLargeSplats() {
+    let camera = SpatialCameraState(
+        position: SIMD3<Float>(0, 0.8, 1.1),
+        yaw: 0,
+        pitch: 0
+    )
+    var samples: [SpatialSplatSample] = []
+    for x in stride(from: Float(-0.9), through: 0.9, by: 0.08) {
+        for z in stride(from: Float(-0.4), through: 0.8, by: 0.08) {
+            samples.append(SpatialSplatSample(
+                position: SIMD3<Float>(x, 0.01, z),
+                horizontalRadius: 0.025,
+                verticalRadius: 0.01
+            ))
+        }
+    }
+    let cabinet = SpatialSplatSample(
+        position: SIMD3<Float>(0.34, 0.78, 0.38),
+        horizontalRadius: 0.42,
+        verticalRadius: 0.65
+    )
+    samples.append(cabinet)
+
+    let placement = StageAvatarPlacementSolver.resolve(
+        normalizedSamples: samples,
+        camera: camera,
+        scene: .cosyWoodHouse
+    )
+    let horizontalDistance = simd_distance(
+        SIMD2<Float>(placement.position.x, placement.position.z),
+        SIMD2<Float>(cabinet.position.x, cabinet.position.z)
+    )
+
+    #expect(horizontalDistance > cabinet.horizontalRadius + 0.2)
+}
+
+@Test
+func marbleAvatarLoadPlanKeepsThePMXResourceBoundaryAndVMDMotion() throws {
+    let root = URL(fileURLWithPath: "/tmp/avatar")
+    let model = root.appending(path: "model.pmx")
+    let motion = root.appending(path: "dance.vmd")
+    let snapshot = StageAvatarRuntimeSnapshot(
+        avatar: StageAvatarAsset(
+            id: "pmx.avatar",
+            name: "PMX Avatar",
+            format: .pmx,
+            modelURL: model,
+            resourceRootURL: root
+        ),
+        motion: StageMotionAsset(
+            id: "vmd.motion",
+            name: "Dance",
+            format: .vmd,
+            url: motion
+        ),
+        revision: 1
+    )
+
+    #expect(
+        try MarbleAvatarLoadPlan.resolve(snapshot) == .pmx(
+            modelURL: model,
+            resourceRootURL: root,
+            motionURL: motion
+        )
+    )
+}
+
+@Test
+func marbleAvatarLoadPlanTreatsProceduralMotionAsPMXRestPose() throws {
+    let root = URL(fileURLWithPath: "/tmp/avatar")
+    let model = root.appending(path: "model.pmx")
+    let snapshot = StageAvatarRuntimeSnapshot(
+        avatar: StageAvatarAsset(
+            id: "pmx.avatar",
+            name: "PMX Avatar",
+            format: .pmx,
+            modelURL: model,
+            resourceRootURL: root
+        ),
+        motion: StageMotionAsset(
+            id: MotionPackageStore.naturalIdleID,
+            name: "Natural Idle",
+            format: .procedural,
+            url: nil
+        ),
+        revision: 1
+    )
+
+    #expect(
+        try MarbleAvatarLoadPlan.resolve(snapshot) == .pmx(
+            modelURL: model,
+            resourceRootURL: root,
+            motionURL: nil
+        )
+    )
+}
+
+@Test
+func marbleAvatarLoadPlanRejectsVRMAForPMX() {
+    let root = URL(fileURLWithPath: "/tmp/avatar")
+    let snapshot = StageAvatarRuntimeSnapshot(
+        avatar: StageAvatarAsset(
+            id: "pmx.avatar",
+            name: "PMX Avatar",
+            format: .pmx,
+            modelURL: root.appending(path: "model.pmx"),
+            resourceRootURL: root
+        ),
+        motion: StageMotionAsset(
+            id: "vrma.motion",
+            name: "VRMA",
+            format: .vrma,
+            url: root.appending(path: "dance.vrma")
+        ),
+        revision: 1
+    )
+
+    #expect(throws: MarbleAvatarLoadError.pmxRequiresVMD) {
+        try MarbleAvatarLoadPlan.resolve(snapshot)
+    }
+}
+
+@Test
+func marblePMXFramingNormalizesFeetToTheExistingPlacementOrigin() {
+    let transform = MarblePMXFraming.modelTransform(
+        bounds: PMXAvatarBounds(
+            minimum: SIMD3<Float>(-5, 2, -3),
+            maximum: SIMD3<Float>(5, 22, 3)
+        ),
+        placement: StageAvatarPlacement(
+            position: SIMD3<Float>(1, 2, 3),
+            scale: 0.8,
+            yaw: 0
+        )
+    )
+    let feetCenter = transform * SIMD4<Float>(0, 2, 0, 1)
+    let headCenter = transform * SIMD4<Float>(0, 22, 0, 1)
+
+    #expect(
+        simd_distance(
+            SIMD3<Float>(feetCenter.x, feetCenter.y, feetCenter.z),
+            SIMD3<Float>(1, 2, 3)
+        ) < 0.0001
+    )
+    #expect(abs((headCenter.y - feetCenter.y) - 1.36) < 0.0001)
+}
+
+@Test
+func marblePMXFramingUsesTheSoleInsteadOfAnAccessoryBelowTheFeet() {
+    let bounds = PMXAvatarBounds(
+        minimum: SIMD3<Float>(-5, -8, -3),
+        maximum: SIMD3<Float>(5, 22, 3)
+    )
+    let placement = StageAvatarPlacement(
+        position: SIMD3<Float>(1, 0.04, 3),
+        scale: 0.8,
+        yaw: 0
+    )
+    let soleReferenceY: Float = 2
+    let transform = MarblePMXFraming.modelTransform(
+        bounds: bounds,
+        placement: placement,
+        soleReferenceY: soleReferenceY
+    )
+    let sole = transform * SIMD4<Float>(0, soleReferenceY, 0, 1)
+    let crown = transform * SIMD4<Float>(0, bounds.maximum.y, 0, 1)
+
+    #expect(abs(sole.y - placement.position.y) < 0.0001)
+    #expect(abs((crown.y - sole.y) - 1.36) < 0.0001)
+}
+
+@Test
+func warmKitchenPMXAvatarUsesHumanScaleRelativeToTheRoom() throws {
+    let calibration = try #require(
+        SpatialWorldCalibration.resolve(
+            worldID: "world-labs-example-warm-kitchen"
+        )
+    )
+    let placement = try #require(calibration.avatarPlacement)
+    let bounds = PMXAvatarBounds(
+        minimum: SIMD3<Float>(-42, 0, -18),
+        maximum: SIMD3<Float>(42, 170.323, 18)
+    )
+    let transform = MarblePMXFraming.modelTransform(
+        bounds: bounds,
+        placement: placement
+    )
+    let sole = transform * SIMD4<Float>(0, bounds.minimum.y, 0, 1)
+    let crown = transform * SIMD4<Float>(0, bounds.maximum.y, 0, 1)
+    let normalizedHeight = crown.y - sole.y
+
+    #expect(normalizedHeight >= 0.75)
+    #expect(normalizedHeight <= 0.78)
+}
+
+@Test
+func marblePMXFramingGroundsTheAnimatedSoleInsteadOfTheRestPose() {
+    let bounds = PMXAvatarBounds(
+        minimum: SIMD3<Float>(-5, 2, -3),
+        maximum: SIMD3<Float>(5, 22, 3)
+    )
+    let placement = StageAvatarPlacement(
+        position: SIMD3<Float>(1, 0.04, 3),
+        scale: 0.8,
+        yaw: 0
+    )
+    let restFootReferenceY: Float = 4
+    let animatedFootReferenceY: Float = 7
+    let animatedSoleY = bounds.minimum.y
+        + animatedFootReferenceY
+        - restFootReferenceY
+    let groundingOffsetY = PMXAnimatedGrounding.localOffsetY(
+        restFootReferenceY: restFootReferenceY,
+        animatedFootReferenceY: animatedFootReferenceY
+    )
+    let transform = MarblePMXFraming.modelTransform(
+        bounds: bounds,
+        placement: placement,
+        localGroundingOffsetY: groundingOffsetY
+    )
+    let groundedSole = transform * SIMD4<Float>(0, animatedSoleY, 0, 1)
+
+    #expect(abs(groundedSole.y - placement.position.y) < 0.0001)
+}
+
+@Test
+func marblePMXFullStageKeepsCameraAndModelTransformsSeparate() {
+    let bounds = PMXAvatarBounds(
+        minimum: SIMD3<Float>(-5, 2, -3),
+        maximum: SIMD3<Float>(5, 22, 3)
+    )
+    let placement = StageAvatarPlacement(
+        position: SIMD3<Float>(0, 0, -0.58),
+        scale: 0.8,
+        yaw: 0
+    )
+    let camera = SpatialCameraState(
+        position: SIMD3<Float>(0, 1.45, 1.75),
+        yaw: 0,
+        pitch: 0
+    )
+    let sharedView = simd_float4x4(
+        SIMD4<Float>(1, 0, 0, 0),
+        SIMD4<Float>(0, 1, 0, 0),
+        SIMD4<Float>(0, 0, 1, 0),
+        SIMD4<Float>(
+            -camera.position.x,
+            -camera.position.y,
+            -camera.position.z,
+            1
+        )
+    )
+    let matrices = MarblePMXRenderMatrices.fullStage(
+        bounds: bounds,
+        placement: placement,
+        sharedCameraView: sharedView
+    )
+    let expectedModel = MarblePMXFraming.modelTransform(
+        bounds: bounds,
+        placement: placement
+    )
+
+    for column in 0..<4 {
+        #expect(
+            simd_distance(
+                matrices.cameraView[column],
+                sharedView[column]
+            ) < 0.0001
+        )
+        #expect(
+            simd_distance(
+                matrices.modelTransform[column],
+                expectedModel[column]
+            ) < 0.0001
+        )
+    }
+}
 
 @Test
 func macOSAppBuildEnablesSigningForMicrophoneEntitlements() throws {
@@ -169,6 +543,72 @@ func stageComposesVideoBelowTheTransparentMetalParticles() throws {
             $0.name == "stage.video-tone-overlay"
         } == true
     )
+
+    controller.close()
+}
+
+@Test
+@MainActor
+func stageComposesTheSpatialWorldAboveParticlesWithoutCapturingInput() throws {
+    let controller = StageWindowController(
+        audioFeatures: VisualAudioFeatureStore()
+    )
+
+    controller.show()
+    let descendants = controller.window?.contentView?.descendants ?? []
+    let spatialWorld = try #require(descendants.first {
+        $0.identifier?.rawValue == "stage.marble-spatial-world"
+    })
+    let particles = try #require(descendants.first {
+        $0.identifier?.rawValue == "stage.metal-particles"
+    })
+
+    #expect(
+        try #require(spatialWorld.layer?.zPosition)
+            > #require(particles.layer?.zPosition)
+    )
+    #expect(spatialWorld.hitTest(.zero) == nil)
+
+    controller.close()
+}
+
+@Test
+@MainActor
+func spatialStageAlwaysProvidesAWorkingReturnToPointCloudControl() throws {
+    let spatialStage = SpatialStageStore()
+    let controller = StageWindowController(
+        audioFeatures: VisualAudioFeatureStore(),
+        spatialStage: spatialStage
+    )
+
+    controller.show()
+    let descendants = controller.window?.contentView?.descendants ?? []
+    let spatialWorld = try #require(descendants.first {
+        $0.identifier?.rawValue == "stage.marble-spatial-world"
+    })
+    let returnButton = try #require(
+        descendants
+            .compactMap { $0 as? NSButton }
+            .first {
+                $0.identifier?.rawValue == "stage.return-to-point-cloud"
+            }
+    )
+
+    #expect(spatialWorld.isHidden)
+    #expect(returnButton.isHidden)
+
+    spatialStage.requestWorldPresentation()
+    spatialStage.finishWorldPresentation()
+
+    #expect(!spatialWorld.isHidden)
+    #expect(!returnButton.isHidden)
+
+    returnButton.performClick(nil)
+
+    #expect(!spatialStage.isWorldPresentationRequested)
+    #expect(!spatialStage.isWorldVisible)
+    #expect(spatialWorld.isHidden)
+    #expect(returnButton.isHidden)
 
     controller.close()
 }
@@ -453,6 +893,52 @@ func spatialProgramRailKeepsTheCompleteScrollableProgram() {
 }
 
 @Test
+func longProgramRailCapsTrackCardHorizontalOffset() {
+    #expect(
+        StageProgramRailCardLayout.horizontalOffset(
+            relativeIndex: 0,
+            isFocused: false
+        ) == 0
+    )
+    #expect(
+        StageProgramRailCardLayout.horizontalOffset(
+            relativeIndex: 1,
+            isFocused: false
+        ) == 9
+    )
+    #expect(
+        StageProgramRailCardLayout.horizontalOffset(
+            relativeIndex: -1,
+            isFocused: false
+        ) == 9
+    )
+    #expect(
+        StageProgramRailCardLayout.horizontalOffset(
+            relativeIndex: 40,
+            isFocused: false
+        ) == 18
+    )
+    #expect(
+        StageProgramRailCardLayout.horizontalOffset(
+            relativeIndex: -40,
+            isFocused: false
+        ) == 18
+    )
+    #expect(
+        StageProgramRailCardLayout.horizontalOffset(
+            relativeIndex: 40,
+            isFocused: true
+        ) == -30
+    )
+    #expect(
+        StageProgramRailCardLayout.horizontalOffset(
+            relativeIndex: -40,
+            isFocused: true
+        ) == -30
+    )
+}
+
+@Test
 @MainActor
 func programRailUsesAPlaylistLevelBeforeItsTrackLevel() {
     var playedSelections: [String] = []
@@ -482,6 +968,45 @@ func programRailUsesAPlaylistLevelBeforeItsTrackLevel() {
 
     selection.replan()
     #expect(replanCount == 1)
+}
+
+@Test
+func requestedWorldKeepsTheSharedSurfaceAbovePointCloudWhileLoading() {
+    let state = StageSurfacePresentationState.resolve(
+        isWorldPresentationRequested: true,
+        isWorldVisible: false
+    )
+
+    #expect(state.isSpatialWorldHidden)
+    #expect(state.isPointCloudHidden)
+    #expect(state.isWorldInteractionHidden)
+    #expect(!state.isLoadingIndicatorHidden)
+    #expect(!state.isReturnToPointCloudHidden)
+}
+
+@Test
+func visibleWorldHidesTheLoadingIndicatorAndShowsTheSharedSurface() {
+    let state = StageSurfacePresentationState.resolve(
+        isWorldPresentationRequested: true,
+        isWorldVisible: true
+    )
+
+    #expect(!state.isSpatialWorldHidden)
+    #expect(state.isPointCloudHidden)
+    #expect(!state.isWorldInteractionHidden)
+    #expect(state.isLoadingIndicatorHidden)
+}
+
+@Test
+func worldCameraDragUsesWindowLocationsWhenEventDeltasAreZero() {
+    let delta = StagePointerDragDelta.resolve(
+        previousLocation: CGPoint(x: 10, y: 20),
+        currentLocation: CGPoint(x: 40, y: 5),
+        eventDelta: .zero
+    )
+
+    #expect(delta.width == 30)
+    #expect(delta.height == 15)
 }
 
 @Test

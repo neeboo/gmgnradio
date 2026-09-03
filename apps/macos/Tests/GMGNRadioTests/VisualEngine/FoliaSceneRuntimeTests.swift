@@ -3,10 +3,10 @@ import Testing
 @testable import GMGNRadio
 
 @Test
-func foliaSceneRegistryKeepsAllTenSourceModes() {
+func lyricSceneRegistryIncludesTheGMGNFoldingVerseMode() {
     let modes = StageLyricsVisualMode.playbackModes
 
-    #expect(modes.count == 10)
+    #expect(modes.count == 11)
     #expect(modes.map(\.foliaSourceMode) == [
         "classic",
         "cadenza",
@@ -18,6 +18,7 @@ func foliaSceneRegistryKeepsAllTenSourceModes() {
         "monet",
         "pendolo",
         "diorama",
+        "gmgn-folding-verse",
     ])
     #expect(modes.map(\.displayName) == [
         "流光",
@@ -30,6 +31,7 @@ func foliaSceneRegistryKeepsAllTenSourceModes() {
         "莫奈",
         "时计",
         "镜台",
+        "折章",
     ])
 }
 
@@ -215,8 +217,8 @@ func everyFoliaSceneDeclaresItsOwnAudioAndCameraBehavior() {
         .lowMidAndMid,
         .bassAndBeat,
         .fullSpectrum,
+        .vocalAndOnset,
     ])
-    #expect(profiles.dropLast().allSatisfy { $0.backend == .swiftUI })
-    #expect(profiles.last?.backend == .metal)
-    #expect(profiles.last?.audioMovesCamera == false)
+    #expect(profiles.filter { $0.backend == .metal }.count == 1)
+    #expect(profiles.allSatisfy { !$0.audioMovesCamera })
 }

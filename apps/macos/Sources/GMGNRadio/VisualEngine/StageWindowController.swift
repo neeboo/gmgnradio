@@ -1,10 +1,16 @@
 import AppKit
 @preconcurrency import AVFoundation
 import Combine
+import os
 import SwiftUI
 
 @MainActor
 final class StageWindowController: NSWindowController, NSWindowDelegate {
+    fileprivate static let log = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "ai.gmgn.radio",
+        category: "StageWindowController"
+    )
+
     private let audioFeatures: VisualAudioFeatureStore
     private let artwork: StageArtworkStore
     private let audioMonitor: (any VisualAudioMonitoring)?
@@ -14,6 +20,11 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     private let programStore: DJProgramStore
     private let libraryStore: SyncedMusicLibraryStore
     private let lyrics: StageLyricsStore
+    private let spatialStage: SpatialStageStore
+    private let marbleLibrary: MarbleWorldLibrary
+    private let avatarRuntime: StageAvatarRuntimeStore
+    private let renderSurfaceController: StageRenderSurfaceController
+    private let cameraCoordinator: StageCameraCoordinator
     private let playbackPosition: @MainActor () -> TimeInterval
     private let onTogglePlayback: @MainActor () -> Void
     private let onPlayProgramTrack: @MainActor (String, Int) -> Void
@@ -27,6 +38,9 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     private var playbackState: LocalMusicPlaybackState
     private var voiceState: RealtimeVoiceConnectionState
     private weak var stageContentView: StageContentView?
+    private var onWillShowHandler: (@MainActor () -> Void)?
+    private var onCloseHandler: (@MainActor () -> Void)?
+    private var didHandleCurrentClose = false
 
     init(
         audioFeatures: VisualAudioFeatureStore,
@@ -38,6 +52,11 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         programStore: DJProgramStore = .shared,
         libraryStore: SyncedMusicLibraryStore = .shared,
         lyrics: StageLyricsStore = .shared,
+        spatialStage: SpatialStageStore = SpatialStageStore(),
+        marbleLibrary: MarbleWorldLibrary? = nil,
+        avatarRuntime: StageAvatarRuntimeStore = .shared,
+        renderSurfaceController: StageRenderSurfaceController? = nil,
+        cameraCoordinator: StageCameraCoordinator? = nil,
         playbackPosition: @escaping @MainActor () -> TimeInterval = { 0 },
         playbackState: LocalMusicPlaybackState = .idle,
         voiceState: RealtimeVoiceConnectionState = .disconnected,
@@ -64,6 +83,19 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         self.programStore = programStore
         self.libraryStore = libraryStore
         self.lyrics = lyrics
+        self.spatialStage = spatialStage
+        let resolvedMarbleLibrary = marbleLibrary
+            ?? MarbleWorldLibrary(spatialStage: spatialStage)
+        self.marbleLibrary = resolvedMarbleLibrary
+        self.avatarRuntime = avatarRuntime
+        self.renderSurfaceController = renderSurfaceController
+            ?? StageRenderSurfaceController(
+                spatialStage: spatialStage,
+                library: resolvedMarbleLibrary,
+                avatarRuntime: avatarRuntime
+            )
+        self.cameraCoordinator = cameraCoordinator
+            ?? StageCameraCoordinator(spatialStage: spatialStage)
         self.playbackPosition = playbackPosition
         self.playbackState = playbackState
         self.voiceState = voiceState
@@ -87,6 +119,14 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         window?.isVisible == true
     }
 
+    func setOnCloseHandler(_ handler: (@MainActor () -> Void)?) {
+        onCloseHandler = handler
+    }
+
+    func setOnWillShowHandler(_ handler: (@MainActor () -> Void)?) {
+        onWillShowHandler = handler
+    }
+
     func setPlaybackState(_ state: LocalMusicPlaybackState) {
         playbackState = state
         stageContentView?.setPlaybackState(state)
@@ -95,6 +135,19 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     func setVoiceState(_ state: RealtimeVoiceConnectionState) {
         voiceState = state
         stageContentView?.setVoiceState(state)
+        let activity: StageAvatarActivity = switch state {
+        case .listening:
+            .listening
+        case .speaking:
+            .speaking
+        case .disconnected, .connecting, .connected, .failed:
+            .idle
+        }
+        avatarRuntime.setActivity(activity)
+    }
+
+    func setVoiceLevel(_ level: Float) {
+        avatarRuntime.setVoiceLevel(level)
     }
 
     func setProgramNavigation(
@@ -108,6 +161,16 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func show() {
+        Self.log.notice(
+            "Showing stage requested=\(self.spatialStage.isWorldPresentationRequested, privacy: .public) visible=\(self.spatialStage.isWorldVisible, privacy: .public)"
+        )
+        didHandleCurrentClose = false
+        onWillShowHandler?()
+        cameraCoordinator.activateFullStage(
+            defaultCamera: SpatialWorldCalibration.resolve(
+                worldID: spatialStage.selectedWorldID
+            )?.cameraHome
+        )
         if window == nil {
             window = makeWindow()
         }
@@ -118,6 +181,11 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         NSApplication.shared.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
+        stageContentView?.attachRenderSurface()
+        updateRenderSurfaceVisibility(for: window)
+        Self.log.notice(
+            "Stage shown surfaceOwner=\(String(describing: self.renderSurfaceController.owner), privacy: .public) requested=\(self.spatialStage.isWorldPresentationRequested, privacy: .public) visible=\(self.spatialStage.isWorldVisible, privacy: .public)"
+        )
         videos.resume()
         try? audioMonitor?.start()
     }
@@ -126,19 +194,32 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         guard let window else {
             return
         }
+        finishCurrentClose()
         window.delegate = nil
         window.close()
         self.window = nil
         stageContentView = nil
         videos.pause()
         audioMonitor?.stop()
+        onCloseHandler?()
     }
 
     func windowWillClose(_ notification: Notification) {
+        finishCurrentClose()
         window = nil
         stageContentView = nil
         videos.pause()
         audioMonitor?.stop()
+        let handler = onCloseHandler
+        Task { @MainActor in
+            await Task.yield()
+            handler?()
+        }
+    }
+
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        updateRenderSurfaceVisibility(for: window)
     }
 
     func windowDidEnterFullScreen(_ notification: Notification) {
@@ -188,6 +269,10 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
             programStore: programStore,
             libraryStore: libraryStore,
             lyrics: lyrics,
+            spatialStage: spatialStage,
+            marbleLibrary: marbleLibrary,
+            avatarRuntime: avatarRuntime,
+            renderSurfaceController: renderSurfaceController,
             playbackPosition: playbackPosition,
             playbackState: playbackState,
             voiceState: voiceState,
@@ -209,14 +294,93 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         window.center()
         return window
     }
+
+    private func updateRenderSurfaceVisibility(for window: NSWindow) {
+        renderSurfaceController.setOwnerVisibility(
+            window.isVisible,
+            occluded: StageWindowOcclusionPolicy.isOccluded(
+                isVisible: window.isVisible,
+                isMiniaturized: window.isMiniaturized
+            ),
+            owner: .fullStage
+        )
+    }
+
+    private func finishCurrentClose() {
+        guard !didHandleCurrentClose else { return }
+        didHandleCurrentClose = true
+        cameraCoordinator.captureUserCamera()
+        renderSurfaceController.setOwnerVisibility(
+            false,
+            owner: .fullStage
+        )
+        renderSurfaceController.detach(from: .fullStage)
+    }
+}
+
+struct StageSurfacePresentationState: Equatable {
+    let isSpatialWorldHidden: Bool
+    let isPointCloudHidden: Bool
+    let isWorldInteractionHidden: Bool
+    let isLoadingIndicatorHidden: Bool
+    let isReturnToPointCloudHidden: Bool
+
+    static func resolve(
+        isWorldPresentationRequested: Bool,
+        isWorldVisible: Bool
+    ) -> Self {
+        Self(
+            isSpatialWorldHidden: !isWorldVisible,
+            isPointCloudHidden: isWorldPresentationRequested,
+            isWorldInteractionHidden: !isWorldVisible,
+            isLoadingIndicatorHidden: !isWorldPresentationRequested
+                || isWorldVisible,
+            isReturnToPointCloudHidden: !isWorldPresentationRequested
+        )
+    }
+}
+
+struct StagePointerDragDelta: Equatable {
+    let width: CGFloat
+    let height: CGFloat
+
+    static func resolve(
+        previousLocation: CGPoint?,
+        currentLocation: CGPoint,
+        eventDelta: CGSize
+    ) -> Self {
+        guard let previousLocation else {
+            return Self(
+                width: eventDelta.width,
+                height: eventDelta.height
+            )
+        }
+        let locationWidth = currentLocation.x - previousLocation.x
+        let locationHeight = previousLocation.y - currentLocation.y
+        if abs(locationWidth) > 0.0001 || abs(locationHeight) > 0.0001 {
+            return Self(width: locationWidth, height: locationHeight)
+        }
+        return Self(
+            width: eventDelta.width,
+            height: eventDelta.height
+        )
+    }
 }
 
 @MainActor
 private final class StageContentView: NSView {
     private let overlayState: StageOverlayState
+    private let spatialStage: SpatialStageStore
+    private let renderSurfaceController: StageRenderSurfaceController
+    private let renderSurfaceContainer = StageRenderSurfaceHostingView()
+    private let worldLoadingView = StageWorldLoadingView()
+    private let worldInteractionView: StageWorldInteractionView
+    private weak var metalView: MetalStageView?
     private var programRail: StageProgramRailHostingView!
     private var visualPicker: StageVisualPickerHostingView!
     private var transportControls: StageTransportControlsView!
+    private var returnToPointCloudButton: StageReturnToPointCloudButton!
+    private var worldVisibilityObserverID: UUID?
     private var isProgramRailVisible = false
     private var isVisualPickerVisible = false
 
@@ -230,6 +394,10 @@ private final class StageContentView: NSView {
         programStore: DJProgramStore,
         libraryStore: SyncedMusicLibraryStore,
         lyrics: StageLyricsStore,
+        spatialStage: SpatialStageStore,
+        marbleLibrary: MarbleWorldLibrary,
+        avatarRuntime: StageAvatarRuntimeStore,
+        renderSurfaceController: StageRenderSurfaceController,
         playbackPosition: @escaping @MainActor () -> TimeInterval,
         playbackState: LocalMusicPlaybackState,
         voiceState: RealtimeVoiceConnectionState,
@@ -245,6 +413,11 @@ private final class StageContentView: NSView {
         onToggleWindowMode: @escaping @MainActor () -> Void
     ) {
         overlayState = StageOverlayState()
+        self.spatialStage = spatialStage
+        self.renderSurfaceController = renderSurfaceController
+        worldInteractionView = StageWorldInteractionView(
+            spatialStage: spatialStage
+        )
         super.init(frame: frame)
 
         let programButton = StageProgramButton { [weak self] in
@@ -299,12 +472,23 @@ private final class StageContentView: NSView {
         videoView.layer?.zPosition = 0
         addSubview(videoView)
 
+        renderSurfaceContainer.frame = bounds
+        renderSurfaceContainer.identifier = NSUserInterfaceItemIdentifier(
+            "stage.shared-render-surface-container"
+        )
+        renderSurfaceContainer.autoresizingMask = [.width, .height]
+        renderSurfaceContainer.wantsLayer = true
+        renderSurfaceContainer.layer?.zPosition = 1.5
+        addSubview(renderSurfaceContainer)
+        renderSurfaceController.attachToFullStage(renderSurfaceContainer)
+
         let metalView = MetalStageView(
             frame: bounds,
             audioFeatures: audioFeatures,
             artwork: artwork,
             visualDirections: visualDirections,
-            videos: videos
+            videos: videos,
+            spatialStage: spatialStage
         )
         metalView.autoresizingMask = [.width, .height]
         metalView.identifier = NSUserInterfaceItemIdentifier(
@@ -313,6 +497,32 @@ private final class StageContentView: NSView {
         metalView.wantsLayer = true
         metalView.layer?.zPosition = 1
         addSubview(metalView)
+        self.metalView = metalView
+
+        worldLoadingView.frame = bounds
+        worldLoadingView.autoresizingMask = [.width, .height]
+        worldLoadingView.layer?.zPosition = 5
+        worldLoadingView.isHidden = true
+        addSubview(worldLoadingView)
+
+        let environmentEffects = StageEnvironmentHostingView(
+            rootView: SpatialEnvironmentEffectsView(
+                spatialStage: spatialStage
+            )
+        )
+        environmentEffects.frame = bounds
+        environmentEffects.autoresizingMask = [.width, .height]
+        environmentEffects.wantsLayer = true
+        environmentEffects.layer?.zPosition = 2
+        addSubview(environmentEffects)
+
+        worldInteractionView.frame = bounds
+        worldInteractionView.autoresizingMask = [.width, .height]
+        worldInteractionView.identifier = NSUserInterfaceItemIdentifier(
+            "stage.world-interaction"
+        )
+        worldInteractionView.isHidden = true
+        addSubview(worldInteractionView)
 
         let overlay = StageOverlayHostingView(
             rootView: StageOverlayView(
@@ -353,7 +563,9 @@ private final class StageContentView: NSView {
                 lyrics: lyrics,
                 visualDirections: visualDirections,
                 videos: videos,
-                programStore: programStore
+                programStore: programStore,
+                spatialStage: spatialStage,
+                marbleLibrary: marbleLibrary
             )
         )
         visualPicker.identifier = NSUserInterfaceItemIdentifier(
@@ -368,6 +580,15 @@ private final class StageContentView: NSView {
         transportControls.translatesAutoresizingMaskIntoConstraints = false
         transportControls.layer?.zPosition = 20
         addSubview(transportControls)
+
+        returnToPointCloudButton = StageReturnToPointCloudButton {
+            spatialStage.exitWorld()
+        }
+        returnToPointCloudButton.translatesAutoresizingMaskIntoConstraints = false
+        returnToPointCloudButton.layer?.zPosition = 21
+        returnToPointCloudButton.isHidden = true
+        addSubview(returnToPointCloudButton)
+
         NSLayoutConstraint.activate([
             transportControls.trailingAnchor.constraint(
                 equalTo: trailingAnchor,
@@ -401,12 +622,41 @@ private final class StageContentView: NSView {
                 constant: -10
             ),
             visualPicker.widthAnchor.constraint(equalToConstant: 590),
-            visualPicker.heightAnchor.constraint(equalToConstant: 378)
+            visualPicker.heightAnchor.constraint(equalToConstant: 458),
+
+            returnToPointCloudButton.trailingAnchor.constraint(
+                equalTo: trailingAnchor,
+                constant: -22
+            ),
+            returnToPointCloudButton.topAnchor.constraint(
+                equalTo: topAnchor,
+                constant: 28
+            ),
+            returnToPointCloudButton.widthAnchor.constraint(
+                equalToConstant: 112
+            ),
+            returnToPointCloudButton.heightAnchor.constraint(
+                equalToConstant: 38
+            )
         ])
+
+        startObservingSpatialPresentation()
     }
 
     required init?(coder: NSCoder) {
         nil
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil {
+            spatialStage.removeWorldVisibilityObserver(
+                worldVisibilityObserverID
+            )
+            worldVisibilityObserverID = nil
+        } else {
+            startObservingSpatialPresentation()
+        }
+        super.viewWillMove(toWindow: newWindow)
     }
 
     func setWindowMode(_ mode: StageWindowMode) {
@@ -453,6 +703,247 @@ private final class StageContentView: NSView {
         }
         visualPicker.isHidden = !isVisualPickerVisible
         transportControls.setVisualPickerExpanded(isVisualPickerVisible)
+    }
+
+    func attachRenderSurface() {
+        renderSurfaceController.attachToFullStage(renderSurfaceContainer)
+    }
+
+    private func startObservingSpatialPresentation() {
+        guard worldVisibilityObserverID == nil else { return }
+        worldVisibilityObserverID = spatialStage.observeWorldVisibility {
+            [weak self] isWorldVisible in
+            self?.applySpatialPresentation(isWorldVisible: isWorldVisible)
+        }
+    }
+
+    private func applySpatialPresentation(isWorldVisible: Bool) {
+        let state = StageSurfacePresentationState.resolve(
+            isWorldPresentationRequested:
+                spatialStage.isWorldPresentationRequested,
+            isWorldVisible: isWorldVisible
+        )
+        renderSurfaceContainer.isHidden = state.isSpatialWorldHidden
+        metalView?.isHidden = state.isPointCloudHidden
+        worldInteractionView.isHidden = state.isWorldInteractionHidden
+        worldLoadingView.isHidden = state.isLoadingIndicatorHidden
+        if isWorldVisible {
+            window?.makeFirstResponder(worldInteractionView)
+        } else if !state.isPointCloudHidden, let metalView {
+            window?.makeFirstResponder(metalView)
+        }
+        renderSurfaceController.setWorldPresentationVisible(isWorldVisible)
+        returnToPointCloudButton.isHidden =
+            state.isReturnToPointCloudHidden
+        StageWindowController.log.notice(
+            "Applied stage presentation requested=\(self.spatialStage.isWorldPresentationRequested, privacy: .public) visible=\(isWorldVisible, privacy: .public) worldHidden=\(state.isSpatialWorldHidden, privacy: .public) pointCloudHidden=\(state.isPointCloudHidden, privacy: .public) loadingHidden=\(state.isLoadingIndicatorHidden, privacy: .public)"
+        )
+    }
+}
+
+@MainActor
+private final class StageWorldInteractionView: NSView {
+    private let spatialStage: SpatialStageStore
+    private var dragInProgress = false
+    private var didLogCurrentDrag = false
+    private var lastDragLocationInWindow: CGPoint?
+
+    init(spatialStage: SpatialStageStore) {
+        self.spatialStage = spatialStage
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override var acceptsFirstResponder: Bool {
+        true
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 2 {
+            endDragIfNeeded()
+            spatialStage.resetCamera()
+            return
+        }
+        beginDrag(
+            buttonNumber: event.buttonNumber,
+            locationInWindow: event.locationInWindow
+        )
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        beginDrag(
+            buttonNumber: event.buttonNumber,
+            locationInWindow: event.locationInWindow
+        )
+    }
+
+    override func otherMouseDown(with event: NSEvent) {
+        beginDrag(
+            buttonNumber: event.buttonNumber,
+            locationInWindow: event.locationInWindow
+        )
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        dragCamera(with: event)
+    }
+
+    override func rightMouseDragged(with event: NSEvent) {
+        dragCamera(with: event)
+    }
+
+    override func otherMouseDragged(with event: NSEvent) {
+        dragCamera(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        endDragIfNeeded()
+    }
+
+    override func rightMouseUp(with event: NSEvent) {
+        endDragIfNeeded()
+    }
+
+    override func otherMouseUp(with event: NSEvent) {
+        endDragIfNeeded()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard let movement = Self.movement(for: event.keyCode) else {
+            super.keyDown(with: event)
+            return
+        }
+        spatialStage.setMovement(movement, active: true)
+    }
+
+    override func keyUp(with event: NSEvent) {
+        guard let movement = Self.movement(for: event.keyCode) else {
+            super.keyUp(with: event)
+            return
+        }
+        spatialStage.setMovement(movement, active: false)
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        spatialStage.setSpeedBoosted(
+            event.modifierFlags.contains(.shift)
+        )
+        super.flagsChanged(with: event)
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil {
+            spatialStage.clearMovement()
+            spatialStage.setSpeedBoosted(false)
+            endDragIfNeeded()
+        }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
+    private func beginDrag(
+        buttonNumber: Int,
+        locationInWindow: CGPoint
+    ) {
+        guard !dragInProgress else { return }
+        dragInProgress = true
+        didLogCurrentDrag = false
+        lastDragLocationInWindow = locationInWindow
+        StageWindowController.log.notice(
+            "World camera drag began button=\(buttonNumber, privacy: .public)"
+        )
+        NSCursor.closedHand.push()
+    }
+
+    private func dragCamera(with event: NSEvent) {
+        let delta = StagePointerDragDelta.resolve(
+            previousLocation: lastDragLocationInWindow,
+            currentLocation: event.locationInWindow,
+            eventDelta: CGSize(
+                width: event.deltaX,
+                height: event.deltaY
+            )
+        )
+        lastDragLocationInWindow = event.locationInWindow
+        let before = spatialStage.camera
+        spatialStage.look(
+            deltaX: Float(delta.width),
+            deltaY: Float(delta.height)
+        )
+        guard !didLogCurrentDrag else { return }
+        didLogCurrentDrag = true
+        StageWindowController.log.notice(
+            "World camera drag deltaX=\(delta.width, privacy: .public) deltaY=\(delta.height, privacy: .public) yawBefore=\(before.yaw, privacy: .public) yawAfter=\(self.spatialStage.camera.yaw, privacy: .public) pitchBefore=\(before.pitch, privacy: .public) pitchAfter=\(self.spatialStage.camera.pitch, privacy: .public)"
+        )
+    }
+
+    private func endDragIfNeeded() {
+        guard dragInProgress else { return }
+        dragInProgress = false
+        lastDragLocationInWindow = nil
+        StageWindowController.log.notice(
+            "World camera drag ended yaw=\(self.spatialStage.camera.yaw, privacy: .public) pitch=\(self.spatialStage.camera.pitch, privacy: .public)"
+        )
+        NSCursor.pop()
+    }
+
+    private static func movement(for keyCode: UInt16) -> SpatialMovement? {
+        switch keyCode {
+        case 13:
+            .forward
+        case 1:
+            .backward
+        case 0:
+            .left
+        case 2:
+            .right
+        default:
+            nil
+        }
+    }
+}
+
+@MainActor
+private final class StageWorldLoadingView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.black.cgColor
+        setAccessibilityLabel("正在进入生活空间")
+
+        let spinner = NSProgressIndicator()
+        spinner.style = .spinning
+        spinner.controlSize = .regular
+        spinner.translatesAutoresizingMaskIntoConstraints = false
+        spinner.startAnimation(nil)
+        addSubview(spinner)
+
+        let label = NSTextField(labelWithString: "正在进入生活空间…")
+        label.font = .systemFont(ofSize: 14, weight: .medium)
+        label.textColor = NSColor.white.withAlphaComponent(0.82)
+        label.alignment = .center
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+
+        NSLayoutConstraint.activate([
+            spinner.centerXAnchor.constraint(equalTo: centerXAnchor),
+            spinner.centerYAnchor.constraint(
+                equalTo: centerYAnchor,
+                constant: -16
+            ),
+            label.topAnchor.constraint(equalTo: spinner.bottomAnchor, constant: 12),
+            label.centerXAnchor.constraint(equalTo: centerXAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        nil
     }
 }
 
@@ -515,6 +1006,26 @@ private final class StageVideoPlayerView: NSView {
 
 @MainActor
 private final class StageOverlayHostingView: NSHostingView<StageOverlayView> {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+}
+
+@MainActor
+private final class StageEnvironmentHostingView:
+    NSHostingView<SpatialEnvironmentEffectsView>
+{
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+}
+
+/// The shared Metal surface is visual-only in the full-space window. Pointer
+/// events must continue through to `MetalStageView`, which owns camera orbit,
+/// reset, and keyboard focus. A plain NSView container would intercept drags
+/// even though `MarbleSpatialView` itself returns nil from hit testing.
+@MainActor
+private final class StageRenderSurfaceHostingView: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? {
         nil
     }
@@ -799,6 +1310,66 @@ private final class StageVisualButton: NSButton {
             : NSColor.clear.cgColor
         toolTip = label
         setAccessibilityLabel(label)
+    }
+}
+
+@MainActor
+private final class StageReturnToPointCloudButton: NSButton {
+    private let handler: @MainActor () -> Void
+
+    init(action: @escaping @MainActor () -> Void) {
+        handler = action
+        super.init(frame: .zero)
+        identifier = NSUserInterfaceItemIdentifier(
+            "stage.return-to-point-cloud"
+        )
+        target = self
+        self.action = #selector(performAction)
+        isBordered = false
+        focusRingType = .none
+        wantsLayer = true
+        layer?.cornerRadius = 19
+        layer?.backgroundColor = NSColor(
+            calibratedWhite: 0.04,
+            alpha: 0.72
+        ).cgColor
+        layer?.borderColor = NSColor(
+            calibratedRed: 0.28,
+            green: 0.86,
+            blue: 1,
+            alpha: 0.48
+        ).cgColor
+        layer?.borderWidth = 1
+
+        let configuration = NSImage.SymbolConfiguration(
+            pointSize: 12,
+            weight: .semibold
+        )
+        image = NSImage(
+            systemSymbolName: "circle.hexagongrid.fill",
+            accessibilityDescription: "返回 3D 点阵"
+        )?.withSymbolConfiguration(configuration)
+        imagePosition = .imageLeading
+        imageHugsTitle = true
+        title = "3D 点阵"
+        font = .systemFont(ofSize: 11, weight: .semibold)
+        contentTintColor = NSColor(
+            calibratedRed: 0.48,
+            green: 0.95,
+            blue: 1,
+            alpha: 1
+        )
+        toolTip = "返回 3D 点阵"
+        setAccessibilityLabel("返回 3D 点阵")
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    @objc
+    private func performAction() {
+        handler()
     }
 }
 

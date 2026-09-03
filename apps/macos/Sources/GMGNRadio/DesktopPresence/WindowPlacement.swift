@@ -5,6 +5,38 @@ struct DisplayFrame: Equatable, Sendable {
     let visibleFrame: CGRect
 }
 
+enum LiveCamWindowDragPhase: Equatable, Sendable {
+    case changed
+    case ended
+}
+
+enum LiveCamWindowMovementPolicy {
+    static func frame(
+        from current: CGRect,
+        translation: CGSize,
+        phase: LiveCamWindowDragPhase,
+        visibleFrames: [CGRect],
+        margin: CGFloat,
+        snapDistance: CGFloat
+    ) -> CGRect {
+        let proposed = current.offsetBy(
+            dx: translation.width,
+            dy: translation.height
+        )
+        switch phase {
+        case .changed:
+            return proposed
+        case .ended:
+            return WindowPlacement.snappedFrame(
+                proposed,
+                visibleFrames: visibleFrames,
+                margin: margin,
+                snapDistance: snapDistance
+            )
+        }
+    }
+}
+
 enum WindowPlacement {
     static func defaultFrame(
         size: CGSize,

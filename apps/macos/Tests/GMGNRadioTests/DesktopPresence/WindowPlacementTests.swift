@@ -68,3 +68,35 @@ func removedDisplayFallsBackToMainDisplay() {
     #expect(result.maxX == 1416)
     #expect(result.minY == 64)
 }
+
+@Test
+func liveCamDragCanCrossFromTheMainDisplayToASecondaryDisplay() {
+    let visibleFrames = [
+        CGRect(x: 0, y: 0, width: 1000, height: 800),
+        CGRect(x: 1000, y: 0, width: 1000, height: 800),
+    ]
+    let start = CGRect(x: 620, y: 200, width: 360, height: 250)
+
+    var crossing = start
+    for _ in 0 ..< 56 {
+        crossing = LiveCamWindowMovementPolicy.frame(
+            from: crossing,
+            translation: CGSize(width: 5, height: 0),
+            phase: .changed,
+            visibleFrames: visibleFrames,
+            margin: 16,
+            snapDistance: 18
+        )
+    }
+    #expect(crossing.minX == 900)
+
+    let released = LiveCamWindowMovementPolicy.frame(
+        from: crossing,
+        translation: CGSize(width: 260, height: 0),
+        phase: .ended,
+        visibleFrames: visibleFrames,
+        margin: 16,
+        snapDistance: 18
+    )
+    #expect(released.minX == 1160)
+}

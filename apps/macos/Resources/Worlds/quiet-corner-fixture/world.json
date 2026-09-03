@@ -1,0 +1,129 @@
+{
+  "schemaVersion": 1,
+  "packageID": "quiet-corner-fixture",
+  "packageVersion": "1.0.0",
+  "worldID": "world-fixture-quiet-corner",
+  "displayName": "Quiet Corner Fixture",
+  "calibration": {
+    "metersPerUnit": 1.0,
+    "visualToGameplay": [
+      1.0, 0.0, 0.0, 0.0,
+      0.0, 1.0, 0.0, 0.0,
+      0.0, 0.0, 1.0, 0.0,
+      0.0, 0.0, 0.0, 1.0
+    ]
+  },
+  "spawn": {
+    "position": { "x": 0.0, "y": 0.0, "z": 0.6 },
+    "rotation": { "x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0 },
+    "scale": { "x": 1.0, "y": 1.0, "z": 1.0 }
+  },
+  "collisionVolumes": [
+    {
+      "id": "collision.fixture.floor",
+      "center": { "x": 0.0, "y": -0.05, "z": 0.0 },
+      "halfExtents": { "x": 1.2, "y": 0.05, "z": 1.2 },
+      "rotation": { "x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0 },
+      "isBlocking": true
+    }
+  ],
+  "waypoints": [
+    {
+      "id": "wp.fixture.spawn",
+      "position": { "x": 0.0, "y": 0.0, "z": 0.6 },
+      "arrivalRadius": 0.2,
+      "enabled": true
+    },
+    {
+      "id": "wp.fixture.window",
+      "position": { "x": -0.45, "y": 0.0, "z": -0.4 },
+      "arrivalRadius": 0.18,
+      "enabled": true
+    }
+  ],
+  "routes": [
+    {
+      "id": "route.fixture.window",
+      "waypointIDs": ["wp.fixture.spawn", "wp.fixture.window"],
+      "bidirectional": true,
+      "enabled": true
+    }
+  ],
+  "activities": [
+    {
+      "id": "fixture.idle",
+      "action": "idle",
+      "entryWaypointID": "wp.fixture.spawn",
+      "transform": {
+        "position": { "x": 0.0, "y": 0.0, "z": 0.6 },
+        "rotation": { "x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0 },
+        "scale": { "x": 1.0, "y": 1.0, "z": 1.0 }
+      },
+      "motionID": "idle.natural",
+      "propIDs": [],
+      "interruptible": true
+    },
+    {
+      "id": "fixture.window.gaze",
+      "action": "gaze",
+      "entryWaypointID": "wp.fixture.window",
+      "transform": {
+        "position": { "x": -0.45, "y": 0.0, "z": -0.4 },
+        "rotation": { "x": 0.0, "y": -0.3826834, "z": 0.0, "w": 0.9238795 },
+        "scale": { "x": 1.0, "y": 1.0, "z": 1.0 }
+      },
+      "motionID": "gaze.window",
+      "propIDs": [],
+      "interruptible": true
+    }
+  ],
+  "activityDefinitions": [
+    {
+      "id": "fixture.idle",
+      "activity": { "type": "idle" },
+      "phases": [
+        { "phase": "approach" },
+        { "phase": "enter" },
+        { "phase": "loop", "motionIDs": ["idle.natural"] },
+        { "phase": "exit" },
+        { "phase": "interrupt" },
+        { "phase": "failed" }
+      ],
+      "interruptible": true,
+      "cooldownSeconds": 0.0
+    },
+    {
+      "id": "fixture.window.gaze",
+      "activity": { "type": "gaze", "targetID": "fixture.window.gaze" },
+      "phases": [
+        { "phase": "approach" },
+        { "phase": "enter" },
+        { "phase": "loop", "motionIDs": ["gaze.window"] },
+        { "phase": "exit" },
+        { "phase": "interrupt" },
+        { "phase": "failed" }
+      ],
+      "interruptible": true,
+      "cooldownSeconds": 10.0
+    }
+  ],
+  "cameras": [
+    {
+      "id": "fixture.character.closeup",
+      "transform": {
+        "position": { "x": 0.0, "y": 1.25, "z": 1.55 },
+        "rotation": { "x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0 },
+        "scale": { "x": 1.0, "y": 1.0, "z": 1.0 }
+      },
+      "fieldOfViewDegrees": 48.0,
+      "nearPlane": 0.05,
+      "farPlane": 50.0
+    }
+  ],
+  "capabilities": [
+    "activity:fixture.idle",
+    "activity:fixture.window.gaze",
+    "camera:fixture.character.closeup"
+  ],
+  "resources": []
+}

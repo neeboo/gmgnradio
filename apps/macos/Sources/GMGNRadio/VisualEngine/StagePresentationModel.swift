@@ -503,6 +503,7 @@ enum StageLyricsVisualMode: CaseIterable, Equatable, Hashable, Sendable {
     case editorialField
     case pendulumWheel
     case dioramaStage
+    case foldingVerse
 
     static let playbackModes: [StageLyricsVisualMode] = [
         .flowingLine,
@@ -515,6 +516,7 @@ enum StageLyricsVisualMode: CaseIterable, Equatable, Hashable, Sendable {
         .posterRail,
         .pendulumWheel,
         .dioramaStage,
+        .foldingVerse,
     ]
 
     static let agentValues = ["automatic"]
@@ -544,6 +546,8 @@ enum StageLyricsVisualMode: CaseIterable, Equatable, Hashable, Sendable {
             "pendulum"
         case .dioramaStage:
             "diorama"
+        case .foldingVerse:
+            "folding_verse"
         }
     }
 
@@ -571,6 +575,8 @@ enum StageLyricsVisualMode: CaseIterable, Equatable, Hashable, Sendable {
             "时计"
         case .dioramaStage:
             "镜台"
+        case .foldingVerse:
+            "折章"
         }
     }
 
@@ -598,6 +604,8 @@ enum StageLyricsVisualMode: CaseIterable, Equatable, Hashable, Sendable {
             "clock.arrow.circlepath"
         case .dioramaStage:
             "cube.transparent"
+        case .foldingVerse:
+            "rectangle.portrait.on.rectangle.portrait"
         }
     }
 
@@ -625,6 +633,8 @@ enum StageLyricsVisualMode: CaseIterable, Equatable, Hashable, Sendable {
             self = .pendulumWheel
         case "diorama":
             self = .dioramaStage
+        case "folding_verse", "folding":
+            self = .foldingVerse
         default:
             return nil
         }
@@ -876,6 +886,98 @@ struct StageLyricFlowSceneModel: Equatable, Sendable {
     }
 }
 
+enum StageLyricFoldDirection: Equatable, Sendable {
+    case left
+    case right
+}
+
+struct StageLyricFoldSceneModel: Equatable, Sendable {
+    static let maximumLinesPerGroup = 4
+    static let paragraphGap: TimeInterval = 5
+    static let transitionDuration: TimeInterval = 0.72
+
+    let groupIndex: Int
+    let previousLines: [StageLyricLine]
+    let currentLines: [StageLyricLine]
+    let activeLineID: String?
+    let foldDirection: StageLyricFoldDirection
+    let transitionProgress: Double
+
+    init(lines: [StageLyricLine], playbackTime: TimeInterval) {
+        let sortedLines = lines.sorted {
+            if $0.startsAt == $1.startsAt {
+                return $0.id < $1.id
+            }
+            return $0.startsAt < $1.startsAt
+        }
+        let groups = Self.makeGroups(from: sortedLines)
+
+        guard !groups.isEmpty else {
+            groupIndex = 0
+            previousLines = []
+            currentLines = []
+            activeLineID = nil
+            foldDirection = .left
+            transitionProgress = 0
+            return
+        }
+
+        let activeLine = sortedLines.last(where: {
+            $0.startsAt <= playbackTime
+        })
+        let resolvedGroupIndex = activeLine.flatMap { line in
+            groups.firstIndex(where: { group in
+                group.contains(where: { $0.id == line.id })
+            })
+        } ?? 0
+        let currentGroup = groups[resolvedGroupIndex]
+        let groupStart = currentGroup.first?.startsAt ?? playbackTime
+
+        groupIndex = resolvedGroupIndex
+        previousLines = resolvedGroupIndex > 0
+            ? groups[resolvedGroupIndex - 1]
+            : []
+        currentLines = currentGroup
+        activeLineID = activeLine?.id
+        foldDirection = resolvedGroupIndex.isMultiple(of: 2)
+            ? .left
+            : .right
+        transitionProgress = min(
+            max(
+                (playbackTime - groupStart) / Self.transitionDuration,
+                0
+            ),
+            1
+        )
+    }
+
+    private static func makeGroups(
+        from lines: [StageLyricLine]
+    ) -> [[StageLyricLine]] {
+        var groups: [[StageLyricLine]] = []
+        var currentGroup: [StageLyricLine] = []
+
+        for line in lines {
+            let previousLine = currentGroup.last
+            let startsNewParagraph = previousLine.map {
+                line.startsAt - $0.startsAt >= paragraphGap
+            } ?? false
+            if currentGroup.count >= maximumLinesPerGroup
+                || startsNewParagraph
+            {
+                groups.append(currentGroup)
+                currentGroup = []
+            }
+            currentGroup.append(line)
+        }
+
+        if !currentGroup.isEmpty {
+            groups.append(currentGroup)
+        }
+        return groups
+    }
+}
+
 enum StageLyricSectionClassifier {
     static func isChorus(
         _ line: StageLyricLine,
@@ -1090,14 +1192,9 @@ final class StagePresentationModel: ObservableObject {
     private var isAgentResponseActive = true
 
     init(
-        programTitle: String = "AFTERGLOW SESSION",
-        programDetail: String = "DJ 自主节目",
-        currentCue: StageTextCue? = StageTextCue(
-            text: "凌晨两点，让城市先慢下来。",
-            secondaryText: "接下来这首歌，会留一点空间给你。",
-            startsAt: 0,
-            endsAt: .infinity
-        )
+        programTitle: String = "",
+        programDetail: String = "",
+        currentCue: StageTextCue? = nil
     ) {
         self.programTitle = programTitle
         self.programDetail = programDetail

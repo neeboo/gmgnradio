@@ -30,5 +30,12 @@
     <string>gmgn radio uses the microphone so you can talk with your DJ.</string>
     <key>NSAppleMusicUsageDescription</key>
     <string>gmgn radio uses your Apple Music account to search and play music for your DJ program.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>gmgn radio connects to your local motion-generation computer to list and download character actions.</string>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
 </dict>
 </plist>

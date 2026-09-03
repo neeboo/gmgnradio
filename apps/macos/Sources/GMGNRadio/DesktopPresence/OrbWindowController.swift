@@ -1,6 +1,26 @@
 import AppKit
 
 @MainActor
+struct OrbStageMenuAction {
+    let isStageVisible: Bool
+
+    var title: String {
+        isStageVisible ? "隐藏 360° 舞台" : "打开 360° 舞台"
+    }
+
+    func perform(
+        showStage: @MainActor () -> Void,
+        hideStage: @MainActor () -> Void
+    ) {
+        if isStageVisible {
+            hideStage()
+        } else {
+            showStage()
+        }
+    }
+}
+
+@MainActor
 final class OrbWindowController: NSWindowController, NSWindowDelegate {
     private enum Constants {
         static let size = CGSize(width: 168, height: 168)
@@ -12,33 +32,61 @@ final class OrbWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private let defaults: UserDefaults
+    private let contentHost: NSView
     private let orbView: OrbMetalView
     private let immersiveController: ImmersiveSceneController
+    private let avatarRuntime: StageAvatarRuntimeStore
+    private let isStageVisible: @MainActor () -> Bool
+    private let showStage: @MainActor () -> Void
+    private let hideStage: @MainActor () -> Void
     private var interactionTask: Task<Void, Never>?
+    private var clickRecognizer: NSClickGestureRecognizer!
 
     init(
         defaults: UserDefaults = .standard,
-        audioFeatures: VisualAudioFeatureStore = VisualAudioFeatureStore()
+        audioFeatures: VisualAudioFeatureStore = VisualAudioFeatureStore(),
+        avatarRuntime: StageAvatarRuntimeStore = .shared,
+        isStageVisible: @escaping @MainActor () -> Bool = { false },
+        showStage: @escaping @MainActor () -> Void = {},
+        hideStage: @escaping @MainActor () -> Void = {}
     ) {
         self.defaults = defaults
+        self.avatarRuntime = avatarRuntime
+        self.isStageVisible = isStageVisible
+        self.showStage = showStage
+        self.hideStage = hideStage
 
         let frame = Self.initialFrame(defaults: defaults)
+        let contentHost = NSView(
+            frame: CGRect(origin: .zero, size: Constants.size)
+        )
+        contentHost.wantsLayer = true
+        contentHost.layer?.isOpaque = false
+        self.contentHost = contentHost
         let orbView = OrbMetalView(
-            frame: CGRect(origin: .zero, size: Constants.size),
+            frame: contentHost.bounds,
             audioFeatures: audioFeatures,
             appearance: OrbAppearance.load(from: defaults)
         )
         orbView.autoresizingMask = [.width, .height]
         self.orbView = orbView
+        contentHost.addSubview(orbView)
         immersiveController = ImmersiveSceneController(audioFeatures: audioFeatures)
 
-        let panel = OrbPanel(frame: frame, contentView: orbView)
+        let panel = OrbPanel(frame: frame, contentView: contentHost)
         if ProcessInfo.processInfo.environment["GMGN_BASELINE"] == "1" {
             panel.backgroundColor = .black
             panel.isOpaque = true
         }
         super.init(window: panel)
         panel.delegate = self
+        clickRecognizer = NSClickGestureRecognizer(
+            target: self,
+            action: #selector(showStageMenu(_:))
+        )
+        clickRecognizer.numberOfClicksRequired = 1
+        clickRecognizer.buttonMask = 0x1
+        contentHost.addGestureRecognizer(clickRecognizer)
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(appearanceDidChange),
@@ -61,12 +109,74 @@ final class OrbWindowController: NSWindowController, NSWindowDelegate {
         window?.orderFrontRegardless()
     }
 
+    func hide() {
+        window?.orderOut(nil)
+    }
+
     func setState(_ state: DJState) {
         orbView.setState(state)
+        let activity: StageAvatarActivity = switch state {
+        case .listening:
+            .listening
+        case .speaking:
+            .speaking
+        default:
+            .idle
+        }
+        avatarRuntime.setActivity(activity)
     }
 
     func setVoiceLevel(_ level: Double) {
         orbView.setVoiceLevel(Float(level))
+        avatarRuntime.setVoiceLevel(Float(level))
+    }
+
+    @objc private func showStageMenu(
+        _ recognizer: NSClickGestureRecognizer
+    ) {
+        guard recognizer.state == .ended else {
+            return
+        }
+        presentStageMenu()
+    }
+
+    private func presentStageMenu() {
+        let action = OrbStageMenuAction(
+            isStageVisible: isStageVisible()
+        )
+        let item = NSMenuItem(
+            title: action.title,
+            action: #selector(toggleStageFromMenu),
+            keyEquivalent: ""
+        )
+        item.target = self
+        item.image = NSImage(
+            systemSymbolName: action.isStageVisible
+                ? "eye.slash"
+                : "rectangle.inset.filled",
+            accessibilityDescription: action.title
+        )
+
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        menu.addItem(item)
+        menu.popUp(
+            positioning: nil,
+            at: NSPoint(
+                x: contentHost.bounds.midX,
+                y: contentHost.bounds.midY
+            ),
+            in: contentHost
+        )
+    }
+
+    @objc private func toggleStageFromMenu() {
+        OrbStageMenuAction(
+            isStageVisible: isStageVisible()
+        ).perform(
+            showStage: showStage,
+            hideStage: hideStage
+        )
     }
 
     @objc private func appearanceDidChange() {

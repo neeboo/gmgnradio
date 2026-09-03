@@ -51,6 +51,7 @@ final class StageArtworkStore {
 @MainActor
 final class MetalStageView: MTKView {
     private var stageRenderer: StageRenderer!
+    private let spatialStage: SpatialStageStore
     private var dragInProgress = false
 
     init(
@@ -58,12 +59,14 @@ final class MetalStageView: MTKView {
         audioFeatures: VisualAudioFeatureStore,
         artwork: StageArtworkStore = StageArtworkStore(),
         visualDirections: StageVisualDirectionStore = StageVisualDirectionStore(),
-        videos: StageVideoPlaybackStore = StageVideoPlaybackStore()
+        videos: StageVideoPlaybackStore = StageVideoPlaybackStore(),
+        spatialStage: SpatialStageStore = SpatialStageStore()
     ) {
         guard let device = MTLCreateSystemDefaultDevice() else {
             preconditionFailure("gmgn radio requires a Metal-capable Apple Silicon Mac")
         }
 
+        self.spatialStage = spatialStage
         super.init(frame: frame, device: device)
         colorPixelFormat = .bgra8Unorm_srgb
         depthStencilPixelFormat = .depth32Float
@@ -85,7 +88,8 @@ final class MetalStageView: MTKView {
                 audioFeatures: audioFeatures,
                 artwork: artwork,
                 visualDirections: visualDirections,
-                videos: videos
+                videos: videos,
+                spatialStage: spatialStage
             )
             delegate = stageRenderer
         } catch {
@@ -101,6 +105,10 @@ final class MetalStageView: MTKView {
         true
     }
 
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         preferredFramesPerSecond = min(
@@ -113,23 +121,105 @@ final class MetalStageView: MTKView {
     override func mouseDown(with event: NSEvent) {
         if event.clickCount == 2 {
             endDragIfNeeded()
-            stageRenderer.resetCamera()
+            if spatialStage.isWorldVisible {
+                spatialStage.resetCamera()
+            } else {
+                stageRenderer.resetCamera()
+            }
             return
         }
+        beginCameraDrag()
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        beginCameraDrag()
+    }
+
+    override func otherMouseDown(with event: NSEvent) {
+        beginCameraDrag()
+    }
+
+    private func beginCameraDrag() {
+        guard !dragInProgress else { return }
         dragInProgress = true
         NSCursor.closedHand.push()
-        stageRenderer.beginDrag()
+        if !spatialStage.isWorldVisible {
+            stageRenderer.beginDrag()
+        }
     }
 
     override func mouseDragged(with event: NSEvent) {
-        stageRenderer.drag(
-            deltaX: Float(event.deltaX),
-            deltaY: Float(event.deltaY)
-        )
+        dragCamera(with: event)
+    }
+
+    override func rightMouseDragged(with event: NSEvent) {
+        dragCamera(with: event)
+    }
+
+    override func otherMouseDragged(with event: NSEvent) {
+        dragCamera(with: event)
+    }
+
+    private func dragCamera(with event: NSEvent) {
+        if spatialStage.isWorldVisible {
+            spatialStage.look(
+                deltaX: Float(event.deltaX),
+                deltaY: Float(event.deltaY)
+            )
+        } else {
+            stageRenderer.drag(
+                deltaX: Float(event.deltaX),
+                deltaY: Float(event.deltaY)
+            )
+        }
     }
 
     override func mouseUp(with event: NSEvent) {
         endDragIfNeeded()
+    }
+
+    override func rightMouseUp(with event: NSEvent) {
+        endDragIfNeeded()
+    }
+
+    override func otherMouseUp(with event: NSEvent) {
+        endDragIfNeeded()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard spatialStage.isWorldVisible,
+              let movement = Self.movement(for: event.keyCode)
+        else {
+            super.keyDown(with: event)
+            return
+        }
+        spatialStage.setMovement(movement, active: true)
+    }
+
+    override func keyUp(with event: NSEvent) {
+        guard spatialStage.isWorldVisible,
+              let movement = Self.movement(for: event.keyCode)
+        else {
+            super.keyUp(with: event)
+            return
+        }
+        spatialStage.setMovement(movement, active: false)
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        spatialStage.setSpeedBoosted(
+            event.modifierFlags.contains(.shift)
+        )
+        super.flagsChanged(with: event)
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil {
+            spatialStage.clearMovement()
+            spatialStage.setSpeedBoosted(false)
+            endDragIfNeeded()
+        }
+        super.viewWillMove(toWindow: newWindow)
     }
 
     private func endDragIfNeeded() {
@@ -139,5 +229,20 @@ final class MetalStageView: MTKView {
         dragInProgress = false
         stageRenderer.endDrag()
         NSCursor.pop()
+    }
+
+    private static func movement(for keyCode: UInt16) -> SpatialMovement? {
+        switch keyCode {
+        case 13:
+            .forward
+        case 1:
+            .backward
+        case 0:
+            .left
+        case 2:
+            .right
+        default:
+            nil
+        }
     }
 }
