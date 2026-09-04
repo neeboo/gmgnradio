@@ -58,20 +58,20 @@ enum AgentConversationBackends {
         AgentConversationBackend(
             kind: .workbuddy,
             displayName: "WorkBuddy",
-            executableNames: ["workbuddy"],
-            supportsNativeContinuation: false
+            executableNames: ["codebuddy", "workbuddy"],
+            supportsNativeContinuation: true
         ),
         AgentConversationBackend(
             kind: .qoder,
             displayName: "Qoder",
             executableNames: ["qoder"],
-            supportsNativeContinuation: false
+            supportsNativeContinuation: true
         ),
         AgentConversationBackend(
             kind: .pi,
             displayName: "Pi",
             executableNames: ["pi"],
-            supportsNativeContinuation: false
+            supportsNativeContinuation: true
         ),
     ]
 
@@ -96,7 +96,6 @@ struct AgentConversationMessage: Equatable, Sendable {
 
 enum AgentConversationError: Error, LocalizedError {
     case backendNotInstalled(AgentConversationBackendID)
-    case protocolPending(AgentConversationBackendID)
     case emptyReply
     case cancelled
 
@@ -105,9 +104,6 @@ enum AgentConversationError: Error, LocalizedError {
         case let .backendNotInstalled(id):
             "\(AgentConversationBackends.backend(for: id).displayName) 尚未安装，"
                 + "请先安装或在设置里选择其它后端。"
-        case let .protocolPending(id):
-            "\(AgentConversationBackends.backend(for: id).displayName) 已安装，"
-                + "但接入协议尚未完成，暂时无法发送。"
         case .emptyReply:
             "Agent 没有返回内容，请稍后再试。"
         case .cancelled:
@@ -122,7 +118,8 @@ protocol AgentExecutableLocating: Sendable {
     func locate(executableNames: [String]) -> URL?
 }
 
-/// 只探测系统标准目录和当前 PATH，不依赖用户家目录。
+/// 探测系统标准目录、PATH 以及常见的用户安装目录；
+/// 不依赖固定用户目录结构，存在才采用。
 struct AgentExecutableLocator: AgentExecutableLocating {
     private let fileManager: FileManager
     private let environment: [String: String]
@@ -137,21 +134,71 @@ struct AgentExecutableLocator: AgentExecutableLocating {
     }
 
     func locate(executableNames: [String]) -> URL? {
-        let standardDirectories = [
+        for name in executableNames {
+            if let url = locateAppBundledCLI(named: name) {
+                return url
+            }
+            for directory in searchDirectories() {
+                let candidate = directory.appending(path: name)
+                if fileManager.isExecutableFile(atPath: candidate.path) {
+                    return candidate
+                }
+            }
+        }
+        return nil
+    }
+
+    private func searchDirectories() -> [URL] {
+        var directories = [
             "/opt/homebrew/bin",
             "/usr/local/bin",
             "/usr/bin",
             "/bin",
             "/usr/sbin",
             "/sbin",
-        ]
-        let pathDirectories = (environment["PATH"] ?? "")
+        ].map { URL(filePath: $0) }
+        let home = fileManager.homeDirectoryForCurrentUser
+        directories += [
+            ".local/bin",
+            ".bun/bin",
+            ".volta/bin",
+            ".cargo/bin",
+            ".local/share/pnpm",
+        ].map { home.appending(path: $0) }
+        // ~/.nvm/versions/node/*/bin
+        let nvmVersions = home.appending(
+            path: ".nvm/versions/node"
+        )
+        if let versions = try? fileManager.contentsOfDirectory(
+            atPath: nvmVersions.path
+        ) {
+            directories += versions
+                .sorted()
+                .map { nvmVersions.appending(path: $0).appending(path: "bin") }
+        }
+        directories += (environment["PATH"] ?? "")
             .split(separator: ":")
-            .map(String.init)
-        for name in executableNames {
-            for directory in standardDirectories + pathDirectories {
-                let candidate = URL(filePath: directory)
-                    .appending(path: name)
+            .map { URL(filePath: String($0)) }
+        return directories
+    }
+
+    /// WorkBuddy 的 CLI 通常打包在应用内：
+    /// <app>.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy。
+    private func locateAppBundledCLI(named name: String) -> URL? {
+        guard name == "codebuddy" else { return nil }
+        let home = fileManager.homeDirectoryForCurrentUser
+        let appContainers = [
+            URL(filePath: "/Applications"),
+            home.appending(path: "Applications"),
+        ]
+        let appNames = ["WorkBuddy.app", "WorkBuddy AI.app"]
+        let relativePath =
+            "Contents/Resources/app.asar.unpacked/cli/bin/codebuddy"
+        for container in appContainers {
+            for appName in appNames {
+                let candidate = container
+                    .appending(path: appName)
+                    .appending(path: relativePath)
                 if fileManager.isExecutableFile(atPath: candidate.path) {
                     return candidate
                 }
@@ -239,7 +286,7 @@ struct AgentConversationPreferences {
 
 struct AgentConversationOutcome: Sendable {
     let reply: String
-    /// 需要持久化的会话标识（Codex thread id / Claude Code session id）。
+    /// 需要持久化的会话标识（Codex thread id / CLI session id）。
     let sessionID: String?
 }
 
@@ -253,8 +300,11 @@ final class AgentConversationService {
 
     private let locator: any AgentExecutableLocating
     private let preferences: AgentConversationPreferences
-    private let runnerFactory: @Sendable (URL) -> any CodexCommandRunning
+    private let runnerFactory:
+        @Sendable (URL) -> any CodexCommandRunning
     private var currentTask: Task<AgentConversationOutcome, Error>?
+    /// DSH 没有原生续聊，由服务内部维护的有限历史保持语境。
+    private var dshHistory: [AgentConversationMessage] = []
 
     init(
         locator: any AgentExecutableLocating = AgentExecutableLocator(),
@@ -300,12 +350,14 @@ final class AgentConversationService {
         preferences.selectedBackendID = id
         currentTask?.cancel()
         currentTask = nil
+        dshHistory = []
     }
 
     func resetSession() {
         currentTask?.cancel()
         currentTask = nil
         preferences.saveSessionID(nil, for: effectiveBackendID)
+        dshHistory = []
     }
 
     func cancel() {
@@ -340,37 +392,62 @@ final class AgentConversationService {
                 preferences.saveSessionID(sessionID, for: .codex)
             }
             return outcome.reply
-        case .claudeCode:
-            let storedSessionID = preferences.sessionID(for: .claudeCode)
+        case .dsh:
             let executableLocator = locator
             let makeRunner = runnerFactory
+            let historyForTurn = history.isEmpty ? dshHistory : history
             let prompt = text
             let outcome = try await run {
-                try await Self.sendViaClaudeCode(
+                try await Self.sendViaDSH(
                     text: prompt,
-                    sessionID: storedSessionID,
+                    history: historyForTurn,
+                    locator: executableLocator,
+                    makeRunner: makeRunner
+                )
+            }
+            dshHistory.append(
+                AgentConversationMessage(role: .user, text: text)
+            )
+            dshHistory.append(
+                AgentConversationMessage(role: .agent, text: outcome.reply)
+            )
+            return outcome.reply
+        case .claudeCode, .workbuddy, .qoder:
+            let storedSessionID = preferences.sessionID(for: id)
+            let executableLocator = locator
+            let makeRunner = runnerFactory
+            let kind = id
+            let prompt = text
+            let outcome = try await run {
+                try await Self.sendViaJSONResultCLI(
+                    kind: kind,
+                    text: prompt,
+                    storedSessionID: storedSessionID,
                     locator: executableLocator,
                     makeRunner: makeRunner
                 )
             }
             if let sessionID = outcome.sessionID {
-                preferences.saveSessionID(sessionID, for: .claudeCode)
+                preferences.saveSessionID(sessionID, for: id)
             }
             return outcome.reply
-        case .dsh:
+        case .pi:
+            let storedSessionID = preferences.sessionID(for: .pi)
             let executableLocator = locator
             let makeRunner = runnerFactory
+            let prompt = text
             let outcome = try await run {
-                try await Self.sendViaDSH(
-                    text: text,
-                    history: history,
+                try await Self.sendViaPi(
+                    text: prompt,
+                    storedSessionID: storedSessionID,
                     locator: executableLocator,
                     makeRunner: makeRunner
                 )
             }
+            if let sessionID = outcome.sessionID {
+                preferences.saveSessionID(sessionID, for: .pi)
+            }
             return outcome.reply
-        case .workbuddy, .qoder, .pi:
-            throw AgentConversationError.protocolPending(id)
         }
     }
 
@@ -472,49 +549,93 @@ final class AgentConversationService {
         (object["message"] as? String) ?? (object["text"] as? String)
     }
 
-    // MARK: - Claude Code
+    // MARK: - JSON result CLIs (Claude Code / WorkBuddy / Qoder)
 
-    /// `claude -p --output-format json --session-id <uuid>`，
-    /// 后续轮次改用 `--resume <uuid>`。
-    private static func sendViaClaudeCode(
+    /// 统一的 `-p --output-format json` 协议：读取 `result` 与 `session_id`。
+    /// 三个后端只有参数拼法不同，由 jsonResultCLIArguments 提供。
+    private static func sendViaJSONResultCLI(
+        kind: AgentConversationBackendID,
         text: String,
-        sessionID: String?,
+        storedSessionID: String?,
         locator: any AgentExecutableLocating,
         makeRunner: @Sendable (URL) -> any CodexCommandRunning
     ) async throws -> AgentConversationOutcome {
         guard
             let executable = locator.locate(
                 executableNames: AgentConversationBackends
-                    .backend(for: .claudeCode).executableNames
+                    .backend(for: kind).executableNames
             )
         else {
-            throw AgentConversationError.backendNotInstalled(.claudeCode)
+            throw AgentConversationError.backendNotInstalled(kind)
         }
-        let isResume = sessionID?.isEmpty == false
-        let session = isResume ? sessionID! : UUID().uuidString
-        var arguments = ["-p", text, "--output-format", "json"]
-        if isResume {
-            arguments += ["--resume", session]
-        } else {
-            arguments += ["--session-id", session]
-        }
+        let isResume = storedSessionID?.isEmpty == false
+        let arguments = jsonResultCLIArguments(
+            kind: kind,
+            text: text,
+            sessionID: storedSessionID,
+            isResume: isResume
+        )
         let result = try await makeRunner(executable)
             .run(arguments: arguments, standardInput: nil)
         guard result.exitCode == 0 else {
             throw AgentConversationError.emptyReply
         }
-        let parsed = parseClaudeCodeOutput(result.output)
+        let parsed = parseJSONResultOutput(result.output)
         guard let reply = parsed.reply, !reply.isEmpty else {
             throw AgentConversationError.emptyReply
         }
-        let reportedSessionID = parsed.sessionID ?? session
         return AgentConversationOutcome(
             reply: reply,
-            sessionID: reportedSessionID
+            sessionID: parsed.sessionID
         )
     }
 
-    nonisolated static func parseClaudeCodeOutput(
+    /// 各后端的命令参数协议：
+    /// - Claude Code：`claude -p <text> --output-format json
+    ///   [--session-id <uuid> | --resume <id>]`
+    /// - WorkBuddy：首次 `codebuddy -p <text> --output-format json`，
+    ///   续聊 `codebuddy -p --resume <id> <text> --output-format json`
+    /// - Qoder：首次携带生成的 `--session-id <uuid>`，续聊 `--resume <id>`
+    nonisolated static func jsonResultCLIArguments(
+        kind: AgentConversationBackendID,
+        text: String,
+        sessionID: String?,
+        isResume: Bool
+    ) -> [String] {
+        switch kind {
+        case .claudeCode:
+            var arguments = ["-p", text, "--output-format", "json"]
+            if isResume, let sessionID {
+                arguments += ["--resume", sessionID]
+            } else {
+                arguments += ["--session-id", UUID().uuidString]
+            }
+            return arguments
+        case .workbuddy:
+            if isResume, let sessionID {
+                return [
+                    "-p", "--resume", sessionID, text,
+                    "--output-format", "json",
+                ]
+            }
+            return ["-p", text, "--output-format", "json"]
+        case .qoder:
+            var arguments = [
+                "-p", text, "--output-format", "json",
+            ]
+            if isResume, let sessionID {
+                arguments += ["--resume", sessionID]
+            } else {
+                arguments += ["--session-id", UUID().uuidString]
+            }
+            return arguments
+        default:
+            return []
+        }
+    }
+
+    /// 解析 `-p --output-format json` 的输出（result + session_id）。
+    nonisolated static func parseJSONResultOutput(
         _ output: String
     ) -> (reply: String?, sessionID: String?) {
         guard
@@ -528,10 +649,129 @@ final class AgentConversationService {
         return (object["result"] as? String, object["session_id"] as? String)
     }
 
+    // MARK: - Pi
+
+    /// `pi --mode json -p <text>`，续聊追加 `--session <id>`；
+    /// 输出为 JSONL：session 事件提供 id，assistant 的
+    /// message_end/turn_end 提供最终内容，或累积 message_update 增量。
+    private static func sendViaPi(
+        text: String,
+        storedSessionID: String?,
+        locator: any AgentExecutableLocating,
+        makeRunner: @Sendable (URL) -> any CodexCommandRunning
+    ) async throws -> AgentConversationOutcome {
+        guard
+            let executable = locator.locate(
+                executableNames: AgentConversationBackends
+                    .backend(for: .pi).executableNames
+            )
+        else {
+            throw AgentConversationError.backendNotInstalled(.pi)
+        }
+        let arguments = piCLIArguments(
+            text: text,
+            sessionID: storedSessionID
+        )
+        let result = try await makeRunner(executable)
+            .run(arguments: arguments, standardInput: nil)
+        guard result.exitCode == 0 else {
+            throw AgentConversationError.emptyReply
+        }
+        let parsed = parsePiEvents(result.output)
+        guard let reply = parsed.reply, !reply.isEmpty else {
+            throw AgentConversationError.emptyReply
+        }
+        return AgentConversationOutcome(
+            reply: reply,
+            sessionID: parsed.sessionID
+        )
+    }
+
+    /// `pi --mode json -p <text>`，续聊追加 `--session <id>`。
+    nonisolated static func piCLIArguments(
+        text: String,
+        sessionID: String?
+    ) -> [String] {
+        var arguments = ["--mode", "json", "-p", text]
+        if let sessionID, !sessionID.isEmpty {
+            arguments += ["--session", sessionID]
+        }
+        return arguments
+    }
+
+    /// 解析 `pi --mode json` 的 JSONL 事件流。
+    nonisolated static func parsePiEvents(
+        _ output: String
+    ) -> (sessionID: String?, reply: String?) {
+        var sessionID: String?
+        var deltaAccumulator = ""
+        var finalReply: String?
+        for line in output.split(separator: "\n") {
+            guard
+                let data = String(line).data(using: .utf8),
+                let object = (try? JSONSerialization.jsonObject(
+                    with: data
+                )) as? [String: Any],
+                let type = object["type"] as? String
+            else {
+                continue
+            }
+            switch type {
+            case "session":
+                sessionID = object["id"] as? String ?? sessionID
+            case "message_update":
+                if let delta = object["text_delta"] as? String {
+                    deltaAccumulator += delta
+                }
+            case "message_end", "turn_end":
+                if let message = object["message"] as? [String: Any],
+                    let text = piContentText(message["content"]),
+                    !text.isEmpty
+                {
+                    finalReply = text
+                }
+            default:
+                continue
+            }
+        }
+        let reply = finalReply
+            ?? (deltaAccumulator.isEmpty ? nil : deltaAccumulator)
+        return (sessionID, reply)
+    }
+
+    /// content 可能是纯字符串，也可能是含 {type/text} 的对象数组。
+    nonisolated private static func piContentText(
+        _ content: Any?
+    ) -> String? {
+        switch content {
+        case let text as String:
+            return text
+        case let items as [Any]:
+            let text = items.compactMap { item -> String? in
+                guard let object = item as? [String: Any] else {
+                    return nil
+                }
+                if let text = object["text"] as? String, !text.isEmpty {
+                    return text
+                }
+                if (object["type"] as? String) == "text",
+                    let text = object["content"] as? String
+                {
+                    return text
+                }
+                return nil
+            }
+            .joined()
+            return text.isEmpty ? nil : text
+        default:
+            return nil
+        }
+    }
+
     // MARK: - DSH
 
     /// `dsh --profile headless <prompt>`；无原生续聊，
-    /// 由应用附带有限的最近历史保持语境。
+    /// 由服务维护的有限历史保持语境。
     private static func sendViaDSH(
         text: String,
         history: [AgentConversationMessage],
