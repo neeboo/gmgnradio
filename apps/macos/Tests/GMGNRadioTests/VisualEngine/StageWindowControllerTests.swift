@@ -605,6 +605,58 @@ func playerKeepsTheSharedAvatarSurfaceInLiveCamUntilSpaceStarts() throws {
 
 @Test
 @MainActor
+func localLivingPodSelectionSuspendsMarbleWorldPreparation() async {
+    let spatialStage = SpatialStageStore()
+    let marbleLibrary = MarbleWorldLibrary(spatialStage: spatialStage)
+
+    marbleLibrary.selectLocalWorld(
+        id: LivingPodScene.worldID,
+        scene: .djHouse
+    )
+    let preparedURL = await marbleLibrary.prepare()
+
+    #expect(preparedURL == nil)
+    #expect(spatialStage.selectedWorldID == LivingPodScene.worldID)
+    #expect(marbleLibrary.selectedWorld == nil)
+    #expect(marbleLibrary.localSplatURL == nil)
+}
+
+@Test
+func defaultSpacePreferenceStartsWithTheLivingPod() throws {
+    let suiteName = "DefaultSpacePreferenceTests-\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    #expect(
+        DefaultSpacePreference.load(defaults: defaults) == .livingPod
+    )
+    #expect(
+        DefaultSpacePreference.allCases.map(\.title) == [
+            "生活舱 01",
+            "上次使用的 Marble 空间",
+        ]
+    )
+    #expect(
+        GMGNSettingsSpacePage.sectionTitles == ["默认空间", "Marble 空间"]
+    )
+}
+
+@Test
+func defaultSpacePreferencePersistsTheLastMarbleChoice() throws {
+    let suiteName = "DefaultSpacePreferencePersistence-\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    DefaultSpacePreference.lastMarbleWorld.save(defaults: defaults)
+
+    #expect(
+        DefaultSpacePreference.load(defaults: defaults)
+            == .lastMarbleWorld
+    )
+}
+
+@Test
+@MainActor
 func stageWindowControllerIncludesAWindowModeButton() {
     let controller = StageWindowController(
         audioFeatures: VisualAudioFeatureStore()

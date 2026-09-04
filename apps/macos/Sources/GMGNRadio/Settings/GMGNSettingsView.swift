@@ -9,8 +9,50 @@ enum GMGNSettingsPage: String, CaseIterable {
 }
 
 enum GMGNSettingsSpacePage {
-    /// 系统设置只保留长期服务配置；颗粒大小等场景调节只在完整舞台的面板出现。
-    static let sectionTitles = ["Marble 空间"]
+    /// 系统设置只保留默认空间和长期服务配置；颗粒大小等场景调节只在完整舞台的面板出现。
+    static let sectionTitles = ["默认空间", "Marble 空间"]
+}
+
+enum DefaultSpacePreference: String, CaseIterable, Identifiable {
+    case livingPod = "living-pod"
+    case lastMarbleWorld = "last-marble-world"
+
+    static let defaultsKey = "space.default-selection"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .livingPod:
+            "生活舱 01"
+        case .lastMarbleWorld:
+            "上次使用的 Marble 空间"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .livingPod:
+            "内置在应用中，无需联网下载"
+        case .lastMarbleWorld:
+            "恢复你上次选择的 Marble 空间"
+        }
+    }
+
+    static func load(
+        defaults: UserDefaults = .standard
+    ) -> DefaultSpacePreference {
+        guard let rawValue = defaults.string(forKey: defaultsKey),
+              let preference = DefaultSpacePreference(rawValue: rawValue)
+        else {
+            return .livingPod
+        }
+        return preference
+    }
+
+    func save(defaults: UserDefaults = .standard) {
+        defaults.set(rawValue, forKey: Self.defaultsKey)
+    }
 }
 
 @MainActor
@@ -75,13 +117,24 @@ struct GMGNSettingsView: View {
 @MainActor
 private struct SpaceSettingsView: View {
     @Bindable var marbleAPIKey: MarbleAPIKeySettingsModel
+    @State private var defaultSpace = DefaultSpacePreference.load()
+
+    private var defaultSpaceSelection: Binding<DefaultSpacePreference> {
+        Binding(
+            get: { defaultSpace },
+            set: { value in
+                defaultSpace = value
+                value.save()
+            }
+        )
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 3) {
                 Text("空间")
                     .font(.title2.weight(.semibold))
-                Text("管理空间生成与同步服务的长期配置")
+                Text("选择默认空间，并管理空间生成服务")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -90,11 +143,23 @@ private struct SpaceSettingsView: View {
             .padding(.vertical, 18)
 
             Form {
-                ForEach(
-                    GMGNSettingsSpacePage.sectionTitles,
-                    id: \.self
-                ) { title in
-                    Section(title) {
+                Section("默认空间") {
+                    Picker("启动时进入", selection: defaultSpaceSelection) {
+                        ForEach(DefaultSpacePreference.allCases) { option in
+                            Text(option.title).tag(option)
+                        }
+                    }
+
+                    Text(defaultSpace.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Text("修改后下次启动生效。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Marble 空间") {
                         HStack(spacing: 12) {
                             Image(systemName: "cube.transparent")
                                 .font(.title3)
@@ -168,7 +233,6 @@ private struct SpaceSettingsView: View {
                                 marbleAPIKey.hasError ? .red : .secondary
                             )
                         }
-                    }
                 }
             }
             .formStyle(.grouped)

@@ -33,6 +33,7 @@ final class MarbleWorldLibrary {
     private let spatialStage: SpatialStageStore
     private var prepareTask: Task<URL?, Never>?
     private var selectionRevision: UInt64 = 0
+    private var selectedLocalWorldID: String?
 
     init(
         client: MarbleWorldClient = MarbleWorldClient(),
@@ -45,6 +46,9 @@ final class MarbleWorldLibrary {
     }
 
     func prepare() async -> URL? {
+        guard selectedLocalWorldID == nil else {
+            return nil
+        }
         if let localSplatURL {
             return localSplatURL
         }
@@ -72,6 +76,7 @@ final class MarbleWorldLibrary {
             return nil
         }
         selectionRevision &+= 1
+        selectedLocalWorldID = nil
         selectedWorld = world
         spatialStage.selectScene(
             .inferred(worldID: world.id, name: world.name)
@@ -80,6 +85,18 @@ final class MarbleWorldLibrary {
         localSplatURL = nil
         errorMessage = nil
         return await cacheSelectedWorld()
+    }
+
+    func selectLocalWorld(id: String, scene: SpatialScenePreset) {
+        selectionRevision &+= 1
+        prepareTask?.cancel()
+        prepareTask = nil
+        selectedLocalWorldID = id
+        selectedWorld = nil
+        localSplatURL = nil
+        errorMessage = nil
+        spatialStage.selectScene(scene)
+        spatialStage.selectWorld(id: id)
     }
 
     func localCollider(

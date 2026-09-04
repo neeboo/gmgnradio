@@ -1992,7 +1992,7 @@ final class AppDelegate:
             livingWorldVisualTask?.cancel()
             livingWorldVisualTask = Task { @MainActor [weak self] in
                 guard let self else { return }
-                if LivingPodScene.isLocalWorld(package.manifest.worldID) {
+                if DefaultSpacePreference.load() == .livingPod {
                     installLocalLivingPodPresentation(package: package)
                     return
                 }
@@ -2030,8 +2030,10 @@ final class AppDelegate:
     private func installLocalLivingPodPresentation(
         package: BundledLivingWorldPackage
     ) {
-        spatialStage.selectScene(.djHouse)
-        spatialStage.selectWorld(id: package.manifest.worldID)
+        marbleWorldLibrary.selectLocalWorld(
+            id: package.manifest.worldID,
+            scene: .djHouse
+        )
         if let calibration = SpatialWorldCalibration.resolve(
             worldID: package.manifest.worldID
         ) {

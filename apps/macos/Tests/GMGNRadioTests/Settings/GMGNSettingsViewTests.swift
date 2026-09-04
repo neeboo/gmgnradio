@@ -16,7 +16,9 @@ func settingsPagesKeepTheAgreedTabOrder() {
 
 @Test
 func settingsSpacePageKeepsOnlyLongTermServiceConfig() {
-    #expect(GMGNSettingsSpacePage.sectionTitles == ["Marble 空间"])
+    #expect(
+        GMGNSettingsSpacePage.sectionTitles == ["默认空间", "Marble 空间"]
+    )
     #expect(!GMGNSettingsSpacePage.sectionTitles.contains("3D 点阵"))
     #expect(!GMGNSettingsSpacePage.sectionTitles.contains("颗粒大小"))
 }
