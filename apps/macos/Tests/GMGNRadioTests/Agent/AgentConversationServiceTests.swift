@@ -80,13 +80,17 @@ private final class PromptCaptureRunner: CodexCommandRunning,
         return storage
     }
 
+    private func record(_ prompt: String) {
+        lock.lock()
+        storage.append(prompt)
+        lock.unlock()
+    }
+
     func run(
         arguments: [String],
         standardInput: String?
     ) async throws -> CodexCommandResult {
-        lock.lock()
-        storage.append(arguments.last ?? "")
-        lock.unlock()
+        record(arguments.last ?? "")
         return CodexCommandResult(exitCode: 0, output: "好的")
     }
 }
@@ -440,8 +444,8 @@ func piArgumentsUseModeJSONAndSessionResume() {
 func parsePiEventsReadsSessionIDAndFinalStringContent() {
     let output = """
         {"type":"session","id":"pi-42"}
-        {"type":"message_update","text_delta":"你"}
-        {"type":"message_update","text_delta":"好"}
+        {"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"你"}}
+        {"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"好"}}
         {"type":"message_end","message":{"content":"最终答案"}}
         """
     let parsed = AgentConversationService.parsePiEvents(output)
@@ -461,10 +465,18 @@ func parsePiEventsHandlesArrayContentAndDeltasOnly() {
 
     let deltaOnly = """
         {"type":"session","id":"pi-2"}
-        {"type":"message_update","text_delta":"增量"}
+        {"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"增量"}}
         """
     let deltaParsed = AgentConversationService.parsePiEvents(deltaOnly)
     #expect(deltaParsed.reply == "增量")
+
+    // 兼容旧顶层 text_delta 字段。
+    let legacyDelta = """
+        {"type":"session","id":"pi-3"}
+        {"type":"message_update","text_delta":"旧增量"}
+        """
+    let legacyParsed = AgentConversationService.parsePiEvents(legacyDelta)
+    #expect(legacyParsed.reply == "旧增量")
 }
 
 @MainActor

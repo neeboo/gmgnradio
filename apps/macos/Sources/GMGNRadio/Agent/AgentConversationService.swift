@@ -411,6 +411,10 @@ final class AgentConversationService {
             dshHistory.append(
                 AgentConversationMessage(role: .agent, text: outcome.reply)
             )
+            // 只保留最近 6 条，避免历史无限增长。
+            if dshHistory.count > 6 {
+                dshHistory = Array(dshHistory.suffix(6))
+            }
             return outcome.reply
         case .claudeCode, .workbuddy, .qoder:
             let storedSessionID = preferences.sessionID(for: id)
@@ -720,7 +724,15 @@ final class AgentConversationService {
             case "session":
                 sessionID = object["id"] as? String ?? sessionID
             case "message_update":
-                if let delta = object["text_delta"] as? String {
+                // 官方结构：assistantMessageEvent: {type:"text_delta",
+                // delta:"..."}；兼容顶层 text_delta 字段。
+                if let event = object["assistantMessageEvent"]
+                    as? [String: Any],
+                    (event["type"] as? String) == "text_delta",
+                    let delta = event["delta"] as? String
+                {
+                    deltaAccumulator += delta
+                } else if let delta = object["text_delta"] as? String {
                     deltaAccumulator += delta
                 }
             case "message_end", "turn_end":

@@ -431,8 +431,9 @@ final class AgentSettingsModel {
         _ id: AgentConversationBackendID
     ) {
         let conversationService = AgentConversationService.shared
+        // 只切换选择，保留各后端已保存的 session id，
+        // 便于切回时继续原会话。
         conversationService.selectBackend(id)
-        conversationService.resetSession()
         selectedConversationBackendID =
             conversationService.effectiveBackendID
         message = nil
