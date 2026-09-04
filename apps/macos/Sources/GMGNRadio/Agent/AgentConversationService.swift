@@ -425,7 +425,7 @@ final class AgentConversationService {
     }
 
     /// 解析 `codex exec --json` 的事件流。
-    nonisolated     static func parseCodexEvents(
+    nonisolated static func parseCodexEvents(
         _ output: String
     ) -> (threadID: String?, reply: String?) {
         var threadID: String?
@@ -498,10 +498,8 @@ final class AgentConversationService {
         } else {
             arguments += ["--session-id", session]
         }
-        let result = try await AgentCommandRunner(
-            executableURL: executable
-        )
-        .run(arguments: arguments, standardInput: nil)
+        let result = try await makeRunner(executable)
+            .run(arguments: arguments, standardInput: nil)
         guard result.exitCode == 0 else {
             throw AgentConversationError.emptyReply
         }
@@ -516,7 +514,7 @@ final class AgentConversationService {
         )
     }
 
-    nonisolated     static func parseClaudeCodeOutput(
+    nonisolated static func parseClaudeCodeOutput(
         _ output: String
     ) -> (reply: String?, sessionID: String?) {
         guard
@@ -561,7 +559,7 @@ final class AgentConversationService {
     }
 
     /// DSH 没有原生续聊，由应用附带有限的最近历史保持语境。
-    nonisolated     static func dshPrompt(
+    nonisolated static func dshPrompt(
         text: String,
         history: [AgentConversationMessage]
     ) -> String {
