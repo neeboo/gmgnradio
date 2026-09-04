@@ -573,8 +573,60 @@ func stageComposesTheSpatialWorldAboveParticlesWithoutCapturingInput() throws {
 }
 
 @Test
+func stageDestinationToggleFollowsTheCurrentStageMode() {
+    let spaceContent = StageDestinationContent.resolve(
+        isWorldPresentationRequested: true
+    )
+    #expect(spaceContent.title == "播放器")
+    #expect(spaceContent.symbolName == "circle.hexagongrid.fill")
+    #expect(spaceContent.accessibilityLabel == "切换到播放器")
+    #expect(
+        StageDestinationAction.resolve(isWorldPresentationRequested: true)
+            == .showPlayer
+    )
+
+    let playerContent = StageDestinationContent.resolve(
+        isWorldPresentationRequested: false
+    )
+    #expect(playerContent.title == "空间")
+    #expect(playerContent.symbolName == "cube.transparent")
+    #expect(playerContent.accessibilityLabel == "进入空间")
+    #expect(
+        StageDestinationAction.resolve(isWorldPresentationRequested: false)
+            == .enterSpace
+    )
+}
+
+@Test
+func stageVisualPickerShowsOnlyTheGroupsForTheCurrentMode() {
+    #expect(
+        StageVisualPickerGroup.visibleGroups(for: .space) == [
+            .worldSelection,
+            .avatarPlacement,
+            .loadingStatus,
+        ]
+    )
+    #expect(
+        StageVisualPickerGroup.visibleGroups(for: .player) == [
+            .lyricsEffects,
+            .pointCloud,
+            .particleSize,
+            .musicVideo,
+        ]
+    )
+    #expect(
+        StageVisualPickerMode.resolve(isWorldPresentationRequested: true)
+            == .space
+    )
+    #expect(
+        StageVisualPickerMode.resolve(isWorldPresentationRequested: false)
+            == .player
+    )
+}
+
+@Test
 @MainActor
-func spatialStageAlwaysProvidesAWorkingReturnToPointCloudControl() throws {
+func stageDestinationButtonStaysAvailableAcrossStageModes() throws {
     let spatialStage = SpatialStageStore()
     let controller = StageWindowController(
         audioFeatures: VisualAudioFeatureStore(),
@@ -586,29 +638,45 @@ func spatialStageAlwaysProvidesAWorkingReturnToPointCloudControl() throws {
     let spatialWorld = try #require(descendants.first {
         $0.identifier?.rawValue == "stage.marble-spatial-world"
     })
-    let returnButton = try #require(
+    let destinationButton = try #require(
         descendants
             .compactMap { $0 as? NSButton }
             .first {
-                $0.identifier?.rawValue == "stage.return-to-point-cloud"
+                $0.identifier?.rawValue == "stage.destination-toggle"
+            }
+    )
+    let visualButton = try #require(
+        descendants
+            .compactMap { $0 as? NSButton }
+            .first {
+                $0.identifier?.rawValue == "stage.visual-toggle"
             }
     )
 
     #expect(spatialWorld.isHidden)
-    #expect(returnButton.isHidden)
+    #expect(!destinationButton.isHidden)
+    #expect(destinationButton.title == "空间")
+    #expect(visualButton.toolTip == "选择字幕、点阵与 MV")
 
-    spatialStage.requestWorldPresentation()
+    destinationButton.performClick(nil)
+
+    #expect(spatialStage.isWorldPresentationRequested)
+    #expect(!destinationButton.isHidden)
+    #expect(destinationButton.title == "播放器")
+    #expect(visualButton.toolTip == "选择空间与人物位置")
+
     spatialStage.finishWorldPresentation()
 
     #expect(!spatialWorld.isHidden)
-    #expect(!returnButton.isHidden)
+    #expect(!destinationButton.isHidden)
 
-    returnButton.performClick(nil)
+    destinationButton.performClick(nil)
 
     #expect(!spatialStage.isWorldPresentationRequested)
-    #expect(!spatialStage.isWorldVisible)
     #expect(spatialWorld.isHidden)
-    #expect(returnButton.isHidden)
+    #expect(!destinationButton.isHidden)
+    #expect(destinationButton.title == "空间")
+    #expect(visualButton.toolTip == "选择字幕、点阵与 MV")
 
     controller.close()
 }
@@ -981,7 +1049,7 @@ func requestedWorldKeepsTheSharedSurfaceAbovePointCloudWhileLoading() {
     #expect(state.isPointCloudHidden)
     #expect(state.isWorldInteractionHidden)
     #expect(!state.isLoadingIndicatorHidden)
-    #expect(!state.isReturnToPointCloudHidden)
+    #expect(!state.isDestinationButtonHidden)
 }
 
 @Test
@@ -995,6 +1063,7 @@ func visibleWorldHidesTheLoadingIndicatorAndShowsTheSharedSurface() {
     #expect(state.isPointCloudHidden)
     #expect(!state.isWorldInteractionHidden)
     #expect(state.isLoadingIndicatorHidden)
+    #expect(!state.isDestinationButtonHidden)
 }
 
 @Test

@@ -323,7 +323,7 @@ struct StageSurfacePresentationState: Equatable {
     let isPointCloudHidden: Bool
     let isWorldInteractionHidden: Bool
     let isLoadingIndicatorHidden: Bool
-    let isReturnToPointCloudHidden: Bool
+    let isDestinationButtonHidden: Bool
 
     static func resolve(
         isWorldPresentationRequested: Bool,
@@ -335,7 +335,40 @@ struct StageSurfacePresentationState: Equatable {
             isWorldInteractionHidden: !isWorldVisible,
             isLoadingIndicatorHidden: !isWorldPresentationRequested
                 || isWorldVisible,
-            isReturnToPointCloudHidden: !isWorldPresentationRequested
+            isDestinationButtonHidden: false
+        )
+    }
+}
+
+enum StageDestinationAction: Equatable {
+    case enterSpace
+    case showPlayer
+
+    static func resolve(isWorldPresentationRequested: Bool) -> Self {
+        isWorldPresentationRequested ? .showPlayer : .enterSpace
+    }
+}
+
+struct StageDestinationContent: Equatable {
+    let title: String
+    let symbolName: String
+    let accessibilityLabel: String
+    let toolTip: String
+
+    static func resolve(isWorldPresentationRequested: Bool) -> Self {
+        if isWorldPresentationRequested {
+            return Self(
+                title: "播放器",
+                symbolName: "circle.hexagongrid.fill",
+                accessibilityLabel: "切换到播放器",
+                toolTip: "返回播放器"
+            )
+        }
+        return Self(
+            title: "空间",
+            symbolName: "cube.transparent",
+            accessibilityLabel: "进入空间",
+            toolTip: "进入空间"
         )
     }
 }
@@ -379,7 +412,7 @@ private final class StageContentView: NSView {
     private var programRail: StageProgramRailHostingView!
     private var visualPicker: StageVisualPickerHostingView!
     private var transportControls: StageTransportControlsView!
-    private var returnToPointCloudButton: StageReturnToPointCloudButton!
+    private var destinationButton: StageDestinationButton!
     private var worldVisibilityObserverID: UUID?
     private var isProgramRailVisible = false
     private var isVisualPickerVisible = false
@@ -581,13 +614,20 @@ private final class StageContentView: NSView {
         transportControls.layer?.zPosition = 20
         addSubview(transportControls)
 
-        returnToPointCloudButton = StageReturnToPointCloudButton {
-            spatialStage.exitWorld()
+        destinationButton = StageDestinationButton { [spatialStage] in
+            switch StageDestinationAction.resolve(
+                isWorldPresentationRequested:
+                    spatialStage.isWorldPresentationRequested
+            ) {
+            case .enterSpace:
+                spatialStage.requestWorldPresentation()
+            case .showPlayer:
+                spatialStage.exitWorld()
+            }
         }
-        returnToPointCloudButton.translatesAutoresizingMaskIntoConstraints = false
-        returnToPointCloudButton.layer?.zPosition = 21
-        returnToPointCloudButton.isHidden = true
-        addSubview(returnToPointCloudButton)
+        destinationButton.translatesAutoresizingMaskIntoConstraints = false
+        destinationButton.layer?.zPosition = 21
+        addSubview(destinationButton)
 
         NSLayoutConstraint.activate([
             transportControls.trailingAnchor.constraint(
@@ -624,21 +664,27 @@ private final class StageContentView: NSView {
             visualPicker.widthAnchor.constraint(equalToConstant: 590),
             visualPicker.heightAnchor.constraint(equalToConstant: 458),
 
-            returnToPointCloudButton.trailingAnchor.constraint(
+            destinationButton.trailingAnchor.constraint(
                 equalTo: trailingAnchor,
                 constant: -22
             ),
-            returnToPointCloudButton.topAnchor.constraint(
+            destinationButton.topAnchor.constraint(
                 equalTo: topAnchor,
                 constant: 28
             ),
-            returnToPointCloudButton.widthAnchor.constraint(
+            destinationButton.widthAnchor.constraint(
                 equalToConstant: 112
             ),
-            returnToPointCloudButton.heightAnchor.constraint(
+            destinationButton.heightAnchor.constraint(
                 equalToConstant: 38
             )
         ])
+        destinationButton.apply(
+            StageDestinationContent.resolve(
+                isWorldPresentationRequested:
+                    spatialStage.isWorldPresentationRequested
+            )
+        )
 
         startObservingSpatialPresentation()
     }
@@ -733,8 +779,19 @@ private final class StageContentView: NSView {
             window?.makeFirstResponder(metalView)
         }
         renderSurfaceController.setWorldPresentationVisible(isWorldVisible)
-        returnToPointCloudButton.isHidden =
-            state.isReturnToPointCloudHidden
+        destinationButton.isHidden = state.isDestinationButtonHidden
+        destinationButton.apply(
+            StageDestinationContent.resolve(
+                isWorldPresentationRequested:
+                    spatialStage.isWorldPresentationRequested
+            )
+        )
+        transportControls.setVisualPickerMode(
+            StageVisualPickerMode.resolve(
+                isWorldPresentationRequested:
+                    spatialStage.isWorldPresentationRequested
+            )
+        )
         StageWindowController.log.notice(
             "Applied stage presentation requested=\(self.spatialStage.isWorldPresentationRequested, privacy: .public) visible=\(isWorldVisible, privacy: .public) worldHidden=\(state.isSpatialWorldHidden, privacy: .public) pointCloudHidden=\(state.isPointCloudHidden, privacy: .public) loadingHidden=\(state.isLoadingIndicatorHidden, privacy: .public)"
         )
@@ -1241,12 +1298,17 @@ private final class StageTransportControlsView: NSVisualEffectView {
     func setVisualPickerExpanded(_ isExpanded: Bool) {
         visualButton.setExpanded(isExpanded)
     }
+
+    func setVisualPickerMode(_ mode: StageVisualPickerMode) {
+        visualButton.setStageMode(mode)
+    }
 }
 
 @MainActor
 private final class StageVisualButton: NSButton {
     private let handler: @MainActor () -> Void
     private var isExpanded = false
+    private var stageMode: StageVisualPickerMode = .player
 
     override var alignmentRectInsets: NSEdgeInsets {
         NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
@@ -1275,13 +1337,26 @@ private final class StageVisualButton: NSButton {
         updateContent()
     }
 
+    func setStageMode(_ mode: StageVisualPickerMode) {
+        guard stageMode != mode else { return }
+        stageMode = mode
+        updateContent()
+    }
+
     @objc
     private func performAction() {
         handler()
     }
 
     private func updateContent() {
-        let label = isExpanded ? "收起视觉选择" : "选择字幕、点阵与 MV"
+        let collapsedLabel: String
+        switch stageMode {
+        case .space:
+            collapsedLabel = "选择空间与人物位置"
+        case .player:
+            collapsedLabel = "选择字幕、点阵与 MV"
+        }
+        let label = isExpanded ? "收起视觉选择" : collapsedLabel
         let configuration = NSImage.SymbolConfiguration(
             pointSize: 14,
             weight: .medium
@@ -1314,14 +1389,14 @@ private final class StageVisualButton: NSButton {
 }
 
 @MainActor
-private final class StageReturnToPointCloudButton: NSButton {
+final class StageDestinationButton: NSButton {
     private let handler: @MainActor () -> Void
 
     init(action: @escaping @MainActor () -> Void) {
         handler = action
         super.init(frame: .zero)
         identifier = NSUserInterfaceItemIdentifier(
-            "stage.return-to-point-cloud"
+            "stage.destination-toggle"
         )
         target = self
         self.action = #selector(performAction)
@@ -1341,17 +1416,8 @@ private final class StageReturnToPointCloudButton: NSButton {
         ).cgColor
         layer?.borderWidth = 1
 
-        let configuration = NSImage.SymbolConfiguration(
-            pointSize: 12,
-            weight: .semibold
-        )
-        image = NSImage(
-            systemSymbolName: "circle.hexagongrid.fill",
-            accessibilityDescription: "返回 3D 点阵"
-        )?.withSymbolConfiguration(configuration)
         imagePosition = .imageLeading
         imageHugsTitle = true
-        title = "3D 点阵"
         font = .systemFont(ofSize: 11, weight: .semibold)
         contentTintColor = NSColor(
             calibratedRed: 0.48,
@@ -1359,12 +1425,25 @@ private final class StageReturnToPointCloudButton: NSButton {
             blue: 1,
             alpha: 1
         )
-        toolTip = "返回 3D 点阵"
-        setAccessibilityLabel("返回 3D 点阵")
+        apply(StageDestinationContent.resolve(isWorldPresentationRequested: false))
     }
 
     required init?(coder: NSCoder) {
         nil
+    }
+
+    func apply(_ content: StageDestinationContent) {
+        let configuration = NSImage.SymbolConfiguration(
+            pointSize: 12,
+            weight: .semibold
+        )
+        image = NSImage(
+            systemSymbolName: content.symbolName,
+            accessibilityDescription: content.accessibilityLabel
+        )?.withSymbolConfiguration(configuration)
+        title = content.title
+        toolTip = content.toolTip
+        setAccessibilityLabel(content.accessibilityLabel)
     }
 
     @objc

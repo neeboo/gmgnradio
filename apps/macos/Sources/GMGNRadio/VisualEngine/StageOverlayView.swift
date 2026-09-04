@@ -1897,6 +1897,36 @@ final class StageOverlayState: ObservableObject {
     }
 }
 
+enum StageVisualPickerMode: Equatable {
+    case space
+    case player
+
+    static func resolve(isWorldPresentationRequested: Bool) -> Self {
+        isWorldPresentationRequested ? .space : .player
+    }
+}
+
+enum StageVisualPickerGroup: Equatable {
+    case worldSelection
+    case avatarPlacement
+    case loadingStatus
+    case lyricsEffects
+    case pointCloud
+    case particleSize
+    case musicVideo
+
+    static func visibleGroups(
+        for mode: StageVisualPickerMode
+    ) -> [Self] {
+        switch mode {
+        case .space:
+            [.worldSelection, .avatarPlacement, .loadingStatus]
+        case .player:
+            [.lyricsEffects, .pointCloud, .particleSize, .musicVideo]
+        }
+    }
+}
+
 @MainActor
 struct StageVisualPickerView: View {
     @ObservedObject var lyrics: StageLyricsStore
@@ -1917,136 +1947,162 @@ struct StageVisualPickerView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            pickerHeader("舞台模式", symbol: "rectangle.3.group")
+            let groups = StageVisualPickerGroup.visibleGroups(
+                for: StageVisualPickerMode.resolve(
+                    isWorldPresentationRequested:
+                        spatialStage.isWorldPresentationRequested
+                )
+            )
 
-            HStack(spacing: 6) {
-                stageModeButton(
-                    title: "3D 点阵",
-                    subtitle: "封面、粒子与歌词",
-                    symbol: "circle.hexagongrid.fill",
-                    isSelected: !spatialStage.isWorldPresentationRequested
-                ) {
-                    spatialStage.exitWorld()
-                }
-                stageModeButton(
-                    title: "空间舞台",
-                    subtitle: spatialStage.isWorldVisible
-                        ? "WASD 探索中"
-                        : "进入可探索场景",
-                    symbol: "cube.transparent",
-                    isSelected: spatialStage.isWorldPresentationRequested,
-                    showsProgress: spatialStage.isWorldPresentationRequested
-                        && !spatialStage.isWorldVisible
-                ) {
-                    enterSelectedWorld()
-                }
+            if groups.contains(.worldSelection) {
+                worldSelectionGroup
             }
+            if groups.contains(.avatarPlacement) {
+                avatarPlacementGroup
+            }
+            if groups.contains(.loadingStatus) {
+                loadingStatusGroup
+            }
+            if groups.contains(.lyricsEffects) {
+                lyricsEffectsGroup
+            }
+            if groups.contains(.pointCloud) {
+                pointCloudGroup
+            }
+            if groups.contains(.particleSize) {
+                particleSizeGroup
+            }
+            if groups.contains(.musicVideo) {
+                musicVideoGroup
+            }
+        }
+        .padding(12)
+        .background {
+            RoundedRectangle(cornerRadius: 24)
+                .fill(.ultraThinMaterial)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 24)
+                        .stroke(.white.opacity(0.14), lineWidth: 1)
+                }
+        }
+        .shadow(color: .black.opacity(0.5), radius: 24, y: 10)
+        .padding(7)
+    }
 
-            if spatialStage.isWorldPresentationRequested {
-                Menu {
-                    Section("公开空间") {
-                        ForEach(marbleLibrary.publicExampleWorlds) { world in
-                            Button {
-                                enter(worldID: world.id)
-                            } label: {
-                                if marbleLibrary.selectedWorld?.id == world.id {
-                                    Label(world.name, systemImage: "checkmark")
-                                } else {
-                                    Text(world.name)
-                                }
-                            }
+    private var worldSelectionGroup: some View {
+        Menu {
+            Section("公开空间") {
+                ForEach(marbleLibrary.publicExampleWorlds) { world in
+                    Button {
+                        enter(worldID: world.id)
+                    } label: {
+                        if marbleLibrary.selectedWorld?.id == world.id {
+                            Label(world.name, systemImage: "checkmark")
+                        } else {
+                            Text(world.name)
                         }
                     }
-                    Section("生成场景") {
-                        ForEach(SpatialScenePreset.allCases) { preset in
-                            Button {
-                                activate(preset: preset)
-                            } label: {
-                                Label(preset.displayName, systemImage: preset.symbolName)
-                            }
-                        }
-                    }
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "globe.americas.fill")
-                        Text(
-                            marbleLibrary.selectedWorld?.isPublicExample == true
-                                ? marbleLibrary.selectedWorld?.name ?? "公开空间"
-                                : "公开空间 · 无需生成"
-                        )
-                        Spacer()
-                        Image(systemName: "chevron.up.chevron.down")
-                            .font(.system(size: 9, weight: .bold))
-                    }
-                    .font(.system(size: 10, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.68))
-                    .padding(.horizontal, 12)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 34)
-                    .background {
-                        RoundedRectangle(cornerRadius: 12)
-                            .fill(Color.white.opacity(0.045))
-                    }
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 12)
-                            .stroke(Color.white.opacity(0.07), lineWidth: 1)
+                }
+            }
+            Section("生成场景") {
+                ForEach(SpatialScenePreset.allCases) { preset in
+                    Button {
+                        activate(preset: preset)
+                    } label: {
+                        Label(preset.displayName, systemImage: preset.symbolName)
                     }
                 }
-                .menuStyle(.borderlessButton)
-                .frame(maxWidth: .infinity)
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "globe.americas.fill")
+                Text(
+                    marbleLibrary.selectedWorld?.isPublicExample == true
+                        ? marbleLibrary.selectedWorld?.name ?? "公开空间"
+                        : "公开空间 · 无需生成"
+                )
+                Spacer()
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 9, weight: .bold))
+            }
+            .font(.system(size: 10, weight: .semibold, design: .rounded))
+            .foregroundStyle(.white.opacity(0.68))
+            .padding(.horizontal, 12)
+            .frame(maxWidth: .infinity)
+            .frame(height: 34)
+            .background {
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(Color.white.opacity(0.045))
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(Color.white.opacity(0.07), lineWidth: 1)
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .frame(maxWidth: .infinity)
+    }
 
-                pickerHeader("人物位置", symbol: "figure.stand")
+    private var avatarPlacementGroup: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            pickerHeader("人物位置", symbol: "figure.stand")
 
-                VStack(spacing: 5) {
-                    avatarPositionSlider(
-                        axis: .x,
-                        range: -2 ... 2,
-                        accessibilityLabel: "人物左右位置"
-                    )
-                    avatarPositionSlider(
-                        axis: .y,
-                        range: -2 ... 2,
-                        accessibilityLabel: "人物上下位置"
-                    )
-                    avatarPositionSlider(
-                        axis: .z,
-                        range: -3 ... 3,
-                        accessibilityLabel: "人物前后位置"
-                    )
-                }
-
-                HStack {
-                    Text("点云空间无碰撞，坐标会按当前空间保存")
-                        .foregroundStyle(.white.opacity(0.36))
-                    Spacer()
-                    Button("重置") {
-                        spatialStage.resetAvatarPosition()
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.cyan.opacity(0.78))
-                }
-                .font(.system(size: 9, weight: .medium, design: .rounded))
+            VStack(spacing: 5) {
+                avatarPositionSlider(
+                    axis: .x,
+                    range: -2 ... 2,
+                    accessibilityLabel: "人物左右位置"
+                )
+                avatarPositionSlider(
+                    axis: .y,
+                    range: -2 ... 2,
+                    accessibilityLabel: "人物上下位置"
+                )
+                avatarPositionSlider(
+                    axis: .z,
+                    range: -3 ... 3,
+                    accessibilityLabel: "人物前后位置"
+                )
             }
 
-            if spatialStage.isWorldPresentationRequested,
-                !spatialStage.isWorldVisible
-            {
-                Label("正在载入空间，完成后自动进入…", systemImage: "cube.transparent")
-                    .font(.system(size: 10, weight: .medium, design: .rounded))
-                    .foregroundStyle(.cyan.opacity(0.72))
-                    .lineLimit(1)
-            } else if let message = marbleLibrary.generationMessage {
-                Label(message, systemImage: "sparkles")
-                    .font(.system(size: 10, weight: .medium, design: .rounded))
-                    .foregroundStyle(.cyan.opacity(0.72))
-                    .lineLimit(1)
-            } else if let message = marbleLibrary.errorMessage {
-                Label(message, systemImage: "exclamationmark.triangle.fill")
-                    .font(.system(size: 10, weight: .medium, design: .rounded))
-                    .foregroundStyle(.orange.opacity(0.78))
-                    .lineLimit(1)
+            HStack {
+                Text("点云空间无碰撞，坐标会按当前空间保存")
+                    .foregroundStyle(.white.opacity(0.36))
+                Spacer()
+                Button("重置") {
+                    spatialStage.resetAvatarPosition()
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.cyan.opacity(0.78))
             }
+            .font(.system(size: 9, weight: .medium, design: .rounded))
+        }
+    }
 
+    @ViewBuilder
+    private var loadingStatusGroup: some View {
+        if spatialStage.isWorldPresentationRequested,
+            !spatialStage.isWorldVisible
+        {
+            Label("正在载入空间，完成后自动进入…", systemImage: "cube.transparent")
+                .font(.system(size: 10, weight: .medium, design: .rounded))
+                .foregroundStyle(.cyan.opacity(0.72))
+                .lineLimit(1)
+        } else if let message = marbleLibrary.generationMessage {
+            Label(message, systemImage: "sparkles")
+                .font(.system(size: 10, weight: .medium, design: .rounded))
+                .foregroundStyle(.cyan.opacity(0.72))
+                .lineLimit(1)
+        } else if let message = marbleLibrary.errorMessage {
+            Label(message, systemImage: "exclamationmark.triangle.fill")
+                .font(.system(size: 10, weight: .medium, design: .rounded))
+                .foregroundStyle(.orange.opacity(0.78))
+                .lineLimit(1)
+        }
+    }
+
+    private var lyricsEffectsGroup: some View {
+        VStack(alignment: .leading, spacing: 12) {
             pickerHeader("字幕特效", symbol: "captions.bubble")
 
             LazyVGrid(columns: lyricColumns, spacing: 6) {
@@ -2060,7 +2116,11 @@ struct StageVisualPickerView: View {
                     }
                 }
             }
+        }
+    }
 
+    private var pointCloudGroup: some View {
+        VStack(alignment: .leading, spacing: 12) {
             pickerHeader("3D 点阵", symbol: "circle.hexagongrid")
 
             LazyVGrid(columns: pointCloudColumns, spacing: 6) {
@@ -2076,37 +2136,43 @@ struct StageVisualPickerView: View {
                     }
                 }
             }
+        }
+    }
 
-            HStack(spacing: 10) {
-                Image(systemName: "circle.grid.2x2.fill")
-                    .foregroundStyle(.white.opacity(0.46))
-                Slider(
-                    value: Binding(
-                        get: {
-                            Double(visualDirections.particleSizeMultiplier)
-                        },
-                        set: {
-                            visualDirections.setParticleSizeMultiplier(
-                                Float($0)
-                            )
-                        }
-                    ),
-                    in: Double(StageParticleSizing.manualRange.lowerBound)
-                        ... Double(StageParticleSizing.manualRange.upperBound)
-                )
-                .tint(.cyan.opacity(0.86))
-                .accessibilityLabel("颗粒大小")
-                Text(
-                    "\(Int(visualDirections.particleSizeMultiplier * 100))%"
-                )
-                .monospacedDigit()
-                .frame(width: 38, alignment: .trailing)
-                .foregroundStyle(.white.opacity(0.5))
-            }
-            .font(.system(size: 11, weight: .semibold, design: .rounded))
-            .padding(.horizontal, 10)
-            .frame(height: 24)
+    private var particleSizeGroup: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "circle.grid.2x2.fill")
+                .foregroundStyle(.white.opacity(0.46))
+            Slider(
+                value: Binding(
+                    get: {
+                        Double(visualDirections.particleSizeMultiplier)
+                    },
+                    set: {
+                        visualDirections.setParticleSizeMultiplier(
+                            Float($0)
+                        )
+                    }
+                ),
+                in: Double(StageParticleSizing.manualRange.lowerBound)
+                    ... Double(StageParticleSizing.manualRange.upperBound)
+            )
+            .tint(.cyan.opacity(0.86))
+            .accessibilityLabel("颗粒大小")
+            Text(
+                "\(Int(visualDirections.particleSizeMultiplier * 100))%"
+            )
+            .monospacedDigit()
+            .frame(width: 38, alignment: .trailing)
+            .foregroundStyle(.white.opacity(0.5))
+        }
+        .font(.system(size: 11, weight: .semibold, design: .rounded))
+        .padding(.horizontal, 10)
+        .frame(height: 24)
+    }
 
+    private var musicVideoGroup: some View {
+        VStack(alignment: .leading, spacing: 12) {
             pickerHeader("MV 场景", symbol: "film.stack")
 
             HStack(spacing: 6) {
@@ -2213,17 +2279,6 @@ struct StageVisualPickerView: View {
                 .menuStyle(.borderlessButton)
             }
         }
-        .padding(12)
-        .background {
-            RoundedRectangle(cornerRadius: 24)
-                .fill(.ultraThinMaterial)
-                .overlay {
-                    RoundedRectangle(cornerRadius: 24)
-                        .stroke(.white.opacity(0.14), lineWidth: 1)
-                }
-        }
-        .shadow(color: .black.opacity(0.5), radius: 24, y: 10)
-        .padding(7)
     }
 
     private func pickerHeader(
@@ -2329,87 +2384,6 @@ struct StageVisualPickerView: View {
             }
         }
         .buttonStyle(.plain)
-    }
-
-    private func stageModeButton(
-        title: String,
-        subtitle: String,
-        symbol: String,
-        isSelected: Bool,
-        showsProgress: Bool = false,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            HStack(spacing: 10) {
-                if showsProgress {
-                    ProgressView()
-                        .controlSize(.small)
-                        .frame(width: 20)
-                } else {
-                    Image(systemName: symbol)
-                        .font(.system(size: 15, weight: .semibold))
-                        .frame(width: 20)
-                }
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(.system(
-                            size: 11,
-                            weight: .bold,
-                            design: .rounded
-                        ))
-                    Text(subtitle)
-                        .font(.system(
-                            size: 9,
-                            weight: .medium,
-                            design: .rounded
-                        ))
-                        .foregroundStyle(.white.opacity(0.4))
-                }
-                Spacer()
-                if isSelected, !showsProgress {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 12, weight: .bold))
-                }
-            }
-            .foregroundStyle(
-                isSelected
-                    ? Color(red: 0.48, green: 0.95, blue: 1)
-                    : Color.white.opacity(0.68)
-            )
-            .padding(.horizontal, 12)
-            .frame(maxWidth: .infinity)
-            .frame(height: 46)
-            .background {
-                RoundedRectangle(cornerRadius: 14)
-                    .fill(
-                        isSelected
-                            ? Color.cyan.opacity(0.16)
-                            : Color.white.opacity(0.045)
-                    )
-            }
-            .overlay {
-                RoundedRectangle(cornerRadius: 14)
-                    .stroke(
-                        isSelected
-                            ? Color.cyan.opacity(0.52)
-                            : Color.white.opacity(0.07),
-                        lineWidth: 1
-                    )
-            }
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func enterSelectedWorld() {
-        guard !spatialStage.isWorldPresentationRequested else {
-            return
-        }
-        let worldID = marbleLibrary.selectedWorld?.id
-            ?? marbleLibrary.publicExampleWorlds.first?.id
-        guard let worldID else {
-            return
-        }
-        enter(worldID: worldID)
     }
 
     private func activate(preset: SpatialScenePreset) {
