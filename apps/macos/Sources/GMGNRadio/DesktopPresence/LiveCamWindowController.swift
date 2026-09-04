@@ -1,19 +1,5 @@
 import AppKit
 
-enum LiveCamChatError: LocalizedError {
-    case voiceSessionConnecting
-    case voiceSessionUnavailable
-
-    var errorDescription: String? {
-        switch self {
-        case .voiceSessionConnecting:
-            "Agent 还在连接，稍等一下再发送。"
-        case .voiceSessionUnavailable:
-            "先点麦克风连接 Agent，再发送文字。"
-        }
-    }
-}
-
 @MainActor
 final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
     private enum Constants {

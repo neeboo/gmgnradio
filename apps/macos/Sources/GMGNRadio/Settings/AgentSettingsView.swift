@@ -120,6 +120,58 @@ struct AgentSettingsView: View {
                     }
                 }
 
+                Section("Agent 聊天后端") {
+                    Picker(
+                        "后端",
+                        selection: Binding(
+                            get: {
+                                model.selectedConversationBackendID
+                            },
+                            set: { model.selectConversationBackend($0) }
+                        )
+                    ) {
+                        ForEach(
+                            AgentConversationBackends.all
+                        ) { backend in
+                            Text(
+                                backend.displayName
+                                    + (
+                                        model
+                                            .isConversationBackendInstalled(
+                                                backend.kind
+                                            )
+                                            ? "" : "（未安装）"
+                                    )
+                            )
+                            .tag(backend.kind)
+                        }
+                    }
+
+                    Text(model.conversationBackendStatusText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Toggle(
+                        isOn: Binding(
+                            get: { model.autoSpeakAgentReplies },
+                            set: {
+                                model.setAutoSpeakAgentReplies($0)
+                            }
+                        )
+                    ) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("自动朗读 Agent 回复")
+                            Text("使用系统语音朗读文字回复，与实时语音相互独立。")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Text("Live Cam 的文字聊天直接走这里选定的后端，无需连接实时语音。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("DJ 声音") {
                     Picker(
                         "服务",
@@ -179,6 +231,10 @@ struct AgentSettingsView: View {
                     }
 
                     Text(providerHelpText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Text("实时语音为实验功能，仅影响麦克风语音对话；Live Cam 文字聊天无需连接这里。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

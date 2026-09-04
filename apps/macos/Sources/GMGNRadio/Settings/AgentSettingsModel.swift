@@ -350,6 +350,13 @@ final class AgentSettingsModel {
     var takeoverEnabled: Bool
     var planningModel: String
 
+    // MARK: Agent 聊天后端（Live Cam 文字聊天）
+
+    var installedConversationBackendIDs:
+        Set<AgentConversationBackendID> = []
+    var selectedConversationBackendID: AgentConversationBackendID = .codex
+    var autoSpeakAgentReplies = true
+
     var voiceID: String {
         get { elevenLabsVoiceID }
         set { elevenLabsVoiceID = newValue }
@@ -402,6 +409,61 @@ final class AgentSettingsModel {
         voiceAccessToken = voice.accessToken ?? ""
         voiceResourceID = voice.resourceID ?? ""
         voiceMicrophoneDeviceID = voice.microphoneDeviceID ?? ""
+
+        let conversationService = AgentConversationService.shared
+        installedConversationBackendIDs = Set(
+            conversationService.installedBackends().map(\.kind)
+        )
+        selectedConversationBackendID =
+            conversationService.effectiveBackendID
+        autoSpeakAgentReplies =
+            conversationService.preferenceStore.autoSpeakReplies
+    }
+
+    func refreshConversationBackends() {
+        let conversationService = AgentConversationService.shared
+        installedConversationBackendIDs = Set(
+            conversationService.installedBackends().map(\.kind)
+        )
+    }
+
+    func selectConversationBackend(
+        _ id: AgentConversationBackendID
+    ) {
+        let conversationService = AgentConversationService.shared
+        conversationService.selectBackend(id)
+        conversationService.resetSession()
+        selectedConversationBackendID =
+            conversationService.effectiveBackendID
+        message = nil
+        hasError = false
+    }
+
+    func setAutoSpeakAgentReplies(_ enabled: Bool) {
+        autoSpeakAgentReplies = enabled
+        AgentConversationService.shared.preferenceStore
+            .autoSpeakReplies = enabled
+    }
+
+    func isConversationBackendInstalled(
+        _ id: AgentConversationBackendID
+    ) -> Bool {
+        installedConversationBackendIDs.contains(id)
+    }
+
+    var conversationBackendStatusText: String {
+        let installed = installedConversationBackendIDs
+        if installed.isEmpty {
+            return "未检测到任何已安装的 Agent 后端。"
+        }
+        return "已安装："
+            + installed
+            .sorted {
+                (AgentConversationBackends.preferredOrder.firstIndex(of: $0) ?? 0)
+                    < (AgentConversationBackends.preferredOrder.firstIndex(of: $1) ?? 0)
+            }
+            .map { AgentConversationBackends.backend(for: $0).displayName }
+            .joined(separator: "、")
     }
 
     func load() async {

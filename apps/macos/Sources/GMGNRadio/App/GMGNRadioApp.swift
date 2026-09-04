@@ -484,6 +484,9 @@ final class AppDelegate:
     private let agentPreferences = DJAgentPreferences()
     private let realtimeVoicePreferences = RealtimeVoicePreferences()
     private let realtimeDJSessionController = RealtimeDJSessionController()
+    private lazy var agentSpeechAnnouncer = AgentSpeechAnnouncer(
+        synthesizer: MacSpeechSynthesizer()
+    )
     private let shortcutSettings = GMGNShortcutSettingsStore()
     private var shortcutCoordinator: GMGNShortcutCoordinator?
 
@@ -2305,7 +2308,7 @@ final class AppDelegate:
                 },
                 onSendMessage: { [weak self] message in
                     guard let self else { return }
-                    try await self.sendLiveCamMessage(message)
+                    await self.sendLiveCamMessage(message)
                 },
                 onToggleVoice: { [weak self] in
                     self?.toggleRealtimeVoiceFromStage()
@@ -2349,11 +2352,15 @@ final class AppDelegate:
                     stageWindowController?.setVoiceLevel(0)
                     setRealtimeVoiceState(.connected)
                 case .agentResponseStarted:
-                    liveCamWindowController?.beginAgentReply()
-                case let .agentTranscriptDelta(text):
-                    liveCamWindowController?.appendAgentReply(text)
+                    // Live Cam 文字聊天由 AgentConversationService 负责，
+                    // 不再消费实时语音事件作为正式回复。
+                    break
+                case .agentTranscriptDelta:
+                    break
                 case let .agentTranscriptFinal(text):
-                    liveCamWindowController?.finishAgentReply(text)
+                    playbackLogger.info(
+                        "语音 Agent 转写：\(text, privacy: .public)"
+                    )
                 case let .userTranscriptFinal(text):
                     playbackLogger.info(
                         "用户最终转写：\(text, privacy: .public)"
@@ -2661,15 +2668,24 @@ final class AppDelegate:
         liveCamWindowController?.setVoiceState(state)
     }
 
-    private func sendLiveCamMessage(_ message: String) async throws {
-        switch RealtimeVoiceStatusStore.shared.state {
-        case .connecting:
-            throw LiveCamChatError.voiceSessionConnecting
-        case .connected, .listening, .speaking:
-            try await realtimeDJSessionController.requestAgentResponse(message)
-        case .disconnected, .failed:
-            throw LiveCamChatError.voiceSessionUnavailable
+    /// Live Cam 文字聊天：直连 AgentConversationService，
+    /// 不依赖实时语音连接状态。
+    private func sendLiveCamMessage(_ message: String) async {
+        liveCamWindowController?.beginAgentReply()
+        let reply: String
+        do {
+            reply = try await AgentConversationService.shared.send(message)
+        } catch {
+            liveCamWindowController?.showChatStatus(
+                (error as? LocalizedError)?.errorDescription
+                    ?? "消息发送失败，请稍后再试。"
+            )
+            return
         }
+        liveCamWindowController?.finishAgentReply(reply)
+        agentSpeechAnnouncer.isEnabled =
+            AgentConversationService.shared.preferenceStore.autoSpeakReplies
+        agentSpeechAnnouncer.announce(reply)
     }
 
     private func updateStageProgramNavigation() {
