@@ -442,8 +442,7 @@ final class AgentSettingsModel {
 
     func setAutoSpeakAgentReplies(_ enabled: Bool) {
         autoSpeakAgentReplies = enabled
-        AgentConversationService.shared.preferenceStore
-            .autoSpeakReplies = enabled
+        AgentConversationService.shared.setAutoSpeakReplies(enabled)
     }
 
     func isConversationBackendInstalled(

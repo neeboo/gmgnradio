@@ -12,6 +12,8 @@ enum AgentConversationBackendID:
     case workbuddy
     case qoder
     case pi
+
+    var id: Self { self }
 }
 
 struct AgentConversationBackend: Sendable, Equatable, Identifiable {
@@ -120,7 +122,7 @@ protocol AgentExecutableLocating: Sendable {
 
 /// 探测系统标准目录、PATH 以及常见的用户安装目录；
 /// 不依赖固定用户目录结构，存在才采用。
-struct AgentExecutableLocator: AgentExecutableLocating {
+struct AgentExecutableLocator: AgentExecutableLocating, @unchecked Sendable {
     private let fileManager: FileManager
     private let environment: [String: String]
 
@@ -299,7 +301,7 @@ final class AgentConversationService {
     static let shared = AgentConversationService()
 
     private let locator: any AgentExecutableLocating
-    private let preferences: AgentConversationPreferences
+    private var preferences: AgentConversationPreferences
     private let runnerFactory:
         @Sendable (URL) -> any CodexCommandRunning
     private var currentTask: Task<AgentConversationOutcome, Error>?
@@ -319,6 +321,10 @@ final class AgentConversationService {
 
     var preferenceStore: AgentConversationPreferences {
         preferences
+    }
+
+    func setAutoSpeakReplies(_ enabled: Bool) {
+        preferences.autoSpeakReplies = enabled
     }
 
     // MARK: Installation
