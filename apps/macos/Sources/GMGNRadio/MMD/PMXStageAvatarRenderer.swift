@@ -202,6 +202,626 @@ enum PMXWarmKitchenCoffeeCup {
     }
 }
 
+/// The avatar's built-in local world: a low-poly cosmic living pod assembled
+/// from SceneKit primitives only (no downloads, textures, or Marble SPZ).
+/// The room factory is pure presentation — collisions, waypoints and activity
+/// anchors stay in the world manifest — and every zone keeps a stable,
+/// recursively findable node name so it can later be swapped for a GLB.
+enum LivingPodScene {
+    static let worldID = "gmgn-living-pod-v1"
+
+    /// The pod is the bundled local space; downloaded Marble worlds are not.
+    static func isLocalWorld(_ worldID: String?) -> Bool {
+        worldID == Self.worldID
+    }
+
+    // MARK: - Shared gameplay/presentation calibration
+    //
+    // The pod renders in the same metre space its world manifest describes, so
+    // these numbers mirror apps/macos/Resources/Worlds/living-pod-v1/world.json
+    // and feed `SpatialWorldCalibration.resolve` for camera and avatar startup.
+
+    /// Top of the deck slab (`hull-floor`), the walkable ground plane.
+    static let floorTopY: Float = 0.12
+    /// Front-deck spawn in front of the room's open side.
+    static let spawnPosition = SIMD3<Float>(0, floorTopY, 1.1)
+    /// Yaw heading of the authored spawn quaternion (w 0.944, y 0.329).
+    static let spawnYaw: Float = 0.67
+    /// Establishing camera on the front apron, looking into the pod.
+    static let presentationCameraPosition = SIMD3<Float>(0, 1.35, 3.05)
+
+    /// The pod renders only while the full stage draws a world, and only when
+    /// that world is the local living pod. Live Cam never draws the cabin.
+    static func shouldDisplay(worldID: String?, drawsWorld: Bool) -> Bool {
+        drawsWorld && isLocalWorld(worldID)
+    }
+
+    // MARK: - Room factory
+
+    /// Builds an open-front stage cabin named `gmgn-living-pod-room`. Dark gray
+    /// hull with warm amber living lights and sparse cyan equipment lights; the
+    /// floor center stays clear so an avatar can stand at the origin.
+    static func makeRoomNode() -> SCNNode {
+        let room = SCNNode()
+        room.name = "gmgn-living-pod-room"
+        appendHull(to: room)
+        room.addChildNode(makeSleepPod())
+        room.addChildNode(makeWorkbenchConsole())
+        room.addChildNode(makeJukebox())
+        room.addChildNode(makeCoffeeMachine())
+        room.addChildNode(makeViewport())
+        room.addChildNode(makeAirlock())
+        return room
+    }
+
+    // MARK: - Hull
+
+    private static func appendHull(to room: SCNNode) {
+        let hull = material(
+            diffuse: NSColor(calibratedWhite: 0.16, alpha: 1),
+            metalness: 0.6,
+            roughness: 0.55
+        )
+        let trim = material(
+            diffuse: NSColor(calibratedWhite: 0.07, alpha: 1),
+            metalness: 0.5,
+            roughness: 0.7
+        )
+        let deck = material(
+            diffuse: NSColor(calibratedWhite: 0.13, alpha: 1),
+            metalness: 0.5,
+            roughness: 0.65
+        )
+        let amberLight = material(
+            diffuse: NSColor(calibratedRed: 1, green: 0.62, blue: 0.22, alpha: 1),
+            metalness: 0,
+            roughness: 0.3,
+            emissive: NSColor(calibratedRed: 1, green: 0.5, blue: 0.12, alpha: 1)
+        )
+
+        // Floor slab; the front half forms an open stage apron.
+        room.addChildNode(node(
+            name: "hull-floor",
+            geometry: SCNBox(width: 3.6, height: 0.12, length: 3.6, chamferRadius: 0.02),
+            material: deck,
+            position: SIMD3<Float>(0, 0.06, 0)
+        ))
+        // Left and right walls run from the back wall to the open front.
+        let sideSigns: [Float] = [-1, 1]
+        for sign in sideSigns {
+            let sideName = sign < 0 ? "hull-wall-left" : "hull-wall-right"
+            room.addChildNode(node(
+                name: sideName,
+                geometry: SCNBox(width: 0.14, height: 2.2, length: 3.3, chamferRadius: 0.01),
+                material: hull,
+                position: SIMD3<Float>(sign * 1.57, 1.22, -0.15)
+            ))
+        }
+        // Back wall split around the center airlock opening.
+        room.addChildNode(node(
+            name: "hull-wall-back-left",
+            geometry: SCNBox(width: 1.2, height: 2.2, length: 0.14, chamferRadius: 0.01),
+            material: hull,
+            position: SIMD3<Float>(-1.1, 1.22, -1.57)
+        ))
+        room.addChildNode(node(
+            name: "hull-wall-back-right",
+            geometry: SCNBox(width: 1.2, height: 2.2, length: 0.14, chamferRadius: 0.01),
+            material: hull,
+            position: SIMD3<Float>(1.1, 1.22, -1.57)
+        ))
+        // Structural ribs carry the warm living lights above the cabin.
+        let ribs: [(name: String, z: Float)] = [
+            ("rib-back", -1.15),
+            ("rib-mid", -0.35),
+        ]
+        for rib in ribs {
+            room.addChildNode(node(
+                name: rib.name,
+                geometry: SCNBox(width: 3.0, height: 0.14, length: 0.16, chamferRadius: 0.03),
+                material: hull,
+                position: SIMD3<Float>(0, 2.39, rib.z)
+            ))
+            room.addChildNode(node(
+                name: "\(rib.name)-amber-light",
+                geometry: SCNBox(width: 2.7, height: 0.02, length: 0.1, chamferRadius: 0.01),
+                material: amberLight,
+                position: SIMD3<Float>(0, 2.3, rib.z)
+            ))
+        }
+        // Wall-top trim band completes the low-poly shell.
+        room.addChildNode(node(
+            name: "hull-trim",
+            geometry: SCNBox(width: 3.44, height: 0.06, length: 0.06, chamferRadius: 0.02),
+            material: trim,
+            position: SIMD3<Float>(0, 2.29, -0.35)
+        ))
+    }
+
+    // MARK: - Sleep pod (back-left)
+
+    private static func makeSleepPod() -> SCNNode {
+        let root = SCNNode()
+        root.name = "sleep-pod"
+
+        let hull = material(
+            diffuse: NSColor(calibratedWhite: 0.16, alpha: 1),
+            metalness: 0.55,
+            roughness: 0.55
+        )
+        let trim = material(
+            diffuse: NSColor(calibratedWhite: 0.07, alpha: 1),
+            metalness: 0.5,
+            roughness: 0.7
+        )
+        let bedding = material(
+            diffuse: NSColor(calibratedRed: 0.42, green: 0.43, blue: 0.47, alpha: 1),
+            metalness: 0.05,
+            roughness: 0.85
+        )
+        let amberLight = material(
+            diffuse: NSColor(calibratedRed: 1, green: 0.62, blue: 0.22, alpha: 1),
+            metalness: 0,
+            roughness: 0.3,
+            emissive: NSColor(calibratedRed: 1, green: 0.5, blue: 0.12, alpha: 1)
+        )
+
+        root.addChildNode(node(
+            name: "bed-base",
+            geometry: SCNBox(width: 1.0, height: 0.2, length: 0.66, chamferRadius: 0.02),
+            material: hull,
+            position: SIMD3<Float>(-1.0, 0.22, -1.15)
+        ))
+        root.addChildNode(node(
+            name: "mattress",
+            geometry: SCNBox(width: 0.9, height: 0.12, length: 0.56, chamferRadius: 0.04),
+            material: bedding,
+            position: SIMD3<Float>(-1.0, 0.38, -1.15)
+        ))
+        root.addChildNode(node(
+            name: "pillow",
+            geometry: SCNBox(width: 0.4, height: 0.09, length: 0.34, chamferRadius: 0.04),
+            material: bedding,
+            position: SIMD3<Float>(-1.26, 0.48, -1.08)
+        ))
+        root.addChildNode(node(
+            name: "headboard",
+            geometry: SCNBox(width: 1.0, height: 0.5, length: 0.08, chamferRadius: 0.02),
+            material: trim,
+            position: SIMD3<Float>(-1.0, 0.6, -1.44)
+        ))
+        root.addChildNode(node(
+            name: "alcove-side",
+            geometry: SCNBox(width: 0.08, height: 0.8, length: 0.72, chamferRadius: 0.01),
+            material: hull,
+            position: SIMD3<Float>(-1.46, 0.62, -1.08)
+        ))
+        root.addChildNode(node(
+            name: "night-light",
+            geometry: SCNBox(width: 0.05, height: 0.05, length: 0.04, chamferRadius: 0.01),
+            material: amberLight,
+            position: SIMD3<Float>(-1.42, 0.88, -0.9)
+        ))
+        root.addChildNode(node(
+            name: "headboard-light",
+            geometry: SCNBox(width: 0.8, height: 0.02, length: 0.03, chamferRadius: 0.01),
+            material: amberLight,
+            position: SIMD3<Float>(-1.0, 0.87, -1.4)
+        ))
+        return root
+    }
+
+    // MARK: - Workbench console (back-right)
+
+    private static func makeWorkbenchConsole() -> SCNNode {
+        let root = SCNNode()
+        root.name = "workbench-console"
+
+        let hull = material(
+            diffuse: NSColor(calibratedWhite: 0.16, alpha: 1),
+            metalness: 0.55,
+            roughness: 0.55
+        )
+        let trim = material(
+            diffuse: NSColor(calibratedWhite: 0.07, alpha: 1),
+            metalness: 0.5,
+            roughness: 0.7
+        )
+        let steel = material(
+            diffuse: NSColor(calibratedWhite: 0.72, alpha: 1),
+            metalness: 0.9,
+            roughness: 0.3
+        )
+        let cyanEquipment = material(
+            diffuse: NSColor(calibratedRed: 0.05, green: 0.85, blue: 0.95, alpha: 1),
+            metalness: 0,
+            roughness: 0.3,
+            emissive: NSColor(calibratedRed: 0, green: 0.75, blue: 0.9, alpha: 1)
+        )
+
+        // Desk and pedestal against the back-right wall.
+        root.addChildNode(node(
+            name: "desk-top",
+            geometry: SCNBox(width: 1.0, height: 0.06, length: 0.5, chamferRadius: 0.01),
+            material: hull,
+            position: SIMD3<Float>(0.95, 0.78, -1.18)
+        ))
+        root.addChildNode(node(
+            name: "pedestal",
+            geometry: SCNBox(width: 0.35, height: 0.63, length: 0.44, chamferRadius: 0.01),
+            material: trim,
+            position: SIMD3<Float>(1.28, 0.435, -1.18)
+        ))
+        // Monitor faces the operator at the center of the room.
+        root.addChildNode(node(
+            name: "monitor-base",
+            geometry: SCNBox(width: 0.28, height: 0.04, length: 0.14, chamferRadius: 0.01),
+            material: steel,
+            position: SIMD3<Float>(0.95, 0.83, -1.39)
+        ))
+        root.addChildNode(node(
+            name: "monitor-neck",
+            geometry: SCNBox(width: 0.06, height: 0.12, length: 0.06, chamferRadius: 0.01),
+            material: steel,
+            position: SIMD3<Float>(0.95, 0.87, -1.39)
+        ))
+        root.addChildNode(node(
+            name: "monitor",
+            geometry: SCNBox(width: 0.92, height: 0.5, length: 0.06, chamferRadius: 0.01),
+            material: trim,
+            position: SIMD3<Float>(0.95, 1.15, -1.39)
+        ))
+        root.addChildNode(node(
+            name: "monitor-screen",
+            geometry: SCNBox(width: 0.84, height: 0.4, length: 0.02, chamferRadius: 0.005),
+            material: cyanEquipment,
+            position: SIMD3<Float>(0.95, 1.15, -1.375)
+        ))
+        root.addChildNode(node(
+            name: "keyboard",
+            geometry: SCNBox(width: 0.4, height: 0.02, length: 0.13, chamferRadius: 0.005),
+            material: steel,
+            position: SIMD3<Float>(0.95, 0.82, -1.05)
+        ))
+        root.addChildNode(node(
+            name: "chair-seat",
+            geometry: SCNCylinder(radius: 0.27, height: 0.1),
+            material: hull,
+            position: SIMD3<Float>(0.95, 0.17, -0.75)
+        ))
+        root.addChildNode(node(
+            name: "console-status",
+            geometry: SCNBox(width: 0.05, height: 0.05, length: 0.02, chamferRadius: 0.01),
+            material: cyanEquipment,
+            position: SIMD3<Float>(0.62, 0.835, -0.92)
+        ))
+        return root
+    }
+
+    // MARK: - Jukebox (right side)
+
+    private static func makeJukebox() -> SCNNode {
+        let root = SCNNode()
+        root.name = "jukebox"
+
+        let hull = material(
+            diffuse: NSColor(calibratedWhite: 0.16, alpha: 1),
+            metalness: 0.55,
+            roughness: 0.55
+        )
+        let trim = material(
+            diffuse: NSColor(calibratedWhite: 0.07, alpha: 1),
+            metalness: 0.5,
+            roughness: 0.7
+        )
+        let steel = material(
+            diffuse: NSColor(calibratedWhite: 0.72, alpha: 1),
+            metalness: 0.9,
+            roughness: 0.3
+        )
+        let amberLight = material(
+            diffuse: NSColor(calibratedRed: 1, green: 0.62, blue: 0.22, alpha: 1),
+            metalness: 0,
+            roughness: 0.3,
+            emissive: NSColor(calibratedRed: 1, green: 0.5, blue: 0.12, alpha: 1)
+        )
+
+        root.addChildNode(node(
+            name: "plinth",
+            geometry: SCNBox(width: 0.5, height: 0.1, length: 0.42, chamferRadius: 0.02),
+            material: trim,
+            position: SIMD3<Float>(1.18, 0.17, 0.3)
+        ))
+        root.addChildNode(node(
+            name: "body",
+            geometry: SCNBox(width: 0.44, height: 1.06, length: 0.36, chamferRadius: 0.03),
+            material: hull,
+            position: SIMD3<Float>(1.18, 0.75, 0.3)
+        ))
+        root.addChildNode(node(
+            name: "top-cap",
+            geometry: SCNBox(width: 0.38, height: 0.05, length: 0.3, chamferRadius: 0.02),
+            material: steel,
+            position: SIMD3<Float>(1.18, 1.305, 0.3)
+        ))
+        root.addChildNode(node(
+            name: "top-light",
+            geometry: SCNCylinder(radius: 0.11, height: 0.02),
+            material: amberLight,
+            position: SIMD3<Float>(1.18, 1.34, 0.3)
+        ))
+        root.addChildNode(node(
+            name: "fascia",
+            geometry: SCNBox(width: 0.03, height: 0.88, length: 0.3, chamferRadius: 0.01),
+            material: trim,
+            position: SIMD3<Float>(0.945, 0.75, 0.3)
+        ))
+        root.addChildNode(node(
+            name: "dial",
+            geometry: SCNCylinder(radius: 0.085, height: 0.03),
+            material: amberLight,
+            position: SIMD3<Float>(0.94, 0.9, 0.3),
+            eulerAngles: SIMD3<Float>(0, 0, .pi / 2)
+        ))
+        let equalizerBars: [(height: CGFloat, z: Float)] = [
+            (0.24, 0.17),
+            (0.3, 0.3),
+            (0.2, 0.43),
+        ]
+        for (index, bar) in equalizerBars.enumerated() {
+            root.addChildNode(node(
+                name: "equalizer-bar-\(index)",
+                geometry: SCNBox(width: 0.015, height: bar.height, length: 0.05, chamferRadius: 0.007),
+                material: amberLight,
+                position: SIMD3<Float>(0.94, 0.44, bar.z)
+            ))
+        }
+        return root
+    }
+
+    // MARK: - Coffee machine (left side, on a small counter)
+
+    private static func makeCoffeeMachine() -> SCNNode {
+        let root = SCNNode()
+        root.name = "coffee-machine"
+
+        let hull = material(
+            diffuse: NSColor(calibratedWhite: 0.16, alpha: 1),
+            metalness: 0.55,
+            roughness: 0.55
+        )
+        let trim = material(
+            diffuse: NSColor(calibratedWhite: 0.07, alpha: 1),
+            metalness: 0.5,
+            roughness: 0.7
+        )
+        let steel = material(
+            diffuse: NSColor(calibratedWhite: 0.72, alpha: 1),
+            metalness: 0.9,
+            roughness: 0.3
+        )
+        let cyanEquipment = material(
+            diffuse: NSColor(calibratedRed: 0.05, green: 0.85, blue: 0.95, alpha: 1),
+            metalness: 0,
+            roughness: 0.3,
+            emissive: NSColor(calibratedRed: 0, green: 0.75, blue: 0.9, alpha: 1)
+        )
+
+        root.addChildNode(node(
+            name: "counter-top",
+            geometry: SCNBox(width: 0.42, height: 0.05, length: 0.95, chamferRadius: 0.01),
+            material: hull,
+            position: SIMD3<Float>(-1.27, 0.625, 0.72)
+        ))
+        root.addChildNode(node(
+            name: "cabinet",
+            geometry: SCNBox(width: 0.3, height: 0.48, length: 0.75, chamferRadius: 0.01),
+            material: trim,
+            position: SIMD3<Float>(-1.35, 0.36, 0.72)
+        ))
+        root.addChildNode(node(
+            name: "machine-body",
+            geometry: SCNBox(width: 0.22, height: 0.3, length: 0.24, chamferRadius: 0.025),
+            material: hull,
+            position: SIMD3<Float>(-1.19, 0.8, 0.72)
+        ))
+        root.addChildNode(node(
+            name: "machine-face",
+            geometry: SCNBox(width: 0.02, height: 0.2, length: 0.18, chamferRadius: 0.008),
+            material: steel,
+            position: SIMD3<Float>(-1.075, 0.8, 0.72)
+        ))
+        root.addChildNode(node(
+            name: "brew-button",
+            geometry: SCNBox(width: 0.02, height: 0.03, length: 0.03, chamferRadius: 0.008),
+            material: cyanEquipment,
+            position: SIMD3<Float>(-1.068, 0.88, 0.78)
+        ))
+        root.addChildNode(node(
+            name: "nozzle",
+            geometry: SCNCylinder(radius: 0.012, height: 0.09),
+            material: steel,
+            position: SIMD3<Float>(-1.12, 0.7, 0.5)
+        ))
+        root.addChildNode(node(
+            name: "drip-tray",
+            geometry: SCNBox(width: 0.13, height: 0.02, length: 0.15, chamferRadius: 0.009),
+            material: steel,
+            position: SIMD3<Float>(-1.12, 0.66, 0.5)
+        ))
+        root.addChildNode(node(
+            name: "cup",
+            geometry: SCNCylinder(radius: 0.025, height: 0.06),
+            material: steel,
+            position: SIMD3<Float>(-1.0, 0.68, 0.4)
+        ))
+        return root
+    }
+
+    // MARK: - Viewport (port wall, looking out at the stars)
+
+    private static func makeViewport() -> SCNNode {
+        let root = SCNNode()
+        root.name = "viewport"
+
+        let trim = material(
+            diffuse: NSColor(calibratedWhite: 0.07, alpha: 1),
+            metalness: 0.5,
+            roughness: 0.7
+        )
+        let glass = material(
+            diffuse: NSColor(calibratedRed: 0.02, green: 0.08, blue: 0.16, alpha: 1),
+            metalness: 0.2,
+            roughness: 0.2,
+            emissive: NSColor(calibratedRed: 0.04, green: 0.2, blue: 0.5, alpha: 1)
+        )
+        let cyanEquipment = material(
+            diffuse: NSColor(calibratedRed: 0.05, green: 0.85, blue: 0.95, alpha: 1),
+            metalness: 0,
+            roughness: 0.3,
+            emissive: NSColor(calibratedRed: 0, green: 0.75, blue: 0.9, alpha: 1)
+        )
+
+        root.addChildNode(node(
+            name: "frame",
+            geometry: SCNBox(width: 0.12, height: 1.1, length: 1.5, chamferRadius: 0.02),
+            material: trim,
+            position: SIMD3<Float>(-1.44, 1.35, -0.1)
+        ))
+        root.addChildNode(node(
+            name: "glass",
+            geometry: SCNBox(width: 0.03, height: 0.9, length: 1.28, chamferRadius: 0.01),
+            material: glass,
+            position: SIMD3<Float>(-1.415, 1.35, -0.1)
+        ))
+        root.addChildNode(node(
+            name: "sill",
+            geometry: SCNBox(width: 0.24, height: 0.05, length: 1.5, chamferRadius: 0.02),
+            material: trim,
+            position: SIMD3<Float>(-1.31, 0.775, -0.1)
+        ))
+        root.addChildNode(node(
+            name: "rim-light",
+            geometry: SCNBox(width: 0.05, height: 0.05, length: 1.36, chamferRadius: 0.02),
+            material: cyanEquipment,
+            position: SIMD3<Float>(-1.39, 1.92, -0.1)
+        ))
+        root.addChildNode(node(
+            name: "status-lamp",
+            geometry: SCNBox(width: 0.06, height: 0.06, length: 0.03, chamferRadius: 0.01),
+            material: cyanEquipment,
+            position: SIMD3<Float>(-1.39, 1.0, 0.62)
+        ))
+        return root
+    }
+
+    // MARK: - Airlock (rear bulkhead)
+
+    private static func makeAirlock() -> SCNNode {
+        let root = SCNNode()
+        root.name = "airlock"
+
+        let trim = material(
+            diffuse: NSColor(calibratedWhite: 0.07, alpha: 1),
+            metalness: 0.5,
+            roughness: 0.7
+        )
+        let steel = material(
+            diffuse: NSColor(calibratedWhite: 0.66, alpha: 1),
+            metalness: 0.9,
+            roughness: 0.3
+        )
+        let cyanEquipment = material(
+            diffuse: NSColor(calibratedRed: 0.05, green: 0.85, blue: 0.95, alpha: 1),
+            metalness: 0,
+            roughness: 0.3,
+            emissive: NSColor(calibratedRed: 0, green: 0.75, blue: 0.9, alpha: 1)
+        )
+
+        root.addChildNode(node(
+            name: "housing",
+            geometry: SCNBox(width: 1.0, height: 2.2, length: 0.14, chamferRadius: 0.02),
+            material: trim,
+            position: SIMD3<Float>(0, 1.22, -1.57)
+        ))
+        root.addChildNode(node(
+            name: "hatch",
+            geometry: SCNCylinder(radius: 0.34, height: 0.07),
+            material: steel,
+            position: SIMD3<Float>(0, 1.22, -1.49),
+            eulerAngles: SIMD3<Float>(.pi / 2, 0, 0)
+        ))
+        root.addChildNode(node(
+            name: "hatch-seal",
+            geometry: SCNTorus(ringRadius: 0.34, pipeRadius: 0.02),
+            material: trim,
+            position: SIMD3<Float>(0, 1.22, -1.485),
+            eulerAngles: SIMD3<Float>(.pi / 2, 0, 0)
+        ))
+        root.addChildNode(node(
+            name: "hatch-window",
+            geometry: SCNCylinder(radius: 0.07, height: 0.02),
+            material: cyanEquipment,
+            position: SIMD3<Float>(0, 1.34, -1.46),
+            eulerAngles: SIMD3<Float>(.pi / 2, 0, 0)
+        ))
+        root.addChildNode(node(
+            name: "handle",
+            geometry: SCNBox(width: 0.03, height: 0.26, length: 0.06, chamferRadius: 0.01),
+            material: steel,
+            position: SIMD3<Float>(0.17, 1.24, -1.45)
+        ))
+        root.addChildNode(node(
+            name: "status-light-top",
+            geometry: SCNBox(width: 0.04, height: 0.04, length: 0.02, chamferRadius: 0.008),
+            material: cyanEquipment,
+            position: SIMD3<Float>(0.4, 1.5, -1.49)
+        ))
+        root.addChildNode(node(
+            name: "status-light-bottom",
+            geometry: SCNBox(width: 0.04, height: 0.04, length: 0.02, chamferRadius: 0.008),
+            material: cyanEquipment,
+            position: SIMD3<Float>(0.4, 1.34, -1.49)
+        ))
+        return root
+    }
+
+    // MARK: - SceneKit helpers (same idiom as PMXWorldPropFactory)
+
+    private static func node(
+        name: String,
+        geometry: SCNGeometry,
+        material: SCNMaterial,
+        position: SIMD3<Float>,
+        eulerAngles: SIMD3<Float> = .zero
+    ) -> SCNNode {
+        geometry.materials = [material]
+        let node = SCNNode(geometry: geometry)
+        node.name = name
+        node.simdPosition = position
+        node.simdEulerAngles = eulerAngles
+        node.castsShadow = true
+        return node
+    }
+
+    private static func material(
+        diffuse: NSColor,
+        metalness: CGFloat,
+        roughness: CGFloat,
+        emissive: NSColor? = nil
+    ) -> SCNMaterial {
+        let material = SCNMaterial()
+        material.diffuse.contents = diffuse
+        material.metalness.contents = metalness
+        material.roughness.contents = roughness
+        material.lightingModel = .physicallyBased
+        if let emissive {
+            material.emission.contents = emissive
+        }
+        return material
+    }
+}
+
 private final class PMXDecodedModelBox: @unchecked Sendable {
     let model: MMDNode
 

@@ -34,6 +34,37 @@ func oneShotMotionDeadlineFiresOnceAtItsDuration() {
 @MainActor
 struct PMXStageAvatarRendererTests {
     @Test
+    func livingPodFactoryBuildsEveryReadableActivityZone() {
+        let pod = LivingPodScene.makeRoomNode()
+
+        #expect(pod.name == "gmgn-living-pod-room")
+        #expect(pod.childNode(withName: "sleep-pod", recursively: true) != nil)
+        #expect(pod.childNode(withName: "workbench-console", recursively: true) != nil)
+        #expect(pod.childNode(withName: "jukebox", recursively: true) != nil)
+        #expect(pod.childNode(withName: "coffee-machine", recursively: true) != nil)
+        #expect(pod.childNode(withName: "viewport", recursively: true) != nil)
+        #expect(pod.childNode(withName: "airlock", recursively: true) != nil)
+    }
+
+    @Test
+    func livingPodOnlyReplacesTheWorldInFullStage() {
+        #expect(LivingPodScene.isLocalWorld(LivingPodScene.worldID))
+        #expect(!LivingPodScene.isLocalWorld("world-labs-example-warm-kitchen"))
+        #expect(
+            LivingPodScene.shouldDisplay(
+                worldID: LivingPodScene.worldID,
+                drawsWorld: true
+            )
+        )
+        #expect(
+            !LivingPodScene.shouldDisplay(
+                worldID: LivingPodScene.worldID,
+                drawsWorld: false
+            )
+        )
+    }
+
+    @Test
     func coffeeMachineFactoryBuildsAVisibleCountertopProp() throws {
         let machine = PMXWorldPropFactory.coffeeMachine()
 

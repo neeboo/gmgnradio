@@ -2,6 +2,8 @@ import AppKit
 @preconcurrency import MetalKit
 import MetalSplatter
 import os
+@preconcurrency import QuartzCore
+@preconcurrency import SceneKit
 import simd
 import SplatIO
 import VRMMetalKit
@@ -517,13 +519,31 @@ final class MarbleSpatialView: MTKView {
 #endif
     }
 
+    /// The local living pod ships with the app and renders synchronously through
+    /// its own SceneKit renderer, so it has no Marble SPZ to prepare or wait on.
+    /// When the full stage requests its world presentation, complete it here so
+    /// entering the local picture never blocks on a remote world.
+    private func presentLocalLivingPodIfRequested() {
+        guard LivingPodScene.isLocalWorld(spatialStage.selectedWorldID),
+              renderProfile.drawsWorld,
+              spatialStage.isWorldPresentationRequested
+        else {
+            return
+        }
+        spatialStage.finishWorldPresentation()
+    }
+
     /// Reconciles the renderer with the library's current selection whenever
     /// the shared surface moves from the character-only Live Cam into the
     /// full stage. This recovers a selection callback that arrived while the
     /// world layer was intentionally disabled.
     func prepareSelectedWorldForFullStage() {
-#if arch(arm64)
         guard renderProfile.drawsWorld else { return }
+        if LivingPodScene.isLocalWorld(spatialStage.selectedWorldID) {
+            presentLocalLivingPodIfRequested()
+            return
+        }
+#if arch(arm64)
         if let selectedURL = library.localSplatURL {
             receiveWorldURL(selectedURL)
         } else {
@@ -536,6 +556,10 @@ final class MarbleSpatialView: MTKView {
     /// Decodes the selected world while the lightweight Live Cam is visible,
     /// so entering the full stage can reuse the already loaded GPU scene.
     func prewarmSelectedWorld() {
+        if LivingPodScene.isLocalWorld(spatialStage.selectedWorldID) {
+            presentLocalLivingPodIfRequested()
+            return
+        }
 #if arch(arm64)
         if let selectedURL = library.localSplatURL {
             load(
@@ -624,6 +648,10 @@ final class MarbleSpatialView: MTKView {
 
 #if arch(arm64)
     private func receiveWorldURL(_ url: URL) {
+        if LivingPodScene.isLocalWorld(spatialStage.selectedWorldID) {
+            presentLocalLivingPodIfRequested()
+            return
+        }
         pendingWorldURL = url
         guard renderProfile.drawsWorld else { return }
         load(
@@ -634,6 +662,10 @@ final class MarbleSpatialView: MTKView {
     }
 
     private func prepareWorldIfNeeded() {
+        if LivingPodScene.isLocalWorld(spatialStage.selectedWorldID) {
+            presentLocalLivingPodIfRequested()
+            return
+        }
         if let pendingWorldURL {
             load(
                 url: pendingWorldURL,
@@ -657,6 +689,10 @@ final class MarbleSpatialView: MTKView {
         renderer: MarbleSpatialRenderer?,
         spatialStage: SpatialStageStore
     ) {
+        if LivingPodScene.isLocalWorld(spatialStage.selectedWorldID) {
+            presentLocalLivingPodIfRequested()
+            return
+        }
         if loadedURL == url {
             if spatialStage.isWorldPresentationRequested {
                 spatialStage.finishWorldPresentation()
@@ -807,6 +843,178 @@ private struct MarbleOccluderUniforms {
     var depthConvention: SIMD4<Float>
 }
 
+/// Renders the bundled local living pod — built with
+/// `LivingPodScene.makeRoomNode()` — into the shared Metal drawable through its
+/// own SceneKit renderer. It is deliberately independent of the PMX model
+/// instances (and of the VRM renderer) so either character can be composited on
+/// top afterwards, and it never waits on SplatRenderer readiness or Marble SPZ
+/// downloads because the pod ships with the app.
+@MainActor
+private final class LivingPodRoomRenderer {
+    /// SceneKit encodes depth in its reversed convention; the room pass clears
+    /// to the far plane. The avatar pass clears depth again after the room, so
+    /// in v1 furniture is allowed not to occlude the character.
+    private static let reverseDepthClear = 0.0
+
+    /// Very dark starfield backdrop outside the open-front cabin shell.
+    private static let backgroundClearColor = MTLClearColorMake(
+        0.008,
+        0.012,
+        0.02,
+        1
+    )
+
+    private let sceneRenderer: SCNRenderer
+    private let scene = SCNScene()
+    private let roomNode: SCNNode
+    private let cameraNode = SCNNode()
+    private let ambientLightNode = SCNNode()
+    private let keyLightNode = SCNNode()
+    private let fillLightNode = SCNNode()
+
+    init(device: MTLDevice) {
+        sceneRenderer = SCNRenderer(device: device, options: nil)
+        sceneRenderer.scene = scene
+
+        roomNode = LivingPodScene.makeRoomNode()
+        scene.rootNode.addChildNode(roomNode)
+
+        let camera = SCNCamera()
+        camera.automaticallyAdjustsZRange = false
+        cameraNode.name = "gmgn-living-pod-camera"
+        cameraNode.camera = camera
+        scene.rootNode.addChildNode(cameraNode)
+
+        configureWarmInteriorLighting()
+
+        scene.background.contents = NSColor.clear
+        sceneRenderer.pointOfView = cameraNode
+        sceneRenderer.autoenablesDefaultLighting = false
+        sceneRenderer.isPlaying = false
+    }
+
+    /// Renders the cabin into the current frame's color and depth targets.
+    /// Returns false when the target is unusable so the caller can skip the
+    /// rest of the frame.
+    @discardableResult
+    func render(
+        commandBuffer: MTLCommandBuffer,
+        colorTexture: MTLTexture,
+        depthTexture: MTLTexture,
+        projection: simd_float4x4,
+        camera: SpatialCameraState
+    ) -> Bool {
+        let width = colorTexture.width
+        let height = colorTexture.height
+        guard width > 0, height > 0 else { return false }
+
+        let cameraView = Self.rotationX(-camera.pitch)
+            * Self.rotationY(-camera.yaw)
+            * Self.translation(-camera.position)
+        cameraNode.simdTransform = cameraView.inverse
+        cameraNode.camera?.projectionTransform = SCNMatrix4(projection)
+
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = colorTexture
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].storeAction = .store
+        pass.colorAttachments[0].clearColor = Self.backgroundClearColor
+        pass.depthAttachment.texture = depthTexture
+        pass.depthAttachment.loadAction = .clear
+        pass.depthAttachment.storeAction = .store
+        pass.depthAttachment.clearDepth = Self.reverseDepthClear
+
+        sceneRenderer.render(
+            atTime: 0,
+            viewport: CGRect(
+                x: 0,
+                y: 0,
+                width: width,
+                height: height
+            ),
+            commandBuffer: commandBuffer,
+            passDescriptor: pass
+        )
+        return true
+    }
+
+    private func configureWarmInteriorLighting() {
+        ambientLightNode.name = "gmgn-living-pod-ambient-light"
+        let ambient = SCNLight()
+        ambient.type = .ambient
+        ambient.intensity = 125
+        ambient.color = NSColor(
+            calibratedRed: 0.90,
+            green: 0.69,
+            blue: 0.48,
+            alpha: 1
+        )
+        ambientLightNode.light = ambient
+        scene.rootNode.addChildNode(ambientLightNode)
+
+        keyLightNode.name = "gmgn-living-pod-key-light"
+        let key = SCNLight()
+        key.type = .directional
+        key.intensity = 880
+        key.color = NSColor(
+            calibratedRed: 1,
+            green: 0.78,
+            blue: 0.56,
+            alpha: 1
+        )
+        keyLightNode.light = key
+        keyLightNode.simdEulerAngles = SIMD3<Float>(-0.72, 0.48, 0)
+        scene.rootNode.addChildNode(keyLightNode)
+
+        fillLightNode.name = "gmgn-living-pod-fill-light"
+        let fill = SCNLight()
+        fill.type = .directional
+        fill.intensity = 240
+        fill.color = NSColor(
+            calibratedRed: 0.46,
+            green: 0.58,
+            blue: 0.82,
+            alpha: 1
+        )
+        fillLightNode.light = fill
+        fillLightNode.simdEulerAngles = SIMD3<Float>(-0.28, -0.86, 0)
+        scene.rootNode.addChildNode(fillLightNode)
+    }
+
+    private static func translation(
+        _ value: SIMD3<Float>
+    ) -> simd_float4x4 {
+        simd_float4x4(columns: (
+            SIMD4(1, 0, 0, 0),
+            SIMD4(0, 1, 0, 0),
+            SIMD4(0, 0, 1, 0),
+            SIMD4(value.x, value.y, value.z, 1)
+        ))
+    }
+
+    private static func rotationX(_ angle: Float) -> simd_float4x4 {
+        let c = cos(angle)
+        let s = sin(angle)
+        return simd_float4x4(columns: (
+            SIMD4(1, 0, 0, 0),
+            SIMD4(0, c, s, 0),
+            SIMD4(0, -s, c, 0),
+            SIMD4(0, 0, 0, 1)
+        ))
+    }
+
+    private static func rotationY(_ angle: Float) -> simd_float4x4 {
+        let c = cos(angle)
+        let s = sin(angle)
+        return simd_float4x4(columns: (
+            SIMD4(c, 0, -s, 0),
+            SIMD4(0, 1, 0, 0),
+            SIMD4(s, 0, c, 0),
+            SIMD4(0, 0, 0, 1)
+        ))
+    }
+}
+
 @MainActor
 private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
     private static let log = Logger(
@@ -841,6 +1049,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
     private var liveCamOrbit = LiveCamCharacterOrbit()
     private var fullStageFrameSampler = FrameRateSampler()
     private var nextFrameCompletions: [MarbleFrameCompletion] = []
+    private var livingPodRoomRenderer: LivingPodRoomRenderer?
 
     init(
         view: MTKView,
@@ -1178,28 +1387,52 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             semaphore.signal()
         }
 
+        let drawsLivingPodRoom = LivingPodScene.shouldDisplay(
+            worldID: spatialStage.selectedWorldID,
+            drawsWorld: renderProfile.drawsWorld
+        )
+        if drawsLivingPodRoom,
+           spatialStage.isWorldPresentationRequested,
+           !spatialStage.isWorldVisible
+        {
+            // The pod's SceneKit room below is renderable immediately, so its
+            // world presentation never waits for a Marble download.
+            spatialStage.finishWorldPresentation()
+        }
+
         if renderProfile.drawsWorld {
-            guard renderer.isReadyToRender else {
-                commandBuffer.commit()
-                return
-            }
-            do {
-                let didRender = try renderer.render(
-                    viewports: [viewport(for: view)],
-                    colorTexture: drawable.texture,
-                    colorStoreAction: .store,
-                    depthTexture: view.depthStencilTexture,
-                    rasterizationRateMap: nil,
-                    renderTargetArrayLength: 0,
-                    to: commandBuffer
-                )
-                guard didRender else {
+            if drawsLivingPodRoom {
+                guard drawLivingPodRoom(
+                    in: view,
+                    drawable: drawable,
+                    commandBuffer: commandBuffer
+                ) else {
                     commandBuffer.commit()
                     return
                 }
-            } catch {
-                commandBuffer.commit()
-                return
+            } else {
+                guard renderer.isReadyToRender else {
+                    commandBuffer.commit()
+                    return
+                }
+                do {
+                    let didRender = try renderer.render(
+                        viewports: [viewport(for: view)],
+                        colorTexture: drawable.texture,
+                        colorStoreAction: .store,
+                        depthTexture: view.depthStencilTexture,
+                        rasterizationRateMap: nil,
+                        renderTargetArrayLength: 0,
+                        to: commandBuffer
+                    )
+                    guard didRender else {
+                        commandBuffer.commit()
+                        return
+                    }
+                } catch {
+                    commandBuffer.commit()
+                    return
+                }
             }
         } else {
             clearLocalSurface(
@@ -1251,6 +1484,31 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
         drawableSize = size
+    }
+
+    private func drawLivingPodRoom(
+        in view: MTKView,
+        drawable: CAMetalDrawable,
+        commandBuffer: MTLCommandBuffer
+    ) -> Bool {
+        guard let depthTexture = view.depthStencilTexture else {
+            return false
+        }
+        let podRenderer: LivingPodRoomRenderer
+        if let livingPodRoomRenderer {
+            podRenderer = livingPodRoomRenderer
+        } else {
+            let roomRenderer = LivingPodRoomRenderer(device: self.renderer.device)
+            livingPodRoomRenderer = roomRenderer
+            podRenderer = roomRenderer
+        }
+        return podRenderer.render(
+            commandBuffer: commandBuffer,
+            colorTexture: drawable.texture,
+            depthTexture: depthTexture,
+            projection: projectionMatrix(for: view),
+            camera: spatialStage.camera
+        )
     }
 
     private func viewport(for view: MTKView) -> SplatRenderer.ViewportDescriptor {
@@ -1310,6 +1568,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
     ) -> Bool {
         guard renderProfile == .fullStage,
               spatialStage.isWorldVisible,
+              !LivingPodScene.isLocalWorld(spatialStage.selectedWorldID),
               let depthTexture = view.depthStencilTexture
         else {
             return false

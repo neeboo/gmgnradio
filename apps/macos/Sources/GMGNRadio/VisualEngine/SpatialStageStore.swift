@@ -263,6 +263,24 @@ struct SpatialWorldCalibration: Equatable, Sendable {
                 ),
                 lighting: .warmInterior
             )
+        case LivingPodScene.worldID:
+            // The pod renders SceneKit primitives in world metres, so its
+            // camera and spawn use the same numbers as the authored package
+            // (floor top y = 0.12). Camera starts on the open front apron and
+            // the avatar at the bundled spawn on the deck.
+            SpatialWorldCalibration(
+                cameraHome: SpatialCameraState(
+                    position: LivingPodScene.presentationCameraPosition,
+                    yaw: 0,
+                    pitch: 0
+                ),
+                avatarPlacement: StageAvatarPlacement(
+                    position: LivingPodScene.spawnPosition,
+                    scale: 1.0,
+                    yaw: LivingPodScene.spawnYaw
+                ),
+                lighting: .warmInterior
+            )
         default:
             nil
         }

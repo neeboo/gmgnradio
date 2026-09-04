@@ -6,6 +6,12 @@ import WorldRuntime
 @Suite
 struct LivingWorldBootstrapTests {
     @Test
+    func bundledLivingWorldDefaultsToTheLocalLivingPod() {
+        #expect(LivingWorldBootstrap.canaryDirectoryName == "living-pod-v1")
+        #expect(LivingWorldBootstrap.defaultWorldID == LivingPodScene.worldID)
+    }
+
+    @Test
     func warmKitchenUsesAvatarSizedCollisionCapsule() {
         #expect(
             LivingWorldBootstrap.collisionCapsule(
@@ -166,6 +172,227 @@ struct LivingWorldBootstrapTests {
         #expect(normalizedBones?.inPlace == true)
         #expect(LivingWorldBootstrap.walkingSpeed(approvedMotions: approved) == 0.45)
     }
+
+    // MARK: - living-pod-v1 bundled package
+
+    @Test
+    func livingPodPackageValidatesAndShipsTheExpectedIdentity() throws {
+        let manifest = try Self.livingPodManifest()
+        #expect(manifest.packageID == "living-pod-v1")
+        #expect(manifest.packageVersion == "1.0.0")
+        #expect(manifest.worldID == LivingPodScene.worldID)
+        #expect(manifest.resources.isEmpty)
+        #expect(manifest.cameras.count == 2)
+        #expect(
+            Set(manifest.activities.map(\.id))
+                == Set(manifest.activityDefinitions.map(\.id))
+        )
+        #expect(
+            manifest.capabilities.isSuperset(
+                of: manifest.activities.map {
+                    WorldCapability.activity($0.id)
+                }
+            )
+        )
+        #expect(
+            manifest.capabilities.isSuperset(
+                of: manifest.cameras.map {
+                    WorldCapability.camera($0.id)
+                }
+            )
+        )
+        _ = try ActivityCatalog(manifest: manifest)
+    }
+
+    @Test
+    func livingPodActivitiesExposeChineseNamesAndApprovedMotionsOnly() throws {
+        let manifest = try Self.livingPodManifest()
+        let approvedMotionIDs = LivingWorldBootstrap.installedLivingMotionIDs
+            .union(["listen.music"])
+        let definitionsByID = Dictionary(
+            uniqueKeysWithValues: manifest.activityDefinitions.map { ($0.id, $0) }
+        )
+
+        for anchor in manifest.activities {
+            let definition = try #require(
+                definitionsByID[anchor.id],
+                "activity \(anchor.id) has no definition"
+            )
+            let displayName = try #require(
+                definition.displayName,
+                "activity \(anchor.id) has no Chinese display name"
+            )
+            #expect(!displayName.isEmpty)
+
+            #expect(Set(definition.phases.map(\.phase)) == Set(LifeActivityPhase.allCases))
+            #expect(
+                Set(definition.phases.map(\.phase)).count == 6,
+                "activity \(anchor.id) must not duplicate phases"
+            )
+
+            let referencedMotions = definition.phases.flatMap(\.motionIDs)
+                + [anchor.motionID].compactMap { $0 }
+            let unexpected = Set(referencedMotions).subtracting(approvedMotionIDs)
+            #expect(
+                unexpected.isEmpty,
+                "activity \(anchor.id) references unapproved motions: \(unexpected.sorted())"
+            )
+        }
+    }
+
+    @Test
+    func livingPodBlocksItsAuthoredWallsAndFurniture() throws {
+        let manifest = try Self.livingPodManifest()
+        let collision = CollisionVolumeWorld(manifest: manifest)
+        let capsule = WorldCapsule(radius: 0.2, height: 1.8)
+
+        // The pod stands on the deck (y = floor top 0.12). Authored furniture
+        // and hull centers must reject the character capsule.
+        let occupiedCenters: [SIMD3<Float>] = [
+            SIMD3(-1.0, 0.12, -1.15),   // bunk
+            SIMD3(0.95, 0.12, -1.18),   // workbench console
+            SIMD3(1.18, 0.12, 0.3),     // jukebox
+            SIMD3(-1.27, 0.12, 0.72),   // coffee counter
+            SIMD3(-1.35, 0.12, -0.1),   // viewport wall
+            SIMD3(0, 0.12, -1.57),      // rear airlock bulkhead
+        ]
+        for position in occupiedCenters {
+            #expect(
+                !collision.canOccupy(capsule, at: position),
+                "The character capsule can still enter living-pod geometry at \(position)"
+            )
+        }
+
+        let walkableCenters: [SIMD3<Float>] = [
+            SIMD3(0, 0.12, 1.1),     // spawn
+            SIMD3(0, 0.12, 0.2),     // center
+            SIMD3(-0.95, 0.12, -0.5), // bunk rest stand
+            SIMD3(0.15, 0.12, -0.6),  // console stand
+            SIMD3(0.62, 0.12, 0.3),   // jukebox stand
+            SIMD3(-0.72, 0.12, 0.72), // coffee stand
+            SIMD3(-0.9, 0.12, -0.1),  // viewport stand
+            SIMD3(0, 0.12, -1.1),     // airlock stand
+        ]
+        for position in walkableCenters {
+            #expect(
+                collision.canOccupy(capsule, at: position),
+                "An authored living-pod activity entry is trapped at \(position)"
+            )
+        }
+    }
+
+    @Test
+    func livingPodRoutesEveryActivityEntryFromSpawnWithoutPenetration() throws {
+        let manifest = try Self.livingPodManifest()
+        let router = WaypointNavigationGraph(manifest: manifest)
+        let collision = CollisionVolumeWorld(manifest: manifest)
+        let capsule = WorldCapsule(radius: 0.2, height: 1.8)
+        let spawn = Self.simd(manifest.spawn.position)
+        let anchorsByEntry = Dictionary(
+            uniqueKeysWithValues: manifest.activities.map {
+                ($0.entryWaypointID, $0)
+            }
+        )
+        #expect(Set(anchorsByEntry.keys) == Set(manifest.waypoints.map(\.id)))
+
+        for anchor in manifest.activities.sorted(by: { $0.id < $1.id }) {
+            let path = try router.route(
+                from: spawn,
+                to: anchor.entryWaypointID
+            )
+            if anchor.entryWaypointID != "wp.spawn" {
+                #expect(
+                    !path.waypointIDs.isEmpty,
+                    "No movement path to \(anchor.id)"
+                )
+            }
+            var cursor = spawn
+            for waypoint in path.points {
+                let destination = Self.simd(waypoint)
+                #expect(
+                    collision.canTraverse(
+                        capsule,
+                        from: cursor,
+                        to: destination,
+                        maximumStepHeight: 0.3
+                    ),
+                    "Blocked segment while routing to \(anchor.id)"
+                )
+                cursor = destination
+            }
+
+            let anchorPosition = Self.simd(anchor.transform.position)
+            #expect(
+                simdDistance(cursor, anchorPosition) <= 0.08,
+                "Entry transform is outside the 8 cm tolerance for \(anchor.id)"
+            )
+            let ground = try #require(
+                collision.groundHeight(at: anchorPosition)
+            )
+            #expect(
+                abs(anchorPosition.y - ground) <= 0.03,
+                "Feet are outside the 3 cm ground tolerance for \(anchor.id)"
+            )
+            #expect(
+                collision.canOccupy(capsule, at: anchorPosition),
+                "Anchor intersects blocking geometry for \(anchor.id)"
+            )
+        }
+
+        // Every authored anchor has a corresponding stand occupied above; also
+        // make sure the anchors agree with their entries so the world context
+        // activity executor can park the avatar at the anchor.
+        for anchor in manifest.activities {
+            let entry = try #require(
+                manifest.waypoints.first(where: { $0.id == anchor.entryWaypointID })
+            )
+            let distance = simdDistance(
+                Self.simd(anchor.transform.position),
+                Self.simd(entry.position)
+            )
+            #expect(
+                distance <= 0.08,
+                "Activity \(anchor.id) transform is \(distance)m from its entry waypoint"
+            )
+        }
+    }
+
+    private static func simd(_ value: WorldVector3) -> SIMD3<Float> {
+        SIMD3(value.x, value.y, value.z)
+    }
+
+    private static func livingPodManifest() throws -> WorldManifest {
+        let sourceFile = URL(filePath: #filePath)
+            .deletingLastPathComponent()
+        let manifestURL = sourceFile
+            .appendingPathComponent("../../../Resources", isDirectory: true)
+            .appendingPathComponent("Worlds", isDirectory: true)
+            .appendingPathComponent("living-pod-v1", isDirectory: true)
+            .appendingPathComponent("world.json")
+            .standardizedFileURL
+        let data = try Data(contentsOf: manifestURL)
+        let manifest = try JSONDecoder().decode(
+            WorldManifest.self,
+            from: data
+        )
+        let findings = WorldPackageValidator().validate(
+            manifest,
+            packageRoot: manifestURL.deletingLastPathComponent()
+        )
+        #expect(
+            findings.isEmpty,
+            "living-pod-v1 package findings: \(findings)"
+        )
+        return manifest
+    }
+}
+
+private func simdDistance(
+    _ lhs: SIMD3<Float>,
+    _ rhs: SIMD3<Float>
+) -> Float {
+    let delta = lhs - rhs
+    return sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z)
 }
 
 @Suite

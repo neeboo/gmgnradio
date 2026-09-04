@@ -14,9 +14,9 @@ enum LivingWorldBootstrapError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .bundledCanaryMissing:
-            "应用内没有找到 Warm Kitchen 示例空间。"
+            "应用内没有找到生活舱示例空间。"
         case let .invalidPackage(findings):
-            "Warm Kitchen 示例空间校验失败：\(findings.map(String.init(describing:)).joined(separator: ", "))"
+            "生活舱示例空间校验失败：\(findings.map(String.init(describing:)).joined(separator: ", "))"
         case let .invalidMotionResource(id, kind, path):
             "生活空间动作资源格式不匹配：id=\(id)，kind=\(kind)，path=\(path)"
         }
@@ -35,7 +35,10 @@ enum LivingWorldBootstrap {
         playbackRate: 1,
         inPlace: true
     )
-    static let canaryDirectoryName = "warm-kitchen-canary"
+    static let canaryDirectoryName = "living-pod-v1"
+    /// The world the app boots into when no Marble world was saved: the local
+    /// bundled living pod, which needs no network download to render.
+    static let defaultWorldID = LivingPodScene.worldID
     static let installedLivingMotionIDs: Set<String> = [
         "gmgn.motion.bones.chair-sit-loop-pmx",
         "gmgn.motion.bones.chair-sit-loop-vrm",

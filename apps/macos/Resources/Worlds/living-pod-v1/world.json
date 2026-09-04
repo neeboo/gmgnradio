@@ -1,0 +1,778 @@
+{
+  "schemaVersion": 1,
+  "packageID": "living-pod-v1",
+  "packageVersion": "1.0.0",
+  "worldID": "gmgn-living-pod-v1",
+  "displayName": "生活舱 01",
+  "calibration": {
+    "metersPerUnit": 1.0,
+    "visualToGameplay": [
+      1.0, 0.0, 0.0, 0.0,
+      0.0, 1.0, 0.0, 0.0,
+      0.0, 0.0, 1.0, 0.0,
+      0.0, 0.0, 0.0, 1.0
+    ]
+  },
+  "spawn": {
+    "position": { "x": 0.0, "y": 0.12, "z": 1.1 },
+    "rotation": { "x": 0.0, "y": 0.329, "z": 0.0, "w": 0.944 },
+    "scale": { "x": 1.0, "y": 1.0, "z": 1.0 }
+  },
+  "collisionVolumes": [
+    {
+      "id": "collision.floor",
+      "center": { "x": 0.0, "y": 0.06, "z": 0.0 },
+      "halfExtents": { "x": 1.8, "y": 0.06, "z": 1.8 },
+      "rotation": { "x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0 },
+      "isBlocking": true
+    },
+    {
+      "id": "collision.wall.left",
+      "center": { "x": -1.57, "y": 1.22, "z": -0.15 },
+      "halfExtents": { "x": 0.07, "y": 1.1, "z": 1.65 },
+      "rotation": { "x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0 },
+      "isBlocking": true
+    },
+    {
+      "id": "collision.wall.right",
+      "center": { "x": 1.57, "y": 1.22, "z": -0.15 },
+      "halfExtents": { "x": 0.07, "y": 1.1, "z": 1.65 },
+      "rotation": { "x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0 },
+      "isBlocking": true
+    },
+    {
+      "id": "collision.wall.back",
+      "center": { "x": 0.0, "y": 1.22, "z": -1.57 },
+      "halfExtents": { "x": 1.7, "y": 1.1, "z": 0.07 },
+      "rotation": { "x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0 },
+      "isBlocking": true
+    },
+    {
+      "id": "collision.bunk",
+      "center": { "x": -1.0, "y": 0.55, "z": -1.15 },
+      "halfExtents": { "x": 0.5, "y": 0.55, "z": 0.33 },
+      "rotation": { "x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0 },
+      "isBlocking": true
+    },
+    {
+      "id": "collision.console",
+      "center": { "x": 0.95, "y": 0.5, "z": -1.18 },
+      "halfExtents": { "x": 0.5, "y": 0.5, "z": 0.26 },
+      "rotation": { "x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0 },
+      "isBlocking": true
+    },
+    {
+      "id": "collision.jukebox",
+      "center": { "x": 1.18, "y": 0.66, "z": 0.3 },
+      "halfExtents": { "x": 0.24, "y": 0.6, "z": 0.21 },
+      "rotation": { "x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0 },
+      "isBlocking": true
+    },
+    {
+      "id": "collision.coffee",
+      "center": { "x": -1.27, "y": 0.6, "z": 0.72 },
+      "halfExtents": { "x": 0.23, "y": 0.6, "z": 0.48 },
+      "rotation": { "x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0 },
+      "isBlocking": true
+    },
+    {
+      "id": "collision.viewport",
+      "center": { "x": -1.35, "y": 1.0, "z": -0.1 },
+      "halfExtents": { "x": 0.16, "y": 0.88, "z": 0.75 },
+      "rotation": { "x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0 },
+      "isBlocking": true
+    }
+  ],
+  "waypoints": [
+    {
+      "id": "wp.spawn",
+      "position": { "x": 0.0, "y": 0.12, "z": 1.1 },
+      "arrivalRadius": 0.25,
+      "enabled": true
+    },
+    {
+      "id": "wp.center",
+      "position": { "x": 0.0, "y": 0.12, "z": 0.2 },
+      "arrivalRadius": 0.25,
+      "enabled": true
+    },
+    {
+      "id": "wp.bunk",
+      "position": { "x": -0.95, "y": 0.12, "z": -0.5 },
+      "arrivalRadius": 0.2,
+      "enabled": true
+    },
+    {
+      "id": "wp.console",
+      "position": { "x": 0.15, "y": 0.12, "z": -0.6 },
+      "arrivalRadius": 0.2,
+      "enabled": true
+    },
+    {
+      "id": "wp.jukebox",
+      "position": { "x": 0.62, "y": 0.12, "z": 0.3 },
+      "arrivalRadius": 0.2,
+      "enabled": true
+    },
+    {
+      "id": "wp.coffee",
+      "position": { "x": -0.72, "y": 0.12, "z": 0.72 },
+      "arrivalRadius": 0.2,
+      "enabled": true
+    },
+    {
+      "id": "wp.viewport",
+      "position": { "x": -0.9, "y": 0.12, "z": -0.1 },
+      "arrivalRadius": 0.2,
+      "enabled": true
+    },
+    {
+      "id": "wp.airlock",
+      "position": { "x": 0.0, "y": 0.12, "z": -1.1 },
+      "arrivalRadius": 0.2,
+      "enabled": true
+    }
+  ],
+  "routes": [
+    {
+      "id": "route.spawn-center",
+      "waypointIDs": ["wp.spawn", "wp.center"],
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "route.center-bunk",
+      "waypointIDs": ["wp.center", "wp.bunk"],
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "route.center-console",
+      "waypointIDs": ["wp.center", "wp.console"],
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "route.center-jukebox",
+      "waypointIDs": ["wp.center", "wp.jukebox"],
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "route.center-coffee",
+      "waypointIDs": ["wp.center", "wp.coffee"],
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "route.center-viewport",
+      "waypointIDs": ["wp.center", "wp.viewport"],
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "route.center-airlock",
+      "waypointIDs": ["wp.center", "wp.airlock"],
+      "bidirectional": true,
+      "enabled": true
+    }
+  ],
+  "activities": [
+    {
+      "id": "home.idle",
+      "action": "idle",
+      "entryWaypointID": "wp.spawn",
+      "transform": {
+        "position": { "x": 0.0, "y": 0.12, "z": 1.1 },
+        "rotation": { "x": 0.0, "y": 0.329, "z": 0.0, "w": 0.944 },
+        "scale": { "x": 1.0, "y": 1.0, "z": 1.0 }
+      },
+      "motionID": null,
+      "propIDs": [],
+      "interruptible": true
+    },
+    {
+      "id": "home.walk",
+      "action": "walk",
+      "entryWaypointID": "wp.center",
+      "transform": {
+        "position": { "x": 0.0, "y": 0.12, "z": 0.2 },
+        "rotation": { "x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0 },
+        "scale": { "x": 1.0, "y": 1.0, "z": 1.0 }
+      },
+      "motionID": null,
+      "propIDs": [],
+      "interruptible": true
+    },
+    {
+      "id": "bunk.rest",
+      "action": "sit",
+      "entryWaypointID": "wp.bunk",
+      "transform": {
+        "position": { "x": -0.95, "y": 0.12, "z": -0.5 },
+        "rotation": { "x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0 },
+        "scale": { "x": 1.0, "y": 1.0, "z": 1.0 }
+      },
+      "motionID": "gmgn.motion.bones.chair-sit-loop-pmx",
+      "propIDs": [],
+      "interruptible": true
+    },
+    {
+      "id": "console.inspect",
+      "action": "gaze",
+      "entryWaypointID": "wp.console",
+      "transform": {
+        "position": { "x": 0.15, "y": 0.12, "z": -0.6 },
+        "rotation": { "x": 0.0, "y": -0.479, "z": 0.0, "w": 0.878 },
+        "scale": { "x": 1.0, "y": 1.0, "z": 1.0 }
+      },
+      "motionID": null,
+      "propIDs": [],
+      "interruptible": true
+    },
+    {
+      "id": "music.listen",
+      "action": "listenMusic",
+      "entryWaypointID": "wp.jukebox",
+      "transform": {
+        "position": { "x": 0.62, "y": 0.12, "z": 0.3 },
+        "rotation": { "x": 0.0, "y": -0.7071, "z": 0.0, "w": 0.7071 },
+        "scale": { "x": 1.0, "y": 1.0, "z": 1.0 }
+      },
+      "motionID": null,
+      "propIDs": [],
+      "interruptible": true
+    },
+    {
+      "id": "coffee.brew",
+      "action": "interact",
+      "entryWaypointID": "wp.coffee",
+      "transform": {
+        "position": { "x": -0.72, "y": 0.12, "z": 0.72 },
+        "rotation": { "x": 0.0, "y": 0.7071, "z": 0.0, "w": 0.7071 },
+        "scale": { "x": 1.0, "y": 1.0, "z": 1.0 }
+      },
+      "motionID": "gmgn.motion.bones.coffee-button-pmx",
+      "propIDs": [],
+      "interruptible": true
+    },
+    {
+      "id": "viewport.gaze",
+      "action": "gaze",
+      "entryWaypointID": "wp.viewport",
+      "transform": {
+        "position": { "x": -0.9, "y": 0.12, "z": -0.1 },
+        "rotation": { "x": 0.0, "y": 0.7071, "z": 0.0, "w": 0.7071 },
+        "scale": { "x": 1.0, "y": 1.0, "z": 1.0 }
+      },
+      "motionID": null,
+      "propIDs": [],
+      "interruptible": true
+    },
+    {
+      "id": "airlock.inspect",
+      "action": "gaze",
+      "entryWaypointID": "wp.airlock",
+      "transform": {
+        "position": { "x": 0.0, "y": 0.12, "z": -1.1 },
+        "rotation": { "x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0 },
+        "scale": { "x": 1.0, "y": 1.0, "z": 1.0 }
+      },
+      "motionID": null,
+      "propIDs": [],
+      "interruptible": true
+    }
+  ],
+  "activityDefinitions": [
+    {
+      "id": "home.idle",
+      "displayName": "在生活舱自然待机",
+      "activity": { "type": "idle" },
+      "phases": [
+        {
+          "phase": "approach",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "enter",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "loop",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "exit",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "interrupt",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "failed",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        }
+      ],
+      "interruptible": true,
+      "cooldownSeconds": 0.0
+    },
+    {
+      "id": "home.walk",
+      "displayName": "在舱内散步",
+      "activity": { "type": "walk", "destinationID": "wp.center" },
+      "phases": [
+        {
+          "phase": "approach",
+          "requiredAnchorIDs": ["home.walk"],
+          "motionIDs": [
+            "gmgn.motion.bones.walk-loop-pmx",
+            "gmgn.motion.bones.walk-loop-vrm",
+            "gmgn.motion.ardy-walk-loop-pmx",
+            "gmgn.motion.ardy-walk-loop-vrm"
+          ],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "enter",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "loop",
+          "requiredAnchorIDs": [],
+          "motionIDs": [
+            "gmgn.motion.bones.walk-loop-pmx",
+            "gmgn.motion.bones.walk-loop-vrm",
+            "gmgn.motion.ardy-walk-loop-pmx",
+            "gmgn.motion.ardy-walk-loop-vrm"
+          ],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "exit",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "interrupt",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "failed",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        }
+      ],
+      "interruptible": true,
+      "cooldownSeconds": 5.0
+    },
+    {
+      "id": "bunk.rest",
+      "displayName": "到睡眠舱休息",
+      "activity": { "type": "sit", "anchorID": "bunk.rest" },
+      "phases": [
+        {
+          "phase": "approach",
+          "requiredAnchorIDs": ["bunk.rest"],
+          "motionIDs": [
+            "gmgn.motion.bones.walk-loop-pmx",
+            "gmgn.motion.bones.walk-loop-vrm",
+            "gmgn.motion.ardy-walk-loop-pmx",
+            "gmgn.motion.ardy-walk-loop-vrm"
+          ],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "enter",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "loop",
+          "requiredAnchorIDs": [],
+          "motionIDs": [
+            "gmgn.motion.bones.chair-sit-loop-pmx",
+            "gmgn.motion.bones.chair-sit-loop-vrm"
+          ],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "exit",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "interrupt",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "failed",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        }
+      ],
+      "interruptible": true,
+      "cooldownSeconds": 30.0
+    },
+    {
+      "id": "console.inspect",
+      "displayName": "查看工作台控制台",
+      "activity": { "type": "gaze", "targetID": "console.inspect" },
+      "phases": [
+        {
+          "phase": "approach",
+          "requiredAnchorIDs": ["console.inspect"],
+          "motionIDs": [
+            "gmgn.motion.bones.walk-loop-pmx",
+            "gmgn.motion.bones.walk-loop-vrm",
+            "gmgn.motion.ardy-walk-loop-pmx",
+            "gmgn.motion.ardy-walk-loop-vrm"
+          ],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "enter",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "loop",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "exit",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "interrupt",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "failed",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        }
+      ],
+      "interruptible": true,
+      "cooldownSeconds": 20.0
+    },
+    {
+      "id": "music.listen",
+      "displayName": "到点唱机旁听音乐",
+      "activity": { "type": "listenMusic", "anchorID": "music.listen" },
+      "phases": [
+        {
+          "phase": "approach",
+          "requiredAnchorIDs": ["music.listen"],
+          "motionIDs": [
+            "gmgn.motion.bones.walk-loop-pmx",
+            "gmgn.motion.bones.walk-loop-vrm",
+            "gmgn.motion.ardy-walk-loop-pmx",
+            "gmgn.motion.ardy-walk-loop-vrm"
+          ],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "enter",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "loop",
+          "requiredAnchorIDs": [],
+          "motionIDs": ["listen.music"],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "exit",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "interrupt",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "failed",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        }
+      ],
+      "interruptible": true,
+      "cooldownSeconds": 45.0
+    },
+    {
+      "id": "coffee.brew",
+      "displayName": "冲泡一杯咖啡",
+      "activity": { "type": "interact", "anchorID": "coffee.brew" },
+      "phases": [
+        {
+          "phase": "approach",
+          "requiredAnchorIDs": ["coffee.brew"],
+          "motionIDs": [
+            "gmgn.motion.bones.walk-loop-pmx",
+            "gmgn.motion.bones.walk-loop-vrm",
+            "gmgn.motion.ardy-walk-loop-pmx",
+            "gmgn.motion.ardy-walk-loop-vrm"
+          ],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "enter",
+          "requiredAnchorIDs": [],
+          "motionIDs": ["gmgn.motion.bones.coffee-button-pmx"],
+          "propIDs": [],
+          "durationSeconds": 3.5
+        },
+        {
+          "phase": "loop",
+          "requiredAnchorIDs": [],
+          "motionIDs": [
+            "gmgn.motion.generated.a-person-naturally-picks-up-a-coffee-cup-76b63e0f"
+          ],
+          "propIDs": [],
+          "durationSeconds": 6.95
+        },
+        {
+          "phase": "exit",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": 0.0
+        },
+        {
+          "phase": "interrupt",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "failed",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        }
+      ],
+      "interruptible": true,
+      "cooldownSeconds": 0.0
+    },
+    {
+      "id": "viewport.gaze",
+      "displayName": "看观景窗外的星空",
+      "activity": { "type": "gaze", "targetID": "viewport.gaze" },
+      "phases": [
+        {
+          "phase": "approach",
+          "requiredAnchorIDs": ["viewport.gaze"],
+          "motionIDs": [
+            "gmgn.motion.bones.walk-loop-pmx",
+            "gmgn.motion.bones.walk-loop-vrm",
+            "gmgn.motion.ardy-walk-loop-pmx",
+            "gmgn.motion.ardy-walk-loop-vrm"
+          ],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "enter",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "loop",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "exit",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "interrupt",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "failed",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        }
+      ],
+      "interruptible": true,
+      "cooldownSeconds": 20.0
+    },
+    {
+      "id": "airlock.inspect",
+      "displayName": "查看气闸门",
+      "activity": { "type": "gaze", "targetID": "airlock.inspect" },
+      "phases": [
+        {
+          "phase": "approach",
+          "requiredAnchorIDs": ["airlock.inspect"],
+          "motionIDs": [
+            "gmgn.motion.bones.walk-loop-pmx",
+            "gmgn.motion.bones.walk-loop-vrm",
+            "gmgn.motion.ardy-walk-loop-pmx",
+            "gmgn.motion.ardy-walk-loop-vrm"
+          ],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "enter",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "loop",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "exit",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "interrupt",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "failed",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        }
+      ],
+      "interruptible": true,
+      "cooldownSeconds": 20.0
+    }
+  ],
+  "cameras": [
+    {
+      "id": "living.establishing",
+      "transform": {
+        "position": { "x": 0.0, "y": 1.35, "z": 3.05 },
+        "rotation": { "x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0 },
+        "scale": { "x": 1.0, "y": 1.0, "z": 1.0 }
+      },
+      "fieldOfViewDegrees": 66.0,
+      "nearPlane": 0.05,
+      "farPlane": 250.0
+    },
+    {
+      "id": "hatch.closeup",
+      "transform": {
+        "position": { "x": 0.35, "y": 1.2, "z": -0.75 },
+        "rotation": { "x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0 },
+        "scale": { "x": 1.0, "y": 1.0, "z": 1.0 }
+      },
+      "fieldOfViewDegrees": 52.0,
+      "nearPlane": 0.05,
+      "farPlane": 100.0
+    }
+  ],
+  "capabilities": [
+    "activity:airlock.inspect",
+    "activity:bunk.rest",
+    "activity:coffee.brew",
+    "activity:console.inspect",
+    "activity:home.idle",
+    "activity:home.walk",
+    "activity:music.listen",
+    "activity:viewport.gaze",
+    "camera:hatch.closeup",
+    "camera:living.establishing"
+  ],
+  "resources": []
+}

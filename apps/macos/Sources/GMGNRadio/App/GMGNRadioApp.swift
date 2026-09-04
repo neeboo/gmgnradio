@@ -1992,6 +1992,12 @@ final class AppDelegate:
             livingWorldVisualTask?.cancel()
             livingWorldVisualTask = Task { @MainActor [weak self] in
                 guard let self else { return }
+                if LivingPodScene.isLocalWorld(package.manifest.worldID) {
+                    installLocalLivingPodPresentation(package: package)
+                    return
+                }
+                // Legacy Marble worlds: resolve the SPZ through the world
+                // catalog and only then ask for the world presentation.
                 let localURL = await marbleWorldLibrary.select(
                     worldID: package.manifest.worldID
                 )
@@ -2013,6 +2019,32 @@ final class AppDelegate:
                 "生活空间启动失败：\(error.localizedDescription, privacy: .public)"
             )
         }
+    }
+
+    /// Boots the bundled living pod on the stage without touching the Marble
+    /// catalog: the pod ships with the app, so selecting a remote SPZ or
+    /// reporting a "Warm Kitchen" visual failure would be wrong. The stage is
+    /// pointed at the local world, the package-authored camera and spawn
+    /// calibration are installed, and the world presentation is completed
+    /// immediately because the pod renders synchronously from SceneKit.
+    private func installLocalLivingPodPresentation(
+        package: BundledLivingWorldPackage
+    ) {
+        spatialStage.selectScene(.djHouse)
+        spatialStage.selectWorld(id: package.manifest.worldID)
+        if let calibration = SpatialWorldCalibration.resolve(
+            worldID: package.manifest.worldID
+        ) {
+            spatialStage.installCameraHome(calibration.cameraHome)
+            if let avatarPlacement = calibration.avatarPlacement {
+                spatialStage.installAvatarPlacement(avatarPlacement)
+            }
+        }
+        spatialStage.requestWorldPresentation()
+        spatialStage.finishWorldPresentation()
+        livingWorldLogger.info(
+            "生活舱本地画面已就绪：world=\(package.manifest.worldID, privacy: .public)"
+        )
     }
 
     private func prepareLivingWorldCollider(
