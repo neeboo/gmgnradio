@@ -156,6 +156,27 @@ func worldVisibilityObserversHideTheSpatialSurfaceAfterExit() {
 
 @MainActor
 @Test
+func finishingAnAlreadyVisibleWorldDoesNotNotifyObserversAgain() {
+    let store = SpatialStageStore()
+    var changes: [Bool] = []
+    var didReenterFinish = false
+    let observerID = store.observeWorldVisibility { visible in
+        changes.append(visible)
+        if visible, !didReenterFinish {
+            didReenterFinish = true
+            store.finishWorldPresentation()
+        }
+    }
+
+    store.requestWorldPresentation()
+    store.finishWorldPresentation()
+
+    #expect(changes == [false, false, true])
+    store.removeWorldVisibilityObserver(observerID)
+}
+
+@MainActor
+@Test
 func sceneFramingObserversReceiveTheLoadedSPZCalibration() {
     let store = SpatialStageStore()
     let framing = MarbleSceneFraming(

@@ -813,6 +813,10 @@ final class SpatialStageStore {
             Self.log.notice("Ignored world presentation finish without request")
             return
         }
+        guard !isWorldVisible else {
+            Self.log.notice("Ignored duplicate world presentation finish")
+            return
+        }
         updateWorldVisibility(true)
         Self.log.notice(
             "World presentation visible world=\(self.selectedWorldID ?? "nil", privacy: .public)"
