@@ -255,21 +255,22 @@ func liveCamClickingAControlDoesNotEnterSpace() throws {
 @Test
 @MainActor
 func liveCamPlayerMenuReflectsTheCurrentSnapshot() throws {
-    let builder = LiveCamPlayerMenuBuilder()
     var previousRequests = 0
-    let menu = builder.rebuild(
-        snapshot: LiveCamPlayerMenuSnapshot(
-            trackTitle: "夜色爵士",
-            isPlaying: true,
-            canTogglePlayback: true,
-            canSelectPrevious: true,
-            canSelectNext: false
-        ),
+    let panel = LiveCamPanel(
+        frame: CGRect(x: 0, y: 0, width: 224, height: 336),
+        contentView: NSView(),
         onPreviousTrack: { previousRequests += 1 },
-        onTogglePlayback: {},
-        onNextTrack: {},
-        onOpenPlayer: {}
+        playerMenuSnapshotProvider: {
+            LiveCamPlayerMenuSnapshot(
+                trackTitle: "夜色爵士",
+                isPlaying: true,
+                canTogglePlayback: true,
+                canSelectPrevious: true,
+                canSelectNext: false
+            )
+        }
     )
+    let menu = panel.makePlayerMenu()
 
     let items = menu.items.filter { !$0.isSeparatorItem }
 
@@ -299,15 +300,11 @@ func liveCamPlayerMenuReflectsTheCurrentSnapshot() throws {
 @Test
 @MainActor
 func liveCamPlayerMenuWithoutAPlayableProgramDisablesTrackControls() {
-    let menu = LiveCamPlayerMenuBuilder().rebuild(
-        snapshot: LiveCamPlayerMenuSnapshot(
-            trackTitle: nil,
-            isPlaying: false,
-            canTogglePlayback: false,
-            canSelectPrevious: false,
-            canSelectNext: false
-        )
+    let panel = LiveCamPanel(
+        frame: CGRect(x: 0, y: 0, width: 224, height: 336),
+        contentView: NSView()
     )
+    let menu = panel.makePlayerMenu()
 
     let items = menu.items.filter { !$0.isSeparatorItem }
 

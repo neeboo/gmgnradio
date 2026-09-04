@@ -68,102 +68,6 @@ enum LiveCamSpaceEntryPolicy {
     }
 }
 
-@MainActor
-final class LiveCamPlayerMenuActionTarget: NSObject {
-    private let handler: @MainActor () -> Void
-
-    init(handler: @escaping @MainActor () -> Void) {
-        self.handler = handler
-    }
-
-    @objc
-    func performAction() {
-        handler()
-    }
-}
-
-@MainActor
-final class LiveCamPlayerMenuBuilder {
-    private(set) var menu = NSMenu()
-    private var actionTargets: [LiveCamPlayerMenuActionTarget] = []
-
-    func rebuild(
-        snapshot: LiveCamPlayerMenuSnapshot,
-        onPreviousTrack: @escaping @MainActor () -> Void = {},
-        onTogglePlayback: @escaping @MainActor () -> Void = {},
-        onNextTrack: @escaping @MainActor () -> Void = {},
-        onOpenPlayer: @escaping @MainActor () -> Void = {}
-    ) -> NSMenu {
-        actionTargets = []
-        menu = NSMenu()
-        menu.autoenablesItems = false
-        menu.setAccessibilityIdentifier("livecam.player.menu")
-
-        let trackItem = NSMenuItem(
-            title: snapshot.menuTitle,
-            action: nil,
-            keyEquivalent: ""
-        )
-        trackItem.isEnabled = false
-        trackItem.setAccessibilityIdentifier("livecam.player.menu.track")
-        menu.addItem(trackItem)
-        menu.addItem(.separator())
-
-        let previousTarget = addAction(
-            "上一首",
-            identifier: "livecam.player.menu.previous",
-            isEnabled: snapshot.canSelectPrevious,
-            handler: onPreviousTrack
-        )
-        let toggleTarget = addAction(
-            snapshot.playPauseTitle,
-            identifier: "livecam.player.menu.playback",
-            isEnabled: snapshot.canTogglePlayback,
-            handler: onTogglePlayback
-        )
-        let nextTarget = addAction(
-            "下一首",
-            identifier: "livecam.player.menu.next",
-            isEnabled: snapshot.canSelectNext,
-            handler: onNextTrack
-        )
-        menu.addItem(.separator())
-
-        let openTarget = addAction(
-            "进入播放器",
-            identifier: "livecam.player.menu.openPlayer",
-            isEnabled: true,
-            handler: onOpenPlayer
-        )
-        actionTargets = [
-            previousTarget,
-            toggleTarget,
-            nextTarget,
-            openTarget,
-        ]
-        return menu
-    }
-
-    private func addAction(
-        _ title: String,
-        identifier: String,
-        isEnabled: Bool,
-        handler: @escaping @MainActor () -> Void
-    ) -> LiveCamPlayerMenuActionTarget {
-        let target = LiveCamPlayerMenuActionTarget(handler: handler)
-        let item = NSMenuItem(
-            title: title,
-            action: #selector(LiveCamPlayerMenuActionTarget.performAction),
-            keyEquivalent: ""
-        )
-        item.isEnabled = isEnabled
-        item.setAccessibilityIdentifier(identifier)
-        item.target = target
-        menu.addItem(item)
-        return target
-    }
-}
-
 struct LiveCamLayout: Equatable, Sendable {
     let size: CGSize
     let cornerRadius: CGFloat
@@ -224,7 +128,6 @@ final class LiveCamInteractionView: NSView {
     private let composer = NSVisualEffectView()
     private let replyBubble = NSVisualEffectView()
     private let replyLabel = NSTextField(wrappingLabelWithString: "")
-    private let playerMenuBuilder = LiveCamPlayerMenuBuilder()
     private var replyPresentation: ReplyPresentation?
     private var onEnterSpace: @MainActor () -> Void
     private var onOpenPlayer: @MainActor () -> Void
@@ -294,34 +197,6 @@ final class LiveCamInteractionView: NSView {
         _ handler: @escaping @MainActor () -> Void
     ) {
         onToggleVoice = handler
-    }
-
-    func setOpenPlayerHandler(
-        _ handler: @escaping @MainActor () -> Void
-    ) {
-        onOpenPlayer = handler
-    }
-
-    func setOpenSettingsHandler(
-        _ handler: @escaping @MainActor () -> Void
-    ) {
-        onOpenSettings = handler
-    }
-
-    func setPlayerTrackHandlers(
-        onPreviousTrack: @escaping @MainActor () -> Void,
-        onTogglePlayback: @escaping @MainActor () -> Void,
-        onNextTrack: @escaping @MainActor () -> Void
-    ) {
-        self.onPreviousTrack = onPreviousTrack
-        self.onTogglePlayback = onTogglePlayback
-        self.onNextTrack = onNextTrack
-    }
-
-    func setPlayerMenuSnapshotProvider(
-        _ provider: @escaping @MainActor () -> LiveCamPlayerMenuSnapshot
-    ) {
-        playerMenuSnapshotProvider = provider
     }
 
     func focusComposer() {
@@ -562,13 +437,60 @@ final class LiveCamInteractionView: NSView {
     }
 
     func makePlayerMenu() -> NSMenu {
-        playerMenuBuilder.rebuild(
-            snapshot: playerMenuSnapshotProvider(),
-            onPreviousTrack: { [weak self] in self?.onPreviousTrack() },
-            onTogglePlayback: { [weak self] in self?.onTogglePlayback() },
-            onNextTrack: { [weak self] in self?.onNextTrack() },
-            onOpenPlayer: { [weak self] in self?.onOpenPlayer() }
+        let snapshot = playerMenuSnapshotProvider()
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        menu.setAccessibilityIdentifier("livecam.player.menu")
+
+        let trackItem = NSMenuItem(
+            title: snapshot.menuTitle,
+            action: nil,
+            keyEquivalent: ""
         )
+        trackItem.isEnabled = false
+        trackItem.setAccessibilityIdentifier("livecam.player.menu.track")
+        menu.addItem(trackItem)
+        menu.addItem(.separator())
+
+        menu.addItem(playerMenuItem(
+            "上一首",
+            identifier: "livecam.player.menu.previous",
+            isEnabled: snapshot.canSelectPrevious,
+            action: #selector(performPreviousTrackMenuAction)
+        ))
+        menu.addItem(playerMenuItem(
+            snapshot.playPauseTitle,
+            identifier: "livecam.player.menu.playback",
+            isEnabled: snapshot.canTogglePlayback,
+            action: #selector(performTogglePlaybackMenuAction)
+        ))
+        menu.addItem(playerMenuItem(
+            "下一首",
+            identifier: "livecam.player.menu.next",
+            isEnabled: snapshot.canSelectNext,
+            action: #selector(performNextTrackMenuAction)
+        ))
+        menu.addItem(.separator())
+        menu.addItem(playerMenuItem(
+            "进入播放器",
+            identifier: "livecam.player.menu.openPlayer",
+            isEnabled: true,
+            action: #selector(performOpenPlayerMenuAction)
+        ))
+        return menu
+    }
+
+    private func playerMenuItem(
+        _ title: String,
+        identifier: String,
+        isEnabled: Bool,
+        action: Selector
+    ) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.isEnabled = isEnabled
+        item.setAccessibilityIdentifier(identifier)
+        item.target = self
+        return item
     }
 
     func presentPlayerMenu() {
@@ -593,6 +515,26 @@ final class LiveCamInteractionView: NSView {
     @objc
     private func openSettings() {
         onOpenSettings()
+    }
+
+    @objc
+    private func performPreviousTrackMenuAction() {
+        onPreviousTrack()
+    }
+
+    @objc
+    private func performTogglePlaybackMenuAction() {
+        onTogglePlayback()
+    }
+
+    @objc
+    private func performNextTrackMenuAction() {
+        onNextTrack()
+    }
+
+    @objc
+    private func performOpenPlayerMenuAction() {
+        onOpenPlayer()
     }
 
     @objc
@@ -694,8 +636,7 @@ final class LiveCamPanel: NSPanel {
             frame: CGRect(origin: .zero, size: frame.size),
             contentView: contentView,
             interactionView: interactionView,
-            apertureMask: apertureMask ?? .ellipse,
-            onEnterSpace: {}
+            apertureMask: apertureMask ?? .ellipse
         )
 
         super.init(
@@ -743,42 +684,8 @@ final class LiveCamPanel: NSPanel {
         onEnterSpace = handler
     }
 
-    func setOpenPlayerHandler(
-        _ handler: @escaping @MainActor () -> Void
-    ) {
-        interactionView.setOpenPlayerHandler(handler)
-    }
-
-    func setOpenSettingsHandler(
-        _ handler: @escaping @MainActor () -> Void
-    ) {
-        interactionView.setOpenSettingsHandler(handler)
-    }
-
-    func setPlayerTrackHandlers(
-        onPreviousTrack: @escaping @MainActor () -> Void,
-        onTogglePlayback: @escaping @MainActor () -> Void,
-        onNextTrack: @escaping @MainActor () -> Void
-    ) {
-        interactionView.setPlayerTrackHandlers(
-            onPreviousTrack: onPreviousTrack,
-            onTogglePlayback: onTogglePlayback,
-            onNextTrack: onNextTrack
-        )
-    }
-
-    func setPlayerMenuSnapshotProvider(
-        _ provider: @escaping @MainActor () -> LiveCamPlayerMenuSnapshot
-    ) {
-        interactionView.setPlayerMenuSnapshotProvider(provider)
-    }
-
     func makePlayerMenu() -> NSMenu {
         interactionView.makePlayerMenu()
-    }
-
-    func presentPlayerMenu() {
-        interactionView.presentPlayerMenu()
     }
 
     func setRotateHandler(
@@ -846,7 +753,7 @@ final class LiveCamApertureView: NSView {
     private let portalContentView: NSView
     private let interactionView: LiveCamInteractionView
     private let apertureLayer = CAShapeLayer()
-    var onEnterSpace: @MainActor () -> Void
+    var onEnterSpace: @MainActor () -> Void = {}
     var onMove: @MainActor (
         CGSize,
         LiveCamWindowDragPhase
@@ -860,13 +767,11 @@ final class LiveCamApertureView: NSView {
         frame: CGRect,
         contentView: NSView,
         interactionView: LiveCamInteractionView,
-        apertureMask: LiveCamApertureMask,
-        onEnterSpace: @escaping @MainActor () -> Void
+        apertureMask: LiveCamApertureMask
     ) {
         portalContentView = contentView
         self.interactionView = interactionView
         self.apertureMask = apertureMask
-        self.onEnterSpace = onEnterSpace
         super.init(frame: frame)
 
         wantsLayer = true

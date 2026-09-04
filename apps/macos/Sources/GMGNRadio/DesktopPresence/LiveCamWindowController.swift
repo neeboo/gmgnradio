@@ -30,11 +30,6 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
     private let defaults: UserDefaults
     private let surfaceContainer = NSView()
     private var onEnterSpace: @MainActor () -> Void
-    private var onOpenPlayer: @MainActor () -> Void
-    private var onOpenSettings: @MainActor () -> Void
-    private var onPreviousTrack: @MainActor () -> Void
-    private var onTogglePlayback: @MainActor () -> Void
-    private var onNextTrack: @MainActor () -> Void
     private var onSendMessage: @MainActor (String) async throws -> Void
     private var onToggleVoice: @MainActor () -> Void
     private var isTransitioningToFullStage = false
@@ -71,11 +66,6 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
         self.shouldPresent = shouldPresent
         self.defaults = defaults
         self.onEnterSpace = onEnterSpace
-        self.onOpenPlayer = onOpenPlayer
-        self.onOpenSettings = onOpenSettings
-        self.onPreviousTrack = onPreviousTrack
-        self.onTogglePlayback = onTogglePlayback
-        self.onNextTrack = onNextTrack
         self.onSendMessage = onSendMessage
         self.onToggleVoice = onToggleVoice
 
@@ -85,6 +75,11 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
             frame: Self.initialFrame(defaultFrame: frame, defaults: defaults),
             contentView: surfaceContainer,
             apertureMask: apertureMask,
+            onOpenPlayer: onOpenPlayer,
+            onOpenSettings: onOpenSettings,
+            onPreviousTrack: onPreviousTrack,
+            onTogglePlayback: onTogglePlayback,
+            onNextTrack: onNextTrack,
             playerMenuSnapshotProvider: playerMenuSnapshotProvider
         )
         super.init(window: panel)
@@ -93,17 +88,6 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
         panel.setEnterSpaceHandler { [weak self] in
             self?.enterSpace()
         }
-        panel.setOpenPlayerHandler { [weak self] in
-            self?.onOpenPlayer()
-        }
-        panel.setOpenSettingsHandler { [weak self] in
-            self?.onOpenSettings()
-        }
-        panel.setPlayerTrackHandlers(
-            onPreviousTrack: { [weak self] in self?.onPreviousTrack() },
-            onTogglePlayback: { [weak self] in self?.onTogglePlayback() },
-            onNextTrack: { [weak self] in self?.onNextTrack() }
-        )
         panel.setRotateHandler { [weak self] translation in
             self?.rotateCamera(by: translation)
         }
