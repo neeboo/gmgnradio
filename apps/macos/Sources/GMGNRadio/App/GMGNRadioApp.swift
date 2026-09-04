@@ -147,7 +147,6 @@ struct GMGNRadioApp: App {
 
         Settings {
             GMGNSettingsView(
-                visualDirections: appDelegate.visualSettingsStore,
                 shortcutSettings: appDelegate.shortcutSettingsStore,
                 connectRealtimeVoice: { configuration in
                     appDelegate.connectRealtimeVoice(configuration)
@@ -488,9 +487,6 @@ final class AppDelegate:
     private let shortcutSettings = GMGNShortcutSettingsStore()
     private var shortcutCoordinator: GMGNShortcutCoordinator?
 
-    var visualSettingsStore: StageVisualDirectionStore {
-        stageVisualDirections
-    }
     var shortcutSettingsStore: GMGNShortcutSettingsStore {
         shortcutSettings
     }

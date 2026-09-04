@@ -1,18 +1,22 @@
 import SwiftUI
 
+enum GMGNSettingsPage: String, CaseIterable {
+    case presence = "角色"
+    case music = "音乐"
+    case space = "空间"
+    case shortcuts = "快捷键"
+    case agent = "DJ"
+}
+
+enum GMGNSettingsSpacePage {
+    /// 系统设置只保留长期服务配置；颗粒大小等场景调节只在完整舞台的面板出现。
+    static let sectionTitles = ["Marble 空间"]
+}
+
 @MainActor
 struct GMGNSettingsView: View {
-    private enum Page: String, CaseIterable {
-        case presence = "角色"
-        case music = "音乐"
-        case visual = "视觉"
-        case shortcuts = "快捷键"
-        case agent = "DJ"
-    }
-
-    @State private var page = Page.presence
+    @State private var page = GMGNSettingsPage.presence
     @State private var marbleAPIKey = MarbleAPIKeySettingsModel()
-    @ObservedObject private var visualDirections: StageVisualDirectionStore
     @ObservedObject private var shortcutSettings: GMGNShortcutSettingsStore
     private let connectRealtimeVoice:
         (RealtimeVoiceConfiguration) -> Void
@@ -20,14 +24,12 @@ struct GMGNSettingsView: View {
     private let agentConfigurationChanged: () -> Void
 
     init(
-        visualDirections: StageVisualDirectionStore,
         shortcutSettings: GMGNShortcutSettingsStore,
         connectRealtimeVoice:
             @escaping (RealtimeVoiceConfiguration) -> Void = { _ in },
         disconnectRealtimeVoice: @escaping () -> Void = {},
         agentConfigurationChanged: @escaping () -> Void = {}
     ) {
-        _visualDirections = ObservedObject(wrappedValue: visualDirections)
         _shortcutSettings = ObservedObject(wrappedValue: shortcutSettings)
         self.connectRealtimeVoice = connectRealtimeVoice
         self.disconnectRealtimeVoice = disconnectRealtimeVoice
@@ -37,7 +39,7 @@ struct GMGNSettingsView: View {
     var body: some View {
         VStack(spacing: 0) {
             Picker("设置", selection: $page) {
-                ForEach(Page.allCases, id: \.self) { page in
+                ForEach(GMGNSettingsPage.allCases, id: \.self) { page in
                     Text(page.rawValue).tag(page)
                 }
             }
@@ -53,11 +55,8 @@ struct GMGNSettingsView: View {
                     PresenceSettingsView()
                 case .music:
                     MusicAccountsView()
-                case .visual:
-                    VisualSettingsView(
-                        visualDirections: visualDirections,
-                        marbleAPIKey: marbleAPIKey
-                    )
+                case .space:
+                    SpaceSettingsView(marbleAPIKey: marbleAPIKey)
                 case .shortcuts:
                     GMGNShortcutSettingsView(settings: shortcutSettings)
                 case .agent:
@@ -74,16 +73,15 @@ struct GMGNSettingsView: View {
 }
 
 @MainActor
-private struct VisualSettingsView: View {
-    @ObservedObject var visualDirections: StageVisualDirectionStore
+private struct SpaceSettingsView: View {
     @Bindable var marbleAPIKey: MarbleAPIKeySettingsModel
 
     var body: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 3) {
-                Text("视觉")
+                Text("空间")
                     .font(.title2.weight(.semibold))
-                Text("调整舞台点阵的显示效果")
+                Text("管理空间生成与同步服务的长期配置")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -92,114 +90,84 @@ private struct VisualSettingsView: View {
             .padding(.vertical, 18)
 
             Form {
-                Section("3D 点阵") {
-                    HStack(spacing: 12) {
-                        Text("颗粒大小")
-                        Slider(
-                            value: Binding(
-                                get: {
-                                    Double(
-                                        visualDirections
-                                            .particleSizeMultiplier
-                                    )
-                                },
-                                set: {
-                                    visualDirections
-                                        .setParticleSizeMultiplier(Float($0))
-                                }
-                            ),
-                            in: Double(
-                                StageParticleSizing.manualRange.lowerBound
-                            ) ... Double(
-                                StageParticleSizing.manualRange.upperBound
+                ForEach(
+                    GMGNSettingsSpacePage.sectionTitles,
+                    id: \.self
+                ) { title in
+                    Section(title) {
+                        HStack(spacing: 12) {
+                            Image(systemName: "cube.transparent")
+                                .font(.title3)
+                                .foregroundStyle(.cyan)
+                                .frame(width: 28)
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("World Labs Marble")
+                                Text("用于同步和生成可探索的 3D 空间")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            Spacer()
+
+                            Label(
+                                marbleAPIKey.isConfigured ? "已配置" : "未配置",
+                                systemImage: marbleAPIKey.isConfigured
+                                    ? "checkmark.circle.fill"
+                                    : "circle"
                             )
+                            .font(.callout)
+                            .foregroundStyle(
+                                marbleAPIKey.isConfigured ? .green : .secondary
+                            )
+                        }
+
+                        SecureField(
+                            marbleAPIKey.isConfigured
+                                ? "粘贴新的 API Key 可覆盖现有配置"
+                                : "粘贴 API Key",
+                            text: $marbleAPIKey.replacementKey
                         )
-                        Text(
-                            "\(Int(visualDirections.particleSizeMultiplier * 100))%"
-                        )
-                        .monospacedDigit()
-                        .foregroundStyle(.secondary)
-                        .frame(width: 42, alignment: .trailing)
-                    }
+                        .textFieldStyle(.roundedBorder)
 
-                    Text("会在不同尺寸的屏幕上自动缩放，这里用于微调最终颗粒大小。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                Section("Marble 空间") {
-                    HStack(spacing: 12) {
-                        Image(systemName: "cube.transparent")
-                            .font(.title3)
-                            .foregroundStyle(.cyan)
-                            .frame(width: 28)
-
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("World Labs Marble")
-                            Text("用于同步和生成可探索的 3D 空间")
+                        HStack {
+                            Text("只保存在本机，不使用钥匙串。")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                        }
 
-                        Spacer()
+                            Spacer()
 
-                        Label(
-                            marbleAPIKey.isConfigured ? "已配置" : "未配置",
-                            systemImage: marbleAPIKey.isConfigured
-                                ? "checkmark.circle.fill"
-                                : "circle"
-                        )
-                        .font(.callout)
-                        .foregroundStyle(
-                            marbleAPIKey.isConfigured ? .green : .secondary
-                        )
-                    }
-
-                    SecureField(
-                        marbleAPIKey.isConfigured
-                            ? "粘贴新的 API Key 可覆盖现有配置"
-                            : "粘贴 API Key",
-                        text: $marbleAPIKey.replacementKey
-                    )
-                    .textFieldStyle(.roundedBorder)
-
-                    HStack {
-                        Text("只保存在本机，不使用钥匙串。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-
-                        Spacer()
-
-                        if marbleAPIKey.isConfigured {
-                            Button("清除", role: .destructive) {
-                                marbleAPIKey.clear()
+                            if marbleAPIKey.isConfigured {
+                                Button("清除", role: .destructive) {
+                                    marbleAPIKey.clear()
+                                }
                             }
+
+                            Button("保存 Key") {
+                                marbleAPIKey.save()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(
+                                marbleAPIKey.replacementKey
+                                    .trimmingCharacters(
+                                        in: .whitespacesAndNewlines
+                                    )
+                                    .isEmpty
+                            )
                         }
 
-                        Button("保存 Key") {
-                            marbleAPIKey.save()
+                        if let message = marbleAPIKey.message {
+                            Label(
+                                message,
+                                systemImage: marbleAPIKey.hasError
+                                    ? "exclamationmark.circle.fill"
+                                    : "checkmark.circle.fill"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(
+                                marbleAPIKey.hasError ? .red : .secondary
+                            )
                         }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(
-                            marbleAPIKey.replacementKey
-                                .trimmingCharacters(
-                                    in: .whitespacesAndNewlines
-                                )
-                                .isEmpty
-                        )
-                    }
-
-                    if let message = marbleAPIKey.message {
-                        Label(
-                            message,
-                            systemImage: marbleAPIKey.hasError
-                                ? "exclamationmark.circle.fill"
-                                : "checkmark.circle.fill"
-                        )
-                        .font(.caption)
-                        .foregroundStyle(
-                            marbleAPIKey.hasError ? .red : .secondary
-                        )
                     }
                 }
             }
