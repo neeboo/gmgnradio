@@ -29,7 +29,12 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
     private let shouldPresent: @MainActor () -> Bool
     private let defaults: UserDefaults
     private let surfaceContainer = NSView()
-    private var onOpenFullStage: @MainActor () -> Void
+    private var onEnterSpace: @MainActor () -> Void
+    private var onOpenPlayer: @MainActor () -> Void
+    private var onOpenSettings: @MainActor () -> Void
+    private var onPreviousTrack: @MainActor () -> Void
+    private var onTogglePlayback: @MainActor () -> Void
+    private var onNextTrack: @MainActor () -> Void
     private var onSendMessage: @MainActor (String) async throws -> Void
     private var onToggleVoice: @MainActor () -> Void
     private var isTransitioningToFullStage = false
@@ -49,7 +54,15 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
         ),
         voiceState: RealtimeVoiceConnectionState = .disconnected,
         shouldPresent: @escaping @MainActor () -> Bool = { true },
-        onOpenFullStage: @escaping @MainActor () -> Void = {},
+        onEnterSpace: @escaping @MainActor () -> Void = {},
+        onOpenPlayer: @escaping @MainActor () -> Void = {},
+        onOpenSettings: @escaping @MainActor () -> Void = {},
+        onPreviousTrack: @escaping @MainActor () -> Void = {},
+        onTogglePlayback: @escaping @MainActor () -> Void = {},
+        onNextTrack: @escaping @MainActor () -> Void = {},
+        playerMenuSnapshotProvider: @escaping @MainActor () -> LiveCamPlayerMenuSnapshot = {
+            .noProgram
+        },
         onSendMessage: @escaping @MainActor (String) async throws -> Void = { _ in },
         onToggleVoice: @escaping @MainActor () -> Void = {}
     ) {
@@ -57,7 +70,12 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
         self.cameraCoordinator = cameraCoordinator
         self.shouldPresent = shouldPresent
         self.defaults = defaults
-        self.onOpenFullStage = onOpenFullStage
+        self.onEnterSpace = onEnterSpace
+        self.onOpenPlayer = onOpenPlayer
+        self.onOpenSettings = onOpenSettings
+        self.onPreviousTrack = onPreviousTrack
+        self.onTogglePlayback = onTogglePlayback
+        self.onNextTrack = onNextTrack
         self.onSendMessage = onSendMessage
         self.onToggleVoice = onToggleVoice
 
@@ -67,14 +85,25 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
             frame: Self.initialFrame(defaultFrame: frame, defaults: defaults),
             contentView: surfaceContainer,
             apertureMask: apertureMask,
-            onOpenFullStage: {}
+            playerMenuSnapshotProvider: playerMenuSnapshotProvider
         )
         super.init(window: panel)
         panel.delegate = self
         panel.isReleasedWhenClosed = false
-        panel.setOpenFullStageHandler { [weak self] in
-            self?.openFullStage()
+        panel.setEnterSpaceHandler { [weak self] in
+            self?.enterSpace()
         }
+        panel.setOpenPlayerHandler { [weak self] in
+            self?.onOpenPlayer()
+        }
+        panel.setOpenSettingsHandler { [weak self] in
+            self?.onOpenSettings()
+        }
+        panel.setPlayerTrackHandlers(
+            onPreviousTrack: { [weak self] in self?.onPreviousTrack() },
+            onTogglePlayback: { [weak self] in self?.onTogglePlayback() },
+            onNextTrack: { [weak self] in self?.onNextTrack() }
+        )
         panel.setRotateHandler { [weak self] translation in
             self?.rotateCamera(by: translation)
         }
@@ -100,9 +129,9 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
 
     func connect(
         to stageWindowController: StageWindowController,
-        onOpenFullStage: @escaping @MainActor () -> Void
+        onEnterSpace: @escaping @MainActor () -> Void
     ) {
-        self.onOpenFullStage = onOpenFullStage
+        self.onEnterSpace = onEnterSpace
         stageWindowController.setOnWillShowHandler { [weak self] in
             self?.prepareForFullStagePresentation()
         }
@@ -216,10 +245,10 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
         window.setFrameOrigin(frame.origin)
     }
 
-    func openFullStage() {
+    func enterSpace() {
         guard !isTransitioningToFullStage else { return }
         prepareForFullStagePresentation()
-        onOpenFullStage()
+        onEnterSpace()
     }
 
     func prepareForFullStagePresentation() {

@@ -5,6 +5,165 @@ enum LiveCamFeed: Equatable, Sendable {
     case virtualWorld
 }
 
+struct LiveCamPlayerMenuSnapshot: Equatable, Sendable {
+    static let noProgram = LiveCamPlayerMenuSnapshot(
+        trackTitle: nil,
+        isPlaying: false,
+        canTogglePlayback: false,
+        canSelectPrevious: false,
+        canSelectNext: false
+    )
+
+    let trackTitle: String?
+    let isPlaying: Bool
+    let canTogglePlayback: Bool
+    let canSelectPrevious: Bool
+    let canSelectNext: Bool
+
+    var menuTitle: String {
+        trackTitle ?? "暂无播放节目"
+    }
+
+    var playPauseTitle: String {
+        isPlaying ? "暂停" : "播放"
+    }
+
+    static func resolve(
+        playerState: LocalMusicPlaybackState,
+        hasPreparedProgram: Bool,
+        trackTitle: String?,
+        canSelectPrevious: Bool,
+        canSelectNext: Bool
+    ) -> Self {
+        let route = ProgramPlaybackToggleRoute.resolve(
+            playerState: playerState,
+            hasPreparedProgram: hasPreparedProgram
+        )
+        return Self(
+            trackTitle: trackTitle,
+            isPlaying: route == .pauseLocal,
+            canTogglePlayback: route != .unavailable,
+            canSelectPrevious: canSelectPrevious,
+            canSelectNext: canSelectNext
+        )
+    }
+}
+
+enum LiveCamSpaceEntryPolicy {
+    static let maximumClickDrift: CGFloat = 4
+
+    static func shouldEnterSpace(
+        downLocation: CGPoint?,
+        upLocation: CGPoint,
+        acceptsBackdropClick: Bool
+    ) -> Bool {
+        guard acceptsBackdropClick, let downLocation else {
+            return false
+        }
+        let drift = hypot(
+            upLocation.x - downLocation.x,
+            upLocation.y - downLocation.y
+        )
+        return drift <= maximumClickDrift
+    }
+}
+
+@MainActor
+final class LiveCamPlayerMenuActionTarget: NSObject {
+    private let handler: @MainActor () -> Void
+
+    init(handler: @escaping @MainActor () -> Void) {
+        self.handler = handler
+    }
+
+    @objc
+    func performAction() {
+        handler()
+    }
+}
+
+@MainActor
+final class LiveCamPlayerMenuBuilder {
+    private(set) var menu = NSMenu()
+    private var actionTargets: [LiveCamPlayerMenuActionTarget] = []
+
+    func rebuild(
+        snapshot: LiveCamPlayerMenuSnapshot,
+        onPreviousTrack: @escaping @MainActor () -> Void = {},
+        onTogglePlayback: @escaping @MainActor () -> Void = {},
+        onNextTrack: @escaping @MainActor () -> Void = {},
+        onOpenPlayer: @escaping @MainActor () -> Void = {}
+    ) -> NSMenu {
+        actionTargets = []
+        menu = NSMenu()
+        menu.autoenablesItems = false
+        menu.setAccessibilityIdentifier("livecam.player.menu")
+
+        let trackItem = NSMenuItem(
+            title: snapshot.menuTitle,
+            action: nil,
+            keyEquivalent: ""
+        )
+        trackItem.isEnabled = false
+        trackItem.setAccessibilityIdentifier("livecam.player.menu.track")
+        menu.addItem(trackItem)
+        menu.addItem(.separator())
+
+        let previousTarget = addAction(
+            "上一首",
+            identifier: "livecam.player.menu.previous",
+            isEnabled: snapshot.canSelectPrevious,
+            handler: onPreviousTrack
+        )
+        let toggleTarget = addAction(
+            snapshot.playPauseTitle,
+            identifier: "livecam.player.menu.playback",
+            isEnabled: snapshot.canTogglePlayback,
+            handler: onTogglePlayback
+        )
+        let nextTarget = addAction(
+            "下一首",
+            identifier: "livecam.player.menu.next",
+            isEnabled: snapshot.canSelectNext,
+            handler: onNextTrack
+        )
+        menu.addItem(.separator())
+
+        let openTarget = addAction(
+            "进入播放器",
+            identifier: "livecam.player.menu.openPlayer",
+            isEnabled: true,
+            handler: onOpenPlayer
+        )
+        actionTargets = [
+            previousTarget,
+            toggleTarget,
+            nextTarget,
+            openTarget,
+        ]
+        return menu
+    }
+
+    private func addAction(
+        _ title: String,
+        identifier: String,
+        isEnabled: Bool,
+        handler: @escaping @MainActor () -> Void
+    ) -> LiveCamPlayerMenuActionTarget {
+        let target = LiveCamPlayerMenuActionTarget(handler: handler)
+        let item = NSMenuItem(
+            title: title,
+            action: #selector(LiveCamPlayerMenuActionTarget.performAction),
+            keyEquivalent: ""
+        )
+        item.isEnabled = isEnabled
+        item.setAccessibilityIdentifier(identifier)
+        item.target = target
+        menu.addItem(item)
+        return target
+    }
+}
+
 struct LiveCamLayout: Equatable, Sendable {
     let size: CGSize
     let cornerRadius: CGFloat
@@ -53,8 +212,11 @@ final class LiveCamInteractionView: NSView {
         case chatStatus
     }
 
+    let spaceButton = NSButton()
+    let playerButton = NSButton()
     let chatButton = NSButton()
     let voiceButton = NSButton()
+    let settingsButton = NSButton()
     let messageField = NSTextField()
     let sendButton = NSButton()
 
@@ -62,7 +224,15 @@ final class LiveCamInteractionView: NSView {
     private let composer = NSVisualEffectView()
     private let replyBubble = NSVisualEffectView()
     private let replyLabel = NSTextField(wrappingLabelWithString: "")
+    private let playerMenuBuilder = LiveCamPlayerMenuBuilder()
     private var replyPresentation: ReplyPresentation?
+    private var onEnterSpace: @MainActor () -> Void
+    private var onOpenPlayer: @MainActor () -> Void
+    private var onOpenSettings: @MainActor () -> Void
+    private var onPreviousTrack: @MainActor () -> Void
+    private var onTogglePlayback: @MainActor () -> Void
+    private var onNextTrack: @MainActor () -> Void
+    private var playerMenuSnapshotProvider: @MainActor () -> LiveCamPlayerMenuSnapshot
     private var onSendMessage: @MainActor (String) -> Void
     private var onToggleVoice: @MainActor () -> Void
     var onComposerVisibilityChanged: @MainActor (Bool) -> Void = { _ in }
@@ -80,9 +250,25 @@ final class LiveCamInteractionView: NSView {
     }
 
     init(
+        onEnterSpace: @escaping @MainActor () -> Void = {},
+        onOpenPlayer: @escaping @MainActor () -> Void = {},
+        onOpenSettings: @escaping @MainActor () -> Void = {},
+        onPreviousTrack: @escaping @MainActor () -> Void = {},
+        onTogglePlayback: @escaping @MainActor () -> Void = {},
+        onNextTrack: @escaping @MainActor () -> Void = {},
+        playerMenuSnapshotProvider: @escaping @MainActor () -> LiveCamPlayerMenuSnapshot = {
+            .noProgram
+        },
         onSendMessage: @escaping @MainActor (String) -> Void = { _ in },
         onToggleVoice: @escaping @MainActor () -> Void = {}
     ) {
+        self.onEnterSpace = onEnterSpace
+        self.onOpenPlayer = onOpenPlayer
+        self.onOpenSettings = onOpenSettings
+        self.onPreviousTrack = onPreviousTrack
+        self.onTogglePlayback = onTogglePlayback
+        self.onNextTrack = onNextTrack
+        self.playerMenuSnapshotProvider = playerMenuSnapshotProvider
         self.onSendMessage = onSendMessage
         self.onToggleVoice = onToggleVoice
         super.init(frame: .zero)
@@ -108,6 +294,34 @@ final class LiveCamInteractionView: NSView {
         _ handler: @escaping @MainActor () -> Void
     ) {
         onToggleVoice = handler
+    }
+
+    func setOpenPlayerHandler(
+        _ handler: @escaping @MainActor () -> Void
+    ) {
+        onOpenPlayer = handler
+    }
+
+    func setOpenSettingsHandler(
+        _ handler: @escaping @MainActor () -> Void
+    ) {
+        onOpenSettings = handler
+    }
+
+    func setPlayerTrackHandlers(
+        onPreviousTrack: @escaping @MainActor () -> Void,
+        onTogglePlayback: @escaping @MainActor () -> Void,
+        onNextTrack: @escaping @MainActor () -> Void
+    ) {
+        self.onPreviousTrack = onPreviousTrack
+        self.onTogglePlayback = onTogglePlayback
+        self.onNextTrack = onNextTrack
+    }
+
+    func setPlayerMenuSnapshotProvider(
+        _ provider: @escaping @MainActor () -> LiveCamPlayerMenuSnapshot
+    ) {
+        playerMenuSnapshotProvider = provider
     }
 
     func focusComposer() {
@@ -179,24 +393,50 @@ final class LiveCamInteractionView: NSView {
 
     private func configureViews() {
         configureButton(
+            spaceButton,
+            symbolName: "cube.transparent",
+            label: "进入空间",
+            identifier: "livecam.button.space",
+            action: #selector(enterSpace)
+        )
+        configureButton(
+            playerButton,
+            symbolName: "music.note",
+            label: "播放器",
+            identifier: "livecam.button.player",
+            action: #selector(presentPlayerMenuAction)
+        )
+        configureButton(
             chatButton,
             symbolName: "message.fill",
             label: "文字聊天",
+            identifier: "livecam.button.chat",
             action: #selector(toggleComposer)
         )
         configureButton(
             voiceButton,
             symbolName: "mic",
             label: "开始语音",
+            identifier: "livecam.button.voice",
             action: #selector(toggleVoice)
+        )
+        configureButton(
+            settingsButton,
+            symbolName: "gearshape.fill",
+            label: "设置",
+            identifier: "livecam.button.settings",
+            action: #selector(openSettings)
         )
 
         controls.orientation = .vertical
         controls.spacing = 6
         controls.alignment = .centerX
         controls.translatesAutoresizingMaskIntoConstraints = false
+        controls.addArrangedSubview(spaceButton)
+        controls.addArrangedSubview(playerButton)
         controls.addArrangedSubview(chatButton)
         controls.addArrangedSubview(voiceButton)
+        controls.addArrangedSubview(settingsButton)
         addSubview(controls)
 
         configureGlass(composer)
@@ -218,6 +458,7 @@ final class LiveCamInteractionView: NSView {
             sendButton,
             symbolName: "arrow.up",
             label: "发送",
+            identifier: "livecam.button.send",
             action: #selector(submitMessage)
         )
         composer.addSubview(sendButton)
@@ -237,11 +478,17 @@ final class LiveCamInteractionView: NSView {
             controls.topAnchor.constraint(equalTo: topAnchor, constant: 10),
             controls.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             controls.widthAnchor.constraint(equalToConstant: 30),
-            controls.heightAnchor.constraint(equalToConstant: 66),
+            controls.heightAnchor.constraint(equalToConstant: 174),
+            spaceButton.widthAnchor.constraint(equalToConstant: 30),
+            spaceButton.heightAnchor.constraint(equalToConstant: 30),
+            playerButton.widthAnchor.constraint(equalToConstant: 30),
+            playerButton.heightAnchor.constraint(equalToConstant: 30),
             chatButton.widthAnchor.constraint(equalToConstant: 30),
             chatButton.heightAnchor.constraint(equalToConstant: 30),
             voiceButton.widthAnchor.constraint(equalToConstant: 30),
             voiceButton.heightAnchor.constraint(equalToConstant: 30),
+            settingsButton.widthAnchor.constraint(equalToConstant: 30),
+            settingsButton.heightAnchor.constraint(equalToConstant: 30),
 
             composer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             composer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
@@ -269,6 +516,7 @@ final class LiveCamInteractionView: NSView {
         _ button: NSButton,
         symbolName: String,
         label: String,
+        identifier: String,
         action: Selector
     ) {
         button.translatesAutoresizingMaskIntoConstraints = false
@@ -280,6 +528,8 @@ final class LiveCamInteractionView: NSView {
         button.imagePosition = .imageOnly
         button.contentTintColor = .white
         button.toolTip = label
+        button.setAccessibilityIdentifier(identifier)
+        button.setAccessibilityLabel(label)
         button.target = self
         button.action = action
         button.wantsLayer = true
@@ -295,6 +545,54 @@ final class LiveCamInteractionView: NSView {
         view.wantsLayer = true
         view.layer?.cornerRadius = 12
         view.layer?.masksToBounds = true
+    }
+
+    func isPassiveDecoration(_ view: NSView) -> Bool {
+        var current: NSView? = view
+        while let node = current {
+            if node === self {
+                return true
+            }
+            if node is NSButton || node === controls || node === composer {
+                return false
+            }
+            current = node.superview
+        }
+        return false
+    }
+
+    func makePlayerMenu() -> NSMenu {
+        playerMenuBuilder.rebuild(
+            snapshot: playerMenuSnapshotProvider(),
+            onPreviousTrack: { [weak self] in self?.onPreviousTrack() },
+            onTogglePlayback: { [weak self] in self?.onTogglePlayback() },
+            onNextTrack: { [weak self] in self?.onNextTrack() },
+            onOpenPlayer: { [weak self] in self?.onOpenPlayer() }
+        )
+    }
+
+    func presentPlayerMenu() {
+        let menu = makePlayerMenu()
+        menu.popUp(
+            positioning: nil,
+            at: NSPoint(x: 0, y: playerButton.bounds.height + 4),
+            in: playerButton
+        )
+    }
+
+    @objc
+    private func enterSpace() {
+        onEnterSpace()
+    }
+
+    @objc
+    private func presentPlayerMenuAction() {
+        presentPlayerMenu()
+    }
+
+    @objc
+    private func openSettings() {
+        onOpenSettings()
     }
 
     @objc
@@ -354,7 +652,7 @@ struct LiveCamApertureMask {
 @MainActor
 final class LiveCamPanel: NSPanel {
     let feed = LiveCamFeed.virtualWorld
-    private var onOpenFullStage: @MainActor () -> Void
+    private var onEnterSpace: @MainActor () -> Void
     private var chatInputActive = false
     let interactionView: LiveCamInteractionView
 
@@ -369,12 +667,26 @@ final class LiveCamPanel: NSPanel {
         frame: CGRect,
         contentView: NSView,
         apertureMask: LiveCamApertureMask? = nil,
-        onOpenFullStage: @escaping @MainActor () -> Void = {},
+        onEnterSpace: @escaping @MainActor () -> Void = {},
+        onOpenPlayer: @escaping @MainActor () -> Void = {},
+        onOpenSettings: @escaping @MainActor () -> Void = {},
+        onPreviousTrack: @escaping @MainActor () -> Void = {},
+        onTogglePlayback: @escaping @MainActor () -> Void = {},
+        onNextTrack: @escaping @MainActor () -> Void = {},
+        playerMenuSnapshotProvider: @escaping @MainActor () -> LiveCamPlayerMenuSnapshot = {
+            .noProgram
+        },
         onSendMessage: @escaping @MainActor (String) -> Void = { _ in },
         onToggleVoice: @escaping @MainActor () -> Void = {}
     ) {
-        self.onOpenFullStage = onOpenFullStage
+        self.onEnterSpace = onEnterSpace
         interactionView = LiveCamInteractionView(
+            onOpenPlayer: onOpenPlayer,
+            onOpenSettings: onOpenSettings,
+            onPreviousTrack: onPreviousTrack,
+            onTogglePlayback: onTogglePlayback,
+            onNextTrack: onNextTrack,
+            playerMenuSnapshotProvider: playerMenuSnapshotProvider,
             onSendMessage: onSendMessage,
             onToggleVoice: onToggleVoice
         )
@@ -383,7 +695,7 @@ final class LiveCamPanel: NSPanel {
             contentView: contentView,
             interactionView: interactionView,
             apertureMask: apertureMask ?? .ellipse,
-            onDoubleClick: onOpenFullStage
+            onEnterSpace: {}
         )
 
         super.init(
@@ -392,6 +704,10 @@ final class LiveCamPanel: NSPanel {
             backing: .buffered,
             defer: false
         )
+
+        apertureView.onEnterSpace = { [weak self] in
+            self?.requestEnterSpace()
+        }
 
         self.contentView = apertureView
         backgroundColor = .clear
@@ -417,15 +733,52 @@ final class LiveCamPanel: NSPanel {
         false
     }
 
-    func requestOpenFullStage() {
-        onOpenFullStage()
+    func requestEnterSpace() {
+        onEnterSpace()
     }
 
-    func setOpenFullStageHandler(
+    func setEnterSpaceHandler(
         _ handler: @escaping @MainActor () -> Void
     ) {
-        onOpenFullStage = handler
-        apertureView.onDoubleClick = handler
+        onEnterSpace = handler
+    }
+
+    func setOpenPlayerHandler(
+        _ handler: @escaping @MainActor () -> Void
+    ) {
+        interactionView.setOpenPlayerHandler(handler)
+    }
+
+    func setOpenSettingsHandler(
+        _ handler: @escaping @MainActor () -> Void
+    ) {
+        interactionView.setOpenSettingsHandler(handler)
+    }
+
+    func setPlayerTrackHandlers(
+        onPreviousTrack: @escaping @MainActor () -> Void,
+        onTogglePlayback: @escaping @MainActor () -> Void,
+        onNextTrack: @escaping @MainActor () -> Void
+    ) {
+        interactionView.setPlayerTrackHandlers(
+            onPreviousTrack: onPreviousTrack,
+            onTogglePlayback: onTogglePlayback,
+            onNextTrack: onNextTrack
+        )
+    }
+
+    func setPlayerMenuSnapshotProvider(
+        _ provider: @escaping @MainActor () -> LiveCamPlayerMenuSnapshot
+    ) {
+        interactionView.setPlayerMenuSnapshotProvider(provider)
+    }
+
+    func makePlayerMenu() -> NSMenu {
+        interactionView.makePlayerMenu()
+    }
+
+    func presentPlayerMenu() {
+        interactionView.presentPlayerMenu()
     }
 
     func setRotateHandler(
@@ -493,12 +846,13 @@ final class LiveCamApertureView: NSView {
     private let portalContentView: NSView
     private let interactionView: LiveCamInteractionView
     private let apertureLayer = CAShapeLayer()
-    var onDoubleClick: @MainActor () -> Void
+    var onEnterSpace: @MainActor () -> Void
     var onMove: @MainActor (
         CGSize,
         LiveCamWindowDragPhase
     ) -> Void = { _, _ in }
     var onRotate: @MainActor (CGSize) -> Void = { _ in }
+    private var clickDownLocation: CGPoint?
     private var lastMoveScreenLocation: CGPoint?
     private var lastRotateScreenLocation: CGPoint?
 
@@ -507,12 +861,12 @@ final class LiveCamApertureView: NSView {
         contentView: NSView,
         interactionView: LiveCamInteractionView,
         apertureMask: LiveCamApertureMask,
-        onDoubleClick: @escaping @MainActor () -> Void
+        onEnterSpace: @escaping @MainActor () -> Void
     ) {
         portalContentView = contentView
         self.interactionView = interactionView
         self.apertureMask = apertureMask
-        self.onDoubleClick = onDoubleClick
+        self.onEnterSpace = onEnterSpace
         super.init(frame: frame)
 
         wantsLayer = true
@@ -527,13 +881,6 @@ final class LiveCamApertureView: NSView {
         interactionView.autoresizingMask = [.width, .height]
         addSubview(interactionView)
 
-        let recognizer = NSClickGestureRecognizer(
-            target: self,
-            action: #selector(handleDoubleClick(_:))
-        )
-        recognizer.numberOfClicksRequired = 2
-        recognizer.buttonMask = LiveCamPointerBinding.moveWindow.buttonMasks[0]
-        addGestureRecognizer(recognizer)
         let moveRecognizer = NSPanGestureRecognizer(
             target: self,
             action: #selector(handleMove(_:))
@@ -568,6 +915,39 @@ final class LiveCamApertureView: NSView {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
         true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard event.buttonNumber == 0 else {
+            super.mouseDown(with: event)
+            return
+        }
+        clickDownLocation = convert(event.locationInWindow, from: nil)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard event.buttonNumber == 0 else {
+            super.mouseUp(with: event)
+            return
+        }
+        let downLocation = clickDownLocation
+        clickDownLocation = nil
+        let upLocation = convert(event.locationInWindow, from: nil)
+        guard let downLocation else { return }
+        let hitView = hitTest(downLocation)
+        let acceptsBackdrop = hitView === self
+            || (hitView.map { interactionView.isPassiveDecoration($0) } ?? false)
+        guard LiveCamSpaceEntryPolicy.shouldEnterSpace(
+            downLocation: downLocation,
+            upLocation: upLocation,
+            acceptsBackdropClick: acceptsBackdrop
+        ) else {
+            return
+        }
+        guard apertureMask.path(in: bounds).contains(upLocation) else {
+            return
+        }
+        onEnterSpace()
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -609,14 +989,6 @@ final class LiveCamApertureView: NSView {
     private func updateAperturePath() {
         apertureLayer.frame = bounds
         apertureLayer.path = apertureMask.path(in: bounds)
-    }
-
-    @objc
-    private func handleDoubleClick(_ recognizer: NSClickGestureRecognizer) {
-        guard recognizer.state == .ended else { return }
-        let location = recognizer.location(in: self)
-        guard apertureMask.path(in: bounds).contains(location) else { return }
-        onDoubleClick()
     }
 
     @objc

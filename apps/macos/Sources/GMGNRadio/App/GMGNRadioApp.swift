@@ -204,27 +204,9 @@ extension GMGNRadioApp {
         case .settings:
             Divider()
             Button("设置…") {
-                SettingsMenuAction(
-                    openSettings: { openSettings() },
-                    scheduleActivation: { activation in
-                        Task { @MainActor in
-                            try? await Task.sleep(for: .milliseconds(120))
-                            activation()
-                        }
-                    },
-                    activateApplication: {
-                        appDelegate.promoteToForeground()
-                    },
-                    revealSettingsWindow: {
-                        guard let window = NSApplication.shared.windows.first(
-                            where: SettingsWindowMatcher.matches
-                        ) else {
-                            return
-                        }
-                        window.makeKeyAndOrderFront(nil)
-                        window.orderFrontRegardless()
-                    }
-                ).perform()
+                appDelegate
+                    .makeSettingsMenuAction(openSettings: { openSettings() })
+                    .perform()
             }
         case .quit:
             Divider()
@@ -956,6 +938,53 @@ final class AppDelegate:
 
     func promoteToForeground() {
         applicationActivation.promoteToForeground()
+    }
+
+    func makeSettingsMenuAction(
+        openSettings: @escaping () -> Void
+    ) -> SettingsMenuAction {
+        SettingsMenuAction(
+            openSettings: openSettings,
+            scheduleActivation: { activation in
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(120))
+                    activation()
+                }
+            },
+            activateApplication: { [weak self] in
+                self?.promoteToForeground()
+            },
+            revealSettingsWindow: { [weak self] in
+                self?.revealSettingsWindow()
+            }
+        )
+    }
+
+    func revealSettingsWindow() {
+        guard let window = NSApplication.shared.windows.first(
+            where: SettingsWindowMatcher.matches
+        ) else {
+            return
+        }
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+    }
+
+    func openSystemSettings() {
+        makeSettingsMenuAction(openSettings: { [weak self] in
+            let revealedExistingWindow = NSApplication.shared.windows.contains(
+                where: SettingsWindowMatcher.matches
+            )
+            if revealedExistingWindow {
+                self?.revealSettingsWindow()
+            } else {
+                NSApp.sendAction(
+                    Selector(("showSettingsWindow:")),
+                    to: nil,
+                    from: nil
+                )
+            }
+        }).perform()
     }
 
     func toggleLyricsVisualMode() {
@@ -2257,6 +2286,27 @@ final class AppDelegate:
                         snapshot: self.avatarRuntime.snapshot
                     ) == .liveCam
                 },
+                onEnterSpace: { [weak self] in
+                    self?.showStage()
+                },
+                onOpenPlayer: { [weak self] in
+                    self?.showPlayer()
+                },
+                onOpenSettings: { [weak self] in
+                    self?.openSystemSettings()
+                },
+                onPreviousTrack: { [weak self] in
+                    self?.playPreviousProgramTrack()
+                },
+                onTogglePlayback: { [weak self] in
+                    self?.toggleLocalPlayback()
+                },
+                onNextTrack: { [weak self] in
+                    self?.playNextProgramTrack()
+                },
+                playerMenuSnapshotProvider: { [weak self] in
+                    self?.liveCamPlayerMenuSnapshot() ?? .noProgram
+                },
                 onSendMessage: { [weak self] message in
                     guard let self else { return }
                     try await self.sendLiveCamMessage(message)
@@ -2267,7 +2317,7 @@ final class AppDelegate:
             )
             liveCamWindowController.connect(
                 to: stageWindowController,
-                onOpenFullStage: { [weak self] in
+                onEnterSpace: { [weak self] in
                     self?.showStage()
                 }
             )
@@ -2632,6 +2682,20 @@ final class AppDelegate:
             canGoPrevious: hasProgram
                 && programPlaybackQueue.canReturnToPrevious,
             canGoNext: hasProgram && programPlaybackQueue.canAdvance
+        )
+    }
+
+    private func liveCamPlayerMenuSnapshot() -> LiveCamPlayerMenuSnapshot {
+        LiveCamPlayerMenuSnapshot.resolve(
+            playerState: localMusicPlayer.state,
+            hasPreparedProgram: activeProgram != nil
+                && programPlaybackQueue.current != nil,
+            trackTitle: programStore.activeSlot?.track.title
+                ?? localMusicPlayer.track?.title,
+            canSelectPrevious: activeProgram != nil
+                && programPlaybackQueue.canReturnToPrevious,
+            canSelectNext: activeProgram != nil
+                && programPlaybackQueue.canAdvance
         )
     }
 

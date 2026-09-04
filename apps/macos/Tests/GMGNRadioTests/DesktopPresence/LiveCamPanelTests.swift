@@ -90,36 +90,299 @@ func liveCamPanelCannotSelectAPhysicalCameraFeed() {
 
 @Test
 @MainActor
-func liveCamPanelForwardsAFullStageRequest() {
+func liveCamPanelForwardsAnEnterSpaceRequest() {
     var requests = 0
     let panel = LiveCamPanel(
         frame: CGRect(x: 0, y: 0, width: 200, height: 120),
         contentView: NSView(),
-        onOpenFullStage: { requests += 1 }
+        onEnterSpace: { requests += 1 }
     )
 
-    panel.requestOpenFullStage()
-    panel.requestOpenFullStage()
+    panel.requestEnterSpace()
+    panel.requestEnterSpace()
 
     #expect(requests == 2)
 }
 
 @Test
 @MainActor
-func liveCamPanelCanReplaceItsFullStageHandler() {
+func liveCamPanelCanReplaceItsEnterSpaceHandler() {
     var originalRequests = 0
     var replacementRequests = 0
     let panel = LiveCamPanel(
         frame: CGRect(x: 0, y: 0, width: 200, height: 120),
         contentView: NSView(),
-        onOpenFullStage: { originalRequests += 1 }
+        onEnterSpace: { originalRequests += 1 }
     )
 
-    panel.setOpenFullStageHandler { replacementRequests += 1 }
-    panel.requestOpenFullStage()
+    panel.setEnterSpaceHandler { replacementRequests += 1 }
+    panel.requestEnterSpace()
 
     #expect(originalRequests == 0)
     #expect(replacementRequests == 1)
+}
+
+@Test
+@MainActor
+func liveCamExposesFiveParallelNavigationButtonsWithChineseLabels() {
+    let panel = LiveCamPanel(
+        frame: CGRect(x: 0, y: 0, width: 224, height: 336),
+        contentView: NSView()
+    )
+    let view = panel.interactionView
+
+    #expect(view.spaceButton.accessibilityIdentifier() == "livecam.button.space")
+    #expect(view.playerButton.accessibilityIdentifier() == "livecam.button.player")
+    #expect(view.chatButton.accessibilityIdentifier() == "livecam.button.chat")
+    #expect(view.voiceButton.accessibilityIdentifier() == "livecam.button.voice")
+    #expect(view.settingsButton.accessibilityIdentifier() == "livecam.button.settings")
+
+    #expect(view.spaceButton.accessibilityLabel() == "进入空间")
+    #expect(view.playerButton.accessibilityLabel() == "播放器")
+    #expect(view.chatButton.accessibilityLabel() == "文字聊天")
+    #expect(view.voiceButton.accessibilityLabel()?.isEmpty == false)
+    #expect(view.settingsButton.accessibilityLabel() == "设置")
+
+    #expect(view.spaceButton.toolTip == "进入空间")
+    #expect(view.playerButton.toolTip == "播放器")
+    #expect(view.settingsButton.toolTip == "设置")
+}
+
+@Test
+@MainActor
+func liveCamSpaceButtonUsesTheSameEntryActionAsClickingTheBackdrop() {
+    var enterRequests = 0
+    let panel = LiveCamPanel(
+        frame: CGRect(x: 0, y: 0, width: 224, height: 336),
+        contentView: NSView(),
+        onEnterSpace: { enterRequests += 1 }
+    )
+
+    panel.interactionView.spaceButton.performClick(nil)
+
+    #expect(enterRequests == 1)
+}
+
+@Test
+@MainActor
+func liveCamSingleClickOnTheBackdropEntersSpace() throws {
+    var enterRequests = 0
+    let panel = LiveCamPanel(
+        frame: CGRect(x: 0, y: 0, width: 224, height: 336),
+        contentView: NSView(),
+        apertureMask: .roundedRectangle(cornerRadius: 28),
+        onEnterSpace: { enterRequests += 1 }
+    )
+    let apertureView = try #require(panel.contentView)
+
+    apertureView.mouseDown(with: try liveCamClickEvent(
+        .leftMouseDown,
+        at: CGPoint(x: 112, y: 168),
+        windowNumber: panel.windowNumber
+    ))
+    apertureView.mouseUp(with: try liveCamClickEvent(
+        .leftMouseUp,
+        at: CGPoint(x: 112, y: 168),
+        windowNumber: panel.windowNumber
+    ))
+
+    #expect(enterRequests == 1)
+}
+
+@Test
+@MainActor
+func liveCamDraggingTheWindowDoesNotEnterSpace() throws {
+    var enterRequests = 0
+    let panel = LiveCamPanel(
+        frame: CGRect(x: 0, y: 0, width: 224, height: 336),
+        contentView: NSView(),
+        apertureMask: .roundedRectangle(cornerRadius: 28),
+        onEnterSpace: { enterRequests += 1 }
+    )
+    let apertureView = try #require(panel.contentView)
+
+    apertureView.mouseDown(with: try liveCamClickEvent(
+        .leftMouseDown,
+        at: CGPoint(x: 60, y: 168),
+        windowNumber: panel.windowNumber
+    ))
+    apertureView.mouseUp(with: try liveCamClickEvent(
+        .leftMouseUp,
+        at: CGPoint(x: 120, y: 168),
+        windowNumber: panel.windowNumber
+    ))
+
+    #expect(enterRequests == 0)
+}
+
+@Test
+@MainActor
+func liveCamClickingAControlDoesNotEnterSpace() throws {
+    var enterRequests = 0
+    let panel = LiveCamPanel(
+        frame: CGRect(x: 0, y: 0, width: 224, height: 336),
+        contentView: NSView(),
+        apertureMask: .roundedRectangle(cornerRadius: 28),
+        onEnterSpace: { enterRequests += 1 }
+    )
+    let apertureView = try #require(panel.contentView)
+    apertureView.layoutSubtreeIfNeeded()
+
+    for button in [
+        panel.interactionView.spaceButton,
+        panel.interactionView.playerButton,
+        panel.interactionView.settingsButton,
+    ] {
+        let center = apertureView.convert(
+            CGPoint(x: button.bounds.midX, y: button.bounds.midY),
+            from: button
+        )
+        apertureView.mouseDown(with: try liveCamClickEvent(
+            .leftMouseDown,
+            at: center,
+            windowNumber: panel.windowNumber
+        ))
+        apertureView.mouseUp(with: try liveCamClickEvent(
+            .leftMouseUp,
+            at: center,
+            windowNumber: panel.windowNumber
+        ))
+    }
+
+    #expect(enterRequests == 0)
+}
+
+@Test
+@MainActor
+func liveCamPlayerMenuReflectsTheCurrentSnapshot() throws {
+    let builder = LiveCamPlayerMenuBuilder()
+    var previousRequests = 0
+    let menu = builder.rebuild(
+        snapshot: LiveCamPlayerMenuSnapshot(
+            trackTitle: "夜色爵士",
+            isPlaying: true,
+            canTogglePlayback: true,
+            canSelectPrevious: true,
+            canSelectNext: false
+        ),
+        onPreviousTrack: { previousRequests += 1 },
+        onTogglePlayback: {},
+        onNextTrack: {},
+        onOpenPlayer: {}
+    )
+
+    let items = menu.items.filter { !$0.isSeparatorItem }
+
+    #expect(items.map(\.title) == [
+        "夜色爵士",
+        "上一首",
+        "暂停",
+        "下一首",
+        "进入播放器",
+    ])
+    #expect(
+        items.map { $0.accessibilityIdentifier() } == [
+            "livecam.player.menu.track",
+            "livecam.player.menu.previous",
+            "livecam.player.menu.playback",
+            "livecam.player.menu.next",
+            "livecam.player.menu.openPlayer",
+        ]
+    )
+    #expect(items.map(\.isEnabled) == [false, true, true, false, true])
+
+    try #require(items.count == 5)
+    menu.performActionForItem(at: 2)
+    #expect(previousRequests == 1)
+}
+
+@Test
+@MainActor
+func liveCamPlayerMenuWithoutAPlayableProgramDisablesTrackControls() {
+    let menu = LiveCamPlayerMenuBuilder().rebuild(
+        snapshot: LiveCamPlayerMenuSnapshot(
+            trackTitle: nil,
+            isPlaying: false,
+            canTogglePlayback: false,
+            canSelectPrevious: false,
+            canSelectNext: false
+        )
+    )
+
+    let items = menu.items.filter { !$0.isSeparatorItem }
+
+    #expect(items[0].title == "暂无播放节目")
+    #expect(!items[0].isEnabled)
+    #expect(items[1].title == "播放")
+    #expect(!items[1].isEnabled)
+    #expect(!items[2].isEnabled)
+    #expect(!items[3].isEnabled)
+}
+
+@Test
+@MainActor
+func liveCamOpeningThePlayerMenuDoesNotChangePlaybackState() {
+    var playbackToggles = 0
+    var snapshot: LiveCamPlayerMenuSnapshot = .noProgram
+    let panel = LiveCamPanel(
+        frame: CGRect(x: 0, y: 0, width: 224, height: 336),
+        contentView: NSView(),
+        onTogglePlayback: { playbackToggles += 1 },
+        playerMenuSnapshotProvider: {
+            snapshot = LiveCamPlayerMenuSnapshot(
+                trackTitle: "夜色爵士",
+                isPlaying: true,
+                canTogglePlayback: true,
+                canSelectPrevious: true,
+                canSelectNext: true
+            )
+            return snapshot
+        }
+    )
+
+    let menu = panel.makePlayerMenu()
+    let playbackItem = menu.items.first {
+        $0.accessibilityIdentifier() == "livecam.player.menu.playback"
+    }
+
+    #expect(playbackToggles == 0)
+    #expect(playbackItem?.title == "暂停")
+}
+
+@Test
+@MainActor
+func liveCamSettingsEntryOnlyCallsTheUnifiedSettingsEntry() {
+    var settingsRequests = 0
+    var enterRequests = 0
+    let panel = LiveCamPanel(
+        frame: CGRect(x: 0, y: 0, width: 224, height: 336),
+        contentView: NSView(),
+        onEnterSpace: { enterRequests += 1 },
+        onOpenSettings: { settingsRequests += 1 }
+    )
+
+    panel.interactionView.settingsButton.performClick(nil)
+
+    #expect(settingsRequests == 1)
+    #expect(enterRequests == 0)
+}
+
+private func liveCamClickEvent(
+    _ type: NSEvent.EventType,
+    at point: CGPoint,
+    windowNumber: Int
+) throws -> NSEvent {
+    try #require(NSEvent.mouseEvent(
+        with: type,
+        location: point,
+        modifierFlags: [],
+        timestamp: 0,
+        windowNumber: windowNumber,
+        context: nil,
+        eventNumber: 0,
+        clickCount: 1,
+        pressure: 1
+    ))
 }
 
 @Test
