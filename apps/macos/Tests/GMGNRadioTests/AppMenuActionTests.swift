@@ -273,12 +273,26 @@ func livingWorldStageEntryRequestsTheWorldBeforeShowingTheWindow() {
 }
 
 @Test
+func systemResidentMenuPresentsOnlyEntryActionsInFixedOrder() {
+    #expect(
+        SystemResidentMenuPolicy.entries == [
+            .showLiveCam,
+            .enterSpace,
+            .openPlayer,
+            .settings,
+            .quit,
+        ]
+    )
+}
+
+@Test
 @MainActor
 func appMenuActionsForwardToTheAdaptedApplicationController() {
     let controller = ApplicationControllerSpy()
 
     AppMenuAction.startAIProgram.perform(on: controller)
     AppMenuAction.showStage.perform(on: controller)
+    AppMenuAction.showPlayer.perform(on: controller)
     AppMenuAction.showLiveCam.perform(on: controller)
     AppMenuAction.playCharacterMotion(id: "builtin.motion.iluvslapbass")
         .perform(on: controller)
@@ -292,6 +306,7 @@ func appMenuActionsForwardToTheAdaptedApplicationController() {
 
     #expect(controller.startAIProgramCallCount == 1)
     #expect(controller.showStageCallCount == 1)
+    #expect(controller.showPlayerCallCount == 1)
     #expect(controller.showLiveCamCallCount == 1)
     #expect(
         controller.playedCharacterMotionIDs
@@ -310,6 +325,7 @@ func appMenuActionsForwardToTheAdaptedApplicationController() {
 private final class ApplicationControllerSpy: GMGNApplicationControlling {
     private(set) var startAIProgramCallCount = 0
     private(set) var showStageCallCount = 0
+    private(set) var showPlayerCallCount = 0
     private(set) var showLiveCamCallCount = 0
     private(set) var playedCharacterMotionIDs: [String] = []
     private(set) var livingActivityIDs: [String] = []
@@ -326,6 +342,10 @@ private final class ApplicationControllerSpy: GMGNApplicationControlling {
 
     func showStage() {
         showStageCallCount += 1
+    }
+
+    func showPlayer() {
+        showPlayerCallCount += 1
     }
 
     func showLiveCam() {

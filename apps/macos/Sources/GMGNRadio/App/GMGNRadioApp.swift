@@ -136,56 +136,72 @@ struct DockReopenAction {
 @main
 struct GMGNRadioApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var livingActivityMenuStore =
-        LivingWorldActivityMenuStore.shared
     @Environment(\.openSettings) private var openSettings
 
     var body: some Scene {
         MenuBarExtra(ProductIdentity.displayName, systemImage: "waveform.circle.fill") {
-            Button("开始 AI 电台") {
-                AppMenuAction.startAIProgram.perform(on: appDelegate)
+            ForEach(SystemResidentMenuPolicy.entries, id: \.self) { entry in
+                systemResidentMenuItem(for: entry)
             }
-            Divider()
-            Button("播放本地音乐…") {
-                AppMenuAction.chooseLocalTrack.perform(on: appDelegate)
-            }
-            Button("暂停 / 继续音乐") {
-                AppMenuAction.toggleLocalPlayback.perform(on: appDelegate)
-            }
-            Divider()
-            Button("打开 360°舞台") {
-                AppMenuAction.showStage.perform(on: appDelegate)
-            }
+        }
+
+        Settings {
+            GMGNSettingsView(
+                visualDirections: appDelegate.visualSettingsStore,
+                shortcutSettings: appDelegate.shortcutSettingsStore,
+                connectRealtimeVoice: { configuration in
+                    appDelegate.connectRealtimeVoice(configuration)
+                },
+                disconnectRealtimeVoice: {
+                    appDelegate.disconnectRealtimeVoice()
+                },
+                agentConfigurationChanged: {
+                    appDelegate.refreshAgentConfiguration()
+                }
+            )
+                .frame(minWidth: 540, minHeight: 440)
+        }
+        .defaultSize(width: 580, height: 500)
+    }
+}
+
+enum SystemResidentMenuEntry: Hashable, Sendable {
+    case showLiveCam
+    case enterSpace
+    case openPlayer
+    case settings
+    case quit
+}
+
+enum SystemResidentMenuPolicy {
+    static let entries: [SystemResidentMenuEntry] = [
+        .showLiveCam,
+        .enterSpace,
+        .openPlayer,
+        .settings,
+        .quit,
+    ]
+}
+
+extension GMGNRadioApp {
+    @ViewBuilder
+    private func systemResidentMenuItem(
+        for entry: SystemResidentMenuEntry
+    ) -> some View {
+        switch entry {
+        case .showLiveCam:
             Button("显示 Live Cam") {
                 AppMenuAction.showLiveCam.perform(on: appDelegate)
             }
-            Button("关闭 360°舞台") {
-                AppMenuAction.closeStage.perform(on: appDelegate)
+        case .enterSpace:
+            Button("进入空间") {
+                AppMenuAction.showStage.perform(on: appDelegate)
             }
-            Divider()
-            Menu("角色动作") {
-                ForEach(appDelegate.characterMotionMenuItems) { item in
-                    Button(item.isActive ? "✓ \(item.name)" : item.name) {
-                        AppMenuAction.playCharacterMotion(id: item.id)
-                            .perform(on: appDelegate)
-                    }
-                }
+        case .openPlayer:
+            Button("打开播放器") {
+                AppMenuAction.showPlayer.perform(on: appDelegate)
             }
-            Menu("生活活动") {
-                ForEach(livingActivityMenuStore.items) { item in
-                    Button(item.name) {
-                        AppMenuAction.runLivingActivity(id: item.id)
-                            .perform(on: appDelegate)
-                    }
-                }
-                Divider()
-                Button("停止当前活动") {
-                    AppMenuAction.stopLivingActivity.perform(on: appDelegate)
-                }
-            }
-            Button("切换歌词视觉") {
-                AppMenuAction.toggleLyricsVisualMode.perform(on: appDelegate)
-            }
+        case .settings:
             Divider()
             Button("设置…") {
                 SettingsMenuAction(
@@ -210,32 +226,12 @@ struct GMGNRadioApp: App {
                     }
                 ).perform()
             }
-            Button("退出桌面背景") {
-                AppMenuAction.exitImmersiveVisuals.perform(on: appDelegate)
-            }
+        case .quit:
             Divider()
-            Button("Quit gmgn radio") {
+            Button("退出 gmgn radio") {
                 NSApplication.shared.terminate(nil)
             }
         }
-
-        Settings {
-            GMGNSettingsView(
-                visualDirections: appDelegate.visualSettingsStore,
-                shortcutSettings: appDelegate.shortcutSettingsStore,
-                connectRealtimeVoice: { configuration in
-                    appDelegate.connectRealtimeVoice(configuration)
-                },
-                disconnectRealtimeVoice: {
-                    appDelegate.disconnectRealtimeVoice()
-                },
-                agentConfigurationChanged: {
-                    appDelegate.refreshAgentConfiguration()
-                }
-            )
-                .frame(minWidth: 540, minHeight: 440)
-        }
-        .defaultSize(width: 580, height: 500)
     }
 }
 
@@ -243,6 +239,7 @@ struct GMGNRadioApp: App {
 protocol GMGNApplicationControlling: AnyObject {
     func startAIProgram()
     func showStage()
+    func showPlayer()
     func showLiveCam()
     func playCharacterMotion(id: String)
     func closeStage()
@@ -403,6 +400,7 @@ enum CharacterMotionMenuPolicy {
 enum AppMenuAction: Sendable {
     case startAIProgram
     case showStage
+    case showPlayer
     case showLiveCam
     case playCharacterMotion(id: String)
     case closeStage
@@ -420,6 +418,8 @@ enum AppMenuAction: Sendable {
             controller.startAIProgram()
         case .showStage:
             controller.showStage()
+        case .showPlayer:
+            controller.showPlayer()
         case .showLiveCam:
             controller.showLiveCam()
         case let .playCharacterMotion(id):
@@ -511,19 +511,6 @@ final class AppDelegate:
     }
     var shortcutSettingsStore: GMGNShortcutSettingsStore {
         shortcutSettings
-    }
-    var characterMotionMenuItems: [CharacterMotionMenuItem] {
-        guard
-            let motionPackageStore,
-            let motions = try? motionPackageStore.listMotions()
-        else {
-            return []
-        }
-        let activeMotionID = try? motionPackageStore.activeMotion().id
-        return CharacterMotionMenuPolicy.items(
-            motions: motions,
-            activeMotionID: activeMotionID
-        )
     }
     private lazy var musicRuntime = MusicRuntime.live()
     private var audioGraphStorage: AudioGraphController?
@@ -841,6 +828,18 @@ final class AppDelegate:
                 self?.stageWindowController?.show()
             }
         ).perform()
+    }
+
+    func showPlayer() {
+        promoteToForeground()
+        if livingWorldContext == nil {
+            configureLivingWorld()
+        }
+        if stageWindowController == nil {
+            configureStage()
+        }
+        spatialStage.exitWorld()
+        stageWindowController?.show()
     }
 
     func showLiveCam() {
