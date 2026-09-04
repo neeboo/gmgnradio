@@ -38,7 +38,8 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     private var playbackState: LocalMusicPlaybackState
     private var voiceState: RealtimeVoiceConnectionState
     private weak var stageContentView: StageContentView?
-    private var onWillShowHandler: (@MainActor () -> Void)?
+    private var onWillPresentSpaceHandler: (@MainActor () -> Void)?
+    private var onShowPlayerHandler: (@MainActor () -> Void)?
     private var onCloseHandler: (@MainActor () -> Void)?
     private var didHandleCurrentClose = false
 
@@ -123,8 +124,12 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         onCloseHandler = handler
     }
 
-    func setOnWillShowHandler(_ handler: (@MainActor () -> Void)?) {
-        onWillShowHandler = handler
+    func setOnWillPresentSpaceHandler(_ handler: (@MainActor () -> Void)?) {
+        onWillPresentSpaceHandler = handler
+    }
+
+    func setOnShowPlayerHandler(_ handler: (@MainActor () -> Void)?) {
+        onShowPlayerHandler = handler
     }
 
     func setPlaybackState(_ state: LocalMusicPlaybackState) {
@@ -165,12 +170,14 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
             "Showing stage requested=\(self.spatialStage.isWorldPresentationRequested, privacy: .public) visible=\(self.spatialStage.isWorldVisible, privacy: .public)"
         )
         didHandleCurrentClose = false
-        onWillShowHandler?()
-        cameraCoordinator.activateFullStage(
-            defaultCamera: SpatialWorldCalibration.resolve(
-                worldID: spatialStage.selectedWorldID
-            )?.cameraHome
-        )
+        if spatialStage.isWorldPresentationRequested {
+            onWillPresentSpaceHandler?()
+            cameraCoordinator.activateFullStage(
+                defaultCamera: SpatialWorldCalibration.resolve(
+                    worldID: spatialStage.selectedWorldID
+                )?.cameraHome
+            )
+        }
         if window == nil {
             window = makeWindow()
         }
@@ -181,7 +188,11 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         NSApplication.shared.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
-        stageContentView?.attachRenderSurface()
+        if spatialStage.isWorldPresentationRequested {
+            stageContentView?.attachRenderSurface()
+        } else {
+            onShowPlayerHandler?()
+        }
         updateRenderSurfaceVisibility(for: window)
         Self.log.notice(
             "Stage shown surfaceOwner=\(String(describing: self.renderSurfaceController.owner), privacy: .public) requested=\(self.spatialStage.isWorldPresentationRequested, privacy: .public) visible=\(self.spatialStage.isWorldVisible, privacy: .public)"
@@ -285,6 +296,12 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
             onNextTrack: onNextTrack,
             onReplanProgram: onReplanProgram,
             onToggleVoice: onToggleVoice,
+            onEnterSpace: { [weak self] in
+                self?.onWillPresentSpaceHandler?()
+            },
+            onShowPlayer: { [weak self] in
+                self?.onShowPlayerHandler?()
+            },
             onToggleWindowMode: { [weak window] in
                 window?.toggleFullScreen(nil)
             }
@@ -443,6 +460,8 @@ private final class StageContentView: NSView {
         onNextTrack: @escaping @MainActor () -> Void,
         onReplanProgram: @escaping @MainActor () -> Void,
         onToggleVoice: @escaping @MainActor () -> Void,
+        onEnterSpace: @escaping @MainActor () -> Void,
+        onShowPlayer: @escaping @MainActor () -> Void,
         onToggleWindowMode: @escaping @MainActor () -> Void
     ) {
         overlayState = StageOverlayState()
@@ -513,7 +532,6 @@ private final class StageContentView: NSView {
         renderSurfaceContainer.wantsLayer = true
         renderSurfaceContainer.layer?.zPosition = 1.5
         addSubview(renderSurfaceContainer)
-        renderSurfaceController.attachToFullStage(renderSurfaceContainer)
 
         let metalView = MetalStageView(
             frame: bounds,
@@ -620,9 +638,11 @@ private final class StageContentView: NSView {
                     spatialStage.isWorldPresentationRequested
             ) {
             case .enterSpace:
+                onEnterSpace()
                 spatialStage.requestWorldPresentation()
             case .showPlayer:
                 spatialStage.exitWorld()
+                onShowPlayer()
             }
         }
         destinationButton.translatesAutoresizingMaskIntoConstraints = false
@@ -764,6 +784,9 @@ private final class StageContentView: NSView {
     }
 
     private func applySpatialPresentation(isWorldVisible: Bool) {
+        if spatialStage.isWorldPresentationRequested {
+            attachRenderSurface()
+        }
         let state = StageSurfacePresentationState.resolve(
             isWorldPresentationRequested:
                 spatialStage.isWorldPresentationRequested,

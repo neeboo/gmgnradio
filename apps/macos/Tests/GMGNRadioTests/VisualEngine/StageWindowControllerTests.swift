@@ -473,6 +473,138 @@ func stageWindowControllerRunsAudioMonitoringOnlyWhilePresented() {
 
 @Test
 @MainActor
+func openingThePlayerDoesNotStartAFullSpaceTransition() {
+    let spatialStage = SpatialStageStore()
+    let controller = StageWindowController(
+        audioFeatures: VisualAudioFeatureStore(),
+        spatialStage: spatialStage
+    )
+    var fullSpaceTransitionCount = 0
+    controller.setOnWillPresentSpaceHandler {
+        fullSpaceTransitionCount += 1
+    }
+
+    controller.show()
+
+    #expect(fullSpaceTransitionCount == 0)
+    controller.close()
+}
+
+@Test
+@MainActor
+func openingThePlayerKeepsTheLiveCamCompanionActive() {
+    let spatialStage = SpatialStageStore()
+    let controller = StageWindowController(
+        audioFeatures: VisualAudioFeatureStore(),
+        spatialStage: spatialStage
+    )
+    var playerPresentationCount = 0
+    controller.setOnShowPlayerHandler {
+        playerPresentationCount += 1
+    }
+
+    controller.show()
+
+    #expect(playerPresentationCount == 1)
+    controller.close()
+}
+
+@Test
+@MainActor
+func enteringSpaceFromThePlayerStartsAFullSpaceTransition() throws {
+    let spatialStage = SpatialStageStore()
+    let controller = StageWindowController(
+        audioFeatures: VisualAudioFeatureStore(),
+        spatialStage: spatialStage
+    )
+    var fullSpaceTransitionCount = 0
+    controller.setOnWillPresentSpaceHandler {
+        fullSpaceTransitionCount += 1
+    }
+    controller.show()
+    fullSpaceTransitionCount = 0
+
+    let destinationButton = try #require(
+        controller.window?.contentView?
+            .descendants
+            .compactMap { $0 as? NSButton }
+            .first {
+                $0.identifier?.rawValue == "stage.destination-toggle"
+            }
+    )
+    destinationButton.performClick(nil)
+
+    #expect(fullSpaceTransitionCount == 1)
+    controller.close()
+}
+
+@Test
+@MainActor
+func switchingFromSpaceToPlayerRestoresTheLiveCamCompanion() throws {
+    let spatialStage = SpatialStageStore()
+    spatialStage.requestWorldPresentation()
+    let controller = StageWindowController(
+        audioFeatures: VisualAudioFeatureStore(),
+        spatialStage: spatialStage
+    )
+    var playerPresentationCount = 0
+    controller.setOnShowPlayerHandler {
+        playerPresentationCount += 1
+    }
+    controller.show()
+
+    let destinationButton = try #require(
+        controller.window?.contentView?
+            .descendants
+            .compactMap { $0 as? NSButton }
+            .first {
+                $0.identifier?.rawValue == "stage.destination-toggle"
+            }
+    )
+    destinationButton.performClick(nil)
+
+    #expect(playerPresentationCount == 1)
+    controller.close()
+}
+
+@Test
+@MainActor
+func playerKeepsTheSharedAvatarSurfaceInLiveCamUntilSpaceStarts() throws {
+    let spatialStage = SpatialStageStore()
+    let marbleLibrary = MarbleWorldLibrary(spatialStage: spatialStage)
+    let renderSurfaceController = StageRenderSurfaceController(
+        spatialStage: spatialStage,
+        library: marbleLibrary
+    )
+    let liveCamContainer = NSView()
+    renderSurfaceController.attachToLiveCam(liveCamContainer)
+    let controller = StageWindowController(
+        audioFeatures: VisualAudioFeatureStore(),
+        spatialStage: spatialStage,
+        marbleLibrary: marbleLibrary,
+        renderSurfaceController: renderSurfaceController
+    )
+
+    controller.show()
+
+    #expect(renderSurfaceController.owner == .liveCam)
+
+    let destinationButton = try #require(
+        controller.window?.contentView?
+            .descendants
+            .compactMap { $0 as? NSButton }
+            .first {
+                $0.identifier?.rawValue == "stage.destination-toggle"
+            }
+    )
+    destinationButton.performClick(nil)
+
+    #expect(renderSurfaceController.owner == .fullStage)
+    controller.close()
+}
+
+@Test
+@MainActor
 func stageWindowControllerIncludesAWindowModeButton() {
     let controller = StageWindowController(
         audioFeatures: VisualAudioFeatureStore()
@@ -550,8 +682,11 @@ func stageComposesVideoBelowTheTransparentMetalParticles() throws {
 @Test
 @MainActor
 func stageComposesTheSpatialWorldAboveParticlesWithoutCapturingInput() throws {
+    let spatialStage = SpatialStageStore()
+    spatialStage.requestWorldPresentation()
     let controller = StageWindowController(
-        audioFeatures: VisualAudioFeatureStore()
+        audioFeatures: VisualAudioFeatureStore(),
+        spatialStage: spatialStage
     )
 
     controller.show()
@@ -635,8 +770,8 @@ func stageDestinationButtonStaysAvailableAcrossStageModes() throws {
 
     controller.show()
     let descendants = controller.window?.contentView?.descendants ?? []
-    let spatialWorld = try #require(descendants.first {
-        $0.identifier?.rawValue == "stage.marble-spatial-world"
+    let surfaceContainer = try #require(descendants.first {
+        $0.identifier?.rawValue == "stage.shared-render-surface-container"
     })
     let destinationButton = try #require(
         descendants
@@ -653,7 +788,7 @@ func stageDestinationButtonStaysAvailableAcrossStageModes() throws {
             }
     )
 
-    #expect(spatialWorld.isHidden)
+    #expect(surfaceContainer.isHidden)
     #expect(!destinationButton.isHidden)
     #expect(destinationButton.title == "空间")
     #expect(visualButton.toolTip == "选择字幕、点阵与 MV")
@@ -665,15 +800,23 @@ func stageDestinationButtonStaysAvailableAcrossStageModes() throws {
     #expect(destinationButton.title == "播放器")
     #expect(visualButton.toolTip == "选择空间与人物位置")
 
+    let spatialWorld = try #require(
+        controller.window?.contentView?.descendants.first {
+            $0.identifier?.rawValue == "stage.marble-spatial-world"
+        }
+    )
+    #expect(spatialWorld.superview === surfaceContainer)
+    #expect(surfaceContainer.isHidden)
+
     spatialStage.finishWorldPresentation()
 
-    #expect(!spatialWorld.isHidden)
+    #expect(!surfaceContainer.isHidden)
     #expect(!destinationButton.isHidden)
 
     destinationButton.performClick(nil)
 
     #expect(!spatialStage.isWorldPresentationRequested)
-    #expect(spatialWorld.isHidden)
+    #expect(surfaceContainer.isHidden)
     #expect(!destinationButton.isHidden)
     #expect(destinationButton.title == "空间")
     #expect(visualButton.toolTip == "选择字幕、点阵与 MV")

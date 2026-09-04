@@ -116,8 +116,11 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
         onEnterSpace: @escaping @MainActor () -> Void
     ) {
         self.onEnterSpace = onEnterSpace
-        stageWindowController.setOnWillShowHandler { [weak self] in
+        stageWindowController.setOnWillPresentSpaceHandler { [weak self] in
             self?.prepareForFullStagePresentation()
+        }
+        stageWindowController.setOnShowPlayerHandler { [weak self] in
+            self?.show()
         }
         stageWindowController.setOnCloseHandler { [weak self] in
             self?.resumeAfterFullStageClosed()
