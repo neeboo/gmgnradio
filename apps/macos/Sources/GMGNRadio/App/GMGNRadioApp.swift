@@ -1086,7 +1086,9 @@ final class AppDelegate:
                     let payload = BailianSessionPayload(
                         apiKey: apiKey,
                         model: model,
-                        voiceID: voiceID
+                        voiceID: voiceID,
+                        microphoneDeviceID:
+                            configuration.microphoneDeviceID
                     )
                     session = BailianRealtimeSession.live(
                         audioGraph: audioGraph,

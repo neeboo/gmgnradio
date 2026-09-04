@@ -5,6 +5,19 @@ struct BailianSessionPayload: Codable, Equatable, Sendable {
     let apiKey: String
     let model: String
     let voiceID: String
+    let microphoneDeviceID: String?
+
+    init(
+        apiKey: String,
+        model: String,
+        voiceID: String,
+        microphoneDeviceID: String? = nil
+    ) {
+        self.apiKey = apiKey
+        self.model = model
+        self.voiceID = voiceID
+        self.microphoneDeviceID = microphoneDeviceID
+    }
 }
 
 struct BailianDecodedMessage: Equatable, Sendable {
@@ -422,7 +435,9 @@ final class BailianWebSocketRealtimeTransport:
             return
         }
         if enabled {
-            try audioGraph.startBailianMicrophoneCapture {
+            try audioGraph.startBailianMicrophoneCapture(
+                preferredDeviceID: payload?.microphoneDeviceID
+            ) {
                 [weak self] data, level in
                 Task { @MainActor [weak self] in
                     await self?.handleMicrophoneData(

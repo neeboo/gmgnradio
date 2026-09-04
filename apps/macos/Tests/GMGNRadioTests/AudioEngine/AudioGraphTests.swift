@@ -150,6 +150,46 @@ func bailianMicrophonePrefersPhysicalInputOverVirtualDefault() {
 }
 
 @Test
+func bailianMicrophoneHonorsAnExplicitAvailableInput() {
+    let devices = [
+        BailianMicrophoneDeviceOption(
+            id: "BuiltInMicrophoneDevice",
+            name: "MacBook Pro麦克风"
+        ),
+        BailianMicrophoneDeviceOption(
+            id: "PD200X",
+            name: "PD200X Podcast Microphone"
+        ),
+    ]
+
+    let selected = BailianMicrophoneDeviceSelector.preferredID(
+        requestedID: "PD200X",
+        defaultID: "BuiltInMicrophoneDevice",
+        devices: devices
+    )
+
+    #expect(selected == "PD200X")
+}
+
+@Test
+func bailianMicrophoneFallsBackWhenSavedInputDisappears() {
+    let devices = [
+        BailianMicrophoneDeviceOption(
+            id: "BuiltInMicrophoneDevice",
+            name: "MacBook Pro麦克风"
+        ),
+    ]
+
+    let selected = BailianMicrophoneDeviceSelector.preferredID(
+        requestedID: "missing-microphone",
+        defaultID: "BuiltInMicrophoneDevice",
+        devices: devices
+    )
+
+    #expect(selected == "BuiltInMicrophoneDevice")
+}
+
+@Test
 @MainActor
 func audioGraphRendersLocalMusicAndPausesToSilence() throws {
     let sourceURL = FileManager.default.temporaryDirectory

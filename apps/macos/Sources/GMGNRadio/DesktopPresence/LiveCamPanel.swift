@@ -48,6 +48,11 @@ struct LiveCamWindowPointerDelta: Equatable, Sendable {
 
 @MainActor
 final class LiveCamInteractionView: NSView {
+    private enum ReplyPresentation {
+        case agentReply
+        case chatStatus
+    }
+
     let chatButton = NSButton()
     let voiceButton = NSButton()
     let messageField = NSTextField()
@@ -57,6 +62,7 @@ final class LiveCamInteractionView: NSView {
     private let composer = NSVisualEffectView()
     private let replyBubble = NSVisualEffectView()
     private let replyLabel = NSTextField(wrappingLabelWithString: "")
+    private var replyPresentation: ReplyPresentation?
     private var onSendMessage: @MainActor (String) -> Void
     private var onToggleVoice: @MainActor () -> Void
     var onComposerVisibilityChanged: @MainActor (Bool) -> Void = { _ in }
@@ -116,9 +122,23 @@ final class LiveCamInteractionView: NSView {
     }
 
     func showReply(_ text: String) {
+        show(text, as: .agentReply)
+    }
+
+    func showChatStatus(_ text: String) {
+        show(text, as: .chatStatus)
+    }
+
+    func dismissChatStatus() {
+        guard replyPresentation == .chatStatus else { return }
+        show("", as: .chatStatus)
+    }
+
+    private func show(_ text: String, as presentation: ReplyPresentation) {
         let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
         replyLabel.stringValue = normalized
         replyBubble.isHidden = normalized.isEmpty
+        replyPresentation = normalized.isEmpty ? nil : presentation
     }
 
     func setVoiceState(_ state: RealtimeVoiceConnectionState) {
@@ -149,6 +169,12 @@ final class LiveCamInteractionView: NSView {
             accessibilityDescription: label
         )
         voiceButton.toolTip = label
+        switch state {
+        case .connected, .listening, .speaking:
+            dismissChatStatus()
+        case .disconnected, .connecting, .failed:
+            break
+        }
     }
 
     private func configureViews() {
@@ -431,6 +457,10 @@ final class LiveCamPanel: NSPanel {
 
     func showAgentReply(_ text: String) {
         interactionView.showReply(text)
+    }
+
+    func showChatStatus(_ text: String) {
+        interactionView.showChatStatus(text)
     }
 
     func setVoiceState(_ state: RealtimeVoiceConnectionState) {

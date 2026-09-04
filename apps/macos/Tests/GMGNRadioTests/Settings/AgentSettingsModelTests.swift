@@ -196,16 +196,14 @@ func agentSettingsLogsOutOfCodexAndReturnsToSignedOut() async {
 
 @MainActor
 @Test
-func agentSettingsPersistsRealtimeVoiceWithoutPuttingTokenInDefaults()
+func agentSettingsPersistsRealtimeVoiceWithoutKeychainPrompts()
     throws
 {
     let suiteName = "RealtimeVoiceSettingsTests.\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: suiteName))
     defer { defaults.removePersistentDomain(forName: suiteName) }
-    let secrets = RealtimeVoiceSecretStoreStub()
     let voicePreferences = RealtimeVoicePreferences(
-        defaults: defaults,
-        secrets: secrets
+        defaults: defaults
     )
     let model = AgentSettingsModel(
         preferences: DJAgentPreferences(defaults: defaults),
@@ -225,14 +223,10 @@ func agentSettingsPersistsRealtimeVoiceWithoutPuttingTokenInDefaults()
     #expect(
         defaults.string(
             forKey: RealtimeVoicePreferences.conversationTokenKey
-        ) == nil
+        ) == "private-token"
     )
     #expect(
-        secrets.values[RealtimeVoicePreferences.conversationTokenKey]
-            == "private-token"
-    )
-    #expect(
-        secrets.values[RealtimeVoicePreferences.apiKeyKey]
+        defaults.string(forKey: RealtimeVoicePreferences.apiKeyKey)
             == "sk-elevenlabs"
     )
 }
@@ -266,16 +260,14 @@ func realtimeVoiceConfigurationRejectsThePlaceholderAgentID() {
 
 @MainActor
 @Test
-func agentSettingsSwitchesProviderAndStoresBailianKeyInKeychain()
+func agentSettingsSwitchesProviderAndStoresBailianKeyLocally()
     throws
 {
     let suiteName = "RealtimeVoiceProviderTests.\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: suiteName))
     defer { defaults.removePersistentDomain(forName: suiteName) }
-    let secrets = RealtimeVoiceSecretStoreStub()
     let preferences = RealtimeVoicePreferences(
-        defaults: defaults,
-        secrets: secrets
+        defaults: defaults
     )
     let model = AgentSettingsModel(voicePreferences: preferences)
 
@@ -288,8 +280,36 @@ func agentSettingsSwitchesProviderAndStoresBailianKeyInKeychain()
     #expect(configuration.apiKey == "sk-bailian")
     #expect(configuration.model == BailianRealtimeOptions.defaultModel)
     #expect(configuration.voiceID == BailianRealtimeOptions.defaultVoice)
-    #expect(defaults.string(forKey: "voice.bailian.apiKey") == nil)
-    #expect(secrets.values["voice.bailian.apiKey"] == "sk-bailian")
+    #expect(
+        defaults.string(forKey: "voice.bailian.apiKey")
+            == "sk-bailian"
+    )
+}
+@MainActor
+@Test
+func agentSettingsPersistsTheSelectedMicrophone() throws {
+    let suiteName = "RealtimeVoiceMicrophoneTests.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let preferences = RealtimeVoicePreferences(
+        defaults: defaults
+    )
+    let model = AgentSettingsModel(voicePreferences: preferences)
+
+    model.selectRealtimeProvider(.bailian)
+    model.voiceAPIKey = "sk-bailian"
+    model.voiceMicrophoneDeviceID = "PD200X"
+
+    let configuration = try #require(model.saveVoiceConfiguration())
+    let reloaded = preferences.load(provider: .bailian)
+
+    #expect(configuration.microphoneDeviceID == "PD200X")
+    #expect(reloaded.microphoneDeviceID == "PD200X")
+    #expect(
+        defaults.string(
+            forKey: RealtimeVoicePreferences.microphoneDeviceIDKey
+        ) == "PD200X"
+    )
 }
 
 @MainActor
@@ -310,14 +330,6 @@ func bailianModelAndVoiceUseSelectableDefaults() {
         ).contains {
             $0.id == model.voiceID
         }
-    )
-}
-
-@Test
-func realtimeVoiceKeychainUsesTheStableSignatureNamespace() {
-    #expect(
-        KeychainRealtimeVoiceSecretStore.defaultService
-            == "ai.gmgn.radio.voice.stable-v1"
     )
 }
 
@@ -404,19 +416,5 @@ private final class CodexAccountServiceStub: CodexAccountServicing {
     func logout() async throws {
         logoutCount += 1
         state = .signedOut
-    }
-}
-
-private final class RealtimeVoiceSecretStoreStub:
-    RealtimeVoiceSecretStoring
-{
-    var values: [String: String] = [:]
-
-    func string(forKey key: String) -> String? {
-        values[key]
-    }
-
-    func setString(_ value: String?, forKey key: String) throws {
-        values[key] = value
     }
 }

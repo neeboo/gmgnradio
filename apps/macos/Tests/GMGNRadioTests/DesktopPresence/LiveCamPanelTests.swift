@@ -270,8 +270,26 @@ func liveCamVoiceEntryAndAgentReplyStayInsideThePortal() {
 
     panel.interactionView.voiceButton.performClick(nil)
     panel.showAgentReply("我找到一张很适合夜晚的唱片。")
+    panel.setVoiceState(.connected)
 
     #expect(voiceRequests == 1)
     #expect(panel.interactionView.replyText == "我找到一张很适合夜晚的唱片。")
     #expect(!panel.interactionView.isReplyHidden)
+}
+
+@Test
+@MainActor
+func liveCamClearsAStaleConnectionStatusAfterVoiceConnects() {
+    let panel = LiveCamPanel(
+        frame: CGRect(x: 0, y: 0, width: 224, height: 336),
+        contentView: NSView()
+    )
+
+    panel.showChatStatus("先点麦克风连接 Agent，再发送文字。")
+    #expect(!panel.interactionView.isReplyHidden)
+
+    panel.setVoiceState(.connected)
+
+    #expect(panel.interactionView.isReplyHidden)
+    #expect(panel.interactionView.replyText.isEmpty)
 }

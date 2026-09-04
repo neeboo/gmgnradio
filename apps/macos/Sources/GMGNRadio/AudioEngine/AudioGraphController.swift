@@ -191,16 +191,46 @@ private final class BailianConverterInputBox: @unchecked Sendable {
     }
 }
 
-struct BailianMicrophoneDeviceOption: Equatable, Sendable {
+struct BailianMicrophoneDeviceOption: Equatable, Sendable, Identifiable {
     let id: String
     let name: String
 }
 
+enum BailianMicrophoneDeviceCatalog {
+    static func availableDevices() -> [BailianMicrophoneDeviceOption] {
+        discoveryDevices().map {
+            BailianMicrophoneDeviceOption(
+                id: $0.uniqueID,
+                name: $0.localizedName
+            )
+        }
+    }
+
+    static func defaultDeviceID() -> String? {
+        AVCaptureDevice.default(for: .audio)?.uniqueID
+    }
+
+    fileprivate static func discoveryDevices() -> [AVCaptureDevice] {
+        AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.microphone],
+            mediaType: .audio,
+            position: .unspecified
+        ).devices
+    }
+}
+
 enum BailianMicrophoneDeviceSelector {
     static func preferredID(
+        requestedID: String? = nil,
         defaultID: String?,
         devices: [BailianMicrophoneDeviceOption]
     ) -> String? {
+        if
+            let requestedID,
+            devices.contains(where: { $0.id == requestedID })
+        {
+            return requestedID
+        }
         if
             let defaultID,
             let defaultDevice = devices.first(
@@ -268,6 +298,7 @@ final class BailianMicrophoneCapture:
     private var sampleCount = 0
 
     init(
+        preferredDeviceID: String? = nil,
         receive: @escaping @Sendable (
             Data,
             RealtimeDJAudioLevel
@@ -276,12 +307,7 @@ final class BailianMicrophoneCapture:
         self.receive = receive
         super.init()
 
-        let discovery = AVCaptureDevice.DiscoverySession(
-            deviceTypes: [.microphone],
-            mediaType: .audio,
-            position: .unspecified
-        )
-        let devices = discovery.devices
+        let devices = BailianMicrophoneDeviceCatalog.discoveryDevices()
         let options = devices.map {
             BailianMicrophoneDeviceOption(
                 id: $0.uniqueID,
@@ -289,6 +315,7 @@ final class BailianMicrophoneCapture:
             )
         }
         let preferredID = BailianMicrophoneDeviceSelector.preferredID(
+            requestedID: preferredDeviceID,
             defaultID: AVCaptureDevice.default(for: .audio)?.uniqueID,
             devices: options
         )
@@ -725,6 +752,7 @@ final class AudioGraphController: LocalMusicPlaybackGraph {
     }
 
     func startBailianMicrophoneCapture(
+        preferredDeviceID: String? = nil,
         _ receive: @escaping @Sendable (
             Data,
             RealtimeDJAudioLevel
@@ -733,7 +761,10 @@ final class AudioGraphController: LocalMusicPlaybackGraph {
         guard microphoneCapture == nil else {
             return
         }
-        let capture = try BailianMicrophoneCapture(receive: receive)
+        let capture = try BailianMicrophoneCapture(
+            preferredDeviceID: preferredDeviceID,
+            receive: receive
+        )
         microphoneCapture = capture
         capture.start()
     }

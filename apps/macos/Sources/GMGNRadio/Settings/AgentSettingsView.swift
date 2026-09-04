@@ -258,6 +258,17 @@ struct AgentSettingsView: View {
                         .tag(option.id)
                 }
             }
+            Picker(
+                "麦克风",
+                selection: $model.voiceMicrophoneDeviceID
+            ) {
+                Text(model.systemMicrophoneLabel)
+                    .tag("")
+                ForEach(model.voiceMicrophoneDevices) { device in
+                    Text(device.name)
+                        .tag(device.id)
+                }
+            }
         case .doubao:
             TextField(
                 "RTC App ID",
@@ -282,9 +293,9 @@ struct AgentSettingsView: View {
     private var providerHelpText: String {
         switch model.realtimeProvider {
         case .elevenLabs:
-            "可填写公开 Agent ID；私有 Agent 可手工填写 API Key，密钥只保存在本机钥匙串。"
+            "可填写公开 Agent ID；私有 Agent 的 API Key 保存在本机配置中。"
         case .bailian:
-            "API Key 只保存在本机；连接后由百炼负责听你说话和实时主持。"
+            "API Key 保存在本机配置中；改麦克风后请断开再连接。连接后由百炼负责听你说话和实时主持。"
         case .doubao:
             "豆包凭据会保存在本机；当前客户端尚未安装 RTC 连接器。"
         }

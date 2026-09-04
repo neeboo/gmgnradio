@@ -189,8 +189,7 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func showChatStatus(_ text: String) {
-        agentReplyBuffer = text
-        (window as? LiveCamPanel)?.showAgentReply(text)
+        (window as? LiveCamPanel)?.showChatStatus(text)
     }
 
     private func rotateCamera(by translation: CGSize) {

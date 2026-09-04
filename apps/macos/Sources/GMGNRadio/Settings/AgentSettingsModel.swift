@@ -1,7 +1,5 @@
 import Foundation
-import LocalAuthentication
 import Observation
-import Security
 
 struct BailianRealtimeModelOption: Identifiable, Equatable, Sendable {
     let id: String
@@ -128,6 +126,31 @@ struct RealtimeVoiceConfiguration: Equatable, Sendable {
     let appID: String?
     let accessToken: String?
     let resourceID: String?
+    let microphoneDeviceID: String?
+
+    init(
+        provider: RealtimeDJProvider,
+        apiKey: String?,
+        agentID: String?,
+        conversationToken: String?,
+        voiceID: String?,
+        model: String?,
+        appID: String?,
+        accessToken: String?,
+        resourceID: String?,
+        microphoneDeviceID: String? = nil
+    ) {
+        self.provider = provider
+        self.apiKey = apiKey
+        self.agentID = agentID
+        self.conversationToken = conversationToken
+        self.voiceID = voiceID
+        self.model = model
+        self.appID = appID
+        self.accessToken = accessToken
+        self.resourceID = resourceID
+        self.microphoneDeviceID = microphoneDeviceID
+    }
 
     var isReadyToConnect: Bool {
         switch provider {
@@ -146,94 +169,6 @@ struct RealtimeVoiceConfiguration: Equatable, Sendable {
     }
 }
 
-protocol RealtimeVoiceSecretStoring: AnyObject {
-    func string(forKey key: String) -> String?
-    func setString(_ value: String?, forKey key: String) throws
-}
-
-final class KeychainRealtimeVoiceSecretStore:
-    RealtimeVoiceSecretStoring
-{
-    static let defaultService = "ai.gmgn.radio.voice.stable-v1"
-
-    private let service: String
-
-    init(
-        service: String = KeychainRealtimeVoiceSecretStore.defaultService
-    ) {
-        self.service = service
-    }
-
-    func string(forKey key: String) -> String? {
-        var query = baseQuery(for: key)
-        query[kSecReturnData as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        let authenticationContext = LAContext()
-        authenticationContext.interactionNotAllowed = true
-        query[kSecUseAuthenticationContext as String] = authenticationContext
-        var result: CFTypeRef?
-        guard
-            SecItemCopyMatching(query as CFDictionary, &result)
-                == errSecSuccess,
-            let data = result as? Data
-        else {
-            return nil
-        }
-        return String(data: data, encoding: .utf8)
-    }
-
-    func setString(_ value: String?, forKey key: String) throws {
-        let query = baseQuery(for: key)
-        guard let value, !value.isEmpty else {
-            let status = SecItemDelete(query as CFDictionary)
-            guard status == errSecSuccess || status == errSecItemNotFound else {
-                throw RealtimeVoiceSecretError.keychain(status)
-            }
-            return
-        }
-
-        let data = Data(value.utf8)
-        let updateStatus = SecItemUpdate(
-            query as CFDictionary,
-            [kSecValueData as String: data] as CFDictionary
-        )
-        if updateStatus == errSecSuccess {
-            return
-        }
-        guard updateStatus == errSecItemNotFound else {
-            throw RealtimeVoiceSecretError.keychain(updateStatus)
-        }
-
-        var item = query
-        item[kSecValueData as String] = data
-        item[kSecAttrAccessible as String] =
-            kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        let addStatus = SecItemAdd(item as CFDictionary, nil)
-        guard addStatus == errSecSuccess else {
-            throw RealtimeVoiceSecretError.keychain(addStatus)
-        }
-    }
-
-    private func baseQuery(for key: String) -> [String: Any] {
-        [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: key,
-        ]
-    }
-}
-
-enum RealtimeVoiceSecretError: LocalizedError {
-    case keychain(OSStatus)
-
-    var errorDescription: String? {
-        switch self {
-        case let .keychain(status):
-            "无法保存语音会话凭据（\(status)）"
-        }
-    }
-}
-
 final class RealtimeVoicePreferences {
     static let providerKey = "voice.provider"
     static let agentIDKey = "voice.elevenlabs.agentID"
@@ -241,17 +176,12 @@ final class RealtimeVoicePreferences {
     static let conversationTokenKey =
         "voice.elevenlabs.conversationToken"
     static let apiKeyKey = "voice.elevenlabs.apiKey"
+    static let microphoneDeviceIDKey = "voice.microphoneDeviceID"
 
     private let defaults: UserDefaults
-    private let secrets: any RealtimeVoiceSecretStoring
 
-    init(
-        defaults: UserDefaults = .standard,
-        secrets: any RealtimeVoiceSecretStoring =
-            KeychainRealtimeVoiceSecretStore()
-    ) {
+    init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        self.secrets = secrets
     }
 
     func load() -> RealtimeVoiceConfiguration {
@@ -265,33 +195,13 @@ final class RealtimeVoicePreferences {
         let provider = defaults.string(forKey: Self.providerKey)
             .flatMap(RealtimeDJProvider.init(rawValue:))
             ?? .elevenLabs
-        return loadMetadata(provider: provider)
+        return load(provider: provider)
     }
 
     func loadMetadata(
         provider: RealtimeDJProvider
     ) -> RealtimeVoiceConfiguration {
-        RealtimeVoiceConfiguration(
-            provider: provider,
-            apiKey: nil,
-            agentID: normalized(
-                defaults.string(forKey: key(provider, "agentID"))
-            ),
-            conversationToken: nil,
-            voiceID: normalized(
-                defaults.string(forKey: key(provider, "voiceID"))
-            ),
-            model: normalized(
-                defaults.string(forKey: key(provider, "model"))
-            ),
-            appID: normalized(
-                defaults.string(forKey: key(provider, "appID"))
-            ),
-            accessToken: nil,
-            resourceID: normalized(
-                defaults.string(forKey: key(provider, "resourceID"))
-            )
-        )
+        load(provider: provider)
     }
 
     func load(
@@ -300,15 +210,13 @@ final class RealtimeVoicePreferences {
         return RealtimeVoiceConfiguration(
             provider: provider,
             apiKey: normalized(
-                secrets.string(forKey: key(provider, "apiKey"))
+                defaults.string(forKey: key(provider, "apiKey"))
             ),
             agentID: normalized(
                 defaults.string(forKey: key(provider, "agentID"))
             ),
             conversationToken: normalized(
-                secrets.string(
-                    forKey: key(provider, "conversationToken")
-                )
+                defaults.string(forKey: key(provider, "conversationToken"))
             ),
             voiceID: normalized(
                 defaults.string(forKey: key(provider, "voiceID"))
@@ -320,10 +228,13 @@ final class RealtimeVoicePreferences {
                 defaults.string(forKey: key(provider, "appID"))
             ),
             accessToken: normalized(
-                secrets.string(forKey: key(provider, "accessToken"))
+                defaults.string(forKey: key(provider, "accessToken"))
             ),
             resourceID: normalized(
                 defaults.string(forKey: key(provider, "resourceID"))
+            ),
+            microphoneDeviceID: normalized(
+                defaults.string(forKey: Self.microphoneDeviceIDKey)
             )
         )
     }
@@ -356,15 +267,19 @@ final class RealtimeVoicePreferences {
             configuration.resourceID,
             forKey: key(provider, "resourceID")
         )
-        try secrets.setString(
+        defaults.set(
+            configuration.microphoneDeviceID,
+            forKey: Self.microphoneDeviceIDKey
+        )
+        defaults.set(
             configuration.apiKey,
             forKey: key(provider, "apiKey")
         )
-        try secrets.setString(
+        defaults.set(
             configuration.conversationToken,
             forKey: key(provider, "conversationToken")
         )
-        try secrets.setString(
+        defaults.set(
             configuration.accessToken,
             forKey: key(provider, "accessToken")
         )
@@ -429,6 +344,9 @@ final class AgentSettingsModel {
     var voiceAppID: String
     var voiceAccessToken: String
     var voiceResourceID: String
+    var voiceMicrophoneDeviceID: String
+    let voiceMicrophoneDevices: [BailianMicrophoneDeviceOption]
+    let defaultMicrophoneDeviceID: String?
     var takeoverEnabled: Bool
     var planningModel: String
 
@@ -445,11 +363,17 @@ final class AgentSettingsModel {
         account: any CodexAccountServicing = CodexAgentAccountService(),
         preferences: DJAgentPreferences = DJAgentPreferences(),
         voicePreferences: RealtimeVoicePreferences =
-            RealtimeVoicePreferences()
+            RealtimeVoicePreferences(),
+        microphoneDevices: [BailianMicrophoneDeviceOption] =
+            BailianMicrophoneDeviceCatalog.availableDevices(),
+        defaultMicrophoneDeviceID: String? =
+            BailianMicrophoneDeviceCatalog.defaultDeviceID()
     ) {
         self.account = account
         self.preferences = preferences
         self.voicePreferences = voicePreferences
+        voiceMicrophoneDevices = microphoneDevices
+        self.defaultMicrophoneDeviceID = defaultMicrophoneDeviceID
         hostPrompt = preferences.hostPrompt()
         takeoverEnabled = preferences.takeoverEnabled()
         planningModel = preferences.planningModel() ?? ""
@@ -477,6 +401,7 @@ final class AgentSettingsModel {
         voiceAppID = voice.appID ?? ""
         voiceAccessToken = voice.accessToken ?? ""
         voiceResourceID = voice.resourceID ?? ""
+        voiceMicrophoneDeviceID = voice.microphoneDeviceID ?? ""
     }
 
     func load() async {
@@ -559,7 +484,8 @@ final class AgentSettingsModel {
             model: normalized(voiceModel),
             appID: normalized(voiceAppID),
             accessToken: normalized(voiceAccessToken),
-            resourceID: normalized(voiceResourceID)
+            resourceID: normalized(voiceResourceID),
+            microphoneDeviceID: normalized(voiceMicrophoneDeviceID)
         )
 
         guard validate(configuration) else {
@@ -620,6 +546,19 @@ final class AgentSettingsModel {
         voiceAppID = configuration.appID ?? ""
         voiceAccessToken = configuration.accessToken ?? ""
         voiceResourceID = configuration.resourceID ?? ""
+        voiceMicrophoneDeviceID = configuration.microphoneDeviceID ?? ""
+    }
+
+    var systemMicrophoneLabel: String {
+        guard
+            let defaultMicrophoneDeviceID,
+            let device = voiceMicrophoneDevices.first(
+                where: { $0.id == defaultMicrophoneDeviceID }
+            )
+        else {
+            return "跟随系统"
+        }
+        return "跟随系统（\(device.name)）"
     }
 
     private func validate(
