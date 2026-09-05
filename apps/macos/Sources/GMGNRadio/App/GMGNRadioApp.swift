@@ -2871,15 +2871,50 @@ final class AppDelegate:
         )
     }
 
+    private func makeResidentWorldTools(messageID: UUID) -> ResidentConversationTools? {
+        guard AgentConversationService.shared.supportsWorldTools,
+              let context = livingWorldContext,
+              spatialStage.selectedWorldID == context.manifest.worldID else { return nil }
+        let worldID = context.manifest.worldID
+        // This lease authorizes only the four tools for the current user message.
+        // It does not enable background takeover or the wider DJ tool collection.
+        let dispatcher = WorldAgentToolDispatcher(takeoverEnabled: { true }, context: context)
+        let session = ResidentWorldToolSession(
+            scopeID: messageID,
+            worldID: worldID,
+            dispatcher: dispatcher,
+            deadline: Date().addingTimeInterval(300),
+            isCurrent: { [weak self, weak context] in
+                guard let self, let context else { return false }
+                return self.liveCamMessageID == messageID
+                    && self.spatialStage.selectedWorldID == worldID
+                    && self.livingWorldContext === context
+            }
+        )
+        return ResidentConversationTools(
+            worldID: worldID,
+            schemasJSON: session.toolSchemasJSON,
+            call: { requestID, name, arguments in
+                let result = await session.call(requestID: requestID, name: name, argumentsJSON: arguments)
+                return ResidentCodexToolReply(resultJSON: result.resultJSON, isError: result.isError)
+            },
+            cancel: { session.cancel() }
+        )
+    }
+
     private func sendLiveCamMessage(_ message: String) async {
         let messageID = UUID()
         let worldContext = currentResidentWorldContext()
+        let requestWorld = livingWorldContext
         liveCamMessageID = messageID
+        let worldTools = makeResidentWorldTools(messageID: messageID)
         defer {
+            worldTools?.cancel()
             if liveCamMessageID == messageID { liveCamMessageID = nil }
         }
         liveCamWindowController?.beginAgentReply()
         let finishCancellation: @MainActor () -> Void = { [weak self] in
+            worldTools?.cancel()
             guard let self, self.liveCamMessageID == messageID else { return }
             self.liveCamMessageID = nil
             self.liveCamWindowController?.showChatStatus("已取消本次回复。")
@@ -2887,7 +2922,7 @@ final class AppDelegate:
         let reply: String
         do {
             reply = try await AgentConversationService.shared.send(
-                message, worldContext: worldContext, onCancel: finishCancellation
+                message, worldContext: worldContext, worldTools: worldTools, onCancel: finishCancellation
             )
         } catch AgentConversationError.cancelled {
             finishCancellation()
@@ -2897,7 +2932,8 @@ final class AppDelegate:
             return
         } catch {
             guard liveCamMessageID == messageID else { return }
-            guard currentResidentWorldContext().sessionScope == worldContext.sessionScope else {
+            guard currentResidentWorldContext().sessionScope == worldContext.sessionScope,
+                  worldTools == nil || livingWorldContext === requestWorld else {
                 finishCancellation()
                 return
             }
@@ -2908,7 +2944,8 @@ final class AppDelegate:
             return
         }
         guard liveCamMessageID == messageID else { return }
-        guard currentResidentWorldContext().sessionScope == worldContext.sessionScope else {
+        guard currentResidentWorldContext().sessionScope == worldContext.sessionScope,
+              worldTools == nil || livingWorldContext === requestWorld else {
             finishCancellation()
             return
         }

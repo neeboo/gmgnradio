@@ -19,11 +19,43 @@ func declaration(_ signature: String, in source: String) -> String {
 let sendMethod = declaration("private func sendLiveCamMessage(", in: app)
 let contextMethod = app.contains("private func currentResidentWorldContext(")
     ? declaration("private func currentResidentWorldContext(", in: app) : ""
+let toolsMethod = app.contains("private func makeResidentWorldTools(")
+    ? declaration("private func makeResidentWorldTools(", in: app) : ""
 let controller = try String(contentsOf: sources.appendingPathComponent("DesktopPresence/LiveCamWindowController.swift"), encoding: .utf8)
 let replyMethods = ["func beginAgentReply(", "func finishAgentReply(", "func showChatStatus("].map { declaration($0, in: controller) }.joined(separator: "\n")
 let harness = #"""
 import Foundation
 import WorldRuntime
+
+struct RealtimeDJToolCall: Codable, Equatable, Sendable {
+    let id: String; let name: String; let argumentsJSON: Data
+}
+struct RealtimeDJToolResult: Codable, Equatable, Sendable {
+    let callID: String; let resultJSON: Data; let isError: Bool
+}
+
+@MainActor final class FormalRunner {
+    var tools: [ResidentConversationTools] = []
+    var prompts: [String] = []
+    var pending: [Int: CheckedContinuation<AgentConversationOutcome, Error>] = [:]
+    func run(_ prompt: String, _ tools: ResidentConversationTools) async throws -> AgentConversationOutcome {
+        let index = self.tools.count
+        self.tools.append(tools)
+        prompts.append(prompt)
+        return try await withCheckedThrowingContinuation { pending[index] = $0 }
+    }
+    func waitForCalls(_ count: Int) async {
+        for _ in 0..<100_000 {
+            if tools.count >= count { return }
+            await Task.yield()
+        }
+        print("FAIL: actual Live Cam send did not reach formal resident sender")
+        exit(1)
+    }
+    func finish(_ index: Int) {
+        pending.removeValue(forKey: index)!.resume(returning: AgentConversationOutcome(reply: "formal reply", sessionID: "formal-session"))
+    }
+}
 
 final class FixtureLocator: AgentExecutableLocating, @unchecked Sendable {
     private let lock = NSLock()
@@ -119,6 +151,7 @@ typealias RealConversationService = AgentConversationService
     init(_ service: RealConversationService) { AgentConversationService.shared = service }
     \#(sendMethod)
     \#(contextMethod)
+    \#(toolsMethod)
     func send(_ message: String) async { await sendLiveCamMessage(message) }
 }
 
@@ -145,6 +178,51 @@ typealias RealConversationService = AgentConversationService
 
 @main struct Tests {
     @MainActor static func main() async throws {
+        for mode in ["finish", "cancel", "selected-world", "replaced-context"] {
+            let suite = "gmgn-formal-app-test-\(UUID())"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let formal = FormalRunner()
+            let textRunner = ControlledRunner()
+            let service = RealConversationService(locator: FixtureLocator(), defaults: defaults,
+                runnerFactory: { _ in textRunner }, residentSender: { _, prompt, _, tools in
+                    try await formal.run(prompt, tools)
+                })
+            service.selectBackend(.codex)
+            let manifest = try JSONDecoder().decode(WorldManifest.self, from: Data(contentsOf:
+                URL(fileURLWithPath: "apps/macos/Resources/Worlds/marble-living-cabin/world.json")))
+            let context = try WorldAgentContext(manifest: manifest)
+            let app = AppHarness(service)
+            app.livingWorldContext = context
+            app.spatialStage.selectedWorldID = manifest.worldID
+            let request = Task { await app.send("去做个活动") }
+            await formal.waitForCalls(1)
+            let tools = formal.tools[0]
+            check(tools.worldID == manifest.worldID, "\(mode): App binds actual world to formal tools")
+            check((try JSONSerialization.jsonObject(with: tools.schemasJSON) as? [Any])?.count == 4,
+                  "\(mode): App exposes exactly four world tools")
+            let started = await tools.call("start", "start_activity", Data(#"{"activity_id":"home.idle"}"#.utf8))
+            check(!started.isError && context.state.activeActivity?.activityID == "home.idle", "\(mode): actual App-to-service callback starts real activity")
+            let stopped = await tools.call("stop", "stop_activity", Data("{}".utf8))
+            check(!stopped.isError && context.state.activeActivity == nil, "\(mode): actual callback stops activity")
+            switch mode {
+            case "cancel": service.cancel()
+            case "selected-world": app.spatialStage.selectedWorldID = "other-world"
+            case "replaced-context": app.livingWorldContext = try WorldAgentContext(manifest: manifest)
+            default: break
+            }
+            if mode != "finish" {
+                let stale = await tools.call("stale", "start_activity", Data(#"{"activity_id":"home.idle"}"#.utf8))
+                check(stale.isError && context.state.activeActivity == nil, "\(mode): old App lease rejects mutations immediately")
+            }
+            formal.finish(0)
+            await request.value
+            let after = await tools.call("after", "start_activity", Data(#"{"activity_id":"home.idle"}"#.utf8))
+            check(after.isError && context.state.activeActivity == nil, "\(mode): completed request releases formal capability lease")
+            check(app.liveCamWindowController?.waiting == false, "\(mode): request always ends waiting bubble")
+            check(app.liveCamWindowController?.replies == (mode == "finish" ? ["formal reply"] : []),
+                  "\(mode): only current world receives formal reply")
+        }
         // Use the shipping manifest and actual WorldAgentContext, with only the
         // external CLI process mocked. No real backend or saved world is read.
         do {
@@ -487,6 +565,12 @@ let compiled = try run("/usr/bin/swiftc", ["-j1", "-parse-as-library",
     sources.appendingPathComponent("Agent/CodexCLI.swift").path,
     sources.appendingPathComponent("Agent/AgentConversationService.swift").path,
     sources.appendingPathComponent("Agent/WorldAgentContext.swift").path,
+    sources.appendingPathComponent("Agent/WorldAgentToolContract.swift").path,
+    sources.appendingPathComponent("Agent/WorldAgentToolDispatcher.swift").path,
+    sources.appendingPathComponent("Agent/ResidentWorldToolSession.swift").path,
+    sources.appendingPathComponent("Agent/ResidentCodexPolicy.swift").path,
+    sources.appendingPathComponent("Agent/ResidentCodexTransport.swift").path,
+    sources.appendingPathComponent("Agent/ResidentCodexAgent.swift").path,
     program.path, "-o", executable.path] + FileManager.default.contentsOfDirectory(
         at: root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug/WorldRuntime.build"),
         includingPropertiesForKeys: nil).filter { $0.pathExtension == "o" }.map(\.path))
