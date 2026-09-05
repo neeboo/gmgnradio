@@ -19,7 +19,9 @@ func fake() {
     record(["launch": CommandLine.arguments])
     func finish(_ status: String = "completed", text: String = "已完成空间活动") {
         emit(["method": "item/completed", "params": ["threadId": "resident-session", "turnId": "turn-1", "item": ["id": "final", "type": "agentMessage", "phase": "final_answer", "text": text]]])
-        emit(["method": "turn/completed", "params": ["threadId": "resident-session", "turn": ["id": "turn-1", "status": status]]])
+        var turn: [String: Any] = ["id": "turn-1", "status": status]
+        if status == "failed" { turn["error"] = ["message": "PRIVATE-TURN", "codexErrorInfo": ["httpConnectionFailed": ["httpStatusCode": 401, "private": "PRIVATE"]], "additionalDetails": "PRIVATE"] }
+        emit(["method": "turn/completed", "params": ["threadId": "resident-session", "turn": turn]])
     }
     while let line = readLine() {
         let frame = json(Data(line.utf8)); record(frame)
@@ -49,7 +51,7 @@ func fake() {
                 continue
             }
             if mode == "errorFalse" || mode == "errorMissing" {
-                var params: [String: Any] = ["threadId": "resident-session", "turnId": "turn-1", "error": ["message": "PRIVATE-TERMINAL"]]
+                var params: [String: Any] = ["threadId": "resident-session", "turnId": "turn-1", "error": ["message": "PRIVATE-TERMINAL", "codexErrorInfo": "unauthorized"]]
                 if mode == "errorFalse" { params["willRetry"] = false }
                 emit(["method": "error", "params": params])
                 continue
@@ -72,6 +74,11 @@ func fake() {
         if CommandLine.arguments.contains("--fake") { fake(); return }
         var checks = 0
         func check(_ condition: Bool, _ message: String) { guard condition else { fatalError("FAIL: " + message) }; checks += 1 }
+        check(ResidentCodexSafeError.code(from: "unauthorized") == "unauthorized", "known safe error code")
+        check(ResidentCodexSafeError.code(from: "PRIVATE-UNKNOWN") == nil, "unknown error string discarded")
+        check(ResidentCodexSafeError.code(from: ["httpConnectionFailed": ["httpStatusCode": 401, "message": "PRIVATE"]]) == "httpConnectionFailed:401", "only known HTTP code projected")
+        check(ResidentCodexSafeError.code(from: ["PRIVATE-UNKNOWN": ["httpStatusCode": 401]]) == nil, "unknown variant discarded")
+        check(ResidentCodexSafeError.code(from: ["httpConnectionFailed": ["httpStatusCode": "PRIVATE"]]) == "httpConnectionFailed", "noninteger HTTP status discarded")
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("gmgn-loop-fixture-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -139,7 +146,11 @@ func fake() {
                 if mode == "errorFalse" || mode == "errorMissing" {
                     if case ResidentCodexAgentError.turnFailed = error { check(true, "terminal error ends turn") }
                     else { fatalError("FAIL: terminal error must fail immediately") }
+                    check(agent.failureCode == "unauthorized", "notification safe diagnostic survives transport")
                 }
+                if mode == "failed" { check(agent.failureCode == "httpConnectionFailed:401", "completed turn safe diagnostic") }
+                check(agent.failureStage != nil, "failure has fixed local stage")
+                check(agent.didSendTurnStart == (mode != "unsafe"), "model turn dispatch is observable")
             }
             if mode == "unsafe" { check(try !frames(file).contains { ($0["method"] as? String)?.hasPrefix("thread/") == true }, "unsafe policy never starts thread") }
             if mode == "eof" { check(Date().timeIntervalSince(began) < 1.5, "EOF ends turn without deadline") }

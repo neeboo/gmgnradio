@@ -26,6 +26,11 @@ enum ResidentCodexAgentError: Error, LocalizedError {
 
 /// One resident turn at a time. World execution stays in the caller's formal tool bridge.
 @MainActor final class ResidentCodexAgent {
+    private(set) var failureStage: String?
+    private(set) var failureCode: String?
+    private(set) var didSendTurnStart = false
+    private var stage = "preflight"
+    private var lastSafeErrorCode: String?
     typealias TransportFactory = (URL, [String], URL, [String: String]) -> ResidentCodexTransport
     typealias ToolHandler = @MainActor (String, String, Data) async -> ResidentCodexToolReply
     private static let allowedTools: Set<String> = ["inspect_world", "list_available_activities", "start_activity", "stop_activity"]
@@ -63,6 +68,8 @@ enum ResidentCodexAgentError: Error, LocalizedError {
         let tools = try Self.dynamicTools(toolsJSON)
         let token = UUID()
         operationID = token
+        failureStage = nil; failureCode = nil; didSendTurnStart = false
+        stage = "preflight"; lastSafeErrorCode = nil
         terminal = nil; threadID = nil; turnID = nil; acceptingTurn = false; finalMessages = []
         let deadline = Task { [weak self] in
             do { try await Task.sleep(nanoseconds: UInt64((self?.turnTimeout ?? 180) * 1_000_000_000)) }
@@ -90,6 +97,7 @@ enum ResidentCodexAgentError: Error, LocalizedError {
                 if let terminal { return try terminal.get() }
 
                 let connection = factory(executableURL, try ResidentCodexPolicy.arguments(disabling: names), workingDirectoryURL, environment)
+                stage = "config"
                 transport = connection
                 connection.onClosed = { [weak self] error in
                     guard let self, self.operationID == token else { return }
@@ -105,6 +113,7 @@ enum ResidentCodexAgentError: Error, LocalizedError {
                 }
                 try await connection.start()
                 try ResidentCodexPolicy.verify(await connection.request(method: "config/read", params: Self.encode(["includeLayers": false])))
+                stage = "thread"
                 var threadParams: [String: Any] = [
                     "cwd": workingDirectoryURL.path, "approvalPolicy": "never", "sandbox": "read-only",
                     "runtimeWorkspaceRoots": [],
@@ -124,6 +133,8 @@ enum ResidentCodexAgentError: Error, LocalizedError {
                       sessionID == nil || sessionID == "" || sessionID == threadID else { throw ResidentCodexAgentError.invalidProtocol }
                 self.threadID = threadID
                 acceptingTurn = true
+                stage = "turn"
+                didSendTurnStart = true
                 let turnResponse = try Self.object(await connection.request(method: "turn/start", params: Self.encode([
                     "threadId": threadID, "environments": [], "approvalPolicy": "never",
                     "cwd": workingDirectoryURL.path, "runtimeWorkspaceRoots": [],
@@ -133,8 +144,10 @@ enum ResidentCodexAgentError: Error, LocalizedError {
                       self.turnID == nil || self.turnID == id else { throw ResidentCodexAgentError.invalidProtocol }
                 self.turnID = id
                 if let terminal { return try terminal.get() }
+                stage = "wait"
                 return try await withCheckedThrowingContinuation { waiter = $0 }
             } catch {
+                if failureStage == nil { failureStage = stage; failureCode = lastSafeErrorCode }
                 // A queued success notification cannot validate a mismatched RPC response.
                 if case .failure(let terminalError) = terminal { throw terminalError }
                 throw error
@@ -163,6 +176,7 @@ enum ResidentCodexAgentError: Error, LocalizedError {
 
     private func complete(_ result: Result<ResidentCodexAgentOutcome, Error>) {
         guard terminal == nil else { return }
+        if case .failure = result { failureStage = stage; failureCode = lastSafeErrorCode }
         terminal = result
         if let waiter { self.waiter = nil; waiter.resume(with: result) }
     }
@@ -185,12 +199,16 @@ enum ResidentCodexAgentError: Error, LocalizedError {
         } else if method == "turn/completed" {
             guard let turnID, let threadID, let turn = params["turn"] as? [String: Any],
                   turn["id"] as? String == turnID else { return }
-            guard turn["status"] as? String == "completed" else { complete(.failure(ResidentCodexAgentError.turnFailed)); return }
+            guard turn["status"] as? String == "completed" else {
+                if let error = turn["error"] as? [String: Any] { lastSafeErrorCode = ResidentCodexSafeError.code(from: error["codexErrorInfo"]) }
+                complete(.failure(ResidentCodexAgentError.turnFailed)); return
+            }
             let reply = finalMessages.map(\.text).joined(separator: "\n\n")
             guard !reply.isEmpty else { complete(.failure(ResidentCodexAgentError.noFinalAnswer)); return }
             complete(.success(ResidentCodexAgentOutcome(reply: reply, sessionID: threadID)))
         } else if method == "error" {
             guard let turnID, params["turnId"] as? String == turnID else { return }
+            if let error = params["error"] as? [String: Any] { lastSafeErrorCode = ResidentCodexSafeError.code(from: error["codexErrorInfo"]) }
             if params["willRetry"] as? Bool == true { return }
             complete(.failure(ResidentCodexAgentError.turnFailed))
         }

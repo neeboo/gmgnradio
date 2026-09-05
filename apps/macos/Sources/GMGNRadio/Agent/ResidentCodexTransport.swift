@@ -1,6 +1,37 @@
 import Foundation
 import Darwin
 
+/// Diagnostics contain only protocol enums and bounded HTTP status integers.
+enum ResidentCodexSafeError {
+    private static let plain: Set<String> = [
+        "contextWindowExceeded", "sessionBudgetExceeded", "usageLimitExceeded", "serverOverloaded",
+        "cyberPolicy", "internalServerError", "unauthorized", "badRequest", "threadRollbackFailed",
+        "sandboxError", "other",
+    ]
+    private static let http: Set<String> = [
+        "httpConnectionFailed", "responseStreamConnectionFailed", "responseStreamDisconnected", "responseTooManyFailedAttempts",
+    ]
+
+    static func projection(_ value: Any?) -> Any? {
+        if let text = value as? String { return plain.contains(text) ? text : nil }
+        guard let object = value as? [String: Any], object.count == 1, let key = object.keys.first else { return nil }
+        if key == "activeTurnNotSteerable" { return [key: [String: Int]()] }
+        guard http.contains(key), let detail = object[key] as? [String: Any] else { return nil }
+        if let status = detail["httpStatusCode"] as? Int, (100...599).contains(status) {
+            return [key: ["httpStatusCode": status]]
+        }
+        return [key: [String: Int]()]
+    }
+
+    static func code(from value: Any?) -> String? {
+        guard let safe = projection(value) else { return nil }
+        if let text = safe as? String { return text }
+        guard let object = safe as? [String: Any], let key = object.keys.first else { return nil }
+        if let detail = object[key] as? [String: Int], let status = detail["httpStatusCode"] { return "\(key):\(status)" }
+        return key
+    }
+}
+
 enum ResidentCodexTransportError: Error, LocalizedError {
     case notConnected, alreadyStarted, launchFailed, connectionClosed, invalidFrame, frameTooLarge
     case writeFailed, timedOut, remoteError(Int)
@@ -187,6 +218,9 @@ enum ResidentCodexTransportError: Error, LocalizedError {
             } else if method == "error" {
                 let raw = frame["params"] as? [String: Any] ?? [:]
                 var safe: [String: Any] = ["error": ["code": "server_error"]]
+                if let error = raw["error"] as? [String: Any], let info = ResidentCodexSafeError.projection(error["codexErrorInfo"]) {
+                    safe["error"] = ["code": "server_error", "codexErrorInfo": info]
+                }
                 if let willRetry = raw["willRetry"] as? Bool { safe["willRetry"] = willRetry }
                 for key in ["threadId", "turnId"] { if let value = raw[key] as? String { safe[key] = value } }
                 onNotification?(method, try Self.encode(safe))
