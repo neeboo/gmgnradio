@@ -351,6 +351,7 @@ final class LiveCamInteractionView: NSView {
         replyBubble.addSubview(replyLabel)
 
         let speechErrorNotice = NSHostingView(rootView: ResidentSpeechErrorNotice())
+        speechErrorNotice.sizingOptions = [.intrinsicContentSize]
         speechErrorNotice.translatesAutoresizingMaskIntoConstraints = false
         speechErrorNotice.identifier = NSUserInterfaceItemIdentifier("livecam.speech-error")
         addSubview(speechErrorNotice)
@@ -659,6 +660,8 @@ final class LiveCamPanel: NSPanel {
             self?.requestEnterSpace()
         }
 
+        contentMinSize = frame.size
+        contentMaxSize = frame.size
         self.contentView = apertureView
         backgroundColor = .clear
         isOpaque = false

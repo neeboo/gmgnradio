@@ -1,7 +1,52 @@
 import AppKit
 import CoreGraphics
+import SwiftUI
 import Testing
 @testable import GMGNRadio
+
+@Test
+@MainActor
+func liveCamSpeechNoticeNeverResizesThePortalOrItsRenderSurface() async throws {
+    let status = AgentSpeechStatusStore.shared
+    let previousError = status.lastErrorMessage
+    defer { status.lastErrorMessage = previousError }
+    status.lastErrorMessage = nil
+    let size = CGSize(width: 224, height: 336)
+    let surface = NSView()
+    let panel = LiveCamPanel(frame: CGRect(origin: .zero, size: size), contentView: surface)
+    panel.isReleasedWhenClosed = false
+    defer { panel.close() }
+    // Exercise the actual composer without ordering the invisible test window front.
+    panel.interactionView.onComposerVisibilityChanged = { _ in }
+    let notice = try #require(panel.interactionView.subviews.first {
+        $0.identifier?.rawValue == "livecam.speech-error"
+    } as? NSHostingView<ResidentSpeechErrorNotice>)
+
+    for error in [nil, String(repeating: "语音服务暂时不可用，请检查设置。", count: 8), nil] as [String?] {
+        status.lastErrorMessage = error
+        for _ in 0..<3 {
+            try await Task.sleep(for: .milliseconds(25))
+            panel.contentView?.needsLayout = true
+            panel.contentView?.layoutSubtreeIfNeeded()
+        }
+        #expect(panel.frame.size == size)
+        #expect(surface.frame.size == size)
+        #expect(!panel.isVisible)
+        #expect(notice.frame.width <= size.width - 20)
+        if error != nil { #expect(notice.frame.height > 0) }
+    }
+
+    panel.interactionView.messageField.stringValue = "保留草稿"
+    for expanded in [true, false] {
+        panel.interactionView.chatButton.performClick(nil)
+        panel.contentView?.layoutSubtreeIfNeeded()
+        #expect(panel.interactionView.isComposerVisible == expanded)
+        #expect(panel.interactionView.messageField.stringValue == "保留草稿")
+        #expect(panel.frame.size == size)
+        #expect(surface.frame.size == size)
+        #expect(!panel.isVisible)
+    }
+}
 
 @Test
 @MainActor
