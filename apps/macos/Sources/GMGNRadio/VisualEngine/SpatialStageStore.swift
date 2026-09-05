@@ -562,7 +562,7 @@ struct SpatialCameraState: Equatable, Sendable {
         guard scrollDelta.isFinite else { return }
         // Trackpads report points; ordinary wheels report much smaller steps.
         let metresPerUnit: Float = precise ? 0.01 : 0.2
-        let distance = min(max(scrollDelta * metresPerUnit, -0.5), 0.5)
+        let distance = min(max(-scrollDelta * metresPerUnit, -0.5), 0.5)
         move(.forward, distance: distance)
     }
 }

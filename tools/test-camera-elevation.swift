@@ -71,9 +71,9 @@ for pitch: Float in [-1.2, 0, 1.2] {
     for yaw: Float in [-1.4, 0, 1.4] {
         var wheel = SpatialCameraState(position: origin, yaw: yaw, pitch: pitch)
         var keyboard = wheel
-        keyboard.move(.forward, distance: 0.2)
+        keyboard.move(.backward, distance: 0.2)
         wheel.dolly(scrollDelta: 1, precise: false)
-        check(wheel == keyboard, "positive mouse wheel follows W including camera pitch")
+        check(wheel == keyboard, "positive wheel pulls back including camera pitch")
         wheel.dolly(scrollDelta: -1, precise: false)
         check(near(wheel.position.x, origin.x) && near(wheel.position.y, origin.y) && near(wheel.position.z, origin.z), "negative wheel reverses dolly")
         check(wheel.pitch == pitch && wheel.yaw == yaw, "wheel preserves view orientation")
@@ -86,7 +86,9 @@ discrete.dolly(scrollDelta: 1, precise: false)
 check(precise == discrete, "trackpad points and discrete wheel normalize to useful speeds")
 var small = SpatialCameraState(position: origin)
 small.dolly(scrollDelta: 0.25, precise: true)
-check(near(small.position.z, origin.z - 0.0025), "small trackpad steps stay smooth without a minimum movement clamp")
+check(near(small.position.z, origin.z + 0.0025), "positive trackpad input pulls back smoothly")
+small.dolly(scrollDelta: -0.5, precise: true)
+check(near(small.position.z, origin.z - 0.0025), "negative trackpad input pushes forward")
 for delta: Float in [-100_000, 100_000] {
     var capped = SpatialCameraState(position: origin)
     capped.dolly(scrollDelta: delta, precise: false)
