@@ -866,7 +866,7 @@ private final class StageWorldInteractionView: NSView {
     init(spatialStage: SpatialStageStore) {
         self.spatialStage = spatialStage
         super.init(frame: .zero)
-        toolTip = "拖动鼠标调整视角；W/S 沿视线前后移动，A/D 左右移动；双击复位"
+        toolTip = "拖动鼠标调整视角；滚轮拉近或拉远；W/S 沿视线前后移动，A/D 左右移动；双击复位"
     }
 
     required init?(coder: NSCoder) {
@@ -879,6 +879,17 @@ private final class StageWorldInteractionView: NSView {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
         true
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard spatialStage.isWorldVisible else {
+            super.scrollWheel(with: event)
+            return
+        }
+        spatialStage.dollyCamera(
+            scrollDelta: Float(event.scrollingDeltaY),
+            precise: event.hasPreciseScrollingDeltas
+        )
     }
 
     override func mouseDown(with event: NSEvent) {

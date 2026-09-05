@@ -5,6 +5,13 @@ import Foundation
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let storeSource = try String(contentsOf: root.appendingPathComponent("apps/macos/Sources/GMGNRadio/VisualEngine/SpatialStageStore.swift"), encoding: .utf8)
 let mappingSource = try String(contentsOf: root.appendingPathComponent("apps/macos/Packages/WorldRuntime/Sources/WorldRuntime/WorldCameraInputMapping.swift"), encoding: .utf8)
+let windowSource = try String(contentsOf: root.appendingPathComponent("apps/macos/Sources/GMGNRadio/VisualEngine/StageWindowController.swift"), encoding: .utf8)
+
+guard storeSource.contains("mutating func dolly(scrollDelta:"),
+      storeSource.contains("func dollyCamera(scrollDelta:") else {
+    print("FAIL: spatial camera has no wheel dolly implementation")
+    exit(1)
+}
 
 func declaration(_ signature: String, in source: String) -> String {
     guard let start = source.range(of: signature)?.lowerBound,
@@ -31,6 +38,7 @@ final class Store {
     \#(declaration("func setMovement(", in: storeSource))
     \#(declaration("func clearMovement()", in: storeSource))
     \#(declaration("func stepCamera(", in: storeSource))
+    \#(declaration("func dollyCamera(", in: storeSource))
 }
 var failures = 0
 func check(_ condition: Bool, _ message: String) {
@@ -59,6 +67,41 @@ for pitch: Float in [-1.2, -0.6, 0, 0.6, 1.2] {
     }
 }
 let store = Store()
+for pitch: Float in [-1.2, 0, 1.2] {
+    for yaw: Float in [-1.4, 0, 1.4] {
+        var wheel = SpatialCameraState(position: origin, yaw: yaw, pitch: pitch)
+        var keyboard = wheel
+        keyboard.move(.forward, distance: 0.2)
+        wheel.dolly(scrollDelta: 1, precise: false)
+        check(wheel == keyboard, "positive mouse wheel follows W including camera pitch")
+        wheel.dolly(scrollDelta: -1, precise: false)
+        check(near(wheel.position.x, origin.x) && near(wheel.position.y, origin.y) && near(wheel.position.z, origin.z), "negative wheel reverses dolly")
+        check(wheel.pitch == pitch && wheel.yaw == yaw, "wheel preserves view orientation")
+    }
+}
+var precise = SpatialCameraState(position: origin)
+precise.dolly(scrollDelta: 20, precise: true)
+var discrete = SpatialCameraState(position: origin)
+discrete.dolly(scrollDelta: 1, precise: false)
+check(precise == discrete, "trackpad points and discrete wheel normalize to useful speeds")
+var small = SpatialCameraState(position: origin)
+small.dolly(scrollDelta: 0.25, precise: true)
+check(near(small.position.z, origin.z - 0.0025), "small trackpad steps stay smooth without a minimum movement clamp")
+for delta: Float in [-100_000, 100_000] {
+    var capped = SpatialCameraState(position: origin)
+    capped.dolly(scrollDelta: delta, precise: false)
+    check(near(abs(capped.position.z - origin.z), 0.5), "wheel spike limited to half metre per event")
+}
+for delta: Float in [0, .nan, .infinity, -.infinity] {
+    var unchanged = SpatialCameraState(position: origin)
+    unchanged.dolly(scrollDelta: delta, precise: true)
+    check(unchanged == SpatialCameraState(position: origin), "zero and invalid wheel inputs do not move camera")
+}
+store.dollyCamera(scrollDelta: 0.25, precise: true)
+var expectedStore = SpatialCameraState(position: origin, pitch: -0.6)
+expectedStore.dolly(scrollDelta: 0.25, precise: true)
+check(store.camera == expectedStore, "store forwards wheel delta without command minimum-distance clamp")
+store.camera = SpatialCameraState(position: origin, pitch: -0.6)
 store.setMovement(.forward, active: true)
 store.stepCamera(deltaTime: 0.1, speedBoosted: false)
 check(store.camera.position.y < origin.y, "held W descends while looking down")
@@ -71,8 +114,17 @@ store.clearMovement()
 store.stepCamera(deltaTime: 0.1, speedBoosted: false)
 check(store.camera == afterMove, "clearMovement stops movement")
 if failures > 0 { print("\(failures) assertions failed"); exit(1) }
-print("PASS: pitch-aware W/S, horizontal A/D, constant speed, key release, clearMovement")
+print("PASS: pitch-aware W/S and wheel dolly, device sensitivity, spike cap, horizontal A/D, key release")
 """#
+
+let interactionView = declaration("private final class StageWorldInteractionView:", in: windowSource)
+guard interactionView.contains("override func scrollWheel(with event: NSEvent)"),
+      interactionView.contains("spatialStage.dollyCamera("),
+      interactionView.contains("event.scrollingDeltaY"),
+      interactionView.contains("event.hasPreciseScrollingDeltas") else {
+    print("FAIL: space interaction overlay does not forward wheel events")
+    exit(1)
+}
 
 let temporaryDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("gmgn-camera-elevation-\(UUID())")
 try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: false)

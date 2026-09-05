@@ -557,6 +557,14 @@ struct SpatialCameraState: Equatable, Sendable {
     mutating func reset(to home: SpatialCameraState = Self.defaultHome) {
         self = home
     }
+
+    mutating func dolly(scrollDelta: Float, precise: Bool) {
+        guard scrollDelta.isFinite else { return }
+        // Trackpads report points; ordinary wheels report much smaller steps.
+        let metresPerUnit: Float = precise ? 0.01 : 0.2
+        let distance = min(max(scrollDelta * metresPerUnit, -0.5), 0.5)
+        move(.forward, distance: distance)
+    }
 }
 
 struct SpatialEnvironmentState: Equatable, Sendable {
@@ -893,6 +901,10 @@ final class SpatialStageStore {
 
     func move(_ direction: SpatialMovement, distance: Float) {
         camera.move(direction, distance: min(max(distance, 0.5), 10))
+    }
+
+    func dollyCamera(scrollDelta: Float, precise: Bool) {
+        camera.dolly(scrollDelta: scrollDelta, precise: precise)
     }
 
     func resetCamera() {
