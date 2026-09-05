@@ -43,6 +43,17 @@ func fake() {
             emit(["method": "item/completed", "params": ["threadId": "resident-session", "turnId": "turn-1", "item": ["id": "comment", "type": "agentMessage", "phase": "commentary", "text": "只是正在想"]]])
             if mode == "early" || mode == "earlyMismatch" { finish() }
             emit(["id": id, "result": ["turn": ["id": mode == "earlyMismatch" ? "other-turn" : "turn-1", "status": "inProgress"]]])
+            if mode == "retry" || mode == "retryHang" {
+                emit(["method": "error", "params": ["threadId": "resident-session", "turnId": "turn-1", "willRetry": true, "error": ["message": "PRIVATE-RETRY"]]])
+                if mode == "retry" { finish() }
+                continue
+            }
+            if mode == "errorFalse" || mode == "errorMissing" {
+                var params: [String: Any] = ["threadId": "resident-session", "turnId": "turn-1", "error": ["message": "PRIVATE-TERMINAL"]]
+                if mode == "errorFalse" { params["willRetry"] = false }
+                emit(["method": "error", "params": params])
+                continue
+            }
             if mode == "hang" { continue }
             if mode == "eof" { exit(0) }
             if mode == "failed" { finish("failed", text: "PRIVATE-SERVER-ERROR"); continue }
@@ -103,6 +114,9 @@ func fake() {
         let (early, _) = try make("early")
         let earlyResult = try await early.send(prompt: "查看", sessionID: nil, toolsJSON: tools, onToolCall: callback)
         check(earlyResult.reply == "已完成空间活动", "completion preceding turn response is retained")
+        let (retry, _) = try make("retry")
+        let retryResult = try await retry.send(prompt: "查看", sessionID: nil, toolsJSON: tools, onToolCall: callback)
+        check(retryResult.reply == "已完成空间活动", "retryable error waits for completed answer")
 
         for mode in ["wrongThread", "wrongTurn", "wrongTool"] {
             let (agent, file) = try make(mode)
@@ -112,11 +126,21 @@ func fake() {
             let reply = try frames(file).first { $0["id"] as? String == "tool-request" }?["result"] as? [String: Any]
             check(reply?["success"] as? Bool == false, "\(mode) formal failed result")
         }
-        for mode in ["unsafe", "eof", "failed", "commentary", "hang", "earlyMismatch"] {
+        for mode in ["unsafe", "eof", "failed", "commentary", "hang", "earlyMismatch", "retryHang", "errorFalse", "errorMissing"] {
             let (agent, file) = try make(mode, timeout: mode == "eof" ? 3 : 0.3)
             let began = Date()
             do { _ = try await agent.send(prompt: "查看", sessionID: nil, toolsJSON: tools, onToolCall: callback); fatalError("FAIL: \(mode) must fail") }
-            catch { check(!String(describing: error).contains("PRIVATE"), "\(mode) safe error") }
+            catch {
+                check(!String(describing: error).contains("PRIVATE"), "\(mode) safe error")
+                if mode == "retryHang" {
+                    if case ResidentCodexAgentError.timedOut = error { check(true, "retry remains bounded by total deadline") }
+                    else { fatalError("FAIL: retryable error must wait for deadline") }
+                }
+                if mode == "errorFalse" || mode == "errorMissing" {
+                    if case ResidentCodexAgentError.turnFailed = error { check(true, "terminal error ends turn") }
+                    else { fatalError("FAIL: terminal error must fail immediately") }
+                }
+            }
             if mode == "unsafe" { check(try !frames(file).contains { ($0["method"] as? String)?.hasPrefix("thread/") == true }, "unsafe policy never starts thread") }
             if mode == "eof" { check(Date().timeIntervalSince(began) < 1.5, "EOF ends turn without deadline") }
         }

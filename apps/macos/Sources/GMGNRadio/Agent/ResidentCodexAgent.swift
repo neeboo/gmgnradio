@@ -191,6 +191,7 @@ enum ResidentCodexAgentError: Error, LocalizedError {
             complete(.success(ResidentCodexAgentOutcome(reply: reply, sessionID: threadID)))
         } else if method == "error" {
             guard let turnID, params["turnId"] as? String == turnID else { return }
+            if params["willRetry"] as? Bool == true { return }
             complete(.failure(ResidentCodexAgentError.turnFailed))
         }
     }

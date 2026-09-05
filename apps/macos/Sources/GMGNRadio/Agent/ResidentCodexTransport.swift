@@ -187,6 +187,7 @@ enum ResidentCodexTransportError: Error, LocalizedError {
             } else if method == "error" {
                 let raw = frame["params"] as? [String: Any] ?? [:]
                 var safe: [String: Any] = ["error": ["code": "server_error"]]
+                if let willRetry = raw["willRetry"] as? Bool { safe["willRetry"] = willRetry }
                 for key in ["threadId", "turnId"] { if let value = raw[key] as? String { safe[key] = value } }
                 onNotification?(method, try Self.encode(safe))
             } else { onNotification?(method, params) }
