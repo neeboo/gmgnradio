@@ -2835,6 +2835,10 @@ final class AppDelegate:
         let reply: String
         do {
             reply = try await AgentConversationService.shared.send(message)
+        } catch AgentConversationError.cancelled {
+            return
+        } catch is CancellationError {
+            return
         } catch {
             liveCamWindowController?.showChatStatus(
                 (error as? LocalizedError)?.errorDescription

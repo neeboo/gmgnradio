@@ -305,6 +305,7 @@ final class AgentConversationService {
     private let runnerFactory:
         @Sendable (URL) -> any CodexCommandRunning
     private var currentTask: Task<AgentConversationOutcome, Error>?
+    private var currentRequestID: UUID?
     /// DSH 没有原生续聊，由服务内部维护的有限历史保持语境。
     private var dshHistory: [AgentConversationMessage] = []
 
@@ -354,20 +355,20 @@ final class AgentConversationService {
 
     func selectBackend(_ id: AgentConversationBackendID) {
         preferences.selectedBackendID = id
-        currentTask?.cancel()
-        currentTask = nil
+        cancel()
         dshHistory = []
     }
 
     func resetSession() {
-        currentTask?.cancel()
-        currentTask = nil
+        cancel()
         preferences.saveSessionID(nil, for: effectiveBackendID)
         dshHistory = []
     }
 
     func cancel() {
         currentTask?.cancel()
+        currentTask = nil
+        currentRequestID = nil
     }
 
     // MARK: Sending
@@ -465,12 +466,41 @@ final class AgentConversationService {
         _ operation: @escaping @Sendable () async throws
             -> AgentConversationOutcome
     ) async throws -> AgentConversationOutcome {
-        let task = Task { try await operation() }
+        cancel()
+        let requestID = UUID()
+        let task = Task {
+            try Task.checkCancellation()
+            let outcome = try await operation()
+            try Task.checkCancellation()
+            return outcome
+        }
+        currentRequestID = requestID
         currentTask = task
-        defer { currentTask = nil }
-        let outcome = try await task.value
-        try Task.checkCancellation()
-        return outcome
+        defer {
+            // 旧请求结束时，不得清掉新请求的取消句柄。
+            if currentRequestID == requestID {
+                currentTask = nil
+                currentRequestID = nil
+            }
+        }
+        do {
+            let outcome = try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
+            guard currentRequestID == requestID, !task.isCancelled,
+                  !Task.isCancelled else {
+                throw AgentConversationError.cancelled
+            }
+            return outcome
+        } catch {
+            // 外部进程可能迟到返回成功或失败；两者均不能污染新会话。
+            if currentRequestID != requestID || task.isCancelled || Task.isCancelled {
+                throw AgentConversationError.cancelled
+            }
+            throw error
+        }
     }
 
     // MARK: - Codex
