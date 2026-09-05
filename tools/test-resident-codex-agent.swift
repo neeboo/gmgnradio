@@ -33,6 +33,10 @@ func fake() {
         switch method {
         case "initialize": emit(["id": id, "result": [:]])
         case "config/read":
+            if mode == "rpcUpgrade" {
+                emit(["id": id, "error": ["code": -32603, "message": "The PRIVATE model requires a newer version of Codex. Please update to the latest version and try again."]])
+                continue
+            }
             if mode == "rpcFailure" {
                 emit(["id": id, "error": ["code": -32603, "message": "Fatal error: failed to load rules: PRIVATE"]])
                 continue
@@ -52,6 +56,11 @@ func fake() {
             if mode == "retry" || mode == "retryHang" {
                 emit(["method": "error", "params": ["threadId": "resident-session", "turnId": "turn-1", "willRetry": true, "error": ["message": "PRIVATE-RETRY"]]])
                 if mode == "retry" { finish() }
+                continue
+            }
+            if mode == "upgrade" {
+                let upstream = String(decoding: bytes(["error": ["type": "invalid_request_error", "param": "model", "message": "The PRIVATE model requires a newer version of Codex. Please update to the latest version and try again."]]), as: UTF8.self)
+                emit(["method": "error", "params": ["threadId": "resident-session", "turnId": "turn-1", "willRetry": false, "error": ["message": upstream, "codexErrorInfo": "other"]]])
                 continue
             }
             if mode == "errorFalse" || mode == "errorMissing" {
@@ -98,6 +107,35 @@ func fake() {
             let message = String(decoding: bytes(["error": ["type": "invalid_request_error", "param": parameter, "message": "PRIVATE"]]), as: UTF8.self)
             check(ResidentCodexSafeError.category(message: message) == "upstream_invalid_request" + (parameter == "PRIVATE" ? "" : ":" + parameter), "only allowed upstream parameter name")
         }
+        let rejectionCases: [(String, String?, String)] = [
+            ("Unsupported value: 'namespace'. PRIVATE", "tools[12].type", "unsupported_value;parameter=tools[].type;feature=namespace"),
+            ("Unsupported tool namespace PRIVATE", nil, "unsupported_value;feature=namespace"),
+            ("Unsupported parameter: 'environment'. PRIVATE", nil, "unsupported_parameter;parameter=environment;feature=environment"),
+            ("Unsupported parameter: 'tool_choice'. PRIVATE", nil, "unsupported_parameter;parameter=tool_choice;feature=tool_choice"),
+            ("Invalid schema for function PRIVATE: missing properties", "tools[0].parameters", "invalid_schema;parameter=tools[].parameters;feature=function"),
+            ("Invalid schema: PRIVATE", "tools[0].parameters.additionalProperties", "invalid_schema;parameter=tools[].parameters.additionalproperties"),
+            ("tools must contain at least one tool", "tools", "empty_tools;parameter=tools"),
+            ("Missing required parameter: 'input'. PRIVATE", "input", "missing_required_parameter;parameter=input"),
+            ("Unsupported model PRIVATE", "model", "unsupported_model;parameter=model"),
+            ("The model PRIVATE does not exist", "model", "model_not_found;parameter=model"),
+            ("You do not have access to model PRIVATE", "model", "model_access_denied;parameter=model"),
+            ("Invalid value: PRIVATE", "tools[5].parameters.properties.PRIVATE", "invalid_value"),
+            ("PRIVATE value is PRIVATE", nil, "unclassified"),
+            ("PRIVATE secret", "PRIVATE.path", "unclassified"),
+            ("token: high priority account", nil, "unclassified"),
+            ("Store must be set to false", nil, "required_value;parameter=store"),
+            ("Instructions are required", nil, "missing_required_parameter;parameter=instructions"),
+            ("The PRIVATE model requires a newer version of Codex. Please update to the latest version and try again.", "model", "codex_upgrade_required;parameter=model"),
+            ("This model requires a newer version of Codex.", "model", "codex_upgrade_required;parameter=model"),
+        ]
+        for (message, param, expected) in rejectionCases {
+            let envelope = String(decoding: bytes(["error": ["type": "invalid_request_error", "message": message, "param": param as Any? ?? NSNull()]]), as: UTF8.self)
+            check(ResidentCodexSafeError.detail(message: envelope) == expected, "safe upstream rejection detail")
+        }
+        for param in ["text.verbosity", "reasoning.effort", "service_tier", "store", "include", "parallel_tool_calls", "truncation", "max_output_tokens"] {
+            check(ResidentCodexSafeError.detail(message: "Unsupported parameter: '\(param)'. PRIVATE") == "unsupported_parameter;parameter=\(param)", "fixed response field recognized without JSON param")
+        }
+        check(!ResidentCodexSafeError.detail(message: "The model uses this version of Codex. Please try again later.").hasPrefix("codex_upgrade_required"), "version mention alone does not request upgrade")
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("gmgn-loop-fixture-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -152,7 +190,7 @@ func fake() {
             let reply = try frames(file).first { $0["id"] as? String == "tool-request" }?["result"] as? [String: Any]
             check(reply?["success"] as? Bool == false, "\(mode) formal failed result")
         }
-        for mode in ["unsafe", "eof", "failed", "commentary", "hang", "earlyMismatch", "retryHang", "errorFalse", "errorMissing", "rpcFailure"] {
+        for mode in ["unsafe", "eof", "failed", "commentary", "hang", "earlyMismatch", "retryHang", "errorFalse", "errorMissing", "rpcFailure", "upgrade", "rpcUpgrade"] {
             let (agent, file) = try make(mode, timeout: mode == "eof" ? 3 : 0.3)
             let began = Date()
             do { _ = try await agent.send(prompt: "查看", sessionID: nil, toolsJSON: tools, onToolCall: callback); fatalError("FAIL: \(mode) must fail") }
@@ -167,14 +205,21 @@ func fake() {
                     else { fatalError("FAIL: terminal error must fail immediately") }
                     check(agent.failureCode == "unauthorized", "notification safe diagnostic survives transport")
                     check(agent.failureCategory == "missing_provider_env", "notification fixed category survives transport")
+                    check(agent.failureDetail == "unclassified;parameter=environment;feature=environment", "notification safe detail survives transport")
                 }
                 if mode == "failed" {
                     check(agent.failureCode == "httpConnectionFailed:401", "completed turn safe diagnostic")
                     check(agent.failureCategory == "unclassified", "completed private text discarded")
+                    check(agent.failureDetail == "unclassified", "completed safe detail retains no private text")
                 }
                 check(agent.failureStage != nil, "failure has fixed local stage")
-                check(agent.didSendTurnStart == (mode != "unsafe" && mode != "rpcFailure"), "model turn dispatch is observable")
+                check(agent.didSendTurnStart == (mode != "unsafe" && mode != "rpcFailure" && mode != "rpcUpgrade"), "model turn dispatch is observable")
                 if mode == "rpcFailure" { check(agent.failureCategory == "rules_load_failed", "RPC failure uses fixed safe category") }
+                if mode == "upgrade" || mode == "rpcUpgrade" {
+                    if case ResidentCodexAgentError.codexUpgradeRequired = error { check(true, "outdated Codex has specific user-facing failure") }
+                    else { fatalError("FAIL: outdated client must request upgrade") }
+                    check((error as? LocalizedError)?.errorDescription?.contains("更新 Codex") == true, "user sees actionable upgrade guidance")
+                }
             }
             if mode == "unsafe" { check(try !frames(file).contains { ($0["method"] as? String)?.hasPrefix("thread/") == true }, "unsafe policy never starts thread") }
             if mode == "eof" { check(Date().timeIntervalSince(began) < 1.5, "EOF ends turn without deadline") }

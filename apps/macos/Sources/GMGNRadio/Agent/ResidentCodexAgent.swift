@@ -11,7 +11,7 @@ struct ResidentCodexAgentOutcome: Sendable {
 }
 
 enum ResidentCodexAgentError: Error, LocalizedError {
-    case busy, invalidProtocol, invalidTools, turnFailed, noFinalAnswer, timedOut
+    case busy, invalidProtocol, invalidTools, turnFailed, noFinalAnswer, timedOut, codexUpgradeRequired
     var errorDescription: String? {
         switch self {
         case .busy: return "居民正在处理上一条消息。"
@@ -20,6 +20,7 @@ enum ResidentCodexAgentError: Error, LocalizedError {
         case .turnFailed: return "居民未能完成本轮回复，请重试。"
         case .noFinalAnswer: return "居民没有返回完整答复，请重试。"
         case .timedOut: return "居民回复等待超时，请重试。"
+        case .codexUpgradeRequired: return "当前模型需要较新版本的 Codex，请先更新 Codex 后重试。"
         }
     }
 }
@@ -29,10 +30,12 @@ enum ResidentCodexAgentError: Error, LocalizedError {
     private(set) var failureStage: String?
     private(set) var failureCode: String?
     private(set) var failureCategory: String?
+    private(set) var failureDetail: String?
     private(set) var didSendTurnStart = false
     private var stage = "preflight"
     private var lastSafeErrorCode: String?
     private var lastSafeErrorCategory: String?
+    private var lastSafeErrorDetail: String?
     typealias TransportFactory = (URL, [String], URL, [String: String]) -> ResidentCodexTransport
     typealias ToolHandler = @MainActor (String, String, Data) async -> ResidentCodexToolReply
     private static let allowedTools: Set<String> = ["inspect_world", "list_available_activities", "start_activity", "stop_activity"]
@@ -70,8 +73,8 @@ enum ResidentCodexAgentError: Error, LocalizedError {
         let tools = try Self.dynamicTools(toolsJSON)
         let token = UUID()
         operationID = token
-        failureStage = nil; failureCode = nil; failureCategory = nil; didSendTurnStart = false
-        stage = "preflight"; lastSafeErrorCode = nil; lastSafeErrorCategory = nil
+        failureStage = nil; failureCode = nil; failureCategory = nil; failureDetail = nil; didSendTurnStart = false
+        stage = "preflight"; lastSafeErrorCode = nil; lastSafeErrorCategory = nil; lastSafeErrorDetail = nil
         terminal = nil; threadID = nil; turnID = nil; acceptingTurn = false; finalMessages = []
         let deadline = Task { [weak self] in
             do { try await Task.sleep(nanoseconds: UInt64((self?.turnTimeout ?? 180) * 1_000_000_000)) }
@@ -151,9 +154,18 @@ enum ResidentCodexAgentError: Error, LocalizedError {
             } catch {
                 if failureStage == nil { failureStage = stage; failureCode = lastSafeErrorCode }
                 if failureCategory == nil { failureCategory = lastSafeErrorCategory ?? transport?.failureCategory }
+                if failureDetail == nil { failureDetail = lastSafeErrorDetail ?? transport?.failureDetail }
                 // A queued success notification cannot validate a mismatched RPC response.
-                if case .failure(let terminalError) = terminal { throw terminalError }
-                throw error
+                var reportedError = error
+                if case .failure(let terminalError) = terminal { reportedError = terminalError }
+                if failureDetail?.split(separator: ";").first == "codex_upgrade_required" {
+                    switch reportedError {
+                    case ResidentCodexAgentError.turnFailed, ResidentCodexTransportError.remoteError:
+                        throw ResidentCodexAgentError.codexUpgradeRequired
+                    default: break
+                    }
+                }
+                throw reportedError
             }
         } onCancel: {
             Task { @MainActor [weak self] in
@@ -182,6 +194,7 @@ enum ResidentCodexAgentError: Error, LocalizedError {
         if case .failure = result {
             failureStage = stage; failureCode = lastSafeErrorCode
             failureCategory = lastSafeErrorCategory ?? transport?.failureCategory
+            failureDetail = lastSafeErrorDetail ?? transport?.failureDetail
         }
         terminal = result
         if let waiter { self.waiter = nil; waiter.resume(with: result) }
@@ -209,6 +222,7 @@ enum ResidentCodexAgentError: Error, LocalizedError {
                 if let error = turn["error"] as? [String: Any] {
                     lastSafeErrorCode = ResidentCodexSafeError.code(from: error["codexErrorInfo"])
                     lastSafeErrorCategory = ResidentCodexSafeError.category(message: error["message"] as? String)
+                    lastSafeErrorDetail = ResidentCodexSafeError.detail(message: error["message"] as? String)
                 }
                 complete(.failure(ResidentCodexAgentError.turnFailed)); return
             }
@@ -221,6 +235,7 @@ enum ResidentCodexAgentError: Error, LocalizedError {
                 lastSafeErrorCode = ResidentCodexSafeError.code(from: error["codexErrorInfo"])
                 // The transport constructs this value from the fixed local classifier.
                 lastSafeErrorCategory = error["category"] as? String
+                lastSafeErrorDetail = error["detail"] as? String
             }
             if params["willRetry"] as? Bool == true { return }
             complete(.failure(ResidentCodexAgentError.turnFailed))

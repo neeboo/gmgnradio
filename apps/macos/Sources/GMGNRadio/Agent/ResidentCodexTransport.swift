@@ -59,6 +59,76 @@ enum ResidentCodexSafeError {
         }
         return "unclassified"
     }
+
+    /// Keep rejection structure, never model names, tool names, property keys, or values.
+    static func detail(message: String?) -> String {
+        guard let message else { return "unclassified" }
+        let envelope = (try? JSONSerialization.jsonObject(with: Data(message.utf8))) as? [String: Any]
+        let error = envelope?["error"] as? [String: Any]
+        let text = (error?["message"] as? String ?? message).lowercased()
+        let code = error?["code"] as? String
+        let reason: String
+        if text.contains("model"), text.contains("version of codex"),
+           text.contains("requires") || (text.contains("please") && text.contains("try again")),
+           ["update", "upgrade", "newer", "latest"].contains(where: text.contains) {
+            reason = "codex_upgrade_required"
+        } else if code == "model_not_found" || (text.contains("model") && text.contains("does not exist")) {
+            reason = "model_not_found"
+        } else if code == "model_access_denied" || (text.contains("model") && (text.contains("do not have access") || text.contains("access denied"))) {
+            reason = "model_access_denied"
+        } else if text.contains("unsupported model") || text.contains("model is not supported") {
+            reason = "unsupported_model"
+        } else if text.contains("invalid schema") || (text.contains("schema") && text.contains("unsupported")) {
+            reason = "invalid_schema"
+        } else if text.contains("tools") && (text.contains("empty") || text.contains("at least one")) {
+            reason = "empty_tools"
+        } else if text.contains("must be set to") {
+            reason = "required_value"
+        } else if text.contains("missing required parameter") || text.contains("is required") || text.contains("are required") {
+            reason = "missing_required_parameter"
+        } else if text.contains("unsupported parameter") || text.contains("unknown parameter") || text.contains("unrecognized request argument") {
+            reason = "unsupported_parameter"
+        } else if text.contains("unsupported value") || text.contains("unsupported tool namespace") {
+            reason = "unsupported_value"
+        } else if text.contains("invalid value:") || text.contains("invalid value for") {
+            reason = "invalid_value"
+        } else { reason = "unclassified" }
+
+        let parameters: Set<String> = [
+            "model", "input", "input[].type", "input[].role", "input[].content", "input[].content[].type",
+            "tools", "tools[].type", "tools[].name", "tools[].namespace", "tools[].parameters",
+            "tools[].parameters.type", "tools[].parameters.properties", "tools[].parameters.required",
+            "tools[].parameters.additionalproperties", "tools[].function", "tools[].function.name",
+            "tools[].function.parameters", "tools[].strict", "tool_choice", "tool_choice.type",
+            "tool_choice.name", "tool_choice.namespace", "environment", "environments", "reasoning",
+            "reasoning.effort", "reasoning.summary", "service_tier", "text", "text.verbosity",
+            "store", "include", "parallel_tool_calls", "truncation", "max_output_tokens", "instructions",
+        ]
+        func parameter(_ candidate: String) -> String? {
+            let normalized = candidate.lowercased()
+                .replacingOccurrences(of: #"\[\d+\]"#, with: "[]", options: .regularExpression)
+                .replacingOccurrences(of: #"\.\d+(?=\.|$)"#, with: "[]", options: .regularExpression)
+            return parameters.contains(normalized) ? normalized : nil
+        }
+        var selectedParameter: String?
+        if let supplied = error?["param"] as? String { selectedParameter = parameter(supplied) }
+        else if let regex = try? NSRegularExpression(pattern: #"[a-z_][a-z0-9_]*(?:\[\d*\]|\.[a-z0-9_]+)*"#) {
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            for match in regex.matches(in: text, range: range) {
+                guard let tokenRange = Range(match.range, in: text) else { continue }
+                if let value = parameter(String(text[tokenRange])) { selectedParameter = value; break }
+            }
+        }
+        var result = reason
+        if let selectedParameter { result += ";parameter=" + selectedParameter }
+        for feature in ["namespace", "tool_choice", "environment", "function"] {
+            if text.range(of: #"\b"# + feature + #"\b"#, options: .regularExpression) != nil {
+                result += ";feature=" + feature
+                break
+            }
+        }
+        return result
+    }
 }
 
 enum ResidentCodexTransportError: Error, LocalizedError {
@@ -83,6 +153,7 @@ enum ResidentCodexTransportError: Error, LocalizedError {
 /// A single owned app-server process. It never launches a thread or grants permissions.
 @MainActor final class ResidentCodexTransport {
     private(set) var failureCategory: String?
+    private(set) var failureDetail: String?
     var onNotification: ((String, Data) -> Void)?
     var onServerRequest: ((String, Data) async throws -> Data)?
     var onClosed: ((Error) -> Void)?
@@ -250,7 +321,9 @@ enum ResidentCodexTransportError: Error, LocalizedError {
                 let error = raw["error"] as? [String: Any] ?? [:]
                 let category = ResidentCodexSafeError.category(message: error["message"] as? String)
                 failureCategory = category
-                var safeError: [String: Any] = ["code": "server_error", "category": category]
+                let detail = ResidentCodexSafeError.detail(message: error["message"] as? String)
+                failureDetail = detail
+                var safeError: [String: Any] = ["code": "server_error", "category": category, "detail": detail]
                 if let info = ResidentCodexSafeError.projection(error["codexErrorInfo"]) {
                     safeError["codexErrorInfo"] = info
                 }
@@ -265,6 +338,7 @@ enum ResidentCodexTransportError: Error, LocalizedError {
         waiting.timeout.cancel()
         if let error = frame["error"] as? [String: Any] {
             failureCategory = ResidentCodexSafeError.category(message: error["message"] as? String)
+            failureDetail = ResidentCodexSafeError.detail(message: error["message"] as? String)
             waiting.continuation.resume(throwing: ResidentCodexTransportError.remoteError(error["code"] as? Int ?? -32603))
         } else if let result = frame["result"] {
             waiting.continuation.resume(returning: try Self.encode(result))
