@@ -2854,12 +2854,14 @@ final class AppDelegate:
             finishCancellation()
             return
         } catch {
+            guard liveCamMessageID == messageID else { return }
             liveCamWindowController?.showChatStatus(
                 (error as? LocalizedError)?.errorDescription
                     ?? "消息发送失败，请稍后再试。"
             )
             return
         }
+        guard liveCamMessageID == messageID else { return }
         liveCamWindowController?.finishAgentReply(reply)
         agentSpeechAnnouncer.isEnabled =
             AgentConversationService.shared.preferenceStore.autoSpeakReplies

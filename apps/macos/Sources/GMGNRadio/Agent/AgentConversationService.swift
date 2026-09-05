@@ -382,11 +382,11 @@ final class AgentConversationService {
         history: [AgentConversationMessage] = [],
         onCancel: (@MainActor () -> Void)? = nil
     ) async throws -> String {
+        cancel()
         let id = effectiveBackendID
         guard isInstalled(id) else {
             throw AgentConversationError.backendNotInstalled(id)
         }
-        cancel()
         currentCancellationHandler = onCancel
         switch id {
         case .codex:

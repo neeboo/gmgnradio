@@ -22,8 +22,14 @@ let replyMethods = ["func beginAgentReply(", "func finishAgentReply(", "func sho
 let harness = #"""
 import Foundation
 
-struct FixtureLocator: AgentExecutableLocating {
-    func locate(executableNames: [String]) -> URL? { URL(fileURLWithPath: "/fixture/" + executableNames[0]) }
+final class FixtureLocator: AgentExecutableLocating, @unchecked Sendable {
+    private let lock = NSLock()
+    private var available = true
+    func setAvailable(_ value: Bool) { lock.lock(); available = value; lock.unlock() }
+    func locate(executableNames: [String]) -> URL? {
+        lock.lock(); defer { lock.unlock() }
+        return available ? URL(fileURLWithPath: "/fixture/" + executableNames[0]) : nil
+    }
 }
 // The process boundary alone is simulated, including a process that ignores
 // cancellation and delivers stdout after the user starts another request.
@@ -109,11 +115,11 @@ typealias RealConversationService = AgentConversationService
     catch AgentConversationError.cancelled { return true }
     catch { return false }
 }
-@MainActor func fixture() -> (RealConversationService, ControlledRunner, UserDefaults, String) {
+@MainActor func fixture(locator: FixtureLocator = FixtureLocator()) -> (RealConversationService, ControlledRunner, UserDefaults, String) {
     let suite = "gmgn-resident-test-\(UUID())"
     let defaults = UserDefaults(suiteName: suite)!
     let runner = ControlledRunner()
-    let service = RealConversationService(locator: FixtureLocator(), defaults: defaults, runnerFactory: { _ in runner })
+    let service = RealConversationService(locator: locator, defaults: defaults, runnerFactory: { _ in runner })
     service.selectBackend(.codex)
     return (service, runner, defaults, suite)
 }
@@ -237,6 +243,24 @@ typealias RealConversationService = AgentConversationService
             check(app.liveCamWindowController?.replies == ["current"], "UI never publishes a stale reply")
             check(app.liveCamWindowController?.statuses == [], "UI never publishes a stale error")
             check(app.agentSpeechAnnouncer.spoken == ["current"], "TTS never announces stale output")
+        }
+        for staleExit: Int32 in [0, 1] {
+            let locator = FixtureLocator()
+            let (service, runner, defaults, suite) = fixture(locator: locator)
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let app = AppHarness(service)
+            let old = Task { await app.send("old") }
+            await runner.waitForCalls(1)
+            locator.setAvailable(false)
+            await app.send("provider-disappeared")
+            let failureStatuses = app.liveCamWindowController?.statuses
+            check(failureStatuses?.count == 1, "new preflight failure is visible")
+            await runner.finish(0, session: "stale-session", reply: "stale-reply", exit: staleExit)
+            await old.value
+            check(app.liveCamWindowController?.statuses == failureStatuses, "old failure cannot replace newer preflight error")
+            check(app.liveCamWindowController?.replies.isEmpty == true, "old success cannot replace newer preflight error")
+            check(app.agentSpeechAnnouncer.spoken.isEmpty, "old success after preflight failure cannot trigger TTS")
+            check(service.preferenceStore.sessionID(for: .codex) == nil, "preflight failure cancels old session persistence")
         }
         for action in ["cancel", "reset", "switch", "caller-cancel"] {
             let (service, runner, defaults, suite) = fixture()
