@@ -2832,8 +2832,48 @@ final class AppDelegate:
     /// 不依赖实时语音连接状态。
     private var liveCamMessageID: UUID?
 
+    private func currentResidentWorldContext() -> ResidentWorldContext {
+        guard let context = livingWorldContext,
+              spatialStage.selectedWorldID == context.manifest.worldID else {
+            return .unavailable(selectedWorldID: spatialStage.selectedWorldID)
+        }
+        let snapshot = context.snapshot
+        let manifest = context.manifest
+        let objects = Set(manifest.activities.flatMap(\.propIDs)).sorted().map { id in
+            let state = context.state.objectStates[id]
+            let position = state?.transform.position
+            return ResidentWorldContext.Object(
+                id: id,
+                displayName: id == "prop.jukebox" ? "点唱机" : nil,
+                position: position.map { [$0.x, $0.y, $0.z] },
+                isEnabled: state?.isEnabled,
+                activityIDs: manifest.activities.filter { $0.propIDs.contains(id) }.map(\.id).sorted()
+            )
+        }
+        let position = snapshot.agentTransform.position
+        return ResidentWorldContext(
+            selectedWorldID: spatialStage.selectedWorldID,
+            worldID: snapshot.worldID,
+            displayName: snapshot.displayName,
+            revision: snapshot.revision,
+            residentPosition: [position.x, position.y, position.z],
+            activeActivity: snapshot.activeActivity?.id,
+            activityPhase: snapshot.activeActivity?.phase.rawValue,
+            objects: objects,
+            availableActivities: snapshot.activities.map { activity in
+                ResidentWorldContext.Activity(
+                    id: activity.id,
+                    displayName: manifest.activityDefinitions.first { $0.id == activity.id }?.displayName,
+                    action: activity.action,
+                    entryPlaceID: activity.entryPlaceID
+                )
+            }
+        )
+    }
+
     private func sendLiveCamMessage(_ message: String) async {
         let messageID = UUID()
+        let worldContext = currentResidentWorldContext()
         liveCamMessageID = messageID
         defer {
             if liveCamMessageID == messageID { liveCamMessageID = nil }
@@ -2846,7 +2886,9 @@ final class AppDelegate:
         }
         let reply: String
         do {
-            reply = try await AgentConversationService.shared.send(message, onCancel: finishCancellation)
+            reply = try await AgentConversationService.shared.send(
+                message, worldContext: worldContext, onCancel: finishCancellation
+            )
         } catch AgentConversationError.cancelled {
             finishCancellation()
             return
@@ -2855,6 +2897,10 @@ final class AppDelegate:
             return
         } catch {
             guard liveCamMessageID == messageID else { return }
+            guard currentResidentWorldContext().sessionScope == worldContext.sessionScope else {
+                finishCancellation()
+                return
+            }
             liveCamWindowController?.showChatStatus(
                 (error as? LocalizedError)?.errorDescription
                     ?? "消息发送失败，请稍后再试。"
@@ -2862,6 +2908,10 @@ final class AppDelegate:
             return
         }
         guard liveCamMessageID == messageID else { return }
+        guard currentResidentWorldContext().sessionScope == worldContext.sessionScope else {
+            finishCancellation()
+            return
+        }
         liveCamWindowController?.finishAgentReply(reply)
         agentSpeechAnnouncer.isEnabled =
             AgentConversationService.shared.preferenceStore.autoSpeakReplies

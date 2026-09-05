@@ -17,10 +17,13 @@ func declaration(_ signature: String, in source: String) -> String {
     fatalError("Unbalanced \(signature)")
 }
 let sendMethod = declaration("private func sendLiveCamMessage(", in: app)
+let contextMethod = app.contains("private func currentResidentWorldContext(")
+    ? declaration("private func currentResidentWorldContext(", in: app) : ""
 let controller = try String(contentsOf: sources.appendingPathComponent("DesktopPresence/LiveCamWindowController.swift"), encoding: .utf8)
 let replyMethods = ["func beginAgentReply(", "func finishAgentReply(", "func showChatStatus("].map { declaration($0, in: controller) }.joined(separator: "\n")
 let harness = #"""
 import Foundation
+import WorldRuntime
 
 final class FixtureLocator: AgentExecutableLocating, @unchecked Sendable {
     private let lock = NSLock()
@@ -66,6 +69,18 @@ actor ControlledRunner: CodexCommandRunning {
     }
 }
 
+struct FixtureWorldState: WorldStatePersisting {
+    let state: WorldState
+    func load() throws -> WorldState? { state }
+    func save(_ state: WorldState) throws {}
+}
+
+func worldPayload(_ prompt: String) throws -> [String: Any] {
+    let json = prompt.components(separatedBy: "空间资料：\n")[1]
+        .components(separatedBy: "\n用户消息：")[0]
+    return try JSONSerialization.jsonObject(with: Data(json.utf8)) as! [String: Any]
+}
+
 typealias RealConversationService = AgentConversationService
 @MainActor final class LiveCamPanel {
     var replies: [String] = []
@@ -98,8 +113,12 @@ typealias RealConversationService = AgentConversationService
     private var liveCamMessageID: UUID?
     var liveCamWindowController: Surface? = Surface()
     var agentSpeechAnnouncer = Speech()
+    struct Stage { var selectedWorldID = "unloaded-world" }
+    var spatialStage = Stage()
+    var livingWorldContext: WorldAgentContext?
     init(_ service: RealConversationService) { AgentConversationService.shared = service }
     \#(sendMethod)
+    \#(contextMethod)
     func send(_ message: String) async { await sendLiveCamMessage(message) }
 }
 
@@ -126,6 +145,131 @@ typealias RealConversationService = AgentConversationService
 
 @main struct Tests {
     @MainActor static func main() async throws {
+        // Use the shipping manifest and actual WorldAgentContext, with only the
+        // external CLI process mocked. No real backend or saved world is read.
+        do {
+            let (service, runner, defaults, suite) = fixture()
+            defer { defaults.removePersistentDomain(forName: suite) }
+            service.preferenceStore.saveSessionID("personal-session", for: .codex)
+            let manifestData = try Data(contentsOf: URL(fileURLWithPath:
+                "apps/macos/Resources/Worlds/marble-living-cabin/world.json"))
+            let manifest = try JSONDecoder().decode(WorldManifest.self, from: manifestData)
+            let context = try WorldAgentContext(manifest: manifest)
+            let app = AppHarness(service)
+            app.livingWorldContext = context
+            app.spatialStage.selectedWorldID = manifest.worldID
+            let first = Task { await app.send("你在什么地方，能做什么？") }
+            await runner.waitForCalls(1)
+            let firstCall = await runner.calls[0]
+            let input = firstCall.input ?? firstCall.arguments.joined(separator: " ")
+            check(input.contains(manifest.worldID), "current world ID reaches actual model input")
+            check(input.contains("residentPosition"), "resident position reaches model input")
+            check(input.contains("prop.jukebox") && input.contains("点唱机"), "declared jukebox has public identity")
+            check(input.contains("music.listen") && input.contains("availableActivities"), "declared activities reach model input")
+            check(input.contains("只读") && input.contains("不能声称"), "text backend explicitly cannot claim execution")
+            check(input.contains("未知"), "absent object runtime position remains unknown")
+            check(!input.contains(".glb") && !input.contains("/Users/") && !input.contains("resources"), "resource and private paths are not context")
+            check(!firstCall.arguments.contains("personal-session"), "room does not resume personal chat session")
+            if input.contains("空间资料：\n") {
+                let payload = try worldPayload(input)
+                let props = payload["objects"] as? [[String: Any]] ?? []
+                check((payload["residentPosition"] as? [NSNumber])?.map(\.floatValue) == [context.state.agentTransform.position.x,
+                    context.state.agentTransform.position.y, context.state.agentTransform.position.z], "resident position is actual runtime position")
+                check(props.first?["position"] == nil && props.first?["isEnabled"] == nil, "unavailable object state is not fabricated from activity anchor")
+                check(props.first?["activityIDs"] as? [String] == ["music.listen"], "object links to its declared activity")
+            }
+            await runner.finish(0, session: "cabin-session")
+            await first.value
+            check(service.preferenceStore.sessionID(for: .codex) == "personal-session", "room session does not replace personal chat session")
+
+            try context.startActivity(id: "home.idle")
+            let next = Task { await app.send("现在在做什么？") }
+            await runner.waitForCalls(2)
+            let secondCall = await runner.calls[1]
+            check(secondCall.arguments.contains("cabin-session"), "same room resumes resident session")
+            check(secondCall.input != firstCall.input && secondCall.input?.contains("activeActivity") == true,
+                  "next turn gets updated live activity snapshot")
+            if let prompt = secondCall.input, prompt.contains("空间资料：\n") {
+                check(try worldPayload(prompt)["activeActivity"] as? String == "home.idle", "current activity value comes from executor snapshot")
+            }
+            await runner.finish(1, session: "cabin-session")
+            await next.value
+
+            // Selection can change before the old context has been replaced.
+            app.spatialStage.selectedWorldID = "other-room"
+            let switched = Task { await app.send("看看新房间") }
+            await runner.waitForCalls(3)
+            let switchedCall = await runner.calls[2]
+            check(!switchedCall.arguments.contains("cabin-session"), "world mismatch never resumes old room session")
+            check(switchedCall.input?.contains("prop.jukebox") != true && switchedCall.input?.contains("music.listen") != true,
+                  "world mismatch does not expose old facilities")
+            check(switchedCall.input?.contains("未知") == true, "unloaded world is explicitly unknown")
+            await runner.finish(2, session: "unavailable-session")
+            await switched.value
+
+            app.spatialStage.selectedWorldID = manifest.worldID
+            let delayed = Task { await app.send("旧空间的回答") }
+            await runner.waitForCalls(4)
+            let replies = app.liveCamWindowController?.replies
+            let speech = app.agentSpeechAnnouncer.spoken
+            app.spatialStage.selectedWorldID = "other-room"
+            await runner.finish(3, reply: "old-room-reply")
+            await delayed.value
+            check(app.liveCamWindowController?.replies == replies, "world switch suppresses delayed room reply")
+            check(app.agentSpeechAnnouncer.spoken == speech, "world switch suppresses delayed room speech")
+
+            var state = WorldSimulation(manifest: manifest, startedAt: Date()).state
+            state.objectStates["prop.jukebox"] = WorldObjectState(isEnabled: false,
+                transform: WorldTransform(position: WorldVector3(x: 2, y: 3, z: 4),
+                    rotation: manifest.spawn.rotation, scale: manifest.spawn.scale),
+                metadata: ["apiKey": "DO-NOT-SEND-SECRET", "resource": "/private/test.glb"])
+            state.objectStates["unpublished-object"] = WorldObjectState(transform: manifest.spawn)
+            app.livingWorldContext = try WorldAgentContext(manifest: manifest, persistence: FixtureWorldState(state: state))
+            app.spatialStage.selectedWorldID = manifest.worldID
+            let restored = Task { await app.send("检查物件") }
+            await runner.waitForCalls(5)
+            let restoredInput = await runner.calls[4].input ?? ""
+            check(!restoredInput.contains("DO-NOT-SEND-SECRET") && !restoredInput.contains("/private/") && !restoredInput.contains("unpublished-object"), "only declared public object state crosses prompt boundary")
+            if restoredInput.contains("空间资料：\n") {
+                let props = try worldPayload(restoredInput)["objects"] as! [[String: Any]]
+                check(props[0]["position"] as? [Int] == [2, 3, 4] && props[0]["isEnabled"] as? Bool == false,
+                      "known object position and enabled status are preserved")
+            }
+            await runner.finish(4)
+            await restored.value
+        }
+        for backend in AgentConversationBackendID.allCases {
+            let (service, runner, defaults, suite) = fixture()
+            defer { defaults.removePersistentDomain(forName: suite) }
+            service.selectBackend(backend)
+            service.preferenceStore.saveSessionID("personal-session", for: backend)
+            let roomA = ResidentWorldContext.unavailable(selectedWorldID: "room-A")
+            let roomB = ResidentWorldContext.unavailable(selectedWorldID: "room-B")
+            let first = Task { try await service.send("only-room-A-history", worldContext: roomA) }
+            await runner.waitForCalls(1)
+            check(await !runner.calls[0].arguments.contains("personal-session"), "\(backend): room starts outside personal session")
+            await runner.finish(0, session: "room-A-session", backend: backend)
+            _ = try await first.value
+            let second = Task { try await service.send("same-room", worldContext: roomA) }
+            await runner.waitForCalls(2)
+            let sameArguments = await runner.calls[1].arguments
+            check(backend == .dsh ? sameArguments.last?.contains("only-room-A-history") == true : sameArguments.contains("room-A-session"), "\(backend): room session continues")
+            await runner.finish(1, session: "room-A-session", backend: backend)
+            _ = try await second.value
+            let third = Task { try await service.send("other-room", history: [.init(role: .user, text: "unsafe-external-history")], worldContext: roomB) }
+            await runner.waitForCalls(3)
+            let otherArguments = await runner.calls[2].arguments
+            check(!otherArguments.contains("room-A-session") && !otherArguments.joined().contains("only-room-A-history") && !otherArguments.joined().contains("unsafe-external-history"), "\(backend): other room never inherits history")
+            await runner.finish(2, session: "room-B-session", backend: backend)
+            _ = try await third.value
+            service.resetSession()
+            check(service.preferenceStore.sessionID(for: backend) == "personal-session", "\(backend): resetting room preserves personal session")
+            let reset = Task { try await service.send("reset-room", worldContext: roomB) }
+            await runner.waitForCalls(4)
+            check(await !runner.calls[3].arguments.contains("room-B-session"), "\(backend): reset starts fresh room session")
+            await runner.finish(3, backend: backend)
+            _ = try await reset.value
+        }
         for backend in AgentConversationBackendID.allCases {
             let (service, runner, defaults, suite) = fixture()
             defer { defaults.removePersistentDomain(forName: suite) }
@@ -339,8 +483,12 @@ func run(_ binary: String, _ arguments: [String]) throws -> Int32 {
     return process.terminationStatus
 }
 let compiled = try run("/usr/bin/swiftc", ["-j1", "-parse-as-library",
+    "-I", root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug/Modules").path,
     sources.appendingPathComponent("Agent/CodexCLI.swift").path,
     sources.appendingPathComponent("Agent/AgentConversationService.swift").path,
-    program.path, "-o", executable.path])
+    sources.appendingPathComponent("Agent/WorldAgentContext.swift").path,
+    program.path, "-o", executable.path] + FileManager.default.contentsOfDirectory(
+        at: root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug/WorldRuntime.build"),
+        includingPropertiesForKeys: nil).filter { $0.pathExtension == "o" }.map(\.path))
 guard compiled == 0 else { exit(compiled) }
 exit(try run(executable.path, []))
