@@ -78,6 +78,28 @@ func fake() {
             }
             return false
         }
+        let nodeFixture = URL(fileURLWithPath: CommandLine.arguments[1])
+        let guiEnvironment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
+        let unrepaired = Process()
+        unrepaired.executableURL = nodeFixture
+        unrepaired.environment = guiEnvironment
+        unrepaired.currentDirectoryURL = nodeFixture.deletingLastPathComponent()
+        unrepaired.standardOutput = Pipe(); unrepaired.standardError = Pipe()
+        try unrepaired.run(); unrepaired.waitUntilExit()
+        check(unrepaired.terminationStatus == 127, "minimal desktop PATH reproduces missing env-node runtime")
+        for inherited in [guiEnvironment, [:]] {
+            let gui = ResidentCodexTransport(executableURL: nodeFixture, arguments: [],
+                currentDirectoryURL: nodeFixture.deletingLastPathComponent(),
+                environment: ResidentCodexPolicy.environment(from: inherited), requestTimeout: 2)
+            do { try await gui.start() }
+            catch { fatalError("FAIL: production environment must initialize env-node peer from desktop PATH") }
+            let guiPID = gui.processIdentifier!
+            let result = object(try await gui.request(method: "echo", params: data([:])))
+            check(result["initialized"] as? Bool == true && result["externalExecutionDisabled"] as? Bool == true,
+                  "real node peer initialized with external execution disabled")
+            gui.close()
+            check(await stopped(guiPID), "GUI runtime fixture child is terminated")
+        }
         let client = transport()
         var closedCount = 0
         client.onClosed = { _ in closedCount += 1 }
@@ -168,12 +190,33 @@ try FileManager.default.createDirectory(at: temporary, withIntermediateDirectori
 defer { try? FileManager.default.removeItem(at: temporary) }
 let fixture = temporary.appendingPathComponent("Checks.swift")
 try harness.write(to: fixture, atomically: true, encoding: .utf8)
+let nodeFixture = temporary.appendingPathComponent("codex-fixture")
+let nodePeer = #"""
+#!/usr/bin/env node
+const lines = require('node:readline').createInterface({ input: process.stdin });
+let initialized = false;
+lines.on('line', line => {
+    const message = JSON.parse(line);
+    if (message.method === 'initialized') { initialized = true; return; }
+    if (message.method === 'initialize' || message.method === 'echo') {
+        const result = message.method === 'initialize' ? {} : {
+            initialized, externalExecutionDisabled: process.env.CODEX_EXEC_SERVER_URL === 'none'
+        };
+        process.stdout.write(JSON.stringify({ id: message.id, result }) + '\n');
+    }
+});
+"""#
+try nodePeer.write(to: nodeFixture, atomically: true, encoding: .utf8)
+try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: nodeFixture.path)
 let binary = temporary.appendingPathComponent("checks")
 let compiler = Process()
 compiler.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
-compiler.arguments = ["swiftc", "-swift-version", "6", "-parse-as-library", source.path, fixture.path, "-o", binary.path]
+compiler.arguments = ["swiftc", "-swift-version", "6", "-parse-as-library", source.path,
+    root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/ResidentCodexPolicy.swift").path,
+    fixture.path, "-o", binary.path]
 try compiler.run(); compiler.waitUntilExit()
 guard compiler.terminationStatus == 0 else { exit(compiler.terminationStatus) }
 let test = Process(); test.executableURL = binary
+test.arguments = [nodeFixture.path]
 try test.run(); test.waitUntilExit()
 exit(test.terminationStatus)

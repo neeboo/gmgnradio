@@ -58,6 +58,11 @@ check(env["CODEX_THREAD_ID"] == nil && env["CODEX_EXEC_SERVER_NOISE_SECRET"] == 
 check(env["OPENAI_API_KEY"] == nil, "do not silently switch logged-in account to inherited API key")
 check(env["CODEX_EXEC_SERVER_URL"] == "none", "disable local execution environment")
 check(env["HTTPS_PROXY"] == "proxy", "preserve connection proxy")
+let directories = (ResidentCodexPolicy.environment(from: ["PATH": "/fixture/bin:/usr/local/bin:/bin"]) ["PATH"] ?? "").split(separator: ":").map(String.init)
+check(Array(directories.prefix(6)) == ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"], "GUI launches include standard runtime directories")
+check(directories.last == "/fixture/bin" && Set(directories).count == directories.count, "preserve additional paths without duplicates")
+let noPath = ResidentCodexPolicy.environment(from: [:])
+check(noPath["PATH"]?.contains("/usr/local/bin") == true && noPath["HOME"] == nil, "missing PATH gains runtime locations without inventing HOME")
 print("\(failures == 0 ? "PASS" : "FAIL"): \(checks) resident policy checks, \(failures) failures")
 exit(failures == 0 ? 0 : 1)
 """#

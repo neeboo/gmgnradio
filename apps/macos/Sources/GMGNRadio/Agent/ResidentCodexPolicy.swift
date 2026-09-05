@@ -77,6 +77,17 @@ enum ResidentCodexPolicy {
             "https_proxy", "http_proxy", "all_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR",
         ]
         var result = source.filter { allowed.contains($0.key) }
+        // Finder-launched apps often omit Homebrew. npm's Codex launcher uses
+        // /usr/bin/env node, so locating the launcher alone is insufficient.
+        let standardDirectories = [
+            "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+        ]
+        let inheritedDirectories = (source["PATH"] ?? "").split(separator: ":").map(String.init)
+        result["PATH"] = (standardDirectories + inheritedDirectories)
+            .reduce(into: [String]()) { paths, directory in
+                if !paths.contains(directory) { paths.append(directory) }
+            }
+            .joined(separator: ":")
         result["CODEX_EXEC_SERVER_URL"] = "none"
         return result
     }
