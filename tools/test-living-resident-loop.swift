@@ -17,6 +17,8 @@ func declaration(_ signature: String, in source: String) -> String {
     fatalError("Unbalanced \(signature)")
 }
 let sendMethod = declaration("private func sendLiveCamMessage(", in: app)
+let controller = try String(contentsOf: sources.appendingPathComponent("DesktopPresence/LiveCamWindowController.swift"), encoding: .utf8)
+let replyMethods = ["func beginAgentReply(", "func finishAgentReply(", "func showChatStatus("].map { declaration($0, in: controller) }.joined(separator: "\n")
 let harness = #"""
 import Foundation
 
@@ -59,12 +61,24 @@ actor ControlledRunner: CodexCommandRunning {
 }
 
 typealias RealConversationService = AgentConversationService
-@MainActor final class Surface {
+@MainActor final class LiveCamPanel {
     var replies: [String] = []
     var statuses: [String] = []
-    func beginAgentReply() {}
-    func finishAgentReply(_ reply: String) { replies.append(reply) }
-    func showChatStatus(_ text: String) { statuses.append(text) }
+    var text = ""
+    func showAgentReply(_ reply: String) {
+        text = reply
+        if reply != "…" && !reply.isEmpty { replies.append(reply) }
+    }
+    func showChatStatus(_ value: String) { text = value; statuses.append(value) }
+}
+@MainActor final class Surface {
+    let panel = LiveCamPanel()
+    var window: AnyObject? { panel }
+    var agentReplyBuffer = ""
+    var replies: [String] { panel.replies }
+    var statuses: [String] { panel.statuses }
+    var waiting: Bool { panel.text == "…" }
+    \#(replyMethods)
 }
 @MainActor final class Speech {
     var isEnabled = false
@@ -75,6 +89,7 @@ typealias RealConversationService = AgentConversationService
     // Resolve the production method's singleton lookup to the injected real
     // service; the method itself is compiled unchanged, UI/TTS are inert sinks.
     enum AgentConversationService { static var shared: RealConversationService! }
+    private var liveCamMessageID: UUID?
     var liveCamWindowController: Surface? = Surface()
     var agentSpeechAnnouncer = Speech()
     init(_ service: RealConversationService) { AgentConversationService.shared = service }
@@ -222,6 +237,45 @@ typealias RealConversationService = AgentConversationService
             check(app.liveCamWindowController?.replies == ["current"], "UI never publishes a stale reply")
             check(app.liveCamWindowController?.statuses == [], "UI never publishes a stale error")
             check(app.agentSpeechAnnouncer.spoken == ["current"], "TTS never announces stale output")
+        }
+        for action in ["cancel", "reset", "switch", "caller-cancel"] {
+            let (service, runner, defaults, suite) = fixture()
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let app = AppHarness(service)
+            let request = Task { await app.send("waiting") }
+            await runner.waitForCalls(1)
+            check(app.liveCamWindowController?.waiting == true, "\(action): actual begin shows waiting")
+            switch action {
+            case "reset": service.resetSession()
+            case "switch": service.selectBackend(.dsh)
+            case "caller-cancel":
+                request.cancel()
+                for _ in 0..<100_000 {
+                    if app.liveCamWindowController?.waiting == false { break }
+                    await Task.yield()
+                }
+            default: service.cancel()
+            }
+            check(app.liveCamWindowController?.waiting == false, "\(action): cancellation immediately ends waiting before process exits")
+            await runner.finish(0)
+            await request.value
+            check(app.liveCamWindowController?.replies.isEmpty == true, "\(action): cancelled request never finishes a reply")
+        }
+        do {
+            let (service, runner, defaults, suite) = fixture()
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let app = AppHarness(service)
+            let old = Task { await app.send("old") }
+            await runner.waitForCalls(1)
+            let current = Task { await app.send("current") }
+            await runner.waitForCalls(2)
+            check(app.liveCamWindowController?.waiting == true, "new request waits after replacing old request")
+            await runner.finish(0)
+            await old.value
+            check(app.liveCamWindowController?.waiting == true, "late cancelled request cannot clear new waiting bubble")
+            await runner.finish(1, reply: "current")
+            await current.value
+            check(app.liveCamWindowController?.waiting == false, "actual finish ends waiting")
         }
         do {
             let (service, runner, defaults, suite) = fixture()

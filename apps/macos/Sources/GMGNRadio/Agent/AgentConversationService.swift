@@ -306,6 +306,7 @@ final class AgentConversationService {
         @Sendable (URL) -> any CodexCommandRunning
     private var currentTask: Task<AgentConversationOutcome, Error>?
     private var currentRequestID: UUID?
+    private var currentCancellationHandler: (@MainActor () -> Void)?
     /// DSH 没有原生续聊，由服务内部维护的有限历史保持语境。
     private var dshHistory: [AgentConversationMessage] = []
 
@@ -369,18 +370,24 @@ final class AgentConversationService {
         currentTask?.cancel()
         currentTask = nil
         currentRequestID = nil
+        let handler = currentCancellationHandler
+        currentCancellationHandler = nil
+        handler?()
     }
 
     // MARK: Sending
 
     func send(
         _ text: String,
-        history: [AgentConversationMessage] = []
+        history: [AgentConversationMessage] = [],
+        onCancel: (@MainActor () -> Void)? = nil
     ) async throws -> String {
         let id = effectiveBackendID
         guard isInstalled(id) else {
             throw AgentConversationError.backendNotInstalled(id)
         }
+        cancel()
+        currentCancellationHandler = onCancel
         switch id {
         case .codex:
             let resumeSessionID = preferences.sessionID(for: .codex)
@@ -466,7 +473,6 @@ final class AgentConversationService {
         _ operation: @escaping @Sendable () async throws
             -> AgentConversationOutcome
     ) async throws -> AgentConversationOutcome {
-        cancel()
         let requestID = UUID()
         let task = Task {
             try Task.checkCancellation()
@@ -481,6 +487,7 @@ final class AgentConversationService {
             if currentRequestID == requestID {
                 currentTask = nil
                 currentRequestID = nil
+                currentCancellationHandler = nil
             }
         }
         do {
@@ -488,6 +495,10 @@ final class AgentConversationService {
                 try await task.value
             } onCancel: {
                 task.cancel()
+                Task { @MainActor [weak self] in
+                    guard self?.currentRequestID == requestID else { return }
+                    self?.cancel()
+                }
             }
             guard currentRequestID == requestID, !task.isCancelled,
                   !Task.isCancelled else {

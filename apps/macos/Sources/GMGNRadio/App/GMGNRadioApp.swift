@@ -2830,14 +2830,28 @@ final class AppDelegate:
 
     /// Live Cam 文字聊天：直连 AgentConversationService，
     /// 不依赖实时语音连接状态。
+    private var liveCamMessageID: UUID?
+
     private func sendLiveCamMessage(_ message: String) async {
+        let messageID = UUID()
+        liveCamMessageID = messageID
+        defer {
+            if liveCamMessageID == messageID { liveCamMessageID = nil }
+        }
         liveCamWindowController?.beginAgentReply()
+        let finishCancellation: @MainActor () -> Void = { [weak self] in
+            guard let self, self.liveCamMessageID == messageID else { return }
+            self.liveCamMessageID = nil
+            self.liveCamWindowController?.showChatStatus("已取消本次回复。")
+        }
         let reply: String
         do {
-            reply = try await AgentConversationService.shared.send(message)
+            reply = try await AgentConversationService.shared.send(message, onCancel: finishCancellation)
         } catch AgentConversationError.cancelled {
+            finishCancellation()
             return
         } catch is CancellationError {
+            finishCancellation()
             return
         } catch {
             liveCamWindowController?.showChatStatus(
