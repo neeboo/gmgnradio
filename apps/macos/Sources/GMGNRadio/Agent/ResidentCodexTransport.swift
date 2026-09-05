@@ -30,6 +30,35 @@ enum ResidentCodexSafeError {
         if let detail = object[key] as? [String: Int], let status = detail["httpStatusCode"] { return "\(key):\(status)" }
         return key
     }
+
+    static func category(message: String?) -> String {
+        guard let message else { return "unclassified" }
+        let prefixes = [
+            ("Fatal error: failed to read current time:", "clock_callback_failed"),
+            ("Missing environment variable: `", "missing_provider_env"),
+            ("Fatal error: failed to load rules:", "rules_load_failed"),
+            ("stream disconnected", "stream_disconnected"),
+        ]
+        for (prefix, category) in prefixes where message.hasPrefix(prefix) { return category }
+        if message == "request timed out" { return "request_timeout" }
+        let statusPrefix = "unexpected status "
+        if message.hasPrefix(statusPrefix) {
+            let remainder = message.dropFirst(statusPrefix.count)
+            let digits = remainder.prefix { $0 >= "0" && $0 <= "9" }
+            let suffix = remainder.dropFirst(digits.count)
+            if let status = Int(digits), (100...599).contains(status),
+               suffix.isEmpty || suffix.first == ":" || suffix.first?.isWhitespace == true {
+                return "unexpected_http_status:\(status)"
+            }
+        }
+        if let root = try? JSONSerialization.jsonObject(with: Data(message.utf8)) as? [String: Any],
+           let error = root["error"] as? [String: Any], error["type"] as? String == "invalid_request_error" {
+            let allowed: Set<String> = ["model", "tools", "input", "reasoning", "service_tier"]
+            if let param = error["param"] as? String, allowed.contains(param) { return "upstream_invalid_request:\(param)" }
+            return "upstream_invalid_request"
+        }
+        return "unclassified"
+    }
 }
 
 enum ResidentCodexTransportError: Error, LocalizedError {
@@ -53,6 +82,7 @@ enum ResidentCodexTransportError: Error, LocalizedError {
 
 /// A single owned app-server process. It never launches a thread or grants permissions.
 @MainActor final class ResidentCodexTransport {
+    private(set) var failureCategory: String?
     var onNotification: ((String, Data) -> Void)?
     var onServerRequest: ((String, Data) async throws -> Data)?
     var onClosed: ((Error) -> Void)?
@@ -217,10 +247,14 @@ enum ResidentCodexTransportError: Error, LocalizedError {
                 }
             } else if method == "error" {
                 let raw = frame["params"] as? [String: Any] ?? [:]
-                var safe: [String: Any] = ["error": ["code": "server_error"]]
-                if let error = raw["error"] as? [String: Any], let info = ResidentCodexSafeError.projection(error["codexErrorInfo"]) {
-                    safe["error"] = ["code": "server_error", "codexErrorInfo": info]
+                let error = raw["error"] as? [String: Any] ?? [:]
+                let category = ResidentCodexSafeError.category(message: error["message"] as? String)
+                failureCategory = category
+                var safeError: [String: Any] = ["code": "server_error", "category": category]
+                if let info = ResidentCodexSafeError.projection(error["codexErrorInfo"]) {
+                    safeError["codexErrorInfo"] = info
                 }
+                var safe: [String: Any] = ["error": safeError]
                 if let willRetry = raw["willRetry"] as? Bool { safe["willRetry"] = willRetry }
                 for key in ["threadId", "turnId"] { if let value = raw[key] as? String { safe[key] = value } }
                 onNotification?(method, try Self.encode(safe))
@@ -230,6 +264,7 @@ enum ResidentCodexTransportError: Error, LocalizedError {
         guard let id = frame["id"] as? Int, let waiting = pending.removeValue(forKey: id) else { return }
         waiting.timeout.cancel()
         if let error = frame["error"] as? [String: Any] {
+            failureCategory = ResidentCodexSafeError.category(message: error["message"] as? String)
             waiting.continuation.resume(throwing: ResidentCodexTransportError.remoteError(error["code"] as? Int ?? -32603))
         } else if let result = frame["result"] {
             waiting.continuation.resume(returning: try Self.encode(result))

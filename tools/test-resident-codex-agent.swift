@@ -33,6 +33,10 @@ func fake() {
         switch method {
         case "initialize": emit(["id": id, "result": [:]])
         case "config/read":
+            if mode == "rpcFailure" {
+                emit(["id": id, "error": ["code": -32603, "message": "Fatal error: failed to load rules: PRIVATE"]])
+                continue
+            }
             let disabled = CommandLine.arguments.contains { $0.contains("\"fixture.server\"={enabled=false}") }
             emit(["id": id, "result": ["config": [
                 "features": Dictionary(uniqueKeysWithValues: ["plugins", "apps", "hooks", "multi_agent", "multi_agent_v2", "image_generation", "shell_tool"].map { ($0, false) }),
@@ -51,7 +55,7 @@ func fake() {
                 continue
             }
             if mode == "errorFalse" || mode == "errorMissing" {
-                var params: [String: Any] = ["threadId": "resident-session", "turnId": "turn-1", "error": ["message": "PRIVATE-TERMINAL", "codexErrorInfo": "unauthorized"]]
+                var params: [String: Any] = ["threadId": "resident-session", "turnId": "turn-1", "error": ["message": "Missing environment variable: `PRIVATE-TERMINAL`", "codexErrorInfo": "unauthorized"]]
                 if mode == "errorFalse" { params["willRetry"] = false }
                 emit(["method": "error", "params": params])
                 continue
@@ -79,6 +83,21 @@ func fake() {
         check(ResidentCodexSafeError.code(from: ["httpConnectionFailed": ["httpStatusCode": 401, "message": "PRIVATE"]]) == "httpConnectionFailed:401", "only known HTTP code projected")
         check(ResidentCodexSafeError.code(from: ["PRIVATE-UNKNOWN": ["httpStatusCode": 401]]) == nil, "unknown variant discarded")
         check(ResidentCodexSafeError.code(from: ["httpConnectionFailed": ["httpStatusCode": "PRIVATE"]]) == "httpConnectionFailed", "noninteger HTTP status discarded")
+        for (message, expected) in [
+            ("Fatal error: failed to read current time: PRIVATE", "clock_callback_failed"),
+            ("Missing environment variable: `PRIVATE`", "missing_provider_env"),
+            ("Fatal error: failed to load rules: PRIVATE", "rules_load_failed"),
+            ("request timed out", "request_timeout"),
+            ("request timed out PRIVATE", "unclassified"),
+            ("stream disconnected before completion: PRIVATE", "stream_disconnected"),
+            ("unexpected status 429: PRIVATE", "unexpected_http_status:429"),
+            ("unexpected status 999: PRIVATE", "unclassified"),
+            ("PRIVATE", "unclassified"),
+        ] { check(ResidentCodexSafeError.category(message: message) == expected, "fixed category excludes private detail") }
+        for parameter in ["model", "tools", "input", "reasoning", "service_tier", "PRIVATE"] {
+            let message = String(decoding: bytes(["error": ["type": "invalid_request_error", "param": parameter, "message": "PRIVATE"]]), as: UTF8.self)
+            check(ResidentCodexSafeError.category(message: message) == "upstream_invalid_request" + (parameter == "PRIVATE" ? "" : ":" + parameter), "only allowed upstream parameter name")
+        }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("gmgn-loop-fixture-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -133,7 +152,7 @@ func fake() {
             let reply = try frames(file).first { $0["id"] as? String == "tool-request" }?["result"] as? [String: Any]
             check(reply?["success"] as? Bool == false, "\(mode) formal failed result")
         }
-        for mode in ["unsafe", "eof", "failed", "commentary", "hang", "earlyMismatch", "retryHang", "errorFalse", "errorMissing"] {
+        for mode in ["unsafe", "eof", "failed", "commentary", "hang", "earlyMismatch", "retryHang", "errorFalse", "errorMissing", "rpcFailure"] {
             let (agent, file) = try make(mode, timeout: mode == "eof" ? 3 : 0.3)
             let began = Date()
             do { _ = try await agent.send(prompt: "查看", sessionID: nil, toolsJSON: tools, onToolCall: callback); fatalError("FAIL: \(mode) must fail") }
@@ -147,10 +166,15 @@ func fake() {
                     if case ResidentCodexAgentError.turnFailed = error { check(true, "terminal error ends turn") }
                     else { fatalError("FAIL: terminal error must fail immediately") }
                     check(agent.failureCode == "unauthorized", "notification safe diagnostic survives transport")
+                    check(agent.failureCategory == "missing_provider_env", "notification fixed category survives transport")
                 }
-                if mode == "failed" { check(agent.failureCode == "httpConnectionFailed:401", "completed turn safe diagnostic") }
+                if mode == "failed" {
+                    check(agent.failureCode == "httpConnectionFailed:401", "completed turn safe diagnostic")
+                    check(agent.failureCategory == "unclassified", "completed private text discarded")
+                }
                 check(agent.failureStage != nil, "failure has fixed local stage")
-                check(agent.didSendTurnStart == (mode != "unsafe"), "model turn dispatch is observable")
+                check(agent.didSendTurnStart == (mode != "unsafe" && mode != "rpcFailure"), "model turn dispatch is observable")
+                if mode == "rpcFailure" { check(agent.failureCategory == "rules_load_failed", "RPC failure uses fixed safe category") }
             }
             if mode == "unsafe" { check(try !frames(file).contains { ($0["method"] as? String)?.hasPrefix("thread/") == true }, "unsafe policy never starts thread") }
             if mode == "eof" { check(Date().timeIntervalSince(began) < 1.5, "EOF ends turn without deadline") }
