@@ -2000,15 +2000,10 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             )
         } else if let pmxAvatarRenderer {
             synchronizePMXWorldMotion(pmxAvatarRenderer)
-            if lastLoggedPMXRenderProfile != renderProfile {
+            let shouldLogPMXFrame = lastLoggedPMXRenderProfile != renderProfile
+            let profileName = renderProfile == .liveCam ? "liveCam" : "fullStage"
+            if shouldLogPMXFrame {
                 lastLoggedPMXRenderProfile = renderProfile
-                let profileName = renderProfile == .liveCam
-                    ? "liveCam"
-                    : "fullStage"
-                let camera = spatialStage.camera
-                Self.log.notice(
-                    "Drawing PMX profile=\(profileName, privacy: .public) cameraX=\(camera.position.x, privacy: .public) cameraY=\(camera.position.y, privacy: .public) cameraZ=\(camera.position.z, privacy: .public) yaw=\(camera.yaw, privacy: .public) pitch=\(camera.pitch, privacy: .public)"
-                )
             }
             let pmxCameraView: simd_float4x4
             let pmxProjection: simd_float4x4
@@ -2064,13 +2059,34 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                     drawsWorld: renderProfile.drawsWorld
                 )
             )
+            if shouldLogPMXFrame {
+                let bounds = pmxAvatarRenderer.localBounds
+                let modelBounds = "min=\(String(describing: bounds?.minimum)) max=\(String(describing: bounds?.maximum))"
+                let tracking = LiveCamPMXTrackingPolicy.cameraOffset(
+                    animatedRootOffset: pmxAvatarRenderer.animatedRootOffset,
+                    bounds: bounds
+                )
+                let eye = pmxCameraView.inverse.columns.3
+                let localTarget = (bounds?.center ?? SIMD3<Float>(0, 0.9, 0))
+                    + (renderProfile == .liveCam ? tracking : .zero)
+                let transformedTarget = pmxModelTransform * SIMD4<Float>(localTarget, 1)
+                let target = SIMD3<Float>(transformedTarget.x, transformedTarget.y, transformedTarget.z)
+                let distance = simd_distance(SIMD3<Float>(eye.x, eye.y, eye.z), target)
+                Self.log.notice(
+                    "PMX frame geometry profile=\(profileName, privacy: .public) boundsWidth=\(view.bounds.width, privacy: .public) boundsHeight=\(view.bounds.height, privacy: .public) drawableWidth=\(view.drawableSize.width, privacy: .public) drawableHeight=\(view.drawableSize.height, privacy: .public) textureWidth=\(drawable.texture.width, privacy: .public) textureHeight=\(drawable.texture.height, privacy: .public) modelBounds=\(modelBounds, privacy: .public)"
+                )
+                Self.log.notice(
+                    "PMX frame camera profile=\(profileName, privacy: .public) eyeX=\(eye.x, privacy: .public) eyeY=\(eye.y, privacy: .public) eyeZ=\(eye.z, privacy: .public) targetX=\(target.x, privacy: .public) targetY=\(target.y, privacy: .public) targetZ=\(target.z, privacy: .public) distance=\(distance, privacy: .public) tracking=\(String(describing: tracking), privacy: .public) projectionX=\(pmxProjection.columns.0.x, privacy: .public) projectionY=\(pmxProjection.columns.1.y, privacy: .public)"
+                )
+            }
             pmxAvatarRenderer.encode(
                 commandBuffer: commandBuffer,
                 renderPassDescriptor: pass,
                 viewMatrix: pmxCameraView,
                 projectionMatrix: pmxProjection,
                 modelTransform: pmxModelTransform,
-                time: Date.timeIntervalSinceReferenceDate
+                time: Date.timeIntervalSinceReferenceDate,
+                diagnosticProfile: shouldLogPMXFrame ? profileName : nil
             )
         }
     }

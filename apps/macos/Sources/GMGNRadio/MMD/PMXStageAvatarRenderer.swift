@@ -2322,7 +2322,8 @@ public final class PMXStageAvatarRenderer {
         viewMatrix: simd_float4x4,
         projectionMatrix: simd_float4x4,
         modelTransform: simd_float4x4 = matrix_identity_float4x4,
-        time: TimeInterval
+        time: TimeInterval,
+        diagnosticProfile: String? = nil
     ) {
         guard let modelNode else {
             return
@@ -2366,6 +2367,23 @@ public final class PMXStageAvatarRenderer {
             commandBuffer: commandBuffer,
             passDescriptor: renderPassDescriptor
         )
+        if let diagnosticProfile {
+            // Compare the authored node values with SceneKit's evaluated tree
+            // after this render; a profile switch must update both together.
+            let containerScale = String(describing: modelContainerNode.simdScale)
+            let containerPosition = String(describing: modelContainerNode.simdPosition)
+            let containerPresentationScale = String(describing: modelContainerNode.presentation.simdScale)
+            let containerPresentationPosition = String(describing: modelContainerNode.presentation.simdPosition)
+            let modelScale = String(describing: modelNode.simdScale)
+            let modelPosition = String(describing: modelNode.simdPosition)
+            let modelPresentationScale = String(describing: modelNode.presentation.simdScale)
+            let modelPresentationPosition = String(describing: modelNode.presentation.simdPosition)
+            let cameraPosition = String(describing: cameraNode.simdPosition)
+            let cameraPresentationPosition = String(describing: cameraNode.presentation.simdPosition)
+            Self.log.notice(
+                "PMX frame transforms profile=\(diagnosticProfile, privacy: .public) sceneTime=\(localTime, privacy: .public) containerScale=\(containerScale, privacy: .public) containerPosition=\(containerPosition, privacy: .public) containerPresentationScale=\(containerPresentationScale, privacy: .public) containerPresentationPosition=\(containerPresentationPosition, privacy: .public) modelScale=\(modelScale, privacy: .public) modelPosition=\(modelPosition, privacy: .public) modelPresentationScale=\(modelPresentationScale, privacy: .public) modelPresentationPosition=\(modelPresentationPosition, privacy: .public) cameraPosition=\(cameraPosition, privacy: .public) cameraPresentationPosition=\(cameraPresentationPosition, privacy: .public)"
+            )
+        }
         if let bone = motionPlaybackProbeBone,
            let report = motionPlaybackProbe?.record(
                time: localTime,
