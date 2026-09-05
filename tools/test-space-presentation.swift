@@ -32,6 +32,11 @@ let storeMethods = [
 let presentationMethod = declaration("private func applySpatialPresentation(", in: controllerSource)
 let presentationState = declaration("struct StageSurfacePresentationState:", in: controllerSource)
 let destinationContent = declaration("struct StageDestinationContent:", in: controllerSource)
+let composerVisibility = declaration("private func updateResidentComposerVisibility()", in: controllerSource)
+let composerFocus = declaration("private func residentComposerOwnsFirstResponder()", in: controllerSource)
+let panelToggles = ["private func toggleResidentChat()", "private func toggleProgramRail()", "private func toggleVisualPicker()"].map {
+    declaration($0, in: controllerSource)
+}.joined(separator: "\n")
 
 let harness = #"""
 import Foundation
@@ -40,13 +45,25 @@ import os
 final class StageWindowController {
     static let log = Logger(subsystem: "test.space-presentation", category: "controller")
 }
-final class View {
+class View {
     var isHidden = false
+    weak var parent: View?
+    var expanded = false
+    var available = false
     func apply(_ content: StageDestinationContent) {}
     func setVisualPickerMode(_ mode: Bool) {}
+    func setResidentChatExpanded(_ value: Bool) { expanded = value }
+    func setResidentChatAvailable(_ value: Bool) { available = value }
+    func setProgramRailExpanded(_ value: Bool) {}
+    func setVisualPickerExpanded(_ value: Bool) {}
+    func setProgramRailVisible(_ value: Bool) {}
+    func isDescendant(of view: View) -> Bool { self === view || parent?.isDescendant(of: view) == true }
 }
+typealias NSView = View
+final class NSTextView: View { weak var delegate: AnyObject? }
 final class Window {
-    func makeFirstResponder(_ view: View) {}
+    var firstResponder: View?
+    func makeFirstResponder(_ view: View) { firstResponder = view }
 }
 enum StageVisualPickerMode {
     static func resolve(isWorldPresentationRequested: Bool) -> Bool {
@@ -79,15 +96,29 @@ final class Content {
     let worldLoadingView = View()
     let destinationButton = View()
     let transportControls = View()
+    let residentComposer = View()
+    let programRail = View()
+    let visualPicker = View()
+    let overlayState = View()
+    var isResidentChatExpanded = false
+    var isProgramRailVisible = false
+    var isVisualPickerVisible = false
     let window: Window? = Window()
     let renderSurfaceController = RenderSurface()
     var completesOnAttach = true
-    init(_ store: Store) { spatialStage = store }
+    init(_ store: Store) { spatialStage = store; residentComposer.isHidden = true }
     func attachRenderSurface() {
         if completesOnAttach { spatialStage.finishWorldPresentation() }
     }
     func receive(_ visible: Bool) { applySpatialPresentation(isWorldVisible: visible) }
+    func refreshComposer() { updateResidentComposerVisibility() }
+    func toggleChat() { toggleResidentChat() }
+    func toggleSettings() { toggleVisualPicker() }
+    func toggleTracks() { toggleProgramRail() }
     \#(presentationMethod)
+    \#(composerVisibility)
+    \#(composerFocus)
+    \#(panelToggles)
 }
 
 var failures = 0
@@ -129,6 +160,41 @@ for uiFirst in [true, false] {
     store.finishWorldPresentation()
     check(content.worldLoadingView.isHidden && !content.renderSurfaceContainer.isHidden,
           "asynchronous finish reveals world")
+    check(content.residentComposer.isHidden, "composer defaults collapsed in entered space")
+    content.toggleChat()
+    check(!content.residentComposer.isHidden && content.transportControls.expanded, "chat button expands composer")
+    let editor = NSTextView()
+    let field = View()
+    field.parent = content.residentComposer
+    editor.delegate = field
+    content.window?.firstResponder = editor
+    content.receive(true)
+    check(content.window?.firstResponder === editor, "world refresh preserves focused text editor")
+    content.toggleSettings()
+    check(content.residentComposer.isHidden, "settings panel does not overlap resident composer")
+    check(content.window?.firstResponder === content.worldInteractionView, "hidden composer releases text focus")
+    let settingsEditor = NSTextView()
+    content.window?.firstResponder = settingsEditor
+    content.receive(true)
+    check(content.window?.firstResponder === settingsEditor, "refresh does not steal settings text focus")
+    content.toggleSettings()
+    check(content.residentComposer.isHidden, "closing settings does not reopen chat")
+    content.toggleChat()
+    content.toggleChat()
+    check(content.residentComposer.isHidden && content.window?.firstResponder === settingsEditor,
+          "collapsing chat leaves unrelated editor focus untouched")
+    content.toggleTracks()
+    content.toggleChat()
+    check(!content.residentComposer.isHidden && content.programRail.isHidden && content.visualPicker.isHidden,
+          "opening chat closes existing panels")
+    content.toggleTracks()
+    check(content.residentComposer.isHidden && !content.isResidentChatExpanded, "opening tracks collapses chat")
+    content.toggleChat()
+    store.exitWorld()
+    check(content.residentComposer.isHidden && !content.transportControls.available, "leaving space hides chat")
+    check(content.window?.firstResponder === settingsEditor, "leaving space preserves unrelated input focus")
+    content.toggleChat()
+    check(content.residentComposer.isHidden, "player mode cannot expose space composer")
     _ = (firstID, secondID)
 }
 if failures > 0 { print("\(failures) assertions failed"); exit(1) }

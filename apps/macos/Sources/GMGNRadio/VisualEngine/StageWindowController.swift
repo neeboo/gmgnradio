@@ -38,6 +38,9 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     private let onRunActivity: @MainActor (String) -> Void
     private let onStopActivity: @MainActor () -> Void
     private let onManageAssets: @MainActor () -> Void
+    private let onSendMessage: @MainActor (String) async -> Void
+    private let onCancelMessage: @MainActor () -> Void
+    private let residentChat = StageResidentChatState()
     private var playbackState: LocalMusicPlaybackState
     private var voiceState: RealtimeVoiceConnectionState
     private weak var stageContentView: StageContentView?
@@ -79,7 +82,9 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         onToggleVoice: @escaping @MainActor () -> Void = {},
         onRunActivity: @escaping @MainActor (String) -> Void = { _ in },
         onStopActivity: @escaping @MainActor () -> Void = {},
-        onManageAssets: @escaping @MainActor () -> Void = {}
+        onManageAssets: @escaping @MainActor () -> Void = {},
+        onSendMessage: @escaping @MainActor (String) async -> Void = { _ in },
+        onCancelMessage: @escaping @MainActor () -> Void = {}
     ) {
         self.audioFeatures = audioFeatures
         self.artwork = artwork
@@ -118,6 +123,9 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         self.onRunActivity = onRunActivity
         self.onStopActivity = onStopActivity
         self.onManageAssets = onManageAssets
+        self.onSendMessage = onSendMessage
+        self.onCancelMessage = onCancelMessage
+        residentChat.voiceActive = voiceState == .listening
         super.init(window: nil)
     }
 
@@ -148,6 +156,7 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
 
     func setVoiceState(_ state: RealtimeVoiceConnectionState) {
         voiceState = state
+        residentChat.voiceActive = state == .listening
         stageContentView?.setVoiceState(state)
         let activity: StageAvatarActivity = switch state {
         case .listening:
@@ -159,6 +168,10 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         }
         avatarRuntime.setActivity(activity)
     }
+
+    func beginResidentReply() { residentChat.begin() }
+    func finishResidentReply(_ text: String) { residentChat.finish(text) }
+    func showResidentChatStatus(_ text: String) { residentChat.showStatus(text) }
 
     func setVoiceLevel(_ level: Float) {
         avatarRuntime.setVoiceLevel(level)
@@ -308,6 +321,9 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
             onRunActivity: onRunActivity,
             onStopActivity: onStopActivity,
             onManageAssets: onManageAssets,
+            residentChat: residentChat,
+            onSendMessage: onSendMessage,
+            onCancelMessage: onCancelMessage,
             onEnterSpace: { [weak self] in
                 self?.onWillPresentSpaceHandler?()
             },
@@ -442,9 +458,11 @@ private final class StageContentView: NSView {
     private var visualPicker: StageVisualPickerHostingView!
     private var transportControls: StageTransportControlsView!
     private var destinationButton: StageDestinationButton!
+    private var residentComposer: NSHostingView<StageResidentComposer>!
     private var worldVisibilityObserverID: UUID?
     private var isProgramRailVisible = false
     private var isVisualPickerVisible = false
+    private var isResidentChatExpanded = false
 
     init(
         frame: CGRect,
@@ -475,6 +493,9 @@ private final class StageContentView: NSView {
         onRunActivity: @escaping @MainActor (String) -> Void,
         onStopActivity: @escaping @MainActor () -> Void,
         onManageAssets: @escaping @MainActor () -> Void,
+        residentChat: StageResidentChatState,
+        onSendMessage: @escaping @MainActor (String) async -> Void,
+        onCancelMessage: @escaping @MainActor () -> Void,
         onEnterSpace: @escaping @MainActor () -> Void,
         onShowPlayer: @escaping @MainActor () -> Void,
         onToggleWindowMode: @escaping @MainActor () -> Void
@@ -516,6 +537,9 @@ private final class StageContentView: NSView {
         let visualButton = StageVisualButton { [weak self] in
             self?.toggleVisualPicker()
         }
+        let chatButton = StageResidentChatButton { [weak self] in
+            self?.toggleResidentChat()
+        }
         let windowModeButton = StageWindowModeButton(
             mode: .windowed,
             action: onToggleWindowMode
@@ -526,6 +550,7 @@ private final class StageContentView: NSView {
             playbackButton: playbackButton,
             nextButton: nextButton,
             voiceButton: voiceButton,
+            chatButton: chatButton,
             visualButton: visualButton,
             windowModeButton: windowModeButton
         )
@@ -651,6 +676,23 @@ private final class StageContentView: NSView {
         transportControls.layer?.zPosition = 20
         addSubview(transportControls)
 
+        residentComposer = NSHostingView(rootView: StageResidentComposer(
+            state: residentChat,
+            onSendMessage: onSendMessage,
+            onCancelMessage: onCancelMessage,
+            onToggleVoice: onToggleVoice,
+            onFocusInput: { [spatialStage] in
+                spatialStage.clearMovement()
+                spatialStage.setSpeedBoosted(false)
+            }
+        ))
+        residentComposer.identifier = NSUserInterfaceItemIdentifier("stage.resident-chat")
+        residentComposer.translatesAutoresizingMaskIntoConstraints = false
+        residentComposer.wantsLayer = true
+        residentComposer.layer?.zPosition = 17
+        residentComposer.isHidden = true
+        addSubview(residentComposer)
+
         destinationButton = StageDestinationButton { [spatialStage] in
             switch StageDestinationAction.resolve(
                 isWorldPresentationRequested:
@@ -676,8 +718,16 @@ private final class StageContentView: NSView {
         )
         preferredPanelWidth.priority = .defaultHigh
         preferredPanelHeight.priority = .defaultHigh
+        let preferredComposerWidth = residentComposer.widthAnchor.constraint(equalToConstant: 620)
+        preferredComposerWidth.priority = .defaultHigh
 
         NSLayoutConstraint.activate([
+            residentComposer.trailingAnchor.constraint(equalTo: transportControls.trailingAnchor),
+            residentComposer.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 22),
+            residentComposer.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -22),
+            residentComposer.bottomAnchor.constraint(equalTo: transportControls.topAnchor, constant: -16),
+            residentComposer.heightAnchor.constraint(lessThanOrEqualToConstant: 250),
+            preferredComposerWidth,
             transportControls.trailingAnchor.constraint(
                 equalTo: trailingAnchor,
                 constant: -22
@@ -782,6 +832,7 @@ private final class StageContentView: NSView {
     private func toggleProgramRail() {
         isProgramRailVisible.toggle()
         if isProgramRailVisible {
+            isResidentChatExpanded = false
             isVisualPickerVisible = false
             visualPicker.isHidden = true
             transportControls.setVisualPickerExpanded(false)
@@ -789,11 +840,13 @@ private final class StageContentView: NSView {
         programRail.isHidden = !isProgramRailVisible
         transportControls.setProgramRailExpanded(isProgramRailVisible)
         overlayState.setProgramRailVisible(isProgramRailVisible)
+        updateResidentComposerVisibility()
     }
 
     private func toggleVisualPicker() {
         isVisualPickerVisible.toggle()
         if isVisualPickerVisible {
+            isResidentChatExpanded = false
             isProgramRailVisible = false
             programRail.isHidden = true
             transportControls.setProgramRailExpanded(false)
@@ -801,6 +854,41 @@ private final class StageContentView: NSView {
         }
         visualPicker.isHidden = !isVisualPickerVisible
         transportControls.setVisualPickerExpanded(isVisualPickerVisible)
+        updateResidentComposerVisibility()
+    }
+
+    private func toggleResidentChat() {
+        guard spatialStage.isWorldPresentationRequested else { return }
+        isResidentChatExpanded.toggle()
+        if isResidentChatExpanded {
+            isProgramRailVisible = false
+            isVisualPickerVisible = false
+            programRail.isHidden = true
+            visualPicker.isHidden = true
+            transportControls.setProgramRailExpanded(false)
+            transportControls.setVisualPickerExpanded(false)
+            overlayState.setProgramRailVisible(false)
+        }
+        updateResidentComposerVisibility()
+    }
+
+    private func residentComposerOwnsFirstResponder() -> Bool {
+        guard let editor = window?.firstResponder as? NSTextView else { return false }
+        if editor.isDescendant(of: residentComposer) { return true }
+        return (editor.delegate as? NSView)?.isDescendant(of: residentComposer) == true
+    }
+
+    private func updateResidentComposerVisibility() {
+        let wasVisible = !residentComposer.isHidden
+        let ownedFocus = residentComposerOwnsFirstResponder()
+        if !spatialStage.isWorldPresentationRequested { isResidentChatExpanded = false }
+        residentComposer.isHidden = !isResidentChatExpanded
+            || isProgramRailVisible || isVisualPickerVisible
+        transportControls.setResidentChatExpanded(!residentComposer.isHidden)
+        transportControls.setResidentChatAvailable(spatialStage.isWorldPresentationRequested)
+        if wasVisible, residentComposer.isHidden, ownedFocus {
+            window?.makeFirstResponder(worldInteractionView)
+        }
     }
 
     func attachRenderSurface() {
@@ -831,9 +919,10 @@ private final class StageContentView: NSView {
         metalView?.isHidden = state.isPointCloudHidden
         worldInteractionView.isHidden = state.isWorldInteractionHidden
         worldLoadingView.isHidden = state.isLoadingIndicatorHidden
-        if isWorldVisible {
+        updateResidentComposerVisibility()
+        if isWorldVisible, !(window?.firstResponder is NSTextView) {
             window?.makeFirstResponder(worldInteractionView)
-        } else if !state.isPointCloudHidden, let metalView {
+        } else if !state.isPointCloudHidden, !(window?.firstResponder is NSTextView), let metalView {
             window?.makeFirstResponder(metalView)
         }
         renderSurfaceController.setWorldPresentationVisible(isWorldVisible)
@@ -943,7 +1032,8 @@ private final class StageWorldInteractionView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
-        guard let movement = Self.movement(for: event.keyCode) else {
+        guard !(window?.firstResponder is NSTextView),
+              let movement = Self.movement(for: event.keyCode) else {
             super.keyDown(with: event)
             return
         }
@@ -956,6 +1046,12 @@ private final class StageWorldInteractionView: NSView {
             return
         }
         spatialStage.setMovement(movement, active: false)
+    }
+
+    override func resignFirstResponder() -> Bool {
+        spatialStage.clearMovement()
+        spatialStage.setSpeedBoosted(false)
+        return super.resignFirstResponder()
     }
 
     override func flagsChanged(with event: NSEvent) {
@@ -978,6 +1074,7 @@ private final class StageWorldInteractionView: NSView {
         buttonNumber: Int,
         locationInWindow: CGPoint
     ) {
+        window?.makeFirstResponder(self)
         guard !dragInProgress else { return }
         dragInProgress = true
         didLogCurrentDrag = false
@@ -1175,6 +1272,7 @@ private final class StageTransportControlsView: NSView {
     private let playbackButton: StagePlaybackButton
     private let nextButton: StageTrackNavigationButton
     private let voiceButton: StageVoiceButton
+    private let chatButton: StageResidentChatButton
     private let visualButton: StageVisualButton
     private let windowModeButton: StageWindowModeButton
 
@@ -1184,6 +1282,7 @@ private final class StageTransportControlsView: NSView {
         playbackButton: StagePlaybackButton,
         nextButton: StageTrackNavigationButton,
         voiceButton: StageVoiceButton,
+        chatButton: StageResidentChatButton,
         visualButton: StageVisualButton,
         windowModeButton: StageWindowModeButton
     ) {
@@ -1192,6 +1291,7 @@ private final class StageTransportControlsView: NSView {
         self.playbackButton = playbackButton
         self.nextButton = nextButton
         self.voiceButton = voiceButton
+        self.chatButton = chatButton
         self.visualButton = visualButton
         self.windowModeButton = windowModeButton
         super.init(frame: .zero)
@@ -1213,7 +1313,7 @@ private final class StageTransportControlsView: NSView {
 
         let buttons: [NSView] = [
             programButton, previousButton, playbackButton, nextButton,
-            voiceButton, visualButton, windowModeButton
+            voiceButton, chatButton, visualButton, windowModeButton
         ]
         for view in buttons + [groupDivider] {
             view.translatesAutoresizingMaskIntoConstraints = false
@@ -1237,7 +1337,8 @@ private final class StageTransportControlsView: NSView {
             groupDivider.widthAnchor.constraint(equalToConstant: 1),
             groupDivider.heightAnchor.constraint(equalToConstant: 20),
             voiceButton.leadingAnchor.constraint(equalTo: groupDivider.trailingAnchor, constant: StageControlPanelLayout.groupGap),
-            visualButton.leadingAnchor.constraint(equalTo: voiceButton.trailingAnchor),
+            chatButton.leadingAnchor.constraint(equalTo: voiceButton.trailingAnchor),
+            visualButton.leadingAnchor.constraint(equalTo: chatButton.trailingAnchor),
             windowModeButton.leadingAnchor.constraint(equalTo: visualButton.trailingAnchor),
             windowModeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -StageControlPanelLayout.sideInset)
         ])
@@ -1275,9 +1376,50 @@ private final class StageTransportControlsView: NSView {
         visualButton.setExpanded(isExpanded)
     }
 
+    func setResidentChatExpanded(_ isExpanded: Bool) {
+        chatButton.setExpanded(isExpanded)
+    }
+
+    func setResidentChatAvailable(_ isAvailable: Bool) {
+        chatButton.isEnabled = isAvailable
+        if !isAvailable { chatButton.toolTip = "进入空间后与居民聊天" }
+    }
+
     func setVisualPickerMode(_ mode: StageVisualPickerMode) {
         visualButton.setStageMode(mode)
     }
+}
+
+@MainActor
+private final class StageResidentChatButton: NSButton {
+    private let handler: @MainActor () -> Void
+
+    init(action: @escaping @MainActor () -> Void) {
+        handler = action
+        super.init(frame: .zero)
+        identifier = NSUserInterfaceItemIdentifier("stage.resident-chat-toggle")
+        target = self
+        self.action = #selector(performToggle)
+        isBordered = false
+        imagePosition = .imageOnly
+        focusRingType = .none
+        wantsLayer = true
+        layer?.cornerRadius = 10
+        setExpanded(false)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func setExpanded(_ expanded: Bool) {
+        image = NSImage(systemSymbolName: expanded ? "bubble.left.fill" : "bubble.left", accessibilityDescription: "聊天")
+        contentTintColor = expanded ? .systemCyan : .white.withAlphaComponent(0.72)
+        layer?.backgroundColor = expanded ? NSColor.systemBlue.withAlphaComponent(0.28).cgColor : NSColor.clear.cgColor
+        toolTip = expanded ? "收起聊天" : "与居民聊天"
+        setAccessibilityLabel(toolTip)
+        setAccessibilityValue(expanded ? "已展开" : "已收起")
+    }
+
+    @objc private func performToggle() { handler() }
 }
 
 @MainActor

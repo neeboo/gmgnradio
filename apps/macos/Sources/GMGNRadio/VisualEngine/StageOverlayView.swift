@@ -2,6 +2,137 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+@MainActor
+final class StageResidentChatState: ObservableObject {
+    @Published var draft = ""
+    @Published private(set) var reply = ""
+    @Published private(set) var isThinking = false
+    @Published var voiceActive = false
+
+    func takeMessage() -> String? {
+        let message = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !isThinking, !message.isEmpty else { return nil }
+        draft = ""
+        begin()
+        return message
+    }
+
+    func begin() { reply = ""; isThinking = true }
+    func finish(_ text: String) { reply = text; isThinking = false }
+    func showStatus(_ text: String) { finish(text) }
+    func cancel() { showStatus("已停止本次回复。") }
+}
+
+/// A quiet, native input surface shared with the resident's existing session.
+@MainActor
+struct StageResidentComposer: View {
+    @ObservedObject var state: StageResidentChatState
+    let onSendMessage: @MainActor (String) async -> Void
+    let onCancelMessage: @MainActor () -> Void
+    let onToggleVoice: @MainActor () -> Void
+    let onFocusInput: @MainActor () -> Void
+    @FocusState private var inputFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if !state.reply.isEmpty {
+                HStack(alignment: .top, spacing: 12) {
+                    ScrollView {
+                        Text(state.reply)
+                            .font(.system(size: 13))
+                            .foregroundStyle(.white.opacity(0.9))
+                            .lineSpacing(4)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(height: 76)
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(state.reply, forType: .string)
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                            .font(.system(size: 12))
+                            .frame(width: 24, height: 24)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.white.opacity(0.55))
+                    .help("复制完整回复")
+                    .accessibilityLabel("复制完整回复")
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                .background(Color(white: 0.1).opacity(0.96), in: RoundedRectangle(cornerRadius: 16))
+            }
+
+            VStack(alignment: .leading, spacing: 12) {
+                TextField("发消息，或让居民做点什么…", text: $state.draft, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 14))
+                    .foregroundStyle(.white.opacity(0.94))
+                    .lineLimit(1...3)
+                    .focused($inputFocused)
+                    .onSubmit(submit)
+                    .accessibilityLabel("给居民发消息")
+                    .accessibilityIdentifier("stage.resident-input")
+                    .onChange(of: inputFocused) { _, focused in
+                        if focused { onFocusInput() }
+                    }
+
+                HStack(spacing: 10) {
+                    Text(state.isThinking ? "正在思考…" : state.voiceActive ? "正在听你说话…" : "你的居民")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.white.opacity(0.43))
+                    Spacer(minLength: 8)
+                    Button(action: onToggleVoice) {
+                        Image(systemName: state.voiceActive ? "mic.fill" : "mic")
+                            .font(.system(size: 15, weight: .medium))
+                            .frame(width: 30, height: 30)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(state.voiceActive ? Color.cyan : .white.opacity(0.72))
+                    .help(state.voiceActive ? "结束语音输入" : "语音输入")
+                    .accessibilityLabel(state.voiceActive ? "结束语音输入" : "语音输入")
+                    Button {
+                        if state.isThinking {
+                            state.cancel()
+                            onCancelMessage()
+                        } else {
+                            submit()
+                        }
+                    } label: {
+                        Image(systemName: state.isThinking ? "stop.fill" : "arrow.up")
+                            .font(.system(size: state.isThinking ? 11 : 15, weight: .semibold))
+                            .foregroundStyle(Color(white: 0.14))
+                            .frame(width: 30, height: 30)
+                            .background(.white.opacity(canSubmit ? 0.92 : 0.25), in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!canSubmit)
+                    .help(state.isThinking ? "停止回复" : "发送消息")
+                    .accessibilityLabel(state.isThinking ? "停止回复" : "发送消息")
+                }
+            }
+            .padding(15)
+            .background(Color(white: 0.15).opacity(0.98), in: RoundedRectangle(cornerRadius: 20))
+            .overlay {
+                RoundedRectangle(cornerRadius: 20)
+                    .stroke(.white.opacity(inputFocused ? 0.22 : 0.1), lineWidth: 1)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .shadow(color: .black.opacity(0.25), radius: 12, y: 4)
+    }
+
+    private var canSubmit: Bool {
+        state.isThinking || !state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func submit() {
+        guard let message = state.takeMessage() else { return }
+        Task { await onSendMessage(message) }
+    }
+}
+
 struct StageOverlayView: View {
     @ObservedObject var presentation: StagePresentationModel
     @ObservedObject var overlayState: StageOverlayState
@@ -1951,7 +2082,7 @@ enum StageControlPanelLayout {
     static let sideInset: CGFloat = 4
     static let groupGap: CGFloat = 6
     static let settingsWidth: CGFloat = 68
-    static let transportWidth: CGFloat = 6 * controlSize + settingsWidth + 2 * sideInset + 2 * groupGap + 1
+    static let transportWidth: CGFloat = 7 * controlSize + settingsWidth + 2 * sideInset + 2 * groupGap + 1
 }
 
 enum StageActivityAvailability {

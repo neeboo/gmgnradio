@@ -50,7 +50,7 @@ precondition(StageVisualPickerGroup.visibleGroups(for: .player) == [.lyricsEffec
 precondition(StageVisualPickerGroup.visibleGroups(for: .space) == [.worldSelection, .avatarPlacement, .loadingStatus])
 precondition(StageControlPanelLayout.maximumWidth == 590 && StageControlPanelLayout.maximumHeight == 458)
 precondition(StageControlPanelLayout.controlSize >= 44)
-precondition(StageControlPanelLayout.transportWidth == 6 * StageControlPanelLayout.controlSize + StageControlPanelLayout.settingsWidth + 2 * StageControlPanelLayout.sideInset + 2 * StageControlPanelLayout.groupGap + 1)
+precondition(StageControlPanelLayout.transportWidth == 7 * StageControlPanelLayout.controlSize + StageControlPanelLayout.settingsWidth + 2 * StageControlPanelLayout.sideInset + 2 * StageControlPanelLayout.groupGap + 1)
 precondition(StageActivityAvailability.canRun(isWorldVisible: true, selectedWorldID: "a", activityWorldID: "a"))
 precondition(!StageActivityAvailability.canRun(isWorldVisible: false, selectedWorldID: "a", activityWorldID: "a"))
 precondition(!StageActivityAvailability.canRun(isWorldVisible: true, selectedWorldID: "b", activityWorldID: "a"))
