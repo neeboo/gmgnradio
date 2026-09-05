@@ -1158,7 +1158,7 @@ private final class StageVisualPickerHostingView:
 {}
 
 @MainActor
-private final class StageTransportControlsView: NSVisualEffectView {
+private final class StageTransportControlsView: NSView {
     private let programButton: StageProgramButton
     private let previousButton: StageTrackNavigationButton
     private let playbackButton: StagePlaybackButton
@@ -1186,142 +1186,49 @@ private final class StageTransportControlsView: NSVisualEffectView {
         super.init(frame: .zero)
 
         identifier = NSUserInterfaceItemIdentifier("stage.transport-controls")
-        material = .hudWindow
-        blendingMode = .withinWindow
-        state = .active
         wantsLayer = true
-        layer?.cornerRadius = 24
+        layer?.cornerRadius = 16
         layer?.borderWidth = 1
-        layer?.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor
+        layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
+        layer?.backgroundColor = NSColor(calibratedRed: 0.075, green: 0.085, blue: 0.105, alpha: 0.98).cgColor
         layer?.shadowColor = NSColor.black.cgColor
-        layer?.shadowOpacity = 0.42
-        layer?.shadowRadius = 14
-        layer?.shadowOffset = CGSize(width: 0, height: -4)
+        layer?.shadowOpacity = 0.25
+        layer?.shadowRadius = 12
+        layer?.shadowOffset = CGSize(width: 0, height: -3)
 
-        let dividers = (0 ..< 6).map { _ in
-            let divider = NSView()
-            divider.wantsLayer = true
-            divider.layer?.backgroundColor = NSColor.white
-                .withAlphaComponent(0.12)
-                .cgColor
-            return divider
+        let groupDivider = NSView()
+        groupDivider.wantsLayer = true
+        groupDivider.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.12).cgColor
+
+        let buttons: [NSView] = [
+            programButton, previousButton, playbackButton, nextButton,
+            voiceButton, visualButton, windowModeButton
+        ]
+        for view in buttons + [groupDivider] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(view)
         }
-
-        (
-            [
-                programButton,
-                previousButton,
-                playbackButton,
-                nextButton,
-                voiceButton,
-                visualButton,
-                windowModeButton
-            ] + dividers
-        ).forEach {
-            $0.translatesAutoresizingMaskIntoConstraints = false
-            addSubview($0)
+        for button in buttons {
+            NSLayoutConstraint.activate([
+                button.centerYAnchor.constraint(equalTo: centerYAnchor),
+                button.heightAnchor.constraint(equalToConstant: StageControlPanelLayout.controlSize),
+                button.widthAnchor.constraint(equalToConstant: button === visualButton
+                    ? StageControlPanelLayout.settingsWidth : StageControlPanelLayout.controlSize)
+            ])
         }
-
         NSLayoutConstraint.activate([
-            programButton.leadingAnchor.constraint(
-                equalTo: leadingAnchor,
-                constant: 4
-            ),
-            programButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            programButton.widthAnchor.constraint(equalToConstant: 44),
-            programButton.heightAnchor.constraint(equalToConstant: 44),
-
-            dividers[0].leadingAnchor.constraint(
-                equalTo: leadingAnchor,
-                constant: 48
-            ),
-            dividers[0].centerYAnchor.constraint(equalTo: centerYAnchor),
-            dividers[0].widthAnchor.constraint(equalToConstant: 1),
-            dividers[0].heightAnchor.constraint(equalToConstant: 18),
-
-            previousButton.leadingAnchor.constraint(
-                equalTo: leadingAnchor,
-                constant: 49
-            ),
-            previousButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            previousButton.widthAnchor.constraint(equalToConstant: 44),
-            previousButton.heightAnchor.constraint(equalToConstant: 44),
-
-            dividers[1].leadingAnchor.constraint(
-                equalTo: leadingAnchor,
-                constant: 93
-            ),
-            dividers[1].centerYAnchor.constraint(equalTo: centerYAnchor),
-            dividers[1].widthAnchor.constraint(equalToConstant: 1),
-            dividers[1].heightAnchor.constraint(equalToConstant: 18),
-
-            playbackButton.leadingAnchor.constraint(
-                equalTo: leadingAnchor,
-                constant: 94
-            ),
-            playbackButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            playbackButton.widthAnchor.constraint(equalToConstant: 44),
-            playbackButton.heightAnchor.constraint(equalToConstant: 44),
-
-            dividers[2].leadingAnchor.constraint(
-                equalTo: leadingAnchor,
-                constant: 138
-            ),
-            dividers[2].centerYAnchor.constraint(equalTo: centerYAnchor),
-            dividers[2].widthAnchor.constraint(equalToConstant: 1),
-            dividers[2].heightAnchor.constraint(equalToConstant: 18),
-
-            nextButton.leadingAnchor.constraint(
-                equalTo: leadingAnchor,
-                constant: 139
-            ),
-            nextButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            nextButton.widthAnchor.constraint(equalToConstant: 44),
-            nextButton.heightAnchor.constraint(equalToConstant: 44),
-
-            dividers[3].leadingAnchor.constraint(
-                equalTo: leadingAnchor,
-                constant: 183
-            ),
-            dividers[3].centerYAnchor.constraint(equalTo: centerYAnchor),
-            dividers[3].widthAnchor.constraint(equalToConstant: 1),
-            dividers[3].heightAnchor.constraint(equalToConstant: 18),
-
-            voiceButton.leadingAnchor.constraint(
-                equalTo: leadingAnchor,
-                constant: 184
-            ),
-            voiceButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            voiceButton.widthAnchor.constraint(equalToConstant: 44),
-            voiceButton.heightAnchor.constraint(equalToConstant: 44),
-
-            dividers[4].leadingAnchor.constraint(
-                equalTo: leadingAnchor,
-                constant: 228
-            ),
-            dividers[4].centerYAnchor.constraint(equalTo: centerYAnchor),
-            dividers[4].widthAnchor.constraint(equalToConstant: 1),
-            dividers[4].heightAnchor.constraint(equalToConstant: 18),
-
-            visualButton.leadingAnchor.constraint(
-                equalTo: leadingAnchor,
-                constant: StageControlPanelLayout.settingsLeading
-            ),
-            visualButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            visualButton.widthAnchor.constraint(equalToConstant: StageControlPanelLayout.settingsWidth),
-            visualButton.heightAnchor.constraint(equalToConstant: 44),
-
-            dividers[5].leadingAnchor.constraint(
-                equalTo: visualButton.trailingAnchor
-            ),
-            dividers[5].centerYAnchor.constraint(equalTo: centerYAnchor),
-            dividers[5].widthAnchor.constraint(equalToConstant: 1),
-            dividers[5].heightAnchor.constraint(equalToConstant: 18),
-
-            windowModeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
-            windowModeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            windowModeButton.widthAnchor.constraint(equalToConstant: 44),
-            windowModeButton.heightAnchor.constraint(equalToConstant: 44)
+            programButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: StageControlPanelLayout.sideInset),
+            previousButton.leadingAnchor.constraint(equalTo: programButton.trailingAnchor),
+            playbackButton.leadingAnchor.constraint(equalTo: previousButton.trailingAnchor),
+            nextButton.leadingAnchor.constraint(equalTo: playbackButton.trailingAnchor),
+            groupDivider.leadingAnchor.constraint(equalTo: nextButton.trailingAnchor, constant: StageControlPanelLayout.groupGap),
+            groupDivider.centerYAnchor.constraint(equalTo: centerYAnchor),
+            groupDivider.widthAnchor.constraint(equalToConstant: 1),
+            groupDivider.heightAnchor.constraint(equalToConstant: 20),
+            voiceButton.leadingAnchor.constraint(equalTo: groupDivider.trailingAnchor, constant: StageControlPanelLayout.groupGap),
+            visualButton.leadingAnchor.constraint(equalTo: voiceButton.trailingAnchor),
+            windowModeButton.leadingAnchor.constraint(equalTo: visualButton.trailingAnchor),
+            windowModeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -StageControlPanelLayout.sideInset)
         ])
     }
 
@@ -1380,11 +1287,12 @@ private final class StageVisualButton: NSButton {
         self.action = #selector(performAction)
         isBordered = false
         imagePosition = .imageLeading
+        imageHugsTitle = true
         title = "设置"
-        font = .systemFont(ofSize: 11, weight: .medium)
+        font = .systemFont(ofSize: 12, weight: .medium)
         focusRingType = .none
         wantsLayer = true
-        layer?.cornerRadius = 20
+        layer?.cornerRadius = 10
         updateContent()
     }
 
@@ -1409,22 +1317,15 @@ private final class StageVisualButton: NSButton {
     }
 
     private func updateContent() {
-        let collapsedLabel: String
-        switch stageMode {
-        case .space:
-            collapsedLabel = "空间设置：环境、角色动作与生活活动"
-        case .player:
-            collapsedLabel = "播放器设置：字幕、点阵、MV 与角色动作"
-        }
+        let collapsedLabel = "舞台设置：播放器、空间、角色与活动"
         let label = isExpanded ? "收起设置" : collapsedLabel
+        title = isExpanded ? "收起" : "设置"
         let configuration = NSImage.SymbolConfiguration(
             pointSize: 14,
             weight: .medium
         )
         image = NSImage(
-            systemSymbolName: isExpanded
-                ? "xmark"
-                : "circle.hexagongrid",
+            systemSymbolName: isExpanded ? "xmark" : "slider.horizontal.3",
             accessibilityDescription: label
         )?.withSymbolConfiguration(configuration)
         contentTintColor = isExpanded
@@ -1440,7 +1341,7 @@ private final class StageVisualButton: NSButton {
                 calibratedRed: 0.04,
                 green: 0.3,
                 blue: 0.42,
-                alpha: 0.72
+                alpha: 0.28
             ).cgColor
             : NSColor.clear.cgColor
         toolTip = label
@@ -1532,7 +1433,7 @@ private final class StageProgramButton: NSButton {
         imagePosition = .imageOnly
         focusRingType = .none
         wantsLayer = true
-        layer?.cornerRadius = 20
+        layer?.cornerRadius = 10
         updateContent()
         updateAppearance()
     }
@@ -1657,7 +1558,7 @@ private final class StageTrackNavigationButton: NSButton {
         imagePosition = .imageOnly
         focusRingType = .none
         wantsLayer = true
-        layer?.cornerRadius = 20
+        layer?.cornerRadius = 10
         let configuration = NSImage.SymbolConfiguration(
             pointSize: 13,
             weight: .medium
@@ -1742,7 +1643,7 @@ private final class StagePlaybackButton: NSButton {
         focusRingType = .none
         contentTintColor = NSColor.white
         wantsLayer = true
-        layer?.cornerRadius = 20
+        layer?.cornerRadius = 10
         setState(state)
         updateAppearance()
     }
@@ -1798,7 +1699,7 @@ private final class StagePlaybackButton: NSButton {
 
     private func updateAppearance() {
         let opacity = isEnabled ? 1.0 : 0.36
-        let backgroundOpacity = pointerIsInside && isEnabled ? 0.24 : 0.14
+        let backgroundOpacity = pointerIsInside && isEnabled ? 0.14 : 0.07
         alphaValue = opacity
         contentTintColor = NSColor.white.withAlphaComponent(0.94)
         layer?.backgroundColor = NSColor(
@@ -1833,7 +1734,7 @@ private final class StageVoiceButton: NSButton {
         imagePosition = .imageOnly
         focusRingType = .none
         wantsLayer = true
-        layer?.cornerRadius = 20
+        layer?.cornerRadius = 10
         setState(state)
     }
 
@@ -2025,7 +1926,7 @@ private final class StageWindowModeButton: NSButton {
         imagePosition = .imageOnly
         focusRingType = .none
         wantsLayer = true
-        layer?.cornerRadius = 20
+        layer?.cornerRadius = 10
         setMode(mode)
         updateAppearance()
     }

@@ -812,18 +812,24 @@ func stageVisualPickerShowsOnlyTheGroupsForTheCurrentMode() {
 }
 
 @Test
-func stageControlPanelTabsRetainActionsAndRejectUnavailableSections() {
-    #expect(StageControlPanelTab.available(for: .player) == [.visuals, .motions])
-    #expect(StageControlPanelTab.available(for: .space) == [.visuals, .motions, .activities])
-    #expect(StageControlPanelTab.activities.resolved(for: .player) == .visuals)
-    #expect(StageControlPanelTab.motions.resolved(for: .space) == .motions)
-    #expect(StageControlPanelTab.motions.resolved(for: .player) == .motions)
-    #expect(StageControlPanelTab.visuals.title(for: .player) == "画面")
-    #expect(StageControlPanelTab.visuals.title(for: .space) == "空间")
+func stageControlPanelSectionsStayAvailableIndependentOfScene() {
+    #expect(StageControlPanelTab.allCases == [.player, .space, .motions, .activities])
+    #expect(StageControlPanelTab.allCases.map(\.title) == ["播放器", "空间", "角色", "活动"])
+    #expect(StageControlPanelTab.initial(for: .player) == .player)
+    #expect(StageControlPanelTab.initial(for: .space) == .space)
 }
 
 @Test
 func stageActivitiesRequireVisibleMatchingWorld() {
+    #expect(StageActivityAvailability.unavailableMessage(
+        isWorldVisible: false, isWorldPresentationRequested: false
+    ) == "进入空间后可选择生活活动。")
+    #expect(StageActivityAvailability.unavailableMessage(
+        isWorldVisible: false, isWorldPresentationRequested: true
+    ) == "空间载入完成后可选择活动。")
+    #expect(StageActivityAvailability.unavailableMessage(
+        isWorldVisible: true, isWorldPresentationRequested: true
+    ) == "这个空间还没有配置生活活动。")
     #expect(StageActivityAvailability.canRun(
         isWorldVisible: true, selectedWorldID: "cabin", activityWorldID: "cabin"
     ))
@@ -842,8 +848,11 @@ func stageActivitiesRequireVisibleMatchingWorld() {
 func stageSettingsButtonFitsTransportAndPanelHasUpperBounds() {
     #expect(StageControlPanelLayout.maximumWidth == 590)
     #expect(StageControlPanelLayout.maximumHeight == 458)
+    #expect(StageControlPanelLayout.controlSize >= 44)
+    #expect(StageControlPanelLayout.transportWidth < 358)
     #expect(StageControlPanelLayout.transportWidth
-        == StageControlPanelLayout.settingsLeading + StageControlPanelLayout.settingsWidth + 1 + 44 + 4)
+        == 6 * StageControlPanelLayout.controlSize + StageControlPanelLayout.settingsWidth
+            + 2 * StageControlPanelLayout.sideInset + 2 * StageControlPanelLayout.groupGap + 1)
 }
 
 @Test
@@ -1004,13 +1013,16 @@ func stageTransportActionsLiveInOneCompactControlIsland() {
     #expect(visualButton?.superview === controls)
     #expect(windowModeButton?.superview === controls)
     controls?.layoutSubtreeIfNeeded()
-    #expect(controls?.frame.size == CGSize(width: 322, height: 48))
+    #expect(controls?.frame.size == CGSize(width: StageControlPanelLayout.transportWidth, height: 48))
     #expect(programButton?.frame.size == CGSize(width: 44, height: 44))
     #expect(previousButton?.frame.size == CGSize(width: 44, height: 44))
     #expect(playbackButton?.frame.size == CGSize(width: 44, height: 44))
     #expect(nextButton?.frame.size == CGSize(width: 44, height: 44))
     #expect(voiceButton?.frame.size == CGSize(width: 44, height: 44))
-    #expect(visualButton?.frame.size == CGSize(width: 44, height: 44))
+    #expect(visualButton?.frame.size == CGSize(
+        width: StageControlPanelLayout.settingsWidth,
+        height: StageControlPanelLayout.controlSize
+    ))
     #expect(windowModeButton?.frame.size == CGSize(width: 44, height: 44))
 
     controller.close()

@@ -1927,22 +1927,19 @@ enum StageVisualPickerGroup: Equatable {
     }
 }
 
-enum StageControlPanelTab: String, Hashable {
-    case visuals, motions, activities
+enum StageControlPanelTab: String, Hashable, CaseIterable {
+    case player, space, motions, activities
 
-    static func available(for mode: StageVisualPickerMode) -> [Self] {
-        mode == .space ? [.visuals, .motions, .activities] : [.visuals, .motions]
+    static func initial(for mode: StageVisualPickerMode) -> Self {
+        mode == .space ? .space : .player
     }
 
-    func resolved(for mode: StageVisualPickerMode) -> Self {
-        Self.available(for: mode).contains(self) ? self : .visuals
-    }
-
-    func title(for mode: StageVisualPickerMode) -> String {
+    var title: String {
         switch self {
-        case .visuals: mode == .space ? "空间" : "画面"
-        case .motions: "角色动作"
-        case .activities: "生活活动"
+        case .player: "播放器"
+        case .space: "空间"
+        case .motions: "角色"
+        case .activities: "活动"
         }
     }
 }
@@ -1950,12 +1947,23 @@ enum StageControlPanelTab: String, Hashable {
 enum StageControlPanelLayout {
     static let maximumWidth: CGFloat = 590
     static let maximumHeight: CGFloat = 458
-    static let settingsLeading: CGFloat = 229
-    static let settingsWidth: CGFloat = 80
-    static let transportWidth: CGFloat = 358
+    static let controlSize: CGFloat = 44
+    static let sideInset: CGFloat = 4
+    static let groupGap: CGFloat = 6
+    static let settingsWidth: CGFloat = 68
+    static let transportWidth: CGFloat = 6 * controlSize + settingsWidth + 2 * sideInset + 2 * groupGap + 1
 }
 
 enum StageActivityAvailability {
+    static func unavailableMessage(
+        isWorldVisible: Bool,
+        isWorldPresentationRequested: Bool
+    ) -> String {
+        if isWorldVisible { return "这个空间还没有配置生活活动。" }
+        return isWorldPresentationRequested
+            ? "空间载入完成后可选择活动。" : "进入空间后可选择生活活动。"
+    }
+
     static func canRun(
         isWorldVisible: Bool,
         selectedWorldID: String?,
@@ -1976,13 +1984,15 @@ struct StageVisualPickerView: View {
     @Bindable var avatarRuntime: StageAvatarRuntimeStore = .shared
     @ObservedObject private var activities = LivingWorldActivityMenuStore.shared
     @State private var model = PresenceSettingsModel()
-    @State private var tab: StageControlPanelTab = .visuals
+    @State private var tab: StageControlPanelTab = .player
+    @State private var didChooseInitialTab = false
     var onRunActivity: @MainActor (String) -> Void = { _ in }
     var onStopActivity: @MainActor () -> Void = {}
     var onManageAssets: @MainActor () -> Void = {}
 
-    private let lyricColumns = [GridItem(.adaptive(minimum: 72), spacing: 6)]
-    private let pointCloudColumns = [GridItem(.adaptive(minimum: 100), spacing: 6)]
+    private let lyricColumns = [GridItem(.adaptive(minimum: 90), spacing: 6)]
+    private let pointCloudColumns = [GridItem(.adaptive(minimum: 110), spacing: 6)]
+    private let videoColumns = [GridItem(.adaptive(minimum: 108), spacing: 6)]
 
     private var mode: StageVisualPickerMode {
         .resolve(isWorldPresentationRequested: spatialStage.isWorldPresentationRequested)
@@ -1990,9 +2000,17 @@ struct StageVisualPickerView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("舞台设置")
+                    .font(.system(size: 16, weight: .semibold))
+                Spacer()
+                Text(mode == .space ? "正在空间中" : "正在播放器中")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.white.opacity(0.64))
+            }
             Picker("设置分区", selection: $tab) {
-                ForEach(StageControlPanelTab.available(for: mode), id: \.self) { item in
-                    Text(item.title(for: mode)).tag(item)
+                ForEach(StageControlPanelTab.allCases, id: \.self) { item in
+                    Text(item.title).tag(item)
                 }
             }
             .pickerStyle(.segmented)
@@ -2000,8 +2018,16 @@ struct StageVisualPickerView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
-                    switch tab.resolved(for: mode) {
-                    case .visuals: visualGroups
+                    switch tab {
+                    case .player:
+                        if mode == .space {
+                            Label("这些效果用于播放器画面，切回播放器后可查看", systemImage: "info.circle")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.white.opacity(0.72))
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        visualGroups(for: .player)
+                    case .space: visualGroups(for: .space)
                     case .motions: motionGroup
                     case .activities: activityGroup
                     }
@@ -2011,18 +2037,24 @@ struct StageVisualPickerView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .padding(12)
+        .padding(16)
         .background {
-            RoundedRectangle(cornerRadius: 24)
-                .fill(.ultraThinMaterial)
+            RoundedRectangle(cornerRadius: 18)
+                .fill(Color(red: 0.075, green: 0.085, blue: 0.105))
                 .overlay {
-                    RoundedRectangle(cornerRadius: 24)
-                        .stroke(.white.opacity(0.14), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: 18)
+                        .stroke(.white.opacity(0.12), lineWidth: 1)
                 }
         }
-        .shadow(color: .black.opacity(0.5), radius: 24, y: 10)
+        .foregroundStyle(.white.opacity(0.92))
+        .environment(\.colorScheme, .dark)
+        .shadow(color: .black.opacity(0.32), radius: 16, y: 6)
         .padding(7)
-        .onChange(of: mode) { _, newMode in tab = tab.resolved(for: newMode) }
+        .onAppear {
+            guard !didChooseInitialTab else { return }
+            tab = .initial(for: mode)
+            didChooseInitialTab = true
+        }
         .onChange(of: tab) { _, newTab in
             if newTab == .motions { model.load() }
         }
@@ -2031,7 +2063,7 @@ struct StageVisualPickerView: View {
         }
     }
 
-    private var visualGroups: some View {
+    private func visualGroups(for mode: StageVisualPickerMode) -> some View {
         let groups = StageVisualPickerGroup.visibleGroups(for: mode)
         return VStack(alignment: .leading, spacing: 12) {
             if groups.contains(.worldSelection) { worldSelectionGroup }
@@ -2113,8 +2145,10 @@ struct StageVisualPickerView: View {
                     .disabled(activities.activeActivityID == nil)
                 if let message = activities.message { Text(message).foregroundStyle(.secondary) }
             } else {
-                Text(spatialStage.isWorldVisible
-                    ? "这个空间还没有配置生活活动。" : "空间载入完成后可选择活动。")
+                Text(StageActivityAvailability.unavailableMessage(
+                    isWorldVisible: spatialStage.isWorldVisible,
+                    isWorldPresentationRequested: spatialStage.isWorldPresentationRequested
+                ))
             }
         }
         .font(.system(size: 12))
@@ -2154,13 +2188,13 @@ struct StageVisualPickerView: View {
                 )
                 Spacer()
                 Image(systemName: "chevron.up.chevron.down")
-                    .font(.system(size: 9, weight: .bold))
+                    .font(.system(size: 12, weight: .bold))
             }
-            .font(.system(size: 10, weight: .semibold, design: .rounded))
+            .font(.system(size: 12, weight: .semibold, design: .rounded))
             .foregroundStyle(.white.opacity(0.68))
             .padding(.horizontal, 12)
             .frame(maxWidth: .infinity)
-            .frame(height: 34)
+            .frame(minHeight: 36)
             .background {
                 RoundedRectangle(cornerRadius: 12)
                     .fill(Color.white.opacity(0.045))
@@ -2198,7 +2232,7 @@ struct StageVisualPickerView: View {
 
             HStack {
                 Text("人物位置会按当前空间保存")
-                    .foregroundStyle(.white.opacity(0.36))
+                    .foregroundStyle(.white.opacity(0.68))
                 Spacer()
                 Button("重置") {
                     spatialStage.resetAvatarPosition()
@@ -2206,7 +2240,7 @@ struct StageVisualPickerView: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(.cyan.opacity(0.78))
             }
-            .font(.system(size: 9, weight: .medium, design: .rounded))
+            .font(.system(size: 12, weight: .medium, design: .rounded))
 
             HStack {
                 Text("W/S 沿视线前后移动，A/D 左右移动")
@@ -2214,7 +2248,7 @@ struct StageVisualPickerView: View {
                 Spacer()
                 Button("镜头复位") { spatialStage.resetCamera() }
             }
-            .font(.system(size: 10))
+            .font(.system(size: 12))
         }
     }
 
@@ -2224,17 +2258,17 @@ struct StageVisualPickerView: View {
             !spatialStage.isWorldVisible
         {
             Label("正在载入空间，完成后自动进入…", systemImage: "cube.transparent")
-                .font(.system(size: 10, weight: .medium, design: .rounded))
+                .font(.system(size: 12, weight: .medium, design: .rounded))
                 .foregroundStyle(.cyan.opacity(0.72))
                 .lineLimit(1)
         } else if let message = marbleLibrary.generationMessage {
             Label(message, systemImage: "sparkles")
-                .font(.system(size: 10, weight: .medium, design: .rounded))
+                .font(.system(size: 12, weight: .medium, design: .rounded))
                 .foregroundStyle(.cyan.opacity(0.72))
                 .lineLimit(1)
         } else if let message = marbleLibrary.errorMessage {
             Label(message, systemImage: "exclamationmark.triangle.fill")
-                .font(.system(size: 10, weight: .medium, design: .rounded))
+                .font(.system(size: 12, weight: .medium, design: .rounded))
                 .foregroundStyle(.orange.opacity(0.78))
                 .lineLimit(1)
         }
@@ -2281,7 +2315,7 @@ struct StageVisualPickerView: View {
     private var particleSizeGroup: some View {
         HStack(spacing: 10) {
             Image(systemName: "circle.grid.2x2.fill")
-                .foregroundStyle(.white.opacity(0.46))
+                .foregroundStyle(.white.opacity(0.68))
             Slider(
                 value: Binding(
                     get: {
@@ -2303,18 +2337,18 @@ struct StageVisualPickerView: View {
             )
             .monospacedDigit()
             .frame(width: 38, alignment: .trailing)
-            .foregroundStyle(.white.opacity(0.5))
+            .foregroundStyle(.white.opacity(0.68))
         }
-        .font(.system(size: 11, weight: .semibold, design: .rounded))
+        .font(.system(size: 12, weight: .semibold, design: .rounded))
         .padding(.horizontal, 10)
-        .frame(height: 24)
+        .frame(minHeight: 36)
     }
 
     private var musicVideoGroup: some View {
         VStack(alignment: .leading, spacing: 12) {
             pickerHeader("MV 场景", symbol: "film.stack")
 
-            HStack(spacing: 6) {
+            LazyVGrid(columns: videoColumns, spacing: 6) {
                 pickerButton(
                     title: "导入 MP4",
                     symbol: "plus",
@@ -2343,7 +2377,7 @@ struct StageVisualPickerView: View {
             if !videos.assets.isEmpty {
                 HStack(spacing: 10) {
                     Image(systemName: "sun.min")
-                        .foregroundStyle(.white.opacity(0.46))
+                        .foregroundStyle(.white.opacity(0.68))
                     Slider(
                         value: Binding(
                             get: { Double(videos.brightness) },
@@ -2356,11 +2390,11 @@ struct StageVisualPickerView: View {
                     Text("\(Int(videos.brightness * 100))%")
                         .monospacedDigit()
                         .frame(width: 38, alignment: .trailing)
-                        .foregroundStyle(.white.opacity(0.5))
+                        .foregroundStyle(.white.opacity(0.68))
                 }
-                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
                 .padding(.horizontal, 10)
-                .frame(height: 24)
+                .frame(minHeight: 36)
 
                 Menu {
                     ForEach(videos.assets) { asset in
@@ -2407,12 +2441,12 @@ struct StageVisualPickerView: View {
                                 ? "已加载"
                                 : "\(videos.assets.count) 段"
                         )
-                            .foregroundStyle(.white.opacity(0.38))
+                            .foregroundStyle(.white.opacity(0.68))
                     }
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
                     .foregroundStyle(.white.opacity(0.68))
                     .padding(.horizontal, 12)
-                    .frame(height: 30)
+                    .frame(minHeight: 36)
                     .background(Color.white.opacity(0.045), in: Capsule())
                 }
                 .menuStyle(.borderlessButton)
@@ -2425,9 +2459,8 @@ struct StageVisualPickerView: View {
         symbol: String
     ) -> some View {
         Label(title, systemImage: symbol)
-            .font(.system(size: 12, weight: .semibold, design: .rounded))
-            .tracking(0.7)
-            .foregroundStyle(.white.opacity(0.6))
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(.white.opacity(0.9))
     }
 
     private func avatarPositionSlider(
@@ -2438,7 +2471,7 @@ struct StageVisualPickerView: View {
         let value = avatarPositionValue(for: axis)
         return HStack(spacing: 9) {
             Text(axis.rawValue)
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .font(.system(size: 12, weight: .bold, design: .monospaced))
                 .foregroundStyle(.white.opacity(0.52))
                 .frame(width: 12)
             Slider(
@@ -2457,12 +2490,12 @@ struct StageVisualPickerView: View {
             .tint(.cyan.opacity(0.86))
             .accessibilityLabel(accessibilityLabel)
             Text(value.formatted(.number.precision(.fractionLength(2))))
-                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
                 .monospacedDigit()
-                .foregroundStyle(.white.opacity(0.48))
+                .foregroundStyle(.white.opacity(0.68))
                 .frame(width: 42, alignment: .trailing)
         }
-        .frame(height: 20)
+        .frame(minHeight: 36)
     }
 
     private func avatarPositionValue(
@@ -2491,7 +2524,7 @@ struct StageVisualPickerView: View {
                     .font(.system(size: 14, weight: .semibold))
                 Text(title)
                     .font(.system(
-                        size: 10,
+                        size: 12,
                         weight: .semibold,
                         design: .rounded
                     ))
@@ -2503,7 +2536,7 @@ struct StageVisualPickerView: View {
                     : Color.white.opacity(0.62)
             )
             .frame(maxWidth: .infinity)
-            .frame(height: 40)
+            .frame(minHeight: 48)
             .background {
                 RoundedRectangle(cornerRadius: 13)
                     .fill(

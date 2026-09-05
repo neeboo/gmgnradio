@@ -22,6 +22,12 @@ func check(_ condition: Bool, _ message: String) {
 let declarations = ["enum StageVisualPickerMode:", "enum StageVisualPickerGroup:", "enum StageControlPanelTab:", "enum StageControlPanelLayout", "enum StageActivityAvailability"]
 for signature in declarations { check(declaration(signature) != nil, "Missing policy: \(signature)") }
 check(source.contains("ScrollView {") && source.contains("Picker(\"设置分区\""), "Control panel needs scrollable sections")
+check(source.contains("ForEach(StageControlPanelTab.allCases") && !source.contains(".onChange(of: mode)"), "All four sections must remain available without scene-driven tab changes")
+check(source.contains("这些效果用于播放器画面，切回播放器后可查看"), "Player effects need a clear scope note while in space")
+check(source.contains(".fill(Color(red: 0.075, green: 0.085, blue: 0.105))"), "Panel requires a stable graphite background")
+check(controller.contains("let groupDivider = NSView()") && !controller.contains("let dividers = (0 ..< 6)"), "Transport should use one group divider")
+check(controller.contains("imageHugsTitle = true") && controller.contains("? \"xmark\" : \"slider.horizontal.3\""), "Settings icon and text should form one compact label with a distinct expanded state")
+check(source.contains("LazyVGrid(columns: videoColumns"), "MV choices must wrap in narrow panels")
 check(source.contains("model.activateMotion(motion)"), "Motion row must call existing activation")
 check(source.contains("model.motionCompatibility(motion)"), "Motion compatibility must control selection")
 check(source.contains("onRunActivity(item.id)") && source.contains("Button(\"停止活动\", action: onStopActivity)"), "Activities must call the app handlers")
@@ -36,21 +42,22 @@ for callback in ["onRunActivity", "onStopActivity", "onManageAssets"] {
 guard failures == 0 else { exit(1) }
 let harness = "import Foundation\n" + declarations.compactMap(declaration).joined(separator: "\n") + #"""
 
-precondition(StageControlPanelTab.available(for: .player) == [.visuals, .motions])
-precondition(StageControlPanelTab.available(for: .space) == [.visuals, .motions, .activities])
-precondition(StageControlPanelTab.activities.resolved(for: .player) == .visuals)
-precondition(StageControlPanelTab.motions.resolved(for: .player) == .motions)
-precondition(StageControlPanelTab.motions.resolved(for: .space) == .motions)
-precondition(StageControlPanelTab.visuals.title(for: .player) == "画面")
-precondition(StageControlPanelTab.visuals.title(for: .space) == "空间")
+precondition(StageControlPanelTab.allCases == [.player, .space, .motions, .activities])
+precondition(StageControlPanelTab.initial(for: .player) == .player)
+precondition(StageControlPanelTab.initial(for: .space) == .space)
+precondition(StageControlPanelTab.allCases.map(\.title) == ["播放器", "空间", "角色", "活动"])
 precondition(StageVisualPickerGroup.visibleGroups(for: .player) == [.lyricsEffects, .pointCloud, .particleSize, .musicVideo])
 precondition(StageVisualPickerGroup.visibleGroups(for: .space) == [.worldSelection, .avatarPlacement, .loadingStatus])
 precondition(StageControlPanelLayout.maximumWidth == 590 && StageControlPanelLayout.maximumHeight == 458)
-precondition(StageControlPanelLayout.transportWidth == StageControlPanelLayout.settingsLeading + StageControlPanelLayout.settingsWidth + 1 + 44 + 4)
+precondition(StageControlPanelLayout.controlSize >= 44)
+precondition(StageControlPanelLayout.transportWidth == 6 * StageControlPanelLayout.controlSize + StageControlPanelLayout.settingsWidth + 2 * StageControlPanelLayout.sideInset + 2 * StageControlPanelLayout.groupGap + 1)
 precondition(StageActivityAvailability.canRun(isWorldVisible: true, selectedWorldID: "a", activityWorldID: "a"))
 precondition(!StageActivityAvailability.canRun(isWorldVisible: false, selectedWorldID: "a", activityWorldID: "a"))
 precondition(!StageActivityAvailability.canRun(isWorldVisible: true, selectedWorldID: "b", activityWorldID: "a"))
 precondition(!StageActivityAvailability.canRun(isWorldVisible: true, selectedWorldID: nil, activityWorldID: nil))
+precondition(StageActivityAvailability.unavailableMessage(isWorldVisible: false, isWorldPresentationRequested: false) == "进入空间后可选择生活活动。")
+precondition(StageActivityAvailability.unavailableMessage(isWorldVisible: false, isWorldPresentationRequested: true) == "空间载入完成后可选择活动。")
+precondition(StageActivityAvailability.unavailableMessage(isWorldVisible: true, isWorldPresentationRequested: true) == "这个空间还没有配置生活活动。")
 print("PASS: panel mode, preserved groups, activity availability, layout policy and source wiring")
 """#
 let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("gmgn-panel-tests-\(UUID()).swift")
