@@ -812,6 +812,41 @@ func stageVisualPickerShowsOnlyTheGroupsForTheCurrentMode() {
 }
 
 @Test
+func stageControlPanelTabsRetainActionsAndRejectUnavailableSections() {
+    #expect(StageControlPanelTab.available(for: .player) == [.visuals, .motions])
+    #expect(StageControlPanelTab.available(for: .space) == [.visuals, .motions, .activities])
+    #expect(StageControlPanelTab.activities.resolved(for: .player) == .visuals)
+    #expect(StageControlPanelTab.motions.resolved(for: .space) == .motions)
+    #expect(StageControlPanelTab.motions.resolved(for: .player) == .motions)
+    #expect(StageControlPanelTab.visuals.title(for: .player) == "画面")
+    #expect(StageControlPanelTab.visuals.title(for: .space) == "空间")
+}
+
+@Test
+func stageActivitiesRequireVisibleMatchingWorld() {
+    #expect(StageActivityAvailability.canRun(
+        isWorldVisible: true, selectedWorldID: "cabin", activityWorldID: "cabin"
+    ))
+    #expect(!StageActivityAvailability.canRun(
+        isWorldVisible: false, selectedWorldID: "cabin", activityWorldID: "cabin"
+    ))
+    #expect(!StageActivityAvailability.canRun(
+        isWorldVisible: true, selectedWorldID: "other", activityWorldID: "cabin"
+    ))
+    #expect(!StageActivityAvailability.canRun(
+        isWorldVisible: true, selectedWorldID: nil, activityWorldID: nil
+    ))
+}
+
+@Test
+func stageSettingsButtonFitsTransportAndPanelHasUpperBounds() {
+    #expect(StageControlPanelLayout.maximumWidth == 590)
+    #expect(StageControlPanelLayout.maximumHeight == 458)
+    #expect(StageControlPanelLayout.transportWidth
+        == StageControlPanelLayout.settingsLeading + StageControlPanelLayout.settingsWidth + 1 + 44 + 4)
+}
+
+@Test
 @MainActor
 func stageDestinationButtonStaysAvailableAcrossStageModes() throws {
     let spatialStage = SpatialStageStore()

@@ -1927,6 +1927,44 @@ enum StageVisualPickerGroup: Equatable {
     }
 }
 
+enum StageControlPanelTab: String, Hashable {
+    case visuals, motions, activities
+
+    static func available(for mode: StageVisualPickerMode) -> [Self] {
+        mode == .space ? [.visuals, .motions, .activities] : [.visuals, .motions]
+    }
+
+    func resolved(for mode: StageVisualPickerMode) -> Self {
+        Self.available(for: mode).contains(self) ? self : .visuals
+    }
+
+    func title(for mode: StageVisualPickerMode) -> String {
+        switch self {
+        case .visuals: mode == .space ? "空间" : "画面"
+        case .motions: "角色动作"
+        case .activities: "生活活动"
+        }
+    }
+}
+
+enum StageControlPanelLayout {
+    static let maximumWidth: CGFloat = 590
+    static let maximumHeight: CGFloat = 458
+    static let settingsLeading: CGFloat = 229
+    static let settingsWidth: CGFloat = 80
+    static let transportWidth: CGFloat = 358
+}
+
+enum StageActivityAvailability {
+    static func canRun(
+        isWorldVisible: Bool,
+        selectedWorldID: String?,
+        activityWorldID: String?
+    ) -> Bool {
+        isWorldVisible && selectedWorldID != nil && selectedWorldID == activityWorldID
+    }
+}
+
 @MainActor
 struct StageVisualPickerView: View {
     @ObservedObject var lyrics: StageLyricsStore
@@ -1935,47 +1973,44 @@ struct StageVisualPickerView: View {
     @Bindable var programStore: DJProgramStore
     @Bindable var spatialStage: SpatialStageStore
     @Bindable var marbleLibrary: MarbleWorldLibrary
+    @Bindable var avatarRuntime: StageAvatarRuntimeStore = .shared
+    @ObservedObject private var activities = LivingWorldActivityMenuStore.shared
+    @State private var model = PresenceSettingsModel()
+    @State private var tab: StageControlPanelTab = .visuals
+    var onRunActivity: @MainActor (String) -> Void = { _ in }
+    var onStopActivity: @MainActor () -> Void = {}
+    var onManageAssets: @MainActor () -> Void = {}
 
-    private let lyricColumns = Array(
-        repeating: GridItem(.flexible(), spacing: 6),
-        count: 6
-    )
-    private let pointCloudColumns = Array(
-        repeating: GridItem(.flexible(), spacing: 6),
-        count: 4
-    )
+    private let lyricColumns = [GridItem(.adaptive(minimum: 72), spacing: 6)]
+    private let pointCloudColumns = [GridItem(.adaptive(minimum: 100), spacing: 6)]
+
+    private var mode: StageVisualPickerMode {
+        .resolve(isWorldPresentationRequested: spatialStage.isWorldPresentationRequested)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            let groups = StageVisualPickerGroup.visibleGroups(
-                for: StageVisualPickerMode.resolve(
-                    isWorldPresentationRequested:
-                        spatialStage.isWorldPresentationRequested
-                )
-            )
+            Picker("设置分区", selection: $tab) {
+                ForEach(StageControlPanelTab.available(for: mode), id: \.self) { item in
+                    Text(item.title(for: mode)).tag(item)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
 
-            if groups.contains(.worldSelection) {
-                worldSelectionGroup
-            }
-            if groups.contains(.avatarPlacement) {
-                avatarPlacementGroup
-            }
-            if groups.contains(.loadingStatus) {
-                loadingStatusGroup
-            }
-            if groups.contains(.lyricsEffects) {
-                lyricsEffectsGroup
-            }
-            if groups.contains(.pointCloud) {
-                pointCloudGroup
-            }
-            if groups.contains(.particleSize) {
-                particleSizeGroup
-            }
-            if groups.contains(.musicVideo) {
-                musicVideoGroup
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    switch tab.resolved(for: mode) {
+                    case .visuals: visualGroups
+                    case .motions: motionGroup
+                    case .activities: activityGroup
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.bottom, 4)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .padding(12)
         .background {
             RoundedRectangle(cornerRadius: 24)
@@ -1987,6 +2022,102 @@ struct StageVisualPickerView: View {
         }
         .shadow(color: .black.opacity(0.5), radius: 24, y: 10)
         .padding(7)
+        .onChange(of: mode) { _, newMode in tab = tab.resolved(for: newMode) }
+        .onChange(of: tab) { _, newTab in
+            if newTab == .motions { model.load() }
+        }
+        .onChange(of: avatarRuntime.snapshot.avatar?.id) { _, _ in
+            if tab == .motions { model.load() }
+        }
+    }
+
+    private var visualGroups: some View {
+        let groups = StageVisualPickerGroup.visibleGroups(for: mode)
+        return VStack(alignment: .leading, spacing: 12) {
+            if groups.contains(.worldSelection) { worldSelectionGroup }
+            if groups.contains(.avatarPlacement) { avatarPlacementGroup }
+            if groups.contains(.loadingStatus) { loadingStatusGroup }
+            if groups.contains(.lyricsEffects) { lyricsEffectsGroup }
+            if groups.contains(.pointCloud) { pointCloudGroup }
+            if groups.contains(.particleSize) { particleSizeGroup }
+            if groups.contains(.musicVideo) { musicVideoGroup }
+        }
+    }
+
+    private var motionGroup: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label(avatarRuntime.snapshot.name ?? "尚未选择角色", systemImage: "person.crop.circle")
+                Spacer()
+                Button("刷新") { model.load() }
+            }
+            Text("选择已安装动作；自然待机可结束当前表演。")
+                .foregroundStyle(.secondary)
+            ForEach(model.motions, id: \.id) { motion in
+                let compatibility = model.motionCompatibility(motion)
+                Button {
+                    model.activateMotion(motion)
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: avatarRuntime.snapshot.motion?.id == motion.id
+                            ? "checkmark.circle.fill" : "figure.dance")
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(motion.name)
+                            if case let .incompatible(reason) = compatibility {
+                                Text(reason).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer()
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
+                }
+                .buttonStyle(.plain)
+                .disabled(compatibility != .compatible || model.isWorking)
+            }
+            if model.motions.isEmpty { Text("暂无可用动作，请在资产管理中安装。") }
+            if let message = model.message {
+                Text(message).foregroundStyle(model.hasError ? Color.orange : Color.secondary)
+            }
+            Button("管理角色与动作…", action: onManageAssets)
+        }
+        .font(.system(size: 12))
+    }
+
+    private var activityGroup: some View {
+        let canRun = StageActivityAvailability.canRun(
+            isWorldVisible: spatialStage.isWorldVisible,
+            selectedWorldID: spatialStage.selectedWorldID,
+            activityWorldID: activities.worldID
+        )
+        return VStack(alignment: .leading, spacing: 10) {
+            Text("活动来自当前空间，角色会走到对应位置再开始。")
+                .foregroundStyle(.secondary)
+            if canRun {
+                ForEach(activities.items) { item in
+                    Button { onRunActivity(item.id) } label: {
+                        HStack {
+                            Image(systemName: activities.activeActivityID == item.id
+                                ? "checkmark.circle.fill" : "play.circle")
+                            Text(item.name)
+                            Spacer()
+                        }
+                        .padding(10)
+                        .background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                }
+                if activities.items.isEmpty { Text("这个空间还没有配置生活活动。") }
+                Button("停止活动", action: onStopActivity)
+                    .disabled(activities.activeActivityID == nil)
+                if let message = activities.message { Text(message).foregroundStyle(.secondary) }
+            } else {
+                Text(spatialStage.isWorldVisible
+                    ? "这个空间还没有配置生活活动。" : "空间载入完成后可选择活动。")
+            }
+        }
+        .font(.system(size: 12))
     }
 
     private var worldSelectionGroup: some View {
@@ -2066,7 +2197,7 @@ struct StageVisualPickerView: View {
             }
 
             HStack {
-                Text("点云空间无碰撞，坐标会按当前空间保存")
+                Text("人物位置会按当前空间保存")
                     .foregroundStyle(.white.opacity(0.36))
                 Spacer()
                 Button("重置") {
@@ -2076,6 +2207,14 @@ struct StageVisualPickerView: View {
                 .foregroundStyle(.cyan.opacity(0.78))
             }
             .font(.system(size: 9, weight: .medium, design: .rounded))
+
+            HStack {
+                Text("W/S 沿视线前后移动，A/D 左右移动")
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("镜头复位") { spatialStage.resetCamera() }
+            }
+            .font(.system(size: 10))
         }
     }
 

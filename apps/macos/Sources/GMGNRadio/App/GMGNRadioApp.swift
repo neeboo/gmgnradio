@@ -293,9 +293,30 @@ final class LivingWorldActivityMenuStore: ObservableObject {
     static let shared = LivingWorldActivityMenuStore()
 
     @Published private(set) var items: [LivingWorldActivityMenuItem] = []
+    @Published private(set) var worldID: String?
+    @Published private(set) var activeActivityID: String?
+    @Published private(set) var message: String?
 
-    func update(definitions: [LifeActivityDefinition]) {
+    func update(definitions: [LifeActivityDefinition], worldID: String? = nil) {
+        self.worldID = worldID
         items = LivingWorldActivityMenuPolicy.items(definitions: definitions)
+        activeActivityID = nil
+        message = nil
+    }
+
+    func canControl(worldID: String?) -> Bool {
+        guard let worldID else { return false }
+        return self.worldID == worldID
+    }
+
+    func updateActiveActivity(id: String?) {
+        guard activeActivityID != id else { return }
+        activeActivityID = id
+        message = nil
+    }
+
+    func report(_ message: String) {
+        self.message = message
     }
 }
 
@@ -853,18 +874,26 @@ final class AppDelegate:
     }
 
     func runLivingWorldActivity(id: String) {
+        let menu = LivingWorldActivityMenuStore.shared
+        guard menu.canControl(worldID: spatialStage.selectedWorldID) else {
+            menu.report("当前空间尚未接入生活活动，请切回生活舱。")
+            return
+        }
         if LivingWorldActivityPresentationPolicy.shouldShowDesktopPresence(
             fullSpaceIsPresented: stageWindowController?.isPresented == true
         ) {
             showLiveCam()
         }
-        guard let context = livingWorldContext else {
+        guard let context = livingWorldContext,
+              context.manifest.worldID == menu.worldID else {
+            menu.report("生活空间尚未就绪，请稍后再试。")
             livingWorldLogger.error("生活空间当前不可用，无法开始菜单活动")
             return
         }
         guard let definition = context.manifest.activityDefinitions.first(
             where: { $0.id == id }
         ) else {
+            menu.report("当前空间没有这项活动。")
             livingWorldLogger.error(
                 "示例空间未声明活动：\(id, privacy: .public)"
             )
@@ -872,7 +901,9 @@ final class AppDelegate:
         }
         do {
             try context.startActivity(id: definition.id)
+            menu.report("已安排：\(definition.displayName ?? id)")
         } catch {
+            menu.report("活动未能开始：\(error.localizedDescription)")
             livingWorldLogger.error(
                 "菜单活动启动失败：id=\(id, privacy: .public)，error=\(error.localizedDescription, privacy: .public)"
             )
@@ -880,13 +911,22 @@ final class AppDelegate:
     }
 
     func stopLivingWorldActivity() {
-        guard let context = livingWorldContext else {
+        let menu = LivingWorldActivityMenuStore.shared
+        guard menu.canControl(worldID: spatialStage.selectedWorldID) else {
+            menu.report("请回到活动所在的生活舱后再停止。")
+            return
+        }
+        guard let context = livingWorldContext,
+              context.manifest.worldID == menu.worldID else {
+            menu.report("生活空间尚未就绪，请稍后再试。")
             livingWorldLogger.error("生活空间当前不可用，无法停止活动")
             return
         }
         do {
             try context.stopActivity()
+            menu.report("生活活动已停止。")
         } catch {
+            menu.report("活动未能停止：\(error.localizedDescription)")
             livingWorldLogger.error(
                 "停止生活活动失败：\(error.localizedDescription, privacy: .public)"
             )
@@ -968,6 +1008,11 @@ final class AppDelegate:
         }
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
+    }
+
+    func openPresenceSettings() {
+        GMGNSettingsNavigation.shared.page = .presence
+        openSystemSettings()
     }
 
     func openSystemSettings() {
@@ -1972,7 +2017,8 @@ final class AppDelegate:
             )
             livingWorldContext = context
             LivingWorldActivityMenuStore.shared.update(
-                definitions: context.manifest.activityDefinitions
+                definitions: context.manifest.activityDefinitions,
+                worldID: context.manifest.worldID
             )
             stageAvatarActivityExecutor = avatarExecutor
             worldAgentToolDispatcher = WorldAgentToolDispatcher(
@@ -2156,6 +2202,7 @@ final class AppDelegate:
     }
 
     private func applyLivingWorldSnapshot(_ snapshot: WorldAgentSnapshot) {
+        LivingWorldActivityMenuStore.shared.updateActiveActivity(id: snapshot.activeActivity?.id)
         performLivingCabinJukeboxEffect(snapshot)
         let spatialWeather: SpatialWeather = switch snapshot.weather {
         case .clear, .cloudy:
@@ -2376,6 +2423,15 @@ final class AppDelegate:
             },
             onToggleVoice: { [weak self] in
                 self?.toggleRealtimeVoiceFromStage()
+            },
+            onRunActivity: { [weak self] id in
+                self?.runLivingWorldActivity(id: id)
+            },
+            onStopActivity: { [weak self] in
+                self?.stopLivingWorldActivity()
+            },
+            onManageAssets: { [weak self] in
+                self?.openPresenceSettings()
             }
         )
         if let stageWindowController {

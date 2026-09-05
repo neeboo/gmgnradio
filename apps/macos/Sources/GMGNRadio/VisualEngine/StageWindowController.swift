@@ -35,6 +35,9 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     private let onNextTrack: @MainActor () -> Void
     private let onReplanProgram: @MainActor () -> Void
     private let onToggleVoice: @MainActor () -> Void
+    private let onRunActivity: @MainActor (String) -> Void
+    private let onStopActivity: @MainActor () -> Void
+    private let onManageAssets: @MainActor () -> Void
     private var playbackState: LocalMusicPlaybackState
     private var voiceState: RealtimeVoiceConnectionState
     private weak var stageContentView: StageContentView?
@@ -73,7 +76,10 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         onPreviousTrack: @escaping @MainActor () -> Void = {},
         onNextTrack: @escaping @MainActor () -> Void = {},
         onReplanProgram: @escaping @MainActor () -> Void = {},
-        onToggleVoice: @escaping @MainActor () -> Void = {}
+        onToggleVoice: @escaping @MainActor () -> Void = {},
+        onRunActivity: @escaping @MainActor (String) -> Void = { _ in },
+        onStopActivity: @escaping @MainActor () -> Void = {},
+        onManageAssets: @escaping @MainActor () -> Void = {}
     ) {
         self.audioFeatures = audioFeatures
         self.artwork = artwork
@@ -109,6 +115,9 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         self.onNextTrack = onNextTrack
         self.onReplanProgram = onReplanProgram
         self.onToggleVoice = onToggleVoice
+        self.onRunActivity = onRunActivity
+        self.onStopActivity = onStopActivity
+        self.onManageAssets = onManageAssets
         super.init(window: nil)
     }
 
@@ -296,6 +305,9 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
             onNextTrack: onNextTrack,
             onReplanProgram: onReplanProgram,
             onToggleVoice: onToggleVoice,
+            onRunActivity: onRunActivity,
+            onStopActivity: onStopActivity,
+            onManageAssets: onManageAssets,
             onEnterSpace: { [weak self] in
                 self?.onWillPresentSpaceHandler?()
             },
@@ -460,6 +472,9 @@ private final class StageContentView: NSView {
         onNextTrack: @escaping @MainActor () -> Void,
         onReplanProgram: @escaping @MainActor () -> Void,
         onToggleVoice: @escaping @MainActor () -> Void,
+        onRunActivity: @escaping @MainActor (String) -> Void,
+        onStopActivity: @escaping @MainActor () -> Void,
+        onManageAssets: @escaping @MainActor () -> Void,
         onEnterSpace: @escaping @MainActor () -> Void,
         onShowPlayer: @escaping @MainActor () -> Void,
         onToggleWindowMode: @escaping @MainActor () -> Void
@@ -616,7 +631,11 @@ private final class StageContentView: NSView {
                 videos: videos,
                 programStore: programStore,
                 spatialStage: spatialStage,
-                marbleLibrary: marbleLibrary
+                marbleLibrary: marbleLibrary,
+                avatarRuntime: avatarRuntime,
+                onRunActivity: onRunActivity,
+                onStopActivity: onStopActivity,
+                onManageAssets: onManageAssets
             )
         )
         visualPicker.identifier = NSUserInterfaceItemIdentifier(
@@ -649,6 +668,15 @@ private final class StageContentView: NSView {
         destinationButton.layer?.zPosition = 21
         addSubview(destinationButton)
 
+        let preferredPanelWidth = visualPicker.widthAnchor.constraint(
+            equalToConstant: StageControlPanelLayout.maximumWidth
+        )
+        let preferredPanelHeight = visualPicker.heightAnchor.constraint(
+            equalToConstant: StageControlPanelLayout.maximumHeight
+        )
+        preferredPanelWidth.priority = .defaultHigh
+        preferredPanelHeight.priority = .defaultHigh
+
         NSLayoutConstraint.activate([
             transportControls.trailingAnchor.constraint(
                 equalTo: trailingAnchor,
@@ -658,7 +686,7 @@ private final class StageContentView: NSView {
                 equalTo: bottomAnchor,
                 constant: -22
             ),
-            transportControls.widthAnchor.constraint(equalToConstant: 322),
+            transportControls.widthAnchor.constraint(equalToConstant: StageControlPanelLayout.transportWidth),
             transportControls.heightAnchor.constraint(equalToConstant: 48),
 
             programRail.trailingAnchor.constraint(
@@ -681,8 +709,12 @@ private final class StageContentView: NSView {
                 equalTo: transportControls.topAnchor,
                 constant: -10
             ),
-            visualPicker.widthAnchor.constraint(equalToConstant: 590),
-            visualPicker.heightAnchor.constraint(equalToConstant: 458),
+            visualPicker.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 18),
+            visualPicker.topAnchor.constraint(greaterThanOrEqualTo: topAnchor, constant: 12),
+            visualPicker.widthAnchor.constraint(lessThanOrEqualToConstant: StageControlPanelLayout.maximumWidth),
+            visualPicker.heightAnchor.constraint(lessThanOrEqualToConstant: StageControlPanelLayout.maximumHeight),
+            preferredPanelWidth,
+            preferredPanelHeight,
 
             destinationButton.trailingAnchor.constraint(
                 equalTo: trailingAnchor,
@@ -1273,15 +1305,14 @@ private final class StageTransportControlsView: NSVisualEffectView {
 
             visualButton.leadingAnchor.constraint(
                 equalTo: leadingAnchor,
-                constant: 229
+                constant: StageControlPanelLayout.settingsLeading
             ),
             visualButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            visualButton.widthAnchor.constraint(equalToConstant: 44),
+            visualButton.widthAnchor.constraint(equalToConstant: StageControlPanelLayout.settingsWidth),
             visualButton.heightAnchor.constraint(equalToConstant: 44),
 
             dividers[5].leadingAnchor.constraint(
-                equalTo: leadingAnchor,
-                constant: 273
+                equalTo: visualButton.trailingAnchor
             ),
             dividers[5].centerYAnchor.constraint(equalTo: centerYAnchor),
             dividers[5].widthAnchor.constraint(equalToConstant: 1),
@@ -1348,7 +1379,9 @@ private final class StageVisualButton: NSButton {
         target = self
         self.action = #selector(performAction)
         isBordered = false
-        imagePosition = .imageOnly
+        imagePosition = .imageLeading
+        title = "设置"
+        font = .systemFont(ofSize: 11, weight: .medium)
         focusRingType = .none
         wantsLayer = true
         layer?.cornerRadius = 20
@@ -1379,11 +1412,11 @@ private final class StageVisualButton: NSButton {
         let collapsedLabel: String
         switch stageMode {
         case .space:
-            collapsedLabel = "选择空间与人物位置"
+            collapsedLabel = "空间设置：环境、角色动作与生活活动"
         case .player:
-            collapsedLabel = "选择字幕、点阵与 MV"
+            collapsedLabel = "播放器设置：字幕、点阵、MV 与角色动作"
         }
-        let label = isExpanded ? "收起视觉选择" : collapsedLabel
+        let label = isExpanded ? "收起设置" : collapsedLabel
         let configuration = NSImage.SymbolConfiguration(
             pointSize: 14,
             weight: .medium

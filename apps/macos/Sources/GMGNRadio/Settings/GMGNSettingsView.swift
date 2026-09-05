@@ -8,6 +8,12 @@ enum GMGNSettingsPage: String, CaseIterable {
     case agent = "DJ"
 }
 
+@MainActor
+final class GMGNSettingsNavigation: ObservableObject {
+    static let shared = GMGNSettingsNavigation()
+    @Published var page = GMGNSettingsPage.presence
+}
+
 enum GMGNSettingsSpacePage {
     /// 系统设置只保留默认空间和长期服务配置；颗粒大小等场景调节只在完整舞台的面板出现。
     static let sectionTitles = ["默认空间", "Marble 空间"]
@@ -57,7 +63,7 @@ enum DefaultSpacePreference: String, CaseIterable, Identifiable {
 
 @MainActor
 struct GMGNSettingsView: View {
-    @State private var page = GMGNSettingsPage.presence
+    @ObservedObject private var navigation = GMGNSettingsNavigation.shared
     @State private var marbleAPIKey = MarbleAPIKeySettingsModel()
     @ObservedObject private var shortcutSettings: GMGNShortcutSettingsStore
     private let connectRealtimeVoice:
@@ -80,7 +86,7 @@ struct GMGNSettingsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Picker("设置", selection: $page) {
+            Picker("设置", selection: $navigation.page) {
                 ForEach(GMGNSettingsPage.allCases, id: \.self) { page in
                     Text(page.rawValue).tag(page)
                 }
@@ -92,7 +98,7 @@ struct GMGNSettingsView: View {
             .padding(.bottom, 8)
 
             Group {
-                switch page {
+                switch navigation.page {
                 case .presence:
                     PresenceSettingsView()
                 case .music:
