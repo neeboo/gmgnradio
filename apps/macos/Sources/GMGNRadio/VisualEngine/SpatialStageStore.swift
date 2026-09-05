@@ -536,7 +536,11 @@ struct SpatialCameraState: Equatable, Sendable {
     }
 
     mutating func move(_ direction: SpatialMovement, distance: Float) {
-        let forward = SIMD3<Float>(-sin(yaw), 0, -cos(yaw))
+        let forward = SIMD3<Float>(
+            -sin(yaw) * cos(pitch),
+            sin(pitch),
+            -cos(yaw) * cos(pitch)
+        )
         let right = SIMD3<Float>(cos(yaw), 0, -sin(yaw))
         switch direction {
         case .forward:

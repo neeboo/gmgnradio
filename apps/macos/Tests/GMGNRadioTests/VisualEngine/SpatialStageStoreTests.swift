@@ -6,6 +6,36 @@ import WorldRuntime
 @testable import GMGNRadio
 
 @Test
+func cameraForwardMovementFollowsPitchAtConstantSpeed() {
+    let origin = SIMD3<Float>(2, 3, 4)
+    for pitch: Float in [-1.2, -0.6, 0, 0.6, 1.2] {
+        for yaw: Float in [-1.4, 0, 1.4] {
+            var camera = SpatialCameraState(position: origin, yaw: yaw, pitch: pitch)
+            camera.move(.forward, distance: 2.5)
+            let delta = camera.position - origin
+            #expect(abs(delta.y - sin(pitch) * 2.5) < 0.00001)
+            #expect(abs(delta.x + sin(yaw) * cos(pitch) * 2.5) < 0.00001)
+            #expect(abs(delta.z + cos(yaw) * cos(pitch) * 2.5) < 0.00001)
+            #expect(abs(simd_length(delta) - 2.5) < 0.00001)
+            camera.move(.backward, distance: 2.5)
+            #expect(simd_distance(camera.position, origin) < 0.00001)
+        }
+    }
+}
+
+@Test
+func cameraLateralMovementStaysHorizontalWhileLookingUpOrDown() {
+    for pitch: Float in [-1.2, 1.2] {
+        for direction in [SpatialMovement.left, .right] {
+            var camera = SpatialCameraState(position: .zero, yaw: 0.7, pitch: pitch)
+            camera.move(direction, distance: 2.5)
+            #expect(camera.position.y == 0)
+            #expect(abs(simd_length(camera.position) - 2.5) < 0.00001)
+        }
+    }
+}
+
+@Test
 func spatialAvatarUsesOnlyPreparedMeshOccluderDepth() {
     #expect(MarbleSpatialDepthPolicy.usesAlphaAwareDepth)
     #expect(MarbleSpatialDepthPolicy.avatarUsesSceneDepth)

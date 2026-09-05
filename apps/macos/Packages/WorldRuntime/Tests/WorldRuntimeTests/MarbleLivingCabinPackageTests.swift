@@ -93,6 +93,7 @@ func marbleCabinRealMeshSupportsAuthoredTour() throws {
     #expect(abs(deviceGround - jukebox.y) < 0.01)
 
     let camera = SIMD3(config.camera.position[0], config.camera.position[1], config.camera.position[2])
+    #expect(abs(camera.y - 1.65) < 0.01, "Default cabin camera starts at standing eye height")
     let cameraProbe = WorldCapsule(radius: 0.05, height: 0.1)
     #expect(mesh.canOccupy(cameraProbe, at: camera - SIMD3(0, 0.05, 0)))
     #expect(mesh.canOccupy(cameraProbe, at: camera + SIMD3(0, 0.15, 0)))

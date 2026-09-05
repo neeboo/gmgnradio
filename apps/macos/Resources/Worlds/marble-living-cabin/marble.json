@@ -69,11 +69,11 @@
   "camera": {
     "position": [
       -1,
-      2.15,
+      1.65,
       1.5
     ],
     "yaw": -0.124355,
-    "pitch": -0.29
+    "pitch": -0.16
   },
   "jukebox": {
     "position": [

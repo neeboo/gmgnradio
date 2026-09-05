@@ -834,6 +834,7 @@ private final class StageWorldInteractionView: NSView {
     init(spatialStage: SpatialStageStore) {
         self.spatialStage = spatialStage
         super.init(frame: .zero)
+        toolTip = "拖动鼠标调整视角；W/S 沿视线前后移动，A/D 左右移动；双击复位"
     }
 
     required init?(coder: NSCoder) {
