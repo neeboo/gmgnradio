@@ -23,10 +23,30 @@ final class StageResidentChatState: ObservableObject {
     func cancel() { showStatus("已停止本次回复。") }
 }
 
+/// Separate from the reply so a failed voice request never hides readable text.
+@MainActor
+struct ResidentSpeechErrorNotice: View {
+    private let status = AgentSpeechStatusStore.shared
+
+    var body: some View {
+        if let message = status.lastErrorMessage, !message.isEmpty {
+            Label(message, systemImage: "speaker.slash")
+                .font(.system(size: 11))
+                .foregroundStyle(.orange.opacity(0.95))
+                .lineLimit(3)
+                .help(message)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(10)
+                .background(Color(white: 0.1).opacity(0.96), in: RoundedRectangle(cornerRadius: 10))
+        }
+    }
+}
+
 /// A quiet, native input surface shared with the resident's existing session.
 @MainActor
 struct StageResidentComposer: View {
     @ObservedObject var state: StageResidentChatState
+    private let speechStatus = AgentSpeechStatusStore.shared
     let onSendMessage: @MainActor (String) async -> Void
     let onCancelMessage: @MainActor () -> Void
     let onToggleVoice: @MainActor () -> Void
@@ -35,6 +55,7 @@ struct StageResidentComposer: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            ResidentSpeechErrorNotice()
             if !state.reply.isEmpty {
                 HStack(alignment: .top, spacing: 12) {
                     ScrollView {
@@ -92,24 +113,17 @@ struct StageResidentComposer: View {
                     .foregroundStyle(state.voiceActive ? Color.cyan : .white.opacity(0.72))
                     .help(state.voiceActive ? "结束语音输入" : "语音输入")
                     .accessibilityLabel(state.voiceActive ? "结束语音输入" : "语音输入")
-                    Button {
-                        if state.isThinking {
-                            state.cancel()
-                            onCancelMessage()
-                        } else {
-                            submit()
-                        }
-                    } label: {
-                        Image(systemName: state.isThinking ? "stop.fill" : "arrow.up")
-                            .font(.system(size: state.isThinking ? 11 : 15, weight: .semibold))
+                    Button(action: performPrimaryAction) {
+                        Image(systemName: canStopReply ? "stop.fill" : "arrow.up")
+                            .font(.system(size: canStopReply ? 11 : 15, weight: .semibold))
                             .foregroundStyle(Color(white: 0.14))
                             .frame(width: 30, height: 30)
                             .background(.white.opacity(canSubmit ? 0.92 : 0.25), in: Circle())
                     }
                     .buttonStyle(.plain)
                     .disabled(!canSubmit)
-                    .help(state.isThinking ? "停止回复" : "发送消息")
-                    .accessibilityLabel(state.isThinking ? "停止回复" : "发送消息")
+                    .help(primaryActionLabel)
+                    .accessibilityLabel(primaryActionLabel)
                 }
             }
             .padding(15)
@@ -124,7 +138,24 @@ struct StageResidentComposer: View {
     }
 
     private var canSubmit: Bool {
-        state.isThinking || !state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        canStopReply || !state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var canStopReply: Bool {
+        state.isThinking || speechStatus.isSpeaking
+    }
+
+    private var primaryActionLabel: String {
+        state.isThinking ? "停止回复" : speechStatus.isSpeaking ? "停止朗读" : "发送消息"
+    }
+
+    private func performPrimaryAction() {
+        if canStopReply {
+            if state.isThinking { state.cancel() }
+            onCancelMessage()
+        } else {
+            submit()
+        }
     }
 
     private func submit() {

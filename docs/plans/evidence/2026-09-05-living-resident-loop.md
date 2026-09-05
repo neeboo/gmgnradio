@@ -163,3 +163,31 @@
 启动后的进程编号为 `24206`，实际执行路径为 `/Applications/gmgn radio.app/Contents/MacOS/gmgn radio`。日志确认 19:59:30 开始载入正式生活舱，19:59:37 安装角色位置，19:59:38 GLB 接管碰撞与遮挡（161600 个三角形）；再次检查进程仍存活。Codex 入口仍为 `0.153.4`。
 
 本次未使用桌面自动化、截图或替用户发送应用内聊天，没有播放音乐。启动及加载日志不能代替用户对最终画面、实际出声和聊天交互的验收。
+
+## 空间折叠输入与百炼 TTS
+
+用户确认使用空间麦克风后，代码检查发现其仍连接旧实时 DJ，最终转写只进入音乐意图处理，未进入居民聊天。此处依据入口代码与用户描述定位，没有取得用户那次录音或据日志还原具体话语。
+
+本次改为单句语音识别：百炼 Qwen3 ASR 只转写，最终稿先关闭录音与识别连接，再调用与文字相同的 `sendLiveCamMessage`。同一个 Agent 会话负责理解、世界工具和回答；语音服务不再生成第二份回答或调用世界工具。取消、重复与过期结果均不送入聊天。
+
+空间右下角固定控制条增加聊天按钮，默认收起，展开后提供文字、麦克风和发送／停止。收起保留草稿与回复，输入不触发摄像机快捷键。该基础界面提交为 `905c747`；随后增加的语音错误提示与朗读停止包含在本次后续改动中。
+
+按用户追加要求，默认回复声音接百炼 `qwen3-tts-flash` 独立合成接口。提供 Cherry、Serena、Ethan、Chelsie 四种匹配音色，配置与思考后端分开；每段最多 600 个 Unicode 标量，长回复按句顺序合成、下载和播放。停止会取消合成或播放并丢弃后续片段，保留回复文字。合成错误在空间和 Live Cam 独立显示，不静默切换系统朗读。
+
+接口依据：[百炼语音识别客户端事件](https://help.aliyun.com/zh/model-studio/qwen-asr-realtime-client-events)、[非实时 TTS 接口](https://help.aliyun.com/zh/model-studio/qwen-tts-api)、[TTS 音色列表](https://help.aliyun.com/zh/model-studio/qwen-tts-voice-list)。API 密钥只用于合成请求，音频下载不携带密钥；下载使用 HTTPS，拒绝重定向。未读取真实密钥作诊断，也未访问钥匙串。
+
+独立审查发现并修复：断开后迟到的音频进入旧 DJ 分支、旧录音清理影响新录音、关闭前等待握手造成阻塞、最终稿取消自身，以及监听完成后仍等待事件。回归先复现再修复；最终独立复审无 P1/P2 遗留问题。
+
+主任务在最终代码上串行运行十组无宿主测试，全部退出码 0：
+
+- `tools/test-resident-voice-input.swift`：17 项，含真实 App 事件方法、关闭顺序、取消、重复、默认配置和监听退出。
+- `tools/test-resident-asr-wire.swift`：25 项，真实转写传输、协议与映射，替换网络和音频硬件边界。
+- `tools/test-bailian-agent-tts.swift`：27 项，真实合成逻辑、分段、取消、播放状态和凭据边界；网络与播放使用测试替身。
+- `tools/test-stage-resident-chat.swift`：23 项，输入状态、折叠和真实界面类型检查。
+- `tools/test-resident-speech-notice.swift`：实际观察错误出现／清除，检查两处聊天均保留回复。
+- `tools/test-living-resident-loop.swift`：164 项居民会话回归。
+- 摄像机、空间显示、控制面板和活动控制四组既有回归全部通过。
+
+旧系统朗读实现仍有 `NSSpeechSynthesizer` 弃用警告，本次百炼默认链路不使用它。没有执行真实 ASR/TTS 请求、录音、音频硬件播放、桌面自动化或宿主测试；这些测试不能代替用户实际说话与试听。口型同步、其它语音供应商和自定义服务仍未完成。豆包、Fish Audio、ElevenLabs 与高级自定义服务已写入第一阶段计划任务 6A，本轮不实现。
+
+最终完整应用构建退出码 0，结果 `BUILD SUCCEEDED`。日志：`/tmp/gmgn-speech-composer.C0dAgN/build.log`。使用单任务、低优先级编译，关闭签名操作；未安装或重启 `/Applications/gmgn radio.app`，已运行版本不会因这次构建自动更新。

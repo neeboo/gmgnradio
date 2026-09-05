@@ -1,28 +1,56 @@
 import Foundation
 import os
 
+enum BailianSessionPurpose: String, Codable, Sendable {
+    case dj
+    case residentTranscription
+}
+
 struct BailianSessionPayload: Codable, Equatable, Sendable {
     let apiKey: String
     let model: String
     let voiceID: String
     let microphoneDeviceID: String?
+    let purpose: BailianSessionPurpose
+
+    var effectiveModel: String {
+        purpose == .residentTranscription ? "qwen3-asr-flash-realtime" : model
+    }
 
     init(
         apiKey: String,
         model: String,
         voiceID: String,
-        microphoneDeviceID: String? = nil
+        microphoneDeviceID: String? = nil,
+        purpose: BailianSessionPurpose = .dj
     ) {
         self.apiKey = apiKey
         self.model = model
         self.voiceID = voiceID
         self.microphoneDeviceID = microphoneDeviceID
+        self.purpose = purpose
+    }
+
+    private enum CodingKeys: String, CodingKey { case apiKey, model, voiceID, microphoneDeviceID, purpose }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        apiKey = try values.decode(String.self, forKey: .apiKey)
+        model = try values.decode(String.self, forKey: .model)
+        voiceID = try values.decode(String.self, forKey: .voiceID)
+        microphoneDeviceID = try values.decodeIfPresent(String.self, forKey: .microphoneDeviceID)
+        purpose = try values.decodeIfPresent(BailianSessionPurpose.self, forKey: .purpose) ?? .dj
     }
 }
 
 struct BailianDecodedMessage: Equatable, Sendable {
     let event: ProviderRealtimeEvent
     let audio: Data?
+    let itemID: String?
+
+    init(event: ProviderRealtimeEvent, audio: Data?, itemID: String? = nil) {
+        self.event = event; self.audio = audio; self.itemID = itemID
+    }
 }
 
 enum BailianRealtimeWireProtocolError: LocalizedError {
@@ -52,7 +80,7 @@ enum BailianRealtimeWireProtocol {
             throw BailianRealtimeWireProtocolError.invalidEndpoint
         }
         components.queryItems = [
-            URLQueryItem(name: "model", value: payload.model)
+            URLQueryItem(name: "model", value: payload.effectiveModel)
         ]
         guard let url = components.url else {
             throw BailianRealtimeWireProtocolError.invalidEndpoint
@@ -70,6 +98,15 @@ enum BailianRealtimeWireProtocol {
         instructions: String,
         providerTools: [[String: Any]] = DJAgentCapabilityManifest.providerTools
     ) throws -> Data {
+        if payload.purpose == .residentTranscription {
+            return try JSONSerialization.data(withJSONObject: [
+                "event_id": eventID(), "type": "session.update",
+                "session": [
+                    "input_audio_format": "pcm", "sample_rate": 16_000,
+                    "turn_detection": ["type": "server_vad", "threshold": 0.2, "silence_duration_ms": 650],
+                ],
+            ])
+        }
         let vadType = payload.model.hasPrefix("qwen3.5-")
             ? "semantic_vad"
             : "server_vad"
@@ -170,7 +207,8 @@ enum BailianRealtimeWireProtocol {
         }
 
         let text: String? = switch type {
-        case "conversation.item.input_audio_transcription.delta":
+        case "conversation.item.input_audio_transcription.delta",
+             "conversation.item.input_audio_transcription.text":
             (object["text"] as? String ?? "")
                 + (object["stash"] as? String ?? "")
         case "conversation.item.input_audio_transcription.completed",
@@ -199,7 +237,8 @@ enum BailianRealtimeWireProtocol {
         )
         return BailianDecodedMessage(
             event: event,
-            audio: type == "response.audio.delta" ? audio : nil
+            audio: type == "response.audio.delta" ? audio : nil,
+            itemID: object["item_id"] as? String
         )
     }
 
@@ -296,6 +335,7 @@ enum BailianRealtimeTransportError: LocalizedError {
     case notConnected
     case connectionClosed
     case serverRejected(String)
+    case transcriptionOnly
 
     var errorDescription: String? {
         switch self {
@@ -303,6 +343,8 @@ enum BailianRealtimeTransportError: LocalizedError {
             "百炼实时语音尚未连接。"
         case .connectionClosed:
             "百炼实时语音连接已断开。"
+        case .transcriptionOnly:
+            "居民语音入口只负责转写，请通过聊天会话处理回复和动作。"
         case let .serverRejected(message):
             message.isEmpty
                 ? "百炼拒绝了实时语音连接，请检查 API Key。"
@@ -311,12 +353,42 @@ enum BailianRealtimeTransportError: LocalizedError {
     }
 }
 
+@MainActor protocol BailianWebSocketConnection: AnyObject {
+    func send(_ data: Data) async throws
+    func receive() async throws -> Data
+    func close()
+}
+
+@MainActor final class BailianURLSessionWebSocketConnection: BailianWebSocketConnection {
+    private let session: URLSession
+    private let task: URLSessionWebSocketTask
+
+    init(request: URLRequest) {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 12
+        session = URLSession(configuration: configuration)
+        task = session.webSocketTask(with: request)
+        task.resume()
+    }
+
+    func send(_ data: Data) async throws { try await task.send(.string(String(decoding: data, as: UTF8.self))) }
+    func receive() async throws -> Data {
+        switch try await task.receive() {
+        case .data(let data): return data
+        case .string(let text): return Data(text.utf8)
+        @unknown default: throw BailianRealtimeWireProtocolError.invalidMessage
+        }
+    }
+    func close() { task.cancel(with: .goingAway, reason: nil); session.invalidateAndCancel() }
+}
+
 @MainActor
 final class BailianWebSocketRealtimeTransport:
     BailianRealtimeTransport
 {
     private let audioGraph: AudioGraphController
     private let providerTools: [[String: Any]]
+    private let connectionFactory: (URLRequest) -> any BailianWebSocketConnection
     private let promptBuilder = DJRealtimePromptBuilder()
     private let logger = Logger(
         subsystem: ProductIdentity.bundleIdentifier,
@@ -326,8 +398,7 @@ final class BailianWebSocketRealtimeTransport:
     private let eventContinuation:
         AsyncStream<ProviderRealtimeEvent>.Continuation
 
-    private var urlSession: URLSession?
-    private var webSocketTask: URLSessionWebSocketTask?
+    private var webSocketTask: (any BailianWebSocketConnection)?
     private var receiveTask: Task<Void, Never>?
     private var payload: BailianSessionPayload?
     private var connected = false
@@ -337,13 +408,17 @@ final class BailianWebSocketRealtimeTransport:
     private var microphonePCM = BailianPCMChunkAccumulator()
     private var agentResponseActive = false
     private var microphoneEchoGate = BailianMicrophoneEchoGate()
+    private var completedTranscriptionItems = Set<String>()
+    private var connectionGeneration = UUID()
 
     init(
         audioGraph: AudioGraphController,
-        providerTools: [[String: Any]] = DJAgentCapabilityManifest.providerTools
+        providerTools: [[String: Any]] = DJAgentCapabilityManifest.providerTools,
+        connectionFactory: @escaping (URLRequest) -> any BailianWebSocketConnection = { BailianURLSessionWebSocketConnection(request: $0) }
     ) {
         self.audioGraph = audioGraph
         self.providerTools = providerTools
+        self.connectionFactory = connectionFactory
         (events, eventContinuation) = AsyncStream.makeStream()
     }
 
@@ -353,35 +428,29 @@ final class BailianWebSocketRealtimeTransport:
 
     func connect(payload: BailianSessionPayload) async throws {
         await disconnect()
+        let generation = connectionGeneration
         self.payload = payload
         eventContinuation.yield(ProviderRealtimeEvent(
             type: "connection.connecting"
         ))
 
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 12
-        let session = URLSession(configuration: configuration)
-        let task = session.webSocketTask(
-            with: try BailianRealtimeWireProtocol.makeRequest(
-                payload: payload
-            )
-        )
-        urlSession = session
+        let task = connectionFactory(try BailianRealtimeWireProtocol.makeRequest(payload: payload))
         webSocketTask = task
-        task.resume()
 
         do {
             try await send(
                 BailianRealtimeWireProtocol.sessionUpdateData(
                     payload: payload,
-                    instructions: try promptBuilder.build(context: nil),
+                    instructions: payload.purpose == .residentTranscription ? "" : try promptBuilder.build(context: nil),
                     providerTools: providerTools
                 ),
                 through: task
             )
 
             while true {
+                guard isCurrent(generation) else { throw CancellationError() }
                 let decoded = try await receive(from: task)
+                guard isCurrent(generation) else { throw CancellationError() }
                 try process(decoded)
                 if decoded.event.type == "session.updated" {
                     connected = true
@@ -402,10 +471,10 @@ final class BailianWebSocketRealtimeTransport:
                 guard let self, let task else {
                     return
                 }
-                await self.receiveLoop(task)
+                await self.receiveLoop(task, generation: generation)
             }
         } catch {
-            await disconnect()
+            if connectionGeneration == generation { await disconnect() }
             throw error
         }
     }
@@ -414,6 +483,7 @@ final class BailianWebSocketRealtimeTransport:
         guard let payload else {
             throw BailianRealtimeTransportError.notConnected
         }
+        guard payload.purpose != .residentTranscription else { return }
         let realtimeContext = try JSONDecoder().decode(
             RealtimeDJContext.self,
             from: context
@@ -435,6 +505,7 @@ final class BailianWebSocketRealtimeTransport:
             return
         }
         if enabled {
+            let generation = connectionGeneration
             try audioGraph.startBailianMicrophoneCapture(
                 preferredDeviceID: payload?.microphoneDeviceID
             ) {
@@ -442,7 +513,8 @@ final class BailianWebSocketRealtimeTransport:
                 Task { @MainActor [weak self] in
                     await self?.handleMicrophoneData(
                         data,
-                        level: level
+                        level: level,
+                        generation: generation
                     )
                 }
             }
@@ -456,12 +528,14 @@ final class BailianWebSocketRealtimeTransport:
         _ enabled: Bool
     ) async throws {
         microphoneTransmissionEnabled = enabled
+        if !enabled { microphonePCM.reset() }
     }
 
     func interrupt() async throws {
         guard connected else {
             throw BailianRealtimeTransportError.notConnected
         }
+        guard payload?.purpose != .residentTranscription else { return }
         audioGraph.stopDJVoice()
         for data in try BailianRealtimeWireProtocol.interruptionData(
             agentResponseActive: agentResponseActive
@@ -473,6 +547,7 @@ final class BailianWebSocketRealtimeTransport:
     }
 
     func requestAgentResponse(_ instruction: String) async throws {
+        guard payload?.purpose != .residentTranscription else { throw BailianRealtimeTransportError.transcriptionOnly }
         guard connected else {
             throw BailianRealtimeTransportError.notConnected
         }
@@ -487,6 +562,7 @@ final class BailianWebSocketRealtimeTransport:
     func submitToolResult(
         _ result: RealtimeDJToolResult
     ) async throws {
+        guard payload?.purpose != .residentTranscription else { throw BailianRealtimeTransportError.transcriptionOnly }
         try await send(
             BailianRealtimeWireProtocol.toolResultData(result)
         )
@@ -496,6 +572,7 @@ final class BailianWebSocketRealtimeTransport:
     }
 
     func disconnect() async {
+        connectionGeneration = UUID()
         receiveTask?.cancel()
         receiveTask = nil
         audioGraph.stopBailianMicrophoneCapture()
@@ -505,22 +582,20 @@ final class BailianWebSocketRealtimeTransport:
         microphonePCM.reset()
         agentResponseActive = false
         microphoneEchoGate.reset()
+        completedTranscriptionItems.removeAll()
         connected = false
         payload = nil
 
-        webSocketTask?.cancel(
-            with: .goingAway,
-            reason: nil
-        )
+        webSocketTask?.close()
         webSocketTask = nil
-        urlSession?.invalidateAndCancel()
-        urlSession = nil
     }
 
     private func handleMicrophoneData(
         _ data: Data,
-        level: RealtimeDJAudioLevel
+        level: RealtimeDJAudioLevel,
+        generation: UUID
     ) async {
+        guard isCurrent(generation), microphoneCaptureEnabled else { return }
         eventContinuation.yield(ProviderRealtimeEvent(
             type: "audio.user.level",
             rms: level.rms,
@@ -534,6 +609,7 @@ final class BailianWebSocketRealtimeTransport:
         }
         guard
             connected,
+            let task = webSocketTask,
             microphoneTransmissionEnabled,
             !agentResponseActive,
             microphoneEchoGate.allowsTransmission()
@@ -541,11 +617,15 @@ final class BailianWebSocketRealtimeTransport:
             return
         }
         for frame in microphonePCM.append(data) {
+            guard isCurrent(generation), connected, microphoneTransmissionEnabled else { return }
             do {
                 try await send(
-                    BailianRealtimeWireProtocol.inputAudioData(frame)
+                    BailianRealtimeWireProtocol.inputAudioData(frame),
+                    through: task
                 )
+                guard isCurrent(generation), microphoneTransmissionEnabled else { return }
             } catch {
+                guard isCurrent(generation) else { return }
                 failConnection(error)
                 return
             }
@@ -553,11 +633,13 @@ final class BailianWebSocketRealtimeTransport:
     }
 
     private func receiveLoop(
-        _ task: URLSessionWebSocketTask
+        _ task: any BailianWebSocketConnection,
+        generation: UUID
     ) async {
         do {
-            while !Task.isCancelled {
+            while isCurrent(generation) {
                 let decoded = try await receive(from: task)
+                guard isCurrent(generation) else { return }
                 try process(decoded)
                 if decoded.event.type == "error" {
                     throw BailianRealtimeTransportError.serverRejected(
@@ -568,13 +650,26 @@ final class BailianWebSocketRealtimeTransport:
         } catch is CancellationError {
             return
         } catch {
+            guard isCurrent(generation) else { return }
             failConnection(error)
         }
+    }
+
+    private func isCurrent(_ generation: UUID) -> Bool {
+        generation == connectionGeneration && !Task.isCancelled
     }
 
     private func process(
         _ decoded: BailianDecodedMessage
     ) throws {
+        if payload?.purpose == .residentTranscription {
+            // ASR is never a second responder or an alternate path to world tools.
+            guard !decoded.event.type.hasPrefix("response."), decoded.audio == nil else { return }
+            if decoded.event.type == "conversation.item.input_audio_transcription.completed",
+               let itemID = decoded.itemID, !completedTranscriptionItems.insert(itemID).inserted { return }
+            eventContinuation.yield(decoded.event)
+            return
+        }
         if ![
             "response.audio.delta",
             "response.audio_transcript.delta",
@@ -654,17 +749,9 @@ final class BailianWebSocketRealtimeTransport:
     }
 
     private func receive(
-        from task: URLSessionWebSocketTask
+        from task: any BailianWebSocketConnection
     ) async throws -> BailianDecodedMessage {
-        let message = try await task.receive()
-        let data: Data = switch message {
-        case let .data(data):
-            data
-        case let .string(text):
-            Data(text.utf8)
-        @unknown default:
-            throw BailianRealtimeWireProtocolError.invalidMessage
-        }
+        let data = try await task.receive()
         return try BailianRealtimeWireProtocol.decode(data)
     }
 
@@ -677,11 +764,9 @@ final class BailianWebSocketRealtimeTransport:
 
     private func send(
         _ data: Data,
-        through task: URLSessionWebSocketTask
+        through task: any BailianWebSocketConnection
     ) async throws {
-        try await task.send(
-            .string(String(decoding: data, as: UTF8.self))
-        )
+        try await task.send(data)
     }
 }
 
@@ -798,10 +883,13 @@ struct BailianRealtimeEventMapper: Sendable {
             return [.userSpeechStarted]
         case "input_audio_buffer.speech_stopped":
             return [.userSpeechFinished]
-        case "conversation.item.input_audio_transcription.delta":
+        case "conversation.item.input_audio_transcription.delta",
+             "conversation.item.input_audio_transcription.text":
             return event.text.map { [.userTranscriptDelta($0)] } ?? []
         case "conversation.item.input_audio_transcription.completed":
             return event.text.map { [.userTranscriptFinal($0)] } ?? []
+        case "conversation.item.input_audio_transcription.failed":
+            return [.failure(failure(from: event, defaultCode: "bailian_transcription_failed"))]
         case "response.created":
             return [.agentResponseStarted]
         case "response.audio.delta":

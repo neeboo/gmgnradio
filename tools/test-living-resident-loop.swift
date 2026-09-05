@@ -137,6 +137,7 @@ typealias RealConversationService = AgentConversationService
     var isEnabled = false
     var spoken: [String] = []
     func announce(_ reply: String) { spoken.append(reply) }
+    func stop() {}
 }
 @MainActor final class AppHarness {
     // Resolve the production method's singleton lookup to the injected real
@@ -145,6 +146,17 @@ typealias RealConversationService = AgentConversationService
     private var liveCamMessageID: UUID?
     private var residentActivityOutcome: ResidentActivityOutcome?
     var liveCamWindowController: Surface? = Surface()
+    final class StageReply {
+        func beginResidentReply() {}
+        func finishResidentReply(_ text: String) {}
+        func showResidentChatStatus(_ text: String) {}
+    }
+    var stageWindowController: StageReply? = StageReply()
+    func disconnectRealtimeVoice() { agentSpeechAnnouncer.stop() }
+    func showResidentVoiceStatus(_ text: String) {
+        liveCamWindowController?.showChatStatus(text)
+        stageWindowController?.showResidentChatStatus(text)
+    }
     var agentSpeechAnnouncer = Speech()
     struct Stage { var selectedWorldID = "unloaded-world" }
     var spatialStage = Stage()

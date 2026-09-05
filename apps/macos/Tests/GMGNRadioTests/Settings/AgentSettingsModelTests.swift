@@ -209,6 +209,7 @@ func agentSettingsPersistsRealtimeVoiceWithoutKeychainPrompts()
         preferences: DJAgentPreferences(defaults: defaults),
         voicePreferences: voicePreferences
     )
+    model.selectRealtimeProvider(.elevenLabs)
     model.elevenLabsAgentID = "agent_radio"
     model.elevenLabsVoiceID = "voice-night"
     model.elevenLabsConversationToken = "private-token"
@@ -235,6 +236,7 @@ func agentSettingsPersistsRealtimeVoiceWithoutKeychainPrompts()
 @Test
 func realtimeVoiceConfigurationAcceptsPublicAgentWithoutPrivateToken() {
     let model = AgentSettingsModel()
+    model.selectRealtimeProvider(.elevenLabs)
     model.elevenLabsAgentID = "agent_public"
     model.elevenLabsConversationToken = ""
 

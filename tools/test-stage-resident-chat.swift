@@ -21,6 +21,12 @@ func declaration(_ signature: String, in text: String) -> String {
     fatalError("Unbalanced declaration")
 }
 let state = declaration("final class StageResidentChatState:", in: overlay)
+guard overlay.contains("private func performPrimaryAction()") else {
+    print("FAIL: speech playback has no stop action that preserves the completed reply")
+    exit(1)
+}
+let primaryAction = declaration("private func performPrimaryAction()", in: overlay)
+let canStop = declaration("private var canStopReply:", in: overlay)
 let keyboard = ["override func keyDown(", "override func keyUp(", "override func resignFirstResponder()", "override func scrollWheel(", "private static func movement("].map {
     declaration($0, in: controller)
 }.joined(separator: "\n")
@@ -68,6 +74,18 @@ struct NSEvent { let keyCode: UInt16; var scrollingDeltaY: Double = 0; var hasPr
     let residentChat = StageResidentChatState()
     \#(replyMethods)
 }
+@MainActor final class SpeechStatus { var isSpeaking = false }
+@MainActor final class ComposerControls {
+    let state = StageResidentChatState()
+    let speechStatus = SpeechStatus()
+    var cancelled = 0
+    var submitted = 0
+    func onCancelMessage() { cancelled += 1 }
+    func submit() { submitted += 1 }
+    func press() { performPrimaryAction() }
+    \#(canStop)
+    \#(primaryAction)
+}
 @main struct Tests {
     @MainActor static func main() {
         var count = 0, failures = 0
@@ -91,6 +109,18 @@ struct NSEvent { let keyCode: UInt16; var scrollingDeltaY: Double = 0; var hasPr
         controller.beginResidentReply()
         controller.showResidentChatStatus("连接失败")
         check(controller.residentChat.reply == "连接失败" && !controller.residentChat.isThinking, "controller failure status clears waiting")
+        let controls = ComposerControls()
+        controls.state.finish("完整的文字回复")
+        controls.speechStatus.isSpeaking = true
+        controls.press()
+        check(controls.cancelled == 1 && controls.submitted == 0, "speaking button stops audio instead of sending")
+        check(controls.state.reply == "完整的文字回复", "stopping audio preserves completed reply")
+        controls.speechStatus.isSpeaking = false
+        controls.state.begin()
+        controls.press()
+        check(!controls.state.isThinking && controls.cancelled == 2, "thinking stop retains existing cancellation behavior")
+        controls.press()
+        check(controls.submitted == 1, "idle primary button still sends")
         let input = Interaction()
         input.keyDown(with: NSEvent(keyCode: 13))
         check(input.spatialStage.movements == [.forward], "W still moves in the scene")
@@ -126,7 +156,11 @@ func run(_ binary: String, _ args: [String]) throws -> Int32 {
 let executable = temporary.appendingPathComponent("test")
 // Type-check the real SwiftUI view and AppKit button without launching a host.
 let uiSource = temporary.appendingPathComponent("UI.swift")
-let ui = "import SwiftUI\nimport AppKit\n@MainActor\n" + state + "\n@MainActor\n"
+let speechSource = try String(contentsOf: sources.appendingPathComponent("Agent/AgentSpeech.swift"), encoding: .utf8)
+let ui = "import SwiftUI\nimport AppKit\nimport Observation\n@MainActor\n@Observable\n"
+    + declaration("final class AgentSpeechStatusStore", in: speechSource) + "\n@MainActor\n"
+    + declaration("struct ResidentSpeechErrorNotice:", in: overlay) + "\n@MainActor\n"
+    + state + "\n@MainActor\n"
     + declaration("struct StageResidentComposer:", in: overlay) + "\n@MainActor\n"
     + declaration("private final class StageResidentChatButton:", in: controller)
 try ui.write(to: uiSource, atomically: true, encoding: .utf8)

@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import SwiftUI
 
 enum LiveCamFeed: Equatable, Sendable {
     case virtualWorld
@@ -349,7 +350,15 @@ final class LiveCamInteractionView: NSView {
         replyLabel.lineBreakMode = .byTruncatingTail
         replyBubble.addSubview(replyLabel)
 
+        let speechErrorNotice = NSHostingView(rootView: ResidentSpeechErrorNotice())
+        speechErrorNotice.translatesAutoresizingMaskIntoConstraints = false
+        speechErrorNotice.identifier = NSUserInterfaceItemIdentifier("livecam.speech-error")
+        addSubview(speechErrorNotice)
+
         NSLayoutConstraint.activate([
+            speechErrorNotice.leadingAnchor.constraint(equalTo: composer.leadingAnchor),
+            speechErrorNotice.trailingAnchor.constraint(equalTo: composer.trailingAnchor),
+            speechErrorNotice.bottomAnchor.constraint(equalTo: composer.topAnchor, constant: -8),
             controls.topAnchor.constraint(equalTo: topAnchor, constant: 10),
             controls.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             controls.widthAnchor.constraint(equalToConstant: 30),

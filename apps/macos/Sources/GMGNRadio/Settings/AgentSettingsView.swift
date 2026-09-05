@@ -151,6 +151,12 @@ struct AgentSettingsView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
+                    Text("空间和 Live Cam 共用这里选定的 Agent；文字和语音转写进入同一个会话。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("回复语音") {
                     Toggle(
                         isOn: Binding(
                             get: { model.autoSpeakAgentReplies },
@@ -161,18 +167,26 @@ struct AgentSettingsView: View {
                     ) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("自动朗读 Agent 回复")
-                            Text("使用系统语音朗读文字回复，与实时语音相互独立。")
+                            Text("选定的 Agent 回答后，使用百炼语音朗读；开麦会停止旧朗读。")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
                     }
-
-                    Text("Live Cam 的文字聊天直接走这里选定的后端，无需连接实时语音。")
+                    LabeledContent("朗读服务", value: "百炼 Qwen3 TTS")
+                    Picker("回复音色", selection: Binding(
+                        get: { model.selectedReplyVoiceID },
+                        set: { model.selectReplyVoice($0) }
+                    )) {
+                        ForEach(BailianTTSVoice.allCases) { voice in
+                            Text(voice.title).tag(voice.rawValue)
+                        }
+                    }
+                    Text("与下方百炼转写共用本机 API Key。只朗读选定 Agent 的回答，失败时保留文字，不切换到其它回答模型。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
-                Section("DJ 声音") {
+                Section("语音输入") {
                     Picker(
                         "服务",
                         selection: Binding(
@@ -203,13 +217,19 @@ struct AgentSettingsView: View {
 
                         Spacer()
 
+                        if model.realtimeProvider == .bailian {
+                            Button("保存配置") {
+                                _ = model.saveVoiceConfiguration()
+                            }
+                            .buttonStyle(.bordered)
+                        }
                         if voiceStatus.state.isConversationOpen {
-                            Button("断开") {
+                            Button("取消录音") {
                                 disconnectRealtimeVoice()
                             }
                             .buttonStyle(.bordered)
                         } else if model.realtimeProvider.canConnectLocally {
-                            Button("连接语音") {
+                            Button("录制一句") {
                                 guard
                                     let configuration =
                                         model.saveVoiceConfiguration()
@@ -234,7 +254,7 @@ struct AgentSettingsView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
-                    Text("实时语音为实验功能，仅影响麦克风语音对话；Live Cam 文字聊天无需连接这里。")
+                    Text("语音转文字 → 选定的 Agent → 百炼朗读。说完一句后麦克风自动关闭，转写服务不生成回答。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -289,31 +309,7 @@ struct AgentSettingsView: View {
                 text: $model.voiceAPIKey,
                 prompt: Text("sk-...")
             )
-            Picker(
-                "实时模型",
-                selection: Binding(
-                    get: { model.voiceModel },
-                    set: { model.selectBailianModel($0) }
-                )
-            ) {
-                ForEach(BailianRealtimeOptions.models) { option in
-                    Text(option.title)
-                        .tag(option.id)
-                }
-            }
-            Picker(
-                "音色",
-                selection: $model.voiceID
-            ) {
-                ForEach(
-                    BailianRealtimeOptions.voices(
-                        for: model.voiceModel
-                    )
-                ) { option in
-                    Text(option.title)
-                        .tag(option.id)
-                }
-            }
+            LabeledContent("转写模型", value: "Qwen3 ASR Flash")
             Picker(
                 "麦克风",
                 selection: $model.voiceMicrophoneDeviceID
@@ -349,19 +345,19 @@ struct AgentSettingsView: View {
     private var providerHelpText: String {
         switch model.realtimeProvider {
         case .elevenLabs:
-            "可填写公开 Agent ID；私有 Agent 的 API Key 保存在本机配置中。"
+            "此服务尚未接入居民语音转写，请选择百炼或直接输入文字。原有配置可以保留。"
         case .bailian:
-            "API Key 保存在本机配置中；改麦克风后请断开再连接。连接后由百炼负责听你说话和实时主持。"
+            "API Key 仅保存在本机配置中。百炼只负责语音转写，固定使用 Qwen3 ASR；无需配置回答模型或音色。"
         case .doubao:
-            "豆包凭据会保存在本机；当前客户端尚未安装 RTC 连接器。"
+            "此服务尚未接入居民语音转写，请选择百炼或直接输入文字。"
         }
     }
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text("智能 DJ")
+            Text("Agent 与语音")
                 .font(.title2.weight(.semibold))
-            Text("同一个 DJ 负责策划、主持和播放")
+            Text("文字和语音共用同一会话，回答后再朗读")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -386,13 +382,13 @@ struct AgentSettingsView: View {
         case .disconnected:
             "尚未连接"
         case .connecting:
-            "正在连接麦克风和实时会话"
+            "正在连接麦克风和转写服务"
         case .connected:
-            "已连接，可以直接和 DJ 说话"
+            "录音已就绪，说完一句自动发送"
         case .listening:
-            "DJ 正在听"
+            "正在录音和转写"
         case .speaking:
-            "DJ 正在说话"
+            "正在朗读 Agent 回复"
         case let .failed(message):
             message
         }
@@ -451,16 +447,16 @@ private extension RealtimeDJProvider {
     }
 
     var canConnectLocally: Bool {
-        hasLocalRuntime
+        self == .bailian
     }
 }
 
 private extension RealtimeVoiceConnectionState {
     var isConversationOpen: Bool {
         switch self {
-        case .connected, .listening, .speaking:
+        case .connecting, .connected, .listening, .speaking:
             true
-        case .disconnected, .connecting, .failed:
+        case .disconnected, .failed:
             false
         }
     }

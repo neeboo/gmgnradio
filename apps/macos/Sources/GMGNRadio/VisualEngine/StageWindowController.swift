@@ -726,7 +726,8 @@ private final class StageContentView: NSView {
             residentComposer.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 22),
             residentComposer.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -22),
             residentComposer.bottomAnchor.constraint(equalTo: transportControls.topAnchor, constant: -16),
-            residentComposer.heightAnchor.constraint(lessThanOrEqualToConstant: 250),
+            residentComposer.heightAnchor.constraint(lessThanOrEqualToConstant: 320),
+            residentComposer.topAnchor.constraint(greaterThanOrEqualTo: topAnchor, constant: 22),
             preferredComposerWidth,
             transportControls.trailingAnchor.constraint(
                 equalTo: trailingAnchor,

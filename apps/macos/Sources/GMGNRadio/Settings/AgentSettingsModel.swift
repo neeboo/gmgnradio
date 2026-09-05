@@ -167,9 +167,14 @@ struct RealtimeVoiceConfiguration: Equatable, Sendable {
                 || conversationToken?.isEmpty == false
         }
     }
+
+    var isReadyForResidentTranscription: Bool {
+        provider == .bailian && apiKey?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
 }
 
 final class RealtimeVoicePreferences {
+    static let replyVoiceIDKey = "speech.bailian.voiceID"
     static let providerKey = "voice.provider"
     static let agentIDKey = "voice.elevenlabs.agentID"
     static let voiceIDKey = "voice.elevenlabs.voiceID"
@@ -184,17 +189,25 @@ final class RealtimeVoicePreferences {
         self.defaults = defaults
     }
 
+    var replyVoiceID: String {
+        defaults.string(forKey: Self.replyVoiceIDKey) ?? "Cherry"
+    }
+
+    func saveReplyVoiceID(_ id: String) {
+        defaults.set(id, forKey: Self.replyVoiceIDKey)
+    }
+
     func load() -> RealtimeVoiceConfiguration {
         let provider = defaults.string(forKey: Self.providerKey)
             .flatMap(RealtimeDJProvider.init(rawValue:))
-            ?? .elevenLabs
+            ?? .bailian
         return load(provider: provider)
     }
 
     func loadMetadata() -> RealtimeVoiceConfiguration {
         let provider = defaults.string(forKey: Self.providerKey)
             .flatMap(RealtimeDJProvider.init(rawValue:))
-            ?? .elevenLabs
+            ?? .bailian
         return load(provider: provider)
     }
 
@@ -356,6 +369,7 @@ final class AgentSettingsModel {
         Set<AgentConversationBackendID> = []
     var selectedConversationBackendID: AgentConversationBackendID = .codex
     var autoSpeakAgentReplies = true
+    var selectedReplyVoiceID: String
 
     var voiceID: String {
         get { elevenLabsVoiceID }
@@ -379,6 +393,7 @@ final class AgentSettingsModel {
         self.account = account
         self.preferences = preferences
         self.voicePreferences = voicePreferences
+        selectedReplyVoiceID = voicePreferences.replyVoiceID
         voiceMicrophoneDevices = microphoneDevices
         self.defaultMicrophoneDeviceID = defaultMicrophoneDeviceID
         hostPrompt = preferences.hostPrompt()
@@ -443,6 +458,13 @@ final class AgentSettingsModel {
     func setAutoSpeakAgentReplies(_ enabled: Bool) {
         autoSpeakAgentReplies = enabled
         AgentConversationService.shared.setAutoSpeakReplies(enabled)
+    }
+
+    func selectReplyVoice(_ id: String) {
+        selectedReplyVoiceID = id
+        voicePreferences.saveReplyVoiceID(id)
+        message = "百炼回复音色已保存，下次朗读生效。"
+        hasError = false
     }
 
     func isConversationBackendInstalled(
@@ -557,7 +579,7 @@ final class AgentSettingsModel {
 
         do {
             try voicePreferences.save(configuration)
-            message = "实时语音配置已保存。"
+            message = "语音输入配置已保存；转写后交给选定的 Agent 回复。"
             hasError = false
             return configuration
         } catch {
@@ -644,10 +666,6 @@ final class AgentSettingsModel {
         case .bailian:
             guard configuration.apiKey != nil else {
                 message = "填写百炼 API Key。"
-                return false
-            }
-            guard configuration.model != nil else {
-                message = "填写百炼实时语音模型。"
                 return false
             }
             return true
