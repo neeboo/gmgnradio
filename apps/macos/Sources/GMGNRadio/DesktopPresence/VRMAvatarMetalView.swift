@@ -407,7 +407,8 @@ private final class DesktopVRMAvatarRenderer: NSObject, MTKViewDelegate {
         let motion = StageAvatarMotionFrame.resolve(
             activity: runtime.activity,
             voiceLevel: runtime.voiceLevel,
-            time: Date.timeIntervalSinceReferenceDate
+            time: Date.timeIntervalSinceReferenceDate,
+            residentSpeechLevel: runtime.residentSpeechLevel
         )
         animationPlayer?.speed = StageAvatarAnimationPlayback.speed(
             for: runtime.activity

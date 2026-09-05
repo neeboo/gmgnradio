@@ -512,6 +512,10 @@ final class AppDelegate:
                 apiKey: preferences.load(provider: .bailian).apiKey ?? "",
                 voiceID: preferences.replyVoiceID
             )
+        }, onPlaybackChanged: { [weak self] state in
+            self?.avatarRuntime.setResidentSpeechPlayback(
+                isPlaying: state.isPlaying, level: state.level
+            )
         })
     )
     private let shortcutSettings = GMGNShortcutSettingsStore()
@@ -614,6 +618,9 @@ final class AppDelegate:
             }
         )
         orbWindowController = controller
+        spatialStage.onWorldSelectionChanged = { [weak self] in
+            self?.cancelResidentMessage()
+        }
         configureLivingWorld()
         configureStage()
         desktopPresenceObserverID = avatarRuntime.observe {

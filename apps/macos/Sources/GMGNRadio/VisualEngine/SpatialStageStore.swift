@@ -160,14 +160,16 @@ struct StageAvatarMotionFrame: Equatable, Sendable {
     static func resolve(
         activity: StageAvatarActivity,
         voiceLevel: Float,
-        time: TimeInterval
+        time: TimeInterval,
+        residentSpeechLevel: Float? = nil
     ) -> StageAvatarMotionFrame {
         let phase = Float(time)
         let voice = min(max(voiceLevel, 0), 1)
         let fallbackSpeech = (sin(phase * 13) + 1) * 0.16
-        let mouth = activity == .speaking
-            ? min(max(voice * 1.18, fallbackSpeech), 1)
-            : 0
+        let mouth = residentSpeechLevel.map { min(max($0 * 1.18, 0), 1) }
+            ?? (activity == .speaking
+                ? min(max(voice * 1.18, fallbackSpeech), 1)
+                : 0)
         let blinkPhase = phase.truncatingRemainder(dividingBy: 4.6)
         let blink = max(0, 1 - abs(blinkPhase - 0.12) / 0.1)
         let motionScale: Float = switch activity {
@@ -590,6 +592,8 @@ final class SpatialStageStore {
     )
 
     var selectedWorldID: String?
+    @ObservationIgnored
+    var onWorldSelectionChanged: (@MainActor () -> Void)?
     var marbleLivingCabin: MarbleLivingCabinPresentation?
     private(set) var selectedScene: SpatialScenePreset = .djHouse
     var camera = SpatialCameraState()
@@ -627,6 +631,7 @@ final class SpatialStageStore {
         let changedWorld = selectedWorldID != id
         selectedWorldID = id
         if changedWorld {
+            onWorldSelectionChanged?()
             clearSceneOccluderTriangles()
         }
         if changedWorld, calibratedWorldID != id {

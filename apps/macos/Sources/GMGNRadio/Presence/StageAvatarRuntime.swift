@@ -164,6 +164,8 @@ final class StageAvatarRuntimeStore {
     private(set) var status: StageAvatarRuntimeStatus = .disabled
     private(set) var activity: StageAvatarActivity = .idle
     private(set) var voiceLevel: Float = 0
+    /// nil keeps the legacy face path; an active zero sample closes the mouth.
+    private(set) var residentSpeechLevel: Float?
     private(set) var worldActivity: StageAvatarWorldActivitySnapshot?
 
     private let packageStore: PresencePackageStore?
@@ -254,6 +256,12 @@ final class StageAvatarRuntimeStore {
 
     func setVoiceLevel(_ level: Float) {
         voiceLevel = min(max(level, 0), 1)
+    }
+
+    func setResidentSpeechPlayback(isPlaying: Bool, level: Float) {
+        residentSpeechLevel = isPlaying
+            ? (level.isFinite ? min(max(level, 0), 1) : 0)
+            : nil
     }
 
     func installWorldActivity(_ activity: StageAvatarWorldActivitySnapshot) {

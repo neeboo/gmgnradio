@@ -2203,7 +2203,8 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         let motion = StageAvatarMotionFrame.resolve(
             activity: avatarRuntime.activity,
             voiceLevel: avatarRuntime.voiceLevel,
-            time: Date.timeIntervalSinceReferenceDate
+            time: Date.timeIntervalSinceReferenceDate,
+            residentSpeechLevel: avatarRuntime.residentSpeechLevel
         )
         avatarAnimationPlayer?.speed = StageAvatarAnimationPlayback.speed(
             for: avatarRuntime.activity
