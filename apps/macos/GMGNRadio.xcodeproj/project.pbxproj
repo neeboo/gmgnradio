@@ -11,6 +11,10 @@
 		FBB6CAE99A695C04A60FFCCC /* AgentConversationServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D367D806624D78C94FB83308 /* AgentConversationServiceTests.swift */; };
 		58D43372CFF298A92ADFEBE9 /* AgentSpeech.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8D7095FB9EFB5B471CAFDFB /* AgentSpeech.swift */; };
 		536642439278EE70BA8D9C63 /* AgentConversationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF68A2A7B2E943C8C65E7710 /* AgentConversationService.swift */; };
+		AE0059010000000000000001 /* ResidentCodexPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE0059010000000000000011 /* ResidentCodexPolicy.swift */; };
+		AE0059010000000000000002 /* ResidentCodexTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE0059010000000000000012 /* ResidentCodexTransport.swift */; };
+		AE0059010000000000000003 /* ResidentCodexAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE0059010000000000000013 /* ResidentCodexAgent.swift */; };
+		AE0059010000000000000004 /* ResidentWorldToolSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE0059010000000000000014 /* ResidentWorldToolSession.swift */; };
 		022B8A3C0241787B9679F7ED /* VRMAvatarMetalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9DC0013373B44A5DFD680348 /* VRMAvatarMetalView.swift */; };
 		023A4F188354D28E15BBCD57 /* FoliaSceneRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB7307989361CD9BA9432B67 /* FoliaSceneRuntime.swift */; };
 		0288310CEA68635FE7EDC404 /* ProgramPlaybackQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F772420CF42B6F465A7F93A /* ProgramPlaybackQueueTests.swift */; };
@@ -238,6 +242,10 @@
 		D367D806624D78C94FB83308 /* AgentConversationServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentConversationServiceTests.swift; sourceTree = "<group>"; };
 		C8D7095FB9EFB5B471CAFDFB /* AgentSpeech.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentSpeech.swift; sourceTree = "<group>"; };
 		CF68A2A7B2E943C8C65E7710 /* AgentConversationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentConversationService.swift; sourceTree = "<group>"; };
+		AE0059010000000000000011 /* ResidentCodexPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentCodexPolicy.swift; sourceTree = "<group>"; };
+		AE0059010000000000000012 /* ResidentCodexTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentCodexTransport.swift; sourceTree = "<group>"; };
+		AE0059010000000000000013 /* ResidentCodexAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentCodexAgent.swift; sourceTree = "<group>"; };
+		AE0059010000000000000014 /* ResidentWorldToolSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentWorldToolSession.swift; sourceTree = "<group>"; };
 		004DBF16E7B8E5F738731129 /* MetalStageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalStageView.swift; sourceTree = "<group>"; };
 		015185F407965D5142B0841B /* WorldAgentContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldAgentContext.swift; sourceTree = "<group>"; };
 		0281DD4F900FFD76446F5C1C /* StageVisualPresetTimeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageVisualPresetTimeline.swift; sourceTree = "<group>"; };
@@ -593,6 +601,10 @@
 				A961113D1516220877214877 /* CodexAgentAccountService.swift */,
 				C8D7095FB9EFB5B471CAFDFB /* AgentSpeech.swift */,
 				CF68A2A7B2E943C8C65E7710 /* AgentConversationService.swift */,
+				AE0059010000000000000011 /* ResidentCodexPolicy.swift */,
+				AE0059010000000000000012 /* ResidentCodexTransport.swift */,
+				AE0059010000000000000013 /* ResidentCodexAgent.swift */,
+				AE0059010000000000000014 /* ResidentWorldToolSession.swift */,
 				EDA99A24B1CD267A7C6DBEDA /* CodexCLI.swift */,
 				977A9FD8072469DD8A215BC8 /* CodexPlanningExecutor.swift */,
 				A321D62650E77B8CBC685704 /* DJAgentPreferences.swift */,
@@ -1184,6 +1196,10 @@
 				B6FFE9B34760DB9760F6F035 /* AccountMusicSource.swift in Sources */,
 				58D43372CFF298A92ADFEBE9 /* AgentSpeech.swift in Sources */,
 				536642439278EE70BA8D9C63 /* AgentConversationService.swift in Sources */,
+				AE0059010000000000000001 /* ResidentCodexPolicy.swift in Sources */,
+				AE0059010000000000000002 /* ResidentCodexTransport.swift in Sources */,
+				AE0059010000000000000003 /* ResidentCodexAgent.swift in Sources */,
+				AE0059010000000000000004 /* ResidentWorldToolSession.swift in Sources */,
 				92BE917E053A2C7267FF1CB3 /* AcousticTrackAnalyzer.swift in Sources */,
 				9653E38E38BFF4C976625281 /* AgentProgramPlanner.swift in Sources */,
 				9A6370C989217374C167A4A7 /* AgentSettingsModel.swift in Sources */,
