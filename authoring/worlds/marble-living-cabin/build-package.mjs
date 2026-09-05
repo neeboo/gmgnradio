@@ -20,7 +20,7 @@ const transform = (position, yaw=0, pitch=0) => ({position:point(position),rotat
 const positions = {'home.idle':layout.spawn.position,'home.walk':layout.walkPosition,'music.listen':layout.musicPosition};
 const waypointIDs = {'home.idle':'wp.spawn','home.walk':'wp.center','music.listen':'wp.jukebox'};
 const manifest = {
-  schemaVersion:1, packageID:'marble-living-cabin', packageVersion:'1.0.0', worldID,
+  schemaVersion:1, packageID:'marble-living-cabin', packageVersion:'1.1.0', worldID,
   displayName:'Marble 生活舱', calibration:{metersPerUnit:1,visualToGameplay:[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]},
   spawn:transform(layout.spawn.position, layout.spawn.yaw),
   collisionVolumes:layout.collisionVolumes,

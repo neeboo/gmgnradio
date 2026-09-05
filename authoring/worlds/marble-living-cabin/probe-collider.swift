@@ -26,8 +26,17 @@ for triangle in raw {
     }
 }
 print("dominant horizontal surfaces (raw converted y, square units)",areas.sorted {$0.value > $1.value}.prefix(14).map {[Float($0.key)/20,$0.value]})
-for originY:Float in [-1.7368507385253906 / 1.2125813961029053] {
-    let triangles = try GLBColliderDecoder().decode(data:data,transform:WorldMeshTransform(axisConversion:.flipYAndZ,origin:SIMD3(0,originY,0),uniformScale:1.2125813961029053))
+let layout = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: "authoring/worlds/marble-living-cabin/layout.json"))) as! [String: Any]
+let framing = layout["framing"] as! [String: Any]
+let origin = (framing["origin"] as! [NSNumber]).map(\.floatValue)
+let scale = (framing["scale"] as! NSNumber).floatValue
+func position(_ name: String) -> [Float] {
+    let value = layout[name]!
+    let values = (value as? [String: Any])?["position"] ?? value
+    return (values as! [NSNumber]).map(\.floatValue)
+}
+for originY:Float in [origin[1]] {
+    let triangles = try GLBColliderDecoder().decode(data:data,transform:WorldMeshTransform(axisConversion:.flipYAndZ,origin:SIMD3(origin[0],originY,origin[2]),uniformScale:scale))
     let collision=TriangleMeshCollisionWorld(triangles:triangles)
     let capsule=WorldCapsule(radius:0.2,height:1.8)
     print("GRID origin y",originY,"letters .=clear ground <=0.3m #=collision _=missing")
@@ -44,7 +53,10 @@ for originY:Float in [-1.7368507385253906 / 1.2125813961029053] {
     for p in [SIMD3<Float>(0,0.3,0),SIMD3<Float>(1,0.3,0),SIMD3<Float>(-1,0.3,0),SIMD3<Float>(0,0.3,1),SIMD3<Float>(0,0.3,-1)] {
         print("sample",triple(p),"ground",collision.groundHeight(at:p) as Any)
     }
-    let proposed:[(String,Float,Float)] = [("spawn",-0.5,-2.5),("walk",-0.4,-1.8),("music",0.3,-3.0),("jukebox",1,-3),("camera-floor",-1,1.5)]
+    let proposed:[(String,Float,Float)] = ["spawn", "walkPosition", "musicPosition", "jukebox", "camera"].map { name in
+        let p = position(name)
+        return (name, p[0], p[2])
+    }
     var grounded:[SIMD3<Float>] = []
     for (name,x,z) in proposed {
         let y=collision.groundHeight(at:SIMD3(x,0.4,z)) ?? -999
@@ -55,7 +67,8 @@ for originY:Float in [-1.7368507385253906 / 1.2125813961029053] {
     for (a,b) in [(0,1),(1,2),(0,2)] {
         print("ROUTE",proposed[a].0,proposed[b].0,collision.canTraverse(capsule,from:grounded[a],to:grounded[b],maximumStepHeight:0.25))
     }
-    let camera=SIMD3<Float>(-1,2.15,1.5)
+    let cameraPosition = position("camera")
+    let camera=SIMD3<Float>(cameraPosition[0],cameraPosition[1],cameraPosition[2])
     print("CAMERA point capsule",collision.canOccupy(WorldCapsule(radius:0.05,height:0.1),at:camera-SIMD3(0,0.05,0)))
     print("CAMERA above +0.2m",collision.canOccupy(WorldCapsule(radius:0.05,height:0.1),at:camera+SIMD3(0,0.15,0)))
 }

@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "packageID": "marble-living-cabin",
-  "packageVersion": "1.0.0",
+  "packageVersion": "1.1.0",
   "worldID": "84503420-3010-4944-8fde-2f383cd08ebe",
   "displayName": "Marble 生活舱",
   "calibration": {
@@ -27,9 +27,9 @@
   },
   "spawn": {
     "position": {
-      "x": -0.5,
-      "y": -0.033926774,
-      "z": -2.5
+      "x": -1,
+      "y": -0.067853548,
+      "z": -5
     },
     "rotation": {
       "x": 0,
@@ -47,9 +47,9 @@
     {
       "id": "collision.jukebox",
       "center": {
-        "x": 1,
-        "y": 0.627388258,
-        "z": -3
+        "x": 2,
+        "y": 0.639776516,
+        "z": -6
       },
       "halfExtents": {
         "x": 0.25,
@@ -69,9 +69,9 @@
     {
       "id": "wp.spawn",
       "position": {
-        "x": -0.5,
-        "y": -0.033926774,
-        "z": -2.5
+        "x": -1,
+        "y": -0.067853548,
+        "z": -5
       },
       "arrivalRadius": 0.2,
       "enabled": true
@@ -79,9 +79,9 @@
     {
       "id": "wp.center",
       "position": {
-        "x": -0.4,
-        "y": -0.022733886,
-        "z": -1.8
+        "x": -0.8,
+        "y": -0.045467772,
+        "z": -3.6
       },
       "arrivalRadius": 0.2,
       "enabled": true
@@ -89,9 +89,9 @@
     {
       "id": "wp.jukebox",
       "position": {
-        "x": 0.3,
-        "y": -0.015613836,
-        "z": -3
+        "x": 1.3,
+        "y": 0.031601157,
+        "z": -6
       },
       "arrivalRadius": 0.2,
       "enabled": true
@@ -116,9 +116,9 @@
       "entryWaypointID": "wp.spawn",
       "transform": {
         "position": {
-          "x": -0.5,
-          "y": -0.033926774,
-          "z": -2.5
+          "x": -1,
+          "y": -0.067853548,
+          "z": -5
         },
         "rotation": {
           "x": 0,
@@ -142,9 +142,9 @@
       "entryWaypointID": "wp.center",
       "transform": {
         "position": {
-          "x": -0.4,
-          "y": -0.022733886,
-          "z": -1.8
+          "x": -0.8,
+          "y": -0.045467772,
+          "z": -3.6
         },
         "rotation": {
           "x": 0,
@@ -168,9 +168,9 @@
       "entryWaypointID": "wp.jukebox",
       "transform": {
         "position": {
-          "x": 0.3,
-          "y": -0.015613836,
-          "z": -3
+          "x": 1.3,
+          "y": 0.031601157,
+          "z": -6
         },
         "rotation": {
           "x": 0,
@@ -382,9 +382,9 @@
       "id": "living.establishing",
       "transform": {
         "position": {
-          "x": -1,
+          "x": -2,
           "y": 1.65,
-          "z": 1.5
+          "z": 3
         },
         "rotation": {
           "x": -0.07976026696863539,
@@ -426,13 +426,13 @@
       "id": "scene.configuration",
       "path": "marble.json",
       "kind": "scene.configuration",
-      "sha256": "f2cb90fe3b5bc83869a7c5ac82828135a7128cf4b1db3c2cc8580a480c27b47c"
+      "sha256": "281deb88a5a68d52556bf9b7466081f8f36b20ea5a1fd743a09fce3248b295ab"
     },
     {
       "id": "prop.jukebox",
       "path": "jukebox.json",
       "kind": "prop.procedural",
-      "sha256": "ba6acadd94ae0419a2468bb2a4e4fc48ea4107b7ddb2f8498bb1e557f68abb2e"
+      "sha256": "d1c84f82563d809f1a5aebbc1dfe6b045725cd5a1212e92e73b049cbf590a527"
     }
   ]
 }

@@ -15,6 +15,7 @@ func marbleCabinPackageUsesGeneratedAssets() throws {
     let manifest = try JSONDecoder().decode(WorldManifest.self, from: data)
     #expect(UUID(uuidString: manifest.worldID) != nil)
     #expect(manifest.packageID == "marble-living-cabin")
+    #expect(manifest.packageVersion == "1.1.0", "Changed metre calibration must not reuse old position saves")
     #expect(manifest.calibration.metersPerUnit == 1)
     #expect(WorldPackageValidator().validate(manifest, packageRoot: root).isEmpty)
     #expect(Set(manifest.activities.map(\.id)) == ["home.idle", "home.walk", "music.listen"])
@@ -47,7 +48,7 @@ func marbleCabinRealMeshSupportsAuthoredTour() throws {
     let manifest = try JSONDecoder().decode(WorldManifest.self, from: Data(contentsOf: root.appendingPathComponent("world.json")))
     let config = try JSONDecoder().decode(MarbleCabinResourceConfiguration.self, from: Data(contentsOf: root.appendingPathComponent("marble.json")))
     #expect(config.framing.origin.count == 3)
-    #expect(abs(config.framing.scale - 1.2125814) < 0.0001)
+    #expect(abs(config.framing.scale - 2.4251628) < 0.0001, "Door reference calibration doubles the generated environment only")
     let origin = SIMD3(config.framing.origin[0], config.framing.origin[1], config.framing.origin[2])
     #expect(abs(origin.y + 1.432358) < 0.0001)
     let triangles = try GLBColliderDecoder().decode(
@@ -88,6 +89,11 @@ func marbleCabinRealMeshSupportsAuthoredTour() throws {
     #expect(worldDistance(previous, music.transform.position.simd3) < 0.01)
 
     let jukebox = SIMD3(config.jukebox.position[0], config.jukebox.position[1], config.jukebox.position[2])
+    let deviceCollision = try #require(manifest.collisionVolumes.first { $0.id == "collision.jukebox" })
+    #expect(abs(deviceCollision.halfExtents.y * 2 - 1.23) < 0.001, "Independent equipment keeps its physical size")
+    #expect(abs(jukebox.x - music.transform.position.x - 0.7) < 0.001, "Interaction reach must not grow with the environment")
+    let musicGround = try #require(mesh.groundHeight(at: music.transform.position.simd3 + SIMD3(0, 0.05, 0)))
+    #expect(abs(musicGround - music.transform.position.y) < 0.01)
     #expect(!props.canOccupy(capsule, at: jukebox))
     let deviceGround = try #require(mesh.groundHeight(at: jukebox + SIMD3(0, 0.05, 0)))
     #expect(abs(deviceGround - jukebox.y) < 0.01)

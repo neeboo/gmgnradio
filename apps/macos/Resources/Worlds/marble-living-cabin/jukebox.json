@@ -2,9 +2,9 @@
   "id": "jukebox",
   "renderer": "builtin.jukebox",
   "position": [
-    1,
-    0.012388258,
-    -3
+    2,
+    0.024776516,
+    -6
   ],
   "yaw": 0,
   "activityID": "music.listen",
