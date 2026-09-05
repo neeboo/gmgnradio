@@ -143,6 +143,7 @@ typealias RealConversationService = AgentConversationService
     // service; the method itself is compiled unchanged, UI/TTS are inert sinks.
     enum AgentConversationService { static var shared: RealConversationService! }
     private var liveCamMessageID: UUID?
+    private var residentActivityOutcome: ResidentActivityOutcome?
     var liveCamWindowController: Surface? = Surface()
     var agentSpeechAnnouncer = Speech()
     struct Stage { var selectedWorldID = "unloaded-world" }
@@ -152,6 +153,8 @@ typealias RealConversationService = AgentConversationService
     \#(sendMethod)
     \#(contextMethod)
     \#(toolsMethod)
+    private func resumeResidentJukebox(owner: UUID) async throws { fatalError("Use the jukebox outcome suite for playback") }
+    private func pauseResidentJukebox(owner: UUID?) async throws { fatalError("Use the jukebox outcome suite for playback") }
     func send(_ message: String) async { await sendLiveCamMessage(message) }
 }
 
@@ -560,7 +563,7 @@ func run(_ binary: String, _ arguments: [String]) throws -> Int32 {
     process.waitUntilExit()
     return process.terminationStatus
 }
-let compiled = try run("/usr/bin/swiftc", ["-j1", "-parse-as-library",
+let compilerArguments: [String] = ["-j1", "-parse-as-library",
     "-I", root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug/Modules").path,
     sources.appendingPathComponent("Agent/CodexCLI.swift").path,
     sources.appendingPathComponent("Agent/AgentConversationService.swift").path,
@@ -568,11 +571,14 @@ let compiled = try run("/usr/bin/swiftc", ["-j1", "-parse-as-library",
     sources.appendingPathComponent("Agent/WorldAgentToolContract.swift").path,
     sources.appendingPathComponent("Agent/WorldAgentToolDispatcher.swift").path,
     sources.appendingPathComponent("Agent/ResidentWorldToolSession.swift").path,
+    sources.appendingPathComponent("Agent/ResidentActivityOutcome.swift").path,
     sources.appendingPathComponent("Agent/ResidentCodexPolicy.swift").path,
     sources.appendingPathComponent("Agent/ResidentCodexTransport.swift").path,
     sources.appendingPathComponent("Agent/ResidentCodexAgent.swift").path,
-    program.path, "-o", executable.path] + FileManager.default.contentsOfDirectory(
+    program.path, "-o", executable.path]
+let runtimeObjects = try FileManager.default.contentsOfDirectory(
         at: root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug/WorldRuntime.build"),
-        includingPropertiesForKeys: nil).filter { $0.pathExtension == "o" }.map(\.path))
+        includingPropertiesForKeys: nil).filter { $0.pathExtension == "o" }.map(\.path)
+let compiled = try run("/usr/bin/swiftc", compilerArguments + runtimeObjects)
 guard compiled == 0 else { exit(compiled) }
 exit(try run(executable.path, []))

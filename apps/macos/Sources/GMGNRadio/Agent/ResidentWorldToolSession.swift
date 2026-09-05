@@ -30,9 +30,13 @@ final class ResidentWorldToolSession {
     private let deadline: Date
     private let now: @MainActor () -> Date
     private let isCurrent: @MainActor () -> Bool
+    private let beforeDispatch: (@MainActor (String, String, Data) -> Void)?
+    private let afterDispatch: (@MainActor (String, Data, RealtimeDJToolResult) async -> RealtimeDJToolResult)?
+    private let onCancel: (@MainActor () -> Void)?
     private var cancelled = false
     private var identities: [String: CallIdentity] = [:]
     private var results: [String: RealtimeDJToolResult] = [:]
+    private var pending: [String: Task<RealtimeDJToolResult, Never>] = [:]
     private(set) var records: [CallRecord] = []
 
     init(
@@ -41,7 +45,10 @@ final class ResidentWorldToolSession {
         dispatcher: WorldAgentToolDispatcher,
         deadline: Date,
         now: @escaping @MainActor () -> Date = { Date() },
-        isCurrent: @escaping @MainActor () -> Bool
+        isCurrent: @escaping @MainActor () -> Bool,
+        beforeDispatch: (@MainActor (String, String, Data) -> Void)? = nil,
+        afterDispatch: (@MainActor (String, Data, RealtimeDJToolResult) async -> RealtimeDJToolResult)? = nil,
+        onCancel: (@MainActor () -> Void)? = nil
     ) {
         self.scopeID = scopeID
         self.worldID = worldID
@@ -49,6 +56,9 @@ final class ResidentWorldToolSession {
         self.deadline = deadline
         self.now = now
         self.isCurrent = isCurrent
+        self.beforeDispatch = beforeDispatch
+        self.afterDispatch = afterDispatch
+        self.onCancel = onCancel
         let schemas = dispatcher.providerTools.compactMap { tool -> [String: Any]? in
             guard let function = tool["function"] as? [String: Any],
                   let name = function["name"] as? String,
@@ -64,7 +74,10 @@ final class ResidentWorldToolSession {
     }
 
     func cancel() {
+        guard !cancelled else { return }
         cancelled = true
+        onCancel?()
+        for task in pending.values { task.cancel() }
     }
 
     func call(requestID: String, name: String, argumentsJSON: Data) async -> RealtimeDJToolResult {
@@ -93,18 +106,33 @@ final class ResidentWorldToolSession {
             } else if let completed = results[requestID] {
                 replayed = true
                 result = completed
+            } else if let running = pending[requestID] {
+                replayed = true
+                result = await awaitResult(running)
             } else {
                 identities[requestID] = identity
-                let dispatched = await dispatcher.handle(RealtimeDJToolCall(
-                    id: scopeID.uuidString + ":" + requestID,
-                    name: name,
-                    argumentsJSON: canonical
-                ))
-                result = RealtimeDJToolResult(
-                    callID: requestID,
-                    resultJSON: dispatched.resultJSON,
-                    isError: dispatched.isError
-                )
+                let task = Task { @MainActor in
+                    guard !self.cancelled, !Task.isCancelled else {
+                        return self.failure(requestID, "tool_session_cancelled", "本次空间操作已取消")
+                    }
+                    guard self.isCurrent(), self.dispatcher.context.snapshot.worldID == self.worldID else {
+                        return self.failure(requestID, "stale_world_session", "空间或会话已经切换")
+                    }
+                    guard self.now() < self.deadline else {
+                        return self.failure(requestID, "tool_session_expired", "本次空间操作已超时")
+                    }
+                    self.beforeDispatch?(requestID, name, canonical)
+                    let dispatched = await self.dispatcher.handle(RealtimeDJToolCall(
+                        id: self.scopeID.uuidString + ":" + requestID,
+                        name: name, argumentsJSON: canonical
+                    ))
+                    let response = RealtimeDJToolResult(callID: requestID, resultJSON: dispatched.resultJSON, isError: dispatched.isError)
+                    if let afterDispatch = self.afterDispatch { return await afterDispatch(name, canonical, response) }
+                    return response
+                }
+                pending[requestID] = task
+                result = await awaitResult(task)
+                pending[requestID] = nil
                 results[requestID] = result
             }
         } else {
@@ -120,6 +148,14 @@ final class ResidentWorldToolSession {
             replayed: replayed
         ))
         return result
+    }
+
+    private func awaitResult(_ task: Task<RealtimeDJToolResult, Never>) async -> RealtimeDJToolResult {
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            Task { @MainActor [weak self] in self?.cancel() }
+        }
     }
 
     private func validatedArguments(name: String, data: Data) -> [String: Any]? {

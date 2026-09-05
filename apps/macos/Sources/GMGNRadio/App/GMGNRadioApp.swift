@@ -547,6 +547,8 @@ final class AppDelegate:
     private var desktopPresenceObserverID: UUID?
     private var livingWorldContext: WorldAgentContext?
     private var livingCabinJukeboxGate = LivingCabinJukeboxGate()
+    private var residentActivityOutcome: ResidentActivityOutcome?
+    private var residentJukeboxPlaybackOwner: UUID?
     private var worldAgentToolDispatcher: WorldAgentToolDispatcher?
     private var livingWorldVisualTask: Task<Void, Never>?
     private var livingWorldColliderTask: Task<Void, Never>?
@@ -1377,6 +1379,8 @@ final class AppDelegate:
         _ url: URL,
         loadSidecarLyrics: Bool = true
     ) throws {
+        try Task.checkCancellation()
+        residentJukeboxPlaybackOwner = ResidentActivityOutcome.playbackOwner
         playbackLogger.info(
             "本地播放开始：url=\(url.path, privacy: .public)，sidecar=\(loadSidecarLyrics)"
         )
@@ -1723,6 +1727,12 @@ final class AppDelegate:
         _ prepared: PreparedProgramPlayback,
         requestOpening: Bool = true
     ) async throws {
+        try Task.checkCancellation()
+        if ResidentActivityOutcome.playbackOwner != nil,
+           case .providerReference = prepared.target {
+            throw ResidentActivityOutcomeError.unsupportedPlaybackSource
+        }
+        residentJukeboxPlaybackOwner = ResidentActivityOutcome.playbackOwner
         guard let activeProgram else {
             playbackLogger.error("播放中止：activeProgram 为空")
             throw DJAgentRadioActionError.noProgram
@@ -2278,6 +2288,7 @@ final class AppDelegate:
     }
 
     private func performLivingCabinJukeboxEffect(_ snapshot: WorldAgentSnapshot) {
+        if residentActivityOutcome?.suppressesAutomaticEffect(snapshot) == true { return }
         guard spatialStage.marbleLivingCabin?.worldID == snapshot.worldID,
               spatialStage.selectedWorldID == snapshot.worldID,
               let active = snapshot.activeActivity,
@@ -2876,6 +2887,26 @@ final class AppDelegate:
               let context = livingWorldContext,
               spatialStage.selectedWorldID == context.manifest.worldID else { return nil }
         let worldID = context.manifest.worldID
+        residentActivityOutcome?.abort()
+        let isCurrent: @MainActor () -> Bool = { [weak self, weak context] in
+            guard let self, let context else { return false }
+            return self.liveCamMessageID == messageID
+                && self.spatialStage.selectedWorldID == worldID
+                && self.livingWorldContext === context
+        }
+        let outcome = ResidentActivityOutcome(
+            context: context,
+            isCurrent: isCurrent,
+            play: { [weak self] owner in
+                guard let self else { throw CancellationError() }
+                try await self.resumeResidentJukebox(owner: owner)
+            },
+            pause: { [weak self] owner in
+                guard let self else { throw CancellationError() }
+                try await self.pauseResidentJukebox(owner: owner)
+            }
+        )
+        residentActivityOutcome = outcome
         // This lease authorizes only the four tools for the current user message.
         // It does not enable background takeover or the wider DJ tool collection.
         let dispatcher = WorldAgentToolDispatcher(takeoverEnabled: { true }, context: context)
@@ -2884,12 +2915,10 @@ final class AppDelegate:
             worldID: worldID,
             dispatcher: dispatcher,
             deadline: Date().addingTimeInterval(300),
-            isCurrent: { [weak self, weak context] in
-                guard let self, let context else { return false }
-                return self.liveCamMessageID == messageID
-                    && self.spatialStage.selectedWorldID == worldID
-                    && self.livingWorldContext === context
-            }
+            isCurrent: isCurrent,
+            beforeDispatch: { id, name, arguments in outcome.prepare(callID: id, name: name, argumentsJSON: arguments) },
+            afterDispatch: { name, arguments, result in await outcome.complete(name: name, argumentsJSON: arguments, result: result) },
+            onCancel: { outcome.abort() }
         )
         return ResidentConversationTools(
             worldID: worldID,
@@ -2900,6 +2929,43 @@ final class AppDelegate:
             },
             cancel: { session.cancel() }
         )
+    }
+
+    private func resumeResidentJukebox(owner: UUID) async throws {
+        try Task.checkCancellation()
+        guard let context = livingWorldContext,
+              spatialStage.selectedWorldID == context.manifest.worldID,
+              let active = context.state.activeActivity,
+              active.activityID == "music.listen",
+              livingCabinJukeboxGate.consume(worldID: context.manifest.worldID, activityID: active.activityID,
+                startedAt: active.startedAt, phase: context.snapshot.activeActivity?.phase.rawValue ?? "") else {
+            throw ResidentActivityOutcomeError.effectAlreadyHandled
+        }
+        let route = ProgramPlaybackStartRoute.resolve(playerState: localMusicPlayer.state,
+            hasPreparedProgram: activeProgram != nil && programPlaybackQueue.current != nil)
+        if route == .startPreparedProgram, let prepared = programPlaybackQueue.current,
+           case .providerReference = prepared.target {
+            throw ResidentActivityOutcomeError.unsupportedPlaybackSource
+        }
+        try await ResidentActivityOutcome.$playbackOwner.withValue(owner) {
+            try await resumeMusic()
+        }
+        try Task.checkCancellation()
+        guard localMusicPlayer.state == .playing,
+              route == .alreadyPlaying || residentJukeboxPlaybackOwner == owner else {
+            throw ResidentActivityOutcomeError.interrupted
+        }
+    }
+
+    private func pauseResidentJukebox(owner: UUID?) async throws {
+        guard owner == nil || residentJukeboxPlaybackOwner == owner else { return }
+        let route = ProgramPlaybackStartRoute.resolve(playerState: localMusicPlayer.state,
+            hasPreparedProgram: activeProgram != nil && programPlaybackQueue.current != nil)
+        if route == .startPreparedProgram, let prepared = programPlaybackQueue.current,
+           case .providerReference = prepared.target {
+            throw ResidentActivityOutcomeError.unsupportedPlaybackSource
+        }
+        try await pauseMusic()
     }
 
     private func sendLiveCamMessage(_ message: String) async {
@@ -3189,6 +3255,7 @@ final class AppDelegate:
     }
 
     func pauseMusic() async throws {
+        residentJukeboxPlaybackOwner = nil
         guard localMusicPlayer.state == .playing else {
             return
         }
@@ -3198,6 +3265,7 @@ final class AppDelegate:
     }
 
     func resumeMusic() async throws {
+        try Task.checkCancellation()
         let route = ProgramPlaybackStartRoute.resolve(
             playerState: localMusicPlayer.state,
             hasPreparedProgram:
@@ -3211,6 +3279,7 @@ final class AppDelegate:
             playbackLogger.info("DJ 播放动作完成：音乐已经在播放")
             return
         case .resumeLocal:
+            residentJukeboxPlaybackOwner = ResidentActivityOutcome.playbackOwner
             try localMusicPlayer.play()
             orbWindowController?.setState(.playing)
             stageWindowController?.setPlaybackState(.playing)
