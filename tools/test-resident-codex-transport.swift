@@ -79,6 +79,8 @@ func fake() {
             return false
         }
         let client = transport()
+        var closedCount = 0
+        client.onClosed = { _ in closedCount += 1 }
         var notificationCount = 0
         client.onNotification = { method, payload in
             if method == "turn/progress", object(payload)["ok"] as? Bool == true { notificationCount += 1 }
@@ -96,6 +98,8 @@ func fake() {
         let callback = try await client.request(method: "callback", params: data([:]))
         check((object(callback)["callback"] as? [String: Any])?["success"] as? Bool == true, "formal callback result")
         client.close()
+        client.close()
+        check(closedCount == 1, "connection termination callback delivered once")
         check(await stopped(pid), "close terminates owned process")
 
         let denied = transport()

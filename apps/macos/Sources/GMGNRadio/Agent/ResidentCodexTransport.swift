@@ -24,6 +24,7 @@ enum ResidentCodexTransportError: Error, LocalizedError {
 @MainActor final class ResidentCodexTransport {
     var onNotification: ((String, Data) -> Void)?
     var onServerRequest: ((String, Data) async throws -> Data)?
+    var onClosed: ((Error) -> Void)?
     var processIdentifier: Int32? { process?.processIdentifier }
 
     private let executableURL: URL
@@ -203,6 +204,8 @@ enum ResidentCodexTransportError: Error, LocalizedError {
     private func finish(_ error: Error) {
         guard !closed else { return }
         closed = true
+        let closedHandler = onClosed
+        onClosed = nil
         output?.readabilityHandler = nil; errors?.readabilityHandler = nil
         if let input { writeQueue.async { try? input.close() } }
         try? output?.close(); try? errors?.close()
@@ -221,5 +224,6 @@ enum ResidentCodexTransportError: Error, LocalizedError {
                 if child.isRunning { kill(child.processIdentifier, SIGKILL) }
             }
         }
+        closedHandler?(error)
     }
 }
