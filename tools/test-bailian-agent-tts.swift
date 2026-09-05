@@ -9,14 +9,19 @@ import Foundation
     var reject = false
     var hold = false
     var waiter: CheckedContinuation<Void, Error>?
-    func play(_ data: Data) async throws {
+    var observers: [@MainActor (AgentSpeechPlaybackState) -> Void] = []
+    func play(_ data: Data, onPlaybackChanged: @escaping @MainActor (AgentSpeechPlaybackState) -> Void) async throws {
         if reject { throw URLError(.cannotDecodeContentData) }
         played.append(data)
+        observers.append(onPlaybackChanged)
+        onPlaybackChanged(.init(isPlaying: true, level: 0.3))
+        defer { onPlaybackChanged(.idle) }
         if hold { try await withCheckedThrowingContinuation { waiter = $0 } }
     }
     func stop() { stops += 1; waiter?.resume(throwing: CancellationError()); waiter = nil }
 }
 @MainActor final class Configuration { var value = BailianTTSConfiguration(apiKey: "fixture-key") }
+@MainActor final class PlaybackEvents { var states: [AgentSpeechPlaybackState] = [] }
 @MainActor final class HTTP {
     var requests: [URLRequest] = []
     var status = 200
@@ -24,9 +29,12 @@ import Foundation
     var hold = false
     var waiter: CheckedContinuation<Void, Never>?
     var cancellationObserved = false
+    var holdAtPost = 0
+    var postCount = 0
     func data(_ request: URLRequest) async throws -> (Data, URLResponse) {
         requests.append(request)
-        if hold {
+        if request.httpMethod == "POST" { postCount += 1 }
+        if hold || (request.httpMethod == "POST" && postCount == holdAtPost) {
             hold = false
             await withCheckedContinuation { waiter = $0 }
             cancellationObserved = Task.isCancelled
@@ -127,6 +135,42 @@ import Foundation
         for _ in 0..<500 { await Task.yield() }
         check(audio.waiter == nil && http.requests.count == beforePlaybackCancel + 2 && status.lastErrorMessage == nil, "stop ends playback and discards unsynthesized remaining chunks")
         audio.hold = false
+        let lifecycleHTTP = HTTP(), lifecycleAudio = Audio(), playbackEvents = PlaybackEvents(), lifecycleStatus = AgentSpeechStatusStore()
+        lifecycleHTTP.hold = true; lifecycleHTTP.holdAtPost = 2; lifecycleAudio.hold = true
+        let lifecycle = BailianSpeechSynthesizer(configuration: { config.value }, statusStore: lifecycleStatus,
+            load: { try await lifecycleHTTP.data($0) }, player: lifecycleAudio,
+            onPlaybackChanged: { playbackEvents.states.append($0) })
+        _ = lifecycle.speak(longText)
+        for _ in 0..<500 { if lifecycleHTTP.waiter != nil { break }; await Task.yield() }
+        check(lifecycle.isSpeaking && !playbackEvents.states.contains { $0.isPlaying }, "synthesis busy never opens mouth")
+        lifecycleHTTP.waiter?.resume(); lifecycleHTTP.waiter = nil
+        for _ in 0..<500 { if lifecycleAudio.waiter != nil { break }; await Task.yield() }
+        check(playbackEvents.states.last == .init(isPlaying: true, level: 0.3), "only actual playback callback drives mouth")
+        let obsoleteMeter = lifecycleAudio.observers[0]
+        lifecycleAudio.waiter?.resume(); lifecycleAudio.waiter = nil
+        for _ in 0..<500 { if lifecycleHTTP.waiter != nil { break }; await Task.yield() }
+        check(lifecycle.isSpeaking && playbackEvents.states.last == .idle, "between text chunks mouth is idle while synthesis remains busy")
+        obsoleteMeter(.init(isPlaying: true, level: 1))
+        check(playbackEvents.states.last == .idle, "old chunk meter cannot reopen mouth during next synthesis")
+        lifecycleHTTP.status = 500; lifecycleHTTP.waiter?.resume(); lifecycleHTTP.waiter = nil
+        await settle(lifecycle)
+        check(playbackEvents.states.last == .idle && lifecycleStatus.lastErrorMessage != nil, "second synthesis chunk failure leaves mouth closed")
+        lifecycleHTTP.status = 200
+        _ = lifecycle.speak("下一轮回答")
+        for _ in 0..<500 { if lifecycleAudio.waiter != nil { break }; await Task.yield() }
+        let eventsBeforeOld = playbackEvents.states.count
+        obsoleteMeter(.idle); obsoleteMeter(.init(isPlaying: true, level: 1))
+        check(playbackEvents.states.count == eventsBeforeOld && playbackEvents.states.last?.level == 0.3, "old speech callbacks cannot overwrite new playback")
+        lifecycle.stopSpeaking()
+        check(playbackEvents.states.last == .idle, "stop playback clears mouth synchronously")
+        for _ in 0..<500 { await Task.yield() }
+        lifecycleHTTP.hold = true
+        _ = lifecycle.speak("取消合成")
+        for _ in 0..<500 { if lifecycleHTTP.waiter != nil { break }; await Task.yield() }
+        let beforeCancelledSynthesis = lifecycleAudio.played.count
+        lifecycle.stopSpeaking(); lifecycleHTTP.waiter?.resume(); lifecycleHTTP.waiter = nil
+        for _ in 0..<500 { await Task.yield() }
+        check(playbackEvents.states.last == .idle && lifecycleAudio.played.count == beforeCancelledSynthesis, "cancelled synthesis never emits playing state")
         for url in ["file:///etc/passwd", "http://127.0.0.1/audio", "https://evil.example/audio", "https://aliyuncs.com.evil.example/audio"] {
             let bytes = try JSONSerialization.data(withJSONObject: ["output": ["audio": ["url": url]]])
             do { _ = try BailianTTSWire.audioURL(bytes); fatalError("unsafe audio URL accepted") } catch { check(true, "untrusted audio URL refused") }
@@ -141,6 +185,6 @@ defer { try? FileManager.default.removeItem(at: folder) }
 let main = folder.appendingPathComponent("Checks.swift"), binary = folder.appendingPathComponent("checks")
 try program.write(to: main, atomically: true, encoding: .utf8)
 let compile = Process(); compile.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
-compile.arguments = ["-swift-version", "6", "-parse-as-library", source.path, main.path, "-o", binary.path]
+compile.arguments = ["-j1", "-swift-version", "6", "-parse-as-library", source.path, main.path, "-o", binary.path]
 try compile.run(); compile.waitUntilExit(); guard compile.terminationStatus == 0 else { exit(compile.terminationStatus) }
 let run = Process(); run.executableURL = binary; try run.run(); run.waitUntilExit(); exit(run.terminationStatus)

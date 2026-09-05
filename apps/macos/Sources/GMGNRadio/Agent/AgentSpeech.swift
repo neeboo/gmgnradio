@@ -202,58 +202,123 @@ enum BailianTTSWire {
     }
 }
 
+struct AgentSpeechPlaybackState: Equatable, Sendable {
+    let isPlaying: Bool
+    let level: Float
+    static let idle = Self(isPlaying: false, level: 0)
+
+    init(isPlaying: Bool, level: Float) {
+        self.isPlaying = isPlaying
+        self.level = isPlaying && level.isFinite ? min(1, max(0, level)) : 0
+    }
+
+    static func normalizedLevel(decibels: Float) -> Float {
+        guard decibels.isFinite, decibels > -60 else { return 0 }
+        return pow(10, min(0, decibels) / 20)
+    }
+}
+
 @MainActor protocol AgentSpeechAudioPlaying: AnyObject {
-    func play(_ data: Data) async throws
+    func play(_ data: Data, onPlaybackChanged: @escaping @MainActor (AgentSpeechPlaybackState) -> Void) async throws
     func stop()
 }
 
-@MainActor final class AgentSpeechAudioPlayer: NSObject, AgentSpeechAudioPlaying, AVAudioPlayerDelegate {
-    private var player: AVAudioPlayer?
-    private var completion: CheckedContinuation<Void, Error>?
+/// The hardware boundary; lifecycle and metering scheduling stay in the player.
+@MainActor protocol AgentSpeechAudioDevice: AnyObject {
+    var onFinished: (@MainActor (Bool) -> Void)? { get set }
+    func start() -> Bool
+    func stop()
+    func measuredDecibels() -> Float
+}
 
-    func play(_ data: Data) async throws {
+@MainActor private final class AgentSpeechAVAudioDevice: NSObject, AgentSpeechAudioDevice, AVAudioPlayerDelegate {
+    private let audio: AVAudioPlayer
+    var onFinished: (@MainActor (Bool) -> Void)?
+
+    init(data: Data) throws {
+        audio = try AVAudioPlayer(data: data)
+        super.init()
+        audio.isMeteringEnabled = true
+        audio.delegate = self
+    }
+
+    func start() -> Bool { audio.play() }
+    func stop() { audio.stop(); audio.delegate = nil }
+    func measuredDecibels() -> Float {
+        guard audio.isPlaying else { return -160 }
+        audio.updateMeters()
+        return (0..<audio.numberOfChannels).map { audio.averagePower(forChannel: $0) }.max() ?? -160
+    }
+
+    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        Task { @MainActor [weak self] in self?.onFinished?(flag) }
+    }
+
+    nonisolated func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
+        Task { @MainActor [weak self] in self?.onFinished?(false) }
+    }
+}
+
+@MainActor final class AgentSpeechAudioPlayer: AgentSpeechAudioPlaying {
+    private let makeDevice: @MainActor (Data) throws -> any AgentSpeechAudioDevice
+    private var device: (any AgentSpeechAudioDevice)?
+    private var identity: UUID?
+    private var completion: CheckedContinuation<Void, Error>?
+    private var playbackChanged: (@MainActor (AgentSpeechPlaybackState) -> Void)?
+    private var meteringTask: Task<Void, Never>?
+
+    init(makeDevice: @escaping @MainActor (Data) throws -> any AgentSpeechAudioDevice = { try AgentSpeechAVAudioDevice(data: $0) }) {
+        self.makeDevice = makeDevice
+    }
+
+    func play(_ data: Data, onPlaybackChanged: @escaping @MainActor (AgentSpeechPlaybackState) -> Void) async throws {
         stop()
         try Task.checkCancellation()
-        let next: AVAudioPlayer
-        do { next = try AVAudioPlayer(data: data) }
-        catch { throw BailianTTSError.playback }
-        let identity = ObjectIdentifier(next)
-        player = next
-        next.delegate = self
+        let next: any AgentSpeechAudioDevice
+        do { next = try makeDevice(data) }
+        catch { onPlaybackChanged(.idle); throw BailianTTSError.playback }
+        let current = UUID()
+        identity = current; device = next; playbackChanged = onPlaybackChanged
+        next.onFinished = { [weak self] succeeded in
+            self?.finish(current, result: succeeded ? .success(()) : .failure(BailianTTSError.playback))
+        }
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 completion = continuation
-                if !next.play() { finish(identity, result: .failure(BailianTTSError.playback)) }
+                guard next.start() else { finish(current, result: .failure(BailianTTSError.playback)); return }
+                sample(current)
+                meteringTask = Task { [weak self] in
+                    while !Task.isCancelled {
+                        do { try await Task.sleep(nanoseconds: 50_000_000) } catch { return }
+                        guard let self, self.identity == current, !Task.isCancelled else { return }
+                        self.sample(current)
+                    }
+                }
             }
         } onCancel: {
-            Task { @MainActor [weak self] in
-                self?.finish(identity, result: .failure(CancellationError()))
-            }
+            Task { @MainActor [weak self] in self?.finish(current, result: .failure(CancellationError())) }
         }
     }
 
     func stop() {
-        guard let player else { return }
-        finish(ObjectIdentifier(player), result: .failure(CancellationError()))
+        guard let identity else { return }
+        finish(identity, result: .failure(CancellationError()))
     }
 
-    private func finish(_ identity: ObjectIdentifier, result: Result<Void, Error>) {
-        guard let player, ObjectIdentifier(player) == identity else { return }
-        player.stop(); player.delegate = nil; self.player = nil
+    private func sample(_ current: UUID) {
+        guard identity == current, let device else { return }
+        playbackChanged?(.init(isPlaying: true, level: AgentSpeechPlaybackState.normalizedLevel(decibels: device.measuredDecibels())))
+    }
+
+    private func finish(_ current: UUID, result: Result<Void, Error>) {
+        guard identity == current else { return }
+        identity = nil
+        meteringTask?.cancel(); meteringTask = nil
+        device?.onFinished = nil; device?.stop(); device = nil
+        let observer = playbackChanged; playbackChanged = nil
         let callback = completion; completion = nil
+        observer?(.idle)
         callback?.resume(with: result)
-    }
-
-    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        let identity = ObjectIdentifier(player)
-        Task { @MainActor [weak self] in
-            self?.finish(identity, result: flag ? .success(()) : .failure(BailianTTSError.playback))
-        }
-    }
-
-    nonisolated func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
-        let identity = ObjectIdentifier(player)
-        Task { @MainActor [weak self] in self?.finish(identity, result: .failure(BailianTTSError.playback)) }
     }
 }
 
@@ -270,6 +335,8 @@ private final class BailianTTSNoRedirects: NSObject, URLSessionTaskDelegate {
     private let statusStore: AgentSpeechStatusStore
     private let load: @MainActor (URLRequest) async throws -> (Data, URLResponse)
     private let player: any AgentSpeechAudioPlaying
+    private let onPlaybackChanged: @MainActor (AgentSpeechPlaybackState) -> Void
+    private var activePlayback: UUID?
     private var operation: Task<Void, Never>?
     private var generation = UUID()
     private(set) var isSpeaking = false {
@@ -279,9 +346,11 @@ private final class BailianTTSNoRedirects: NSObject, URLSessionTaskDelegate {
     init(configuration: @escaping @MainActor () -> BailianTTSConfiguration,
          statusStore: AgentSpeechStatusStore = .shared,
          load: @escaping @MainActor (URLRequest) async throws -> (Data, URLResponse) = { try await BailianSpeechSynthesizer.session.data(for: $0) },
-         player: any AgentSpeechAudioPlaying = AgentSpeechAudioPlayer()) {
+         player: any AgentSpeechAudioPlaying = AgentSpeechAudioPlayer(),
+         onPlaybackChanged: @escaping @MainActor (AgentSpeechPlaybackState) -> Void = { _ in }) {
         self.configuration = configuration; self.statusStore = statusStore
         self.load = load; self.player = player
+        self.onPlaybackChanged = onPlaybackChanged
     }
 
     @discardableResult func speak(_ text: String) -> Bool {
@@ -296,7 +365,12 @@ private final class BailianTTSNoRedirects: NSObject, URLSessionTaskDelegate {
         isSpeaking = true
         operation = Task { [weak self] in
             guard let self else { return }
-            defer { if generation == current { isSpeaking = false; operation = nil } }
+            defer {
+                if generation == current {
+                    activePlayback = nil; onPlaybackChanged(.idle)
+                    isSpeaking = false; operation = nil
+                }
+            }
             do {
                 for chunk in chunks {
                     try requireCurrent(current)
@@ -310,10 +384,19 @@ private final class BailianTTSNoRedirects: NSObject, URLSessionTaskDelegate {
                     try requireCurrent(current)
                     try checkHTTP(audioResponse)
                     guard !audio.isEmpty, audio.count <= 16 * 1_048_576 else { throw BailianTTSError.invalidResponse }
-                    do { try await player.play(audio) }
+                    let playback = UUID()
+                    activePlayback = playback
+                    do {
+                        try await player.play(audio, onPlaybackChanged: { [weak self] state in
+                            guard let self, self.generation == current, self.activePlayback == playback else { return }
+                            self.onPlaybackChanged(state)
+                        })
+                    }
                     catch is CancellationError { throw CancellationError() }
                     catch { throw BailianTTSError.playback }
                     try requireCurrent(current)
+                    activePlayback = nil
+                    onPlaybackChanged(.idle)
                 }
             } catch {
                 guard generation == current, !Task.isCancelled, !(error is CancellationError) else { return }
@@ -326,8 +409,10 @@ private final class BailianTTSNoRedirects: NSObject, URLSessionTaskDelegate {
 
     func stopSpeaking() {
         generation = UUID()
+        activePlayback = nil
         operation?.cancel(); operation = nil
         player.stop(); isSpeaking = false
+        onPlaybackChanged(.idle)
     }
 
     private func requireCurrent(_ current: UUID) throws {
