@@ -99,6 +99,9 @@ public struct ActivityExecutor: Sendable {
 
     public private(set) var cooldowns: [String: Date] = [:]
 
+    /// Execution identity stays distinct even when two requests share a world timestamp.
+    public var currentRequestID: String? { current?.request.id }
+
     public init(
         position: WorldVector3,
         yaw: Float = 0,

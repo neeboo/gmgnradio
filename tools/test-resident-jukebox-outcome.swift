@@ -25,13 +25,17 @@ func declaration(_ signature: String, in text: String) -> String {
 let appSource = try String(contentsOf: sources.appendingPathComponent("App/GMGNRadioApp.swift"), encoding: .utf8)
 let resumeMethod = declaration("private func resumeResidentJukebox(", in: appSource)
 let pauseMethod = declaration("private func pauseResidentJukebox(", in: appSource)
+let toggleMethod = declaration("func toggleLocalPlayback() {", in: appSource)
+let automaticEffectMethod = declaration("private func performLivingCabinJukeboxEffect(", in: appSource)
 let playerSource = try String(contentsOf: sources.appendingPathComponent("AudioEngine/LocalMusicPlayer.swift"), encoding: .utf8)
 let queueSource = try String(contentsOf: sources.appendingPathComponent("AudioEngine/ProgramPlaybackQueue.swift"), encoding: .utf8)
 let playerState = declaration("enum LocalMusicPlaybackState:", in: playerSource)
 let playbackRoute = declaration("enum ProgramPlaybackStartRoute:", in: queueSource)
+let toggleRoute = declaration("enum ProgramPlaybackToggleRoute:", in: queueSource)
 let harness = #"""
 import Foundation
 import WorldRuntime
+import os
 \#(physicsAndGate)
 struct RealtimeDJToolCall: Codable, Equatable, Sendable { let id: String; let name: String; let argumentsJSON: Data }
 struct RealtimeDJToolResult: Codable, Equatable, Sendable { let callID: String; let resultJSON: Data; let isError: Bool }
@@ -39,11 +43,32 @@ struct Config: Decodable { struct Framing: Decodable { let origin: [Float]; let 
 enum PlayerError: Error { case missingTrack, pauseFailed }
 \#(playerState)
 \#(playbackRoute)
+\#(toggleRoute)
 @MainActor final class AppPlaybackHarness {
-    struct Stage { var selectedWorldID: String }
-    struct Player { var state: LocalMusicPlaybackState = .idle }
-    struct Prepared { enum Target { case localFile, providerReference }; var target: Target }
+    struct Cabin { var worldID: String }
+    struct Stage { var selectedWorldID: String; var marbleLivingCabin: Cabin? }
+    struct Player {
+        var state: LocalMusicPlaybackState = .idle
+        mutating func pause() { state = .paused }
+        mutating func play() throws { state = .playing }
+    }
+    struct Prepared {
+        enum Target { case localFile, providerReference }; var target: Target
+        struct Track { let id = "fixture" }; struct Slot { let track = Track() }; let slot = Slot()
+    }
     struct Queue { var current: Prepared? }
+    enum DisplayState { case idle, paused, playing }
+    final class Display {
+        func setState(_ state: DisplayState) {}
+        func setPlaybackState(_ state: DisplayState) {}
+    }
+    final class LiveCam { func showChatStatus(_ message: String) {} }
+    let playbackLogger = Logger(subsystem: "gmgn.hostless.test", category: "jukebox")
+    var orbWindowController: Display? = Display()
+    var stageWindowController: Display? = Display()
+    var liveCamWindowController: LiveCam? = LiveCam()
+    var livingWorldLogger: Logger { playbackLogger }
+    var residentActivityOutcome: ResidentActivityOutcome?
     var livingWorldContext: WorldAgentContext?
     var spatialStage: Stage
     var localMusicPlayer = Player()
@@ -53,7 +78,10 @@ enum PlayerError: Error { case missingTrack, pauseFailed }
     var residentJukeboxPlaybackOwner: UUID?
     var resumes = 0
     var pauses = 0
-    init(_ context: WorldAgentContext) { livingWorldContext = context; spatialStage = Stage(selectedWorldID: context.manifest.worldID) }
+    init(_ context: WorldAgentContext) {
+        livingWorldContext = context
+        spatialStage = Stage(selectedWorldID: context.manifest.worldID, marbleLivingCabin: Cabin(worldID: context.manifest.worldID))
+    }
     func resumeMusic() async throws {
         resumes += 1
         let route = ProgramPlaybackStartRoute.resolve(playerState: localMusicPlayer.state,
@@ -63,10 +91,15 @@ enum PlayerError: Error { case missingTrack, pauseFailed }
         localMusicPlayer.state = .playing
     }
     func pauseMusic() async throws { pauses += 1; localMusicPlayer.state = .paused; residentJukeboxPlaybackOwner = nil }
+    func presentPlaybackError(_ error: Error) { check(false, "unexpected fake local player failure") }
+    func startPreparedProgramPlayback() {}
     \#(resumeMethod)
     \#(pauseMethod)
+    \#(toggleMethod)
+    \#(automaticEffectMethod)
     func play(_ owner: UUID) async throws { try await resumeResidentJukebox(owner: owner) }
     func pause(_ owner: UUID?) async throws { try await pauseResidentJukebox(owner: owner) }
+    func scheduleAutomaticEffect(_ snapshot: WorldAgentSnapshot) { performLivingCabinJukeboxEffect(snapshot) }
 }
 @MainActor var checks = 0
 @MainActor var failures = 0
@@ -104,7 +137,8 @@ func code(_ result: RealtimeDJToolResult) -> String? { (try? JSONSerialization.j
             play: { [unowned self] owner in
                 let active = self.context.state.activeActivity!
                 check(self.gate.consume(worldID: manifest.worldID, activityID: active.activityID,
-                    startedAt: active.startedAt, phase: self.context.snapshot.activeActivity!.phase.rawValue), "tracked playback consumes existing gate once")
+                    startedAt: active.startedAt, phase: self.context.snapshot.activeActivity!.phase.rawValue,
+                    requestID: self.context.currentActivityRequestID), "tracked playback consumes existing gate once")
                 if self.unsupported { throw ResidentActivityOutcomeError.unsupportedPlaybackSource }
                 self.starts += 1
                 self.playbackOwner = owner
@@ -185,7 +219,7 @@ func code(_ result: RealtimeDJToolResult) -> String? { (try? JSONSerialization.j
             let stopped = await f.stop()
             check(stopped.isError && code(stopped) == "music_pause_failed", "pause failure is not reported as success")
         }
-        for mode in ["cancel-navigation", "cancel-player", "caller-cancel", "world-change", "new-activity", "manual-playback", "new-request-playback"] {
+        for mode in ["cancel-navigation", "cancel-player", "caller-cancel", "world-change", "new-activity", "same-time-replacement", "manual-playback", "new-request-playback"] {
             let f = try Fixture()
             f.navigationHeld = mode != "cancel-player" && mode != "manual-playback" && mode != "new-request-playback"
             f.playerHeld = !f.navigationHeld
@@ -196,6 +230,21 @@ func code(_ result: RealtimeDJToolResult) -> String? { (try? JSONSerialization.j
             case "new-activity":
                 try f.context.stopActivity(); try f.context.tick(deltaTime: 0.1); try f.context.startActivity(id: "home.idle")
                 f.navigationHeld = false
+            case "same-time-replacement":
+                let oldStartedAt = f.context.state.activeActivity?.startedAt
+                let oldRequestID = f.context.currentActivityRequestID
+                check(f.context.activityCatalog.definition(id: "music.listen")?.cooldownSeconds == 45,
+                      "same-frame replacement uses shipping 45-second cooldown definition")
+                var instanceGate = LivingCabinJukeboxGate()
+                check(instanceGate.consume(worldID: f.context.manifest.worldID, activityID: "music.listen",
+                    startedAt: oldStartedAt!, phase: "loop", requestID: oldRequestID), "first executor identity can trigger effect")
+                try f.context.startActivity(id: "music.listen")
+                check(f.context.state.activeActivity?.startedAt == oldStartedAt,
+                      "real explicit request replacement succeeds with exactly same world timestamp")
+                check(f.context.currentActivityRequestID != oldRequestID, "real executor request identity distinguishes same-frame replacement")
+                check(instanceGate.consume(worldID: f.context.manifest.worldID, activityID: "music.listen",
+                    startedAt: oldStartedAt!, phase: "loop", requestID: f.context.currentActivityRequestID), "replacement gets its own effect despite identical timestamp")
+                f.session.cancel()
             case "manual-playback", "new-request-playback":
                 f.playbackOwner = UUID(); f.playing = true; f.session.cancel()
             case "caller-cancel": task.cancel()
@@ -204,7 +253,8 @@ func code(_ result: RealtimeDJToolResult) -> String? { (try? JSONSerialization.j
             f.playerWait?.resume(); f.playerWait = nil
             let result = await task.value
             check(result.isError, "\(mode): cancelled or replaced work cannot return playback success")
-            check(mode == "new-activity" ? f.context.state.activeActivity?.activityID == "home.idle" : f.context.state.activeActivity == nil,
+            let expectedActivity = mode == "new-activity" ? "home.idle" : mode == "same-time-replacement" ? "music.listen" : nil
+            check(f.context.state.activeActivity?.activityID == expectedActivity,
                   "\(mode): cleanup only stops its own activity")
             check(mode == "manual-playback" || mode == "new-request-playback" ? f.playing : !f.playing, "\(mode): cancellation cannot affect newer playback")
             if mode == "cancel-navigation" || mode == "world-change" || mode == "new-activity" {
@@ -213,6 +263,14 @@ func code(_ result: RealtimeDJToolResult) -> String? { (try? JSONSerialization.j
         }
         do {
             let f = try Fixture(); _ = await f.start()
+            let reloaded = try Fixture(); _ = await reloaded.start()
+            check(f.context.currentActivityRequestID == reloaded.context.currentActivityRequestID,
+                  "real independent contexts can reuse executor request IDs")
+            let staleApp = AppPlaybackHarness(f.context)
+            staleApp.scheduleAutomaticEffect(f.context.snapshot)
+            staleApp.livingWorldContext = reloaded.context
+            for _ in 0..<100 { await Task.yield() }
+            check(staleApp.resumes == 0, "actual delayed App effect cannot play into reloaded context with reused request ID")
             for state: LocalMusicPlaybackState in [.idle, .paused, .ready, .playing] {
                 let app = AppPlaybackHarness(f.context)
                 app.localMusicPlayer.state = state
@@ -233,6 +291,16 @@ func code(_ result: RealtimeDJToolResult) -> String? { (try? JSONSerialization.j
             check(local.pauses == 0, "actual App helper cannot cancel another playback owner")
             try await local.pause(owner)
             check(local.pauses == 1 && local.localMusicPlayer.state == .paused, "actual App helper pauses its own local playback")
+            let manual = AppPlaybackHarness(f.context)
+            let oldOwner = UUID()
+            try await manual.play(oldOwner)
+            manual.toggleLocalPlayback()
+            check(manual.residentJukeboxPlaybackOwner == nil && manual.localMusicPlayer.state == .paused,
+                  "actual bottom-bar toggle releases resident ownership when manually paused")
+            manual.toggleLocalPlayback()
+            try await manual.pause(oldOwner)
+            check(manual.localMusicPlayer.state == .playing && manual.pauses == 0,
+                  "old request cleanup cannot stop music manually resumed by actual toggle")
             let absent = AppPlaybackHarness(f.context)
             absent.activeProgram = nil; absent.programPlaybackQueue.current = nil
             do { try await absent.play(UUID()); check(false, "missing program must fail") }

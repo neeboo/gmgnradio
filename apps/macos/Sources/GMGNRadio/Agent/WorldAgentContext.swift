@@ -75,6 +75,7 @@ final class WorldAgentContext {
 
     private(set) var simulation: WorldSimulation
     private(set) var activityExecutor: ActivityExecutor
+    var currentActivityRequestID: String? { activityExecutor.currentRequestID }
     private var movement: MovementRun?
     private var activityPhaseElapsed: TimeInterval = 0
     private let persistence: (any WorldStatePersisting)?

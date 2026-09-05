@@ -1343,6 +1343,7 @@ final class AppDelegate:
     }
 
     func toggleLocalPlayback() {
+        residentJukeboxPlaybackOwner = nil
         let route = ProgramPlaybackToggleRoute.resolve(
             playerState: localMusicPlayer.state,
             hasPreparedProgram:
@@ -1563,6 +1564,7 @@ final class AppDelegate:
         }
         activeProgram = plan
         isStartingProgramPlayback = true
+        residentJukeboxPlaybackOwner = nil
         localMusicPlayer.pause()
         stageWindowController?.setPlaybackState(.idle)
         stageWindowController?.setProgramNavigation(
@@ -2292,15 +2294,18 @@ final class AppDelegate:
         guard spatialStage.marbleLivingCabin?.worldID == snapshot.worldID,
               spatialStage.selectedWorldID == snapshot.worldID,
               let active = snapshot.activeActivity,
-              let startedAt = livingWorldContext?.simulation.state.activeActivity?.startedAt,
+              let context = livingWorldContext,
+              let startedAt = context.simulation.state.activeActivity?.startedAt,
+              let requestID = context.currentActivityRequestID,
               livingCabinJukeboxGate.consume(
                 worldID: snapshot.worldID, activityID: active.id,
-                startedAt: startedAt, phase: active.phase.rawValue
+                startedAt: startedAt, phase: active.phase.rawValue, requestID: requestID
               ) else { return }
-        Task { @MainActor [weak self] in
-            guard let self,
+        Task { @MainActor [weak self, weak context] in
+            guard let self, let context,
                   spatialStage.selectedWorldID == snapshot.worldID,
-                  livingWorldContext?.simulation.state.activeActivity?.startedAt == startedAt,
+                  livingWorldContext === context,
+                  livingWorldContext?.currentActivityRequestID == requestID,
                   livingWorldContext?.snapshot.activeActivity?.id == "music.listen"
             else { return }
             do {
@@ -2937,8 +2942,9 @@ final class AppDelegate:
               spatialStage.selectedWorldID == context.manifest.worldID,
               let active = context.state.activeActivity,
               active.activityID == "music.listen",
+              let requestID = context.currentActivityRequestID,
               livingCabinJukeboxGate.consume(worldID: context.manifest.worldID, activityID: active.activityID,
-                startedAt: active.startedAt, phase: context.snapshot.activeActivity?.phase.rawValue ?? "") else {
+                startedAt: active.startedAt, phase: context.snapshot.activeActivity?.phase.rawValue ?? "", requestID: requestID) else {
             throw ResidentActivityOutcomeError.effectAlreadyHandled
         }
         let route = ProgramPlaybackStartRoute.resolve(playerState: localMusicPlayer.state,
@@ -3207,6 +3213,7 @@ final class AppDelegate:
         activeProgram = plan
         isStartingProgramPlayback = true
         defer { isStartingProgramPlayback = false }
+        residentJukeboxPlaybackOwner = nil
         localMusicPlayer.pause()
         stageWindowController?.setPlaybackState(.idle)
         try await programPlaybackQueue.select(
@@ -3416,6 +3423,7 @@ final class AppDelegate:
                 failedTrackIDs: programPlaybackQueue.failedTrackIDs
             )
         }
+        residentJukeboxPlaybackOwner = nil
         localMusicPlayer.pause()
         activeProgram = proposal
         programStore.publish(proposal)

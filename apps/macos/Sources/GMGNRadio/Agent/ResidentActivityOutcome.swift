@@ -19,7 +19,7 @@ final class ResidentActivityOutcome {
 
     private struct OwnedActivity {
         let callID: String
-        let startedAt: Date
+        let requestID: String
         let playbackID: UUID
         var playbackAttempted = false
     }
@@ -87,9 +87,12 @@ final class ResidentActivityOutcome {
                 return response(result.callID, ok: false, code: "music_pause_failed", message: "角色已停止活动，但音乐暂停失败，请检查播放器。")
             }
         }
-        guard name == "start_activity", isMusic(argumentsJSON),
-              let active = context.state.activeActivity, active.activityID == "music.listen" else { return result }
-        let instance = OwnedActivity(callID: result.callID, startedAt: active.startedAt, playbackID: UUID())
+        guard name == "start_activity", isMusic(argumentsJSON) else { return result }
+        guard context.state.activeActivity?.activityID == "music.listen",
+              let requestID = context.currentActivityRequestID else {
+            return response(result.callID, ok: false, code: "activity_cancelled", message: "点唱机活动已经结束或被替换。")
+        }
+        let instance = OwnedActivity(callID: result.callID, requestID: requestID, playbackID: UUID())
         owned = instance
         defer { if owned?.callID == result.callID { owned = nil } }
         do {
@@ -131,7 +134,7 @@ final class ResidentActivityOutcome {
 
     private func ownsCurrentActivity() -> Bool {
         guard let owned, let active = context.state.activeActivity else { return false }
-        return active.activityID == "music.listen" && active.startedAt == owned.startedAt
+        return active.activityID == "music.listen" && context.currentActivityRequestID == owned.requestID
     }
 
     private func stopOwnedActivity() {

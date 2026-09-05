@@ -15,17 +15,18 @@ struct MarbleLivingCabinCollisionWorld: WorldCollisionQuerying {
     }
 }
 
-/// An effect is keyed by the persisted activity instance, not the 30 Hz frame.
+/// An effect is keyed by the execution instance, not the 30 Hz frame.
 struct LivingCabinJukeboxGate {
     private var lastInstance: String?
 
     mutating func consume(
-        worldID: String, activityID: String, startedAt: Date, phase: String
+        worldID: String, activityID: String, startedAt: Date, phase: String,
+        requestID: String? = nil
     ) -> Bool {
         guard activityID == "music.listen", phase == "enter" || phase == "loop" else {
             return false
         }
-        let instance = "\(worldID):\(startedAt.timeIntervalSince1970)"
+        let instance = "\(worldID):\(requestID ?? String(startedAt.timeIntervalSince1970))"
         guard instance != lastInstance else { return false }
         lastInstance = instance
         return true
