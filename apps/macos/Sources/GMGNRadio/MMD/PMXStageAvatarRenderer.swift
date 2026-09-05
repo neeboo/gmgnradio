@@ -254,6 +254,17 @@ enum LivingPodScene {
         return room
     }
 
+    /// Standalone metre-scale device. The origin is the centre of its bottom
+    /// face and its controls face -X, so a world package can place it directly.
+    static func makeIndependentJukebox() -> SCNNode {
+        let jukebox = makeJukebox()
+        let authoredBase = SIMD3<Float>(1.18, floorTopY, 0.3)
+        for child in jukebox.childNodes {
+            child.simdPosition -= authoredBase
+        }
+        return jukebox
+    }
+
     // MARK: - Hull
 
     private static func appendHull(to room: SCNNode) {

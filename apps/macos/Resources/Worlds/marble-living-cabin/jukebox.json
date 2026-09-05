@@ -1,0 +1,12 @@
+{
+  "id": "jukebox",
+  "renderer": "builtin.jukebox",
+  "position": [
+    1,
+    0.012388258,
+    -3
+  ],
+  "yaw": 0,
+  "activityID": "music.listen",
+  "effect": "player.resume"
+}

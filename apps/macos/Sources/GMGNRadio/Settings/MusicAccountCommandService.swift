@@ -48,7 +48,7 @@ struct MusicAccountCommandService: Sendable {
 
     static func live() -> MusicAccountCommandService {
         MusicAccountCommandService(
-            sessions: KeychainMusicProviderSessionStore(),
+            sessions: LocalMusicProviderSessionStore(),
             neteaseClient: NeteaseMusicProviderClient(),
             qqMusicClient: QQMusicProviderClient()
         )

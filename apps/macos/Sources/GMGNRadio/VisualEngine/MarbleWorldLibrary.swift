@@ -34,6 +34,7 @@ final class MarbleWorldLibrary {
     private var prepareTask: Task<URL?, Never>?
     private var selectionRevision: UInt64 = 0
     private var selectedLocalWorldID: String?
+    private var bundledColliders: [String: URL] = [:]
 
     init(
         client: MarbleWorldClient = MarbleWorldClient(),
@@ -47,7 +48,7 @@ final class MarbleWorldLibrary {
 
     func prepare() async -> URL? {
         guard selectedLocalWorldID == nil else {
-            return nil
+            return localSplatURL
         }
         if let localSplatURL {
             return localSplatURL
@@ -99,9 +100,44 @@ final class MarbleWorldLibrary {
         spatialStage.selectWorld(id: id)
     }
 
+    /// Select an adopted generated world without catalog fetches or auto-selection.
+    func adoptCachedWorld(
+        _ world: MarbleWorld, splatURL: URL, colliderURL: URL
+    ) {
+        selectionRevision &+= 1
+        prepareTask?.cancel()
+        prepareTask = nil
+        selectedLocalWorldID = world.id
+        selectedWorld = world
+        worlds.removeAll { $0.id == world.id }
+        worlds.insert(world, at: 0)
+        bundledColliders[world.id] = colliderURL
+        localSplatURL = splatURL
+        errorMessage = nil
+        isPreparing = false
+        spatialStage.selectScene(.inferred(worldID: world.id, name: world.name))
+        spatialStage.selectWorld(id: world.id)
+        onLocalSplatChange?(splatURL)
+    }
+
+    func reportLivingCabinFailure(_ error: Error) {
+        selectionRevision &+= 1
+        prepareTask?.cancel()
+        prepareTask = nil
+        selectedLocalWorldID = LivingWorldBootstrap.marbleCabinDirectoryName
+        selectedWorld = nil
+        localSplatURL = nil
+        isPreparing = false
+        errorMessage = error.localizedDescription
+    }
+
     func localCollider(
         for worldID: String
     ) async throws -> (URL, MarbleColliderSourceCoordinates)? {
+        if let url = bundledColliders[worldID],
+           let world = worlds.first(where: { $0.id == worldID }) {
+            return (url, world.colliderSourceCoordinates)
+        }
         guard let world = worlds.first(where: { $0.id == worldID }),
               let url = try await cache.localCollider(for: world)
         else {
@@ -147,10 +183,10 @@ final class MarbleWorldLibrary {
 
         do {
             let accountWorlds = try await client.listWorlds(pageSize: 50)
-            worlds = mergedWithPublicExamples(accountWorlds)
             guard selectionRevision == expectedSelectionRevision else {
                 return localSplatURL
             }
+            worlds = mergedWithPublicExamples(accountWorlds)
 
             let savedID = UserDefaults.standard.string(
                 forKey: "marble.selected-world-id"
@@ -197,11 +233,16 @@ final class MarbleWorldLibrary {
             return nil
         }
 
+        let expectedSelectionRevision = selectionRevision
         do {
             let url = try await cache.localSplat(
                 for: selectedWorld,
                 asset: asset
             )
+            guard selectionRevision == expectedSelectionRevision,
+                  self.selectedWorld?.id == selectedWorld.id else {
+                return localSplatURL
+            }
             localSplatURL = url
             UserDefaults.standard.set(
                 selectedWorld.id,
@@ -210,6 +251,7 @@ final class MarbleWorldLibrary {
             onLocalSplatChange?(url)
             return url
         } catch {
+            guard selectionRevision == expectedSelectionRevision else { return localSplatURL }
             errorMessage = error.localizedDescription
             Self.log.error("Unable to cache Marble world: \(error.localizedDescription, privacy: .public)")
             return nil

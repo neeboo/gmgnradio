@@ -156,6 +156,34 @@ func worldVisibilityObserversHideTheSpatialSurfaceAfterExit() {
 
 @MainActor
 @Test
+func synchronousWorldFinishDoesNotDeliverStaleLoadingToOtherObservers() {
+    let store = SpatialStageStore()
+    var changes = [[Bool](), [Bool]()]
+    let observerIDs = (0..<2).map { index in
+        store.observeWorldVisibility { visible in
+            changes[index].append(visible)
+            if store.isWorldPresentationRequested, !visible {
+                store.finishWorldPresentation()
+            }
+        }
+    }
+
+    // Either dictionary observer can finish first; neither may receive a stale
+    // loading notification after its nested visible notification.
+    for _ in 0..<2 {
+        store.requestWorldPresentation()
+        #expect(store.isWorldVisible)
+        #expect(changes.allSatisfy { $0.last == true })
+
+        store.exitWorld()
+        #expect(!store.isWorldVisible)
+        #expect(changes.allSatisfy { $0.last == false })
+    }
+    observerIDs.forEach { store.removeWorldVisibilityObserver($0) }
+}
+
+@MainActor
+@Test
 func finishingAnAlreadyVisibleWorldDoesNotNotifyObserversAgain() {
     let store = SpatialStageStore()
     var changes: [Bool] = []

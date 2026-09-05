@@ -1,0 +1,438 @@
+{
+  "schemaVersion": 1,
+  "packageID": "marble-living-cabin",
+  "packageVersion": "1.0.0",
+  "worldID": "84503420-3010-4944-8fde-2f383cd08ebe",
+  "displayName": "Marble 生活舱",
+  "calibration": {
+    "metersPerUnit": 1,
+    "visualToGameplay": [
+      1,
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      1
+    ]
+  },
+  "spawn": {
+    "position": {
+      "x": -0.5,
+      "y": -0.033926774,
+      "z": -2.5
+    },
+    "rotation": {
+      "x": 0,
+      "y": 0,
+      "z": 0,
+      "w": 1
+    },
+    "scale": {
+      "x": 1,
+      "y": 1,
+      "z": 1
+    }
+  },
+  "collisionVolumes": [
+    {
+      "id": "collision.jukebox",
+      "center": {
+        "x": 1,
+        "y": 0.627388258,
+        "z": -3
+      },
+      "halfExtents": {
+        "x": 0.25,
+        "y": 0.615,
+        "z": 0.21
+      },
+      "rotation": {
+        "x": 0,
+        "y": 0,
+        "z": 0,
+        "w": 1
+      },
+      "isBlocking": true
+    }
+  ],
+  "waypoints": [
+    {
+      "id": "wp.spawn",
+      "position": {
+        "x": -0.5,
+        "y": -0.033926774,
+        "z": -2.5
+      },
+      "arrivalRadius": 0.2,
+      "enabled": true
+    },
+    {
+      "id": "wp.center",
+      "position": {
+        "x": -0.4,
+        "y": -0.022733886,
+        "z": -1.8
+      },
+      "arrivalRadius": 0.2,
+      "enabled": true
+    },
+    {
+      "id": "wp.jukebox",
+      "position": {
+        "x": 0.3,
+        "y": -0.015613836,
+        "z": -3
+      },
+      "arrivalRadius": 0.2,
+      "enabled": true
+    }
+  ],
+  "routes": [
+    {
+      "id": "route.jukebox",
+      "waypointIDs": [
+        "wp.spawn",
+        "wp.center",
+        "wp.jukebox"
+      ],
+      "bidirectional": true,
+      "enabled": true
+    }
+  ],
+  "activities": [
+    {
+      "id": "home.idle",
+      "action": "idle",
+      "entryWaypointID": "wp.spawn",
+      "transform": {
+        "position": {
+          "x": -0.5,
+          "y": -0.033926774,
+          "z": -2.5
+        },
+        "rotation": {
+          "x": 0,
+          "y": 0,
+          "z": 0,
+          "w": 1
+        },
+        "scale": {
+          "x": 1,
+          "y": 1,
+          "z": 1
+        }
+      },
+      "motionID": null,
+      "propIDs": [],
+      "interruptible": true
+    },
+    {
+      "id": "home.walk",
+      "action": "walk",
+      "entryWaypointID": "wp.center",
+      "transform": {
+        "position": {
+          "x": -0.4,
+          "y": -0.022733886,
+          "z": -1.8
+        },
+        "rotation": {
+          "x": 0,
+          "y": 0,
+          "z": 0,
+          "w": 1
+        },
+        "scale": {
+          "x": 1,
+          "y": 1,
+          "z": 1
+        }
+      },
+      "motionID": null,
+      "propIDs": [],
+      "interruptible": true
+    },
+    {
+      "id": "music.listen",
+      "action": "listenMusic",
+      "entryWaypointID": "wp.jukebox",
+      "transform": {
+        "position": {
+          "x": 0.3,
+          "y": -0.015613836,
+          "z": -3
+        },
+        "rotation": {
+          "x": 0,
+          "y": -0.7071067811865475,
+          "z": 0,
+          "w": 0.7071067811865476
+        },
+        "scale": {
+          "x": 1,
+          "y": 1,
+          "z": 1
+        }
+      },
+      "motionID": null,
+      "propIDs": [
+        "prop.jukebox"
+      ],
+      "interruptible": true
+    }
+  ],
+  "activityDefinitions": [
+    {
+      "id": "home.idle",
+      "displayName": "在生活舱自然待机",
+      "activity": {
+        "type": "idle"
+      },
+      "phases": [
+        {
+          "phase": "approach",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "enter",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "loop",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "exit",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "interrupt",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "failed",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        }
+      ],
+      "interruptible": true,
+      "cooldownSeconds": 0
+    },
+    {
+      "id": "home.walk",
+      "displayName": "在舱内散步",
+      "activity": {
+        "type": "walk",
+        "destinationID": "wp.center"
+      },
+      "phases": [
+        {
+          "phase": "approach",
+          "requiredAnchorIDs": [
+            "home.walk"
+          ],
+          "motionIDs": [
+            "gmgn.motion.bones.walk-loop-pmx",
+            "gmgn.motion.bones.walk-loop-vrm",
+            "gmgn.motion.ardy-walk-loop-pmx",
+            "gmgn.motion.ardy-walk-loop-vrm"
+          ],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "enter",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "loop",
+          "requiredAnchorIDs": [],
+          "motionIDs": [
+            "gmgn.motion.bones.walk-loop-pmx",
+            "gmgn.motion.bones.walk-loop-vrm",
+            "gmgn.motion.ardy-walk-loop-pmx",
+            "gmgn.motion.ardy-walk-loop-vrm"
+          ],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "exit",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "interrupt",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "failed",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        }
+      ],
+      "interruptible": true,
+      "cooldownSeconds": 5
+    },
+    {
+      "id": "music.listen",
+      "displayName": "到点唱机旁听音乐",
+      "activity": {
+        "type": "listenMusic",
+        "anchorID": "music.listen"
+      },
+      "phases": [
+        {
+          "phase": "approach",
+          "requiredAnchorIDs": [
+            "music.listen"
+          ],
+          "motionIDs": [
+            "gmgn.motion.bones.walk-loop-pmx",
+            "gmgn.motion.bones.walk-loop-vrm",
+            "gmgn.motion.ardy-walk-loop-pmx",
+            "gmgn.motion.ardy-walk-loop-vrm"
+          ],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "enter",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": 0.6
+        },
+        {
+          "phase": "loop",
+          "requiredAnchorIDs": [],
+          "motionIDs": [
+            "listen.music"
+          ],
+          "propIDs": [
+            "prop.jukebox"
+          ],
+          "durationSeconds": null
+        },
+        {
+          "phase": "exit",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "interrupt",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "failed",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        }
+      ],
+      "interruptible": true,
+      "cooldownSeconds": 45
+    }
+  ],
+  "cameras": [
+    {
+      "id": "living.establishing",
+      "transform": {
+        "position": {
+          "x": -1,
+          "y": 2.15,
+          "z": 1.5
+        },
+        "rotation": {
+          "x": -0.14421321281795904,
+          "y": -0.06148536808858036,
+          "z": -0.008978390299684304,
+          "w": 0.9875937865678177
+        },
+        "scale": {
+          "x": 1,
+          "y": 1,
+          "z": 1
+        }
+      },
+      "fieldOfViewDegrees": 66,
+      "nearPlane": 0.05,
+      "farPlane": 250
+    }
+  ],
+  "capabilities": [
+    "activity:home.idle",
+    "activity:home.walk",
+    "activity:music.listen",
+    "camera:living.establishing"
+  ],
+  "resources": [
+    {
+      "id": "scene.marble",
+      "path": "scene-500k.spz",
+      "kind": "scene.spz",
+      "sha256": "2f82fe6f4c8437e407170de4f945455058ff464729e09366ca1f4942930efc52"
+    },
+    {
+      "id": "collision.marble",
+      "path": "collider.glb",
+      "kind": "collision.glb",
+      "sha256": "91d184681fbd27ff9cf0ef483b97736c9dea43e22b2cef4d7c6bf7241062eb3d"
+    },
+    {
+      "id": "scene.configuration",
+      "path": "marble.json",
+      "kind": "scene.configuration",
+      "sha256": "77d74d9ba5f563f386121063a866e8835378f17192828025d03ed6660939bab2"
+    },
+    {
+      "id": "prop.jukebox",
+      "path": "jukebox.json",
+      "kind": "prop.procedural",
+      "sha256": "ba6acadd94ae0419a2468bb2a4e4fc48ea4107b7ddb2f8498bb1e557f68abb2e"
+    }
+  ]
+}

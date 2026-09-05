@@ -1,0 +1,4 @@
+# Resource hashes cover exact bytes across checkouts.
+*.json text eol=lf
+*.spz binary
+*.glb binary

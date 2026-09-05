@@ -525,6 +525,7 @@ final class AppDelegate:
     private var livingWorldApprovedMotions: [String: StageMotionAsset] = [:]
     private var desktopPresenceObserverID: UUID?
     private var livingWorldContext: WorldAgentContext?
+    private var livingCabinJukeboxGate = LivingCabinJukeboxGate()
     private var worldAgentToolDispatcher: WorldAgentToolDispatcher?
     private var livingWorldVisualTask: Task<Void, Never>?
     private var livingWorldColliderTask: Task<Void, Never>?
@@ -609,7 +610,7 @@ final class AppDelegate:
             )
         } else {
             playbackLogger.info(
-                "测试或隔离启动：跳过真实节目、音乐账号与钥匙串恢复"
+                "测试或隔离启动：跳过真实节目与音乐账号恢复"
             )
         }
 
@@ -1913,22 +1914,35 @@ final class AppDelegate:
     }
 
     private func configureLivingWorld() {
-        if stageRenderSurfaceController == nil {
-            stageRenderSurfaceController = StageRenderSurfaceController(
-                spatialStage: spatialStage,
-                library: marbleWorldLibrary,
-                avatarRuntime: avatarRuntime
-            )
-        }
-        if stageCameraCoordinator == nil {
-            stageCameraCoordinator = StageCameraCoordinator(
-                spatialStage: spatialStage
-            )
-        }
         guard livingWorldContext == nil else { return }
 
         do {
-            let package = try LivingWorldBootstrap.loadBundledCanary()
+            let package = try LivingWorldBootstrap.loadBundledCanary(
+                preferMarble: DefaultSpacePreference.load() == .livingPod
+            )
+            let marbleCabin = try LivingWorldBootstrap.loadMarbleCabin(package: package)
+            // Bind the generated package before renderer initialization can prewarm
+            // an unrelated saved Marble world.
+            if let marbleCabin {
+                spatialStage.marbleLivingCabin = marbleCabin.presentation
+                marbleWorldLibrary.adoptCachedWorld(
+                    marbleCabin.world, splatURL: marbleCabin.splatURL,
+                    colliderURL: marbleCabin.colliderURL
+                )
+                spatialStage.installCameraHome(marbleCabin.presentation.camera)
+                spatialStage.installAvatarPlacement(marbleCabin.presentation.avatarPlacement)
+            } else if DefaultSpacePreference.load() == .livingPod {
+                marbleWorldLibrary.selectLocalWorld(id: package.manifest.worldID, scene: .djHouse)
+            }
+            if stageRenderSurfaceController == nil {
+                stageRenderSurfaceController = StageRenderSurfaceController(
+                    spatialStage: spatialStage, library: marbleWorldLibrary,
+                    avatarRuntime: avatarRuntime
+                )
+            }
+            if stageCameraCoordinator == nil {
+                stageCameraCoordinator = StageCameraCoordinator(spatialStage: spatialStage)
+            }
             let avatarExecutor = StageAvatarActivityExecutor(
                 runtime: avatarRuntime,
                 spatialStage: spatialStage,
@@ -1992,6 +2006,11 @@ final class AppDelegate:
             livingWorldVisualTask?.cancel()
             livingWorldVisualTask = Task { @MainActor [weak self] in
                 guard let self else { return }
+                if marbleCabin != nil {
+                    spatialStage.requestWorldPresentation()
+                    // The SPZ renderer signals completion only after load succeeds.
+                    return
+                }
                 if DefaultSpacePreference.load() == .livingPod {
                     installLocalLivingPodPresentation(package: package)
                     return
@@ -2015,6 +2034,8 @@ final class AppDelegate:
                 "生活空间已启动：world=\(package.manifest.worldID, privacy: .public)，state=Application Support/LivingWorld/\(package.manifest.packageID, privacy: .public)/\(stateVersionDirectory, privacy: .public)/state.json"
             )
         } catch {
+            marbleWorldLibrary.reportLivingCabinFailure(error)
+            liveCamWindowController?.showChatStatus(error.localizedDescription)
             livingWorldLogger.error(
                 "生活空间启动失败：\(error.localizedDescription, privacy: .public)"
             )
@@ -2066,6 +2087,9 @@ final class AppDelegate:
                 guard let (url, sourceCoordinates) = try await marbleWorldLibrary
                     .localCollider(for: worldID)
                 else {
+                    if spatialStage.marbleLivingCabin?.worldID == worldID {
+                        throw LivingWorldBootstrapError.invalidMarbleCabin("没有找到生成舱体的碰撞网格。")
+                    }
                     livingWorldLogger.notice(
                         "空间没有碰撞 GLB，继续使用包内碰撞体：world=\(worldID, privacy: .public)"
                     )
@@ -2092,8 +2116,19 @@ final class AppDelegate:
                     return
                 }
                 spatialStage.installSceneOccluderTriangles(prepared.1)
+                let collision: any WorldCollisionQuerying
+                if spatialStage.marbleLivingCabin?.worldID == worldID {
+                    collision = MarbleLivingCabinCollisionWorld(
+                        environment: prepared.0,
+                        props: CollisionVolumeWorld(volumes: context.manifest.collisionVolumes.filter {
+                            $0.id == "collision.jukebox"
+                        })
+                    )
+                } else {
+                    collision = prepared.0
+                }
                 let correctedPosition = try context
-                    .installCollisionWorldAndReconcilePlacement(prepared.0)
+                    .installCollisionWorldAndReconcilePlacement(collision)
                 if let correctedPosition {
                     livingWorldLogger.notice(
                         "碰撞 GLB 修正角色落点：x=\(correctedPosition.x, privacy: .public)，y=\(correctedPosition.y, privacy: .public)，z=\(correctedPosition.z, privacy: .public)"
@@ -2106,6 +2141,13 @@ final class AppDelegate:
                 return
             } catch {
                 livingWorldColliderFraming = nil
+                if spatialStage.marbleLivingCabin?.worldID == worldID {
+                    spatialStage.exitWorld()
+                    marbleWorldLibrary.reportLivingCabinFailure(error)
+                    liveCamWindowController?.showChatStatus("生活舱碰撞网格加载失败：\(error.localizedDescription)")
+                    livingWorldLogger.error("生成生活舱碰撞加载失败：\(error.localizedDescription, privacy: .public)")
+                    return
+                }
                 livingWorldLogger.error(
                     "碰撞 GLB 加载失败，继续使用包内碰撞体：\(error.localizedDescription, privacy: .public)"
                 )
@@ -2114,6 +2156,7 @@ final class AppDelegate:
     }
 
     private func applyLivingWorldSnapshot(_ snapshot: WorldAgentSnapshot) {
+        performLivingCabinJukeboxEffect(snapshot)
         let spatialWeather: SpatialWeather = switch snapshot.weather {
         case .clear, .cloudy:
             .clear
@@ -2185,6 +2228,33 @@ final class AppDelegate:
             from: previousAvatarPosition,
             to: spatialStage.avatarPlacement.position
         )
+    }
+
+    private func performLivingCabinJukeboxEffect(_ snapshot: WorldAgentSnapshot) {
+        guard spatialStage.marbleLivingCabin?.worldID == snapshot.worldID,
+              spatialStage.selectedWorldID == snapshot.worldID,
+              let active = snapshot.activeActivity,
+              let startedAt = livingWorldContext?.simulation.state.activeActivity?.startedAt,
+              livingCabinJukeboxGate.consume(
+                worldID: snapshot.worldID, activityID: active.id,
+                startedAt: startedAt, phase: active.phase.rawValue
+              ) else { return }
+        Task { @MainActor [weak self] in
+            guard let self,
+                  spatialStage.selectedWorldID == snapshot.worldID,
+                  livingWorldContext?.simulation.state.activeActivity?.startedAt == startedAt,
+                  livingWorldContext?.snapshot.activeActivity?.id == "music.listen"
+            else { return }
+            do {
+                try await resumeMusic()
+                liveCamWindowController?.showChatStatus("点唱机开始播放音乐。")
+            } catch {
+                liveCamWindowController?.showChatStatus(
+                    "点唱机暂时无法播放，请先在播放器选择音乐。\(error.localizedDescription)"
+                )
+                livingWorldLogger.error("点唱机播放失败：\(error.localizedDescription, privacy: .public)")
+            }
+        }
     }
 
     private func refreshInstalledLivingWorldMotions() {

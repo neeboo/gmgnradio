@@ -34,6 +34,20 @@ func oneShotMotionDeadlineFiresOnceAtItsDuration() {
 @MainActor
 struct PMXStageAvatarRendererTests {
     @Test
+    func independentJukeboxHasMetreScaleAndNoRoomShell() {
+        let jukebox = LivingPodScene.makeIndependentJukebox()
+        #expect(jukebox.name == "jukebox")
+        #expect(jukebox.simdPosition == .zero)
+        #expect(abs(jukebox.boundingBox.min.y) < 0.001)
+        #expect(abs(jukebox.boundingBox.max.y - 1.23) < 0.01)
+        #expect(jukebox.childNode(withName: "hull-floor", recursively: true) == nil)
+        #expect(jukebox.childNode(withName: "sleep-pod", recursively: true) == nil)
+        let plinth = jukebox.childNode(withName: "plinth", recursively: false)
+        #expect(abs(plinth?.simdPosition.x ?? 100) < 0.001)
+        #expect(abs(plinth?.simdPosition.z ?? 100) < 0.001)
+    }
+
+    @Test
     func livingPodFactoryBuildsEveryReadableActivityZone() {
         let pod = LivingPodScene.makeRoomNode()
 

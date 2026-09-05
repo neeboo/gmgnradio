@@ -103,7 +103,7 @@ final class MusicRuntime {
     }
 
     static func live() -> MusicRuntime {
-        let sessions = KeychainMusicProviderSessionStore()
+        let sessions = LocalMusicProviderSessionStore()
         return MusicRuntime(
             netease: NeteaseMusicSource(
                 sessions: sessions,

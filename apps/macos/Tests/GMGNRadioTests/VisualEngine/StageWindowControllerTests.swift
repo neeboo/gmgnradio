@@ -632,7 +632,7 @@ func defaultSpacePreferenceStartsWithTheLivingPod() throws {
     )
     #expect(
         DefaultSpacePreference.allCases.map(\.title) == [
-            "生活舱 01",
+            "飞船生活舱（Marble）",
             "上次使用的 Marble 空间",
         ]
     )

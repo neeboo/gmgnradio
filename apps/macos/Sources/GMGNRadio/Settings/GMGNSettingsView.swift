@@ -24,7 +24,7 @@ enum DefaultSpacePreference: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .livingPod:
-            "生活舱 01"
+            "飞船生活舱（Marble）"
         case .lastMarbleWorld:
             "上次使用的 Marble 空间"
         }
@@ -33,7 +33,7 @@ enum DefaultSpacePreference: String, CaseIterable, Identifiable {
     var detail: String {
         switch self {
         case .livingPod:
-            "内置在应用中，无需联网下载"
+            "Marble 生成舱体，可交互点唱机；资源已内置，无需重新生成"
         case .lastMarbleWorld:
             "恢复你上次选择的 Marble 空间"
         }

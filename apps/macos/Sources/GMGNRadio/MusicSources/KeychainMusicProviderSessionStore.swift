@@ -1,143 +1,73 @@
 import Foundation
-import LocalAuthentication
-import Security
 
-enum MusicProviderSessionStoreError: Error, Equatable {
-    case keychain(OSStatus)
+enum MusicProviderSessionStoreError: Error, Equatable, LocalizedError {
     case invalidStoredSession
+
+    var errorDescription: String? {
+        "本机保存的音乐登录信息已损坏，请重新登录。"
+    }
 }
 
-actor KeychainMusicProviderSessionStore: MusicProviderSessionStore {
-    static let defaultService = "ai.gmgn.radio.music-providers.stable-v1"
+// The historical filename remains in the Xcode project. This implementation
+// uses only local files; it never attempts to migrate old system credentials.
+actor LocalMusicProviderSessionStore: MusicProviderSessionStore {
+    static let defaultDirectoryURL = FileManager.default
+        .homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/ai.gmgn.radio/secrets/music-sessions", isDirectory: true)
 
-    private let service: String
-    private let permitsKeychainAccess: Bool
+    private let directoryURL: URL
+    private let files = FileManager.default
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
-    private var loadedProviderIDs = Set<MusicProviderID>()
-    private var cachedSessions: [
-        MusicProviderID: MusicProviderSession
-    ] = [:]
 
-    init(
-        service: String = KeychainMusicProviderSessionStore.defaultService,
-        permitsKeychainAccess: Bool = KeychainMusicProviderSessionStore
-            .defaultKeychainAccessPolicy()
-    ) {
-        self.service = service
-        self.permitsKeychainAccess = permitsKeychainAccess
+    init(directoryURL: URL = LocalMusicProviderSessionStore.defaultDirectoryURL) {
+        self.directoryURL = directoryURL
     }
 
-    func session(
-        for providerID: MusicProviderID
-    ) throws -> MusicProviderSession? {
-        guard permitsKeychainAccess else {
-            return cachedSessions[providerID]
-        }
-        if loadedProviderIDs.contains(providerID) {
-            return cachedSessions[providerID]
-        }
-        var query = baseQuery(for: providerID)
-        query[kSecReturnData] = true
-        query[kSecMatchLimit] = kSecMatchLimitOne
-        let authenticationContext = LAContext()
-        authenticationContext.interactionNotAllowed = true
-        query[kSecUseAuthenticationContext] = authenticationContext
-
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        if status == errSecItemNotFound {
-            loadedProviderIDs.insert(providerID)
+    func session(for providerID: MusicProviderID) throws -> MusicProviderSession? {
+        let url = sessionURL(for: providerID)
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain
+            && error.code == NSFileReadNoSuchFileError {
             return nil
         }
-        guard status == errSecSuccess else {
-            throw MusicProviderSessionStoreError.keychain(status)
-        }
-        guard
-            let data = result as? Data,
-            let session = try? decoder.decode(
-                MusicProviderSession.self,
-                from: data
-            )
-        else {
+        try files.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directoryURL.path)
+        try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        do {
+            return try decoder.decode(MusicProviderSession.self, from: data)
+        } catch {
             throw MusicProviderSessionStoreError.invalidStoredSession
         }
-        loadedProviderIDs.insert(providerID)
-        cachedSessions[providerID] = session
-        return session
     }
 
-    func save(
-        _ session: MusicProviderSession,
-        for providerID: MusicProviderID
-    ) throws {
-        guard permitsKeychainAccess else {
-            loadedProviderIDs.insert(providerID)
-            cachedSessions[providerID] = session
-            return
-        }
+    func save(_ session: MusicProviderSession, for providerID: MusicProviderID) throws {
         let data = try encoder.encode(session)
-        let query = baseQuery(for: providerID)
-        let update = [kSecValueData: data] as CFDictionary
-        let updateStatus = SecItemUpdate(query as CFDictionary, update)
-
-        if updateStatus == errSecItemNotFound {
-            var item = query
-            item[kSecValueData] = data
-            item[kSecAttrAccessible] =
-                kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-            let addStatus = SecItemAdd(item as CFDictionary, nil)
-            guard addStatus == errSecSuccess else {
-                throw MusicProviderSessionStoreError.keychain(addStatus)
-            }
-            loadedProviderIDs.insert(providerID)
-            cachedSessions[providerID] = session
-            return
-        }
-
-        guard updateStatus == errSecSuccess else {
-            throw MusicProviderSessionStoreError.keychain(updateStatus)
-        }
-        loadedProviderIDs.insert(providerID)
-        cachedSessions[providerID] = session
+        try files.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try files.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directoryURL.path)
+        let url = sessionURL(for: providerID)
+        try data.write(to: url, options: .atomic)
+        try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
-    func removeSession(
-        for providerID: MusicProviderID
-    ) throws {
-        guard permitsKeychainAccess else {
-            loadedProviderIDs.insert(providerID)
-            cachedSessions.removeValue(forKey: providerID)
-            return
+    func removeSession(for providerID: MusicProviderID) throws {
+        do {
+            try files.removeItem(at: sessionURL(for: providerID))
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain
+            && error.code == NSFileNoSuchFileError {
+            // Removing an already-disconnected provider is idempotent.
         }
-        let status = SecItemDelete(baseQuery(for: providerID) as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw MusicProviderSessionStoreError.keychain(status)
-        }
-        loadedProviderIDs.insert(providerID)
-        cachedSessions.removeValue(forKey: providerID)
     }
 
-    private func baseQuery(
-        for providerID: MusicProviderID
-    ) -> [CFString: Any] {
-        [
-            kSecClass: kSecClassGenericPassword,
-            kSecAttrService: service,
-            kSecAttrAccount: providerID.rawValue
-        ]
-    }
-
-    private static func defaultKeychainAccessPolicy(
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> Bool {
-        let testEnvironmentKeys = [
-            "XCTestConfigurationFilePath",
-            "XCTestBundlePath",
-            "XCInjectBundleInto",
-        ]
-        return !testEnvironmentKeys.contains { key in
-            !(environment[key] ?? "").isEmpty
-        }
+    private func sessionURL(for providerID: MusicProviderID) -> URL {
+        // Provider IDs are extensible strings. Hex encoding keeps each session
+        // inside this directory even when an ID contains a path separator.
+        let filename = providerID.rawValue.utf8.map { String(format: "%02x", $0) }.joined()
+        return directoryURL.appendingPathComponent(filename + ".json")
     }
 }

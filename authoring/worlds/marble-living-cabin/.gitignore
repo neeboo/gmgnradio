@@ -1,0 +1,6 @@
+# Adopted SPZ/GLB are versioned once in the app world package.
+# Keep optional high-resolution previews and duplicate downloads local.
+/assets/*
+!/assets/thumbnail.webp
+!/assets/downloads.json
+/application-frame.png

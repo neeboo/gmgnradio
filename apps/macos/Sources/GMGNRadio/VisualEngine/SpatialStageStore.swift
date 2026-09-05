@@ -560,6 +560,15 @@ struct SpatialEnvironmentState: Equatable, Sendable {
     var revision: UInt64 = 0
 }
 
+struct MarbleLivingCabinPresentation: Equatable, Sendable {
+    let worldID: String
+    let camera: SpatialCameraState
+    let avatarPlacement: StageAvatarPlacement
+    let jukeboxPosition: SIMD3<Float>
+    let jukeboxYaw: Float
+    let sceneFraming: MarbleSceneFraming
+}
+
 @MainActor
 @Observable
 final class SpatialStageStore {
@@ -569,6 +578,7 @@ final class SpatialStageStore {
     )
 
     var selectedWorldID: String?
+    var marbleLivingCabin: MarbleLivingCabinPresentation?
     private(set) var selectedScene: SpatialScenePreset = .djHouse
     var camera = SpatialCameraState()
     private(set) var isWorldPresentationRequested = false
@@ -850,6 +860,9 @@ final class SpatialStageStore {
     private func updateWorldVisibility(_ visible: Bool) {
         isWorldVisible = visible
         for observer in worldVisibilityObservers.values {
+            // A prior observer may synchronously finish or exit the world.
+            // Its nested notification has already delivered the newer state.
+            guard isWorldVisible == visible else { break }
             observer(visible)
         }
     }

@@ -1,0 +1,28 @@
+{
+  "worldID": "84503420-3010-4944-8fde-2f383cd08ebe",
+  "framing": {
+    "origin": [0, -1.432358, 0],
+    "scale": 1.2125813961029053,
+    "minimum": [-3.8703408, -1.4687314, -6.14262],
+    "maximum": [6.241805, 0.77561134, 5.1560845]
+  },
+  "camera": {
+    "position": [-1, 2.15, 1.5],
+    "yaw": -0.124355,
+    "pitch": -0.29
+  },
+  "spawn": { "position": [-0.5, -0.033926774, -2.5], "yaw": 0 },
+  "walkPosition": [-0.4, -0.022733886, -1.8],
+  "musicPosition": [0.3, -0.015613836, -3],
+  "musicYaw": -1.5707963267948966,
+  "jukebox": { "position": [1, 0.012388258, -3], "yaw": 0 },
+  "collisionVolumes": [
+    {
+      "id": "collision.jukebox",
+      "center": { "x": 1, "y": 0.627388258, "z": -3 },
+      "halfExtents": { "x": 0.25, "y": 0.615, "z": 0.21 },
+      "rotation": { "x": 0, "y": 0, "z": 0, "w": 1 },
+      "isBlocking": true
+    }
+  ]
+}

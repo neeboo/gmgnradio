@@ -8,6 +8,136 @@ import simd
 import SplatIO
 import VRMMetalKit
 import WorldRuntime
+#if DEBUG
+import ImageIO
+#endif
+
+#if DEBUG
+// BEGIN DEBUG FRAME CAPTURE
+/// Opt-in export of this renderer's drawable only; never captures the desktop.
+@MainActor
+final class MarbleDebugFrameCapture {
+    static let shared: MarbleDebugFrameCapture? = {
+        let environment = ProcessInfo.processInfo.environment
+        guard let url = outputURL(environment: environment) else {
+            if environment["GMGN_SPACE_FRAME_OUTPUT"] != nil {
+                Logger(subsystem: "ai.gmgn.radio", category: "SpaceFrameExport")
+                    .error("GMGN_SPACE_FRAME_OUTPUT must be an absolute PNG path")
+            }
+            return nil
+        }
+        return MarbleDebugFrameCapture(outputURL: url)
+    }()
+
+    let outputURL: URL
+    private var readyFrameCount = 0
+    private var attempted = false
+
+    init(outputURL: URL) {
+        self.outputURL = outputURL
+    }
+
+    static func outputURL(environment: [String: String]) -> URL? {
+        guard let path = environment["GMGN_SPACE_FRAME_OUTPUT"],
+              path.hasPrefix("/"),
+              (path as NSString).pathExtension.lowercased() == "png"
+        else { return nil }
+        return URL(fileURLWithPath: path)
+    }
+
+    func claimIfReady(_ isReady: Bool) -> Bool {
+        guard !attempted else { return false }
+        readyFrameCount = isReady ? readyFrameCount + 1 : 0
+        guard readyFrameCount >= 3 else { return false }
+        attempted = true
+        return true
+    }
+
+    func encode(
+        texture: MTLTexture,
+        commandBuffer: MTLCommandBuffer,
+        isReady: Bool
+    ) {
+        guard claimIfReady(isReady) else { return }
+        let log = Logger(subsystem: "ai.gmgn.radio", category: "SpaceFrameExport")
+        let width = texture.width
+        let height = texture.height
+        let bytesPerRow = (width * 4 + 255) & ~255
+        guard texture.pixelFormat == .bgra8Unorm_srgb,
+              let buffer = texture.device.makeBuffer(
+                  length: bytesPerRow * height,
+                  options: .storageModeShared
+              ),
+              let blit = commandBuffer.makeBlitCommandEncoder()
+        else {
+            log.error("Space frame export failed to allocate GPU readback")
+            return
+        }
+        blit.label = "gmgn single debug frame export"
+        blit.copy(
+            from: texture,
+            sourceSlice: 0,
+            sourceLevel: 0,
+            sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+            sourceSize: MTLSize(width: width, height: height, depth: 1),
+            to: buffer,
+            destinationOffset: 0,
+            destinationBytesPerRow: bytesPerRow,
+            destinationBytesPerImage: bytesPerRow * height
+        )
+        blit.endEncoding()
+        let outputURL = self.outputURL
+        commandBuffer.addCompletedHandler { completed in
+            guard completed.status == .completed else {
+                log.error("Space frame export GPU failure: \(completed.error?.localizedDescription ?? "unknown", privacy: .public)")
+                return
+            }
+            do {
+                let pixels = Data(bytes: buffer.contents(), count: bytesPerRow * height)
+                try Self.writePNG(
+                    pixels, width: width, height: height,
+                    bytesPerRow: bytesPerRow, outputURL: outputURL
+                )
+                log.notice("Space frame exported: \(outputURL.path, privacy: .public)")
+            } catch {
+                log.error("Space frame PNG failure: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
+    nonisolated static func writePNG(
+        _ pixels: Data,
+        width: Int,
+        height: Int,
+        bytesPerRow: Int,
+        outputURL: URL
+    ) throws {
+        guard let provider = CGDataProvider(data: pixels as CFData),
+              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let image = CGImage(
+                  width: width, height: height,
+                  bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: bytesPerRow,
+                  space: colorSpace,
+                  bitmapInfo: CGBitmapInfo.byteOrder32Little.union(
+                      CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue)
+                  ),
+                  provider: provider, decode: nil,
+                  shouldInterpolate: false, intent: .defaultIntent
+              ),
+              let destination = CGImageDestinationCreateWithURL(
+                  outputURL as CFURL, "public.png" as CFString, 1, nil
+              )
+        else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+    }
+}
+// END DEBUG FRAME CAPTURE
+#endif
 
 enum MarbleViewportMetrics {
     static func resolve(
@@ -29,6 +159,21 @@ struct MarbleSceneFraming: Equatable, Sendable {
     let uniformScale: Float
     let normalizedMinimum: SIMD3<Float>
     let normalizedMaximum: SIMD3<Float>
+
+    /// Adopted worlds provide a measured ground origin and metre conversion.
+    /// Bounds are in source coordinates; no room-size fitting is applied.
+    init(
+        groundedOrigin: SIMD3<Float>,
+        uniformScale: Float,
+        minimum: SIMD3<Float>,
+        maximum: SIMD3<Float>
+    ) {
+        self.center = (minimum + maximum) * 0.5
+        self.groundedOrigin = groundedOrigin
+        self.uniformScale = uniformScale
+        self.normalizedMinimum = (minimum - groundedOrigin) * uniformScale
+        self.normalizedMaximum = (maximum - groundedOrigin) * uniformScale
+    }
 
     init(positions: [SIMD3<Float>]) {
         guard !positions.isEmpty else {
@@ -388,6 +533,32 @@ enum MarbleSceneDepthConvention: Equatable, Sendable {
 }
 
 enum MarbleOccluderMesh {
+    static func boxPositions(
+        minimum: SIMD3<Float>,
+        maximum: SIMD3<Float>,
+        transform: simd_float4x4
+    ) -> [SIMD3<Float>] {
+        let corners: [SIMD3<Float>] = [
+            SIMD3(minimum.x, minimum.y, minimum.z),
+            SIMD3(maximum.x, minimum.y, minimum.z),
+            SIMD3(maximum.x, maximum.y, minimum.z),
+            SIMD3(minimum.x, maximum.y, minimum.z),
+            SIMD3(minimum.x, minimum.y, maximum.z),
+            SIMD3(maximum.x, minimum.y, maximum.z),
+            SIMD3(maximum.x, maximum.y, maximum.z),
+            SIMD3(minimum.x, maximum.y, maximum.z),
+        ].map {
+            let point = transform * SIMD4<Float>($0, 1)
+            return SIMD3<Float>(point.x, point.y, point.z)
+        }
+        let indices = [
+            0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6,
+            0, 4, 5, 0, 5, 1, 3, 2, 6, 3, 6, 7,
+            0, 3, 7, 0, 7, 4, 1, 5, 6, 1, 6, 2,
+        ]
+        return indices.map { corners[$0] }
+    }
+
     static func positions(
         for triangles: [WorldTriangle]
     ) -> [SIMD3<Float>] {
@@ -441,6 +612,11 @@ final class MarbleSpatialView: MTKView {
         clearColor = MTLClearColorMake(0, 0, 0, 0)
         clearDepth = 1
         framebufferOnly = true
+#if DEBUG
+        if MarbleDebugFrameCapture.shared != nil {
+            framebufferOnly = false
+        }
+#endif
         enableSetNeedsDisplay = false
         isPaused = false
         preferredFramesPerSecond = 60
@@ -720,6 +896,11 @@ final class MarbleSpatialView: MTKView {
             } catch {
                 self?.loadingURL = nil
                 spatialStage.exitWorld()
+                if let cabin = spatialStage.marbleLivingCabin,
+                   cabin.worldID == spatialStage.selectedWorldID
+                {
+                    self?.library.reportLivingCabinFailure(error)
+                }
                 Self.log.error("Unable to load Marble SPZ: \(error.localizedDescription, privacy: .public)")
             }
         }
@@ -843,12 +1024,9 @@ private struct MarbleOccluderUniforms {
     var depthConvention: SIMD4<Float>
 }
 
-/// Renders the bundled local living pod — built with
-/// `LivingPodScene.makeRoomNode()` — into the shared Metal drawable through its
-/// own SceneKit renderer. It is deliberately independent of the PMX model
-/// instances (and of the VRM renderer) so either character can be composited on
-/// top afterwards, and it never waits on SplatRenderer readiness or Marble SPZ
-/// downloads because the pod ships with the app.
+/// Renders supplied room or prop geometry into the shared Metal drawable.
+/// The local legacy room clears the background; a standalone Marble prop
+/// preserves the SPZ colour already rendered. Neither owns the avatar.
 @MainActor
 private final class LivingPodRoomRenderer {
     /// SceneKit encodes depth in its reversed convention; the room pass clears
@@ -872,11 +1050,11 @@ private final class LivingPodRoomRenderer {
     private let keyLightNode = SCNNode()
     private let fillLightNode = SCNNode()
 
-    init(device: MTLDevice) {
+    init(device: MTLDevice, rootNode: SCNNode) {
         sceneRenderer = SCNRenderer(device: device, options: nil)
         sceneRenderer.scene = scene
 
-        roomNode = LivingPodScene.makeRoomNode()
+        roomNode = rootNode
         scene.rootNode.addChildNode(roomNode)
 
         let camera = SCNCamera()
@@ -902,7 +1080,9 @@ private final class LivingPodRoomRenderer {
         colorTexture: MTLTexture,
         depthTexture: MTLTexture,
         projection: simd_float4x4,
-        camera: SpatialCameraState
+        camera: SpatialCameraState,
+        preservesBackground: Bool = false,
+        preservesDepth: Bool = false
     ) -> Bool {
         let width = colorTexture.width
         let height = colorTexture.height
@@ -916,11 +1096,11 @@ private final class LivingPodRoomRenderer {
 
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = colorTexture
-        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].loadAction = preservesBackground ? .load : .clear
         pass.colorAttachments[0].storeAction = .store
         pass.colorAttachments[0].clearColor = Self.backgroundClearColor
         pass.depthAttachment.texture = depthTexture
-        pass.depthAttachment.loadAction = .clear
+        pass.depthAttachment.loadAction = preservesDepth ? .load : .clear
         pass.depthAttachment.storeAction = .store
         pass.depthAttachment.clearDepth = Self.reverseDepthClear
 
@@ -1050,6 +1230,8 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
     private var fullStageFrameSampler = FrameRateSampler()
     private var nextFrameCompletions: [MarbleFrameCompletion] = []
     private var livingPodRoomRenderer: LivingPodRoomRenderer?
+    private var marbleJukeboxRenderer: LivingPodRoomRenderer?
+    private var marbleJukeboxNode: SCNNode?
 
     init(
         view: MTKView,
@@ -1121,6 +1303,9 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         }
         let device = renderer.device
         let worldID = spatialStage.selectedWorldID
+        let cabinPresentation = spatialStage.marbleLivingCabin.flatMap {
+            $0.worldID == worldID ? $0 : nil
+        }
         let scene = spatialStage.selectedScene
         let worldCalibration = SpatialWorldCalibration.resolve(
             worldID: worldID
@@ -1138,10 +1323,10 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                 to: points.count,
                 by: sampleStride
             ).map { points[$0] }
-            let framing = MarbleSceneFraming(
-                positions: sampledPoints.map(\.position)
-            )
-            let cameraHome = worldCalibration?.cameraHome
+            let framing = cabinPresentation?.sceneFraming
+                ?? MarbleSceneFraming(positions: sampledPoints.map(\.position))
+            let cameraHome = cabinPresentation?.camera
+                ?? worldCalibration?.cameraHome
                 ?? framing.recommendedCameraHome(worldID: worldID)
             let samples = sampledPoints.map { point in
                 framing.normalizedSample(
@@ -1150,7 +1335,11 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                     rotation: point.rotation
                 )
             }
-            let avatarPlacement = if let calibratedPlacement =
+            let avatarPlacement = if let authoredPlacement =
+                cabinPresentation?.avatarPlacement
+            {
+                authoredPlacement
+            } else if let calibratedPlacement =
                 worldCalibration?.avatarPlacement
             {
                 StageAvatarPlacementSolver.grounded(
@@ -1433,6 +1622,11 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                     commandBuffer.commit()
                     return
                 }
+                drawMarbleJukebox(
+                    in: view,
+                    drawable: drawable,
+                    commandBuffer: commandBuffer
+                )
             }
         } else {
             clearLocalSurface(
@@ -1460,6 +1654,23 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                 deltaTime: max(delta, 0)
             )
         }
+#if DEBUG
+        if renderProfile == .fullStage,
+           let frameCapture = MarbleDebugFrameCapture.shared
+        {
+            frameCapture.encode(
+                texture: drawable.texture,
+                commandBuffer: commandBuffer,
+                isReady: renderer.isReadyToRender
+                    && spatialStage.isWorldVisible
+                    && spatialStage.marbleLivingCabin?.worldID == spatialStage.selectedWorldID
+                    && marbleJukeboxNode != nil
+                    && (avatarModel != nil || pmxAvatarRenderer != nil)
+                    && hasPreparedOccluder
+                    && occluderVertexCount > 0
+            )
+        }
+#endif
         commandBuffer.present(drawable)
         let frameCompletions = nextFrameCompletions
         nextFrameCompletions.removeAll(keepingCapacity: true)
@@ -1498,7 +1709,10 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         if let livingPodRoomRenderer {
             podRenderer = livingPodRoomRenderer
         } else {
-            let roomRenderer = LivingPodRoomRenderer(device: self.renderer.device)
+            let roomRenderer = LivingPodRoomRenderer(
+                device: self.renderer.device,
+                rootNode: LivingPodScene.makeRoomNode()
+            )
             livingPodRoomRenderer = roomRenderer
             podRenderer = roomRenderer
         }
@@ -1508,6 +1722,47 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             depthTexture: depthTexture,
             projection: projectionMatrix(for: view),
             camera: spatialStage.camera
+        )
+    }
+
+    private func drawMarbleJukebox(
+        in view: MTKView,
+        drawable: CAMetalDrawable,
+        commandBuffer: MTLCommandBuffer
+    ) {
+        guard renderProfile.drawsWorld,
+              let cabin = spatialStage.marbleLivingCabin,
+              cabin.worldID == spatialStage.selectedWorldID,
+              let depthTexture = view.depthStencilTexture
+        else { return }
+
+        if marbleJukeboxRenderer == nil {
+            let node = LivingPodScene.makeIndependentJukebox()
+            marbleJukeboxNode = node
+            marbleJukeboxRenderer = LivingPodRoomRenderer(
+                device: renderer.device,
+                rootNode: node
+            )
+        }
+        marbleJukeboxNode?.simdPosition = cabin.jukeboxPosition
+        marbleJukeboxNode?.simdEulerAngles = SIMD3<Float>(0, cabin.jukeboxYaw, 0)
+        // Exclude the device proxy here so it does not hide its own geometry.
+        let hasSceneDepth = drawSceneOccluder(
+            in: view,
+            drawable: drawable,
+            commandBuffer: commandBuffer,
+            projection: projectionMatrix(for: view),
+            depthOverride: .sceneKitReverse,
+            includeCabinProp: false
+        )
+        marbleJukeboxRenderer?.render(
+            commandBuffer: commandBuffer,
+            colorTexture: drawable.texture,
+            depthTexture: depthTexture,
+            projection: projectionMatrix(for: view),
+            camera: spatialStage.camera,
+            preservesBackground: true,
+            preservesDepth: hasSceneDepth
         )
     }
 
@@ -1564,7 +1819,9 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         in view: MTKView,
         drawable: CAMetalDrawable,
         commandBuffer: MTLCommandBuffer,
-        projection: simd_float4x4
+        projection: simd_float4x4,
+        depthOverride: MarbleSceneDepthConvention? = nil,
+        includeCabinProp: Bool = true
     ) -> Bool {
         guard renderProfile == .fullStage,
               spatialStage.isWorldVisible,
@@ -1574,7 +1831,22 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             return false
         }
         refreshOccluderBufferIfNeeded()
-        guard let occluderVertexBuffer, occluderVertexCount > 0 else {
+        let propVertices: [SIMD3<Float>]
+        if includeCabinProp,
+           let cabin = spatialStage.marbleLivingCabin,
+           cabin.worldID == spatialStage.selectedWorldID,
+           let node = marbleJukeboxNode
+        {
+            let bounds = node.boundingBox
+            propVertices = MarbleOccluderMesh.boxPositions(
+                minimum: SIMD3<Float>(Float(bounds.min.x), Float(bounds.min.y), Float(bounds.min.z)),
+                maximum: SIMD3<Float>(Float(bounds.max.x), Float(bounds.max.y), Float(bounds.max.z)),
+                transform: node.simdTransform
+            )
+        } else {
+            propVertices = []
+        }
+        guard occluderVertexCount > 0 || !propVertices.isEmpty else {
             return false
         }
 
@@ -1582,7 +1854,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         let cameraView = rotationX(-camera.pitch)
             * rotationY(-camera.yaw)
             * translation(-camera.position)
-        let depthConvention = MarbleSceneDepthConvention.resolve(
+        let depthConvention = depthOverride ?? MarbleSceneDepthConvention.resolve(
             avatarFormat: avatarRuntime.snapshot.avatar?.format
         )
         var uniforms = MarbleOccluderUniforms(
@@ -1615,7 +1887,6 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                 : occluderForwardDepthState
         )
         encoder.setCullMode(.none)
-        encoder.setVertexBuffer(occluderVertexBuffer, offset: 0, index: 0)
         encoder.setVertexBytes(
             &uniforms,
             length: MemoryLayout<MarbleOccluderUniforms>.stride,
@@ -1626,11 +1897,25 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             length: MemoryLayout<MarbleOccluderUniforms>.stride,
             index: 1
         )
-        encoder.drawPrimitives(
-            type: .triangle,
-            vertexStart: 0,
-            vertexCount: occluderVertexCount
-        )
+        if let occluderVertexBuffer, occluderVertexCount > 0 {
+            encoder.setVertexBuffer(occluderVertexBuffer, offset: 0, index: 0)
+            encoder.drawPrimitives(
+                type: .triangle,
+                vertexStart: 0,
+                vertexCount: occluderVertexCount
+            )
+        }
+        if !propVertices.isEmpty {
+            propVertices.withUnsafeBytes { bytes in
+                guard let baseAddress = bytes.baseAddress else { return }
+                encoder.setVertexBytes(baseAddress, length: bytes.count, index: 0)
+            }
+            encoder.drawPrimitives(
+                type: .triangle,
+                vertexStart: 0,
+                vertexCount: propVertices.count
+            )
+        }
         encoder.endEncoding()
         return true
     }

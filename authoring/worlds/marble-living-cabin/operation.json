@@ -1,0 +1,138 @@
+{
+  "status": "completed",
+  "submitted_at": "2026-09-05T04:38:22.884Z",
+  "request": {
+    "model": "marble-1.1",
+    "world_prompt": {
+      "type": "image",
+      "is_pano": false,
+      "disable_recaption": true,
+      "text_prompt": "Create a navigable 3D interior of the empty spacecraft living cabin shown in the reference image. Preserve its roomy layout, pale warm wall panels, large left observation window showing a blue planet and stars, warm indirect lighting, rear airlock, metal deck seams and open central floor. This is a human-scale living room around 7 metres wide, 8 metres deep and 3.2 metres high, not a tiny display box. The room continues naturally behind the reference camera with enclosing spacecraft walls. Keep the central floor flat and walkable, and keep the door a normal human doorway. Preserve built-in perimeter platforms and shelves as part of the architecture. Do not add people, 2B, humanoids, statues, animals, freestanding cylinders, coffee machines, jukeboxes or loose furniture: a realtime engine will add the character and independent interactive objects later. No text, logos or watermark. Keep the lighting bright enough to clearly read the wall and floor surfaces and keep the open central activity area unobstructed.",
+      "image_prompt": {
+        "source": "media_asset",
+        "media_asset_id": "7535668c-cfc3-4822-842c-30153cfd3384"
+      }
+    }
+  },
+  "operation_id": "b6c0e1f5-c01f-4453-ae7f-b3e3015fe852",
+  "operation": {
+    "operation_id": "b6c0e1f5-c01f-4453-ae7f-b3e3015fe852",
+    "created_at": "2026-09-05T04:38:24Z",
+    "updated_at": "2026-09-05T04:43:48Z",
+    "expires_at": "2026-09-05T07:38:24Z",
+    "done": true,
+    "error": null,
+    "metadata": {
+      "progress": {
+        "status": "SUCCEEDED",
+        "description": "World generation completed successfully"
+      },
+      "world_id": "84503420-3010-4944-8fde-2f383cd08ebe",
+      "operation_type": "world_generation",
+      "public_model_name": "marble-1.1"
+    },
+    "response": {
+      "world_id": "84503420-3010-4944-8fde-2f383cd08ebe",
+      "display_name": "",
+      "tags": null,
+      "assets": {
+        "mesh": {
+          "collider_mesh_url": "https://cdn.marble.worldlabs.ai/84503420-3010-4944-8fde-2f383cd08ebe/514cb1c1.glb",
+          "hq_mesh_url": null,
+          "full_res_mesh_url": null
+        },
+        "imagery": {
+          "pano_url": "https://cdn.marble.worldlabs.ai/84503420-3010-4944-8fde-2f383cd08ebe/13256b02-c8bd-4576-9174-1947d8db899c_panos/rgb_0.png"
+        },
+        "splats": {
+          "spz_urls": {
+            "500k": "https://cdn.marble.worldlabs.ai/84503420-3010-4944-8fde-2f383cd08ebe/23df1b0a-ccfd-4f4f-9406-f6086ed3edf7_ceramic_500k.spz",
+            "100k": "https://cdn.marble.worldlabs.ai/84503420-3010-4944-8fde-2f383cd08ebe/33a25bd3-8899-49d5-8932-a8bca04339e3_dust_100k.spz",
+            "150k": "https://cdn.marble.worldlabs.ai/84503420-3010-4944-8fde-2f383cd08ebe/81958b80-f216-4018-8a5c-fd0ad2a76cbd_ceramic_150k.spz",
+            "full_res": "https://cdn.marble.worldlabs.ai/84503420-3010-4944-8fde-2f383cd08ebe/c4b4098a-41b2-42b0-9353-8235fdd490d5_ceramic.spz"
+          },
+          "semantics_metadata": {
+            "metric_scale_factor": 1.2125814,
+            "ground_plane_offset": 1.7368507
+          }
+        },
+        "thumbnail_url": "https://cdn.marble.worldlabs.ai/84503420-3010-4944-8fde-2f383cd08ebe/c8b5c3b4-0cee-4f74-9470-ed41703951bf_sand_mpi/thumbnail.webp",
+        "caption": "Create a navigable 3D interior of the empty spacecraft living cabin shown in the reference image. Preserve its roomy layout, pale warm wall panels, large left observation window showing a blue planet and stars, warm indirect lighting, rear airlock, metal deck seams and open central floor. This is a human-scale living room around 7 metres wide, 8 metres deep and 3.2 metres high, not a tiny display box. The room continues naturally behind the reference camera with enclosing spacecraft walls. Keep the central floor flat and walkable, and keep the door a normal human doorway. Preserve built-in perimeter platforms and shelves as part of the architecture. Do not add people, 2B, humanoids, statues, animals, freestanding cylinders, coffee machines, jukeboxes or loose furniture: a realtime engine will add the character and independent interactive objects later. No text, logos or watermark. Keep the lighting bright enough to clearly read the wall and floor surfaces and keep the open central activity area unobstructed."
+      },
+      "created_at": null,
+      "updated_at": null,
+      "permission": {
+        "public": false,
+        "allowed_readers": [],
+        "allowed_writers": [],
+        "allow_id_access": false
+      },
+      "world_prompt": null,
+      "world_marble_url": "https://marble.worldlabs.ai/world/84503420-3010-4944-8fde-2f383cd08ebe",
+      "model": null
+    },
+    "cost": {
+      "total_credits": 1580,
+      "line_items": [
+        {
+          "name": "Pano generation (image, non-pano)",
+          "credits": 80
+        },
+        {
+          "name": "World generation",
+          "credits": 1500
+        }
+      ]
+    }
+  },
+  "checked_at": "2026-09-05T04:47:47.362Z",
+  "world": {
+    "world_id": "84503420-3010-4944-8fde-2f383cd08ebe",
+    "display_name": "",
+    "tags": null,
+    "assets": {
+      "mesh": {
+        "collider_mesh_url": "https://cdn.marble.worldlabs.ai/84503420-3010-4944-8fde-2f383cd08ebe/514cb1c1.glb",
+        "hq_mesh_url": null,
+        "full_res_mesh_url": null
+      },
+      "imagery": {
+        "pano_url": "https://cdn.marble.worldlabs.ai/84503420-3010-4944-8fde-2f383cd08ebe/13256b02-c8bd-4576-9174-1947d8db899c_panos/rgb_0.png"
+      },
+      "splats": {
+        "spz_urls": {
+          "500k": "https://cdn.marble.worldlabs.ai/84503420-3010-4944-8fde-2f383cd08ebe/23df1b0a-ccfd-4f4f-9406-f6086ed3edf7_ceramic_500k.spz",
+          "100k": "https://cdn.marble.worldlabs.ai/84503420-3010-4944-8fde-2f383cd08ebe/33a25bd3-8899-49d5-8932-a8bca04339e3_dust_100k.spz",
+          "150k": "https://cdn.marble.worldlabs.ai/84503420-3010-4944-8fde-2f383cd08ebe/81958b80-f216-4018-8a5c-fd0ad2a76cbd_ceramic_150k.spz",
+          "full_res": "https://cdn.marble.worldlabs.ai/84503420-3010-4944-8fde-2f383cd08ebe/c4b4098a-41b2-42b0-9353-8235fdd490d5_ceramic.spz"
+        },
+        "semantics_metadata": {
+          "metric_scale_factor": 1.2125813961029053,
+          "ground_plane_offset": 1.7368507385253906
+        }
+      },
+      "thumbnail_url": "https://cdn.marble.worldlabs.ai/84503420-3010-4944-8fde-2f383cd08ebe/c8b5c3b4-0cee-4f74-9470-ed41703951bf_sand_mpi/thumbnail.webp",
+      "caption": "Create a navigable 3D interior of the empty spacecraft living cabin shown in the reference image. Preserve its roomy layout, pale warm wall panels, large left observation window showing a blue planet and stars, warm indirect lighting, rear airlock, metal deck seams and open central floor. This is a human-scale living room around 7 metres wide, 8 metres deep and 3.2 metres high, not a tiny display box. The room continues naturally behind the reference camera with enclosing spacecraft walls. Keep the central floor flat and walkable, and keep the door a normal human doorway. Preserve built-in perimeter platforms and shelves as part of the architecture. Do not add people, 2B, humanoids, statues, animals, freestanding cylinders, coffee machines, jukeboxes or loose furniture: a realtime engine will add the character and independent interactive objects later. No text, logos or watermark. Keep the lighting bright enough to clearly read the wall and floor surfaces and keep the open central activity area unobstructed."
+    },
+    "created_at": "2026-09-05T04:38:23Z",
+    "updated_at": "2026-09-05T04:43:48Z",
+    "permission": {
+      "public": false,
+      "allowed_readers": [],
+      "allowed_writers": [],
+      "allow_id_access": false
+    },
+    "world_prompt": {
+      "text_prompt": "Create a navigable 3D interior of the empty spacecraft living cabin shown in the reference image. Preserve its roomy layout, pale warm wall panels, large left observation window showing a blue planet and stars, warm indirect lighting, rear airlock, metal deck seams and open central floor. This is a human-scale living room around 7 metres wide, 8 metres deep and 3.2 metres high, not a tiny display box. The room continues naturally behind the reference camera with enclosing spacecraft walls. Keep the central floor flat and walkable, and keep the door a normal human doorway. Preserve built-in perimeter platforms and shelves as part of the architecture. Do not add people, 2B, humanoids, statues, animals, freestanding cylinders, coffee machines, jukeboxes or loose furniture: a realtime engine will add the character and independent interactive objects later. No text, logos or watermark. Keep the lighting bright enough to clearly read the wall and floor surfaces and keep the open central activity area unobstructed.",
+      "type": "image",
+      "image_prompt": {
+        "uri": "https://cdn.marble.worldlabs.ai/api/media-assets/APOAtTQUpyUzKXVSmDMNCsUXYqF2/7535668c-cfc3-4822-842c-30153cfd3384/reference-empty.png",
+        "data_base64": null,
+        "extension": "png"
+      },
+      "is_pano": false
+    },
+    "world_marble_url": "https://marble.worldlabs.ai/world/84503420-3010-4944-8fde-2f383cd08ebe",
+    "model": "marble-1.1"
+  }
+}

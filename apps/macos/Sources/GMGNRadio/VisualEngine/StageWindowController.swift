@@ -783,10 +783,13 @@ private final class StageContentView: NSView {
         }
     }
 
-    private func applySpatialPresentation(isWorldVisible: Bool) {
+    private func applySpatialPresentation(isWorldVisible _: Bool) {
         if spatialStage.isWorldPresentationRequested {
             attachRenderSurface()
         }
+        // Attaching the local room can synchronously finish presentation and
+        // reenter this observer. Do not restore the older loading state.
+        let isWorldVisible = spatialStage.isWorldVisible
         let state = StageSurfacePresentationState.resolve(
             isWorldPresentationRequested:
                 spatialStage.isWorldPresentationRequested,
