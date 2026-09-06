@@ -2,7 +2,7 @@
 
 ## 已完成与未完成
 
-已部署独立 Comfy 后端及带鉴权的异步 API，5个模型全部下载完成，并通过实际 API 提交原创参考图。**尚未产出真实 GLB，不能据此宣布道具已能放入空间。**首件被空闲内存门槛阻止，状态可查、可取消；本轮已停止远程轮询，不动旧Comfy缓存。
+已部署独立 Comfy 后端及带鉴权的异步 API，5个模型全部下载完成。首件最初因可用内存不足等待；用户随后明确授权释放旧Comfy模型缓存，原任务自动继续并已成功导出、校验和发布真实GLB。**图片转道具生成已通过首件验收，空间内视觉、尺度、碰撞和交互接入仍由主线验收。**
 
 ## 原环境只读检查
 
@@ -11,7 +11,7 @@
 - 原 ComfyUI：`8188`，源码 `5599a05`（2026-08-07），队列检查均为空。
 - 原 H3：`9000/api/h3/health`返回 `{"status":"ok"}`。
 - 原 Comfy 进程 PID `911345`，RSS 约 71,256,024 KiB。整机 121 GiB 内存，约 102—103 GiB 使用，17—18 GiB可用；GPU利用率0%不代表模型已释放。
-- 未重启、卸载、升级或停止上述服务；未调用旧 Comfy 释放模型缓存，也未读取其凭据。
+- 初始阶段未重启、卸载、升级或停止上述服务，未调用旧Comfy释放模型缓存，也未读取其凭据。后续仅在用户新授权下执行官方缓存释放，详情见“授权后首件真实生成”。
 
 ## 工作流与隔离部署
 
@@ -45,10 +45,10 @@
 - 任务 ID：`d30c33db0665442084444263cecede0e`。
 - 参考：脚本绘制的原创无品牌蓝积木，输入授权声明 CC0。
 - 用户目标高度：0.3米，不能当作从单图推断出的真实尺度。
-- 首次返回 `queued`；模型齐全后的最后回读是 `waiting_resources` / `shared_memory_busy`，无假成功、无 GLB链接。
+- 首次返回 `queued`；模型齐全后的第一阶段回读是 `waiting_resources` / `shared_memory_busy`，当时没有宣称生成成功。
 - 幂等键 `original-blue-block-v1`，重复提交复用同任务，不二次调用模型。
 
-最后 `/health` 回读：`status=api_ready`、`generation.ready=false`、`reason=shared_memory_busy`、`available_gib=17.9`、`minimum_gib=24`。API 后续每30秒确认旧、新 Comfy 队列空闲与可用内存，既有单件任务继续排队，不增加新任务。运营者获得用户许可并手工释放旧Comfy驻留缓存，或其他工作负载自然退出后，内存达到门槛即可自动继续；本服务不执行释放。
+第一阶段最后 `/health` 回读：`status=api_ready`、`generation.ready=false`、`reason=shared_memory_busy`、`available_gib=17.9`、`minimum_gib=24`。API 每30秒确认旧、新 Comfy 队列空闲与可用内存，既有单件任务继续排队，没有增加新任务。运营者获得用户许可并手工释放旧Comfy驻留缓存，或其他工作负载自然退出后，内存达到门槛即可自动继续；服务本身不执行释放。
 
 原8188最后仍返回空队列，H3仍返回`status=ok`；新两个进程均active，8190/8191只监听127.0.0.1。Token、数据库、进程锁文件权限均600。
 
@@ -73,8 +73,43 @@
 
 固定生成档位：TRELLIS.2，种子42，上采样1024、重网格256/2次平滑/100万预聚类、目标2万面、纹理/法线1024、AO512×16。下载后的 GLB要求≤32 MiB、≤22000面，必须无外部 URI。
 
+## 授权后首件真实生成
+
+用户明确授权释放旧Comfy模型缓存后，重新核对8188与8190均空队列、原任务仍为`waiting_resources`。只读检查旧`server.py:1192`确认`POST /free`仅设置`unload_models`和`free_memory`队列标记；随后向8188发送这两个布尔值为true，返回HTTP200。未停止或重启旧Comfy、未删除任何模型、未调用全局interrupt，H3检查仍正常。
+
+实际可用内存由约17.9 GiB升至约101 GiB。原任务自动从等待进入运行，没有新建任务或重新提交。Comfy正式执行记录：
+
+- API任务：`d30c33db0665442084444263cecede0e`。
+- Comfy任务：`546b1c5e-fa56-4769-a664-2c866f3bacce`。
+- `execution_start`: `1788666765286`；`execution_success`: `1788666924025`，推理与后处理共 **158.739秒**。
+- `execution_cached.nodes=[]`，本件没有复用节点计算结果。
+- 中间形状为6,410,702顶点、12,821,292面；后处理后正式输出为20,000面。
+- Comfy进程`MemoryPeak=11575586816`字节，约10.78 GiB，未调整20 GiB上限。结束后GPU利用率回到0%。
+
+正式产物：
+
+| 字段 | 实际值 |
+| --- | --- |
+| API状态 | completed，reason=null |
+| API下载 | `/v1/jobs/d30c33db0665442084444263cecede0e/model.glb` |
+| 服务发布文件 | `/home/spark/gmgn-prop-service/data/outputs/d30c33db0665442084444263cecede0e.glb` |
+| Comfy原始文件 | `/home/spark/gmgn-prop-service/comfyui/output/props/d30c33db0665442084444263cecede0e_00001.glb` |
+| SHA-256 | `b1642a74ee956c4920c884243825b845f4797a48109f8d79ad33ec1cd5bb077b` |
+| 字节数 | 1,597,348（约1.52 MiB） |
+| 面数 | 20,000三角面 |
+| 结构 | 1 primitive，1材质，5 accessor，无场景变换 |
+| 贴图 | 3张内嵌PNG：基础色、金属粗糙/AO、法线，无外部URI |
+| 局部尺寸 | 1.00789618 × 1.00790071 × 1.00789702模型单位 |
+| 局部范围 | min约(-0.50395048,-0.50395131,-0.50394917)，max约(0.50394571,0.50394940,0.50394785) |
+
+目标高度0.3米是用户/测试预设，按Y高度换算尺度约0.297648，尚未应用到GLB。返回`scale_calibrated=false`、`scale_requires_confirmation=true`、`interaction_status=unbound`，没有把图片转网格等同于已可交互物件。
+
+主任务独立核验：通过鉴权 API 下载到 DGX 临时目录，所得 SHA-256 与服务发布值一致；将发布 GLB 复制到 Mac 后，用实际 `glb_inspect.py` 重新检查，文件大小、面数、结构、尺寸及哈希再次一致。没有显示或复制 API 凭据到 Mac。
+
+本地资产位于 `/Users/ghostcorn/dev/gmgnradio/tmp/generated-props/d30c33db0665442084444263cecede0e/blue-block.glb`；同目录 `preview.png` 为真实 GLB 的预览。使用 Blender 5.2 无窗口导入，CPU 两线程、640×640、16采样渲染，约6秒完成；未启动 GMGN 或进行桌面操作。图像检查确认蓝色立方体、完整表面和可见材质，边缘有少量生成起伏。此件只验证服务流程；不能用简单立方体的成功推断复杂家具、活动部件或角色绑定的质量。
+
 ## 接入主线所需的下一份证据
 
-生成成功后需补充真实 GLB 哈希、面数、材质、模型局部尺寸与预览，并将产物交给空间物件导入：确认目标尺寸、坐标轴、落地、碰撞和交互绑定。服务返回 `inspect/place`用途候选；`interaction_bindings=[]`和`interaction_status=unbound`明确尚未赋予实际游戏动作。
+真实GLB哈希、面数、材质、模型局部尺寸、API下载与本地预览已验证；仍需主线完成空间物件导入：确认目标尺寸、坐标轴、落地、碰撞和交互绑定。服务返回 `inspect/place`用途候选；`interaction_bindings=[]`和`interaction_status=unbound`明确尚未赋予实际游戏动作。
 
-本轮未触发付费云API；成本为用户DGX计算与模型下载/存储。还没有真实生成耗时和内存峰值数据。Comfy-Org模型页标注MIT，但上线交易前仍需分别核对基础模型、编码器、输入图及输出资产的许可范围。
+本轮未触发付费云API；成本为用户DGX计算与模型下载/存储。首件约158.739秒、Comfy进程内存峰值约10.78 GiB，仅代表本次简单积木和固定低档，不能外推复杂物件。Comfy-Org模型页标注MIT，但上线交易前仍需分别核对基础模型、编码器、输入图及输出资产的许可范围。
