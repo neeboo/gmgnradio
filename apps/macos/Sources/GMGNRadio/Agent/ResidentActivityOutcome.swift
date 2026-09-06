@@ -2,12 +2,14 @@ import Foundation
 
 enum ResidentActivityOutcomeError: Error, LocalizedError, Equatable {
     case unsupportedPlaybackSource, effectAlreadyHandled, interrupted, timedOut
+    case musicNotPrepared
     var errorDescription: String? {
         switch self {
         case .unsupportedPlaybackSource: "当前点唱机操作暂不支持该播放源，请使用播放器手动操作。"
         case .effectAlreadyHandled: "这次点唱机操作已经处理，无法再次确认播放结果。"
         case .interrupted: "本次点唱机操作已取消或被其他活动替换。"
         case .timedOut: "居民未能及时完成点唱机操作。"
+        case .musicNotPrepared: "当前没有已准备的曲目，音乐尚未播放。可通过可用音乐工具查询状态和已有歌单。"
         }
     }
 }
@@ -119,8 +121,10 @@ final class ResidentActivityOutcome {
                 code = "playback_source_unsupported"; message = ResidentActivityOutcomeError.unsupportedPlaybackSource.localizedDescription
             } else if (error as? ResidentActivityOutcomeError) == .timedOut {
                 code = "activity_timed_out"; message = "居民未能及时完成点唱机操作。"
+            } else if (error as? ResidentActivityOutcomeError) == .musicNotPrepared {
+                code = "music_not_prepared"; message = ResidentActivityOutcomeError.musicNotPrepared.localizedDescription
             } else {
-                code = "music_playback_failed"; message = "点唱机未能开始播放，请先在播放器选择可用曲目。"
+                code = "music_playback_failed"; message = "点唱机未能开始播放，音乐尚未播放。可通过可用音乐工具检查播放器状态。"
             }
             return response(result.callID, ok: false, code: code, message: message)
         }

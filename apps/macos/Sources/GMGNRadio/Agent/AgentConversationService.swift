@@ -507,7 +507,7 @@ final class AgentConversationService {
                 throw AgentConversationError.worldToolsUnavailable
             }
         }
-        let scope = worldContext.map { $0.sessionScope + (worldTools == nil ? "" : ".tools.v2") }
+        let scope = worldContext.map { $0.sessionScope + (worldTools == nil ? "" : ".tools.v3") }
         currentSessionScope = scope
         let prompt = try worldContext?.prompt(for: text, toolsAvailable: worldTools != nil) ?? text
         let id = effectiveBackendID

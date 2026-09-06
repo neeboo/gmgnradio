@@ -33,6 +33,7 @@ import Foundation
     func cancel() { cancels += 1 }
 }
 @MainActor final class App {
+    var musicSelectionGeneration: UInt64 = 0
     var residentAgentLoop: Loop? = Loop()
     var voiceStops = 0
     func disconnectRealtimeVoice() { voiceStops += 1 }

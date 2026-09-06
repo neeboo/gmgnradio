@@ -546,6 +546,9 @@ final class AppDelegate:
         )
     )
     private var activeProgram: ProgramPlan?
+    private var isPreparingMusicLibraryTrack = false
+    /// Shared by resident and DJ preparation; newer playback intent invalidates late commits.
+    private var musicSelectionGeneration: UInt64 = 0
     private var interruptionCoordinator: InterruptionCoordinator?
     private var orbWindowController: OrbWindowController?
     private var stageWindowController: StageWindowController?
@@ -1078,6 +1081,8 @@ final class AppDelegate:
     private func startAIProgram(
         immediateUserInstruction: String?
     ) {
+        musicSelectionGeneration &+= 1
+        let requestedGeneration = musicSelectionGeneration
         orbWindowController?.setState(.thinking)
         activeProgram = nil
         updateStageProgramNavigation()
@@ -1086,21 +1091,37 @@ final class AppDelegate:
             guard let self else {
                 return
             }
+            var ownedGeneration = requestedGeneration
+            var committedQueue: ProgramPlaybackQueue?
+            let isCurrent: @MainActor () -> Bool = {
+                !Task.isCancelled && self.musicSelectionGeneration == ownedGeneration
+                    && (committedQueue == nil || self.programPlaybackQueue === committedQueue)
+            }
+            guard isCurrent() else { return }
             do {
                 let plan = try await makeAIProgramPlan(
                     immediateUserInstruction:
                         immediateUserInstruction
                 )
-                activeProgram = plan
-                programStore.publish(plan)
-                try await programPlaybackQueue.load(plan)
-                guard let prepared = programPlaybackQueue.current else {
+                guard isCurrent() else { return }
+                let queue = ProgramPlaybackQueue(preflight: PlaybackPreflight(
+                    preparer: MusicRuntimePlaybackPreparer(runtime: musicRuntime)))
+                try await queue.load(plan)
+                guard isCurrent() else { return }
+                guard let prepared = queue.current else {
                     throw ProgramPlaybackQueueError.noPlayableSlots(
-                        failedTrackIDs: programPlaybackQueue.failedTrackIDs
+                        failedTrackIDs: queue.failedTrackIDs
                     )
                 }
-                try await playPreparedWithFallback(prepared)
+                committedQueue = queue
+                programPlaybackQueue = queue
+                activeProgram = plan
+                programStore.publish(plan)
+                try await playPreparedWithFallback(prepared,
+                    isCurrentSelection: isCurrent,
+                    onSelectionCommitted: { ownedGeneration = self.musicSelectionGeneration })
             } catch {
+                guard isCurrent() else { return }
                 orbWindowController?.setState(.failed)
                 activeProgram = nil
                 updateStageProgramNavigation()
@@ -1296,6 +1317,7 @@ final class AppDelegate:
     }
 
     private func cancelResidentMessage() {
+        musicSelectionGeneration &+= 1
         disconnectRealtimeVoice()
         if let residentAgentLoop { residentAgentLoop.stop() }
         else { AgentConversationService.shared.cancel() }
@@ -1372,6 +1394,8 @@ final class AppDelegate:
             return
         }
 
+        musicSelectionGeneration &+= 1
+
         do {
             activeProgram = nil
             updateStageProgramNavigation()
@@ -1382,6 +1406,7 @@ final class AppDelegate:
     }
 
     func toggleLocalPlayback() {
+        musicSelectionGeneration &+= 1
         residentAgentLoop?.stop()
         residentJukeboxPlaybackOwner = nil
         let route = ProgramPlaybackToggleRoute.resolve(
@@ -1421,6 +1446,7 @@ final class AppDelegate:
         loadSidecarLyrics: Bool = true
     ) throws {
         try Task.checkCancellation()
+        musicSelectionGeneration &+= 1
         residentJukeboxPlaybackOwner = ResidentActivityOutcome.playbackOwner
         playbackLogger.info(
             "本地播放开始：url=\(url.path, privacy: .public)，sidecar=\(loadSidecarLyrics)"
@@ -1590,6 +1616,7 @@ final class AppDelegate:
         programID: String,
         at slotIndex: Int
     ) {
+        musicSelectionGeneration &+= 1
         residentAgentLoop?.stop()
         guard
             !isStartingProgramPlayback,
@@ -1678,6 +1705,7 @@ final class AppDelegate:
     }
 
     private func playPreviousProgramTrack() {
+        musicSelectionGeneration &+= 1
         residentAgentLoop?.stop()
         guard
             activeProgram != nil,
@@ -1700,6 +1728,7 @@ final class AppDelegate:
     }
 
     private func playNextProgramTrack() {
+        musicSelectionGeneration &+= 1
         residentAgentLoop?.stop()
         guard activeProgram != nil else {
             return
@@ -1736,20 +1765,27 @@ final class AppDelegate:
     private func playPreparedWithFallback(
         _ initial: PreparedProgramPlayback,
         requestOpening: Bool = true,
-        allowFallback: Bool = true
+        allowFallback: Bool = true,
+        isCurrentSelection: @MainActor () -> Bool = { true },
+        onSelectionCommitted: @MainActor () -> Void = {}
     ) async throws {
         playbackLogger.info(
             "准备播放：track=\(initial.slot.track.id, privacy: .public)，title=\(initial.slot.track.title, privacy: .public)，fallback=\(allowFallback)，opening=\(requestOpening)"
         )
         var prepared: PreparedProgramPlayback? = initial
         while let candidate = prepared {
+            guard isCurrentSelection() else { throw CancellationError() }
             do {
                 try await playPrepared(
                     candidate,
-                    requestOpening: requestOpening
+                    requestOpening: requestOpening,
+                    isCurrentSelection: isCurrentSelection,
+                    onSelectionCommitted: onSelectionCommitted
                 )
+                guard isCurrentSelection() else { throw CancellationError() }
                 return
             } catch {
+                guard isCurrentSelection() else { throw CancellationError() }
                 playbackLogger.error(
                     "歌曲播放失败：track=\(candidate.slot.track.id, privacy: .public)，error=\(error.localizedDescription, privacy: .public)"
                 )
@@ -1758,6 +1794,7 @@ final class AppDelegate:
                 }
                 prepared = await programPlaybackQueue
                     .replaceCurrentAfterFailure()
+                guard isCurrentSelection() else { throw CancellationError() }
                 playbackLogger.info(
                     "自动候补：next=\(prepared?.slot.track.id ?? "nil", privacy: .public)"
                 )
@@ -1770,7 +1807,9 @@ final class AppDelegate:
 
     private func playPrepared(
         _ prepared: PreparedProgramPlayback,
-        requestOpening: Bool = true
+        requestOpening: Bool = true,
+        isCurrentSelection: @MainActor () -> Bool = { true },
+        onSelectionCommitted: @MainActor () -> Void = {}
     ) async throws {
         try Task.checkCancellation()
         if ResidentActivityOutcome.playbackOwner != nil,
@@ -1797,14 +1836,18 @@ final class AppDelegate:
         )
         let previouslyCommittedTrack = committedPlaybackTrack
 
+        musicSelectionGeneration &+= 1
+        onSelectionCommitted()
         switch prepared.target {
         case let .localFile(url):
+            defer { onSelectionCommitted() }
             try playLocalTrack(url, loadSidecarLyrics: false)
         case let .providerReference(providerID, trackID):
             guard providerID == .appleMusic else {
                 throw MusicProviderClientError.playbackUnavailable
             }
             try await musicRuntime.startAppleMusic(trackID: trackID)
+            guard isCurrentSelection() else { throw CancellationError() }
             orbWindowController?.setState(.playing)
             stageWindowController?.setPlaybackState(.playing)
         }
@@ -1831,6 +1874,7 @@ final class AppDelegate:
             trackTitle: slot.track.title
         )
         await present(plan: activeProgram, slotIndex: index)
+        guard isCurrentSelection() else { throw CancellationError() }
         let lyricTrackID = slot.track.id
         Task { [weak self] in
             guard
@@ -2365,7 +2409,7 @@ final class AppDelegate:
                 liveCamWindowController?.showChatStatus("点唱机开始播放音乐。")
             } catch {
                 liveCamWindowController?.showChatStatus(
-                    "点唱机暂时无法播放，请先在播放器选择音乐。\(error.localizedDescription)"
+                    "点唱机尚未开始播放。\(error.localizedDescription)"
                 )
                 livingWorldLogger.error("点唱机播放失败：\(error.localizedDescription, privacy: .public)")
             }
@@ -3055,7 +3099,8 @@ final class AppDelegate:
                     return RealtimeDJToolResult(callID: id, resultJSON: result.data, isError: result.isError)
                 })
         }
-        // This lease authorizes only registered world and loop tools for this turn.
+        let musicTools = ResidentMusicToolBridge(actions: self, isCurrent: isCurrent)
+        // This lease authorizes only registered world, loop and music-library tools for this turn.
         // It does not grant the wider DJ, account, shell or desktop capabilities.
         let dispatcher = WorldAgentToolDispatcher(takeoverEnabled: { true }, context: context,
             onActivityStarted: { [weak self] context, requestID in
@@ -3071,7 +3116,7 @@ final class AppDelegate:
             beforeDispatch: { id, name, arguments in outcome.prepare(callID: id, name: name, argumentsJSON: arguments) },
             afterDispatch: { name, arguments, result in await outcome.complete(name: name, argumentsJSON: arguments, result: result) },
             onCancel: { outcome.abort() },
-            additionalTools: additionalTools,
+            additionalTools: additionalTools + musicTools.tools,
             maximumCalls: 32
         )
         return ResidentConversationTools(
@@ -3099,6 +3144,7 @@ final class AppDelegate:
         }
         let route = ProgramPlaybackStartRoute.resolve(playerState: localMusicPlayer.state,
             hasPreparedProgram: activeProgram != nil && programPlaybackQueue.current != nil)
+        if route == .unavailable { throw ResidentActivityOutcomeError.musicNotPrepared }
         if route == .startPreparedProgram, let prepared = programPlaybackQueue.current,
            case .providerReference = prepared.target {
             throw ResidentActivityOutcomeError.unsupportedPlaybackSource
@@ -3315,10 +3361,75 @@ final class AppDelegate:
         )
     }
 
+    private func makeMusicLibraryAgentService() -> MusicLibraryAgentService {
+        let selectedWorld = spatialStage.selectedWorldID
+        let context = livingWorldContext
+        let runtime = musicRuntime
+        let selectionGeneration = musicSelectionGeneration
+        return MusicLibraryAgentService(
+            store: musicLibraryStore,
+            fetchPage: { provider, playlistID, offset, limit in
+                return try await runtime.fetchPlaylistPage(providerID: provider,
+                    playlistID: playlistID, offset: offset, limit: limit)
+            },
+            makeQueue: {
+                // Preparation owns a private queue until the selection is ready.
+                return ProgramPlaybackQueue(preflight: PlaybackPreflight(
+                    preparer: MusicRuntimePlaybackPreparer(runtime: runtime)), lockedCapacity: 0)
+            },
+            isCurrent: { [weak self] in
+                guard let self else { return false }
+                return !Task.isCancelled && spatialStage.selectedWorldID == selectedWorld
+                    && livingWorldContext === context
+                    && musicSelectionGeneration == selectionGeneration
+            },
+            commit: { [weak self] plan, queue, index in
+                guard let self else { throw CancellationError() }
+                guard musicSelectionGeneration == selectionGeneration else {
+                    throw DJAgentMusicLibraryError.interrupted
+                }
+                try commitMusicLibraryPreparation(plan: plan, queue: queue, index: index)
+            }
+        )
+    }
+
+    func listMusicPlaylists(query: String?, offset: Int, limit: Int) async throws -> DJAgentMusicPlaylistsPage {
+        try makeMusicLibraryAgentService().list(query: query, offset: offset, limit: limit)
+    }
+
+    func readMusicPlaylist(playlistID: String, offset: Int, limit: Int) async throws -> DJAgentMusicPlaylistPage {
+        try await makeMusicLibraryAgentService().read(playlistID: playlistID, offset: offset, limit: limit)
+    }
+
+    func prepareMusicTrack(playlistID: String, trackID: String) async throws -> DJAgentMusicPreparation {
+        guard !isPreparingMusicLibraryTrack, !isStartingProgramPlayback else {
+            throw DJAgentMusicLibraryError.busy
+        }
+        isPreparingMusicLibraryTrack = true
+        defer { isPreparingMusicLibraryTrack = false }
+        return try await makeMusicLibraryAgentService().prepare(playlistID: playlistID, trackID: trackID)
+    }
+
+    private func commitMusicLibraryPreparation(plan: ProgramPlan, queue: ProgramPlaybackQueue, index: Int) throws {
+        try Task.checkCancellation()
+        guard !isStartingProgramPlayback else { throw DJAgentMusicLibraryError.busy }
+        musicSelectionGeneration &+= 1
+        localMusicPlayer.stop()
+        residentJukeboxPlaybackOwner = nil
+        committedPlaybackTrack = nil
+        activeProgram = plan
+        programPlaybackQueue = queue
+        programStore.publish(plan)
+        programStore.activateSlot(at: index)
+        stageWindowController?.setPlaybackState(.ready)
+        updateStageProgramNavigation()
+    }
+
     func playProgramTrack(
         trackID: String?,
         slotIndex: Int?
     ) async throws {
+        musicSelectionGeneration &+= 1
         guard
             let plan = activeProgram ?? programStore.plan
         else {
@@ -3363,6 +3474,7 @@ final class AppDelegate:
     }
 
     func playNextTrack() async throws {
+        musicSelectionGeneration &+= 1
         guard activeProgram != nil else {
             throw DJAgentRadioActionError.noProgram
         }
@@ -3380,6 +3492,7 @@ final class AppDelegate:
     }
 
     func playPreviousTrack() async throws {
+        musicSelectionGeneration &+= 1
         guard
             activeProgram != nil,
             let previous = programPlaybackQueue.returnToPrevious()
@@ -3394,6 +3507,7 @@ final class AppDelegate:
     }
 
     func pauseMusic() async throws {
+        musicSelectionGeneration &+= 1
         residentJukeboxPlaybackOwner = nil
         guard localMusicPlayer.state == .playing else {
             return
@@ -3405,6 +3519,7 @@ final class AppDelegate:
 
     func resumeMusic() async throws {
         try Task.checkCancellation()
+        musicSelectionGeneration &+= 1
         let route = ProgramPlaybackStartRoute.resolve(
             playerState: localMusicPlayer.state,
             hasPreparedProgram:
@@ -3543,6 +3658,7 @@ final class AppDelegate:
     }
 
     func activatePreparedProgram() async throws {
+        musicSelectionGeneration &+= 1
         guard let proposal = programStore.pendingPlan else {
             throw DJAgentRadioActionError.noPreparedProgram
         }
@@ -3591,6 +3707,7 @@ final class AppDelegate:
     private func scheduleBackgroundTrackInsertion(
         immediateInstruction: String
     ) {
+        musicSelectionGeneration &+= 1
         backgroundProgramAgentTask?.cancel()
         let requestID = UUID()
         backgroundProgramRequestID = requestID
@@ -3629,6 +3746,7 @@ final class AppDelegate:
                         proposal: proposal,
                         mode: .insertNext
                     )
+                    musicSelectionGeneration &+= 1
                     activeProgram = revised
                     programStore.publish(revised)
                     programStore.activateSlot(at: activeSlotIndex)
@@ -3803,7 +3921,7 @@ private enum DJAgentRadioActionError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .noProgram:
-            "当前还没有可接管的节目"
+            "当前没有已准备的播放节目。"
         case .noPreparedProgram:
             "后台还没有准备好可切换的新节目"
         case .trackNotFound:

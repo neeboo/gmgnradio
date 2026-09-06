@@ -94,7 +94,7 @@ struct TextRunner: CodexCommandRunning {
         captured.pending?.resume(returning: AgentConversationOutcome(reply: "late", sessionID: "late-session"))
         captured.pending = nil
         check(await task.value, "late successful sender cannot return after cancellation")
-        check(blocked.preferenceStore.sessionID(for: .codex, scope: world.sessionScope + ".tools.v2") == "tools-thread", "late session never overwrites original")
+        check(blocked.preferenceStore.sessionID(for: .codex, scope: world.sessionScope + ".tools.v3") == "tools-thread", "late session never overwrites original")
         print("\(failed == 0 ? "PASS" : "FAIL"): \(count) resident routing checks, \(failed) failures")
         exit(failed == 0 ? 0 : 1)
     }

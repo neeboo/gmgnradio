@@ -30,6 +30,11 @@ let replyMethods = ["func beginAgentReply(", "func finishAgentReply(", "func sho
 let harness = #"""
 import Foundation
 import WorldRuntime
+enum StageVisualMood: String, CaseIterable { case afterglow, liquid, pulse }
+enum StageLyricsVisualMode: String { case auto; static let agentValues = ["auto"]; init?(agentValue: String) { self.init(rawValue: agentValue) } }
+enum SpatialScenePreset: String, CaseIterable { case cabin }
+enum SpatialWeather: String, CaseIterable { case clear }
+enum SpatialCameraCommandDirection: String, CaseIterable { case reset }
 
 struct RealtimeDJToolCall: Codable, Equatable, Sendable {
     let id: String; let name: String; let argumentsJSON: Data
@@ -148,7 +153,8 @@ typealias RealConversationService = AgentConversationService
     func announce(_ reply: String) { spoken.append(reply) }
     func stop() {}
 }
-@MainActor final class AppHarness {
+@MainActor final class AppHarness: DJAgentRadioActions {
+    var musicSelectionGeneration: UInt64 = 0
     // Resolve the production method's singleton lookup to the injected real
     // service; the method itself is compiled unchanged, UI/TTS are inert sinks.
     enum AgentConversationService { static var shared: RealConversationService! }
@@ -182,6 +188,21 @@ typealias RealConversationService = AgentConversationService
     \#(toolsMethod)
     private func resumeResidentJukebox(owner: UUID) async throws { fatalError("Use the jukebox outcome suite for playback") }
     private func pauseResidentJukebox(owner: UUID?) async throws { fatalError("Use the jukebox outcome suite for playback") }
+    func snapshot(takeoverEnabled: Bool) -> DJAgentRadioState { .init(takeoverEnabled: takeoverEnabled, playbackState: "idle", activeTrackID: nil, activeSlotIndex: nil, program: []) }
+    func currentTrackSnapshot() -> DJAgentCurrentTrackSnapshot? { nil }
+    func playProgramTrack(trackID: String?, slotIndex: Int?) async throws { fatalError("unexpected playback") }
+    func playNextTrack() async throws { fatalError("unexpected playback") }
+    func playPreviousTrack() async throws { fatalError("unexpected playback") }
+    func pauseMusic() async throws { fatalError("unexpected playback") }
+    func resumeMusic() async throws { fatalError("unexpected playback") }
+    func replanProgram(immediateInstruction: String?) async throws { fatalError("unexpected replan") }
+    func activatePreparedProgram() async throws { fatalError("unexpected playback") }
+    func insertTrack(immediateInstruction: String) async throws { fatalError("unexpected insert") }
+    func setVisualMood(_ mood: StageVisualMood) async throws { fatalError("unexpected visual") }
+    func searchMusic(query: String, limit: Int) async throws -> [DJAgentMusicTrack] { fatalError("unexpected search") }
+    func setLyricsMode(_ mode: StageLyricsVisualMode) async throws { fatalError("unexpected visual") }
+    func setSpatialEnvironment(scene: SpatialScenePreset?, weather: SpatialWeather?) async throws { fatalError("unexpected world change") }
+    func moveSpatialCamera(direction: SpatialCameraCommandDirection, distance: Float) async throws { fatalError("unexpected camera") }
     func enqueue(_ message: String) async { await sendLiveCamMessage(message) }
     func stop() { cancelResidentMessage() }
     func waitUntilIdle() async {
@@ -241,8 +262,8 @@ typealias RealConversationService = AgentConversationService
             await formal.waitForCalls(1)
             let tools = formal.tools[0]
             check(tools.worldID == manifest.worldID, "\(mode): App binds actual world to formal tools")
-            check((try JSONSerialization.jsonObject(with: tools.schemasJSON) as? [Any])?.count == 6,
-                  "\(mode): App exposes four world tools and two loop tools")
+            check((try JSONSerialization.jsonObject(with: tools.schemasJSON) as? [Any])?.count == 11,
+                  "\(mode): App exposes four world, two loop and five music tools")
             check(formal.prompts[0].contains("这是居民生活循环的一轮"), "\(mode): actual App supplies generic loop instructions")
             let observed = await tools.call("loop-read", "read_resident_state", Data("{}".utf8))
             check(!observed.isError && !tools.allowsSilentCompletion(), "\(mode): reading state alone does not authorize silent completion")
@@ -626,6 +647,8 @@ let compilerArguments: [String] = ["-j1", "-parse-as-library",
     sources.appendingPathComponent("Agent/ResidentAgentLoop.swift").path,
     sources.appendingPathComponent("Agent/ResidentLoopTools.swift").path,
     sources.appendingPathComponent("Agent/ResidentActivityOwnership.swift").path,
+    sources.appendingPathComponent("Agent/DJAgentToolDispatcher.swift").path,
+    sources.appendingPathComponent("Agent/ResidentMusicToolBridge.swift").path,
     program.path, "-o", executable.path]
 let runtimeObjects = try FileManager.default.contentsOfDirectory(
         at: root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug/WorldRuntime.build"),

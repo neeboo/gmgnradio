@@ -336,7 +336,7 @@ func fake() {
         check(await service.steerResident("慢一点") == .delivered, "service steers the actual active resident")
         check(try await serviceTask.value == "已完成空间活动", "steering retains original reply task")
         check(try !frames(serviceAudit).contains { $0["method"] as? String == "thread/resume" }, "new tools registry does not resume legacy session")
-        check(service.preferenceStore.sessionID(for: .codex, scope: context.sessionScope + ".tools.v2") == "resident-session", "new registry session is stored separately")
+        check(service.preferenceStore.sessionID(for: .codex, scope: context.sessionScope + ".tools.v3") == "resident-session", "new registry session is stored separately")
         check(await service.steerResident("结束后") == .notDelivered, "service releases finished resident")
         service.selectBackend(.dsh)
         check(await service.steerResident("不支持") == .notDelivered, "unsupported backend steering remains unsent")

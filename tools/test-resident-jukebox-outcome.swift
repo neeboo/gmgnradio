@@ -78,6 +78,7 @@ enum PlayerError: Error { case missingTrack, pauseFailed }
     var programPlaybackQueue = Queue(current: Prepared(target: .localFile))
     var livingCabinJukeboxGate = LivingCabinJukeboxGate()
     var residentJukeboxPlaybackOwner: UUID?
+    var musicSelectionGeneration: UInt64 = 0
     var resumes = 0
     var pauses = 0
     init(_ context: WorldAgentContext) {
@@ -113,6 +114,7 @@ func code(_ result: RealtimeDJToolResult) -> String? { (try? JSONSerialization.j
     var starts = 0
     var pauses = 0
     var fails = false
+    var musicNotPrepared = false
     var unsupported = false
     var pauseFails = false
     var navigationHeld = false
@@ -142,6 +144,7 @@ func code(_ result: RealtimeDJToolResult) -> String? { (try? JSONSerialization.j
                     startedAt: active.startedAt, phase: self.context.snapshot.activeActivity!.phase.rawValue,
                     requestID: self.context.currentActivityRequestID), "tracked playback consumes existing gate once")
                 if self.unsupported { throw ResidentActivityOutcomeError.unsupportedPlaybackSource }
+                if self.musicNotPrepared { throw ResidentActivityOutcomeError.musicNotPrepared }
                 self.starts += 1
                 self.playbackOwner = owner
                 if self.playerHeld { await withCheckedContinuation { self.playerWait = $0 } }
@@ -198,7 +201,21 @@ func code(_ result: RealtimeDJToolResult) -> String? { (try? JSONSerialization.j
             let f = try Fixture(); f.fails = true
             let result = await f.start()
             check(result.isError && code(result) == "music_playback_failed", "missing track or player failure reaches same formal tool")
+            let payload = try JSONSerialization.jsonObject(with: result.resultJSON) as! [String: Any]
+            check(!(payload["message"] as? String ?? "").contains("请先在播放器选择"),
+                  "generic player failure does not force user to select music manually")
             check(!f.playing && f.context.state.activeActivity == nil, "failed playback ends owned activity")
+        }
+        do {
+            let f = try Fixture(); f.musicNotPrepared = true
+            let result = await f.start()
+            check(result.isError && code(result) == "music_not_prepared", "missing preparation has a distinct actionable fact code")
+            let payload = try JSONSerialization.jsonObject(with: result.resultJSON) as! [String: Any]
+            let message = payload["message"] as? String ?? ""
+            check(message.contains("可用音乐工具") && message.contains("音乐尚未播放"),
+                  "missing preparation describes actual state and available tool recovery")
+            check(!f.playing && f.starts == 0 && f.context.state.activeActivity == nil,
+                  "missing preparation ends owned activity without claiming playback")
         }
         do {
             let f = try Fixture(); f.unsupported = true
@@ -306,7 +323,8 @@ func code(_ result: RealtimeDJToolResult) -> String? { (try? JSONSerialization.j
             let absent = AppPlaybackHarness(f.context)
             absent.activeProgram = nil; absent.programPlaybackQueue.current = nil
             do { try await absent.play(UUID()); check(false, "missing program must fail") }
-            catch { check(absent.resumes == 1, "missing program error comes from existing resume function") }
+            catch { check(error as? ResidentActivityOutcomeError == .musicNotPrepared && absent.resumes == 0,
+                          "actual App reports missing preparation before calling player") }
             let provider = AppPlaybackHarness(f.context)
             provider.programPlaybackQueue.current = .init(target: .providerReference)
             do { try await provider.pause(nil); check(false, "unsupported provider cannot be reported paused") }

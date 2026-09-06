@@ -344,6 +344,37 @@ enum DJAgentCapabilityManifest {
             requiredParameters: ["query"]
         ),
         DJAgentCapability(
+            name: "list_music_playlists",
+            description: "查询用户已经同步的歌单；只返回真实歌单和分页状态，不替用户选择音乐",
+            requiresTakeover: false,
+            parameters: [
+                "query": DJAgentToolParameter(type: "string", description: "可选的歌单名称关键词；不传时分页列出全部已有歌单"),
+                "offset": DJAgentToolParameter(type: "integer", description: "从 0 开始的分页位置"),
+                "limit": DJAgentToolParameter(type: "integer", description: "每页 1 到 50 项，默认 20"),
+            ]
+        ),
+        DJAgentCapability(
+            name: "read_music_playlist",
+            description: "按真实歌单 ID 分页读取曲目；内容未缓存时从已连接服务读取，不启动登录",
+            requiresTakeover: false,
+            parameters: [
+                "playlist_id": DJAgentToolParameter(type: "string", description: "列表工具返回的真实歌单 ID"),
+                "offset": DJAgentToolParameter(type: "integer", description: "从 0 开始的曲目位置"),
+                "limit": DJAgentToolParameter(type: "integer", description: "每页 1 到 50 首，默认 20"),
+            ],
+            requiredParameters: ["playlist_id"]
+        ),
+        DJAgentCapability(
+            name: "prepare_music_track",
+            description: "准备指定歌单中的真实曲目；成功后暂停现有播放并选择该曲目，但不开始播放、不自动候补。播放需另行调用可用播放工具或使用空间中的点唱机活动。",
+            requiresTakeover: true,
+            parameters: [
+                "playlist_id": DJAgentToolParameter(type: "string", description: "已读取的真实歌单 ID"),
+                "track_id": DJAgentToolParameter(type: "string", description: "该歌单内容中返回的真实曲目 ID"),
+            ],
+            requiredParameters: ["playlist_id", "track_id"]
+        ),
+        DJAgentCapability(
             name: "play_program_track",
             description: "按 track_id 或 slot_index 播放节目中的歌曲",
             requiresTakeover: true,
@@ -549,6 +580,71 @@ struct DJAgentPlaybackTrack: Codable, Equatable, Sendable {
     let artist: String
 }
 
+struct DJAgentMusicPlaylist: Codable, Equatable, Sendable {
+    let id: String
+    let provider: String
+    let name: String
+    let trackCount: Int
+    let loadedTrackCount: Int
+    let supportsPreparation: Bool
+}
+
+struct DJAgentMusicPlaylistsPage: Codable, Equatable, Sendable {
+    let playlists: [DJAgentMusicPlaylist]
+    let offset: Int
+    let nextOffset: Int?
+    let isSyncing: Bool
+}
+
+struct DJAgentMusicPlaylistPage: Codable, Equatable, Sendable {
+    let playlistID: String
+    let tracks: [DJAgentMusicTrack]
+    let offset: Int
+    let nextOffset: Int?
+    let totalTrackCount: Int
+}
+
+struct DJAgentMusicPreparation: Codable, Equatable, Sendable {
+    let playlistID: String
+    let trackID: String
+    var status: String = "prepared"
+    var isPlaying: Bool = false
+}
+
+/// Deliberately closed errors: provider descriptions may contain signed URLs or credentials.
+enum DJAgentMusicLibraryError: Error, LocalizedError, Equatable {
+    case unsupported, invalidArguments, playlistNotFound, trackNotFound
+    case sourceUnsupported, libraryUnavailable, preparationFailed, interrupted, busy
+
+    var code: String {
+        switch self {
+        case .unsupported: "music_library_unsupported"
+        case .invalidArguments: "invalid_arguments"
+        case .playlistNotFound: "playlist_not_found"
+        case .trackNotFound: "track_not_found"
+        case .sourceUnsupported: "playback_source_unsupported"
+        case .libraryUnavailable: "music_library_unavailable"
+        case .preparationFailed: "music_preparation_failed"
+        case .interrupted: "operation_cancelled"
+        case .busy: "music_busy"
+        }
+    }
+
+    var errorDescription: String? {
+        switch self {
+        case .unsupported: "当前播放器尚未接通歌单工具。"
+        case .invalidArguments: "歌单工具参数无效，请使用真实编号和有效分页范围。"
+        case .playlistNotFound: "当前已有歌单中没有这个编号，请重新读取歌单列表。"
+        case .trackNotFound: "这张歌单已读取的内容中没有这首曲目，请查询歌单内容。"
+        case .sourceUnsupported: "当前来源不支持居民准备和验证播放。"
+        case .libraryUnavailable: "当前无法读取更多歌单内容，已有缓存仍可查询。"
+        case .preparationFailed: "指定曲目准备失败，音乐尚未开始播放。"
+        case .interrupted: "本次音乐操作已取消或被更新的操作替换。"
+        case .busy: "播放器正在处理其他操作，请稍后查询状态。"
+        }
+    }
+}
+
 struct DJAgentCurrentTrackSnapshot: Codable, Equatable, Sendable {
     let sampledAt: String
     let playbackState: String
@@ -603,6 +699,9 @@ struct DJAgentToolResponse: Codable, Equatable, Sendable {
     let state: DJAgentRadioState?
     let tracks: [DJAgentMusicTrack]?
     let currentTrack: DJAgentCurrentTrackSnapshot?
+    var playlistsPage: DJAgentMusicPlaylistsPage? = nil
+    var playlistPage: DJAgentMusicPlaylistPage? = nil
+    var preparation: DJAgentMusicPreparation? = nil
 }
 
 @MainActor
@@ -625,6 +724,9 @@ protocol DJAgentRadioActions: AnyObject {
         query: String,
         limit: Int
     ) async throws -> [DJAgentMusicTrack]
+    func listMusicPlaylists(query: String?, offset: Int, limit: Int) async throws -> DJAgentMusicPlaylistsPage
+    func readMusicPlaylist(playlistID: String, offset: Int, limit: Int) async throws -> DJAgentMusicPlaylistPage
+    func prepareMusicTrack(playlistID: String, trackID: String) async throws -> DJAgentMusicPreparation
     func setLyricsMode(_ mode: StageLyricsVisualMode) async throws
     func setSpatialEnvironment(
         scene: SpatialScenePreset?,
@@ -634,6 +736,18 @@ protocol DJAgentRadioActions: AnyObject {
         direction: SpatialCameraCommandDirection,
         distance: Float
     ) async throws
+}
+
+extension DJAgentRadioActions {
+    func listMusicPlaylists(query: String?, offset: Int, limit: Int) async throws -> DJAgentMusicPlaylistsPage {
+        throw DJAgentMusicLibraryError.unsupported
+    }
+    func readMusicPlaylist(playlistID: String, offset: Int, limit: Int) async throws -> DJAgentMusicPlaylistPage {
+        throw DJAgentMusicLibraryError.unsupported
+    }
+    func prepareMusicTrack(playlistID: String, trackID: String) async throws -> DJAgentMusicPreparation {
+        throw DJAgentMusicLibraryError.unsupported
+    }
 }
 
 @MainActor
@@ -782,7 +896,28 @@ final class DJAgentToolDispatcher {
             let message: String
             var tracks: [DJAgentMusicTrack]?
             var currentTrack: DJAgentCurrentTrackSnapshot?
+            var playlistsPage: DJAgentMusicPlaylistsPage?
+            var playlistPage: DJAgentMusicPlaylistPage?
+            var preparation: DJAgentMusicPreparation?
             switch call.name {
+            case "list_music_playlists":
+                let args = try MusicLibraryArguments(name: call.name, data: call.argumentsJSON)
+                try Task.checkCancellation()
+                playlistsPage = try await actions.listMusicPlaylists(query: args.query, offset: args.offset, limit: args.limit)
+                try Task.checkCancellation()
+                message = "已读取已有歌单列表。"
+            case "read_music_playlist":
+                let args = try MusicLibraryArguments(name: call.name, data: call.argumentsJSON)
+                try Task.checkCancellation()
+                playlistPage = try await actions.readMusicPlaylist(playlistID: args.playlistID!, offset: args.offset, limit: args.limit)
+                try Task.checkCancellation()
+                message = "已读取歌单曲目。"
+            case "prepare_music_track":
+                let args = try MusicLibraryArguments(name: call.name, data: call.argumentsJSON)
+                try Task.checkCancellation()
+                preparation = try await actions.prepareMusicTrack(playlistID: args.playlistID!, trackID: args.trackID!)
+                try Task.checkCancellation()
+                message = "指定曲目已准备，尚未开始播放。"
             case "read_radio_state":
                 message = "已读取当前电台状态"
             case "read_current_track":
@@ -945,9 +1080,20 @@ final class DJAgentToolDispatcher {
                 message: message,
                 state: actions.snapshot(takeoverEnabled: enabled),
                 tracks: tracks,
-                currentTrack: currentTrack
+                currentTrack: currentTrack,
+                playlistsPage: playlistsPage,
+                playlistPage: playlistPage,
+                preparation: preparation
             )
         } catch {
+            if Self.musicLibraryToolNames.contains(call.name) {
+                let safeError: DJAgentMusicLibraryError
+                if error is CancellationError { safeError = .interrupted }
+                else if let known = error as? DJAgentMusicLibraryError { safeError = known }
+                else { safeError = call.name == "prepare_music_track" ? .preparationFailed : .libraryUnavailable }
+                return makeResult(callID: call.id, ok: false, code: safeError.code,
+                    message: safeError.localizedDescription, state: actions.snapshot(takeoverEnabled: enabled), tracks: nil)
+            }
             return makeResult(
                 callID: call.id,
                 ok: false,
@@ -956,6 +1102,63 @@ final class DJAgentToolDispatcher {
                 state: actions.snapshot(takeoverEnabled: enabled),
                 tracks: nil
             )
+        }
+    }
+
+    private static let musicLibraryToolNames: Set<String> = [
+        "list_music_playlists", "read_music_playlist", "prepare_music_track",
+    ]
+
+    private struct MusicLibraryArguments {
+        let query: String?
+        let playlistID: String?
+        let trackID: String?
+        let offset: Int
+        let limit: Int
+
+        init(name: String, data: Data) throws {
+            guard let value = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                throw DJAgentMusicLibraryError.invalidArguments
+            }
+            let allowed: Set<String>
+            switch name {
+            case "list_music_playlists": allowed = ["query", "offset", "limit"]
+            case "read_music_playlist": allowed = ["playlist_id", "offset", "limit"]
+            case "prepare_music_track": allowed = ["playlist_id", "track_id"]
+            default: throw DJAgentMusicLibraryError.invalidArguments
+            }
+            guard Set(value.keys).isSubset(of: allowed) else { throw DJAgentMusicLibraryError.invalidArguments }
+            if let rawQuery = value["query"] {
+                guard let text = rawQuery as? String else { throw DJAgentMusicLibraryError.invalidArguments }
+                query = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            } else { query = nil }
+            func identifier(_ key: String, required: Bool) throws -> String? {
+                guard let raw = value[key] else {
+                    if required { throw DJAgentMusicLibraryError.invalidArguments }
+                    return nil
+                }
+                guard let text = raw as? String, !text.isEmpty,
+                      text == text.trimmingCharacters(in: .whitespacesAndNewlines),
+                      text.rangeOfCharacter(from: .controlCharacters) == nil else {
+                    throw DJAgentMusicLibraryError.invalidArguments
+                }
+                return text
+            }
+            playlistID = try identifier("playlist_id", required: name != "list_music_playlists")
+            trackID = try identifier("track_id", required: name == "prepare_music_track")
+            func integer(_ key: String, default fallback: Int) throws -> Int {
+                guard let raw = value[key] else { return fallback }
+                // JSONDecoder rejects booleans, strings, null, fractional and overflowing numbers.
+                struct IntegerValue: Decodable { let value: Int }
+                guard let encoded = try? JSONSerialization.data(withJSONObject: ["value": raw]),
+                      let decoded = try? JSONDecoder().decode(IntegerValue.self, from: encoded) else {
+                    throw DJAgentMusicLibraryError.invalidArguments
+                }
+                return decoded.value
+            }
+            offset = try integer("offset", default: 0)
+            limit = try integer("limit", default: 20)
+            guard offset >= 0, (1...50).contains(limit) else { throw DJAgentMusicLibraryError.invalidArguments }
         }
     }
 
@@ -977,7 +1180,10 @@ final class DJAgentToolDispatcher {
         message: String,
         state: DJAgentRadioState?,
         tracks: [DJAgentMusicTrack]?,
-        currentTrack: DJAgentCurrentTrackSnapshot? = nil
+        currentTrack: DJAgentCurrentTrackSnapshot? = nil,
+        playlistsPage: DJAgentMusicPlaylistsPage? = nil,
+        playlistPage: DJAgentMusicPlaylistPage? = nil,
+        preparation: DJAgentMusicPreparation? = nil
     ) -> RealtimeDJToolResult {
         let response = DJAgentToolResponse(
             ok: ok,
@@ -985,7 +1191,10 @@ final class DJAgentToolDispatcher {
             message: message,
             state: state,
             tracks: tracks,
-            currentTrack: currentTrack
+            currentTrack: currentTrack,
+            playlistsPage: playlistsPage,
+            playlistPage: playlistPage,
+            preparation: preparation
         )
         let data = (try? JSONEncoder().encode(response))
             ?? Data(#"{"ok":false,"message":"结果编码失败"}"#.utf8)
