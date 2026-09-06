@@ -4,6 +4,7 @@ import SwiftUI
 struct AgentSettingsView: View {
     @State private var model = AgentSettingsModel()
     @State private var voiceStatus = RealtimeVoiceStatusStore.shared
+    @AppStorage("resident.autonomous.enabled.v1") private var residentAutonomyEnabled = false
     private let connectRealtimeVoice:
         (RealtimeVoiceConfiguration) -> Void
     private let disconnectRealtimeVoice: () -> Void
@@ -152,6 +153,14 @@ struct AgentSettingsView: View {
                         .foregroundStyle(.secondary)
 
                     Text("空间和 Live Cam 共用这里选定的 Agent；文字和语音转写进入同一个会话。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Toggle("允许居民自主安排活动", isOn: $residentAutonomyEnabled)
+                        .onChange(of: residentAutonomyEnabled) { _, _ in
+                            NotificationCenter.default.post(name: Notification.Name("gmgnResidentAutonomyChanged"), object: nil)
+                        }
+                    Text("开启后，居民可在空闲或活动变化时使用当前 Codex 思考并操作已支持的物件，会消耗模型额度。试验版每小时最多主动思考 6 轮，停止按钮可随时暂停。其他后端暂不自动运行。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

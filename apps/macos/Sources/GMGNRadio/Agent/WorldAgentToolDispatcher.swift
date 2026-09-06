@@ -54,15 +54,18 @@ final class WorldAgentToolDispatcher {
     }
 
     private let takeoverEnabled: @MainActor () -> Bool
+    private let onActivityStarted: @MainActor (WorldAgentContext, String) -> Void
     let context: WorldAgentContext
     private var completedCalls: [String: RealtimeDJToolResult] = [:]
 
     init(
         takeoverEnabled: @escaping @MainActor () -> Bool,
-        context: WorldAgentContext
+        context: WorldAgentContext,
+        onActivityStarted: @escaping @MainActor (WorldAgentContext, String) -> Void = { _, _ in }
     ) {
         self.takeoverEnabled = takeoverEnabled
         self.context = context
+        self.onActivityStarted = onActivityStarted
     }
 
     var providerTools: [[String: Any]] {
@@ -127,6 +130,9 @@ final class WorldAgentToolDispatcher {
             case "start_activity":
                 let arguments = try decode(ActivityArguments.self, from: call.argumentsJSON)
                 try context.startActivity(id: arguments.activityID)
+                if let requestID = context.currentActivityRequestID {
+                    onActivityStarted(context, requestID)
+                }
                 message = "角色开始执行 \(arguments.activityID)"
             case "stop_activity":
                 let arguments = try decode(

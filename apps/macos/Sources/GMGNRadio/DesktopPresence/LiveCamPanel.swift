@@ -1,6 +1,7 @@
 import AppKit
 import CoreGraphics
 import SwiftUI
+import Observation
 
 enum LiveCamFeed: Equatable, Sendable {
     case virtualWorld
@@ -111,7 +112,7 @@ struct LiveCamWindowPointerDelta: Equatable, Sendable {
 }
 
 @MainActor
-final class LiveCamInteractionView: NSView {
+final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
     private enum ReplyPresentation {
         case agentReply
         case chatStatus
@@ -124,11 +125,17 @@ final class LiveCamInteractionView: NSView {
     let settingsButton = NSButton()
     let messageField = NSTextField()
     let sendButton = NSButton()
+    let stopButton = NSButton()
+    private var residentThinking = false
+    private var residentCanStop = false
 
     private let controls = NSStackView()
     private let composer = NSVisualEffectView()
     private let replyBubble = NSVisualEffectView()
     private let replyLabel = NSTextField(wrappingLabelWithString: "")
+    private let deliveryNotice = NSVisualEffectView()
+    private let deliveryLabel = NSTextField(wrappingLabelWithString: "")
+    private var deliveryHeight: NSLayoutConstraint?
     private var replyPresentation: ReplyPresentation?
     private var onEnterSpace: @MainActor () -> Void
     private var onOpenPlayer: @MainActor () -> Void
@@ -138,6 +145,7 @@ final class LiveCamInteractionView: NSView {
     private var onNextTrack: @MainActor () -> Void
     private var playerMenuSnapshotProvider: @MainActor () -> LiveCamPlayerMenuSnapshot
     private var onSendMessage: @MainActor (String) -> Void
+    private var onCancelMessage: @MainActor () -> Void = {}
     private var onToggleVoice: @MainActor () -> Void
     var onComposerVisibilityChanged: @MainActor (Bool) -> Void = { _ in }
 
@@ -177,6 +185,7 @@ final class LiveCamInteractionView: NSView {
         self.onToggleVoice = onToggleVoice
         super.init(frame: .zero)
         configureViews()
+        observeSpeechPlayback()
     }
 
     required init?(coder: NSCoder) {
@@ -198,6 +207,63 @@ final class LiveCamInteractionView: NSView {
         _ handler: @escaping @MainActor () -> Void
     ) {
         onToggleVoice = handler
+    }
+
+    func setCancelMessageHandler(_ handler: @escaping @MainActor () -> Void) {
+        onCancelMessage = handler
+    }
+
+    func setResidentThinking(_ thinking: Bool) {
+        residentThinking = thinking
+        updateComposerActions()
+    }
+
+    func setResidentCanStop(_ canStop: Bool) {
+        residentCanStop = canStop
+        updateComposerActions()
+    }
+
+    func setResidentDeliveryNotice(_ text: String?) {
+        let message = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        deliveryLabel.stringValue = message
+        deliveryNotice.isHidden = message.isEmpty
+        deliveryHeight?.constant = message.isEmpty ? 0 : 42
+    }
+
+    var residentDeliveryNotice: String { deliveryLabel.stringValue }
+
+    private var canStopResident: Bool {
+        residentThinking || AgentSpeechStatusStore.shared.isSpeaking || residentCanStop
+    }
+
+    private func observeSpeechPlayback() {
+        updateComposerActions()
+        withObservationTracking {
+            _ = AgentSpeechStatusStore.shared.isSpeaking
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in self?.observeSpeechPlayback() }
+        }
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        updateComposerActions()
+    }
+
+    private var hasDraft: Bool {
+        !messageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func updateComposerActions() {
+        let primaryStops = canStopResident && !hasDraft
+        let stopLabel = residentThinking || residentCanStop ? "停止当前任务" : "停止朗读"
+        let label = primaryStops ? stopLabel : "发送消息"
+        sendButton.image = NSImage(systemSymbolName: primaryStops ? "stop.fill" : "arrow.up", accessibilityDescription: label)
+        sendButton.toolTip = label
+        sendButton.setAccessibilityLabel(label)
+        sendButton.isEnabled = canStopResident || hasDraft
+        stopButton.isHidden = !canStopResident || !hasDraft
+        stopButton.toolTip = stopLabel
+        stopButton.setAccessibilityLabel(stopLabel)
     }
 
     func focusComposer() {
@@ -328,6 +394,7 @@ final class LiveCamInteractionView: NSView {
         messageField.placeholderString = "跟 Agent 说点什么…"
         messageField.target = self
         messageField.action = #selector(submitMessage)
+        messageField.delegate = self
         composer.addSubview(messageField)
 
         configureButton(
@@ -335,9 +402,33 @@ final class LiveCamInteractionView: NSView {
             symbolName: "arrow.up",
             label: "发送",
             identifier: "livecam.button.send",
-            action: #selector(submitMessage)
+            action: #selector(performPrimaryAction)
         )
-        composer.addSubview(sendButton)
+        configureButton(
+            stopButton,
+            symbolName: "stop.fill",
+            label: "停止当前任务",
+            identifier: "livecam.button.stop",
+            action: #selector(stopResident)
+        )
+        let composerActions = NSStackView(views: [stopButton, sendButton])
+        composerActions.orientation = .horizontal
+        composerActions.spacing = 6
+        composerActions.translatesAutoresizingMaskIntoConstraints = false
+        composer.addSubview(composerActions)
+        updateComposerActions()
+
+        configureGlass(deliveryNotice)
+        deliveryNotice.isHidden = true
+        addSubview(deliveryNotice)
+        deliveryLabel.translatesAutoresizingMaskIntoConstraints = false
+        deliveryLabel.font = .systemFont(ofSize: 10)
+        deliveryLabel.textColor = .systemOrange
+        deliveryLabel.maximumNumberOfLines = 2
+        deliveryLabel.setAccessibilityIdentifier("livecam.resident-delivery-notice")
+        deliveryNotice.addSubview(deliveryLabel)
+        deliveryHeight = deliveryNotice.heightAnchor.constraint(equalToConstant: 0)
+        deliveryHeight?.isActive = true
 
         configureGlass(replyBubble)
         replyBubble.isHidden = true
@@ -359,7 +450,13 @@ final class LiveCamInteractionView: NSView {
         NSLayoutConstraint.activate([
             speechErrorNotice.leadingAnchor.constraint(equalTo: composer.leadingAnchor),
             speechErrorNotice.trailingAnchor.constraint(equalTo: composer.trailingAnchor),
-            speechErrorNotice.bottomAnchor.constraint(equalTo: composer.topAnchor, constant: -8),
+            speechErrorNotice.bottomAnchor.constraint(equalTo: deliveryNotice.topAnchor, constant: -8),
+            deliveryNotice.leadingAnchor.constraint(equalTo: composer.leadingAnchor),
+            deliveryNotice.trailingAnchor.constraint(equalTo: composer.trailingAnchor),
+            deliveryNotice.bottomAnchor.constraint(equalTo: composer.topAnchor, constant: -6),
+            deliveryLabel.leadingAnchor.constraint(equalTo: deliveryNotice.leadingAnchor, constant: 8),
+            deliveryLabel.trailingAnchor.constraint(equalTo: deliveryNotice.trailingAnchor, constant: -8),
+            deliveryLabel.centerYAnchor.constraint(equalTo: deliveryNotice.centerYAnchor),
             controls.topAnchor.constraint(equalTo: topAnchor, constant: 10),
             controls.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             controls.widthAnchor.constraint(equalToConstant: 30),
@@ -381,9 +478,11 @@ final class LiveCamInteractionView: NSView {
             composer.heightAnchor.constraint(equalToConstant: 42),
             messageField.leadingAnchor.constraint(equalTo: composer.leadingAnchor, constant: 10),
             messageField.centerYAnchor.constraint(equalTo: composer.centerYAnchor),
-            messageField.trailingAnchor.constraint(equalTo: sendButton.leadingAnchor, constant: -6),
-            sendButton.trailingAnchor.constraint(equalTo: composer.trailingAnchor, constant: -6),
-            sendButton.centerYAnchor.constraint(equalTo: composer.centerYAnchor),
+            messageField.trailingAnchor.constraint(equalTo: composerActions.leadingAnchor, constant: -6),
+            composerActions.trailingAnchor.constraint(equalTo: composer.trailingAnchor, constant: -6),
+            composerActions.centerYAnchor.constraint(equalTo: composer.centerYAnchor),
+            stopButton.widthAnchor.constraint(equalToConstant: 30),
+            stopButton.heightAnchor.constraint(equalToConstant: 30),
             sendButton.widthAnchor.constraint(equalToConstant: 30),
             sendButton.heightAnchor.constraint(equalToConstant: 30),
 
@@ -563,8 +662,21 @@ final class LiveCamInteractionView: NSView {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !message.isEmpty else { return }
         messageField.stringValue = ""
+        setResidentThinking(true)
         closeComposer()
         onSendMessage(message)
+    }
+
+    @objc
+    private func performPrimaryAction() {
+        if canStopResident && !hasDraft { stopResident() }
+        else { submitMessage() }
+    }
+
+    @objc
+    private func stopResident() {
+        setResidentThinking(false)
+        onCancelMessage()
     }
 
     @objc
@@ -725,6 +837,22 @@ final class LiveCamPanel: NSPanel {
         _ handler: @escaping @MainActor () -> Void
     ) {
         interactionView.setToggleVoiceHandler(handler)
+    }
+
+    func setCancelMessageHandler(_ handler: @escaping @MainActor () -> Void) {
+        interactionView.setCancelMessageHandler(handler)
+    }
+
+    func setResidentThinking(_ thinking: Bool) {
+        interactionView.setResidentThinking(thinking)
+    }
+
+    func setResidentCanStop(_ canStop: Bool) {
+        interactionView.setResidentCanStop(canStop)
+    }
+
+    func setResidentDeliveryNotice(_ text: String?) {
+        interactionView.setResidentDeliveryNotice(text)
     }
 
     func showAgentReply(_ text: String) {

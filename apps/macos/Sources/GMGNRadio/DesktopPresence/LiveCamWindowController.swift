@@ -17,6 +17,8 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
     private let surfaceContainer = NSView()
     private var onEnterSpace: @MainActor () -> Void
     private var onSendMessage: @MainActor (String) async throws -> Void
+    private var onCancelMessage: @MainActor () -> Void
+    private var messageRevision: UInt64 = 0
     private var onToggleVoice: @MainActor () -> Void
     private var isTransitioningToFullStage = false
     private var presentationRevision: UInt64 = 0
@@ -45,6 +47,7 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
             .noProgram
         },
         onSendMessage: @escaping @MainActor (String) async throws -> Void = { _ in },
+        onCancelMessage: @escaping @MainActor () -> Void = {},
         onToggleVoice: @escaping @MainActor () -> Void = {}
     ) {
         self.renderSurfaceController = renderSurfaceController
@@ -53,6 +56,7 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
         self.defaults = defaults
         self.onEnterSpace = onEnterSpace
         self.onSendMessage = onSendMessage
+        self.onCancelMessage = onCancelMessage
         self.onToggleVoice = onToggleVoice
 
         surfaceContainer.wantsLayer = true
@@ -82,6 +86,11 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
         }
         panel.setSendMessageHandler { [weak self] message in
             self?.sendMessage(message)
+        }
+        panel.setCancelMessageHandler { [weak self] in
+            guard let self else { return }
+            messageRevision &+= 1
+            onCancelMessage()
         }
         panel.setToggleVoiceHandler { [weak self] in
             self?.onToggleVoice()
@@ -174,7 +183,20 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
 
     func beginAgentReply() {
         agentReplyBuffer = ""
+        setResidentThinking(true)
         (window as? LiveCamPanel)?.showAgentReply("…")
+    }
+
+    func setResidentThinking(_ thinking: Bool) {
+        (window as? LiveCamPanel)?.setResidentThinking(thinking)
+    }
+
+    func setResidentCanStop(_ canStop: Bool) {
+        (window as? LiveCamPanel)?.setResidentCanStop(canStop)
+    }
+
+    func setResidentDeliveryNotice(_ text: String?) {
+        (window as? LiveCamPanel)?.setResidentDeliveryNotice(text)
     }
 
     func appendAgentReply(_ delta: String) {
@@ -183,6 +205,7 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func finishAgentReply(_ text: String) {
+        setResidentThinking(false)
         let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if !normalized.isEmpty {
             agentReplyBuffer = normalized
@@ -289,12 +312,17 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func sendMessage(_ message: String) {
+        messageRevision &+= 1
+        let revision = messageRevision
+        setResidentThinking(true)
         showChatStatus("…")
         Task { [weak self] in
             guard let self else { return }
             do {
                 try await onSendMessage(message)
             } catch {
+                guard revision == messageRevision else { return }
+                setResidentThinking(false)
                 showChatStatus(
                     (error as? LocalizedError)?.errorDescription
                         ?? "消息发送失败，请稍后再试。"

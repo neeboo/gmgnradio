@@ -4,6 +4,14 @@ import Foundation
 /// Transport-provided IDs identify calls only; they cannot select a different world.
 @MainActor
 final class ResidentWorldToolSession {
+    /// App-registered capabilities share the same world lease and call ledger.
+    struct AdditionalTool {
+        let name: String
+        let description: String
+        let inputSchema: [String: Any]
+        let validate: @MainActor ([String: Any]) -> Bool
+        let handle: @MainActor (String, Data) async -> RealtimeDJToolResult
+    }
     struct CallRecord: Codable, Equatable, Sendable {
         let scopeID: UUID
         let worldID: String
@@ -33,6 +41,10 @@ final class ResidentWorldToolSession {
     private let beforeDispatch: (@MainActor (String, String, Data) -> Void)?
     private let afterDispatch: (@MainActor (String, Data, RealtimeDJToolResult) async -> RealtimeDJToolResult)?
     private let onCancel: (@MainActor () -> Void)?
+    private let additionalTools: [String: AdditionalTool]
+    private let maximumCalls: Int
+    private var dispatchedCalls = 0
+    private var registeredNames: Set<String> { Self.allowedToolNames.union(additionalTools.keys) }
     private var cancelled = false
     private var identities: [String: CallIdentity] = [:]
     private var results: [String: RealtimeDJToolResult] = [:]
@@ -48,7 +60,9 @@ final class ResidentWorldToolSession {
         isCurrent: @escaping @MainActor () -> Bool,
         beforeDispatch: (@MainActor (String, String, Data) -> Void)? = nil,
         afterDispatch: (@MainActor (String, Data, RealtimeDJToolResult) async -> RealtimeDJToolResult)? = nil,
-        onCancel: (@MainActor () -> Void)? = nil
+        onCancel: (@MainActor () -> Void)? = nil,
+        additionalTools: [AdditionalTool] = [],
+        maximumCalls: Int = 64
     ) {
         self.scopeID = scopeID
         self.worldID = worldID
@@ -59,7 +73,15 @@ final class ResidentWorldToolSession {
         self.beforeDispatch = beforeDispatch
         self.afterDispatch = afterDispatch
         self.onCancel = onCancel
-        let schemas = dispatcher.providerTools.compactMap { tool -> [String: Any]? in
+        self.maximumCalls = max(0, maximumCalls)
+        var registered: [String: AdditionalTool] = [:]
+        for tool in additionalTools where !Self.allowedToolNames.contains(tool.name) && registered[tool.name] == nil {
+            guard tool.inputSchema["type"] as? String == "object",
+                  JSONSerialization.isValidJSONObject(tool.inputSchema) else { continue }
+            registered[tool.name] = tool
+        }
+        self.additionalTools = registered
+        var schemas = dispatcher.providerTools.compactMap { tool -> [String: Any]? in
             guard let function = tool["function"] as? [String: Any],
                   let name = function["name"] as? String,
                   Self.allowedToolNames.contains(name) else { return nil }
@@ -68,6 +90,9 @@ final class ResidentWorldToolSession {
                 "description": function["description"] ?? "",
                 "inputSchema": function["parameters"] ?? [:],
             ]
+        }
+        schemas += registered.keys.sorted().compactMap { name in
+            registered[name].map { ["name": $0.name, "description": $0.description, "inputSchema": $0.inputSchema] }
         }
         // The existing contract consists only of JSON primitives.
         toolSchemasJSON = (try? JSONSerialization.data(withJSONObject: schemas, options: [.sortedKeys])) ?? Data("[]".utf8)
@@ -92,7 +117,7 @@ final class ResidentWorldToolSession {
             result = failure(requestID, "tool_session_expired", "本次空间操作已超时")
         } else if requestID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             result = failure(requestID, "invalid_call_id", "工具调用编号不能为空")
-        } else if !Self.allowedToolNames.contains(name) {
+        } else if !registeredNames.contains(name) {
             result = failure(requestID, "tool_not_allowed", "本次会话未开放这个工具")
         } else if let arguments = validatedArguments(name: name, data: argumentsJSON),
                   let canonical = try? JSONSerialization.data(withJSONObject: arguments, options: [.sortedKeys]) {
@@ -109,7 +134,10 @@ final class ResidentWorldToolSession {
             } else if let running = pending[requestID] {
                 replayed = true
                 result = await awaitResult(running)
+            } else if dispatchedCalls >= maximumCalls {
+                result = failure(requestID, "tool_budget_exhausted", "本轮工具调用已达上限，请保留进度并结束本轮思考")
             } else {
+                dispatchedCalls += 1
                 identities[requestID] = identity
                 let task = Task { @MainActor in
                     guard !self.cancelled, !Task.isCancelled else {
@@ -120,6 +148,9 @@ final class ResidentWorldToolSession {
                     }
                     guard self.now() < self.deadline else {
                         return self.failure(requestID, "tool_session_expired", "本次空间操作已超时")
+                    }
+                    if let tool = self.additionalTools[name] {
+                        return await tool.handle(requestID, canonical)
                     }
                     self.beforeDispatch?(requestID, name, canonical)
                     let dispatched = await self.dispatcher.handle(RealtimeDJToolCall(
@@ -142,7 +173,7 @@ final class ResidentWorldToolSession {
             scopeID: scopeID,
             worldID: worldID,
             callID: requestID,
-            toolName: Self.allowedToolNames.contains(name) ? name : "unsupported",
+            toolName: registeredNames.contains(name) ? name : "unsupported",
             activityID: activityID,
             ok: !result.isError,
             replayed: replayed
@@ -159,6 +190,11 @@ final class ResidentWorldToolSession {
     }
 
     private func validatedArguments(name: String, data: Data) -> [String: Any]? {
+        if let tool = additionalTools[name] {
+            guard let arguments = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  tool.validate(arguments) else { return nil }
+            return arguments
+        }
         guard let capability = WorldAgentToolContract.capabilities.first(where: { $0.name == name }),
               let arguments = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               Set(arguments.keys).isSubset(of: Set(capability.parameters.keys)),

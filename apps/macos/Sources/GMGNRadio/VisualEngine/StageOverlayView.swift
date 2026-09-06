@@ -8,16 +8,19 @@ final class StageResidentChatState: ObservableObject {
     @Published private(set) var reply = ""
     @Published private(set) var isThinking = false
     @Published var voiceActive = false
+    @Published var deliveryNotice: String?
+    @Published var canStop = false
 
     func takeMessage() -> String? {
         let message = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !isThinking, !message.isEmpty else { return nil }
+        guard !message.isEmpty else { return nil }
         draft = ""
         begin()
         return message
     }
 
     func begin() { reply = ""; isThinking = true }
+    func setThinking(_ thinking: Bool) { isThinking = thinking }
     func finish(_ text: String) { reply = text; isThinking = false }
     func showStatus(_ text: String) { finish(text) }
     func cancel() { showStatus("已停止本次回复。") }
@@ -86,6 +89,13 @@ struct StageResidentComposer: View {
             }
 
             VStack(alignment: .leading, spacing: 12) {
+                if let notice = state.deliveryNotice, !notice.isEmpty {
+                    Text(notice)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.orange.opacity(0.95))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("stage.resident-delivery-notice")
+                }
                 TextField("发消息，或让居民做点什么…", text: $state.draft, axis: .vertical)
                     .textFieldStyle(.plain)
                     .font(.system(size: 14))
@@ -113,9 +123,21 @@ struct StageResidentComposer: View {
                     .foregroundStyle(state.voiceActive ? Color.cyan : .white.opacity(0.72))
                     .help(state.voiceActive ? "结束语音输入" : "语音输入")
                     .accessibilityLabel(state.voiceActive ? "结束语音输入" : "语音输入")
+                    if canStopReply && hasDraft {
+                        Button(action: stopReply) {
+                            Image(systemName: "stop.fill")
+                                .font(.system(size: 11, weight: .semibold))
+                                .frame(width: 30, height: 30)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.white.opacity(0.72))
+                        .help(stopActionLabel)
+                        .accessibilityLabel(stopActionLabel)
+                        .accessibilityIdentifier("stage.resident-stop")
+                    }
                     Button(action: performPrimaryAction) {
-                        Image(systemName: canStopReply ? "stop.fill" : "arrow.up")
-                            .font(.system(size: canStopReply ? 11 : 15, weight: .semibold))
+                        Image(systemName: primaryStops ? "stop.fill" : "arrow.up")
+                            .font(.system(size: primaryStops ? 11 : 15, weight: .semibold))
                             .foregroundStyle(Color(white: 0.14))
                             .frame(width: 30, height: 30)
                             .background(.white.opacity(canSubmit ? 0.92 : 0.25), in: Circle())
@@ -138,24 +160,36 @@ struct StageResidentComposer: View {
     }
 
     private var canSubmit: Bool {
-        canStopReply || !state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        canStopReply || hasDraft
     }
 
+    private var hasDraft: Bool {
+        !state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var primaryStops: Bool { canStopReply && !hasDraft }
+
     private var canStopReply: Bool {
-        state.isThinking || speechStatus.isSpeaking
+        state.isThinking || speechStatus.isSpeaking || state.canStop
     }
 
     private var primaryActionLabel: String {
-        state.isThinking ? "停止回复" : speechStatus.isSpeaking ? "停止朗读" : "发送消息"
+        primaryStops ? stopActionLabel : "发送消息"
     }
 
+    private var stopActionLabel: String { state.isThinking || state.canStop ? "停止当前任务" : "停止朗读" }
+
     private func performPrimaryAction() {
-        if canStopReply {
-            if state.isThinking { state.cancel() }
-            onCancelMessage()
+        if primaryStops {
+            stopReply()
         } else {
             submit()
         }
+    }
+
+    private func stopReply() {
+        if state.isThinking { state.cancel() }
+        onCancelMessage()
     }
 
     private func submit() {

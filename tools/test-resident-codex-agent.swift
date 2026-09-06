@@ -9,6 +9,9 @@ import Darwin
 func bytes(_ value: Any) -> Data { try! JSONSerialization.data(withJSONObject: value, options: .fragmentsAllowed) }
 func json(_ value: Data) -> [String: Any] { try! JSONSerialization.jsonObject(with: value) as! [String: Any] }
 func emit(_ value: [String: Any]) { FileHandle.standardOutput.write(bytes(value) + Data([10])) }
+struct FixtureLocator: AgentExecutableLocating {
+    func locate(executableNames: [String]) -> URL? { URL(fileURLWithPath: CommandLine.arguments[0]) }
+}
 func fake() {
     let mode = CommandLine.arguments[2]
     let audit = CommandLine.arguments[3]
@@ -26,7 +29,7 @@ func fake() {
     while let line = readLine() {
         let frame = json(Data(line.utf8)); record(frame)
         guard let method = frame["method"] as? String else {
-            if frame["id"] as? String == "tool-request" { finish() }
+            if frame["id"] as? String == "tool-request" { finish(text: mode.hasPrefix("silent") ? "" : "已完成空间活动") }
             continue
         }
         let id = frame["id"] ?? 0
@@ -69,7 +72,7 @@ func fake() {
                 emit(["method": "error", "params": params])
                 continue
             }
-            if mode == "hang" { continue }
+            if mode == "hang" || (mode.hasPrefix("steer") && mode != "steerDuringTool") { continue }
             if mode == "eof" { exit(0) }
             if mode == "failed" { finish("failed", text: "PRIVATE-SERVER-ERROR"); continue }
             if mode == "early" || mode == "earlyMismatch" { continue }
@@ -77,7 +80,16 @@ func fake() {
                 emit(["method": "turn/completed", "params": ["threadId": "resident-session", "turn": ["id": "turn-1", "status": "completed"]]])
                 continue
             }
-            emit(["id": "tool-request", "method": "item/tool/call", "params": ["threadId": mode == "wrongThread" ? "other-room" : "resident-session", "turnId": mode == "wrongTurn" ? "other-turn" : "turn-1", "callId": "world-call", "namespace": NSNull(), "tool": mode == "wrongTool" ? "shell" : "inspect_world", "arguments": [:]]])
+            emit(["id": "tool-request", "method": "item/tool/call", "params": ["threadId": mode == "wrongThread" ? "other-room" : "resident-session", "turnId": mode == "wrongTurn" ? "other-turn" : "turn-1", "callId": "world-call", "namespace": NSNull(), "tool": mode == "wrongTool" ? "shell" : (mode.hasPrefix("silent") ? "update_resident_intent" : "inspect_world"), "arguments": [:]]])
+        case "turn/steer":
+            if mode == "steerRejected" {
+                emit(["id": id, "error": ["code": -32600, "message": "No active turn"]])
+            } else if mode == "steerEOF" { exit(0) }
+            else if mode == "steerTimeout" { continue }
+            else {
+                emit(["id": id, "result": ["turnId": mode == "steerWrongAck" ? "other-turn" : "turn-1"]])
+            }
+            finish()
         default: break
         }
     }
@@ -230,6 +242,104 @@ func fake() {
         waiting.cancel()
         do { _ = try await waiting.value; fatalError("FAIL: cancellation") }
         catch { check(error is CancellationError, "task cancellation ends whole turn") }
+
+        let loopTools = bytes(["inspect_world", "update_resident_intent"].map {
+            ["name": $0, "description": "Fixture", "inputSchema": ["type": "object"]] as [String: Any]
+        })
+        let (silent, _) = try make("silent")
+        var controlSucceeded = false
+        let quiet = try await silent.send(prompt: "自主安排", sessionID: nil, toolsJSON: loopTools,
+            allowsSilentCompletion: { controlSucceeded }, onToolCall: { _, name, _ in
+                check(name == "update_resident_intent", "registered loop tool reaches caller")
+                controlSucceeded = true
+                return ResidentCodexToolReply(resultJSON: bytes(["ok": true]), isError: false)
+            })
+        check(quiet.reply.isEmpty, "explicit successful control allows quiet completion")
+        let (silentDenied, _) = try make("silentDenied")
+        do {
+            _ = try await silentDenied.send(prompt: "自主安排", sessionID: nil, toolsJSON: loopTools,
+                onToolCall: { _, _, _ in ResidentCodexToolReply(resultJSON: bytes(["ok": false]), isError: true) })
+            fatalError("FAIL: empty final requires explicit current turn control success")
+        } catch { check(error is ResidentCodexAgentError, "ordinary empty final remains failure") }
+        let (silentNoTool, _) = try make("commentary")
+        do {
+            _ = try await silentNoTool.send(prompt: "自主安排", sessionID: nil, toolsJSON: loopTools,
+                allowsSilentCompletion: { true }, onToolCall: callback)
+            fatalError("FAIL: stale caller flag cannot authorize silence without a tool this turn")
+        } catch { check(error is ResidentCodexAgentError, "silent permission also requires tool execution this turn") }
+        let (silentFailedTool, _) = try make("silentFailedTool")
+        do {
+            _ = try await silentFailedTool.send(prompt: "自主安排", sessionID: nil, toolsJSON: loopTools,
+                allowsSilentCompletion: { true }, onToolCall: { _, _, _ in
+                    ResidentCodexToolReply(resultJSON: bytes(["ok": false]), isError: true)
+                })
+            fatalError("FAIL: a failed tool cannot authorize silence")
+        } catch { check(error is ResidentCodexAgentError, "failed tool cannot authorize silent completion") }
+
+        let (duringTool, duringToolAudit) = try make("steerDuringTool")
+        var pendingTool: CheckedContinuation<Void, Never>?
+        let duringToolTask = Task {
+            try await duringTool.send(prompt: "去点唱机", sessionID: nil, toolsJSON: tools, onToolCall: { _, _, _ in
+                await withCheckedContinuation { pendingTool = $0 }
+                return ResidentCodexToolReply(resultJSON: bytes(["ok": true]), isError: false)
+            })
+        }
+        for _ in 0..<200 {
+            if pendingTool != nil { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        check(pendingTool != nil, "world tool is genuinely pending")
+        check(await duringTool.steer("先别急") == .delivered, "steer can arrive while a world tool is pending")
+        check(try !frames(duringToolAudit).contains { $0["method"] as? String == "turn/interrupt" }, "ordinary guidance never interrupts current tool")
+        pendingTool?.resume()
+        _ = try await duringToolTask.value
+
+        for (mode, expected) in [("steer", ResidentSteeringDelivery.delivered), ("steerRejected", .notDelivered),
+                                 ("steerEOF", .unknown), ("steerWrongAck", .unknown), ("steerTimeout", .unknown)] {
+            let (agent, file) = try make(mode)
+            check(await agent.steer("尚未开始") == .notDelivered, "idle steer stays unsent")
+            let task = Task { try await agent.send(prompt: "听歌", sessionID: nil, toolsJSON: tools, onToolCall: callback) }
+            for _ in 0..<200 {
+                if try frames(file).contains(where: { $0["method"] as? String == "turn/start" }) { break }
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+            check(await agent.steer("换舒缓的") == expected, "\(mode) delivery has honest acknowledgement")
+            agent.cancel()
+            _ = try? await task.value
+            let sent = try frames(file).filter { $0["method"] as? String == "turn/steer" }
+            check(sent.count == 1, "steer is never retried automatically")
+            let parameters = sent.first!["params"] as! [String: Any]
+            check(parameters["expectedTurnId"] as? String == "turn-1" && parameters["threadId"] as? String == "resident-session", "steer binds active turn precondition")
+            check((parameters["input"] as? [[String: Any]])?.first?["text"] as? String == "换舒缓的", "steer preserves human guidance")
+            check(await agent.steer("结束后") == .notDelivered, "completed turn steer stays unsent")
+        }
+        let suite = "gmgn-steer-service-" + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let (serviceAgent, serviceAudit) = try make("steer")
+        let service = AgentConversationService(locator: FixtureLocator(), defaults: defaults,
+            useResidentAgent: true, residentAgentFactory: { _, _ in serviceAgent })
+        service.selectBackend(.codex)
+        check(await service.steerResident("闲置") == .notDelivered, "service idle steering returns unsent")
+        let context = ResidentWorldContext(selectedWorldID: "fixture", worldID: "fixture", displayName: nil,
+            revision: 1, residentPosition: nil, activeActivity: nil, activityPhase: nil, objects: [], availableActivities: [])
+        defaults.set("legacy-session", forKey: AgentConversationPreferenceKeys.sessionKey(for: .codex) + "." + context.sessionScope + ".tools.v1")
+        let serviceTools = ResidentConversationTools(worldID: "fixture", schemasJSON: tools,
+            call: { _, _, _ in ResidentCodexToolReply(resultJSON: bytes(["ok": true]), isError: false) }, cancel: {})
+        let serviceTask = Task { try await service.send("播放", worldContext: context, worldTools: serviceTools) }
+        for _ in 0..<200 {
+            if try frames(serviceAudit).contains(where: { $0["method"] as? String == "turn/start" }) { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        try await Task.sleep(nanoseconds: 10_000_000)
+        check(await service.steerResident("慢一点") == .delivered, "service steers the actual active resident")
+        check(try await serviceTask.value == "已完成空间活动", "steering retains original reply task")
+        check(try !frames(serviceAudit).contains { $0["method"] as? String == "thread/resume" }, "new tools registry does not resume legacy session")
+        check(service.preferenceStore.sessionID(for: .codex, scope: context.sessionScope + ".tools.v2") == "resident-session", "new registry session is stored separately")
+        check(await service.steerResident("结束后") == .notDelivered, "service releases finished resident")
+        service.selectBackend(.dsh)
+        check(await service.steerResident("不支持") == .notDelivered, "unsupported backend steering remains unsent")
         print("PASS: \(checks) resident Codex agent checks")
     }
 }
@@ -241,7 +351,7 @@ let main = work.appendingPathComponent("Checks.swift")
 try program.write(to: main, atomically: true, encoding: .utf8)
 let binary = work.appendingPathComponent("checks")
 let compiler = Process(); compiler.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
-compiler.arguments = ["swiftc", "-swift-version", "6", "-parse-as-library", source.path, root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/ResidentCodexTransport.swift").path, root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/ResidentCodexPolicy.swift").path, main.path, "-o", binary.path]
+compiler.arguments = ["swiftc", "-j1", "-swift-version", "6", "-parse-as-library", source.path] + ["ResidentCodexTransport", "ResidentCodexPolicy", "AgentConversationService", "CodexCLI", "ResidentSteeringDelivery"].map { root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/\($0).swift").path } + [main.path, "-o", binary.path]
 try compiler.run(); compiler.waitUntilExit()
 guard compiler.terminationStatus == 0 else { exit(compiler.terminationStatus) }
 let test = Process(); test.executableURL = binary; try test.run(); test.waitUntilExit(); exit(test.terminationStatus)

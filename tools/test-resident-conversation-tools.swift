@@ -94,7 +94,7 @@ struct TextRunner: CodexCommandRunning {
         captured.pending?.resume(returning: AgentConversationOutcome(reply: "late", sessionID: "late-session"))
         captured.pending = nil
         check(await task.value, "late successful sender cannot return after cancellation")
-        check(blocked.preferenceStore.sessionID(for: .codex, scope: world.sessionScope + ".tools.v1") == "tools-thread", "late session never overwrites original")
+        check(blocked.preferenceStore.sessionID(for: .codex, scope: world.sessionScope + ".tools.v2") == "tools-thread", "late session never overwrites original")
         print("\(failed == 0 ? "PASS" : "FAIL"): \(count) resident routing checks, \(failed) failures")
         exit(failed == 0 ? 0 : 1)
     }
@@ -104,7 +104,7 @@ let main = work.appendingPathComponent("Main.swift")
 try harness.write(to: main, atomically: true, encoding: .utf8)
 let binary = work.appendingPathComponent("test")
 let compile = Process(); compile.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
-compile.arguments = ["-parse-as-library", "-j1"] + ["CodexCLI", "AgentConversationService", "ResidentCodexTransport", "ResidentCodexPolicy", "ResidentCodexAgent"].map {
+compile.arguments = ["-parse-as-library", "-j1"] + ["CodexCLI", "AgentConversationService", "ResidentCodexTransport", "ResidentCodexPolicy", "ResidentCodexAgent", "ResidentSteeringDelivery"].map {
     root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/\($0).swift").path
 } + [main.path, "-o", binary.path]
 try compile.run(); compile.waitUntilExit()

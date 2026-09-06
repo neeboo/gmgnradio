@@ -366,6 +366,7 @@ struct ResidentConversationTools: Sendable {
     let schemasJSON: Data
     let call: @MainActor @Sendable (String, String, Data) async -> ResidentCodexToolReply
     let cancel: @MainActor @Sendable () -> Void
+    var allowsSilentCompletion: @MainActor @Sendable () -> Bool = { false }
 }
 
 // MARK: - Service
@@ -375,17 +376,7 @@ struct ResidentConversationTools: Sendable {
 @MainActor
 final class AgentConversationService {
     typealias ResidentSender = @MainActor @Sendable (URL, String, String?, ResidentConversationTools) async throws -> AgentConversationOutcome
-    static let shared = AgentConversationService(residentSender: { executable, prompt, sessionID, tools in
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("gmgn-resident-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
-                                               attributes: [.posixPermissions: 0o700])
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let agent = ResidentCodexAgent(executableURL: executable, workingDirectoryURL: directory)
-        let outcome = try await agent.send(prompt: prompt, sessionID: sessionID,
-                                           toolsJSON: tools.schemasJSON, onToolCall: tools.call)
-        return AgentConversationOutcome(reply: outcome.reply, sessionID: outcome.sessionID)
-    })
+    static let shared = AgentConversationService(useResidentAgent: true)
 
     private let locator: any AgentExecutableLocating
     private var preferences: AgentConversationPreferences
@@ -398,20 +389,29 @@ final class AgentConversationService {
     private var dshHistoryByScope: [String: [AgentConversationMessage]] = [:]
     private var currentSessionScope: String?
     private let residentSender: ResidentSender?
+    private let useResidentAgent: Bool
+    private let residentAgentFactory: @MainActor (URL, URL) -> ResidentCodexAgent
+    private var currentResidentAgent: ResidentCodexAgent?
 
-    var supportsWorldTools: Bool { effectiveBackendID == .codex && residentSender != nil }
+    var supportsWorldTools: Bool { effectiveBackendID == .codex && (residentSender != nil || useResidentAgent) }
 
     init(
         locator: any AgentExecutableLocating = AgentExecutableLocator(),
         defaults: UserDefaults = .standard,
         runnerFactory: @escaping @Sendable (URL) -> any CodexCommandRunning =
             { AgentCommandRunner(executableURL: $0) },
-        residentSender: ResidentSender? = nil
+        residentSender: ResidentSender? = nil,
+        useResidentAgent: Bool = false,
+        residentAgentFactory: @escaping @MainActor (URL, URL) -> ResidentCodexAgent = {
+            ResidentCodexAgent(executableURL: $0, workingDirectoryURL: $1)
+        }
     ) {
         self.locator = locator
         self.preferences = AgentConversationPreferences(defaults: defaults)
         self.runnerFactory = runnerFactory
         self.residentSender = residentSender
+        self.useResidentAgent = useResidentAgent
+        self.residentAgentFactory = residentAgentFactory
     }
 
     var preferenceStore: AgentConversationPreferences {
@@ -460,12 +460,35 @@ final class AgentConversationService {
     }
 
     func cancel() {
+        currentResidentAgent?.cancel()
+        currentResidentAgent = nil
         currentTask?.cancel()
         currentTask = nil
         currentRequestID = nil
         let handler = currentCancellationHandler
         currentCancellationHandler = nil
         handler?()
+    }
+
+    func steerResident(_ text: String) async -> ResidentSteeringDelivery {
+        guard effectiveBackendID == .codex, let agent = currentResidentAgent else { return .notDelivered }
+        return await agent.steer(text)
+    }
+
+    private func sendResident(executable: URL, prompt: String, sessionID: String?,
+                              tools: ResidentConversationTools) async throws -> AgentConversationOutcome {
+        try Task.checkCancellation()
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gmgn-resident-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+                                               attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let agent = residentAgentFactory(executable, directory)
+        currentResidentAgent = agent
+        defer { if currentResidentAgent === agent { currentResidentAgent = nil } }
+        let outcome = try await agent.send(prompt: prompt, sessionID: sessionID, toolsJSON: tools.schemasJSON,
+                                          allowsSilentCompletion: tools.allowsSilentCompletion, onToolCall: tools.call)
+        return AgentConversationOutcome(reply: outcome.reply, sessionID: outcome.sessionID)
     }
 
     // MARK: Sending
@@ -484,7 +507,7 @@ final class AgentConversationService {
                 throw AgentConversationError.worldToolsUnavailable
             }
         }
-        let scope = worldContext.map { $0.sessionScope + (worldTools == nil ? "" : ".tools.v1") }
+        let scope = worldContext.map { $0.sessionScope + (worldTools == nil ? "" : ".tools.v2") }
         currentSessionScope = scope
         let prompt = try worldContext?.prompt(for: text, toolsAvailable: worldTools != nil) ?? text
         let id = effectiveBackendID
@@ -502,11 +525,12 @@ final class AgentConversationService {
             let makeRunner = runnerFactory
             let sendResident = residentSender
             let outcome = try await run {
-                if let worldTools, let sendResident {
+                if let worldTools {
                     guard let executable = executableLocator.locate(executableNames: ["codex"]) else {
                         throw AgentConversationError.backendNotInstalled(.codex)
                     }
-                    return try await sendResident(executable, prompt, resumeSessionID, worldTools)
+                    if let sendResident { return try await sendResident(executable, prompt, resumeSessionID, worldTools) }
+                    return try await self.sendResident(executable: executable, prompt: prompt, sessionID: resumeSessionID, tools: worldTools)
                 }
                 return try await Self.sendViaCodex(
                     text: prompt,

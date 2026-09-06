@@ -620,9 +620,15 @@ final class AppDelegate:
         orbWindowController = controller
         spatialStage.onWorldSelectionChanged = { [weak self] in
             self?.cancelResidentMessage()
+            self?.residentAgentLoop?.invalidate()
+            self?.residentAgentLoop = nil
+            self?.lastResidentActivityRequestID = nil
         }
         configureLivingWorld()
         configureStage()
+        startResidentLoopScheduling()
+        NotificationCenter.default.addObserver(self, selector: #selector(residentAutonomyDidChange(_:)),
+            name: Notification.Name("gmgnResidentAutonomyChanged"), object: nil)
         desktopPresenceObserverID = avatarRuntime.observe {
             [weak self] snapshot in
             self?.applyDesktopPresence(snapshot)
@@ -696,6 +702,8 @@ final class AppDelegate:
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        residentLoopSchedulingTask?.cancel()
+        residentAgentLoop?.invalidate()
         shortcutCoordinator?.stop()
         avatarRuntime.removeObserver(desktopPresenceObserverID)
         desktopPresenceObserverID = nil
@@ -707,6 +715,7 @@ final class AppDelegate:
     }
 
     @objc private func manualMotionWillActivate(_ notification: Notification) {
+        residentAgentLoop?.stop()
         guard let context = livingWorldContext else { return }
         do {
             try context.stopActivity(reason: "用户从设置选择动作")
@@ -894,6 +903,7 @@ final class AppDelegate:
     }
 
     func runLivingWorldActivity(id: String) {
+        residentAgentLoop?.stop()
         let menu = LivingWorldActivityMenuStore.shared
         guard menu.canControl(worldID: spatialStage.selectedWorldID) else {
             menu.report("当前空间尚未接入生活活动，请切回生活舱。")
@@ -931,6 +941,7 @@ final class AppDelegate:
     }
 
     func stopLivingWorldActivity() {
+        residentAgentLoop?.stop()
         let menu = LivingWorldActivityMenuStore.shared
         guard menu.canControl(worldID: spatialStage.selectedWorldID) else {
             menu.report("请回到活动所在的生活舱后再停止。")
@@ -1286,7 +1297,8 @@ final class AppDelegate:
 
     private func cancelResidentMessage() {
         disconnectRealtimeVoice()
-        AgentConversationService.shared.cancel()
+        if let residentAgentLoop { residentAgentLoop.stop() }
+        else { AgentConversationService.shared.cancel() }
     }
 
     private func consumeResidentVoiceEvent(
@@ -1370,6 +1382,7 @@ final class AppDelegate:
     }
 
     func toggleLocalPlayback() {
+        residentAgentLoop?.stop()
         residentJukeboxPlaybackOwner = nil
         let route = ProgramPlaybackToggleRoute.resolve(
             playerState: localMusicPlayer.state,
@@ -1577,6 +1590,7 @@ final class AppDelegate:
         programID: String,
         at slotIndex: Int
     ) {
+        residentAgentLoop?.stop()
         guard
             !isStartingProgramPlayback,
             let plan = programStore.selectProgram(id: programID)
@@ -1664,6 +1678,7 @@ final class AppDelegate:
     }
 
     private func playPreviousProgramTrack() {
+        residentAgentLoop?.stop()
         guard
             activeProgram != nil,
             let previous = programPlaybackQueue.returnToPrevious()
@@ -1685,6 +1700,7 @@ final class AppDelegate:
     }
 
     private func playNextProgramTrack() {
+        residentAgentLoop?.stop()
         guard activeProgram != nil else {
             return
         }
@@ -2241,6 +2257,15 @@ final class AppDelegate:
     }
 
     private func applyLivingWorldSnapshot(_ snapshot: WorldAgentSnapshot) {
+        let activityRequestID = livingWorldContext?.currentActivityRequestID
+        if let previous = lastResidentActivityRequestID, previous != activityRequestID {
+            residentAgentLoop?.receiveEvent(.init(
+                id: "activity:\(snapshot.worldID):\(snapshot.revision)", kind: "activity_changed",
+                summary: "之前的活动已结束或被替换；当前活动：\(snapshot.activeActivity?.id ?? "无")。可通过世界工具查询实际状态。"
+            ))
+        }
+        lastResidentActivityRequestID = activityRequestID
+        synchronizeResidentLoopPresentation()
         LivingWorldActivityMenuStore.shared.updateActiveActivity(id: snapshot.activeActivity?.id)
         performLivingCabinJukeboxEffect(snapshot)
         let spatialWeather: SpatialWeather = switch snapshot.weather {
@@ -2518,6 +2543,9 @@ final class AppDelegate:
                 onSendMessage: { [weak self] message in
                     guard let self else { return }
                     await self.sendLiveCamMessage(message)
+                },
+                onCancelMessage: { [weak self] in
+                    self?.cancelResidentMessage()
                 },
                 onToggleVoice: { [weak self] in
                     self?.toggleRealtimeVoiceFromStage()
@@ -2875,6 +2903,82 @@ final class AppDelegate:
     /// Live Cam 文字聊天：直连 AgentConversationService，
     /// 不依赖实时语音连接状态。
     private var liveCamMessageID: UUID?
+    private var residentAgentLoop: ResidentAgentLoop?
+    private let residentActivityOwnership = ResidentActivityOwnership()
+    private var residentLoopSchedulingTask: Task<Void, Never>?
+    private var lastResidentActivityRequestID: String?
+
+    private func ensureResidentLoop() -> ResidentAgentLoop {
+        if let residentAgentLoop { return residentAgentLoop }
+        let loop = ResidentAgentLoop(
+            run: { [weak self] input in
+                guard let self else { throw CancellationError() }
+                return try await self.performResidentTurn(input)
+            },
+            steer: { text in await AgentConversationService.shared.steerResident(text) },
+            onReply: { [weak self] reply in
+                guard let self else { return }
+                liveCamWindowController?.finishAgentReply(reply)
+                stageWindowController?.finishResidentReply(reply)
+                agentSpeechAnnouncer.isEnabled = AgentConversationService.shared.preferenceStore.autoSpeakReplies
+                agentSpeechAnnouncer.announce(reply)
+            },
+            onFailure: { [weak self] message in self?.showResidentVoiceStatus(message) },
+            onChange: { [weak self] in self?.synchronizeResidentLoopPresentation() },
+            onCancel: { [weak self] in
+                AgentConversationService.shared.cancel()
+                self?.residentActivityOutcome?.abort()
+                try? self?.residentActivityOwnership.stopOwnedActivity()
+                self?.agentSpeechAnnouncer.stop()
+            }
+        )
+        residentAgentLoop = loop
+        return loop
+    }
+
+    private func synchronizeResidentLoopPresentation() {
+        let thinking = residentAgentLoop?.snapshot.isRunning ?? false
+        liveCamWindowController?.setResidentThinking(thinking)
+        stageWindowController?.setResidentThinking(thinking)
+        let loop = residentAgentLoop?.snapshot
+        let canStop = residentActivityOwnership.hasActiveActivity
+            || (loop?.backgroundEnabled == true && loop?.isStopped == false)
+        liveCamWindowController?.setResidentCanStop(canStop)
+        stageWindowController?.setResidentCanStop(canStop)
+        let notice = residentAgentLoop?.snapshot.unconfirmedUserMessages.isEmpty == false
+            ? "有补充消息尚未确认送达，未重复发送。" : nil
+        liveCamWindowController?.setResidentDeliveryNotice(notice)
+        stageWindowController?.setResidentDeliveryNotice(notice)
+    }
+
+    private func startResidentLoopScheduling() {
+        residentLoopSchedulingTask?.cancel()
+        residentLoopSchedulingTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(5)) } catch { return }
+                guard let self else { return }
+                refreshResidentAutonomy()
+            }
+        }
+    }
+
+    @objc private func residentAutonomyDidChange(_ notification: Notification) {
+        refreshResidentAutonomy()
+    }
+
+    private func refreshResidentAutonomy() {
+        let enabled = UserDefaults.standard.bool(forKey: "resident.autonomous.enabled.v1")
+            && AgentConversationService.shared.supportsWorldTools
+            && livingWorldContext?.manifest.worldID == spatialStage.selectedWorldID
+            && livingWorldContext != nil
+        if enabled {
+            let loop = ensureResidentLoop()
+            loop.setBackgroundEnabled(true)
+            loop.tick()
+        } else {
+            residentAgentLoop?.setBackgroundEnabled(false)
+        }
+    }
 
     private func currentResidentWorldContext() -> ResidentWorldContext {
         guard let context = livingWorldContext,
@@ -2940,9 +3044,24 @@ final class AppDelegate:
             }
         )
         residentActivityOutcome = outcome
-        // This lease authorizes only the four tools for the current user message.
-        // It does not enable background takeover or the wider DJ tool collection.
-        let dispatcher = WorldAgentToolDispatcher(takeoverEnabled: { true }, context: context)
+        let loopTools = ResidentLoopTools(loop: ensureResidentLoop(), runID: messageID)
+        let additionalTools = ResidentLoopTools.schemas.compactMap { schema -> ResidentWorldToolSession.AdditionalTool? in
+            guard let name = schema["name"] as? String,
+                  let description = schema["description"] as? String,
+                  let inputSchema = schema["inputSchema"] as? [String: Any] else { return nil }
+            return ResidentWorldToolSession.AdditionalTool(name: name, description: description,
+                inputSchema: inputSchema, validate: { _ in true }, handle: { id, arguments in
+                    let result = loopTools.handle(name: name, argumentsJSON: arguments)
+                    return RealtimeDJToolResult(callID: id, resultJSON: result.data, isError: result.isError)
+                })
+        }
+        // This lease authorizes only registered world and loop tools for this turn.
+        // It does not grant the wider DJ, account, shell or desktop capabilities.
+        let dispatcher = WorldAgentToolDispatcher(takeoverEnabled: { true }, context: context,
+            onActivityStarted: { [weak self] context, requestID in
+                self?.residentActivityOwnership.claim(context: context, requestID: requestID)
+                self?.synchronizeResidentLoopPresentation()
+            })
         let session = ResidentWorldToolSession(
             scopeID: messageID,
             worldID: worldID,
@@ -2951,7 +3070,9 @@ final class AppDelegate:
             isCurrent: isCurrent,
             beforeDispatch: { id, name, arguments in outcome.prepare(callID: id, name: name, argumentsJSON: arguments) },
             afterDispatch: { name, arguments, result in await outcome.complete(name: name, argumentsJSON: arguments, result: result) },
-            onCancel: { outcome.abort() }
+            onCancel: { outcome.abort() },
+            additionalTools: additionalTools,
+            maximumCalls: 32
         )
         return ResidentConversationTools(
             worldID: worldID,
@@ -2960,7 +3081,8 @@ final class AppDelegate:
                 let result = await session.call(requestID: requestID, name: name, argumentsJSON: arguments)
                 return ResidentCodexToolReply(resultJSON: result.resultJSON, isError: result.isError)
             },
-            cancel: { session.cancel() }
+            cancel: { session.cancel() },
+            allowsSilentCompletion: { loopTools.allowsSilentCompletion }
         )
     }
 
@@ -3004,7 +3126,12 @@ final class AppDelegate:
 
     private func sendLiveCamMessage(_ message: String) async {
         disconnectRealtimeVoice()
-        let messageID = UUID()
+        ensureResidentLoop().receiveUserMessage(message)
+    }
+
+    private func performResidentTurn(_ input: ResidentAgentLoop.Input) async throws -> String {
+        let messageID = input.runID
+        guard residentAgentLoop?.isCurrent(runID: messageID) == true else { throw CancellationError() }
         let worldContext = currentResidentWorldContext()
         let requestWorld = livingWorldContext
         liveCamMessageID = messageID
@@ -3013,50 +3140,23 @@ final class AppDelegate:
             worldTools?.cancel()
             if liveCamMessageID == messageID { liveCamMessageID = nil }
         }
-        liveCamWindowController?.beginAgentReply()
-        stageWindowController?.beginResidentReply()
         let finishCancellation: @MainActor () -> Void = { [weak self] in
             worldTools?.cancel()
             guard let self, self.liveCamMessageID == messageID else { return }
             self.liveCamMessageID = nil
-            self.liveCamWindowController?.showChatStatus("已取消本次回复。")
-            self.stageWindowController?.showResidentChatStatus("已取消本次回复。")
         }
-        let reply: String
-        do {
-            reply = try await AgentConversationService.shared.send(
-                message, worldContext: worldContext, worldTools: worldTools, onCancel: finishCancellation
-            )
-        } catch AgentConversationError.cancelled {
-            finishCancellation()
-            return
-        } catch is CancellationError {
-            finishCancellation()
-            return
-        } catch {
-            guard liveCamMessageID == messageID else { return }
-            guard currentResidentWorldContext().sessionScope == worldContext.sessionScope,
-                  worldTools == nil || livingWorldContext === requestWorld else {
-                finishCancellation()
-                return
-            }
-            showResidentVoiceStatus(
-                (error as? LocalizedError)?.errorDescription
-                    ?? "消息发送失败，请稍后再试。"
-            )
-            return
-        }
-        guard liveCamMessageID == messageID else { return }
+        let reply = try await AgentConversationService.shared.send(
+            worldTools == nil ? input.userMessages.joined(separator: "\n") : input.promptText,
+            worldContext: worldContext, worldTools: worldTools, onCancel: finishCancellation
+        )
+        guard liveCamMessageID == messageID,
+              residentAgentLoop?.isCurrent(runID: messageID) == true else { throw CancellationError() }
         guard currentResidentWorldContext().sessionScope == worldContext.sessionScope,
               worldTools == nil || livingWorldContext === requestWorld else {
             finishCancellation()
-            return
+            throw CancellationError()
         }
-        liveCamWindowController?.finishAgentReply(reply)
-        stageWindowController?.finishResidentReply(reply)
-        agentSpeechAnnouncer.isEnabled =
-            AgentConversationService.shared.preferenceStore.autoSpeakReplies
-        agentSpeechAnnouncer.announce(reply)
+        return reply
     }
 
     private func updateStageProgramNavigation() {

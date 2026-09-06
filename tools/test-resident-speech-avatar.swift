@@ -69,6 +69,9 @@ struct Camera { mutating func reset(to: CameraHome) {} }
     \#(worldSelection)
 }
 @MainActor final class App {
+    final class Loop { func invalidate() {} }
+    var residentAgentLoop: Loop?
+    var lastResidentActivityRequestID: String?
     let avatarRuntime: StageAvatarRuntimeStore
     let spatialStage = Spatial()
     var cancellations = 0

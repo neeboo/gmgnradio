@@ -8,6 +8,10 @@ guard FileManager.default.fileExists(atPath: bridge.path) else {
     print("FAIL: resident world tool session is not implemented")
     exit(1)
 }
+guard try String(contentsOf: bridge, encoding: .utf8).contains("struct AdditionalTool") else {
+    print("FAIL: resident session cannot register loop capabilities or enforce a call budget")
+    exit(1)
+}
 let bootstrap = try String(contentsOf: sources.appendingPathComponent("App/LivingWorldBootstrap.swift"), encoding: .utf8)
 let collisionStart = bootstrap.range(of: "struct MarbleLivingCabinCollisionWorld:")!.lowerBound
 let collisionEnd = bootstrap.range(of: "/// An effect is keyed", range: collisionStart..<bootstrap.endIndex)!.lowerBound
@@ -171,6 +175,32 @@ func code(_ result: RealtimeDJToolResult) -> String? { payload(result)["code"] a
         check(!listed.isError && (payload(listed)["snapshot"] as? [String: Any])?["activities"] != nil,
               "read-only activity list works with takeover disabled")
         check(context.state.activeActivity == nil, "rejected final calls leave resident idle")
+        var extensionCalls = 0
+        let extensionTool = ResidentWorldToolSession.AdditionalTool(
+            name: "read_resident_state", description: "Read process-local resident state",
+            inputSchema: ["type": "object", "properties": [:], "additionalProperties": false],
+            validate: { $0.isEmpty },
+            handle: { id, _ in
+                extensionCalls += 1
+                return RealtimeDJToolResult(callID: id, resultJSON: Data("{\"ok\":true}".utf8), isError: false)
+            })
+        let extended = ResidentWorldToolSession(scopeID: UUID(), worldID: manifest.worldID,
+            dispatcher: dispatcher, deadline: Date(timeIntervalSince1970: 300),
+            now: { clock.value }, isCurrent: { current.value },
+            additionalTools: [extensionTool], maximumCalls: 2)
+        let extendedSchemas = try JSONSerialization.jsonObject(with: extended.toolSchemasJSON) as! [[String: Any]]
+        check(extendedSchemas.count == 5, "only registered extension is advertised alongside world tools")
+        let extensionFirst = await extended.call(requestID: "extension", name: "read_resident_state", argumentsJSON: Data("{}".utf8))
+        let extensionDuplicate = await extended.call(requestID: "extension", name: "read_resident_state", argumentsJSON: Data("{}".utf8))
+        check(!extensionFirst.isError && extensionFirst == extensionDuplicate && extensionCalls == 1, "registered capability shares call deduplication")
+        let invalidExtension = await extended.call(requestID: "bad-extension", name: "read_resident_state", argumentsJSON: Data("{\"extra\":true}".utf8))
+        check(code(invalidExtension) == "invalid_arguments" && extensionCalls == 1, "registered capability validates arguments before execution")
+        _ = await extended.call(requestID: "second", name: "inspect_world", argumentsJSON: Data("{}".utf8))
+        let exhausted = await extended.call(requestID: "third", name: "read_resident_state", argumentsJSON: Data("{}".utf8))
+        check(code(exhausted) == "tool_budget_exhausted" && extensionCalls == 1, "per-turn call limit prevents further operations")
+        extended.cancel()
+        let afterClose = await extended.call(requestID: "closed", name: "read_resident_state", argumentsJSON: Data("{}".utf8))
+        check(code(afterClose) == "tool_session_cancelled" && extensionCalls == 1, "registered capability cannot survive closed lease")
         print("\(failures == 0 ? "PASS" : "FAIL"): \(checks) resident world tool checks, \(failures) failures")
         exit(failures == 0 ? 0 : 1)
     }

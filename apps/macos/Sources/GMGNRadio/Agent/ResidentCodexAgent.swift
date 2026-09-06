@@ -38,7 +38,10 @@ enum ResidentCodexAgentError: Error, LocalizedError {
     private var lastSafeErrorDetail: String?
     typealias TransportFactory = (URL, [String], URL, [String: String]) -> ResidentCodexTransport
     typealias ToolHandler = @MainActor (String, String, Data) async -> ResidentCodexToolReply
-    private static let allowedTools: Set<String> = ["inspect_world", "list_available_activities", "start_activity", "stop_activity"]
+    // Only the schemas supplied by the trusted application register capabilities.
+    private var registeredTools: Set<String> = []
+    private var allowsSilentCompletion: (@MainActor () -> Bool)?
+    private var successfulToolCall = false
     private let executableURL: URL
     private let workingDirectoryURL: URL
     private let environment: [String: String]
@@ -67,10 +70,14 @@ enum ResidentCodexAgentError: Error, LocalizedError {
     }
 
     func send(prompt: String, sessionID: String?, toolsJSON: Data,
+              allowsSilentCompletion: @escaping @MainActor () -> Bool = { false },
               onToolCall: @escaping ToolHandler) async throws -> ResidentCodexAgentOutcome {
         try Task.checkCancellation()
         guard operationID == nil else { throw ResidentCodexAgentError.busy }
         let tools = try Self.dynamicTools(toolsJSON)
+        registeredTools = Set(tools.compactMap { $0["name"] as? String })
+        self.allowsSilentCompletion = allowsSilentCompletion
+        successfulToolCall = false
         let token = UUID()
         operationID = token
         failureStage = nil; failureCode = nil; failureCategory = nil; failureDetail = nil; didSendTurnStart = false
@@ -89,6 +96,7 @@ enum ResidentCodexAgentError: Error, LocalizedError {
             transport?.onServerRequest = nil
             transport?.close(); transport = nil
             operationID = nil; acceptingTurn = false
+            registeredTools = []; self.allowsSilentCompletion = nil
         }
         return try await withTaskCancellationHandler {
             do {
@@ -184,6 +192,25 @@ enum ResidentCodexAgentError: Error, LocalizedError {
         fail(CancellationError())
     }
 
+    /// Uses the server's active-turn precondition; a missing acknowledgement is
+    /// deliberately not retried because the human input may already be accepted.
+    func steer(_ text: String) async -> ResidentSteeringDelivery {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              operationID != nil, terminal == nil, acceptingTurn,
+              let threadID, let turnID, let transport else { return .notDelivered }
+        do {
+            let response = try Self.object(await transport.request(method: "turn/steer", params: Self.encode([
+                "threadId": threadID, "expectedTurnId": turnID,
+                "input": [["type": "text", "text": text, "text_elements": []]],
+            ])))
+            // A matching acknowledgement remains proof of delivery even when
+            // turn/completed arrives immediately afterwards.
+            return response["turnId"] as? String == turnID ? .delivered : .unknown
+        } catch ResidentCodexTransportError.remoteError(let code) where [-32600, -32601, -32602].contains(code) {
+            return .notDelivered
+        } catch { return .unknown }
+    }
+
     private func fail(_ error: Error) {
         complete(.failure(error))
         transport?.close()
@@ -227,7 +254,9 @@ enum ResidentCodexAgentError: Error, LocalizedError {
                 complete(.failure(ResidentCodexAgentError.turnFailed)); return
             }
             let reply = finalMessages.map(\.text).joined(separator: "\n\n")
-            guard !reply.isEmpty else { complete(.failure(ResidentCodexAgentError.noFinalAnswer)); return }
+            guard !reply.isEmpty || (successfulToolCall && allowsSilentCompletion?() == true) else {
+                complete(.failure(ResidentCodexAgentError.noFinalAnswer)); return
+            }
             complete(.success(ResidentCodexAgentOutcome(reply: reply, sessionID: threadID)))
         } else if method == "error" {
             guard let turnID, params["turnId"] as? String == turnID else { return }
@@ -248,13 +277,14 @@ enum ResidentCodexAgentError: Error, LocalizedError {
               params["turnId"] as? String == turnID,
               params["namespace"] == nil || params["namespace"] is NSNull,
               let callID = params["callId"] as? String, !callID.isEmpty,
-              let name = params["tool"] as? String, Self.allowedTools.contains(name),
+              let name = params["tool"] as? String, registeredTools.contains(name),
               let arguments = params["arguments"] as? [String: Any],
               let encoded = try? Self.encode(arguments) else { return Self.failedTool("工具请求不属于当前居民会话。") }
         let result = await handler(callID, name, encoded)
         guard operationID == token, terminal == nil, !Task.isCancelled else { return Self.failedTool("居民会话已结束。") }
         guard (try? JSONSerialization.jsonObject(with: result.resultJSON, options: .fragmentsAllowed)) != nil,
               let text = String(data: result.resultJSON, encoding: .utf8) else { return Self.failedTool("空间工具返回无效结果。") }
+        if !result.isError { successfulToolCall = true }
         return (try? Self.encode(["success": !result.isError, "contentItems": [["type": "inputText", "text": text]]])) ?? Self.failedTool("空间工具返回无效结果。")
     }
 
@@ -268,9 +298,11 @@ enum ResidentCodexAgentError: Error, LocalizedError {
               !tools.isEmpty else { throw ResidentCodexAgentError.invalidTools }
         var names = Set<String>()
         return try tools.map { tool in
-            guard let name = tool["name"] as? String, allowedTools.contains(name), names.insert(name).inserted,
+            guard let name = tool["name"] as? String,
+                  name.range(of: "^[A-Za-z_][A-Za-z0-9_]{0,63}$", options: .regularExpression) != nil,
+                  names.insert(name).inserted,
                   let description = tool["description"] as? String,
-                  let schema = tool["inputSchema"] as? [String: Any] else { throw ResidentCodexAgentError.invalidTools }
+                  let schema = tool["inputSchema"] as? [String: Any], schema["type"] as? String == "object" else { throw ResidentCodexAgentError.invalidTools }
             return ["type": "function", "name": name, "description": description, "inputSchema": schema]
         }
     }

@@ -170,6 +170,9 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func beginResidentReply() { residentChat.begin() }
+    func setResidentThinking(_ thinking: Bool) { residentChat.setThinking(thinking) }
+    func setResidentCanStop(_ canStop: Bool) { residentChat.canStop = canStop }
+    func setResidentDeliveryNotice(_ text: String?) { residentChat.deliveryNotice = text }
     func finishResidentReply(_ text: String) { residentChat.finish(text) }
     func showResidentChatStatus(_ text: String) { residentChat.showStatus(text) }
 

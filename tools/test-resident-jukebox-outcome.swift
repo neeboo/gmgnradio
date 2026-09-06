@@ -45,6 +45,8 @@ enum PlayerError: Error { case missingTrack, pauseFailed }
 \#(playbackRoute)
 \#(toggleRoute)
 @MainActor final class AppPlaybackHarness {
+    final class ResidentLoop { func stop() {} }
+    var residentAgentLoop: ResidentLoop?
     struct Cabin { var worldID: String }
     struct Stage { var selectedWorldID: String; var marbleLivingCabin: Cabin? }
     struct Player {

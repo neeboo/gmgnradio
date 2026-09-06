@@ -5,6 +5,15 @@ let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let sources = root.appendingPathComponent("apps/macos/Sources/GMGNRadio")
 let controller = try String(contentsOf: sources.appendingPathComponent("VisualEngine/StageWindowController.swift"), encoding: .utf8)
 let overlay = try String(contentsOf: sources.appendingPathComponent("VisualEngine/StageOverlayView.swift"), encoding: .utf8)
+let liveCamController = try String(contentsOf: sources.appendingPathComponent("DesktopPresence/LiveCamWindowController.swift"), encoding: .utf8)
+guard controller.contains("func setResidentThinking("), controller.contains("func setResidentDeliveryNotice(") else {
+    print("FAIL: loop state and uncertain delivery cannot update independently of the reply")
+    exit(1)
+}
+guard controller.contains("func setResidentCanStop(") else {
+    print("FAIL: a silent active resident has no independent stop state")
+    exit(1)
+}
 guard overlay.contains("final class StageResidentChatState:"), controller.contains("func beginResidentReply()") else {
     print("FAIL: space has no resident composer or shared reply entry points")
     exit(1)
@@ -27,13 +36,17 @@ guard overlay.contains("private func performPrimaryAction()") else {
 }
 let primaryAction = declaration("private func performPrimaryAction()", in: overlay)
 let canStop = declaration("private var canStopReply:", in: overlay)
+let steeringControls = ["private var hasDraft:", "private var primaryStops:", "private func stopReply()"].map {
+    declaration($0, in: overlay)
+}.joined(separator: "\n")
 let keyboard = ["override func keyDown(", "override func keyUp(", "override func resignFirstResponder()", "override func scrollWheel(", "private static func movement("].map {
     declaration($0, in: controller)
 }.joined(separator: "\n")
-let replyMethods = ["func beginResidentReply()", "func finishResidentReply(", "func showResidentChatStatus("].map {
+let replyMethods = ["func beginResidentReply()", "func finishResidentReply(", "func showResidentChatStatus(", "func setResidentThinking(", "func setResidentDeliveryNotice(", "func setResidentCanStop("].map {
     declaration($0, in: controller)
 }.joined(separator: "\n")
 let chatToggle = declaration("private func toggleResidentChat()", in: controller)
+let liveCamSend = declaration("private func sendMessage(", in: liveCamController)
 precondition(!chatToggle.contains("cancel") && !chatToggle.contains("residentChat"), "collapsing chat must not cancel or reset its state")
 precondition(controller.contains("residentComposer.trailingAnchor.constraint(equalTo: transportControls.trailingAnchor)"), "composer belongs above the bottom-right controls")
 precondition(overlay.contains("ScrollView") && overlay.contains(".textSelection(.enabled)"), "reply must remain readable and selectable")
@@ -83,11 +96,26 @@ struct NSEvent { let keyCode: UInt16; var scrollingDeltaY: Double = 0; var hasPr
     func onCancelMessage() { cancelled += 1 }
     func submit() { submitted += 1 }
     func press() { performPrimaryAction() }
+    func pressStop() { stopReply() }
     \#(canStop)
+    \#(steeringControls)
     \#(primaryAction)
 }
+@MainActor final class LiveCamSubmission {
+    var messageRevision: UInt64 = 0
+    var isThinking = false
+    var status = ""
+    var pending: [String: CheckedContinuation<Void, Error>] = [:]
+    func setResidentThinking(_ value: Bool) { isThinking = value }
+    func showChatStatus(_ value: String) { status = value }
+    func onSendMessage(_ message: String) async throws {
+        try await withCheckedThrowingContinuation { pending[message] = $0 }
+    }
+    func send(_ message: String) { sendMessage(message) }
+    \#(liveCamSend)
+}
 @main struct Tests {
-    @MainActor static func main() {
+    @MainActor static func main() async {
         var count = 0, failures = 0
         func check(_ condition: Bool, _ text: String) { count += 1; if !condition { failures += 1; print("FAIL: \(text)") } }
         let state = StageResidentChatState()
@@ -95,10 +123,11 @@ struct NSEvent { let keyCode: UInt16; var scrollingDeltaY: Double = 0; var hasPr
         state.draft = "  去点唱机放首歌  \n"
         check(state.takeMessage() == "去点唱机放首歌" && state.draft.isEmpty && state.isThinking, "submit trims message and starts waiting")
         state.draft = "下一条"
-        check(state.takeMessage() == nil && state.draft == "下一条", "waiting does not submit another accidental Enter")
+        check(state.takeMessage() == "下一条" && state.draft.isEmpty && state.isThinking, "human guidance can be submitted while the loop is thinking")
         state.finish("正在播放")
         check(state.reply == "正在播放" && !state.isThinking, "reply exits waiting")
-        check(state.takeMessage() == "下一条", "new message works after reply")
+        state.draft = "接着说"
+        check(state.takeMessage() == "接着说", "new message works after reply")
         state.cancel()
         check(!state.isThinking && !state.reply.isEmpty, "stop exits waiting immediately")
         let controller = Controller()
@@ -106,6 +135,15 @@ struct NSEvent { let keyCode: UInt16; var scrollingDeltaY: Double = 0; var hasPr
         check(controller.residentChat.isThinking, "controller forwards shared reply start")
         controller.finishResidentReply("你好")
         check(controller.residentChat.reply == "你好" && !controller.residentChat.isThinking, "controller forwards shared reply finish")
+        controller.setResidentThinking(true)
+        controller.setResidentDeliveryNotice("有补充消息尚未确认送达，未重复发送。")
+        check(controller.residentChat.reply == "你好" && controller.residentChat.isThinking, "loop status update preserves completed reply")
+        check(controller.residentChat.deliveryNotice != nil, "uncertain delivery is visible separately from the reply")
+        controller.setResidentThinking(false)
+        controller.setResidentDeliveryNotice(nil)
+        check(controller.residentChat.reply == "你好" && !controller.residentChat.isThinking && controller.residentChat.deliveryNotice == nil, "clearing delivery and busy status preserves completed reply")
+        controller.setResidentCanStop(true)
+        check(controller.residentChat.canStop && !controller.residentChat.isThinking && controller.residentChat.reply == "你好", "silent owned activity exposes stop without implying thinking")
         controller.beginResidentReply()
         controller.showResidentChatStatus("连接失败")
         check(controller.residentChat.reply == "连接失败" && !controller.residentChat.isThinking, "controller failure status clears waiting")
@@ -121,6 +159,27 @@ struct NSEvent { let keyCode: UInt16; var scrollingDeltaY: Double = 0; var hasPr
         check(!controls.state.isThinking && controls.cancelled == 2, "thinking stop retains existing cancellation behavior")
         controls.press()
         check(controls.submitted == 1, "idle primary button still sends")
+        controls.state.begin()
+        controls.state.draft = "换点舒缓的"
+        controls.press()
+        check(controls.submitted == 2 && controls.cancelled == 2 && controls.state.isThinking, "nonempty guidance sends without cancelling current work")
+        controls.pressStop()
+        check(controls.cancelled == 3 && controls.state.draft == "换点舒缓的" && !controls.state.isThinking, "independent stop cancels immediately and preserves pending guidance")
+        controls.state.draft = ""
+        controls.state.canStop = true
+        controls.press()
+        check(controls.cancelled == 4 && controls.submitted == 2 && !controls.state.isThinking, "silent resident activity remains stoppable after reply and speech end")
+        let liveCam = LiveCamSubmission()
+        liveCam.send("先找歌")
+        while liveCam.pending["先找歌"] == nil { await Task.yield() }
+        liveCam.send("换个风格")
+        while liveCam.pending["换个风格"] == nil { await Task.yield() }
+        liveCam.pending.removeValue(forKey: "先找歌")?.resume(throwing: CancellationError())
+        for _ in 0..<10 { await Task.yield() }
+        check(liveCam.isThinking && liveCam.status == "…", "late error from older message cannot overwrite current guidance state")
+        liveCam.pending.removeValue(forKey: "换个风格")?.resume()
+        for _ in 0..<10 { await Task.yield() }
+        check(liveCam.isThinking, "message admission completion does not finish the agent loop")
         let input = Interaction()
         input.keyDown(with: NSEvent(keyCode: 13))
         check(input.spatialStage.movements == [.forward], "W still moves in the scene")

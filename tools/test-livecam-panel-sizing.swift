@@ -5,6 +5,19 @@ import Foundation
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let base = root.appendingPathComponent("apps/macos/Sources/GMGNRadio")
 func read(_ path: String) throws -> String { try String(contentsOf: base.appendingPathComponent(path), encoding: .utf8) }
+let panelSource = try read("DesktopPresence/LiveCamPanel.swift")
+guard panelSource.contains("func setResidentCanStop(") else {
+    print("FAIL: Live Cam cannot stop a silent owned activity")
+    exit(1)
+}
+guard panelSource.contains("func setResidentDeliveryNotice("), panelSource.contains("observeSpeechPlayback") else {
+    print("FAIL: Live Cam has no separate delivery notice or reactive speech stop")
+    exit(1)
+}
+guard panelSource.contains("func setResidentThinking("), panelSource.contains("livecam.button.stop") else {
+    print("FAIL: Live Cam has no independent immediate stop while entering human guidance")
+    exit(1)
+}
 func declaration(_ signature: String, in source: String) -> String {
     let start = source.range(of: signature)!.lowerBound
     let opening = source[start...].firstIndex(of: "{")!
@@ -69,6 +82,43 @@ import SwiftUI
                 check(panel.interactionView.messageField.stringValue == "保留草稿", "composer toggle preserves draft")
                 check(!panel.isVisible, "composer test never displays a window")
             }
+            var sent: [String] = []
+            var stopped = 0
+            panel.setSendMessageHandler { sent.append($0) }
+            panel.setCancelMessageHandler { stopped += 1 }
+            panel.setResidentThinking(true)
+            check(!panel.interactionView.stopButton.isHidden, "independent stop is visible beside a pending draft")
+            panel.interactionView.sendButton.performClick(nil)
+            check(sent == ["保留草稿"] && stopped == 0, "sending guidance does not cancel the current loop")
+            check(panel.interactionView.messageField.stringValue.isEmpty, "submitted guidance clears only the draft")
+            panel.interactionView.sendButton.performClick(nil)
+            check(stopped == 1 && sent.count == 1, "empty primary action immediately stops current loop")
+            panel.interactionView.messageField.stringValue = "换点舒缓的"
+            panel.setResidentThinking(true)
+            panel.interactionView.stopButton.performClick(nil)
+            check(stopped == 2 && panel.interactionView.messageField.stringValue == "换点舒缓的", "independent stop preserves an unsent draft")
+            panel.showAgentReply("保留完整回答")
+            panel.setResidentDeliveryNotice("有补充消息尚未确认送达，未重复发送。")
+            panel.contentView?.layoutSubtreeIfNeeded()
+            check(panel.interactionView.replyText == "保留完整回答", "delivery notice never overwrites final reply")
+            check(!panel.interactionView.residentDeliveryNotice.isEmpty && panel.frame.size == requested, "delivery notice is visible without changing viewport size")
+            panel.setResidentDeliveryNotice(nil)
+            check(panel.interactionView.residentDeliveryNotice.isEmpty && panel.interactionView.replyText == "保留完整回答", "clearing delivery notice preserves reply")
+            AgentSpeechStatusStore.shared.isSpeaking = true
+            for _ in 0..<10 { await Task.yield() }
+            check(!panel.interactionView.stopButton.isHidden && panel.interactionView.stopButton.toolTip == "停止朗读", "speech observation exposes independent stop without thinking")
+            panel.interactionView.stopButton.performClick(nil)
+            check(stopped == 3 && panel.interactionView.replyText == "保留完整回答", "speech stop uses app cancellation without clearing text")
+            AgentSpeechStatusStore.shared.isSpeaking = false
+            for _ in 0..<10 { await Task.yield() }
+            check(panel.interactionView.stopButton.isHidden, "speech stop disappears after playback finishes")
+            panel.setResidentCanStop(true)
+            check(!panel.interactionView.stopButton.isHidden && panel.interactionView.stopButton.toolTip == "停止当前任务", "silent owned activity retains independent stop")
+            panel.interactionView.stopButton.performClick(nil)
+            check(stopped == 4 && panel.interactionView.replyText == "保留完整回答", "silent activity stop reaches application without clearing reply")
+            panel.setResidentCanStop(false)
+            check(panel.interactionView.stopButton.isHidden, "application-owned stop state clears once activity is stopped")
+            check(!panel.isVisible, "steering checks never display a window")
             panel.close()
         }
         AgentSpeechStatusStore.shared.lastErrorMessage = nil

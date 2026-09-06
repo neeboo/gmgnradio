@@ -17,12 +17,16 @@ func declaration(_ signature: String, in source: String) -> String {
     fatalError("Unbalanced \(signature)")
 }
 let sendMethod = declaration("private func sendLiveCamMessage(", in: app)
+let loopMethods = ["private func ensureResidentLoop(", "private func synchronizeResidentLoopPresentation(",
+                   "private func performResidentTurn(", "private func cancelResidentMessage("].map {
+    declaration($0, in: app)
+}.joined(separator: "\n")
 let contextMethod = app.contains("private func currentResidentWorldContext(")
     ? declaration("private func currentResidentWorldContext(", in: app) : ""
 let toolsMethod = app.contains("private func makeResidentWorldTools(")
     ? declaration("private func makeResidentWorldTools(", in: app) : ""
 let controller = try String(contentsOf: sources.appendingPathComponent("DesktopPresence/LiveCamWindowController.swift"), encoding: .utf8)
-let replyMethods = ["func beginAgentReply(", "func finishAgentReply(", "func showChatStatus("].map { declaration($0, in: controller) }.joined(separator: "\n")
+let replyMethods = ["func beginAgentReply(", "func finishAgentReply(", "func showChatStatus(", "func setResidentThinking("].map { declaration($0, in: controller) }.joined(separator: "\n")
 let harness = #"""
 import Foundation
 import WorldRuntime
@@ -118,6 +122,8 @@ typealias RealConversationService = AgentConversationService
     var replies: [String] = []
     var statuses: [String] = []
     var text = ""
+    var thinking = false
+    func setResidentThinking(_ value: Bool) { thinking = value }
     func showAgentReply(_ reply: String) {
         text = reply
         if reply != "…" && !reply.isEmpty { replies.append(reply) }
@@ -130,7 +136,10 @@ typealias RealConversationService = AgentConversationService
     var agentReplyBuffer = ""
     var replies: [String] { panel.replies }
     var statuses: [String] { panel.statuses }
-    var waiting: Bool { panel.text == "…" }
+    var waiting: Bool { panel.thinking }
+    var deliveryNotice: String?
+    func setResidentDeliveryNotice(_ value: String?) { deliveryNotice = value }
+    func setResidentCanStop(_ value: Bool) {}
     \#(replyMethods)
 }
 @MainActor final class Speech {
@@ -144,12 +153,17 @@ typealias RealConversationService = AgentConversationService
     // service; the method itself is compiled unchanged, UI/TTS are inert sinks.
     enum AgentConversationService { static var shared: RealConversationService! }
     private var liveCamMessageID: UUID?
+    private var residentAgentLoop: ResidentAgentLoop?
+    private let residentActivityOwnership = ResidentActivityOwnership()
     private var residentActivityOutcome: ResidentActivityOutcome?
     var liveCamWindowController: Surface? = Surface()
     final class StageReply {
         func beginResidentReply() {}
         func finishResidentReply(_ text: String) {}
         func showResidentChatStatus(_ text: String) {}
+        func setResidentThinking(_ thinking: Bool) {}
+        func setResidentDeliveryNotice(_ notice: String?) {}
+        func setResidentCanStop(_ canStop: Bool) {}
     }
     var stageWindowController: StageReply? = StageReply()
     func disconnectRealtimeVoice() { agentSpeechAnnouncer.stop() }
@@ -163,11 +177,24 @@ typealias RealConversationService = AgentConversationService
     var livingWorldContext: WorldAgentContext?
     init(_ service: RealConversationService) { AgentConversationService.shared = service }
     \#(sendMethod)
+    \#(loopMethods)
     \#(contextMethod)
     \#(toolsMethod)
     private func resumeResidentJukebox(owner: UUID) async throws { fatalError("Use the jukebox outcome suite for playback") }
     private func pauseResidentJukebox(owner: UUID?) async throws { fatalError("Use the jukebox outcome suite for playback") }
-    func send(_ message: String) async { await sendLiveCamMessage(message) }
+    func enqueue(_ message: String) async { await sendLiveCamMessage(message) }
+    func stop() { cancelResidentMessage() }
+    func waitUntilIdle() async {
+        for _ in 0..<500_000 {
+            if residentAgentLoop?.snapshot.isRunning != true { return }
+            await Task.yield()
+        }
+        fatalError("Resident loop did not become idle")
+    }
+    func send(_ message: String) async {
+        await sendLiveCamMessage(message)
+        await waitUntilIdle()
+    }
 }
 
 @MainActor var checks = 0
@@ -214,14 +241,20 @@ typealias RealConversationService = AgentConversationService
             await formal.waitForCalls(1)
             let tools = formal.tools[0]
             check(tools.worldID == manifest.worldID, "\(mode): App binds actual world to formal tools")
-            check((try JSONSerialization.jsonObject(with: tools.schemasJSON) as? [Any])?.count == 4,
-                  "\(mode): App exposes exactly four world tools")
+            check((try JSONSerialization.jsonObject(with: tools.schemasJSON) as? [Any])?.count == 6,
+                  "\(mode): App exposes four world tools and two loop tools")
+            check(formal.prompts[0].contains("这是居民生活循环的一轮"), "\(mode): actual App supplies generic loop instructions")
+            let observed = await tools.call("loop-read", "read_resident_state", Data("{}".utf8))
+            check(!observed.isError && !tools.allowsSilentCompletion(), "\(mode): reading state alone does not authorize silent completion")
+            let planned = await tools.call("loop-intent", "update_resident_intent",
+                Data(#"{"summary":"保留当前委托，等待下一条引导","status":"waiting_user"}"#.utf8))
+            check(!planned.isError && tools.allowsSilentCompletion(), "\(mode): actual App loop tool records intent for this turn")
             let started = await tools.call("start", "start_activity", Data(#"{"activity_id":"home.idle"}"#.utf8))
             check(!started.isError && context.state.activeActivity?.activityID == "home.idle", "\(mode): actual App-to-service callback starts real activity")
             let stopped = await tools.call("stop", "stop_activity", Data("{}".utf8))
             check(!stopped.isError && context.state.activeActivity == nil, "\(mode): actual callback stops activity")
             switch mode {
-            case "cancel": service.cancel()
+            case "cancel": app.stop()
             case "selected-world": app.spatialStage.selectedWorldID = "other-world"
             case "replaced-context": app.livingWorldContext = try WorldAgentContext(manifest: manifest)
             default: break
@@ -234,6 +267,8 @@ typealias RealConversationService = AgentConversationService
             await request.value
             let after = await tools.call("after", "start_activity", Data(#"{"activity_id":"home.idle"}"#.utf8))
             check(after.isError && context.state.activeActivity == nil, "\(mode): completed request releases formal capability lease")
+            let latePlan = await tools.call("late-plan", "update_resident_intent", Data(#"{"summary":"迟到的修改","status":"active"}"#.utf8))
+            check(latePlan.isError && !tools.allowsSilentCompletion(), "\(mode): ended or stopped turn cannot mutate intent")
             check(app.liveCamWindowController?.waiting == false, "\(mode): request always ends waiting bubble")
             check(app.liveCamWindowController?.replies == (mode == "finish" ? ["formal reply"] : []),
                   "\(mode): only current world receives formal reply")
@@ -471,6 +506,7 @@ typealias RealConversationService = AgentConversationService
             let app = AppHarness(service)
             let old = Task { await app.send("old") }
             await runner.waitForCalls(1)
+            app.stop()
             let current = Task { await app.send("new") }
             await runner.waitForCalls(2)
             await runner.finish(1, session: "new", reply: "current")
@@ -488,6 +524,7 @@ typealias RealConversationService = AgentConversationService
             let app = AppHarness(service)
             let old = Task { await app.send("old") }
             await runner.waitForCalls(1)
+            app.stop()
             locator.setAvailable(false)
             await app.send("provider-disappeared")
             let failureStatuses = app.liveCamWindowController?.statuses
@@ -499,23 +536,18 @@ typealias RealConversationService = AgentConversationService
             check(app.agentSpeechAnnouncer.spoken.isEmpty, "old success after preflight failure cannot trigger TTS")
             check(service.preferenceStore.sessionID(for: .codex) == nil, "preflight failure cancels old session persistence")
         }
-        for action in ["cancel", "reset", "switch", "caller-cancel"] {
+        for action in ["cancel", "reset", "switch", "stop-button"] {
             let (service, runner, defaults, suite) = fixture()
             defer { defaults.removePersistentDomain(forName: suite) }
             let app = AppHarness(service)
             let request = Task { await app.send("waiting") }
             await runner.waitForCalls(1)
             check(app.liveCamWindowController?.waiting == true, "\(action): actual begin shows waiting")
+            app.stop()
             switch action {
             case "reset": service.resetSession()
             case "switch": service.selectBackend(.dsh)
-            case "caller-cancel":
-                request.cancel()
-                for _ in 0..<100_000 {
-                    if app.liveCamWindowController?.waiting == false { break }
-                    await Task.yield()
-                }
-            default: service.cancel()
+            default: break
             }
             check(app.liveCamWindowController?.waiting == false, "\(action): cancellation immediately ends waiting before process exits")
             await runner.finish(0)
@@ -528,15 +560,18 @@ typealias RealConversationService = AgentConversationService
             let app = AppHarness(service)
             let old = Task { await app.send("old") }
             await runner.waitForCalls(1)
-            let current = Task { await app.send("current") }
+            await app.enqueue("current")
+            for _ in 0..<100 { await Task.yield() }
+            check(await runner.calls.count == 1, "unsupported steering queues guidance without cancelling active request")
+            check(app.liveCamWindowController?.waiting == true, "queued guidance retains current thinking state")
+            await runner.finish(0, session: "continued", reply: "first reply")
             await runner.waitForCalls(2)
-            check(app.liveCamWindowController?.waiting == true, "new request waits after replacing old request")
-            await runner.finish(0)
-            await old.value
-            check(app.liveCamWindowController?.waiting == true, "late cancelled request cannot clear new waiting bubble")
+            check(await runner.calls[1].arguments.contains("continued"), "queued guidance resumes completed session")
+            check(app.liveCamWindowController?.waiting == true, "next queued turn remains visibly thinking")
             await runner.finish(1, reply: "current")
-            await current.value
+            await old.value
             check(app.liveCamWindowController?.waiting == false, "actual finish ends waiting")
+            check(app.liveCamWindowController?.replies == ["first reply", "current"], "both serial turns publish their own completed reply")
         }
         do {
             let (service, runner, defaults, suite) = fixture()
@@ -587,6 +622,10 @@ let compilerArguments: [String] = ["-j1", "-parse-as-library",
     sources.appendingPathComponent("Agent/ResidentCodexPolicy.swift").path,
     sources.appendingPathComponent("Agent/ResidentCodexTransport.swift").path,
     sources.appendingPathComponent("Agent/ResidentCodexAgent.swift").path,
+    sources.appendingPathComponent("Agent/ResidentSteeringDelivery.swift").path,
+    sources.appendingPathComponent("Agent/ResidentAgentLoop.swift").path,
+    sources.appendingPathComponent("Agent/ResidentLoopTools.swift").path,
+    sources.appendingPathComponent("Agent/ResidentActivityOwnership.swift").path,
     program.path, "-o", executable.path]
 let runtimeObjects = try FileManager.default.contentsOfDirectory(
         at: root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug/WorldRuntime.build"),
