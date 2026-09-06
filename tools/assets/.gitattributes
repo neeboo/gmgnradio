@@ -1,0 +1,4 @@
+# Preserve upstream workflow bytes: the service verifies its exact SHA-256.
+workflow.source.json -text
+*.py text eol=lf
+*.service text eol=lf

@@ -1,0 +1,20 @@
+[Unit]
+Description=gmgn isolated image-to-prop Comfy backend
+
+[Service]
+Type=simple
+WorkingDirectory=/home/spark/gmgn-prop-service/comfyui
+Environment=OMP_NUM_THREADS=2
+Environment=OPENBLAS_NUM_THREADS=2
+ExecStart=/home/spark/gmgn-prop-service/venv/bin/python main.py --listen 127.0.0.1 --port 8190 --disable-all-custom-nodes --lowvram --reserve-vram 4 --disable-auto-launch
+Nice=15
+MemoryHigh=18G
+MemoryMax=20G
+MemorySwapMax=0
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

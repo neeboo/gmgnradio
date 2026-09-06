@@ -1,0 +1,17 @@
+[Unit]
+Description=gmgn private image-to-prop API
+After=gmgn-prop-comfy.service
+Wants=gmgn-prop-comfy.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/spark/gmgn-prop-service
+ExecStart=/home/spark/gmgn-prop-service/venv/bin/python prop_service.py --root /home/spark/gmgn-prop-service/data --workflow /home/spark/gmgn-prop-service/workflow.source.json --comfy-output /home/spark/gmgn-prop-service/comfyui/output --token-file /home/spark/gmgn-prop-service/api-token
+Nice=15
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
