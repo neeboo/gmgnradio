@@ -625,7 +625,6 @@ final class AppDelegate:
             self?.cancelResidentMessage()
             self?.residentAgentLoop?.invalidate()
             self?.residentAgentLoop = nil
-            self?.lastResidentActivityRequestID = nil
         }
         configureLivingWorld()
         configureStage()
@@ -2126,6 +2125,20 @@ final class AppDelegate:
                 },
                 context: context
             )
+            let observationScopeID = UUID().uuidString
+            context.onEventsPublished = { [weak self, weak context] events in
+                guard let self, let context,
+                      self.livingWorldContext === context,
+                      self.spatialStage.selectedWorldID == context.manifest.worldID else { return }
+                let loop = self.ensureResidentLoop()
+                for event in events {
+                    if let observation = ResidentWorldObservation.event(
+                        event, worldID: context.manifest.worldID, scopeID: observationScopeID
+                    ) {
+                        loop.receiveEvent(observation)
+                    }
+                }
+            }
             context.onSnapshotChanged = { [weak self] snapshot in
                 self?.applyLivingWorldSnapshot(snapshot)
             }
@@ -2301,14 +2314,6 @@ final class AppDelegate:
     }
 
     private func applyLivingWorldSnapshot(_ snapshot: WorldAgentSnapshot) {
-        let activityRequestID = livingWorldContext?.currentActivityRequestID
-        if let previous = lastResidentActivityRequestID, previous != activityRequestID {
-            residentAgentLoop?.receiveEvent(.init(
-                id: "activity:\(snapshot.worldID):\(snapshot.revision)", kind: "activity_changed",
-                summary: "之前的活动已结束或被替换；当前活动：\(snapshot.activeActivity?.id ?? "无")。可通过世界工具查询实际状态。"
-            ))
-        }
-        lastResidentActivityRequestID = activityRequestID
         synchronizeResidentLoopPresentation()
         LivingWorldActivityMenuStore.shared.updateActiveActivity(id: snapshot.activeActivity?.id)
         performLivingCabinJukeboxEffect(snapshot)
@@ -2950,7 +2955,6 @@ final class AppDelegate:
     private var residentAgentLoop: ResidentAgentLoop?
     private let residentActivityOwnership = ResidentActivityOwnership()
     private var residentLoopSchedulingTask: Task<Void, Never>?
-    private var lastResidentActivityRequestID: String?
 
     private func ensureResidentLoop() -> ResidentAgentLoop {
         if let residentAgentLoop { return residentAgentLoop }

@@ -84,8 +84,10 @@ final class WorldAgentContext {
     private let maximumStepHeight: Float
     private var tickingTask: Task<Void, Never>?
     private var lastCheckpointWorldTime: Date?
+    private var publishedEventCount = 0
 
     var onSnapshotChanged: (@MainActor (WorldAgentSnapshot) -> Void)?
+    var onEventsPublished: (@MainActor ([WorldEvent]) -> Void)?
     var onTickError: (@MainActor (Error) -> Void)?
 
     init(
@@ -317,7 +319,6 @@ final class WorldAgentContext {
             throw WorldAgentContextError.unknownActivity(id)
         }
 
-        movement = nil
         let date = requestedAt ?? state.worldTime
         let request = ScheduledActivity(
             id: "agent-\(id)-\(state.revision)",
@@ -326,7 +327,9 @@ final class WorldAgentContext {
             priority: .explicitUserRequest,
             requestedAt: date
         )
-        var effects = activityExecutor.start(request, definition: definition, at: date)
+        // Validate the replacement and its approach before changing the current execution.
+        var preparedExecutor = activityExecutor
+        var effects = preparedExecutor.start(request, definition: definition, at: date)
         if effects.contains(where: \.isRejectedOrFailed) {
             throw WorldAgentContextError.activityRejected(id)
         }
@@ -337,14 +340,13 @@ final class WorldAgentContext {
                     from: state.agentTransform.position.simd,
                     to: anchor.entryWaypointID
                 )
-                effects += try activityExecutor.supplyApproach(
+                effects += try preparedExecutor.supplyApproach(
                     ActivityApproachPlan(
                         waypoints: path.points,
                         targetYaw: Self.yaw(of: anchor.transform.rotation)
                     )
                 )
             } catch {
-                _ = activityExecutor.fail(.pathUnavailable, at: date)
                 throw WorldAgentContextError.routeBlocked(anchor.entryWaypointID)
             }
         }
@@ -352,6 +354,8 @@ final class WorldAgentContext {
             throw WorldAgentContextError.routeBlocked(anchor.entryWaypointID)
         }
 
+        activityExecutor = preparedExecutor
+        movement = nil
         if state.activeActivity != nil {
             _ = try simulation.cancelActivity(expectedRevision: state.revision)
         }
@@ -582,9 +586,16 @@ final class WorldAgentContext {
                 if state.activeActivity != nil {
                     _ = try simulation.completeActivity(expectedRevision: state.revision)
                 }
-            case .cancelled, .failed:
+            case .cancelled:
                 if state.activeActivity != nil {
                     _ = try simulation.cancelActivity(expectedRevision: state.revision)
+                }
+            case let .failed(_, reason):
+                if state.activeActivity != nil {
+                    _ = try simulation.cancelActivity(
+                        reason: "活动执行失败：\(reason.rawValue)",
+                        expectedRevision: state.revision
+                    )
                 }
             case let .resumed(activityID, _):
                 if state.activeActivity != nil {
@@ -627,10 +638,31 @@ final class WorldAgentContext {
     }
 
     private func publish(forcePersistence: Bool) throws {
+        publishObservations()
         onSnapshotChanged?(snapshot)
         if forcePersistence {
             try saveCheckpoint()
         }
+    }
+
+    private func publishObservations() {
+        // Keep the cursor until an observer is attached, including the initial load fact.
+        guard let onEventsPublished else { return }
+        // Index directly into the append-only log; never scan historical frame events.
+        let end = simulation.events.count
+        var observations: [WorldEvent] = []
+        for index in publishedEventCount..<end {
+            let event = simulation.events[index]
+            switch event.kind {
+            case .timeAdvanced, .timeCaughtUp, .agentTransformUpdated, .liveCameraChanged:
+                break
+            default:
+                observations.append(event)
+            }
+        }
+        // Advance before either callback, because observers may synchronously mutate the world.
+        publishedEventCount = end
+        if !observations.isEmpty { onEventsPublished(observations) }
     }
 
     private func saveCheckpoint() throws {
