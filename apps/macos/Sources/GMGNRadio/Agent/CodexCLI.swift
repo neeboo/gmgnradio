@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 struct CodexCommandResult: Equatable, Sendable {
     let exitCode: Int32
@@ -14,14 +15,16 @@ protocol CodexCommandRunning: Sendable {
 
 enum CodexCLIError: Error, LocalizedError {
     case unavailable
+    /// 关联值是**仅供诊断**的原始 CLI 输出，可能含路径或凭据；绝不直接显示给用户。
     case commandFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .unavailable:
             "未找到 Codex CLI，请先安装 Codex。"
-        case let .commandFailed(message):
-            message.isEmpty ? "Codex 操作失败。" : message
+        case .commandFailed:
+            "Codex 本次操作没有成功，已停止。请确认现场后重新发送；"
+                + "若反复失败，请在设置里重新登录 Codex。"
         }
     }
 }
@@ -62,7 +65,7 @@ struct CodexProcessRunner: CodexCommandRunning {
         }.value
     }
 
-    private static func commandEnvironment(
+    fileprivate static func commandEnvironment(
         base: [String: String]
     ) -> [String: String] {
         var environment = base
@@ -111,5 +114,133 @@ struct CodexProcessRunner: CodexCommandRunning {
             }
         }
         return nil
+    }
+}
+
+enum DSHReplyTimeout: Error, LocalizedError {
+    case request, turn
+
+    var errorDescription: String? {
+        switch self {
+        case .request: "等待 DSH 本次回复超时，已停止等待。部分操作可能已经发生，请先核对当前状态。"
+        case .turn: "DSH 本轮回复超时，已停止继续调用。部分操作可能已经发生，请先核对当前状态。"
+        }
+    }
+}
+
+/// Only the DSH headless lane uses this runner. Other CLI backends retain their
+/// existing process behavior. Every invocation owns a fresh process and lease.
+struct DSHProcessRunner: CodexCommandRunning {
+    let executableURL: URL
+    var requestTimeout: TimeInterval = 120
+
+    func run(arguments: [String], standardInput: String?) async throws -> CodexCommandResult {
+        let operation = DSHProcessOperation()
+        return try await operation.run(executableURL: executableURL, arguments: arguments,
+                                       standardInput: standardInput, timeout: requestTimeout)
+    }
+}
+
+@MainActor private final class DSHProcessOperation {
+    private var continuation: CheckedContinuation<CodexCommandResult, Error>?
+    private var process: Process?
+    private var deadline: Task<Void, Never>?
+    private var settled = false
+    private var stdoutResult: CodexCommandResult?
+    private var stderrText: String?
+
+    nonisolated init() {}
+
+    func run(executableURL: URL, arguments: [String], standardInput: String?,
+             timeout: TimeInterval) async throws -> CodexCommandResult {
+        try Task.checkCancellation()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                // Cancellation may win between the initial check and waiter
+                // registration. Never launch after that lease has settled.
+                guard !settled, !Task.isCancelled else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                self.continuation = continuation
+                let child = Process(), output = Pipe(), diagnostics = Pipe(), input = Pipe()
+                child.executableURL = executableURL
+                child.arguments = arguments
+                child.environment = CodexProcessRunner.commandEnvironment(base: ProcessInfo.processInfo.environment)
+                child.standardOutput = output
+                child.standardError = diagnostics
+                child.standardInput = input
+                process = child
+                do { try child.run() }
+                catch { settle(.failure(error)); return }
+                let seconds = timeout.isFinite ? max(0.01, min(timeout, 3_600)) : 120
+                deadline = Task { [weak self] in
+                    do { try await Task.sleep(for: .seconds(seconds)) } catch { return }
+                    self?.stop(DSHReplyTimeout.request)
+                }
+                // Neither a pipe read nor a blocked stdin write can block the
+                // main actor, cancellation, or the caller's deadline.
+                _ = fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
+                DispatchQueue.global(qos: .userInitiated).async {
+                    if let standardInput { try? input.fileHandleForWriting.write(contentsOf: Data(standardInput.utf8)) }
+                    try? input.fileHandleForWriting.close()
+                }
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    let data = diagnostics.fileHandleForReading.readDataToEndOfFile()
+                    try? diagnostics.fileHandleForReading.close()
+                    let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                    Task { @MainActor [weak self] in
+                        self?.stderrText = text
+                        self?.settleAfterDrain()
+                    }
+                }
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    let data = output.fileHandleForReading.readDataToEndOfFile()
+                    child.waitUntilExit()
+                    try? output.fileHandleForReading.close()
+                    let result = CodexCommandResult(exitCode: child.terminationStatus,
+                        output: String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
+                    Task { @MainActor [weak self] in
+                        self?.stdoutResult = result
+                        self?.settleAfterDrain()
+                    }
+                }
+            }
+        } onCancel: {
+            Task { @MainActor in self.stop(CancellationError()) }
+        }
+    }
+
+    private func settleAfterDrain() {
+        guard !settled, let stdoutResult, let stderrText else { return }
+        // DSH reserves stdout for the model reply. Diagnostics can be emitted
+        // on a successful run, so only failed exits consume stderr.
+        let output = stdoutResult.exitCode == 0 || stderrText.isEmpty ? stdoutResult.output : stderrText
+        settle(.success(CodexCommandResult(exitCode: stdoutResult.exitCode, output: output)))
+    }
+
+    private func stop(_ error: Error) {
+        guard !settled else { return }
+        let child = process
+        settle(.failure(error))
+        guard let child, child.isRunning else { return }
+        child.terminate()
+        // Retain only this owned Process, never a global PID lookup. A delayed
+        // kill checks that the same Process is still running, so a later turn
+        // or a recycled PID cannot inherit this cancellation.
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(250))
+            if child.isRunning { kill(child.processIdentifier, SIGKILL) }
+        }
+    }
+
+    private func settle(_ result: Result<CodexCommandResult, Error>) {
+        guard !settled else { return }
+        settled = true
+        deadline?.cancel(); deadline = nil
+        process = nil
+        let waiting = continuation
+        continuation = nil
+        waiting?.resume(with: result)
     }
 }

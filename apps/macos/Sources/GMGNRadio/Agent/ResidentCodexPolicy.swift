@@ -33,9 +33,17 @@ enum ResidentCodexPolicy {
         return servers.keys.sorted()
     }
 
+    /// Resident Codex keeps its hosted web_search capability: it is a
+    /// server-side tool that reads public pages and never depends on the local
+    /// sandbox, so it does not weaken the read-only workspace boundary below.
+    /// `live` is the open mode (per Codex docs, `"disabled"` turns the tool
+    /// off; `"cached"`/`"indexed"` gate to an index). Results stay untrusted
+    /// model input like any other fetched content.
+    static let residentWebSearchMode = "live"
+
     static func arguments(disabling names: [String]) throws -> [String] {
         var overrides = disabledFeatures.map { "features.\($0)=false" }
-        overrides += ["agents.enabled=false", "notify=[]", "web_search=\"disabled\"",
+        overrides += ["agents.enabled=false", "notify=[]", "web_search=\"\(residentWebSearchMode)\"",
                       "cli_auth_credentials_store=\"file\"", "mcp_oauth_credentials_store=\"file\""]
         if !names.isEmpty {
             let encoder = JSONEncoder()
@@ -56,7 +64,8 @@ enum ResidentCodexPolicy {
               disabledFeatures.allSatisfy({ features[$0] as? Bool == false }),
               let agents = config["agents"] as? [String: Any], agents["enabled"] as? Bool == false,
               let notify = config["notify"] as? [Any], notify.isEmpty,
-              config["web_search"] as? String == "disabled",
+              let webSearch = config["web_search"] as? String, !webSearch.isEmpty,
+              webSearch != "disabled",
               config["cli_auth_credentials_store"] as? String == "file",
               config["mcp_oauth_credentials_store"] as? String == "file" else {
             throw ResidentCodexPolicyError.unsafeConfiguration

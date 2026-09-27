@@ -12,7 +12,29 @@ final class AgentSpeechStatusStore {
 
     var lastErrorMessage: String?
     var isSpeaking = false
+    @ObservationIgnored
+    var onStopSpeaking: (@MainActor () -> Void)?
+
+    func stopSpeaking() {
+        onStopSpeaking?()
+    }
 }
+
+// MARK: - Delivery outcome
+
+/// 一次朗读请求的最终交付结果。App 只有在 `finished` 时才能把该轮回复记为
+/// “已语音交付”；`cancelled` 与 `failed` 一律不得触发语音记忆确认。
+enum AgentSpeechOutcome: Equatable, Sendable {
+    /// 整段语音自然播放完毕（Bailian 为全部分段全部播完）。
+    case finished
+    /// 被新朗读替换、被用户停止，或从未开始（朗读被禁用 / 文本为空）。
+    case cancelled
+    /// 启动、网络、合成或播放失败。
+    case failed
+}
+
+/// 朗读交付回调：同一次朗读请求恰好调用一次，永远在 MainActor 上触发。
+typealias AgentSpeechCompletion = @MainActor (AgentSpeechOutcome) -> Void
 
 // MARK: - Protocol
 
@@ -22,56 +44,136 @@ protocol SpeechSynthesizing: AnyObject {
     @discardableResult
     func speak(_ text: String) -> Bool
 
+    /// 带交付回调的朗读：回调恰好一次；只有整段语音自然播完才报告 `.finished`。
+    @discardableResult
+    func speak(_ text: String, completion: @escaping AgentSpeechCompletion) -> Bool
+
     func stopSpeaking()
 }
 
-// MARK: - macOS implementation
+// MARK: - System voice (NSSpeechSynthesizer boundary)
 
-/// 基于 NSSpeechSynthesizer 的本地语音合成。
+/// 单次朗读的真实语音引擎边界；每个 utterance 使用独立实例以可靠归属回调，
+/// 停止/替换后迟到的 didFinish 只会归属旧实例，不会误报新朗读成功。
 @MainActor
-final class MacSpeechSynthesizer: NSObject, SpeechSynthesizing {
-    private let synthesizer = NSSpeechSynthesizer()
-    private let statusStore: AgentSpeechStatusStore
-    private var pendingStopCallbacks = 0
+protocol SystemVoiceSpeaking: AnyObject {
+    /// 引擎自然结束或出错时回调（finishedSpeaking: Bool），只会触发一次。
+    var onFinished: (@MainActor (Bool) -> Void)? { get set }
 
-    init(statusStore: AgentSpeechStatusStore = .shared) {
-        self.statusStore = statusStore
+    @discardableResult
+    func startSpeaking(_ text: String) -> Bool
+
+    func stopSpeaking()
+}
+
+/// NSSpeechSynthesizer 封装：弱 delegate + MainActor 回跳，与既有实现一致。
+@MainActor
+private final class MacSystemVoice: NSObject, SystemVoiceSpeaking, NSSpeechSynthesizerDelegate {
+    private let synthesizer = NSSpeechSynthesizer()
+    var onFinished: (@MainActor (Bool) -> Void)?
+
+    override init() {
         super.init()
         synthesizer.delegate = self
     }
 
     @discardableResult
-    func speak(_ text: String) -> Bool {
-        let trimmed = text.trimmingCharacters(
-            in: .whitespacesAndNewlines
-        )
-        guard !trimmed.isEmpty else {
-            return false
-        }
-        return synthesizer.startSpeaking(trimmed)
+    func startSpeaking(_ text: String) -> Bool {
+        synthesizer.startSpeaking(text)
     }
 
     func stopSpeaking() {
-        if synthesizer.isSpeaking { pendingStopCallbacks += 1 }
         synthesizer.stopSpeaking()
     }
-}
 
-extension MacSpeechSynthesizer: NSSpeechSynthesizerDelegate {
     nonisolated func speechSynthesizer(
         _ sender: NSSpeechSynthesizer,
         didFinishSpeaking finishedSpeaking: Bool
     ) {
-        guard !finishedSpeaking else { return }
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            if self.pendingStopCallbacks > 0 {
-                self.pendingStopCallbacks -= 1
-                return
-            }
-            self.statusStore.lastErrorMessage =
+        let finished = finishedSpeaking
+        Task { @MainActor [weak self] in self?.onFinished?(finished) }
+    }
+}
+
+/// 基于 NSSpeechSynthesizer 的本地语音合成。每次朗读持有独立引擎实例：
+/// 完成的回调只能通过“当前引擎”身份匹配，旧实例的任何迟到事件都不再有效。
+@MainActor
+final class MacSpeechSynthesizer: SpeechSynthesizing {
+    private let statusStore: AgentSpeechStatusStore
+    private let makeVoice: @MainActor () -> any SystemVoiceSpeaking
+    private var voice: (any SystemVoiceSpeaking)?
+    private var pendingCompletion: AgentSpeechCompletion?
+
+    init(
+        statusStore: AgentSpeechStatusStore = .shared,
+        makeVoice: @escaping @MainActor () -> any SystemVoiceSpeaking = { MacSystemVoice() }
+    ) {
+        self.statusStore = statusStore
+        self.makeVoice = makeVoice
+    }
+
+    @discardableResult
+    func speak(_ text: String) -> Bool {
+        beginUtterance(text, completion: nil)
+    }
+
+    @discardableResult
+    func speak(_ text: String, completion: @escaping AgentSpeechCompletion) -> Bool {
+        beginUtterance(text, completion: completion)
+    }
+
+    private func beginUtterance(_ text: String, completion: AgentSpeechCompletion?) -> Bool {
+        stopSpeaking()
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            completion?(.cancelled)
+            return false
+        }
+        statusStore.lastErrorMessage = nil
+        let voice = makeVoice()
+        self.voice = voice
+        pendingCompletion = completion
+        voice.onFinished = { [weak self, weak voice] finished in
+            guard let self, let voice, self.voice === voice else { return }
+            self.settleUtterance(
+                voice,
+                outcome: finished ? .finished : .failed,
+                recordFailureMessage: !finished
+            )
+        }
+        guard voice.startSpeaking(trimmed) else {
+            settleUtterance(voice, outcome: .failed, recordFailureMessage: false)
+            return false
+        }
+        return true
+    }
+
+    func stopSpeaking() {
+        guard let voice else { return }
+        self.voice = nil
+        voice.onFinished = nil
+        voice.stopSpeaking()
+        if let completion = pendingCompletion {
+            pendingCompletion = nil
+            completion(.cancelled)
+        }
+    }
+
+    private func settleUtterance(
+        _ voice: any SystemVoiceSpeaking,
+        outcome: AgentSpeechOutcome,
+        recordFailureMessage: Bool
+    ) {
+        guard self.voice === voice else { return }
+        self.voice = nil
+        voice.onFinished = nil
+        if recordFailureMessage {
+            statusStore.lastErrorMessage =
                 "语音朗读失败，请检查系统语音设置；文字回复不受影响。"
         }
+        let completion = pendingCompletion
+        pendingCompletion = nil
+        completion?(outcome)
     }
 }
 
@@ -96,13 +198,38 @@ final class AgentSpeechAnnouncer {
     }
 
     func announce(_ text: String) {
-        guard isEnabled else { return }
+        performAnnounce(text, completion: nil)
+    }
+
+    /// 带交付回调的朗读入口：每次调用恰好回调一次。
+    /// - `.finished`：整段语音自然播完，App 才应把该轮记为“已语音交付”。
+    /// - `.cancelled`：朗读被禁用 / 文本为空 / 被新朗读替换 / 用户停止。
+    /// - `.failed`：启动、网络、合成或播放失败。
+    func announce(_ text: String, completion: @escaping AgentSpeechCompletion) {
+        performAnnounce(text, completion: completion)
+    }
+
+    private func performAnnounce(_ text: String, completion: AgentSpeechCompletion?) {
+        guard isEnabled else {
+            completion?(.cancelled)
+            return
+        }
         let trimmed = text.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty else {
+            completion?(.cancelled)
+            return
+        }
         statusStore.lastErrorMessage = nil
-        if !synthesizer.speak(trimmed), statusStore.lastErrorMessage == nil {
+        if !synthesizer.speak(trimmed, completion: { [weak self] outcome in
+            guard let self else { return }
+            if outcome == .failed, self.statusStore.lastErrorMessage == nil {
+                self.statusStore.lastErrorMessage =
+                    "语音朗读启动失败；文字回复不受影响。"
+            }
+            completion?(outcome)
+        }), statusStore.lastErrorMessage == nil {
             statusStore.lastErrorMessage =
                 "语音朗读启动失败；文字回复不受影响。"
         }
@@ -339,6 +466,7 @@ private final class BailianTTSNoRedirects: NSObject, URLSessionTaskDelegate {
     private var activePlayback: UUID?
     private var operation: Task<Void, Never>?
     private var generation = UUID()
+    private var pendingCompletion: AgentSpeechCompletion?
     private(set) var isSpeaking = false {
         didSet { statusStore.isSpeaking = isSpeaking }
     }
@@ -354,14 +482,30 @@ private final class BailianTTSNoRedirects: NSObject, URLSessionTaskDelegate {
     }
 
     @discardableResult func speak(_ text: String) -> Bool {
+        beginUtterance(text, completion: nil)
+    }
+
+    @discardableResult func speak(_ text: String, completion: @escaping AgentSpeechCompletion) -> Bool {
+        beginUtterance(text, completion: completion)
+    }
+
+    private func beginUtterance(_ text: String, completion: AgentSpeechCompletion?) -> Bool {
         stopSpeaking()
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return false }
+        guard !text.isEmpty else {
+            completion?(.cancelled)
+            return false
+        }
         statusStore.lastErrorMessage = nil
         let settings = configuration(), current = generation
         let chunks = BailianTTSWire.textChunks(text)
         do { _ = try BailianTTSWire.request(text: chunks[0], configuration: settings) }
-        catch { statusStore.lastErrorMessage = (error as? BailianTTSError)?.errorDescription; return false }
+        catch {
+            statusStore.lastErrorMessage = (error as? BailianTTSError)?.errorDescription
+            completion?(.failed)
+            return false
+        }
+        pendingCompletion = completion
         isSpeaking = true
         operation = Task { [weak self] in
             guard let self else { return }
@@ -398,10 +542,12 @@ private final class BailianTTSNoRedirects: NSObject, URLSessionTaskDelegate {
                     activePlayback = nil
                     onPlaybackChanged(.idle)
                 }
+                resolve(current, .finished)
             } catch {
                 guard generation == current, !Task.isCancelled, !(error is CancellationError) else { return }
                 statusStore.lastErrorMessage = (error as? BailianTTSError)?.errorDescription
                     ?? "百炼语音连接失败，请检查网络；文字回复不受影响。"
+                resolve(current, .failed)
             }
         }
         return true
@@ -413,6 +559,18 @@ private final class BailianTTSNoRedirects: NSObject, URLSessionTaskDelegate {
         operation?.cancel(); operation = nil
         player.stop(); isSpeaking = false
         onPlaybackChanged(.idle)
+        if let completion = pendingCompletion {
+            pendingCompletion = nil
+            completion(.cancelled)
+        }
+    }
+
+    /// 只允许当前 generation 的朗读结算回调；迟到/旧的 operation 无法报告成功。
+    private func resolve(_ current: UUID, _ outcome: AgentSpeechOutcome) {
+        guard generation == current else { return }
+        let completion = pendingCompletion
+        pendingCompletion = nil
+        completion?(outcome)
     }
 
     private func requireCurrent(_ current: UUID) throws {

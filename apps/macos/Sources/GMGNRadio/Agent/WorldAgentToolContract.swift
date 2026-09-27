@@ -53,7 +53,7 @@ enum WorldAgentToolContract {
         ),
         WorldAgentCapability(
             name: "list_available_activities",
-            description: "列出当前世界清单中角色可以执行的生活活动",
+            description: "列出当前世界清单与已绑定物件使用能力中可执行的生活活动",
             requiresTakeover: false
         ),
         WorldAgentCapability(
@@ -82,12 +82,12 @@ enum WorldAgentToolContract {
         ),
         WorldAgentCapability(
             name: "start_activity",
-            description: "让角色执行世界清单中定义的生活活动",
+            description: "让角色执行世界清单或已绑定物件使用能力的活动（如 coffee.brew@物件编号）",
             requiresTakeover: true,
             parameters: [
                 "activity_id": WorldAgentToolParameter(
                     type: "string",
-                    description: "世界清单中的活动 ID"
+                    description: "世界清单或已绑定物件能力中的活动 ID"
                 ),
             ],
             requiredParameters: ["activity_id"]
@@ -175,7 +175,7 @@ enum WorldAgentToolContract {
             case "start_activity":
                 parameters["activity_id"] = WorldAgentToolParameter(
                     type: "string",
-                    description: "世界清单中的活动 ID",
+                    description: "世界清单或已绑定物件能力中的活动 ID",
                     allowedValues: activityIDs
                 )
             case "move_live_camera":

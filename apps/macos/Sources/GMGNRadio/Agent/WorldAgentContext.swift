@@ -64,27 +64,71 @@ struct WorldAgentSnapshot: Codable, Equatable, Sendable {
 @MainActor
 final class WorldAgentContext {
     private struct MovementRun {
-        let path: WorldPath
+        let requestID: String
+        var path: WorldPath
         var nextPointIndex: Int
+        var replansRemaining = 1
+    }
+
+    private struct PatrolRun {
+        var targetID: String
+        var visits: [String: Int] = [:]
+    }
+
+    private struct NavigationSegment: Hashable {
+        let start: SIMD3<Float>
+        let end: SIMD3<Float>
     }
 
     let manifest: WorldManifest
     let navigationGraph: WaypointNavigationGraph
     let collisionWorld: ReplaceableCollisionWorld
-    let activityCatalog: ActivityCatalog
+    private var baseCollisionWorld: any WorldCollisionQuerying
+    private let authoredActivityCatalog: ActivityCatalog
+
+    /// A bound prop capability becomes one concrete, discoverable activity with
+    /// a standable operation spot resolved against the current collision world.
+    /// `approachPoint` is the collision-verified final leg appended after the
+    /// entry waypoint when the waypoint itself lies outside arm's reach.
+    private struct PropActivity {
+        let definition: LifeActivityDefinition
+        let objectID: String
+        let templateID: String
+        let entryWaypointID: String
+        let approachPoint: WorldVector3?
+        let targetYaw: Float
+    }
+
+    private var propActivities: [String: PropActivity] = [:]
+    private var combinedActivityCatalog: ActivityCatalog?
+
+    var activityCatalog: ActivityCatalog {
+        combinedActivityCatalog ?? authoredActivityCatalog
+    }
 
     private(set) var simulation: WorldSimulation
     private(set) var activityExecutor: ActivityExecutor
     var currentActivityRequestID: String? { activityExecutor.currentRequestID }
+    var currentMovementRequestID: String? { movement?.requestID }
     private var movement: MovementRun?
+    private var patrol: PatrolRun?
+    private let executionScopeID = UUID().uuidString
+    // Only planning uses this cache. Each actual movement step is checked again.
+    private var navigationTraversalCache: [NavigationSegment: Bool] = [:]
     private var activityPhaseElapsed: TimeInterval = 0
     private let persistence: (any WorldStatePersisting)?
-    private let walkingSpeed: Float
+    private var walkingSpeed: Float
     private let capsule: WorldCapsule
     private let maximumStepHeight: Float
     private var tickingTask: Task<Void, Never>?
     private var lastCheckpointWorldTime: Date?
-    private var publishedEventCount = 0
+    /// Monotonic observation cursor over the retained event window: the `sequence`
+    /// of the last retained event this context has scanned, or `nil` before the
+    /// first scan. Sequences are mutation watermarks that never restart (even after
+    /// a restore or a window trim), so this cursor stays valid while
+    /// `WorldSimulation` drops the oldest retained events — an absolute array index
+    /// would silently desynchronize. See `publishObservations`.
+    private var publishedSequence: UInt64?
 
     var onSnapshotChanged: (@MainActor (WorldAgentSnapshot) -> Void)?
     var onEventsPublished: (@MainActor ([WorldEvent]) -> Void)?
@@ -100,10 +144,11 @@ final class WorldAgentContext {
     ) throws {
         self.manifest = manifest
         navigationGraph = WaypointNavigationGraph(manifest: manifest)
+        baseCollisionWorld = CollisionVolumeWorld(manifest: manifest)
         collisionWorld = ReplaceableCollisionWorld(
             initial: CollisionVolumeWorld(manifest: manifest)
         )
-        activityCatalog = try ActivityCatalog(manifest: manifest)
+        authoredActivityCatalog = try ActivityCatalog(manifest: manifest)
         self.persistence = persistence
         self.walkingSpeed = max(0, walkingSpeed)
         self.capsule = capsule
@@ -121,6 +166,9 @@ final class WorldAgentContext {
             simulation = WorldSimulation(manifest: manifest, startedAt: startedAt)
         }
 
+        collisionWorld.replace(with: PropLayoutCollisionWorld(base: baseCollisionWorld,
+            volumes: simulation.state.objectStates.values.compactMap(\.generatedCollisionVolume)))
+
         let transform = simulation.state.agentTransform
         activityExecutor = ActivityExecutor(
             position: transform.position,
@@ -131,48 +179,305 @@ final class WorldAgentContext {
             maximumStepHeight: self.maximumStepHeight
         )
 
+        rebuildPropActivities()
+
         if let active = simulation.state.activeActivity,
-           let definition = activityCatalog.definition(id: active.activityID),
-           let anchor = manifest.activities.first(where: { $0.id == active.activityID })
+           let restored = resolvedActivityPlan(activityID: active.activityID)
         {
             let request = ScheduledActivity(
-                id: "restored-\(active.activityID)-\(active.startedAt.timeIntervalSince1970)",
+                id: "\(executionScopeID)-restored-\(active.activityID)-\(active.startedAt.timeIntervalSince1970)",
                 definitionID: active.activityID,
-                activity: definition.activity,
+                activity: restored.definition.activity,
                 priority: .autonomousIdle,
                 requestedAt: active.startedAt
             )
             let effects = activityExecutor.start(
                 request,
-                definition: definition,
+                definition: restored.definition,
                 at: simulation.state.worldTime
             )
             if effects.contains(where: \.requestsPath) {
                 let path = try navigationGraph.route(
                     from: transform.position.simd,
-                    to: anchor.entryWaypointID
+                    to: restored.entryWaypointID
                 )
+                var points = path.points
+                if let approachPoint = restored.approachPoint { points.append(approachPoint) }
                 _ = try activityExecutor.supplyApproach(
                     ActivityApproachPlan(
-                        waypoints: path.points,
-                        targetYaw: Self.yaw(of: anchor.transform.rotation)
+                        waypoints: points,
+                        targetYaw: restored.targetYaw
                     )
                 )
             }
+            if active.activityID == "home.walk" {
+                patrol = PatrolRun(targetID: restored.entryWaypointID)
+            }
+        } else if let active = simulation.state.activeActivity,
+                  propActivities[active.activityID] == nil,
+                  let stale = simulation.state.objectStates.first(where: { objectID, item in
+                      // Map the stale run through the persisted capability, not
+                      // through currently discoverable activities: the machine
+                      // may have no operation spot at all after a restart.
+                      guard let capability = item.propCapability else { return false }
+                      return WorldPropActivityTemplate.activityID(
+                          objectID: objectID, templateID: capability.templateID
+                      ) == active.activityID
+                  }),
+                  let capability = stale.value.propCapability {
+            // The operation spot no longer resolves after a restart (layout or
+            // collision changed while stopped). End the phantom run: a prop
+            // usage nothing can ever finish must not survive as "running".
+            let reason = "重启后无法到达物件操作位点"
+            _ = try? simulation.cancelActivity(reason: reason,
+                expectedRevision: simulation.state.revision)
+            _ = try? simulation.recordPropUsage(objectID: stale.key,
+                usage: WorldPropUsageState(templateID: capability.templateID, status: .stopped,
+                    activityRequestID: "restored", updatedAt: simulation.state.worldTime, reason: reason),
+                expectedRevision: simulation.state.revision)
+            try? publish(forcePersistence: true)
         }
     }
 
+    /// Resolves an activity against bound prop capabilities first, then the
+    /// authored manifest. Prop activities own their operation spot and facing.
+    private func resolvedActivityPlan(
+        activityID: String
+    ) -> (definition: LifeActivityDefinition, entryWaypointID: String,
+          approachPoint: WorldVector3?, targetYaw: Float)? {
+        if let propActivity = propActivities[activityID] {
+            return (propActivity.definition, propActivity.entryWaypointID,
+                    propActivity.approachPoint, propActivity.targetYaw)
+        }
+        guard let definition = authoredActivityCatalog.definition(id: activityID),
+              let anchor = manifest.activities.first(where: { $0.id == activityID })
+        else { return nil }
+        return (definition, anchor.entryWaypointID, nil, Self.yaw(of: anchor.transform.rotation))
+    }
+
+    private func rebuildPropActivities() {
+        var rebuilt: [String: PropActivity] = [:]
+        for (objectID, item) in simulation.state.objectStates {
+            guard item.isEnabled,
+                  let prop = item.generatedProp, prop.objectID == objectID,
+                  let capability = item.propCapability, capability.objectID == objectID,
+                  let template = WorldPropActivityTemplate.supported[capability.templateID]
+            else { continue }
+            guard let entry = resolvedOperationSpot(
+                propCenter: item.transform.position,
+                propYaw: Self.yaw(of: item.transform.rotation),
+                propHalfExtents: WorldVector3(
+                    x: prop.size.x / 2, y: prop.size.y / 2, z: prop.size.z / 2
+                ),
+                in: collisionWorld
+            ) else { continue }
+            let yaw = atan2(
+                item.transform.position.x - entry.standPoint.x,
+                item.transform.position.z - entry.standPoint.z
+            )
+            let activity = PropActivity(
+                definition: template.definition(objectID: objectID),
+                objectID: objectID,
+                templateID: capability.templateID,
+                entryWaypointID: entry.waypointID,
+                approachPoint: entry.approachPoint,
+                targetYaw: yaw
+            )
+            rebuilt[activity.definition.id] = activity
+        }
+        propActivities = rebuilt
+        combinedActivityCatalog = try? ActivityCatalog(
+            definitions: authoredActivityCatalog.definitions + rebuilt.values.map(\.definition)
+        )
+    }
+
+    /// Resolves where the resident actually stands to operate the machine:
+    /// the nearest standable anchor waypoint, and — when that waypoint lies
+    /// outside arm's reach — a short final leg marched toward the footprint and
+    /// verified against the installed collision world (grounded, capsule fits,
+    /// straight-line traversable). No qualifying spot means the activity is
+    /// explicitly unavailable; a remote button press is never assumed.
+    private func resolvedOperationSpot(
+        propCenter: WorldVector3,
+        propYaw: Float,
+        propHalfExtents: WorldVector3,
+        in world: any WorldCollisionQuerying
+    ) -> (waypointID: String, approachPoint: WorldVector3?, standPoint: WorldVector3)? {
+        func occupiable(_ position: WorldVector3) -> WorldVector3? {
+            groundedPosition(position, in: world)
+        }
+        for waypoint in WorldPropActivityTemplate.operationAnchorCandidates(
+            propCenter: propCenter,
+            waypoints: manifest.waypoints,
+            canStand: { occupiable($0) != nil }
+        ) {
+            let waypointEdge = WorldPropActivityTemplate.footprintEdgeDistance(
+                from: waypoint.position, propCenter: propCenter,
+                propYaw: propYaw, propHalfExtents: propHalfExtents
+            )
+            guard waypointEdge > WorldPropActivityTemplate.interactionReach else {
+                return (waypoint.id, nil, waypoint.position)
+            }
+            if let approachPoint = WorldPropActivityTemplate.finalApproachPoint(
+                from: waypoint.position, propCenter: propCenter,
+                propYaw: propYaw, propHalfExtents: propHalfExtents,
+                resolve: occupiable
+            ), world.canTraverse(
+                capsule, from: waypoint.position.simd, to: approachPoint.simd,
+                maximumStepHeight: maximumStepHeight
+            ) {
+                return (waypoint.id, approachPoint, approachPoint)
+            }
+        }
+        return nil
+    }
+
+    func isPropCapabilityActivity(_ activityID: String) -> Bool {
+        propActivities[activityID] != nil
+    }
+
+    func propActivityIDs(objectID: String) -> [String] {
+        propActivities.values
+            .filter { $0.objectID == objectID }
+            .map(\.definition.id)
+            .sorted()
+    }
+
     var state: WorldState { simulation.state }
+    /// The simulation's retained event window (session marker + newest events,
+    /// bounded by `WorldSimulation.retainedEventCapacity`). Read-through for
+    /// introspection and tests only; observation delivery goes through the
+    /// sequence cursor in `publishObservations`.
     var events: [WorldEvent] { simulation.events }
 
+    func updateWalkingSpeed(_ speed: Float) {
+        guard speed.isFinite, speed >= 0 else { return }
+        walkingSpeed = speed
+        activityExecutor.updateWalkingSpeed(speed)
+    }
+
+    func completeActivityPlayback(requestID: String, phase: LifeActivityPhase) throws {
+        guard currentActivityRequestID == requestID, state.activeActivity != nil,
+              activityExecutor.status.phase == phase, phase != .approach else { return }
+        // An indefinite loop has no renderer completion authority.
+        if phase == .loop,
+           activityCatalog.definition(id: activityExecutor.status.activityID ?? "")?
+            .contract(for: .loop)?.durationSeconds == nil { return }
+        guard patrol == nil else { return }
+        try applyActivityEffects(activityExecutor.advancePhase(at: state.worldTime),
+            usageRequestID: requestID)
+        try publish(forcePersistence: true)
+    }
+
+    func failActivityPlayback(requestID: String, phase: LifeActivityPhase) throws {
+        guard currentActivityRequestID == requestID, state.activeActivity != nil,
+              activityExecutor.status.phase == phase else { return }
+        patrol = nil
+        try applyActivityEffects(activityExecutor.fail(.missingMotion, at: state.worldTime),
+            usageRequestID: requestID)
+        try publish(forcePersistence: true)
+    }
+
+    func failMovementPlayback(requestID: String) throws {
+        guard let run = movement, run.requestID == requestID else { return }
+        movement = nil
+        try simulation.recordMovementOutcome(requestID: run.requestID,
+            destinationID: run.path.destinationID, failure: ActivityExecutionFailure.missingMotion.rawValue,
+            expectedRevision: state.revision)
+        try publish(forcePersistence: true)
+    }
+
     func installCollisionWorld(_ world: any WorldCollisionQuerying) {
-        collisionWorld.replace(with: world)
+        navigationTraversalCache.removeAll(keepingCapacity: true)
+        baseCollisionWorld = world
+        collisionWorld.replace(with: layoutCollisionWorld(for: state))
+        // Entry spots stand or fall with the installed environment, so the
+        // discovered prop activities must be re-derived, not just at layout commits.
+        rebuildPropActivities()
+    }
+
+    func layoutCollisionWorld(for state: WorldState) -> any WorldCollisionQuerying {
+        PropLayoutCollisionWorld(base: baseCollisionWorld,
+            volumes: state.objectStates.values.compactMap(\.generatedCollisionVolume))
+    }
+
+    /// Conservative horizontal clearance against the currently installed environment.
+    /// Authored props use exact box checks in the placement service as well.
+    func hasEnvironmentClearance(for volume: WorldCollisionVolume) -> Bool {
+        let radius = max(0.02, sqrt(volume.halfExtents.x * volume.halfExtents.x + volume.halfExtents.z * volume.halfExtents.z))
+        return baseCollisionWorld.canOccupy(WorldCapsule(radius: radius,
+            height: volume.halfExtents.y * 2 + radius * 2),
+            at: SIMD3(volume.center.x, volume.center.y - volume.halfExtents.y, volume.center.z))
+    }
+
+    /// Persistence is the commit point. No callback, renderer or physics sees an unsaved candidate.
+    @discardableResult
+    func commitPropLayout(_ command: WorldPropLayoutCommand, expectedLayoutRevision: UInt64,
+                          requestID: String, validate: (WorldState) throws -> Void) throws -> WorldState {
+        var candidate = simulation
+        let baseline = state
+        try candidate.applyPropLayout(command, expectedLayoutRevision: expectedLayoutRevision, requestID: requestID)
+        guard candidate.state != state else { return state }
+        try validate(candidate.state)
+        guard state == baseline else {
+            throw WorldPropLayoutError.staleRevision(submitted: expectedLayoutRevision, current: state.layoutRevision)
+        }
+        // The whole transaction is decided on the candidate: the stale-run
+        // cancel is folded into the candidate state, so the save is the single
+        // commit point. A failed save leaves memory — world, collision,
+        // executor, usage — completely untouched, and the old run keeps
+        // receiving its receipts. No callback ever sees anything unsaved.
+        let candidateCollision = PropLayoutCollisionWorld(base: baseCollisionWorld,
+            volumes: candidate.state.objectStates.values.compactMap(\.generatedCollisionVolume))
+        var executorStopped = false
+        if let activeID = state.activeActivity?.activityID,
+           let active = propActivities[activeID] {
+            let placementChanged: Bool = {
+                guard let before = baseline.objectStates[active.objectID],
+                      let after = candidate.state.objectStates[active.objectID] else { return false }
+                return before.isEnabled != after.isEnabled || before.transform != after.transform
+            }()
+            var spotResolved: (waypointID: String, approachPoint: WorldVector3?, standPoint: WorldVector3)?
+            if !placementChanged, let item = candidate.state.objectStates[active.objectID],
+               let prop = item.generatedProp, item.isEnabled,
+               let capability = item.propCapability,
+               WorldPropActivityTemplate.supported[capability.templateID] != nil {
+                spotResolved = resolvedOperationSpot(
+                    propCenter: item.transform.position,
+                    propYaw: Self.yaw(of: item.transform.rotation),
+                    propHalfExtents: WorldVector3(
+                        x: prop.size.x / 2, y: prop.size.y / 2, z: prop.size.z / 2
+                    ),
+                    in: candidateCollision
+                )
+            }
+            if placementChanged || spotResolved == nil {
+                _ = try candidate.cancelActivity(reason: "物件已收回或移动，使用中止",
+                    expectedRevision: candidate.state.revision)
+                executorStopped = true
+            }
+        }
+        try persistence?.save(candidate.state)
+        simulation = candidate
+        collisionWorld.replace(with: candidateCollision)
+        rebuildPropActivities()
+        if executorStopped {
+            _ = activityExecutor.stop(at: state.worldTime)
+            activityPhaseElapsed = 0
+        }
+        navigationTraversalCache.removeAll(keepingCapacity: true)
+        lastCheckpointWorldTime = state.worldTime
+        publishObservations()
+        onSnapshotChanged?(snapshot)
+        return state
     }
 
     @discardableResult
     func installCollisionWorldAndReconcilePlacement(
         _ world: any WorldCollisionQuerying
     ) throws -> WorldVector3? {
+        let world = PropLayoutCollisionWorld(base: world,
+            volumes: state.objectStates.values.compactMap(\.generatedCollisionVolume))
         let current = state.agentTransform.position
         let resolved = groundedPosition(current, in: world)
             ?? manifest.waypoints
@@ -208,19 +513,29 @@ final class WorldAgentContext {
             throw WorldAgentContextError.noWalkablePlacement
         }
 
+        baseCollisionWorld = world.base
         collisionWorld.replace(with: world)
+        navigationTraversalCache.removeAll(keepingCapacity: true)
+        rebuildPropActivities()
         guard resolved != current else { return nil }
 
         let deltaX = resolved.x - current.x
         let deltaZ = resolved.z - current.z
         if deltaX * deltaX + deltaZ * deltaZ > 0.0001 {
+            let stoppingActivityID = state.activeActivity?.activityID
+            let usageRequestID = currentActivityRequestID
             movement = nil
+            patrol = nil
             _ = activityExecutor.stop(at: state.worldTime)
             if state.activeActivity != nil {
                 _ = try simulation.cancelActivity(
                     reason: "碰撞网格更新后迁移到可站立位置",
                     expectedRevision: state.revision
                 )
+                if let stoppingActivityID {
+                    syncPropUsage(stoppingActivityID, status: .stopped,
+                        requestID: usageRequestID ?? "", reason: "碰撞网格更新后迁移到可站立位置")
+                }
             }
             activityPhaseElapsed = 0
         }
@@ -237,7 +552,7 @@ final class WorldAgentContext {
         let activeActivity = simulation.state.activeActivity.map { activity in
             WorldAgentActiveActivitySnapshot(
                 id: activity.activityID,
-                activity: status.activity,
+                activity: patrol.map { .walk(destinationID: $0.targetID) } ?? status.activity,
                 phase: status.phase
             )
         }
@@ -260,7 +575,7 @@ final class WorldAgentContext {
             },
             completedGoalIDs: state.completedGoals.keys.sorted(),
             places: manifest.waypoints
-                .filter(\.enabled)
+                .filter { $0.enabled && !$0.id.hasPrefix("wp.auto.") }
                 .map {
                     WorldAgentPlaceSnapshot(
                         id: $0.id,
@@ -269,16 +584,22 @@ final class WorldAgentContext {
                     )
                 }
                 .sorted { $0.id < $1.id },
-            activities: manifest.activities
-                .map {
-                    WorldAgentActivityOption(
-                        id: $0.id,
-                        action: $0.action,
-                        entryPlaceID: $0.entryWaypointID,
-                        interruptible: $0.interruptible
-                    )
-                }
-                .sorted { $0.id < $1.id },
+            activities: (manifest.activities.map {
+                WorldAgentActivityOption(
+                    id: $0.id,
+                    action: $0.action,
+                    entryPlaceID: $0.entryWaypointID,
+                    interruptible: $0.interruptible
+                )
+            } + propActivities.values.map { propActivity in
+                WorldAgentActivityOption(
+                    id: propActivity.definition.id,
+                    action: propActivity.definition.activity.typeID,
+                    entryPlaceID: propActivity.entryWaypointID,
+                    interruptible: propActivity.definition.interruptible
+                )
+            })
+            .sorted { $0.id < $1.id },
             cameras: manifest.cameras
                 .map {
                     WorldAgentCameraOption(
@@ -295,10 +616,30 @@ final class WorldAgentContext {
         guard manifest.waypoints.contains(where: { $0.id == placeID && $0.enabled }) else {
             throw WorldAgentContextError.unknownPlace(placeID)
         }
+        let position = state.agentTransform.position.simd
+        guard canTraverse(from: position, to: position) else {
+            throw WorldAgentContextError.routeBlocked(placeID)
+        }
         return try navigationGraph.route(
-            from: state.agentTransform.position.simd,
-            to: placeID
+            from: position,
+            to: placeID,
+            canTraverse: cachedNavigationTraversal
         )
+    }
+
+    private func cachedNavigationTraversal(from start: SIMD3<Float>, to end: SIMD3<Float>) -> Bool {
+        let segment = NavigationSegment(start: start, end: end)
+        if let cached = navigationTraversalCache[segment] { return cached }
+        let result = canTraverse(from: start, to: end)
+        navigationTraversalCache[segment] = result
+        return result
+    }
+
+    private func canTraverse(from start: SIMD3<Float>, to target: SIMD3<Float>) -> Bool {
+        guard let ground = collisionWorld.groundHeight(at: target), ground.isFinite else { return false }
+        let destination = SIMD3(target.x, ground, target.z)
+        return collisionWorld.canOccupy(capsule, at: destination)
+            && collisionWorld.canTraverse(capsule, from: start, to: destination, maximumStepHeight: maximumStepHeight)
     }
 
     @discardableResult
@@ -307,21 +648,23 @@ final class WorldAgentContext {
         if state.activeActivity != nil {
             try stopActivity()
         }
-        movement = MovementRun(path: path, nextPointIndex: 0)
+        patrol = nil
+        movement = MovementRun(requestID: UUID().uuidString, path: path, nextPointIndex: 0)
         try recordControlChange()
         return path
     }
 
     func startActivity(id: String, requestedAt: Date? = nil) throws {
-        guard let definition = activityCatalog.definition(id: id),
-              let anchor = manifest.activities.first(where: { $0.id == id })
-        else {
+        guard let plan = resolvedActivityPlan(activityID: id) else {
             throw WorldAgentContextError.unknownActivity(id)
         }
+        let definition = plan.definition
+        let entryWaypointID = plan.entryWaypointID
+        let targetYaw = plan.targetYaw
 
         let date = requestedAt ?? state.worldTime
         let request = ScheduledActivity(
-            id: "agent-\(id)-\(state.revision)",
+            id: "\(executionScopeID)-agent-\(id)-\(state.revision)",
             definitionID: id,
             activity: definition.activity,
             priority: .explicitUserRequest,
@@ -329,6 +672,8 @@ final class WorldAgentContext {
         )
         // Validate the replacement and its approach before changing the current execution.
         var preparedExecutor = activityExecutor
+        preparedExecutor.synchronizePlacement(position: state.agentTransform.position,
+            yaw: Self.yaw(of: state.agentTransform.rotation))
         var effects = preparedExecutor.start(request, definition: definition, at: date)
         if effects.contains(where: \.isRejectedOrFailed) {
             throw WorldAgentContextError.activityRejected(id)
@@ -336,44 +681,58 @@ final class WorldAgentContext {
 
         if effects.contains(where: \.requestsPath) {
             do {
-                let path = try navigationGraph.route(
-                    from: state.agentTransform.position.simd,
-                    to: anchor.entryWaypointID
-                )
+                let path = try planRoute(to: entryWaypointID)
+                var points = path.points
+                if let approachPoint = plan.approachPoint { points.append(approachPoint) }
                 effects += try preparedExecutor.supplyApproach(
                     ActivityApproachPlan(
-                        waypoints: path.points,
-                        targetYaw: Self.yaw(of: anchor.transform.rotation)
+                        waypoints: points,
+                        targetYaw: targetYaw
                     )
                 )
             } catch {
-                throw WorldAgentContextError.routeBlocked(anchor.entryWaypointID)
+                throw WorldAgentContextError.routeBlocked(entryWaypointID)
             }
         }
         guard !effects.contains(where: \.isRejectedOrFailed) else {
-            throw WorldAgentContextError.routeBlocked(anchor.entryWaypointID)
+            throw WorldAgentContextError.routeBlocked(entryWaypointID)
         }
 
+        let priorActivityID = state.activeActivity?.activityID
+        let priorRequestID = currentActivityRequestID
         activityExecutor = preparedExecutor
         movement = nil
-        if state.activeActivity != nil {
+        patrol = id == "home.walk" ? PatrolRun(targetID: entryWaypointID) : nil
+        if let priorActivityID {
             _ = try simulation.cancelActivity(expectedRevision: state.revision)
+            syncPropUsage(priorActivityID, status: .stopped, requestID: priorRequestID ?? "",
+                reason: "新的使用请求替换了当前运行")
         }
         _ = try simulation.startActivity(id, expectedRevision: state.revision)
+        syncPropUsage(id, status: .running, requestID: activityExecutor.currentRequestID ?? "")
         activityPhaseElapsed = 0
         try publish(forcePersistence: true)
     }
 
     func stopActivity(reason: String? = nil) throws {
+        let wasMoving = movement != nil
+        let stoppingActivityID = state.activeActivity?.activityID
+        let usageRequestID = currentActivityRequestID
+        movement = nil
+        patrol = nil
         let effects = activityExecutor.stop(at: state.worldTime)
         guard state.activeActivity != nil else {
-            if !effects.isEmpty { try recordControlChange() }
+            if wasMoving || !effects.isEmpty { try recordControlChange() }
             return
         }
         _ = try simulation.cancelActivity(
             reason: Self.normalizedOptional(reason),
             expectedRevision: state.revision
         )
+        if let stoppingActivityID {
+            syncPropUsage(stoppingActivityID, status: .stopped, requestID: usageRequestID ?? "",
+                reason: Self.normalizedOptional(reason) ?? "使用已停止")
+        }
         activityPhaseElapsed = 0
         try publish(forcePersistence: true)
     }
@@ -478,11 +837,19 @@ final class WorldAgentContext {
         guard var run = movement else { return }
         var remaining = walkingSpeed * Float(deltaTime)
         var position = state.agentTransform.position
+        var yaw = Self.yaw(of: state.agentTransform.rotation)
+        var didTurn = false
 
         while remaining > 0, run.nextPointIndex < run.path.points.count {
             let target = run.path.points[run.nextPointIndex]
             let delta = target.subtracting(position)
             let horizontalDistance = hypot(delta.x, delta.z)
+            if !didTurn, horizontalDistance > 0.0001 {
+                let targetYaw = atan2(delta.x, delta.z)
+                let difference = atan2(sin(targetYaw-yaw), cos(targetYaw-yaw))
+                yaw += max(-4.5 * Float(deltaTime), min(4.5 * Float(deltaTime), difference))
+                didTurn = true
+            }
             let destination: WorldVector3
             if horizontalDistance <= remaining || horizontalDistance <= 0.0001 {
                 destination = target
@@ -498,8 +865,8 @@ final class WorldAgentContext {
             guard let ground = collisionWorld.groundHeight(at: destination.simd),
                   ground.isFinite
             else {
-                movement = nil
-                throw WorldAgentContextError.routeBlocked(run.path.destinationID)
+                try handleBlockedMovement(run, position: position, yaw: yaw)
+                return
             }
             let groundedDestination = WorldVector3(
                 x: destination.x,
@@ -514,8 +881,8 @@ final class WorldAgentContext {
                       maximumStepHeight: maximumStepHeight
                   )
             else {
-                movement = nil
-                throw WorldAgentContextError.routeBlocked(run.path.destinationID)
+                try handleBlockedMovement(run, position: position, yaw: yaw)
+                return
             }
 
             position = groundedDestination
@@ -529,8 +896,31 @@ final class WorldAgentContext {
 
         movement = run.nextPointIndex >= run.path.points.count ? nil : run
         if position != state.agentTransform.position {
-            try updateTransform(position: position, yaw: Self.yaw(of: state.agentTransform.rotation), notify: false)
+            try updateTransform(position: position, yaw: yaw, notify: false)
         }
+        if movement == nil {
+            try simulation.recordMovementOutcome(requestID: run.requestID, destinationID: run.path.destinationID,
+                expectedRevision: state.revision)
+        }
+    }
+
+    private func handleBlockedMovement(_ run: MovementRun, position: WorldVector3, yaw: Float) throws {
+        navigationTraversalCache.removeAll(keepingCapacity: true)
+        if position != state.agentTransform.position {
+            try updateTransform(position: position, yaw: yaw, notify: false)
+        }
+        if run.replansRemaining > 0, let path = try? planRoute(to: run.path.destinationID), !path.points.isEmpty {
+            var retry = run
+            retry.path = path
+            retry.nextPointIndex = 0
+            retry.replansRemaining -= 1
+            movement = retry
+            return
+        }
+        movement = nil
+        try simulation.recordMovementOutcome(requestID: run.requestID, destinationID: run.path.destinationID,
+            failure: ActivityExecutionFailure.blocked.rawValue, expectedRevision: state.revision)
+        throw WorldAgentContextError.routeBlocked(run.path.destinationID)
     }
 
     private func groundedPosition(
@@ -551,11 +941,16 @@ final class WorldAgentContext {
     }
 
     private func tickActivity(deltaTime: TimeInterval) throws {
+        let usageRequestID = currentActivityRequestID
         let effects = activityExecutor.tick(deltaTime: deltaTime)
-        try applyActivityEffects(effects)
+        try applyActivityEffects(effects, usageRequestID: usageRequestID)
 
         let status = activityExecutor.status
         guard status.activityID != nil, status.phase != .approach else { return }
+        if patrol != nil {
+            try continuePatrol()
+            return
+        }
         activityPhaseElapsed += deltaTime
         guard let definition = status.activityID.flatMap(activityCatalog.definition),
               let duration = definition.contract(for: status.phase)?.durationSeconds,
@@ -564,10 +959,66 @@ final class WorldAgentContext {
             return
         }
         activityPhaseElapsed = 0
-        try applyActivityEffects(activityExecutor.advancePhase(at: state.worldTime))
+        try applyActivityEffects(activityExecutor.advancePhase(at: state.worldTime),
+            usageRequestID: usageRequestID)
     }
 
-    private func applyActivityEffects(_ effects: [ActivityExecutionEffect]) throws {
+    /// Bounded local selection: no model calls, no graph scan on every frame.
+    /// Eight attempted destinations per completed leg is also the failure budget.
+    private func continuePatrol() throws {
+        guard var run = patrol, state.activeActivity?.activityID == "home.walk" else { patrol = nil; return }
+        run.visits[run.targetID, default: 0] += 1
+        let position = state.agentTransform.position
+        let candidates = manifest.waypoints.filter {
+            let distance = hypot($0.position.x-position.x, $0.position.z-position.z)
+            return $0.enabled && $0.id != run.targetID && distance >= 1 && distance <= 6
+        }.sorted {
+            let lhs = (run.visits[$0.id, default: 0], abs(hypot($0.position.x-position.x, $0.position.z-position.z)-3), $0.id)
+            let rhs = (run.visits[$1.id, default: 0], abs(hypot($1.position.x-position.x, $1.position.z-position.z)-3), $1.id)
+            return lhs < rhs
+        }
+        for candidate in candidates.prefix(8) {
+            guard let path = try? planRoute(to: candidate.id), !path.points.isEmpty else { continue }
+            var executor = activityExecutor
+            let effects = try executor.continueApproach(ActivityApproachPlan(waypoints: path.points))
+            guard !effects.contains(where: \.isRejectedOrFailed) else { continue }
+            activityExecutor = executor
+            run.targetID = candidate.id
+            patrol = run
+            try applyActivityEffects(effects, usageRequestID: executor.currentRequestID)
+            return
+        }
+        patrol = nil
+        try applyActivityEffects(activityExecutor.fail(.pathUnavailable, at: state.worldTime))
+    }
+
+    /// Usage receipts are recorded only for prop activities, only at real
+    /// lifecycle transitions, and anchored to the request that actually drove
+    /// the run. A lost binding makes the write fail, so a stale in-flight
+    /// activity can never complete a withdrawn or rebound object.
+    private func syncPropUsage(_ activityID: String, status: WorldPropUsageState.Status,
+                               requestID: String, reason: String? = nil) {
+        guard !requestID.isEmpty, let propActivity = propActivities[activityID] else { return }
+        // Reasons are bounded to the persisted metadata limit, so an over-long
+        // stop reason can never fail the write and leave a "running" usage.
+        let boundedReason = reason.map { $0.count <= 256 ? $0 : String($0.prefix(256)) }
+        do {
+            try simulation.recordPropUsage(objectID: propActivity.objectID,
+                usage: WorldPropUsageState(templateID: propActivity.templateID, status: status,
+                    activityRequestID: requestID, updatedAt: state.worldTime, reason: boundedReason),
+                expectedRevision: state.revision)
+        } catch {
+            // A failed terminal write must never be swallowed: the usage state
+            // would stay stale (running) while nothing runs. Surface it through
+            // the context's error channel instead of hiding it.
+            onTickError?(error)
+        }
+    }
+
+    private func applyActivityEffects(
+        _ effects: [ActivityExecutionEffect],
+        usageRequestID: String? = nil
+    ) throws {
         if let position = effects.compactMap(\.movedPosition).last {
             try updateTransform(
                 position: position,
@@ -582,21 +1033,32 @@ final class WorldAgentContext {
             switch effect {
             case .phaseChanged:
                 activityPhaseElapsed = 0
-            case .completed:
+            case let .completed(activityID):
+                patrol = nil
                 if state.activeActivity != nil {
                     _ = try simulation.completeActivity(expectedRevision: state.revision)
                 }
-            case .cancelled:
+                syncPropUsage(activityID, status: .completed, requestID: usageRequestID ?? "")
+            case let .cancelled(activityID):
+                patrol = nil
                 if state.activeActivity != nil {
                     _ = try simulation.cancelActivity(expectedRevision: state.revision)
                 }
-            case let .failed(_, reason):
+                syncPropUsage(activityID, status: .stopped, requestID: usageRequestID ?? "",
+                    reason: "使用已停止")
+            case let .failed(activityID, reason):
+                patrol = nil
+                if reason == .blocked || reason == .pathUnavailable {
+                    navigationTraversalCache.removeAll(keepingCapacity: true)
+                }
                 if state.activeActivity != nil {
-                    _ = try simulation.cancelActivity(
-                        reason: "活动执行失败：\(reason.rawValue)",
+                    _ = try simulation.failActivity(
+                        reason: reason.rawValue,
                         expectedRevision: state.revision
                     )
                 }
+                syncPropUsage(activityID, status: .failed, requestID: usageRequestID ?? "",
+                    reason: reason.rawValue)
             case let .resumed(activityID, _):
                 if state.activeActivity != nil {
                     _ = try simulation.cancelActivity(expectedRevision: state.revision)
@@ -648,21 +1110,71 @@ final class WorldAgentContext {
     private func publishObservations() {
         // Keep the cursor until an observer is attached, including the initial load fact.
         guard let onEventsPublished else { return }
-        // Index directly into the append-only log; never scan historical frame events.
-        let end = simulation.events.count
+        let retained = simulation.events
+        // Real retained events were evicted from the fixed-capacity window before
+        // this context's cursor reached them: the consumer lagged beyond the cache.
+        // Clock events consume sequence numbers between retained events, so only the
+        // simulation's explicit eviction counter can distinguish an honest gap from
+        // ordinary clock noise.
+        let missedRetained = simulation.trimmedNewestSequence
+            .map { (publishedSequence ?? 0) < $0 } ?? false
+        // Scan the retained window strictly after the cursor. On an eviction gap the
+        // historical session marker (`.worldLoaded`/`.worldRestored`) fronts an
+        // *incomplete* stream, so it is skipped and an explicit observation-gap
+        // notice is delivered instead: handing the stale marker through unchanged
+        // would masquerade a trimmed history as a complete one.
         var observations: [WorldEvent] = []
-        for index in publishedEventCount..<end {
-            let event = simulation.events[index]
-            switch event.kind {
-            case .timeAdvanced, .timeCaughtUp, .agentTransformUpdated, .liveCameraChanged:
-                break
-            default:
-                observations.append(event)
+        if missedRetained, publishedSequence == nil {
+            for event in retained.dropFirst() {
+                observations.append(contentsOf: filteredDelivery(for: event))
+            }
+        } else {
+            for event in retained {
+                if let publishedSequence, event.sequence <= publishedSequence { continue }
+                observations.append(contentsOf: filteredDelivery(for: event))
+            }
+        }
+        if missedRetained {
+            // Honest re-observation notice, never a fabricated world fact. The world
+            // was NOT restored, so the resident must not be told it was: this marker
+            // carries its own kind (`.observationGap`) and `ResidentWorldObservation`
+            // maps it to an explicit `observation_gap` notice that says events were
+            // lost and current state must be re-queried.
+            //
+            // The marker's sequence is the simulation's real eviction watermark
+            // (`trimmedNewestSequence`): the highest sequence an evicted event
+            // actually carried. That keeps the marker monotonic and inside the live
+            // watermark range — no reserved top-of-`UInt64` band — while its resident
+            // identity still cannot collide with `world:<scope>:<worldID>:<sequence>`
+            // because the mapper namespaces the two id schemes separately. The marker
+            // never enters the simulation log.
+            if let trimmed = simulation.trimmedNewestSequence {
+                observations.insert(
+                    WorldEvent(
+                        sequence: trimmed,
+                        revision: state.revision,
+                        worldTime: state.worldTime,
+                        kind: .observationGap(worldID: state.worldID)
+                    ),
+                    at: 0
+                )
             }
         }
         // Advance before either callback, because observers may synchronously mutate the world.
-        publishedEventCount = end
+        if let newest = retained.last,
+           publishedSequence.map({ newest.sequence > $0 }) ?? true {
+            publishedSequence = newest.sequence
+        }
         if !observations.isEmpty { onEventsPublished(observations) }
+    }
+
+    private func filteredDelivery(for event: WorldEvent) -> [WorldEvent] {
+        switch event.kind {
+        case .timeAdvanced, .timeCaughtUp, .agentTransformUpdated, .liveCameraChanged:
+            return []
+        default:
+            return [event]
+        }
     }
 
     private func saveCheckpoint() throws {
@@ -684,6 +1196,30 @@ final class WorldAgentContext {
     private static func normalizedOptional(_ value: String?) -> String? {
         let normalized = value?.trimmingCharacters(in: .whitespacesAndNewlines)
         return normalized?.isEmpty == false ? normalized : nil
+    }
+}
+
+/// Generated props block bodies but never contribute a walkable top surface.
+private struct PropLayoutCollisionWorld: WorldCollisionQuerying {
+    let base: any WorldCollisionQuerying
+    let props: CollisionVolumeWorld
+    init(base: any WorldCollisionQuerying, volumes: [WorldCollisionVolume]) {
+        self.base = base; props = CollisionVolumeWorld(volumes: volumes)
+    }
+    func canOccupy(_ capsule: WorldCapsule, at position: SIMD3<Float>) -> Bool {
+        base.canOccupy(capsule, at: position) && props.canOccupy(capsule, at: position)
+    }
+    func groundHeight(at position: SIMD3<Float>) -> Float? { base.groundHeight(at: position) }
+    func canTraverse(_ capsule: WorldCapsule, from start: SIMD3<Float>, to end: SIMD3<Float>, maximumStepHeight: Float) -> Bool {
+        guard base.canTraverse(capsule, from: start, to: end, maximumStepHeight: maximumStepHeight) else { return false }
+        let distance = sqrt((end-start).x*(end-start).x + (end-start).y*(end-start).y + (end-start).z*(end-start).z)
+        guard distance.isFinite, distance < 10_000 else { return false }
+        let steps = max(1, Int(ceil(distance / max(0.01,capsule.radius/2))))
+        for i in 0...steps {
+            let p = start + (end-start) * (Float(i)/Float(steps))
+            guard props.canOccupy(capsule, at: p) else { return false }
+        }
+        return true
     }
 }
 

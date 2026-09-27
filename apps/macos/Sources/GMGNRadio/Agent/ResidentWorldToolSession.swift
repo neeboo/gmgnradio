@@ -28,7 +28,8 @@ final class ResidentWorldToolSession {
     }
 
     static let allowedToolNames: Set<String> = [
-        "inspect_world", "list_available_activities", "start_activity", "stop_activity",
+        "inspect_world", "list_places", "list_available_activities", "plan_route", "move_to",
+        "start_activity", "stop_activity", "look_at",
     ]
 
     let scopeID: UUID
@@ -42,7 +43,8 @@ final class ResidentWorldToolSession {
     private let afterDispatch: (@MainActor (String, Data, RealtimeDJToolResult) async -> RealtimeDJToolResult)?
     private let onCancel: (@MainActor () -> Void)?
     private let additionalTools: [String: AdditionalTool]
-    private let maximumCalls: Int
+    /// Nil uses the existing deadline and cancellation lease without a count cutoff.
+    private let maximumCalls: Int?
     private var dispatchedCalls = 0
     private var registeredNames: Set<String> { Self.allowedToolNames.union(additionalTools.keys) }
     private var cancelled = false
@@ -62,7 +64,7 @@ final class ResidentWorldToolSession {
         afterDispatch: (@MainActor (String, Data, RealtimeDJToolResult) async -> RealtimeDJToolResult)? = nil,
         onCancel: (@MainActor () -> Void)? = nil,
         additionalTools: [AdditionalTool] = [],
-        maximumCalls: Int = 64
+        maximumCalls: Int? = 64
     ) {
         self.scopeID = scopeID
         self.worldID = worldID
@@ -73,7 +75,7 @@ final class ResidentWorldToolSession {
         self.beforeDispatch = beforeDispatch
         self.afterDispatch = afterDispatch
         self.onCancel = onCancel
-        self.maximumCalls = max(0, maximumCalls)
+        self.maximumCalls = maximumCalls.map { max(0, $0) }
         var registered: [String: AdditionalTool] = [:]
         for tool in additionalTools where !Self.allowedToolNames.contains(tool.name) && registered[tool.name] == nil {
             guard tool.inputSchema["type"] as? String == "object",
@@ -134,7 +136,7 @@ final class ResidentWorldToolSession {
             } else if let running = pending[requestID] {
                 replayed = true
                 result = await awaitResult(running)
-            } else if dispatchedCalls >= maximumCalls {
+            } else if let maximumCalls, dispatchedCalls >= maximumCalls {
                 result = failure(requestID, "tool_budget_exhausted", "本轮工具调用已达上限，请保留进度并结束本轮思考")
             } else {
                 dispatchedCalls += 1
@@ -199,7 +201,7 @@ final class ResidentWorldToolSession {
               let arguments = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               Set(arguments.keys).isSubset(of: Set(capability.parameters.keys)),
               capability.requiredParameters.allSatisfy({ arguments[$0] != nil }) else { return nil }
-        // The four exposed tools currently accept strings only. Fail closed if
+        // The exposed world tools currently accept strings only. Fail closed if
         // the shared contract introduces another type until this bridge supports it.
         for (key, value) in arguments {
             guard capability.parameters[key]?.type == "string", value is String else { return nil }

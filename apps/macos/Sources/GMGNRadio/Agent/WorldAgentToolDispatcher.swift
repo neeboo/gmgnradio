@@ -55,21 +55,40 @@ final class WorldAgentToolDispatcher {
 
     private let takeoverEnabled: @MainActor () -> Bool
     private let onActivityStarted: @MainActor (WorldAgentContext, String) -> Void
+    private let availableActivity: @MainActor (String) -> Bool
     let context: WorldAgentContext
     private var completedCalls: [String: RealtimeDJToolResult] = [:]
 
     init(
         takeoverEnabled: @escaping @MainActor () -> Bool,
         context: WorldAgentContext,
-        onActivityStarted: @escaping @MainActor (WorldAgentContext, String) -> Void = { _, _ in }
+        onActivityStarted: @escaping @MainActor (WorldAgentContext, String) -> Void = { _, _ in },
+        availableActivity: @escaping @MainActor (String) -> Bool = { _ in true }
     ) {
         self.takeoverEnabled = takeoverEnabled
         self.context = context
         self.onActivityStarted = onActivityStarted
+        self.availableActivity = availableActivity
     }
 
     var providerTools: [[String: Any]] {
-        WorldAgentToolContract.providerTools(for: context.manifest)
+        WorldAgentToolContract.providerTools(for: context.manifest).map { tool in
+            guard var function = tool["function"] as? [String: Any],
+                  function["name"] as? String == "start_activity",
+                  var parameters = function["parameters"] as? [String: Any],
+                  var properties = parameters["properties"] as? [String: Any],
+                  var activity = properties["activity_id"] as? [String: Any] else { return tool }
+            // A resumed provider session retains its original tool definition.
+            // Discover changing activities through list/inspect; enforce current
+            // availability again immediately before executing start_activity.
+            activity.removeValue(forKey: "enum")
+            properties["activity_id"] = activity
+            parameters["properties"] = properties
+            function["parameters"] = parameters
+            var result = tool
+            result["function"] = function
+            return result
+        }
     }
 
     func handles(_ name: String) -> Bool {
@@ -118,7 +137,7 @@ final class WorldAgentToolDispatcher {
             case "list_places":
                 message = "当前世界有 \(context.snapshot.places.count) 个可到达地点"
             case "list_available_activities":
-                message = "当前世界有 \(context.snapshot.activities.count) 个可执行活动"
+                message = "当前世界有 \(context.snapshot.activities.filter { availableActivity($0.id) }.count) 个可执行活动"
             case "plan_route":
                 let arguments = try decode(PlaceArguments.self, from: call.argumentsJSON)
                 route = try context.planRoute(to: arguments.placeID)
@@ -129,6 +148,10 @@ final class WorldAgentToolDispatcher {
                 message = "角色开始前往 \(arguments.placeID)"
             case "start_activity":
                 let arguments = try decode(ActivityArguments.self, from: call.argumentsJSON)
+                guard availableActivity(arguments.activityID) else {
+                    return makeResult(callID: call.id, ok: false, code: "activity_unavailable",
+                        message: "当前角色未安装或不兼容这项活动的动作，请选择当前可用活动")
+                }
                 try context.startActivity(id: arguments.activityID)
                 if let requestID = context.currentActivityRequestID {
                     onActivityStarted(context, requestID)
@@ -201,11 +224,22 @@ final class WorldAgentToolDispatcher {
         message: String,
         route: WorldPath? = nil
     ) -> RealtimeDJToolResult {
+        let snapshot = context.snapshot
+        let visibleSnapshot = WorldAgentSnapshot(
+            revision: snapshot.revision, worldID: snapshot.worldID,
+            displayName: snapshot.displayName, worldTime: snapshot.worldTime,
+            weather: snapshot.weather, agentTransform: snapshot.agentTransform,
+            liveCamera: snapshot.liveCamera, activeActivity: snapshot.activeActivity,
+            movement: snapshot.movement, completedGoalIDs: snapshot.completedGoalIDs,
+            places: snapshot.places,
+            activities: snapshot.activities.filter { availableActivity($0.id) },
+            cameras: snapshot.cameras
+        )
         let response = WorldAgentToolResponse(
             ok: ok,
             code: code,
             message: message,
-            snapshot: context.snapshot,
+            snapshot: visibleSnapshot,
             route: route
         )
         let encoder = JSONEncoder()
@@ -257,7 +291,9 @@ final class WorldAgentToolDispatcher {
         case let WorldSimulationError.goalAlreadyCompleted(goalID):
             "目标 \(goalID) 已经完成"
         default:
-            "世界操作失败：\(String(describing: error))"
+            // 绝不回显 `String(describing:)`：枚举 error 的关联值可能含退出码、
+            // 路径或原始诊断；这类信息只能进日志，不能上屏/回灌模型。
+            "世界操作失败，请重新发送这条消息；若反复出现，请重启应用。"
         }
     }
 }

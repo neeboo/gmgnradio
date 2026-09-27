@@ -137,15 +137,16 @@ enum ResidentCodexTransportError: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .notConnected: return "居民会话尚未连接。"
-        case .alreadyStarted: return "居民会话连接已经启动。"
-        case .launchFailed: return "无法启动居民会话。"
-        case .connectionClosed: return "居民会话连接已结束。"
-        case .invalidFrame: return "居民会话收到无效数据。"
-        case .frameTooLarge: return "居民会话数据超过限制。"
-        case .writeFailed: return "无法发送居民会话消息。"
-        case .timedOut: return "居民会话等待超时。"
-        case .remoteError(let code): return "居民会话请求失败（\(code)）。"
+        case .notConnected: return "居民会话尚未连接，请重新发送消息。"
+        case .alreadyStarted: return "居民会话连接已经启动，请稍候再试。"
+        case .launchFailed: return "无法启动居民会话，请检查安装后重试。"
+        case .connectionClosed: return "居民会话连接已中断，请重新发送刚才的内容。"
+        case .invalidFrame: return "居民会话返回了无法识别的数据，请重新发送消息。"
+        case .frameTooLarge: return "居民会话数据超过安全上限，请重试或缩短内容。"
+        case .writeFailed: return "无法发送居民会话消息，请重新发送。"
+        case .timedOut: return "居民会话等待超时，请稍后重新发送。"
+        // 关联的远端错误码只供诊断，不拼接进用户文案。
+        case .remoteError: return "居民会话请求失败，请重新发送消息。"
         }
     }
 }

@@ -3,6 +3,9 @@ import Foundation
 struct ResidentCodexToolReply: Sendable {
     let resultJSON: Data
     let isError: Bool
+    /// 原生图片通道：非 nil 时序列化会附加真实 PNG 的 inputImage 项。
+    /// 仅元数据文本照常携带；文件路径本身绝不作为视觉输入。
+    var image: ResidentVisionImage?
 }
 
 struct ResidentCodexAgentOutcome: Sendable {
@@ -69,7 +72,7 @@ enum ResidentCodexAgentError: Error, LocalizedError {
         }
     }
 
-    func send(prompt: String, sessionID: String?, toolsJSON: Data,
+    func send(prompt: String, imageURLs: [URL] = [], sessionID: String?, toolsJSON: Data,
               allowsSilentCompletion: @escaping @MainActor () -> Bool = { false },
               onToolCall: @escaping ToolHandler) async throws -> ResidentCodexAgentOutcome {
         try Task.checkCancellation()
@@ -148,10 +151,14 @@ enum ResidentCodexAgentError: Error, LocalizedError {
                 acceptingTurn = true
                 stage = "turn"
                 didSendTurnStart = true
+                // App-prepared attachments use the protocol's native image input.
+                // This grants no file tools or additional workspace roots.
+                var input: [[String: Any]] = prompt.isEmpty ? [] : [["type": "text", "text": prompt, "text_elements": []]]
+                input += imageURLs.map { ["type": "localImage", "path": $0.path] }
                 let turnResponse = try Self.object(await connection.request(method: "turn/start", params: Self.encode([
                     "threadId": threadID, "environments": [], "approvalPolicy": "never",
                     "cwd": workingDirectoryURL.path, "runtimeWorkspaceRoots": [],
-                    "input": [["type": "text", "text": prompt, "text_elements": []]],
+                    "input": input,
                 ])))
                 guard let turn = turnResponse["turn"] as? [String: Any], let id = turn["id"] as? String, !id.isEmpty,
                       self.turnID == nil || self.turnID == id else { throw ResidentCodexAgentError.invalidProtocol }
@@ -284,8 +291,20 @@ enum ResidentCodexAgentError: Error, LocalizedError {
         guard operationID == token, terminal == nil, !Task.isCancelled else { return Self.failedTool("居民会话已结束。") }
         guard (try? JSONSerialization.jsonObject(with: result.resultJSON, options: .fragmentsAllowed)) != nil,
               let text = String(data: result.resultJSON, encoding: .utf8) else { return Self.failedTool("空间工具返回无效结果。") }
+        // 原生图片通道：仅当工具回执携带强类型真实 PNG 时才附加 inputImage；
+        // 文件路径或纯文本永不伪装成视觉输入，超预算按失败处理。
+        var contentItems: [[String: String]] = [["type": "inputText", "text": text]]
+        if let image = result.image {
+            let png = image.pngData
+            guard !png.isEmpty, png.count <= ResidentCodexAgent.maximumToolImageBytes else {
+                return Self.failedTool("画面数据超出预算，无法作为视觉输入。")
+            }
+            contentItems.append(["type": "inputImage",
+                "imageUrl": "data:image/png;base64," + png.base64EncodedString()])
+        }
+        // 全部验证（JSON 有效性 + 图片预算）通过后才承认本轮工具成功。
         if !result.isError { successfulToolCall = true }
-        return (try? Self.encode(["success": !result.isError, "contentItems": [["type": "inputText", "text": text]]])) ?? Self.failedTool("空间工具返回无效结果。")
+        return (try? Self.encode(["success": !result.isError, "contentItems": contentItems])) ?? Self.failedTool("空间工具返回无效结果。")
     }
 
     private static func failedTool(_ text: String) -> Data {
@@ -306,6 +325,9 @@ enum ResidentCodexAgentError: Error, LocalizedError {
             return ["type": "function", "name": name, "description": description, "inputSchema": schema]
         }
     }
+
+    /// 单张工具回执图片的宿主侧预算（与捕获策略 512 KiB 对齐）。
+    private static let maximumToolImageBytes = 512 * 1024
 
     private static func encode(_ value: Any) throws -> Data { try JSONSerialization.data(withJSONObject: value) }
     private static func object(_ data: Data) throws -> [String: Any] {
