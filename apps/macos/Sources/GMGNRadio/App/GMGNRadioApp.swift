@@ -3649,8 +3649,14 @@ final class AppDelegate:
               context.manifest.worldID == WishMachineScene.worldID else { return }
         spatialStage.residentPropOutputs = context.state.objectStates.values.filter(\.isEnabled).compactMap(residentPropDescriptor)
         spatialStage.residentHeldProp = residentHeldPropDescriptor(context: context)
-        spatialStage.residentPropDisplayStand = .init(worldID: context.manifest.worldID, objectID: "resident.display_table",
-            position: ResidentPropPlacementConfiguration.tablePosition, size: ResidentPropPlacementConfiguration.tableSize)
+        // 展示台的视觉几何从 manifest 的碰撞体反推：几何只有一个来源（layout.json → world.json），
+        // 视觉与碰撞不会各自漂移。世界没声明它就不画，碰撞也一并没有。
+        if let table = ResidentPropPlacementConfiguration.tableTransform(in: context.manifest) {
+            spatialStage.residentPropDisplayStand = .init(worldID: context.manifest.worldID,
+                objectID: "resident.display_table", position: table.position, size: table.size)
+        } else {
+            spatialStage.residentPropDisplayStand = nil
+        }
         stageWindowController?.updateResidentPropEditor(residentPropEditorSnapshot(context: context))
         for (id, status) in spatialStage.residentPropRenderStatuses {
             if case .failed(_, let message) = status, residentPropNotices[id] != message {

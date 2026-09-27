@@ -177,8 +177,11 @@ let second=WorldGeneratedProp(objectID:"test.second",sourceWishID:"test.second",
         // 643/649，全部是 `wp.auto.x-5/-6.z-9/-10/-11.h0`）。这是 `ba8ff40` 重烘焙引入的
         // 回归——删掉 `cabinSupportReservationIntersects` 时它同时移除了"把展示台 footprint
         // 排除出导航图"这件事。证据与修法见 `docs/plans/2026-09-27-p2-decoration-design.md` §12。
-        let stand=ResidentPropPlacementConfiguration.tableCollision
-        check(WorldPropMeshClearance.canPlace(stand,supportHeight:ResidentPropPlacementConfiguration.tablePosition.y,triangles:triangles),"table real box clear in mesh")
+        // 展示台现在由 manifest 声明（不再硬编码在 App 里），所以这里也从 manifest 取。
+        guard let stand=ResidentPropPlacementConfiguration.tableCollision(in:manifest) else {
+            print("FAIL: the manifest declares the display table"); exit(1)
+        }
+        check(WorldPropMeshClearance.canPlace(stand,supportHeight:stand.center.y-stand.halfExtents.y,triangles:triangles),"table real box clear in mesh")
         // 8. 失败的预览不改库存状态。
         check(context.state.objectStates[second.objectID]?.isEnabled == false,"rejected previews preserve disabled inventory")
         print("PASS: \(count) real cabin grid placement checks; layers=\(grid.layers.count), coffee anchor y=\(anchor.supportHeight)")

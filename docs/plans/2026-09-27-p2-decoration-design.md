@@ -20,7 +20,9 @@
 | 7 格子渲染 pass + 建造模式开关 | ✅ | `43a7501`、`a6baf60`、`ffa3251` |
 | 8 光标拾取 + 接入实时视图 | ✅ | `8b7da88`、`a8dbfa8` |
 | 9 编辑器改为「格子 + footprint」 | ✅ | `e3c0ed1`、本轮 |
-| 10 回归（`make test-all`） | ✅ 当前态 | 32 + 173 + 70 + 203 + 19 harness 全绿 |
+| 10 回归（`make test-all`） | ✅ 当前态 | 32 + 176 + 70 + 203 + 20 harness 全绿 |
+| §12 回归 1（展示台挡住导航） | ✅ 已修 | 本轮 |
+| §12 回归 2（桌面不可摆放） | ❌ 待修（机制已定位） | — |
 
 **7、8、9 全部完成**：格子在建造模式可见、鼠标拾取格子着色、点击在吸附后的格心上落地。
 摆放校验已经是「格子 + `PropPlacementEvaluator`」，具名摆放面（`ResidentPropSupportSurface`
@@ -413,15 +415,40 @@ public protocol WorldPropSupportQuerying: WorldCollisionQuerying {
 | 重烘焙产出与既有 `layout.json` 不一致 | 先跑 `test_cabin_navigation_package.py` 的重建比对再动 app 资源 |
 | 真人手感无法离线验证 | 明确列为真人验收项 |
 
-## 12. ⚠️ 工作项 5 引入的两个实测回归（未修复，下一轮处理）
+## 12. 工作项 5 引入的两个实测回归（回归 1 已修复；回归 2 待修）
 
 在把摆放校验切到「格子 + footprint」之后，用真实舱体数据实测发现：**删除
 `cabinSupportReservationIntersects` 的代价比当时评估的大**。它不只做"摆放面预留"，
 它同时**把展示台的 footprint 排除在导航图之外**。删掉之后：
 
-### 回归 1：6 个 waypoint 运行时不可达
+### 回归 1：6 个 waypoint 运行时不可达 —— ✅ 已修复
 
-证据（同一份 manifest，只切换碰撞世界里有没有展示台）：
+**修法（已落地）**：把展示台搬进 `authoring/worlds/marble-living-cabin/layout.json` 的
+`collisionVolumes`（它就是世界里一件真实家具），App 不再硬编码它的几何，改为从 manifest
+反推视觉变换（`ResidentPropPlacementConfiguration.tableTransform(in:)`，
+`position.y = center.y - half.y`、`size = half * 2`），`independentCollisionVolumes` 也从
+"按 id 白名单挑两个 + 拼硬编码的第三个"简化成"manifest 声明什么就挡什么"。然后重烘焙。
+
+**修复后实测**：
+
+```
+生产胶囊 0.2 m：展示台挡住的路线数 0            （修复前 42）
+运行时可达性：含展示台 643/643 可达，失败 0     （修复前 643/649，6 个不可达）
+烘焙器：PASS: 643 grounded waypoints; 2354 edges verified in both directions; all reachable from wp.spawn
+```
+
+waypoint 从 649 变 643 是**预期的**：烘焙器现在看得见展示台，不会再造出它到不了的 6 个点。
+`blockedCandidates` 729 → 735（+6，正是展示台 footprint），而
+`triangleCount 161600` / `surfaceCandidates 2421` / `gridColumns 2695` / `columnsWithoutGround 1549`
+全部不变 —— 变化完全由新增的家具体积解释。
+
+> 一个差点误报的坑：静态探针最初报"仍有 5 条路线被挡"。那是**探针自己**用了 0.3 m 胶囊，
+> 而烘焙与验证用的是生产胶囊 0.2 m。改成 0.2 m 后是 0。**探针的口径必须与生产一致**，
+> 否则会凭空造出一个回归。
+
+下面是修复前的证据，保留作为对照。
+
+**修复前**（同一份 manifest，只切换碰撞世界里有没有展示台）：
 
 ```
 不含展示台：649/649 可达，失败 0
@@ -451,7 +478,39 @@ public protocol WorldPropSupportQuerying: WorldCollisionQuerying {
 注意：运行时惰性重规划（工作项 4）**不能**替代这件事——它能绕开，但绕不开时抛
 `unreachable`，就是上面那 6 个点。
 
-### 回归 2：桌面不再是可摆放面
+### 回归 2：桌面不再是可摆放面 —— ❌ 待修（机制已完全定位）
+
+**机制（已定位到具体代码）**：候选判定是"站立层 ∪ 家具下地面层"
+（`PropSupportGridFilter.run`），而站立判据用的是**列最小角**、不是格心。于是任何家具
+footprint 外面都会出现一圈列：**格子压在家具上、但列角点落在外面**。这些列
+`canOccupy` 为假（胶囊进不去）、列里又只有地面一层（角点不在家具下，扫描取不到顶面），
+于是**既不是站立层、也不是家具下地面层 → 不在候选里**。它们把家具 footprint 内部的列
+**整圈隔离**，BFS 进不去 —— 家具底下的地面与家具顶面**同时**从网格里消失。
+
+合成几何可复现：4×4 m 平地 + 顶面 0.5 m 的桌子，桌子四周恰好 16 列不可站立，
+其中内圈 9 列有顶面（`coveredGroundLayers 9`）、外圈 7 列没有；最终那 9 列的
+地面与桌面**全部**被剔除。
+
+**已尝试并否决的两条修法**（都实测过，别再重复走）：
+
+| 尝试 | 结果 |
+| --- | --- |
+| 让**所有 layer 0 列**都成为候选 | ❌ **破坏墙隔离**。墙列之所以被排除，正是因为它"既非站立层也非家具下地面层、不在候选里"。放宽候选后 BFS 直接穿墙（"两块互不连通的地面"与"插墙"两个用例立刻失败） |
+| 站立判据改用**格心**而不是列角点 | ⚠️ 方向对（外圈正是角点造成的），但会改变台阶连通与桌子用例的计数（`layersAfterFilter` 303 vs 314、`reachableLayers` 278 vs 289），并且触发一次 crash。**需要连同墙用例、台阶用例与真实舱体数字一起重新定标**，不能顺手改 |
+
+**已经就绪、但暂未接线的一半**：`WorldRuntime` 的 `PropSupportDerivationWorld`
+（把家具顶面同时当作 `groundHeight` 与**合成三角形**提供，且严格实现 `groundHeight`
+的"不高于 `position.y + 0.05`"契约——这一条是实测踩出来的坑：不加上限会让同一高度被
+反复取到、把地面层永远挡掉）。它已有 3 个单测（含一个 `withKnownIssue` 记录上面的环隔离，
+修好后会主动失败提醒翻转断言），但**还没有接进 App**：过滤器没修好之前接上去不产生任何
+效果，接线的正确时机是与过滤器修法同批。
+
+**修法建议**：把站立判据与格子对齐（格心），然后**系统性地**重定标
+`PropSupportGridTests` 的墙/台阶/桌子用例与真实舱体守卫数字，再接线派生世界。
+
+原报告如下。
+
+### 回归 2（原报告）：桌面不再是可摆放面
 
 派生的承托网格在桌面高度 `y≈0.52 m` 附近**一个层都没有**（只用网格 0 个；网格 + 碰撞体也是 0 个），
 而旧实现有一个具名的 `resident.display_table` 摆放面。也就是说**"把咖啡机放在展示台上"
