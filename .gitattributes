@@ -1,0 +1,23 @@
+# Normalize text to LF in both the index and the working tree.
+#
+# This is load-bearing, not cosmetic: world packages embed the SHA-256 of file
+# bytes. `authoring/worlds/marble-living-cabin/build-package.mjs` hashes
+# `assets/collider.glb` and `Presence/ResidentPropPlacementConfiguration.swift`,
+# and `apps/macos/Resources/Worlds/marble-living-cabin/world.json` pins the
+# SHA-256 of every shipped resource. On a machine with `core.autocrlf=true`, a
+# CRLF checkout would invalidate the baked-navigation gate
+# ("Baked navigation is stale") on a clean clone.
+* text=auto eol=lf
+
+*.spz binary
+*.glb binary
+*.vmd binary
+*.vrma binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.icns binary
+*.bmp binary
+*.pdf binary
+*.db binary

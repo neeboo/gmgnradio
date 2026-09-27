@@ -6,8 +6,27 @@
 DerivedData/
 .derived-data/
 build/
+Build/
 *.xcuserstate
 xcuserdata/
 
 .swiftpm/
 .build/
+
+# Xcode/SwiftPM caches and mirrored dependencies. Package.resolved stays
+# tracked (apps/macos/GMGNRadio.xcodeproj/.../swiftpm/Package.resolved) so a
+# clean clone still resolves the same pinned versions.
+apps/macos/Packages/checkouts/
+apps/macos/Packages/repositories/
+apps/macos/Packages/artifacts/
+apps/macos/Packages/workspace-state.json
+
+# Local working output. Never inputs to a build, test or package.
+tmp/
+backups/
+dist/
+.sessions/
+.pytest_cache/
+
+__pycache__/
+*.blend1
