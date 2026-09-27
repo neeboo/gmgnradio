@@ -46,6 +46,19 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     private let residentChat = StageResidentChatState()
     private let wishMachineTasks = WishMachineTaskPresentationStore()
     private let residentPropEditor = ResidentPropEditorState()
+
+    /// 建造模式的光标回调，转发给交互视图。
+    var onResidentPropGridCursor: ((SIMD2<Float>) -> Void)? {
+        didSet { stageContentView?.onGridCursor = onResidentPropGridCursor }
+    }
+
+    /// 建造模式算 footprint 用的物件尺寸：优先"正在拖动/待确认"的那个，否则用选中的。
+    /// 没有选中任何物件时返回 nil，调用方退回"一格"的 footprint。
+    var residentPropFootprint: (size: SIMD2<Float>, height: Float)? {
+        guard let prop = (residentPropEditor.candidate ?? residentPropEditor.selectedObject)?.generatedProp
+        else { return nil }
+        return (SIMD2(prop.size.x, prop.size.z), prop.size.y)
+    }
     private var playbackState: LocalMusicPlaybackState
     private var voiceState: RealtimeVoiceConnectionState
     private weak var stageContentView: StageContentView?
@@ -545,6 +558,11 @@ struct StagePointerDragDelta: Equatable {
 
 @MainActor
 private final class StageContentView: NSView {
+    /// 建造模式的光标回调，转给真正处理鼠标的交互视图。
+    var onGridCursor: ((SIMD2<Float>) -> Void)? {
+        didSet { worldInteractionView.onGridCursor = onGridCursor }
+    }
+
     private let overlayState: StageOverlayState
     private let spatialStage: SpatialStageStore
     private let renderSurfaceController: StageRenderSurfaceController
@@ -1142,6 +1160,10 @@ private final class StageWorldInteractionView: NSView {
     private var didLogCurrentDrag = false
     private var lastDragLocationInWindow: CGPoint?
 
+    /// 建造模式的光标回调。参数是**归一化、左上原点**的光标位置，与
+    /// `SpatialStageStore.residentPropPoint` 和 `PropSupportGridPicker` 同一套约定。
+    var onGridCursor: ((SIMD2<Float>) -> Void)?
+
     init(spatialStage: SpatialStageStore, propEditor: ResidentPropEditorState) {
         self.spatialStage = spatialStage
         self.propEditor = propEditor
@@ -1297,9 +1319,20 @@ private final class StageWorldInteractionView: NSView {
     }
 
     private func updatePropPointer(_ event: NSEvent, confirm: Bool = false) {
-        guard bounds.width > 0, bounds.height > 0, let surface = propEditor.surface else { return }
+        guard bounds.width > 0, bounds.height > 0 else { return }
         let point = convert(event.locationInWindow, from: nil)
+        // 归一化到**左上原点**，与 `SpatialStageStore.residentPropPoint` 和
+        // `PropSupportGridPicker` 的约定一致（AppKit 的视图坐标是左下原点，所以要翻 y）。
         let normalized = SIMD2<Float>(Float(point.x / bounds.width), Float(1 - point.y / bounds.height))
+
+        // 建造模式交给格子拾取：射线与**每一层**格子平面求交、就近命中，不再依赖
+        // "当前摆放面"的单一高度 —— 这正是建造模式能放地面、放桌面、放夹层的原因。
+        if spatialStage.isResidentPropBuildModeActive, spatialStage.residentPropBuildModeProjection != nil {
+            onGridCursor?(normalized)
+            return
+        }
+
+        guard let surface = propEditor.surface else { return }
         pointerTask?.cancel()
         guard let position = spatialStage.residentPropPoint(normalizedPoint: normalized, surfaceY: surface.position.y) else {
             propEditor.pointerMissed(); return

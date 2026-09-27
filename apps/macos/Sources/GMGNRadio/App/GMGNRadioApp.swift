@@ -2974,6 +2974,10 @@ final class AppDelegate:
                 self?.openSystemInbox()
             }
         )
+        // 建造模式：鼠标移动 → 格子拾取 → footprint 判定 → 整块着色。
+        stageWindowController?.onResidentPropGridCursor = { [weak self] normalized in
+            self?.residentPropGridHover(normalized: normalized)
+        }
         if let stageWindowController {
             configureResidentPropEditor(stageWindowController)
             let liveCamWindowController = LiveCamWindowController(
@@ -3784,6 +3788,26 @@ final class AppDelegate:
         spatialStage.residentPropGridCells = residentPropGridEditor.renderCells
         spatialStage.residentPropGridStates = residentPropGridEditor.cellStates
         spatialStage.residentPropGridSpacing = residentPropGridEditor.isReady ? residentPropGridEditor.spacing : 0
+    }
+
+    /// 光标 → 格子悬停。
+    ///
+    /// 只做悬停与判定；**点击提交仍走既有的摆放面校验**，把那一步切到 "格子 + footprint"
+    /// 需要同时改摆放服务（见工作项 9），所以现在点击不会在格子上落地任何东西。
+    private func residentPropGridHover(normalized: SIMD2<Float>) {
+        guard let context = livingWorldContext,
+              let projection = spatialStage.residentPropBuildModeProjection else { return }
+        let footprint = stageWindowController?.residentPropFootprint
+        let size = footprint?.size ?? SIMD2(repeating: residentPropGridEditor.spacing)
+        let height = footprint?.height ?? residentPropGridEditor.spacing
+        residentPropGridEditor.updateHover(
+            normalizedCursor: normalized,
+            inverseViewProjection: projection.inverseViewProjection,
+            footprintSize: size,
+            height: height,
+            blockingVolumes: context.manifest.collisionVolumes.filter(\.isBlocking),
+            placedProps: context.state.objectStates.values.compactMap(\.generatedCollisionVolume)
+        )
     }
 
     /// 格子覆盖的范围：以导航图的 waypoint 包络为准 —— 那**就是**可玩区域，而且已经在
