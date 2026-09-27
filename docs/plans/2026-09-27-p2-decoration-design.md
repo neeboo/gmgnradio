@@ -17,13 +17,21 @@
 | 5 删除 `supportReservation` 与摆放面哈希门禁 | ✅ | `c4943a5` |
 | 5b 重烘焙（631 → 649 waypoints） | ✅ | `ba8ff40` |
 | 6 删除 8 处件数门禁 + 渲染预算重设计 | ✅ | `1e58470`、`e6971be` |
-| 7 格子渲染 pass（实例生成层已就绪，**Metal pass 未做**） | ⏳ 一半 | `43a7501` |
-| 8 光标拾取（**纯逻辑已就绪，未接入实时视图**） | ⏳ 一半 | `8b7da88` |
-| 9 编辑器改为「格子 + footprint」 | ❌ 未开始 | — |
-| 10 回归（`make test-all`） | ✅ 当前态 | 32 + 173 + 70 + 203 + 18 harness 全绿 |
+| 7 格子渲染 pass + 建造模式开关 | ✅ | `43a7501`、`a6baf60`、`ffa3251` |
+| 8 光标拾取 + 接入实时视图 | ✅ | `8b7da88`、`a8dbfa8` |
+| 9 编辑器改为「格子 + footprint」 | ⏳ **只剩校验切换 + 旋转键** | `e3c0ed1` |
+| 10 回归（`make test-all`） | ✅ 当前态 | 32 + 173 + 70 + 203 + 19 harness 全绿 |
 
-**剩余工作集中在 App 层的 7 / 8 / 9，三者互相依赖**（编辑器状态提供网格与悬停格，渲染与拾取消费它），
-应作为一个整体实施：Metal 实例化 pass + 鼠标拾取接线 + 编辑器放置校验改为「格子 + footprint」。
+**7 与 8 已完成**：格子在建造模式可见（`ffa3251`），鼠标悬停会拾取格子并着色（`a8dbfa8`）。
+
+**工作项 9 只剩一件**：把 `ResidentPropPlacementService` 的摆放校验从"具名摆放面"切到
+"格子 + `PropPlacementEvaluator`"，并加 90° 步进旋转键。编辑器的
+`escape` / `confirm` / `withdraw` / `undo` / `movePointer` **都已存在**，
+所以 Esc、收回、撤销不需要新写；缺的是校验切换与旋转键。
+
+**在此之前，建造模式下点击不会落地任何东西**：悬停与绿/红已经是真的，但提交走的是
+摆放面校验，格子位置会被它拒绝。这是有意的半步，而不是遗漏。
+
 `WorldRuntime` 侧已经全部完成，不再需要改动。
 
 ## 0. 标准
@@ -417,5 +425,6 @@ public protocol WorldPropSupportQuerying: WorldCollisionQuerying {
 | `test-resident-speech-avatar.swift` | 编译失败：`value of type 'App' has no member 'r…'` |
 | `test-wish-machine-app-runtime.swift` | 编译失败：`cannot find 'registerResidentMemoryTurn' in scope` |
 | `test-wish-machine-delivery-loop.swift` | 顶层运行时错误（退出码 5 / 133 不稳定） |
+| `test-stage-resident-chat.swift` | 编译失败：`cannot find 'showFailureStatus' in scope` |
 
 修它们需要逐个决定"现在的等价断言是什么"，属于独立的一小批工作。**不要把它们的失败算到 P2 头上。**
