@@ -67,13 +67,53 @@ Sims 里的家具是**真的挡路**的：Sim 会绕过沙发，你把门堵死�
 
 ### 决定 2：取消件数上限
 
-**不是调大，是取消。** 删掉 §1 表格里全部 5 处，并删掉 `WorldPropLayoutError.visibleLimit`（它保护的是一个不该存在的约束）。
+**不是调大，是取消。** 共 **8 处门禁**需要删除：
+
+**WorldRuntime（数据模型）**
+1. `WorldSimulation.swift:142` —— `guard count < 4`
+2. `WorldSimulation.swift:175` —— `guard otherVisibleCount < 4`
+3. `WorldPropLayout.swift:106` —— `case visibleLimit`
+4. `WorldPropLayout.swift:155` —— 对应的用户文案
+
+**App（门禁）**
+
+5. `ResidentPropPlacementService.swift:144` —— `guard placed.count <= 4`
+6. `ResidentPropRenderer.swift:53` —— `if nextHeld != nil, next.count == 4 { next.removeLast() }`（**静默截断**）
+7. `WishMachineOutputDescriptor.swift:49` —— `.prefix(4)`（**静默截断**）
+8. `WishMachineOutputDescriptor.swift:52` —— `result.count < 4`
 
 **并确立一条原则：**
 
 > **渲染预算永远不该变成"你不许放"。**
 
-渲染端按距离与重要性裁剪（近处优先、远处淡出），必要时降级；**绝不因渲染理由拒绝用户的放置**。因此压测决定的是「同时可见多少、多远内可见」，不是「能放多少」。
+渲染端按距离与重要性裁剪（近处优先、远处淡出），必要时降级；**绝不因渲染理由拒绝用户的放置**。
+
+### 决定 2b：渲染侧有一个真预算，必须重新设计而不是删除
+
+删掉上面 8 处之后会暴露一个**真实约束**（第 6 处，且它不是门禁）：
+
+```swift
+// ResidentPropRenderer.swift:101-103
+if cache.count+loads.count >= 5, let evict = cache.keys.sorted().first(where: { !active.contains($0) }) { cache.removeValue(forKey: evict) }
+guard cache.count+loads.count < 5 else { throw WishMachineOutputError.renderUnavailable }
+```
+
+每个 GLB 道具是**一次完整解析 + 纹理上传**，所以缓存上限是必要的。但现在的策略有两个问题：
+
+1. **上限 5 的来源就是那个 4 件上限**（4 件 + 1 手持）。取消件数上限后，放第 6 件会抛 `renderUnavailable`。
+2. **缓存满且全都在视野内时直接抛错**——这正是"渲染预算变成了不许放"。
+
+**重新设计：**
+
+| 项 | 策略 |
+| --- | --- |
+| 缓存上限 | 提高到可容纳整个房间的合理值（例如 32），不再是 5 |
+| 淘汰顺序 | **按到相机的距离**（最远先淘汰），而不是 `cache.keys.sorted().first`（按 key 字典序，语义上无意义） |
+| 距离裁剪 | 超过阈值（房间对角线约 27 m，阈值取 30 m 即可覆盖全屋）的道具不绘制，其资产可释放 |
+| 预算不足时 | **跳过本帧绘制，绝不抛错**；等有资产被淘汰后自然恢复 |
+| 加载并发 | 目前**每个物件一个 `Task`，无全局并发上限**——放 30 件会同时解析 30 个 GLB。需要**有界并发**（例如 2–4）并排队 |
+
+这样"放多少"由用户决定，"同时画多少 / 同时解析多少"由渲染端自己管。
 
 ### 决定 3：门禁不再锁摆放面 —— 那个耦合直接消失，而不是被管理
 
@@ -185,7 +225,7 @@ public protocol WorldPropSupportQuerying: WorldCollisionQuerying {
 | 4 | **让居民绕过家具**：`ActivityExecutor` 把 `collisionQuery` 推出的 `canTraverse` 传进 `route(from:to:canTraverse:)` | `WorldRuntime` | 单测：路径被物件挡住时改走可行边；无障碍时路径与今天逐点一致 |
 | 5 | **删除 `supportReservation` 与摆放面哈希门禁** | `tools/navigation/`、`bake-living-cabin-navigation.py`、`build-package.mjs` | Python 守卫重建成功；烘焙图只多约 3 个点 |
 | 5b | **重烘焙一次** `marble-living-cabin`，核对 report | `authoring/` + `Resources/` | `triangleCount 161600`；`waypointCount` / `bidirectionalEdgeCount` 变化有据可查 |
-| 6 | 删除 5 处件数限制与 `visibleLimit` | `WorldSimulation`、`ResidentPropPlacementService`、`ResidentPropRenderer`、`WishMachineOutputDescriptor` | 放 30 件全部可见、可存档；既有 12 项 `WorldPropLayout` 测试不回归 |
+| 6 | 删除 8 处件数门禁（决定 2）+ 重新设计渲染预算（决定 2b：缓存 32、按距离淘汰、超距裁剪、预算不足跳过本帧、加载有界并发） | `WorldSimulation`、`WorldPropLayout`、`ResidentPropPlacementService`、`ResidentPropRenderer`、`WishMachineOutputDescriptor` | 放 30 件全部可见、可存档；无 `renderUnavailable`；既有 12 项 `WorldPropLayout` 测试按新语义更新 |
 | 7 | 格子渲染 pass（实例化 quad + 距离淡出 + 深度测试） | `ResidentPropRenderer` 旁 | 视觉验收：被墙遮挡、不闪烁、60 fps |
 | 8 | 光标拾取：射线 → 格子平面求交 → 最近命中 | 渲染/相机层 | 悬停高亮跟手；远处格子也能选中 |
 | 9 | 编辑器改成"格子 + footprint" | `ResidentPropEditorState/Service` + `View` | 悬停绿/红正确；吸附；90° 旋转；Esc/Delete/撤销 |
