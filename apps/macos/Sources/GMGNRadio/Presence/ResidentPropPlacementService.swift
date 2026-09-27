@@ -141,7 +141,6 @@ final class ResidentPropPlacementService {
            let volume = held.returnState.generatedCollisionVolume {
             placed.append((held.objectID, held.returnState, volume))
         }
-        guard placed.count <= 4 else { throw WorldPropLayoutError.visibleLimit }
         for (id,item,box) in placed {
             guard item.generatedProp?.objectID == id else { throw WorldPropLayoutError.invalidObject }
             guard let surface = surfaces.first(where: { $0.id == item.supportSurfaceID }) else { throw ResidentPropPlacementError.unknownSurface }

@@ -49,7 +49,7 @@ private let coffee = WorldGeneratedProp(objectID: "wish.object.1", sourceWishID:
     #expect(throws: WorldPropLayoutError.self) { try restored.applyPropLayout(.withdraw(objectID: coffee.objectID),expectedLayoutRevision: 4,requestID: "place") }
 }
 
-@Test func generatedLayoutDuplicateImportBindsRequestAndRejectsFifthVisibleItem() throws {
+@Test func generatedLayoutDuplicateImportBindsRequestAndAllowsManyVisibleItems() throws {
     var sim=layoutSimulation()
     try sim.applyPropLayout(.register(coffee),expectedLayoutRevision:0,requestID:"first")
     try sim.applyPropLayout(.register(coffee),expectedLayoutRevision:1,requestID:"duplicate")
@@ -59,7 +59,10 @@ private let coffee = WorldGeneratedProp(objectID: "wish.object.1", sourceWishID:
         try sim.applyPropLayout(.register(prop),expectedLayoutRevision:sim.state.layoutRevision,requestID:"r\(i)")
         try sim.applyPropLayout(.place(objectID:prop.objectID,placement:.init(surfaceID:"floor",position:.init(x:Float(i),y:0,z:2),yaw:0)),expectedLayoutRevision:sim.state.layoutRevision,requestID:"p\(i)")
     }
-    #expect(throws: WorldPropLayoutError.visibleLimit) { try sim.applyPropLayout(.place(objectID:coffee.objectID,placement:.init(surfaceID:"floor",position:.init(x:0,y:0,z:2),yaw:0)),expectedLayoutRevision:sim.state.layoutRevision,requestID:"fifth") }
+    // 不再有件数上限：第 5 件必须成功，而不是被拒绝或被静默丢弃。
+    try sim.applyPropLayout(.place(objectID:coffee.objectID,placement:.init(surfaceID:"floor",position:.init(x:0,y:0,z:2),yaw:0)),expectedLayoutRevision:sim.state.layoutRevision,requestID:"fifth")
+    #expect(sim.state.objectStates[coffee.objectID]?.isEnabled == true)
+    #expect(sim.state.objectStates.values.filter { $0.isEnabled && $0.generatedProp != nil }.count == 5)
 }
 
 @Test func generatedLayoutKeepsAbsoluteScaleAndRejectsCorruptMetadata() throws {
@@ -250,21 +253,12 @@ private let rightHandGrip = WorldPropGripCalibration(
     for i in 2...5 {
         let prop = WorldGeneratedProp(objectID: "prop\(i)", sourceWishID: "wish\(i)", assetID: "asset\(i)", displayName: "item", size: .init(x: 0.2, y: 0.2, z: 0.2), sourceHeight: 1)
         try sim.applyPropLayout(.register(prop), expectedLayoutRevision: sim.state.layoutRevision, requestID: "r\(i)")
-        if i < 5 {
-            try sim.applyPropLayout(
-                .place(objectID: prop.objectID, placement: .init(surfaceID: "floor", position: .init(x: Float(i), y: 0, z: 2), yaw: 0)),
-                expectedLayoutRevision: sim.state.layoutRevision,
-                requestID: "p\(i)"
-            )
-        } else {
-            #expect(throws: WorldPropLayoutError.visibleLimit) {
-                try sim.applyPropLayout(
-                    .place(objectID: prop.objectID, placement: .init(surfaceID: "floor", position: .init(x: Float(i), y: 0, z: 2), yaw: 0)),
-                    expectedLayoutRevision: sim.state.layoutRevision,
-                    requestID: "p\(i)"
-                )
-            }
-        }
+        // 手持中的物件与已摆放物件各自计数，不再互相挤占名额。
+        try sim.applyPropLayout(
+            .place(objectID: prop.objectID, placement: .init(surfaceID: "floor", position: .init(x: Float(i), y: 0, z: 2), yaw: 0)),
+            expectedLayoutRevision: sim.state.layoutRevision,
+            requestID: "p\(i)"
+        )
     }
     #expect(throws: WorldPropLayoutError.requestConflict) {
         try sim.applyPropLayout(.returnHeld(objectID: coffee.objectID, avatarAssetID: "avatar.2b"), expectedLayoutRevision: sim.state.layoutRevision, requestID: "coffee-hold")
@@ -286,4 +280,41 @@ private let rightHandGrip = WorldPropGripCalibration(
         #expect(error.errorDescription?.contains("物件") == true || error.errorDescription?.contains("活动") == true || error.errorDescription?.contains("握持") == true)
     }
     #expect(WorldSimulationError.propIsHeld(objectID: "prop").errorDescription?.contains("手持") == true)
+}
+
+@Test func generatedLayoutPlacesThirtyItemsAndPersistsThem() throws {
+    // 装修的验收：不设件数上限。放下 30 件后全部可见，并且能原样存档、原样恢复。
+    // 这条取代了原来的"第四件上限"语义，也钉住了"渲染预算不得变成不许放"。
+    var sim = layoutSimulation()
+    for i in 0..<30 {
+        let prop = WorldGeneratedProp(
+            objectID: "prop\(i)", sourceWishID: "wish\(i)", assetID: "asset\(i)",
+            displayName: "item\(i)", size: .init(x: 0.2, y: 0.2, z: 0.2), sourceHeight: 1
+        )
+        try sim.applyPropLayout(.register(prop), expectedLayoutRevision: sim.state.layoutRevision, requestID: "r\(i)")
+        try sim.applyPropLayout(
+            .place(objectID: prop.objectID,
+                   placement: .init(surfaceID: "floor",
+                                    position: .init(x: Float(i % 10), y: 0, z: Float(i / 10)),
+                                    yaw: Float(i) * 0.1)),
+            expectedLayoutRevision: sim.state.layoutRevision,
+            requestID: "p\(i)"
+        )
+    }
+    let visible = sim.state.objectStates.values.filter { $0.isEnabled && $0.generatedProp != nil }
+    #expect(visible.count == 30, "no placement cap: all thirty items stay visible")
+    #expect(visible.compactMap { $0.generatedProp?.objectID }.count == 30)
+
+    // 原子 JSON 存档往返后仍然全部在位，且位置/朝向逐一相同。
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("gmgn-thirty-\(UUID()).json")
+    defer { try? FileManager.default.removeItem(at: url) }
+    let persistence = AtomicJSONWorldStatePersistence(fileURL: url)
+    try persistence.save(sim.state)
+    let loaded = try persistence.load()
+    let restored = try #require(loaded)
+    let restoredVisible = restored.objectStates.values.filter { $0.isEnabled && $0.generatedProp != nil }
+    #expect(restoredVisible.count == 30)
+    for (id, item) in sim.state.objectStates {
+        #expect(restored.objectStates[id]?.transform == item.transform, "\(id) keeps its placement across a reload")
+    }
 }

@@ -137,9 +137,6 @@ public struct WorldSimulation: Sendable {
             guard var item = state.objectStates[id], let prop = item.generatedProp, prop.objectID == id else { throw WorldPropLayoutError.invalidObject }
             guard state.heldProp?.objectID != id else { throw WorldPropLayoutError.objectIsHeld(objectID: id) }
             guard !placement.surfaceID.isEmpty, [placement.position.x,placement.position.y,placement.position.z,placement.yaw].allSatisfy(\.isFinite) else { throw WorldPropLayoutError.invalidPlacement }
-            let count = state.objectStates.filter { $0.key != id && $0.value.isEnabled && $0.value.generatedProp != nil }.count
-                + (state.heldProp == nil ? 0 : 1)
-            guard count < 4 else { throw WorldPropLayoutError.visibleLimit }
             next.layoutUndo = .init(objectID: id, previous: item, previousHeldProp: state.heldProp)
             let scale = prop.size.y / prop.sourceHeight
             item.isEnabled = true
@@ -169,10 +166,6 @@ public struct WorldSimulation: Sendable {
             guard var item = state.objectStates[id], item.generatedProp?.objectID == id else {
                 throw WorldPropLayoutError.invalidObject
             }
-            let otherVisibleCount = state.objectStates.filter {
-                $0.key != id && $0.value.isEnabled && $0.value.generatedProp != nil
-            }.count
-            guard item.isEnabled || otherVisibleCount < 4 else { throw WorldPropLayoutError.visibleLimit }
             next.layoutUndo = nil
             item.metadata["gmgn.prop-grip.v1"] = String(decoding: try JSONEncoder().encode(calibration), as: UTF8.self)
             let returnState = item

@@ -103,7 +103,6 @@ public enum WorldPropLayoutError: Error, Equatable, Sendable {
     case invalidObject
     case invalidPlacement
     case nothingToUndo
-    case visibleLimit
     case heldPropAlreadyExists(objectID: String)
     case objectIsHeld(objectID: String)
     case heldPropMismatch
@@ -152,7 +151,6 @@ extension WorldPropLayoutError: LocalizedError {
         case .invalidObject: "物件不存在或物件资料无效。"
         case .invalidPlacement: "物件摆放位置无效。"
         case .nothingToUndo: "没有可撤销的物件操作。"
-        case .visibleLimit: "空间里同时展示或手持的物件已经达到上限。"
         case let .heldPropAlreadyExists(objectID): "居民已经手持物件 \(objectID)。"
         case let .objectIsHeld(objectID): "物件 \(objectID) 正在手持中，请先放回。"
         case .heldPropMismatch: "手持物件或居民已经变化，请重新查看后再操作。"
