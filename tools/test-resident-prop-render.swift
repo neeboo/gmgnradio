@@ -1,6 +1,7 @@
 import Foundation
 let descriptor = "apps/macos/Sources/GMGNRadio/Presence/WishMachineOutputDescriptor.swift"
 let picker = "apps/macos/Sources/GMGNRadio/Presence/PropSupportGridPicker.swift"
+let presentation = "apps/macos/Sources/GMGNRadio/Presence/PropSupportGridPresentation.swift"
 let source = try String(contentsOfFile: descriptor, encoding: .utf8)
 guard source.contains("struct ResidentPropRenderDescriptor") else { print("FAIL: resident prop placement contract missing"); exit(1) }
 // 拾取器刻意只依赖 Foundation + simd，所以这里能单独编译它做离线验证。
@@ -11,6 +12,11 @@ let pickerImports = pickerSource.split(separator: "\n").map { $0.trimmingCharact
 guard !pickerImports.contains("import WorldRuntime") else { print("FAIL: grid picker must stay independent of WorldRuntime for offline verification"); exit(1) }
 guard pickerImports.allSatisfy({ $0 == "" || !$0.hasPrefix("import ") || $0 == "import Foundation" || $0 == "import simd" }) else {
     print("FAIL: grid picker must only import Foundation and simd"); exit(1) }
+let presentationSource = try String(contentsOfFile: presentation, encoding: .utf8)
+guard presentationSource.contains("enum PropSupportGridPresentation") else { print("FAIL: grid presentation missing"); exit(1) }
+let presentationImports = presentationSource.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+guard presentationImports.allSatisfy({ $0 == "" || !$0.hasPrefix("import ") || $0 == "import Foundation" || $0 == "import simd" }) else {
+    print("FAIL: grid presentation must only import Foundation and simd"); exit(1) }
 let harness = #"""
 import Foundation
 import simd
@@ -107,7 +113,66 @@ func check(_ value: Bool, _ message: String) { if !value { print("FAIL:",message
   check(PropSupportGridPicker.pick(normalized:SIMD2(0.5,0.5),inverseViewProjection:camera,
         candidates:[above],spacing:0.25,maximumDistance:30)==nil,
         "layer behind the camera is not picked")
-  print("PASS: prop scale/yaw, unique preview/cancel, shared identity, world isolation, support ray and multi-layer grid picking")
+  // ── 建造模式格子呈现（工作项 7 中可离线验证的部分）──────────────────────
+  func gridCell(_ x:Int,_ z:Int,_ layer:Int,_ height:Float) -> PropSupportGridPresentation.Cell {
+      PropSupportGridPresentation.Cell(columnX:x,columnZ:z,layer:layer,
+          columnXWorld:Float(x)*0.25,columnZWorld:Float(z)*0.25,supportHeight:height) }
+  var grid=PropSupportGridPresentation.Options.default
+  grid.lift=0.001; grid.gap=0.08; grid.fadeStart=2; grid.fadeEnd=6
+  grid.maximumDistance=10; grid.maximumInstances=20000
+  let origin=SIMD3<Float>(0,0,0)
+  check(PropSupportGridPresentation.instances(cells:[],states:[:],cameraPosition:origin,spacing:0.25,options:grid).isEmpty,
+        "no cells means no instances")
+  check(PropSupportGridPresentation.instances(cells:[gridCell(0,0,0,0)],states:[:],cameraPosition:origin,spacing:0,options:grid).isEmpty,
+        "invalid spacing draws nothing")
+  var badGrid=grid; badGrid.fadeEnd=badGrid.fadeStart
+  check(PropSupportGridPresentation.instances(cells:[gridCell(0,0,0,0)],states:[:],cameraPosition:origin,spacing:0.25,options:badGrid).isEmpty,
+        "invalid options draw nothing")
+
+  let near=PropSupportGridPresentation.instances(cells:[gridCell(0,0,0,0.5)],states:[:],cameraPosition:origin,spacing:0.25,options:grid)
+  check(near.count==1,"near cell is drawn")
+  check(abs(near[0].center.x-0.125)<0.00001 && abs(near[0].center.z-0.125)<0.00001,
+        "quad is centred inside its cell, not on the column corner")
+  check(abs(near[0].center.y-0.501)<0.00001,"quad is lifted off the support plane")
+  check(abs(near[0].size-0.23)<0.00001,"quad leaves a gap so cells read as a grid")
+  check(abs(near[0].alpha-1)<0.00001,"inside fadeStart the grid is opaque")
+  check(near[0].state == .placeable,"cells without a verdict default to placeable")
+
+  // 相机在原点：列 16 的世界 X=4.0，列 24 的世界 X=6.0，列 40 的世界 X=10.0。
+  let fading=PropSupportGridPresentation.instances(cells:[gridCell(16,0,0,0)],states:[:],cameraPosition:origin,spacing:0.25,options:grid)
+  let fadingDistance=simd_length(SIMD3<Float>(4.125,0.001,0.125))
+  check(fading.count==1 && abs(fading[0].alpha-(1-(fadingDistance-2)/4))<0.0001,
+        "alpha falls off linearly between fadeStart and fadeEnd")
+  let nearer=PropSupportGridPresentation.instances(cells:[gridCell(8,0,0,0)],states:[:],cameraPosition:origin,spacing:0.25,options:grid)
+  check(nearer.count==1 && fading.count==1 && nearer[0].alpha > fading[0].alpha,
+        "a nearer cell is never more transparent than a farther one")
+  check(PropSupportGridPresentation.instances(cells:[gridCell(24,0,0,0)],states:[:],cameraPosition:origin,spacing:0.25,options:grid).isEmpty,
+        "a cell exactly at fadeEnd is not drawn")
+  check(PropSupportGridPresentation.instances(cells:[gridCell(40,0,0,0)],states:[:],cameraPosition:origin,spacing:0.25,options:grid).isEmpty,
+        "a cell beyond maximumDistance is not drawn")
+
+  // 状态着色：每种状态颜色不同，且能被显式覆盖。
+  let allStates:[PropSupportGridPresentation.CellState] = [.placeable,.blocked,.occupied,.validFootprint,.invalidFootprint]
+  var tints=Set<[Float]>()
+  for state in allStates { tints.insert([state.tint.x,state.tint.y,state.tint.z,state.tint.w]) }
+  check(tints.count==allStates.count,"every cell state has its own colour")
+  let blockedCell=gridCell(0,0,0,0)
+  let withState=PropSupportGridPresentation.instances(cells:[blockedCell],states:[blockedCell:.blocked],cameraPosition:origin,spacing:0.25,options:grid)
+  check(withState.count==1 && withState[0].state == .blocked,"an explicit verdict overrides the default")
+
+  // 预算：超出上限时丢【最远】的，保留最近的，并维持原始顺序。
+  var budget=grid; budget.maximumInstances=3
+  let five=[gridCell(0,0,0,0),gridCell(4,0,0,0),gridCell(8,0,0,0),gridCell(12,0,0,0),gridCell(16,0,0,0)]
+  let kept=PropSupportGridPresentation.instances(cells:five,states:[:],cameraPosition:origin,spacing:0.25,options:budget)
+  check(kept.count==3,"budget caps the instance count")
+  check(abs(kept[0].center.x-0.125)<0.00001 && abs(kept[1].center.x-1.125)<0.00001 && abs(kept[2].center.x-2.125)<0.00001,
+        "budget drops the farthest cells and keeps the order stable")
+  check(PropSupportGridPresentation.instances(cells:five,states:[:],cameraPosition:origin,spacing:0.25,options:grid).count==5,
+        "all five cells fit when the budget allows")
+  check(PropSupportGridPresentation.instances(cells:five,states:[:],cameraPosition:origin,spacing:0.25,options:budget)
+        == PropSupportGridPresentation.instances(cells:five,states:[:],cameraPosition:origin,spacing:0.25,options:budget),
+        "instance generation is deterministic")
+  print("PASS: prop scale/yaw, unique preview/cancel, shared identity, world isolation, support ray, multi-layer grid picking and grid presentation")
  }
 }
 """#
@@ -117,6 +182,6 @@ defer {try? FileManager.default.removeItem(at:temp)}
 let file=temp.appendingPathComponent("main.swift"),exe=temp.appendingPathComponent("check")
 try harness.write(to:file,atomically:true,encoding:.utf8)
 func run(_ path:String,_ args:[String]) throws->Int32 {let p=Process();p.executableURL=URL(fileURLWithPath:path);p.arguments=args;try p.run();p.waitUntilExit();return p.terminationStatus}
-let result=try run("/usr/bin/nice",["-n","15","/usr/bin/swiftc","-j1","-parse-as-library",descriptor,picker,file.path,"-o",exe.path])
+let result=try run("/usr/bin/nice",["-n","15","/usr/bin/swiftc","-j1","-parse-as-library",descriptor,picker,presentation,file.path,"-o",exe.path])
 guard result==0 else {exit(result)}
 exit(try run(exe.path,[]))

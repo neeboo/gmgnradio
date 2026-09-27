@@ -73,6 +73,7 @@
 		3D797429E450227D21862C59 /* ResidentPropScene.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1952AEC89F2EB509261F9EB9 /* ResidentPropScene.swift */; };
 		3E8E742B504FD7092CB26D03 /* AppIcon.icns in Resources */ = {isa = PBXBuildFile; fileRef = A336B0DC33890C83CFC50402 /* AppIcon.icns */; };
 		3E9B5FF688288BB909B54974 /* MarbleSpatialView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B2AAC89D19825EE7D4ABFCD /* MarbleSpatialView.swift */; };
+		3FB43FFEC22AAD70D446E154 /* PropSupportGridPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3ECC82D2CA5287308B9ACA45 /* PropSupportGridPresentation.swift */; };
 		402CCD2A9D568D5EC38E88FD /* MotionFormatFilter.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2CF2D3E1DDB2710C1854C97 /* MotionFormatFilter.swift */; };
 		4112603D7E0222EA77CBF228 /* ResidentPropPlacementService.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6D9D44D3F0366183C6571C0 /* ResidentPropPlacementService.swift */; };
 		4148B50FC20182BF4400E0E4 /* LiveCamPanelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 942E433DD468BC9999CEE582 /* LiveCamPanelTests.swift */; };
@@ -374,6 +375,7 @@
 		3C5D0DADBAA7035525DDE57F /* UnifiedMusicSearchTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnifiedMusicSearchTests.swift; sourceTree = "<group>"; };
 		3D6F3BC0818D1BCD25076374 /* ResidentWebImagePublicDNSResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentWebImagePublicDNSResolver.swift; sourceTree = "<group>"; };
 		3EC30AFB44CBD4D6847AC1E3 /* MarbleAPIKeySettingsModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarbleAPIKeySettingsModel.swift; sourceTree = "<group>"; };
+		3ECC82D2CA5287308B9ACA45 /* PropSupportGridPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PropSupportGridPresentation.swift; sourceTree = "<group>"; };
 		3F6DF0E5038DD4BDC58A0D55 /* ResidentVisionTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentVisionTools.swift; sourceTree = "<group>"; };
 		4374B4687559AEDE957A3117 /* Orb.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Orb.metal; sourceTree = "<group>"; };
 		43F2D91E87ABAC0F51F8C126 /* OrbState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbState.swift; sourceTree = "<group>"; };
@@ -960,6 +962,7 @@
 				22092892913901B6B9A639FF /* PropGenerationStore.swift */,
 				7042ABB00311D453A5D5E557 /* PropImagePreparation.swift */,
 				8C764576419E37F7B13BAB58 /* PropSupportGridPicker.swift */,
+				3ECC82D2CA5287308B9ACA45 /* PropSupportGridPresentation.swift */,
 				AC7A4B6E567E74C7977C92ED /* PropTaskDaemonClient.swift */,
 				0E16B502423D8CB2B119C833 /* RemoteMotionLibrary.swift */,
 				C12A593D2E39AA38BDE94F2C /* ResidentImageAttachment.swift */,
@@ -1489,6 +1492,7 @@
 				F6DB346A7C0E9037A9199668 /* PropGenerationStore.swift in Sources */,
 				977A6550B9EDEDE80B2D0915 /* PropImagePreparation.swift in Sources */,
 				0183599BCE0055F20464F7CA /* PropSupportGridPicker.swift in Sources */,
+				3FB43FFEC22AAD70D446E154 /* PropSupportGridPresentation.swift in Sources */,
 				49CF26C41737F0892F222A5D /* PropTaskDaemonClient.swift in Sources */,
 				4AAB471D551D8A088912E7A4 /* QQMusicProviderClient.swift in Sources */,
 				B3D5D78DF1FC2D95AE00D4DA /* RadioPluginAvailability.swift in Sources */,
