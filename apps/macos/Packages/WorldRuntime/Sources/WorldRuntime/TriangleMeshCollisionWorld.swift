@@ -232,6 +232,37 @@ public struct TriangleMeshCollisionWorld: WorldCollisionQuerying {
     }
 }
 
+extension TriangleMeshCollisionWorld: WorldPropSupportQuerying {
+    /// 按平面范围取局部三角形，复用构造时建立的 0.25 m 空间哈希。
+    ///
+    /// 为什么必须分桶：`WorldPropMeshClearance.canPlace` 是 O(传入三角形数)，真实房间有
+    /// 161,600 个三角形；若每格都传全量就是 3.2 亿次检测。这里的范围查询把单个 footprint
+    /// 的输入降到几十个三角形。
+    ///
+    /// 为什么排序去重：哈希会把同一个三角形写进它 AABB 覆盖的每个 cell，`candidateIndices`
+    /// 返回的是 Set（无序且可能重叠）。摆放判定要求"同样几何 → 同样结果"，所以这里
+    /// 精确筛选后按内部索引升序输出。
+    ///
+    /// 为什么还要精确筛选：cell 粒度是 0.25 m，候选集合可能包含 AABB 其实不相交的三角形
+    /// （大三角形横跨好几个 cell）。精确筛选保证结果与暴力遍历全量三角形完全一致。
+    public func triangles(in bounds: WorldPlanarBounds) -> [WorldTriangle] {
+        guard bounds.isValid else { return [] }
+        let candidates = candidateIndices(
+            minimumX: bounds.minimumX,
+            maximumX: bounds.maximumX,
+            minimumZ: bounds.minimumZ,
+            maximumZ: bounds.maximumZ
+        )
+        guard !candidates.isEmpty else { return [] }
+        var result: [WorldTriangle] = []
+        result.reserveCapacity(candidates.count)
+        for index in candidates.sorted() where triangles[index].intersects(bounds) {
+            result.append(triangles[index])
+        }
+        return result
+    }
+}
+
 private func cellRange(
     minimum: Float,
     maximum: Float,
