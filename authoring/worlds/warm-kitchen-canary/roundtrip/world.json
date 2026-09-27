@@ -1,0 +1,1457 @@
+{
+  "activities": [
+    {
+      "action": "sit",
+      "entryWaypointID": "wp.chair",
+      "id": "chair.sit",
+      "interruptible": true,
+      "motionID": "sit.chair",
+      "propIDs": [],
+      "transform": {
+        "position": {
+          "x": -0.3499999940395355,
+          "y": 0.0,
+          "z": 0.6499999761581421
+        },
+        "rotation": {
+          "w": 0.944,
+          "x": 0.0,
+          "y": -0.329,
+          "z": 0.0
+        },
+        "scale": {
+          "x": 1.0,
+          "y": 1.0,
+          "z": 1.0
+        }
+      }
+    },
+    {
+      "action": "walk",
+      "entryWaypointID": "wp.dining.table",
+      "id": "dining.walk",
+      "interruptible": true,
+      "motionID": "walk.forward",
+      "propIDs": [],
+      "transform": {
+        "position": {
+          "x": -0.3499999940395355,
+          "y": 0.0,
+          "z": 1.0
+        },
+        "rotation": {
+          "w": 0.203,
+          "x": 0.0,
+          "y": 0.979,
+          "z": 0.0
+        },
+        "scale": {
+          "x": 1.0,
+          "y": 1.0,
+          "z": 1.0
+        }
+      }
+    },
+    {
+      "action": "idle",
+      "entryWaypointID": "wp.spawn",
+      "id": "home.idle",
+      "interruptible": true,
+      "motionID": "idle.natural",
+      "propIDs": [],
+      "transform": {
+        "position": {
+          "x": 0.0,
+          "y": 0.0,
+          "z": 1.100000023841858
+        },
+        "rotation": {
+          "w": 0.944,
+          "x": 0.0,
+          "y": 0.329,
+          "z": 0.0
+        },
+        "scale": {
+          "x": 1.0,
+          "y": 1.0,
+          "z": 1.0
+        }
+      }
+    },
+    {
+      "action": "turn",
+      "entryWaypointID": "wp.center",
+      "id": "home.turn",
+      "interruptible": true,
+      "motionID": "turn.in-place",
+      "propIDs": [],
+      "transform": {
+        "position": {
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0.20000000298023224
+        },
+        "rotation": {
+          "w": 1.0,
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0.0
+        },
+        "scale": {
+          "x": 1.0,
+          "y": 1.0,
+          "z": 1.0
+        }
+      }
+    },
+    {
+      "action": "walk",
+      "entryWaypointID": "wp.center",
+      "id": "home.walk",
+      "interruptible": true,
+      "motionID": "walk.forward",
+      "propIDs": [],
+      "transform": {
+        "position": {
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0.20000000298023224
+        },
+        "rotation": {
+          "w": 1.0,
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0.0
+        },
+        "scale": {
+          "x": 1.0,
+          "y": 1.0,
+          "z": 1.0
+        }
+      }
+    },
+    {
+      "action": "walk",
+      "entryWaypointID": "wp.kitchen.counter",
+      "id": "kitchen.walk",
+      "interruptible": true,
+      "motionID": "walk.forward",
+      "propIDs": [],
+      "transform": {
+        "position": {
+          "x": 0.3799999952316284,
+          "y": 0.0,
+          "z": -1.2799999713897705
+        },
+        "rotation": {
+          "w": 0.7071068,
+          "x": 0.0,
+          "y": 0.7071068,
+          "z": 0.0
+        },
+        "scale": {
+          "x": 1.0,
+          "y": 1.0,
+          "z": 1.0
+        }
+      }
+    },
+    {
+      "action": "interact",
+      "entryWaypointID": "wp.kitchen.counter",
+      "id": "coffee.brew",
+      "interruptible": true,
+      "motionID": "gmgn.motion.bones.coffee-button-pmx",
+      "propIDs": [],
+      "transform": {
+        "position": {
+          "x": 0.3799999952316284,
+          "y": 0.0,
+          "z": -1.2799999713897705
+        },
+        "rotation": {
+          "w": 0.7071068,
+          "x": 0.0,
+          "y": 0.7071068,
+          "z": 0.0
+        },
+        "scale": {
+          "x": 1.0,
+          "y": 1.0,
+          "z": 1.0
+        }
+      }
+    },
+    {
+      "action": "listenMusic",
+      "entryWaypointID": "wp.speaker",
+      "id": "music.listen",
+      "interruptible": true,
+      "motionID": "listen.music",
+      "propIDs": [],
+      "transform": {
+        "position": {
+          "x": -0.30000001192092896,
+          "y": 0.0,
+          "z": 0.3499999940395355
+        },
+        "rotation": {
+          "w": 0.98,
+          "x": 0.0,
+          "y": 0.199,
+          "z": 0.0
+        },
+        "scale": {
+          "x": 1.0,
+          "y": 1.0,
+          "z": 1.0
+        }
+      }
+    },
+    {
+      "action": "gaze",
+      "entryWaypointID": "wp.window",
+      "id": "window.gaze",
+      "interruptible": true,
+      "motionID": "gaze.window",
+      "propIDs": [],
+      "transform": {
+        "position": {
+          "x": -0.3499999940395355,
+          "y": 0.0,
+          "z": -0.75
+        },
+        "rotation": {
+          "w": 0.7071068,
+          "x": 0.0,
+          "y": -0.7071068,
+          "z": 0.0
+        },
+        "scale": {
+          "x": 1.0,
+          "y": 1.0,
+          "z": 1.0
+        }
+      }
+    }
+  ],
+  "activityDefinitions": [
+    {
+      "activity": {
+        "anchorID": "chair.sit",
+        "type": "sit"
+      },
+      "cooldownSeconds": 30.0,
+      "id": "chair.sit",
+      "interruptible": true,
+      "phases": [
+        {
+          "durationSeconds": null,
+          "motionIDs": [
+            "gmgn.motion.bones.walk-loop-pmx",
+            "gmgn.motion.bones.walk-loop-vrm",
+            "gmgn.motion.ardy-walk-loop-pmx",
+            "gmgn.motion.ardy-walk-loop-vrm",
+            "walk.forward"
+          ],
+          "phase": "approach",
+          "propIDs": [],
+          "requiredAnchorIDs": [
+            "chair.sit"
+          ]
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "enter",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [
+            "gmgn.motion.bones.chair-sit-loop-pmx",
+            "gmgn.motion.bones.chair-sit-loop-vrm",
+            "sit.chair"
+          ],
+          "phase": "loop",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "exit",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "interrupt",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "failed",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        }
+      ]
+    },
+    {
+      "activity": {
+        "destinationID": "wp.dining.table",
+        "type": "walk"
+      },
+      "cooldownSeconds": 0.0,
+      "displayName": "走到餐桌旁",
+      "id": "dining.walk",
+      "interruptible": true,
+      "phases": [
+        {
+          "durationSeconds": null,
+          "motionIDs": [
+            "gmgn.motion.bones.walk-loop-pmx",
+            "gmgn.motion.bones.walk-loop-vrm",
+            "gmgn.motion.ardy-walk-loop-pmx",
+            "gmgn.motion.ardy-walk-loop-vrm",
+            "walk.forward"
+          ],
+          "phase": "approach",
+          "propIDs": [],
+          "requiredAnchorIDs": [
+            "dining.walk"
+          ]
+        },
+        {
+          "durationSeconds": 0.0,
+          "motionIDs": [],
+          "phase": "enter",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": 0.0,
+          "motionIDs": [],
+          "phase": "loop",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": 0.0,
+          "motionIDs": [],
+          "phase": "exit",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "interrupt",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "failed",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        }
+      ]
+    },
+    {
+      "activity": {
+        "type": "idle"
+      },
+      "cooldownSeconds": 0.0,
+      "id": "home.idle",
+      "interruptible": true,
+      "phases": [
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "approach",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "enter",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [
+            "idle.natural"
+          ],
+          "phase": "loop",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "exit",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "interrupt",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "failed",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        }
+      ]
+    },
+    {
+      "activity": {
+        "targetYaw": 0.0,
+        "type": "turn"
+      },
+      "cooldownSeconds": 5.0,
+      "id": "home.turn",
+      "interruptible": true,
+      "phases": [
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "approach",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "enter",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [
+            "turn.in-place"
+          ],
+          "phase": "loop",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "exit",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "interrupt",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "failed",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        }
+      ]
+    },
+    {
+      "activity": {
+        "destinationID": "wp.center",
+        "type": "walk"
+      },
+      "cooldownSeconds": 5.0,
+      "id": "home.walk",
+      "interruptible": true,
+      "phases": [
+        {
+          "durationSeconds": null,
+          "motionIDs": [
+            "gmgn.motion.bones.walk-loop-pmx",
+            "gmgn.motion.bones.walk-loop-vrm",
+            "gmgn.motion.ardy-walk-loop-pmx",
+            "gmgn.motion.ardy-walk-loop-vrm",
+            "walk.forward"
+          ],
+          "phase": "approach",
+          "propIDs": [],
+          "requiredAnchorIDs": [
+            "home.walk"
+          ]
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "enter",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [
+            "gmgn.motion.bones.walk-loop-pmx",
+            "gmgn.motion.bones.walk-loop-vrm",
+            "gmgn.motion.ardy-walk-loop-pmx",
+            "gmgn.motion.ardy-walk-loop-vrm",
+            "walk.forward"
+          ],
+          "phase": "loop",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "exit",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "interrupt",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "failed",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        }
+      ]
+    },
+    {
+      "activity": {
+        "destinationID": "wp.kitchen.counter",
+        "type": "walk"
+      },
+      "cooldownSeconds": 0.0,
+      "displayName": "走到厨房操作台",
+      "id": "kitchen.walk",
+      "interruptible": true,
+      "phases": [
+        {
+          "durationSeconds": null,
+          "motionIDs": [
+            "gmgn.motion.bones.walk-loop-pmx",
+            "gmgn.motion.bones.walk-loop-vrm",
+            "gmgn.motion.ardy-walk-loop-pmx",
+            "gmgn.motion.ardy-walk-loop-vrm",
+            "walk.forward"
+          ],
+          "phase": "approach",
+          "propIDs": [],
+          "requiredAnchorIDs": [
+            "kitchen.walk"
+          ]
+        },
+        {
+          "durationSeconds": 0.0,
+          "motionIDs": [],
+          "phase": "enter",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": 0.0,
+          "motionIDs": [],
+          "phase": "loop",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": 0.0,
+          "motionIDs": [],
+          "phase": "exit",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "interrupt",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "failed",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        }
+      ]
+    },
+    {
+      "activity": {
+        "anchorID": "coffee.brew",
+        "type": "interact"
+      },
+      "cooldownSeconds": 0.0,
+      "displayName": "操作咖啡机",
+      "id": "coffee.brew",
+      "interruptible": true,
+      "phases": [
+        {
+          "durationSeconds": null,
+          "motionIDs": [
+            "gmgn.motion.bones.walk-loop-pmx",
+            "gmgn.motion.bones.walk-loop-vrm",
+            "gmgn.motion.ardy-walk-loop-pmx",
+            "gmgn.motion.ardy-walk-loop-vrm",
+            "walk.forward"
+          ],
+          "phase": "approach",
+          "propIDs": [],
+          "requiredAnchorIDs": [
+            "coffee.brew"
+          ]
+        },
+        {
+          "durationSeconds": 3.5,
+          "motionIDs": [
+            "gmgn.motion.bones.coffee-button-pmx"
+          ],
+          "phase": "enter",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": 6.95,
+          "motionIDs": [
+            "gmgn.motion.generated.a-person-naturally-picks-up-a-coffee-cup-76b63e0f"
+          ],
+          "phase": "loop",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": 0.0,
+          "motionIDs": [],
+          "phase": "exit",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "interrupt",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "failed",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        }
+      ]
+    },
+    {
+      "activity": {
+        "anchorID": "music.listen",
+        "type": "listenMusic"
+      },
+      "cooldownSeconds": 45.0,
+      "id": "music.listen",
+      "interruptible": true,
+      "phases": [
+        {
+          "durationSeconds": null,
+          "motionIDs": [
+            "gmgn.motion.bones.walk-loop-pmx",
+            "gmgn.motion.bones.walk-loop-vrm",
+            "gmgn.motion.ardy-walk-loop-pmx",
+            "gmgn.motion.ardy-walk-loop-vrm",
+            "walk.forward"
+          ],
+          "phase": "approach",
+          "propIDs": [],
+          "requiredAnchorIDs": [
+            "music.listen"
+          ]
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "enter",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [
+            "listen.music"
+          ],
+          "phase": "loop",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "exit",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "interrupt",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "failed",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        }
+      ]
+    },
+    {
+      "activity": {
+        "targetID": "window.gaze",
+        "type": "gaze"
+      },
+      "cooldownSeconds": 20.0,
+      "id": "window.gaze",
+      "interruptible": true,
+      "phases": [
+        {
+          "durationSeconds": null,
+          "motionIDs": [
+            "gmgn.motion.bones.walk-loop-pmx",
+            "gmgn.motion.bones.walk-loop-vrm",
+            "gmgn.motion.ardy-walk-loop-pmx",
+            "gmgn.motion.ardy-walk-loop-vrm",
+            "walk.forward"
+          ],
+          "phase": "approach",
+          "propIDs": [],
+          "requiredAnchorIDs": [
+            "window.gaze"
+          ]
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "enter",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [
+            "gaze.window"
+          ],
+          "phase": "loop",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "exit",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "interrupt",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        },
+        {
+          "durationSeconds": null,
+          "motionIDs": [],
+          "phase": "failed",
+          "propIDs": [],
+          "requiredAnchorIDs": []
+        }
+      ]
+    }
+  ],
+  "calibration": {
+    "metersPerUnit": 1.0,
+    "visualToGameplay": [
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      -1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  },
+  "cameras": [
+    {
+      "farPlane": 250.0,
+      "fieldOfViewDegrees": 66.0,
+      "id": "living.establishing",
+      "nearPlane": 0.05,
+      "transform": {
+        "position": {
+          "x": 0.0,
+          "y": 0.8199999928474426,
+          "z": 2.049999952316284
+        },
+        "rotation": {
+          "w": 1.0,
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0.0
+        },
+        "scale": {
+          "x": 1.0,
+          "y": 1.0,
+          "z": 1.0
+        }
+      }
+    },
+    {
+      "farPlane": 100.0,
+      "fieldOfViewDegrees": 52.0,
+      "id": "window.closeup",
+      "nearPlane": 0.05,
+      "transform": {
+        "position": {
+          "x": -0.10000000149011612,
+          "y": 1.350000023841858,
+          "z": 0.15000000596046448
+        },
+        "rotation": {
+          "w": 0.906,
+          "x": -0.044,
+          "y": -0.42,
+          "z": -0.02
+        },
+        "scale": {
+          "x": 1.0,
+          "y": 1.0,
+          "z": 1.0
+        }
+      }
+    }
+  ],
+  "capabilities": [
+    "activity:chair.sit",
+    "activity:coffee.brew",
+    "activity:dining.walk",
+    "activity:home.idle",
+    "activity:home.turn",
+    "activity:home.walk",
+    "activity:kitchen.walk",
+    "activity:music.listen",
+    "activity:window.gaze",
+    "camera:living.establishing",
+    "camera:window.closeup"
+  ],
+  "collisionVolumes": [
+    {
+      "center": {
+        "x": -0.7799999713897705,
+        "y": 0.44999998807907104,
+        "z": 0.25
+      },
+      "halfExtents": {
+        "x": 0.18000000715255737,
+        "y": 0.44999998807907104,
+        "z": 0.75
+      },
+      "id": "collision.cabinet.left",
+      "isBlocking": true,
+      "rotation": {
+        "w": 1.0,
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      }
+    },
+    {
+      "center": {
+        "x": 0.7799999713897705,
+        "y": 0.44999998807907104,
+        "z": -0.25
+      },
+      "halfExtents": {
+        "x": 0.18000000715255737,
+        "y": 0.44999998807907104,
+        "z": 1.25
+      },
+      "id": "collision.cabinet.right",
+      "isBlocking": true,
+      "rotation": {
+        "w": 1.0,
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      }
+    },
+    {
+      "center": {
+        "x": -0.17499999701976776,
+        "y": 0.44999998807907104,
+        "z": -1.2999999523162842
+      },
+      "halfExtents": {
+        "x": 0.22499999403953552,
+        "y": 0.44999998807907104,
+        "z": 0.25
+      },
+      "id": "collision.counter.back",
+      "isBlocking": true,
+      "rotation": {
+        "w": 1.0,
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      }
+    },
+    {
+      "center": {
+        "x": 0.10000000149011612,
+        "y": 0.5,
+        "z": 0.6499999761581421
+      },
+      "halfExtents": {
+        "x": 0.15000000596046448,
+        "y": 0.5,
+        "z": 0.1599999964237213
+      },
+      "id": "collision.dining.chair",
+      "isBlocking": true,
+      "rotation": {
+        "w": 1.0,
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      }
+    },
+    {
+      "center": {
+        "x": -0.3499999940395355,
+        "y": 0.3799999952316284,
+        "z": 1.5299999713897705
+      },
+      "halfExtents": {
+        "x": 0.44999998807907104,
+        "y": 0.3799999952316284,
+        "z": 0.17000000178813934
+      },
+      "id": "collision.dining.table",
+      "isBlocking": true,
+      "rotation": {
+        "w": 1.0,
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      }
+    },
+    {
+      "center": {
+        "x": 0.0,
+        "y": -0.05000000074505806,
+        "z": 0.0
+      },
+      "halfExtents": {
+        "x": 1.0499999523162842,
+        "y": 0.05000000074505806,
+        "z": 1.75
+      },
+      "id": "collision.floor",
+      "isBlocking": true,
+      "rotation": {
+        "w": 1.0,
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      }
+    },
+    {
+      "center": {
+        "x": -1.0499999523162842,
+        "y": 1.100000023841858,
+        "z": 0.0
+      },
+      "halfExtents": {
+        "x": 0.05000000074505806,
+        "y": 1.100000023841858,
+        "z": 1.75
+      },
+      "id": "collision.wall.east",
+      "isBlocking": true,
+      "rotation": {
+        "w": 1.0,
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      }
+    },
+    {
+      "center": {
+        "x": 0.0,
+        "y": 1.100000023841858,
+        "z": -1.75
+      },
+      "halfExtents": {
+        "x": 1.0499999523162842,
+        "y": 1.100000023841858,
+        "z": 0.05000000074505806
+      },
+      "id": "collision.wall.north",
+      "isBlocking": true,
+      "rotation": {
+        "w": 1.0,
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      }
+    },
+    {
+      "center": {
+        "x": 0.0,
+        "y": 1.100000023841858,
+        "z": 1.75
+      },
+      "halfExtents": {
+        "x": 1.0499999523162842,
+        "y": 1.100000023841858,
+        "z": 0.05000000074505806
+      },
+      "id": "collision.wall.south",
+      "isBlocking": true,
+      "rotation": {
+        "w": 1.0,
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      }
+    },
+    {
+      "center": {
+        "x": 1.0499999523162842,
+        "y": 1.100000023841858,
+        "z": 0.0
+      },
+      "halfExtents": {
+        "x": 0.05000000074505806,
+        "y": 1.100000023841858,
+        "z": 1.75
+      },
+      "id": "collision.wall.west",
+      "isBlocking": true,
+      "rotation": {
+        "w": 1.0,
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      }
+    }
+  ],
+  "displayName": "Warm Kitchen Canary",
+  "packageID": "warm-kitchen-canary",
+  "packageVersion": "1.1.0",
+  "resources": [],
+  "routes": [
+    {
+      "bidirectional": true,
+      "enabled": true,
+      "id": "route.auto.0",
+      "waypointIDs": [
+        "wp.auto.05",
+        "wp.auto.06"
+      ]
+    },
+    {
+      "bidirectional": true,
+      "enabled": true,
+      "id": "route.auto.1",
+      "waypointIDs": [
+        "wp.auto.08",
+        "wp.auto.09"
+      ]
+    },
+    {
+      "bidirectional": true,
+      "enabled": true,
+      "id": "route.auto.2",
+      "waypointIDs": [
+        "wp.auto.09",
+        "wp.auto.10"
+      ]
+    },
+    {
+      "bidirectional": true,
+      "enabled": true,
+      "id": "route.auto.3",
+      "waypointIDs": [
+        "wp.auto.10",
+        "wp.auto.11"
+      ]
+    },
+    {
+      "bidirectional": true,
+      "enabled": true,
+      "id": "route.auto.4",
+      "waypointIDs": [
+        "wp.auto.10",
+        "wp.auto.17"
+      ]
+    },
+    {
+      "bidirectional": true,
+      "enabled": true,
+      "id": "route.auto.5",
+      "waypointIDs": [
+        "wp.auto.11",
+        "wp.auto.18"
+      ]
+    },
+    {
+      "bidirectional": true,
+      "enabled": true,
+      "id": "route.auto.6",
+      "waypointIDs": [
+        "wp.auto.17",
+        "wp.auto.18"
+      ]
+    },
+    {
+      "bidirectional": true,
+      "enabled": true,
+      "id": "route.auto.anchor.wp.center",
+      "waypointIDs": [
+        "wp.center",
+        "wp.auto.17"
+      ]
+    },
+    {
+      "bidirectional": true,
+      "enabled": true,
+      "id": "route.auto.anchor.wp.chair",
+      "waypointIDs": [
+        "wp.chair",
+        "wp.auto.09"
+      ]
+    },
+    {
+      "bidirectional": true,
+      "enabled": true,
+      "id": "route.auto.anchor.wp.dining.table",
+      "waypointIDs": [
+        "wp.dining.table",
+        "wp.auto.08"
+      ]
+    },
+    {
+      "bidirectional": true,
+      "enabled": true,
+      "id": "route.auto.anchor.wp.kitchen.aisle",
+      "waypointIDs": [
+        "wp.kitchen.aisle",
+        "wp.auto.17"
+      ]
+    },
+    {
+      "bidirectional": true,
+      "enabled": true,
+      "id": "route.auto.anchor.wp.kitchen.counter",
+      "waypointIDs": [
+        "wp.kitchen.counter",
+        "wp.auto.18"
+      ]
+    },
+    {
+      "bidirectional": true,
+      "enabled": true,
+      "id": "route.auto.anchor.wp.speaker",
+      "waypointIDs": [
+        "wp.speaker",
+        "wp.auto.09"
+      ]
+    },
+    {
+      "bidirectional": true,
+      "enabled": true,
+      "id": "route.auto.anchor.wp.turn",
+      "waypointIDs": [
+        "wp.turn",
+        "wp.auto.17"
+      ]
+    },
+    {
+      "bidirectional": true,
+      "enabled": true,
+      "id": "route.auto.anchor.wp.window",
+      "waypointIDs": [
+        "wp.window",
+        "wp.auto.11"
+      ]
+    },
+    {
+      "bidirectional": true,
+      "enabled": true,
+      "id": "route.auto.spawn",
+      "waypointIDs": [
+        "wp.spawn",
+        "wp.auto.08"
+      ]
+    },
+    {
+      "bidirectional": true,
+      "enabled": true,
+      "id": "route.home-loop",
+      "waypointIDs": [
+        "wp.spawn",
+        "wp.center",
+        "wp.chair",
+        "wp.speaker"
+      ]
+    },
+    {
+      "bidirectional": true,
+      "enabled": true,
+      "id": "route.kitchen-dining",
+      "waypointIDs": [
+        "wp.kitchen.counter",
+        "wp.kitchen.aisle",
+        "wp.center",
+        "wp.dining.table"
+      ]
+    },
+    {
+      "bidirectional": true,
+      "enabled": true,
+      "id": "route.window",
+      "waypointIDs": [
+        "wp.spawn",
+        "wp.center",
+        "wp.window"
+      ]
+    }
+  ],
+  "schemaVersion": 1,
+  "spawn": {
+    "position": {
+      "x": 0.0,
+      "y": 0.0,
+      "z": 1.100000023841858
+    },
+    "rotation": {
+      "w": 0.944,
+      "x": 0.0,
+      "y": 0.329,
+      "z": 0.0
+    },
+    "scale": {
+      "x": 1.0,
+      "y": 1.0,
+      "z": 1.0
+    }
+  },
+  "waypoints": [
+    {
+      "arrivalRadius": 0.2,
+      "enabled": true,
+      "id": "wp.auto.05",
+      "position": {
+        "x": -0.7499999403953552,
+        "y": 0.0,
+        "z": -1.0138888359069824
+      }
+    },
+    {
+      "arrivalRadius": 0.2,
+      "enabled": true,
+      "id": "wp.auto.06",
+      "position": {
+        "x": -0.7833333015441895,
+        "y": 0.0,
+        "z": -1.4722222089767456
+      }
+    },
+    {
+      "arrivalRadius": 0.2,
+      "enabled": true,
+      "id": "wp.auto.08",
+      "position": {
+        "x": -0.2999999523162842,
+        "y": 0.0,
+        "z": 1.0
+      }
+    },
+    {
+      "arrivalRadius": 0.2,
+      "enabled": true,
+      "id": "wp.auto.09",
+      "position": {
+        "x": -0.2999999523162842,
+        "y": 0.0,
+        "z": 0.5
+      }
+    },
+    {
+      "arrivalRadius": 0.2,
+      "enabled": true,
+      "id": "wp.auto.10",
+      "position": {
+        "x": -0.2333332896232605,
+        "y": 0.0,
+        "z": -0.06944441795349121
+      }
+    },
+    {
+      "arrivalRadius": 0.2,
+      "enabled": true,
+      "id": "wp.auto.11",
+      "position": {
+        "x": -0.29999998211860657,
+        "y": 0.0,
+        "z": -0.5
+      }
+    },
+    {
+      "arrivalRadius": 0.2,
+      "enabled": true,
+      "id": "wp.auto.17",
+      "position": {
+        "x": 0.1250000298023224,
+        "y": 0.0,
+        "z": 0.027777791023254395
+      }
+    },
+    {
+      "arrivalRadius": 0.2,
+      "enabled": true,
+      "id": "wp.auto.18",
+      "position": {
+        "x": 0.20000004768371582,
+        "y": 0.0,
+        "z": -0.5
+      }
+    },
+    {
+      "arrivalRadius": 0.22,
+      "enabled": true,
+      "id": "wp.center",
+      "position": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.20000000298023224
+      }
+    },
+    {
+      "arrivalRadius": 0.18,
+      "enabled": true,
+      "id": "wp.chair",
+      "position": {
+        "x": -0.3499999940395355,
+        "y": 0.0,
+        "z": 0.6499999761581421
+      }
+    },
+    {
+      "arrivalRadius": 0.18,
+      "enabled": true,
+      "id": "wp.dining.table",
+      "position": {
+        "x": -0.3499999940395355,
+        "y": 0.0,
+        "z": 1.0
+      }
+    },
+    {
+      "arrivalRadius": 0.18,
+      "enabled": true,
+      "id": "wp.kitchen.aisle",
+      "position": {
+        "x": 0.10000000149011612,
+        "y": 0.0,
+        "z": -0.20000000298023224
+      }
+    },
+    {
+      "arrivalRadius": 0.18,
+      "enabled": true,
+      "id": "wp.kitchen.counter",
+      "position": {
+        "x": 0.3799999952316284,
+        "y": 0.0,
+        "z": -1.2799999713897705
+      }
+    },
+    {
+      "arrivalRadius": 0.2,
+      "enabled": true,
+      "id": "wp.spawn",
+      "position": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 1.100000023841858
+      }
+    },
+    {
+      "arrivalRadius": 0.2,
+      "enabled": true,
+      "id": "wp.speaker",
+      "position": {
+        "x": -0.30000001192092896,
+        "y": 0.0,
+        "z": 0.3499999940395355
+      }
+    },
+    {
+      "arrivalRadius": 0.2,
+      "enabled": true,
+      "id": "wp.turn",
+      "position": {
+        "x": 0.30000001192092896,
+        "y": 0.0,
+        "z": 0.0
+      }
+    },
+    {
+      "arrivalRadius": 0.18,
+      "enabled": true,
+      "id": "wp.window",
+      "position": {
+        "x": -0.3499999940395355,
+        "y": 0.0,
+        "z": -0.75
+      }
+    }
+  ],
+  "worldID": "world-labs-example-warm-kitchen"
+}
