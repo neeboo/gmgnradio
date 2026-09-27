@@ -129,6 +129,7 @@
 		6692E2E943A70B2A96CB57F0 /* CandidatePoolBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6140AFA7ADC6446BA3A1508C /* CandidatePoolBuilder.swift */; };
 		68928B80FD3BD85BC656E924 /* ElevenLabs in Frameworks */ = {isa = PBXBuildFile; productRef = C87548AD309AC59561DE9A6E /* ElevenLabs */; };
 		68B069C0D0B6FC9CB8D4E3B9 /* StageCameraModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B2A3586C14E9FEC3F15B9AF /* StageCameraModel.swift */; };
+		68D169AB1772AA516F212FB1 /* PropSupportGrid.metal in Sources */ = {isa = PBXBuildFile; fileRef = 21A756B3302C482BE4A15842 /* PropSupportGrid.metal */; };
 		69E8DF516C69EFDBC1CE1347 /* StageCameraCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39349160925540EB8F375932 /* StageCameraCoordinator.swift */; };
 		6A39085D638B377D449E931E /* StageCameraCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB8A88527BC23EB19602B4AB /* StageCameraCoordinatorTests.swift */; };
 		6B5712B6CB1BCDEE82542F67 /* ResidentPerformanceMotionPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 193229015897C584DE49ABC2 /* ResidentPerformanceMotionPolicy.swift */; };
@@ -215,6 +216,7 @@
 		BB0112E2A1FB4A53193103FD /* WorldAgentContext.swift in Sources */ = {isa = PBXBuildFile; fileRef = 015185F407965D5142B0841B /* WorldAgentContext.swift */; };
 		BC40F7C048A99BA508438443 /* AudioFeatureFrame.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9AE1C62891D06F5AAEE8F1BD /* AudioFeatureFrame.swift */; };
 		BCE1B3E3076E3BD5439597E4 /* RemoteMotionLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E16B502423D8CB2B119C833 /* RemoteMotionLibrary.swift */; };
+		BD7A533625344B6740D9529A /* PropSupportGridRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 652898977757565954C3204B /* PropSupportGridRenderer.swift */; };
 		BDC05DA87665B003D98568B7 /* PMXMaterialCompatibility.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1D9F054780A912DD632D2B6 /* PMXMaterialCompatibility.swift */; };
 		BE07E362E209AC1F9219CBB3 /* VMDToVRMClipAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE18DAB4452CEAD1448BC100 /* VMDToVRMClipAdapter.swift */; };
 		BEB4C8BCA7C17AD706CD5267 /* GLTFMetalKit in Frameworks */ = {isa = PBXBuildFile; productRef = C3FCCC8D1C10983C138146E3 /* GLTFMetalKit */; };
@@ -343,6 +345,7 @@
 		20C65C2BD0FD2417BAFBD387 /* PresenceCommandService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceCommandService.swift; sourceTree = "<group>"; };
 		21262FD0142A1963EDD81FA1 /* MotionDistribution */ = {isa = PBXFileReference; lastKnownFileType = folder; name = MotionDistribution; path = Packages/MotionDistribution; sourceTree = SOURCE_ROOT; };
 		216A6D94509E4915BCC18C7C /* RealtimeDJSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeDJSession.swift; sourceTree = "<group>"; };
+		21A756B3302C482BE4A15842 /* PropSupportGrid.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = PropSupportGrid.metal; sourceTree = "<group>"; };
 		22092892913901B6B9A639FF /* PropGenerationStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PropGenerationStore.swift; sourceTree = "<group>"; };
 		2598E4800DAB1870BB2DBC4A /* AudioDeviceMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioDeviceMonitor.swift; sourceTree = "<group>"; };
 		261885CA8D0EB71B1E5F27A1 /* MusicProviderWebLoginPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicProviderWebLoginPolicyTests.swift; sourceTree = "<group>"; };
@@ -416,6 +419,7 @@
 		62F1E2237122DE6B5777545D /* ResidentCodexTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentCodexTransport.swift; sourceTree = "<group>"; };
 		63B9090B88216BD89FF23432 /* QQMusicProviderClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QQMusicProviderClient.swift; sourceTree = "<group>"; };
 		64AD6CEA51CDFB9A0C88D625 /* MarbleWorldCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarbleWorldCache.swift; sourceTree = "<group>"; };
+		652898977757565954C3204B /* PropSupportGridRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PropSupportGridRenderer.swift; sourceTree = "<group>"; };
 		686B5AC0FF2E46498D118088 /* DJProgramStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DJProgramStoreTests.swift; sourceTree = "<group>"; };
 		6922C4A5824C1A1AA82A0B41 /* ResidentSystemInboxStateStorage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentSystemInboxStateStorage.swift; sourceTree = "<group>"; };
 		6A98371838646D4018D596A5 /* PresenceSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceSettingsView.swift; sourceTree = "<group>"; };
@@ -963,6 +967,7 @@
 				7042ABB00311D453A5D5E557 /* PropImagePreparation.swift */,
 				8C764576419E37F7B13BAB58 /* PropSupportGridPicker.swift */,
 				3ECC82D2CA5287308B9ACA45 /* PropSupportGridPresentation.swift */,
+				652898977757565954C3204B /* PropSupportGridRenderer.swift */,
 				AC7A4B6E567E74C7977C92ED /* PropTaskDaemonClient.swift */,
 				0E16B502423D8CB2B119C833 /* RemoteMotionLibrary.swift */,
 				C12A593D2E39AA38BDE94F2C /* ResidentImageAttachment.swift */,
@@ -1165,6 +1170,7 @@
 			children = (
 				CE95E971E1A8C2085882DD3C /* Immersive.metal */,
 				4374B4687559AEDE957A3117 /* Orb.metal */,
+				21A756B3302C482BE4A15842 /* PropSupportGrid.metal */,
 				E13F2FD5A9D73C17F8A9C25F /* Stage.metal */,
 			);
 			path = Shaders;
@@ -1491,8 +1497,10 @@
 				A6C74A559603EC578B1554EC /* PropGenerationSettingsSection.swift in Sources */,
 				F6DB346A7C0E9037A9199668 /* PropGenerationStore.swift in Sources */,
 				977A6550B9EDEDE80B2D0915 /* PropImagePreparation.swift in Sources */,
+				68D169AB1772AA516F212FB1 /* PropSupportGrid.metal in Sources */,
 				0183599BCE0055F20464F7CA /* PropSupportGridPicker.swift in Sources */,
 				3FB43FFEC22AAD70D446E154 /* PropSupportGridPresentation.swift in Sources */,
+				BD7A533625344B6740D9529A /* PropSupportGridRenderer.swift in Sources */,
 				49CF26C41737F0892F222A5D /* PropTaskDaemonClient.swift in Sources */,
 				4AAB471D551D8A088912E7A4 /* QQMusicProviderClient.swift in Sources */,
 				B3D5D78DF1FC2D95AE00D4DA /* RadioPluginAvailability.swift in Sources */,
