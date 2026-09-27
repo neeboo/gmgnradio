@@ -26,9 +26,18 @@ for required in ["var worldID:", "var activeActivityID:", "var message:", "func 
 let navigation = declaration("final class GMGNSettingsNavigation:", in: settings)
 let run = declaration("func runLivingWorldActivity(id: String) {", in: app)
 let stop = declaration("func stopLivingWorldActivity() {", in: app)
+// 生产代码把菜单定义来源从 context.manifest.activityDefinitions 重构为
+// context.activityCatalog.definitions（App/GMGNRadioApp.swift 中
+// LivingWorldActivityMenuStore.shared.update(...) 的实参）。行为没有回归：传给
+// definitions: 的实参仍然必须按 isResidentActivityAvailable($0.id) 过滤。
+// 因此这里锚定该唯一调用点的 definitions: 标签，再要求其后紧跟同一条「按居民可用性
+// 过滤 .definitions」的表达式，而不是放宽成"源码里出现过 filter"。
 guard let availability = run.range(of: "guard isResidentActivityAvailable(id)"),
       let start = run.range(of: "try context.startActivity"), availability.lowerBound < start.lowerBound,
-      app.contains("definitions: context.manifest.activityDefinitions.filter { isResidentActivityAvailable($0.id) }") else {
+      let menuUpdate = app.range(of: "LivingWorldActivityMenuStore.shared.update("),
+      let definitionsLabel = app.range(of: "definitions:", range: menuUpdate.upperBound..<app.endIndex),
+      app[definitionsLabel.upperBound...].prefix(240)
+          .contains(".definitions.filter { isResidentActivityAvailable($0.id) }") else {
     print("FAIL: activity menu must filter and recheck actual avatar/motion availability"); exit(1)
 }
 for method in [run, stop] {

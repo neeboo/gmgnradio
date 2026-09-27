@@ -36,7 +36,13 @@ let dependencies = "import SwiftUI\nimport Observation\n"
     + declaration("enum ResidentStatusNoticeKind:", in: try read("Agent/ResidentAgentLoop.swift")) + "\n"
     + declaration("struct ResidentStatusNoticeDecision:", in: try read("Agent/ResidentAgentLoop.swift")) + "\n"
     + declaration("enum ResidentStatusNoticeMerge", in: try read("Agent/ResidentAgentLoop.swift")) + "\n"
-    + declaration("enum LiveCamWindowDragPhase:", in: try read("DesktopPresence/WindowPlacement.swift")) + "\n@MainActor\n@Observable\n"
+    + declaration("enum LiveCamWindowDragPhase:", in: try read("DesktopPresence/WindowPlacement.swift")) + "\n"
+    // Live Cam 控件依赖的两个跨文件声明：共享的对话记录行模型（Sendable，两个聊天
+    // 表面口径一致）与系统消息入口按钮（AppKit，@MainActor）。此前缺失时编译器只会
+    // 报 "cannot find type" 并连带退化成 "cannot infer contextual base"，因此必须把
+    // 真实声明补进抽取清单，而不是放宽或删除任何断言。
+    + declaration("struct ResidentChatTranscriptLine:", in: try read("Agent/ResidentAgentLoop.swift")) + "\n@MainActor\n"
+    + declaration("final class ResidentSystemMailBadgeButton: NSView {", in: try read("Presence/ResidentSystemInboxUI.swift")) + "\n@MainActor\n@Observable\n"
     + declaration("final class AgentSpeechStatusStore", in: try read("Agent/AgentSpeech.swift")) + "\n@MainActor\n"
     + declaration("struct ResidentSpeechErrorNotice:", in: try read("VisualEngine/StageOverlayView.swift")) + "\n@MainActor\n"
     + declaration("struct WishMachineTaskStatusView:", in: try read("VisualEngine/StageOverlayView.swift"))

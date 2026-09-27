@@ -107,6 +107,15 @@ final class Content {
     let programRail = View()
     let visualPicker = View()
     let overlayState = View()
+    // 生产里的空间任务反馈浮层是 NSHostingView<WishMachineTaskStatusView>，初始即为
+    // 隐藏（只在空间呈现请求下可见），applySpatialPresentation 负责驱动其可见性。这里
+    // 补一个同名 mock，让抽取体保持原样编译，而不是删掉那一句生产代码；并让它从"隐藏"
+    // 起步，使下面进入/退出的两条可见性断言都真正依赖生产那一句，而非 mock 默认值。
+    let residentTaskFeedback: View = {
+        let view = View()
+        view.isHidden = true
+        return view
+    }()
     var isResidentChatExpanded = false
     var isProgramRailVisible = false
     var isVisualPickerVisible = false
@@ -149,6 +158,7 @@ for uiFirst in [true, false] {
         let label = "uiFirst=\(uiFirst) visit=\(visit)"
         store.requestWorldPresentation()
         check(store.isWorldVisible, "\(label): store is visible")
+        check(!content.residentTaskFeedback.isHidden, "\(label): resident task feedback follows entered world")
         check(!content.renderSurfaceContainer.isHidden, "\(label): world remains shown after synchronous attach")
         check(!content.worldInteractionView.isHidden, "\(label): world accepts input")
         check(content.worldLoadingView.isHidden, "\(label): loading indicator is hidden")
@@ -156,6 +166,7 @@ for uiFirst in [true, false] {
         check(renderCache, "\(label): other observer does not retain stale false")
         store.exitWorld()
         check(!store.isWorldVisible && !renderCache, "\(label): exit reaches all observers")
+        check(content.residentTaskFeedback.isHidden, "\(label): exit hides resident task feedback")
         check(content.renderSurfaceContainer.isHidden, "\(label): exited world is hidden")
         check(content.worldLoadingView.isHidden, "\(label): exit does not leave loading")
     }

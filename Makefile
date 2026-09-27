@@ -60,6 +60,12 @@ test-python:
 test-harnesses:
 	swift tools/test-first-use-guidance.swift
 	swift tools/test-space-first-defaults.swift
+	swift tools/test-stage-control-actions.swift
+	swift tools/test-stage-control-panels.swift
+	swift tools/test-space-presentation.swift
+	swift tools/test-livecam-avatar-framing.swift
+	swift tools/test-livecam-panel-sizing.swift
+	swift tools/test-stage-avatar-follow-smoothing.swift
 	swift tools/test-living-resident-loop.swift
 	swift tools/test-resident-status-lifecycle.swift
 	swift tools/test-resident-chat-transcript.swift
