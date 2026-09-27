@@ -406,3 +406,16 @@ public protocol WorldPropSupportQuerying: WorldCollisionQuerying {
 | 多高度层（桌面/台阶）语义不清 | 派生输出显式带"层"，UI 选层 |
 | 重烘焙产出与既有 `layout.json` 不一致 | 先跑 `test_cabin_navigation_package.py` 的重建比对再动 app 资源 |
 | 真人手感无法离线验证 | 明确列为真人验收项 |
+
+## 11. 已知失效验证资产（与 P2 无关，勿误判为回归）
+
+实施 P2 时发现 3 个 `tools/test-*.swift` 早就是坏的。我用干净 worktree 在改动前的提交上复现过，
+**确认它们的失败与 P2 无关**。它们都不在 `make test-harnesses` 里，所以一直处于漂移状态：
+
+| 脚本 | 失败方式 |
+| --- | --- |
+| `test-resident-speech-avatar.swift` | 编译失败：`value of type 'App' has no member 'r…'` |
+| `test-wish-machine-app-runtime.swift` | 编译失败：`cannot find 'registerResidentMemoryTurn' in scope` |
+| `test-wish-machine-delivery-loop.swift` | 顶层运行时错误（退出码 5 / 133 不稳定） |
+
+修它们需要逐个决定"现在的等价断言是什么"，属于独立的一小批工作。**不要把它们的失败算到 P2 头上。**
