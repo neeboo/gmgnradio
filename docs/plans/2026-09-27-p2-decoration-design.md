@@ -182,6 +182,60 @@ guard cache.count+loads.count < 5 else { throw WishMachineOutputError.renderUnav
 
 今天编辑器里的 2 个"面"（`ResidentPropEditorSurface`）**正好对应未来的 2 个"层"**。UI 上那个"选面"下拉框不用删，升级为"选层"（地面 / 桌面 / 台阶）：用户习惯不变，只是每层从 0.8 m 小方块变成整片区域。
 
+### 5.5 三方接口（已定，基于工作项 1–3 实际产出的 API）
+
+**格子（工作项 1–2 已产出）**
+
+```swift
+PropSupportGrid                                  // spacing / bounds / parameters
+  .layers: [PropSupportLayerRef]                 // 扁平、确定性顺序（x → z → layer）
+  .layers(at: PropSupportColumn) -> [PropSupportLayer]
+  .contains(_ column: PropSupportColumn) -> Bool
+  .nearestLayer(to:maximumDistance:) -> PropSupportLayerRef?
+
+PropSupportLayerRef { column: PropSupportColumn; layer: PropSupportLayer }
+  .supportHeight / .center                       // 便捷访问
+```
+
+**判定（工作项 3 已产出）**
+
+```swift
+WorldPlanarFootprint(size:yaw:)                  // .halfExtents / .center(anchoredAt:spacing:) / .columns(...)
+PropPlacementEvaluator.evaluate(footprint:height:at:grid:collision:blockingVolumes:placedProps:) -> PropSupportBlockReason?
+PropSupportBlockReason                           // 已带 errorDescription（中文，可直接做悬停提示）
+WorldPropBoxOverlap.overlaps(...)                // OBB SAT
+```
+
+**工作项 7（渲染）**：新增 `PropSupportGridRenderer`，签名照搬 `ResidentPropRenderer.render`：
+
+```swift
+func render(commandBuffer:colorTexture:depthTexture:viewProjection:cameraPosition:
+            reversedDepth:preservesDepth:grid:hovered:evaluate:) -> Bool
+```
+
+- `colorAttachments[0].loadAction = .load`（叠加在 splat 场景之上）
+- `depthAttachment` 复用**同一个**深度纹理做深度测试 → **墙体遮挡自动成立**（§5.1）
+- 一格一个实例化 quad，`y = supportHeight + 0.001` 防 z-fighting
+- 颜色由 `evaluate` 闭包给出的 `PropSupportBlockReason?` 决定（nil = 绿）
+- 距离淡出；超出阈值整格不画
+
+**工作项 8（拾取）**：**不需要对三角形求交。**
+
+```swift
+// 1) 用 viewProjection 的逆矩阵把光标 NDC 反投影成射线
+// 2) 对每个候选层求交：平面为 y = supportHeight，t = (supportHeight - origin.y) / dir.y
+// 3) 交点 (x, z) → 用 grid.spacing 取整成 PropSupportColumn → grid.contains 确认
+// 4) 多层命中时取最近的 t
+```
+
+纯 CPU、纯数学，**可离线单测**（合成 viewProjection + 合成 grid）。
+
+**工作项 9（编辑器）**
+- `ResidentPropEditorState` 增加 `hovered: PropSupportLayerRef?` 与 `blockReason: PropSupportBlockReason?`
+- 放置命令的 `surfaceID` 从"手写的面 id"改为**层名**（地面 / 桌面 / 台阶），精确格子由位置反推 —— 这样 `WorldState` 保持紧凑，且与今天的 `metadata["gmgn.support-surface.v1"]` 兼容
+- `ResidentPropPlacementService` 里"必须落在某个面内 + `abs(y - surface.center.y) < 0.005`"的校验，替换为 `PropPlacementEvaluator` + footprint 检查
+- 交互：悬停高亮 → 点击放下、拖动移动、`R`/`,`/`.` 90° 步进旋转、Esc 取消、Delete 收回、Cmd+Z 撤销
+
 ## 6. 实施约束（已核实，直接影响可行性）
 
 ### 6.1 `canPlace` 是 O(三角形数)，必须做空间分桶
