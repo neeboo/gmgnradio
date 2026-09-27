@@ -629,3 +629,107 @@ private struct SlopedGroundWorld: WorldCollisionQuerying {
         risePerMeter * position.x
     }
 }
+
+@Test("Placed props block the approach, and an unobstructed route is unchanged")
+func executorConsultsCollisionWhenRouting() throws {
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let definition = executorDefinition(
+        id: "walk.window",
+        activity: .walk(destinationID: "wp.window")
+    )
+    // 唯一通路：spawn(0,0,0) → window(2,0,0)，没有替代边。
+    let router = WaypointNavigationGraph(
+        waypoints: [
+            WorldWaypoint(id: "wp.spawn", position: .zero, arrivalRadius: 0.1, enabled: true),
+            WorldWaypoint(
+                id: "wp.window",
+                position: WorldVector3(x: 2, y: 0, z: 0),
+                arrivalRadius: 0.1,
+                enabled: true
+            ),
+        ],
+        routes: [
+            WorldRoute(
+                id: "route.window",
+                waypointIDs: ["wp.spawn", "wp.window"],
+                bidirectional: true,
+                enabled: true
+            ),
+        ]
+    )
+
+    // 一块合成平地。注意**不能**用空的 CollisionVolumeWorld 代表"无障碍"：它没有地面，
+    // groundHeight 返回 nil，于是 canTraverse 处处失败 —— 那不是无障碍世界。
+    let floor = [
+        WorldTriangle(
+            SIMD3<Float>(-10, 0, -10), SIMD3<Float>(10, 0, -10), SIMD3<Float>(10, 0, 10)
+        ),
+        WorldTriangle(
+            SIMD3<Float>(-10, 0, -10), SIMD3<Float>(10, 0, 10), SIMD3<Float>(-10, 0, 10)
+        ),
+    ]
+
+    // 1) 无障碍：接入 collisionQuery 之后，正常路径必须与今天完全一致（走完并进入 enter）。
+    var clear = ActivityExecutor(
+        position: .zero,
+        walkingSpeed: 2,
+        collisionQuery: TriangleMeshCollisionWorld(triangles: floor)
+    )
+    _ = clear.start(
+        scheduled(definition, priority: .explicitUserRequest, at: now),
+        definition: definition,
+        at: now
+    )
+    #expect(throws: Never.self) { try clear.acquireApproach(using: router) }
+    #expect(clear.tick(deltaTime: 1).contains(
+        .phaseChanged(activityID: definition.id, phase: .enter)
+    ))
+    #expect(clear.status.position == WorldVector3(x: 2, y: 0, z: 0))
+
+    // 2) 在唯一通路上放一个阻塞体积：规划必须发现走不通并抛 unreachable。
+    //    这条是"闭包真的被查询"的证据 —— 没有接线时它会照旧穿过去并规划成功。
+    // 地面来自网格、障碍来自体积，与 App 里的 MarbleLivingCabinCollisionWorld 同构。
+    // 刻意**不能**只留体积：那样就没有地面，canTraverse 会因为"没有地面"而失败，
+    // 测试就会为错误的原因通过。
+    let blocked = TestGroundWithObstacle(
+        ground: TriangleMeshCollisionWorld(triangles: floor),
+        obstacles: CollisionVolumeWorld(volumes: [
+            WorldCollisionVolume(
+                id: "prop.blocking",
+                center: WorldVector3(x: 1, y: 0.9, z: 0),
+                halfExtents: WorldVector3(x: 0.4, y: 0.9, z: 0.4),
+                rotation: WorldQuaternion(x: 0, y: 0, z: 0, w: 1),
+                isBlocking: true
+            ),
+        ])
+    )
+    var executor = ActivityExecutor(
+        position: .zero,
+        walkingSpeed: 2,
+        collisionQuery: blocked
+    )
+    _ = executor.start(
+        scheduled(definition, priority: .explicitUserRequest, at: now),
+        definition: definition,
+        at: now
+    )
+    #expect(throws: WorldNavigationError.unreachable(destinationID: "wp.window")) {
+        try executor.acquireApproach(using: router)
+    }
+}
+
+/// 测试用的组合世界：地面取自网格，障碍取自体积（等价于 App 的
+/// `MarbleLivingCabinCollisionWorld`）。分开的理由见上面 blocked 用例的注释。
+private struct TestGroundWithObstacle: WorldCollisionQuerying {
+    let ground: any WorldCollisionQuerying
+    let obstacles: CollisionVolumeWorld
+
+    func canOccupy(_ capsule: WorldCapsule, at position: SIMD3<Float>) -> Bool {
+        ground.canOccupy(capsule, at: position) && obstacles.canOccupy(capsule, at: position)
+    }
+
+    func groundHeight(at position: SIMD3<Float>) -> Float? {
+        ground.groundHeight(at: position)
+    }
+}
+

@@ -44,6 +44,17 @@ public protocol WorldNavigationRouting: Sendable {
         from position: SIMD3<Float>,
         to anchorID: String
     ) throws -> WorldPath
+
+    /// 让调用方把**运行时可达性**注入路径规划。
+    ///
+    /// 物件摆放之后成为障碍，而导航图是在烘焙时建好的。图不会为此重建：它在提议路径上
+    /// 逐段调用这个闭包，发现受阻的有向边就记下来并改道（惰性重规划）。所以"居民绕过
+    /// 家具"不需要重烘焙，只需要把碰撞世界接进来。
+    func route(
+        from position: SIMD3<Float>,
+        to anchorID: String,
+        canTraverse: (SIMD3<Float>, SIMD3<Float>) -> Bool
+    ) throws -> WorldPath
 }
 
 /// A vertical character capsule whose `position` is interpreted as its feet.

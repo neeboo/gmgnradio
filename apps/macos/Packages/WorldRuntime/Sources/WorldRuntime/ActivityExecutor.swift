@@ -226,7 +226,23 @@ public struct ActivityExecutor: Sendable {
             throw ActivityExecutorError.noActiveApproach
         }
 
-        let path = try router.route(from: position.simd3, to: destinationID)
+        // 物件摆放后成为导航障碍：把由碰撞世界推出的可达性交给路径规划，图会用它在
+        // 候选边上做碰撞查询并惰性重规划（绕开家具），而不是撞上去才发现受阻。
+        //
+        // 没有碰撞世界时沿用本文件既有的 fail-open 约定（见 `resolvedDestination` 的
+        // `guard let collisionQuery else { return destination }`）：导航不是授权边界，
+        // 摆放判定才是。
+        let canTraverse: (SIMD3<Float>, SIMD3<Float>) -> Bool
+        if let collisionQuery {
+            let capsule = capsule
+            let maximumStepHeight = maximumStepHeight
+            canTraverse = { start, end in
+                collisionQuery.canTraverse(capsule, from: start, to: end, maximumStepHeight: maximumStepHeight)
+            }
+        } else {
+            canTraverse = { _, _ in true }
+        }
+        let path = try router.route(from: position.simd3, to: destinationID, canTraverse: canTraverse)
         return try supplyApproach(
             ActivityApproachPlan(waypoints: path.points, targetYaw: targetYaw)
         )
