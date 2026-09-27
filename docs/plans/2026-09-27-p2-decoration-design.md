@@ -44,19 +44,26 @@
 
 ## 3. 三个决定
 
-### 决定 1：物件不阻挡通行，但放置不得切断连通性
+### 决定 1：物件阻挡导航（Sims 式），靠已有的运行时重规划实现 —— 不需要重烘焙
 
-今天已经是**半约束**（`blockedRoute`）。放开后会变尖锐：物件多了能把点唱机围死。
+Sims 里的家具是**真的挡路**的：Sim 会绕过沙发，你把门堵死他就过不去。所以"像 Sims"就意味着**物件阻挡导航**。
 
-| 方案 | 代价 |
+**关键发现：这套机制仓库里已经写好了，只是没接上。**
+
+| 已核实的事实 | 位置 |
 | --- | --- |
-| (a) 物件成为导航障碍 | 每放一件都要重算走路地图；放置时卡顿 |
-| **(b) 物件不阻挡通行，但放置时禁止切断活动入口连通性** | 只需一次可达性检查；不重烘焙 |
-| (c) 完全不管 | 用户能把角色关在外面，像 bug |
+| 路径规划**已经支持**惰性重规划：在提议路径上做碰撞查询，发现受阻的有向边就加入 `blockedEdges` 并**重新规划** | `WaypointNavigationGraph.route(from:to:canTraverse:)`（:117-211） |
+| `ActivityExecutor` **已经持有**碰撞世界，并在逐步移动时校验 `canOccupy` + `canTraverse` | `ActivityExecutor.swift:96`、`:509-515` |
+| 但它算路径时调的是**不检查**的那个重载（`canTraverse: { _,_ in true }`） | `ActivityExecutor.swift:229` |
+| 物件**已经在**碰撞世界里 | `MarbleLivingCabinCollisionWorld`（`LivingWorldBootstrap.swift:5-16`）组合 `environment` + `props` |
 
-**采用 (b)。** 判据：以本次放置为附加障碍，检查 6 个活动入口是否仍能从 `wp.spawn` 到达；不可达则拒绝并给出可读原因。用已有的 `WaypointNavigationGraph`（309 行，含惰性重规划）。
+**所以改动很小**：让 `ActivityExecutor` 把由 `collisionQuery` 推出的 `canTraverse` 传进 `route(from:to:canTraverse:)`。已有的惰性重规划立刻生效——**居民会绕过你放的家具，而不是撞上去然后报"受阻"**。
 
-代价说清楚：**角色会从你放的家具上走过去。** 对一个以装修为主的功能，这比角色卡在半路好。
+**代价**：无重烘焙，无放置卡顿。每次路径规划多做几次局部碰撞查询，而图的实现已有缓存。
+
+**并且 `supportReservation` 可以直接删除**（设计因此大幅简化，见决定 3）：它今天的作用是"让 waypoint 不要生成在那两个手写摆放面上"。既然物件改为在运行时通过受阻边阻挡通行，就**不需要** waypoint 回避摆放区了。实测代价：`report.rejectedEdges.supportReservation = 3`——删掉只会让烘焙图多出约 3 个点。
+
+**放置时的连通性检查**从"必需"降为"体验优化"（Sims 会提示你堵死了通路）。它可以后做，且不是本期的阻塞项。
 
 ### 决定 2：取消件数上限
 
@@ -68,19 +75,21 @@
 
 渲染端按距离与重要性裁剪（近处优先、远处淡出），必要时降级；**绝不因渲染理由拒绝用户的放置**。因此压测决定的是「同时可见多少、多远内可见」，不是「能放多少」。
 
-### 决定 3：门禁改锁输入与算法，不再锁手写产物
+### 决定 3：门禁不再锁摆放面 —— 那个耦合直接消失，而不是被管理
+
+因为决定 1 删除了 `supportReservation`，摆放面**不再是导航烘焙的输入**，所以不需要"改锁什么"的折中方案：
 
 | | 现在 | 改成 |
 | --- | --- | --- |
-| 哈希对象 | `ResidentPropPlacementConfiguration.swift` 的字节 | `collider.glb` SHA-256、`framing`、`collisionVolumes`、`manualWaypoints`、**派生算法版本号 + 派生参数** |
+| `supportReservation` | 依据两个手写面预留 0.25 / 0.30 m 净空 | **删除**（实测只影响 3 个候选点） |
+| `build-package.mjs` 里的 `propSupportConfigurationSHA256` 门禁 | 对手写摆放面文件取 SHA-256 | **删除该条**（不再有这条依赖） |
+| 其余门禁 | `collider.glb` SHA-256、`framing`、`collisionVolumes`、`manualWaypoints` | **保留不变** |
 
-**并且**：烘焙时的 `supportReservation` **保留**，但输入从"手写面"改为"**同一套派生实现算出的面**"。这保证导航点不会生成在合法摆放区里，两边用同一个真相。
+效果：**"改摆放面 → 导航失效"这个问题不存在了**，而不是被绕开。`bake-living-cabin-navigation.py` 里把 `ResidentPropPlacementConfiguration.swift` 编进烘焙模块的那段代码也可以删掉。网格间距因此完全自由（决定见 §5.3）。
 
-> 这是最容易做错的一处：若烘焙时去掉 `supportReservation`，waypoint 会生成在摆放区里，之后用户在那儿放东西就会出现"导航点落在物件内部"。
+## 4. 摆放面为什么必须派生（而不是手写或删掉）
 
-## 4. 为什么摆放面必须派生（而不是删掉）
-
-依赖方向是**反的**，这是本设计的核心：
+**历史原因（已核实，靠删除解决）**：依赖方向曾经是反的——
 
 ```text
 手写摆放面 ──是──▶ 导航烘焙的【输入】
@@ -88,7 +97,17 @@
                   让 waypoint 不生成在摆放区里
 ```
 
-所以"改摆放面 → 导航失效"不是官僚主义，是真实依赖。自由装修要求摆放面不是手写常量；正确解法是让**派生面成为导航与摆放的共同真相**。
+这就是"改摆放面 → 导航失效"的由来：不是官僚主义，是真实依赖。
+
+**但决定 1 让这个依赖变得多余**：物件改为在运行时通过受阻边阻挡通行，waypoint 就不需要回避摆放区了。所以这条路走的是**删除依赖**（决定 3），而不是"让派生面成为共同真相"。
+
+**那为什么摆放面仍然要派生？** 因为用户需要一个**能看见、能指着放的表面结构**：
+
+- 画格子要有"哪一层、在哪、多大"（§5）
+- 判定"放得下吗"要有承托高度与净空（§6.3）
+- 物件 footprint 占几格要有一致的格子坐标系（§5.2）
+
+这三件事都只服务放置体验与渲染，**与导航再无关系**。所以派生是一件事，导航是另一件事——两条线解耦了。
 
 ## 5. 格子怎么看到（Sims 标准）
 
@@ -161,18 +180,19 @@ public protocol WorldPropSupportQuerying: WorldCollisionQuerying {
 | # | 工作 | 位置 | 验收 |
 | --- | --- | --- | --- |
 | 1 | `WorldPlanarBounds` + `WorldPropSupportQuerying` + 三角形范围查询 | `WorldRuntime` | 单测：范围查询返回的三角形与暴力全量筛选一致 |
-| 2 | `PropSupportGrid` 派生：多层枚举 + 网格/体积校验 + 确定性 | `WorldRuntime` | 单测：同一几何必产出同一网格；地面/桌面/台阶多层；插墙格被拒；跨列确定性 |
-| 3 | 物件 footprint 与放置判定（含多格占据、占用互斥） | `WorldRuntime` | 单测：2×2 footprint 整块判定；重叠被拒；旋转 90° 后 footprint 正确 |
-| 4 | 烘焙器改用同一派生；门禁改锁输入 + 算法版本 | `tools/navigation/`、`build-package.mjs` | Python 守卫仍能重建 committed world.json |
-| 5 | **重烘焙一次** `marble-living-cabin`，核对 report | `authoring/` + `Resources/` | `triangleCount 161600` / waypoint / edge 数与预期一致或有据可查 |
+| 2 | `PropSupportGrid` 派生：多层枚举 + 确定性 | `WorldRuntime` | 单测：同一几何必产出同一网格；地面/桌面/台阶多层；跨列确定性 |
+| 3 | 物件 footprint 与放置判定（网格 / 阻挡体积 / 已放物件 / 净空） | `WorldRuntime` | 单测：2×2 footprint 整块判定；重叠被拒；旋转 90° 后 footprint 正确 |
+| 4 | **让居民绕过家具**：`ActivityExecutor` 把 `collisionQuery` 推出的 `canTraverse` 传进 `route(from:to:canTraverse:)` | `WorldRuntime` | 单测：路径被物件挡住时改走可行边；无障碍时路径与今天逐点一致 |
+| 5 | **删除 `supportReservation` 与摆放面哈希门禁** | `tools/navigation/`、`bake-living-cabin-navigation.py`、`build-package.mjs` | Python 守卫重建成功；烘焙图只多约 3 个点 |
+| 5b | **重烘焙一次** `marble-living-cabin`，核对 report | `authoring/` + `Resources/` | `triangleCount 161600`；`waypointCount` / `bidirectionalEdgeCount` 变化有据可查 |
 | 6 | 删除 5 处件数限制与 `visibleLimit` | `WorldSimulation`、`ResidentPropPlacementService`、`ResidentPropRenderer`、`WishMachineOutputDescriptor` | 放 30 件全部可见、可存档；既有 12 项 `WorldPropLayout` 测试不回归 |
 | 7 | 格子渲染 pass（实例化 quad + 距离淡出 + 深度测试） | `ResidentPropRenderer` 旁 | 视觉验收：被墙遮挡、不闪烁、60 fps |
 | 8 | 光标拾取：射线 → 格子平面求交 → 最近命中 | 渲染/相机层 | 悬停高亮跟手；远处格子也能选中 |
-| 9 | 编辑器改成"格子 + footprint"（保留不碰撞 + 连通性检查） | `ResidentPropEditorState/Service` + `View` | 悬停绿/红正确；吸附；90° 旋转；Esc/Delete/撤销 |
+| 9 | 编辑器改成"格子 + footprint" | `ResidentPropEditorState/Service` + `View` | 悬停绿/红正确；吸附；90° 旋转；Esc/Delete/撤销 |
 | 10 | 回归 | — | `make test-all` 全绿；`make build` 成功 |
 
-**串行**：1 → 2 → 3；4 → 5；6 依赖 2/3；7、8、9 依赖 2/3。
-**可并行**：6 与 7/8/9 无依赖关系。
+**串行**：1 → 2 → 3；4 →（与 5 无依赖）；5 → 5b；6 依赖 2/3；7、8、9 依赖 2/3。
+**可并行**：6、以及 4/5 这条"导航解耦"线，与 7/8/9 这条"渲染交互"线互不依赖。
 
 ## 8. 验收（Sims 标准逐条）
 
@@ -183,7 +203,8 @@ public protocol WorldPropSupportQuerying: WorldCollisionQuerying {
 | 3 | 鼠标指着放：悬停高亮、绿红判定、吸附、旋转 | **真人手感**（测试不能代替） |
 | 4 | 格子被墙/家具正确遮挡 | 真人看；以及深度测试的离线检查 |
 | 5 | 退出重进还在原处 | 离线可测（`WorldStatePersistence` 原子 JSON） |
-| 附加 | 改摆放面不再让导航失效 | 门禁测试 |
+| 附加 | 摆放面与导航**彻底解耦**（依赖已删除） | 门禁里不再有摆放面这一条 |
+| 附加 | 居民会绕过家具而不是撞上去 | 离线：路径在受阻边处改道 |
 | 附加 | `make test-all` 全绿 | 自动 |
 
 **第 3 条只有真人能判**，明确列为真人验收，不用状态测试顶替。
@@ -201,9 +222,10 @@ public protocol WorldPropSupportQuerying: WorldCollisionQuerying {
 | 风险 | 缓解 |
 | --- | --- |
 | `canPlace` 全量遍历导致不可用 | §6.1 的空间分桶必须先做（工作项 1） |
-| 去除 `supportReservation` 旧语义 → 导航点落在摆放区 | 保留它，只把输入换成派生面（决定 3） |
+| 删除 `supportReservation` 后烘焙图变化 | 实测只影响 3 个候选点；重烘焙后逐项核对 report |
+| `canTraverse` 接进路径规划后路径行为变化 | 单测要求"无障碍时路径与今天逐点一致"，把变化限制在"确实受阻"的情形 |
+| 物件把某个活动入口围死 | 本期接受（可在放置时提示）；Sims 同样允许堵死。连通性提示列为体验优化 |
 | 格子数量大导致渲染/拾取变慢 | 距离裁剪 + 分块上传；拾取按层过滤 |
 | 多高度层（桌面/台阶）语义不清 | 派生输出显式带"层"，UI 选层 |
-| 连通性检查随物件数增长 | 只在放置时算一次；`WaypointNavigationGraph` 已有惰性与缓存 |
 | 重烘焙产出与既有 `layout.json` 不一致 | 先跑 `test_cabin_navigation_package.py` 的重建比对再动 app 资源 |
 | 真人手感无法离线验证 | 明确列为真人验收项 |
