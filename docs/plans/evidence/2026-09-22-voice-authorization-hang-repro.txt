@@ -1,0 +1,15 @@
+# 2026-09-22 语音首次授权挂起复现（修复前）
+
+命令：抽取生产 enqueueResidentVoiceShutdown + 建模旧 requestMicrophoneAccess（continuation 不响应取消）
+场景：12s 连接超时触发 disconnectRealtimeVoice()，连接任务被取消并入队 shutdown。
+
+```
+SWIFT TASK CONTINUATION MISUSE: main() leaked its continuation without resuming it. This may cause tasks waiting on it to remain suspended forever.
+shutdown landed within 2s: false
+session cleanup trace: ["capture:false", "transmit:false", "disconnect"]
+residentVoiceShutdownTask still set: true
+exit=1
+```
+
+结论：shutdown 2 秒内未落地，residentVoiceShutdownTask 从不清零；
+后续 connectRealtimeVoice 的 await previousShutdown?.value 因此永久挂起，重试失效。
