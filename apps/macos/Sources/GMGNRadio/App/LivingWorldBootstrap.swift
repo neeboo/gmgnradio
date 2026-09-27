@@ -15,6 +15,20 @@ struct MarbleLivingCabinCollisionWorld: WorldCollisionQuerying {
     }
 }
 
+/// 摆放格子派生需要三角形几何，而这个组合类型只承诺 `any WorldCollisionQuerying`。
+/// 三角形来自 `environment`（生成舱体的网格）；`props` 是独立的阻挡体积，没有三角形。
+///
+/// 拿不到几何时返回**空数组**是有意为之，而且**不是 fail-open**：
+/// - `PropSupportGridBuilder.build` 先用 `triangles(in:)` 算 Y 范围，范围里没有可用几何时
+///   它返回**空网格**（注释原文"不猜、不放行"）；
+/// - `PropPlacementEvaluator.evaluate` 里局部三角形为空 → `.noSupport`（第二道闸）。
+/// 所以"拿不到几何"的结果是**不能摆放**，不是处处可放。
+extension MarbleLivingCabinCollisionWorld: WorldPropSupportQuerying {
+    func triangles(in bounds: WorldPlanarBounds) -> [WorldTriangle] {
+        (environment as? any WorldPropSupportQuerying)?.triangles(in: bounds) ?? []
+    }
+}
+
 /// An effect is keyed by the execution instance, not the 30 Hz frame.
 struct LivingCabinJukeboxGate {
     private var lastInstance: String?

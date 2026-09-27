@@ -227,6 +227,7 @@
 		C8B225A7F271ACEB26A2CAB1 /* VMDHumanoidMap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C3F9B64C68EF0ED6C90F53C /* VMDHumanoidMap.swift */; };
 		C9DB2A280E948D8A7684443F /* ResidentMemoryConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5D0F4C4AE1862B9277CE51DC /* ResidentMemoryConfiguration.swift */; };
 		CA7376BF0239E2E46824D607 /* ResidentClaudeProcessRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6F313F9AA07A438357513FA /* ResidentClaudeProcessRunner.swift */; };
+		CC440250E8A26020325CFFF4 /* PropSupportGridMapping.swift in Sources */ = {isa = PBXBuildFile; fileRef = A06778F3534FE1B87C9D3FC7 /* PropSupportGridMapping.swift */; };
 		CCB321AF1A35FDC741CF2B1F /* MotionPackageStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 285BEEED3B1193DF6448D871 /* MotionPackageStoreTests.swift */; };
 		D721C4D533DAA4D461CEF6D2 /* PlaybackContext.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2457A76CBF19C18E6D386EE /* PlaybackContext.swift */; };
 		D807A54C3784A2FF10D4278D /* MMDSceneKit in Frameworks */ = {isa = PBXBuildFile; productRef = 1F7DF91FFD2A650CA42087BD /* MMDSceneKit */; };
@@ -237,6 +238,7 @@
 		DD34674AE84A35C15E3EB4A7 /* CodexAgentAccountService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A961113D1516220877214877 /* CodexAgentAccountService.swift */; };
 		DDDEBAB15217CC1A60061CDE /* SyncedMusicLibraryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F7B6F4B8014DFB9AD76A24A /* SyncedMusicLibraryStore.swift */; };
 		DDF647CA9001A4919EA82834 /* ProgramVisualDirector.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C25006F47A0D72758A7B6B0 /* ProgramVisualDirector.swift */; };
+		DFBB39349649A969874CAEEE /* ResidentPropGridEditorModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2AFE7612BD0C88006DB3BDC2 /* ResidentPropGridEditorModel.swift */; };
 		E07CACC669D4A648231EE3A0 /* VisualAudioFeatureExtractor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36C707778632484C921F090C /* VisualAudioFeatureExtractor.swift */; };
 		E0EF77C4410BA971E66381AE /* CodexTrackRankingAgentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F341732E30CC1C3F05A7532 /* CodexTrackRankingAgentTests.swift */; };
 		E1E72C29EB3D2A8256F43741 /* RealtimeDJSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 216A6D94509E4915BCC18C7C /* RealtimeDJSession.swift */; };
@@ -354,6 +356,7 @@
 		28D2705070A09B46791FEE87 /* AudioAnalyzer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioAnalyzer.swift; sourceTree = "<group>"; };
 		29B18EF24D82A3E14E358738 /* CandidatePoolBuilderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CandidatePoolBuilderTests.swift; sourceTree = "<group>"; };
 		2A7B0521E016B54D6D21D12D /* AgentSettingsModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentSettingsModelTests.swift; sourceTree = "<group>"; };
+		2AFE7612BD0C88006DB3BDC2 /* ResidentPropGridEditorModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentPropGridEditorModel.swift; sourceTree = "<group>"; };
 		2B3D886F759F9B2EBE61D14B /* ResidentWorldToolSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentWorldToolSession.swift; sourceTree = "<group>"; };
 		2D6999758740371B4CC8758D /* StageWindowControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageWindowControllerTests.swift; sourceTree = "<group>"; };
 		3023F129331001DBAEBAF6D0 /* TrackKnowledge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrackKnowledge.swift; sourceTree = "<group>"; };
@@ -462,6 +465,7 @@
 		9F772420CF42B6F465A7F93A /* ProgramPlaybackQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgramPlaybackQueueTests.swift; sourceTree = "<group>"; };
 		9FE339024D9CADE22E3549D1 /* LivingWorldBootstrapTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LivingWorldBootstrapTests.swift; sourceTree = "<group>"; };
 		A054BF4EB9B407D4E3BE532C /* ResidentDSHConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentDSHConfiguration.swift; sourceTree = "<group>"; };
+		A06778F3534FE1B87C9D3FC7 /* PropSupportGridMapping.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PropSupportGridMapping.swift; sourceTree = "<group>"; };
 		A1D9F054780A912DD632D2B6 /* PMXMaterialCompatibility.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PMXMaterialCompatibility.swift; sourceTree = "<group>"; };
 		A303D7B9477D9BFF5F5544D2 /* RealtimeDJSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeDJSessionTests.swift; sourceTree = "<group>"; };
 		A321D62650E77B8CBC685704 /* DJAgentPreferences.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DJAgentPreferences.swift; sourceTree = "<group>"; };
@@ -965,6 +969,7 @@
 				CB1CE401DC46221687D05BF6 /* PropGenerationConfiguration.swift */,
 				22092892913901B6B9A639FF /* PropGenerationStore.swift */,
 				7042ABB00311D453A5D5E557 /* PropImagePreparation.swift */,
+				A06778F3534FE1B87C9D3FC7 /* PropSupportGridMapping.swift */,
 				8C764576419E37F7B13BAB58 /* PropSupportGridPicker.swift */,
 				3ECC82D2CA5287308B9ACA45 /* PropSupportGridPresentation.swift */,
 				652898977757565954C3204B /* PropSupportGridRenderer.swift */,
@@ -973,6 +978,7 @@
 				C12A593D2E39AA38BDE94F2C /* ResidentImageAttachment.swift */,
 				193229015897C584DE49ABC2 /* ResidentPerformanceMotionPolicy.swift */,
 				4B883AB50613AABC30AE090C /* ResidentPropEditorState.swift */,
+				2AFE7612BD0C88006DB3BDC2 /* ResidentPropGridEditorModel.swift */,
 				FEA756421C88CC46A0081E6E /* ResidentPropPlacementConfiguration.swift */,
 				F6D9D44D3F0366183C6571C0 /* ResidentPropPlacementService.swift */,
 				0CF4BBDAD919719A1DBF7F9E /* ResidentPropRenderer.swift */,
@@ -1498,6 +1504,7 @@
 				F6DB346A7C0E9037A9199668 /* PropGenerationStore.swift in Sources */,
 				977A6550B9EDEDE80B2D0915 /* PropImagePreparation.swift in Sources */,
 				68D169AB1772AA516F212FB1 /* PropSupportGrid.metal in Sources */,
+				CC440250E8A26020325CFFF4 /* PropSupportGridMapping.swift in Sources */,
 				0183599BCE0055F20464F7CA /* PropSupportGridPicker.swift in Sources */,
 				3FB43FFEC22AAD70D446E154 /* PropSupportGridPresentation.swift in Sources */,
 				BD7A533625344B6740D9529A /* PropSupportGridRenderer.swift in Sources */,
@@ -1529,6 +1536,7 @@
 				6B5712B6CB1BCDEE82542F67 /* ResidentPerformanceMotionPolicy.swift in Sources */,
 				B388D26A0C8A9CFC0FDE7946 /* ResidentPropEditorState.swift in Sources */,
 				16C07A20AA5DBDF36D914E03 /* ResidentPropEditorView.swift in Sources */,
+				DFBB39349649A969874CAEEE /* ResidentPropGridEditorModel.swift in Sources */,
 				995518C0CBFC44D828848E40 /* ResidentPropPlacementConfiguration.swift in Sources */,
 				4112603D7E0222EA77CBF228 /* ResidentPropPlacementService.swift in Sources */,
 				20C8510B171A3F23D8C51635 /* ResidentPropRenderer.swift in Sources */,

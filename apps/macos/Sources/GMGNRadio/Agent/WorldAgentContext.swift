@@ -387,6 +387,13 @@ final class WorldAgentContext {
         try publish(forcePersistence: true)
     }
 
+    /// 建造模式派生格子用的几何入口。装进上下文的 world 可能是包装类型
+    /// （`MarbleLivingCabinCollisionWorld` 或 `PropLayoutCollisionWorld`），它们已转发
+    /// 三角形；拿不到时返回 nil，调用方必须按 fail-closed 处理（不能摆放）。
+    var propSupportQuerying: (any WorldPropSupportQuerying)? {
+        collisionWorld.propSupportQuerying()
+    }
+
     func installCollisionWorld(_ world: any WorldCollisionQuerying) {
         navigationTraversalCache.removeAll(keepingCapacity: true)
         baseCollisionWorld = world
@@ -1200,7 +1207,11 @@ final class WorldAgentContext {
 }
 
 /// Generated props block bodies but never contribute a walkable top surface.
-private struct PropLayoutCollisionWorld: WorldCollisionQuerying {
+/// 摆放格子派生需要三角形几何。这个包装类型的地面与几何都来自 `base`，`props` 只是
+/// 已放物件的阻挡体积（没有三角形）。转发给 `base`，拿不到就返回空数组 —— 理由与
+/// `MarbleLivingCabinCollisionWorld` 的 conformance 相同：派生器会因此得到空网格
+/// （"不猜、不放行"），评估器会因此得到 `.noSupport`，两道都是 fail-closed。
+private struct PropLayoutCollisionWorld: WorldCollisionQuerying, WorldPropSupportQuerying {
     let base: any WorldCollisionQuerying
     let props: CollisionVolumeWorld
     init(base: any WorldCollisionQuerying, volumes: [WorldCollisionVolume]) {
@@ -1210,6 +1221,9 @@ private struct PropLayoutCollisionWorld: WorldCollisionQuerying {
         base.canOccupy(capsule, at: position) && props.canOccupy(capsule, at: position)
     }
     func groundHeight(at position: SIMD3<Float>) -> Float? { base.groundHeight(at: position) }
+    func triangles(in bounds: WorldPlanarBounds) -> [WorldTriangle] {
+        (base as? any WorldPropSupportQuerying)?.triangles(in: bounds) ?? []
+    }
     func canTraverse(_ capsule: WorldCapsule, from start: SIMD3<Float>, to end: SIMD3<Float>, maximumStepHeight: Float) -> Bool {
         guard base.canTraverse(capsule, from: start, to: end, maximumStepHeight: maximumStepHeight) else { return false }
         let distance = sqrt((end-start).x*(end-start).x + (end-start).y*(end-start).y + (end-start).z*(end-start).z)

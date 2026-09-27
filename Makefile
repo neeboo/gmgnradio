@@ -68,6 +68,7 @@ test-harnesses:
 	swift tools/test-stage-avatar-follow-smoothing.swift
 	swift tools/test-living-resident-loop.swift
 	swift tools/test-resident-prop-render.swift
+	swift tools/test-resident-prop-grid-editor.swift
 	swift tools/test-resident-status-lifecycle.swift
 	swift tools/test-resident-chat-transcript.swift
 	swift tools/test-resident-voice-authorization.swift
