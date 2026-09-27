@@ -274,8 +274,18 @@ func livingWorldStageEntryRequestsTheWorldBeforeShowingTheWindow() {
 
 @Test
 func systemResidentMenuPresentsOnlyEntryActionsInFixedOrder() {
+    // P1 空间优先：电台插件关闭（默认）时菜单不含「打开播放器」。
     #expect(
-        SystemResidentMenuPolicy.entries == [
+        SystemResidentMenuPolicy.entries(isRadioPluginEnabled: false) == [
+            .showLiveCam,
+            .enterSpace,
+            .settings,
+            .quit,
+        ]
+    )
+    // 插件打开时恢复改动前的完整条目与顺序（`.openPlayer` 及其按钮实现全部保留）。
+    #expect(
+        SystemResidentMenuPolicy.entries(isRadioPluginEnabled: true) == [
             .showLiveCam,
             .enterSpace,
             .openPlayer,

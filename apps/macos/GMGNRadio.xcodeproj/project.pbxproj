@@ -201,6 +201,7 @@
 		AF1441539464E4D2EF837CCD /* LocalMusicPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FF24F42B5B2AAA879E95FC5 /* LocalMusicPlayer.swift */; };
 		B388D26A0C8A9CFC0FDE7946 /* ResidentPropEditorState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B883AB50613AABC30AE090C /* ResidentPropEditorState.swift */; };
 		B38CAD275CF9668811068E88 /* ResidentWorldToolSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B3D886F759F9B2EBE61D14B /* ResidentWorldToolSession.swift */; };
+		B3D5D78DF1FC2D95AE00D4DA /* RadioPluginAvailability.swift in Sources */ = {isa = PBXBuildFile; fileRef = 54F6542DAF3E8B142D3CED06 /* RadioPluginAvailability.swift */; };
 		B6A4696B49C6BBA8EDDB7B92 /* WishMachineOutputDescriptor.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20D9EFF63FF6E6E09848AE6 /* WishMachineOutputDescriptor.swift */; };
 		B6FFE9B34760DB9760F6F035 /* AccountMusicSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA2E1A48CBD8D8307D47212 /* AccountMusicSource.swift */; };
 		B7E5C80664487C1D748EF6D4 /* PresencePackageStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4BC287B276AB0F4EDFACFE51 /* PresencePackageStore.swift */; };
@@ -393,6 +394,7 @@
 		4F94A9FD30F5FD8D3205D63C /* StageDioramaTransition.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageDioramaTransition.swift; sourceTree = "<group>"; };
 		52DE13F25FFCC1705453AA9D /* PropAttachment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PropAttachment.swift; sourceTree = "<group>"; };
 		545EE2E600188F6E719A6DB1 /* VRMAvatarMetalViewTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VRMAvatarMetalViewTests.swift; sourceTree = "<group>"; };
+		54F6542DAF3E8B142D3CED06 /* RadioPluginAvailability.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RadioPluginAvailability.swift; sourceTree = "<group>"; };
 		575C2E8050A211BF521B0F6F /* ProgramVisualDirectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgramVisualDirectorTests.swift; sourceTree = "<group>"; };
 		57824C2F7F47C53433BAC019 /* ResidentConversationMemory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentConversationMemory.swift; sourceTree = "<group>"; };
 		58D62C063D06327ED604C562 /* ResidentPropEditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentPropEditorView.swift; sourceTree = "<group>"; };
@@ -1008,6 +1010,7 @@
 			children = (
 				39FC866C894AFC1D958539BF /* GMGNRadioApp.swift */,
 				D6193EB94AEB654EF7CE2D34 /* LivingWorldBootstrap.swift */,
+				54F6542DAF3E8B142D3CED06 /* RadioPluginAvailability.swift */,
 			);
 			path = App;
 			sourceTree = "<group>";
@@ -1484,6 +1487,7 @@
 				977A6550B9EDEDE80B2D0915 /* PropImagePreparation.swift in Sources */,
 				49CF26C41737F0892F222A5D /* PropTaskDaemonClient.swift in Sources */,
 				4AAB471D551D8A088912E7A4 /* QQMusicProviderClient.swift in Sources */,
+				B3D5D78DF1FC2D95AE00D4DA /* RadioPluginAvailability.swift in Sources */,
 				E1E72C29EB3D2A8256F43741 /* RealtimeDJSession.swift in Sources */,
 				AD473CDA80FF3D2D2D266FC6 /* RealtimeDJSessionController.swift in Sources */,
 				BCE1B3E3076E3BD5439597E4 /* RemoteMotionLibrary.swift in Sources */,

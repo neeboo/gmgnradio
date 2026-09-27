@@ -45,8 +45,12 @@ guard failures == 0 else { exit(1) }
 let harness = "import Foundation\n" + declarations.compactMap(declaration).joined(separator: "\n") + #"""
 
 precondition(StageControlPanelTab.allCases == [.player, .space, .motions, .activities])
-precondition(StageControlPanelTab.initial(for: .player) == .player)
-precondition(StageControlPanelTab.initial(for: .space) == .space)
+// 有意改变的默认值（P1 空间优先）：电台插件关闭时任何入口都先落在「空间」。
+// 播放器分区本身没有被删除，插件打开时恢复改动前的默认。
+precondition(StageControlPanelTab.initial(for: .player, isRadioPluginEnabled: false) == .space)
+precondition(StageControlPanelTab.initial(for: .space, isRadioPluginEnabled: false) == .space)
+precondition(StageControlPanelTab.initial(for: .player, isRadioPluginEnabled: true) == .player)
+precondition(StageControlPanelTab.initial(for: .space, isRadioPluginEnabled: true) == .space)
 precondition(StageControlPanelTab.allCases.map(\.title) == ["播放器", "空间", "角色", "活动"])
 precondition(StageVisualPickerGroup.visibleGroups(for: .player) == [.lyricsEffects, .pointCloud, .particleSize, .musicVideo])
 precondition(StageVisualPickerGroup.visibleGroups(for: .space) == [.worldSelection, .avatarPlacement, .loadingStatus])

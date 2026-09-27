@@ -5,17 +5,24 @@ enum DesktopPresenceMode: Equatable, Sendable {
     case orb
     case liveCam
 
+    /// P1：光球是播放器的桌面身体，随播放器一起进插件。
+    /// 电台插件关闭（默认）时这里**永不返回 `.orb`**；没有角色时由调用方
+    /// （`GMGNRadioApp.applyDesktopPresence` / `showLiveCam`）走 `LiveCamPresentationRequest`
+    /// 的可见引导，而不是退回光球。插件打开时恢复改动前的行为。
     static func resolve(
-        snapshot: StageAvatarRuntimeSnapshot
+        snapshot: StageAvatarRuntimeSnapshot,
+        isRadioPluginEnabled: Bool
     ) -> DesktopPresenceMode {
-        snapshot.avatar == nil ? .orb : .liveCam
+        guard isRadioPluginEnabled else { return .liveCam }
+        return snapshot.avatar == nil ? .orb : .liveCam
     }
 }
 
 /// 「显示 Live Cam」在还没有角色时的可见引导。
 ///
-/// 没有角色时桌面呈现只能是光球，直接调用 `applyDesktopPresence` 会让用户觉得
-/// 菜单没反应。这里给出可执行的设置路径，绝不引入默认角色或新权限。
+/// 没有角色时桌面呈现没有可显示的对象（光球随播放器进插件后不再兜底），直接调用
+/// `applyDesktopPresence` 会让用户觉得菜单没反应。这里给出可执行的设置路径，
+/// 绝不引入默认角色或新权限。
 enum LiveCamPresentationRequest: Equatable, Sendable {
     case present
     case needsAvatar(guidance: String)

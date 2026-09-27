@@ -2301,8 +2301,15 @@ enum StageVisualPickerGroup: Equatable {
 enum StageControlPanelTab: String, Hashable, CaseIterable {
     case player, space, motions, activities
 
-    static func initial(for mode: StageVisualPickerMode) -> Self {
-        mode == .space ? .space : .player
+    /// P1：默认呈现面是空间。电台插件关闭（默认）时**任何**入口都先落在「空间」；
+    /// 插件打开时恢复改动前的行为（空间模式落空间，其余落播放器）。
+    /// 四个分区本身始终可选；`mode` 参数保留以免破坏调用点。
+    static func initial(
+        for mode: StageVisualPickerMode,
+        isRadioPluginEnabled: Bool
+    ) -> Self {
+        guard isRadioPluginEnabled else { return .space }
+        return mode == .space ? .space : .player
     }
 
     var title: String {
@@ -2355,7 +2362,7 @@ struct StageVisualPickerView: View {
     @Bindable var avatarRuntime: StageAvatarRuntimeStore = .shared
     @ObservedObject private var activities = LivingWorldActivityMenuStore.shared
     @State private var model = PresenceSettingsModel()
-    @State private var tab: StageControlPanelTab = .player
+    @State private var tab: StageControlPanelTab = .space
     @State private var didChooseInitialTab = false
     @State private var motionCategory: MotionLibraryCategory?
     var onRunActivity: @MainActor (String) -> Void = { _ in }
@@ -2424,7 +2431,10 @@ struct StageVisualPickerView: View {
         .padding(7)
         .onAppear {
             guard !didChooseInitialTab else { return }
-            tab = .initial(for: mode)
+            tab = .initial(
+                for: mode,
+                isRadioPluginEnabled: RadioPluginAvailability.isEnabled()
+            )
             didChooseInitialTab = true
         }
         .onChange(of: tab) { _, newTab in

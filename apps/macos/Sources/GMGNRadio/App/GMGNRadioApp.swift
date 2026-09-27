@@ -281,7 +281,12 @@ struct GMGNRadioApp: App {
 
     var body: some Scene {
         MenuBarExtra(ProductIdentity.displayName, systemImage: "waveform.circle.fill") {
-            ForEach(SystemResidentMenuPolicy.entries, id: \.self) { entry in
+            ForEach(
+                SystemResidentMenuPolicy.entries(
+                    isRadioPluginEnabled: RadioPluginAvailability.isEnabled()
+                ),
+                id: \.self
+            ) { entry in
                 systemResidentMenuItem(for: entry)
             }
         }
@@ -314,13 +319,16 @@ enum SystemResidentMenuEntry: Hashable, Sendable {
 }
 
 enum SystemResidentMenuPolicy {
-    static let entries: [SystemResidentMenuEntry] = [
-        .showLiveCam,
-        .enterSpace,
-        .openPlayer,
-        .settings,
-        .quit,
-    ]
+    /// P1：默认呈现面只有菜单栏 + 空间 + 设置。
+    /// 电台插件关闭（默认）时菜单不含「打开播放器」；插件打开时恢复改动前的完整条目与顺序。
+    /// `.openPlayer` 这个 case 与它的按钮实现全部保留，只受门禁控制。
+    static func entries(
+        isRadioPluginEnabled: Bool
+    ) -> [SystemResidentMenuEntry] {
+        isRadioPluginEnabled
+            ? [.showLiveCam, .enterSpace, .openPlayer, .settings, .quit]
+            : [.showLiveCam, .enterSpace, .settings, .quit]
+    }
 }
 
 extension GMGNRadioApp {
@@ -1131,7 +1139,8 @@ final class AppDelegate:
         if stageWindowController == nil {
             configureStage()
         }
-        // 没有角色时桌面只能是光球：给出可见、可执行的引导，不能看起来没反应。
+        // 没有角色时桌面呈现没有可显示的对象（光球随播放器进插件后不再兜底）：
+        // 给出可见、可执行的引导，不能看起来没反应。
         switch LiveCamPresentationRequest.resolve(hasAvatar: avatarRuntime.snapshot.avatar != nil) {
         case .present:
             applyDesktopPresence(avatarRuntime.snapshot)
@@ -1147,13 +1156,23 @@ final class AppDelegate:
     private func applyDesktopPresence(
         _ snapshot: StageAvatarRuntimeSnapshot
     ) {
-        switch DesktopPresenceMode.resolve(snapshot: snapshot) {
+        switch DesktopPresenceMode.resolve(
+            snapshot: snapshot,
+            isRadioPluginEnabled: RadioPluginAvailability.isEnabled()
+        ) {
         case .orb:
             liveCamWindowController?.hide()
             orbWindowController?.show()
         case .liveCam:
             orbWindowController?.hide()
             guard stageWindowController?.isPresented != true else { return }
+            // 门禁关闭后没有角色时不再退回光球：走 LiveCamPresentationRequest 的可见引导
+            // （「显示 Live Cam」菜单），这里不呈现空窗口。
+            guard LiveCamPresentationRequest.resolve(hasAvatar: snapshot.avatar != nil) == .present
+            else {
+                liveCamWindowController?.hide()
+                return
+            }
             liveCamWindowController?.show()
         }
     }
@@ -2963,9 +2982,15 @@ final class AppDelegate:
                 voiceState: RealtimeVoiceStatusStore.shared.state,
                 shouldPresent: { [weak self] in
                     guard let self else { return false }
-                    return DesktopPresenceMode.resolve(
-                        snapshot: self.avatarRuntime.snapshot
-                    ) == .liveCam
+                    let snapshot = self.avatarRuntime.snapshot
+                    guard DesktopPresenceMode.resolve(
+                        snapshot: snapshot,
+                        isRadioPluginEnabled: RadioPluginAvailability.isEnabled()
+                    ) == .liveCam else { return false }
+                    // Live Cam 是角色视图：没有角色时不呈现空窗口，改走可见引导
+                    // （与 applyDesktopPresence 同一判据）。
+                    return LiveCamPresentationRequest
+                        .resolve(hasAvatar: snapshot.avatar != nil) == .present
                 },
                 onEnterSpace: { [weak self] in
                     self?.showStage()

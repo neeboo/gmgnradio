@@ -815,8 +815,12 @@ func stageVisualPickerShowsOnlyTheGroupsForTheCurrentMode() {
 func stageControlPanelSectionsStayAvailableIndependentOfScene() {
     #expect(StageControlPanelTab.allCases == [.player, .space, .motions, .activities])
     #expect(StageControlPanelTab.allCases.map(\.title) == ["播放器", "空间", "角色", "活动"])
-    #expect(StageControlPanelTab.initial(for: .player) == .player)
-    #expect(StageControlPanelTab.initial(for: .space) == .space)
+    // P1 空间优先：电台插件关闭（默认）时任何入口都先落在「空间」；
+    // 插件打开时恢复改动前的默认（空间落空间，其余落播放器）。
+    #expect(StageControlPanelTab.initial(for: .player, isRadioPluginEnabled: false) == .space)
+    #expect(StageControlPanelTab.initial(for: .space, isRadioPluginEnabled: false) == .space)
+    #expect(StageControlPanelTab.initial(for: .player, isRadioPluginEnabled: true) == .player)
+    #expect(StageControlPanelTab.initial(for: .space, isRadioPluginEnabled: true) == .space)
 }
 
 @Test

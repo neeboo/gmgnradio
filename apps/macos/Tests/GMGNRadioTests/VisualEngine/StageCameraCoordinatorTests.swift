@@ -10,7 +10,11 @@ func desktopPresenceUsesTheOrbOnlyWhenNoAvatarIsSelected() {
         motion: nil,
         revision: 1
     )
-    #expect(DesktopPresenceMode.resolve(snapshot: empty) == .orb)
+    // P1 空间优先：电台插件关闭（默认）时光球（播放器的桌面身体）永不出现，
+    // 没有角色时由调用方走 LiveCamPresentationRequest 的可见引导。
+    #expect(DesktopPresenceMode.resolve(snapshot: empty, isRadioPluginEnabled: false) == .liveCam)
+    // 插件打开时恢复改动前的行为：没有角色退回光球。
+    #expect(DesktopPresenceMode.resolve(snapshot: empty, isRadioPluginEnabled: true) == .orb)
 
     for format in StageAvatarFormat.allCases {
         let avatar = StageAvatarAsset(
@@ -25,7 +29,8 @@ func desktopPresenceUsesTheOrbOnlyWhenNoAvatarIsSelected() {
             motion: nil,
             revision: 2
         )
-        #expect(DesktopPresenceMode.resolve(snapshot: snapshot) == .liveCam)
+        #expect(DesktopPresenceMode.resolve(snapshot: snapshot, isRadioPluginEnabled: false) == .liveCam)
+        #expect(DesktopPresenceMode.resolve(snapshot: snapshot, isRadioPluginEnabled: true) == .liveCam)
     }
 }
 
