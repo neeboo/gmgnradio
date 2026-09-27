@@ -87,6 +87,129 @@ extension StageMotionAsset {
             inPlace: inPlace ?? fallback.inPlace
         )
     }
+
+    /// A locomotion loop is a looping, in-place clip that carries an authored
+    /// ground speed (`strideSpeed`). Idle, sit, and dance loops do not carry a
+    /// stride contract, so they never count as locomotion even when the
+    /// generator marked them in-place. The check never invents a speed: the
+    /// finite positive `strideSpeed` must already be present.
+    var isLocomotionLoop: Bool {
+        guard loop, inPlace == true,
+              let strideSpeed, strideSpeed.isFinite, strideSpeed > 0
+        else { return false }
+        return true
+    }
+}
+
+/// Horizontal ground-speed telemetry captured by the world executor between
+/// consecutive agent snapshots, plus whether the resolved playback is a
+/// locomotion loop.
+///
+/// Renderers combine this with ``StageLocomotionGait`` to retime the walk clip
+/// against the avatar's *actual* travel, so distance per step keeps matching
+/// the ground regardless of speed changes or target-rig proportions, without
+/// reloading or restarting the clip (phase stays owned by the animation
+/// player).
+struct StageAvatarLocomotionTelemetry: Equatable, Sendable {
+    /// Smoothed horizontal ground speed in meters per second.
+    var measuredSpeed: Float = 0
+    /// True while the resolved world playback is an in-place locomotion loop.
+    var isLocomotionActive = false
+    /// Source world revision this measurement was derived from.
+    var sourceRevision: UInt64 = 0
+
+    static let standing = StageAvatarLocomotionTelemetry()
+
+    /// Content equality ignoring the informational revision, with speed
+    /// quantized to 5 mm/s so a world ticking at 30 Hz does not churn
+    /// observers while the avatar cruises at a constant speed.
+    func matchesContent(_ other: StageAvatarLocomotionTelemetry) -> Bool {
+        isLocomotionActive == other.isLocomotionActive
+            && abs(measuredSpeed - other.measuredSpeed) <= 0.005
+    }
+
+    init(
+        measuredSpeed: Float = 0,
+        isLocomotionActive: Bool = false,
+        sourceRevision: UInt64 = 0
+    ) {
+        self.measuredSpeed = measuredSpeed.isFinite && measuredSpeed >= 0
+            ? measuredSpeed
+            : 0
+        self.isLocomotionActive = isLocomotionActive
+        self.sourceRevision = sourceRevision
+    }
+}
+
+/// Calibration of one locomotion clip applied to one avatar rig: the clip's
+/// authored step speed plus the source/target hips heights used to scale it.
+///
+/// Pure playback math — no clocks, no smoothing, no player state. When either
+/// side of the hips ratio is missing, ``heightScale`` stays `1` (never
+/// fabricate a correction from absent data); the authored speed is then used
+/// unchanged, which reproduces today's constant-speed behavior exactly.
+///
+/// The type is public because `PMXStageAvatarRenderer` (a public renderer
+/// contract) accepts it in `loadMotion(locomotion:)` and re-exposes it through
+/// ``loadedLocomotionGait``.
+public struct StageLocomotionGait: Equatable, Sendable {
+    /// Clip step speed at rate 1 on the reference rig, in meters per second
+    /// (VRMA manifest `strideSpeed`, or the measured PMX compatibility).
+    public let authoredStepSpeed: Float
+    /// Reference rig hips rest height when the clip carries it (VRMA extra).
+    public let sourceHipsHeight: Float?
+    /// Target avatar hips rest height when it can be measured from the rig.
+    public let targetHipsHeight: Float?
+
+    /// Below this ground speed the clip freezes (rate 0) instead of pumping
+    /// small steps in place; this is the "stopped, no marching" guarantee.
+    public static let freezeSpeed: Float = 0.06
+    /// No run clip exists beyond the authored walk, so the adaptive rate is
+    /// capped (also mirrors VRMMetalKit's locomotion maximum).
+    public static let maximumRate: Float = 1.3
+
+    public init(
+        authoredStepSpeed: Float,
+        sourceHipsHeight: Float? = nil,
+        targetHipsHeight: Float? = nil
+    ) {
+        self.authoredStepSpeed = authoredStepSpeed.isFinite
+            && authoredStepSpeed > 0
+            ? authoredStepSpeed
+            : 0
+        self.sourceHipsHeight = sourceHipsHeight
+        self.targetHipsHeight = targetHipsHeight
+    }
+
+    /// Bipedal stride scales with hip height as a first-order proxy for leg
+    /// length. Clamped so a wildly mis-sized rig cannot produce an absurd
+    /// correction; missing data keeps the scale at 1.
+    public var heightScale: Float {
+        guard let source = sourceHipsHeight, source.isFinite, source > 0,
+              let target = targetHipsHeight, target.isFinite, target > 0
+        else { return 1 }
+        return min(max(target / source, 0.5), 2)
+    }
+
+    /// Ground speed the clip implies at rate 1 on this avatar. Keeping the
+    /// body's measured travel at this speed (or retiming the clip to it)
+    /// plants the feet; any deviation is exactly the moonwalk/slide error.
+    public var impliedStepSpeed: Float {
+        authoredStepSpeed * heightScale
+    }
+
+    /// Playback rate that keeps the clip's steps matched to `groundSpeed`
+    /// (meters/second). Zero at standstill (freeze, phase preserved); the
+    /// rate is otherwise proportional `groundSpeed / impliedStepSpeed`,
+    /// capped at ``maximumRate``.
+    public func playbackRate(forGroundSpeed groundSpeed: Float) -> Float {
+        let speed = groundSpeed.isFinite ? max(0, groundSpeed) : 0
+        guard speed > 0 else { return 0 }
+        let implied = impliedStepSpeed
+        guard implied.isFinite, implied > 0 else { return 0 }
+        if speed < Self.freezeSpeed { return 0 }
+        return min(speed / implied, Self.maximumRate)
+    }
 }
 
 enum StageMotionCompletionPolicy {
@@ -149,6 +272,24 @@ struct StageAvatarWorldActivitySnapshot: Equatable, Sendable {
     let phase: LifeActivityPhase
     let motionPlayback: StageAvatarMotionPlayback
     let sourceRevision: UInt64
+    var activityRequestID: String? = nil
+}
+
+struct StageMotionPlaybackIdentity: Equatable, Sendable {
+    let motion: StageMotionAsset
+    let snapshotRevision: UInt64
+    let worldActivityRequestID: String?
+    let worldActivityPhase: LifeActivityPhase?
+}
+
+enum StageMotionPlaybackOutcome: Equatable, Sendable {
+    case completed
+    case failed(String)
+}
+
+struct StageMotionPlaybackEvent: Equatable, Sendable {
+    let identity: StageMotionPlaybackIdentity
+    let outcome: StageMotionPlaybackOutcome
 }
 
 @MainActor
@@ -167,11 +308,50 @@ final class StageAvatarRuntimeStore {
     /// nil keeps the legacy face path; an active zero sample closes the mouth.
     private(set) var residentSpeechLevel: Float?
     private(set) var worldActivity: StageAvatarWorldActivitySnapshot?
+    /// Measured ground speed + locomotion-active flag for the visible avatar.
+    /// The world executor updates this on every applied snapshot tick so
+    /// renderers can retime an active walk clip without restarting it.
+    private(set) var locomotion = StageAvatarLocomotionTelemetry.standing
+    private var residentThinkingRunID: UUID?
+    private var installedResidentMotions: [StageMotionAsset] = []
+
+    var isResidentThinking: Bool { residentThinkingRunID != nil }
+
+    /// Resident full-body clips come from installed BONES packages. Missing
+    /// clips remain unavailable; never substitute an authored pose.
+    var residentThinkingMotion: StageMotionAsset? {
+        guard isResidentThinking else { return nil }
+        return residentLoopMotion("thinking-loop", avatarFormat: snapshot.avatar?.format)
+    }
+
+    var residentIdleMotion: StageMotionAsset? {
+        residentLoopMotion("idle-loop", avatarFormat: snapshot.avatar?.format)
+    }
+
+    var residentHoldDisplayMotion: StageMotionAsset? {
+        residentLoopMotion("hold-display", avatarFormat: snapshot.avatar?.format)
+    }
+
+    private func residentLoopMotion(
+        _ name: String, avatarFormat: StageAvatarFormat?
+    ) -> StageMotionAsset? {
+        guard let avatarFormat else { return nil }
+        let suffix = avatarFormat == .pmx ? "pmx" : "vrm"
+        let format: StageMotionFormat = avatarFormat == .pmx ? .vmd : .vrma
+        return installedResidentMotions.first {
+            $0.id == "gmgn.motion.bones.\(name)-\(suffix)"
+                && $0.format == format && $0.url != nil && $0.loop
+        }
+    }
 
     private let packageStore: PresencePackageStore?
     private let motionPackageStore: MotionPackageStore?
     @ObservationIgnored
     private var observers: [UUID: (StageAvatarRuntimeSnapshot) -> Void] = [:]
+    @ObservationIgnored
+    private var motionPlaybackObservers: [UUID: (StageMotionPlaybackEvent) -> Void] = [:]
+    @ObservationIgnored
+    private var terminalPlaybackIdentities: [StageMotionPlaybackIdentity] = []
 
     init(
         packageStore: PresencePackageStore? = try? .liveStore(),
@@ -196,7 +376,7 @@ final class StageAvatarRuntimeStore {
         observers[id] = nil
     }
 
-    func refresh() {
+    func refresh(forcePlaybackReload: Bool = false) {
         var avatar = snapshot.avatar
         var motion = snapshot.motion
         var refreshError: Error?
@@ -213,15 +393,25 @@ final class StageAvatarRuntimeStore {
 
         if let motionPackageStore {
             do {
+                installedResidentMotions = try motionPackageStore.listMotions()
                 motion = try motionPackageStore.activeMotion()
             } catch {
+                installedResidentMotions = []
                 refreshError = refreshError ?? error
             }
         } else {
+            installedResidentMotions = []
             motion = nil
         }
 
-        setSnapshot(avatar: avatar, motion: motion)
+        if motion?.id.hasPrefix("gmgn.motion.bones.") != true,
+           motion?.id != "builtin.motion.iluvslapbass",
+           motion?.id != "gmgn.motion.ardy-backflip"
+        {
+            motion = residentLoopMotion("idle-loop", avatarFormat: avatar?.format)
+        }
+
+        setSnapshot(avatar: avatar, motion: motion, forcePlaybackReload: forcePlaybackReload)
         if let refreshError {
             status = .failed(refreshError.localizedDescription)
         } else if let avatar {
@@ -247,6 +437,60 @@ final class StageAvatarRuntimeStore {
         }
     }
 
+    func playbackIdentity(for motion: StageMotionAsset) -> StageMotionPlaybackIdentity {
+        let world: StageAvatarWorldActivitySnapshot?
+        if case let .temporary(activeMotion) = worldActivity?.motionPlayback,
+           activeMotion == motion {
+            world = worldActivity
+        } else {
+            world = nil
+        }
+        return StageMotionPlaybackIdentity(
+            motion: motion,
+            snapshotRevision: snapshot.revision,
+            worldActivityRequestID: world?.activityRequestID,
+            worldActivityPhase: world?.phase
+        )
+    }
+
+    @discardableResult
+    func observeMotionPlayback(_ observer: @escaping (StageMotionPlaybackEvent) -> Void) -> UUID {
+        let id = UUID()
+        motionPlaybackObservers[id] = observer
+        return id
+    }
+
+    func removeMotionPlaybackObserver(_ id: UUID?) {
+        guard let id else { return }
+        motionPlaybackObservers[id] = nil
+    }
+
+    func reportMotionPlayback(
+        identity: StageMotionPlaybackIdentity,
+        outcome: StageMotionPlaybackOutcome
+    ) {
+        guard playbackIdentity(for: identity.motion) == identity,
+              !terminalPlaybackIdentities.contains(identity)
+        else { return }
+        if outcome == .completed, identity.motion.loop { return }
+        terminalPlaybackIdentities.append(identity)
+        if terminalPlaybackIdentities.count > 32 {
+            terminalPlaybackIdentities.removeFirst()
+        }
+        if case let .failed(message) = outcome { status = .failed(message) }
+        let event = StageMotionPlaybackEvent(identity: identity, outcome: outcome)
+        for observer in Array(motionPlaybackObservers.values) { observer(event) }
+        // World activity completion is owned by the world bridge. A stale
+        // renderer must never clear a replacement user selection.
+        if outcome == .completed,
+           identity.worldActivityPhase == nil,
+           snapshot.revision == identity.snapshotRevision,
+           snapshot.motion == identity.motion,
+           let url = identity.motion.url {
+            finishOneShotMotion(at: url)
+        }
+    }
+
     func setActivity(_ activity: StageAvatarActivity) {
         self.activity = activity
         if activity != .speaking {
@@ -264,8 +508,29 @@ final class StageAvatarRuntimeStore {
             : nil
     }
 
+    func beginResidentThinking(runID: UUID) {
+        residentThinkingRunID = runID
+    }
+
+    func endResidentThinking(runID: UUID) {
+        guard residentThinkingRunID == runID else { return }
+        residentThinkingRunID = nil
+    }
+
+    func clearResidentThinking() {
+        residentThinkingRunID = nil
+    }
+
     func installWorldActivity(_ activity: StageAvatarWorldActivitySnapshot) {
         worldActivity = activity
+    }
+
+    /// Commits ground-speed telemetry measured by the world executor. Content
+    /// is coalesced (speed quantized to 5 mm/s, revision ignored) so a paused
+    /// or constant-speed world does not churn observers every tick.
+    func updateLocomotion(_ telemetry: StageAvatarLocomotionTelemetry) {
+        guard !locomotion.matchesContent(telemetry) else { return }
+        locomotion = telemetry
     }
 
     func clearWorldActivity() {
@@ -288,9 +553,10 @@ final class StageAvatarRuntimeStore {
 
     private func setSnapshot(
         avatar: StageAvatarAsset?,
-        motion: StageMotionAsset?
+        motion: StageMotionAsset?,
+        forcePlaybackReload: Bool = false
     ) {
-        guard snapshot.avatar != avatar || snapshot.motion != motion else {
+        guard forcePlaybackReload || snapshot.avatar != avatar || snapshot.motion != motion else {
             return
         }
         snapshot = StageAvatarRuntimeSnapshot(
