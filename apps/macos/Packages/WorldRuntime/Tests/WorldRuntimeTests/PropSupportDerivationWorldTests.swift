@@ -82,20 +82,14 @@ func derivationWorldTurnsFurnitureTopIntoASupportLayer() {
     #expect(world.triangles(in: fixture.bounds).count == 4, "the table top is supplied as geometry")
     #expect(withTops.report.coveredGroundLayers > 0, "the table columns are recognised as furniture-covered ground")
 
-    // 但**过滤器**还有一环没接上，所以桌面仍然到不了最终网格。见设计文档 §12 回归 2。
-    // 用 `withKnownIssue` 记录：修好之后这条会**主动失败**（"known issue was not recorded"），
-    // 逼着把它翻成真断言，而不是让缺口悄悄留着。
-    withKnownIssue("""
-    候选判定是"站立层 ∪ 家具下地面层"。家具 footprint 外面有一圈列：格子压在家具上、    但列角点落在外面 —— 它们既不可站立、列里又没有第二层，于是不在候选里，把 footprint     内部的列整个隔离，BFS 进不去，桌面（以及家具底下的地面）一起被剔除。    修法要让站立判据与格子对齐（或换一种标记），会改变"墙靠不在候选里被排除"这条性质，    需要连同墙用例与真实舱体数字一起重新验证。见 docs/plans/2026-09-27-p2-decoration-design.md §12。
-    """) {
-        let tableTop = withTops.layers.filter {
-            abs($0.supportHeight - 0.5) < 0.01
-                && abs(Float($0.column.x) * withTops.spacing) <= 0.4
-                && abs(Float($0.column.z) * withTops.spacing) <= 0.4
-        }
-        #expect(!tableTop.isEmpty, "the table top becomes a placeable support layer")
-        #expect(withTops.report.furnitureBandLayers > 0, "the top is retained through the furniture band")
+    // 家具顶面确实进了最终网格 —— 这正是 §12 回归 2 要修的东西。
+    let tableTop = withTops.layers.filter {
+        abs($0.supportHeight - 0.5) < 0.01
+            && abs(Float($0.column.x) * withTops.spacing) <= 0.4
+            && abs(Float($0.column.z) * withTops.spacing) <= 0.4
     }
+    #expect(!tableTop.isEmpty, "the table top becomes a placeable support layer")
+    #expect(withTops.report.furnitureBandLayers > 0, "the top is retained through the furniture band")
 }
 
 /// 声称支持派生、但给不出任何三角形的世界。用来覆盖"拿不到几何"这条路径：

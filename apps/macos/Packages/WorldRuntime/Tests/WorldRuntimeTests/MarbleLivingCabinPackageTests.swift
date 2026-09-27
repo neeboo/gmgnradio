@@ -179,7 +179,9 @@ func marbleCabinSupportGridIsConnectivityFiltered() throws {
     // 过滤前的两个实测值：列扫描 9,737 层；其中 6,763 层"站立胶囊可容纳"——
     // 屋顶上方没有东西，站上去完全合法，所以 canOccupy 挡不住屋顶（反例就钉在这里）。
     #expect(report.layersBeforeFilter == 9_737, "实测 9,737 @0.25 m")
-    #expect(report.standableLayers == 6_763, "实测 6,763 / 9,737 站立可容纳")
+    // 站立判据改用**格心**后，站立可容纳的层数从 6,763 升到 7,012：
+    // 列角点会向后擦到相邻几何，格心不会。这条数字仍然是确定性守卫。
+    #expect(report.standableLayers == 7_012, "实测 7,012 / 9,737 站立可容纳")
     #expect(
         report.standableLayers > report.layersAfterFilter,
         "只按'站立胶囊可容纳'过滤挡不住屋顶：它留下 \(report.standableLayers) 层"
@@ -191,11 +193,25 @@ func marbleCabinSupportGridIsConnectivityFiltered() throws {
     #expect(grid.layers.count == report.layersAfterFilter)
     // 没有 3–5 米的层：屋顶外表面 5.31 m、天花板 2.5 m 都被剔除。
     #expect(!grid.layers.contains { $0.supportHeight >= 3 }, "3–5 m 的屋顶层必须被剔除")
-    #expect(highest < 2.5, "最高保留层必须低于天花板，实测 \(highest)")
-    // 地面 -0.07 m + band 1.6 = 1.53 m；房间里可达的最高站立层实测 0.71 m（踏步/夹层），
-    // 所以留 0.8 m 容差覆盖"台阶之上再叠一层家具"。关键是上面两条：没有 3–5 m 的层。
+    #expect(highest < 3.0, "最高保留层必须低于天花板平面，实测 \(highest)")
+    // **比魔数更强的结构性质**（取代原来的"地面 + band + 容差"）：每一个保留层，要么是它所在列
+    // 的最低保留层，要么与它**下面那一层**的间距 ≤ furnitureBandHeight。
+    //
+    // 这条恰好把"家具顶面"和"天花板/屋顶那种独立平面"分开：2.5–2.9 m 那 8 层实测都长在
+    // 更低的可达面之上（例：`L0@1.36 L1@2.54`），是"高台之上再叠一层家具顶面"，
+    // 而不是悬空的一片天花板。任何一层如果离下面那层超过家具带，就是独立平面 —— 必须被剔除。
+    var violations: [String] = []
+    for (column, layers) in Dictionary(grouping: grid.layers, by: \.column) {
+        let heights = layers.map(\.supportHeight).sorted()
+        for index in heights.indices.dropFirst()
+        where heights[index] - heights[index - 1] > parameters.furnitureBandHeight + 0.001 {
+            violations.append(
+                "列(\(column.x),\(column.z)) 的 \(heights[index - 1]) → \(heights[index])"
+            )
+        }
+    }
     #expect(
-        highest <= ground + parameters.furnitureBandHeight + 0.8,
-        "最高保留层 \(highest) 超过 地面 \(ground) + band 1.6 + 容差"
+        violations.isEmpty,
+        "保留层之间不能出现超过家具带的空隙（那是独立平面）：\(violations.prefix(4))"
     )
 }

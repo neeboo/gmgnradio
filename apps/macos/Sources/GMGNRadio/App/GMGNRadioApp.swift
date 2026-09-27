@@ -3786,8 +3786,15 @@ final class AppDelegate:
             publishResidentPropGrid()
             return
         }
+        // 派生用的世界把家具体积的**顶面**也当作承托面（合成顶面三角形 + y 受限的
+        // `groundHeight`），否则桌面/柜顶永远不成为承托层（§12 回归 2）。
+        // 居民落地用的世界不受影响 —— 那个 `groundHeight` 刻意只问网格，否则居民会站到桌子上。
+        let derivation = PropSupportDerivationWorld(
+            base: collision,
+            topVolumes: context.manifest.collisionVolumes.filter(\.isBlocking)
+        )
         residentPropGridEditor.activate(
-            collision: collision,
+            collision: derivation,
             seed: context.manifest.spawn.position,
             bounds: bounds,
             key: context.manifest.worldID

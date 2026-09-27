@@ -46,8 +46,12 @@ struct Config: Decodable {
             minimumZ=min(minimumZ,p.z); maximumZ=max(maximumZ,p.z)
         }
         let margin = parameters.spacing + parameters.capsuleRadius
+        // 与 App 相同：派生世界把家具体积的**顶面**也当作承托面（合成顶面三角形 +
+        // y 受限的 groundHeight），否则真实展示台的桌面不会是承托层（§12 回归 2）。
+        let derivation = PropSupportDerivationWorld(
+            base: mesh, topVolumes: manifest.collisionVolumes.filter(\.isBlocking))
         let grid = PropSupportGridBuilder.build(
-            collision: mesh,
+            collision: derivation,
             bounds: WorldPlanarBounds(minimumX:minimumX-margin,maximumX:maximumX+margin,
                                       minimumZ:minimumZ-margin,maximumZ:maximumZ+margin),
             seed: manifest.spawn.position,
@@ -56,7 +60,7 @@ struct Config: Decodable {
         check(!grid.layers.isEmpty,"real cabin derives a non-empty support grid")
         check(!grid.layers.contains { $0.supportHeight >= 3 },"no layer sits on the roof")
 
-        let support=ResidentPropPlacementSupport(grid:grid,collision:mesh)
+        let support=ResidentPropPlacementSupport(grid:grid,collision:derivation)
         let context=try WorldAgentContext(manifest:manifest)
         let independent=ResidentPropPlacementConfiguration.independentCollisionVolumes(manifest)
         let combined=MarbleLivingCabinCollisionWorld(environment:mesh,props:CollisionVolumeWorld(volumes:independent))
@@ -64,6 +68,22 @@ struct Config: Decodable {
         let service=ResidentPropPlacementService(context:context,support:{ support })
         _=try service.commit(.register(prop),expectedLayoutRevision:0,requestID:"register")
 
+        // 8. 回归 2 的终验收：**真实展示台的桌面**必须是承托层，而且真的能在上面摆放。
+        guard let table=ResidentPropPlacementConfiguration.tableCollision(in:manifest) else {
+            print("FAIL: the manifest declares the display table"); exit(1)
+        }
+        let tableTopY=table.center.y+table.halfExtents.y
+        let tableLayers=grid.layers.filter { layer in
+            abs(layer.supportHeight-tableTopY)<0.02
+                && abs(Float(layer.column.x)*grid.spacing+grid.spacing*0.5-table.center.x)
+                    <= table.halfExtents.x
+                && abs(Float(layer.column.z)*grid.spacing+grid.spacing*0.5-table.center.z)
+                    <= table.halfExtents.z
+        }
+        check(!tableLayers.isEmpty,"the real display table top is a support layer")
+        // 把家具顶面当承托面**不能**把屋顶/天花板平面放回来。
+        check(!grid.layers.contains { $0.supportHeight >= 3 },"furniture tops do not readmit the roof")
+        guard let tableLayer=tableLayers.first else { exit(1) }
         func placement(_ layer:PropSupportLayerRef,_ yaw:Float=0) -> WorldPropPlacement {
             .init(surfaceID:"grid.layer\(layer.layer)",position:.init(
                 x:Float(layer.column.x)*grid.spacing+grid.spacing*0.5,
@@ -86,6 +106,16 @@ struct Config: Decodable {
         guard let anchor else {
             print("FAIL: the real coffee never fits anywhere in the derived grid (\(sampled) anchors sampled); first error: \(firstError ?? "none")")
             exit(1)
+        }
+        // 用**真实展示台**做一件小物件（0.2×0.2）的摆放预检：桌面这一层必须能落地。
+        let mug=WorldGeneratedProp(objectID:"test.mug",sourceWishID:"test.mug",assetID:"test.mug",
+            displayName:"杯子",size:WorldVector3(x:0.2,y:0.2,z:0.2),sourceHeight:1)
+        _=try service.commit(.register(mug),expectedLayoutRevision:context.state.layoutRevision,requestID:"register-mug")
+        do {
+            _=try service.preview(objectID:mug.objectID,placement:placement(tableLayer))
+            check(true,"a mug previews on the real display table top (regression 2 acceptance)")
+        } catch {
+            check(false,"a mug on the real display table top (\(error.localizedDescription))")
         }
         check(true,"real coffee fits the derived grid at column (\(anchor.column.x),\(anchor.column.z)) y=\(anchor.supportHeight)")
 

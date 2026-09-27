@@ -309,7 +309,9 @@ func gridKeepsFurnitureTopWithinBand() {
     #expect(report.coveredGroundLayers == 25, "桌子盖住的 25 列，地面被桌面挡住站立")
     #expect(report.reachableLayers == 17 * 17, "可达的是地面（含家具下地面）")
     #expect(report.furnitureBandLayers == 25, "桌面层靠 furnitureBandHeight 保留")
-    #expect(report.standableLayers == 17 * 17, "264 个空地地面 + 25 个桌面自己可站立")
+    // 站立判据用**格心**：桌子四周有一圈列的格心就在桌板旁边，胶囊擦到桌板 → 不可站立。
+    // 它们仍然会被**保留**（地面层是候选，且桌面靠 band 挂上去），只是不计入站立层。
+    #expect(report.standableLayers == 278, "289 个地面里，桌边那圈列的格心胶囊擦到桌板")
 }
 
 @Test("悬浮面在 band 内且正下方有可达地面：作为家具顶面保留（不连通，见 report）")
@@ -494,12 +496,29 @@ func gridWithoutUsableSeedIsEmpty() throws {
         bounds: WorldPlanarBounds(minimumX: -shaft, maximumX: shaft, minimumZ: -shaft, maximumZ: shaft),
         seed: WorldVector3(x: 0, y: 0, z: 0)
     )
-    #expect(sealed.layers.isEmpty)
-    #expect(!sealed.report.seeded)
+    // **语义变化（地面层全部入候选时改断言）**：竖井里那一层地面现在**是候选**
+    // （"地面平面"不再要求站立胶囊塞得进去），所以网格里有这一格、`seeded` 为真。
+    // 但它是"看得见、放不下"：站立层为 0，且**任何** footprint 都会被评估器拒绝。
+    // 关键性质（本条用例真正要钉的）：放宽候选**不会**变成"到处都能放"。
+    #expect(sealed.layers.count == 1)
+    #expect(sealed.report.seeded)
     #expect(sealed.report.layersBeforeFilter == 1)
-    #expect(sealed.report.standableLayers == 0)
+    #expect(sealed.report.standableLayers == 0, "0.25 m 竖井里塞不下站立胶囊")
     #expect(sealed.report.coveredGroundLayers == 0)
-    #expect(sealed.report.layersAfterFilter == 0)
+    #expect(sealed.report.layersAfterFilter == 1)
+    let onlyCell = try #require(sealed.layers.first)
+    #expect(
+        PropPlacementEvaluator.evaluate(
+            footprint: WorldPlanarFootprint(size: SIMD2(0.2, 0.2)),
+            height: 0.2,
+            at: onlyCell,
+            grid: sealed,
+            collision: TriangleMeshCollisionWorld(triangles: shaftTriangles),
+            blockingVolumes: [],
+            placedProps: []
+        ) != nil,
+        "竖井里那一格放不下任何东西"
+    )
 }
 
 @Test("同几何两次派生逐项相等，report 也相等；三角形顺序无关")
@@ -545,13 +564,19 @@ func wallInsideColumnIsRejectedByMesh() throws {
         seed: WorldVector3(x: 0, y: 0, z: 0)
     )
 
-    // 墙脚那两列（世界 x = 0.5 / 0.75，z ∈ [-0.5, 0.5]）整列消失。
-    #expect(grid.layers(at: PropSupportColumn(x: 2, z: 0)).isEmpty)
-    #expect(grid.layers(at: PropSupportColumn(x: 3, z: 0)).isEmpty)
+    // **语义再变化（站立判据改用格心时改断言）**：墙在 x = 0.6，落在列 (2,0) 的格子
+    // （世界 0.5–0.75）里，所以那一列消失；而列 (3,0)（世界 0.75–1.0）是**干净地面** ——
+    // 它的格心 0.875 加上胶囊半径也够不到 0.6，站得下、也放得下。
+    // 旧断言"两列都消失"是列角点探测的产物：角点 0.75 的胶囊会向后擦到墙。
+    #expect(grid.layers(at: PropSupportColumn(x: 2, z: 0)).isEmpty, "墙所在的那一列消失")
 
+    let footprint = WorldPlanarFootprint(size: SIMD2(0.25, 0.25))
+    // 墙右边一列是干净地面，可以放。
+    let besideWall = try #require(supportRef(grid, x: 3, z: 0))
+    #expect(evaluate(footprint, at: besideWall, grid: grid, collision: world) == nil,
+            "墙右边一列是干净地面，可以放")
     // 离墙足够远的列还在，而且能放。
     let clear = try #require(supportRef(grid, x: -2, z: 0))
-    let footprint = WorldPlanarFootprint(size: SIMD2(0.25, 0.25))
     #expect(evaluate(footprint, at: clear, grid: grid, collision: world) == nil)
 }
 

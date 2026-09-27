@@ -490,6 +490,55 @@ private struct PropSupportGridFilter {
     let scannedLayers: [PropSupportLayerRef]
     let layersByColumn: [PropSupportColumn: [PropSupportLayer]]
 
+    /// 格子的代表点：列最小角 + 半格。
+    ///
+    /// 站立判据必须问**格心**，而不是列最小角。理由不是审美：`canOccupy` 问的是
+    /// "胶囊能不能站在这一点上"，而一个格子的代表点就是它的中心。用角点会造出一圈
+    /// "角点落在家具外面、格子却压在家具上"的列 —— 这些列不可站立、列里又没有第二层，
+    /// 于是不在候选里，把家具 footprint 内部的列**整圈隔离**，BFS 进不去，
+    /// 家具底下的地面与家具顶面一起消失（见设计文档 §12 回归 2）。
+    private func cellProbe(column: PropSupportColumn, height: Float) -> SIMD3<Float> {
+        SIMD3(
+            Float(column.x) * parameters.spacing + parameters.spacing * 0.5,
+            height,
+            Float(column.z) * parameters.spacing + parameters.spacing * 0.5
+        )
+    }
+
+    /// 这一列是不是**竖直隔断**（墙）：整列都容不下站立胶囊。
+    ///
+    /// 为什么要单独判它：`canOccupy` 用的是**胶囊**，半径 0.2 m 在 0.25 m 网格下接近一整格。
+    /// 于是任何障碍物旁边都会出现一圈"身体擦到障碍、格心其实没问题"的列，而它们列里又
+    /// 没有第二层，于是既不是站立层也不是家具下地面层 —— 不在候选里，把障碍物内部的列
+    /// **整圈隔离**（地面与家具顶面一起消失）。把站立判据从列角点挪到格心只是改变环的宽度，
+    /// 治不了根。
+    ///
+    /// 真正的分界是**障碍有多高**：
+    /// - 低矮障碍（台阶、桌面）：它的**上方**容得下身体 → 地面平面在那里是连续的；
+    /// - 墙：整列都进不去 → 才是真正的隔断。
+    ///
+    /// 判定成本按列记忆化。探测高度取该列自己的层高、地面、以及 `地面 + maximumStepHeight`
+    /// （最后这个是为了"旁边就有一级台阶、格心不在台阶上"的环列）。
+    private func isFullHeightObstruction(
+        column: PropSupportColumn,
+        ground: Float,
+        cache: inout [PropSupportColumn: Bool]
+    ) -> Bool {
+        if let cached = cache[column] { return cached }
+        let capsule = parameters.capsule
+        var heights: [Float] = [ground]
+        for layer in layersByColumn[column] ?? [] { heights.append(layer.supportHeight) }
+        heights.append(ground + parameters.maximumStepHeight)
+        let result = !heights.contains { height in
+            guard height.isFinite, height >= ground - 0.0001,
+                  height <= ground + capsule.height + 0.0001
+            else { return false }
+            return collision.canOccupy(capsule, at: cellProbe(column: column, height: height))
+        }
+        cache[column] = result
+        return result
+    }
+
     func run() -> (
         layers: [PropSupportLayerRef],
         report: PropSupportGridReport,
@@ -521,7 +570,7 @@ private struct PropSupportGridFilter {
             guard let columnLayers = layersByColumn[column], let ground = columnLayers.first else {
                 continue
             }
-            if collision.canOccupy(capsule, at: ground.center.simd3) {
+            if collision.canOccupy(capsule, at: cellProbe(column: column, height: ground.supportHeight)) {
                 standable.insert(groundRef)
             } else if columnLayers.dropFirst().contains(where: {
                 $0.supportHeight - ground.supportHeight > 0.0001
@@ -530,12 +579,24 @@ private struct PropSupportGridFilter {
             }) {
                 coveredGround.insert(groundRef)
             }
-            for layer in columnLayers.dropFirst() where collision.canOccupy(capsule, at: layer.center.simd3) {
+            for layer in columnLayers.dropFirst()
+            where collision.canOccupy(capsule, at: cellProbe(column: column, height: layer.supportHeight)) {
                 standable.insert(PropSupportLayerRef(column: column, layer: layer))
             }
         }
+        // 候选 = 站立层 ∪ 家具下地面层 ∪ **所有地面层**。
+        //
+        // 为什么"所有地面层"也要进候选（而不是只进站立层）：`canOccupy` 用的是**胶囊**，
+        // 半径 0.2 m 在 0.25 m 网格下接近一整格。障碍物旁边因此有一圈"身体擦到障碍、
+        // 格心其实没问题"的列；如果它们不在候选里，就会把障碍物内部的列整圈隔离。
+        // 让地面层全部入候选之后，**墙靠"不可达"被排除**（它是竖直隔断，横向过不去，
+        // 又不满足 band 条件），而不是靠"不在候选里"—— 后者是一个几何近似，
+        // 会把台阶边缘、桌面旁边这些**真正连续的地面**一起误杀。
         var candidates = standable
         candidates.formUnion(coveredGround)
+        candidates.formUnion(scannedLayers.filter { $0.layer.layer == 0 })
+        // "整列都进不去吗"的按列缓存：每个列最多问一次，横向 8 邻域共享。
+        var fullHeightCache: [PropSupportColumn: Bool] = [:]
 
         let baseReport = PropSupportGridReport(
             columns: columnsWithSupport,
@@ -611,10 +672,16 @@ private struct PropSupportGridFilter {
                           abs(layer.supportHeight - current.supportHeight)
                               <= parameters.maximumStepHeight + 0.0001
                     else { continue }
+                    // 地面层之间：只要不是**竖直隔断**，地面平面就是连续的。
+                    // 低矮障碍（台阶、桌面）挡得住站立胶囊，但其上方容得下身体，
+                    // 所以它不应该把地板劈成两块。
                     let bothGroundLevel = current.layer.layer == 0 && layer.layer == 0
+                    let groundPlaneContinues = bothGroundLevel
+                        && !isFullHeightObstruction(column: column, ground: layer.supportHeight,
+                                                    cache: &fullHeightCache)
                     let furnitureFloorLevel = coveredGround.contains(current)
                         || coveredGround.contains(ref)
-                    guard (bothGroundLevel && furnitureFloorLevel)
+                    guard (bothGroundLevel && (furnitureFloorLevel || groundPlaneContinues))
                         || collision.canTraverse(
                             capsule,
                             from: current.center.simd3,
