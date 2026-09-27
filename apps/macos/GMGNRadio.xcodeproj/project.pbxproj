@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		00A6BDE2BE36617F32C7B3A2 /* AgentConversationServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 17A3DE66E68B4A0E15047818 /* AgentConversationServiceTests.swift */; };
+		0183599BCE0055F20464F7CA /* PropSupportGridPicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C764576419E37F7B13BAB58 /* PropSupportGridPicker.swift */; };
 		022B8A3C0241787B9679F7ED /* VRMAvatarMetalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9DC0013373B44A5DFD680348 /* VRMAvatarMetalView.swift */; };
 		023A4F188354D28E15BBCD57 /* FoliaSceneRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB7307989361CD9BA9432B67 /* FoliaSceneRuntime.swift */; };
 		0288310CEA68635FE7EDC404 /* ProgramPlaybackQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F772420CF42B6F465A7F93A /* ProgramPlaybackQueueTests.swift */; };
@@ -435,6 +436,7 @@
 		8A9A0DF149EE2164BBDE40EB /* OrbMotionModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbMotionModelTests.swift; sourceTree = "<group>"; };
 		8BBF9F8F8D467021C46B08F5 /* AcousticTrackAnalyzer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcousticTrackAnalyzer.swift; sourceTree = "<group>"; };
 		8BC6A0897CCA1202FE5CC208 /* ResidentDSHHostToolsBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentDSHHostToolsBridge.swift; sourceTree = "<group>"; };
+		8C764576419E37F7B13BAB58 /* PropSupportGridPicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PropSupportGridPicker.swift; sourceTree = "<group>"; };
 		8FF24F42B5B2AAA879E95FC5 /* LocalMusicPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalMusicPlayer.swift; sourceTree = "<group>"; };
 		908F400DB2F1BAA7F52A31FB /* GMGNRadio.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = GMGNRadio.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		91AE9B5CC47487FE7A0A86CE /* AgentProgramPlanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentProgramPlanner.swift; sourceTree = "<group>"; };
@@ -957,6 +959,7 @@
 				CB1CE401DC46221687D05BF6 /* PropGenerationConfiguration.swift */,
 				22092892913901B6B9A639FF /* PropGenerationStore.swift */,
 				7042ABB00311D453A5D5E557 /* PropImagePreparation.swift */,
+				8C764576419E37F7B13BAB58 /* PropSupportGridPicker.swift */,
 				AC7A4B6E567E74C7977C92ED /* PropTaskDaemonClient.swift */,
 				0E16B502423D8CB2B119C833 /* RemoteMotionLibrary.swift */,
 				C12A593D2E39AA38BDE94F2C /* ResidentImageAttachment.swift */,
@@ -1485,6 +1488,7 @@
 				A6C74A559603EC578B1554EC /* PropGenerationSettingsSection.swift in Sources */,
 				F6DB346A7C0E9037A9199668 /* PropGenerationStore.swift in Sources */,
 				977A6550B9EDEDE80B2D0915 /* PropImagePreparation.swift in Sources */,
+				0183599BCE0055F20464F7CA /* PropSupportGridPicker.swift in Sources */,
 				49CF26C41737F0892F222A5D /* PropTaskDaemonClient.swift in Sources */,
 				4AAB471D551D8A088912E7A4 /* QQMusicProviderClient.swift in Sources */,
 				B3D5D78DF1FC2D95AE00D4DA /* RadioPluginAvailability.swift in Sources */,
