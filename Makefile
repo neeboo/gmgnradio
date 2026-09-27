@@ -59,6 +59,7 @@ test-python:
 # it, so this target is slow (minutes, not seconds).
 test-harnesses:
 	swift tools/test-first-use-guidance.swift
+	swift tools/test-living-resident-loop.swift
 	swift tools/test-resident-status-lifecycle.swift
 	swift tools/test-resident-chat-transcript.swift
 	swift tools/test-resident-voice-authorization.swift

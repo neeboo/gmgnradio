@@ -24,6 +24,15 @@ let imageDeclarations = ["struct ResidentImageAttachment", "struct ResidentChatS
 let machineSource = try String(contentsOf: sources.appendingPathComponent("Presence/WishMachineScene.swift"), encoding: .utf8)
 let machineIDs = machineSource.components(separatedBy: .newlines).filter { $0.contains("static let worldID =") || $0.contains("static let propID =") }.joined(separator: "\n")
 let loopMethods = ["private func ensureResidentLoop(", "private func synchronizeResidentLoopPresentation(",
+                   // 生产把回合失败出口从内联的可见状态改成了具名的
+                   // presentResidentLoopFailure：失败文本仍写进同一可见表面，
+                   // 只是后台回合不再替用户展开聊天。整套方法原文抽取，行为不变。
+                   "private func presentResidentLoopFailure(",
+                   // synchronizeResidentLoopPresentation 现在还会在空闲时给出
+                   // 「一个后端都没装」的设置指引；指引文案与判断逻辑由
+                   // test-first-use-guidance 专测，这里必须编译同一份真实实现，
+                   // 才能证明它不会盖掉真实失败状态。
+                   "private func refreshResidentBackendGuidance(",
                    "private struct ResidentMemoryTurnSlot", "private func registerResidentMemoryTurn(",
                    "private func presentResidentReply(", "private func confirmResidentMemoryTurn(",
                    "private static func residentMemoryObservedAt(",
@@ -38,7 +47,10 @@ let contextMethod = app.contains("private func currentResidentWorldContext(")
 let toolsMethod = app.contains("private func makeResidentWorldTools(")
     ? declaration("private func makeResidentWorldTools(", in: app) : ""
 let controller = try String(contentsOf: sources.appendingPathComponent("DesktopPresence/LiveCamWindowController.swift"), encoding: .utf8)
-let replyMethods = ["func beginAgentReply(", "func finishAgentReply(", "func showChatStatus(", "func setResidentThinking("].map { declaration($0, in: controller) }.joined(separator: "\n")
+// 失败出口改为 showFailureStatus（LiveCam）与 showResidentFailureStatus（舞台），
+// residentStatusText 是「空闲时是否已有提示」的判断依据；三者都按当前生产签名原文抽取。
+let replyMethods = ["func beginAgentReply(", "func finishAgentReply(", "func showChatStatus(", "func setResidentThinking(",
+                    "func showFailureStatus(", "var residentStatusText"].map { declaration($0, in: controller) }.joined(separator: "\n")
 let harness = #"""
 import Foundation
 import WorldRuntime
@@ -159,7 +171,12 @@ func worldPayload(_ prompt: String) throws -> [String: Any] {
 typealias RealConversationService = AgentConversationService
 @MainActor final class LiveCamPanel {
     var replies: [String] = []
+    // 真实 LiveCamPanel 只有一个可见状态槽（residentStatusText），并用生产的
+    // ResidentStatusNoticeMerge 按类别合并：failure 不被后续 info/voice 覆盖。
+    // statuses 记录每次真正改变可见状态槽的发布，供断言使用。
     var statuses: [String] = []
+    private var statusNotice: String?
+    private var statusKind: ResidentStatusNoticeKind = .info
     var text = ""
     var thinking = false
     func setResidentThinking(_ value: Bool) { thinking = value }
@@ -167,7 +184,21 @@ typealias RealConversationService = AgentConversationService
         text = reply
         if reply != "…" && !reply.isEmpty { replies.append(reply) }
     }
-    func showChatStatus(_ value: String) { text = value; statuses.append(value) }
+    // 普通提示与失败提示共用同一个可见槽，并按真实面板的类别规则合并：居民回合
+    // 失败（含后端预检失败）走 showFailureStatus，绝不会被后续普通提示盖掉。
+    func showChatStatus(_ value: String) { apply(value, kind: .info) }
+    func showFailureStatus(_ value: String) { apply(value, kind: .failure) }
+    // 真实面板正是用这个属性回答「当前是否已有提示」；生产据此决定要不要补设置指引。
+    var residentStatusText: String? { statusNotice }
+    private func apply(_ value: String, kind: ResidentStatusNoticeKind) {
+        let decision = ResidentStatusNoticeMerge.resolve(incoming: value, kind: kind,
+            current: statusNotice, currentKind: statusKind)
+        let changed = decision.text != statusNotice || decision.kind != statusKind
+        statusNotice = decision.text
+        statusKind = decision.kind
+        text = decision.text ?? ""
+        if let notice = decision.text, changed { statuses.append(notice) }
+    }
 }
 @MainActor final class Surface {
     let panel = LiveCamPanel()
@@ -245,6 +276,10 @@ typealias RealConversationService = AgentConversationService
         memoryDeliveryResults.append(result)
     }
     private var residentAgentLoop: ResidentAgentLoop?
+    // 「未确认送达」界面提示的生命周期策略：生产在 GMGNRadioApp 里就是
+    // `private var residentUnconfirmedNotice = ResidentUnconfirmedNoticePolicy()`，
+    // 这里保留同名同类型，让抽取出的调用点编译到真实实现上（不是空桩）。
+    private var residentUnconfirmedNotice = ResidentUnconfirmedNoticePolicy()
     private var residentChatTranscript = ResidentChatTranscript()
     private var residentTranscriptScopeKey: String { "harness-scope" }
     private func publishResidentTranscript() {}
@@ -255,9 +290,13 @@ typealias RealConversationService = AgentConversationService
     var liveCamWindowController: Surface? = Surface()
     final class StageReply {
         func beginResidentReply() {}
-        func finishResidentReply(_ text: String) {}
-        func showResidentChatStatus(_ text: String) {}
-        func setResidentThinking(_ thinking: Bool) {}
+        // 舞台的居民呈现方法现在都带 autoRevealsChat：后台/自驱回合只更新状态，
+        // 不替用户展开聊天。签名与默认值同 StageWindowController 现状一致。
+        func finishResidentReply(_ text: String, autoRevealsChat: Bool = true) {}
+        func showResidentChatStatus(_ text: String, autoRevealsChat: Bool = true) {}
+        func showResidentFailureStatus(_ text: String, autoRevealsChat: Bool = false) {}
+        func setResidentThinking(_ thinking: Bool, autoRevealsChat: Bool = true) {}
+        var residentStatusText: String? { nil }
         var progress: String?
         func setResidentProgress(_ value: String?) { progress = value }
         func setResidentDeliveryNotice(_ notice: String?) {}
@@ -743,11 +782,16 @@ func jsonEqual(_ lhs: Any, _ rhs: Any) -> Bool {
             app.stop()
             locator.setAvailable(false)
             await app.send("provider-disappeared")
-            let failureStatuses = app.liveCamWindowController?.statuses
-            check(failureStatuses?.count == 1, "new preflight failure is visible")
+            // 生产现在会在没有可用后端时先由 refreshResidentBackendGuidance 发布
+            // 「未安装后端」的设置指引（同属 failure 类别），真实预检失败随后按
+            // ResidentStatusNoticeMerge 的 (.failure, .failure) 规则覆盖它：发布日志
+            // 因此会多出一条，可见槽里只剩预检失败。断言直接看可见提示本身，
+            // 既不放过「指引冒充失败」，也不因为中间那条指引而误报。
+            let failureNotice = app.liveCamWindowController?.residentStatusText
+            check(failureNotice?.contains("尚未安装") == true, "new preflight failure is visible")
             await runner.finish(0, session: "stale-session", reply: "stale-reply", exit: staleExit)
             await old.value
-            check(app.liveCamWindowController?.statuses == failureStatuses, "old failure cannot replace newer preflight error")
+            check(app.liveCamWindowController?.residentStatusText == failureNotice, "old failure cannot replace newer preflight error")
             check(app.liveCamWindowController?.replies.isEmpty == true, "old success cannot replace newer preflight error")
             check(app.agentSpeechAnnouncer.spoken.isEmpty, "old success after preflight failure cannot trigger TTS")
             check(service.preferenceStore.sessionID(for: .codex) == nil, "preflight failure cancels old session persistence")

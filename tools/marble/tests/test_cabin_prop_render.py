@@ -9,6 +9,28 @@ RENDER = ROOT / "apps/macos/Sources/GMGNRadio/VisualEngine/Metal/MarbleSpatialVi
 PROPS = ROOT / "apps/macos/Sources/GMGNRadio/MMD/PMXStageAvatarRenderer.swift"
 
 
+def extract_declaration(source, header):
+    """Return the whole Swift declaration starting at `header`, braces balanced.
+
+    Splicing with "next declaration" text markers is fragile: any unrelated type
+    inserted between two declarations silently leaks into the excerpt and drags
+    in symbols the harness never declares. Matching the closing brace at the
+    declaration's own depth keeps the excerpt to exactly one type.
+    """
+    start = source.index(header)
+    opening = source.index("{", start)
+    depth = 0
+    for index in range(opening, len(source)):
+        character = source[index]
+        if character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start:index + 1]
+    raise AssertionError(f"unbalanced Swift declaration for {header!r}")
+
+
 class CabinPropRenderTests(unittest.TestCase):
     def test_independent_jukebox_uses_local_metres_without_room_geometry(self):
         source = PROPS.read_text()
@@ -82,11 +104,12 @@ print("Explicit metre calibration PASS")
     def test_prop_proxy_has_twelve_transformed_faces(self):
         source = RENDER.read_text()
         self.assertTrue("static func boxPositions(" in source)
-        mesh = source.split("enum MarbleOccluderMesh {", 1)[1].split(
-            "@MainActor\nfinal class MarbleSpatialView", 1)[0]
+        # MarbleOccluderMesh is followed by ResidentPropSurfaceEligibility
+        # (which needs MTKView / MarbleSpatialView) before MarbleSpatialView, so
+        # the excerpt must stop at the enum's own closing brace.
+        mesh = extract_declaration(source, "enum MarbleOccluderMesh {")
         program = """import simd
 struct WorldTriangle { let first, second, third: SIMD3<Float> }
-enum MarbleOccluderMesh {
 """ + mesh
         program += """
 var transform = matrix_identity_float4x4
@@ -108,23 +131,51 @@ print("Prop depth proxy PASS")
 
     def test_scene_kit_bounds_convert_at_the_real_render_call_site(self):
         source = RENDER.read_text()
-        mesh = source.split("enum MarbleOccluderMesh {", 1)[1].split(
-            "@MainActor\nfinal class MarbleSpatialView", 1)[0]
+        mesh = extract_declaration(source, "enum MarbleOccluderMesh {")
         call_site = source.split("            let bounds = node.boundingBox", 1)[1].split(
             "        } else {", 1)[0]
+        # The production call site lives in MarbleSpatialRenderer and reads two
+        # of that renderer's private stored properties: marbleWishMachineNode
+        # and residentDisplayStandNode. A verbatim excerpt of the method body
+        # therefore cannot type-check on its own, so mirror those two properties
+        # as parameters named exactly like the renderer's state. The extracted
+        # statements stay untouched; only the surrounding context is supplied.
         program = """import SceneKit
 import simd
 struct WorldTriangle { let first, second, third: SIMD3<Float> }
-enum MarbleOccluderMesh {
 """ + mesh + """
-let node = SCNNode(geometry: SCNBox(width: 0.5, height: 1.2, length: 0.42, chamferRadius: 0))
-node.simdPosition = SIMD3<Float>(2, 0.6, -3)
-let propVertices: [SIMD3<Float>]
-let bounds = node.boundingBox
+
+func renderVertices(
+    marbleWishMachineNode: SCNNode?,
+    residentDisplayStandNode: SCNNode?
+) -> [SIMD3<Float>] {
+    let node = SCNNode(geometry: SCNBox(width: 0.5, height: 1.2, length: 0.42, chamferRadius: 0))
+    node.simdPosition = SIMD3<Float>(2, 0.6, -3)
+    let propVertices: [SIMD3<Float>]
+    let bounds = node.boundingBox
 """ + call_site + """
-assert(propVertices.count == 36)
-assert(abs(propVertices.map(\\.x).min()! - 1.75) < 0.001)
-assert(abs(propVertices.map(\\.y).min()!) < 0.001)
+    return propVertices
+}
+
+// Cabin prop only, the pre-machine/stand state the original assertion covered.
+let propOnly = renderVertices(marbleWishMachineNode: nil, residentDisplayStandNode: nil)
+assert(propOnly.count == 36)
+assert(abs(propOnly.map(\\.x).min()! - 1.75) < 0.001)
+assert(abs(propOnly.map(\\.y).min()!) < 0.001)
+
+// Wish machine and resident display stand are now appended at the same call
+// site. Place them clear of the prop so the aggregate bounds only hold if each
+// branch converts its own SceneKit boundingBox with its own simdTransform.
+let machine = SCNNode(geometry: SCNBox(width: 0.2, height: 0.2, length: 0.2, chamferRadius: 0))
+machine.simdPosition = SIMD3<Float>(2, 0.6, 3)
+let stand = SCNNode(geometry: SCNBox(width: 1, height: 0.1, length: 1, chamferRadius: 0))
+stand.simdPosition = SIMD3<Float>(3, 0.6, -3)
+let allVertices = renderVertices(marbleWishMachineNode: machine, residentDisplayStandNode: stand)
+assert(allVertices.count == 108)
+assert(abs(allVertices.map(\\.x).min()! - 1.75) < 0.001)
+assert(abs(allVertices.map(\\.x).max()! - 3.5) < 0.001)
+assert(abs(allVertices.map(\\.y).min()!) < 0.001)
+assert(abs(allVertices.map(\\.z).max()! - 3.1) < 0.001)
 print("SceneKit bounds render call-site PASS")
 """
         result = subprocess.run(["swift", "-"], input=program, text=True,
