@@ -44,12 +44,18 @@ struct ResidentPropPreparedAsset: Equatable, Sendable {
 }
 
 enum ResidentPropRenderSelection {
+    /// 只做**去重**（同一 objectID 保留一次）与 preview 替换，**不再截断件数**。
+    ///
+    /// 这里曾经硬编码 4 件：`.prefix(4)` 会把第 5 件及以后直接丢掉，而
+    /// `result.count < 4` 会让超出上限的 preview 不出现。两者都是**静默丢数据**——
+    /// 用户摆好的家具会凭空消失。件数如果要有上限，必须由世界模型给出**可见的拒绝**，
+    /// 而渲染端只按自己的预算决定"这一帧画多少"。
     static func resolve(_ objects: [ResidentPropRenderDescriptor], preview: ResidentPropRenderDescriptor?, worldID: String?) -> [ResidentPropRenderDescriptor] {
         var seen = Set<String>()
-        var result = objects.filter { $0.worldID == worldID && seen.insert($0.objectID).inserted }.prefix(4).map { $0 }
+        var result = objects.filter { $0.worldID == worldID && seen.insert($0.objectID).inserted }
         if let preview, preview.worldID == worldID {
             if let index = result.firstIndex(where: { $0.objectID == preview.objectID }) { result[index] = preview }
-            else if result.count < 4 { result.append(preview) }
+            else { result.append(preview) }
         }
         return result
     }

@@ -19,6 +19,16 @@ import simd
     private var submitted = Set<String>()
     private var failed = Set<String>()
     private(set) var assetLoadCount = 0
+    /// 已解析 GLB 资产的预算。每个资产是一次完整解析 + 纹理上传，所以必须有上限；
+    /// 但**预算只决定"先画谁"，绝不决定"能不能放"**：能放多少由世界模型说了算，
+    /// 渲染端预算不足时只是这一帧不画，等资产被释放后自然补上。
+    static let assetBudget = 32
+    /// 同时进行的 GLB 解析上限。一次放下 30 件时不应该同时解析 30 个 GLB。
+    static let maximumConcurrentLoads = 4
+    /// 当前被需要的资产键（已摆放 + 手持）。
+    private var activeAssetKeys: Set<String> {
+        Set(desired.map(\.assetKey) + (desiredHeld.map { [$0.assetKey] } ?? []))
+    }
     var onStatusChanged: (@MainActor (String, WishMachineOutputStatus) -> Void)?
 
     init(device: MTLDevice, colorFormat: MTLPixelFormat, depthFormat: MTLPixelFormat) {
@@ -50,7 +60,8 @@ import simd
         }
         var next = ResidentPropRenderSelection.resolve(objects, preview: preview, worldID: nextWorld)
         let nextHeld = held.flatMap { $0.worldID == nextWorld ? $0 : nil }
-        if nextHeld != nil, next.count == 4 { next.removeLast() }
+        // 手持与已摆放各自计数。旧代码在手持时会砍掉最后一件已摆放物件，
+        // 用户看到的是"我摆的家具自己消失了"——静默丢数据，不再保留该行为。
         let previous = Dictionary(uniqueKeysWithValues: desired.map { ($0.objectID,$0.assetKey) })
             .merging(desiredHeld.map { [$0.objectID: $0.assetKey] } ?? [:]) { _, new in new }
         desired=next;desiredHeld=nextHeld
@@ -65,6 +76,11 @@ import simd
             if previous[item.objectID] != item.assetKey { submitted.remove(item.objectID);failed.remove(item.objectID) }
             if cache[item.assetKey] == nil { submitted.remove(item.objectID) }
             guard !submitted.contains(item.objectID), !failed.contains(item.objectID), objectLoads[item.objectID] == nil else { continue }
+            // 预算 / 并发闸门：超了就**本帧不加载**，下次 update 会自然重试。
+            // 刻意不抛错 —— 抛错会被上面的 catch 标成 failed，那件家具就永远画不出来了。
+            Self.makeRoom(cache: &cache, active: activeAssetKeys)
+            guard cache.count + loads.count < Self.assetBudget,
+                  objectLoads.count < Self.maximumConcurrentLoads else { continue }
             onStatusChanged?(item.objectID,.loading(id:item.objectID))
             if cache[item.assetKey] != nil { continue }
             let epoch=generation
@@ -84,6 +100,23 @@ import simd
         }
     }
 
+    /// 为即将加载的资产腾位置。
+    ///
+    /// **只淘汰当前不需要的资产**（按资产键排序，保证确定性）。刻意不淘汰"当前需要
+    /// 但距离较远"的资产：那会让它在下一帧被重新加载，和本次要加载的资产来回抖动
+    /// （每帧一次完整 GLB 解析）。所以预算真的用尽时，调用方选择"这一帧不画"，
+    /// 等资产自然释放（收回物件、切换空间、退出编辑器）后补上。
+    static func makeRoom(
+        cache: inout [String: WishMachineOutputRenderer.Loaded],
+        active: Set<String>
+    ) {
+        guard cache.count >= assetBudget else { return }
+        for key in cache.keys.filter({ !active.contains($0) }).sorted() {
+            cache.removeValue(forKey: key)
+            if cache.count < assetBudget { return }
+        }
+    }
+
     func prepare(_ item: ResidentHeldPropDescriptor) async throws -> ResidentPropPreparedAsset {
         try await prepare(Self.renderDescriptor(for: item))
     }
@@ -97,10 +130,10 @@ import simd
         if let existing=cache[key] { asset=existing }
         else {
             if loads[key] == nil {
-                let active=Set(desired.map(\.assetKey) + (desiredHeld.map { [$0.assetKey] } ?? []))
-                if cache.count+loads.count >= 5,
-                   let evict=cache.keys.sorted().first(where: { !active.contains($0) }) { cache.removeValue(forKey:evict) }
-                guard cache.count+loads.count < 5 else { throw WishMachineOutputError.renderUnavailable }
+                Self.makeRoom(cache: &cache, active: activeAssetKeys)
+                // 兜底：update 已经做过预算闸门，正常路径不会走到这里。直接调用
+                // prepare 的外部路径仍然得到可见失败，而不是静默不加载。
+                guard cache.count+loads.count < Self.assetBudget else { throw WishMachineOutputError.renderUnavailable }
                 let device=device,color=colorFormat,depth=depthFormat
                 let output=WishMachineOutputDescriptor(id:item.objectID,worldID:item.worldID,modelURL:item.modelURL,targetHeightMeters:item.targetHeightMeters)
                 assetLoadCount += 1

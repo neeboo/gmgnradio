@@ -51,6 +51,16 @@ func check(_ value: Bool, _ message: String) { if !value { print("FAIL:",message
   check(ResidentPropRenderSelection.resolve([a,b],preview:preview,worldID:"w")==[preview,b],"preview replaces original exactly once")
   check(ResidentPropRenderSelection.resolve([a,b],preview:nil,worldID:"w")==[a,b],"cancel restores formal transforms")
   check(ResidentPropRenderSelection.resolve([a,b],preview:preview,worldID:"other").isEmpty,"world isolation")
+  // 不再截断件数。这里曾经硬编码 4：第 5 件起会被静默丢弃，用户摆的家具凭空消失。
+  let many=(0..<6).map { i in ResidentPropRenderDescriptor(objectID:"m\(i)",worldID:"w",assetID:"shared",modelURL:url,targetHeightMeters:0.8,position:p,yaw:0) }
+  check(ResidentPropRenderSelection.resolve(many,preview:nil,worldID:"w").count==6,
+        "every placed prop is selected, not just the first four")
+  check(ResidentPropRenderSelection.resolve(many,preview:many[5],worldID:"w").count==6,
+        "previewing an existing prop does not change the count")
+  let extra=ResidentPropRenderDescriptor(objectID:"extra",worldID:"w",assetID:"shared",modelURL:url,targetHeightMeters:0.8,position:p,yaw:0)
+  let withExtra=ResidentPropRenderSelection.resolve(many,preview:extra,worldID:"w")
+  check(withExtra.count==7 && withExtra.last?.objectID=="extra",
+        "a preview for a new prop is appended rather than dropped at the old cap")
   let identity=matrix_identity_float4x4
   check(ResidentPropProjection.point(normalized:SIMD2(0.5,0.5),surfaceY:0,inverseViewProjection:identity)==nil,"parallel ray rejected")
   var camera=identity;camera.columns.2=SIMD4(0,-1,0,0);camera.columns.1=SIMD4(0,0,1,0);camera.columns.3=SIMD4(0,2,0,1)
