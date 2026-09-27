@@ -47,6 +47,7 @@ struct MotionPackageStore {
     static let naturalIdleID = "idle"
     static func liveStore() throws -> Self { Self() }
     func activeMotion() throws -> StageMotionAsset? { nil }
+    func listMotions() throws -> [StageMotionAsset] { [] }
     func activate(id: String) throws {}
 }
 \#(declaration("enum StageAvatarActivity:", in: spatial))
@@ -58,6 +59,15 @@ typealias StageAvatarPlacement = Placement
 struct CameraHome { static let defaultHome = Self() }
 struct Camera { mutating func reset(to: CameraHome) {} }
 @MainActor final class Spatial {
+    final class Ownership { func invalidate() {} }
+    let residentPropRenderOwnership = Ownership()
+    func clearResidentPropRendererHooks() {}
+    var residentPropPreview: Int?
+    var residentHeldProp: Int?
+    var residentPropDisplayStand: Int?
+    var residentPropOutputs: [Int] = []
+    var residentPropRenderStatuses: [String: Int] = [:]
+    var residentPropViewProjection: Int?
     var selectedWorldID: String? = "cabin"
     var onWorldSelectionChanged: (() -> Void)?
     var calibratedWorldID: String?
@@ -69,6 +79,10 @@ struct Camera { mutating func reset(to: CameraHome) {} }
     \#(worldSelection)
 }
 @MainActor final class App {
+    func safelyReturnHeldProp(reason: String) {}
+    var residentWishImages: [String: String] = [:]
+    final class AudioGraph { func setResidentSpeechPlaying(_ playing: Bool) {} }
+    let audioGraph = AudioGraph()
     final class Loop { func invalidate() {} }
     var residentAgentLoop: Loop?
     var lastResidentActivityRequestID: String?

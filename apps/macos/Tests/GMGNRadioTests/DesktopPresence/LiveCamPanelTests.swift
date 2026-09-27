@@ -551,7 +551,7 @@ func liveCamComposerSendsTrimmedTextAndReturnsToObservation() {
     let panel = LiveCamPanel(
         frame: CGRect(x: 0, y: 0, width: 224, height: 336),
         contentView: NSView(),
-        onSendMessage: { messages.append($0) }
+        onSendMessage: { messages.append($0.text) }
     )
 
     panel.interactionView.chatButton.performClick(nil)

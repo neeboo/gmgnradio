@@ -1199,11 +1199,20 @@ struct PMXStageAvatarRendererTests {
     }
 
     @Test
-    func fullStageGroundingDoesNotFeedSoleMotionBackIntoRootLockedDance() {
+    func fullStageGroundingLiftsRootLockedClipsOneSidedly() {
+        // Root translation is preserved by preparedMotion, so a root-locked clip
+        // that drops the body must be lifted out of the floor ...
         #expect(
             PMXFullStageGroundingPolicy.offset(
                 rootMotionEnabled: false,
                 animatedOffset: 12.5
+            ) == 12.5
+        )
+        // ... but it must never be lowered, so authored jumps/floats survive.
+        #expect(
+            PMXFullStageGroundingPolicy.offset(
+                rootMotionEnabled: false,
+                animatedOffset: -12.5
             ) == 0
         )
         #expect(
@@ -1211,6 +1220,12 @@ struct PMXStageAvatarRendererTests {
                 rootMotionEnabled: true,
                 animatedOffset: 12.5
             ) == 12.5
+        )
+        #expect(
+            PMXFullStageGroundingPolicy.offset(
+                rootMotionEnabled: true,
+                animatedOffset: -12.5
+            ) == -12.5
         )
     }
 
@@ -1464,7 +1479,7 @@ struct PMXStageAvatarRendererTests {
     }
 
     @Test
-    func naturalIdleRelaxesStandardMMDArmsAndBreathes() throws {
+    func missingBonesIdleDoesNotGenerateReplacementMotion() throws {
         let model = MMDNode()
         for name in ["左腕", "右腕", "上半身", "頭"] {
             let bone = MMDNode()
@@ -1473,30 +1488,7 @@ struct PMXStageAvatarRendererTests {
         }
 
         let idle = PMXStageAvatarRenderer.naturalIdleMotion(for: model)
-        let tracks = try #require(idle.animations).compactMap {
-            $0 as? CAKeyframeAnimation
-        }
-        let leftArm = try #require(
-            tracks.first { $0.keyPath == "/左腕.transform.quaternion" }
-        )
-        let rightArm = try #require(
-            tracks.first { $0.keyPath == "/右腕.transform.quaternion" }
-        )
-        let chest = try #require(
-            tracks.first { $0.keyPath == "/上半身.transform.quaternion" }
-        )
-        let head = try #require(
-            tracks.first { $0.keyPath == "/頭.transform.quaternion" }
-        )
-        let leftValue = try #require(leftArm.values?.first as? NSValue)
-            .scnVector4Value
-        let rightValue = try #require(rightArm.values?.first as? NSValue)
-            .scnVector4Value
-
-        #expect(leftValue.z < -0.2)
-        #expect(rightValue.z > 0.2)
-        #expect(chest.values?.count == 3)
-        #expect(head.values?.count == 3)
+        #expect(try #require(idle.animations).isEmpty)
         #expect(idle.duration > 3)
         #expect(idle.repeatCount == .infinity)
     }

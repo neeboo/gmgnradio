@@ -47,7 +47,7 @@ func fake() {
             let disabled = CommandLine.arguments.contains { $0.contains("\"fixture.server\"={enabled=false}") }
             emit(["id": id, "result": ["config": [
                 "features": Dictionary(uniqueKeysWithValues: ["plugins", "apps", "hooks", "multi_agent", "multi_agent_v2", "image_generation", "shell_tool"].map { ($0, false) }),
-                "agents": ["enabled": false], "notify": [String](), "web_search": "disabled", "cli_auth_credentials_store": "file", "mcp_oauth_credentials_store": "file",
+                "agents": ["enabled": false], "notify": [String](), "web_search": "live", "cli_auth_credentials_store": "file", "mcp_oauth_credentials_store": "file",
                 "mcp_servers": ["fixture.server": ["enabled": !(disabled && mode != "unsafe"), "secret": "PRIVATE-CONFIG"]]
             ]]])
         case "thread/start", "thread/resume": emit(["id": id, "result": ["thread": ["id": "resident-session"]]])
@@ -159,6 +159,20 @@ func fake() {
                 ResidentCodexTransport(executableURL: executable, arguments: ["--fake", mode, audit.path] + args, currentDirectoryURL: cwd, environment: env, requestTimeout: 1)
             })
             return (agent, audit)
+        }
+        for prompt in ["请看这张图片", ""] {
+            let (agent, audit) = try make("early")
+            let image = directory.appendingPathComponent("prepared image.png")
+            _ = try await agent.send(prompt: prompt, imageURLs: [image], sessionID: nil, toolsJSON: tools) { _, _, _ in
+                ResidentCodexToolReply(resultJSON: bytes(["ok": true]), isError: false)
+            }
+            let lines = try String(contentsOf: audit, encoding: .utf8).split(separator: "\n").map { json(Data($0.utf8)) }
+            let turn = lines.first { $0["method"] as? String == "turn/start" }!["params"] as! [String: Any]
+            let input = turn["input"] as! [[String: Any]]
+            check(input.last?["type"] as? String == "localImage", "image is native localImage input")
+            check(input.last?["path"] as? String == image.path, "prepared local image path preserved")
+            check(input.filter { $0["type"] as? String == "text" }.count == (prompt.isEmpty ? 0 : 1), "pure image does not need a fake text prompt")
+            check((turn["runtimeWorkspaceRoots"] as? [String]) == [], "image does not expand workspace access")
         }
         func frames(_ file: URL) throws -> [[String: Any]] {
             try String(contentsOf: file, encoding: .utf8).split(separator: "\n").map { json(Data($0.utf8)) }
@@ -276,6 +290,56 @@ func fake() {
             fatalError("FAIL: a failed tool cannot authorize silence")
         } catch { check(error is ResidentCodexAgentError, "failed tool cannot authorize silent completion") }
 
+        // 工具回执原生图片通道：响应 schema 恰为 contentItems [inputText,
+        // inputImage(data:image/png;base64,…)] + success；不带 localImage/path；
+        // 超预算图片按失败处理，静默完成只有在图片验证也通过后才被允许。
+        func codexFixtureImage(pngBytes: Int) -> ResidentVisionImage {
+            let camera = ResidentVisionCameraStamp(label: "codex-fixture", kind: .fullStageObserver,
+                position: [0, 0, 0], yaw: 0, pitch: 0, fieldOfViewDegrees: 66, coordinateSpace: "world")
+            let stamp = ResidentVisionRenderedStamp(surfaceProfile: "full_stage_drawable", frameIndex: 1,
+                capturedAt: Date(timeIntervalSince1970: 100), worldID: "fixture", residentAvatarID: nil,
+                residentAvatarFrameRevision: nil, residentPosition: nil, camera: camera)
+            let frame = ResidentVisionRenderedFrame(pixelsBGRA: Data(repeating: 0x7F, count: 16),
+                width: 4, height: 1, bytesPerRow: 16, stamp: stamp)
+            return ResidentVisionImage(pngData: Data(repeating: 0x50, count: pngBytes),
+                metadata: ResidentVisionMetadata.make(renderedFrame: frame,
+                    perspective: .currentObservation, expectedWorldRevision: nil), fileURL: nil)
+        }
+        do {
+            let (imageAgent, imageFile) = try make("silentImage")
+            let imageResult = try await imageAgent.send(prompt: "自主查看", sessionID: nil, toolsJSON: loopTools,
+                allowsSilentCompletion: { true }, onToolCall: { _, _, _ in
+                    ResidentCodexToolReply(resultJSON: bytes(["ok": true, "message": "真实画面"]), isError: false,
+                        image: codexFixtureImage(pngBytes: 256))
+                })
+            check(imageResult.reply.isEmpty, "a fully validated image reply permits quiet completion")
+            let response = try frames(imageFile).first { $0["id"] as? String == "tool-request" }?["result"] as? [String: Any]
+            let items = response?["contentItems"] as? [[String: Any]]
+            check(response?["success"] as? Bool == true, "validated image reply reports success")
+            check(items?.first?["type"] as? String == "inputText", "the reply text rides inputText")
+            check(items?.count == 2 && items?.last?["type"] as? String == "inputImage",
+                "the real PNG rides one native inputImage item")
+            let imageURL = items?.last?["imageUrl"] as? String ?? ""
+            check(imageURL.hasPrefix("data:image/png;base64,"), "the inputImage item carries a PNG data URL")
+            check(!imageURL.hasPrefix("file:") && !imageURL.contains("/tmp/"), "no local file path leaks into the reply")
+        }
+        do {
+            let (deniedAgent, deniedFile) = try make("silentImage")
+            do {
+                _ = try await deniedAgent.send(prompt: "自主查看", sessionID: nil, toolsJSON: loopTools,
+                    allowsSilentCompletion: { true }, onToolCall: { _, _, _ in
+                        ResidentCodexToolReply(resultJSON: bytes(["ok": true]), isError: false,
+                            image: codexFixtureImage(pngBytes: 513 * 1024))
+                    })
+                fatalError("FAIL: an over-budget image must fail validation and deny silence")
+            } catch { check(error is ResidentCodexAgentError, "an over-budget image fails the turn") }
+            let deniedResponse = try frames(deniedFile).first { $0["id"] as? String == "tool-request" }?["result"] as? [String: Any]
+            check(deniedResponse?["success"] as? Bool == false, "an over-budget image returns a failed result")
+            let deniedItems = deniedResponse?["contentItems"] as? [[String: Any]] ?? []
+            check(!deniedItems.contains { $0["type"] as? String == "inputImage" },
+                "an over-budget image never ships image bytes")
+        }
+
         let (duringTool, duringToolAudit) = try make("steerDuringTool")
         var pendingTool: CheckedContinuation<Void, Never>?
         let duringToolTask = Task {
@@ -324,10 +388,11 @@ func fake() {
         check(await service.steerResident("闲置") == .notDelivered, "service idle steering returns unsent")
         let context = ResidentWorldContext(selectedWorldID: "fixture", worldID: "fixture", displayName: nil,
             revision: 1, residentPosition: nil, activeActivity: nil, activityPhase: nil, objects: [], availableActivities: [])
-        defaults.set("legacy-session", forKey: AgentConversationPreferenceKeys.sessionKey(for: .codex) + "." + context.sessionScope + ".tools.v1")
+        defaults.set("legacy-session", forKey: AgentConversationPreferenceKeys.sessionKey(for: .codex) + "." + context.sessionScope + ".tools.v5")
         let serviceTools = ResidentConversationTools(worldID: "fixture", schemasJSON: tools,
             call: { _, _, _ in ResidentCodexToolReply(resultJSON: bytes(["ok": true]), isError: false) }, cancel: {})
-        let serviceTask = Task { try await service.send("播放", worldContext: context, worldTools: serviceTools) }
+        let serviceImage = directory.appendingPathComponent("service-image.png")
+        let serviceTask = Task { try await service.send("播放", imageURLs: [serviceImage], worldContext: context, worldTools: serviceTools) }
         for _ in 0..<200 {
             if try frames(serviceAudit).contains(where: { $0["method"] as? String == "turn/start" }) { break }
             try await Task.sleep(nanoseconds: 5_000_000)
@@ -335,8 +400,12 @@ func fake() {
         try await Task.sleep(nanoseconds: 10_000_000)
         check(await service.steerResident("慢一点") == .delivered, "service steers the actual active resident")
         check(try await serviceTask.value == "已完成空间活动", "steering retains original reply task")
+        let serviceTurn = try frames(serviceAudit).first { $0["method"] as? String == "turn/start" }!["params"] as! [String: Any]
+        check((serviceTurn["input"] as? [[String: Any]])?.last?["path"] as? String == serviceImage.path, "service forwards images through actual resident agent transport")
         check(try !frames(serviceAudit).contains { $0["method"] as? String == "thread/resume" }, "new tools registry does not resume legacy session")
-        check(service.preferenceStore.sessionID(for: .codex, scope: context.sessionScope + ".tools.v3") == "resident-session", "new registry session is stored separately")
+        check(service.preferenceStore.sessionID(for: .codex, scope: context.sessionScope + ".tools.v8") == "resident-session", "new web-reference registry session is stored separately")
+        check(service.preferenceStore.sessionID(for: .codex, scope: context.sessionScope + ".tools.v7") == nil, "the previous registry session is never reused after the web-reference upgrade")
+        check(service.preferenceStore.sessionID(for: .codex, scope: context.sessionScope + ".tools.v5") == "legacy-session", "old resident session remains intact after one-time tool registry upgrade")
         check(await service.steerResident("结束后") == .notDelivered, "service releases finished resident")
         service.selectBackend(.dsh)
         check(await service.steerResident("不支持") == .notDelivered, "unsupported backend steering remains unsent")
@@ -351,7 +420,16 @@ let main = work.appendingPathComponent("Checks.swift")
 try program.write(to: main, atomically: true, encoding: .utf8)
 let binary = work.appendingPathComponent("checks")
 let compiler = Process(); compiler.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
-compiler.arguments = ["swiftc", "-j1", "-swift-version", "6", "-parse-as-library", source.path] + ["ResidentCodexTransport", "ResidentCodexPolicy", "AgentConversationService", "CodexCLI", "ResidentSteeringDelivery"].map { root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/\($0).swift").path } + [main.path, "-o", binary.path]
+let agentFiles = ["ResidentCodexTransport", "ResidentCodexPolicy", "AgentConversationService", "CodexCLI",
+    "ResidentSteeringDelivery", "ResidentDSHTransport", "ResidentDSHConfiguration",
+    "ResidentStateClient", "ResidentMemoryClient", "ResidentConversationMemory",
+    "ResidentDSHAgentToolBridge", "ResidentDSHHostToolsBridge",
+    "ResidentClaudeToolBridge", "ResidentClaudeProcessRunner"].map {
+    root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/\($0).swift").path
+}
+let visionFile = root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/ResidentVisionCapture.swift")
+compiler.arguments = ["swiftc", "-j1", "-swift-version", "6", "-parse-as-library", source.path]
+    + agentFiles + [visionFile.path] + [main.path, "-o", binary.path]
 try compiler.run(); compiler.waitUntilExit()
 guard compiler.terminationStatus == 0 else { exit(compiler.terminationStatus) }
 let test = Process(); test.executableURL = binary; try test.run(); test.waitUntilExit(); exit(test.terminationStatus)

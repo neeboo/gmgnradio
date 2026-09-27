@@ -26,6 +26,11 @@ for required in ["var worldID:", "var activeActivityID:", "var message:", "func 
 let navigation = declaration("final class GMGNSettingsNavigation:", in: settings)
 let run = declaration("func runLivingWorldActivity(id: String) {", in: app)
 let stop = declaration("func stopLivingWorldActivity() {", in: app)
+guard let availability = run.range(of: "guard isResidentActivityAvailable(id)"),
+      let start = run.range(of: "try context.startActivity"), availability.lowerBound < start.lowerBound,
+      app.contains("definitions: context.manifest.activityDefinitions.filter { isResidentActivityAvailable($0.id) }") else {
+    print("FAIL: activity menu must filter and recheck actual avatar/motion availability"); exit(1)
+}
 for method in [run, stop] {
     guard method.contains("canControl(worldID: spatialStage.selectedWorldID)"),
           method.contains("menu.report("),

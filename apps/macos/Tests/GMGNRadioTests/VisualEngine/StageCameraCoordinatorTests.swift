@@ -305,7 +305,7 @@ func directorUpdatesDoNotOverrideAnActiveUserCamera() throws {
 
 @Test
 @MainActor
-func fullStageCameraPansWithAvatarWithoutMovingIntoTheWorld() throws {
+func fullStageCameraSmoothsAvatarFollowWithoutMovingIntoTheWorld() throws {
     let suite = try #require(
         UserDefaults(suiteName: "StageCameraCoordinatorTests.avatarFollow")
     )
@@ -326,12 +326,230 @@ func fullStageCameraPansWithAvatarWithoutMovingIntoTheWorld() throws {
         to: SIMD3<Float>(0.72, 1.4, 0.55)
     )
 
+    // The 30 Hz snapshot step is queued, not applied as a whole-frame jump.
+    #expect(stage.camera.yaw == 0.7)
+    #expect(stage.pendingAvatarFollowYaw != 0)
+
+    // Render frames digest the queued rotation smoothly to the same final yaw
+    // the old immediate follow produced (rotation is conserved, no snap-back).
+    for _ in 0..<120 {
+        stage.advanceAvatarFollowRotation(deltaTime: 1.0 / 60.0)
+    }
     #expect(stage.camera.position == SIMD3<Float>(0.4, 0.82, 2.1))
     let previousBearing = atan2(Float(0.4), Float(3.0))
     let currentBearing = atan2(Float(-0.32), Float(1.55))
     let expectedYaw = 0.7 + currentBearing - previousBearing
-    #expect(abs(stage.camera.yaw - expectedYaw) < 0.0001)
+    #expect(abs(stage.camera.yaw - expectedYaw) < 0.0005)
     #expect(stage.camera.pitch == -0.2)
+    #expect(stage.pendingAvatarFollowYaw.magnitude < 0.0005)
+}
+
+@Test
+@MainActor
+func fullStageFollowDigestsPartiallyEachRenderFrame() throws {
+    let suite = try #require(
+        UserDefaults(suiteName: "StageCameraCoordinatorTests.partialFollow")
+    )
+    suite.removePersistentDomain(
+        forName: "StageCameraCoordinatorTests.partialFollow"
+    )
+    let stage = SpatialStageStore(defaults: suite)
+    let coordinator = StageCameraCoordinator(spatialStage: stage)
+    coordinator.activateFullStage()
+    let startYaw = stage.camera.yaw
+
+    coordinator.followAvatarHorizontally(
+        from: SIMD3<Float>(0, 0, -0.9),
+        to: SIMD3<Float>(0.72, 1.4, 0.55)
+    )
+    let queued = stage.pendingAvatarFollowYaw
+    let appliedFirstFrame = stage.advanceAvatarFollowRotation(
+        deltaTime: 1.0 / 60.0
+    )
+
+    #expect(appliedFirstFrame > 0)
+    #expect(appliedFirstFrame < abs(queued) * 0.6)
+    #expect(stage.pendingAvatarFollowYaw == queued - appliedFirstFrame)
+    // Only yaw moves: position, pitch and height stay untouched while following.
+    let camera = stage.camera
+    #expect(camera.yaw == startYaw + appliedFirstFrame)
+    #expect(camera.pitch == 0)
+}
+
+@Test
+@MainActor
+func fullStageFollowDropsItsBacklogAfterARenderGap() throws {
+    let suite = try #require(
+        UserDefaults(suiteName: "StageCameraCoordinatorTests.followGap")
+    )
+    suite.removePersistentDomain(forName: "StageCameraCoordinatorTests.followGap")
+    let stage = SpatialStageStore(defaults: suite)
+    let coordinator = StageCameraCoordinator(spatialStage: stage)
+    coordinator.activateFullStage()
+    let cameraBefore = stage.camera
+
+    coordinator.followAvatarHorizontally(
+        from: SIMD3<Float>(0, 0, -0.9),
+        to: SIMD3<Float>(0.72, 1.4, 0.55)
+    )
+    #expect(stage.pendingAvatarFollowYaw != 0)
+
+    // Render loop was stopped (occluded/hidden) for seconds: the stale backlog
+    // is discarded, never swung into a giant single-frame rotation.
+    let applied = stage.advanceAvatarFollowRotation(deltaTime: 2)
+    #expect(applied == 0)
+    #expect(stage.pendingAvatarFollowYaw == 0)
+    #expect(stage.camera == cameraBefore)
+}
+
+@Test
+@MainActor
+func userCameraOrbitCancelsQueuedFollowAndSuppressesNewFollow() throws {
+    let suite = try #require(
+        UserDefaults(suiteName: "StageCameraCoordinatorTests.userOrbit")
+    )
+    suite.removePersistentDomain(forName: "StageCameraCoordinatorTests.userOrbit")
+    let stage = SpatialStageStore(defaults: suite)
+    let coordinator = StageCameraCoordinator(spatialStage: stage)
+    coordinator.activateFullStage()
+
+    coordinator.followAvatarHorizontally(
+        from: SIMD3<Float>(0, 0, -0.9),
+        to: SIMD3<Float>(0.72, 1.4, 0.55)
+    )
+    #expect(stage.pendingAvatarFollowYaw != 0)
+
+    // The user starts an orbit drag: queued follow rotation is cancelled at
+    // the moment of the interaction so it cannot fight the drag.
+    stage.look(deltaX: 20, deltaY: 0)
+    #expect(stage.pendingAvatarFollowYaw == 0)
+    let yawAfterDrag = stage.camera.yaw
+
+    // While the user is still interacting, new follow deltas are suppressed.
+    coordinator.followAvatarHorizontally(
+        from: SIMD3<Float>(0.72, 1.4, 0.55),
+        to: SIMD3<Float>(1.4, 1.4, 1.2)
+    )
+    #expect(stage.pendingAvatarFollowYaw == 0)
+    #expect(stage.camera.yaw == yawAfterDrag)
+
+    // Once the interaction is old enough, follow resumes from fresh deltas.
+    stage.noteCameraYawInteraction(
+        at: ContinuousClock.now.advanced(
+            by: .seconds(-(AvatarFollowUserPolicy.suppressionInterval + 1))
+        )
+    )
+    coordinator.followAvatarHorizontally(
+        from: SIMD3<Float>(1.4, 1.4, 1.2),
+        to: SIMD3<Float>(2.2, 1.4, 0.5)
+    )
+    #expect(stage.pendingAvatarFollowYaw != 0)
+}
+
+@Test
+@MainActor
+func resetCameraCancelsQueuedFollowRotation() throws {
+    let suite = try #require(
+        UserDefaults(suiteName: "StageCameraCoordinatorTests.userReset")
+    )
+    suite.removePersistentDomain(forName: "StageCameraCoordinatorTests.userReset")
+    let stage = SpatialStageStore(defaults: suite)
+    stage.installCameraHome(
+        SpatialCameraState(
+            position: SIMD3<Float>(2, 1, 3),
+            yaw: 0.4,
+            pitch: 0
+        )
+    )
+    let coordinator = StageCameraCoordinator(spatialStage: stage)
+    coordinator.activateFullStage()
+
+    coordinator.followAvatarHorizontally(
+        from: SIMD3<Float>(0, 0, -0.9),
+        to: SIMD3<Float>(0.72, 1.4, 0.55)
+    )
+    #expect(stage.pendingAvatarFollowYaw != 0)
+
+    stage.resetCamera()
+    #expect(stage.pendingAvatarFollowYaw == 0)
+    #expect(stage.camera == SpatialCameraState(position: SIMD3<Float>(2, 1, 3), yaw: 0.4))
+}
+
+@Test
+@MainActor
+func leavingFullStageCancelsQueuedFollowRotation() throws {
+    let suite = try #require(
+        UserDefaults(suiteName: "StageCameraCoordinatorTests.leaveFullStage")
+    )
+    suite.removePersistentDomain(
+        forName: "StageCameraCoordinatorTests.leaveFullStage"
+    )
+    let stage = SpatialStageStore(defaults: suite)
+    let coordinator = StageCameraCoordinator(spatialStage: stage)
+    coordinator.activateFullStage()
+    #expect(stage.isAvatarFollowActive)
+
+    coordinator.followAvatarHorizontally(
+        from: SIMD3<Float>(0, 0, -0.9),
+        to: SIMD3<Float>(0.72, 1.4, 0.55)
+    )
+    #expect(stage.pendingAvatarFollowYaw != 0)
+
+    coordinator.activateLiveCam()
+    #expect(!stage.isAvatarFollowActive)
+    #expect(stage.pendingAvatarFollowYaw == 0)
+
+    // Live Cam (or any non-following owner) never digests or applies follow
+    // rotation even if a stale call arrives.
+    let cameraBefore = stage.camera
+    let applied = stage.advanceAvatarFollowRotation(deltaTime: 1.0 / 60.0)
+    #expect(applied == 0)
+    #expect(stage.camera == cameraBefore)
+}
+
+@Test
+@MainActor
+func followRotationIsInertWhileTheStoreIsNotInFullStage() throws {
+    let suite = try #require(
+        UserDefaults(suiteName: "StageCameraCoordinatorTests.followInert")
+    )
+    suite.removePersistentDomain(forName: "StageCameraCoordinatorTests.followInert")
+    let stage = SpatialStageStore(defaults: suite)
+    let cameraBefore = stage.camera
+
+    stage.enqueueAvatarFollowYaw(0.4)
+    #expect(stage.pendingAvatarFollowYaw == 0)
+    #expect(stage.advanceAvatarFollowRotation(deltaTime: 1.0 / 60.0) == 0)
+    #expect(stage.camera == cameraBefore)
+}
+
+@Test
+@MainActor
+func cameraHomeReplacementDropsStaleFollowRotation() throws {
+    let suite = try #require(
+        UserDefaults(suiteName: "StageCameraCoordinatorTests.homeFollow")
+    )
+    suite.removePersistentDomain(forName: "StageCameraCoordinatorTests.homeFollow")
+    let stage = SpatialStageStore(defaults: suite)
+    let coordinator = StageCameraCoordinator(spatialStage: stage)
+    coordinator.activateFullStage()
+
+    coordinator.followAvatarHorizontally(
+        from: SIMD3<Float>(0, 0, -0.9),
+        to: SIMD3<Float>(0.72, 1.4, 0.55)
+    )
+    #expect(stage.pendingAvatarFollowYaw != 0)
+
+    // A whole-camera replacement (world/scene/home) must not be followed by a
+    // rotation backlog computed against the old view.
+    stage.installCameraHome(
+        SpatialCameraState(
+            position: SIMD3<Float>(0, 0.82, 2.05),
+            yaw: 0,
+            pitch: 0
+        )
+    )
+    #expect(stage.pendingAvatarFollowYaw == 0)
 }
 
 @Test

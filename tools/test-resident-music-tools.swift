@@ -75,7 +75,7 @@ func json(_ result: RealtimeDJToolResult) -> [String: Any] { try! JSONSerializat
             dispatcher: WorldAgentToolDispatcher(takeoverEnabled: { true }, context: context),
             deadline: Date().addingTimeInterval(30), isCurrent: { current }, additionalTools: bridge.tools)
         let schemas = try JSONSerialization.jsonObject(with: session.toolSchemasJSON) as! [[String: Any]]
-        check(schemas.count == 9, "real session registers music and four world tools")
+        check(schemas.count == 13, "real session registers music and eight world tools")
         for tool in bridge.tools {
             check(tool.inputSchema["additionalProperties"] as? Bool == false, "shared schema closes extra arguments")
         }

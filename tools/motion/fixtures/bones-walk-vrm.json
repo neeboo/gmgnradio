@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "filename": "walk_ff_stop_180_R_normal_pace_001__A443",
+  "sourceSHA256": "c6cbe36345c303f136aa0914a086de7a1af80f38a6eb67dc32afcfe71b7e2fc2",
+  "startFrame": 61,
+  "endFrame": 197,
+  "outputFPS": 120,
+  "maxSeamDegrees": 4,
+  "maxFootSeamMeters": 0.018,
+  "maxVerticalSeamMeters": 0.002,
+  "selection": "One continuous recorded forward gait cycle before deceleration; excludes the stationary end of the full source."
+}

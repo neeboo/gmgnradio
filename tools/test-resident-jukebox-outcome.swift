@@ -23,6 +23,12 @@ func declaration(_ signature: String, in text: String) -> String {
     fatalError("unterminated declaration")
 }
 let appSource = try String(contentsOf: sources.appendingPathComponent("App/GMGNRadioApp.swift"), encoding: .utf8)
+let toolLeaseMethod = declaration("private func makeResidentWorldTools(", in: appSource)
+guard toolLeaseMethod.contains("let deadline = Date().addingTimeInterval(300)"),
+      toolLeaseMethod.components(separatedBy: "deadline: deadline").count == 3 else {
+    print("FAIL: activity result and world tools must share the same 300-second turn deadline")
+    exit(1)
+}
 let resumeMethod = declaration("private func resumeResidentJukebox(", in: appSource)
 let pauseMethod = declaration("private func pauseResidentJukebox(", in: appSource)
 let toggleMethod = declaration("func toggleLocalPlayback() {", in: appSource)
@@ -94,6 +100,7 @@ enum PlayerError: Error { case missingTrack, pauseFailed }
         localMusicPlayer.state = .playing
     }
     func pauseMusic() async throws { pauses += 1; localMusicPlayer.state = .paused; residentJukeboxPlaybackOwner = nil }
+    func stopResidentLoop(reason: String) -> Bool { residentAgentLoop?.stop(); return true }
     func presentPlaybackError(_ error: Error) { check(false, "unexpected fake local player failure") }
     func startPreparedProgramPlayback() {}
     \#(resumeMethod)
@@ -283,13 +290,13 @@ func code(_ result: RealtimeDJToolResult) -> String? { (try? JSONSerialization.j
         do {
             let f = try Fixture(); _ = await f.start()
             let reloaded = try Fixture(); _ = await reloaded.start()
-            check(f.context.currentActivityRequestID == reloaded.context.currentActivityRequestID,
-                  "real independent contexts can reuse executor request IDs")
+            check(f.context.currentActivityRequestID != reloaded.context.currentActivityRequestID,
+                  "independent world contexts isolate executor request IDs")
             let staleApp = AppPlaybackHarness(f.context)
             staleApp.scheduleAutomaticEffect(f.context.snapshot)
             staleApp.livingWorldContext = reloaded.context
             for _ in 0..<100 { await Task.yield() }
-            check(staleApp.resumes == 0, "actual delayed App effect cannot play into reloaded context with reused request ID")
+            check(staleApp.resumes == 0, "actual delayed App effect cannot play into reloaded world context")
             for state: LocalMusicPlaybackState in [.idle, .paused, .ready, .playing] {
                 let app = AppPlaybackHarness(f.context)
                 app.localMusicPlayer.state = state

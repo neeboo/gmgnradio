@@ -462,6 +462,9 @@ def retarget_bvh_to_motion_spec(
         ).as_euler("XYZ", degrees=False)
         rotations = np.unwrap(rotations, axis=0)
         degrees = np.rad2deg(rotations)
+        # A 720-degree period preserves quaternion signs across complete rolls.
+        # Keep already bounded samples unchanged, including published assets.
+        degrees = np.where(np.abs(degrees) > 360.0, (degrees + 360.0) % 720.0 - 360.0, degrees)
         tracks[target_name] = [
             {"t": sample_index / output_fps, "r": [float(value) for value in degrees[sample_index]]}
             for sample_index in range(len(sampled))

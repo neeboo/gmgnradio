@@ -19,7 +19,7 @@ let switches = ["plugins", "apps", "hooks", "multi_agent", "multi_agent_v2", "im
 var safe: [String: Any] = [
     "features": Dictionary(uniqueKeysWithValues: switches.map { ($0, false) }),
     "agents": ["enabled": false], "notify": [String](),
-    "web_search": "disabled", "cli_auth_credentials_store": "file", "mcp_oauth_credentials_store": "file",
+    "web_search": "live", "cli_auth_credentials_store": "file", "mcp_oauth_credentials_store": "file",
     "mcp_servers": ["fixture.server": ["enabled": false, "env": ["TOKEN": "fixture-private"]]]
 ]
 let names = try ResidentCodexPolicy.serverNames(in: data(safe))
@@ -29,6 +29,8 @@ check(args.first == "app-server", "app server command")
 check(args.contains("cli_auth_credentials_store=\"file\""), "file-only auth at process startup")
 check(args.contains("features.plugins=false") && args.contains("features.hooks=false"), "disable startup extensions")
 check(args.contains("notify=[]"), "disable legacy notify")
+check(args.contains("web_search=\"live\""), "resident web search stays enabled with live mode")
+check(!args.joined().contains("web_search=\"disabled\""), "the resident never forces web search off")
 let mcp = args.first { $0.hasPrefix("mcp_servers=") } ?? ""
 check(mcp.contains("\"fixture.server\"={enabled=false}"), "literal dotted server name")
 check(mcp.contains("\"quoted\\\"name\"={enabled=false}"), "escaped server name")
@@ -43,11 +45,16 @@ for key in switches {
     do { try ResidentCodexPolicy.verify(data(altered)) } catch { rejected = true }
     check(rejected, "reject enabled \(key)")
 }
-for (key, value) in [("mcp_servers", ["unknown": [:]] as Any), ("notify", ["command"] as Any), ("cli_auth_credentials_store", "keyring" as Any), ("mcp_oauth_credentials_store", "auto" as Any), ("web_search", "live" as Any), ("agents", ["enabled": true] as Any)] {
+for (key, value) in [("mcp_servers", ["unknown": [:]] as Any), ("notify", ["command"] as Any), ("cli_auth_credentials_store", "keyring" as Any), ("mcp_oauth_credentials_store", "auto" as Any), ("web_search", "disabled" as Any), ("web_search", "" as Any), ("agents", ["enabled": true] as Any)] {
     var altered = safe; altered[key] = value
     var rejected = false
     do { try ResidentCodexPolicy.verify(data(altered)) } catch { rejected = true }
     check(rejected, "reject unsafe \(key)")
+}
+for mode in ["cached", "indexed"] {
+    var altered = safe; altered["web_search"] = mode
+    do { try ResidentCodexPolicy.verify(data(altered)) }
+    catch { check(false, "verify accepts non-disabled web search mode \(mode)") }
 }
 var rejected = false
 do { _ = try ResidentCodexPolicy.serverNames(in: Data("{}".utf8)) } catch { rejected = true }

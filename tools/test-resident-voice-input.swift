@@ -64,6 +64,7 @@ enum VoiceState: Equatable { case disconnected, connecting, connected, listening
     var residentVoiceSession: (any RealtimeDJSession)?
     var residentVoiceEventTask: Task<Void, Never>?
     var residentVoiceShutdownTask: Task<Void, Never>?
+    var residentVoiceShutdownGeneration: UInt64 = 0
     var realtimeVoiceTimeoutTask: Task<Void, Never>?
     var stageWindowController: Panel? = Panel()
     var orbWindowController: Panel? = Panel()
@@ -72,6 +73,7 @@ enum VoiceState: Equatable { case disconnected, connecting, connected, listening
     let trace = Trace()
     func setRealtimeVoiceState(_ state: VoiceState) { self.state = state }
     func showResidentVoiceStatus(_ text: String) { statuses.append(text) }
+    func showResidentVoiceFailure(_ text: String) { statuses.append(text) }
     func sendLiveCamMessage(_ text: String) async {
         disconnectRealtimeVoice()
         trace.entries.append(Task.isCancelled ? "cancelled-send" : "send:\(text)")
@@ -82,6 +84,10 @@ enum VoiceState: Equatable { case disconnected, connecting, connected, listening
     }
     \#(consume)
     \#(shutdown)
+    private func clearResidentVoiceShutdown(generation: UInt64) {
+        guard residentVoiceShutdownGeneration == generation else { return }
+        residentVoiceShutdownTask = nil
+    }
     func receive(_ event: RealtimeDJEvent, id: UUID, session: Session) async {
         await consumeResidentVoiceEvent(event, requestID: id, session: session)
     }

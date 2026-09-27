@@ -17,8 +17,20 @@ func declaration(_ signature: String, in source: String) -> String {
     fatalError("Unbalanced \(signature)")
 }
 let sendMethod = declaration("private func sendLiveCamMessage(", in: app)
+let submissionMethod = declaration("private func sendResidentSubmission(", in: app)
+let submissionSource = declaration("private enum ResidentSubmissionSource", in: app)
+let imageSource = try String(contentsOf: sources.appendingPathComponent("Presence/ResidentImageAttachment.swift"), encoding: .utf8)
+let imageDeclarations = ["struct ResidentImageAttachment", "struct ResidentChatSubmission"].map { declaration($0, in: imageSource) }.joined(separator: "\n")
+let machineSource = try String(contentsOf: sources.appendingPathComponent("Presence/WishMachineScene.swift"), encoding: .utf8)
+let machineIDs = machineSource.components(separatedBy: .newlines).filter { $0.contains("static let worldID =") || $0.contains("static let propID =") }.joined(separator: "\n")
 let loopMethods = ["private func ensureResidentLoop(", "private func synchronizeResidentLoopPresentation(",
-                   "private func performResidentTurn(", "private func cancelResidentMessage("].map {
+                   "private struct ResidentMemoryTurnSlot", "private func registerResidentMemoryTurn(",
+                   "private func presentResidentReply(", "private func confirmResidentMemoryTurn(",
+                   "private static func residentMemoryObservedAt(",
+                   "private func performResidentTurn(",
+                   "private func returnHeldPropBeforeResidentStop(reason: String) -> Bool",
+                   "private func stopResidentLoop(reason: String) -> Bool",
+                   "private func cancelResidentMessage("].map {
     declaration($0, in: app)
 }.joined(separator: "\n")
 let contextMethod = app.contains("private func currentResidentWorldContext(")
@@ -30,6 +42,11 @@ let replyMethods = ["func beginAgentReply(", "func finishAgentReply(", "func sho
 let harness = #"""
 import Foundation
 import WorldRuntime
+// No render host is created; the real vision contracts compile below, while
+// this conversation fixture deliberately has no available capture surface.
+\#(imageDeclarations)
+enum WishMachineScene { \#(machineIDs) }
+enum ResidentPropHostError: LocalizedError { case editorOpen; var errorDescription:String? { "请先结束摆放。" } }
 enum StageVisualMood: String, CaseIterable { case afterglow, liquid, pulse }
 enum StageLyricsVisualMode: String { case auto; static let agentValues = ["auto"]; init?(agentValue: String) { self.init(rawValue: agentValue) } }
 enum SpatialScenePreset: String, CaseIterable { case cabin }
@@ -41,6 +58,16 @@ struct RealtimeDJToolCall: Codable, Equatable, Sendable {
 }
 struct RealtimeDJToolResult: Codable, Equatable, Sendable {
     let callID: String; let resultJSON: Data; let isError: Bool
+}
+
+// The real web-reference tools compile here; their network seam is stubbed because
+// this suite never registers an image (the fixture authorize step returns nil).
+struct ResidentWebImageResponse: Sendable {
+    let data: Data; let mimeType: String; let finalURL: URL
+}
+struct ResidentWebImageDownloader: Sendable {
+    func download(_ url: URL) async throws -> Data { throw URLError(.unsupportedURL) }
+    func fetchPublicData(_ url: URL, maximumBytes: Int) async throws -> ResidentWebImageResponse { throw URLError(.unsupportedURL) }
 }
 
 @MainActor final class FormalRunner {
@@ -116,6 +143,13 @@ struct FixtureWorldState: WorldStatePersisting {
     func save(_ state: WorldState) throws {}
 }
 
+final class RejectWishNetwork: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() { fatalError("Conversation fixtures must never make a generation request") }
+    override func stopLoading() {}
+}
+
 func worldPayload(_ prompt: String) throws -> [String: Any] {
     let json = prompt.components(separatedBy: "空间资料：\n")[1]
         .components(separatedBy: "\n用户消息：")[0]
@@ -143,23 +177,79 @@ typealias RealConversationService = AgentConversationService
     var statuses: [String] { panel.statuses }
     var waiting: Bool { panel.thinking }
     var deliveryNotice: String?
+    var progress: String?
+    func setResidentProgress(_ value: String?) { progress = value }
     func setResidentDeliveryNotice(_ value: String?) { deliveryNotice = value }
     func setResidentCanStop(_ value: Bool) {}
+    func restoreResidentSubmission(_ submission: ResidentChatSubmission, notice: String) { showChatStatus(notice) }
     \#(replyMethods)
 }
 @MainActor final class Speech {
+    enum Outcome { case finished, cancelled, failed }
     var isEnabled = false
     var spoken: [String] = []
+    var completions: [(Outcome) -> Void] = []
     func announce(_ reply: String) { spoken.append(reply) }
-    func stop() {}
+    func announce(_ reply: String, completion: @escaping (Outcome) -> Void) {
+        spoken.append(reply)
+        completions.append(completion)
+    }
+    func complete(_ outcome: Outcome) {
+        let callbacks = completions; completions.removeAll()
+        callbacks.forEach { $0(outcome) }
+    }
+    func stop() { complete(.cancelled) }
 }
 @MainActor final class AppHarness: DJAgentRadioActions {
+    final class Avatar {
+        var thinkingID: UUID?
+        func beginResidentThinking(runID: UUID) { thinkingID = runID }
+        func endResidentThinking(runID: UUID) { if thinkingID == runID { thinkingID = nil } }
+        func clearResidentThinking() { thinkingID = nil }
+    }
+    let avatarRuntime = Avatar()
+    private let wishMachineCoordinator: WishMachineCoordinator
+    // This suite exercises conversation/tool leases with no image or wish event.
+    // Image grants, persistence, rendering and pause are exercised by the focused
+    // test-wish-machine-app-runtime and coordinator suites, not simulated here.
+    private func bindResidentWishScope(_ context: ResidentWorldContext, loop: ResidentAgentLoop) {}
+    private func rebindResidentLoopMemory() {}
+    private func residentSelfState() -> ResidentSelfState? { nil }
+    private func residentVisionSession(messageID: UUID) -> ResidentVisionToolbox.Session? { nil }
+    struct RenderSurface {
+        struct View { var residentVisionSurfaceHandle: (any ResidentVisionSurface)? { nil } }
+        let surfaceView = View()
+    }
+    private let stageRenderSurfaceController: RenderSurface? = nil
+    private func pauseResidentWishContinuations() {}
+    private func authorizeWishImages(_ input: ResidentAgentLoop.Input, worldContext: ResidentWorldContext) throws -> UUID? {
+        precondition(input.imageURLs.isEmpty); return nil
+    }
+    private func registerWishImages(_ attachments: [ResidentImageAttachment], loop: ResidentAgentLoop, worldScope: String) { precondition(attachments.isEmpty) }
+    private func acknowledgeWishEvents(_ events: [ResidentAgentLoop.Event], worldContext: ResidentWorldContext) async throws { precondition(!events.contains { $0.id.hasPrefix("wish.") }) }
+    private func synchronizeWishMachinePresentation() {}
+    private func wishMachinePromptContext(_ context: ResidentWorldContext) -> String { "" }
+    private func reconcileResidentWishPlacements(_ context: ResidentWorldContext) throws {}
+    private func isResidentActivityAvailable(_ id: String) -> Bool { true }
     var musicSelectionGeneration: UInt64 = 0
     // Resolve the production method's singleton lookup to the injected real
     // service; the method itself is compiled unchanged, UI/TTS are inert sinks.
     enum AgentConversationService { static var shared: RealConversationService! }
     private var liveCamMessageID: UUID?
+    private var residentTurnSourceByRunID: [UUID: ResidentMemorySource] = [:]
+    private var residentMemoryTurnSlot: ResidentMemoryTurnSlot?
+    // Memory transport remains unbound. Record the real service's confirmation
+    // results instead of pretending that an external durable write succeeded.
+    var memoryDeliveryResults: [AgentConversationMemoryDeliveryResult] = []
+    private func presentResidentMemoryDeliveryFailure(_ result: AgentConversationMemoryDeliveryResult) {
+        memoryDeliveryResults.append(result)
+    }
     private var residentAgentLoop: ResidentAgentLoop?
+    private var residentChatTranscript = ResidentChatTranscript()
+    private var residentTranscriptScopeKey: String { "harness-scope" }
+    private func publishResidentTranscript() {}
+    private func settleSilentResidentTurnIfNeeded() {}
+    private var residentPropEditingWorldID: String?
     private let residentActivityOwnership = ResidentActivityOwnership()
     private var residentActivityOutcome: ResidentActivityOutcome?
     var liveCamWindowController: Surface? = Surface()
@@ -168,8 +258,11 @@ typealias RealConversationService = AgentConversationService
         func finishResidentReply(_ text: String) {}
         func showResidentChatStatus(_ text: String) {}
         func setResidentThinking(_ thinking: Bool) {}
+        var progress: String?
+        func setResidentProgress(_ value: String?) { progress = value }
         func setResidentDeliveryNotice(_ notice: String?) {}
         func setResidentCanStop(_ canStop: Bool) {}
+        func restoreResidentSubmission(_ submission: ResidentChatSubmission, notice: String) {}
     }
     var stageWindowController: StageReply? = StageReply()
     func disconnectRealtimeVoice() { agentSpeechAnnouncer.stop() }
@@ -181,11 +274,45 @@ typealias RealConversationService = AgentConversationService
     struct Stage { var selectedWorldID = "unloaded-world" }
     var spatialStage = Stage()
     var livingWorldContext: WorldAgentContext?
-    init(_ service: RealConversationService) { AgentConversationService.shared = service }
+    private func residentPropPlacementService(context:WorldAgentContext,isCurrent:@escaping @MainActor ()->Bool) -> ResidentPropPlacementService {
+        ResidentPropPlacementService(context:context,surfaces:[],isCurrent:isCurrent,validateEnvironment:{_,_ in})
+    }
+    private func synchronizeResidentPropPresentation() {}
+    private func prepareResidentPropMutation(_ command:WorldPropLayoutCommand,context:WorldAgentContext) async throws {}
+    private func synchronizeOwnedResidentProps() async {}
+    private func residentWishPlacementGrant(objectID:String,placement:WorldPropPlacement,worldID:String,residentScope:String) throws -> ResidentPropDelegatedGrant {
+        throw WishMachineError.unauthorized
+    }
+    private func recordResidentWishPlacement(_ grant:ResidentPropDelegatedGrant,placement:WorldPropPlacement,worldID:String,residentScope:String) throws {
+        throw WishMachineError.unauthorized
+    }
+    init(_ service: RealConversationService) {
+        AgentConversationService.shared = service
+        // Inherits this executable's temporary fixture directory. Never reads
+        // Application Support or configures a remote generation service.
+        let directory = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent(UUID().uuidString)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RejectWishNetwork.self]
+        let store = fixtureWishStore(directory: directory.appendingPathComponent("core"), session: URLSession(configuration: configuration))
+        wishMachineCoordinator = WishMachineCoordinator(store: store, directory: directory.appendingPathComponent("wish"), canClaim: { _ in nil })
+    }
     \#(sendMethod)
+    \#(submissionSource)
+    \#(submissionMethod)
     \#(loopMethods)
     \#(contextMethod)
     \#(toolsMethod)
+    // Test-only entry: the production method above is compiled unchanged. This
+    // seam only pins liveCamMessageID exactly like performResidentTurn does and
+    // returns the real short-lived lease; it adds no production behavior.
+    func makeLiveResidentTools(messageID: UUID) -> ResidentConversationTools? {
+        liveCamMessageID = messageID
+        return makeResidentWorldTools(messageID: messageID)
+    }
+    func releaseLiveResidentMessage(messageID: UUID) {
+        if liveCamMessageID == messageID { liveCamMessageID = nil }
+    }
+    func currentResidentRunID() -> UUID? { residentAgentLoop?.snapshot.runID }
     private func resumeResidentJukebox(owner: UUID) async throws { fatalError("Use the jukebox outcome suite for playback") }
     private func pauseResidentJukebox(owner: UUID?) async throws { fatalError("Use the jukebox outcome suite for playback") }
     func snapshot(takeoverEnabled: Bool) -> DJAgentRadioState { .init(takeoverEnabled: takeoverEnabled, playbackState: "idle", activeTrackID: nil, activeSlotIndex: nil, program: []) }
@@ -216,6 +343,10 @@ typealias RealConversationService = AgentConversationService
         await sendLiveCamMessage(message)
         await waitUntilIdle()
     }
+    func sendSubmission(_ message: String) async throws {
+        try await sendResidentSubmission(.init(text: message), source: .liveCam)
+        await waitUntilIdle()
+    }
 }
 
 @MainActor var checks = 0
@@ -223,6 +354,11 @@ typealias RealConversationService = AgentConversationService
 @MainActor func check(_ condition: Bool, _ message: String) {
     checks += 1
     if !condition { failures += 1; print("FAIL: \(message)") }
+}
+// Deep JSON value comparison: proves the Claude-selected manifest is the same
+// value the Codex path assembled, not a re-listed or synthetic copy.
+func jsonEqual(_ lhs: Any, _ rhs: Any) -> Bool {
+    (lhs as AnyObject).isEqual(rhs)
 }
 @MainActor func cancelled(_ task: Task<String, Error>) async -> Bool {
     do { _ = try await task.value; return false }
@@ -234,7 +370,13 @@ typealias RealConversationService = AgentConversationService
     let suite = "gmgn-resident-test-\(UUID())"
     let defaults = UserDefaults(suiteName: suite)!
     let runner = ControlledRunner()
-    let service = RealConversationService(locator: locator, defaults: defaults, runnerFactory: { _ in runner })
+    let service = RealConversationService(locator: locator, defaults: defaults, runnerFactory: { _ in runner },
+        claudeRunnerFactory: { _, _, _, _ in runner },
+        claudeEnvironmentProvider: { configDir in
+            // Fixture-only credential: the real whitelist builder runs, but the
+            // secret is a literal here so no process environment is read.
+            ResidentClaudeEnvironment.make(base: ["ANTHROPIC_API_KEY": "fixture"], configDirectory: configDir)
+        })
     service.selectBackend(.codex)
     return (service, runner, defaults, suite)
 }
@@ -258,12 +400,25 @@ typealias RealConversationService = AgentConversationService
             let app = AppHarness(service)
             app.livingWorldContext = context
             app.spatialStage.selectedWorldID = manifest.worldID
-            let request = Task { await app.send("去做个活动") }
+            let request = Task {
+                if mode == "finish" { try await app.sendSubmission("去做个活动") }
+                else { await app.send("去做个活动") }
+            }
             await formal.waitForCalls(1)
             let tools = formal.tools[0]
             check(tools.worldID == manifest.worldID, "\(mode): App binds actual world to formal tools")
-            check((try JSONSerialization.jsonObject(with: tools.schemasJSON) as? [Any])?.count == 11,
-                  "\(mode): App exposes four world, two loop and five music tools")
+            let schemas = try JSONSerialization.jsonObject(with: tools.schemasJSON) as! [[String: Any]]
+            let names = Set(schemas.compactMap { $0["name"] as? String })
+            let previousNames: Set<String> = ["inspect_world", "list_places", "list_available_activities", "plan_route", "move_to",
+                "start_activity", "stop_activity", "look_at",
+                "read_resident_state", "update_resident_intent", "read_radio_state", "read_current_track",
+                "list_music_playlists", "read_music_playlist", "prepare_music_track"]
+            let wishNames: Set<String> = ["submit_wish_generation", "read_wish_generation", "retry_wish_generation", "cancel_wish_generation", "claim_wish_output", "resume_wish_continuation"]
+            let referenceNames: Set<String> = ["search_wish_reference_images", "register_wish_reference_image"]
+            let propNames: Set<String> = ["read_owned_props", "list_placement_surfaces", "preview_prop_placement", "apply_prop_placement", "withdraw_prop", "undo_prop_placement",
+                "hold_prop", "adjust_held_prop_grip", "return_held_prop", "enable_prop_capability"]
+            check(previousNames.isSubset(of: names), "\(mode): App retains eight world, two loop and five music tools")
+            check(names == previousNames.union(wishNames).union(referenceNames).union(propNames) && schemas.count == 33, "\(mode): App exposes six wish, two reference and ten owned-prop tools")
             check(formal.prompts[0].contains("这是居民生活循环的一轮"), "\(mode): actual App supplies generic loop instructions")
             let observed = await tools.call("loop-read", "read_resident_state", Data("{}".utf8))
             check(!observed.isError && !tools.allowsSilentCompletion(), "\(mode): reading state alone does not authorize silent completion")
@@ -285,7 +440,7 @@ typealias RealConversationService = AgentConversationService
                 check(stale.isError && context.state.activeActivity == nil, "\(mode): old App lease rejects mutations immediately")
             }
             formal.finish(0)
-            await request.value
+            try await request.value
             let after = await tools.call("after", "start_activity", Data(#"{"activity_id":"home.idle"}"#.utf8))
             check(after.isError && context.state.activeActivity == nil, "\(mode): completed request releases formal capability lease")
             let latePlan = await tools.call("late-plan", "update_resident_intent", Data(#"{"summary":"迟到的修改","status":"active"}"#.utf8))
@@ -293,6 +448,12 @@ typealias RealConversationService = AgentConversationService
             check(app.liveCamWindowController?.waiting == false, "\(mode): request always ends waiting bubble")
             check(app.liveCamWindowController?.replies == (mode == "finish" ? ["formal reply"] : []),
                   "\(mode): only current world receives formal reply")
+            check(app.memoryDeliveryResults.isEmpty, "\(mode): starting speech alone cannot confirm memory delivery")
+            app.agentSpeechAnnouncer.complete(.finished)
+            check(app.agentSpeechAnnouncer.spoken == (mode == "finish" ? ["formal reply"] : []),
+                  "\(mode): only current successfully delivered reply reaches speech")
+            check(app.memoryDeliveryResults.isEmpty,
+                  "\(mode): unbound memory has no delivery receipt and never claims confirmation")
         }
         // Use the shipping manifest and actual WorldAgentContext, with only the
         // external CLI process mocked. No real backend or saved world is read.
@@ -402,7 +563,22 @@ typealias RealConversationService = AgentConversationService
             let second = Task { try await service.send("same-room", worldContext: roomA) }
             await runner.waitForCalls(2)
             let sameArguments = await runner.calls[1].arguments
-            check(backend == .dsh ? sameArguments.last?.contains("only-room-A-history") == true : sameArguments.contains("room-A-session"), "\(backend): room session continues")
+            let sameInput = await runner.calls[1].input
+            let continues: Bool
+            switch backend {
+            case .dsh:
+                continues = sameArguments.last?.contains("only-room-A-history") == true
+            case .claudeCode:
+                // Claude Code has no native resume: same-room continuity must come
+                // from the bounded in-memory history replayed on stdin, and argv
+                // must never carry --resume or the previous session id.
+                continues = sameInput?.contains("only-room-A-history") == true
+                    && !sameArguments.contains("--resume")
+                    && !sameArguments.contains("room-A-session")
+            default:
+                continues = sameArguments.contains("room-A-session")
+            }
+            check(continues, "\(backend): room session continues")
             await runner.finish(1, session: "room-A-session", backend: backend)
             _ = try await second.value
             let third = Task { try await service.send("other-room", history: [.init(role: .user, text: "unsafe-external-history")], worldContext: roomB) }
@@ -430,14 +606,33 @@ typealias RealConversationService = AgentConversationService
             let second = Task { try await service.send("what-is-my-name") }
             await runner.waitForCalls(2)
             let arguments = await runner.calls[1].arguments
-            check(backend == .dsh ? arguments.last?.contains("my-name-is-resident") == true : arguments.contains("resident"), "\(backend): second turn retains context")
+            let secondInput = await runner.calls[1].input
+            let retains: Bool
+            switch backend {
+            case .dsh:
+                retains = arguments.last?.contains("my-name-is-resident") == true
+            case .claudeCode:
+                // Claude context lives only in the bounded stdin history; argv is
+                // always a fresh session with no --resume or session id.
+                retains = secondInput?.contains("my-name-is-resident") == true
+                    && !arguments.contains("--resume")
+                    && !arguments.contains("resident")
+            default:
+                retains = arguments.contains("resident")
+            }
+            check(retains, "\(backend): second turn retains context")
             await runner.finish(1, backend: backend)
             _ = try await second.value
             service.resetSession()
             let third = Task { try await service.send("fresh") }
             await runner.waitForCalls(3)
             let freshArguments = await runner.calls[2].arguments
-            check(!freshArguments.contains("resident") && freshArguments.last?.contains("my-name-is-resident") != true, "\(backend): reset clears context")
+            let freshInput = await runner.calls[2].input
+            // Reset must clear the argv session id and, for Claude, the stdin history.
+            check(!freshArguments.contains("resident")
+                  && freshArguments.last?.contains("my-name-is-resident") != true
+                  && (backend != .claudeCode || freshInput?.contains("my-name-is-resident") != true),
+                  "\(backend): reset clears context")
             await runner.finish(2, backend: backend)
             _ = try await third.value
         }
@@ -611,6 +806,123 @@ typealias RealConversationService = AgentConversationService
             await retry.value
             check(app.liveCamWindowController?.replies == ["recovered"], "UI accepts reply after failure")
         }
+        // Integration regression: selecting the real .claudeCode backend must not
+        // change the production world-tool manifest or the per-turn authority that
+        // App.makeResidentWorldTools assembles. Only the CLI process boundary is
+        // stubbed; no Claude/DSH process, MCP host, UDS, UI, Keychain, window, GPU
+        // or network runs, and no static tool list is asserted against.
+        do {
+            let suite = "gmgn-resident-claude-world-tools-\(UUID())"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let codexRunner = ControlledRunner()
+            let claudeRunner = ControlledRunner()
+            let service = RealConversationService(locator: FixtureLocator(), defaults: defaults,
+                runnerFactory: { _ in codexRunner },
+                residentSender: { _, _, _, _ in
+                    AgentConversationOutcome(reply: "unused", sessionID: nil)
+                },
+                claudeRunnerFactory: { _, _, _, _ in claudeRunner },
+                claudeEnvironmentProvider: { _ in ["ANTHROPIC_API_KEY": "fixture"] })
+            service.selectBackend(.codex)
+            let manifest = try JSONDecoder().decode(WorldManifest.self, from: Data(contentsOf:
+                URL(fileURLWithPath: "apps/macos/Resources/Worlds/marble-living-cabin/world.json")))
+            let context = try WorldAgentContext(manifest: manifest)
+            let app = AppHarness(service)
+            app.livingWorldContext = context
+            app.spatialStage.selectedWorldID = manifest.worldID
+            check(service.supportsWorldTools, "codex: production capability wires world tools")
+
+            // Capture the actual manifest the real Codex selection assembles.
+            let codexMessageID = UUID()
+            let codexTools = app.makeLiveResidentTools(messageID: codexMessageID)
+            check(codexTools != nil, "codex: real App.makeResidentWorldTools returns a lease")
+            let codexSchemas: [[String: Any]] = codexTools.flatMap {
+                try? JSONSerialization.jsonObject(with: $0.schemasJSON) as? [[String: Any]]
+            } ?? []
+            check(codexSchemas.count == 33, "codex: actual App manifest exposes all 33 production schemas")
+            check(codexTools?.visionCapable == false
+                  && !codexSchemas.contains { ($0["name"] as? String) == "capture_space_photo" },
+                  "codex: absent GPU vision surface registers no capture schema")
+            codexTools?.cancel()
+            app.releaseLiveResidentMessage(messageID: codexMessageID)
+
+            // Same real App assembly, now with the production Claude branch selected.
+            service.selectBackend(.claudeCode)
+            check(service.supportsWorldTools, "claudeCode: production capability wires world tools")
+
+            // Start a real Claude-selected resident run with world tools suppressed
+            // (selected world temporarily mismatched) so the turn suspends on the
+            // stubbed CLI boundary without starting the MCP host/UDS or any process.
+            // The real lease is then assembled against that live run.
+            app.spatialStage.selectedWorldID = "claude-lease-probe-world"
+            await app.enqueue("claude lease probe")
+            await claudeRunner.waitForCalls(1)
+            app.spatialStage.selectedWorldID = manifest.worldID
+            let runID = app.currentResidentRunID()
+            check(runID != nil, "claudeCode: a real resident run is active")
+            let claudeTools = runID.flatMap { app.makeLiveResidentTools(messageID: $0) }
+            check(claudeTools != nil, "claudeCode: real App.makeResidentWorldTools returns a lease")
+            let claudeSchemas: [[String: Any]] = claudeTools.flatMap {
+                try? JSONSerialization.jsonObject(with: $0.schemasJSON) as? [[String: Any]]
+            } ?? []
+            check(claudeSchemas.count == 33, "claudeCode: actual App manifest exposes the same 33 production schemas")
+            check((codexSchemas as NSArray).isEqual(claudeSchemas as NSArray),
+                  "claudeCode: actual manifest equals codex manifest as a whole JSON value")
+            var fieldsMatch = codexSchemas.count == claudeSchemas.count
+            if fieldsMatch {
+                for (codex, claude) in zip(codexSchemas, claudeSchemas) {
+                    fieldsMatch = (codex["name"] as? String) == (claude["name"] as? String)
+                        && (codex["description"] as? String) == (claude["description"] as? String)
+                        && jsonEqual(codex["inputSchema"] ?? [:], claude["inputSchema"] ?? [:])
+                    if !fieldsMatch { break }
+                }
+            }
+            check(fieldsMatch, "claudeCode: every schema name/description/inputSchema matches codex field-for-field")
+            check(claudeTools?.worldID == manifest.worldID, "claudeCode: lease binds the real selected world")
+
+            if let claudeTools {
+                let observed = await claudeTools.call("claude-read", "read_resident_state", Data("{}".utf8))
+                check(!observed.isError, "claudeCode: real App lease reads resident state")
+                let started = await claudeTools.call("claude-start", "start_activity", Data(#"{"activity_id":"home.idle"}"#.utf8))
+                check(!started.isError && context.state.activeActivity?.activityID == "home.idle",
+                      "claudeCode: real App-to-service callback starts activity")
+                let stopped = await claudeTools.call("claude-stop", "stop_activity", Data("{}".utf8))
+                check(!stopped.isError && context.state.activeActivity == nil,
+                      "claudeCode: real callback stops activity")
+                claudeTools.cancel()
+                let afterCancel = await claudeTools.call("claude-cancelled", "start_activity", Data(#"{"activity_id":"home.idle"}"#.utf8))
+                check(afterCancel.isError && context.state.activeActivity == nil,
+                      "claudeCode: cancelled lease rejects mutations")
+            }
+
+            // A fresh Claude-selected lease over the same live run is current until
+            // the selected world moves; then it must reject mutations.
+            let switchedTools = runID.flatMap { app.makeLiveResidentTools(messageID: $0) }
+            check(switchedTools != nil, "claudeCode: a fresh real lease assembles")
+            if let switchedTools {
+                let live = await switchedTools.call("claude-live", "read_resident_state", Data("{}".utf8))
+                check(!live.isError, "claudeCode: fresh lease is current in the selected world")
+                app.spatialStage.selectedWorldID = "other-world"
+                let stale = await switchedTools.call("claude-stale", "start_activity", Data(#"{"activity_id":"home.idle"}"#.utf8))
+                check(stale.isError && context.state.activeActivity == nil,
+                      "claudeCode: old lease rejects mutations after the selected world changes")
+            }
+
+            // Let the suspended pure-chat turn finish; nothing external ever ran.
+            await claudeRunner.finish(0, session: "claude-lease-session", reply: "probe reply", backend: .claudeCode)
+            await app.waitUntilIdle()
+
+            // Only Codex/Claude/DSH carry world tools; the remaining backends stay off.
+            for backend in [AgentConversationBackendID.workbuddy, .qoder, .pi] {
+                service.selectBackend(backend)
+                check(!service.supportsWorldTools, "\(backend): production capability keeps world tools off")
+                let messageID = UUID()
+                let unsupportedTools = app.makeLiveResidentTools(messageID: messageID)
+                check(unsupportedTools == nil, "\(backend): real App exposes no world-tool lease")
+                app.releaseLiveResidentMessage(messageID: messageID)
+            }
+        }
         print("\(failures == 0 ? "PASS" : "FAIL"): \(checks) resident conversation checks, \(failures) failures")
         exit(failures == 0 ? 0 : 1)
     }
@@ -635,6 +947,12 @@ let compilerArguments: [String] = ["-j1", "-parse-as-library",
     "-I", root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug/Modules").path,
     sources.appendingPathComponent("Agent/CodexCLI.swift").path,
     sources.appendingPathComponent("Agent/AgentConversationService.swift").path,
+    sources.appendingPathComponent("Agent/ResidentDSHAgentToolBridge.swift").path,
+    sources.appendingPathComponent("Agent/ResidentDSHHostToolsBridge.swift").path,
+    sources.appendingPathComponent("Agent/ResidentClaudeToolBridge.swift").path,
+    sources.appendingPathComponent("Agent/ResidentClaudeProcessRunner.swift").path,
+    sources.appendingPathComponent("Agent/ResidentDSHTransport.swift").path,
+    sources.appendingPathComponent("Agent/ResidentDSHConfiguration.swift").path,
     sources.appendingPathComponent("Agent/WorldAgentContext.swift").path,
     sources.appendingPathComponent("Agent/WorldAgentToolContract.swift").path,
     sources.appendingPathComponent("Agent/WorldAgentToolDispatcher.swift").path,
@@ -645,10 +963,28 @@ let compilerArguments: [String] = ["-j1", "-parse-as-library",
     sources.appendingPathComponent("Agent/ResidentCodexAgent.swift").path,
     sources.appendingPathComponent("Agent/ResidentSteeringDelivery.swift").path,
     sources.appendingPathComponent("Agent/ResidentAgentLoop.swift").path,
+    sources.appendingPathComponent("Agent/ResidentMemoryStore.swift").path,
+    sources.appendingPathComponent("Agent/ResidentStateClient.swift").path,
+    sources.appendingPathComponent("Agent/ResidentMemoryClient.swift").path,
+    sources.appendingPathComponent("Agent/ResidentConversationMemory.swift").path,
+    sources.appendingPathComponent("Presence/ResidentVisionCapture.swift").path,
+    sources.appendingPathComponent("Agent/ResidentVisionTools.swift").path,
+    sources.appendingPathComponent("Agent/ResidentVisionImageBox.swift").path,
     sources.appendingPathComponent("Agent/ResidentLoopTools.swift").path,
     sources.appendingPathComponent("Agent/ResidentActivityOwnership.swift").path,
     sources.appendingPathComponent("Agent/DJAgentToolDispatcher.swift").path,
     sources.appendingPathComponent("Agent/ResidentMusicToolBridge.swift").path,
+    sources.appendingPathComponent("Presence/ResidentPropPlacementService.swift").path,
+    sources.appendingPathComponent("Agent/ResidentPropToolBridge.swift").path,
+    sources.appendingPathComponent("Presence/PropGenerationClient.swift").path,
+    sources.appendingPathComponent("Presence/PropGenerationStore.swift").path,
+    sources.appendingPathComponent("Presence/PropTaskDaemonClient.swift").path,
+    root.appendingPathComponent("tools/fixtures/WishMachineDaemonFixture.swift").path,
+    sources.appendingPathComponent("Presence/PropImagePreparation.swift").path,
+    sources.appendingPathComponent("Presence/WishMachineOutputDescriptor.swift").path,
+    sources.appendingPathComponent("Presence/WishMachineCoordinator.swift").path,
+    sources.appendingPathComponent("Agent/ResidentWishMachineTools.swift").path,
+    sources.appendingPathComponent("Agent/ResidentWishReferenceTools.swift").path,
     program.path, "-o", executable.path]
 let runtimeObjects = try FileManager.default.contentsOfDirectory(
         at: root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug/WorldRuntime.build"),

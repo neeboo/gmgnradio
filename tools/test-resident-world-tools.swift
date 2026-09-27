@@ -3,6 +3,14 @@ import Foundation
 
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let sources = root.appendingPathComponent("apps/macos/Sources/GMGNRadio")
+let worldJSON = try JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("apps/macos/Resources/Worlds/marble-living-cabin/world.json"))) as! [String: Any]
+let worldActivityIDs = (worldJSON["activities"] as! [[String: Any]]).compactMap { $0["id"] as? String }
+guard worldActivityIDs.contains("performance.backflip"), worldActivityIDs.contains("performance.jumping_jacks") else {
+    print("FAIL: installed performance motions have no formal world activities"); exit(1)
+}
+guard try String(contentsOf: sources.appendingPathComponent("Agent/WorldAgentToolDispatcher.swift"), encoding: .utf8).contains("availableActivity:") else {
+    print("FAIL: dispatcher cannot consistently filter and reject unavailable motions"); exit(1)
+}
 let bridge = sources.appendingPathComponent("Agent/ResidentWorldToolSession.swift")
 guard FileManager.default.fileExists(atPath: bridge.path) else {
     print("FAIL: resident world tool session is not implemented")
@@ -53,14 +61,68 @@ func code(_ result: RealtimeDJToolResult) -> String? { payload(result)["code"] a
         let manifest = try JSONDecoder().decode(WorldManifest.self, from: Data(contentsOf:
             URL(fileURLWithPath: "apps/macos/Resources/Worlds/marble-living-cabin/world.json")))
         let context = try WorldAgentContext(manifest: manifest)
+        let restricted = WorldAgentToolDispatcher(takeoverEnabled: { true }, context: context,
+            availableActivity: { $0 != "music.listen" })
+        let unavailableList = await restricted.handle(RealtimeDJToolCall(id: "restricted-list", name: "list_available_activities", argumentsJSON: Data("{}".utf8)))
+        let restrictedSnapshot = payload(unavailableList)["snapshot"] as! [String: Any]
+        let restrictedActivities = restrictedSnapshot["activities"] as! [[String: Any]]
+        check(!restrictedActivities.contains { $0["id"] as? String == "music.listen" }, "unavailable activities absent from snapshot/list")
+        let restrictedTools = restricted.providerTools
+        let restrictedStart = restrictedTools.first { ($0["function"] as? [String: Any])?["name"] as? String == "start_activity" }!["function"] as! [String: Any]
+        let restrictedProperties = (restrictedStart["parameters"] as! [String: Any])["properties"] as! [String: Any]
+        let restrictedActivitySchema = restrictedProperties["activity_id"] as! [String: Any]
+        check(restrictedActivitySchema["type"] as? String == "string" && restrictedActivitySchema["enum"] == nil, "activity schema stays stable across avatar changes")
+        let unrestricted = WorldAgentToolDispatcher(takeoverEnabled: { true }, context: context)
+        let restrictedSchemaBytes = try JSONSerialization.data(withJSONObject: restricted.providerTools, options: [.sortedKeys])
+        let unrestrictedSchemaBytes = try JSONSerialization.data(withJSONObject: unrestricted.providerTools, options: [.sortedKeys])
+        check(restrictedSchemaBytes == unrestrictedSchemaBytes, "changing available assets never changes resumed tool schema")
+        let restrictedBefore = context.snapshot
+        let rejectedMotion = await restricted.handle(RealtimeDJToolCall(id: "restricted-start", name: "start_activity", argumentsJSON: Data(#"{"activity_id":"music.listen"}"#.utf8)))
+        check(code(rejectedMotion) == "activity_unavailable" && context.snapshot == restrictedBefore, "unavailable start fails before world mutation")
         let worldRoot = URL(fileURLWithPath: "apps/macos/Resources/Worlds/marble-living-cabin")
         let config = try JSONDecoder().decode(Config.self, from: Data(contentsOf: worldRoot.appendingPathComponent("marble.json")))
         let origin = SIMD3(config.framing.origin[0], config.framing.origin[1], config.framing.origin[2])
         let triangles = try GLBColliderDecoder().decode(data: Data(contentsOf: worldRoot.appendingPathComponent("collider.glb")),
             transform: WorldMeshTransform(axisConversion: .flipYAndZ, origin: origin, uniformScale: config.framing.scale))
         let physics = MarbleLivingCabinCollisionWorld(environment: TriangleMeshCollisionWorld(triangles: triangles),
-            props: CollisionVolumeWorld(volumes: manifest.collisionVolumes.filter { $0.id == "collision.jukebox" }))
+            props: CollisionVolumeWorld(volumes: manifest.collisionVolumes))
+        let performancePosition = manifest.spawn.position
+        check(physics.canOccupy(WorldCapsule(radius: 0.7, height: 2.5), at: SIMD3(performancePosition.x, performancePosition.y, performancePosition.z)), "performance anchor has enlarged body/air clearance in actual collision mesh")
+        for activityID in ["performance.backflip", "performance.jumping_jacks"] {
+            let performanceContext = try WorldAgentContext(manifest: manifest)
+            _ = try performanceContext.installCollisionWorldAndReconcilePlacement(physics)
+            try performanceContext.startActivity(id: activityID)
+            for _ in 0..<450 { try performanceContext.tick(deltaTime: 1.0/30) }
+            check(performanceContext.state.activeActivity == nil, "finite performance terminates: \(activityID)")
+            check(abs(performanceContext.state.agentTransform.position.x-performancePosition.x) < 0.1 && abs(performanceContext.state.agentTransform.position.z-performancePosition.z) < 0.1, "performance never translates world position: \(activityID)")
+        }
         _ = try context.installCollisionWorldAndReconcilePlacement(physics)
+        let patrolContext = try WorldAgentContext(manifest: manifest, walkingSpeed: 1.2)
+        _ = try patrolContext.installCollisionWorldAndReconcilePlacement(physics)
+        check(Set(patrolContext.snapshot.places.map(\.id)) == ["wp.spawn", "wp.center", "wp.jukebox", "wish_machine.pickup"], "only four semantic places are exposed; generated navigation stays internal")
+        let patrolStarted = Date()
+        try patrolContext.startActivity(id: "home.walk")
+        let coldPatrolPlanning = Date().timeIntervalSince(patrolStarted)
+        var patrolTargets = Set<String>()
+        let patrolRequestID = patrolContext.currentActivityRequestID
+        var slowestPatrolTick: TimeInterval = 0
+        for _ in 0..<900 {
+            let tickStarted = Date()
+            try patrolContext.tick(deltaTime: 1.0/30)
+            slowestPatrolTick = max(slowestPatrolTick, Date().timeIntervalSince(tickStarted))
+            if case let .walk(destinationID)? = patrolContext.snapshot.activeActivity?.activity { patrolTargets.insert(destinationID) }
+            let p = patrolContext.state.agentTransform.position
+            check(physics.canOccupy(WorldCapsule(radius: 0.2, height: 1.8), at: SIMD3(p.x,p.y,p.z)), "actual mesh permits every patrol body position")
+        }
+        check(patrolTargets.count >= 3 && patrolContext.currentActivityRequestID == patrolRequestID, "actual cabin patrol continues across three targets in one execution")
+        print("Patrol: \(patrolTargets.count) targets, 30 simulated seconds, \(Date().timeIntervalSince(patrolStarted)) wall seconds, cold plan \(coldPatrolPlanning)s, slowest tick \(slowestPatrolTick)s")
+        try patrolContext.stopActivity()
+        let stoppedPatrolPosition = patrolContext.state.agentTransform.position
+        try patrolContext.tick(deltaTime: 20)
+        check(patrolContext.state.agentTransform.position == stoppedPatrolPosition && patrolContext.state.activeActivity == nil, "actual cabin patrol stop does not resume")
+        let internalTarget = manifest.waypoints.first { $0.id.hasPrefix("wp.auto.") && hypot($0.position.x-stoppedPatrolPosition.x, $0.position.z-stoppedPatrolPosition.z) > 0.5 }!
+        let internalPath = try patrolContext.planRoute(to: internalTarget.id)
+        check(internalPath.destinationID == internalTarget.id && !internalPath.points.isEmpty, "known generated waypoint remains navigable internally")
         let dispatcher = WorldAgentToolDispatcher(takeoverEnabled: { true }, context: context)
         let clock = Clock()
         let current = Current()
@@ -70,7 +132,8 @@ func code(_ result: RealtimeDJToolResult) -> String? { payload(result)["code"] a
             now: { clock.value }, isCurrent: { current.value })
         let schemas = try JSONSerialization.jsonObject(with: session.toolSchemasJSON) as! [[String: Any]]
         check(Set(schemas.compactMap { $0["name"] as? String }) ==
-              ["inspect_world", "list_available_activities", "start_activity", "stop_activity"], "only four formal tools advertised")
+              ["inspect_world", "list_places", "list_available_activities", "plan_route", "move_to",
+               "start_activity", "stop_activity", "look_at"], "resident life tools are advertised")
         for schema in schemas {
             let input = schema["inputSchema"] as? [String: Any]
             check(input?["type"] as? String == "object", "tool arguments are objects")
@@ -78,14 +141,14 @@ func code(_ result: RealtimeDJToolResult) -> String? { payload(result)["code"] a
         }
         let startSchema = schemas.first { $0["name"] as? String == "start_activity" }!
         let parameters = (startSchema["inputSchema"] as! [String: Any])["properties"] as! [String: Any]
-        check((parameters["activity_id"] as? [String: Any])?["enum"] as? [String] == manifest.activities.map(\.id).sorted(), "advertised activity IDs come from actual manifest")
+        check((parameters["activity_id"] as? [String: Any])?["type"] as? String == "string" && (parameters["activity_id"] as? [String: Any])?["enum"] == nil, "discover actual activity IDs through list tool instead of frozen schema enum")
         check(!String(decoding: session.toolSchemasJSON, as: UTF8.self).contains("/Users/"), "tool schemas contain no local paths")
         let first = await session.call(requestID: "read", name: "inspect_world", argumentsJSON: Data("{}".utf8))
         check(!first.isError && first.callID == "read", "read returns original transport call ID")
         check((payload(first)["snapshot"] as? [String: Any])?["worldID"] as? String == manifest.worldID, "read uses actual bound world")
         let before = context.snapshot
         for (name, argument, expected) in [
-            ("move_to", "{\"place_id\":\"home\"}", "tool_not_allowed"),
+            ("move_live_camera", "{\"camera_id\":\"home\"}", "tool_not_allowed"),
             ("shell", "{}", "tool_not_allowed"),
             ("start_activity", "{}", "invalid_arguments"),
             ("start_activity", "{\"activity_id\":7}", "invalid_arguments"),
@@ -189,7 +252,7 @@ func code(_ result: RealtimeDJToolResult) -> String? { payload(result)["code"] a
             now: { clock.value }, isCurrent: { current.value },
             additionalTools: [extensionTool], maximumCalls: 2)
         let extendedSchemas = try JSONSerialization.jsonObject(with: extended.toolSchemasJSON) as! [[String: Any]]
-        check(extendedSchemas.count == 5, "only registered extension is advertised alongside world tools")
+        check(extendedSchemas.count == 9, "only registered extension is advertised alongside world tools")
         let extensionFirst = await extended.call(requestID: "extension", name: "read_resident_state", argumentsJSON: Data("{}".utf8))
         let extensionDuplicate = await extended.call(requestID: "extension", name: "read_resident_state", argumentsJSON: Data("{}".utf8))
         check(!extensionFirst.isError && extensionFirst == extensionDuplicate && extensionCalls == 1, "registered capability shares call deduplication")
@@ -201,6 +264,16 @@ func code(_ result: RealtimeDJToolResult) -> String? { payload(result)["code"] a
         extended.cancel()
         let afterClose = await extended.call(requestID: "closed", name: "read_resident_state", argumentsJSON: Data("{}".utf8))
         check(code(afterClose) == "tool_session_cancelled" && extensionCalls == 1, "registered capability cannot survive closed lease")
+        let timeBounded = ResidentWorldToolSession(scopeID: UUID(), worldID: manifest.worldID,
+            dispatcher: dispatcher, deadline: Date(timeIntervalSince1970: 300),
+            now: { clock.value }, isCurrent: { current.value }, maximumCalls: nil)
+        for index in 0..<70 {
+            let result = await timeBounded.call(requestID: "uncapped-\(index)", name: "inspect_world", argumentsJSON: Data("{}".utf8))
+            check(!result.isError, "DSH time-bounded lease has no hidden call-count cutoff")
+        }
+        timeBounded.cancel()
+        let timeBoundedStopped = await timeBounded.call(requestID: "uncapped-stop", name: "inspect_world", argumentsJSON: Data("{}".utf8))
+        check(code(timeBoundedStopped) == "tool_session_cancelled", "count-free lease still enforces explicit stop")
         print("\(failures == 0 ? "PASS" : "FAIL"): \(checks) resident world tool checks, \(failures) failures")
         exit(failures == 0 ? 0 : 1)
     }

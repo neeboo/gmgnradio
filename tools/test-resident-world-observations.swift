@@ -3,6 +3,12 @@ import Foundation
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let sources = root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent")
 let contextSource = sources.appendingPathComponent("WorldAgentContext.swift")
+let observationSource = try String(contentsOf: sources.appendingPathComponent("ResidentWorldObservation.swift"), encoding: .utf8)
+guard observationSource.contains("case let .movementCompleted("),
+      observationSource.contains("case let .movementFailed("),
+      observationSource.contains("case let .activityFailed(") else {
+    print("FAIL: navigation completion and real playback failure are not mapped to resident facts"); exit(1)
+}
 let app = try String(contentsOf: sources.deletingLastPathComponent().appendingPathComponent("App/GMGNRadioApp.swift"), encoding: .utf8)
 guard let wireStart = app.range(of: "let observationScopeID = UUID().uuidString"),
       let wireEnd = app.range(of: "context.onSnapshotChanged =", range: wireStart.upperBound..<app.endIndex) else {
@@ -76,10 +82,27 @@ import WorldRuntime
         let failure = WorldEvent(sequence: 1000, revision: 1000, worldTime: Date(), kind: .activityCancelled(activityID: "home.walk", reason: "execution_failed:blocked"))
         check(ResidentWorldObservation.event(failure, worldID: manifest.worldID, scopeID: "fixture")?.kind == "activity_cancelled", "caller supplied reason cannot forge a formal failure type")
         check(ResidentWorldObservation.event(failure, worldID: manifest.worldID, scopeID: "fixture")?.summary.contains("execution_failed:blocked") == true, "cancellation reason is preserved as data")
+        let movementDone = WorldEvent(sequence: 1010, revision: 1010, worldTime: Date(),
+            kind: .movementCompleted(requestID: "walk-instance", destinationID: "wp.window"))
+        let movementDoneObservation = ResidentWorldObservation.event(movementDone, worldID: manifest.worldID, scopeID: "fixture")
+        check(movementDoneObservation?.kind == "movement_completed", "real route completion has its own fact")
+        check(movementDoneObservation?.summary.contains("walk-instance") == true && movementDoneObservation?.summary.contains("wp.window") == true, "movement completion retains request and destination")
+        let movementFailed = WorldEvent(sequence: 1011, revision: 1011, worldTime: Date(),
+            kind: .movementFailed(requestID: "walk-instance", destinationID: "wp.window", reason: "blocked"))
+        let movementFailureObservation = ResidentWorldObservation.event(movementFailed, worldID: manifest.worldID, scopeID: "fixture")
+        check(movementFailureObservation?.kind == "movement_failed" && movementFailureObservation?.summary.contains("blocked") == true, "blocked route reaches resident without inventing arrival")
+        let playbackFailed = WorldEvent(sequence: 1012, revision: 1012, worldTime: Date(),
+            kind: .activityFailed(activityID: "performance.backflip", reason: "missingMotion"))
+        let playbackFailureObservation = ResidentWorldObservation.event(playbackFailed, worldID: manifest.worldID, scopeID: "fixture")
+        check(playbackFailureObservation?.kind == "activity_failed" && playbackFailureObservation?.summary.contains("missingMotion") == true, "playback failure is distinct from user cancellation")
         let first = ResidentWorldObservation.event(completed, worldID: manifest.worldID, scopeID: "first")
         let second = ResidentWorldObservation.event(completed, worldID: manifest.worldID, scopeID: "second")
         check(first?.id != second?.id, "reloaded same world uses separate event identity")
         check(ResidentWorldObservation.event(WorldEvent(sequence: 1001, revision: 1001, worldTime: Date(), kind: .timeAdvanced(duration: 1)), worldID: manifest.worldID, scopeID: "fixture") == nil, "mapper excludes frame noise")
+        let layoutEvent = WorldEvent(sequence: 1002, revision: 1002, worldTime: Date(), kind: .propLayoutChanged(objectID: "coffee", layoutRevision: 7))
+        let layoutObservation = ResidentWorldObservation.event(layoutEvent, worldID: manifest.worldID, scopeID: "fixture")
+        check(layoutObservation?.kind == "prop_layout_changed", "committed prop layout wakes observation")
+        check(layoutObservation?.summary.contains("coffee") == true && layoutObservation?.summary.contains("7") == true, "layout observation retains object and revision without inventing an action")
         let failedContext = try WorldAgentContext(manifest: manifest)
         var failureEvents: [WorldEvent] = []
         failedContext.onEventsPublished = { failureEvents += $0 }
@@ -88,7 +111,7 @@ import WorldRuntime
         failedContext.installCollisionWorld(CollisionVolumeWorld(volumes: []))
         try failedContext.tick(deltaTime: 0.1)
         check(failedContext.state.activeActivity == nil && failedContext.currentActivityRequestID == nil, "blocked running activity ends in both state and executor")
-        check(failureEvents.contains { if case let .activityCancelled("home.walk", reason) = $0.kind { reason?.contains("blocked") == true } else { false } }, "real executor failure preserves blocked reason")
+        check(failureEvents.contains { if case let .activityFailed("home.walk", reason) = $0.kind { reason.contains("blocked") } else { false } }, "real executor failure preserves blocked reason as a failure fact")
         let rejectedContext = try WorldAgentContext(manifest: manifest)
         rejectedContext.installCollisionWorld(CollisionVolumeWorld(volumes: []))
         try rejectedContext.startActivity(id: "home.idle")
@@ -162,6 +185,8 @@ let build = root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build
 let objects = try FileManager.default.contentsOfDirectory(at: build.appendingPathComponent("WorldRuntime.build"), includingPropertiesForKeys: nil).filter { $0.pathExtension == "o" }.map(\.path)
 let compiled = try run("/usr/bin/swiftc", ["-j1", "-swift-version", "6", "-parse-as-library", "-I", build.appendingPathComponent("Modules").path,
     contextSource.path, sources.appendingPathComponent("ResidentAgentLoop.swift").path,
+    sources.appendingPathComponent("ResidentMemoryStore.swift").path,
+    sources.appendingPathComponent("ResidentStateClient.swift").path,
     sources.appendingPathComponent("ResidentSteeringDelivery.swift").path, sources.appendingPathComponent("ResidentWorldObservation.swift").path,
     program.path, "-o", executable.path] + objects)
 guard compiled == 0 else { exit(compiled) }

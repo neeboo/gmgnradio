@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "source": "https://seed-viewer.bones.studio/",
+  "metadataEndpoint": "https://seed-viewer.bones.studio/api/storage_local/metadata/",
+  "bvhEndpoint": "https://seed-viewer.bones.studio/api/storage_local/somabvh/",
+  "distribution": "Private local evaluation only. BONES source BVH and derived motion files are not vendored; verify BONES licensing before distribution.",
+  "selection": "Continuous source-frame intervals at native 120 FPS, sampled to 30 FPS. Root motion is vertical-only. No authored poses, endpoint replacement, or artificial looping frames.",
+  "visualAcceptance": "Pending user-run host preview; numerical checks do not establish visual acceptance.",
+  "preservedExceptions": ["existing slap bass", "existing backflip"],
+  "motions": [
+    {
+      "key": "thinking-loop",
+      "displayName": "BONES 连续思考",
+      "category": "Gestures",
+      "moveName": "thinking_R_001__A405",
+      "filename": "thinking_R_001__A405",
+      "sourceSHA256": "a4e797a5351ca7615b0cda91e6d888cb8a90d839425eb08013e4a6b4edb3d350",
+      "startFrame": 96,
+      "endFrame": 1908,
+      "maxSeamDegrees": 6,
+      "minMotionDegrees": 30,
+      "activityIDs": ["resident.thinking"]
+    },
+    {
+      "key": "idle-loop",
+      "displayName": "BONES 自然待机",
+      "category": "Basic Locomotion Styles",
+      "moveName": "neutral_idle_002__A120",
+      "filename": "neutral_idle_loop_002__A120",
+      "sourceSHA256": "ae693cfa9d2da4caf7dccc59c3a7f34bdee66defd1324d6bd78a13589f6ff872",
+      "startFrame": 504,
+      "endFrame": 1020,
+      "maxSeamDegrees": 3,
+      "minMotionDegrees": 3,
+      "activityIDs": ["resident.idle"]
+    },
+    {
+      "key": "hold-display",
+      "displayName": "BONES 单手持小物件",
+      "category": "Object Manipulation",
+      "moveName": "small_light_one_hand_hold_long_R_001__A504",
+      "filename": "small_light_one_hand_hold_long_001__A504",
+      "sourceSHA256": "60b8f6395a22ccfb6b201a3043f938bc4172a3bd5990f8df4b6ded86e21485ff",
+      "startFrame": 1128,
+      "endFrame": 1884,
+      "maxSeamDegrees": 3,
+      "minMotionDegrees": 3,
+      "activityIDs": ["prop.hold"]
+    },
+    {
+      "key": "jumping-jacks",
+      "displayName": "BONES 开合跳",
+      "category": "Sports",
+      "moveName": "jumping_jack_001__A359",
+      "filename": "exercise_v001_001__A359",
+      "sourceSHA256": "8d55b250c09c32cbcf099faa94d52874a99416bb897731397c70f4cdcbf2eadf",
+      "startFrame": 0,
+      "endFrame": 516,
+      "maxSeamDegrees": 8,
+      "minMotionDegrees": 100,
+      "activityIDs": ["exercise.jumping-jacks"]
+    }
+  ]
+}

@@ -31,13 +31,16 @@ import Foundation
                 let config = envelope?["config"] as? [String: Any] ?? [:]
                 let features = config["features"] as? [String: Any] ?? [:]
                 print("Policy flags: " + ["plugins", "apps", "hooks", "multi_agent", "multi_agent_v2", "image_generation", "shell_tool"].map { "\($0)=\(features[$0] as? Bool == false ? "off" : "unconfirmed")" }.joined(separator: ","))
-                print("fileAuth=\(config["cli_auth_credentials_store"] as? String == "file"), fileMCPAuth=\(config["mcp_oauth_credentials_store"] as? String == "file"), notifyEmpty=\((config["notify"] as? [Any])?.isEmpty == true), agentsOff=\((config["agents"] as? [String:Any])?["enabled"] as? Bool == false), webOff=\(config["web_search"] as? String == "disabled")")
+                print("fileAuth=\(config["cli_auth_credentials_store"] as? String == "file"), fileMCPAuth=\(config["mcp_oauth_credentials_store"] as? String == "file"), notifyEmpty=\((config["notify"] as? [Any])?.isEmpty == true), agentsOff=\((config["agents"] as? [String:Any])?["enabled"] as? Bool == false), webSearchOn=\(config["web_search"] as? String != "disabled")")
                 throw error
             }
             print("PASS: configuration preflight; \(names.count) external MCP definitions disabled; no thread or model started")
             resident.close()
         } catch {
+            let safe = error as? ResidentCodexTransportError
             print("FAIL: configuration preflight (\(type(of: error))); private response suppressed")
+            if let transport = active, let category = transport.failureCategory { print("diagnostic category: \(category)") }
+            if let detail = active?.failureDetail { print("diagnostic detail: \(detail)") }
             active?.close()
             exit(1)
         }

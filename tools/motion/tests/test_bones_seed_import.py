@@ -103,6 +103,26 @@ class BVHParsingTests(unittest.TestCase):
 
 
 class BonesSeedRetargetingTests(unittest.TestCase):
+    def test_full_turns_preserve_quaternions_with_bounded_euler_components(self) -> None:
+        identity = np.eye(3)
+        for direction in (-1, 1):
+            with self.subTest(direction=direction):
+                spec = retarget_bvh_to_motion_spec(
+                    minimal_bvh(hips_rotations=[(direction * i * 10.0, 0.0, 0.0) for i in range(49)]),
+                    name="full roll",
+                    loop=False,
+                    output_fps=30,
+                    t_pose_orientations={"Root": identity, "Hips": identity, "Spine1": identity},
+                    humanoid_map={"hips": "Hips", "spine": "Spine1"},
+                )
+                validate_motion_spec(spec)
+                for index, frame in enumerate(spec["tracks"]["hips"]):
+                    self.assertLessEqual(max(abs(value) for value in frame["r"]), 360.0)
+                    actual = Rotation.from_euler("XYZ", frame["r"], degrees=True).as_quat()
+                    expected = Rotation.from_euler("Z", direction * index * 40.0, degrees=True).as_quat()
+                    np.testing.assert_allclose(actual, expected, atol=1e-12)
+                np.testing.assert_allclose(spec["hips"][-1]["p"], [4.8, 2.4, 9.6])
+
     def test_composes_skipped_source_joints_in_target_local_rotation(self) -> None:
         identity = np.eye(3)
         absolute = {

@@ -253,7 +253,7 @@ try harness.write(to: main, atomically: true, encoding: .utf8)
 let binary = work.appendingPathComponent("probe")
 let compile = Process(); compile.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
 let runtime = root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug")
-let names = ["CodexCLI", "AgentConversationService", "ResidentCodexTransport", "ResidentCodexPolicy", "ResidentCodexAgent", "ResidentSteeringDelivery", "WorldAgentContext", "WorldAgentToolContract", "WorldAgentToolDispatcher", "ResidentWorldToolSession", "ResidentActivityOutcome"]
+let names = ["CodexCLI", "AgentConversationService", "ResidentCodexTransport", "ResidentCodexPolicy", "ResidentCodexAgent", "ResidentSteeringDelivery", "ResidentDSHTransport", "ResidentDSHConfiguration", "WorldAgentContext", "WorldAgentToolContract", "WorldAgentToolDispatcher", "ResidentWorldToolSession", "ResidentActivityOutcome"]
 let files = names.map { sources.appendingPathComponent("Agent/\($0).swift").path }
 let objects = try FileManager.default.contentsOfDirectory(at: runtime.appendingPathComponent("WorldRuntime.build"), includingPropertiesForKeys: nil).filter { $0.pathExtension == "o" }.map(\.path)
 compile.arguments = ["-j1", "-parse-as-library", "-I", runtime.appendingPathComponent("Modules").path] + files + [main.path, "-o", binary.path] + objects

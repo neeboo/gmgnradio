@@ -54,6 +54,7 @@ class View {
     func setVisualPickerMode(_ mode: Bool) {}
     func setResidentChatExpanded(_ value: Bool) { expanded = value }
     func setResidentChatAvailable(_ value: Bool) { available = value }
+    func setPropEditorAvailable(_ value: Bool) {}
     func setProgramRailExpanded(_ value: Bool) {}
     func setVisualPickerExpanded(_ value: Bool) {}
     func setProgramRailVisible(_ value: Bool) {}
@@ -75,6 +76,10 @@ final class RenderSurface {
     func setWorldPresentationVisible(_ visible: Bool) { isWorldVisible = visible }
 }
 final class Store {
+    final class RenderOwnership { func invalidate() {} }
+    let residentPropRenderOwnership = RenderOwnership()
+    var residentPropPreview: String?
+    func clearResidentPropRendererHooks() {}
     static let log = Logger(subsystem: "test.space-presentation", category: "store")
     var isWorldPresentationRequested = false
     var isWorldVisible = false
@@ -89,6 +94,8 @@ final class Store {
 \#(destinationContent)
 
 final class Content {
+    final class PropEditor { func close() {} }
+    let residentPropEditor = PropEditor()
     let spatialStage: Store
     let renderSurfaceContainer = View()
     let metalView: View? = View()

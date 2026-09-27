@@ -25,13 +25,13 @@ struct LivingWorldBootstrapTests {
         let root = URL(filePath: "/tmp/world-motion-fixture", directoryHint: .isDirectory)
         let resources = [
             WorldResource(
-                id: "walk.forward",
+                id: "gmgn.motion.bones.walk-loop-vrm",
                 path: "motions/walk.vrma",
                 sha256: String(repeating: "0", count: 64),
                 kind: "motion.vrma"
             ),
             WorldResource(
-                id: "dance.stage",
+                id: "gmgn.motion.bones.chair-sit-loop-pmx",
                 path: "motions/dance.vmd",
                 sha256: String(repeating: "1", count: 64),
                 kind: "motion.vmd"
@@ -49,18 +49,18 @@ struct LivingWorldBootstrapTests {
             packageRoot: root
         )
 
-        #expect(Set(approved.keys) == ["walk.forward", "dance.stage"])
-        #expect(approved["walk.forward"]?.format == .vrma)
-        #expect(approved["walk.forward"]?.url == root.appendingPathComponent(
+        #expect(Set(approved.keys) == ["gmgn.motion.bones.walk-loop-vrm", "gmgn.motion.bones.chair-sit-loop-pmx"])
+        #expect(approved["gmgn.motion.bones.walk-loop-vrm"]?.format == .vrma)
+        #expect(approved["gmgn.motion.bones.walk-loop-vrm"]?.url == root.appendingPathComponent(
             "motions/walk.vrma"
         ))
-        #expect(approved["dance.stage"]?.format == .vmd)
+        #expect(approved["gmgn.motion.bones.chair-sit-loop-pmx"]?.format == .vmd)
     }
 
     @Test
     func mismatchedMotionExtensionIsRejected() {
         let resource = WorldResource(
-            id: "walk.forward",
+            id: "gmgn.motion.bones.walk-loop-vrm",
             path: "motions/walk.vmd",
             sha256: String(repeating: "0", count: 64),
             kind: "motion.vrma"
@@ -132,7 +132,7 @@ struct LivingWorldBootstrapTests {
     }
 
     @Test
-    func ardyWalkUsesItsLocomotionContractInsteadOfAGlobalSpeed() {
+    func ardyWalkNoLongerEntersTheResidentAllowList() {
         let walk = StageMotionAsset(
             id: "gmgn.motion.ardy-walk-loop-pmx",
             name: "ARDY Walk",
@@ -141,12 +141,8 @@ struct LivingWorldBootstrapTests {
         )
 
         let approved = LivingWorldBootstrap.approvedInstalledMotions([walk])
-        let normalized = approved[walk.id]
-
-        #expect(normalized?.strideSpeed == 0.45)
-        #expect(normalized?.playbackRate == 4)
-        #expect(normalized?.inPlace == true)
-        #expect(LivingWorldBootstrap.walkingSpeed(approvedMotions: approved) == 0.45)
+        #expect(approved[walk.id] == nil)
+        #expect(LivingWorldBootstrap.walkingSpeed(approvedMotions: approved) == LivingWorldBootstrap.fallbackWalkingSpeed)
     }
 
     @Test
@@ -167,10 +163,31 @@ struct LivingWorldBootstrapTests {
         let approved = LivingWorldBootstrap.approvedInstalledMotions([ardy, bones])
         let normalizedBones = approved[bones.id]
 
-        #expect(normalizedBones?.strideSpeed == 0.45)
+        // 0.75 m/s is the measured rate-1 feet-plant speed of the installed
+        // walk-loop-pmx VMD on the shipped na_2b rig (stance-drift regression),
+        // not a hand-picked constant; see LivingWorldBootstrap.bonesWalkCompatibility.
+        #expect(normalizedBones?.strideSpeed == 0.75)
         #expect(normalizedBones?.playbackRate == 1)
         #expect(normalizedBones?.inPlace == true)
-        #expect(LivingWorldBootstrap.walkingSpeed(approvedMotions: approved) == 0.45)
+        #expect(approved[ardy.id] == nil)
+        #expect(LivingWorldBootstrap.walkingSpeed(approvedMotions: approved) == 0.75)
+    }
+
+    @Test
+    func oldWorldResourcesAndSupplementalMotionsCannotRestoreRetiredSources() throws {
+        let retired = StageMotionAsset(
+            id: "gmgn.motion.ardy-walk-loop-pmx", name: "Retired walk",
+            format: .vmd, url: URL(filePath: "/tmp/retired.vmd")
+        )
+        let resource = WorldResource(
+            id: retired.id, path: "motions/retired.vmd",
+            sha256: String(repeating: "0", count: 64), kind: "motion.vmd"
+        )
+        let approved = try LivingWorldBootstrap.approvedMotions(
+            resources: [resource], packageRoot: URL(filePath: "/tmp/world-motion-fixture"),
+            supplementalMotions: ["walk.forward": retired]
+        )
+        #expect(approved.isEmpty)
     }
 
     // MARK: - living-pod-v1 bundled package

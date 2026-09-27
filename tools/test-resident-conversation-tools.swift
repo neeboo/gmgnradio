@@ -59,7 +59,7 @@ struct TextRunner: CodexCommandRunning {
         let readonly = try await service.send("普通文字", worldContext: world)
         check(readonly == "readonly", "no tools stays on existing text path")
         service.selectBackend(.dsh)
-        check(!service.supportsWorldTools, "unimplemented backend remains readonly")
+        check(service.supportsWorldTools, "DSH uses the bounded host world-tool loop")
         service.selectBackend(.codex)
         let otherWorld = ResidentWorldContext(selectedWorldID: "other", worldID: "other", displayName: nil, revision: 1, residentPosition: [], activeActivity: nil, activityPhase: nil, objects: [], availableActivities: [])
         let otherTools = ResidentConversationTools(worldID: "other", schemasJSON: tools.schemasJSON, call: tools.call, cancel: tools.cancel)
@@ -94,7 +94,7 @@ struct TextRunner: CodexCommandRunning {
         captured.pending?.resume(returning: AgentConversationOutcome(reply: "late", sessionID: "late-session"))
         captured.pending = nil
         check(await task.value, "late successful sender cannot return after cancellation")
-        check(blocked.preferenceStore.sessionID(for: .codex, scope: world.sessionScope + ".tools.v3") == "tools-thread", "late session never overwrites original")
+        check(blocked.preferenceStore.sessionID(for: .codex, scope: world.sessionScope + ".tools.v8") == "tools-thread", "late session never overwrites original")
         print("\(failed == 0 ? "PASS" : "FAIL"): \(count) resident routing checks, \(failed) failures")
         exit(failed == 0 ? 0 : 1)
     }
@@ -104,9 +104,15 @@ let main = work.appendingPathComponent("Main.swift")
 try harness.write(to: main, atomically: true, encoding: .utf8)
 let binary = work.appendingPathComponent("test")
 let compile = Process(); compile.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
-compile.arguments = ["-parse-as-library", "-j1"] + ["CodexCLI", "AgentConversationService", "ResidentCodexTransport", "ResidentCodexPolicy", "ResidentCodexAgent", "ResidentSteeringDelivery"].map {
-    root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/\($0).swift").path
-} + [main.path, "-o", binary.path]
+var compileArguments = ["-parse-as-library", "-j1"]
+for agentName in ["CodexCLI", "AgentConversationService", "ResidentCodexTransport", "ResidentCodexPolicy", "ResidentCodexAgent", "ResidentSteeringDelivery", "ResidentDSHTransport", "ResidentDSHConfiguration", "ResidentStateClient", "ResidentMemoryClient", "ResidentConversationMemory", "ResidentDSHAgentToolBridge", "ResidentDSHHostToolsBridge", "ResidentClaudeToolBridge", "ResidentClaudeProcessRunner"] {
+    compileArguments.append(root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/\(agentName).swift").path)
+}
+compileArguments.append(contentsOf: [
+    root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/ResidentVisionCapture.swift").path,
+    main.path, "-o", binary.path,
+])
+compile.arguments = compileArguments
 try compile.run(); compile.waitUntilExit()
 guard compile.terminationStatus == 0 else { exit(compile.terminationStatus) }
 let test = Process(); test.executableURL = binary

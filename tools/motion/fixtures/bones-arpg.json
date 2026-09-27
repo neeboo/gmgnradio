@@ -1,0 +1,1441 @@
+{
+  "schemaVersion": 1,
+  "name": "BONES ARPG 常用动作来源清单",
+  "metadataFile": "seed_metadata_v004.csv",
+  "metadataSHA256": "71d09422034946d17dbb0db027d569408c486545bdb12f7979d55e6ffd9bbc39",
+  "metadataRowCount": 142220,
+  "scope": "仅选择来源并进入动作库；不绑定自动行为。保留现有 slap bass 与后空翻，不修改已有 resident 动作清单。",
+  "importPolicy": {
+    "sourceFrames": "complete",
+    "rootMotion": "full",
+    "playback": "one-shot",
+    "activityBinding": "none",
+    "visualAcceptance": "pending"
+  },
+  "selectionNotes": [
+    "逐条核对官方 CSV 的 filename、content_name、自然描述与技术描述；以明确动作语义选择，未按宽关键词自动充数。",
+    "常用中性原始录制优先；只有方向覆盖或对应动作变体需要时选择官方已有 _M 文件，不自行镜像或合成动作。",
+    "行走和慢跑覆盖八方向移动、起步、停止；原地转身覆盖左右45/90/135/180度。来源名称中的 loop 只用于识别录制内容，本批全部保留完整区间并按一次性动作入库。",
+    "攻击仅收录明确左右交替直拳的 shadow_boxing 组合录制，不宣称单次轻击/重击或武器连招已覆盖。",
+    "昏厥、失足与普通受击分别命名；侧翻滚与跳落卸力翻滚分别命名，未混充地面前后闪避滚。",
+    "排除自打脸、庆祝举拳、踢垃圾、踢腿健身、伤腿 quickstep 等语义不符素材；排除自然描述含疲惫的 walk_ff_loop_270_R_001__A418，改选 normal_pace。",
+    "排除 safety_roll_315_L_001__A415：自然描述与技术描述的方向冲突，待视觉核验后再判断。",
+    "素材选择与元数据完整性已核对；骨骼重定向、脚底接触、动作幅度、视觉表现仍需后续逐项验收。"
+  ],
+  "gaps": [
+    {
+      "category": "攻击",
+      "missing": [
+        "独立单次轻击与重击",
+        "独立踢击",
+        "持剑、刀、枪等武器攻击与连招"
+      ],
+      "reason": "当前完整元数据中未确认语义匹配的独立来源；shadow_boxing 为徒手连续直拳，不拆名冒充不同攻击。"
+    },
+    {
+      "category": "防御",
+      "missing": [
+        "格挡进入、保持、退出",
+        "招架与弹反",
+        "持盾防御"
+      ],
+      "reason": "未确认明确对应的来源；战斗准备姿态不等于格挡。"
+    },
+    {
+      "category": "受击",
+      "missing": [
+        "前后左右常规受击硬直",
+        "轻重受击分级",
+        "独立击退与击倒分段"
+      ],
+      "reason": "本次只确认受回旋踢后旋转倒地；昏厥、失足和碰肩不作为常规受击替代。"
+    },
+    {
+      "category": "攀爬",
+      "missing": [
+        "墙面连续攀爬",
+        "抓沿悬挂与沿边横移",
+        "从悬挂状态攀上台面"
+      ],
+      "reason": "已确认的是梯子与楼梯动作、多高度跨越；未确认普通墙面攀爬及抓沿动作。"
+    },
+    {
+      "category": "爬梯阶段",
+      "missing": [
+        "独立向上攀爬循环",
+        "独立向上攀爬结束"
+      ],
+      "reason": "完整元数据已确认向上起始和向下起停循环，但未确认独立上爬循环/结束条目；不把起始录制自动重命名为循环。"
+    },
+    {
+      "category": "跳跃阶段",
+      "missing": [
+        "独立空中悬空循环",
+        "独立落地轻重缓冲片段"
+      ],
+      "reason": "已选完整跳跃与平台跳上跳落；未裁剪拆分为独立腾空和落地资产。"
+    },
+    {
+      "category": "地面翻滚",
+      "missing": [
+        "语义方向无歧义的独立前滚",
+        "语义方向无歧义的独立后滚"
+      ],
+      "reason": "已选左右地面侧滚与跳落卸力滚；safety_roll_315_L 的自然描述与技术描述方向冲突，暂不入选。"
+    }
+  ],
+  "motions": [
+    {
+      "key": "idle-neutral",
+      "displayName": "自然站立待机",
+      "category": "待机与警戒",
+      "filename": "neutral_idle_loop_002__A120",
+      "sourceCategory": "Basic Locomotion Styles",
+      "activityIDs": []
+    },
+    {
+      "key": "idle-alert",
+      "displayName": "警戒观察待机",
+      "category": "待机与警戒",
+      "filename": "idle_vigilance_loop_R_001__A500",
+      "sourceCategory": "Advanced Locomotion",
+      "activityIDs": []
+    },
+    {
+      "key": "alert-enter",
+      "displayName": "进入警戒姿态",
+      "category": "待机与警戒",
+      "filename": "idle_vigilance_start_R_001__A500",
+      "sourceCategory": "Advanced Locomotion",
+      "activityIDs": []
+    },
+    {
+      "key": "idle-staggered",
+      "displayName": "右脚前置站姿",
+      "category": "待机与警戒",
+      "filename": "idle_to_idle_right_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-forward-loop",
+      "displayName": "向前行走移动",
+      "category": "行走移动",
+      "filename": "walk_ff_loop_180_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-forward-right-loop",
+      "displayName": "向右前行走移动",
+      "category": "行走移动",
+      "filename": "walk_ff_loop_225_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-right-loop",
+      "displayName": "向右行走移动",
+      "category": "行走移动",
+      "filename": "walk_ff_loop_270_R_normal_pace_001__A443",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-back-right-loop",
+      "displayName": "向右后行走移动",
+      "category": "行走移动",
+      "filename": "walk_ff_loop_315_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-backward-loop",
+      "displayName": "向后行走移动",
+      "category": "行走移动",
+      "filename": "walk_ff_loop_360_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-back-left-loop",
+      "displayName": "向左后行走移动",
+      "category": "行走移动",
+      "filename": "walk_sideway_045_loop_002__A041",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-left-loop",
+      "displayName": "向左行走移动",
+      "category": "行走移动",
+      "filename": "walk_sideway_090_loop_001__A041",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-forward-left-loop",
+      "displayName": "向左前行走移动",
+      "category": "行走移动",
+      "filename": "walk_sideway_135_loop_001__A041",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-forward-start",
+      "displayName": "向前行走起步",
+      "category": "行走起步",
+      "filename": "walk_ff_start_180_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-forward-right-start",
+      "displayName": "向右前行走起步",
+      "category": "行走起步",
+      "filename": "walk_ff_start_225_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-right-start",
+      "displayName": "向右行走起步",
+      "category": "行走起步",
+      "filename": "walk_ff_start_270_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-back-right-start",
+      "displayName": "向右后行走起步",
+      "category": "行走起步",
+      "filename": "walk_ff_start_315_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-backward-start",
+      "displayName": "向后行走起步",
+      "category": "行走起步",
+      "filename": "walk_ff_start_360_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-back-left-start",
+      "displayName": "向左后行走起步",
+      "category": "行走起步",
+      "filename": "walk_sideway_045_start_001__A041",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-left-start",
+      "displayName": "向左行走起步",
+      "category": "行走起步",
+      "filename": "walk_sideway_090_start_001__A041",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-forward-left-start",
+      "displayName": "向左前行走起步",
+      "category": "行走起步",
+      "filename": "walk_sideway_135_start_002__A041",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-forward-stop",
+      "displayName": "向前行走停止",
+      "category": "行走停止",
+      "filename": "walk_ff_stop_180_R_normal_pace_001__A443",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-forward-right-stop",
+      "displayName": "向右前行走停止",
+      "category": "行走停止",
+      "filename": "walk_ff_stop_225_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-right-stop",
+      "displayName": "向右行走停止",
+      "category": "行走停止",
+      "filename": "walk_ff_stop_270_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-back-right-stop",
+      "displayName": "向右后行走停止",
+      "category": "行走停止",
+      "filename": "walk_ff_stop_315_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-backward-stop",
+      "displayName": "向后行走停止",
+      "category": "行走停止",
+      "filename": "walk_ff_stop_360_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-back-left-stop",
+      "displayName": "向左后行走停止",
+      "category": "行走停止",
+      "filename": "walk_sideway_045_stop_003__A041",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-left-stop",
+      "displayName": "向左行走停止",
+      "category": "行走停止",
+      "filename": "walk_sideway_090_stop_001__A041",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "walk-forward-left-stop",
+      "displayName": "向左前行走停止",
+      "category": "行走停止",
+      "filename": "walk_sideway_135_stop_002__A041",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-forward-loop",
+      "displayName": "向前慢跑移动",
+      "category": "慢跑移动",
+      "filename": "jog_ff_loop_180_R_001__A500",
+      "sourceCategory": "Baseline",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-forward-right-loop",
+      "displayName": "向右前慢跑移动",
+      "category": "慢跑移动",
+      "filename": "jog_ff_loop_225_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-right-loop",
+      "displayName": "向右慢跑移动",
+      "category": "慢跑移动",
+      "filename": "jog_ff_loop_270_R_002__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-back-right-loop",
+      "displayName": "向右后慢跑移动",
+      "category": "慢跑移动",
+      "filename": "jog_ff_loop_315_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-backward-loop",
+      "displayName": "向后慢跑移动",
+      "category": "慢跑移动",
+      "filename": "jog_ff_loop_360_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-forward-left-loop",
+      "displayName": "向左前慢跑移动（官方镜像）",
+      "category": "慢跑移动",
+      "filename": "jog_ff_loop_225_R_001__A418_M",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-left-loop",
+      "displayName": "向左慢跑移动（官方镜像）",
+      "category": "慢跑移动",
+      "filename": "jog_ff_loop_270_R_002__A418_M",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-back-left-loop",
+      "displayName": "向左后慢跑移动（官方镜像）",
+      "category": "慢跑移动",
+      "filename": "jog_ff_loop_315_R_001__A418_M",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-forward-start",
+      "displayName": "向前慢跑起步",
+      "category": "慢跑起步",
+      "filename": "jog_ff_start_180_R_002__A528",
+      "sourceCategory": "Baseline",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-forward-right-start",
+      "displayName": "向右前慢跑起步",
+      "category": "慢跑起步",
+      "filename": "jog_ff_start_225_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-right-start",
+      "displayName": "向右慢跑起步",
+      "category": "慢跑起步",
+      "filename": "jog_ff_start_270_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-back-right-start",
+      "displayName": "向右后慢跑起步",
+      "category": "慢跑起步",
+      "filename": "jog_ff_start_315_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-backward-start",
+      "displayName": "向后慢跑起步",
+      "category": "慢跑起步",
+      "filename": "jog_ff_start_360_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-forward-left-start",
+      "displayName": "向左前慢跑起步（官方镜像）",
+      "category": "慢跑起步",
+      "filename": "jog_ff_start_225_R_001__A418_M",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-left-start",
+      "displayName": "向左慢跑起步（官方镜像）",
+      "category": "慢跑起步",
+      "filename": "jog_ff_start_270_R_001__A418_M",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-back-left-start",
+      "displayName": "向左后慢跑起步（官方镜像）",
+      "category": "慢跑起步",
+      "filename": "jog_ff_start_315_R_001__A418_M",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-forward-stop",
+      "displayName": "向前慢跑停止",
+      "category": "慢跑停止",
+      "filename": "jog_ff_stop_180_R_002__A528",
+      "sourceCategory": "Baseline",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-forward-right-stop",
+      "displayName": "向右前慢跑停止",
+      "category": "慢跑停止",
+      "filename": "jog_ff_stop_225_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-right-stop",
+      "displayName": "向右慢跑停止",
+      "category": "慢跑停止",
+      "filename": "jog_ff_stop_270_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-back-right-stop",
+      "displayName": "向右后慢跑停止",
+      "category": "慢跑停止",
+      "filename": "jog_ff_stop_315_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-backward-stop",
+      "displayName": "向后慢跑停止",
+      "category": "慢跑停止",
+      "filename": "jog_ff_stop_360_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-forward-left-stop",
+      "displayName": "向左前慢跑停止（官方镜像）",
+      "category": "慢跑停止",
+      "filename": "jog_ff_stop_225_R_001__A418_M",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-left-stop",
+      "displayName": "向左慢跑停止（官方镜像）",
+      "category": "慢跑停止",
+      "filename": "jog_ff_stop_270_R_001__A418_M",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jog-back-left-stop",
+      "displayName": "向左后慢跑停止（官方镜像）",
+      "category": "慢跑停止",
+      "filename": "jog_ff_stop_315_R_001__A418_M",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "sprint-forward-loop",
+      "displayName": "向前冲刺循环",
+      "category": "冲刺",
+      "filename": "run_loop_180_R_001__A331",
+      "sourceCategory": "Advanced Locomotion",
+      "activityIDs": []
+    },
+    {
+      "key": "sprint-forward-start",
+      "displayName": "向前冲刺起步",
+      "category": "冲刺",
+      "filename": "run_start_180_R_001__A331",
+      "sourceCategory": "Advanced Locomotion",
+      "activityIDs": []
+    },
+    {
+      "key": "sprint-forward-stop",
+      "displayName": "向前冲刺停止",
+      "category": "冲刺",
+      "filename": "run_stop_180_R_001__A331",
+      "sourceCategory": "Advanced Locomotion",
+      "activityIDs": []
+    },
+    {
+      "key": "turn-idle-left-180",
+      "displayName": "左转180度",
+      "category": "原地转身",
+      "filename": "step_rotate_idle_000_001__A041",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "turn-idle-left-135",
+      "displayName": "左转135度",
+      "category": "原地转身",
+      "filename": "step_rotate_idle_045_001__A041",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "turn-idle-left-90",
+      "displayName": "左转90度",
+      "category": "原地转身",
+      "filename": "step_rotate_idle_090_005__A041",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "turn-idle-left-45",
+      "displayName": "左转45度",
+      "category": "原地转身",
+      "filename": "step_rotate_idle_135_001__A041",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "turn-idle-right-90",
+      "displayName": "右转90度",
+      "category": "原地转身",
+      "filename": "idle_turn_270_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "turn-idle-right-180",
+      "displayName": "右转180度",
+      "category": "原地转身",
+      "filename": "idle_turn_360_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "turn-idle-right-45",
+      "displayName": "右转45度（官方镜像）",
+      "category": "原地转身",
+      "filename": "step_rotate_idle_135_001__A041_M",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "turn-idle-right-135",
+      "displayName": "右转135度（官方镜像）",
+      "category": "原地转身",
+      "filename": "step_rotate_idle_045_001__A041_M",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "turn-walk-right-90",
+      "displayName": "右转90度后行走",
+      "category": "转身移动",
+      "filename": "turn_walk_270_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "turn-walk-right-180",
+      "displayName": "右转180度后行走",
+      "category": "转身移动",
+      "filename": "turn_walk_360_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "turn-walk-left-90",
+      "displayName": "左转90度后行走",
+      "category": "转身移动",
+      "filename": "turn_start_walk_090_001__A041",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "turn-walk-left-180",
+      "displayName": "左转180度后行走",
+      "category": "转身移动",
+      "filename": "turn_start_walk_000_001__A041",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "turn-jog-right-90",
+      "displayName": "右转90度后慢跑",
+      "category": "转身移动",
+      "filename": "turn_jog_270_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "turn-jog-right-180",
+      "displayName": "右转180度后慢跑",
+      "category": "转身移动",
+      "filename": "turn_jog_360_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "turn-jog-left-90",
+      "displayName": "左转90度后慢跑",
+      "category": "转身移动",
+      "filename": "turn_start_jog_090_001__A041",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "turn-jog-left-180",
+      "displayName": "左转180度后慢跑",
+      "category": "转身移动",
+      "filename": "turn_start_jog_000_001__A041",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "arc-walk-loop",
+      "displayName": "顺时针弧线行走移动",
+      "category": "弧线移动",
+      "filename": "walk_arc_cw_loop_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "arc-walk-start",
+      "displayName": "顺时针弧线行走起步",
+      "category": "弧线移动",
+      "filename": "walk_arc_cw_start_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "arc-walk-stop",
+      "displayName": "顺时针弧线行走停止",
+      "category": "弧线移动",
+      "filename": "walk_arc_cw_stop_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "arc-jog-loop",
+      "displayName": "顺时针弧线慢跑移动",
+      "category": "弧线移动",
+      "filename": "jog_arc_cw_loop_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "arc-jog-start",
+      "displayName": "顺时针弧线慢跑起步",
+      "category": "弧线移动",
+      "filename": "jog_arc_cw_start_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "arc-jog-stop",
+      "displayName": "顺时针弧线慢跑停止",
+      "category": "弧线移动",
+      "filename": "jog_arc_cw_stop_R_001__A418",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "crouch-idle",
+      "displayName": "蹲伏待机",
+      "category": "蹲伏",
+      "filename": "crouch_idle_002__A244",
+      "sourceCategory": "Advanced Locomotion",
+      "activityIDs": []
+    },
+    {
+      "key": "crouch-forward",
+      "displayName": "向前蹲伏移动",
+      "category": "蹲伏",
+      "filename": "crouch_ff_loop_180_R_001__A244",
+      "sourceCategory": "Advanced Locomotion",
+      "activityIDs": []
+    },
+    {
+      "key": "crouch-forward-right",
+      "displayName": "向右前蹲伏移动",
+      "category": "蹲伏",
+      "filename": "crouch_ff_loop_225_R_001__A244",
+      "sourceCategory": "Advanced Locomotion",
+      "activityIDs": []
+    },
+    {
+      "key": "crouch-right",
+      "displayName": "向右蹲伏移动",
+      "category": "蹲伏",
+      "filename": "crouch_ff_loop_270_R_001__A244",
+      "sourceCategory": "Advanced Locomotion",
+      "activityIDs": []
+    },
+    {
+      "key": "crouch-back-right",
+      "displayName": "向右后蹲伏移动",
+      "category": "蹲伏",
+      "filename": "crouch_ff_loop_315_R_001__A244",
+      "sourceCategory": "Advanced Locomotion",
+      "activityIDs": []
+    },
+    {
+      "key": "crouch-backward",
+      "displayName": "向后蹲伏移动",
+      "category": "蹲伏",
+      "filename": "crouch_ff_loop_360_R_001__A244",
+      "sourceCategory": "Advanced Locomotion",
+      "activityIDs": []
+    },
+    {
+      "key": "crouch-start",
+      "displayName": "向前蹲伏起步",
+      "category": "蹲伏",
+      "filename": "crouch_ff_start_180_R_001__A244",
+      "sourceCategory": "Advanced Locomotion",
+      "activityIDs": []
+    },
+    {
+      "key": "crouch-stop",
+      "displayName": "向前蹲伏停止",
+      "category": "蹲伏",
+      "filename": "crouch_ff_stop_180_R_001__A244",
+      "sourceCategory": "Advanced Locomotion",
+      "activityIDs": []
+    },
+    {
+      "key": "jump-up",
+      "displayName": "原地起跳落地",
+      "category": "原地跳跃",
+      "filename": "jump_001__A041",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jump-forward",
+      "displayName": "向前小跳",
+      "category": "方向跳跃",
+      "filename": "jump_ff_180_R_001__A529",
+      "sourceCategory": "Baseline",
+      "activityIDs": []
+    },
+    {
+      "key": "jump-right",
+      "displayName": "向右小跳",
+      "category": "方向跳跃",
+      "filename": "jump_ff_270_R_001__A528",
+      "sourceCategory": "Baseline",
+      "activityIDs": []
+    },
+    {
+      "key": "jump-backward",
+      "displayName": "向后小跳",
+      "category": "方向跳跃",
+      "filename": "jump_ff_360_R_002__A528",
+      "sourceCategory": "Baseline",
+      "activityIDs": []
+    },
+    {
+      "key": "jump-left",
+      "displayName": "向左小跳",
+      "category": "方向跳跃",
+      "filename": "jump_left_001__A041",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jump-back-left",
+      "displayName": "向左后小跳",
+      "category": "方向跳跃",
+      "filename": "jump_sideway_045_001__A041",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jump-forward-left",
+      "displayName": "向左前小跳",
+      "category": "方向跳跃",
+      "filename": "jump_sideway_135_003__A041",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jump-high-up",
+      "displayName": "原地高跳",
+      "category": "原地跳跃",
+      "filename": "high_jump_R_opt_2_001__A476",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "platform-off-front-50cm",
+      "displayName": "从50厘米平台向前跳落",
+      "category": "平台跳上跳落",
+      "filename": "jump_off_front_50cm_001__A415",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "platform-off-back-50cm",
+      "displayName": "从50厘米平台向后跳落",
+      "category": "平台跳上跳落",
+      "filename": "jump_off_50cm_001__A415",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "platform-off-1m",
+      "displayName": "从1米平台跳落",
+      "category": "平台跳上跳落",
+      "filename": "jump_off_1m_R_002__A415",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "platform-on-50cm",
+      "displayName": "跳上50厘米平台",
+      "category": "平台跳上跳落",
+      "filename": "jump_on_50cm_001__A415",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "platform-on-1m",
+      "displayName": "跳上1米平台",
+      "category": "平台跳上跳落",
+      "filename": "jump_on_1m_R_002__A300",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "vault-50cm-right",
+      "displayName": "右手支撑翻越50厘米障碍",
+      "category": "跨越翻越",
+      "filename": "jump_over_obstacle_0_5m_R_001__A415",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "vault-75cm-right",
+      "displayName": "右手支撑翻越75厘米障碍",
+      "category": "跨越翻越",
+      "filename": "jump_over_obstacle_0_75m_R_001__A415",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "vault-1m-right",
+      "displayName": "右手支撑翻越1米障碍",
+      "category": "跨越翻越",
+      "filename": "jump_over_obstacle_1m_R_001__A304",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "vault-1m-left",
+      "displayName": "左手支撑翻越1米障碍",
+      "category": "跨越翻越",
+      "filename": "jump_over_obstacle_1m_L_001__A415",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "vault-150cm-right",
+      "displayName": "右手支撑翻越1.5米障碍",
+      "category": "跨越翻越",
+      "filename": "jump_over_obstacle_1_5m_R_002__A304",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "vault-150cm-left",
+      "displayName": "左手支撑翻越1.5米障碍",
+      "category": "跨越翻越",
+      "filename": "jump_over_obstacle_1_5m_L_001__A415",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "vault-2m-right",
+      "displayName": "右手支撑翻越2米障碍",
+      "category": "跨越翻越",
+      "filename": "jump_over_obstacle_2m_R_001__A304",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "vault-75cm-no-hands",
+      "displayName": "无手支撑跨越75厘米障碍",
+      "category": "跨越翻越",
+      "filename": "jump_over_obstacle_no_hand_0_75m_R_002__A415",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "ladder-up-start-symmetric",
+      "displayName": "双侧同步开始爬梯",
+      "category": "梯子攀爬",
+      "filename": "ladder_climbing_up_start_R_001__A300",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "ladder-up-start-alternating",
+      "displayName": "手脚交替开始爬梯",
+      "category": "梯子攀爬",
+      "filename": "ladder_climbing_up_start_R_005_ns__A300",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "ladder-down-start",
+      "displayName": "开始下梯",
+      "category": "梯子攀爬",
+      "filename": "ladder_climbing_down_start_R_003__A300",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "ladder-down-loop",
+      "displayName": "连续下梯",
+      "category": "梯子攀爬",
+      "filename": "ladder_climbing_down_loop_R_003__A300",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "ladder-down-stop",
+      "displayName": "停止下梯",
+      "category": "梯子攀爬",
+      "filename": "ladder_climbing_down_stop_R_004__A300",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "ladder-idle",
+      "displayName": "梯上停留",
+      "category": "梯子攀爬",
+      "filename": "ladder_climbing_idle_R_001__A300",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "ladder-step-off",
+      "displayName": "从梯子踏回地面",
+      "category": "梯子攀爬",
+      "filename": "ladder_climbing_stepdown_R_001__A300",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "ladder-jump-off",
+      "displayName": "从梯子跳落地面",
+      "category": "梯子攀爬",
+      "filename": "ladder_climbing_jumpdown_R_002__A300",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "stairs-walk-up-start",
+      "displayName": "开始走上楼梯",
+      "category": "楼梯移动",
+      "filename": "stairs_climbing_up_start_R_001__A300",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "stairs-walk-down-loop",
+      "displayName": "走下楼梯",
+      "category": "楼梯移动",
+      "filename": "stairs_climbing_down_loop_R_001__A300",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "stairs-walk-down-stop",
+      "displayName": "下楼梯到达地面",
+      "category": "楼梯移动",
+      "filename": "stairs_climbing_down_stop_R_001__A300",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "stairs-jog-up-start",
+      "displayName": "开始跑上楼梯",
+      "category": "楼梯移动",
+      "filename": "stairs_climbing_jog_up_start_R_001__A300",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "stairs-jog-down-loop",
+      "displayName": "跑下楼梯",
+      "category": "楼梯移动",
+      "filename": "stairs_climbing_jog_down_loop_R_001__A300",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "stairs-jog-down-stop",
+      "displayName": "跑下楼梯后停止",
+      "category": "楼梯移动",
+      "filename": "stairs_climbing_jog_down_stop_R_001__A300",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "dodge-right",
+      "displayName": "向右闪避",
+      "category": "战斗闪避",
+      "filename": "ib_dodge_270_R_001__A437",
+      "sourceCategory": "Martial Arts",
+      "activityIDs": []
+    },
+    {
+      "key": "dodge-left",
+      "displayName": "向左闪避（官方镜像）",
+      "category": "战斗闪避",
+      "filename": "ib_dodge_270_R_001__A437_M",
+      "sourceCategory": "Martial Arts",
+      "activityIDs": []
+    },
+    {
+      "key": "dodge-backward",
+      "displayName": "后撤闪避",
+      "category": "战斗闪避",
+      "filename": "ib_dodge_back_L_001__A437",
+      "sourceCategory": "Martial Arts",
+      "activityIDs": []
+    },
+    {
+      "key": "dodge-duck",
+      "displayName": "俯身闪避",
+      "category": "战斗闪避",
+      "filename": "ib_dodge_down_L_002__A437",
+      "sourceCategory": "Martial Arts",
+      "activityIDs": []
+    },
+    {
+      "key": "dodge-up",
+      "displayName": "上跳闪避",
+      "category": "战斗闪避",
+      "filename": "ib_dodge_up_R_001__A437",
+      "sourceCategory": "Martial Arts",
+      "activityIDs": []
+    },
+    {
+      "key": "roll-side-right",
+      "displayName": "向右侧翻滚",
+      "category": "翻滚",
+      "filename": "side_roll_R_002__A415",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "roll-side-left",
+      "displayName": "向左侧翻滚（官方镜像）",
+      "category": "翻滚",
+      "filename": "side_roll_R_002__A415_M",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "roll-landing-shoulder",
+      "displayName": "跳落后肩部卸力翻滚",
+      "category": "翻滚",
+      "filename": "jump_to_shoulder_roll_R_001__A415",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "roll-long-jump-shoulder",
+      "displayName": "长跳后肩部卸力翻滚",
+      "category": "翻滚",
+      "filename": "tiger_jump_to_shoulder_roll_R_001__A415",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "combat-turn-right-jog",
+      "displayName": "进入战斗姿态右转起跑",
+      "category": "战斗姿态移动",
+      "filename": "ib_combat_turn_jog_start_270_R_003__A437",
+      "sourceCategory": "Martial Arts",
+      "activityIDs": []
+    },
+    {
+      "key": "combat-turn-back-jog",
+      "displayName": "进入战斗姿态后转起跑",
+      "category": "战斗姿态移动",
+      "filename": "ib_combat_turn_jog_start_360_R_001__A437",
+      "sourceCategory": "Martial Arts",
+      "activityIDs": []
+    },
+    {
+      "key": "attack-straight-punch-combo-a359",
+      "displayName": "徒手交替直拳组合（演员359）",
+      "category": "徒手攻击",
+      "filename": "shadow_boxing_R_001__A359",
+      "sourceCategory": "Sports",
+      "activityIDs": []
+    },
+    {
+      "key": "attack-straight-punch-combo-a360",
+      "displayName": "徒手交替直拳组合（演员360）",
+      "category": "徒手攻击",
+      "filename": "shadow_boxing_R_001__A360",
+      "sourceCategory": "Sports",
+      "activityIDs": []
+    },
+    {
+      "key": "attack-straight-punch-combo-a361",
+      "displayName": "徒手交替直拳组合（演员361）",
+      "category": "徒手攻击",
+      "filename": "shadow_boxing_R_001__A361",
+      "sourceCategory": "Sports",
+      "activityIDs": []
+    },
+    {
+      "key": "attack-straight-punch-combo-a362",
+      "displayName": "徒手交替直拳组合（演员362）",
+      "category": "徒手攻击",
+      "filename": "shadow_boxing_R_001__A362",
+      "sourceCategory": "Sports",
+      "activityIDs": []
+    },
+    {
+      "key": "hit-air-spin-fall",
+      "displayName": "遭回旋踢后旋转倒地",
+      "category": "受击倒地",
+      "filename": "fall_spin_in_air_R_001__A304",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "hit-air-spin-fall-mirror",
+      "displayName": "遭回旋踢后旋转倒地（官方镜像）",
+      "category": "受击倒地",
+      "filename": "fall_spin_in_air_R_001__A304_M",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "recovery-faint",
+      "displayName": "昏厥倒地",
+      "category": "跌倒与起身",
+      "filename": "faint_R_001__A456",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "recovery-faint-side",
+      "displayName": "昏厥侧倒",
+      "category": "跌倒与起身",
+      "filename": "faint_side_R_001__A472",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "recovery-run-fall",
+      "displayName": "奔跑失足倒地",
+      "category": "跌倒与起身",
+      "filename": "run_fall_R_001__A533",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "recovery-get-up-back",
+      "displayName": "仰卧起身",
+      "category": "跌倒与起身",
+      "filename": "stand_up_lying_R_002__A472",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "recovery-get-up-side",
+      "displayName": "侧卧起身",
+      "category": "跌倒与起身",
+      "filename": "stand_up_lying_side_R_002__A472",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "recovery-get-up-front",
+      "displayName": "俯卧起身",
+      "category": "跌倒与起身",
+      "filename": "stand_up_lying_stomach_R_002__A472",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "recovery-faint-recover-back",
+      "displayName": "昏厥后从仰卧起身",
+      "category": "跌倒与起身",
+      "filename": "faint_stand_up_lying_R_001__A492",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "recovery-faint-recover-side",
+      "displayName": "昏厥后从侧卧起身",
+      "category": "跌倒与起身",
+      "filename": "faint_stand_up_lying_side_R_001__A492",
+      "sourceCategory": "Stunts",
+      "activityIDs": []
+    },
+    {
+      "key": "pickup-standing",
+      "displayName": "站立拾取地面物件",
+      "category": "拾取交互",
+      "filename": "item_pick_up_standing_R_001__A410",
+      "sourceCategory": "Object Manipulation",
+      "activityIDs": []
+    },
+    {
+      "key": "pickup-crouched",
+      "displayName": "蹲姿拾取物件",
+      "category": "拾取交互",
+      "filename": "item_pick_up_crouch_idle_R_001__A548",
+      "sourceCategory": "Object Manipulation",
+      "activityIDs": []
+    },
+    {
+      "key": "pickup-walking",
+      "displayName": "行走中拾取物件",
+      "category": "拾取交互",
+      "filename": "item_pick_up_walk_R_001__A410",
+      "sourceCategory": "Object Manipulation",
+      "activityIDs": []
+    },
+    {
+      "key": "pickup-jogging",
+      "displayName": "慢跑中拾取物件",
+      "category": "拾取交互",
+      "filename": "item_pick_up_jog_R_001__A410",
+      "sourceCategory": "Object Manipulation",
+      "activityIDs": []
+    },
+    {
+      "key": "pickup-crouch-walking",
+      "displayName": "蹲行中拾取物件",
+      "category": "拾取交互",
+      "filename": "item_pick_up_crouch_walk_R_001__A410",
+      "sourceCategory": "Object Manipulation",
+      "activityIDs": []
+    },
+    {
+      "key": "pickup-front-high",
+      "displayName": "拿取前方高处小物件",
+      "category": "拾取交互",
+      "filename": "small_light_one_hand_pick_up_front_high_R_001__A516",
+      "sourceCategory": "Object Manipulation",
+      "activityIDs": []
+    },
+    {
+      "key": "pickup-side-high",
+      "displayName": "拿取右侧高处小物件",
+      "category": "拾取交互",
+      "filename": "small_light_one_hand_pick_up_right_side_high_R_001__A516",
+      "sourceCategory": "Object Manipulation",
+      "activityIDs": []
+    },
+    {
+      "key": "pickup-front-medium",
+      "displayName": "拿取前方中位小物件",
+      "category": "拾取交互",
+      "filename": "small_light_one_hand_pick_up_front_medium_R_001__A508",
+      "sourceCategory": "Object Manipulation",
+      "activityIDs": []
+    },
+    {
+      "key": "interact-door-open",
+      "displayName": "打开内侧左开门",
+      "category": "门与机关交互",
+      "filename": "inside_door_handle_left_side_open_walk_R_001__A512",
+      "sourceCategory": "Object Interaction",
+      "activityIDs": []
+    },
+    {
+      "key": "interact-door-pass-close",
+      "displayName": "开门通过后关门",
+      "category": "门与机关交互",
+      "filename": "inside_door_handle_left_side_open_walk_close_behind_R_001__A512",
+      "sourceCategory": "Object Interaction",
+      "activityIDs": []
+    },
+    {
+      "key": "interact-door-pull",
+      "displayName": "拉门把手",
+      "category": "门与机关交互",
+      "filename": "inside_door_handle_left_side_pull_R_001__A512",
+      "sourceCategory": "Object Interaction",
+      "activityIDs": []
+    },
+    {
+      "key": "interact-door-knock",
+      "displayName": "敲门",
+      "category": "门与机关交互",
+      "filename": "outside_door_left_side_knock_R_001__A512",
+      "sourceCategory": "Object Interaction",
+      "activityIDs": []
+    },
+    {
+      "key": "interact-button-high",
+      "displayName": "按高位按钮",
+      "category": "门与机关交互",
+      "filename": "high_button_push_001__A480",
+      "sourceCategory": "Object Interaction",
+      "activityIDs": []
+    },
+    {
+      "key": "interact-button-mid",
+      "displayName": "按中位按钮",
+      "category": "门与机关交互",
+      "filename": "mid_button_push_002__A484",
+      "sourceCategory": "Object Interaction",
+      "activityIDs": []
+    },
+    {
+      "key": "object-hold-small",
+      "displayName": "单手持小物件",
+      "category": "持物交互",
+      "filename": "small_light_one_hand_hold_001__A504",
+      "sourceCategory": "Object Manipulation",
+      "activityIDs": []
+    },
+    {
+      "key": "object-hold-small-long",
+      "displayName": "单手持续持小物件",
+      "category": "持物交互",
+      "filename": "small_light_one_hand_hold_long_001__A504",
+      "sourceCategory": "Object Manipulation",
+      "activityIDs": []
+    },
+    {
+      "key": "object-hold-large",
+      "displayName": "双手持轻大物件",
+      "category": "持物交互",
+      "filename": "big_light_two_hands_hold_R_001__A508",
+      "sourceCategory": "Object Manipulation",
+      "activityIDs": []
+    },
+    {
+      "key": "object-switch-hands",
+      "displayName": "将物件换手",
+      "category": "持物交互",
+      "filename": "neutral_item_switch_hands_R_001__A542",
+      "sourceCategory": "Object Manipulation",
+      "activityIDs": []
+    },
+    {
+      "key": "place-front-high",
+      "displayName": "放置小物件到前方高处",
+      "category": "放置交互",
+      "filename": "small_light_one_hand_put_down_front_high_R_001__A516",
+      "sourceCategory": "Object Manipulation",
+      "activityIDs": []
+    },
+    {
+      "key": "place-front-medium",
+      "displayName": "放置小物件到前方中位",
+      "category": "放置交互",
+      "filename": "small_light_one_hand_put_down_front_medium_R_001__A508",
+      "sourceCategory": "Object Manipulation",
+      "activityIDs": []
+    },
+    {
+      "key": "place-front-low",
+      "displayName": "放置小物件到前方低处",
+      "category": "放置交互",
+      "filename": "small_light_one_hand_put_down_front_low_001__A504",
+      "sourceCategory": "Object Manipulation",
+      "activityIDs": []
+    },
+    {
+      "key": "place-side-low",
+      "displayName": "放置小物件到右侧低处",
+      "category": "放置交互",
+      "filename": "small_light_one_hand_put_down_right_side_low_001__A504",
+      "sourceCategory": "Object Manipulation",
+      "activityIDs": []
+    },
+    {
+      "key": "jump-back-right",
+      "displayName": "向右后小跳（官方镜像）",
+      "category": "方向跳跃",
+      "filename": "jump_sideway_045_001__A041_M",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    },
+    {
+      "key": "jump-forward-right",
+      "displayName": "向右前小跳（官方镜像）",
+      "category": "方向跳跃",
+      "filename": "jump_sideway_135_003__A041_M",
+      "sourceCategory": "Basic Locomotion Neutral",
+      "activityIDs": []
+    }
+  ]
+}
