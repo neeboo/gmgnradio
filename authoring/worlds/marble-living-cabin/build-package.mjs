@@ -66,10 +66,8 @@ for (const performance of [
 if (layout.navigation) {
   const navigation = layout.navigation;
   const colliderSHA256 = createHash('sha256').update(await readFile(join(source,'assets','collider.glb'))).digest('hex');
-  const propSupportConfigurationSHA256 = createHash('sha256').update(await readFile('apps/macos/Sources/GMGNRadio/Presence/ResidentPropPlacementConfiguration.swift')).digest('hex');
   if (navigation.schemaVersion !== 1 || navigation.generator !== 'production-capsule-grid-v1' ||
       navigation.source?.worldID !== worldID || navigation.source?.colliderSHA256 !== colliderSHA256 ||
-      navigation.source?.propSupportConfigurationSHA256 !== propSupportConfigurationSHA256 ||
       !isDeepStrictEqual(navigation.source?.framing, layout.framing) ||
       !isDeepStrictEqual(navigation.source?.collisionVolumes, layout.collisionVolumes) ||
       !isDeepStrictEqual(navigation.source?.manualWaypoints, manifest.waypoints)) {

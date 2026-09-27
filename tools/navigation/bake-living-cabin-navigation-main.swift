@@ -64,7 +64,6 @@ import Foundation
         document["generator"] = "production-capsule-grid-v1"
         document["source"] = ["worldID":manifest.worldID,
             "colliderSHA256":SHA256.hash(data:colliderData).map {String(format:"%02x",$0)}.joined(),
-            "propSupportConfigurationSHA256":cabinSupportConfigurationSHA256,
             "framing":rawConfiguration["framing"]!,
             "collisionVolumes":rawManifest["collisionVolumes"]!,
             "manualWaypoints":rawAnchors]

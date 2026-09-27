@@ -11,7 +11,6 @@ struct CabinNavigationReport: Codable {
     var gridColumns = 0
     var surfaceCandidates = 0
     var blockedCandidates = 0
-    var supportReservedCandidates = 0
     var columnsWithoutGround = 0
     var disconnectedCandidates = 0
     var rejectedEdges: [String:Int] = [:]
@@ -26,37 +25,6 @@ struct CabinNavigationReport: Codable {
     var capsuleHeightMeters: Float = 1.8
     var maximumStepMeters: Float = 0.3
     var verificationSampleSpacingMeters: Float = 0.05
-}
-
-// Keep the complete legal support footprint clear for future props. The
-// placement service reserves a 0.25 m resident capsule around every route.
-// Slab intersection against the inflated footprint also rejects edges whose
-// endpoints are clear but whose interior cuts through a support corner.
-func cabinSupportReservationIntersects(from start: SIMD3<Float>, to end: SIMD3<Float>) -> Bool {
-    ResidentPropPlacementConfiguration.surfaces.contains { surface in
-        // The existing real-cabin support regression additionally requires
-        // 0.30 m clearance around the physical table (test-resident-prop-surfaces).
-        let radius: Float = surface.excludedCollisionID == ResidentPropPlacementConfiguration.tableCollisionID ? 0.3 : 0.25
-        let c = cos(surface.yaw), s = sin(surface.yaw)
-        func local(_ p: SIMD3<Float>) -> SIMD2<Float> {
-            let x = p.x-surface.center.x, z = p.z-surface.center.z
-            return SIMD2(c*x-s*z,s*x+c*z)
-        }
-        let a = local(start), delta = local(end)-a
-        let extent = SIMD2(surface.halfExtents.x+radius,surface.halfExtents.z+radius)
-        var lower: Float = 0, upper: Float = 1
-        for axis in 0..<2 {
-            if abs(delta[axis]) < 0.000001 {
-                if abs(a[axis]) > extent[axis] { return false }
-            } else {
-                let first = (-extent[axis]-a[axis])/delta[axis]
-                let second = (extent[axis]-a[axis])/delta[axis]
-                lower = max(lower,min(first,second)); upper = min(upper,max(first,second))
-                if lower > upper { return false }
-            }
-        }
-        return true
-    }
 }
 
 struct CabinNavigationFailure: Error, CustomStringConvertible {
@@ -77,7 +45,6 @@ struct CabinNavigationPhysics: WorldCollisionQuerying {
 // The denser sample pass additionally checks the same grounded destinations
 // the activity executor consumes while it advances along an edge.
 func cabinEdgeFailure(from start: SIMD3<Float>, to end: SIMD3<Float>, physics: CabinNavigationPhysics) -> String? {
-    if cabinSupportReservationIntersects(from:start,to:end) { return "supportReservation" }
     let capsule = WorldCapsule(radius:0.2,height:1.8)
     guard physics.mesh.canTraverse(capsule,from:start,to:end,maximumStepHeight:0.3) else { return "meshTraversal" }
     guard physics.canTraverse(capsule,from:start,to:end,maximumStepHeight:0.3) else { return "combinedTraversal" }
@@ -112,9 +79,6 @@ func bakeCabinNavigation(triangles: [WorldTriangle], volumes: [WorldCollisionVol
     var points = Dictionary(uniqueKeysWithValues:anchors.map {($0.id,$0)})
     var cells: [GridCell:[String]] = [:]
     for anchor in anchors {
-        guard !cabinSupportReservationIntersects(from:anchor.position.simd3,to:anchor.position.simd3) else {
-            throw CabinNavigationFailure("Authored anchor overlaps prop support reservation: \(anchor.id)")
-        }
         guard physics.canOccupy(capsule,at:anchor.position.simd3),
               let ground = physics.groundHeight(at:anchor.position.simd3), abs(ground-anchor.position.y) < 0.05 else {
             throw CabinNavigationFailure("Authored anchor does not fit the real ground: \(anchor.id)")
@@ -138,7 +102,6 @@ func bakeCabinNavigation(triangles: [WorldTriangle], volumes: [WorldCollisionVol
                 report.surfaceCandidates += 1
                 let p = SIMD3(px,height,pz)
                 guard physics.canOccupy(capsule,at:p) else { report.blockedCandidates += 1; continue }
-                guard !cabinSupportReservationIntersects(from:p,to:p) else { report.supportReservedCandidates += 1; continue }
                 if anchors.contains(where:{worldDistance($0.position.simd3,p) < 0.05}) { continue }
                 let id = "wp.auto.x\(x).z\(z).h\(level)"
                 points[id] = WorldWaypoint(id:id,position:WorldVector3(p),arrivalRadius:0.2,enabled:true)

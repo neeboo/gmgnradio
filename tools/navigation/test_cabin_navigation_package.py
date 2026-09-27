@@ -18,9 +18,6 @@ class CabinNavigationPackageTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.source = self.root / "authoring/worlds/marble-living-cabin"
         self.source.mkdir(parents=True)
-        self.support_config = self.root / "apps/macos/Sources/GMGNRadio/Presence/ResidentPropPlacementConfiguration.swift"
-        self.support_config.parent.mkdir(parents=True)
-        shutil.copyfile(ROOT / "apps/macos/Sources/GMGNRadio/Presence/ResidentPropPlacementConfiguration.swift", self.support_config)
         for filename in ["layout.json", "operation.json", "build-package.mjs"]:
             shutil.copyfile(ROOT / "authoring/worlds/marble-living-cabin" / filename, self.source / filename)
         old = self.root / "apps/macos/Resources/Worlds/living-pod-v1"
@@ -43,7 +40,6 @@ class CabinNavigationPackageTests(unittest.TestCase):
             "source":{"worldID":self.layout["worldID"], "framing":copy.deepcopy(self.layout["framing"]),
                 "collisionVolumes":copy.deepcopy(self.layout["collisionVolumes"]),
                 "manualWaypoints":self.baseline["waypoints"],
-                "propSupportConfigurationSHA256":hashlib.sha256(self.support_config.read_bytes()).hexdigest(),
                 "colliderSHA256":hashlib.sha256(b"temporary build fixture").hexdigest()}}
         self.layout["navigation"] = self.navigation
 
@@ -67,8 +63,7 @@ class CabinNavigationPackageTests(unittest.TestCase):
                          {k:v for k,v in self.baseline.items() if k not in ("waypoints","routes")})
 
     def test_rebuild_refuses_navigation_with_stale_physics_or_anchors(self):
-        for key,value in [("colliderSHA256","0"*64), ("framing",{}), ("collisionVolumes",[]), ("manualWaypoints",[]),
-                          ("propSupportConfigurationSHA256","0"*64)]:
+        for key,value in [("colliderSHA256","0"*64), ("framing",{}), ("collisionVolumes",[]), ("manualWaypoints",[])]:
             with self.subTest(key=key):
                 saved = self.navigation["source"][key]
                 self.navigation["source"][key] = value
