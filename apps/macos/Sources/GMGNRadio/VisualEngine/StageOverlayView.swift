@@ -9,21 +9,77 @@ final class StageResidentChatState: ObservableObject {
     @Published private(set) var isThinking = false
     @Published var voiceActive = false
     @Published var deliveryNotice: String?
+    @Published var progress: String?
+    @Published private(set) var statusNotice: String?
+    /// 当前状态行的类别，决定它能否被普通提示覆盖（见 ResidentStatusNoticeMerge）。
+    private(set) var statusKind: ResidentStatusNoticeKind = .info
     @Published var canStop = false
+    /// 最近对话（宿主持有的同一份快照）：用户提交的回合 + 居民回复，按回合可
+    /// 回看。展示层只渲染，不做回合判定，与 LiveCam 口径一致。
+    @Published private(set) var transcript: [ResidentChatTranscriptLine] = []
+    let images = ResidentAttachmentStore()
+    private var recovery = ResidentDraftRecovery()
 
-    func takeMessage() -> String? {
+    init() { images.onChange = { [weak self] in self?.objectWillChange.send() } }
+
+    func takeMessage() -> ResidentChatSubmission? {
         let message = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !message.isEmpty else { return nil }
+        guard images.canSubmit, !message.isEmpty || !images.attachments.isEmpty else { return nil }
         draft = ""
+        recovery = ResidentDraftRecovery()
         begin()
-        return message
+        return ResidentChatSubmission(text: message, attachments: images.takeAttachments())
     }
 
-    func begin() { reply = ""; isThinking = true }
-    func setThinking(_ thinking: Bool) { isThinking = thinking }
-    func finish(_ text: String) { reply = text; isThinking = false }
-    func showStatus(_ text: String) { finish(text) }
-    func cancel() { showStatus("已停止本次回复。") }
+    func restore(_ submission: ResidentChatSubmission, error: Error) {
+        restore(submission, notice: error.localizedDescription)
+    }
+
+    func restore(_ submission: ResidentChatSubmission, notice: String) {
+        let recovered = recovery.restore(submission, text: draft, attachments: images.attachments)
+        draft = recovered.text
+        images.restore(recovered.attachments)
+        setThinking(false)
+        // 失败回填是失败提示，不能被下一条普通应用信息盖掉。
+        showFailureStatus(notice + "\n文字和图片已保留。")
+    }
+
+    func begin() { reply = ""; applyStatus(nil, kind: .info); isThinking = true }
+    /// 宿主推送的最近对话快照：只替换展示数据，不影响状态行/回合判定。
+    func setTranscript(_ lines: [ResidentChatTranscriptLine]) { transcript = lines }
+    func setThinking(_ thinking: Bool) {
+        if thinking && !isThinking { applyStatus(nil, kind: .info) }
+        isThinking = thinking
+        if !thinking { progress = nil }
+    }
+    func finish(_ text: String) { reply = text; applyStatus(nil, kind: .info); setThinking(false) }
+    func showStatus(_ text: String) { applyStatus(text, kind: .info) }
+    /// 语音连接/收音的临时提示，连接成功或断麦后可用 dismissVoiceStatus 清除。
+    func showVoiceStatus(_ text: String) { applyStatus(text, kind: .voice) }
+    /// 需要用户确认或重试的失败；普通提示绝不覆盖它。
+    func showFailureStatus(_ text: String) { applyStatus(text, kind: .failure) }
+    func dismissStatus() { applyStatus(nil, kind: .info) }
+    /// 只清除语音临时提示，绝不抹掉真正的失败提示。
+    func dismissVoiceStatus() {
+        guard statusKind == .voice else { return }
+        applyStatus(nil, kind: .info)
+    }
+    /// 换世界/换后端等上下文切换：旧提示全部作废（含旧失败），新上下文重新开始。
+    func clearTransient() {
+        applyStatus(nil, kind: .info)
+        progress = nil
+    }
+    private func applyStatus(_ text: String?, kind: ResidentStatusNoticeKind) {
+        let decision = ResidentStatusNoticeMerge.resolve(
+            incoming: text,
+            kind: kind,
+            current: statusNotice,
+            currentKind: statusKind
+        )
+        statusNotice = decision.text
+        statusKind = decision.kind
+    }
+    func cancel() { setThinking(false); showStatus("已停止本次回复。") }
 }
 
 /// Separate from the reply so a failed voice request never hides readable text.
@@ -45,12 +101,70 @@ struct ResidentSpeechErrorNotice: View {
     }
 }
 
+/// Async wish jobs remain visible independently of the resident's reply and thinking state.
+/// Terminal tasks hide 30 seconds after their stored prompt anchor; the expiry
+/// timestamp is persisted in the shared inbox, so refreshes and reopenings
+/// never keep a finished task resident. In-progress and pending tasks stay.
+@MainActor
+struct WishMachineTaskStatusView: View {
+    @ObservedObject var state: WishMachineTaskPresentationStore
+    var maximumHeight: CGFloat = 132
+    var compact = false
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { timeline in
+            let visible = state.tasks.filter { task in
+                guard let expiry = task.promptExpiresAt else { return true }
+                return timeline.date < expiry
+            }
+            if !visible.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("许愿任务")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.55))
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 9) {
+                            ForEach(visible) { task in
+                                VStack(alignment: .leading, spacing: 3) {
+                                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                        Image(systemName: task.isTerminal ? "circle.fill" : "clock")
+                                            .font(.system(size: 8))
+                                        Text(task.title).lineLimit(1)
+                                        Spacer(minLength: 2)
+                                        Text(task.status).foregroundStyle(.white.opacity(0.75)).lineLimit(1)
+                                    }
+                                    .font(.system(size: 11, weight: .medium))
+                                    if !compact, let detail = task.detail, !detail.isEmpty {
+                                        Text(detail)
+                                            .font(.system(size: 10))
+                                            .foregroundStyle(.white.opacity(0.6))
+                                            .lineLimit(2)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .help([task.title, task.status, task.detail].compactMap { $0 }.joined(separator: "\n"))
+                                .accessibilityElement(children: .combine)
+                                .accessibilityIdentifier("resident.wish-task.\(task.id.uuidString)")
+                            }
+                        }
+                    }
+                    .frame(height: min(maximumHeight, CGFloat(visible.count) * (compact ? 20 : 48)))
+                }
+                .foregroundStyle(.white)
+                .padding(compact ? 6 : 10)
+                .background(Color(white: 0.1).opacity(0.96), in: RoundedRectangle(cornerRadius: 10))
+                .accessibilityIdentifier("resident.wish-tasks")
+            }
+        }
+    }
+}
+
 /// A quiet, native input surface shared with the resident's existing session.
 @MainActor
 struct StageResidentComposer: View {
     @ObservedObject var state: StageResidentChatState
     private let speechStatus = AgentSpeechStatusStore.shared
-    let onSendMessage: @MainActor (String) async -> Void
+    let onSendMessage: @MainActor (ResidentChatSubmission) async throws -> Void
     let onCancelMessage: @MainActor () -> Void
     let onToggleVoice: @MainActor () -> Void
     let onFocusInput: @MainActor () -> Void
@@ -59,29 +173,63 @@ struct StageResidentComposer: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             ResidentSpeechErrorNotice()
-            if !state.reply.isEmpty {
+            if !state.transcript.isEmpty || !state.reply.isEmpty {
                 HStack(alignment: .top, spacing: 12) {
                     ScrollView {
-                        Text(state.reply)
-                            .font(.system(size: 13))
-                            .foregroundStyle(.white.opacity(0.9))
-                            .lineSpacing(4)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                        VStack(alignment: .leading, spacing: 8) {
+                            // 最近对话：按回合回看，含未送达/取消的明确标记；只有
+                            // 与历史重复的后台回复才不重复显示。
+                            ForEach(Array(state.transcript.enumerated()), id: \.offset) { _, line in
+                                let label = ResidentChatTranscriptLine.speakerLabel(line.speaker)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    if !label.isEmpty {
+                                        Text(label)
+                                            .font(.system(size: 10, weight: .medium))
+                                            .foregroundStyle(.white.opacity(0.45))
+                                    }
+                                    Text(line.text)
+                                        .font(.system(size: 13))
+                                        .foregroundStyle(line.speaker == .notice
+                                            ? Color.orange.opacity(0.95) : .white.opacity(0.9))
+                                        .lineSpacing(4)
+                                        .textSelection(.enabled)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                            }
+                            if let standalone = ResidentChatTranscriptLine.standaloneReply(
+                                state.reply, in: state.transcript
+                            ) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("居民")
+                                        .font(.system(size: 10, weight: .medium))
+                                        .foregroundStyle(.white.opacity(0.45))
+                                    Text(standalone)
+                                        .font(.system(size: 13))
+                                        .foregroundStyle(.white.opacity(0.9))
+                                        .lineSpacing(4)
+                                        .textSelection(.enabled)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .frame(height: 76)
-                    Button {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(state.reply, forType: .string)
-                    } label: {
-                        Image(systemName: "doc.on.doc")
-                            .font(.system(size: 12))
-                            .frame(width: 24, height: 24)
+                    .frame(height: 132)
+                    .accessibilityIdentifier("stage.resident-transcript")
+                    if !state.reply.isEmpty {
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(state.reply, forType: .string)
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                                .font(.system(size: 12))
+                                .frame(width: 24, height: 24)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.white.opacity(0.55))
+                        .help("复制最新回复")
+                        .accessibilityLabel("复制最新回复")
                     }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.white.opacity(0.55))
-                    .help("复制完整回复")
-                    .accessibilityLabel("复制完整回复")
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
@@ -89,6 +237,13 @@ struct StageResidentComposer: View {
             }
 
             VStack(alignment: .leading, spacing: 12) {
+                if let notice = state.statusNotice, !notice.isEmpty {
+                    Text("应用提示：" + notice)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.orange.opacity(0.95))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("stage.resident-status-notice")
+                }
                 if let notice = state.deliveryNotice, !notice.isEmpty {
                     Text(notice)
                         .font(.system(size: 11))
@@ -96,23 +251,25 @@ struct StageResidentComposer: View {
                         .fixedSize(horizontal: false, vertical: true)
                         .accessibilityIdentifier("stage.resident-delivery-notice")
                 }
-                TextField("发消息，或让居民做点什么…", text: $state.draft, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 14))
-                    .foregroundStyle(.white.opacity(0.94))
-                    .lineLimit(1...3)
-                    .focused($inputFocused)
-                    .onSubmit(submit)
-                    .accessibilityLabel("给居民发消息")
-                    .accessibilityIdentifier("stage.resident-input")
-                    .onChange(of: inputFocused) { _, focused in
-                        if focused { onFocusInput() }
-                    }
+                ResidentAttachmentStrip(store: state.images)
+                ResidentAttachmentInput(text: $state.draft, store: state.images, onSubmit: submit, onFocus: {
+                    inputFocused = true
+                    onFocusInput()
+                }, onBlur: { inputFocused = false })
+                .frame(minHeight: 24)
 
                 HStack(spacing: 10) {
-                    Text(state.isThinking ? "正在思考…" : state.voiceActive ? "正在听你说话…" : "你的居民")
+                    Button { state.images.chooseImages() } label: {
+                        Image(systemName: "plus").font(.system(size: 15)).frame(width: 28, height: 28)
+                    }
+                    .buttonStyle(.plain)
+                    .help("添加图片，也可以直接粘贴图片")
+                    .accessibilityLabel("添加图片附件")
+                    .disabled(state.images.isPreparing || state.images.attachments.count >= 4)
+                    Text(state.isThinking ? (state.progress ?? "等待居民回应…") : state.voiceActive ? "正在听你说话…" : "你的居民")
                         .font(.system(size: 11))
                         .foregroundStyle(.white.opacity(0.43))
+                        .accessibilityIdentifier("stage.resident-progress")
                     Spacer(minLength: 8)
                     Button(action: onToggleVoice) {
                         Image(systemName: state.voiceActive ? "mic.fill" : "mic")
@@ -125,9 +282,13 @@ struct StageResidentComposer: View {
                     .accessibilityLabel(state.voiceActive ? "结束语音输入" : "语音输入")
                     if canStopReply && hasDraft {
                         Button(action: stopReply) {
-                            Image(systemName: "stop.fill")
-                                .font(.system(size: 11, weight: .semibold))
-                                .frame(width: 30, height: 30)
+                            if speechStatus.isSpeaking {
+                                Text("停止说话").font(.system(size: 12, weight: .medium))
+                            } else {
+                                Image(systemName: "stop.fill")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .frame(width: 30, height: 30)
+                            }
                         }
                         .buttonStyle(.plain)
                         .foregroundStyle(.white.opacity(0.72))
@@ -136,11 +297,18 @@ struct StageResidentComposer: View {
                         .accessibilityIdentifier("stage.resident-stop")
                     }
                     Button(action: performPrimaryAction) {
-                        Image(systemName: primaryStops ? "stop.fill" : "arrow.up")
-                            .font(.system(size: primaryStops ? 11 : 15, weight: .semibold))
-                            .foregroundStyle(Color(white: 0.14))
-                            .frame(width: 30, height: 30)
-                            .background(.white.opacity(canSubmit ? 0.92 : 0.25), in: Circle())
+                        if primaryStops && speechStatus.isSpeaking {
+                            Text("停止说话")
+                                .font(.system(size: 12, weight: .medium))
+                                .padding(.horizontal, 9).frame(height: 30)
+                                .background(.white.opacity(0.12), in: Capsule())
+                        } else {
+                            Image(systemName: primaryStops ? "stop.fill" : "arrow.up")
+                                .font(.system(size: primaryStops ? 11 : 15, weight: .semibold))
+                                .foregroundStyle(Color(white: 0.14))
+                                .frame(width: 30, height: 30)
+                                .background(.white.opacity(canSubmit ? 0.92 : 0.25), in: Circle())
+                        }
                     }
                     .buttonStyle(.plain)
                     .disabled(!canSubmit)
@@ -160,11 +328,11 @@ struct StageResidentComposer: View {
     }
 
     private var canSubmit: Bool {
-        canStopReply || hasDraft
+        primaryStops || (hasDraft && state.images.canSubmit)
     }
 
     private var hasDraft: Bool {
-        !state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !state.images.attachments.isEmpty
     }
 
     private var primaryStops: Bool { canStopReply && !hasDraft }
@@ -177,7 +345,7 @@ struct StageResidentComposer: View {
         primaryStops ? stopActionLabel : "发送消息"
     }
 
-    private var stopActionLabel: String { state.isThinking || state.canStop ? "停止当前任务" : "停止朗读" }
+    private var stopActionLabel: String { speechStatus.isSpeaking ? "停止说话" : "停止当前任务" }
 
     private func performPrimaryAction() {
         if primaryStops {
@@ -188,13 +356,20 @@ struct StageResidentComposer: View {
     }
 
     private func stopReply() {
+        if speechStatus.isSpeaking {
+            speechStatus.stopSpeaking()
+            return
+        }
         if state.isThinking { state.cancel() }
         onCancelMessage()
     }
 
     private func submit() {
         guard let message = state.takeMessage() else { return }
-        Task { await onSendMessage(message) }
+        Task {
+            do { try await onSendMessage(message) }
+            catch { state.restore(message, error: error) }
+        }
     }
 }
 
@@ -2147,7 +2322,7 @@ enum StageControlPanelLayout {
     static let sideInset: CGFloat = 4
     static let groupGap: CGFloat = 6
     static let settingsWidth: CGFloat = 68
-    static let transportWidth: CGFloat = 7 * controlSize + settingsWidth + 2 * sideInset + 2 * groupGap + 1
+    static let transportWidth: CGFloat = 8 * controlSize + settingsWidth + 2 * sideInset + 2 * groupGap + 1
 }
 
 enum StageActivityAvailability {
@@ -2182,6 +2357,7 @@ struct StageVisualPickerView: View {
     @State private var model = PresenceSettingsModel()
     @State private var tab: StageControlPanelTab = .player
     @State private var didChooseInitialTab = false
+    @State private var motionCategory: MotionLibraryCategory?
     var onRunActivity: @MainActor (String) -> Void = { _ in }
     var onStopActivity: @MainActor () -> Void = {}
     var onManageAssets: @MainActor () -> Void = {}
@@ -2281,7 +2457,15 @@ struct StageVisualPickerView: View {
             }
             Text("选择已安装动作；自然待机可结束当前表演。")
                 .foregroundStyle(.secondary)
-            ForEach(model.motions, id: \.id) { motion in
+            Picker("分类", selection: $motionCategory) {
+                Text("全部").tag(MotionLibraryCategory?.none)
+                ForEach(MotionLibraryCategory.allCases) { category in
+                    Text(category.title).tag(MotionLibraryCategory?.some(category))
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            ForEach(model.motions(in: motionCategory), id: \.id) { motion in
                 let compatibility = model.motionCompatibility(motion)
                 Button {
                     model.activateMotion(motion)
@@ -2304,7 +2488,13 @@ struct StageVisualPickerView: View {
                 .buttonStyle(.plain)
                 .disabled(compatibility != .compatible || model.isWorking)
             }
-            if model.motions.isEmpty { Text("暂无可用动作，请在资产管理中安装。") }
+            if model.motions.isEmpty {
+                Text("暂无可用动作，请在资产管理中安装。")
+            } else if let notice = model.motionListNotice {
+                Text(notice).foregroundStyle(.secondary)
+            } else if model.motions(in: motionCategory).isEmpty, motionCategory != nil {
+                Text("这个分类下暂无当前角色可用的动作。").foregroundStyle(.secondary)
+            }
             if let message = model.message {
                 Text(message).foregroundStyle(model.hasError ? Color.orange : Color.secondary)
             }

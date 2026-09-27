@@ -5,6 +5,7 @@ import SwiftUI
 struct PresenceSettingsView: View {
     @State private var model = PresenceSettingsModel()
     @State private var isAddingFromLink = false
+    @State private var motionCategory: MotionLibraryCategory?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -26,7 +27,20 @@ struct PresenceSettingsView: View {
                 }
 
                 Section {
-                    ForEach(model.motions, id: \.id) { motion in
+                    Picker("分类", selection: $motionCategory) {
+                        Text("全部").tag(MotionLibraryCategory?.none)
+                        ForEach(MotionLibraryCategory.allCases) { category in
+                            Text(category.title).tag(MotionLibraryCategory?.some(category))
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    if let notice = model.motionListNotice {
+                        Text(notice)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(model.motions(in: motionCategory), id: \.id) { motion in
                         MotionRow(
                             motion: motion,
                             compatibility: model.motionCompatibility(motion),
@@ -37,10 +51,16 @@ struct PresenceSettingsView: View {
                                 : { model.removeMotion(motion) }
                         )
                     }
+                    if motionCategory != nil, model.motionListNotice == nil,
+                       model.motions(in: motionCategory).isEmpty {
+                        Text("这个分类下暂无当前角色可用的动作。")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
                 } header: {
                     Text("动作")
                 } footer: {
-                    Text("VRM 可使用 VRMA、VMD 和自然待机；PMX 可使用 VMD 和自然待机。切换角色格式时会分别记住动作选择。")
+                    Text("VRM 列表显示 VRMA 和自然待机；PMX 列表显示 VMD 和自然待机。切换角色格式时会分别记住动作选择。两类动作都保留安装，已有转接播放能力不变。")
                 }
 
                 Section("动作库") {
@@ -61,7 +81,14 @@ struct PresenceSettingsView: View {
                         .disabled(model.isWorking || model.remoteMotionCatalogURL.isEmpty)
                     }
 
-                    ForEach(model.publishedMotions, id: \.catalogIdentity) { published in
+                    if model.publishedMotions.isEmpty == false,
+                       model.availablePublishedMotions.isEmpty,
+                       let notice = model.motionListNotice {
+                        Text(notice)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(model.availablePublishedMotions, id: \.catalogIdentity) { published in
                         PublishedMotionRow(
                             motion: published,
                             installState: model.publishedMotionInstallState(published),
@@ -119,6 +146,7 @@ struct PresenceSettingsView: View {
             }
         }
         .task { model.load() }
+        .onChange(of: model.activeAvatarID) { _, _ in model.load() }
         .sheet(isPresented: $isAddingFromLink) {
             AddPresenceFromLinkSheet(
                 model: model,

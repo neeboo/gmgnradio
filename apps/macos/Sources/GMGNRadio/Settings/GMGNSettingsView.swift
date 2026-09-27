@@ -240,6 +240,7 @@ private struct SpaceSettingsView: View {
                             )
                         }
                 }
+                PropGenerationSettingsSection()
             }
             .formStyle(.grouped)
         }

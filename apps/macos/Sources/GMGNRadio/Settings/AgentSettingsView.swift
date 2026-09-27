@@ -121,6 +121,24 @@ struct AgentSettingsView: View {
                     }
                 }
 
+                Section("居民人格") {
+                    TextEditor(text: $model.residentPersona)
+                        .font(.body)
+                        .frame(minHeight: 120)
+
+                    HStack {
+                        Text("独立于上面的 DJ 主持偏好，统一用于居民会话。保存后下一轮生效，切换空间仍保留；人格只影响语气、措辞和关注点，不会扩大或改变工具权限。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("保存") {
+                            model.saveResidentPersona()
+                            notifyResidentAutonomyChanged()
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                }
+
                 Section("Agent 聊天后端") {
                     Picker(
                         "后端",
@@ -158,9 +176,41 @@ struct AgentSettingsView: View {
 
                     Toggle("允许居民自主安排活动", isOn: $residentAutonomyEnabled)
                         .onChange(of: residentAutonomyEnabled) { _, _ in
-                            NotificationCenter.default.post(name: Notification.Name("gmgnResidentAutonomyChanged"), object: nil)
+                            notifyResidentAutonomyChanged()
                         }
-                    Text("开启后，居民可在空闲或活动变化时使用当前 Codex 思考并操作已支持的物件，会消耗模型额度。试验版每小时最多主动思考 6 轮，停止按钮可随时暂停。其他后端暂不自动运行。")
+                    Text("开启后，居民会在空闲或活动变化时用当前选定的、支持世界工具的思考后端（Codex、DSH 或 Claude Code）自主观察和行动，会消耗对应模型额度。每小时最多主动思考的轮数由下面的预算决定；设为 0 只表示不再发起新的后台思考，不会取消正在进行的一轮，要立即暂停当前轮请使用停止按钮。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    LabeledContent("每小时后台思考预算") {
+                        Picker(
+                            "每小时后台思考预算",
+                            selection: Binding(
+                                get: {
+                                    model.backgroundTurnsPerHour
+                                },
+                                set: { value in
+                                    _ = model
+                                        .saveBackgroundTurnsPerHour(value)
+                                    notifyResidentAutonomyChanged()
+                                }
+                            )
+                        ) {
+                            ForEach(
+                                0...ResidentPreferences
+                                    .maximumBackgroundTurnsPerHour,
+                                id: \.self
+                            ) { value in
+                                Text(
+                                    value == 0 ? "0 轮（不再新起）" : "\(value) 轮"
+                                )
+                                .tag(value)
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(width: 160)
+                    }
+                    Text("预算按本次居民会话的滚动一小时计算，默认 6，可选 0...6；额度只在本循环实例内累计，不跨循环重建或重启保留，不是跨重启的全局配额。这里的“轮”是后台思考轮数，不等于 HTTP 请求次数或费用。实际调度由居民循环读取该值。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -286,6 +336,15 @@ struct AgentSettingsView: View {
             }
         }
         .task { await model.load() }
+    }
+
+    /// 复用既有的自主设置通知，让宿主热更新自主开关与后台思考预算；
+    /// 居民人格本身由居民会话每轮重新读取，无需重建会话。
+    private func notifyResidentAutonomyChanged() {
+        NotificationCenter.default.post(
+            name: Notification.Name("gmgnResidentAutonomyChanged"),
+            object: nil
+        )
     }
 
     @ViewBuilder

@@ -3,6 +3,7 @@ import AppKit
 import Combine
 import os
 import SwiftUI
+import WorldRuntime
 
 @MainActor
 final class StageWindowController: NSWindowController, NSWindowDelegate {
@@ -38,9 +39,13 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     private let onRunActivity: @MainActor (String) -> Void
     private let onStopActivity: @MainActor () -> Void
     private let onManageAssets: @MainActor () -> Void
-    private let onSendMessage: @MainActor (String) async -> Void
+    private let onSendMessage: @MainActor (ResidentChatSubmission) async throws -> Void
     private let onCancelMessage: @MainActor () -> Void
+    private let onOpenSystemInbox: @MainActor () -> Void
+    private var systemInboxUnread = 0
     private let residentChat = StageResidentChatState()
+    private let wishMachineTasks = WishMachineTaskPresentationStore()
+    private let residentPropEditor = ResidentPropEditorState()
     private var playbackState: LocalMusicPlaybackState
     private var voiceState: RealtimeVoiceConnectionState
     private weak var stageContentView: StageContentView?
@@ -83,8 +88,9 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         onRunActivity: @escaping @MainActor (String) -> Void = { _ in },
         onStopActivity: @escaping @MainActor () -> Void = {},
         onManageAssets: @escaping @MainActor () -> Void = {},
-        onSendMessage: @escaping @MainActor (String) async -> Void = { _ in },
-        onCancelMessage: @escaping @MainActor () -> Void = {}
+        onSendMessage: @escaping @MainActor (ResidentChatSubmission) async throws -> Void = { _ in },
+        onCancelMessage: @escaping @MainActor () -> Void = {},
+        onOpenSystemInbox: @escaping @MainActor () -> Void = {}
     ) {
         self.audioFeatures = audioFeatures
         self.artwork = artwork
@@ -125,6 +131,7 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         self.onManageAssets = onManageAssets
         self.onSendMessage = onSendMessage
         self.onCancelMessage = onCancelMessage
+        self.onOpenSystemInbox = onOpenSystemInbox
         residentChat.voiceActive = voiceState == .listening
         super.init(window: nil)
     }
@@ -141,6 +148,28 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         onCloseHandler = handler
     }
 
+    func configureResidentPropEditor(
+        preview: @escaping @MainActor (String, WorldPropPlacement) async throws -> WorldObjectState,
+        commit: @escaping @MainActor (WorldPropLayoutCommand, UInt64, String) async throws -> ResidentPropEditorSnapshot,
+        hold: (@MainActor (String, UInt64, String) async throws -> ResidentPropEditorSnapshot)? = nil,
+        adjustHeldGrip: (@MainActor (String, WorldVector3, WorldQuaternion, UInt64, String) async throws -> ResidentPropEditorSnapshot)? = nil,
+        returnHeld: (@MainActor (String, UInt64, String) async throws -> ResidentPropEditorSnapshot)? = nil,
+        onPreviewChanged: @escaping @MainActor (WorldObjectState?) -> Void,
+        onEditingChanged: @escaping @MainActor (Bool) -> Void
+    ) {
+        residentPropEditor.preview = preview
+        residentPropEditor.commit = commit
+        residentPropEditor.hold = hold
+        residentPropEditor.adjustHeldGrip = adjustHeldGrip
+        residentPropEditor.returnHeld = returnHeld
+        residentPropEditor.onPreviewChanged = onPreviewChanged
+        residentPropEditor.onEditingChanged = onEditingChanged
+    }
+
+    func updateResidentPropEditor(_ snapshot: ResidentPropEditorSnapshot) {
+        residentPropEditor.update(snapshot)
+    }
+
     func setOnWillPresentSpaceHandler(_ handler: (@MainActor () -> Void)?) {
         onWillPresentSpaceHandler = handler
     }
@@ -155,9 +184,18 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func setVoiceState(_ state: RealtimeVoiceConnectionState) {
+        let startsListening = state == .connecting && voiceState != .connecting
+        let changed = state != voiceState
         voiceState = state
         residentChat.voiceActive = state == .listening
         stageContentView?.setVoiceState(state)
+        if startsListening {
+            residentChat.showVoiceStatus("正在连接语音转写…")
+        } else if changed, state != .connecting {
+            // 语音状态已改变：「正在连接/正在听」这类临时提示不再成立，清掉；
+            // 真正的失败提示（failure 类别）不受影响。
+            residentChat.dismissVoiceStatus()
+        }
         let activity: StageAvatarActivity = switch state {
         case .listening:
             .listening
@@ -169,12 +207,56 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         avatarRuntime.setActivity(activity)
     }
 
-    func beginResidentReply() { residentChat.begin() }
-    func setResidentThinking(_ thinking: Bool) { residentChat.setThinking(thinking) }
+    func beginResidentReply() {
+        residentChat.begin()
+        stageContentView?.showResidentChat()
+    }
+    func setResidentThinking(_ thinking: Bool, autoRevealsChat: Bool = true) {
+        let startsNewTurn = thinking && !residentChat.isThinking
+        residentChat.setThinking(thinking)
+        // 后台/自驱回合不得抢开聊天或收起用户正在看的面板：状态照常更新，
+        // 只有真正由用户发起的回合才自动展开。
+        if startsNewTurn && autoRevealsChat { stageContentView?.showResidentChat() }
+    }
+    func setResidentProgress(_ text: String?) { residentChat.progress = text }
+    func setWishMachineTasks(_ tasks: [WishMachineTaskPresentation]) { wishMachineTasks.update(tasks) }
+
+    func setSystemInboxUnread(_ count: Int) {
+        systemInboxUnread = count
+        stageContentView?.setSystemInboxUnread(count)
+    }
     func setResidentCanStop(_ canStop: Bool) { residentChat.canStop = canStop }
     func setResidentDeliveryNotice(_ text: String?) { residentChat.deliveryNotice = text }
-    func finishResidentReply(_ text: String) { residentChat.finish(text) }
-    func showResidentChatStatus(_ text: String) { residentChat.showStatus(text) }
+    /// 最近对话快照（宿主推送）：按回合回看发给居民的话与较早的回复。
+    func setResidentTranscript(_ lines: [ResidentChatTranscriptLine]) {
+        residentChat.setTranscript(lines)
+    }
+    func finishResidentReply(_ text: String, autoRevealsChat: Bool = true) {
+        residentChat.finish(text)
+        if !text.isEmpty && autoRevealsChat { stageContentView?.showResidentChat() }
+    }
+    func showResidentChatStatus(_ text: String, autoRevealsChat: Bool = true) {
+        residentChat.showStatus(text)
+        if !text.isEmpty && autoRevealsChat { stageContentView?.showResidentChat() }
+    }
+    /// 失败提示走独立类别：后续普通应用信息不得把它盖掉。
+    func showResidentFailureStatus(_ text: String, autoRevealsChat: Bool = false) {
+        residentChat.showFailureStatus(text)
+        if !text.isEmpty && autoRevealsChat { stageContentView?.showResidentChat() }
+    }
+    /// 语音连接/收音的临时提示（正在听等），连接结论落地后可被清除。
+    func showResidentVoiceStatus(_ text: String) {
+        residentChat.showVoiceStatus(text)
+    }
+    /// 换世界/换后端等上下文切换：清掉旧提示与旧进度，失败提示也不例外。
+    func clearResidentTransientStatus() {
+        residentChat.clearTransient()
+    }
+    var residentStatusText: String? { residentChat.statusNotice }
+    func restoreResidentSubmission(_ submission: ResidentChatSubmission, notice: String) {
+        residentChat.restore(submission, notice: notice)
+        stageContentView?.showResidentChat()
+    }
 
     func setVoiceLevel(_ level: Float) {
         avatarRuntime.setVoiceLevel(level)
@@ -258,6 +340,10 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         updateRenderSurfaceVisibility(for: window)
     }
 
+    func windowDidResignKey(_ notification: Notification) {
+        residentPropEditor.close()
+    }
+
     func windowDidEnterFullScreen(_ notification: Notification) {
         stageContentView?.setWindowMode(.fullScreen)
     }
@@ -325,6 +411,9 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
             onStopActivity: onStopActivity,
             onManageAssets: onManageAssets,
             residentChat: residentChat,
+            wishMachineTasks: wishMachineTasks,
+            residentPropEditor: residentPropEditor,
+            onOpenSystemInbox: onOpenSystemInbox,
             onSendMessage: onSendMessage,
             onCancelMessage: onCancelMessage,
             onEnterSpace: { [weak self] in
@@ -338,7 +427,11 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
             }
         )
         stageContentView = contentView
+        contentView.setSystemInboxUnread(systemInboxUnread)
         window.contentView = contentView
+        if residentChat.isThinking || residentChat.voiceActive || !residentChat.reply.isEmpty || residentChat.statusNotice != nil {
+            contentView.showResidentChat()
+        }
         window.center()
         return window
     }
@@ -357,6 +450,8 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     private func finishCurrentClose() {
         guard !didHandleCurrentClose else { return }
         didHandleCurrentClose = true
+        AgentSpeechStatusStore.shared.stopSpeaking()
+        residentPropEditor.close()
         cameraCoordinator.captureUserCamera()
         renderSurfaceController.setOwnerVisibility(
             false,
@@ -460,8 +555,16 @@ private final class StageContentView: NSView {
     private var programRail: StageProgramRailHostingView!
     private var visualPicker: StageVisualPickerHostingView!
     private var transportControls: StageTransportControlsView!
+
+    func setSystemInboxUnread(_ count: Int) {
+        transportControls?.setSystemInboxUnread(count)
+    }
     private var destinationButton: StageDestinationButton!
     private var residentComposer: NSHostingView<StageResidentComposer>!
+    private let residentTaskFeedback: NSHostingView<WishMachineTaskStatusView>
+    private let residentPropEditor: ResidentPropEditorState
+    private var propEditorPanel: NSHostingView<ResidentPropEditorView>!
+    private var editorVisibilitySubscription: AnyCancellable?
     private var worldVisibilityObserverID: UUID?
     private var isProgramRailVisible = false
     private var isVisualPickerVisible = false
@@ -497,7 +600,10 @@ private final class StageContentView: NSView {
         onStopActivity: @escaping @MainActor () -> Void,
         onManageAssets: @escaping @MainActor () -> Void,
         residentChat: StageResidentChatState,
-        onSendMessage: @escaping @MainActor (String) async -> Void,
+        wishMachineTasks: WishMachineTaskPresentationStore,
+        residentPropEditor: ResidentPropEditorState,
+        onOpenSystemInbox: @escaping @MainActor () -> Void,
+        onSendMessage: @escaping @MainActor (ResidentChatSubmission) async throws -> Void,
         onCancelMessage: @escaping @MainActor () -> Void,
         onEnterSpace: @escaping @MainActor () -> Void,
         onShowPlayer: @escaping @MainActor () -> Void,
@@ -506,8 +612,11 @@ private final class StageContentView: NSView {
         overlayState = StageOverlayState()
         self.spatialStage = spatialStage
         self.renderSurfaceController = renderSurfaceController
+        self.residentPropEditor = residentPropEditor
+        residentTaskFeedback = NSHostingView(rootView: WishMachineTaskStatusView(state: wishMachineTasks))
         worldInteractionView = StageWorldInteractionView(
-            spatialStage: spatialStage
+            spatialStage: spatialStage,
+            propEditor: residentPropEditor
         )
         super.init(frame: frame)
 
@@ -543,6 +652,11 @@ private final class StageContentView: NSView {
         let chatButton = StageResidentChatButton { [weak self] in
             self?.toggleResidentChat()
         }
+        let systemInboxButton = ResidentSystemMailBadgeButton(
+            identifier: "stage.system-inbox-toggle",
+            action: onOpenSystemInbox
+        )
+        let propEditorButton = StagePropEditorButton { [weak self] in self?.togglePropEditor() }
         let windowModeButton = StageWindowModeButton(
             mode: .windowed,
             action: onToggleWindowMode
@@ -554,6 +668,8 @@ private final class StageContentView: NSView {
             nextButton: nextButton,
             voiceButton: voiceButton,
             chatButton: chatButton,
+            systemInboxButton: systemInboxButton,
+            propEditorButton: propEditorButton,
             visualButton: visualButton,
             windowModeButton: windowModeButton
         )
@@ -696,6 +812,29 @@ private final class StageContentView: NSView {
         residentComposer.isHidden = true
         addSubview(residentComposer)
 
+        residentTaskFeedback.sizingOptions = [.intrinsicContentSize]
+        residentTaskFeedback.translatesAutoresizingMaskIntoConstraints = false
+        residentTaskFeedback.wantsLayer = true
+        residentTaskFeedback.layer?.zPosition = 18
+        residentTaskFeedback.isHidden = !spatialStage.isWorldPresentationRequested
+        addSubview(residentTaskFeedback)
+
+        propEditorPanel = NSHostingView(rootView: ResidentPropEditorView(state: residentPropEditor))
+        propEditorPanel.identifier = NSUserInterfaceItemIdentifier("stage.prop-editor")
+        propEditorPanel.translatesAutoresizingMaskIntoConstraints = false
+        propEditorPanel.wantsLayer = true
+        propEditorPanel.layer?.zPosition = 19
+        propEditorPanel.isHidden = true
+        addSubview(propEditorPanel)
+        editorVisibilitySubscription = residentPropEditor.$isOpen.sink { [weak self] open in
+            self?.propEditorPanel.isHidden = !open
+            self?.transportControls.setPropEditorExpanded(open)
+            if open {
+                self?.spatialStage.clearMovement()
+                self?.spatialStage.setSpeedBoosted(false)
+            }
+        }
+
         destinationButton = StageDestinationButton { [spatialStage] in
             switch StageDestinationAction.resolve(
                 isWorldPresentationRequested:
@@ -725,6 +864,13 @@ private final class StageContentView: NSView {
         preferredComposerWidth.priority = .defaultHigh
 
         NSLayoutConstraint.activate([
+            residentTaskFeedback.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
+            residentTaskFeedback.topAnchor.constraint(equalTo: topAnchor, constant: 22),
+            residentTaskFeedback.widthAnchor.constraint(equalToConstant: 280),
+            propEditorPanel.trailingAnchor.constraint(equalTo: transportControls.trailingAnchor),
+            propEditorPanel.bottomAnchor.constraint(equalTo: transportControls.topAnchor, constant: -12),
+            propEditorPanel.widthAnchor.constraint(equalToConstant: 340),
+            propEditorPanel.topAnchor.constraint(greaterThanOrEqualTo: topAnchor, constant: 16),
             residentComposer.trailingAnchor.constraint(equalTo: transportControls.trailingAnchor),
             residentComposer.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 22),
             residentComposer.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -22),
@@ -740,7 +886,7 @@ private final class StageContentView: NSView {
                 equalTo: bottomAnchor,
                 constant: -22
             ),
-            transportControls.widthAnchor.constraint(equalToConstant: StageControlPanelLayout.transportWidth),
+            transportControls.widthAnchor.constraint(equalToConstant: StageControlPanelLayout.transportWidth + StageControlPanelLayout.controlSize),
             transportControls.heightAnchor.constraint(equalToConstant: 48),
 
             programRail.trailingAnchor.constraint(
@@ -834,6 +980,7 @@ private final class StageContentView: NSView {
     }
 
     private func toggleProgramRail() {
+        residentPropEditor.close()
         isProgramRailVisible.toggle()
         if isProgramRailVisible {
             isResidentChatExpanded = false
@@ -848,6 +995,7 @@ private final class StageContentView: NSView {
     }
 
     private func toggleVisualPicker() {
+        residentPropEditor.close()
         isVisualPickerVisible.toggle()
         if isVisualPickerVisible {
             isResidentChatExpanded = false
@@ -862,6 +1010,7 @@ private final class StageContentView: NSView {
     }
 
     private func toggleResidentChat() {
+        residentPropEditor.close()
         guard spatialStage.isWorldPresentationRequested else { return }
         isResidentChatExpanded.toggle()
         if isResidentChatExpanded {
@@ -874,6 +1023,37 @@ private final class StageContentView: NSView {
             overlayState.setProgramRailVisible(false)
         }
         updateResidentComposerVisibility()
+    }
+
+    func showResidentChat() {
+        // Feedback may arrive while another surface owns focus or an edit is in progress.
+        // Keep the edit intact and reveal the existing composer without moving keyboard focus.
+        guard spatialStage.isWorldPresentationRequested, !residentPropEditor.isOpen else { return }
+        isResidentChatExpanded = true
+        isProgramRailVisible = false
+        isVisualPickerVisible = false
+        programRail.isHidden = true
+        visualPicker.isHidden = true
+        transportControls.setProgramRailExpanded(false)
+        transportControls.setVisualPickerExpanded(false)
+        overlayState.setProgramRailVisible(false)
+        updateResidentComposerVisibility()
+    }
+
+    private func togglePropEditor() {
+        guard spatialStage.isWorldPresentationRequested else { return }
+        if residentPropEditor.isOpen { residentPropEditor.close(); return }
+        isResidentChatExpanded = false
+        isProgramRailVisible = false
+        isVisualPickerVisible = false
+        programRail.isHidden = true
+        visualPicker.isHidden = true
+        transportControls.setProgramRailExpanded(false)
+        transportControls.setVisualPickerExpanded(false)
+        overlayState.setProgramRailVisible(false)
+        updateResidentComposerVisibility()
+        window?.makeFirstResponder(worldInteractionView)
+        residentPropEditor.open()
     }
 
     private func residentComposerOwnsFirstResponder() -> Bool {
@@ -908,6 +1088,9 @@ private final class StageContentView: NSView {
     }
 
     private func applySpatialPresentation(isWorldVisible _: Bool) {
+        residentTaskFeedback.isHidden = !spatialStage.isWorldPresentationRequested
+        if !spatialStage.isWorldPresentationRequested { residentPropEditor.close() }
+        transportControls.setPropEditorAvailable(spatialStage.isWorldPresentationRequested)
         if spatialStage.isWorldPresentationRequested {
             attachRenderSurface()
         }
@@ -952,12 +1135,16 @@ private final class StageContentView: NSView {
 @MainActor
 private final class StageWorldInteractionView: NSView {
     private let spatialStage: SpatialStageStore
+    private let propEditor: ResidentPropEditorState
+    private var pointerTask: Task<Void, Never>?
+    private var pointerTracking: NSTrackingArea?
     private var dragInProgress = false
     private var didLogCurrentDrag = false
     private var lastDragLocationInWindow: CGPoint?
 
-    init(spatialStage: SpatialStageStore) {
+    init(spatialStage: SpatialStageStore, propEditor: ResidentPropEditorState) {
         self.spatialStage = spatialStage
+        self.propEditor = propEditor
         super.init(frame: .zero)
         toolTip = "拖动鼠标调整视角；滚轮拉近或拉远；W/S 沿视线前后移动，A/D 左右移动；双击复位"
     }
@@ -986,6 +1173,11 @@ private final class StageWorldInteractionView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        if consumesPropPointer {
+            window?.makeFirstResponder(self)
+            updatePropPointer(event, confirm: true)
+            return
+        }
         if event.clickCount == 2 {
             endDragIfNeeded()
             spatialStage.resetCamera()
@@ -1012,6 +1204,7 @@ private final class StageWorldInteractionView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if consumesPropPointer { updatePropPointer(event); return }
         dragCamera(with: event)
     }
 
@@ -1036,6 +1229,12 @@ private final class StageWorldInteractionView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
+        if window?.firstResponder is NSTextView { super.keyDown(with: event); return }
+        if event.keyCode == 53, propEditor.isOpen {
+            propEditor.escape()
+            return
+        }
+        if propEditor.isOpen { return }
         guard !(window?.firstResponder is NSTextView),
               let movement = Self.movement(for: event.keyCode) else {
             super.keyDown(with: event)
@@ -1059,6 +1258,7 @@ private final class StageWorldInteractionView: NSView {
     }
 
     override func flagsChanged(with event: NSEvent) {
+        guard !propEditor.isOpen else { spatialStage.setSpeedBoosted(false); return }
         spatialStage.setSpeedBoosted(
             event.modifierFlags.contains(.shift)
         )
@@ -1070,8 +1270,45 @@ private final class StageWorldInteractionView: NSView {
             spatialStage.clearMovement()
             spatialStage.setSpeedBoosted(false)
             endDragIfNeeded()
+            pointerTask?.cancel()
+            propEditor.close()
         }
         super.viewWillMove(toWindow: newWindow)
+    }
+
+    private var consumesPropPointer: Bool {
+        ResidentPropEditorState.consumesScenePointer(isOpen: propEditor.isOpen, moving: propEditor.isMoving,
+                                                     inputOwnsFocus: window?.firstResponder is NSTextView)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let pointerTracking { removeTrackingArea(pointerTracking) }
+        let area = NSTrackingArea(rect: .zero, options: [.activeInKeyWindow, .inVisibleRect, .mouseMoved], owner: self, userInfo: nil)
+        addTrackingArea(area); pointerTracking = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        guard consumesPropPointer else { super.mouseMoved(with: event); return }
+        let point = convert(event.locationInWindow, from: nil)
+        // A tracking area can see moves above another view. Never project a control or input click.
+        guard superview?.hitTest(convert(point, to: superview)) === self else { return }
+        updatePropPointer(event)
+    }
+
+    private func updatePropPointer(_ event: NSEvent, confirm: Bool = false) {
+        guard bounds.width > 0, bounds.height > 0, let surface = propEditor.surface else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        let normalized = SIMD2<Float>(Float(point.x / bounds.width), Float(1 - point.y / bounds.height))
+        pointerTask?.cancel()
+        guard let position = spatialStage.residentPropPoint(normalizedPoint: normalized, surfaceY: surface.position.y) else {
+            propEditor.pointerMissed(); return
+        }
+        pointerTask = Task { [weak self] in
+            guard let self, !Task.isCancelled else { return }
+            await propEditor.movePointer(to: .init(x: position.x, y: position.y, z: position.z))
+            if confirm, !Task.isCancelled { await propEditor.confirm() }
+        }
     }
 
     private func beginDrag(
@@ -1277,6 +1514,8 @@ private final class StageTransportControlsView: NSView {
     private let nextButton: StageTrackNavigationButton
     private let voiceButton: StageVoiceButton
     private let chatButton: StageResidentChatButton
+    private let systemInboxButton: ResidentSystemMailBadgeButton
+    private let propEditorButton: StagePropEditorButton
     private let visualButton: StageVisualButton
     private let windowModeButton: StageWindowModeButton
 
@@ -1287,6 +1526,8 @@ private final class StageTransportControlsView: NSView {
         nextButton: StageTrackNavigationButton,
         voiceButton: StageVoiceButton,
         chatButton: StageResidentChatButton,
+        systemInboxButton: ResidentSystemMailBadgeButton,
+        propEditorButton: StagePropEditorButton,
         visualButton: StageVisualButton,
         windowModeButton: StageWindowModeButton
     ) {
@@ -1296,6 +1537,8 @@ private final class StageTransportControlsView: NSView {
         self.nextButton = nextButton
         self.voiceButton = voiceButton
         self.chatButton = chatButton
+        self.systemInboxButton = systemInboxButton
+        self.propEditorButton = propEditorButton
         self.visualButton = visualButton
         self.windowModeButton = windowModeButton
         super.init(frame: .zero)
@@ -1317,7 +1560,7 @@ private final class StageTransportControlsView: NSView {
 
         let buttons: [NSView] = [
             programButton, previousButton, playbackButton, nextButton,
-            voiceButton, chatButton, visualButton, windowModeButton
+            voiceButton, chatButton, systemInboxButton, propEditorButton, visualButton, windowModeButton
         ]
         for view in buttons + [groupDivider] {
             view.translatesAutoresizingMaskIntoConstraints = false
@@ -1342,7 +1585,9 @@ private final class StageTransportControlsView: NSView {
             groupDivider.heightAnchor.constraint(equalToConstant: 20),
             voiceButton.leadingAnchor.constraint(equalTo: groupDivider.trailingAnchor, constant: StageControlPanelLayout.groupGap),
             chatButton.leadingAnchor.constraint(equalTo: voiceButton.trailingAnchor),
-            visualButton.leadingAnchor.constraint(equalTo: chatButton.trailingAnchor),
+            systemInboxButton.leadingAnchor.constraint(equalTo: chatButton.trailingAnchor),
+            propEditorButton.leadingAnchor.constraint(equalTo: systemInboxButton.trailingAnchor),
+            visualButton.leadingAnchor.constraint(equalTo: propEditorButton.trailingAnchor),
             windowModeButton.leadingAnchor.constraint(equalTo: visualButton.trailingAnchor),
             windowModeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -StageControlPanelLayout.sideInset)
         ])
@@ -1384,6 +1629,13 @@ private final class StageTransportControlsView: NSView {
         chatButton.setExpanded(isExpanded)
     }
 
+    func setSystemInboxUnread(_ count: Int) {
+        systemInboxButton.setUnreadCount(count)
+    }
+
+    func setPropEditorExpanded(_ expanded: Bool) { propEditorButton.contentTintColor = expanded ? .systemCyan : .white }
+    func setPropEditorAvailable(_ available: Bool) { propEditorButton.isEnabled = available }
+
     func setResidentChatAvailable(_ isAvailable: Bool) {
         chatButton.isEnabled = isAvailable
         if !isAvailable { chatButton.toolTip = "进入空间后与居民聊天" }
@@ -1392,6 +1644,23 @@ private final class StageTransportControlsView: NSView {
     func setVisualPickerMode(_ mode: StageVisualPickerMode) {
         visualButton.setStageMode(mode)
     }
+}
+
+@MainActor
+private final class StagePropEditorButton: NSButton {
+    private let handler: @MainActor () -> Void
+    init(action: @escaping @MainActor () -> Void) {
+        handler = action
+        super.init(frame: .zero)
+        title = ""
+        image = NSImage(systemSymbolName: "square.stack.3d.up", accessibilityDescription: "摆放物件")
+        isBordered = false; contentTintColor = .white
+        target = self; self.action = #selector(activate)
+        toolTip = "摆放物件"
+        identifier = NSUserInterfaceItemIdentifier("stage.prop-editor-toggle")
+    }
+    required init?(coder: NSCoder) { nil }
+    @objc private func activate() { handler() }
 }
 
 @MainActor

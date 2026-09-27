@@ -595,8 +595,118 @@ final class SpatialStageStore {
     @ObservationIgnored
     var onWorldSelectionChanged: (@MainActor () -> Void)?
     var marbleLivingCabin: MarbleLivingCabinPresentation?
+    var wishMachineState: WishMachineScene.State = .idle
+    var wishMachineOutput: WishMachineOutputDescriptor?
+    var wishMachineOutputStatus: WishMachineOutputStatus = .empty {
+        didSet {
+            guard wishMachineOutputStatus != oldValue else { return }
+            onWishMachineOutputStatusChanged?()
+        }
+    }
+    @ObservationIgnored
+    var onWishMachineOutputStatusChanged: (@MainActor () -> Void)?
+    var residentPropOutputs: [ResidentPropRenderDescriptor] = []
+    var residentPropPreview: ResidentPropRenderDescriptor?
+    var residentHeldProp: ResidentHeldPropDescriptor?
+    var residentPropDisplayStand: ResidentPropDisplayStand?
+    var residentPropRenderStatuses: [String: WishMachineOutputStatus] = [:]
+    @ObservationIgnored var residentPropPrepareHandler: (@MainActor (ResidentPropRenderDescriptor) async throws -> ResidentPropPreparedAsset)?
+    @ObservationIgnored var residentPropPreparedHandler: (@MainActor (String, URL, String) -> Bool)?
+    @ObservationIgnored var residentPropAttachmentValidationHandler: (@MainActor (String, PropAttachmentPoint) throws -> Void)?
+    @ObservationIgnored var residentPropClearHandler: (@MainActor () -> Void)?
+    @ObservationIgnored var residentPropActiveHandler: (@MainActor () -> Bool)?
+    @ObservationIgnored var residentPropViewProjection: simd_float4x4?
+    @ObservationIgnored let residentPropRenderOwnership = ResidentPropRenderOwnership()
+
+    func releaseResidentPropRenderer(_ owner: ResidentPropRenderOwner) {
+        guard residentPropRenderOwnership.release(owner: owner) else { return }
+        clearResidentPropRendererHooks()
+    }
+
+    private func clearResidentPropRendererHooks() {
+        residentPropClearHandler?()
+        residentPropClearHandler = nil
+        residentPropActiveHandler = nil
+        residentPropPrepareHandler = nil
+        residentPropPreparedHandler = nil
+        residentPropAttachmentValidationHandler = nil
+        residentPropViewProjection = nil
+        residentPropRenderStatuses = [:]
+    }
+
+    /// Explicit readiness for launch-time recovery: the visible world renderer
+    /// publishes its handlers on the first eligible draw, which races app
+    /// startup. Callers defer while this is false instead of reporting a
+    /// claimed prop as an asset failure. The query touches no task, ownership
+    /// or model record.
+    func canPrepareResidentProp(worldID: String) -> Bool {
+        ResidentPropStartupRecovery.canPrepare(
+            isWorldVisible: isWorldVisible,
+            hasActiveRenderer: residentPropActiveHandler?() == true,
+            selectedWorldID: selectedWorldID,
+            descriptorWorldID: worldID,
+            hasPrepareHandler: residentPropPrepareHandler != nil
+        )
+    }
+
+    func prepareResidentProp(_ descriptor: ResidentPropRenderDescriptor) async throws -> ResidentPropPreparedAsset {
+        guard canPrepareResidentProp(worldID: descriptor.worldID), let residentPropPrepareHandler else { throw WishMachineOutputError.renderUnavailable }
+        let result = try await residentPropPrepareHandler(descriptor)
+        guard canPrepareResidentProp(worldID: descriptor.worldID) else { throw CancellationError() }
+        return result
+    }
+
+    func isResidentPropPrepared(assetID: String, modelURL: URL) -> Bool {
+        guard isWorldVisible, residentPropActiveHandler?() == true, let selectedWorldID else { return false }
+        return residentPropPreparedHandler?(assetID, modelURL, selectedWorldID) ?? false
+    }
+
+    func validateResidentPropAttachment(
+        avatarID: String,
+        assetID: String,
+        modelURL: URL,
+        point: PropAttachmentPoint
+    ) throws {
+        guard isWorldVisible,
+              residentPropActiveHandler?() == true,
+              let selectedWorldID,
+              residentPropPreparedHandler?(assetID, modelURL, selectedWorldID) == true
+        else {
+            throw PropAttachmentError.assetNotPrepared
+        }
+        guard avatarID == ResidentPropAttachmentEligibility.supportedAvatarID,
+              let residentPropAttachmentValidationHandler
+        else {
+            throw PropAttachmentError.unsupportedAvatar
+        }
+        try residentPropAttachmentValidationHandler(avatarID, point)
+    }
+
+    /// Normalized viewport point uses top-left origin, independent of backing pixels.
+    func residentPropPoint(normalizedPoint: SIMD2<Float>, surfaceY: Float) -> SIMD3<Float>? {
+        guard isWorldVisible, residentPropActiveHandler?() == true, let residentPropViewProjection else { return nil }
+        return ResidentPropProjection.point(normalized: normalizedPoint, surfaceY: surfaceY, inverseViewProjection: simd_inverse(residentPropViewProjection))
+    }
+
+    func residentPropScreenPoint(world: SIMD3<Float>) -> SIMD2<Float>? {
+        guard isWorldVisible, residentPropActiveHandler?() == true, let residentPropViewProjection else { return nil }
+        let clip = residentPropViewProjection * SIMD4(world, 1)
+        guard clip.w > 0.000001 else { return nil }
+        return SIMD2((clip.x/clip.w+1)/2, (1-clip.y/clip.w)/2)
+    }
     private(set) var selectedScene: SpatialScenePreset = .djHouse
     var camera = SpatialCameraState()
+    /// Avatar-follow rotation state (see AvatarFollowYawDigester). Living-world
+    /// snapshots arrive near 30 Hz and enqueue whole-step yaw deltas here; each
+    /// rendered frame then advances the shared camera through them, so the
+    /// world never turns in 30 Hz jumps. The store is the only writer of the
+    /// camera, which lets user drags/resets cancel the queue at the exact
+    /// moment of the interaction.
+    private(set) var isAvatarFollowActive = false
+    private var avatarFollowYawDigester = AvatarFollowYawDigester()
+    private var lastCameraYawInteractionAt = ContinuousClock.now.advanced(
+        by: .seconds(-(AvatarFollowUserPolicy.suppressionInterval + 1))
+    )
     private(set) var isWorldPresentationRequested = false
     private(set) var isWorldVisible = false
     var isSpeedBoosted = false
@@ -631,6 +741,14 @@ final class SpatialStageStore {
         let changedWorld = selectedWorldID != id
         selectedWorldID = id
         if changedWorld {
+            residentPropRenderOwnership.invalidate()
+            clearResidentPropRendererHooks()
+            residentPropPreview = nil
+            residentHeldProp = nil
+            residentPropDisplayStand = nil
+            residentPropOutputs = []
+            residentPropRenderStatuses = [:]
+            residentPropViewProjection = nil
             onWorldSelectionChanged?()
             clearSceneOccluderTriangles()
         }
@@ -641,6 +759,7 @@ final class SpatialStageStore {
             )
         }
         camera.reset(to: cameraHome)
+        cancelAvatarFollowRotation()
     }
 
     func selectScene(_ scene: SpatialScenePreset) {
@@ -653,12 +772,14 @@ final class SpatialStageStore {
             selectedScene = scene
         }
         camera.reset(to: cameraHome)
+        cancelAvatarFollowRotation()
     }
 
     func installCameraHome(_ home: SpatialCameraState) {
         cameraHome = home
         calibratedWorldID = selectedWorldID
         camera.reset(to: home)
+        cancelAvatarFollowRotation()
     }
 
     func installSceneFraming(_ framing: MarbleSceneFraming) {
@@ -876,6 +997,11 @@ final class SpatialStageStore {
 
     private func updateWorldVisibility(_ visible: Bool) {
         isWorldVisible = visible
+        if !visible {
+            residentPropRenderOwnership.invalidate()
+            clearResidentPropRendererHooks()
+            residentPropPreview = nil
+        }
         for observer in worldVisibilityObservers.values {
             // A prior observer may synchronously finish or exit the world.
             // Its nested notification has already delivered the newer state.
@@ -902,6 +1028,7 @@ final class SpatialStageStore {
 
     func look(deltaX: Float, deltaY: Float) {
         camera.look(deltaX: deltaX, deltaY: deltaY)
+        noteCameraYawInteraction()
     }
 
     func move(_ direction: SpatialMovement, distance: Float) {
@@ -914,6 +1041,78 @@ final class SpatialStageStore {
 
     func resetCamera() {
         camera.reset(to: cameraHome)
+        noteCameraYawInteraction()
+    }
+
+    // MARK: - Avatar follow rotation (queued at ~30 Hz, digested per frame)
+
+    var pendingAvatarFollowYaw: Float {
+        avatarFollowYawDigester.pending
+    }
+
+    /// Seconds since the user last drove the camera directly (orbit drag or
+    /// reset). The camera coordinator uses this to suppress follow rotation
+    /// while the user is still interacting.
+    var timeSinceLastCameraYawInteraction: TimeInterval {
+        Self.durationSeconds(ContinuousClock.now - lastCameraYawInteractionAt)
+    }
+
+    /// Enables or disables queued avatar-follow rotation. The full-stage camera
+    /// coordinator turns this on when it takes ownership and off when Live Cam
+    /// (or another owner) takes over, so follow rotation can never leak into a
+    /// view the follow does not own.
+    func setAvatarFollowActive(_ active: Bool) {
+        isAvatarFollowActive = active
+        avatarFollowYawDigester.cancel()
+        if active {
+            // A fresh full-stage session starts with follow ready to run: a
+            // look that happened while another owner held the camera must not
+            // suppress the new session's follow.
+            lastCameraYawInteractionAt = ContinuousClock.now.advanced(
+                by: .seconds(-(AvatarFollowUserPolicy.suppressionInterval + 1))
+            )
+        }
+    }
+
+    /// Queues one snapshot-cadence follow yaw delta (from the camera
+    /// coordinator). Ignored unless the full stage is following.
+    func enqueueAvatarFollowYaw(_ delta: Float) {
+        guard isAvatarFollowActive else { return }
+        avatarFollowYawDigester.enqueue(delta)
+    }
+
+    /// Digests queued follow yaw at render cadence. The renderer calls this on
+    /// every drawn frame, before any view matrix reads the camera, and applies
+    /// the returned rotation to the shared camera so every pass of the frame
+    /// (world, occluder, avatar, props) stays on one consistent view.
+    @discardableResult
+    func advanceAvatarFollowRotation(deltaTime: Float) -> Float {
+        guard isAvatarFollowActive else { return 0 }
+        let applied = avatarFollowYawDigester.advance(deltaTime: deltaTime)
+        if applied != 0 {
+            camera.yaw += applied
+        }
+        return applied
+    }
+
+    /// Records a direct user camera interaction (orbit drag or reset) and
+    /// cancels any queued follow rotation so it cannot fight the user or apply
+    /// late after the interaction. `at` exists for deterministic tests.
+    func noteCameraYawInteraction(at time: ContinuousClock.Instant = ContinuousClock.now) {
+        lastCameraYawInteractionAt = time
+        avatarFollowYawDigester.cancel()
+    }
+
+    /// Drops queued follow rotation without suppressing future follow. Used
+    /// when the whole camera is replaced (world/scene/home switches) so a
+    /// backlog computed against the previous view cannot rotate the new one.
+    func cancelAvatarFollowRotation() {
+        avatarFollowYawDigester.cancel()
+    }
+
+    private static func durationSeconds(_ duration: Duration) -> TimeInterval {
+        Double(duration.components.seconds)
+            + Double(duration.components.attoseconds) / 1_000_000_000_000_000_000
     }
 
     func applyCameraCommand(
@@ -949,5 +1148,40 @@ final class SpatialStageStore {
             environment.weather = weather
         }
         environment.revision &+= 1
+    }
+}
+
+/// Pure launch-recovery decision for claimed resident props, kept free of
+/// Metal/AppKit so tools/test-resident-prop-startup.swift can compile and
+/// exercise it. The world renderer installs its handlers on the first eligible
+/// draw, which races app startup; recovery defers that window silently and
+/// lets the existing refreshWishMachine cycle retry once handlers exist.
+enum ResidentPropStartupRecovery {
+    enum Action: Equatable {
+        case prepare
+        case deferUntilRendererReady
+        case ignoreRendererLoss
+        case report(String)
+    }
+
+    static func canPrepare(
+        isWorldVisible: Bool,
+        hasActiveRenderer: Bool,
+        selectedWorldID: String?,
+        descriptorWorldID: String,
+        hasPrepareHandler: Bool
+    ) -> Bool {
+        isWorldVisible && hasActiveRenderer && selectedWorldID == descriptorWorldID && hasPrepareHandler
+    }
+
+    static func action(rendererReady: Bool, error: Error?) -> Action {
+        guard let error else {
+            return rendererReady ? .prepare : .deferUntilRendererReady
+        }
+        if error is CancellationError { return .ignoreRendererLoss }
+        if let renderError = error as? WishMachineOutputError, case .renderUnavailable = renderError, !rendererReady {
+            return .ignoreRendererLoss
+        }
+        return .report(error.localizedDescription)
     }
 }

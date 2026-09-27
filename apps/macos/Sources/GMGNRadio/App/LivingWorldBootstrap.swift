@@ -92,6 +92,25 @@ struct BundledMarbleLivingCabin {
     let colliderURL: URL
 }
 
+/// The adopted cabin's tray-only 1.2 upgrade preserves the 1.1 history.
+/// Reads may fall back once; every checkpoint writes the versioned 1.2 file.
+/// An existing broken 1.2 file must surface its error, never resurrect 1.1.
+struct LivingCabinVersion12Persistence: WorldStatePersisting {
+    let current: AtomicJSONWorldStatePersistence
+    let previous: AtomicJSONWorldStatePersistence
+
+    func load() throws -> WorldState? {
+        if FileManager.default.fileExists(atPath: current.fileURL.path) {
+            return try current.load()
+        }
+        return try previous.load()
+    }
+
+    func save(_ state: WorldState) throws {
+        try current.save(state)
+    }
+}
+
 enum LivingWorldBootstrapError: LocalizedError {
     case bundledCanaryMissing
     case invalidPackage([WorldPackageError])
@@ -114,13 +133,16 @@ enum LivingWorldBootstrapError: LocalizedError {
 
 enum LivingWorldBootstrap {
     static let fallbackWalkingSpeed: Float = 1.2
-    static let ardyWalkCompatibility = StageMotionLocomotion(
-        strideSpeed: 0.45,
-        playbackRate: 4,
-        inPlace: true
-    )
+    /// PMX/VMD locomotion compatibility. The stride contract is *measured* on
+    /// the shipped target rig (na_2b_0414 standard PMX, world-normalised to
+    /// 1.7 m): stance-drift regression of the installed
+    /// `gmgn.motion.bones.walk-loop-pmx` VMD evaluated with the runtime
+    /// MMDSceneKit deformation model gives 0.72–0.78 m/s at rate 1
+    /// (cadence ≈ 86 steps/min), not a hand-picked constant. See
+    /// `tools/test-walking-adaptation.swift` and the measurement evidence in
+    /// `tools/motion/measure_walk_loop_pmx.py`.
     static let bonesWalkCompatibility = StageMotionLocomotion(
-        strideSpeed: 0.45,
+        strideSpeed: 0.75,
         playbackRate: 1,
         inPlace: true
     )
@@ -139,9 +161,8 @@ enum LivingWorldBootstrap {
         "gmgn.motion.bones.walk-loop-pmx",
         "gmgn.motion.bones.walk-loop-vrm",
         "gmgn.motion.bones.coffee-button-pmx",
-        "gmgn.motion.ardy-walk-loop-pmx",
-        "gmgn.motion.ardy-walk-loop-vrm",
-        "gmgn.motion.generated.a-person-naturally-picks-up-a-coffee-cup-76b63e0f",
+        "gmgn.motion.bones.arpg.interact-button-mid-vrm",
+        "gmgn.motion.bones.arpg.interact-button-mid-pmx",
     ]
 
     static func loadBundledCanary(
@@ -328,6 +349,32 @@ enum LivingWorldBootstrap {
             .appendingPathComponent("state.json")
     }
 
+    static func statePersistence(
+        manifest: WorldManifest,
+        fileManager: FileManager = .default,
+        applicationSupportBase: URL? = nil
+    ) throws -> any WorldStatePersisting {
+        let current = AtomicJSONWorldStatePersistence(fileURL: try stateFileURL(
+            packageID: manifest.packageID,
+            packageVersion: manifest.packageVersion,
+            fileManager: fileManager,
+            applicationSupportBase: applicationSupportBase
+        ))
+        guard manifest.packageID == "marble-living-cabin",
+              manifest.worldID == "84503420-3010-4944-8fde-2f383cd08ebe",
+              manifest.packageVersion == "1.2.0"
+        else { return current }
+        return LivingCabinVersion12Persistence(
+            current: current,
+            previous: AtomicJSONWorldStatePersistence(fileURL: try stateFileURL(
+                packageID: manifest.packageID,
+                packageVersion: "1.1.0",
+                fileManager: fileManager,
+                applicationSupportBase: applicationSupportBase
+            ))
+        )
+    }
+
     /// Builds the only motion allow-list available to living activities.
     /// Resource IDs are the motion IDs referenced by phase contracts.
     static func approvedMotions(
@@ -335,8 +382,16 @@ enum LivingWorldBootstrap {
         packageRoot: URL,
         supplementalMotions: [String: StageMotionAsset] = [:]
     ) throws -> [String: StageMotionAsset] {
-        var result = supplementalMotions
+        func permitsSource(_ id: String) -> Bool {
+            id.hasPrefix("gmgn.motion.bones.")
+                || id == "gmgn.motion.ardy-backflip"
+                || id == MotionPackageStore.iluvSlapBassID
+        }
+        // Keep the explicit music alias, but do not let an old world package
+        // or supplemental entry restore a retired non-BONES resident motion.
+        var result = supplementalMotions.filter { permitsSource($0.value.id) }
         for resource in resources {
+            guard permitsSource(resource.id) else { continue }
             let format: StageMotionFormat
             let expectedExtension: String
             switch resource.kind {
@@ -376,6 +431,9 @@ enum LivingWorldBootstrap {
     ) -> [String: StageMotionAsset] {
         Dictionary(
             uniqueKeysWithValues: motions.compactMap { motion in
+                if let performance = ResidentPerformanceMotionPolicy.approvedMotion(motion) {
+                    return (performance.id, performance)
+                }
                 guard installedLivingMotionIDs.contains(motion.id) else {
                     return nil
                 }
@@ -383,10 +441,6 @@ enum LivingWorldBootstrap {
                 if motion.id.hasPrefix("gmgn.motion.bones.walk-loop-") {
                     normalized = motion.applyingLocomotionFallback(
                         bonesWalkCompatibility
-                    )
-                } else if motion.id.hasPrefix("gmgn.motion.ardy-walk-loop-") {
-                    normalized = motion.applyingLocomotionFallback(
-                        ardyWalkCompatibility
                     )
                 } else {
                     normalized = motion
@@ -397,18 +451,18 @@ enum LivingWorldBootstrap {
     }
 
     static func walkingSpeed(
-        approvedMotions: [String: StageMotionAsset]
+        approvedMotions: [String: StageMotionAsset],
+        avatarFormat: StageAvatarFormat? = nil
     ) -> Float {
-        let requestedWalkIDs = [
-            "gmgn.motion.bones.walk-loop-pmx",
-            "gmgn.motion.bones.walk-loop-vrm",
-            "gmgn.motion.ardy-walk-loop-pmx",
-            "gmgn.motion.ardy-walk-loop-vrm",
-            "walk.forward",
-        ]
-        return requestedWalkIDs.lazy
-            .compactMap { approvedMotions[$0]?.strideSpeed }
-            .first ?? fallbackWalkingSpeed
+        guard let avatarFormat else { return fallbackWalkingSpeed }
+        let id = "gmgn.motion.bones.walk-loop-\(avatarFormat.rawValue)"
+        let format: StageMotionFormat = avatarFormat == .pmx ? .vmd : .vrma
+        guard let motion = approvedMotions[id],
+              motion.format == format, motion.url != nil,
+              motion.loop, motion.inPlace == true,
+              let strideSpeed = motion.strideSpeed
+        else { return fallbackWalkingSpeed }
+        return strideSpeed * motion.playbackRate
     }
 
     static func collisionCapsule(worldID: String) -> WorldCapsule {
@@ -427,13 +481,10 @@ enum LivingWorldBootstrap {
         fileManager: FileManager = .default,
         applicationSupportBase: URL? = nil
     ) throws -> WorldAgentContext {
-        let persistence = AtomicJSONWorldStatePersistence(
-            fileURL: try stateFileURL(
-                packageID: package.manifest.packageID,
-                packageVersion: package.manifest.packageVersion,
-                fileManager: fileManager,
-                applicationSupportBase: applicationSupportBase
-            )
+        let persistence = try statePersistence(
+            manifest: package.manifest,
+            fileManager: fileManager,
+            applicationSupportBase: applicationSupportBase
         )
         return try WorldAgentContext(
             manifest: package.manifest,

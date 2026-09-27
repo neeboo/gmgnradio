@@ -124,22 +124,66 @@ final class PresenceSettingsModel {
         packages.first(where: \.isActive)?.manifest.engine
     }
 
+    /// Shared-runtime identity lets an open settings window refresh after a
+    /// character switch made by another surface, including clearing it.
+    var activeAvatarID: String? {
+        avatarRuntime.snapshot.avatar?.id
+    }
+
     static func motionCompatibility(
         avatarEngine: PresenceEngine?,
         motionFormat: StageMotionFormat
     ) -> MotionCompatibility {
+        // Playback compatibility remains broader than native-format browsing.
+        // Filtering a list must not invalidate an existing VMD-on-VRM choice.
         switch avatarEngine {
-        case .vrm:
-            return .compatible
+        case .vrm: return .compatible
         case .pmx:
             return motionFormat == .vrma
-                ? .incompatible("VRMA 只能用于 VRM 角色。")
-                : .compatible
-        case .live2D:
-            return .incompatible("Live2D 角色暂不支持骨骼动作。")
-        case .orb, nil:
-            return .incompatible("请先选择 VRM 或 PMX 角色。")
+                ? .incompatible("VRMA 只能用于 VRM 角色。") : .compatible
+        case .live2D: return .incompatible("Live2D 角色暂不支持骨骼动作。")
+        case .orb, nil: return .incompatible("请先选择 VRM 或 PMX 角色。")
         }
+    }
+
+    /// Native-format browsing projection. The broader playback compatibility
+    /// above deliberately does not determine which duplicate formats to show.
+    var availableMotions: [StageMotionAsset] {
+        motions.filter { motion in
+            MotionFormatFilter.isNativeFormat(
+                engine: MotionFormatFilter.Engine(activeAvatarEngine),
+                format: MotionFormatFilter.Format(motion.format))
+        }
+    }
+
+    /// Remote catalog entries natively belonging to the active avatar. The
+    /// catalog's format string (not its name) drives the filter; unknown
+    /// formats are hidden from both characters' lists.
+    var availablePublishedMotions: [PublishedMotion] {
+        publishedMotions.filter { published in
+            guard let format = MotionFormatFilter.native(catalogFormat: published.format) else {
+                return false
+            }
+            return MotionFormatFilter.isNativeFormat(
+                engine: MotionFormatFilter.Engine(activeAvatarEngine), format: format)
+        }
+    }
+
+    /// Format filter first, then the browsing category (`nil` = 全部).
+    /// Unclassified and non-BONES motions are only offered under 全部.
+    func motions(in category: MotionLibraryCategory?) -> [StageMotionAsset] {
+        MotionFormatFilter.libraryList(
+            motions,
+            engine: MotionFormatFilter.Engine(activeAvatarEngine),
+            category: category)
+    }
+
+    /// Explains an empty list while motions are installed (wrong character or
+    /// no character). `nil` means the filtered list itself is the truth.
+    var motionListNotice: String? {
+        MotionFormatFilter.unavailableNotice(
+            engine: MotionFormatFilter.Engine(activeAvatarEngine),
+            installedCount: motions.count)
     }
 
     func motionCompatibility(_ motion: StageMotionAsset) -> MotionCompatibility {
@@ -252,7 +296,9 @@ final class PresenceSettingsModel {
                 show(message: "已安装并启用 \(installed.name)。")
             } else {
                 activeMotionID = try store.activeMotion().id
-                show(message: "动作已安装；切换到 VRM 角色后即可使用。")
+                show(message: published.format == "vmd"
+                    ? "动作已安装；切换到 PMX 角色后即可使用。"
+                    : "动作已安装；切换到 VRM 角色后即可使用。")
             }
         } catch {
             show(error: error)
@@ -549,6 +595,33 @@ final class PresenceSettingsModel {
             ?? "无法打开角色或动作目录。"
         hasError = true
     }
+}
+
+extension MotionFormatFilter.Engine {
+    init(_ engine: PresenceEngine?) {
+        switch engine {
+        case .vrm: self = .vrm
+        case .pmx: self = .pmx
+        case .live2D: self = .live2D
+        case .orb: self = .orb
+        case nil: self = .unspecified
+        }
+    }
+}
+
+extension MotionFormatFilter.Format {
+    init(_ format: StageMotionFormat) {
+        switch format {
+        case .procedural: self = .procedural
+        case .vrma: self = .vrma
+        case .vmd: self = .vmd
+        }
+    }
+}
+
+extension StageMotionAsset: MotionLibraryFiltering {
+    var libraryMotionID: String { id }
+    var boneFormat: MotionFormatFilter.Format { MotionFormatFilter.Format(format) }
 }
 
 private enum PresenceDownloadError: Error, LocalizedError {

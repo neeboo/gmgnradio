@@ -288,6 +288,7 @@ private final class DesktopVRMAvatarRenderer: NSObject, MTKViewDelegate {
     private var renderer: VRMRenderer?
     private var model: VRMModel?
     private var animationPlayer: AnimationPlayer?
+    private var playbackIdentity: StageMotionPlaybackIdentity?
     private var restRotations: [VRMHumanoidBone: simd_quatf] = [:]
     private var framingCenter = SIMD3<Float>(0, 0.9, 0)
     private var framingHeight: Float = 1.8
@@ -312,6 +313,7 @@ private final class DesktopVRMAvatarRenderer: NSObject, MTKViewDelegate {
         avatar: StageAvatarAsset,
         motion: StageMotionAsset?
     ) async throws {
+        let identity = motion.map { runtime.playbackIdentity(for: $0) }
         guard avatar.format == .vrm else {
             throw DesktopVRMAvatarLoadError.unsupportedFormat(avatar.format)
         }
@@ -357,10 +359,18 @@ private final class DesktopVRMAvatarRenderer: NSObject, MTKViewDelegate {
         renderer.lookAtController?.enabled = true
         renderer.lookAtController?.target = .camera
 
-        let animationPlayer = try StageAvatarAnimationLoader.makeLoopingPlayer(
-            for: motion,
-            model: model
-        )
+        let animationPlayer: AnimationPlayer?
+        do {
+            animationPlayer = try StageAvatarAnimationLoader.makeLoopingPlayer(
+                for: motion,
+                model: model
+            )
+        } catch {
+            if let identity {
+                runtime.reportMotionPlayback(identity: identity, outcome: .failed(error.localizedDescription))
+            }
+            throw error
+        }
         animationPlayer?.lookAtController = renderer.lookAtController
 
         let bounds = model.modelLocalBounds
@@ -383,6 +393,7 @@ private final class DesktopVRMAvatarRenderer: NSObject, MTKViewDelegate {
         self.model = model
         self.renderer = renderer
         self.animationPlayer = animationPlayer
+        playbackIdentity = identity
         restRotations = rotations
     }
 
@@ -410,13 +421,18 @@ private final class DesktopVRMAvatarRenderer: NSObject, MTKViewDelegate {
             time: Date.timeIntervalSinceReferenceDate,
             residentSpeechLevel: runtime.residentSpeechLevel
         )
-        animationPlayer?.speed = StageAvatarAnimationPlayback.speed(
-            for: runtime.activity
-        )
         animationPlayer?.update(
             deltaTime: min(max(delta, 1 / 240), 1 / 20),
             model: model
         )
+        if let player = animationPlayer, player.isFinished,
+           let identity = playbackIdentity, !identity.motion.loop {
+            animationPlayer = nil
+            for node in model.nodes { node.resetToBindPose() }
+            model.updateNodeTransforms()
+            renderer.resetPhysics()
+            runtime.reportMotionPlayback(identity: identity, outcome: .completed)
+        }
         apply(
             motion: motion,
             to: model,
@@ -430,7 +446,8 @@ private final class DesktopVRMAvatarRenderer: NSObject, MTKViewDelegate {
         let distanceForHeight = framingHeight
             / (2 * tan(fieldOfView * 0.5))
         let distance = max(distanceForHeight * max(0.72 / aspect, 1), 1.2)
-        let liftedCenter = framingCenter + SIMD3<Float>(0, motion.bodyLift, 0)
+        let bodyLift = animationPlayer == nil ? motion.bodyLift : 0
+        let liftedCenter = framingCenter + SIMD3<Float>(0, bodyLift, 0)
         renderer.viewMatrix = lookAt(
             eye: liftedCenter + SIMD3<Float>(0, 0.02, distance),
             center: liftedCenter,

@@ -59,6 +59,12 @@ targets:
       - package: MetalSplatter
         product: SplatIO
       - package: VRMMetalKit
+      - package: VRMMetalKit
+        product: GLTFMetalKit
+    postBuildScripts:
+      - name: Bundle Rust task daemon
+        script: '"${SRCROOT}/../../tools/build-taskd-helper.sh"'
+        basedOnDependencyAnalysis: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.gmgn.radio

@@ -567,6 +567,18 @@ enum MarbleOccluderMesh {
 }
 
 @MainActor
+enum ResidentPropSurfaceEligibility {
+    static func isActive(_ view: MTKView) -> Bool {
+        // The controller deliberately pauses MTKView's private display link
+        // and runs its own manual loop. Its explicit activity is authoritative.
+        guard let surface = view as? MarbleSpatialView else { return false }
+        return surface.residentPropRenderingActive && view.window?.isVisible == true
+            && view.window?.isMiniaturized == false
+            && !view.isHiddenOrHasHiddenAncestor
+    }
+}
+
+@MainActor
 final class MarbleSpatialView: MTKView {
     private static let log = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "ai.gmgn.radio",
@@ -592,6 +604,36 @@ final class MarbleSpatialView: MTKView {
     private var liveCamOrbit = LiveCamCharacterOrbit()
     private var pendingWorldURL: URL?
     private var didRequestWorldPreparation = false
+
+    private(set) var residentPropRenderingActive = false
+
+    /// 居民视觉帧回读源(仅渲染器自身 drawable,不截桌面);供应用接线交给
+    /// ResidentVisionCaptureService / ResidentVisionToolbox。
+    private var residentVisionSurface: (any ResidentVisionSurface)?
+
+    /// 非空时表示本视图(arm64 渲染器)可为居民观察提供真实画面帧。
+    var residentVisionSurfaceHandle: (any ResidentVisionSurface)? {
+        residentVisionSurface
+    }
+
+    func setResidentPropRenderingActive(_ active: Bool) {
+        residentPropRenderingActive = active
+        if !active {
+#if arch(arm64)
+            spatialRenderer?.suspendResidentPropRendering()
+#endif
+        }
+    }
+
+    override var isHidden: Bool {
+        didSet {
+            if isHidden {
+#if arch(arm64)
+                spatialRenderer?.suspendResidentPropRendering()
+#endif
+            }
+        }
+    }
 
     init(
         frame: CGRect,
@@ -635,6 +677,10 @@ final class MarbleSpatialView: MTKView {
             spatialRenderer = renderer
             restoreAvatarObservationAfterReparent()
             delegate = renderer
+            let visionSurface = MarbleResidentVisionSurface()
+            residentVisionSurface = visionSurface
+            spatialRenderer?.residentVisionSurface = visionSurface
+            visionSurface.attach(hostView: self)
             library.onLocalSplatChange = { [weak self] url in
                 self?.receiveWorldURL(url)
             }
@@ -658,6 +704,7 @@ final class MarbleSpatialView: MTKView {
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         if newWindow == nil {
+            setResidentPropRenderingActive(false)
             avatarRuntime.removeObserver(avatarObserverID)
             avatarObserverID = nil
         }
@@ -1024,6 +1071,284 @@ private struct MarbleOccluderUniforms {
     var depthConvention: SIMD4<Float>
 }
 
+// BEGIN RESIDENT VISION FRAME SOURCE
+/// Resident vision frame source that reads back this renderer's own full-stage
+/// drawable only — never the desktop, never a screen recording. Captures are
+/// strictly request-driven (one in flight at a time) and only the frame that is
+/// newly rendered *after* the request is returned.
+///
+/// Request identity: every request gets a fresh `captureID` generation through
+/// the hostless `ResidentVisionSingleFlight` gate. Completion (GPU readback),
+/// cancellation and immediate frame-offer resolutions all carry that generation
+/// and only take effect while it is still the current request — so when request
+/// A is cancelled and request B starts, A's late GPU callback or A's late cancel
+/// task can never resolve or cancel B.
+@MainActor
+final class MarbleResidentVisionSurface: ResidentVisionSurface {
+    private struct Pending {
+        let captureID: UUID
+        let request: ResidentVisionCaptureRequest
+        let requestedAt: Date
+        /// framebufferOnly 在本次请求开始前的原值。任何出口都只恢复该原值,
+        /// 绝不无条件置 true(DEBUG 帧导出等可能合法地要求保持 false)。
+        let originalFramebufferOnly: Bool
+        let continuation: CheckedContinuation<
+            ResidentVisionSurfaceFrameResult, Never
+        >
+    }
+
+    private weak var hostView: MTKView?
+    private var pending: Pending?
+    private var readbackInFlight = false
+    /// 单飞 + 代次匹配(纯逻辑,离线测试直接覆盖同一份生产代码)。
+    private let flight = ResidentVisionSingleFlight()
+
+    func attach(hostView: MTKView) {
+        self.hostView = hostView
+    }
+
+    func captureCurrentObservation(
+        request: ResidentVisionCaptureRequest,
+        requestedAt: Date
+    ) async -> ResidentVisionSurfaceFrameResult {
+        // 每次调用一个 captureID 身份;完成/取消都带它,过期回调不能碰新请求。
+        let captureID = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard let hostView else {
+                    // 无画面视图:立即失败 —— 不登记请求、不改 framebufferOnly、
+                    // 也不空等到超时。
+                    continuation.resume(
+                        returning: .failure(
+                            code: .captureUnavailable,
+                            message: "没有可用的舞台画面视图(全舞台渲染器未接入)"
+                        )
+                    )
+                    return
+                }
+                guard self.flight.begin(captureID: captureID) else {
+                    continuation.resume(
+                        returning: .failure(
+                            code: .captureUnavailable,
+                            message: "上一次画面请求尚未完成,请稍后重试"
+                        )
+                    )
+                    return
+                }
+                self.pending = Pending(
+                    captureID: captureID,
+                    request: request,
+                    requestedAt: requestedAt,
+                    originalFramebufferOnly: hostView.framebufferOnly,
+                    continuation: continuation
+                )
+                // Drawable readback needs a non-framebufferOnly drawable. Flip
+                // the layer flag only while this request is active; the recorded
+                // original value is restored on every exit path (frame, failure,
+                // cancel, timeout, no picture).
+                hostView.framebufferOnly = false
+                // Produce a fresh frame promptly even if the explicit render
+                // loop is between beats.
+                hostView.draw()
+            }
+        } onCancel: { [weak self, captureID] in
+            Task { @MainActor [weak self] in
+                self?.finishIfCurrent(
+                    captureID,
+                    .failure(
+                        code: .cancelled,
+                        message: "画面请求已取消"
+                    )
+                )
+            }
+        }
+    }
+
+    /// Called by the renderer at the end of every rendered frame, after every
+    /// pass (world, props, avatar) has drawn into the shared drawable.
+    func offerRenderedFrame(
+        view: MTKView,
+        drawable: CAMetalDrawable,
+        commandBuffer: MTLCommandBuffer,
+        profile: LiveCamRenderProfile,
+        worldID: String?,
+        worldVisible: Bool,
+        camera: SpatialCameraState,
+        avatarAssetID: String?,
+        avatarFrameRevision: UInt64,
+        avatarPosition: SIMD3<Float>,
+        frameIndex: UInt64
+    ) {
+        guard let pending, !readbackInFlight else { return }
+        let captureID = pending.captureID
+        guard profile == .fullStage, worldVisible,
+              let worldID, !worldID.isEmpty
+        else {
+            finishIfCurrent(
+                captureID,
+                .failure(
+                    code: .noPicture,
+                    message:
+                        "当前没有可见的全舞台画面(full-stage 未激活或空间不可见)"
+                )
+            )
+            return
+        }
+        guard worldID == pending.request.worldID else {
+            finishIfCurrent(
+                captureID,
+                .failure(
+                    code: .staleWorld,
+                    message: "等待画面期间空间已切换,画面不属于请求的空间"
+                )
+            )
+            return
+        }
+        encodeReadback(
+            view: view,
+            drawable: drawable,
+            commandBuffer: commandBuffer,
+            captureID: captureID,
+            worldID: worldID,
+            camera: camera,
+            avatarAssetID: avatarAssetID,
+            avatarFrameRevision: avatarFrameRevision,
+            avatarPosition: avatarPosition,
+            frameIndex: frameIndex
+        )
+    }
+
+    private func encodeReadback(
+        view: MTKView,
+        drawable: CAMetalDrawable,
+        commandBuffer: MTLCommandBuffer,
+        captureID: UUID,
+        worldID: String,
+        camera: SpatialCameraState,
+        avatarAssetID: String?,
+        avatarFrameRevision: UInt64,
+        avatarPosition: SIMD3<Float>,
+        frameIndex: UInt64
+    ) {
+        guard let pending, pending.captureID == captureID else { return }
+        let originalFramebufferOnly = pending.originalFramebufferOnly
+        let texture = drawable.texture
+        let width = texture.width
+        let height = texture.height
+        let bytesPerRow = (width * 4 + 255) & ~255
+        guard texture.pixelFormat == .bgra8Unorm_srgb,
+              let buffer = texture.device.makeBuffer(
+                  length: bytesPerRow * height,
+                  options: .storageModeShared
+              ),
+              let blit = commandBuffer.makeBlitCommandEncoder()
+        else {
+            finishIfCurrent(
+                captureID,
+                .failure(
+                    code: .encodingFailed,
+                    message: "无法为画面分配 GPU 回读缓冲"
+                )
+            )
+            return
+        }
+        readbackInFlight = true
+        blit.label = "gmgn resident vision single frame readback"
+        blit.copy(
+            from: texture,
+            sourceSlice: 0,
+            sourceLevel: 0,
+            sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+            sourceSize: MTLSize(width: width, height: height, depth: 1),
+            to: buffer,
+            destinationOffset: 0,
+            destinationBytesPerRow: bytesPerRow,
+            destinationBytesPerImage: bytesPerRow * height
+        )
+        blit.endEncoding()
+
+        let stamp = ResidentVisionRenderedStamp(
+            surfaceProfile: "full_stage_drawable",
+            frameIndex: frameIndex,
+            capturedAt: Date(),
+            worldID: worldID,
+            residentAvatarID: avatarAssetID,
+            residentAvatarFrameRevision: avatarFrameRevision,
+            residentPosition: [
+                avatarPosition.x, avatarPosition.y, avatarPosition.z,
+            ],
+            camera: ResidentVisionCameraStamp(
+                label: "全舞台固定观察相机(full-stage observer)",
+                kind: .fullStageObserver,
+                position: [
+                    camera.position.x, camera.position.y, camera.position.z,
+                ],
+                yaw: camera.yaw,
+                pitch: camera.pitch,
+                fieldOfViewDegrees: 66,
+                coordinateSpace: "stage_renderer_current_world"
+            )
+        )
+        commandBuffer.addCompletedHandler { [weak self, captureID] completed in
+            guard completed.status == .completed else {
+                let message = "画面 GPU 回读失败:"
+                    + (completed.error?.localizedDescription ?? "unknown")
+                Task { @MainActor [weak self] in
+                    self?.finishIfCurrent(
+                        captureID,
+                        .failure(
+                            code: .encodingFailed,
+                            message: message
+                        )
+                    )
+                }
+                return
+            }
+            let pixels = Data(
+                bytes: buffer.contents(),
+                count: bytesPerRow * height
+            )
+            Task { @MainActor [weak self] in
+                self?.finishIfCurrent(
+                    captureID,
+                    .frame(
+                        ResidentVisionRenderedFrame(
+                            pixelsBGRA: pixels,
+                            width: width,
+                            height: height,
+                            bytesPerRow: bytesPerRow,
+                            stamp: stamp
+                        )
+                    )
+                )
+            }
+        }
+        // The blit is already encoded, so the current drawable no longer needs
+        // to stay readable while the readback finishes: restore the
+        // framebufferOnly value recorded when this request started (never
+        // unconditionally true — a DEBUG frame export or another reader may
+        // legitimately require it to stay false).
+        view.framebufferOnly = originalFramebufferOnly
+    }
+
+    /// 只有 captureID 仍是当前请求时才结束它并恢复 framebufferOnly 原值。
+    /// 过期回调(旧请求的 GPU 完成、旧取消任务)在这里被丢弃,无法解析或
+    /// 取消之后才开始的新请求。
+    private func finishIfCurrent(
+        _ captureID: UUID,
+        _ result: ResidentVisionSurfaceFrameResult
+    ) {
+        guard let pending, pending.captureID == captureID else { return }
+        guard flight.finish(captureID) else { return }
+        self.pending = nil
+        readbackInFlight = false
+        let originalFramebufferOnly = pending.originalFramebufferOnly
+        hostView?.framebufferOnly = originalFramebufferOnly
+        pending.continuation.resume(returning: result)
+    }
+}
+// END RESIDENT VISION FRAME SOURCE
+
 /// Renders supplied room or prop geometry into the shared Metal drawable.
 /// The local legacy room clears the background; a standalone Marble prop
 /// preserves the SPZ colour already rendered. Neither owns the avatar.
@@ -1220,18 +1545,38 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
     private var avatarRenderer: VRMRenderer?
     private var avatarModel: VRMModel?
     private var avatarAnimationPlayer: AnimationPlayer?
+    private var appliedVRMLocomotionGait: StageLocomotionGait?
     private var avatarRestRotations: [VRMHumanoidBone: simd_quatf] = [:]
     private var pmxAvatarRenderer: PMXStageAvatarRenderer?
     private var appliedVRMResolvedMotion: StageAvatarResolvedMotion?
     private var appliedPMXResolvedMotion: StageAvatarResolvedMotion?
+    private var appliedVRMPlaybackIdentity: StageMotionPlaybackIdentity?
+    private var appliedPMXPlaybackIdentity: StageMotionPlaybackIdentity?
+    /// Terminal failed playback identities, retained so a failed motion stays
+    /// failed across temporary thinking/world-motion changes. Entries are
+    /// pruned whenever the snapshot revision advances and the arrays are
+    /// capped, so retention cannot grow indefinitely.
+    private var failedVRMPlaybackIdentities: [StageMotionPlaybackIdentity] = []
+    private var failedPMXPlaybackIdentities: [StageMotionPlaybackIdentity] = []
     private var lastLoggedPMXRenderProfile: LiveCamRenderProfile?
     private var renderProfile = LiveCamRenderProfile.fullStage
     private var liveCamOrbit = LiveCamCharacterOrbit()
     private var fullStageFrameSampler = FrameRateSampler()
     private var nextFrameCompletions: [MarbleFrameCompletion] = []
+    /// 居民视觉帧回读源(渲染器自身 drawable 的请求式导出)。
+    var residentVisionSurface: MarbleResidentVisionSurface?
+    private var renderedFrameCounter: UInt64 = 0
     private var livingPodRoomRenderer: LivingPodRoomRenderer?
     private var marbleJukeboxRenderer: LivingPodRoomRenderer?
     private var marbleJukeboxNode: SCNNode?
+    private var marbleWishMachineNode: SCNNode?
+    private var wishMachineOutputRenderer: WishMachineOutputRenderer?
+    private var residentPropRenderer: ResidentPropRenderer?
+    private let residentPropRenderOwner = ResidentPropRenderOwner()
+    private var residentPropRenderRevision: UInt64?
+    private var residentDisplayStandNode: SCNNode?
+    private var residentDisplayStandDescriptor: ResidentPropDisplayStand?
+    private var marbleIndependentPropsNode: SCNNode?
 
     init(
         view: MTKView,
@@ -1431,15 +1776,6 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         avatarRenderer.lookAtController?.enabled = true
         avatarRenderer.lookAtController?.target = .camera
 
-        let animationPlayer = try StageAvatarAnimationLoader.makeLoopingPlayer(
-            for: motion,
-            model: model
-        )
-        if let animationPlayer {
-            animationPlayer.applyRootMotion = false
-            animationPlayer.lookAtController = avatarRenderer.lookAtController
-        }
-
         var restRotations: [VRMHumanoidBone: simd_quatf] = [:]
         for bone in [
             VRMHumanoidBone.spine,
@@ -1458,9 +1794,12 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         }
         avatarModel = model
         self.avatarRenderer = avatarRenderer
-        avatarAnimationPlayer = animationPlayer
-        appliedVRMResolvedMotion = motion.map(StageAvatarResolvedMotion.asset)
-            ?? .naturalIdle
+        avatarAnimationPlayer = nil
+        appliedVRMLocomotionGait = nil
+        // Apply through the frame synchronizer so load failures use the same
+        // identity cache and feedback path as later motion changes.
+        appliedVRMResolvedMotion = nil
+        appliedVRMPlaybackIdentity = nil
         avatarRestRotations = restRotations
         pmxAvatarRenderer = nil
         appliedPMXResolvedMotion = nil
@@ -1473,9 +1812,6 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
     ) async throws {
         guard !Task.isCancelled else { return }
         let pmxRenderer = PMXStageAvatarRenderer(device: renderer.device)
-        pmxRenderer.onMotionFinished = { [weak avatarRuntime] url in
-            avatarRuntime?.finishOneShotMotion(at: url)
-        }
         pmxRenderer.setLightingProfile(
             PMXAvatarLightingPolicy.resolve(
                 renderProfile: renderProfile,
@@ -1489,33 +1825,24 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             resourceRootURL: resourceRootURL
         )
         guard !Task.isCancelled else { return }
-        if let motionURL {
-            let repeats = avatarRuntime.snapshot.motion.map {
-                $0.url == motionURL ? $0.loop : true
-            } ?? true
-            try await pmxRenderer.loadMotion(
-                from: motionURL,
-                repeats: repeats,
-                playbackRate: avatarRuntime.snapshot.motion?.playbackRate ?? 1
-            )
-        }
         guard !Task.isCancelled else { return }
 
         avatarRenderer = nil
         avatarModel = nil
         avatarAnimationPlayer = nil
+        appliedVRMLocomotionGait = nil
         appliedVRMResolvedMotion = nil
         avatarRestRotations.removeAll(keepingCapacity: false)
         pmxAvatarRenderer = pmxRenderer
-        appliedPMXResolvedMotion = avatarRuntime.snapshot.motion.map(
-            StageAvatarResolvedMotion.asset
-        ) ?? .naturalIdle
+        appliedPMXResolvedMotion = nil
+        appliedPMXPlaybackIdentity = nil
     }
 
     func clearAvatar() {
         avatarRenderer = nil
         avatarModel = nil
         avatarAnimationPlayer = nil
+        appliedVRMLocomotionGait = nil
         appliedVRMResolvedMotion = nil
         avatarRestRotations.removeAll(keepingCapacity: false)
         pmxAvatarRenderer = nil
@@ -1530,6 +1857,9 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
     func applyRenderProfile(_ profile: LiveCamRenderProfile) {
         guard renderProfile != profile else { return }
         renderProfile = profile
+        if !profile.drawsWorld {
+            suspendResidentPropRendering()
+        }
         fullStageFrameSampler.reset()
         pmxAvatarRenderer?.setLightingProfile(
             PMXAvatarLightingPolicy.resolve(
@@ -1539,6 +1869,12 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                 )?.lighting
             )
         )
+    }
+
+    func suspendResidentPropRendering() {
+        spatialStage.releaseResidentPropRenderer(residentPropRenderOwner)
+        residentPropRenderRevision = nil
+        residentPropRenderer?.update([], preview: nil, worldID: nil, isVisible: false)
     }
 
     func updateLiveCamOrbit(_ orbit: LiveCamCharacterOrbit) {
@@ -1552,6 +1888,84 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
+        renderedFrameCounter &+= 1
+        if !ResidentPropSurfaceEligibility.isActive(view) { suspendResidentPropRendering() }
+        if residentPropRenderer == nil, renderProfile.drawsWorld {
+            residentPropRenderer = ResidentPropRenderer(device: renderer.device, colorFormat: view.colorPixelFormat, depthFormat: view.depthStencilPixelFormat)
+        }
+        let propLease = spatialStage.residentPropRenderOwnership.claim(
+            owner: residentPropRenderOwner, worldID: spatialStage.selectedWorldID,
+            drawsWorld: renderProfile.drawsWorld, isVisible: spatialStage.isWorldVisible && ResidentPropSurfaceEligibility.isActive(view)
+        )
+        if let revision = propLease, revision != residentPropRenderRevision, let propRenderer = residentPropRenderer {
+            let owner = residentPropRenderOwner, worldID = spatialStage.selectedWorldID
+            propRenderer.onStatusChanged = { [weak spatialStage, weak owner, weak view] id, status in
+                guard let spatialStage, let owner, let view, ResidentPropSurfaceEligibility.isActive(view), spatialStage.residentPropRenderOwnership.accepts(owner: owner, worldID: worldID, revision: revision) else { return }
+                spatialStage.residentPropRenderStatuses[id] = status == .empty ? nil : status
+            }
+            spatialStage.residentPropPrepareHandler = { [weak propRenderer, weak spatialStage, weak owner, weak view] descriptor in
+                guard let propRenderer, let spatialStage, let owner, let view, ResidentPropSurfaceEligibility.isActive(view),
+                      spatialStage.residentPropRenderOwnership.accepts(owner: owner, worldID: descriptor.worldID, revision: revision) else { throw CancellationError() }
+                let prepared = try await propRenderer.prepare(descriptor)
+                guard ResidentPropSurfaceEligibility.isActive(view), spatialStage.residentPropRenderOwnership.accepts(owner: owner, worldID: descriptor.worldID, revision: revision) else { throw CancellationError() }
+                return prepared
+            }
+            spatialStage.residentPropPreparedHandler = { [weak propRenderer, weak spatialStage, weak owner, weak view] assetID, modelURL, worldID in
+                guard let spatialStage, let owner, let view, ResidentPropSurfaceEligibility.isActive(view), spatialStage.residentPropRenderOwnership.accepts(owner: owner, worldID: worldID, revision: revision) else { return false }
+                return propRenderer?.isPrepared(assetID: assetID, modelURL: modelURL, worldID: worldID) ?? false
+            }
+            spatialStage.residentPropAttachmentValidationHandler = { [weak self, weak spatialStage, weak owner, weak view] avatarID, point in
+                guard let self, let spatialStage, let owner, let view,
+                      ResidentPropSurfaceEligibility.isActive(view),
+                      spatialStage.residentPropRenderOwnership.accepts(
+                          owner: owner,
+                          worldID: worldID,
+                          revision: revision
+                      ),
+                      self.renderProfile.drawsWorld,
+                      self.avatarRuntime.snapshot.avatar?.id == avatarID,
+                      let pmxAvatarRenderer = self.pmxAvatarRenderer
+                else {
+                    throw PropAttachmentError.unsupportedAvatar
+                }
+                try pmxAvatarRenderer.validateAttachmentPoint(point)
+            }
+            spatialStage.residentPropClearHandler = { [weak propRenderer] in
+                propRenderer?.update([], preview: nil, worldID: nil, isVisible: false)
+            }
+            spatialStage.residentPropActiveHandler = { [weak spatialStage, weak owner, weak view] in
+                guard let spatialStage, let owner, let view, ResidentPropSurfaceEligibility.isActive(view) else { return false }
+                return spatialStage.residentPropRenderOwnership.accepts(owner: owner, worldID: worldID, revision: revision)
+            }
+            residentPropRenderRevision = revision
+        }
+        residentPropRenderer?.update(
+            spatialStage.residentPropOutputs,
+            preview: spatialStage.residentPropPreview,
+            held: renderProfile.drawsWorld ? spatialStage.residentHeldProp : nil,
+            worldID: spatialStage.selectedWorldID,
+            isVisible: propLease != nil
+        )
+        reconcileMarbleWishMachineNode()
+        if wishMachineOutputRenderer == nil, renderProfile.drawsWorld {
+            let outputRenderer = WishMachineOutputRenderer(device: renderer.device, colorFormat: view.colorPixelFormat, depthFormat: view.depthStencilPixelFormat)
+            outputRenderer.onStatusChanged = { [weak spatialStage] status in
+                guard let spatialStage else { return }
+                switch status {
+                case .empty: break
+                case let .loading(id), let .ready(id), let .failed(id, _):
+                    guard spatialStage.wishMachineOutput?.id == id,
+                          spatialStage.wishMachineOutput?.worldID == spatialStage.selectedWorldID,
+                          spatialStage.isWorldVisible else { return }
+                }
+                spatialStage.wishMachineOutputStatus = status
+            }
+            wishMachineOutputRenderer = outputRenderer
+        }
+        wishMachineOutputRenderer?.update(
+            spatialStage.wishMachineOutput, worldID: spatialStage.selectedWorldID,
+            isVisible: spatialStage.isWorldVisible && WishMachineScene.shouldDisplay(worldID: spatialStage.selectedWorldID, drawsWorld: renderProfile.drawsWorld)
+        )
         guard let drawable = view.currentDrawable,
               let commandBuffer = commandQueue.makeCommandBuffer()
         else {
@@ -1569,6 +1983,11 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             deltaTime: delta,
             speedBoosted: spatialStage.isSpeedBoosted
         )
+        // Avatar-follow rotation arrives at snapshot cadence (about 30 Hz).
+        // Digest it at render cadence before any view matrix below reads the
+        // camera, so the world rotates on every rendered frame instead of
+        // stepping whole snapshot deltas every other 60 fps frame.
+        spatialStage.advanceAvatarFollowRotation(deltaTime: delta)
 
         _ = inFlightSemaphore.wait(timeout: .distantFuture)
         let semaphore = inFlightSemaphore
@@ -1644,16 +2063,55 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             projection: projection
         )
 
+        var hasGeneratedOutputDepth = false
+        if renderProfile.drawsWorld, let depthTexture = view.depthStencilTexture {
+            let camera = spatialStage.camera
+            let cameraView = rotationX(-camera.pitch) * rotationY(-camera.yaw) * translation(-camera.position)
+            if propLease != nil { spatialStage.residentPropViewProjection = projection * cameraView }
+            hasGeneratedOutputDepth = wishMachineOutputRenderer?.render(
+                commandBuffer: commandBuffer, colorTexture: drawable.texture, depthTexture: depthTexture,
+                viewProjection: projection * cameraView, cameraPosition: camera.position,
+                reversedDepth: MarbleSceneDepthConvention.resolve(avatarFormat: avatarRuntime.snapshot.avatar?.format) == .sceneKitReverse,
+                preservesDepth: hasPreparedOccluder
+            ) ?? false
+            let hasPlacedProps = residentPropRenderer?.render(
+                commandBuffer: commandBuffer, colorTexture: drawable.texture, depthTexture: depthTexture,
+                viewProjection: projection * cameraView, cameraPosition: camera.position,
+                reversedDepth: MarbleSceneDepthConvention.resolve(avatarFormat: avatarRuntime.snapshot.avatar?.format) == .sceneKitReverse,
+                preservesDepth: hasPreparedOccluder || hasGeneratedOutputDepth
+            ) ?? false
+            hasGeneratedOutputDepth = hasGeneratedOutputDepth || hasPlacedProps
+        }
+
         if renderProfile.drawsAvatar {
             drawAvatar(
                 in: view,
                 drawable: drawable,
                 commandBuffer: commandBuffer,
                 projection: projection,
-                hasPreparedOccluder: hasPreparedOccluder,
+                hasPreparedOccluder: hasPreparedOccluder || hasGeneratedOutputDepth,
                 deltaTime: max(delta, 0)
             )
         }
+        renderResidentHeldProp(
+            in: view,
+            drawable: drawable,
+            commandBuffer: commandBuffer,
+            projection: projection
+        )
+        residentVisionSurface?.offerRenderedFrame(
+            view: view,
+            drawable: drawable,
+            commandBuffer: commandBuffer,
+            profile: renderProfile,
+            worldID: spatialStage.selectedWorldID,
+            worldVisible: spatialStage.isWorldVisible,
+            camera: spatialStage.camera,
+            avatarAssetID: avatarRuntime.snapshot.avatar?.id,
+            avatarFrameRevision: avatarRuntime.snapshot.revision,
+            avatarPosition: spatialStage.avatarPlacement.position,
+            frameIndex: renderedFrameCounter
+        )
 #if DEBUG
         if renderProfile == .fullStage,
            let frameCapture = MarbleDebugFrameCapture.shared
@@ -1665,6 +2123,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                     && spatialStage.isWorldVisible
                     && spatialStage.marbleLivingCabin?.worldID == spatialStage.selectedWorldID
                     && marbleJukeboxNode != nil
+                    && marbleWishMachineNode?.parent != nil
                     && (avatarModel != nil || pmxAvatarRenderer != nil)
                     && hasPreparedOccluder
                     && occluderVertexCount > 0
@@ -1739,12 +2198,24 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         if marbleJukeboxRenderer == nil {
             let node = LivingPodScene.makeIndependentJukebox()
             marbleJukeboxNode = node
+            let props = SCNNode()
+            marbleIndependentPropsNode = props
+            props.name = "marble-interactive-props"
+            props.addChildNode(node)
             marbleJukeboxRenderer = LivingPodRoomRenderer(
                 device: renderer.device,
-                rootNode: node
+                rootNode: props
             )
         }
+        reconcileMarbleWishMachineNode()
         marbleJukeboxNode?.simdPosition = cabin.jukeboxPosition
+        let stand = spatialStage.residentPropDisplayStand.flatMap { $0.worldID == spatialStage.selectedWorldID ? $0 : nil }
+        if stand != residentDisplayStandDescriptor {
+            residentDisplayStandNode?.removeFromParentNode()
+            residentDisplayStandNode = stand.map { ResidentPropScene.makeDisplayStand($0) }
+            if let node = residentDisplayStandNode { marbleIndependentPropsNode?.addChildNode(node) }
+            residentDisplayStandDescriptor = stand
+        }
         marbleJukeboxNode?.simdEulerAngles = SIMD3<Float>(0, cabin.jukeboxYaw, 0)
         // Exclude the device proxy here so it does not hide its own geometry.
         let hasSceneDepth = drawSceneOccluder(
@@ -1764,6 +2235,24 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             preservesBackground: true,
             preservesDepth: hasSceneDepth
         )
+    }
+
+    private func reconcileMarbleWishMachineNode() {
+        guard let propsRoot = marbleIndependentPropsNode else {
+            marbleWishMachineNode = nil
+            return
+        }
+        marbleWishMachineNode = WishMachineScene.reconcileMachineNode(
+            in: propsRoot,
+            worldID: spatialStage.selectedWorldID,
+            drawsWorld: renderProfile.drawsWorld
+        )
+        if let marbleWishMachineNode {
+            WishMachineScene.update(
+                marbleWishMachineNode,
+                state: spatialStage.wishMachineState
+            )
+        }
     }
 
     private func viewport(for view: MTKView) -> SplatRenderer.ViewportDescriptor {
@@ -1838,11 +2327,28 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
            let node = marbleJukeboxNode
         {
             let bounds = node.boundingBox
-            propVertices = MarbleOccluderMesh.boxPositions(
+            var vertices = MarbleOccluderMesh.boxPositions(
                 minimum: SIMD3<Float>(Float(bounds.min.x), Float(bounds.min.y), Float(bounds.min.z)),
                 maximum: SIMD3<Float>(Float(bounds.max.x), Float(bounds.max.y), Float(bounds.max.z)),
                 transform: node.simdTransform
             )
+            if let machine = marbleWishMachineNode, !machine.isHidden {
+                let bounds = machine.boundingBox
+                vertices += MarbleOccluderMesh.boxPositions(
+                    minimum: SIMD3<Float>(Float(bounds.min.x), Float(bounds.min.y), Float(bounds.min.z)),
+                    maximum: SIMD3<Float>(Float(bounds.max.x), Float(bounds.max.y), Float(bounds.max.z)),
+                    transform: machine.simdTransform
+                )
+            }
+            if let stand = residentDisplayStandNode {
+                let bounds = stand.boundingBox
+                vertices += MarbleOccluderMesh.boxPositions(
+                    minimum: SIMD3(Float(bounds.min.x),Float(bounds.min.y),Float(bounds.min.z)),
+                    maximum: SIMD3(Float(bounds.max.x),Float(bounds.max.y),Float(bounds.max.z)),
+                    transform: stand.simdTransform
+                )
+            }
+            propVertices = vertices
         } else {
             propVertices = []
         }
@@ -2079,6 +2585,8 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                     "PMX frame camera profile=\(profileName, privacy: .public) eyeX=\(eye.x, privacy: .public) eyeY=\(eye.y, privacy: .public) eyeZ=\(eye.z, privacy: .public) targetX=\(target.x, privacy: .public) targetY=\(target.y, privacy: .public) targetZ=\(target.z, privacy: .public) distance=\(distance, privacy: .public) tracking=\(String(describing: tracking), privacy: .public) projectionX=\(pmxProjection.columns.0.x, privacy: .public) projectionY=\(pmxProjection.columns.1.y, privacy: .public)"
                 )
             }
+            pmxAvatarRenderer.locomotionMeasuredSpeed = avatarRuntime.locomotion.isLocomotionActive
+                ? avatarRuntime.locomotion.measuredSpeed : nil
             pmxAvatarRenderer.encode(
                 commandBuffer: commandBuffer,
                 renderPassDescriptor: pass,
@@ -2091,14 +2599,66 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         }
     }
 
+    /// Drops failure records from earlier playback revisions. Entries keyed to
+    /// a stale revision can never repeat, so this keeps retention bounded
+    /// across avatar/session changes.
+    private func pruneStaleFailedPlaybackIdentities(
+        _ identities: inout [StageMotionPlaybackIdentity]
+    ) {
+        let revision = avatarRuntime.snapshot.revision
+        identities.removeAll { $0.snapshotRevision != revision }
+    }
+
+    /// Remembers a terminal failed playback identity so it is not re-attempted
+    /// when the same identity re-resolves after temporary thinking or
+    /// world-motion changes. Only an explicit new playback revision or
+    /// activity request (a fresh identity) permits another attempt.
+    private func rememberFailedPlaybackIdentity(
+        _ identity: StageMotionPlaybackIdentity,
+        into identities: inout [StageMotionPlaybackIdentity]
+    ) {
+        pruneStaleFailedPlaybackIdentities(&identities)
+        guard !identities.contains(identity) else { return }
+        identities.append(identity)
+        if identities.count > 32 { identities.removeFirst() }
+    }
+
     private func synchronizePMXWorldMotion(
         _ renderer: PMXStageAvatarRenderer
     ) {
+        let heldDisplayMotion: StageMotionAsset? = if renderProfile.drawsWorld,
+           spatialStage.residentHeldProp?.calibration.avatarAssetID
+            == avatarRuntime.snapshot.avatar?.id
+        {
+            avatarRuntime.residentHoldDisplayMotion
+        } else {
+            nil
+        }
         let resolved = StageAvatarResolvedMotion.resolve(
             selectedMotion: avatarRuntime.snapshot.motion,
-            worldPlayback: avatarRuntime.worldActivity?.motionPlayback
+            worldPlayback: avatarRuntime.worldActivity?.motionPlayback,
+            residentThinkingMotion: avatarRuntime.residentThinkingMotion,
+            heldDisplayMotion: heldDisplayMotion,
+            naturalIdleMotion: avatarRuntime.residentIdleMotion
         )
-        guard resolved != appliedPMXResolvedMotion else { return }
+        let identity: StageMotionPlaybackIdentity? = if case let .asset(motion) = resolved {
+            avatarRuntime.playbackIdentity(for: motion)
+        } else { nil }
+        pruneStaleFailedPlaybackIdentities(&failedPMXPlaybackIdentities)
+        guard resolved != appliedPMXResolvedMotion || identity != appliedPMXPlaybackIdentity else { return }
+        // Cache the attempt before loading, including failures. A fresh user
+        // revision or world request explicitly permits another attempt.
+        appliedPMXResolvedMotion = resolved
+        appliedPMXPlaybackIdentity = identity
+        renderer.onMotionFinished = nil
+        if let identity, failedPMXPlaybackIdentities.contains(identity) {
+            // A failed identity stays failed across temporary thinking and
+            // world-motion changes. Restore the cleared renderer state without
+            // re-loading the bad asset or re-reporting the terminal failure.
+            renderer.setCoffeeCupVisible(false)
+            renderer.clearMotion()
+            return
+        }
 
         switch resolved {
         case .naturalIdle:
@@ -2109,8 +2669,15 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             guard motion.format == .vmd, let motionURL = motion.url else {
                 renderer.setCoffeeCupVisible(false)
                 renderer.clearMotion()
-                appliedPMXResolvedMotion = .naturalIdle
+                if let identity {
+                    rememberFailedPlaybackIdentity(identity, into: &failedPMXPlaybackIdentities)
+                    avatarRuntime.reportMotionPlayback(identity: identity, outcome: .failed("Resolved PMX motion has no compatible VMD asset"))
+                }
                 return
+            }
+            renderer.onMotionFinished = { [weak avatarRuntime] url in
+                guard let identity, identity.motion.url == url else { return }
+                avatarRuntime?.reportMotionPlayback(identity: identity, outcome: .completed)
             }
             let loaded = loadPMXMotion(
                 motionURL,
@@ -2118,6 +2685,8 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                 repeats: motion.loop,
                 playbackRate: motion.playbackRate,
                 inPlace: motion.inPlace == true,
+                locomotion: PMXStageAvatarRenderer.locomotionGait(for: motion),
+                identity: identity,
                 failureMessage: "Unable to apply resolved PMX motion"
             )
             if loaded {
@@ -2134,28 +2703,109 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         }
     }
 
+    private func renderResidentHeldProp(
+        in view: MTKView,
+        drawable: CAMetalDrawable,
+        commandBuffer: MTLCommandBuffer,
+        projection: simd_float4x4
+    ) {
+        guard renderProfile.drawsWorld,
+              spatialStage.isWorldVisible,
+              let held = spatialStage.residentHeldProp,
+              held.worldID == spatialStage.selectedWorldID,
+              let depthTexture = view.depthStencilTexture
+        else { return }
+        guard held.calibration.avatarAssetID == avatarRuntime.snapshot.avatar?.id
+        else {
+            spatialStage.residentPropRenderStatuses[held.objectID] = .failed(
+                id: held.objectID,
+                message: PropAttachmentError.avatarMismatch.localizedDescription
+            )
+            return
+        }
+        guard let pmxAvatarRenderer, let residentPropRenderer else {
+            spatialStage.residentPropRenderStatuses[held.objectID] = .failed(
+                id: held.objectID,
+                message: PropAttachmentError.unsupportedAvatar.localizedDescription
+            )
+            return
+        }
+        do {
+            let handPose = try pmxAvatarRenderer.evaluatedAttachmentPose(
+                for: held.attachmentPoint
+            )
+            let camera = spatialStage.camera
+            let cameraView = rotationX(-camera.pitch)
+                * rotationY(-camera.yaw)
+                * translation(-camera.position)
+            _ = try residentPropRenderer.renderAttachment(
+                handPose: handPose,
+                commandBuffer: commandBuffer,
+                colorTexture: drawable.texture,
+                depthTexture: depthTexture,
+                viewProjection: projection * cameraView,
+                cameraPosition: camera.position,
+                reversedDepth: true,
+                preservesDepth: true
+            )
+        } catch {
+            spatialStage.residentPropRenderStatuses[held.objectID] = .failed(
+                id: held.objectID,
+                message: error.localizedDescription
+            )
+        }
+    }
+
     private func synchronizeVRMWorldMotion(_ model: VRMModel) {
         let resolved = StageAvatarResolvedMotion.resolve(
             selectedMotion: avatarRuntime.snapshot.motion,
-            worldPlayback: avatarRuntime.worldActivity?.motionPlayback
+            worldPlayback: avatarRuntime.worldActivity?.motionPlayback,
+            residentThinkingMotion: avatarRuntime.residentThinkingMotion,
+            naturalIdleMotion: avatarRuntime.residentIdleMotion
         )
-        guard resolved != appliedVRMResolvedMotion else { return }
+        let identity: StageMotionPlaybackIdentity? = if case let .asset(motion) = resolved {
+            avatarRuntime.playbackIdentity(for: motion)
+        } else { nil }
+        pruneStaleFailedPlaybackIdentities(&failedVRMPlaybackIdentities)
+        guard resolved != appliedVRMResolvedMotion || identity != appliedVRMPlaybackIdentity else { return }
         appliedVRMResolvedMotion = resolved
+        appliedVRMPlaybackIdentity = identity
+
+        // Clear
+        // the previous clip's complete local pose before the new player writes
+        // its tracks, including when returning to idle or loading fails.
+        avatarAnimationPlayer = nil
+        appliedVRMLocomotionGait = nil
+        for node in model.nodes { node.resetToBindPose() }
+        model.updateNodeTransforms()
+        avatarRenderer?.resetPhysics()
+
+        // A failed identity stays failed across temporary thinking and
+        // world-motion changes; only an explicit new playback revision or
+        // activity request (a fresh identity) permits another attempt.
+        if let identity, failedVRMPlaybackIdentities.contains(identity) {
+            return
+        }
 
         do {
             switch resolved {
             case .naturalIdle:
                 avatarAnimationPlayer = nil
             case let .asset(motion):
-                let player = try StageAvatarAnimationLoader.makeLoopingPlayer(
+                let loaded = try StageAvatarAnimationLoader.makeLoopingPlayerWithGait(
                     for: motion,
                     model: model
                 )
-                player?.lookAtController = avatarRenderer?.lookAtController
-                avatarAnimationPlayer = player
+                loaded.player?.lookAtController = avatarRenderer?.lookAtController
+                avatarAnimationPlayer = loaded.player
+                appliedVRMLocomotionGait = loaded.gait
             }
         } catch {
             avatarAnimationPlayer = nil
+            if let identity {
+                rememberFailedPlaybackIdentity(identity, into: &failedVRMPlaybackIdentities)
+                avatarRuntime.reportMotionPlayback(identity: identity, outcome: .failed(error.localizedDescription))
+            }
             Self.log.error(
                 "Unable to apply resolved VRM motion: \(error.localizedDescription, privacy: .public)"
             )
@@ -2169,6 +2819,8 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         repeats: Bool,
         playbackRate: Float,
         inPlace: Bool = false,
+        locomotion: StageLocomotionGait? = nil,
+        identity: StageMotionPlaybackIdentity? = nil,
         failureMessage: String
     ) -> Bool {
         do {
@@ -2176,11 +2828,16 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                 from: url,
                 repeats: repeats,
                 playbackRate: playbackRate,
-                inPlace: inPlace
+                inPlace: inPlace,
+                locomotion: locomotion
             )
             return true
         } catch {
             renderer.clearMotion()
+            if let identity {
+                rememberFailedPlaybackIdentity(identity, into: &failedPMXPlaybackIdentities)
+                avatarRuntime.reportMotionPlayback(identity: identity, outcome: .failed(error.localizedDescription))
+            }
             Self.log.error(
                 "\(failureMessage, privacy: .public): \(error.localizedDescription, privacy: .public)"
             )
@@ -2200,19 +2857,30 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         deltaTime: Float
     ) {
         synchronizeVRMWorldMotion(avatarModel)
+        StageAvatarAnimationLoader.applyLocomotion(
+            telemetry: avatarRuntime.locomotion,
+            gait: appliedVRMLocomotionGait,
+            player: avatarAnimationPlayer
+        )
         let motion = StageAvatarMotionFrame.resolve(
             activity: avatarRuntime.activity,
             voiceLevel: avatarRuntime.voiceLevel,
             time: Date.timeIntervalSinceReferenceDate,
             residentSpeechLevel: avatarRuntime.residentSpeechLevel
         )
-        avatarAnimationPlayer?.speed = StageAvatarAnimationPlayback.speed(
-            for: avatarRuntime.activity
-        )
         avatarAnimationPlayer?.update(
             deltaTime: min(max(deltaTime, 1 / 240), 1 / 20),
             model: avatarModel
         )
+        if let player = avatarAnimationPlayer, player.isFinished,
+           let identity = appliedVRMPlaybackIdentity, !identity.motion.loop {
+            avatarAnimationPlayer = nil
+            appliedVRMLocomotionGait = nil
+            for node in avatarModel.nodes { node.resetToBindPose() }
+            avatarModel.updateNodeTransforms()
+            avatarRenderer.resetPhysics()
+            avatarRuntime.reportMotionPlayback(identity: identity, outcome: .completed)
+        }
         apply(
             motion: motion,
             to: avatarModel,
@@ -2220,8 +2888,9 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             usesFullBodyAnimation: avatarAnimationPlayer != nil
         )
 
+        let bodyLift = avatarAnimationPlayer == nil ? motion.bodyLift : 0
         let placedPosition = placement.position
-            + SIMD3<Float>(0, motion.bodyLift, 0)
+            + SIMD3<Float>(0, bodyLift, 0)
         let modelTransform = translation(placedPosition)
             * rotationY(placement.yaw)
             * scale(placement.scale)

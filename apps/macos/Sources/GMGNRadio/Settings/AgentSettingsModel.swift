@@ -363,6 +363,14 @@ final class AgentSettingsModel {
     var takeoverEnabled: Bool
     var planningModel: String
 
+    // MARK: 居民人格与后台思考预算
+
+    /// 独立于 DJ hostPrompt 的居民人格；保存后下一轮注入 Codex/DSH 居民会话。
+    var residentPersona: String
+    /// 本次居民会话滚动一小时内的后台自主思考预算（0...6，默认 6），可读写。
+    /// 额度随循环实例存活，不跨循环重建或重启保留；实际 loop 预算由循环接线方读取。
+    var backgroundTurnsPerHour: Int
+
     // MARK: Agent 聊天后端（Live Cam 文字聊天）
 
     var installedConversationBackendIDs:
@@ -379,12 +387,14 @@ final class AgentSettingsModel {
     private let account: any CodexAccountServicing
     private let preferences: DJAgentPreferences
     private let voicePreferences: RealtimeVoicePreferences
+    private let residentPreferences: ResidentPreferences
 
     init(
         account: any CodexAccountServicing = CodexAgentAccountService(),
         preferences: DJAgentPreferences = DJAgentPreferences(),
         voicePreferences: RealtimeVoicePreferences =
             RealtimeVoicePreferences(),
+        residentPreferences: ResidentPreferences = ResidentPreferences(),
         microphoneDevices: [BailianMicrophoneDeviceOption] =
             BailianMicrophoneDeviceCatalog.availableDevices(),
         defaultMicrophoneDeviceID: String? =
@@ -393,12 +403,16 @@ final class AgentSettingsModel {
         self.account = account
         self.preferences = preferences
         self.voicePreferences = voicePreferences
+        self.residentPreferences = residentPreferences
         selectedReplyVoiceID = voicePreferences.replyVoiceID
         voiceMicrophoneDevices = microphoneDevices
         self.defaultMicrophoneDeviceID = defaultMicrophoneDeviceID
         hostPrompt = preferences.hostPrompt()
         takeoverEnabled = preferences.takeoverEnabled()
         planningModel = preferences.planningModel() ?? ""
+        residentPersona = residentPreferences.persona
+        backgroundTurnsPerHour =
+            residentPreferences.backgroundTurnsPerHour
         let voice = voicePreferences.loadMetadata()
         realtimeProvider = voice.provider
         let resolvedVoiceModel: String
@@ -542,6 +556,30 @@ final class AgentSettingsModel {
         hostPrompt = preferences.hostPrompt()
         message = "DJ 偏好已保存。"
         hasError = false
+    }
+
+    /// 保存居民人格。人格独立于 DJ hostPrompt；居民会话每轮重新读取，保存后
+    /// 下一轮生效，切换空间仍保留。设置页保存后另行发出既有自主设置通知。
+    func saveResidentPersona() {
+        residentPreferences.savePersona(residentPersona)
+        residentPersona = residentPreferences.persona
+        message = "居民人格已保存，下一轮思考生效。"
+        hasError = false
+    }
+
+    /// 保存本次居民会话滚动一小时的后台思考预算（0...6），返回收敛后的值供设置页回显。
+    /// 0 只表示不再发起新的后台思考，不会取消正在进行的一轮；实际 loop 预算由居民
+    /// 循环接线方读取 `ResidentPreferences`，额度不跨循环重建或重启保留。
+    @discardableResult
+    func saveBackgroundTurnsPerHour(_ value: Int) -> Int {
+        let saved = residentPreferences
+            .saveBackgroundTurnsPerHour(value)
+        backgroundTurnsPerHour = saved
+        message = saved == 0
+            ? "已保存：不再发起新的后台思考，不会取消正在进行的一轮。"
+            : "后台思考预算已保存：本次会话滚动一小时内最多 \(saved) 轮。"
+        hasError = false
+        return saved
     }
 
     func saveAgentConfiguration(showMessage: Bool = true) {

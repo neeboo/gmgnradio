@@ -1,6 +1,41 @@
 import AppKit
 import os
 
+/// Frame-cadence bookkeeping for the explicit render loop.
+///
+/// Each frame is scheduled to *start* one `interval` after the previous frame
+/// started, and the idle before it is that target minus the previous frame's
+/// measured draw time — so the loop runs at the target cadence instead of
+/// drawCPU + a full interval. When a frame overruns its interval
+/// (`draw > interval`) the next frame starts immediately (machine-bound at the
+/// real draw cost): missed beats are dropped rather than burst-rendered, so a
+/// long main-actor hiccup can never turn into a busy catch-up burst.
+struct StageRenderFramePacer: Equatable, Sendable {
+    var interval: TimeInterval
+    private(set) var nextStart: TimeInterval
+
+    init(interval: TimeInterval, firstFrameAt start: TimeInterval = 0) {
+        // Guard a zero/negative fps input (quality resolution edge) so the
+        // loop can never sleep for zero or spin.
+        self.interval = max(interval, 0.0001)
+        self.nextStart = max(start, 0)
+    }
+
+    /// How long the loop should idle so the next frame starts at its paced
+    /// time. Zero when the loop is already behind its cadence.
+    func idleTime(now: TimeInterval) -> TimeInterval {
+        max(0, nextStart - now)
+    }
+
+    /// Records one drawn frame that started at `start` and ended at `end`
+    /// (seconds on the same time base as `firstFrameAt`). The next frame's
+    /// start moves one interval forward, never behind this frame's real end,
+    /// which is what drops missed beats instead of accumulating them.
+    mutating func frameDrew(startedAt start: TimeInterval, endedAt end: TimeInterval) {
+        nextStart = max(start + interval, end)
+    }
+}
+
 enum StageRenderSurfaceOwner: Equatable, Sendable {
     case detached
     case liveCam
@@ -276,6 +311,7 @@ final class StageRenderSurfaceController {
             activity: activity,
             quality: activeQuality
         )
+        surfaceView.setResidentPropRenderingActive(nextMode != .stopped)
         renderLoopMode = nextMode
         switch nextMode {
         case .stopped:
@@ -288,6 +324,17 @@ final class StageRenderSurfaceController {
     private func startRenderLoop() {
         guard renderLoopTask == nil else { return }
         renderLoopTask = Task { @MainActor [weak self] in
+            let clock = ContinuousClock()
+            let loopStart = clock.now
+            // Re-anchored on every loop start (paused → active, reparent,
+            // quality switch): a stale cadence from a stopped loop must never
+            // make the first frames sleep for a past deadline.
+            var pacer = StageRenderFramePacer(interval: 0)
+            func elapsedSeconds(_ duration: Duration) -> TimeInterval {
+                Double(duration.components.seconds)
+                    + Double(duration.components.attoseconds)
+                    / 1_000_000_000_000_000_000
+            }
             while !Task.isCancelled {
                 guard let self else { return }
                 guard case let .manual(currentFramesPerSecond) =
@@ -296,14 +343,33 @@ final class StageRenderSurfaceController {
                 else {
                     return
                 }
+                let interval = 1.0 / Double(max(currentFramesPerSecond, 1))
+                let now = elapsedSeconds(clock.now - loopStart)
+                if pacer.interval != interval {
+                    // Target cadence changed (quality switch): restart pacing
+                    // at the current time so a slower target never inherits a
+                    // stale, already-past next-start time.
+                    pacer = StageRenderFramePacer(
+                        interval: interval,
+                        firstFrameAt: now
+                    )
+                }
+                let idle = pacer.idleTime(now: now)
+                if idle > 0 {
+                    try? await Task.sleep(for: .seconds(idle))
+                } else {
+                    // Over-budget frames still have to release the main
+                    // actor so input, cancellation and world ticks can run.
+                    await Task.yield()
+                }
+                guard !Task.isCancelled,
+                      case .manual = self.renderLoopMode,
+                      !self.surfaceView.isHidden
+                else { return }
+                let frameStart = elapsedSeconds(clock.now - loopStart)
                 self.surfaceView.draw()
-                let framesPerSecond = max(
-                    currentFramesPerSecond,
-                    1
-                )
-                try? await Task.sleep(
-                    for: .seconds(1.0 / Double(framesPerSecond))
-                )
+                let frameEnd = elapsedSeconds(clock.now - loopStart)
+                pacer.frameDrew(startedAt: frameStart, endedAt: frameEnd)
             }
         }
     }

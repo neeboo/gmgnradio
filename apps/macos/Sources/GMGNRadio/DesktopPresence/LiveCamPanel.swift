@@ -112,8 +112,8 @@ struct LiveCamWindowPointerDelta: Equatable, Sendable {
 }
 
 @MainActor
-final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
-    private enum ReplyPresentation {
+final class LiveCamInteractionView: NSView, NSTextFieldDelegate, NSGestureRecognizerDelegate {
+    enum ReplyPresentation {
         case agentReply
         case chatStatus
     }
@@ -121,18 +121,44 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
     let spaceButton = NSButton()
     let playerButton = NSButton()
     let chatButton = NSButton()
+    let mailButton = ResidentSystemMailBadgeButton(identifier: "livecam.button.system-inbox")
     let voiceButton = NSButton()
     let settingsButton = NSButton()
-    let messageField = NSTextField()
+    let messageField = ResidentAttachmentTextField()
+    private let images = ResidentAttachmentStore()
+    private var recovery = ResidentDraftRecovery()
+    private let attachButton = NSButton()
+    private var composerHeight: NSLayoutConstraint?
     let sendButton = NSButton()
     let stopButton = NSButton()
     private var residentThinking = false
+    private var residentProgress: String?
+    private var residentDeliveryMessage: String?
+    private var residentStatusNotice: String?
+    private var residentStatusKind: ResidentStatusNoticeKind = .info
+    private var residentVoiceState = RealtimeVoiceConnectionState.disconnected
     private var residentCanStop = false
+    private let wishMachineTasks = WishMachineTaskPresentationStore()
+    private var systemInboxHandler: (@MainActor () -> Void)?
 
     private let controls = NSStackView()
     private let composer = NSVisualEffectView()
     private let replyBubble = NSVisualEffectView()
     private let replyLabel = NSTextField(wrappingLabelWithString: "")
+    private let replyDismissButton = NSButton()
+    private let fullReplyScroll = NSScrollView()
+    private let fullReplyText = NSTextView()
+    private var compactReplyHeight: NSLayoutConstraint?
+    private var expandedReplyHeight: NSLayoutConstraint?
+    private var latestReplyText = ""
+    private var replyDismissed = false
+    /// 回复气泡的回合号：同一回合内重复观察同一文本保持去重（不撤销用户关闭），
+    /// 新回合即使回复与上一回合完全相同也要重新显示，合法重复不被吞掉。
+    private var replyTurn = 0
+    private var latestReplyTurn = -1
+    /// 最近对话快照（宿主持有的同一份数据）：展开聊天后按回合回看，绝不只留
+    /// 最后一条；展示层只渲染，不做回合判定。
+    private var residentTranscriptLines: [ResidentChatTranscriptLine] = []
     private let deliveryNotice = NSVisualEffectView()
     private let deliveryLabel = NSTextField(wrappingLabelWithString: "")
     private var deliveryHeight: NSLayoutConstraint?
@@ -144,7 +170,7 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
     private var onTogglePlayback: @MainActor () -> Void
     private var onNextTrack: @MainActor () -> Void
     private var playerMenuSnapshotProvider: @MainActor () -> LiveCamPlayerMenuSnapshot
-    private var onSendMessage: @MainActor (String) -> Void
+    private var onSendMessage: @MainActor (ResidentChatSubmission) -> Void
     private var onCancelMessage: @MainActor () -> Void = {}
     private var onToggleVoice: @MainActor () -> Void
     var onComposerVisibilityChanged: @MainActor (Bool) -> Void = { _ in }
@@ -154,7 +180,7 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
     }
 
     var replyText: String {
-        replyLabel.stringValue
+        latestReplyText
     }
 
     var isReplyHidden: Bool {
@@ -171,7 +197,7 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
         playerMenuSnapshotProvider: @escaping @MainActor () -> LiveCamPlayerMenuSnapshot = {
             .noProgram
         },
-        onSendMessage: @escaping @MainActor (String) -> Void = { _ in },
+        onSendMessage: @escaping @MainActor (ResidentChatSubmission) -> Void = { _ in },
         onToggleVoice: @escaping @MainActor () -> Void = {}
     ) {
         self.onEnterSpace = onEnterSpace
@@ -198,7 +224,7 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
     }
 
     func setSendMessageHandler(
-        _ handler: @escaping @MainActor (String) -> Void
+        _ handler: @escaping @MainActor (ResidentChatSubmission) -> Void
     ) {
         onSendMessage = handler
     }
@@ -213,9 +239,44 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
         onCancelMessage = handler
     }
 
+    func setSystemInboxHandler(_ handler: @escaping @MainActor () -> Void) {
+        systemInboxHandler = handler
+        mailButton.setAction { [weak self] in self?.systemInboxHandler?() }
+    }
+
+    func setSystemInboxUnread(_ count: Int) {
+        mailButton.setUnreadCount(count)
+    }
+
+    func setEnterSpaceHandler(_ handler: @escaping @MainActor () -> Void) {
+        onEnterSpace = handler
+    }
+
     func setResidentThinking(_ thinking: Bool) {
+        let startsNewTurn = thinking && !residentThinking
         residentThinking = thinking
+        if startsNewTurn {
+            // 新回合：旧回合作废，回复气泡即使文本相同也要重新显示；旧失败提示
+            // 也已由用户的新动作接手。
+            replyTurn += 1
+            residentStatusNotice = nil
+            residentStatusKind = .info
+        }
+        if thinking {
+            if residentProgress == nil { residentProgress = "等待居民回应…" }
+        }
+        if !thinking { residentProgress = nil }
+        updateResidentStatusNotice()
         updateComposerActions()
+    }
+
+    func setResidentProgress(_ text: String?) {
+        residentProgress = text
+        updateResidentStatusNotice()
+    }
+
+    func setWishMachineTasks(_ tasks: [WishMachineTaskPresentation]) {
+        wishMachineTasks.update(tasks)
     }
 
     func setResidentCanStop(_ canStop: Bool) {
@@ -224,10 +285,98 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
     }
 
     func setResidentDeliveryNotice(_ text: String?) {
-        let message = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        residentDeliveryMessage = text
+        updateResidentStatusNotice()
+    }
+
+    /// 最近对话快照（宿主推送）：展开聊天后按回合可滚动回看发给居民的话、
+    /// 较早的回复，以及明确的未送达/取消标记。
+    func setResidentTranscript(_ lines: [ResidentChatTranscriptLine]) {
+        residentTranscriptLines = lines
+        updateReplyDisclosure()
+    }
+
+    /// 普通应用提示：不得覆盖尚未处理的失败或语音临时提示。
+    func showChatStatus(_ text: String) {
+        applyStatusNotice(text, kind: .info)
+    }
+
+    /// 语音连接/收音的临时提示；连接结论落地后可被 dismissVoiceStatus 清除。
+    func showVoiceStatus(_ text: String) {
+        applyStatusNotice(text, kind: .voice)
+    }
+
+    /// 失败提示走独立类别：后续普通应用信息不得把它盖掉。
+    func showFailureStatus(_ text: String) {
+        applyStatusNotice(text, kind: .failure)
+    }
+
+    /// 只清除语音临时提示，绝不抹掉真正的失败提示。
+    func dismissVoiceStatus() {
+        guard residentStatusKind == .voice else { return }
+        applyStatusNotice(nil, kind: .info)
+    }
+
+    /// 换世界/换后端等上下文切换：清掉旧提示与旧进度，失败提示也不例外。
+    func clearTransientStatus() {
+        residentStatusNotice = nil
+        residentStatusKind = .info
+        residentProgress = nil
+        updateResidentStatusNotice()
+    }
+
+    var residentStatusText: String? { residentStatusNotice }
+
+    private func applyStatusNotice(_ text: String?, kind: ResidentStatusNoticeKind) {
+        let decision = ResidentStatusNoticeMerge.resolve(
+            incoming: text,
+            kind: kind,
+            current: residentStatusNotice,
+            currentKind: residentStatusKind
+        )
+        residentStatusNotice = decision.text
+        residentStatusKind = decision.kind
+        updateResidentStatusNotice()
+    }
+
+    private func updateResidentStatusNotice() {
+        var lines = [residentProgress, residentDeliveryMessage].compactMap { text -> String? in
+            let normalized = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return normalized.isEmpty ? nil : normalized
+        }
+        if let residentStatusNotice, !residentStatusNotice.isEmpty {
+            lines.append("应用提示：" + residentStatusNotice)
+        }
+        let message = lines.joined(separator: "\n")
         deliveryLabel.stringValue = message
+        deliveryLabel.toolTip = message
         deliveryNotice.isHidden = message.isEmpty
-        deliveryHeight?.constant = message.isEmpty ? 0 : 42
+        updateDeliveryNoticeHeight()
+    }
+
+    /// 按真实排版宽度测量高度：多行失败提示（含自动换行）不再被固定行高裁掉。
+    private func updateDeliveryNoticeHeight() {
+        guard let deliveryHeight else { return }
+        guard !deliveryLabel.stringValue.isEmpty else {
+            deliveryHeight.constant = 0
+            return
+        }
+        let available = deliveryNotice.bounds.width - 16
+        guard available > 20 else {
+            deliveryHeight.constant = 42
+            return
+        }
+        let bounds = NSRect(x: 0, y: 0, width: available, height: .greatestFiniteMagnitude)
+        let measured = deliveryLabel.cell?.cellSize(forBounds: bounds).height ?? 0
+        let height = max(24, ceil(measured) + 16)
+        if abs(deliveryHeight.constant - height) > 0.5 {
+            deliveryHeight.constant = height
+        }
+    }
+
+    override func layout() {
+        super.layout()
+        updateDeliveryNoticeHeight()
     }
 
     var residentDeliveryNotice: String { deliveryLabel.stringValue }
@@ -250,20 +399,44 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
     }
 
     private var hasDraft: Bool {
-        !messageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !messageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !images.attachments.isEmpty
     }
 
     private func updateComposerActions() {
-        let primaryStops = canStopResident && !hasDraft
-        let stopLabel = residentThinking || residentCanStop ? "停止当前任务" : "停止朗读"
+        let speaking = AgentSpeechStatusStore.shared.isSpeaking
+        let primaryStops = Self.composerPrimaryActionStops(
+            isThinking: residentThinking,
+            isSpeaking: speaking,
+            hasDraft: hasDraft
+        )
+        let stopLabel = speaking ? "停止说话" : "停止当前任务"
         let label = primaryStops ? stopLabel : "发送消息"
         sendButton.image = NSImage(systemSymbolName: primaryStops ? "stop.fill" : "arrow.up", accessibilityDescription: label)
         sendButton.toolTip = label
         sendButton.setAccessibilityLabel(label)
-        sendButton.isEnabled = canStopResident || hasDraft
-        stopButton.isHidden = !canStopResident || !hasDraft
+        sendButton.title = primaryStops && speaking ? "停止说话" : ""
+        sendButton.imagePosition = primaryStops && speaking ? .noImage : .imageOnly
+        sendButton.isEnabled = primaryStops || (hasDraft && images.canSubmit)
+        attachButton.isEnabled = !images.isPreparing && images.attachments.count < 4
+        // 独立停止按钮：只要还有可停止的对象就保留明确入口；主按钮已经是停止时
+        // 不重复显示。仅因自主生活开启的后台预算不会把主按钮变成停止。
+        stopButton.isHidden = !canStopResident || primaryStops
         stopButton.toolTip = stopLabel
         stopButton.setAccessibilityLabel(stopLabel)
+        stopButton.title = speaking ? "停止说话" : ""
+        stopButton.imagePosition = speaking ? .noImage : .imageOnly
+    }
+
+    /// 纯决策：主（发送）按钮何时表示停止。
+    ///
+    /// 只有真正在进行的人类可见回合（思考中/说话中）才让主按钮变停止；仅因自主
+    /// 生活开启的后台预算不改变主按钮语义，避免用户在空输入时点发送误停自主生活。
+    static func composerPrimaryActionStops(
+        isThinking: Bool,
+        isSpeaking: Bool,
+        hasDraft: Bool
+    ) -> Bool {
+        (isThinking || isSpeaking) && !hasDraft
     }
 
     func focusComposer() {
@@ -274,27 +447,96 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
     func closeComposer() {
         guard isComposerVisible else { return }
         composer.isHidden = true
+        updateReplyDisclosure()
         onComposerVisibilityChanged(false)
     }
 
     func showReply(_ text: String) {
+        residentStatusNotice = nil
+        residentStatusKind = .info
+        updateResidentStatusNotice()
         show(text, as: .agentReply)
     }
 
-    func showChatStatus(_ text: String) {
-        show(text, as: .chatStatus)
-    }
-
     func dismissChatStatus() {
-        guard replyPresentation == .chatStatus else { return }
-        show("", as: .chatStatus)
+        residentStatusNotice = nil
+        residentStatusKind = .info
+        updateResidentStatusNotice()
     }
 
     private func show(_ text: String, as presentation: ReplyPresentation) {
         let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        replyLabel.stringValue = normalized
-        replyBubble.isHidden = normalized.isEmpty
+        guard Self.shouldPresentReply(
+            normalized,
+            as: presentation,
+            latestText: latestReplyText,
+            latestPresentation: replyPresentation,
+            latestTurn: latestReplyTurn,
+            currentTurn: replyTurn
+        ) else { return }
+        latestReplyText = normalized
+        latestReplyTurn = replyTurn
+        // 不再按 240 字静默截断：标签自身限制 3 行并在末尾显示省略号，
+        // 完整文本始终保留在可展开的滚动视图里。
+        replyDismissed = false
         replyPresentation = normalized.isEmpty ? nil : presentation
+        updateReplyDisclosure()
+    }
+
+    /// 纯决策：同一回合内重复观察同一文本保持去重；新回合的相同回复必须重新显示。
+    static func shouldPresentReply(
+        _ text: String,
+        as presentation: ReplyPresentation,
+        latestText: String,
+        latestPresentation: ReplyPresentation?,
+        latestTurn: Int,
+        currentTurn: Int
+    ) -> Bool {
+        text != latestText || latestPresentation != presentation || latestTurn != currentTurn
+    }
+
+    /// 展开后显示的完整记录：最近对话按回合拼接；后台/自驱回复不在历史里
+    /// （或与历史最后一条不同）时单独追加，同一回合绝不重复显示。
+    private var expandedReplyContent: String {
+        let transcript = ResidentChatTranscriptLine.plainText(residentTranscriptLines)
+        guard let standalone = ResidentChatTranscriptLine.standaloneReply(
+            latestReplyText, in: residentTranscriptLines
+        ) else { return transcript }
+        return transcript.isEmpty ? standalone : transcript + "\n\n" + standalone
+    }
+
+    private func updateReplyDisclosure() {
+        let expanded = isComposerVisible
+        compactReplyHeight?.isActive = !expanded
+        expandedReplyHeight?.isActive = expanded
+        replyLabel.isHidden = expanded
+        fullReplyScroll.isHidden = !expanded
+        replyLabel.stringValue = latestReplyText
+        fullReplyText.string = expandedReplyContent
+        // 展开时以最近对话为准；收起时保持原有紧凑气泡（只显示最新回复），
+        // 不因历史里有等待中的回合就露出空气泡。
+        let hasContent = expanded ? !expandedReplyContent.isEmpty : !latestReplyText.isEmpty
+        replyBubble.isHidden = !hasContent || (!expanded && replyDismissed)
+    }
+
+    @objc private func dismissReply() {
+        replyDismissed = true
+        replyBubble.isHidden = true
+    }
+
+    @objc private func openReply(_ gesture: NSClickGestureRecognizer) {
+        guard !replyDismissButton.frame.contains(gesture.location(in: replyBubble)) else { return }
+        composer.isHidden = false
+        updateReplyDisclosure()
+        onComposerVisibilityChanged(true)
+        focusComposer()
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: NSGestureRecognizer, shouldAttemptToRecognizeWith event: NSEvent) -> Bool {
+        // A parent click recognizer otherwise delays/cancels the button's mouse
+        // tracking before openReply's later location check can protect it.
+        let point = replyDismissButton.convert(event.locationInWindow, from: nil)
+        return replyDismissButton.isHidden || !replyDismissButton.bounds.contains(point)
     }
 
     func setVoiceState(_ state: RealtimeVoiceConnectionState) {
@@ -325,11 +567,15 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
             accessibilityDescription: label
         )
         voiceButton.toolTip = label
+        let changedVoiceState = state != residentVoiceState
+        residentVoiceState = state
         switch state {
-        case .connected, .listening, .speaking:
-            dismissChatStatus()
-        case .disconnected, .connecting, .failed:
+        case .connecting:
             break
+        case .disconnected, .connected, .listening, .speaking, .failed:
+            // 语音状态已改变：「正在连接/正在听」不再成立，清掉；重复的同一状态
+            // 不清除，避免每次收音事件都闪掉 listening 提示。失败提示不受影响。
+            if changedVoiceState { dismissVoiceStatus() }
         }
     }
 
@@ -350,7 +596,7 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
         )
         configureButton(
             chatButton,
-            symbolName: "message.fill",
+            symbolName: "message",
             label: "文字聊天",
             identifier: "livecam.button.chat",
             action: #selector(toggleComposer)
@@ -364,7 +610,7 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
         )
         configureButton(
             settingsButton,
-            symbolName: "gearshape.fill",
+            symbolName: "gearshape",
             label: "设置",
             identifier: "livecam.button.settings",
             action: #selector(openSettings)
@@ -377,8 +623,11 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
         controls.addArrangedSubview(spaceButton)
         controls.addArrangedSubview(playerButton)
         controls.addArrangedSubview(chatButton)
+        controls.addArrangedSubview(mailButton)
         controls.addArrangedSubview(voiceButton)
         controls.addArrangedSubview(settingsButton)
+        configureControlSurface(mailButton)
+        mailButton.setIconStyle(pointSize: 16, color: .white)
         addSubview(controls)
 
         configureGlass(composer)
@@ -392,10 +641,42 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
         messageField.font = .systemFont(ofSize: 12)
         messageField.textColor = .white
         messageField.placeholderString = "跟 Agent 说点什么…"
+        messageField.maximumNumberOfLines = 3
+        messageField.usesSingleLineMode = false
+        messageField.cell?.wraps = true
+        messageField.cell?.isScrollable = false
+        messageField.lineBreakMode = .byWordWrapping
         messageField.target = self
         messageField.action = #selector(submitMessage)
         messageField.delegate = self
+        messageField.onPasteAttachment = { [weak self] in self?.images.paste(from: $0) ?? false }
         composer.addSubview(messageField)
+
+        configureButton(attachButton, symbolName: "plus", label: "添加图片附件", identifier: "livecam.button.attach", action: #selector(chooseImages))
+        composer.addSubview(attachButton)
+        let imageStrip = NSHostingView(rootView: ResidentAttachmentStrip(store: images))
+        imageStrip.translatesAutoresizingMaskIntoConstraints = false
+        composer.addSubview(imageStrip)
+        images.onChange = { [weak self, weak imageStrip] in
+            guard let self else { return }
+            let hasImages = !images.attachments.isEmpty || images.isPreparing || images.errorMessage != nil
+            imageStrip?.isHidden = !hasImages
+            composerHeight?.constant = hasImages ? 140 : 70
+            updateComposerActions()
+        }
+        imageStrip.isHidden = true
+        composerHeight = composer.heightAnchor.constraint(equalToConstant: 70)
+        composerHeight?.isActive = true
+        NSLayoutConstraint.activate([
+            attachButton.leadingAnchor.constraint(equalTo: composer.leadingAnchor, constant: 6),
+            attachButton.bottomAnchor.constraint(equalTo: composer.bottomAnchor, constant: -6),
+            attachButton.widthAnchor.constraint(equalToConstant: 26),
+            attachButton.heightAnchor.constraint(equalToConstant: 30),
+            imageStrip.leadingAnchor.constraint(equalTo: composer.leadingAnchor, constant: 10),
+            imageStrip.trailingAnchor.constraint(equalTo: composer.trailingAnchor, constant: -10),
+            imageStrip.topAnchor.constraint(equalTo: composer.topAnchor, constant: 7),
+            imageStrip.bottomAnchor.constraint(lessThanOrEqualTo: composer.bottomAnchor, constant: -70),
+        ])
 
         configureButton(
             sendButton,
@@ -424,22 +705,53 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
         deliveryLabel.translatesAutoresizingMaskIntoConstraints = false
         deliveryLabel.font = .systemFont(ofSize: 10)
         deliveryLabel.textColor = .systemOrange
-        deliveryLabel.maximumNumberOfLines = 2
+        deliveryLabel.maximumNumberOfLines = 0
         deliveryLabel.setAccessibilityIdentifier("livecam.resident-delivery-notice")
         deliveryNotice.addSubview(deliveryLabel)
         deliveryHeight = deliveryNotice.heightAnchor.constraint(equalToConstant: 0)
         deliveryHeight?.isActive = true
 
         configureGlass(replyBubble)
+        replyBubble.identifier = NSUserInterfaceItemIdentifier("livecam.reply-bubble")
+        replyBubble.toolTip = "点击查看最近对话"
+        let openReplyGesture = NSClickGestureRecognizer(target: self, action: #selector(openReply(_:)))
+        openReplyGesture.delegate = self
+        replyBubble.addGestureRecognizer(openReplyGesture)
         replyBubble.isHidden = true
         addSubview(replyBubble)
 
         replyLabel.translatesAutoresizingMaskIntoConstraints = false
         replyLabel.font = .systemFont(ofSize: 12)
         replyLabel.textColor = .white
-        replyLabel.maximumNumberOfLines = 4
+        replyLabel.maximumNumberOfLines = 3
         replyLabel.lineBreakMode = .byTruncatingTail
         replyBubble.addSubview(replyLabel)
+
+        configureButton(replyDismissButton, symbolName: "xmark", label: "关闭回复气泡", identifier: "livecam.reply-dismiss", action: #selector(dismissReply))
+        replyBubble.addSubview(replyDismissButton)
+        fullReplyScroll.translatesAutoresizingMaskIntoConstraints = false
+        fullReplyScroll.identifier = NSUserInterfaceItemIdentifier("livecam.full-reply")
+        fullReplyScroll.hasVerticalScroller = true
+        fullReplyScroll.drawsBackground = false
+        fullReplyText.isEditable = false
+        fullReplyText.isSelectable = true
+        fullReplyText.drawsBackground = false
+        fullReplyText.font = .systemFont(ofSize: 12)
+        fullReplyText.textColor = .white
+        fullReplyText.isVerticallyResizable = true
+        fullReplyText.isHorizontallyResizable = false
+        fullReplyText.autoresizingMask = [.width]
+        fullReplyText.textContainer?.widthTracksTextView = true
+        fullReplyScroll.documentView = fullReplyText
+        fullReplyScroll.isHidden = true
+        replyBubble.addSubview(fullReplyScroll)
+        compactReplyHeight = replyBubble.heightAnchor.constraint(lessThanOrEqualToConstant: 74)
+        compactReplyHeight?.isActive = true
+        expandedReplyHeight = replyBubble.heightAnchor.constraint(equalToConstant: 136)
+        expandedReplyHeight?.priority = .defaultHigh
+        let replyWidth = replyBubble.widthAnchor.constraint(equalToConstant: 260)
+        replyWidth.priority = .defaultHigh
+        replyWidth.isActive = true
 
         let speechErrorNotice = NSHostingView(rootView: ResidentSpeechErrorNotice())
         speechErrorNotice.sizingOptions = [.intrinsicContentSize]
@@ -447,26 +759,39 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
         speechErrorNotice.identifier = NSUserInterfaceItemIdentifier("livecam.speech-error")
         addSubview(speechErrorNotice)
 
+        let wishTaskNotice = NSHostingView(rootView: WishMachineTaskStatusView(state: wishMachineTasks, maximumHeight: 20, compact: true))
+        wishTaskNotice.sizingOptions = [.intrinsicContentSize]
+        wishTaskNotice.translatesAutoresizingMaskIntoConstraints = false
+        wishTaskNotice.identifier = NSUserInterfaceItemIdentifier("livecam.wish-tasks")
+        addSubview(wishTaskNotice)
+
         NSLayoutConstraint.activate([
             speechErrorNotice.leadingAnchor.constraint(equalTo: composer.leadingAnchor),
             speechErrorNotice.trailingAnchor.constraint(equalTo: composer.trailingAnchor),
             speechErrorNotice.bottomAnchor.constraint(equalTo: deliveryNotice.topAnchor, constant: -8),
             deliveryNotice.leadingAnchor.constraint(equalTo: composer.leadingAnchor),
             deliveryNotice.trailingAnchor.constraint(equalTo: composer.trailingAnchor),
-            deliveryNotice.bottomAnchor.constraint(equalTo: composer.topAnchor, constant: -6),
+            deliveryNotice.bottomAnchor.constraint(equalTo: wishTaskNotice.topAnchor, constant: -6),
+            wishTaskNotice.leadingAnchor.constraint(equalTo: composer.leadingAnchor),
+            wishTaskNotice.trailingAnchor.constraint(equalTo: composer.trailingAnchor),
+            wishTaskNotice.bottomAnchor.constraint(equalTo: composer.topAnchor, constant: -6),
             deliveryLabel.leadingAnchor.constraint(equalTo: deliveryNotice.leadingAnchor, constant: 8),
             deliveryLabel.trailingAnchor.constraint(equalTo: deliveryNotice.trailingAnchor, constant: -8),
             deliveryLabel.centerYAnchor.constraint(equalTo: deliveryNotice.centerYAnchor),
             controls.topAnchor.constraint(equalTo: topAnchor, constant: 10),
             controls.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             controls.widthAnchor.constraint(equalToConstant: 30),
-            controls.heightAnchor.constraint(equalToConstant: 174),
+            controls.heightAnchor.constraint(equalToConstant:
+                CGFloat(controls.arrangedSubviews.count) * 30
+                + CGFloat(controls.arrangedSubviews.count - 1) * controls.spacing),
             spaceButton.widthAnchor.constraint(equalToConstant: 30),
             spaceButton.heightAnchor.constraint(equalToConstant: 30),
             playerButton.widthAnchor.constraint(equalToConstant: 30),
             playerButton.heightAnchor.constraint(equalToConstant: 30),
             chatButton.widthAnchor.constraint(equalToConstant: 30),
             chatButton.heightAnchor.constraint(equalToConstant: 30),
+            mailButton.widthAnchor.constraint(equalToConstant: 30),
+            mailButton.heightAnchor.constraint(equalToConstant: 30),
             voiceButton.widthAnchor.constraint(equalToConstant: 30),
             voiceButton.heightAnchor.constraint(equalToConstant: 30),
             settingsButton.widthAnchor.constraint(equalToConstant: 30),
@@ -475,24 +800,34 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
             composer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             composer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             composer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
-            composer.heightAnchor.constraint(equalToConstant: 42),
-            messageField.leadingAnchor.constraint(equalTo: composer.leadingAnchor, constant: 10),
-            messageField.centerYAnchor.constraint(equalTo: composer.centerYAnchor),
+            messageField.leadingAnchor.constraint(equalTo: attachButton.trailingAnchor, constant: 6),
+            messageField.bottomAnchor.constraint(equalTo: composer.bottomAnchor, constant: -12),
+            messageField.heightAnchor.constraint(equalToConstant: 46),
             messageField.trailingAnchor.constraint(equalTo: composerActions.leadingAnchor, constant: -6),
             composerActions.trailingAnchor.constraint(equalTo: composer.trailingAnchor, constant: -6),
-            composerActions.centerYAnchor.constraint(equalTo: composer.centerYAnchor),
-            stopButton.widthAnchor.constraint(equalToConstant: 30),
+            composerActions.bottomAnchor.constraint(equalTo: composer.bottomAnchor, constant: -6),
+            stopButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 30),
             stopButton.heightAnchor.constraint(equalToConstant: 30),
-            sendButton.widthAnchor.constraint(equalToConstant: 30),
+            sendButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 30),
             sendButton.heightAnchor.constraint(equalToConstant: 30),
 
             replyBubble.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            replyBubble.trailingAnchor.constraint(equalTo: controls.leadingAnchor, constant: -8),
+            replyBubble.trailingAnchor.constraint(lessThanOrEqualTo: controls.leadingAnchor, constant: -8),
+            replyBubble.widthAnchor.constraint(lessThanOrEqualToConstant: 260),
+            replyBubble.bottomAnchor.constraint(lessThanOrEqualTo: composer.topAnchor, constant: -8),
             replyBubble.topAnchor.constraint(equalTo: topAnchor, constant: 10),
             replyLabel.leadingAnchor.constraint(equalTo: replyBubble.leadingAnchor, constant: 10),
-            replyLabel.trailingAnchor.constraint(equalTo: replyBubble.trailingAnchor, constant: -10),
+            replyLabel.trailingAnchor.constraint(equalTo: replyDismissButton.leadingAnchor, constant: -5),
             replyLabel.topAnchor.constraint(equalTo: replyBubble.topAnchor, constant: 8),
             replyLabel.bottomAnchor.constraint(equalTo: replyBubble.bottomAnchor, constant: -8),
+            replyDismissButton.topAnchor.constraint(equalTo: replyBubble.topAnchor, constant: 5),
+            replyDismissButton.trailingAnchor.constraint(equalTo: replyBubble.trailingAnchor, constant: -5),
+            replyDismissButton.widthAnchor.constraint(equalToConstant: 20),
+            replyDismissButton.heightAnchor.constraint(equalToConstant: 20),
+            fullReplyScroll.topAnchor.constraint(equalTo: replyDismissButton.bottomAnchor, constant: 2),
+            fullReplyScroll.leadingAnchor.constraint(equalTo: replyBubble.leadingAnchor, constant: 8),
+            fullReplyScroll.trailingAnchor.constraint(equalTo: replyBubble.trailingAnchor, constant: -8),
+            fullReplyScroll.bottomAnchor.constraint(equalTo: replyBubble.bottomAnchor, constant: -8),
         ])
     }
 
@@ -510,15 +845,22 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
             accessibilityDescription: label
         )
         button.imagePosition = .imageOnly
+        button.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 16, weight: .regular)
         button.contentTintColor = .white
         button.toolTip = label
         button.setAccessibilityIdentifier(identifier)
         button.setAccessibilityLabel(label)
         button.target = self
         button.action = action
-        button.wantsLayer = true
-        button.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.45).cgColor
-        button.layer?.cornerRadius = 15
+        configureControlSurface(button)
+    }
+
+    private func configureControlSurface(_ view: NSView) {
+        view.wantsLayer = true
+        view.layer?.backgroundColor = NSColor(white: 0.12, alpha: 0.94).cgColor
+        view.layer?.cornerRadius = 15
+        view.layer?.borderWidth = 1
+        view.layer?.borderColor = NSColor.white.withAlphaComponent(0.18).cgColor
     }
 
     private func configureGlass(_ view: NSVisualEffectView) {
@@ -649,6 +991,7 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
     @objc
     private func toggleComposer() {
         composer.isHidden.toggle()
+        updateReplyDisclosure()
         let isVisible = !composer.isHidden
         onComposerVisibilityChanged(isVisible)
         if isVisible {
@@ -657,14 +1000,32 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
     }
 
     @objc
+    private func chooseImages() { images.chooseImages() }
+
+    func restoreSubmission(_ submission: ResidentChatSubmission) {
+        let recovered = recovery.restore(submission, text: messageField.stringValue, attachments: images.attachments)
+        messageField.stringValue = recovered.text
+        images.restore(recovered.attachments)
+        composer.isHidden = false
+        updateReplyDisclosure()
+        onComposerVisibilityChanged(true)
+        updateComposerActions()
+    }
+
+    @objc
     private func submitMessage() {
+        guard ResidentTextInputPolicy.shouldSubmit(
+            isComposing: messageField.isComposingText
+        ) else { return }
         let message = messageField.stringValue
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !message.isEmpty else { return }
+        guard images.canSubmit, !message.isEmpty || !images.attachments.isEmpty else { return }
+        let submission = ResidentChatSubmission(text: message, attachments: images.takeAttachments())
         messageField.stringValue = ""
+        recovery = ResidentDraftRecovery()
         setResidentThinking(true)
         closeComposer()
-        onSendMessage(message)
+        onSendMessage(submission)
     }
 
     @objc
@@ -675,6 +1036,10 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate {
 
     @objc
     private func stopResident() {
+        if AgentSpeechStatusStore.shared.isSpeaking {
+            AgentSpeechStatusStore.shared.stopSpeaking()
+            return
+        }
         setResidentThinking(false)
         onCancelMessage()
     }
@@ -740,7 +1105,7 @@ final class LiveCamPanel: NSPanel {
         playerMenuSnapshotProvider: @escaping @MainActor () -> LiveCamPlayerMenuSnapshot = {
             .noProgram
         },
-        onSendMessage: @escaping @MainActor (String) -> Void = { _ in },
+        onSendMessage: @escaping @MainActor (ResidentChatSubmission) -> Void = { _ in },
         onToggleVoice: @escaping @MainActor () -> Void = {}
     ) {
         self.onEnterSpace = onEnterSpace
@@ -771,10 +1136,20 @@ final class LiveCamPanel: NSPanel {
         apertureView.onEnterSpace = { [weak self] in
             self?.requestEnterSpace()
         }
+        interactionView.setEnterSpaceHandler { [weak self] in
+            self?.requestEnterSpace()
+        }
 
         contentMinSize = frame.size
         contentMaxSize = frame.size
         self.contentView = apertureView
+        // NSHostingView can propagate its fitting size through the overlay and
+        // shrink this borderless window despite contentMinSize/contentMaxSize.
+        // The portal owns its viewport; chat content must fit inside it.
+        NSLayoutConstraint.activate([
+            apertureView.widthAnchor.constraint(equalToConstant: frame.width),
+            apertureView.heightAnchor.constraint(equalToConstant: frame.height),
+        ])
         backgroundColor = .clear
         isOpaque = false
         hasShadow = false
@@ -828,7 +1203,7 @@ final class LiveCamPanel: NSPanel {
     }
 
     func setSendMessageHandler(
-        _ handler: @escaping @MainActor (String) -> Void
+        _ handler: @escaping @MainActor (ResidentChatSubmission) -> Void
     ) {
         interactionView.setSendMessageHandler(handler)
     }
@@ -847,12 +1222,20 @@ final class LiveCamPanel: NSPanel {
         interactionView.setResidentThinking(thinking)
     }
 
+    func setResidentProgress(_ text: String?) {
+        interactionView.setResidentProgress(text)
+    }
+
     func setResidentCanStop(_ canStop: Bool) {
         interactionView.setResidentCanStop(canStop)
     }
 
     func setResidentDeliveryNotice(_ text: String?) {
         interactionView.setResidentDeliveryNotice(text)
+    }
+
+    func setResidentTranscript(_ lines: [ResidentChatTranscriptLine]) {
+        interactionView.setResidentTranscript(lines)
     }
 
     func showAgentReply(_ text: String) {
@@ -862,6 +1245,20 @@ final class LiveCamPanel: NSPanel {
     func showChatStatus(_ text: String) {
         interactionView.showChatStatus(text)
     }
+
+    func showVoiceStatus(_ text: String) {
+        interactionView.showVoiceStatus(text)
+    }
+
+    func showFailureStatus(_ text: String) {
+        interactionView.showFailureStatus(text)
+    }
+
+    func clearTransientStatus() {
+        interactionView.clearTransientStatus()
+    }
+
+    var residentStatusText: String? { interactionView.residentStatusText }
 
     func setVoiceState(_ state: RealtimeVoiceConnectionState) {
         interactionView.setVoiceState(state)
@@ -883,7 +1280,7 @@ final class LiveCamPanel: NSPanel {
 }
 
 @MainActor
-final class LiveCamApertureView: NSView {
+final class LiveCamApertureView: NSView, NSGestureRecognizerDelegate {
     var apertureMask: LiveCamApertureMask {
         didSet {
             updateAperturePath()
@@ -931,6 +1328,7 @@ final class LiveCamApertureView: NSView {
             action: #selector(handleMove(_:))
         )
         moveRecognizer.buttonMask = LiveCamPointerBinding.moveWindow.buttonMasks[0]
+        moveRecognizer.delegate = self
         addGestureRecognizer(moveRecognizer)
         updateAperturePath()
     }
@@ -960,6 +1358,13 @@ final class LiveCamApertureView: NSView {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
         true
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: NSGestureRecognizer, shouldAttemptToRecognizeWith event: NSEvent) -> Bool {
+        // Dragging the resident moves the window; interacting with its controls
+        // must keep the native button/text/scroll event stream intact.
+        let point = convert(event.locationInWindow, from: nil)
+        return interactionView.hitTest(point) == nil
     }
 
     override func mouseDown(with event: NSEvent) {

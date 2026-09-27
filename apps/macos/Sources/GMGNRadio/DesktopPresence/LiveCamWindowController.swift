@@ -16,7 +16,7 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
     private let defaults: UserDefaults
     private let surfaceContainer = NSView()
     private var onEnterSpace: @MainActor () -> Void
-    private var onSendMessage: @MainActor (String) async throws -> Void
+    private var onSendMessage: @MainActor (ResidentChatSubmission) async throws -> Void
     private var onCancelMessage: @MainActor () -> Void
     private var messageRevision: UInt64 = 0
     private var onToggleVoice: @MainActor () -> Void
@@ -46,7 +46,7 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
         playerMenuSnapshotProvider: @escaping @MainActor () -> LiveCamPlayerMenuSnapshot = {
             .noProgram
         },
-        onSendMessage: @escaping @MainActor (String) async throws -> Void = { _ in },
+        onSendMessage: @escaping @MainActor (ResidentChatSubmission) async throws -> Void = { _ in },
         onCancelMessage: @escaping @MainActor () -> Void = {},
         onToggleVoice: @escaping @MainActor () -> Void = {}
     ) {
@@ -184,11 +184,29 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
     func beginAgentReply() {
         agentReplyBuffer = ""
         setResidentThinking(true)
-        (window as? LiveCamPanel)?.showAgentReply("…")
+        setResidentProgress("等待居民回应…")
     }
 
     func setResidentThinking(_ thinking: Bool) {
         (window as? LiveCamPanel)?.setResidentThinking(thinking)
+    }
+
+    func setResidentProgress(_ text: String?) {
+        (window as? LiveCamPanel)?.setResidentProgress(text)
+    }
+
+    func setWishMachineTasks(_ tasks: [WishMachineTaskPresentation]) {
+        (window as? LiveCamPanel)?.interactionView.setWishMachineTasks(tasks)
+    }
+
+    func setSystemInboxHandler(
+        _ handler: @escaping @MainActor () -> Void
+    ) {
+        (window as? LiveCamPanel)?.interactionView.setSystemInboxHandler(handler)
+    }
+
+    func setSystemInboxUnread(_ count: Int) {
+        (window as? LiveCamPanel)?.interactionView.setSystemInboxUnread(count)
     }
 
     func setResidentCanStop(_ canStop: Bool) {
@@ -197,6 +215,10 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
 
     func setResidentDeliveryNotice(_ text: String?) {
         (window as? LiveCamPanel)?.setResidentDeliveryNotice(text)
+    }
+
+    func setResidentTranscript(_ lines: [ResidentChatTranscriptLine]) {
+        (window as? LiveCamPanel)?.setResidentTranscript(lines)
     }
 
     func appendAgentReply(_ delta: String) {
@@ -215,6 +237,29 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
 
     func showChatStatus(_ text: String) {
         (window as? LiveCamPanel)?.showChatStatus(text)
+    }
+
+    func showVoiceStatus(_ text: String) {
+        (window as? LiveCamPanel)?.showVoiceStatus(text)
+    }
+
+    func showFailureStatus(_ text: String) {
+        (window as? LiveCamPanel)?.showFailureStatus(text)
+    }
+
+    func clearTransientStatus() {
+        (window as? LiveCamPanel)?.clearTransientStatus()
+    }
+
+    var residentStatusText: String? {
+        (window as? LiveCamPanel)?.residentStatusText
+    }
+
+    func restoreResidentSubmission(_ submission: ResidentChatSubmission, notice: String) {
+        guard let panel = window as? LiveCamPanel else { return }
+        panel.interactionView.restoreSubmission(submission)
+        // 失败回填是失败提示，不能被下一条普通应用信息（点唱机/语音等）盖掉。
+        panel.showFailureStatus(notice + "\n文字和图片已保留。")
     }
 
     private func rotateCamera(by translation: CGSize) {
@@ -311,19 +356,19 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
         )
     }
 
-    private func sendMessage(_ message: String) {
+    private func sendMessage(_ message: ResidentChatSubmission) {
         messageRevision &+= 1
         let revision = messageRevision
         setResidentThinking(true)
-        showChatStatus("…")
         Task { [weak self] in
             guard let self else { return }
             do {
                 try await onSendMessage(message)
             } catch {
                 guard revision == messageRevision else { return }
+                (window as? LiveCamPanel)?.interactionView.restoreSubmission(message)
                 setResidentThinking(false)
-                showChatStatus(
+                showFailureStatus(
                     (error as? LocalizedError)?.errorDescription
                         ?? "消息发送失败，请稍后再试。"
                 )

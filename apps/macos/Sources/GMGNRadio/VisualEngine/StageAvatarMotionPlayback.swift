@@ -74,15 +74,19 @@ enum StageAvatarResolvedMotion: Equatable, Sendable {
 
     static func resolve(
         selectedMotion: StageMotionAsset?,
-        worldPlayback: StageAvatarMotionPlayback?
+        worldPlayback: StageAvatarMotionPlayback?,
+        residentThinkingMotion: StageMotionAsset? = nil,
+        heldDisplayMotion: StageMotionAsset? = nil,
+        naturalIdleMotion: StageMotionAsset? = nil
     ) -> StageAvatarResolvedMotion {
         switch worldPlayback {
         case let .temporary(motion):
             return .asset(motion)
         case .naturalIdle(fallback: .some):
-            return .naturalIdle
+            return naturalIdleMotion.map(Self.asset) ?? .naturalIdle
         case .naturalIdle(fallback: nil), nil:
-            return selectedMotion.map(Self.asset) ?? .naturalIdle
+            return (heldDisplayMotion ?? residentThinkingMotion ?? selectedMotion ?? naturalIdleMotion)
+                .map(Self.asset) ?? .naturalIdle
         }
     }
 }

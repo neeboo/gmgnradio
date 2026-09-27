@@ -938,17 +938,20 @@ enum PMXAnimatedGrounding {
 }
 
 enum PMXFullStageGroundingPolicy {
-    /// Root-locked choreography already owns the body's vertical pose. Feeding
-    /// an asynchronously sampled presentation-tree sole height back into the
-    /// next frame translates the whole model and can make it alternate above
-    /// and below its authored world Y. Dynamic compensation is only valid when
-    /// root motion is intentionally enabled.
+    /// `preparedMotion` preserves every authored root-translation axis regardless
+    /// of `rootMotionEnabled`, so the full-stage framing anchors the *rest* sole at
+    /// the placement Y while the clip carries its own vertical displacement.
+    ///
+    /// Root motion enabled keeps the full signed compensation. Otherwise apply a
+    /// one-sided lift: remove floor penetration (animated sole or root below rest)
+    /// but never lower the model, so authored jumps, floats and root rises stay
+    /// untouched and the model cannot oscillate below its authored world Y.
     static func offset(
         rootMotionEnabled: Bool,
         animatedOffset: Float
     ) -> Float {
-        guard rootMotionEnabled, animatedOffset.isFinite else { return 0 }
-        return animatedOffset
+        guard animatedOffset.isFinite else { return 0 }
+        return rootMotionEnabled ? animatedOffset : max(0, animatedOffset)
     }
 }
 
@@ -1619,6 +1622,12 @@ public final class PMXStageAvatarRenderer {
     public private(set) var localBounds: PMXAvatarBounds?
     public private(set) var loadedModelURL: URL?
     public private(set) var loadedMotionURL: URL?
+    /// Locomotion gait of the currently loaded motion; nil unless the motion is
+    /// an in-place locomotion loop with authored stride metadata.
+    public private(set) var loadedLocomotionGait: StageLocomotionGait?
+    /// Measured horizontal ground speed (m/s) fed by the world host each frame
+    /// while the avatar walks. Nil keeps the authored playback rate untouched.
+    public var locomotionMeasuredSpeed: Float?
     public private(set) var isUsingNaturalIdle = false
     public private(set) var localGroundingOffsetY: Float = 0
     public private(set) var animatedRootOffset = SIMD3<Float>.zero
@@ -1793,6 +1802,34 @@ public final class PMXStageAvatarRenderer {
 
     var isCoffeeMachineVisible: Bool {
         !worldPropContainerNode.isHidden
+    }
+
+    func validateAttachmentPoint(_ point: PropAttachmentPoint) throws {
+        guard let modelNode, PMXMaterialCompatibility.isRaw2BModel(modelNode)
+        else { throw PropAttachmentError.unsupportedAvatar }
+        guard point.boneNameCandidates.contains(where: {
+            modelNode.childNode(withName: $0, recursively: true) != nil
+        }) else {
+            throw PropAttachmentError.missingHandBone
+        }
+    }
+
+    /// Called after SceneKit encoded the current avatar frame. Presentation
+    /// nodes contain the evaluated VMD pose for that same frame.
+    func evaluatedAttachmentPose(
+        for point: PropAttachmentPoint
+    ) throws -> simd_float4x4 {
+        try validateAttachmentPoint(point)
+        guard let modelNode,
+              let bone = point.boneNameCandidates.lazy.compactMap({
+                  modelNode.childNode(withName: $0, recursively: true)
+              }).first
+        else {
+            throw PropAttachmentError.missingHandBone
+        }
+        return try PropAttachmentPose.orthonormalized(
+            bone.presentation.simdWorldTransform
+        )
     }
 
     func setCoffeeCupVisible(_ isVisible: Bool) {
@@ -1992,88 +2029,10 @@ public final class PMXStageAvatarRenderer {
     public static func naturalIdleMotion(
         for model: MMDNode
     ) -> CAAnimationGroup {
-        if PMXMaterialCompatibility.isRaw2BModel(model) {
-            return raw2BNaturalIdleMotion(for: model)
-        }
-        var tracks: [CAAnimation] = []
-        if let leftArm = firstBone(
-            in: model,
-            named: ["左腕", "左上腕", "leftarm", "leftupperarm"]
-        ) {
-            tracks.append(
-                naturalIdleTrack(
-                    for: leftArm,
-                    relaxationAngle: -0.72,
-                    breathingAngle: 0.014,
-                    axis: SIMD3<Float>(0, 0, 1)
-                )
-            )
-        }
-        if let rightArm = firstBone(
-            in: model,
-            named: ["右腕", "右上腕", "rightarm", "rightupperarm"]
-        ) {
-            tracks.append(
-                naturalIdleTrack(
-                    for: rightArm,
-                    relaxationAngle: 0.72,
-                    breathingAngle: -0.014,
-                    axis: SIMD3<Float>(0, 0, 1)
-                )
-            )
-        }
-        if let chest = firstBone(
-            in: model,
-            named: [
-                "上半身2",
-                "上半身",
-                "胸",
-                "upperbody2",
-                "upperbody",
-                "chest",
-                "spine",
-            ]
-        ) {
-            tracks.append(
-                naturalIdleTrack(
-                    for: chest,
-                    relaxationAngle: -0.008,
-                    breathingAngle: 0.018,
-                    axis: SIMD3<Float>(1, 0, 0)
-                )
-            )
-        }
-        if let head = firstBone(
-            in: model,
-            named: ["頭", "head"]
-        ) {
-            tracks.append(
-                naturalIdleTrack(
-                    for: head,
-                    relaxationAngle: 0,
-                    breathingAngle: 0.018,
-                    axis: SIMD3<Float>(0, 0, 1)
-                )
-            )
-        }
-
         let group = CAAnimationGroup()
-        group.animations = tracks
-        group.duration = naturalIdleDuration
-        group.repeatCount = .infinity
-        group.usesSceneTimeBase = false
-        group.isRemovedOnCompletion = false
-        group.fillMode = .forwards
-        return group
-    }
-
-    private static func raw2BNaturalIdleMotion(
-        for model: MMDNode
-    ) -> CAAnimationGroup {
-        let group = CAAnimationGroup()
-        // The anonymous 2B rig has exporter-specific bone axes. Its safe idle
-        // is the authored PMX bind pose; generic rotations deform the complete
-        // child chain before any user-selected motion begins.
+        // BONES supplies the visible idle clip through the runtime resolver.
+        // With no available clip, retain the model's rest pose; never invent
+        // breathing or arm keyframes as a replacement motion.
         group.animations = []
         group.duration = naturalIdleDuration
         group.repeatCount = .infinity
@@ -2134,7 +2093,8 @@ public final class PMXStageAvatarRenderer {
         from url: URL,
         repeats: Bool = true,
         playbackRate: Float = 1,
-        inPlace: Bool = false
+        inPlace: Bool = false,
+        locomotion: StageLocomotionGait? = nil
     ) throws {
         guard let modelNode else {
             throw LoadError.modelNotLoaded
@@ -2147,7 +2107,8 @@ public final class PMXStageAvatarRenderer {
             from: url,
             repeats: repeats,
             playbackRate: playbackRate,
-            inPlace: inPlace
+            inPlace: inPlace,
+            locomotion: locomotion
         )
     }
 
@@ -2155,7 +2116,8 @@ public final class PMXStageAvatarRenderer {
         from url: URL,
         repeats: Bool = true,
         playbackRate: Float = 1,
-        inPlace: Bool = false
+        inPlace: Bool = false,
+        locomotion: StageLocomotionGait? = nil
     ) async throws {
         try Task.checkCancellation()
         guard let targetModel = modelNode else {
@@ -2173,7 +2135,8 @@ public final class PMXStageAvatarRenderer {
             from: url,
             repeats: repeats,
             playbackRate: playbackRate,
-            inPlace: inPlace
+            inPlace: inPlace,
+            locomotion: locomotion
         )
     }
 
@@ -2238,6 +2201,8 @@ public final class PMXStageAvatarRenderer {
         animatedRootOffset = .zero
         loadedModelURL = url
         loadedMotionURL = nil
+        loadedLocomotionGait = nil
+        locomotionMeasuredSpeed = nil
         installNaturalIdle(on: model)
     }
 
@@ -2254,7 +2219,8 @@ public final class PMXStageAvatarRenderer {
         from url: URL,
         repeats: Bool,
         playbackRate: Float,
-        inPlace: Bool
+        inPlace: Bool,
+        locomotion: StageLocomotionGait?
     ) {
         // SceneKit animation players use this renderer's local scene clock.
         // A motion attached after the avatar has already been rendered must
@@ -2286,7 +2252,12 @@ public final class PMXStageAvatarRenderer {
             repeats: repeats
         )
         loadedMotionURL = url
+        loadedLocomotionGait = locomotion
         isUsingNaturalIdle = false
+        // A new clip must start from zero compensation. Otherwise the previous
+        // clip's sampled sole offset is applied to this clip's first frames, which
+        // shows up as a one-frame vertical jump or fresh floor penetration.
+        localGroundingOffsetY = 0
         let probeBone = ["左ひざ", "右ひざ", "左腕", "右腕"].lazy
             .compactMap { modelNode.childNode(withName: $0, recursively: true) }
             .first
@@ -2305,6 +2276,8 @@ public final class PMXStageAvatarRenderer {
     public func clearMotion() {
         modelNode?.removeAnimation(forKey: Self.motionKey, blendOutDuration: 0)
         loadedMotionURL = nil
+        loadedLocomotionGait = nil
+        locomotionMeasuredSpeed = nil
         oneShotMotionPlayback = nil
         localGroundingOffsetY = 0
         renderTimeline.restartAnimationClock()
@@ -2356,6 +2329,7 @@ public final class PMXStageAvatarRenderer {
         sceneRenderer.sceneTime = localTime
         updateRaw2BFootIKTargets()
         updateCoffeeCupAttachment()
+        updateLocomotionPlaybackRate()
         sceneRenderer.render(
             atTime: localTime,
             viewport: CGRect(
@@ -2405,6 +2379,41 @@ public final class PMXStageAvatarRenderer {
         }
     }
 
+    /// Retimes the loaded locomotion motion against the measured ground speed
+    /// each frame. Only changes the CAAnimation player's speed (0 freezes the
+    /// pose without restarting it), so playback phase stays continuous. A nil
+    /// measured speed or a non-locomotion motion leaves the authored rate.
+    private func updateLocomotionPlaybackRate() {
+        guard let gait = loadedLocomotionGait,
+              let measured = locomotionMeasuredSpeed,
+              measured.isFinite,
+              let player = modelNode?.animationPlayer(
+                  forKey: Self.motionKey
+              )
+        else { return }
+        let rate = gait.playbackRate(forGroundSpeed: measured)
+        let clamped = min(max(rate, 0), StageLocomotionGait.maximumRate)
+        if abs(player.speed - CGFloat(clamped)) > 0.005 {
+            player.speed = CGFloat(clamped)
+        }
+    }
+
+    /// Resolves the gait for a PMX/VMD locomotion motion. VMD carries no
+    /// source-rig hips metadata, so the correction uses only the manifest
+    /// stride contract (the PMX bootstrap compatibility when absent); the
+    /// height ratio is left at 1 rather than inventing a source scale.
+    static func locomotionGait(
+        for motion: StageMotionAsset
+    ) -> StageLocomotionGait? {
+        guard motion.isLocomotionLoop, let strideSpeed = motion.strideSpeed
+        else { return nil }
+        return StageLocomotionGait(
+            authoredStepSpeed: strideSpeed,
+            sourceHipsHeight: nil,
+            targetHipsHeight: nil
+        )
+    }
+
     private func updateAnimatedRootOffset() {
         guard let modelNode,
               let trackingRootBone
@@ -2451,10 +2460,15 @@ public final class PMXStageAvatarRenderer {
             localGroundingOffsetY = 0
             return
         }
-        localGroundingOffsetY = PMXAnimatedGrounding.localOffsetY(
+        let soleOffset = PMXAnimatedGrounding.localOffsetY(
             restFootReferenceY: restFootReferenceY,
             animatedFootReferenceY: animatedFootReferenceY
         )
+        // A downward root/center translation can bury the torso while the sole band
+        // is still near the floor, so include it before the one-sided policy runs.
+        // Root rises and lifted feet stay excluded because both terms are negative.
+        let rootDrop = -animatedRootOffset.y
+        localGroundingOffsetY = max(soleOffset, rootDrop)
     }
 
     private static func footReferenceY(
@@ -2544,46 +2558,6 @@ public final class PMXStageAvatarRenderer {
             }
         }
         return match
-    }
-
-    private static func naturalIdleTrack(
-        for bone: SCNNode,
-        relaxationAngle: Float,
-        breathingAngle: Float,
-        axis: SIMD3<Float>
-    ) -> CAKeyframeAnimation {
-        let restOrientation = bone.simdOrientation
-        let angles = [
-            relaxationAngle - breathingAngle,
-            relaxationAngle + breathingAngle,
-            relaxationAngle - breathingAngle,
-        ]
-        let values = angles.map { angle -> NSValue in
-            let orientation = restOrientation
-                * simd_quatf(angle: angle, axis: axis)
-            return NSValue(
-                scnVector4: SCNVector4(
-                    orientation.vector.x,
-                    orientation.vector.y,
-                    orientation.vector.z,
-                    orientation.vector.w
-                )
-            )
-        }
-        let track = CAKeyframeAnimation(
-            keyPath: "/\(bone.name ?? "").transform.quaternion"
-        )
-        track.values = values
-        track.keyTimes = [0, 0.5, 1]
-        track.timingFunctions = [
-            CAMediaTimingFunction(name: .easeInEaseOut),
-            CAMediaTimingFunction(name: .easeInEaseOut),
-        ]
-        track.duration = naturalIdleDuration
-        track.usesSceneTimeBase = false
-        track.isRemovedOnCompletion = false
-        track.fillMode = .forwards
-        return track
     }
 
     private static func canonicalFileURL(_ url: URL) -> URL {

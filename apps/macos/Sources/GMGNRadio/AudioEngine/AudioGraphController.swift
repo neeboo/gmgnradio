@@ -515,6 +515,8 @@ final class AudioGraphController: LocalMusicPlaybackGraph {
     private let programMixer = AVAudioMixerNode()
     private let visualBridge: PlaybackVisualFeatureBridge
     private let duckingController: MixerDuckingController
+    private var djIsSpeaking = false
+    private var residentSpeechPlaying = false
     private let completionDispatcher = AudioGraphCompletionDispatcher()
     private let djVoiceDrainTracker = DJVoiceDrainTracker()
     private var currentFile: AVAudioFile?
@@ -682,11 +684,19 @@ final class AudioGraphController: LocalMusicPlaybackGraph {
         visualBridge.reset()
         if resetDucking {
             duckingController.reset()
+            duckingController.setDJSpeaking(djIsSpeaking || residentSpeechPlaying)
         }
     }
 
     func setDJSpeaking(_ speaking: Bool) {
-        duckingController.setDJSpeaking(speaking)
+        djIsSpeaking = speaking
+        duckingController.setDJSpeaking(djIsSpeaking || residentSpeechPlaying)
+    }
+
+    func setResidentSpeechPlaying(_ playing: Bool) {
+        guard residentSpeechPlaying != playing else { return }
+        residentSpeechPlaying = playing
+        duckingController.setDJSpeaking(djIsSpeaking || residentSpeechPlaying)
     }
 
     func stopDJVoice() {
@@ -816,6 +826,7 @@ final class AudioGraphController: LocalMusicPlaybackGraph {
             duckingController.configure(
                 sampleRate: programMixer.outputFormat(forBus: 0).sampleRate
             )
+            duckingController.setDJSpeaking(djIsSpeaking || residentSpeechPlaying)
             engine.prepare()
             try engine.start()
             if shouldResume {
