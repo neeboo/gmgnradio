@@ -1,136 +1,209 @@
-# P2 设计：装修可玩性（摆放面派生）
+# P2 设计：装修可玩性（Sims 式格子摆放）
 
-日期：2026-09-27
-状态：设计待实施
+日期：2026-09-27（修订）
+状态：待实施
 上游：`docs/plans/2026-09-27-space-first-plan.md` 的 P2
 前置：P0（仓库止血）与 P1（默认呈现面）已完成并推送
 
-## 1. 问题
+## 0. 标准
 
-"让大家把装修搞起来"卡在三个具体的地方，全部已核实：
+> **要像 The Sims 那样才算 OK。**
+
+具体是这五条，后文全部围绕它们：
+
+1. **进建造模式 → 整个房间浮出格子**，不是几个画好的小方块。
+2. **不限件数**。你能放多少由房间和你的耐心决定，不由渲染预算决定。
+3. **鼠标直接指着放**：悬停高亮、绿/红判定、吸附到格、一键旋转。
+4. **格子被墙和家具正确遮挡**，不是浮在画面最上层。
+5. **退出重进，东西还在原处。**
+
+## 1. 问题（已核实）
 
 | # | 卡点 | 证据 |
 | --- | --- | --- |
-| 1 | 同时只能摆 **4 件** | `WorldSimulation.swift:142` 与 `:175` 两处 `guard count < 4 else { throw WorldPropLayoutError.visibleLimit }` |
-| 2 | 只有 **2 个手写摆放面**，且写死在这间屋子 | `ResidentPropPlacementConfiguration.swift`：`resident.floor`（中心 `(-2.6,-0.03,-3)`，半尺寸 `(0.4,0,0.5)` = 0.8 m × 1.0 m）与 `resident.display_table`。注释自陈 "verified against this cabin's shipped collider" |
-| 3 | 摆放面被哈希锁进导航烘焙门禁 | `build-package.mjs:69` 对 `ResidentPropPlacementConfiguration.swift` 取 SHA-256 写入 `navigation.source`，`:72` 不匹配即抛 "Baked navigation is stale" |
+| 1 | 同时只能摆 **4 件** | `WorldSimulation.swift:142`、`:175`；`ResidentPropPlacementService.swift:144`；**另有 2 处静默截断**：`ResidentPropRenderer.swift:53`（`removeLast()`）、`WishMachineOutputDescriptor.swift:49`（`.prefix(4)`） |
+| 2 | 只有 **2 个手写摆放面**，写死在这间屋子 | `ResidentPropPlacementConfiguration.swift`：`resident.floor`（0.8 m × 1.0 m）与 `resident.display_table` |
+| 3 | 摆放面被哈希锁进导航烘焙门禁 | `build-package.mjs:69` 对该 Swift 文件取 SHA-256 写入 `navigation.source`，`:72` 不匹配即 "Baked navigation is stale" |
 
-第 3 条的因果是**反的**，这是本设计的核心：
+**这不是技术限制，是刻意的范围缩小。** 出处：`todos/002-ready-p2-generated-prop-placement.md:29`
 
-```text
-手写摆放面  ──是──▶  导航烘焙的【输入】
-                    （cabinSupportReservationIntersects 在面周围预留 0.25 / 0.30 m 净空，
-                      让 waypoint 不生成在摆放区里）
-```
+> "**先批准一块地面和一张独立展示台**……**至多四件同时摆出**，其他留在物件库。手持、网页、交易和**完整装修不在本批范围**。"
 
-所以"改摆放面 → 导航失效"不是官僚主义，是**真实的依赖**。自由装修要求摆放面不是手写常量。
+那一批的目的是跑通"生成 → 领取 → 摆放 → 存档"链路。P2 就是那句**完整装修**。
 
-## 2. 当前模型的完整形状（已核实）
+**差距**：房间地面 13.5 m × 23.0 m = **310 m²**；可站立格点 2,421 个 ≈ 605 m²（含桌面、多层）；当前可放 **1.39 m² = 0.23%**。
 
-**摆放校验**（`ResidentPropPlacementService`，213 行）依次判：
+## 2. 几何事实
 
-1. `unknownSurface` / `outsideSurface` — 必须落在某个手写面内；
-2. `collision(name)` — 不撞居民或其它物件；
-3. `blockedRoute(name)` — **不挡活动入口或通道**；
-4. 手持另有 `avatarUnavailable` / `attachmentUnsupported` / `propTooLarge`（>45 cm 只能摆放）等。
+| 事实 | 值 | 来源 |
+| --- | --- | --- |
+| 房间地面范围 | 13.5 m × 23.0 m | `layout.json` → `navigation.report.groundBounds` |
+| 可站立格点 | 2,421（0.5 m 间距） | 同上 |
+| 碰撞网格 | 161,600 三角形 | `MarbleLivingCabinPackageTests` 实测 |
+| 被拒格点 | `capsuleCollision` 104、`meshTraversal` 69、`combinedTraversal` 61、`stepHeight` 15、`supportReservation` 3、`missingGround` 1 | `report.rejectedEdges` |
 
-**几何能力已经具备**（不需要新建）：
+## 3. 三个决定
 
-- `WorldRuntime` 已有 `TriangleMeshCollisionWorld`（483 行）、`GLBColliderDecoder`（446 行）、`CollisionVolumeWorld`（236 行）、`ReplaceableCollisionWorld`（43 行）、`WorldGeometry`（111 行）。
-- `tools/navigation/LivingCabinNavigation.swift` 已在用同一套原语做格子扫描：`report.surfaceCandidates = 2421`、`blockedCandidates = 729`、`supportReservedCandidates`，以及 `cabinSupportReservationIntersects`。
+### 决定 1：物件不阻挡通行，但放置不得切断连通性
 
-**关键区分**：烘焙器的 `surfaceCandidates` 判据是"**胶囊能否站立**"（`physics.canOccupy(capsule, at:)`），**不是**"物件能否放置"。两者共用同一套几何原语，但判定条件不同（承托面积、物件包围盒、净空高度）。所以这是**复用原语、新增判据**，不是新建能力。
-
-## 3. 目标模型
-
-摆放面从**碰撞几何在运行时派生**，不再手写、不再作为手写文件参与门禁。
-
-```text
-collider.glb ──▶ TriangleMeshCollisionWorld
-                      │
-                      ├─▶ （既有）导航烘焙：胶囊可站立 ──▶ waypoints/routes
-                      │
-                      └─▶ （新增）PropSupportGrid：可承托 + 净空 + 不撞阻挡体积
-                                     │
-                                     └─▶ 用户选格 + 面内偏移 + 旋转
-```
-
-派生输出 `PropSupportGrid`：每个格子记录承托高度层（一列可能有多层：地面、桌面、台阶）、该层的可用净空、以及是否允许放置。
-
-**派生放在 `WorldRuntime`**（保持 Foundation-only），因此可以离线单测，且烘焙器能复用同一实现 —— 这一点很重要，见 §4 取舍 3。
-
-## 4. 三个必须现在决定的取舍
-
-### 取舍 1：物件是否阻挡导航？
-
-这在今天已经是**真实约束**（`blockedRoute`），自由摆放会让它变尖锐：20 件物件可以把点唱机围死。
+今天已经是**半约束**（`blockedRoute`）。放开后会变尖锐：物件多了能把点唱机围死。
 
 | 方案 | 代价 |
 | --- | --- |
-| (a) 物件成为导航障碍，运行时重规划 | 每摆一件都可能让既有权图失效；路径重算成本随物件数增长 |
-| (b) 物件**不阻挡通行**，但放置时**禁止切断连通性** | 需要一个可达性检查；不需要重烘焙 |
-| (c) 完全不管 | 用户能把居民关在外面，且看起来像 bug |
+| (a) 物件成为导航障碍 | 每放一件都要重算走路地图；放置时卡顿 |
+| **(b) 物件不阻挡通行，但放置时禁止切断活动入口连通性** | 只需一次可达性检查；不重烘焙 |
+| (c) 完全不管 | 用户能把角色关在外面，像 bug |
 
-**建议 (b)。** 理由：保留"不许把点唱机围死"这条用户能理解的约束，又不需要重烘焙；而连通性检查可以由已有的 `WaypointNavigationGraph`（309 行，含 `route(from:to:canTraverse:)` 与惰性重规划）直接做。
+**采用 (b)。** 判据：以本次放置为附加障碍，检查 6 个活动入口是否仍能从 `wp.spawn` 到达；不可达则拒绝并给出可读原因。用已有的 `WaypointNavigationGraph`（309 行，含惰性重规划）。
 
-具体判据：以本次放置为障碍重算一次可达性，若**任一活动入口**（`activity.entry`，共 6 个活动）从 `wp.spawn` 变为不可达，则拒绝并给出可读原因（复用 `blockedRoute` 文案风格）。
+代价说清楚：**角色会从你放的家具上走过去。** 对一个以装修为主的功能，这比角色卡在半路好。
 
-### 取舍 2：上限提到多少？
+### 决定 2：取消件数上限
 
-**先 20，压测后再定。** p95 帧率不达标就回到 10，不带病上线（`FrameRateSampler` 已有 p95）。
+**不是调大，是取消。** 删掉 §1 表格里全部 5 处，并删掉 `WorldPropLayoutError.visibleLimit`（它保护的是一个不该存在的约束）。
 
-注意这不只是改数字：`objectStates` 是字典（无碍），但渲染路径（`ResidentPropRenderer` / `MarbleSpatialView`）与派生格子的承托判定要跟得上。
+**并确立一条原则：**
 
-### 取舍 3：手写面消失后，烘焙门禁锁什么？
+> **渲染预算永远不该变成"你不许放"。**
 
-门禁**必须保留**（它防的是"用旧导航配新碰撞"），但锁的对象要改：
+渲染端按距离与重要性裁剪（近处优先、远处淡出），必要时降级；**绝不因渲染理由拒绝用户的放置**。因此压测决定的是「同时可见多少、多远内可见」，不是「能放多少」。
+
+### 决定 3：门禁改锁输入与算法，不再锁手写产物
 
 | | 现在 | 改成 |
 | --- | --- | --- |
-| 锁 | `ResidentPropPlacementConfiguration.swift` 的文件字节 | `collider.glb` SHA-256、`framing`、`collisionVolumes`、`manualWaypoints`，**加上派生算法版本号 + 派生参数** |
+| 哈希对象 | `ResidentPropPlacementConfiguration.swift` 的字节 | `collider.glb` SHA-256、`framing`、`collisionVolumes`、`manualWaypoints`、**派生算法版本号 + 派生参数** |
 
-这样门禁锁的是**输入与算法**，而不是手写产物。用户摆放不再可能让导航失效，但"碰撞几何或派生规则变了"仍然会被抓住。
+**并且**：烘焙时的 `supportReservation` **保留**，但输入从"手写面"改为"**同一套派生实现算出的面**"。这保证导航点不会生成在合法摆放区里，两边用同一个真相。
 
-**并且**：烘焙时的 `supportReservation` 继续保留，但它的输入从"手写面"改成"**同一套派生实现算出的面**"。这保证导航与摆放不会互相踩（waypoint 不生成在合法摆放区里），而两边用的是同一个真相。
+> 这是最容易做错的一处：若烘焙时去掉 `supportReservation`，waypoint 会生成在摆放区里，之后用户在那儿放东西就会出现"导航点落在物件内部"。
 
-> 这一条是本设计里最容易做错的地方：如果烘焙时去掉了 supportReservation，waypoint 会生成在原摆放区里，之后用户在那儿放东西就会出现"导航点落在物件内部"的诡异状态。
+## 4. 为什么摆放面必须派生（而不是删掉）
 
-## 5. 工作分解
+依赖方向是**反的**，这是本设计的核心：
+
+```text
+手写摆放面 ──是──▶ 导航烘焙的【输入】
+                  cabinSupportReservationIntersects 在每个面周围预留 0.25 / 0.30 m 净空，
+                  让 waypoint 不生成在摆放区里
+```
+
+所以"改摆放面 → 导航失效"不是官僚主义，是真实依赖。自由装修要求摆放面不是手写常量；正确解法是让**派生面成为导航与摆放的共同真相**。
+
+## 5. 格子怎么看到（Sims 标准）
+
+### 5.1 现状（已核实）
+
+- **完全没有任何 3D 鼠标拾取**：`MarbleSpatialView.swift`（3,080 行）里只有一个 `hitTest`（:1049），没有 `mouseDragged` / `mouseMoved` / 射线求交。今天的摆放是"在下拉框里选一个命名的面"。
+- **但深度缓冲已共用**：`ResidentPropRenderer` 用 `depthAttachment.storeAction = .store` + reversed depth（:130 / :182）。**所以格子画进同一个 pass 就会被墙和家具正确遮挡**——标准第 4 条几乎免费。
+
+### 5.2 设计
+
+| 项 | 设计 |
+| --- | --- |
+| 出现时机 | **建造模式开关**。生活模式不显示 |
+| 画在哪 | 派生出的承托面。**一层一个平面**：地面、桌面、台阶 |
+| 怎么画 | 实例化四边形（一格一个 quad），同一深度缓冲 + 深度测试；按距离淡出；贴地抬高约 1 mm 防 z-fighting |
+| 颜色 | 🟢 可放 · 🔴 不可放（插墙/家具、越界） · 🟡 悬停格 + 物件 footprint · ⬜ 已被占用 |
+| 怎么选 | **光标射线 → 与格子平面求交 → 取最近命中**。纯 CPU，不做 GPU readback。矩阵取自 `StageCameraCoordinator` / `StageUniforms` |
+| 吸附 / 旋转 | 位置吸附到格；旋转默认 **90° 步进**，修饰键自由转 |
+| 多格占用 | footprint 由物件 `size` 算（0.45 m 物件在 0.25 m 格上占 **2×2**），**整块一起高亮、一起变绿/红** |
+| 键盘 | 旋转 / Esc 取消 / Delete 收回 / 撤销（复用已有单槽 undo） |
+
+### 5.3 间距不必与导航相同
+
+| 网格 | 间距 | 理由 |
+| --- | --- | --- |
+| 导航 | 0.5 m | 只需"角色能站" |
+| **摆放** | **0.25 m 起步**（小物件可到 0.1 m） | 需要贴合物件尺寸 |
+
+两者只在**"哪些区域要预留"这个粗粒度问题**上必须一致——这正是让烘焙器复用同一份派生结果的原因。
+
+### 5.4 连续性
+
+今天编辑器里的 2 个"面"（`ResidentPropEditorSurface`）**正好对应未来的 2 个"层"**。UI 上那个"选面"下拉框不用删，升级为"选层"（地面 / 桌面 / 台阶）：用户习惯不变，只是每层从 0.8 m 小方块变成整片区域。
+
+## 6. 实施约束（已核实，直接影响可行性）
+
+### 6.1 `canPlace` 是 O(三角形数)，必须做空间分桶
+
+`WorldPropMeshClearance.canPlace(box:supportHeight:triangles:)` 会遍历**传入的全部**三角形。它的文档注释已经写明：
+
+> "Placement-only triangle/box test. **Callers cache the local triangles for authored support regions.**"
+
+若对 2,000 格 × 161,600 三角形直接调用 = **3.2 亿次**检测，不可行。
+
+**解法**：`TriangleMeshCollisionWorld` 内部**已经有** 0.25 m 的三角形空间哈希（`Cell` + `candidateIndices`），但 `triangles` 是 `private`。需要**加一个公开的按范围取三角形的方法**。
+
+> 这个测试还要求 `abs(q.x) < 0.0001 && abs(q.z) < 0.0001`（只支持 yaw 旋转），并且**允许与承托面接触、但拒绝任何穿入物件的三角形**。正好是摆放校验要的语义。
+
+### 6.2 需要一个新的窄协议
+
+```swift
+/// 摆放派生需要三角形几何，而 WorldCollisionQuerying 只有胶囊查询。
+/// CollisionVolumeWorld 没有三角形，因此不实现它。
+public protocol WorldPropSupportQuerying: WorldCollisionQuerying {
+    func triangles(in bounds: WorldPlanarBounds) -> [WorldTriangle]
+}
+```
+
+由 `TriangleMeshCollisionWorld` 与 `ReplaceableCollisionWorld` 实现。`CollisionVolumeWorld` 不实现（摆放派生要求网格几何）。
+
+### 6.3 摆设校验要同时覆盖网格与阻挡体积
+
+`collider.glb` 是环境；但点唱机、许愿机、展示台是**独立的** `WorldCollisionVolume`（`isBlocking: true`）。所以格子判定必须两样都测：
+
+- 网格：`WorldPropMeshClearance.canPlace`
+- 体积：盒 vs 盒（**目前无现成实现**，需新增一个 OBB-OBB SAT 辅助，约 30 行）
+
+## 7. 工作分解
 
 | # | 工作 | 位置 | 验收 |
 | --- | --- | --- | --- |
-| 1 | `PropSupportGrid`：从碰撞几何派生可放置格子 + 查询接口 | `Packages/WorldRuntime` | 单测：同一几何必产出同一网格（确定性）；多高度层（地面/桌面）；非平地承托 |
-| 2 | 烘焙器改用同一派生实现；门禁改锁输入 + 派生版本 | `tools/navigation/LivingCabinNavigation.swift`、`authoring/.../build-package.mjs` | Python 守卫测试仍能重建出 committed world.json（`test_cabin_navigation_package.py`） |
-| 3 | **重烘焙一次** `marble-living-cabin` 并核对 report | `authoring/` + `Resources/Worlds/` | `triangleCount 161600` / `waypointCount` / `bidirectionalEdgeCount` 与预期一致或有据可查的变化 |
-| 4 | 上限 4 → 20 | `WorldSimulation.swift` 两处 | `WorldPropLayout` 既有 12 项测试不回归；新增上限行为测试 |
-| 5 | 摆放校验：从"选面"改为"格子 + 面内偏移"；保留 collision / blockedRoute，新增连通性检查（取舍 1b） | `ResidentPropPlacementService.swift` | 新增：切断连通性被拒绝；合法放置仍通过 |
-| 6 | 编辑器 UX：格子高亮 → 拖放 → 旋转 → 吸附 → 撤销 | `ResidentPropEditorView/State`（现 121 + 224 行） | **真人鼠标手感确认**，离线测试不代替 |
-| 7 | 回归 | — | `make test-all` 全绿；`make build` 成功 |
+| 1 | `WorldPlanarBounds` + `WorldPropSupportQuerying` + 三角形范围查询 | `WorldRuntime` | 单测：范围查询返回的三角形与暴力全量筛选一致 |
+| 2 | `PropSupportGrid` 派生：多层枚举 + 网格/体积校验 + 确定性 | `WorldRuntime` | 单测：同一几何必产出同一网格；地面/桌面/台阶多层；插墙格被拒；跨列确定性 |
+| 3 | 物件 footprint 与放置判定（含多格占据、占用互斥） | `WorldRuntime` | 单测：2×2 footprint 整块判定；重叠被拒；旋转 90° 后 footprint 正确 |
+| 4 | 烘焙器改用同一派生；门禁改锁输入 + 算法版本 | `tools/navigation/`、`build-package.mjs` | Python 守卫仍能重建 committed world.json |
+| 5 | **重烘焙一次** `marble-living-cabin`，核对 report | `authoring/` + `Resources/` | `triangleCount 161600` / waypoint / edge 数与预期一致或有据可查 |
+| 6 | 删除 5 处件数限制与 `visibleLimit` | `WorldSimulation`、`ResidentPropPlacementService`、`ResidentPropRenderer`、`WishMachineOutputDescriptor` | 放 30 件全部可见、可存档；既有 12 项 `WorldPropLayout` 测试不回归 |
+| 7 | 格子渲染 pass（实例化 quad + 距离淡出 + 深度测试） | `ResidentPropRenderer` 旁 | 视觉验收：被墙遮挡、不闪烁、60 fps |
+| 8 | 光标拾取：射线 → 格子平面求交 → 最近命中 | 渲染/相机层 | 悬停高亮跟手；远处格子也能选中 |
+| 9 | 编辑器改成"格子 + footprint"（保留不碰撞 + 连通性检查） | `ResidentPropEditorState/Service` + `View` | 悬停绿/红正确；吸附；90° 旋转；Esc/Delete/撤销 |
+| 10 | 回归 | — | `make test-all` 全绿；`make build` 成功 |
 
-顺序上 **1 → 2 → 3 必须串行**（3 依赖 2，2 依赖 1）；4 与 5 依赖 1；6 依赖 5。
+**串行**：1 → 2 → 3；4 → 5；6 依赖 2/3；7、8、9 依赖 2/3。
+**可并行**：6 与 7/8/9 无依赖关系。
 
-## 6. 验收
+## 8. 验收（Sims 标准逐条）
 
-- 一个没玩过的人，**5 分钟内自己摆 10 件物件**，无需指导（需真人）。
-- 摆放过程中 60 fps 不塌（p95）。
-- 摆完退出重进，位置与朝向完整保留。
-- **改摆放面不再导致导航失效。**
-- `make test-all` 全绿；`WorldRuntime` 测试 ≥143 + 新增。
+| # | 标准 | 怎么验 |
+| --- | --- | --- |
+| 1 | 进建造模式整个房间浮出格子 | 真人看 |
+| 2 | 不限件数 | 放 30 件，全部可见、可存档、可再进入 |
+| 3 | 鼠标指着放：悬停高亮、绿红判定、吸附、旋转 | **真人手感**（测试不能代替） |
+| 4 | 格子被墙/家具正确遮挡 | 真人看；以及深度测试的离线检查 |
+| 5 | 退出重进还在原处 | 离线可测（`WorldStatePersistence` 原子 JSON） |
+| 附加 | 改摆放面不再让导航失效 | 门禁测试 |
+| 附加 | `make test-all` 全绿 | 自动 |
 
-## 7. 非目标
+**第 3 条只有真人能判**，明确列为真人验收，不用状态测试顶替。
+
+## 9. 非目标
 
 - 不做任意 GLB 家具系统（点唱机等仍是专用实现）。
 - 不做物理仿真（无重力掉落、无堆叠、无碰撞反弹）。
-- 不做分享/导入（那是 P3）。
+- 不做墙体物件（挂画、壁灯）——Sims 有墙格，本期不做。
+- 不做分享 / 导入（那是 P3）。
 - 不做多 agent 同场。
 
-## 8. 风险
+## 10. 风险
 
 | 风险 | 缓解 |
 | --- | --- |
-| 去掉 supportReservation 旧语义 → 导航点落在摆放区 | 保留它，只把输入换成派生面（取舍 3） |
-| 上限提升撞渲染性能 | 先压测 20；不达标回 10 |
-| 多高度层（桌面/台阶）承托语义不清 | 派生输出显式带"层"，放置时用户选层 |
-| 连通性检查成本随物件数增长 | 只在放置时算一次；`WaypointNavigationGraph` 已有惰性重规划与缓存 |
-| 重烘焙产出与既有 `layout.json` 不一致 | 先跑 `test_cabin_navigation_package.py` 的重建比对，再动 app 资源 |
-| 真人手感无法离线验证 | 明确列为真人验收项，不用状态测试顶替 |
+| `canPlace` 全量遍历导致不可用 | §6.1 的空间分桶必须先做（工作项 1） |
+| 去除 `supportReservation` 旧语义 → 导航点落在摆放区 | 保留它，只把输入换成派生面（决定 3） |
+| 格子数量大导致渲染/拾取变慢 | 距离裁剪 + 分块上传；拾取按层过滤 |
+| 多高度层（桌面/台阶）语义不清 | 派生输出显式带"层"，UI 选层 |
+| 连通性检查随物件数增长 | 只在放置时算一次；`WaypointNavigationGraph` 已有惰性与缓存 |
+| 重烘焙产出与既有 `layout.json` 不一致 | 先跑 `test_cabin_navigation_package.py` 的重建比对再动 app 资源 |
+| 真人手感无法离线验证 | 明确列为真人验收项 |
