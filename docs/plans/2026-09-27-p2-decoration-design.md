@@ -176,7 +176,37 @@ guard cache.count+loads.count < 5 else { throw WishMachineOutputError.renderUnav
 | 导航 | 0.5 m | 只需"角色能站" |
 | **摆放** | **0.25 m 起步**（小物件可到 0.1 m） | 需要贴合物件尺寸 |
 
-两者只在**"哪些区域要预留"这个粗粒度问题**上必须一致——这正是让烘焙器复用同一份派生结果的原因。
+两者只在**"哪些区域要预留"这个粗粒度问题**上必须一致——而这个问题已经随决定 1 消失了，所以间距完全自由。
+
+### 5.3b 必须做"可达性过滤"，否则格子会铺满屋顶（已用真实数据证实）
+
+列扫描枚举出**每一层承托面**，但烘焙器紧接着还有一步而派生当时漏掉了。烘焙器的注释写着：
+
+> "Visit every actual ground layer; **connectivity decides which layer belongs to the resident's reachable area.**"
+
+真实生活舱实测（161,600 三角形，0.25 m 间距）：
+
+| 指标 | 值 |
+| --- | --- |
+| 层总数 | **9,737** |
+| 有承托面的列 | 4,591（其中 4,535 列是多层） |
+| 高度分布 | y≈-1: 1067 · **y≈0: 3231** · y≈1: 694 · y≈2: 864 · **y≈3: 1611** · y≈4: 555 · **y≈5: 1715** |
+| 最高层 | **5.31 m**（几何包围盒顶 5.35 m） |
+| 站立胶囊可容纳 | 6,763 / 9,737 |
+
+**两个显而易见的过滤都不管用：**
+
+1. `isWalkableSurface` 用 `normal.y * normal.y`——**对朝上/朝下都成立**，区分不了地板与天花板；屋顶外表面甚至是**朝上**的，照样通过。
+2. "站立胶囊可容纳"——**顶不住**：屋顶上方没有东西，站在屋顶上完全合法，所以 6,763 层通过，包含 3–5 米那 3,881 层。
+
+**正确做法（对齐烘焙器）**：从种子点（世界 spawn）做**连通性 BFS**，只保留：
+
+- **可达的站立层**（用 `canOccupy` 判定候选 + `canTraverse` 判定相邻列之间的连通 + `maximumStepHeight` 判定同列纵向连通）
+- **紧挨可达层上方一个带宽内的层**（`furnitureBandHeight`，默认 1.6 m）——这些是**桌面/家具顶面**：它们自己站不住人（被家具占着），但就在可达地面正上方，是合法摆放面
+
+并输出 `report`（`layersBeforeFilter` / `layersAfterFilter` / `standableLayers` / `reachableLayers` / `furnitureBandLayers` / `seeded`），对齐烘焙器的 `report` 风格。
+
+这条过滤同时解决三件事：屋顶/天花板不再有格子、地面以下（y≈-1）的外侧底面被排除、不连通的孤岛被排除。
 
 ### 5.4 连续性
 
@@ -275,6 +305,7 @@ public protocol WorldPropSupportQuerying: WorldCollisionQuerying {
 | --- | --- | --- | --- |
 | 1 | `WorldPlanarBounds` + `WorldPropSupportQuerying` + 三角形范围查询 | `WorldRuntime` | 单测：范围查询返回的三角形与暴力全量筛选一致 |
 | 2 | `PropSupportGrid` 派生：多层枚举 + 确定性 | `WorldRuntime` | 单测：同一几何必产出同一网格；地面/桌面/台阶多层；跨列确定性 |
+| 2b | **可达性过滤**：从 spawn 做连通性 BFS，只保留可达站立层 + 其上方 `furnitureBandHeight` 内的家具顶面；输出 `report` | `WorldRuntime` | 真实几何实测：层数从 9,737 显著下降，且**不再有 3–5 米的层**；天花板/孤岛/地面以下被剔除 |
 | 3 | 物件 footprint 与放置判定（网格 / 阻挡体积 / 已放物件 / 净空） | `WorldRuntime` | 单测：2×2 footprint 整块判定；重叠被拒；旋转 90° 后 footprint 正确 |
 | 4 | **让居民绕过家具**：`ActivityExecutor` 把 `collisionQuery` 推出的 `canTraverse` 传进 `route(from:to:canTraverse:)` | `WorldRuntime` | 单测：路径被物件挡住时改走可行边；无障碍时路径与今天逐点一致 |
 | 5 | **删除 `supportReservation` 与摆放面哈希门禁** | `tools/navigation/`、`bake-living-cabin-navigation.py`、`build-package.mjs` | Python 守卫重建成功；烘焙图只多约 3 个点 |
