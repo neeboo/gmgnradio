@@ -52,6 +52,10 @@ public struct WorldActivityState: Codable, Equatable, Sendable {
 
 public struct WorldState: Codable, Equatable, Sendable {
     public var revision: UInt64
+    public var layoutRevision: UInt64 = 0
+    public var layoutReceipts: [String: WorldPropLayoutCommand] = [:]
+    public var layoutUndo: WorldPropLayoutUndo?
+    public var heldProp: WorldHeldProp?
     public var worldID: String
     public var worldTime: Date
     public var lastObservedWallTime: Date
@@ -71,6 +75,7 @@ public struct WorldState: Codable, Equatable, Sendable {
         agentTransform: WorldTransform,
         liveCamera: WorldCameraState? = nil,
         activeActivity: WorldActivityState? = nil,
+        heldProp: WorldHeldProp? = nil,
         objectStates: [String: WorldObjectState] = [:],
         completedGoals: [String: WorldGoalState] = [:]
     ) {
@@ -82,12 +87,14 @@ public struct WorldState: Codable, Equatable, Sendable {
         self.agentTransform = agentTransform
         self.liveCamera = liveCamera
         self.activeActivity = activeActivity
+        self.heldProp = heldProp
         self.objectStates = objectStates
         self.completedGoals = completedGoals
     }
 
     private enum CodingKeys: String, CodingKey {
         case revision
+        case layoutRevision, layoutReceipts, layoutUndo, heldProp
         case worldID
         case worldTime
         case lastObservedWallTime
@@ -102,6 +109,10 @@ public struct WorldState: Codable, Equatable, Sendable {
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         revision = try container.decode(UInt64.self, forKey: .revision)
+        layoutRevision = try container.decodeIfPresent(UInt64.self, forKey: .layoutRevision) ?? 0
+        layoutReceipts = try container.decodeIfPresent([String: WorldPropLayoutCommand].self, forKey: .layoutReceipts) ?? [:]
+        layoutUndo = try container.decodeIfPresent(WorldPropLayoutUndo.self, forKey: .layoutUndo)
+        heldProp = try container.decodeIfPresent(WorldHeldProp.self, forKey: .heldProp)
         worldID = try container.decode(String.self, forKey: .worldID)
         worldTime = try container.decode(Date.self, forKey: .worldTime)
         lastObservedWallTime = try container.decode(

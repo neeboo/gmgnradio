@@ -46,7 +46,15 @@ func simulationAdvancesLogicalTimeDeterministically() throws {
         worldTime: startedAt.addingTimeInterval(12.5),
         kind: .timeAdvanced(duration: 12.5)
     ))
-    #expect(simulation.events.last == event)
+    // Clock events are returned as the mutation receipt but are disposable noise:
+    // they must never grow the retained log at the 30 Hz resident tick cadence.
+    #expect(simulation.events.count == 1, "time events are never retained")
+    #expect(simulation.events.last == WorldEvent(
+        sequence: 0,
+        revision: 0,
+        worldTime: startedAt,
+        kind: .worldLoaded(worldID: simulation.state.worldID)
+    ))
 }
 
 @Test("A stale revision cannot mutate state or append an event")
@@ -204,11 +212,8 @@ func simulationRunsActivityLifecycle() throws {
     #expect(simulation.events.map(\.kind) == [
         .worldLoaded(worldID: "world.tests.living-room"),
         .activityStarted(activityID: "window.gaze"),
-        .timeAdvanced(duration: 10),
         .activityInterrupted(activityID: "window.gaze", reason: "conversation"),
-        .timeAdvanced(duration: 5),
         .activityResumed(activityID: "window.gaze"),
-        .timeAdvanced(duration: 2),
         .activityCompleted(activityID: "window.gaze"),
     ])
 }
@@ -257,7 +262,9 @@ func simulationCatchesUpAfterSleepInOneStep() throws {
         simulation.state.activeActivity?.elapsedActiveTime
     )
     #expect(abs(elapsedActiveTime - 6 * 60 * 60) < 0.001)
-    #expect(simulation.events.count == eventCountBeforeSleep + 1)
+    // Catch-up mutates logical time in one step and returns its receipt, but the
+    // clock event is disposable and must not grow the retained log.
+    #expect(simulation.events.count == eventCountBeforeSleep)
     guard case let .timeCaughtUp(duration) = event.kind else {
         Issue.record("Expected a single timeCaughtUp event")
         return

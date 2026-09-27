@@ -91,7 +91,7 @@ public struct ActivityExecutor: Sendable {
     private var suspended: [SuspendedRun] = []
     private var position: WorldVector3
     private var yaw: Float
-    private let walkingSpeed: Float
+    private var walkingSpeed: Float
     private let turningSpeed: Float
     private let collisionQuery: (any WorldCollisionQuerying)?
     private let capsule: WorldCapsule
@@ -101,6 +101,20 @@ public struct ActivityExecutor: Sendable {
 
     /// Execution identity stays distinct even when two requests share a world timestamp.
     public var currentRequestID: String? { current?.request.id }
+
+    public mutating func updateWalkingSpeed(_ speed: Float) {
+        guard speed.isFinite, speed >= 0 else { return }
+        walkingSpeed = speed
+    }
+
+    /// Continue an existing execution without changing its identity or activity.
+    /// The supplied path still passes the same collision checks as its first leg.
+    public mutating func continueApproach(_ plan: ActivityApproachPlan) throws -> [ActivityExecutionEffect] {
+        guard var active = current else { throw ActivityExecutorError.noActiveApproach }
+        active.phase = .approach
+        current = active
+        return [.phaseChanged(activityID: active.definition.id, phase: .approach)] + (try supplyApproach(plan))
+    }
 
     public init(
         position: WorldVector3,

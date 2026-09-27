@@ -42,6 +42,153 @@ func unreachableDestination() {
     }
 }
 
+@Test("Traversal filtering takes an authored detour around a blocked short edge")
+func traversalFilteredDetour() throws {
+    let router = WaypointNavigationGraph(
+        waypoints: [waypoint("a", 0, 0, 0), waypoint("b", 1, 0, 0),
+                    waypoint("c", 0, 0, 2), waypoint("d", 2, 0, 0)],
+        routes: [route("short", ["a", "b", "d"]), route("detour", ["a", "c", "d"])]
+    )
+    let path = try router.route(from: .zero, to: "d", canTraverse: { from, to in
+        !(from == SIMD3<Float>(0, 0, 0) && to == SIMD3<Float>(1, 0, 0))
+    })
+    #expect(path.waypointIDs == ["c", "d"])
+}
+
+@Test("Traversal filtering rejects all blocked edges and blocked graph entry")
+func traversalFilteredUnreachable() {
+    let router = WaypointNavigationGraph(
+        waypoints: [waypoint("a", 0, 0, 0), waypoint("d", 2, 0, 0)],
+        routes: [route("link", ["a", "d"])]
+    )
+    #expect(throws: WorldNavigationError.unreachable(destinationID: "d")) {
+        try router.route(from: .zero, to: "d", canTraverse: { _, _ in false })
+    }
+    #expect(throws: WorldNavigationError.unreachable(destinationID: "d")) {
+        try router.route(from: SIMD3(-1, 0, 0), to: "d", canTraverse: { from, _ in
+            from.x >= 0
+        })
+    }
+}
+
+@Test("Blocked entry selects the next nearest reachable waypoint")
+func traversalFilteredEntry() throws {
+    let router = WaypointNavigationGraph(
+        waypoints: [waypoint("a", 0, 0, 0), waypoint("b", 0, 0, 2),
+                    waypoint("d", 2, 0, 2)],
+        routes: [route("links", ["a", "b", "d"])]
+    )
+    let position = SIMD3<Float>(-1, 0, 0)
+    let path = try router.route(from: position, to: "d", canTraverse: { from, to in
+        !(from == position && to == .zero)
+    })
+    #expect(path.waypointIDs == ["b", "d"])
+}
+
+@Test("Waypoint entry preserves deterministic ID ties and route direction")
+func deterministicRoutingTies() throws {
+    let router = WaypointNavigationGraph(
+        waypoints: [waypoint("b", -1, 0, 0), waypoint("a", 1, 0, 0),
+                    waypoint("right", 1, 0, 2), waypoint("left", -1, 0, 2),
+                    waypoint("d", 0, 0, 3)],
+        routes: [route("b-path", ["b", "left", "d"], bidirectional: false),
+                 route("a-path", ["a", "right", "d"], bidirectional: false)]
+    )
+    #expect(try router.route(from: .zero, to: "d").waypointIDs == ["a", "right", "d"])
+    #expect(throws: WorldNavigationError.unreachable(destinationID: "a")) {
+        try router.route(from: SIMD3(0, 0, 3), to: "a")
+    }
+}
+
+@Test("Equal length paths retain the original deterministic predecessor tie")
+func deterministicPathTies() throws {
+    let router = WaypointNavigationGraph(
+        waypoints: [waypoint("start", 0, 0, 0), waypoint("b", -1, 0, 1),
+                    waypoint("a", 1, 0, 1), waypoint("d", 0, 0, 2)],
+        routes: [route("b-path", ["start", "b", "d"]),
+                 route("a-path", ["start", "a", "d"])]
+    )
+    #expect(try router.route(from: .zero, to: "d").waypointIDs == ["a", "d"])
+    #expect(try router.route(from: .zero, to: "d", canTraverse: { _, _ in true })
+        .waypointIDs == ["a", "d"])
+}
+
+@Test("A 631 waypoint route avoids repeated graph searches and edge collision queries")
+func largeWaypointGraphPerformance() throws {
+    let count = 631
+    let ids = (0..<count).map { String(format: "wp.%04d", $0) }
+    let router = WaypointNavigationGraph(
+        waypoints: (0..<count).map { waypoint(ids[$0], Float($0), 0, 0) },
+        routes: [route("chain", ids)]
+    )
+    var checkedEdges = Set<String>()
+    var repeatedEdge = false
+    let started = ContinuousClock.now
+    let path = try router.route(from: .zero, to: ids[count - 1], canTraverse: { from, to in
+        let key = "\(from.x):\(to.x)"
+        if !checkedEdges.insert(key).inserted { repeatedEdge = true }
+        return true
+    })
+    #expect(path.waypointIDs == Array(ids.dropFirst()))
+    #expect(path.totalLength == Float(count - 1))
+    #expect(!repeatedEdge)
+    #expect(checkedEdges.count <= 2 * (count - 1) + 1)
+    #expect(started.duration(to: .now) < .seconds(3))
+}
+
+@Test("A short route in a wide 631 waypoint graph only collision checks its own segments")
+func wideWaypointGraphLazyCollisionChecks() throws {
+    let branches = (0..<629).map { waypoint("branch.\($0)", Float($0 + 100), 0, 10) }
+    let router = WaypointNavigationGraph(
+        waypoints: [waypoint("start", 0, 0, 0), waypoint("destination", 1, 0, 0)] + branches,
+        routes: [route("direct", ["start", "destination"])] + branches.map {
+            route("via.\($0.id)", ["start", $0.id, "destination"])
+        }
+    )
+    var collisionChecks = 0
+    let path = try router.route(from: .zero, to: "destination", canTraverse: { _, _ in
+        collisionChecks += 1
+        return true
+    })
+    #expect(path.waypointIDs == ["destination"])
+    #expect(collisionChecks == 2)
+}
+
+@Test("Lazy replanning caches shared route edges and the entry segment")
+func lazyReplanningCachesSegments() throws {
+    let router = WaypointNavigationGraph(
+        waypoints: [waypoint("a", 0, 0, 0), waypoint("b", 1, 0, 0),
+                    waypoint("c", 2, 0, 1), waypoint("d", 3, 0, 0)],
+        routes: [route("short", ["a", "b", "d"], bidirectional: false),
+                 route("detour", ["b", "c", "d"], bidirectional: false)]
+    )
+    var calls: [String: Int] = [:]
+    let path = try router.route(from: .zero, to: "d", canTraverse: { from, to in
+        calls["\(from.x):\(to.x)", default: 0] += 1
+        return !(from.x == 1 && to.x == 3)
+    })
+    #expect(path.waypointIDs == ["b", "c", "d"])
+    #expect(calls.count == 5)
+    #expect(calls.values.allSatisfy { $0 == 1 })
+}
+
+@Test("Lazy replanning exhausts blocked graph edges without repeating physical checks")
+func lazyReplanningExhaustsBlockedEdges() {
+    let router = WaypointNavigationGraph(
+        waypoints: [waypoint("a", 0, 0, 0), waypoint("b", 1, 0, 0),
+                    waypoint("d", 2, 0, 0)],
+        routes: [route("chain", ["a", "b", "d"], bidirectional: false)]
+    )
+    var calls = 0
+    #expect(throws: WorldNavigationError.unreachable(destinationID: "d")) {
+        try router.route(from: SIMD3(-1, 0, 0), to: "d", canTraverse: { from, _ in
+            calls += 1
+            return from.x == -1
+        })
+    }
+    #expect(calls == 4)
+}
+
 @Test("Disabled authored routes do not participate in shortest path routing")
 func disabledRouteIsIgnored() throws {
     let router = WaypointNavigationGraph(
