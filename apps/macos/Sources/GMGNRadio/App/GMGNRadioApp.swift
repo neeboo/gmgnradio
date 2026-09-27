@@ -3432,6 +3432,9 @@ final class AppDelegate:
     private var residentPropPreparationRunning = false
     private var residentPropNotices: [String: String] = [:]
     private var residentPropEnvironmentContext: ObjectIdentifier?
+    /// 建造模式的格子数据中枢。网格只在几何变化时派生（按 worldID 缓存），
+    /// 已放物件的增删不改变网格。
+    private let residentPropGridEditor = ResidentPropGridEditorModel()
     private var residentPropEnvironmentTriangles: [WorldTriangle] = []
     private var residentPropEditingWorldID: String?
     private var residentPropEditingID: UUID?
@@ -3752,6 +3755,57 @@ final class AppDelegate:
             && residentPropEditingID == editorID && spatialStage.selectedWorldID == context.manifest.worldID
     }
 
+    /// 开启建造模式并派生格子。
+    ///
+    /// 拿不到网格几何时**停用**而不是放行：`context.propSupportQuerying` 为 nil 意味着
+    /// 碰撞世界给不出三角形，派生器会得到空网格、评估器会给 `.noSupport` —— 两道都是
+    /// fail-closed。与其画一张空网格，不如明确不进入格子系统。
+    private func activateResidentPropGrid(context: WorldAgentContext) {
+        residentPropGridEditor.onGridChanged = { [weak self] in self?.publishResidentPropGrid() }
+        guard let collision = context.propSupportQuerying,
+              let bounds = residentPropGridBounds(context: context) else {
+            livingWorldLogger.notice("建造模式：当前空间拿不到摆放几何或导航范围，已停用格子派生。")
+            residentPropGridEditor.deactivate()
+            publishResidentPropGrid()
+            return
+        }
+        residentPropGridEditor.activate(
+            collision: collision,
+            seed: context.manifest.spawn.position,
+            bounds: bounds,
+            key: context.manifest.worldID
+        )
+        publishResidentPropGrid()
+    }
+
+    /// 把格子的网格与着色转发给渲染层。模型每次变更后都会调用（见 `onGridChanged`）。
+    private func publishResidentPropGrid() {
+        spatialStage.isResidentPropBuildModeActive = residentPropGridEditor.isBuildModeActive
+        spatialStage.residentPropGridCells = residentPropGridEditor.renderCells
+        spatialStage.residentPropGridStates = residentPropGridEditor.cellStates
+        spatialStage.residentPropGridSpacing = residentPropGridEditor.isReady ? residentPropGridEditor.spacing : 0
+    }
+
+    /// 格子覆盖的范围：以导航图的 waypoint 包络为准 —— 那**就是**可玩区域，而且已经在
+    /// `world.json` 里随包分发，不需要把烘焙 report 的 groundBounds 再搬一份到运行时。
+    /// 外扩"一格 + 胶囊半径"，让贴边的格子也落在范围内。
+    private func residentPropGridBounds(context: WorldAgentContext) -> WorldPlanarBounds? {
+        let positions = context.manifest.waypoints.filter(\.enabled).map(\.position)
+        guard let first = positions.first else { return nil }
+        var minimumX = first.x, maximumX = first.x
+        var minimumZ = first.z, maximumZ = first.z
+        for position in positions {
+            minimumX = min(minimumX, position.x); maximumX = max(maximumX, position.x)
+            minimumZ = min(minimumZ, position.z); maximumZ = max(maximumZ, position.z)
+        }
+        let parameters = PropSupportGridParameters.default
+        let margin = parameters.spacing + parameters.capsuleRadius
+        return WorldPlanarBounds(
+            minimumX: minimumX - margin, maximumX: maximumX + margin,
+            minimumZ: minimumZ - margin, maximumZ: maximumZ + margin
+        )
+    }
+
     private func setResidentPropEditing(_ editing: Bool) {
         if editing {
             guard residentPropEditingWorldID == nil, let context = livingWorldContext,
@@ -3767,12 +3821,15 @@ final class AppDelegate:
             residentActivityOutcome?.abort()
             do { try context.stopActivity() } catch { showResidentVoiceStatus("生活活动停止失败：\(error.localizedDescription)") }
             spatialStage.clearMovement()
+            activateResidentPropGrid(context: context)
             Task { @MainActor [weak self] in await self?.synchronizeOwnedResidentProps() }
         } else {
             guard let worldID = residentPropEditingWorldID else { return }
             residentPropEditingWorldID = nil
             residentPropEditingID = nil
             spatialStage.residentPropPreview = nil
+            residentPropGridEditor.deactivate()
+            publishResidentPropGrid()
             guard spatialStage.selectedWorldID == worldID, livingWorldContext?.manifest.worldID == worldID else { return }
             if UserDefaults.standard.bool(forKey: "resident.autonomous.enabled.v1") == residentPropEditingPreferenceEnabled {
                 residentAgentLoop?.setBackgroundEnabled(residentPropEditingBackgroundEnabled)

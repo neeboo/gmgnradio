@@ -27,6 +27,11 @@ import WorldRuntime
     /// 当前 footprint 朝向（弧度，已归一化）。90° 步进由 `rotateFootprint(bySteps:)` 驱动。
     @Published private(set) var footprintYaw: Float = 0
 
+    /// 每次状态变更**之后**触发，供宿主把网格与着色转发给渲染层。
+    ///
+    /// 刻意不用 `objectWillChange`：它在变更**之前**发，订阅者读到的是旧值。
+    var onGridChanged: (@MainActor () -> Void)?
+
     private var collision: (any WorldPropSupportQuerying)?
     private var gridKey: String?
     private var cells: [PropSupportGridPresentation.Cell] = []
@@ -44,6 +49,8 @@ import WorldRuntime
     private var hoveredLayerRef: PropSupportLayerRef?
 
     var isReady: Bool { grid != nil }
+    /// 供渲染层使用的格子，与 `cellStates` 同一坐标系（缺省状态的格子也在这里）。
+    var renderCells: [PropSupportGridPresentation.Cell] { cells }
     var spacing: Float { grid?.spacing ?? PropSupportGridParameters.default.spacing }
 
     /// 开启建造模式并（按需）派生网格。
@@ -62,6 +69,7 @@ import WorldRuntime
         if gridKey == key, let grid {
             // 已有同一份几何的网格：只把缓存重新指向它，不重新派生。
             rebuildCaches(from: grid)
+            onGridChanged?()
             return
         }
         let built = PropSupportGridBuilder.build(
@@ -75,6 +83,7 @@ import WorldRuntime
         gridKey = key
         rebuildCaches(from: built)
         clearHover()
+        onGridChanged?()
     }
 
     func deactivate() {
@@ -87,6 +96,7 @@ import WorldRuntime
         candidates = []
         layerRefs = [:]
         clearHover()
+        onGridChanged?()
     }
 
     func clearHover() {
@@ -102,6 +112,7 @@ import WorldRuntime
     func rotateFootprint(bySteps steps: Int) {
         footprintYaw = PropSupportGridMapping.yaw(rotatedBySteps: steps, from: footprintYaw)
         reevaluateFootprint()
+        onGridChanged?()
     }
 
     /// 光标 → 最近格子 → footprint 整体判定 → 整块着色。
@@ -186,6 +197,7 @@ import WorldRuntime
             hovered = nil
             hoveredBlockReason = nil
             cellStates = [:]
+            onGridChanged?()
             return
         }
         let footprint = WorldPlanarFootprint(size: inputs.footprintSize, yaw: footprintYaw)
@@ -211,5 +223,6 @@ import WorldRuntime
                 && $0.layer == layerRef.layer.layer
         }
         hoveredBlockReason = reason
+        onGridChanged?()
     }
 }

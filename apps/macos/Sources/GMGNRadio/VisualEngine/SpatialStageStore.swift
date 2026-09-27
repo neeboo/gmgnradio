@@ -609,6 +609,13 @@ final class SpatialStageStore {
     var residentPropPreview: ResidentPropRenderDescriptor?
     var residentHeldProp: ResidentHeldPropDescriptor?
     var residentPropDisplayStand: ResidentPropDisplayStand?
+
+    /// 建造模式的格子与着色。由 `ResidentPropGridEditorModel` 提供，这里只做转发，
+    /// 让格子与其他道具数据走同一条路：同一帧、同一相机、同一个深度缓冲。
+    var residentPropGridCells: [PropSupportGridPresentation.Cell] = []
+    var residentPropGridStates: [PropSupportGridPresentation.Cell: PropSupportGridPresentation.CellState] = [:]
+    var residentPropGridSpacing: Float = 0
+    var isResidentPropBuildModeActive = false
     var residentPropRenderStatuses: [String: WishMachineOutputStatus] = [:]
     @ObservationIgnored var residentPropPrepareHandler: (@MainActor (ResidentPropRenderDescriptor) async throws -> ResidentPropPreparedAsset)?
     @ObservationIgnored var residentPropPreparedHandler: (@MainActor (String, URL, String) -> Bool)?
@@ -686,6 +693,28 @@ final class SpatialStageStore {
     func residentPropPoint(normalizedPoint: SIMD2<Float>, surfaceY: Float) -> SIMD3<Float>? {
         guard isWorldVisible, residentPropActiveHandler?() == true, let residentPropViewProjection else { return nil }
         return ResidentPropProjection.point(normalized: normalizedPoint, surfaceY: surfaceY, inverseViewProjection: simd_inverse(residentPropViewProjection))
+    }
+
+    /// 建造模式拾取所需的逆视图投影与格距。
+    ///
+    /// 与 `residentPropPoint` 同一套约定（归一化、左上原点、`0...1`）。没开建造模式、或还没有
+    /// 投影矩阵时返回 nil —— 这样普通游玩时的鼠标移动不会误触发格子拾取。
+    var residentPropBuildModeProjection: (inverseViewProjection: simd_float4x4, spacing: Float)? {
+        guard isWorldVisible, isResidentPropBuildModeActive,
+              residentPropGridSpacing > 0, let residentPropViewProjection else { return nil }
+        return (simd_inverse(residentPropViewProjection), residentPropGridSpacing)
+    }
+
+    /// 本帧要画的格子实例。距离裁剪、淡出与预算都在 `PropSupportGridPresentation` 里，
+    /// 这里只做"没开建造模式就不画"的判断。
+    func residentPropGridInstances(cameraPosition: SIMD3<Float>) -> [PropSupportGridPresentation.Instance] {
+        guard isResidentPropBuildModeActive, !residentPropGridCells.isEmpty else { return [] }
+        return PropSupportGridPresentation.instances(
+            cells: residentPropGridCells,
+            states: residentPropGridStates,
+            cameraPosition: cameraPosition,
+            spacing: residentPropGridSpacing
+        )
     }
 
     func residentPropScreenPoint(world: SIMD3<Float>) -> SIMD2<Float>? {

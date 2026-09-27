@@ -1572,6 +1572,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
     private var marbleWishMachineNode: SCNNode?
     private var wishMachineOutputRenderer: WishMachineOutputRenderer?
     private var residentPropRenderer: ResidentPropRenderer?
+    private var propSupportGridRenderer: PropSupportGridRenderer?
     private let residentPropRenderOwner = ResidentPropRenderOwner()
     private var residentPropRenderRevision: UInt64?
     private var residentDisplayStandNode: SCNNode?
@@ -1875,6 +1876,9 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         spatialStage.releaseResidentPropRenderer(residentPropRenderOwner)
         residentPropRenderRevision = nil
         residentPropRenderer?.update([], preview: nil, worldID: nil, isVisible: false)
+        spatialStage.isResidentPropBuildModeActive = false
+        spatialStage.residentPropGridCells = []
+        spatialStage.residentPropGridStates = [:]
     }
 
     func updateLiveCamOrbit(_ orbit: LiveCamCharacterOrbit) {
@@ -1892,6 +1896,9 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         if !ResidentPropSurfaceEligibility.isActive(view) { suspendResidentPropRendering() }
         if residentPropRenderer == nil, renderProfile.drawsWorld {
             residentPropRenderer = ResidentPropRenderer(device: renderer.device, colorFormat: view.colorPixelFormat, depthFormat: view.depthStencilPixelFormat)
+        }
+        if propSupportGridRenderer == nil, renderProfile.drawsWorld {
+            propSupportGridRenderer = PropSupportGridRenderer(device: renderer.device, colorFormat: view.colorPixelFormat, depthFormat: view.depthStencilPixelFormat)
         }
         let propLease = spatialStage.residentPropRenderOwnership.claim(
             owner: residentPropRenderOwner, worldID: spatialStage.selectedWorldID,
@@ -2081,6 +2088,18 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                 preservesDepth: hasPreparedOccluder || hasGeneratedOutputDepth
             ) ?? false
             hasGeneratedOutputDepth = hasGeneratedOutputDepth || hasPlacedProps
+
+            // 建造模式的格子。只做深度测试、不写深度，所以它的返回值**不并入**
+            // preservesDepth 链：它没有让后面的绘制多一层遮挡。
+            if spatialStage.isResidentPropBuildModeActive, let propSupportGridRenderer {
+                propSupportGridRenderer.render(
+                    commandBuffer: commandBuffer, colorTexture: drawable.texture, depthTexture: depthTexture,
+                    viewProjection: projection * cameraView,
+                    reversedDepth: MarbleSceneDepthConvention.resolve(avatarFormat: avatarRuntime.snapshot.avatar?.format) == .sceneKitReverse,
+                    preservesDepth: hasPreparedOccluder || hasGeneratedOutputDepth,
+                    instances: spatialStage.residentPropGridInstances(cameraPosition: camera.position)
+                )
+            }
         }
 
         if renderProfile.drawsAvatar {
