@@ -5,6 +5,27 @@
 上游：`docs/plans/2026-09-27-space-first-plan.md` 的 P2
 前置：P0（仓库止血）与 P1（默认呈现面）已完成并推送
 
+## 实施进度（随提交更新）
+
+| 工作项 | 状态 | 提交 |
+| --- | --- | --- |
+| 1 三角形范围查询 + `WorldPropSupportQuerying` | ✅ | `67927f6` |
+| 2 `PropSupportGrid` 派生（多层列扫描 + 确定性） | ✅ | `67927f6` |
+| 2b 可达性过滤（9,737 → 3,185 层，屋顶消失） | ✅ | `490a65d` |
+| 3 footprint + `PropPlacementEvaluator`（分桶，禁全量） | ✅ | `67927f6` |
+| 4 `ActivityExecutor` 接 `canTraverse`（居民绕开家具） | ✅ | `1e2568e` |
+| 5 删除 `supportReservation` 与摆放面哈希门禁 | ✅ | `c4943a5` |
+| 5b 重烘焙（631 → 649 waypoints） | ✅ | `ba8ff40` |
+| 6 删除 8 处件数门禁 + 渲染预算重设计 | ✅ | `1e58470`、`e6971be` |
+| 7 格子渲染 pass（实例生成层已就绪，**Metal pass 未做**） | ⏳ 一半 | `43a7501` |
+| 8 光标拾取（**纯逻辑已就绪，未接入实时视图**） | ⏳ 一半 | `8b7da88` |
+| 9 编辑器改为「格子 + footprint」 | ❌ 未开始 | — |
+| 10 回归（`make test-all`） | ✅ 当前态 | 32 + 173 + 70 + 203 + 18 harness 全绿 |
+
+**剩余工作集中在 App 层的 7 / 8 / 9，三者互相依赖**（编辑器状态提供网格与悬停格，渲染与拾取消费它），
+应作为一个整体实施：Metal 实例化 pass + 鼠标拾取接线 + 编辑器放置校验改为「格子 + footprint」。
+`WorldRuntime` 侧已经全部完成，不再需要改动。
+
 ## 0. 标准
 
 > **要像 The Sims 那样才算 OK。**
