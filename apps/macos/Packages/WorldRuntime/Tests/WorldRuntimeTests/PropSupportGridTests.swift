@@ -138,9 +138,9 @@ func gridDerivesSingleGroundLayer() {
         triangles: horizontalQuad(minimumX: -5, maximumX: 5, minimumZ: -5, maximumZ: 5, y: 0)
     )
     let bounds = WorldPlanarBounds(minimumX: -5, maximumX: 5, minimumZ: -5, maximumZ: 5)
-    let grid = PropSupportGridBuilder.build(collision: world, bounds: bounds)
-
-    #expect(grid.parameters == .default)
+    // 种子取世界原点：它落在平地内，且这一列只有地面层。
+    let grid = PropSupportGridBuilder.build(
+        collision: world, bounds: bounds, seed: WorldVector3(x: 0, y: 0, z: 0))
     #expect(grid.parameters.algorithmVersion >= 1)
     #expect(grid.spacing == 0.25)
     #expect(grid.bounds == bounds)
@@ -167,9 +167,9 @@ func gridDerivesMultipleLayersUnderATable() {
         + horizontalQuad(minimumX: 0, maximumX: 1, minimumZ: 0, maximumZ: 1, y: tableHeight)
     let world = TriangleMeshCollisionWorld(triangles: triangles)
     let bounds = WorldPlanarBounds(minimumX: -2, maximumX: 2, minimumZ: -2, maximumZ: 2)
-    let grid = PropSupportGridBuilder.build(collision: world, bounds: bounds)
-
-    // 桌下（世界坐标 0.5, 0.5）有两层。
+    // 种子取 (-1, 0, -1)：桌子盖住 0…1，原点在桌子正下方，故意避开它。
+    let grid = PropSupportGridBuilder.build(
+        collision: world, bounds: bounds, seed: WorldVector3(x: -1, y: 0, z: -1))
     let underTable = grid.layers(at: PropSupportColumn(x: 2, z: 2))
     #expect(underTable.count == 2)
     #expect(underTable[0].layer == 0)
@@ -199,13 +199,13 @@ func gridDerivationIsDeterministic() {
     let bounds = WorldPlanarBounds(minimumX: -2, maximumX: 2, minimumZ: -2, maximumZ: 2)
 
     let world = TriangleMeshCollisionWorld(triangles: triangles)
-    let first = PropSupportGridBuilder.build(collision: world, bounds: bounds)
-    let second = PropSupportGridBuilder.build(collision: world, bounds: bounds)
+    let first = PropSupportGridBuilder.build(collision: world, bounds: bounds, seed: WorldVector3(x: 0, y: 0, z: 0))
+    let second = PropSupportGridBuilder.build(collision: world, bounds: bounds, seed: WorldVector3(x: 0, y: 0, z: 0))
     #expect(first.layers == second.layers)
     #expect(!first.layers.isEmpty)
 
     let reordered = TriangleMeshCollisionWorld(triangles: triangles.reversed())
-    let third = PropSupportGridBuilder.build(collision: reordered, bounds: bounds)
+    let third = PropSupportGridBuilder.build(collision: reordered, bounds: bounds, seed: WorldVector3(x: 0, y: 0, z: 0))
     #expect(third.layers == first.layers)
 }
 
@@ -217,7 +217,8 @@ func nearestLayerPicksClosestLayer() throws {
     let world = TriangleMeshCollisionWorld(triangles: triangles)
     let grid = PropSupportGridBuilder.build(
         collision: world,
-        bounds: WorldPlanarBounds(minimumX: -2, maximumX: 2, minimumZ: -2, maximumZ: 2)
+        bounds: WorldPlanarBounds(minimumX: -2, maximumX: 2, minimumZ: -2, maximumZ: 2),
+        seed: WorldVector3(x: 0, y: 0, z: 0)
     )
 
     // 桌面上方 0.1 m：最近的是桌面层。
@@ -244,7 +245,8 @@ func emptyGeometryProducesNoSupport() {
     let world = TriangleMeshCollisionWorld(triangles: [])
     let grid = PropSupportGridBuilder.build(
         collision: world,
-        bounds: WorldPlanarBounds(minimumX: 0, maximumX: 1, minimumZ: 0, maximumZ: 1)
+        bounds: WorldPlanarBounds(minimumX: 0, maximumX: 1, minimumZ: 0, maximumZ: 1),
+        seed: WorldVector3(x: 0, y: 0, z: 0)
     )
     #expect(grid.layers.isEmpty)
     #expect(grid.contains(PropSupportColumn(x: 0, z: 0)))
@@ -267,25 +269,314 @@ func emptyGeometryProducesNoSupport() {
     )
 }
 
+// MARK: - 工作项 4：连通性过滤（可达性）
+//
+// 这些用例全部是合成几何：过滤规则要能一眼看懂"哪一层为什么被留下/剔除"。
+// 真实 161,600 三角形的守卫在 `MarbleLivingCabinPackageTests` 里。
+
+@Test("地面 + 桌子：桌面层（在 band 内）保留，地面保留")
+func gridKeepsFurnitureTopWithinBand() {
+    // 0.75 m 的真实餐桌高度：站立胶囊在这个高度**进不去桌子下面**，
+    // 但桌面正下方就是可达地面，band 把桌面留下来。
+    let tableHeight: Float = 0.75
+    let triangles = flatFloor()
+        + horizontalQuad(minimumX: 0.5, maximumX: 1.5, minimumZ: 0.5, maximumZ: 1.5, y: tableHeight)
+    let world = TriangleMeshCollisionWorld(triangles: triangles)
+    let grid = PropSupportGridBuilder.build(
+        collision: world,
+        bounds: WorldPlanarBounds(minimumX: -2, maximumX: 2, minimumZ: -2, maximumZ: 2),
+        seed: WorldVector3(x: -1, y: 0, z: -1)
+    )
+
+    // 桌下（世界 0.5, 0.5）两层都在：地面层 + 桌面层。
+    let underTable = grid.layers(at: PropSupportColumn(x: 2, z: 2))
+    #expect(underTable.count == 2)
+    #expect(abs(underTable[0].supportHeight) < 0.0001)
+    #expect(abs(underTable[1].supportHeight - tableHeight) < 0.0001)
+    // 桌子之外只有地面。
+    #expect(grid.layers(at: PropSupportColumn(x: -4, z: -4)).count == 1)
+
+    // 报告把"为什么留下"写清楚：桌面不是靠站立/连通留下的，是靠 band。
+    let report = grid.report
+    print(
+        "[地面+桌子] 过滤前 \(report.layersBeforeFilter) → 过滤后 \(report.layersAfterFilter)；"
+            + "站立 \(report.standableLayers)、家具下地面 \(report.coveredGroundLayers)、"
+            + "可达 \(report.reachableLayers)、band \(report.furnitureBandLayers)"
+    )
+    #expect(report.seeded)
+    #expect(report.layersBeforeFilter == 17 * 17 + 25)
+    #expect(report.layersAfterFilter == 17 * 17 + 25)
+    #expect(report.coveredGroundLayers == 25, "桌子盖住的 25 列，地面被桌面挡住站立")
+    #expect(report.reachableLayers == 17 * 17, "可达的是地面（含家具下地面）")
+    #expect(report.furnitureBandLayers == 25, "桌面层靠 furnitureBandHeight 保留")
+    #expect(report.standableLayers == 17 * 17, "264 个空地地面 + 25 个桌面自己可站立")
+}
+
+@Test("悬浮面在 band 内且正下方有可达地面：作为家具顶面保留（不连通，见 report）")
+func gridKeepsFloatingSurfaceWithinBandAsFurnitureTop() {
+    // 与上一条同样的规则，只是"家具"没有腿：0.5 m 悬浮面。
+    // 高差 0.5 > maximumStepHeight 迈不上去（不连通），但它在可达地面正上方 1.6 m 内。
+    // 这条边界是刻意的：格子只回答"哪一层能放东西"，家具顶面本来就不需要走得到。
+    let triangles = flatFloor()
+        + horizontalQuad(minimumX: 0.5, maximumX: 1.5, minimumZ: 0.5, maximumZ: 1.5, y: 0.5)
+    let world = TriangleMeshCollisionWorld(triangles: triangles)
+    let grid = PropSupportGridBuilder.build(
+        collision: world,
+        bounds: WorldPlanarBounds(minimumX: -2, maximumX: 2, minimumZ: -2, maximumZ: 2),
+        seed: WorldVector3(x: -1, y: 0, z: -1)
+    )
+    #expect(grid.layers(at: PropSupportColumn(x: 2, z: 2)).count == 2)
+    #expect(grid.report.reachableLayers == 17 * 17, "悬浮面不在可达集里（不连通）")
+    #expect(grid.report.furnitureBandLayers == 25, "但它在 band 内，作为家具顶面保留")
+}
+
+@Test("地面 + 天花板（2.5 m，与地面不连通）：天花板被剔除")
+func gridDropsDisconnectedCeiling() {
+    let ceilingHeight: Float = 2.5
+    let triangles = flatFloor()
+        + horizontalQuad(minimumX: -2, maximumX: 2, minimumZ: -2, maximumZ: 2, y: ceilingHeight)
+    let world = TriangleMeshCollisionWorld(triangles: triangles)
+    let grid = PropSupportGridBuilder.build(
+        collision: world,
+        bounds: WorldPlanarBounds(minimumX: -2, maximumX: 2, minimumZ: -2, maximumZ: 2),
+        seed: WorldVector3(x: 0, y: 0, z: 0)
+    )
+
+    // 列扫描枚举出 289 地面 + 289 天花板；两个面**站立胶囊都能容纳**
+    // （天花板朝上朝下都算"可行走面"，屋顶外表面更是朝上的）——
+    // 这正是 `isWalkableSurface` / `canOccupy` 挡不住天花板的反例，只有连通性挡得住。
+    #expect(grid.report.layersBeforeFilter == 289 * 2)
+    #expect(grid.report.standableLayers == 289 * 2)
+    #expect(grid.report.seeded)
+    #expect(grid.report.layersAfterFilter == 289)
+    #expect(grid.report.reachableLayers == 289)
+    #expect(grid.report.furnitureBandLayers == 0, "2.5 m 远在 band(1.6) 之外")
+    #expect(grid.layers.count == 289)
+    #expect(grid.layers.allSatisfy { abs($0.supportHeight) < 0.0001 }, "天花板 2.5 m 必须被剔除")
+}
+
+@Test("两块互不连通的地面（中间一道墙）：种子那块保留，另一块被剔除")
+func gridDropsFloorIslandBehindAWall() {
+    // 连续地面 x ∈ [-2, 2]、z ∈ [-1, 1]；x = 0.25 的墙把 z ∈ [-1, 1] 整段封死。
+    // 墙脚下那一列（世界 x = 0.25）站立胶囊进不去，墙又是竖直几何、列里没有横向承托层
+    // → 既不是站立层也不是家具下地面层 → 整列从候选里消失，BFS 无法穿过。
+    let triangles = horizontalQuad(minimumX: -2, maximumX: 2, minimumZ: -1, maximumZ: 1, y: 0)
+        + verticalQuad(x: 0.25, minimumY: 0, maximumY: 2, minimumZ: -1, maximumZ: 1)
+    let world = TriangleMeshCollisionWorld(triangles: triangles)
+    let grid = PropSupportGridBuilder.build(
+        collision: world,
+        bounds: WorldPlanarBounds(minimumX: -2, maximumX: 2, minimumZ: -1, maximumZ: 1),
+        seed: WorldVector3(x: -1, y: 0, z: 0)
+    )
+
+    // 17 × 9 = 153 列都枚举出了地面；墙那一列被剔除后只剩左半 9 × 9 = 81 列。
+    #expect(grid.report.layersBeforeFilter == 153)
+    #expect(grid.report.seeded)
+    #expect(grid.report.layersAfterFilter == 81)
+    #expect(grid.layers.allSatisfy { $0.column.x <= 0 }, "种子在左半，右半是孤岛")
+    #expect(grid.layers(at: PropSupportColumn(x: 1, z: 0)).isEmpty, "墙脚下的列不存在")
+    #expect(grid.layers(at: PropSupportColumn(x: 2, z: 0)).isEmpty, "墙右侧的孤岛被剔除")
+    #expect(grid.layers(at: PropSupportColumn(x: 0, z: 0)).count == 1)
+}
+
+@Test("台阶（高差 = maximumStepHeight）：保留且连通，不是靠 band 摆上去的")
+func gridKeepsStepConnected() {
+    // 0.3 m 的踏步，正好等于 maximumStepHeight：横向 canTraverse + 同列纵向都连通。
+    let stepHeight: Float = 0.3
+    let triangles = flatFloor()
+        + horizontalQuad(minimumX: 0.5, maximumX: 1.5, minimumZ: -2, maximumZ: 2, y: stepHeight)
+    let world = TriangleMeshCollisionWorld(triangles: triangles)
+    let grid = PropSupportGridBuilder.build(
+        collision: world,
+        bounds: WorldPlanarBounds(minimumX: -2, maximumX: 2, minimumZ: -2, maximumZ: 2),
+        seed: WorldVector3(x: -1, y: 0, z: 0)
+    )
+
+    let onStep = grid.layers(at: PropSupportColumn(x: 2, z: 0))
+    #expect(onStep.count == 2)
+    #expect(abs(onStep[1].supportHeight - stepHeight) < 0.0001)
+    #expect(grid.report.seeded)
+    // 踏步层在**可达集**里（不是 band 摆上去的）：这是"连通"的判据。
+    #expect(grid.report.furnitureBandLayers == 0)
+    #expect(grid.report.reachableLayers == grid.report.layersAfterFilter)
+    #expect(grid.report.layersAfterFilter == grid.report.layersBeforeFilter)
+}
+
+@Test("高差大于 maximumStepHeight 的平台：不连通，整层被剔除")
+func gridDropsPlatformAboveStepHeight() {
+    // 地面在 x = 0.25 结束，紧接着 0.5 m 高的实心平台（x ∈ [0.5, 1.5]）。
+    // 0.5 > maximumStepHeight(0.3) 迈不上去；平台自己那一列没有可达层在下方的 band 锚点
+    // （地板不铺到平台下面）→ 平台顶面整层被剔除。
+    let platformHeight: Float = 0.5
+    let triangles = horizontalQuad(minimumX: -2, maximumX: 0.25, minimumZ: -1, maximumZ: 1, y: 0)
+        + horizontalQuad(
+            minimumX: 0.5,
+            maximumX: 1.5,
+            minimumZ: -1,
+            maximumZ: 1,
+            y: platformHeight
+        )
+        + verticalQuad(x: 0.5, minimumY: 0, maximumY: platformHeight, minimumZ: -1, maximumZ: 1)
+    let world = TriangleMeshCollisionWorld(triangles: triangles)
+    let grid = PropSupportGridBuilder.build(
+        collision: world,
+        bounds: WorldPlanarBounds(minimumX: -2, maximumX: 1.5, minimumZ: -1, maximumZ: 1),
+        seed: WorldVector3(x: -1, y: 0, z: 0)
+    )
+
+    print(
+        "[0.5 m 平台] 过滤前 \(grid.report.layersBeforeFilter) → 过滤后 \(grid.report.layersAfterFilter)"
+            + "（可达 \(grid.report.reachableLayers)、band \(grid.report.furnitureBandLayers)）"
+    )
+    #expect(grid.report.seeded)
+    #expect(grid.report.layersBeforeFilter == 10 * 9 + 5 * 9, "地板 10 列 + 平台 5 列，各 9 行")
+    #expect(grid.layers.allSatisfy { abs($0.supportHeight) < 0.0001 }, "平台顶面必须被剔除")
+    #expect(grid.layers(at: PropSupportColumn(x: 2, z: 0)).isEmpty, "世界 x = 0.5 是平台列")
+    #expect(grid.layers.count == 10 * 9)
+}
+
+@Test("家具顶面高出可达地面超过 furnitureBandHeight：被剔除")
+func gridDropsFurnitureTopAboveBand() {
+    // 与「地面 + 桌子」同样的形态，只是顶面在 2.0 m：超过 band(1.6) 就被剔除。
+    let topHeight: Float = 2.0
+    let triangles = flatFloor()
+        + horizontalQuad(minimumX: 0.5, maximumX: 1.5, minimumZ: 0.5, maximumZ: 1.5, y: topHeight)
+    let world = TriangleMeshCollisionWorld(triangles: triangles)
+    let grid = PropSupportGridBuilder.build(
+        collision: world,
+        bounds: WorldPlanarBounds(minimumX: -2, maximumX: 2, minimumZ: -2, maximumZ: 2),
+        seed: WorldVector3(x: -1, y: 0, z: -1)
+    )
+
+    #expect(grid.report.layersBeforeFilter == 17 * 17 + 25)
+    #expect(grid.report.seeded)
+    #expect(grid.report.furnitureBandLayers == 0)
+    #expect(grid.report.layersAfterFilter == 17 * 17)
+    // 顶面下面的地面本身能站人（2.0 m 远在胶囊头顶之上），所以它照常保留。
+    #expect(grid.layers(at: PropSupportColumn(x: 2, z: 2)).count == 1)
+    #expect(grid.layers.allSatisfy { abs($0.supportHeight) < 0.0001 }, "2.0 m 的顶面必须被剔除")
+}
+
+@Test("种子在 bounds 外 / 没有候选层：空网格 + report 说明（不崩溃）")
+func gridWithoutUsableSeedIsEmpty() throws {
+    let world = TriangleMeshCollisionWorld(triangles: flatFloor())
+    let bounds = WorldPlanarBounds(minimumX: -2, maximumX: 2, minimumZ: -2, maximumZ: 2)
+
+    // 1) 种子在边界外：不猜、不放行，返回空网格，但 report 仍然说清楚扫到了什么。
+    let outside = PropSupportGridBuilder.build(
+        collision: world,
+        bounds: bounds,
+        seed: WorldVector3(x: 100, y: 0, z: 100)
+    )
+    #expect(outside.layers.isEmpty)
+    #expect(!outside.report.seeded)
+    #expect(outside.report.layersBeforeFilter == 289, "列扫描照常发生，report 不撒谎")
+    #expect(outside.report.layersAfterFilter == 0)
+    #expect(outside.report.standableLayers == 289)
+    #expect(outside.contains(PropSupportColumn(x: 0, z: 0)), "越界与'这里没有承托面'仍可区分")
+
+    // 2) 没有候选层：0.25 m 宽的竖井（四面墙 + 地面）。扫描得到 1 层，但站立胶囊进不去，
+    //    墙又不在列里产生横向承托层 → 没有站立层、也没有家具下地面层。
+    let shaft: Float = 0.125
+    let shaftTriangles = horizontalQuad(
+        minimumX: -shaft,
+        maximumX: shaft,
+        minimumZ: -shaft,
+        maximumZ: shaft,
+        y: 0
+    )
+        + verticalQuad(x: shaft, minimumY: 0, maximumY: 2, minimumZ: -shaft, maximumZ: shaft)
+        + verticalQuad(x: -shaft, minimumY: 0, maximumY: 2, minimumZ: -shaft, maximumZ: shaft)
+        + verticalQuad(x: 0, minimumY: 0, maximumY: 2, minimumZ: shaft, maximumZ: shaft)
+        + verticalQuad(x: 0, minimumY: 0, maximumY: 2, minimumZ: -shaft, maximumZ: -shaft)
+    let sealed = PropSupportGridBuilder.build(
+        collision: TriangleMeshCollisionWorld(triangles: shaftTriangles),
+        bounds: WorldPlanarBounds(minimumX: -shaft, maximumX: shaft, minimumZ: -shaft, maximumZ: shaft),
+        seed: WorldVector3(x: 0, y: 0, z: 0)
+    )
+    #expect(sealed.layers.isEmpty)
+    #expect(!sealed.report.seeded)
+    #expect(sealed.report.layersBeforeFilter == 1)
+    #expect(sealed.report.standableLayers == 0)
+    #expect(sealed.report.coveredGroundLayers == 0)
+    #expect(sealed.report.layersAfterFilter == 0)
+}
+
+@Test("同几何两次派生逐项相等，report 也相等；三角形顺序无关")
+func connectivityFilterIsDeterministic() {
+    let triangles = flatFloor(minimumX: -3, maximumX: 3, minimumZ: -3, maximumZ: 3)
+        + horizontalQuad(minimumX: 0.4, maximumX: 1.4, minimumZ: 0.4, maximumZ: 1.4, y: 0.8)
+        + horizontalQuad(minimumX: -2, maximumX: -1.2, minimumZ: -2, maximumZ: -1.2, y: 0.3)
+        + verticalQuad(x: 0.6, minimumY: 0, maximumY: 2, minimumZ: -2, maximumZ: 0.2)
+    let bounds = WorldPlanarBounds(minimumX: -3, maximumX: 3, minimumZ: -3, maximumZ: 3)
+    let seed = WorldVector3(x: -1, y: 0, z: -1)
+
+    let world = TriangleMeshCollisionWorld(triangles: triangles)
+    let first = PropSupportGridBuilder.build(collision: world, bounds: bounds, seed: seed)
+    let second = PropSupportGridBuilder.build(collision: world, bounds: bounds, seed: seed)
+    #expect(first.layers == second.layers)
+    #expect(first.report == second.report)
+    #expect(first.report.seeded)
+    #expect(!first.layers.isEmpty)
+
+    let reordered = TriangleMeshCollisionWorld(triangles: triangles.reversed())
+    let third = PropSupportGridBuilder.build(collision: reordered, bounds: bounds, seed: seed)
+    #expect(third.layers == first.layers)
+    #expect(third.report == first.report)
+}
+
 // MARK: - 工作项 3：footprint 与放置判定
 
 @Test("插墙的格子被判定为 blockedByMesh，空地仍然可放")
 func wallInsideColumnIsRejectedByMesh() throws {
+    // **语义变化（连通性过滤落地时改断言，理由见下）**：墙所在的那一列现在**在派生阶段
+    // 就被剔除**——站立胶囊进不去墙里（`canOccupy` 为假），墙又是竖直几何、不会在列里
+    // 产生横向承托层，所以它既不是"站立层"也不是"家具下地面层"。
+    // 于是"占地压到墙"的失败原因从 `.blockedByMesh` 变成 `.noSupport`
+    // （`PropPlacementEvaluator` 先查整块占地的承托层，再查网格；它的语义没动）。
+    // 这条用例保留下来钉住新语义：过滤后的网格里**不存在**"能站进墙里"的锚点。
+    // `.blockedByMesh` 的覆盖由紧随其后的 `footprintInsideFurnitureLegIsBlockedByMesh` 保住
+    // （桌腿所在的列因为有桌面这个 band 内的上层而保留，网格判定照旧拒绝）。
     let wall = verticalQuad(x: 0.6, minimumY: 0, maximumY: 2, minimumZ: -0.5, maximumZ: 0.5)
     let world = TriangleMeshCollisionWorld(triangles: flatFloor() + wall)
     let grid = PropSupportGridBuilder.build(
         collision: world,
-        bounds: WorldPlanarBounds(minimumX: -1, maximumX: 1, minimumZ: -1, maximumZ: 1)
+        bounds: WorldPlanarBounds(minimumX: -1, maximumX: 1, minimumZ: -1, maximumZ: 1),
+        seed: WorldVector3(x: 0, y: 0, z: 0)
     )
-    let footprint = WorldPlanarFootprint(size: SIMD2(0.25, 0.25))
 
-    // 世界坐标 (0.5, 0)：占地 x ∈ [0.5, 0.75] 正好被 x = 0.6 的墙穿过。
-    let blocked = try #require(supportRef(grid, x: 2, z: 0))
-    #expect(evaluate(footprint, at: blocked, grid: grid, collision: world) == .blockedByMesh)
+    // 墙脚那两列（世界 x = 0.5 / 0.75，z ∈ [-0.5, 0.5]）整列消失。
+    #expect(grid.layers(at: PropSupportColumn(x: 2, z: 0)).isEmpty)
+    #expect(grid.layers(at: PropSupportColumn(x: 3, z: 0)).isEmpty)
 
-    // 世界坐标 (-0.5, 0)：离墙很远。
+    // 离墙足够远的列还在，而且能放。
     let clear = try #require(supportRef(grid, x: -2, z: 0))
+    let footprint = WorldPlanarFootprint(size: SIMD2(0.25, 0.25))
     #expect(evaluate(footprint, at: clear, grid: grid, collision: world) == nil)
+}
+
+@Test("桌腿插进占地仍然是 blockedByMesh：家具下的地面层保留，网格判定照旧")
+func footprintInsideFurnitureLegIsBlockedByMesh() throws {
+    // 桌子 = 桌面（0.8 m，在 furnitureBandHeight 内）+ 一根桌腿。
+    // 桌面下面的地面站不住人（桌面就在躯干高度上），但它属于"家具下地面层"，
+    // 所以这一列仍然存在，`.blockedByMesh` 这条路径不会因为过滤而失效。
+    let top = horizontalQuad(minimumX: 0.4, maximumX: 1.4, minimumZ: -0.2, maximumZ: 0.6, y: 0.8)
+    let leg = verticalQuad(x: 0.9, minimumY: 0, maximumY: 0.8, minimumZ: 0, maximumZ: 0.2)
+    let world = TriangleMeshCollisionWorld(triangles: flatFloor() + top + leg)
+    let grid = PropSupportGridBuilder.build(
+        collision: world,
+        bounds: WorldPlanarBounds(minimumX: -2, maximumX: 2, minimumZ: -2, maximumZ: 2),
+        seed: WorldVector3(x: 0, y: 0, z: 0)
+    )
+
+    // 世界 (0.5, 0)：桌面盖住这一列 → 地面层（家具下）+ 桌面层（band）。
+    let underTable = PropSupportColumn(x: 2, z: 0)
+    #expect(grid.layers(at: underTable).count == 2)
+    let anchor = try #require(supportRef(grid, x: 2, z: 0, layer: 0))
+
+    // 0.5 m footprint 锚定在 (0.5, 0) → 占地 x ∈ [0.5,1.0]、z ∈ [0,0.5]，桌腿 x = 0.9 插在里面。
+    let footprint = WorldPlanarFootprint(size: SIMD2(0.5, 0.5))
+    #expect(evaluate(footprint, at: anchor, grid: grid, collision: world) == .blockedByMesh)
 }
 
 @Test("阻挡体积重叠的格子被判定为 blockedByBlockingVolume(id)")
@@ -293,7 +584,8 @@ func blockingVolumeIsRejected() throws {
     let world = TriangleMeshCollisionWorld(triangles: flatFloor())
     let grid = PropSupportGridBuilder.build(
         collision: world,
-        bounds: WorldPlanarBounds(minimumX: -2, maximumX: 2, minimumZ: -2, maximumZ: 2)
+        bounds: WorldPlanarBounds(minimumX: -2, maximumX: 2, minimumZ: -2, maximumZ: 2),
+        seed: WorldVector3(x: 0, y: 0, z: 0)
     )
     let footprint = WorldPlanarFootprint(size: SIMD2(0.25, 0.25))
     let anchor = try #require(supportRef(grid, x: 0, z: 0))
@@ -339,7 +631,8 @@ func placedPropOverlapIsRejected() throws {
     let world = TriangleMeshCollisionWorld(triangles: flatFloor())
     let grid = PropSupportGridBuilder.build(
         collision: world,
-        bounds: WorldPlanarBounds(minimumX: -2, maximumX: 2, minimumZ: -2, maximumZ: 2)
+        bounds: WorldPlanarBounds(minimumX: -2, maximumX: 2, minimumZ: -2, maximumZ: 2),
+        seed: WorldVector3(x: 0, y: 0, z: 0)
     )
     let footprint = WorldPlanarFootprint(size: SIMD2(0.25, 0.25))
     let anchor = try #require(supportRef(grid, x: 0, z: 0))
@@ -436,7 +729,8 @@ func footprintAtEdgeIsOutsideBounds() throws {
     )
     let grid = PropSupportGridBuilder.build(
         collision: world,
-        bounds: WorldPlanarBounds(minimumX: -1, maximumX: 1, minimumZ: -1, maximumZ: 1)
+        bounds: WorldPlanarBounds(minimumX: -1, maximumX: 1, minimumZ: -1, maximumZ: 1),
+        seed: WorldVector3(x: 0, y: 0, z: 0)
     )
 
     // 上边界：0.75 m 的 footprint 锚定在 x = 1.0 的列上会越过边界。
@@ -466,7 +760,8 @@ func footprintRequiresOneConsistentSupportLayer() throws {
     let world = TriangleMeshCollisionWorld(triangles: triangles)
     let grid = PropSupportGridBuilder.build(
         collision: world,
-        bounds: WorldPlanarBounds(minimumX: -2, maximumX: 2, minimumZ: -2, maximumZ: 2)
+        bounds: WorldPlanarBounds(minimumX: -2, maximumX: 2, minimumZ: -2, maximumZ: 2),
+        seed: WorldVector3(x: 0, y: 0, z: 0)
     )
     // 世界坐标 (1.5, 0.5)：桌子边缘那一列，同时有地面层（0）和桌面层（0.8）。
     let edge = PropSupportColumn(x: 6, z: 2)
@@ -530,12 +825,25 @@ func boxOverlapHonoursYawRotation() {
 @Test("局部三角形能覆盖只与 footprint 一部分相交的三角形")
 func localTrianglesCatchPartialIntersections() throws {
     // 一根细柱只穿过 0.5 × 0.5 footprint 的左半边。
+    //
+    // 柱子必须带一个 0.6 m 的顶盖：柱脚那一列（世界 0, 0 离柱面只有 0.15 m）站立胶囊进不去，
+    // 而柱子本身是竖直几何、不会在列里产生横向承托层；没有顶盖这一列会被连通性过滤整列剔除
+    // （`supportRef` 拿不到锚点）。加了顶盖之后它是"家具下地面层"，被保留 ——
+    // 这正好也是真实家具的形态（桌腿 + 桌面）。
     let peg = verticalQuad(x: 0.15, minimumY: 0, maximumY: 0.6, minimumZ: 0, maximumZ: 0.3)
-    let triangles = flatFloor() + peg
+    let pegCap = horizontalQuad(
+        minimumX: -0.05,
+        maximumX: 0.3,
+        minimumZ: -0.05,
+        maximumZ: 0.3,
+        y: 0.6
+    )
+    let triangles = flatFloor() + peg + pegCap
     let world = TriangleMeshCollisionWorld(triangles: triangles)
     let grid = PropSupportGridBuilder.build(
         collision: world,
-        bounds: WorldPlanarBounds(minimumX: -2, maximumX: 2, minimumZ: -2, maximumZ: 2)
+        bounds: WorldPlanarBounds(minimumX: -2, maximumX: 2, minimumZ: -2, maximumZ: 2),
+        seed: WorldVector3(x: 0, y: 0, z: 0)
     )
     let footprint = WorldPlanarFootprint(size: SIMD2(0.5, 0.5))
     let anchor = try #require(supportRef(grid, x: 0, z: 0))
@@ -579,7 +887,8 @@ func localTrianglesNeverMissACollision() {
     let world = TriangleMeshCollisionWorld(triangles: triangles, cellSize: 0.25)
     let grid = PropSupportGridBuilder.build(
         collision: world,
-        bounds: WorldPlanarBounds(minimumX: -3, maximumX: 3, minimumZ: -3, maximumZ: 3)
+        bounds: WorldPlanarBounds(minimumX: -3, maximumX: 3, minimumZ: -3, maximumZ: 3),
+        seed: WorldVector3(x: 0, y: 0, z: 0)
     )
     #expect(!grid.layers.isEmpty)
 
@@ -662,7 +971,8 @@ func triangleBucketingKeepsPlacementCheap() {
     // 小范围派生一张网格用于反复评估（网格本身不是这次要测的开销）。
     let grid = PropSupportGridBuilder.build(
         collision: world,
-        bounds: WorldPlanarBounds(minimumX: 0.5, maximumX: 2.5, minimumZ: 0.5, maximumZ: 2.5)
+        bounds: WorldPlanarBounds(minimumX: 0.5, maximumX: 2.5, minimumZ: 0.5, maximumZ: 2.5),
+        seed: WorldVector3(x: 1, y: 0, z: 1)
     )
     #expect(grid.layers.count == 81)
 

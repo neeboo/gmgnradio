@@ -105,3 +105,97 @@ func marbleCabinRealMeshSupportsAuthoredTour() throws {
     #expect(mesh.canOccupy(cameraProbe, at: camera + SIMD3(0, 0.15, 0)))
     #expect(worldDistance(camera, spawn) > 4)
 }
+
+/// 真实几何守卫（工作项 4）：连通性过滤必须在真实生活舱上真的把屋顶/天花板剔掉。
+///
+/// 这是"派生出来的格子会铺满屋顶"这个可见缺陷的回归测试：只用列扫描（工作项 1–3）会得到
+/// 9,737 层（含 5.31 m 的屋顶外表面与 2.5 m 的天花板），装修模式一进去整个屋子都是格子。
+@Test("Real cabin support grid drops the roof: connectivity filter cuts the 9,737 scanned layers")
+func marbleCabinSupportGridIsConnectivityFiltered() throws {
+    let root = marbleCabinPackageRoot()
+    let manifest = try JSONDecoder().decode(
+        WorldManifest.self,
+        from: Data(contentsOf: root.appendingPathComponent("world.json"))
+    )
+    let config = try JSONDecoder().decode(
+        MarbleCabinResourceConfiguration.self,
+        from: Data(contentsOf: root.appendingPathComponent("marble.json"))
+    )
+    let origin = SIMD3(config.framing.origin[0], config.framing.origin[1], config.framing.origin[2])
+    let triangles = try GLBColliderDecoder().decode(
+        data: Data(contentsOf: root.appendingPathComponent("collider.glb")),
+        transform: WorldMeshTransform(
+            axisConversion: .flipYAndZ,
+            origin: origin,
+            uniformScale: config.framing.scale
+        )
+    )
+    #expect(triangles.count == 161_600)
+    let mesh = TriangleMeshCollisionWorld(triangles: triangles)
+
+    var minimumX = Float.greatestFiniteMagnitude
+    var maximumX = -Float.greatestFiniteMagnitude
+    var minimumZ = Float.greatestFiniteMagnitude
+    var maximumZ = -Float.greatestFiniteMagnitude
+    for triangle in triangles {
+        for vertex in [triangle.first, triangle.second, triangle.third] {
+            minimumX = min(minimumX, vertex.x)
+            maximumX = max(maximumX, vertex.x)
+            minimumZ = min(minimumZ, vertex.z)
+            maximumZ = max(maximumZ, vertex.z)
+        }
+    }
+
+    // 默认参数 = 0.25 m 网格 + 站立胶囊(0.2 / 1.8) + maximumStepHeight 0.3 + band 1.6。
+    let parameters = PropSupportGridParameters()
+    let seed = manifest.spawn.position
+    let clock = ContinuousClock()
+    let start = clock.now
+    let grid = PropSupportGridBuilder.build(
+        collision: mesh,
+        bounds: WorldPlanarBounds(
+            minimumX: minimumX,
+            maximumX: maximumX,
+            minimumZ: minimumZ,
+            maximumZ: maximumZ
+        ),
+        seed: seed,
+        parameters: parameters
+    )
+    let elapsed = start.duration(to: clock.now)
+
+    let report = grid.report
+    let highest = grid.layers.map(\.supportHeight).max() ?? 0
+    let ground = try #require(mesh.groundHeight(at: seed.simd3 + SIMD3(0, 0.05, 0)))
+    print(
+        "[真实生活舱承托网格] 过滤前 \(report.layersBeforeFilter) 层 → 过滤后 \(report.layersAfterFilter) 层；"
+            + "站立胶囊可容纳 \(report.standableLayers)、家具下地面 "
+            + "\(report.coveredGroundLayers)、可达 \(report.reachableLayers)、"
+            + "band \(report.furnitureBandLayers)；最高保留层 \(highest) m、地面 \(ground) m；"
+            + "派生耗时 \(elapsed)"
+    )
+
+    #expect(report.seeded)
+    // 过滤前的两个实测值：列扫描 9,737 层；其中 6,763 层"站立胶囊可容纳"——
+    // 屋顶上方没有东西，站上去完全合法，所以 canOccupy 挡不住屋顶（反例就钉在这里）。
+    #expect(report.layersBeforeFilter == 9_737, "实测 9,737 @0.25 m")
+    #expect(report.standableLayers == 6_763, "实测 6,763 / 9,737 站立可容纳")
+    #expect(
+        report.standableLayers > report.layersAfterFilter,
+        "只按'站立胶囊可容纳'过滤挡不住屋顶：它留下 \(report.standableLayers) 层"
+    )
+    #expect(report.coveredGroundLayers > 0, "桌面/家具顶面靠'家具下地面层'拿到 band 锚点")
+    // 过滤后实测 3,185 层（可达 2,976 + 家具带 209），不到过滤前的一半。
+    #expect(report.layersAfterFilter < 4_000, "实测 \(report.layersAfterFilter)")
+    #expect(report.reachableLayers < report.layersAfterFilter, "家具顶面是 band 补进来的，不是可达层")
+    #expect(grid.layers.count == report.layersAfterFilter)
+    // 没有 3–5 米的层：屋顶外表面 5.31 m、天花板 2.5 m 都被剔除。
+    #expect(!grid.layers.contains { $0.supportHeight >= 3 }, "3–5 m 的屋顶层必须被剔除")
+    #expect(highest < 2.5, "最高保留层必须低于天花板，实测 \(highest)")
+    // 地面 -0.07 m + band 1.6 = 1.53 m；房间里可达的最高站立层实测 0.71 m（踏步/夹层），
+    // 所以留 0.8 m 容差覆盖"台阶之上再叠一层家具"。关键是上面两条：没有 3–5 m 的层。
+    #expect(
+        highest <= ground + parameters.furnitureBandHeight + 0.8,
+        "最高保留层 \(highest) 超过 地面 \(ground) + band 1.6 + 容差"
+    )
+}
