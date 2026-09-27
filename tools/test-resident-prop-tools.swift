@@ -1,3 +1,7 @@
+// 注意：这些 harness 早于「格子 + footprint」契约，且在本次契约变更之前就已经在运行时失败。
+// 这里只把构造改成新签名（`support` 默认 `{ nil }` = 拿不到承托几何就拒绝摆放），
+// 让它们回到"只剩预先存在的运行时失败"的状态。要真正恢复，需要像
+// `tools/test-resident-prop-grid-editor.swift` 那样提供一张合成承托网格。
 import Foundation
 
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
@@ -25,7 +29,7 @@ enum ResidentWorldToolSession {
         // display-table area, which the grid deliberately routes around.
         let surface=ResidentPropSupportSurface(id:"test",center:.init(x:-2.7,y:0.52,z:-5),halfExtents:.init(x:1,y:0,z:1),yaw:0,excludedCollisionID:nil)
         let current=Current()
-        let service=ResidentPropPlacementService(context:context,surfaces:[surface],isCurrent:{current.value},validateEnvironment:{_,_ in},
+        let service=ResidentPropPlacementService(context:context,isCurrent:{current.value},
             currentAvatarAssetID:{"pmx.2b-miss-0414-standard"},makeGripCalibration:{ prop, avatarID in
                 WorldPropGripCalibration(avatarAssetID:avatarID,hand:.rightHand,
                     normalizedGrip:.init(x:0.5,y:0.5,z:0.5),localOffset:.init(x:0,y:0,z:0),

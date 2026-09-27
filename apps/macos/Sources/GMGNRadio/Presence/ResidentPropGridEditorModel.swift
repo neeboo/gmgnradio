@@ -49,6 +49,8 @@ import WorldRuntime
     private var hoveredLayerRef: PropSupportLayerRef?
 
     var isReady: Bool { grid != nil }
+    /// 摆放校验需要的碰撞世界（能给出三角形）。与 `grid` 同时可用，否则为 nil。
+    var supportCollision: (any WorldPropSupportQuerying)? { collision }
     /// 供渲染层使用的格子，与 `cellStates` 同一坐标系（缺省状态的格子也在这里）。
     var renderCells: [PropSupportGridPresentation.Cell] { cells }
     var spacing: Float { grid?.spacing ?? PropSupportGridParameters.default.spacing }
@@ -168,6 +170,11 @@ import WorldRuntime
             ),
             footprintYaw
         )
+    }
+
+    /// 悬停所在层的标识。`surfaceID` 现在是层标识，不再是具名摆放面。
+    var hoveredLayerName: String? {
+        hoveredLayerRef.map { "grid.layer\($0.layer)" }
     }
 
     /// 当前悬停是否可放（`hoveredBlockReason == nil` 且有悬停）。

@@ -148,12 +148,11 @@ func usageStatus(_ result: RealtimeDJToolResult) -> String? {
         do {
             let context = try makeContext()
             try bindPlacedMachine(in: context)
-            let service = ResidentPropPlacementService(context: context, surfaces: [
-                ResidentPropSupportSurface(id: "resident.display_table",
-                    center: WorldVector3(x: 2, y: 0.52, z: 2),
-                    halfExtents: WorldVector3(x: 0.5, y: 0.02, z: 0.5), yaw: 0,
-                    excludedCollisionID: nil),
-            ], validateEnvironment: { _, _ in })
+            // 这条 harness 只走能力绑定的路径：所有摆放都用 `context.commitPropLayout`
+            // 并带 `{ _ in }` 校验闭包（绕过服务），所以不需要承托几何。
+            // 摆放校验现在是「格子 + footprint」，默认的 `support: { nil }` 表示
+            // "拿不到几何就拒绝摆放"（fail-closed），这里不会被触发。
+            let service = ResidentPropPlacementService(context: context)
             let arguments = try JSONSerialization.data(withJSONObject: [
                 "object_id": coffeeObjectID, "capability": "coffee.brew", "layout_revision": 2])
             let background = ResidentPropToolBridge(service: service, allowsMutation: false, isCurrent: { true })

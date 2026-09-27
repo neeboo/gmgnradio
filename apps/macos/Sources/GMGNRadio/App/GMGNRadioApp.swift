@@ -2623,8 +2623,7 @@ final class AppDelegate:
                     )
                     return (
                         TriangleMeshCollisionWorld(triangles: triangles),
-                        triangles,
-                        ResidentPropPlacementConfiguration.nearbyTriangles(triangles)
+                        triangles
                     )
                 }.value
                 try Task.checkCancellation()
@@ -2645,8 +2644,6 @@ final class AppDelegate:
                 }
                 let correctedPosition = try context
                     .installCollisionWorldAndReconcilePlacement(collision)
-                residentPropEnvironmentContext = ObjectIdentifier(context)
-                residentPropEnvironmentTriangles = prepared.2
                 if let correctedPosition {
                     livingWorldLogger.notice(
                         "碰撞 GLB 修正角色落点：x=\(correctedPosition.x, privacy: .public)，y=\(correctedPosition.y, privacy: .public)，z=\(correctedPosition.z, privacy: .public)"
@@ -2977,6 +2974,11 @@ final class AppDelegate:
         // 建造模式：鼠标移动 → 格子拾取 → footprint 判定 → 整块着色。
         stageWindowController?.onResidentPropGridCursor = { [weak self] normalized in
             self?.residentPropGridHover(normalized: normalized)
+        }
+        // R / Shift+R：90° 步进旋转。旋转改的是 footprint 朝向，重新着色后由
+        // `publishResidentPropGrid` 把新的吸附位置与朝向推给预览。
+        stageWindowController?.onResidentPropGridRotate = { [weak self] steps in
+            self?.residentPropGridEditor.rotateFootprint(bySteps: steps)
         }
         if let stageWindowController {
             configureResidentPropEditor(stageWindowController)
@@ -3435,11 +3437,9 @@ final class AppDelegate:
     private var residentPropAssetContext: ObjectIdentifier?
     private var residentPropPreparationRunning = false
     private var residentPropNotices: [String: String] = [:]
-    private var residentPropEnvironmentContext: ObjectIdentifier?
     /// 建造模式的格子数据中枢。网格只在几何变化时派生（按 worldID 缓存），
     /// 已放物件的增删不改变网格。
     private let residentPropGridEditor = ResidentPropGridEditorModel()
-    private var residentPropEnvironmentTriangles: [WorldTriangle] = []
     private var residentPropEditingWorldID: String?
     private var residentPropEditingID: UUID?
     private var residentPropEditingBackgroundEnabled = false
@@ -3455,17 +3455,20 @@ final class AppDelegate:
 
     private func residentPropPlacementService(context: WorldAgentContext,
                                               isCurrent: @escaping @MainActor () -> Bool) -> ResidentPropPlacementService {
-        ResidentPropPlacementService(context: context, surfaces: ResidentPropPlacementConfiguration.surfaces,
+        ResidentPropPlacementService(context: context,
+            // 承托几何来自建造模式的格子模型：派生好的网格 + 能给出三角形的碰撞世界。
+            // 建造模式没开或几何不可用时返回 nil，摆放一律被拒绝（fail-closed）。
+            support: { [weak self] in
+                guard let self, let grid = self.residentPropGridEditor.grid,
+                      let collision = self.residentPropGridEditor.supportCollision else { return nil }
+                return ResidentPropPlacementSupport(grid: grid, collision: collision)
+            },
             prepare: { [weak self] prop in
                 guard let self, let asset = self.residentOwnedPropAssets[prop.objectID], asset.prop == prop,
                       self.spatialStage.isResidentPropPrepared(assetID: prop.assetID, modelURL: asset.descriptor.modelURL)
                 else { throw ResidentPropHostError.assetUnverified }
-            }, isCurrent: isCurrent, validateEnvironment: { [weak self, weak context] box, supportHeight in
-                guard let self, let context, self.residentPropEnvironmentContext == ObjectIdentifier(context),
-                      !self.residentPropEnvironmentTriangles.isEmpty else { throw ResidentPropPlacementError.environmentNotReady }
-                guard WorldPropMeshClearance.canPlace(box, supportHeight: supportHeight, triangles: self.residentPropEnvironmentTriangles)
-                else { throw ResidentPropPlacementError.collision("生成空间网格") }
-            }, currentAvatarAssetID: { [weak self] in self?.avatarRuntime.snapshot.avatar?.id },
+            }, isCurrent: isCurrent,
+            currentAvatarAssetID: { [weak self] in self?.avatarRuntime.snapshot.avatar?.id },
             makeGripCalibration: { [weak self] prop, avatarID in
                 guard let self, let avatar = self.avatarRuntime.snapshot.avatar, avatar.id == avatarID else {
                     throw ResidentPropPlacementError.avatarChanged
@@ -3628,8 +3631,12 @@ final class AppDelegate:
             .sorted { $0.generatedProp!.objectID < $1.generatedProp!.objectID }
         return .init(worldID: context.manifest.worldID, revision: context.state.layoutRevision,
               objects: objects,
-              surfaces: ResidentPropPlacementConfiguration.surfaces.map {
-                  .init(id: $0.id, name: ResidentPropPlacementConfiguration.name(for: $0.id), position: $0.center)
+              // 摆放面现在是格子派生出来的**承托层**，按高度归并（真实房间有 3,000+ 格，
+              // 全列给 UI 没意义）。最低那层叫"地面"，其余按高度命名。
+              surfaces: service.listedSupportLayers().enumerated().map { index, layer in
+                  .init(id: layer.id,
+                        name: index == 0 ? "地面" : String(format: "台面 %.2f m", layer.supportHeight),
+                        position: layer.center)
               }, canUndo: context.state.layoutUndo != nil, heldProp: context.state.heldProp,
               holdUnavailableReasons: Dictionary(uniqueKeysWithValues: objects.compactMap { item in
                   guard let id = item.generatedProp?.objectID, let reason = service.holdEligibility(objectID: id) else { return nil }
@@ -3788,6 +3795,17 @@ final class AppDelegate:
         spatialStage.residentPropGridCells = residentPropGridEditor.renderCells
         spatialStage.residentPropGridStates = residentPropGridEditor.cellStates
         spatialStage.residentPropGridSpacing = residentPropGridEditor.isReady ? residentPropGridEditor.spacing : 0
+
+        // 悬停命中格子后，把预览挪到**吸附后的格心**（含当前 footprint 朝向）。
+        // 预览走既有的摆放服务，所以"这里能不能放"由 `PropPlacementEvaluator` 决定；
+        // 放不下时编辑器会显示红格与原因，而不是静默不动。
+        guard let snapped = residentPropGridEditor.snappedPlacement else { return }
+        let target = WorldVector3(x: snapped.position.x, y: snapped.position.y, z: snapped.position.z)
+        let layerName = residentPropGridEditor.hoveredLayerName ?? "grid"
+        Task { [weak self] in
+            await self?.stageWindowController?.moveResidentPropGridPointer(
+                to: target, layerName: layerName, yaw: snapped.yaw)
+        }
     }
 
     /// 光标 → 格子悬停。

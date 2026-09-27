@@ -19,20 +19,18 @@
 | 6 删除 8 处件数门禁 + 渲染预算重设计 | ✅ | `1e58470`、`e6971be` |
 | 7 格子渲染 pass + 建造模式开关 | ✅ | `43a7501`、`a6baf60`、`ffa3251` |
 | 8 光标拾取 + 接入实时视图 | ✅ | `8b7da88`、`a8dbfa8` |
-| 9 编辑器改为「格子 + footprint」 | ⏳ **只剩校验切换 + 旋转键** | `e3c0ed1` |
+| 9 编辑器改为「格子 + footprint」 | ✅ | `e3c0ed1`、本轮 |
 | 10 回归（`make test-all`） | ✅ 当前态 | 32 + 173 + 70 + 203 + 19 harness 全绿 |
 
-**7 与 8 已完成**：格子在建造模式可见（`ffa3251`），鼠标悬停会拾取格子并着色（`a8dbfa8`）。
+**7、8、9 全部完成**：格子在建造模式可见、鼠标拾取格子着色、点击在吸附后的格心上落地。
+摆放校验已经是「格子 + `PropPlacementEvaluator`」，具名摆放面（`ResidentPropSupportSurface`
+与 `ResidentPropPlacementConfiguration.surfaces/nearbyTriangles/name(for:)`）已整体删除。
+键盘：R / Shift+R 做 90° 步进旋转，Delete 收回，Cmd+Z 撤销，Esc 取消（后三个面板上也有按钮）。
 
-**工作项 9 只剩一件**：把 `ResidentPropPlacementService` 的摆放校验从"具名摆放面"切到
-"格子 + `PropPlacementEvaluator`"，并加 90° 步进旋转键。编辑器的
-`escape` / `confirm` / `withdraw` / `undo` / `movePointer` **都已存在**，
-所以 Esc、收回、撤销不需要新写；缺的是校验切换与旋转键。
+**但请看 §12：工作项 5 的删除带来了两个实测回归（6 个 waypoint 不可达、桌面不再是摆放面），
+下一轮必须先修它们。**
 
-**在此之前，建造模式下点击不会落地任何东西**：悬停与绿/红已经是真的，但提交走的是
-摆放面校验，格子位置会被它拒绝。这是有意的半步，而不是遗漏。
-
-`WorldRuntime` 侧已经全部完成，不再需要改动。
+`WorldRuntime` 侧已经全部完成，不再需要改动（除非 §12 的修法要求它支持"体积顶面作为承托面"）。
 
 ## 0. 标准
 
@@ -415,6 +413,66 @@ public protocol WorldPropSupportQuerying: WorldCollisionQuerying {
 | 重烘焙产出与既有 `layout.json` 不一致 | 先跑 `test_cabin_navigation_package.py` 的重建比对再动 app 资源 |
 | 真人手感无法离线验证 | 明确列为真人验收项 |
 
+## 12. ⚠️ 工作项 5 引入的两个实测回归（未修复，下一轮处理）
+
+在把摆放校验切到「格子 + footprint」之后，用真实舱体数据实测发现：**删除
+`cabinSupportReservationIntersects` 的代价比当时评估的大**。它不只做"摆放面预留"，
+它同时**把展示台的 footprint 排除在导航图之外**。删掉之后：
+
+### 回归 1：6 个 waypoint 运行时不可达
+
+证据（同一份 manifest，只切换碰撞世界里有没有展示台）：
+
+```
+不含展示台：649/649 可达，失败 0
+含展示台：  643/649 可达，失败 6
+   不可达 wp.auto.x-5.z-10.h0 / x-5.z-11.h0 / x-5.z-9.h0
+   不可达 wp.auto.x-6.z-10.h0 / x-6.z-11.h0 / x-6.z-9.h0
+```
+
+对照重烘焙前后的静态检查（采样 0.3 m 胶囊沿每条路线）：
+
+| manifest | 被展示台挡住的路线数 |
+| --- | --- |
+| `c4943a5`（重烘焙前） | **0** |
+| `ba8ff40`（重烘焙后） | **42** |
+
+**根因**：展示台是**独立碰撞体**，只在 App 里硬编码
+（`ResidentPropPlacementConfiguration.tableCollision`），**不在 `world.json` 的
+`collisionVolumes` 里**；而烘焙器恰恰只用 `manifest.collisionVolumes` 作为障碍
+（`bake-living-cabin-navigation-main.swift:25`）。所以烘焙器看不见展示台，会穿过它布线。
+
+**修法（推荐顺序）**：
+1. 把展示台搬进 `world.json` 的 `collisionVolumes`（它是世界里一件真实家具，本来就该在那里），
+   App 侧删掉硬编码几何；
+2. 重烘焙，复核"被挡路线 0 / 全部锚点可达"；
+3. 之后才谈是否还需要别的预留机制。
+
+注意：运行时惰性重规划（工作项 4）**不能**替代这件事——它能绕开，但绕不开时抛
+`unreachable`，就是上面那 6 个点。
+
+### 回归 2：桌面不再是可摆放面
+
+派生的承托网格在桌面高度 `y≈0.52 m` 附近**一个层都没有**（只用网格 0 个；网格 + 碰撞体也是 0 个），
+而旧实现有一个具名的 `resident.display_table` 摆放面。也就是说**"把咖啡机放在展示台上"
+这条路没了**。
+
+**根因**：`PropSupportGridBuilder` 的列扫描依赖 `groundHeight(at:)`；而
+`MarbleLivingCabinCollisionWorld.groundHeight` **只问 `environment`（网格）**，
+注释写着"The generated mesh supplies the floor; independent furniture only blocks"。
+碰撞体不提供"顶面作为地面"，所以桌子顶面永远不成为一个承托层。
+
+**修法**：让派生器把"阻挡体积的顶面"也当成候选承托面（或给
+`MarbleLivingCabinCollisionWorld.groundHeight` 增加一个**仅供摆放派生**的变体，
+不要改居民落地用的那一个，否则居民会站到桌子上）。回归 1 的修法（把展示台放进 manifest）
+会让这一步更自然：体积进入 manifest 之后，派生器与烘焙器看到的是同一份世界。
+
+### 两个回归都没有被"绕过"掩盖
+
+* `tools/test-resident-prop-grid-placement.swift` 只断言摆放链路（13 项），
+  静态的"展示台不挡路线"断言已从中移出——它属于导航问题，不属于摆放问题；
+* 上面两个数字都是实测的，不是推断的。
+
 ## 11. 已知失效验证资产（与 P2 无关，勿误判为回归）
 
 实施 P2 时发现 3 个 `tools/test-*.swift` 早就是坏的。我用干净 worktree 在改动前的提交上复现过，
@@ -426,5 +484,13 @@ public protocol WorldPropSupportQuerying: WorldCollisionQuerying {
 | `test-wish-machine-app-runtime.swift` | 编译失败：`cannot find 'registerResidentMemoryTurn' in scope` |
 | `test-wish-machine-delivery-loop.swift` | 顶层运行时错误（退出码 5 / 133 不稳定） |
 | `test-stage-resident-chat.swift` | 编译失败：`cannot find 'showFailureStatus' in scope` |
+| `test-resident-prop-placement.swift` | 运行时致命错误（本轮已改到新签名，恢复可编译） |
+| `test-resident-prop-tools.swift` | 运行时致命错误（同上） |
+| `test-resident-prop-capability.swift` | 运行时致命错误（同上；契约变更前是 swift-frontend 崩溃） |
+| `test-wish-machine-delivery-loop.swift` | 顶层运行时错误（同上，已恢复可编译） |
+
+`test-resident-prop-surfaces.swift` 已**被取代**：它的主题（具名摆放面）不复存在，
+现在由 `tools/test-resident-prop-grid-placement.swift` 承担——在真实舱体几何上跑完整
+「格子 + footprint」链路（13 项检查）。它的失败因此在上面这张表里消失了。
 
 修它们需要逐个决定"现在的等价断言是什么"，属于独立的一小批工作。**不要把它们的失败算到 P2 头上。**

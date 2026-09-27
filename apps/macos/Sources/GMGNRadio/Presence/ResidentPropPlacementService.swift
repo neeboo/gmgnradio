@@ -1,22 +1,25 @@
 import Foundation
 import WorldRuntime
 
-struct ResidentPropSupportSurface: Equatable, Sendable {
-    let id: String
-    let center: WorldVector3
-    let halfExtents: WorldVector3
-    let yaw: Float
-    let excludedCollisionID: String?
+/// 摆放校验需要的承托几何。
+///
+/// 由建造模式的 `ResidentPropGridEditorModel` 提供。拿不到时摆放一律被拒绝
+/// （fail-closed），而不是"随便放"。
+struct ResidentPropPlacementSupport {
+    let grid: PropSupportGrid
+    let collision: any WorldPropSupportQuerying
 }
 
 enum ResidentPropPlacementError: Error, Equatable, LocalizedError {
     case inactiveContext, environmentNotReady, unknownSurface, outsideSurface, collision(String), blockedRoute(String)
+    case blockedBySupport(PropSupportBlockReason)
     case avatarUnavailable, avatarChanged, attachmentUnsupported(String), propTooLarge(String), activityActive, notHeld
     var errorDescription: String? {
         switch self {
         case .inactiveContext: "当前空间或编辑操作已结束。"
         case .environmentNotReady: "空间碰撞数据尚未准备好，请稍后再摆放。"
-        case .unknownSurface: "请选择可用的地面或展示台。"
+        case .unknownSurface: "这里不是可以摆放的承托面。"
+        case .blockedBySupport(let reason): reason.errorDescription
         case .outsideSurface: "物件超出了支撑面的范围。"
         case .collision(let name): "这里会碰到居民或物件：\(name)。"
         case .blockedRoute(let name): "这里会挡住活动入口或通道：\(name)。"
@@ -33,24 +36,73 @@ enum ResidentPropPlacementError: Error, Equatable, LocalizedError {
 @MainActor
 final class ResidentPropPlacementService {
     let context: WorldAgentContext
-    let surfaces: [ResidentPropSupportSurface]
+    /// 承托几何的来源。默认 nil = 拿不到 = 不可摆放（fail-closed）。
+    private let support: () -> ResidentPropPlacementSupport?
     private let prepare: (WorldGeneratedProp) throws -> Void
     private let isCurrent: () -> Bool
-    private let validateEnvironment: (WorldCollisionVolume, Float) throws -> Void
     private let currentAvatarAssetID: () -> String?
     private let makeGripCalibration: (WorldGeneratedProp, String) throws -> WorldPropGripCalibration
-    init(context: WorldAgentContext, surfaces: [ResidentPropSupportSurface],
+    init(context: WorldAgentContext,
+         support: @escaping () -> ResidentPropPlacementSupport? = { nil },
          prepare: @escaping (WorldGeneratedProp) throws -> Void = { _ in },
          isCurrent: @escaping () -> Bool = { true },
-         validateEnvironment: @escaping (WorldCollisionVolume, Float) throws -> Void = { _,_ in throw ResidentPropPlacementError.environmentNotReady },
          currentAvatarAssetID: @escaping () -> String? = { nil },
          makeGripCalibration: @escaping (WorldGeneratedProp, String) throws -> WorldPropGripCalibration = { _,_ in
              throw ResidentPropPlacementError.attachmentUnsupported("当前居民还没有右手展示适配。")
          }) {
-        self.context = context; self.surfaces = surfaces; self.prepare = prepare; self.isCurrent = isCurrent
-        self.validateEnvironment = validateEnvironment
+        self.context = context; self.support = support; self.prepare = prepare; self.isCurrent = isCurrent
         self.currentAvatarAssetID = currentAvatarAssetID
         self.makeGripCalibration = makeGripCalibration
+    }
+
+    /// 供 `list_placement_surfaces` 工具列出的承托层。
+    ///
+    /// **不再逐个列出格子**：真实生活舱过滤后有 3,000+ 层，全列给 agent 既没用也读不完。
+    /// 按**承托高度**归并成层（同一高度的所有格子是同一层），报出高度、格数与水平范围。
+    /// `surface_id` 因此从"具名摆放面"变成"层标识"（`layer.<i>`）；实际能否摆放由位置决定，
+    /// 由 `PropPlacementEvaluator` 判定。
+    struct SupportLayerInfo: Equatable, Sendable {
+        let id: String
+        let supportHeight: Float
+        let cellCount: Int
+        let center: WorldVector3
+        let halfExtents: WorldVector3
+    }
+
+    func listedSupportLayers() -> [SupportLayerInfo] {
+        guard let grid = support()?.grid else { return [] }
+        let spacing = grid.spacing
+        guard spacing.isFinite, spacing > 0 else { return [] }
+        var byHeight: [Float: [PropSupportLayerRef]] = [:]
+        for layer in grid.layers { byHeight[layer.supportHeight, default: []].append(layer) }
+        return byHeight.keys.sorted().enumerated().map { index, height in
+            let layers = byHeight[height] ?? []
+            var minimumX = Float.greatestFiniteMagnitude, maximumX = -Float.greatestFiniteMagnitude
+            var minimumZ = Float.greatestFiniteMagnitude, maximumZ = -Float.greatestFiniteMagnitude
+            for layer in layers {
+                let x = Float(layer.column.x) * spacing
+                let z = Float(layer.column.z) * spacing
+                minimumX = min(minimumX, x); maximumX = max(maximumX, x + spacing)
+                minimumZ = min(minimumZ, z); maximumZ = max(maximumZ, z + spacing)
+            }
+            guard minimumX.isFinite, minimumZ.isFinite else {
+                return SupportLayerInfo(id: "layer.\(index)", supportHeight: height, cellCount: 0,
+                                        center: .init(x: 0, y: height, z: 0), halfExtents: .init(x: 0, y: 0, z: 0))
+            }
+            // `center` 必须是**一个真实格心**，不能是层范围的质心：编辑器用它给未摆放的
+            // 物件做初始位置，而校验要求位置落在格心上（否则首帧就会报"不是承托面"）。
+            // 取列序最小的那一格，确定性。`halfExtents` 仍然是整层的水平范围，供 UI 展示。
+            let first = layers.min { ($0.column.x, $0.column.z) < ($1.column.x, $1.column.z) }
+            let anchorX = Float(first?.column.x ?? 0) * spacing + spacing * 0.5
+            let anchorZ = Float(first?.column.z ?? 0) * spacing + spacing * 0.5
+            return SupportLayerInfo(
+                id: "layer.\(index)",
+                supportHeight: height,
+                cellCount: layers.count,
+                center: .init(x: anchorX, y: height, z: anchorZ),
+                halfExtents: .init(x: (maximumX - minimumX) / 2, y: 0, z: (maximumZ - minimumZ) / 2)
+            )
+        }
     }
 
     func holdCommand(objectID: String) throws -> WorldPropLayoutCommand {
@@ -141,28 +193,33 @@ final class ResidentPropPlacementService {
            let volume = held.returnState.generatedCollisionVolume {
             placed.append((held.objectID, held.returnState, volume))
         }
+        // 承托几何拿不到就一律拒绝（fail-closed），而不是"随便放"。
+        let support = support()
         for (id,item,box) in placed {
-            guard item.generatedProp?.objectID == id else { throw WorldPropLayoutError.invalidObject }
-            guard let surface = surfaces.first(where: { $0.id == item.supportSurfaceID }) else { throw ResidentPropPlacementError.unknownSurface }
-            guard abs(item.transform.position.y - surface.center.y) < 0.005 else { throw ResidentPropPlacementError.outsideSurface }
-            let yaw = atan2(2*(box.rotation.w*box.rotation.y),1-2*box.rotation.y*box.rotation.y)
-            for x in [-box.halfExtents.x,box.halfExtents.x] {
-                for z in [-box.halfExtents.z,box.halfExtents.z] {
-                    let wx = box.center.x + cos(yaw)*x + sin(yaw)*z - surface.center.x
-                    let wz = box.center.z - sin(yaw)*x + cos(yaw)*z - surface.center.z
-                    let lx = cos(surface.yaw)*wx-sin(surface.yaw)*wz
-                    let lz = sin(surface.yaw)*wx+cos(surface.yaw)*wz
-                    guard abs(lx) <= surface.halfExtents.x+0.0001, abs(lz) <= surface.halfExtents.z+0.0001 else { throw ResidentPropPlacementError.outsideSurface }
-                }
+            guard item.generatedProp?.objectID == id, let prop = item.generatedProp else {
+                throw WorldPropLayoutError.invalidObject
             }
-            for other in context.manifest.collisionVolumes where other.isBlocking && other.id != surface.excludedCollisionID {
-                if Self.overlap(box,other) { throw ResidentPropPlacementError.collision(other.id) }
+            guard let support else { throw ResidentPropPlacementError.environmentNotReady }
+            // 摆放校验 = 「格子 + footprint」：物件必须坐在**某一层格子**上，整块 footprint
+            // 在该层放得下。网格、阻挡体积、已放物件、净空、越界全部由评估器判定。
+            // 因此状态里的 surfaceID 现在只是一个随状态存下来的标签，不再参与校验。
+            guard let layerRef = Self.supportLayer(at: item.transform.position, grid: support.grid) else {
+                throw ResidentPropPlacementError.unknownSurface
+            }
+            let yaw = atan2(2*(box.rotation.w*box.rotation.y),1-2*box.rotation.y*box.rotation.y)
+            let footprint = WorldPlanarFootprint(size: SIMD2(prop.size.x, prop.size.z), yaw: yaw)
+            if let reason = PropPlacementEvaluator.evaluate(
+                footprint: footprint,
+                height: prop.size.y,
+                at: layerRef,
+                grid: support.grid,
+                collision: support.collision,
+                blockingVolumes: context.manifest.collisionVolumes.filter(\.isBlocking),
+                placedProps: placed.filter { $0.0 != id }.map(\.2)
+            ) {
+                throw ResidentPropPlacementError.blockedBySupport(reason)
             }
             guard context.hasEnvironmentClearance(for: box) else { throw ResidentPropPlacementError.collision("环境") }
-            try validateEnvironment(box,surface.center.y)
-            for (otherID,_,other) in placed where otherID != id {
-                if Self.overlap(box,other) { throw ResidentPropPlacementError.collision(otherID) }
-            }
         }
         let obstacles = CollisionVolumeWorld(volumes: placed.map(\.2))
         let capsule = WorldCapsule(radius: 0.25,height: 1.8)
@@ -192,21 +249,20 @@ final class ResidentPropPlacementService {
         }
     }
 
-    // Exact separating-axis footprint test for the authored yaw-only placement boxes.
-    private static func overlap(_ a: WorldCollisionVolume,_ b: WorldCollisionVolume) -> Bool {
-        guard abs(a.center.y-b.center.y) < a.halfExtents.y+b.halfExtents.y-0.0001 else { return false }
-        func axes(_ q: WorldQuaternion)->[(Float,Float)] {
-            let yaw=atan2(2*(q.w*q.y+q.x*q.z),1-2*(q.y*q.y+q.z*q.z))
-            return [(cos(yaw),-sin(yaw)),(sin(yaw),cos(yaw))]
+    /// 从摆放位置反查它坐在哪一层格子上。
+    ///
+    /// 位置来自 `PropSupportGridMapping.snappedPlacementPosition`，也就是**格心**
+    /// （列最小角 + 半格），所以列号必须先把半格减掉再取整。高度必须与该层的承托高度
+    /// 一致（容差 0.005，与旧的摆放面校验同口径）。
+    private static func supportLayer(at position: WorldVector3, grid: PropSupportGrid) -> PropSupportLayerRef? {
+        let spacing = grid.spacing
+        guard spacing.isFinite, spacing > 0 else { return nil }
+        let column = PropSupportColumn(
+            x: Int(((position.x - spacing * 0.5) / spacing).rounded()),
+            z: Int(((position.z - spacing * 0.5) / spacing).rounded())
+        )
+        return grid.layers.first {
+            $0.column == column && abs($0.supportHeight - position.y) < 0.005
         }
-        let aa=axes(a.rotation),bb=axes(b.rotation)
-        for axis in aa+bb {
-            let distance=abs((a.center.x-b.center.x)*axis.0+(a.center.z-b.center.z)*axis.1)
-            func radius(_ box:WorldCollisionVolume,_ axes:[(Float,Float)])->Float {
-                abs(axis.0*axes[0].0+axis.1*axes[0].1)*box.halfExtents.x + abs(axis.0*axes[1].0+axis.1*axes[1].1)*box.halfExtents.z
-            }
-            if distance >= radius(a,aa)+radius(b,bb)-0.0001 { return false }
-        }
-        return true
     }
 }

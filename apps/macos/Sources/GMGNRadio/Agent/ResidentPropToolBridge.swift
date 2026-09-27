@@ -60,7 +60,7 @@ extension ResidentPropDelegationError: LocalizedError {
                 properties["capability"] = ["type": "string", "description": "受支持的使用能力模板，当前仅支持 coffee.brew"]
             }
             if ["preview_prop_placement", "apply_prop_placement"].contains(name) {
-                properties["surface_id"] = ["type": "string", "description": "list_placement_surfaces 返回的支撑面编号"]
+                properties["surface_id"] = ["type": "string", "description": "list_placement_surfaces 返回的承托层编号（layer.<n>）。摆放是否成立由坐标决定。"]
                 for key in ["x", "y", "z", "yaw"] { properties[key] = ["type": "number"] }
             }
             if name == "adjust_held_prop_grip" {
@@ -69,7 +69,7 @@ extension ResidentPropDelegationError: LocalizedError {
             if Self.isMutation(name) { properties["layout_revision"] = ["type": "integer", "minimum": 0] }
             let descriptions = [
                 "read_owned_props": "读取真实已拥有物件、是否摆出、位置、能力绑定、最近一次使用状态（running/completed/stopped/failed，以回执为准）与布局版本。生成物件默认仅有外形；只有明确启用 coffee.brew 冲泡模板的咖啡机才可按模板在空间内模拟使用，不涉及现实硬件或物理结构。",
-                "list_placement_surfaces": "读取允许摆放的地面与展示台坐标、范围、角度；位置为底部中心，yaw 为弧度。",
+                "list_placement_surfaces": "读取可摆放的承托层：承托高度、格数与水平范围（不再逐个列出格子）。位置为底部中心，yaw 为弧度。",
                 "preview_prop_placement": "只验证候选摆放，不改变世界、不显示预览。碰撞或通道错误可用于调整计划。",
                 "apply_prop_placement": "按本轮人类摆放或移动委托提交已拥有物件的位置和朝向；后台仅可续办原生成任务仍有效的有限摆放委托，只能摆该产物到允许的支撑面。先查询布局版本和支撑面并预检，位置和朝向使用绝对值。",
                 "withdraw_prop": "仅按本轮人类委托收回已拥有摆件，保留物件和来源，不删除或重新生成。",
@@ -128,7 +128,11 @@ extension ResidentPropDelegationError: LocalizedError {
         }
         do {
             if name == "list_placement_surfaces" {
-                return result(["ok": true, "surfaces": service.surfaces.map { ["id": $0.id, "center": Self.vector($0.center), "half_extents": Self.vector($0.halfExtents), "yaw": $0.yaw] }])
+                // 承托面现在是"层"：按承托高度归并，不再逐格列出（见 `listedSupportLayers`）。
+                return result(["ok": true, "surfaces": service.listedSupportLayers().map {
+                    ["id": $0.id, "support_height": $0.supportHeight, "cell_count": $0.cellCount,
+                     "center": Self.vector($0.center), "half_extents": Self.vector($0.halfExtents), "yaw": Float.zero]
+                }])
             }
             var preview: WorldObjectState?
             if ["preview_prop_placement", "apply_prop_placement"].contains(name) {

@@ -52,6 +52,15 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         didSet { stageContentView?.onGridCursor = onResidentPropGridCursor }
     }
 
+    var onResidentPropGridRotate: ((Int) -> Void)? {
+        didSet { stageContentView?.onGridRotate = onResidentPropGridRotate }
+    }
+
+    /// 建造模式：把预览挪到吸附后的格心（层名 + footprint 朝向）。
+    func moveResidentPropGridPointer(to position: WorldVector3, layerName: String, yaw: Float) async {
+        await residentPropEditor.moveGridPointer(to: position, layerName: layerName, yaw: yaw)
+    }
+
     /// 建造模式算 footprint 用的物件尺寸：优先"正在拖动/待确认"的那个，否则用选中的。
     /// 没有选中任何物件时返回 nil，调用方退回"一格"的 footprint。
     var residentPropFootprint: (size: SIMD2<Float>, height: Float)? {
@@ -561,6 +570,9 @@ private final class StageContentView: NSView {
     /// 建造模式的光标回调，转给真正处理鼠标的交互视图。
     var onGridCursor: ((SIMD2<Float>) -> Void)? {
         didSet { worldInteractionView.onGridCursor = onGridCursor }
+    }
+    var onGridRotate: ((Int) -> Void)? {
+        didSet { worldInteractionView.onGridRotate = onGridRotate }
     }
 
     private let overlayState: StageOverlayState
@@ -1163,6 +1175,8 @@ private final class StageWorldInteractionView: NSView {
     /// 建造模式的光标回调。参数是**归一化、左上原点**的光标位置，与
     /// `SpatialStageStore.residentPropPoint` 和 `PropSupportGridPicker` 同一套约定。
     var onGridCursor: ((SIMD2<Float>) -> Void)?
+    /// 建造模式的 90° 步进旋转（+1 顺时针 / -1 逆时针）。
+    var onGridRotate: ((Int) -> Void)?
 
     init(spatialStage: SpatialStageStore, propEditor: ResidentPropEditorState) {
         self.spatialStage = spatialStage
@@ -1256,6 +1270,23 @@ private final class StageWorldInteractionView: NSView {
             propEditor.escape()
             return
         }
+        // 建造模式：R 顺时针 90°，Shift+R 逆时针 90°。
+        if propEditor.isOpen, spatialStage.isResidentPropBuildModeActive,
+           let steps = Self.gridRotationSteps(for: event) {
+            onGridRotate?(steps)
+            return
+        }
+        // Delete / Forward Delete：收回选中的物件（面板上也有"收回"按钮）。
+        if propEditor.isOpen, event.keyCode == 51 || event.keyCode == 117 {
+            Task { await propEditor.withdraw() }
+            return
+        }
+        // Cmd+Z：撤销上一次摆放（面板上也有"撤销上次"按钮）。
+        if propEditor.isOpen, event.modifierFlags.contains(.command),
+           event.charactersIgnoringModifiers?.lowercased() == "z" {
+            Task { await propEditor.undo() }
+            return
+        }
         if propEditor.isOpen { return }
         guard !(window?.firstResponder is NSTextView),
               let movement = Self.movement(for: event.keyCode) else {
@@ -1316,6 +1347,12 @@ private final class StageWorldInteractionView: NSView {
         // A tracking area can see moves above another view. Never project a control or input click.
         guard superview?.hitTest(convert(point, to: superview)) === self else { return }
         updatePropPointer(event)
+    }
+
+    /// 建造模式的 90° 步进旋转键。
+    private static func gridRotationSteps(for event: NSEvent) -> Int? {
+        guard event.charactersIgnoringModifiers?.lowercased() == "r" else { return nil }
+        return event.modifierFlags.contains(.shift) ? -1 : 1
     }
 
     private func updatePropPointer(_ event: NSEvent, confirm: Bool = false) {

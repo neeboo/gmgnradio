@@ -109,6 +109,23 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
         guard !isSaving, let p = placement else { return }
         await validate(.init(surfaceID: p.surfaceID, position: point, yaw: p.yaw))
     }
+    /// 建造模式：把预览挪到吸附后的格心。
+    ///
+    /// 与 `movePointer` 的差别有两点，都是建造模式需要的：
+    /// - `surfaceID` 换成**层标识**（surfaceID 不再是具名摆放面）；
+    /// - `yaw` 由调用方给（来自 `ResidentPropGridEditorModel.footprintYaw`），
+    ///   这样 footprint 朝向只有一个真相来源，不会和编辑器里的旧值打架。
+    func moveGridPointer(to point: WorldVector3, layerName: String, yaw: Float) async {
+        guard !isSaving, placement != nil else { return }
+        await validate(.init(surfaceID: layerName, position: point, yaw: yaw))
+    }
+
+    /// 建造模式的 90° 步进旋转（既有的 `rotate` 是 45°，保留给别的入口）。
+    func rotateQuarterTurn(bySteps steps: Int) async {
+        guard !isSaving, let p = placement else { return }
+        await validate(.init(surfaceID: p.surfaceID, position: p.position, yaw: p.yaw + Float(steps) * .pi / 2))
+    }
+
     func pointerMissed() {
         guard !isSaving else { return }
         previewGeneration = UUID(); candidate = nil; onPreviewChanged(nil)

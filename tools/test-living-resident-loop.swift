@@ -314,7 +314,7 @@ typealias RealConversationService = AgentConversationService
     var spatialStage = Stage()
     var livingWorldContext: WorldAgentContext?
     private func residentPropPlacementService(context:WorldAgentContext,isCurrent:@escaping @MainActor ()->Bool) -> ResidentPropPlacementService {
-        ResidentPropPlacementService(context:context,surfaces:[],isCurrent:isCurrent,validateEnvironment:{_,_ in})
+        ResidentPropPlacementService(context:context,isCurrent:isCurrent)
     }
     private func synchronizeResidentPropPresentation() {}
     private func prepareResidentPropMutation(_ command:WorldPropLayoutCommand,context:WorldAgentContext) async throws {}

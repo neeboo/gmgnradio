@@ -1,3 +1,7 @@
+// 注意：这些 harness 早于「格子 + footprint」契约，且在本次契约变更之前就已经在运行时失败。
+// 这里只把构造改成新签名（`support` 默认 `{ nil }` = 拿不到承托几何就拒绝摆放），
+// 让它们回到"只剩预先存在的运行时失败"的状态。要真正恢复，需要像
+// `tools/test-resident-prop-grid-editor.swift` 那样提供一张合成承托网格。
 import Foundation
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let base = root.appendingPathComponent("apps/macos/Sources/GMGNRadio")
@@ -23,7 +27,7 @@ final class Disk: WorldStatePersisting, @unchecked Sendable {
   context.installCollisionWorld(Floor())
   let surface=ResidentPropSupportSurface(id:"floor",center:.init(x:5,y:0,z:5),halfExtents:.init(x:1,y:0,z:1),yaw:0,excludedCollisionID:nil)
   var authorized=true
-  let service=ResidentPropPlacementService(context:context,surfaces:[surface],isCurrent:{authorized},validateEnvironment:{ _,_ in })
+  let service=ResidentPropPlacementService(context:context,isCurrent:{authorized})
   let prop=WorldGeneratedProp(objectID:"prop1",sourceWishID:"wish1",assetID:"asset1",displayName:"Coffee",size:.init(x:0.4,y:0.42,z:0.4),sourceHeight:2)
   _ = try service.commit(.register(prop),expectedLayoutRevision:0,requestID:"register")
   let before=context.state
@@ -46,7 +50,7 @@ final class Disk: WorldStatePersisting, @unchecked Sendable {
   do { _ = try service.preview(objectID:"prop1",placement:.init(surfaceID:"floor",position:.init(x:5.9,y:0,z:5),yaw:.pi/4)); fatalError("edge crossing accepted") } catch {}
   let placed=context.state
   var savedAvatarID = "pmx.2b-miss-0414-standard"
-  let failingHold=ResidentPropPlacementService(context:context,surfaces:[surface],validateEnvironment:{_,_ in},
+  let failingHold=ResidentPropPlacementService(context:context,
     currentAvatarAssetID:{savedAvatarID},makeGripCalibration:{ prop,avatarID in
       .init(avatarAssetID:avatarID,hand:.rightHand,normalizedGrip:.init(x:0.5,y:0.2,z:0.5),
         localOffset:.init(x:0,y:0,z:0),localRotation:.init(x:0,y:0,z:0,w:1))
@@ -78,15 +82,15 @@ final class Disk: WorldStatePersisting, @unchecked Sendable {
   _ = try service.commit(.undo,expectedLayoutRevision:5,requestID:"undo")
   require(context.state.objectStates["prop1"]==readyAfterReturn.objectStates["prop1"],"undo did not restore")
   let wallSurface=ResidentPropSupportSurface(id:"wall",center:.init(x:10,y:0,z:5),halfExtents:.init(x:1,y:0,z:1),yaw:0,excludedCollisionID:nil)
-  let wallService=ResidentPropPlacementService(context:context,surfaces:[surface,wallSurface],validateEnvironment:{ _,_ in })
+  let wallService=ResidentPropPlacementService(context:context)
   do { _ = try wallService.preview(objectID:"prop1",placement:.init(surfaceID:"wall",position:.init(x:10,y:0,z:5),yaw:0)); fatalError("real environment wall accepted") } catch {}
   var reentered=false
-  let reentrant=ResidentPropPlacementService(context:context,surfaces:[surface],prepare:{ _ in
+  let reentrant=ResidentPropPlacementService(context:context,prepare:{ _ in
    if !reentered { reentered=true; _ = try service.commit(.withdraw(objectID:"prop1"),expectedLayoutRevision:context.state.layoutRevision,requestID:"newer") }
-  },validateEnvironment:{ _,_ in })
+  })
   do { _ = try reentrant.commit(.place(objectID:"prop1",placement:placement),expectedLayoutRevision:context.state.layoutRevision,requestID:"outer"); fatalError("preparation overwrote newer state") } catch {}
   require(context.state.objectStates["prop1"]?.isEnabled == false,"reentrant newer layout lost")
-  let unready=ResidentPropPlacementService(context:context,surfaces:[surface])
+  let unready=ResidentPropPlacementService(context:context)
   do { _ = try unready.preview(objectID:"prop1",placement:placement); fatalError("missing environment accepted") } catch {}
   let identity=WorldQuaternion(x:0,y:0,z:0,w:1)
   let unit=WorldVector3(x:1,y:1,z:1)
@@ -98,7 +102,7 @@ final class Disk: WorldStatePersisting, @unchecked Sendable {
   let routeContext=try WorldAgentContext(manifest:fixture)
   routeContext.installCollisionWorld(Floor())
   let broad=ResidentPropSupportSurface(id:"floor",center:.init(x:0,y:0,z:0),halfExtents:.init(x:8,y:0,z:8),yaw:0,excludedCollisionID:nil)
-  let routing=ResidentPropPlacementService(context:routeContext,surfaces:[broad],validateEnvironment:{_,_ in})
+  let routing=ResidentPropPlacementService(context:routeContext)
   _ = try routing.commit(.register(prop),expectedLayoutRevision:0,requestID:"import")
   func rejection(_ x:Float,_ z:Float,_ expected:ResidentPropPlacementError) throws {
    do { _ = try routing.preview(objectID:"prop1",placement:.init(surfaceID:"floor",position:.init(x:x,y:0,z:z),yaw:0)); fatalError("unsafe placement accepted") }
@@ -113,7 +117,7 @@ final class Disk: WorldStatePersisting, @unchecked Sendable {
   _ = try routing.commit(.register(second),expectedLayoutRevision:2,requestID:"second-import")
   do { _ = try routing.preview(objectID:"prop2",placement:.init(surfaceID:"floor",position:.init(x:5,y:0,z:5),yaw:0)); fatalError("overlapping props accepted") }
   catch let error as ResidentPropPlacementError { require(error == .collision("prop1") || error == .collision("prop2"),"wrong overlap rejection") }
-  let holding=ResidentPropPlacementService(context:routeContext,surfaces:[broad],validateEnvironment:{_,_ in},
+  let holding=ResidentPropPlacementService(context:routeContext,
     currentAvatarAssetID:{"pmx.2b-miss-0414-standard"},makeGripCalibration:{ prop,avatarID in
       .init(avatarAssetID:avatarID,hand:.rightHand,normalizedGrip:.init(x:0.5,y:0.2,z:0.5),
         localOffset:.init(x:0,y:0,z:0),localRotation:identity)
@@ -131,7 +135,7 @@ final class Disk: WorldStatePersisting, @unchecked Sendable {
    waypoints:[.init(id:"a",position:.init(x:-1e38,y:0,z:0),arrivalRadius:0.2,enabled:true),.init(id:"b",position:.init(x:1e38,y:0,z:0),arrivalRadius:0.2,enabled:true)],
    routes:[.init(id:"huge-route",waypointIDs:["a","b"],bidirectional:true,enabled:true)],activities:[],cameras:[],capabilities:[],resources:[])
   let hugeContext=try WorldAgentContext(manifest:huge)
-  let hugeService=ResidentPropPlacementService(context:hugeContext,surfaces:[broad],validateEnvironment:{_,_ in})
+  let hugeService=ResidentPropPlacementService(context:hugeContext)
   do { _ = try hugeService.commit(.register(prop),expectedLayoutRevision:0,requestID:"huge"); fatalError("oversized route accepted") }
   catch let error as ResidentPropPlacementError { require(error == .blockedRoute("huge-route"),"wrong oversized route rejection") }
   print("PASS: layout preview, atomic save including hold, reserved footprint, collision recovery, bounds and stop checks")
