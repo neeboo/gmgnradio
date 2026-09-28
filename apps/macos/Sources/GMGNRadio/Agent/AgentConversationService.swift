@@ -1095,8 +1095,9 @@ final class AgentConversationService {
         (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
 
-    /// 适配器 onError 的可见文案；不应出现的内部状态（notBound/emptyText）返回
-    /// nil 静默，不打扰已成功的聊天。
+    /// 适配器 onError 的**日志**文案；不应出现的内部状态（notBound/emptyText）
+    /// 返回 nil 静默。宿主侧只把它写进日志、不上屏：记忆交付失败不影响聊天，
+    /// 用状态行告诉用户只会让人以为聊天坏了。
     nonisolated private static func memoryErrorDescription(
         _ error: ResidentConversationMemoryError
     ) -> String? {
