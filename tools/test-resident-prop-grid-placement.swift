@@ -247,6 +247,44 @@ let second=WorldGeneratedProp(objectID:"test.second",sourceWishID:"test.second",
               "on the real cabin a row click enters the carrying state once the grid is ready (selectedID=\(editable.selectedID ?? "nil"), notice=\(editable.notice))")
         check(editable.candidate != nil,
               "the carrying state previews the prop at its own placement (preview=\(editable.candidate == nil ? "nil" : "set"), notice=\(editable.notice))")
+        // 10.（任务 2）**还没摆出来**的物件的初始落点必须是"真的能放"的那一格。
+        //
+        // 旧行为：初始落点固定退到 `listedSupportLayers().first.center` —— 最低层里列序最小的格。
+        // 真实生活舱实测那一格被活动通道挡住，于是勾和控件都出现了、footprint 却是红的，
+        // 直到鼠标动一下才对。这里两条一起钉住：旧的默认点**确实**被挡，而自动初始落点**可放**。
+        let rookie=WorldGeneratedProp(objectID:"test.rookie",sourceWishID:"test.rookie",assetID:"test.rookie",
+            displayName:"新物件",size:WorldVector3(x:0.2,y:0.2,z:0.2),sourceHeight:1)
+        _=try service.commit(.register(rookie),expectedLayoutRevision:context.state.layoutRevision,requestID:"register-rookie")
+        do {
+            _=try service.preview(objectID:rookie.objectID,
+                placement:.init(surfaceID:listed[0].id,position:listed[0].center,yaw:0))
+            check(false,"the lowest layer's minimum-column cell is the spot the old default landed on")
+        } catch {
+            check(true,"on the real cabin the old default landing spot is blocked (\(error.localizedDescription))")
+        }
+        let autoSurfaces=ResidentPropInitialPlacement.fillingAnchors(
+            listed.enumerated().map { index,layer in
+                ResidentPropEditorSurface(id:layer.id,
+                    name:index == 0 ? "地面" : String(format:"台面 %.2f m",layer.supportHeight),
+                    position:layer.center,cellCount:layer.cellCount) },
+            grid:grid,spawn:manifest.spawn.position)
+        let automatic=ResidentPropEditorState()
+        automatic.update(.init(worldID:manifest.worldID,revision:context.state.layoutRevision,
+            objects:context.state.objectStates.values.filter { $0.generatedProp != nil },
+            surfaces:autoSurfaces,canUndo:false,heldProp:context.state.heldProp))
+        automatic.open()
+        automatic.preview = { id,placement in try service.preview(objectID:id,placement:placement) }
+        await automatic.select(objectID:rookie.objectID)
+        check(automatic.candidate != nil && automatic.isCarrying,
+            "selecting a prop that is not placed yet must start on a placeable spot (candidate=\(automatic.candidate == nil ? "nil" : "set"), notice=\(automatic.notice))")
+        // 而且那个落点必须是**真实存在的格心**（列号 × 间距 + 半格、层高一致），
+        // 不是"断言某个具体坐标"：换世界、换尺寸它都得成立。
+        check(automatic.placement.map { placement in grid.layers.contains { layer in
+            abs(layer.supportHeight - placement.position.y) < 0.005
+                && Float(layer.column.x) * grid.spacing + grid.spacing * 0.5 == placement.position.x
+                && Float(layer.column.z) * grid.spacing + grid.spacing * 0.5 == placement.position.z
+        } } ?? false,"the automatic landing spot is a real derived grid cell centre")
+
         print("PASS: \(count) real cabin grid placement checks; layers=\(grid.layers.count), coffee anchor y=\(anchor.supportHeight)")
     }
 }

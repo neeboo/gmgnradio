@@ -219,6 +219,7 @@
 		BD7A533625344B6740D9529A /* PropSupportGridRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 652898977757565954C3204B /* PropSupportGridRenderer.swift */; };
 		BDC05DA87665B003D98568B7 /* PMXMaterialCompatibility.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1D9F054780A912DD632D2B6 /* PMXMaterialCompatibility.swift */; };
 		BE07E362E209AC1F9219CBB3 /* VMDToVRMClipAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE18DAB4452CEAD1448BC100 /* VMDToVRMClipAdapter.swift */; };
+		BE8279BE4B674F79C4B6B749 /* ResidentPropHitTest.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA90C9153FCCDA6F98E99627 /* ResidentPropHitTest.swift */; };
 		BEB4C8BCA7C17AD706CD5267 /* GLTFMetalKit in Frameworks */ = {isa = PBXBuildFile; productRef = C3FCCC8D1C10983C138146E3 /* GLTFMetalKit */; };
 		C04254A6FF945016763D8B48 /* ResidentStateClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 19678E75760FF52C34D1F4BB /* ResidentStateClient.swift */; };
 		C10827D8D39E84E9E79DFFD9 /* DJProgramStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F0C99CC73DBA693F2E286F1 /* DJProgramStore.swift */; };
@@ -570,6 +571,7 @@
 		F8D7676CE6E2E2866ECEB0E9 /* ResidentDSHAgentToolBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentDSHAgentToolBridge.swift; sourceTree = "<group>"; };
 		F904758C6A09AFB3E4669F60 /* ResidentMusicToolBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentMusicToolBridge.swift; sourceTree = "<group>"; };
 		F934C041C38E2FBEE9EFAEB7 /* OrbMetalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbMetalView.swift; sourceTree = "<group>"; };
+		FA90C9153FCCDA6F98E99627 /* ResidentPropHitTest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentPropHitTest.swift; sourceTree = "<group>"; };
 		FB1A15690B115ECC57F64F9E /* RealtimeDJSessionController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeDJSessionController.swift; sourceTree = "<group>"; };
 		FB8A88527BC23EB19602B4AB /* StageCameraCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageCameraCoordinatorTests.swift; sourceTree = "<group>"; };
 		FC8DB2FC6BF5BF149BD893CC /* StageWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageWindowController.swift; sourceTree = "<group>"; };
@@ -976,6 +978,7 @@
 				193229015897C584DE49ABC2 /* ResidentPerformanceMotionPolicy.swift */,
 				4B883AB50613AABC30AE090C /* ResidentPropEditorState.swift */,
 				2AFE7612BD0C88006DB3BDC2 /* ResidentPropGridEditorModel.swift */,
+				FA90C9153FCCDA6F98E99627 /* ResidentPropHitTest.swift */,
 				FEA756421C88CC46A0081E6E /* ResidentPropPlacementConfiguration.swift */,
 				F6D9D44D3F0366183C6571C0 /* ResidentPropPlacementService.swift */,
 				0CF4BBDAD919719A1DBF7F9E /* ResidentPropRenderer.swift */,
@@ -1533,6 +1536,7 @@
 				B388D26A0C8A9CFC0FDE7946 /* ResidentPropEditorState.swift in Sources */,
 				16C07A20AA5DBDF36D914E03 /* ResidentPropEditorView.swift in Sources */,
 				DFBB39349649A969874CAEEE /* ResidentPropGridEditorModel.swift in Sources */,
+				BE8279BE4B674F79C4B6B749 /* ResidentPropHitTest.swift in Sources */,
 				995518C0CBFC44D828848E40 /* ResidentPropPlacementConfiguration.swift in Sources */,
 				4112603D7E0222EA77CBF228 /* ResidentPropPlacementService.swift in Sources */,
 				20C8510B171A3F23D8C51635 /* ResidentPropRenderer.swift in Sources */,

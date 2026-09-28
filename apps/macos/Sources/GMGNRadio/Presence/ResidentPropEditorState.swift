@@ -6,6 +6,120 @@ struct ResidentPropEditorSurface: Identifiable, Equatable, Sendable {
     let id: String
     let name: String
     let position: WorldVector3
+    /// 这一层上有多少个格子（同一承托高度的格子数）。
+    ///
+    /// 为什么要它：真实舱体的地面是**起伏网格**，按高度归并之后每个高度常常只有 1 格
+    /// （实测 3,160 格 / 3,136 个高度）；而桌面、台面是平的，一层能有十几格。
+    /// 未摆出的物件的初始落点因此先试**格子多**的层 —— 那才是"平整、放得下"的承托面。
+    var cellCount: Int = 0
+    /// 这一层的候选落点，**离出生点（`manifest.spawn`）近的排在前面**。
+    ///
+    /// 空数组表示"只有 `position` 这一个候选"（宿主拿不到网格时的退路，旧行为）。
+    /// 顺序是**纯顺序**：能不能放由 `ResidentPropEditorState` 用 `preview`
+    /// （= `ResidentPropPlacementService.preview`，fail-closed）逐个确认。
+    var candidateAnchors: [WorldVector3] = []
+}
+
+/// 未摆出物件的初始落点候选：**纯排序，不含任何判定**。
+///
+/// 规则只有一句话：**承托面越平整越大越靠前**（同一高度上的格子越多越靠前），
+/// 同一个承托面内**离出生点越近越靠前**（并列按列序，保证确定性）。
+///
+/// 为什么不在这里判"能不能放"：那有唯一一条既有路径（`PropPlacementEvaluator` 给悬停格子判、
+/// `ResidentPropPlacementService.preview` 给落点判）。这里只提供**顺序**，判定留给它们。
+enum ResidentPropInitialPlacement {
+    /// 把网格里**同一承托高度**的格子按"离出生点近"排好，挂到对应的承托面上。
+    ///
+    /// `surfaces` 必须来自同一份网格（`ResidentPropPlacementService.listedSupportLayers()`），
+    /// 所以按高度归并时能一一对上。`grid` 为 nil 或 `surfaces` 为空时原样返回 ——
+    /// 那是"格子还在派生"，不是"没有候选"。
+    static func fillingAnchors(
+        _ surfaces: [ResidentPropEditorSurface],
+        grid: PropSupportGrid?,
+        spawn: WorldVector3,
+        limitPerSurface: Int = 8
+    ) -> [ResidentPropEditorSurface] {
+        guard let grid, !surfaces.isEmpty, grid.spacing.isFinite, grid.spacing > 0 else { return surfaces }
+        let spacing = grid.spacing
+        var byHeight: [Float: [PropSupportLayerRef]] = [:]
+        for layer in grid.layers { byHeight[layer.supportHeight, default: []].append(layer) }
+        return surfaces.map { surface in
+            guard let layers = byHeight[surface.position.y], !layers.isEmpty else { return surface }
+            let ordered = layers
+                .map { layer -> (distance: Float, x: Int, z: Int, position: WorldVector3) in
+                    let x = Float(layer.column.x) * spacing + spacing * 0.5
+                    let z = Float(layer.column.z) * spacing + spacing * 0.5
+                    let dx = x - spawn.x, dz = z - spawn.z
+                    return (dx * dx + dz * dz, layer.column.x, layer.column.z,
+                            WorldVector3(x: x, y: layer.supportHeight, z: z))
+                }
+                .sorted { $0.distance == $1.distance
+                    ? ($0.x, $0.z) < ($1.x, $1.z)
+                    : $0.distance < $1.distance }
+                .prefix(max(1, limitPerSurface))
+            var enriched = surface
+            enriched.candidateAnchors = ordered.map(\.position)
+            return enriched
+        }
+    }
+}
+
+/// 场景里一次「点一下」该做什么 —— **唯一一份**分流规则。
+///
+/// 控制器只负责把"按下/抬起、clickCount、手上有没有物件、命中哪一件"喂进来，
+/// 规则本身在这里（于是它可以离线逐项验证，不需要起窗口、也不需要真的鼠标）。
+///
+/// 与"点面板里那一行"是两条入口，但**同一条出口**：`select(objectID:)`。
+enum ResidentPropSceneClick {
+    enum Action: Equatable {
+        /// 什么也不做（编辑器没开 / 没点中任何东西 / 双击）。
+        case none
+        /// 拿起场景里的已摆物件：进入携带态（`ResidentPropEditorState.select`）。
+        case pickUp(String)
+        /// 点地放下：既有落地通路（`onResidentPropGridCommit`）。
+        case dropAtGrid
+        /// 双击：把「刚在场景里拾起的那一下」撤回原位（preview 从不改世界），并复位相机。
+        case reclaimPickUpAndResetCamera
+    }
+
+    /// 「抬起」这一次点击该做什么。
+    ///
+    /// - 编辑器没打开（或格子没激活）：**没有任何效果**（防误触）。
+    /// - 手上有物件：任何单击都是**放下**，绝不是重新拾取 —— 否则"想把手里这件放稳"
+    ///   会变成"把脚边那件又拿起来"。
+    /// - 空手 + 单击命中已摆物件：拾取。
+    /// - 双击：不拾取（既有的"复位相机"保留，见 `resolvePress`）。
+    static func resolve(
+        isEditorOpen: Bool,
+        isBuildModeActive: Bool,
+        isCarrying: Bool,
+        clickCount: Int,
+        hitObjectID: String?
+    ) -> Action {
+        guard isEditorOpen, isBuildModeActive else { return .none }
+        if isCarrying { return .dropAtGrid }
+        guard clickCount == 1, let hitObjectID else { return .none }
+        return .pickUp(hitObjectID)
+    }
+
+    /// 「按下」这一次该做什么：只回答双击那一下要不要**撤回刚拾起的那一件**。
+    ///
+    /// 双击的第一下已经是一记合法的单击（已经拿起），第二下到来时把这一下撤回原位并复位相机 ——
+    /// 净效果就是"双击不做拾取，相机照旧复位"。撤回不需要新状态：携带态只是 preview，
+    /// **从不改世界**，所以撤回不会留下半次摆放。
+    ///
+    /// 判据里刻意**不问** `isCarrying`：拾取是异步的，第二下完全可能赶在它落地之前到来。
+    /// `cancelPreview()` 两种时序都能兜住（它清 `selectedID`，`select` 的后续步骤会自己放弃）。
+    static func resolvePress(
+        isEditorOpen: Bool,
+        isBuildModeActive: Bool,
+        carryingStartedAtScenePointer: Bool,
+        clickCount: Int
+    ) -> Action {
+        guard isEditorOpen, isBuildModeActive else { return .none }
+        guard carryingStartedAtScenePointer, clickCount > 1 else { return .none }
+        return .reclaimPickUpAndResetCamera
+    }
 }
 
 struct ResidentPropEditorSnapshot: Equatable, Sendable {
@@ -147,8 +261,58 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
         }
         let q = object.transform.rotation
         let yaw = atan2(2 * (q.w * q.y + q.x * q.z), 1 - 2 * (q.y * q.y + q.z * q.z))
-        await validate(.init(surfaceID: support.id, position: object.isEnabled ? object.transform.position : support.position, yaw: yaw))
+        if object.isEnabled {
+            // **已摆出的物件必须继续用自身的 transform**：它现在就在那儿，携带态只是把它
+            // 原地"拿起来"，所以初始落点必须是它自己的位置与朝向。
+            await validate(.init(surfaceID: support.id, position: object.transform.position, yaw: yaw))
+            return
+        }
+        // 未摆出的物件（刚领的许愿产物）没有自己的 transform 可用。旧行为是固定退到那一层里
+        // **列序最小**的那一格 —— 真实房间里那一格常常紧贴墙、家具或活动通道，于是勾和控件都
+        // 出现了、footprint 却是红的，直到鼠标动一下才对。
+        // 现在改成：按"承托面越平整越靠前、同面内离出生点越近越靠前"逐个用 `preview` 试，
+        // **第一个真能放的就是初始落点**；判定只用既有的摆放服务，这里不新写几何。
+        guard let initial = await firstPlaceablePlacement(objectID: objectID, yaw: yaw) else {
+            // 试遍候选都不可放：保持现状（退回这一层的默认落点）并**明说**，不假装成功。
+            let fallback = WorldPropPlacement(surfaceID: support.id, position: support.position, yaw: yaw)
+            await validate(fallback)
+            if candidate == nil { notice = "这里没有找到能放下它的位置：\(notice)" }
+            return
+        }
+        await validate(initial)
     }
+
+    /// 未摆出物件的初始落点：按候选顺序逐个问 `preview`，第一个非 nil 的就是它。
+    ///
+    /// - 候选顺序由宿主填进 `snapshot.surfaces`（`cellCount` 越大越靠前，同层内离出生点越近）；
+    ///   拿不到网格时 `candidateAnchors` 为空，退回每一层的 `position`（旧行为）。
+    /// - 判定**只有**一条：`preview`（= `ResidentPropPlacementService.preview`，fail-closed）。
+    /// - `initialPlacementAttemptLimit` 是**主线程预算**：真实舱体一次 preview 约 5–13 ms
+    ///   （-Onone；它要遍历全部承托层、活动通道与已放物件），不封顶就会在"放不下"的物件上
+    ///   把主线程卡住。实测：0.2 m / 0.35×0.57 m / 0.45 m 三种尺寸都在**第 1 个候选**就成功。
+    private func firstPlaceablePlacement(objectID: String, yaw: Float) async -> WorldPropPlacement? {
+        guard let preview, !snapshot.surfaces.isEmpty else { return nil }
+        // 承托面的顺序：格子多的在前（平整、成块的桌面/台面），并列时低的在前 —— 确定性。
+        let ordered = snapshot.surfaces.sorted {
+            $0.cellCount == $1.cellCount ? $0.position.y < $1.position.y : $0.cellCount > $1.cellCount
+        }
+        var attempts = 0
+        for surface in ordered {
+            let anchors = surface.candidateAnchors.isEmpty ? [surface.position] : surface.candidateAnchors
+            for anchor in anchors {
+                guard attempts < Self.initialPlacementAttemptLimit else { return nil }
+                // 试的过程中用户可能已经取消选择、关掉编辑器或换了世界：那就别再往下试。
+                guard isOpen, !isSaving, selectedID == objectID else { return nil }
+                attempts += 1
+                let placement = WorldPropPlacement(surfaceID: surface.id, position: anchor, yaw: yaw)
+                if (try? await preview(objectID, placement)) != nil { return placement }
+            }
+        }
+        return nil
+    }
+
+    /// 初始落点最多试几次 `preview`。见 `firstPlaceablePlacement` 的取舍说明。
+    static let initialPlacementAttemptLimit = 32
 
     /// 这一行现在能坐在哪一层承托面上。
     ///

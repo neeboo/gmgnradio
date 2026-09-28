@@ -95,6 +95,13 @@ enum PropSupportGridPresentation {
         case validFootprint
         /// 当前 footprint 的一部分，但整体不合法。
         case invalidFootprint
+        /// 光标正悬停在**这一件已经摆出来的物件**上（The Sims 的 white glow 语义：
+        /// 发光 = "这一件可以点起来"）。
+        ///
+        /// 它和 `validFootprint` 共用同一条绘制路径：`ResidentPropGridEditorModel` 把悬停物件的
+        /// footprint 格子写进 `states`，而 `focus` 的锚点**就是** `states` 的键 —— 于是发光
+        /// 自动落在"物件脚下那一小块 + 两圈淡格"里，不绕开焦点裁剪，也不需要第二个绘制入口。
+        case hoverTarget
 
         /// 线性 RGBA。放在这里是为了让"哪种状态什么颜色"成为**可测的事实**，
         /// 而不是散落在 shader 里的魔法数。
@@ -105,6 +112,9 @@ enum PropSupportGridPresentation {
             case .occupied: SIMD4(0.55, 0.58, 0.62, 1)
             case .validFootprint: SIMD4(1.00, 0.82, 0.25, 1)
             case .invalidFootprint: SIMD4(0.95, 0.35, 0.30, 1)
+            // 白里透青：与黄（可放）、红（不可放）、灰（被占）都不同色相，所以"发光"不会被
+            // 误读成某一种判定结果 —— 它回答的是"点它就能拿起来"，不是"这里能不能放"。
+            case .hoverTarget: SIMD4(0.86, 0.97, 1.00, 1)
             }
         }
     }

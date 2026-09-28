@@ -2,6 +2,7 @@ import Foundation
 let descriptor = "apps/macos/Sources/GMGNRadio/Presence/WishMachineOutputDescriptor.swift"
 let picker = "apps/macos/Sources/GMGNRadio/Presence/PropSupportGridPicker.swift"
 let presentation = "apps/macos/Sources/GMGNRadio/Presence/PropSupportGridPresentation.swift"
+let hitTest = "apps/macos/Sources/GMGNRadio/Presence/ResidentPropHitTest.swift"
 let source = try String(contentsOfFile: descriptor, encoding: .utf8)
 guard source.contains("struct ResidentPropRenderDescriptor") else { print("FAIL: resident prop placement contract missing"); exit(1) }
 // 拾取器刻意只依赖 Foundation + simd，所以这里能单独编译它做离线验证。
@@ -17,6 +18,12 @@ guard presentationSource.contains("enum PropSupportGridPresentation") else { pri
 let presentationImports = presentationSource.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
 guard presentationImports.allSatisfy({ $0 == "" || !$0.hasPrefix("import ") || $0 == "import Foundation" || $0 == "import simd" }) else {
     print("FAIL: grid presentation must only import Foundation and simd"); exit(1) }
+// 场景内「点已摆物件」的命中：同样只依赖 Foundation + simd（它复用拾取器的射线）。
+let hitTestSource = try String(contentsOfFile: hitTest, encoding: .utf8)
+guard hitTestSource.contains("enum ResidentPropHitTest") else { print("FAIL: resident prop hit test missing"); exit(1) }
+let hitTestImports = hitTestSource.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+guard hitTestImports.allSatisfy({ $0 == "" || !$0.hasPrefix("import ") || $0 == "import Foundation" || $0 == "import simd" }) else {
+    print("FAIL: resident prop hit test must only import Foundation and simd"); exit(1) }
 let harness = #"""
 import Foundation
 import simd
@@ -162,7 +169,7 @@ func check(_ value: Bool, _ message: String) { if !value { print("FAIL:",message
         "a cell beyond maximumDistance is not drawn")
 
   // 状态着色：每种状态颜色不同，且能被显式覆盖。
-  let allStates:[PropSupportGridPresentation.CellState] = [.placeable,.blocked,.occupied,.validFootprint,.invalidFootprint]
+  let allStates:[PropSupportGridPresentation.CellState] = [.placeable,.blocked,.occupied,.validFootprint,.invalidFootprint,.hoverTarget]
   var tints=Set<[Float]>()
   for state in allStates { tints.insert([state.tint.x,state.tint.y,state.tint.z,state.tint.w]) }
   check(tints.count==allStates.count,"every cell state has its own colour")
@@ -221,7 +228,77 @@ func check(_ value: Bool, _ message: String) { if !value { print("FAIL:",message
         cells:stacked,states:[anchorCell:.validFootprint],cameraPosition:origin,spacing:0.25,options:grid)
         .allSatisfy { $0.center.y < 0.5 },
         "a neighbouring layer's grid does not float into the focus patch")
-  print("PASS: prop scale/yaw, unique preview/cancel, shared identity, world isolation, support ray, multi-layer grid picking, grid presentation and the focus patch that replaces the floor-wide carpet")
+  // ── 已摆物件的悬停发光：进场的是 `.hoverTarget`，而且**不越过** focus 裁剪 ────────
+  // 4 格 footprint（2×2 列）的悬停发光的着色表：它就是编辑器模型在光标移到已摆物件上时
+  // 写进 `states` 的东西（模型那一侧的断言在 test-resident-prop-editor.swift）。
+  var glow:[PropSupportGridPresentation.Cell:PropSupportGridPresentation.CellState]=[:]
+  for x in 0...1 { for z in 0...1 { glow[gridCell(x,z,0,0)] = .hoverTarget } }
+  let lit=PropSupportGridPresentation.focusedInstances(
+      cells:lawn,states:glow,cameraPosition:origin,spacing:0.25,options:grid)
+  check(lit.count==36,"the glowing prop's patch is its 2x2 footprint plus two rings (36 cells), not the floor")
+  // 「不越过裁剪」逐格量出来：画出来的列**恰好**是 footprint 的列范围各外扩 ringCount 圈，
+  // 再远一列都没有实例（不是靠"总数看起来差不多"）。
+  let litColumns=Set(lit.map { Int((($0.center.x-0.125)/0.25).rounded()) })
+  let litRows=Set(lit.map { Int((($0.center.z-0.125)/0.25).rounded()) })
+  let expectedColumns=Set(-PropSupportGridPresentation.Focus.ringCount...1+PropSupportGridPresentation.Focus.ringCount)
+  check(litColumns==expectedColumns && litRows==expectedColumns,
+        "the glow patch is exactly the footprint columns expanded by the ring count, no column farther")
+  check(lit.filter { $0.state == .hoverTarget }.count==4
+        && lit.filter { $0.state == .hoverTarget }.allSatisfy { abs($0.alpha-1) < 0.00001 },
+        "every hovered footprint cell is drawn at full contrast inside the patch")
+  check(lit.filter { $0.state != .hoverTarget }.allSatisfy {
+        abs($0.alpha-PropSupportGridPresentation.Focus.ringAlpha) < 0.00001 },
+        "the ring around a glowing prop stays faint")
+  check(PropSupportGridPresentation.focusedInstances(
+        cells:lawn,states:glow,cameraPosition:origin,spacing:0.25,options:grid).count
+        < PropSupportGridPresentation.instances(cells:lawn,states:glow,cameraPosition:origin,spacing:0.25,options:grid).count,
+        "the glow goes through the focus clip instead of flooding the floor")
+  // ── 场景内点已摆物件：射线 × yaw 包围盒（摆放校验用的同一个盒子）────────────────
+  func target(_ id:String,_ x:Float,_ y:Float,_ z:Float,_ hx:Float,_ hy:Float,_ hz:Float,_ yaw:Float=0)
+      -> ResidentPropHitTest.Target {
+      .init(objectID:id,center:SIMD3(x,y,z),halfExtents:SIMD3(hx,hy,hz),yaw:yaw) }
+  // 合成相机：位于 (0,2,0) 沿 -Y 看下去（与上面格子拾取同一个相机）。
+  let down=camera
+  let lamp=target("lamp",0,0.5,0,0.2,0.5,0.2)
+  check(ResidentPropHitTest.hit(normalized:SIMD2(0.5,0.5),inverseViewProjection:down,targets:[lamp])=="lamp",
+        "a ray through a placed prop hits it")
+  check(ResidentPropHitTest.hit(normalized:SIMD2(1.4,0.5),inverseViewProjection:down,targets:[lamp])==nil,
+        "a ray outside the prop's box does not hit it")
+  check(ResidentPropHitTest.hit(normalized:SIMD2(1.5,0.5),inverseViewProjection:down,targets:[lamp])==nil,
+        "a cursor outside the viewport hits nothing")
+  check(ResidentPropHitTest.hit(normalized:SIMD2(0.5,0.5),inverseViewProjection:down,targets:[])==nil,
+        "no placed props means no hit")
+  check(ResidentPropHitTest.hit(normalized:SIMD2(0.5,0.5),inverseViewProjection:down,targets:[lamp],maximumDistance:0.5)==nil,
+        "a hit beyond maximumDistance is rejected")
+  // 前后重叠时取**最近**的那一件（否则点前面那件会拿起身后那件）。
+  let closer=target("closer",0,1.2,0,0.2,0.2,0.2), farther=target("farther",0,0.4,0,0.2,0.2,0.2)
+  check(ResidentPropHitTest.hit(normalized:SIMD2(0.5,0.5),inverseViewProjection:down,targets:[farther,closer])=="closer",
+        "the nearest prop wins, independent of order")
+  check(ResidentPropHitTest.hit(normalized:SIMD2(0.5,0.5),inverseViewProjection:down,targets:[closer,farther])=="closer",
+        "the nearest prop wins, independent of order")
+  // yaw **必须**参与判定：同一支射线在转 90° 之后才落进这块薄板里。
+  let thin=target("thin",0,0,0,0.5,0.5,0.2,.pi/2)
+  let unrotated=target("thin",0,0,0,0.5,0.5,0.2,0)
+  // 命中点 (0.15, ·, 0.5)：转 90° 后在板内（局部 x = −0.5 ≤ 0.5、局部 z = 0.15 ≤ 0.2），
+  // 不转则在板外（世界 z = 0.5 > 0.2）。
+  let spot=SIMD3<Float>(0.15,0,0.5)
+  check(ResidentPropHitTest.distance(rayOrigin:spot+SIMD3(0,2,0),rayDirection:SIMD3(0,-1,0),target:thin) != nil,
+        "yaw rotates the hit box (a ray into the rotated sliver is a hit)")
+  check(ResidentPropHitTest.distance(rayOrigin:spot+SIMD3(0,2,0),rayDirection:SIMD3(0,-1,0),target:unrotated) == nil,
+        "the same ray misses the unrotated box (yaw is really applied)")
+  // 射线起点在盒内 → 距离 0（不是"背面的 tExit"）。
+  check(ResidentPropHitTest.distance(rayOrigin:SIMD3(0,0,0),rayDirection:SIMD3(0,-1,0),target:unrotated)==0,
+        "a ray starting inside the box reports zero distance")
+  // 反方向、退化输入都不算命中（fail-closed，不猜）。
+  check(ResidentPropHitTest.distance(rayOrigin:SIMD3(0,3,0),rayDirection:SIMD3(0,1,0),target:unrotated)==nil,
+        "a prop behind the camera is not hit")
+  check(ResidentPropHitTest.distance(rayOrigin:SIMD3(0,3,0),rayDirection:SIMD3(0,-1,0),
+        target:target("degenerate",0,0,0,0,0.5,0.2))==nil,"a degenerate box is never hit")
+  check(ResidentPropHitTest.distance(rayOrigin:SIMD3(0,3,0),rayDirection:SIMD3(0,-1,0),
+        target:target("badYaw",0,0,0,0.5,0.5,0.2,.nan))==nil,"a non-finite yaw is never hit")
+  check(ResidentPropHitTest.hit(normalized:SIMD2(0.5,1.5),inverseViewProjection:down,targets:[lamp])==nil,
+        "a cursor below the viewport hits nothing")
+  print("PASS: prop scale/yaw, unique preview/cancel, shared identity, world isolation, support ray, multi-layer grid picking, grid presentation, the focus patch that replaces the floor-wide carpet, the hover glow patch and the placed-prop hit test")
  }
 }
 """#
@@ -231,6 +308,6 @@ defer {try? FileManager.default.removeItem(at:temp)}
 let file=temp.appendingPathComponent("main.swift"),exe=temp.appendingPathComponent("check")
 try harness.write(to:file,atomically:true,encoding:.utf8)
 func run(_ path:String,_ args:[String]) throws->Int32 {let p=Process();p.executableURL=URL(fileURLWithPath:path);p.arguments=args;try p.run();p.waitUntilExit();return p.terminationStatus}
-let result=try run("/usr/bin/nice",["-n","15","/usr/bin/swiftc","-j1","-parse-as-library",descriptor,picker,presentation,file.path,"-o",exe.path])
+let result=try run("/usr/bin/nice",["-n","15","/usr/bin/swiftc","-j1","-parse-as-library",descriptor,picker,presentation,hitTest,file.path,"-o",exe.path])
 guard result==0 else {exit(result)}
 exit(try run(exe.path,[]))

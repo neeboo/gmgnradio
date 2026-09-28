@@ -62,6 +62,30 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         didSet { stageContentView?.onGridRotate = onResidentPropGridRotate }
     }
 
+    /// 建造模式：**空手**时在场景里点了一下（归一化、左上原点、`clickCount`）。
+    ///
+    /// 与 `onResidentPropGridCommit`（手上有物件时的落地）分成两条是刻意的：分流规则只有
+    /// 一份（`ResidentPropSceneClick.resolve`），而"手上有没有物件"由本视图判定 ——
+    /// 于是"点已摆物件 = 拾取"和"点地 = 放下"不可能互相吃掉。
+    var onResidentPropScenePick: ((SIMD2<Float>, Int) -> Void)? {
+        didSet { stageContentView?.onScenePick = onResidentPropScenePick }
+    }
+
+    /// 鼠标此刻是不是"手上拿着物件"（场景拾取/落地分流要读它）。
+    var isResidentPropCarrying: Bool {
+        residentPropEditor.isCarrying
+    }
+
+    /// 场景里**空手**点中一件已摆物件：等价于点面板里那一行（同一条 `select(objectID:)`）。
+    func selectResidentPropFromScene(objectID: String) async {
+        await residentPropEditor.select(objectID: objectID)
+    }
+
+    /// 宿主真的派发了一次"场景里拾起"：让交互视图知道双击的第二下该撤回谁。
+    func noteResidentPropScenePickUp() {
+        stageContentView?.noteScenePickUp()
+    }
+
     /// 建造模式：把预览挪到吸附后的格心（层名 + footprint 朝向）。
     func moveResidentPropGridPointer(to position: WorldVector3, layerName: String, yaw: Float) async {
         await residentPropEditor.moveGridPointer(to: position, layerName: layerName, yaw: yaw)
@@ -653,6 +677,15 @@ private final class StageContentView: NSView {
     }
     var onGridRotate: ((Int) -> Void)? {
         didSet { worldInteractionView.onGridRotate = onGridRotate }
+    }
+    /// 建造模式：空手时在场景里点了一下（转给交互视图，与 `onGridCommit` 同一条出口口径）。
+    var onScenePick: ((SIMD2<Float>, Int) -> Void)? {
+        didSet { worldInteractionView.onScenePick = onScenePick }
+    }
+
+    /// 宿主真的派发了一次"场景里拾起"：转给交互视图（双击的第二下据此撤回它）。
+    func noteScenePickUp() {
+        worldInteractionView.noteResidentPropScenePickUp()
     }
 
     private let overlayState: StageOverlayState
@@ -1329,8 +1362,23 @@ private final class StageWorldInteractionView: NSView {
     /// 建造模式「点一下落地」的回调。参数与 `onGridCursor` 完全一致（归一化、左上原点），
     /// 这样落点就是用户最后看到 footprint 停住的那个格心。
     var onGridCommit: ((SIMD2<Float>) -> Void)?
+    /// 建造模式「空手点了一下」的回调：归一化点 + `clickCount`。手上有物件时**不会**走这里
+    /// （那是上面的落地通路），所以宿主拿到的永远是"拾取"这一侧的问题。
+    var onScenePick: ((SIMD2<Float>, Int) -> Void)?
     /// 建造模式的 45° 步进旋转（+1 顺时针 / -1 逆时针）。
     var onGridRotate: ((Int) -> Void)?
+    /// 本次「手上这件」是不是**刚在场景里单击拾起**的（面板点行不会置它）。
+    ///
+    /// 双击的第二下据此把这一下撤回原位 + 复位相机，而不是把它丢在光标处 —— 见 `mouseDown`。
+    /// 宿主在真的派发了一次拾取时调用 `noteResidentPropScenePickUp()`；下一记空手点击
+    /// （`mouseUp` 的 else 分支）就会把它清掉，所以它只在"这一记拾取 → 下一个鼠标事件"
+    /// 这一段里为真，不构成第二份选中状态。
+    private var didPickUpFromScenePointer = false
+
+    /// 宿主（App）真的派发了一次"场景里拾起"时调用：让双击的第二下知道该撤回谁。
+    func noteResidentPropScenePickUp() {
+        didPickUpFromScenePointer = true
+    }
 
     init(spatialStage: SpatialStageStore, propEditor: ResidentPropEditorState) {
         self.spatialStage = spatialStage
@@ -1369,6 +1417,23 @@ private final class StageWorldInteractionView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        // 双击：把「刚在场景里拾起的那一下」**撤回原位**（preview 从不改世界，所以不需要新状态），
+        // 并照旧复位相机。净效果 = "双击不做拾取 + 双击复位相机"。
+        // 条件放在最前面：第二下到来时手上已经有物件了，不能再让它掉进"携带态"的分支里被放下。
+        let press = ResidentPropSceneClick.resolvePress(
+            isEditorOpen: propEditor.isOpen,
+            isBuildModeActive: spatialStage.isResidentPropBuildModeActive,
+            carryingStartedAtScenePointer: didPickUpFromScenePointer,
+            clickCount: event.clickCount
+        )
+        if press == .reclaimPickUpAndResetCamera {
+            didPickUpFromScenePointer = false
+            propPressOriginInWindow = nil
+            propEditor.cancelPreview()
+            endDragIfNeeded()
+            spatialStage.resetCamera()
+            return
+        }
         if consumesPropPointer {
             window?.makeFirstResponder(self)
             // **手柄命中优先于放置**：命中手柄就只旋转，绝不进入下面的放置分支，
@@ -1397,6 +1462,15 @@ private final class StageWorldInteractionView: NSView {
             spatialStage.resetCamera()
             return
         }
+        // 建造模式、**空手**：左键在场景里是"拿起/落地"的手势，不是转相机 —— 但按下同样
+        // **只记点**：拖动超过 4 pt 才转成相机拖拽（见 `mouseDragged`），抬起时没超过阈值
+        // 才算"点一下"（`mouseUp` → `onScenePick`）。于是"空手时也能拖视角"照旧可用。
+        if propEditor.isOpen, spatialStage.isResidentPropBuildModeActive {
+            window?.makeFirstResponder(self)
+            propPressOriginInWindow = event.locationInWindow
+            updatePropPointer(event)
+            return
+        }
         beginDrag(
             buttonNumber: event.buttonNumber,
             locationInWindow: event.locationInWindow
@@ -1418,7 +1492,9 @@ private final class StageWorldInteractionView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        if consumesPropPointer {
+        // 建造模式（编辑器打开 + 格子激活）在**携带时和空手时是同一套手感**：按下只记点，
+        // 超过 4 pt 才转成相机拖拽。空手时也要走这条，否则 `mouseDown` 记下的按下点没人收尾。
+        if consumesPropPointer || (propEditor.isOpen && spatialStage.isResidentPropBuildModeActive) {
             // 非建造模式：保持原样（继续把预览挪到支持面上的指针位置）。
             guard spatialStage.isResidentPropBuildModeActive else {
                 updatePropPointer(event)
@@ -1469,7 +1545,17 @@ private final class StageWorldInteractionView: NSView {
         updatePropPointer(event)
         guard Self.isWithinClickDrift(from: origin, to: event.locationInWindow),
               let normalized = normalizedPropPointer(for: event) else { return }
-        onGridCommit?(normalized)
+        if propEditor.isCarrying {
+            // 既有落地通路，原样：手上有物件时单击 = 放下。
+            didPickUpFromScenePointer = false
+            onGridCommit?(normalized)
+        } else {
+            // 空手：交给宿主按唯一的那个分流规则（`ResidentPropSceneClick.resolve`）判 ——
+            // 命中已摆物件才拾取，点空地什么也不做。
+            // 上一次"场景拾起"到这一记为止就算过去了：宿主若真的拾取，会立刻再置回来。
+            didPickUpFromScenePointer = false
+            onScenePick?(normalized, event.clickCount)
+        }
     }
 
     override func rightMouseUp(with event: NSEvent) {
@@ -1545,6 +1631,7 @@ private final class StageWorldInteractionView: NSView {
             // 视图离开窗口后不会再有 mouseUp：把没结算的按下点清掉，
             // 免得下次回到这个视图时第一次 mouseUp 被当成落地。
             propPressOriginInWindow = nil
+            didPickUpFromScenePointer = false
             pointerTask?.cancel()
             propEditor.close()
         }
@@ -1564,7 +1651,12 @@ private final class StageWorldInteractionView: NSView {
     }
 
     override func mouseMoved(with event: NSEvent) {
-        guard consumesPropPointer else { super.mouseMoved(with: event); return }
+        // 建造模式**空手**时也要跟手：这时场景里的鼠标回答的是"光标下那件已摆物件要不要发光"
+        // （以及"点它就能拿起来"），不发光的格子也就没有可点的目标。
+        guard consumesPropPointer || (propEditor.isOpen && spatialStage.isResidentPropBuildModeActive) else {
+            super.mouseMoved(with: event)
+            return
+        }
         let point = convert(event.locationInWindow, from: nil)
         // A tracking area can see moves above another view. Never project a control or input click.
         guard superview?.hitTest(convert(point, to: superview)) === self else { return }

@@ -3059,6 +3059,11 @@ final class AppDelegate:
         stageWindowController?.onResidentPropGridCommit = { [weak self] normalized in
             self?.residentPropGridCommit(normalized: normalized)
         }
+        // 建造模式：**空手**在场景里点了一下 → 拿起光标下的已摆物件（等价于点面板那一行）。
+        // 手上有物件时不会走这里（那是上面的落地通路），所以两条路不可能互相吃掉。
+        stageWindowController?.onResidentPropScenePick = { [weak self] normalized, clickCount in
+            self?.residentPropScenePick(normalized: normalized, clickCount: clickCount)
+        }
         // R / ⇧R / `,` / `.` / 场景内手柄：45° 步进旋转（Sims 4 官方口径；原来是 90°）。旋转改的是
         // footprint 朝向，重新着色后由 `publishResidentPropGrid` 把新的吸附位置与朝向推给预览。
         stageWindowController?.onResidentPropGridRotate = { [weak self] steps in
@@ -3741,15 +3746,20 @@ final class AppDelegate:
         })
         let objects = context.state.objectStates.values.filter { $0.generatedProp != nil }
             .sorted { $0.generatedProp!.objectID < $1.generatedProp!.objectID }
+        // 摆放面现在是格子派生出来的**承托层**，按高度归并（真实房间有 3,000+ 格，
+        // 全列给 UI 没意义）。最低那层叫"地面"，其余按高度命名。
+        let surfaces = service.listedSupportLayers().enumerated().map { index, layer in
+            ResidentPropEditorSurface(id: layer.id,
+                  name: index == 0 ? "地面" : String(format: "台面 %.2f m", layer.supportHeight),
+                  position: layer.center, cellCount: layer.cellCount)
+        }
         return .init(worldID: context.manifest.worldID, revision: context.state.layoutRevision,
               objects: objects,
-              // 摆放面现在是格子派生出来的**承托层**，按高度归并（真实房间有 3,000+ 格，
-              // 全列给 UI 没意义）。最低那层叫"地面"，其余按高度命名。
-              surfaces: service.listedSupportLayers().enumerated().map { index, layer in
-                  .init(id: layer.id,
-                        name: index == 0 ? "地面" : String(format: "台面 %.2f m", layer.supportHeight),
-                        position: layer.center)
-              }, canUndo: context.state.layoutUndo != nil, heldProp: context.state.heldProp,
+              // 未摆出物件的初始落点候选（**纯顺序**，判定仍由 `preview` 给）：
+              // 同承托高度上格子多的层（平整的桌面/台面）在前，同层内离出生点近的在前。
+              surfaces: ResidentPropInitialPlacement.fillingAnchors(
+                  surfaces, grid: residentPropGridEditor.grid, spawn: context.manifest.spawn.position),
+              canUndo: context.state.layoutUndo != nil, heldProp: context.state.heldProp,
               holdUnavailableReasons: Dictionary(uniqueKeysWithValues: objects.compactMap { item in
                   guard let id = item.generatedProp?.objectID, let reason = service.holdEligibility(objectID: id) else { return nil }
                   return (id, reason)
@@ -3999,7 +4009,87 @@ final class AppDelegate:
             blockingVolumes: context.manifest.collisionVolumes.filter(\.isBlocking),
             placedProps: context.state.objectStates.values.compactMap(\.generatedCollisionVolume)
         )
+        updateResidentPropHoverTarget(normalized: normalized, projection: projection.inverseViewProjection,
+                                      context: context)
         return true
+    }
+
+    /// 光标下那件**已摆出**的物件 → 它的 footprint 格子发光（The Sims 的 white glow）。
+    ///
+    /// 发光写在格子管线的 `cellStates` 里，于是它和 footprint 的判定着色走**同一条**绘制路径，
+    /// 并且自动受 `PropSupportGridPresentation.focus` 的焦点裁剪约束（裁剪的锚点就是
+    /// `states` 的键）—— 不会绕开裁剪去铺满地面。
+    ///
+    /// 携带时**不发光**：手上那件的 footprint 已经由摆放预览着色，两套高亮会打架。
+    private func updateResidentPropHoverTarget(
+        normalized: SIMD2<Float>,
+        projection: simd_float4x4,
+        context: WorldAgentContext
+    ) {
+        guard stageWindowController?.isResidentPropCarrying != true else {
+            residentPropGridEditor.clearHoveredProp()
+            return
+        }
+        guard let objectID = residentPropHitObjectID(normalized: normalized, inverseViewProjection: projection,
+                                                     context: context),
+              let volume = context.state.objectStates[objectID]?.generatedCollisionVolume else {
+            residentPropGridEditor.clearHoveredProp()
+            return
+        }
+        residentPropGridEditor.setHoveredProp(objectID: objectID, volume: volume)
+    }
+
+    /// 光标打在**哪一件已摆物件**上。唯一的命中判据是 `ResidentPropHitTest`
+    /// （射线 × `generatedCollisionVolume` 那个 yaw 包围盒 = 摆放校验用的同一个盒子）。
+    private func residentPropHitObjectID(
+        normalized: SIMD2<Float>,
+        inverseViewProjection: simd_float4x4,
+        context: WorldAgentContext
+    ) -> String? {
+        ResidentPropHitTest.hit(
+            normalized: normalized,
+            inverseViewProjection: inverseViewProjection,
+            targets: context.state.objectStates.values.compactMap { item in
+                guard let volume = item.generatedCollisionVolume else { return nil }
+                let q = volume.rotation
+                let yaw = atan2(2 * (q.w * q.y + q.x * q.z), 1 - 2 * (q.y * q.y + q.z * q.z))
+                return .init(
+                    objectID: volume.id,
+                    center: SIMD3(volume.center.x, volume.center.y, volume.center.z),
+                    halfExtents: SIMD3(volume.halfExtents.x, volume.halfExtents.y, volume.halfExtents.z),
+                    yaw: yaw
+                )
+            }
+        )
+    }
+
+    /// 建造模式：**空手**点了一下 → 命中已摆物件就拿起它。
+    ///
+    /// 分流规则只有一份（`ResidentPropSceneClick.resolve`，与控制器共用同一个纯类型）：
+    /// 编辑器没打开 / 没命中 / 双击 → 什么都不做；命中 → 走**和面板行完全相同**的
+    /// `select(objectID:)`，于是"从场景拿起"和"从面板拿起"不可能有两套行为。
+    private func residentPropScenePick(normalized: SIMD2<Float>, clickCount: Int) {
+        // 编辑器没打开时点场景物件**不产生任何效果**（防误触）——控制器那边也已经用
+        // `propEditor.isOpen` 挡了一层，这里是宿主自己的守卫。
+        guard residentPropEditingID != nil, let context = livingWorldContext,
+              let projection = spatialStage.residentPropBuildModeProjection else { return }
+        let hit = residentPropHitObjectID(normalized: normalized,
+                                          inverseViewProjection: projection.inverseViewProjection,
+                                          context: context)
+        let action = ResidentPropSceneClick.resolve(
+            isEditorOpen: residentPropEditingID != nil,
+            isBuildModeActive: spatialStage.isResidentPropBuildModeActive,
+            // 控制器只在空手时调到这条（手上有物件走落地通路），所以这里恒为 false。
+            isCarrying: stageWindowController?.isResidentPropCarrying == true,
+            clickCount: clickCount,
+            hitObjectID: hit
+        )
+        guard case .pickUp(let objectID) = action else { return }
+        // 这一记拾取是"场景拾起"：告诉控制器双击的第二下该撤回它（而不是丢在光标处）。
+        stageWindowController?.noteResidentPropScenePickUp()
+        Task { [weak self] in
+            await self?.stageWindowController?.selectResidentPropFromScene(objectID: objectID)
+        }
     }
 
     /// 建造模式：点一下 → 在吸附后的格心上落地。
