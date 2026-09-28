@@ -3982,16 +3982,10 @@ final class AppDelegate:
         AgentConversationService.shared.attachConversationMemory(
             residentConversationMemory
         ) { [weak self] message in
-            // 已交付回合入队/投递失败是一次性交付事件，走不缓存去重的交付提示行。
-            self?.showResidentMemoryDeliveryNotice(message)
+            // **只记日志，不上屏**：记忆交付失败是本地记忆的内部细节，聊天本身
+            // 不受影响，用状态行打扰用户只会让人以为"聊天坏了"。
+            self?.livingWorldLogger.notice("记忆交付错误：\(message, privacy: .public)")
         }
-    }
-
-    /// 一次性交付事件（入队/投递失败等）的可见出口：与配置提示分开、不缓存去重，
-    /// 每次真实失败都让用户知道本轮记忆写入未完成。
-    private func showResidentMemoryDeliveryNotice(_ text: String) {
-        liveCamWindowController?.showChatStatus(text)
-        stageWindowController?.showResidentChatStatus(text)
     }
 
     /// performResidentTurn 在 run/world/当前引用守卫全部通过后登记本回合交付
@@ -4107,28 +4101,22 @@ final class AppDelegate:
         presentResidentMemoryDeliveryFailure(result)
     }
 
-    /// 交付确认失败结果的可见呈现：.accepted/.notCurrent 静默（正常消费或已被
-    /// 取代，无需打扰）；失败结果给出简洁文案，说明本次未写入长期记忆。
+    /// 交付确认失败结果的处理：.accepted/.notCurrent 静默（正常消费或已被取代）；
+    /// 其余失败**只记日志、不上屏** —— 本地记忆的交付细节不该变成聊天状态行。
     private func presentResidentMemoryDeliveryFailure(
         _ result: AgentConversationMemoryDeliveryResult
     ) {
+        // **全部只进日志、不上屏**：这些是本地记忆的交付细节，不是用户需要处理的
+        // 事情，聊天也不受影响。产品要求：不要用状态行打扰用户。
         switch result {
         case .accepted, .notCurrent:
             break
         case .unavailable:
-            showResidentMemoryDeliveryNotice(
-                "记忆服务暂时不可用：本轮对话未写入记忆。聊天与已显示的回复不受影响。"
-            )
+            livingWorldLogger.notice("记忆交付失败：本地记忆服务不可用，本轮未写入。")
         case .rejectedText:
-            showResidentMemoryDeliveryNotice(
-                "本轮对话未写入长期记忆：内容含控制字符或超过 2000 字上限，未做" +
-                "改写或截断保存。聊天与已显示的回复不受影响。"
-            )
+            livingWorldLogger.notice("记忆交付失败：内容含控制字符或超过 2000 字上限，未改写或截断。")
         case .queueFull:
-            showResidentMemoryDeliveryNotice(
-                "本轮对话暂未写入长期记忆：记忆交付队列已满，尚未进入易失缓冲。" +
-                "聊天与已显示的回复不受影响。"
-            )
+            livingWorldLogger.notice("记忆交付失败：交付队列已满，本轮未进入易失缓冲。")
         }
     }
 

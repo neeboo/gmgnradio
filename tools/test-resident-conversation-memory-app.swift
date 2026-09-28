@@ -2,7 +2,7 @@
 //
 // 从真实 GMGNRadioApp.swift 提取（非重写）registerResidentMemoryTurn /
 // presentResidentReply / confirmResidentMemoryTurn / presentResidentMemoryDelivery-
-// Failure / showResidentMemoryDeliveryNotice / sendLiveCamMessage 六个生产方法体，
+// Failure / sendLiveCamMessage 五个生产方法体，
 // 用 fake 记忆/语音/显示表面编译运行。行为覆盖：
 //   - userMessage 只在守卫通过后登记；source 随 runID 最小绑定（voice/text）；
 //   - 显示/语音完成前绝无 ingest；autoSpeak 开启只认整段语音自然播完
@@ -45,7 +45,6 @@ let registerTurn = declaration("private func registerResidentMemoryTurn(")
 let presentReply = declaration("private func presentResidentReply(")
 let confirmTurn = declaration("private func confirmResidentMemoryTurn(")
 let deliveryFailure = declaration("private func presentResidentMemoryDeliveryFailure(")
-let deliveryNotice = declaration("private func showResidentMemoryDeliveryNotice(")
 let sendLiveCam = declaration("private func sendLiveCamMessage(")
 let loopSourceURL = root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/ResidentAgentLoop.swift")
 let loopSource = try String(contentsOf: loopSourceURL, encoding: .utf8)
@@ -82,11 +81,15 @@ guard presentReply.contains("if outcome == .finished, let slot, memoryTurn"),
     print("FAIL: presentResidentReply must announce regardless of slot and confirm only a matching finished slot")
     exit(1)
 }
+// 交付失败必须仍然被区分处理，但**只进日志、不上屏**：这正是产品要求，
+// 所以这里断言生产代码里有日志、且没有任何往聊天表面写状态行的出口。
 guard deliveryFailure.contains("case .rejectedText:"),
       deliveryFailure.contains("case .queueFull:"),
       deliveryFailure.contains("case .unavailable:"),
-      deliveryFailure.contains("showResidentMemoryDeliveryNotice(") else {
-    print("FAIL: confirm failure results must reach a visible delivery notice")
+      deliveryFailure.contains("livingWorldLogger.notice("),
+      !deliveryFailure.contains("showChatStatus("),
+      !deliveryFailure.contains("showResidentChatStatus(") else {
+    print("FAIL: confirm failure results must be logged without a visible notice")
     exit(1)
 }
 
@@ -128,6 +131,7 @@ func publicized(_ body: String) -> String {
 
 let harness = #"""
 import Foundation
+import os
 
 \#(transcriptTypes)
 
@@ -233,6 +237,9 @@ struct ResidentMemoryTurnSlot {
 @MainActor
 final class App {
     let service = AgentConversationService.shared
+    /// 生产里是 App 的 `os.Logger`。这里用**真的** Logger：交付失败现在只记日志，
+    /// 而那句日志带 `privacy: .public` 插值，只有真 OSLog 类型接得住。
+    let livingWorldLogger = Logger(subsystem: "ai.gmgn.radio.harness", category: "memory")
     var agentSpeechAnnouncer = FakeAnnouncer()
     var liveCamWindowController: FakeLiveCam? = FakeLiveCam()
     var stageWindowController: FakeStage? = FakeStage()
@@ -250,7 +257,6 @@ final class App {
     \#(publicized(presentReply))
     \#(publicized(confirmTurn))
     \#(publicized(deliveryFailure))
-    \#(publicized(deliveryNotice))
 
     private static func residentMemoryObservedAt() -> String {
         ISO8601DateFormatter().string(from: Date())
@@ -376,8 +382,8 @@ final class App {
         check(app.liveCamWindowController?.statuses.count == statusesBeforeBackground,
               "no memory slot is not an error: no failure notice is raised")
 
-        // 9. rejectedText：整轮不写记忆但聊天不受影响——确认结果必须可见，
-        //    不能默默冒充记忆成功；slot 保留（失败凭据未消费，可重试）。
+        // 9. rejectedText：整轮不写记忆但聊天不受影响。**失败只进日志、不上屏**
+        //    （产品要求：不要用状态行打扰用户）；slot 保留（失败凭据未消费，可重试）。
         service.preferenceStore.autoSpeakReplies = false
         app.liveCamWindowController = FakeLiveCam()
         app.stageWindowController = FakeStage()
@@ -388,14 +394,12 @@ final class App {
         app.presentResidentReply("已显示的回复")
         check(service.confirmed.count == confirmedBeforeBackground,
               "rejectedText never ingests")
-        check(app.liveCamWindowController?.statuses.last?.contains("未写入长期记忆") == true,
-              "rejectedText shows a visible not-written notice")
-        check(app.liveCamWindowController?.statuses.last?.contains("控制字符") == true,
-              "rejectedText notice names the stable reason")
+        check(app.liveCamWindowController?.statuses.isEmpty == true,
+              "rejectedText raises no visible notice (logged only)")
         check(app.residentMemoryTurnSlot != nil,
               "rejectedText keeps the unconsumed slot for a possible retry")
 
-        // 10. queueFull：同样可见「未写入（队列满、未进易失缓冲）」，不入队不冒充。
+        // 10. queueFull：同样不入队、不冒充成功，且同样不上屏。
         service.forcedResult = nil
         service.stage(requestID: UUID())
         service.forcedResult = .queueFull
@@ -404,13 +408,11 @@ final class App {
         app.presentResidentReply("队列满的回复")
         check(service.confirmed.count == confirmedBeforeBackground,
               "queueFull never ingests")
-        check(app.liveCamWindowController?.statuses.last?.contains("队列已满") == true,
-              "queueFull shows a visible queue-full notice")
-        check(app.liveCamWindowController?.statuses.last?.contains("易失缓冲") == true,
-              "queueFull notice does not claim durable storage")
+        check(app.liveCamWindowController?.statuses.isEmpty == true,
+              "queueFull raises no visible notice (logged only)")
 
-        // 11. unavailable（记忆未接线）：可见、不写；accepted 静默（正常易失入队，
-        //     不冒充 durable，也不需要失败提示）。
+        // 11. unavailable（记忆服务不可用）：不写、不上屏；accepted 静默（正常易失
+        //     入队，不冒充 durable）。
         service.forcedResult = nil
         service.stage(requestID: UUID())
         service.forcedResult = .unavailable
@@ -419,10 +421,8 @@ final class App {
         app.presentResidentReply("未接线的回复")
         check(service.confirmed.count == confirmedBeforeBackground,
               "unavailable never ingests")
-        // 文案已随"外部 provider 接线移除"校准：适配器现在恒为挂载，
-        // "未接线"不再准确，改为说明记忆服务暂时不可用。
-        check(app.liveCamWindowController?.statuses.last?.contains("暂时不可用") == true,
-              "unavailable shows a visible memory-service-unavailable notice")
+        check(app.liveCamWindowController?.statuses.isEmpty == true,
+              "unavailable raises no visible notice (logged only)")
         let statusCountBeforeAccepted = app.liveCamWindowController?.statuses.count ?? 0
         service.forcedResult = nil
         service.stage(requestID: UUID())
