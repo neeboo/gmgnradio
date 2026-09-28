@@ -598,52 +598,21 @@ footprint 外面都会出现一圈列：**格子压在家具上、但列角点�
 
 不建议超过 3 cm：再放宽收益很小，而"悬空/陷入"会开始刺眼。
 
-### 现状：**已按"推荐"档落地**（2026-09-28）
+### 现状：**只改了贴地容差，高度差保持原值**（2026-09-28 复核后）
 
-`restingTolerance = 0.02`、`maximumSupportHeightDeviation = 0.05` 已写进生产默认值
-（`WorldPropLayout.swift` / `PropPlacementEvaluator.swift`），即上表的 **55.9%** 那一行。
-回退就是把这两个常量改回去，一行的事。
+`restingTolerance = 0.02`（原 0.0001）已落地；`maximumSupportHeightDeviation` **保持 2 cm 不变**。
+即上表 **46.3%** 那一格。
 
-连带变化：
+**为什么不动高度差**：放宽到 5 cm 能把可放率从 46.3% 提到 55.9%（+9.6 个百分点），
+但那 9.6 个百分点是拿"物件可以跨在高度断差上、视觉上可能一部分悬空或陷入"换来的 ——
+而 2 cm 这条带是**有明确理由的既有决定**，不该为了百分点数顺手推翻。实测也支持这个取舍：
+高度差退回 2 cm 后，90° 旋转仍然有 **16/2885** 个落点通过（改前是 0/2885，两者都改是 19/2885），
+也就是那 9.6 个百分点只多买到 3 个旋转落点。要动它应当作为**独立决定**单独提出。
 
-- `test-wish-machine-delivery-loop.swift` 里那条 KNOWN 缺口（90° 旋转 **0/2885**）**按设计
-  主动失败**提醒提升 —— 已提升为正式断言，现在实测 **19/2885** 通过 ✓。
-- `WorldPropLayoutTests` 里那个编码了旧决定的用例（低矮凸起必须挡住）已按新决定重推：
-  ≤ 容差的起伏算贴地、**超过容差的仍必须挡住**，两侧边界都钉住，原意（物件判定比角色
-  胶囊更严）没有被容差吃掉。
-- 想改档位（1 cm 保守 / 3 cm 宽松）只需改这两个常量，然后跑
-  `swift test --package-path apps/macos/Packages/WorldRuntime` 看是否有断言要跟着重推。
+**关于贴地容差本身**：它确实在 `WorldPropLayout.swift:190` 的既有约定
+（"never skip a triangle crossing into the item"）上开了口子 —— 这点必须点名承认。但跳过条件是
+`maxY ≤ support + 容差`，即"**顶端**在承托面 +2 cm 以内"的几何；墙与家具的顶端远高于此，
+照旧挡住。实际放宽的只有生成地面的起伏与作者摆的、低于 2 cm 的门槛。
 
-## 11. 已知失效验证资产（与 P2 无关，勿误判为回归）
+回退就是把这一个常量改回去。连带变化见下。
 
-实施 P2 时发现 3 个 `tools/test-*.swift` 早就是坏的。我用干净 worktree 在改动前的提交上复现过，
-**确认它们的失败与 P2 无关**。它们都不在 `make test-harnesses` 里，所以一直处于漂移状态：
-
-| 脚本 | 失败方式 |
-| --- | --- |
-| `test-resident-speech-avatar.swift` | 编译失败：`value of type 'App' has no member 'r…'` |
-| `test-wish-machine-app-runtime.swift` | 编译失败：`cannot find 'registerResidentMemoryTurn' in scope` |
-| `test-wish-machine-delivery-loop.swift` | 顶层运行时错误（退出码 5 / 133 不稳定） |
-| `test-stage-resident-chat.swift` | 编译失败：`cannot find 'showFailureStatus' in scope` |
-| `test-resident-prop-placement.swift` | 运行时致命错误（本轮已改到新签名，恢复可编译） |
-| `test-resident-prop-tools.swift` | 运行时致命错误（同上） |
-| `test-resident-prop-capability.swift` | 运行时致命错误（同上；契约变更前是 swift-frontend 崩溃） |
-| `test-wish-machine-delivery-loop.swift` | 顶层运行时错误（同上，已恢复可编译） |
-
-**本轮（P2 收口后）的复核结果**：
-
-| 脚本 | 状态 |
-| --- | --- |
-| `test-stage-resident-chat.swift` | ✅ **已修**（74 项通过）：本轮新增的生产成员同步进了它的本地 stub；一条断言是过期的（生产只有 `showResidentChat()` 会展开输入框），已改钉新行为 |
-| `test-wish-machine-delivery-loop.swift` | ✅ **已修**（PASS，含 1 条 KNOWN）：迁移到格子口径，落点从派生层取；旋转检查改走持久化路径，并把 §13 的产品缺口记为已知项（缺口修好时它会主动失败） |
-| `test-resident-speech-avatar.swift` | ❌ 仍未修：**stub 漂移**。生产的 `StageAvatarMotionPlayback` 是 enum，harness 里是本地 struct，于是抽出代码里的 `.temporary` 找不到。修它要按最小面重建那个 enum（并补 `StageMotionAsset` / `StageAvatarMotionFallback`），与 P2 无关 |
-| `test-wish-machine-app-runtime.swift` | 🟡 **部分推进**：已补 `pushSystemInboxSnapshots` / `pushWishTaskPrompts` 两个呈现侧管道的桩（本 harness 断言的是持久域那一侧，这两条不在其覆盖内）。**仍缺**：`performResidentTurn` 的 `userMessage:` 签名已变、`registerResidentMemoryTurn` 等生产成员尚未进 App 桩 —— 它需要一次系统性追平，不是补一个名字就完 |
-| `test-resident-prop-placement.swift` | ❌ 仍未修：引用了**已被格子取代**的 `ResidentPropSupportSurface`（生产里已无此类型）。做法应比照 `test-wish-machine-delivery-loop.swift`：迁移到格子口径，落点从派生层取 |
-| `test-resident-prop-tools.swift` | ❌ 同上（同一类下游失败） |
-| `test-resident-prop-capability.swift` | ❌ 同上（契约变更前是 swift-frontend 崩溃，现在是运行期失败） |
-
-`test-resident-prop-surfaces.swift` 已**被取代**：它的主题（具名摆放面）不复存在，
-现在由 `tools/test-resident-prop-grid-placement.swift` 承担——在真实舱体几何上跑完整
-「格子 + footprint」链路（13 项检查）。它的失败因此在上面这张表里消失了。
-
-修它们需要逐个决定"现在的等价断言是什么"，属于独立的一小批工作。**不要把它们的失败算到 P2 头上。**
