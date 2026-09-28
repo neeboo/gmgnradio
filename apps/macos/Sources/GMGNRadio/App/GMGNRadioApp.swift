@@ -2798,9 +2798,21 @@ final class AppDelegate:
                 try await resumeMusic()
                 liveCamWindowController?.showChatStatus("点唱机开始播放音乐。")
             } catch {
-                liveCamWindowController?.showChatStatus(
-                    "点唱机尚未开始播放。\(error.localizedDescription)"
-                )
+                // 良性状态不上屏：按了播放但队列里还没有节目、或后台还没准备好，这不是故障，
+                // 用橙色横幅说它只会像出错。DJ 工具侧仍靠同一个错误描述向 agent 说明情况，
+                // 所以错误类型本身不动，只改这里的呈现；真失败照旧上屏。
+                let isBenign: Bool
+                switch error {
+                case DJAgentRadioActionError.noProgram, DJAgentRadioActionError.noPreparedProgram:
+                    isBenign = true
+                default:
+                    isBenign = false
+                }
+                if !isBenign {
+                    liveCamWindowController?.showChatStatus(
+                        "点唱机尚未开始播放。\(error.localizedDescription)"
+                    )
+                }
                 livingWorldLogger.error("点唱机播放失败：\(error.localizedDescription, privacy: .public)")
             }
         }
