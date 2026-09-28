@@ -77,12 +77,44 @@ precondition(imageInput.contains("controlTextDidEndEditing") && overlay.contains
 precondition(!chatToggle.contains("cancel") && !chatToggle.contains("residentChat"), "collapsing chat must not cancel or reset its state")
 precondition(controller.contains("residentComposer.trailingAnchor.constraint(equalTo: transportControls.trailingAnchor)"), "composer belongs above the bottom-right controls")
 precondition(overlay.contains("ScrollView") && overlay.contains(".textSelection(.enabled)"), "reply must remain readable and selectable")
+// ── 场景内旋转手柄的屏幕锚点 ─────────────────────────────────────────────────
+// 手柄原先锚在"footprint 中心沿局部 +Z 外扩 max(0.35, 0.6 × 最大半宽) 米"的**世界点**上：
+// 投影到屏幕后那个偏移是 `米数 / 相机距离` 量级，相机一近就缩到几个点，手柄被顶到光标
+// 所在格的前方、永远点不到。改成"投影后的 footprint 中心 + **固定屏幕偏移**"之后，
+// 锚点计算里不能再出现任何随距离缩放的量 —— 这条结构性性质下面与真实投影一起断言。
+let rotationHandleAnchor = declaration("enum ResidentPropRotationHandleAnchor", in: controller)
+guard rotationHandleAnchor.contains("screenOffsetX"),
+      rotationHandleAnchor.contains("screenOffsetY") else {
+    print("FAIL: the rotation handle anchor has no named screen-space offset constants")
+    exit(1)
+}
+let handleWorldAnchor = declaration("private var rotationHandleWorldAnchor: SIMD3<Float>?", in: controller)
+guard handleWorldAnchor.contains("placement.position"),
+      !handleWorldAnchor.contains("outward"),
+      !handleWorldAnchor.contains("spacing"),
+      !handleWorldAnchor.contains("yaw") else {
+    print("FAIL: the handle anchor must be the footprint centre, not a world-space forward expansion")
+    exit(1)
+}
+let handleCenter = declaration("private var rotationHandleCenter: NSPoint?", in: controller)
+guard handleCenter.contains("residentPropScreenPoint(world:") else {
+    print("FAIL: the handle must project through the shared resident prop screen point")
+    exit(1)
+}
+// 结构性的"没有随距离缩放的量"：纯函数只读投影点与视图尺寸，不再读格距/外扩米数。
+guard !rotationHandleAnchor.contains("outward"),
+      !rotationHandleAnchor.contains("spacing"),
+      !rotationHandleAnchor.contains("spatialStage") else {
+    print("FAIL: the handle anchor still scales with camera distance")
+    exit(1)
+}
 let harness = #"""
 import Foundation
 import Combine
 import AppKit
 import Observation
 import simd
+\#(rotationHandleAnchor)
 @MainActor @Observable
 \#(speechStore)
 \#(noticeTypes)
@@ -483,6 +515,88 @@ enum StageAvatarActivity { case listening, speaking, idle }
         input.keyDown(with: NSEvent(keyCode: 43))
         input.keyDown(with: NSEvent(keyCode: 15, charactersIgnoringModifiers: "r"))
         check(rotations == [-1, 1, 1, -1], "rotation keys stay inert outside build mode")
+
+        // ── 场景内旋转手柄：锚点 = footprint 中心的投影 + 固定屏幕偏移 ──────────
+        // bug 的本质是"偏移随相机距离缩放"（世界空间外扩把圆环顶到光标前面）。锚点计算已经
+        // 纯函数化（`ResidentPropRotationHandleAnchor.center`），于是可以用**两个不同尺度**的
+        // 真实投影断言：同一个世界点在不同相机距离下，圆心相对投影中心的偏移**完全相等**。
+        let handleViewSize = CGSize(width: 1440, height: 900)
+        // 与 `MarbleSpatialView` 同一套投影：perspective(fov 66°) * rotationX(-pitch) *
+        // rotationY(-yaw) * translation(-camera.position)。相机在 y = 0.8 m、俯角 25°、
+        // yaw 0，离世界点（一个格心）的水平距离就是 `groundDistance`。
+        func handleProjection(groundDistance: Float) -> simd_float4x4 {
+            let world = SIMD3<Float>(0, 0, -2)
+            let fov: Float = 66 * .pi / 180
+            let aspect = Float(handleViewSize.width / handleViewSize.height)
+            let y = 1 / tan(fov * 0.5), x = y / aspect
+            let near: Float = 0.05, far: Float = 250, z = far / (near - far)
+            let projection = simd_float4x4(columns: (
+                SIMD4(x, 0, 0, 0), SIMD4(0, y, 0, 0),
+                SIMD4(0, 0, z, -1), SIMD4(0, 0, z * near, 0)
+            ))
+            let pitch: Float = -25 * .pi / 180
+            let cosine = cos(pitch), sine = sin(pitch)
+            let rotation = simd_float4x4(columns: (
+                SIMD4(1, 0, 0, 0), SIMD4(0, cosine, -sine, 0),
+                SIMD4(0, sine, cosine, 0), SIMD4(0, 0, 0, 1)
+            ))
+            let camera = SIMD3<Float>(0, 0.8, world.z + groundDistance)
+            let translation = simd_float4x4(columns: (
+                SIMD4(1, 0, 0, 0), SIMD4(0, 1, 0, 0),
+                SIMD4(0, 0, 1, 0), SIMD4(-camera.x, -camera.y, -camera.z, 1)
+            ))
+            return projection * rotation * translation
+        }
+        func handleScreenPoint(_ world: SIMD3<Float>, _ viewProjection: simd_float4x4) -> SIMD2<Float> {
+            let clip = viewProjection * SIMD4(world, 1)
+            return SIMD2((clip.x / clip.w + 1) / 2, (1 - clip.y / clip.w) / 2)
+        }
+        func handleAnchorOffset(_ normalized: SIMD2<Float>) -> CGPoint {
+            let centre = ResidentPropRotationHandleAnchor.center(
+                projectedCenter: normalized, viewSize: handleViewSize)
+            return CGPoint(
+                x: centre.x - CGFloat(normalized.x) * handleViewSize.width,
+                y: centre.y - CGFloat(1 - normalized.y) * handleViewSize.height
+            )
+        }
+        let handleWorld = SIMD3<Float>(0, 0, -2)
+        let nearProjection = handleScreenPoint(handleWorld, handleProjection(groundDistance: 1))
+        let farProjection = handleScreenPoint(handleWorld, handleProjection(groundDistance: 3))
+        check(abs(nearProjection.x - farProjection.x) > 0.001 || abs(nearProjection.y - farProjection.y) > 0.001,
+              "the same footprint centre projects to different points at different camera distances")
+        let nearOffset = handleAnchorOffset(nearProjection)
+        let farOffset = handleAnchorOffset(farProjection)
+        check(nearOffset == farOffset,
+              "the handle offset from the projected footprint centre is independent of camera distance")
+        check(nearOffset == ResidentPropRotationHandleAnchor.screenOffset,
+              "the handle offset is exactly the named screen-space constant")
+        check(nearOffset.x == ResidentPropRotationHandleAnchor.screenOffsetX
+                && nearOffset.y == ResidentPropRotationHandleAnchor.screenOffsetY,
+              "both named offset constants feed the anchor")
+        // 偏移量的下界：必须大于命中半径 32 pt，否则圆环的命中区会盖住 hover 格的格心，
+        // "点一下落地"会被误判成旋转。
+        check(hypot(nearOffset.x, nearOffset.y) > 32,
+              "the screen offset stays outside the 32 pt hit radius so a place-click still places")
+        // 上界：每个分量都要落在 hover 格的投影范围内（格心吸附跟着光标走，跨过一列/一行
+        // 圆环就会跟着跳一格）。0.25 m 的格子在 1.5 / 2.0 / 2.2 m 处的投影半宽×半深实测约
+        // 51.0×21.2 / 40.3×13.6 / 37.1×11.6 pt，34/10 都装得下（2.2 m 就是这套偏移的边界）；
+        // 44 pt 这类垂直偏移在 ~0.85 m 外就出格了。
+        for (groundDistance, expected) in [
+            (Float(1.5), SIMD2<Float>(51.0, 21.2)),
+            (Float(2.0), SIMD2<Float>(40.3, 13.6)),
+            (Float(2.2), SIMD2<Float>(37.1, 11.6)),
+        ] {
+            let projection = handleProjection(groundDistance: groundDistance)
+            let centre = handleScreenPoint(handleWorld, projection)
+            let column = handleScreenPoint(handleWorld + SIMD3<Float>(0.25, 0, 0), projection)
+            let row = handleScreenPoint(handleWorld + SIMD3<Float>(0, 0, -0.25), projection)
+            let halfWidth = abs(column.x - centre.x) * Float(handleViewSize.width) / 2
+            let halfDepth = abs(row.y - centre.y) * Float(handleViewSize.height) / 2
+            check(abs(halfWidth - expected.x) < 0.5 && abs(halfDepth - expected.y) < 0.5,
+                  "the projected cell at \(groundDistance) m measures \(expected) pt (bounds the offset)")
+            check(abs(nearOffset.x) < CGFloat(halfWidth) && abs(nearOffset.y) < CGFloat(halfDepth),
+                  "the handle stays inside the hovered cell at \(groundDistance) m, so the pointer can reach it")
+        }
         print("\(failures == 0 ? "PASS" : "FAIL"): \(count) stage resident chat checks, \(failures) failures")
         exit(failures == 0 ? 0 : 1)
     }

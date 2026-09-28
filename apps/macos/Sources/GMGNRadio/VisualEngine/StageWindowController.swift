@@ -587,6 +587,46 @@ struct StagePointerDragDelta: Equatable {
     }
 }
 
+/// 场景内旋转手柄的**屏幕锚点**：投影后的 footprint 中心 + **固定屏幕空间偏移**。
+///
+/// **为什么必须是屏幕空间偏移**：偏移若落在世界空间（原先的做法是"沿 footprint 局部 +Z
+/// 外扩 `max(0.35, 0.6 × 最大半宽)` 米"），投影到屏幕上就是 `外扩米数 / 相机距离` 量级 ——
+/// 相机越近，手柄离光标越远（fov 66°、视口约 900 pt 时 32 pt 只覆盖 `0.046 × 相机距离`
+/// 米），而吸附锚点跟着光标走，于是"光标每越过一格，手柄同步前进一格"，只有把镜头拉到
+/// 4–7 m 以外才点得到。固定 pt 偏移与相机距离**无关**：任意距离、任意格子，圆环都贴在
+/// footprint 中心投影点的右上侧同一个位置。
+///
+/// 偏移量的取值不是随手写的，它被两条约束夹住（见
+/// `tools/test-stage-resident-chat.swift` 里"偏移与相机距离无关"的断言）：
+/// 1. **必须大于命中半径 32 pt**（`StageWorldInteractionView.rotationHandleHitRadius`）：
+///    否则圆环的命中区会盖住 hover 格的**格心**，"点一下落地"就会被误判成旋转。
+///    所以 `hypot(screenOffsetX, screenOffsetY) ≈ 35.4 pt > 32 pt`。
+/// 2. **每个分量都要落在 hover 格的投影范围内**：格心的吸附跟着光标走，光标从格心走向
+///    圆环时只要跨过一列/一行，圆环就会跟着跳一格。0.25 m 的格子在 1440×900、fov 66°、
+///    相机高 0.8 m、俯角 25° 时，地面 1.0/1.5/2.0/2.2/2.5 m 处的格子投影半宽×半深约为
+///    70×38 / 51×21 / 40×14 / 37×12 / 33×9 pt，所以垂直分量尤其要小：地面平的深度轴在
+///    屏幕上被俯角压扁，44 pt 这类垂直偏移在 ~0.85 m 之外就落到格子外面（原定的 48/44
+///    就是这样）。34/10 到 ~2.2 m 为止都还在格子里；再远就需要更小的偏移，而更小的偏移
+///    会掉进约束 1 的 32 pt 命中区 —— 这个分界是这套屏幕偏移机制的边界，不是靠调数字
+///    绕得开的（`tools/test-stage-resident-chat.swift` 把 1.5 / 2.0 / 2.2 m 三档钉住了）。
+enum ResidentPropRotationHandleAnchor {
+    /// 相对 footprint 中心投影点的固定屏幕偏移，落在光标的右上侧（AppKit 点，y 轴向上为正）。
+    static let screenOffsetX: CGFloat = 34
+    static let screenOffsetY: CGFloat = 10
+    static let screenOffset = CGPoint(x: screenOffsetX, y: screenOffsetY)
+
+    /// 归一化（左上原点）投影点 → 视图坐标（左下原点）的手柄圆心。
+    ///
+    /// 纯函数：输入只有投影点与视图尺寸，**没有任何随相机距离缩放的量** —— 这正是
+    /// "同一世界点在不同相机距离下，手柄屏幕偏移恒定"这条性质可以被离线断言的原因。
+    static func center(projectedCenter: SIMD2<Float>, viewSize: CGSize) -> CGPoint {
+        CGPoint(
+            x: CGFloat(projectedCenter.x) * viewSize.width + screenOffsetX,
+            y: CGFloat(1 - projectedCenter.y) * viewSize.height + screenOffsetY
+        )
+    }
+}
+
 @MainActor
 private final class StageContentView: NSView {
     /// 建造模式的光标回调，转给真正处理鼠标的交互视图。
@@ -1537,49 +1577,37 @@ private final class StageWorldInteractionView: NSView {
 
     // MARK: - 旋转手柄
 
-    /// 手柄的**世界锚点**：footprint 中心沿其**局部 +Z（前方）**外扩
-    /// `max(0.35, 0.6 × footprint 最大半宽)` 米。
+    /// 手柄的**世界锚点**：footprint 中心。
     ///
-    /// 本地 → 世界的 yaw 约定**照抄** `WorldPlanarFootprint.center(anchoredAt:spacing:)`
-    /// （`PropPlacementEvaluator`）：本地 +X → `(cos yaw, -sin yaw)`，本地 +Z → `(sin yaw, cos yaw)`。
-    /// ⚠️ 这里采用的是"本地 +Z 为正前方"（与评估器同一套），**真机上左右/前后是否需要取反
-    /// 只能肉眼确认** —— 无 GUI 的环境里验证不了。
+    /// `placement.position` 是吸附后的**锚定格（那一列）的格心**，也就是 footprint 的中心，
+    /// 直接拿来用即可 —— **不再**退回最小角、更**不再**沿局部 +Z 外扩任何米数：外扩量属于
+    /// 世界空间，投影到屏幕上会随相机距离缩放（近处把圆环顶到光标前面，见
+    /// `ResidentPropRotationHandleAnchor`）。屏幕上的偏移由那个纯函数统一加。
+    ///
+    /// 建造模式这一条与改动前一致（原来是通过 `residentPropBuildModeProjection?.spacing`
+    /// 间接要求的）：非建造模式的"在支持面上挪物件"路径也会写 `placement`，那里不该冒出手柄
+    /// —— `mouseDown` 本来也只在建造模式里让手柄命中生效。
     private var rotationHandleWorldAnchor: SIMD3<Float>? {
         guard propEditor.isCarrying,
-              let placement = propEditor.placement,
-              let footprint = propEditor.footprint,
-              let spacing = spatialStage.residentPropBuildModeProjection?.spacing else { return nil }
-        let halfX = footprint.size.x / 2
-        let halfZ = footprint.size.y / 2
-        let outward = max(0.35, 0.6 * max(halfX, halfZ))
-        // `placement.position` 是**锚定格（footprint 最小角那一列）的格心**，而 footprint 以
-        // 该列的**最小角**为锚点（见 `WorldPlanarFootprint.center`）：先退回最小角，
-        // 再走"到中心 + 沿前方外扩"的本地偏移。
-        let anchorX = placement.position.x - spacing * 0.5
-        let anchorZ = placement.position.z - spacing * 0.5
-        let localX = halfX
-        let localZ = halfZ + outward
-        let cosine = cos(placement.yaw)
-        let sine = sin(placement.yaw)
-        return SIMD3(
-            anchorX + cosine * localX + sine * localZ,
-            placement.position.y,
-            anchorZ - sine * localX + cosine * localZ
-        )
+              spatialStage.isResidentPropBuildModeActive,
+              let placement = propEditor.placement else { return nil }
+        return SIMD3(placement.position.x, placement.position.y, placement.position.z)
     }
 
-    /// 手柄圆环在本视图坐标里的圆心（AppKit 左下原点）。没在手 / 投影不可用 / 拿不到
-    /// 尺寸时为 nil —— 也就是不画、不命中。
+    /// 手柄圆环在本视图坐标里的圆心（AppKit 左下原点）。没在手 / 投影不可用时为 nil ——
+    /// 也就是不画、不命中。
     ///
     /// 世界 → 屏幕用**既有的** `SpatialStageStore.residentPropScreenPoint(world:)`
-    /// （它给的是归一化、左上原点，所以 y 要翻回来）。
+    /// （它给的是归一化、左上原点，所以 y 要翻回来），再加上**固定屏幕偏移**
+    /// （`ResidentPropRotationHandleAnchor.center`）。整条链上没有任何随距离缩放的量。
     private var rotationHandleCenter: NSPoint? {
         guard let world = rotationHandleWorldAnchor,
               let normalized = spatialStage.residentPropScreenPoint(world: world) else { return nil }
-        return NSPoint(
-            x: CGFloat(normalized.x) * bounds.width,
-            y: CGFloat(1 - normalized.y) * bounds.height
+        let center = ResidentPropRotationHandleAnchor.center(
+            projectedCenter: normalized,
+            viewSize: bounds.size
         )
+        return NSPoint(x: center.x, y: center.y)
     }
 
     /// 手柄命中（可见圆环 26 pt，命中区 32 pt）。
