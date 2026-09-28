@@ -106,22 +106,29 @@ func near(_ a: Float, _ b: Float, _ tolerance: Float = 0.00001) -> Bool { abs(a 
         check(wideStates.count == 4, "the whole footprint lights up, not just its anchor cell")
         check(wideStates.values.allSatisfy { $0 == .validFootprint }, "the whole footprint shares one verdict")
 
-        // ── 90° 步进旋转 ──────────────────────────────────────────────────
-        check(near(PropSupportGridMapping.yaw(rotatedBySteps: 1, from: 0), Float.pi / 2), "one step is 90 degrees")
-        check(near(PropSupportGridMapping.yaw(rotatedBySteps: 2, from: 0), Float.pi), "two steps is 180 degrees")
-        check(near(PropSupportGridMapping.yaw(rotatedBySteps: 3, from: 0), Float.pi * 1.5), "three steps is 270 degrees")
-        check(near(PropSupportGridMapping.yaw(rotatedBySteps: 4, from: 0), 0), "four steps returns to the start")
-        check(near(PropSupportGridMapping.yaw(rotatedBySteps: -1, from: 0), Float.pi * 1.5),
+        // ── 45° 步进旋转（2026-09-28 由 90° 改成 45°，对齐 The Sims 4） ──────
+        check(near(PropSupportGridMapping.yaw(rotatedBySteps: 1, from: 0), Float.pi / 4), "one step is 45 degrees")
+        check(near(PropSupportGridMapping.yaw(rotatedBySteps: 2, from: 0), Float.pi / 2), "two steps is 90 degrees")
+        check(near(PropSupportGridMapping.yaw(rotatedBySteps: 3, from: 0), Float.pi * 0.75), "three steps is 135 degrees")
+        check(near(PropSupportGridMapping.yaw(rotatedBySteps: 4, from: 0), Float.pi), "four steps is 180 degrees")
+        // 一整圈回到起点：45° 步长下是 8 步（原来 90° 时是 4 步）—— 原意保留，数字跟着步长走。
+        check(near(PropSupportGridMapping.yaw(rotatedBySteps: 8, from: 0), 0), "eight steps returns to the start")
+        check(near(PropSupportGridMapping.yaw(rotatedBySteps: -1, from: 0), Float.pi * 1.75),
               "a negative step wraps instead of going negative")
         check(near(PropSupportGridMapping.normalizedYaw(-Float.pi / 2), Float.pi * 1.5),
               "negative yaw normalises into [0, 2pi)")
-        // 反复累加不会漂成大数。
+        // 反复累加不会漂成大数。**实跑测量**（不是推的）：45° 步长累加 1000 次（= 125 整圈）后
+        // yaw = 6.2831254 = 2π − 6.0e-5，即每步一次 Float 舍入、1000 步共漂 6e-5 弧度（约 0.0034°）。
+        // 所以这里钉"仍在 [0, 2π)" + "离起点不超过 1e-4 弧度"：原来那句 1e-5 的 `near(yaw, 0)`
+        // 是 90° 步长（4 步一圈）时的巧合，不是设计保证；45° 下它必然失败（实测 6.0e-5 > 1e-5）。
         var yaw: Float = 0
         for _ in 0..<1000 { yaw = PropSupportGridMapping.yaw(rotatedBySteps: 1, from: yaw) }
-        check(yaw >= 0 && yaw < Float.pi * 2 && near(yaw, 0), "a thousand quarter turns stays normalised")
+        let driftFromStart = min(yaw, Float.pi * 2 - yaw)
+        check(yaw >= 0 && yaw < Float.pi * 2 && driftFromStart <= 0.0001,
+              "a thousand 45° steps stays normalised and returns within 1e-4 rad of the start")
         check(PropSupportGridMapping.normalizedYaw(.nan) == 0, "non-finite yaw falls back to zero")
 
-        print("PASS: 30 grid mapping checks, 0 failures")
+        print("PASS: 31 grid mapping checks, 0 failures")
     }
 }
 """#

@@ -111,7 +111,7 @@ enum PropSupportGridMapping {
         return SIMD3(origin.x + spacing * 0.5, supportHeight, origin.y + spacing * 0.5)
     }
 
-    /// 把 yaw 归一化到 `[0, 2π)`。90° 步进旋转用它，避免反复累加后漂成大数。
+    /// 把 yaw 归一化到 `[0, 2π)`。步进旋转用它，避免反复累加后漂成大数。
     static func normalizedYaw(_ yaw: Float) -> Float {
         guard yaw.isFinite else { return 0 }
         let twoPi = Float.pi * 2
@@ -119,8 +119,12 @@ enum PropSupportGridMapping {
         return remainder < 0 ? remainder + twoPi : remainder
     }
 
-    /// 90° 步进旋转。
+    /// 步进旋转：**45° 一步**（与 The Sims 4 官方口径一致；2026-09-28 之前是 90°，
+    /// 见 `docs/plans/2026-09-28-decoration-in-space-interaction.md` D4）。
+    ///
+    /// 步长只在这一处：`ResidentPropGridEditorModel.rotateFootprint(bySteps:)` 是旋转的
+    /// 唯一入口（R / ⇧R / `,` / `.` / 场景内手柄都走它），谁都不要再抄一份。
     static func yaw(rotatedBySteps steps: Int, from yaw: Float) -> Float {
-        normalizedYaw(yaw + Float(steps) * (Float.pi / 2))
+        normalizedYaw(yaw + Float(steps) * (Float.pi / 4))
     }
 }

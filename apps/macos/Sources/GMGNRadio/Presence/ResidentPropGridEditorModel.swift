@@ -24,7 +24,7 @@ import WorldRuntime
     @Published private(set) var hoveredBlockReason: PropSupportBlockReason?
     /// 需要着色的格子（footprint 内）。缺省即"可放"。
     @Published private(set) var cellStates: [PropSupportGridPresentation.Cell: PropSupportGridPresentation.CellState] = [:]
-    /// 当前 footprint 朝向（弧度，已归一化）。90° 步进由 `rotateFootprint(bySteps:)` 驱动。
+    /// 当前 footprint 朝向（弧度，已归一化）。45° 步进由 `rotateFootprint(bySteps:)` 驱动。
     @Published private(set) var footprintYaw: Float = 0
 
     /// 每次状态变更**之后**触发，供宿主把网格与着色转发给渲染层。
@@ -116,7 +116,8 @@ import WorldRuntime
         cellStates = [:]
     }
 
-    /// 90° 步进旋转。旋转后立刻按上一次的评估输入重算整块 footprint 的着色，
+    /// 45° 步进旋转（步长在 `PropSupportGridMapping.yaw(rotatedBySteps:from:)`）。
+    /// 旋转后立刻按上一次的评估输入重算整块 footprint 的着色，
     /// 这样用户按住旋转键就能看到绿/红跟着转。
     func rotateFootprint(bySteps steps: Int) {
         footprintYaw = PropSupportGridMapping.yaw(rotatedBySteps: steps, from: footprintYaw)

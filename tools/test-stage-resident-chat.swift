@@ -463,6 +463,26 @@ enum StageAvatarActivity { case listening, speaking, idle }
         input.window?.firstResponder = NSTextView()
         input.keyDown(with: NSEvent(keyCode: 53))
         check(input.propEditor.escapeCalls == 1 && input.forwarded.last == 53, "text focus owns Escape before scene editor")
+        // 建造模式步进旋转键：R / ⇧R，以及 Sims 4 肌肉记忆的 `,`（逆时针）/ `.`（顺时针）。
+        // 步长（45°）在映射层验证，这里只验键码与方向。
+        input.window?.firstResponder = input
+        input.spatialStage.isResidentPropBuildModeActive = true
+        var rotations: [Int] = []
+        input.onGridRotate = { rotations.append($0) }
+        input.keyDown(with: NSEvent(keyCode: 43))
+        input.keyDown(with: NSEvent(keyCode: 47))
+        input.keyDown(with: NSEvent(keyCode: 15, charactersIgnoringModifiers: "r"))
+        input.keyDown(with: NSEvent(keyCode: 15, modifierFlags: .shift, charactersIgnoringModifiers: "r"))
+        check(rotations == [-1, 1, 1, -1], "`,` is counter-clockwise, `.` is clockwise, and Shift+R keeps reversing R")
+        // `⌘,`（设置…）与 `⌘.`（取消）是系统/App 快捷键，不能被旋转吃掉。
+        input.keyDown(with: NSEvent(keyCode: 43, modifierFlags: .command))
+        input.keyDown(with: NSEvent(keyCode: 47, modifierFlags: .command))
+        check(rotations == [-1, 1, 1, -1], "Cmd+, and Cmd+. are not swallowed as rotation shortcuts")
+        // 不在建造模式时这些键不该旋转（R 依然按老规矩只在建造模式里生效）。
+        input.spatialStage.isResidentPropBuildModeActive = false
+        input.keyDown(with: NSEvent(keyCode: 43))
+        input.keyDown(with: NSEvent(keyCode: 15, charactersIgnoringModifiers: "r"))
+        check(rotations == [-1, 1, 1, -1], "rotation keys stay inert outside build mode")
         print("\(failures == 0 ? "PASS" : "FAIL"): \(count) stage resident chat checks, \(failures) failures")
         exit(failures == 0 ? 0 : 1)
     }

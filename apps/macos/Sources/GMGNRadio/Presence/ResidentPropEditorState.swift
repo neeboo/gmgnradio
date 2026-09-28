@@ -64,6 +64,15 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     /// 的 `WorldPropLayoutCommand.hold`，会持久化、绑居民右手、要求 2B 角色、最长边 >0.45 m
     /// 拒绝）是**两件不同的事**，命名上不要混：「在手」=鼠标携带，「手持/拿着看/放回」=居民携带。
     var isCarrying: Bool { isOpen && placement != nil && !isSelectedHeld }
+    /// 当前摆放/建造模式算 footprint 用的物件尺寸：优先"正在拖动/待确认"的那个，否则用选中的。
+    /// 没有选中任何物件时返回 nil，调用方退回"一格"。
+    ///
+    /// **唯一一份推导**：摆放校验（`residentPropGridHover` 的 `footprintSize`/`height`）与
+    /// 场景内旋转手柄的外扩距离都读它——两处各抄一遍的话，手柄会偏离真正被判定/着色的 footprint。
+    var footprint: (size: SIMD2<Float>, height: Float)? {
+        guard let prop = (candidate ?? selectedObject)?.generatedProp else { return nil }
+        return (SIMD2(prop.size.x, prop.size.z), prop.size.y)
+    }
     var selectedGrip: WorldPropGripCalibration? { isSelectedHeld ? selectedObject?.gripCalibration : nil }
     var selectedHoldUnavailableReason: String? { selectedID.flatMap { snapshot.holdUnavailableReasons[$0] } }
     var surface: ResidentPropEditorSurface? { snapshot.surfaces.first { $0.id == placement?.surfaceID } }
@@ -127,7 +136,9 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
         await validate(.init(surfaceID: layerName, position: point, yaw: yaw))
     }
 
-    /// 建造模式的 90° 步进旋转（既有的 `rotate` 是 45°，保留给别的入口）。
+    /// 建造模式的 90° 步进旋转。**全仓已无任何调用者**（旋转的唯一入口是
+    /// `ResidentPropGridEditorModel.rotateFootprint(bySteps:)`，R / ⇧R / `,` / `.` /
+    /// 场景内手柄都走它）。这里保留只是为了"先报告、别删"；确认后应整段删除。
     func rotateQuarterTurn(bySteps steps: Int) async {
         guard !isSaving, let p = placement else { return }
         await validate(.init(surfaceID: p.surfaceID, position: p.position, yaw: p.yaw + Float(steps) * .pi / 2))
@@ -142,6 +153,13 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
         guard let p = placement else { return }
         await movePointer(to: .init(x: p.position.x + x, y: p.position.y, z: p.position.z + z))
     }
+    /// 面板上的 45° 旋转按钮（`ResidentPropEditorView` 的「左转 45° / 右转 45°」）。
+    ///
+    /// ⚠️ 这条路径只改 `placement.yaw`，**是第二个 yaw 真相来源**（唯一真相是
+    /// `ResidentPropGridEditorModel.footprintYaw`），下一次 `publishResidentPropGrid`
+    /// 会把预览转回去。建造模式的手柄/按键**绝不**走这里。
+    /// 本步（第 2 步）**没有删它**：删了会打断 `ResidentPropEditorView.swift:66-67` 的编译，
+    /// 而那个文件属于后续的"面板瘦身"步（D10）。
     func rotate(_ direction: Float) async {
         guard !isSaving, let p = placement else { return }
         await validate(.init(surfaceID: p.surfaceID, position: p.position, yaw: p.yaw + direction * .pi / 4))

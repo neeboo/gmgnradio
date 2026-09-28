@@ -86,10 +86,9 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
 
     /// 建造模式算 footprint 用的物件尺寸：优先"正在拖动/待确认"的那个，否则用选中的。
     /// 没有选中任何物件时返回 nil，调用方退回"一格"的 footprint。
+    /// 推导只有一份（`ResidentPropEditorState.footprint`）：场景内旋转手柄也要用它。
     var residentPropFootprint: (size: SIMD2<Float>, height: Float)? {
-        guard let prop = (residentPropEditor.candidate ?? residentPropEditor.selectedObject)?.generatedProp
-        else { return nil }
-        return (SIMD2(prop.size.x, prop.size.z), prop.size.y)
+        residentPropEditor.footprint
     }
     private var playbackState: LocalMusicPlaybackState
     private var voiceState: RealtimeVoiceConnectionState
@@ -789,6 +788,13 @@ private final class StageContentView: NSView {
             "stage.world-interaction"
         )
         worldInteractionView.isHidden = true
+        // 场景内的旋转手柄就画在这个视图里（`StageWorldInteractionView.draw(_:)`），因为
+        // 它本来就是指针的唯一所有者 —— 画与命中判定同类型、同坐标系。兄弟视图全都用
+        // layer.zPosition 排层（世界 1.5 / 环境特效 2 / 加载 5 / 面板 10+），而这里原先
+        // 没设 wantsLayer：layer-backed 混排下 `draw(_:)` 会被 Metal 世界整块盖住。
+        // 见 `docs/plans/2026-09-28-decoration-in-space-interaction.md` 真机验证项 2 的退路。
+        worldInteractionView.wantsLayer = true
+        worldInteractionView.layer?.zPosition = 6
         addSubview(worldInteractionView)
 
         let overlay = StageOverlayHostingView(
@@ -1202,13 +1208,25 @@ private final class StageWorldInteractionView: NSView {
     /// nil 表示当前没有待判定的按下；超过抖动阈值转成相机拖拽时会被清掉。
     private var propPressOriginInWindow: CGPoint?
 
+    // MARK: - 场景内旋转手柄（第 2 步）
+
+    /// 可见圆环的半径与线宽（屏幕空间恒定，不随距离缩放）。
+    private static let rotationHandleRadius: CGFloat = 26
+    private static let rotationHandleLineWidth: CGFloat = 3
+    /// 手柄命中半径：**比可见圆环大**，便于瞄准。
+    private static let rotationHandleHitRadius: CGFloat = 32
+    /// 光标是不是正停在手柄上（决定光标形状与圆环亮度）。
+    private var isRotationHandleHovered = false
+    /// 编辑器状态一变就把手柄重画一遍（开始/结束携带、换格、旋转）。
+    private var rotationHandleRefresh: AnyCancellable?
+
     /// 建造模式的光标回调。参数是**归一化、左上原点**的光标位置，与
     /// `SpatialStageStore.residentPropPoint` 和 `PropSupportGridPicker` 同一套约定。
     var onGridCursor: ((SIMD2<Float>) -> Void)?
     /// 建造模式「点一下落地」的回调。参数与 `onGridCursor` 完全一致（归一化、左上原点），
     /// 这样落点就是用户最后看到 footprint 停住的那个格心。
     var onGridCommit: ((SIMD2<Float>) -> Void)?
-    /// 建造模式的 90° 步进旋转（+1 顺时针 / -1 逆时针）。
+    /// 建造模式的 45° 步进旋转（+1 顺时针 / -1 逆时针）。
     var onGridRotate: ((Int) -> Void)?
 
     init(spatialStage: SpatialStageStore, propEditor: ResidentPropEditorState) {
@@ -1216,6 +1234,12 @@ private final class StageWorldInteractionView: NSView {
         self.propEditor = propEditor
         super.init(frame: .zero)
         toolTip = "拖动鼠标调整视角；滚轮拉近或拉远；W/S 沿视线前后移动，A/D 左右移动；双击复位"
+        // 手柄画在本视图里（`draw(_:)`），位置完全由编辑器状态决定：状态一变就标脏即可，
+        // **不需要任何每帧注册机制** —— 这正是把绘制放在 `draw(_:)` 的好处。
+        // 少了这条，"点地即放 / Esc"之后鼠标不动的话，旧圆环会一直留在屏幕上。
+        rotationHandleRefresh = propEditor.objectWillChange.sink { [weak self] _ in
+            self?.needsDisplay = true
+        }
     }
 
     required init?(coder: NSCoder) {
@@ -1244,6 +1268,14 @@ private final class StageWorldInteractionView: NSView {
     override func mouseDown(with event: NSEvent) {
         if consumesPropPointer {
             window?.makeFirstResponder(self)
+            // **手柄命中优先于放置**：命中手柄就只旋转，绝不进入下面的放置分支，
+            // 也**不记按下点**（记了就会在 mouseUp 被当成"点一下落地"，见那里的守卫）。
+            // 旋转按键与 R 键同一个方向约定：+1 顺时针、⇧ 反向。
+            if spatialStage.isResidentPropBuildModeActive,
+               isRotationHandleHit(at: convert(event.locationInWindow, from: nil)) {
+                onGridRotate?(event.modifierFlags.contains(.shift) ? -1 : 1)
+                return
+            }
             // 建造模式：按下**只记点**，绝不 beginDrag —— 否则左键一按就开始转相机，
             // 「点一下落地」永远不会发生。落地在 mouseUp（见那里），
             // 中间只要手抖超过阈值就会转成相机拖拽（见 mouseDragged）。
@@ -1351,7 +1383,10 @@ private final class StageWorldInteractionView: NSView {
             propEditor.escape()
             return
         }
-        // 建造模式：R 顺时针 90°，Shift+R 逆时针 90°。
+        // 建造模式：R 顺时针 45°，Shift+R 逆时针 45°；`,` 逆时针、`.` 顺时针
+        // （Sims 4 肌肉记忆，键码也在 `gridRotationSteps(for:)` 里）。
+        // 这里与 R 同一段、同一个出口 —— 于是"手柄 / R / ⇧R / , / ."全都汇到
+        // `onGridRotate` → `ResidentPropGridEditorModel.rotateFootprint(bySteps:)` 这一条链上。
         if propEditor.isOpen, spatialStage.isResidentPropBuildModeActive,
            let steps = Self.gridRotationSteps(for: event) {
             onGridRotate?(steps)
@@ -1421,7 +1456,7 @@ private final class StageWorldInteractionView: NSView {
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let pointerTracking { removeTrackingArea(pointerTracking) }
-        let area = NSTrackingArea(rect: .zero, options: [.activeInKeyWindow, .inVisibleRect, .mouseMoved], owner: self, userInfo: nil)
+        let area = NSTrackingArea(rect: .zero, options: [.activeInKeyWindow, .inVisibleRect, .mouseMoved, .mouseEnteredAndExited], owner: self, userInfo: nil)
         addTrackingArea(area); pointerTracking = area
     }
 
@@ -1433,8 +1468,27 @@ private final class StageWorldInteractionView: NSView {
         updatePropPointer(event)
     }
 
-    /// 建造模式的 90° 步进旋转键。
+    /// 光标离开交互视图：手柄的 `pointingHand` 不能留在别处（例如 Metal 世界那张没设
+    /// 光标区的画面上）。
+    override func mouseExited(with event: NSEvent) {
+        guard isRotationHandleHovered else { return }
+        isRotationHandleHovered = false
+        NSCursor.arrow.set()
+        needsDisplay = true
+    }
+
+    /// 建造模式的步进旋转键：`R` / `⇧R`，以及 Sims 4 肌肉记忆的 `,` / `.`。
     private static func gridRotationSteps(for event: NSEvent) -> Int? {
+        // `,` 逆时针、`.` 顺时针（The Sims 4 官方口径）。
+        // **必须放行 `⌘` 组合**：`⌘,` 是系统/App 的「设置…」、`⌘.` 是「取消」，
+        // 不能被旋转吃掉。
+        if !event.modifierFlags.contains(.command) {
+            switch event.keyCode {
+            case 43: return -1  // ,
+            case 47: return 1   // .
+            default: break
+            }
+        }
         guard event.charactersIgnoringModifiers?.lowercased() == "r" else { return nil }
         return event.modifierFlags.contains(.shift) ? -1 : 1
     }
@@ -1458,6 +1512,9 @@ private final class StageWorldInteractionView: NSView {
 
     private func updatePropPointer(_ event: NSEvent, confirm: Bool = false) {
         guard let normalized = normalizedPropPointer(for: event) else { return }
+        // 手柄画在本视图里，所以指针一移动就重算悬停并标脏 —— 圆环跟着 footprint 走，
+        // 不需要任何每帧注册机制（选 `draw(_:)` 而不是新开一层 overlay 就是为了这个）。
+        updateRotationHandle(at: convert(event.locationInWindow, from: nil))
 
         // 建造模式交给格子拾取：射线与**每一层**格子平面求交、就近命中，不再依赖
         // "当前摆放面"的单一高度 —— 这正是建造模式能放地面、放桌面、放夹层的原因。
@@ -1476,6 +1533,94 @@ private final class StageWorldInteractionView: NSView {
             await propEditor.movePointer(to: .init(x: position.x, y: position.y, z: position.z))
             if confirm, !Task.isCancelled { await propEditor.confirm() }
         }
+    }
+
+    // MARK: - 旋转手柄
+
+    /// 手柄的**世界锚点**：footprint 中心沿其**局部 +Z（前方）**外扩
+    /// `max(0.35, 0.6 × footprint 最大半宽)` 米。
+    ///
+    /// 本地 → 世界的 yaw 约定**照抄** `WorldPlanarFootprint.center(anchoredAt:spacing:)`
+    /// （`PropPlacementEvaluator`）：本地 +X → `(cos yaw, -sin yaw)`，本地 +Z → `(sin yaw, cos yaw)`。
+    /// ⚠️ 这里采用的是"本地 +Z 为正前方"（与评估器同一套），**真机上左右/前后是否需要取反
+    /// 只能肉眼确认** —— 无 GUI 的环境里验证不了。
+    private var rotationHandleWorldAnchor: SIMD3<Float>? {
+        guard propEditor.isCarrying,
+              let placement = propEditor.placement,
+              let footprint = propEditor.footprint,
+              let spacing = spatialStage.residentPropBuildModeProjection?.spacing else { return nil }
+        let halfX = footprint.size.x / 2
+        let halfZ = footprint.size.y / 2
+        let outward = max(0.35, 0.6 * max(halfX, halfZ))
+        // `placement.position` 是**锚定格（footprint 最小角那一列）的格心**，而 footprint 以
+        // 该列的**最小角**为锚点（见 `WorldPlanarFootprint.center`）：先退回最小角，
+        // 再走"到中心 + 沿前方外扩"的本地偏移。
+        let anchorX = placement.position.x - spacing * 0.5
+        let anchorZ = placement.position.z - spacing * 0.5
+        let localX = halfX
+        let localZ = halfZ + outward
+        let cosine = cos(placement.yaw)
+        let sine = sin(placement.yaw)
+        return SIMD3(
+            anchorX + cosine * localX + sine * localZ,
+            placement.position.y,
+            anchorZ - sine * localX + cosine * localZ
+        )
+    }
+
+    /// 手柄圆环在本视图坐标里的圆心（AppKit 左下原点）。没在手 / 投影不可用 / 拿不到
+    /// 尺寸时为 nil —— 也就是不画、不命中。
+    ///
+    /// 世界 → 屏幕用**既有的** `SpatialStageStore.residentPropScreenPoint(world:)`
+    /// （它给的是归一化、左上原点，所以 y 要翻回来）。
+    private var rotationHandleCenter: NSPoint? {
+        guard let world = rotationHandleWorldAnchor,
+              let normalized = spatialStage.residentPropScreenPoint(world: world) else { return nil }
+        return NSPoint(
+            x: CGFloat(normalized.x) * bounds.width,
+            y: CGFloat(1 - normalized.y) * bounds.height
+        )
+    }
+
+    /// 手柄命中（可见圆环 26 pt，命中区 32 pt）。
+    private func isRotationHandleHit(at point: NSPoint) -> Bool {
+        guard let center = rotationHandleCenter else { return false }
+        return hypot(point.x - center.x, point.y - center.y) <= Self.rotationHandleHitRadius
+    }
+
+    /// 指针移动时更新手柄悬停态：命中就换成 `pointingHand`，并标脏让圆环变亮。
+    private func updateRotationHandle(at point: NSPoint) {
+        let hovered = isRotationHandleHit(at: point)
+        if hovered != isRotationHandleHovered {
+            isRotationHandleHovered = hovered
+            // 拖相机时 `beginDrag` 已经 push 了 `closedHand`，别去抢光标。
+            if !dragInProgress {
+                (hovered ? NSCursor.pointingHand : NSCursor.arrow).set()
+            }
+        }
+        needsDisplay = true
+    }
+
+    /// 手柄：在手的物件旁边画一个 26 pt 圆环（白色 12% 底 + 青色描边，命中时变亮）。
+    ///
+    /// 画在这里而不是新开一层 overlay：本视图是**指针的唯一所有者**，绘制与命中判定
+    /// 同类型、同坐标系；那几个 hosting view 的 `hitTest` 全返回 nil，再开一层等于第三套坐标系。
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard let center = rotationHandleCenter else { return }
+        let radius = Self.rotationHandleRadius
+        let ring = NSBezierPath(ovalIn: NSRect(
+            x: center.x - radius,
+            y: center.y - radius,
+            width: radius * 2,
+            height: radius * 2
+        ))
+        let isHot = isRotationHandleHovered
+        NSColor.white.withAlphaComponent(isHot ? 0.20 : 0.12).setFill()
+        ring.fill()
+        NSColor.cyan.withAlphaComponent(isHot ? 1 : 0.78).setStroke()
+        ring.lineWidth = Self.rotationHandleLineWidth
+        ring.stroke()
     }
 
     private func beginDrag(
