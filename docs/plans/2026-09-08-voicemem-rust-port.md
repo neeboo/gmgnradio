@@ -1,5 +1,22 @@
 # VoiceMem Rust Memory Port Implementation Plan
 
+> **后续变更（2026-09-28）：外部 provider 层已整体移除。**
+>
+> 产品负责人决定：**记忆模块留在 Rust 里自己做，不再依赖外部 compaction / embedding 服务。**
+> 因此本计划里"配置外部 provider"的那一半已删除：
+>
+> - daemon：`memory_configure` 及其 provider 存储、所有对外部 endpoint 的 HTTP 调用、
+>   `memory_orchestrator.rs` 的压缩调度与它接入 `memory.rs` 的全部调用点；
+> - App：`GMGN_MEMORY_*` 环境变量解析（`ResidentMemoryConfiguration.swift` 整个文件）、
+>   provider 状态轮询、"缺配置 / 后台整理失败"的常驻可见提示；
+> - 安装器：`--configure-memory-only` 与那套 provider 校验常量。
+>
+> **保留**：`services/gmgn-taskd/src/memory.rs` 的本地记忆（快照提交、ingest/recall/
+> read/query/turn/pending、向量账本结构）以及 App 侧的 recall/ingest 接线。
+> 语义压缩与向量检索暂时没有 provider —— 按上述决定留待 Rust 侧自行实现。
+>
+> **下面正文描述的是变更前的设计，保留作为历史记录。**
+
 ## Latest user amendment: DSH-only implementation
 
 2026-09-08 latest scope expansion: implement Rust-side dual-lane orchestration as specified in `docs/plans/2026-09-08-voicemem-rust-orchestration.md`. One DSH owns the whole Rust specialization (core, concurrency/provider repairs, recall/ingest orchestration); the other owns Swift/voice application work only. Swift must not duplicate Rust consolidation scheduling. The former limited dual-section-only scope is superseded by that additive plan.

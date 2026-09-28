@@ -725,7 +725,7 @@ final class AppDelegate:
     /// 这份快照，口径一致。不做持久化：现有唯一按回合存储的是模型长期记忆，
     /// 其冻结合同不允许 Swift 侧重组为界面历史（见体验修复文档）。
     private var residentChatTranscript = ResidentChatTranscript()
-    // MARK: VoiceMem 长期记忆（编排薄适配器 + 运行时配置）
+    // MARK: 长期记忆（本地编排薄适配器；外部 provider 接线已移除）
     /// 该轮已成功结束、等待「显示/语音完成」才确认入库的交付凭据。只调用显示
     /// API 但没有任何显示表面（controller 全 nil）不算已显示；模型返回或语音
     /// 启动成功都不算交付完成。
@@ -738,31 +738,12 @@ final class AppDelegate:
     }
 
     /// 编排薄适配器（memory_recall / memory_ingest / memory_status /
-    /// memory_configure 转发），复用 gmgn-taskd 统一状态合同运输。
+    /// recall / ingest 转发），复用 gmgn-taskd 统一状态合同运输。
     private lazy var residentConversationMemory: ResidentConversationMemory = {
         ResidentConversationMemory(
             transport: ResidentTaskDaemonStateTransport(client: PropTaskDaemonClient())
         )
     }()
-    /// daemon 重启后 provider 配置丢失：最近一次 memory_status 的 configured
-    /// 摘要，据此按需重新 memory_configure，而不是只在启动配一次。
-    private var residentMemoryConfigured: (compaction: Bool, embedding: Bool)?
-    /// 配置/状态轮询节流：不新增高频调度，只搭既有定期刷新。
-    private var residentMemoryConfigurationAttemptAt: Date?
-    /// 缺配置/失败提示去重，避免每轮刷新反复打扰。
-    private var residentMemoryConfigurationNotice: String?
-    /// 上面的提示文案是否已真正写进过至少一个可见聊天表面。启动时 controller
-    /// 可能全 nil：只缓存去重的话，稍后打开的 UI 永远看不到缺配置/失败提示。
-    /// 新文案在表面不可用时保持未显示状态，由既有定期刷新在表面可用后补一次。
-    private var residentMemoryConfigurationNoticeShown = false
-    /// 当前是否正展示「后台整理失败/缺 provider」滞留提示：失败时置真，后台恢复
-    /// （idle/pending/running 或无该 scope 状态可取）后清一次旧提示，不留残行。
-    private var residentMemoryBackgroundIssueShown = false
-    /// 运行中的配置查询（防并发重复配置）。
-    private var residentMemoryConfigurationInFlight = false
-    /// 显式环境变量不完整：本进程无法自动配置，但不停查——仍按 30 秒节流轮询，
-    /// 以便 daemon 被外部配好后清掉缺配置提示与标记（见 apply）。
-    private var residentMemoryEnvironmentIncomplete = false
     /// 真实人类输入来源的最小 runID 绑定：语音转写入口登记 .voice，键盘入口
     /// 缺省即 .text；新运行开始时绑定，供交付确认传 source。
     private var residentTurnSourceByRunID: [UUID: ResidentMemorySource] = [:]
@@ -3991,223 +3972,19 @@ final class AppDelegate:
         }
     }
 
-    // MARK: - VoiceMem 长期记忆接线（App 宿主侧）
-
-    /// 一次性接线：把编排薄适配器挂到 AgentConversationService 并给可见错误出口，
-    /// 然后按环境变量 + daemon memory_status.configured 配置/重配 provider。
-    /// 复用既有 gmgn-taskd 生命周期，不开新服务、不替换居民计划 residentMemoryStore。
+    /// 把**本地**对话记忆适配器（daemon 的 `memory_recall` / `memory_ingest`）挂到会话服务。
+    ///
+    /// 这里**不再有任何外部 provider 接线**：`memory_configure` 与"语义压缩 / embedding
+    /// 服务"的整套配置（环境变量解析、provider 状态轮询、缺配置/后台整理失败的可见提示）
+    /// 已整体移除。记忆模块本身留在 Rust daemon 里（`memory.rs`），不再依赖外部服务；
+    /// 安装器里那套记忆 provider 环境变量与 `--configure-memory-only` 同步删除。
     private func configureResidentConversationMemory() {
         AgentConversationService.shared.attachConversationMemory(
             residentConversationMemory
         ) { [weak self] message in
-            // 已交付回合入队/投递失败（队列满、daemon 拒绝、传输失败）是一次性
-            // 交付事件，走不缓存去重的交付提示行；不占用配置状态提示位。
+            // 已交付回合入队/投递失败是一次性交付事件，走不缓存去重的交付提示行。
             self?.showResidentMemoryDeliveryNotice(message)
         }
-        residentMemoryConfigured = nil
-        refreshResidentMemoryConfigurationIfNeeded(force: true)
-    }
-
-    /// 搭既有 5 秒定期刷新的配置核对（30 秒节流 + 进行中防重，不加高频模型/
-    /// compact 调度）：daemon 重启后 provider 配置丢失（memory_status.configured=
-    /// false），据此按显式环境变量重新 memory_configure，而不是只在启动配一次。
-    /// 显式环境变量缺失只表示本进程暂时无法自动配置，不是永久停查：仍按 30 秒
-    /// 节流轮询，才能感知外部（daemon/编排侧）后来把 provider 配好并清掉旧提示。
-    private func refreshResidentMemoryConfigurationIfNeeded(force: Bool = false) {
-        // force 只跳过 30 秒节流，绝不绕过进行中防重：同一时刻只允许一个配置核对。
-        guard !residentMemoryConfigurationInFlight else { return }
-        let now = Date()
-        if !force, let last = residentMemoryConfigurationAttemptAt,
-           now.timeIntervalSince(last) < 30 { return }
-        residentMemoryConfigurationAttemptAt = now
-        residentMemoryConfigurationInFlight = true
-        Task { @MainActor [weak self] in
-            defer { self?.residentMemoryConfigurationInFlight = false }
-            await self?.applyResidentMemoryConfigurationIfNeeded()
-        }
-    }
-
-    /// memory_status.configured 为 true 并不等于记忆可用：编排合同里后台整理
-    /// 失败/缺 provider（orchestration.state=failed/unconfigured）时已确认内容
-    /// 只留在易失缓冲、尚未成为长期记忆，必须让用户可见（ingest accepted 后
-    /// 后台失败不会走 onError，只能靠本状态轮询呈现）；恢复时清理旧提示。
-    /// 只展示稳定错误码（lastError）或安全文案，聊天照常、不发起整理。
-    private func applyResidentMemoryConfigurationIfNeeded() async {
-        let memory = residentConversationMemory
-        let environmentConfiguration = ResidentMemoryEnvironmentConfiguration.read()
-        // 发起时身份：await 期间换空间/重绑定会改 scope 或推进代次，旧结果绝不
-        // 落到新空间（不覆盖也不清新空间的 configured 摘要/提示/后台状态）。
-        let queryScope = currentResidentMemoryScope()
-        let queryGeneration = residentMemoryBindingGeneration
-        do {
-            let status = try await memory.configurationStatus(scope: queryScope)
-            guard !Task.isCancelled,
-                  currentResidentMemoryScope() == queryScope,
-                  residentMemoryBindingGeneration == queryGeneration else { return }
-            let summary = (status.configured.compaction, status.configured.embedding)
-            residentMemoryConfigured = summary
-            // daemon 已配置（或本就由其它通道配好）：无需动作，聊天照常。
-            // 若本进程先前因缺显式环境变量或 memory_configure 失败留下过期的
-            // 「缺配置/配置失败」提示与标记，而 daemon 现在已由外部配好，清掉
-            // 这些过时的配置故障，并让可见状态反映当前配置，避免恢复后聊天
-            // 表面仍停留在旧警告上。后台整理失败/缺 provider（failed/
-            // unconfigured）仍由 presentResidentMemoryBackgroundStatus 如实呈现，
-            // 绝不被恢复/成功文案覆盖。
-            if summary.0 && summary.1 {
-                let staleConfigurationFault = residentMemoryEnvironmentIncomplete
-                    || residentMemoryConfigurationNotice?.contains("缺少显式配置") == true
-                    || residentMemoryConfigurationNotice?.contains("长期记忆后台配置失败") == true
-                residentMemoryEnvironmentIncomplete = false
-                if staleConfigurationFault {
-                    residentMemoryConfigurationNotice = nil
-                    residentMemoryConfigurationNoticeShown = false
-                }
-                let backgroundHealthy = status.orchestration == nil
-                    || status.orchestration?.state == .idle
-                    || status.orchestration?.state == .pending
-                    || status.orchestration?.state == .running
-                let hadBackgroundIssue = residentMemoryBackgroundIssueShown
-                presentResidentMemoryBackgroundStatus(status.orchestration)
-                if staleConfigurationFault, backgroundHealthy, !hadBackgroundIssue {
-                    // 后台无故障时状态出口不会产生新行：补一条只表示「配置已恢复」
-                    // 的状态行（不代表写入完成），替掉表面上的过期缺配置/配置失败文案。
-                    showResidentMemoryNotice("长期记忆后台配置已恢复。")
-                }
-                return
-            }
-        } catch {
-            // daemon 未就绪/传输失败：沿用节流稍后由定期刷新再试，不影响聊天。
-            return
-        }
-        guard environmentConfiguration.isComplete,
-              let compaction = environmentConfiguration.compaction,
-              let embedding = environmentConfiguration.embedding else {
-            residentMemoryEnvironmentIncomplete = true
-            // 技术字段（环境变量名、端点）只进日志，绝不上屏；界面只告诉用户
-            // 长期记忆暂未启用以及怎么恢复。
-            livingWorldLogger.notice(
-                "长期记忆后台缺少显式配置：需要 GMGN_MEMORY_COMPACTION_ENDPOINT/TOKEN 与 GMGN_MEMORY_EMBEDDING_ENDPOINT/TOKEN（MODEL 可选）"
-            )
-            showResidentMemoryNotice(
-                "长期记忆后台缺少显式配置：本机还没有可用的记忆服务，已联系不上配置。" +
-                "请联系维护者按部署说明配置后重启。聊天、语音和居民日常不受影响，" +
-                "只是本轮对话暂不写入长期记忆。"
-            )
-            return
-        }
-        do {
-            try await memory.configure(
-                kind: .compaction, endpoint: compaction.endpoint,
-                token: compaction.token, model: compaction.model
-            )
-            // 第一个 await 之后、第二个 configure 之前核对身份：换空间/取消即
-            // 停止，绝不把旧空间的 provider 配置继续写进新空间。
-            guard !Task.isCancelled,
-                  currentResidentMemoryScope() == queryScope,
-                  residentMemoryBindingGeneration == queryGeneration else { return }
-            try await memory.configure(
-                kind: .embedding, endpoint: embedding.endpoint,
-                token: embedding.token, model: embedding.model
-            )
-            guard !Task.isCancelled,
-                  currentResidentMemoryScope() == queryScope,
-                  residentMemoryBindingGeneration == queryGeneration else { return }
-            residentMemoryConfigured = (true, true)
-            residentMemoryEnvironmentIncomplete = false
-            residentMemoryBackgroundIssueShown = false
-            showResidentMemoryNotice("长期记忆后台配置已就绪。")
-        } catch {
-            // 失败也要先核对身份：旧空间/已取消的失败不得变成新空间的可见提示。
-            guard !Task.isCancelled,
-                  currentResidentMemoryScope() == queryScope,
-                  residentMemoryBindingGeneration == queryGeneration else { return }
-            showResidentMemoryNotice(
-                "长期记忆后台配置失败：\(error.localizedDescription)。聊天不受影响，" +
-                "将继续按现有节奏重试配置。"
-            )
-        }
-    }
-
-    /// 已配置时当前 scope 的后台整理状态呈现。nil（旧 daemon 无 orchestration
-    /// 附加字段 / 该 scope 尚无记忆）无从呈现：若此前提示过后台问题则清掉旧行。
-    /// 只切换状态行文本，不发起整理、不改变聊天。
-    private func presentResidentMemoryBackgroundStatus(
-        _ orchestration: ResidentMemoryOrchestration?
-    ) {
-        guard let orchestration else {
-            if residentMemoryBackgroundIssueShown {
-                residentMemoryBackgroundIssueShown = false
-                showResidentMemoryNotice("长期记忆后台整理已恢复。")
-            }
-            return
-        }
-        switch orchestration.state {
-        case .failed:
-            residentMemoryBackgroundIssueShown = true
-            let detail = orchestration.lastError.map { "（\($0)）" } ?? ""
-            showResidentMemoryNotice(
-                "长期记忆后台整理失败\(detail)：已确认内容仍暂留在易失缓冲，" +
-                "尚未成为长期记忆。聊天不受影响，将按现有节奏继续整理。"
-            )
-        case .unconfigured:
-            residentMemoryBackgroundIssueShown = true
-            showResidentMemoryNotice(
-                "长期记忆后台整理暂不可用（缺 provider 配置）：已确认内容仍暂留" +
-                "在易失缓冲，尚未成为长期记忆。聊天不受影响，配置就绪后继续整理。"
-            )
-        case .idle, .pending, .running:
-            // 正常/整理中：无问题。若此前提示过后台失败/不可用，恢复时清旧提示
-            // 一次；稳态不再重复打扰。
-            if residentMemoryBackgroundIssueShown {
-                residentMemoryBackgroundIssueShown = false
-                showResidentMemoryNotice("长期记忆后台整理已恢复。")
-            }
-        }
-    }
-
-    /// 配置核对用的只读 scope：优先当前已绑定居民 scope；无世界时用占位 scope
-    /// 读取 daemon 全局 configured 摘要（memory 部分为 null，不影响判断）。
-    private func currentResidentMemoryScope() -> ResidentStateScope {
-        if let binding = residentMemoryBinding, residentAgentLoop === binding.loop {
-            return binding.scope
-        }
-        let context = currentResidentWorldContext()
-        if let worldID = context.worldID {
-            return ResidentStateScope(worldID: worldID, residentScope: context.sessionScope)
-        }
-        return ResidentStateScope(worldID: "chat", residentScope: "chat")
-    }
-
-    /// 去重的可见状态出口：写进两个聊天表面的状态行；同文案且已真实显示过的
-    /// 不重复打扰（每 5 秒定期刷新不刷屏）。启动时聊天表面（controller）可能还
-    /// 没建好：此时只缓存文案、不显示，也不当成「已显示过去重」——等表面可用
-    /// 后由 flushResidentMemoryNoticeIfNeeded 补显示一次，绝不因缓存去重永久
-    /// 吞掉缺配置/后台失败提示。
-    private func showResidentMemoryNotice(_ text: String) {
-        if residentMemoryConfigurationNotice == text {
-            if residentMemoryConfigurationNoticeShown { return }
-            // 同文案但从未真正显示过（例如上次缓存时表面尚不可用）：继续补显示。
-        } else {
-            residentMemoryConfigurationNotice = text
-            residentMemoryConfigurationNoticeShown = false
-        }
-        guard liveCamWindowController != nil || stageWindowController != nil else { return }
-        residentMemoryConfigurationNoticeShown = true
-        liveCamWindowController?.showChatStatus(text)
-        stageWindowController?.showResidentChatStatus(text)
-    }
-
-    /// 搭既有 5 秒定期刷新补做「迟到但可见」的一次呈现：启动时表面全 nil 而暂存
-    /// 的缺配置/后台失败提示，在任一聊天表面可用后显示一次；已真实显示过或没有
-    /// 待显示文案就立即返回，不重复刷屏。environmentIncomplete 只表示本进程暂时
-    /// 缺显式配置，既不阻止 30 秒节流轮询，也不让已缓存的提示永久不可见。
-    private func flushResidentMemoryNoticeIfNeeded() {
-        guard let text = residentMemoryConfigurationNotice,
-              !residentMemoryConfigurationNoticeShown,
-              liveCamWindowController != nil || stageWindowController != nil else { return }
-        residentMemoryConfigurationNoticeShown = true
-        liveCamWindowController?.showChatStatus(text)
-        stageWindowController?.showResidentChatStatus(text)
     }
 
     /// 一次性交付事件（入队/投递失败等）的可见出口：与配置提示分开、不缓存去重，
@@ -4340,7 +4117,7 @@ final class AppDelegate:
             break
         case .unavailable:
             showResidentMemoryDeliveryNotice(
-                "长期记忆未接线：本轮对话未写入记忆。聊天与已显示的回复不受影响。"
+                "记忆服务暂时不可用：本轮对话未写入记忆。聊天与已显示的回复不受影响。"
             )
         case .rejectedText:
             showResidentMemoryDeliveryNotice(
@@ -4451,9 +4228,6 @@ final class AppDelegate:
                 guard let self else { return }
                 await refreshWishMachine()
                 refreshResidentAutonomy()
-                refreshResidentMemoryConfigurationIfNeeded()
-                // 启动时表面未建好而暂存的缺配置/后台失败提示，在表面可用后补一次。
-                flushResidentMemoryNoticeIfNeeded()
                 // 没有后端时不等用户输入：表面可用就先给出设置路径。
                 refreshResidentBackendGuidance()
             }

@@ -698,7 +698,7 @@ final class AgentConversationService {
     private var claudeHistoryByScope: [String: [AgentConversationMessage]] = [:]
     private var claudeHistoryScopeOrder: [String] = []
     /// VoiceMem 记忆编排的薄适配器（只转发 memory_recall / memory_ingest /
-    /// memory_status / memory_configure，不在 Swift 做双路排序或调度整理）。
+    /// 不在 Swift 做双路排序或调度整理）。
     /// 宿主接线时注入一次；nil = 未接线（聊天不受影响，只是不召回、不入记忆）。
     /// 模型返回后绝不自动 ingest：真实交付由 App 在显示/语音完成后调用
     /// confirmDeliveredTurn(requestID:userText:reply:source:) 显式确认。

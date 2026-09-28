@@ -25,28 +25,14 @@ SQLite 由专属存储线程单写。任务变更、事件和具有明确 scope 
 
 同一数据库同时承载 world/resident 作用域的持久状态、事件流与消息（`state_read`、`state_commit`、`event_read`、`message_read`、`message_ack`），由显式 `schema_migrations` 版本表升级：v1 旧库幂等保留，v2 新增 resident 表，v3（memory-storage-v1）新增记忆快照/向量表。JSON 合同与错误码见 [resident 存储合同](../../docs/plans/2026-09-08-resident-storage-contract.md)。resident 进程级回归：`TASKD_BIN="$PWD/services/gmgn-taskd/target/debug/gmgn-taskd" python3 tools/test-resident-state-daemon.py -v`。
 
-VoiceMem 选择性移植的长期记忆层（七个 additive `memory_*` 方法、快照/向量原子提交、sqlite-vec 静态链接、真实配置的 compaction/embedding provider、易失 pending turns）合同见 [VoiceMem Rust 记忆合同](../../docs/plans/2026-09-08-voicemem-rust-contract.md)，出处与许可证见 `VoiceMem-NOTICE.md`。双路编排增补（`memory_recall` 两路同代检索与有界融合、`memory_ingest` 已交付回合原子入易失缓冲与 Rust 后台自动整理、`memory_status.orchestration` 可见状态）见 [VoiceMem Rust 双路记忆编排计划](../../docs/plans/2026-09-08-voicemem-rust-orchestration.md)，实现记录见 [Rust 核心 evidence](../../docs/plans/evidence/2026-09-08-voicemem-rust-core.md)。provider wire 见下方「VoiceMem provider wire」。进程级回归：`TASKD_BIN="$PWD/services/gmgn-taskd/target/debug/gmgn-taskd" python3 services/gmgn-taskd/tests/memory_process.py -v`、`python3 services/gmgn-taskd/tests/memory_races.py -v`（断连取消压缩、并发压缩绑定捕获基线 generation）与 `python3 services/gmgn-taskd/tests/orchestration_process.py -v`（后台批量/断连独立整理、ingest 原子幂等易失、recall 分路配额与单次共享 embedding）。注意：`tools/test-resident-state-daemon.py` 中的 v1 升级断言仍写死版本 2，v3 迁移后需改为 3（tools 归 Swift/tools owner，待其更新）。
+VoiceMem 选择性移植的长期记忆层留在 Rust daemon 内：`memory_status/read/query/turn/pending` 与本地 `memory_ingest/memory_recall` 的协议、快照与幂等账本（`memory_snapshots`/`memory_requests`/`memory_vec_rows`）、sqlite-vec 静态链接与易失 pending turns 都保留，出处与许可证见 `VoiceMem-NOTICE.md`；合同见 [VoiceMem Rust 记忆合同](../../docs/plans/2026-09-08-voicemem-rust-contract.md)。**外部 VoiceMem 服务层已整体拆除**：daemon 不再向任何 compaction/embedding endpoint 发 HTTP，也不再持有 endpoint/token/model 配置，只服务外部 provider 的两个 IPC 方法（配置 provider、语义压缩提交）已整体从 dispatch 删除（调用得到 `unknown_method`），后台压缩编排与断连取消管线一并移除。为后续在 Rust 内自行实现语义抽取，快照与向量代次账本的结构、三张表与 sqlite-vec 注册都原样保留，但不再写入向量。进程级回归：`TASKD_BIN="$PWD/services/gmgn-taskd/target/debug/gmgn-taskd" python3 services/gmgn-taskd/tests/local_memory_process.py -v`（无任何 provider fixture：易失回合缓冲、已交付回合原子幂等入队、scope 隔离、status/read/pending，以及 query/recall 的如实「语义检索不可用」应答）。注意：`tools/test-resident-state-daemon.py` 中的 v1 升级断言仍写死版本 2，v3 迁移后需改为 3（tools 归 Swift/tools owner，待其更新）。
 
-## VoiceMem provider wire（Rust daemon 的 HTTP 客户端契约）
+## 本地记忆行为（provider 拆除后）
 
-`memory_configure` 的 `endpoint` 是 origin（无路径）；daemon 在 origin 上调用两个**标准 OpenAI-compatible** 端点，离线 fixture 与独立验收 fixture 都必须实现它们（`memory_*` IPC 形状不变）：
-
-- 压缩：`POST {endpoint}/v1/chat/completions`，Bearer token。
-  请求 body：`{"model": <memory_configure 的 compaction model>, "messages": [{"role":"system","content": <COMPACTION_RULES>}, {"role":"user","content": "<previous 快照 + turns + limits 的 JSON 字符串>"}]}`。
-  `model` 必须已配置（未配置时压缩以 `memory_compact_failed` 显式失败）；system content 与规则全文见 `src/memory.rs::COMPACTION_RULES`（长期事实/偏好 vs 有依据关系笔记、一次性请求不记、单次情绪不推人格、保留具体日期/名字/数字、notes 禁止照读、校正/删除以 `removed`+替换表达、输出 frozen envelope）。
-  响应必须是 chat-completions JSON：顶层 `model` 回显请求模型，`choices[0].message.content` 是 frozen envelope JSON 字符串（容忍 ```json 围栏）：
-  `{"facts":[{"category":"fact|preference","text":"…","observedAt":"…","grounding":"…"}],"notes":[{"category":"relationship|experience","text":"…","observedAt":"…","grounding":"…"}],"removed":["<上一版 entryID>"]}`。
-- 嵌入：`POST {endpoint}/v1/embeddings`，Bearer token。请求 `{"model": <embedding model（可选提示）>, "input": [text…]}`。
-  响应：`{"object":"list","data":[{"object":"embedding","index":i,"embedding":[…]}],"model":"…"}`；daemon 校验 count、`index` 顺序、model（顶层或逐条一致）、维度一致且 `1..=8192`、数值 finite 且向量非全零。压缩产出一条以上时对所有条目文本嵌入；零条且已有上一版时沿用上一版 model/维度（不调用）；零条且无上一版时以单条空文本探针锚定维度（探针向量丢弃，绝不落库）。
-- 断连取消：请求在压缩 provider 返回后的迟到响应不得落库 —— `memory_compact` 的取消标志在提交 barrier 与存储线程提交闭包内检查；客户端断开后压缩以失败结束，pending 保留。压缩始终把「读取旧快照时的 generation」绑定为内部 CAS（即使省略 `expectedVectorGeneration`），并发中先提交者胜、后提交者 `memory_conflict`。
-- 抽取上下文：chat 请求的 user content JSON 另含可选 `previousReply`（{text, source, observedAt}）—— 指向前一条已交付 agent 回复，即使它自己的 turns 已被上次整理清空仍保留在易失 pairs 列表，供回应经验归因（right-lane feedback）；同一 scope 任一方向只可能有一条。每条分路分区（vec0 虚拟表）带 `section` 元数据列（`facts`/`notes`），recall 两路都先按 scope/当前代/section 过滤再取 top-k，绝不做全局 top-k 后丢弃。
-
-
-## VoiceMem 双路编排（memory_recall / memory_ingest / 后台整理）
-
-- `memory_recall`：一次 query embedding 供事实/经验两路复用；每路先按 scope、当前 `vectorGeneration`、`section` 过滤再 KNN top-k（`factLimit` 默认 6、1–12；`noteLimit` 默认 4、1–8），两路同一代、有界融合为 ≤8000 Unicode 字符的纯文本 `context`。notes 在 context 中始终带「禁止照读/不据此认定人格」标记；两路都无命中时给出证据不足提示。`freshSession=true` 才在 context 中加入带标记的本地快照+易失 pending 有界恢复段（embedding 未配置时 facts/notes 为空、status=unconfigured，但本地恢复仍可用）。
-- `memory_ingest`：只接受已交付回合，原子追加 user+agent 两条易失 turns 并按 scope 保持顺序（200 上限 FIFO）；`(scope, requestID)` 接收幂等只在内存有界保存（每 scope 最近 200 次），重放返回 `replayed:true`，同 requestID 不同内容返回 `memory_request_conflict`。原始对话文本永不落盘，重启后未整理原文与接收幂等一并丢失。source=text/voice、observedAt 与前一真实 agent 回复作为易失抽取上下文。回复中的 `consolidation` 表示 idle/pending/running/unconfigured/failed。
-- Rust 后台自动整理（同 daemon、同库、单 writer，与显式 `memory_compact` 同一提交管线）：同 scope 至多一项进行中；pending turns 达到阈值（默认 4 条）短延迟（默认 2s）后启动，未达阈值空闲 30s 后整理。时钟/阈值是内部可注入策略（`memory_orchestrator::Policy`），离线测试注入毫秒级延迟，绝不实等 30 秒，也不新增用户配置框架。失败不清 pending、不无限重试（下次新输入或显式 `memory_compact` 重试），`memory_status.orchestration = {state, lastError}` 以稳定错误码可见。已接受回合的后台整理独立于短 IPC 连接寿命；显式长请求 `memory_compact` 的断连取消语义不变，两者不混用。
+- `memory_recall`：请求形状不变（`freshSession`、`factLimit` 1–12、`noteLimit` 1–8），但语义检索那一侧已随 embedding provider 删除：`facts`/`notes` 恒为空数组、`status` 恒为 `unconfigured`，**不做关键词/时间序兜底**（词法巧合不是语义证据）。`freshSession=true` 时 context 仍带带标记的本地快照 + 易失 pending 有界恢复段（≤8000 Unicode 字符），并明确声明「语义记忆检索当前不可用」；notes 始终带「禁止照读/不据此认定人格」标记。
+- `memory_ingest`：只接受已交付回合，原子追加 user+agent 两条易失 turns 并按 scope 保持顺序（200 上限 FIFO）；`(scope, requestID)` 接收幂等只在内存有界保存（每 scope 最近 200 次），重放返回 `replayed:true`，同 requestID 不同内容返回 `memory_request_conflict`。原始对话文本永不落盘，重启后未提交原文与接收幂等一并丢失。回复只有 `{accepted, replayed, pendingTurns}`，不再有压缩状态字段。
+- `memory_query`：协议与参数校验保留，但没有查询向量可用，恒返回 `status:"unconfigured"` + 空 `results`。
+- 不再有后台自动整理、`memory_status.orchestration` 或 provider 配置状态；`memory_status` 只报 `{memory, pendingTurns}`。
 
 ## IPC
 

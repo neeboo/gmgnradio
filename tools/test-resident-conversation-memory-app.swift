@@ -419,8 +419,10 @@ final class App {
         app.presentResidentReply("未接线的回复")
         check(service.confirmed.count == confirmedBeforeBackground,
               "unavailable never ingests")
-        check(app.liveCamWindowController?.statuses.last?.contains("未接线") == true,
-              "unavailable shows a visible not-connected notice")
+        // 文案已随"外部 provider 接线移除"校准：适配器现在恒为挂载，
+        // "未接线"不再准确，改为说明记忆服务暂时不可用。
+        check(app.liveCamWindowController?.statuses.last?.contains("暂时不可用") == true,
+              "unavailable shows a visible memory-service-unavailable notice")
         let statusCountBeforeAccepted = app.liveCamWindowController?.statuses.count ?? 0
         service.forcedResult = nil
         service.stage(requestID: UUID())

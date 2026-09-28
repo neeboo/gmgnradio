@@ -4,8 +4,8 @@ import Foundation
 // 合同：docs/plans/2026-09-08-voicemem-rust-orchestration.md（冻结）
 //
 // 职责边界（本文件必须保持"薄"）：
-// - 只转发 memory_recall / memory_ingest / memory_configure / memory_status。
-// - 绝不调用 memory_compact / memory_query / memory_read / memory_turn，绝不
+// - 只转发 memory_recall / memory_ingest（本地记忆；外部 provider 接线已整体移除）。
+// - 绝不调用 memory_query / memory_read / memory_turn，绝不
 //   在 Swift 侧做双路排序、二次融合或安排/调度整理。
 // - 恢复上下文只取 Rust 已融合好的 `context`：Swift 只做 ≤8000 字符的硬限制
 //   并把结果当不透明数据使用；`freshSession` 由调用方显式传入（全新会话 true，
@@ -35,7 +35,7 @@ struct ResidentConversationMemoryContext: Equatable, Sendable {
 /// memory_ingest 成功进入 Rust 易失缓冲后的状态事件。
 ///
 /// 只代表"已交付回合被 Rust 接受进 volatile 缓冲"——不冒充 durable 落库：
-/// 落库由 Rust 后台整理完成，长期状态以 `consolidation` 与后续 memory_status
+/// 落库由 Rust 后台整理完成，长期状态以 `consolidation` 为准
 /// 的 orchestration 为准。事件携带 scope + generation 供消费方防晚到串写。
 struct ResidentConversationMemoryStatusEvent: Equatable, Sendable {
     let scope: ResidentStateScope
@@ -43,7 +43,6 @@ struct ResidentConversationMemoryStatusEvent: Equatable, Sendable {
     let requestID: String
     let replayed: Bool
     let pendingTurns: UInt64
-    let consolidation: ResidentMemoryConsolidation
 }
 
 /// 交付失败事件（daemon 拒绝、畸形响应、传输错误、队列满等）。
@@ -145,36 +144,7 @@ final class ResidentConversationMemory {
         return count
     }
 
-    // MARK: - 转发：memory_configure / memory_status / memory_recall
-
-    /// 转发 `memory_configure`。token 只作为请求参数转发给 daemon（daemon 内存
-    /// 保存、不落盘、不进日志），本适配器不落属性、不写盘、不打日志、不读环境
-    /// 变量/钥匙串。App 的配置入口由后续轮次接线。
-    func configure(kind: ResidentMemoryProviderKind, endpoint: String,
-                   token: String, model: String? = nil) async throws {
-        try await client.memoryConfigure(kind: kind, endpoint: endpoint,
-                                         token: token, model: model)
-    }
-
-    /// 转发 `memory_status`：返回 typed status，后台整理状态（orchestration 的
-    /// failed/unconfigured 等）对调用方可见。未绑定 scope → 抛 notBound。
-    ///
-    /// 调用方用「发起时的 scope + generation」标识一次查询：await 期间若
-    /// bind/reset 已切换作用域或代次，返回前校验失败会抛 CancellationError——
-    /// 绝不让旧 scope 的结果落到新 scope 调用方（取消/切换都按取消处理）。
-    func status() async throws -> ResidentMemoryStatus {
-        let query = try boundIdentity()
-        let result = try await client.memoryStatus(scope: query.scope)
-        try ensureStillCurrent(query)
-        return result
-    }
-
-    /// 供宿主「配置检查」使用的只读 memory_status：不要求先 bind。只读取 daemon
-    /// 的全局 configured 摘要（重启丢失后据此重配）与指定 scope 的后台整理状态，
-    /// 不参与本适配器的 scope/generation 门控、不推进代次。
-    func configurationStatus(scope: ResidentStateScope) async throws -> ResidentMemoryStatus {
-        try await client.memoryStatus(scope: scope)
-    }
+    // MARK: - 转发：memory_recall
 
     /// 转发 `memory_recall` 并只取 Rust 融合的 context。freshSession 由调用方
     /// 显式传入：全新会话 true；原生续聊/同一会话追加查询 false（避免反复整段
@@ -276,8 +246,7 @@ final class ResidentConversationMemory {
             guard isCurrent(item) else { return }
             onStatus?(ResidentConversationMemoryStatusEvent(
                 scope: item.scope, generation: item.generation, requestID: item.requestID,
-                replayed: result.replayed, pendingTurns: result.pendingTurns,
-                consolidation: result.consolidation))
+                replayed: result.replayed, pendingTurns: result.pendingTurns))
         } catch let error as ResidentStateError {
             guard isCurrent(item) else { return }
             onError?(ResidentConversationMemoryErrorEvent(

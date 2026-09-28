@@ -2,13 +2,6 @@ import Foundation
 
 // MARK: - 值类型
 
-/// `memory_configure` 的 provider 类别（合同 §3.1）。压缩与嵌入彼此独立配置：
-/// 缺失其一就显式 unavailable，绝不静默降级。
-enum ResidentMemoryProviderKind: String, Codable, Sendable {
-    case compaction
-    case embedding
-}
-
 /// `memory_turn` / `memory_pending` 的发言方（合同 §2.3/§3.5）。只接受
 /// user/agent；CC 侧保证只投喂真实用户文字与已成功送达的回复。
 enum ResidentMemoryRole: String, Codable, Sendable {
@@ -82,47 +75,6 @@ struct ResidentMemorySnapshot: Equatable, Sendable, Codable {
     let sections: ResidentMemorySections
 }
 
-/// `memory_status` 的 `configured` 摘要（合同 §3.2）。
-struct ResidentMemoryConfigured: Equatable, Sendable, Codable {
-    let compaction: Bool
-    let embedding: Bool
-}
-
-/// `memory_status` 摘要里的条目计数（合同 §3.2 `entryCounts`）。
-struct ResidentMemoryCounts: Equatable, Sendable, Codable {
-    let facts: UInt64
-    let notes: UInt64
-}
-
-/// `memory_status` 摘要里的快照元数据（无 sections，用 entryCounts 概览）。
-struct ResidentMemoryStatusMemory: Equatable, Sendable, Codable {
-    let schemaVersion: UInt64
-    let revision: UInt64
-    let vectorGeneration: UInt64
-    let processedWatermark: UInt64
-    let nextWatermark: UInt64
-    let embedding: ResidentMemoryEmbedding
-    let entryCounts: ResidentMemoryCounts
-}
-
-/// `memory_status` 的可选 `orchestration` 附加字段（编排合同增补）：Rust 后台
-/// 整理的状态概览。旧 daemon/旧 fixture 缺省该键或显式 null → nil（向后兼容，
-/// 旧客户端本就忽略附加字段）；`lastError` 是稳定错误码或 null，不含敏感详情。
-struct ResidentMemoryOrchestration: Equatable, Sendable, Codable {
-    let state: ResidentMemoryConsolidation
-    let lastError: String?
-}
-
-/// `memory_status` 回复（合同 §3.2）。`memory:null` 表示该 scope 尚无快照
-/// （不是错误）；`pendingTurns` 独立于快照存在；`orchestration` 是编排合同
-/// 增补的可选字段，缺省/显式 null → nil，不破坏旧响应解析。
-struct ResidentMemoryStatus: Equatable, Sendable, Codable {
-    let configured: ResidentMemoryConfigured
-    let memory: ResidentMemoryStatusMemory?
-    let pendingTurns: UInt64
-    let orchestration: ResidentMemoryOrchestration?
-}
-
 /// `memory_pending` 里的一条易失 turn（合同 §3.6）。只用于拼「本会话尚未入库」
 /// 的即时上下文，禁止缓存为长期记忆。
 struct ResidentMemoryPendingTurn: Equatable, Sendable, Codable {
@@ -158,16 +110,6 @@ struct ResidentMemoryQueryResult: Equatable, Sendable, Codable {
     let results: [ResidentMemoryQueryHit]
 }
 
-/// `memory_compact` 回复（合同 §3.7）。`replayed:true` 表示同一
-/// `(scope, requestID)` 幂等回放，未重复压缩、未推进 revision。
-struct ResidentMemoryCompactResult: Equatable, Sendable, Codable {
-    let revision: UInt64
-    let vectorGeneration: UInt64
-    let replayed: Bool
-    let processedWatermark: UInt64
-    let pendingTurns: UInt64
-}
-
 /// 发言来源（编排合同增补 `memory_ingest`）：`voice` 表示真实语音转写来源，
 /// 只证明来源是语音，不代表完成了声纹/情绪识别；缺省 `text`。
 enum ResidentMemorySource: String, Codable, Sendable {
@@ -175,8 +117,8 @@ enum ResidentMemorySource: String, Codable, Sendable {
     case voice
 }
 
-/// 后台整理/编排状态（编排合同增补）：`memory_ingest` 回复的 `consolidation`
-/// 与 `memory_status` 的 `orchestration.state` 共用同一组取值。`pending` 表示
+/// 后台整理/编排状态：**只由 `memory_recall` 的 `consolidation` 字段使用**
+/// （`memory_ingest` 回复已不再回报整理去向）。`pending` 表示
 /// 已交付回合进入易失缓冲、等待后台整理；`running` 表示整理进行中；
 /// `failed`/`unconfigured` 表示失败/缺 provider 但内容仍在易失缓冲。读取侧
 /// 遇到白名单外的取值即畸形响应。
@@ -204,16 +146,17 @@ struct ResidentMemoryRecallResult: Equatable, Sendable, Codable {
     let pendingTurns: UInt64
 }
 
-/// `memory_ingest` 回复（编排合同增补）：`accepted:true` 只代表已交付回合成对
-/// 进入该 scope 的易失缓冲，**绝不代表 durable 落库**——落库由 Rust 后台整理
-/// 完成，客户端不得冒充长期保存。`replayed:true` 表示同一 `(scope, requestID)`
-/// 幂等回放，未重复入队；缺 provider 时仍 accepted=true 且
-/// consolidation=unconfigured，内容保留在易失缓冲。
+/// `memory_ingest` 回复：`accepted:true` 只代表已交付回合成对进入该 scope 的
+/// 易失缓冲，**绝不代表 durable 落库**——落库由 Rust 侧完成，客户端不得冒充
+/// 长期保存。`replayed:true` 表示同一 `(scope, requestID)` 幂等回放，未重复入队。
+///
+/// 回复**不再带 `consolidation`**：外部 provider 移除后没有语义压缩，daemon 侧
+/// 也不再回报本轮的整理去向（原来缺 provider 时是 `unconfigured`）。客户端若继续
+/// 严格解码该字段，每次投递都会抛 `invalidResponse` 而丢掉整轮记忆。
 struct ResidentMemoryIngestResult: Equatable, Sendable, Codable {
     let accepted: Bool
     let replayed: Bool
     let pendingTurns: UInt64
-    let consolidation: ResidentMemoryConsolidation
 }
 
 // MARK: - 客户端
@@ -222,7 +165,7 @@ struct ResidentMemoryIngestResult: Equatable, Sendable, Codable {
 ///
 /// 合同（docs/plans/2026-09-08-voicemem-rust-contract.md，冻结 + 编排合同
 /// docs/plans/2026-09-08-voicemem-rust-orchestration.md 增补 memory_recall/
-/// memory_ingest 与 memory_status 可选 orchestration 字段）只在本文件实现；
+/// memory_ingest）只在本文件实现；
 /// scope 一律复用 `ResidentStateScope` 内嵌对象（两个维度都参与隔离）；
 /// revision / vectorGeneration / processedWatermark / nextWatermark / facts /
 /// notes / 可选 grounding·observedAt 均保留为类型化字段。
@@ -247,50 +190,6 @@ final class ResidentMemoryClient {
     }
 
     // MARK: - 七个冻结方法
-
-    /// `memory_configure`（合同 §3.1）：配置压缩/嵌入 provider，daemon 内存
-    /// 保存、永不落盘。结果恒为 `{"configured": true}`；不是 true 即畸形响应。
-    func memoryConfigure(kind: ResidentMemoryProviderKind, endpoint: String,
-                         token: String, model: String? = nil) async throws {
-        var params: [String: ResidentStateJSON] = [
-            "kind": .string(kind.rawValue),
-            "endpoint": .string(endpoint),
-            "token": .string(token),
-        ]
-        if let model { params["model"] = .string(model) }
-        let response = try await transport.call(method: "memory_configure", params: params)
-        guard response["configured"]?.boolValue == true else { throw ResidentStateError.invalidResponse }
-    }
-
-    /// `memory_status`（合同 §3.2）：只读、无副作用。`memory:null` → nil。
-    func memoryStatus(scope: ResidentStateScope) async throws -> ResidentMemoryStatus {
-        let response = try await transport.call(method: "memory_status", params: scopeParams(scope))
-        let configured = try requireObject(response["configured"])
-        let compaction = try requireBool(configured["compaction"])
-        let embedding = try requireBool(configured["embedding"])
-        // memory 键缺失即畸形；显式 null 才是"该 scope 尚无快照"。
-        guard let memoryValue = response["memory"] else { throw ResidentStateError.invalidResponse }
-        let memory: ResidentMemoryStatusMemory?
-        if case .null = memoryValue {
-            memory = nil
-        } else {
-            memory = try decodeStatusMemory(memoryValue)
-        }
-        let pendingTurns = try strictUInt64(response["pendingTurns"])
-        // orchestration 是编排合同增补的可选字段：缺省（旧 daemon/fixture）或
-        // 显式 null → nil；出现但形状错误 → 畸形响应。
-        var orchestration: ResidentMemoryOrchestration?
-        if let orchestrationValue = response["orchestration"] {
-            if case .null = orchestrationValue {
-                orchestration = nil
-            } else {
-                orchestration = try decodeOrchestration(orchestrationValue)
-            }
-        }
-        return ResidentMemoryStatus(configured: ResidentMemoryConfigured(
-            compaction: compaction, embedding: embedding), memory: memory,
-            pendingTurns: pendingTurns, orchestration: orchestration)
-    }
 
     /// `memory_read`（合同 §3.3）：返回当前唯一一版快照全文（含 sections）。
     /// 显式 `memory:null` → nil；快照对象无法解码 → 显式错误，不是"空记忆"。
@@ -345,29 +244,6 @@ final class ResidentMemoryClient {
         return try items.map(decodePendingTurn)
     }
 
-    /// `memory_compact`（合同 §3.7）：语义压缩 + 向量化的持久提交点。可能耗时，
-    /// CC 不得放在延迟敏感回复路径内同步调用。`requestID` 幂等；提供
-    /// `expectedVectorGeneration` 则必须等于当前代，否则 `memory_conflict`。
-    func memoryCompact(scope: ResidentStateScope, requestID: String,
-                       expectedVectorGeneration: UInt64? = nil) async throws -> ResidentMemoryCompactResult {
-        var params = scopeParams(scope)
-        params["requestID"] = .string(requestID)
-        if let expectedVectorGeneration {
-            params["expectedVectorGeneration"] = .number(Double(expectedVectorGeneration))
-        }
-        let response = try await transport.call(method: "memory_compact", params: params)
-        let revision = try strictUInt64(response["revision"])
-        let vectorGeneration = try strictUInt64(response["vectorGeneration"])
-        let replayed = try requireBool(response["replayed"])
-        let processedWatermark = try strictUInt64(response["processedWatermark"])
-        let pendingTurns = try strictUInt64(response["pendingTurns"])
-        return ResidentMemoryCompactResult(revision: revision, vectorGeneration: vectorGeneration,
-                                           replayed: replayed, processedWatermark: processedWatermark,
-                                           pendingTurns: pendingTurns)
-    }
-
-    // MARK: - 双路检索与交付写入（编排合同增补）
-
     /// `memory_recall`（编排合同增补）：一次 embedding、双路检索与 Rust 有界
     /// 融合。`freshSession` 由调用方显式决定（全新会话 true / 原生续聊 false），
     /// 缺省 false；factLimit/noteLimit 缺省 6/4。本方法只严格解码——facts/notes
@@ -415,12 +291,8 @@ final class ResidentMemoryClient {
         guard response["accepted"]?.boolValue == true else { throw ResidentStateError.invalidResponse }
         let replayed = try requireBool(response["replayed"])
         let pendingTurns = try strictUInt64(response["pendingTurns"])
-        guard let consolidationRaw = response["consolidation"]?.stringValue,
-              let consolidation = ResidentMemoryConsolidation(rawValue: consolidationRaw) else {
-            throw ResidentStateError.invalidResponse
-        }
         return ResidentMemoryIngestResult(accepted: true, replayed: replayed,
-                                          pendingTurns: pendingTurns, consolidation: consolidation)
+                                          pendingTurns: pendingTurns)
     }
 
     // MARK: - 严格解码助手
@@ -508,24 +380,6 @@ final class ResidentMemoryClient {
                                    observedAt: observedAt, grounding: grounding)
     }
 
-    private func decodeStatusMemory(_ value: ResidentStateJSON) throws -> ResidentMemoryStatusMemory {
-        let object = try requireObject(value)
-        let schemaVersion = try strictUInt64(object["schemaVersion"])
-        let revision = try strictUInt64(object["revision"])
-        let vectorGeneration = try strictUInt64(object["vectorGeneration"])
-        let processedWatermark = try strictUInt64(object["processedWatermark"])
-        let nextWatermark = try strictUInt64(object["nextWatermark"])
-        let embedding = try decodeEmbedding(object["embedding"])
-        let countsObject = try requireObject(object["entryCounts"])
-        let facts = try strictUInt64(countsObject["facts"])
-        let notes = try strictUInt64(countsObject["notes"])
-        return ResidentMemoryStatusMemory(schemaVersion: schemaVersion, revision: revision,
-                                          vectorGeneration: vectorGeneration,
-                                          processedWatermark: processedWatermark,
-                                          nextWatermark: nextWatermark, embedding: embedding,
-                                          entryCounts: ResidentMemoryCounts(facts: facts, notes: notes))
-    }
-
     private func decodePendingTurn(_ value: ResidentStateJSON) throws -> ResidentMemoryPendingTurn {
         let object = try requireObject(value)
         let turnID = try requireString(object["turnID"])
@@ -562,16 +416,4 @@ final class ResidentMemoryClient {
         return hit
     }
 
-    /// memory_status 的可选 orchestration 对象（编排合同增补）：state 必须落在
-    /// 编排状态白名单，lastError 为可选字符串（缺省/显式 null → nil，其它类型
-    /// 畸形）。
-    private func decodeOrchestration(_ value: ResidentStateJSON) throws -> ResidentMemoryOrchestration {
-        let object = try requireObject(value)
-        guard let stateRaw = object["state"]?.stringValue,
-              let state = ResidentMemoryConsolidation(rawValue: stateRaw) else {
-            throw ResidentStateError.invalidResponse
-        }
-        let lastError = try optionalString(object["lastError"])
-        return ResidentMemoryOrchestration(state: state, lastError: lastError)
-    }
 }

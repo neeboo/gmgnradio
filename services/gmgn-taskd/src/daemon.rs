@@ -53,21 +53,16 @@ impl Service {
     }
 
     /// Credential hygiene for the additive memory methods (contract §1): any
-    /// configured token — wish origin tokens or in-memory memory provider
-    /// tokens — appearing anywhere in the params rejects the whole request.
+    /// configured wish origin token appearing anywhere in the params rejects
+    /// the whole request. Long-term memory owns no credential of its own since
+    /// the external VoiceMem provider layer was removed.
     async fn has_configured_secret(&self, params: &Value) -> bool {
-        let mut tokens: Vec<String> = self.credentials.read().await.values().cloned().collect();
-        tokens.extend(self.memory.configured_tokens().await);
+        let tokens: Vec<String> = self.credentials.read().await.values().cloned().collect();
         tokens
             .iter()
             .any(|token| provider::contains_secret(params, token))
     }
-    async fn request(
-        &self,
-        method: &str,
-        params: Value,
-        cancel: &memory::Cancellation,
-    ) -> Result<Value> {
+    async fn request(&self, method: &str, params: Value) -> Result<Value> {
         match method {
             "configure" => {
                 let origin =
@@ -253,23 +248,6 @@ impl Service {
                     })
                     .await
             }
-            "memory_configure" => {
-                // This method's job is to receive a provider token, so the
-                // secret-hygiene pre-check does not apply (reusing one token
-                // for both provider kinds, or re-configuring idempotently, is
-                // legitimate); the other six memory_* methods keep the check.
-                let request: memory::ConfigureRequest =
-                    serde_json::from_value(params).map_err(|_| "invalid_memory_configure")?;
-                self.memory
-                    .configure(
-                        &request.kind,
-                        &request.endpoint,
-                        &request.token,
-                        request.model,
-                    )
-                    .await?;
-                Ok(json!({"configured":true}))
-            }
             "memory_status" => {
                 if self.has_configured_secret(&params).await {
                     return Err("invalid_memory_status");
@@ -293,7 +271,7 @@ impl Service {
                 let request: memory::QueryRequest =
                     serde_json::from_value(params).map_err(|_| "invalid_memory_query")?;
                 self.memory
-                    .query(&self.client, request.scope, &request.query, request.top_k)
+                    .query(request.scope, &request.query, request.top_k)
                     .await
             }
             "memory_turn" => {
@@ -314,23 +292,6 @@ impl Service {
                     serde_json::from_value(params).map_err(|_| "invalid_memory_pending")?;
                 self.memory.pending(request.scope).await
             }
-            "memory_compact" => {
-                if self.has_configured_secret(&params).await {
-                    return Err("invalid_memory_compact");
-                }
-                let request: memory::CompactRequest =
-                    serde_json::from_value(params).map_err(|_| "invalid_memory_compact")?;
-                self.memory
-                    .clone()
-                    .compact_explicit(
-                        &self.client,
-                        request.scope,
-                        &request.request_id,
-                        request.expected,
-                        cancel.clone(),
-                    )
-                    .await
-            }
             "memory_ingest" => {
                 if self.has_configured_secret(&params).await {
                     return Err("invalid_memory_ingest");
@@ -338,9 +299,7 @@ impl Service {
                 let request: memory::IngestRequest =
                     serde_json::from_value(params).map_err(|_| "invalid_memory_ingest")?;
                 self.memory
-                    .clone()
                     .ingest(
-                        &self.client,
                         request.scope,
                         &request.request_id,
                         &request.user_text,
@@ -358,7 +317,6 @@ impl Service {
                     serde_json::from_value(params).map_err(|_| "invalid_memory_recall")?;
                 self.memory
                     .recall(
-                        &self.client,
                         request.scope,
                         &request.query,
                         request.fresh_session.unwrap_or(false),
@@ -377,10 +335,10 @@ impl Service {
         let mut reader = BufReader::new(reader);
         // A dedicated reader task assembles request frames and pushes them over
         // a channel. Request handling is decoupled from frame assembly so
-        // canceling an in-flight request never drops a partially read pipelined
+        // aborting an in-flight request never drops a partially read pipelined
         // frame, while EOF is still observed concurrently with a running
-        // request (which is what lets a disconnect cancel an uncommitted
-        // memory_compact before its commit barrier).
+        // request (a client that vanished stops waiting for a reply it can no
+        // longer read).
         enum ReaderEvent {
             Frame(Vec<u8>),
             End,
@@ -502,21 +460,13 @@ impl Service {
                 continue;
             }
             // Run the request on a spawned task so a client disconnect can
-            // cancel it before its side effects commit (contract §2.4: an
-            // unobserved compaction must not land). While it runs, the reader
-            // task's EOF or pipelined frames are observed; memory_compact
-            // honors the cancellation flag at its commit barrier (and inside
-            // the commit closure), so aborting the task alone can never leave a
-            // durable write behind once the flag is set.
-            let cancel = memory::Cancellation::new();
+            // abort it instead of leaving the connection waiting on a reply
+            // nobody will read. While it runs, the reader task's EOF or
+            // pipelined frames are observed so later frames keep their order.
             let service = self.clone();
             let method = request.method.clone();
             let params = request.params.clone();
-            let task_cancel = cancel.clone();
-            let mut task = tokio::spawn(async move {
-                let result = service.request(&method, params, &task_cancel).await;
-                (result, task_cancel.canceled())
-            });
+            let mut task = tokio::spawn(async move { service.request(&method, params).await });
             let outcome = loop {
                 tokio::select! {
                     outcome = &mut task => break outcome,
@@ -524,20 +474,17 @@ impl Service {
                         Some(ReaderEvent::Frame(line)) => queued.push_back(line),
                         Some(ReaderEvent::End) => {
                             // Client disconnected while the request was in
-                            // flight: cancel it and drop the connection.
-                            cancel.cancel();
+                            // flight: drop the reply and the connection.
                             task.abort();
                             let _ = task.await;
                             return Ok(());
                         }
                         Some(ReaderEvent::Error(code)) => {
-                            cancel.cancel();
                             task.abort();
                             let _ = task.await;
                             return Err(code);
                         }
                         None => {
-                            cancel.cancel();
                             task.abort();
                             let _ = task.await;
                             return Err("client_disconnected");
@@ -545,14 +492,10 @@ impl Service {
                     },
                 }
             };
-            let (result, canceled) = match outcome {
-                Ok(joined) => joined,
+            let result = match outcome {
+                Ok(result) => result,
                 Err(_) => return Err("worker_failed"),
             };
-            if canceled {
-                // The client vanished before the reply could be delivered.
-                return Ok(());
-            }
             let response = match result {
                 Ok(result) => json!({"id": request.id, "result": result}),
                 Err(code) => failure(request.id, code),
@@ -882,5 +825,85 @@ mod tests {
         let count = drain.await.unwrap();
         assert_eq!(result, Err("frame_too_large"));
         assert_eq!(count, 0);
+    }
+
+    /// 本地记忆方法仍然可用，并且只汇报本地字段：没有 provider 配置、没有压缩
+    /// 编排，也没有压缩调度状态。
+    ///
+    /// 为什么还要探一个不存在的 memory 方法：外部 provider 层的两个方法是被整体
+    /// 删除的（没有兼容分支、没有假装成功的兜底），所以这里断言"不属于本地集合的
+    /// memory_* 调用一律 unknown_method"。源码里刻意不再写出被删方法的名字，
+    /// 便于用 grep 直接验证 provider 层已经不存在。
+    #[tokio::test]
+    async fn local_memory_methods_report_local_fields_only() {
+        let dir = std::env::temp_dir().join(format!("gmgn-daemon-local-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = Service::new(Database::open(dir.clone(), None).unwrap()).unwrap();
+        let scope = json!({"scope": {"worldID": "install", "residentScope": "install"}});
+        assert_eq!(
+            service.request("memory_provider_configuration", json!({})).await,
+            Err("unknown_method")
+        );
+
+        assert_eq!(
+            service.request("memory_status", scope.clone()).await.unwrap(),
+            json!({"memory": null, "pendingTurns": 0})
+        );
+        assert_eq!(
+            service
+                .request(
+                    "memory_ingest",
+                    json!({
+                        "scope": {"worldID": "install", "residentScope": "install"},
+                        "requestID": uuid::Uuid::new_v4().hyphenated().to_string(),
+                        "userText": "本地记忆仍然写入",
+                        "agentReply": "收到",
+                    }),
+                )
+                .await
+                .unwrap(),
+            json!({"accepted": true, "replayed": false, "pendingTurns": 2})
+        );
+        // 语义检索一侧没有 provider，就如实报 unconfigured + 空结果，绝不假检索。
+        let recall = service
+            .request(
+                "memory_recall",
+                json!({
+                    "scope": {"worldID": "install", "residentScope": "install"},
+                    "query": "本地记忆",
+                    "freshSession": false,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recall["status"], "unconfigured");
+        assert_eq!(recall["facts"], json!([]));
+        assert_eq!(recall["notes"], json!([]));
+        assert_eq!(
+            service
+                .request(
+                    "memory_query",
+                    json!({
+                        "scope": {"worldID": "install", "residentScope": "install"},
+                        "query": "本地记忆",
+                    }),
+                )
+                .await
+                .unwrap(),
+            json!({"status": "unconfigured", "results": []})
+        );
+        let status = service.request("memory_status", scope).await.unwrap();
+        assert_eq!(status["pendingTurns"], 2);
+        assert_eq!(
+            service
+                .request("memory_pending", json!({"scope": {"worldID": "install", "residentScope": "install"}}))
+                .await
+                .unwrap()["turns"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

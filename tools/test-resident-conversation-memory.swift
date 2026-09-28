@@ -1,14 +1,15 @@
 // ResidentConversationMemory 与编排合同
 // （docs/plans/2026-09-08-voicemem-rust-orchestration.md）的离线直接核对：
 // StubTransport / GatedTransport 只记录请求并回放 fixture，绝不启动 taskd/
-// 宿主、不读数据库。覆盖：薄适配器只转发 memory_recall/ingest/configure/status
-// （绝无 memory_compact/query/read/turn、绝无 state_commit）；fresh/resume 由
+// 宿主、不读数据库。覆盖：薄适配器只转发 memory_recall/ingest（绝无
+// memory_compact/query/read/turn、绝无 state_commit）；fresh/resume 由
 // 调用方显式传入 freshSession；恢复 context 的 ≤8000 硬限制；recordDeliveredTurn
 // 空文本拒绝与 source=voice 转发；有界串行交付队列的顺序/背压/cancelPending；
 // bind/reset 推进 generation，scope 切换后旧 scope 的未发送任务失效、晚到
 // onStatus/onError 被门控丢弃；ingest accepted 不冒充 durable；daemon/
-// invalidResponse/transport 错误可见；memory_status orchestration 的 failed/
-// unconfigured 可见。并发场景用受控 continuation（GatedTransport）推进，不做
+// invalidResponse/transport 错误可见。外部记忆 provider 接线（适配器的配置/
+// 状态转发及状态方法里的 orchestration 字段）已从生产整体移除，
+// 这里不再覆盖。并发场景用受控 continuation（GatedTransport）推进，不做
 // 无限 sleep/轮询。
 import Foundation
 import Darwin
@@ -99,29 +100,16 @@ func scope(_ world: String = "world-a", _ resident: String = "resident-a") -> Re
 
 // MARK: - fixture 构造器
 
-func configuredOK() -> [String: ResidentStateJSON] { ["configured": .bool(true)] }
-
-func statusFixture(pendingTurns: Double = 0,
-                   orchestration: ResidentStateJSON? = nil) -> [String: ResidentStateJSON] {
-    var response: [String: ResidentStateJSON] = [
-        "configured": .object(["compaction": .bool(true), "embedding": .bool(true)]),
-        "memory": .null,
-        "pendingTurns": .number(pendingTurns),
-    ]
-    if let orchestration { response["orchestration"] = orchestration }
-    return response
-}
-
 func recallFixture(context: String, status: String = "ok", pendingTurns: Double = 0) -> [String: ResidentStateJSON] {
     ["status": .string(status), "revision": .number(0), "vectorGeneration": .number(0),
      "facts": .array([]), "notes": .array([]), "context": .string(context),
      "pendingTurns": .number(pendingTurns)]
 }
 
-func ingestFixture(replayed: Bool = false, pendingTurns: Double = 4,
-                   consolidation: String = "pending") -> [String: ResidentStateJSON] {
+/// daemon 的 `memory_ingest` 回复：外部 provider 移除后**不再有 `consolidation`**。
+func ingestFixture(replayed: Bool = false, pendingTurns: Double = 4) -> [String: ResidentStateJSON] {
     ["accepted": .bool(true), "replayed": .bool(replayed),
-     "pendingTurns": .number(pendingTurns), "consolidation": .string(consolidation)]
+     "pendingTurns": .number(pendingTurns)]
 }
 
 let forbiddenMethods = ["memory_compact", "memory_query", "memory_read", "memory_turn",
@@ -158,21 +146,11 @@ let forbiddenMethods = ["memory_compact", "memory_query", "memory_read", "memory
         } catch {
             check(false, "restore unbound must throw notBound (got \(error))")
         }
-        do {
-            _ = try await adapter.status()
-            check(false, "status without bound scope must throw notBound")
-        } catch ResidentConversationMemoryError.notBound {
-            check(true, "status without bound scope throws notBound")
-        } catch {
-            check(false, "status unbound must throw notBound (got \(error))")
-        }
     }
 
-    // MARK: - 2. 薄适配器只转发 memory_recall/ingest/configure/status
+    // MARK: - 2. 薄适配器只转发 memory_recall/ingest
     do {
         let transport = StubTransport([
-            configuredOK(),
-            statusFixture(pendingTurns: 1),
             recallFixture(context: "融合上下文", status: "ok", pendingTurns: 2),
             ingestFixture(pendingTurns: 3),
         ])
@@ -181,28 +159,21 @@ let forbiddenMethods = ["memory_compact", "memory_query", "memory_read", "memory
         let adapter = ResidentConversationMemory(transport: transport)
         adapter.onStatus = { statusEvents.append($0) }
         adapter.onError = { errorEvents.append($0) }
-        try await adapter.configure(kind: .embedding, endpoint: "http://127.0.0.1:4711",
-                                    token: "configure-secret", model: "text-embed")
         adapter.bind(scope: scope())
-        let status = try await adapter.status()
-        check(status.pendingTurns == 1, "adapter status() forwards memory_status result")
         let context = try await adapter.restore(query: "居民偏好", freshSession: false)
         check(context.status == .ok && context.text == "融合上下文" && context.pendingTurns == 2,
               "adapter restore() returns Rust context as data")
         let accepted = adapter.recordDeliveredTurn(requestID: "uuid-1", userText: "用户文字", agentReply: "已播回复")
         check(accepted, "recordDeliveredTurn accepts a confirmed delivered turn")
         await pump()
-        check(transport.recorded.map(\.method) == ["memory_configure", "memory_status", "memory_recall", "memory_ingest"],
-              "adapter forwards exactly configure/status/recall/ingest in call order")
+        check(transport.recorded.map(\.method) == ["memory_recall", "memory_ingest"],
+              "adapter forwards exactly recall/ingest in call order")
         checkNoForbidden(transport.recorded, "adapter never calls compact/query/read/turn/state_commit/...")
         check(statusEvents.count == 1 && errorEvents.isEmpty, "one status event for the accepted ingest, no errors")
-        let configureParams = transport.recorded[0].params
-        check(configureParams["token"]?.stringValue == "configure-secret",
-              "configure token travels in params only (never stored/logged by adapter)")
-        let recallParams = transport.recorded[2].params
+        let recallParams = transport.recorded[0].params
         check(recallParams["query"]?.stringValue == "居民偏好" && recallParams["freshSession"]?.boolValue == false,
               "restore forwards explicit query + freshSession=false")
-        let ingestParams = transport.recorded[3].params
+        let ingestParams = transport.recorded[1].params
         check(ingestParams["requestID"]?.stringValue == "uuid-1"
               && ingestParams["userText"]?.stringValue == "用户文字"
               && ingestParams["agentReply"]?.stringValue == "已播回复",
@@ -282,9 +253,9 @@ let forbiddenMethods = ["memory_compact", "memory_query", "memory_read", "memory
     // MARK: - 6. accepted ≠ durable：多次成功入队也只走 memory_ingest，绝不自行 compact
     do {
         let transport = StubTransport([
-            ingestFixture(replayed: false, pendingTurns: 4, consolidation: "pending"),
-            ingestFixture(replayed: true, pendingTurns: 3, consolidation: "running"),
-            ingestFixture(replayed: false, pendingTurns: 6, consolidation: "unconfigured"),
+            ingestFixture(replayed: false, pendingTurns: 4),
+            ingestFixture(replayed: true, pendingTurns: 3),
+            ingestFixture(replayed: false, pendingTurns: 6),
         ])
         var events: [ResidentConversationMemoryStatusEvent] = []
         let adapter = ResidentConversationMemory(transport: transport)
@@ -296,15 +267,15 @@ let forbiddenMethods = ["memory_compact", "memory_query", "memory_read", "memory
         await pump()
         check(transport.recorded.map(\.method) == ["memory_ingest", "memory_ingest", "memory_ingest"],
               "three accepted deliveries invoke memory_ingest only")
-        checkNoForbidden(transport.recorded, "accepted ingest never triggers memory_compact or any other method")
+        checkNoForbidden(transport.recorded, "accepted ingest never triggers any method other than memory_ingest")
         check(events.count == 3, "one status event per accepted ingest")
         if events.count == 3 {
-            check(events[0].consolidation == .pending && events[0].replayed == false,
-                  "first accepted event reports consolidation pending (still volatile, not durable)")
-            check(events[1].consolidation == .running && events[1].replayed == true,
+            check(events[0].replayed == false,
+                  "first accepted event is a fresh delivery, not a replay")
+            check(events[1].replayed == true,
                   "replayed ingest is reported via replayed=true (idempotent replay, not a duplicate write)")
-            check(events[2].consolidation == .unconfigured,
-                  "accepted + unconfigured consolidation is visible (provider missing is not hidden)")
+            check(events[2].replayed == false && events[2].pendingTurns == 6,
+                  "each event carries its own pendingTurns (third fixture is 6, not a carried-over value)")
             check(events.allSatisfy { $0.scope == scope() && $0.generation == 1 },
                   "status events carry the delivering scope and generation")
         }
@@ -337,30 +308,7 @@ let forbiddenMethods = ["memory_compact", "memory_query", "memory_read", "memory
         check(transport.recorded.count == 1, "valid delivery proceeds after rejections")
     }
 
-    // MARK: - 8. memory_status orchestration：failed / unconfigured 可见
-    do {
-        let failedStatus = statusFixture(pendingTurns: 3,
-                                         orchestration: .object(["state": .string("failed"),
-                                                                 "lastError": .string("consolidation_failed")]))
-        let unconfiguredStatus = statusFixture(pendingTurns: 5,
-                                               orchestration: .object(["state": .string("unconfigured"),
-                                                                       "lastError": .null]))
-        let legacyStatus = statusFixture(pendingTurns: 2)
-        let transport = StubTransport([failedStatus, unconfiguredStatus, legacyStatus])
-        let adapter = ResidentConversationMemory(transport: transport)
-        adapter.bind(scope: scope())
-        let failed = try await adapter.status()
-        check(failed.orchestration?.state == .failed && failed.orchestration?.lastError == "consolidation_failed",
-              "orchestration failed + lastError is visible through adapter status()")
-        let unconfigured = try await adapter.status()
-        check(unconfigured.orchestration?.state == .unconfigured && unconfigured.orchestration?.lastError == nil,
-              "orchestration unconfigured is visible through adapter status()")
-        let legacy = try await adapter.status()
-        check(legacy.orchestration == nil && legacy.pendingTurns == 2,
-              "legacy status without orchestration still decodes through the adapter")
-    }
-
-    // MARK: - 9. 有界串行队列：顺序 + 背压（queueFull）+ 恢复
+    // MARK: - 8. 有界串行队列：顺序 + 背压（queueFull）+ 恢复
     do {
         let transport = GatedTransport()
         var statusEvents: [ResidentConversationMemoryStatusEvent] = []
@@ -382,7 +330,7 @@ let forbiddenMethods = ["memory_compact", "memory_query", "memory_read", "memory
         check(errorEvents.last?.code == .queueFull && errorEvents.last?.requestID == "u3",
               "queue overflow surfaces onError(.queueFull) with the rejected requestID")
         // 放行第一个：事件到达，drain 继续到第二个。
-        transport.stage(ingestFixture(pendingTurns: 1, consolidation: "pending"))
+        transport.stage(ingestFixture(pendingTurns: 1))
         await pump()
         check(statusEvents.map(\.requestID) == ["u1"], "first ingest completes with a status event")
         check(transport.recorded.count == 2 && transport.pendingGateCount == 1,
@@ -390,9 +338,9 @@ let forbiddenMethods = ["memory_compact", "memory_query", "memory_read", "memory
         // 空间释放后新交付可再次入队（顺序仍为入队序）。
         check(adapter.recordDeliveredTurn(requestID: "u4", userText: "第四个", agentReply: "a"),
               "delivery accepted again once capacity frees")
-        transport.stage(ingestFixture(pendingTurns: 2, consolidation: "pending"))
+        transport.stage(ingestFixture(pendingTurns: 2))
         await pump()
-        transport.stage(ingestFixture(pendingTurns: 3, consolidation: "pending"))
+        transport.stage(ingestFixture(pendingTurns: 3))
         await pump()
         check(transport.recorded.map { $0.params["userText"]?.stringValue } == ["第一个", "第二个", "第四个"],
               "same-scope ingest requests leave the queue in enqueue order")
@@ -401,7 +349,7 @@ let forbiddenMethods = ["memory_compact", "memory_query", "memory_read", "memory
         check(transport.pendingGateCount == 0, "no ingest left in flight at the end of the scenario")
     }
 
-    // MARK: - 10. scope 切换：旧 scope 未发送任务失效；晚到 onStatus 被门控丢弃
+    // MARK: - 9. scope 切换：旧 scope 未发送任务失效；晚到 onStatus 被门控丢弃
     do {
         let transport = GatedTransport()
         var statusEvents: [ResidentConversationMemoryStatusEvent] = []
@@ -422,7 +370,7 @@ let forbiddenMethods = ["memory_compact", "memory_query", "memory_read", "memory
         check(adapter.recordDeliveredTurn(requestID: "b1", userText: "B 回合", agentReply: "a"),
               "scope B delivery enqueued after the switch")
         // 放行 A 回合一：它已被 Rust 接受（不可撤回），但事件是旧 scope/代次 → 门控丢弃。
-        transport.stage(ingestFixture(pendingTurns: 1, consolidation: "pending"))
+        transport.stage(ingestFixture(pendingTurns: 1))
         await pump()
         check(statusEvents.isEmpty && errorEvents.isEmpty,
               "late status/error from the old scope is gated out after the switch")
@@ -430,7 +378,7 @@ let forbiddenMethods = ["memory_compact", "memory_query", "memory_read", "memory
               "drain skipped the invalidated scope A queued turn and moved to scope B")
         check(transport.recorded.map { $0.params["userText"]?.stringValue } == ["A 回合一", "B 回合"],
               "invalidated unsent old-scope turn (A 回合二) never reaches the transport")
-        transport.stage(ingestFixture(pendingTurns: 2, consolidation: "pending"))
+        transport.stage(ingestFixture(pendingTurns: 2))
         await pump()
         check(statusEvents.count == 1, "scope B delivery completes with exactly one status event")
         if let event = statusEvents.first {
@@ -440,7 +388,7 @@ let forbiddenMethods = ["memory_compact", "memory_query", "memory_read", "memory
         check(transport.pendingGateCount == 0, "no ingest left in flight at the end of the scenario")
     }
 
-    // MARK: - 11. scope 切换同样门控晚到 onError（daemon 拒绝旧 scope 在途回合）
+    // MARK: - 10. scope 切换同样门控晚到 onError（daemon 拒绝旧 scope 在途回合）
     do {
         let transport = GatedTransport()
         var statusEvents: [ResidentConversationMemoryStatusEvent] = []
@@ -459,13 +407,13 @@ let forbiddenMethods = ["memory_compact", "memory_query", "memory_read", "memory
         check(transport.recorded.count == 1, "only the old in-flight ingest reached the transport")
         _ = adapter.recordDeliveredTurn(requestID: "b1", userText: "新回合", agentReply: "a")
         await pump()
-        transport.stage(ingestFixture(pendingTurns: 1, consolidation: "pending"))
+        transport.stage(ingestFixture(pendingTurns: 1))
         await pump()
         check(statusEvents.count == 1 && statusEvents.first?.scope == scope("w-b", "r-2"),
               "new-scope delivery still completes with a status event after the switch")
     }
 
-    // MARK: - 12. cancelPending：只取消未发送队列，不撤销已在途/已接受回合
+    // MARK: - 11. cancelPending：只取消未发送队列，不撤销已在途/已接受回合
     do {
         let transport = GatedTransport()
         var statusEvents: [ResidentConversationMemoryStatusEvent] = []
@@ -479,14 +427,14 @@ let forbiddenMethods = ["memory_compact", "memory_query", "memory_read", "memory
         _ = adapter.recordDeliveredTurn(requestID: "c3", userText: "排队三", agentReply: "a")
         let dropped = adapter.cancelPending()
         check(dropped == 2, "cancelPending drops the two unsent queued deliveries")
-        transport.stage(ingestFixture(pendingTurns: 1, consolidation: "pending"))
+        transport.stage(ingestFixture(pendingTurns: 1))
         await pump()
         check(transport.recorded.count == 1 && statusEvents.map(\.requestID) == ["c1"],
               "in-flight delivery already accepted by Rust completes; cancelled ones are never sent")
         check(transport.pendingGateCount == 0, "no ingest left in flight at the end of the scenario")
     }
 
-    // MARK: - 13. reset 清空未发送队列并解绑；恢复需重新 bind
+    // MARK: - 12. reset 清空未发送队列并解绑；恢复需重新 bind
     do {
         let transport = GatedTransport()
         let adapter = ResidentConversationMemory(transport: transport)
@@ -504,7 +452,7 @@ let forbiddenMethods = ["memory_compact", "memory_query", "memory_read", "memory
         check(transport.recorded.count == 1, "deliveries work again after rebind")
     }
 
-    // MARK: - 14. 交付错误可见性：daemon code / invalidResponse / transport 错误
+    // MARK: - 13. 交付错误可见性：daemon code / invalidResponse / transport 错误
     do {
         let daemonGate = GatedTransport()
         var errorEvents: [ResidentConversationMemoryErrorEvent] = []
@@ -527,7 +475,7 @@ let forbiddenMethods = ["memory_compact", "memory_query", "memory_read", "memory
         badAdapter.bind(scope: scope())
         _ = badAdapter.recordDeliveredTurn(requestID: "b1", userText: "u", agentReply: "a")
         await pump()
-        badGate.stage(["accepted": .bool(true)])  // 缺 replayed/pendingTurns/consolidation → 畸形
+        badGate.stage(["accepted": .bool(true)])  // 缺 replayed/pendingTurns → 畸形
         await pump()
         check(errorEvents.last?.code == .invalidResponse,
               "malformed ingest response surfaces as invalidResponse, never as a fake success")
@@ -546,7 +494,7 @@ let forbiddenMethods = ["memory_compact", "memory_query", "memory_read", "memory
         check(errorEvents.last?.code == .transport, "non-daemon transport error surfaces as .transport")
     }
 
-    // MARK: - 15. restore/status await 期间 scope/generation 切换：旧结果不返回给新调用方
+    // MARK: - 14. restore await 期间 scope/generation 切换：旧结果不返回给新调用方
     do {
         // restore：请求挂起期间 bind 到新 scope，旧 scope 的回复必须抛取消类错误，
         // 绝不把旧 scope 的整段恢复注入到新 scope 调用方。
@@ -573,14 +521,15 @@ let forbiddenMethods = ["memory_compact", "memory_query", "memory_read", "memory
         check(transport.pendingGateCount == 0, "stale-scope regression: no restore left in flight")
     }
     do {
-        // status：挂起期间 reset 解绑，旧 scope 的 memory_status 结果不能返回给调用方。
+        // restore + reset：请求挂起期间 reset 解绑，旧 scope 的 memory_recall 结果
+        // 同样不能返回给调用方（与上面的 bind 切换共用 ensureStillCurrent 门控）。
         let transport = GatedTransport()
         let adapter = ResidentConversationMemory(transport: transport)
         var caught: Error?
         adapter.bind(scope: scope("w-a", "r-1"))
-        let statusTask = Task { @MainActor in
+        let resetTask = Task { @MainActor in
             do {
-                _ = try await adapter.status()
+                _ = try await adapter.restore(query: "解绑前查询", freshSession: true)
                 return "returned"
             } catch {
                 caught = error
@@ -588,16 +537,16 @@ let forbiddenMethods = ["memory_compact", "memory_query", "memory_read", "memory
             }
         }
         await pump()
-        check(transport.pendingGateCount == 1, "stale-scope regression: status request is in flight")
+        check(transport.pendingGateCount == 1, "stale-scope regression: restore request is in flight before reset")
         adapter.reset()  // await 期间解绑
-        transport.stage(statusFixture(pendingTurns: 9))
-        let outcome = await statusTask.value
+        transport.stage(recallFixture(context: "解绑前整段恢复", status: "ok", pendingTurns: 9))
+        let outcome = await resetTask.value
         check(outcome == "threw" && caught is CancellationError,
-              "stale-scope regression: old-scope status result is not returned after reset")
-        check(transport.pendingGateCount == 0, "stale-scope regression: no status left in flight")
+              "stale-scope regression: old-scope restore result is not returned after reset")
+        check(transport.pendingGateCount == 0, "stale-scope regression: no restore left in flight after reset")
     }
     do {
-        // 没有切换时 restore/status 正常返回（防回归：不因新校验误伤正常路径）。
+        // 没有切换时 restore 正常返回（防回归：不因校验误伤正常路径）。
         let transport = GatedTransport()
         let adapter = ResidentConversationMemory(transport: transport)
         adapter.bind(scope: scope())

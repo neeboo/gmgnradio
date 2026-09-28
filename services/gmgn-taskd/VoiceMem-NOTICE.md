@@ -2,7 +2,7 @@
 
 Scope: the durable world/resident memory layer implemented in
 `services/gmgn-taskd/src/memory.rs` and exercised by
-`services/gmgn-taskd/tests/memory_process.py`.
+`services/gmgn-taskd/tests/local_memory_process.py`.
 
 ## VoiceMem (semantic reference)
 
@@ -36,7 +36,10 @@ right-brain graph storage; snapshot-style whole-section consolidation with an
 explicit `removed` list replaces a pure additive append stream; no audio /
 voiceprint / scene / multi-speaker handling; no real user database access or
 model-weight downloads; vector storage is sqlite-vec (below) instead of
-mem0/Qdrant; compaction and embedding are explicitly configured providers.
+mem0/Qdrant. The external compaction/embedding service layer of the original
+port was removed from this daemon: the semantic snapshot tables and the
+vector-generation ledger stay in place, but nothing writes vectors any more
+and no provider is called.
 
 ## sqlite-vec
 

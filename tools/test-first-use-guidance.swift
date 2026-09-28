@@ -49,11 +49,9 @@ let wiringChecks: [(Bool, String)] = [
      "App derives the guidance from real backend usability"),
     (conversationSource.contains("请打开\\(ResidentBackendReadiness.settingsPath)"),
      "backend-not-installed errors point at the settings path"),
-    (!appSource.contains("\"长期记忆后台缺少显式配置：请设置 GMGN_MEMORY"),
-     "environment variable names are gone from the on-screen memory notice"),
-    (appSource.contains("livingWorldLogger.notice(")
-        && appSource.contains("GMGN_MEMORY_COMPACTION_ENDPOINT/TOKEN"),
-     "environment variable names stay in the operator log"),
+    // 外部记忆 provider 接线已整体移除：应用源码里不该再出现任何 GMGN_MEMORY_*。
+    (!appSource.contains("GMGN_MEMORY"),
+     "external memory provider variables are gone from the app entirely"),
 ]
 
 let harness = #"""

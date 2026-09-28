@@ -1,7 +1,6 @@
 mod daemon;
 mod files;
 mod memory;
-mod memory_orchestrator;
 mod messages;
 mod model;
 mod provider;

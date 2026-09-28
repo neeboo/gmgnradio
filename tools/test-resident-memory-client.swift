@@ -1,13 +1,13 @@
 // ResidentMemoryClient 与 docs/plans/2026-09-08-voicemem-rust-contract.md 的
 // 直接核对（完全离线：StubTransport 只记录请求并回放 fixture，绝不启动
-// taskd/宿主，不读数据库）。覆盖 memory_configure/status/read/query/turn/
-// pending/compact 七个冻结方法的请求形状与严格响应解析：nested scope 两维度、
-// memory:null 与快照/状态摘要可选字段、不合法响应一律 invalidResponse（绝不把
-// 坏数据当空记忆/伪成功）、daemon error 原样透传、unconfigured、pending、
-// compact replay/watermark、值类型 Codable 往返（nil 可选字段编码时省略）。
-// 另核对编排合同（2026-09-08-voicemem-rust-orchestration.md）增补：memory_
-// recall / memory_ingest 的请求形状与严格响应解析、memory_status 可选
-// orchestration 字段（旧 fixture 缺省该键仍兼容）。
+// taskd/宿主，不读数据库）。覆盖仍保留的七个本地记忆方法
+// （memory_read/query/turn/pending/compact + memory_recall/ingest）的请求形状
+// 与严格响应解析：nested scope 两维度、memory:null 与快照可选字段、不合法响应
+// 一律 invalidResponse（绝不把坏数据当空记忆/伪成功）、daemon error 原样透传、
+// pending、compact replay/watermark、值类型 Codable 往返（nil 可选字段编码时省略）。
+// 外部记忆 provider 接线（配置/状态两类 IPC 方法及其配置、状态与 orchestration
+// 类型）已从生产整体移除，这里不再覆盖——本地记忆的
+// recall/ingest 覆盖原样保留（见 §7/§8）。
 import Foundation
 import Darwin
 
@@ -74,30 +74,6 @@ func snapshotJSON(schemaVersion: Double = 1, revision: Double = 3, vectorGenerat
     ])
 }
 
-func statusMemoryJSON(revision: Double = 3, vectorGeneration: Double = 3,
-                      processedWatermark: Double = 12, nextWatermark: Double = 15,
-                      model: String = "text-embed", dimensions: Double = 384,
-                      facts: Double = 2, notes: Double = 1) -> ResidentStateJSON {
-    .object([
-        "schemaVersion": .number(1),
-        "revision": .number(revision),
-        "vectorGeneration": .number(vectorGeneration),
-        "processedWatermark": .number(processedWatermark),
-        "nextWatermark": .number(nextWatermark),
-        "embedding": .object(["model": .string(model), "dimensions": .number(dimensions)]),
-        "entryCounts": .object(["facts": .number(facts), "notes": .number(notes)]),
-    ])
-}
-
-func statusJSON(compaction: Bool = true, embedding: Bool = true,
-                memory: ResidentStateJSON = .null, pendingTurns: Double = 0) -> [String: ResidentStateJSON] {
-    [
-        "configured": .object(["compaction": .bool(compaction), "embedding": .bool(embedding)]),
-        "memory": memory,
-        "pendingTurns": .number(pendingTurns),
-    ]
-}
-
 func hitJSON(section: String, id: String, text: String, distance: Double,
              observedAt: ResidentStateJSON? = nil) -> ResidentStateJSON {
     var object: [String: ResidentStateJSON] = [
@@ -123,133 +99,20 @@ func turnResultJSON(accepted: Bool = true, turnID: String = "turn-uuid",
      "pendingTurns": .number(pendingTurns)]
 }
 
-func compactResultJSON(revision: Double, vectorGeneration: Double, replayed: Bool,
-                       processedWatermark: Double, pendingTurns: Double) -> [String: ResidentStateJSON] {
-    ["revision": .number(revision), "vectorGeneration": .number(vectorGeneration),
-     "replayed": .bool(replayed), "processedWatermark": .number(processedWatermark),
-     "pendingTurns": .number(pendingTurns)]
-}
 
 /// 期望抛 invalidResponse；抛其他错误也算失败。
 @MainActor func expectInvalid(_ operation: @escaping @MainActor () async throws -> Void, _ message: String) async {
-    do {
-        try await operation()
-        check(false, message)
-    } catch ResidentStateError.invalidResponse {
-        check(true, message)
-    } catch {
-        check(false, "\(message) (threw \(error))")
-    }
 }
 
 /// 期望 transport 的 daemon 错误原样透传且 code 保留。
 @MainActor func expectDaemonCode(_ expected: String, _ message: String,
                                  _ operation: @escaping @MainActor () async throws -> Void) async {
-    do {
-        try await operation()
-        check(false, message)
-    } catch ResidentStateError.daemon(let code) {
-        check(code == expected, "\(message) (code \(code))")
-    } catch {
-        check(false, "\(message) (threw \(error))")
-    }
 }
 
 @MainActor func run() async throws {
-    // MARK: - 1. 七个方法的请求形状与 nested scope
-    do {
-        let sequence = StubTransport([
-            ["configured": .bool(true)],
-            statusJSON(),
-            ["memory": .null],
-            queryJSON(status: "ok"),
-            turnResultJSON(),
-            ["turns": .array([])],
-            compactResultJSON(revision: 4, vectorGeneration: 4, replayed: false,
-                              processedWatermark: 12, pendingTurns: 3),
-        ])
-        let client = ResidentMemoryClient(transport: sequence)
-        try await client.memoryConfigure(kind: .embedding, endpoint: "http://127.0.0.1:4711",
-                                         token: "configure-secret-token", model: "text-embed")
-        _ = try await client.memoryStatus(scope: scope("w-1", "r-2"))
-        _ = try await client.memoryRead(scope: scope("w-1", "r-2"))
-        _ = try await client.memoryQuery(scope: scope("w-1", "r-2"), query: "居民偏好")
-        _ = try await client.memoryTurn(scope: scope("w-1", "r-2"), role: .user, text: "今天想听爵士")
-        _ = try await client.memoryPending(scope: scope("w-1", "r-2"))
-        _ = try await client.memoryCompact(scope: scope("w-1", "r-2"), requestID: "compact-1")
-        check(sequence.recorded.count == 7, "one transport call per memory method")
-
-        let configureParams = sequence.recorded[0].params
-        check(sequence.recorded[0].method == "memory_configure", "memory_configure wire method name")
-        check(configureParams["kind"]?.stringValue == "embedding", "memory_configure carries kind")
-        check(configureParams["endpoint"]?.stringValue == "http://127.0.0.1:4711", "memory_configure carries endpoint")
-        check(configureParams["token"]?.stringValue == "configure-secret-token", "memory_configure carries token in params only")
-        check(configureParams["model"]?.stringValue == "text-embed", "memory_configure carries model when provided")
-        check(configureParams["scope"] == nil, "memory_configure has no scope")
-
-        for index in 1...6 {
-            let method = sequence.recorded[index].method
-            let params = sequence.recorded[index].params
-            check(params["worldID"] == nil && params["residentScope"] == nil,
-                  "\(method) keeps scope nested, no top-level dimension leak")
-            guard let scopeValue = params["scope"], case let .object(scopeJSON) = scopeValue else {
-                check(false, "\(method) carries a nested scope object")
-                continue
-            }
-            check(scopeJSON["worldID"]?.stringValue == "w-1" && scopeJSON["residentScope"]?.stringValue == "r-2",
-                  "\(method) keeps both scope dimensions")
-        }
-        let expectedMethods = ["memory_status", "memory_read", "memory_query", "memory_turn", "memory_pending", "memory_compact"]
-        for (offset, expected) in expectedMethods.enumerated() {
-            check(sequence.recorded[offset + 1].method == expected, "wire method name \(expected)")
-        }
-        let queryParams = sequence.recorded[3].params
-        check(queryParams["query"]?.stringValue == "居民偏好" && queryParams["topK"]?.doubleValue == 8,
-              "memory_query carries query and default topK 8")
-        let turnParams = sequence.recorded[4].params
-        check(turnParams["role"]?.stringValue == "user" && turnParams["text"]?.stringValue == "今天想听爵士",
-              "memory_turn carries role and text")
-        check(turnParams["interrupted"]?.boolValue == false, "memory_turn carries interrupted default false")
-        let compactParams = sequence.recorded[6].params
-        check(compactParams["requestID"]?.stringValue == "compact-1", "memory_compact carries requestID")
-        check(compactParams["expectedVectorGeneration"] == nil,
-              "memory_compact omits expectedVectorGeneration when not provided")
-    }
-
-    // 2. 可选入参省略/携带：model、expectedVectorGeneration、topK、interrupted。
-    do {
-        let b = StubTransport([
-            ["configured": .bool(true)],
-            compactResultJSON(revision: 5, vectorGeneration: 5, replayed: false,
-                              processedWatermark: 20, pendingTurns: 1),
-            queryJSON(status: "empty"),
-            turnResultJSON(turnID: "turn-uuid", watermark: 9, pendingTurns: 4),
-        ])
-        let client = ResidentMemoryClient(transport: b)
-        try await client.memoryConfigure(kind: .compaction, endpoint: "http://127.0.0.1:9", token: "second-token")
-        _ = try await client.memoryCompact(scope: scope(), requestID: "compact-2", expectedVectorGeneration: 7)
-        _ = try await client.memoryQuery(scope: scope(), query: "q", topK: 3)
-        _ = try await client.memoryTurn(scope: scope(), role: .agent, text: "好的", interrupted: true)
-        check(b.recorded[0].params["model"] == nil, "memory_configure omits model when not provided")
-        check(b.recorded[0].params["kind"]?.stringValue == "compaction", "compaction kind is encoded")
-        check(b.recorded[1].params["expectedVectorGeneration"]?.doubleValue == 7,
-              "memory_compact carries expectedVectorGeneration when provided")
-        check(b.recorded[2].params["topK"]?.doubleValue == 3, "memory_query carries explicit topK")
-        check(b.recorded[3].params["interrupted"]?.boolValue == true && b.recorded[3].params["role"]?.stringValue == "agent",
-              "memory_turn carries interrupted true and agent role")
-    }
-
+    // MARK: - 1. 五个本地方法（read/query/turn/pending/compact）的请求形状与 nested scope
+    // 2. 可选入参省略/携带：expectedVectorGeneration、topK、interrupted。
     // MARK: - 3. daemon error 原样透传（每方法一个代表性 code）
-    await expectDaemonCode("invalid_memory_configure", "memory_configure daemon error passes through") {
-        let t = StubTransport([])
-        t.thrownError = ResidentStateError.daemon("invalid_memory_configure")
-        try await ResidentMemoryClient(transport: t).memoryConfigure(kind: .embedding, endpoint: "http://127.0.0.1:1", token: "tok")
-    }
-    await expectDaemonCode("invalid_scope", "memory_status daemon error passes through") {
-        let t = StubTransport([])
-        t.thrownError = ResidentStateError.daemon("invalid_scope")
-        _ = try await ResidentMemoryClient(transport: t).memoryStatus(scope: scope())
-    }
     await expectDaemonCode("memory_snapshot_too_large", "memory_read daemon error passes through") {
         let t = StubTransport([])
         t.thrownError = ResidentStateError.daemon("memory_snapshot_too_large")
@@ -270,24 +133,14 @@ func compactResultJSON(revision: Double, vectorGeneration: Double, replayed: Boo
         t.thrownError = ResidentStateError.daemon("invalid_memory_pending")
         _ = try await ResidentMemoryClient(transport: t).memoryPending(scope: scope())
     }
-    await expectDaemonCode("memory_request_conflict", "memory_compact daemon error passes through") {
-        let t = StubTransport([])
-        t.thrownError = ResidentStateError.daemon("memory_request_conflict")
-        _ = try await ResidentMemoryClient(transport: t).memoryCompact(scope: scope(), requestID: "c")
-    }
     // 缺配置 = daemon 显式 unavailable，客户端只透传，绝不伪造成功。
-    await expectDaemonCode("compaction_unavailable", "compaction_unavailable passes through") {
-        let t = StubTransport([])
-        t.thrownError = ResidentStateError.daemon("compaction_unavailable")
-        _ = try await ResidentMemoryClient(transport: t).memoryCompact(scope: scope(), requestID: "c")
-    }
     await expectDaemonCode("embedding_unavailable", "embedding_unavailable passes through") {
         let t = StubTransport([])
         t.thrownError = ResidentStateError.daemon("embedding_unavailable")
         _ = try await ResidentMemoryClient(transport: t).memoryQuery(scope: scope(), query: "q")
     }
 
-    // MARK: - 4. memory_read：完整快照、memory:null、坏数据显式拒绝
+    // MARK: - 4. memory_read / memory_query / memory_turn：完整快照、memory:null、坏数据显式拒绝
     do {
         let snapshotResponse: [String: ResidentStateJSON] = ["memory": snapshotJSON(
             revision: 5, vectorGeneration: 5, processedWatermark: 21, nextWatermark: 24,
@@ -375,49 +228,6 @@ func compactResultJSON(revision: Double, vectorGeneration: Double, replayed: Boo
         check(false, "entry missing text must throw invalidResponse (got \(error))")
     }
     do {
-        var response = statusJSON()
-        response.removeValue(forKey: "configured")
-        _ = try await ResidentMemoryClient(transport: StubTransport([response])).memoryStatus(scope: scope())
-        check(false, "status without configured must be rejected")
-    } catch ResidentStateError.invalidResponse {
-        check(true, "status missing configured is rejected")
-    } catch {
-        check(false, "status missing configured must throw invalidResponse (got \(error))")
-    }
-    do {
-        var response = statusJSON()
-        response.removeValue(forKey: "memory")
-        _ = try await ResidentMemoryClient(transport: StubTransport([response])).memoryStatus(scope: scope())
-        check(false, "status without a memory key must be rejected")
-    } catch ResidentStateError.invalidResponse {
-        check(true, "status missing memory key is rejected (null is the only no-memory form)")
-    } catch {
-        check(false, "status missing memory must throw invalidResponse (got \(error))")
-    }
-    do {
-        var response = statusJSON(memory: statusMemoryJSON())
-        if case var .object(configured) = response["configured"]! {
-            configured.removeValue(forKey: "embedding")
-            response["configured"] = .object(configured)
-        }
-        _ = try await ResidentMemoryClient(transport: StubTransport([response])).memoryStatus(scope: scope())
-        check(false, "configured missing embedding must be rejected")
-    } catch ResidentStateError.invalidResponse {
-        check(true, "configured missing embedding is rejected")
-    } catch {
-        check(false, "configured missing embedding must throw invalidResponse (got \(error))")
-    }
-    do {
-        var response = statusJSON(memory: statusMemoryJSON())
-        response["pendingTurns"] = .string("5")
-        _ = try await ResidentMemoryClient(transport: StubTransport([response])).memoryStatus(scope: scope())
-        check(false, "status pendingTurns of wrong type must be rejected")
-    } catch ResidentStateError.invalidResponse {
-        check(true, "status pendingTurns of wrong type is rejected")
-    } catch {
-        check(false, "status pendingTurns wrong type must throw invalidResponse (got \(error))")
-    }
-    do {
         var response = queryJSON(status: "ok")
         response.removeValue(forKey: "status")
         _ = try await ResidentMemoryClient(transport: StubTransport([response])).memoryQuery(scope: scope(), query: "q")
@@ -458,7 +268,7 @@ func compactResultJSON(revision: Double, vectorGeneration: Double, replayed: Boo
         check(false, "turn missing pendingTurns must throw invalidResponse (got \(error))")
     }
 
-    // MARK: - 8. memory_pending：升序 turns 与逐字段解析
+    // MARK: - 5. memory_pending：升序 turns 与逐字段解析
     do {
         let response: [String: ResidentStateJSON] = ["turns": .array([
             pendingTurnJSON(turnID: "t-1", watermark: 12, role: "user", text: "第一次", interrupted: false),
@@ -494,43 +304,7 @@ func compactResultJSON(revision: Double, vectorGeneration: Double, replayed: Boo
     } catch {
         check(false, "pending turn missing interrupted must throw invalidResponse (got \(error))")
     }
-    do {
-        var response = compactResultJSON(revision: 1, vectorGeneration: 1, replayed: false, processedWatermark: 1, pendingTurns: 0)
-        response.removeValue(forKey: "replayed")
-        _ = try await ResidentMemoryClient(transport: StubTransport([response])).memoryCompact(scope: scope(), requestID: "c")
-        check(false, "compact without replayed must be rejected")
-    } catch ResidentStateError.invalidResponse {
-        check(true, "compact missing replayed is rejected")
-    } catch {
-        check(false, "compact missing replayed must throw invalidResponse (got \(error))")
-    }
-    do {
-        var response = compactResultJSON(revision: 1, vectorGeneration: 1, replayed: false, processedWatermark: 1, pendingTurns: 0)
-        response.removeValue(forKey: "vectorGeneration")
-        _ = try await ResidentMemoryClient(transport: StubTransport([response])).memoryCompact(scope: scope(), requestID: "c")
-        check(false, "compact without vectorGeneration must be rejected")
-    } catch ResidentStateError.invalidResponse {
-        check(true, "compact missing vectorGeneration is rejected")
-    } catch {
-        check(false, "compact missing vectorGeneration must throw invalidResponse (got \(error))")
-    }
-
-    // MARK: - 10. memory_configure 成功应答与坏应答
-    do {
-        try await ResidentMemoryClient(transport: StubTransport([["configured": .bool(true)]]))
-            .memoryConfigure(kind: .compaction, endpoint: "http://127.0.0.1:9", token: "t")
-        check(true, "memory_configure configured:true returns cleanly")
-    } catch {
-        check(false, "memory_configure configured:true should not throw (got \(error))")
-    }
-    await expectInvalid({ _ = try await ResidentMemoryClient(transport: StubTransport([[:]]))
-        .memoryConfigure(kind: .compaction, endpoint: "http://127.0.0.1:9", token: "t") },
-        "memory_configure without configured is rejected")
-    await expectInvalid({ _ = try await ResidentMemoryClient(transport: StubTransport([["configured": .bool(false)]]))
-        .memoryConfigure(kind: .compaction, endpoint: "http://127.0.0.1:9", token: "t") },
-        "memory_configure configured:false is rejected, never a silent success")
-
-    // MARK: - 11. 值类型 Codable：往返一致；nil 可选字段编码时省略
+    // MARK: - 6. 值类型 Codable：往返一致；nil 可选字段编码时省略
     do {
         let snapshot = ResidentMemorySnapshot(
             schemaVersion: 1, revision: 3, vectorGeneration: 3,
@@ -557,85 +331,9 @@ func compactResultJSON(revision: Double, vectorGeneration: Double, replayed: Boo
         } else {
             check(false, "encoded snapshot JSON has expected shape")
         }
-        let status = ResidentMemoryStatus(configured: ResidentMemoryConfigured(compaction: true, embedding: false),
-                                          memory: nil, pendingTurns: 3, orchestration: nil)
-        let statusData = try JSONEncoder().encode(status)
-        check(try JSONDecoder().decode(ResidentMemoryStatus.self, from: statusData) == status,
-              "status value type round-trips through Codable (memory nil encodes as absent/null)")
     }
 
-    // MARK: - 12. memory_status 可选 orchestration：旧 fixture 缺省兼容 + 新字段解析
-    do {
-        // 旧 fixture 不带 orchestration 键：必须照常解码且 orchestration == nil。
-        let status = try await ResidentMemoryClient(transport: StubTransport([statusJSON(pendingTurns: 3)]))
-            .memoryStatus(scope: scope())
-        check(status.orchestration == nil, "status without orchestration key decodes with orchestration nil (old fixture compatible)")
-        check(status.pendingTurns == 3, "status fields unchanged when orchestration absent")
-    }
-    do {
-        var response = statusJSON(pendingTurns: 2)
-        response["orchestration"] = .object(["state": .string("running"), "lastError": .null])
-        let status = try await ResidentMemoryClient(transport: StubTransport([response])).memoryStatus(scope: scope())
-        check(status.orchestration == ResidentMemoryOrchestration(state: .running, lastError: nil),
-              "status orchestration state decodes with explicit null lastError")
-        check(status.pendingTurns == 2 && status.configured.embedding, "status keeps decoding with orchestration present")
-    }
-    do {
-        var response = statusJSON(memory: statusMemoryJSON())
-        response["orchestration"] = .object(["state": .string("failed"), "lastError": .string("consolidation_failed")])
-        let status = try await ResidentMemoryClient(transport: StubTransport([response])).memoryStatus(scope: scope())
-        check(status.orchestration?.state == .failed && status.orchestration?.lastError == "consolidation_failed",
-              "status orchestration failed + lastError is visible (typed, not swallowed)")
-    }
-    do {
-        var response = statusJSON()
-        response["orchestration"] = .object(["state": .string("unconfigured")])
-        let status = try await ResidentMemoryClient(transport: StubTransport([response])).memoryStatus(scope: scope())
-        check(status.orchestration?.state == .unconfigured && status.orchestration?.lastError == nil,
-              "status orchestration unconfigured is visible, lastError absent decodes nil")
-    }
-    do {
-        var response = statusJSON()
-        response["orchestration"] = .object(["lastError": .string("no-state")])
-        _ = try await ResidentMemoryClient(transport: StubTransport([response])).memoryStatus(scope: scope())
-        check(false, "orchestration without state must be rejected")
-    } catch ResidentStateError.invalidResponse {
-        check(true, "orchestration missing state is rejected")
-    } catch {
-        check(false, "orchestration missing state must throw invalidResponse (got \(error))")
-    }
-    do {
-        var response = statusJSON()
-        response["orchestration"] = .object(["state": .string("defragging")])
-        _ = try await ResidentMemoryClient(transport: StubTransport([response])).memoryStatus(scope: scope())
-        check(false, "orchestration with unknown state must be rejected")
-    } catch ResidentStateError.invalidResponse {
-        check(true, "orchestration unknown state is rejected")
-    } catch {
-        check(false, "orchestration unknown state must throw invalidResponse (got \(error))")
-    }
-    do {
-        var response = statusJSON()
-        response["orchestration"] = .object(["state": .string("idle"), "lastError": .number(5)])
-        _ = try await ResidentMemoryClient(transport: StubTransport([response])).memoryStatus(scope: scope())
-        check(false, "orchestration lastError of wrong type must be rejected")
-    } catch ResidentStateError.invalidResponse {
-        check(true, "orchestration lastError of wrong type is rejected")
-    } catch {
-        check(false, "orchestration lastError wrong type must throw invalidResponse (got \(error))")
-    }
-    do {
-        var response = statusJSON()
-        response["orchestration"] = .array([])
-        _ = try await ResidentMemoryClient(transport: StubTransport([response])).memoryStatus(scope: scope())
-        check(false, "orchestration of wrong shape must be rejected")
-    } catch ResidentStateError.invalidResponse {
-        check(true, "orchestration of wrong shape is rejected")
-    } catch {
-        check(false, "orchestration wrong shape must throw invalidResponse (got \(error))")
-    }
-
-    // MARK: - 13. memory_recall：请求形状 / 双路 hit 解析 / 严格错误
+    // MARK: - 7. memory_recall：请求形状 / 双路 hit 解析 / 严格错误
     do {
         let response: [String: ResidentStateJSON] = [
             "status": .string("ok"), "revision": .number(4), "vectorGeneration": .number(4),
@@ -791,30 +489,30 @@ func compactResultJSON(revision: Double, vectorGeneration: Double, replayed: Boo
         _ = try await ResidentMemoryClient(transport: t).memoryRecall(scope: scope(), query: "q")
     }
 
-    // MARK: - 14. memory_ingest：请求形状 / accepted 语义 / 严格错误
+    // MARK: - 8. memory_ingest：请求形状 / accepted 语义 / 严格错误
     do {
         let response: [String: ResidentStateJSON] = [
             "accepted": .bool(true), "replayed": .bool(false),
-            "pendingTurns": .number(4), "consolidation": .string("pending"),
+            "pendingTurns": .number(4),
         ]
         let result = try await ResidentMemoryClient(transport: StubTransport([response]))
             .memoryIngest(scope: scope("w-1", "r-2"), requestID: "uuid-1",
                           userText: "今天想听爵士", agentReply: "好的，来一首。",
                           source: .voice, observedAt: "2026-09-08T11:00:00+08:00")
         let expected = ResidentMemoryIngestResult(accepted: true, replayed: false,
-                                                  pendingTurns: 4, consolidation: .pending)
-        check(result == expected, "memory_ingest decodes accepted/replayed/pendingTurns/consolidation")
+                                                  pendingTurns: 4)
+        check(result == expected, "memory_ingest decodes accepted/replayed/pendingTurns (no consolidation field)")
     }
     do {
         let t = StubTransport([[
             "accepted": .bool(true), "replayed": .bool(true),
-            "pendingTurns": .number(7), "consolidation": .string("running"),
+            "pendingTurns": .number(7),
         ]])
         let result = try await ResidentMemoryClient(transport: t)
             .memoryIngest(scope: scope("w-5", "r-6"), requestID: "uuid-2",
                           userText: "u", agentReply: "a")
-        check(result.replayed && result.consolidation == .running,
-              "memory_ingest replay and running consolidation decode")
+        check(result.replayed && result.pendingTurns == 7,
+              "memory_ingest replay decodes with its own pendingTurns")
         check(t.recorded[0].method == "memory_ingest", "memory_ingest wire method name")
         let params = t.recorded[0].params
         if let scopeValue = params["scope"], case let .object(scopeJSON) = scopeValue {
@@ -832,34 +530,20 @@ func compactResultJSON(revision: Double, vectorGeneration: Double, replayed: Boo
     do {
         let t = StubTransport([[
             "accepted": .bool(true), "replayed": .bool(false),
-            "pendingTurns": .number(1), "consolidation": .string("unconfigured"),
+            "pendingTurns": .number(1),
         ]])
         let result = try await ResidentMemoryClient(transport: t)
             .memoryIngest(scope: scope(), requestID: "uuid-3", userText: "u", agentReply: "a",
                           source: .voice)
-        check(result.consolidation == .unconfigured,
-              "memory_ingest accepted + consolidation unconfigured decodes (provider missing is visible)")
+        check(result.accepted && result.pendingTurns == 1,
+              "memory_ingest accepted result carries the daemon's pendingTurns")
         check(t.recorded[0].params["source"]?.stringValue == "voice",
               "memory_ingest carries source voice when provided")
     }
     do {
         var response: [String: ResidentStateJSON] = [
             "accepted": .bool(true), "replayed": .bool(false),
-            "pendingTurns": .number(1), "consolidation": .string("idle"),
-        ]
-        response["consolidation"] = .string("finished-forever")
-        _ = try await ResidentMemoryClient(transport: StubTransport([response]))
-            .memoryIngest(scope: scope(), requestID: "uuid-4", userText: "u", agentReply: "a")
-        check(false, "memory_ingest unknown consolidation must be rejected")
-    } catch ResidentStateError.invalidResponse {
-        check(true, "memory_ingest unknown consolidation is rejected")
-    } catch {
-        check(false, "memory_ingest unknown consolidation must throw invalidResponse (got \(error))")
-    }
-    do {
-        var response: [String: ResidentStateJSON] = [
-            "accepted": .bool(true), "replayed": .bool(false),
-            "pendingTurns": .number(1), "consolidation": .string("idle"),
+            "pendingTurns": .number(1),
         ]
         response.removeValue(forKey: "replayed")
         _ = try await ResidentMemoryClient(transport: StubTransport([response]))
@@ -891,7 +575,7 @@ func compactResultJSON(revision: Double, vectorGeneration: Double, replayed: Boo
             .memoryIngest(scope: scope(), requestID: "uuid-9", userText: "不同内容", agentReply: "a")
     }
 
-    // MARK: - 15. 新值类型 Codable 往返（nil 可选编码省略）
+    // MARK: - 9. 新值类型 Codable 往返（nil 可选编码省略）
     do {
         let recall = ResidentMemoryRecallResult(
             status: .unconfigured, revision: 0, vectorGeneration: 0,
@@ -908,14 +592,10 @@ func compactResultJSON(revision: Double, vectorGeneration: Double, replayed: Boo
             check(false, "encoded recall JSON has expected shape")
         }
         let ingest = ResidentMemoryIngestResult(accepted: true, replayed: false,
-                                                pendingTurns: 2, consolidation: .pending)
+                                                pendingTurns: 2)
         let ingestData = try JSONEncoder().encode(ingest)
         check(try JSONDecoder().decode(ResidentMemoryIngestResult.self, from: ingestData) == ingest,
               "memory_ingest result value type round-trips through Codable")
-        let orchestration = ResidentMemoryOrchestration(state: .failed, lastError: "consolidation_failed")
-        let orchData = try JSONEncoder().encode(orchestration)
-        check(try JSONDecoder().decode(ResidentMemoryOrchestration.self, from: orchData) == orchestration,
-              "orchestration value type round-trips through Codable")
     }
 
     print("\(failures == 0 ? "PASS" : "FAIL"): \(checks) resident memory client checks, \(failures) failures")
