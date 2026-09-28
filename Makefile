@@ -60,6 +60,7 @@ test-python:
 test-harnesses:
 	swift tools/test-first-use-guidance.swift
 	swift tools/test-space-first-defaults.swift
+	swift tools/test-stage-decoration-menu.swift
 	swift tools/test-stage-control-actions.swift
 	swift tools/test-stage-control-panels.swift
 	swift tools/test-space-presentation.swift

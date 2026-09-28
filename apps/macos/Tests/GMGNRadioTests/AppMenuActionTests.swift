@@ -275,24 +275,59 @@ func livingWorldStageEntryRequestsTheWorldBeforeShowingTheWindow() {
 @Test
 func systemResidentMenuPresentsOnlyEntryActionsInFixedOrder() {
     // P1 空间优先：电台插件关闭（默认）时菜单不含「打开播放器」。
+    // 装修入口属于空间那一组，不在门禁控制范围内，紧跟「进入空间」。
     #expect(
         SystemResidentMenuPolicy.entries(isRadioPluginEnabled: false) == [
             .showLiveCam,
             .enterSpace,
+            .toggleDecoration,
             .settings,
             .quit,
         ]
     )
-    // 插件打开时恢复改动前的完整条目与顺序（`.openPlayer` 及其按钮实现全部保留）。
+    // 插件打开时恢复改动前的完整条目与顺序（`.openPlayer` 及其按钮实现全部保留）；
+    // 装修入口插在「进入空间」与「打开播放器」之间，原有四条的相对顺序不变。
     #expect(
         SystemResidentMenuPolicy.entries(isRadioPluginEnabled: true) == [
             .showLiveCam,
             .enterSpace,
+            .toggleDecoration,
             .openPlayer,
             .settings,
             .quit,
         ]
     )
+}
+
+@Test
+func decorationMenuTitleFollowsTheDecorationState() {
+    #expect(StageDecorationMenuTitle.resolve(isDecorating: false) == "装修空间")
+    #expect(StageDecorationMenuTitle.resolve(isDecorating: true) == "结束装修")
+}
+
+@Test
+@MainActor
+func decorationEntryPresentsTheSpaceBeforeTogglingTheEditorInOneStep() {
+    var isDecorating = false
+    var calls: [String] = []
+    let action = StageDecorationEntryAction(
+        isDecorationEditorOpen: { isDecorating },
+        showStage: { calls.append("showStage") },
+        toggleDecorationEditor: {
+            calls.append("toggleDecorationEditor")
+            isDecorating.toggle()
+        }
+    )
+
+    // 进入装修：先呈现空间，再开编辑器 —— 一次点击就够。
+    action.perform()
+    #expect(calls == ["showStage", "toggleDecorationEditor"])
+    #expect(isDecorating)
+
+    // 结束装修：只退出装修，不重新呈现空间。
+    action.perform()
+    #expect(calls == ["showStage", "toggleDecorationEditor", "toggleDecorationEditor"])
+    #expect(!isDecorating)
 }
 
 @Test
@@ -304,6 +339,7 @@ func appMenuActionsForwardToTheAdaptedApplicationController() {
     AppMenuAction.showStage.perform(on: controller)
     AppMenuAction.showPlayer.perform(on: controller)
     AppMenuAction.showLiveCam.perform(on: controller)
+    AppMenuAction.toggleDecorationEditor.perform(on: controller)
     AppMenuAction.playCharacterMotion(id: "builtin.motion.iluvslapbass")
         .perform(on: controller)
     AppMenuAction.runLivingActivity(id: "window.gaze").perform(on: controller)
@@ -318,6 +354,7 @@ func appMenuActionsForwardToTheAdaptedApplicationController() {
     #expect(controller.showStageCallCount == 1)
     #expect(controller.showPlayerCallCount == 1)
     #expect(controller.showLiveCamCallCount == 1)
+    #expect(controller.toggleDecorationEditorCallCount == 1)
     #expect(
         controller.playedCharacterMotionIDs
             == ["builtin.motion.iluvslapbass"]
@@ -337,6 +374,7 @@ private final class ApplicationControllerSpy: GMGNApplicationControlling {
     private(set) var showStageCallCount = 0
     private(set) var showPlayerCallCount = 0
     private(set) var showLiveCamCallCount = 0
+    private(set) var toggleDecorationEditorCallCount = 0
     private(set) var playedCharacterMotionIDs: [String] = []
     private(set) var livingActivityIDs: [String] = []
     private(set) var stopLivingActivityCallCount = 0
@@ -360,6 +398,10 @@ private final class ApplicationControllerSpy: GMGNApplicationControlling {
 
     func showLiveCam() {
         showLiveCamCallCount += 1
+    }
+
+    func toggleDecorationEditor() {
+        toggleDecorationEditorCallCount += 1
     }
 
     func playCharacterMotion(id: String) {

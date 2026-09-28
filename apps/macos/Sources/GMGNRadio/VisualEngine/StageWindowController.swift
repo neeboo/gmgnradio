@@ -198,6 +198,7 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         hold: (@MainActor (String, UInt64, String) async throws -> ResidentPropEditorSnapshot)? = nil,
         adjustHeldGrip: (@MainActor (String, WorldVector3, WorldQuaternion, UInt64, String) async throws -> ResidentPropEditorSnapshot)? = nil,
         returnHeld: (@MainActor (String, UInt64, String) async throws -> ResidentPropEditorSnapshot)? = nil,
+        refreshSnapshot: (@MainActor () -> ResidentPropEditorSnapshot?)? = nil,
         onPreviewChanged: @escaping @MainActor (WorldObjectState?) -> Void,
         onEditingChanged: @escaping @MainActor (Bool) -> Void
     ) {
@@ -206,12 +207,25 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         residentPropEditor.hold = hold
         residentPropEditor.adjustHeldGrip = adjustHeldGrip
         residentPropEditor.returnHeld = returnHeld
+        residentPropEditor.refreshSnapshot = refreshSnapshot
         residentPropEditor.onPreviewChanged = onPreviewChanged
         residentPropEditor.onEditingChanged = onEditingChanged
     }
 
     func updateResidentPropEditor(_ snapshot: ResidentPropEditorSnapshot) {
         residentPropEditor.update(snapshot)
+    }
+
+    /// 菜单栏要读的装修状态：装修面板此刻是否打开。
+    var isDecorationEditorOpen: Bool {
+        residentPropEditor.isOpen
+    }
+
+    /// 菜单栏「装修空间 / 结束装修」的**窄入口**：只转交装修编辑器的开关，
+    /// 不重排窗口生命周期（空间窗口的开/关仍由既有路径负责）。
+    /// 空间还没呈现、世界快照还没到时由内容视图挂起意图，见 `StageContentView.toggleDecorationEditor()`。
+    func toggleDecorationEditor() {
+        stageContentView?.toggleDecorationEditor()
     }
 
     func setOnWillPresentSpaceHandler(_ handler: (@MainActor () -> Void)?) {
@@ -661,6 +675,10 @@ private final class StageContentView: NSView {
     private let residentPropEditor: ResidentPropEditorState
     private var propEditorPanel: NSHostingView<ResidentPropEditorView>!
     private var editorVisibilitySubscription: AnyCancellable?
+    private var editorSnapshotSubscription: AnyCancellable?
+    /// 菜单栏「装修空间」在空间/世界快照还没就绪时挂起的意图。
+    /// 不能静默丢弃：等既有的呈现回调或世界快照到达时补一次（见 `applyPendingDecorationEditorRequest()`）。
+    private var pendingDecorationEditorRequest = false
     private var worldVisibilityObserverID: UUID?
     private var isProgramRailVisible = false
     private var isVisualPickerVisible = false
@@ -933,8 +951,18 @@ private final class StageContentView: NSView {
             self?.propEditorPanel.isHidden = !open
             self?.transportControls.setPropEditorExpanded(open)
             if open {
+                self?.pendingDecorationEditorRequest = false
                 self?.spatialStage.clearMovement()
                 self?.spatialStage.setSpeedBoosted(false)
+            }
+            // 菜单栏标题的唯一状态源：装修的每一次开/关都经过这里。
+            StageDecorationMenuStore.shared.update(isDecorating: open)
+        }
+        // 世界快照是 `open()` 的前置条件（它要求非空 worldID）。快照迟到时补上挂起的装修意图。
+        // `@Published` 在 willSet 发出，所以读值要放到下一拍。
+        editorSnapshotSubscription = residentPropEditor.$snapshot.sink { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.applyPendingDecorationEditorRequest()
             }
         }
 
@@ -1159,6 +1187,35 @@ private final class StageContentView: NSView {
         residentPropEditor.open()
     }
 
+    /// 菜单栏「装修空间 / 结束装修」在空间内部的落地。
+    ///
+    /// 已在装修 → 只退出装修（`togglePropEditor()` 的关闭分支，空间窗口保持打开）。
+    /// 未装修 → 先按进场路径开一次；没打开就**挂起意图**而不是静默返回，原因有两种：
+    ///   1. 空间还没请求呈现（守卫失败）——由呈现回调 `applySpatialPresentation` 补；
+    ///   2. 世界快照还没到（`open()` 要求非空 worldID）——由快照订阅补。
+    func toggleDecorationEditor() {
+        if residentPropEditor.isOpen {
+            pendingDecorationEditorRequest = false
+            togglePropEditor()
+            return
+        }
+        togglePropEditor()
+        if !residentPropEditor.isOpen {
+            pendingDecorationEditorRequest = true
+        }
+    }
+
+    /// 补上挂起的装修请求（菜单入口一步到位，不要求用户点第二次）。
+    /// 快照/呈现还没就绪时**保留**挂起状态，等下一次既有回调。
+    private func applyPendingDecorationEditorRequest() {
+        guard pendingDecorationEditorRequest,
+              spatialStage.isWorldPresentationRequested,
+              !residentPropEditor.snapshot.worldID.isEmpty,
+              !residentPropEditor.isOpen else { return }
+        pendingDecorationEditorRequest = false
+        togglePropEditor()
+    }
+
     private func residentComposerOwnsFirstResponder() -> Bool {
         guard let editor = window?.firstResponder as? NSTextView else { return false }
         if editor.isDescendant(of: residentComposer) { return true }
@@ -1192,7 +1249,11 @@ private final class StageContentView: NSView {
 
     private func applySpatialPresentation(isWorldVisible _: Bool) {
         residentTaskFeedback.isHidden = !spatialStage.isWorldPresentationRequested
-        if !spatialStage.isWorldPresentationRequested { residentPropEditor.close() }
+        if !spatialStage.isWorldPresentationRequested {
+            residentPropEditor.close()
+            // 空间已经退出：挂起的装修意图作废，不能等下次进空间时突然弹出来。
+            pendingDecorationEditorRequest = false
+        }
         transportControls.setPropEditorAvailable(spatialStage.isWorldPresentationRequested)
         if spatialStage.isWorldPresentationRequested {
             attachRenderSurface()
@@ -1229,6 +1290,8 @@ private final class StageContentView: NSView {
                     spatialStage.isWorldPresentationRequested
             )
         )
+        // 呈现/退出的既有回调：菜单入口挂起的装修意图在这里补一次（快照没到就继续挂着）。
+        applyPendingDecorationEditorRequest()
         StageWindowController.log.notice(
             "Applied stage presentation requested=\(self.spatialStage.isWorldPresentationRequested, privacy: .public) visible=\(isWorldVisible, privacy: .public) worldHidden=\(state.isSpatialWorldHidden, privacy: .public) pointCloudHidden=\(state.isPointCloudHidden, privacy: .public) loadingHidden=\(state.isLoadingIndicatorHidden, privacy: .public)"
         )

@@ -21,7 +21,7 @@ struct Config: Decodable {
     let framing: Framing
 }
 @main struct Test {
-    @MainActor static func main() throws {
+    @MainActor static func main() async throws {
         let root = URL(fileURLWithPath:"apps/macos/Resources/Worlds/marble-living-cabin")
         let manifest = try JSONDecoder().decode(WorldManifest.self, from: Data(contentsOf:root.appendingPathComponent("world.json")))
         let config = try JSONDecoder().decode(Config.self, from: Data(contentsOf:root.appendingPathComponent("marble.json")))
@@ -214,6 +214,39 @@ let second=WorldGeneratedProp(objectID:"test.second",sourceWishID:"test.second",
         check(WorldPropMeshClearance.canPlace(stand,supportHeight:stand.center.y-stand.halfExtents.y,triangles:triangles),"table real box clear in mesh")
         // 8. 失败的预览不改库存状态。
         check(context.state.objectStates[second.objectID]?.isEnabled == false,"rejected previews preserve disabled inventory")
+
+        // 9. 「点物件那一行必须进入携带态」——2026-09-28 真机缺陷，在**真实舱体几何**上验收。
+        //
+        // 症状：面板打开、地面铺满绿色可放格、行显示「已摆出」，但点它没有勾、没有高亮、
+        // 下方也不出现任何控件。原因是面板的 `surfaces` 是宿主**推送**来的字段，而格子派生
+        // 是异步的：就绪那一刻推送还没到，面板手里还是"派生中"的那一份（`surfaces` 为空），
+        // `select()` 的承托守卫于是静默 return。
+        //
+        // 因此这里钉两条**行为**（不是"某行代码存在"）：
+        //   - 承托面的**归并逻辑本身在真实房间里是好的**（就绪后非空、派生中为空）——
+        //     即根因不是 `listedSupportLayers()` 的过滤条件；
+        //   - 格子就绪后的那一份快照真的能让点一行进携带态。
+        let derivingsService=ResidentPropPlacementService(context:context,support:{ nil })
+        check(derivingsService.listedSupportLayers().isEmpty,
+              "before the grid is derived the panel has no support surface at all (the stale snapshot of the defect)")
+        let listed=service.listedSupportLayers()
+        check(!listed.isEmpty,"the real cabin lists support layers once the grid is ready (\(listed.count) layers)")
+        let editable=ResidentPropEditorState()
+        editable.update(.init(worldID:manifest.worldID,revision:context.state.layoutRevision,
+            objects:context.state.objectStates.values.filter { $0.generatedProp != nil }
+                .sorted { $0.generatedProp!.objectID < $1.generatedProp!.objectID },
+            surfaces:listed.enumerated().map { index,layer in
+                ResidentPropEditorSurface(id:layer.id,
+                    name:index == 0 ? "地面" : String(format:"台面 %.2f m",layer.supportHeight),
+                    position:layer.center) },
+            canUndo:false,heldProp:context.state.heldProp))
+        editable.open()
+        editable.preview = { id,placement in try service.preview(objectID:id,placement:placement) }
+        await editable.select(objectID:prop.objectID)
+        check(editable.selectedID == prop.objectID && editable.placement != nil && editable.isCarrying,
+              "on the real cabin a row click enters the carrying state once the grid is ready (selectedID=\(editable.selectedID ?? "nil"), notice=\(editable.notice))")
+        check(editable.candidate != nil,
+              "the carrying state previews the prop at its own placement (preview=\(editable.candidate == nil ? "nil" : "set"), notice=\(editable.notice))")
         print("PASS: \(count) real cabin grid placement checks; layers=\(grid.layers.count), coffee anchor y=\(anchor.supportHeight)")
     }
 }
@@ -233,6 +266,7 @@ let objects = try FileManager.default.contentsOfDirectory(at:build.appendingPath
 let compiled = try run("/usr/bin/swiftc",["-j1","-parse-as-library","-I",build.appendingPathComponent("Modules").path,
     sourceRoot.appendingPathComponent("Agent/WorldAgentContext.swift").path,
     sourceRoot.appendingPathComponent("Presence/ResidentPropPlacementService.swift").path,
+    sourceRoot.appendingPathComponent("Presence/ResidentPropEditorState.swift").path,
     sourceRoot.appendingPathComponent("Presence/ResidentPropPlacementConfiguration.swift").path,
     program.path,"-o",executable.path]+objects)
 guard compiled == 0 else { exit(compiled) }

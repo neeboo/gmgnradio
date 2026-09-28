@@ -10,8 +10,13 @@ let storeSource = try String(contentsOf: sourceDirectory.appendingPathComponent(
 
 // Extract declarations unchanged, including their implementation. Braces in these
 // declarations are balanced; extraction failures stop the test rather than pass.
-func declaration(_ signature: String, in source: String) -> String {
-    guard let start = source.range(of: signature)?.lowerBound,
+// `last` 取后一个同名实现：`func toggleDecorationEditor()` 在控制器上是窄入口转发，
+// 在内容视图里才是落地的那一个。
+func declaration(_ signature: String, in source: String, last: Bool = false) -> String {
+    let found = last
+        ? source.range(of: signature, options: .backwards)
+        : source.range(of: signature)
+    guard let start = found?.lowerBound,
           let opening = source[start...].firstIndex(of: "{") else {
         fatalError("Missing production declaration: \(signature)")
     }
@@ -34,6 +39,10 @@ let presentationState = declaration("struct StageSurfacePresentationState:", in:
 let destinationContent = declaration("struct StageDestinationContent:", in: controllerSource)
 let composerVisibility = declaration("private func updateResidentComposerVisibility()", in: controllerSource)
 let composerFocus = declaration("private func residentComposerOwnsFirstResponder()", in: controllerSource)
+// 菜单栏装修入口在空间内部的落地：进入/退出、挂起意图与「呈现完成时补一次」。
+let decorationToggle = declaration("func toggleDecorationEditor()", in: controllerSource, last: true)
+let pendingDecorationReplay = declaration("private func applyPendingDecorationEditorRequest()", in: controllerSource)
+let propEditorToggle = declaration("private func togglePropEditor()", in: controllerSource)
 let panelToggles = ["private func toggleResidentChat()", "private func toggleProgramRail()", "private func toggleVisualPicker()"].map {
     declaration($0, in: controllerSource)
 }.joined(separator: "\n")
@@ -94,7 +103,14 @@ final class Store {
 \#(destinationContent)
 
 final class Content {
-    final class PropEditor { func close() {} }
+    /// 装修编辑器的最小状态：`open()` 与生产一样要求非空 worldID。
+    final class PropEditor {
+        final class Snapshot { var worldID = "" }
+        var isOpen = false
+        var snapshot = Snapshot()
+        func open() { guard !snapshot.worldID.isEmpty, !isOpen else { return }; isOpen = true }
+        func close() { isOpen = false }
+    }
     let residentPropEditor = PropEditor()
     let spatialStage: Store
     let renderSurfaceContainer = View()
@@ -119,6 +135,8 @@ final class Content {
     var isResidentChatExpanded = false
     var isProgramRailVisible = false
     var isVisualPickerVisible = false
+    /// 菜单栏装修入口在空间/世界快照还没就绪时挂起的意图（生产里是同一名字的存储属性）。
+    var pendingDecorationEditorRequest = false
     let window: Window? = Window()
     let renderSurfaceController = RenderSurface()
     var completesOnAttach = true
@@ -131,10 +149,15 @@ final class Content {
     func toggleChat() { toggleResidentChat() }
     func toggleSettings() { toggleVisualPicker() }
     func toggleTracks() { toggleProgramRail() }
+    /// 生产里「世界快照到达」由内容视图订阅 `residentPropEditor.$snapshot` 触发同一入口。
+    func replayPendingDecoration() { applyPendingDecorationEditorRequest() }
     \#(presentationMethod)
     \#(composerVisibility)
     \#(composerFocus)
     \#(panelToggles)
+    \#(decorationToggle)
+    \#(pendingDecorationReplay)
+    \#(propEditorToggle)
 }
 
 var failures = 0
@@ -215,6 +238,35 @@ for uiFirst in [true, false] {
     check(content.residentComposer.isHidden, "player mode cannot expose space composer")
     _ = (firstID, secondID)
 }
+
+// ── 菜单栏「装修空间」挂起的意图 ────────────────────────────────────────────
+// 空间/世界快照还没就绪时不能静默丢弃；快照一到就补上（用户不需要点第二次）；
+// 退出空间时作废，免得下次进空间时突然弹出装修面板。
+let decorationStore = Store()
+let decorationContent = Content(decorationStore)
+let decorationObserverID = decorationStore.observeWorldVisibility { decorationContent.receive($0) }
+decorationContent.completesOnAttach = false
+decorationStore.requestWorldPresentation()
+// 世界快照还没到：请求留着，面板不能提前打开。
+decorationContent.pendingDecorationEditorRequest = true
+decorationContent.receive(true)
+check(decorationContent.pendingDecorationEditorRequest && !decorationContent.residentPropEditor.isOpen,
+      "a parked decoration request waits for the world snapshot instead of silently doing nothing")
+// 快照到达 → 补上（生产里由 $snapshot 订阅触发同一入口）。
+decorationContent.residentPropEditor.snapshot.worldID = "gmgn-living-pod-v1"
+decorationContent.replayPendingDecoration()
+check(decorationContent.residentPropEditor.isOpen && !decorationContent.pendingDecorationEditorRequest,
+      "the parked decoration request opens the editor once the world snapshot arrives")
+// 已在装修：结束装修只关面板，不重新呈现空间。
+decorationContent.toggleDecorationEditor()
+check(!decorationContent.residentPropEditor.isOpen && decorationStore.isWorldPresentationRequested,
+      "leaving decoration only closes the editor and keeps the space presented")
+// 退出空间：挂起的意图作废。
+decorationContent.pendingDecorationEditorRequest = true
+decorationStore.exitWorld()
+check(!decorationContent.pendingDecorationEditorRequest,
+      "leaving the space drops a parked decoration request")
+_ = decorationObserverID
 if failures > 0 { print("\(failures) assertions failed"); exit(1) }
 print("PASS: both observer orders, initial entry, reentry, exit, and asynchronous loading")
 """#

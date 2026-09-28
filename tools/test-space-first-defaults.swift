@@ -76,6 +76,9 @@ let wiringChecks: [(Bool, String)] = [
         && appSource.contains("Button(\"打开播放器\")")
         && appSource.contains("AppMenuAction.showPlayer.perform"),
      "the open-player menu button and its action are retained for the plugin"),
+    (appSource.contains("case .toggleDecoration:")
+        && appSource.contains("AppMenuAction.toggleDecorationEditor.perform"),
+     "the decoration entry is wired through AppMenuAction instead of living in the view"),
     (appSource.contains("orbWindowController?.show()"),
      "the orb presentation path is retained for the plugin"),
     (FileManager.default.fileExists(
@@ -125,7 +128,7 @@ struct StageAvatarRuntimeSnapshot {
 
         // 1) 门禁关闭：三项默认都空间优先。
         check(SystemResidentMenuPolicy.entries(isRadioPluginEnabled: pluginOff)
-                == [.showLiveCam, .enterSpace, .settings, .quit],
+                == [.showLiveCam, .enterSpace, .toggleDecoration, .settings, .quit],
               "plugin off keeps the menu to space entries plus settings and quit")
         check(!SystemResidentMenuPolicy.entries(isRadioPluginEnabled: pluginOff).contains(.openPlayer),
               "plugin off hides the open-player entry")
@@ -144,7 +147,7 @@ struct StageAvatarRuntimeSnapshot {
 
         // 2) 门禁打开：三项恢复改动前的行为。
         check(SystemResidentMenuPolicy.entries(isRadioPluginEnabled: pluginOn)
-                == [.showLiveCam, .enterSpace, .openPlayer, .settings, .quit],
+                == [.showLiveCam, .enterSpace, .toggleDecoration, .openPlayer, .settings, .quit],
               "plugin on restores the full menu in the original order")
         check(StageControlPanelTab.initial(for: .player, isRadioPluginEnabled: pluginOn) == .player,
               "plugin on restores the player-first panel default")
@@ -170,6 +173,9 @@ struct StageAvatarRuntimeSnapshot {
                                                selectedWorldID: "w",
                                                activityWorldID: "w"),
               "activities still run in a visible matching world")
+        check(SystemResidentMenuPolicy.entries(isRadioPluginEnabled: pluginOff).contains(.toggleDecoration)
+                && SystemResidentMenuPolicy.entries(isRadioPluginEnabled: pluginOn).contains(.toggleDecoration),
+              "the decoration entry exists with the gate off and on: it is not a player entry")
         check(!StageActivityAvailability.canRun(isWorldVisible: false,
                                                 selectedWorldID: "w",
                                                 activityWorldID: "w"),

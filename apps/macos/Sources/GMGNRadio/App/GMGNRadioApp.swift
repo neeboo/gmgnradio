@@ -278,6 +278,9 @@ struct DockReopenAction {
 struct GMGNRadioApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @Environment(\.openSettings) private var openSettings
+    /// 装修入口的标题要跟着装修状态走，所以菜单宿主必须观察一个会变的源
+    /// （和 `LivingWorldActivityMenuStore.shared` 同一套做法，只是这里只需要一个 Bool）。
+    @StateObject private var stageDecorationMenu = StageDecorationMenuStore.shared
 
     var body: some Scene {
         MenuBarExtra(ProductIdentity.displayName, systemImage: "waveform.circle.fill") {
@@ -313,6 +316,8 @@ struct GMGNRadioApp: App {
 enum SystemResidentMenuEntry: Hashable, Sendable {
     case showLiveCam
     case enterSpace
+    /// 装修入口：标题跟着装修状态走（未装修「装修空间」/ 装修中「结束装修」）。
+    case toggleDecoration
     case openPlayer
     case settings
     case quit
@@ -322,12 +327,38 @@ enum SystemResidentMenuPolicy {
     /// P1：默认呈现面只有菜单栏 + 空间 + 设置。
     /// 电台插件关闭（默认）时菜单不含「打开播放器」；插件打开时恢复改动前的完整条目与顺序。
     /// `.openPlayer` 这个 case 与它的按钮实现全部保留，只受门禁控制。
+    /// 装修入口（`.toggleDecoration`）紧跟在「进入空间」后面：它属于空间那一组条目，
+    /// 而且默认呈现面下也必须存在 —— 它要解决的正是「装修模式找不到」。
     static func entries(
         isRadioPluginEnabled: Bool
     ) -> [SystemResidentMenuEntry] {
         isRadioPluginEnabled
-            ? [.showLiveCam, .enterSpace, .openPlayer, .settings, .quit]
-            : [.showLiveCam, .enterSpace, .settings, .quit]
+            ? [.showLiveCam, .enterSpace, .toggleDecoration, .openPlayer, .settings, .quit]
+            : [.showLiveCam, .enterSpace, .toggleDecoration, .settings, .quit]
+    }
+}
+
+/// 装修入口的标题是装修状态的**投影**，不是另存一份状态。
+enum StageDecorationMenuTitle {
+    static func resolve(isDecorating: Bool) -> String {
+        isDecorating ? "结束装修" : "装修空间"
+    }
+}
+
+/// 菜单栏装修条目的刷新源。
+///
+/// `MenuBarExtra` 的条目在 `body` 求值时构建，所以标题要跟状态走就必须观察一个会变的源。
+/// 唯一的写入者是 `StageContentView` 里既有的 `residentPropEditor.$isOpen` 订阅 —— 装修的
+/// 每一次开/关（图标按钮、菜单入口、Escape、空间退出、关窗）都从那里经过，不会漏。
+@MainActor
+final class StageDecorationMenuStore: ObservableObject {
+    static let shared = StageDecorationMenuStore()
+
+    @Published private(set) var isDecorating = false
+
+    func update(isDecorating: Bool) {
+        guard self.isDecorating != isDecorating else { return }
+        self.isDecorating = isDecorating
     }
 }
 
@@ -344,6 +375,14 @@ extension GMGNRadioApp {
         case .enterSpace:
             Button("进入空间") {
                 AppMenuAction.showStage.perform(on: appDelegate)
+            }
+        case .toggleDecoration:
+            Button(
+                StageDecorationMenuTitle.resolve(
+                    isDecorating: stageDecorationMenu.isDecorating
+                )
+            ) {
+                AppMenuAction.toggleDecorationEditor.perform(on: appDelegate)
             }
         case .openPlayer:
             Button("打开播放器") {
@@ -371,6 +410,8 @@ protocol GMGNApplicationControlling: AnyObject {
     func showStage()
     func showPlayer()
     func showLiveCam()
+    /// 菜单栏的「装修空间 / 结束装修」：未装修时先呈现空间再进装修，装修中只退出装修。
+    func toggleDecorationEditor()
     func playCharacterMotion(id: String)
     func closeStage()
     func runLivingWorldActivity(id: String)
@@ -423,6 +464,28 @@ struct LivingWorldStageEntryAction {
     func perform() {
         requestWorldPresentation()
         showStageWindow()
+    }
+}
+
+/// 菜单栏装修入口的排程。
+///
+/// 未装修时**一步到位**：先按「进入空间」把空间呈现出来（`requestWorldPresentation` 是同步
+/// 的，所以紧接着的装修开关能过 `spatialStage.isWorldPresentationRequested` 这道守卫），
+/// 再切换装修编辑器 —— 不要求用户先自己点一次「进入空间」。
+/// 已在装修时只退出装修：不重新呈现空间，也不动空间窗口（关掉的是编辑器面板）。
+@MainActor
+struct StageDecorationEntryAction {
+    let isDecorationEditorOpen: () -> Bool
+    let showStage: () -> Void
+    let toggleDecorationEditor: () -> Void
+
+    func perform() {
+        if isDecorationEditorOpen() {
+            toggleDecorationEditor()
+            return
+        }
+        showStage()
+        toggleDecorationEditor()
     }
 }
 
@@ -553,6 +616,8 @@ enum AppMenuAction: Sendable {
     case showStage
     case showPlayer
     case showLiveCam
+    /// 装修入口：一步到位（先呈现空间，再切换装修编辑器）。
+    case toggleDecorationEditor
     case playCharacterMotion(id: String)
     case closeStage
     case runLivingActivity(id: String)
@@ -573,6 +638,8 @@ enum AppMenuAction: Sendable {
             controller.showPlayer()
         case .showLiveCam:
             controller.showLiveCam()
+        case .toggleDecorationEditor:
+            controller.toggleDecorationEditor()
         case let .playCharacterMotion(id):
             controller.playCharacterMotion(id: id)
         case .closeStage:
@@ -1107,6 +1174,25 @@ final class AppDelegate:
         }
         spatialStage.exitWorld()
         stageWindowController?.show()
+    }
+
+    /// 菜单栏「装修空间 / 结束装修」。
+    ///
+    /// 装修开关本身在 `StageWindowController`（`toggleDecorationEditor()` 是它对外唯一的窄入口），
+    /// 这里只负责「先呈现空间」这半步：空间窗口还没被创建时，`showStage()` 会创建并呈现它，
+    /// 之后那次开关就能落到一个已经请求了呈现的空间上。
+    func toggleDecorationEditor() {
+        StageDecorationEntryAction(
+            isDecorationEditorOpen: { [weak self] in
+                self?.stageWindowController?.isDecorationEditorOpen ?? false
+            },
+            showStage: { [weak self] in
+                self?.showStage()
+            },
+            toggleDecorationEditor: { [weak self] in
+                self?.stageWindowController?.toggleDecorationEditor()
+            }
+        ).perform()
     }
 
     func showLiveCam() {
@@ -3440,6 +3526,24 @@ final class AppDelegate:
     private let residentPropGridEditor = ResidentPropGridEditorModel()
     /// 最近一次推给编辑器的吸附目标（位置 + 朝向）。用来跳掉"同一格内移动鼠标"的重复预检。
     private var residentPropGridPushedHover: ResidentPropGridHoverKey?
+    /// 本次装修有没有真的去派生格子。只用来区分"派生中"与"永远拿不到几何"。
+    private var residentPropGridDerivationRequested = false
+
+    /// 面板快照里承托几何的状态：**就绪与否看 `isGridReady`**，`isUnavailable` 只回答
+    /// "还会不会好"。两个事实都来自 `residentPropGridEditor`（唯一真相）。
+    ///
+    /// 它同时是"要不要重推面板快照"的比较键 —— 见 `publishResidentPropGrid`。
+    private struct ResidentPropSupportPhase: Equatable {
+        let isGridReady: Bool
+        let isUnavailable: Bool
+        /// 与 `ResidentPropEditorSnapshot.supportGeometryUnavailable` 同义。
+        var supportGeometryUnavailable: Bool { !isGridReady && isUnavailable }
+    }
+    private var residentPropSupportPhase: ResidentPropSupportPhase {
+        .init(isGridReady: residentPropGridEditor.isReady,
+              isUnavailable: !residentPropGridDerivationRequested)
+    }
+    private var publishedResidentPropSupportPhase: ResidentPropSupportPhase?
 
     /// 吸附目标的比较键。用**位置 + 朝向**而不是格号：编辑器真正关心的是"预览挪到哪"。
     private struct ResidentPropGridHoverKey: Equatable {
@@ -3649,7 +3753,10 @@ final class AppDelegate:
               holdUnavailableReasons: Dictionary(uniqueKeysWithValues: objects.compactMap { item in
                   guard let id = item.generatedProp?.objectID, let reason = service.holdEligibility(objectID: id) else { return nil }
                   return (id, reason)
-              }))
+              }),
+              // 面板要能区分"格子还在生成"与"这个空间永远拿不到几何"：前者的措辞要和
+              // 点击落地那条一致（见 `residentPropGridCommit`），后者不能说"请稍候"。
+              supportGeometryUnavailable: residentPropSupportPhase.supportGeometryUnavailable)
     }
 
     private func synchronizeResidentPropPresentation() {
@@ -3769,6 +3876,13 @@ final class AppDelegate:
             try service.commit(command, expectedLayoutRevision: revision, requestID: requestID)
             self.synchronizeResidentPropPresentation()
             return self.residentPropEditorSnapshot(context: context)
+        }, refreshSnapshot: { [weak self] in
+            // 点一行时按**现状**再要一份：格子派生是异步的，而面板手里的快照是推送来的。
+            // 装修已经结束或世界换了就答 nil —— 那时这次点击本来就该作废。
+            guard let self, let context = self.livingWorldContext,
+                  let editorID = self.residentPropEditingID,
+                  self.isResidentPropEditorCurrent(context: context, editorID: editorID) else { return nil }
+            return self.residentPropEditorSnapshot(context: context)
         }, onPreviewChanged: { [weak self] preview in
             guard let self else { return }
             self.spatialStage.residentPropPreview = preview.flatMap(self.residentPropDescriptor)
@@ -3790,6 +3904,7 @@ final class AppDelegate:
         guard let collision = context.propSupportQuerying,
               let bounds = residentPropGridBounds(context: context) else {
             livingWorldLogger.notice("建造模式：当前空间拿不到摆放几何或导航范围，已停用格子派生。")
+            residentPropGridDerivationRequested = false
             residentPropGridEditor.deactivate()
             publishResidentPropGrid()
             return
@@ -3805,6 +3920,7 @@ final class AppDelegate:
         let seed = context.manifest.spawn.position
         let key = context.manifest.worldID
         residentPropGridPushedHover = nil
+        residentPropGridDerivationRequested = true
         Task { [weak self] in
             await self?.residentPropGridEditor.activate(
                 collision: derivation, seed: seed, bounds: bounds, key: key
@@ -3819,6 +3935,17 @@ final class AppDelegate:
         spatialStage.residentPropGridCells = residentPropGridEditor.renderCells
         spatialStage.residentPropGridStates = residentPropGridEditor.cellStates
         spatialStage.residentPropGridSpacing = residentPropGridEditor.isReady ? residentPropGridEditor.spacing : 0
+
+        // 承托几何的就绪是**异步**的（真实舱体一次派生 0.5 s，-Onone 6.6 s），而面板的
+        // `surfaces` 是快照字段：就绪状态一变就必须重新投影一次快照，否则面板手里一直是
+        // "还没派生完"的那一份 —— 格子已经画出来了，点一行却会被 `select()` 的承托守卫
+        // 静默挡下（2026-09-28 修的缺陷）。
+        //
+        // **只在状态变化时推**：本函数每次鼠标移动都会被调用，而一次快照要归并 3,000+ 格。
+        if publishedResidentPropSupportPhase != residentPropSupportPhase {
+            publishedResidentPropSupportPhase = residentPropSupportPhase
+            synchronizeResidentPropPresentation()
+        }
 
         // 悬停命中格子后，把预览挪到**吸附后的格心**（含当前 footprint 朝向）。
         // 预览走既有的摆放服务，所以"这里能不能放"由 `PropPlacementEvaluator` 决定；
@@ -3948,6 +4075,7 @@ final class AppDelegate:
             residentPropEditingWorldID = nil
             residentPropEditingID = nil
             spatialStage.residentPropPreview = nil
+            residentPropGridDerivationRequested = false
             residentPropGridEditor.deactivate()
             publishResidentPropGrid()
             guard spatialStage.selectedWorldID == worldID, livingWorldContext?.manifest.worldID == worldID else { return }

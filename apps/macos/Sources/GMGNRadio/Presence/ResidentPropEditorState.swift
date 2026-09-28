@@ -16,13 +16,28 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     let canUndo: Bool
     let heldProp: WorldHeldProp?
     let holdUnavailableReasons: [String: String]
+    /// 承托几何**永远**不会来（派生的前置条件不成立：拿不到碰撞三角形或导航范围）。
+    ///
+    /// `false`（缺省）表示"格子还在派生"。这个字段只回答"还会不会好"，**不回答就绪与否** ——
+    /// 就绪与否只看 `surfaces` 是不是空，所以两者不可能自相矛盾。
+    let supportGeometryUnavailable: Bool
     init(worldID: String, revision: UInt64, objects: [WorldObjectState], surfaces: [ResidentPropEditorSurface],
-         canUndo: Bool, heldProp: WorldHeldProp? = nil, holdUnavailableReasons: [String: String] = [:]) {
+         canUndo: Bool, heldProp: WorldHeldProp? = nil, holdUnavailableReasons: [String: String] = [:],
+         supportGeometryUnavailable: Bool = false) {
         self.worldID = worldID; self.revision = revision; self.objects = objects; self.surfaces = surfaces
         self.canUndo = canUndo; self.heldProp = heldProp; self.holdUnavailableReasons = holdUnavailableReasons
+        self.supportGeometryUnavailable = supportGeometryUnavailable
     }
     static let empty = Self(worldID: "", revision: 0, objects: [], surfaces: [], canUndo: false,
-                            heldProp: nil, holdUnavailableReasons: [:])
+                            heldProp: nil, holdUnavailableReasons: [:], supportGeometryUnavailable: false)
+
+    /// 拿不到承托几何时，面板要**说出来**的原因（有承托面时不会被读到）。
+    ///
+    /// 「派生中」的措辞与点击落地那条（`GMGNRadioApp.residentPropGridCommit`）**逐字一致**：
+    /// 同一个用户处境（格子还没出来）在两处说同一句话，工具测试钉住这一点。
+    var supportUnavailableNotice: String {
+        supportGeometryUnavailable ? "当前空间拿不到摆放几何，暂时不能摆放" : "格子还在生成，请稍候"
+    }
 }
 
 /// Drafts never change the world. Both validation and saving go through the host's placement service.
@@ -41,6 +56,10 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     var hold: (@MainActor (String, UInt64, String) async throws -> ResidentPropEditorSnapshot)?
     var adjustHeldGrip: (@MainActor (String, WorldVector3, WorldQuaternion, UInt64, String) async throws -> ResidentPropEditorSnapshot)?
     var returnHeld: (@MainActor (String, UInt64, String) async throws -> ResidentPropEditorSnapshot)?
+    /// 按**现状**再要一份快照。宿主没有可答的上下文（没在装修、世界换了）时返回 nil。
+    ///
+    /// 唯一消费者是 `select(objectID:)`：见那里对"快照是推送来的、格子却异步派生"的说明。
+    var refreshSnapshot: (@MainActor () -> ResidentPropEditorSnapshot?)?
     var onPreviewChanged: @MainActor (WorldObjectState?) -> Void = { _ in }
     var onEditingChanged: @MainActor (Bool) -> Void = { _ in }
     private var generation = UUID()
@@ -102,10 +121,25 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
         else if selectedID != nil { cancelPreview() }
         else { close() }
     }
+    /// 点一行 → 进入携带态（`isCarrying`）。
+    ///
+    /// **不信任手里的快照**：`surfaces` 是宿主**推送**来的字段，而格子派生是异步的
+    /// （真实舱体一次 0.5 s，-Onone 6.6 s）。就绪那一刻的推送可能还没到，所以点一行时先按
+    /// 现状要一份（`refreshSnapshot`）再判 —— 否则"格子已经画出来了、点一行却毫无反应"。
     func select(objectID: String) async {
-        guard isOpen, !isSaving,
-              let object = snapshot.objects.first(where: { $0.generatedProp?.objectID == objectID }),
-              let support = snapshot.surfaces.first(where: { $0.id == object.supportSurfaceID }) ?? snapshot.surfaces.first else { return }
+        guard isOpen, !isSaving else { return }
+        if let refreshed = refreshSnapshot?() { update(refreshed) }
+        guard isOpen else { return }
+        // 行是从 `objects`（`snapshot.objects` 的过滤结果）画出来的，所以找不到只可能是
+        // 快照刚好换了一版（例如世界被换掉）。那不是用户的动作失败，静默即可。
+        guard let object = snapshot.objects.first(where: { $0.generatedProp?.objectID == objectID }) else { return }
+        // 「必须有承托面」是**前置检查**，不是形式：`support` 同时给出初始落点 ——
+        // `surfaceID` 与"未摆出物件的出生位置"（见下面的 `validate`）。拿不到就进不了携带态。
+        // 但**绝不静默**：用户点了那一行，必须看得见为什么还没反应。
+        guard let support = support(for: object) else {
+            notice = snapshot.supportUnavailableNotice
+            return
+        }
         selectedID = objectID; draftRevision = snapshot.revision; requestID = UUID().uuidString
         if snapshot.heldProp?.objectID == objectID {
             placement = nil; candidate = nil; isMoving = false; notice = "手持展示中"; onPreviewChanged(nil)
@@ -115,6 +149,15 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
         let yaw = atan2(2 * (q.w * q.y + q.x * q.z), 1 - 2 * (q.y * q.y + q.z * q.z))
         await validate(.init(surfaceID: support.id, position: object.isEnabled ? object.transform.position : support.position, yaw: yaw))
     }
+
+    /// 这一行现在能坐在哪一层承托面上。
+    ///
+    /// `supportSurfaceID` 是摆放时随状态存下来的**标签**，未摆出的物件没有它 —— 那时退回
+    /// 第一层（`listedSupportLayers()` 按高度升序，第一层就是语义上的"地面"）。
+    private func support(for object: WorldObjectState) -> ResidentPropEditorSurface? {
+        snapshot.surfaces.first { $0.id == object.supportSurfaceID } ?? snapshot.surfaces.first
+    }
+
     func selectSurface(_ id: String) async {
         guard !isSaving, let s = snapshot.surfaces.first(where: { $0.id == id }), selectedID != nil else { return }
         draftRevision = snapshot.revision

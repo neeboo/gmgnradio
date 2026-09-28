@@ -35,6 +35,7 @@ func method(_ signature:String, in source:String = controller) -> String {
 let harness = #"""
 import Foundation
 import Combine
+import simd
 import WorldRuntime
 func precondition(_ condition:@autoclosure()->Bool,_ message:String="assertion failed") {
  if !condition() { print("FAIL: \(message)"); exit(1) }
@@ -44,6 +45,26 @@ func precondition(_ condition:@autoclosure()->Bool,_ message:String="assertion f
  let residentPropEditor = ResidentPropEditorState()
  \#(method("func configureResidentPropEditor("))
  \#(method("func updateResidentPropEditor("))
+ /// 格子点击落地那条路径的入口。本 harness 不驱动它（`snappedPlacement` 恒为 nil），
+ /// 只要求被抽取的 `publishResidentPropGrid` 能编过。
+ func moveResidentPropGridPointer(to position:WorldVector3,layerName:String,yaw:Float) async {}
+}
+/// 建造模式格子模型的替身：只保留 `publishResidentPropGrid` 读的那几个事实，
+/// 但**"就绪是异步的"这个时序**照旧（`isReady` 不会在请求的那一刻就为真）。
+@MainActor final class GridStub {
+ var isBuildModeActive = false
+ var isReady = false
+ var spacing:Float = 0.25
+ var renderCells:[Int] = []
+ var cellStates:[Int:Int] = [:]
+ var snappedPlacement:(position:SIMD3<Float>,yaw:Float)?
+ var hoveredLayerName:String?
+ /// 派生完成：这一刻起渲染层才有格子可画（与真机 `residentPropGridEditor` 同一时序）。
+ func becomeReady(cells:Int = 4) {
+  isBuildModeActive = true
+  isReady = true
+  renderCells = Array(0..<cells)
+ }
 }
 typealias StageWindowController = ControllerHarness
 enum ResidentPropPlacementError: Error { case inactiveContext }
@@ -87,23 +108,51 @@ typealias WorldAgentContext = LayoutContext
  }
 }
 @MainActor final class AppGuardHarness {
- final class Spatial { var selectedWorldID:String? = "a";var residentPropPreview:WorldObjectState? }
+ final class Spatial {
+  var selectedWorldID:String? = "a";var residentPropPreview:WorldObjectState?
+  var isResidentPropBuildModeActive = false
+  var residentPropGridCells:[Int] = []
+  var residentPropGridStates:[Int:Int] = [:]
+  var residentPropGridSpacing:Float = 0
+ }
  var livingWorldContext:LayoutContext?
  let spatialStage = Spatial()
+ /// 建造模式的格子模型（替身）。**就绪是异步的**：请求派生的那一刻 `isReady` 还是 false。
+ let residentPropGridEditor = GridStub()
+ /// 本次装修有没有真的去派生格子（区分"派生中"与"永远拿不到几何"）。
+ var residentPropGridDerivationRequested = false
+ /// 最近一次推给面板的承托几何状态。只在变化时重推快照。
+ private var publishedResidentPropSupportPhase:ResidentPropSupportPhase?
+ private var residentPropGridPushedHover:ResidentPropGridHoverKey?
+ var stageWindowController:ControllerHarness?
  var residentPropEditingID:UUID?
  var residentPropEditingWorldID:String?
  var isPreparing = false
  var delayPreparation = false
+ /// 格子派生好之后，面板该看到的承托面（真机来自 `listedSupportLayers()`）。
  var surfaces:[ResidentPropEditorSurface] = []
  func prepareResidentPropMutation(_ command:WorldPropLayoutCommand,context:LayoutContext) async throws {
   if delayPreparation { isPreparing = true;try await Task.sleep(for:.milliseconds(25));isPreparing = false }
  }
  func residentPropPlacementService(context:LayoutContext,isCurrent:@escaping()->Bool) -> PlacementFixture { .init(context,isCurrent:isCurrent) }
  func residentPropDescriptor(_ state:WorldObjectState) -> WorldObjectState? { state }
- func synchronizeResidentPropPresentation() {}
- func residentPropEditorSnapshot(context:LayoutContext) -> ResidentPropEditorSnapshot {
-  .init(worldID:context.manifest.worldID,revision:context.state.layoutRevision,objects:Array(context.state.objectStates.values),surfaces:surfaces,canUndo:false,heldProp:context.state.heldProp)
+ /// 真机：唯一一处把快照推给面板（`updateResidentPropEditor`）。
+ func synchronizeResidentPropPresentation() {
+  guard let context = livingWorldContext, spatialStage.selectedWorldID == context.manifest.worldID else { return }
+  stageWindowController?.updateResidentPropEditor(residentPropEditorSnapshot(context:context))
  }
+ /// 真机：`surfaces` 来自格子（没派生好就是空），`supportGeometryUnavailable` 来自同一个判据。
+ func residentPropEditorSnapshot(context:LayoutContext) -> ResidentPropEditorSnapshot {
+  .init(worldID:context.manifest.worldID,revision:context.state.layoutRevision,
+   objects:Array(context.state.objectStates.values),
+   surfaces:residentPropSupportPhase.isGridReady ? surfaces : [],
+   canUndo:false,heldProp:context.state.heldProp,
+   supportGeometryUnavailable:residentPropSupportPhase.supportGeometryUnavailable)
+ }
+ \#(method("private struct ResidentPropSupportPhase",in:appSource))
+ \#(method("private var residentPropSupportPhase",in:appSource))
+ \#(method("private struct ResidentPropGridHoverKey",in:appSource))
+ \#(method("private func publishResidentPropGrid(",in:appSource).replacingOccurrences(of:"private func",with:"func"))
  func setResidentPropEditing(_ editing:Bool) {
   residentPropEditingID = editing ? UUID() : nil
   residentPropEditingWorldID = editing ? livingWorldContext?.manifest.worldID : nil
@@ -220,7 +269,10 @@ typealias WorldAgentContext = LayoutContext
   escaping.escape();await waitingCommit.value
   let actualHost = AppGuardHarness(), actualController = ControllerHarness()
   let world = WorldState(revision:0,worldID:"a",worldTime:Date(),lastObservedWallTime:Date(),weather:.clear,agentTransform:identity,objectStates:["cup":object])
-  let context = LayoutContext(world);actualHost.livingWorldContext = context;actualHost.surfaces = [surface]
+  let context = LayoutContext(world);actualHost.livingWorldContext = context
+  // 格子派生完成之后面板才看得到承托面（真机：`surfaces` 来自 `listedSupportLayers()`）。
+  actualHost.surfaces = [surface];actualHost.residentPropGridDerivationRequested = true
+  actualHost.residentPropGridEditor.becomeReady()
   actualHost.configureResidentPropEditor(actualController)
   actualController.updateResidentPropEditor(actualHost.residentPropEditorSnapshot(context:context))
   let actualEditor = actualController.residentPropEditor
@@ -240,7 +292,74 @@ typealias WorldAgentContext = LayoutContext
   await Task.yield();race.update(.init(worldID:"a",revision:4,objects:[object],surfaces:[surface],canUndo:false))
   await stalePreview.value
   precondition(race.candidate == nil && !race.canConfirm,"old revision preview must not be adopted")
-  print("PASS: editor cancel, failure preservation, hand controls, duplicate submit, stale revision, late world, input routing")
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 2026-09-28 缺陷：**格子已经画出来了，点物件那一行却没有任何反应**。
+  //
+  // 真机症状（截图）：面板打开、地面铺满绿色可放格、行显示「E2E-0907 咖啡机 / 已摆出」，
+  // 但没有勾、没有高亮、下方也不出现任何控件 ⇒ `selectedID == nil` ⇒ `select()` 提前 return。
+  // 四个条件里唯一失败的是**承托面**：`snapshot.surfaces` 是宿主**推送**来的字段，而格子
+  // 派生是异步的（真实舱体 -O 0.5 s / -Onone 6.6 s），就绪那一刻的推送还没到，面板手里
+  // 还是"派生中"的那一份（`surfaces` 为空）。
+  //
+  // 下面四条把"点一行"的**行为**钉死（而不是钉某一行代码存在）：
+  //   1. 拿不到承托几何 → 进不了携带态（fail-closed 保留），但**必须说出来**；
+  //   2. 宿主能答出现状（格子已就绪）→ 点一行**必须**进携带态；
+  //   3. 永远拿不到几何 → 不能说"请稍候"（那不是"还没好"，是"好不了"）；
+  //   4. 格子就绪那一刻，宿主**自己**必须重新投影一次面板快照。
+  let driftingRow = ResidentPropEditorSnapshot(
+    worldID:"a",revision:3,objects:[object],surfaces:[],canUndo:false,heldProp:nil,
+    holdUnavailableReasons:[:],supportGeometryUnavailable:false)
+  let stranded = ResidentPropEditorState()
+  stranded.update(driftingRow);stranded.open()
+  stranded.preview = { _, p in WorldObjectState(transform:.init(position:p.position,rotation:identity.rotation,scale:identity.scale),metadata:metadata) }
+  // 宿主答不出更好的现状（没在装修 / 世界换了）：仍然不许静默。
+  await stranded.select(objectID:"cup")
+  precondition(stranded.selectedID == nil && stranded.placement == nil,
+    "no support geometry must not enter the carrying state")
+  precondition(stranded.notice == "格子还在生成，请稍候",
+    "a click without support geometry must say so, not return silently (got \"\(stranded.notice)\")")
+
+  // 同一个"陈旧快照"，但宿主能答出**现状**：格子已经就绪 → 点一行必须进携带态。
+  let catchingUp = ResidentPropEditorState()
+  catchingUp.update(driftingRow);catchingUp.open()
+  catchingUp.preview = { _, p in WorldObjectState(transform:.init(position:p.position,rotation:identity.rotation,scale:identity.scale),metadata:metadata) }
+  catchingUp.refreshSnapshot = { ResidentPropEditorSnapshot(worldID:"a",revision:3,objects:[object],surfaces:[surface],canUndo:false,heldProp:nil,
+    holdUnavailableReasons:[:],supportGeometryUnavailable:false) }
+  await catchingUp.select(objectID:"cup")
+  precondition(catchingUp.selectedID == "cup" && catchingUp.placement?.surfaceID == "floor",
+    "a click must enter the carrying state once the grid is ready, without waiting for the next push")
+  precondition(catchingUp.candidate != nil && !catchingUp.snapshot.surfaces.isEmpty,
+    "the carrying state must be backed by the fresh support surfaces")
+
+  let hopeless = ResidentPropEditorState()
+  hopeless.update(.init(worldID:"a",revision:3,objects:[object],surfaces:[],canUndo:false,heldProp:nil,
+    holdUnavailableReasons:[:],supportGeometryUnavailable:true))
+  hopeless.open()
+  await hopeless.select(objectID:"cup")
+  precondition(hopeless.selectedID == nil && hopeless.notice == "当前空间拿不到摆放几何，暂时不能摆放",
+    "geometry that will never arrive must not tell the resident to wait (got \"\(hopeless.notice)\")")
+
+  // 根因：**格子就绪**必须触发一次面板快照的重新投影。这一段驱动的是 App 里被抽取出来的
+  // `publishResidentPropGrid`（真代码），只有"格子模型怎么变"和"快照怎么算"是替身。
+  let wiringHost = AppGuardHarness(), wiringController = ControllerHarness()
+  wiringHost.livingWorldContext = context
+  wiringHost.surfaces = [surface]
+  wiringHost.stageWindowController = wiringController
+  wiringHost.configureResidentPropEditor(wiringController)
+  wiringHost.residentPropGridDerivationRequested = true   // 已请求派生，格子还没出来
+  wiringHost.publishResidentPropGrid()
+  wiringController.residentPropEditor.open()
+  precondition(wiringController.residentPropEditor.snapshot.surfaces.isEmpty,
+    "the panel sees no support surface while the grid is still deriving")
+  wiringHost.residentPropGridEditor.becomeReady()          // 派生完成：渲染层这一刻才有格子
+  wiringHost.publishResidentPropGrid()
+  precondition(!wiringController.residentPropEditor.snapshot.surfaces.isEmpty,
+    "grid readiness must re-project the panel snapshot (otherwise every row click is swallowed silently)")
+  await wiringController.residentPropEditor.select(objectID:"cup")
+  precondition(wiringController.residentPropEditor.selectedID == "cup",
+    "after the grid is ready a row click must enter the carrying state")
+  print("PASS: editor cancel, failure preservation, hand controls, duplicate submit, stale revision, late world, input routing, ready-grid row click")
  }
 }
 """#
