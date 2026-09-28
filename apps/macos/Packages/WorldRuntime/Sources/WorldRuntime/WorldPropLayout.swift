@@ -164,7 +164,20 @@ extension WorldPropLayoutError: LocalizedError {
 /// Placement-only triangle/box test. Callers cache the local triangles for authored support regions.
 /// This deliberately does not share the character controller's step-over behavior.
 public enum WorldPropMeshClearance {
-    public static func canPlace(_ box: WorldCollisionVolume, supportHeight: Float, triangles: [WorldTriangle]) -> Bool {
+    /// 允许"贴地"判定放宽多少米：低于/等于 `supportHeight + restingTolerance` 的三角形
+    /// 视为与承托面接触，不当作插进物件。
+    ///
+    /// 这个值只对**手工摆平的承托面**无所谓（0.1 毫米足够）；但真实舱体的地面是生成
+    /// 出来的起伏网格，footprint 里总有比锚点高几毫米的三角形，于是同一块地面上一件
+    /// 0.35×0.57 m 的物件只有 3% 的格子能放（90° 时 1%）。要不要放宽、放宽到多少是
+    /// **产品取舍**：放得越宽，物件越可能肉眼可见地陷进地面。所以这里把它做成显式
+    /// 参数（默认仍是原来的 0.1 毫米），让"如果放宽到 N 毫米会怎样"可以被实测，
+    /// 而不是靠猜。
+    public static let restingTolerance: Float = 0.0001
+
+    public static func canPlace(_ box: WorldCollisionVolume, supportHeight: Float,
+                                triangles: [WorldTriangle],
+                                restingTolerance: Float = WorldPropMeshClearance.restingTolerance) -> Bool {
         let q=box.rotation, h=SIMD3(box.halfExtents.x,box.halfExtents.y,box.halfExtents.z)
         let center=SIMD3(box.center.x,box.center.y,box.center.z)
         guard [h.x,h.y,h.z].allSatisfy({ $0.isFinite && $0>0 }),
@@ -188,7 +201,7 @@ public enum WorldPropMeshClearance {
             let minY=min(t.first.y,min(t.second.y,t.third.y)),maxY=max(t.first.y,max(t.second.y,t.third.y))
             let minZ=min(t.first.z,min(t.second.z,t.third.z)),maxZ=max(t.first.z,max(t.second.z,t.third.z))
             // Permit contact with the authored support, never skip a triangle crossing into the item.
-            if maxY <= supportHeight+0.0001 || minY >= center.y+h.y || maxY <= center.y-h.y
+            if maxY <= supportHeight+restingTolerance || minY >= center.y+h.y || maxY <= center.y-h.y
                 || maxX < center.x-ex || minX > center.x+ex || maxZ < center.z-ez || minZ > center.z+ez { continue }
             let points=vertices.map(local)
             let edges=[points[1]-points[0],points[2]-points[1],points[0]-points[2]]

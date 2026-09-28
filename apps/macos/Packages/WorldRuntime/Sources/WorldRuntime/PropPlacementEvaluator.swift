@@ -171,7 +171,9 @@ public enum PropPlacementEvaluator {
         grid: PropSupportGrid,
         collision: any WorldPropSupportQuerying,
         blockingVolumes: [WorldCollisionVolume],
-        placedProps: [WorldCollisionVolume]
+        placedProps: [WorldCollisionVolume],
+        restingTolerance: Float = WorldPropMeshClearance.restingTolerance,
+        supportHeightDeviation: Float = PropPlacementEvaluator.maximumSupportHeightDeviation
     ) -> PropSupportBlockReason? {
         guard footprint.isValid,
               height.isFinite, height > 0,
@@ -194,7 +196,7 @@ public enum PropPlacementEvaluator {
                 $0.layer == anchor.layer.layer
             }),
                 abs(layer.supportHeight - anchor.layer.supportHeight)
-                    <= maximumSupportHeightDeviation
+                    <= supportHeightDeviation
             else {
                 return .noSupport
             }
@@ -223,7 +225,8 @@ public enum PropPlacementEvaluator {
         guard WorldPropMeshClearance.canPlace(
             box,
             supportHeight: supportHeight,
-            triangles: localTriangles
+            triangles: localTriangles,
+            restingTolerance: restingTolerance
         ) else {
             return .blockedByMesh
         }
