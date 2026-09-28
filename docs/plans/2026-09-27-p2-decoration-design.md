@@ -24,7 +24,15 @@
 | §12 回归 1（展示台挡住导航） | ✅ 已修 | 本轮 |
 | §12 回归 2（桌面不可摆放） | ✅ 已修（三处协同改动 + 接线派生世界） | 本轮 |
 
-**7、8、9 全部完成**：格子在建造模式可见、鼠标拾取格子着色、点击在吸附后的格心上落地。
+**7、8、9 的几何/拾取/着色已完成**：格子在建造模式可见，鼠标移动时 footprint 跟着吸附格心走并整块着色。
+**但「点一下在吸附后的格心上落地」当时并没有接上**（原文在这里写了一个假的 ✅）：
+`StageWindowController.updatePropPointer` 的建造模式分支 `onGridCursor?(normalized)` 之后就
+`return` 了，把 `mouseDown` 传来的 `confirm: true` 丢掉；而全文件里唯一的 `propEditor.confirm()`
+在非建造模式的 `surface` 路径上，具名摆放面删除（见下）之后那条路径已不可达 —— 所以点击什么都不发生。
+落地通路是在**后续的《装修模式改成 3D 空间内直接操作》第 1 步「点地即放」**里才接上的：新增
+`onResidentPropGridCommit` 回调（鼠标"按下→抬起"未超过 `LiveCamSpaceEntryPolicy.maximumClickDrift`
+才算点一下）与 `moveAndConfirmResidentPropGridPointer(to:layerName:yaw:)`，点击时自己按顺序
+await「挪到吸附格心 + 确认」，不能复用 `publishResidentPropGrid` 的防抖推送（同一格会被跳过）。
 摆放校验已经是「格子 + `PropPlacementEvaluator`」，具名摆放面（`ResidentPropSupportSurface`
 与 `ResidentPropPlacementConfiguration.surfaces/nearbyTriangles/name(for:)`）已整体删除。
 键盘：R / Shift+R 做 90° 步进旋转，Delete 收回，Cmd+Z 撤销，Esc 取消（后三个面板上也有按钮）。

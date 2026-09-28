@@ -2968,6 +2968,11 @@ final class AppDelegate:
         stageWindowController?.onResidentPropGridCursor = { [weak self] normalized in
             self?.residentPropGridHover(normalized: normalized)
         }
+        // 建造模式：点一下 → 在吸附后的格心上落地。与悬停同一个归一化口径，
+        // 所以落点就是用户最后看到 footprint 停住的那一格。
+        stageWindowController?.onResidentPropGridCommit = { [weak self] normalized in
+            self?.residentPropGridCommit(normalized: normalized)
+        }
         // R / Shift+R：90° 步进旋转。旋转改的是 footprint 朝向，重新着色后由
         // `publishResidentPropGrid` 把新的吸附位置与朝向推给预览。
         stageWindowController?.onResidentPropGridRotate = { [weak self] steps in
@@ -3844,8 +3849,18 @@ final class AppDelegate:
     /// 悬停只负责算出**吸附后的格心**，然后交给编辑器去跑预检；真正的落地由编辑器的
     /// `confirm()` 走摆放服务完成，那一步已经是「格子 + footprint」口径（工作项 9）。
     private func residentPropGridHover(normalized: SIMD2<Float>) {
+        updateResidentPropGridHover(normalized: normalized)
+    }
+
+    /// 悬停与落地**共用**的拾取步骤。
+    ///
+    /// 两处必须用完全一样的输入（投影、footprint 尺寸/高度、阻挡体积、已放物件），
+    /// 否则"红绿格看到的位置"和"真正落地的位置"会拿两套碰撞输入各算一遍。
+    /// 返回 false 表示世界上下文或建造模式投影还没就绪（网格正在派生）。
+    @discardableResult
+    private func updateResidentPropGridHover(normalized: SIMD2<Float>) -> Bool {
         guard let context = livingWorldContext,
-              let projection = spatialStage.residentPropBuildModeProjection else { return }
+              let projection = spatialStage.residentPropBuildModeProjection else { return false }
         let footprint = stageWindowController?.residentPropFootprint
         let size = footprint?.size ?? SIMD2(repeating: residentPropGridEditor.spacing)
         let height = footprint?.height ?? residentPropGridEditor.spacing
@@ -3857,6 +3872,38 @@ final class AppDelegate:
             blockingVolumes: context.manifest.collisionVolumes.filter(\.isBlocking),
             placedProps: context.state.objectStates.values.compactMap(\.generatedCollisionVolume)
         )
+        return true
+    }
+
+    /// 建造模式：点一下 → 在吸附后的格心上落地。
+    ///
+    /// **刻意不走 `publishResidentPropGrid` 的防抖推送**：那条路径在"鼠标还在同一格"时会
+    /// `guard hover != residentPropGridPushedHover else { return }` 直接跳过，而且它是异步
+    /// Task —— 点击要么落在上一个格心，要么什么都不发生。点击必须自己按顺序 await
+    /// 「挪 + 确认」（见 `moveAndConfirmResidentPropGridPointer`）。
+    private func residentPropGridCommit(normalized: SIMD2<Float>) {
+        guard updateResidentPropGridHover(normalized: normalized) else {
+            // 网格派生在 -Onone 下要 6.6 s。这段窗口里的点击必须给一句人话，
+            // 否则用户只会觉得"点了没反应"。
+            showResidentVoiceStatus("格子还在生成，请稍候")
+            return
+        }
+        // 红格不提交。原因文案（`PropSupportBlockReason.errorDescription`，已是中文）
+        // 就在编辑器面板的 notice 上，这里不覆盖它。
+        guard residentPropGridEditor.canPlaceAtHover,
+              let snapped = residentPropGridEditor.snappedPlacement,
+              let layerName = residentPropGridEditor.hoveredLayerName else { return }
+        let yaw = residentPropGridEditor.footprintYaw
+        let target = WorldVector3(x: snapped.position.x, y: snapped.position.y, z: snapped.position.z)
+        // 先记下这次推送：下面的「挪 + 确认」自己会把预览放到位，防抖路径不该再推一遍
+        // （那会和确认抢时序，也白白多跑一次评估器）。
+        residentPropGridPushedHover = ResidentPropGridHoverKey(
+            x: target.x, y: target.y, z: target.z, yaw: yaw
+        )
+        Task { [weak self] in
+            await self?.stageWindowController?.moveAndConfirmResidentPropGridPointer(
+                to: target, layerName: layerName, yaw: yaw)
+        }
     }
 
     /// 格子覆盖的范围：以导航图的 waypoint 包络为准 —— 那**就是**可玩区域，而且已经在

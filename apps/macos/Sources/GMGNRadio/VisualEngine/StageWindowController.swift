@@ -52,6 +52,12 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         didSet { stageContentView?.onGridCursor = onResidentPropGridCursor }
     }
 
+    /// 建造模式「点一下落地」的回调，转发给交互视图。参数与 `onResidentPropGridCursor`
+    /// 同一套约定：**归一化、左上原点**，与 `PropSupportGridPicker` 一致。
+    var onResidentPropGridCommit: ((SIMD2<Float>) -> Void)? {
+        didSet { stageContentView?.onGridCommit = onResidentPropGridCommit }
+    }
+
     var onResidentPropGridRotate: ((Int) -> Void)? {
         didSet { stageContentView?.onGridRotate = onResidentPropGridRotate }
     }
@@ -59,6 +65,23 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     /// 建造模式：把预览挪到吸附后的格心（层名 + footprint 朝向）。
     func moveResidentPropGridPointer(to position: WorldVector3, layerName: String, yaw: Float) async {
         await residentPropEditor.moveGridPointer(to: position, layerName: layerName, yaw: yaw)
+    }
+
+    /// 建造模式：把预览挪到吸附后的格心，然后**立刻落地**。
+    ///
+    /// 与 `moveResidentPropGridPointer` 分成两个入口是刻意的。悬停推送走
+    /// `publishResidentPropGrid` 的防抖路径（同一个格心不重复推），点击不能借用它：
+    /// 鼠标停在原地点击时格子没变，那条路径会直接跳过推送。点击必须自己
+    /// **按顺序 await**「挪 + 确认」，否则会落在上一个格心（甚至什么都不发生）。
+    ///
+    /// `canConfirm` 是 internal（`ResidentPropEditorState` 同模块），此处直接可用。
+    func moveAndConfirmResidentPropGridPointer(
+        to position: WorldVector3,
+        layerName: String,
+        yaw: Float
+    ) async {
+        await residentPropEditor.moveGridPointer(to: position, layerName: layerName, yaw: yaw)
+        if residentPropEditor.canConfirm { await residentPropEditor.confirm() }
     }
 
     /// 建造模式算 footprint 用的物件尺寸：优先"正在拖动/待确认"的那个，否则用选中的。
@@ -570,6 +593,10 @@ private final class StageContentView: NSView {
     /// 建造模式的光标回调，转给真正处理鼠标的交互视图。
     var onGridCursor: ((SIMD2<Float>) -> Void)? {
         didSet { worldInteractionView.onGridCursor = onGridCursor }
+    }
+    /// 建造模式「点一下落地」的回调，同样转给交互视图。
+    var onGridCommit: ((SIMD2<Float>) -> Void)? {
+        didSet { worldInteractionView.onGridCommit = onGridCommit }
     }
     var onGridRotate: ((Int) -> Void)? {
         didSet { worldInteractionView.onGridRotate = onGridRotate }
@@ -1171,10 +1198,16 @@ private final class StageWorldInteractionView: NSView {
     private var dragInProgress = false
     private var didLogCurrentDrag = false
     private var lastDragLocationInWindow: CGPoint?
+    /// 建造模式里「鼠标按下但还没决定是点一下还是拖相机」的按下点（窗口坐标）。
+    /// nil 表示当前没有待判定的按下；超过抖动阈值转成相机拖拽时会被清掉。
+    private var propPressOriginInWindow: CGPoint?
 
     /// 建造模式的光标回调。参数是**归一化、左上原点**的光标位置，与
     /// `SpatialStageStore.residentPropPoint` 和 `PropSupportGridPicker` 同一套约定。
     var onGridCursor: ((SIMD2<Float>) -> Void)?
+    /// 建造模式「点一下落地」的回调。参数与 `onGridCursor` 完全一致（归一化、左上原点），
+    /// 这样落点就是用户最后看到 footprint 停住的那个格心。
+    var onGridCommit: ((SIMD2<Float>) -> Void)?
     /// 建造模式的 90° 步进旋转（+1 顺时针 / -1 逆时针）。
     var onGridRotate: ((Int) -> Void)?
 
@@ -1211,10 +1244,20 @@ private final class StageWorldInteractionView: NSView {
     override func mouseDown(with event: NSEvent) {
         if consumesPropPointer {
             window?.makeFirstResponder(self)
+            // 建造模式：按下**只记点**，绝不 beginDrag —— 否则左键一按就开始转相机，
+            // 「点一下落地」永远不会发生。落地在 mouseUp（见那里），
+            // 中间只要手抖超过阈值就会转成相机拖拽（见 mouseDragged）。
+            if spatialStage.isResidentPropBuildModeActive {
+                propPressOriginInWindow = event.locationInWindow
+                updatePropPointer(event)
+                return
+            }
+            // 非建造模式（既有的支持面路径）：行为保持不变。
             updatePropPointer(event, confirm: true)
             return
         }
-        if event.clickCount == 2 {
+        // 携带物件时双击是「落地」手势，不能顺手把相机也复位。
+        if event.clickCount == 2, !propEditor.isCarrying {
             endDragIfNeeded()
             spatialStage.resetCamera()
             return
@@ -1240,7 +1283,30 @@ private final class StageWorldInteractionView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        if consumesPropPointer { updatePropPointer(event); return }
+        if consumesPropPointer {
+            // 非建造模式：保持原样（继续把预览挪到支持面上的指针位置）。
+            guard spatialStage.isResidentPropBuildModeActive else {
+                updatePropPointer(event)
+                return
+            }
+            // 这一下已经判定成"拖相机"了：继续转，别再回头当"点一下"。
+            if dragInProgress {
+                dragCamera(with: event)
+                return
+            }
+            // 建造模式：没超过点击抖动阈值就还只是「手抖」，继续跟着光标走；
+            // 超过了才认定用户在拖相机 —— 这样"想微调落点"不会被当成转视角，
+            // 而"按住左键转相机"在建造模式里也依然可用。
+            guard let origin = propPressOriginInWindow,
+                  !Self.isWithinClickDrift(from: origin, to: event.locationInWindow) else {
+                updatePropPointer(event)
+                return
+            }
+            propPressOriginInWindow = nil
+            beginDrag(buttonNumber: event.buttonNumber, locationInWindow: origin)
+            dragCamera(with: event)
+            return
+        }
         dragCamera(with: event)
     }
 
@@ -1253,7 +1319,22 @@ private final class StageWorldInteractionView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
-        endDragIfNeeded()
+        // 建造模式：只有「按下 → 抬起」之间没超过点击抖动阈值，才算"点一下"。
+        // 超过阈值的那一下已经在 mouseDragged 里转成相机拖拽（按下点被清掉），
+        // 这里就只负责收尾，不会顺手把物件放下。
+        guard let origin = propPressOriginInWindow else {
+            endDragIfNeeded()
+            return
+        }
+        propPressOriginInWindow = nil
+        guard spatialStage.isResidentPropBuildModeActive else {
+            endDragIfNeeded()
+            return
+        }
+        updatePropPointer(event)
+        guard Self.isWithinClickDrift(from: origin, to: event.locationInWindow),
+              let normalized = normalizedPropPointer(for: event) else { return }
+        onGridCommit?(normalized)
     }
 
     override func rightMouseUp(with event: NSEvent) {
@@ -1323,6 +1404,9 @@ private final class StageWorldInteractionView: NSView {
             spatialStage.clearMovement()
             spatialStage.setSpeedBoosted(false)
             endDragIfNeeded()
+            // 视图离开窗口后不会再有 mouseUp：把没结算的按下点清掉，
+            // 免得下次回到这个视图时第一次 mouseUp 被当成落地。
+            propPressOriginInWindow = nil
             pointerTask?.cancel()
             propEditor.close()
         }
@@ -1355,12 +1439,25 @@ private final class StageWorldInteractionView: NSView {
         return event.modifierFlags.contains(.shift) ? -1 : 1
     }
 
-    private func updatePropPointer(_ event: NSEvent, confirm: Bool = false) {
-        guard bounds.width > 0, bounds.height > 0 else { return }
+    /// 光标位置 → **归一化、左上原点**坐标。与 `SpatialStageStore.residentPropPoint` 和
+    /// `PropSupportGridPicker` 的约定一致（AppKit 的视图坐标是左下原点，所以要翻 y）。
+    ///
+    /// 悬停（`updatePropPointer`）与落地（`mouseUp`）**共用这一个式子**：两边各写一份的话，
+    /// 只要有一处飘了，用户看到的 footprint 和真正落地的格子就会错开。
+    private func normalizedPropPointer(for event: NSEvent) -> SIMD2<Float>? {
+        guard bounds.width > 0, bounds.height > 0 else { return nil }
         let point = convert(event.locationInWindow, from: nil)
-        // 归一化到**左上原点**，与 `SpatialStageStore.residentPropPoint` 和
-        // `PropSupportGridPicker` 的约定一致（AppKit 的视图坐标是左下原点，所以要翻 y）。
-        let normalized = SIMD2<Float>(Float(point.x / bounds.width), Float(1 - point.y / bounds.height))
+        return SIMD2<Float>(Float(point.x / bounds.width), Float(1 - point.y / bounds.height))
+    }
+
+    /// 「点一下」还是「拖一下」：与 Live Cam 进入空间同一套阈值与算法
+    /// （`LiveCamSpaceEntryPolicy.maximumClickDrift`），不再各留一个魔数。
+    private static func isWithinClickDrift(from origin: CGPoint, to current: CGPoint) -> Bool {
+        hypot(current.x - origin.x, current.y - origin.y) <= LiveCamSpaceEntryPolicy.maximumClickDrift
+    }
+
+    private func updatePropPointer(_ event: NSEvent, confirm: Bool = false) {
+        guard let normalized = normalizedPropPointer(for: event) else { return }
 
         // 建造模式交给格子拾取：射线与**每一层**格子平面求交、就近命中，不再依赖
         // "当前摆放面"的单一高度 —— 这正是建造模式能放地面、放桌面、放夹层的原因。
