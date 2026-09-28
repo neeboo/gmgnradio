@@ -3848,8 +3848,8 @@ final class AppDelegate:
 
     /// 光标 → 格子悬停。
     ///
-    /// 只做悬停与判定；**点击提交仍走既有的摆放面校验**，把那一步切到 "格子 + footprint"
-    /// 需要同时改摆放服务（见工作项 9），所以现在点击不会在格子上落地任何东西。
+    /// 悬停只负责算出**吸附后的格心**，然后交给编辑器去跑预检；真正的落地由编辑器的
+    /// `confirm()` 走摆放服务完成，那一步已经是「格子 + footprint」口径（工作项 9）。
     private func residentPropGridHover(normalized: SIMD2<Float>) {
         guard let context = livingWorldContext,
               let projection = spatialStage.residentPropBuildModeProjection else { return }
