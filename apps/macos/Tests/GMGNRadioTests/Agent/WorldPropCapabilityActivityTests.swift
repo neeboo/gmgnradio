@@ -102,6 +102,64 @@ private func makeCapabilityContext(
     )
 }
 
+/// 合成承托几何：一张水平承托层。
+///
+/// 「具名摆放面」（`ResidentPropSupportSurface`）已从生产代码删除，摆放校验现在是
+/// 「格子 + footprint」：物件必须坐在某一层格子上，整块占地由 `PropPlacementEvaluator`
+/// 判定。这里按旧的 `resident.display_table`（中心 (2, 0.52, 2)、半长 0.5×0.5、yaw 0）
+/// 派生一张等价的承托网格给 `support:`，而不是把断言改成空壳。
+private struct FlatSupport: WorldPropSupportQuerying {
+    let minimumX: Float
+    let maximumX: Float
+    let minimumZ: Float
+    let maximumZ: Float
+    let height: Float
+
+    func canOccupy(_ capsule: WorldCapsule, at position: SIMD3<Float>) -> Bool { true }
+
+    /// 遵守 `groundHeight` 的 y 受限契约：只报不高于查询点的承托面，列扫描才会收敛。
+    func groundHeight(at position: SIMD3<Float>) -> Float? {
+        guard position.x >= minimumX, position.x <= maximumX,
+              position.z >= minimumZ, position.z <= maximumZ else { return nil }
+        return height <= position.y + 0.05 ? height : nil
+    }
+
+    func canTraverse(
+        _ capsule: WorldCapsule,
+        from start: SIMD3<Float>,
+        to destination: SIMD3<Float>,
+        maximumStepHeight: Float
+    ) -> Bool { true }
+
+    func triangles(in bounds: WorldPlanarBounds) -> [WorldTriangle] {
+        guard bounds.maximumX >= minimumX, bounds.minimumX <= maximumX,
+              bounds.maximumZ >= minimumZ, bounds.minimumZ <= maximumZ else { return [] }
+        let a = SIMD3<Float>(minimumX, height, minimumZ)
+        let b = SIMD3<Float>(maximumX, height, minimumZ)
+        let c = SIMD3<Float>(maximumX, height, maximumZ)
+        let d = SIMD3<Float>(minimumX, height, maximumZ)
+        return [WorldTriangle(a, b, c), WorldTriangle(a, c, d)]
+    }
+}
+
+private let capabilitySupportWorld = FlatSupport(
+    minimumX: 1, maximumX: 3, minimumZ: 1, maximumZ: 3, height: 0.52
+)
+
+private let capabilitySupport: ResidentPropPlacementSupport = {
+    let bounds = WorldPlanarBounds(
+        minimumX: capabilitySupportWorld.minimumX, maximumX: capabilitySupportWorld.maximumX,
+        minimumZ: capabilitySupportWorld.minimumZ, maximumZ: capabilitySupportWorld.maximumZ
+    )
+    let grid = PropSupportGridBuilder.build(
+        collision: capabilitySupportWorld,
+        bounds: bounds,
+        seed: WorldVector3(x: 2, y: 0.52, z: 2),
+        parameters: PropSupportGridParameters()
+    )
+    return ResidentPropPlacementSupport(grid: grid, collision: capabilitySupportWorld)
+}()
+
 @MainActor
 private func bindPlacedCoffeeMachine(in context: WorldAgentContext) throws {
     let prop = WorldGeneratedProp(
@@ -295,19 +353,7 @@ func dispatcherRejectsPropUsageWhenCurrentAvatarFormatLacksTheButtonMotion() asy
 func capabilityToolBindsReadsBackAndRequiresHumanRound() async throws {
     let context = try makeCapabilityContext()
     try bindPlacedCoffeeMachine(in: context)
-    let service = ResidentPropPlacementService(
-        context: context,
-        surfaces: [
-            ResidentPropSupportSurface(
-                id: "resident.display_table",
-                center: WorldVector3(x: 2, y: 0.52, z: 2),
-                halfExtents: WorldVector3(x: 0.5, y: 0.02, z: 0.5),
-                yaw: 0,
-                excludedCollisionID: nil
-            ),
-        ],
-        validateEnvironment: { _, _ in }
-    )
+    let service = ResidentPropPlacementService(context: context, support: { capabilitySupport })
 
     let arguments = try JSONSerialization.data(withJSONObject: [
         "object_id": coffeeObjectID,

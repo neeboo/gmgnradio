@@ -71,6 +71,8 @@ test-harnesses:
 	swift tools/test-resident-prop-render.swift
 	swift tools/test-resident-prop-grid-editor.swift
 	swift tools/test-resident-prop-grid-placement.swift
+	swift tools/test-resident-prop-placement.swift
+	swift tools/test-resident-prop-tools.swift
 	swift tools/test-resident-status-lifecycle.swift
 	swift tools/test-resident-chat-transcript.swift
 	swift tools/test-resident-voice-authorization.swift

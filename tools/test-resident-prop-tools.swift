@@ -1,7 +1,9 @@
-// 注意：这些 harness 早于「格子 + footprint」契约，且在本次契约变更之前就已经在运行时失败。
-// 这里只把构造改成新签名（`support` 默认 `{ nil }` = 拿不到承托几何就拒绝摆放），
-// 让它们回到"只剩预先存在的运行时失败"的状态。要真正恢复，需要像
-// `tools/test-resident-prop-grid-editor.swift` 那样提供一张合成承托网格。
+// 摆件工具桥的委托/授权/幂等行为检查（无宿主、无网络）。
+//
+// 主题已经迁移到「格子 + footprint」：具名摆放面（`ResidentPropSupportSurface`）已从生产
+// 代码删除，摆放校验改为「位置落在某一层格子的格心上 + `PropPlacementEvaluator` 整块
+// footprint 判定」。下面用一张解析平面派生出真实的 `PropSupportGrid` 作为承托几何
+// （等价于原来那张具名面 `test`；`surface_id` 现在只是状态里的层标签）。
 import Foundation
 
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
@@ -20,16 +22,46 @@ enum ResidentWorldToolSession {
     }
 }
 @MainActor final class Current { var value = true }
+/// 合成承托几何：一张水平承托层（旧具名摆放面 `test` 的等价物）。
+///
+/// 摆放校验现在要的是「格子 + 承托几何」，所以承托面必须由几何派生：这张解析平面给出
+/// 承托高度与覆盖范围，`groundHeight` 遵守 y 受限契约（只报不高于查询点的承托面），
+/// 列扫描才能收敛成"一列一层"。
+struct FlatSupport: WorldPropSupportQuerying {
+    let minimumX:Float; let maximumX:Float; let minimumZ:Float; let maximumZ:Float; let height:Float
+    func canOccupy(_ capsule:WorldCapsule,at position:SIMD3<Float>)->Bool { true }
+    func groundHeight(at position:SIMD3<Float>)->Float? {
+        guard position.x >= minimumX, position.x <= maximumX,
+              position.z >= minimumZ, position.z <= maximumZ else { return nil }
+        return height <= position.y + 0.05 ? height : nil
+    }
+    func canTraverse(_ capsule:WorldCapsule,from start:SIMD3<Float>,to destination:SIMD3<Float>,maximumStepHeight:Float)->Bool { true }
+    func triangles(in bounds:WorldPlanarBounds)->[WorldTriangle] {
+        guard bounds.maximumX >= minimumX, bounds.minimumX <= maximumX,
+              bounds.maximumZ >= minimumZ, bounds.minimumZ <= maximumZ else { return [] }
+        let a=SIMD3<Float>(minimumX,height,minimumZ),b=SIMD3<Float>(maximumX,height,minimumZ)
+        let c=SIMD3<Float>(maximumX,height,maximumZ),d=SIMD3<Float>(minimumX,height,maximumZ)
+        return [WorldTriangle(a,b,c),WorldTriangle(a,c,d)]
+    }
+}
+/// 与旧面 `test` 同范围同高度：中心 (-2.7, 0.52, -5)、半长 (1, 0, 1)。
+let flatWorld=FlatSupport(minimumX:-3.7,maximumX:-1.7,minimumZ:-6,maximumZ:-4,height:0.52)
+@MainActor func flatSupport()->ResidentPropPlacementSupport {
+    let bounds=WorldPlanarBounds(minimumX:flatWorld.minimumX,maximumX:flatWorld.maximumX,
+                                 minimumZ:flatWorld.minimumZ,maximumZ:flatWorld.maximumZ)
+    let grid=PropSupportGridBuilder.build(collision:flatWorld,bounds:bounds,
+                                          seed:WorldVector3(x:-2.7,y:0.52,z:-5),parameters:PropSupportGridParameters())
+    return ResidentPropPlacementSupport(grid:grid,collision:flatWorld)
+}
 @main struct Tests {
     @MainActor static func main() async throws {
         let data=try Data(contentsOf:URL(fileURLWithPath:"apps/macos/Resources/Worlds/marble-living-cabin/world.json"))
         let manifest=try JSONDecoder().decode(WorldManifest.self,from:data)
         let context=try WorldAgentContext(manifest:manifest)
-        // The shipped auto waypoint grid now covers the open floor; use the
-        // display-table area, which the grid deliberately routes around.
-        let surface=ResidentPropSupportSurface(id:"test",center:.init(x:-2.7,y:0.52,z:-5),halfExtents:.init(x:1,y:0,z:1),yaw:0,excludedCollisionID:nil)
+        // 承托层由几何派生：范围与旧的具名面 `test` 相同（展示台桌面高度 0.52 m）。
+        let flat=flatSupport()
         let current=Current()
-        let service=ResidentPropPlacementService(context:context,isCurrent:{current.value},
+        let service=ResidentPropPlacementService(context:context,support:{flat},isCurrent:{current.value},
             currentAvatarAssetID:{"pmx.2b-miss-0414-standard"},makeGripCalibration:{ prop, avatarID in
                 WorldPropGripCalibration(avatarAssetID:avatarID,hand:.rightHand,
                     normalizedGrip:.init(x:0.5,y:0.5,z:0.5),localOffset:.init(x:0,y:0,z:0),
