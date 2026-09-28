@@ -129,6 +129,32 @@ def validate(app, require_helper=True):
             raise RuntimeError(f'Missing executable app/helper: {relative}')
 
 
+def ensure_signature(app):
+    """仅当签名**不完整**时补一次 ad-hoc 签名，返回是否补过。
+
+    Xcode 的 Debug 产物是 linker-signed：可执行文件本身有签名，但 bundle 资源
+    封印对不上，`codesign --verify --deep --strict` 会报
+    "code has no resources but signature indicates they must be present"。
+    这种 bundle 可能被 macOS 拒绝启动，所以在替换前补签，让装出来的副本自洽。
+
+    反过来，**已经正确签名（含 Developer ID / 公证）的产物绝不能重签**：那会把
+    正式签名换成 ad-hoc，等于毁掉分发能力。所以这里只补不覆盖。
+    """
+    verified = subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)],
+                              capture_output=True)
+    if verified.returncode == 0:
+        return False
+    resigned = subprocess.run(['codesign', '--force', '--deep', '--sign', '-', str(app)],
+                              capture_output=True)
+    if resigned.returncode != 0:
+        raise RuntimeError('Installed bundle signature could not be repaired')
+    recheck = subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)],
+                             capture_output=True)
+    if recheck.returncode != 0:
+        raise RuntimeError('Repaired bundle signature still fails verification')
+    return True
+
+
 def install(source, destination, root, runtime=None, timeout=15):
     source, destination, root = (Path(p).expanduser().resolve() for p in (source, destination, root))
     if source == destination or source in destination.parents or destination in source.parents:
@@ -146,6 +172,9 @@ def install(source, destination, root, runtime=None, timeout=15):
     try:
         shutil.copytree(source, staged, symlinks=True)
         validate(staged)
+        # 先补签暂存副本再替换：装出去的 bundle 一定是自洽的；中途失败也不会
+        # 留下一个签坏了的正式安装。
+        signature_repaired = ensure_signature(staged)
         rows = runtime.processes()
         executables = {str(app / 'Contents/MacOS/gmgn radio') for app in (source, destination)}
         apps = [(pid, command) for pid, command in rows if command in executables]
@@ -172,7 +201,8 @@ def install(source, destination, root, runtime=None, timeout=15):
         # token，安装器也不再读取任何记忆 provider 环境变量。安装只负责替换
         # bundle、拉起 daemon 并验证套接字归属；记忆模块在 daemon 内部自行工作。
         return {'destination': str(destination), 'backup': str(backup) if backup.exists() else None,
-                'daemon_verified': True, 'app_stopped': bool(apps), 'open_app_manually': True}
+                'daemon_verified': True, 'signature_repaired': signature_repaired,
+                'app_stopped': bool(apps), 'open_app_manually': True}
     except Exception as error:
         if swapped:
             try:

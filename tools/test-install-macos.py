@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import json
 import socket
+import shutil
 import subprocess
 import sys
 import threading
@@ -238,7 +239,52 @@ class InstallTests(unittest.TestCase):
     # -- 外部 VoiceMem provider 配置已整体移除 ------------------------------
 
     def receipt_fields(self, receipt):
-        return {key: value for key, value in receipt.items() if key != 'backup'}
+        # backup 是临时路径；signature_repaired 取决于**源产物**的签名状态
+        # （本测试的 fixture 是带可执行位的文本文件，必然需要补签），两者都不
+        # 参与逐字段比较。签名本身另有专门的断言。
+        return {key: value for key, value in receipt.items()
+                if key not in ('backup', 'signature_repaired')}
+
+    def test_installed_bundle_signature_verifies(self):
+        """装出去的 bundle 必须通过严格验签。
+
+        Xcode 的 Debug 产物是 linker-signed：可执行文件有签名，但 bundle 资源
+        封印对不上（"code has no resources but signature indicates they must be
+        present"），macOS 可能因此拒绝启动。安装器必须把这种产物补成自洽的。
+
+        这里断言**结果**而不是"是否补过"：源产物本来就签好的环境不该被重签，
+        所以不能要求 signature_repaired 恒为真。
+        """
+        receipt = self.run_install()
+        self.assertIn('signature_repaired', receipt)
+        result = subprocess.run(['codesign', '--verify', '--deep', '--strict', str(self.dest)],
+                                capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+    def test_valid_signature_is_left_alone(self):
+        """已经正确签名的产物不得被重签 —— 那会把正式签名（Developer ID/公证）
+        换成 ad-hoc，等于毁掉分发能力。
+
+        fixture 必须用**真实 Mach-O**：文本文件当可执行体时，codesign 只能把签名
+        放进扩展属性，而 `shutil.copytree` 不保留扩展属性，暂存副本必然验签失败、
+        每次都触发补签 —— 那样这条测试就永远测不到"不重签"这个分支。Mach-O 的
+        签名是嵌在文件里的，复制不会丢，才测得到。
+        """
+        echo = Path('/bin/echo').read_bytes()
+        for relative in ['Contents/Helpers/gmgn-taskd', 'Contents/MacOS/gmgn radio']:
+            target = self.source / relative
+            target.unlink()
+            # 只写字节、不抄标志：copy2 会连 /bin/echo 的受限文件标志一起抄，
+            # 触发 Operation not permitted。Mach-O 的内容本身就够了。
+            target.write_bytes(echo)
+            target.chmod(0o755)
+        subprocess.run(['codesign', '--force', '--deep', '--sign', '-', str(self.source)],
+                       check=True, capture_output=True)
+        verified = subprocess.run(['codesign', '--verify', '--deep', '--strict', str(self.source)],
+                                  capture_output=True)
+        self.assertEqual(verified.returncode, 0, verified.stderr.decode())
+        receipt = self.run_install()
+        self.assertFalse(receipt['signature_repaired'])
 
     def test_install_never_reads_memory_provider_variables(self):
         """GMGN_MEMORY_* 不再被读取：部分/完整/垃圾取值都不能改变安装行为。
