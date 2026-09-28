@@ -3531,24 +3531,74 @@ final class AppDelegate:
     private let residentPropGridEditor = ResidentPropGridEditorModel()
     /// 最近一次推给编辑器的吸附目标（位置 + 朝向）。用来跳掉"同一格内移动鼠标"的重复预检。
     private var residentPropGridPushedHover: ResidentPropGridHoverKey?
-    /// 本次装修有没有真的去派生格子。只用来区分"派生中"与"永远拿不到几何"。
-    private var residentPropGridDerivationRequested = false
+    /// **正在进行的那一次**格子派生的令牌（nil = 现在没有派生在跑）。
+    ///
+    /// 为什么是令牌而不是 Bool：Bool 记不住"这次请求后来死了"。2026-09-28 真机上
+    /// 面板一直说「格子还在生成，请稍候」，而采样里**没有任何派生在跑** —— 说明
+    /// "请求过"必须随任务结束而失效，否则这句话会永远挂着，用户也就永远点不动那一行。
+    /// 令牌只由 `activateResidentPropGrid` 发放，由那次派生的收尾收回。
+    private var residentPropGridDerivation: UUID?
 
-    /// 面板快照里承托几何的状态：**就绪与否看 `isGridReady`**，`isUnavailable` 只回答
-    /// "还会不会好"。两个事实都来自 `residentPropGridEditor`（唯一真相）。
+    /// 面板快照里承托几何的状态：**就绪与否看 `isGridReady`**，`isDeriving` 只回答
+    /// "还会不会好"。两个事实都来自 `residentPropGridEditor` 与派生令牌（唯一真相）。
     ///
     /// 它同时是"要不要重推面板快照"的比较键 —— 见 `publishResidentPropGrid`。
+    /// 注意它**不回答"承托面能不能用"**：那件事只有 `surfaces` 说了算，见
+    /// `ResidentPropSupportReadiness`。
     private struct ResidentPropSupportPhase: Equatable {
         let isGridReady: Bool
-        let isUnavailable: Bool
-        /// 与 `ResidentPropEditorSnapshot.supportGeometryUnavailable` 同义。
-        var supportGeometryUnavailable: Bool { !isGridReady && isUnavailable }
+        let isDeriving: Bool
     }
     private var residentPropSupportPhase: ResidentPropSupportPhase {
         .init(isGridReady: residentPropGridEditor.isReady,
-              isUnavailable: !residentPropGridDerivationRequested)
+              isDeriving: residentPropGridDerivation != nil)
     }
     private var publishedResidentPropSupportPhase: ResidentPropSupportPhase?
+    /// 最近一次**已经写进日志**的相位。只为压制"推失败时每次鼠标移动都刷一条"。
+    private var loggedResidentPropSupportPhase: ResidentPropSupportPhase?
+
+    /// 「这次点击还能不能拿到摆放几何」—— 面板那句提示与它**一一对应**。
+    ///
+    /// 为什么要它（而不是直接看 `grid != nil`）：`PropSupportGridBuilder` 的失败是
+    /// **fail-closed 但非 nil** 的 —— 种子越界、范围内没有可用几何、没有候选层时它返回
+    /// `PropSupportGrid.empty`，而 `grid != nil` 会被 `isReady` 判成"就绪"。于是
+    /// `!isGridReady && …` 恒为假，面板只能永远说「格子还在生成，请稍候」：既没有格子在
+    /// 生成，也永远点不动那一行。真机 2026-09-28 的截图就是这句话。
+    ///
+    /// 判据只有两条，各自回答一个问题：
+    /// - `hasSurfaces`（`surfaces` 非空）：**现在能不能摆放**（fail-closed 的唯一判据）；
+    /// - `isDeriving`（有一次派生真的在跑）：**还会不会好**。
+    ///
+    /// 两者互斥地覆盖三种事实：有承托面 = 就绪；没有但任务在跑 = 真的在生成；
+    /// 没有且没有任务在跑 = 拿不到（无论 `grid` 是不是非 nil 的空网格）。
+    enum ResidentPropSupportReadiness: Equatable {
+        case deriving
+        case ready
+        case unavailable
+
+        static func resolve(hasSurfaces: Bool, isDeriving: Bool) -> Self {
+            if hasSurfaces { return .ready }
+            return isDeriving ? .deriving : .unavailable
+        }
+
+        /// 与 `ResidentPropEditorSnapshot.supportGeometryUnavailable` 同义。
+        var supportGeometryUnavailable: Bool { self == .unavailable }
+    }
+
+    /// 这次点击要不要先把装修会话接回来。
+    ///
+    /// 为什么需要自救：面板的开关（`ResidentPropEditorState.isOpen`）与宿主的装修会话
+    /// （`residentPropEditingID` / `residentPropEditingWorldID`）是两份状态，而
+    /// `setResidentPropEditing(true)` 的守卫会**静默** return。一旦会话没接上，面板虽然
+    /// 开着，`refreshSnapshot` 却永远答 nil，于是那一行永远停在"还没好"—— 而且关掉面板
+    /// 再打开也未必重接（同一个守卫仍然拦）。所以点行时按现状判断一次并重接，
+    /// 比"让用户多点几次"可靠：格子已经就绪时点行必须能进携带态。
+    enum ResidentPropDecorationSessionRearm {
+        static func shouldRearm(hasSession: Bool, sessionWorldID: String?, worldID: String) -> Bool {
+            guard hasSession else { return true }
+            return sessionWorldID != worldID
+        }
+    }
 
     /// 吸附目标的比较键。用**位置 + 朝向**而不是格号：编辑器真正关心的是"预览挪到哪"。
     private struct ResidentPropGridHoverKey: Equatable {
@@ -3753,6 +3803,10 @@ final class AppDelegate:
                   name: index == 0 ? "地面" : String(format: "台面 %.2f m", layer.supportHeight),
                   position: layer.center, cellCount: layer.cellCount)
         }
+        let readiness = ResidentPropSupportReadiness.resolve(
+            hasSurfaces: !surfaces.isEmpty,
+            isDeriving: residentPropGridDerivation != nil
+        )
         return .init(worldID: context.manifest.worldID, revision: context.state.layoutRevision,
               objects: objects,
               // 未摆出物件的初始落点候选（**纯顺序**，判定仍由 `preview` 给）：
@@ -3766,12 +3820,19 @@ final class AppDelegate:
               }),
               // 面板要能区分"格子还在生成"与"这个空间永远拿不到几何"：前者的措辞要和
               // 点击落地那条一致（见 `residentPropGridCommit`），后者不能说"请稍候"。
-              supportGeometryUnavailable: residentPropSupportPhase.supportGeometryUnavailable)
+              //
+              // **判据必须同时看承托面与"有没有派生在跑"**（见 `ResidentPropSupportReadiness`）：
+              // 只问 `grid != nil` 的话，派生失败留下的空网格会被当成"就绪"，于是面板
+              // 永远说"还在生成"、那一行永远点不动（2026-09-28 真机缺陷）。
+              supportGeometryUnavailable: readiness.supportGeometryUnavailable)
     }
 
-    private func synchronizeResidentPropPresentation() {
+    /// 把当前快照推给面板。返回**是否真的推成功** —— 世界已切换/窗口不在时不算推成功，
+    /// 调用方据此决定要不要把"这个相位已经推过"记下来（见 `publishResidentPropGrid`）。
+    @discardableResult
+    private func synchronizeResidentPropPresentation() -> Bool {
         guard let context = livingWorldContext, spatialStage.selectedWorldID == context.manifest.worldID,
-              context.manifest.worldID == WishMachineScene.worldID else { return }
+              context.manifest.worldID == WishMachineScene.worldID else { return false }
         spatialStage.residentPropOutputs = context.state.objectStates.values.filter(\.isEnabled).compactMap(residentPropDescriptor)
         spatialStage.residentHeldProp = residentHeldPropDescriptor(context: context)
         // 展示台的视觉几何从 manifest 的碰撞体反推：几何只有一个来源（layout.json → world.json），
@@ -3782,7 +3843,8 @@ final class AppDelegate:
         } else {
             spatialStage.residentPropDisplayStand = nil
         }
-        stageWindowController?.updateResidentPropEditor(residentPropEditorSnapshot(context: context))
+        guard let stageWindowController else { return false }
+        stageWindowController.updateResidentPropEditor(residentPropEditorSnapshot(context: context))
         for (id, status) in spatialStage.residentPropRenderStatuses {
             if case .failed(_, let message) = status, residentPropNotices[id] != message {
                 showResidentVoiceStatus("物件显示失败，已保存的摆放和所有权仍保留：\(message)")
@@ -3790,6 +3852,7 @@ final class AppDelegate:
             }
         }
         synchronizeWishMachinePresentation()
+        return true
     }
 
     private func residentHeldPropDescriptor(context: WorldAgentContext) -> ResidentHeldPropDescriptor? {
@@ -3888,9 +3951,24 @@ final class AppDelegate:
             return self.residentPropEditorSnapshot(context: context)
         }, refreshSnapshot: { [weak self] in
             // 点一行时按**现状**再要一份：格子派生是异步的，而面板手里的快照是推送来的。
-            // 装修已经结束或世界换了就答 nil —— 那时这次点击本来就该作废。
-            guard let self, let context = self.livingWorldContext,
-                  let editorID = self.residentPropEditingID,
+            //
+            // 装修已经结束或世界换了就答 nil —— 那时这次点击本来就该作废。但**答 nil 之前
+            // 先自救一次**：面板开着而宿主的装修会话没接上（进入分支被守卫静默挡下、或者
+            // 上一次会话留下的身份已经过期）时，干等下去只会让那一行永远停在"还没好"。
+            // 重接本身走的还是那条既有进入分支，守卫（世界必须一致）一个字都没放宽。
+            guard let self, let context = self.livingWorldContext else { return nil }
+            if ResidentPropDecorationSessionRearm.shouldRearm(
+                hasSession: self.residentPropEditingID != nil,
+                sessionWorldID: self.residentPropEditingWorldID,
+                worldID: context.manifest.worldID
+            ) {
+                // 会话属于**别的**世界时，进入分支自己的守卫会把它挡下（`residentPropEditingWorldID`
+                // 非 nil）。所以先按既有退出分支把它收干净，再重接 —— 两步都是既有路径，
+                // "世界必须一致"这条 fail-closed 守卫一个字都没放宽。
+                if self.residentPropEditingWorldID != nil { self.setResidentPropEditing(false) }
+                self.setResidentPropEditing(true)
+            }
+            guard let editorID = self.residentPropEditingID,
                   self.isResidentPropEditorCurrent(context: context, editorID: editorID) else { return nil }
             return self.residentPropEditorSnapshot(context: context)
         }, onPreviewChanged: { [weak self] preview in
@@ -3909,12 +3987,20 @@ final class AppDelegate:
     /// 拿不到网格几何时**停用**而不是放行：`context.propSupportQuerying` 为 nil 意味着
     /// 碰撞世界给不出三角形，派生器会得到空网格、评估器会给 `.noSupport` —— 两道都是
     /// fail-closed。与其画一张空网格，不如明确不进入格子系统。
+    ///
+    /// 日志（`.notice`）是这套状态机的常驻诊断，不是临时脚手架：真机 2026-09-28 的
+    /// "永远说还在生成"之所以查了很久，正是因为**这条路每一步都是静默的** ——
+    /// 守卫静默 return、任务静默被停用、派生静默返回空网格。下面每条都能独立回答
+    /// "这一步有没有发生、结果是什么"。
     private func activateResidentPropGrid(context: WorldAgentContext) {
         residentPropGridEditor.onGridChanged = { [weak self] in self?.publishResidentPropGrid() }
-        guard let collision = context.propSupportQuerying,
-              let bounds = residentPropGridBounds(context: context) else {
-            livingWorldLogger.notice("建造模式：当前空间拿不到摆放几何或导航范围，已停用格子派生。")
-            residentPropGridDerivationRequested = false
+        let collision = context.propSupportQuerying
+        let bounds = residentPropGridBounds(context: context)
+        guard let collision, let bounds else {
+            livingWorldLogger.notice(
+                "建造模式：当前空间拿不到摆放几何或导航范围，已停用格子派生。碰撞三角形=\(collision != nil, privacy: .public)，导航范围=\(bounds != nil, privacy: .public)"
+            )
+            residentPropGridDerivation = nil
             residentPropGridEditor.deactivate()
             publishResidentPropGrid()
             return
@@ -3930,12 +4016,34 @@ final class AppDelegate:
         let seed = context.manifest.spawn.position
         let key = context.manifest.worldID
         residentPropGridPushedHover = nil
-        residentPropGridDerivationRequested = true
+        // 令牌与这次任务同生共死：面板的"还会不会好"只看令牌在不在（见
+        // `ResidentPropSupportReadiness`）。任务**结束时**（无论成功、失败还是被停用）
+        // 令牌必须失效，否则一次失败的派生会让面板永远说"格子还在生成"。
+        let derivationToken = UUID()
+        residentPropGridDerivation = derivationToken
+        livingWorldLogger.notice(
+            "建造模式：请求派生格子 world=\(key, privacy: .public) bounds=[\(bounds.minimumX, privacy: .public),\(bounds.maximumX, privacy: .public)]×[\(bounds.minimumZ, privacy: .public),\(bounds.maximumZ, privacy: .public)] seed=(\(seed.x, privacy: .public),\(seed.y, privacy: .public),\(seed.z, privacy: .public))"
+        )
         Task { [weak self] in
             await self?.residentPropGridEditor.activate(
                 collision: derivation, seed: seed, bounds: bounds, key: key
             )
+            self?.finishResidentPropGridDerivation(derivationToken)
         }
+        publishResidentPropGrid()
+    }
+
+    /// 一次格子派生的收尾：令牌失效 + 按**现状**重推面板快照。
+    ///
+    /// 分开成一步是为了让"请求过"与"任务在跑"始终一致 —— 任务一结束（哪怕它什么都没派
+    /// 生出来），面板看到的就必须是"就绪"或"拿不到"，而不是"还在生成"。
+    private func finishResidentPropGridDerivation(_ token: UUID) {
+        guard residentPropGridDerivation == token else { return }
+        residentPropGridDerivation = nil
+        let layers = residentPropGridEditor.grid?.layers.count ?? -1
+        livingWorldLogger.notice(
+            "建造模式：格子派生结束，网格层=\(layers, privacy: .public) 可绘制列=\(self.residentPropGridEditor.renderCells.count, privacy: .public)"
+        )
         publishResidentPropGrid()
     }
 
@@ -3952,9 +4060,23 @@ final class AppDelegate:
         // 静默挡下（2026-09-28 修的缺陷）。
         //
         // **只在状态变化时推**：本函数每次鼠标移动都会被调用，而一次快照要归并 3,000+ 格。
-        if publishedResidentPropSupportPhase != residentPropSupportPhase {
-            publishedResidentPropSupportPhase = residentPropSupportPhase
-            synchronizeResidentPropPresentation()
+        //
+        // **只有真的推成功才记住这个相位**：世界刚切换、窗口还没建好时
+        // `synchronizeResidentPropPresentation()` 会拒绝推送；如果把"相位"记成已推，之后
+        // 相位不再变化，面板就永远收不到那一份 —— 于是格子其实早就好了，面板却一直说
+        // "还在生成"，关掉再打开也一样（第二个机制，2026-09-28 真机）。推失败时保持
+        // 未记录，下一次本函数（鼠标一动就会来）会重试；守卫是 O(1)，不会因此变慢。
+        let phase = residentPropSupportPhase
+        if publishedResidentPropSupportPhase != phase {
+            let pushed = synchronizeResidentPropPresentation()
+            if pushed { publishedResidentPropSupportPhase = phase }
+            // 相位只报一次：推失败时本函数会被鼠标移动反复调到，不能把日志刷满。
+            if pushed || loggedResidentPropSupportPhase != phase {
+                loggedResidentPropSupportPhase = phase
+                livingWorldLogger.notice(
+                    "建造模式：承托几何相位 网格就绪=\(phase.isGridReady, privacy: .public) 派生在跑=\(phase.isDeriving, privacy: .public) 重推面板快照=\(pushed, privacy: .public)"
+                )
+            }
         }
 
         // 悬停命中格子后，把预览挪到**吸附后的格心**（含当前 footprint 朝向）。
@@ -4143,12 +4265,24 @@ final class AppDelegate:
         )
     }
 
+    /// 装修会话的开/关：**这里的两条守卫过去都是静默 return**，而它们决定的正是
+    /// "面板开着、却没有人会回答它的点击"。所以每一步都留一条 `.notice`：
+    /// 真机上只要看这两条日志，就能立刻区分"进没进装修"和"进不去是因为哪一条"。
     private func setResidentPropEditing(_ editing: Bool) {
         if editing {
+            livingWorldLogger.notice(
+                "装修：请求进入装修（当前世界=\(self.spatialStage.selectedWorldID ?? "nil", privacy: .public) 期望世界=\(self.livingWorldContext?.manifest.worldID ?? "nil", privacy: .public)）"
+            )
             guard residentPropEditingWorldID == nil, let context = livingWorldContext,
-                  spatialStage.selectedWorldID == context.manifest.worldID else { return }
+                  spatialStage.selectedWorldID == context.manifest.worldID else {
+                livingWorldLogger.notice(
+                    "装修：请求进入装修被守卫挡下（会话世界=\(self.residentPropEditingWorldID ?? "nil", privacy: .public) 生活空间上下文=\(self.livingWorldContext != nil, privacy: .public) 当前世界=\(self.spatialStage.selectedWorldID ?? "nil", privacy: .public) 期望世界=\(self.livingWorldContext?.manifest.worldID ?? "nil", privacy: .public)）"
+                )
+                return
+            }
             residentPropEditingWorldID = context.manifest.worldID
             residentPropEditingID = UUID()
+            livingWorldLogger.notice("装修：进入装修 world=\(context.manifest.worldID, privacy: .public)")
             residentPropEditingBackgroundEnabled = residentAgentLoop?.snapshot.backgroundEnabled ?? false
             residentPropEditingPreferenceEnabled = UserDefaults.standard.bool(forKey: "resident.autonomous.enabled.v1")
             temporarilyPauseResidentForPropEditing()
@@ -4161,12 +4295,19 @@ final class AppDelegate:
             activateResidentPropGrid(context: context)
             Task { @MainActor [weak self] in await self?.synchronizeOwnedResidentProps() }
         } else {
-            guard let worldID = residentPropEditingWorldID else { return }
+            guard let worldID = residentPropEditingWorldID else {
+                // 会话本来就不在：没有格子要收，也没有任务要停。仍然报一条，因为
+                // "退出时才发现会话从来没接上"正是真机上最难看出来的一种状态。
+                livingWorldLogger.notice("装修：退出装修，但会话本来就没接上（residentPropEditingWorldID 为 nil），无需清理。")
+                return
+            }
             residentPropEditingWorldID = nil
             residentPropEditingID = nil
             spatialStage.residentPropPreview = nil
-            residentPropGridDerivationRequested = false
+            // 令牌与网格必须一起失效：会话没了，就没有"还在生成"这回事了。
+            residentPropGridDerivation = nil
             residentPropGridEditor.deactivate()
+            livingWorldLogger.notice("装修：退出装修 world=\(worldID, privacy: .public)，格子已停用。")
             publishResidentPropGrid()
             guard spatialStage.selectedWorldID == worldID, livingWorldContext?.manifest.worldID == worldID else { return }
             if UserDefaults.standard.bool(forKey: "resident.autonomous.enabled.v1") == residentPropEditingPreferenceEnabled {

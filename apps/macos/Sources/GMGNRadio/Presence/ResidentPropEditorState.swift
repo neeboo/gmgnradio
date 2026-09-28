@@ -150,12 +150,35 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     /// 「派生中」的措辞与点击落地那条（`GMGNRadioApp.residentPropGridCommit`）**逐字一致**：
     /// 同一个用户处境（格子还没出来）在两处说同一句话，工具测试钉住这一点。
     var supportUnavailableNotice: String {
-        supportGeometryUnavailable ? "当前空间拿不到摆放几何，暂时不能摆放" : "格子还在生成，请稍候"
+        supportGeometryUnavailable ? Self.supportUnavailableText : Self.supportDerivingText
     }
+
+    /// 「格子还在生成」——**只在真的有一次派生在跑的时候**才允许说。
+    ///
+    /// 它为什么必须是一个常量而不是散落的字面量：真机 2026-09-28，格子其实早就好了，
+    /// 这句话却一直挂着，用户以为永远好不了。现在它与宿主的"派生令牌"一一对应。
+    static let supportDerivingText = "格子还在生成，请稍候"
+    /// 「拿不到摆放几何」——**不会好了**（没派生在跑、或者派生完了但一无所获）。
+    static let supportUnavailableText = "当前空间拿不到摆放几何，暂时不能摆放"
 }
 
 /// Drafts never change the world. Both validation and saving go through the host's placement service.
 @MainActor final class ResidentPropEditorState: ObservableObject {
+    /// 宿主**答不出**现状（装修会话已经不在）时的那句话。
+    ///
+    /// 为什么必须是**第三句**：`refreshSnapshot` 返回 nil 与"返回一份承托面为空的现状"是
+    /// 两件互斥的事实 —— 前者是"这次点击没有人会来救"，后者是"宿主说现在确实没有承托面"。
+    /// 把 nil 当成"没有新信息"而沿用手里那份陈旧快照，就等于替宿主撒谎：真机上那句
+    /// 「格子还在生成，请稍候」正是这么来的（它其实永远不会好，因为会话已经不在）。
+    static let supportSessionUnavailableText = "这次点击没有拿到摆放几何的当前状态：请收起摆放面板后重新打开"
+    /// 承托面到了之后，替换掉上面那两句过期提示的那一句。
+    static let supportReadyText = "格子已就绪，可以摆放了"
+    /// 需要随事实刷新/替换的承托面提示（业务提示不在此列，绝不覆盖）。
+    static let supportNotices: Set<String> = [
+        ResidentPropEditorSnapshot.supportDerivingText,
+        ResidentPropEditorSnapshot.supportUnavailableText,
+        supportSessionUnavailableText,
+    ]
     @Published private(set) var snapshot = ResidentPropEditorSnapshot.empty
     @Published private(set) var isOpen = false
     @Published private(set) var selectedID: String?
@@ -218,6 +241,13 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
             notice = "房间摆放已有变化，请重新选择位置"
             candidate = nil; onPreviewChanged(nil)
         }
+        // 「提示必须与事实一致」也包括**事实变了但提示没刷新**：承托面到了以后，
+        // 面板上还挂着"格子还在生成 / 拿不到摆放几何"就是在说一句过期的话 ——
+        // 用户会以为永远好不了（真机 2026-09-28 的截图正是这句话挂在已经就绪的格子上）。
+        // 只改写这三句承托面提示，业务提示（预览失败、保存结果…）一个字都不动。
+        if !value.surfaces.isEmpty, Self.supportNotices.contains(notice) {
+            notice = Self.supportReadyText
+        }
         snapshot = value
     }
     func open() { guard !snapshot.worldID.isEmpty, !isOpen else { return }; isOpen = true; onEditingChanged(true) }
@@ -242,16 +272,24 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     /// 现状要一份（`refreshSnapshot`）再判 —— 否则"格子已经画出来了、点一行却毫无反应"。
     func select(objectID: String) async {
         guard isOpen, !isSaving else { return }
-        if let refreshed = refreshSnapshot?() { update(refreshed) }
+        // 宿主答出来的那份是**唯一的现状**；`nil` 表示它答不出来（装修会话不在/世界换了）。
+        // 这两件事在后面必须分开处理，所以这里留住"有没有答"这个事实本身。
+        let refreshed = refreshSnapshot?()
+        if let refreshed { update(refreshed) }
         guard isOpen else { return }
         // 行是从 `objects`（`snapshot.objects` 的过滤结果）画出来的，所以找不到只可能是
         // 快照刚好换了一版（例如世界被换掉）。那不是用户的动作失败，静默即可。
         guard let object = snapshot.objects.first(where: { $0.generatedProp?.objectID == objectID }) else { return }
         // 「必须有承托面」是**前置检查**，不是形式：`support` 同时给出初始落点 ——
         // `surfaceID` 与"未摆出物件的出生位置"（见下面的 `validate`）。拿不到就进不了携带态。
-        // 但**绝不静默**：用户点了那一行，必须看得见为什么还没反应。
+        // 但**绝不静默**，而且**绝不说谎**：用户点了那一行，必须看得见为什么还没反应。
+        //
+        // 两句提示的判据是不同的：
+        // - 宿主答了现状（`refreshed != nil`）⇒ 用快照自己的说法：真的在生成 / 永远拿不到；
+        // - 宿主答不出来（`refreshed == nil`）⇒ 不能说"还在生成"。没人会来救这次点击，
+        //   说"请稍候"就是撒谎（真机 2026-09-28：格子早就好了，这句话却一直挂着）。
         guard let support = support(for: object) else {
-            notice = snapshot.supportUnavailableNotice
+            notice = refreshed == nil ? Self.supportSessionUnavailableText : snapshot.supportUnavailableNotice
             return
         }
         selectedID = objectID; draftRevision = snapshot.revision; requestID = UUID().uuidString

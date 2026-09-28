@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import os
 import simd
 import WorldRuntime
 
@@ -14,6 +15,12 @@ import WorldRuntime
 /// 物件包进碰撞世界，网格几何不变）。所以按调用方给的 `key`（例如 worldID）派生一次即可，
 /// 每次放置都重建是浪费：真实生活舱一次派生在 -O 下约 0.5 s。
 @MainActor final class ResidentPropGridEditorModel: ObservableObject {
+    /// 派生这条链的常驻诊断（与宿主同一个 subsystem/category，`log show` 一条命令就能读全）。
+    ///
+    /// 为什么要它：真机 2026-09-28 的"面板永远说格子还在生成"之所以查了很久，是因为这条
+    /// 链**每一步都是静默的** —— 缓存命中、算完被丢弃、派生出空网格，全都不留痕迹。
+    /// 日志是 `.notice` 级：不带 `--info` 也能看到。
+    static let log = Logger(subsystem: ProductIdentity.bundleIdentifier, category: "LivingWorld")
     /// 建造模式是否开启。关闭时渲染层不该画格子，拾取也不该命中。
     @Published private(set) var isBuildModeActive = false
     @Published private(set) var grid: PropSupportGrid?
@@ -78,10 +85,13 @@ import WorldRuntime
         isBuildModeActive = true
         if gridKey == key, let grid {
             // 已有同一份几何的网格：只把缓存重新指向它，不重新派生。
+            Self.log.notice("格子派生：命中缓存 key=\(key, privacy: .public) 层=\(grid.layers.count, privacy: .public)")
             rebuildCaches(from: grid)
             onGridChanged?()
             return
         }
+        Self.log.notice("格子派生：开始 key=\(key, privacy: .public)")
+        let startedAt = ContinuousClock.now
         // 派生是**纯计算**，且真实舱体一次要 0.5 s（-O）/ 6.6 s（-Onone）。
         // 同步做会把打开装修编辑器的那一帧卡住，所以放后台；`PropSupportGrid` 是 Sendable。
         let built = await Task.detached(priority: .userInitiated) {
@@ -92,17 +102,28 @@ import WorldRuntime
                 parameters: parameters
             )
         }.value
+        let elapsed = startedAt.duration(to: .now)
         // 派生期间编辑器可能已经被关掉：那就别把结果写回来。
-        guard isBuildModeActive, gridKey != key else { return }
+        guard isBuildModeActive, gridKey != key else {
+            // 这条过去是完全静默的：一次算完的派生被丢掉，外面却还留着"请求过"的印记。
+            // 真机排查必须能一眼看出是**哪一半**把它丢掉的。
+            Self.log.notice("格子派生：结果被丢弃（建造模式开着=\(self.isBuildModeActive, privacy: .public) 缓存键相同=\(self.gridKey == key, privacy: .public)）key=\(key, privacy: .public)")
+            return
+        }
         grid = built
         report = built.report
         gridKey = key
         rebuildCaches(from: built)
         clearHover()
+        let report = built.report
+        Self.log.notice(
+            "格子派生：完成 key=\(key, privacy: .public) 耗时=\(elapsed.description, privacy: .public) 层=\(built.layers.count, privacy: .public) 列=\(self.cells.count, privacy: .public) 种上=\(report.seeded, privacy: .public) 过滤前=\(report.layersBeforeFilter, privacy: .public)"
+        )
         onGridChanged?()
     }
 
     func deactivate() {
+        Self.log.notice("格子派生：停用（此前缓存键=\(self.gridKey ?? "nil", privacy: .public)）")
         isBuildModeActive = false
         onGridChanged?()
         grid = nil
