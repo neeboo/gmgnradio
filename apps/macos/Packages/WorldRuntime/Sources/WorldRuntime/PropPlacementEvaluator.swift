@@ -154,7 +154,7 @@ extension PropSupportBlockReason: LocalizedError {
 public enum PropPlacementEvaluator {
     /// 同一个 footprint 覆盖的各列，承托高度允许的最大差值（米）。
     /// 超过它说明这块地不平（例如一半在桌面、一半在地面），物件会悬空或陷进去。
-    public static let maximumSupportHeightDeviation: Float = 0.02
+    public static let maximumSupportHeightDeviation: Float = 0.05
 
     /// 局部三角形范围查询的外扩余量（米）：`canPlace` 自己会做精确的 AABB 与 SAT 判定，
     /// 这里只保证"包围盒刚好相切"的三角形不会被漏掉。

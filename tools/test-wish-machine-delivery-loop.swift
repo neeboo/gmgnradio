@@ -416,11 +416,13 @@ final class RecordedService: URLProtocol {
             (try? service.preview(objectID: job.objectID, placement: $0)) != nil
         }.count
         print("[delivery] 90° 旋转：\(acceptingRotation)/\(rotationCandidates.count) 个落点通过摆放校验")
-        check(reportKnownGap(acceptingRotation == 0,
-            "真实舱体地面上多格物件的 90° 旋转被摆放校验全部拒绝（实测 0/\(rotationCandidates.count)）；"
-            + "根因是净空判定对承托面只有 0.0001 m 的贴地容差，而地面本身起伏超过它；"
-            + "修法是给\"贴地\"一个显式容差（产品取舍），见 docs/plans/2026-09-27-p2-decoration-design.md §13。"),
-            "已知缺口已被修复，请把它提升为正式断言")
+        // 这条曾经是 KNOWN 缺口：贴地容差 0.0001 m 时，真实舱体地面上 90° 旋转
+        // **0/2885** 个落点全部被拒。改成 2 cm 贴地容差 + 5 cm 占地高度差后它被修好，
+        // 于是按 KNOWN 的约定提升为正式断言（不再允许"已知还坏着"）。
+        // 依据：docs/plans/2026-09-27-p2-decoration-design.md §13。
+        check(acceptingRotation > 0,
+            "真实舱体地面上多格物件的 90° 旋转至少有一个落点能通过摆放校验（避免退回 0/\(rotationCandidates.count)）")
+        print("[delivery] 90° 旋转可放落点：\(acceptingRotation)/\(rotationCandidates.count)")
         try context.commitPropLayout(.place(objectID: job.objectID, placement: rotated),
             expectedLayoutRevision: context.state.layoutRevision, requestID: "rotate-claimed") { _ in }
         let restored = try WorldAgentContext(manifest: manifest, persistence: persistence)

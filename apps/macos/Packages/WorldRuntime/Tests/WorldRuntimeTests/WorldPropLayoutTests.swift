@@ -9,13 +9,25 @@ private func layoutSimulation() -> WorldSimulation {
 }
 private let coffee = WorldGeneratedProp(objectID: "wish.object.1", sourceWishID: "wish1", assetID: "asset1", displayName: "咖啡机", size: .init(x: 0.3,y: 0.42,z: 0.4), sourceHeight: 2)
 
-@Test func generatedLayoutRejectsLowMeshCornerWhichCapsuleMisses() {
+/// 原意：**物件判定比角色胶囊更严** —— 胶囊能过去的低矮几何，仍可能挡住物件。
+///
+/// 2026-09-28 按 §13 的实测重新推导：真实舱体的地面是生成出来的起伏网格，
+/// `restingTolerance`（2 cm）内的三角形视为与承托面接触，**不算**插进物件 ——
+/// 否则 0.35×0.57 m 的物件只有 2.6% 的格子能放。但**超过**容差的凸起仍必须挡住，
+/// 这条原意不能被容差吃掉，所以下面把两侧边界都钉住。
+@Test func generatedLayoutSeparatesRestingReliefFromRealObstruction() {
     let box=WorldCollisionVolume(id:"box",center:.init(x:0,y:0.21,z:0),halfExtents:.init(x:0.2,y:0.21,z:0.2),rotation:.init(x:0,y:0,z:0,w:1),isBlocking:true)
+    // 起伏 1–2 cm：落在 2 cm 贴地容差内 → 视为贴地，可放。
     let bump=WorldTriangle(SIMD3(0.19,0.01,-0.01),SIMD3(0.19,0.02,-0.01),SIMD3(0.19,0.02,0.01))
     let mesh=TriangleMeshCollisionWorld(triangles:[bump])
     let radius:Float=sqrt(0.08)
     #expect(mesh.canOccupy(.init(radius:radius,height:0.42+radius*2),at:.zero))
-    #expect(!WorldPropMeshClearance.canPlace(box,supportHeight:0,triangles:[bump]))
+    #expect(WorldPropMeshClearance.canPlace(box,supportHeight:0,triangles:[bump]),
+            "承托面自身的起伏（≤ restingTolerance）不算插进物件")
+    // 同一位置抬高到 4 cm：超出容差 → 真的是障碍，必须挡住。
+    let corner=WorldTriangle(SIMD3(0.19,0.01,-0.01),SIMD3(0.19,0.04,-0.01),SIMD3(0.19,0.04,0.01))
+    #expect(!WorldPropMeshClearance.canPlace(box,supportHeight:0,triangles:[corner]),
+            "超过 restingTolerance 的凸起仍然必须挡住")
     let floor=WorldTriangle(SIMD3(-2,0,-2),SIMD3(2,0,-2),SIMD3(0,0,2))
     #expect(WorldPropMeshClearance.canPlace(box,supportHeight:0,triangles:[floor]))
     let crossing=WorldTriangle(SIMD3(0.1,-1,0),SIMD3(0.1,1,0),SIMD3(0.1,0.1,0.1))

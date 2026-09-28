@@ -173,7 +173,7 @@ public enum WorldPropMeshClearance {
     /// **产品取舍**：放得越宽，物件越可能肉眼可见地陷进地面。所以这里把它做成显式
     /// 参数（默认仍是原来的 0.1 毫米），让"如果放宽到 N 毫米会怎样"可以被实测，
     /// 而不是靠猜。
-    public static let restingTolerance: Float = 0.0001
+    public static let restingTolerance: Float = 0.02
 
     public static func canPlace(_ box: WorldCollisionVolume, supportHeight: Float,
                                 triangles: [WorldTriangle],

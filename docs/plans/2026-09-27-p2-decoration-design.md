@@ -598,11 +598,21 @@ footprint 外面都会出现一圈列：**格子压在家具上、但列角点�
 
 不建议超过 3 cm：再放宽收益很小，而"悬空/陷入"会开始刺眼。
 
-### 现状
+### 现状：**已按"推荐"档落地**（2026-09-28）
 
-默认值**未改**（仍是 0.1 mm / 2 cm），所以你测到的就是上表第一行。改哪一行只是改一处
-默认值；`test-wish-machine-delivery-loop.swift` 里记的那条 KNOWN 缺口会在修好后主动失败，
-提醒把它提升为正式断言。
+`restingTolerance = 0.02`、`maximumSupportHeightDeviation = 0.05` 已写进生产默认值
+（`WorldPropLayout.swift` / `PropPlacementEvaluator.swift`），即上表的 **55.9%** 那一行。
+回退就是把这两个常量改回去，一行的事。
+
+连带变化：
+
+- `test-wish-machine-delivery-loop.swift` 里那条 KNOWN 缺口（90° 旋转 **0/2885**）**按设计
+  主动失败**提醒提升 —— 已提升为正式断言，现在实测 **19/2885** 通过 ✓。
+- `WorldPropLayoutTests` 里那个编码了旧决定的用例（低矮凸起必须挡住）已按新决定重推：
+  ≤ 容差的起伏算贴地、**超过容差的仍必须挡住**，两侧边界都钉住，原意（物件判定比角色
+  胶囊更严）没有被容差吃掉。
+- 想改档位（1 cm 保守 / 3 cm 宽松）只需改这两个常量，然后跑
+  `swift test --package-path apps/macos/Packages/WorldRuntime` 看是否有断言要跟着重推。
 
 ## 11. 已知失效验证资产（与 P2 无关，勿误判为回归）
 
