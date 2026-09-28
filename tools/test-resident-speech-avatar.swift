@@ -38,7 +38,24 @@ import Observation
 struct WorldTransform: Equatable, Sendable { var value = 0 }
 struct LifeActivity: Equatable, Sendable { var id = "walk" }
 struct LifeActivityPhase: Equatable, Sendable { var id = "loop" }
-struct StageAvatarMotionPlayback: Equatable, Sendable { var id = "walk-motion" }
+  /// 生产里 `StageAvatarMotionPlayback` 是 **enum**（`VisualEngine/StageAvatarMotionPlayback.swift`），
+  /// 不是 struct —— 之前用 struct 顶替，生产代码里的 `.temporary(...)` 就找不到了。
+  /// 本 harness 只用到「类型本身 + `.temporary` 载荷 + 两个只读属性」，所以按最小面重建；
+  /// 它的 `resolve(...)` 会拖进 PhaseContract / approvedMotions，不在本 harness 覆盖范围内。
+  enum StageAvatarMotionPlayback: Equatable, Sendable {
+      case temporary(StageMotionAsset)
+      case naturalIdle(fallback: StageAvatarMotionFallback?)
+      var fallback: StageAvatarMotionFallback? {
+          guard case let .naturalIdle(fallback) = self else { return nil }
+          return fallback
+      }
+      var isNaturalIdleFallback: Bool { fallback != nil }
+  }
+  struct StageAvatarMotionFallback: Equatable, Sendable {
+      var activityTypeID = "walk"
+      var phase = LifeActivityPhase()
+      var requestedMotionIDs: [String] = []
+  }
 struct PresencePackageStore {
     static func liveStore() throws -> Self { Self() }
     func activeAvatar() throws -> StageAvatarAsset? { nil }
@@ -60,6 +77,9 @@ struct CameraHome { static let defaultHome = Self() }
 struct Camera { mutating func reset(to: CameraHome) {} }
 @MainActor final class Spatial {
     final class Ownership { func invalidate() {} }
+    /// 生产里这个方法是 SpatialStageStore 自己的（转场/选世界时取消跟随旋转）。
+    /// harness 只抽取了调用它的那批方法，所以这里给一个空实现。
+    func cancelAvatarFollowRotation() {}
     let residentPropRenderOwnership = Ownership()
     func clearResidentPropRendererHooks() {}
     var residentPropPreview: Int?
@@ -78,7 +98,28 @@ struct Camera { mutating func reset(to: CameraHome) {} }
     func installBaseAvatarPlacement(_ placement: Placement) {}
     \#(worldSelection)
 }
+/// 生产里是 StageWindowController / LiveCamWindowController；本 harness 的主题是**语音状态
+/// 与头像播放**，所以只补被抽取片段真正用到的那几个成员，不假装覆盖窗口行为。
+@MainActor final class StageWindowController {
+    var isPresented = false
+    func clearResidentTransientStatus() {}
+    func setResidentDeliveryNotice(_ text: String?) {}
+}
+@MainActor final class LiveCamWindowController {
+    func clearTransientStatus() {}
+    func setResidentDeliveryNotice(_ text: String?) {}
+}
+/// 生产里在 ResidentAgentLoop.swift；harness 只需要它可被 reset。
+struct ResidentUnconfirmedNoticePolicy { func reset() {} }
+
 @MainActor final class App {
+    var stageWindowController: StageWindowController? = StageWindowController()
+    var liveCamWindowController: LiveCamWindowController? = LiveCamWindowController()
+    var residentUnconfirmedNotice = ResidentUnconfirmedNoticePolicy()
+    /// 生产里是 GMGNRadioApp 自己的：把转写切到新 scope 再推给两个展示层。
+    /// 本 harness 的主题是**语音状态与头像播放**，不是转写切换，所以只补一个等价签名；
+    /// harness 不对它做任何行为断言（真要测转写应另开 harness）。
+    func resetResidentTranscriptForContextSwitch() {}
     func safelyReturnHeldProp(reason: String) {}
     var residentWishImages: [String: String] = [:]
     final class AudioGraph { func setResidentSpeechPlaying(_ playing: Bool) {} }
@@ -113,7 +154,7 @@ struct Camera { mutating func reset(to: CameraHome) {} }
     @MainActor static func main() {
         let runtime = StageAvatarRuntimeStore(packageStore: nil, motionPackageStore: nil)
         let app = App(runtime)
-        let worldActivity = StageAvatarWorldActivitySnapshot(transform: WorldTransform(), activity: LifeActivity(), phase: LifeActivityPhase(), motionPlayback: StageAvatarMotionPlayback(), sourceRevision: 9)
+        let worldActivity = StageAvatarWorldActivitySnapshot(transform: WorldTransform(), activity: LifeActivity(), phase: LifeActivityPhase(), motionPlayback: StageAvatarMotionPlayback.naturalIdle(fallback: nil), sourceRevision: 9)
         runtime.installWorldActivity(worldActivity)
         runtime.setActivity(.listening)
         runtime.setVoiceLevel(0.3)
