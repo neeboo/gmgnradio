@@ -56,6 +56,55 @@ private let machine = WorldGeneratedProp(
     displayName: "E2E-0907 咖啡机",
     size: WorldVector3(x: 0.2915, y: 0.35, z: 0.47193), sourceHeight: 2)
 
+/// 合成承托几何：一张水平承托层（旧具名摆放面 `resident.display_table` 的等价物）。
+///
+/// 「具名摆放面」（`ResidentPropSupportSurface`）已从生产代码删除，摆放校验现在是
+/// 「格子 + footprint」：物件必须坐在某一层格子上，整块占地由 `PropPlacementEvaluator`
+/// 判定。能力绑定会走 `ResidentPropPlacementService.commit` → `validate`，而 `validate`
+/// 对**每一个已摆放物件**都要求承托几何；拿不到就 fail-closed 报 `environmentNotReady`。
+/// 所以这里按原来的 `resident.display_table`（中心 (2, 0.52, 2)、半长 0.5×0.5、yaw 0）
+/// 派生一张等价的承托网格交给 `support:`，而不是把断言放宽成空壳。
+struct FlatSupport: WorldPropSupportQuerying {
+    let minimumX: Float
+    let maximumX: Float
+    let minimumZ: Float
+    let maximumZ: Float
+    let height: Float
+
+    func canOccupy(_ capsule: WorldCapsule, at position: SIMD3<Float>) -> Bool { true }
+
+    /// 遵守 `groundHeight` 的 y 受限契约：只报不高于查询点的承托面，列扫描才会收敛。
+    func groundHeight(at position: SIMD3<Float>) -> Float? {
+        guard position.x >= minimumX, position.x <= maximumX,
+              position.z >= minimumZ, position.z <= maximumZ else { return nil }
+        return height <= position.y + 0.05 ? height : nil
+    }
+
+    func canTraverse(_ capsule: WorldCapsule, from start: SIMD3<Float>,
+                     to destination: SIMD3<Float>, maximumStepHeight: Float) -> Bool { true }
+
+    func triangles(in bounds: WorldPlanarBounds) -> [WorldTriangle] {
+        guard bounds.maximumX >= minimumX, bounds.minimumX <= maximumX,
+              bounds.maximumZ >= minimumZ, bounds.minimumZ <= maximumZ else { return [] }
+        let a = SIMD3<Float>(minimumX, height, minimumZ), b = SIMD3<Float>(maximumX, height, minimumZ)
+        let c = SIMD3<Float>(maximumX, height, maximumZ), d = SIMD3<Float>(minimumX, height, maximumZ)
+        return [WorldTriangle(a, b, c), WorldTriangle(a, c, d)]
+    }
+}
+
+/// 与旧面 `resident.display_table` 同范围同高度：中心 (2, 0.52, 2)、半长 (0.5, 0, 0.5)。
+let displayTableWorld = FlatSupport(minimumX: 1, maximumX: 3, minimumZ: 1, maximumZ: 3, height: 0.52)
+
+@MainActor
+func displayTableSupport() -> ResidentPropPlacementSupport {
+    let bounds = WorldPlanarBounds(minimumX: displayTableWorld.minimumX, maximumX: displayTableWorld.maximumX,
+                                   minimumZ: displayTableWorld.minimumZ, maximumZ: displayTableWorld.maximumZ)
+    let grid = PropSupportGridBuilder.build(collision: displayTableWorld, bounds: bounds,
+                                            seed: WorldVector3(x: 2, y: 0.52, z: 2),
+                                            parameters: PropSupportGridParameters())
+    return ResidentPropPlacementSupport(grid: grid, collision: displayTableWorld)
+}
+
 @MainActor
 private func makeManifest(coffeeNearZ: Float = 2.8) -> WorldManifest {
     let identity = WorldQuaternion(x: 0, y: 0, z: 0, w: 1)
@@ -121,6 +170,18 @@ private func bindPlacedMachine(in context: WorldAgentContext,
     }
 }
 
+/// 人轮工具桥上的能力绑定调用。`support` 是唯一变量：传 nil 就是生产代码的
+/// fail-closed 默认（`ResidentPropPlacementService(context:)`），传承托几何才是可摆放的环境。
+@MainActor
+private func enableCapability(in context: WorldAgentContext,
+                              support: ResidentPropPlacementSupport?,
+                              arguments: Data,
+                              callID: String) async -> RealtimeDJToolResult {
+    let service = ResidentPropPlacementService(context: context, support: { support })
+    let bridge = ResidentPropToolBridge(service: service, allowsMutation: true, isCurrent: { true })
+    return await bridge.tools.first { $0.name == "enable_prop_capability" }!.handle(callID, arguments)
+}
+
 @MainActor
 private func usage(_ context: WorldAgentContext) -> WorldPropUsageState? {
     context.state.objectStates[coffeeObjectID]?.propUsage
@@ -146,24 +207,64 @@ func usageStatus(_ result: RealtimeDJToolResult) -> String? {
     @MainActor static func main() async throws {
         // 1. Binding requires a human round; the bound readback is exact.
         do {
-            let context = try makeContext()
-            try bindPlacedMachine(in: context)
-            // 这条 harness 只走能力绑定的路径：所有摆放都用 `context.commitPropLayout`
-            // 并带 `{ _ in }` 校验闭包（绕过服务），所以不需要承托几何。
-            // 摆放校验现在是「格子 + footprint」，默认的 `support: { nil }` 表示
-            // "拿不到几何就拒绝摆放"（fail-closed），这里不会被触发。
-            let service = ResidentPropPlacementService(context: context)
             let arguments = try JSONSerialization.data(withJSONObject: [
                 "object_id": coffeeObjectID, "capability": "coffee.brew", "layout_revision": 2])
+
+            // 1a. 没有承托几何时，能力绑定必须**当场**明确失败并报出可读原因；既不能"看着
+            //     接受"，更不能把失败留到以后以 `unknownActivity` 的面目炸掉。这正是本
+            //     harness 踩过的历史漂移：服务构造时漏了承托几何，绑定悄悄失败，直到
+            //     `startActivity` 才暴露。探针与 1b 走**完全相同**的调用路径，只有 support 不同。
+            let unbacked = try makeContext()
+            try bindPlacedMachine(in: unbacked)
+            let refused = await enableCapability(in: unbacked, support: nil,
+                arguments: arguments, callID: "bind-without-support")
+            check(refused.isError,
+                "without support geometry the capability binding reports failure instead of success")
+            check(payload(refused)["code"] as? String == "placement_rejected",
+                "the missing support geometry is an explicit binding rejection")
+            check(payload(refused)["message"] as? String
+                    == ResidentPropPlacementError.environmentNotReady.localizedDescription,
+                "the rejection message names the missing support geometry, got: \(payload(refused)["message"] ?? "nil")")
+            check(unbacked.state.objectStates[coffeeObjectID]?.propCapability == nil,
+                "a refused binding leaves no half-bound capability behind")
+            check(!unbacked.snapshot.activities.contains { $0.id == coffeeActivityID },
+                "the refusal happens at the binding call, before the activity could become discoverable")
+            check(unbacked.state.layoutRevision == 2,
+                "a refused binding consumes no layout revision")
+            // 这条失败之所以必须当场说清：没有绑定就没有可发现的 activity，任何后续
+            // `startActivity` 只可能是 `unknownActivity`（旧症状的表象）。把两者钉在一起，
+            // 保证"沉默的后置崩溃"不会再被误读成绑定成功。
+            var deferred: WorldAgentContextError?
+            do { try unbacked.startActivity(id: coffeeActivityID) }
+            catch let error as WorldAgentContextError { deferred = error }
+            check(deferred == .unknownActivity(coffeeActivityID),
+                "an unbound capability only ever surfaces later as unknownActivity")
+
+            // 1b. 配上与旧具名面 `resident.display_table` 等价的承托几何后，绑定照旧成立。
+            let context = try makeContext()
+            try bindPlacedMachine(in: context)
+            // 这条 harness 的摆放全部走 `context.commitPropLayout` + `{ _ in }` 校验闭包
+            // （绕过服务）；但**能力绑定**走 `ResidentPropPlacementService.commit`，它会对
+            // 已摆放物件跑完整的承托校验，所以这里必须提供承托网格，不能再用默认的 nil。
+            let support = displayTableSupport()
+            let service = ResidentPropPlacementService(context: context, support: { support })
             let background = ResidentPropToolBridge(service: service, allowsMutation: false, isCurrent: { true })
             let backgroundTool = background.tools.first { $0.name == "enable_prop_capability" }!
             let denied = await backgroundTool.handle("bind-denied", arguments)
             check(denied.isError && payload(denied)["code"] as? String == "human_guidance_required",
                 "background round cannot enable a capability")
             let bound = ResidentPropToolBridge(service: service, allowsMutation: true, isCurrent: { true })
-            let bind = await bound.tools.first { $0.name == "enable_prop_capability" }!.handle("bind-1", arguments)
+            let bind = await enableCapability(in: context, support: support,
+                arguments: arguments, callID: "bind-1")
             check(!bind.isError && payload(bind)["interaction_status"] as? String == "capability_bound_use_only",
                 "human round binds coffee.brew and reports capability_bound_use_only")
+            // 绑定失败时立刻带着工具给出的可读原因退出，绝不退化成后面那条 `unknownActivity`：
+            // 历史漂移的症状正是在这里炸掉的（见 1a 的断言）。
+            guard !bind.isError else {
+                print("FAIL: human round could not bind coffee.brew: code=\(payload(bind)["code"] ?? "nil")"
+                    + " message=\(payload(bind)["message"] ?? "nil")")
+                exit(1)
+            }
             let read = await bound.tools.first { $0.name == "read_owned_props" }!.handle(
                 "read-1", Data("{}".utf8))
             check(!read.isError, "read_owned_props succeeds")
