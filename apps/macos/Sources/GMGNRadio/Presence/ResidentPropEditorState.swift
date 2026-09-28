@@ -57,6 +57,13 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     }
     var selectedObject: WorldObjectState? { snapshot.objects.first { $0.generatedProp?.objectID == selectedID } }
     var isSelectedHeld: Bool { selectedID != nil && snapshot.heldProp?.objectID == selectedID }
+    /// 「鼠标把物件拿在手上」——**派生**，不新增存储状态。
+    ///
+    /// 这样 confirm / cancelPreview / save 这些既有清理路径会自动把它清掉，不存在
+    /// "忘了复位"的失效 bug。与「居民把物件拿在手里」（`isSelectedHeld` / `holdSelected()`
+    /// 的 `WorldPropLayoutCommand.hold`，会持久化、绑居民右手、要求 2B 角色、最长边 >0.45 m
+    /// 拒绝）是**两件不同的事**，命名上不要混：「在手」=鼠标携带，「手持/拿着看/放回」=居民携带。
+    var isCarrying: Bool { isOpen && placement != nil && !isSelectedHeld }
     var selectedGrip: WorldPropGripCalibration? { isSelectedHeld ? selectedObject?.gripCalibration : nil }
     var selectedHoldUnavailableReason: String? { selectedID.flatMap { snapshot.holdUnavailableReasons[$0] } }
     var surface: ResidentPropEditorSurface? { snapshot.surfaces.first { $0.id == placement?.surfaceID } }

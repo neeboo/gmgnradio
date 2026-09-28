@@ -1330,7 +1330,7 @@ private final class StageWorldInteractionView: NSView {
     }
 
     private var consumesPropPointer: Bool {
-        ResidentPropEditorState.consumesScenePointer(isOpen: propEditor.isOpen, moving: propEditor.isMoving,
+        ResidentPropEditorState.consumesScenePointer(isOpen: propEditor.isOpen, moving: propEditor.isCarrying || propEditor.isMoving,
                                                      inputOwnsFocus: window?.firstResponder is NSTextView)
     }
 
