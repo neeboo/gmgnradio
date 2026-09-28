@@ -627,8 +627,8 @@ footprint 外面都会出现一圈列：**格子压在家具上、但列角点�
 | `test-stage-resident-chat.swift` | ✅ **已修**（74 项通过）：本轮新增的生产成员同步进了它的本地 stub；一条断言是过期的（生产只有 `showResidentChat()` 会展开输入框），已改钉新行为 |
 | `test-wish-machine-delivery-loop.swift` | ✅ **已修**（PASS，含 1 条 KNOWN）：迁移到格子口径，落点从派生层取；旋转检查改走持久化路径，并把 §13 的产品缺口记为已知项（缺口修好时它会主动失败） |
 | `test-resident-speech-avatar.swift` | ❌ 仍未修：**stub 漂移**。生产的 `StageAvatarMotionPlayback` 是 enum，harness 里是本地 struct，于是抽出代码里的 `.temporary` 找不到。修它要按最小面重建那个 enum（并补 `StageMotionAsset` / `StageAvatarMotionFallback`），与 P2 无关 |
-| `test-wish-machine-app-runtime.swift` | ❌ 仍未修：**改名漂移**。`pushSystemInboxSnapshots` / `pushWishTaskPrompts` 在生产里已不存在，harness 仍调用 |
-| `test-resident-prop-placement.swift` | ❌ 仍未修：运行期 `unknownActivity("coffee.brew@<objectID>")`。它是 §13 的**下游**：落点落在居民站不到的位置 → 派生不出物件活动 |
+| `test-wish-machine-app-runtime.swift` | 🟡 **部分推进**：已补 `pushSystemInboxSnapshots` / `pushWishTaskPrompts` 两个呈现侧管道的桩（本 harness 断言的是持久域那一侧，这两条不在其覆盖内）。**仍缺**：`performResidentTurn` 的 `userMessage:` 签名已变、`registerResidentMemoryTurn` 等生产成员尚未进 App 桩 —— 它需要一次系统性追平，不是补一个名字就完 |
+| `test-resident-prop-placement.swift` | ❌ 仍未修：引用了**已被格子取代**的 `ResidentPropSupportSurface`（生产里已无此类型）。做法应比照 `test-wish-machine-delivery-loop.swift`：迁移到格子口径，落点从派生层取 |
 | `test-resident-prop-tools.swift` | ❌ 同上（同一类下游失败） |
 | `test-resident-prop-capability.swift` | ❌ 同上（契约变更前是 swift-frontend 崩溃，现在是运行期失败） |
 

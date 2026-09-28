@@ -233,6 +233,13 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
     func synchronizeOwnedResidentProps() async {}
     func wishMachinePromptContext(_ world: ResidentWorldContext) -> String { "" }
     func reconcileResidentWishPlacements(_ world: ResidentWorldContext) throws {}
+    /// 生产里这两条是**呈现侧管道**：把系统信箱未读数推给两个表面、把许愿任务提示
+    /// 按代次投递给统一状态域。本 harness 断言的是**持久域**那一侧（MessageStore 的
+    /// subscriptions / acknowledged 由被抽取的方法直接驱动），不覆盖这两条管道，
+    /// 所以只补签名可编译，不假装覆盖其行为。
+    var wishTaskPromptGeneration = 0
+    func pushSystemInboxSnapshots() {}
+    func pushWishTaskPrompts(_ tasks: [WishMachineTaskPresentation], worldID: String, scope: String) {}
     \#(methods)
     func refresh() async { await refreshWishMachine() }
     func settle() async {
