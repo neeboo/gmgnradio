@@ -182,7 +182,46 @@ func check(_ value: Bool, _ message: String) { if !value { print("FAIL:",message
   check(PropSupportGridPresentation.instances(cells:five,states:[:],cameraPosition:origin,spacing:0.25,options:budget)
         == PropSupportGridPresentation.instances(cells:five,states:[:],cameraPosition:origin,spacing:0.25,options:budget),
         "instance generation is deterministic")
-  print("PASS: prop scale/yaw, unique preview/cancel, shared identity, world isolation, support ray, multi-layer grid picking and grid presentation")
+  // ── 建造模式格子的焦点裁剪（The Sims：只画脚下一小块，不铺满地面）────────
+  // 20 m × 20 m 的一块地板：0.25 m 格距 = 80×80 = 6400 列，比真实房间的一整块地板还大。
+  var lawn:[PropSupportGridPresentation.Cell]=[]
+  for x in -40..<40 { for z in -40..<40 { lawn.append(gridCell(x,z,0,0)) } }
+  // 锚点 = 1×1 的 footprint（**空手**悬停时编辑器给的就是"一格"），着色表里只有它。
+  let anchorCell=gridCell(0,0,0,0)
+  let anchored=PropSupportGridPresentation.focusedInstances(
+      cells:lawn,states:[anchorCell:.validFootprint],cameraPosition:origin,spacing:0.25,options:grid)
+  let ring=Float(PropSupportGridPresentation.Focus.ringCount)
+  check(anchored.count==25,
+        "the focused patch is the footprint plus two rings, not the whole floor")
+  check(anchored.allSatisfy { abs($0.center.x-0.125) <= ring*0.25+0.0001
+        && abs($0.center.z-0.125) <= ring*0.25+0.0001 },
+        "no instance is generated for a column farther than the ring radius")
+  check(anchored.filter { $0.state == .validFootprint }.count==1
+        && anchored.filter { $0.state == .validFootprint }.allSatisfy { abs($0.alpha-1) < 0.00001 },
+        "the anchored footprint stays high contrast inside the patch")
+  check(anchored.filter { $0.state != .validFootprint }.allSatisfy {
+        abs($0.alpha-PropSupportGridPresentation.Focus.ringAlpha) < 0.00001 },
+        "the ring is drawn at the ring alpha, not at the footprint's contrast")
+  check(PropSupportGridPresentation.Focus.ringAlpha > 0
+        && PropSupportGridPresentation.Focus.ringAlpha < 0.5,
+        "the ring is a faint hint rather than a solid carpet")
+  // 改动前的那种"整片"由一个入口生成，这里量出它到底有多少格：量级对比是结构性的。
+  let unfocused=PropSupportGridPresentation.instances(
+      cells:lawn,states:[anchorCell:.validFootprint],cameraPosition:origin,spacing:0.25,options:grid).count
+  check(unfocused > anchored.count*20,
+        "focusing removes the floor-wide carpet (before/after differ by more than 20x)")
+  // 没有锚点（光标没落在任何承托层上，或还没进场景）→ 一个格子都不画，而不是恢复整片。
+  check(PropSupportGridPresentation.focusedInstances(
+        cells:lawn,states:[:],cameraPosition:origin,spacing:0.25,options:grid).isEmpty,
+        "with no anchor the grid draws nothing instead of flooding the floor")
+  // 焦点不跨层：锚点在地面时，旁边桌上的格子不该跟着浮出来。
+  var stacked=lawn
+  for y in 1...4 { stacked.append(gridCell(y,0,1,0.7)) }
+  check(PropSupportGridPresentation.focusedInstances(
+        cells:stacked,states:[anchorCell:.validFootprint],cameraPosition:origin,spacing:0.25,options:grid)
+        .allSatisfy { $0.center.y < 0.5 },
+        "a neighbouring layer's grid does not float into the focus patch")
+  print("PASS: prop scale/yaw, unique preview/cancel, shared identity, world isolation, support ray, multi-layer grid picking, grid presentation and the focus patch that replaces the floor-wide carpet")
  }
 }
 """#

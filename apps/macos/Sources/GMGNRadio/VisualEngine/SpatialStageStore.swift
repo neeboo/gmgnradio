@@ -705,11 +705,16 @@ final class SpatialStageStore {
         return (simd_inverse(residentPropViewProjection), residentPropGridSpacing)
     }
 
-    /// 本帧要画的格子实例。距离裁剪、淡出与预算都在 `PropSupportGridPresentation` 里，
-    /// 这里只做"没开建造模式就不画"的判断。
+    /// 本帧要画的格子实例。
+    ///
+    /// 走 `focusedInstances`：**只画当前 footprint（或空手时的光标格）周围一小块**
+    /// —— 本体按状态着色全对比，外扩两圈压到 `Focus.ringAlpha`，更远的格子在这里就
+    /// 不生成实例（The Sims 的做法）。没有锚点时不画，不再铺满整个地面。
+    /// 距离裁剪、淡出与预算仍然都在 `PropSupportGridPresentation` 里；这里只做
+    /// "没开建造模式就不画"的判断。
     func residentPropGridInstances(cameraPosition: SIMD3<Float>) -> [PropSupportGridPresentation.Instance] {
         guard isResidentPropBuildModeActive, !residentPropGridCells.isEmpty else { return [] }
-        return PropSupportGridPresentation.instances(
+        return PropSupportGridPresentation.focusedInstances(
             cells: residentPropGridCells,
             states: residentPropGridStates,
             cameraPosition: cameraPosition,

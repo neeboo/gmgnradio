@@ -11,6 +11,78 @@ import simd
 /// 与 `PropSupportGridPicker` 同一套约定：格子 `(columnX, columnZ)` 覆盖
 /// `[x*s, (x+1)*s] × [z*s, (z+1)*s]`，列坐标是**最小角**。
 enum PropSupportGridPresentation {
+    /// 建造模式格子的**焦点裁剪**：只画锚定 footprint 本体 + 外扩的几圈。
+    ///
+    /// The Sims 的格子是**局部辅助线**，不是铺满地面的地毯。漫过整个地板的实心格子
+    /// 既盖住了地面材质，也把唯一重要的信息（这块能不能放）淹没了。所以：
+    ///
+    ///   - footprint 本体（`states` 里已被 `PropSupportGridMapping.footprintStates`
+    ///     标记过的那批格子）按 `CellState.tint` 全对比绘制；
+    ///   - 本体外扩 `ringCount` 圈压到 `ringAlpha`，作为"邻近可延伸区域"的提示；
+    ///   - **再远的格子一个实例都不生成** —— 过滤落在生成这一步，渲染器不必每帧
+    ///     去丢弃几千个格子。
+    ///
+    /// **锚点只有一处来源：`states` 的键。** 不需要新的状态源，因为：
+    ///   - 携带物件时，`footprintStates` 已经把 footprint 覆盖的列写进 `states`；
+    ///   - **没携带物件时**，编辑器仍然按"一格"的 footprint 做悬停判定
+    ///     （`GMGNRadioApp.updateResidentPropGridHover` 在 `footprint == nil` 时
+    ///     退回 `spacing` 见方），所以光标所在格同样会出现在 `states` 里。
+    ///
+    /// `states` 为空（光标没落在任何承托层上，或还没进场景）时**一个格子都不画** ——
+    /// 这正是"空旷时不再铺满地面"。
+    struct Focus: Equatable, Sendable {
+        /// 外扩圈数。
+        ///
+        /// 取 **2** 而不是 1：1 圈在 1×1 的悬停 footprint 下只有 8 个淡格，看上去像一圈
+        /// 描边而不是"格子"——看不出格距，也就回答不了"怎么看到格子"这个原始需求。
+        /// 2 圈最小给出 5×5，每个方向能看见两条淡线再淡出。代价仍然很小：0.25 m 格距下
+        /// 一共 25 格，相对真实生活舱派生出的上千列只是脚下一小块，不会变回地毯。
+        static let ringCount = 2
+        /// 外圈的不透明度。
+        ///
+        /// 取 **0.2**：淡环必须明显弱于 footprint 的状态色（黄 `.validFootprint` /
+        /// 红 `.invalidFootprint`，见 `CellState.tint`），否则用户分不清"这块能放"
+        /// 和"这块只是附近"；但又要亮到在浅色与深色地面上都能被看见。0.2 大约是一层
+        /// 看得见但透底的染色，正好是辅助线的量级。
+        static let ringAlpha: Float = 0.2
+
+        /// footprint 本体的格子（= `states` 的键），全对比。
+        let core: Set<Cell>
+        /// 参与绘制的格子（本体 + 外圈），顺序与传入的 `cells` 一致。
+        let cells: [Cell]
+    }
+
+    /// 从 footprint 着色表推出"这一帧该画哪些格子"。
+    ///
+    /// - footprint 是贴着**某一层**放的（`footprintStates` 按锚点层过滤），所以只有与它
+    ///   同层的格子才进焦点：否则旁边桌面上会凭空浮出一片格子，比原来更乱。
+    /// - 本体是矩形（可能斜放），用它的**轴对齐外包**外扩 `ringCount` 圈：形状规整、
+    ///   代价是 O(1)。逐格算 Chebyshev 距离只在斜放 footprint 上略有差别，不值得多扫一遍。
+    static func focus(cells: [Cell], states: [Cell: CellState]) -> Focus {
+        let core = Set(states.keys)
+        guard !core.isEmpty else { return Focus(core: [], cells: []) }
+
+        var layers: Set<Int> = []
+        var minimumX = Int.max, maximumX = Int.min
+        var minimumZ = Int.max, maximumZ = Int.min
+        for cell in core {
+            layers.insert(cell.layer)
+            minimumX = min(minimumX, cell.columnX)
+            maximumX = max(maximumX, cell.columnX)
+            minimumZ = min(minimumZ, cell.columnZ)
+            maximumZ = max(maximumZ, cell.columnZ)
+        }
+        let lowX = minimumX - Focus.ringCount, highX = maximumX + Focus.ringCount
+        let lowZ = minimumZ - Focus.ringCount, highZ = maximumZ + Focus.ringCount
+
+        let visible = cells.filter { cell in
+            layers.contains(cell.layer)
+                && cell.columnX >= lowX && cell.columnX <= highX
+                && cell.columnZ >= lowZ && cell.columnZ <= highZ
+        }
+        return Focus(core: core, cells: visible)
+    }
+
     /// 一个格子在画面里的状态。颜色由渲染层按 `tint` 映射。
     enum CellState: Equatable, Sendable {
         /// 这里可以放。
@@ -115,6 +187,41 @@ enum PropSupportGridPresentation {
         spacing: Float,
         options: Options = .default
     ) -> [Instance] {
+        build(cells: cells, states: states, cameraPosition: cameraPosition,
+              spacing: spacing, options: options, alphaScale: { _ in 1 })
+    }
+
+    /// **本帧实际要画的东西**：`focus` 圈定的那一小块，本体全对比、外圈压到 `Focus.ringAlpha`。
+    ///
+    /// 这是建造模式唯一该走的入口 —— 直接调 `instances` 会画出整片地面（那是改动前的行为，
+    /// 只在离线逐项验证距离淡出/预算时才有用）。
+    static func focusedInstances(
+        cells: [Cell],
+        states: [Cell: CellState],
+        cameraPosition: SIMD3<Float>,
+        spacing: Float,
+        options: Options = .default
+    ) -> [Instance] {
+        let focus = focus(cells: cells, states: states)
+        guard !focus.core.isEmpty else { return [] }
+        let ringAlpha = Focus.ringAlpha
+        return build(
+            cells: focus.cells, states: states, cameraPosition: cameraPosition,
+            spacing: spacing, options: options,
+            alphaScale: { focus.core.contains($0) ? 1 : ringAlpha }
+        )
+    }
+
+    /// 实例生成的唯一实现。`alphaScale` 是逐格的不透明度倍数（焦点环用它把外圈压淡），
+    /// 与距离淡出**相乘**：淡出只回答"远近"，`alphaScale` 只回答"本体还是外圈"。
+    private static func build(
+        cells: [Cell],
+        states: [Cell: CellState],
+        cameraPosition: SIMD3<Float>,
+        spacing: Float,
+        options: Options,
+        alphaScale: (Cell) -> Float
+    ) -> [Instance] {
         guard options.isValid, !cells.isEmpty,
               spacing.isFinite, spacing > 0,
               cameraPosition.x.isFinite, cameraPosition.y.isFinite, cameraPosition.z.isFinite
@@ -132,7 +239,7 @@ enum PropSupportGridPresentation {
             guard center.x.isFinite, center.y.isFinite, center.z.isFinite else { continue }
             let distance = simd_length(center - cameraPosition)
             guard distance.isFinite, distance <= options.maximumDistance else { continue }
-            let alpha = options.alpha(at: distance)
+            let alpha = options.alpha(at: distance) * alphaScale(cell)
             guard alpha > 0 else { continue }
 
             let lifted = SIMD3(center.x, center.y + options.lift, center.z)
