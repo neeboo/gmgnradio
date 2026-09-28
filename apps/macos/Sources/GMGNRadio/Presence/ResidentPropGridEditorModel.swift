@@ -65,7 +65,7 @@ import WorldRuntime
         bounds: WorldPlanarBounds,
         key: String,
         parameters: PropSupportGridParameters = .default
-    ) {
+    ) async {
         self.collision = collision
         isBuildModeActive = true
         if gridKey == key, let grid {
@@ -74,12 +74,18 @@ import WorldRuntime
             onGridChanged?()
             return
         }
-        let built = PropSupportGridBuilder.build(
-            collision: collision,
-            bounds: bounds,
-            seed: seed,
-            parameters: parameters
-        )
+        // 派生是**纯计算**，且真实舱体一次要 0.5 s（-O）/ 6.6 s（-Onone）。
+        // 同步做会把打开装修编辑器的那一帧卡住，所以放后台；`PropSupportGrid` 是 Sendable。
+        let built = await Task.detached(priority: .userInitiated) {
+            PropSupportGridBuilder.build(
+                collision: collision,
+                bounds: bounds,
+                seed: seed,
+                parameters: parameters
+            )
+        }.value
+        // 派生期间编辑器可能已经被关掉：那就别把结果写回来。
+        guard isBuildModeActive, gridKey != key else { return }
         grid = built
         report = built.report
         gridKey = key
@@ -90,6 +96,7 @@ import WorldRuntime
 
     func deactivate() {
         isBuildModeActive = false
+        onGridChanged?()
         grid = nil
         report = nil
         gridKey = nil

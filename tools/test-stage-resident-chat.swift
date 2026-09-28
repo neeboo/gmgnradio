@@ -44,7 +44,7 @@ let canStop = declaration("private var canStopReply:", in: overlay)
 let steeringControls = ["private var hasDraft:", "private var primaryStops:", "private func stopReply()"].map {
     declaration($0, in: overlay)
 }.joined(separator: "\n")
-let keyboard = ["override func keyDown(", "override func keyUp(", "override func resignFirstResponder()", "override func scrollWheel(", "private static func movement("].map {
+let keyboard = ["override func keyDown(", "override func keyUp(", "override func resignFirstResponder()", "override func scrollWheel(", "private static func movement(", "private static func gridRotationSteps("].map {
     declaration($0, in: controller)
 }.joined(separator: "\n")
 let replyMethods = ["func beginResidentReply()", "func finishResidentReply(", "func showResidentChatStatus(", "func setResidentThinking(", "func setResidentDeliveryNotice(", "func setResidentCanStop(", "func restoreResidentSubmission(", "func setVoiceState(", "func setWishMachineTasks("].map {
@@ -82,6 +82,7 @@ import Foundation
 import Combine
 import AppKit
 import Observation
+import simd
 @MainActor @Observable
 \#(speechStore)
 \#(noticeTypes)
@@ -89,7 +90,19 @@ import Observation
 \#(state)
 enum SpatialMovement: Hashable { case forward, backward, left, right }
 final class Window { var firstResponder: AnyObject? }
-struct NSEvent { let keyCode: UInt16; var scrollingDeltaY: Double = 0; var hasPreciseScrollingDeltas = false }
+struct NSEvent {
+    let keyCode: UInt16
+    var scrollingDeltaY: Double = 0
+    var hasPreciseScrollingDeltas = false
+    /// 建造模式快捷键（R / Shift+R、Delete、Cmd+Z）要读的字段。
+    struct ModifierFlags: OptionSet {
+        let rawValue: UInt
+        static let shift = ModifierFlags(rawValue: 1)
+        static let command = ModifierFlags(rawValue: 2)
+    }
+    var modifierFlags: ModifierFlags = []
+    var charactersIgnoringModifiers: String?
+}
 @MainActor class Responder {
     var window: Window? = Window()
     var forwarded: [UInt16] = []
@@ -100,6 +113,9 @@ struct NSEvent { let keyCode: UInt16; var scrollingDeltaY: Double = 0; var hasPr
 }
 @MainActor final class Store {
     var isWorldVisible = true
+    /// 建造模式的状态由 `SpatialStageStore` 转发，`keyDown` 会读它来决定 R 键是否旋转。
+    var isResidentPropBuildModeActive = false
+    var residentPropBuildModeProjection: (inverseViewProjection: simd_float4x4, spacing: Float)?
     var movements: Set<SpatialMovement> = []
     var boosted = false
     var dollyCalls = 0
@@ -115,9 +131,16 @@ struct NSEvent { let keyCode: UInt16; var scrollingDeltaY: Double = 0; var hasPr
     final class PropEditor {
         var isOpen = false
         var escapeCalls = 0
+        var withdrawCalls = 0
+        var undoCalls = 0
         func escape() { escapeCalls += 1 }
+        func withdraw() async { withdrawCalls += 1 }
+        func undo() async { undoCalls += 1 }
     }
     let propEditor = PropEditor()
+    /// 建造模式的 R / Shift+R 旋转回调。
+    var onGridRotate: ((Int) -> Void)?
+    var onGridCursor: ((SIMD2<Float>) -> Void)?
     \#(keyboard)
 }
 @MainActor final class Controller {
@@ -192,6 +215,9 @@ enum StageAvatarActivity { case listening, speaking, idle }
     var pending: [String: CheckedContinuation<Void, Error>] = [:]
     func setResidentThinking(_ value: Bool) { isThinking = value }
     func showChatStatus(_ value: String) { status = value }
+    /// 被抽取的 `sendMessage` 在失败路径上会调它（生产里在 `LiveCamWindowController` 上）。
+    var failureStatus: String?
+    func showFailureStatus(_ text: String) { failureStatus = text }
     func onSendMessage(_ message: ResidentChatSubmission) async throws {
         try await withCheckedThrowingContinuation { pending[message.text] = $0 }
     }
@@ -245,7 +271,16 @@ enum StageAvatarActivity { case listening, speaking, idle }
         controller.setWishMachineTasks([generatingWish])
         check(controller.stageContentView?.residentComposer.isHidden == true && controller.wishMachineTasks.tasks == [generatingWish], "wish updates preserve collapsed chat while updating the independent task store")
         controller.setVoiceState(.connecting)
-        check(controller.stageContentView?.residentComposer.isHidden == false, "toolbar voice connection reveals its feedback before transcripts arrive")
+        // **语义变化**：语音"正在连接"的反馈现在走独立的状态提示，**不再**把输入框顶出来
+        // （生产里只有 `showResidentChat()` 会展开它）。旧断言钉的是更早的行为。
+        check(
+            controller.residentChat.statusNotice?.contains("正在连接语音转写") == true,
+            "toolbar voice connection reports its feedback before transcripts arrive"
+        )
+        check(
+            controller.stageContentView?.residentComposer.isHidden == true,
+            "voice feedback does not hijack the composer"
+        )
         check(controller.residentChat.statusNotice == "正在连接语音转写…" && !controller.residentChat.isThinking, "voice connecting has a visible status without pretending the resident is thinking")
         controller.stageContentView?.collapse()
         controller.setVoiceState(.connecting)

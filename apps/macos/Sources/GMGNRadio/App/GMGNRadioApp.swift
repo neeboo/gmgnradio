@@ -3440,6 +3440,16 @@ final class AppDelegate:
     /// 建造模式的格子数据中枢。网格只在几何变化时派生（按 worldID 缓存），
     /// 已放物件的增删不改变网格。
     private let residentPropGridEditor = ResidentPropGridEditorModel()
+    /// 最近一次推给编辑器的吸附目标（位置 + 朝向）。用来跳掉"同一格内移动鼠标"的重复预检。
+    private var residentPropGridPushedHover: ResidentPropGridHoverKey?
+
+    /// 吸附目标的比较键。用**位置 + 朝向**而不是格号：编辑器真正关心的是"预览挪到哪"。
+    private struct ResidentPropGridHoverKey: Equatable {
+        let x: Float
+        let y: Float
+        let z: Float
+        let yaw: Float
+    }
     private var residentPropEditingWorldID: String?
     private var residentPropEditingID: UUID?
     private var residentPropEditingBackgroundEnabled = false
@@ -3793,12 +3803,15 @@ final class AppDelegate:
             base: collision,
             topVolumes: context.manifest.collisionVolumes.filter(\.isBlocking)
         )
-        residentPropGridEditor.activate(
-            collision: derivation,
-            seed: context.manifest.spawn.position,
-            bounds: bounds,
-            key: context.manifest.worldID
-        )
+        // 派生放后台：见 `activate` 的说明。开启状态立刻生效（格子会在派生完成后出现）。
+        let seed = context.manifest.spawn.position
+        let key = context.manifest.worldID
+        residentPropGridPushedHover = nil
+        Task { [weak self] in
+            await self?.residentPropGridEditor.activate(
+                collision: derivation, seed: seed, bounds: bounds, key: key
+            )
+        }
         publishResidentPropGrid()
     }
 
@@ -3812,8 +3825,20 @@ final class AppDelegate:
         // 悬停命中格子后，把预览挪到**吸附后的格心**（含当前 footprint 朝向）。
         // 预览走既有的摆放服务，所以"这里能不能放"由 `PropPlacementEvaluator` 决定；
         // 放不下时编辑器会显示红格与原因，而不是静默不动。
-        guard let snapped = residentPropGridEditor.snappedPlacement else { return }
+        //
+        // **只在吸附目标或朝向变化时才推**：`onGridChanged` 每次鼠标移动都会触发，
+        // 而一次预览预检要遍历所有已放物件跑评估器（实测 30 件时约 30 ms）。鼠标在同一个
+        // 格子里移动不该重复付这个代价 —— 否则 60 Hz 的移动事件能把主线程打满。
+        guard let snapped = residentPropGridEditor.snappedPlacement else {
+            residentPropGridPushedHover = nil
+            return
+        }
         let target = WorldVector3(x: snapped.position.x, y: snapped.position.y, z: snapped.position.z)
+        let hover = ResidentPropGridHoverKey(
+            x: target.x, y: target.y, z: target.z, yaw: snapped.yaw
+        )
+        guard hover != residentPropGridPushedHover else { return }
+        residentPropGridPushedHover = hover
         let layerName = residentPropGridEditor.hoveredLayerName ?? "grid"
         Task { [weak self] in
             await self?.stageWindowController?.moveResidentPropGridPointer(

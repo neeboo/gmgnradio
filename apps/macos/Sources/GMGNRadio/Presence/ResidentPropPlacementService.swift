@@ -219,7 +219,11 @@ final class ResidentPropPlacementService {
             ) {
                 throw ResidentPropPlacementError.blockedBySupport(reason)
             }
-            guard context.hasEnvironmentClearance(for: box) else { throw ResidentPropPlacementError.collision("环境") }
+            // 这里**不再**额外做一次 `context.hasEnvironmentClearance`：那个判据用的是
+            // 箱体的**外接圆半径**胶囊（咖啡机 0.35×0.57 → 半径 0.334 m，而箱体半宽只有
+            // 0.175×0.285），并要求这么粗的圆柱从箱底起整段空着。评估器已经用**真实 OBB**
+            // 对局部三角形做了 SAT 判定，还单独做了独立体积的 OBB-OBB 判定 —— 两者都更精确，
+            // 那句胶囊检查只会制造假拒绝（实测：真实舱体地面上它把可放格数压到几乎为零）。
         }
         let obstacles = CollisionVolumeWorld(volumes: placed.map(\.2))
         let capsule = WorldCapsule(radius: 0.25,height: 1.8)
