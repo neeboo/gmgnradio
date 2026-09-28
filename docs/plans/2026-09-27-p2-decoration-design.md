@@ -617,6 +617,18 @@ swift tools/test-wish-machine-delivery-loop.swift     # 会打印落点候选与
 | `test-resident-prop-capability.swift` | 运行时致命错误（同上；契约变更前是 swift-frontend 崩溃） |
 | `test-wish-machine-delivery-loop.swift` | 顶层运行时错误（同上，已恢复可编译） |
 
+**本轮（P2 收口后）的复核结果**：
+
+| 脚本 | 状态 |
+| --- | --- |
+| `test-stage-resident-chat.swift` | ✅ **已修**（74 项通过）：本轮新增的生产成员同步进了它的本地 stub；一条断言是过期的（生产只有 `showResidentChat()` 会展开输入框），已改钉新行为 |
+| `test-wish-machine-delivery-loop.swift` | ✅ **已修**（PASS，含 1 条 KNOWN）：迁移到格子口径，落点从派生层取；旋转检查改走持久化路径，并把 §13 的产品缺口记为已知项（缺口修好时它会主动失败） |
+| `test-resident-speech-avatar.swift` | ❌ 仍未修：**stub 漂移**。生产的 `StageAvatarMotionPlayback` 是 enum，harness 里是本地 struct，于是抽出代码里的 `.temporary` 找不到。修它要按最小面重建那个 enum（并补 `StageMotionAsset` / `StageAvatarMotionFallback`），与 P2 无关 |
+| `test-wish-machine-app-runtime.swift` | ❌ 仍未修：**改名漂移**。`pushSystemInboxSnapshots` / `pushWishTaskPrompts` 在生产里已不存在，harness 仍调用 |
+| `test-resident-prop-placement.swift` | ❌ 仍未修：运行期 `unknownActivity("coffee.brew@<objectID>")`。它是 §13 的**下游**：落点落在居民站不到的位置 → 派生不出物件活动 |
+| `test-resident-prop-tools.swift` | ❌ 同上（同一类下游失败） |
+| `test-resident-prop-capability.swift` | ❌ 同上（契约变更前是 swift-frontend 崩溃，现在是运行期失败） |
+
 `test-resident-prop-surfaces.swift` 已**被取代**：它的主题（具名摆放面）不复存在，
 现在由 `tools/test-resident-prop-grid-placement.swift` 承担——在真实舱体几何上跑完整
 「格子 + footprint」链路（13 项检查）。它的失败因此在上面这张表里消失了。

@@ -728,6 +728,11 @@ struct LocalDSHLocator: AgentExecutableLocating {
         do { _ = try await productionService.send("纯文字") }
         catch DSHReplyTimeout.request { requestTimedOut = true }
         check(requestTimedOut, "default production DSH routing selects the bounded runner for first plain text")
+        // 等被判超时的那次**真正退出**再发下一条：fixture 在超时分支里 `sleep 2.5`，
+        // 而这次超时只有 1 s。不等的话，下一条请求会撞上一个仍在运行的旧进程，
+        // 于是在机器有负载（例如刚跑完十几个 harness）时被吞掉、表现成 `launched=false`。
+        // 这是**测试自身的竞态**，不是被测行为：单独跑必过，连跑就抖。
+        try await Task.sleep(nanoseconds: 3_000_000_000)
         do {
             let recoveredReply = try await productionService.send("下一条文字")
             check(recoveredReply == "after timeout", "production service can reply after a real process timeout")
