@@ -13,10 +13,12 @@ import Foundation
 ///   1. **该不该画、画什么**（`content(isCarrying:reason:)`）；
 ///   2. **画在哪**（`frame(anchor:ringRadius:textSize:viewSize:)`）—— 屏幕空间，不动 Metal。
 ///
-/// 只依赖 Foundation，所以绘制逻辑能离线单测（`tools/test-resident-prop-render.swift`）。
+/// 只依赖 Foundation + CoreGraphics（屏幕空间的几何），所以绘制逻辑能离线单测
+/// （`tools/test-resident-prop-render.swift`）。
 enum ResidentPropBlockReasonLabel {
-    /// 胶囊底边与**圆环外缘**之间的间隙。圆环半径 26 pt，所以标签整体在锚点上方
-    /// `10（手柄固定偏移）+ 26（半径）+ 6（间隙）= 42 pt`，且与圆环同侧（右上）——
+    /// 胶囊底边与**圆环外缘**之间的间隙。圆环半径是
+    /// `StageWorldInteractionView.rotationHandleRadius`（26 pt），手柄本身又比落点投影高 10 pt，
+    /// 所以标签整体在落点上方 `10 + 26 + 6 = 42 pt`，且与圆环同侧（右上）——
     /// 落点那个格子本身不会被挡住。
     static let ringGap: CGFloat = 6
     static let horizontalPadding: CGFloat = 8
