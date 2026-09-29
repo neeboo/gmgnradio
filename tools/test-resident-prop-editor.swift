@@ -858,6 +858,10 @@ typealias WorldAgentContext = LayoutContext
     "precondition: opening decoration opens the editor")
   precondition(focusHarness.residentPropGridEditor.isBuildModeActive && focusHarness.residentPropGridEditor.isReady,
     "precondition: opening decoration derives the grid")
+  // 令牌 = "还有一次派生在跑"的唯一凭据：失焦不许碰它（真机上它就是在这里被收回的，
+  // 于是面板显示"还在生成"，其实已经没人在算了）。
+  let focusDerivationToken = UUID()
+  focusHarness.residentPropGridDerivation = focusDerivationToken
   // 切到别的窗口去说话 —— 真机就是这一步把装修杀掉的。
   focusHarness.windowDidResignKey(Notification(name:Notification.Name("NSWindowDidResignKeyNotification")))
   precondition(focusHarness.residentPropEditor.isOpen,
@@ -866,8 +870,8 @@ typealias WorldAgentContext = LayoutContext
     "losing window focus must not end the decoration session")
   precondition(focusHarness.residentPropGridEditor.isReady && !focusHarness.residentPropGridEditor.renderCells.isEmpty,
     "losing window focus must not discard the derived grid")
-  precondition(focusHarness.residentPropGridDerivation == nil,
-    "losing window focus must not touch the derivation token")
+  precondition(focusHarness.residentPropGridDerivation == focusDerivationToken,
+    "losing window focus must not revoke the derivation token (the panel would keep saying \"still generating\")")
   // 切回来：控制器里没有 `windowDidBecomeKey` 的补偿逻辑（结构性断言见
   // `test-stage-resident-chat.swift`），所以这一趟往返对会话什么也没做。
   precondition(focusHarness.residentPropEditor.isOpen && focusHarness.residentPropGridEditor.isReady,
