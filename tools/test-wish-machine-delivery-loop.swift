@@ -47,6 +47,12 @@ func reportKnownGap(_ stillMissing: Bool, _ message: String) -> Bool {
     return stillMissing
 }
 
+func usableWorldPosition(_ p: WorldVector3) -> Bool {
+    let limit: Float = 1e6
+    return p.x.isFinite && p.y.isFinite && p.z.isFinite
+        && abs(p.x) < limit && abs(p.y) < limit && abs(p.z) < limit
+}
+
 @MainActor var deliverySupportCache: ResidentPropPlacementSupport?
 
 @MainActor func deliverySupport(triangles: [WorldTriangle], manifest: WorldManifest) -> ResidentPropPlacementSupport {
@@ -64,7 +70,21 @@ func reportKnownGap(_ stillMissing: Bool, _ message: String) -> Bool {
         bounds: WorldPlanarBounds(minimumX: minX - margin, maximumX: maxX + margin,
                                   minimumZ: minZ - margin, maximumZ: maxZ + margin),
         seed: manifest.spawn.position, parameters: parameters)
-    let support = ResidentPropPlacementSupport(grid: grid, collision: derivation)
+    var anchorPositions: [String: WorldVector3] = [:]
+    for activity in manifest.activities {
+        guard let waypoint = manifest.waypoints.first(where: { $0.id == activity.entryWaypointID && $0.enabled }),
+              usableWorldPosition(waypoint.position) else { continue }
+        anchorPositions[activity.entryWaypointID] = waypoint.position
+    }
+    let map = WorldPlacementRouteMap(grid: grid,
+        lowerHeight: (waypoints.map(\.y).min() ?? 0) - 0.6,
+        upperHeight: (waypoints.map(\.y).max() ?? 0) + 0.6)
+    let constraint: ResidentPropPlacementSupport.RouteConstraint? = (
+        !anchorPositions.isEmpty
+            && map.nearestNode(to: manifest.spawn.position) != nil
+            && anchorPositions.values.allSatisfy { map.node(at: $0) != nil }
+    ) ? .init(map: map, anchorIDs: anchorPositions.keys.sorted(), anchorPositions: anchorPositions) : nil
+    let support = ResidentPropPlacementSupport(grid: grid, collision: derivation, routeConstraint: constraint)
     deliverySupportCache = support
     return support
 }

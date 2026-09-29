@@ -131,6 +131,15 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         residentPropEditor.isCarrying
     }
 
+    /// 当前选中的物件 objectID（= 摆放服务判定用的那个）。
+    ///
+    /// 为什么宿主需要读它：格子的黄/红必须由**与落地完全相同的那条判定**回答
+    /// （`ResidentPropPlacementService.previewState(objectID:placement:)`，按 objectID 走）。
+    /// `residentPropFootprint` 非 nil 当且仅当有选中物件，两者配套使用。
+    var residentPropSelectedObjectID: String? {
+        residentPropEditor.selectedID
+    }
+
     /// 场景里**空手**点中一件已摆物件：等价于点面板里那一行（同一条 `select(objectID:)`）。
     func selectResidentPropFromScene(objectID: String) async {
         await residentPropEditor.select(objectID: objectID)

@@ -60,7 +60,61 @@ struct Config: Decodable {
         check(!grid.layers.isEmpty,"real cabin derives a non-empty support grid")
         check(!grid.layers.contains { $0.supportHeight >= 3 },"no layer sits on the roof")
 
-        let support=ResidentPropPlacementSupport(grid:grid,collision:derivation)
+        // 收窄后的路点判据（"居民还走不走得到活动锚点"）。
+        //
+        // 判据要的三样输入（可站带、锚点、居民当前位置）都来自**真实世界坐标**：路点高度与
+        // 活动入口都在 y≈0、居民出生点在 (-1,-5)。本 harness 的**摆放几何**是真实舱体
+        // 派生网格（`grid`/`derivation`），但那张网格不含"居民走的地面"这一层语义，
+        // 所以移动图用一层解析地面表达"居民在这些路点高度上走"。真实舱体上的
+        // 收窄前后对比在 `test-resident-prop-one-judge.swift`。
+        struct FlatGround: WorldPropSupportQuerying {
+            let minimumX: Float; let maximumX: Float
+            let minimumZ: Float; let maximumZ: Float
+            func canOccupy(_ capsule: WorldCapsule, at position: SIMD3<Float>) -> Bool { true }
+            func groundHeight(at position: SIMD3<Float>) -> Float? {
+                guard position.x >= minimumX, position.x <= maximumX,
+                      position.z >= minimumZ, position.z <= maximumZ else { return nil }
+                return 0 <= position.y + 0.05 ? 0 : nil
+            }
+            func canTraverse(_ capsule: WorldCapsule, from start: SIMD3<Float>,
+                             to destination: SIMD3<Float>, maximumStepHeight: Float) -> Bool { true }
+            func triangles(in bounds: WorldPlanarBounds) -> [WorldTriangle] {
+                guard bounds.maximumX >= minimumX, bounds.minimumX <= maximumX,
+                      bounds.maximumZ >= minimumZ, bounds.minimumZ <= maximumZ else { return [] }
+                let a = SIMD3<Float>(minimumX, 0, minimumZ), b = SIMD3<Float>(maximumX, 0, minimumZ)
+                let c = SIMD3<Float>(maximumX, 0, maximumZ), d = SIMD3<Float>(minimumX, 0, maximumZ)
+                return [WorldTriangle(a, b, c), WorldTriangle(a, c, d)]
+            }
+        }
+        let groundWorld = FlatGround(minimumX: minimumX - 1, maximumX: maximumX + 1,
+                                     minimumZ: minimumZ - 1, maximumZ: maximumZ + 1)
+        let groundGrid = PropSupportGridBuilder.build(
+            collision: groundWorld,
+            bounds: WorldPlanarBounds(minimumX: minimumX - 1, maximumX: maximumX + 1,
+                                      minimumZ: minimumZ - 1, maximumZ: maximumZ + 1),
+            seed: manifest.spawn.position, parameters: parameters)
+        let routeAnchorsByID: [String: WorldVector3] = { () -> [String: WorldVector3] in
+            var result: [String: WorldVector3] = [:]
+            for activity in manifest.activities {
+                guard let waypoint = manifest.waypoints.first(where: {
+                    $0.id == activity.entryWaypointID && $0.enabled
+                }) else { continue }
+                result[activity.entryWaypointID] = waypoint.position
+            }
+            return result
+        }()
+        let waypointHeights = manifest.waypoints.filter(\.enabled).map(\.position.y)
+        let routeMap = WorldPlacementRouteMap(grid: groundGrid,
+            lowerHeight: (waypointHeights.min() ?? 0) - 0.2,
+            upperHeight: (waypointHeights.max() ?? 0) + 0.2)
+        let routeConstraint: ResidentPropPlacementSupport.RouteConstraint? = (
+            !routeAnchorsByID.isEmpty
+                && routeMap.nearestNode(to: manifest.spawn.position) != nil
+                && routeAnchorsByID.values.allSatisfy { routeMap.node(at: $0) != nil }
+        ) ? .init(map: routeMap,
+                  anchorIDs: routeAnchorsByID.keys.sorted(),
+                  anchorPositions: routeAnchorsByID) : nil
+        let support=ResidentPropPlacementSupport(grid:grid,collision:derivation,routeConstraint:routeConstraint)
         let context=try WorldAgentContext(manifest:manifest)
         let independent=ResidentPropPlacementConfiguration.independentCollisionVolumes(manifest)
         let combined=MarbleLivingCabinCollisionWorld(environment:mesh,props:CollisionVolumeWorld(volumes:independent))
@@ -250,17 +304,20 @@ let second=WorldGeneratedProp(objectID:"test.second",sourceWishID:"test.second",
         // 10.（任务 2）**还没摆出来**的物件的初始落点必须是"真的能放"的那一格。
         //
         // 旧行为：初始落点固定退到 `listedSupportLayers().first.center` —— 最低层里列序最小的格。
-        // 真实生活舱实测那一格被活动通道挡住，于是勾和控件都出现了、footprint 却是红的，
-        // 直到鼠标动一下才对。这里两条一起钉住：旧的默认点**确实**被挡，而自动初始落点**可放**。
+        //
+        // 2026-09-29 收窄路点判据**之前**，真实生活舱实测那一格被"全部 643 个路点都要空着"
+        // 那条判据挡住（footprint 是红的），于是自动初始落点必须另找。收窄之后那一格**可以放**
+        // 了（这正是本次要修的缺陷：地板本来就不该被那条判据禁掉），所以这里的断言反过来：
+        // 旧的默认点现在可放，而自动初始落点照样是一个真实格心、照样可放。
         let rookie=WorldGeneratedProp(objectID:"test.rookie",sourceWishID:"test.rookie",assetID:"test.rookie",
             displayName:"新物件",size:WorldVector3(x:0.2,y:0.2,z:0.2),sourceHeight:1)
         _=try service.commit(.register(rookie),expectedLayoutRevision:context.state.layoutRevision,requestID:"register-rookie")
         do {
             _=try service.preview(objectID:rookie.objectID,
                 placement:.init(surfaceID:listed[0].id,position:listed[0].center,yaw:0))
-            check(false,"the lowest layer's minimum-column cell is the spot the old default landed on")
+            check(true,"after narrowing the route rule the old default landing spot is placeable again (this is the fix)")
         } catch {
-            check(true,"on the real cabin the old default landing spot is blocked (\(error.localizedDescription))")
+            check(false,"the old default landing spot must be placeable once the route rule is narrowed (\(error.localizedDescription))")
         }
         let autoSurfaces=ResidentPropInitialPlacement.fillingAnchors(
             listed.enumerated().map { index,layer in

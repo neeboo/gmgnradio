@@ -72,6 +72,7 @@ test-harnesses:
 	swift tools/test-resident-prop-grid-editor.swift
 	swift tools/test-resident-prop-grid-placement.swift
 	swift tools/test-resident-prop-placement.swift
+	swift tools/test-resident-prop-one-judge.swift
 	swift tools/test-resident-prop-tools.swift
 	swift tools/test-resident-prop-capability.swift
 	swift tools/test-resident-status-lifecycle.swift

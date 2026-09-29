@@ -137,6 +137,16 @@ let livingWorldLogger = Logger(subsystem: ProductIdentity.bundleIdentifier, cate
 \#(gridPicker)
 \#(gridPresentation)
 \#(gridModelSource)
+// 格子模型引用 `ResidentPropPlacementSupport.RouteConstraint`（生产里由
+// `ResidentPropPlacementService.swift` 声明）。这条 harness 不起摆放服务，所以只放一个
+// 同形的壳：**判据的输入形状**与生产一致，断言才落在真的那条路上。
+struct ResidentPropPlacementSupport {
+    struct RouteConstraint {
+        let map: WorldPlacementRouteMap
+        let anchorIDs: [String]
+        let anchorPositions: [String: WorldVector3]
+    }
+}
 \#(blockLabelSource)
 /// 一块 3 m × 3 m 的平地板（y = 0）：派生出来的承托网格每列只有一层、而且同高。
 ///
@@ -1138,6 +1148,7 @@ typealias WorldAgentContext = LayoutContext
   // 原因也算出来了，但只写在面板右下角那行 `notice` 里。下面用**真的格子模型**算出原因
   // （`PropSupportGridEditorModel.hoveredBlockReason`），再断言标签拿到的就是同一份文案。
   let reasonModel = ResidentPropGridEditorModel()
+  var reasonPlacedProps:[WorldCollisionVolume] = []
   let reasonFloor = FlatFloorCollision(half:1.5)
   await reasonModel.activate(collision:reasonFloor,seed:.init(x:0,y:0,z:0),
     bounds:.init(minimumX:-1.5,maximumX:1.5,minimumZ:-1.5,maximumZ:1.5),key:"reason-harness")
@@ -1150,9 +1161,27 @@ typealias WorldAgentContext = LayoutContext
   reasonCamera.columns.3 = SIMD4(0,2,0,1)
   let reasonCursor = SIMD2<Float>(0.5,0.5)
   let reasonSize = SIMD2<Float>(repeating:reasonModel.spacing)
+  // 格子的黄/红由**与落地完全相同的那条判定**回答（生产里是 `ResidentPropPlacementService`）。
+  // 这条 harness 不起服务，所以用同一个判定（`PropPlacementEvaluator`）当替身：
+  // 判据是同一个、输入是同一份，红的格与原因仍然出自同一条路。
+  reasonModel.verdictForPlacement = { _, footprint, height, position, yaw in
+    guard let grid = reasonModel.grid else { return .noSupport }
+    let column = PropSupportColumn(x:Int((position.x/grid.spacing).rounded(.down)),
+                                   z:Int((position.z/grid.spacing).rounded(.down)))
+    guard let layer = grid.layers.first(where: { $0.column == column
+        && abs($0.supportHeight - position.y) < 0.005 }) else { return .noSupport }
+    return PropPlacementEvaluator.evaluate(
+      footprint: WorldPlanarFootprint(size:footprint,yaw:yaw), height:height, at:layer, grid:grid,
+      collision: reasonFloor, blockingVolumes: [], placedProps: reasonPlacedProps)
+  }
   func hoverReason(with placed:[WorldCollisionVolume]) {
+    // 房间里的摆放变了 ⇒ 那一批"这一格能不能放"的答案全部作废（生产里由宿主在收到新快照时
+    // 调 `invalidateVerdicts()`；这条 harness 没有快照，就自己在这一处作废）。
+    reasonModel.invalidateVerdicts()
+    reasonPlacedProps = placed
     reasonModel.updateHover(normalizedCursor:reasonCursor,inverseViewProjection:reasonCamera,
-      footprintSize:reasonSize,height:reasonSize.x,blockingVolumes:[],placedProps:placed)
+      footprintSize:reasonSize,height:reasonSize.x,objectID:"harness.reason",
+      blockingVolumes:[],placedProps:placed)
   }
   hoverReason(with:[])
   precondition(reasonModel.canPlaceAtHover,
@@ -1179,7 +1208,7 @@ typealias WorldAgentContext = LayoutContext
   let labelText = ResidentPropBlockReasonLabel.content(isCarrying:true,reason:blockedReason?.errorDescription)
   precondition(labelText == blockedReason?.errorDescription && labelText != nil,
     "the label next to the cursor must show the existing block reason verbatim, not a newly written string")
-  // 既有六种原因的投影就是标签的全部文案：新造一句（例如"这里不能放"）会在这里裂开。
+  // 既有原因的投影就是标签的全部文案：新造一句（例如"这里不能放"）会在这里裂开。
   let existingReasons:[String?] = [
     PropSupportBlockReason.outsideBounds.errorDescription,
     PropSupportBlockReason.noSupport.errorDescription,
@@ -1187,6 +1216,8 @@ typealias WorldAgentContext = LayoutContext
     PropSupportBlockReason.blockedByBlockingVolume("点唱机").errorDescription,
     PropSupportBlockReason.blockedByPlacedProp("落地灯").errorDescription,
     PropSupportBlockReason.insufficientClearance.errorDescription,
+    // 收窄路点判据之后新增的这一条：挡住居民通路。文案同样来自这一份投影（不新造字符串）。
+    PropSupportBlockReason.blockedRoute("wp.center").errorDescription,
   ]
   precondition(existingReasons.allSatisfy { $0 != nil && !$0!.isEmpty },
     "every existing block reason still projects to a non-empty Chinese sentence")

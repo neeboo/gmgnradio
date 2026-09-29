@@ -48,6 +48,51 @@ import WorldRuntime
     /// 刻意不用 `objectWillChange`：它在变更**之前**发，订阅者读到的是旧值。
     var onGridChanged: (@MainActor () -> Void)?
 
+    /// 格子的黄/红由**与落地完全相同的那条判定**回答。
+    ///
+    /// 为什么必须这么接：真机 2026-09-29 的缺陷是"格子说可放、一点却被拒绝" ——
+    /// 着色那条路（`PropPlacementEvaluator`）完全不知道路点/通道，而落地那条路
+    /// （`ResidentPropPlacementService.validate`）额外要求"居民还走得到活动锚点"。
+    /// 273 个"可放=true"的去重格被服务拒绝 273/273，用户看到的却是一格绿。
+    ///
+    /// 现在两条路共用同一个出口：宿主把 `ResidentPropPlacementService.preview`
+    /// （fail-closed，返回"能不能放 + 真正的原因"）包成这个闭包。于是
+    ///
+    /// - 服务会接受 ⇒ footprint 黄（可放）；
+    /// - 服务会拒绝 ⇒ footprint 红，且 `hoveredBlockReason` 就是**服务给出的那个原因**
+    ///   （不再是评估器那条不知道路点的路给出的 nil）。
+    ///
+    /// 判据仍然只有一条：能不能放由服务回答，`fail-closed` 一个字都没放宽。
+    var verdictForPlacement: (@MainActor (_ objectID: String, _ footprint: SIMD2<Float>, _ height: Float,
+                                          _ position: WorldVector3, _ yaw: Float) -> PropSupportBlockReason?)?
+
+    /// 判定结果的**有界缓存**：`格心 + 朝向(+物件)` → 判定。
+    ///
+    /// 为什么需要：这一条判定要跑完整服务校验（实测真实舱体冷调用中位 0.11 ms、p95 4.6 ms），而 `updateHover`
+    /// 每次鼠标移动都会跑。鼠标在同一格内移动本来就已经被 `snappedPlacement` 那一层挡住，
+    /// 但"在同一块 footprint 里挪半格""来回划过同一行格子"仍然会重复问同一个格子。
+    /// 缓存让重复询问变成 O(1)。
+    ///
+    /// 失效点只有一处：`ResidentPropEditorState.update(_:)` 收到新快照（`revision` 变了）
+    /// 时宿主会调 `invalidateVerdicts()` —— 判定依赖"房间里现在有什么"，revision 是那条
+    /// 事实的版本号。
+    private struct VerdictKey: Hashable {
+        let x: Float
+        let y: Float
+        let z: Float
+        let yaw: Float
+        let width: Float
+        let height: Float
+        let depth: Float
+    }
+    /// 上界：一个 footprint 的候选格 + 8 个朝向远小于它，超过就整体丢弃（不淘汰单条，
+    /// 避免在"用户正在犹豫"的时候把最常命中的那一条淘汰掉）。
+    static let verdictCacheLimit = 4096
+    private var verdicts: [VerdictKey: PropSupportBlockReason?] = [:]
+    /// 缓存命中/未命中计数（诊断与实测用）。
+    private(set) var verdictCacheHits = 0
+    private(set) var verdictCacheMisses = 0
+
     private var collision: (any WorldPropSupportQuerying)?
     private var gridKey: String?
     /// 当前**激活会话**的世界键（`activate` 一开始就写下，`deactivate` 清掉）。
@@ -71,6 +116,8 @@ import WorldRuntime
 
     /// 最近一次评估的输入。旋转时要据此重算着色，而不需要新的光标位置。
     private struct EvaluationInputs {
+        /// 手上这一件的 objectID（= 落地时交给摆放服务的那个）。
+        let objectID: String
         let footprintSize: SIMD2<Float>
         let height: Float
         let blockingVolumes: [WorldCollisionVolume]
@@ -85,6 +132,91 @@ import WorldRuntime
     var isReady: Bool { grid != nil }
     /// 摆放校验需要的碰撞世界（能给出三角形）。与 `grid` 同时可用，否则为 nil。
     var supportCollision: (any WorldPropSupportQuerying)? { collision }
+
+    /// 「居民还走不走得到活动锚点」用的**移动图**（收窄后的唯一一条路点判据）。
+    ///
+    /// 只依赖派生出的承托网格与"可站带"，**与已放物件无关** —— 所以按网格缓存一份，
+    /// 换网格（换世界 / 重新派生）时自动重建。建图实测 1.6 ms（真机舱体 3160 层 / 2948
+    /// 个可站节点，-O，n=5），一次派生只付一次。
+    private var routeMap: WorldPlacementRouteMap?
+    /// 移动图缓存属于哪一份网格。用网格的层数当身份（同一世界重复派生出的层数一致，
+    /// 换世界/换参数则不同），并额外在 `setRouteBand` / `deactivate` 处显式失效。
+    private var routeMapLayerCount: Int?
+    private var routeBand: (lower: Float, upper: Float)?
+
+    /// 告诉模型"可站立的承托带"在哪（来自世界里的路点高度：居民只在这些高度上走）。
+    ///
+    /// 必须在服务开始判摆放**之前**调用一次（`GMGNRadioApp.activateResidentPropGrid`），
+    /// 否则移动图拿不到范围，判据走 fail-closed（拒绝摆放）而不是放行。
+    func setRouteBand(lower: Float, upper: Float) {
+        routeBand = (lower, upper)
+        routeMap = nil
+        routeMapLayerCount = nil
+    }
+
+    /// 从世界路点推"可站带"：居民只在这些高度上站立/行走，桌面与屋顶都在带外。
+    ///
+    /// 唯一一份推导：生产宿主与离线 harness 都走这里，避免两处各抄一个 margin。
+    /// 路点为空（或全部停用）时返回 false ⇒ 拿不到可站带 ⇒ 拒绝摆放（fail-closed）。
+    @discardableResult
+    func setRouteBand(fromWaypoints waypoints: [WorldWaypoint], margin: Float = 0.2) -> Bool {
+        let heights = waypoints.filter(\.enabled).map(\.position.y)
+        guard let lowest = heights.min(), let highest = heights.max() else { return false }
+        setRouteBand(lower: lowest - margin, upper: highest + margin)
+        return true
+    }
+
+    /// 从活动锚点表推 `RouteConstraint`（收窄判据的全部输入）。
+    ///
+    /// 锚点 = `WorldActivityAnchor.entryWaypointID`：活动一律先走到它的入口路点，
+    /// 所以"每个锚点都要能站、要走得到"就是居民真正需要的东西；639 个 `wp.auto.*`
+    /// 只是中间路点，运行时本来就会绕路。
+    ///
+    /// 拿不到地图、或锚点一个都对不上路点 ⇒ nil ⇒ 服务拒绝摆放（fail-closed）。
+    func routeConstraint(activities: [WorldActivityAnchor],
+                         waypoints: [WorldWaypoint]) -> ResidentPropPlacementSupport.RouteConstraint? {
+        guard let map = placementRouteMap() else { return nil }
+        var positions: [String: WorldVector3] = [:]
+        for activity in activities {
+            guard let waypoint = waypoints.first(where: {
+                $0.id == activity.entryWaypointID && $0.enabled
+            }) else { continue }
+            // 病态输入（非有限 / 离谱的世界坐标）一律当作"拿不到判据" ⇒ 拒绝摆放。
+            // 绝不能把它们喂进移动图：列号换算会溢出，而"溢出"不是一条判据。
+            guard Self.isUsableWorldPosition(waypoint.position) else {
+                Self.log.notice("摆放判据：锚点位置不可用 \(activity.entryWaypointID, privacy: .public)，按 fail-closed 处理")
+                return nil
+            }
+            positions[activity.entryWaypointID] = waypoint.position
+        }
+        guard !positions.isEmpty else { return nil }
+        return .init(map: map, anchorIDs: positions.keys.sorted(), anchorPositions: positions)
+    }
+
+    /// 世界坐标是否可用作判据输入：有限，且换算成列号不会溢出（|坐标| / 间距 < 1e6 与
+    /// `Int` 余量都够）。
+    static func isUsableWorldPosition(_ position: WorldVector3) -> Bool {
+        let limit: Float = 1e6
+        return position.x.isFinite && position.y.isFinite && position.z.isFinite
+            && abs(position.x) < limit && abs(position.y) < limit && abs(position.z) < limit
+    }
+
+    /// 当前的移动图（按需建、按网格缓存）。拿不到网格/范围时返回 nil ⇒ 服务拒绝摆放。
+    func placementRouteMap() -> WorldPlacementRouteMap? {
+        guard let grid, let routeBand else { return nil }
+        if let routeMap, routeMapLayerCount == grid.layers.count { return routeMap }
+        let map = WorldPlacementRouteMap(
+            grid: grid,
+            lowerHeight: routeBand.lower,
+            upperHeight: routeBand.upper
+        )
+        Self.log.notice(
+            "摆放判据：移动图已建 可站节点=\(map.standableNodeCount, privacy: .public) 带=[\(routeBand.lower, privacy: .public), \(routeBand.upper, privacy: .public)]"
+        )
+        routeMap = map
+        routeMapLayerCount = grid.layers.count
+        return map
+    }
     /// 供渲染层使用的格子，与 `cellStates` 同一坐标系（缺省状态的格子也在这里）。
     var renderCells: [PropSupportGridPresentation.Cell] { cells }
     var spacing: Float { grid?.spacing ?? PropSupportGridParameters.default.spacing }
@@ -150,6 +282,27 @@ import WorldRuntime
         Self.log.notice(
             "格子派生：完成 key=\(key, privacy: .public) 耗时=\(elapsed.description, privacy: .public) 层=\(built.layers.count, privacy: .public) 列=\(self.cells.count, privacy: .public) 种上=\(report.seeded, privacy: .public) 过滤前=\(report.layersBeforeFilter, privacy: .public)"
         )
+        onGridChanged?()
+    }
+
+    /// 直接装一份**已经派生好的**网格（连同能给出三角形的碰撞世界）。
+    ///
+    /// 与 `activate` 的差别：`activate` 会自己去派生（真实舱体 -O 下约 8 s）。
+    /// 这里给的是"别人已经算出来的同一份几何"，用于：
+    /// - 离线 harness 在**真实舱体**派生网格上驱动着色/判定（推导一次，反复用）；
+    /// - 将来宿主把派生结果从别处接手时复用同一条装填路径（不是测试专用 API）。
+    func installDerivedGrid(_ grid: PropSupportGrid,
+                            collision: any WorldPropSupportQuerying,
+                            key: String) {
+        self.collision = collision
+        isBuildModeActive = true
+        activeKey = key
+        storeCachedGrid(grid, key: key)
+        self.grid = grid
+        report = grid.report
+        gridKey = key
+        rebuildCaches(from: grid)
+        clearHover()
         onGridChanged?()
     }
 
@@ -272,6 +425,7 @@ import WorldRuntime
         inverseViewProjection: simd_float4x4,
         footprintSize: SIMD2<Float>,
         height: Float,
+        objectID: String,
         blockingVolumes: [WorldCollisionVolume],
         placedProps: [WorldCollisionVolume],
         maximumDistance: Float = 30
@@ -296,7 +450,18 @@ import WorldRuntime
             return
         }
         hoveredLayerRef = layerRef
+        // 房间里的摆设变了 ⇒ 那一批"这一格能不能放"的答案全部作废。
+        //
+        // 缓存按「格心 + 朝向 + 物件尺寸」存，而判定的输入还包括"房间里现在摆着什么"
+        // （`placedProps` / `blockingVolumes`）。输入变了还复用旧答案，红/绿就会与落地判定
+        // 分叉 —— 那正是这次要修的缺陷，绝不能靠缓存重新引入。宿主收到新快照时也会调
+        // `invalidateVerdicts()`（revision 是另一个失效信号），这里是**按输入**的那一道。
+        if evaluationInputs?.placedProps != placedProps
+            || evaluationInputs?.blockingVolumes != blockingVolumes {
+            invalidateVerdicts()
+        }
         evaluationInputs = EvaluationInputs(
+            objectID: objectID,
             footprintSize: footprintSize,
             height: height,
             blockingVolumes: blockingVolumes,
@@ -399,7 +564,7 @@ import WorldRuntime
     }
 
     private func reevaluateFootprint() {
-        guard let grid, let collision, let layerRef = hoveredLayerRef, let inputs = evaluationInputs else {
+        guard let grid, collision != nil, let layerRef = hoveredLayerRef, let inputs = evaluationInputs else {
             hovered = nil
             hoveredBlockReason = nil
             footprintStates = [:]
@@ -407,18 +572,11 @@ import WorldRuntime
             return
         }
         let footprint = WorldPlanarFootprint(size: inputs.footprintSize, yaw: footprintYaw)
-        let reason = PropPlacementEvaluator.evaluate(
-            footprint: footprint,
-            height: inputs.height,
-            at: layerRef,
-            grid: grid,
-            collision: collision,
-            blockingVolumes: inputs.blockingVolumes,
-            placedProps: inputs.placedProps
-        )
+        let reason = verdict(footprint: footprint, height: inputs.height, layerRef: layerRef,
+                             objectID: inputs.objectID)
         let columns = footprint.columns(anchoredAt: layerRef.column, spacing: grid.spacing)
         let covered = Set(columns.map { PropSupportGridMapping.ColumnKey(x: $0.x, z: $0.z) })
-        footprintStates = PropSupportGridMapping.footprintStates(
+        let nextStates = PropSupportGridMapping.footprintStates(
             cells: cells,
             coveredColumns: covered,
             anchorLayer: layerRef.layer.layer,
@@ -428,7 +586,59 @@ import WorldRuntime
             $0.columnX == layerRef.column.x && $0.columnZ == layerRef.column.z
                 && $0.layer == layerRef.layer.layer
         }
+        // 只在**判定或着色真的变了**时才重推：本函数每次鼠标移动都会跑，而
+        // `publishCellStates` 会触发宿主那条"推给预览 + 推给渲染层"的链。
+        let changed = footprintStates != nextStates || hoveredBlockReason != reason
+        footprintStates = nextStates
         hoveredBlockReason = reason
-        publishCellStates()
+        if changed { publishCellStates() }
+    }
+
+    /// 悬停落点的**唯一判定出口**：与落地完全同源。
+    ///
+    /// - 拿不到 `footprint`（编辑器还没选中任何物件）时**不判定**，也就没有一个"绿格"
+    ///   会骗用户：`isBuildModeActive` 仍然为真，但没有任何 footprint 被着色。
+    /// - 判定结果按「格心 + 朝向 + 物件尺寸」缓存（见 `verdicts`）。
+    /// 悬停落点的判定出口。`internal`（不是 `private`）是为了让离线 harness 能**直接**
+    /// 驱动判定的缓存行为并实测耗时 —— 那条断言（同一格重复询问必须全部命中）只有在这里
+    /// 才看得见，走 `updateHover` 还要先命中格子平面。
+    func verdict(footprint: WorldPlanarFootprint, height: Float,
+                 layerRef: PropSupportLayerRef, objectID: String) -> PropSupportBlockReason? {
+        guard let provider = verdictForPlacement, let grid else { return nil }
+        let position = PropSupportGridMapping.snappedPlacementPosition(
+            columnX: layerRef.column.x,
+            columnZ: layerRef.column.z,
+            spacing: grid.spacing,
+            supportHeight: layerRef.supportHeight
+        )
+        let key = VerdictKey(
+            x: position.x, y: position.y, z: position.z, yaw: footprint.yaw,
+            width: footprint.size.x, height: height, depth: footprint.size.y
+        )
+        if let cached = verdicts[key] {
+            verdictCacheHits += 1
+            return cached
+        }
+        verdictCacheMisses += 1
+        let reason = provider(
+            objectID,
+            footprint.size, height,
+            WorldVector3(x: position.x, y: position.y, z: position.z),
+            footprint.yaw
+        )
+        // 结果里带 id 的原因（哪件已放物件 / 哪个锚点）逐条不同，缓存的是**这一格**的答案，
+        // 所以原样存下来即可；上界到了就整体丢弃，绝不因为缓存让判定变松。
+        if verdicts.count >= Self.verdictCacheLimit { verdicts.removeAll(keepingCapacity: true) }
+        verdicts[key] = reason
+        return reason
+    }
+
+    /// 丢掉全部判定缓存。**唯一**调用点是"房间里的摆放变了"（宿主收到新快照时）。
+    ///
+    /// 判定依赖"现在房间里有什么"，revision 就是那条事实的版本号；缓存跨 revision 复用
+    /// 会让红/绿与落地判定分叉 —— 那正是这次要修的缺陷，绝不能重新引入。
+    func invalidateVerdicts() {
+        guard !verdicts.isEmpty else { return }
+        verdicts.removeAll(keepingCapacity: true)
     }
 }

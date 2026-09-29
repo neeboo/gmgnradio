@@ -46,12 +46,77 @@ struct FlatSupport: WorldPropSupportQuerying {
 }
 /// 与旧面 `test` 同范围同高度：中心 (-2.7, 0.52, -5)、半长 (1, 0, 1)。
 let flatWorld=FlatSupport(minimumX:-3.7,maximumX:-1.7,minimumZ:-6,maximumZ:-4,height:0.52)
+
+/// 收窄后的路点约束：与生产**同一条**推导。
+///
+/// 判据要的三样东西必须取自**同一个世界**：可站带（路点高度）、锚点位置、居民当前位置。
+/// 合成平面上的验证要用合成世界的路点/居民 —— 拿真实舱体的路点给合成平面算，居民与锚点
+/// 根本不在同一片坐标里，判据只会 fail-closed 拒绝一切（那正是它该做的）。
+///
+/// 拿不到可用节点时返回 nil ⇒ 服务拒绝摆放（fail-closed）。
+@MainActor func routeConstraint(_ grid:PropSupportGrid,
+                                anchorCandidates:[WorldVector3],
+                                resident:WorldVector3)->ResidentPropPlacementSupport.RouteConstraint? {
+ func usable(_ p:WorldVector3)->Bool {
+   let limit:Float=1e6
+   return p.x.isFinite && p.y.isFinite && p.z.isFinite
+     && abs(p.x)<limit && abs(p.y)<limit && abs(p.z)<limit
+ }
+ let heights=[resident.y]+anchorCandidates.map(\.y)
+ guard let lowest=heights.min(), let highest=heights.max(),
+       anchorCandidates.allSatisfy(usable), usable(resident) else { return nil }
+ let map=WorldPlacementRouteMap(grid:grid,lowerHeight:lowest-0.6,upperHeight:highest+0.6)
+ guard map.nearestNode(to:resident) != nil else { return nil }
+ var positions:[String:WorldVector3]=[:]
+ for candidate in anchorCandidates where map.node(at:candidate) != nil {
+   positions["anchor.\(positions.count)"]=candidate
+ }
+ guard !positions.isEmpty else { return nil }
+ return .init(map:map,anchorIDs:positions.keys.sorted(),anchorPositions:positions)
+}
+
+/// 站立地面 + 台面的合成世界：`flatWorld` 只覆盖那一小块台面，而"居民还走不走得到
+/// 活动入口"这条判据要的是**居民与锚点所站的整片地面**。所以台面之外再给一层 y=0 的地面。
+struct FlatRoomAndTable: WorldPropSupportQuerying {
+    let minimumX:Float; let maximumX:Float; let minimumZ:Float; let maximumZ:Float
+    let table:FlatSupport
+    func canOccupy(_ capsule:WorldCapsule,at position:SIMD3<Float>)->Bool { true }
+    func groundHeight(at position:SIMD3<Float>)->Float? {
+        var candidates:[Float]=[]
+        if position.x >= minimumX, position.x <= maximumX,
+           position.z >= minimumZ, position.z <= maximumZ,
+           0 <= position.y + 0.05 { candidates.append(0) }
+        if let tableHeight=table.groundHeight(at:position) { candidates.append(tableHeight) }
+        return candidates.max()
+    }
+    func canTraverse(_ capsule:WorldCapsule,from start:SIMD3<Float>,to destination:SIMD3<Float>,
+                     maximumStepHeight:Float)->Bool { true }
+    /// 三角形顺序决定层号：地面在前（layer 0）、台面在后（layer 1）。
+    func triangles(in bounds:WorldPlanarBounds)->[WorldTriangle] {
+        var result:[WorldTriangle]=[]
+        if bounds.maximumX >= minimumX, bounds.minimumX <= maximumX,
+           bounds.maximumZ >= minimumZ, bounds.minimumZ <= maximumZ {
+            let a=SIMD3<Float>(minimumX,0,minimumZ),b=SIMD3<Float>(maximumX,0,minimumZ)
+            let c=SIMD3<Float>(maximumX,0,maximumZ),d=SIMD3<Float>(minimumX,0,maximumZ)
+            result.append(WorldTriangle(a,b,c)); result.append(WorldTriangle(a,c,d))
+        }
+        result.append(contentsOf:table.triangles(in:bounds))
+        return result
+    }
+}
 @MainActor func flatSupport()->ResidentPropPlacementSupport {
-    let bounds=WorldPlanarBounds(minimumX:flatWorld.minimumX,maximumX:flatWorld.maximumX,
-                                 minimumZ:flatWorld.minimumZ,maximumZ:flatWorld.maximumZ)
-    let grid=PropSupportGridBuilder.build(collision:flatWorld,bounds:bounds,
-                                          seed:WorldVector3(x:-2.7,y:0.52,z:-5),parameters:PropSupportGridParameters())
-    return ResidentPropPlacementSupport(grid:grid,collision:flatWorld)
+    let room=FlatRoomAndTable(minimumX:-8,maximumX:8,minimumZ:-10,maximumZ:2,table:flatWorld)
+    let bounds=WorldPlanarBounds(minimumX:-8,maximumX:8,minimumZ:-10,maximumZ:2)
+    let grid=PropSupportGridBuilder.build(collision:room,bounds:bounds,
+                                          seed:WorldVector3(x:0,y:0,z:0),parameters:PropSupportGridParameters())
+    // 活动入口与居民都在**地面**上（世界路点 y=0）；台面（y=0.52）只用来摆物件。
+    let anchors:[WorldVector3]=[
+        WorldVector3(x:-2.0,y:0,z:-5.0),
+        WorldVector3(x:-1.0,y:0,z:-3.0),
+    ]
+    return ResidentPropPlacementSupport(grid:grid,collision:room,
+        routeConstraint:routeConstraint(grid,anchorCandidates:anchors,
+                                        resident:WorldVector3(x:0,y:0,z:0)))
 }
 @main struct Tests {
     @MainActor static func main() async throws {

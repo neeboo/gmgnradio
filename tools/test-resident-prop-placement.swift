@@ -47,20 +47,70 @@ struct FlatSupport: WorldPropSupportQuerying {
 /// 覆盖 (5,0,5) 一带（旧的具名面 `floor`），但**不**覆盖 (5.9,0,5) 与 (10,0,5)：
 /// 那两处必须仍然被判成"不是承托面"。
 let flatWorld=FlatSupport(minimumX:-1,maximumX:5.5,minimumZ:-1,maximumZ:10,height:0)
-@MainActor func flatSupport()->ResidentPropPlacementSupport {
+/// 收窄后的路点约束：与生产**同一条**推导（世界路点定可站带、活动锚点定目标）。
+/// 生产里这段在 `ResidentPropGridEditorModel`（宿主侧）；这里逐字重算一遍，
+/// 因为它只是"把世界的两个数组喂进 `WorldPlacementRouteMap`"，没有别的逻辑。
+///
+/// **锚点必须取自同一个世界**（`bandManifest` 同时给出可站带与锚点）：合成平面上的
+/// 验证要用合成世界的路点，真实舱体上的验证要用真实舱体的路点。
+@MainActor func routeConstraint(_ grid:PropSupportGrid,_ manifest:WorldManifest)->ResidentPropPlacementSupport.RouteConstraint? {
+ /// 病态世界坐标（非有限 / 离谱）一律当作"拿不到判据"。生产里这条在
+ /// `ResidentPropGridEditorModel.isUsableWorldPosition`（列号换算会溢出，而溢出不是判据）。
+ func usable(_ p:WorldVector3)->Bool {
+   let limit:Float=1e6
+   return p.x.isFinite && p.y.isFinite && p.z.isFinite
+     && abs(p.x)<limit && abs(p.y)<limit && abs(p.z)<limit
+ }
+ let heights=manifest.waypoints.filter(\.enabled).map(\.position.y)
+ guard let lowest=heights.min(), let highest=heights.max() else { return nil }
+ let map=WorldPlacementRouteMap(grid:grid,lowerHeight:lowest-0.2,upperHeight:highest+0.2)
+ var positions:[String:WorldVector3]=[:]
+ for activity in manifest.activities {
+   guard let waypoint=manifest.waypoints.first(where:{ $0.id==activity.entryWaypointID && $0.enabled }),
+         usable(waypoint.position) else { return nil }
+   positions[activity.entryWaypointID]=waypoint.position
+ }
+ guard !positions.isEmpty else { return nil }
+ return .init(map:map,anchorIDs:positions.keys.sorted(),anchorPositions:positions)
+}
+/// 合成平面的支撑几何。
+///
+/// `bandSource` 是**可站带的来源**（世界路点高度）：生产里就是当前世界的路点。
+/// 这里之所以要分开传，是因为下面有几段在**合成世界**上验证，而"居民当前位置能不能
+/// 走到锚点"是按**世界里真的路点**算的 —— 拿另一个世界的路点来算，居民与锚点根本不在
+/// 同一片坐标里，判据只会 fail-closed 拒绝一切（那正是它该做的）。
+@MainActor func flatSupport(_ manifest:WorldManifest)->ResidentPropPlacementSupport {
  let bounds=WorldPlanarBounds(minimumX:flatWorld.minimumX,maximumX:flatWorld.maximumX,
                               minimumZ:flatWorld.minimumZ,maximumZ:flatWorld.maximumZ)
  let grid=PropSupportGridBuilder.build(collision:flatWorld,bounds:bounds,
                                        seed:WorldVector3(x:5,y:0,z:5),parameters:PropSupportGridParameters())
- return ResidentPropPlacementSupport(grid:grid,collision:flatWorld)
+ return ResidentPropPlacementSupport(grid:grid,collision:flatWorld,
+   routeConstraint:routeConstraint(grid,manifest))
 }
 @MainActor func require(_ b:Bool,_ s:String) { if !b { print("FAIL: \(s)"); exit(1) } }
 @main struct Test {
  @MainActor static func main() throws {
   let manifest = try JSONDecoder().decode(WorldManifest.self,from:Data(contentsOf:URL(fileURLWithPath:"apps/macos/Resources/Worlds/marble-living-cabin/world.json")))
-  let disk=Disk(); let context=try WorldAgentContext(manifest:manifest,persistence:disk)
+  let identity=WorldQuaternion(x:0,y:0,z:0,w:1)
+  let unit=WorldVector3(x:1,y:1,z:1)
+  let fixture=WorldManifest(schemaVersion:manifest.schemaVersion,packageID:"test",packageVersion:"1",worldID:"test",displayName:"test",calibration:manifest.calibration,
+   spawn:.init(position:.init(x:0,y:0,z:0),rotation:identity,scale:unit),
+   collisionVolumes:[.init(id:"fixed",center:.init(x:4,y:0.5,z:0),halfExtents:.init(x:0.5,y:0.5,z:0.5),rotation:identity,isBlocking:true)],
+   waypoints:[.init(id:"a",position:.init(x:1,y:0,z:2),arrivalRadius:0.2,enabled:true),.init(id:"b",position:.init(x:3,y:0,z:2),arrivalRadius:0.2,enabled:true)],
+   routes:[.init(id:"route",waypointIDs:["a","b"],bidirectional:true,enabled:true)],
+   // 收窄后的判据要的是**活动锚点**：这条 sit 让 `routeConstraint` 有目标，"挡住入口"
+   // 才有一条真的判据可验（没有活动 ⇒ 拿不到判据 ⇒ fail-closed 拒绝一切）。
+   activities:[.init(id:"sit",action:"sit",entryWaypointID:"a",
+     transform:.init(position:.init(x:1,y:0,z:2),rotation:identity,scale:unit),
+     motionID:nil,propIDs:[],interruptible:true)],
+   cameras:[],capabilities:[],resources:[])
+  // **合成世界**（`fixture`）：可站带与活动锚点都取自它，所以"格子 + footprint"与
+  // "居民还走得到锚点"这两条判据在同一片坐标里。用真实舱体的路点给合成平面算，
+  // 居民与锚点根本不在同一处，判据只会 fail-closed 拒绝一切。
+  let fixtureDisk=Disk()
+  let context=try WorldAgentContext(manifest:fixture,persistence:fixtureDisk)
   context.installCollisionWorld(Floor())
-  let flat=flatSupport()
+  let flat=flatSupport(fixture)
   var authorized=true
   let service=ResidentPropPlacementService(context:context,support:{flat},isCurrent:{authorized})
   let prop=WorldGeneratedProp(objectID:"prop1",sourceWishID:"wish1",assetID:"asset1",displayName:"Coffee",size:.init(x:0.4,y:0.42,z:0.4),sourceHeight:2)
@@ -69,17 +119,17 @@ let flatWorld=FlatSupport(minimumX:-1,maximumX:5.5,minimumZ:-1,maximumZ:10,heigh
   let placement=WorldPropPlacement(surfaceID:"floor",position:.init(x:5,y:0,z:5),yaw:0)
   _ = try service.preview(objectID:"prop1",placement:placement)
   require(context.state==before,"preview mutated state")
-  disk.fail=true
+  fixtureDisk.fail=true
   do { _ = try service.commit(.place(objectID:"prop1",placement:placement),expectedLayoutRevision:1,requestID:"place"); fatalError("save failure accepted") } catch {}
   require(context.state==before && context.collisionWorld.canOccupy(.init(radius:0.1,height:1),at:SIMD3(5,0,5)),"failed save changed state/collision")
-  disk.fail=false
+  fixtureDisk.fail=false
   _ = try service.commit(.place(objectID:"prop1",placement:placement),expectedLayoutRevision:1,requestID:"place")
   require(!context.collisionWorld.canOccupy(.init(radius:0.1,height:1),at:SIMD3(5,0,5)),"new object not blocking")
   require(context.collisionWorld.groundHeight(at:SIMD3(5,0,5))==0,"object top became ground")
   context.installCollisionWorld(Floor())
   require(!context.collisionWorld.canOccupy(.init(radius:0.1,height:1),at:SIMD3(5,0,5)),"base replacement lost object")
   require(!context.collisionWorld.canOccupy(.init(radius:0.1,height:1),at:SIMD3(10,0,5)),"base replacement lost environment")
-  let restored=try WorldAgentContext(manifest:manifest,persistence:disk)
+  let restored=try WorldAgentContext(manifest:fixture,persistence:fixtureDisk)
   restored.installCollisionWorld(Floor())
   require(!restored.collisionWorld.canOccupy(.init(radius:0.1,height:1),at:SIMD3(5,0,5)),"restore lost object collision")
   do { _ = try service.preview(objectID:"prop1",placement:.init(surfaceID:"floor",position:.init(x:5.9,y:0,z:5),yaw:.pi/4)); fatalError("edge crossing accepted") }
@@ -96,17 +146,17 @@ let flatWorld=FlatSupport(minimumX:-1,maximumX:5.5,minimumZ:-1,maximumZ:10,heigh
   do { _ = try failingHold.commit(delayedHold,expectedLayoutRevision:2,requestID:"changed-avatar");fatalError("changed avatar accepted") }
   catch let error as ResidentPropPlacementError { require(error == .avatarChanged,"wrong changed-avatar rejection") }
   require(context.state == placed,"changed avatar committed a hold")
-  savedAvatarID = "pmx.2b-miss-0414-standard";disk.fail=true
+  savedAvatarID = "pmx.2b-miss-0414-standard";fixtureDisk.fail=true
   do { _ = try failingHold.commit(delayedHold,expectedLayoutRevision:2,requestID:"failed-hold-save");fatalError("failed hold save accepted") } catch {}
   require(context.state == placed && context.state.heldProp == nil,"failed hold persistence changed state")
-  disk.fail=false
+  fixtureDisk.fail=false
   _ = try failingHold.commit(delayedHold,expectedLayoutRevision:2,requestID:"saved-hold")
   let heldBeforeFailedReturn = context.state
   let delayedReturn = try failingHold.returnHeldCommand(objectID:"prop1")
-  disk.fail=true
+  fixtureDisk.fail=true
   do { _ = try failingHold.commit(delayedReturn,expectedLayoutRevision:3,requestID:"failed-return-save");fatalError("failed return save accepted") } catch {}
   require(context.state == heldBeforeFailedReturn && context.state.heldProp?.objectID == "prop1","failed return persistence claimed the hand was clear")
-  disk.fail=false
+  fixtureDisk.fail=false
   _ = try failingHold.commit(delayedReturn,expectedLayoutRevision:3,requestID:"saved-return")
   let readyAfterReturn = context.state
   authorized=false
@@ -127,21 +177,10 @@ let flatWorld=FlatSupport(minimumX:-1,maximumX:5.5,minimumZ:-1,maximumZ:10,heigh
    if !reentered { reentered=true; _ = try service.commit(.withdraw(objectID:"prop1"),expectedLayoutRevision:context.state.layoutRevision,requestID:"newer") }
   })
   do { _ = try reentrant.commit(.place(objectID:"prop1",placement:placement),expectedLayoutRevision:context.state.layoutRevision,requestID:"outer"); fatalError("preparation overwrote newer state") } catch {}
-  require(context.state.objectStates["prop1"]?.isEnabled == false,"reentrant newer layout lost")
-  // 拿不到承托几何 → fail-closed（`support` 默认 `{ nil }`），而不是"随便放"。
-  let unready=ResidentPropPlacementService(context:context)
-  do { _ = try unready.preview(objectID:"prop1",placement:placement); fatalError("missing environment accepted") }
-  catch let error as ResidentPropPlacementError { require(error == .environmentNotReady,"wrong missing-environment rejection: \(error)") }
-  let identity=WorldQuaternion(x:0,y:0,z:0,w:1)
-  let unit=WorldVector3(x:1,y:1,z:1)
-  let fixture=WorldManifest(schemaVersion:manifest.schemaVersion,packageID:"test",packageVersion:"1",worldID:"test",displayName:"test",calibration:manifest.calibration,
-   spawn:.init(position:.init(x:0,y:0,z:0),rotation:identity,scale:unit),
-   collisionVolumes:[.init(id:"fixed",center:.init(x:4,y:0.5,z:0),halfExtents:.init(x:0.5,y:0.5,z:0.5),rotation:identity,isBlocking:true)],
-   waypoints:[.init(id:"a",position:.init(x:1,y:0,z:2),arrivalRadius:0.2,enabled:true),.init(id:"b",position:.init(x:3,y:0,z:2),arrivalRadius:0.2,enabled:true)],
-   routes:[.init(id:"route",waypointIDs:["a","b"],bidirectional:true,enabled:true)],activities:[],cameras:[],capabilities:[],resources:[])
   let routeContext=try WorldAgentContext(manifest:fixture)
   routeContext.installCollisionWorld(Floor())
-  let routing=ResidentPropPlacementService(context:routeContext,support:{flat})
+  let routeFlat=flatSupport(fixture)
+  let routing=ResidentPropPlacementService(context:routeContext,support:{routeFlat})
   _ = try routing.commit(.register(prop),expectedLayoutRevision:0,requestID:"import")
   func rejection(_ x:Float,_ z:Float,_ expected:ResidentPropPlacementError) throws {
    do { _ = try routing.preview(objectID:"prop1",placement:.init(surfaceID:"floor",position:.init(x:x,y:0,z:z),yaw:0)); fatalError("unsafe placement accepted") }
@@ -151,14 +190,21 @@ let flatWorld=FlatSupport(minimumX:-1,maximumX:5.5,minimumZ:-1,maximumZ:10,heigh
   // 阻挡体积/已放物件的互斥现在由 `PropPlacementEvaluator` 判定，所以原因走
   // `.blockedBySupport(...)`（旧的 `.collision(id)` 通道已经不存在）。
   try rejection(4,0,.blockedBySupport(.blockedByBlockingVolume("fixed")))
+  // 收窄后：挡住**活动入口**（锚点自己那一格）必须被拒。fixture 的 sit 活动锚在 a。
   try rejection(1,2,.blockedRoute("a"))
-  try rejection(2,2,.blockedRoute("route"))
+  // 中间路点被压住**不再**否决摆放（这正是本次收窄）。fixture 两个路点都是锚点，
+  // 所以这条由 `tools/test-resident-prop-one-judge.swift` 在真实舱体上钉住。
+  require(context.state.objectStates["prop1"]?.isEnabled == false,"reentrant newer layout lost")
+  // 拿不到承托几何 → fail-closed（`support` 默认 `{ nil }`），而不是"随便放"。
+  let unready=ResidentPropPlacementService(context:context)
+  do { _ = try unready.preview(objectID:"prop1",placement:placement); fatalError("missing environment accepted") }
+  catch let error as ResidentPropPlacementError { require(error == .environmentNotReady,"wrong missing-environment rejection: \(error)") }
   _ = try routing.commit(.place(objectID:"prop1",placement:.init(surfaceID:"floor",position:.init(x:5,y:0,z:5),yaw:0)),expectedLayoutRevision:1,requestID:"first-place")
   let second=WorldGeneratedProp(objectID:"prop2",sourceWishID:"wish2",assetID:"asset2",displayName:"Second",size:prop.size,sourceHeight:2)
   _ = try routing.commit(.register(second),expectedLayoutRevision:2,requestID:"second-import")
   do { _ = try routing.preview(objectID:"prop2",placement:.init(surfaceID:"floor",position:.init(x:5,y:0,z:5),yaw:0)); fatalError("overlapping props accepted") }
   catch let error as ResidentPropPlacementError { require(error == .blockedBySupport(.blockedByPlacedProp("prop1")) || error == .blockedBySupport(.blockedByPlacedProp("prop2")),"wrong overlap rejection: \(error)") }
-  let holding=ResidentPropPlacementService(context:routeContext,support:{flat},
+  let holding=ResidentPropPlacementService(context:routeContext,support:{routeFlat},
     currentAvatarAssetID:{"pmx.2b-miss-0414-standard"},makeGripCalibration:{ prop,avatarID in
       .init(avatarAssetID:avatarID,hand:.rightHand,normalizedGrip:.init(x:0.5,y:0.2,z:0.5),
         localOffset:.init(x:0,y:0,z:0),localRotation:identity)
@@ -175,10 +221,20 @@ let flatWorld=FlatSupport(minimumX:-1,maximumX:5.5,minimumZ:-1,maximumZ:10,heigh
   let huge=WorldManifest(schemaVersion:fixture.schemaVersion,packageID:"huge",packageVersion:"1",worldID:"huge",displayName:"huge",calibration:fixture.calibration,spawn:fixture.spawn,collisionVolumes:[],
    waypoints:[.init(id:"a",position:.init(x:-1e38,y:0,z:0),arrivalRadius:0.2,enabled:true),.init(id:"b",position:.init(x:1e38,y:0,z:0),arrivalRadius:0.2,enabled:true)],
    routes:[.init(id:"huge-route",waypointIDs:["a","b"],bidirectional:true,enabled:true)],activities:[],cameras:[],capabilities:[],resources:[])
+  // 病态的路线输入（±1e38）现在是**锚点位置的可用性**判据：拿不到可用锚点 ⇒ 拿不到约束
+  // ⇒ 服务 fail-closed 拒绝摆放。列号换算绝不接受这种输入（会溢出，而溢出不是判据）。
   let hugeContext=try WorldAgentContext(manifest:huge)
-  let hugeService=ResidentPropPlacementService(context:hugeContext)
-  do { _ = try hugeService.commit(.register(prop),expectedLayoutRevision:0,requestID:"huge"); fatalError("oversized route accepted") }
-  catch let error as ResidentPropPlacementError { require(error == .blockedRoute("huge-route"),"wrong oversized route rejection") }
+  let hugeService=ResidentPropPlacementService(context:hugeContext,support:{flatSupport(huge)})
+  _ = try hugeService.commit(.register(prop),expectedLayoutRevision:0,requestID:"huge-import")
+  // 真的摆一件：判据要的是"摆放之后还走不走得到锚点"，而锚点位置不可用 ⇒ 拿不到约束
+  // ⇒ fail-closed 拒绝（而不是拿一个会溢出的坐标去算列号）。
+  do {
+    _ = try hugeService.commit(.place(objectID:"prop1",
+        placement:.init(surfaceID:"floor",position:.init(x:5,y:0,z:5),yaw:0)),
+        expectedLayoutRevision:hugeContext.state.layoutRevision,requestID:"huge-place")
+    fatalError("oversized route accepted")
+  }
+  catch let error as ResidentPropPlacementError { require(error == .environmentNotReady,"wrong oversized route rejection: \(error)") }
   print("PASS: layout preview, atomic save including hold, reserved footprint, collision recovery, bounds and stop checks")
  }
 }

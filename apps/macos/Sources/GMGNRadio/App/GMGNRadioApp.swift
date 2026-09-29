@@ -3633,7 +3633,13 @@ final class AppDelegate:
             support: { [weak self] in
                 guard let self, let grid = self.residentPropGridEditor.grid,
                       let collision = self.residentPropGridEditor.supportCollision else { return nil }
-                return ResidentPropPlacementSupport(grid: grid, collision: collision)
+                return ResidentPropPlacementSupport(
+                    grid: grid,
+                    collision: collision,
+                    // 「别把唯一通路堵死」这条判据的全部输入（收窄后）。
+                    // 拿不到就返回 nil ⇒ 服务拒绝摆放（fail-closed）。
+                    routeConstraint: self.residentPropRouteConstraint()
+                )
             },
             prepare: { [weak self] prop in
                 guard let self, let asset = self.residentOwnedPropAssets[prop.objectID], asset.prop == prop,
@@ -3852,6 +3858,10 @@ final class AppDelegate:
         }
         guard let stageWindowController else { return false }
         stageWindowController.updateResidentPropEditor(residentPropEditorSnapshot(context: context))
+        // 房间里现在有什么变了 ⇒ 那一批"这一格能不能放"的答案全部作废。
+        // 判定依赖"现在房间里有什么"，复用旧答案会让红/绿与落地判定分叉 ——
+        // 那正是这次要修的缺陷，绝不能靠缓存重新引入。
+        residentPropGridEditor.invalidateVerdicts()
         for (id, status) in spatialStage.residentPropRenderStatuses {
             if case .failed(_, let message) = status, residentPropNotices[id] != message {
                 showResidentVoiceStatus("物件显示失败，已保存的摆放和所有权仍保留：\(message)")
@@ -4001,6 +4011,17 @@ final class AppDelegate:
     /// "这一步有没有发生、结果是什么"。
     private func activateResidentPropGrid(context: WorldAgentContext) {
         residentPropGridEditor.onGridChanged = { [weak self] in self?.publishResidentPropGrid() }
+        // 格子的黄/红 = **与落地完全相同的那条判定**（摆放服务）。这一条接线是这次修复的
+        // 核心：着色那条路过去跑的是 `PropPlacementEvaluator`（完全不知道路点/通道），
+        // 与落地那条路分叉，于是"格子说可放、一点却被拒绝"（真机 273/273）。
+        residentPropGridEditor.verdictForPlacement = { [weak self] objectID, footprint, height, position, yaw in
+            self?.residentPropVerdict(objectID: objectID, footprint: footprint, height: height,
+                                      position: position, yaw: yaw)
+        }
+        // 「居民还走不走得到活动锚点」这条判据的**可站带**：世界路点的高度范围。
+        // 居民只在这些高度上站立/行走，桌面与屋顶都在带外。必须在任何一次摆放判定之前
+        // 写进模型，否则移动图建不出来 ⇒ 服务 fail-closed 拒绝摆放。
+        residentPropGridEditor.setRouteBand(fromWaypoints: context.manifest.waypoints)
         let collision = context.propSupportQuerying
         let bounds = residentPropGridBounds(context: context)
         guard let collision, let bounds else {
@@ -4136,6 +4157,56 @@ final class AppDelegate:
         updateResidentPropGridHover(normalized: normalized)
     }
 
+    /// 「居民还走不走得到活动锚点」这条判据的全部输入（**收窄后**的唯一一条路点约束）。
+    ///
+    /// 唯一一份推导在格子模型里（`ResidentPropGridEditorModel.routeConstraint(activities:waypoints:)`）：
+    /// 移动图按网格缓存、锚点取 `WorldActivityAnchor.entryWaypointID`。这里只负责
+    /// 把世界的活动与路点喂进去。
+    ///
+    /// 拿不到任何一项就返回 nil ⇒ 服务拒绝摆放（fail-closed），而不是跳过判据。
+    private func residentPropRouteConstraint() -> ResidentPropPlacementSupport.RouteConstraint? {
+        guard let context = livingWorldContext else { return nil }
+        return residentPropGridEditor.routeConstraint(
+            activities: context.manifest.activities,
+            waypoints: context.manifest.waypoints
+        )
+    }
+
+    /// 格子的黄/红 = **与落地完全相同的那条判定**（`ResidentPropPlacementService`）。
+    ///
+    /// 这是这次修复的核心：真机 2026-09-29 的缺陷是"格子说可放、一点却被拒绝" ——
+    /// 着色走的是 `PropPlacementEvaluator`（不知道路点），落地走的是服务校验（还要求
+    /// 居民走得到锚点）。273 个"可放=true"的去重格被服务拒绝 273/273。
+    ///
+    /// 现在把服务的判定包成同步闭包交给格子模型：服务接受 ⇒ 黄；服务拒绝 ⇒ 红，
+    /// 且光标旁那枚标签显示的**就是服务给出的原因**。
+    private func residentPropVerdict(objectID: String, footprint: SIMD2<Float>, height: Float,
+                                     position: WorldVector3, yaw: Float) -> PropSupportBlockReason? {
+        guard let context = livingWorldContext else { return nil }
+        let service = residentPropPlacementService(context: context, isCurrent: { [weak self] in
+            self?.livingWorldContext === context && self?.residentPropEditingWorldID != nil
+        })
+        let placement = WorldPropPlacement(
+            surfaceID: residentPropGridEditor.hoveredLayerName ?? "grid",
+            position: position,
+            yaw: yaw
+        )
+        do {
+            // **同一个函数**：落地走 `preview` / `commit`，格子着色走这里 ——
+            // 两条路的差别只有"读不读返回值"。
+            _ = try service.previewState(objectID: objectID, placement: placement)
+            return nil
+        } catch {
+            // 原因必须**可读**，而且要与落地时面板上那句话同源：几何类原因直接投影，
+            // 通道类原因投影成 `.blockedRoute`（文案在 `PropSupportBlockReason` 里）。
+            if let reason = error as? PropSupportBlockReason { return reason }
+            if case ResidentPropPlacementError.blockedRoute(let id) = error { return .blockedRoute(id) }
+            if case ResidentPropPlacementError.blockedBySupport(let reason) = error { return reason }
+            if case ResidentPropPlacementError.collision = error { return .blockedByMesh }
+            return .noSupport
+        }
+    }
+
     /// 悬停与落地**共用**的拾取步骤。
     ///
     /// 两处必须用完全一样的输入（投影、footprint 尺寸/高度、阻挡体积、已放物件），
@@ -4149,13 +4220,21 @@ final class AppDelegate:
             return false
         }
         let footprint = stageWindowController?.residentPropFootprint
-        let size = footprint?.size ?? SIMD2(repeating: residentPropGridEditor.spacing)
-        let height = footprint?.height ?? residentPropGridEditor.spacing
+        // 没有在携带任何物件时**不判定**（也就没有一格会变绿）：格子的黄/红由摆放服务
+        // 回答，而服务是按 objectID 判定的，没有物件就没有那条判定。
+        guard let footprint, let objectID = stageWindowController?.residentPropSelectedObjectID else {
+            residentPropGridEditor.clearHover()
+            noteResidentPropGridHoverResult(normalized: normalized)
+            updateResidentPropHoverTarget(normalized: normalized,
+                                          projection: projection.inverseViewProjection, context: context)
+            return true
+        }
         residentPropGridEditor.updateHover(
             normalizedCursor: normalized,
             inverseViewProjection: projection.inverseViewProjection,
-            footprintSize: size,
-            height: height,
+            footprintSize: footprint.size,
+            height: footprint.height,
+            objectID: objectID,
             blockingVolumes: context.manifest.collisionVolumes.filter(\.isBlocking),
             placedProps: context.state.objectStates.values.compactMap(\.generatedCollisionVolume)
         )

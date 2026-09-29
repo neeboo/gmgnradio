@@ -8,6 +8,29 @@ import WorldRuntime
 struct ResidentPropPlacementSupport {
     let grid: PropSupportGrid
     let collision: any WorldPropSupportQuerying
+    /// 「挡住居民走路」这条判据的全部输入。
+    ///
+    /// 现在的判据是**收窄后**的：从居民当前位置出发，还能不能走到每一个活动锚点
+    /// （见 `WorldPlacementRouteMap`）。它替代了旧的"643 个路点 + 2354 条路线的
+    /// 0.1 m 采样都必须空着"——后者在真机舱体上让地板一格都放不下。
+    ///
+    /// `nil` = 调用方拿不到移动图 ⇒ 这条判据**拒绝**（fail-closed），而不是跳过。
+    var routeConstraint: RouteConstraint?
+
+    /// 缺省 = 拿不到移动图 = 拒绝（fail-closed）。生产宿主必须显式给出。
+    init(grid: PropSupportGrid,
+         collision: any WorldPropSupportQuerying,
+         routeConstraint: RouteConstraint? = nil) {
+        self.grid = grid
+        self.collision = collision
+        self.routeConstraint = routeConstraint
+    }
+
+    struct RouteConstraint {
+        let map: WorldPlacementRouteMap
+        let anchorIDs: [String]
+        let anchorPositions: [String: WorldVector3]
+    }
 }
 
 enum ResidentPropPlacementError: Error, Equatable, LocalizedError {
@@ -22,7 +45,7 @@ enum ResidentPropPlacementError: Error, Equatable, LocalizedError {
         case .blockedBySupport(let reason): reason.errorDescription
         case .outsideSurface: "物件超出了支撑面的范围。"
         case .collision(let name): "这里会碰到居民或物件：\(name)。"
-        case .blockedRoute(let name): "这里会挡住活动入口或通道：\(name)。"
+        case .blockedRoute(let name): "摆在这里居民就走不到 \(name) 了。"
         case .avatarUnavailable: "当前没有可用于手持展示的居民。"
         case .avatarChanged: "居民已经更换，这次手持操作没有保存。"
         case .attachmentUnsupported(let reason): reason
@@ -150,11 +173,25 @@ final class ResidentPropPlacementService {
 
     func preview(objectID: String, placement: WorldPropPlacement) throws -> WorldObjectState {
         guard isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
+        return try previewState(objectID: objectID, placement: placement)
+            .objectStates[objectID]!
+    }
+
+    /// `preview` 的**同步**形态，供"格子该是什么颜色"使用。
+    ///
+    /// 为什么要有它：格子的黄/红必须由**与落地完全相同的那条判定**决定（真机 2026-09-29 的
+    /// 缺陷是"格子说可放、一点却被拒绝"）。而 `preview` 是 `async` —— 着色那条路是每帧
+    /// 同步跑的（鼠标一动就要出新颜色），拿不到它的结果。这里把同一条判定（`validate`，
+    /// 一个字都不改）暴露成同步调用，于是"格子颜色"与"落地"是**同一个函数**的返回值。
+    ///
+    /// 仍然 fail-closed：拒绝就是拒绝，抛出的原因就是光标旁那枚标签要显示的原因。
+    func previewState(objectID: String, placement: WorldPropPlacement) throws -> WorldState {
+        guard isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
         var candidate = WorldSimulation(restoring: context.state)
         try candidate.applyPropLayout(.place(objectID: objectID, placement: placement),
             expectedLayoutRevision: context.state.layoutRevision, requestID: "preview.\(UUID())")
         try validate(candidate.state)
-        return candidate.state.objectStates[objectID]!
+        return candidate.state
     }
 
     @discardableResult
@@ -194,12 +231,14 @@ final class ResidentPropPlacementService {
             placed.append((held.objectID, held.returnState, volume))
         }
         // 承托几何拿不到就一律拒绝（fail-closed），而不是"随便放"。
-        let support = support()
+        //
+        // 守卫在**循环里**是刻意的：`register`（只把物件收进库存、还没摆出来）没有承托面可判，
+        // 于是它不需要承托几何也能成立；只有真的要判定"摆在哪"时才要求几何。
         for (id,item,box) in placed {
             guard item.generatedProp?.objectID == id, let prop = item.generatedProp else {
                 throw WorldPropLayoutError.invalidObject
             }
-            guard let support else { throw ResidentPropPlacementError.environmentNotReady }
+            guard let support = support() else { throw ResidentPropPlacementError.environmentNotReady }
             // 摆放校验 = 「格子 + footprint」：物件必须坐在**某一层格子**上，整块 footprint
             // 在该层放得下。网格、阻挡体积、已放物件、净空、越界全部由评估器判定。
             // 因此状态里的 surfaceID 现在只是一个随状态存下来的标签，不再参与校验。
@@ -225,30 +264,65 @@ final class ResidentPropPlacementService {
             // 对局部三角形做了 SAT 判定，还单独做了独立体积的 OBB-OBB 判定 —— 两者都更精确，
             // 那句胶囊检查只会制造假拒绝（实测：真实舱体地面上它把可放格数压到几乎为零）。
         }
-        let obstacles = CollisionVolumeWorld(volumes: placed.map(\.2))
-        let capsule = WorldCapsule(radius: 0.25,height: 1.8)
-        func clear(_ p: WorldVector3, radius: Float = 0.25) -> Bool {
-            obstacles.canOccupy(.init(radius: max(0.25,radius),height: max(1.8,2*radius)),at: SIMD3(p.x,p.y,p.z))
-        }
-        guard clear(state.agentTransform.position) else { throw ResidentPropPlacementError.collision("居民") }
-        for point in context.manifest.waypoints where point.enabled {
-            guard clear(point.position,radius: point.arrivalRadius) else { throw ResidentPropPlacementError.blockedRoute(point.id) }
-        }
-        for activity in context.manifest.activities {
-            guard clear(activity.transform.position) else { throw ResidentPropPlacementError.blockedRoute(activity.id) }
-        }
-        let points = Dictionary(uniqueKeysWithValues: context.manifest.waypoints.map { ($0.id,$0.position) })
-        for route in context.manifest.routes where route.enabled {
-            for pair in zip(route.waypointIDs,route.waypointIDs.dropFirst()) {
-                guard let a=points[pair.0], let b=points[pair.1] else { continue }
-                let dx=Double(b.x)-Double(a.x),dy=Double(b.y)-Double(a.y),dz=Double(b.z)-Double(a.z)
-                let stepCount=ceil(sqrt(dx*dx+dy*dy+dz*dz)/0.1)
-                guard stepCount.isFinite, stepCount <= 10_000 else { throw ResidentPropPlacementError.blockedRoute(route.id) }
-                let start=SIMD3(a.x,a.y,a.z),end=SIMD3(b.x,b.y,b.z),d=end-start
-                let steps=max(1,Int(stepCount))
-                for i in 0...steps where !obstacles.canOccupy(capsule,at:start+d*(Float(i)/Float(steps))) {
-                    throw ResidentPropPlacementError.blockedRoute(route.id)
-                }
+        // 「别把居民关在里面 / 别把唯一通路堵死」——**收窄后**的这一条判据。
+        //
+        // 旧实现（2026-09-29 之前）要求：居民当前位置、**全部 643 个路点**、6 个活动锚点、
+        // 以及 2354 条路线的 0.1 m 采样点，全都能容纳 0.25 m 的站立胶囊。真机实测：
+        // 格子说"可放"的 273 个去重格被服务拒绝 273/273，理由全是 `blockedRoute(waypoint …)`；
+        // 存档 9 条摆放回执**全部**落在展示台 y=0.52，地面层一条都没有。也就是说那条判据
+        // 实际上禁止了一切地面装修。
+        //
+        // 为什么它过分：导航图是烘焙产物、**运行时本来就会绕路**（惰性重规划：路由器在提议
+        // 路径上逐段问 `canTraverse`，遇到受阻的有向边就记下来改道，见
+        // `WorldNavigationRouting.route(from:to:canTraverse:)`）。所以"家具压住某个中间路点"
+        // 不是致命错误 —— 真实的房间装修就是允许你在走道上放东西，居民绕过去。
+        //
+        // 为什么不能干脆不检查：把**唯一通路**（门口/独木桥）堵死，目标锚点就永久不可达，
+        // 那次活动会永久失败，而用户看到的仍是一格绿。所以保留的正是这条**真的会坏掉**的
+        // 约束：从居民当前位置出发，还能走到每一个活动锚点吗。
+        //
+        // 代价：用派生好的承托格子当移动图做一次 BFS（`WorldPlacementRouteMap`），
+        // 每个节点 O(1)。不碰三角形网格 —— 真路由器每问一条边要 2.5 s（实测中位），
+        // 一次摆放判定 16 s，鼠标一动跑不了。
+        // 「别把居民夹在墙里」：居民**现在站的地方**不能被这件新家具压住。
+        // 这一条与旧实现同口径（0.25 m / 1.8 m 的站立胶囊），只对居民自己这一个点判定。
+        if !placed.isEmpty {
+            let obstacles = CollisionVolumeWorld(volumes: placed.map(\.2))
+            guard obstacles.canOccupy(WorldCapsule(radius: 0.25, height: 1.8),
+                                      at: SIMD3(state.agentTransform.position.x,
+                                                state.agentTransform.position.y,
+                                                state.agentTransform.position.z)) else {
+                throw ResidentPropPlacementError.collision("居民")
+            }
+            // 「别把唯一通路堵死」——**收窄后**的这一条判据（见上面的长说明）。
+            guard let support = support(), let constraint = support.routeConstraint else {
+                throw ResidentPropPlacementError.environmentNotReady
+            }
+            // 移动图上的障碍 = **房间里现在所有**带阻挡体积的物件（含这一件候选）。
+            // 把既有的也算进来，判据就同时覆盖"新家具和旧家具合起来把路堵死"。
+            var occupied: Set<Int> = []
+            for (_, item, box) in placed {
+                guard let prop = item.generatedProp,
+                      let layer = Self.supportLayer(at: item.transform.position, grid: support.grid)
+                else { continue }
+                let yaw = atan2(2*(box.rotation.w*box.rotation.y), 1-2*box.rotation.y*box.rotation.y)
+                let footprint = WorldPlanarFootprint(size: SIMD2(prop.size.x, prop.size.z), yaw: yaw)
+                occupied.formUnion(constraint.map.blockedNodes(
+                    footprint: footprint, height: prop.size.y,
+                    at: layer.column, supportHeight: layer.supportHeight))
+            }
+            switch constraint.map.decision(
+                blockedNodes: occupied,
+                anchorIDs: constraint.anchorIDs,
+                anchorPositions: constraint.anchorPositions,
+                residentPosition: state.agentTransform.position
+            ) {
+            case .allowed:
+                break
+            case .blockedAnchor(let id), .blockedRoute(let id):
+                throw ResidentPropPlacementError.blockedRoute(id)
+            case .unavailable:
+                throw ResidentPropPlacementError.environmentNotReady
             }
         }
     }

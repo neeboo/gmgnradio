@@ -95,14 +95,107 @@ struct FlatSupport: WorldPropSupportQuerying {
 /// 与旧面 `resident.display_table` 同范围同高度：中心 (2, 0.52, 2)、半长 (0.5, 0, 0.5)。
 let displayTableWorld = FlatSupport(minimumX: 1, maximumX: 3, minimumZ: 1, maximumZ: 3, height: 0.52)
 
+/// 收窄后的路点约束：与生产**同一条**推导。
+///
+/// 判据要的三样东西必须取自**同一个世界**：可站带（路点高度）、锚点位置、居民当前位置。
+/// 合成平面上的验证要用合成世界的路点/居民 —— 拿真实舱体的路点给合成平面算，居民与锚点
+/// 根本不在同一片坐标里，判据只会 fail-closed 拒绝一切（那正是它该做的）。
+///
+/// `probeFootprint`/`probeHeight`/`probeAnchorColumn` 给出"这次要摆的那一件"：
+/// 候选锚点里**被它压住**的不算锚点（居民在那次活动里本来就站不上去了）——
+/// 合成场景里"活动入口"要由调用方指定，这个过滤让调用方不必手算物件半径。
+/// 一个锚点都不剩时返回 nil ⇒ 服务拒绝摆放（fail-closed）。
+@MainActor func routeConstraint(_ grid:PropSupportGrid,
+                                anchorCandidates:[WorldVector3],
+                                resident:WorldVector3,
+                                probeFootprint:WorldPlanarFootprint?=nil,
+                                probeHeight:Float=0.3,
+                                probeAnchorColumn:PropSupportColumn?=nil)
+ -> ResidentPropPlacementSupport.RouteConstraint? {
+ func usable(_ p:WorldVector3)->Bool {
+   let limit:Float=1e6
+   return p.x.isFinite && p.y.isFinite && p.z.isFinite
+     && abs(p.x)<limit && abs(p.y)<limit && abs(p.z)<limit
+ }
+ let heights=[resident.y]+anchorCandidates.map(\.y)
+ guard let lowest=heights.min(), let highest=heights.max(),
+       anchorCandidates.allSatisfy(usable), usable(resident) else { return nil }
+ let map=WorldPlacementRouteMap(grid:grid,lowerHeight:lowest-0.6,upperHeight:highest+0.6)
+ guard map.nearestNode(to:resident) != nil else { return nil }
+ var positions:[String:WorldVector3]=[:]
+ for candidate in anchorCandidates {
+   guard map.node(at:candidate) != nil else { continue }
+   if let probeFootprint, let probeAnchorColumn {
+     let occupied=map.blockedNodes(footprint:probeFootprint,height:probeHeight,
+       at:probeAnchorColumn,supportHeight:candidate.y)
+     if let node=map.node(at:candidate), occupied.contains(node) { continue }
+   }
+   positions["anchor.\(positions.count)"]=candidate
+ }
+ guard !positions.isEmpty else { return nil }
+ return .init(map:map,anchorIDs:positions.keys.sorted(),anchorPositions:positions)
+}
+
+
+
+
+/// 站立地面 + 台面的合成世界：`displayTableWorld` 只覆盖 (1,1)-(3,3) 的台面，
+/// 而"居民还走不走得到活动入口"这条判据需要**居民与锚点所站的整片地面**。
+/// 所以这里在台面之外再给一层 y=0 的地面，两个承托面都来自几何（不写死格子）。
+struct FlatRoomAndTable: WorldPropSupportQuerying {
+    let minimumX: Float
+    let maximumX: Float
+    let minimumZ: Float
+    let maximumZ: Float
+    let table: FlatSupport
+
+    func canOccupy(_ capsule: WorldCapsule, at position: SIMD3<Float>) -> Bool { true }
+
+    func groundHeight(at position: SIMD3<Float>) -> Float? {
+        var candidates: [Float] = []
+        if position.x >= minimumX, position.x <= maximumX,
+           position.z >= minimumZ, position.z <= maximumZ,
+           0 <= position.y + 0.05 { candidates.append(0) }
+        if let tableHeight = table.groundHeight(at: position) { candidates.append(tableHeight) }
+        return candidates.max()
+    }
+
+    func canTraverse(_ capsule: WorldCapsule, from start: SIMD3<Float>,
+                     to destination: SIMD3<Float>, maximumStepHeight: Float) -> Bool { true }
+
+    /// 三角形的顺序决定层号：地面在前（layer 0）、台面在后（layer 1）。
+    func triangles(in bounds: WorldPlanarBounds) -> [WorldTriangle] {
+        var result: [WorldTriangle] = []
+        if bounds.maximumX >= minimumX, bounds.minimumX <= maximumX,
+           bounds.maximumZ >= minimumZ, bounds.minimumZ <= maximumZ {
+            let a = SIMD3<Float>(minimumX, 0, minimumZ), b = SIMD3<Float>(maximumX, 0, minimumZ)
+            let c = SIMD3<Float>(maximumX, 0, maximumZ), d = SIMD3<Float>(minimumX, 0, maximumZ)
+            result.append(WorldTriangle(a, b, c))
+            result.append(WorldTriangle(a, c, d))
+        }
+        result.append(contentsOf: table.triangles(in: bounds))
+        return result
+    }
+}
+
 @MainActor
 func displayTableSupport() -> ResidentPropPlacementSupport {
-    let bounds = WorldPlanarBounds(minimumX: displayTableWorld.minimumX, maximumX: displayTableWorld.maximumX,
-                                   minimumZ: displayTableWorld.minimumZ, maximumZ: displayTableWorld.maximumZ)
-    let grid = PropSupportGridBuilder.build(collision: displayTableWorld, bounds: bounds,
-                                            seed: WorldVector3(x: 2, y: 0.52, z: 2),
+    let room = FlatRoomAndTable(minimumX: -6, maximumX: 6, minimumZ: -6, maximumZ: 6,
+                                table: displayTableWorld)
+    let bounds = WorldPlanarBounds(minimumX: -6, maximumX: 6, minimumZ: -6, maximumZ: 6)
+    let grid = PropSupportGridBuilder.build(collision: room, bounds: bounds,
+                                            seed: WorldVector3(x: 0, y: 0, z: 0),
                                             parameters: PropSupportGridParameters())
-    return ResidentPropPlacementSupport(grid: grid, collision: displayTableWorld)
+    // 活动入口取展示台桌面上的几个真实格心；被**这件咖啡机**压住的那些自动不算
+    // （那正是"占掉活动入口"的判据，不该由这里手算半径来回避）。
+    // 活动入口与居民都在**地面**上（世界路点 y=0），台面上的机器不挡它们。
+    let anchors: [WorldVector3] = [
+        WorldVector3(x: -0.5, y: 0, z: 1.0),
+        WorldVector3(x: 1.0, y: 0, z: -0.5),
+    ]
+    let rc = routeConstraint(grid, anchorCandidates: anchors,
+                             resident: WorldVector3(x: 0, y: 0, z: 0))
+    return ResidentPropPlacementSupport(grid: grid, collision: room, routeConstraint: rc)
 }
 
 @MainActor

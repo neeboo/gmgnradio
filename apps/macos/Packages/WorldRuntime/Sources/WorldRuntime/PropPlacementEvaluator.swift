@@ -125,6 +125,12 @@ public enum PropSupportBlockReason: Equatable, Sendable {
     case blockedByBlockingVolume(String)
     case blockedByPlacedProp(String)
     case insufficientClearance
+    /// 摆在这里居民就走不到某个活动入口了（唯一通路被切断）。
+    ///
+    /// 这条不属于几何判定（不插墙、不重叠也可能触发），但它与上面几条**必须走同一条
+    /// 呈现路径**：格子的红、光标旁那枚标签的原因都从这里出。见
+    /// `WorldPlacementRouteMap`。
+    case blockedRoute(String)
 }
 
 extension PropSupportBlockReason: LocalizedError {
@@ -136,6 +142,7 @@ extension PropSupportBlockReason: LocalizedError {
         case let .blockedByBlockingVolume(id): "这里会碰到 \(id)。"
         case let .blockedByPlacedProp(id): "这里会和已经放好的 \(id) 重叠。"
         case .insufficientClearance: "这里空间不够，放不下。"
+        case let .blockedRoute(id): "摆在这里居民就走不到 \(id) 了。"
         }
     }
 }
