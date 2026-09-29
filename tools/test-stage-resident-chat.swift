@@ -67,6 +67,20 @@ let steeringControls = ["private var hasDraft:", "private var primaryStops:", "p
 let keyboard = ["override func keyDown(", "override func keyUp(", "override func flagsChanged(", "override func resignFirstResponder()", "override func scrollWheel(", "private static func movement(", "private static func gridRotationSteps("].map {
     declaration($0, in: controller)
 }.joined(separator: "\n")
+// ── 门禁的判据来源：**真正的输入框**，不是任意 `NSTextView` ──────────────────────
+// 真机 2026-09-29：用户在「摆放」面板点了一行 → 进了携带态 → 鼠标不跟手、圆环点不动、
+// `R`/`,`/`.` 全没反应。键盘这一半的机制是"keyDown 根本到不了场景交互视图"；而门禁里那条
+// `window?.firstResponder is NSTextView` 又太宽：装修面板自己也是 SwiftUI 托管视图，点一下
+// 它里面的东西就可能把 first responder 交给一个 `NSTextView` —— 那是"刚点完列表"，不是
+// "正在打字"。判据本体 `stageTextInputOwnsFocus(host:firstResponder:)` 必须由**真正的输入框
+// 宿主**（`residentComposer`）决定，`keyDown` 与 `consumesPropPointer` 都只读 `inputOwnsFocus`。
+let inputFocusPredicate = declaration("@MainActor\nfunc stageTextInputOwnsFocus(", in: controller)
+let inputOwnsFocus = declaration("private var inputOwnsFocus", in: controller)
+guard controller.contains("var isTextInputFocused: (() -> Bool)?"),
+      inputOwnsFocus.contains("isTextInputFocused?() ?? (window?.firstResponder is NSTextView)") else {
+    print("FAIL: the scene gate must take \"is the input field typing\" from its host, and keep the old answer as the fail-closed fallback")
+    exit(1)
+}
 // ── 装修模式下的相机键：编辑器先处理，其余键落到相机 ──────────────────────────
 // 回归缺陷：`keyDown` 里曾有一条 `if propEditor.isOpen { return }` 的无条件拦截，于是装修
 // 模式下 W/A/S/D 全被吃掉，用户连换个角度看落点都做不到（The Sims / Unity / Unreal 里
@@ -82,6 +96,10 @@ let keyDownCode = keyDownBody.split(separator: "\n", omittingEmptySubsequences: 
 }.joined(separator: "\n")
 guard !keyDownCode.contains("if propEditor.isOpen { return }") else {
     print("FAIL: keyDown still blocks every key unconditionally while the decoration editor is open")
+    exit(1)
+}
+guard keyDownCode.contains("inputOwnsFocus"), !keyDownCode.contains("is NSTextView") else {
+    print("FAIL: keyDown must not decide \"the user is typing\" from any NSTextView")
     exit(1)
 }
 let keyDownBranchOrder = [
@@ -187,6 +205,9 @@ struct NSEvent {
     var modifierFlags: ModifierFlags = []
     var charactersIgnoringModifiers: String?
 }
+/// 场景门禁的**判据本体**（生产实现，逐字抽取）：first responder 必须是这个输入框宿主自己
+/// 或它的后代。harness 用真 AppKit 视图树搭出"合成器里的 field editor"与"别处的 NSTextView"。
+\#(inputFocusPredicate)
 @MainActor class Responder {
     var window: Window? = Window()
     var forwarded: [UInt16] = []
@@ -226,6 +247,11 @@ struct NSEvent {
     /// 建造模式的 R / Shift+R 旋转回调。
     var onGridRotate: ((Int) -> Void)?
     var onGridCursor: ((SIMD2<Float>) -> Void)?
+    /// 「真正的输入框正在打字」——生产里由宿主注入（`residentComposerOwnsFirstResponder()`）。
+    /// 探针这里直接接生产判据本体 + 真 AppKit 视图树，于是"面板的 NSTextView"与"输入框的
+    /// field editor"是**两个可分辨的事实**，而不是同一个 `is NSTextView`。
+    var isTextInputFocused: (() -> Bool)?
+    \#(inputOwnsFocus)
     \#(keyboard)
 }
 @MainActor final class Controller {
@@ -589,6 +615,44 @@ enum StageAvatarActivity { case listening, speaking, idle }
             check(input.spatialStage.movements.isEmpty && input.forwarded.last == key,
                   "text focus still owns camera key \(key) while the decoration editor is open")
         }
+        // ── 门禁的判据来源：只有**真正的输入框**才算"正在打字" ──────────────────────
+        // 真机 2026-09-29：用户在「摆放」面板点了一行 → 进了携带态（青色圆环画出来了）→ 但
+        // 鼠标不跟手、点圆环没反应、`R`/`,`/`.`/Esc 全没反应。门禁里那条
+        // `window?.firstResponder is NSTextView` 太宽：装修面板自己也是 SwiftUI 托管视图，
+        // 点一下它里面的东西就可能把 first responder 交给一个 `NSTextView` —— 那是"刚点完
+        // 列表"，不是"正在打字"。探针注入**生产判据本体**，两种 responder 于是可分辨。
+        let composerHost = NSView()
+        let composerField = NSTextView()
+        composerHost.addSubview(composerField)
+        // 窗口里**除了输入框之外**的文本视图（装修面板的托管视图里的控件、设置里的文本区…）：
+        // 判据只该问"是不是那个输入框"，不该问"窗口里有没有文本视图"。
+        let otherHost = NSView()
+        let otherEditor = NSTextView()
+        otherHost.addSubview(otherEditor)
+        input.isTextInputFocused = {
+            stageTextInputOwnsFocus(host: composerHost, firstResponder: input.window?.firstResponder)
+        }
+        // 输入框**真的**在打字：键盘仍然归它（这条保护一个字都不许放宽）。
+        input.window?.firstResponder = composerField
+        input.keyDown(with: NSEvent(keyCode: 53))
+        check(input.propEditor.escapeCalls == 1 && input.forwarded.last == 53,
+              "typing in the real input field still owns Escape before the scene editor")
+        for key: UInt16 in [13, 0, 1, 2] {
+            input.keyDown(with: NSEvent(keyCode: key))
+            check(input.spatialStage.movements.isEmpty && input.forwarded.last == key,
+                  "typing in the real input field still owns camera key \(key) while the decoration editor is open")
+        }
+        // 别处的 `NSTextView` 拿焦点**不是**打字：场景必须照常收键（旧判据在这里把场景挡死）。
+        input.forwarded.removeAll()
+        input.window?.firstResponder = otherEditor
+        input.keyDown(with: NSEvent(keyCode: 53))
+        check(input.propEditor.escapeCalls == 2 && input.forwarded.isEmpty,
+              "a text view that is not the real input field must not take Escape away from the scene editor")
+        input.keyDown(with: NSEvent(keyCode: 13))
+        check(input.spatialStage.movements == [.forward],
+              "a text view that is not the real input field must not block the scene camera keys")
+        input.keyUp(with: NSEvent(keyCode: 13))
+        check(input.spatialStage.movements.isEmpty, "releasing the camera key still stops motion")
         // 建造模式步进旋转键：R / ⇧R，以及 Sims 4 肌肉记忆的 `,`（逆时针）/ `.`（顺时针）。
         // 步长（45°）在映射层验证，这里只验键码与方向。
         input.window?.firstResponder = input

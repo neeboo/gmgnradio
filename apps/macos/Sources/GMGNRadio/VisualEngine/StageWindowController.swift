@@ -5,6 +5,23 @@ import os
 import SwiftUI
 import WorldRuntime
 
+/// 「真正的输入框正在打字」——场景键盘/指针门禁的**判据本体**（全工程只有这一份）。
+///
+/// 判据 = first responder 真的是这个**输入框宿主**自己或它的后代。`NSTextView` 的 field editor
+/// 走 `delegate`（它才是真正的宿主控件），所以两种形态都算。
+///
+/// **任意** `NSTextView` 不算：原来门禁读的是 `window?.firstResponder is NSTextView`，它只问
+/// "焦点是不是落在某个文本视图上"，不问"是不是那个输入框"。舞台窗口里并不只有输入框里有文本
+/// 视图（聊天输入框的 field editor、设置里的文本区、别处的只读 `NSTextView`…），任何一个拿到
+/// 焦点都会被判成"用户在打字"，场景于是既不跟手也不收键。门禁的本意只有一条：
+/// **用户在聊天输入框里打字时，场景别抢键盘/指针**（见 `residentComposerOwnsFirstResponder()`）。
+@MainActor
+func stageTextInputOwnsFocus(host: NSView?, firstResponder: AnyObject?) -> Bool {
+    guard let host, let editor = firstResponder as? NSTextView else { return false }
+    if editor.isDescendant(of: host) { return true }
+    return (editor.delegate as? NSView)?.isDescendant(of: host) == true
+}
+
 @MainActor
 final class StageWindowController: NSWindowController, NSWindowDelegate {
     fileprivate static let log = Logger(
@@ -733,6 +750,8 @@ private final class StageContentView: NSView {
     private var isProgramRailVisible = false
     private var isVisualPickerVisible = false
     private var isResidentChatExpanded = false
+    /// 上一次为"输入框在打字"打过的门禁诊断 owner（同一条不重复打，见 `noteSceneInputGateBlocked()`）。
+    private var lastLoggedSceneInputFocusOwner: String?
 
     init(
         frame: CGRect,
@@ -997,6 +1016,8 @@ private final class StageContentView: NSView {
         propEditorPanel.layer?.zPosition = 19
         propEditorPanel.isHidden = true
         addSubview(propEditorPanel)
+        // responder 相关的两处接线在这一处收口（门禁判据 + 面板动作后的焦点交回）。
+        wireSceneInputOwnership()
         editorVisibilitySubscription = residentPropEditor.$isOpen.sink { [weak self] open in
             self?.propEditorPanel.isHidden = !open
             self?.transportControls.setPropEditorExpanded(open)
@@ -1266,10 +1287,61 @@ private final class StageContentView: NSView {
         togglePropEditor()
     }
 
+    /// 「正在打字」的唯一判据：first responder 必须真的是 `residentComposer` 自己或它的后代。
+    ///
+    /// 判据本体在 `stageTextInputOwnsFocus(host:firstResponder:)`；这里只提供"谁是输入框宿主"。
+    /// 装修门禁（`consumesPropPointer` / `keyDown`）与这里共用同一个判据，不各写一份。
     private func residentComposerOwnsFirstResponder() -> Bool {
-        guard let editor = window?.firstResponder as? NSTextView else { return false }
-        if editor.isDescendant(of: residentComposer) { return true }
-        return (editor.delegate as? NSView)?.isDescendant(of: residentComposer) == true
+        stageTextInputOwnsFocus(host: residentComposer, firstResponder: window?.firstResponder)
+    }
+
+    /// responder 相关的两处接线（只有这一处，两个方向不会分家）：
+    ///
+    /// 1. **门禁判据**：场景交互视图只认**真正的输入框**（`residentComposerOwnsFirstResponder()`），
+    ///    不把任意 `NSTextView` 当成"正在打字"。原来的判据 `window?.firstResponder is NSTextView`
+    ///    只问"焦点在不在某个文本视图上"，窗口里任何一个文本视图拿到焦点都会被误判成打字 ——
+    ///    场景于是既不跟手也不收键，而用户其实只是在别处点了一下。
+    /// 2. **焦点交回**：面板动作（`select` / `undo` / `withdraw`）做完之后，把键盘焦点交回场景
+    ///    交互视图（`returnSceneFocus(trigger:)`，走既有的 `makeFirstResponder` 路径）。
+    ///
+    /// 接在这里而不是 `StageWindowController.configureResidentPropEditor`：那个入口只注入
+    /// 预览/提交/手持这些**服务**回调，而这里要的是本视图拥有的场景交互视图。
+    private func wireSceneInputOwnership() {
+        worldInteractionView.isTextInputFocused = { [weak self] in
+            guard let self, self.residentComposerOwnsFirstResponder() else { return false }
+            self.noteSceneInputGateBlocked()
+            return true
+        }
+        residentPropEditor.onSceneFocusRequested = { [weak self] trigger in
+            self?.returnSceneFocus(trigger: trigger)
+        }
+    }
+
+    /// 门禁被"正在打字"挡下时的诊断（`.notice`；同一条 owner 只报一次，鼠标每动一下不会刷屏）。
+    ///
+    /// 与 `returnSceneFocus(trigger:)` 那条配对看：真机上只要出现这条，就知道**是谁**挡住了
+    /// 场景输入（owner 是 responder 的**动态类型**）—— 不必再猜。
+    private func noteSceneInputGateBlocked() {
+        let owner = window?.firstResponder.map { String(describing: type(of: $0)) } ?? "nil"
+        guard lastLoggedSceneInputFocusOwner != owner else { return }
+        lastLoggedSceneInputFocusOwner = owner
+        StageWindowController.log.notice(
+            "场景门禁：真正的输入框正在打字，场景不抢键盘/指针 owner=\(owner, privacy: .public)"
+        )
+    }
+
+    /// **面板**动作结束后把键盘焦点交回场景交互视图。
+    ///
+    /// 走的是既有的 `makeFirstResponder(worldInteractionView)` 那条路径（与 `togglePropEditor()`
+    /// 开面板时同一个出口），不新造机制。`.notice` 打出**交回前**的 owner，与门禁那条配对：
+    /// 真机上"点完行之后焦点有没有回到场景"一眼可读。
+    private func returnSceneFocus(trigger: String) {
+        guard let window else { return }
+        let before = window.firstResponder.map { String(describing: type(of: $0)) } ?? "nil"
+        window.makeFirstResponder(worldInteractionView)
+        StageWindowController.log.notice(
+            "摆放面板动作=\(trigger, privacy: .public) 焦点交回场景：交回前 owner=\(before, privacy: .public) 交回后 owner=\(window.firstResponder.map { String(describing: type(of: $0)) } ?? "nil", privacy: .public)"
+        )
     }
 
     private func updateResidentComposerVisibility() {
@@ -1584,7 +1656,7 @@ private final class StageWorldInteractionView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
-        if window?.firstResponder is NSTextView { super.keyDown(with: event); return }
+        if inputOwnsFocus { super.keyDown(with: event); return }
         if event.keyCode == 53, propEditor.isOpen {
             propEditor.escape()
             return
@@ -1617,7 +1689,7 @@ private final class StageWorldInteractionView: NSView {
         // 优先级（自上而下，先命中先 return）：文本焦点 → Esc 放回 → R/⇧R/,/. 旋转 →
         // Delete 收回 → ⌘Z 撤销 → 相机移动 → super。编辑器的键都排在相机之前，所以放行
         // 相机不会把它们抢走。
-        guard !(window?.firstResponder is NSTextView),
+        guard !inputOwnsFocus,
               let movement = Self.movement(for: event.keyCode) else {
             super.keyDown(with: event)
             return
@@ -1666,9 +1738,26 @@ private final class StageWorldInteractionView: NSView {
         super.viewWillMove(toWindow: newWindow)
     }
 
+    /// 「用户正在输入框里打字」——由宿主注入的**唯一**判据（见 `StageContentView.wireSceneInputOwnership()`：
+    /// 它接的是 `residentComposerOwnsFirstResponder()`）。
+    ///
+    /// 为什么不在这里读 `window?.firstResponder is NSTextView`：那个式子**太宽** —— 它只问
+    /// "焦点是不是落在某个文本视图上"，不问"是不是那个输入框"。舞台窗口里的文本视图不止输入框
+    /// 一个，任何一个拿到焦点都会被判成"用户在打字"，于是场景既不跟手也不收键（真机 2026-09-29
+    /// 的三个症状正是这一族：落点不更新、圆环点不动、`R`/`,`/`.` 全没反应）。
+    ///
+    /// 注入缺失时退回旧的保守判据（任意 `NSTextView`）：宁可少收一次指针/键，也**不许**在
+    /// 用户打字时抢走 —— 生产里这个注入恒存在（`StageContentView.init` 里 `wireSceneInputOwnership()`）。
+    var isTextInputFocused: (() -> Bool)?
+
+    /// 门禁判据的**唯一**读取点：`consumesPropPointer` 与 `keyDown` 都读它。
+    private var inputOwnsFocus: Bool {
+        isTextInputFocused?() ?? (window?.firstResponder is NSTextView)
+    }
+
     private var consumesPropPointer: Bool {
         ResidentPropEditorState.consumesScenePointer(isOpen: propEditor.isOpen, moving: propEditor.isCarrying || propEditor.isMoving,
-                                                     inputOwnsFocus: window?.firstResponder is NSTextView)
+                                                     inputOwnsFocus: inputOwnsFocus)
     }
 
     override func updateTrackingAreas() {

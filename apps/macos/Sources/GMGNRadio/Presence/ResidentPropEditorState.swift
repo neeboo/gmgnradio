@@ -226,6 +226,22 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     var refreshSnapshot: (@MainActor () -> ResidentPropEditorSnapshot?)?
     var onPreviewChanged: @MainActor (WorldObjectState?) -> Void = { _ in }
     var onEditingChanged: @MainActor (Bool) -> Void = { _ in }
+    /// 一个**面板**动作做完之后，把键盘焦点交回场景交互视图（参数是动作名，只给诊断日志用）。
+    ///
+    /// 为什么必须由宿主做：面板是 SwiftUI 的 `NSHostingView`，点完一行/一个按钮之后窗口的
+    /// first responder 可能已经不在 `StageWorldInteractionView` 上，而"点完这一行接着在房间里
+    /// 挪落点、按 `R`/`⇧R`/`,`/`.` 转、按 `Esc` 放回"正是这套编辑的**全部**手感 ——
+    /// 焦点不在场景上时这些一个都不生效（真机 2026-09-29：点行进了携带态、圆环也画出来了，
+    /// 但鼠标不跟手、圆环点不动、`R`/`,`/`.` 全没反应）。
+    ///
+    /// 宿主把它接到**既有的** `window.makeFirstResponder(worldInteractionView)` 上
+    /// （与 `togglePropEditor()` 开面板时那条路径同一个出口），本类型不碰 responder chain。
+    ///
+    /// 只挂在"面板触发、接着要用户回场景操作"的动作上：`select` / `undo` / `withdraw`。
+    /// 「居民右手」那套（`holdSelected` / `returnSelected` / `nudgeHeld` / `rotateHeld`）不挂：
+    /// 它们的效果是**居民手里**的东西，用户是在面板上连点微调，抢焦点没有收益（也刻意不动
+    /// 那套既有行为）。
+    var onSceneFocusRequested: (@MainActor (String) -> Void)?
     private var generation = UUID()
     private var previewGeneration = UUID()
     private var draftRevision: UInt64?
@@ -317,11 +333,21 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     /// 承托面一到就由 `completePendingSelectIfReady()` 走**同一条出口**补做。
     func select(objectID: String) async {
         guard isOpen, !isSaving else { return }
+        // 点行是**面板**动作：无论这一次是立刻进携带态、还是因为几何没到先记成待办
+        // （`rememberPendingSelect`），用户接下来都在房间里等/看 —— 焦点现在就交回场景。
+        handFocusBackToScene(trigger: "选择物件")
         // 用户又点了一次：上一次没能兑现的那次点行要么被这一次**覆盖**（这一次也进不了携带态
         // 时会被重新记住），要么被这一次**兑现**（这一次能进，走的就是下面同一条出口）。
         // 两条路都不该让它继续挂着 —— 待办**只允许一件**，绝不排队成一串。
         clearPendingSelect(reason: "用户又点了一次（后一次覆盖前一次）")
         await performSelect(objectID: objectID)
+    }
+
+    /// 面板动作的收尾：把键盘焦点交回场景交互视图（见 `onSceneFocusRequested`）。
+    ///
+    /// 唯一出口：任何一个面板动作要抢回焦点都走这里，不在调用点各写一遍。
+    private func handFocusBackToScene(trigger: String) {
+        onSceneFocusRequested?(trigger)
     }
 
     /// 点行的**唯一出口**：正常点击与"承托面到了以后补做那次待办"都走这里。
@@ -541,9 +567,16 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     }
     func withdraw() async {
         guard !isSaving, let id = selectedID, selectedObject?.isEnabled == true else { return }
+        // 收回是**面板**动作：用户接下来要接着在房间里挑/放，焦点交回场景。
+        handFocusBackToScene(trigger: "收回")
         await save(.withdraw(objectID: id))
     }
-    func undo() async { guard snapshot.canUndo, !isSaving else { return }; await save(.undo) }
+    func undo() async {
+        guard snapshot.canUndo, !isSaving else { return }
+        // 撤销是**面板**动作：用户接下来还要接着摆放/转视角，焦点交回场景。
+        handFocusBackToScene(trigger: "撤销上次")
+        await save(.undo)
+    }
     func holdSelected() async {
         guard let id = selectedID, snapshot.holdUnavailableReasons[id] == nil, let hold else { return }
         await saveAction(key: "hold:\(id)", keepSelection: id) { revision, requestID in

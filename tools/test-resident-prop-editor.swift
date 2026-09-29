@@ -23,6 +23,43 @@ guard controller.contains("StageControlPanelLayout.transportWidth + StageControl
       controller.contains("Float(1 - point.y / bounds.height)") else {
  print("FAIL: native editor size or bottom-left pointer mapping is missing");exit(1)
 }
+// ── 场景输入门禁的判据来源：**真正的输入框**，不是任意 `NSTextView` ──────────────
+// 真机 2026-09-29：用户在右侧「摆放」面板点了一行 → 进了携带态 → 鼠标不跟手、圆环点不动、
+// `R`/`,`/`.` 全没反应。两条同源怀疑里，**能成立的那条**是判据太宽：门禁读的是
+// `window?.firstResponder is NSTextView`，而"用户在打字"的本意只有"first responder 是
+// `residentComposer`（聊天输入框）自己或它的后代"。判据本体必须只有一份，且必须由真正的
+// 输入框宿主决定；门禁的两处读取（`consumesPropPointer` / `keyDown`）都不许再出现裸的
+// `is NSTextView`（那会让面板里的文本视图把场景整个挡掉）。
+let inputFocusPredicate = method("@MainActor\nfunc stageTextInputOwnsFocus(", in: controller)
+guard controller.contains("var isTextInputFocused: (() -> Bool)?"),
+      controller.contains("isTextInputFocused?() ?? (window?.firstResponder is NSTextView)") else {
+ print("FAIL: the scene gate must take its \"is the input field typing\" answer from its host, and keep the old answer as the fail-closed fallback");exit(1)
+}
+let consumesPropPointer = method("private var consumesPropPointer", in: controller)
+guard consumesPropPointer.contains("inputOwnsFocus: inputOwnsFocus"),
+      !consumesPropPointer.contains("is NSTextView") else {
+ print("FAIL: consumesPropPointer must not decide \"typing\" from any NSTextView");exit(1)
+}
+let inputOwnsFocus = method("private var inputOwnsFocus", in: controller)
+guard inputOwnsFocus.contains("isTextInputFocused?()") else {
+ print("FAIL: the scene gate has no single source for \"the input field owns focus\"");exit(1)
+}
+// 门禁判据与"焦点交回场景"必须接在**同一处**（`wireSceneInputOwnership`），且交回走既有的
+// `makeFirstResponder(worldInteractionView)`：真机上点完面板动作之后，键盘/指针必须回到场景。
+let wireOwnership = method("private func wireSceneInputOwnership(", in: controller)
+guard wireOwnership.contains("residentPropEditor.onSceneFocusRequested ="),
+      wireOwnership.contains("worldInteractionView.isTextInputFocused ="),
+      wireOwnership.contains("residentComposerOwnsFirstResponder()") else {
+ print("FAIL: the scene gate's predicate and the panel-to-scene focus hand-back must be wired together from the real composer");exit(1)
+}
+let returnSceneFocus = method("private func returnSceneFocus(", in: controller)
+guard returnSceneFocus.contains("window.makeFirstResponder(worldInteractionView)") else {
+ print("FAIL: handing focus back to the scene must use the existing makeFirstResponder(worldInteractionView) path");exit(1)
+}
+let selectBody = method("func select(objectID: String) async", in: model)
+guard selectBody.contains("handFocusBackToScene(") else {
+ print("FAIL: clicking a panel row must hand the keyboard focus back to the scene");exit(1)
+}
 guard ["拿着看", "放回", "向前", "向后", "向上", "向下", "左转 15°", "右转 15°"].allSatisfy(editorView.contains),
       editorView.contains("state.isSelectedHeld") else {
  print("FAIL: limited right-hand controls are missing from the shared placement panel");exit(1)
@@ -58,10 +95,13 @@ import Foundation
 import Combine
 import simd
 import os
+import AppKit
 import WorldRuntime
 func precondition(_ condition:@autoclosure()->Bool,_ message:String="assertion failed") {
  if !condition() { print("FAIL: \(message)"); exit(1) }
 }
+/// 场景键盘/指针门禁的**判据本体**（生产实现，逐字抽取）。
+\#(inputFocusPredicate)
 /// 被一起编进来的生产代码（格子模型、被抽取的 App 方法）要用的最小环境：
 /// 日志与 bundle 标识。harness 不装 subsystem，只要求这些引用能解析。
 enum ProductIdentity { static let bundleIdentifier = "test.gmgn.fixture" }
@@ -170,12 +210,53 @@ final class CountingFloorCollision: WorldPropSupportQuerying, @unchecked Sendabl
  \#(method("func windowDidResignKey("))
 }
 @MainActor final class ControllerHarness {
+ /// 被抽取的生产代码里的日志引用（`StageWindowController.log` 在这里解析到这个类型）。
+ static let log = Logger(subsystem: ProductIdentity.bundleIdentifier, category: "ControllerHarness")
  let residentPropEditor = ResidentPropEditorState()
  \#(method("func configureResidentPropEditor("))
  \#(method("func updateResidentPropEditor("))
  /// 格子点击落地那条路径的入口。本 harness 不驱动它（`snappedPlacement` 恒为 nil），
  /// 只要求被抽取的 `publishResidentPropGrid` 能编过。
  func moveResidentPropGridPointer(to position:WorldVector3,layerName:String,yaw:Float) async {}
+}
+/// 窗口替身：只需要"谁是 first responder"这一件事 —— 焦点交回是不是真的换人，全靠它记。
+@MainActor final class FocusWindow {
+ var firstResponder: AnyObject?
+ func makeFirstResponder(_ responder: AnyObject) { firstResponder = responder }
+}
+/// 场景交互视图的替身：只做两件事 —— 被 `makeFirstResponder` 指到的那个对象，以及
+/// `isTextInputFocused` 这个**注入位**（生产里它是 `StageWorldInteractionView` 的存储属性，
+/// 抽取出来的 `inputOwnsFocus` 读它；结构断言已经把生产那一行的类型钉死）。
+@MainActor final class SceneInteractionStandIn {
+ var isTextInputFocused: (() -> Bool)?
+}
+/// `StageContentView` 里 responder 相关的两处接线 + 门禁判据（生产实现，逐字抽取）：
+/// `wireSceneInputOwnership()` 是**唯一**的接线处，`returnSceneFocus` 是焦点交回的唯一出口，
+/// `residentComposerOwnsFirstResponder()` 是"正在打字"的唯一判据。
+///
+/// 这里用**真 AppKit 视图树**（`residentComposer` 里挂一个 `NSTextView`）来回答门禁：
+/// "面板里的 `NSTextView`"与"聊天输入框里的 field editor"是两个不同的东西，只有后者算打字。
+@MainActor final class SceneOwnershipHarness {
+ let residentPropEditor = ResidentPropEditorState()
+ let residentComposer = NSView()
+ let worldInteractionView = SceneInteractionStandIn()
+ var window: FocusWindow? = FocusWindow()
+ var lastLoggedSceneInputFocusOwner: String?
+ \#(method("private func wireSceneInputOwnership(").replacingOccurrences(of:"private func",with:"func"))
+ \#(method("private func residentComposerOwnsFirstResponder(").replacingOccurrences(of:"private func",with:"func"))
+ \#(method("private func noteSceneInputGateBlocked(").replacingOccurrences(of:"private func",with:"func"))
+ \#(method("private func returnSceneFocus(").replacingOccurrences(of:"private func",with:"func"))
+}
+/// 场景交互视图的**门禁部分**（`inputOwnsFocus` / `consumesPropPointer` 原样抽取）。
+/// 判定本体 `ResidentPropEditorState.consumesScenePointer` 与编辑器状态都是生产实现；
+/// 只有"注入位"（`isTextInputFocused`）与窗口替身是 harness 的。
+@MainActor final class SceneGateProbe {
+ let propEditor: ResidentPropEditorState
+ var window: FocusWindow?
+ var isTextInputFocused: (() -> Bool)?
+ init(_ propEditor: ResidentPropEditorState) { self.propEditor = propEditor }
+ \#(method("private var inputOwnsFocus").replacingOccurrences(of:"private var",with:"var"))
+ \#(method("private var consumesPropPointer").replacingOccurrences(of:"private var",with:"var"))
 }
 /// 建造模式格子模型的替身：只保留 `publishResidentPropGrid` / 就绪判据读的那几个事实，
 /// 但**"就绪是异步的"这个时序**照旧（`isReady` 不会在请求的那一刻就为真）。
@@ -361,6 +442,71 @@ typealias WorldAgentContext = LayoutContext
   precondition(!ResidentPropEditorState.consumesScenePointer(isOpen:true,moving:true,inputOwnsFocus:true))
   precondition(ResidentPropEditorState.consumesScenePointer(isOpen:true,moving:true,inputOwnsFocus:false))
   precondition(!ResidentPropEditorState.consumesScenePointer(isOpen:true,moving:false,inputOwnsFocus:false))
+
+  // ── 门禁的判据来源：**真正的输入框**，不是任意 `NSTextView` ─────────────────────
+  // 真机 2026-09-29：用户在右侧「摆放」面板里点了物件那一行 → 确实进了携带态（青色圆环画出来了）
+  // → 但鼠标不跟手、点圆环没反应、`R`/`,`/`.` 全没反应。两条同源怀疑里，**判据太宽**那条成立：
+  // 门禁读的是 `window?.firstResponder is NSTextView`，于是"窗口里任何一个文本视图拿到焦点"
+  // 都被当成"用户在打字"。这里用**真 AppKit 视图树**把这条钉死：装修面板里的 `NSTextView`
+  // 不是打字（场景照常收指针）；只有 `residentComposer`（聊天输入框）里的 field editor 才算。
+  let ownership = SceneOwnershipHarness()
+  ownership.wireSceneInputOwnership()
+  let composerField = NSTextView()
+  ownership.residentComposer.addSubview(composerField)
+  // 窗口里**除了输入框之外**的文本视图（真机上可能是设置里的文本区、别的面板里的控件；
+  // 判据不该问它在哪个面板，只该问它是不是那个输入框）。
+  let otherEditor = NSTextView()
+  let otherHost = NSView()
+  otherHost.addSubview(otherEditor)
+  precondition(ownership.worldInteractionView.isTextInputFocused != nil,
+    "the scene interaction view must receive the gate predicate from its host")
+  ownership.window?.firstResponder = otherEditor
+  precondition(!ownership.worldInteractionView.isTextInputFocused!(),
+    "a text view that is not the real input field is not \"the user is typing\"")
+  ownership.window?.firstResponder = composerField
+  precondition(ownership.worldInteractionView.isTextInputFocused!(),
+    "typing in the resident composer is \"the user is typing\" and must still gate the scene")
+  ownership.window?.firstResponder = otherHost
+  precondition(!ownership.worldInteractionView.isTextInputFocused!(),
+    "a plain view is not \"the user is typing\"")
+
+  // ── 面板动作 → 焦点交回场景交互视图 ─────────────────────────────────────────
+  // 「点面板行之后，场景交互视图重新成为 first responder」。走的是**真状态机**（`select`）+
+  // **真接线**（`wireSceneInputOwnership`）+ **真交回路径**（`returnSceneFocus` →
+  // `makeFirstResponder(worldInteractionView)`）。先把 first responder 摆成"面板里的文本视图"
+  // —— 真机上点完一行就是这个状态，而它正是"场景收不到键盘/指针"的来源。
+  ownership.residentPropEditor.preview = { _, p in
+   WorldObjectState(transform:.init(position:p.position,rotation:identity.rotation,scale:identity.scale),metadata:metadata)
+  }
+  ownership.residentPropEditor.commit = { _, _, _ in snapshot }
+  ownership.residentPropEditor.update(snapshot)
+  ownership.residentPropEditor.open()
+  ownership.window?.firstResponder = otherEditor
+  await ownership.residentPropEditor.select(objectID:"cup")
+  precondition(ownership.window?.firstResponder === ownership.worldInteractionView,
+    "clicking a row in the decoration panel must hand the keyboard focus back to the scene interaction view")
+  precondition(ownership.residentPropEditor.isCarrying,
+    "precondition: the row click really entered the carrying state")
+  // 携带态 + 面板的 `NSTextView` 拿焦点 ⇒ 场景**仍然**收指针（旧判据在这里会误判成打字）。
+  let gate = SceneGateProbe(ownership.residentPropEditor)
+  gate.window = ownership.window
+  gate.isTextInputFocused = ownership.worldInteractionView.isTextInputFocused
+  ownership.window?.firstResponder = otherEditor
+  precondition(gate.consumesPropPointer,
+    "with a text view that is not the input field focused, a carried prop must still follow the scene pointer")
+  ownership.window?.firstResponder = composerField
+  precondition(!gate.consumesPropPointer,
+    "typing in the resident composer must still keep the scene from stealing the pointer")
+  // 收回 / 撤销同样是面板动作：做完也要把焦点交回场景（用户接着还在房间里操作）。
+  ownership.window?.firstResponder = otherEditor
+  await ownership.residentPropEditor.withdraw()
+  precondition(ownership.window?.firstResponder === ownership.worldInteractionView,
+    "withdrawing from the panel must hand the keyboard focus back to the scene interaction view")
+  ownership.window?.firstResponder = otherEditor
+  await ownership.residentPropEditor.undo()
+  precondition(ownership.window?.firstResponder === ownership.worldInteractionView,
+    "undoing from the panel must hand the keyboard focus back to the scene interaction view")
+
   let host = ControllerHarness()
   var editEvents:[Bool] = []
   host.configureResidentPropEditor(preview:{ _, _ in object },commit:{ _, _, _ in snapshot },onPreviewChanged:{ _ in },onEditingChanged:{ editEvents.append($0) })
@@ -1139,7 +1285,7 @@ typealias WorldAgentContext = LayoutContext
   precondition(boundedCollision.queryCount > queriesAfterThreeWorlds,
     "the evicted world must derive again (the cache is bounded, not a leak)")
 
-  print("PASS: editor cancel, failure preservation, hand controls, duplicate submit, stale revision, late world, input routing, ready-grid row click, host-cannot-answer vs host-says-empty, empty-grid and dead-derivation honesty, stale notice refresh, skipped-push retry, the row click that arrives before the grid is ready (remembered, completed on readiness from the clicked prop's own transform, invalidated by every \"I do not want this\" signal, never queued), scene pick-up routing, placed-prop transform, hover glow inside the focus clip, the placeable initial landing spot, window focus loss preserving the decoration session and its derivation, and same-world grid reuse from a bounded cache")
+  print("PASS: editor cancel, failure preservation, hand controls, duplicate submit, stale revision, late world, input routing, ready-grid row click, host-cannot-answer vs host-says-empty, empty-grid and dead-derivation honesty, stale notice refresh, skipped-push retry, the row click that arrives before the grid is ready (remembered, completed on readiness from the clicked prop's own transform, invalidated by every \"I do not want this\" signal, never queued), scene pick-up routing, placed-prop transform, hover glow inside the focus clip, the placeable initial landing spot, window focus loss preserving the decoration session and its derivation, and same-world grid reuse from a bounded cache, the typing gate resolving to the real input field only, and the panel-to-scene hands-back of keyboard focus")
  }
 }
 """#

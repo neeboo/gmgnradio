@@ -39,6 +39,10 @@ let presentationState = declaration("struct StageSurfacePresentationState:", in:
 let destinationContent = declaration("struct StageDestinationContent:", in: controllerSource)
 let composerVisibility = declaration("private func updateResidentComposerVisibility()", in: controllerSource)
 let composerFocus = declaration("private func residentComposerOwnsFirstResponder()", in: controllerSource)
+    .replacingOccurrences(of: "private func", with: "func")
+// 「正在打字」的判据本体（它现在也供场景键盘/指针门禁使用）。harness 里它是文件作用域函数，
+// 用 mock 的 `View`/`NSTextView`（`isDescendant(of:)` + `delegate`）就能跑真实现。
+let inputFocusPredicate = declaration("func stageTextInputOwnsFocus(", in: controllerSource)
 // 菜单栏装修入口在空间内部的落地：进入/退出、挂起意图与「呈现完成时补一次」。
 let decorationToggle = declaration("func toggleDecorationEditor()", in: controllerSource, last: true)
 let pendingDecorationReplay = declaration("private func applyPendingDecorationEditorRequest()", in: controllerSource)
@@ -54,6 +58,7 @@ import os
 final class StageWindowController {
     static let log = Logger(subsystem: "test.space-presentation", category: "controller")
 }
+\#(inputFocusPredicate)
 class View {
     var isHidden = false
     weak var parent: View?
@@ -239,6 +244,30 @@ for uiFirst in [true, false] {
     _ = (firstID, secondID)
 }
 
+// ── 「正在打字」的判据来源：**真正的输入框**，而不是任意 `NSTextView` ────────────
+// 真机 2026-09-29：用户在「摆放」面板点了一行 → 进了携带态（圆环画出来了）→ 鼠标不跟手、
+// 圆环点不动、`R`/`,`/`.` 全没反应。装修面板自己也是 SwiftUI 托管视图，点一下它里面的东西
+// 就可能把 first responder 交给一个 `NSTextView`；那**不是**打字 —— 场景门禁（键盘与指针）
+// 只认 `residentComposer`（聊天输入框）自己或它的后代，否则场景会被"刚点完列表"整个挡死。
+let ownershipStore = Store()
+let ownershipContent = Content(ownershipStore)
+let outsideEditor = NSTextView()
+ownershipContent.window?.firstResponder = outsideEditor
+check(!ownershipContent.residentComposerOwnsFirstResponder(),
+      "a text view that merely shares the window with the composer is not typing")
+let composerEditor = NSTextView()
+let composerField = View()
+composerField.parent = ownershipContent.residentComposer
+composerEditor.delegate = composerField
+ownershipContent.window?.firstResponder = composerEditor
+check(ownershipContent.residentComposerOwnsFirstResponder(),
+      "the composer's field editor is typing and must still gate the scene")
+let composerTextView = NSTextView()
+composerTextView.parent = ownershipContent.residentComposer
+ownershipContent.window?.firstResponder = composerTextView
+check(ownershipContent.residentComposerOwnsFirstResponder(),
+      "a text view inside the composer is typing")
+
 // ── 菜单栏「装修空间」挂起的意图 ────────────────────────────────────────────
 // 空间/世界快照还没就绪时不能静默丢弃；快照一到就补上（用户不需要点第二次）；
 // 退出空间时作废，免得下次进空间时突然弹出装修面板。
@@ -268,7 +297,7 @@ check(!decorationContent.pendingDecorationEditorRequest,
       "leaving the space drops a parked decoration request")
 _ = decorationObserverID
 if failures > 0 { print("\(failures) assertions failed"); exit(1) }
-print("PASS: both observer orders, initial entry, reentry, exit, and asynchronous loading")
+print("PASS: both observer orders, initial entry, reentry, exit, asynchronous loading, and the typing predicate resolving to the real composer only")
 """#
 
 func runHarness() throws -> Int32 {
