@@ -38,6 +38,21 @@ func method(_ signature:String, in source:String = controller) -> String {
  }
  fatalError("unbalanced method")
 }
+// ── 结构性断言（真源码）：窗口失焦**不是**放弃编辑的意图 ────────────────────────
+// 装修的"在手"状态只是一份本地草稿（`placement`/`candidate`，`preview` 从不改世界）。
+// 真机 2026-09-28：用户打开装修 → 点了一下物件那一行 → 切到别的窗口说话，装修在 4.4 s 后
+// 自己退出了，而 Debug 下一次派生要 4.8 s ⇒ 派生每次被掐死、结果被丢弃。所以
+// `windowDidResignKey` 里不许出现任何关闭/停用装修会话的动作（读 `isOpen` 这种只读引用无妨）。
+let resignKeyHandler = method("func windowDidResignKey(")
+for forbidden in ["close()","deactivate","escape(","cancelPreview"] where resignKeyHandler.contains(forbidden) {
+ print("FAIL: windowDidResignKey must not close or deactivate the decoration editor on focus loss (found \"\(forbidden)\")");exit(1)
+}
+if controller.contains("func windowDidBecomeKey") {
+ let becomeKeyHandler = method("func windowDidBecomeKey(")
+ guard !becomeKeyHandler.contains("close()"), !becomeKeyHandler.contains("deactivate") else {
+  print("FAIL: regaining window focus must not compensate for focus loss by closing the decoration editor");exit(1)
+ }
+}
 let harness = #"""
 import Foundation
 import Combine
@@ -86,6 +101,73 @@ struct FlatFloorCollision: WorldPropSupportQuerying {
   return 0
  }
  func canTraverse(_ capsule: WorldCapsule, from start: SIMD3<Float>, to destination: SIMD3<Float>, maximumStepHeight: Float) -> Bool { true }
+}
+/// 计数版平地板：`triangles(in:)` 的调用次数就是"派生**真的问过几何**没有"的唯一证据。
+///
+/// 按世界缓存这条行为断言不能只看"模型里有个字典"：第二次进入同一世界必须**一次都不问**
+/// 几何，那才叫复用而不是重算。
+///
+/// `sleepSeconds` 只作用在**第一次**查询上（多睡 50 ms），用来把"派生正在进行中"这一段
+/// 拉长到主线程能观察到 —— 于是"切窗口/关面板会不会打断进行中的派生"可以被真的测出来，
+/// 而不是靠时序碰运气。
+final class CountingFloorCollision: WorldPropSupportQuerying, @unchecked Sendable {
+ let half: Float
+ private let sleepSeconds: Double
+ private let lock = NSLock()
+ private var queries = 0
+ init(half: Float, sleepSeconds: Double = 0) { self.half = half; self.sleepSeconds = sleepSeconds }
+ var queryCount: Int { lock.lock(); defer { lock.unlock() }; return queries }
+ private var plane: [WorldTriangle] {
+  [WorldTriangle(SIMD3(-half,0,-half),SIMD3(half,0,-half),SIMD3(half,0,half)),
+   WorldTriangle(SIMD3(-half,0,-half),SIMD3(half,0,half),SIMD3(-half,0,half))]
+ }
+ func triangles(in bounds: WorldPlanarBounds) -> [WorldTriangle] {
+  lock.lock()
+  queries += 1
+  let isFirstQuery = queries == 1
+  lock.unlock()
+  if isFirstQuery, sleepSeconds > 0 { Thread.sleep(forTimeInterval: sleepSeconds) }
+  guard bounds.minimumX <= half, bounds.maximumX >= -half,
+        bounds.minimumZ <= half, bounds.maximumZ >= -half else { return [] }
+  return plane
+ }
+ func canOccupy(_ capsule: WorldCapsule, at position: SIMD3<Float>) -> Bool { position.y >= -0.001 }
+ func groundHeight(at position: SIMD3<Float>) -> Float? {
+  guard position.x >= -half, position.x <= half,
+        position.z >= -half, position.z <= half,
+        position.y + 0.05 >= 0 else { return nil }
+  return 0
+ }
+ func canTraverse(_ capsule: WorldCapsule, from start: SIMD3<Float>, to destination: SIMD3<Float>, maximumStepHeight: Float) -> Bool { true }
+}
+/// 窗口失焦这条路的**真源码**：`windowDidResignKey` 从 `StageWindowController` 里原样抽出来
+/// 编译（不是替身），所以"失焦会不会关掉装修、会不会打断派生"测的是生产代码。
+///
+/// 接线刻意照抄真机：会话关闭（`onEditingChanged(false)`）⇒ App 的 `setResidentPropEditing(false)`
+/// ⇒ 停用格子并收回派生令牌。
+@MainActor final class DecorationFocusHarness {
+ static let log = Logger(subsystem: ProductIdentity.bundleIdentifier, category: "StageWindowController")
+ let residentPropEditor = ResidentPropEditorState()
+ let residentPropGridEditor = ResidentPropGridEditorModel()
+ /// **正在进行的那一次**派生的令牌（与 App 里的 `residentPropGridDerivation` 同名同义）。
+ var residentPropGridDerivation: UUID?
+ init() {
+  residentPropEditor.onEditingChanged = { [unowned self] open in
+   guard !open else { return }
+   residentPropGridDerivation = nil
+   residentPropGridEditor.deactivate()
+  }
+ }
+ /// 打开装修：进会话 + 派生格子（真机 `open()` → `activateResidentPropGrid()`）。
+ func beginDecoration(worldID: String, collision: any WorldPropSupportQuerying = FlatFloorCollision(half: 1.5)) async {
+  residentPropEditor.update(.init(worldID: worldID, revision: 1, objects: [], surfaces: [], canUndo: false))
+  residentPropEditor.open()
+  residentPropGridDerivation = UUID()
+  await residentPropGridEditor.activate(collision: collision, seed: .init(x: 0, y: 0, z: 0),
+   bounds: .init(minimumX: -1.5, maximumX: 1.5, minimumZ: -1.5, maximumZ: 1.5), key: worldID)
+  residentPropGridDerivation = nil
+ }
+ \#(method("func windowDidResignKey("))
 }
 @MainActor final class ControllerHarness {
  let residentPropEditor = ResidentPropEditorState()
@@ -762,7 +844,110 @@ typealias WorldAgentContext = LayoutContext
       spawn:zero).allSatisfy { $0.candidateAnchors.count <= 8 },
     "without a grid the surface candidates stay empty instead of being invented")
 
-  print("PASS: editor cancel, failure preservation, hand controls, duplicate submit, stale revision, late world, input routing, ready-grid row click, host-cannot-answer vs host-says-empty, empty-grid and dead-derivation honesty, stale notice refresh, skipped-push retry, scene pick-up routing, placed-prop transform, hover glow inside the focus clip and the placeable initial landing spot")
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 2026-09-28 阻塞缺陷（真机确诊）：**窗口失焦把装修会话杀掉了**。
+  //
+  // 用户只是「打开装修 → 点了一下物件那一行 → 切到别的窗口跟我说话」，装修在打开 4.4 s 后
+  // 自己退出了，而 Debug 构建下一次派生要 4.8 s ⇒ 派生每次都被掐死、结果被丢弃，于是面板
+  // 永远说"格子还在生成"、那一行永远点不动。下面把"失焦不关装修、不打断派生"钉在**真源码**上：
+  // `windowDidResignKey` 是从 `StageWindowController` 里原样抽出来编译的（不是替身），
+  // 接线也照抄真机（会话关闭 ⇒ 停用格子 + 收回派生令牌）。
+  let focusHarness = DecorationFocusHarness()
+  await focusHarness.beginDecoration(worldID:"focus-world")
+  precondition(focusHarness.residentPropEditor.isOpen,
+    "precondition: opening decoration opens the editor")
+  precondition(focusHarness.residentPropGridEditor.isBuildModeActive && focusHarness.residentPropGridEditor.isReady,
+    "precondition: opening decoration derives the grid")
+  // 切到别的窗口去说话 —— 真机就是这一步把装修杀掉的。
+  focusHarness.windowDidResignKey(Notification(name:Notification.Name("NSWindowDidResignKeyNotification")))
+  precondition(focusHarness.residentPropEditor.isOpen,
+    "losing window focus must not close the decoration editor")
+  precondition(focusHarness.residentPropGridEditor.isBuildModeActive,
+    "losing window focus must not end the decoration session")
+  precondition(focusHarness.residentPropGridEditor.isReady && !focusHarness.residentPropGridEditor.renderCells.isEmpty,
+    "losing window focus must not discard the derived grid")
+  precondition(focusHarness.residentPropGridDerivation == nil,
+    "losing window focus must not touch the derivation token")
+  // 切回来：控制器里没有 `windowDidBecomeKey` 的补偿逻辑（结构性断言见
+  // `test-stage-resident-chat.swift`），所以这一趟往返对会话什么也没做。
+  precondition(focusHarness.residentPropEditor.isOpen && focusHarness.residentPropGridEditor.isReady,
+    "the editor and its derived grid must survive a window focus round trip")
+
+  // 派生**正在进行中**失焦：不许被掐死，也不许结果被丢弃（真机上 4.8 s 就是这么被掐掉的）。
+  let inflightCollision = CountingFloorCollision(half:1.5,sleepSeconds:0.05)
+  let inflightHarness = DecorationFocusHarness()
+  let inflightTask = Task { await inflightHarness.beginDecoration(worldID:"focus-inflight",collision:inflightCollision) }
+  for _ in 0..<100_000 { if inflightCollision.queryCount > 0 { break };await Task.yield() }
+  precondition(inflightCollision.queryCount > 0,
+    "precondition: the in-flight derivation really started asking the geometry")
+  precondition(inflightHarness.residentPropGridEditor.isBuildModeActive && !inflightHarness.residentPropGridEditor.isReady,
+    "precondition: the derivation is still in flight")
+  inflightHarness.windowDidResignKey(Notification(name:Notification.Name("NSWindowDidResignKeyNotification")))
+  await inflightTask.value
+  precondition(inflightHarness.residentPropEditor.isOpen && inflightHarness.residentPropGridEditor.isBuildModeActive
+      && inflightHarness.residentPropGridEditor.isReady,
+    "losing window focus mid-derivation must neither kill the session nor drop the finished grid")
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 按世界缓存：**同一世界第二次进入装修复用缓存网格，不重新派生**（行为断言）。
+  //
+  // 判据是"几何还被问过没有"：第二次进入必须**一次都不问** —— 只断言"模型里有个字典"不够。
+  let flatBounds = WorldPlanarBounds(minimumX:-1.5,maximumX:1.5,minimumZ:-1.5,maximumZ:1.5)
+  let cacheCollision = CountingFloorCollision(half:1.5)
+  let cachedModel = ResidentPropGridEditorModel()
+  await cachedModel.activate(collision:cacheCollision,seed:.init(x:0,y:0,z:0),bounds:flatBounds,key:"cache-world")
+  precondition(cachedModel.isReady && !cachedModel.renderCells.isEmpty,
+    "precondition: the first entry derives a grid")
+  let queriesAfterFirstEntry = cacheCollision.queryCount
+  precondition(queriesAfterFirstEntry > 0,
+    "precondition: the first derivation really asked the geometry (queries=\(queriesAfterFirstEntry))")
+  cachedModel.deactivate()
+  precondition(!cachedModel.isBuildModeActive && !cachedModel.isReady && cachedModel.renderCells.isEmpty
+      && cachedModel.cellStates.isEmpty && cachedModel.supportCollision == nil,
+    "deactivate must clear the active state (build mode, grid, cells, colouring, collision)")
+  await cachedModel.activate(collision:cacheCollision,seed:.init(x:0,y:0,z:0),bounds:flatBounds,key:"cache-world")
+  precondition(cachedModel.isReady,"re-entering the same world must be ready immediately")
+  precondition(cacheCollision.queryCount == queriesAfterFirstEntry,
+    "re-entering the same world must reuse the cached grid instead of deriving it again (queries \(queriesAfterFirstEntry) → \(cacheCollision.queryCount))")
+  precondition(!cachedModel.renderCells.isEmpty,
+    "the cached grid must be re-projected into cells on re-entry")
+
+  // 派生**进行中**用户明确关掉面板（X / Esc）：结果一样不许丢，下次进来直接复用。
+  let interruptedCollision = CountingFloorCollision(half:1.5,sleepSeconds:0.05)
+  let interruptedModel = ResidentPropGridEditorModel()
+  let interruptedTask = Task { await interruptedModel.activate(collision:interruptedCollision,
+    seed:.init(x:0,y:0,z:0),bounds:flatBounds,key:"interrupted-world") }
+  for _ in 0..<100_000 { if interruptedCollision.queryCount > 0 { break };await Task.yield() }
+  precondition(interruptedCollision.queryCount > 0,"precondition: the interrupted derivation really started")
+  interruptedModel.deactivate()
+  await interruptedTask.value
+  precondition(!interruptedModel.isBuildModeActive,"an explicit close must leave the build mode off")
+  let queriesAfterInterrupted = interruptedCollision.queryCount
+  await interruptedModel.activate(collision:interruptedCollision,seed:.init(x:0,y:0,z:0),bounds:flatBounds,
+    key:"interrupted-world")
+  precondition(interruptedModel.isReady,
+    "a derivation that finished while the panel was closed must still be reused on the next entry")
+  precondition(interruptedCollision.queryCount == queriesAfterInterrupted,
+    "closing the panel must not throw away a derivation that already finished (queries \(queriesAfterInterrupted) → \(interruptedCollision.queryCount))")
+
+  // 缓存必须有**上界**：换世界不会让网格无限增长；被淘汰的世界重进要重新派生，仍在缓存里的则复用。
+  let boundedCollision = CountingFloorCollision(half:1.5)
+  let boundedModel = ResidentPropGridEditorModel()
+  for key in ["bound-a","bound-b","bound-c"] {
+    await boundedModel.activate(collision:boundedCollision,seed:.init(x:0,y:0,z:0),bounds:flatBounds,key:key)
+    boundedModel.deactivate()
+  }
+  precondition(boundedModel.retainedGridCount == ResidentPropGridEditorModel.retainedGridLimit,
+    "the grid cache must stay bounded (\(boundedModel.retainedGridCount) retained, limit \(ResidentPropGridEditorModel.retainedGridLimit))")
+  let queriesAfterThreeWorlds = boundedCollision.queryCount
+  await boundedModel.activate(collision:boundedCollision,seed:.init(x:0,y:0,z:0),bounds:flatBounds,key:"bound-c")
+  precondition(boundedCollision.queryCount == queriesAfterThreeWorlds,
+    "the most recently used world must still be cached")
+  await boundedModel.activate(collision:boundedCollision,seed:.init(x:0,y:0,z:0),bounds:flatBounds,key:"bound-a")
+  precondition(boundedCollision.queryCount > queriesAfterThreeWorlds,
+    "the evicted world must derive again (the cache is bounded, not a leak)")
+
+  print("PASS: editor cancel, failure preservation, hand controls, duplicate submit, stale revision, late world, input routing, ready-grid row click, host-cannot-answer vs host-says-empty, empty-grid and dead-derivation honesty, stale notice refresh, skipped-push retry, scene pick-up routing, placed-prop transform, hover glow inside the focus clip, the placeable initial landing spot, window focus loss preserving the decoration session and its derivation, and same-world grid reuse from a bounded cache")
  }
 }
 """#

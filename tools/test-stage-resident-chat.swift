@@ -35,6 +35,26 @@ func declaration(_ signature: String, in text: String) -> String {
     fatalError("Unbalanced declaration")
 }
 let state = declaration("final class StageResidentChatState:", in: overlay)
+// ── 窗口失焦：不许关掉装修会话 ────────────────────────────────────────────────
+// 装修的"在手"状态只是一份**本地草稿**（`placement`/`candidate`，`preview` 从不改世界），
+// 切到别的窗口去说话不构成"我放弃这次编辑"；The Sims 也不会因为切窗口就退出建造模式。
+// 真机 2026-09-28（阻塞缺陷）：用户只是「打开装修 → 点了一下物件那一行 → 切窗口说话」，
+// 装修在打开 4.4 s 后自己退出了，而 Debug 构建下一次派生要 4.8 s ⇒ 派生每次都被掐死、
+// 结果被丢弃，面板于是永远说"还在生成"、那一行永远点不动。
+// 明确的关闭意图各有入口（面板 X / Esc 链 / 切换面板 / 切换空间或世界 / 关窗），
+// 所以失焦这条路上不许出现任何关闭或停用编辑器的动作（只读 `isOpen` 无妨）。
+let resignKeyHandler = declaration("func windowDidResignKey(", in: controller)
+for forbidden in ["close()", "deactivate", "escape(", "cancelPreview"] where resignKeyHandler.contains(forbidden) {
+    print("FAIL: windowDidResignKey must not close or deactivate the decoration editor on focus loss (found \"\(forbidden)\")")
+    exit(1)
+}
+if controller.contains("func windowDidBecomeKey") {
+    let becomeKeyHandler = declaration("func windowDidBecomeKey(", in: controller)
+    guard !becomeKeyHandler.contains("close()"), !becomeKeyHandler.contains("deactivate") else {
+        print("FAIL: regaining window focus must not compensate for focus loss by closing the decoration editor")
+        exit(1)
+    }
+}
 guard overlay.contains("private func performPrimaryAction()") else {
     print("FAIL: speech playback has no stop action that preserves the completed reply")
     exit(1)

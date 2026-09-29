@@ -2,6 +2,12 @@ import SwiftUI
 import WorldRuntime
 
 /// A temporary, quiet shelf. The actual object remains in the room during previews.
+///
+/// 2026-09-29：这里**不再是配置表单**。落点、朝向、放下都改在 3D 空间里用鼠标做
+/// （射线命中哪一层就放哪一层；点地面放下；`R` / `⇧R` / `,` / `.` 或物件旁的圆环转
+/// 45°；`Esc` 放回）。面板只留下"选哪一件"和几个不可替代的次要动作：撤销、收回，
+/// 以及**居民右手**那一套（拿着看/放回/微调）——那是"居民真的把东西拿在手里"
+/// （会持久化、要求 2B 角色、最长边 >0.45 m 直接拒绝），和鼠标携带是两件事。
 struct ResidentPropEditorView: View {
     @ObservedObject var state: ResidentPropEditorState
     var body: some View {
@@ -59,44 +65,24 @@ struct ResidentPropEditorView: View {
                         Button("放回") { Task { await state.returnSelected() } }
                     }.controlSize(.small)
                 } else {
-                    Picker("放在", selection: Binding(get: { state.placement?.surfaceID ?? "" }, set: { id in Task { await state.selectSurface(id) } })) {
-                        ForEach(state.snapshot.surfaces) { Text($0.name).tag($0.id) }
-                    }
+                    // 不做落点配置：层由射线命中决定，朝向与放下都在空间里完成。
                     HStack(spacing: 8) {
-                        Button("左转 45°") { Task { await state.rotate(-1) } }
-                        Button("右转 45°") { Task { await state.rotate(1) } }
-                        Spacer()
-                        Button(state.isMoving ? "停止移动" : "移动") { state.toggleMoving() }
-                    }.controlSize(.small)
-                    HStack(spacing: 7) {
-                        Text("微调").foregroundStyle(.secondary)
-                        step("arrow.left", x: -0.1, z: 0); step("arrow.up", x: 0, z: -0.1)
-                        step("arrow.down", x: 0, z: 0.1); step("arrow.right", x: 0.1, z: 0)
-                        Spacer()
-                        Button("收回") { Task { await state.withdraw() } }.disabled(state.selectedObject?.isEnabled != true)
-                    }.controlSize(.small)
-                    HStack {
                         Button("拿着看") { Task { await state.holdSelected() } }
                             .disabled(state.selectedHoldUnavailableReason != nil || state.isSaving)
-                        if let reason = state.selectedHoldUnavailableReason {
-                            Text(reason).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2)
-                        }
+                        Button("收回") { Task { await state.withdraw() } }
+                            .disabled(state.selectedObject?.isEnabled != true)
+                    }.controlSize(.small)
+                    if let reason = state.selectedHoldUnavailableReason {
+                        Text(reason).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2)
                     }
-                    if state.isMoving {
-                        Text("移动指针选择落点，单击确认；Esc 取消")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
-                    }
+                    Text("移动指针选择落点，左键放下；R / ⇧R / , / . 或圆环旋转 45°；Esc 放回")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
             }
             if !state.notice.isEmpty { Text(state.notice).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
             HStack {
                 Button("撤销上次") { Task { await state.undo() } }.disabled(!state.snapshot.canUndo || state.isSaving)
                 Spacer()
-                if state.selectedID != nil && !state.isSelectedHeld {
-                    Button("取消") { state.cancelPreview() }.disabled(state.isSaving)
-                    Button(state.isSaving ? "保存中…" : "确认") { Task { await state.confirm() } }
-                        .buttonStyle(.borderedProminent).tint(.cyan.opacity(0.7)).disabled(!state.canConfirm)
-                }
             }.controlSize(.small)
         }
         .font(.system(size: 12)).padding(16)
@@ -109,10 +95,6 @@ struct ResidentPropEditorView: View {
         .shadow(color: .black.opacity(0.25), radius: 12, y: 3)
         .onExitCommand { state.escape() }
         .disabled(state.isSaving)
-    }
-    private func step(_ icon: String, x: Float, z: Float) -> some View {
-        Button { Task { await state.nudge(x: x, z: z) } } label: { Image(systemName: icon) }
-            .help("移动 10 厘米")
     }
     private func holdStep(_ title: String, y: Float = 0, z: Float = 0) -> some View {
         Button(title) { Task { await state.nudgeHeld(y: y, z: z) } }

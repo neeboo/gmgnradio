@@ -14,6 +14,10 @@ import WorldRuntime
 /// **缓存策略**：网格只依赖几何、种子与参数，**与已放物件无关**（`commitPropLayout` 只把
 /// 物件包进碰撞世界，网格几何不变）。所以按调用方给的 `key`（例如 worldID）派生一次即可，
 /// 每次放置都重建是浪费：真实生活舱一次派生在 -O 下约 0.5 s。
+///
+/// 缓存**跨装修会话存活**（`deactivate()` 只清"当前激活状态"，不丢网格）：真机 2026-09-28
+/// 的阻塞缺陷里，Debug 构建一次派生要 4.8 s，而用户每次切窗口都会（错误地）关掉装修会话，
+/// 于是派生永远跑不完、结果永远被丢弃。结果一旦算出来就必须留住 —— 同一个世界算一遍就够。
 @MainActor final class ResidentPropGridEditorModel: ObservableObject {
     /// 派生这条链的常驻诊断（与宿主同一个 subsystem/category，`log show` 一条命令就能读全）。
     ///
@@ -46,6 +50,21 @@ import WorldRuntime
 
     private var collision: (any WorldPropSupportQuerying)?
     private var gridKey: String?
+    /// 当前**激活会话**的世界键（`activate` 一开始就写下，`deactivate` 清掉）。
+    ///
+    /// 与 `gridKey`（"已经就绪的那份网格属于谁"）分开：派生是异步的，一次派生跑完时
+    /// 会话可能已经换到别的世界了 —— 那种结果只能进缓存，不能写回激活状态。
+    private var activeKey: String?
+    /// 派生结果的**按世界缓存**（最近使用在后，上界 `retainedGridLimit`）。
+    ///
+    /// 值类型 `PropSupportGrid` 是 `Sendable` 的不可变快照，本类型又是 `@MainActor`，
+    /// 所以这份持有不引入任何跨线程共享（`SWIFT_STRICT_CONCURRENCY: complete` 下合法）。
+    private var cachedGrids: [String: PropSupportGrid] = [:]
+    private var cachedGridOrder: [String] = []
+    /// 缓存上界：只保留最近这么多个世界的网格，避免换世界时无限增长。
+    static let retainedGridLimit = 2
+    /// 当前缓存的网格数（诊断用）。
+    var retainedGridCount: Int { cachedGrids.count }
     private var cells: [PropSupportGridPresentation.Cell] = []
     private var candidates: [PropSupportGridPicker.Candidate] = []
     private var layerRefs: [PropSupportColumn: [Int: PropSupportLayerRef]] = [:]
@@ -83,14 +102,23 @@ import WorldRuntime
     ) async {
         self.collision = collision
         isBuildModeActive = true
-        if gridKey == key, let grid {
-            // 已有同一份几何的网格：只把缓存重新指向它，不重新派生。
-            Self.log.notice("格子派生：命中缓存 key=\(key, privacy: .public) 层=\(grid.layers.count, privacy: .public)")
-            rebuildCaches(from: grid)
+        activeKey = key
+        if let cached = cachedGrids[key] {
+            // 已有同一份几何的网格（哪怕上一次装修会话已经退出）：只把缓存重新指向它，
+            // 不重新派生 —— 这就是"重开装修不再等 4.8 s"。
+            touchCachedGrid(key)
+            grid = cached
+            report = cached.report
+            gridKey = key
+            Self.log.notice("格子派生：命中缓存 key=\(key, privacy: .public) 层=\(cached.layers.count, privacy: .public)")
+            rebuildCaches(from: cached)
+            clearHover()
             onGridChanged?()
             return
         }
-        Self.log.notice("格子派生：开始 key=\(key, privacy: .public)")
+        Self.log.notice(
+            "格子派生：开始 key=\(key, privacy: .public) 已缓存网格=\(self.cachedGrids.count, privacy: .public)/\(Self.retainedGridLimit, privacy: .public)"
+        )
         let startedAt = ContinuousClock.now
         // 派生是**纯计算**，且真实舱体一次要 0.5 s（-O）/ 6.6 s（-Onone）。
         // 同步做会把打开装修编辑器的那一帧卡住，所以放后台；`PropSupportGrid` 是 Sendable。
@@ -103,11 +131,14 @@ import WorldRuntime
             )
         }.value
         let elapsed = startedAt.duration(to: .now)
-        // 派生期间编辑器可能已经被关掉：那就别把结果写回来。
-        guard isBuildModeActive, gridKey != key else {
+        // 算完的东西**先留在缓存里**：关掉面板不该丢掉一次已经跑完的派生（"同一世界算一遍就够"）。
+        // 之前这里在写回之前就返回，于是"关掉再打开"每次都要从头再算一遍。
+        storeCachedGrid(built, key: key)
+        // 派生期间编辑器可能已经被关掉（明确意图）或切到了别的世界：那就别把结果写回**激活状态**。
+        guard activeKey == key, gridKey != key else {
             // 这条过去是完全静默的：一次算完的派生被丢掉，外面却还留着"请求过"的印记。
             // 真机排查必须能一眼看出是**哪一半**把它丢掉的。
-            Self.log.notice("格子派生：结果被丢弃（建造模式开着=\(self.isBuildModeActive, privacy: .public) 缓存键相同=\(self.gridKey == key, privacy: .public)）key=\(key, privacy: .public)")
+            Self.log.notice("格子派生：结果已进缓存但未写回激活状态（建造模式开着=\(self.isBuildModeActive, privacy: .public) 缓存键相同=\(self.gridKey == key, privacy: .public) 激活键=\(self.activeKey ?? "nil", privacy: .public)）key=\(key, privacy: .public)")
             return
         }
         grid = built
@@ -122,9 +153,16 @@ import WorldRuntime
         onGridChanged?()
     }
 
+    /// 停用**当前激活会话**：渲染层立刻不该再画格子，拾取也不该命中。
+    ///
+    /// 但**不丢网格本身**：几何与"这次装修会话开没开"无关，重开同一个世界时直接复用
+    /// （见 `activate` 的命中分支）。只有 LRU 上界（`storeCachedGrid`）会淘汰它。
     func deactivate() {
-        Self.log.notice("格子派生：停用（此前缓存键=\(self.gridKey ?? "nil", privacy: .public)）")
+        Self.log.notice(
+            "格子派生：停用（此前缓存键=\(self.gridKey ?? "nil", privacy: .public)，已缓存网格=\(self.cachedGrids.count, privacy: .public)/\(Self.retainedGridLimit, privacy: .public)）"
+        )
         isBuildModeActive = false
+        activeKey = nil
         onGridChanged?()
         grid = nil
         report = nil
@@ -137,6 +175,31 @@ import WorldRuntime
         hoverTarget = nil
         clearHover()
         onGridChanged?()
+    }
+
+    /// 把一份派生结果放进按世界的缓存，并按 LRU 上界淘汰最老的。
+    ///
+    /// 刻意**与"当前有没有在装修"无关**：一次跑完的派生结果不能因为用户关了面板就消失。
+    private func storeCachedGrid(_ grid: PropSupportGrid, key: String) {
+        cachedGrids[key] = grid
+        cachedGridOrder.removeAll { $0 == key }
+        cachedGridOrder.append(key)
+        while cachedGridOrder.count > Self.retainedGridLimit {
+            // 只淘汰**不是当前激活会话**的那一份：激活中的网格必须始终留在缓存里，
+            // 否则"退出装修 → 重进"会退化回重新派生。
+            guard let index = cachedGridOrder.firstIndex(where: { $0 != activeKey }) else { return }
+            let evicted = cachedGridOrder.remove(at: index)
+            cachedGrids[evicted] = nil
+            Self.log.notice(
+                "格子派生：缓存淘汰 key=\(evicted, privacy: .public) 上界=\(Self.retainedGridLimit, privacy: .public)"
+            )
+        }
+    }
+
+    /// 标记某个世界的网格是"最近用过"的（命中缓存时调用）。
+    private func touchCachedGrid(_ key: String) {
+        cachedGridOrder.removeAll { $0 == key }
+        cachedGridOrder.append(key)
     }
 
     /// 光标移到一件**已摆出来的**物件上：它的 footprint 格子进入 `.hoverTarget`（发光）。

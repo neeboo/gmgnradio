@@ -422,8 +422,25 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         updateRenderSurfaceVisibility(for: window)
     }
 
+    /// 窗口失焦**不是**放弃编辑的意图，因此这里不关装修会话。
+    ///
+    /// 装修的"在手"状态只是一份**本地草稿**（`ResidentPropEditorState` 的 `placement` /
+    /// `candidate`，`preview` 从不改世界），切到别的窗口去说话不构成"我放弃这次编辑"；
+    /// The Sims 也不会因为切窗口就退出建造模式。
+    ///
+    /// 真机 2026-09-28 的阻塞缺陷正出在这里：用户只是「打开装修 → 点了一下物件那一行 →
+    /// 切到别的窗口说话」，装修在打开 4.4 s 后自己退出了，而 Debug 构建下一次派生要 4.8 s ——
+    /// 派生每次都被掐死、结果被丢弃，于是面板永远说"还在生成"、那一行永远点不动。
+    ///
+    /// 只有**明确**的关闭意图才结束会话，它们各有自己的入口：面板 X 与 `Esc` 链
+    /// （`ResidentPropEditorState.escape()` / `close()`）、切换到别的面板（程序单 / 视觉选择 /
+    /// 聊天）、切换空间或世界（`applySpatialPresentation`）、关窗（`windowWillClose` /
+    /// `finishCurrentClose`）、退出空间。这里只留一条常驻诊断：真机上"装修为什么还开着/没了"
+    /// 必须能一眼看出是失焦被保留，而不是没人接上。
     func windowDidResignKey(_ notification: Notification) {
-        residentPropEditor.close()
+        Self.log.notice(
+            "装修：空间窗口失焦，保留装修会话与在手草稿（失焦不是放弃编辑）。editorOpen=\(self.residentPropEditor.isOpen, privacy: .public)"
+        )
     }
 
     func windowDidEnterFullScreen(_ notification: Notification) {
