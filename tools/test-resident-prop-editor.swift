@@ -15,8 +15,30 @@ let gridMapping = try String(contentsOf:root.appendingPathComponent("apps/macos/
 let gridPicker = try String(contentsOf:root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/PropSupportGridPicker.swift"),encoding:.utf8)
 let gridPresentation = try String(contentsOf:root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/PropSupportGridPresentation.swift"),encoding:.utf8)
 let gridModelSource = try String(contentsOf:root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/ResidentPropGridEditorModel.swift"),encoding:.utf8)
+// 光标旁那枚「这里为什么不能放」的纯逻辑（同时是 `ResidentPropEditorView` 图例的取色来源）。
+let blockLabelSource = try String(contentsOf:root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/ResidentPropBlockReasonLabel.swift"),encoding:.utf8)
+guard blockLabelSource.contains("enum ResidentPropBlockReasonLabel") else {
+    print("FAIL: the cursor-side block-reason label is missing");exit(1)
+}
 let controller = try String(contentsOf:root.appendingPathComponent("apps/macos/Sources/GMGNRadio/VisualEngine/StageWindowController.swift"),encoding:.utf8)
 let editorView = try String(contentsOf:root.appendingPathComponent("apps/macos/Sources/GMGNRadio/VisualEngine/ResidentPropEditorView.swift"),encoding:.utf8)
+// ── 光标旁那枚标签的**绘制条件**只能来自那个纯判据 ────────────────────────────
+// 真机：红格的原因只写在面板右下角，用户看不见。现在它跟着光标走 —— 但"什么时候画"
+// 必须仍然由 `ResidentPropBlockReasonLabel.content` 回答（携带 + 真的有原因），
+// 视图里自己判断（例如"总是画"）会让可放时也冒出一枚噪音标签。
+let blockLabelDraw = method("private func drawBlockReasonLabel(", in: controller)
+guard blockLabelDraw.contains("guard let text = ResidentPropBlockReasonLabel.content("),
+      blockLabelDraw.contains("isCarrying: propEditor.isCarrying"),
+      blockLabelDraw.contains("reason: spatialStage.residentPropBlockReason?.errorDescription") else {
+ print("FAIL: the cursor-side label must be drawn only through ResidentPropBlockReasonLabel.content(isCarrying:reason:...) and take its copy from the existing block-reason projection");exit(1)
+}
+// 实时性：这一拍里 `onGridCursor` 才会算出新的原因，所以标脏必须在它**之后** ——
+// 否则标签永远慢一次 hover。
+let pointerUpdate = method("private func updatePropPointer(", in: controller)
+guard let cursorCall = pointerUpdate.range(of:"onGridCursor?(normalized)"),
+      pointerUpdate.range(of:"needsDisplay = true",range:cursorCall.upperBound..<pointerUpdate.endIndex) != nil else {
+ print("FAIL: the hover redraw must be marked after onGridCursor returns (otherwise the label lags one hover behind)");exit(1)
+}
 guard controller.contains("StageControlPanelLayout.transportWidth + StageControlPanelLayout.controlSize"),
       controller.contains("window.minSize = CGSize(width: 760, height: 520)"),
       controller.contains("propEditorPanel.widthAnchor.constraint(equalToConstant: 340)"),
@@ -115,6 +137,7 @@ let livingWorldLogger = Logger(subsystem: ProductIdentity.bundleIdentifier, cate
 \#(gridPicker)
 \#(gridPresentation)
 \#(gridModelSource)
+\#(blockLabelSource)
 /// 一块 3 m × 3 m 的平地板（y = 0）：派生出来的承托网格每列只有一层、而且同高。
 ///
 /// 真实舱体的地面是起伏网格（每个高度常常只有一格），反而量不出"整块 footprint 发光"这件事；
@@ -276,6 +299,9 @@ final class CountingFloorCollision: WorldPropSupportQuerying, @unchecked Sendabl
  var cellStates:[Int:Int] = [:]
  var snappedPlacement:(position:SIMD3<Float>,yaw:Float)?
  var hoveredLayerName:String?
+ /// 与真机 `ResidentPropGridEditorModel.hoveredBlockReason` 对应：nil = 这个落点能放。
+ /// 光标旁那枚标签读的就是它（经 `publishResidentPropGrid` 原样转发）。
+ var hoveredBlockReason:PropSupportBlockReason?
  /// 派生完成：这一刻起渲染层才有格子可画（与真机 `residentPropGridEditor` 同一时序）。
  func becomeReady(cells:Int = 4) {
   isBuildModeActive = true
@@ -333,6 +359,8 @@ typealias WorldAgentContext = LayoutContext
   var residentPropGridCells:[Int] = []
   var residentPropGridStates:[Int:Int] = [:]
   var residentPropGridSpacing:Float = 0
+  /// 真机 `SpatialStageStore.residentPropBlockReason`：给渲染层读的「这里为什么不能放」。
+  var residentPropBlockReason:PropSupportBlockReason?
  }
  var livingWorldContext:LayoutContext?
  let spatialStage = Spatial()
@@ -1104,6 +1132,83 @@ typealias WorldAgentContext = LayoutContext
     "moving the cursor off the prop turns the glow off")
 
   // ─────────────────────────────────────────────────────────────────────────────
+  // 光标旁那枚「这里为什么不能放」：文案必须来自**既有的阻挡原因投影**，不是新造的字符串。
+  //
+  // 真机：用户看到台面上一片绿格、其中两格是红的，问"这两个红色的是什么意思"。红 = 不能放 ✓，
+  // 原因也算出来了，但只写在面板右下角那行 `notice` 里。下面用**真的格子模型**算出原因
+  // （`PropSupportGridEditorModel.hoveredBlockReason`），再断言标签拿到的就是同一份文案。
+  let reasonModel = ResidentPropGridEditorModel()
+  let reasonFloor = FlatFloorCollision(half:1.5)
+  await reasonModel.activate(collision:reasonFloor,seed:.init(x:0,y:0,z:0),
+    bounds:.init(minimumX:-1.5,maximumX:1.5,minimumZ:-1.5,maximumZ:1.5),key:"reason-harness")
+  precondition(reasonModel.isReady,"precondition: the flat floor derives a support grid for the reason test")
+  // 合成相机：位于 (0,2,0) 沿 -Y 看下去（与 `test-resident-prop-render.swift` 同一个相机），
+  // 光标打在视口正中 ⇒ 命中地面柱 (0,0) 那一层。
+  var reasonCamera = matrix_identity_float4x4
+  reasonCamera.columns.2 = SIMD4(0,-1,0,0)
+  reasonCamera.columns.1 = SIMD4(0,0,1,0)
+  reasonCamera.columns.3 = SIMD4(0,2,0,1)
+  let reasonCursor = SIMD2<Float>(0.5,0.5)
+  let reasonSize = SIMD2<Float>(repeating:reasonModel.spacing)
+  func hoverReason(with placed:[WorldCollisionVolume]) {
+    reasonModel.updateHover(normalizedCursor:reasonCursor,inverseViewProjection:reasonCamera,
+      footprintSize:reasonSize,height:reasonSize.x,blockingVolumes:[],placedProps:placed)
+  }
+  hoverReason(with:[])
+  precondition(reasonModel.canPlaceAtHover,
+    "precondition: the empty drop spot is placeable (reason=\(String(describing:reasonModel.hoveredBlockReason)))")
+  precondition(reasonModel.cellStates.values.contains(.validFootprint),
+    "precondition: a placeable drop spot is painted yellow (.validFootprint) — the legend's second colour")
+  precondition(ResidentPropBlockReasonLabel.content(isCarrying:true,
+      reason:reasonModel.hoveredBlockReason?.errorDescription) == nil,
+    "a placeable drop spot must draw no label at all (pure predicate: no reason → nothing to draw)")
+  precondition(ResidentPropBlockReasonLabel.content(isCarrying:false,
+      reason:PropSupportBlockReason.blockedByPlacedProp("落地灯").errorDescription) == nil,
+    "with nothing in hand no label is drawn, reason or not")
+  // 同一格上摆一件物件 ⇒ 模型给出 `.blockedByPlacedProp`，格子转红，标签出现 ——
+  // 三者（红格 / 原因 / 标签）出自**同一个**判定。
+  let blocker = WorldCollisionVolume(id:"落地灯",center:.init(x:0.125,y:0.1,z:0.125),
+    halfExtents:.init(x:0.2,y:0.2,z:0.2),rotation:.init(x:0,y:0,z:0,w:1),isBlocking:true)
+  hoverReason(with:[blocker])
+  let blockedReason = reasonModel.hoveredBlockReason
+  precondition(blockedReason == .blockedByPlacedProp("落地灯"),
+    "precondition: a placed prop on the drop spot blocks it (got \(String(describing:blockedReason)))")
+  precondition(reasonModel.cellStates.values.contains(.invalidFootprint)
+      && !reasonModel.cellStates.values.contains(.validFootprint),
+    "precondition: the blocked drop spot is painted red (.invalidFootprint) — the legend's third colour")
+  let labelText = ResidentPropBlockReasonLabel.content(isCarrying:true,reason:blockedReason?.errorDescription)
+  precondition(labelText == blockedReason?.errorDescription && labelText != nil,
+    "the label next to the cursor must show the existing block reason verbatim, not a newly written string")
+  // 既有六种原因的投影就是标签的全部文案：新造一句（例如"这里不能放"）会在这里裂开。
+  let existingReasons:[String?] = [
+    PropSupportBlockReason.outsideBounds.errorDescription,
+    PropSupportBlockReason.noSupport.errorDescription,
+    PropSupportBlockReason.blockedByMesh.errorDescription,
+    PropSupportBlockReason.blockedByBlockingVolume("点唱机").errorDescription,
+    PropSupportBlockReason.blockedByPlacedProp("落地灯").errorDescription,
+    PropSupportBlockReason.insufficientClearance.errorDescription,
+  ]
+  precondition(existingReasons.allSatisfy { $0 != nil && !$0!.isEmpty },
+    "every existing block reason still projects to a non-empty Chinese sentence")
+  precondition(existingReasons.contains(labelText),
+    "the label text must be one of the existing projections, not a second set of copy (got \"\(labelText ?? "nil")\")")
+  precondition(labelText == "这里会和已经放好的 落地灯 重叠。",
+    "the label shows exactly what the panel notice shows (got \"\(labelText ?? "nil")\")")
+  // 转发：`publishResidentPropGrid`（真代码）把原因原样写进渲染层 —— 标签才有得可读。
+  let reasonHost = AppGuardHarness(), reasonController = ControllerHarness()
+  reasonHost.livingWorldContext = context
+  reasonHost.stageWindowController = reasonController
+  reasonHost.spatialStage.residentPropBlockReason = nil
+  reasonHost.residentPropGridEditor.hoveredBlockReason = blockedReason
+  reasonHost.publishResidentPropGrid()
+  precondition(reasonHost.spatialStage.residentPropBlockReason == blockedReason,
+    "the block reason must be forwarded to the render layer untouched — that value is what the cursor-side label reads")
+  reasonHost.residentPropGridEditor.hoveredBlockReason = nil
+  reasonHost.publishResidentPropGrid()
+  precondition(reasonHost.spatialStage.residentPropBlockReason == nil,
+    "a placeable hover clears the forwarded reason, so the label cannot stay stale on screen")
+
+  // ─────────────────────────────────────────────────────────────────────────────
   // 任务 2：**还没摆出来**的物件的初始落点必须是"真的能放"的那一格。
   //
   // 旧行为：固定退到 `snapshot.surfaces.first.position`（最低层里列序最小的格）。真实生活舱实测
@@ -1285,7 +1390,7 @@ typealias WorldAgentContext = LayoutContext
   precondition(boundedCollision.queryCount > queriesAfterThreeWorlds,
     "the evicted world must derive again (the cache is bounded, not a leak)")
 
-  print("PASS: editor cancel, failure preservation, hand controls, duplicate submit, stale revision, late world, input routing, ready-grid row click, host-cannot-answer vs host-says-empty, empty-grid and dead-derivation honesty, stale notice refresh, skipped-push retry, the row click that arrives before the grid is ready (remembered, completed on readiness from the clicked prop's own transform, invalidated by every \"I do not want this\" signal, never queued), scene pick-up routing, placed-prop transform, hover glow inside the focus clip, the placeable initial landing spot, window focus loss preserving the decoration session and its derivation, and same-world grid reuse from a bounded cache, the typing gate resolving to the real input field only, and the panel-to-scene hands-back of keyboard focus")
+  print("PASS: editor cancel, failure preservation, hand controls, duplicate submit, stale revision, late world, input routing, ready-grid row click, host-cannot-answer vs host-says-empty, empty-grid and dead-derivation honesty, stale notice refresh, skipped-push retry, the row click that arrives before the grid is ready (remembered, completed on readiness from the clicked prop's own transform, invalidated by every \"I do not want this\" signal, never queued), scene pick-up routing, placed-prop transform, hover glow inside the focus clip, the placeable initial landing spot, the cursor-side \"why can't I put it here\" label taking its copy from the existing block-reason projection (and drawing nothing when placeable), window focus loss preserving the decoration session and its derivation, and same-world grid reuse from a bounded cache, the typing gate resolving to the real input field only, and the panel-to-scene hands-back of keyboard focus")
  }
 }
 """#
@@ -1300,7 +1405,7 @@ compile.arguments = ["swiftc","-j1","-parse-as-library","-swift-version","6","-I
 try compile.run();compile.waitUntilExit();guard compile.terminationStatus == 0 else { exit(compile.terminationStatus) }
 if !CommandLine.arguments.contains("--red-double-submit") {
  let viewCheck = Process();viewCheck.executableURL = URL(fileURLWithPath:"/usr/bin/xcrun")
- viewCheck.arguments = ["swiftc","-j1","-typecheck","-swift-version","6","-I",products.appendingPathComponent("Modules").path,modelURL.path,root.appendingPathComponent("apps/macos/Sources/GMGNRadio/VisualEngine/ResidentPropEditorView.swift").path]
+ viewCheck.arguments = ["swiftc","-j1","-typecheck","-swift-version","6","-I",products.appendingPathComponent("Modules").path,modelURL.path,root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/PropSupportGridPresentation.swift").path,root.appendingPathComponent("apps/macos/Sources/GMGNRadio/VisualEngine/ResidentPropEditorView.swift").path]
  try viewCheck.run();viewCheck.waitUntilExit();guard viewCheck.terminationStatus == 0 else { exit(viewCheck.terminationStatus) }
 }
 let run = Process();run.executableURL = binary;try run.run();run.waitUntilExit();exit(run.terminationStatus)

@@ -24,12 +24,75 @@ guard hitTestSource.contains("enum ResidentPropHitTest") else { print("FAIL: res
 let hitTestImports = hitTestSource.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
 guard hitTestImports.allSatisfy({ $0 == "" || !$0.hasPrefix("import ") || $0 == "import Foundation" || $0 == "import simd" }) else {
     print("FAIL: resident prop hit test must only import Foundation and simd"); exit(1) }
+// 光标旁那枚「这里为什么不能放」的纯逻辑：几何只用 CoreGraphics，**不许**碰 AppKit /
+// Metal / WorldRuntime —— 否则它就不能被离线编译与断言。
+let blockLabel = "apps/macos/Sources/GMGNRadio/Presence/ResidentPropBlockReasonLabel.swift"
+let blockLabelSource = try String(contentsOfFile: blockLabel, encoding: .utf8)
+guard blockLabelSource.contains("enum ResidentPropBlockReasonLabel") else {
+    print("FAIL: the block-reason label next to the cursor is missing"); exit(1) }
+let blockLabelImports = blockLabelSource.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+guard blockLabelImports.allSatisfy({
+    $0 == "" || !$0.hasPrefix("import ")
+        || $0 == "import Foundation" || $0 == "import CoreGraphics" }) else {
+    print("FAIL: the block-reason label must only import Foundation and CoreGraphics (it is drawn in the interaction view, not in Metal)"); exit(1) }
+// 面板里的图例：它必须从格子配色的**同一处**取色，而不是各写一份 RGB。
+let editorView = "apps/macos/Sources/GMGNRadio/VisualEngine/ResidentPropEditorView.swift"
+let editorViewSource = try String(contentsOfFile: editorView, encoding: .utf8)
+guard editorViewSource.contains("PropSupportGridPresentation.Legend.entries"),
+      editorViewSource.contains("entry.srgbTint") else {
+    print("FAIL: the placement panel has no legend for the grid colours (users keep asking what red means)"); exit(1) }
+// 一份源码里所有「带小数点的数字字面量」，按出现顺序、归一成两位小数（`1.0` 与 `1.00` 同形）。
+func decimalLiterals(_ source: String) -> [String] {
+    let regex = try! NSRegularExpression(pattern: #"[0-9]+\.[0-9]+"#)
+    let text = source as NSString
+    return regex.matches(in: source, range: NSRange(location: 0, length: text.length)).map {
+        String(format: "%.2f", Double(text.substring(with: $0.range)) ?? -1)
+    }
+}
+// App 侧全部源码 → 各自的数字字面量。图例「与格子渲染同源」这条断言要能**真的抓住**
+// "各写一份 RGB"，所以它扫的是全仓：同一个三元组只允许出现在定义 tint 的那一个文件里。
+func mentionsState(_ source: String, _ name: String) -> Bool {
+    let regex = try! NSRegularExpression(pattern: "\\.\(name)\\b")
+    return regex.firstMatch(in: source, range: NSRange(source.startIndex..., in: source)) != nil
+}
+var appSourceNumbers: [(file: String, numbers: [String])] = []
+var blockedOrOccupiedOutsideThePalette: [String] = []
+if let walker = FileManager.default.enumerator(atPath: "apps/macos/Sources/GMGNRadio") {
+    for case let path as String in walker where path.hasSuffix(".swift") {
+        let text = try String(contentsOfFile: "apps/macos/Sources/GMGNRadio/" + path, encoding: .utf8)
+        appSourceNumbers.append((path, decimalLiterals(text)))
+        // `.blocked` / `.occupied` 这两个 `CellState` 在当前链路里没有任何赋值点（只有配色表
+        // 提到它们，见 `case .blocked:`）。图例因此不列它们；哪天真的被赋给格子，这条会亮，
+        // 图例必须跟着补上。
+        //
+        // 判据是"这个文件在谈 `CellState`"：`.blocked` / `.occupied` 是全仓的常用词
+        // （`ActivityExecutionFailure.blocked`、`.blockedRoute` …），只按字面量扫会误报。
+        if path != "Presence/PropSupportGridPresentation.swift",
+           text.contains("CellState"),
+           mentionsState(text, "blocked") || mentionsState(text, "occupied") {
+            blockedOrOccupiedOutsideThePalette.append(path)
+        }
+    }
+}
+guard blockedOrOccupiedOutsideThePalette.isEmpty else {
+    print("FAIL: .blocked/.occupied now have a live assignment in \(blockedOrOccupiedOutsideThePalette) — the legend must list them"); exit(1) }
+guard blockedOrOccupiedOutsideThePalette.isEmpty else {
+    print("FAIL: .blocked/.occupied now have a live assignment in \(blockedOrOccupiedOutsideThePalette) — the legend must list them"); exit(1) }
+let sourceNumbersLiteral = "[" + appSourceNumbers
+    .map { entry in
+        "(\"\(entry.file)\", [" + entry.numbers.map { "\"\($0)\"" }.joined(separator: ",") + "])"
+    }
+    .joined(separator: ",") + "]"
 let harness = #"""
 import Foundation
 import simd
+import CoreGraphics
 func check(_ value: Bool, _ message: String) { if !value { print("FAIL:",message);exit(1) } }
 @main struct Checks {
  @MainActor static func main() throws {
+  /// App 侧每份源码的数字字面量（由 harness 的驱动脚本扫出来注入）：图例"与格子同源"这条
+  /// 断言扫的是**全仓**，所以"各写一份 RGB"不可能蒙混过关。
+  let appSourceNumbers:[(file:String,numbers:[String])] = \#(sourceNumbersLiteral)
   let ownership=ResidentPropRenderOwnership(),space=ResidentPropRenderOwner(),cam=ResidentPropRenderOwner()
   let lease=ownership.claim(owner:space,worldID:"w",drawsWorld:true,isVisible:true)!
   check(ownership.claim(owner:cam,worldID:"w",drawsWorld:false,isVisible:true)==nil,"LiveCam cannot replace space owner")
@@ -298,7 +361,71 @@ func check(_ value: Bool, _ message: String) { if !value { print("FAIL:",message
         target:target("badYaw",0,0,0,0.5,0.5,0.2,.nan))==nil,"a non-finite yaw is never hit")
   check(ResidentPropHitTest.hit(normalized:SIMD2(0.5,1.5),inverseViewProjection:down,targets:[lamp])==nil,
         "a cursor below the viewport hits nothing")
-  print("PASS: prop scale/yaw, unique preview/cancel, shared identity, world isolation, support ray, multi-layer grid picking, grid presentation, the focus patch that replaces the floor-wide carpet, the hover glow patch and the placed-prop hit test")
+  // ── 图例（面板里那一行小方块）：只有链路真的会赋给格子的三种颜色 ──────────────
+  let legend=PropSupportGridPresentation.Legend.entries
+  check(legend.map(\.state)==[.placeable,.validFootprint,.invalidFootprint],
+        "the legend lists exactly the three states the live link paints: green (other cells), yellow (this drop spot, placeable), red (this drop spot, blocked)")
+  check(!legend.contains { $0.state == .blocked || $0.state == .occupied },
+        "the legend must not advertise colours the live link never assigns to a cell")
+  check(legend.allSatisfy { !$0.label.isEmpty && $0.label.count <= 8 },
+        "legend labels stay short — a legend is not a manual")
+  /// 某个三元组是否**连续**出现在这份源码的数字字面量里。逐字复制一份 RGB 一定会命中。
+  func paints(_ numbers:[String],_ rgb:[String])->Bool {
+      guard numbers.count>=rgb.count else { return false }
+      for start in 0...(numbers.count-rgb.count) where Array(numbers[start..<(start+rgb.count)])==rgb { return true }
+      return false
+  }
+  for entry in legend {
+      // 图例的颜色必须**就是**格子实例上那个状态的 tint（逐分量相等），
+      // 并且那份 tint 只允许在定义它的那一个文件里以字面量出现 —— 各写一份 RGB 会在这里裂开。
+      let cell=gridCell(0,0,0,0)
+      let drawn=PropSupportGridPresentation.instances(cells:[cell],states:[cell:entry.state],
+          cameraPosition:origin,spacing:0.25,options:grid)
+      check(drawn.count==1 && drawn[0].state==entry.state,"precondition: the state is drawn")
+      check(entry.tint==drawn[0].state.tint,
+            "the legend colour must be the very same tint the cell is drawn with (\(entry.label))")
+      let linear=[entry.tint.x,entry.tint.y,entry.tint.z].map { String(format:"%.2f",$0) }
+      let paintedIn=appSourceNumbers.filter { paints($0.numbers,linear) }.map(\.file)
+      check(paintedIn==["Presence/PropSupportGridPresentation.swift"],
+            "the grid tint \(linear) must live in exactly one place, not be copied into the legend (found in \(paintedIn))")
+      // 手抄一份"算好的 sRGB"同样不行：面板只能走 tint 的派生值。
+      let srgb=[entry.srgbTint.x,entry.srgbTint.y,entry.srgbTint.z].map { String(format:"%.2f",$0) }
+      check(!appSourceNumbers.contains { paints($0.numbers,srgb) },
+            "the legend swatch must be derived from the grid tint, not hand-written as sRGB \(srgb)")
+      check(entry.srgbTint != SIMD3(entry.tint.x,entry.tint.y,entry.tint.z),
+            "the panel swatch is the sRGB rendering of the very same tint, not the raw linear value (the grid is drawn into a .bgra8Unorm_srgb attachment)")
+  }
+  // ── 光标旁那枚「这里为什么不能放」：什么时候画、画在哪 ─────────────────────────
+  check(ResidentPropBlockReasonLabel.content(isCarrying:true,reason:nil)==nil,
+        "a placeable spot has no reason, so no label is drawn at all")
+  check(ResidentPropBlockReasonLabel.content(isCarrying:false,reason:"这里会插进墙或家具。")==nil,
+        "with nothing in hand there is no label, reason or not")
+  check(ResidentPropBlockReasonLabel.content(isCarrying:true,reason:"  \n ")==nil,
+        "a blank reason draws nothing instead of an empty bubble")
+  let reasonSample="这里会和已经放好的 落地灯 重叠。"
+  check(ResidentPropBlockReasonLabel.content(isCarrying:true,reason:reasonSample)==reasonSample,
+        "the label text is the reason exactly as the existing projection gives it — not re-worded, not truncated")
+  // 位置：锚点（圆环圆心）正上方、不压圆环、不出视图。
+  let anchor=CGPoint(x:400,y:300)
+  let viewSize=CGSize(width:900,height:600)
+  let textSize=CGSize(width:150,height:14)
+  let box=ResidentPropBlockReasonLabel.frame(anchor:anchor,ringRadius:26,textSize:textSize,viewSize:viewSize)
+  check(abs(box.midX-anchor.x)<0.001,"the label is centred on the handle anchor")
+  check(box.minY>=anchor.y+26,
+        "the label sits above the ring (anchor + radius), so neither the ring nor the drop spot is covered")
+  check(box.width==textSize.width+16 && box.height==textSize.height+8,
+        "the capsule is the text plus its padding")
+  check(box.minX>=0 && box.minY>=0 && box.maxX<=viewSize.width && box.maxY<=viewSize.height,
+        "the label stays inside the view")
+  let leftEdge=ResidentPropBlockReasonLabel.frame(anchor:CGPoint(x:4,y:300),ringRadius:26,textSize:textSize,viewSize:viewSize)
+  let rightEdge=ResidentPropBlockReasonLabel.frame(anchor:CGPoint(x:896,y:300),ringRadius:26,textSize:textSize,viewSize:viewSize)
+  let topEdge=ResidentPropBlockReasonLabel.frame(anchor:CGPoint(x:400,y:595),ringRadius:26,textSize:textSize,viewSize:viewSize)
+  check(leftEdge.minX>=0 && rightEdge.maxX<=viewSize.width,"a label near a side edge is clamped into the view")
+  check(topEdge.maxY<=viewSize.height,"a label near the top edge is clamped into the view")
+  check(ResidentPropBlockReasonLabel.frame(anchor:anchor,ringRadius:40,textSize:textSize,viewSize:viewSize).minY
+        > ResidentPropBlockReasonLabel.frame(anchor:anchor,ringRadius:26,textSize:textSize,viewSize:viewSize).minY,
+        "the label gives way to the ring: a bigger radius pushes it further up")
+  print("PASS: prop scale/yaw, unique preview/cancel, shared identity, world isolation, support ray, multi-layer grid picking, grid presentation, the focus patch that replaces the floor-wide carpet, the hover glow patch, the placed-prop hit test, the three-colour legend that takes its colours from the grid tint itself, and the cursor-side block-reason label (drawn only when carrying with a reason, anchored above the ring)")
  }
 }
 """#
@@ -308,6 +435,106 @@ defer {try? FileManager.default.removeItem(at:temp)}
 let file=temp.appendingPathComponent("main.swift"),exe=temp.appendingPathComponent("check")
 try harness.write(to:file,atomically:true,encoding:.utf8)
 func run(_ path:String,_ args:[String]) throws->Int32 {let p=Process();p.executableURL=URL(fileURLWithPath:path);p.arguments=args;try p.run();p.waitUntilExit();return p.terminationStatus}
-let result=try run("/usr/bin/nice",["-n","15","/usr/bin/swiftc","-j1","-parse-as-library",descriptor,picker,presentation,hitTest,file.path,"-o",exe.path])
+let result=try run("/usr/bin/nice",["-n","15","/usr/bin/swiftc","-j1","-parse-as-library",descriptor,picker,presentation,hitTest,blockLabel,file.path,"-o",exe.path])
 guard result==0 else {exit(result)}
-exit(try run(exe.path,[]))
+let checks=try run(exe.path,[])
+guard checks==0 else {exit(checks)}
+
+// ── 在手预览（2026-09-29 真机缺陷的行为断言）────────────────────────────────────
+//
+// 「带着一件**已摆出的**物件移动光标时，渲染端拿到的选择必须是**同一件物件、在光标那一格**，
+// 而不是它原来站着的位置；而且同一个 objectID 只出现一次（不能画两份）。」
+//
+// 为什么这一步要单独再编一次：这条链的**上游**是编辑器状态机（`ResidentPropEditorState`），
+// 它依赖 `WorldRuntime`（`WorldObjectState` / `WorldPropPlacement`），而上面那段 harness
+// 刻意只编 Foundation + simd 的纯文件。所以这里把编辑器与**真实的** `resolve` 一起编进来，
+// 走完整条真机链路：
+//   摆放服务拒绝这次落点（真机是 `blockedRoute`，实测该次会话 273/273 个"格子说可放"的
+//   落点全被拒）→ `ResidentPropEditorState.validate` → `onPreviewChanged` →
+//   `GMGNRadioApp.residentPropDescriptor` 那条**唯一**的换算 → `ResidentPropRenderSelection.resolve`。
+//
+// 缺陷版本下 `onPreviewChanged` 只收到 nil（编辑器把预览整个丢掉了），于是 resolve 继续给出
+// **原地那一件** —— 用户看到的就是"物件站在原地不动、只有落点格子跟着鼠标跑"。
+let editorState = "apps/macos/Sources/GMGNRadio/Presence/ResidentPropEditorState.swift"
+let worldBuild = "apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug"
+let worldObjects = (try? FileManager.default.contentsOfDirectory(atPath: worldBuild + "/WorldRuntime.build"))?
+    .filter { $0.hasSuffix(".swift.o") }.sorted().map { worldBuild + "/WorldRuntime.build/" + $0 } ?? []
+guard !worldObjects.isEmpty else {
+    print("FAIL: the in-hand preview probe needs the WorldRuntime build artefacts (run `swift build --package-path apps/macos/Packages/WorldRuntime` first)")
+    exit(1)
+}
+let onHandHarness = #"""
+import Foundation
+import WorldRuntime
+import simd
+func check(_ value: Bool, _ message: String) { if !value { print("FAIL:", message); exit(1) } }
+/// 摆放服务在真机上给出的那一条拒绝（`ResidentPropPlacementError.blockedRoute`）的等价物：
+/// 这条断言只关心"服务拒绝了这次落点"，所以这里自己抛一个同形状的错误，不引入服务文件。
+struct PreviewRejected: LocalizedError {
+    var errorDescription: String? { "这里会挡住活动入口或通道：wp.auto.x0.z-2.h0" }
+}
+@main struct OnHandPreview {
+ @MainActor static func main() async throws {
+  let modelURL = URL(fileURLWithPath: "/tmp/fixture.glb")
+  // 存档里的那一件：完好、已摆出、在台面上（真机 2026-09-29 咖啡机）。
+  let prop = WorldGeneratedProp(objectID: "wish-prop-coffee", sourceWishID: "wish",
+      assetID: "sha256:coffee", displayName: "咖啡机",
+      size: .init(x: 0.29150167, y: 0.35, z: 0.4719286), sourceHeight: 0.7465656)
+  let metadata = ["gmgn.generated-prop.v1": String(data: try JSONEncoder().encode(prop), encoding: .utf8)!]
+  let scale = prop.size.y / prop.sourceHeight
+  let placed = WorldObjectState(isEnabled: true,
+      transform: .init(position: .init(x: -2.875, y: 0.52, z: -4.875),
+                       rotation: .init(x: 0, y: 0, z: 0, w: 1),
+                       scale: .init(x: scale, y: scale, z: scale)),
+      metadata: metadata)
+  let snapshot = ResidentPropEditorSnapshot(worldID: "w", revision: 9, objects: [placed],
+      surfaces: [ResidentPropEditorSurface(id: "layer.0", name: "地面",
+                                           position: .init(x: 0, y: -0.041, z: 0))], canUndo: false)
+  let editor = ResidentPropEditorState()
+  var previews: [WorldObjectState?] = []
+  editor.onPreviewChanged = { previews.append($0) }
+  // 真机上那一条：落点被判不能放（挡住居民路点/通道），服务抛错。
+  editor.preview = { _, _ in throw PreviewRejected() }
+  editor.update(snapshot)
+  editor.open()
+  await editor.select(objectID: prop.objectID)
+  check(editor.isCarrying, "picking up an already placed prop must enter the carrying state")
+  let cell = WorldVector3(x: -1.375, y: -0.041, z: -6.625)
+  await editor.moveGridPointer(to: cell, layerName: "layer.0", yaw: 0.5)
+  // 编辑器推给宿主的那一份：**显示**事实（手上拿着什么、现在在哪），不是落点判定。
+  guard let last = previews.last, let onHand = last else {
+      check(false, "cursor moved while carrying an already placed prop, but the editor pushed nil — the in-hand preview is thrown away and the renderer keeps drawing the prop parked at its placed position")
+      return
+  }
+  check(onHand.generatedProp == placed.generatedProp,
+      "the in-hand preview must carry the placed prop's own generatedProp identity, or the host's asset-ownership guard rejects it and nothing is drawn")
+  // 与 `GMGNRadioApp.residentPropDescriptor` 一模一样的换算（这里编译的就是那一份）。
+  func descriptor(_ state: WorldObjectState) -> ResidentPropRenderDescriptor {
+      let p = state.transform.position, q = state.transform.rotation
+      return .residentProp(objectID: prop.objectID, worldID: "w", assetID: prop.assetID, modelURL: modelURL,
+                           targetHeightMeters: prop.size.y, position: SIMD3(p.x, p.y, p.z),
+                           rotation: SIMD4(q.x, q.y, q.z, q.w))
+  }
+  let placedDescriptor = descriptor(placed)
+  let onHandDescriptor = descriptor(onHand)
+  check(placedDescriptor.position.x == -2.875 && placedDescriptor.position.z == -4.875,
+        "the placed copy still sits where it was placed")
+  let selection = ResidentPropRenderSelection.resolve([placedDescriptor], preview: onHandDescriptor, worldID: "w")
+  check(selection.count == 1, "the in-hand preview must replace the placed copy, never draw two props with one id")
+  check(selection.allSatisfy { $0.objectID == prop.objectID }, "only the carried prop id may be selected")
+  check(abs(selection[0].position.x - cell.x) < 0.0001 && abs(selection[0].position.y - cell.y) < 0.0001
+        && abs(selection[0].position.z - cell.z) < 0.0001,
+        "the render selection must be the carried prop at the cursor cell, not the copy parked at its placed position")
+  check(abs(selection[0].yaw - 0.5) < 0.0001, "the render selection must carry the preview yaw")
+  check(abs(selection[0].position.x - placedDescriptor.position.x) > 1,
+        "the stale placed transform must be gone from the selection")
+  print("PASS: the in-hand preview of an already placed prop follows the cursor cell (one id, one copy) even when the placement service rejects the drop point")
+ }
+}
+"""#
+let onHandFile=temp.appendingPathComponent("onhand.swift"),onHandExe=temp.appendingPathComponent("onhand")
+try onHandHarness.write(to:onHandFile,atomically:true,encoding:.utf8)
+let onHandCompile=try run("/usr/bin/nice",["-n","15","/usr/bin/swiftc","-j1","-parse-as-library","-swift-version","6",
+    "-I",worldBuild + "/Modules",descriptor,editorState,onHandFile.path,"-o",onHandExe.path] + worldObjects)
+guard onHandCompile==0 else {exit(onHandCompile)}
+exit(try run(onHandExe.path,[]))

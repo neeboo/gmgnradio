@@ -79,6 +79,24 @@ struct ResidentPropEditorView: View {
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
             }
+            // 图例：用户连着两轮问"这两个红色的是什么意思" —— 缺的不是原因，是**画面没有图例**。
+            // 一行、极短；颜色小方块直接取自格子渲染的同一份 `CellState.tint`
+            // （`PropSupportGridPresentation.Legend`），这里**不写第二份 RGB**。
+            HStack(spacing: 10) {
+                ForEach(Array(PropSupportGridPresentation.Legend.entries.enumerated()), id: \.offset) { _, entry in
+                    HStack(spacing: 4) {
+                        RoundedRectangle(cornerRadius: 2)
+                            .fill(Color(
+                                red: Double(entry.srgbTint.x),
+                                green: Double(entry.srgbTint.y),
+                                blue: Double(entry.srgbTint.z)
+                            ))
+                            .frame(width: 8, height: 8)
+                        Text(entry.label).font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
             if !state.notice.isEmpty { Text(state.notice).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
             HStack {
                 Button("撤销上次") { Task { await state.undo() } }.disabled(!state.snapshot.canUndo || state.isSaving)

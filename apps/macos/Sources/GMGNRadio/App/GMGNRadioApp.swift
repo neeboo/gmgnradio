@@ -3789,9 +3789,11 @@ final class AppDelegate:
     private func residentPropDescriptor(_ item: WorldObjectState) -> ResidentPropRenderDescriptor? {
         guard let prop = item.generatedProp, let asset = residentOwnedPropAssets[prop.objectID], asset.prop == prop else { return nil }
         let p = item.transform.position, q = item.transform.rotation
-        return .init(objectID: prop.objectID, worldID: asset.descriptor.worldID, assetID: prop.assetID,
-                     modelURL: asset.descriptor.modelURL, targetHeightMeters: prop.size.y,
-                     position: SIMD3(p.x, p.y, p.z), yaw: atan2(2*q.w*q.y, 1-2*q.y*q.y))
+        // 换算只有一份（`ResidentPropRenderDescriptor.residentProp`）：已摆那一件与在手预览
+        // 走同一行代码，所以"预览被描述符判据挡掉、已摆的却画得出来"这种不对称不可能存在。
+        return .residentProp(objectID: prop.objectID, worldID: asset.descriptor.worldID, assetID: prop.assetID,
+                             modelURL: asset.descriptor.modelURL, targetHeightMeters: prop.size.y,
+                             position: SIMD3(p.x, p.y, p.z), rotation: SIMD4(q.x, q.y, q.z, q.w))
     }
 
     private func residentPropEditorSnapshot(context: WorldAgentContext) -> ResidentPropEditorSnapshot {
@@ -4058,6 +4060,11 @@ final class AppDelegate:
         spatialStage.residentPropGridCells = residentPropGridEditor.renderCells
         spatialStage.residentPropGridStates = residentPropGridEditor.cellStates
         spatialStage.residentPropGridSpacing = residentPropGridEditor.isReady ? residentPropGridEditor.spacing : 0
+        // 「这里为什么不能放」跟着光标走：原因早就算出来了（`hoveredBlockReason`），
+        // 但原来只写在面板下方那行 `notice` 里，而用户的视线在光标/物件上。原样转发给
+        // 渲染层，由场景里的那枚小胶囊显示（文案仍由 `PropSupportBlockReason.errorDescription`
+        // 投影，这里不拼字符串）。
+        spatialStage.residentPropBlockReason = residentPropGridEditor.hoveredBlockReason
 
         // 承托几何的就绪是**异步**的（真实舱体一次派生 0.5 s，-Onone 6.6 s），而面板的
         // `surfaces` 是快照字段：就绪状态一变就必须重新投影一次快照，否则面板手里一直是

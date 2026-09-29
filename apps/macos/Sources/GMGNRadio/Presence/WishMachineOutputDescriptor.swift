@@ -36,6 +36,22 @@ struct ResidentPropRenderDescriptor: Equatable, Sendable {
     var assetKey: String { assetID + "|" + modelURL.standardizedFileURL.path }
 }
 
+extension ResidentPropRenderDescriptor {
+    /// 「一个物件状态 → 渲染描述符」的**唯一一份**换算：位置直接取，朝向从四元数取 yaw。
+    ///
+    /// 宿主（`GMGNRadioApp.residentPropDescriptor`）只负责把关（`generatedProp` 有效、
+    /// `asset.prop == prop` 的资产归属），换算在**这里** —— 于是已摆那一件与在手预览走的是
+    /// 同一行代码，**不可能**出现"已摆的画得出来、预览被判据挡掉"这种不对称（真机 2026-09-29
+    /// 排查时的第一嫌疑）。它只依赖 Foundation + simd，离线 harness 能直接跑。
+    static func residentProp(objectID: String, worldID: String, assetID: String, modelURL: URL,
+                             targetHeightMeters: Float, position: SIMD3<Float>,
+                             rotation: SIMD4<Float>) -> Self {
+        .init(objectID: objectID, worldID: worldID, assetID: assetID, modelURL: modelURL,
+              targetHeightMeters: targetHeightMeters, position: position,
+              yaw: atan2(2 * rotation.w * rotation.y, 1 - 2 * rotation.y * rotation.y))
+    }
+}
+
 struct ResidentPropPreparedAsset: Equatable, Sendable {
     let minimum: SIMD3<Float>
     let maximum: SIMD3<Float>

@@ -615,6 +615,13 @@ final class SpatialStageStore {
     var residentPropGridCells: [PropSupportGridPresentation.Cell] = []
     var residentPropGridStates: [PropSupportGridPresentation.Cell: PropSupportGridPresentation.CellState] = [:]
     var residentPropGridSpacing: Float = 0
+    /// 当前落点**放不下**的原因，由 `ResidentPropGridEditorModel.hoveredBlockReason` 原样转发
+    /// （nil = 能放）。与上面的格子/着色同一处转发、同一个时机。
+    ///
+    /// 消费者只有一个：场景里跟随光标的"为什么不能放"标签
+    /// （`StageWorldInteractionView.drawBlockReasonLabel`）。这里**不拼文案**，也不做取舍 ——
+    /// 文案由 `PropSupportBlockReason.errorDescription` 投影，与面板那行 `notice` 是同一份。
+    var residentPropBlockReason: PropSupportBlockReason?
     var isResidentPropBuildModeActive = false
     var residentPropRenderStatuses: [String: WishMachineOutputStatus] = [:]
     @ObservationIgnored var residentPropPrepareHandler: (@MainActor (ResidentPropRenderDescriptor) async throws -> ResidentPropPreparedAsset)?

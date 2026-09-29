@@ -1879,6 +1879,8 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         spatialStage.isResidentPropBuildModeActive = false
         spatialStage.residentPropGridCells = []
         spatialStage.residentPropGridStates = [:]
+        // 原因与格子同生共死：格子收掉了，"为什么不能放"当然也不该留在屏幕上。
+        spatialStage.residentPropBlockReason = nil
     }
 
     func updateLiveCamOrbit(_ orbit: LiveCamCharacterOrbit) {

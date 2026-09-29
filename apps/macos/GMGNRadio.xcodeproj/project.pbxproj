@@ -145,6 +145,7 @@
 		7A17C5E01AC43CD75E7C7195 /* OrbState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43F2D91E87ABAC0F51F8C126 /* OrbState.swift */; };
 		7B5FE2C2BD09CA693E0FE5D3 /* WorldAgentToolContract.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4979C002BFA7259332C1AF5A /* WorldAgentToolContract.swift */; };
 		7BD9C88B72DF7E4C5BDB5946 /* StageVideoPlayback.swift in Sources */ = {isa = PBXBuildFile; fileRef = 62CA937FC34ED9EC46864B5D /* StageVideoPlayback.swift */; };
+		7C0DCA5A91A6F22DF4DB4472 /* ResidentPropBlockReasonLabel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B43C3927253A50F50B106EC9 /* ResidentPropBlockReasonLabel.swift */; };
 		7C50D48494FD59E6CFB00BB3 /* MusicLibraryIndexTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1E913F8A2DAADDE01C3180B /* MusicLibraryIndexTests.swift */; };
 		7E1DB314B827DCAB36BC00D5 /* WorldRuntime in Frameworks */ = {isa = PBXBuildFile; productRef = 2E44C6EDA5C62A22AED02009 /* WorldRuntime */; };
 		80574074C083E5D43F598460 /* QQMusicProviderClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8042FA4CDA3D9A3CA61FD63 /* QQMusicProviderClientTests.swift */; };
@@ -488,6 +489,7 @@
 		B0F3CB58D63948E17D4EC76C /* ElevenLabsSDKConversationTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElevenLabsSDKConversationTransport.swift; sourceTree = "<group>"; };
 		B20D9EFF63FF6E6E09848AE6 /* WishMachineOutputDescriptor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WishMachineOutputDescriptor.swift; sourceTree = "<group>"; };
 		B2CF2D3E1DDB2710C1854C97 /* MotionFormatFilter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MotionFormatFilter.swift; sourceTree = "<group>"; };
+		B43C3927253A50F50B106EC9 /* ResidentPropBlockReasonLabel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentPropBlockReasonLabel.swift; sourceTree = "<group>"; };
 		B70D6D452CCF2867DEC5DA94 /* NanoemVMDLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NanoemVMDLoader.swift; sourceTree = "<group>"; };
 		B8B2E1684E9AD716A583F585 /* SpatialStageStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpatialStageStore.swift; sourceTree = "<group>"; };
 		B8DE276D1E32F92A4062FE08 /* StageVideoPlaybackTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageVideoPlaybackTests.swift; sourceTree = "<group>"; };
@@ -976,6 +978,7 @@
 				0E16B502423D8CB2B119C833 /* RemoteMotionLibrary.swift */,
 				C12A593D2E39AA38BDE94F2C /* ResidentImageAttachment.swift */,
 				193229015897C584DE49ABC2 /* ResidentPerformanceMotionPolicy.swift */,
+				B43C3927253A50F50B106EC9 /* ResidentPropBlockReasonLabel.swift */,
 				4B883AB50613AABC30AE090C /* ResidentPropEditorState.swift */,
 				2AFE7612BD0C88006DB3BDC2 /* ResidentPropGridEditorModel.swift */,
 				FA90C9153FCCDA6F98E99627 /* ResidentPropHitTest.swift */,
@@ -1533,6 +1536,7 @@
 				189961BE3CFC288458F544EF /* ResidentMemoryStore.swift in Sources */,
 				964267DB09DF0C90FA77AA4B /* ResidentMusicToolBridge.swift in Sources */,
 				6B5712B6CB1BCDEE82542F67 /* ResidentPerformanceMotionPolicy.swift in Sources */,
+				7C0DCA5A91A6F22DF4DB4472 /* ResidentPropBlockReasonLabel.swift in Sources */,
 				B388D26A0C8A9CFC0FDE7946 /* ResidentPropEditorState.swift in Sources */,
 				16C07A20AA5DBDF36D914E03 /* ResidentPropEditorView.swift in Sources */,
 				DFBB39349649A969874CAEEE /* ResidentPropGridEditorModel.swift in Sources */,

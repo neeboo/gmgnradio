@@ -546,11 +546,42 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
         guard !isSaving, let p = placement else { return }
         await validate(.init(surfaceID: p.surfaceID, position: p.position, yaw: p.yaw + direction * .pi / 4))
     }
+    /// 「手上这一件现在在哪」= 把落点套在**它自己**的状态上。**显示专用**。
+    ///
+    /// 变换口径与 `WorldSimulation.applyPropLayout(.place)` 逐字一致（位置 + 绕 Y 的 yaw 四元数，
+    /// 缩放沿用原件；`metadata` 原样带过去，所以 `generatedProp` 与已摆那一件**完全相同**，
+    /// 宿主那条 `asset.prop == prop` 的资产归属判据一个字都没放宽）。
+    ///
+    /// 为什么必须由**落点**推出，而不是只信摆放服务：服务是 fail-closed 的判定入口 ——
+    /// 落点被判不能放（真机实测：`blockedRoute`，挡住居民路点/通道）时它抛错，编辑器因此拿不到
+    /// 任何状态，`onPreviewChanged` 只能收到 nil，渲染端于是继续画**原地那一件**。真机
+    /// 2026-09-29：移动咖啡机时该次会话**全部 273 个"格子说可放"的落点都被服务拒绝**，
+    /// 于是在手的物件一次都没跟过光标 —— 用户看到"物件站在原地不动、只有落点格子跟着鼠标跑"。
+    ///
+    /// 判定与显示必须分开：能不能放仍由 `preview` / `commit`（同一条 fail-closed 校验）回答，
+    /// 显示只回答"手上拿着什么、它现在在哪"（The Sims 里拿起来的就是物件本身，放不下时它照样
+    /// 跟着光标，红格与光标旁的原因才是判定）。世界一个字节都不改：这一份状态从不提交、从不落盘。
+    static func onHandState(_ object: WorldObjectState, placement: WorldPropPlacement) -> WorldObjectState {
+        let yaw = placement.yaw
+        return WorldObjectState(
+            isEnabled: true,
+            transform: .init(
+                position: .init(x: placement.position.x, y: placement.position.y, z: placement.position.z),
+                rotation: .init(x: 0, y: sin(yaw / 2), z: 0, w: cos(yaw / 2)),
+                scale: object.transform.scale
+            ),
+            metadata: object.metadata
+        )
+    }
+
     private func validate(_ p: WorldPropPlacement) async {
         guard isOpen, !isSaving, let id = selectedID, let preview else { return }
         let run = UUID(); previewGeneration = run
         draftRevision = snapshot.revision
-        let context = generation; placement = p; candidate = nil; onPreviewChanged(nil)
+        let context = generation; placement = p; candidate = nil
+        // 在手预览**先**跟着光标走：服务还没答（甚至永远答"不能放"）时也要看得见手上那一件。
+        // 服务答了就用服务那一份（与这一份同位置；额外带来 `candidate`，即"这里能放"）。
+        onPreviewChanged(selectedObject.map { Self.onHandState($0, placement: p) })
         requestID = UUID().uuidString
         do {
             let result = try await preview(id, p)

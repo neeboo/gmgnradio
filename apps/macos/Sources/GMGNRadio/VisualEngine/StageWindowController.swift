@@ -1995,6 +1995,11 @@ private final class StageWorldInteractionView: NSView {
             noteSceneInputChain("updatePropPointer.分支", state: "建造模式·格子拾取 wired=\(wired)",
                 "场景输入链[5] updatePropPointer 分支=建造模式·格子拾取 → 即将调用 onGridCursor(归一化=\(Self.pointerChainPoint(normalized))) onGridCursor已接线=\(wired)")
             onGridCursor?(normalized)
+            // **标脏必须在回调之后**：这一拍里 `onGridCursor` 才会走完
+            // 「App → 格子模型 → 空间站」把"这里能不能放、为什么不能"算出来并写进
+            // `spatialStage.residentPropBlockReason`。上面那次 `updateRotationHandle` 的标脏
+            // 早于它，单独靠它会让光标旁的标签永远慢一帧。
+            needsDisplay = true
             noteSceneInputChain("onGridCursor.转发", state: "已转发 wired=\(wired)",
                 "场景输入链[6] onGridCursor 调用点已返回（onGridCursor已接线=\(wired)；false = 宿主回调从未接上，App 侧不会有 [7]/[8]/[9]）")
             return
@@ -2093,6 +2098,57 @@ private final class StageWorldInteractionView: NSView {
         NSColor.cyan.withAlphaComponent(isHot ? 1 : 0.78).setStroke()
         ring.lineWidth = Self.rotationHandleLineWidth
         ring.stroke()
+        // 「为什么不能放」跟着同一个锚点走，画在圆环**上方**（同侧、错开），所以它既不压住
+        // 落点那一格、也不压住圆环。可放时不画（见 `drawBlockReasonLabel`）。
+        drawBlockReasonLabel(anchor: center)
+    }
+
+    /// 光标旁那枚"这里为什么不能放"的小胶囊（屏幕空间，不动 Metal）。
+    ///
+    /// 真机反馈：用户看到台面上一片绿格、其中两格是红的，问"这两个红色的是什么意思"。
+    /// 红 = 不能放 ✓，原因也算出来了 —— 但只写在面板右下角那行 `notice` 里，而用户的视线
+    /// 在光标/物件上。所以原因要贴在光标旁边。
+    ///
+    /// 文案**只在既有投影上取**：`hoveredBlockReason`（`PropSupportBlockReason`）
+    /// → `errorDescription`，与面板 `notice` 同一份，不在这里另写一套。
+    /// 位置、尺寸、夹边都由 `ResidentPropBlockReasonLabel` 这个纯类型决定（可离线单测）。
+    private func drawBlockReasonLabel(anchor: NSPoint) {
+        guard let text = ResidentPropBlockReasonLabel.content(
+            isCarrying: propEditor.isCarrying,
+            reason: spatialStage.residentPropBlockReason?.errorDescription
+        ) else { return }
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(
+                ofSize: ResidentPropBlockReasonLabel.fontSize,
+                weight: .medium
+            ),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.94),
+        ]
+        let textSize = (text as NSString).size(withAttributes: attributes)
+        let frame = ResidentPropBlockReasonLabel.frame(
+            anchor: anchor,
+            ringRadius: Self.rotationHandleRadius,
+            textSize: textSize,
+            viewSize: bounds.size
+        )
+        let capsule = NSBezierPath(
+            roundedRect: frame,
+            xRadius: ResidentPropBlockReasonLabel.cornerRadius,
+            yRadius: ResidentPropBlockReasonLabel.cornerRadius
+        )
+        // 与既有浮动 UI 同一套观感：深底、浅描边、白字。
+        NSColor.black.withAlphaComponent(0.66).setFill()
+        capsule.fill()
+        NSColor.white.withAlphaComponent(0.18).setStroke()
+        capsule.lineWidth = 1
+        capsule.stroke()
+        (text as NSString).draw(
+            at: NSPoint(
+                x: frame.minX + ResidentPropBlockReasonLabel.horizontalPadding,
+                y: frame.midY - textSize.height / 2
+            ),
+            withAttributes: attributes
+        )
     }
 
     private func beginDrag(

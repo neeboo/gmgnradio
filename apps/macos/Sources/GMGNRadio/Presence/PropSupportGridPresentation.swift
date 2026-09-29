@@ -117,6 +117,66 @@ enum PropSupportGridPresentation {
             case .hoverTarget: SIMD4(0.86, 0.97, 1.00, 1)
             }
         }
+
+        /// 同一个颜色的 **sRGB 分量**，给面板里的色板（SwiftUI）用。
+        ///
+        /// 为什么需要转换：格子画进的颜色附件是 `.bgra8Unorm_srgb`
+        /// （`MarbleSpatialView.colorPixelFormat`），shader 直出 `tint`，线性→sRGB 由 GPU 做。
+        /// 面板是 CPU 侧的 sRGB 绘制，直接把线性分量当 sRGB 用会明显偏暗 ——
+        /// 于是"图例的小方块"和"画面里的格子"看着就是两种颜色，图例反而更误导。
+        ///
+        /// 它**不是第二份调色**：值完全由 `tint` 派生，改 tint 两处一起变。
+        var srgbTint: SIMD3<Float> {
+            let rgba = tint
+            return SIMD3(
+                Self.linearToSRGB(rgba.x),
+                Self.linearToSRGB(rgba.y),
+                Self.linearToSRGB(rgba.z)
+            )
+        }
+
+        /// 线性 → sRGB：与 GPU 在同一条 `.bgra8Unorm_srgb` 附件上用的传输函数一致。
+        static func linearToSRGB(_ value: Float) -> Float {
+            guard value.isFinite else { return 0 }
+            let clamped = min(max(value, 0), 1)
+            return clamped <= 0.0031308
+                ? 12.92 * clamped
+                : 1.055 * pow(clamped, 1 / 2.4) - 0.055
+        }
+    }
+
+    /// 面板里的**图例**：颜色小方块 + 极短说明。
+    ///
+    /// 用户连着两轮问"这两个红色的是什么意思"，说明缺的不是原因（原因早就算出来了），
+    /// 而是**画面本身没有图例**。图例只列**当前链路真的会赋给格子**的状态：
+    ///   - `.validFootprint` / `.invalidFootprint`：`PropSupportGridMapping.footprintStates`
+    ///     产出的两种（footprint 整体合法 → 黄；不合法 → 红）；
+    ///   - `.placeable`：`states` 字典里缺失的格子由 `build` 默认成它（外圈那批淡格）。
+    ///
+    /// `.blocked` / `.occupied` 两个 case 存在但**当前链路里没有任何赋值点**
+    /// （承托网格派生时已经把不可用区域过滤掉了）。列一个不会发生的颜色比没有图例更让人困惑，
+    /// 所以它们不出现在图例里。
+    ///
+    /// **颜色的唯一来源是上面的 `CellState.tint`**（`Entry.tint` 就是它、`Entry.srgbTint`
+    /// 是它的一次颜色空间转换）：面板不写第二份 RGB，以后调色两边自动一致。
+    enum Legend {
+        struct Entry: Equatable, Sendable {
+            let state: CellState
+            /// 极短说明（图例不是说明书）。黄 = 当前落点且可放、红 = 不能放、绿 = 能放的其他格。
+            let label: String
+
+            /// 与格子渲染**同一个**线性 RGBA。
+            var tint: SIMD4<Float> { state.tint }
+            /// 同一个颜色的 sRGB 分量（面板是 sRGB 绘制）。
+            var srgbTint: SIMD3<Float> { state.srgbTint }
+        }
+
+        /// 三种颜色，顺序与用户在画面上看到的层级一致：先"能放"，再"当前落点"，最后"不能放"。
+        static let entries: [Entry] = [
+            Entry(state: .placeable, label: "能放"),
+            Entry(state: .validFootprint, label: "当前落点·可放"),
+            Entry(state: .invalidFootprint, label: "当前落点·放不下"),
+        ]
     }
 
     /// 一个待呈现的格子。`columnX/columnZ` 是**最小角**的世界坐标（与 WorldRuntime 一致）。
