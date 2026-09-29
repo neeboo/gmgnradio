@@ -1609,7 +1609,14 @@ private final class StageWorldInteractionView: NSView {
             Task { await propEditor.undo() }
             return
         }
-        if propEditor.isOpen { return }
+        // 走到这里的才是"编辑器不要的键"，而相机键（W/A/S/D）就该落在这里。
+        // 原来这里有一条 `if propEditor.isOpen { return }` 的无条件拦截，于是装修模式下
+        // 相机**完全**动不了 —— The Sims / Unity / Unreal 里拿着物件时相机照常可用
+        // （Unity 甚至从不禁止相机），装修时连换个角度看落点都得先放下物件，是最差的做法。
+        //
+        // 优先级（自上而下，先命中先 return）：文本焦点 → Esc 放回 → R/⇧R/,/. 旋转 →
+        // Delete 收回 → ⌘Z 撤销 → 相机移动 → super。编辑器的键都排在相机之前，所以放行
+        // 相机不会把它们抢走。
         guard !(window?.firstResponder is NSTextView),
               let movement = Self.movement(for: event.keyCode) else {
             super.keyDown(with: event)
@@ -1633,7 +1640,11 @@ private final class StageWorldInteractionView: NSView {
     }
 
     override func flagsChanged(with event: NSEvent) {
-        guard !propEditor.isOpen else { spatialStage.setSpeedBoosted(false); return }
+        // 装修模式下 Shift 仍然是相机加速键（与非装修模式的 `MetalStageView` 一致）。
+        // 编辑器唯一的 Shift 用途是 ⇧R 逆时针旋转，那是一条 keyDown 组合、且走
+        // `PropSupportGridMapping.yaw(rotatedBySteps:)` 的 45° 步进，不吃速度；
+        // boost 只影响 `stepCamera` 的位移速度（6 vs 2.5 m/s）。两者同时成立正是想要的：
+        // 按住 Shift 一边转一边绕着落点看一圈。所以这里不需要任何仲裁。
         spatialStage.setSpeedBoosted(
             event.modifierFlags.contains(.shift)
         )

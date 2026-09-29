@@ -64,9 +64,41 @@ let canStop = declaration("private var canStopReply:", in: overlay)
 let steeringControls = ["private var hasDraft:", "private var primaryStops:", "private func stopReply()"].map {
     declaration($0, in: overlay)
 }.joined(separator: "\n")
-let keyboard = ["override func keyDown(", "override func keyUp(", "override func resignFirstResponder()", "override func scrollWheel(", "private static func movement(", "private static func gridRotationSteps("].map {
+let keyboard = ["override func keyDown(", "override func keyUp(", "override func flagsChanged(", "override func resignFirstResponder()", "override func scrollWheel(", "private static func movement(", "private static func gridRotationSteps("].map {
     declaration($0, in: controller)
 }.joined(separator: "\n")
+// ── 装修模式下的相机键：编辑器先处理，其余键落到相机 ──────────────────────────
+// 回归缺陷：`keyDown` 里曾有一条 `if propEditor.isOpen { return }` 的无条件拦截，于是装修
+// 模式下 W/A/S/D 全被吃掉，用户连换个角度看落点都做不到（The Sims / Unity / Unreal 里
+// 拿着物件时相机照常可用）。反过来也不许矫枉过正：相机那一段必须留在**所有**编辑器分支
+// 之后，否则装修时 Esc / R / ⇧R / , / . / Delete / ⌘Z 会被相机抢走。
+// 这里把分支顺序钉死（行为面在 harness 里逐键验），路径本身也不能再出现那条无条件拦截。
+let keyDownBody = declaration("override func keyDown(", in: controller)
+// 注释里会引用历史缺陷的写法（说明"原来那条拦截长什么样"），所以按行去掉 `//` 注释，
+// 只对**代码**做结构判断。
+let keyDownCode = keyDownBody.split(separator: "\n", omittingEmptySubsequences: false).map { line -> String in
+    guard let comment = line.range(of: "//") else { return String(line) }
+    return String(line[line.startIndex..<comment.lowerBound])
+}.joined(separator: "\n")
+guard !keyDownCode.contains("if propEditor.isOpen { return }") else {
+    print("FAIL: keyDown still blocks every key unconditionally while the decoration editor is open")
+    exit(1)
+}
+let keyDownBranchOrder = [
+    "event.keyCode == 53",  // Esc：放回预览物件
+    "Self.gridRotationSteps(for: event)",  // R / ⇧R / `,` / `.`
+    "event.keyCode == 51",  // Delete / Forward Delete：收回
+    "lowercased() == \"z\"",  // ⌘Z：撤销
+    "Self.movement(for: event.keyCode)",  // 相机 W/A/S/D：必须最后
+]
+var branchCursor = keyDownCode.startIndex
+for branch in keyDownBranchOrder {
+    guard let found = keyDownCode.range(of: branch, range: branchCursor..<keyDownCode.endIndex) else {
+        print("FAIL: the decoration editor's keys must all be handled before the camera branch in keyDown (broken order at \"\(branch)\")")
+        exit(1)
+    }
+    branchCursor = found.upperBound
+}
 let replyMethods = ["func beginResidentReply()", "func finishResidentReply(", "func showResidentChatStatus(", "func setResidentThinking(", "func setResidentDeliveryNotice(", "func setResidentCanStop(", "func restoreResidentSubmission(", "func setVoiceState(", "func setWishMachineTasks("].map {
     declaration($0, in: controller)
 }.joined(separator: "\n")
@@ -160,6 +192,7 @@ struct NSEvent {
     var forwarded: [UInt16] = []
     func keyDown(with event: NSEvent) { forwarded.append(event.keyCode) }
     func keyUp(with event: NSEvent) {}
+    func flagsChanged(with event: NSEvent) {}
     func resignFirstResponder() -> Bool { true }
     func scrollWheel(with event: NSEvent) {}
 }
@@ -508,13 +541,54 @@ enum StageAvatarActivity { case listening, speaking, idle }
         input.scrollWheel(with: NSEvent(keyCode: 0, scrollingDeltaY: 2))
         check(input.spatialStage.dollyCalls == 1, "scene wheel dolly preserved")
         input.propEditor.isOpen = true
+        // ── 装修模式下的相机键：编辑器不再无条件拦截 ──────────────────────────
+        // 回归缺陷：`keyDown` 里曾有一条 `if propEditor.isOpen { return }`，装修时 WASD 全被
+        // 吃掉，用户连换个角度看落点都做不到。相机键属于"编辑器不要的键"，必须落到相机。
+        input.forwarded.removeAll()
+        let cameraKeys: [(UInt16, SpatialMovement)] = [(13, .forward), (1, .backward), (0, .left), (2, .right)]
+        for (key, movement) in cameraKeys {
+            input.keyDown(with: NSEvent(keyCode: key))
+            check(input.spatialStage.movements == [movement],
+                  "camera key \(key) still moves the camera while the decoration editor is open")
+            input.keyUp(with: NSEvent(keyCode: key))
+            check(input.spatialStage.movements.isEmpty,
+                  "camera key \(key) release still stops motion while the decoration editor is open")
+        }
+        check(input.forwarded.isEmpty,
+              "while decorating, camera keys are consumed as camera motion instead of falling through the responder chain")
         input.keyDown(with: NSEvent(keyCode: 13))
-        check(input.spatialStage.movements.isEmpty, "editing cannot leak W into camera movement")
+        input.keyDown(with: NSEvent(keyCode: 2))
+        check(input.spatialStage.movements == [.forward, .right],
+              "holding W+D while decorating keeps both camera axes active")
+        input.keyUp(with: NSEvent(keyCode: 13))
+        input.keyUp(with: NSEvent(keyCode: 2))
+        check(input.spatialStage.movements.isEmpty, "releasing the camera axes stops motion while decorating")
+        // Shift 相机加速在装修模式下同样可用（与非装修模式的 `MetalStageView` 一致）。
+        input.flagsChanged(with: NSEvent(keyCode: 56, modifierFlags: .shift))
+        check(input.spatialStage.boosted, "Shift still boosts camera speed while the decoration editor is open")
+        input.flagsChanged(with: NSEvent(keyCode: 56))
+        check(!input.spatialStage.boosted, "releasing Shift drops the camera speed boost while decorating")
+        // 编辑器自己的键仍然优先：既不能被相机抢走，也不许变成相机位移，更不许被转发出去。
         input.keyDown(with: NSEvent(keyCode: 53))
-        check(input.propEditor.escapeCalls == 1, "scene Escape cancels prop preview first")
+        check(input.propEditor.escapeCalls == 1 && input.spatialStage.movements.isEmpty && input.forwarded.isEmpty,
+              "scene Escape cancels prop preview first and never becomes camera motion")
+        input.keyDown(with: NSEvent(keyCode: 51))
+        for _ in 0..<10 { await Task.yield() }
+        check(input.propEditor.withdrawCalls == 1 && input.spatialStage.movements.isEmpty && input.forwarded.isEmpty,
+              "Delete reclaims the prop while decorating and never becomes camera motion")
+        input.keyDown(with: NSEvent(keyCode: 6, modifierFlags: .command, charactersIgnoringModifiers: "z"))
+        for _ in 0..<10 { await Task.yield() }
+        check(input.propEditor.undoCalls == 1 && input.spatialStage.movements.isEmpty && input.forwarded.isEmpty,
+              "Cmd+Z undoes a placement while decorating and never becomes camera motion")
         input.window?.firstResponder = NSTextView()
         input.keyDown(with: NSEvent(keyCode: 53))
         check(input.propEditor.escapeCalls == 1 && input.forwarded.last == 53, "text focus owns Escape before scene editor")
+        // 文本焦点优先于相机（焦点判断在 `keyDown` 最前面）：装修面板里打字时 WASD 不许被抢。
+        for key: UInt16 in [13, 0, 1, 2] {
+            input.keyDown(with: NSEvent(keyCode: key))
+            check(input.spatialStage.movements.isEmpty && input.forwarded.last == key,
+                  "text focus still owns camera key \(key) while the decoration editor is open")
+        }
         // 建造模式步进旋转键：R / ⇧R，以及 Sims 4 肌肉记忆的 `,`（逆时针）/ `.`（顺时针）。
         // 步长（45°）在映射层验证，这里只验键码与方向。
         input.window?.firstResponder = input
