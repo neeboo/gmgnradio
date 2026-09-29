@@ -581,6 +581,15 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
             }
         )
         stageContentView = contentView
+        // 四条场景回调是**窗口存在之前**赋到控制器上的（`configureStage()` 先建控制器、再赋回调，
+        // 而窗口要到 `show()` 才建），那时 `stageContentView` 还是 nil，`?.` 会把赋值静默丢掉且
+        // 永不补 —— 于是交互视图的四个回调全程为 nil：鼠标移动不更新落点、点击不落地、
+        // R / , / . 全部没反应（2026-09-29 真机定位）。这里补一次转发；关窗重开也走这条路
+        // （`finishCurrentClose` 会把 `stageContentView` 置回 nil）。
+        contentView.onGridCursor = onResidentPropGridCursor
+        contentView.onGridCommit = onResidentPropGridCommit
+        contentView.onGridRotate = onResidentPropGridRotate
+        contentView.onScenePick = onResidentPropScenePick
         contentView.setSystemInboxUnread(systemInboxUnread)
         window.contentView = contentView
         if residentChat.isThinking || residentChat.voiceActive || !residentChat.reply.isEmpty || residentChat.statusNotice != nil {
