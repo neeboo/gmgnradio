@@ -3557,6 +3557,11 @@ final class AppDelegate:
     /// 最近一次**已经写进日志**的相位。只为压制"推失败时每次鼠标移动都刷一条"。
     private var loggedResidentPropSupportPhase: ResidentPropSupportPhase?
 
+    /// **场景输入链[7]/[8]** 的限流键：上一次已经上报过的「悬停 guard 失败原因」或
+    /// 「命中格」签名。`updateResidentPropGridHover` 每次鼠标移动都会被调到（60 Hz），
+    /// 所以只在签名变化时报一条 —— 同一个原因 / 同一格不重复刷屏。
+    private var loggedResidentPropGridHoverSignature: String?
+
     /// 「这次点击还能不能拿到摆放几何」—— 面板那句提示与它**一一对应**。
     ///
     /// 为什么要它（而不是直接看 `grid != nil`）：`PropSupportGridBuilder` 的失败是
@@ -4087,7 +4092,15 @@ final class AppDelegate:
         // 而一次预览预检要遍历所有已放物件跑评估器（实测 30 件时约 30 ms）。鼠标在同一个
         // 格子里移动不该重复付这个代价 —— 否则 60 Hz 的移动事件能把主线程打满。
         guard let snapped = residentPropGridEditor.snappedPlacement else {
-            residentPropGridPushedHover = nil
+            // **场景输入链[9b]**（只观测）：从"有悬停目标"变成"没有"时报一条 ——
+            // 说明预览停在上一个格心不动了。限流：只在真的从非 nil 掉到 nil 时报，
+            // 用既有的 `residentPropGridPushedHover` 当比较键，不引入新状态。
+            if residentPropGridPushedHover != nil {
+                residentPropGridPushedHover = nil
+                livingWorldLogger.notice(
+                    "场景输入链[9b] 推给预览：snappedPlacement=nil（悬停没有命中任何格子）→ 本次不推 moveResidentPropGridPointer"
+                )
+            }
             return
         }
         let target = WorldVector3(x: snapped.position.x, y: snapped.position.y, z: snapped.position.z)
@@ -4097,6 +4110,11 @@ final class AppDelegate:
         guard hover != residentPropGridPushedHover else { return }
         residentPropGridPushedHover = hover
         let layerName = residentPropGridEditor.hoveredLayerName ?? "grid"
+        // **场景输入链[9]**（只观测）：限流就是上面那条 `hover != residentPropGridPushedHover`
+        // —— 只有吸附格心或朝向真的变化时才报一条，鼠标在同一格内移动不会刷屏。
+        livingWorldLogger.notice(
+            "场景输入链[9] 推给预览：moveResidentPropGridPointer 落点=(\(target.x, privacy: .public), \(target.y, privacy: .public), \(target.z, privacy: .public)) layer=\(layerName, privacy: .public) yaw=\(snapped.yaw, privacy: .public)（同格心+同朝向不重复推）"
+        )
         Task { [weak self] in
             await self?.stageWindowController?.moveResidentPropGridPointer(
                 to: target, layerName: layerName, yaw: snapped.yaw)
@@ -4119,7 +4137,10 @@ final class AppDelegate:
     @discardableResult
     private func updateResidentPropGridHover(normalized: SIMD2<Float>) -> Bool {
         guard let context = livingWorldContext,
-              let projection = spatialStage.residentPropBuildModeProjection else { return false }
+              let projection = spatialStage.residentPropBuildModeProjection else {
+            noteResidentPropGridHoverGuardFailure(normalized: normalized)
+            return false
+        }
         let footprint = stageWindowController?.residentPropFootprint
         let size = footprint?.size ?? SIMD2(repeating: residentPropGridEditor.spacing)
         let height = footprint?.height ?? residentPropGridEditor.spacing
@@ -4131,9 +4152,55 @@ final class AppDelegate:
             blockingVolumes: context.manifest.collisionVolumes.filter(\.isBlocking),
             placedProps: context.state.objectStates.values.compactMap(\.generatedCollisionVolume)
         )
+        noteResidentPropGridHoverResult(normalized: normalized)
         updateResidentPropHoverTarget(normalized: normalized, projection: projection.inverseViewProjection,
                                       context: context)
         return true
+    }
+
+    /// **场景输入链[7]**：悬停 guard 失败的**哪一个条件**（只观测，不参与判据）。
+    ///
+    /// 限流：按失败原因去重（同一原因只报一条），坐标取"该原因下的第一条"那一次。
+    private func noteResidentPropGridHoverGuardFailure(normalized: SIMD2<Float>) {
+        let coordinate = String(format: "(%.3f, %.3f)", normalized.x, normalized.y)
+        let reason: String
+        let detail: String
+        if livingWorldContext == nil {
+            reason = "livingWorldContext=nil"
+            detail = "世界上下文还没接上（装修会话/世界快照没就绪）"
+        } else {
+            reason = "residentPropBuildModeProjection=nil"
+            detail = "投影不可用：世界可见=\(spatialStage.isWorldVisible) 建造模式=\(spatialStage.isResidentPropBuildModeActive) 格距=\(spatialStage.residentPropGridSpacing) 有投影矩阵=\(spatialStage.residentPropViewProjection != nil)"
+        }
+        guard loggedResidentPropGridHoverSignature != reason else { return }
+        loggedResidentPropGridHoverSignature = reason
+        livingWorldLogger.notice(
+            "场景输入链[7] App 悬停 guard 失败：\(reason, privacy: .public)（\(detail, privacy: .public)）→ 格子拾取没有跑 归一化=\(coordinate, privacy: .public)"
+        )
+    }
+
+    /// **场景输入链[8]**：`updateHover` 跑完之后的**结果**（只观测）。
+    ///
+    /// 限流：按"命中格心 + 朝向 + 层 + 可放性"（或"未命中"）去重 —— 鼠标在同一格内移动
+    /// 不重复刷屏，跨格/旋转/可放性变化时各报一条。坐标取"该签名下的第一条"那一次。
+    private func noteResidentPropGridHoverResult(normalized: SIMD2<Float>) {
+        let coordinate = String(format: "(%.3f, %.3f)", normalized.x, normalized.y)
+        guard let snapped = residentPropGridEditor.snappedPlacement else {
+            guard loggedResidentPropGridHoverSignature != "miss" else { return }
+            loggedResidentPropGridHoverSignature = "miss"
+            livingWorldLogger.notice(
+                "场景输入链[8] App 悬停未命中：updateHover 已跑但 snappedPlacement=nil（光标没落在任何格子上，网格可能还没派生完）归一化=\(coordinate, privacy: .public)"
+            )
+            return
+        }
+        let layer = residentPropGridEditor.hoveredLayerName ?? "nil"
+        let blockReason = residentPropGridEditor.hoveredBlockReason.flatMap { $0.errorDescription } ?? "无"
+        let signature = "hit|\(snapped.position.x)|\(snapped.position.y)|\(snapped.position.z)|\(snapped.yaw)|\(layer)|\(residentPropGridEditor.canPlaceAtHover)"
+        guard loggedResidentPropGridHoverSignature != signature else { return }
+        loggedResidentPropGridHoverSignature = signature
+        livingWorldLogger.notice(
+            "场景输入链[8] App 悬停命中：updateHover 已跑 归一化=\(coordinate, privacy: .public) 吸附格心=(\(snapped.position.x, privacy: .public), \(snapped.position.y, privacy: .public), \(snapped.position.z, privacy: .public)) layer=\(layer, privacy: .public) yaw=\(snapped.yaw, privacy: .public) 可放=\(self.residentPropGridEditor.canPlaceAtHover, privacy: .public) 阻挡原因=\(blockReason, privacy: .public)"
+        )
     }
 
     /// 光标下那件**已摆出**的物件 → 它的 footprint 格子发光（The Sims 的 white glow）。

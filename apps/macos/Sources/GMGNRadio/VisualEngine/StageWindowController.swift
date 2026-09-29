@@ -66,17 +66,35 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
 
     /// 建造模式的光标回调，转发给交互视图。
     var onResidentPropGridCursor: ((SIMD2<Float>) -> Void)? {
-        didSet { stageContentView?.onGridCursor = onResidentPropGridCursor }
+        didSet {
+            stageContentView?.onGridCursor = onResidentPropGridCursor
+            noteSceneCallbackWiring(
+                "onResidentPropGridCursor→onGridCursor",
+                forwarded: stageContentView?.onGridCursor != nil
+            )
+        }
     }
 
     /// 建造模式「点一下落地」的回调，转发给交互视图。参数与 `onResidentPropGridCursor`
     /// 同一套约定：**归一化、左上原点**，与 `PropSupportGridPicker` 一致。
     var onResidentPropGridCommit: ((SIMD2<Float>) -> Void)? {
-        didSet { stageContentView?.onGridCommit = onResidentPropGridCommit }
+        didSet {
+            stageContentView?.onGridCommit = onResidentPropGridCommit
+            noteSceneCallbackWiring(
+                "onResidentPropGridCommit→onGridCommit",
+                forwarded: stageContentView?.onGridCommit != nil
+            )
+        }
     }
 
     var onResidentPropGridRotate: ((Int) -> Void)? {
-        didSet { stageContentView?.onGridRotate = onResidentPropGridRotate }
+        didSet {
+            stageContentView?.onGridRotate = onResidentPropGridRotate
+            noteSceneCallbackWiring(
+                "onResidentPropGridRotate→onGridRotate",
+                forwarded: stageContentView?.onGridRotate != nil
+            )
+        }
     }
 
     /// 建造模式：**空手**时在场景里点了一下（归一化、左上原点、`clickCount`）。
@@ -85,7 +103,27 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     /// 一份（`ResidentPropSceneClick.resolve`），而"手上有没有物件"由本视图判定 ——
     /// 于是"点已摆物件 = 拾取"和"点地 = 放下"不可能互相吃掉。
     var onResidentPropScenePick: ((SIMD2<Float>, Int) -> Void)? {
-        didSet { stageContentView?.onScenePick = onResidentPropScenePick }
+        didSet {
+            stageContentView?.onScenePick = onResidentPropScenePick
+            noteSceneCallbackWiring(
+                "onResidentPropScenePick→onScenePick",
+                forwarded: stageContentView?.onScenePick != nil
+            )
+        }
+    }
+
+    /// **场景输入链[0]**：宿主接线到底有没有真的落到交互视图上（只观测，不参与任何判据）。
+    ///
+    /// 为什么要它：这四个 `didSet` 的转发目标是 `stageContentView`（**弱引用**），而
+    /// `StageContentView` 是在第一次 `show()` 里 `makeWindow()` 时才创建的；宿主一旦先把
+    /// 回调赋进来、那一刻 `stageContentView` 还是 nil，`?.` 就**静默丢掉**这次转发，
+    /// 而 `configureStage()` 只在控制器为 nil 时跑一次，之后永远不会补 —— 于是交互视图的
+    /// `onGridCursor` / `onGridCommit` / `onGridRotate` / `onScenePick` 永远为 nil。
+    /// 这条日志把"赋值"与"真的接上"分开：`已转发到交互视图=false` 就是断点。
+    private func noteSceneCallbackWiring(_ name: String, forwarded: Bool) {
+        Self.log.notice(
+            "场景输入链[0] 宿主接线 \(name, privacy: .public)：stageContentView存在=\(self.stageContentView != nil, privacy: .public) 已转发到交互视图=\(forwarded, privacy: .public)（false = 这个回调永远不会被调用）"
+        )
     }
 
     /// 鼠标此刻是不是"手上拿着物件"（场景拾取/落地分流要读它）。
@@ -1307,8 +1345,26 @@ private final class StageContentView: NSView {
     /// 接在这里而不是 `StageWindowController.configureResidentPropEditor`：那个入口只注入
     /// 预览/提交/手持这些**服务**回调，而这里要的是本视图拥有的场景交互视图。
     private func wireSceneInputOwnership() {
+        // **场景输入链[10]** 的限流状态（只观测）：门禁探针每次鼠标移动都会被调到，
+        // 所以只在"答案变化"时报一条，外加**最初的两次调用**（用来证明探针真的被调到过）。
+        // 上限 8 条：owner 类型换几次也不会刷屏。
+        var lastProbeAnswer: String?
+        var probeCallCount = 0
+        var probeLogCount = 0
         worldInteractionView.isTextInputFocused = { [weak self] in
-            guard let self, self.residentComposerOwnsFirstResponder() else { return false }
+            guard let self else { return false }
+            let owns = self.residentComposerOwnsFirstResponder()
+            let owner = self.window?.firstResponder.map { String(describing: type(of: $0)) } ?? "nil"
+            let answer = "\(owns)|\(owner)"
+            probeCallCount += 1
+            if probeCallCount <= 2 || (lastProbeAnswer != answer && probeLogCount < 8) {
+                lastProbeAnswer = answer
+                probeLogCount += 1
+                StageWindowController.log.notice(
+                    "场景输入链[10] 门禁探针 isTextInputFocused 返回=\(owns, privacy: .public) owner=\(owner, privacy: .public) 第\(probeCallCount, privacy: .public)次调用（false = 场景照常收指针/键盘）"
+                )
+            }
+            guard owns else { return false }
             self.noteSceneInputGateBlocked()
             return true
         }
@@ -1433,6 +1489,47 @@ private final class StageWorldInteractionView: NSView {
     /// nil 表示当前没有待判定的按下；超过抖动阈值转成相机拖拽时会被清掉。
     private var propPressOriginInWindow: CGPoint?
 
+    // MARK: - 场景输入链路诊断（只观测，不参与任何判据）
+
+    /// **场景输入链**的限流器：`tag` → 上一次已经上报过的「状态签名」。
+    ///
+    /// 鼠标每动一下都会走完整条链（`mouseMoved` → `updatePropPointer` → `onGridCursor`），
+    /// 所以日志必须按**状态变化**去重，而不是按事件：同一个 tag 的同一个签名只报一条。
+    /// 状态签名里刻意**不放坐标**（坐标每像素都变，会把去重打穿）—— 坐标只出现在
+    /// 「该状态下的第一条」那一行里。
+    private var loggedSceneInputStates: [String: String] = [:]
+    /// 已经上报过的键盘分支（`keyDown` 的每个分支各报一次，键盘不会刷屏）。
+    private var loggedSceneKeyBranches: Set<String> = []
+
+    /// 场景输入链诊断的**唯一出口**：同 tag 同状态只报一条（`message` 懒构造，去重时不建字符串）。
+    private func noteSceneInputChain(_ tag: String, state: String, _ message: @autoclosure () -> String) {
+        guard loggedSceneInputStates[tag] != state else { return }
+        loggedSceneInputStates[tag] = state
+        let text = message()
+        Self.log.notice("\(text, privacy: .public)")
+    }
+
+    /// 键盘/指针诊断用的 logger：与控制器同一条子系统与类别（`ai.gmgn.radio` / `LivingWorld`）。
+    ///
+    /// 写成视图自己的 `Self.log` 别名是为了让 `tools/test-stage-resident-chat.swift` 抽取
+    /// `keyDown` 编译时也能解析（那个 harness 给它的替身类提供同名 `static let log`）。
+    private static let log = StageWindowController.log
+
+    /// 指针链路诊断用的**状态签名**：只含影响分支选择的布尔量（不含坐标）。
+    private var pointerChainState: String {
+        "consumesPropPointer=\(consumesPropPointer) propEditor.isOpen=\(propEditor.isOpen) 建造模式=\(spatialStage.isResidentPropBuildModeActive) isTextInputFocused=\(inputOwnsFocus)"
+    }
+
+    /// 指针链路诊断用的归一化坐标文案（与 `normalizedPropPointer` 同一个式子，只用于日志）。
+    private func pointerChainCoordinate(_ event: NSEvent) -> String {
+        guard let normalized = normalizedPropPointer(for: event) else { return "nil" }
+        return Self.pointerChainPoint(normalized)
+    }
+
+    private static func pointerChainPoint(_ value: SIMD2<Float>) -> String {
+        String(format: "(%.3f, %.3f)", value.x, value.y)
+    }
+
     // MARK: - 场景内旋转手柄（第 2 步）
 
     /// 可见圆环的半径与线宽（屏幕空间恒定，不随距离缩放）。
@@ -1515,6 +1612,11 @@ private final class StageWorldInteractionView: NSView {
             carryingStartedAtScenePointer: didPickUpFromScenePointer,
             clickCount: event.clickCount
         )
+        // **场景输入链[12]**（只观测）：按下到底有没有到达交互视图、`resolvePress` 判成哪一支，
+        // 以及四条落地/旋转回调的接线状态 —— 全 nil 时"点哪里都没反应"就是它。
+        // 限流：同一个判定 + 同一组门禁状态只报一条。
+        noteSceneInputChain("mouseDown.到达", state: "\(press)|\(pointerChainState)",
+            "场景输入链[12] mouseDown 到达交互视图 resolvePress=\(String(describing: press)) \(pointerChainState) onGridCommit已接线=\(onGridCommit != nil) onScenePick已接线=\(onScenePick != nil) onGridRotate已接线=\(onGridRotate != nil) onGridCursor已接线=\(onGridCursor != nil) 归一化=\(pointerChainCoordinate(event))")
         if press == .reclaimPickUpAndResetCamera {
             didPickUpFromScenePointer = false
             propPressOriginInWindow = nil
@@ -1619,6 +1721,11 @@ private final class StageWorldInteractionView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        // **场景输入链[13]**（只观测）：抬起时"手上有物件"决定走落地还是拾取，两条回调都
+        // 没接上时这里就是点一下这条链的终点。限流：同一状态只报一条。
+        noteSceneInputChain("mouseUp.到达",
+            state: "carrying=\(propEditor.isCarrying) 有按下点=\(propPressOriginInWindow != nil) 建造模式=\(spatialStage.isResidentPropBuildModeActive)",
+            "场景输入链[13] mouseUp 到达交互视图 携带=\(propEditor.isCarrying) 有按下点=\(propPressOriginInWindow != nil) 建造模式=\(spatialStage.isResidentPropBuildModeActive) onGridCommit已接线=\(onGridCommit != nil) onScenePick已接线=\(onScenePick != nil) 归一化=\(pointerChainCoordinate(event))")
         // 建造模式：只有「按下 → 抬起」之间没超过点击抖动阈值，才算"点一下"。
         // 超过阈值的那一下已经在 mouseDragged 里转成相机拖拽（按下点被清掉），
         // 这里就只负责收尾，不会顺手把物件放下。
@@ -1656,8 +1763,22 @@ private final class StageWorldInteractionView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
-        if inputOwnsFocus { super.keyDown(with: event); return }
+        // **场景输入链[11]**：这条只回答"键盘到底有没有到达交互视图、命中了哪个分支"。
+        // 限流：每个分支只报**一次**（键盘不会刷屏），所以分支名就是去重键。
+        // 只观测：不参与任何判定，也不改变下面各分支的顺序。
+        // `event.keyCode` 先取出成值类型再进闭包：`NSEvent` 不是 `Sendable`，
+        // 直接在 @MainActor 闭包里引用它会命中 Swift 6 的 sending 诊断。
+        let eventKeyCode = event.keyCode
+        let noteKeyBranch: (String) -> Void = { [weak self] branch in
+            guard let self, !self.loggedSceneKeyBranches.contains(branch) else { return }
+            self.loggedSceneKeyBranches.insert(branch)
+            Self.log.notice(
+                "场景输入链[11] keyDown 分支=\(branch, privacy: .public) keyCode=\(eventKeyCode, privacy: .public) 文本焦点=\(self.inputOwnsFocus, privacy: .public) 编辑器打开=\(self.propEditor.isOpen, privacy: .public) 建造模式=\(self.spatialStage.isResidentPropBuildModeActive, privacy: .public) onGridRotate已接线=\(self.onGridRotate != nil, privacy: .public)"
+            )
+        }
+        if inputOwnsFocus { noteKeyBranch("文本焦点（交给输入框）"); super.keyDown(with: event); return }
         if event.keyCode == 53, propEditor.isOpen {
+            noteKeyBranch("Esc 放回")
             propEditor.escape()
             return
         }
@@ -1667,17 +1788,20 @@ private final class StageWorldInteractionView: NSView {
         // `onGridRotate` → `ResidentPropGridEditorModel.rotateFootprint(bySteps:)` 这一条链上。
         if propEditor.isOpen, spatialStage.isResidentPropBuildModeActive,
            let steps = Self.gridRotationSteps(for: event) {
+            noteKeyBranch("R/⇧R/,/. 旋转 steps=\(String(describing: steps))")
             onGridRotate?(steps)
             return
         }
         // Delete / Forward Delete：收回选中的物件（面板上也有"收回"按钮）。
         if propEditor.isOpen, event.keyCode == 51 || event.keyCode == 117 {
+            noteKeyBranch("Delete 收回")
             Task { await propEditor.withdraw() }
             return
         }
         // Cmd+Z：撤销上一次摆放（面板上也有"撤销上次"按钮）。
         if propEditor.isOpen, event.modifierFlags.contains(.command),
            event.charactersIgnoringModifiers?.lowercased() == "z" {
+            noteKeyBranch("⌘Z 撤销")
             Task { await propEditor.undo() }
             return
         }
@@ -1691,9 +1815,11 @@ private final class StageWorldInteractionView: NSView {
         // 相机不会把它们抢走。
         guard !inputOwnsFocus,
               let movement = Self.movement(for: event.keyCode) else {
+            noteKeyBranch("super（编辑器与相机都不认这个键）")
             super.keyDown(with: event)
             return
         }
+        noteKeyBranch("相机移动 \(String(describing: movement))")
         spatialStage.setMovement(movement, active: true)
     }
 
@@ -1765,18 +1891,39 @@ private final class StageWorldInteractionView: NSView {
         if let pointerTracking { removeTrackingArea(pointerTracking) }
         let area = NSTrackingArea(rect: .zero, options: [.activeInKeyWindow, .inVisibleRect, .mouseMoved, .mouseEnteredAndExited], owner: self, userInfo: nil)
         addTrackingArea(area); pointerTracking = area
+        // **场景输入链[0b]**：追踪区确实装上了（只观测）。`mouseMoved` 一条都没来时，
+        // 这条能区分「追踪区没装 / 视图被隐藏」与「装了但事件被别的视图截走」。
+        // 限流：视图尺寸 / 隐藏 / 窗口是否收 mouseMoved 变化时才报。
+        let state = "\(bounds.width)x\(bounds.height) hidden=\(isHidden) acceptsMouseMoved=\(window?.acceptsMouseMovedEvents == true)"
+        noteSceneInputChain("trackingArea", state: state,
+            "场景输入链[0b] 追踪区安装：视图尺寸=\(Int(self.bounds.width))x\(Int(self.bounds.height)) 视图隐藏=\(self.isHidden) 窗口acceptsMouseMovedEvents=\(self.window?.acceptsMouseMovedEvents == true) 选项=mouseMoved+inVisibleRect")
     }
 
     override func mouseMoved(with event: NSEvent) {
+        // **场景输入链[1]**：这一条只回答"鼠标到底有没有到达交互视图"。
+        // 限流：状态签名（consumes/编辑器/建造模式/打字门禁）变化时才报一条；
+        // 坐标是"该状态下的第一条"那一次的位置。
+        noteSceneInputChain("mouseMoved.到达", state: pointerChainState,
+            "场景输入链[1] mouseMoved 到达交互视图 归一化=\(pointerChainCoordinate(event)) \(pointerChainState)（本条按状态去重：该状态下的第一条）")
         // 建造模式**空手**时也要跟手：这时场景里的鼠标回答的是"光标下那件已摆物件要不要发光"
         // （以及"点它就能拿起来"），不发光的格子也就没有可点的目标。
         guard consumesPropPointer || (propEditor.isOpen && spatialStage.isResidentPropBuildModeActive) else {
+            noteSceneInputChain("mouseMoved.门禁未命中", state: pointerChainState,
+                "场景输入链[2] mouseMoved 到了但门禁未命中（consumesPropPointer=false 且 非「编辑器打开+建造模式」）→ 直接 super，摆放链路不跑 归一化=\(pointerChainCoordinate(event))")
             super.mouseMoved(with: event)
             return
         }
         let point = convert(event.locationInWindow, from: nil)
         // A tracking area can see moves above another view. Never project a control or input click.
-        guard superview?.hitTest(convert(point, to: superview)) === self else { return }
+        let pointerHitView = superview?.hitTest(convert(point, to: superview))
+        guard pointerHitView === self else {
+            let owner = pointerHitView.map { String(describing: type(of: $0)) } ?? "nil"
+            noteSceneInputChain("mouseMoved.hitTest挡下", state: owner,
+                "场景输入链[3] hitTest 守卫挡下：该点的命中视图=\(owner)（不是 StageWorldInteractionView）→ 这一次移动被丢弃，摆放链路不跑 归一化=\(pointerChainCoordinate(event))")
+            return
+        }
+        noteSceneInputChain("mouseMoved.守卫通过", state: pointerChainState,
+            "场景输入链[4] mouseMoved 门禁与 hitTest 均通过 → 转入 updatePropPointer 归一化=\(pointerChainCoordinate(event)) \(pointerChainState)")
         updatePropPointer(event)
     }
 
@@ -1823,7 +1970,11 @@ private final class StageWorldInteractionView: NSView {
     }
 
     private func updatePropPointer(_ event: NSEvent, confirm: Bool = false) {
-        guard let normalized = normalizedPropPointer(for: event) else { return }
+        guard let normalized = normalizedPropPointer(for: event) else {
+            noteSceneInputChain("updatePropPointer.分支", state: "归一化失败",
+                "场景输入链[5] updatePropPointer 分支=归一化失败（视图 bounds 为空）→ return")
+            return
+        }
         // 手柄画在本视图里，所以指针一移动就重算悬停并标脏 —— 圆环跟着 footprint 走，
         // 不需要任何每帧注册机制（选 `draw(_:)` 而不是新开一层 overlay 就是为了这个）。
         updateRotationHandle(at: convert(event.locationInWindow, from: nil))
@@ -1831,11 +1982,23 @@ private final class StageWorldInteractionView: NSView {
         // 建造模式交给格子拾取：射线与**每一层**格子平面求交、就近命中，不再依赖
         // "当前摆放面"的单一高度 —— 这正是建造模式能放地面、放桌面、放夹层的原因。
         if spatialStage.isResidentPropBuildModeActive, spatialStage.residentPropBuildModeProjection != nil {
+            let wired = onGridCursor != nil
+            noteSceneInputChain("updatePropPointer.分支", state: "建造模式·格子拾取 wired=\(wired)",
+                "场景输入链[5] updatePropPointer 分支=建造模式·格子拾取 → 即将调用 onGridCursor(归一化=\(Self.pointerChainPoint(normalized))) onGridCursor已接线=\(wired)")
             onGridCursor?(normalized)
+            noteSceneInputChain("onGridCursor.转发", state: "已转发 wired=\(wired)",
+                "场景输入链[6] onGridCursor 调用点已返回（onGridCursor已接线=\(wired)；false = 宿主回调从未接上，App 侧不会有 [7]/[8]/[9]）")
             return
         }
 
-        guard let surface = propEditor.surface else { return }
+        noteSceneInputChain("updatePropPointer.legacy",
+            state: "建造模式=\(spatialStage.isResidentPropBuildModeActive) 投影可用=\(spatialStage.residentPropBuildModeProjection != nil)",
+            "场景输入链[5] updatePropPointer 分支=legacy·具名承托面（建造模式=\(self.spatialStage.isResidentPropBuildModeActive) 建造模式投影可用=\(self.spatialStage.residentPropBuildModeProjection != nil)）归一化=\(Self.pointerChainPoint(normalized))")
+        guard let surface = propEditor.surface else {
+            noteSceneInputChain("updatePropPointer.无承托面", state: "surface=nil",
+                "场景输入链[5b] updatePropPointer 分支=legacy·没有承托面（propEditor.surface=nil）→ 直接 return，不移动预览")
+            return
+        }
         pointerTask?.cancel()
         guard let position = spatialStage.residentPropPoint(normalizedPoint: normalized, surfaceY: surface.position.y) else {
             propEditor.pointerMissed(); return

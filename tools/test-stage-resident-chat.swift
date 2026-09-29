@@ -184,6 +184,7 @@ import Combine
 import AppKit
 import Observation
 import simd
+import os
 \#(rotationHandleAnchor)
 @MainActor @Observable
 \#(speechStore)
@@ -234,6 +235,13 @@ struct NSEvent {
 }
 @MainActor final class Interaction: Responder {
     let spatialStage = Store()
+    /// 被抽取的生产 `keyDown` 会写一条**只观测**的诊断（`场景输入链[11]`），并把分支记在
+    /// `loggedSceneKeyBranches` 里。生产里那个 `private static let log` 是
+    /// `StageWindowController.log` 的别名；harness 给它同名同形的替身（`Self.log`），
+    /// 与 `test-resident-prop-editor` 里 `ControllerHarness.log` 是同一手法。
+    /// 行为断言完全不受影响 —— 这两个成员都只被日志用到。
+    static let log = Logger(subsystem: "test.gmgn.stage-chat", category: "chat")
+    var loggedSceneKeyBranches: Set<String> = []
     final class PropEditor {
         var isOpen = false
         var escapeCalls = 0
