@@ -314,6 +314,12 @@ typealias WorldAgentContext = LayoutContext
  \#(method("private func configureResidentPropEditor(",in:appSource).replacingOccurrences(of:"private func",with:"func"))
  \#(method("private func isResidentPropEditorCurrent(",in:appSource).replacingOccurrences(of:"private func",with:"func"))
 }
+/// 宿主此刻**答得出来的现状**。做成一个引用盒子是因为：闭包得先装配好，之后再改它 ——
+/// 待办补做正好发生在宿主推来新快照（`update`）之后，测试必须能改"现在"。
+@MainActor final class HostSnapshotBox {
+ var value:ResidentPropEditorSnapshot
+ init(_ value:ResidentPropEditorSnapshot) { self.value = value }
+}
 @main struct Test {
  @MainActor static func main() async throws {
   let s = ResidentPropEditorState()
@@ -550,6 +556,188 @@ typealias WorldAgentContext = LayoutContext
   await hopelessButAnswered.select(objectID:"cup")
   precondition(hopelessButAnswered.notice == ResidentPropEditorSnapshot.supportUnavailableText,
     "when the host answers \"never\" the panel must repeat that, not the session message (got \"\(hopelessButAnswered.notice)\")")
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 2026-09-28 真机缺陷（第二次确诊）：**打开装修就点物件那一行，那一次点击被浪费掉**。
+  //
+  // 真机日志：19.105 进入装修 → 19.130 开始派生 → 19.832 派生完成（0.69 s）。用户在那 0.7 s
+  // 窗口里点了那一行：当时 `surfaces` 还是空的，面板回了一句"格子还在生成，请稍候"
+  // 就把这次点击**扔掉了**。格子好了以后提示确实换成了"可以摆放了"，但**那次点击不会被补做**
+  // —— 用户以为点过了，实际"没有携带态"。
+  //
+  // 下面把"待办"钉成**行为**（不是钉某个变量）：
+  //   1. 未就绪时点行 ⇒ 记住意图 + 可读提示；承托面到（宿主的就绪重推）⇒ **自动进入携带态**，
+  //      不需要第二次点击，而且 placement 必须来自**被点的那一件**（用它自己的 transform）；
+  //   2. "用户不要这件事了"的每一条路（改选另一件 / 关面板 / Esc / 退出装修 / 换世界 / 保存中）
+  //      ⇒ 待办被作废：之后**重新打开面板**再收到承托面，也绝不会自己拿起东西；
+  //   3. 待办**只允许一件**：后点覆盖前点，绝不排队（先点的那件永远不许事后被补做）。
+  let deferredAnchor = WorldVector3(x:2,y:0.5,z:1)
+  var deferredMetadata = metadata
+  deferredMetadata["gmgn.support-surface.v1"] = "table"
+  let deferredObject = WorldObjectState(
+    transform:.init(position:deferredAnchor,rotation:identity.rotation,scale:identity.scale),
+    metadata:deferredMetadata)
+  let deferredSurfaces:[ResidentPropEditorSurface] = [
+    .init(id:"floor",name:"地面",position:zero,cellCount:1),
+    .init(id:"table",name:"台面 0.50 m",position:.init(x:-3,y:0.5,z:-3),cellCount:8)]
+  /// 宿主**答得出来**的"格子还在生成"：承托面为空，但确实有一次派生在跑
+  /// （`supportGeometryUnavailable == false`）—— 与"永远拿不到"互斥。
+  let deferredDeriving = ResidentPropEditorSnapshot(worldID:"a",revision:3,objects:[deferredObject],
+    surfaces:[],canUndo:true,heldProp:nil,holdUnavailableReasons:[:],supportGeometryUnavailable:false)
+  let deferredReady = ResidentPropEditorSnapshot(worldID:"a",revision:3,objects:[deferredObject],
+    surfaces:deferredSurfaces,canUndo:true)
+  let otherWorldReady = ResidentPropEditorSnapshot(worldID:"b",revision:3,objects:[deferredObject],
+    surfaces:deferredSurfaces,canUndo:true)
+
+  // (1) 未就绪时点行 ⇒ 记住意图 + 可读提示；承托面到 ⇒ **自动进入携带态**（不需要第二次点击）。
+  //     这是"真机那 0.7 s 窗口"的逐字复现：`update(deferredReady)` 就是 19.832 那次重推。
+  let deferred = ResidentPropEditorState()
+  deferred.update(deferredDeriving);deferred.open()
+  let deferredHost = HostSnapshotBox(deferredDeriving)
+  deferred.refreshSnapshot = { deferredHost.value }
+  var deferredPreviews:[String] = []
+  deferred.preview = { id, _ in deferredPreviews.append(id);return deferredObject }
+  await deferred.select(objectID:"cup")
+  precondition(deferred.selectedID == nil && !deferred.isCarrying,
+    "precondition: without support geometry a row click must not enter the carrying state")
+  precondition(deferred.notice == ResidentPropEditorSnapshot.supportDerivingText,
+    "a row click before the grid is ready must still say \"\(ResidentPropEditorSnapshot.supportDerivingText)\" (got \"\(deferred.notice)\")")
+  deferredHost.value = deferredReady
+  deferred.update(deferredReady)          // 宿主在格子就绪那一刻重推快照
+  for _ in 0..<1_000 { if deferred.isCarrying { break };await Task.yield() }
+  precondition(deferred.isCarrying,
+    "once the grid is ready the row click that was swallowed must be completed automatically, without a second click (carrying=\(deferred.isCarrying) selected=\(deferred.selectedID ?? "nil") notice=\(deferred.notice))")
+  precondition(deferred.selectedID == "cup",
+    "the completed click must carry the very row that was clicked (got \(deferred.selectedID ?? "nil"))")
+  precondition(deferred.placement?.surfaceID == "table"
+      && deferred.placement?.position.x == deferredAnchor.x
+      && deferred.placement?.position.z == deferredAnchor.z,
+    "the completed carrying state must come from the clicked prop's own transform (surface=\(deferred.placement?.surfaceID ?? "nil") position=\(String(describing:deferred.placement?.position)))")
+  precondition(deferred.candidate != nil && deferredPreviews == ["cup"],
+    "the completed click must preview exactly that prop (previews=\(deferredPreviews) candidate=\(deferred.candidate != nil))")
+  precondition(deferred.notice != ResidentPropEditorSnapshot.supportDerivingText,
+    "a completed click must not leave the stale \"still generating\" notice behind (got \"\(deferred.notice)\")")
+
+  // (2) "用户不要这件事了"的每一条路都必须**作废**待办。判据刻意放在"之后**重新打开面板**
+  //     再收到承托面"上：关掉面板本身会让携带态不可见，只有重新打开才暴露"待办还活着"。
+  func pendingThenInvalidated(_ label:String, laterSnapshot:ResidentPropEditorSnapshot,
+                              _ invalidate:(ResidentPropEditorState) async -> Void) async {
+    let editor = ResidentPropEditorState()
+    editor.update(deferredDeriving);editor.open()
+    let hostSnapshot = HostSnapshotBox(deferredDeriving)
+    editor.refreshSnapshot = { hostSnapshot.value }
+    editor.commit = { _, _, _ in deferredReady }
+    var previewed:[String] = []
+    editor.preview = { id, _ in previewed.append(id);return deferredObject }
+    await editor.select(objectID:"cup")
+    precondition(editor.notice == ResidentPropEditorSnapshot.supportDerivingText,
+      "precondition (\(label)): the row click must be remembered while the grid is deriving (notice=\(editor.notice))")
+    await invalidate(editor)
+    hostSnapshot.value = laterSnapshot
+    editor.update(laterSnapshot)
+    editor.open()                          // 用户重新打开面板
+    for _ in 0..<1_000 { await Task.yield() }
+    precondition(!editor.isCarrying && editor.selectedID == nil && previewed.isEmpty,
+      "\(label) must invalidate the pending row click: reopening the panel and getting the surfaces must NOT pick anything up (carrying=\(editor.isCarrying) selected=\(editor.selectedID ?? "nil") previewed=\(previewed))")
+  }
+  await pendingThenInvalidated("closing the panel", laterSnapshot:deferredReady) { $0.close() }
+  // Esc 在"手上有待办"时的分支是 close()（没有选中任何东西），所以这里钉的就是那条。
+  await pendingThenInvalidated("pressing Escape", laterSnapshot:deferredReady) { $0.escape() }
+  // 换世界：宿主推来**别的世界**的现状。待办属于旧世界，必须随之作废。
+  await pendingThenInvalidated("switching worlds", laterSnapshot:otherWorldReady) {
+    $0.update(.init(worldID:"b",revision:0,objects:[],surfaces:[],canUndo:false))
+  }
+  // 保存中：真的起一次保存（`undo` 走 `save`）。世界随时可能换一份回来，待办一律作废。
+  // 这次保存刻意**失败**（commit 抛错）：失败分支走不到 `cancelPreview()`，所以这一条钉的是
+  // `save` 自己那次作废，而不是被别的清理路径捎带着清掉的。
+  await pendingThenInvalidated("a save in flight", laterSnapshot:deferredReady) { editor in
+    editor.commit = { _, _, _ in
+      throw NSError(domain:"test",code:9,userInfo:[NSLocalizedDescriptionKey:"保存失败"])
+    }
+    await editor.undo()
+  }
+
+  // 退出装修：走**真机那条链**（菜单「结束装修」/ 窗口关闭都落到控制器的 `close()`），
+  // 而不是直接戳状态机 —— 这条链上任何一步漏了作废，待办都会活到下一次重推。
+  let exitHost = AppGuardHarness(), exitController = ControllerHarness()
+  exitHost.livingWorldContext = context
+  exitHost.surfaces = [surface]
+  exitHost.stageWindowController = exitController
+  exitHost.configureResidentPropEditor(exitController)
+  let exitToken = UUID()
+  exitHost.residentPropGridDerivation = exitToken
+  exitHost.publishResidentPropGrid()       // 派生在跑：面板看到的承托面为空
+  exitController.residentPropEditor.open()
+  await exitController.residentPropEditor.select(objectID:"cup")   // 这次点击落在空档里
+  precondition(exitController.residentPropEditor.selectedID == nil
+      && exitController.residentPropEditor.notice == ResidentPropEditorSnapshot.supportDerivingText,
+    "precondition: a row click during the derivation is remembered, not carried (notice=\(exitController.residentPropEditor.notice))")
+  exitController.residentPropEditor.close()      // ← 结束装修 / 关面板走的就是这一条
+  exitHost.residentPropGridEditor.becomeReady()  // 格子随后才派生完
+  exitHost.finishResidentPropGridDerivation(exitToken)
+  precondition(!exitController.residentPropEditor.snapshot.surfaces.isEmpty,
+    "precondition: the ready grid re-projects the panel snapshot")
+  exitController.residentPropEditor.open()       // 用户重新打开装修
+  for _ in 0..<1_000 { await Task.yield() }
+  precondition(!exitController.residentPropEditor.isCarrying && exitController.residentPropEditor.selectedID == nil,
+    "ending the decoration session must invalidate the pending row click: reopening it must NOT pick anything up (carrying=\(exitController.residentPropEditor.isCarrying) selected=\(exitController.residentPropEditor.selectedID ?? "nil"))")
+
+  // (3) 待办**只允许一件**（后点覆盖前点，绝不排队）。
+  let kettleProp = WorldGeneratedProp(objectID:"kettle",sourceWishID:"wish",assetID:"kettle-asset",
+    displayName:"水壶",size:.init(x:0.1,y:0.2,z:0.1),sourceHeight:1)
+  var kettleMetadata = ["gmgn.generated-prop.v1":String(data:try JSONEncoder().encode(kettleProp),encoding:.utf8)!]
+  kettleMetadata["gmgn.support-surface.v1"] = "floor"
+  let kettleAnchor = WorldVector3(x:-1,y:0,z:-1)
+  let kettleObject = WorldObjectState(
+    transform:.init(position:kettleAnchor,rotation:identity.rotation,scale:identity.scale),
+    metadata:kettleMetadata)
+  let twoObjects = [deferredObject,kettleObject]
+  func pairSnapshot(surfaces:[ResidentPropEditorSurface]) -> ResidentPropEditorSnapshot {
+    .init(worldID:"a",revision:3,objects:twoObjects,surfaces:surfaces,canUndo:true,heldProp:nil,
+      holdUnavailableReasons:[:],supportGeometryUnavailable:false)
+  }
+  let bothDeriving = pairSnapshot(surfaces:[]), bothReady = pairSnapshot(surfaces:deferredSurfaces)
+  // (3a) 未就绪时连点两行：只有**后点**的那一件会被补做，先点的那一件永远不许事后被拿起。
+  let queue = ResidentPropEditorState()
+  queue.update(bothDeriving);queue.open()
+  let queueHost = HostSnapshotBox(bothDeriving)
+  queue.refreshSnapshot = { queueHost.value }
+  var queuedPreviews:[String] = []
+  queue.preview = { id, _ in queuedPreviews.append(id);return twoObjects.first { $0.generatedProp?.objectID == id }! }
+  await queue.select(objectID:"cup")
+  await queue.select(objectID:"kettle")
+  precondition(queue.notice == ResidentPropEditorSnapshot.supportDerivingText,
+    "precondition: both row clicks landed while the grid was still deriving (notice=\(queue.notice))")
+  queueHost.value = bothReady
+  queue.update(bothReady)
+  for _ in 0..<1_000 { if queue.isCarrying { break };await Task.yield() }
+  precondition(queue.isCarrying && queue.selectedID == "kettle",
+    "only the most recent row click may be remembered and completed (carrying=\(queue.isCarrying) selected=\(queue.selectedID ?? "nil") previewed=\(queuedPreviews))")
+  precondition(queuedPreviews == ["kettle"],
+    "the superseded row click must never be completed later (previewed=\(queuedPreviews))")
+  precondition(queue.placement?.position.x == kettleAnchor.x,
+    "the completed click must carry the most recently clicked prop (position=\(String(describing:queue.placement?.position)))")
+
+  // (3b) 未就绪时点了 cup，随后承托面到了、用户改点 kettle 并且**这次成功了**：
+  //      旧的那次待办必须**已经不存在** —— 否则宿主下一次重推快照会把它补做，
+  //      于是"用户明明拿起了 kettle，过一会儿手里变成了 cup"。
+  let supersede = ResidentPropEditorState()
+  supersede.update(bothDeriving);supersede.open()
+  let supersedeHost = HostSnapshotBox(bothDeriving)
+  supersede.refreshSnapshot = { supersedeHost.value }
+  var supersedePreviews:[String] = []
+  supersede.preview = { id, _ in supersedePreviews.append(id);return twoObjects.first { $0.generatedProp?.objectID == id }! }
+  await supersede.select(objectID:"cup")
+  precondition(supersede.selectedID == nil && supersede.notice == ResidentPropEditorSnapshot.supportDerivingText,
+    "precondition: the first row click is remembered while the grid is deriving")
+  supersedeHost.value = bothReady
+  await supersede.select(objectID:"kettle")
+  precondition(supersede.isCarrying && supersede.selectedID == "kettle",
+    "the row click that finally can be honoured must enter the carrying state (selected=\(supersede.selectedID ?? "nil"))")
+  supersede.update(bothReady)             // 宿主下一次重推（鼠标一动就会推）
+  for _ in 0..<1_000 { await Task.yield() }
+  precondition(supersede.selectedID == "kettle" && supersedePreviews == ["kettle"],
+    "a newer row click must supersede the older pending one for good, never the other way round (selected=\(supersede.selectedID ?? "nil") previewed=\(supersedePreviews))")
 
   // 根因的前提必须由**真实现**证明：`PropSupportGridBuilder.build` 的 fail-closed 失败
   // **不是 nil 网格**，而是一个"层为空的网格"。真机那句"永远还在生成"就活在这一格上：
@@ -951,7 +1139,7 @@ typealias WorldAgentContext = LayoutContext
   precondition(boundedCollision.queryCount > queriesAfterThreeWorlds,
     "the evicted world must derive again (the cache is bounded, not a leak)")
 
-  print("PASS: editor cancel, failure preservation, hand controls, duplicate submit, stale revision, late world, input routing, ready-grid row click, host-cannot-answer vs host-says-empty, empty-grid and dead-derivation honesty, stale notice refresh, skipped-push retry, scene pick-up routing, placed-prop transform, hover glow inside the focus clip, the placeable initial landing spot, window focus loss preserving the decoration session and its derivation, and same-world grid reuse from a bounded cache")
+  print("PASS: editor cancel, failure preservation, hand controls, duplicate submit, stale revision, late world, input routing, ready-grid row click, host-cannot-answer vs host-says-empty, empty-grid and dead-derivation honesty, stale notice refresh, skipped-push retry, the row click that arrives before the grid is ready (remembered, completed on readiness from the clicked prop's own transform, invalidated by every \"I do not want this\" signal, never queued), scene pick-up routing, placed-prop transform, hover glow inside the focus clip, the placeable initial landing spot, window focus loss preserving the decoration session and its derivation, and same-world grid reuse from a bounded cache")
  }
 }
 """#

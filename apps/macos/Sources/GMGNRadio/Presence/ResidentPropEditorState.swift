@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import os
 import WorldRuntime
 
 struct ResidentPropEditorSurface: Identifiable, Equatable, Sendable {
@@ -188,6 +189,32 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     @Published private(set) var isSaving = false
     @Published private(set) var notice = ""
     @Published var showsPlacedOnly = false
+    /// 「格子还没就绪时点的那一行」——一次**待办**，不是选中。
+    ///
+    /// 为什么需要它：真机一次格子派生 0.7 s（Debug 4.8 s），用户**打开装修就点行**，
+    /// 那一下正好落在空档里，被回一句「格子还在生成，请稍候」就**丢掉了**；格子好了那句
+    /// 提示会换成「可以摆放了」，但那次点击**不会被补做** —— 用户以为点过了，实际没有携带态。
+    ///
+    /// 三条约束（缺一条就会变成"过一会儿自己拿起一件东西"，比丢一次点击更糟）：
+    /// - **只允许一件**：后一次点行**覆盖**前一次，绝不排队成一串；
+    /// - 只在"承托面还没到 / 宿主答不出"时写入；承托面一到就由
+    ///   `completePendingSelectIfReady()` 走**同一条出口**补做；
+    /// - 任何"用户已经不要这件事了"的信号（改选另一件、关面板、Esc、退出装修、换世界、
+    ///   保存中）都必须**作废**它。
+    private var pendingSelectObjectID: String?
+    /// 每一次"用户又点了一次 / 作废"都会 +1。补做是异步的（`update` 同步、`preview` 要等），
+    /// 所以补做的任务必须带上**发起时的这一个数**：中间只要发生任何一件"用户已经不要这件事了"
+    /// 的事，那个在飞的补做就自己失效 —— 否则会出现"关掉面板之后它还是把东西拿起来了"。
+    private var selectIntentGeneration = 0
+    /// 携带态待办的诊断日志（与宿主同一个 subsystem/category，`log show` 一条命令读全）。
+    ///
+    /// 为什么要它：这次修的是"用户点了行、却什么都没发生"。三个分支（记住意图 / 补做 /
+    /// 作废）里任何一个是**静默**的，真机上就分不清"没记住""记住了但没补做"与
+    /// "记住了又被别的事件作废了"。三条都是 `.notice`，不带 `--info` 也能看到。
+    ///
+    /// 这里用字面量 subsystem 而不是 `ProductIdentity`：本文件也被 `tools/*` 的离线 harness
+    /// 直接编译，那些 harness 不装 App 的 `ProductIdentity`。值与 `ProductIdentity` 一致。
+    private let livingWorldLogger = Logger(subsystem: "ai.gmgn.radio", category: "LivingWorld")
     var preview: (@MainActor (String, WorldPropPlacement) async throws -> WorldObjectState)?
     var commit: (@MainActor (WorldPropLayoutCommand, UInt64, String) async throws -> ResidentPropEditorSnapshot)?
     var hold: (@MainActor (String, UInt64, String) async throws -> ResidentPropEditorSnapshot)?
@@ -249,17 +276,29 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
             notice = Self.supportReadyText
         }
         snapshot = value
+        // 承托面到了 ⇒ 把"格子还没就绪时点的那一行"补做掉（见 `completePendingSelectIfReady`）。
+        // 这是**唯一**的补做触发点：宿主在就绪那一刻重推快照，正是那次点击被浪费的地方。
+        completePendingSelectIfReady()
     }
     func open() { guard !snapshot.worldID.isEmpty, !isOpen else { return }; isOpen = true; onEditingChanged(true) }
     func close() {
-        generation = UUID(); isSaving = false; cancelPreview()
+        generation = UUID(); isSaving = false
+        // 关面板 / 退出装修 / 换世界走的是同一条 `close()`：都是"用户不要这件事了"。
+        // 待办必须在这里作废，否则格子就绪那一刻会**自己**拿起一件他从没在当前意图里选过的东西。
+        clearPendingSelect(reason: "关闭面板、退出装修或换世界")
+        cancelPreview()
         if isOpen { isOpen = false; onEditingChanged(false) }
     }
     func cancelPreview() {
+        // 双击撤回、外部取消都从这里走：同样是"不要这件事了"。
+        clearPendingSelect(reason: "取消选择")
         previewGeneration = UUID(); candidate = nil; placement = nil; selectedID = nil
         draftRevision = nil; isMoving = false; notice = ""; onPreviewChanged(nil)
     }
     func escape() {
+        // Esc 是"我不要这件事了"的最强信号：先作废待办，再按既有分支走
+        // （两条分支各自也会清，这里是**明写**，便于真机日志一眼看出是 Esc 干的）。
+        clearPendingSelect(reason: "Esc")
         // Saving can await asset preparation. Closing revokes the host's editing lease before it resumes.
         if isSaving { close() }
         else if selectedID != nil { cancelPreview() }
@@ -270,7 +309,26 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     /// **不信任手里的快照**：`surfaces` 是宿主**推送**来的字段，而格子派生是异步的
     /// （真实舱体一次 0.5 s，-Onone 6.6 s）。就绪那一刻的推送可能还没到，所以点一行时先按
     /// 现状要一份（`refreshSnapshot`）再判 —— 否则"格子已经画出来了、点一行却毫无反应"。
+    ///
+    /// **拿不到承托面时，这一次点击不许被丢掉**：真机 2026-09-28，用户打开装修就点行，
+    /// 而格子要 0.7 s（Debug 4.8 s）才派生完，于是那一点正好落在空档里，被回一句
+    /// "格子还在生成，请稍候"就没了 —— 格子好了那句提示会换成"可以摆放了"，但**那次点击
+    /// 不会被补做**（用户以为点过了，实际没有携带态）。现在改成：这一次点击被**记住**，
+    /// 承托面一到就由 `completePendingSelectIfReady()` 走**同一条出口**补做。
     func select(objectID: String) async {
+        guard isOpen, !isSaving else { return }
+        // 用户又点了一次：上一次没能兑现的那次点行要么被这一次**覆盖**（这一次也进不了携带态
+        // 时会被重新记住），要么被这一次**兑现**（这一次能进，走的就是下面同一条出口）。
+        // 两条路都不该让它继续挂着 —— 待办**只允许一件**，绝不排队成一串。
+        clearPendingSelect(reason: "用户又点了一次（后一次覆盖前一次）")
+        await performSelect(objectID: objectID)
+    }
+
+    /// 点行的**唯一出口**：正常点击与"承托面到了以后补做那次待办"都走这里。
+    ///
+    /// 单独立出来就是为了让补做**不可能**另写一套逻辑：它进的仍是同一个 `select` 主体，
+    /// 所以 fail-closed 一个字都没放宽（没有几何依旧进不了携带态）。
+    private func performSelect(objectID: String) async {
         guard isOpen, !isSaving else { return }
         // 宿主答出来的那份是**唯一的现状**；`nil` 表示它答不出来（装修会话不在/世界换了）。
         // 这两件事在后面必须分开处理，所以这里留住"有没有答"这个事实本身。
@@ -290,6 +348,8 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
         //   说"请稍候"就是撒谎（真机 2026-09-28：格子早就好了，这句话却一直挂着）。
         guard let support = support(for: object) else {
             notice = refreshed == nil ? Self.supportSessionUnavailableText : snapshot.supportUnavailableNotice
+            // 把这一次意图记下来：承托面一到就补做（提示先落定，日志里能读到用户看到的那句话）。
+            rememberPendingSelect(objectID: objectID, hostAnswered: refreshed != nil)
             return
         }
         selectedID = objectID; draftRevision = snapshot.revision; requestID = UUID().uuidString
@@ -318,6 +378,57 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
             return
         }
         await validate(initial)
+    }
+
+    /// 承托面还没到（或宿主答不出）⇒ 为这一次点行**记一个待办**。
+    ///
+    /// **只允许一件**：直接赋值，后一次点行覆盖前一次（绝不排队成一串）。
+    /// 写入时机只有一处 —— `performSelect` 的承托守卫；所以待办永远是"用户点过、但还没兑现"
+    /// 的那一件，不会凭空出现。
+    private func rememberPendingSelect(objectID: String, hostAnswered: Bool) {
+        pendingSelectObjectID = objectID
+        livingWorldLogger.notice(
+            "携带态待办：记住这次点行 objectID=\(objectID, privacy: .public) 宿主答出现状=\(hostAnswered, privacy: .public) 承托面=\(self.snapshot.surfaces.count, privacy: .public) 提示=\(self.notice, privacy: .public)"
+        )
+    }
+
+    /// **作废**待办。每一个"用户已经不要这件事了"的信号都必须经过这里：
+    /// 改选另一件（`select` 开头覆盖）、关面板 / 退出装修 / 换世界（`close`）、
+    /// Esc（`escape`）、保存中（`save` / `saveAction`）。
+    ///
+    /// 少一处就会变成"过一会儿自己拿起一件东西" —— 那比原来那次点击被浪费更糟。
+    private func clearPendingSelect(reason: String) {
+        // 任何作废（哪怕此刻没有待办）都让**在飞的补做**失效：作废必须是无条件的。
+        selectIntentGeneration &+= 1
+        guard let objectID = pendingSelectObjectID else { return }
+        pendingSelectObjectID = nil
+        livingWorldLogger.notice(
+            "携带态待办：作废 objectID=\(objectID, privacy: .public) 原因=\(reason, privacy: .public)"
+        )
+    }
+
+    /// 宿主**答出了现状**、而且承托面**已经到**了 ⇒ 把那次没能兑现的点行**补做**掉。
+    ///
+    /// 唯一触发点：`update(_:)` 收到一份承托面非空的新快照（宿主在格子就绪那一刻的重推），
+    /// 也就是真机上那次点击被浪费的地方。补做走 `performSelect`（与正常点行**完全同一条出口**），
+    /// 所以 fail-closed 一个字都没放宽：没有几何仍然进不了携带态。
+    /// 这里的 `snapshot.surfaces` 非空**就是**"几何到了"这个既有判据，不是新判据。
+    private func completePendingSelectIfReady() {
+        guard let objectID = pendingSelectObjectID, !snapshot.surfaces.isEmpty else { return }
+        // 这里**只清待办、不作废**：这一件正是要补做的，绝不能让 clearPendingSelect 把它自己
+        // 那次补做的令牌也一起作废掉。
+        pendingSelectObjectID = nil
+        let intent = selectIntentGeneration
+        livingWorldLogger.notice(
+            "携带态待办：承托面已到，补做这次点行 objectID=\(objectID, privacy: .public) 承托面=\(self.snapshot.surfaces.count, privacy: .public) Revision=\(self.snapshot.revision, privacy: .public)"
+        )
+        // 补做是异步的（要走 `preview`），而 `update` 是同步的：交给主线程的下一个回合。
+        // 执行时重新确认这个意图**没有被更新的一次点击或任何作废事件取代** —— 中间用户可能
+        // 已经关面板 / Esc / 保存 / 改选了另一件，那些事件各自会把令牌推走。
+        Task { @MainActor [weak self] in
+            guard let self, self.isOpen, !self.isSaving, self.selectIntentGeneration == intent else { return }
+            await self.performSelect(objectID: objectID)
+        }
     }
 
     /// 未摆出物件的初始落点：按候选顺序逐个问 `preview`，第一个非 nil 的就是它。
@@ -465,6 +576,8 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     private func save(_ command: WorldPropLayoutCommand) async {
         guard isOpen, !isSaving, let commit else { return }
         isSaving = true; isMoving = false
+        // 保存中：世界随时可能换一份回来，这次待办一律作废（见 `clearPendingSelect`）。
+        clearPendingSelect(reason: "保存中")
         submittedActionKey = nil
         if submittedCommand != command { requestID = UUID().uuidString; submittedCommand = command }
         let context = generation, revision = snapshot.revision, id = requestID
@@ -486,6 +599,8 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
                             perform: @escaping @MainActor (UInt64, String) async throws -> ResidentPropEditorSnapshot) async {
         guard isOpen, !isSaving else { return }
         isSaving = true; isMoving = false
+        // 保存中：世界随时可能换一份回来，这次待办一律作废（见 `clearPendingSelect`）。
+        clearPendingSelect(reason: "保存中")
         if submittedCommand != nil || submittedActionKey != key { requestID = UUID().uuidString }
         submittedCommand = nil
         submittedActionKey = key
