@@ -154,6 +154,31 @@ guard editorView.contains("左键放下；右键旋转 45°") else {
 guard !editorView.contains("或圆环旋转") else {
  print("FAIL: the placement panel hint still tells the user to rotate with the left button on the ring");exit(1)
 }
+// ── 圆环是**静态提示**：不再随悬停变亮、不再换光标（2026-09-29）─────────────────
+// 缺陷形状：左键在圆环上已经只有"放下"一个含义，但圆环进入 32 pt 命中区仍会**变亮**并把
+// 光标换成手型 —— 视觉上继续暗示"点我旋转"，与刚消除的"一个键两个含义"是同一类错误。
+// 现在：命中区判定、悬停状态与"指针一动就为手柄标脏"的调用整体删除，`draw(_:)` 的两条配色
+// 不再有悬停分支，全文件不再出现手型光标。
+//
+// **原来那条断言去了哪**：旧版由 `SceneMouseProbe` 逐字抽取生产里的 `isRotationHandleHit`
+// 与 `rotationHandleHitRadius`，好让"退回旧实现"时"点在圆环正中"那一记被判成旋转而 FAIL。
+// 命中区整体删除后那两处抽取一并删除（否则 `method(...)` 找不到签名会直接崩），换成下面
+// 这三条结构断言 —— 仍然能抓住"退回旧实现"（已实测：见各处 FAIL 文案）。
+for deadRingSymbol in ["isRotationHandleHit", "rotationHandleHitRadius",
+                       "isRotationHandleHovered", "pointingHand"] where controller.contains(deadRingSymbol) {
+ print("FAIL: the rotation ring must stay a static hint — \"\(deadRingSymbol)\" is back in StageWindowController (the ring brightens and/or swaps the cursor on hover, so it still looks clickable)");exit(1)
+}
+let pointerUpdateCode = codeOnly(method("private func updatePropPointer(", in: controller))
+guard !pointerUpdateCode.contains("updateRotationHandle"),
+      !pointerUpdateCode.contains("isRotationHandleHit") else {
+ print("FAIL: updatePropPointer must not run a per-frame ring hover update — the ring has no hover state and must not repaint (or re-cursor) on every mouse move");exit(1)
+}
+let ringDrawCode = method("override func draw(", in: controller)
+guard !ringDrawCode.contains("isHot"),
+      ringDrawCode.contains("withAlphaComponent(0.12)"),
+      ringDrawCode.contains("withAlphaComponent(0.78)") else {
+ print("FAIL: the ring must be drawn with the static 12% fill / 78% stroke — a hover-dependent brightness branch is back");exit(1)
+}
 func method(_ signature:String, in source:String = controller) -> String {
  let start = source.range(of:signature)!.lowerBound
  let open = source[start...].firstIndex(of:"{")!
@@ -368,10 +393,12 @@ final class CountingFloorCollision: WorldPropSupportQuerying, @unchecked Sendabl
 ///
 /// 只有三处是 harness 的，且都与"哪个键干什么"无关：
 /// 1. 圆环**画在哪**（`ringCenter`）：生产由"footprint 中心投影 + 34/10 锚点"决定，
-///    `test-stage-resident-chat.swift` 已用真实投影把锚点钉住；这里只需要一个可点到的圆心，
-///    好把"点在圆环正中"这一下真的喂进去。`isRotationHandleHit` 与命中半径**仍从生产抽取**，
-///    于是"退回旧实现"时这一下会被判成旋转、下面的断言必然失败（已实测）。
-/// 2. `updatePropPointer`：鼠标这几条路只把它当悬停更新（改 footprint 落点/圆环亮度），
+///    `test-stage-resident-chat.swift` 已用真实投影把锚点钉住；这里只需要一个"圆环正中"的
+///    坐标，好把"点在圆环正中"这一下真的喂进去（2026-09-29 起圆环是静态提示、没有命中判定，
+///    所以只留坐标，不再抽取任何命中函数 —— 旧版这里逐字抽取 `isRotationHandleHit` 与
+///    32 pt 命中半径，用来让"退回旧实现"必然失败；命中区整体删除后改为文件作用域的
+///    "必须不存在"结构断言，见上面那段）。
+/// 2. `updatePropPointer`：鼠标这几条路只把它当悬停更新（改 footprint 落点），
 ///    与落地、旋转无关，这里换成计数器。
 /// 3. `SpatialStageStore` 的替身：只保留分流真正读/写的建造模式标志、相机、复位。
 @MainActor final class SceneMouseProbe: NSView {
@@ -397,6 +424,7 @@ final class CountingFloorCollision: WorldPropSupportQuerying, @unchecked Sendabl
  var onGridRotate:((Int)->Void)?
  var isTextInputFocused:(() -> Bool)?
  /// 圆环圆心（AppKit 坐标）。nil = 屏幕上没有圆环（空手时本来就不画）。
+ /// 2026-09-29 起圆环是静态提示：这个坐标只用来喂"左键点在圆环正中"那一记，不再有命中判定。
  var ringCenter:NSPoint? = NSPoint(x:512,y:344)
  /// `updatePropPointer` 的调用次数（悬停那一侧，见类型说明）。
  var propPointerUpdates = 0
@@ -408,9 +436,6 @@ final class CountingFloorCollision: WorldPropSupportQuerying, @unchecked Sendabl
  private var rightPressOriginInWindow:CGPoint?
  private var didPickUpFromScenePointer = false
  private var loggedSceneInputStates:[String:String] = [:]
- private static let rotationHandleHitRadius:CGFloat = 32
- /// 圆环的**屏幕位置**：生产里是"投影 + 锚点"算出来的计算属性，这里直接给定。
- private var rotationHandleCenter:NSPoint? { ringCenter }
  init(_ propEditor:ResidentPropEditorState) {
   self.propEditor = propEditor
   super.init(frame:NSRect(x:0,y:0,width:1000,height:600))
@@ -449,7 +474,6 @@ final class CountingFloorCollision: WorldPropSupportQuerying, @unchecked Sendabl
  \#(method("private var pointerChainState").replacingOccurrences(of:"private var",with:"var"))
  \#(method("private func pointerChainCoordinate"))
  \#(method("private static func pointerChainPoint"))
- \#(method("private func isRotationHandleHit"))
  \#(method("override func mouseDown("))
  \#(method("override func mouseUp("))
  \#(method("override func mouseDragged("))

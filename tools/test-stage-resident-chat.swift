@@ -178,6 +178,24 @@ guard !rotationHandleAnchor.contains("outward"),
     print("FAIL: the handle anchor still scales with camera distance")
     exit(1)
 }
+// 可见圆环半径：下面"偏移量的下界"要拿它当基准，所以读生产的**唯一一份**
+// （`StageWorldInteractionView.rotationHandleRadius`），不另抄一个魔数。数值本身也钉住：
+// 26 pt 是圆环的既有尺寸，属于"不要动"的那批常量之一。
+let rotationRingRadius: Double = {
+    guard let line = controller.split(separator: "\n").first(where: {
+              $0.contains("static let rotationHandleRadius")
+          }),
+          let value = Double(line.split(separator: "=").last?
+              .trimmingCharacters(in: .whitespaces) ?? "") else {
+        print("FAIL: the visible rotation ring radius is not declared in StageWindowController")
+        exit(1)
+    }
+    return value
+}()
+guard rotationRingRadius == 26 else {
+    print("FAIL: the visible rotation ring radius moved (expected 26 pt, got \(rotationRingRadius) pt)")
+    exit(1)
+}
 let harness = #"""
 import Foundation
 import Combine
@@ -739,12 +757,15 @@ enum StageAvatarActivity { case listening, speaking, idle }
         check(nearOffset.x == ResidentPropRotationHandleAnchor.screenOffsetX
                 && nearOffset.y == ResidentPropRotationHandleAnchor.screenOffsetY,
               "both named offset constants feed the anchor")
-        // 偏移量的下界：必须大于悬停半径 32 pt，否则圆环的悬停区会盖住 hover 格的格心 ——
-        // 光标还停在格心上，圆环就亮起来并换成 `pointingHand`。它**不再**参与点击分流
-        // （左键在任何位置都是放下、右键单击才是旋转，见 `test-resident-prop-editor.swift`
-        // 里那组用真 mouseDown/mouseUp 抽取驱动的断言），34/10 这个值一个字都没动。
-        check(hypot(nearOffset.x, nearOffset.y) > 32,
-              "the screen offset stays outside the 32 pt hover radius so hovering the cell centre never lights the ring")
+        // 偏移量的下界（2026-09-29 换了个理由）：圆环是**静态提示**，原来那个 32 pt 悬停命中区
+        // （`rotationHandleHitRadius` / `isRotationHandleHit`）已整体删除 —— 现在全文件不再
+        // 出现手型光标，也不再有"悬停变亮"，见 `test-resident-prop-editor.swift` 里
+        // "圆环不再随悬停变亮、不再改光标"那组断言。仍然要守的是：**可见圆环不许压住
+        // footprint 中心的投影点**（那是落点、也是用户在瞄的地方）。所以偏移必须大于圆环
+        // 半径；半径由脚本顶部从生产源码里读出并钉住（`\#(rotationRingRadius)` pt），
+        // 这里不另抄魔数。34/10 这个值一个字都没动。
+        check(hypot(nearOffset.x, nearOffset.y) > \#(rotationRingRadius),
+              "the screen offset stays outside the visible ring radius (\#(rotationRingRadius) pt) so the ring never sits on the footprint centre the user is aiming at")
         // 上界：每个分量都要落在 hover 格的投影范围内（格心吸附跟着光标走，跨过一列/一行
         // 圆环就会跟着跳一格）。0.25 m 的格子在 1.5 / 2.0 / 2.2 m 处的投影半宽×半深实测约
         // 51.0×21.2 / 40.3×13.6 / 37.1×11.6 pt，34/10 都装得下（2.2 m 就是这套偏移的边界）；

@@ -726,17 +726,19 @@ struct StagePointerDragDelta: Equatable {
 ///
 /// 偏移量的取值不是随手写的，它被两条约束夹住（见
 /// `tools/test-stage-resident-chat.swift` 里"偏移与相机距离无关"的断言）：
-/// 1. **必须大于悬停半径 32 pt**（`StageWorldInteractionView.rotationHandleHitRadius`）：
-///    否则圆环的悬停区会盖住 hover 格的**格心** —— 光标还停在格心上、圆环就已经亮起来
-///    并换成 `pointingHand`（那个反馈现在只表示"光标压住了圆环"，不表示"点它能转"）。
-///    所以 `hypot(screenOffsetX, screenOffsetY) ≈ 35.4 pt > 32 pt`。
+/// 1. **必须大于可见圆环半径 26 pt**（`StageWorldInteractionView.rotationHandleRadius`）：
+///    圆环的圆心就贴在 footprint 中心投影的右上侧，偏移太小时圆环会压住那个投影点 ——
+///    那是落点、也是用户在瞄的地方，盖上去既挡视线又像"这里能点"。所以
+///    `hypot(screenOffsetX, screenOffsetY) ≈ 35.4 pt > 26 pt`。
+///    （2026-09-29 之前这条写的是"必须大于 32 pt 悬停命中区"；圆环改成静态提示后，命中区
+///    本身被删掉了，34/10 这个值一个字没动。）
 /// 2. **每个分量都要落在 hover 格的投影范围内**：格心的吸附跟着光标走，光标从格心走向
 ///    圆环时只要跨过一列/一行，圆环就会跟着跳一格。0.25 m 的格子在 1440×900、fov 66°、
 ///    相机高 0.8 m、俯角 25° 时，地面 1.0/1.5/2.0/2.2/2.5 m 处的格子投影半宽×半深约为
 ///    70×38 / 51×21 / 40×14 / 37×12 / 33×9 pt，所以垂直分量尤其要小：地面平的深度轴在
 ///    屏幕上被俯角压扁，44 pt 这类垂直偏移在 ~0.85 m 之外就落到格子外面（原定的 48/44
 ///    就是这样）。34/10 到 ~2.2 m 为止都还在格子里；再远就需要更小的偏移，而更小的偏移
-///    会掉进约束 1 的 32 pt 命中区 —— 这个分界是这套屏幕偏移机制的边界，不是靠调数字
+///    会掉进约束 1 的 26 pt 圆环里 —— 这个分界是这套屏幕偏移机制的边界，不是靠调数字
 ///    绕得开的（`tools/test-stage-resident-chat.swift` 把 1.5 / 2.0 / 2.2 m 三档钉住了）。
 enum ResidentPropRotationHandleAnchor {
     /// 相对 footprint 中心投影点的固定屏幕偏移，落在光标的右上侧（AppKit 点，y 轴向上为正）。
@@ -1560,16 +1562,14 @@ private final class StageWorldInteractionView: NSView {
     /// 可见圆环的半径与线宽（屏幕空间恒定，不随距离缩放）。
     private static let rotationHandleRadius: CGFloat = 26
     private static let rotationHandleLineWidth: CGFloat = 3
-    /// 手柄**悬停**判定半径：比可见圆环（26 pt）大，便于瞄准。
-    ///
-    /// 它现在**只服务于悬停**（圆环变亮 + 光标形状），**不再参与任何点击分流**：
-    /// 左键在任何位置都是放下（`mouseDown` 里那条"命中圆环就旋转"的分支已删），
-    /// 旋转是右键单击（`rightMouseDown` / `rightMouseUp`）。所以它没有变成死代码，
-    /// 连同 `isRotationHandleHit` 一起保留；圆环的锚点 34/10 也一个字没动。
-    private static let rotationHandleHitRadius: CGFloat = 32
-    /// 光标是不是正停在手柄上（决定光标形状与圆环亮度）。
-    private var isRotationHandleHovered = false
+    /// 圆环是**静态提示**（2026-09-29）：它表示"这件东西朝哪边"，也提示可以用右键单击 /
+    /// `R` / `⇧R` / `,` / `.` 旋转 —— 但它**不接受左键，也不再表现为可点击**：指针进入它
+    /// 附近既不改亮度、也不换光标。原先为此存在的悬停命中半径与命中判定、悬停状态
+    /// （以及 `mouseExited` 里那段光标复位）已随之整体删除。圆环的锚点 34/10 一个字没动。
     /// 编辑器状态一变就把手柄重画一遍（开始/结束携带、换格、旋转）。
+    ///
+    /// 位置只由 `propEditor.placement`（`@Published`）与投影决定，所以这一条订阅就够 ——
+    /// 指针移动那条路**不再**为手柄标脏（`updatePropPointer` 里那次调用已删）。
     private var rotationHandleRefresh: AnyCancellable?
 
     /// 建造模式的光标回调。参数是**归一化、左上原点**的光标位置，与
@@ -2008,15 +2008,6 @@ private final class StageWorldInteractionView: NSView {
         updatePropPointer(event)
     }
 
-    /// 光标离开交互视图：手柄的 `pointingHand` 不能留在别处（例如 Metal 世界那张没设
-    /// 光标区的画面上）。
-    override func mouseExited(with event: NSEvent) {
-        guard isRotationHandleHovered else { return }
-        isRotationHandleHovered = false
-        NSCursor.arrow.set()
-        needsDisplay = true
-    }
-
     /// 建造模式的步进旋转键：`R` / `⇧R`，以及 Sims 4 肌肉记忆的 `,` / `.`。
     private static func gridRotationSteps(for event: NSEvent) -> Int? {
         // `,` 逆时针、`.` 顺时针（The Sims 4 官方口径）。
@@ -2056,9 +2047,9 @@ private final class StageWorldInteractionView: NSView {
                 "场景输入链[5] updatePropPointer 分支=归一化失败（视图 bounds 为空）→ return")
             return
         }
-        // 手柄画在本视图里，所以指针一移动就重算悬停并标脏 —— 圆环跟着 footprint 走，
-        // 不需要任何每帧注册机制（选 `draw(_:)` 而不是新开一层 overlay 就是为了这个）。
-        updateRotationHandle(at: convert(event.locationInWindow, from: nil))
+        // 圆环不在这里更新：它是**静态提示**（2026-09-29），没有悬停态，重画由
+        // `rotationHandleRefresh`（`propEditor.objectWillChange`）负责 —— 指针移动这条路
+        // 不再为手柄做任何事，也不再有"命中圆环就变亮/换光标"的副作用。
 
         // 建造模式交给格子拾取：射线与**每一层**格子平面求交、就近命中，不再依赖
         // "当前摆放面"的单一高度 —— 这正是建造模式能放地面、放桌面、放夹层的原因。
@@ -2069,8 +2060,8 @@ private final class StageWorldInteractionView: NSView {
             onGridCursor?(normalized)
             // **标脏必须在回调之后**：这一拍里 `onGridCursor` 才会走完
             // 「App → 格子模型 → 空间站」把"这里能不能放、为什么不能"算出来并写进
-            // `spatialStage.residentPropBlockReason`。上面那次 `updateRotationHandle` 的标脏
-            // 早于它，单独靠它会让光标旁的标签永远慢一帧。
+            // `spatialStage.residentPropBlockReason`。早于它的标脏（原来那次来自
+            // 圆环的悬停更新，2026-09-29 随悬停态一起删除）会让光标旁的标签永远慢一帧。
             needsDisplay = true
             noteSceneInputChain("onGridCursor.转发", state: "已转发 wired=\(wired)",
                 "场景输入链[6] onGridCursor 调用点已返回（onGridCursor已接线=\(wired)；false = 宿主回调从未接上，App 侧不会有 [7]/[8]/[9]）")
@@ -2107,7 +2098,7 @@ private final class StageWorldInteractionView: NSView {
     ///
     /// 建造模式这一条与改动前一致（原来是通过 `residentPropBuildModeProjection?.spacing`
     /// 间接要求的）：非建造模式的"在支持面上挪物件"路径也会写 `placement`，那里不该冒出手柄
-    /// —— `mouseDown` 本来也只在建造模式里让手柄命中生效。
+    /// —— 手柄本来就只在建造模式里画（左键在任何位置都是放下，不看手柄，见 `mouseDown`）。
     private var rotationHandleWorldAnchor: SIMD3<Float>? {
         guard propEditor.isCarrying,
               spatialStage.isResidentPropBuildModeActive,
@@ -2116,7 +2107,7 @@ private final class StageWorldInteractionView: NSView {
     }
 
     /// 手柄圆环在本视图坐标里的圆心（AppKit 左下原点）。没在手 / 投影不可用时为 nil ——
-    /// 也就是不画、不命中。
+    /// 也就是不画（圆环没有命中判定，所以这里只影响绘制）。
     ///
     /// 世界 → 屏幕用**既有的** `SpatialStageStore.residentPropScreenPoint(world:)`
     /// （它给的是归一化、左上原点，所以 y 要翻回来），再加上**固定屏幕偏移**
@@ -2131,32 +2122,13 @@ private final class StageWorldInteractionView: NSView {
         return NSPoint(x: center.x, y: center.y)
     }
 
-    /// 手柄悬停命中（可见圆环 26 pt，悬停区 32 pt）——**只**决定圆环亮不亮与光标形状。
-    private func isRotationHandleHit(at point: NSPoint) -> Bool {
-        guard let center = rotationHandleCenter else { return false }
-        return hypot(point.x - center.x, point.y - center.y) <= Self.rotationHandleHitRadius
-    }
-
-    /// 指针移动时更新手柄悬停态：命中就换成 `pointingHand`，并标脏让圆环变亮。
+    /// 手柄：在手的物件旁边画一个 26 pt 圆环（白色 12% 底 + 青色描边）。
     ///
-    /// 注意它**不参与点击分流**：左键落在圆环上也是放下（`mouseDown` 已经不再问这里的命中）。
-    /// 保留原样的亮/暗与光标，是因为那属于既有的悬停反馈，与"哪个键旋转"是两件事。
-    private func updateRotationHandle(at point: NSPoint) {
-        let hovered = isRotationHandleHit(at: point)
-        if hovered != isRotationHandleHovered {
-            isRotationHandleHovered = hovered
-            // 拖相机时 `beginDrag` 已经 push 了 `closedHand`，别去抢光标。
-            if !dragInProgress {
-                (hovered ? NSCursor.pointingHand : NSCursor.arrow).set()
-            }
-        }
-        needsDisplay = true
-    }
-
-    /// 手柄：在手的物件旁边画一个 26 pt 圆环（白色 12% 底 + 青色描边，命中时变亮）。
+    /// 画在这里而不是新开一层 overlay：本视图是**指针的唯一所有者**，圆环用的是与指针、
+    /// 投影同一套视图坐标；那几个 hosting view 的 `hitTest` 全返回 nil，再开一层等于第三套坐标系。
     ///
-    /// 画在这里而不是新开一层 overlay：本视图是**指针的唯一所有者**，绘制与命中判定
-    /// 同类型、同坐标系；那几个 hosting view 的 `hitTest` 全返回 nil，再开一层等于第三套坐标系。
+    /// 配色是**静态**的（2026-09-29）：圆环不再随悬停变亮 —— 它只是"这件东西朝哪边"的提示，
+    /// 不接受左键、也不表现为可点击（原先的悬停命中判定与悬停态已删，见 `rotationHandleRefresh`）。
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         guard let center = rotationHandleCenter else { return }
@@ -2167,10 +2139,9 @@ private final class StageWorldInteractionView: NSView {
             width: radius * 2,
             height: radius * 2
         ))
-        let isHot = isRotationHandleHovered
-        NSColor.white.withAlphaComponent(isHot ? 0.20 : 0.12).setFill()
+        NSColor.white.withAlphaComponent(0.12).setFill()
         ring.fill()
-        NSColor.cyan.withAlphaComponent(isHot ? 1 : 0.78).setStroke()
+        NSColor.cyan.withAlphaComponent(0.78).setStroke()
         ring.lineWidth = Self.rotationHandleLineWidth
         ring.stroke()
         // 「为什么不能放」跟着同一个锚点走，画在圆环**上方**（同侧、错开），所以它既不压住
