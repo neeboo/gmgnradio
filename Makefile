@@ -41,6 +41,16 @@ install: build
 test-install:
 	$(PYTHON) tools/test-install-macos.py
 
+# Build products are launchable bundles, so LaunchServices registers every one
+# of them the moment Xcode writes it -- and Spotlight then offers a second
+# "gmgn radio" next to the installed app. `make install` deletes its product
+# after copying it into place; routine verification builds one too, so this is
+# the same cleanup as a standalone target. Unregister first (the file is about
+# to be deleted, and a registration whose bundle is gone cannot be removed with
+# `lsregister -u` afterwards), then delete.
+dedupe:
+	-python3 tools/dedupe-app-registrations.py
+
 test-worlds:
 	swift test --package-path apps/macos/Packages/WorldRuntime
 
@@ -84,7 +94,7 @@ test-harnesses:
 	swift tools/test-resident-background-presentation.swift
 	swift tools/test-resident-agent-loop.swift
 
-test-all: test-install test-worlds test-daemon test-python test-harnesses
+test-all: test-install test-worlds test-daemon test-python test-harnesses dedupe
 
 test: generate
 	xcodebuild test \
