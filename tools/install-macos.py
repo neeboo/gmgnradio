@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Install one macOS bundle and replace its scoped task daemon together."""
 import argparse
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -9,8 +10,25 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
+
+
+@contextlib.contextmanager
+def stage(timings, name):
+    """Record how long one install stage took, when the caller asked for it.
+
+    `timings` is None for every ordinary install (including the unit tests), so
+    this is a no-op unless opt-in profiling is on: the receipt on stdout stays
+    byte-identical, and the numbers are reported separately on stderr.
+    """
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        if timings is not None:
+            timings[name] = round(time.monotonic() - started, 3)
 
 
 # The daemon verification probe (see Runtime.verify) answers an empty
@@ -129,7 +147,7 @@ def validate(app, require_helper=True):
             raise RuntimeError(f'Missing executable app/helper: {relative}')
 
 
-def ensure_signature(app):
+def ensure_signature(app, timings=None):
     """仅当签名**不完整**时补一次 ad-hoc 签名，返回是否补过。
 
     Xcode 的 Debug 产物是 linker-signed：可执行文件本身有签名，但 bundle 资源
@@ -140,16 +158,19 @@ def ensure_signature(app):
     反过来，**已经正确签名（含 Developer ID / 公证）的产物绝不能重签**：那会把
     正式签名换成 ad-hoc，等于毁掉分发能力。所以这里只补不覆盖。
     """
-    verified = subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)],
-                              capture_output=True)
+    with stage(timings, 'signature.verify_before'):
+        verified = subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)],
+                                  capture_output=True)
     if verified.returncode == 0:
         return False
-    resigned = subprocess.run(['codesign', '--force', '--deep', '--sign', '-', str(app)],
-                              capture_output=True)
+    with stage(timings, 'signature.resign'):
+        resigned = subprocess.run(['codesign', '--force', '--deep', '--sign', '-', str(app)],
+                                  capture_output=True)
     if resigned.returncode != 0:
         raise RuntimeError('Installed bundle signature could not be repaired')
-    recheck = subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)],
-                             capture_output=True)
+    with stage(timings, 'signature.verify_after'):
+        recheck = subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)],
+                                 capture_output=True)
     if recheck.returncode != 0:
         raise RuntimeError('Repaired bundle signature still fails verification')
     return True
@@ -211,10 +232,16 @@ def ensure_single_registration(app):
                     stale.append(path)
         for path in stale:
             subprocess.run([lsregister, '-u', str(path)], capture_output=True, timeout=30)
-        if stale:
-            # `lsregister -u` 对**已经不在磁盘上**的路径是拒绝的（dump 里会写
-            # "Bundle node not found on disk"），所以死注册用 `-u` 清不掉 ——
-            # 实测只能重建数据库。只在确实存在别的注册时才做（正常装机走不到这里）。
+        # `lsregister -u` 对**已经不在磁盘上**的路径是拒绝的（dump 里会写
+        # "Bundle node not found on disk"），所以死注册用 `-u` 清不掉 ——
+        # 实测只能重建数据库。只在确实有死注册时才做。
+        #
+        # 2026-09-30：这里过去是"只要 stale 非空就重建"，而装机时最常见的 stale
+        # 恰恰是 **xcodebuild 刚注册、文件还在** 的构建产物（`lsregister -u` 对它
+        # 有效）。为它重建整个 LaunchServices 数据库，每次装机白付约 8 s
+        # （实测 registration 阶段 15.0 s 对 6.9 s）。现在只有"文件已不在磁盘上"
+        # 的死注册才触发重建。
+        if any(not path.exists() for path in stale):
             subprocess.run([lsregister, '-kill', '-r', '-domain', 'local',
                             '-domain', 'system', '-domain', 'user'],
                            capture_output=True, timeout=120)
@@ -224,13 +251,15 @@ def ensure_single_registration(app):
         return False
 
 
-def install(source, destination, root, runtime=None, timeout=15):
+def install(source, destination, root, runtime=None, timeout=15, timings=None):
     source, destination, root = (Path(p).expanduser().resolve() for p in (source, destination, root))
     if source == destination or source in destination.parents or destination in source.parents:
         raise RuntimeError('Source and destination must be separate bundles')
-    validate(source)
+    with stage(timings, 'validate_source'):
+        validate(source)
     if destination.exists():
-        validate(destination, require_helper=False)
+        with stage(timings, 'validate_destination'):
+            validate(destination, require_helper=False)
     runtime = runtime or Runtime()
     sock = root / 'taskd.sock'
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -239,41 +268,53 @@ def install(source, destination, root, runtime=None, timeout=15):
     child = None
     swapped = False
     try:
-        shutil.copytree(source, staged, symlinks=True)
-        validate(staged)
+        with stage(timings, 'copy_bundle'):
+            shutil.copytree(source, staged, symlinks=True)
+        with stage(timings, 'validate_staged'):
+            validate(staged)
         # 先补签暂存副本再替换：装出去的 bundle 一定是自洽的；中途失败也不会
         # 留下一个签坏了的正式安装。
-        signature_repaired = ensure_signature(staged)
-        rows = runtime.processes()
+        with stage(timings, 'signature'):
+            signature_repaired = ensure_signature(staged, timings)
+        with stage(timings, 'scan_processes'):
+            rows = runtime.processes()
         executables = {str(app / 'Contents/MacOS/gmgn radio') for app in (source, destination)}
         apps = [(pid, command) for pid, command in rows if command in executables]
-        for pid, command in apps:
-            runtime.stop(pid, command, timeout)
+        with stage(timings, 'stop_app'):
+            for pid, command in apps:
+                runtime.stop(pid, command, timeout)
         commands = set()
         for app in (source, destination):
             commands.update(_daemon_commands(app / 'Contents/Helpers/gmgn-taskd', root, sock))
-        daemons = [(pid, command) for pid, command in runtime.processes() if command in commands]
-        for pid, command in daemons:
-            runtime.stop(pid, command, timeout)
-        if destination.exists():
-            destination.rename(backup)
+        with stage(timings, 'stop_daemons'):
+            daemons = [(pid, command) for pid, command in runtime.processes() if command in commands]
+            for pid, command in daemons:
+                runtime.stop(pid, command, timeout)
+        with stage(timings, 'backup_rename'):
+            if destination.exists():
+                destination.rename(backup)
         try:
-            staged.rename(destination)
+            with stage(timings, 'swap_rename'):
+                staged.rename(destination)
         except Exception:
             if backup.exists():
                 backup.rename(destination)
             raise
         swapped = True
-        child = runtime.start(destination / 'Contents/Helpers/gmgn-taskd', root, sock)
-        runtime.verify(child, sock, timeout)
+        with stage(timings, 'daemon_start'):
+            child = runtime.start(destination / 'Contents/Helpers/gmgn-taskd', root, sock)
+        with stage(timings, 'daemon_verify'):
+            runtime.verify(child, sock, timeout)
         # 外部 VoiceMem provider 层已拆除：这里不再向 daemon 发送任何 endpoint/
         # token，安装器也不再读取任何记忆 provider 环境变量。安装只负责替换
         # bundle、拉起 daemon 并验证套接字归属；记忆模块在 daemon 内部自行工作。
         #
         # 安装成功后的两项收尾（都不影响返回值，也都不算失败）：LaunchServices 里
         # 只留这一条注册；历次安装的工作区只留本次这一个（回滚用），其余删掉。
-        ensure_single_registration(destination)
-        prune_install_workspaces(destination.parent, keep=workspace)
+        with stage(timings, 'registration'):
+            ensure_single_registration(destination)
+        with stage(timings, 'prune_workspaces'):
+            prune_install_workspaces(destination.parent, keep=workspace)
         return {'destination': str(destination), 'backup': str(backup) if backup.exists() else None,
                 'daemon_verified': True, 'signature_repaired': signature_repaired,
                 'app_stopped': bool(apps), 'open_app_manually': True}
@@ -295,11 +336,26 @@ def main():
     parser.add_argument('--source', type=Path, required=True)
     parser.add_argument('--destination', type=Path, default=Path('/Applications/gmgn radio.app'))
     parser.add_argument('--root', type=Path, default=Path.home() / 'Library/Application Support/gmgn radio/TaskService')
+    # 排查装机慢用的可观测性开关，默认关闭：stdout 的回执保持逐字段不变
+    # （tools/test-install-macos.py 会逐字段比较它），计时走 stderr。
+    # 也可以直接 `GMGN_INSTALL_TIMING=1 make install`。
+    parser.add_argument('--timing', action='store_true',
+                        default=os.environ.get('GMGN_INSTALL_TIMING') == '1',
+                        help='report per-stage install timings on stderr')
     args = parser.parse_args()
+    timings = {} if args.timing else None
+    started = time.monotonic()
     try:
-        print(json.dumps(install(args.source, args.destination, args.root), ensure_ascii=False))
+        receipt = install(args.source, args.destination, args.root, timings=timings)
     except Exception as error:
+        if timings is not None:
+            timings['total'] = round(time.monotonic() - started, 3)
+            print(json.dumps({'timings': timings, 'failed': True}), file=sys.stderr)
         parser.exit(1, f'{error}\n')
+    if timings is not None:
+        timings['total'] = round(time.monotonic() - started, 3)
+        print(json.dumps({'timings': timings, 'failed': False}), file=sys.stderr)
+    print(json.dumps(receipt, ensure_ascii=False))
 
 
 if __name__ == '__main__':

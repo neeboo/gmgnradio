@@ -1,7 +1,24 @@
-.PHONY: generate test test-all test-install test-worlds test-daemon test-python test-harnesses build install
+.PHONY: generate test test-all test-install test-worlds test-daemon test-python test-harnesses build install install-debug install-universal
 
-CONFIGURATION ?= Debug
+# 默认 Release：只有 -O 下"承托网格派生"才是 0.5 s 量级（-Onone 是 6.6 s，
+# 真机一次要六秒多，用户等不了）。想最快编译走 make install-debug。
+CONFIGURATION ?= Release
 DERIVED_DATA ?= apps/macos/Build
+# SwiftPM 的检出/仓库/产物放在 DerivedData **之外**。过去它们在
+# apps/macos/Build/SourcePackages 里，`rm -rf apps/macos/Build` 会一并删掉
+# 734 MB 检出，下一次冷编译要重新 git clone 并跑 `submodule update
+# --init --recursive`（实测 252 s，而且必须联网）。这四个目录名本来就在
+# .gitignore 里（apps/macos/Packages/{checkouts,repositories,artifacts}）。
+CLONED_SOURCE_PACKAGES ?= apps/macos/Packages
+# 本机迭代只编当前架构。Release 默认 ARCHS=arm64 x86_64，每个 Swift 模块编两遍
+# （实测 App target 187 个文件 arm64 320 s / x86_64 284 s，两者并行但抢同一批
+# 核），post-build 的 Rust daemon 也要 cargo build 两次再 lipo（实测 162 s）。
+# 需要给别人用的通用二进制走 make install-universal，那条路不受影响。
+ARCH_FLAGS ?= ONLY_ACTIVE_ARCH=YES
+# 保留 -O，只把编译模式从整模块优化换成增量：改一个文件时只重编它和依赖它的
+# 文件，而不是**整个模块**。整模块下改一行 = 重编 App target 全部 187 个文件
+# （实测增量 146 s，冷编译 320 s）。
+COMPILATION_MODE ?= SWIFT_COMPILATION_MODE=incremental
 PYTHON ?= python3
 CARGO ?= $(shell command -v cargo 2>/dev/null || echo $(HOME)/.cargo/bin/cargo)
 
@@ -16,15 +33,29 @@ build: generate
 		-configuration "$(CONFIGURATION)" \
 		-destination 'platform=macOS' \
 		-derivedDataPath "$(DERIVED_DATA)" \
+		-clonedSourcePackagesDirPath "$(CLONED_SOURCE_PACKAGES)" \
 		-disableAutomaticPackageResolution \
 		-onlyUsePackageVersionsFromResolvedFile \
 		-skipPackageUpdates \
+		$(ARCH_FLAGS) $(COMPILATION_MODE) \
 		CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
 
 # One entry point: build the app + bundled helper, then install and switch both.
+# 日常迭代就用这一条：Release 的 -O 手感 + 单架构 + 增量编译。
 install: build
 	python3 tools/install-macos.py --source "$(DERIVED_DATA)/Build/Products/$(CONFIGURATION)/gmgn radio.app"
 	rm -rf "$(DERIVED_DATA)/Build/Products/$(CONFIGURATION)/gmgn radio.app"
+
+# 分发形状：通用二进制（arm64 + x86_64）+ 整模块优化 —— 也就是改造前
+# `make install CONFIGURATION=Release` 的行为。给别人的机器用这条。
+install-universal: ARCH_FLAGS := ONLY_ACTIVE_ARCH=NO
+install-universal: COMPILATION_MODE := SWIFT_COMPILATION_MODE=wholemodule
+install-universal: install
+
+# 编译最快（-Onone），但承托网格派生要 6.6 s：只在改动与装修面板无关、
+# 且不需要真机手感时使用。
+install-debug: CONFIGURATION := Debug
+install-debug: install
 
 # ---------------------------------------------------------------------------
 # Verification
