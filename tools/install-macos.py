@@ -190,17 +190,34 @@ def ensure_single_registration(app):
         if not bundle_id:
             return False
         dump = subprocess.run([lsregister, '-dump'], capture_output=True, text=True, timeout=60)
-        current, stale = None, []
-        for line in dump.stdout.splitlines():
-            stripped = line.strip()
-            if stripped.startswith('bundle id:'):
-                current = stripped.split('bundle id:', 1)[1].strip()
-            elif stripped.startswith('path:') and current == bundle_id:
-                path = Path(stripped.split('path:', 1)[1].strip())
+        # `lsregister -dump` 的每条记录里 `path:` 出现在 `bundle id:` **之前**（实测），
+        # 所以不能"先看到 bundle id 再收 path" —— 必须按 `-----` 分隔的区块整体判断。
+        stale = []
+        for block in dump.stdout.split('\n----------'):
+            if bundle_id not in block:
+                continue
+            for line in block.splitlines():
+                stripped = line.strip()
+                if not stripped.startswith('path:'):
+                    continue
+                # dump 里路径后面跟着注册表的句柄，例如
+                # `path:   /Applications/gmgn radio.app (0x7b2c)` —— 不去掉尾巴
+                # 就会去注销一个不存在的文件名，静默失败（2026-09-29 实测）。
+                text = stripped.split('path:', 1)[1].strip()
+                if text.endswith(')') and ' (0x' in text:
+                    text = text[:text.rindex(' (0x')]
+                path = Path(text)
                 if path != app:
                     stale.append(path)
         for path in stale:
             subprocess.run([lsregister, '-u', str(path)], capture_output=True, timeout=30)
+        if stale:
+            # `lsregister -u` 对**已经不在磁盘上**的路径是拒绝的（dump 里会写
+            # "Bundle node not found on disk"），所以死注册用 `-u` 清不掉 ——
+            # 实测只能重建数据库。只在确实存在别的注册时才做（正常装机走不到这里）。
+            subprocess.run([lsregister, '-kill', '-r', '-domain', 'local',
+                            '-domain', 'system', '-domain', 'user'],
+                           capture_output=True, timeout=120)
         subprocess.run([lsregister, '-f', str(app)], capture_output=True, timeout=30)
         return True
     except Exception:

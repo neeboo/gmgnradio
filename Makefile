@@ -24,6 +24,7 @@ build: generate
 # One entry point: build the app + bundled helper, then install and switch both.
 install: build
 	python3 tools/install-macos.py --source "$(DERIVED_DATA)/Build/Products/$(CONFIGURATION)/gmgn radio.app"
+	rm -rf "$(DERIVED_DATA)/Build/Products/$(CONFIGURATION)/gmgn radio.app"
 
 # ---------------------------------------------------------------------------
 # Verification
