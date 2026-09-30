@@ -55,7 +55,10 @@ func q(_ v:[Double],_ p:Double)->Double{let s=v.sorted();return s.isEmpty ?0:s[m
 
   // 移动图 + 锚点（收窄后的全部输入）
   let hs = ps.map(\.y)
-  let anchorIDs = Set(manifest.activities.map(\.entryWaypointID)).sorted()
+  // 只有**世界固有**锚点在这里：道具功能点锚点的几何来自运行时注册表（
+  // `WorldPropAnchorRegistry`），本 harness 的上下文没有喂功能点声明，
+  // 所以服务侧注册表为空 —— 两边的锚点集合仍然逐字一致（"一个判据"）。
+  let anchorIDs = Set(manifest.activities.compactMap(\.entryWaypointID)).sorted()
   var anchorPositions: [String: WorldVector3] = [:]
   for id in anchorIDs { if let w = manifest.waypoints.first(where:{$0.id==id}) { anchorPositions[id]=w.position } }
   let map = WorldPlacementRouteMap(grid: grid, lowerHeight: hs.min()!-0.2, upperHeight: hs.max()!+0.2)

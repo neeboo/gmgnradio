@@ -27729,24 +27729,8 @@
     {
       "id": "wish_machine.collect",
       "action": "interact",
-      "entryWaypointID": "wish_machine.pickup",
-      "transform": {
-        "position": {
-          "x": 0.8,
-          "y": -0.037016094,
-          "z": -3.55
-        },
-        "rotation": {
-          "x": 0,
-          "y": 1,
-          "z": 0,
-          "w": 6.123233995736766e-17
-        },
-        "scale": {
-          "x": 1,
-          "y": 1,
-          "z": 1
-        }
+      "functionPoint": {
+        "propID": "wish_machine.device"
       },
       "motionID": null,
       "propIDs": [
@@ -27809,24 +27793,8 @@
     {
       "id": "music.listen",
       "action": "listenMusic",
-      "entryWaypointID": "wp.jukebox",
-      "transform": {
-        "position": {
-          "x": 1.3,
-          "y": 0.031601157,
-          "z": -6
-        },
-        "rotation": {
-          "x": 0,
-          "y": -0.7071067811865475,
-          "z": 0,
-          "w": 0.7071067811865476
-        },
-        "scale": {
-          "x": 1,
-          "y": 1,
-          "z": 1
-        }
+      "functionPoint": {
+        "propID": "prop.jukebox"
       },
       "motionID": null,
       "propIDs": [
@@ -28305,13 +28273,13 @@
       "id": "prop.jukebox",
       "path": "jukebox.json",
       "kind": "prop.procedural",
-      "sha256": "d1c84f82563d809f1a5aebbc1dfe6b045725cd5a1212e92e73b049cbf590a527"
+      "sha256": "13e6bce3919c04d1b71f6c632734879f5019e065ff43d152352600891887544b"
     },
     {
       "id": "wish_machine.device",
       "path": "wish-machine.json",
       "kind": "prop.procedural",
-      "sha256": "9982666478c793522f884cd47f83cf51969382aac45d93bac77252c40f46c277"
+      "sha256": "ba0dcd16ca59ddfc8e6c8625eed9ee8b53de1ab2a5079d53f26f7eb3d7524b6a"
     }
   ]
 }

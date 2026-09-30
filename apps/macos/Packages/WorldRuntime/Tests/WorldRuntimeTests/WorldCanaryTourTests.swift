@@ -75,7 +75,7 @@ func warmKitchenAutoGraphReachesEveryActivityEntryFromSpawn() throws {
 
     // home.walk and home.turn deliberately share the wp.center entry, so the
     // reachability requirement is about the entry set, not per-activity rows.
-    let entries = Set(manifest.activities.map(\.entryWaypointID))
+    let entries = Set(manifest.activities.compactMap(\.entryWaypointID))
     for entry in entries.sorted() {
         #expect(
             reachable.contains(entry),
@@ -107,7 +107,7 @@ func warmKitchenCompletesSixStopCollisionTour() throws {
         let anchor = try #require(anchorsByID[activityID])
         let path = try router.route(
             from: position,
-            to: anchor.entryWaypointID
+            to: try #require(anchor.entryWaypointID)
         )
         if !path.waypointIDs.isEmpty {
             #expect(
@@ -128,7 +128,7 @@ func warmKitchenCompletesSixStopCollisionTour() throws {
             position = destination
         }
 
-        let anchorPosition = anchor.transform.position.simd3
+        let anchorPosition = try #require(anchor.transform).position.simd3
         #expect(
             distance(position, anchorPosition) <= 0.08,
             "Entry transform is outside the 8 cm tolerance for \(activityID)"
@@ -157,7 +157,7 @@ func warmKitchenRoutesEveryActivityEntryFromSpawn() throws {
     for anchor in manifest.activities.sorted(by: { $0.id < $1.id }) {
         let path = try router.route(
             from: spawnPosition,
-            to: anchor.entryWaypointID
+            to: try #require(anchor.entryWaypointID)
         )
         if anchor.entryWaypointID != "wp.spawn" {
             #expect(
@@ -197,10 +197,11 @@ func warmKitchenOffersCoffeeMachineInteraction() throws {
 
     #expect(anchor.action == "interact")
     #expect(anchor.entryWaypointID == "wp.kitchen.counter")
-    #expect(abs(anchor.transform.position.x - 0.38) < 0.001)
-    #expect(abs(anchor.transform.position.z + 1.28) < 0.001)
-    #expect(abs(anchor.transform.rotation.w - 0.7071068) < 0.001)
-    #expect(abs(anchor.transform.rotation.y - 0.7071068) < 0.001)
+    let transform = try #require(anchor.transform)
+    #expect(abs(transform.position.x - 0.38) < 0.001)
+    #expect(abs(transform.position.z + 1.28) < 0.001)
+    #expect(abs(transform.rotation.w - 0.7071068) < 0.001)
+    #expect(abs(transform.rotation.y - 0.7071068) < 0.001)
     #expect(definition.displayName == "操作咖啡机")
     #expect(definition.activity == .interact(anchorID: "coffee.brew"))
     #expect(
@@ -421,7 +422,7 @@ func warmKitchenRejectsObsoletePositionInsideRightCabinet() throws {
 
     let path = try WaypointNavigationGraph(manifest: manifest).route(
         from: legacyPosition.simd3,
-        to: anchor.entryWaypointID
+        to: try #require(anchor.entryWaypointID)
     )
     let approachEffects = try executor.supplyApproach(
         ActivityApproachPlan(waypoints: path.points)

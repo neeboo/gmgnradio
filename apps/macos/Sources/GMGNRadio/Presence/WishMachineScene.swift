@@ -1,24 +1,58 @@
 import AppKit
 import SceneKit
+import WorldRuntime
 
 /// Metre-scale independent prop. The front/output faces -Z; origin is the foot.
+///
+/// **坐标一律来自世界包里的 `prop.procedural` 声明**（`wish-machine.json`）：
+/// 这里不再有第二份数字。没有装声明就没有坐标 —— 机器不出现，取物点与出货口也不存在
+/// （fail-closed），而不是退回到一组"看起来对"的常量。
 enum WishMachineScene {
     enum State: String, Equatable, Sendable { case idle, generating, ready, failed }
     static let worldID = "84503420-3010-4944-8fde-2f383cd08ebe"
     static let propID = "wish_machine.device"
     static let activityID = "wish_machine.collect"
-    static let pickupWaypointID = "wish_machine.pickup"
-    static let position = SIMD3<Float>(0.8, -0.018, -2.6)
-    static let size = SIMD3<Float>(0.9, 0.5, 0.8)
-    static let pickupPosition = SIMD3<Float>(0.8, -0.037016094, -3.55)
-    /// Bottom alignment for a generated item, 25 cm above the tray surface.
-    static let outletPosition = SIMD3<Float>(0.8, 0.732, -2.6)
     /// Presentation-only enlargement. Formal position, collision size and
     /// pickup/output coordinates stay in the authored metre-space contract.
     static let visualScale: Float = 1.3
 
+    /// 世界包装入的声明。装一次，只读。`nonisolated(unsafe)`：写入只发生在世界装载
+    /// （主线程）那一刻，之后所有读者都只读它。
+    nonisolated(unsafe) private(set) static var declaration: WorldProceduralPropDeclaration?
+
+    static func install(_ declaration: WorldProceduralPropDeclaration?) {
+        Self.declaration = declaration
+    }
+
+    static var position: SIMD3<Float> {
+        guard let seed = declaration?.seedPosition else { return .zero }
+        return SIMD3(seed.x, seed.y, seed.z)
+    }
+
+    static var size: SIMD3<Float> {
+        guard let size = declaration?.size else { return .zero }
+        return SIMD3(size.x, size.y, size.z)
+    }
+
+    /// 一个功能点的**世界**坐标 = 局部声明 × 种子摆放（与运行时注册表同一套算式）。
+    /// 没有声明、或声明里没有这个角色 ⇒ `nil`。
+    static func functionPoint(_ role: String) -> SIMD3<Float>? {
+        guard let declaration,
+              let point = declaration.functionPointDeclaration?.point(role: role) else { return nil }
+        let world = WorldPropAnchorRegistry.worldPosition(
+            of: point.position, placedAt: declaration.seedPosition, yaw: declaration.seedYaw
+        )
+        return SIMD3(world.x, world.y, world.z)
+    }
+
+    /// 居民取物的落点（`pickup` 站立功能点）。
+    static var pickupPosition: SIMD3<Float>? { functionPoint("pickup") }
+
+    /// 生成物件的出货点（`outlet` 发射功能点），局部高度 = 托盘面 + 25 cm。
+    static var outletPosition: SIMD3<Float>? { functionPoint("outlet") }
+
     static func shouldDisplay(worldID: String?, drawsWorld: Bool) -> Bool {
-        drawsWorld && worldID == Self.worldID
+        drawsWorld && worldID == Self.worldID && declaration != nil
     }
 
     /// Restores the independent machine when a retained props renderer loses
@@ -69,7 +103,8 @@ enum WishMachineScene {
         visuals.addChildNode(box("wish_machine.rim.right", size: SIMD3(0.025,0.025,0.78), at: SIMD3(0.445,0.50,0), material: outline))
         let outputAnchor = SCNNode()
         outputAnchor.name = "wish_machine.output_anchor"
-        outputAnchor.simdPosition = outletPosition - position
+        // 出货口来自声明的 `outlet` 功能点（局部 → 视觉子树的局部偏移）。
+        outputAnchor.simdPosition = (outletPosition ?? position) - position
         root.addChildNode(outputAnchor)
         let label = SCNText(string: "WISH", extrusionDepth: 0.1)
         label.font = NSFont.systemFont(ofSize: 10, weight: .semibold)

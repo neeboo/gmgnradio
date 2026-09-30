@@ -26,7 +26,7 @@ public struct WorldPackageValidator: Sendable {
         findings.append(contentsOf: calibrationFindings(in: manifest))
         findings.append(contentsOf: duplicateIDFindings(in: manifest))
         findings.append(contentsOf: routeFindings(in: manifest))
-        findings.append(contentsOf: activityFindings(in: manifest))
+        findings.append(contentsOf: activityFindings(in: manifest, packageRoot: packageRoot))
         findings.append(
             contentsOf: activityDefinitionFindings(
                 in: manifest,
@@ -108,7 +108,8 @@ public struct WorldPackageValidator: Sendable {
     }
 
     private func activityFindings(
-        in manifest: WorldManifest
+        in manifest: WorldManifest,
+        packageRoot: URL
     ) -> [WorldPackageError] {
         let waypointIDs = Set(manifest.waypoints.map(\.id))
         let waypointsByID = Dictionary(
@@ -117,28 +118,32 @@ public struct WorldPackageValidator: Sendable {
         )
         let resourceIDs = Set(manifest.resources.map(\.id))
         let entryFindings: [WorldPackageError] = manifest.activities
-            .filter { !waypointIDs.contains($0.entryWaypointID) }
-            .sorted {
-                ($0.id, $0.entryWaypointID) < ($1.id, $1.entryWaypointID)
+            .compactMap { activity -> (String, String)? in
+                guard let waypointID = activity.entryWaypointID,
+                      !waypointIDs.contains(waypointID) else { return nil }
+                return (activity.id, waypointID)
             }
+            .sorted { ($0.0, $0.1) < ($1.0, $1.1) }
             .map {
                 .missingActivityEntryWaypoint(
-                    activityID: $0.id,
-                    waypointID: $0.entryWaypointID
+                    activityID: $0.0,
+                    waypointID: $0.1
                 )
             }
         let transformFindings: [WorldPackageError] = manifest.activities
             .compactMap { activity -> (String, String, Float)? in
-                guard let waypoint = waypointsByID[activity.entryWaypointID]
+                guard let waypointID = activity.entryWaypointID,
+                      let transform = activity.transform,
+                      let waypoint = waypointsByID[waypointID]
                 else {
                     return nil
                 }
                 let distance = worldDistance(
-                    activity.transform.position.simd3,
+                    transform.position.simd3,
                     waypoint.position.simd3
                 )
                 guard distance > 0.08 else { return nil }
-                return (activity.id, activity.entryWaypointID, distance)
+                return (activity.id, waypointID, distance)
             }
             .sorted {
                 ($0.0, $0.1) < ($1.0, $1.1)
@@ -166,7 +171,59 @@ public struct WorldPackageValidator: Sendable {
                     resourceID: $0.1
                 )
             }
-        return entryFindings + transformFindings + propFindings
+        let functionPointFindings = self.functionPointFindings(
+            in: manifest, packageRoot: packageRoot
+        )
+        return entryFindings + transformFindings + propFindings + functionPointFindings
+    }
+
+    /// 「道具功能点锚点」这一侧的 fail-closed 检查。
+    ///
+    /// 一个 `functionPoint` 入口在运行时能注册出锚点，当且仅当：
+    ///
+    /// 1. 绑定的道具是 `prop.procedural` 资源，且能在包里**读出来**（不是凭空写一个 id）；
+    /// 2. 该道具声明了一个 `standingSpot` 功能点，把这个活动绑成自己的接近锚点；
+    /// 3. 这个道具 id 也在同一行的 `propIDs` 里（"这件道具属于这个活动"不能两处不一致）。
+    ///
+    /// 读不出声明 = 拒绝装载。绝不在运行时不声不响地"没有锚点"。
+    private func functionPointFindings(
+        in manifest: WorldManifest,
+        packageRoot: URL
+    ) -> [WorldPackageError] {
+        var findings: [WorldPackageError] = []
+        let resourcesByID = Dictionary(
+            manifest.resources.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        for activity in manifest.activities.sorted(by: { $0.id < $1.id }) {
+            guard let propID = activity.functionPointPropID else { continue }
+            guard activity.propIDs.contains(propID) else {
+                findings.append(.functionPointPropNotDeclared(
+                    activityID: activity.id, propID: propID
+                ))
+                continue
+            }
+            guard let resource = resourcesByID[propID], resource.kind == "prop.procedural" else {
+                findings.append(.missingFunctionPointDeclaration(
+                    activityID: activity.id, propID: propID
+                ))
+                continue
+            }
+            guard let data = try? Data(contentsOf: packageRoot.appendingPathComponent(resource.path)),
+                  let declaration = try? JSONDecoder().decode(
+                      WorldProceduralPropDeclaration.self, from: data
+                  ),
+                  declaration.objectID == propID,
+                  let points = declaration.functionPointDeclaration,
+                  points.entryPoint(activityID: activity.id) != nil
+            else {
+                findings.append(.missingFunctionPointDeclaration(
+                    activityID: activity.id, propID: propID
+                ))
+                continue
+            }
+        }
+        return findings
     }
 
     private func activityDefinitionFindings(
@@ -220,12 +277,13 @@ public struct WorldPackageValidator: Sendable {
                 )
             }
             if case let .walk(destinationID) = definition.activity,
-               anchor.entryWaypointID != destinationID
+               let entryWaypointID = anchor.entryWaypointID,
+               entryWaypointID != destinationID
             {
                 findings.append(
                     .activityWalkDestinationMismatch(
                         activityID: activityID,
-                        entryWaypointID: anchor.entryWaypointID,
+                        entryWaypointID: entryWaypointID,
                         destinationWaypointID: destinationID
                     )
                 )

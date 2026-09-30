@@ -256,8 +256,11 @@ final class RecordedService: URLProtocol {
         let capturer = FrameCapturer(evidenceDirectory: evidenceDirectory)
         let worldID = manifest.worldID, resident = "isolated-delivery-resident"
         let coordinator = WishMachineCoordinator(store: store, directory: directory.appendingPathComponent("wishes"), canClaim: { job in
-            let p = context.snapshot.agentTransform.position, target = WishMachineScene.pickupPosition
-            let distance = simd_length(SIMD3(p.x,p.y,p.z) - target)
+            let p = context.snapshot.agentTransform.position
+            // 取物点 = 运行时注册出来的锚点（声明 × 摆放）；没注册出来就没有领取依据。
+            guard let target = context.propAnchorRegistry.entry(activityID: WishMachineScene.activityID)?.position
+            else { return nil }
+            let distance = simd_length(SIMD3(p.x,p.y,p.z) - SIMD3(target.x,target.y,target.z))
             return .init(worldID: worldID, activityID: context.snapshot.activeActivity?.id,
                 phase: context.snapshot.activeActivity?.phase.rawValue, distanceMeters: Double(distance),
                 outputAvailable: capturer.status == .ready(id: job.objectID))
@@ -567,8 +570,11 @@ final class RecordedService: URLProtocol {
         let capturer = FrameCapturer(evidenceDirectory: evidenceDirectory)
         let worldID = manifest.worldID, resident = "isolated-delivery-resident"
         let coordinator = WishMachineCoordinator(store: store, directory: stateDirectory.appendingPathComponent("wishes"), canClaim: { job in
-            let p = context.snapshot.agentTransform.position, target = WishMachineScene.pickupPosition
-            let distance = simd_length(SIMD3(p.x,p.y,p.z) - target)
+            let p = context.snapshot.agentTransform.position
+            // 取物点 = 运行时注册出来的锚点（声明 × 摆放）；没注册出来就没有领取依据。
+            guard let target = context.propAnchorRegistry.entry(activityID: WishMachineScene.activityID)?.position
+            else { return nil }
+            let distance = simd_length(SIMD3(p.x,p.y,p.z) - SIMD3(target.x,target.y,target.z))
             return .init(worldID: worldID, activityID: context.snapshot.activeActivity?.id,
                 phase: context.snapshot.activeActivity?.phase.rawValue, distanceMeters: Double(distance),
                 outputAvailable: capturer.status == .ready(id: job.objectID))

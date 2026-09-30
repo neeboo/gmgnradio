@@ -22,12 +22,47 @@ func marbleCabinPackageUsesGeneratedAssets() throws {
     #expect(manifest.resources.contains { $0.path == "scene-500k.spz" })
     #expect(manifest.resources.contains { $0.path == "collider.glb" })
     #expect(manifest.collisionVolumes.contains { $0.id == "collision.jukebox" })
+    // 三件家具的活动只声明**绑定**，几何在本体坐标系下的道具声明里（`prop.procedural`）。
     let music = try #require(manifest.activities.first { $0.id == "music.listen" })
-    let waypoint = try #require(manifest.waypoints.first { $0.id == music.entryWaypointID })
-    #expect(music.transform.position == waypoint.position)
+    #expect(music.entry == .functionPoint(propID: "prop.jukebox"))
+    #expect(music.entryWaypointID == nil && music.transform == nil,
+            "a function-point anchor carries no baked geometry at all")
+    let wish = try #require(manifest.activities.first { $0.id == "wish_machine.collect" })
+    #expect(wish.entry == .functionPoint(propID: "wish_machine.device"))
     #expect(manifest.activityDefinitions.first { $0.id == "music.listen" }?.activity.typeID == "listenMusic")
     let enterDuration = try #require(manifest.activityDefinitions.first { $0.id == "music.listen" }?.contract(for: .enter)?.durationSeconds)
     #expect(enterDuration > 0 && enterDuration < 3)
+
+    // 声明 × 种子摆放必须**逐位重现**旧的烘焙几何：`wp.jukebox` 就是锚点本身。
+    let sources = try marbleCabinFunctionSources(in: manifest, root: root)
+    let registry = try WorldPropAnchorRegistry.derive(sources: sources, objectStates: [:])
+    let anchor = try #require(registry.entry(activityID: "music.listen"))
+    let waypoint = try #require(manifest.waypoints.first { $0.id == "wp.jukebox" })
+    #expect(worldDistance(anchor.position.simd3, waypoint.position.simd3) < 0.001,
+            "the registered jukebox anchor must land exactly on the baked wp.jukebox waypoint")
+    // 朝向也是从声明派生出来的（`interact` 没写 yaw ⇒ 面向道具原点）：-π/2 就是
+    // 迁移前 `music.listen` 烘焙 rotation (0,-0.7071,0,0.7071) 换算出来的那一个 yaw。
+    // 断言这个数是为了证明"派生值 == 旧烘焙值"，不是在 App 里写死它。
+    #expect(abs(anchor.yaw - (-Float.pi / 2)) < 0.0001,
+            "derived facing \(anchor.yaw) must equal the migrated music.listen facing")
+}
+
+/// 世界包里每件 `prop.procedural` 的（声明 + 种子摆放）。
+private func marbleCabinFunctionSources(
+    in manifest: WorldManifest,
+    root: URL
+) throws -> [WorldPropFunctionSource] {
+    try manifest.resources
+        .filter { $0.kind == "prop.procedural" }
+        .sorted { $0.id < $1.id }
+        .map { resource in
+            let declaration = try JSONDecoder().decode(
+                WorldProceduralPropDeclaration.self,
+                from: Data(contentsOf: root.appendingPathComponent(resource.path))
+            )
+            #expect(declaration.objectID == resource.id)
+            return try #require(declaration.functionSource)
+        }
 }
 
 private struct MarbleCabinResourceConfiguration: Decodable {
@@ -67,9 +102,19 @@ func marbleCabinRealMeshSupportsAuthoredTour() throws {
     #expect(props.canOccupy(capsule, at: spawn))
 
     let graph = WaypointNavigationGraph(manifest: manifest)
-    let music = try #require(manifest.activities.first { $0.id == "music.listen" })
-    let path = try graph.route(from: spawn, to: music.entryWaypointID)
-    #expect(path.waypointIDs.last == music.entryWaypointID)
+    // 入口不再是 `manifest.activities` 上烘焙的 `entryWaypointID`：它由道具声明
+    // （`jukebox.json` 的 `interact` 局部点）× 种子摆放派生出来。派生值与烘焙的
+    // `wp.jukebox` 逐位相同，所以从这条路点走进去的几何仍然是同一条。
+    let registry = try WorldPropAnchorRegistry.derive(
+        sources: try marbleCabinFunctionSources(in: manifest, root: root),
+        objectStates: [:]
+    )
+    let entryAnchor = try #require(registry.entry(activityID: "music.listen"))
+    let entryWaypoint = try #require(manifest.waypoints.first {
+        $0.enabled && worldDistance($0.position.simd3, entryAnchor.position.simd3) <= 0.01
+    }?.id)
+    let path = try graph.route(from: spawn, to: entryWaypoint)
+    #expect(path.waypointIDs.last == entryWaypoint)
     #expect(!path.points.isEmpty)
     var previous = spawn
     for waypoint in path.points {
@@ -86,14 +131,14 @@ func marbleCabinRealMeshSupportsAuthoredTour() throws {
         }
         previous = destination
     }
-    #expect(worldDistance(previous, music.transform.position.simd3) < 0.01)
+    #expect(worldDistance(previous, entryAnchor.position.simd3) < 0.01)
 
     let jukebox = SIMD3(config.jukebox.position[0], config.jukebox.position[1], config.jukebox.position[2])
     let deviceCollision = try #require(manifest.collisionVolumes.first { $0.id == "collision.jukebox" })
     #expect(abs(deviceCollision.halfExtents.y * 2 - 1.23) < 0.001, "Independent equipment keeps its physical size")
-    #expect(abs(jukebox.x - music.transform.position.x - 0.7) < 0.001, "Interaction reach must not grow with the environment")
-    let musicGround = try #require(mesh.groundHeight(at: music.transform.position.simd3 + SIMD3(0, 0.05, 0)))
-    #expect(abs(musicGround - music.transform.position.y) < 0.01)
+    #expect(abs(jukebox.x - entryAnchor.position.x - 0.7) < 0.001, "Interaction reach must not grow with the environment")
+    let musicGround = try #require(mesh.groundHeight(at: entryAnchor.position.simd3 + SIMD3(0, 0.05, 0)))
+    #expect(abs(musicGround - entryAnchor.position.y) < 0.01)
     #expect(!props.canOccupy(capsule, at: jukebox))
     let deviceGround = try #require(mesh.groundHeight(at: jukebox + SIMD3(0, 0.05, 0)))
     #expect(abs(deviceGround - jukebox.y) < 0.01)

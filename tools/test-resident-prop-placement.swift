@@ -66,9 +66,12 @@ let flatWorld=FlatSupport(minimumX:-1,maximumX:5.5,minimumZ:-1,maximumZ:10,heigh
  let map=WorldPlacementRouteMap(grid:grid,lowerHeight:lowest-0.2,upperHeight:highest+0.2)
  var positions:[String:WorldVector3]=[:]
  for activity in manifest.activities {
-   guard let waypoint=manifest.waypoints.first(where:{ $0.id==activity.entryWaypointID && $0.enabled }),
+   // 道具功能点锚点不受这里的烘焙几何支配（服务会从候选状态派生并合并），
+   // 缺 `entryWaypointID` 时跳过不是放宽：它本来就没有烘焙入口。
+   guard let entryWaypointID=activity.entryWaypointID else { continue }
+   guard let waypoint=manifest.waypoints.first(where:{ $0.id==entryWaypointID && $0.enabled }),
          usable(waypoint.position) else { return nil }
-   positions[activity.entryWaypointID]=waypoint.position
+   positions[entryWaypointID]=waypoint.position
  }
  guard !positions.isEmpty else { return nil }
  return .init(map:map,anchorIDs:positions.keys.sorted(),anchorPositions:positions)

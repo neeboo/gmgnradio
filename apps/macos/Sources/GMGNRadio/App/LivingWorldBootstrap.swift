@@ -488,6 +488,45 @@ enum LivingWorldBootstrap {
         }
     }
 
+    /// 世界包里**一件**道具的 `prop.procedural` 声明。读不出/非法 = `nil`（绝不猜）。
+    static func proceduralDeclaration(
+        id: String,
+        in package: BundledLivingWorldPackage,
+        fileManager: FileManager = .default
+    ) -> WorldProceduralPropDeclaration? {
+        guard let resource = package.manifest.resources.first(where: { $0.id == id }),
+              resource.kind == "prop.procedural" else { return nil }
+        let url = package.packageRoot.appendingPathComponent(resource.path)
+        guard fileManager.fileExists(atPath: url.path),
+              let data = try? Data(contentsOf: url),
+              let declaration = try? JSONDecoder().decode(
+                  WorldProceduralPropDeclaration.self, from: data
+              ),
+              declaration.objectID == id
+        else { return nil }
+        return declaration
+    }
+
+    /// 世界包里 `prop.procedural` 道具的**功能点来源**（声明 + 种子摆放）。
+    ///
+    /// 读不出 / 非法 = 这件道具没有功能点（跳过），**绝不猜坐标**。装载期由
+    /// `WorldPackageValidator` 的 `missingFunctionPointDeclaration` 拦下
+    /// "活动绑了一件声明不出来的道具"，所以这里静默跳过不会造成"活动悄悄没有锚点"。
+    ///
+    /// 排序固定：注册表的派生顺序必须确定（同一份包 ⇒ 同一份锚点）。
+    static func propFunctionSources(
+        in package: BundledLivingWorldPackage,
+        fileManager: FileManager = .default
+    ) -> [WorldPropFunctionSource] {
+        package.manifest.resources
+            .filter { $0.kind == "prop.procedural" }
+            .sorted { $0.id < $1.id }
+            .compactMap { resource -> WorldPropFunctionSource? in
+                proceduralDeclaration(id: resource.id, in: package, fileManager: fileManager)?
+                    .functionSource
+            }
+    }
+
     @MainActor
     static func makeContext(
         package: BundledLivingWorldPackage,
@@ -500,11 +539,16 @@ enum LivingWorldBootstrap {
             fileManager: fileManager,
             applicationSupportBase: applicationSupportBase
         )
+        // 许愿机的视觉放置与取物/出货点也来自声明：App 里不再有第二份数字。
+        WishMachineScene.install(
+            proceduralDeclaration(id: WishMachineScene.propID, in: package, fileManager: fileManager)
+        )
         return try WorldAgentContext(
             manifest: package.manifest,
             persistence: persistence,
             walkingSpeed: walkingSpeed ?? fallbackWalkingSpeed,
-            capsule: collisionCapsule(worldID: package.manifest.worldID)
+            capsule: collisionCapsule(worldID: package.manifest.worldID),
+            propFunctionSources: propFunctionSources(in: package, fileManager: fileManager)
         )
     }
 }

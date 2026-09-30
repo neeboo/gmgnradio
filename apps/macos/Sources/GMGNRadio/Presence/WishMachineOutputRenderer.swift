@@ -132,9 +132,14 @@ final class WishMachineOutputRenderer {
             try Task.checkCancellation()
             try WishMachineTexturePolicy.validateLoadedTextureCount(asset.textures.count, required: requiredTextureCount)
             guard !asset.drawCalls.isEmpty else { throw WishMachineOutputError.invalidAsset }
+            // 出货口来自世界包声明（`outlet` 功能点）。声明缺失 ⇒ 没有出货口 ⇒ 不渲染，
+            // 而不是退回到一组写死的坐标。
+            guard let outlet = WishMachineScene.outletPosition else {
+                throw WishMachineOutputError.renderUnavailable
+            }
             let transform = try WishMachineOutputPlacement.transform(
                 minimum: asset.worldBounds.min, maximum: asset.worldBounds.max,
-                targetHeight: output.targetHeightMeters, outlet: WishMachineScene.outletPosition
+                targetHeight: output.targetHeightMeters, outlet: outlet
             )
             let calls = asset.drawCalls.map { GLTFDrawCall(mesh: $0.mesh, material: $0.material, modelMatrix: transform * $0.modelMatrix, skinPalette: $0.skinPalette) }
             let renderer = try GLTFRenderer(device: device)

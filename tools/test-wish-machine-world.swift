@@ -36,7 +36,7 @@ func check(_ value: Bool, _ message: String) { if !value { print("FAIL:", messag
         guard let anchor = manifest.activities.first(where: { $0.id == "wish_machine.collect" }) else {
             check(false, "wish_machine.collect is missing from the actual bundled world"); return
         }
-        check(anchor.entryWaypointID == "wish_machine.pickup", "pickup waypoint contract")
+        check(anchor.entry == .functionPoint(propID: "wish_machine.device"), "the machine's anchor is a prop function point, not baked geometry")
         check(anchor.propIDs == ["wish_machine.device"], "machine prop contract")
         guard let resource = manifest.resources.first(where: { $0.id == "wish_machine.device" }) else {
             check(false, "machine resource exists"); return
@@ -46,13 +46,33 @@ func check(_ value: Bool, _ message: String) { if !value { print("FAIL:", messag
         let authored = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: "authoring/worlds/marble-living-cabin/layout.json"))) as! [String:Any]
         let configJSON = try JSONSerialization.jsonObject(with: resourceBytes) as! [String:Any]
         let authoredWish = authored["wishMachine"] as! [String:Any]
-        for key in ["position","pickupPosition","size","outletPosition"] {
-            check((authoredWish[key] as! [NSNumber]) == (configJSON[key] as! [NSNumber]), "authoring and bundled machine agree: \(key)")
+        for key in ["position","size","functionPoints"] {
+            let a = try JSONSerialization.data(withJSONObject: authoredWish[key]!, options: [.sortedKeys])
+            let b = try JSONSerialization.data(withJSONObject: configJSON[key]!, options: [.sortedKeys])
+            check(a == b, "authoring and bundled machine agree: \(key)")
+        }
+        // 声明是几何的**唯一**来源：锚点由它 × 摆放派生。
+        let declaration = try JSONDecoder().decode(WorldProceduralPropDeclaration.self, from: resourceBytes)
+        // 与 App 同口径：**每一件** `prop.procedural` 都是声明来源（音箱的活动也一样）。
+        let sources: [WorldPropFunctionSource] = try manifest.resources
+            .filter { $0.kind == "prop.procedural" }
+            .sorted { $0.id < $1.id }
+            .compactMap { resource in
+                try JSONDecoder().decode(
+                    WorldProceduralPropDeclaration.self,
+                    from: Data(contentsOf: root.appendingPathComponent(resource.path))
+                ).functionSource
+            }
+        let registry = try WorldPropAnchorRegistry.derive(sources: sources, objectStates: [:])
+        guard let pickupAnchor = registry.entry(activityID: "wish_machine.collect") else {
+            check(false, "the machine declaration must register a pickup entry"); return
         }
         let physics = Physics(environment: environment, props: CollisionVolumeWorld(volumes: manifest.collisionVolumes))
-        let a = anchor.transform.position
+        let a = pickupAnchor.position
         check(physics.canOccupy(capsule, at: SIMD3(a.x,a.y,a.z)), "pickup point is occupiable")
-        let context = try WorldAgentContext(manifest: manifest, startedAt: Date(timeIntervalSince1970: 1000))
+        WishMachineScene.install(declaration)
+        let context = try WorldAgentContext(manifest: manifest, startedAt: Date(timeIntervalSince1970: 1000),
+                                           propFunctionSources: sources)
         _ = try context.installCollisionWorldAndReconcilePlacement(physics)
         try context.startActivity(id: "wish_machine.collect")
         for _ in 0..<900 {
@@ -61,7 +81,7 @@ func check(_ value: Bool, _ message: String) { if !value { print("FAIL:", messag
         }
         check(context.snapshot.activeActivity?.id == "wish_machine.collect" && context.snapshot.activeActivity?.phase == .loop, "resident reaches pickup loop against actual collider")
         let p = context.snapshot.agentTransform.position
-        let target = anchor.transform.position
+        let target = pickupAnchor.position
         check(hypot(p.x-target.x,p.z-target.z) <= 0.25, "arrival within collection distance")
         check(!physics.canOccupy(capsule, at: SIMD3(0.8,-0.018,-2.6)), "machine blocks resident")
         check(WishMachineScene.shouldDisplay(worldID: manifest.worldID, drawsWorld: true), "machine visible in cabin")
@@ -69,16 +89,19 @@ func check(_ value: Bool, _ message: String) { if !value { print("FAIL:", messag
         check(!WishMachineScene.shouldDisplay(worldID: "other-world", drawsWorld: true), "machine hidden from other worlds")
         let propsRoot = SCNNode()
         propsRoot.name = "marble-interactive-props"
-        let node = WishMachineScene.reconcileMachineNode(
+        let node: SCNNode? = WishMachineScene.reconcileMachineNode(
             in: propsRoot,
             worldID: manifest.worldID,
             drawsWorld: true
         )
         check(node != nil, "full-stage cabin creates the machine whenever the props root exists")
         guard let node else { return }
-        check(node.name == anchor.propIDs.first, "scene and manifest share machine identity")
+        check(node.name == "wish_machine.device", "scene and manifest share machine identity")
         check(node.childNode(withName: "wish_machine.outlet", recursively: true) != nil, "physical outlet exists")
-        check(node.childNode(withName: "wish_machine.output_anchor", recursively: true)?.simdWorldPosition == WishMachineScene.outletPosition, "item bottom floats 25 cm above tray")
+        guard let outlet = WishMachineScene.outletPosition else {
+            check(false, "the installed declaration must yield an outlet function point"); return
+        }
+        check(node.childNode(withName: "wish_machine.output_anchor", recursively: true)?.simdWorldPosition == outlet, "item bottom floats 25 cm above tray")
         check(node.simdPosition == WishMachineScene.position, "machine placed in metre coordinates")
         check(node.childNode(withName: "wish_machine.header", recursively: true) == nil, "tray has no lid hiding generated item")
         check(node.childNode(withName: "wish_machine.back", recursively: true) == nil, "tray has no back wall")

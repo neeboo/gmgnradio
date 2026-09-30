@@ -1,5 +1,6 @@
 {
-  "id": "jukebox",
+  "id": "prop.jukebox",
+  "kind": "prop.procedural",
   "renderer": "builtin.jukebox",
   "position": [
     2,
@@ -8,5 +9,17 @@
   ],
   "yaw": 0,
   "activityID": "music.listen",
-  "effect": "player.resume"
+  "effect": "player.resume",
+  "functionPoints": [
+    {
+      "role": "interact",
+      "kind": "standingSpot",
+      "position": [
+        -0.7,
+        0.006824641,
+        0
+      ],
+      "activityID": "music.listen"
+    }
+  ]
 }

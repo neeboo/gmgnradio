@@ -96,10 +96,13 @@ struct Config: Decodable {
         let routeAnchorsByID: [String: WorldVector3] = { () -> [String: WorldVector3] in
             var result: [String: WorldVector3] = [:]
             for activity in manifest.activities {
-                guard let waypoint = manifest.waypoints.first(where: {
-                    $0.id == activity.entryWaypointID && $0.enabled
-                }) else { continue }
-                result[activity.entryWaypointID] = waypoint.position
+                // 道具功能点锚点（`entryWaypointID == nil`）的几何在运行时注册表里，
+                // 由摆放服务从候选状态派生后合并进来；本 harness 只喂世界固有锚点。
+                guard let entryWaypointID = activity.entryWaypointID,
+                      let waypoint = manifest.waypoints.first(where: {
+                          $0.id == entryWaypointID && $0.enabled
+                      }) else { continue }
+                result[entryWaypointID] = waypoint.position
             }
             return result
         }()

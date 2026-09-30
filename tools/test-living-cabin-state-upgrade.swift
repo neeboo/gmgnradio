@@ -43,6 +43,18 @@ func check(_ value: Bool, _ message: String) { if !value { print("FAIL:",message
         let manifestURL = URL(fileURLWithPath: "apps/macos/Resources/Worlds/marble-living-cabin/world.json")
         let data = try Data(contentsOf: manifestURL)
         let manifest = try JSONDecoder().decode(WorldManifest.self, from: data)
+        // 活动入口的几何来自道具声明（运行时注册）；上下文必须拿到这些声明，
+        // 否则 `wish_machine.collect` 只会在装载期通过校验、运行时却注册不出锚点。
+        let functionSources: [WorldPropFunctionSource] = try manifest.resources
+            .filter { $0.kind == "prop.procedural" }
+            .sorted { $0.id < $1.id }
+            .compactMap { resource in
+                try JSONDecoder().decode(
+                    WorldProceduralPropDeclaration.self,
+                    from: Data(contentsOf: manifestURL.deletingLastPathComponent()
+                        .appendingPathComponent(resource.path))
+                ).functionSource
+            }
         func url(_ version: String, package: String = "marble-living-cabin") throws -> URL {
             try LivingWorldBootstrap.stateFileURL(packageID: package, packageVersion: version, applicationSupportBase: base)
         }
@@ -85,12 +97,12 @@ func check(_ value: Bool, _ message: String) { if !value { print("FAIL:",message
         var foreign = saved; foreign.worldID = "foreign"
         try oldStore.save(foreign)
         do {
-            _ = try WorldAgentContext(manifest: manifest, persistence: persistence)
+            _ = try WorldAgentContext(manifest: manifest, persistence: persistence, propFunctionSources: functionSources)
             check(false,"foreign legacy state must not restore")
         } catch WorldAgentContextError.restoredWorldMismatch { }
         saved.agentTransform = WorldTransform(position: WorldVector3(x: 0.8,y: -0.018,z: -2.6), rotation: saved.agentTransform.rotation, scale: saved.agentTransform.scale)
         try oldStore.save(saved)
-        let context = try WorldAgentContext(manifest: manifest, persistence: persistence)
+        let context = try WorldAgentContext(manifest: manifest, persistence: persistence, propFunctionSources: functionSources)
         check(context.snapshot.activities.contains { $0.id == "wish_machine.collect" }, "new machine comes from current manifest while old object state survives")
         let packageRoot = manifestURL.deletingLastPathComponent()
         let config = try JSONDecoder().decode(Config.self, from: Data(contentsOf: packageRoot.appendingPathComponent("marble.json")))

@@ -5254,7 +5254,9 @@ final class AppDelegate:
               spatialStage.selectedWorldID == job.worldID,
               currentResidentWorldContext().sessionScope == job.residentScope else { return nil }
         let position = context.snapshot.agentTransform.position
-        let target = WishMachineScene.pickupPosition
+        // 取物点 = **运行时注册出来的锚点**（声明 × 摆放）。没注册出来就没有领取依据。
+        guard let target = context.propAnchorRegistry.entry(activityID: WishMachineScene.activityID)?.position
+        else { return nil }
         let dx = Double(position.x - target.x), dy = Double(position.y - target.y), dz = Double(position.z - target.z)
         let outputAvailable = spatialStage.wishMachineOutput?.id == job.objectID
             && spatialStage.wishMachineOutput?.worldID == job.worldID

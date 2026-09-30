@@ -1,5 +1,6 @@
 {
   "id": "wish_machine.device",
+  "kind": "prop.procedural",
   "renderer": "builtin.wish_machine",
   "position": [
     0.8,
@@ -7,21 +8,41 @@
     -2.6
   ],
   "yaw": 0,
-  "pickupPosition": [
-    0.8,
-    -0.037016094,
-    -3.55
-  ],
-  "pickupYaw": 3.141592653589793,
-  "outletPosition": [
-    0.8,
-    0.732,
-    -2.6
-  ],
   "size": [
     0.9,
     0.5,
     0.8
   ],
-  "activityID": "wish_machine.collect"
+  "activityID": "wish_machine.collect",
+  "functionPoints": [
+    {
+      "role": "pickup",
+      "kind": "standingSpot",
+      "position": [
+        0,
+        -0.019016094,
+        -0.95
+      ],
+      "yaw": 3.141592653589793,
+      "activityID": "wish_machine.collect"
+    },
+    {
+      "role": "outlet",
+      "kind": "emitter",
+      "position": [
+        0,
+        0.75,
+        0
+      ]
+    },
+    {
+      "role": "interact",
+      "kind": "interaction",
+      "position": [
+        0,
+        0.5,
+        -0.4
+      ]
+    }
+  ]
 }

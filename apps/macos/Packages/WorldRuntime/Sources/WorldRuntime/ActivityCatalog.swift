@@ -7,6 +7,9 @@ public enum ActivityCatalogError: Error, Equatable, Sendable {
     case missingDefinition(activityID: String)
     case orphanDefinition(activityID: String)
     case unsupportedAction(activityID: String, action: String)
+    /// 旧包适配器遇到了"道具功能点锚点"：它的几何只有运行时才存在，
+    /// 旧包（无 `activityDefinitions`）无从表达 ⇒ 拒绝。
+    case functionPointAnchorRequiresDefinition(activityID: String)
     case actionMismatch(
         activityID: String,
         anchorAction: String,
@@ -106,15 +109,24 @@ public struct ActivityCatalog: Sendable {
                 action: anchor.action
             )
         }
+        // 旧包（没有 `activityDefinitions`）只能表达世界固有锚点：它的执行契约完全由
+        // 烘焙几何决定。道具功能点锚点的几何是**运行时派生**的，旧包无从表达 ——
+        // 拒绝，而不是替它编一份契约。
+        guard let entryWaypointID = anchor.entryWaypointID,
+              let transform = anchor.transform else {
+            throw ActivityCatalogError.functionPointAnchorRequiresDefinition(
+                activityID: anchor.id
+            )
+        }
 
         let activity: LifeActivity
         switch action {
         case "idle":
             activity = .idle
         case "walk":
-            activity = .walk(destinationID: anchor.entryWaypointID)
+            activity = .walk(destinationID: entryWaypointID)
         case "turn":
-            activity = .turn(targetYaw: yaw(of: anchor.transform.rotation))
+            activity = .turn(targetYaw: yaw(of: transform.rotation))
         case "sit":
             activity = .sit(anchorID: anchor.id)
         case "gaze":

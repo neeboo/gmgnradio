@@ -18,6 +18,24 @@ const old = await readJSON('apps/macos/Resources/Worlds/living-pod-v1/world.json
 const point = ([x,y,z]) => ({x,y,z});
 const rotation = (yaw=0, pitch=0) => ({x:Math.sin(pitch/2)*Math.cos(yaw/2),y:Math.cos(pitch/2)*Math.sin(yaw/2),z:-Math.sin(pitch/2)*Math.sin(yaw/2),w:Math.cos(pitch/2)*Math.cos(yaw/2)});
 const transform = (position, yaw=0, pitch=0) => ({position:point(position),rotation:rotation(yaw,pitch),scale:{x:1,y:1,z:1}});
+// 道具功能点的几何只有一份：本体坐标系下的声明。导航路点是**导航数据**（由烘焙器写进
+// layout.navigation），所以构建期要断言"声明 × 摆放"与它的路点一致 —— 不一致就拒绝出包，
+// 两份数据没有悄悄分叉的空间。旋转式与运行时注册表（WorldPropAnchorRegistry.worldPosition）
+// 逐字相同：角色前方 -Z，yaw 只绕 +Y。
+const localToWorld = (local, position, yaw = 0) => {
+  const cosine = Math.cos(yaw), sine = Math.sin(yaw);
+  return [position[0] + cosine*local[0] + sine*local[2], position[1] + local[1], position[2] - sine*local[0] + cosine*local[2]];
+};
+const functionPoint = (declaration, role) => {
+  const point = (declaration.functionPoints ?? []).find(candidate => candidate.role === role);
+  if (!point) throw new Error(`Prop ${declaration.id ?? ''} declares no ${role} function point`);
+  return point;
+};
+const anchorDrift = (declaration, role, waypoint) => Math.hypot(
+  localToWorld(functionPoint(declaration, role).position, declaration.position, declaration.yaw)[0] - waypoint[0],
+  localToWorld(functionPoint(declaration, role).position, declaration.position, declaration.yaw)[1] - waypoint[1],
+  localToWorld(functionPoint(declaration, role).position, declaration.position, declaration.yaw)[2] - waypoint[2]);
+
 const positions = {'home.idle':layout.spawn.position,'home.walk':layout.walkPosition,'music.listen':layout.musicPosition};
 const waypointIDs = {'home.idle':'wp.spawn','home.walk':'wp.center','music.listen':'wp.jukebox'};
 const residentMotionIDs = ids => ids.filter(id => id.startsWith('gmgn.motion.bones.') || id === 'gmgn.motion.ardy-backflip' || id === 'listen.music');
@@ -28,15 +46,24 @@ const manifest = {
   collisionVolumes:layout.collisionVolumes,
   waypoints:Object.entries(positions).map(([id,p])=>({id:waypointIDs[id],position:point(p),arrivalRadius:0.2,enabled:true})),
   routes:[{id:'route.jukebox',waypointIDs:['wp.spawn','wp.center','wp.jukebox'],bidirectional:true,enabled:true}],
-  activities:old.activities.filter(a=>a.id in positions).map(a=>({...a,transform:transform(positions[a.id],a.id==='music.listen'?layout.musicYaw:layout.spawn.yaw),motionID:null,propIDs:a.id==='music.listen'?['prop.jukebox']:[]})),
+  activities:old.activities.filter(a=>a.id in positions).map(a=>a.id==='music.listen'
+    ? {id:'music.listen',action:'listenMusic',functionPoint:{propID:'prop.jukebox'},motionID:null,propIDs:['prop.jukebox'],interruptible:true}
+    : {...a,transform:transform(positions[a.id],layout.spawn.yaw),motionID:null,propIDs:[]}),
   activityDefinitions:old.activityDefinitions.filter(a=>a.id in positions).map(a=>({...a,phases:a.phases.map(p=>({...p,motionIDs:residentMotionIDs(p.motionIDs),...(a.id==='music.listen'?{durationSeconds:p.phase==='enter'?0.6:p.durationSeconds,propIDs:p.phase==='loop'?['prop.jukebox']:[]}:{} )}))})),
   cameras:[{id:'living.establishing',transform:transform(layout.camera.position,layout.camera.yaw,layout.camera.pitch),fieldOfViewDegrees:66,nearPlane:0.05,farPlane:250}],
   capabilities:['activity:home.idle','activity:home.walk','activity:music.listen','camera:living.establishing'], resources:[]
 };
-const wish = layout.wishMachine;
-manifest.waypoints.unshift({id:'wish_machine.pickup',position:point(wish.pickupPosition),arrivalRadius:0.2,enabled:true});
+const wish = layout.wishMachine, jukebox = layout.jukebox;
+const jukeboxDrift = anchorDrift(jukebox, 'interact', positions['music.listen']);
+if (!(jukeboxDrift <= 0.01)) throw new Error(`Jukebox interact function point drifted ${jukeboxDrift.toFixed(4)} m from wp.jukebox`);
+const bakedPickup = (layout.navigation?.source?.manualWaypoints ?? []).find(candidate => candidate.id === 'wish_machine.pickup');
+if (bakedPickup) {
+  const drift = anchorDrift(wish, 'pickup', [bakedPickup.position.x, bakedPickup.position.y, bakedPickup.position.z]);
+  if (!(drift <= 0.01)) throw new Error(`Wish machine pickup function point drifted ${drift.toFixed(4)} m from its baked navigation waypoint`);
+}
+manifest.waypoints.unshift(bakedPickup ?? {id:'wish_machine.pickup',position:point(localToWorld(functionPoint(wish,'pickup').position,wish.position,wish.yaw)),arrivalRadius:0.2,enabled:true});
 manifest.routes.unshift({id:'wish_machine.route',waypointIDs:['wp.spawn','wp.center','wish_machine.pickup'],bidirectional:true,enabled:true});
-manifest.activities.unshift({id:'wish_machine.collect',action:'interact',entryWaypointID:'wish_machine.pickup',transform:transform(wish.pickupPosition,wish.pickupYaw),motionID:null,propIDs:['wish_machine.device'],interruptible:true});
+manifest.activities.unshift({id:'wish_machine.collect',action:'interact',functionPoint:{propID:'wish_machine.device'},motionID:null,propIDs:['wish_machine.device'],interruptible:true});
 manifest.activityDefinitions.unshift({
   id:'wish_machine.collect',displayName:'到许愿机出料口等候领取（到位后调用领取工具）',
   activity:{type:'interact',anchorID:'wish_machine.collect'},
@@ -88,8 +115,9 @@ const writeResource=async (file,data,kind,id)=>{
   await writeFile(join(destination,file),bytes);
   manifest.resources.push({id,path:file,kind,sha256:createHash('sha256').update(bytes).digest('hex')});
 };
-await writeResource('marble.json',{world,framing:layout.framing,camera:layout.camera,jukebox:layout.jukebox},'scene.configuration','scene.configuration');
-await writeResource('jukebox.json',{id:'jukebox',renderer:'builtin.jukebox',position:layout.jukebox.position,yaw:layout.jukebox.yaw,activityID:'music.listen',effect:'player.resume'},'prop.procedural','prop.jukebox');
-await writeResource('wish-machine.json',{id:'wish_machine.device',renderer:'builtin.wish_machine',...wish,activityID:'wish_machine.collect'},'prop.procedural','wish_machine.device');
+// 场景配置只留视觉放置：功能点**不进** marble.json，避免同一件事有第二份真相。
+await writeResource('marble.json',{world,framing:layout.framing,camera:layout.camera,jukebox:{position:jukebox.position,yaw:jukebox.yaw}},'scene.configuration','scene.configuration');
+await writeResource('jukebox.json',{id:'prop.jukebox',kind:'prop.procedural',renderer:'builtin.jukebox',position:jukebox.position,yaw:jukebox.yaw,activityID:'music.listen',effect:'player.resume',functionPoints:jukebox.functionPoints},'prop.procedural','prop.jukebox');
+await writeResource('wish-machine.json',{id:'wish_machine.device',kind:'prop.procedural',renderer:'builtin.wish_machine',position:wish.position,yaw:wish.yaw,size:wish.size,activityID:'wish_machine.collect',functionPoints:wish.functionPoints},'prop.procedural','wish_machine.device');
 await writeFile(join(destination,'world.json'),JSON.stringify(manifest,null,2)+'\n');
 console.log(JSON.stringify({worldID,destination,resources:manifest.resources.length,activities:manifest.activities.map(a=>a.id)},null,2));

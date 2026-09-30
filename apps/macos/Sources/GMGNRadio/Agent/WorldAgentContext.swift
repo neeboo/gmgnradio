@@ -1,4 +1,5 @@
 import Foundation
+import os
 import WorldRuntime
 
 enum WorldAgentContextError: Error, Equatable {
@@ -97,10 +98,24 @@ final class WorldAgentContext {
         let entryWaypointID: String
         let approachPoint: WorldVector3?
         let targetYaw: Float
+        /// 非 `nil` = 这件活动的入口是**运行时注册的道具功能点锚点**（不是绑定能力模板）。
+        /// 移动/收回时靠它判断"锚点是不是从居民脚下移走了"。
+        let functionPointAnchorID: String?
+        let functionPointPosition: WorldVector3?
+
+        var isFunctionPoint: Bool { functionPointAnchorID != nil }
     }
 
     private var propActivities: [String: PropActivity] = [:]
     private var combinedActivityCatalog: ActivityCatalog?
+    /// 世界包/资产声明的道具功能点来源。**锚点不落盘**：每次布局变化都从
+    /// （声明 × 摆放）重新派生。
+    let propFunctionSources: [WorldPropFunctionSource]
+    /// 当前已注册出来的道具功能点世界锚点。纯值、每次重建、永不落盘。
+    private(set) var propAnchorRegistry: WorldPropAnchorRegistry = .empty
+    /// 最近一次派生失败的原因（诊断用）。派生失败时**保留旧注册表**，
+    /// 绝不发布半注册状态。
+    private(set) var propAnchorRegistryFault: WorldPropAnchorError?
 
     var activityCatalog: ActivityCatalog {
         combinedActivityCatalog ?? authoredActivityCatalog
@@ -140,9 +155,11 @@ final class WorldAgentContext {
         persistence: (any WorldStatePersisting)? = nil,
         walkingSpeed: Float = 1.2,
         capsule: WorldCapsule = WorldCapsule(radius: 0.2, height: 1.8),
-        maximumStepHeight: Float = 0.3
+        maximumStepHeight: Float = 0.3,
+        propFunctionSources: [WorldPropFunctionSource] = []
     ) throws {
         self.manifest = manifest
+        self.propFunctionSources = propFunctionSources
         navigationGraph = WaypointNavigationGraph(manifest: manifest)
         baseCollisionWorld = CollisionVolumeWorld(manifest: manifest)
         collisionWorld = ReplaceableCollisionWorld(
@@ -239,8 +256,11 @@ final class WorldAgentContext {
         }
     }
 
-    /// Resolves an activity against bound prop capabilities first, then the
-    /// authored manifest. Prop activities own their operation spot and facing.
+    /// Resolves an activity against **registered prop function-point anchors**
+    /// first, then bound prop capabilities, then the authored manifest.
+    ///
+    /// 「活动规划只认注册出来的锚点」：道具功能点锚点的几何只有注册表知道，
+    /// `manifest.activities` 那一行**不含**任何几何（见 `WorldActivityEntry`）。
     private func resolvedActivityPlan(
         activityID: String
     ) -> (definition: LifeActivityDefinition, entryWaypointID: String,
@@ -252,10 +272,15 @@ final class WorldAgentContext {
         guard let definition = authoredActivityCatalog.definition(id: activityID),
               let anchor = manifest.activities.first(where: { $0.id == activityID })
         else { return nil }
-        return (definition, anchor.entryWaypointID, nil, Self.yaw(of: anchor.transform.rotation))
+        // 世界固有锚点：几何随世界烘焙。道具功能点锚点在 `propActivities` 里，
+        // 走不到这一行 —— 不注册就**没有**锚点，绝不回退到任何烘焙值。
+        guard let entryWaypointID = anchor.entryWaypointID,
+              let transform = anchor.transform else { return nil }
+        return (definition, entryWaypointID, nil, Self.yaw(of: transform.rotation))
     }
 
     private func rebuildPropActivities() {
+        rebuildPropAnchorRegistry()
         var rebuilt: [String: PropActivity] = [:]
         for (objectID, item) in simulation.state.objectStates {
             guard item.isEnabled,
@@ -281,15 +306,90 @@ final class WorldAgentContext {
                 templateID: capability.templateID,
                 entryWaypointID: entry.waypointID,
                 approachPoint: entry.approachPoint,
-                targetYaw: yaw
+                targetYaw: yaw,
+                functionPointAnchorID: nil,
+                functionPointPosition: nil
             )
             rebuilt[activity.definition.id] = activity
+        }
+        for activityID in propAnchorRegistry.registeredActivityIDs {
+            guard let anchor = propAnchorRegistry.entry(activityID: activityID),
+                  let definition = authoredActivityCatalog.definition(id: activityID),
+                  let entry = resolvedFunctionPointSpot(anchor: anchor, in: collisionWorld)
+            else { continue }
+            rebuilt[activityID] = PropActivity(
+                definition: definition,
+                objectID: anchor.objectID,
+                templateID: activityID,
+                entryWaypointID: entry.waypointID,
+                approachPoint: entry.approachPoint,
+                targetYaw: anchor.yaw,
+                functionPointAnchorID: anchor.id,
+                functionPointPosition: anchor.position
+            )
         }
         propActivities = rebuilt
         combinedActivityCatalog = try? ActivityCatalog(
             definitions: authoredActivityCatalog.definitions + rebuilt.values.map(\.definition)
         )
     }
+
+    /// 从（声明 × 摆放）重新派生注册表。
+    ///
+    /// 派生失败 ⇒ **保留旧注册表**并记下原因：注册表是纯值，失败时旧值仍然完整可用，
+    /// 所以不可能出现"一半锚点是新的一半是旧的"。这是移动/收回/换世界/加载存档
+    /// 共用的同一条回滚语义。
+    private func rebuildPropAnchorRegistry() {
+        do {
+            propAnchorRegistry = try WorldPropAnchorRegistry.derive(
+                sources: propFunctionSources,
+                objectStates: simulation.state.objectStates
+            )
+            propAnchorRegistryFault = nil
+        } catch let error as WorldPropAnchorError {
+            propAnchorRegistryFault = error
+            Self.log.error("道具功能点注册失败，保留上一份注册表：\(String(describing: error), privacy: .public)")
+        } catch {
+            Self.log.error("道具功能点注册失败：\(String(describing: error), privacy: .public)")
+        }
+    }
+
+    /// 把一个**已注册的功能点锚点**落成可走的落点：先找落在锚点上的路点
+    /// （世界包烘焙时 `wp.jukebox` / `wish_machine.pickup` 就是锚点本身，于是
+    /// 种子摆放下的路线与旧行为逐字一致），找不到就退到"最近的可站立路点 + 一段
+    /// 经过碰撞校验的最后接近"。两者都不成立 = 这件道具的活动**不可用**。
+    private func resolvedFunctionPointSpot(
+        anchor: WorldPropFunctionAnchor,
+        in world: any WorldCollisionQuerying
+    ) -> (waypointID: String, approachPoint: WorldVector3?, standPoint: WorldVector3)? {
+        func occupiable(_ position: WorldVector3) -> WorldVector3? {
+            groundedPosition(position, in: world)
+        }
+        guard let standPoint = occupiable(anchor.position) else { return nil }
+        if let exact = manifest.waypoints.first(where: { waypoint in
+            guard waypoint.enabled else { return false }
+            let dx = waypoint.position.x - anchor.position.x
+            let dy = waypoint.position.y - anchor.position.y
+            let dz = waypoint.position.z - anchor.position.z
+            return (dx * dx + dy * dy + dz * dz) <= 0.0001
+        }) {
+            return (exact.id, nil, standPoint)
+        }
+        for waypoint in WorldPropActivityTemplate.operationAnchorCandidates(
+            propCenter: WorldVector3(x: anchor.position.x, y: anchor.position.y, z: anchor.position.z),
+            waypoints: manifest.waypoints,
+            canStand: { occupiable($0) != nil }
+        ) {
+            guard world.canTraverse(
+                capsule, from: waypoint.position.simd, to: standPoint.simd,
+                maximumStepHeight: maximumStepHeight
+            ) else { continue }
+            return (waypoint.id, standPoint, standPoint)
+        }
+        return nil
+    }
+
+    private static let log = Logger(subsystem: "gmgn.world", category: "prop-anchors")
 
     /// Resolves where the resident actually stands to operate the machine:
     /// the nearest standable anchor waypoint, and — when that waypoint lies
@@ -439,29 +539,47 @@ final class WorldAgentContext {
         var executorStopped = false
         if let activeID = state.activeActivity?.activityID,
            let active = propActivities[activeID] {
-            let placementChanged: Bool = {
-                guard let before = baseline.objectStates[active.objectID],
-                      let after = candidate.state.objectStates[active.objectID] else { return false }
-                return before.isEnabled != after.isEnabled || before.transform != after.transform
-            }()
-            var spotResolved: (waypointID: String, approachPoint: WorldVector3?, standPoint: WorldVector3)?
-            if !placementChanged, let item = candidate.state.objectStates[active.objectID],
-               let prop = item.generatedProp, item.isEnabled,
-               let capability = item.propCapability,
-               WorldPropActivityTemplate.supported[capability.templateID] != nil {
-                spotResolved = resolvedOperationSpot(
-                    propCenter: item.transform.position,
-                    propYaw: Self.yaw(of: item.transform.rotation),
-                    propHalfExtents: WorldVector3(
-                        x: prop.size.x / 2, y: prop.size.y / 2, z: prop.size.z / 2
-                    ),
-                    in: candidateCollision
+            if active.isFunctionPoint {
+                // 道具功能点锚点：新位置由**候选状态**派生。锚点移动了、消失了、
+                // 或者在新位置上站不住，正在跑的那一次就必须中止 —— 否则居民会继续
+                // 在一个已经不存在的入口上等回执。
+                let candidateRegistry = try? WorldPropAnchorRegistry.derive(
+                    sources: propFunctionSources, objectStates: candidate.state.objectStates
                 )
-            }
-            if placementChanged || spotResolved == nil {
-                _ = try candidate.cancelActivity(reason: "物件已收回或移动，使用中止",
-                    expectedRevision: candidate.state.revision)
-                executorStopped = true
+                let anchor = candidateRegistry?.anchor(id: active.functionPointAnchorID ?? "")
+                let spotResolved = anchor.flatMap {
+                    resolvedFunctionPointSpot(anchor: $0, in: candidateCollision)
+                }
+                if anchor?.position != active.functionPointPosition || spotResolved == nil {
+                    _ = try candidate.cancelActivity(reason: "物件已收回或移动，使用中止",
+                        expectedRevision: candidate.state.revision)
+                    executorStopped = true
+                }
+            } else {
+                let placementChanged: Bool = {
+                    guard let before = baseline.objectStates[active.objectID],
+                          let after = candidate.state.objectStates[active.objectID] else { return false }
+                    return before.isEnabled != after.isEnabled || before.transform != after.transform
+                }()
+                var spotResolved: (waypointID: String, approachPoint: WorldVector3?, standPoint: WorldVector3)?
+                if !placementChanged, let item = candidate.state.objectStates[active.objectID],
+                   let prop = item.generatedProp, item.isEnabled,
+                   let capability = item.propCapability,
+                   WorldPropActivityTemplate.supported[capability.templateID] != nil {
+                    spotResolved = resolvedOperationSpot(
+                        propCenter: item.transform.position,
+                        propYaw: Self.yaw(of: item.transform.rotation),
+                        propHalfExtents: WorldVector3(
+                            x: prop.size.x / 2, y: prop.size.y / 2, z: prop.size.z / 2
+                        ),
+                        in: candidateCollision
+                    )
+                }
+                if placementChanged || spotResolved == nil {
+                    _ = try candidate.cancelActivity(reason: "物件已收回或移动，使用中止",
+                        expectedRevision: candidate.state.revision)
+                    executorStopped = true
+                }
             }
         }
         try persistence?.save(candidate.state)
@@ -591,12 +709,15 @@ final class WorldAgentContext {
                     )
                 }
                 .sorted { $0.id < $1.id },
-            activities: (manifest.activities.map {
-                WorldAgentActivityOption(
-                    id: $0.id,
-                    action: $0.action,
-                    entryPlaceID: $0.entryWaypointID,
-                    interruptible: $0.interruptible
+            activities: (manifest.activities.compactMap { anchor -> WorldAgentActivityOption? in
+                // 道具功能点锚点**不在**这里出现：它们的几何来自运行时注册表，
+                // 由下面的 `propActivities` 提供。这里只出世界固有锚点。
+                guard let entryWaypointID = anchor.entryWaypointID else { return nil }
+                return WorldAgentActivityOption(
+                    id: anchor.id,
+                    action: anchor.action,
+                    entryPlaceID: entryWaypointID,
+                    interruptible: anchor.interruptible
                 )
             } + propActivities.values.map { propActivity in
                 WorldAgentActivityOption(

@@ -298,6 +298,28 @@ final class ResidentPropPlacementService {
             guard let support = support(), let constraint = support.routeConstraint else {
                 throw ResidentPropPlacementError.environmentNotReady
             }
+            // 锚点集合 = 世界固有锚点（随世界烘焙）+ **候选状态派生**出来的道具功能点锚点。
+            //
+            // 先试算、后提交：注册表从 `state`（候选）派生，所以判据看到的正是
+            // "这件道具摆上去之后真实存在的锚点"，包括它**自己**的 pickup/interact ——
+            // "移动之后居民还走得到新取物点吗"因此是同一条判据，而不是事后补一条。
+            //
+            // 派生失败（角色重复、两件道具抢同一个活动入口）⇒ 判据输入不成立 ⇒ 拒绝。
+            let candidateRegistry: WorldPropAnchorRegistry
+            do {
+                candidateRegistry = try WorldPropAnchorRegistry.derive(
+                    sources: context.propFunctionSources,
+                    objectStates: state.objectStates
+                )
+            } catch {
+                throw ResidentPropPlacementError.environmentNotReady
+            }
+            var anchorPositions = constraint.anchorPositions
+            for (id, position) in candidateRegistry.routeAnchorPositions {
+                anchorPositions[id] = position
+            }
+            var anchorIDSet = Set(constraint.anchorIDs)
+            anchorIDSet.formUnion(candidateRegistry.routeAnchorIDs)
             // 移动图上的障碍 = **房间里现在所有**带阻挡体积的物件（含这一件候选）。
             // 把既有的也算进来，判据就同时覆盖"新家具和旧家具合起来把路堵死"。
             var occupied: Set<Int> = []
@@ -313,8 +335,8 @@ final class ResidentPropPlacementService {
             }
             switch constraint.map.decision(
                 blockedNodes: occupied,
-                anchorIDs: constraint.anchorIDs,
-                anchorPositions: constraint.anchorPositions,
+                anchorIDs: anchorIDSet.sorted(),
+                anchorPositions: anchorPositions,
                 residentPosition: state.agentTransform.position
             ) {
             case .allowed:

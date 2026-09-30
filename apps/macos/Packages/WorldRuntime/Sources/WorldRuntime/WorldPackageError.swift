@@ -12,6 +12,11 @@ public enum WorldPackageError: Error, Equatable, Sendable {
         maximumDistance: Float
     )
     case missingActivityPropResource(activityID: String, resourceID: String)
+    /// 活动的 `functionPoint` 入口绑到了一件**不在同一行 `propIDs` 里**的道具。
+    case functionPointPropNotDeclared(activityID: String, propID: String)
+    /// 活动的 `functionPoint` 入口在包里找不到能把该活动绑成接近锚点的道具声明。
+    /// 运行时因此注册不出锚点 —— 装载期就拒绝，绝不留一个"没有锚点"的活动。
+    case missingFunctionPointDeclaration(activityID: String, propID: String)
     case missingActivityDefinition(activityID: String)
     case duplicateActivityDefinition(activityID: String)
     case orphanActivityDefinition(activityID: String)

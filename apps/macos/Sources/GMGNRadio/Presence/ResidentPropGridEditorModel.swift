@@ -166,11 +166,15 @@ import WorldRuntime
         return true
     }
 
-    /// 从活动锚点表推 `RouteConstraint`（收窄判据的全部输入）。
+    /// 从活动锚点表推 `RouteConstraint`（收窄判据的**世界固有**锚点部分）。
     ///
     /// 锚点 = `WorldActivityAnchor.entryWaypointID`：活动一律先走到它的入口路点，
     /// 所以"每个锚点都要能站、要走得到"就是居民真正需要的东西；639 个 `wp.auto.*`
     /// 只是中间路点，运行时本来就会绕路。
+    ///
+    /// **道具功能点锚点不在这里**：它们没有烘焙几何（`entryWaypointID == nil`），
+    /// 由摆放服务在判定时从**候选状态**派生出来并合并进来（`WorldPropAnchorRegistry`
+    /// 是唯一来源）。这里跳过它们不是放宽判据 —— 那个集合只会更全，不会更松。
     ///
     /// 拿不到地图、或锚点一个都对不上路点 ⇒ nil ⇒ 服务拒绝摆放（fail-closed）。
     func routeConstraint(activities: [WorldActivityAnchor],
@@ -178,16 +182,17 @@ import WorldRuntime
         guard let map = placementRouteMap() else { return nil }
         var positions: [String: WorldVector3] = [:]
         for activity in activities {
-            guard let waypoint = waypoints.first(where: {
-                $0.id == activity.entryWaypointID && $0.enabled
-            }) else { continue }
+            guard let entryWaypointID = activity.entryWaypointID,
+                  let waypoint = waypoints.first(where: {
+                      $0.id == entryWaypointID && $0.enabled
+                  }) else { continue }
             // 病态输入（非有限 / 离谱的世界坐标）一律当作"拿不到判据" ⇒ 拒绝摆放。
             // 绝不能把它们喂进移动图：列号换算会溢出，而"溢出"不是一条判据。
             guard Self.isUsableWorldPosition(waypoint.position) else {
-                Self.log.notice("摆放判据：锚点位置不可用 \(activity.entryWaypointID, privacy: .public)，按 fail-closed 处理")
+                Self.log.notice("摆放判据：锚点位置不可用 \(entryWaypointID, privacy: .public)，按 fail-closed 处理")
                 return nil
             }
-            positions[activity.entryWaypointID] = waypoint.position
+            positions[entryWaypointID] = waypoint.position
         }
         guard !positions.isEmpty else { return nil }
         return .init(map: map, anchorIDs: positions.keys.sorted(), anchorPositions: positions)
