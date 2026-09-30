@@ -1,5 +1,76 @@
 import Foundation
 
+/// 「这个胶囊能不能站在这个落点」——**唯一一份**几何实现。
+///
+/// 世界上有两个地方要回答"这里有没有东西"，而且**必须给出同一个答案**：
+///
+/// - `CollisionVolumeWorld.canOccupy`：居民真实移动/站立（`PropLayoutCollisionWorld`
+///   的底座就是它），也就是"已摆放的生成物件是不是世界障碍"这条运行时判据；
+/// - `WorldPlacementRouteMap.blockedNodes`：摆放时的"摆上去之后居民还走不走得到
+///   活动锚点"预检（格子红/黄与落地是否被拒都由它决定）。
+///
+/// 这两条曾经各有一套几何：运行时用物件的 **yaw OBB**（`generatedCollisionVolume` 的
+/// 真实旋转），预检用**未旋转**的半尺寸去扩世界轴的 AABB。真机 2026-09-30 那把
+/// yaw=90° 的斧头实测：预检只标了 11 个被占节点，而运行时的真值是 15 个 ——
+/// **9 个真被挡的节点没标（fail-open）、5 个没被挡的节点被标（假拒绝）**。
+///
+/// 所以判据收在这里：两个调用方都只能问 `isClear`，不可能再出现第二套几何。
+public enum WorldCapsuleClearance {
+    /// 胶囊（底座落在 `position`，竖直向上）与该体积**不相交**时返回 true。
+    ///
+    /// 表面接触算合法占用（与 `CollisionVolumeWorld` 原来的口径逐字一致）。
+    ///
+    /// 体积**无法表示**（尺寸非正/非有限、中心或四元数退化）时返回 **false**：
+    /// 元数据坏掉的物件不能被静默当成"这里没有东西"（fail-closed）。这条与
+    /// `PropPlacementEvaluator` 里"宁可多挡一件，也不因为元数据不一致漏挡"同向。
+    public static func isClear(
+        _ capsule: WorldCapsule,
+        at position: SIMD3<Float>,
+        of volume: WorldCollisionVolume
+    ) -> Bool {
+        guard capsule.isValid, position.isFinite else {
+            return false
+        }
+        guard let box = OrientedBox(volume) else {
+            return false
+        }
+
+        let bottom = position + SIMD3(0, capsule.radius, 0)
+        let top = position + SIMD3(0, capsule.height - capsule.radius, 0)
+        let localBottom = box.toLocal(bottom)
+        let localTop = box.toLocal(top)
+        let distanceSquared = segmentAABBDistanceSquared(
+            from: localBottom,
+            to: localTop,
+            halfExtents: box.halfExtents
+        )
+        return distanceSquared >= capsule.radius * capsule.radius - 0.000001
+    }
+
+    /// 体积在世界坐标下的半尺寸（把三个局部半轴旋转到世界后取分量绝对值之和）。
+    ///
+    /// 供"只扫物件真正覆盖的那几列"使用：调用方的代价因此只随物件自身尺寸增长，
+    /// 与房间大小、三角形数量无关。体积无法表示时返回 nil。
+    public static func worldHalfExtents(
+        of volume: WorldCollisionVolume
+    ) -> SIMD3<Float>? {
+        guard let box = OrientedBox(volume) else {
+            return nil
+        }
+        let x = box.rotation.rotating(SIMD3(1, 0, 0))
+        let y = box.rotation.rotating(SIMD3(0, 1, 0))
+        let z = box.rotation.rotating(SIMD3(0, 0, 1))
+        let halfExtents = box.halfExtents
+        var result = SIMD3<Float>.zero
+        for axis in 0 ..< 3 {
+            result[axis] = halfExtents.x * abs(x[axis])
+                + halfExtents.y * abs(y[axis])
+                + halfExtents.z * abs(z[axis])
+        }
+        return result.isFinite ? result : nil
+    }
+}
+
 public struct CollisionVolumeWorld: WorldCollisionQuerying {
     private let blockingVolumes: [WorldCollisionVolume]
 
@@ -15,30 +86,14 @@ public struct CollisionVolumeWorld: WorldCollisionQuerying {
         _ capsule: WorldCapsule,
         at position: SIMD3<Float>
     ) -> Bool {
+        // 判据委托给 `WorldCapsuleClearance`（唯一一份几何）：这里不再各写一遍
+        // 距离测试，否则"运行时"与"摆放预检"又会慢慢漂开。
         guard capsule.isValid, position.isFinite else {
             return false
         }
-
-        let bottom = position + SIMD3(0, capsule.radius, 0)
-        let top = position + SIMD3(0, capsule.height - capsule.radius, 0)
-        let radiusSquared = capsule.radius * capsule.radius
-
-        for volume in blockingVolumes {
-            guard let box = OrientedBox(volume) else {
-                continue
-            }
-            let localBottom = box.toLocal(bottom)
-            let localTop = box.toLocal(top)
-            let distanceSquared = segmentAABBDistanceSquared(
-                from: localBottom,
-                to: localTop,
-                halfExtents: box.halfExtents
-            )
-
-            // Surface contact is valid occupancy. Penetration is not.
-            if distanceSquared < radiusSquared - 0.000001 {
-                return false
-            }
+        for volume in blockingVolumes
+        where !WorldCapsuleClearance.isClear(capsule, at: position, of: volume) {
+            return false
         }
         return true
     }
@@ -60,7 +115,10 @@ public struct CollisionVolumeWorld: WorldCollisionQuerying {
 private struct OrientedBox {
     let center: SIMD3<Float>
     let halfExtents: SIMD3<Float>
+    /// 世界 → 局部的旋转（用于把胶囊端点搬进盒子坐标系）。
     let inverseRotation: NormalizedQuaternion
+    /// 局部 → 世界的旋转（用于把半轴搬进世界坐标算世界包围盒）。
+    let rotation: NormalizedQuaternion
 
     init?(_ volume: WorldCollisionVolume) {
         let center = volume.center.simd3
@@ -74,6 +132,7 @@ private struct OrientedBox {
 
         self.center = center
         self.halfExtents = halfExtents
+        self.rotation = rotation
         inverseRotation = rotation.conjugate
     }
 

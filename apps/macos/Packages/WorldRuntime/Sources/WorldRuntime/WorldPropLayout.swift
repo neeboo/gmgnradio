@@ -143,6 +143,63 @@ public extension WorldObjectState {
     }
 }
 
+/// 世界状态 → **世界障碍体积**的**唯一**一份换算。
+///
+/// 「已摆放的生成物件在世界里是障碍」这件事有两个消费者，它们的输入必须逐字相同：
+///
+/// - 运行时移动/站立（`WorldAgentContext` 的 `PropLayoutCollisionWorld` → 居民胶囊）；
+/// - 摆放时的"这里会不会挡人 / 挡住活动锚点"预检（`ResidentPropPlacementService`）。
+///
+/// 两边以前各自写 `state.objectStates.values.compactMap(\.generatedCollisionVolume)`：
+/// 同一份 `compactMap`，但**解不出体积的已摆物件被静默丢掉**（`compactMap` 的语义），
+/// 于是"元数据坏掉的物件"在两个判据里都变成"这里没有东西"——一件看不见、也挡不住的
+/// 家具。那正是这个项目反复踩的坑：**判定只能有一条，而且缺失必须可见**。
+///
+/// 所以这里把"哪些物件有体积、哪些解不出来"一次性说清楚：
+/// - `volumes`：全部可用的阻挡体积（运行时与摆放预检共用）；
+/// - `unmodelledObjectIDs`：`isEnabled == true` 却解不出体积的物件编号。调用方**必须**
+///   把它当成"判据不完整"来处理（拒绝并报告），不得当作"无障碍"继续。
+public enum WorldLayoutObstacles {
+    public struct Resolution: Equatable, Sendable {
+        public let volumes: [WorldCollisionVolume]
+        /// 已摆出（`isEnabled`）却解不出碰撞体积的物件编号，字典序。
+        public let unmodelledObjectIDs: [String]
+
+        public init(volumes: [WorldCollisionVolume], unmodelledObjectIDs: [String]) {
+            self.volumes = volumes
+            self.unmodelledObjectIDs = unmodelledObjectIDs
+        }
+    }
+
+    /// 已摆出的物件（含**手持物件的原放回位置**）+ 它们的阻挡体积。
+    ///
+    /// 手持中的物件在状态里是 `isEnabled == false`（它现在在居民手上），但它**注定要
+    /// 放回** `heldProp.returnState` 那个位置 —— 摆放判据必须把那个位置按"已经有东西"
+    /// 处理，否则用户可以在居民手里那件物件的放回点上再摆一件，一放回就互相穿模。
+    /// 运行时移动判据不需要这一条（那个位置此刻真的什么都没有），但体积来源仍是这一份。
+    public static func resolve(_ state: WorldState) -> Resolution {
+        var volumes: [WorldCollisionVolume] = []
+        var unmodelled: [String] = []
+        for (id, item) in state.objectStates {
+            guard item.isEnabled else { continue }
+            if let volume = item.generatedCollisionVolume {
+                volumes.append(volume)
+            } else if item.generatedProp == nil {
+                // `isEnabled` + 解析不出 `generatedProp`：元数据坏了（不认识/尺寸非法）。
+                unmodelled.append(id)
+            }
+        }
+        if let held = state.heldProp, held.returnState.isEnabled,
+           let volume = held.returnState.generatedCollisionVolume {
+            volumes.append(volume)
+        }
+        return Resolution(
+            volumes: volumes.sorted { $0.id < $1.id },
+            unmodelledObjectIDs: unmodelled.sorted()
+        )
+    }
+}
+
 extension WorldPropLayoutError: LocalizedError {
     public var errorDescription: String? {
         switch self {

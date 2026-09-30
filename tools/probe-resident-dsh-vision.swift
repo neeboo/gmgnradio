@@ -151,7 +151,7 @@ func writePNG(width: Int, height: Int, to url: URL, pixel: (Int, Int) -> (UInt8,
         check(ResidentDSHComposition.validateComposedConfig(diskText), "on-disk composition passes the whitelist validator")
         check(ResidentDSHComposition.declaresImageInput(diskText), "on-disk composition selects a model declaring image input")
         check(diskText.contains("provider: deepseek-official"), "composition locks the official provider route")
-        check(diskText.contains("model: deepseek-v4-flash-vision-exp"), "composition locks deepseek-v4-flash-vision-exp")
+        check(diskText.contains("model: deepseek-flash"), "composition locks the current multimodal model deepseek-flash")
         check(diskText.contains("@deepseek-ai/dsh-credentials-local"), "managed credential source is the only key path")
         check(diskText.contains("@deepseek-ai/dsh-attachment-local"), "attachment store is mounted for native image admission")
         // The official schema check happens at boot: the acp-demo loader
@@ -380,7 +380,7 @@ func writePNG(width: Int, height: Int, to url: URL, pixel: (Int, Int) -> (UInt8,
         let elapsed = Int(Date().timeIntervalSince(startedAt))
         print("== RECEIPT ==")
         print("result: PASS")
-        print("model: deepseek-v4-flash-vision-exp @ deepseek-official")
+        print("model: deepseek-flash @ deepseek-official")
         print("handshake: image=true (advertised at initialize, enforced by the production image gate)")
         print("transport: production ResidentDSHConnector through a transparent recording wrapper; probe-dedicated sandbox (the service default connector-factory path is not exercised by this probe)")
         print("session_id: \(realSessionID)")

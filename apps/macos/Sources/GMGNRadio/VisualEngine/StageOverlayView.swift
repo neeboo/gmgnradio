@@ -134,6 +134,36 @@ struct WishMachineTaskStatusView: View {
                                         Text(task.status).foregroundStyle(.white.opacity(0.75)).lineLimit(1)
                                     }
                                     .font(.system(size: 11, weight: .medium))
+                                    // 停止不是看不见的状态：任务行必须自己说"自主行动
+                                    // 已停止"，并给一个动作就能解除，而不是等用户猜一句
+                                    // 能让居民调用恢复工具的话。紧凑行（Live Cam）只留
+                                    // 状态文字，完整面板给出恢复控件。
+                                    if task.autoContinuationPaused {
+                                        if compact {
+                                            Text("自主行动已停止")
+                                                .font(.system(size: 9))
+                                                .foregroundStyle(.orange.opacity(0.95))
+                                                .lineLimit(1)
+                                        } else {
+                                            HStack(spacing: 6) {
+                                                Text("自主行动已停止")
+                                                    .font(.system(size: 10))
+                                                    .foregroundStyle(.orange.opacity(0.95))
+                                                    .lineLimit(1)
+                                                Button("恢复自动领取") {
+                                                    state.onResumeAutomaticContinuation?(task.id)
+                                                }
+                                                .buttonStyle(.plain)
+                                                .font(.system(size: 10, weight: .medium))
+                                                .foregroundStyle(.white)
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2)
+                                                .background(Color.white.opacity(0.16), in: Capsule())
+                                                .accessibilityIdentifier("resident.wish-task.\(task.id.uuidString).resume")
+                                                .disabled(state.onResumeAutomaticContinuation == nil)
+                                            }
+                                        }
+                                    }
                                     if !compact, let detail = task.detail, !detail.isEmpty {
                                         Text(detail)
                                             .font(.system(size: 10))

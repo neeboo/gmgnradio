@@ -3050,6 +3050,10 @@ final class AppDelegate:
                 self?.openSystemInbox()
             }
         )
+        // 面板上的"恢复自动领取"= 宿主的一个动作：任务级续办与 run 级停止一起解开。
+        stageWindowController?.setWishContinuationResumeHandler { [weak self] id in
+            self?.resumeWishAutomaticContinuation(id: id)
+        }
         // 建造模式：鼠标移动 → 格子拾取 → footprint 判定 → 整块着色。
         stageWindowController?.onResidentPropGridCursor = { [weak self] normalized in
             self?.residentPropGridHover(normalized: normalized)
@@ -3127,6 +3131,9 @@ final class AppDelegate:
             )
             liveCamWindowController.setSystemInboxHandler { [weak self] in
                 self?.openSystemInbox()
+            }
+            liveCamWindowController.setWishContinuationResumeHandler { [weak self] id in
+                self?.resumeWishAutomaticContinuation(id: id)
             }
             self.liveCamWindowController = liveCamWindowController
             publishResidentTranscript()
@@ -4488,6 +4495,57 @@ final class AppDelegate:
         }
     }
 
+    /// 已领产物是否已经在当前空间里真正摆好（宿主读回，不是模型声明）。
+    /// 领取后的续办必须凭这份读回决定能否恢复原摆放委托；同一个判据同时供
+    /// 工具租约（后台续办）与面板上的一次"恢复"使用。
+    private func residentWishPlacementAlreadyCompleted(_ job: WishMachineJob) -> Bool? {
+        guard let context = livingWorldContext, context.manifest.worldID == job.worldID,
+              let placedState = context.state.objectStates[job.objectID],
+              placedState.generatedProp != nil,
+              UUID(uuidString: placedState.generatedProp?.sourceWishID ?? "") == job.id else { return nil }
+        return placedState.isEnabled
+    }
+
+    /// 面板上的**一个动作**：恢复该许愿任务的自动续办，并解除"停止自主行动"。
+    /// 这是人类的一次明确操作——不是模型工具，也不需要用户说对任何一句话。
+    /// 它同时做两件语义各自独立的事，因为用户按下"恢复"就是这个意思：
+    ///   1) 任务级：持久恢复该许愿的自动续办，并授予**一次**可信续办事件
+    ///      （每次点击都用新的宿主授权；旧授权在再次停止后不可复用）；
+    ///   2) run 级：解除"停止自主"，否则续办事件只会排队而不会真正执行。
+    /// 它不新建生成任务、不替用户领取，也不代表后台获得任何新权限：领取与摆放
+    /// 仍由居民按本轮授权执行。
+    @discardableResult
+    private func resumeWishAutomaticContinuation(id: UUID) -> Bool {
+        guard let scope = residentWishScope, let loop = residentAgentLoop,
+              scope.loopID == ObjectIdentifier(loop) else {
+            // 一次操作不能"点了没反应"：接不上当前居民会话/许愿机空间时也要说清楚。
+            showResidentVoiceStatus("恢复自动领取失败：当前没有绑定到此空间的居民许愿会话，请重新进入该空间后再试。")
+            return false
+        }
+        // run 级解除先做：即使任务级恢复此刻被拒（例如任务已终态），"停止自主"
+        // 这个用户可见的状态也已经被这一个动作解开了。
+        loop.resumeAutonomyByUser()
+        do {
+            let existing = try wishMachineCoordinator.read(id: id, worldID: scope.worldID,
+                residentScope: scope.residentScope)
+            guard existing.autoContinuationPaused == true else {
+                synchronizeWishMachinePresentation()
+                return true
+            }
+            _ = try wishMachineCoordinator.resumeContinuations(id: id, worldID: scope.worldID,
+                residentScope: scope.residentScope, authorizationID: UUID(),
+                placementAlreadyCompleted: existing.stage == .claimed
+                    ? residentWishPlacementAlreadyCompleted(existing) : nil)
+        } catch {
+            showResidentVoiceStatus("恢复自动领取失败：\(error.localizedDescription)")
+            synchronizeWishMachinePresentation()
+            return false
+        }
+        synchronizeWishMachinePresentation()
+        Task { @MainActor [weak self] in await self?.refreshWishMachine() }
+        return true
+    }
+
     /// 居民自身真实状态快照：来自当前 WorldAgentContext 与角色运行时，
     /// 由宿主在工具调用时注入，模型不能从记忆生成或修改。
     private func residentSelfState() -> ResidentSelfState? {
@@ -4746,6 +4804,11 @@ final class AppDelegate:
         var notices: [String] = []
         let queuedCount = loop?.pendingUserMessages.count ?? 0
         if queuedCount > 0 { notices.append("\(queuedCount) 条消息排队中。") }
+        // "停止"必须看得见：它在界面上不是隐形状态。这里说明停止只停自主续办，
+        // 并给出解除路径（许愿任务行的"恢复自动领取"，或设置里切换一次自主生活）。
+        if loop?.isAutonomyPausedByUser == true {
+            notices.append("自主行动已停止：后台不会自行续办、自行领取或摆放；直接下达指令仍会执行。点许愿任务行的「恢复自动领取」，或在设置里切换一次「允许居民自主安排活动」，即可解除。")
+        }
         // 交付未确认只在用户尚未接手时提示：用户下次发送/停止/换空间后旧提示不再
         // 显示；模型上下文里的 unconfirmedUserMessages 不变，仍避免重复执行。
         let pendingUnconfirmed = residentUnconfirmedNotice.pending(
@@ -4794,6 +4857,12 @@ final class AppDelegate:
     }
 
     @objc private func residentAutonomyDidChange(_ notification: Notification) {
+        // 用户在设置里重新打开"允许居民自主安排活动"就是一次明确的人类操作：
+        // 它必须真的解开此前的"停止自主行动"。停止不是永久契约，也不该要求
+        // 用户猜一句能让居民调用 update_resident_intent 的话。
+        if UserDefaults.standard.bool(forKey: "resident.autonomous.enabled.v1") {
+            residentAgentLoop?.resumeAutonomyByUser()
+        }
         refreshResidentAutonomy()
     }
 
@@ -4973,7 +5042,13 @@ final class AppDelegate:
         }
     }
 
+    /// `humanOrderedClaim` 是"本轮是否载有人类明确指令"的**实时**判据（不是建租约
+    /// 时的一次快照）：后台 run 被人类引导接手后，本轮就是奉命轮，人类当轮的
+    /// 明确领取必须能执行。`allowsPausedWishClaim` 仍只描述"这一轮是不是由人类
+    /// 输入发起的"——它决定本轮能否**恢复**任务级自动续办（人类明确要求恢复的
+    /// 那一轮才给恢复授权），恢复与领取是两件事。
     private func makeResidentWorldTools(messageID: UUID, wishAuthorizationID: UUID? = nil, allowsPausedWishClaim: Bool = false,
+                                       humanOrderedClaim: @escaping @MainActor () -> Bool = { false },
                                        allowsPropMutation: Bool = false) -> ResidentConversationTools? {
         guard AgentConversationService.shared.supportsWorldTools,
               let context = livingWorldContext,
@@ -5027,14 +5102,12 @@ final class AppDelegate:
         let wishTools = worldID == WishMachineScene.worldID
             ? ResidentWishMachineTools(coordinator: wishMachineCoordinator, worldID: worldID,
                 residentScope: currentResidentWorldContext().sessionScope,
-                authorizationID: wishAuthorizationID, isCurrent: isCurrent, allowPausedClaim: allowsPausedWishClaim,
+                authorizationID: wishAuthorizationID, isCurrent: isCurrent, humanOrderedClaim: humanOrderedClaim,
                 continuationResumeAuthorizationID: allowsPausedWishClaim ? messageID : nil,
-                resumePlacementStatus: { [weak context] job in
-                    guard isCurrent(), let context,
-                          let placedState = context.state.objectStates[job.objectID],
-                          placedState.generatedProp != nil,
-                          UUID(uuidString: placedState.generatedProp?.sourceWishID ?? "") == job.id else { return nil }
-                    return placedState.isEnabled
+                resumePlacementStatus: { [weak self] job in
+                    // 本轮租约已失配就不读回：这份读回只证明"当前"空间的真实摆放。
+                    guard isCurrent() else { return nil }
+                    return self?.residentWishPlacementAlreadyCompleted(job)
                 }).tools : []
         // 网页参考图：wishworld 的每一次回合（含后台）都注册相同的两个 schema；后台没有
         // 生成授权时 register 会在 handle 内被拒绝，search 仍只读可用。绝不能按
@@ -5504,10 +5577,14 @@ final class AppDelegate:
         if job.computeMayContinue {
             detail = [detail, "远端计算可能仍在继续。"].compactMap { $0 }.joined(separator: "\n")
         }
+        // 任务级自动续办停止：必须可见（不是只写在提示词里的隐形状态）。行内
+        // 由 autoContinuationPaused 驱动"自主行动已停止 + 恢复"控件；detail
+        // 说明它不影响本轮明确指令，也不影响任务与产物。
         if job.autoContinuationPaused == true && !terminal {
-            detail = [detail, "自动领取与摆放已暂停，任务和产物保留。"].compactMap { $0 }.joined(separator: "\n")
+            detail = [detail, "自主行动已停止：不会自行前往领取或摆放；任务与产物保留，直接下达指令仍可当轮执行。"].compactMap { $0 }.joined(separator: "\n")
         }
-        return WishMachineTaskPresentation(id: job.id, title: job.name, status: status, detail: detail, isTerminal: terminal)
+        return WishMachineTaskPresentation(id: job.id, title: job.name, status: status, detail: detail,
+            isTerminal: terminal, autoContinuationPaused: job.autoContinuationPaused == true)
     }
 
     private func refreshWishMachine() async {
@@ -5688,7 +5765,11 @@ final class AppDelegate:
                                           context: ResidentWorldContext, automatic: Bool, resumed: Bool = false) {
         guard residentPropEditingWorldID == nil else { return }
         let loop = ensureResidentLoop()
-        guard !loop.snapshot.isStopped, !loop.snapshot.isInvalidated else { return }
+        guard !loop.snapshot.isInvalidated else { return }
+        // 停止只停自主行动，不停"事实的入队"：已经发生的事实（产物就绪、失败、
+        // 摆放完成）照常排队，供下一次人类明确指令当轮看见并使用。反过来，
+        // 停止期间绝不发放自主续办授权（下面的 isStopped 分支只投递普通观察），
+        // 因此被停止后不会自行领取、摆放或新建生成。
         // Queue observations even during a turn or an intent pause, so the next
         // human input can see them. The loop still gates autonomous execution;
         // acknowledgement remains tied to successful consumption below.
@@ -5707,7 +5788,9 @@ final class AppDelegate:
             kind: message.kind + "." + message.taskId.uuidString + "." + message.id.uuidString,
             summary: String(decoding: data, as: UTF8.self))
         let terminal = ["wish.failed", "wish.cancelled", "wish.interrupted", "wish.placed"].contains(message.kind)
-        if terminal || resumed || (message.kind == "wish.outputReady" && automatic && job.stage != .claimed) {
+        if loop.snapshot.isStopped {
+            loop.receiveEvent(observation)
+        } else if terminal || resumed || (message.kind == "wish.outputReady" && automatic && job.stage != .claimed) {
             loop.receiveContinuationEvent(observation)
         } else { loop.receiveEvent(observation) }
     }
@@ -5774,10 +5857,10 @@ final class AppDelegate:
         用户同时交代做好后放在哪里时，先查询支持面，再将明确的目的地通过 submit_wish_generation 的 destination 保存；用户未交代摆放时不要自行添加。只指定展示台无需擅自替用户固定精确坐标，领取后可在该支持面范围内预检合法落点。
         提交后可继续其他事情，并用 update_resident_intent 留下 waiting_event。宿主会在成品实际可见时发送 outputReady，按预算唤醒一次续办；不需要持续调用模型查询。
         收到 outputReady 后，在未被用户停止或要求等待时，自行查看当前活动并前往 wish_machine.collect；到达后调用 claim_wish_output 核实领取。工具失败时根据真实原因调整，不要把开始活动当成领取成功。
-        auto_continuation_paused 为 true 的旧任务已被用户停止自动领取；只保留任务与产物，不得自行前往领取。仅在新的人类消息明确要求领取该物件时手动领取，普通聊天不恢复旧委托。
+        auto_continuation_paused 为 true 表示该任务的**自动续办**已被用户停止：后台不得自行前往领取或摆放，只保留任务与产物；这**不是**对该任务的永久封禁。本轮人类明确下令领取该物件时，直接按令前往并 claim_wish_output 即可，不需要先调用 resume_wish_continuation；普通聊天不恢复旧委托。按令领取不会自动重新打开自动续办。
         claimed 表示领取登记，宿主还需将校验过的物件保存进库存。用 read_owned_props 核对入库，不要因暂无库存再次生成。
         当前支持面可用 list_placement_surfaces 查询，物件位置为底中心、yaw 为弧度。后台仅可续办 placement_delegation.state 为 pending 的原摆放委托：只摆本次产物、只用允许支持面，并遵守用户指定的精确位置和朝向。领取并用 read_owned_props 核实入库后，查询 layout_revision、预检、调用 apply_prop_placement，直到工具确认。放不下时在委托允许范围内调整；仍放不下就留在库存并说明。placed、revoked 或 failed 的委托不再自动执行。其他移动、收回、手持或撤销仍需本轮人类明确指令。
-        用户本轮明确要求恢复指定许愿时，先调用 resume_wish_continuation（指定 wish_id 并确认恢复），仅在成功回执后说明该许愿授权已恢复；随后需要自主续办时，再调用 update_resident_intent 并设置 resume_paused_intent=true。仅更新居民意图不会恢复许愿授权。普通聊天或后台通知不得恢复暂停任务。已实际摆好的物件无需重复领取或摆放。
+        resume_wish_continuation 只用于把该任务的**自动续办**（后台自行领取与摆放）重新打开，它不是领取已就绪产物的前置条件。用户本轮明确要求恢复指定许愿时，先调用 resume_wish_continuation（指定 wish_id 并确认恢复），仅在成功回执后说明该许愿授权已恢复；随后需要自主续办时，再调用 update_resident_intent 并设置 resume_paused_intent=true。仅更新居民意图不会恢复许愿授权。普通聊天或后台通知不得恢复暂停任务。已实际摆好的物件无需重复领取或摆放。
         生成物件目前只有外形，没有冲泡或战斗功能。正式领取且最长边不超过 45 厘米的小道具，可由当前已适配的 2B 右手展示；操作必须依次使用正式工具 hold_prop、adjust_held_prop_grip、return_held_prop，其中微调按需执行。只依据工具回执说明结果，其他角色或更大物件仍只能摆放。
         """
     }
@@ -5842,8 +5925,15 @@ final class AppDelegate:
         liveCamMessageID = messageID
         defer { if liveCamMessageID == messageID { liveCamMessageID = nil } }
         let wishAuthorizationID = try authorizeWishImages(input, worldContext: worldContext)
+        // 奉命轮 = 本轮由人类输入发起，或后台 run 已被人类引导接手。领取授权
+        // 按每次工具调用实时求值：停止只停自主，不吊销人类当轮的明确指令。
         let worldTools = makeResidentWorldTools(messageID: messageID, wishAuthorizationID: wishAuthorizationID,
-            allowsPausedWishClaim: !input.isBackground, allowsPropMutation: !input.isBackground)
+            allowsPausedWishClaim: !input.isBackground,
+            humanOrderedClaim: { [weak self] in
+                guard let self else { return false }
+                return !input.isBackground || self.residentAgentLoop?.runHasHumanInput(runID: messageID) == true
+            },
+            allowsPropMutation: !input.isBackground)
         defer {
             worldTools?.cancel()
         }

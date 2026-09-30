@@ -9,7 +9,7 @@ pub const PNG_LIMIT: usize = 8 * 1024 * 1024;
 pub const MODEL_LIMIT: usize = 32 * 1024 * 1024;
 pub const FRAME_LIMIT: usize = 12 * 1024 * 1024;
 
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Source {
     pub author: String,
     pub license: String,
@@ -47,9 +47,101 @@ pub struct Job {
     pub cancel_requested: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<Context>,
+    /// Artifact identity owned by the caller: one wish, one prop. Optional and
+    /// additive so payloads that predate it keep parsing; when present the
+    /// store refuses a second *active* job for the same id.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "sourceWishID")]
+    pub source_wish_id: Option<String>,
+    /// Fingerprint of the generation parameters that determine the mesh
+    /// silhouette (and therefore the collision box). Mandatory for a fallback
+    /// retry: the retry either carries the same fingerprint or is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_profile: Option<String>,
 }
 fn interrupted() -> String {
     "interrupted".into()
+}
+
+/// The generation parameters that decide the mesh silhouette. These are the
+/// numbers a fallback retry must reproduce: changing any of them changes the
+/// geometry, so it also changes the collision box and every downstream anchor.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GenerationProfile {
+    pub resolution: u32,
+    pub decimation: u32,
+    pub texture_size: u32,
+    pub remesh: bool,
+}
+
+pub const PROFILE_TAG: &str = "gmgn-mesh-v1";
+
+impl GenerationProfile {
+    pub fn validate(&self) -> Result<()> {
+        if !(64..=4096).contains(&self.resolution)
+            || !(1_000..=5_000_000).contains(&self.decimation)
+            || !(64..=8192).contains(&self.texture_size)
+        {
+            return Err("invalid_generation_profile");
+        }
+        Ok(())
+    }
+    /// The audit string stored in `workflow_profile`. It spells out every
+    /// silhouette-determining parameter, so the receipt alone documents what
+    /// geometry the artifact was generated with.
+    pub fn fingerprint(&self) -> String {
+        format!(
+            "{PROFILE_TAG};resolution={};decimation={};texture_size={};remesh={}",
+            self.resolution, self.decimation, self.texture_size, self.remesh
+        )
+    }
+    /// Reads back a fingerprint produced by [`Self::fingerprint`]. Used to
+    /// canonicalise a recorded profile before comparing it with a retry.
+    pub fn parse(value: &str) -> Result<Self> {
+        let mut parts = value.split(';');
+        if parts.next() != Some(PROFILE_TAG) {
+            return Err("invalid_workflow_profile");
+        }
+        let mut resolution = None;
+        let mut decimation = None;
+        let mut texture_size = None;
+        let mut remesh = None;
+        for part in parts {
+            let (key, value) = part.split_once('=').ok_or("invalid_workflow_profile")?;
+            let duplicate = match key {
+                "resolution" => resolution
+                    .replace(value.parse().map_err(|_| "invalid_workflow_profile")?)
+                    .is_some(),
+                "decimation" => decimation
+                    .replace(value.parse().map_err(|_| "invalid_workflow_profile")?)
+                    .is_some(),
+                "texture_size" => texture_size
+                    .replace(value.parse().map_err(|_| "invalid_workflow_profile")?)
+                    .is_some(),
+                "remesh" => remesh
+                    .replace(match value {
+                        "true" => true,
+                        "false" => false,
+                        _ => return Err("invalid_workflow_profile"),
+                    })
+                    .is_some(),
+                _ => return Err("invalid_workflow_profile"),
+            };
+            if duplicate {
+                return Err("invalid_workflow_profile");
+            }
+        }
+        let profile = Self {
+            resolution: resolution.ok_or("invalid_workflow_profile")?,
+            decimation: decimation.ok_or("invalid_workflow_profile")?,
+            texture_size: texture_size.ok_or("invalid_workflow_profile")?,
+            remesh: remesh.ok_or("invalid_workflow_profile")?,
+        };
+        profile
+            .validate()
+            .map_err(|_| "invalid_workflow_profile")?;
+        Ok(profile)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -69,6 +161,11 @@ pub struct Submit {
     pub height_meters: f64,
     #[serde(default)]
     pub context: Option<Context>,
+    /// Additive: callers that predate the field simply omit it.
+    #[serde(default, rename = "sourceWishID")]
+    pub source_wish_id: Option<String>,
+    #[serde(default)]
+    pub generation_profile: Option<GenerationProfile>,
 }
 
 pub fn identity(s: &str) -> Result<String> {
@@ -150,6 +247,14 @@ impl Submit {
                 .any(|s| s.trim().is_empty() || s.len() > 200)
         }) {
             return Err("invalid_context");
+        }
+        if self.source_wish_id.as_ref().is_some_and(|id| {
+            id.trim().is_empty() || id.len() > 200 || id.chars().any(char::is_control)
+        }) {
+            return Err("invalid_source_wish_id");
+        }
+        if let Some(profile) = &self.generation_profile {
+            profile.validate()?;
         }
         if !(1..=100).contains(&self.name.chars().count())
             || self.name.chars().any(|c| "/\\\0".contains(c))
@@ -327,6 +432,12 @@ pub fn stage(job: &Job) -> &'static str {
     }
 }
 
+/// Whether the daemon may still do work for this job. Terminal stages release
+/// the artifact identity so a fallback retry can claim the same wish again.
+pub fn is_active(job: &Job) -> bool {
+    !["ready", "cancelled", "failed", "interrupted"].contains(&job.backend_stage.as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,10 +462,88 @@ mod tests {
             backend_stage: "running".into(),
             cancel_requested: false,
             context: None,
+            source_wish_id: None,
+            workflow_profile: None,
         };
         let value = json!({"id":"a".repeat(32),"state":"running","reason":null,"name":job.name,"source":job.source,"height_meters":0.5,"compute_may_continue":false,"created_at":1.0,"updated_at":1.0});
         (job, value)
     }
+    #[test]
+    fn profile_fingerprint_records_every_silhouette_parameter() {
+        let profile = GenerationProfile {
+            resolution: 512,
+            decimation: 200_000,
+            texture_size: 2048,
+            remesh: true,
+        };
+        let fingerprint = profile.fingerprint();
+        assert_eq!(
+            fingerprint,
+            "gmgn-mesh-v1;resolution=512;decimation=200000;texture_size=2048;remesh=true"
+        );
+        assert_eq!(GenerationProfile::parse(&fingerprint).unwrap(), profile);
+        // Every parameter is audible in the fingerprint: changing one changes
+        // the geometry the artifact was meshed with, so it must change the
+        // fingerprint too.
+        for changed in [
+            GenerationProfile {
+                resolution: 513,
+                ..profile
+            },
+            GenerationProfile {
+                decimation: 200_001,
+                ..profile
+            },
+            GenerationProfile {
+                texture_size: 2049,
+                ..profile
+            },
+            GenerationProfile {
+                remesh: false,
+                ..profile
+            },
+        ] {
+            assert_ne!(changed.fingerprint(), fingerprint, "{changed:?}");
+        }
+        // Re-ordered but equivalent fingerprints are still recognised.
+        assert_eq!(
+            GenerationProfile::parse(
+                "gmgn-mesh-v1;remesh=false;texture_size=1024;decimation=50000;resolution=256"
+            )
+            .unwrap(),
+            GenerationProfile {
+                resolution: 256,
+                decimation: 50_000,
+                texture_size: 1024,
+                remesh: false,
+            }
+        );
+        for invalid in [
+            "",
+            "dgx-mesh-v3;resolution=512",
+            "gmgn-mesh-v1;resolution=512",
+            "gmgn-mesh-v1;resolution=0;decimation=200000;texture_size=2048;remesh=true",
+            "gmgn-mesh-v1;resolution=512;resolution=512;decimation=200000;texture_size=2048;remesh=true",
+            "gmgn-mesh-v1;resolution=512;decimation=200000;texture_size=2048;remesh=yes",
+        ] {
+            assert_eq!(
+                GenerationProfile::parse(invalid),
+                Err("invalid_workflow_profile"),
+                "{invalid}"
+            );
+        }
+        assert_eq!(
+            GenerationProfile {
+                resolution: 8,
+                decimation: 200_000,
+                texture_size: 2048,
+                remesh: true,
+            }
+            .validate(),
+            Err("invalid_generation_profile")
+        );
+    }
+
     #[test]
     fn running_receipt_must_not_contain_a_malformed_optional_result() {
         let (job, mut value) = fixture();

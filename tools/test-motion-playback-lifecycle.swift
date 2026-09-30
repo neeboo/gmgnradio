@@ -107,6 +107,8 @@ struct TestHeldProp { let calibration: TestCalibration }
 struct TestSpatialStage { let residentHeldProp: TestHeldProp? = nil }
 enum PMXWarmKitchenCoffeeCup { static func shouldDisplay(motionID: String) -> Bool { false } }
 @MainActor final class PMXStageAvatarRenderer {
+    enum MotionLoadFailurePolicy: Equatable, Sendable { case preserveCurrentMotion }
+    static let motionLoadFailurePolicy: MotionLoadFailurePolicy = .preserveCurrentMotion
     \#(declaration("static func locomotionGait(", in: pmx))
     var loadedLocomotionGait: StageLocomotionGait?
     var onMotionFinished: ((URL) -> Void)?

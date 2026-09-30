@@ -8,17 +8,22 @@ import CoreFoundation
     private let residentScope: String
     private let authorizationID: UUID?
     private let isCurrent: @MainActor () -> Bool
-    private let allowPausedClaim: Bool
+    /// "本轮是否载有人类明确指令"。任务级 `autoContinuationPaused` 只停**自主**
+    /// 续办（自行前往领取、自行摆放、后台新建生成）：它绝不吊销人类当轮明确
+    /// 下令的领取。这里按**每次调用**求值，而不是在建租约时拍快照——后台 run
+    /// 被人类引导接手后，这一轮就已经是奉命轮。
+    private let humanOrderedClaim: @MainActor () -> Bool
     private let continuationResumeAuthorizationID: UUID?
     private let resumePlacementStatus: @MainActor (WishMachineJob) -> Bool?
 
     init(coordinator: WishMachineCoordinator, worldID: String, residentScope: String,
-         authorizationID: UUID?, isCurrent: @escaping @MainActor () -> Bool, allowPausedClaim: Bool = false,
+         authorizationID: UUID?, isCurrent: @escaping @MainActor () -> Bool,
+         humanOrderedClaim: @escaping @MainActor () -> Bool = { false },
          continuationResumeAuthorizationID: UUID? = nil,
          resumePlacementStatus: @escaping @MainActor (WishMachineJob) -> Bool? = { _ in nil }) {
         self.coordinator = coordinator; self.worldID = worldID; self.residentScope = residentScope
         self.authorizationID = authorizationID; self.isCurrent = isCurrent
-        self.allowPausedClaim = allowPausedClaim
+        self.humanOrderedClaim = humanOrderedClaim
         self.continuationResumeAuthorizationID = continuationResumeAuthorizationID
         self.resumePlacementStatus = resumePlacementStatus
     }
@@ -144,7 +149,7 @@ import CoreFoundation
             var payload: [String: Any] = ["ok": true, "wish_id": job.id.uuidString, "object_id": job.objectID,
                 "stage": job.stage.rawValue, "compute_may_continue": job.computeMayContinue,
                 "auto_continuation_paused": job.autoContinuationPaused == true,
-                "message": job.autoContinuationPaused == true ? message + " 自动领取已暂停，仍可按本轮用户指令领取。" : message]
+                "message": job.autoContinuationPaused == true ? message + " 自动续办已停止：不会自行前往领取或摆放；本轮人类明确下令仍可直接领取，无需先恢复续办。" : message]
             payload["accepted"] = job.daemonAccepted == true
             payload["notification"] = "async_task_events"
             payload["cancel_requested"] = job.cancelRequested == true
@@ -184,7 +189,10 @@ import CoreFoundation
     }
     private func claimWhenArrived(id: UUID) async throws -> WishMachineJob {
         let existing = try coordinator.read(id: id, worldID: worldID, residentScope: residentScope)
-        guard allowPausedClaim || existing.autoContinuationPaused != true else { throw WishMachineError.automaticContinuationPaused }
+        // 任务级暂停只拦"自主"领取：没有本轮人类明确指令时拒绝；有明确指令时
+        // 直接按令领取，不要求先 resume_wish_continuation（那不是领取的前置条件，
+        // 它只重新打开自动续办）。
+        guard humanOrderedClaim() || existing.autoContinuationPaused != true else { throw WishMachineError.automaticContinuationPaused }
         if existing.stage == .claimed { return existing }
         guard existing.stage == .ready else { throw WishMachineError.notReady }
         let clock = ContinuousClock(), deadline = ContinuousClock.now.advanced(by: .seconds(15))
@@ -192,7 +200,7 @@ import CoreFoundation
             try Task.checkCancellation()
             guard isCurrent() else { throw CancellationError() }
             let current = try coordinator.read(id: id, worldID: worldID, residentScope: residentScope)
-            guard allowPausedClaim || current.autoContinuationPaused != true else { throw WishMachineError.automaticContinuationPaused }
+            guard humanOrderedClaim() || current.autoContinuationPaused != true else { throw WishMachineError.automaticContinuationPaused }
             guard let evidence = try coordinator.claimEvidence(id: id, worldID: worldID, residentScope: residentScope),
                   evidence.worldID == worldID, evidence.activityID == "wish_machine.collect" else { throw WishMachineError.notAtMachine }
             do { return try coordinator.claim(id: id, worldID: worldID, residentScope: residentScope) }

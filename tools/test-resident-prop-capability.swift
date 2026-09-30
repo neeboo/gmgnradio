@@ -101,16 +101,14 @@ let displayTableWorld = FlatSupport(minimumX: 1, maximumX: 3, minimumZ: 1, maxim
 /// 合成平面上的验证要用合成世界的路点/居民 —— 拿真实舱体的路点给合成平面算，居民与锚点
 /// 根本不在同一片坐标里，判据只会 fail-closed 拒绝一切（那正是它该做的）。
 ///
-/// `probeFootprint`/`probeHeight`/`probeAnchorColumn` 给出"这次要摆的那一件"：
+/// `probeVolume` 给出"这次要摆的那一件"（`generatedCollisionVolume` 同口径的体积）：
 /// 候选锚点里**被它压住**的不算锚点（居民在那次活动里本来就站不上去了）——
 /// 合成场景里"活动入口"要由调用方指定，这个过滤让调用方不必手算物件半径。
 /// 一个锚点都不剩时返回 nil ⇒ 服务拒绝摆放（fail-closed）。
 @MainActor func routeConstraint(_ grid:PropSupportGrid,
                                 anchorCandidates:[WorldVector3],
                                 resident:WorldVector3,
-                                probeFootprint:WorldPlanarFootprint?=nil,
-                                probeHeight:Float=0.3,
-                                probeAnchorColumn:PropSupportColumn?=nil)
+                                probeVolume:WorldCollisionVolume?=nil)
  -> ResidentPropPlacementSupport.RouteConstraint? {
  func usable(_ p:WorldVector3)->Bool {
    let limit:Float=1e6
@@ -125,9 +123,9 @@ let displayTableWorld = FlatSupport(minimumX: 1, maximumX: 3, minimumZ: 1, maxim
  var positions:[String:WorldVector3]=[:]
  for candidate in anchorCandidates {
    guard map.node(at:candidate) != nil else { continue }
-   if let probeFootprint, let probeAnchorColumn {
-     let occupied=map.blockedNodes(footprint:probeFootprint,height:probeHeight,
-       at:probeAnchorColumn,supportHeight:candidate.y)
+   if let probeVolume {
+     // 判据与运行时同一份：被这件物件压住的格心不算锚点。
+     let occupied=map.blockedNodes(volume:probeVolume)
      if let node=map.node(at:candidate), occupied.contains(node) { continue }
    }
    positions["anchor.\(positions.count)"]=candidate

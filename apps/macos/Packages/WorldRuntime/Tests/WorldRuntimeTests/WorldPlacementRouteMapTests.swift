@@ -61,8 +61,23 @@ private func makeMap(_ grid: PropSupportGrid) -> WorldPlacementRouteMap {
     WorldPlacementRouteMap(grid: grid, lowerHeight: -0.2, upperHeight: 0.4)
 }
 
-/// 走路用的小物件：0.35 × 0.57 m，与真机咖啡机同尺寸的那一档。
-private let footprint = WorldPlanarFootprint(size: SIMD2(0.35, 0.57), yaw: 0)
+/// 与运行时**同一个**体积来源：`generatedCollisionVolume` 就是 `WorldCollisionVolume`
+/// （底心 + 尺寸 + yaw 四元数）。这里按同一口径造一件。
+private func propVolume(
+    size: SIMD2<Float>,
+    yaw: Float = 0,
+    height: Float,
+    center: SIMD2<Float>,
+    bottom: Float
+) -> WorldCollisionVolume {
+    WorldCollisionVolume(
+        id: "prop.test",
+        center: WorldVector3(x: center.x, y: bottom + height / 2, z: center.y),
+        halfExtents: WorldVector3(x: size.x / 2, y: height / 2, z: size.y / 2),
+        rotation: WorldQuaternion(x: 0, y: sin(yaw / 2), z: 0, w: cos(yaw / 2)),
+        isBlocking: true
+    )
+}
 
 @Test("移动图只收可站带内的承托层，并且锚点能落在节点上")
 func routeMapCoversStandableBand() throws {
@@ -161,29 +176,78 @@ func routeMapFailsClosedWithoutAnchorNode() throws {
     #expect(decision == .unavailable)
 }
 
-@Test("物件只挡住它自己那一段高度：台面上的东西不挡台面下的地面")
+@Test("被占节点 = 运行时站立判定的真值：同一份几何只有一个答案")
+func routeMapBlockedNodesMatchRuntimeOccupancy() throws {
+    let map = makeMap(makeGrid())
+    let volume = propVolume(size: SIMD2(0.35, 0.57), height: 0.4,
+                            center: SIMD2(2.625, 2.625), bottom: 0)
+    let blocked = map.blockedNodes(volume: volume)
+    #expect(!blocked.isEmpty, "地面上的物件必须挡住脚下的节点")
+    #expect(blocked == truthNodes(map, volume: volume),
+            "移动图的被占节点必须与运行时站立判定逐节点一致")
+}
+
+@Test("yaw 旋转的物件按真实朝向挡人：轴向搞反会让摆放预检与运行时给出两个答案")
+func routeMapBlockedNodesRespectYaw() throws {
+    let map = makeMap(makeGrid())
+    // 与真机那把斧头同形状：0.885 × 0.0865 m，绕 Y 转 90°。
+    let rotated = propVolume(size: SIMD2(0.885, 0.0865), yaw: .pi / 2, height: 0.7,
+                             center: SIMD2(2.625, 2.625), bottom: 0)
+    let blocked = map.blockedNodes(volume: rotated)
+    #expect(blocked == truthNodes(map, volume: rotated),
+            "yaw 旋转的物件必须与运行时逐节点一致（图 \(blocked.count) / 运行时 \(truthNodes(map, volume: rotated).count)）")
+    // 方向性：转 90° 之后被占节点应沿世界 Z 铺开，而不是沿世界 X。
+    var columns: [PropSupportColumn] = []
+    for x in 0 ..< 22 {
+        for z in 0 ..< 22 {
+            let position = WorldVector3(x: (Float(x) + 0.5) * map.spacing, y: 0,
+                                        z: (Float(z) + 0.5) * map.spacing)
+            guard let node = map.node(at: position), blocked.contains(node) else { continue }
+            columns.append(PropSupportColumn(x: x, z: z))
+        }
+    }
+    if !columns.isEmpty {
+        let spanX = (columns.map(\.x).max() ?? 0) - (columns.map(\.x).min() ?? 0)
+        let spanZ = (columns.map(\.z).max() ?? 0) - (columns.map(\.z).min() ?? 0)
+        #expect(spanZ > spanX,
+                "0.885 m 的那条边转到 90° 之后必须沿 Z 铺开（实测 spanX=\(spanX) spanZ=\(spanZ)）")
+    }
+}
+
+@Test("物件只挡住它自己那一段高度：高处的物件不挡脚下的节点")
 func routeMapBlockedNodesRespectVerticalExtent() throws {
-    let grid = makeGrid()
-    let map = makeMap(grid)
-    let layer = try #require(grid.layers.first { $0.column == PropSupportColumn(x: 2, z: 2) })
-    // 台面上的物件：承托高度 0.5 m，落在可站带之外 ⇒ 不该挡任何地面节点。
-    let above = map.blockedNodes(footprint: footprint, height: 0.4,
-                                 at: layer.column, supportHeight: 0.5)
-    #expect(above.isEmpty, "台面上的物件不得挡地面（实测 \(above.count) 个节点）")
-    // 地面上的物件：必须挡住它脚下的那几个节点。
-    let onFloor = map.blockedNodes(footprint: footprint, height: 0.4,
-                                  at: layer.column, supportHeight: 0)
+    let map = makeMap(makeGrid())
+    // 头顶之上（底 2.2 m、高 0.4 m）的物件不该挡任何地面节点：站姿胶囊只到 1.8 m。
+    let above = map.blockedNodes(volume: propVolume(size: SIMD2(0.35, 0.57), height: 0.4,
+                                                    center: SIMD2(2.625, 2.625), bottom: 2.2))
+    #expect(above.isEmpty, "高处的物件不得挡地面（实测 \(above.count) 个节点）")
+    let onFloor = map.blockedNodes(volume: propVolume(size: SIMD2(0.35, 0.57), height: 0.4,
+                                                      center: SIMD2(2.625, 2.625), bottom: 0))
     #expect(!onFloor.isEmpty, "地面上的物件必须挡住脚下的节点")
-    #expect(onFloor.count <= 16, "一件 0.35×0.57 m 的物件不该挡住十几个以上的格子（实测 \(onFloor.count)）")
 }
 
 @Test("footprint 越大挡得越多（判据随物件尺寸单调）")
 func routeMapScalesWithFootprint() throws {
     let map = makeMap(makeGrid())
-    let column = PropSupportColumn(x: 5, z: 5)
-    let small = map.blockedNodes(footprint: WorldPlanarFootprint(size: SIMD2(0.2, 0.2), yaw: 0),
-                                 height: 0.3, at: column, supportHeight: 0)
-    let large = map.blockedNodes(footprint: WorldPlanarFootprint(size: SIMD2(0.9, 0.9), yaw: 0),
-                                 height: 0.3, at: column, supportHeight: 0)
+    let small = map.blockedNodes(volume: propVolume(size: SIMD2(0.2, 0.2), height: 0.3,
+                                                    center: SIMD2(2.625, 2.625), bottom: 0))
+    let large = map.blockedNodes(volume: propVolume(size: SIMD2(0.9, 0.9), height: 0.3,
+                                                    center: SIMD2(2.625, 2.625), bottom: 0))
     #expect(small.count < large.count, "大 footprint 必须挡住更多节点（小 \(small.count) / 大 \(large.count)）")
+}
+
+/// 与运行时同一条判据的真值集合：`CollisionVolumeWorld.canOccupy` 在每个可站节点上问一遍。
+private func truthNodes(_ map: WorldPlacementRouteMap, volume: WorldCollisionVolume) -> Set<Int> {
+    let runtime = CollisionVolumeWorld(volumes: [volume])
+    var truth: Set<Int> = []
+    for x in 0 ..< 22 {
+        for z in 0 ..< 22 {
+            let position = WorldVector3(x: (Float(x) + 0.5) * map.spacing, y: 0,
+                                        z: (Float(z) + 0.5) * map.spacing)
+            guard let node = map.node(at: position) else { continue }
+            guard !runtime.canOccupy(map.capsule, at: SIMD3(position.x, position.y, position.z)) else { continue }
+            truth.insert(node)
+        }
+    }
+    return truth
 }

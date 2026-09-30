@@ -218,8 +218,9 @@ func q(_ v:[Double],_ p:Double)->Double{let s=v.sorted();return s.isEmpty ?0:s[m
   var example: String? = nil
   for layer in cells {
     let footprint = WorldPlanarFootprint(size: SIMD2(size.x,size.z), yaw: 0)
-    let blocked = map.blockedNodes(footprint: footprint, height: size.y,
-      at: layer.column, supportHeight: layer.supportHeight)
+    // 判据只有一条：被占节点由**运行时那一份**几何回答（胶囊 × 物件的 yaw OBB）。
+    let blocked = map.blockedNodes(volume: PropPlacementEvaluator.placementVolume(
+      footprint: footprint, height: size.y, at: layer, spacing: grid.spacing))
     let decision = map.decision(blockedNodes: blocked, anchorIDs: anchorIDs,
       anchorPositions: anchorPositions, residentPosition: manifest.spawn.position)
     if case .blockedRoute(let id) = decision {
@@ -240,8 +241,9 @@ func q(_ v:[Double],_ p:Double)->Double{let s=v.sorted();return s.isEmpty ?0:s[m
   var routeExample: String? = nil
   for layer in cells {
     let footprint = WorldPlanarFootprint(size: SIMD2(size.x,size.z), yaw: 0)
-    let blocked = map.blockedNodes(footprint: footprint, height: size.y,
-      at: layer.column, supportHeight: layer.supportHeight)
+    // 判据只有一条：被占节点由**运行时那一份**几何回答（胶囊 × 物件的 yaw OBB）。
+    let blocked = map.blockedNodes(volume: PropPlacementEvaluator.placementVolume(
+      footprint: footprint, height: size.y, at: layer, spacing: grid.spacing))
     for id in anchorIDs {
       let decision = map.decision(blockedNodes: blocked, anchorIDs: [id],
         anchorPositions: anchorPositions, residentPosition: manifest.spawn.position)

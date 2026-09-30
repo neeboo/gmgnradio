@@ -131,6 +131,13 @@ public enum PropSupportBlockReason: Equatable, Sendable {
     /// 呈现路径**：格子的红、光标旁那枚标签的原因都从这里出。见
     /// `WorldPlacementRouteMap`。
     case blockedRoute(String)
+    /// 房间里有一件**已摆出**的物件解不出碰撞体积（资产元数据损坏 / 尺寸非法）。
+    ///
+    /// 这一条不是几何判定，而是"判据的输入不成立"：那件物件在世界通行判定里也表达
+    /// 不出来（也没有画出来），于是"这里会不会挡人 / 会不会和它重叠"根本没法回答。
+    /// **必须拒绝并说出来**，不能像过去那样 `compactMap` 静默丢掉它、把面板显示成
+    /// 一片可放 —— 那等于让这件物件对所有判据都"无敌"。
+    case unmodelledPlacedProp(String)
 }
 
 extension PropSupportBlockReason: LocalizedError {
@@ -143,6 +150,8 @@ extension PropSupportBlockReason: LocalizedError {
         case let .blockedByPlacedProp(id): "这里会和已经放好的 \(id) 重叠。"
         case .insufficientClearance: "这里空间不够，放不下。"
         case let .blockedRoute(id): "摆在这里居民就走不到 \(id) 了。"
+        case let .unmodelledPlacedProp(id):
+            "已摆出的物件 \(id) 读不出碰撞体积，没法判断这里会不会挡住居民；请先把它收回再摆放。"
         }
     }
 }

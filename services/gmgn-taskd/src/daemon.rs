@@ -7,7 +7,7 @@ use crate::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -24,7 +24,10 @@ pub struct Service {
     pub db: Database,
     credentials: Arc<RwLock<HashMap<String, String>>>,
     memory: Arc<memory::Memory>,
-    client: reqwest::Client,
+    /// The generation backend this daemon is bound to. Scheduling, cancellation
+    /// bookkeeping, integrity checks and local storage stay here; the backend
+    /// owns only the remote calls behind [`provider::PropProvider`].
+    provider: Arc<dyn provider::PropProvider>,
 }
 #[derive(Deserialize)]
 struct Request {
@@ -44,11 +47,20 @@ struct MessageScope {
 
 impl Service {
     pub fn new(db: Database) -> Result<Self> {
+        Self::with_provider(
+            db,
+            Arc::new(provider::RemoteHTTPProvider::new(provider::client()?)),
+        )
+    }
+
+    /// Binds the daemon to an explicit backend. Tests use it to drive the same
+    /// scheduler and IPC surface without a network.
+    pub fn with_provider(db: Database, provider: Arc<dyn provider::PropProvider>) -> Result<Self> {
         Ok(Self {
             db: db.clone(),
             credentials: Arc::new(RwLock::new(HashMap::new())),
             memory: Arc::new(memory::Memory::new(db)),
-            client: provider::client()?,
+            provider,
         })
     }
 
@@ -107,6 +119,67 @@ impl Service {
                         Ok(json!({"job":if cancel { s.cancel(&id)? } else { s.retry(&id)? }}))
                     })
                     .await
+            }
+            "failover" => {
+                let id = model::identity(params["id"].as_str().ok_or("invalid_id")?)?;
+                let endpoint = params["endpoint"].as_str().ok_or("invalid_endpoint")?.to_owned();
+                let profile: Option<model::GenerationProfile> = match params.get("generationProfile")
+                {
+                    None | Some(Value::Null) => None,
+                    Some(value) => Some(
+                        serde_json::from_value(value.clone())
+                            .map_err(|_| "invalid_generation_profile")?,
+                    ),
+                };
+                self.db
+                    .call(move |s| {
+                        let (job, replaced) = s.failover(&id, &endpoint, profile)?;
+                        Ok(json!({"job": job, "replaced": replaced}))
+                    })
+                    .await
+            }
+            "providers_status" => {
+                // Read-only and offline: it describes the backend this daemon is
+                // bound to plus every origin that has a credential or a job. No
+                // token ever appears in the reply.
+                let mut endpoints: BTreeMap<String, (bool, u64, u64)> = BTreeMap::new();
+                for endpoint in self.credentials.read().await.keys() {
+                    endpoints.entry(endpoint.clone()).or_insert((true, 0, 0)).0 = true;
+                }
+                for value in self.db.call(|s| s.all()).await? {
+                    let row = endpoints
+                        .entry(value.job.endpoint.clone())
+                        .or_insert((false, 0, 0));
+                    row.1 += 1;
+                    if model::is_active(&value.job) {
+                        row.2 += 1;
+                    }
+                }
+                let endpoints: Vec<Value> = endpoints
+                    .into_iter()
+                    .map(|(endpoint, (configured, jobs, active))| {
+                        json!({"endpoint":endpoint,"configured":configured,"jobs":jobs,"activeJobs":active})
+                    })
+                    .collect();
+                Ok(json!({"provider": self.provider.capabilities(), "endpoints": endpoints}))
+            }
+            "provider_probe" => {
+                let endpoint =
+                    model::endpoint(params["endpoint"].as_str().ok_or("invalid_endpoint")?)?;
+                let input_px = match params.get("inputPx") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => Some(
+                        value
+                            .as_u64()
+                            .filter(|n| (1..=16384).contains(n))
+                            .ok_or("invalid_input_px")? as u32,
+                    ),
+                };
+                let token = self.credentials.read().await.get(&endpoint).cloned();
+                let capabilities = self.provider.probe(&endpoint, token.as_deref()).await?;
+                let ready = capabilities.is_ready();
+                let accepts_input_px = input_px.map(|px| capabilities.accepts_input_px(px));
+                Ok(json!({"endpoint":endpoint,"ready":ready,"acceptsInputPx":accepts_input_px,"capabilities":capabilities}))
             }
             "publish_message" => {
                 if self
@@ -554,7 +627,7 @@ impl Service {
         let download = job.backend_stage == "downloading" && !job.cancel_requested;
         let submit = job.receipt.is_none();
         if download {
-            let result = provider::download(&self.client, &job, &token).await;
+            let result = self.provider.fetch_model(&job, &token).await;
             self.db
                 .call(move |s| {
                     let mut current = s.get(&id)?;
@@ -578,14 +651,17 @@ impl Service {
                 })
                 .await?;
         } else {
-            let result = provider::request(
-                &self.client,
-                &job,
-                &token,
-                submit,
-                job.cancel_requested && !submit,
-            )
-            .await;
+            // Same three-way dispatch the pre-trait `provider::request(client,
+            // job, token, submit, cancel)` call expressed with two booleans:
+            // first contact is a submit, afterwards an explicit cancel request
+            // takes precedence over polling.
+            let result = if submit {
+                self.provider.submit(&job, &token).await
+            } else if job.cancel_requested {
+                self.provider.cancel(&job, &token).await
+            } else {
+                self.provider.status(&job, &token).await
+            };
             self.db
                 .call(move |s| {
                     let mut current = s.get(&id)?;
@@ -809,6 +885,178 @@ pub fn options() -> Result<Options> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::provider::testwire::serve_once;
+
+    const PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=";
+
+    async fn service() -> (Service, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("gmgn-daemon-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = Service::new(Database::open(dir.clone(), None).unwrap()).unwrap();
+        (service, dir)
+    }
+
+    fn submission(wish: &str) -> Value {
+        json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "endpoint": "https://primary.invalid",
+            "name": "wish-prop",
+            "pngBase64": PNG_BASE64,
+            "source": {"author": "resident", "license": "CC0-1.0"},
+            "heightMeters": 0.5,
+            "sourceWishID": wish,
+            "generationProfile": {"resolution": 512, "decimation": 200000, "textureSize": 2048, "remesh": true},
+        })
+    }
+
+    /// Read-only and offline: it describes the bound backend and every origin
+    /// that has a credential or a job, and never echoes a token.
+    #[tokio::test]
+    async fn providers_status_reports_the_bound_backend_without_network() {
+        let (service, dir) = service().await;
+        let status = service.request("providers_status", json!({})).await.unwrap();
+        assert_eq!(status["provider"]["kind"], "remote_http");
+        assert_eq!(status["provider"]["max_input_px"], 2048);
+        assert_eq!(status["provider"]["uploads_data"], true);
+        assert_eq!(status["endpoints"], json!([]));
+
+        service
+            .request(
+                "configure",
+                json!({"endpoint": "https://dgx.invalid", "token": "secret-probe-token"}),
+            )
+            .await
+            .unwrap();
+        let submitted = service.request("submit", submission("wish-1")).await.unwrap();
+        let id = submitted["job"]["id"].as_str().unwrap().to_owned();
+        let status = service.request("providers_status", json!({})).await.unwrap();
+        assert_eq!(
+            status["endpoints"],
+            json!([
+                {"endpoint": "https://dgx.invalid", "configured": true, "jobs": 0, "activeJobs": 0},
+                {"endpoint": "https://primary.invalid", "configured": false, "jobs": 1, "activeJobs": 1},
+            ])
+        );
+        assert_eq!(status["endpoints"][1]["jobs"], 1);
+        service.request("cancel", json!({"id": id})).await.unwrap();
+        let status = service.request("providers_status", json!({})).await.unwrap();
+        assert_eq!(status["endpoints"][1]["activeJobs"], 0);
+        assert!(!serde_json::to_string(&status)
+            .unwrap()
+            .contains("secret-probe-token"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Negotiation in both directions: a health response without the optional
+    /// `provider` block behaves exactly as before, and one with the block
+    /// decides readiness and the input limit by field.
+    #[tokio::test]
+    async fn provider_probe_negotiates_health_and_input_limits() {
+        let (service, dir) = service().await;
+        let (origin, server) = serve_once(
+            200,
+            vec![("Content-Type", "application/json".into())],
+            br#"{"status":"api_ready","generation":{"ready":true}}"#.to_vec(),
+        )
+        .await;
+        let probed = service
+            .request("provider_probe", json!({"endpoint": origin, "inputPx": 2048}))
+            .await
+            .unwrap();
+        let _ = server.await;
+        assert_eq!(probed["ready"], true);
+        assert_eq!(probed["acceptsInputPx"], true);
+        assert_eq!(probed["capabilities"], json!({}));
+
+        let (origin, server) = serve_once(
+            200,
+            vec![("Content-Type", "application/json".into())],
+            br#"{"status":"api_ready","generation":{"ready":true},"provider":{"id":"local","max_input_px":512,"ready":false,"reason":"gpu busy"}}"#.to_vec(),
+        )
+        .await;
+        let probed = service
+            .request("provider_probe", json!({"endpoint": origin, "inputPx": 2048}))
+            .await
+            .unwrap();
+        let _ = server.await;
+        assert_eq!(probed["ready"], false);
+        assert_eq!(probed["capabilities"]["reason"], "gpu busy");
+        assert_eq!(probed["acceptsInputPx"], false);
+
+        // A backend whose health is not the shipped api_ready contract is
+        // reported, never assumed ready.
+        let (origin, server) = serve_once(
+            200,
+            vec![("Content-Type", "application/json".into())],
+            br#"{"status":"ok","backend":"mlx"}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(
+            service
+                .request("provider_probe", json!({"endpoint": origin}))
+                .await
+                .err(),
+            Some("provider_not_ready")
+        );
+        let _ = server.await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The fallback half of the "one wish, one artifact" gate: a drifting
+    /// fingerprint is refused, an identical one opens exactly one replacement.
+    #[tokio::test]
+    async fn failover_ipc_refuses_profile_drift_and_keeps_one_active_job() {
+        let (service, dir) = service().await;
+        let submitted = service.request("submit", submission("wish-1")).await.unwrap();
+        let id = submitted["job"]["id"].as_str().unwrap().to_owned();
+        let source_key = submitted["job"]["idempotencyKey"].as_str().unwrap().to_owned();
+
+        assert_eq!(
+            service
+                .request(
+                    "failover",
+                    json!({"id": id, "endpoint": "https://backup.invalid", "generationProfile": {"resolution": 1024, "decimation": 200000, "textureSize": 2048, "remesh": true}}),
+                )
+                .await
+                .err(),
+            Some("fallback_profile_mismatch_would_change_collision_box")
+        );
+        assert_eq!(
+            service
+                .request(
+                    "failover",
+                    json!({"id": id, "endpoint": "https://backup.invalid", "generationProfile": {"resolution": 512, "decimation": 200000, "textureSize": 4096, "remesh": true}}),
+                )
+                .await
+                .err(),
+            Some("fallback_profile_mismatch_would_change_collision_box")
+        );
+
+        let replaced = service
+            .request(
+                "failover",
+                json!({"id": id, "endpoint": "https://backup.invalid", "generationProfile": {"resolution": 512, "decimation": 200000, "textureSize": 2048, "remesh": true}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replaced["replaced"]["backendStage"], "cancelled");
+        assert_eq!(replaced["job"]["sourceWishID"], "wish-1");
+        assert_eq!(
+            replaced["job"]["workflowProfile"],
+            "gmgn-mesh-v1;resolution=512;decimation=200000;texture_size=2048;remesh=true"
+        );
+        assert_eq!(replaced["job"]["idempotencyKey"], format!("{source_key}-r1"));
+        let jobs = service.db.call(|s| s.all()).await.unwrap();
+        assert_eq!(
+            jobs.iter()
+                .filter(|value| value.job.source_wish_id.as_deref() == Some("wish-1")
+                    && model::is_active(&value.job))
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[tokio::test]
     async fn oversized_outbound_frames_are_rejected_before_writing() {

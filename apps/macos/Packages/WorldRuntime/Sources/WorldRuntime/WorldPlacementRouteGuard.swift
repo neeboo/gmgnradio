@@ -57,7 +57,17 @@ public struct WorldPlacementRouteMap: Sendable {
     /// 移动图的一格边长（米）。**等于**派生承托网格的间距：节点就是承托格子本身。
     public let spacing: Float
     /// 行走胶囊半径（米）。物件向外扩张这么多才算"站不上去"。
+    ///
+    /// 默认 0.25 比居民真正的胶囊（0.2）**更大** —— 这是摆放预检有意的保守余量
+    /// （fail-closed 方向）。但**几何模型只有一份**：被占节点由
+    /// `WorldCapsuleClearance` 用这个胶囊对物件的真实 OBB 判定，调用方不另算几何。
     public let capsuleRadius: Float
+    /// 行走胶囊高度（米），与居民真正的胶囊同高。
+    public let capsuleHeight: Float
+    /// 用于"这根节点站不站得住"的站姿胶囊。
+    public var capsule: WorldCapsule {
+        WorldCapsule(radius: capsuleRadius, height: capsuleHeight)
+    }
     /// 相邻两格之间允许的高差（= 角色控制器的 `maximumStepHeight`）。
     public let maximumStepHeight: Float
     public let lowerHeight: Float
@@ -80,13 +90,15 @@ public struct WorldPlacementRouteMap: Sendable {
         lowerHeight: Float,
         upperHeight: Float,
         maximumStepHeight: Float = 0.25,
-        capsuleRadius: Float = 0.25
+        capsuleRadius: Float = 0.25,
+        capsuleHeight: Float = 1.8
     ) {
         self.spacing = grid.spacing
         self.lowerHeight = lowerHeight
         self.upperHeight = upperHeight
         self.maximumStepHeight = maximumStepHeight
         self.capsuleRadius = capsuleRadius
+        self.capsuleHeight = capsuleHeight
         var heights: [PropSupportColumn: Float] = [:]
         heights.reserveCapacity(grid.layers.count)
         var minimumX = Int.max, maximumX = Int.min
@@ -121,40 +133,53 @@ public struct WorldPlacementRouteMap: Sendable {
     /// 这根承托高度/位置能不能站人（诊断与测试用）。
     public func supportHeight(at column: PropSupportColumn) -> Float? { standable[column] }
 
-    /// 物件占据的移动图节点（含向外一个胶囊半径）。
+    /// 物件占据的移动图节点。
     ///
-    /// 与站姿同口径：格心落在"占地矩形外扩胶囊半径"里、且**竖直区间与物件相交**的格子算被占。
-    /// 后者保证"桌面上的东西不挡桌子底下的地面"。
+    /// **与运行时同一个判据**：把**同一个** `WorldCollisionVolume`（摆放服务手里那份
+    /// `generatedCollisionVolume` / 候选的 `placementVolume`）交给
+    /// `WorldCapsuleClearance.isClear`，问"站姿胶囊能不能站在这根节点上"。
     ///
-    /// 格心判据是**确定性**的（与物件半尺寸落在格子的哪一半无关）；代价是理论上可能漏掉
-    /// "物件压住走廊、但没压住任何格心"的边角情形 —— 那种情形由运行时的惰性重规划接管
-    /// （导航本来就会改道）。
+    /// 为什么必须共用：这条判据决定"摆上去之后居民还走不走得到活动锚点"，而运行时
+    /// 真正拦人的是 `CollisionVolumeWorld.canOccupy`。两边各写一套几何就会漂开 ——
+    /// 真机 2026-09-30 的斧头（yaw=90°）实测：旧实现（未旋转的半尺寸去扩世界轴 AABB）
+    /// 只标了 11 个被占节点，而运行时真值是 15 个（9 个漏挡、5 个假挡）。
+    ///
+    /// 代价：只扫物件**自己**的世界包围盒覆盖的那几列（`worldHalfExtents`），每列 O(1)
+    /// 的胶囊×OBB 测试。与房间大小、三角形数、路网规模都无关；不碰三角形网格。
+    ///
+    /// 体积无法表示时返回**空集**是调用方不能接受的静默放行 —— 所以调用方
+    /// （`ResidentPropPlacementService`）必须先通过 `WorldLayoutObstacles.resolve`
+    /// 拿到"全部解得出体积的物件"，解不出的那些在这里根本到不了（详见那里的说明）。
     public func blockedNodes(
-        footprint: WorldPlanarFootprint,
-        height: Float,
-        at anchor: PropSupportColumn,
-        supportHeight: Float
+        volume: WorldCollisionVolume,
+        capsule: WorldCapsule? = nil
     ) -> Set<Int> {
-        guard footprint.isValid, height.isFinite, height > 0,
-              spacing.isFinite, spacing > 0, columnStride > 0, !standable.isEmpty else { return [] }
-        let center = footprint.center(anchoredAt: anchor, spacing: spacing)
-        let half = footprint.halfExtents
-        let blockHalfX = half.x + capsuleRadius
-        let blockHalfZ = half.y + capsuleRadius
-        let top = supportHeight + height
-        // 只扫物件矩形覆盖的那几列，而不是整张图。
-        let xRange = Int(floor((center.x - blockHalfX) / spacing))...Int(floor((center.x + blockHalfX) / spacing))
-        let zRange = Int(floor((center.y - blockHalfZ) / spacing))...Int(floor((center.y + blockHalfZ) / spacing))
+        let capsule = capsule ?? self.capsule
+        guard capsule.isValid,
+              spacing.isFinite, spacing > 0, columnStride > 0, !standable.isEmpty,
+              let halfExtents = WorldCapsuleClearance.worldHalfExtents(of: volume)
+        else { return [] }
+        let center = SIMD3(volume.center.x, volume.center.y, volume.center.z)
+        // 只扫物件世界包围盒**外扩站姿胶囊**之后覆盖的那几列：代价随物件尺寸与胶囊半径
+        // 有界，且一定是"可能被判阻挡"的节点的超集（|格心-中心| > 半尺寸+半径 时胶囊
+        // 绝不可能碰到盒子）。
+        let reachX = halfExtents.x + capsule.radius
+        let reachZ = halfExtents.z + capsule.radius
+        let xRange = Int(floor((center.x - reachX) / spacing))
+            ... Int(floor((center.x + reachX) / spacing))
+        let zRange = Int(floor((center.z - reachZ) / spacing))
+            ... Int(floor((center.z + reachZ) / spacing))
         var result: Set<Int> = []
         for x in xRange {
             for z in zRange {
                 let column = PropSupportColumn(x: x, z: z)
                 guard let layerHeight = standable[column], let node = nodes[column] else { continue }
-                // 竖直方向也要相交：物件只挡住它自己那一段高度（台面上的东西不挡地面）。
-                guard layerHeight <= top + 0.0001, layerHeight >= supportHeight - 0.0001 else { continue }
                 let cx = (Float(x) + 0.5) * spacing
                 let cz = (Float(z) + 0.5) * spacing
-                guard abs(cx - center.x) <= blockHalfX, abs(cz - center.y) <= blockHalfZ else { continue }
+                // 节点上的居民站在它自己的承托高度上（与运行时 `groundedDestination` 同形）。
+                guard !WorldCapsuleClearance.isClear(
+                    capsule, at: SIMD3(cx, layerHeight, cz), of: volume
+                ) else { continue }
                 result.insert(node)
             }
         }
@@ -163,7 +188,7 @@ public struct WorldPlacementRouteMap: Sendable {
 
     /// 收窄后的判据：**从居民当前位置出发，还能走到每一个活动锚点吗**。
     ///
-    /// - `blockedNodes`：这次摆放新增的障碍节点（`blockedNodes(footprint:...)`）。
+    /// - `blockedNodes`：这次摆放新增的障碍节点（`blockedNodes(volume:...)`，判据与运行时同一份）。
     ///   调用方把**已放物件**的障碍节点并进来时，判据就同时覆盖了"这间房现在的样子"。
     /// - `anchorPositions`：锚点 id → 落点（世界坐标）。
     public func decision(

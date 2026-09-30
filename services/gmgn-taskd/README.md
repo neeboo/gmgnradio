@@ -46,4 +46,23 @@ VoiceMem 选择性移植的长期记忆层留在 Rust daemon 内：`memory_statu
 
 旧 `PropGeneration/tasks.json` 只读导入，素材复制到新私有目录；保留原 UUID、幂等键和有效回执。已有远端 ID 继续查询，无回执记录不会自动重发。源文件损坏时启动失败并保留原文件，成功迁移按源根目录幂等记录。
 
+## 生成后端抽象与回退（第一步，仅守护进程）
+
+生成 provider 收敛为一个 trait：`src/provider.rs` 的 `PropProvider`（`capabilities` / `probe` / `submit` / `status` / `cancel` / `fetch_model`）。现有远程实现是唯一实现 `RemoteHTTPProvider`，每个方法都直接复用 trait 化之前的 `request`/`download` 代码；线上字节与错误分类由 `tests/fixtures/remote_http.json`（trait 化之前录制的请求字节 + 回执）逐字段锁定。
+
+`/health` 允许出现**可选**的 `provider` 块（`id`/`kind`/`ready`/`reason`/`stages`/`max_input_px`/`est_seconds`/`uploads_data`/`quota`）。整块缺失或字段缺失 ⇒ 与今天一致的默认能力（不因为缺字段拒绝既有 DGX 服务）；出现时按字段判定 readiness 与输入边长上限。只有显式调用 `provider_probe` 才会读 `/health`，任务路径不因此多一次请求。
+
+新增方法（旧方法语义不变）：
+
+- `providers_status`：无参数，只读且不联网。返回 `{provider:<capabilities>, endpoints:[{endpoint,configured,jobs,activeJobs}]}`，不含任何 token。
+- `provider_probe {endpoint, inputPx?}`：对该 origin 发 `GET /health`（只有已 `configure` 的 origin 才带 Bearer），返回 `{endpoint, ready, acceptsInputPx, capabilities}`。不是 `api_ready` 的 health 返回 `provider_not_ready`。
+- `failover {id, endpoint, generationProfile?}`：为同一件产物换后端重开任务。旧的先取消；旧任务仍活跃（远端可能还在跑）时返回 `source_task_still_active`，已就绪返回 `artifact_already_ready`。
+- `submit` 新增可选字段 `sourceWishID` 与 `generationProfile {resolution,decimation,textureSize,remesh}`；`job` 新增可选字段 `sourceWishID` 与 `workflowProfile`（双方都缺省时与今天序列化完全一致）。
+
+两条不变量：
+
+- 一个 `sourceWishID` 最多一个活跃 job（活跃 = `backendStage` 不属于 `ready`/`cancelled`/`failed`/`interrupted`），第二笔写入返回 `duplicate_active_source_wish`。
+- `workflowProfile` 是决定网格轮廓、因而决定碰撞盒的参数指纹 `gmgn-mesh-v1;resolution=<n>;decimation=<n>;texture_size=<n>;remesh=<bool>`。回退重试必须沿用同一指纹，否则返回 `fallback_profile_mismatch_would_change_collision_box`；两端都没有指纹时返回 `missing_workflow_profile`。
+
+
 依赖 API 核对参考：[Tokio watch](https://docs.rs/tokio/latest/tokio/sync/watch/)、[reqwest ClientBuilder](https://docs.rs/reqwest/0.12.28/reqwest/struct.ClientBuilder.html)、[rusqlite Connection](https://docs.rs/rusqlite/0.32.1/rusqlite/struct.Connection.html)、[PNG Decoder](https://docs.rs/png/0.17.16/png/struct.Decoder.html)。

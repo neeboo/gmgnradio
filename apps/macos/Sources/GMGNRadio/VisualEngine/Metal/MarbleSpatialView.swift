@@ -2607,7 +2607,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                 )
             }
             pmxAvatarRenderer.locomotionMeasuredSpeed = avatarRuntime.locomotion.isLocomotionActive
-                ? avatarRuntime.locomotion.measuredSpeed : nil
+                ? avatarRuntime.locomotion.gaitGroundSpeed : nil
             pmxAvatarRenderer.encode(
                 commandBuffer: commandBuffer,
                 renderPassDescriptor: pass,
@@ -2676,8 +2676,13 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             // A failed identity stays failed across temporary thinking and
             // world-motion changes. Restore the cleared renderer state without
             // re-loading the bad asset or re-reporting the terminal failure.
+            // This path used to be silent; a body that keeps translating with
+            // no motion is exactly the "sliding" defect, so it names itself.
             renderer.setCoffeeCupVisible(false)
             renderer.clearMotion()
+            Self.log.error(
+                "PMX motion \(identity.motion.id, privacy: .public) was already reported failed for this request; the avatar falls back to the rest pose instead of re-attempting it"
+            )
             return
         }
 
@@ -2686,6 +2691,9 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             renderer.setCoffeeCupVisible(false)
             renderer.clearMotion()
             appliedPMXResolvedMotion = resolved
+            Self.log.notice(
+                "Cleared PMX motion to the rest pose: the world resolved no playable clip (thinking/selected/idle all unavailable)"
+            )
         case let .asset(motion):
             guard motion.format == .vmd, let motionURL = motion.url else {
                 renderer.setCoffeeCupVisible(false)
@@ -2694,6 +2702,9 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                     rememberFailedPlaybackIdentity(identity, into: &failedPMXPlaybackIdentities)
                     avatarRuntime.reportMotionPlayback(identity: identity, outcome: .failed("Resolved PMX motion has no compatible VMD asset"))
                 }
+                Self.log.error(
+                    "Resolved PMX motion has no compatible VMD asset id=\(motion.id, privacy: .public) format=\(motion.format.rawValue, privacy: .public) url=\(motion.url == nil ? "nil" : "set", privacy: .public); the avatar falls back to the rest pose"
+                )
                 return
             }
             renderer.onMotionFinished = { [weak avatarRuntime] url in
@@ -2854,13 +2865,20 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             )
             return true
         } catch {
-            renderer.clearMotion()
+            // The renderer declares ``motionLoadFailurePolicy``; honor it
+            // instead of contradicting it. Clearing to the rest pose turned one
+            // transient bad asset into "the avatar has no motion at all", which
+            // reads as sliding whenever the world keeps translating it.
+            switch PMXStageAvatarRenderer.motionLoadFailurePolicy {
+            case .preserveCurrentMotion:
+                break
+            }
             if let identity {
                 rememberFailedPlaybackIdentity(identity, into: &failedPMXPlaybackIdentities)
                 avatarRuntime.reportMotionPlayback(identity: identity, outcome: .failed(error.localizedDescription))
             }
             Self.log.error(
-                "\(failureMessage, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                "\(failureMessage, privacy: .public): \(error.localizedDescription, privacy: .public); keeping the current PMX motion"
             )
             return false
         }

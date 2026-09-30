@@ -198,6 +198,7 @@ impl Store {
             Ok(_) | Err("missing_task") => {}
             Err(code) => return Err(code),
         }
+        self.ensure_single_active_artifact(value)?;
         let serialized = serde_json::to_string(value).map_err(|_| "invalid_input")?;
         let job = serde_json::to_string(&value.job).map_err(|_| "invalid_input")?;
         let tx = self
@@ -315,6 +316,7 @@ impl Store {
     pub fn submit(&mut self, mut input: Submit) -> Result<Job> {
         let bytes = input.validate()?;
         let hash = model::digest(&bytes);
+        let profile = input.generation_profile.map(|profile| profile.fingerprint());
         let existing = match self.get(&input.id) {
             Ok(value) => Some(value),
             Err("missing_task") => None,
@@ -328,6 +330,8 @@ impl Store {
                 || j.height_meters != input.height_meters
                 || j.image_sha256 != hash
                 || j.context != input.context
+                || j.source_wish_id != input.source_wish_id
+                || j.workflow_profile != profile
             {
                 return Err("idempotency_conflict");
             }
@@ -350,6 +354,8 @@ impl Store {
             backend_stage: "queued".into(),
             cancel_requested: false,
             context: input.context,
+            source_wish_id: input.source_wish_id,
+            workflow_profile: profile,
         };
         self.save(&Stored {
             job: job.clone(),
@@ -400,6 +406,129 @@ impl Store {
         s.job.last_error = None;
         self.save(&s)?;
         Ok(s.job)
+    }
+
+    /// A wish owns at most one *active* artifact. Two live generations for the
+    /// same `sourceWishID` would mean the world could register two props for one
+    /// wish, so the second write is refused outright rather than reconciled
+    /// later. Terminal stages (ready/cancelled/failed/interrupted) release the
+    /// wish again.
+    fn ensure_single_active_artifact(&self, value: &Stored) -> Result<()> {
+        let Some(wish) = value.job.source_wish_id.as_deref() else {
+            return Ok(());
+        };
+        if !model::is_active(&value.job) {
+            return Ok(());
+        }
+        for other in self.all()? {
+            if other.job.id != value.job.id
+                && other.job.source_wish_id.as_deref() == Some(wish)
+                && model::is_active(&other.job)
+            {
+                return Err("duplicate_active_source_wish");
+            }
+        }
+        Ok(())
+    }
+
+    /// Opens a fallback job for the same artifact on a different backend.
+    ///
+    /// The old job is cancelled first, inside the same storage turn, and the
+    /// failover is refused while that task is still active, so a wish never has
+    /// two live generations. The retry must reuse the recorded
+    /// `workflow_profile` fingerprint: different generation parameters move the
+    /// mesh silhouette, which would move the collision box and every anchor
+    /// derived from it.
+    pub fn failover(
+        &mut self,
+        id: &str,
+        endpoint: &str,
+        profile: Option<model::GenerationProfile>,
+    ) -> Result<(Job, Job)> {
+        let endpoint = model::endpoint(endpoint)?;
+        let replaced = self.get(id)?;
+        if replaced.job.backend_stage == "ready" {
+            // The artifact is already delivered; regenerating it is exactly the
+            // double generation the whole fallback path exists to prevent.
+            return Err("artifact_already_ready");
+        }
+        let recorded = replaced
+            .job
+            .workflow_profile
+            .clone()
+            .or_else(|| {
+                replaced.job.receipt.as_ref().and_then(|receipt| {
+                    receipt["result"]["workflow_profile"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+            });
+        let requested = match profile {
+            Some(profile) => {
+                profile.validate()?;
+                Some(profile.fingerprint())
+            }
+            None => None,
+        };
+        let workflow_profile = match (recorded.as_deref(), requested) {
+            (Some(recorded), Some(requested)) => {
+                if canonical_profile(recorded) != canonical_profile(&requested) {
+                    return Err("fallback_profile_mismatch_would_change_collision_box");
+                }
+                canonical_profile(recorded)
+            }
+            (Some(recorded), None) => canonical_profile(recorded),
+            (None, Some(requested)) => requested,
+            (None, None) => {
+                // Without a pinned fingerprint the retry could silently switch
+                // meshing parameters, so it is refused instead of guessed.
+                return Err("missing_workflow_profile");
+            }
+        };
+        self.cancel(id)?;
+        let replaced = self.get(id)?;
+        if model::is_active(&replaced.job) {
+            // The remote job may still be live; the caller retries the failover
+            // once cancellation reaches a terminal stage.
+            return Err("source_task_still_active");
+        }
+        let bytes = files::read(Path::new(&replaced.job.image_path), PNG_LIMIT)?;
+        model::validate_png(&bytes)?;
+        if model::digest(&bytes) != replaced.job.image_sha256 {
+            return Err("image_integrity_failed");
+        }
+        let root = root_key(&replaced.job.idempotency_key);
+        let revision = 1 + self
+            .all()?
+            .iter()
+            .filter(|other| other.job.idempotency_key.starts_with(&format!("{root}-r")))
+            .count();
+        let id = uuid::Uuid::new_v4().hyphenated().to_string().to_uppercase();
+        let path = self.root.join(format!("{id}.png"));
+        files::publish(&path, &bytes)?;
+        let job = Job {
+            id,
+            name: replaced.job.name.clone(),
+            endpoint,
+            image_path: path.to_string_lossy().into(),
+            image_sha256: replaced.job.image_sha256.clone(),
+            height_meters: replaced.job.height_meters,
+            source: replaced.job.source.clone(),
+            idempotency_key: format!("{root}-r{revision}"),
+            receipt: None,
+            local_model_path: None,
+            last_error: None,
+            backend_stage: "queued".into(),
+            cancel_requested: false,
+            context: replaced.job.context.clone(),
+            source_wish_id: replaced.job.source_wish_id.clone(),
+            workflow_profile: Some(workflow_profile),
+        };
+        self.save(&Stored {
+            job: job.clone(),
+            attempted: false,
+        })?;
+        Ok((job, replaced.job))
     }
     fn recover(&mut self) -> Result<()> {
         for mut value in self.all()? {
@@ -520,9 +649,237 @@ impl Store {
     }
 }
 
+/// Re-reads a recorded fingerprint so that `resolution=512;...` and an
+/// equivalent-but-differently-ordered string compare equal. A profile the
+/// daemon did not write (an opaque backend string) is compared verbatim.
+fn canonical_profile(profile: &str) -> String {
+    model::GenerationProfile::parse(profile)
+        .map(|profile| profile.fingerprint())
+        .unwrap_or_else(|_| profile.to_owned())
+}
+
+/// Strips an existing `-rN` fallback suffix so a chain of fallbacks keeps
+/// numbering one root key instead of nesting (`root-r1-r2`).
+fn root_key(key: &str) -> &str {
+    match key.rsplit_once("-r") {
+        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => key,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=";
+
+    fn new_store() -> (Store, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("gmgn-failover-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(dir.clone(), watch::channel(0).0).unwrap();
+        (store, dir)
+    }
+
+    fn submit(wish: Option<&str>, profile: Option<model::GenerationProfile>) -> Submit {
+        Submit {
+            id: uuid::Uuid::new_v4().to_string(),
+            endpoint: "https://primary.invalid".into(),
+            name: "wish-prop".into(),
+            png_base64: PNG_BASE64.into(),
+            source: model::Source {
+                author: "resident".into(),
+                license: "CC0-1.0".into(),
+            },
+            height_meters: 0.5,
+            context: None,
+            source_wish_id: wish.map(str::to_owned),
+            generation_profile: profile,
+        }
+    }
+
+    fn profile(resolution: u32) -> model::GenerationProfile {
+        model::GenerationProfile {
+            resolution,
+            decimation: 200_000,
+            texture_size: 2048,
+            remesh: true,
+        }
+    }
+
+    fn active_wishes(store: &Store) -> Vec<String> {
+        let mut wishes: Vec<String> = store
+            .all()
+            .unwrap()
+            .into_iter()
+            .filter(|value| model::is_active(&value.job))
+            .filter_map(|value| value.job.source_wish_id)
+            .collect();
+        wishes.sort();
+        wishes
+    }
+
+    #[test]
+    fn a_wish_never_has_two_active_jobs() {
+        let (mut store, dir) = new_store();
+        let first = store
+            .submit(submit(Some("wish-1"), Some(profile(512))))
+            .unwrap();
+        assert!(model::is_active(&first));
+        assert_eq!(
+            store
+                .submit(submit(Some("wish-1"), Some(profile(512))))
+                .err(),
+            Some("duplicate_active_source_wish")
+        );
+        // A different wish is independent of the first.
+        assert!(store
+            .submit(submit(Some("wish-2"), Some(profile(512))))
+            .is_ok());
+        // A terminal stage releases the wish again.
+        store.cancel(&first.id).unwrap();
+        assert!(!model::is_active(&store.get(&first.id).unwrap().job));
+        assert!(store
+            .submit(submit(Some("wish-1"), Some(profile(512))))
+            .is_ok());
+        assert_eq!(
+            active_wishes(&store),
+            vec!["wish-1".to_string(), "wish-2".to_string()]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failover_replaces_the_source_task_and_keeps_the_fingerprint() {
+        let (mut store, dir) = new_store();
+        let source = store
+            .submit(submit(Some("wish-1"), Some(profile(512))))
+            .unwrap();
+        let (job, replaced) = store
+            .failover(&source.id, "https://backup.invalid", Some(profile(512)))
+            .unwrap();
+        assert_eq!(replaced.backend_stage, "cancelled");
+        assert!(!model::is_active(&replaced));
+        assert_eq!(job.endpoint, "https://backup.invalid");
+        assert_eq!(job.source_wish_id.as_deref(), Some("wish-1"));
+        assert_eq!(
+            job.idempotency_key,
+            format!("{}-r1", source.idempotency_key)
+        );
+        assert_eq!(
+            job.workflow_profile.as_deref(),
+            Some(profile(512).fingerprint().as_str())
+        );
+        assert_eq!(job.image_sha256, source.image_sha256);
+        assert_eq!(job.height_meters, source.height_meters);
+        assert_eq!(job.name, source.name);
+        assert_eq!(job.source, source.source);
+        assert!(job.receipt.is_none());
+        assert!(model::is_active(&job));
+        assert_eq!(active_wishes(&store), vec!["wish-1".to_string()]);
+        // A second fallback keeps numbering one root key and the wish still has
+        // exactly one active job.
+        let (second, _) = store.failover(&job.id, "https://third.invalid", None).unwrap();
+        assert_eq!(
+            second.idempotency_key,
+            format!("{}-r2", source.idempotency_key)
+        );
+        assert_eq!(
+            second.workflow_profile.as_deref(),
+            Some(profile(512).fingerprint().as_str())
+        );
+        assert_eq!(active_wishes(&store), vec!["wish-1".to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failover_refuses_a_profile_that_would_move_the_collision_box() {
+        let (mut store, dir) = new_store();
+        let source = store
+            .submit(submit(Some("wish-1"), Some(profile(512))))
+            .unwrap();
+        let before = store.all().unwrap().len();
+        assert_eq!(
+            store
+                .failover(&source.id, "https://backup.invalid", Some(profile(1024)))
+                .err(),
+            Some("fallback_profile_mismatch_would_change_collision_box")
+        );
+        // A refused retry leaves the source task exactly as it was and opens
+        // nothing.
+        assert_eq!(store.all().unwrap().len(), before);
+        assert_eq!(store.get(&source.id).unwrap().job.backend_stage, "queued");
+        assert!(store
+            .failover(&source.id, "https://backup.invalid", Some(profile(512)))
+            .is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failover_refuses_an_unrecorded_fingerprint() {
+        let (mut store, dir) = new_store();
+        let source = store.submit(submit(Some("wish-1"), None)).unwrap();
+        assert_eq!(
+            store
+                .failover(&source.id, "https://backup.invalid", None)
+                .err(),
+            Some("missing_workflow_profile")
+        );
+        // A structured retry is never silently accepted against an opaque
+        // backend profile either.
+        let mut stored = store.get(&source.id).unwrap();
+        stored.job.workflow_profile = Some("dgx-mesh-v3;resolution=512".into());
+        store.save(&stored).unwrap();
+        assert_eq!(
+            store
+                .failover(&source.id, "https://backup.invalid", Some(profile(512)))
+                .err(),
+            Some("fallback_profile_mismatch_would_change_collision_box")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failover_waits_for_an_active_source_task_to_stop() {
+        let (mut store, dir) = new_store();
+        let source = store
+            .submit(submit(Some("wish-1"), Some(profile(512))))
+            .unwrap();
+        let mut stored = store.get(&source.id).unwrap();
+        stored.job.receipt = Some(json!({"id": "a".repeat(32), "state": "running"}));
+        stored.job.backend_stage = "running".into();
+        stored.attempted = true;
+        store.save(&stored).unwrap();
+        assert_eq!(
+            store
+                .failover(&source.id, "https://backup.invalid", Some(profile(512)))
+                .err(),
+            Some("source_task_still_active")
+        );
+        // The cancellation is persisted; that is what eventually frees the wish.
+        let stored = store.get(&source.id).unwrap();
+        assert!(stored.job.cancel_requested);
+        assert!(model::is_active(&stored.job));
+        assert_eq!(active_wishes(&store), vec!["wish-1".to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_ready_artifact_is_never_regenerated() {
+        let (mut store, dir) = new_store();
+        let source = store
+            .submit(submit(Some("wish-1"), Some(profile(512))))
+            .unwrap();
+        let mut stored = store.get(&source.id).unwrap();
+        stored.job.backend_stage = "ready".into();
+        store.save(&stored).unwrap();
+        assert_eq!(
+            store
+                .failover(&source.id, "https://backup.invalid", Some(profile(512)))
+                .err(),
+            Some("artifact_already_ready")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn malformed_existing_identity_is_never_replaced_by_save() {

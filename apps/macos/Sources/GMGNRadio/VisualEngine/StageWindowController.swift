@@ -366,6 +366,10 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     }
     func setResidentProgress(_ text: String?) { residentChat.progress = text }
     func setWishMachineTasks(_ tasks: [WishMachineTaskPresentation]) { wishMachineTasks.update(tasks) }
+    /// 面板上的"恢复自动领取"动作接到宿主（不是模型工具）：解除不依赖措辞。
+    func setWishContinuationResumeHandler(_ handler: @escaping (UUID) -> Void) {
+        wishMachineTasks.onResumeAutomaticContinuation = handler
+    }
 
     func setSystemInboxUnread(_ count: Int) {
         systemInboxUnread = count

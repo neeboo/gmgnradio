@@ -113,6 +113,14 @@ extension StageMotionAsset {
 struct StageAvatarLocomotionTelemetry: Equatable, Sendable {
     /// Smoothed horizontal ground speed in meters per second.
     var measuredSpeed: Float = 0
+    /// The same travel over a longer window. The world publishes snapshots on
+    /// its own cadence while the clip is drawn at the render cadence, so a
+    /// single sample can land on a stalled tick; the gait reads this smooth
+    /// companion whenever the world is moving the avatar.
+    var sustainedSpeed: Float = 0
+    /// True while the world is authoritatively translating the avatar (the
+    /// executor's walking phase, or observed displacement on the latest tick).
+    var isWorldMoving = false
     /// True while the resolved world playback is an in-place locomotion loop.
     var isLocomotionActive = false
     /// Source world revision this measurement was derived from.
@@ -120,22 +128,43 @@ struct StageAvatarLocomotionTelemetry: Equatable, Sendable {
 
     static let standing = StageAvatarLocomotionTelemetry()
 
+    /// Ground speed the visible clip must be retimed against.
+    ///
+    /// While the world is moving the avatar, the higher of the responsive and
+    /// sustained estimates is authoritative: a stalled sample must never
+    /// freeze a clip whose body is sliding across the floor. Once the world
+    /// stops moving the avatar, only the responsive estimate counts, so a
+    /// genuine standstill still freezes the clip promptly (no marching in
+    /// place, no gait left over from the previous leg).
+    var gaitGroundSpeed: Float {
+        guard isWorldMoving else { return measuredSpeed }
+        return max(measuredSpeed, sustainedSpeed)
+    }
+
     /// Content equality ignoring the informational revision, with speed
     /// quantized to 5 mm/s so a world ticking at 30 Hz does not churn
     /// observers while the avatar cruises at a constant speed.
     func matchesContent(_ other: StageAvatarLocomotionTelemetry) -> Bool {
         isLocomotionActive == other.isLocomotionActive
+            && isWorldMoving == other.isWorldMoving
             && abs(measuredSpeed - other.measuredSpeed) <= 0.005
+            && abs(sustainedSpeed - other.sustainedSpeed) <= 0.005
     }
 
     init(
         measuredSpeed: Float = 0,
+        sustainedSpeed: Float = 0,
+        isWorldMoving: Bool = false,
         isLocomotionActive: Bool = false,
         sourceRevision: UInt64 = 0
     ) {
         self.measuredSpeed = measuredSpeed.isFinite && measuredSpeed >= 0
             ? measuredSpeed
             : 0
+        self.sustainedSpeed = sustainedSpeed.isFinite && sustainedSpeed >= 0
+            ? sustainedSpeed
+            : 0
+        self.isWorldMoving = isWorldMoving
         self.isLocomotionActive = isLocomotionActive
         self.sourceRevision = sourceRevision
     }

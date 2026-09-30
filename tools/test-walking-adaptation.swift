@@ -85,6 +85,8 @@ let loaderHips = declaration("static func measureHipsRestHeight(", in: loader)
 let pmxGait = declaration("static func locomotionGait(", in: pmx)
 let executorBody = executorSource.replacingOccurrences(
     of: "import WorldRuntime", with: "")
+let defaultMotionPolicy = try read(
+    "apps/macos/Sources/GMGNRadio/Presence/ResidentLocomotionMotionPolicy.swift")
 
 let harness = #"""
 import Foundation
@@ -97,8 +99,15 @@ struct WorldVector3: Equatable, Sendable { var x: Float = 0; var y: Float = 0; v
 struct WorldQuaternion: Equatable, Sendable { var x: Float = 0; var y: Float = 0; var z: Float = 0; var w: Float = 1 }
 struct WorldTransform: Equatable, Sendable { var position = WorldVector3(); var rotation = WorldQuaternion() }
 struct LifeActivity: Equatable, Sendable { let typeID: String }
-enum LifeActivityPhase: String, Sendable { case approach, enter, loop, exit }
-struct ActivityPhaseContract { let phase: LifeActivityPhase }
+enum LifeActivityPhase: String, Sendable { case approach, enter, loop, exit, interrupt, failed }
+enum StageAvatarFormat: String, Sendable { case vrm, pmx }
+struct ActivityPhaseContract {
+    let phase: LifeActivityPhase
+    var requiredAnchorIDs: [String] = []
+    var motionIDs: [String] = []
+    var propIDs: [String] = []
+    var durationSeconds: TimeInterval? = nil
+}
 
 struct StageMotionAsset: Equatable, Sendable {
     let id: String
@@ -193,19 +202,30 @@ enum PMXStageAvatarRenderer {
 struct StageMotionPlaybackIdentity { let motion: StageMotionAsset; let worldActivityRequestID: String?; let worldActivityPhase: LifeActivityPhase? }
 enum StageMotionPlaybackOutcome { case completed, failed(String) }
 struct StageMotionPlaybackEvent { let identity: StageMotionPlaybackIdentity; let outcome: StageMotionPlaybackOutcome }
-struct Fallback { let requestedMotionIDs: [String]; let activityTypeID: String; let phase: LifeActivityPhase; let reason: LifeActivityPhase }
+struct Fallback: Equatable { let requestedMotionIDs: [String]; let activityTypeID: String; let phase: LifeActivityPhase; let reason: LifeActivityPhase }
 enum StageAvatarMotionPlayback: Equatable, Sendable {
     case temporary(StageMotionAsset)
-    var fallback: Fallback? { nil }
+    case naturalIdle(fallback: Fallback?)
+    var fallback: Fallback? {
+        guard case let .naturalIdle(fallback) = self else { return nil }
+        return fallback
+    }
     static func resolve(activity: LifeActivity, phase: LifeActivityPhase,
                         phaseContract: ActivityPhaseContract?,
                         approvedMotions: [String: StageMotionAsset]) -> Self {
-        // Mirrors the real resolver for the harness: a locomotion asset in the
-        // approved set wins, otherwise a plain non-locomotion one-shot.
-        if let walk = approvedMotions.values.first(where: { $0.isLocomotionLoop }) {
-            return .temporary(walk)
+        // Mirrors the real resolver for the harness: the declared (and, since
+        // the locomotion policy appends them, the default) ids are consulted in
+        // order, and the first approved one wins.
+        let requested = phaseContract?.motionIDs ?? []
+        if let motion = requested.lazy.compactMap({ approvedMotions[$0] }).first {
+            return .temporary(motion)
         }
-        return .temporary(StageMotionAsset(id: "one-shot", name: "One Shot", format: .vrma, url: nil))
+        if activity == LifeActivity(typeID: "idle"), requested.isEmpty {
+            return .naturalIdle(fallback: nil)
+        }
+        return .naturalIdle(fallback: Fallback(
+            requestedMotionIDs: requested, activityTypeID: activity.typeID,
+            phase: phase, reason: phase))
     }
 }
 struct StageAvatarWorldActivitySnapshot: Equatable, Sendable {
@@ -214,10 +234,15 @@ struct StageAvatarWorldActivitySnapshot: Equatable, Sendable {
     var activityRequestID: String? = nil
 }
 struct StageAvatarPlacement { let position: SIMD3<Float>; let scale: Float; let yaw: Float }
+/// The one field of the avatar snapshot the executor's motion policy reads.
+struct StageAvatarAssetSnapshot { let format: StageAvatarFormat }
+struct StageAvatarRuntimeSnapshotShim { let avatar: StageAvatarAssetSnapshot? }
 @MainActor final class StageAvatarRuntimeStore {
     var worldActivity: StageAvatarWorldActivitySnapshot?
     var installs = 0
     var locomotion = StageAvatarLocomotionTelemetry.standing
+    var snapshot = StageAvatarRuntimeSnapshotShim(
+        avatar: StageAvatarAssetSnapshot(format: .vrm))
     func installWorldActivity(_ value: StageAvatarWorldActivitySnapshot) { installs += 1; worldActivity = value }
     func clearWorldActivity() { worldActivity = nil }
     func updateLocomotion(_ value: StageAvatarLocomotionTelemetry) {
@@ -232,6 +257,7 @@ struct StageAvatarPlacement { let position: SIMD3<Float>; let scale: Float; let 
 }
 
 \#(executorBody)
+\#(defaultMotionPolicy)
 
 @main struct Test {
     @MainActor static func main() {
@@ -320,7 +346,8 @@ struct StageAvatarPlacement { let position: SIMD3<Float>; let scale: Float; let 
         //    na_2b rig (stance-drift regression 0.72-0.78 m/s, cadence ~86
         //    steps/min), so the bootstrap default nav speed equals it and the
         //    normal constant-speed cruise keeps rate exactly 1 (no maxRate cap).
-        let pmxWalk = StageMotionAsset(id: "walk-pmx", name: "Walk PMX", format: .vmd, url: nil,
+        let pmxWalk = StageMotionAsset(id: "walk-pmx", name: "Walk PMX", format: .vmd,
+                                       url: URL(fileURLWithPath: "/offline/walk-pmx.vmd"),
                                        loop: true, inPlace: true, strideSpeed: 0.75)
         let pmxGait = PMXStageAvatarRenderer.locomotionGait(for: pmxWalk)
         precondition(pmxGait != nil && pmxGait!.sourceHipsHeight == nil
@@ -434,6 +461,8 @@ struct StageAvatarPlacement { let position: SIMD3<Float>; let scale: Float; let 
         //     stops the locomotion flag without reloading or rewinding the
         //     animation player, so the phase stays continuous.
         let pmxStore = StageAvatarRuntimeStore(), pmxStage = SpatialStageStore()
+        pmxStore.snapshot = StageAvatarRuntimeSnapshotShim(
+            avatar: StageAvatarAssetSnapshot(format: .pmx))
         var pmxNow: TimeInterval = 0
         let pmxExecutor = StageAvatarActivityExecutor(runtime: pmxStore, spatialStage: pmxStage,
                                                       worldSpawn: WorldTransform(), clock: { pmxNow })
@@ -444,8 +473,13 @@ struct StageAvatarPlacement { let position: SIMD3<Float>; let scale: Float; let 
             pmxX += dx
             var transform = WorldTransform()
             transform.position.x = pmxX
+            // The world declares its stepping clip for the phase, exactly as a
+            // package does (`home.walk.approach`); the resolver must pick it.
             _ = pmxExecutor.apply(transform: transform, activity: walkActivity, phase: .approach,
-                                  sourceRevision: revision, approvedMotions: ["walk": pmxWalk])
+                                  sourceRevision: revision,
+                                  phaseContract: ActivityPhaseContract(
+                                      phase: .approach, motionIDs: [pmxWalk.id]),
+                                  approvedMotions: [pmxWalk.id: pmxWalk])
         }
         for revision in 1...90 { pmxTick(0.75 / 30, revision: UInt64(revision)) }
         precondition(abs(pmxStore.locomotion.measuredSpeed - 0.75) < 0.05,

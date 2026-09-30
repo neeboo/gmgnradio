@@ -195,8 +195,37 @@ actor Recorder: CodexCommandRunning {
 
         let attachmentRow = "- id: attachment-local\n  name: '@deepseek-ai/dsh-attachment-local'\n  config:\n    dshHome: '\(sandbox.appendingPathComponent("home").path)'\n"
         check(composed.contains(attachmentRow), "the sandboxed attachment row is emitted verbatim")
-        let visionCatalogRow = "      - id: deepseek-v4-flash-vision-exp\n        inputModalities: [text, image]\n"
-        check(composed.contains(visionCatalogRow), "the vision model declares image input in the mounted catalog")
+        let visionCatalogRow = "      - id: deepseek-flash\n        inputModalities: [text, image]\n"
+        check(composed.contains(visionCatalogRow), "the current multimodal model declares image input in the mounted catalog")
+        check(composed.contains("    model: deepseek-flash\n"), "the composition selects deepseek-flash")
+        check(!composed.contains("deepseek-v4-flash"), "the retired model names are gone from the emitted composition")
+        // 能力判定必须在发送前可靠拿到：宿主在带世界工具的那一轮会把自己的私有
+        // 插件行（gmgn-host-tools）追加到同一份 composition 上，而发送时的
+        // modelImageDeclared 只拿到读回文本。私有行绝不能把「模型声明了图片输入」
+        // 这条事实读成 false（真机就是在这里被拦下的），而任何其它偏差仍须 fail-closed。
+        let hostToolsPath = dshWork.appendingPathComponent("gmgn-host-tools.mjs").path
+        let hostToolsRow = "\n- id: gmgn-host-tools\n  name: '\(hostToolsPath)'"
+        let composedWithHostTools = ResidentDSHComposition.residentYAML(
+            attachmentHome: sandbox.appendingPathComponent("home"),
+            persistenceRoot: sandbox.appendingPathComponent("sessions"),
+            persona: persona, hostToolsPluginPath: hostToolsPath)
+        check(composedWithHostTools.contains(hostToolsRow),
+              "the host-private plugin row is emitted verbatim when world tools are in play")
+        check(ResidentDSHComposition.validateComposedConfig(composedWithHostTools, hostToolsPluginPath: hostToolsPath),
+              "the world-tools composition is valid when validated with the emitted plugin path")
+        check(ResidentDSHComposition.declaresImageInput(composedWithHostTools),
+              "the host-private tool row does not hide the image model declaration (production send-time read)")
+        let madeSandbox = try ResidentDSHComposition.makeResidentSandbox(hostToolsPluginPath: hostToolsPath)
+        check(ResidentDSHComposition.declaresImageInput(madeSandbox.compositionText),
+              "the exact production call-site shape (makeResidentSandbox read-back) declares image input")
+        madeSandbox.removeAll()
+        check(!ResidentDSHComposition.declaresImageInput(
+            composedWithHostTools.replacingOccurrences(of: hostToolsPath, with: dshWork.appendingPathComponent("foreign.mjs").path)),
+              "a foreign private-row name still fails the image declaration check")
+        check(!ResidentDSHComposition.declaresImageInput(
+            composedWithHostTools.replacingOccurrences(of: visionCatalogRow,
+                with: "      - id: deepseek-flash\n        inputModalities: [text]\n")),
+              "a text-only catalog cannot hide behind the host-private tool row")
         let skillsRow = "    skills:\n      enabled: false\n"
         check(composed.contains(skillsRow), "skills are explicitly disabled because the spine enables them by default")
         // The composition mounts the native web seam: the web service pinned to
@@ -221,8 +250,8 @@ actor Recorder: CodexCommandRunning {
             ("subagent row", composed + "\n- id: tool-subagent\n  name: '@deepseek-ai/dsh-tool-subagent'\n"),
             ("unknown row", composed + "\n- id: mystery-tool\n  name: '@deepseek-ai/dsh-mystery'\n"),
             ("missing attachment store", composed.replacingOccurrences(of: attachmentRow, with: "")),
-            ("text-only selection", composed.replacingOccurrences(of: "    model: deepseek-v4-flash-vision-exp", with: "    model: deepseek-v4-flash")),
-            ("text-only catalog", composed.replacingOccurrences(of: visionCatalogRow, with: "      - id: deepseek-v4-flash-vision-exp\n        inputModalities: [text]\n")),
+            ("text-only selection", composed.replacingOccurrences(of: "    model: deepseek-flash", with: "    model: deepseek-v4-pro")),
+            ("text-only catalog", composed.replacingOccurrences(of: visionCatalogRow, with: "      - id: deepseek-flash\n        inputModalities: [text]\n")),
             ("bash re-enabled", composed.replacingOccurrences(of: "    toolBash: false", with: "    toolBash: true")),
             ("missing workspaceContext", composed.replacingOccurrences(of: "    workspaceContext: false\n", with: "")),
             ("unknown provider", composed.replacingOccurrences(of: "    provider: deepseek-official", with: "    provider: deepseek-other")),
@@ -241,7 +270,7 @@ actor Recorder: CodexCommandRunning {
             check(!ResidentDSHComposition.validateComposedConfig(text), "tampered composition fails closed: \(label)")
         }
         check(!ResidentDSHComposition.declaresImageInput(
-            composed.replacingOccurrences(of: visionCatalogRow, with: "      - id: deepseek-v4-flash-vision-exp\n        inputModalities: [text]\n")),
+            composed.replacingOccurrences(of: visionCatalogRow, with: "      - id: deepseek-flash\n        inputModalities: [text]\n")),
               "a text-only catalog cannot claim image input")
 
         // ── Plugin dependency resolution: the official loader anchors bare

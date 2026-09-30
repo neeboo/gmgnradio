@@ -457,11 +457,35 @@ extension WishMachineCoordinator {
         let backgroundClaim = await pauseReadTools.first { $0.name == "claim_wish_output" }!.handle("ambient-claim", pauseClaimArguments)
         let afterBackgroundClaim = try pauseRestart.read(id: pauseJob.id, worldID: "world", residentScope: "resident")
         check(backgroundClaim.isError && afterBackgroundClaim.stage == .ready, "ambient read and claim cannot bypass persisted commission pause")
-        let humanTools = ResidentWishMachineTools(coordinator: pauseRestart, worldID: "world", residentScope: "resident", authorizationID: nil, isCurrent: { true }, allowPausedClaim: true).tools
+        let humanTools = ResidentWishMachineTools(coordinator: pauseRestart, worldID: "world", residentScope: "resident", authorizationID: nil, isCurrent: { true }, humanOrderedClaim: { true }).tools
         let humanClaim = await humanTools.first { $0.name == "claim_wish_output" }!.handle("new-human-claim", pauseClaimArguments)
         let manualClaim = try pauseRestart.read(id: pauseJob.id, worldID: "world", residentScope: "resident")
         check(!humanClaim.isError && manualClaim.autoContinuationPaused == true, "fresh human claim does not silently reenable automatic commission")
         check(manualClaim.stage == .claimed && manualClaim.objectID == pauseJob.objectID, "fresh human instruction can still claim paused output")
+        // 领取授权是"本轮是否载有人类明确指令"，按每次调用求值：后台 run 被人类
+        // 引导接手后（同一 run 的 humanOrderedClaim 由 false 变 true）必须能领取。
+        // 建租约时的快照口径会让这一轮白跑，这正是真机上"明确下令也拿不到"的一类。
+        let steeringPaused = WishMachineCoordinator(store: pauseStore, directory: pauseWishes, canClaim: { _ in evidence })
+        HTTP.state = "completed"
+        let steeringGrant = UUID()
+        try steeringPaused.authorize(attachments: [attachment], worldID: "world", residentScope: "resident", authorizationID: steeringGrant,
+                                     source: .init(author: "user", license: "internal"))
+        let steeringJob = try await steeringPaused.submitSettled(requestID: "steering-paused-job", authorizationID: steeringGrant,
+            attachmentID: attachment.id, name: "steered sword", heightMeters: 1.2, worldID: "world", residentScope: "resident")
+        try steeringPaused.pauseContinuations(worldID: "world", residentScope: "resident")
+        var steeredRunHasHumanInput = false
+        let steeringTools = ResidentWishMachineTools(coordinator: steeringPaused, worldID: "world", residentScope: "resident",
+            authorizationID: nil, isCurrent: { true }, humanOrderedClaim: { steeredRunHasHumanInput }).tools
+        let steeringClaimArguments = try JSONSerialization.data(withJSONObject: ["wish_id": steeringJob.id.uuidString])
+        let snapshotDenied = await steeringTools.first { $0.name == "claim_wish_output" }!
+            .handle("snapshotless-claim", steeringClaimArguments)
+        check(snapshotDenied.isError, "a run with no human input cannot claim a paused artifact")
+        steeredRunHasHumanInput = true
+        let steeredClaim = await steeringTools.first { $0.name == "claim_wish_output" }!
+            .handle("steered-human-claim", steeringClaimArguments)
+        let steeredReadback = try steeringPaused.read(id: steeringJob.id, worldID: "world", residentScope: "resident")
+        check(!steeredClaim.isError && steeredReadback.stage == .claimed && steeredReadback.autoContinuationPaused == true,
+              "human steering into a live run authorizes that run's explicit claim without resuming automatic commission")
         let newGrant = UUID()
         try pauseRestart.authorize(attachments: [attachment], worldID: "world", residentScope: "resident", authorizationID: newGrant,
                                    source: .init(author: "user", license: "internal"))

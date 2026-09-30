@@ -139,7 +139,7 @@ struct ProbeTimeout: Error, LocalizedError {
         let elapsed = Int(Date().timeIntervalSince(startedAt))
         print("== RECEIPT ==")
         print("result: PASS")
-        print("model: deepseek-v4-flash-vision-exp @ deepseek-official (native web seam mounted)")
+        print("model: deepseek-flash @ deepseek-official (native web seam mounted)")
         print("transport: production ResidentDSHConnector; official dsh-acp-demo entry")
         print("session_id: \(handle.sessionID)")
         print("web_search: real search performed; reply cites source URL(s)")
@@ -165,6 +165,7 @@ compile.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
 compile.arguments = ["-swift-version", "6", "-parse-as-library", "-j1"] + [
     "CodexCLI", "AgentConversationService", "ResidentCodexTransport", "ResidentCodexPolicy",
     "ResidentCodexAgent", "ResidentSteeringDelivery", "ResidentDSHTransport", "ResidentDSHConfiguration",
+    "ResidentDSHHostToolsBridge", "ResidentClaudeToolBridge", "ResidentClaudeProcessRunner",
 ].map { root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/\($0).swift").path } + [main.path, "-o", binary.path]
 try compile.run()
 let compileDeadline = Date().addingTimeInterval(180)

@@ -123,13 +123,18 @@ enum StageAvatarAnimationLoader {
     /// never reloaded or restarted, so playback phase stays continuous. When
     /// the resolved playback is not locomotion (idle/dance/sit), or no gait is
     /// available, the player keeps its authored speed untouched.
+    ///
+    /// The speed comes from ``StageAvatarLocomotionTelemetry/gaitGroundSpeed``:
+    /// while the world is translating the avatar the smooth sustained estimate
+    /// is authoritative, so a snapshot that landed on a stalled tick can never
+    /// freeze the feet of a body that is visibly sliding across the floor.
     static func applyLocomotion(
         telemetry: StageAvatarLocomotionTelemetry,
         gait: StageLocomotionGait?,
         player: AnimationPlayer?
     ) {
         guard let player, let gait, telemetry.isLocomotionActive else { return }
-        let rate = gait.playbackRate(forGroundSpeed: telemetry.measuredSpeed)
+        let rate = gait.playbackRate(forGroundSpeed: telemetry.gaitGroundSpeed)
         player.speed = rate
     }
 }

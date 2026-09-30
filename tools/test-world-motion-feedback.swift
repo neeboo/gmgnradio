@@ -20,6 +20,8 @@ guard let refreshStart = app.range(of: "private func refreshInstalledLivingWorld
       app[refreshStart..<refreshEnd].contains("avatarFormat: avatarRuntime.snapshot.avatar?.format") else {
     print("FAIL: avatar refresh leaves the world's movement speed on the previous skeleton"); exit(1)
 }
+let defaultMotionPolicy = try String(contentsOf: root.appendingPathComponent(
+    "apps/macos/Sources/GMGNRadio/Presence/ResidentLocomotionMotionPolicy.swift"), encoding: .utf8)
 let harness = #"""
 import Foundation
 import simd
@@ -27,21 +29,38 @@ struct WorldVector3: Equatable, Sendable { var x: Float = 0; var y: Float = 0; v
 struct WorldQuaternion: Equatable, Sendable { var x: Float = 0; var y: Float = 0; var z: Float = 0; var w: Float = 1 }
 struct WorldTransform: Equatable, Sendable { var position = WorldVector3(); var rotation = WorldQuaternion() }
 struct LifeActivity: Equatable, Sendable { let typeID: String }
-enum LifeActivityPhase: String, Sendable { case approach, enter, loop, exit }
-struct ActivityPhaseContract { let phase: LifeActivityPhase }
+enum LifeActivityPhase: String, Sendable { case approach, enter, loop, exit, interrupt, failed }
+enum StageAvatarFormat: String, Sendable { case vrm, pmx }
+struct ActivityPhaseContract {
+    let phase: LifeActivityPhase
+    var requiredAnchorIDs: [String] = []
+    var motionIDs: [String] = []
+    var propIDs: [String] = []
+    var durationSeconds: TimeInterval? = nil
+}
 struct StageAvatarLocomotionTelemetry: Equatable, Sendable {
     var measuredSpeed: Float = 0
+    var sustainedSpeed: Float = 0
+    var isWorldMoving = false
     var isLocomotionActive = false
     var sourceRevision: UInt64 = 0
     static let standing = StageAvatarLocomotionTelemetry()
-    init(measuredSpeed: Float = 0, isLocomotionActive: Bool = false, sourceRevision: UInt64 = 0) {
+    var gaitGroundSpeed: Float { isWorldMoving ? max(measuredSpeed, sustainedSpeed) : measuredSpeed }
+    init(measuredSpeed: Float = 0, sustainedSpeed: Float = 0, isWorldMoving: Bool = false,
+         isLocomotionActive: Bool = false, sourceRevision: UInt64 = 0) {
         self.measuredSpeed = measuredSpeed
+        self.sustainedSpeed = sustainedSpeed
+        self.isWorldMoving = isWorldMoving
         self.isLocomotionActive = isLocomotionActive
         self.sourceRevision = sourceRevision
     }
 }
+enum StageMotionFormat: String { case procedural, vrma, vmd }
+/// The freeze boundary the executor's locomotion predicate reads.
+enum StageLocomotionGait { static let freezeSpeed: Float = 0.06 }
 struct StageMotionAsset: Equatable, Sendable {
-    let id: String; let url: URL?; var loop = false
+    let id: String; let url: URL?; var format: StageMotionFormat = .vmd
+    var loop = false
     var inPlace: Bool? = false
     var strideSpeed: Float? = nil
     var isLocomotionLoop: Bool {
@@ -51,10 +70,14 @@ struct StageMotionAsset: Equatable, Sendable {
 struct StageMotionPlaybackIdentity { let motion: StageMotionAsset; let worldActivityRequestID: String?; let worldActivityPhase: LifeActivityPhase? }
 enum StageMotionPlaybackOutcome { case completed, failed(String) }
 struct StageMotionPlaybackEvent { let identity: StageMotionPlaybackIdentity; let outcome: StageMotionPlaybackOutcome }
-struct Fallback { let requestedMotionIDs: [String]; let activityTypeID: String; let phase: LifeActivityPhase; let reason: LifeActivityPhase }
+struct Fallback: Equatable { let requestedMotionIDs: [String]; let activityTypeID: String; let phase: LifeActivityPhase; let reason: LifeActivityPhase }
 enum StageAvatarMotionPlayback: Equatable, Sendable {
     case temporary(StageMotionAsset)
-    var fallback: Fallback? { nil }
+    case naturalIdle(fallback: Fallback?)
+    var fallback: Fallback? {
+        guard case let .naturalIdle(fallback) = self else { return nil }
+        return fallback
+    }
     static func resolve(activity: LifeActivity, phase: LifeActivityPhase, phaseContract: ActivityPhaseContract?, approvedMotions: [String: StageMotionAsset]) -> Self {
         .temporary(StageMotionAsset(id: "one-shot", url: nil))
     }
@@ -65,10 +88,15 @@ struct StageAvatarWorldActivitySnapshot: Equatable, Sendable {
     var activityRequestID: String? = nil
 }
 struct StageAvatarPlacement { let position: SIMD3<Float>; let scale: Float; let yaw: Float }
+/// The one field of the avatar snapshot the executor's motion policy reads.
+struct StageAvatarAssetSnapshot { let format: StageAvatarFormat }
+struct StageAvatarRuntimeSnapshotShim { let avatar: StageAvatarAssetSnapshot? }
 @MainActor final class StageAvatarRuntimeStore {
     var worldActivity: StageAvatarWorldActivitySnapshot?
     var installs = 0
     var locomotion = StageAvatarLocomotionTelemetry.standing
+    var snapshot = StageAvatarRuntimeSnapshotShim(
+        avatar: StageAvatarAssetSnapshot(format: .vrm))
     func installWorldActivity(_ value: StageAvatarWorldActivitySnapshot) { installs += 1; worldActivity = value }
     func clearWorldActivity() { worldActivity = nil }
     func updateLocomotion(_ value: StageAvatarLocomotionTelemetry) {
@@ -98,6 +126,7 @@ struct StageAvatarPlacement { let position: SIMD3<Float>; let scale: Float; let 
     \#(method)
 }
 \#(source.replacingOccurrences(of: "import WorldRuntime", with: ""))
+\#(defaultMotionPolicy)
 @main struct Test {
     @MainActor static func main() {
         let runtime = StageAvatarRuntimeStore(), stage = SpatialStageStore()

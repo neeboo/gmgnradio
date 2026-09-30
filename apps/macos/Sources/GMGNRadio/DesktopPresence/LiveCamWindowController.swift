@@ -199,6 +199,10 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
         (window as? LiveCamPanel)?.interactionView.setWishMachineTasks(tasks)
     }
 
+    func setWishContinuationResumeHandler(_ handler: @escaping (UUID) -> Void) {
+        (window as? LiveCamPanel)?.interactionView.setWishContinuationResumeHandler(handler)
+    }
+
     func setSystemInboxHandler(
         _ handler: @escaping @MainActor () -> Void
     ) {

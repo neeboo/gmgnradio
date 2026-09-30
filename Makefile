@@ -109,6 +109,7 @@ test-harnesses:
 	swift tools/test-livecam-avatar-framing.swift
 	swift tools/test-livecam-panel-sizing.swift
 	swift tools/test-stage-avatar-follow-smoothing.swift
+	swift tools/test-resident-walk-motion-default.swift
 	swift tools/test-living-resident-loop.swift
 	swift tools/test-resident-prop-render.swift
 	swift tools/test-resident-prop-grid-editor.swift
@@ -127,6 +128,7 @@ test-harnesses:
 	swift tools/test-resident-tool-bridge-errors.swift
 	swift tools/test-resident-background-presentation.swift
 	swift tools/test-resident-agent-loop.swift
+	swift tools/test-resident-prop-world-collision.swift
 
 test-all: test-install test-worlds test-daemon test-python test-harnesses dedupe
 

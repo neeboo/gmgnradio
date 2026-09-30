@@ -1134,7 +1134,59 @@ enum PictureFailure: LocalizedError {
         pausedDeliveryLoop.receiveUserMessage("告诉我后台任务的结果"); await settle()
         check(pausedDelivery.inputs.last!.events == [pausedOrdinary, pausedTerminal],
               "paused queued events are available to an explicit foreground turn without resuming autonomy")
+        // ── 停止的语义边界：只停自主，不停人类当轮明确指令 ──────────────────
+        // 被停止之后的奉命轮必须拿到"照令执行"的口径；旧措辞让居民在用户明确
+        // 说"去把斧头领了"时也保持暂停、只回答不做。
+        check(pausedDelivery.inputs.last!.isHumanOrderedTurn
+              && pausedDelivery.inputs.last!.promptText.contains("人类明确下令的动作")
+              && pausedDelivery.inputs.last!.promptText.contains("必须照令执行")
+              && !pausedDelivery.inputs.last!.promptText.contains("本轮没有人类输入"),
+              "a human-ordered turn after a stop is told to execute explicit orders, not to stay paused")
+        check(pausedDeliveryLoop.snapshot.isAutonomyPausedByUser
+              && !pausedDeliveryLoop.runHasHumanInput(runID: UUID()),
+              "run stop and autonomy pause stay observable while another run has no human input")
+        check(pausedDeliveryLoop.runHasHumanInput(runID: pausedDelivery.inputs.last!.runID),
+              "the ordered run itself reports human input")
         pausedDelivery.finish(); await settle()
+
+        // 停止后没有明确指令 ⇒ 后台轮不得自行跑起来；解除必须是一个明确动作
+        // （宿主的恢复），而不是靠猜措辞。
+        let released = Runner(), releasedClock = Clock()
+        let releasedLoop = ResidentAgentLoop(now: { releasedClock.date },
+            run: { try await released.run($0) }, steer: { await released.steer($0) })
+        releasedLoop.setBackgroundEnabled(true)
+        releasedLoop.receiveUserMessage("先看看窗外"); await settle()
+        if !released.continuations.isEmpty { released.finish("看过了"); await settle() }
+        releasedLoop.stop()
+        check(releasedLoop.snapshot.isAutonomyPausedByUser && releasedLoop.snapshot.isStopped,
+              "an explicit stop marks both the run stop and the autonomy pause")
+        releasedClock.advance(70); releasedLoop.tick(); await settle()
+        check(released.inputs.count == 1, "after a stop no background turn may start without a human release")
+        check(releasedLoop.resumeAutonomyByUser() && releasedLoop.snapshot.isAutonomyPausedByUser == false,
+              "one explicit host release clears the stop without any phrasing")
+        releasedClock.advance(70); releasedLoop.tick(); await settle()
+        check(released.inputs.count == 2 && released.inputs.last!.isBackground
+              && !released.inputs.last!.isHumanOrderedTurn
+              && released.inputs.last!.promptText.contains("本轮没有人类输入"),
+              "only after the human release does autonomy really resume, and that wake is not an ordered turn")
+        check(releasedLoop.resumeAutonomyByUser() == false, "releasing an already-released stop is a no-op")
+        // 注入式回归时不能让 harness 自己崩掉：拿不到预期轮次就到此为止，
+        // 失败的断言已经逐条打印，剩下的检查没有可观测对象。
+        if released.inputs.count > 1 {
+            released.finish("自主观察"); await settle()
+            check(releasedLoop.runHasHumanInput(runID: released.inputs.last!.runID) == false,
+                  "a background wake never reports human input by itself")
+            releasedLoop.receiveEvent(.init(id: "released-wake", kind: "task.stateChanged", summary: "后台新状态"))
+            releasedClock.advance(70); releasedLoop.tick(); await settle()
+            check(released.inputs.count == 3 && released.inputs.last!.isBackground,
+                  "the released resident can start another background turn")
+            released.delivery = .delivered
+            releasedLoop.receiveUserMessage("去把斧头领了"); await settle()
+            check(releasedLoop.runHasHumanInput(runID: released.inputs.last!.runID)
+                  && released.inputs.count == 3,
+                  "human steering delivered into a live background run makes that run an ordered run")
+            if !released.continuations.isEmpty { released.finish("去领取"); await settle() }
+        }
 
         let recover = Runner(), recoverClock = Clock()
         let recoverLoop = ResidentAgentLoop(now: { recoverClock.date },

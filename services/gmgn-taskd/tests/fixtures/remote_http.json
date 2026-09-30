@@ -1,0 +1,313 @@
+{
+  "expected": {
+    "cancel_receipt": {
+      "compute_may_continue": false,
+      "created_at": 1758000000.0,
+      "height_meters": 0.5,
+      "id": "0123456789abcdef0123456789abcdef",
+      "name": "offline-fixture-prop",
+      "reason": null,
+      "result": {
+        "affordance_candidates": [
+          "surface",
+          "grasp"
+        ],
+        "inspection": {
+          "accessor_bounds": {},
+          "accessors": 0,
+          "bounds": {
+            "dimensions": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "max": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "min": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "space": "model",
+            "units": "meters"
+          },
+          "bytes": 24,
+          "materials": 0,
+          "meters_per_model_unit": 1.0,
+          "primitives": 0,
+          "scale_calibrated": false,
+          "scene_transform_count": 0,
+          "sha256": "ab7cb3261b3327eca0eed861fd7d0f73b784dbf7f1b4d839b48661a2878d6e63",
+          "triangles": 0
+        },
+        "interaction_bindings": [],
+        "interaction_status": "unbound",
+        "model_url": "/v1/jobs/0123456789abcdef0123456789abcdef/model.glb",
+        "scale_requires_confirmation": true,
+        "source": {
+          "author": "resident",
+          "license": "CC0-1.0"
+        },
+        "suggested_height_meters": 0.5,
+        "workflow_profile": "dgx-mesh-v3;resolution=512;decimation=200000;texture_size=2048;remesh=true"
+      },
+      "source": {
+        "author": "resident",
+        "license": "CC0-1.0"
+      },
+      "state": "completed",
+      "updated_at": 1758000060.0
+    },
+    "model_bytes": 24,
+    "model_sha256": "ab7cb3261b3327eca0eed861fd7d0f73b784dbf7f1b4d839b48661a2878d6e63",
+    "status_receipt": {
+      "compute_may_continue": false,
+      "created_at": 1758000000.0,
+      "height_meters": 0.5,
+      "id": "0123456789abcdef0123456789abcdef",
+      "name": "offline-fixture-prop",
+      "reason": null,
+      "result": {
+        "affordance_candidates": [
+          "surface",
+          "grasp"
+        ],
+        "inspection": {
+          "accessor_bounds": {},
+          "accessors": 0,
+          "bounds": {
+            "dimensions": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "max": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "min": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "space": "model",
+            "units": "meters"
+          },
+          "bytes": 24,
+          "materials": 0,
+          "meters_per_model_unit": 1.0,
+          "primitives": 0,
+          "scale_calibrated": false,
+          "scene_transform_count": 0,
+          "sha256": "ab7cb3261b3327eca0eed861fd7d0f73b784dbf7f1b4d839b48661a2878d6e63",
+          "triangles": 0
+        },
+        "interaction_bindings": [],
+        "interaction_status": "unbound",
+        "model_url": "/v1/jobs/0123456789abcdef0123456789abcdef/model.glb",
+        "scale_requires_confirmation": true,
+        "source": {
+          "author": "resident",
+          "license": "CC0-1.0"
+        },
+        "suggested_height_meters": 0.5,
+        "workflow_profile": "dgx-mesh-v3;resolution=512;decimation=200000;texture_size=2048;remesh=true"
+      },
+      "source": {
+        "author": "resident",
+        "license": "CC0-1.0"
+      },
+      "state": "completed",
+      "updated_at": 1758000060.0
+    },
+    "submit_receipt": {
+      "compute_may_continue": false,
+      "created_at": 1758000000.0,
+      "height_meters": 0.5,
+      "id": "0123456789abcdef0123456789abcdef",
+      "name": "offline-fixture-prop",
+      "reason": null,
+      "result": {
+        "affordance_candidates": [
+          "surface",
+          "grasp"
+        ],
+        "inspection": {
+          "accessor_bounds": {},
+          "accessors": 0,
+          "bounds": {
+            "dimensions": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "max": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "min": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "space": "model",
+            "units": "meters"
+          },
+          "bytes": 24,
+          "materials": 0,
+          "meters_per_model_unit": 1.0,
+          "primitives": 0,
+          "scale_calibrated": false,
+          "scene_transform_count": 0,
+          "sha256": "ab7cb3261b3327eca0eed861fd7d0f73b784dbf7f1b4d839b48661a2878d6e63",
+          "triangles": 0
+        },
+        "interaction_bindings": [],
+        "interaction_status": "unbound",
+        "model_url": "/v1/jobs/0123456789abcdef0123456789abcdef/model.glb",
+        "scale_requires_confirmation": true,
+        "source": {
+          "author": "resident",
+          "license": "CC0-1.0"
+        },
+        "suggested_height_meters": 0.5,
+        "workflow_profile": "dgx-mesh-v3;resolution=512;decimation=200000;texture_size=2048;remesh=true"
+      },
+      "source": {
+        "author": "resident",
+        "license": "CC0-1.0"
+      },
+      "state": "completed",
+      "updated_at": 1758000060.0
+    }
+  },
+  "glb_base64": "Z2xURgIAAAAYAAAABAAAAEpTT057fSAg",
+  "glb_sha256": "ab7cb3261b3327eca0eed861fd7d0f73b784dbf7f1b4d839b48661a2878d6e63",
+  "job": {
+    "height_meters": 0.5,
+    "id": "B4B8F45D-F7F8-4584-BC74-C9D3BE3FE413",
+    "idempotency_key": "B4B8F45D-F7F8-4584-BC74-C9D3BE3FE413",
+    "name": "offline-fixture-prop",
+    "source": {
+      "author": "resident",
+      "license": "CC0-1.0"
+    }
+  },
+  "png_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=",
+  "png_sha256": "7ac2abfce2be8b46dd9826d597d94edeefc1570b4a992622721b90a1850e3ee9",
+  "receipt": {
+    "compute_may_continue": false,
+    "created_at": 1758000000.0,
+    "height_meters": 0.5,
+    "id": "0123456789abcdef0123456789abcdef",
+    "name": "offline-fixture-prop",
+    "reason": null,
+    "result": {
+      "affordance_candidates": [
+        "surface",
+        "grasp"
+      ],
+      "inspection": {
+        "accessor_bounds": {},
+        "accessors": 0,
+        "bounds": {
+          "dimensions": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "max": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "min": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "space": "model",
+          "units": "meters"
+        },
+        "bytes": 24,
+        "materials": 0,
+        "meters_per_model_unit": 1.0,
+        "primitives": 0,
+        "scale_calibrated": false,
+        "scene_transform_count": 0,
+        "sha256": "ab7cb3261b3327eca0eed861fd7d0f73b784dbf7f1b4d839b48661a2878d6e63",
+        "triangles": 0
+      },
+      "interaction_bindings": [],
+      "interaction_status": "unbound",
+      "model_url": "/v1/jobs/0123456789abcdef0123456789abcdef/model.glb",
+      "scale_requires_confirmation": true,
+      "source": {
+        "author": "resident",
+        "license": "CC0-1.0"
+      },
+      "suggested_height_meters": 0.5,
+      "workflow_profile": "dgx-mesh-v3;resolution=512;decimation=200000;texture_size=2048;remesh=true"
+    },
+    "source": {
+      "author": "resident",
+      "license": "CC0-1.0"
+    },
+    "state": "completed",
+    "updated_at": 1758000060.0
+  },
+  "remote_id": "0123456789abcdef0123456789abcdef",
+  "token": "offline-secret-do-not-persist",
+  "wire": {
+    "cancel": {
+      "body": "{}",
+      "headers": [
+        "accept: */*",
+        "authorization: bearer offline-secret-do-not-persist",
+        "content-length: 2",
+        "content-type: application/json",
+        "host: {{HOST}}"
+      ],
+      "method": "POST",
+      "path": "/v1/jobs/0123456789abcdef0123456789abcdef/cancel"
+    },
+    "download": {
+      "body": "",
+      "headers": [
+        "accept: */*",
+        "authorization: bearer offline-secret-do-not-persist",
+        "host: {{HOST}}"
+      ],
+      "method": "GET",
+      "path": "/v1/jobs/0123456789abcdef0123456789abcdef/model.glb"
+    },
+    "status": {
+      "body": "",
+      "headers": [
+        "accept: */*",
+        "authorization: bearer offline-secret-do-not-persist",
+        "host: {{HOST}}"
+      ],
+      "method": "GET",
+      "path": "/v1/jobs/0123456789abcdef0123456789abcdef"
+    },
+    "submit": {
+      "body": "{\"height_meters\":0.5,\"image_base64\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=\",\"name\":\"offline-fixture-prop\",\"source\":{\"author\":\"resident\",\"license\":\"CC0-1.0\"}}",
+      "headers": [
+        "accept: */*",
+        "authorization: bearer offline-secret-do-not-persist",
+        "content-length: 212",
+        "content-type: application/json",
+        "host: {{HOST}}",
+        "idempotency-key: b4b8f45d-f7f8-4584-bc74-c9d3be3fe413"
+      ],
+      "method": "POST",
+      "path": "/v1/jobs"
+    }
+  }
+}

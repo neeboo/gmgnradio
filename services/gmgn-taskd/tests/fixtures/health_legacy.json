@@ -1,0 +1,7 @@
+{
+  "status": "api_ready",
+  "generation": {
+    "ready": true,
+    "queue_depth": 0
+  }
+}

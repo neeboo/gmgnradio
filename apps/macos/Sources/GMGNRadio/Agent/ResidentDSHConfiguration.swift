@@ -28,8 +28,13 @@ struct ResidentDSHSandbox {
 /// emitted line grammar, not a general YAML parser.
 enum ResidentDSHComposition {
     static let providerID = "deepseek-official"
-    static let visionModelID = "deepseek-v4-flash-vision-exp"
-    static let textModelIDs = ["deepseek-v4-flash", "deepseek-v4-pro"]
+    /// 官方当前唯一的多模态模型名（V4.1 Flash，原生视觉理解）。旧名
+    /// `deepseek-v4-flash-vision-exp` 已下线：即使暂时仍被路由到同一个模型，
+    /// 也不再作为本组合的选择或目录条目 —— 能力声明必须指向现役模型名。
+    /// 见 https://api-docs.deepseek.com/zh-cn/guides/vision/ 与 `/models` 返回。
+    static let visionModelID = "deepseek-flash"
+    /// 现役纯文本模型（V4 Pro）。V4.1 Flash 自身的文本能力由 `visionModelID` 承担。
+    static let textModelIDs = ["deepseek-v4-pro"]
 
     /// One bounded persona. There is no second visual resident: the same
     /// conversation service speaks through this composition. The persona
@@ -62,12 +67,10 @@ enum ResidentDSHComposition {
             reasoningEffort: low
             maxTokens: 8192
             models:
-              - id: deepseek-v4-flash
-                inputModalities: [text]
+              - id: deepseek-flash
+                inputModalities: [text, image]
               - id: deepseek-v4-pro
                 inputModalities: [text]
-              - id: deepseek-v4-flash-vision-exp
-                inputModalities: [text, image]
         - id: credentials
           name: '@deepseek-ai/dsh-credentials-local'
         - id: attachment-local
@@ -78,7 +81,7 @@ enum ResidentDSHComposition {
           name: '@deepseek-ai/dsh-acp-demo'
           config:
             provider: deepseek-official
-            model: deepseek-v4-flash-vision-exp
+            model: deepseek-flash
             persistenceRoot: '\(escape(persistenceRoot.path))'
             packChunks: false
             persistenceCompression: none
@@ -469,7 +472,7 @@ enum ResidentDSHComposition {
               llm.config["maxTokens"]?.text == "8192",
               llm.config["maxTokens"]?.isQuoted == false,
               llm.nested.isEmpty,
-              llm.models.count == 3,
+              llm.models.count == 1 + textModelIDs.count,
               llm.models[visionModelID] == ["text", "image"],
               textModelIDs.allSatisfy({ llm.models[$0] == ["text"] }) else { return false }
 
@@ -520,8 +523,33 @@ enum ResidentDSHComposition {
 
     /// The selected model must exist in the mounted catalog and declare image
     /// input; both facts come from the validated composition itself.
+    ///
+    /// The host appends its private tool-plugin row (`gmgn-host-tools`) to this
+    /// same composition whenever the resident turn carries world tools, and
+    /// `makeResidentSandbox` validates that row with the exact path it wrote.
+    /// A later capability read happens on the read-back text alone, so it must
+    /// not depend on the caller still holding that path: the private row is
+    /// accepted only when it names the fixed private plugin filename, and the
+    /// full whitelist (including the catalog's image modality) is then re-run
+    /// with that expectation. Any other deviation still fails closed.
     static func declaresImageInput(_ output: String) -> Bool {
-        validateComposedConfig(output)
+        if validateComposedConfig(output) { return true }
+        guard let privateRow = privateHostToolsPath(in: output) else { return false }
+        return validateComposedConfig(output, hostToolsPluginPath: privateRow)
+    }
+
+    /// The host-private plugin path an already-emitted composition carries, or
+    /// nil when it carries none (or one that cannot be the host's own row).
+    private static func privateHostToolsPath(in output: String) -> String? {
+        let lines = output.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        for (index, line) in lines.enumerated() where line == "- id: \(hostToolsRowID)" {
+            guard index + 1 < lines.count, lines[index + 1].hasPrefix("  name: "),
+                  let value = quotedValue(String(lines[index + 1].dropFirst(8))),
+                  value.hasPrefix("/"),
+                  value.hasSuffix("/\(hostToolsPluginFilename)") else { return nil }
+            return value
+        }
+        return nil
     }
 
     // MARK: Parsing internals

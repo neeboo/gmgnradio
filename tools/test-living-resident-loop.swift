@@ -6,8 +6,32 @@ let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let sources = root.appendingPathComponent("apps/macos/Sources/GMGNRadio")
 let app = try String(contentsOf: sources.appendingPathComponent("App/GMGNRadioApp.swift"), encoding: .utf8)
 func declaration(_ signature: String, in source: String) -> String {
-    guard let start = source.range(of: signature)?.lowerBound,
-          let opening = source[start...].firstIndex(of: "{") else { fatalError("Missing \(signature)") }
+    guard let start = source.range(of: signature)?.lowerBound else { fatalError("Missing \(signature)") }
+    // 默认参数里可能自带闭包（`humanOrderedClaim: ... = { false }`）：按第一处
+    // `{` 起算会把方法体截断在默认闭包里。只有签名里先出现 `(` 时（函数声明）
+    // 才先配平参数表；枚举/结构体（`(` 出现在类型体里或没有）仍按第一个 `{`
+    // 起算，避免把类型体当参数表。
+    let opening: String.Index
+    let firstBrace = source[start...].firstIndex(of: "{")
+    if let paren = source.range(of: "(", range: start..<(firstBrace ?? source.endIndex))?.lowerBound {
+        var depth = 0
+        var cursor = paren
+        while cursor < source.endIndex {
+            if source[cursor] == "(" { depth += 1 }
+            if source[cursor] == ")" {
+                depth -= 1
+                if depth == 0 { break }
+            }
+            cursor = source.index(after: cursor)
+        }
+        guard cursor < source.endIndex, let body = source[cursor...].firstIndex(of: "{") else {
+            fatalError("Missing \(signature)")
+        }
+        opening = body
+    } else {
+        guard let body = source[start...].firstIndex(of: "{") else { fatalError("Missing \(signature)") }
+        opening = body
+    }
     var depth = 0
     for i in source[opening...].indices {
         if source[i] == "{" { depth += 1 }
@@ -39,6 +63,10 @@ let loopMethods = ["private func ensureResidentLoop(", "private func synchronize
                    "private func performResidentTurn(",
                    "private func returnHeldPropBeforeResidentStop(reason: String) -> Bool",
                    "private func stopResidentLoop(reason: String) -> Bool",
+                   // 摆放读回（"已领产物是否真的在当前空间里摆好"）现在由面板的
+                   // 一次"恢复"和后台续办共用同一份宿主事实，所以这里必须编译
+                   // 同一份真实实现。
+                   "private func residentWishPlacementAlreadyCompleted(",
                    "private func cancelResidentMessage("].map {
     declaration($0, in: app)
 }.joined(separator: "\n")

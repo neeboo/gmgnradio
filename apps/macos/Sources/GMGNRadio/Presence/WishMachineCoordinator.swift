@@ -139,7 +139,7 @@ enum WishMachineError: LocalizedError {
         case .notAtMachine: return "请先走到许愿机领取位置；托盘实际显示物品后才能领取。"
         case .retryUnavailable: return "只能确认结果未明的原提交；新生成需要用户重新发起。"
         case .pauseNotPersisted: return "当前运行已暂停自动领取，但暂停状态保存失败；重启后可能恢复，请先解决存储问题。"
-        case .automaticContinuationPaused: return "该领取委托已暂停，后台不能继续领取；请等待用户新的领取指令。"
+        case .automaticContinuationPaused: return "该任务的自动续办已停止，后台不能自行领取或摆放；本轮人类明确下令的领取不受影响。"
         case .placementRevoked: return "该摆放委托已停止，需要用户新的摆放委托才能重试。"
         case .continuationResumeUnavailable: return "该任务当前不能恢复自动续办；已取消、失败或完成的操作不会自动重试。"
         case .continuationResumeUnauthorized: return "需要本轮用户明确恢复该许愿任务；旧恢复授权不能在再次停止后复用。"

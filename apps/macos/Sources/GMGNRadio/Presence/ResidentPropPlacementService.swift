@@ -222,14 +222,20 @@ final class ResidentPropPlacementService {
     }
 
     private func validate(_ state: WorldState) throws {
-        var placed = state.objectStates.compactMap { id, item -> (String, WorldObjectState, WorldCollisionVolume)? in
-            guard let volume = item.generatedCollisionVolume else { return nil }
-            return (id,item,volume)
+        // 「世界障碍」只有一条来源：`WorldLayoutObstacles`（与运行时 `WorldAgentContext`
+        // 消费的是同一份换算）。解不出碰撞体积的已摆物件**必须可见地拒绝**：
+        // `compactMap` 的旧写法会把它静默丢掉，让它对这条判据（也对运行时）变成"无敌"。
+        let obstacles = WorldLayoutObstacles.resolve(state)
+        if let unmodelled = obstacles.unmodelledObjectIDs.first {
+            throw ResidentPropPlacementError.blockedBySupport(.unmodelledPlacedProp(unmodelled))
         }
-        if let held = state.heldProp, held.returnState.isEnabled,
-           let volume = held.returnState.generatedCollisionVolume {
-            placed.append((held.objectID, held.returnState, volume))
+        // 编号 + 物件状态（尺寸/层要用）+ **同一个** 阻挡体积（运行时也读它）。
+        var placed: [(String, WorldObjectState, WorldCollisionVolume)] = obstacles.volumes.compactMap { volume in
+            if let item = state.objectStates[volume.id] { return (volume.id, item, volume) }
+            if let held = state.heldProp, held.objectID == volume.id { return (volume.id, held.returnState, volume) }
+            return nil
         }
+        placed.sort { $0.0 < $1.0 }
         // 承托几何拿不到就一律拒绝（fail-closed），而不是"随便放"。
         //
         // 守卫在**循环里**是刻意的：`register`（只把物件收进库存、还没摆出来）没有承托面可判，
@@ -322,16 +328,17 @@ final class ResidentPropPlacementService {
             anchorIDSet.formUnion(candidateRegistry.routeAnchorIDs)
             // 移动图上的障碍 = **房间里现在所有**带阻挡体积的物件（含这一件候选）。
             // 把既有的也算进来，判据就同时覆盖"新家具和旧家具合起来把路堵死"。
+            //
+            // 被判定的东西就是上面那个 `box`（= `generatedCollisionVolume`，也就是运行时
+            // 拦人的同一个体积），判定函数就是运行时那一份（`WorldCapsuleClearance`，经
+            // `WorldPlacementRouteMap.blockedNodes`）—— **判据只有一条**。
+            //
+            // 这里以前自己重建 footprint（尺寸 × yaw）再交给移动图，而移动图用**未旋转**的
+            // 半尺寸去扩世界轴 AABB：真机那把 yaw=90° 的斧头因此漏挡 9 个、假挡 5 个节点。
+            // 也不再因为"查不到承托层"而 `continue` 跳过一件已放物件（那是静默 fail-open）。
             var occupied: Set<Int> = []
-            for (_, item, box) in placed {
-                guard let prop = item.generatedProp,
-                      let layer = Self.supportLayer(at: item.transform.position, grid: support.grid)
-                else { continue }
-                let yaw = atan2(2*(box.rotation.w*box.rotation.y), 1-2*box.rotation.y*box.rotation.y)
-                let footprint = WorldPlanarFootprint(size: SIMD2(prop.size.x, prop.size.z), yaw: yaw)
-                occupied.formUnion(constraint.map.blockedNodes(
-                    footprint: footprint, height: prop.size.y,
-                    at: layer.column, supportHeight: layer.supportHeight))
+            for (_, _, box) in placed {
+                occupied.formUnion(constraint.map.blockedNodes(volume: box))
             }
             switch constraint.map.decision(
                 blockedNodes: occupied,

@@ -1,0 +1,20 @@
+{
+  "status": "api_ready",
+  "generation": {
+    "ready": true,
+    "queue_depth": 2
+  },
+  "provider": {
+    "id": "dgx-trellis",
+    "kind": "remote_http",
+    "ready": true,
+    "reason": null,
+    "stages": ["submit", "status", "cancel", "fetch_model"],
+    "max_input_px": 512,
+    "est_seconds": 420.0,
+    "uploads_data": true,
+    "quota": {
+      "jobs_per_hour": 6
+    }
+  }
+}

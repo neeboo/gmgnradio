@@ -22,7 +22,9 @@ let methods = ["private func wishMachineClaimEvidence(", "private func synchroni
                "private func registerWishImages(", "private func authorizeWishImages(",
                "private struct ResidentWishImageRegistration", "private func performResidentTurn(",
                "private struct ResidentWishScope", "private func bindResidentWishScope(",
-               "private func pauseResidentWishContinuations()"].map(declaration).joined(separator: "\n")
+               "private func pauseResidentWishContinuations()",
+               "private func residentWishPlacementAlreadyCompleted(",
+               "private func resumeWishAutomaticContinuation("].map(declaration).joined(separator: "\n")
 let messageStateStart = source.range(of: "    private var residentWishMessageScope:")!.lowerBound
 let messageStateEnd = source.range(of: "    private struct ResidentOwnedPropAsset")!.lowerBound
 let messageState = String(source[messageStateStart..<messageStateEnd])
@@ -65,7 +67,7 @@ struct WishPlacementDelegation {
     enum State { case placed, pending, failed, revoked }
     var state: State; var lastError: String?
 }
-struct WishMachineTaskPresentation { let id: UUID; let title: String; let status: String; let detail: String?; let isTerminal: Bool }
+struct WishMachineTaskPresentation { let id: UUID; let title: String; let status: String; let detail: String?; let isTerminal: Bool; var autoContinuationPaused = false }
 @MainActor final class TaskPanel {
     var tasks: [WishMachineTaskPresentation] = []
     func setWishMachineTasks(_ tasks: [WishMachineTaskPresentation]) { self.tasks = tasks }
@@ -98,9 +100,23 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
     var stopped = false
     var invalidated = false
     var intentPaused = false
-    struct Snapshot { let isRunning: Bool; let isStopped: Bool; let isInvalidated: Bool; let intentPausedByUser: Bool }
+    struct Snapshot {
+        let isRunning: Bool; let isStopped: Bool; let isInvalidated: Bool; let intentPausedByUser: Bool
+        var isAutonomyPausedByUser: Bool { isStopped || intentPausedByUser }
+    }
     var snapshot: Snapshot { .init(isRunning: active != nil, isStopped: stopped, isInvalidated: invalidated, intentPausedByUser: intentPaused) }
+    var humanInputRuns = Set<UUID>()
+    var releases = 0
     func isCurrent(runID: UUID) -> Bool { active == runID }
+    func runHasHumanInput(runID: UUID) -> Bool { !invalidated && active == runID && humanInputRuns.contains(runID) }
+    @discardableResult
+    func resumeAutonomyByUser() -> Bool {
+        var changed = false
+        if intentPaused { intentPaused = false; changed = true }
+        if stopped, active == nil { stopped = false; changed = true }
+        if changed { releases += 1 }
+        return changed
+    }
     func allowsSilentCompletion(runID: UUID) -> Bool { active == runID && canCompleteSilently }
     func receiveEvent(_ event: Event) { if !observations.contains(where: { $0.id == event.id }) && !continuations.contains(where: { $0.id == event.id }) { observations.append(event) } }
     func receiveContinuationEvent(_ event: Event) { if !continuations.contains(where: { $0.id == event.id }) { continuations.append(event) } }
@@ -125,6 +141,27 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
         pausedScopes.append(worldID + ":" + residentScope)
         for index in jobs.indices where jobs[index].worldID == worldID && jobs[index].residentScope == residentScope { jobs[index].autoContinuationPaused = true }
         if pauseFails { throw FixtureError.failed }
+    }
+    var resumeAuthorizations: [UUID] = []
+    var resumeFails = false
+    func read(id: UUID, worldID: String, residentScope: String) throws -> WishMachineJob {
+        guard let job = jobs.first(where: { $0.id == id && $0.worldID == worldID && $0.residentScope == residentScope }) else { throw FixtureError.failed }
+        return job
+    }
+    @discardableResult
+    func resumeContinuations(id: UUID, worldID: String, residentScope: String, authorizationID: UUID,
+                             placementAlreadyCompleted: Bool? = nil) throws -> WishMachineJob {
+        if resumeFails { throw FixtureError.failed }
+        guard let index = jobs.firstIndex(where: { $0.id == id && $0.worldID == worldID && $0.residentScope == residentScope }),
+              jobs[index].autoContinuationPaused == true else { throw FixtureError.failed }
+        guard !resumeAuthorizations.contains(authorizationID) else { throw FixtureError.failed }
+        resumeAuthorizations.append(authorizationID)
+        jobs[index].autoContinuationPaused = false
+        events.append(.init(id: UUID(), wishID: id, worldID: worldID, residentScope: residentScope,
+            objectID: jobs[index].objectID, kind: .stateChanged, autoContinuationPaused: false,
+            continuationResumeAuthorizationID: authorizationID))
+        onChange?()
+        return jobs[index]
     }
     func automaticContinuationEvents(worldID: String, residentScope: String) -> [WishMachineEvent] {
         pendingEvents(worldID: worldID, residentScope: residentScope).filter { event in jobs.contains { $0.id == event.wishID && $0.autoContinuationPaused != true } }
@@ -192,7 +229,8 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
     var propAnchorRegistry = AnchorRegistry()
     let manifest = Manifest()
     var snapshot = Snapshot()
-    struct ObjectState { var generatedProp: Bool?; var isEnabled = false }
+    struct GeneratedProp { let sourceWishID: String }
+    struct ObjectState { var generatedProp: GeneratedProp?; var isEnabled = false }
     struct State { var objectStates: [String: ObjectState] = [:] }
     var state = State()
 }
@@ -241,7 +279,7 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
     let tools = ResidentConversationTools()
     func currentResidentWorldContext() -> ResidentWorldContext { .init(worldID: spatialStage.selectedWorldID, sessionScope: scope) }
     func ensureResidentLoop() -> ResidentAgentLoop { residentAgentLoop! }
-    func makeResidentWorldTools(messageID: UUID, wishAuthorizationID: UUID?, allowsPausedWishClaim: Bool, allowsPropMutation: Bool) -> ResidentConversationTools? { tools }
+    func makeResidentWorldTools(messageID: UUID, wishAuthorizationID: UUID?, allowsPausedWishClaim: Bool, humanOrderedClaim: @escaping @MainActor () -> Bool = { false }, allowsPropMutation: Bool) -> ResidentConversationTools? { tools }
     func synchronizeOwnedResidentProps() async {}
     func wishMachinePromptContext(_ world: ResidentWorldContext) -> String { "" }
     func reconcileResidentWishPlacements(_ world: ResidentWorldContext) throws {}
@@ -274,6 +312,10 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
     /// 生产里的回合记忆登记只走语义记忆服务（本 harness 不覆盖），这里只补签名可编译。
     func registerResidentMemoryTurn(runID: UUID, realUserText: String?, reply: String) {}
     func perform(_ input: ResidentAgentLoop.Input) async throws -> String { try await performResidentTurn(input) }
+    /// 生产里作用域在 ensureResidentLoop()/回合入口绑定；harness 直接绑定一次。
+    func bindWishScope() { bindResidentWishScope(currentResidentWorldContext(), loop: residentAgentLoop!) }
+    /// 面板的"恢复自动领取"控件就是这一次调用（生产里由两个窗口的 handler 接线）。
+    func resume(_ id: UUID) -> Bool { resumeWishAutomaticContinuation(id: id) }
     func register(_ image: ResidentImageAttachment) { registerWishImages([image], loop: residentAgentLoop!, worldScope: scope) }
     func prepare(_ input: ResidentAgentLoop.Input) throws -> UUID? { try authorizeWishImages(input, worldContext: currentResidentWorldContext()) }
     func pause() { pauseResidentWishContinuations() }
@@ -459,7 +501,7 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
         placedApp.wishMachineCoordinator.jobs = [claimedJob]
         placedApp.propGenerationStore.jobs = [claimedJob]
         placedApp.wishMachineCoordinator.placement = .init(state: .revoked)
-        placedApp.livingWorldContext!.state.objectStates[job.objectID] = .init(generatedProp: true, isEnabled: true)
+        placedApp.livingWorldContext!.state.objectStates[job.objectID] = .init(generatedProp: .init(sourceWishID: job.id.uuidString), isEnabled: true)
         await placedApp.refresh()
         check(placedApp.stageWindowController!.tasks.first?.status == "已摆放", "actual manual placement is displayed even when the earlier automatic delegation remains revoked")
         check(placedApp.wishMachineCoordinator.placement?.state == .revoked, "displaying manual placement never revives or completes the revoked automatic delegation")
@@ -517,6 +559,78 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
         check(resumeApp.residentAgentLoop!.continuations.map(\.id) == ["wish." + resumedEvent.id.uuidString], "persisted explicit restoration grants a new continuation even after the old output-ready event was consumed")
         check(resumeApp.propGenerationStore.published[resumedEvent.id]?.payload["resume_authorization_id"] == .string(resumedEvent.continuationResumeAuthorizationID!.uuidString), "restoration notification preserves the real foreground authorization identity")
         check(resumeApp.propGenerationStore.published[resumedEvent.id]?.payload["auto_continuation_paused"] == .bool(false), "restoration notification reports the persisted pause state")
+
+        // ── 停止后仍然没有"不请自来"的自主续办，但事实照样入队 ──────────────
+        // 旧实现里 isStopped 直接把这台产物的就绪事实整条丢掉，与紧邻注释
+        // （"停止期间也照样排队给下一次人类输入看"）自相矛盾；居民因此只能
+        // 靠碰运气再查一次。现在事实入队，自主授权仍然挂起。
+        let factApp = App()
+        var factJob = job; factJob.autoContinuationPaused = true
+        let readyFact = WishMachineEvent(id: UUID(), wishID: id, worldID: "room", residentScope: "resident",
+            objectID: "item", kind: .outputReady)
+        factApp.wishMachineCoordinator.jobs = [factJob]
+        factApp.wishMachineCoordinator.events = [readyFact]
+        factApp.propGenerationStore.jobs = [factJob]
+        factApp.spatialStage.wishMachineOutputStatus = .ready(id: "item")
+        factApp.residentAgentLoop!.stopped = true
+        await factApp.refresh()
+        check(factApp.residentAgentLoop!.observations.contains { $0.id == "wish." + readyFact.id.uuidString },
+              "a stop still queues the ready fact for the next human turn instead of dropping it")
+        check(factApp.residentAgentLoop!.continuations.isEmpty,
+              "a stop never turns that same fact into an autonomous continuation")
+        check(factApp.propGenerationStore.acknowledged("agent").isEmpty,
+              "queuing a fact during a stop is not consumption")
+        factApp.residentAgentLoop!.stopped = false // 新的真实人类消息
+        factApp.residentAgentLoop!.active = UUID()
+        await factApp.refresh()
+        check(factApp.residentAgentLoop!.continuations.isEmpty && factApp.wishMachineCoordinator.jobs[0].autoContinuationPaused == true,
+              "a fresh human turn clears the run stop but never the task-level pause")
+
+        // ── 解除停止是一个动作：任务级续办与 run 级停止各自可观测 ────────────
+        let releaseApp = App()
+        var releaseJob = job; releaseJob.autoContinuationPaused = true
+        releaseApp.wishMachineCoordinator.jobs = [releaseJob]
+        releaseApp.propGenerationStore.jobs = [releaseJob]
+        releaseApp.spatialStage.wishMachineOutputStatus = .ready(id: "item")
+        releaseApp.residentAgentLoop!.stopped = true
+        releaseApp.residentAgentLoop!.intentPaused = true
+        await releaseApp.refresh()
+        let pausedTask = releaseApp.stageWindowController!.tasks.first!
+        check(pausedTask.autoContinuationPaused, "the task row carries the task-level pause as visible state")
+        check(pausedTask.detail?.contains("自主行动已停止") == true
+              && pausedTask.detail?.contains("直接下达指令仍可当轮执行") == true,
+              "the row explains that the stop only blocks autonomy, not this turn's explicit order")
+        check(releaseApp.residentAgentLoop!.snapshot.isAutonomyPausedByUser
+              && releaseApp.wishMachineCoordinator.jobs[0].autoContinuationPaused == true,
+              "run stop and task-level pause are two observably separate states")
+        releaseApp.bindWishScope()
+        check(releaseApp.resume(id),
+              "the panel's single resume action succeeds on a stopped task")
+        check(releaseApp.wishMachineCoordinator.jobs[0].autoContinuationPaused == false
+              && releaseApp.residentAgentLoop!.snapshot.isAutonomyPausedByUser == false
+              && releaseApp.residentAgentLoop!.releases == 1,
+              "one host action clears both the task-level pause and the run-level stop")
+        check(releaseApp.wishMachineCoordinator.resumeAuthorizations.count == 1,
+              "the release uses exactly one fresh host authorization")
+        check(releaseApp.wishMachineCoordinator.jobs[0].stage == .ready,
+              "resuming automatic continuation never claims the artifact by itself")
+        await releaseApp.settle()
+        let releasedFacts = releaseApp.wishMachineCoordinator.automaticContinuationEvents(worldID: "room", residentScope: "resident")
+        check(releasedFacts.count == 1
+              && releasedFacts[0].continuationResumeAuthorizationID == releaseApp.wishMachineCoordinator.resumeAuthorizations[0],
+              "the release grants exactly one trusted continuation carrying the host's own authorization")
+        check(releaseApp.residentAgentLoop!.continuations.count == 1,
+              "the released resident receives one continuation and no ambient autonomy")
+        // 再次停止后再按一次"恢复"用的是全新宿主授权：旧授权不会被复用。
+        try releaseApp.wishMachineCoordinator.pauseContinuations(worldID: "room", residentScope: "resident")
+        releaseApp.residentAgentLoop!.stopped = true
+        releaseApp.residentAgentLoop!.intentPaused = true
+        check(releaseApp.resume(id)
+              && releaseApp.wishMachineCoordinator.resumeAuthorizations.count == 2
+              && releaseApp.wishMachineCoordinator.resumeAuthorizations[0] != releaseApp.wishMachineCoordinator.resumeAuthorizations[1],
+              "each stop needs its own fresh release authorization; the old one is never replayed")
+        check(releaseApp.residentAgentLoop!.releases == 2,
+              "the second release is another explicit human action, not an ambient recovery")
 
         let isolatedApp = App()
         isolatedApp.wishMachineCoordinator.jobs = [failedJob]
