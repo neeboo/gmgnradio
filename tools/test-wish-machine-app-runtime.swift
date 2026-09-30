@@ -85,7 +85,7 @@ enum WishMachineOutputStatus: Equatable { case empty, loading(id: String), ready
 enum WishMachineScene {
     enum State { case idle, generating, ready, failed }
     static let worldID = "room"
-    static let pickupPosition = SIMD3<Float>(0.8, 0, -3.55)
+    static let activityID = "wish_machine.collect"
 }
 struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
 @MainActor final class ResidentAgentLoop {
@@ -175,9 +175,21 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
 @MainActor final class World {
     struct Manifest { let worldID = "room" }
     struct Transform { var position = SIMD3<Float>(0.8, 0, -3.55) }
-    enum Phase: String { case loop, traveling }
+    enum Phase: String { case loop, traveling, approach, enter }
     struct Activity { let id: String; let phase: Phase }
+    /// 模拟状态的"这件活动是 active"：**不是**领取判据要用的"真的在跑"。
     struct Snapshot { var agentTransform = Transform(); var activeActivity: Activity? = .init(id: "wish_machine.collect", phase: .loop) }
+    /// 执行器的一手事实：没有 run 就是 nil。与 `snapshot.activeActivity` 分开建模，
+    /// 因为两者确实可以不一致（模拟状态说在跑、执行器空转时相位会回落到 loop）。
+    struct Running { let id: String; let phase: Phase }
+    var runningActivity: Running? = .init(id: "wish_machine.collect", phase: .loop)
+    /// 注册出来的取物锚点：领取位置的**唯一**来源。
+    struct Anchor { let id: String; let position: SIMD3<Float> }
+    struct AnchorRegistry {
+        var anchor: Anchor? = .init(id: "wish_machine.device#pickup", position: SIMD3(0.8, 0, -3.55))
+        func entry(activityID: String) -> Anchor? { activityID == WishMachineScene.activityID ? anchor : nil }
+    }
+    var propAnchorRegistry = AnchorRegistry()
     let manifest = Manifest()
     var snapshot = Snapshot()
     struct ObjectState { var generatedProp: Bool?; var isEnabled = false }
@@ -200,7 +212,7 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
     var error: Error?
     var reply = "done"
     var onSend: (() -> Void)?
-    func send(_ text: String, imageURLs: [URL], worldContext: ResidentWorldContext, worldTools: ResidentConversationTools?, onCancel: @escaping @MainActor () -> Void) async throws -> String {
+    func send(_ text: String, imageURLs: [URL], worldContext: ResidentWorldContext, worldTools: ResidentConversationTools?, userMessage: String? = nil, onCancel: @escaping @MainActor () -> Void) async throws -> String {
         calls += 1
         if let error { throw error }
         onSend?()
@@ -239,7 +251,14 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
     /// 所以只补签名可编译，不假装覆盖其行为。
     var wishTaskPromptGeneration = 0
     func pushSystemInboxSnapshots() {}
-    func pushWishTaskPrompts(_ tasks: [WishMachineTaskPresentation], worldID: String, scope: String) {}
+    /// 生产里这条先落统一状态域（system inbox）再投影到两个表面。本 harness 断言的是
+    /// 两个表面看到同一份持久任务，不覆盖 inbox 落库，所以只按**同一个 tasks 值**
+    /// 同步投影到两个面板 —— 不假装覆盖 inbox 那条管道。
+    func pushWishTaskPrompts(_ tasks: [WishMachineTaskPresentation], worldID: String, scope: String) {
+        wishTaskPromptGeneration += 1
+        stageWindowController?.setWishMachineTasks(tasks)
+        liveCamWindowController?.setWishMachineTasks(tasks)
+    }
     \#(methods)
     func refresh() async { await refreshWishMachine() }
     func settle() async {
@@ -252,6 +271,8 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
         while residentWishMessageRefreshRunning { await Task.yield() }
     }
     func evidence(_ job: WishMachineJob) -> WishMachineClaimEvidence? { wishMachineClaimEvidence(for: job) }
+    /// 生产里的回合记忆登记只走语义记忆服务（本 harness 不覆盖），这里只补签名可编译。
+    func registerResidentMemoryTurn(runID: UUID, realUserText: String?, reply: String) {}
     func perform(_ input: ResidentAgentLoop.Input) async throws -> String { try await performResidentTurn(input) }
     func register(_ image: ResidentImageAttachment) { registerWishImages([image], loop: residentAgentLoop!, worldScope: scope) }
     func prepare(_ input: ResidentAgentLoop.Input) throws -> UUID? { try authorizeWishImages(input, worldContext: currentResidentWorldContext()) }
@@ -344,8 +365,35 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
         check(app.wishMachineCoordinator.pausedScopes.count == 1, "old binding cannot pause a replacement resident loop")
         app.residentAgentLoop = oldLoop
         check(app.evidence(job)?.outputAvailable == true && app.evidence(job)?.distanceMeters == 0, "claim evidence uses actual rendered output and resident location")
+        // ── 领取位置只有一个来源：运行时注册的取物锚点 ─────────────────────────
+        app.livingWorldContext!.propAnchorRegistry.anchor = .init(
+            id: "wish_machine.device#pickup", position: SIMD3(3.5, 0.25, -7.25)) // 与烘焙值不同的位置
+        check(app.evidence(job)?.distanceMeters ?? 0 > 0.25,
+              "the comparison point must follow the registered anchor, not the resident's own coordinates")
+        app.livingWorldContext!.snapshot.agentTransform.position = SIMD3(3.5, 0.25, -7.25)
+        check(app.evidence(job)?.distanceMeters == 0 && app.evidence(job) != nil,
+              "standing on the moved registered anchor must supply claim evidence")
+        app.livingWorldContext!.propAnchorRegistry.anchor = nil
+        check(app.evidence(job) == nil, "no registered pickup anchor means no claim evidence at all")
+        app.livingWorldContext!.propAnchorRegistry.anchor = .init(
+            id: "wish_machine.device#pickup", position: SIMD3(0.8, 0, -3.55))
+        app.livingWorldContext!.snapshot.agentTransform.position = SIMD3(0.8, 0, -3.55)
+        // ── "真的在跑"只认执行器一份事实，不认模拟状态 + 相位回落拼出来的假象 ──
+        check(app.evidence(job)?.activityID == "wish_machine.collect" && app.evidence(job)?.phase == "loop",
+              "a genuinely running collection loop supplies the activity and phase")
+        app.livingWorldContext!.runningActivity = nil
+        check(app.evidence(job)?.activityID == nil && app.evidence(job)?.phase == nil,
+              "an idle executor cannot be described as a running activity, even while the simulation still records one")
+        check(app.livingWorldContext!.snapshot.activeActivity?.phase == .loop,
+              "the simulation snapshot still reports its safe-idle loop phase, which is exactly why evidence must not read it")
+        app.livingWorldContext!.runningActivity = .init(id: "wish_machine.collect", phase: .loop)
         app.livingWorldContext!.snapshot.agentTransform.position.x += 1
         check(app.evidence(job)!.distanceMeters > 0.25, "resident away from pickup cannot satisfy arrival distance")
+        app.livingWorldContext!.snapshot.agentTransform.position.x -= 1
+        app.spatialStage.wishMachineOutputStatus = .loading(id: "item")
+        check(app.evidence(job)?.outputAvailable == false && app.evidence(job) != nil,
+              "standing on the registered anchor with an unrendered tray still refuses the pickup")
+        app.spatialStage.wishMachineOutputStatus = .ready(id: "item")
         app.scope = "other"
         check(app.evidence(job) == nil, "another resident scope cannot supply claim evidence")
         app.scope = "resident"

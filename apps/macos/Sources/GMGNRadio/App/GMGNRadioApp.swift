@@ -5261,8 +5261,12 @@ final class AppDelegate:
         let outputAvailable = spatialStage.wishMachineOutput?.id == job.objectID
             && spatialStage.wishMachineOutput?.worldID == job.worldID
             && spatialStage.wishMachineOutputStatus == .ready(id: job.objectID)
-        return WishMachineClaimEvidence(worldID: job.worldID, activityID: context.snapshot.activeActivity?.id,
-            phase: context.snapshot.activeActivity?.phase.rawValue,
+        // "在跑哪个活动、哪个相位"只认执行器**同一份**一手事实。`snapshot.activeActivity`
+        // 把模拟状态的 id 与执行器的相位拼在一起：执行器空转时它给的是"没有 id + 安全待机
+        // 的 loop"，于是 `phase == "loop"` 会在什么都没跑的时候成立。领取要的是"真的在跑"。
+        let running = context.runningActivity
+        return WishMachineClaimEvidence(worldID: job.worldID, activityID: running?.id,
+            phase: running?.phase.rawValue,
             distanceMeters: sqrt(dx * dx + dy * dy + dz * dz), outputAvailable: outputAvailable)
     }
 

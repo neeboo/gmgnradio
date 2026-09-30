@@ -29,6 +29,29 @@ struct Config: Decodable {
     let framing: Framing
 }
 
+// 世界运行时之外的宿主类型（只为复刻 App 的可开始性判据）。
+enum StageAvatarFormat: String, Sendable { case vrm, pmx }
+enum StageMotionFormat: String, Sendable { case procedural, vrma, vmd }
+struct StageMotionAsset: Equatable, Sendable {
+    let id: String
+    let name: String
+    let format: StageMotionFormat
+    let url: URL?
+    let version: String?
+    let sha256: String?
+    let loop: Bool
+    let strideSpeed: Float?
+    let playbackRate: Float
+    let inPlace: Bool?
+    init(id: String, name: String = "", format: StageMotionFormat, url: URL?,
+         version: String? = nil, sha256: String? = nil, loop: Bool = true,
+         strideSpeed: Float? = nil, playbackRate: Float = 1, inPlace: Bool? = nil) {
+        self.id = id; self.name = name; self.format = format; self.url = url
+        self.version = version; self.sha256 = sha256; self.loop = loop
+        self.strideSpeed = strideSpeed; self.playbackRate = playbackRate; self.inPlace = inPlace
+    }
+}
+
 func unwrap<T>(_ value: T?) throws -> T {
     guard let value else { throw ProbeError.missing }
     return value
@@ -44,6 +67,32 @@ func planarDistance(_ first: WorldVector3, _ second: WorldVector3) -> Float {
 }
 func describe(_ value: WorldVector3) -> String {
     String(format: "(%.3f,%.3f,%.3f)", value.x, value.y, value.z)
+}
+
+/// App `isResidentActivityAvailable(id)` 的分支形状（`App/GMGNRadioApp.swift`）：
+///
+///     if context.isPropCapabilityActivity(id), let enter = 契约(.enter) {
+///         return enter.motionIDs.contains { supported[$0] != nil }   // 只有绑定能力活动走这条
+///     }
+///     return ResidentPerformanceMotionPolicy.isAvailable(...)         // 其余活动按通用策略
+///
+/// 分类用**真源码** `WorldAgentContext.isPropCapabilityActivity`，通用策略用**真源码**
+/// `ResidentPerformanceMotionPolicy`；动作门禁那半边代入"一个动作都没装"（`installed == [:]`），
+/// 因为设备活动的 enter 契约本来就 `motionIDs == []` —— 这正是 649e425 之后它们被判成
+/// "缺动作、不可用"的原因。格式匹配在空表上没有意义，所以这里只查"装了没有"。
+@MainActor
+func residentActivityAvailable(
+    _ context: WorldAgentContext,
+    _ activityID: String,
+    installed: [String: StageMotionAsset],
+    avatarFormat: StageAvatarFormat?
+) -> Bool {
+    if context.isPropCapabilityActivity(activityID),
+       let enter = context.activityCatalog.definition(id: activityID)?.contract(for: .enter) {
+        return enter.motionIDs.contains { installed[$0] != nil }
+    }
+    return ResidentPerformanceMotionPolicy.isAvailable(
+        activityID: activityID, avatarFormat: avatarFormat, approvedMotions: installed)
 }
 
 @main struct Test {
@@ -367,6 +416,64 @@ func describe(_ value: WorldVector3) -> String {
             manifest.waypoints.first { $0.id == "wp.jukebox" }?.position)) < 0.001,
               "the jukebox keeps its registered entry (derived from its own declaration) while the machine is withdrawn")
 
+        // ── 断言 5：活动的**来源**必须显式区分，可开始性不能拿生成物件的规则审设备活动 ──
+        // 居民能不能真的走到领取位置，取决于 App 允不允许 `start_activity
+        // wish_machine.collect`。649e425 把功能点锚点活动也塞进 `propActivities`，
+        // 而 `isPropCapabilityActivity` 当时是"在这个字典里就算生成物件能力活动"，
+        // 于是设备活动被要求"enter 相位必须有已批准的 avatar 动作" —— 而它的 enter
+        // 契约本来就是 `motionIDs == []`，判据恒为 false，居民**永远**进不了领取活动。
+        //
+        // 用**种子摆放**的新上下文做这一组断言（上面的上下文已经把机器收回了，
+        // 收回后活动本就不该存在）。
+        let seedContext = try WorldAgentContext(manifest: manifest, propFunctionSources: sources)
+        _ = try seedContext.installCollisionWorldAndReconcilePlacement(combined)
+        check(seedContext.isRegisteredFunctionPointActivity("wish_machine.collect"),
+              "the machine's activity must be classified as a registered function-point activity")
+        check(!seedContext.isPropCapabilityActivity("wish_machine.collect"),
+              "the machine's activity must not be classified as a generated-prop capability activity")
+        check(seedContext.isRegisteredFunctionPointActivity("music.listen"),
+              "the jukebox's activity must be classified as a registered function-point activity")
+        check(!seedContext.isPropCapabilityActivity("music.listen"),
+              "the jukebox's activity must not be classified as a generated-prop capability activity")
+        check(seedContext.activityCatalog.definition(id: "wish_machine.collect")?
+                .contract(for: .enter)?.motionIDs.isEmpty == true,
+              "the machine's enter phase declares no motion, so no motion can be missing")
+        let installed: [String: StageMotionAsset] = [:] // 一个动作都没装：最少假设
+        for avatarFormat in [StageAvatarFormat.pmx, StageAvatarFormat.vrm] {
+            check(residentActivityAvailable(seedContext, "wish_machine.collect",
+                    installed: installed, avatarFormat: avatarFormat),
+                  "a resident on \(avatarFormat.rawValue) must be able to start the machine's collection activity")
+            check(residentActivityAvailable(seedContext, "music.listen",
+                    installed: installed, avatarFormat: avatarFormat),
+                  "a resident on \(avatarFormat.rawValue) must be able to start the jukebox's activity")
+        }
+        // 门禁没有被拆掉：真实需要动作的表演活动，在没装动作时仍然不可开始。
+        check(!residentActivityAvailable(seedContext, "performance.backflip",
+                installed: installed, avatarFormat: .pmx),
+              "a performance activity without its installed motion must stay unavailable")
+
+        // ── 断言 6：领取判据里的"真的在跑"只能来自执行器一份事实 ────────────────
+        // `snapshot.activeActivity` 把模拟状态的 id 与执行器的相位拼在一起：执行器没有 run 时
+        // `ActivityExecutor.status` 走安全待机回退（activityID: nil, phase: .loop），于是
+        // "相位是 loop"在什么都没跑时也成立。恢复一份"模拟状态记着领取活动、执行器还没接管"
+        // 的存档就能造出这个不一致，它必须**不能**冒充"真的在跑"。
+        struct StaleRestore: WorldStatePersisting {
+            let state: WorldState
+            func save(_ state: WorldState) throws {}
+            func load() throws -> WorldState? { state }
+        }
+        var stale = seedContext.state
+        stale.activeActivity = WorldActivityState(
+            activityID: "wish_machine.collect", status: .running, startedAt: Date(timeIntervalSince1970: 0))
+        let staleContext = try WorldAgentContext(
+            manifest: manifest, persistence: StaleRestore(state: stale), propFunctionSources: sources)
+        check(staleContext.snapshot.activeActivity?.id == "wish_machine.collect",
+              "the restored simulation still records the collection activity")
+        check(staleContext.snapshot.activeActivity?.phase == .loop,
+              "an idle executor's safe-idle fallback reports phase loop, which is why the snapshot's phase cannot prove a run")
+        check(staleContext.runningActivity == nil,
+              "the executor's own fact must be nil when no run is executing, got \(String(describing: staleContext.runningActivity))")
+
         print("PASS: \(checks) prop function-point anchor checks; machine moved to \(describe(moved)); "
             + "blocker rejected at \(describe(blockerCell)); jukebox entry \(describe(jukeboxEntry.position))")
     }
@@ -407,6 +514,7 @@ let build = root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build
 let objects = try FileManager.default.contentsOfDirectory(at: build.appendingPathComponent("WorldRuntime.build"), includingPropertiesForKeys: nil).filter { $0.pathExtension == "o" }.map(\.path)
 let compiled = try run("/usr/bin/swiftc", ["-j1", "-parse-as-library", "-I", build.appendingPathComponent("Modules").path,
     sourceRoot.appendingPathComponent("Agent/WorldAgentContext.swift").path,
+    sourceRoot.appendingPathComponent("Presence/ResidentPerformanceMotionPolicy.swift").path,
     sourceRoot.appendingPathComponent("Presence/ResidentPropPlacementService.swift").path,
     sourceRoot.appendingPathComponent("Presence/ResidentPropPlacementConfiguration.swift").path,
     sourceRoot.appendingPathComponent("Presence/ResidentPropEditorState.swift").path,

@@ -92,6 +92,19 @@ final class WorldAgentContext {
     /// `approachPoint` is the collision-verified final leg appended after the
     /// entry waypoint when the waypoint itself lies outside arm's reach.
     private struct PropActivity {
+        /// 这件活动的**来源**。两类活动的几何都来自运行时注册/派生，但它们是不同的东西，
+        /// 消费方（动作可用性、进入阶段动作失败回写）用的是不同规则：
+        ///
+        /// - `boundCapability`：生成物件绑定的能力模板。它的进入阶段是**回执驱动的动作**
+        ///   （`WorldPropActivityTemplate.enterMotionIDs`），没有可播的动作就不能算可用。
+        /// - `functionPointAnchor`：世界固有设备声明的功能点锚点（许愿机、点唱机）。
+        ///   它的进入阶段由世界包的活动定义**逐字**声明要不要动作，宿主不得拿生成物件的
+        ///   规则去判它 —— 那会把 `enter.motionIDs == []`（本来就不需要动作）判成"缺动作"。
+        ///
+        /// 这两类以前被同一个"在 `propActivities` 里"的判据混在一起，于是世界设备活动
+        /// 被按生成物件能力活动审查。来源必须是**显式**的，不能靠"在哪里出现过"推断。
+        enum Origin { case boundCapability, functionPointAnchor }
+
         let definition: LifeActivityDefinition
         let objectID: String
         let templateID: String
@@ -102,8 +115,9 @@ final class WorldAgentContext {
         /// 移动/收回时靠它判断"锚点是不是从居民脚下移走了"。
         let functionPointAnchorID: String?
         let functionPointPosition: WorldVector3?
+        let origin: Origin
 
-        var isFunctionPoint: Bool { functionPointAnchorID != nil }
+        var isFunctionPoint: Bool { origin == .functionPointAnchor }
     }
 
     private var propActivities: [String: PropActivity] = [:]
@@ -308,7 +322,8 @@ final class WorldAgentContext {
                 approachPoint: entry.approachPoint,
                 targetYaw: yaw,
                 functionPointAnchorID: nil,
-                functionPointPosition: nil
+                functionPointPosition: nil,
+                origin: .boundCapability
             )
             rebuilt[activity.definition.id] = activity
         }
@@ -325,7 +340,8 @@ final class WorldAgentContext {
                 approachPoint: entry.approachPoint,
                 targetYaw: anchor.yaw,
                 functionPointAnchorID: anchor.id,
-                functionPointPosition: anchor.position
+                functionPointPosition: anchor.position,
+                origin: .functionPointAnchor
             )
         }
         propActivities = rebuilt
@@ -432,8 +448,20 @@ final class WorldAgentContext {
         return nil
     }
 
+    /// 这件活动是不是**生成物件绑定的能力模板**活动。只有它才有"回执驱动的进入动作"，
+    /// 也才受"当前 avatar 格式必须有匹配的已批准动作"这条门禁。
+    ///
+    /// 判据必须是**来源**：649e425 之后 `propActivities` 同时装着两类活动（生成物件能力、
+    /// 世界固有设备的功能点锚点），按"在不在这个字典里"分类会让设备活动被生成物件的规则
+    /// 审查 —— `wish_machine.collect` / `music.listen` 的进入阶段本来就 `motionIDs == []`，
+    /// 于是被判成"缺动作、不可用"，居民永远无法进入领取活动。
     func isPropCapabilityActivity(_ activityID: String) -> Bool {
-        propActivities[activityID] != nil
+        propActivities[activityID]?.origin == .boundCapability
+    }
+
+    /// 这件活动是不是**世界固有设备声明的功能点锚点**活动（几何来自运行时注册表）。
+    func isRegisteredFunctionPointActivity(_ activityID: String) -> Bool {
+        propActivities[activityID]?.origin == .functionPointAnchor
     }
 
     func propActivityIDs(objectID: String) -> [String] {
@@ -670,6 +698,22 @@ final class WorldAgentContext {
         activityExecutor.synchronizePlacement(position: resolved, yaw: yaw)
         try publish(forcePersistence: true)
         return resolved
+    }
+
+    /// 执行器**唯一**的一手事实：「现在真的在跑哪个活动、跑到哪个相位」。
+    ///
+    /// `snapshot.activeActivity` 不是这个问题的答案：它的 `id` 来自**模拟状态**
+    /// （`simulation.state.activeActivity`），`phase` 来自**执行器**，两者可以描述不同的
+    /// 东西 —— 执行器没有 run 时 `ActivityExecutor.status` 走安全待机回退，返回
+    /// `activityID == nil` 与 `phase == .loop`。也就是说"相位是 loop"在什么都没跑的时候
+    /// 也成立，`phase` 单独不构成"真的在跑"的证据。
+    ///
+    /// 领取这类"必须真的站在设备前"的判据要的是执行器这一份事实：没有 run 就**没有**
+    /// 活动（`nil`），相位也只会是那个 run 自己的相位。
+    var runningActivity: WorldAgentActiveActivitySnapshot? {
+        let status = activityExecutor.status
+        guard let id = status.activityID else { return nil }
+        return WorldAgentActiveActivitySnapshot(id: id, activity: status.activity, phase: status.phase)
     }
 
     var snapshot: WorldAgentSnapshot {

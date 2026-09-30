@@ -33,6 +33,43 @@ struct ResidentImageAttachment: Identifiable, Codable, Sendable, Equatable { let
 struct RealtimeDJToolCall { let id: String; let name: String; let argumentsJSON: Data }
 struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isError: Bool }
 
+// 宿主动作类型（只为复刻 App 的 `isResidentActivityAvailable` 分支）。
+enum StageAvatarFormat: String, Sendable { case vrm, pmx }
+enum StageMotionFormat: String, Sendable { case procedural, vrma, vmd }
+struct StageMotionAsset: Equatable, Sendable {
+    let id: String
+    let name: String
+    let format: StageMotionFormat
+    let url: URL?
+    let version: String?
+    let sha256: String?
+    let loop: Bool
+    let strideSpeed: Float?
+    let playbackRate: Float
+    let inPlace: Bool?
+    init(id: String, name: String = "", format: StageMotionFormat, url: URL?,
+         version: String? = nil, sha256: String? = nil, loop: Bool = true,
+         strideSpeed: Float? = nil, playbackRate: Float = 1, inPlace: Bool? = nil) {
+        self.id = id; self.name = name; self.format = format; self.url = url
+        self.version = version; self.sha256 = sha256; self.loop = loop
+        self.strideSpeed = strideSpeed; self.playbackRate = playbackRate; self.inPlace = inPlace
+    }
+}
+
+/// App `isResidentActivityAvailable(id)` 的分支形状：只有**绑定能力**活动才走"进入阶段
+/// 必须有匹配动作"这条门禁（真源码 `WorldAgentContext.isPropCapabilityActivity` 按来源分类），
+/// 其余活动交给真源码 `ResidentPerformanceMotionPolicy`。本 harness 一个动作都没装。
+@MainActor
+func residentActivityAvailable(_ context: WorldAgentContext, _ activityID: String) -> Bool {
+    let installed: [String: StageMotionAsset] = [:]
+    if context.isPropCapabilityActivity(activityID),
+       let enter = context.activityCatalog.definition(id: activityID)?.contract(for: .enter) {
+        return enter.motionIDs.contains { installed[$0] != nil }
+    }
+    return ResidentPerformanceMotionPolicy.isAvailable(
+        activityID: activityID, avatarFormat: .pmx, approvedMotions: installed)
+}
+
 /// 旧的"具名摆放面"已删除：承托面现在由 `PropSupportGrid` 从真实几何派生。
 /// 这里按 App 的口径派生一次（展示台由 manifest 声明，顶面靠 `PropSupportDerivationWorld`
 /// 的合成顶面三角形成为承托层），并给出两个与旧面等价的落点。
@@ -72,9 +109,12 @@ func usableWorldPosition(_ p: WorldVector3) -> Bool {
         seed: manifest.spawn.position, parameters: parameters)
     var anchorPositions: [String: WorldVector3] = [:]
     for activity in manifest.activities {
-        guard let waypoint = manifest.waypoints.first(where: { $0.id == activity.entryWaypointID && $0.enabled }),
+        // 649e425 起活动入口是二选一：世界固有路点，或运行时注册的道具功能点锚点
+        // （后者在这里**没有**烘焙路点，几何由注册表给出）。
+        guard let entryWaypointID = activity.entryWaypointID,
+              let waypoint = manifest.waypoints.first(where: { $0.id == entryWaypointID && $0.enabled }),
               usableWorldPosition(waypoint.position) else { continue }
-        anchorPositions[activity.entryWaypointID] = waypoint.position
+        anchorPositions[entryWaypointID] = waypoint.position
     }
     let map = WorldPlacementRouteMap(grid: grid,
         lowerHeight: (waypoints.map(\.y).min() ?? 0) - 0.6,
@@ -218,7 +258,25 @@ final class RecordedService: URLProtocol {
         let physics = MarbleLivingCabinCollisionWorld(environment: TriangleMeshCollisionWorld(triangles: triangles),
             props: CollisionVolumeWorld(volumes: ResidentPropPlacementConfiguration.independentCollisionVolumes(manifest)))
         let persistence = AtomicJSONWorldStatePersistence(fileURL: directory.appendingPathComponent("world.json"))
-        let context = try WorldAgentContext(manifest: manifest, persistence: persistence)
+        // 与生产 `LivingWorldBootstrap.makeContext` 同口径：道具功能点声明来自世界包资源，
+        // 取物点由（声明 × 摆放）在运行时派生 —— 不喂 sources 就**没有**锚点，
+        // 领取判据与活动规划都会落空（这正是 649e425 之后本 harness 曾经死掉的原因）。
+        func declaration(_ id: String) throws -> WorldProceduralPropDeclaration? {
+            guard let resource = manifest.resources.first(where: { $0.id == id && $0.kind == "prop.procedural" }),
+                  let value = try? JSONDecoder().decode(WorldProceduralPropDeclaration.self,
+                      from: Data(contentsOf: worldRoot.appendingPathComponent(resource.path))),
+                  value.objectID == id else { return nil }
+            return value
+        }
+        let sources = try manifest.resources
+            .filter { $0.kind == "prop.procedural" }
+            .sorted { $0.id < $1.id }
+            .compactMap { try declaration($0.id)?.functionSource }
+        // 许愿机的视觉放置与出货口同样来自声明（生产由 `WishMachineScene.install` 装载）；
+        // 没装声明 ⇒ 没有 outlet ⇒ 托盘永远渲染不出产物。
+        WishMachineScene.install(try declaration(WishMachineScene.propID))
+        let context = try WorldAgentContext(manifest: manifest, persistence: persistence,
+            propFunctionSources: sources)
         _ = try context.installCollisionWorldAndReconcilePlacement(physics)
         return (context, triangles, manifest, persistence)
     }
@@ -261,8 +319,11 @@ final class RecordedService: URLProtocol {
             guard let target = context.propAnchorRegistry.entry(activityID: WishMachineScene.activityID)?.position
             else { return nil }
             let distance = simd_length(SIMD3(p.x,p.y,p.z) - SIMD3(target.x,target.y,target.z))
-            return .init(worldID: worldID, activityID: context.snapshot.activeActivity?.id,
-                phase: context.snapshot.activeActivity?.phase.rawValue, distanceMeters: Double(distance),
+            // 与生产 `wishMachineClaimEvidence` 同口径："在跑哪个活动、哪个相位"只认执行器的
+            // 一份事实 —— 模拟状态的 id 与执行器回落成安全待机的 loop 拼起来会冒充"在跑"。
+            let running = context.runningActivity
+            return .init(worldID: worldID, activityID: running?.id,
+                phase: running?.phase.rawValue, distanceMeters: Double(distance),
                 outputAvailable: capturer.status == .ready(id: job.objectID))
         })
         let service = ResidentPropPlacementService(context: context,
@@ -329,7 +390,14 @@ final class RecordedService: URLProtocol {
         }
         check(lit > 100 && capturer.status == .ready(id: job.objectID), "same GLB is actually drawn before pickup")
         try capturer.saveFrame("01-tray-output-offscreen")
-        let dispatcher = WorldAgentToolDispatcher(takeoverEnabled: { true }, context: context)
+        // 居民要真的能被派进领取活动：App 的 `start_activity` 门禁按**来源**分类活动
+        // （`isResidentActivityAvailable`），设备功能点活动不是生成物件能力活动，不该被
+        // "enter 相位必须有已批准 avatar 动作"审查 —— 否则这条完整链路在真机上根本走不到。
+        check(!context.isPropCapabilityActivity("wish_machine.collect")
+                && context.isRegisteredFunctionPointActivity("wish_machine.collect"),
+              "the collection activity must be classified by origin, or App start_activity refuses it")
+        let dispatcher = WorldAgentToolDispatcher(takeoverEnabled: { true }, context: context,
+            availableActivity: { residentActivityAvailable(context, $0) })
         let start = await dispatcher.handle(.init(id: "walk-to-tray", name: "start_activity",
             argumentsJSON: try JSONSerialization.data(withJSONObject: ["activity_id": "wish_machine.collect"])))
         check(!start.isError, "production activity tool starts navigation")
@@ -575,8 +643,11 @@ final class RecordedService: URLProtocol {
             guard let target = context.propAnchorRegistry.entry(activityID: WishMachineScene.activityID)?.position
             else { return nil }
             let distance = simd_length(SIMD3(p.x,p.y,p.z) - SIMD3(target.x,target.y,target.z))
-            return .init(worldID: worldID, activityID: context.snapshot.activeActivity?.id,
-                phase: context.snapshot.activeActivity?.phase.rawValue, distanceMeters: Double(distance),
+            // 与生产 `wishMachineClaimEvidence` 同口径："在跑哪个活动、哪个相位"只认执行器的
+            // 一份事实 —— 模拟状态的 id 与执行器回落成安全待机的 loop 拼起来会冒充"在跑"。
+            let running = context.runningActivity
+            return .init(worldID: worldID, activityID: running?.id,
+                phase: running?.phase.rawValue, distanceMeters: Double(distance),
                 outputAvailable: capturer.status == .ready(id: job.objectID))
         })
         let service = ResidentPropPlacementService(context: context,
@@ -698,7 +769,8 @@ final class RecordedService: URLProtocol {
             }
             check(lit > 100 && capturer.status == .ready(id: job.objectID), "live GLB is actually drawn before pickup")
             try capturer.saveFrame("01-tray-output-offscreen")
-            let dispatcher = WorldAgentToolDispatcher(takeoverEnabled: { true }, context: context)
+            let dispatcher = WorldAgentToolDispatcher(takeoverEnabled: { true }, context: context,
+                availableActivity: { residentActivityAvailable(context, $0) })
             let start = await dispatcher.handle(.init(id: "walk-to-tray", name: "start_activity",
                 argumentsJSON: try JSONSerialization.data(withJSONObject: ["activity_id": "wish_machine.collect"])))
             check(!start.isError, "production activity tool starts navigation")
@@ -842,6 +914,7 @@ let inputs = ["Presence/PropGenerationClient", "Presence/PropGenerationStore", "
     "Presence/PropGenerationConfiguration",
     "Presence/WishMachineCoordinator", "Presence/WishMachineOutputDescriptor", "Presence/WishMachineOutputRenderer",
     "Presence/WishMachineScene", "Presence/ResidentPropPlacementService", "Presence/ResidentPropPlacementConfiguration",
+    "Presence/ResidentPerformanceMotionPolicy",
     "Agent/ResidentWishMachineTools", "Agent/ResidentPropToolBridge", "Agent/WorldAgentContext", "Agent/WorldAgentToolContract", "Agent/WorldAgentToolDispatcher"]
     .map { sources.appendingPathComponent($0 + ".swift").path }
     + [root.appendingPathComponent("tools/fixtures/WishMachineDaemonFixture.swift").path]

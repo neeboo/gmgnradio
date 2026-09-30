@@ -295,6 +295,43 @@ extension WishMachineCoordinator {
         let afterStoppedClaim = try coordinator.read(id: job.id, worldID: "world", residentScope: "resident")
         check(stoppedClaim.isError && afterStoppedClaim.stage == .ready,
               "stop during arrival wait leaves output unclaimed")
+        // ── 领取判据：站在注册锚点上 ⇒ 通过；越容差 / 托盘没东西 / 没有真的在跑 ⇒ 仍然拒绝 ──
+        // 位置判据只有注册锚点一个来源（宿主用 `propAnchorRegistry.entry(activityID:)` 供口径），
+        // 这里逐条把边界钉住：既不许"站在锚点上还不通过"，也不许把门禁拆掉。
+        // 先跑拒绝组：领取一旦成功，后面的 `claim` 会按幂等直接返回，拒绝就测不出来了。
+        evidence = .init(worldID: "world", activityID: "wish_machine.collect", phase: "loop",
+                         distanceMeters: 0.25 + 0.000001, outputAvailable: true)
+        var beyondToleranceRejected = false
+        do { _ = try coordinator.claim(id: job.id, worldID: "world", residentScope: "resident") }
+        catch WishMachineError.notAtMachine { beyondToleranceRejected = true }
+        check(beyondToleranceRejected, "distance beyond the registered anchor tolerance must still refuse the pickup")
+        evidence = .init(worldID: "world", activityID: "wish_machine.collect", phase: "loop",
+                         distanceMeters: 0, outputAvailable: false)
+        var unrenderedTrayRejected = false
+        do { _ = try coordinator.claim(id: job.id, worldID: "world", residentScope: "resident") }
+        catch WishMachineError.notAtMachine { unrenderedTrayRejected = true }
+        check(unrenderedTrayRejected, "an unrendered tray must still refuse the pickup while standing on the anchor")
+        // 执行器空转时 `ActivityExecutor.status` 会把相位回落成安全待机的 loop：没有 id 的
+        // 一边必须仍然拒绝，不能靠这个回落相位冒充"真的在跑领取活动"。
+        evidence = .init(worldID: "world", activityID: nil, phase: "loop",
+                         distanceMeters: 0, outputAvailable: true)
+        var idleExecuterRejected = false
+        do { _ = try coordinator.claim(id: job.id, worldID: "world", residentScope: "resident") }
+        catch WishMachineError.notAtMachine { idleExecuterRejected = true }
+        check(idleExecuterRejected, "a safe-idle loop phase without a running collect activity must still refuse the pickup")
+        evidence = .init(worldID: "world", activityID: "wish_machine.collect", phase: "approach",
+                         distanceMeters: 0, outputAvailable: true)
+        var approachingRejected = false
+        do { _ = try coordinator.claim(id: job.id, worldID: "world", residentScope: "resident") }
+        catch WishMachineError.notAtMachine { approachingRejected = true }
+        check(approachingRejected, "an unfinished approach must still refuse the pickup")
+        check(try coordinator.read(id: job.id, worldID: "world", residentScope: "resident").stage == .ready,
+              "every rejected evidence attempt leaves the output unclaimed")
+        // 站在注册锚点上、托盘也渲染好了 ⇒ 必须通过（位置判据只认注册锚点这一个来源）。
+        evidence = .init(worldID: "world", activityID: "wish_machine.collect", phase: "loop",
+                         distanceMeters: 0, outputAvailable: true)
+        check(try coordinator.claim(id: job.id, worldID: "world", residentScope: "resident").stage == .claimed,
+              "standing exactly on the registered pickup anchor with a rendered tray must claim")
         evidence = .init(worldID: "world", activityID: "wish_machine.collect", phase: "loop", distanceMeters: 0.25, outputAvailable: true)
         let claimed = try coordinator.claim(id: job.id, worldID: "world", residentScope: "resident")
         let claimedAgain = try coordinator.claim(id: job.id, worldID: "world", residentScope: "resident")
