@@ -267,8 +267,11 @@ struct ApplicationIconInstaller {
 struct DockReopenAction {
     let showDesktopPresence: @MainActor () -> Void
 
+    /// 点 Dock 图标（底栏图标）只把应用带回前台。**已经有可见窗口时不得切换
+    /// 桌面形态**：`showLiveCam()` 会把正在看的那扇窗直接关掉换成小窗，这正是
+    /// 真机上的「点底栏的 icon 就变小窗」。只有没有任何可见窗口时才恢复桌面形态。
     func perform(hasVisibleWindows: Bool) -> Bool {
-        _ = hasVisibleWindows
+        guard !hasVisibleWindows else { return true }
         showDesktopPresence()
         return true
     }
@@ -564,22 +567,11 @@ enum LivingWorldActivityMenuPolicy {
     }
 }
 
-enum LivingWorldActivityPresentationPolicy {
-    static func shouldShowDesktopPresence(
-        fullSpaceIsPresented: Bool
-    ) -> Bool {
-        !fullSpaceIsPresented
-    }
-}
-
-enum CharacterMotionPresentationPolicy {
-    static func shouldShowDesktopPresence(
-        fullSpaceIsPresented: Bool
-    ) -> Bool {
-        !fullSpaceIsPresented
-    }
-}
-
+/// 生活活动与角色动作都**不再**有「顺带显示桌面形态」的判据：它们各自的
+/// 呈现决策已并入唯一判据 `LiveCamPresentationPolicy`（触发源为
+/// `.livingWorldActivityChange` / `.characterMotionChange`，恒不呈现）。
+/// 原先两个只回答「空间开着吗」的策略就是这条缺陷的来源 —— 空间没开时它们
+/// 一律回答「该显示小窗」，于是活动开始和菜单动作都把小窗顶了出来。
 enum MusicPlaybackPresentationPolicy {
     static let opensFullStageOnPlaybackStart = false
 }
@@ -932,7 +924,10 @@ final class AppDelegate:
         desktopPresenceObserverID = avatarRuntime.observe {
             [weak self] snapshot in
             self?.safelyReturnHeldPropIfAvatarChanged(snapshot)
-            self?.applyDesktopPresence(snapshot)
+            // 角色快照变化 = 走路、语音电平、Agent 说话、动作、许愿任务……这些
+            // 都不是「进入小窗」的动作。这里只做形态清理（插件开时的光球分支），
+            // 绝不呈现小窗：见 `LiveCamPresentationTrigger.mayPresentLiveCam`。
+            self?.applyDesktopPresence(snapshot, trigger: .avatarSnapshotChange)
             self?.refreshInstalledLivingWorldMotions()
         }
         avatarRuntime.refresh()
@@ -991,7 +986,9 @@ final class AppDelegate:
         } else if ApplicationLaunchPolicy.shouldShowDesktopPresenceOnLaunch(
             environment: environment
         ) {
-            showLiveCam()
+            // 冷启动的默认桌面形态是产品定义的入口（不是会话中的「切过去」），
+            // 所以它是唯一允许使用的非显式触发源。
+            showLiveCam(trigger: .launchDefault)
         }
         if let trackPath = environment["GMGN_LOCAL_TRACK"] {
             do {
@@ -1174,6 +1171,10 @@ final class AppDelegate:
         }
         spatialStage.exitWorld()
         stageWindowController?.show()
+        // 用户显式要求看播放器（菜单/小窗的播放器菜单）。播放器模式里角色只可能画在
+        // Live Cam 上（一份渲染面），所以**在这个显式入口**交接一次；`show()`
+        // 自己不再顺手呈现小窗，任何非显式路径也不会走到这里。
+        liveCamWindowController?.show()
     }
 
     /// 菜单栏「装修空间 / 结束装修」。
@@ -1195,7 +1196,13 @@ final class AppDelegate:
         ).perform()
     }
 
+    /// 用户显式的「显示 Live Cam」入口（菜单栏/快捷键/窗口按钮）：
+    /// 空间开着时它等价于「收成小窗」，这正是用户唯一接受的变小窗动作。
     func showLiveCam() {
+        showLiveCam(trigger: .explicitUserAction)
+    }
+
+    private func showLiveCam(trigger: LiveCamPresentationTrigger) {
         if stageWindowController?.isPresented == true {
             stageWindowController?.close()
             return
@@ -1210,7 +1217,7 @@ final class AppDelegate:
         // 给出可见、可执行的引导，不能看起来没反应。
         switch LiveCamPresentationRequest.resolve(hasAvatar: avatarRuntime.snapshot.avatar != nil) {
         case .present:
-            applyDesktopPresence(avatarRuntime.snapshot)
+            applyDesktopPresence(avatarRuntime.snapshot, trigger: trigger)
         case let .needsAvatar(guidance):
             let alert = NSAlert()
             alert.alertStyle = .informational
@@ -1220,8 +1227,13 @@ final class AppDelegate:
         }
     }
 
+    /// 桌面形态的唯一落地处。`trigger` 决定这次调用**有没有资格呈现**小窗：
+    /// 居民状态播报、活动开始、角色动作、角色快照变化一律不呈现（只做形态清理），
+    /// 见 `LiveCamPresentationPolicy`。呈现之外的清理（插件开时的光球分支）不受
+    /// 触发源限制 —— 收起来从来不是「自动切到小窗」。
     private func applyDesktopPresence(
-        _ snapshot: StageAvatarRuntimeSnapshot
+        _ snapshot: StageAvatarRuntimeSnapshot,
+        trigger: LiveCamPresentationTrigger
     ) {
         switch DesktopPresenceMode.resolve(
             snapshot: snapshot,
@@ -1232,12 +1244,17 @@ final class AppDelegate:
             orbWindowController?.show()
         case .liveCam:
             orbWindowController?.hide()
-            guard stageWindowController?.isPresented != true else { return }
-            // 门禁关闭后没有角色时不再退回光球：走 LiveCamPresentationRequest 的可见引导
-            // （「显示 Live Cam」菜单），这里不呈现空窗口。
-            guard LiveCamPresentationRequest.resolve(hasAvatar: snapshot.avatar != nil) == .present
-            else {
+            // 门禁关闭后没有角色时不再退回光球：不留空窗口，也不呈现（旧行为）。
+            // 这是「收起来」，与「自动切到小窗」相反，所以不受触发源限制。
+            if LiveCamPresentationRequest.resolve(hasAvatar: snapshot.avatar != nil) != .present {
                 liveCamWindowController?.hide()
+                return
+            }
+            guard LiveCamPresentationPolicy.shouldPresentLiveCam(
+                trigger: trigger,
+                hasAvatar: snapshot.avatar != nil,
+                fullStageIsPresented: stageWindowController?.isPresented == true
+            ) else {
                 return
             }
             liveCamWindowController?.show()
@@ -1255,11 +1272,8 @@ final class AppDelegate:
             menu.report("当前空间尚未接入生活活动，请切回生活舱。")
             return
         }
-        if LivingWorldActivityPresentationPolicy.shouldShowDesktopPresence(
-            fullSpaceIsPresented: stageWindowController?.isPresented == true
-        ) {
-            showLiveCam()
-        }
+        // 「活动开始了」不是「进入小窗」的动作：这里以前会顺带 `showLiveCam()`，
+        // 于是任何一次活动都把小窗顶出来。活动照常开始，窗口形态不动。
         guard let context = livingWorldContext,
               context.manifest.worldID == menu.worldID else {
             menu.report("生活空间尚未就绪，请稍后再试。")
@@ -1338,11 +1352,8 @@ final class AppDelegate:
             )
             try motionPackageStore.activate(id: motion.id)
             avatarRuntime.refresh()
-            if CharacterMotionPresentationPolicy.shouldShowDesktopPresence(
-                fullSpaceIsPresented: stageWindowController?.isPresented == true
-            ) {
-                showLiveCam()
-            }
+            // 「播了一个动作」不是「进入小窗」的动作：这里以前会顺带 `showLiveCam()`，
+            // 于是任何一次动作都把窗口形态改掉。动作照常播放，窗口形态不动。
             livingWorldLogger.info(
                 "已从菜单播放角色动作：motion=\(motion.name, privacy: .public)"
             )
@@ -5870,6 +5881,11 @@ final class AppDelegate:
     private func sendResidentSubmission(_ submission: ResidentChatSubmission, source: ResidentSubmissionSource) async throws {
         guard residentPropEditingWorldID == nil else { throw ResidentPropHostError.editorOpen }
         let imageURLs = submission.attachments.map(\.url)
+        // **居民图片链[2] 提交**的日志不在这里：这个方法被多个离线 harness 原文抽取
+        // 编译（test-living-resident-loop / test-resident-loop-app /
+        // test-resident-submission-recovery），不属于本方法的日志设施会让它们编不过。
+        // [2] 由 `ResidentAgentLoop.receiveUserMessage`（紧跟其后的同一入口）与
+        // [4]/[7]（`AgentConversationService.validateImageSupport` / `send`）打出。
         try AgentConversationService.shared.validateImageSupport(imageURLs: imageURLs)
         disconnectRealtimeVoice()
         let loop = ensureResidentLoop()

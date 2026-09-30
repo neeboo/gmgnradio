@@ -35,6 +35,57 @@ enum LiveCamPresentationRequest: Equatable, Sendable {
     }
 }
 
+/// 「谁可以让 Live Cam 小窗出现」的唯一判据。
+///
+/// 真机要求（2026-09-30）：小窗**只由用户的显式动作**出现。居民状态播报（语音、
+/// 聊天、进度、失败、交付提示）、生活活动开始、走路与角色动作、许愿任务变化都
+/// 不许把它顶出来 —— 这些事件只更新状态文字，绝不改变窗口形态。
+///
+/// 触发源做成值类型而不是散在各个调用点的 `if`：每个调用点都必须声明自己的
+/// 来源，离线 harness 能逐条注入并断言，回退时立刻 FAIL。
+enum LiveCamPresentationTrigger: Equatable, Sendable, CaseIterable {
+    /// 用户显式的小窗动作：菜单「显示 Live Cam」、快捷键、窗口自己的入口。
+    case explicitUserAction
+    /// 冷启动的默认桌面形态（`ApplicationLaunchPolicy`）。这是产品定义的默认
+    /// 入口，不是会话中的「切过去」；它是唯一允许的非显式呈现。
+    case launchDefault
+    /// 居民状态播报：语音转写、聊天状态、进度、失败与交付提示。
+    case residentStatusNotice
+    /// 生活活动开始/停止。
+    case livingWorldActivityChange
+    /// 角色动作（菜单或设置里播放动作）。
+    case characterMotionChange
+    /// 角色快照变化：选择角色、走路、语音电平、Agent 说话、许愿任务……
+    case avatarSnapshotChange
+
+    /// 只有显式动作与冷启动默认形态可以**呈现**小窗。
+    var mayPresentLiveCam: Bool {
+        switch self {
+        case .explicitUserAction, .launchDefault:
+            true
+        case .residentStatusNotice, .livingWorldActivityChange,
+             .characterMotionChange, .avatarSnapshotChange:
+            false
+        }
+    }
+}
+
+enum LiveCamPresentationPolicy {
+    /// 呈现小窗的完整判据：触发源允许 + 有角色可显示 + 完整空间没有占着渲染面。
+    ///
+    /// 「空间占着」时返回 false 的语义与改动前一致：**什么都不做**（既不呈现，
+    /// 也不把窗口收掉），窗口形态由空间那一侧负责。
+    static func shouldPresentLiveCam(
+        trigger: LiveCamPresentationTrigger,
+        hasAvatar: Bool,
+        fullStageIsPresented: Bool
+    ) -> Bool {
+        guard trigger.mayPresentLiveCam else { return false }
+        guard !fullStageIsPresented else { return false }
+        return LiveCamPresentationRequest.resolve(hasAvatar: hasAvatar) == .present
+    }
+}
+
 enum LiveCamRenderProfile: Equatable, Sendable {
     case liveCam
     case fullStage

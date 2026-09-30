@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
+import simd
 
 @MainActor
 final class StageResidentChatState: ObservableObject {
@@ -296,7 +297,15 @@ struct StageResidentComposer: View {
                     .help("添加图片，也可以直接粘贴图片")
                     .accessibilityLabel("添加图片附件")
                     .disabled(state.images.isPreparing || state.images.attachments.count >= 4)
-                    Text(state.isThinking ? (state.progress ?? "等待居民回应…") : state.voiceActive ? "正在听你说话…" : "你的居民")
+                    // 状态行：符号与头顶气泡**同一个来源**（`ResidentStatusBadge`）。四种
+                    // 状态的文案与改动前逐字一致，新增的只有前缀（说话分支是新增的：
+                    // 语音正在输出时这里原本显示空闲文案，看不出"它在说话"）。
+                    Text(ResidentStatusBadge.statusLine(
+                        isThinking: state.isThinking,
+                        isSpeaking: speechStatus.isSpeaking,
+                        isListening: state.voiceActive,
+                        progress: state.progress ?? "等待居民回应…"
+                    ))
                         .font(.system(size: 11))
                         .foregroundStyle(.white.opacity(0.43))
                         .accessibilityIdentifier("stage.resident-progress")
@@ -403,6 +412,226 @@ struct StageResidentComposer: View {
     }
 }
 
+/// 居民**头顶**那朵漫画式思考/说话气泡（本需求的主交付）。
+///
+/// 三件事各自只有一个来源，这里不重复任何一份：
+///
+/// 1. **画什么** —— `ResidentStatusBadge.symbol(isThinking:isSpeaking:)`。和舞台下方
+///    状态行、Live Cam 面板状态行是**同一个函数**，所以三处不可能显示不同的符号；
+/// 2. **画在哪** —— 头顶世界点由**既有的**绑定矩阵 `MarblePMXFraming.modelTransform`
+///    给出（与 `MarbleSpatialView` 画角色用的是同一行代码），再喂给**既有的**
+///    `SpatialStageStore.residentPropScreenPoint`（与装修旋转手柄的锚点同一个投影）。
+///    本视图里没有一句自己写的投影数学；
+/// 3. **画成什么样** —— `ResidentStatusBadge` 里那几条纯几何（云瓣、指向圆点、浮动、
+///    呼吸）。尺寸是恒定 pt，链路上没有任何随相机距离缩放的量。
+///
+/// 屏幕空间绘制（SwiftUI `Canvas`），不碰 Metal / shader，也不进输入链：外面套的是
+/// `StageOverlayHostingView`（`hitTest` 返回 nil），这里再显式 `allowsHitTesting(false)`。
+@MainActor
+struct StageResidentHeadBadgeView: View {
+    let spatialStage: SpatialStageStore
+    @ObservedObject var residentChat: StageResidentChatState
+    /// 语音是否正在输出。与合成器的"停止说话"读的是同一个源。
+    private let speechStatus = AgentSpeechStatusStore.shared
+
+    var body: some View {
+        let isThinking = residentChat.isThinking
+        let isSpeaking = speechStatus.isSpeaking
+        let visible = ResidentStatusBadge.isVisible(
+            isThinking: isThinking,
+            isSpeaking: isSpeaking
+        )
+        ZStack {
+            if visible {
+                // 只读 `timeline.date` 来算浮动/呼吸，**不改任何 SwiftUI 布局**：每帧被
+                // 重画的只有这一块画布，位置是时间的纯函数，所以不会抖也不会漂。
+                TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
+                    Canvas { context, size in
+                        draw(
+                            in: &context,
+                            viewSize: size,
+                            date: timeline.date,
+                            isThinking: isThinking,
+                            isSpeaking: isSpeaking
+                        )
+                    }
+                }
+                .transition(.opacity)
+            }
+        }
+        // 状态切换淡入淡出（0.22 s）；空闲态整朵（云 + 点）一起消失，不留孤立符号。
+        .animation(.easeInOut(duration: 0.22), value: visible)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private func draw(
+        in context: inout GraphicsContext,
+        viewSize: CGSize,
+        date: Date,
+        isThinking: Bool,
+        isSpeaking: Bool
+    ) {
+        guard let symbol = ResidentStatusBadge.symbol(
+            isThinking: isThinking,
+            isSpeaking: isSpeaking
+        ),
+        let geometry = headGeometry(viewSize: viewSize),
+        let anchor = ResidentStatusBadge.anchor(
+            projectedHead: geometry.head,
+            characterScreenHeight: geometry.characterScreenHeight,
+            viewSize: viewSize
+        )
+        else { return }
+
+        let seconds = date.timeIntervalSinceReferenceDate
+        // 云体随浮动轻轻上下；指向点不跟着浮（`tailDots` 拿的是**名义**锚点），
+        // 于是"与头的最小间隙"不会被浮动吃掉。
+        let cloud = ResidentStatusBadge.cloudRect(
+            anchor: anchor,
+            bob: ResidentStatusBadge.bobOffset(seconds: seconds)
+        )
+        // 顺序：指向点 → 云 → 云里的符号。符号最后画，永远压在云上。
+        drawTailDots(in: &context, anchor: anchor)
+        drawCloud(in: &context, rect: cloud)
+        drawSymbol(
+            in: &context,
+            symbol: symbol,
+            cloud: cloud,
+            seconds: seconds,
+            isThinking: isThinking
+        )
+    }
+
+    /// 头顶与脚下的屏幕位置（左上原点、pt）。世界→屏幕这一跳**全部复用既有实现**。
+    ///
+    /// 两次投影都走 `SpatialStageStore.residentPropScreenPoint`（与装修旋转手柄的锚点同一个
+    /// 函数），世界点分别由**既有的**绑定矩阵 `MarblePMXFraming.modelTransform` 从"本地头顶"
+    /// 与"本地脚底"得到。本视图里没有一句自己写的投影数学。
+    ///
+    /// 为什么要投影**两个**点：云与头之间的间隙需要知道角色在屏幕上有多高（近景头大、
+    /// 远景头小），否则固定 pt 的间隙在近景会被头本身吃掉 —— 那正是真机"卡在头部"的成因。
+    private func headGeometry(viewSize: CGSize) -> (head: CGPoint, characterScreenHeight: CGFloat)? {
+        // 角色当前的世界摆放：与 `MarbleSpatialView` 画角色时读的是同一个属性
+        // （`spatialStage.avatarPlacement`），所以走动/转场时气泡跟着一起动。
+        //
+        // 跟随的是**身体根节点**（placement + 归一化身高），不是头骨：点头/转身这类
+        // 头部动画不会让气泡甩来甩去，气泡只跟"这个人站在哪"。这条口径与改动前一致，
+        // 没有改语义（头骨姿态只存在于渲染器内部，宿主侧拿不到，也不该为此改渲染链）。
+        let placement = spatialStage.avatarPlacement
+        let modelTransform = MarblePMXFraming.modelTransform(
+            bounds: nil,
+            placement: placement
+        )
+        guard let headNormalized = spatialStage.residentPropScreenPoint(
+            world: ResidentStatusBadge.headTopWorldPoint(modelTransform: modelTransform)
+        ) else { return nil }
+        let head = ResidentStatusBadge.viewPoint(
+            projectedNormalized: CGPoint(
+                x: CGFloat(headNormalized.x),
+                y: CGFloat(headNormalized.y)
+            ),
+            viewSize: viewSize
+        )
+        // 脚点：绑定矩阵把本地脚底（y = 0）映射到 `placement.position`，正是角色站的地方。
+        // 拿不到时给 0，`headGap(characterScreenHeight:)` 会退回最小间隙。
+        let characterScreenHeight: CGFloat = spatialStage
+            .residentPropScreenPoint(world: placement.position)
+            .map { foot in
+                abs(CGFloat(foot.y) * viewSize.height - head.y)
+            } ?? 0
+        return (head, characterScreenHeight)
+    }
+
+    /// 由大到小的三个指向圆点，画在云底与头顶之间。每颗都是"先描边色放大一圈、再填充色"。
+    ///
+    /// 配色取自 `ResidentStatusBadge.tailDotFill/tailDotOutline` —— 与云体同一套，不另写 RGB。
+    private func drawTailDots(in context: inout GraphicsContext, anchor: CGPoint) {
+        let dots = ResidentStatusBadge.tailDots(anchor: anchor)
+        for dot in dots {
+            context.fill(
+                Path(ellipseIn: dotRect(dot.center, dot.radius + Self.outlineWidth)),
+                with: .color(ResidentStatusBadge.tailDotOutline.color)
+            )
+        }
+        for dot in dots {
+            context.fill(
+                Path(ellipseIn: dotRect(dot.center, dot.radius)),
+                with: .color(ResidentStatusBadge.tailDotFill.color)
+            )
+        }
+    }
+
+    private func dotRect(_ center: CGPoint, _ radius: CGFloat) -> CGRect {
+        CGRect(
+            x: center.x - radius,
+            y: center.y - radius,
+            width: radius * 2,
+            height: radius * 2
+        )
+    }
+
+    /// 云朵：先按描边色把每一块放大画一遍（得到干净的外轮廓），再用填充色画本体。
+    ///
+    /// 这样就不需要布尔并集路径 —— 叠加出来就是一朵单层轮廓的云，没有内部弧线。
+    /// 白底 + 深色细描边：暗背景上白底最清楚，亮背景上由描边界定轮廓。
+    private func drawCloud(in context: inout GraphicsContext, rect: CGRect) {
+        let blobs = ResidentStatusBadge.cloudBlobs(in: rect)
+        for blob in blobs {
+            context.fill(
+                Path(
+                    roundedRect: blob.rect.insetBy(
+                        dx: -Self.outlineWidth,
+                        dy: -Self.outlineWidth
+                    ),
+                    cornerRadius: blob.cornerRadius + Self.outlineWidth
+                ),
+                with: .color(ResidentStatusBadge.cloudOutline.color)
+            )
+        }
+        for blob in blobs {
+            context.fill(
+                Path(roundedRect: blob.rect, cornerRadius: blob.cornerRadius),
+                with: .color(ResidentStatusBadge.cloudFill.color)
+            )
+        }
+    }
+
+    /// 云里的符号。思考时轻微呼吸（`breathScale`），说话时不呼吸（边说话边缩放会显得吵）。
+    private func drawSymbol(
+        in context: inout GraphicsContext,
+        symbol: String,
+        cloud: CGRect,
+        seconds: Double,
+        isThinking: Bool
+    ) {
+        let scale = isThinking ? ResidentStatusBadge.breathScale(seconds: seconds) : 1
+        var symbolContext = context
+        symbolContext.translateBy(x: cloud.midX, y: cloud.midY)
+        symbolContext.scaleBy(x: scale, y: scale)
+        symbolContext.draw(
+            Text(symbol)
+                .font(.system(size: Self.symbolFontSize))
+                .foregroundStyle(ResidentStatusBadge.symbolInk.color),
+            at: CGPoint.zero
+        )
+    }
+
+    /// 描边宽度（pt）。云、指向点共用同一条，粗细一致。
+    private static let outlineWidth: CGFloat = 1.4
+    /// 云里符号的字号。云体 50×36、底面只占半个云高，18 pt 的 emoji 四周仍留得下白边，
+    /// 不会顶到云瓣的圆弧上。
+    private static let symbolFontSize: CGFloat = 18
+}
+
+/// 配色的**唯一一份**分量 → SwiftUI `Color`。RGB 只写在 `ResidentStatusBadgeInk` 里，
+/// 这里没有任何字面量颜色。
+private extension ResidentStatusBadgeInk {
+    var color: Color {
+        Color(.sRGB, red: red, green: green, blue: blue, opacity: alpha)
+    }
+}
+
 struct StageOverlayView: View {
     @ObservedObject var presentation: StagePresentationModel
     @ObservedObject var overlayState: StageOverlayState
@@ -410,6 +639,15 @@ struct StageOverlayView: View {
     @ObservedObject var videos: StageVideoPlaybackStore
     let audioFeatures: VisualAudioFeatureStore
     let playbackPosition: @MainActor () -> TimeInterval
+    /// 角色头顶气泡要的**世界**（角色位置 + 既有投影都从它取）。
+    ///
+    /// 这里放开成普通 `let`（不是 `@Bindable`）：这一层自己不读它的任何属性，读发生在
+    /// `StageResidentHeadBadgeView` 的 body 里，Observation 就只订阅到那一层 —— 角色一动
+    /// 只重画气泡，不会把歌词/节目单整棵视图树一起重算。
+    let spatialStage: SpatialStageStore
+    /// 居民的"在想"取自合成器那份**同一个**状态对象（`StageResidentChatState`），
+    /// 不新建第二份 thinking 状态。
+    @ObservedObject var residentChat: StageResidentChatState
 
     var body: some View {
         ZStack {
@@ -420,6 +658,15 @@ struct StageOverlayView: View {
                 playbackPosition: playbackPosition
             )
             .allowsHitTesting(false)
+
+            // 居民头顶那朵思考/说话气泡（主交付）。放在这一层而不是合成器那一层，
+            // 是因为只有这一层是**铺满整个舞台**的覆盖层，而且宿主是
+            // `StageOverlayHostingView` —— 那个 hosting view 的 `hitTest` 返回 nil，
+            // 所以气泡天然**穿透点击**，场景指针仍旧归 `StageWorldInteractionView`。
+            StageResidentHeadBadgeView(
+                spatialStage: spatialStage,
+                residentChat: residentChat
+            )
 
             VStack(alignment: .leading) {
                 if !presentation.programTitle.isEmpty {

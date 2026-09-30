@@ -538,6 +538,38 @@ enum ResidentDSHComposition {
         return validateComposedConfig(output, hostToolsPluginPath: privateRow)
     }
 
+    /// 诊断用组合摘要（只读、无副作用）：把判据 B 依赖的**输入文本**压缩成一行 ——
+    /// 行 id 顺序、`acp-agent` 选中的模型、模型目录里的 `inputModalities`。
+    ///
+    /// 真机上「判据 B 到底读到哪份组合」必须一眼可读：整份 YAML 打进日志太长，
+    /// 而只打一个 bool 又无法区分「少了私有行」和「模型目录没有 image 模态」。
+    /// 缩进是这套行语法的语义（0 = 行、4 = 行的 config 键、6 = 模型条目、
+    /// 8 = 该模型的 inputModalities），所以这里按缩进读数，与
+    /// `validateComposedConfig` 同一个口径。
+    static func compositionSummary(_ output: String) -> String {
+        var rowIDs: [String] = []
+        var selectedModel = "?"
+        var modalities: [String] = []
+        var pendingModelID: String?
+        for rawLine in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(rawLine)
+            let indent = line.prefix(while: { $0 == " " }).count
+            let body = line.dropFirst(indent)
+            if indent == 0, body.hasPrefix("- id: ") {
+                rowIDs.append(String(body.dropFirst(6)))
+            } else if indent == 6, body.hasPrefix("- id: ") {
+                pendingModelID = String(body.dropFirst(6))
+            } else if indent == 8, body.hasPrefix("inputModalities: ") {
+                if let id = pendingModelID {
+                    modalities.append("\(id)=\(body.dropFirst("inputModalities: ".count))")
+                }
+            } else if indent == 4, body.hasPrefix("model: ") {
+                selectedModel = String(body.dropFirst("model: ".count))
+            }
+        }
+        return "rows=\(rowIDs.joined(separator: ",")) acp-agent.model=\(selectedModel) 模型目录inputModalities=[\(modalities.joined(separator: " "))]"
+    }
+
     /// The host-private plugin path an already-emitted composition carries, or
     /// nil when it carries none (or one that cannot be the host's own row).
     private static func privateHostToolsPath(in output: String) -> String? {

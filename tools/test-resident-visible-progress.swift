@@ -52,9 +52,21 @@ let methods = ["func setResidentThinking(", "func setResidentProgress(", "func s
                "private func applyStatusNotice("].map {
     declaration($0, in: liveCam)
 }.joined(separator: "\n")
+// 「状态 → 符号」的唯一来源：`updateResidentStatusNotice` 会给进度行加上它。
+// 把它整份拼进来，harness 里跑的就是**生产那一份**投影，不是抄来的副本。
+let badgeTypes = try read("VisualEngine/ResidentStatusBadge.swift")
 let harness = #"""
 import Foundation
+import simd
 \#(noticeTypes)
+\#(badgeTypes)
+/// 生产里是 `@MainActor @Observable final class AgentSpeechStatusStore`；这里只要
+/// "语音是否正在输出"这一个可读事实，所以给一个同名的非隔离替身 —— 被抽取的状态方法
+/// 在 harness 里不在 MainActor 上，隔离版本反而编不过。
+final class AgentSpeechStatusStore {
+    static let shared = AgentSpeechStatusStore()
+    var isSpeaking = false
+}
 final class Label { var stringValue = ""; var toolTip: String? }
 final class Notice { var isHidden = true }
 final class Height { var constant: CGFloat = 0 }
@@ -78,7 +90,9 @@ final class Status {
 }
 let state = Status()
 state.setResidentThinking(true)
-precondition(state.deliveryLabel.stringValue == "等待居民回应…")
+// 期望值由**生产符号**推出（`ResidentStatusBadge.thinkingSymbol`），不在 harness 里再抄
+// 一遍 emoji 字面量 —— 否则符号一改，这条断言就变成了"两处字面量恰好相同"。
+precondition(state.deliveryLabel.stringValue == ResidentStatusBadge.thinkingSymbol + " 等待居民回应…")
 state.setResidentProgress("正在查询歌单…")
 state.setResidentDeliveryNotice("2 条消息排队中")
 precondition(state.deliveryLabel.stringValue.contains("查询歌单") && state.deliveryLabel.stringValue.contains("2 条消息"))

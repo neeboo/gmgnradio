@@ -33,13 +33,41 @@ guard !marble.contains("animationPlayer.applyRootMotion = false"),
 guard runtime.contains("func reportMotionPlayback("), runtime.contains("func playbackIdentity(") else {
     print("FAIL: runtime has no identity-scoped playback completion/failure feedback"); exit(1)
 }
+// The "selected but never loaded" break must stay self-naming on both sides.
+guard marble.contains("worldPlayback: avatarRuntime.worldActivity?.renderPlayback"),
+      marble.contains("Playback heartbeat") else {
+    print("FAIL: the renderer must resolve the movement-driven playback channel and report what it is actually playing")
+    exit(1)
+}
+guard pmx.contains("motionPlaybackDiagnostics"),
+      pmx.contains("loadedMotionURL?.deletingPathExtension().lastPathComponent") else {
+    print("FAIL: the PMX renderer must expose its loaded clip, player rate and drawn pose")
+    exit(1)
+}
 let harness = #"""
 import Foundation
 import Observation
 struct WorldTransform: Equatable, Sendable {}
 struct LifeActivity: Equatable, Sendable {}
-struct LifeActivityPhase: Equatable, Sendable {}
-enum StageAvatarMotionPlayback: Equatable, Sendable { case temporary(StageMotionAsset); case naturalIdle(fallback: String?) }
+struct LifeActivityPhase: Equatable, Sendable {
+    let rawValue: String
+    static let approach = LifeActivityPhase(rawValue: "approach")
+    static let enter = LifeActivityPhase(rawValue: "enter")
+    static let loop = LifeActivityPhase(rawValue: "loop")
+    static let exit = LifeActivityPhase(rawValue: "exit")
+    static let interrupt = LifeActivityPhase(rawValue: "interrupt")
+    static let failed = LifeActivityPhase(rawValue: "failed")
+    init() { self.rawValue = "loop" }
+    init(rawValue: String) { self.rawValue = rawValue }
+}
+struct StageAvatarMotionFallback: Equatable, Sendable {
+    let activityTypeID: String; let phase: LifeActivityPhase
+    let requestedMotionIDs: [String]; let reason: StageAvatarMotionFallbackReason
+}
+enum StageAvatarMotionFallbackReason: String, Equatable, Sendable {
+    case phaseHasNoApprovedMotion, approvedMotionUnavailable, inactivePhase
+}
+enum StageAvatarMotionPlayback: Equatable, Sendable { case temporary(StageMotionAsset); case naturalIdle(fallback: StageAvatarMotionFallback?) }
 enum StageAvatarActivity: Equatable, Sendable { case idle, listening, speaking }
 struct PresencePackageStore {
     static func liveStore() throws -> Self { Self() }
@@ -240,12 +268,61 @@ enum PMXWarmKitchenCoffeeCup { static func shouldDisplay(motionID: String) -> Bo
         host.frame(renderer)
         precondition(renderer.loadedLocomotionGait?.authoredStepSpeed == 0.75,
             "real PMX synchronizer must pass the measured gait to the renderer")
+        // Regression: the world declares nothing for the phase (the cabin's
+        // `wish_machine.collect` declares no motion at all) while the avatar's
+        // ground is moving, so the executor fills in the built-in walking clip
+        // on the *visual* channel only. The renderer must load and apply that
+        // clip: "selected" without "loaded and applied" is a body sliding in
+        // its bind pose.
+        let substituteURL = URL(fileURLWithPath: "/offline/walk-substitute.vmd")
+        let substituteWalk = StageMotionAsset(id: "gmgn.motion.bones.walk-loop-pmx",
+            name: "Walk", format: .vmd, url: substituteURL, loop: true,
+            strideSpeed: 0.75, playbackRate: 1, inPlace: true)
+        let declaredNothing = StageAvatarMotionPlayback.naturalIdle(
+            fallback: StageAvatarMotionFallback(activityTypeID: "interact",
+                phase: .approach, requestedMotionIDs: [], reason: .phaseHasNoApprovedMotion))
+        renderer.fails = false
+        renderer.failingPaths = []
+        store.installWorldActivity(StageAvatarWorldActivitySnapshot(
+            transform: WorldTransform(), activity: LifeActivity(), phase: LifeActivityPhase(),
+            motionPlayback: declaredNothing, sourceRevision: 200, activityRequestID: "walk-sub",
+            visualPlayback: .temporary(substituteWalk)))
+        host.frame(renderer)
+        precondition(renderer.attemptsByPath[substituteURL.path] == 1,
+            "the movement-driven walking clip must be loaded by the renderer")
+        precondition(host.appliedPMXResolvedMotion == .asset(substituteWalk),
+            "the movement-driven walking clip must be applied, not just selected")
+        // A locomotion clip is never suppressed by a stale failure record: the
+        // body must not be left posed while the world keeps moving it. This is
+        // the shape the old code failed in - the substitute's identity is
+        // recorded as failed, another clip plays in between, and the walk
+        // re-resolves with that same recorded identity.
+        let staleThinking = StageMotionAsset(id: "pmx-thinking", name: "Thinking",
+            format: .vmd, url: URL(fileURLWithPath: "/offline/thinking.vmd"), loop: true)
+        store.installWorldActivity(StageAvatarWorldActivitySnapshot(
+            transform: WorldTransform(), activity: LifeActivity(), phase: LifeActivityPhase(),
+            motionPlayback: .temporary(staleThinking), sourceRevision: 202,
+            activityRequestID: "thinking-between"))
+        host.frame(renderer)
+        let staleWalkIdentity = store.playbackIdentity(for: substituteWalk)
+        host.failedPMXPlaybackIdentities = [staleWalkIdentity]
+        store.installWorldActivity(StageAvatarWorldActivitySnapshot(
+            transform: WorldTransform(), activity: LifeActivity(), phase: LifeActivityPhase(),
+            motionPlayback: declaredNothing, sourceRevision: 203, activityRequestID: "walk-sub-2",
+            visualPlayback: .temporary(substituteWalk)))
+        host.frame(renderer)
+        precondition(renderer.attemptsByPath[substituteURL.path] == 2,
+            "a stale failure record must not stop the walking clip from being (re)applied")
+        precondition(host.failedPMXPlaybackIdentities.isEmpty,
+            "a successful application clears the stale failure record")
+        host.failedPMXPlaybackIdentities = []
         store.removeMotionPlaybackObserver(pmxObserver)
         print("PASS: full XYZ, in-place XZ lock with original Y, authored rate and one-shot flag")
         print("PASS: once-only terminal events, stale request rejection and explicit playback retry identity")
         print("PASS: real PMX synchronizer caches failed attempts across 120 frames and allows explicit retry")
         print("PASS: failed identity survives temporary B playback without reload or duplicate failure, retries only on new revision/request")
         print("PASS: real PMX synchronizer forwards measured locomotion calibration")
+        print("PASS: the selected walking clip is really loaded and applied (movement-driven channel, stale-failure record cannot suppress it)")
     }
 }
 """#

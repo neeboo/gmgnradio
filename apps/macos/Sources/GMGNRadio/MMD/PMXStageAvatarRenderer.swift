@@ -1681,6 +1681,8 @@ public final class PMXStageAvatarRenderer {
     private var configuration: Configuration
     private var modelNode: MMDNode?
     private var modelRestTransform = matrix_identity_float4x4
+    /// Rest orientations of the diagnostic bones, captured at model install.
+    private var restBoneOrientations: [String: simd_quatf] = [:]
     private weak var trackingRootBone: SCNNode?
     private var trackingRootRestPosition = SIMD3<Float>.zero
     public private(set) var restFootReferenceY: Float?
@@ -2203,7 +2205,52 @@ public final class PMXStageAvatarRenderer {
         loadedMotionURL = nil
         loadedLocomotionGait = nil
         locomotionMeasuredSpeed = nil
+        // Rest pose of the diagnostic bones, captured before any clip is
+        // attached: the difference from these is what tells a bind pose apart
+        // from a clip that is merely holding still.
+        restBoneOrientations = Dictionary(
+            uniqueKeysWithValues: Self.diagnosticBoneNames.compactMap { name in
+                model.childNode(withName: name, recursively: true).map {
+                    (name, $0.simdOrientation)
+                }
+            }
+        )
         installNaturalIdle(on: model)
+    }
+
+    /// Bones whose current-vs-rest angle is reported by
+    /// ``motionPlaybackDiagnostics``: arms + knees + feet, i.e. exactly the
+    /// joints a walk cycle moves and a bind pose leaves at zero.
+    private static let diagnosticBoneNames = ["左腕", "右腕", "左ひざ", "右ひざ", "左足", "右足"]
+
+    /// Live, loadable-agnostic playback fact for the host's diagnostics.
+    ///
+    /// It answers "is the body actually being animated, and in which pose" —
+    /// the question a selection heartbeat cannot answer. `clip` is what the
+    /// renderer really has loaded (not what was requested), `speed` is the
+    /// player's current rate (0 = frozen), and each bone entry is the angle in
+    /// degrees between the drawn orientation and the model's rest orientation:
+    /// all-zero means the bind pose is on screen, which is precisely the
+    /// "selected but nothing is playing" failure.
+    public var motionPlaybackDiagnostics: String {
+        let player = modelNode?.animationPlayer(forKey: Self.motionKey)
+        let clip = loadedMotionURL?.deletingPathExtension().lastPathComponent
+            ?? (isUsingNaturalIdle ? "natural-idle(rest)" : "none")
+        let speed = Float(player?.speed ?? 0)
+        let hasPlayer = player != nil
+        let bones = Self.diagnosticBoneNames.compactMap { name -> String? in
+            guard let node = modelNode?.childNode(withName: name, recursively: true),
+                  let rest = restBoneOrientations[name]
+            else { return nil }
+            let current = node.presentation.simdOrientation
+            let dot = min(abs(simd_dot(
+                simd_normalize(current).vector,
+                simd_normalize(rest).vector
+            )), 1)
+            let degrees = 2 * acos(dot) * 180 / .pi
+            return "\(name)=\(String(format: "%.1f", degrees))"
+        }
+        return "clip=\(clip) hasPlayer=\(hasPlayer) speed=\(String(format: "%.2f", speed)) pose[\(bones.joined(separator: " "))]"
     }
 
     private func validateMotionRequest(_ url: URL) throws {

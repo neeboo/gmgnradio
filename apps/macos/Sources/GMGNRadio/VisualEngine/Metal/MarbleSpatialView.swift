@@ -1552,6 +1552,10 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
     private var appliedPMXResolvedMotion: StageAvatarResolvedMotion?
     private var appliedVRMPlaybackIdentity: StageMotionPlaybackIdentity?
     private var appliedPMXPlaybackIdentity: StageMotionPlaybackIdentity?
+    /// Playback-heartbeat throttling: one line per second per distinct playback
+    /// state, so a real-machine log carries "what was actually drawn".
+    private var lastPlaybackHeartbeatAt: TimeInterval?
+    private var lastPlaybackHeartbeatSignature: String?
     /// Terminal failed playback identities, retained so a failed motion stays
     /// failed across temporary thinking/world-motion changes. Entries are
     /// pruned whenever the snapshot revision advances and the arrays are
@@ -2489,6 +2493,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             return
         }
 
+
         let placement = spatialStage.avatarPlacement
         let cameraView: simd_float4x4
         if renderProfile == .liveCam {
@@ -2617,6 +2622,14 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                 time: Date.timeIntervalSinceReferenceDate,
                 diagnosticProfile: shouldLogPMXFrame ? profileName : nil
             )
+            logPlaybackHeartbeat(
+                profile: profileName,
+                playback: "PMX",
+                details: pmxAvatarRenderer.motionPlaybackDiagnostics,
+                request: avatarRuntime.worldActivity?.activityRequestID ?? "none",
+                phase: avatarRuntime.worldActivity?.phase.rawValue ?? "none",
+                declared: declaredPlaybackID
+            )
         }
     }
 
@@ -2644,6 +2657,46 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         if identities.count > 32 { identities.removeFirst() }
     }
 
+    /// What the world *declared* for this frame, to contrast with what the
+    /// renderer can prove it is actually playing.
+    private var declaredPlaybackID: String {
+        guard let playback = avatarRuntime.worldActivity?.motionPlayback else { return "none" }
+        if case let .temporary(motion) = playback { return motion.id }
+        return "naturalIdle"
+    }
+
+    /// Says what the renderer is *actually* playing, once per second per
+    /// profile, including the drawn pose relative to the model's rest pose.
+    ///
+    /// The selection heartbeat lives in the executor ("the world chose X"); a
+    /// body can still be drawn in its bind pose when the chosen clip never
+    /// reached the renderer, so "chosen" and "played" are reported separately
+    /// and the pose angles make an all-zero (bind) pose unmistakable.
+    private func logPlaybackHeartbeat(
+        profile: String,
+        playback: String,
+        details: String,
+        request: String,
+        phase: String,
+        declared: String
+    ) {
+        // The drawn pose changes every frame, so the state key is the *clip the
+        // renderer has loaded* (plus profile and the world's declaration), not
+        // the whole rendered string: any change of what is playing is reported
+        // immediately, and the same state is re-reported once per second.
+        let clipToken = details.split(separator: " ").first.map(String.init) ?? details
+        let signature = "\(profile)|\(playback)|\(clipToken)|\(declared)"
+        let now = Date.timeIntervalSinceReferenceDate
+        if lastPlaybackHeartbeatSignature == signature {
+            guard let lastPlaybackHeartbeatAt, now - lastPlaybackHeartbeatAt >= 1 else { return }
+        }
+        lastPlaybackHeartbeatAt = now
+        lastPlaybackHeartbeatSignature = signature
+        Self.log.notice(
+            "Playback heartbeat profile=\(profile, privacy: .public) \(playback, privacy: .public) \(details, privacy: .public) request=\(request, privacy: .public) phase=\(phase, privacy: .public) declared=\(declared, privacy: .public)"
+        )
+    }
+
     private func synchronizePMXWorldMotion(
         _ renderer: PMXStageAvatarRenderer
     ) {
@@ -2666,22 +2719,49 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             avatarRuntime.playbackIdentity(for: motion)
         } else { nil }
         pruneStaleFailedPlaybackIdentities(&failedPMXPlaybackIdentities)
-        guard resolved != appliedPMXResolvedMotion || identity != appliedPMXPlaybackIdentity else { return }
+        let unchanged = resolved == appliedPMXResolvedMotion
+            && identity == appliedPMXPlaybackIdentity
+        guard !unchanged else { return }
+        // Every decision below is named in the log: "the world resolved X, the
+        // renderer did Y" is the fact that a selection heartbeat cannot carry.
+        let worldPlaybackID: String = if case let .temporary(motion)? = avatarRuntime.worldActivity?.renderPlayback {
+            motion.id
+        } else {
+            "none"
+        }
+        let resolvedID: String = if case let .asset(motion) = resolved {
+            "\(motion.id)(\(motion.format.rawValue),\(motion.url == nil ? "no-url" : "url"))"
+        } else {
+            "naturalIdle"
+        }
+        let failedCount = failedPMXPlaybackIdentities.count
+        let appliedBefore = appliedPMXResolvedMotion.map(String.init(describing:)) ?? "none"
+        Self.log.notice(
+            "PMX world motion decision world=\(worldPlaybackID, privacy: .public) resolved=\(resolvedID, privacy: .public) identity=\(identity?.motion.id ?? "none", privacy: .public) request=\(identity?.worldActivityRequestID ?? "none", privacy: .public) phase=\(identity?.worldActivityPhase?.rawValue ?? "none", privacy: .public) failedIdentities=\(failedCount, privacy: .public) appliedBefore=\(appliedBefore, privacy: .public)"
+        )
         // Cache the attempt before loading, including failures. A fresh user
         // revision or world request explicitly permits another attempt.
         appliedPMXResolvedMotion = resolved
         appliedPMXPlaybackIdentity = identity
         renderer.onMotionFinished = nil
-        if let identity, failedPMXPlaybackIdentities.contains(identity) {
+        // A locomotion clip is never suppressed by an earlier failure record:
+        // the body must not be left posed while the world keeps moving it. The
+        // record still stops the *report* from repeating, and a successful
+        // application clears it.
+        let isLocomotionClip: Bool = if case let .asset(motion) = resolved {
+            motion.isLocomotionLoop
+        } else {
+            false
+        }
+        if let identity, !isLocomotionClip,
+           failedPMXPlaybackIdentities.contains(identity) {
             // A failed identity stays failed across temporary thinking and
-            // world-motion changes. Restore the cleared renderer state without
-            // re-loading the bad asset or re-reporting the terminal failure.
-            // This path used to be silent; a body that keeps translating with
-            // no motion is exactly the "sliding" defect, so it names itself.
+            // world-motion changes: keep the current clip (the declared failure
+            // policy) instead of dropping to the rest pose, and name the
+            // identity so a permanently missing motion is never invisible.
             renderer.setCoffeeCupVisible(false)
-            renderer.clearMotion()
             Self.log.error(
-                "PMX motion \(identity.motion.id, privacy: .public) was already reported failed for this request; the avatar falls back to the rest pose instead of re-attempting it"
+                "PMX motion \(identity.motion.id, privacy: .public) was already reported failed for request=\(identity.worldActivityRequestID ?? "none", privacy: .public); keeping the current clip instead of re-attempting it"
             )
             return
         }
@@ -2711,6 +2791,9 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                 guard let identity, identity.motion.url == url else { return }
                 avatarRuntime?.reportMotionPlayback(identity: identity, outcome: .completed)
             }
+            Self.log.notice(
+                "Loading PMX motion id=\(motion.id, privacy: .public) file=\(motionURL.lastPathComponent, privacy: .public) repeats=\(motion.loop, privacy: .public) inPlace=\(motion.inPlace == true, privacy: .public) playbackRate=\(motion.playbackRate, privacy: .public) locomotion=\(PMXStageAvatarRenderer.locomotionGait(for: motion) != nil, privacy: .public)"
+            )
             let loaded = loadPMXMotion(
                 motionURL,
                 into: renderer,
@@ -2722,6 +2805,9 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                 failureMessage: "Unable to apply resolved PMX motion"
             )
             if loaded {
+                if let identity {
+                    failedPMXPlaybackIdentities.removeAll { $0 == identity }
+                }
                 appliedPMXResolvedMotion = resolved
                 renderer.setCoffeeCupVisible(
                     PMXWarmKitchenCoffeeCup.shouldDisplay(motionID: motion.id)
@@ -2800,6 +2886,20 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         } else { nil }
         pruneStaleFailedPlaybackIdentities(&failedVRMPlaybackIdentities)
         guard resolved != appliedVRMResolvedMotion || identity != appliedVRMPlaybackIdentity else { return }
+        let worldPlaybackID: String = if case let .temporary(motion)? = avatarRuntime.worldActivity?.renderPlayback {
+            motion.id
+        } else {
+            "none"
+        }
+        let resolvedID: String = if case let .asset(motion) = resolved {
+            "\(motion.id)(\(motion.format.rawValue),\(motion.url == nil ? "no-url" : "url"))"
+        } else {
+            "naturalIdle"
+        }
+        let failedCount = failedVRMPlaybackIdentities.count
+        Self.log.notice(
+            "VRM world motion decision world=\(worldPlaybackID, privacy: .public) resolved=\(resolvedID, privacy: .public) identity=\(identity?.motion.id ?? "none", privacy: .public) request=\(identity?.worldActivityRequestID ?? "none", privacy: .public) failedIdentities=\(failedCount, privacy: .public)"
+        )
         appliedVRMResolvedMotion = resolved
         appliedVRMPlaybackIdentity = identity
 
@@ -2814,8 +2914,19 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
 
         // A failed identity stays failed across temporary thinking and
         // world-motion changes; only an explicit new playback revision or
-        // activity request (a fresh identity) permits another attempt.
-        if let identity, failedVRMPlaybackIdentities.contains(identity) {
+        // activity request (a fresh identity) permits another attempt. A
+        // locomotion clip is never suppressed: the body must not be left in its
+        // bind pose while the world keeps translating it.
+        let isLocomotionClip: Bool = if case let .asset(motion) = resolved {
+            motion.isLocomotionLoop
+        } else {
+            false
+        }
+        if let identity, !isLocomotionClip,
+           failedVRMPlaybackIdentities.contains(identity) {
+            Self.log.error(
+                "VRM motion \(identity.motion.id, privacy: .public) was already reported failed for request=\(identity.worldActivityRequestID ?? "none", privacy: .public); keeping the previous clip instead of re-attempting it"
+            )
             return
         }
 
@@ -2823,6 +2934,9 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             switch resolved {
             case .naturalIdle:
                 avatarAnimationPlayer = nil
+                Self.log.notice(
+                    "Cleared VRM motion to the bind pose: the world resolved no playable clip"
+                )
             case let .asset(motion):
                 let loaded = try StageAvatarAnimationLoader.makeLoopingPlayerWithGait(
                     for: motion,
@@ -2831,6 +2945,12 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                 loaded.player?.lookAtController = avatarRenderer?.lookAtController
                 avatarAnimationPlayer = loaded.player
                 appliedVRMLocomotionGait = loaded.gait
+                if let identity {
+                    failedVRMPlaybackIdentities.removeAll { $0 == identity }
+                }
+                Self.log.notice(
+                    "Applied resolved VRM motion id=\(motion.id, privacy: .public) loop=\(motion.loop, privacy: .public) locomotion=\(loaded.gait != nil, privacy: .public)"
+                )
             }
         } catch {
             avatarAnimationPlayer = nil
@@ -2900,6 +3020,23 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             telemetry: avatarRuntime.locomotion,
             gait: appliedVRMLocomotionGait,
             player: avatarAnimationPlayer
+        )
+        let vrmClipID: String = if case let .asset(motion)? = appliedVRMResolvedMotion {
+            motion.id
+        } else {
+            "naturalIdle"
+        }
+        let vrmSpeed = Float(avatarAnimationPlayer?.speed ?? 0)
+        let vrmHasPlayer = avatarAnimationPlayer != nil
+        let vrmGait = appliedVRMLocomotionGait != nil
+        let vrmHipHeight = avatarModel.nodes.first?.initialTranslation.y ?? 0
+        logPlaybackHeartbeat(
+            profile: renderProfile == .liveCam ? "liveCam" : "fullStage",
+            playback: "VRM",
+            details: "clip=\(vrmClipID) hasPlayer=\(vrmHasPlayer) speed=\(String(format: "%.2f", vrmSpeed)) gait=\(vrmGait) hips=\(String(format: "%.3f", vrmHipHeight))",
+            request: avatarRuntime.worldActivity?.activityRequestID ?? "none",
+            phase: avatarRuntime.worldActivity?.phase.rawValue ?? "none",
+            declared: declaredPlaybackID
         )
         let motion = StageAvatarMotionFrame.resolve(
             activity: avatarRuntime.activity,

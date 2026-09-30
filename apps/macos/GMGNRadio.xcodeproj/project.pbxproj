@@ -28,6 +28,7 @@
 		1029A6F209C61A64E0EBF1A5 /* DJAgentPreferences.swift in Sources */ = {isa = PBXBuildFile; fileRef = A321D62650E77B8CBC685704 /* DJAgentPreferences.swift */; };
 		112047AE282D76793385E8D2 /* MetalSplatter in Frameworks */ = {isa = PBXBuildFile; productRef = 4C2793185FB349C1D1DEE032 /* MetalSplatter */; };
 		119696923E6727DCFC6373AD /* StreamingMusicCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF4EF80770D71D3EC6B0D33D /* StreamingMusicCache.swift */; };
+		124DE75B028E61EFAFDC5712 /* ResidentStatusBadge.swift in Sources */ = {isa = PBXBuildFile; fileRef = DAD2011C1B13A08F62BC302B /* ResidentStatusBadge.swift */; };
 		1416CFCA7EF61E9C6910B6CD /* MusicAccountsModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74CB5FDE714890B936EBFF0A /* MusicAccountsModelTests.swift */; };
 		14F3DD1C897214893411775A /* AudioAnalyzerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F147E6715B7962D9C712C642 /* AudioAnalyzerTests.swift */; };
 		158A2856BBB54445A141FA3F /* NeteaseMusicProviderClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94A2BF219797EE74E2B2C162 /* NeteaseMusicProviderClientTests.swift */; };
@@ -536,6 +537,7 @@
 		D6F313F9AA07A438357513FA /* ResidentClaudeProcessRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentClaudeProcessRunner.swift; sourceTree = "<group>"; };
 		D73BB32CFC397588C53B1B26 /* PMXStageAvatarRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PMXStageAvatarRenderer.swift; sourceTree = "<group>"; };
 		D97F73949C67E2C74646A608 /* NeteaseMusicProviderClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NeteaseMusicProviderClient.swift; sourceTree = "<group>"; };
+		DAD2011C1B13A08F62BC302B /* ResidentStatusBadge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentStatusBadge.swift; sourceTree = "<group>"; };
 		DC40E01F73CFB13274ED0B8B /* ResidentCodexPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentCodexPolicy.swift; sourceTree = "<group>"; };
 		DCC5468C463F8DC8DE45695B /* WishMachineCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WishMachineCoordinator.swift; sourceTree = "<group>"; };
 		DCF719BB745F9C7E94029828 /* StagePresentationModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StagePresentationModel.swift; sourceTree = "<group>"; };
@@ -671,6 +673,7 @@
 				32A231638291FF4F5DA2F049 /* ProgramVisualCue.swift */,
 				4C25006F47A0D72758A7B6B0 /* ProgramVisualDirector.swift */,
 				58D62C063D06327ED604C562 /* ResidentPropEditorView.swift */,
+				DAD2011C1B13A08F62BC302B /* ResidentStatusBadge.swift */,
 				D40A78C216C16AF9A7BF4F96 /* SpatialEnvironmentEffectsView.swift */,
 				B8B2E1684E9AD716A583F585 /* SpatialStageStore.swift */,
 				ACAAB0C3BB4344BA3E26C9BF /* StageAvatarMotionPlayback.swift */,
@@ -1551,6 +1554,7 @@
 				3D797429E450227D21862C59 /* ResidentPropScene.swift in Sources */,
 				91B55E583C0A274F29063E6F /* ResidentPropToolBridge.swift in Sources */,
 				C04254A6FF945016763D8B48 /* ResidentStateClient.swift in Sources */,
+				124DE75B028E61EFAFDC5712 /* ResidentStatusBadge.swift in Sources */,
 				E6EB719F55B52F1FE142E026 /* ResidentSteeringDelivery.swift in Sources */,
 				5802934BD03181448678449E /* ResidentSystemInbox.swift in Sources */,
 				EE95EF0A8FF1624F096C459D /* ResidentSystemInboxStateStorage.swift in Sources */,

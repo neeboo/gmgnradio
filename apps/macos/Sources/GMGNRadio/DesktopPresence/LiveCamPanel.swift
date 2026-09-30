@@ -349,6 +349,24 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate, NSGestureRecogn
             let normalized = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return normalized.isEmpty ? nil : normalized
         }
+        // 居民的"在想 / 在说"标在**进度那一行**上，符号取自与舞台头顶气泡、舞台状态行
+        // 同一个来源（`ResidentStatusBadge`），所以三处不可能显示不同的符号。
+        // `residentProgress` 非空时它的那一行必然排在 `lines[0]`（数组顺序 + compactMap
+        // 保序），所以这里不会错标到投递提示上。
+        let progressText = (residentProgress ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let isSpeaking = AgentSpeechStatusStore.shared.isSpeaking
+        if !progressText.isEmpty, !lines.isEmpty {
+            lines[0] = ResidentStatusBadge.decorate(
+                lines[0],
+                isThinking: residentThinking,
+                isSpeaking: isSpeaking
+            )
+        } else if isSpeaking {
+            // 没在思考、只有语音在播（TTS 输出阶段）：这一行原本什么都不显示，
+            // 用户看不出"它在说话"。
+            lines.insert(ResidentStatusBadge.speakingLine, at: 0)
+        }
         if let residentStatusNotice, !residentStatusNotice.isEmpty {
             lines.append("应用提示：" + residentStatusNotice)
         }

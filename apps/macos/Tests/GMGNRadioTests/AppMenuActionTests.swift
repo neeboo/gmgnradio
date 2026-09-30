@@ -134,30 +134,66 @@ func livingActivityMenuIncludesEveryAuthoredActivityWithReadableNames() {
 }
 
 @Test
-func startingALivingActivityKeepsAnOpenFullSpaceVisible() {
+func startingALivingActivityNeverPresentsTheLiveCam() {
+    // 活动开始不是「进入小窗」的动作。旧测试只断言「空间开着时不该切」，
+    // 空间没开时那条策略一律回答「该显示小窗」，于是活动把小窗顶了出来。
     #expect(
-        LivingWorldActivityPresentationPolicy.shouldShowDesktopPresence(
-            fullSpaceIsPresented: true
-        ) == false
+        !LiveCamPresentationPolicy.shouldPresentLiveCam(
+            trigger: .livingWorldActivityChange,
+            hasAvatar: true,
+            fullStageIsPresented: false
+        )
     )
     #expect(
-        LivingWorldActivityPresentationPolicy.shouldShowDesktopPresence(
-            fullSpaceIsPresented: false
-        ) == true
+        !LiveCamPresentationPolicy.shouldPresentLiveCam(
+            trigger: .livingWorldActivityChange,
+            hasAvatar: true,
+            fullStageIsPresented: true
+        )
     )
 }
 
 @Test
-func selectingACharacterMotionKeepsAnOpenFullSpaceVisible() {
+func selectingACharacterMotionNeverPresentsTheLiveCam() {
     #expect(
-        CharacterMotionPresentationPolicy.shouldShowDesktopPresence(
-            fullSpaceIsPresented: true
-        ) == false
+        !LiveCamPresentationPolicy.shouldPresentLiveCam(
+            trigger: .characterMotionChange,
+            hasAvatar: true,
+            fullStageIsPresented: false
+        )
     )
+}
+
+@Test
+func residentStateNoticesAndSnapshotChangesNeverPresentTheLiveCam() {
+    // 语音、状态播报、走路与许愿任务变化都不许改变窗口形态。
+    for trigger in [
+        LiveCamPresentationTrigger.residentStatusNotice,
+        .avatarSnapshotChange,
+    ] {
+        #expect(
+            !LiveCamPresentationPolicy.shouldPresentLiveCam(
+                trigger: trigger,
+                hasAvatar: true,
+                fullStageIsPresented: false
+            )
+        )
+    }
+    // 保留项：用户的显式小窗动作仍然有效（还有角色、空间没占着渲染面）。
     #expect(
-        CharacterMotionPresentationPolicy.shouldShowDesktopPresence(
-            fullSpaceIsPresented: false
-        ) == true
+        LiveCamPresentationPolicy.shouldPresentLiveCam(
+            trigger: .explicitUserAction,
+            hasAvatar: true,
+            fullStageIsPresented: false
+        )
+    )
+    // 冷启动的默认入口是唯一允许的非显式呈现。
+    #expect(
+        LiveCamPresentationPolicy.shouldPresentLiveCam(
+            trigger: .launchDefault,
+            hasAvatar: true,
+            fullStageIsPresented: false
+        )
     )
 }
 

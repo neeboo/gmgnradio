@@ -23,7 +23,7 @@ func foregroundActivationMakesTheApplicationRegularBeforeActivatingIt() {
 
 @Test
 @MainActor
-func dockReopenRestoresTheSelectedDesktopPresence() {
+func dockReopenRestoresTheDesktopPresenceOnlyWhenNothingIsVisible() {
     var showDesktopPresenceCount = 0
     let action = DockReopenAction {
         showDesktopPresenceCount += 1
@@ -32,8 +32,10 @@ func dockReopenRestoresTheSelectedDesktopPresence() {
     #expect(action.perform(hasVisibleWindows: false))
     #expect(showDesktopPresenceCount == 1)
 
+    // 已经有可见窗口时点 Dock 图标不得切换桌面形态：那会把用户正在看的窗口
+    // 换掉（真机上的「点底栏的 icon 就变小窗」）。
     #expect(action.perform(hasVisibleWindows: true))
-    #expect(showDesktopPresenceCount == 2)
+    #expect(showDesktopPresenceCount == 1)
 }
 
 @Test

@@ -1,4 +1,28 @@
 import Foundation
+import os
+
+/// **居民图片链[3] 队列/轮次**：带图的提交进入队列后，有没有被带进真正的那一轮。
+///
+/// 图片回合在队列里比纯文字多一条规则：正在跑的轮次不接受带图引导（引导通道只有
+/// 文字），带图消息必须留给下一个轮次。这条规则如果什么时候失效，用户只会看到
+/// 「图片没反应」。所以入队、出队、成轮三处各一条，外加轮次失败时的确切错误。
+///
+/// 常驻诊断，限流 32 条/进程。
+@MainActor
+private enum ResidentImageChainLog {
+    static let log = Logger(subsystem: "ai.gmgn.radio", category: "ResidentImageTransport")
+    private static var budget = 32
+    static func note(_ message: String) {
+        guard budget > 0 else { return }
+        budget -= 1
+        log.notice("\(message, privacy: .public)")
+    }
+    static func failure(_ message: String) {
+        guard budget > 0 else { return }
+        budget -= 1
+        log.error("\(message, privacy: .public)")
+    }
+}
 
 /// 居民聊天区一条状态行的类别。两个聊天表面（LiveCam、空间）共用同一套语义，
 /// 避免「语音连接中」「本轮失败」等互相覆盖或长期残留。
@@ -735,9 +759,32 @@ final class ResidentAgentLoop {
                             onUndelivered: @escaping @MainActor () -> Void = {},
                             onFailure: @escaping @MainActor (String) -> Void = { _ in }) {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !invalidated, !text.isEmpty || !imageURLs.isEmpty else { return }
+        guard !invalidated, !text.isEmpty || !imageURLs.isEmpty else {
+            if !imageURLs.isEmpty {
+                ResidentImageChainLog.failure(
+                    "居民图片链[3] 入队被拒 原因=循环已作废 图片=\(imageURLs.count)"
+                )
+            }
+            return
+        }
         stopped = false
         noteMutation()
+        if !imageURLs.isEmpty {
+            // 计划执行中轮次不接受带图引导，这条消息会留在队列里等下一轮 ——
+            // 真机上如果只看到这一条而长时间没有 [3] 出队，就是「等不到下一轮」。
+            // 附件体检（存在/字节）放在这里，因为这是本方法唯一能拿到 URL 的位置，
+            // 而它紧跟 `sendResidentSubmission` 之后，等价于 [2] 的落点。
+            // 只读文件属性、绝不整份读进内存：这条日志在主线程上，32 MiB 的同步读
+            // 会让界面卡一下（真正的字节读取发生在 `dshNativeImageBlocks`）。
+            let attachmentCheck = imageURLs.map { url -> String in
+                let values = try? url.resourceValues(forKeys: [.fileSizeKey])
+                let exists = values?.fileSize != nil
+                return "\(url.lastPathComponent)|存在=\(exists)|字节=\(values?.fileSize ?? -1)"
+            }.joined(separator: " ; ")
+            ResidentImageChainLog.note(
+                "居民图片链[2] 提交抵达轮次队列 图片=\(imageURLs.count) 文字长度=\(text.count) 有进行中轮次=\(activeRunID != nil) 队列长度=\(messages.count + 1) 附件=[\(attachmentCheck)]"
+            )
+        }
         // 用户已接手：尚未就绪的旧恢复作废（不再重试，也不覆盖新计划），
         // 但用户消息本身照常进入队列/回合，不受恢复状态影响。
         memoryRestoreSuperseded = true
@@ -1110,10 +1157,22 @@ final class ResidentAgentLoop {
     }
 
     private func drainUserMessages() {
-        guard !invalidated, !stopped, activeRunID == nil, !messages.isEmpty else { return }
+        guard !invalidated, !stopped, activeRunID == nil, !messages.isEmpty else {
+            if !messages.isEmpty, messages.contains(where: { !$0.imageURLs.isEmpty }) {
+                ResidentImageChainLog.note(
+                    "居民图片链[3] 出队等待 原因=作废\(invalidated)/停自主\(stopped)/已有轮次\(activeRunID != nil) 队列长度=\(messages.count) 队列图片=\(messages.flatMap(\.imageURLs).count)"
+                )
+            }
+            return
+        }
         let batch = messages
         let images = messages.flatMap(\.imageURLs)
         messages.removeAll()
+        if !images.isEmpty {
+            ResidentImageChainLog.note(
+                "居民图片链[3] 出队成轮 消息=\(batch.count) 图片=\(images.count) 文件=[\(images.map(\.lastPathComponent).joined(separator: ","))]"
+            )
+        }
         beginRun(userMessages: batch.map(\.text), imageURLs: images, isBackground: false, submissions: batch)
     }
 
@@ -1144,6 +1203,13 @@ final class ResidentAgentLoop {
         lastWakeAt = now()
         activeModelInvocationStarted = false
         onChange()
+        if !imageURLs.isEmpty {
+            // 轮次真正拿到图片：从这一行往下，图片已经交给宿主发送路径
+            // （`performResidentTurn` → `AgentConversationService.send(imageURLs:)`）。
+            ResidentImageChainLog.note(
+                "居民图片链[3] 轮次带图 run=\(id.uuidString.prefix(8)) 图片=\(imageURLs.count) 文字消息=\(userMessages.count) 后台轮=\(isBackground)"
+            )
+        }
         task = Task { @MainActor [weak self] in
             guard let self, self.isCurrent(runID: id), !Task.isCancelled else { return }
             // 调度出轮次不等于真正调用：后台轮次在越过守卫、即将调用前必须按运行时
@@ -1163,7 +1229,16 @@ final class ResidentAgentLoop {
             self.activeModelInvocationStarted = true
             let result: Result<String, Error>
             do { result = .success(try await self.run(input)) }
-            catch { result = .failure(error) }
+            catch {
+                if !input.imageURLs.isEmpty {
+                    // **图片链的确切错误**：真机上要的就是这一行 —— 类型 + 文案，
+                    // 而不是 UI 那句概述。
+                    ResidentImageChainLog.failure(
+                        "居民图片链[7] 带图轮次失败 图片=\(input.imageURLs.count) 错误类型=\(String(describing: type(of: error))) 错误文案=\(error.localizedDescription) 完整=\(String(describing: error))"
+                    )
+                }
+                result = .failure(error)
+            }
             guard self.isCurrent(runID: id) else { return }
             // 提供方失败/取消是本轮真实终态：一旦当前轮接受结果就立即计数，不能等
             // finishIfReady——等待中的引导会推迟完成，而 stop 会丢弃 completedResult，

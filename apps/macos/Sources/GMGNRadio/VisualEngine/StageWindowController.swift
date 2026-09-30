@@ -447,9 +447,13 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         window.orderFrontRegardless()
         if spatialStage.isWorldPresentationRequested {
             stageContentView?.attachRenderSurface()
-        } else {
-            onShowPlayerHandler?()
         }
+        // 播放器模式**不再**在这里顺手把 Live Cam 顶出来：`show()` 是窗口生命周期
+        // 的公共路径（任何 `showStage()` / `showPlayer()` / 歌词模式切换都会经过），
+        // 让「把舞台窗显示出来」这个动作附带切换窗口形态，就是用户说的
+        // 「动不动就到小窗」。渲染面的交接只发生在**显式的播放器入口**：
+        // 目的地按钮的 `.showPlayer`（走 `onShowPlayerHandler`）与
+        // `GMGNRadioApp.showPlayer()`。
         updateRenderSurfaceVisibility(for: window)
         Self.log.notice(
             "Stage shown surfaceOwner=\(String(describing: self.renderSurfaceController.owner), privacy: .public) requested=\(self.spatialStage.isWorldPresentationRequested, privacy: .public) visible=\(self.spatialStage.isWorldVisible, privacy: .public)"
@@ -994,7 +998,11 @@ private final class StageContentView: NSView {
                 lyrics: lyrics,
                 videos: videos,
                 audioFeatures: audioFeatures,
-                playbackPosition: playbackPosition
+                playbackPosition: playbackPosition,
+                // 角色头顶气泡要的两样：世界（角色位置 + 既有投影）与居民那份**同一个**
+                // thinking 状态。两者本来就在这层的作用域里，不新建状态、不新建投影。
+                spatialStage: spatialStage,
+                residentChat: residentChat
             )
         )
         overlay.frame = bounds

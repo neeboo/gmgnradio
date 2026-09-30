@@ -196,6 +196,102 @@ guard rotationRingRadius == 26 else {
     print("FAIL: the visible rotation ring radius moved (expected 26 pt, got \(rotationRingRadius) pt)")
     exit(1)
 }
+// ── 居民状态 → 符号：唯一来源 + 头顶气泡（世界锚定） ─────────────────────────
+// 三个渲染点（舞台头顶气泡、舞台状态行、Live Cam 面板状态行）必须都从
+// `ResidentStatusBadge` 取符号；emoji 字面量只许在那一份文件里出现。
+let badgeSourcePath = sources.appendingPathComponent("VisualEngine/ResidentStatusBadge.swift").path
+let badge = try String(contentsOfFile: badgeSourcePath, encoding: .utf8)
+let marble = try String(contentsOf: sources.appendingPathComponent("VisualEngine/Metal/MarbleSpatialView.swift"), encoding: .utf8)
+let headBadgeView = declaration("struct StageResidentHeadBadgeView:", in: overlay)
+guard badge.contains("static let thinkingSymbol"),
+      badge.contains("static let speakingSymbol") else {
+    print("FAIL: 状态→符号的唯一来源没有命名常量（思考/说话符号必须各只有一份定义）")
+    exit(1)
+}
+guard overlay.contains("ResidentStatusBadge.statusLine("),
+      liveCamPanel.contains("ResidentStatusBadge.decorate("),
+      headBadgeView.contains("ResidentStatusBadge.symbol(") else {
+    print("FAIL: 舞台状态行 / Live Cam 状态行 / 头顶气泡必须共用同一个状态→符号来源")
+    exit(1)
+}
+for (name, source) in [("舞台覆盖层", overlay), ("Live Cam 面板", liveCamPanel),
+                       ("Live Cam 窗口控制器", liveCamController)]
+where source.contains("🤔") || source.contains("🗣️") {
+    print("FAIL: \(name) 里出现了 emoji 字面量 —— 那就是第二份来源，改一处会分叉")
+    exit(1)
+}
+// 头顶锚点必须来自**角色当前摆放 + 既有绑定矩阵 + 既有投影**，不许自己造一套。
+guard headBadgeView.contains("MarblePMXFraming.modelTransform("),
+      headBadgeView.contains("spatialStage.avatarPlacement") else {
+    print("FAIL: 头顶锚点必须复用既有角色绑定矩阵（MarblePMXFraming.modelTransform）并跟随角色摆放")
+    exit(1)
+}
+guard headBadgeView.contains("residentPropScreenPoint("),
+      !headBadgeView.contains("perspective"),
+      !headBadgeView.contains("lookAt") else {
+    print("FAIL: 头顶锚点必须复用既有投影（residentPropScreenPoint），不许新造投影")
+    exit(1)
+}
+// 间隙要按角色**在屏幕上的身高**缩放，所以脚点也要走同一套既有投影（两次投影）。
+guard headBadgeView.contains("residentPropScreenPoint(world: placement.position)"),
+      headBadgeView.contains("characterScreenHeight: geometry.characterScreenHeight") else {
+    print("FAIL: 与头的间隙必须按角色屏高缩放，必须同时投影脚点并把它交给 anchor")
+    exit(1)
+}
+// 跟随的是**身体根节点**（placement + 归一化身高），不是头骨姿态。
+guard headBadgeView.contains("spatialStage.avatarPlacement"),
+      !headBadgeView.contains("headBone"),
+      !headBadgeView.contains("boneMatrix") else {
+    print("FAIL: 气泡跟随的应当是身体根节点（点头/转身不该把气泡甩走）")
+    exit(1)
+}
+// 配色也只有一份：气泡视图里不许出现任何颜色字面量（RGB 只在 ResidentStatusBadgeInk 里）。
+for literal in ["Color(white:", "Color(red:", "Color.white", "Color.black"] where headBadgeView.contains(literal) {
+    print("FAIL: 头顶气泡里出现了颜色字面量 \(literal) —— 配色必须只有一份")
+    exit(1)
+}
+guard headBadgeView.contains("ResidentStatusBadge.cloudFill.color"),
+      headBadgeView.contains("ResidentStatusBadge.cloudOutline.color"),
+      headBadgeView.contains("ResidentStatusBadge.tailDotFill.color"),
+      headBadgeView.contains("ResidentStatusBadge.tailDotOutline.color"),
+      headBadgeView.contains("ResidentStatusBadge.symbolInk.color") else {
+    print("FAIL: 云体/描边/指向点/符号的配色必须全部从 ResidentStatusBadgeInk 取")
+    exit(1)
+}
+guard badge.contains("static let cloudFill"), badge.contains("static let symbolInk"),
+      badge.contains("static var tailDotFill") else {
+    print("FAIL: 配色必须在 ResidentStatusBadge 里声明为唯一一份")
+    exit(1)
+}
+// 覆盖层穿透点击：宿主 hosting view 的 hitTest 返回 nil，气泡自己也关掉命中测试。
+let overlayHost = declaration("private final class StageOverlayHostingView:", in: controller)
+guard overlayHost.contains("override func hitTest(_ point: NSPoint) -> NSView?") else {
+    print("FAIL: 头顶气泡所在的覆盖层没有 hitTest 覆写")
+    exit(1)
+}
+guard headBadgeView.contains(".allowsHitTesting(false)") else {
+    print("FAIL: 头顶气泡必须 allowsHitTesting(false)，否则会挡住场景的指针")
+    exit(1)
+}
+// 空闲态不画：气泡的存在性只由 `isVisible(isThinking:isSpeaking:)` 决定。
+guard headBadgeView.contains("if visible"),
+      headBadgeView.contains("ResidentStatusBadge.isVisible(") else {
+    print("FAIL: 气泡必须由状态投影决定画不画（空闲态整朵消失）")
+    exit(1)
+}
+// 头顶本地高度与生产绑定矩阵里的 `normalizedHeight` 是**同一个量**：这里读出生产值，
+// 下面拿它钉住 `ResidentStatusBadge.headLocalTopY` —— 改一处不会静默错位。
+let marblenormalizedHeight: Double = {
+    guard let line = marble.split(separator: "\n").first(where: {
+              $0.contains("normalizedHeight: Float =")
+          }),
+          let value = Double(line.split(separator: "=").last?
+              .trimmingCharacters(in: .whitespaces) ?? "") else {
+        print("FAIL: MarblePMXFraming.normalizedHeight is not declared")
+        exit(1)
+    }
+    return value
+}()
 let harness = #"""
 import Foundation
 import Combine
@@ -786,6 +882,312 @@ enum StageAvatarActivity { case listening, speaking, idle }
             check(abs(nearOffset.x) < CGFloat(halfWidth) && abs(nearOffset.y) < CGFloat(halfDepth),
                   "the handle stays inside the hovered cell at \(groundDistance) m, so the pointer can reach it")
         }
+        // ── 居民头顶的思考/说话气泡（世界锚定，主交付） ──────────────────────────
+        // 需求原话："在它头顶"、"搞一个 ☁️ 之类的"。所以这组断言守三件事：
+        //   1. 状态 → 符号（含叠加规则与空闲态）；
+        //   2. 位置 = **角色头顶的世界投影**，不是固定屏幕位置，且角色/相机一动就跟着动；
+        //   3. 空闲态整朵（云 + 指向点）不画。
+        check(ResidentStatusBadge.symbol(isThinking: true, isSpeaking: false)
+                == ResidentStatusBadge.thinkingSymbol,
+              "思考中必须出现思考符号")
+        check(ResidentStatusBadge.symbol(isThinking: false, isSpeaking: true)
+                == ResidentStatusBadge.speakingSymbol,
+              "说话中必须出现说话符号")
+        check(ResidentStatusBadge.symbol(isThinking: true, isSpeaking: true)
+                == ResidentStatusBadge.speakingSymbol,
+              "叠加规则明确：说话优先于思考（同时为真时取说话符号）")
+        check(ResidentStatusBadge.symbol(isThinking: false, isSpeaking: false) == nil,
+              "空闲态没有符号")
+        check(!ResidentStatusBadge.isVisible(isThinking: false, isSpeaking: false),
+              "空闲态不画头顶气泡")
+        for text in [ResidentStatusBadge.idleLabel, ResidentStatusBadge.listeningText] {
+            check(!text.contains(ResidentStatusBadge.thinkingSymbol)
+                    && !text.contains(ResidentStatusBadge.speakingSymbol),
+                  "空闲/听音文案里不许留孤立 emoji（\"\(text)\"）")
+        }
+        // 文字行三处同源：符号一律从 `ResidentStatusBadge` 来，不在这里另拼字面量。
+        check(ResidentStatusBadge.statusLine(
+                isThinking: true, isSpeaking: false, isListening: false,
+                progress: "正在查询歌单…")
+                == ResidentStatusBadge.thinkingSymbol + " 正在查询歌单…",
+              "思考行的符号 + 真实进度文案（进度口径不变）")
+        check(ResidentStatusBadge.statusLine(
+                isThinking: false, isSpeaking: true, isListening: false, progress: "x")
+                == ResidentStatusBadge.speakingSymbol + " " + ResidentStatusBadge.speakingText,
+              "说话行的符号来自同一个来源")
+        check(ResidentStatusBadge.statusLine(
+                isThinking: false, isSpeaking: false, isListening: true, progress: "x")
+                == ResidentStatusBadge.listeningSymbol + " " + ResidentStatusBadge.listeningText,
+              "听音行的符号来自同一个来源")
+        check(ResidentStatusBadge.statusLine(
+                isThinking: false, isSpeaking: false, isListening: false, progress: "x")
+                == ResidentStatusBadge.idleLabel,
+              "空闲行与改动前逐字一致（不加符号）")
+        check(ResidentStatusBadge.decorate("工具请求已返回，等待居民回应…",
+                                          isThinking: true, isSpeaking: false)
+                == ResidentStatusBadge.thinkingSymbol + " 工具请求已返回，等待居民回应…",
+              "Live Cam 面板的进度行用的是同一个投影函数")
+
+        // 头顶锚点：本地头顶高度经**角色绑定矩阵**变成世界点。
+        // 矩阵形状与 `MarblePMXFraming.modelTransform` 一致（平移 × 绕 Y × 均匀缩放）。
+        let badgeScale: Float = 0.82
+        func badgePlacementTransform(_ position: SIMD3<Float>, yaw: Float = 0) -> simd_float4x4 {
+            let cosine = cos(yaw), sine = sin(yaw)
+            return simd_float4x4(columns: (
+                SIMD4(badgeScale * cosine, 0, -badgeScale * sine, 0),
+                SIMD4(0, badgeScale, 0, 0),
+                SIMD4(badgeScale * sine, 0, badgeScale * cosine, 0),
+                SIMD4(position.x, position.y, position.z, 1)
+            ))
+        }
+        let standingHead = ResidentStatusBadge.headTopWorldPoint(
+            modelTransform: badgePlacementTransform(SIMD3(-0.72, 0, -0.58)))
+        let walkedHead = ResidentStatusBadge.headTopWorldPoint(
+            modelTransform: badgePlacementTransform(SIMD3(0.40, 0, -1.20)))
+        check(abs(standingHead.y - badgeScale * ResidentStatusBadge.headLocalTopY) < 0.0001,
+              "头顶世界点 = 角色地面高度 + 缩放 × 本地头顶高度")
+        check(abs(standingHead.x + 0.72) < 0.0001 && abs(standingHead.z + 0.58) < 0.0001,
+              "头顶世界点在水平面上与角色位置重合（正上方，不是固定屏幕位置）")
+        check(simd_distance(standingHead, walkedHead) > 0.5,
+              "角色走动后头顶世界点随之变化")
+
+        // 与 `MarbleSpatialView` 同一套投影：perspective(fov 66°) × rotationX(-pitch) ×
+        // rotationY(-yaw) × translation(-camera.position)。
+        let badgeViewSize = CGSize(width: 1440, height: 900)
+        func badgeViewProjection(cameraYaw: Float, cameraDistance: Float = 1.8) -> simd_float4x4 {
+            let fov: Float = 66 * .pi / 180
+            let aspect = Float(badgeViewSize.width / badgeViewSize.height)
+            let y = 1 / tan(fov * 0.5), x = y / aspect
+            let near: Float = 0.05, far: Float = 250, z = far / (near - far)
+            let projection = simd_float4x4(columns: (
+                SIMD4(x, 0, 0, 0), SIMD4(0, y, 0, 0),
+                SIMD4(0, 0, z, -1), SIMD4(0, 0, z * near, 0)
+            ))
+            let pitch: Float = -12 * .pi / 180
+            let cosine = cos(pitch), sine = sin(pitch)
+            let rotation = simd_float4x4(columns: (
+                SIMD4(1, 0, 0, 0), SIMD4(0, cosine, -sine, 0),
+                SIMD4(0, sine, cosine, 0), SIMD4(0, 0, 0, 1)
+            ))
+            let yawCos = cos(cameraYaw), yawSin = sin(cameraYaw)
+            let yawRotation = simd_float4x4(columns: (
+                SIMD4(yawCos, 0, -yawSin, 0), SIMD4(0, 1, 0, 0),
+                SIMD4(yawSin, 0, yawCos, 0), SIMD4(0, 0, 0, 1)
+            ))
+            let camera = SIMD3<Float>(0, 1.2, cameraDistance)
+            let translation = simd_float4x4(columns: (
+                SIMD4(1, 0, 0, 0), SIMD4(0, 1, 0, 0),
+                SIMD4(0, 0, 1, 0), SIMD4(-camera.x, -camera.y, -camera.z, 1)
+            ))
+            return projection * rotation * yawRotation * translation
+        }
+        /// 与 `SpatialStageStore.residentPropScreenPoint` 逐字同形（归一化、左上原点）。
+        func badgeNormalizedPoint(_ world: SIMD3<Float>, _ viewProjection: simd_float4x4) -> CGPoint {
+            let clip = viewProjection * SIMD4(world, 1)
+            guard clip.w > 0.000001 else { return CGPoint(x: -1, y: -1) }
+            return CGPoint(
+                x: CGFloat((clip.x / clip.w + 1) / 2),
+                y: CGFloat((1 - clip.y / clip.w) / 2)
+            )
+        }
+        /// 头顶 + 脚下的屏幕位置（两次既有投影），以及由此得到的**角色屏高**。
+        func badgeScreen(
+            head: SIMD3<Float>, foot: SIMD3<Float>,
+            cameraYaw: Float, cameraDistance: Float = 1.8
+        ) -> (head: CGPoint, foot: CGPoint, characterScreenHeight: CGFloat) {
+            let viewProjection = badgeViewProjection(
+                cameraYaw: cameraYaw, cameraDistance: cameraDistance)
+            let headPoint = ResidentStatusBadge.viewPoint(
+                projectedNormalized: badgeNormalizedPoint(head, viewProjection),
+                viewSize: badgeViewSize)
+            let footPoint = ResidentStatusBadge.viewPoint(
+                projectedNormalized: badgeNormalizedPoint(foot, viewProjection),
+                viewSize: badgeViewSize)
+            return (headPoint, footPoint, abs(footPoint.y - headPoint.y))
+        }
+        func badgeAnchor(
+            head: SIMD3<Float>, foot: SIMD3<Float>,
+            cameraYaw: Float, cameraDistance: Float = 1.8
+        ) -> CGPoint? {
+            let screen = badgeScreen(
+                head: head, foot: foot,
+                cameraYaw: cameraYaw, cameraDistance: cameraDistance)
+            return ResidentStatusBadge.anchor(
+                projectedHead: screen.head,
+                characterScreenHeight: screen.characterScreenHeight,
+                viewSize: badgeViewSize
+            )
+        }
+        let standingFoot = SIMD3<Float>(-0.72, 0, -0.58)
+        let standingScreen = badgeScreen(
+            head: standingHead, foot: standingFoot, cameraYaw: 0)
+        let headPoint = standingScreen.head
+        check(standingScreen.characterScreenHeight > 100,
+              "站立角色在屏幕上有可测量的身高（间隙的缩放基数是真的，不是 0）")
+        guard let anchor = badgeAnchor(head: standingHead, foot: standingFoot, cameraYaw: 0) else {
+            check(false, "站立角色的头顶投影应当落在视图内，气泡才画得出来")
+            print("\(failures == 0 ? "PASS" : "FAIL"): \(count) stage resident chat checks, \(failures) failures")
+            exit(failures == 0 ? 0 : 1)
+        }
+        check(abs(anchor.x - headPoint.x) < 0.0001,
+              "云朵水平居中于头顶投影（指向点正对头顶）")
+        check(anchor.y < headPoint.y,
+              "云朵在头顶**上方**（左上原点下，y 比头顶小）")
+        // 真机反馈："要用白色底，离头要有一点距离才行，现在小云朵卡在头部了"。
+        // 所以这里断的不是"云在上面一点点"，而是"云体整体在头顶之上 + 与头留够净空"。
+        let standingGap = ResidentStatusBadge.headGap(
+            characterScreenHeight: standingScreen.characterScreenHeight)
+        check(abs((headPoint.y - anchor.y)
+                    - (standingGap + ResidentStatusBadge.tailSpan
+                        + ResidentStatusBadge.cloudSize.height / 2)) < 0.0001,
+              "云朵中心 = 头顶 − 净空 − 指向点跨度 − 半个云高（**不是以头顶为中心**）")
+        let cloud = ResidentStatusBadge.cloudRect(anchor: anchor)
+        check(cloud.maxY < headPoint.y,
+              "云体整体位于头顶**之上**（底边也在头顶上方）")
+        check(cloud.maxY <= headPoint.y
+                - (standingGap + ResidentStatusBadge.tailSpan) + 0.0001,
+              "云体底边与头顶之间隔着『净空 + 指向点跨度』（不是擦着头发）")
+        check(cloud.maxY <= headPoint.y - ResidentStatusBadge.minimumHeadGap,
+              "云体底边与头顶的净空不少于 minimumHeadGap（\(ResidentStatusBadge.minimumHeadGap) pt）")
+        // 浮动到最低点也仍然满足：云体不压头、净空不被浮动吃掉。
+        let lowestCloud = ResidentStatusBadge.cloudRect(
+            anchor: anchor, bob: ResidentStatusBadge.bobAmplitude)
+        check(lowestCloud.maxY < headPoint.y - ResidentStatusBadge.minimumHeadGap,
+              "浮动到最低点，云体底边仍在头顶之上并留够最小净空")
+        // 相机一动（拖动/缩放）⇒ 同一个世界头顶点投影到不同屏幕点 ⇒ 气泡跟着动。
+        let yawedHeadPoint = badgeScreen(
+            head: standingHead, foot: standingFoot, cameraYaw: 0.35).head
+        check(hypot(yawedHeadPoint.x - headPoint.x, yawedHeadPoint.y - headPoint.y) > 1,
+              "相机一转，头顶投影点就变（气泡不会停在原地滞后一拍）")
+        // 角色走动 ⇒ 气泡跟着动。
+        if let walkedAnchor = badgeAnchor(
+            head: walkedHead, foot: SIMD3(0.40, 0, -1.20), cameraYaw: 0) {
+            check(hypot(walkedAnchor.x - anchor.x, walkedAnchor.y - anchor.y) > 1,
+                  "角色走动后气泡位置随之变化（锚在角色头顶，不是固定屏幕位置）")
+        } else {
+            check(false, "走动后的头顶投影应当仍落在视图内")
+        }
+        // 指向点：由大到小、正对头顶、从云体下垂向头顶，且最后一个点与头顶仍有间隙。
+        let dots = ResidentStatusBadge.tailDots(anchor: anchor)
+        check(dots.count == 3, "云下面有三个指向圆点（漫画式想法标记）")
+        check(dots[0].radius > dots[1].radius && dots[1].radius > dots[2].radius,
+              "指向圆点由大到小")
+        check(dots.allSatisfy { abs($0.center.x - anchor.x) < 0.0001 },
+              "指向圆点全部正对头顶（x 与头顶投影相同）")
+        check(dots[2].center.y > dots[0].center.y,
+              "最小的点在最下面、离头顶最近")
+        check(dots[0].center.y > cloud.maxY,
+              "指向圆点都在云底之下（不压在云上）")
+        check(dots[2].center.y < headPoint.y,
+              "最后一个指向点在头顶之上（从云体下垂向头顶，不是戳进头里）")
+        check(headPoint.y - (dots[2].center.y + dots[2].radius)
+                >= ResidentStatusBadge.minimumHeadGap,
+              "最下面那个指向点的下边缘与头顶至少留 minimumHeadGap（\(ResidentStatusBadge.minimumHeadGap) pt）")
+        // 相机拉近/拉远：间隙按角色屏高缩放，但夹在上下限内。
+        let nearScreen = badgeScreen(
+            head: standingHead, foot: standingFoot, cameraYaw: 0, cameraDistance: 0.8)
+        let farScreen = badgeScreen(
+            head: standingHead, foot: standingFoot, cameraYaw: 0, cameraDistance: 7.0)
+        check(nearScreen.characterScreenHeight > standingScreen.characterScreenHeight
+                && farScreen.characterScreenHeight < standingScreen.characterScreenHeight,
+              "相机拉近角色屏高变大、拉远变小（间隙的缩放基数确实跟着相机走）")
+        check(ResidentStatusBadge.headGap(characterScreenHeight: farScreen.characterScreenHeight)
+                >= ResidentStatusBadge.minimumHeadGap,
+              "拉远时间隙不小于 minimumHeadGap（云不会贴着头）")
+        check(ResidentStatusBadge.headGap(characterScreenHeight: nearScreen.characterScreenHeight)
+                <= ResidentStatusBadge.maximumHeadGap,
+              "拉近时间隙不超过 maximumHeadGap（云不会被推到看不见）")
+        check(ResidentStatusBadge.headGap(characterScreenHeight: 100_000)
+                == ResidentStatusBadge.maximumHeadGap,
+              "屏高极大时夹在上限（近景不会把云推飞）")
+        check(ResidentStatusBadge.headGap(characterScreenHeight: 0)
+                == ResidentStatusBadge.minimumHeadGap
+                && ResidentStatusBadge.headGap(characterScreenHeight: .nan)
+                    == ResidentStatusBadge.minimumHeadGap,
+              "拿不到屏高（0 / NaN）时退回最小值，仍不压头")
+        // 中段（没被上下限夹住）必须真的**按比例**放大 —— 否则"随屏高缩放"只是一句注释。
+        let midGap = 190 * ResidentStatusBadge.headGapRatio
+        check(midGap > ResidentStatusBadge.minimumHeadGap
+                && midGap < ResidentStatusBadge.maximumHeadGap,
+              "测试用的中段屏高确实落在上下限之间（断言本身有效）")
+        check(abs(ResidentStatusBadge.headGap(characterScreenHeight: 190) - midGap) < 0.0001,
+              "中段间隙 = 角色屏高 × headGapRatio（真的按屏高缩放，不是常量）")
+        check(ResidentStatusBadge.headGap(characterScreenHeight: 190)
+                > ResidentStatusBadge.headGap(characterScreenHeight: 140),
+              "角色在屏幕上越大，间隙越大（单调，近景不压头）")
+        // 近景是"卡在头部"最容易复发的场景：这里必须单独守一遍。
+        if let nearAnchor = badgeAnchor(
+            head: standingHead, foot: standingFoot, cameraYaw: 0, cameraDistance: 0.8) {
+            let nearCloud = ResidentStatusBadge.cloudRect(anchor: nearAnchor)
+            check(nearCloud.maxY < nearScreen.head.y - ResidentStatusBadge.minimumHeadGap,
+                  "近景（头在屏幕上很大）时云体底边与头顶仍有最小净空")
+        } else {
+            check(false, "近景的头顶投影应当落在视图内")
+        }
+        // 空闲态 / 头顶投影跑到视图外：整朵不画（也不夹到屏幕边上指向空处）。
+        check(ResidentStatusBadge.anchor(
+                projectedHead: CGPoint(x: -5, y: 300),
+                characterScreenHeight: 300,
+                viewSize: badgeViewSize) == nil,
+              "头顶投影落到视图外时不画（世界锚定的提示不做夹边）")
+        check(ResidentStatusBadge.anchor(
+                projectedHead: CGPoint(x: 700, y: 4),
+                characterScreenHeight: 300,
+                viewSize: badgeViewSize) == nil,
+              "画面顶端塞不下整朵云时不画（不会挂半个云出去）")
+        // 尺寸恒定：链路上没有任何随距离缩放的量。
+        check(ResidentStatusBadge.cloudSize == CGSize(width: 50, height: 36),
+              "气泡尺寸是固定屏幕 pt（相机拉远不会缩到看不见）")
+        // 配色：白色主体 + 深色符号，云体与指向圆点同一套（RGB 只有一份）。
+        check(ResidentStatusBadge.cloudFill.luminance > 0.9
+                && ResidentStatusBadge.cloudFill.alpha > 0.9,
+              "云体用白色（近白、不透明）填充 —— 真机反馈'要用白色底'")
+        check(ResidentStatusBadge.symbolInk.luminance < 0.25,
+              "符号墨色是深色（压在白色主体上）")
+        check(ResidentStatusBadge.cloudOutline.luminance < 0.4
+                && ResidentStatusBadge.cloudOutline.alpha < 0.9,
+              "描边是深色细线（亮背景也能分辨，暗背景上不抢戏）")
+        check(ResidentStatusBadge.tailDotFill == ResidentStatusBadge.cloudFill
+                && ResidentStatusBadge.tailDotOutline == ResidentStatusBadge.cloudOutline,
+              "指向圆点与云体**同一套配色**（不另写一份 RGB）")
+        check(ResidentStatusBadge.cloudFill != ResidentStatusBadge.symbolInk
+                && ResidentStatusBadge.cloudFill.luminance
+                    - ResidentStatusBadge.symbolInk.luminance > 0.6,
+              "底与符号的亮度差足够大（白底 + 深符号，对比度不是擦边）")
+        // 动感：纯时间函数、有界、不累积（不会每帧重排导致抖动）。
+        check(abs(ResidentStatusBadge.bobOffset(seconds: 0)) < 0.0001,
+              "浮动在 t = 0 时归零（纯时间函数，无累积漂移）")
+        check(abs(ResidentStatusBadge.bobOffset(seconds: ResidentStatusBadge.bobPeriod * 3 / 4)
+                    + ResidentStatusBadge.bobAmplitude) < 0.0001,
+              "浮动在四分之三个周期到达最低点（幅度 = bobAmplitude）")
+        check(abs(ResidentStatusBadge.bobOffset(seconds: 12.34))
+                <= ResidentStatusBadge.bobAmplitude + 0.0001,
+              "浮动幅度有界（克制，不做夸张弹跳）")
+        check(abs(ResidentStatusBadge.breathScale(seconds: 0) - 1) < 0.0001
+                && abs(ResidentStatusBadge.breathScale(
+                    seconds: ResidentStatusBadge.breathPeriod / 4)
+                    - (1 + ResidentStatusBadge.breathAmplitude)) < 0.0001,
+              "思考时符号呼吸：幅度 = breathAmplitude，周期 = breathPeriod")
+        // 云朵几何：四块都在云框内，中间那瓣最高。
+        let cloudRect = CGRect(origin: .zero, size: ResidentStatusBadge.cloudSize)
+        let blobs = ResidentStatusBadge.cloudBlobs(in: cloudRect)
+        check(blobs.count == 4, "云朵由底面 + 三个圆瓣拼成")
+        check(blobs.allSatisfy { cloudRect.insetBy(dx: -0.001, dy: -0.001).contains($0.rect) },
+              "云瓣都画在云框内（不会溢出到 rect 之外）")
+        check(blobs[2].rect.minY < blobs[1].rect.minY && blobs[2].rect.minY < blobs[3].rect.minY,
+              "中间那瓣最高（圆润的云形，不是一个方块）")
+        // 三瓣必须**真的鼓出来**。只查"在框内 + 中间最高"是不够的：把三瓣半径缩到 0.05×云高，
+        // 云就退化成一块圆角矩形加几个小点，那两条照样通过（实测注入 J2 抓不住）。
+        let baseTop = cloudRect.maxY - 0.58 * cloudRect.height
+        for (index, lobe) in blobs.dropFirst().enumerated() {
+            check(lobe.rect.height / 2 > 0.15 * cloudRect.height,
+                  "第 \(index + 1) 个圆瓣的半径要够大（> 15% 云高），不然云会退化成圆角矩形")
+        }
+        check(baseTop - blobs[2].rect.minY > 0.25 * cloudRect.height,
+              "最大的那瓣要切实鼓出底面上沿（云朵的辨识度来自这几个圆弧）")
+        // 头顶本地高度必须与生产绑定矩阵里的 normalizedHeight 一致。
+        check(abs(ResidentStatusBadge.headLocalTopY - Float(\#(marblenormalizedHeight))) < 0.0001,
+              "头顶高度与 MarblePMXFraming.normalizedHeight 一致（\#(marblenormalizedHeight) m）")
         print("\(failures == 0 ? "PASS" : "FAIL"): \(count) stage resident chat checks, \(failures) failures")
         exit(failures == 0 ? 0 : 1)
     }
@@ -812,7 +1214,9 @@ let ui = "import SwiftUI\nimport AppKit\nimport Observation\n@MainActor\n@Observ
     + declaration("struct StageResidentComposer:", in: overlay) + "\n@MainActor\n"
     + declaration("private final class StageResidentChatButton:", in: controller)
 try ui.write(to: uiSource, atomically: true, encoding: .utf8)
-let attachmentSources = ["Presence/ResidentImageAttachment.swift", "Presence/PropImagePreparation.swift", "Presence/PropGenerationClient.swift", "Presence/WishMachineTaskPresentation.swift"].map { sources.appendingPathComponent($0).path }
+// `ResidentStatusBadge.swift` 一并编进来：下面那些断言跑的是**生产那一份**状态→符号
+// 投影与气泡几何，不是 harness 里抄的一份副本。
+let attachmentSources = ["VisualEngine/ResidentStatusBadge.swift", "Presence/ResidentImageAttachment.swift", "Presence/PropImagePreparation.swift", "Presence/PropGenerationClient.swift", "Presence/WishMachineTaskPresentation.swift"].map { sources.appendingPathComponent($0).path }
 let checked = try run("/usr/bin/swiftc", ["-j1", "-typecheck", "-target", "arm64-apple-macos14.0", uiSource.path] + attachmentSources)
 guard checked == 0 else { exit(checked) }
 let compiled = try run("/usr/bin/swiftc", ["-j1", "-parse-as-library", source.path, "-o", executable.path] + attachmentSources)

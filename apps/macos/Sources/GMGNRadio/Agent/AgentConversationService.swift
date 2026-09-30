@@ -1,5 +1,6 @@
 import CoreFoundation
 import Foundation
+import os
 
 // MARK: - Backend registry
 
@@ -663,6 +664,26 @@ final class AgentConversationService {
     typealias ResidentImageSender = @MainActor @Sendable (URL, String, [URL], String?, ResidentConversationTools) async throws -> AgentConversationOutcome
     static let shared = AgentConversationService(useResidentAgent: true)
 
+    /// **居民图片链[4]-[7]** 的常驻诊断。与 `Presence/ResidentImageAttachment.swift`、
+    /// `Agent/ResidentAgentLoop.swift`、`App/GMGNRadioApp.swift` 同一 subsystem/category，
+    /// 一条 `log show` 按 `居民图片链[N]` 就能读出断在哪一关：
+    ///   [1] 附件进草稿 → [2] 提交 → [3] 队列/轮次 → [4] 发送入口 →
+    ///   [5] 两道判据（发送时求值）→ [6] 上链（图片块真的提交）→ [7] 失败确切原因。
+    /// 只在这些低频关口调用（每次提交/每轮/每次建 runtime），不构成刷屏压力。
+    nonisolated static let imageChainLog = Logger(
+        subsystem: "ai.gmgn.radio", category: "ResidentImageTransport"
+    )
+
+    /// 统一出口：整条消息一次性标成 public。绝不逐段插值 —— os.log 默认把
+    /// 动态字符串打成 `<private>`，那样真机上 grep `居民图片链` 只会看到占位符，
+    /// 诊断等于没有（本文件里 `[4]/[5]/[6]/[7]` 的取值是排障的关键）。
+    nonisolated private static func imageChainNote(_ message: String) {
+        imageChainLog.notice("\(message, privacy: .public)")
+    }
+    nonisolated private static func imageChainFailure(_ message: String) {
+        imageChainLog.error("\(message, privacy: .public)")
+    }
+
     private let locator: any AgentExecutableLocating
     private var preferences: AgentConversationPreferences
     /// 居民人格与后台思考预算偏好（独立字段，绝不复用 DJ hostPrompt）。
@@ -757,17 +778,43 @@ final class AgentConversationService {
     /// handshake + model capability gate still runs at send time.
     func validateImageSupport(imageURLs: [URL]) throws {
         guard !imageURLs.isEmpty else { return }
-        switch effectiveBackendID {
-        case .codex:
-            return
-        case .dsh:
-            guard residentDSHImageConnector != nil
-                || ResidentDSHComposition.isNativeImageTransportAvailable(using: locator) else {
-                throw AgentConversationError.imagesUnsupported(.dsh)
+        // **居民图片链[2] 提交**：表达「这次提交带了几张图」的唯一关口，两条聊天
+        // 界面（舞台 / 直播）与 `send` 都经过这里。附件是否真的在磁盘上、读得出来，
+        // 也在这里一并打 —— 真机上「图片收不到」最常见的上游原因就是文件没了或
+        // 读不到，而这里恰好是最后一个能在发送前发现它的地方。
+        noteImageSubmissionAcceptance(imageURLs)
+        do {
+            switch effectiveBackendID {
+            case .codex:
+                return
+            case .dsh:
+                guard residentDSHImageConnector != nil
+                    || ResidentDSHComposition.isNativeImageTransportAvailable(using: locator) else {
+                    throw AgentConversationError.imagesUnsupported(.dsh)
+                }
+            case .claudeCode, .workbuddy, .qoder, .pi:
+                throw AgentConversationError.imagesUnsupported(effectiveBackendID)
             }
-        case .claudeCode, .workbuddy, .qoder, .pi:
-            throw AgentConversationError.imagesUnsupported(effectiveBackendID)
+        } catch {
+            let backend = effectiveBackendID.rawValue
+            AgentConversationService.imageChainFailure(
+                "居民图片链[7] 提交前置能力检查拒绝 后端=\(backend) 图片=\(imageURLs.count) 错误类型=\(String(describing: type(of: error))) 错误文案=\(error.localizedDescription)"
+            )
+            throw error
         }
+    }
+
+    /// 图片链[2] 的体检：每个附件的存在性、字节数、扩展名与实际可读性。
+    private func noteImageSubmissionAcceptance(_ imageURLs: [URL]) {
+        // 只读文件属性，绝不在这里整份读图：本方法在主线程上被提交路径调用。
+        let summary = imageURLs.map { url -> String in
+            let values = try? url.resourceValues(forKeys: [.fileSizeKey])
+            return "\(url.lastPathComponent)|\(url.pathExtension)|存在=\(values?.fileSize != nil)|字节=\(values?.fileSize ?? -1)"
+        }.joined(separator: " ; ")
+        let backend = effectiveBackendID.rawValue
+        AgentConversationService.imageChainNote(
+            "居民图片链[2] 提交前置能力检查通过 后端=\(backend) 图片=\(imageURLs.count) 附件=[\(summary)]"
+        )
     }
 
     init(
@@ -1150,10 +1197,25 @@ final class AgentConversationService {
             requiresImageTransport: !images.isEmpty
         )
         if !images.isEmpty {
-            guard state.imagePromptCapability, state.modelImageDeclared else {
+            // 判据 A/B 在**发送那一刻**的实际取值。这里绝不读启动时的缓存快照：
+            // 两个值都是本 runtime 一次性求值的结果，失败时下一行会连同
+            // 「退役 runtime」一起写出来，重试因此能真正自愈。
+            let capabilityA = state.imagePromptCapability
+            let declaredB = state.modelImageDeclared
+            guard capabilityA, declaredB else {
                 // Both checks must hold before any image bytes are serialized.
+                // 两个值都是**这个 runtime** 的常量（官方 initialize 的握手结果 +
+                // 写回校验过的 composition 声明），重建 runtime 只会得到同一个值，
+                // 退役反而会丢掉一个仍然可用的文本会话 —— 所以这里诚实地失败，
+                // 不退役、不放宽。真机诊断靠这一行：它同时给出 A/B 的实际取值。
+                AgentConversationService.imageChainFailure(
+                    "居民图片链[7] 判据不成立，图片未发送（runtime 保留：判据是 runtime 常量，重建同值；文本会话继续可用） 判据A握手image=\(capabilityA) 判据B模型声明=\(declaredB) 图片=\(images.count) 运行时scope=\(state.scope)"
+                )
                 throw AgentConversationError.dshImageCapabilityUnavailable
             }
+            AgentConversationService.imageChainNote(
+                "居民图片链[5] 判据成立（发送时求值） 判据A握手image=\(capabilityA) 判据B模型声明=\(declaredB) 图片=\(images.count) 运行时scope=\(state.scope)"
+            )
         }
         let connector = state.connector
         let bootstrapHistory = state.hasSubmittedPrompt ? [] : history
@@ -1200,6 +1262,18 @@ final class AgentConversationService {
     ) async throws -> String {
         try Task.checkCancellation()
         guard dshImageRuntime?.id == state.id else { throw CancellationError() }
+        let imageBlocks = blocks.reduce(0) { count, block in
+            if case .image = block { return count + 1 }
+            return count
+        }
+        if imageBlocks > 0 {
+            // **图片链[6] 上链**：这就是真正离开宿主的图片数。没有这一条而用户
+            // 说「发了图」，说明断点在发送之前；有这一条而居民仍看不到图，
+            // 断点就在 provider 或模型侧（此时 [6] 与 [5] 都成立）。
+            AgentConversationService.imageChainNote(
+                "居民图片链[6] 提交上链 图片块=\(imageBlocks) 文本块=\(blocks.count - imageBlocks) 运行时scope=\(state.scope) session=\(state.sessionID)"
+            )
+        }
         // Admission can be uncertain on cancellation or provider failure. Do
         // not replay a possibly accepted bootstrap in a surviving ACP session.
         // A terminal transport failure retires this runtime and starts fresh.
@@ -1330,6 +1404,12 @@ final class AgentConversationService {
                 // 不支持时明确失败，绝不把 image bytes 降级成 base64 文本塞进 JSON。
                 if let image = reply.image, !image.pngData.isEmpty {
                     guard state.imagePromptCapability, state.modelImageDeclared else {
+                        // 与发送前的判据同一个来源、同一套理由：判据是 runtime 常量，
+                        // 重建同值、退役只会丢掉可用的文本会话，所以只诚实失败并
+                        // 打出两个取值（真机靠这一行区分是握手还是模型声明断的）。
+                        AgentConversationService.imageChainFailure(
+                            "居民图片链[7] 工具回执带图但判据不成立 判据A=\(state.imagePromptCapability) 判据B=\(state.modelImageDeclared) 工具=\(name) 图片字节=\(image.pngData.count)"
+                        )
                         throw AgentConversationError.dshImageCapabilityUnavailable
                     }
                     blocks = [
@@ -1489,6 +1569,18 @@ final class AgentConversationService {
                 hostToolsPluginPath: hostTools?.channel.pluginFileURL.path
             )
             modelImageDeclared = ResidentDSHComposition.declaresImageInput(box.compositionText)
+            // **判据 B 的输入与结果**（发送那一刻求值一次，不是启动缓存）：
+            // 输入是刚写回并校验过的 composition 文本，摘要给出模型行、模型目录里
+            // 的 inputModalities、附件服务行与私有 host-tools 行是否在场。
+            let summary = ResidentDSHComposition.compositionSummary(box.compositionText)
+            AgentConversationService.imageChainNote(
+                "居民图片链[5] 判据B declaresImageInput=\(modelImageDeclared) 私有host-tools行=\(box.compositionText.contains("- id: \(ResidentDSHComposition.hostToolsRowID)")) 组合文本字节=\(box.compositionText.utf8.count) 组合摘要=[\(summary)]"
+            )
+            if let hostTools {
+                AgentConversationService.imageChainNote(
+                    "居民图片链[5] 本轮组合携带私有插件行 path=\(hostTools.channel.pluginFileURL.path)"
+                )
+            }
             connector = ResidentDSHConnector(
                 nodeExecutable: transport.node,
                 entryPoint: transport.entry,
@@ -1512,8 +1604,16 @@ final class AgentConversationService {
             sandbox?.removeAll()
             hostTools?.binding.clear()
             hostTools?.channel.stop()
+            AgentConversationService.imageChainFailure(
+                "居民图片链[7] 握手/建会话失败 错误类型=\(String(describing: type(of: error))) 错误文案=\(error.localizedDescription) 带图回合=\(requiresImageTransport)"
+            )
             throw error
         }
+        // **判据 A 的发送时取值**：直接来自刚刚这次官方 `initialize` 的
+        // `agentCapabilities.promptCapabilities.image`，绝不是启动时的缓存快照。
+        AgentConversationService.imageChainNote(
+            "居民图片链[5] 判据A 握手 promptCapabilities.image=\(handle.imagePromptCapability) session=\(handle.sessionID) 带图回合=\(requiresImageTransport) 本轮新建runtime=\(sandbox != nil)"
+        )
         let state = DSHImageRuntimeState(
             scope: scope,
             sessionID: handle.sessionID,
@@ -1552,12 +1652,26 @@ final class AgentConversationService {
             case "jpg", "jpeg": mimeType = "image/jpeg"
             case "webp": mimeType = "image/webp"
             case "gif": mimeType = "image/gif"
-            default: throw AgentConversationError.imageFormatUnsupported
+            default:
+                AgentConversationService.imageChainFailure(
+                    "居民图片链[7] 图片块读取失败 原因=扩展名不支持 文件=\(url.lastPathComponent) 扩展名=\(url.pathExtension)"
+                )
+                throw AgentConversationError.imageFormatUnsupported
             }
             guard let data = try? Data(contentsOf: url), !data.isEmpty else {
+                AgentConversationService.imageChainFailure(
+                    "居民图片链[7] 图片块读取失败 原因=字节读不出来或为空 文件=\(url.lastPathComponent) 存在=\(FileManager.default.fileExists(atPath: url.path))"
+                )
                 throw AgentConversationError.imageFormatUnsupported
             }
             blocks.append(ResidentDSHImageBlock(data: data, mimeType: mimeType))
+        }
+        if !blocks.isEmpty {
+            // 归一化后的真实格式/字节：与附件层 [1] 的落盘字节对得上，就证明
+            // 「用户那张图」和「上链那张图」是同一份字节。
+            let summary = zip(urls, blocks).map { "\($0.lastPathComponent):\($1.mimeType):\($1.data.count)B" }
+                .joined(separator: ",")
+            AgentConversationService.imageChainNote("居民图片链[4] 图片块就绪 张数=\(blocks.count) 明细=[\(summary)]")
         }
         return blocks
     }
@@ -1576,7 +1690,19 @@ final class AgentConversationService {
         cancel()
         defer { worldTools?.cancel() }
         let id = effectiveBackendID
-        try validateImageSupport(imageURLs: imageURLs)
+        if !imageURLs.isEmpty {
+            AgentConversationService.imageChainNote(
+                "居民图片链[4] 发送入口 后端=\(id.rawValue) 图片=\(imageURLs.count) 有世界工具=\(worldTools != nil) worldID=\(worldContext?.worldID ?? "nil") 文件=[\(imageURLs.map(\.lastPathComponent).joined(separator: ","))]"
+            )
+        }
+        do {
+            try validateImageSupport(imageURLs: imageURLs)
+        } catch {
+            AgentConversationService.imageChainFailure(
+                "居民图片链[7] 发送入口能力检查拒绝 后端=\(id.rawValue) 图片=\(imageURLs.count) 错误类型=\(String(describing: type(of: error))) 错误文案=\(error.localizedDescription)"
+            )
+            throw error
+        }
         if let worldTools {
             guard supportsWorldTools, worldContext?.worldID == worldTools.worldID else {
                 throw AgentConversationError.worldToolsUnavailable
@@ -1672,6 +1798,16 @@ final class AgentConversationService {
                 || residentDSHImageConnector != nil
                 || dshImageRuntime?.scope == runtimeScope
                 || (worldTools?.visionCapable == true && runtimeScope != "chat")
+            if !imageURLs.isEmpty {
+                // 带图回合必须走原生 ACP（图片是原生内容块，绝不降级成文本）。
+                // 这一行同时说明「为什么」走原生：图片/已建会话/世界声明视觉。
+                let injectedConnector = residentDSHImageConnector != nil
+                let existingNativeSession = dshImageRuntime?.scope == runtimeScope
+                let declaresVision = worldTools?.visionCapable == true
+                AgentConversationService.imageChainNote(
+                    "居民图片链[4] 路径判定 走原生ACP=\(goNative) 因为图片=\(!imageURLs.isEmpty) 注入连接器=\(injectedConnector) 已有原生会话=\(existingNativeSession) 世界声明视觉=\(declaresVision) runtimeScope=\(runtimeScope)"
+                )
+            }
             // 原生 ACP 会话已建立时靠会话自身连续性保持真实历史，sendViaDSHNative
             // 只在真正新会话首次提交时携带 bootstrap 历史、续聊一律丢弃该 history。
             // 因此每轮仍以真实用户文字召回：只有「进程内历史为空且原生会话尚未

@@ -492,7 +492,7 @@ func openingThePlayerDoesNotStartAFullSpaceTransition() {
 
 @Test
 @MainActor
-func openingThePlayerKeepsTheLiveCamCompanionActive() {
+func showingTheStageInPlayerModeDoesNotPresentTheLiveCamByItself() {
     let spatialStage = SpatialStageStore()
     let controller = StageWindowController(
         audioFeatures: VisualAudioFeatureStore(),
@@ -505,7 +505,9 @@ func openingThePlayerKeepsTheLiveCamCompanionActive() {
 
     controller.show()
 
-    #expect(playerPresentationCount == 1)
+    // 显示舞台窗是窗口生命周期的公共路径：它不再顺带把 Live Cam 顶出来。
+    // 渲染面只在显式的播放器入口交接（目的地按钮 / GMGNRadioApp.showPlayer()）。
+    #expect(playerPresentationCount == 0)
     controller.close()
 }
 
