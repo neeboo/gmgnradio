@@ -87,6 +87,73 @@ guard ["拿着看", "放回", "向前", "向后", "向上", "向下", "左转 15
  print("FAIL: limited right-hand controls are missing from the shared placement panel");exit(1)
 }
 let appSource = try String(contentsOf:root.appendingPathComponent("apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift"),encoding:.utf8)
+// ── 场景里的左/右键分工：**左键放下、右键旋转 45°** ────────────────────────────
+// 缺陷形状：左键在圆环的 32 pt 命中区上是"旋转 45°"、在别处才是"放下" —— 同一个键两个含义，
+// 用户点圆环时以为要放下、点地面时以为转了向，两个动作都不可预期（需求原话："左键又是旋转
+// 又是放下，这就矛盾了"）。现在：
+//   · `mouseDown`（左键）**不再问圆环命中**，也**不再旋转** —— 任何位置的左键都进同一条
+//     "按下记点 → 抬起按 4 pt 判定 → 携带时 onGridCommit" 的路；
+//   · 右键单击 = 旋转，必须复用 `onGridRotate`（与 `R` / `,` / `.` 同一条出口），
+//     不许另写一份 yaw；
+//   · 右键拖动 = 相机轨道（`beginDrag` + `dragCamera`），沿用同一个 4 pt 阈值。
+// 行为证据在下面用**真 `mouseDown` / `mouseUp` / 右键三个方法源码抽取**的探针跑。
+let mouseDownBody = method("override func mouseDown(")
+// 注释里会引用历史缺陷的写法（说明"原来那条分支长什么样"），所以按行去掉 `//` 注释，
+// 只对**代码**做结构判断（与 `test-stage-resident-chat.swift` 对 keyDown 的同一手法）。
+func codeOnly(_ body:String) -> String {
+ body.split(separator:"\n",omittingEmptySubsequences:false).map { line -> String in
+  guard let comment = line.range(of:"//") else { return String(line) }
+  return String(line[line.startIndex..<comment.lowerBound])
+ }.joined(separator:"\n")
+}
+let mouseDownCode = codeOnly(mouseDownBody)
+guard !mouseDownCode.contains("isRotationHandleHit"), !mouseDownCode.contains("onGridRotate?(") else {
+ print("FAIL: the left button must have exactly one meaning — mouseDown still asks the ring hit test or rotates (left click is both rotate and drop again)");exit(1)
+}
+let rightDownBody = codeOnly(method("override func rightMouseDown("))
+let rightUpBody = codeOnly(method("override func rightMouseUp("))
+let rightDraggedBody = codeOnly(method("override func rightMouseDragged("))
+guard rightDownBody.contains("consumesRightClickRotate"),
+      rightUpBody.contains("consumesRightClickRotate"),
+      rightUpBody.contains("Self.isWithinClickDrift"),
+      rightUpBody.contains("onGridRotate?(") else {
+ print("FAIL: a right click must rotate through onGridRotate and only inside the shared click-drift threshold");exit(1)
+}
+guard rightDraggedBody.contains("Self.isWithinClickDrift"),
+      rightDraggedBody.contains("beginDrag"),
+      rightDraggedBody.contains("dragCamera") else {
+ print("FAIL: a right drag must stay the camera orbit behind the same click-drift threshold");exit(1)
+}
+for body in [rightDownBody, rightUpBody, rightDraggedBody] where body.contains("rotateFootprint") || body.contains("footprintYaw") {
+ print("FAIL: the right button must reuse the single onGridRotate exit instead of a second yaw path");exit(1)
+}
+// 门禁里"手上有物件"必须**明写**：空手右键单击不许转（也不许拾取）。结构化钉死这一条，
+// 免得日后有人把 `isCarrying` 当成多余条件删掉（行为面另有空手/关面板两条断言）。
+guard method("private var consumesRightClickRotate", in:controller).contains("propEditor.isCarrying") else {
+ print("FAIL: the right-click rotation gate must explicitly require a carried prop (an empty-handed right click must never rotate)");exit(1)
+}
+guard method("override func keyDown(").contains("onGridRotate?(steps)") else {
+ print("FAIL: the keyboard rotation must keep going through the same onGridRotate exit the right button uses");exit(1)
+}
+let rotateWiring = method("onResidentPropGridRotate = ", in:appSource)
+guard rotateWiring.contains("rotateFootprint(bySteps: steps)") else {
+ print("FAIL: the single rotation exit must still forward to ResidentPropGridEditorModel.rotateFootprint(bySteps:)");exit(1)
+}
+// 「点一下还是拖一下」的阈值只有一处：`LiveCamSpaceEntryPolicy.maximumClickDrift`（4 pt）。
+// 场景里左键的"落地 / 拖相机"与新加的右键的"旋转 / 拖相机"都读它，所以这里把**本体**抽出来编进
+// harness（不是另写一个 4），并断言它没被改大改小。
+let liveCamPanel = try String(contentsOf:root.appendingPathComponent("apps/macos/Sources/GMGNRadio/DesktopPresence/LiveCamPanel.swift"),encoding:.utf8)
+guard liveCamPanel.contains("static let maximumClickDrift: CGFloat = 4") else {
+ print("FAIL: the shared click-drift threshold moved (both scene buttons rely on LiveCamSpaceEntryPolicy.maximumClickDrift)");exit(1)
+}
+let clickDriftPolicy = method("enum LiveCamSpaceEntryPolicy", in:liveCamPanel)
+// 面板那一行提示必须与新操作一致（只改文案；布局与其它控件不动）。
+guard editorView.contains("左键放下；右键旋转 45°") else {
+ print("FAIL: the placement panel hint must say the left button drops and the right button rotates");exit(1)
+}
+guard !editorView.contains("或圆环旋转") else {
+ print("FAIL: the placement panel hint still tells the user to rotate with the left button on the ring");exit(1)
+}
 func method(_ signature:String, in source:String = controller) -> String {
  let start = source.range(of:signature)!.lowerBound
  let open = source[start...].firstIndex(of:"{")!
@@ -290,6 +357,108 @@ final class CountingFloorCollision: WorldPropSupportQuerying, @unchecked Sendabl
  init(_ propEditor: ResidentPropEditorState) { self.propEditor = propEditor }
  \#(method("private var inputOwnsFocus").replacingOccurrences(of:"private var",with:"var"))
  \#(method("private var consumesPropPointer").replacingOccurrences(of:"private var",with:"var"))
+}
+\#(method("struct StagePointerDragDelta"))
+\#(clickDriftPolicy)
+/// 场景交互视图的**鼠标分流部分**（`mouseDown` / `mouseUp` / 右键那三个 / `mouseDragged`）
+/// **逐字抽取**自生产代码：真 `ResidentPropEditorState`、真 `ResidentPropSceneClick`、
+/// 真 AppKit 视图（`convert` / `bounds` / `normalizedPropPointer` 全走生产那一份），
+/// 连 `beginDrag` / `dragCamera` / `endDragIfNeeded` 也是生产的 —— 相机轨道那一条因此是
+/// **真的在转**（`Stage` 替身只记 `look` 的调用与 yaw 变化）。
+///
+/// 只有三处是 harness 的，且都与"哪个键干什么"无关：
+/// 1. 圆环**画在哪**（`ringCenter`）：生产由"footprint 中心投影 + 34/10 锚点"决定，
+///    `test-stage-resident-chat.swift` 已用真实投影把锚点钉住；这里只需要一个可点到的圆心，
+///    好把"点在圆环正中"这一下真的喂进去。`isRotationHandleHit` 与命中半径**仍从生产抽取**，
+///    于是"退回旧实现"时这一下会被判成旋转、下面的断言必然失败（已实测）。
+/// 2. `updatePropPointer`：鼠标这几条路只把它当悬停更新（改 footprint 落点/圆环亮度），
+///    与落地、旋转无关，这里换成计数器。
+/// 3. `SpatialStageStore` 的替身：只保留分流真正读/写的建造模式标志、相机、复位。
+@MainActor final class SceneMouseProbe: NSView {
+ static let log = Logger(subsystem:ProductIdentity.bundleIdentifier,category:"SceneMouseProbe")
+ final class Stage {
+  struct Camera { var yaw:Float = 0;var pitch:Float = 0 }
+  var isResidentPropBuildModeActive = false
+  var camera = Camera()
+  var lookCalls = 0
+  var lastLookDelta = SIMD2<Float>(0,0)
+  var resetCameraCalls = 0
+  func look(deltaX:Float,deltaY:Float) {
+   lookCalls += 1;lastLookDelta = .init(deltaX,deltaY)
+   camera.yaw += deltaX;camera.pitch += deltaY
+  }
+  func resetCamera() { resetCameraCalls += 1 }
+ }
+ let spatialStage = Stage()
+ let propEditor:ResidentPropEditorState
+ var onGridCursor:((SIMD2<Float>)->Void)?
+ var onGridCommit:((SIMD2<Float>)->Void)?
+ var onScenePick:((SIMD2<Float>,Int)->Void)?
+ var onGridRotate:((Int)->Void)?
+ var isTextInputFocused:(() -> Bool)?
+ /// 圆环圆心（AppKit 坐标）。nil = 屏幕上没有圆环（空手时本来就不画）。
+ var ringCenter:NSPoint? = NSPoint(x:512,y:344)
+ /// `updatePropPointer` 的调用次数（悬停那一侧，见类型说明）。
+ var propPointerUpdates = 0
+ // 与生产同名的私有状态：抽取出来的那几个方法要读写它们。
+ private var dragInProgress = false
+ private var didLogCurrentDrag = false
+ private var lastDragLocationInWindow:CGPoint?
+ private var propPressOriginInWindow:CGPoint?
+ private var rightPressOriginInWindow:CGPoint?
+ private var didPickUpFromScenePointer = false
+ private var loggedSceneInputStates:[String:String] = [:]
+ private static let rotationHandleHitRadius:CGFloat = 32
+ /// 圆环的**屏幕位置**：生产里是"投影 + 锚点"算出来的计算属性，这里直接给定。
+ private var rotationHandleCenter:NSPoint? { ringCenter }
+ init(_ propEditor:ResidentPropEditorState) {
+  self.propEditor = propEditor
+  super.init(frame:NSRect(x:0,y:0,width:1000,height:600))
+ }
+ required init?(coder:NSCoder) { nil }
+ func noteResidentPropScenePickUp() { didPickUpFromScenePointer = true }
+ /// 合成鼠标事件（真 AppKit 事件；落点就是视图坐标里的那一点）。
+ static func mouseEvent(_ type:NSEvent.EventType,_ point:NSPoint,clickCount:Int = 1,
+   modifiers:NSEvent.ModifierFlags = []) -> NSEvent {
+  NSEvent.mouseEvent(with:type,location:point,modifierFlags:modifiers,timestamp:0,windowNumber:0,
+   context:nil,eventNumber:0,clickCount:clickCount,pressure:0)!
+ }
+ /// 真机手势：左键"按下 → 抬起"（中间一步都没动，于是必然在 4 pt 之内）。
+ func leftClick(at point:NSPoint,clickCount:Int = 1) {
+  mouseDown(with:Self.mouseEvent(.leftMouseDown,point,clickCount:clickCount))
+  mouseUp(with:Self.mouseEvent(.leftMouseUp,point,clickCount:clickCount))
+ }
+ /// 真机手势：右键"按下 → 抬起"，中间一步都没动。
+ func rightClick(at point:NSPoint) {
+  rightMouseDown(with:Self.mouseEvent(.rightMouseDown,point))
+  rightMouseUp(with:Self.mouseEvent(.rightMouseUp,point))
+ }
+ /// 真机手势：右键按住拖走（从 origin 拖到 end）。
+ func rightDrag(from origin:NSPoint,to end:NSPoint) {
+  rightMouseDown(with:Self.mouseEvent(.rightMouseDown,origin))
+  rightMouseDragged(with:Self.mouseEvent(.rightMouseDragged,end))
+  rightMouseUp(with:Self.mouseEvent(.rightMouseUp,end))
+ }
+ func updatePropPointer(_ event:NSEvent,confirm:Bool = false) { propPointerUpdates += 1 }
+ \#(method("private var inputOwnsFocus").replacingOccurrences(of:"private var",with:"var"))
+ \#(method("private var consumesPropPointer").replacingOccurrences(of:"private var",with:"var"))
+ \#(method("private var consumesRightClickRotate").replacingOccurrences(of:"private var",with:"var"))
+ \#(method("private static func isWithinClickDrift"))
+ \#(method("private func normalizedPropPointer"))
+ \#(method("private func noteSceneInputChain"))
+ \#(method("private var pointerChainState").replacingOccurrences(of:"private var",with:"var"))
+ \#(method("private func pointerChainCoordinate"))
+ \#(method("private static func pointerChainPoint"))
+ \#(method("private func isRotationHandleHit"))
+ \#(method("override func mouseDown("))
+ \#(method("override func mouseUp("))
+ \#(method("override func mouseDragged("))
+ \#(method("override func rightMouseDown("))
+ \#(method("override func rightMouseUp("))
+ \#(method("override func rightMouseDragged("))
+ \#(method("private func beginDrag("))
+ \#(method("private func dragCamera("))
+ \#(method("private func endDragIfNeeded("))
 }
 /// 建造模式格子模型的替身：只保留 `publishResidentPropGrid` / 就绪判据读的那几个事实，
 /// 但**"就绪是异步的"这个时序**照旧（`isReady` 不会在请求的那一刻就为真）。
@@ -1107,6 +1276,111 @@ typealias WorldAgentContext = LayoutContext
   precondition(scenePick.candidate != nil && scenePickPreviews == 1,
     "the carrying state previews the prop at its own transform (previews=\(scenePickPreviews))")
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 场景鼠标分流：**左键放下、右键旋转 45°**（"左键又是旋转又是放下"那个冲突的回归）。
+  //
+  // 真机口径：用户在「摆放」面板点了一行 → 携带态 → 圆环画在光标右上侧。旧实现里左键落在
+  // 圆环的 32 pt 命中区上是**旋转 45°**、落在别处才是**放下** —— 同一个键两个含义，用户点
+  // 圆环时以为要放下、点地面时以为转了向，两边都不可预期。现在：
+  //   · 左键在任何位置（**包括圆环正中**）只有一个含义 = 放下；
+  //   · 右键单击 = 旋转 45°（走 `onGridRotate` → `rotateFootprint(bySteps:)`，与 R 同一条）；
+  //   · 右键拖动 = 相机轨道，一字未改；
+  //   · 空手右键单击什么也不做（不转、不拾取）。
+  // 下面全部由**真 `mouseDown` / `mouseUp` / 右键三个方法源码抽取**的探针驱动。
+  let mouseEditor = ResidentPropEditorState()
+  mouseEditor.update(placedSnapshot);mouseEditor.open()
+  mouseEditor.preview = { _, _ in placedObject }
+  await mouseEditor.select(objectID:"cup")
+  precondition(mouseEditor.isCarrying,"precondition: the mouse probe starts from a carrying editor")
+  let mouseProbe = SceneMouseProbe(mouseEditor)
+  mouseProbe.spatialStage.isResidentPropBuildModeActive = true
+  var mouseCommits:[SIMD2<Float>] = []
+  var mousePicks:[(SIMD2<Float>,Int)] = []
+  var rightSteps:[Int] = []
+  // 与真机**同一条出口**：右键与 `R` / `,` / `.` 都汇到 `onGridRotate`，App 侧那一个闭包再喂给
+  // `ResidentPropGridEditorModel.rotateFootprint(bySteps:)`（这条链有结构性断言钉住）。
+  let rotationModel = ResidentPropGridEditorModel()
+  mouseProbe.onGridCommit = { mouseCommits.append($0) }
+  mouseProbe.onScenePick = { mousePicks.append(($0,$1)) }
+  mouseProbe.onGridRotate = { steps in
+    rightSteps.append(steps)
+    rotationModel.rotateFootprint(bySteps:steps)
+  }
+  // (1) 携带时左键单击 = 放下 —— **点在圆环正中也不许旋转**（这就是那个冲突本身）。
+  let ringCenter = mouseProbe.ringCenter!
+  mouseProbe.leftClick(at:ringCenter)
+  precondition(mouseCommits.count == 1 && rightSteps.isEmpty,
+    "a left click on the rotation ring must drop the prop, never rotate it (drops=\(mouseCommits.count) rotations=\(rightSteps))")
+  precondition(mousePicks.isEmpty,"a left click while carrying is a drop, never a scene pick")
+  precondition(abs(mouseCommits[0].x - Float(ringCenter.x / mouseProbe.bounds.width)) < 0.0001
+      && abs(mouseCommits[0].y - Float(1 - ringCenter.y / mouseProbe.bounds.height)) < 0.0001,
+    "the drop point must be the production normalized pointer (got \(mouseCommits[0]))")
+  // 圆环之外当然也还是放下 —— 同一个键只有这一条路，不是"圆环那一支被特判掉了"。
+  mouseProbe.leftClick(at:NSPoint(x:300,y:200))
+  precondition(mouseCommits.count == 2 && rightSteps.isEmpty,
+    "a left click away from the ring still drops and never rotates (drops=\(mouseCommits.count) rotations=\(rightSteps))")
+  // (2) 携带时右键单击 = 顺时针 45°，且落在与 `R` 相同的 `rotateFootprint(bySteps:)` 上。
+  let yawBeforeRightClick = rotationModel.footprintYaw
+  mouseProbe.rightClick(at:NSPoint(x:420,y:260))
+  precondition(rightSteps == [1],
+    "a right click while carrying must rotate 45° clockwise through onGridRotate (got \(rightSteps))")
+  precondition(mouseCommits.count == 2 && mousePicks.isEmpty,"a right click never drops and never picks")
+  precondition(abs(rotationModel.footprintYaw - yawBeforeRightClick - Float.pi / 4) < 0.000001,
+    "the right click must advance the footprint by exactly one 45° step through rotateFootprint(bySteps:) (yaw \(yawBeforeRightClick) → \(rotationModel.footprintYaw))")
+  mouseProbe.rightClick(at:NSPoint(x:420,y:260))
+  precondition(rightSteps == [1,1],"two right clicks must both go clockwise through the same exit (got \(rightSteps))")
+  precondition(abs(rotationModel.footprintYaw - yawBeforeRightClick - Float.pi / 2) < 0.000001,
+    "two right clicks must be exactly two 45° steps (yaw \(yawBeforeRightClick) → \(rotationModel.footprintYaw))")
+  // (3) 右键**拖动** = 相机轨道，不旋转（沿用左键那一个 4 pt 阈值与既有 beginDrag/dragCamera）。
+  let looksBeforeDrag = mouseProbe.spatialStage.lookCalls
+  let stepsBeforeDrag = rightSteps.count
+  let commitsBeforeDrag = mouseCommits.count
+  mouseProbe.rightDrag(from:NSPoint(x:500,y:300),to:NSPoint(x:560,y:330))
+  precondition(mouseProbe.spatialStage.lookCalls > looksBeforeDrag
+      && mouseProbe.spatialStage.lastLookDelta != SIMD2<Float>(0,0),
+    "a right drag must stay the camera orbit (lookCalls \(looksBeforeDrag) → \(mouseProbe.spatialStage.lookCalls), delta=\(mouseProbe.spatialStage.lastLookDelta))")
+  precondition(rightSteps.count == stepsBeforeDrag && mouseCommits.count == commitsBeforeDrag && mousePicks.isEmpty,
+    "a right drag must never rotate, drop or pick (rotations=\(rightSteps) drops=\(mouseCommits) picks=\(mousePicks.count))")
+  // 编辑器没开（面板没打开、手上也没有物件）：右键行为**完全不变**（拖动照旧是相机轨道，
+  // 单击照旧什么也不做 —— 不是"空手但面板开着"那一种，见下一条）。
+  let closedEditor = ResidentPropEditorState()
+  closedEditor.update(placedSnapshot)
+  precondition(!closedEditor.isOpen && !closedEditor.isCarrying,"precondition: the closed editor is really closed")
+  let closedProbe = SceneMouseProbe(closedEditor)
+  closedProbe.spatialStage.isResidentPropBuildModeActive = true
+  var closedRotations:[Int] = []
+  var closedSideEffects = 0
+  closedProbe.onGridRotate = { closedRotations.append($0) }
+  closedProbe.onGridCommit = { _ in closedSideEffects += 1 }
+  closedProbe.onScenePick = { _, _ in closedSideEffects += 1 }
+  let closedLooks = closedProbe.spatialStage.lookCalls
+  closedProbe.rightDrag(from:NSPoint(x:200,y:400),to:NSPoint(x:260,y:430))
+  precondition(closedProbe.spatialStage.lookCalls > closedLooks,
+    "with the editor closed a right drag must still orbit the camera")
+  closedProbe.rightClick(at:NSPoint(x:200,y:400))
+  precondition(closedRotations.isEmpty && closedSideEffects == 0,
+    "with the editor closed a right click must do nothing at all (rotations=\(closedRotations) side effects=\(closedSideEffects))")
+  // (4) 空手右键单击：无副作用。空手时圆环本来就不画（`ringCenter = nil`），
+  //     这里连同"右键拖动照旧可用"一起验。
+  let emptyEditor = ResidentPropEditorState()
+  emptyEditor.update(placedSnapshot);emptyEditor.open()
+  precondition(!emptyEditor.isCarrying,"precondition: the second editor is empty-handed")
+  let emptyProbe = SceneMouseProbe(emptyEditor)
+  emptyProbe.spatialStage.isResidentPropBuildModeActive = true
+  emptyProbe.ringCenter = nil
+  var emptyRotations:[Int] = []
+  var emptySideEffects = 0
+  emptyProbe.onGridRotate = { emptyRotations.append($0) }
+  emptyProbe.onGridCommit = { _ in emptySideEffects += 1 }
+  emptyProbe.onScenePick = { _, _ in emptySideEffects += 1 }
+  emptyProbe.rightClick(at:NSPoint(x:512,y:344))
+  precondition(emptyRotations.isEmpty && emptySideEffects == 0,
+    "an empty-handed right click must do nothing: no rotation and no pick (rotations=\(emptyRotations) side effects=\(emptySideEffects))")
+  let emptyLooks = emptyProbe.spatialStage.lookCalls
+  emptyProbe.rightDrag(from:NSPoint(x:512,y:344),to:NSPoint(x:600,y:390))
+  precondition(emptyProbe.spatialStage.lookCalls > emptyLooks && emptyRotations.isEmpty && emptySideEffects == 0,
+    "an empty-handed right drag must still orbit the camera and change nothing else (lookCalls \(emptyLooks) → \(emptyProbe.spatialStage.lookCalls), rotations=\(emptyRotations))")
+
   // (c) 悬停发光：光标移到已摆物件上 → **它的 footprint 格子**进入 `.hoverTarget`，
   //     并且这批格子自动成为焦点裁剪的锚点（patch 恰好是 footprint + 两圈，没有更远的列）。
   let gridModel = ResidentPropGridEditorModel()
@@ -1421,7 +1695,7 @@ typealias WorldAgentContext = LayoutContext
   precondition(boundedCollision.queryCount > queriesAfterThreeWorlds,
     "the evicted world must derive again (the cache is bounded, not a leak)")
 
-  print("PASS: editor cancel, failure preservation, hand controls, duplicate submit, stale revision, late world, input routing, ready-grid row click, host-cannot-answer vs host-says-empty, empty-grid and dead-derivation honesty, stale notice refresh, skipped-push retry, the row click that arrives before the grid is ready (remembered, completed on readiness from the clicked prop's own transform, invalidated by every \"I do not want this\" signal, never queued), scene pick-up routing, placed-prop transform, hover glow inside the focus clip, the placeable initial landing spot, the cursor-side \"why can't I put it here\" label taking its copy from the existing block-reason projection (and drawing nothing when placeable), window focus loss preserving the decoration session and its derivation, and same-world grid reuse from a bounded cache, the typing gate resolving to the real input field only, and the panel-to-scene hands-back of keyboard focus")
+  print("PASS: editor cancel, failure preservation, hand controls, duplicate submit, stale revision, late world, input routing, ready-grid row click, host-cannot-answer vs host-says-empty, empty-grid and dead-derivation honesty, stale notice refresh, skipped-push retry, the row click that arrives before the grid is ready (remembered, completed on readiness from the clicked prop's own transform, invalidated by every \"I do not want this\" signal, never queued), scene pick-up routing, placed-prop transform, hover glow inside the focus clip, the placeable initial landing spot, the cursor-side \"why can't I put it here\" label taking its copy from the existing block-reason projection (and drawing nothing when placeable), window focus loss preserving the decoration session and its derivation, and same-world grid reuse from a bounded cache, the typing gate resolving to the real input field only, and the panel-to-scene hands-back of keyboard focus, and the scene mouse split: the left button drops even on the rotation ring (one meaning only) while a right click rotates 45° through the same rotateFootprint(bySteps:) exit, a right drag stays the camera orbit, and an empty-handed right click does nothing")
  }
 }
 """#

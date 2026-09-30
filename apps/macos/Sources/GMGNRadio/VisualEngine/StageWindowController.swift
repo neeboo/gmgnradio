@@ -726,8 +726,9 @@ struct StagePointerDragDelta: Equatable {
 ///
 /// 偏移量的取值不是随手写的，它被两条约束夹住（见
 /// `tools/test-stage-resident-chat.swift` 里"偏移与相机距离无关"的断言）：
-/// 1. **必须大于命中半径 32 pt**（`StageWorldInteractionView.rotationHandleHitRadius`）：
-///    否则圆环的命中区会盖住 hover 格的**格心**，"点一下落地"就会被误判成旋转。
+/// 1. **必须大于悬停半径 32 pt**（`StageWorldInteractionView.rotationHandleHitRadius`）：
+///    否则圆环的悬停区会盖住 hover 格的**格心** —— 光标还停在格心上、圆环就已经亮起来
+///    并换成 `pointingHand`（那个反馈现在只表示"光标压住了圆环"，不表示"点它能转"）。
 ///    所以 `hypot(screenOffsetX, screenOffsetY) ≈ 35.4 pt > 32 pt`。
 /// 2. **每个分量都要落在 hover 格的投影范围内**：格心的吸附跟着光标走，光标从格心走向
 ///    圆环时只要跨过一列/一行，圆环就会跟着跳一格。0.25 m 的格子在 1440×900、fov 66°、
@@ -1506,6 +1507,12 @@ private final class StageWorldInteractionView: NSView {
     /// 建造模式里「鼠标按下但还没决定是点一下还是拖相机」的按下点（窗口坐标）。
     /// nil 表示当前没有待判定的按下；超过抖动阈值转成相机拖拽时会被清掉。
     private var propPressOriginInWindow: CGPoint?
+    /// 右键那一下「还没决定是单击旋转还是拖相机」的按下点（窗口坐标）。
+    ///
+    /// 与 `propPressOriginInWindow` 同一手法、**同一个阈值**，只是判定的动作不同
+    /// （左键 = 放下，右键 = 转 45°）。只在 `consumesRightClickRotate` 成立时被写入；
+    /// 一旦判定成相机拖拽（超过阈值）就清掉，于是抬起时不会再转。
+    private var rightPressOriginInWindow: CGPoint?
 
     // MARK: - 场景输入链路诊断（只观测，不参与任何判据）
 
@@ -1553,7 +1560,12 @@ private final class StageWorldInteractionView: NSView {
     /// 可见圆环的半径与线宽（屏幕空间恒定，不随距离缩放）。
     private static let rotationHandleRadius: CGFloat = 26
     private static let rotationHandleLineWidth: CGFloat = 3
-    /// 手柄命中半径：**比可见圆环大**，便于瞄准。
+    /// 手柄**悬停**判定半径：比可见圆环（26 pt）大，便于瞄准。
+    ///
+    /// 它现在**只服务于悬停**（圆环变亮 + 光标形状），**不再参与任何点击分流**：
+    /// 左键在任何位置都是放下（`mouseDown` 里那条"命中圆环就旋转"的分支已删），
+    /// 旋转是右键单击（`rightMouseDown` / `rightMouseUp`）。所以它没有变成死代码，
+    /// 连同 `isRotationHandleHit` 一起保留；圆环的锚点 34/10 也一个字没动。
     private static let rotationHandleHitRadius: CGFloat = 32
     /// 光标是不是正停在手柄上（决定光标形状与圆环亮度）。
     private var isRotationHandleHovered = false
@@ -1645,14 +1657,13 @@ private final class StageWorldInteractionView: NSView {
         }
         if consumesPropPointer {
             window?.makeFirstResponder(self)
-            // **手柄命中优先于放置**：命中手柄就只旋转，绝不进入下面的放置分支，
-            // 也**不记按下点**（记了就会在 mouseUp 被当成"点一下落地"，见那里的守卫）。
-            // 旋转按键与 R 键同一个方向约定：+1 顺时针、⇧ 反向。
-            if spatialStage.isResidentPropBuildModeActive,
-               isRotationHandleHit(at: convert(event.locationInWindow, from: nil)) {
-                onGridRotate?(event.modifierFlags.contains(.shift) ? -1 : 1)
-                return
-            }
+            // **左键只有"放下"一个含义**：这里原来有一条"命中圆环就旋转"的分支，
+            // 于是同一个键在圆环上是旋转、在别处是放下 —— 用户点圆环时以为要放下、
+            // 点地面时以为转了向，两个动作都不可预期。现在圆环**照画不误**
+            // （它是"往哪转"的可视线索），但**不再吃掉左键**；旋转在右键单击（见
+            // `rightMouseDown` / `rightMouseUp`）。落在圆环上的左键与落在别处完全同一条路：
+            // 记下按下点 → `mouseUp` 按 4 pt 阈值判成"点一下" → 携带时 `onGridCommit` 放下。
+            //
             // 建造模式：按下**只记点**，绝不 beginDrag —— 否则左键一按就开始转相机，
             // 「点一下落地」永远不会发生。落地在 mouseUp（见那里），
             // 中间只要手抖超过阈值就会转成相机拖拽（见 mouseDragged）。
@@ -1687,6 +1698,19 @@ private final class StageWorldInteractionView: NSView {
     }
 
     override func rightMouseDown(with event: NSEvent) {
+        // 右键：**单击 = 转 45°，拖动 = 转相机**（两条含义互斥，靠位移分流 —— 与左键
+        // 在建造模式里"点一下落地 / 拖动转相机"完全是同一套手感与**同一个阈值**
+        // `LiveCamSpaceEntryPolicy.maximumClickDrift`）。
+        //
+        // 只有"编辑器打开 + 建造模式 + 手上有物件"（`consumesRightClickRotate`）才有单击含义：
+        // 这时按下**只记点**，绝不 `beginDrag` —— 否则右键一按就开始转相机，单击旋转永远不会发生。
+        // 其余情况（空手 / 编辑器没开 / 非建造模式）照旧**立刻**开始相机拖拽，右键拖动不变；
+        // 空手右键单击于是既不旋转、也不拾取 —— 因为抬起时没有待判定的按下点。
+        if consumesRightClickRotate {
+            window?.makeFirstResponder(self)
+            rightPressOriginInWindow = event.locationInWindow
+            return
+        }
         beginDrag(
             buttonNumber: event.buttonNumber,
             locationInWindow: event.locationInWindow
@@ -1731,6 +1755,16 @@ private final class StageWorldInteractionView: NSView {
     }
 
     override func rightMouseDragged(with event: NSEvent) {
+        // 右键**拖动**仍然是相机轨道，一个字都没变：只有"那一记右键还在待判定"时才多一层
+        // 阈值判断 —— 超过 4 pt 就把它转成真正的相机拖拽（与左键同一条 `beginDrag` +
+        // `dragCamera` 路），于是拖到一半绝不会再回头被当成"单击旋转"。
+        guard let origin = rightPressOriginInWindow else {
+            dragCamera(with: event)
+            return
+        }
+        guard !Self.isWithinClickDrift(from: origin, to: event.locationInWindow) else { return }
+        rightPressOriginInWindow = nil
+        beginDrag(buttonNumber: event.buttonNumber, locationInWindow: origin)
         dragCamera(with: event)
     }
 
@@ -1773,7 +1807,23 @@ private final class StageWorldInteractionView: NSView {
     }
 
     override func rightMouseUp(with event: NSEvent) {
+        guard let origin = rightPressOriginInWindow else {
+            endDragIfNeeded()
+            return
+        }
+        rightPressOriginInWindow = nil
         endDragIfNeeded()
+        // 单击（按下 → 抬起之间没超过抖动阈值）= 携带时**顺时针 45°**：出口与 `R` 键、
+        // `,` / `.` 完全同一条（`onGridRotate` → `ResidentPropGridEditorModel.rotateFootprint(bySteps:)`，
+        // 45° 步长只在映射层那一处），没有第二份 yaw 逻辑。⇧ 反向沿用被删掉的那条圆环分支的约定。
+        let isClick = Self.isWithinClickDrift(from: origin, to: event.locationInWindow)
+        let rotates = isClick && consumesRightClickRotate
+        // **场景输入链[14]**（只观测）：右键到底判成了旋转还是什么都不做 ——
+        // "右键没反应" / "空手右键误转" 这两类问题看这一条。限流：同一判定只报一条。
+        noteSceneInputChain("rightMouseUp.分流", state: "单击=\(isClick) 旋转=\(rotates) 携带=\(propEditor.isCarrying) 建造模式=\(spatialStage.isResidentPropBuildModeActive)",
+            "场景输入链[14] rightMouseUp 到达交互视图 单击=\(isClick) 判定旋转=\(rotates) 携带=\(propEditor.isCarrying) 建造模式=\(spatialStage.isResidentPropBuildModeActive) 输入框在打字=\(inputOwnsFocus) onGridRotate已接线=\(onGridRotate != nil)")
+        guard rotates else { return }
+        onGridRotate?(event.modifierFlags.contains(.shift) ? -1 : 1)
     }
 
     override func otherMouseUp(with event: NSEvent) {
@@ -1875,6 +1925,8 @@ private final class StageWorldInteractionView: NSView {
             // 视图离开窗口后不会再有 mouseUp：把没结算的按下点清掉，
             // 免得下次回到这个视图时第一次 mouseUp 被当成落地。
             propPressOriginInWindow = nil
+            // 右键那一记同理：留着它，下次右键抬起会被当成"单击旋转"。
+            rightPressOriginInWindow = nil
             didPickUpFromScenePointer = false
             pointerTask?.cancel()
             propEditor.close()
@@ -1902,6 +1954,17 @@ private final class StageWorldInteractionView: NSView {
     private var consumesPropPointer: Bool {
         ResidentPropEditorState.consumesScenePointer(isOpen: propEditor.isOpen, moving: propEditor.isCarrying || propEditor.isMoving,
                                                      inputOwnsFocus: inputOwnsFocus)
+    }
+
+    /// 右键单击 = 转 45° 的门禁：**编辑器打开 + 建造模式 + 手上有物件 + 输入框没在打字**。
+    ///
+    /// 比 `consumesPropPointer` 更严的两条都必要：
+    /// - `isCarrying`：空手右键单击必须**什么都不做**（既不转，也不走拾取；拾取是左键的事）。
+    /// - `isResidentPropBuildModeActive`：圆环本来就只在建造模式里画，非建造模式没有"往哪转"
+    ///   这回事，与被删掉的那条圆环分支同一口径。
+    /// 打字门禁（`inputOwnsFocus`）由 `consumesPropPointer` 带进来，与左键共用一份判据。
+    private var consumesRightClickRotate: Bool {
+        consumesPropPointer && propEditor.isCarrying && spatialStage.isResidentPropBuildModeActive
     }
 
     override func updateTrackingAreas() {
@@ -2068,13 +2131,16 @@ private final class StageWorldInteractionView: NSView {
         return NSPoint(x: center.x, y: center.y)
     }
 
-    /// 手柄命中（可见圆环 26 pt，命中区 32 pt）。
+    /// 手柄悬停命中（可见圆环 26 pt，悬停区 32 pt）——**只**决定圆环亮不亮与光标形状。
     private func isRotationHandleHit(at point: NSPoint) -> Bool {
         guard let center = rotationHandleCenter else { return false }
         return hypot(point.x - center.x, point.y - center.y) <= Self.rotationHandleHitRadius
     }
 
     /// 指针移动时更新手柄悬停态：命中就换成 `pointingHand`，并标脏让圆环变亮。
+    ///
+    /// 注意它**不参与点击分流**：左键落在圆环上也是放下（`mouseDown` 已经不再问这里的命中）。
+    /// 保留原样的亮/暗与光标，是因为那属于既有的悬停反馈，与"哪个键旋转"是两件事。
     private func updateRotationHandle(at point: NSPoint) {
         let hovered = isRotationHandleHit(at: point)
         if hovered != isRotationHandleHovered {

@@ -3064,7 +3064,7 @@ final class AppDelegate:
         stageWindowController?.onResidentPropScenePick = { [weak self] normalized, clickCount in
             self?.residentPropScenePick(normalized: normalized, clickCount: clickCount)
         }
-        // R / ⇧R / `,` / `.` / 场景内手柄：45° 步进旋转（Sims 4 官方口径；原来是 90°）。旋转改的是
+        // R / ⇧R / `,` / `.` / 场景内**右键单击**：45° 步进旋转（Sims 4 官方口径；原来是 90°）。旋转改的是
         // footprint 朝向，重新着色后由 `publishResidentPropGrid` 把新的吸附位置与朝向推给预览。
         stageWindowController?.onResidentPropGridRotate = { [weak self] steps in
             self?.residentPropGridEditor.rotateFootprint(bySteps: steps)

@@ -75,7 +75,7 @@ struct ResidentPropEditorView: View {
                     if let reason = state.selectedHoldUnavailableReason {
                         Text(reason).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2)
                     }
-                    Text("移动指针选择落点，左键放下；R / ⇧R / , / . 或圆环旋转 45°；Esc 放回")
+                    Text("移动指针选择落点，左键放下；右键旋转 45°（R / ⇧R / , / . 同）；Esc 放回")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
             }

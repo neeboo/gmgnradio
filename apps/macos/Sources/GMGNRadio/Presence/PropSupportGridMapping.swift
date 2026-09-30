@@ -123,7 +123,7 @@ enum PropSupportGridMapping {
     /// 见 `docs/plans/2026-09-28-decoration-in-space-interaction.md` D4）。
     ///
     /// 步长只在这一处：`ResidentPropGridEditorModel.rotateFootprint(bySteps:)` 是旋转的
-    /// 唯一入口（R / ⇧R / `,` / `.` / 场景内手柄都走它），谁都不要再抄一份。
+    /// 唯一入口（R / ⇧R / `,` / `.` / 场景内右键单击都走它），谁都不要再抄一份。
     static func yaw(rotatedBySteps steps: Int, from yaw: Float) -> Float {
         normalizedYaw(yaw + Float(steps) * (Float.pi / 4))
     }

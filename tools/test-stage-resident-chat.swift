@@ -739,10 +739,12 @@ enum StageAvatarActivity { case listening, speaking, idle }
         check(nearOffset.x == ResidentPropRotationHandleAnchor.screenOffsetX
                 && nearOffset.y == ResidentPropRotationHandleAnchor.screenOffsetY,
               "both named offset constants feed the anchor")
-        // 偏移量的下界：必须大于命中半径 32 pt，否则圆环的命中区会盖住 hover 格的格心，
-        // "点一下落地"会被误判成旋转。
+        // 偏移量的下界：必须大于悬停半径 32 pt，否则圆环的悬停区会盖住 hover 格的格心 ——
+        // 光标还停在格心上，圆环就亮起来并换成 `pointingHand`。它**不再**参与点击分流
+        // （左键在任何位置都是放下、右键单击才是旋转，见 `test-resident-prop-editor.swift`
+        // 里那组用真 mouseDown/mouseUp 抽取驱动的断言），34/10 这个值一个字都没动。
         check(hypot(nearOffset.x, nearOffset.y) > 32,
-              "the screen offset stays outside the 32 pt hit radius so a place-click still places")
+              "the screen offset stays outside the 32 pt hover radius so hovering the cell centre never lights the ring")
         // 上界：每个分量都要落在 hover 格的投影范围内（格心吸附跟着光标走，跨过一列/一行
         // 圆环就会跟着跳一格）。0.25 m 的格子在 1.5 / 2.0 / 2.2 m 处的投影半宽×半深实测约
         // 51.0×21.2 / 40.3×13.6 / 37.1×11.6 pt，34/10 都装得下（2.2 m 就是这套偏移的边界）；

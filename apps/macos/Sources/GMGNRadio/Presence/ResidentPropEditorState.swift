@@ -520,7 +520,7 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
 
     /// 建造模式的 90° 步进旋转。**全仓已无任何调用者**（旋转的唯一入口是
     /// `ResidentPropGridEditorModel.rotateFootprint(bySteps:)`，R / ⇧R / `,` / `.` /
-    /// 场景内手柄都走它）。这里保留只是为了"先报告、别删"；确认后应整段删除。
+    /// 场景内右键单击都走它）。这里保留只是为了"先报告、别删"；确认后应整段删除。
     func rotateQuarterTurn(bySteps steps: Int) async {
         guard !isSaving, let p = placement else { return }
         await validate(.init(surfaceID: p.surfaceID, position: p.position, yaw: p.yaw + Float(steps) * .pi / 2))
