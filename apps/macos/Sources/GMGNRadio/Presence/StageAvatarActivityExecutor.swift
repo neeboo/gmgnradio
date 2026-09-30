@@ -109,6 +109,10 @@ final class StageAvatarActivityExecutor {
     /// Keeps "moving without a walking pose" a single report per episode
     /// instead of a per-tick flood, without ever letting it go unreported.
     private var lastUnwalkableKey: String?
+    /// Last time the walking heartbeat was emitted. One line per second while
+    /// the ground is moving is what lets a real-machine log prove that a whole
+    /// displacement was covered by a walking clip, instead of sampling it.
+    private var lastWalkingHeartbeatAt: TimeInterval?
 
     init(
         runtime: StageAvatarRuntimeStore,
@@ -167,30 +171,32 @@ final class StageAvatarActivityExecutor {
             ResidentLocomotionMotionPolicy.isPlayable($0.value, on: avatarFormat)
         }
         let declaredMotionIDs = matchingContract?.motionIDs ?? []
-        let defaultMotionIDs = Self.defaultMotionIDs(
+        // The world's own declaration, resolved and nothing else: this value is
+        // the report channel the host reads to decide whether a capability's
+        // receipt-driven enter motion was satisfied. It is never filled in with
+        // a default, in any phase.
+        let declaredPlayback = StageAvatarMotionPlayback.resolve(
+            activity: activity,
             phase: phase,
-            matchingContract: matchingContract,
+            phaseContract: matchingContract,
+            approvedMotions: playableMotions
+        )
+        // What the body must look like. Movement decides, not the phase: a
+        // resident walking through `.enter` / `.exit` / `.interrupt` towards a
+        // machine is still walking, and a declared clip always outranks this.
+        let visualPlayback = Self.visualPlayback(
+            declared: declaredPlayback,
             isLocomoting: isLocomoting,
             approvedMotions: playableMotions,
             avatarFormat: avatarFormat
         )
-        let playback = StageAvatarMotionPlayback.resolve(
-            activity: activity,
-            phase: phase,
-            phaseContract: Self.effectiveContract(
-                matchingContract: matchingContract,
-                phase: phase,
-                isLocomoting: isLocomoting,
-                defaultMotionIDs: defaultMotionIDs
-            ),
-            approvedMotions: playableMotions
-        )
+        let isSubstituted = visualPlayback != declaredPlayback
         let locomotionTelemetry = StageAvatarLocomotionTelemetry(
             measuredSpeed: measuredSpeed,
             sustainedSpeed: groundSpeedMeter.sustainedSpeed,
             isWorldMoving: groundSpeedMeter.isTranslating
                 || isLocomoting,
-            isLocomotionActive: locomotionAsset(from: playback) != nil,
+            isLocomotionActive: locomotionAsset(from: visualPlayback) != nil,
             sourceRevision: sourceRevision
         )
         runtime.updateLocomotion(locomotionTelemetry)
@@ -198,9 +204,10 @@ final class StageAvatarActivityExecutor {
             transform: transform,
             activity: activity,
             phase: phase,
-            motionPlayback: playback,
+            motionPlayback: declaredPlayback,
             sourceRevision: sourceRevision,
-            activityRequestID: activityRequestID
+            activityRequestID: activityRequestID,
+            visualPlayback: isSubstituted ? visualPlayback : nil
         )
         let placement = StageAvatarPlacement(
             position: SIMD3<Float>(
@@ -218,7 +225,8 @@ final class StageAvatarActivityExecutor {
            current.activity == snapshot.activity,
            current.phase == snapshot.phase,
            current.activityRequestID == snapshot.activityRequestID,
-           current.motionPlayback == snapshot.motionPlayback
+           current.motionPlayback == snapshot.motionPlayback,
+           current.visualPlayback == snapshot.visualPlayback
         {
             latestSourceRevision = sourceRevision
             return .unchanged(sourceRevision: sourceRevision)
@@ -226,55 +234,108 @@ final class StageAvatarActivityExecutor {
 
         // Playback resolution is completed before either observable store is
         // changed, keeping the visible transform and activity snapshot in one
-        // main-actor commit.
-        let playbackChanged = runtime.worldActivity?.motionPlayback != playback
+        // main-actor commit. The *visual* playback is what the renderer draws,
+        // so that is what decides whether a reload is due.
+        let playbackChanged = runtime.worldActivity?.renderPlayback != visualPlayback
         let phaseChanged = runtime.worldActivity?.phase != phase
         latestSourceRevision = sourceRevision
         runtime.installWorldActivity(snapshot)
         spatialStage.setWorldAvatarPlacement(placement)
 
-        if case let .temporary(motion) = playback,
+        // The declaration is reported first and unconditionally: "the world
+        // declared no motion for this phase" is the fact the host fails closed
+        // on, and it stays true even when a walking substitute is drawn.
+        if let fallback = declaredPlayback.fallback {
+            let requested = fallback.requestedMotionIDs.joined(separator: ",")
+            Self.log.notice(
+                "Falling back to natural idle activity=\(fallback.activityTypeID, privacy: .public) phase=\(fallback.phase.rawValue, privacy: .public) reason=\(fallback.reason.rawValue, privacy: .public) requested=\(requested, privacy: .public) phaseHasMotion=\(!fallback.requestedMotionIDs.isEmpty, privacy: .public)"
+            )
+        }
+        if case let .temporary(motion) = declaredPlayback,
            playbackChanged || phaseChanged
         {
             let fileName = motion.url?.lastPathComponent ?? "nil"
             Self.log.notice(
                 "Resolved activity motion activity=\(activity.typeID, privacy: .public) phase=\(phase.rawValue, privacy: .public) id=\(motion.id, privacy: .public) file=\(fileName, privacy: .public)"
             )
-            // A default substitution is reported as loudly as the resolution
-            // itself: "the world declared no walking motion" is a fact the
-            // operator needs, not an implementation detail.
-            if !declaredMotionIDs.contains(motion.id) {
-                let declared = declaredMotionIDs.isEmpty
-                    ? "none"
-                    : declaredMotionIDs.joined(separator: ",")
-                Self.log.notice(
-                    "Defaulting to built-in \(isLocomoting ? "walk" : "idle", privacy: .public) motion activity=\(activity.typeID, privacy: .public) phase=\(phase.rawValue, privacy: .public) id=\(motion.id, privacy: .public) reason=\(isLocomoting ? "locomotion" : "phaseDeclaredNoMotion", privacy: .public) declared=\(declared, privacy: .public)"
-                )
-            }
-            lastUnwalkableKey = nil
-        } else if let fallback = playback.fallback {
-            let requested = fallback.requestedMotionIDs.joined(separator: ",")
+        }
+        // The visible substitution: the ground is moving, so the body walks —
+        // whatever the phase declared, or did not declare. Reported with the
+        // measurement that drove it, so "why is it walking here?" is answerable
+        // from the log alone.
+        if isSubstituted, case let .temporary(motion) = visualPlayback,
+           playbackChanged || phaseChanged
+        {
+            let declared = declaredMotionIDs.isEmpty
+                ? "none"
+                : declaredMotionIDs.joined(separator: ",")
+            let sustainedSpeed = groundSpeedMeter.sustainedSpeed
             Self.log.notice(
-                "Falling back to natural idle activity=\(fallback.activityTypeID, privacy: .public) phase=\(fallback.phase.rawValue, privacy: .public) reason=\(fallback.reason.rawValue, privacy: .public) requested=\(requested, privacy: .public)"
+                "Defaulting to built-in walk motion while the ground moves activity=\(activity.typeID, privacy: .public) phase=\(phase.rawValue, privacy: .public) id=\(motion.id, privacy: .public) reason=locomotion measured=\(measuredSpeed, privacy: .public) sustained=\(sustainedSpeed, privacy: .public) declared=\(declared, privacy: .public) declaredMotionUnavailable=\(declaredPlayback.fallback != nil, privacy: .public)"
             )
+            lastUnwalkableKey = nil
         }
         // Moving with no playable walking clip is the one degradation that must
         // never be silent: the world keeps translating the avatar, so a still
         // body reads as "sliding". Report it once per (activity, phase) and
         // never hide it behind the ordinary fallback line above.
-        if isLocomoting, case .naturalIdle = playback {
+        if isLocomoting, case .naturalIdle = visualPlayback {
             let key = "\(activityRequestID ?? "none")#\(activity.typeID)#\(phase.rawValue)"
             if lastUnwalkableKey != key {
                 lastUnwalkableKey = key
-                let candidates = (
-                    declaredMotionIDs + defaultMotionIDs
-                ).joined(separator: ",")
+                let candidates = ResidentLocomotionMotionPolicy
+                    .defaultMotionIDs(
+                        isLocomoting: true,
+                        approvedMotions: playableMotions,
+                        avatarFormat: avatarFormat
+                    )
+                    .joined(separator: ",")
                 Self.log.error(
-                    "No usable walking motion: the avatar is moving without a walk clip activity=\(activity.typeID, privacy: .public) phase=\(phase.rawValue, privacy: .public) avatarFormat=\(avatarFormat?.rawValue ?? "none", privacy: .public) candidates=\(candidates, privacy: .public)"
+                    "No usable walking motion: the avatar is moving without a walk clip activity=\(activity.typeID, privacy: .public) phase=\(phase.rawValue, privacy: .public) avatarFormat=\(avatarFormat?.rawValue ?? "none", privacy: .public) declared=\(declaredMotionIDs.joined(separator: ","), privacy: .public) candidates=\(candidates, privacy: .public) measured=\(measuredSpeed, privacy: .public)"
                 )
             }
         }
+        logWalkingHeartbeat(
+            isLocomoting: isLocomoting,
+            activity: activity,
+            phase: phase,
+            playback: visualPlayback,
+            declaredMotionIDs: declaredMotionIDs,
+            measuredSpeed: measuredSpeed,
+            sustainedSpeed: locomotionTelemetry.sustainedSpeed
+        )
         return .applied(snapshot)
+    }
+
+    /// One line per second while the ground is moving, naming the clip the
+    /// renderer was told to play. A real-machine log then *proves* coverage:
+    /// every second of displacement carries a heartbeat whose `walkClip=true`,
+    /// and a stretch of floor with no heartbeat (or one with `walkClip=false`)
+    /// is visible as such instead of having to be inferred from install lines.
+    private func logWalkingHeartbeat(
+        isLocomoting: Bool,
+        activity: LifeActivity,
+        phase: LifeActivityPhase,
+        playback: StageAvatarMotionPlayback,
+        declaredMotionIDs: [String],
+        measuredSpeed: Float,
+        sustainedSpeed: Float
+    ) {
+        guard isLocomoting else {
+            lastWalkingHeartbeatAt = nil
+            return
+        }
+        let now = clock()
+        if let lastWalkingHeartbeatAt, now - lastWalkingHeartbeatAt < 1 {
+            return
+        }
+        lastWalkingHeartbeatAt = now
+        let walkClip = locomotionAsset(from: playback)
+        let clipID = walkClip?.id ?? "none"
+        let hasWalkClip = walkClip != nil
+        Self.log.notice(
+            "Walking heartbeat activity=\(activity.typeID, privacy: .public) phase=\(phase.rawValue, privacy: .public) visual=\(clipID, privacy: .public) walkClip=\(hasWalkClip, privacy: .public) measured=\(measuredSpeed, privacy: .public) sustained=\(sustainedSpeed, privacy: .public) declared=\(declaredMotionIDs.joined(separator: ","), privacy: .public)"
+        )
     }
 
     @discardableResult
@@ -295,6 +356,7 @@ final class StageAvatarActivityExecutor {
         runtime.clearWorldActivity()
         runtime.updateLocomotion(.standing)
         groundSpeedMeter.reset()
+        lastWalkingHeartbeatAt = nil
         spatialStage.clearTransientAvatarPlacement()
         return .cleared(sourceRevision: sourceRevision)
     }
@@ -323,60 +385,43 @@ final class StageAvatarActivityExecutor {
         return measuredSpeed.isFinite && measuredSpeed > StageLocomotionGait.freezeSpeed
     }
 
-    /// Motion ids to append after a phase's declared ids.
+    /// What the renderer must play, given what the world declared.
     ///
-    /// `.enter` and `.exit` are deliberately untouched: a generated-prop
-    /// capability's enter phase is a receipt-driven gate the host fails closed
-    /// on (`isNaturalIdleFallback` + `isPropCapabilityActivity`), so silently
-    /// giving it a clip would turn "the motion is missing" into "the usage
-    /// succeeded". `.failed`/`.interrupt` resolve to the inactive-phase
-    /// fallback before any id is read. `matchingContract == nil` is genuine
-    /// user idle: the user's selected/thinking/idle chain owns that case
-    /// unless the ground is moving, in which case locomotion wins.
-    static func defaultMotionIDs(
-        phase: LifeActivityPhase,
-        matchingContract: ActivityPhaseContract?,
+    /// The rule is about the **ground**, not the phase:
+    ///
+    /// - a declared clip always plays (the world's intent outranks the default);
+    /// - otherwise, if the avatar's ground is genuinely moving, the built-in
+    ///   walking clip plays — in **every** phase, including `.enter`, `.exit`
+    ///   and `.interrupt`. A resident walking towards a machine during an
+    ///   `enter` phase is walking, and the previous phase-gated rule is exactly
+    ///   what made that stretch of floor show a standing pose;
+    /// - otherwise the declaration stands (which resolves to the natural/selected
+    ///   idle for a standing avatar).
+    ///
+    /// This never touches ``StageAvatarWorldActivitySnapshot/motionPlayback``,
+    /// which stays the world's own declaration: "the enter motion is missing"
+    /// must keep failing closed in the host's receipt gate even while the body
+    /// is drawn walking. Playback and contract satisfaction are separate facts.
+    static func visualPlayback(
+        declared: StageAvatarMotionPlayback,
         isLocomoting: Bool,
         approvedMotions: [String: StageMotionAsset],
         avatarFormat: StageAvatarFormat?
-    ) -> [String] {
-        switch phase {
-        case .failed, .interrupt, .enter, .exit:
-            return []
-        case .approach:
-            return ResidentLocomotionMotionPolicy.defaultMotionIDs(
+    ) -> StageAvatarMotionPlayback {
+        if case .temporary = declared { return declared }
+        guard isLocomoting else { return declared }
+        guard let walk = ResidentLocomotionMotionPolicy.firstPlayable(
+            ResidentLocomotionMotionPolicy.defaultMotionIDs(
                 isLocomoting: true,
                 approvedMotions: approvedMotions,
                 avatarFormat: avatarFormat
-            )
-        case .loop:
-            guard matchingContract != nil || isLocomoting else { return [] }
-            return ResidentLocomotionMotionPolicy.defaultMotionIDs(
-                isLocomoting: isLocomoting,
-                approvedMotions: approvedMotions,
-                avatarFormat: avatarFormat
-            )
+            ),
+            approvedMotions: approvedMotions,
+            avatarFormat: avatarFormat
+        ) else {
+            return declared
         }
-    }
-
-    /// The contract handed to the resolver: the world's declaration first, the
-    /// locomotion/idle default after it. `nil` only for genuine user idle that
-    /// is not moving, which keeps the pre-existing selected-motion chain.
-    static func effectiveContract(
-        matchingContract: ActivityPhaseContract?,
-        phase: LifeActivityPhase,
-        isLocomoting: Bool,
-        defaultMotionIDs: [String]
-    ) -> ActivityPhaseContract? {
-        if matchingContract == nil, !isLocomoting { return nil }
-        if defaultMotionIDs.isEmpty, let matchingContract { return matchingContract }
-        return ActivityPhaseContract(
-            phase: phase,
-            requiredAnchorIDs: matchingContract?.requiredAnchorIDs ?? [],
-            motionIDs: (matchingContract?.motionIDs ?? []) + defaultMotionIDs,
-            propIDs: matchingContract?.propIDs ?? [],
-            durationSeconds: matchingContract?.durationSeconds
-        )
+        return .temporary(walk)
     }
 
     private static func yaw(from rotation: WorldQuaternion) -> Float {

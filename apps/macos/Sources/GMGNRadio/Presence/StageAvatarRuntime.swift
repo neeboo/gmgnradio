@@ -295,6 +295,22 @@ struct StageAvatarRuntimeSnapshot: Equatable, Sendable {
 /// Ephemeral full-body state driven by the deterministic world runtime.
 /// Voice/facial activity remains in `StageAvatarRuntimeStore.activity`, while
 /// the user's selected avatar and motion remain in `snapshot`.
+///
+/// The two playback fields answer two different questions on purpose:
+///
+/// - ``motionPlayback`` — **what the world declared** for this activity and
+///   phase, resolved against the approved motion set and nothing else. This is
+///   the report channel: the host fails a generated-prop capability's enter
+///   phase when this is a natural-idle fallback, because a capability whose
+///   receipt-driven motion is missing must not silently "succeed".
+/// - ``visualPlayback`` — **what the renderer must play**. It equals
+///   ``motionPlayback`` unless the declaration resolved to nothing while the
+///   avatar's ground is actually moving, in which case it is the built-in
+///   walking clip (see `ResidentLocomotionMotionPolicy`).
+///
+/// Keeping them apart is what lets a resident that is *walking through* an
+/// enter phase look like it is walking without turning "the enter motion is
+/// missing" into "the usage succeeded".
 struct StageAvatarWorldActivitySnapshot: Equatable, Sendable {
     let transform: WorldTransform
     let activity: LifeActivity
@@ -302,6 +318,13 @@ struct StageAvatarWorldActivitySnapshot: Equatable, Sendable {
     let motionPlayback: StageAvatarMotionPlayback
     let sourceRevision: UInt64
     var activityRequestID: String? = nil
+    var visualPlayback: StageAvatarMotionPlayback? = nil
+
+    /// The clip the renderer plays: the locomotion substitute when one was
+    /// needed, otherwise the world's own declaration.
+    var renderPlayback: StageAvatarMotionPlayback {
+        visualPlayback ?? motionPlayback
+    }
 }
 
 struct StageMotionPlaybackIdentity: Equatable, Sendable {
@@ -466,6 +489,14 @@ final class StageAvatarRuntimeStore {
         }
     }
 
+    /// Playback identity of one motion.
+    ///
+    /// Identity is attached only to the world's **declared** playback
+    /// (``StageAvatarWorldActivitySnapshot/motionPlayback``), never to the
+    /// locomotion substitute in ``StageAvatarWorldActivitySnapshot/visualPlayback``:
+    /// the built-in walk clip is not the world's contract, so its completion
+    /// or failure must not be written back as a world receipt (that would let
+    /// an asset the world never declared fail or finish its activity).
     func playbackIdentity(for motion: StageMotionAsset) -> StageMotionPlaybackIdentity {
         let world: StageAvatarWorldActivitySnapshot?
         if case let .temporary(activeMotion) = worldActivity?.motionPlayback,

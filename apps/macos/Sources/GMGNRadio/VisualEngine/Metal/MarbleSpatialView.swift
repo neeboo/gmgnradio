@@ -2657,7 +2657,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         }
         let resolved = StageAvatarResolvedMotion.resolve(
             selectedMotion: avatarRuntime.snapshot.motion,
-            worldPlayback: avatarRuntime.worldActivity?.motionPlayback,
+            worldPlayback: avatarRuntime.worldActivity?.renderPlayback,
             residentThinkingMotion: avatarRuntime.residentThinkingMotion,
             heldDisplayMotion: heldDisplayMotion,
             naturalIdleMotion: avatarRuntime.residentIdleMotion
@@ -2791,7 +2791,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
     private func synchronizeVRMWorldMotion(_ model: VRMModel) {
         let resolved = StageAvatarResolvedMotion.resolve(
             selectedMotion: avatarRuntime.snapshot.motion,
-            worldPlayback: avatarRuntime.worldActivity?.motionPlayback,
+            worldPlayback: avatarRuntime.worldActivity?.renderPlayback,
             residentThinkingMotion: avatarRuntime.residentThinkingMotion,
             naturalIdleMotion: avatarRuntime.residentIdleMotion
         )

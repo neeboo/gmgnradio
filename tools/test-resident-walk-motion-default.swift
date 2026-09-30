@@ -22,6 +22,7 @@ let policy = try read("apps/macos/Sources/GMGNRadio/Presence/ResidentLocomotionM
 let executor = try read("apps/macos/Sources/GMGNRadio/Presence/StageAvatarActivityExecutor.swift")
     .replacingOccurrences(of: "import WorldRuntime", with: "")
 let runtime = try read("apps/macos/Sources/GMGNRadio/Presence/StageAvatarRuntime.swift")
+let view = try read("apps/macos/Sources/GMGNRadio/VisualEngine/Metal/MarbleSpatialView.swift")
 
 // The production surfaces this harness is about must exist before it can test
 // them; a rename that silently drops the default would otherwise "pass".
@@ -30,9 +31,23 @@ guard policy.contains("static func walkMotionIDs("),
       policy.contains("func isPlayable("),
       executor.contains("ResidentLocomotionMotionPolicy.defaultMotionIDs("),
       executor.contains("No usable walking motion"),
-      executor.contains("Defaulting to built-in"),
+      executor.contains("Defaulting to built-in walk motion while the ground moves"),
+      executor.contains("static func visualPlayback("),
       resolver.contains("case naturalIdle") else {
     print("FAIL: the walking-motion default policy or its executor linkage is missing")
+    exit(1)
+}
+// The separation is a code fact, not a comment: what the world declared drives
+// receipts; what the renderer draws is the movement-driven channel.
+guard view.contains("worldPlayback: avatarRuntime.worldActivity?.renderPlayback") else {
+    print("FAIL: the renderer must draw the movement-driven renderPlayback, not the world declaration")
+    exit(1)
+}
+let identityBody = declaration("func playbackIdentity(", in: runtime)
+guard identityBody.contains("worldActivity?.motionPlayback"),
+      !identityBody.contains("renderPlayback"),
+      !identityBody.contains("visualPlayback") else {
+    print("FAIL: a locomotion substitute must never carry a world request identity (its failure/completion would be written back as a world receipt)")
     exit(1)
 }
 
@@ -57,6 +72,28 @@ func computedProperty(_ signature: String, in source: String) -> String {
 let telemetryDecl = declaration("struct StageAvatarLocomotionTelemetry:", in: runtime)
 let gaitDecl = declaration("struct StageLocomotionGait:", in: runtime)
 let isLocomotionLoop = computedProperty("var isLocomotionLoop: Bool", in: runtime)
+
+// The two real-machine timelines are replayed from the *shipped* package so
+// the harness cannot drift from what the cabin actually declares.
+let cabinWorld = try JSONSerialization.jsonObject(
+    with: Data(contentsOf: root.appendingPathComponent(
+        "apps/macos/Resources/Worlds/marble-living-cabin/world.json")))
+    as? [String: Any] ?? [:]
+func phaseMotionIDs(_ activityID: String, _ phase: String) -> [String] {
+    guard let definitions = cabinWorld["activityDefinitions"] as? [[String: Any]],
+          let definition = definitions.first(where: { $0["id"] as? String == activityID }),
+          let phases = definition["phases"] as? [[String: Any]],
+          let entry = phases.first(where: { $0["phase"] as? String == phase })
+    else { return [] }
+    return entry["motionIDs"] as? [String] ?? []
+}
+let collectEnterMotionIDs = phaseMotionIDs("wish_machine.collect", "enter")
+let homeWalkApproachMotionIDs = phaseMotionIDs("home.walk", "approach")
+guard collectEnterMotionIDs.isEmpty,
+      homeWalkApproachMotionIDs.contains("gmgn.motion.bones.walk-loop-pmx") else {
+    print("FAIL: the shipped cabin package no longer matches the timelines this harness replays")
+    exit(1)
+}
 
 let harness = #"""
 import Foundation
@@ -124,6 +161,10 @@ struct StageAvatarWorldActivitySnapshot: Equatable, Sendable {
     let motionPlayback: StageAvatarMotionPlayback
     let sourceRevision: UInt64
     var activityRequestID: String? = nil
+    var visualPlayback: StageAvatarMotionPlayback? = nil
+    var renderPlayback: StageAvatarMotionPlayback {
+        visualPlayback ?? motionPlayback
+    }
 }
 struct StageAvatarAssetSnapshot { let format: StageAvatarFormat }
 struct StageAvatarRuntimeSnapshotShim { let avatar: StageAvatarAssetSnapshot? }
@@ -168,26 +209,38 @@ let dancePMX = StageMotionAsset(
 let declaredVRMWalk = StageMotionAsset(
     id: "world.declared.walk", name: "declared", format: .vrma,
     url: URL(fileURLWithPath: "/offline/declared.vrma"), loop: true, inPlace: true)
+let declaredPMXWalk = StageMotionAsset(
+    id: "world.declared.pmx.walk", name: "declared", format: .vmd,
+    url: URL(fileURLWithPath: "/offline/declared-pmx.vmd"),
+    loop: true, inPlace: true, strideSpeed: 0.75)
 
 let approved = [walkPMX.id: walkPMX, walkVRM.id: walkVRM, idlePMX.id: idlePMX,
-                dancePMX.id: dancePMX, declaredVRMWalk.id: declaredVRMWalk]
+                dancePMX.id: dancePMX, declaredVRMWalk.id: declaredVRMWalk,
+                declaredPMXWalk.id: declaredPMXWalk]
 
+// Read from the shipped `marble-living-cabin` package by the outer script.
+let wishMachineCollectEnterMotionIDs: [String] = \#(collectEnterMotionIDs)
+let homeWalkApproachMotionIDs: [String] = \#(homeWalkApproachMotionIDs)
+
+/// Drives the real executor over `translations` (metres per 30 Hz tick) and
+/// hands back the last snapshot, so both channels can be inspected:
+/// `motionPlayback` is the world's declaration (the report), `renderPlayback`
+/// is what the renderer draws.
 @MainActor
-func playback(
+func snapshot(
     activity: LifeActivity = .walk(destinationID: "wp.center"),
     phase: LifeActivityPhase = .approach,
     contract: ActivityPhaseContract?,
     approvedMotions: [String: StageMotionAsset] = approved,
     avatarFormat: StageAvatarFormat = .pmx,
     translations: [Float] = [0, 0.025, 0.05]
-) -> StageAvatarMotionPlayback? {
+) -> StageAvatarWorldActivitySnapshot? {
     let store = StageAvatarRuntimeStore()
     store.snapshot = StageAvatarRuntimeSnapshotShim(avatar: StageAvatarAssetSnapshot(format: avatarFormat))
     let stage = SpatialStageStore()
     var now: TimeInterval = 0
     let subject = StageAvatarActivityExecutor(
         runtime: store, spatialStage: stage, worldSpawn: WorldTransform(), clock: { now })
-    var last: StageAvatarMotionPlayback?
     for (index, x) in translations.enumerated() {
         var transform = WorldTransform()
         transform.position.x = x
@@ -195,10 +248,9 @@ func playback(
             transform: transform, activity: activity, phase: phase,
             sourceRevision: UInt64(index + 1), activityRequestID: "request-\(index)",
             phaseContract: contract, approvedMotions: approvedMotions)
-        last = store.worldActivity?.motionPlayback
         now += 1.0 / 30.0
     }
-    return last
+    return store.worldActivity
 }
 
 @MainActor
@@ -211,78 +263,119 @@ func playback(
             guard case let .temporary(motion)? = playback else { return nil }
             return motion.id
         }
-
-        // 1. Every moving snapshot resolves to *some* clip, and it is a walking
-        //    clip. Four hostile declarations the real machine produces: no
-        //    contract at all, a contract that declares nothing (the cabin's
-        //    `wish_machine.collect.approach`), one that declares an id nobody
-        //    installed, and one whose declared clip has the wrong format for
-        //    the avatar (a .vrma declared for a PMX body).
-        let movingCases: [(String, ActivityPhaseContract?)] = [
-            ("no contract", nil),
-            ("empty declaration", ActivityPhaseContract(phase: .approach, motionIDs: [])),
-            ("uninstalled declaration",
-             ActivityPhaseContract(phase: .approach, motionIDs: ["gmgn.motion.bones.walk-loop-gone"])),
-            ("wrong-format declaration",
-             ActivityPhaseContract(phase: .approach, motionIDs: [declaredVRMWalk.id])),
-        ]
-        for (label, contract) in movingCases {
-            let resolved = playback(contract: contract)
-            expect(temporaryID(resolved) == walkPMX.id,
-                   "moving with \(label) must play the built-in walk clip, got \(String(describing: resolved))")
+        func declared(_ snap: StageAvatarWorldActivitySnapshot?) -> StageAvatarMotionPlayback? {
+            snap?.motionPlayback
+        }
+        func visual(_ snap: StageAvatarWorldActivitySnapshot?) -> StageAvatarMotionPlayback? {
+            snap?.renderPlayback
         }
 
-        // 2. A declaration still wins when it is usable: the default is a
-        //    fallback, never a replacement.
-        let declared = playback(contract: ActivityPhaseContract(
-            phase: .approach, motionIDs: [dancePMX.id, walkPMX.id]))
-        expect(temporaryID(declared) == dancePMX.id,
-               "a declared, installed clip stays the first choice")
+        // 1. **Movement, not the phase, decides the pose.** A resident walking
+        //    towards a machine passes through `.enter` / `.exit` /
+        //    `.interrupt` while its ground is still moving; every one of those
+        //    phases must draw the walking clip. The declaration in each case is
+        //    hostile in the way the real machine is: absent, empty (the cabin's
+        //    `wish_machine.collect` declares no motion at all), naming a clip
+        //    nobody installed, or naming a clip in the wrong container.
+        let phases: [LifeActivityPhase] = [.approach, .enter, .loop, .exit, .interrupt, .failed]
+        let declarations: [(String, ActivityPhaseContract?)] = [
+            ("no contract", nil),
+            ("empty declaration", ActivityPhaseContract(phase: .enter, motionIDs: [])),
+            ("uninstalled declaration",
+             ActivityPhaseContract(phase: .enter, motionIDs: ["gmgn.motion.bones.walk-loop-gone"])),
+            ("wrong-container declaration",
+             ActivityPhaseContract(phase: .enter, motionIDs: [declaredVRMWalk.id])),
+        ]
+        for phase in phases {
+            for (label, template) in declarations {
+                let contract = template.map {
+                    ActivityPhaseContract(phase: phase, requiredAnchorIDs: $0.requiredAnchorIDs,
+                                          motionIDs: $0.motionIDs, propIDs: $0.propIDs,
+                                          durationSeconds: $0.durationSeconds)
+                }
+                let snap = snapshot(
+                    activity: .interact(anchorID: "wish_machine.device"),
+                    phase: phase, contract: contract)
+                expect(temporaryID(visual(snap)) == walkPMX.id,
+                       "phase \(phase.rawValue) with \(label): the ground is moving, so the avatar must play the built-in walk clip (movement decides, not the phase); got \(String(describing: visual(snap)))")
+            }
+        }
 
-        // 3. A moving avatar that is already at its target still gets the walk
-        //    clip on the first tick (before a second position sample exists to
-        //    measure): the phase itself is the authoritative walking fact.
-        let firstTick = playback(contract: nil, translations: [0])
-        expect(temporaryID(firstTick) == walkPMX.id,
+        // 2. A declared, installed clip still outranks the default.
+        let declaredWins = snapshot(contract: ActivityPhaseContract(
+            phase: .approach, motionIDs: [declaredPMXWalk.id, walkPMX.id]))
+        expect(temporaryID(visual(declaredWins)) == declaredPMXWalk.id,
+               "a declared, installed clip stays the first choice")
+        expect(temporaryID(declared(declaredWins)) == declaredPMXWalk.id,
+               "the declaration channel reports the declared clip, not the default")
+
+        // 3. The first tick of a walk already walks (the approach phase is the
+        //    executor's own authoritative walking fact, before a second
+        //    position sample exists to measure).
+        let firstTick = snapshot(
+            activity: .interact(anchorID: "wish_machine.device"),
+            phase: .approach, contract: nil, translations: [0])
+        expect(temporaryID(visual(firstTick)) == walkPMX.id,
                "the first tick of a walk already has a walking pose")
 
-        // 4. Standing still with a semantic activity that declares nothing must
-        //    play the built-in idle loop, not "natural idle with nothing to
-        //    play" (which is the rest pose).
-        let standing = playback(
+        // 4. Standing still must NOT walk: movement is the criterion, not the
+        //    phase, so a settled `.enter` keeps the declaration's idle.
+        let standingEnter = snapshot(
             activity: .interact(anchorID: "wish_machine.device"),
-            phase: .loop,
-            contract: ActivityPhaseContract(phase: .loop, motionIDs: []),
+            phase: .enter, contract: ActivityPhaseContract(phase: .enter, motionIDs: []),
             translations: [5, 5, 5])
-        expect(temporaryID(standing) == idlePMX.id,
-               "a settled activity without a declared clip plays the built-in idle loop, got \(String(describing: standing))")
+        expect(temporaryID(visual(standingEnter)) == nil,
+               "a settled enter phase must not walk, got \(String(describing: visual(standingEnter)))")
+        expect(standingEnter?.motionPlayback.fallback != nil,
+               "a settled enter phase without a motion still reports the fallback")
 
-        // 5. The generated-prop enter phase stays fail-closed: the host turns a
-        //    natural-idle fallback on `.enter` into a *failed* usage, so the
-        //    default must never quietly satisfy that gate.
-        let enter = playback(
+        // 5. **The fail-closed report is separate from the drawing.** On a
+        //    moving `.enter` without a usable declared motion the body walks,
+        //    and the world declaration must *still* read as an unmet fallback:
+        //    the host turns that into a failed capability usage, and it must
+        //    not be satisfied by the walking substitute.
+        let movingEnter = snapshot(
             activity: .interact(anchorID: "coffee.brew@object"),
+            phase: .enter, contract: ActivityPhaseContract(phase: .enter, motionIDs: []))
+        expect(movingEnter?.motionPlayback.fallback != nil,
+               "an enter phase without a motion still reports the fallback the host fails closed on")
+        expect(temporaryID(visual(movingEnter)) == walkPMX.id,
+               "the same moving enter phase draws the walking clip (playback and receipt are separate)")
+
+        // 6. Idle micro-motion: a standing semantic activity with no declared
+        //    clip resolves to the built-in idle loop through the real renderer
+        //    chain, and never to "no pose at all".
+        let standingLoop = snapshot(
+            activity: .interact(anchorID: "wish_machine.device"),
+            phase: .loop, contract: ActivityPhaseContract(phase: .loop, motionIDs: []),
+            translations: [5, 5, 5])
+        let idleResolved = StageAvatarResolvedMotion.resolve(
+            selectedMotion: nil,
+            worldPlayback: visual(standingLoop),
+            naturalIdleMotion: idlePMX)
+        expect(idleResolved == .asset(idlePMX),
+               "a settled activity with no declared clip plays the built-in idle loop, got \(String(describing: idleResolved))")
+        let restResolved = StageAvatarResolvedMotion.resolve(
+            selectedMotion: nil,
+            worldPlayback: visual(standingLoop),
+            naturalIdleMotion: nil)
+        expect(restResolved == .asset(idlePMX) || restResolved == .naturalIdle,
+               "a missing idle clip is reported as the rest pose, never as a fabricated motion")
+
+        // 7. Moving with no walk clip installed cannot be silent: the resolver
+        //    reports the fallback (which the executor logs as an error), and a
+        //    dance is never promoted into the walking pose.
+        let noWalk = snapshot(
             phase: .enter,
             contract: ActivityPhaseContract(phase: .enter, motionIDs: []),
-            translations: [5, 5, 5])
-        expect(enter?.fallback != nil,
-               "an enter phase without a motion still reports the fallback the host fails closed on")
-
-        // 6. Moving with no walk clip installed at all cannot be silent: the
-        //    resolver reports a fallback (which the executor logs as an error),
-        //    never a motion.
-        let noWalk = playback(
-            contract: nil,
             approvedMotions: [idlePMX.id: idlePMX, dancePMX.id: dancePMX])
-        expect(noWalk?.fallback != nil,
+        expect(noWalk?.motionPlayback.fallback != nil || temporaryID(visual(noWalk)) == nil,
                "moving with no installed walk clip must report the missing motion")
-        expect(temporaryID(noWalk) == nil,
+        expect(temporaryID(visual(noWalk)) != dancePMX.id,
                "a dance must never be promoted into the walking pose")
 
-        // 7. The visible clip is never frozen while the world is translating
-        //    the avatar: a snapshot that landed on a stalled tick lowers the
-        //    responsive estimate, and the sustained estimate must still drive
-        //    the gait instead of parking the legs.
+        // 8. The visible clip is never frozen while the world is translating
+        //    the avatar, and a genuine standstill still freezes.
         let gait = StageLocomotionGait(authoredStepSpeed: 0.75)
         let stalledSample = StageAvatarLocomotionTelemetry(
             measuredSpeed: 0.01, sustainedSpeed: 0.75, isWorldMoving: true,
@@ -297,16 +390,48 @@ func playback(
         expect(gait.playbackRate(forGroundSpeed: stopped.gaitGroundSpeed) == 0,
                "a genuine standstill still freezes instead of marching in place")
 
-        // 8. The VRM path gets the same default, chosen by format: a PMX clip
-        //    is never handed to a VRM avatar.
-        let vrmResolved = playback(
-            phase: .approach, contract: nil,
+        // 9. The VRM path gets the same movement-driven default, chosen by
+        //    format: a PMX clip is never handed to a VRM avatar.
+        let vrmResolved = snapshot(
+            phase: .enter, contract: nil,
             approvedMotions: [walkPMX.id: walkPMX, walkVRM.id: walkVRM],
             avatarFormat: .vrm)
-        expect(temporaryID(vrmResolved) == walkVRM.id,
+        expect(temporaryID(visual(vrmResolved)) == walkVRM.id,
                "a VRM avatar defaults to the VRM walk clip")
 
-        print("PASS: 8 walking-motion default checks (moving always walks, dedicated still wins, idle micro-motion, enter stays fail-closed, missing walk reported, no frozen gait, format-correct default)")
+        // 10. Replay of the two real-machine timelines from the shipped package.
+        //     22:21:25 — the resident was walking towards the wish machine while
+        //     the collect activity sat in its (motion-less) `.enter` phase, and
+        //     the old rule gated the substitute on the phase, so the walking
+        //     clip was never drawn and the idle loop played instead.
+        let collectEnter = snapshot(
+            activity: .interact(anchorID: "wish_machine.device"),
+            phase: .enter,
+            contract: ActivityPhaseContract(
+                phase: .enter, motionIDs: wishMachineCollectEnterMotionIDs),
+            approvedMotions: [walkPMX.id: walkPMX, idlePMX.id: idlePMX])
+        expect(temporaryID(visual(collectEnter)) == walkPMX.id,
+               "replayed 22:21:25 (interact/.enter, declared \(wishMachineCollectEnterMotionIDs), moving): the renderer must get the walking clip")
+        expect(collectEnter?.motionPlayback.fallback != nil,
+               "replayed 22:21:25 must still report the unmet enter motion to the host")
+        //     22:22:03 — the declared `home.walk` approach keeps its own clip,
+        //     unchanged by this fix.
+        let homeWalk = snapshot(
+            activity: .walk(destinationID: "wp.center"),
+            phase: .approach,
+            contract: ActivityPhaseContract(
+                phase: .approach, motionIDs: homeWalkApproachMotionIDs))
+        expect(temporaryID(visual(homeWalk)) == walkPMX.id,
+               "replayed 22:22:03 (walk/.approach, declared home.walk) keeps the declared walking clip")
+        expect(temporaryID(declared(homeWalk)) == walkPMX.id,
+               "replayed 22:22:03 reports the declared clip as satisfied, unchanged")
+
+        // Informational trace in the same field names the app logs, so the
+        // decision for a real timeline can be read without guessing.
+        print("REPLAY 22:21:25-like activity=interact phase=enter declared=\(wishMachineCollectEnterMotionIDs) render=\(temporaryID(visual(collectEnter)) ?? "none") walkClip=\(temporaryID(visual(collectEnter)) != nil) receiptFallback=\(collectEnter?.motionPlayback.fallback != nil)")
+        print("REPLAY 22:22:03-like activity=walk phase=approach declared=\(homeWalkApproachMotionIDs) render=\(temporaryID(visual(homeWalk)) ?? "none") walkClip=\(temporaryID(visual(homeWalk)) != nil) receiptFallback=\(homeWalk?.motionPlayback.fallback != nil)")
+
+        print("PASS: 10+ walking-motion checks (movement decides the pose in every phase, declarations still win, first tick walks, standing never walks, the enter receipt stays unmet while the body walks, idle micro-motion, missing walk reported, no frozen gait, format-correct default)")
     }
 }
 """#

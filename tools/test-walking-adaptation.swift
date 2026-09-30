@@ -232,6 +232,8 @@ struct StageAvatarWorldActivitySnapshot: Equatable, Sendable {
     let transform: WorldTransform; let activity: LifeActivity; let phase: LifeActivityPhase
     let motionPlayback: StageAvatarMotionPlayback; let sourceRevision: UInt64
     var activityRequestID: String? = nil
+    var visualPlayback: StageAvatarMotionPlayback? = nil
+    var renderPlayback: StageAvatarMotionPlayback { visualPlayback ?? motionPlayback }
 }
 struct StageAvatarPlacement { let position: SIMD3<Float>; let scale: Float; let yaw: Float }
 /// The one field of the avatar snapshot the executor's motion policy reads.
