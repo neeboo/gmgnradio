@@ -11,6 +11,9 @@ final class StageResidentChatState: ObservableObject {
     @Published var voiceActive = false
     @Published var deliveryNotice: String?
     @Published var progress: String?
+    /// 拖着图片经过对话面板时落点是否亮着。**只由落点自己的命中判据点亮**：非图片
+    /// 拖拽（文本、别的文件）不会走到 `draggingEntered` 的接受分支，所以不会亮。
+    @Published var isImageDropTargeted = false
     @Published private(set) var statusNotice: String?
     /// 当前状态行的类别，决定它能否被普通提示覆盖（见 ResidentStatusNoticeMerge）。
     private(set) var statusKind: ResidentStatusNoticeKind = .info
@@ -268,6 +271,13 @@ struct StageResidentComposer: View {
             }
 
             VStack(alignment: .leading, spacing: 12) {
+                // 落点提示：拖着图片经过时面板边框/底色变化，并明说这一下会做什么。
+                if state.isImageDropTargeted {
+                    Label("松手把图片加进这条消息", systemImage: "photo.badge.plus")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.cyan.opacity(0.95))
+                        .accessibilityIdentifier("stage.resident-image-drop-hint")
+                }
                 if let notice = state.statusNotice, !notice.isEmpty {
                     Text("应用提示：" + notice)
                         .font(.system(size: 11))
@@ -356,14 +366,44 @@ struct StageResidentComposer: View {
                 }
             }
             .padding(15)
-            .background(Color(white: 0.15).opacity(0.98), in: RoundedRectangle(cornerRadius: 20))
+            .background(
+                (state.isImageDropTargeted ? Color(red: 0.10, green: 0.28, blue: 0.34) : Color(white: 0.15)).opacity(0.98),
+                in: RoundedRectangle(cornerRadius: 20)
+            )
             .overlay {
                 RoundedRectangle(cornerRadius: 20)
-                    .stroke(.white.opacity(inputFocused ? 0.22 : 0.1), lineWidth: 1)
+                    .stroke(
+                        .white.opacity(state.isImageDropTargeted ? 0.55 : (inputFocused ? 0.22 : 0.1)),
+                        lineWidth: state.isImageDropTargeted ? 2 : 1
+                    )
             }
         }
         .frame(maxWidth: .infinity)
         .shadow(color: .black.opacity(0.25), radius: 12, y: 4)
+        // 拖拽落点：整个对话面板（含输入框）。非拖拽时刻这个视图的 `hitTest` 恒为 nil，
+        // 所以按钮/输入框/场景交互都与加它之前逐事件一致。
+        .overlay {
+            ResidentImageDropTarget(
+                isTargeted: $state.isImageDropTargeted,
+                onFileURLs: acceptDroppedImageFiles,
+                onBitmap: acceptDroppedImageData
+            )
+        }
+    }
+
+    /// 拖进来的图片文件：**与「＋ 选择文件」同一条** `ResidentAttachmentStore.add(urls:)`。
+    ///
+    /// 这里刻意**不先筛一遍**：混合拖拽（图片 + 别的文件）里那个非图片文件也交给 store，
+    /// 由 store 逐个校验并逐个给出可见原因 —— 不允许静默丢弃。超过 4 张、上一批还在准备、
+    /// 不是图片，这三种拒绝的文案与判据都在 store 那一份逻辑里，这里不重复任何一条。
+    private func acceptDroppedImageFiles(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        Task { await state.images.add(urls: urls) }
+    }
+
+    /// 直接拖进来的位图内容：**与「⌘V」同一条** `add(imageData:)`。
+    private func acceptDroppedImageData(_ data: Data) {
+        Task { await state.images.add(imageData: data) }
     }
 
     private var canSubmit: Bool {

@@ -292,6 +292,120 @@ let marblenormalizedHeight: Double = {
     }
     return value
 }()
+// ── 拖拽接收图片（访达把图拖进窗口）──────────────────────────────────────────
+//
+// 用户一直说"给它图不行"，而图片链那两条判据在生产形状下都是 true —— 真因是全仓
+// **没有任何拖拽接收**：从访达把图拖进对话面板，没有附件、没有报错、也没有日志。
+// 这一段把"拖进来"锁成与「＋ 选择文件」**同一条附件入口**，且不许落点自己解析图片。
+let attachmentSource = try String(contentsOf: sources.appendingPathComponent("Presence/ResidentImageAttachment.swift"), encoding: .utf8)
+let composer = declaration("struct StageResidentComposer:", in: overlay)
+let chooseImages = declaration("func chooseImages()", in: attachmentSource)
+let storeAddURLs = declaration("func add(urls: [URL]) async", in: attachmentSource)
+let attachmentStrip = declaration("struct ResidentAttachmentStrip:", in: attachmentSource)
+let dropView = declaration("final class ResidentImageDropView:", in: attachmentSource)
+let dropTarget = declaration("struct ResidentImageDropTarget:", in: attachmentSource)
+let dropPolicy = declaration("enum ResidentImageDropPolicy {", in: attachmentSource)
+let dropMouseWatch = declaration("enum ResidentImageDropMouseWatch {", in: attachmentSource)
+let dropMouseWatchHitTest = declaration("static func allowsHitTesting", in: attachmentSource)
+let dropHitTest = declaration("override func hitTest(_ point: NSPoint) -> NSView?", in: attachmentSource)
+let dropEntered = declaration("override func draggingEntered(", in: attachmentSource)
+let dropUpdated = declaration("override func draggingUpdated(", in: attachmentSource)
+let dropPerform = declaration("override func performDragOperation(", in: attachmentSource)
+let acceptDroppedFiles = declaration("private func acceptDroppedImageFiles(_ urls: [URL])", in: composer)
+// 断言 1：拖进来的图片文件必须走「＋ 选择文件」**同一条**入口。
+guard chooseImages.contains("add(urls: panel.urls)") else {
+    print("FAIL: 「＋ 选择文件」不是走 add(urls:)，本断言的前提失效")
+    exit(1)
+}
+guard storeAddURLs.contains("ResidentImageFilePolicy.isImageFileURL(url)"),
+      dropPolicy.contains("fileURLs.contains(where: ResidentImageFilePolicy.isImageFileURL)") else {
+    print("FAIL: 拖拽判据与 store 的校验不是同一份判据 —— 不许出现第二份「是不是图片」")
+    exit(1)
+}
+guard overlay.contains("ResidentImageDropTarget(") else {
+    print("FAIL: 对话面板/输入框上没有注册拖拽落点（拖进来的图片还是不会发生任何事）")
+    exit(1)
+}
+guard composer.contains("ResidentImageDropTarget("),
+      composer.contains("onFileURLs: acceptDroppedImageFiles"),
+      acceptDroppedFiles.contains("state.images.add(urls: urls)") else {
+    print("FAIL: 拖进来的图片文件没有走「＋ 选择文件」同一条入口（ResidentAttachmentStore.add(urls:)）")
+    exit(1)
+}
+guard composer.contains("state.images.add(imageData: data)") else {
+    print("FAIL: 直接拖进来的位图没有走「⌘V」同一条入口（ResidentAttachmentStore.add(imageData:)）")
+    exit(1)
+}
+// 落点**不许**自己解析图片字节 / 自己归一化：否则又会变成两份真相。
+// 扫描范围包含 composer 上的那两个回执函数（拖拽真正落地的地方）。
+for token in ["PropImagePreparation", "NSImage(", "CIImage", "data(contentsOf", "writePrivate",
+              "UTType(", "pngData", "CGImageSource", "sips"]
+where dropView.contains(token) || dropTarget.contains(token) || composer.contains(token) {
+    print("FAIL: 拖拽落点自己解析了图片（\(token)）—— 必须复用既有附件入口，不允许第二条通道")
+    exit(1)
+}
+// 一次拖拽里的所有文件 URL 都要交出去，由 store 逐个校验（混合拖拽里的非图片文件
+// 不能被落点先筛掉，否则就是静默丢弃）。
+guard dropView.contains("onFileURLs(urls)"), !dropView.contains("urls.filter") else {
+    print("FAIL: 拖拽落点自己筛过一遍文件 URL —— 被筛掉的那些会成为静默丢弃")
+    exit(1)
+}
+// 断言 2：非图片拖拽不亮起、不接入、也不报假成功。
+// 逐条声明地钉：进入与移动**两处**的高亮都必须读同一份判据，且落点里不允许出现
+// 任何**无条件**点亮（`setTargeted(true)`）—— 只看"文件里某处出现过判据"是抓不住的
+// （实测把 draggingEntered 改成无条件点亮，只查 contains 的版本照样 PASS）。
+guard dropEntered.contains("setTargeted(payload.isAccepted)"),
+      dropUpdated.contains("setTargeted(payload.isAccepted)"),
+      !dropView.contains("setTargeted(true)"),
+      !dropView.contains("onTargetingChange(true)"),
+      dropEntered.contains("return payload.isAccepted ? .copy : []"),
+      dropUpdated.contains("return payload.isAccepted ? .copy : []"),
+      dropPerform.contains("case .unsupported:"),
+      dropPerform.contains("return false") else {
+    print("FAIL: 拖拽高亮/接受必须只由「这一笔里有没有图片」决定（非图片不许亮起、不许接入）")
+    exit(1)
+}
+// 断言 3：超过上限不许在落点静默截断 —— 上限与拒绝文案都归 store 那一份逻辑。
+for token in ["prefix(", "dropLast", "removeLast", "urls[0", "< 4", "> 4", ">= 4", "count == 4"] where acceptDroppedFiles.contains(token) {
+    print("FAIL: 拖拽落点自己判/自己截断上限（\(token)）—— 超过 4 张会被静默丢弃，必须由 store 给出可见拒绝")
+    exit(1)
+}
+guard storeAddURLs.contains("每条消息最多添加 4 张图片。") else {
+    print("FAIL: 超过 4 张的可见拒绝必须由既有的 store 逻辑给出")
+    exit(1)
+}
+guard attachmentStrip.contains("store.errorMessage") else {
+    print("FAIL: 拒绝原因没有被渲染出来（ResidentAttachmentStrip 必须显示 store.errorMessage）")
+    exit(1)
+}
+guard storeAddURLs.contains("原因=上一批还在准备") else {
+    print("FAIL: 上一批还在准备时的第二次接入会被静默丢掉（store 必须给出可见原因）")
+    exit(1)
+}
+// 断言 4：拖拽不许抢走场景里的鼠标交互。
+guard dropHitTest.contains("ResidentImageDropPolicy.allowsHitTesting("),
+      dropHitTest.contains("return nil"),
+      dropHitTest.contains("return super.hitTest(point)"),
+      dropMouseWatchHitTest.contains("return isPointerDragEvent(eventType)") else {
+    print("FAIL: 落点的命中必须由 allowsHitTesting 门禁决定（否则本地点选/相机拖动/装修拖动会被它截住）")
+    exit(1)
+}
+guard dropMouseWatchHitTest.contains("guard !localMouseIsDown"),
+      dropMouseWatch.contains("NSEvent.addLocalMonitorForEvents") else {
+    print("FAIL: 必须能区分「本 app 自己按着鼠标」（相机旋转/装修拖动的事件类型与访达拖进来相同）")
+    exit(1)
+}
+for token in ["override func mouseDown", "override func mouseDragged", "override func mouseUp", "override func scrollWheel"] where dropView.contains(token) {
+    print("FAIL: 落点自己接管了鼠标事件（\(token)）—— 门禁已保证非拖拽时刻它完全不存在")
+    exit(1)
+}
+guard controller.contains("ResidentPropEditorState.consumesScenePointer("),
+      controller.contains("Float(1 - point.y / bounds.height)"),
+      controller.contains("worldInteractionView.layer?.zPosition = 6"),
+      overlayHost.contains("override func hitTest(_ point: NSPoint) -> NSView?") else {
+    print("FAIL: 场景指针链路（门禁签名/归一化/世界交互层/覆盖层穿透）必须原样保留")
+    exit(1)
+}
 let harness = #"""
 import Foundation
 import Combine
@@ -475,6 +589,12 @@ enum StageAvatarActivity { case listening, speaking, idle }
     func updateComposerActions() {}
     func updateReplyDisclosure() {}
     \#(liveCamRestore)
+}
+/// 测试用的「准备中」闸门：靠状态观测而不是 sleep 的时间差，避免 harness 偶发。
+@MainActor final class DropPreparationGate {
+    private var pending: CheckedContinuation<Void, Never>?
+    func wait() async { await withCheckedContinuation { pending = $0 } }
+    func open() { pending?.resume(); pending = nil }
 }
 @main struct Tests {
     @MainActor static func main() async {
@@ -1188,6 +1308,87 @@ enum StageAvatarActivity { case listening, speaking, idle }
         // 头顶本地高度必须与生产绑定矩阵里的 normalizedHeight 一致。
         check(abs(ResidentStatusBadge.headLocalTopY - Float(\#(marblenormalizedHeight))) < 0.0001,
               "头顶高度与 MarblePMXFraming.normalizedHeight 一致（\#(marblenormalizedHeight) m）")
+        // ── 拖拽接收图片（访达拖进来）─────────────────────────────────────────
+        // 判据跑的是**生产那一份** `ResidentImageDropPolicy` / `ResidentAttachmentStore`，
+        // 不是 harness 里抄的一份副本。
+        //
+        // 断言 1：拖入图片文件 ⇒ 会被接下去（交给与「＋ 选择文件」同一条 add(urls:)）。
+        let droppedImage = URL(fileURLWithPath: "/tmp/猫.png")
+        let droppedText = URL(fileURLWithPath: "/tmp/notes.txt")
+        check(ResidentImageFilePolicy.isImageFileURL(droppedImage)
+                && !ResidentImageFilePolicy.isImageFileURL(droppedText),
+              "图片文件的判据与 store 共用同一份（.png 是、.txt 不是）")
+        check(ResidentImageDropPolicy.payload(fileURLs: [droppedImage], hasBitmap: false)
+                == .fileURLs([droppedImage]),
+              "拖进来的图片文件会被接下去")
+        // 混合拖拽：一次把这一笔里的所有文件 URL 都交出去，由 store 逐个校验。
+        check(ResidentImageDropPolicy.payload(fileURLs: [droppedImage, droppedText], hasBitmap: false)
+                == .fileURLs([droppedImage, droppedText]),
+              "混合拖拽把所有文件 URL 都交给 store（非图片那个由 store 给出可见原因，不静默）")
+        // 断言 2：拖入非图片 ⇒ 不亮起、不接入。
+        check(ResidentImageDropPolicy.payload(fileURLs: [droppedText], hasBitmap: false) == .unsupported,
+              "拖入非图片文件不会被接入（也不会有假成功）")
+        check(ResidentImageDropPolicy.payload(fileURLs: [], hasBitmap: false) == .unsupported,
+              "纯文本拖动不会被接入")
+        check(ResidentImageDropPolicy.payload(fileURLs: [], hasBitmap: true) == .bitmap,
+              "直接拖进来的位图走位图那条路（与 ⌘V 同一条 add(imageData:)）")
+        check(!ResidentImageDropPolicy.payload(fileURLs: [droppedText], hasBitmap: false).isAccepted,
+              "非图片拖拽的判据是「不接受」⇒ 落点不会亮起")
+        // 断言 4：拖拽不许抢走场景鼠标交互。
+        check(ResidentImageDropPolicy.allowsHitTesting(eventType: .leftMouseDragged, localMouseIsDown: false),
+              "别的 app 拖着东西经过时落点才参与命中")
+        check(!ResidentImageDropPolicy.allowsHitTesting(eventType: .leftMouseDragged, localMouseIsDown: true),
+              "本 app 自己按着鼠标的拖动（相机旋转/装修拖动）绝不能被落点截住")
+        for event in [AppKit.NSEvent.EventType.leftMouseDown, .rightMouseDown, .mouseMoved, .scrollWheel, .keyDown, .cursorUpdate] {
+            check(!ResidentImageDropPolicy.allowsHitTesting(eventType: event, localMouseIsDown: false),
+                  "本地点选/悬停/滚动/按键时落点完全不存在（\(event.rawValue)）")
+        }
+        check(!ResidentImageDropPolicy.allowsHitTesting(eventType: nil, localMouseIsDown: false),
+              "没有当前事件时落点完全不存在")
+        // 断言 3（+ 断言 1/2 的落点行为）：真的走 store 那一份校验/上限/可见拒绝。
+        let dropDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gmgn-drop-\(UUID())")
+        try? FileManager.default.createDirectory(at: dropDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dropDirectory) }
+        func droppedFile(_ name: String) -> URL {
+            let url = dropDirectory.appendingPathComponent(name)
+            try? Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).write(to: url)
+            return url
+        }
+        let preparedPNG = Data(repeating: 0x7A, count: 512)
+        let cappedStore = ResidentAttachmentStore(
+            directory: dropDirectory.appendingPathComponent("capped")
+        ) { _ in preparedPNG }
+        await cappedStore.add(urls: (1...6).map { droppedFile("图\($0).png") })
+        check(cappedStore.attachments.count == 4,
+              "超过 4 张时只接入 4 张（上限仍在 store 那一份逻辑里）")
+        check(cappedStore.errorMessage != nil,
+              "超过 4 张必须给出可见拒绝，而不是静默丢弃")
+        let mixedStore = ResidentAttachmentStore(
+            directory: dropDirectory.appendingPathComponent("mixed")
+        ) { _ in preparedPNG }
+        await mixedStore.add(urls: [droppedFile("好图.png"), droppedFile("笔记.txt")])
+        check(mixedStore.attachments.count == 1 && mixedStore.attachments.first?.displayName == "好图.png",
+              "混合拖拽里只有图片被接入")
+        check(mixedStore.errorMessage != nil,
+              "混合拖拽里的非图片文件必须给出可见原因（不静默丢弃）")
+        // 上一批还在准备时的第二次接入（＋/⌘V/拖拽都走 add(urls:)）同样不许静默丢弃。
+        let gate = DropPreparationGate()
+        let slowStore = ResidentAttachmentStore(
+            directory: dropDirectory.appendingPathComponent("slow")
+        ) { _ in
+            await gate.wait()
+            return preparedPNG
+        }
+        let slowTask = Task { await slowStore.add(urls: [droppedFile("慢图.png")]) }
+        var spins = 0
+        while !slowStore.isPreparing, spins < 10_000 { spins += 1; await Task.yield() }
+        check(slowStore.isPreparing, "第一笔确实已经进入准备中（这条断言本身有效）")
+        await slowStore.add(urls: [droppedFile("第二张.png")])
+        gate.open()
+        await slowTask.value
+        check(slowStore.attachments.count == 1 && slowStore.errorMessage != nil,
+              "上一批还在准备时的第二次接入必须给出可见原因，而不是静默丢弃")
         print("\(failures == 0 ? "PASS" : "FAIL"): \(count) stage resident chat checks, \(failures) failures")
         exit(failures == 0 ? 0 : 1)
     }
