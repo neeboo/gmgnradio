@@ -155,6 +155,58 @@ def ensure_signature(app):
     return True
 
 
+def prune_install_workspaces(parent, keep=None):
+    """删除历次安装留下的临时工作区，只保留 keep 那一个（= 最近一次可回滚的备份）。
+
+    2026-09-29：每次 `make install` 都会在 `/Applications` 下留一个
+    `.gmgn-install-XXXX/previous.backup`（一份完整的 app 副本），而**从来没有清理过** ——
+    真机上攒到 19 个、2.4 GB，而且这些目录里各装着一个 app bundle，会被 Spotlight/
+    LaunchServices 当成候选，于是"打开方式"里出现第二个 gmgn radio。
+    安装成功时保留一个（回滚用），其余一律删掉；删不掉不算安装失败。
+    """
+    keep = Path(keep) if keep is not None else None
+    for candidate in Path(parent).glob('.gmgn-install-*'):
+        if keep is not None and candidate == keep:
+            continue
+        try:
+            shutil.rmtree(candidate)
+        except OSError:
+            pass
+
+
+def ensure_single_registration(app):
+    """让这个 bundle id 在 LaunchServices 里**只剩本安装这一条**注册。
+
+    真机上曾出现两个 "gmgn radio"：一份是 /Applications 里的正式安装，另一份是
+    构建产物路径（文件早删了，注册还留着）。这里把同一 bundle id 的其它注册逐个注销，
+    再注册本安装。尽力而为：任何一步失败都不影响安装结果。
+    """
+    app = Path(app)
+    lsregister = ('/System/Library/Frameworks/CoreServices.framework/Frameworks/'
+                  'LaunchServices.framework/Support/lsregister')
+    try:
+        with (app / 'Contents/Info.plist').open('rb') as handle:
+            bundle_id = plistlib.load(handle).get('CFBundleIdentifier')
+        if not bundle_id:
+            return False
+        dump = subprocess.run([lsregister, '-dump'], capture_output=True, text=True, timeout=60)
+        current, stale = None, []
+        for line in dump.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('bundle id:'):
+                current = stripped.split('bundle id:', 1)[1].strip()
+            elif stripped.startswith('path:') and current == bundle_id:
+                path = Path(stripped.split('path:', 1)[1].strip())
+                if path != app:
+                    stale.append(path)
+        for path in stale:
+            subprocess.run([lsregister, '-u', str(path)], capture_output=True, timeout=30)
+        subprocess.run([lsregister, '-f', str(app)], capture_output=True, timeout=30)
+        return True
+    except Exception:
+        return False
+
+
 def install(source, destination, root, runtime=None, timeout=15):
     source, destination, root = (Path(p).expanduser().resolve() for p in (source, destination, root))
     if source == destination or source in destination.parents or destination in source.parents:
@@ -200,6 +252,11 @@ def install(source, destination, root, runtime=None, timeout=15):
         # 外部 VoiceMem provider 层已拆除：这里不再向 daemon 发送任何 endpoint/
         # token，安装器也不再读取任何记忆 provider 环境变量。安装只负责替换
         # bundle、拉起 daemon 并验证套接字归属；记忆模块在 daemon 内部自行工作。
+        #
+        # 安装成功后的两项收尾（都不影响返回值，也都不算失败）：LaunchServices 里
+        # 只留这一条注册；历次安装的工作区只留本次这一个（回滚用），其余删掉。
+        ensure_single_registration(destination)
+        prune_install_workspaces(destination.parent, keep=workspace)
         return {'destination': str(destination), 'backup': str(backup) if backup.exists() else None,
                 'daemon_verified': True, 'signature_repaired': signature_repaired,
                 'app_stopped': bool(apps), 'open_app_manually': True}
