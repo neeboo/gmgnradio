@@ -703,7 +703,8 @@ public extension WorldPropCollisionProxyMesh {
         format: WorldPropCollisionFormat,
         position: WorldVector3,
         yaw: Float,
-        heightMeters: Float
+        heightMeters: Float,
+        orientation: WorldPropOrientation? = nil
     ) -> WorldPropProxyObstacleMesh? {
         let origin = SIMD3(position.x, position.y, position.z)
         guard origin.isFinite, yaw.isFinite, heightMeters.isFinite, heightMeters > 0 else {
@@ -711,13 +712,54 @@ public extension WorldPropCollisionProxyMesh {
         }
         let cosine = cos(yaw)
         let sine = sin(yaw)
-        let scale = heightMeters / (maximum.y - minimum.y)
+        // 物件的网格可能是**躺着**的（`WorldPropOrientation`）。代理是同一份网格导出的，
+        // 所以它必须跟着一起转正，并且按**转正之后**的包围盒重新归一化 —— 否则"模型立着、
+        // 代理躺着"，碰撞形状与画面各说各话。
+        guard let orientation, !orientation.isIdentity else {
+            let scale = heightMeters / (maximum.y - minimum.y)
+            guard scale.isFinite, scale > 0 else { return nil }
+            var placedTriangles: [WorldTriangle] = []
+            placedTriangles.reserveCapacity(triangles.count)
+            for triangle in triangles {
+                let converted = [triangle.first, triangle.second, triangle.third].map { vertex -> SIMD3<Float> in
+                    let scaled = vertex * scale
+                    let rotated = SIMD3(
+                        cosine * scaled.x + sine * scaled.z,
+                        scaled.y,
+                        -sine * scaled.x + cosine * scaled.z
+                    )
+                    return origin + rotated
+                }
+                placedTriangles.append(WorldTriangle(converted[0], converted[1], converted[2]))
+            }
+            return WorldPropProxyObstacleMesh(
+                id: id,
+                proxySHA256: sourceSHA256,
+                format: format,
+                triangles: placedTriangles,
+                origin: origin,
+                yaw: yaw
+            )
+        }
+        let oriented = WorldPropOrientationPolicy.orientedBounds(
+            minimum: minimum, maximum: maximum, by: orientation
+        )
+        let orientedHeight = oriented.maximum.y - oriented.minimum.y
+        guard orientedHeight.isFinite, orientedHeight > 0 else { return nil }
+        let scale = heightMeters / orientedHeight
         guard scale.isFinite, scale > 0 else { return nil }
+        let centerX = (oriented.minimum.x + oriented.maximum.x) / 2
+        let centerZ = (oriented.minimum.z + oriented.maximum.z) / 2
         var placedTriangles: [WorldTriangle] = []
         placedTriangles.reserveCapacity(triangles.count)
         for triangle in triangles {
             let converted = [triangle.first, triangle.second, triangle.third].map { vertex -> SIMD3<Float> in
-                let scaled = vertex * scale
+                let upright = WorldPropRotation.rotate(vertex, by: orientation.rotation)
+                let scaled = SIMD3(
+                    (upright.x - centerX) * scale,
+                    (upright.y - oriented.minimum.y) * scale,
+                    (upright.z - centerZ) * scale
+                )
                 let rotated = SIMD3(
                     cosine * scaled.x + sine * scaled.z,
                     scaled.y,

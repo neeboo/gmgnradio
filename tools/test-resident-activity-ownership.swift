@@ -110,12 +110,24 @@ func run(_ binary: String, _ args: [String]) throws -> Int32 {
     let process = Process(); process.executableURL = URL(fileURLWithPath: binary); process.arguments = args
     try process.run(); process.waitUntilExit(); return process.terminationStatus
 }
-let build = root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug")
+// WorldRuntime 的模块搜索路径 + 目标文件**只有一处定义**：tools/world-runtime-harness-flags.sh。
+// 不要在这里拼 `.build/...`：27 份各自拼写正是 SwiftPM 与 xcodebuild 两份模块并存的根因。
+func worldRuntimeHarnessFlags() -> [String] {
+    let process = Process(), pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = [FileManager.default.currentDirectoryPath + "/tools/world-runtime-harness-flags.sh"]
+    process.standardOutput = pipe
+    try? process.run(); process.waitUntilExit()
+    guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
+    return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .split(separator: "\n").map(String.init)
+}
+let worldRuntimeFlags = worldRuntimeHarnessFlags()
+let worldRuntimeModules = worldRuntimeFlags[1]
 let files = ["WorldAgentContext", "WorldAgentToolContract", "WorldAgentToolDispatcher", "ResidentActivityOwnership"]
 let sourcePaths = files.map { sources.appendingPathComponent("\($0).swift").path }
-let objects = try FileManager.default.contentsOfDirectory(at: build.appendingPathComponent("WorldRuntime.build"), includingPropertiesForKeys: nil)
-    .filter { $0.pathExtension == "o" }.map(\.path)
-let arguments = ["-j1", "-parse-as-library", "-I", build.appendingPathComponent("Modules").path] + sourcePaths +
+let objects = Array(worldRuntimeFlags.dropFirst(2))
+let arguments = ["-j1", "-parse-as-library", "-I", worldRuntimeModules] + sourcePaths +
     [program.path, "-o", temp.appendingPathComponent("test").path] + objects
 let compiled = try run("/usr/bin/swiftc", arguments)
 guard compiled == 0 else { exit(compiled) }

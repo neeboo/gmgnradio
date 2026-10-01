@@ -1368,7 +1368,20 @@ struct PMXRenderTimeline: Equatable, Sendable {
         self.maximumStep = maximumStep
     }
 
-    mutating func advance(to timestamp: TimeInterval) -> TimeInterval {
+    /// Advances the animation clock by the wall time since the previous call,
+    /// scaled by `rate`.
+    ///
+    /// `rate` is how a locomotion clip is retimed against the measured ground
+    /// speed *without touching the animation player*: writing
+    /// `SCNAnimationPlayer.speed` restarts that player at animation time zero,
+    /// and time zero of the retargeted walk clip is the model's rest pose, so
+    /// a per-frame write pins the body to the bind pose for the whole
+    /// displacement. Scaling the clock keeps the clip's phase continuous, and
+    /// `rate == 0` freezes it exactly like the player speed 0 used to.
+    mutating func advance(
+        to timestamp: TimeInterval,
+        rate: TimeInterval = 1
+    ) -> TimeInterval {
         guard timestamp.isFinite else {
             return elapsed
         }
@@ -1381,7 +1394,8 @@ struct PMXRenderTimeline: Equatable, Sendable {
         guard delta > 0 else {
             return elapsed
         }
-        elapsed += min(delta, maximumStep)
+        let scale = rate.isFinite ? max(0, rate) : 1
+        elapsed += min(delta, maximumStep) * scale
         return elapsed
     }
 
@@ -1807,12 +1821,29 @@ public final class PMXStageAvatarRenderer {
     }
 
     func validateAttachmentPoint(_ point: PropAttachmentPoint) throws {
-        guard let modelNode, PMXMaterialCompatibility.isRaw2BModel(modelNode)
+        guard let modelNode, Self.acceptsAttachmentRig(modelNode)
         else { throw PropAttachmentError.unsupportedAvatar }
         guard point.boneNameCandidates.contains(where: {
             modelNode.childNode(withName: $0, recursively: true) != nil
         }) else {
-            throw PropAttachmentError.missingHandBone
+            throw PropAttachmentError.missingBone(point)
+        }
+    }
+
+    /// 能挂物件的 2B 骨架有**两代**，判据落在"这个挂点自己的骨名找不找得到"（上面那条 guard），
+    /// 这里只回答"这是不是一套我们认识的 2B 骨架"：
+    ///
+    /// - 匿名 raw 2B 骨架（`boneNNN`，`isRaw2BModel`）；
+    /// - **作者命名**的标准 PMX（`センター`/`上半身`/`右手首` 这一套）。真机当前激活的就是它
+    ///   （`PresencePackages/.selection.json` → `pmx.2b-miss-0414-standard`；`manifest.json`
+    ///   → `na_2b_0414.pmx`，156 根骨，骨表我逐根解析核过）。
+    ///
+    /// 只认匿名骨架的话，这台机器上**连右手都挂不上**：`isRaw2BModel` 明确要求六根标准 MMD 骨
+    /// 一根都找不到，而这份模型六根全有 ⇒ 每一次挂载都被判 `.unsupportedAvatar`。
+    static func acceptsAttachmentRig(_ model: SCNNode) -> Bool {
+        if PMXMaterialCompatibility.isRaw2BModel(model) { return true }
+        return ["センター", "上半身", "右手首"].allSatisfy {
+            model.childNode(withName: $0, recursively: true) != nil
         }
     }
 
@@ -1827,7 +1858,7 @@ public final class PMXStageAvatarRenderer {
                   modelNode.childNode(withName: $0, recursively: true)
               }).first
         else {
-            throw PropAttachmentError.missingHandBone
+            throw PropAttachmentError.missingBone(point)
         }
         return try PropAttachmentPose.orthonormalized(
             bone.presentation.simdWorldTransform
@@ -2290,7 +2321,13 @@ public final class PMXStageAvatarRenderer {
                 $0.hasPrefix("gmgn.motion.")
             }
         )
-        let speed = min(max(playbackRate, 0.01), 8)
+        // A locomotion clip's rate belongs to the gait contract and is applied
+        // through the render clock (``locomotionPlaybackRate()``), which is
+        // what the old per-frame player-speed write used to override this
+        // value with. Keeping the player at 1 here stops the authored rate and
+        // the gait rate from multiplying, and reproduces that behaviour
+        // exactly without ever re-assigning the player after the load.
+        let speed = locomotion == nil ? min(max(playbackRate, 0.01), 8) : 1
         modelNode.animationPlayer(forKey: Self.motionKey)?.speed = CGFloat(speed)
         oneShotMotionPlayback = PMXOneShotMotionPlayback.begin(
             url: url,
@@ -2372,11 +2409,16 @@ public final class PMXStageAvatarRenderer {
         cameraNode.camera?.projectionTransform = SCNMatrix4(
             camera.projectionTransform
         )
-        let localTime = renderTimeline.advance(to: time)
+        // The locomotion retime is applied to the clock, not to the animation
+        // player: see ``PMXRenderTimeline/advance(to:rate:)``. The player's
+        // speed stays exactly what the clip was loaded with.
+        let localTime = renderTimeline.advance(
+            to: time,
+            rate: Double(locomotionPlaybackRate())
+        )
         sceneRenderer.sceneTime = localTime
         updateRaw2BFootIKTargets()
         updateCoffeeCupAttachment()
-        updateLocomotionPlaybackRate()
         sceneRenderer.render(
             atTime: localTime,
             viewport: CGRect(
@@ -2426,23 +2468,28 @@ public final class PMXStageAvatarRenderer {
         }
     }
 
-    /// Retimes the loaded locomotion motion against the measured ground speed
-    /// each frame. Only changes the CAAnimation player's speed (0 freezes the
-    /// pose without restarting it), so playback phase stays continuous. A nil
-    /// measured speed or a non-locomotion motion leaves the authored rate.
-    private func updateLocomotionPlaybackRate() {
+    /// Retime rate for the loaded locomotion motion against the measured
+    /// ground speed, for the current frame.
+    ///
+    /// This is a **read-only** query. The rate used to be written into
+    /// `SCNAnimationPlayer.speed` on every frame whose value moved by more than
+    /// 0.005. Assigning that property restarts the player at animation time
+    /// zero, and time zero of the retargeted walk clip is the model's rest
+    /// pose, so the measured ground speed's own jitter pinned the walking body
+    /// to the bind pose: the real-machine log shows 56 walk heartbeats and not
+    /// one of them off `pose[左腕=0.0 右腕=0.0 左ひざ=0.0 …]`. The caller feeds
+    /// this into the render clock instead, so the clip's phase stays
+    /// continuous and no clip is ever restarted by a retime.
+    ///
+    /// A nil measured speed or a non-locomotion motion is rate 1 — the
+    /// authored rate. Rate 0 is the standstill freeze (no marching in place).
+    private func locomotionPlaybackRate() -> Float {
         guard let gait = loadedLocomotionGait,
               let measured = locomotionMeasuredSpeed,
-              measured.isFinite,
-              let player = modelNode?.animationPlayer(
-                  forKey: Self.motionKey
-              )
-        else { return }
+              measured.isFinite
+        else { return 1 }
         let rate = gait.playbackRate(forGroundSpeed: measured)
-        let clamped = min(max(rate, 0), StageLocomotionGait.maximumRate)
-        if abs(player.speed - CGFloat(clamped)) > 0.005 {
-            player.speed = CGFloat(clamped)
-        }
+        return min(max(rate, 0), StageLocomotionGait.maximumRate)
     }
 
     /// Resolves the gait for a PMX/VMD locomotion motion. VMD carries no

@@ -78,9 +78,87 @@ guard appSource.contains("(error as? ResidentPropPlacementError) == .environment
     print("FAIL: the backlog must classify the service's own refusal value, not a copy of its text")
     exit(1)
 }
+// 判据分层必须落在**类型**上，而且"全部空间判据"只能出现在空间那一支里 ——
+// 这正是本次要修的形状：登记进库存**不得**被按摆放来判。
+guard serviceText.contains("enum ResidentPropLayoutIntent") else {
+    print("FAIL: the judgement layering must be a type (`ResidentPropLayoutIntent`), not a scattered flag")
+    exit(1)
+}
+guard let inventoryBranch = serviceText.range(of: "case let .inventoryRegistration(objectID):"),
+      let spatialBranch = serviceText.range(of: "case .spatialChange:") else {
+    print("FAIL: `commit` must dispatch on the typed intent (inventory vs spatial)")
+    exit(1)
+}
+let inventoryBody = String(serviceText[inventoryBranch.upperBound..<spatialBranch.lowerBound])
+guard !inventoryBody.contains("validate(state)") else {
+    print("FAIL: the inventory-registration layer must not run the spatial judgement (`validate(state)`)")
+    exit(1)
+}
+guard inventoryBody.contains("validateInventoryRegistration(") else {
+    print("FAIL: the inventory layer must run its own judgement (`validateInventoryRegistration`)")
+    exit(1)
+}
+guard serviceText[spatialBranch.upperBound...].contains("try validate(state)") else {
+    print("FAIL: the spatial layer must still run the full spatial judgement (`validate(state)`)")
+    exit(1)
+}
+// ---- 手持尺寸上限：只有一处定义，判据与文案都读它 -------------------------------
+// 上限与它的"人话"文案**逐字**从生产源码 `PropAttachment.swift` 抽出来（不是在这儿抄一份
+// 数字）：生产里改了，这个 harness 立刻跟着变。这一条同时是"全仓没有第二个写死的 45/0.45"
+// 的门禁部分 —— 判据、拒绝文案、系统提示词三处都必须指向同一份定义。
+let attachmentText = try String(contentsOf: base.appendingPathComponent("Presence/PropAttachment.swift"),
+                                encoding: .utf8)
+func attachmentLine(_ prefix: String, _ what: String) -> String {
+    guard let line = attachmentText.split(separator: "\n")
+        .map({ $0.trimmingCharacters(in: .whitespaces) })
+        .first(where: { $0.hasPrefix(prefix) }) else {
+        print("FAIL: PropAttachment.swift 里找不到\(what)（以 \"\(prefix)\" 开头的声明）")
+        exit(1)
+    }
+    return line
+}
+let holdableMetersLine = attachmentLine("static let holdableLongestEdgeMeters", "手持上限")
+let holdableTextLine = attachmentLine("static var holdableLongestEdgeText", "手持上限文案")
+guard serviceText.contains("<= ResidentPropAttachmentEligibility.holdableLongestEdgeMeters") else {
+    print("FAIL: 手持判据必须读唯一那份上限（`holdableLongestEdgeMeters`），不许写死数字")
+    exit(1)
+}
+guard serviceText.contains("\\(ResidentPropAttachmentEligibility.holdableLongestEdgeText)") else {
+    print("FAIL: 拒绝文案必须与上限同源（插值 `holdableLongestEdgeText`），不许写死数字")
+    exit(1)
+}
+guard appSource.contains("不超过 \\(ResidentPropAttachmentEligibility.holdableLongestEdgeText)") else {
+    print("FAIL: 系统提示词必须与判据同源（插值 `holdableLongestEdgeText`），不许写死数字")
+    exit(1)
+}
+for (name, text) in [("ResidentPropPlacementService.swift", serviceText), ("GMGNRadioApp.swift", appSource)] {
+    guard !text.contains("45 厘米") else {
+        print("FAIL: \(name) 里还有第二处写死的 45 厘米（上限必须只有一处定义）")
+        exit(1)
+    }
+}
+// 工具描述是 agent 真正读到的"能拿多大"（`hold_prop` 的 description），
+// 所以它也必须在同一份定义上：写死一个数就是第二种真相。
+// 注意坑：这里的旧文案是**没有空格**的「45厘米」，只按「45 厘米」搜是搜不到的。
+let toolBridgeText = try String(contentsOf: base.appendingPathComponent("Agent/ResidentPropToolBridge.swift"),
+                                encoding: .utf8)
+guard toolBridgeText.contains("\\(ResidentPropAttachmentEligibility.holdableLongestEdgeText)") else {
+    print("FAIL: 工具描述（hold_prop）必须与上限同源（插值 `holdableLongestEdgeText`），不许写死数字")
+    exit(1)
+}
+guard !toolBridgeText.contains("45厘米") && !toolBridgeText.contains("45 厘米") else {
+    print("FAIL: 工具描述里还有写死的 45 厘米")
+    exit(1)
+}
 let code = #"""
 import Foundation
 import WorldRuntime
+/// 手持上限：**逐字**取自生产源码 `PropAttachment.swift` 的那两行（见本文件上面的抽取器）。
+/// 这里刻意不写数字 —— 断言里也没有第二个上限，改生产那一行这里立刻跟着变。
+enum ResidentPropAttachmentEligibility {
+ \#(holdableMetersLine)
+ \#(holdableTextLine)
+}
 struct Floor: WorldCollisionQuerying {
  func canOccupy(_ c: WorldCapsule,at p: SIMD3<Float>)->Bool { p.x < 9 }
  func groundHeight(at p: SIMD3<Float>)->Float? { 0 }
@@ -286,11 +364,37 @@ let flatWorld=FlatSupport(minimumX:-1,maximumX:5.5,minimumZ:-1,maximumZ:10,heigh
   do { _ = try holding.preview(objectID:"prop2",placement:.init(surfaceID:"floor",position:.init(x:5,y:0,z:5),yaw:0));fatalError("held return footprint was reused") }
   catch let error as ResidentPropPlacementError { require(error == .blockedBySupport(.blockedByPlacedProp("prop1")) || error == .blockedBySupport(.blockedByPlacedProp("prop2")),"wrong held-footprint rejection: \(error)") }
   _ = try holding.commit(holding.returnHeldCommand(objectID:"prop1"),expectedLayoutRevision:4,requestID:"return-footprint")
+  // ---- 手持尺寸闸门：判据、拒绝文案、系统提示词读的是**同一份**上限 --------------
+  // 真机那把「2B 白色长剑」：摆正后的世界尺寸 = 0.1462 × 1.1 × 0.0624，最长边 1.1 m。
+  // 它**必须**拿得起来 —— 改造前 0.45 m 的闸门把它拒在门外，那正是"白色长剑怎么才能
+  // 用手拿着"今天答不出来的唯一原因。
+  let holdSword=WorldGeneratedProp(objectID:"hold-sword",sourceWishID:"wish-hold-sword",
+    assetID:"hold-sword-asset",displayName:"2B 白色长剑",size:.init(x:0.1462,y:1.1,z:0.0624),sourceHeight:1.1)
+  _ = try routing.commit(.register(holdSword),expectedLayoutRevision:routeContext.state.layoutRevision,requestID:"hold-sword-import")
+  // `holdCommand` 对**已登记**物件就判尺寸（不要求已摆出），所以正向用例不需要建完整摆放链。
+  do { _ = try holding.holdCommand(objectID:"hold-sword") }
+  catch { fatalError("1.1 m 的剑必须能手持（上限 \(ResidentPropAttachmentEligibility.holdableLongestEdgeText)）：\(error)") }
+  // 界限**之下**的另一件（真机咖啡机 0.566 m）同样必须拿得起来 ——
+  // "上限抬高之后咖啡机也能拿"是这次改动的必然结果，不是意外。
   let coffeeMachine=WorldGeneratedProp(objectID:"coffee-machine",sourceWishID:"wish-coffee",assetID:"coffee-asset",displayName:"咖啡机",
     size:.init(x:0.35,y:0.42,z:0.566),sourceHeight:1)
-  _ = try routing.commit(.register(coffeeMachine),expectedLayoutRevision:5,requestID:"coffee-import")
-  do { _ = try holding.holdCommand(objectID:"coffee-machine"); fatalError("oversized coffee machine accepted for holding") }
-  catch let error as ResidentPropPlacementError { require(error == .propTooLarge("咖啡机"),"wrong oversized holding rejection") }
+  _ = try routing.commit(.register(coffeeMachine),expectedLayoutRevision:routeContext.state.layoutRevision,requestID:"coffee-import")
+  do { _ = try holding.holdCommand(objectID:"coffee-machine") }
+  catch { fatalError("上限之下的咖啡机必须能手持：\(error)") }
+  // 界限**之上**的（上限 + 0.05 m）必须被拒，而且拒绝文案必须与上限**同源**
+  // （含 `holdableLongestEdgeText`）—— 把文案写死成别的数，这一条就红。
+  let tooLong=WorldGeneratedProp(objectID:"hold-toolong",sourceWishID:"wish-hold-toolong",
+    assetID:"hold-toolong-asset",displayName:"超大件",
+    size:.init(x:ResidentPropAttachmentEligibility.holdableLongestEdgeMeters+0.05,y:0.2,z:0.2),sourceHeight:1)
+  _ = try routing.commit(.register(tooLong),expectedLayoutRevision:routeContext.state.layoutRevision,requestID:"hold-toolong-import")
+  do {
+    _ = try holding.holdCommand(objectID:"hold-toolong")
+    fatalError("超过上限（\(ResidentPropAttachmentEligibility.holdableLongestEdgeText)）的物件被接受去手持了")
+  } catch let error as ResidentPropPlacementError {
+    require(error == .propTooLarge("超大件"),"wrong oversized holding rejection: \(error)")
+    require(error.errorDescription?.contains(ResidentPropAttachmentEligibility.holdableLongestEdgeText) == true,
+      "拒绝文案必须与上限同源（必须含 \(ResidentPropAttachmentEligibility.holdableLongestEdgeText)），实测 \(error.errorDescription ?? "nil")")
+  }
   let huge=WorldManifest(schemaVersion:fixture.schemaVersion,packageID:"huge",packageVersion:"1",worldID:"huge",displayName:"huge",calibration:fixture.calibration,spawn:fixture.spawn,collisionVolumes:[],
    waypoints:[.init(id:"a",position:.init(x:-1e38,y:0,z:0),arrivalRadius:0.2,enabled:true),.init(id:"b",position:.init(x:1e38,y:0,z:0),arrivalRadius:0.2,enabled:true)],
    routes:[.init(id:"huge-route",waypointIDs:["a","b"],bidirectional:true,enabled:true)],activities:[],cameras:[],capabilities:[],resources:[])
@@ -309,13 +413,19 @@ let flatWorld=FlatSupport(minimumX:-1,maximumX:5.5,minimumZ:-1,maximumZ:10,heigh
   }
   catch let error as ResidentPropPlacementError { require(error == .environmentNotReady,"wrong oversized route rejection: \(error)") }
   // ---------------------------------------------------------------------------
-  // 「已领取但入库被拒」：确证卡在哪一步 + 补做台账（真机 2026-10-01 `2B 白色长剑`）
+  // 「已领取但入库被拒」：判据分层（真机 2026-10-01 `2B 白色长剑`）
   //
-  // 真机存档的形状：世界 `objectStates` 里**已经有**已摆出（`isEnabled`）的物件
-  // （存档 `marble-living-cabin/1.2.0/state.json`：斧头 + 咖啡机），此刻领取一件新物件、
-  // 而承托几何拿不到（装修会话没开 ⇒ `support()` 返回 nil，见 `activateResidentPropGrid`
-  // 是**唯一**的激活点）。判定 fail-closed 拒绝 —— 这是**对的**，本测试钉住它不许放宽。
-  // 要修的是"被拒之后没人补做"：由下面的台账断言覆盖。
+  // 真机存档的形状：权威 `world_records` 的 `objects` 域里**已经有**已摆出（`isEnabled`）
+  // 的物件（斧头 + 咖啡机），此刻领取一件新物件，而它在权威里**连一条 `objectStates`
+  // 都没有** —— 没有落点，也没有承托面可言。
+  //
+  // 分层（本次修复，落在类型 `ResidentPropLayoutIntent` 上）：
+  //   * **入库登记**（`.register` / 未摆出物件的 `.resize`）= 归属与资产：
+  //     物件身份、尺寸合法、资产存在且哈希自洽、请求幂等；
+  //   * **摆放**（`.place` / `.withdraw` / `.hold` / `.returnHeld` / `.enableCapability` /
+  //     `.undo` / 已摆出/在手物件的 `.resize`）= **今天全部**空间判据
+  //     （承托面、footprint 互斥、越界、居民不被压住、唯一通路），一个字不放宽。
+  // ---------------------------------------------------------------------------
   let claimedSword = WorldGeneratedProp(objectID:"prop-sword", sourceWishID:"wish-sword",
     assetID:"asset-sword", displayName:"2B 白色长剑（外形摆件）", size:prop.size, sourceHeight:2)
   let swordRequestID = "claimed.4210DB95-9253-4CAF-83A3-3C45F090B099"
@@ -327,34 +437,85 @@ let flatWorld=FlatSupport(minimumX:-1,maximumX:5.5,minimumZ:-1,maximumZ:10,heigh
   _ = try stuckRouting.commit(.register(alreadyPlaced), expectedLayoutRevision:0, requestID:"claimed.axe")
   _ = try stuckRouting.commit(.place(objectID:"prop-axe", placement:.init(surfaceID:"floor",
       position:.init(x:5,y:0,z:5),yaw:0)), expectedLayoutRevision:1, requestID:"place.axe")
+  // (A) **承托几何拿不到**时登记照样成立：库存里的东西不在空间里，没有承托面可判。
+  // 把空间判据接回登记（例如让 `commit` 无条件跑 `validate`）⇒ 这里会以
+  // `.environmentNotReady` 变红。
   let geometryless = ResidentPropPlacementService(context:stuckContext, support:{nil})
-  var refusedWithoutGeometry = false
   do {
     _ = try geometryless.commit(.register(claimedSword),
         expectedLayoutRevision:stuckContext.state.layoutRevision, requestID:swordRequestID)
-  } catch let error as ResidentPropPlacementError {
-    refusedWithoutGeometry = (error == .environmentNotReady)
-    require(error.localizedDescription == "空间碰撞数据尚未准备好，请稍后再摆放。",
-            "the user-visible reason must stay the service's own text")
+  } catch {
+    require(false, "入库登记不得要求承托几何（库存里的东西不在空间里）：\(error)")
   }
-  // 注入"未就绪也放行"（例如删掉 `validate` 里的承托守卫）就死在这一行。
-  require(refusedWithoutGeometry,
-          "registration without support geometry was accepted (fail-closed judgement was widened)")
-  require(stuckContext.state.objectStates["prop-sword"] == nil,
-          "a refused registration must leave no inventory record — this is the stuck state")
-  require(stuckContext.state.layoutReceipts[swordRequestID] == nil,
-          "a refused registration must leave no receipt (real device: no `claimed.4210DB95…` receipt)")
-  // 几何一到，同一条提交立刻成立：变量是"几何在不在"，不是服务、资产或物件本身。
-  _ = try stuckRouting.commit(.register(claimedSword),
-      expectedLayoutRevision:stuckContext.state.layoutRevision, requestID:swordRequestID)
   require(stuckContext.state.objectStates["prop-sword"]?.generatedProp != nil,
-          "with support geometry the same registration must land in inventory")
-  // 幂等（既有幂等键 `claimed.<jobID>`）：同一回执再放一次**不写第二遍**。
+          "with no support geometry the registration must still land in inventory")
+  require(stuckContext.state.objectStates["prop-sword"]?.isEnabled == false,
+          "an inventory registration must not put the object into space")
+  require(stuckContext.state.objectStates["prop-sword"]?.supportSurfaceID == nil,
+          "the real sword has no landing point at all (no support surface recorded)")
+  require(stuckContext.state.layoutReceipts[swordRequestID] != nil,
+          "a successful registration must leave the existing `claimed.<jobID>` receipt")
+  // 既有那件不回归：仍在库存、仍已摆出。
+  require(stuckContext.state.objectStates["prop-axe"]?.isEnabled == true,
+          "the already-placed axe must stay placed")
+  // (B) 幂等：同一 `claimed.<jobID>` 重放**不写第二条**、也不涨 `layoutRevision`。
   let afterSwordRegister = stuckContext.state
-  _ = try stuckRouting.commit(.register(claimedSword),
+  _ = try geometryless.commit(.register(claimedSword),
       expectedLayoutRevision:afterSwordRegister.layoutRevision, requestID:swordRequestID)
   require(stuckContext.state == afterSwordRegister,
           "a replayed `claimed.<jobID>` receipt must not write a second inventory record")
+  require(stuckContext.state.layoutRevision == afterSwordRegister.layoutRevision,
+          "a replayed `claimed.<jobID>` receipt must not grow the layout revision")
+  // (C) 真机形状：房间里已摆出的东西**不在当前网格的承托层上**。真机那把斧头就是这样
+  //     （y=-0.058583736，而冷派生出的网格里它那一列整列没有层：它自己的阻挡体积把
+  //     那一列从 BFS 里挤掉了）。**摆放**会因此被拒（下面钉住），但**登记不许多看它一眼**。
+  let offGridContext = try WorldAgentContext(manifest:fixture)
+  offGridContext.installCollisionWorld(Floor())
+  let offGridService = ResidentPropPlacementService(context:offGridContext, support:{flatSupport(fixture)})
+  let offGridProp = WorldGeneratedProp(objectID:"prop-offgrid", sourceWishID:"wish-offgrid",
+    assetID:"asset-offgrid", displayName:"斧头", size:prop.size, sourceHeight:2)
+  _ = try offGridService.commit(.register(offGridProp), expectedLayoutRevision:0, requestID:"offgrid-register")
+  // 用世界自己的提交入口摆到合成平面之外（这一条刻意绕开服务：它要造的是"已摆出但不在
+  // 任何承托层上"这个**现状**，正是真机冷派生之后斧头的样子）。
+  _ = try offGridContext.commitPropLayout(.place(objectID:"prop-offgrid",
+      placement:.init(surfaceID:"off", position:.init(x:40,y:0,z:40), yaw:0)),
+      expectedLayoutRevision:offGridContext.state.layoutRevision, requestID:"offgrid-place") { _ in }
+  require(offGridContext.state.objectStates["prop-offgrid"]?.isEnabled == true,
+          "the fixture must really contain an object that is placed and off the support grid")
+  let secondSword = WorldGeneratedProp(objectID:"prop-sword2", sourceWishID:"wish-sword2",
+    assetID:"asset-sword2", displayName:"2B 白色长剑（外形摆件）", size:prop.size, sourceHeight:2)
+  do {
+    _ = try offGridService.commit(.register(secondSword),
+        expectedLayoutRevision:offGridContext.state.layoutRevision, requestID:"claimed.second-sword")
+  } catch {
+    require(false, "入库登记被**别的**已摆物件的位置判据拒了（判据用错层）：\(error)")
+  }
+  require(offGridContext.state.objectStates["prop-sword2"]?.generatedProp != nil,
+          "the second sword must be in inventory even though the room holds an off-grid placed prop")
+  // 同一条路、同一份几何：**摆放**仍然按今天全部判据拒绝（空间判据一个字没放宽）。
+  do {
+    _ = try offGridService.commit(.place(objectID:"prop-sword2",
+        placement:.init(surfaceID:"floor", position:.init(x:5,y:0,z:5), yaw:0)),
+        expectedLayoutRevision:offGridContext.state.layoutRevision, requestID:"offgrid-place-sword")
+    require(false, "a placement must still be judged against every placed prop (off-grid one included)")
+  } catch let error as ResidentPropPlacementError {
+    require(error == .unknownSurface, "the placement refusal must still be the support-surface judgement: \(error)")
+  }
+  // (D) 入库那一层**不是空判据**：资产/归属判据（宿主注入的 `prepare`）拒绝时登记必须跟着拒绝。
+  let assetRejecting = ResidentPropPlacementService(context:offGridContext,
+    support:{flatSupport(fixture)}, prepare:{ _ in throw NSError(domain:"asset", code:1) })
+  let thirdSword = WorldGeneratedProp(objectID:"prop-sword3", sourceWishID:"wish-sword3",
+    assetID:"asset-sword3", displayName:"2B 白色长剑（外形摆件）", size:prop.size, sourceHeight:2)
+  var assetRefusal = false
+  do {
+    _ = try assetRejecting.commit(.register(thirdSword),
+        expectedLayoutRevision:offGridContext.state.layoutRevision, requestID:"claimed.third-sword")
+  } catch { assetRefusal = true }
+  require(assetRefusal, "the inventory layer must still refuse when the ownership/asset judgement refuses")
+  require(offGridContext.state.objectStates["prop-sword3"] == nil,
+          "a refused registration must leave no inventory record")
+  require(offGridContext.state.layoutReceipts["claimed.third-sword"] == nil,
+          "a refused registration must leave no receipt")
 
   // 台账：被拒之后**记住**，几何就绪那一刻补做，且同一件只报一次。
   var backlog = ResidentPropInventoryBacklog()
@@ -406,7 +567,7 @@ let flatWorld=FlatSupport(minimumX:-1,maximumX:5.5,minimumZ:-1,maximumZ:10,heigh
           "the task row detail must carry the same promise and the same reason")
 
   print("PASS: layout preview, atomic save including hold, reserved footprint, collision recovery, bounds and stop checks")
-  print("PASS: claimed-prop inventory backlog (refused register keeps a visible pending entry, re-attempts once, idempotent, fail-closed intact)")
+  print("PASS: claimed-prop inventory layering (registration judges ownership/assets only — no support geometry, no other placed prop's position; placement still judged by every spatial rule; idempotent `claimed.<jobID>`; asset refusal still refuses)")
  }
 }
 """#
@@ -415,11 +576,25 @@ try FileManager.default.createDirectory(at:tmp,withIntermediateDirectories:true)
 defer { try? FileManager.default.removeItem(at:tmp) }
 let source=tmp.appendingPathComponent("Test.swift"); try code.write(to:source,atomically:true,encoding:.utf8)
 func run(_ binary:String,_ args:[String])throws->Int32 { let p=Process();p.executableURL=URL(fileURLWithPath:binary);p.arguments=args;try p.run();p.waitUntilExit();return p.terminationStatus }
-let build=root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug")
+// WorldRuntime 的模块搜索路径 + 目标文件**只有一处定义**：tools/world-runtime-harness-flags.sh。
+// 不要在这里拼 `.build/...`：27 份各自拼写正是 SwiftPM 与 xcodebuild 两份模块并存的根因。
+// `build` 由那唯一一份定义**推出来**（= Modules 的上一级），本文件不持有路径字面量。
+func worldRuntimeHarnessFlags() -> [String] {
+    let process = Process(), pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = [FileManager.default.currentDirectoryPath + "/tools/world-runtime-harness-flags.sh"]
+    process.standardOutput = pipe
+    try? process.run(); process.waitUntilExit()
+    guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
+    return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .split(separator: "\n").map(String.init)
+}
+let worldRuntimeFlags = worldRuntimeHarnessFlags()
+let build = URL(fileURLWithPath: worldRuntimeFlags[1]).deletingLastPathComponent()
 let objects=try FileManager.default.contentsOfDirectory(at:build.appendingPathComponent("WorldRuntime.build"),includingPropertiesForKeys:nil).filter{$0.pathExtension=="o"}.map(\.path)
 let binary=tmp.appendingPathComponent("test")
 let result=try run("/usr/bin/swiftc",["-j1","-parse-as-library","-I",build.appendingPathComponent("Modules").path,base.appendingPathComponent("Agent/WorldAgentContext.swift").path,service.path,source.path,"-o",binary.path]+objects)
 guard result==0 else { exit(result) }
 let status=try run(binary.path,[])
-print("PASS: claimed-prop inventory wiring (refusal remembered, geometry-ready callback drains, existing receipt key, no timer, 「我的物件」 list reads the inventory record only)")
+print("PASS: claimed-prop inventory wiring (judgement layering is a type, inventory layer never runs `validate`, spatial layer still runs it; geometry-ready callback drains; existing receipt key; no timer; 「我的物件」 list reads the inventory record only)")
 exit(status)

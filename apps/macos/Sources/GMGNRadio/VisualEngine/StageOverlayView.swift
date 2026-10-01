@@ -138,23 +138,20 @@ struct WishMachineTaskStatusView: View {
                                                 .font(.system(size: 8))
                                             Text(task.title).lineLimit(1)
                                             Spacer(minLength: 2)
-                                            Text(task.status).foregroundStyle(.white.opacity(0.75)).lineLimit(1)
+                                            // **一句现状**：整行只有这一句状态，由三轴派生
+                                            // （`WishMachineTaskPresentation.currentStatusLine`，
+                                            // 三轴 → 文案 的判断在投影里那唯一一处）。
+                                            // 这里不渲染"生成/归属/摆放"三个标签，也**不在这里
+                                            // 拼任何状态文案** —— 拼一份就是第二份真相。
+                                            Text(task.currentStatusLine)
+                                                .foregroundStyle(.white.opacity(0.75)).lineLimit(1)
+                                                .accessibilityIdentifier("resident.wish-task.\(task.id.uuidString).status")
                                         }
                                         .font(.system(size: 11, weight: .medium))
                                         // **任务行只表达它自己的三轴状态（生成/归属/摆放）。**
                                         // 授权在全局开关（autonomyBanner）上，连通性在全局横幅
                                         // （connectivityBanner）上；任务行上不存在任何按任务的
                                         // "停止/恢复"控件 —— "能不能自主"不是任务状态。
-                                        if !compact, let axes = task.axes {
-                                            HStack(spacing: 4) {
-                                                axisChip("生成", axes.generation.label)
-                                                    .accessibilityIdentifier("resident.wish-task.\(task.id.uuidString).generation")
-                                                axisChip("归属", axes.ownership.label)
-                                                    .accessibilityIdentifier("resident.wish-task.\(task.id.uuidString).ownership")
-                                                axisChip("摆放", axes.placement.label)
-                                                    .accessibilityIdentifier("resident.wish-task.\(task.id.uuidString).placement")
-                                            }
-                                        }
                                         if !compact, let detail = task.detail, !detail.isEmpty {
                                             Text(detail)
                                                 .font(.system(size: 10))
@@ -163,7 +160,7 @@ struct WishMachineTaskStatusView: View {
                                         }
                                     }
                                     .frame(maxWidth: .infinity, alignment: .leading)
-                                    .help([task.title, task.status, task.detail].compactMap { $0 }.joined(separator: "\n"))
+                                    .help([task.title, task.currentStatusLine, task.detail].compactMap { $0 }.joined(separator: "\n"))
                                     .accessibilityElement(children: .combine)
                                     .accessibilityIdentifier("resident.wish-task.\(task.id.uuidString)")
                                 }
@@ -178,20 +175,6 @@ struct WishMachineTaskStatusView: View {
                 }
             }
         }
-    }
-
-    /// 三轴里的一格：只说"哪条轴 = 现在是什么"。任务行不在这里表达授权或连通性。
-    @ViewBuilder
-    private func axisChip(_ title: String, _ value: String) -> some View {
-        HStack(spacing: 3) {
-            Text(title).foregroundStyle(.white.opacity(0.45))
-            Text(value).foregroundStyle(.white.opacity(0.85))
-        }
-        .font(.system(size: 9))
-        .lineLimit(1)
-        .padding(.horizontal, 5)
-        .padding(.vertical, 2)
-        .background(Color.white.opacity(0.08), in: Capsule())
     }
 
     /// **连通性是全局事实，不是任务属性。**

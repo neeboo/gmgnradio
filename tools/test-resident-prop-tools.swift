@@ -256,8 +256,20 @@ let file=temporary.appendingPathComponent("Test.swift")
 try harness.write(to:file,atomically:true,encoding:.utf8)
 let exe=temporary.appendingPathComponent("test")
 func run(_ binary:String,_ args:[String]) throws->Int32{let p=Process();p.executableURL=URL(fileURLWithPath:binary);p.arguments=args;try p.run();p.waitUntilExit();return p.terminationStatus}
-let build=root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug")
-let objects=try FileManager.default.contentsOfDirectory(at:build.appendingPathComponent("WorldRuntime.build"),includingPropertiesForKeys:nil).filter{$0.pathExtension == "o"}.map(\.path)
-let code=try run("/usr/bin/swiftc",["-j1","-parse-as-library","-I",build.appendingPathComponent("Modules").path,sources.appendingPathComponent("Agent/WorldAgentContext.swift").path,sources.appendingPathComponent("Presence/ResidentPropPlacementService.swift").path,bridge.path,file.path,"-o",exe.path]+objects)
+// WorldRuntime 的模块搜索路径 + 目标文件**只有一处定义**：tools/world-runtime-harness-flags.sh。
+// 不要在这里拼 `.build/...`：27 份各自拼写正是 SwiftPM 与 xcodebuild 两份模块并存的根因。
+func worldRuntimeHarnessFlags() -> [String] {
+    let process = Process(), pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = [FileManager.default.currentDirectoryPath + "/tools/world-runtime-harness-flags.sh"]
+    process.standardOutput = pipe
+    try? process.run(); process.waitUntilExit()
+    guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
+    return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .split(separator: "\n").map(String.init)
+}
+let worldRuntimeFlags = worldRuntimeHarnessFlags()
+let objects=Array(worldRuntimeFlags.dropFirst(2))
+let code=try run("/usr/bin/swiftc",["-j1","-parse-as-library","-I",worldRuntimeFlags[1],sources.appendingPathComponent("Agent/WorldAgentContext.swift").path,sources.appendingPathComponent("Presence/ResidentPropPlacementService.swift").path,bridge.path,root.appendingPathComponent("tools/fixtures/ResidentPropHoldLimitShim.swift").path,file.path,"-o",exe.path]+objects)
 guard code == 0 else{exit(code)}
 exit(try run(exe.path,[]))

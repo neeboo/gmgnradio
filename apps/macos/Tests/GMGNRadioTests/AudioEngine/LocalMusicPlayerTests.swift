@@ -101,12 +101,25 @@ private final class LocalMusicPlaybackGraphSpy: LocalMusicPlaybackGraph {
     private(set) var pauseCallCount = 0
     private(set) var stopCallCount = 0
 
+    /// 这份 spy 模拟的是**真的会出声**的图：`play()` 之后它自报在播。
+    /// `LocalMusicPlayer` 的"出声"判据要求图自己给出事实，spy 也必须给出。
+    private var rendering = false
+    private var startedAt: Date?
+    var isPlaying: Bool {
+        rendering
+    }
+    var playbackPosition: TimeInterval {
+        guard rendering, let startedAt else { return 0 }
+        return Date().timeIntervalSince(startedAt)
+    }
+
     func load(
         _ url: URL,
         completion: @escaping @MainActor @Sendable () -> Void
     ) throws -> LocalTrack {
         loadCallCount += 1
         stopCallCount += 1
+        rendering = false
         completions.append(completion)
         return LocalTrack(
             url: url,
@@ -117,20 +130,28 @@ private final class LocalMusicPlaybackGraphSpy: LocalMusicPlaybackGraph {
 
     func play() throws {
         playCallCount += 1
+        rendering = true
+        startedAt = Date()
     }
 
     func pause() {
         pauseCallCount += 1
+        rendering = false
+        startedAt = nil
     }
 
     func stop() {
         stopCallCount += 1
+        rendering = false
+        startedAt = nil
     }
 
     func finish(at index: Int? = nil) {
         guard !completions.isEmpty else {
             return
         }
+        rendering = false
+        startedAt = nil
         completions[index ?? completions.count - 1]()
     }
 }

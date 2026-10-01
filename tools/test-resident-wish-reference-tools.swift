@@ -3,6 +3,20 @@
 // against a fake public API response and a fake local-acceptance daemon only.
 import Foundation
 
+// WorldRuntime 的模块搜索路径与目标文件**只有一处定义**：tools/world-runtime-harness-flags.sh。
+// harness 一律调用它，绝不自己拼 `.build/...`（27 份各自拼写正是 SwiftPM 模块与 xcodebuild
+// `Products/Debug` 旧模块两份并存的根因，后者报 `WorldQuaternion` 没有 `identity`）。
+func worldRuntimeHarnessFlags() -> [String] {
+    let process = Process(), pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = [FileManager.default.currentDirectoryPath + "/tools/world-runtime-harness-flags.sh"]
+    process.standardOutput = pipe
+    try? process.run(); process.waitUntilExit()
+    guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
+    return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .split(separator: "\n").map(String.init)
+}
+
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let sources = root.appendingPathComponent("apps/macos/Sources/GMGNRadio")
 let referenceSource = sources.appendingPathComponent("Agent/ResidentWishReferenceTools.swift")
@@ -617,7 +631,8 @@ try harness.write(to: main, atomically: true, encoding: .utf8)
 let binary = work.appendingPathComponent("checks")
 let compile = Process()
 compile.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
-compile.arguments = ["-swift-version", "6", "-j1", "-parse-as-library",
+compile.arguments = ["-swift-version", "6", "-j1", "-parse-as-library"]
+    + worldRuntimeHarnessFlags() + [
     sources.appendingPathComponent("Presence/PropGenerationClient.swift").path,
     sources.appendingPathComponent("Presence/PropGenerationStore.swift").path,
     sources.appendingPathComponent("Presence/PropImagePreparation.swift").path,

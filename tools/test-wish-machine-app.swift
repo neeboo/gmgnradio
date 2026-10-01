@@ -29,7 +29,10 @@ check(app.contains("continuationResumeAuthorizationID: allowsPausedWishClaim ? m
 check(app.contains("resumePlacementStatus:") && app.contains("placedState.generatedProp != nil") && app.contains("return placedState.isEnabled"), "resuming a claimed wish reads actual owned world state to prevent duplicate placement")
 check(app.contains("UUID(uuidString: placedState.generatedProp?.sourceWishID ?? \"\") == job.id"), "resume readback validates the generated prop belongs to the same wish")
 check(app.contains("resume_wish_continuation") && app.contains("仅更新居民意图不会恢复许愿授权"), "prompt distinguishes wish authorization restoration from loop intent restoration")
-check(app.contains("正式领取且最长边不超过 45 厘米的小道具"), "resident prompt must describe the actual hand-held size boundary")
+// 系统提示词里的手持上限必须与判据**同源**：这里钉的是**插值位**，不是数字 ——
+// 提示词里写死任何一个数（哪怕恰好等于上限）都会红，因为上限改了它不会跟着改。
+check(app.contains("正式领取且最长边不超过 \\(ResidentPropAttachmentEligibility.holdableLongestEdgeText)的小道具"), "resident prompt must describe the actual hand-held size boundary by interpolating the single limit definition")
+check(!app.contains("45 厘米"), "resident prompt must not hardcode a second copy of the hand-held size boundary")
 check(app.contains("当前已适配的 2B 右手"), "resident prompt must identify the currently supported avatar hand")
 check(app.contains("hold_prop、adjust_held_prop_grip、return_held_prop"), "resident prompt must direct the agent to formal held-prop tools")
 check(!app.contains("没有冲泡、战斗或手持功能"), "resident prompt must not deny the implemented hand-held capability")

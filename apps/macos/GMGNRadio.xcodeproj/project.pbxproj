@@ -39,6 +39,7 @@
 		18D95198C844925F1128A3A8 /* PlaybackPreflight.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A51F3C676423186E826820 /* PlaybackPreflight.swift */; };
 		1A2BC997A7C386773F8963A6 /* DuckingEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = D25733DF25D5A2B074A49C2F /* DuckingEnvelope.swift */; };
 		1B17067E6E5406867B2F3E18 /* RealtimeDJSessionControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3559685E6AD36B0070B98424 /* RealtimeDJSessionControllerTests.swift */; };
+		1BCCBF702B0008424A46D3A1 /* PropGripInference.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBC8B03D49EAAC3199530E0E /* PropGripInference.swift */; };
 		1C3A5B8FF3F65A4910CE3018 /* ProgramVisualDirectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 575C2E8050A211BF521B0F6F /* ProgramVisualDirectorTests.swift */; };
 		1D3A678C00AF1D35FCCBAE90 /* ResidentLoopTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = D3C574D570AA01A8B19AD9AD /* ResidentLoopTools.swift */; };
 		1ED568F6F97B33E89F70EDA2 /* FoliaSceneDetailModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5D8847A424483823D23948A0 /* FoliaSceneDetailModels.swift */; };
@@ -180,6 +181,7 @@
 		964267DB09DF0C90FA77AA4B /* ResidentMusicToolBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = F904758C6A09AFB3E4669F60 /* ResidentMusicToolBridge.swift */; };
 		9653E38E38BFF4C976625281 /* AgentProgramPlanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91AE9B5CC47487FE7A0A86CE /* AgentProgramPlanner.swift */; };
 		966720FCB35C2DA9CD0439C1 /* PresenceSettingsModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07A8377E0830ED4ED8D57DB6 /* PresenceSettingsModel.swift */; };
+		96CBD8107E93FEABEB75D0D3 /* PropAttachmentSlot.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFD4AFB29135D0E00D93E4E9 /* PropAttachmentSlot.swift */; };
 		976213343175CDB4D7634C92 /* ResidentLocomotionMotionPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30C49D1F8B1D6E86CA04C0B3 /* ResidentLocomotionMotionPolicy.swift */; };
 		977A6550B9EDEDE80B2D0915 /* PropImagePreparation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7042ABB00311D453A5D5E557 /* PropImagePreparation.swift */; };
 		979D7A111DA0058F6F64F12A /* StageParticleGeometryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F64257C748D0B7218B3CCDD1 /* StageParticleGeometryTests.swift */; };
@@ -510,6 +512,7 @@
 		BBAA0158B7BFF631FD685449 /* DJState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DJState.swift; sourceTree = "<group>"; };
 		BBB583E2AA3BD7F6DA17AED6 /* DJStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DJStateTests.swift; sourceTree = "<group>"; };
 		BBB9CA08DB935D4F73EBCAA7 /* PresenceSettingsModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceSettingsModelTests.swift; sourceTree = "<group>"; };
+		BBC8B03D49EAAC3199530E0E /* PropGripInference.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PropGripInference.swift; sourceTree = "<group>"; };
 		BCDF0B028ECB022DE9E68D0E /* StageRenderSurfaceController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageRenderSurfaceController.swift; sourceTree = "<group>"; };
 		BDCE4DF69A7F8E8FCB4244B2 /* StagePresentationModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StagePresentationModelTests.swift; sourceTree = "<group>"; };
 		BF9A4902E75F2E8D7081C852 /* OrbRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbRenderer.swift; sourceTree = "<group>"; };
@@ -535,6 +538,7 @@
 		CB7307989361CD9BA9432B67 /* FoliaSceneRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FoliaSceneRuntime.swift; sourceTree = "<group>"; };
 		CE18DAB4452CEAD1448BC100 /* VMDToVRMClipAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VMDToVRMClipAdapter.swift; sourceTree = "<group>"; };
 		CE95E971E1A8C2085882DD3C /* Immersive.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Immersive.metal; sourceTree = "<group>"; };
+		CFD4AFB29135D0E00D93E4E9 /* PropAttachmentSlot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PropAttachmentSlot.swift; sourceTree = "<group>"; };
 		D25733DF25D5A2B074A49C2F /* DuckingEnvelope.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DuckingEnvelope.swift; sourceTree = "<group>"; };
 		D3C574D570AA01A8B19AD9AD /* ResidentLoopTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentLoopTools.swift; sourceTree = "<group>"; };
 		D40A78C216C16AF9A7BF4F96 /* SpatialEnvironmentEffectsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpatialEnvironmentEffectsView.swift; sourceTree = "<group>"; };
@@ -981,10 +985,12 @@
 				E10077CC5B0FFD300B288B48 /* PresenceManifest.swift */,
 				4BC287B276AB0F4EDFACFE51 /* PresencePackageStore.swift */,
 				52DE13F25FFCC1705453AA9D /* PropAttachment.swift */,
+				CFD4AFB29135D0E00D93E4E9 /* PropAttachmentSlot.swift */,
 				E6B98D23C9CD0B46A51B0153 /* PropGenerationClient.swift */,
 				CB1CE401DC46221687D05BF6 /* PropGenerationConfiguration.swift */,
 				22092892913901B6B9A639FF /* PropGenerationStore.swift */,
 				03A877215EBD7A9A904CDBD1 /* PropGenerationWorkflowCollision.swift */,
+				BBC8B03D49EAAC3199530E0E /* PropGripInference.swift */,
 				7042ABB00311D453A5D5E557 /* PropImagePreparation.swift */,
 				A06778F3534FE1B87C9D3FC7 /* PropSupportGridMapping.swift */,
 				8C764576419E37F7B13BAB58 /* PropSupportGridPicker.swift */,
@@ -1520,11 +1526,13 @@
 				FF00236614D842DFE0D2FF7A /* ProgramVisualCue.swift in Sources */,
 				DDF647CA9001A4919EA82834 /* ProgramVisualDirector.swift in Sources */,
 				A4A8744CADC96C7185CFF12C /* PropAttachment.swift in Sources */,
+				96CBD8107E93FEABEB75D0D3 /* PropAttachmentSlot.swift in Sources */,
 				98FA1863591C47A4ED8427FF /* PropGenerationClient.swift in Sources */,
 				A5D9DB6B72442AA994536F5E /* PropGenerationConfiguration.swift in Sources */,
 				A6C74A559603EC578B1554EC /* PropGenerationSettingsSection.swift in Sources */,
 				F6DB346A7C0E9037A9199668 /* PropGenerationStore.swift in Sources */,
 				9D2202699E9D276547189632 /* PropGenerationWorkflowCollision.swift in Sources */,
+				1BCCBF702B0008424A46D3A1 /* PropGripInference.swift in Sources */,
 				977A6550B9EDEDE80B2D0915 /* PropImagePreparation.swift in Sources */,
 				68D169AB1772AA516F212FB1 /* PropSupportGrid.metal in Sources */,
 				CC440250E8A26020325CFFF4 /* PropSupportGridMapping.swift in Sources */,

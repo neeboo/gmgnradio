@@ -1,6 +1,24 @@
 import Foundation
+// WorldRuntime 的模块搜索路径与目标文件**只有一处定义**：tools/world-runtime-harness-flags.sh。
+// harness 一律调用它，绝不自己拼 `.build/...`（27 份各自拼写正是 SwiftPM 模块与 xcodebuild
+// `Products/Debug` 旧模块两份并存的根因，后者报 `WorldQuaternion` 没有 `identity`）。
+func worldRuntimeHarnessFlags() -> [String] {
+    let process = Process(), pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = [FileManager.default.currentDirectoryPath + "/tools/world-runtime-harness-flags.sh"]
+    process.standardOutput = pipe
+    try? process.run(); process.waitUntilExit()
+    guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
+    return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .split(separator: "\n").map(String.init)
+}
 let source = "apps/macos/Sources/GMGNRadio/Presence/WishMachineOutputDescriptor.swift"
+// `PropSizeIntent` 是 **App 侧**的类型（`PropGenerationClient.swift` 拥有它，不是 WorldRuntime
+// 的）。描述符引用它，所以那份真源码必须一起编进来 —— 编同一份，不是在这里补个同名 stub。
+// （这条与 WorldRuntime 无关，是本 harness 自己漏挂的旧账：HEAD 上就已经缺它。）
+let sizeIntentSource = "apps/macos/Sources/GMGNRadio/Presence/PropGenerationClient.swift"
 guard FileManager.default.fileExists(atPath:source) else { print("FAIL: no metre-scale, world-scoped wish output contract");exit(1) }
+guard FileManager.default.fileExists(atPath:sizeIntentSource) else { print("FAIL: PropSizeIntent owner source is missing");exit(1) }
 let harness = #"""
 import Foundation
 import simd
@@ -47,6 +65,6 @@ defer {try? FileManager.default.removeItem(at:temp)}
 let test=temp.appendingPathComponent("main.swift"), executable=temp.appendingPathComponent("check")
 try harness.write(to:test,atomically:true,encoding:.utf8)
 func run(_ path:String,_ args:[String]) throws->Int32 {let p=Process();p.executableURL=URL(fileURLWithPath:path);p.arguments=args;try p.run();p.waitUntilExit();return p.terminationStatus}
-let code=try run("/usr/bin/nice",["-n","15","/usr/bin/swiftc","-j1","-parse-as-library",source,test.path,"-o",executable.path])
+let code=try run("/usr/bin/nice",["-n","15","/usr/bin/swiftc","-j1","-parse-as-library"]+worldRuntimeHarnessFlags()+[sizeIntentSource,source,test.path,"-o",executable.path])
 guard code == 0 else {exit(code)}
 exit(try run(executable.path,Array(CommandLine.arguments.dropFirst())))

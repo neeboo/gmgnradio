@@ -187,8 +187,7 @@ public struct WorldSimulation: Sendable {
                 throw WorldPropLayoutError.heldPropAlreadyExists(objectID: held.objectID)
             }
             guard !avatarAssetID.isEmpty, avatarAssetID.count <= 256,
-                  calibration.isValid, calibration.avatarAssetID == avatarAssetID,
-                  calibration.hand == .rightHand else {
+                  calibration.isValid, calibration.avatarAssetID == avatarAssetID else {
                 throw WorldPropLayoutError.invalidGripCalibration
             }
             guard var item = state.objectStates[id], item.generatedProp?.objectID == id else {
@@ -199,10 +198,12 @@ public struct WorldSimulation: Sendable {
             let returnState = item
             item.isEnabled = false
             next.objectStates[id] = item
+            // 挂在哪个挂点是**标定自己说的话**（`calibration.hand`），不是这里再判一次
+            // "必须是右手"：旧存档仍然是 `rightHand`，行为逐字节不变。
             next.heldProp = WorldHeldProp(
                 objectID: id,
                 avatarAssetID: avatarAssetID,
-                hand: .rightHand,
+                hand: calibration.hand,
                 returnState: returnState
             )
         case let .adjustGrip(id, avatarAssetID, calibration):
@@ -211,8 +212,7 @@ public struct WorldSimulation: Sendable {
                 throw WorldPropLayoutError.invalidGripCalibration
             }
             guard var held = state.heldProp,
-                  held.objectID == id, held.avatarAssetID == avatarAssetID,
-                  held.hand == calibration.hand else {
+                  held.objectID == id, held.avatarAssetID == avatarAssetID else {
                 throw WorldPropLayoutError.heldPropMismatch
             }
             guard calibration.avatarAssetID == avatarAssetID else {
@@ -225,6 +225,9 @@ public struct WorldSimulation: Sendable {
             let json = String(decoding: try JSONEncoder().encode(calibration), as: UTF8.self)
             item.metadata["gmgn.prop-grip.v1"] = json
             held.returnState.metadata["gmgn.prop-grip.v1"] = json
+            // 挂点跟着标定走：`.adjustGrip` 就是"把这件东西挪到另一个挂点/微调它的姿势"
+            // 那条既有命令。`returnState` 一个字不改 —— 放回哪儿仍然是拿起前那一处。
+            held.hand = calibration.hand
             next.objectStates[id] = item
             next.heldProp = held
         case let .returnHeld(id, avatarAssetID):

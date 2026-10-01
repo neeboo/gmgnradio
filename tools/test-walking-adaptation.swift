@@ -83,10 +83,63 @@ let loaderApply = declaration("static func applyLocomotion(", in: loader)
 let loaderGait = declaration("static func locomotionGait(", in: loader)
 let loaderHips = declaration("static func measureHipsRestHeight(", in: loader)
 let pmxGait = declaration("static func locomotionGait(", in: pmx)
+let pmxTimeline = declaration("struct PMXRenderTimeline", in: pmx)
 let executorBody = executorSource.replacingOccurrences(
     of: "import WorldRuntime", with: "")
 let defaultMotionPolicy = try read(
     "apps/macos/Sources/GMGNRadio/Presence/ResidentLocomotionMotionPolicy.swift")
+
+// ---------------------------------------------------------------------------
+// The retime must never restart the clip it is retiming.
+//
+// This is the break these guards exist for, and it is the one the older
+// "renderer reads the movement-driven channel" assertion could not see: the
+// host *did* hand the walk clip to the PMX renderer, the clip *was* installed
+// and its player *was* running at the retimed rate, and the body was still
+// drawn in the bind pose. Assigning `SCNAnimationPlayer.speed` mid-playback
+// restarts that player at animation time zero, animation time zero of the
+// retargeted walk clip is the model's rest pose, and the measured ground
+// speed's own jitter trips the >0.005 guard on nearly every frame, so the
+// player never gets past frame zero. On the device that is 56 walking
+// heartbeats and not one of them off `pose[左腕=0.0 右腕=0.0 左ひざ=0.0 …]`,
+// while the executor kept reporting `walkClip=true`.
+//
+// The retime therefore has to ride the render clock, which scales the clip's
+// phase and never rewinds it.
+guard let retimeStart = pmx.range(of: "private func locomotionPlaybackRate() -> Float")
+else {
+    print("FAIL: the PMX renderer must expose a read-only locomotion retime rate")
+    exit(1)
+}
+var retimeDepth = 0
+var retimeEnd = retimeStart.upperBound
+for index in pmx[retimeStart.upperBound...].indices {
+    if pmx[index] == "{" { retimeDepth += 1 }
+    if pmx[index] == "}" {
+        retimeDepth -= 1
+        if retimeDepth == 0 { retimeEnd = index; break }
+    }
+}
+let locomotionRetime = String(pmx[retimeStart.lowerBound...retimeEnd])
+guard !locomotionRetime.contains(".speed ="),
+      !locomotionRetime.contains("animationPlayer(")
+else {
+    print("FAIL: the locomotion retime writes SCNAnimationPlayer.speed; assigning that property restarts the clip at animation time zero, which is the bind pose for the retargeted walk clip, so the body is drawn standing while the renderer reports the walk clip")
+    exit(1)
+}
+guard pmx.contains("rate: Double(locomotionPlaybackRate())"),
+      pmx.contains("elapsed += min(delta, maximumStep) * scale")
+else {
+    print("FAIL: the locomotion retime must be applied by scaling the render clock, not by restarting the animation player")
+    exit(1)
+}
+let playerSpeedWrites = pmx.components(separatedBy: ".speed = ").count - 1
+guard playerSpeedWrites == 1,
+      declaration("private func installMotion(", in: pmx).contains(".speed = CGFloat(speed)")
+else {
+    print("FAIL: SCNAnimationPlayer.speed may only be written once, at load time; a second write is a mid-playback restart")
+    exit(1)
+}
 
 let harness = #"""
 import Foundation
@@ -126,6 +179,10 @@ enum StageMotionFormat: String { case procedural, vrma, vmd }
 
 \#(telemetryDecl)
 \#(gaitDecl)
+
+// MARK: The render clock the PMX locomotion retime rides (PMXStageAvatarRenderer.swift)
+
+\#(pmxTimeline)
 
 // MARK: Full production loader compiled against inert shims
 
@@ -518,7 +575,50 @@ struct StageAvatarRuntimeSnapshotShim { let avatar: StageAvatarAssetSnapshot? }
         precondition(pausePlayer.loadCount == 0 && pausePlayer.speed > 0,
                      "resume after pause+clear retimes the existing player; phase continuity is preserved")
 
-        print("PASS: 13 walking-adaptation groups (rate math, zero/varied speed, proportions, VRM/PMX measured contract, executor ground-speed linkage, pause/clear in-place freeze with continuous phase, cap policy at cruise)")
+        // ---- the PMX retime rides the render clock, so the clip is never restarted
+        //
+        // Animation time zero of the retargeted walk clip is the model's rest
+        // pose, so "the clip is drawn standing while the renderer reports it
+        // playing" is exactly "the clip's phase is back at zero". A retime that
+        // rides the clock can never do that; the one that wrote
+        // SCNAnimationPlayer.speed did it on almost every frame.
+        do {
+            var clock = PMXRenderTimeline()
+            var now = 1_000.0
+            // The device's own measured gait speeds, replayed as per-frame
+            // jitter: their spread is what tripped the old >0.005 guard.
+            let measured: [Float] = [0.6656, 0.6740, 0.6696, 0.6640, 0.6577,
+                                     0.6495, 0.6724, 0.6390, 0.6752, 0.6729,
+                                     0.6831, 0.6695]
+            var phases: [TimeInterval] = []
+            for frame in 0..<180 {
+                let rate = pmxGait!.playbackRate(
+                    forGroundSpeed: measured[frame % measured.count])
+                now += 1.0 / 60.0
+                phases.append(clock.advance(to: now, rate: Double(rate)))
+            }
+            precondition(phases.count == 180)
+            precondition(zip(phases, phases.dropFirst()).allSatisfy { $1 > $0 },
+                         "a retimed locomotion clip advances monotonically: its phase never rewinds to frame zero, which is the bind pose")
+            let total = phases.last!
+            precondition(total > 1.8 && total < 3.4,
+                         "the retime scales the render clock by the measured rate instead of restarting the clip")
+
+            // Standstill: rate 0 holds the phase, it does not rewind or march.
+            let held = clock.advance(to: now + 5, rate: 0)
+            precondition(held == total,
+                         "a standstill freezes the clip at its current phase; the old player-speed write made 0 a restart, not a hold")
+
+            // A jittery telemetry sample must not move the phase backwards.
+            let jittered = clock.advance(to: now + 5 + 1.0 / 60.0,
+                                         rate: Double(pmxGait!.playbackRate(forGroundSpeed: 0.6390)))
+            precondition(jittered > held,
+                         "every retime change moves the clip forward; no frame is ever re-drawn from frame zero")
+            precondition(clock.advance(to: now, rate: 1) == jittered,
+                         "a backwards timestamp never rewinds the clip")
+        }
+
+        print("PASS: 14 walking-adaptation groups (rate math, zero/varied speed, proportions, VRM/PMX measured contract, executor ground-speed linkage, pause/clear in-place freeze with continuous phase, cap policy at cruise, PMX retime rides the render clock so the walk clip is never restarted into its bind pose)")
     }
 }
 """#

@@ -17,6 +17,20 @@
 //   5. 任务的尺寸出处可读（任务行/回执），而且与记录的意图同源。
 import Foundation
 
+// WorldRuntime 的模块搜索路径与目标文件**只有一处定义**：tools/world-runtime-harness-flags.sh。
+// harness 一律调用它，绝不自己拼 `.build/...`（27 份各自拼写正是 SwiftPM 模块与 xcodebuild
+// `Products/Debug` 旧模块两份并存的根因，后者报 `WorldQuaternion` 没有 `identity`）。
+func worldRuntimeHarnessFlags() -> [String] {
+    let process = Process(), pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = [FileManager.default.currentDirectoryPath + "/tools/world-runtime-harness-flags.sh"]
+    process.standardOutput = pipe
+    try? process.run(); process.waitUntilExit()
+    guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
+    return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .split(separator: "\n").map(String.init)
+}
+
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let sources = root.appendingPathComponent("apps/macos/Sources/GMGNRadio")
 let required = ["Presence/PropGenerationClient.swift", "Presence/PropGenerationStore.swift",
@@ -521,6 +535,7 @@ let binary = temp.appendingPathComponent("checks")
 let compiler = Process()
 compiler.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
 compiler.arguments = ["swiftc", "-swift-version", "6", "-parse-as-library"]
+    + worldRuntimeHarnessFlags()
     + required.map { sources.appendingPathComponent($0).path } + [main.path, "-o", binary.path]
 try compiler.run(); compiler.waitUntilExit()
 guard compiler.terminationStatus == 0 else { exit(compiler.terminationStatus) }

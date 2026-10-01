@@ -1,4 +1,5 @@
 import Foundation
+import WorldRuntime
 @preconcurrency import Metal
 import GLTFMetalKit
 import simd
@@ -147,12 +148,22 @@ import simd
         }
         try Task.checkCancellation()
         let minimum=asset.asset.worldBounds.min,maximum=asset.asset.worldBounds.max
-        _=try ResidentPropPlacementMatrix.transform(minimum:minimum,maximum:maximum,targetHeight:item.targetHeightMeters,position:item.position,yaw:item.yaw)
-        let sourceHeight=maximum.y-minimum.y
+        _=try ResidentPropPlacementMatrix.transform(minimum:minimum,maximum:maximum,targetHeight:item.targetHeightMeters,position:item.position,yaw:item.yaw,orientation:item.orientation)
+        // `sourceHeight` 与 `size` 都是**摆正之后**的那一份：`WorldSimulation` 用
+        // `size.y / sourceHeight` 算物件自己的等比缩放，渲染矩阵也按摆正后的高度归一 ——
+        // 两处必须是同一个数，否则画面与存档各缩各的。躺着的网格（真机那把剑）在这一步
+        // 从"原始 Y 跨度 0.133"变成"摆正后高度 1.005"，于是 1.1 m 的请求就是一把立着的
+        // 1.1 m 剑，而不是 8.28 m 长的横棍。
+        let oriented = WorldPropOrientationPolicy.orientedBounds(
+            minimum: minimum, maximum: maximum, rotation: item.orientation
+        )
+        let orientedExtent = oriented.maximum - oriented.minimum
+        let sourceHeight = orientedExtent.y
+        guard sourceHeight.isFinite, sourceHeight > 0.000_01 else { throw WishMachineOutputError.invalidDimensions }
         // 只按高度轴归一的尺寸（见 `ResidentPropPreparedAsset.size` 的说明）：真正的自动
         // 尺寸由 `WorldPropSizePolicy` 在**拿到生成请求高度的那一处**算出（细长物件按最长边
         // 归一）。渲染端不重复应用策略 —— 它拿到的 targetHeight 已经是定稿高度。
-        return ResidentPropPreparedAsset(minimum:minimum,maximum:maximum,sourceHeight:sourceHeight,size:(maximum-minimum)*(item.targetHeightMeters/sourceHeight))
+        return ResidentPropPreparedAsset(minimum:minimum,maximum:maximum,sourceHeight:sourceHeight,size:orientedExtent*(item.targetHeightMeters/sourceHeight))
     }
 
     @discardableResult func render(commandBuffer: MTLCommandBuffer, colorTexture: MTLTexture, depthTexture: MTLTexture,
@@ -169,7 +180,7 @@ import simd
         for item in drawable {
             guard let loaded=cache[item.assetKey] else { continue }
             do {
-                let transform=try ResidentPropPlacementMatrix.transform(minimum:loaded.asset.worldBounds.min,maximum:loaded.asset.worldBounds.max,targetHeight:item.targetHeightMeters,position:item.position,yaw:item.yaw)
+                let transform=try ResidentPropPlacementMatrix.transform(minimum:loaded.asset.worldBounds.min,maximum:loaded.asset.worldBounds.max,targetHeight:item.targetHeightMeters,position:item.position,yaw:item.yaw,orientation:item.orientation)
                 let calls=loaded.asset.drawCalls.map { GLTFDrawCall(mesh:$0.mesh,material:$0.material,modelMatrix:transform * $0.modelMatrix,skinPalette:$0.skinPalette) }
                 loaded.renderer.encodeOpaqueDrawCalls(calls,scene:GLTFSceneState(viewProjection:WishMachineOutputPlacement.projection(viewProjection,reversedDepth:reversedDepth),cameraPosition:cameraPosition),pipelineStates:loaded.pipelines,depthState:reversedDepth ? loaded.reverseDepth : loaded.forwardDepth,encoder:encoder)
             } catch { failed.insert(item.objectID);onStatusChanged?(item.objectID,.failed(id:item.objectID,message:WishMachineOutputError.invalidDimensions.localizedDescription));continue }

@@ -14,8 +14,22 @@ import Foundation
 
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let sources = root.appendingPathComponent("apps/macos/Sources/GMGNRadio")
-let runtimePackage = root.appendingPathComponent("apps/macos/Packages/WorldRuntime")
-let runtimeBuild = runtimePackage.appendingPathComponent(".build/arm64-apple-macosx/debug")
+// WorldRuntime 的模块搜索路径 + 目标文件**只有一处定义**：tools/world-runtime-harness-flags.sh。
+// `--ensure` 保留本 harness 原有的"缺产物就先编译一次"的意图；`runtimeBuild` / `runtimePackage`
+// 都由那一处**推出来**，本文件不再持有 `.build/...` 字面量。
+func worldRuntimeHarnessFlags() -> [String] {
+    let process = Process(), pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = [FileManager.default.currentDirectoryPath + "/tools/world-runtime-harness-flags.sh", "--ensure"]
+    process.standardOutput = pipe
+    try? process.run(); process.waitUntilExit()
+    guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
+    return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .split(separator: "\n").map(String.init)
+}
+let worldRuntimeFlags = worldRuntimeHarnessFlags()
+let runtimeBuild = URL(fileURLWithPath: worldRuntimeFlags[1]).deletingLastPathComponent()
+let runtimePackage = runtimeBuild.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
 
 func run(_ binary: String, _ arguments: [String]) throws -> Int32 {
     let process = Process()
@@ -30,13 +44,8 @@ func run(_ binary: String, _ arguments: [String]) throws -> Int32 {
     return process.terminationStatus
 }
 
-// Keep the linked WorldRuntime objects fresh; a stale or missing module fails
-// the run with its real status instead of being papered over.
-let buildStatus = try run("/usr/bin/swift", ["build", "--disable-sandbox", "--package-path", runtimePackage.path])
-guard buildStatus == 0 else {
-    print("FAIL: WorldRuntime package build failed with \(buildStatus)")
-    exit(buildStatus)
-}
+// 对象的"新鲜"交给唯一那份定义：`--ensure` 在缺产物时先跑一次 swift build（见上方）。
+// 这里不再自己拼路径、也不再自己起第二次编译；产物缺了会由那一处打出 FAIL 并说明原因。
 let objectFiles = try FileManager.default.contentsOfDirectory(
     at: runtimeBuild.appendingPathComponent("WorldRuntime.build"),
     includingPropertiesForKeys: nil

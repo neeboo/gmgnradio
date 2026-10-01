@@ -805,6 +805,8 @@ final class AppDelegate:
     private var desktopPresenceObserverID: UUID?
     private var livingWorldContext: WorldAgentContext?
     private var livingCabinJukeboxGate = LivingCabinJukeboxGate()
+    /// 一次执行实例里已经报过的"点唱机没出声"原因（同一个原因只报一次）。
+    private var reportedJukeboxSilenceInstance: String?
     private var residentActivityOutcome: ResidentActivityOutcome?
     private var residentJukeboxPlaybackOwner: UUID?
     private var worldAgentToolDispatcher: WorldAgentToolDispatcher?
@@ -2878,30 +2880,52 @@ final class AppDelegate:
 
     private func performLivingCabinJukeboxEffect(_ snapshot: WorldAgentSnapshot) {
         if residentActivityOutcome?.suppressesAutomaticEffect(snapshot) == true { return }
-        guard spatialStage.marbleLivingCabin?.worldID == snapshot.worldID,
-              spatialStage.selectedWorldID == snapshot.worldID,
-              let active = snapshot.activeActivity,
-              let context = livingWorldContext,
-              let startedAt = context.simulation.state.activeActivity?.startedAt,
-              let requestID = context.currentActivityRequestID,
-              livingCabinJukeboxGate.consume(
-                worldID: snapshot.worldID, activityID: active.id,
-                startedAt: startedAt, phase: active.phase.rawValue, requestID: requestID
-              ) else { return }
+        guard let active = snapshot.activeActivity,
+              active.id == "music.listen",
+              active.phase == .enter || active.phase == .loop else { return }
+        // 从这里往下，每一条不成立都意味着"这一次不会出声"。过去它们共用同一个静默
+        // return，真机上只能看到"操作被接受，然后什么都没发生"—— 原因既不上屏也不
+        // 可分辨。现在每一条都有名字。
+        guard spatialStage.marbleLivingCabin?.worldID == snapshot.worldID else {
+            return reportJukeboxSilence(snapshot, "生活舱没有接在这个世界上")
+        }
+        guard spatialStage.selectedWorldID == snapshot.worldID else {
+            return reportJukeboxSilence(snapshot, "当前显示的不是这个世界")
+        }
+        guard let context = livingWorldContext else {
+            return reportJukeboxSilence(snapshot, "生活空间上下文已经不存在")
+        }
+        guard let startedAt = context.simulation.state.activeActivity?.startedAt else {
+            return reportJukeboxSilence(snapshot, "模拟状态里没有这次活动（活动只活在执行器里）")
+        }
+        guard let requestID = context.currentActivityRequestID else {
+            return reportJukeboxSilence(snapshot, "这次活动没有执行请求编号")
+        }
+        guard livingCabinJukeboxGate.consume(
+            worldID: snapshot.worldID, activityID: active.id,
+            startedAt: startedAt, phase: active.phase.rawValue, requestID: requestID
+        ) else {
+            livingWorldLogger.info(
+                "点唱机：这次执行实例已经处理过，跳过重复触发 request=\(requestID, privacy: .public)"
+            )
+            return
+        }
+        reportedJukeboxSilenceInstance = nil
         Task { @MainActor [weak self, weak context] in
-            guard let self, let context,
-                  spatialStage.selectedWorldID == snapshot.worldID,
+            guard let self, let context else { return }
+            guard spatialStage.selectedWorldID == snapshot.worldID,
                   livingWorldContext === context,
                   livingWorldContext?.currentActivityRequestID == requestID,
                   livingWorldContext?.snapshot.activeActivity?.id == "music.listen"
-            else { return }
+            else {
+                return reportJukeboxSilence(snapshot, "等待播放结果期间世界或活动已经换掉了")
+            }
             do {
                 try await resumeMusic()
                 liveCamWindowController?.showChatStatus("点唱机开始播放音乐。")
             } catch {
-                // 良性状态不上屏：按了播放但队列里还没有节目、或后台还没准备好，这不是故障，
-                // 用橙色横幅说它只会像出错。DJ 工具侧仍靠同一个错误描述向 agent 说明情况，
-                // 所以错误类型本身不动，只改这里的呈现；真失败照旧上屏。
+                // 良性状态也**必须**上屏：用户问的正是"为什么没出声"。橙色横幅说的是
+                // 事实（没有已准备的曲目），不是把正常状态说成故障。
                 let isBenign: Bool
                 switch error {
                 case DJAgentRadioActionError.noProgram, DJAgentRadioActionError.noPreparedProgram:
@@ -2909,14 +2933,27 @@ final class AppDelegate:
                 default:
                     isBenign = false
                 }
-                if !isBenign {
-                    liveCamWindowController?.showChatStatus(
-                        "点唱机尚未开始播放。\(error.localizedDescription)"
-                    )
-                }
-                livingWorldLogger.error("点唱机播放失败：\(error.localizedDescription, privacy: .public)")
+                reportJukeboxSilence(
+                    snapshot,
+                    isBenign
+                        ? "点唱机上没有已经准备好的曲目（\(error.localizedDescription)）"
+                        : error.localizedDescription
+                )
             }
         }
+    }
+
+    /// 一次执行实例里同一条原因只报一次，但**一定**报：日志 + 屏上状态。
+    /// 静默的失败在真机上与"什么都没发生"无法区分，这正是点唱机缺陷的形态。
+    private func reportJukeboxSilence(_ snapshot: WorldAgentSnapshot, _ reason: String) {
+        let phase = snapshot.activeActivity?.phase.rawValue ?? "nil"
+        let instance = "\(snapshot.worldID):\(snapshot.activeActivity?.id ?? "nil"):\(phase):\(reason)"
+        livingWorldLogger.error(
+            "点唱机没有出声：\(reason, privacy: .public) instance=\(instance, privacy: .public)"
+        )
+        guard reportedJukeboxSilenceInstance != instance else { return }
+        reportedJukeboxSilenceInstance = instance
+        liveCamWindowController?.showChatStatus("点唱机没有出声：\(reason)")
     }
 
     private func refreshInstalledLivingWorldMotions() {
@@ -3690,7 +3727,7 @@ final class AppDelegate:
                 else { throw ResidentPropHostError.assetUnverified }
             }, isCurrent: isCurrent,
             currentAvatarAssetID: { [weak self] in self?.avatarRuntime.snapshot.avatar?.id },
-            makeGripCalibration: { [weak self] prop, avatarID in
+            makeGripCalibration: { [weak self] prop, avatarID, point in
                 guard let self, let avatar = self.avatarRuntime.snapshot.avatar, avatar.id == avatarID else {
                     throw ResidentPropPlacementError.avatarChanged
                 }
@@ -3700,10 +3737,14 @@ final class AppDelegate:
                 guard let asset = self.residentOwnedPropAssets[prop.objectID], asset.prop.matchesIdentity(of: prop) else {
                     throw ResidentPropHostError.assetUnverified
                 }
+                // 门槛问的是**这个挂点自己的骨骼**：找不到就报「这个角色没有可用的腰部骨骼」
+                // 这类读得懂的话（`PropAttachmentError.missingBone`），而不是静默挂不上。
                 try self.spatialStage.validateResidentPropAttachment(avatarID: avatarID,
-                    assetID: prop.assetID, modelURL: asset.descriptor.modelURL, point: .rightHand)
-                guard let calibration = ResidentPropAttachmentEligibility.suggestedCalibration(for: prop, avatar: avatar) else {
-                    throw ResidentPropPlacementError.attachmentUnsupported("这个物件还没有当前居民的右手握点建议。")
+                    assetID: prop.assetID, modelURL: asset.descriptor.modelURL, point: point)
+                guard let calibration = ResidentPropAttachmentEligibility.suggestedCalibration(
+                    for: prop, avatar: avatar, point: point) else {
+                    throw ResidentPropPlacementError.attachmentUnsupported(
+                        "这个物件还没有当前居民的\(PropAttachmentSlots.displayName(for: point))挂点建议。")
                 }
                 return calibration
             })
@@ -3733,6 +3774,9 @@ final class AppDelegate:
         guard !residentPropPreparationRunning else { return }
         residentPropPreparationRunning = true
         defer { residentPropPreparationRunning = false }
+        /// 这一轮"摆正"要给用户看的话（按物件）。在**既有那几条会 removeValue 的路径之后**
+        /// 统一发出去，否则"已按主轴摆正"会被"入库成功"冲掉 —— 用户就只看到结果、看不到原因。
+        var orientationNotices: [String: String] = [:]
         let scope = currentResidentWorldContext().sessionScope
         let jobs = wishMachineCoordinator.residentJobs(worldID: context.manifest.worldID, residentScope: scope).filter { $0.stage == .claimed }
         // The Metal view publishes its resident-prop handlers on the first
@@ -3776,7 +3820,31 @@ final class AppDelegate:
                 // （"一把 1.1 米的剑"）说的是**最长边** 1.1 m，原来按高度归一成了 8.285 m 长、
                 // 比舱室还长、摆放被拒后从房间里消失。没有意图时才走自动推断（细长物件 > 4 按最长边）。
                 let extent = prepared.maximum - prepared.minimum
-                let sourceExtent = WorldVector3(x: extent.x, y: extent.y, z: extent.z)
+                // ---- 摆正（朝向归一）----------------------------------------------------
+                // 生成服务交回来的网格**不保证立着**（真机那把剑的 AABB 是 1.005 × 0.133 × 0.057，
+                // 躺着）。这一步只在**入库这一处**做一次，三条路按优先级，而且**都不许猜**：
+                //   ① 回执 `authoritative_size` 里声明的 `up_axis` / `forward_axis`（最干净）；
+                //   ② 由网格自身的主轴推断（最长边明显不在 Y 轴上 ⇒ 躺着生成）；
+                //   ③ 都说不清 ⇒ **保留原样**并在面板上说清楚（`unresolved`）。
+                // 摆正**先于**尺寸策略：转正之后的 AABB 才是"这件东西多大"的输入，
+                // 于是 1.1 m 的请求得到一把立着的 1.1 m 剑，而不是 8.28 m 长的横棍。
+                let declared = receipt.result?.workflowAuthoritativeSize
+                let orientation = WorldPropOrientationPolicy.resolve(
+                    sourceExtent: WorldVector3(x: extent.x, y: extent.y, z: extent.z),
+                    declaredUpAxis: declared?.upAxis,
+                    declaredForwardAxis: declared?.forwardAxis
+                )
+                let orientedExtent = WorldPropOrientationPolicy.orientedExtent(
+                    of: WorldVector3(x: extent.x, y: extent.y, z: extent.z), by: orientation
+                )
+                let sourceExtent = orientedExtent
+                // 摆正这件事**必须说出来**（转了要说、"保留原样"更要说）：用户看到物件换了
+                // 姿态（或者本该换却没换），画面里得有东西解释这是谁干的、凭什么。
+                // 已经立着的资产（绝大多数）notice 是 nil，不打扰。
+                // 记在这里、**最后再发**：下面几条既有路径都会 `removeValue`，早发会被冲掉。
+                if let notice = orientation.notice {
+                    orientationNotices[job.objectID] = "\(job.name)：\(notice)"
+                }
                 // 契约的意图 → 世界状态的意图：轴/出处就是同一批字面量，越界 ⇒ nil（不静默）。
                 let sizeIntent = job.sizeIntent.flatMap {
                     WorldPropSizeIntent(axis: $0.axis.rawValue, meters: $0.meters, source: $0.source.rawValue)
@@ -3792,8 +3860,10 @@ final class AppDelegate:
                 }
                 let prop = WorldGeneratedProp(objectID: job.objectID, sourceWishID: job.id.uuidString,
                     assetID: descriptor.assetID, displayName: job.name,
-                    size: autoSize.size, sourceHeight: prepared.sourceHeight,
-                    sizeIntent: sizeIntent)
+                    size: autoSize.size, sourceHeight: sourceExtent.y,
+                    sizeIntent: sizeIntent,
+                    // 已经立着的资产不写这个键 ⇒ 元数据与改造前逐字节相同。
+                    orientation: orientation.shouldArchive ? orientation : nil)
                 // 用户**手动定过尺寸**的物件：世界状态里那一份 `size` 是唯一定稿，自动基线不再
                 // 要求逐位相等 —— 要求相等就等于"改过尺寸的物件在下一次准备时被判成资产归属
                 // 不一致"，那件物件会从房间里消失（正是这次要修的观感缺陷）。
@@ -3802,9 +3872,35 @@ final class AppDelegate:
                 if context.state.objectStates[job.objectID] != nil {
                     guard let storedProp, storedProp.matchesIdentity(of: prop) else { throw ResidentPropHostError.ownershipMismatch }
                 }
-                residentOwnedPropAssets[job.objectID] = ResidentOwnedPropAsset(prop: storedProp ?? prop, descriptor: descriptor)
+                // 旧存档（改造前登记的）没有 `orientation`，而它的 `sourceHeight` 是按**原始**
+                // 网格量的。网格字节没变（`assetID` 就是 sha256），所以这里把"同一份网格的新
+                // 量法"补上：尺寸/尺寸意图/代理/锁**全部以存档那一份为准**，只补朝向与高度基准。
+                // 不写回存档 ⇒ 不静默改用户已经保存的东西；渲染与碰撞本会话立刻正确。
+                let delivered = storedProp.map { stored in
+                    WorldGeneratedProp(
+                        objectID: stored.objectID, sourceWishID: stored.sourceWishID,
+                        assetID: stored.assetID, displayName: stored.displayName,
+                        size: stored.size, sourceHeight: sourceExtent.y,
+                        sizeLocked: stored.sizeLocked, collision: stored.collision,
+                        authoritativeSize: stored.authoritativeSize, sizeIntent: stored.sizeIntent,
+                        orientation: stored.orientation ?? (orientation.shouldArchive ? orientation : nil)
+                    )
+                } ?? prop
+                var preparedDescriptor = descriptor
+                preparedDescriptor.orientation = delivered.orientationRotation
+                residentOwnedPropAssets[job.objectID] = ResidentOwnedPropAsset(prop: delivered, descriptor: preparedDescriptor)
                 residentPropNotices.removeValue(forKey: job.objectID)
                 residentPropAssetFailures.removeValue(forKey: job.objectID)
+                // 握点推断说了什么，同样**必须说出来**：这条说明走的就是上面
+                // `orientationNotices[job.objectID]` 那条既有的可见通道（同一格 →
+                // 末尾统一 `residentPropNotices` + `showResidentVoiceStatus`），
+                // 不新开第二条 notice 通道。入库这一处是唯一同时握有"最终世界尺寸 +
+                // 摆正旋转"的地方（`delivered`），所以握点说明与握点标定读的是
+                // 同一次 `PropGripInference` 推断 —— 一句话不会只说给日志听。
+                if let gripNotice = ResidentPropAttachmentEligibility.suggestedGripNotice(for: delivered) {
+                    let prefix = orientationNotices[job.objectID].map { $0 + " " } ?? "\(job.name)："
+                    orientationNotices[job.objectID] = prefix + gripNotice
+                }
                 // 夹取时**说出来**（夹取是"静默改数字"之外唯一诚实的做法）；
                 // 按用户说的尺寸落定时也说出来，让"尺寸是怎么定的"看得见。
                 if let reason = autoSize.reason {
@@ -3887,6 +3983,13 @@ final class AppDelegate:
                 }
             }
         }
+        // 摆正的说明放在**最后**：它说的是"这件东西的姿态是怎么定的"，
+        // 比"入库成功"更值得留在面板上（后者是流程，前者是事实）。
+        for (objectID, message) in orientationNotices.sorted(by: { $0.key < $1.key }) {
+            guard residentPropNotices[objectID] != message else { continue }
+            residentPropNotices[objectID] = message
+            showResidentVoiceStatus(message)
+        }
         synchronizeResidentPropPresentation()
     }
 
@@ -3941,9 +4044,14 @@ final class AppDelegate:
         // 换算只有一份（`ResidentPropRenderDescriptor.residentProp`）：已摆那一件与在手预览
         // 走同一行代码，所以"预览被描述符判据挡掉、已摆的却画得出来"这种不对称不可能存在。
         // 渲染目标高度必须与判据/碰撞盒同源（`effectiveSize`：有工作流权威尺寸时以它为准）。
+        //
+        // 摆正旋转读 `asset.prop`（本会话交付的那一份）而不是 `item.generatedProp`：
+        // 旧存档里没有这个字段，而"这件网格是躺着的"是本会话量出来的事实 ——
+        // 两者仍是**同一个出口**（`WorldGeneratedProp.orientationRotation`），不是第二份朝向。
         return .residentProp(objectID: prop.objectID, worldID: asset.descriptor.worldID, assetID: prop.assetID,
                              modelURL: asset.descriptor.modelURL, targetHeightMeters: prop.effectiveSize.y,
-                             position: SIMD3(p.x, p.y, p.z), rotation: SIMD4(q.x, q.y, q.z, q.w))
+                             position: SIMD3(p.x, p.y, p.z), rotation: SIMD4(q.x, q.y, q.z, q.w),
+                             orientation: asset.prop.orientationRotation)
     }
 
     private func residentPropEditorSnapshot(context: WorldAgentContext) -> ResidentPropEditorSnapshot {
@@ -3991,7 +4099,10 @@ final class AppDelegate:
               // **判据必须同时看承托面与"有没有派生在跑"**（见 `ResidentPropSupportReadiness`）：
               // 只问 `grid != nil` 的话，派生失败留下的空网格会被当成"就绪"，于是面板
               // 永远说"还在生成"、那一行永远点不动（2026-09-28 真机缺陷）。
-              supportGeometryUnavailable: readiness.supportGeometryUnavailable)
+              supportGeometryUnavailable: readiness.supportGeometryUnavailable,
+              // 「靠墙」读的是派生出来的竖直面与**判据说可以**的那批格子（与地板摆放同一个出口）。
+              wallFaces: residentPropGridEditor.wallPatches.count,
+              wallPlaceableCells: residentPropGridEditor.wallPlaceableCellCount)
     }
 
     /// 把当前快照推给面板。返回**是否真的推成功** —— 世界已切换/窗口不在时不算推成功，
@@ -4034,7 +4145,11 @@ final class AppDelegate:
               let asset = residentOwnedPropAssets[held.objectID], asset.prop.matchesIdentity(of: prop) else { return nil }
         return .init(objectID: prop.objectID, worldID: context.manifest.worldID, assetID: prop.assetID,
                      modelURL: asset.descriptor.modelURL, targetHeightMeters: prop.effectiveSize.y,
-                     attachmentPoint: .rightHand, calibration: calibration)
+                     // 挂在哪个挂点是**持久状态自己说的话**（`WorldHeldProp.hand` / 标定里的 `hand`），
+                     // 不是这里再写死一个右手。
+                     attachmentPoint: held.attachmentPoint, calibration: calibration,
+                     // 手持与已摆共用同一份资产级摆正旋转（同一个出口）。
+                     orientation: asset.prop.orientationRotation)
     }
 
     private func safelyReturnHeldPropIfAvatarChanged(_ snapshot: StageAvatarRuntimeSnapshot) {
@@ -4082,7 +4197,7 @@ final class AppDelegate:
             try service.commit(command, expectedLayoutRevision: revision, requestID: requestID)
             self.synchronizeResidentPropPresentation()
             return self.residentPropEditorSnapshot(context: context)
-        }, hold: { [weak self] id, revision, requestID in
+        }, hold: { [weak self] id, point, revision, requestID in
             guard let self, let context = self.livingWorldContext,
                   let editorID = self.residentPropEditingID,
                   self.isResidentPropEditorCurrent(context: context, editorID: editorID) else { throw ResidentPropPlacementError.inactiveContext }
@@ -4090,7 +4205,8 @@ final class AppDelegate:
                 guard let self, let context else { return false }
                 return self.isResidentPropEditorCurrent(context: context, editorID: editorID)
             })
-            let command = try service.holdCommand(objectID: id)
+            // 拿起来 / 就地换挂点：同一个入口（面板上"手/背后/腰间"那一行读的就是它）。
+            let command = try service.holdCommand(objectID: id, point: point)
             try await self.prepareResidentPropMutation(command, context: context)
             try service.commit(command, expectedLayoutRevision: revision, requestID: requestID)
             self.synchronizeResidentPropPresentation()
@@ -5146,10 +5262,21 @@ final class AppDelegate:
                 && self.livingWorldContext === context
                 && self.residentPropEditingWorldID == nil
         }
+        // 「这一轮为什么不current」的**具体**原因。没有它，点唱机被提前结束在工具侧
+        // 只能说"已取消或被替换"，而真正的原因（比如空间正在装修）既不上屏也不进日志。
+        let currentBlocker: @MainActor () -> String? = { [weak self, weak context] in
+            guard let self else { return "应用状态已经释放" }
+            if self.liveCamMessageID != messageID { return "本轮对话已经被新的一轮替换" }
+            if self.spatialStage.selectedWorldID != worldID { return "已经切换到别的世界" }
+            guard let context, self.livingWorldContext === context else { return "生活空间已经重新加载" }
+            if self.residentPropEditingWorldID != nil { return "空间正在装修（摆放模式），居民的点唱机操作已失去授权" }
+            return nil
+        }
         let deadline = Date().addingTimeInterval(300)
         let outcome = ResidentActivityOutcome(
             context: context,
             isCurrent: isCurrent,
+            currentBlocker: currentBlocker,
             play: { [weak self] owner in
                 guard let self else { throw CancellationError() }
                 try await self.resumeResidentJukebox(owner: owner)
@@ -6098,7 +6225,7 @@ final class AppDelegate:
         claimed 表示领取登记，宿主还需将校验过的物件保存进库存。用 read_owned_props 核对入库，不要因暂无库存再次生成。
         当前支持面可用 list_placement_surfaces 查询，物件位置为底中心、yaw 为弧度。后台仅可续办 placement_delegation.state 为 pending 的原摆放委托：只摆本次产物、只用允许支持面，并遵守用户指定的精确位置和朝向。领取并用 read_owned_props 核实入库后，查询 layout_revision、预检、调用 apply_prop_placement，直到工具确认。放不下时在委托允许范围内调整；仍放不下就留在库存并说明。placed、revoked 或 failed 的委托不再自动执行。其他移动、收回、手持或撤销仍需本轮人类明确指令。
         resume_wish_continuation 只用于把该任务的**自动续办**（后台自行领取与摆放）重新打开，它不是领取已就绪产物的前置条件。用户本轮明确要求恢复指定许愿时，先调用 resume_wish_continuation（指定 wish_id 并确认恢复），仅在成功回执后说明该许愿授权已恢复；随后需要自主续办时，再调用 update_resident_intent 并设置 resume_paused_intent=true。仅更新居民意图不会恢复许愿授权。普通聊天或后台通知不得恢复暂停任务。已实际摆好的物件无需重复领取或摆放。
-        生成物件目前只有外形，没有冲泡或战斗功能。正式领取且最长边不超过 45 厘米的小道具，可由当前已适配的 2B 右手展示；操作必须依次使用正式工具 hold_prop、adjust_held_prop_grip、return_held_prop，其中微调按需执行。只依据工具回执说明结果，其他角色或更大物件仍只能摆放。
+        生成物件目前只有外形，没有冲泡或战斗功能。正式领取且最长边不超过 \(ResidentPropAttachmentEligibility.holdableLongestEdgeText)的小道具，可由当前已适配的 2B 角色拿在右手、挂在背后或挂在腰间：hold_prop 的 slot 参数决定挂点（rightHand 拿在手里 / back 挂在背后 / waist 挂在腰间），用户说"挂背后 / 挂腰上 / 拿手里"时选对应项，已经拿在手上的同一件物件换挂点也用它；操作必须依次使用正式工具 hold_prop、adjust_held_prop_grip、return_held_prop，其中微调按需执行。只依据工具回执说明结果（回执里的 held_slot_name 就是它现在挂在哪儿），其他角色或更大物件仍只能摆放。
         """
     }
 
@@ -6544,6 +6671,7 @@ final class AppDelegate:
         case .resumeLocal:
             residentJukeboxPlaybackOwner = ResidentActivityOutcome.playbackOwner
             try localMusicPlayer.play()
+            try await confirmAudiblePlayback(reason: "resumeLocal")
             orbWindowController?.setState(.playing)
             stageWindowController?.setPlaybackState(.playing)
         case .startPreparedProgram:
@@ -6551,9 +6679,22 @@ final class AppDelegate:
                 requestOpening: false,
                 allowFallback: false
             )
+            try await confirmAudiblePlayback(reason: "startPreparedProgram")
         case .unavailable:
             throw DJAgentRadioActionError.noProgram
         }
+    }
+
+    /// 「真的出声了」的判据与日志：音频图自报在播，**而且播放位置在前进**。
+    ///
+    /// 过去这里只认自己记的 `localMusicPlayer.state`：`AVAudioPlayerNode.play()` 一被
+    /// 调用状态就变成 `.playing`，于是"操作被接受、曲目也备好、扬声器没有声音"在代码
+    /// 里和"放得好好的"完全一样。位置不动就是没出声，必须抛出去，不能记成成功。
+    private func confirmAudiblePlayback(reason: String) async throws {
+        let observed = try await localMusicPlayer.confirmPlaybackProgress()
+        playbackLogger.info(
+            "点唱机出声证据：reason=\(reason, privacy: .public)，isPlaying=\(self.localMusicPlayer.isGraphPlaying)，position=\(observed.start, format: .fixed(precision: 3))→\(observed.current, format: .fixed(precision: 3))，track=\(self.localMusicPlayer.track?.title ?? "nil", privacy: .public)"
+        )
     }
 
     func replanProgram(

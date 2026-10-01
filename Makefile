@@ -169,6 +169,13 @@ test-python:
 # same machine-flattening event as several concurrent `make build`s. So the
 # whole list shares **one** gate acquisition: taking the lock per script would
 # serialise nothing (another build can slip in between any two of them).
+#
+# 裸 `swift tools/test-*.swift` 这条路上**没有 SwiftPM 的模块搜索路径**，所以任何一个
+# `import WorldRuntime` 的生产文件都要靠 harness 自己把模块目录与目标文件传给 swiftc。
+# 那份参数**只有一处定义**：tools/world-runtime-harness-flags.sh。harness 只调用它，
+# 谁都不许再自己拼 `.build/...` —— 27 份各自拼写正是 SwiftPM 模块与 xcodebuild
+# `Products/Debug` 旧模块两份并存的根因（后者会报 `WorldQuaternion` 没有 `identity`）。
+# 改路径/换目录只改那一个脚本。
 test-harnesses:
 	$(BUILD_LOCK) $(MAKE) --no-print-directory _test-harnesses
 
@@ -185,11 +192,28 @@ _test-harnesses:
 	swift tools/test-stage-avatar-follow-smoothing.swift
 	swift tools/test-resident-walk-motion-default.swift
 	swift tools/test-motion-playback-lifecycle.swift
+	# 点唱机"请求被接受 ⇒ 真的出声"的唯一判据、失败必须可见、提前结束必须带原因，
+	# 以及 `makeResidentWorldTools` 抽取器必须抽到完整函数体（回合期限断言靠它）。
+	# 它**从来没挂进来过**：抽取器在默认闭包参数处截断，deadline 断言永远看不到函数体，
+	# 于是一直红着没人管（2026-10-01 真机"点唱机放不出声音"）。
+	swift tools/test-resident-jukebox-outcome.swift
 	swift tools/test-living-resident-loop.swift
 	swift tools/test-resident-prop-render.swift
 	swift tools/test-resident-prop-grid-editor.swift
 	swift tools/test-resident-prop-grid-placement.swift
+	# 摆正（朝向归一）+ 靠墙（竖直面）：两件事各自的判据，见各自文件头。
+	swift tools/test-resident-prop-orientation-and-wall.swift
 	swift tools/test-resident-prop-function-anchors.swift
+	# 手持那一环的门禁。`tools/test-prop-attachment.swift` **从来没挂进来过**，于是
+	# "手骨跟随 / 只读骨骼 / 握点单一来源 / 缺失可见失败 / 细长物件刃轴压在骨轴上"
+	# 这五条今天一条都没在跑（见 tools/test-resident-prop-hold.swift 的文件头）。
+	swift tools/test-resident-prop-hold.swift
+	# `tools/test-prop-attachment.swift` 同样**从来没挂进来过**，所以它红着没人管：
+	# 朝向那条线给 `PropAttachment.swift` 加了 `WorldPropRotation` /
+	# `WorldPropOrientationPolicy` 的引用之后，这个旧 harness 的手写 stub 就跟不上了。
+	# 现在它编的是**真源码**（几何 / 朝向 / 握点推断三份），只有"世界里的大类型"还是
+	# stub，并多钉一条"矮胖物件的手感逐位不回归"。
+	swift tools/test-prop-attachment.swift
 	swift tools/test-wish-machine-coordinator.swift
 	swift tools/test-wish-machine-app-runtime.swift
 	swift tools/test-resident-prop-placement.swift

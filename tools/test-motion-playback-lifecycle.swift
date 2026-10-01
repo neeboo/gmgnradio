@@ -44,6 +44,29 @@ guard pmx.contains("motionPlaybackDiagnostics"),
     print("FAIL: the PMX renderer must expose its loaded clip, player rate and drawn pose")
     exit(1)
 }
+// The real-machine walk regression the host-source greps above cannot see: the
+// render path used to write SCNAnimationPlayer.speed on every frame. Assigning
+// that property restarts the player at animation time zero, and time zero of
+// the retargeted walk clip is the model's rest pose, so the heartbeats logged
+// pose[左腕=0.0 右腕=0.0 左ひざ=0.0 …] for the whole displacement while 211 of
+// 361 frames were drawn in the bind pose. The locomotion retime belongs on the
+// render clock — advance(to:rate:) — and never on the animation player.
+let playerSpeedWrites = pmx
+    .split(separator: "\n", omittingEmptySubsequences: false)
+    .map { String($0) }
+    .filter { $0.contains(".speed = ") && !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+guard playerSpeedWrites.count == 1,
+      playerSpeedWrites.allSatisfy({ $0.contains("animationPlayer(forKey: Self.motionKey)?.speed = ") }),
+      pmx.contains("rate: TimeInterval = 1"),
+      pmx.contains("rate: Double(locomotionPlaybackRate())"),
+      !pmx.contains("updateLocomotionPlaybackRate") else {
+    print("FAIL: render path must not write SCNAnimationPlayer.speed every frame — assigning it restarts the locomotion clip at its rest pose, so the gait rate belongs on the render clock (advance(to:rate:)) instead")
+    for line in playerSpeedWrites {
+        print("  offending .speed assignment: \(line.trimmingCharacters(in: .whitespaces))")
+    }
+    exit(1)
+}
+print("PASS: the render path never writes SCNAnimationPlayer.speed per frame (only the one-shot load-time assignment in installMotion); the locomotion retime rides the render clock via advance(to:rate:)")
 let harness = #"""
 import Foundation
 import Observation

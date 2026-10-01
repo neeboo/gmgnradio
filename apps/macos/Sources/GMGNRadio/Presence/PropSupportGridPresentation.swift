@@ -102,6 +102,13 @@ enum PropSupportGridPresentation {
         /// footprint 格子写进 `states`，而 `focus` 的锚点**就是** `states` 的键 —— 于是发光
         /// 自动落在"物件脚下那一小块 + 两圈淡格"里，不绕开焦点裁剪，也不需要第二个绘制入口。
         case hoverTarget
+        /// **靠墙可放**：这一格不是地板的整格玩法，而是"背朝墙、正面朝房间"的那个落点。
+        ///
+        /// 它与 `.placeable` 分开，是因为它回答的是**另一个问题**：不是"这格能不能放"，
+        /// 而是"这里能不能靠着那面墙放"。判据仍然是那**唯一**一条
+        /// （`PropPlacementEvaluator` / 摆放服务），颜色只是把它的答案按"靠墙"这个上下文
+        /// 重画一次；颜色不同、**判定出口相同**。
+        case wallPlaceable
 
         /// 线性 RGBA。放在这里是为了让"哪种状态什么颜色"成为**可测的事实**，
         /// 而不是散落在 shader 里的魔法数。
@@ -112,6 +119,8 @@ enum PropSupportGridPresentation {
             case .occupied: SIMD4(0.55, 0.58, 0.62, 1)
             case .validFootprint: SIMD4(1.00, 0.82, 0.25, 1)
             case .invalidFootprint: SIMD4(0.95, 0.35, 0.30, 1)
+            // 蓝（与绿"能放"、黄"当前落点"、红"放不下"、青白"能点起来"都不同色相）。
+            case .wallPlaceable: SIMD4(0.25, 0.72, 0.95, 1)
             // 白里透青：与黄（可放）、红（不可放）、灰（被占）都不同色相，所以"发光"不会被
             // 误读成某一种判定结果 —— 它回答的是"点它就能拿起来"，不是"这里能不能放"。
             case .hoverTarget: SIMD4(0.86, 0.97, 1.00, 1)
@@ -171,9 +180,16 @@ enum PropSupportGridPresentation {
             var srgbTint: SIMD3<Float> { state.srgbTint }
         }
 
-        /// 三种颜色，顺序与用户在画面上看到的层级一致：先"能放"，再"当前落点"，最后"不能放"。
+        /// 四种颜色，顺序与用户在画面上看到的层级一致：先"能放"，再"能靠墙"，再"当前落点"，
+        /// 最后"不能放"。
+        ///
+        /// `.wallPlaceable` 只有**真的派生出竖直面**时才会被赋给格子
+        /// （`ResidentPropGridEditorModel.refreshWallPlaceability`）；平房间里一堵墙都没有，
+        /// 于是那一行自然为空 —— 与 `.blocked`/`.occupied` 那种"链路里根本没有赋值点"
+        /// 的 case 不同，它有赋值点，只是可能一个都没有。
         static let entries: [Entry] = [
             Entry(state: .placeable, label: "能放"),
+            Entry(state: .wallPlaceable, label: "能靠墙放"),
             Entry(state: .validFootprint, label: "当前落点·可放"),
             Entry(state: .invalidFootprint, label: "当前落点·放不下"),
         ]

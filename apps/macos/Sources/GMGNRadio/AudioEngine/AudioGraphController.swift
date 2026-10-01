@@ -540,6 +540,11 @@ final class AudioGraphController: LocalMusicPlaybackGraph {
         musicNode.isPlaying
     }
 
+    /// `LocalMusicPlaybackGraph` 的判据：图自己说自己在不在出声。
+    var isPlaying: Bool {
+        musicNode.isPlaying
+    }
+
     var playbackPosition: TimeInterval {
         guard
             let renderTime = musicNode.lastRenderTime,
@@ -639,9 +644,11 @@ final class AudioGraphController: LocalMusicPlaybackGraph {
     }
 
     func play() throws {
+        // 没有音轨就**报错**，不再静默 return：静默 return 让上层把"什么都没播"
+        // 记成"正在播放"，这正是真机上"操作被接受却不出声"的第一种形态。
         guard currentFile != nil else {
-            logger.error("AudioGraph play 取消：currentFile 为空")
-            return
+            logger.error("AudioGraph play 失败：currentFile 为空")
+            throw LocalMusicPlaybackError.trackNotLoaded
         }
         logger.info(
             "AudioGraph play：engineRunning=\(self.engine.isRunning)，musicPlaying=\(self.musicNode.isPlaying)"
@@ -658,6 +665,12 @@ final class AudioGraphController: LocalMusicPlaybackGraph {
             }
         }
         musicNode.play()
+        guard musicNode.isPlaying else {
+            logger.error(
+                "AudioGraph play 失败：musicNode.play() 之后 isPlaying 仍为 false，引擎没有在渲染"
+            )
+            throw LocalMusicPlaybackError.graphNotPlaying
+        }
         logger.info(
             "AudioGraph play 完成：engineRunning=\(self.engine.isRunning)，musicPlaying=\(self.musicNode.isPlaying)"
         )

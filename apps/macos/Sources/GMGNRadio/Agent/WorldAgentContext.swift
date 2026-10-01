@@ -1171,6 +1171,17 @@ final class WorldAgentContext {
     private func syncPropUsage(_ activityID: String, status: WorldPropUsageState.Status,
                                requestID: String, reason: String? = nil) {
         guard !requestID.isEmpty, let propActivity = propActivities[activityID] else { return }
+        // 使用状态只能写在**生成物件**的库存记录上（`recordPropUsage` 要求
+        // `objectStates[objectID].generatedProp`）。世界包声明的设备（点唱机）没有
+        // 生成物件记录，于是过去这里对每一次点唱机开始/结束都抛 `invalidObject`，
+        // 被压成一行"生活空间推进失败"——既把"没有可写的记录"说成"世界推进失败"，
+        // 也没有任何出口。明确跳过并说明原因，而不是制造一条假故障。
+        guard simulation.state.objectStates[propActivity.objectID]?.generatedProp != nil else {
+            Self.log.info(
+                "设备活动的使用状态无处可写：activity=\(activityID, privacy: .public)，objectID=\(propActivity.objectID, privacy: .public) 是**世界包声明的设备**，没有生成物件库存记录；跳过（不是故障）。"
+            )
+            return
+        }
         // Reasons are bounded to the persisted metadata limit, so an over-long
         // stop reason can never fail the write and leave a "running" usage.
         let boundedReason = reason.map { $0.count <= 256 ? $0 : String($0.prefix(256)) }

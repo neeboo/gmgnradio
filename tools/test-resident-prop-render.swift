@@ -386,10 +386,16 @@ func check(_ value: Bool, _ message: String) { if !value { print("FAIL:",message
         target:target("badYaw",0,0,0,0.5,0.5,0.2,.nan))==nil,"a non-finite yaw is never hit")
   check(ResidentPropHitTest.hit(normalized:SIMD2(0.5,1.5),inverseViewProjection:down,targets:[lamp])==nil,
         "a cursor below the viewport hits nothing")
-  // ── 图例（面板里那一行小方块）：只有链路真的会赋给格子的三种颜色 ──────────────
+  // ── 图例（面板里那一行小方块）：只有链路真的会赋给格子的颜色 ──────────────────
+  //
+  // 2026-10-02 加入第四种：`.wallPlaceable`（蓝）—— 靠墙可放。它**有赋值点**
+  // （`ResidentPropGridEditorModel.refreshWallPlaceability` 只在派生出竖直面时才会写），
+  // 与 `.blocked`/`.occupied` 那种"链路里根本没有赋值点"的 case 不同。
+  // 面板那一行只在**真的派生出竖直面**时才显示它（见 `ResidentPropEditorView`），
+  // 所以平房间里不会多出一个看不懂的蓝色小方块。
   let legend=PropSupportGridPresentation.Legend.entries
-  check(legend.map(\.state)==[.placeable,.validFootprint,.invalidFootprint],
-        "the legend lists exactly the three states the live link paints: green (other cells), yellow (this drop spot, placeable), red (this drop spot, blocked)")
+  check(legend.map(\.state)==[.placeable,.wallPlaceable,.validFootprint,.invalidFootprint],
+        "the legend lists exactly the states the live link paints: green (other cells), blue (wall-placeable), yellow (this drop spot, placeable), red (this drop spot, blocked)")
   check(!legend.contains { $0.state == .blocked || $0.state == .occupied },
         "the legend must not advertise colours the live link never assigns to a cell")
   check(legend.allSatisfy { !$0.label.isEmpty && $0.label.count <= 8 },
@@ -450,7 +456,7 @@ func check(_ value: Bool, _ message: String) { if !value { print("FAIL:",message
   check(ResidentPropBlockReasonLabel.frame(anchor:anchor,ringRadius:40,textSize:textSize,viewSize:viewSize).minY
         > ResidentPropBlockReasonLabel.frame(anchor:anchor,ringRadius:26,textSize:textSize,viewSize:viewSize).minY,
         "the label gives way to the ring: a bigger radius pushes it further up")
-  print("PASS: prop scale/yaw, unique preview/cancel, shared identity, world isolation, support ray, multi-layer grid picking, grid presentation, the focus patch that replaces the floor-wide carpet, the hover glow patch, the placed-prop hit test, the three-colour legend that takes its colours from the grid tint itself, and the cursor-side block-reason label (drawn only when carrying with a reason, anchored above the ring)")
+  print("PASS: prop scale/yaw, unique preview/cancel, shared identity, world isolation, support ray, multi-layer grid picking, grid presentation, the focus patch that replaces the floor-wide carpet, the hover glow patch, the placed-prop hit test, the multi-colour legend that takes its colours from the grid tint itself, and the cursor-side block-reason label (drawn only when carrying with a reason, anchored above the ring)")
  }
 }
 """#
@@ -460,7 +466,30 @@ defer {try? FileManager.default.removeItem(at:temp)}
 let file=temp.appendingPathComponent("main.swift"),exe=temp.appendingPathComponent("check")
 try harness.write(to:file,atomically:true,encoding:.utf8)
 func run(_ path:String,_ args:[String]) throws->Int32 {let p=Process();p.executableURL=URL(fileURLWithPath:path);p.arguments=args;try p.run();p.waitUntilExit();return p.terminationStatus}
-let result=try run("/usr/bin/nice",["-n","15","/usr/bin/swiftc","-j1","-parse-as-library",descriptor,sizeIntentShim.path,picker,presentation,hitTest,blockLabel,file.path,"-o",exe.path])
+// 生产描述符现在 `import WorldRuntime`（摆放矩阵要读资产级摆正旋转 `WorldPropOrientation`），
+// 所以这一档编译也要带上模块搜索路径与对象文件 —— 与下面第二档同一条口径。
+// WorldRuntime 的模块搜索路径 + 目标文件**只有一处定义**：tools/world-runtime-harness-flags.sh。
+// 不要在这里拼 `.build/...`：27 份各自拼写正是 SwiftPM 与 xcodebuild 两份模块并存的根因。
+// `worldBuild` 由那唯一一份定义**推出来**（= Modules 的上一级），本文件不持有路径字面量。
+func worldRuntimeHarnessFlags() -> [String] {
+    let process = Process(), pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = [FileManager.default.currentDirectoryPath + "/tools/world-runtime-harness-flags.sh"]
+    process.standardOutput = pipe
+    try? process.run(); process.waitUntilExit()
+    guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
+    return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .split(separator: "\n").map(String.init)
+}
+let worldRuntimeFlags = worldRuntimeHarnessFlags()
+let worldBuild = URL(fileURLWithPath: worldRuntimeFlags[1]).deletingLastPathComponent().path
+let worldObjects = (try? FileManager.default.contentsOfDirectory(atPath: worldBuild + "/WorldRuntime.build"))?
+    .filter { $0.hasSuffix(".swift.o") }.sorted().map { worldBuild + "/WorldRuntime.build/" + $0 } ?? []
+guard !worldObjects.isEmpty else {
+    print("FAIL: WorldRuntime 还没编译过（先 `swift build --package-path apps/macos/Packages/WorldRuntime`）")
+    exit(1)
+}
+let result=try run("/usr/bin/nice",["-n","15","/usr/bin/swiftc","-j1","-parse-as-library","-I",worldBuild + "/Modules",descriptor,sizeIntentShim.path,picker,presentation,hitTest,blockLabel,file.path,"-o",exe.path] + worldObjects)
 guard result==0 else {exit(result)}
 let checks=try run(exe.path,[])
 guard checks==0 else {exit(checks)}
@@ -481,9 +510,6 @@ guard checks==0 else {exit(checks)}
 // 缺陷版本下 `onPreviewChanged` 只收到 nil（编辑器把预览整个丢掉了），于是 resolve 继续给出
 // **原地那一件** —— 用户看到的就是"物件站在原地不动、只有落点格子跟着鼠标跑"。
 let editorState = "apps/macos/Sources/GMGNRadio/Presence/ResidentPropEditorState.swift"
-let worldBuild = "apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug"
-let worldObjects = (try? FileManager.default.contentsOfDirectory(atPath: worldBuild + "/WorldRuntime.build"))?
-    .filter { $0.hasSuffix(".swift.o") }.sorted().map { worldBuild + "/WorldRuntime.build/" + $0 } ?? []
 guard !worldObjects.isEmpty else {
     print("FAIL: the in-hand preview probe needs the WorldRuntime build artefacts (run `swift build --package-path apps/macos/Packages/WorldRuntime` first)")
     exit(1)

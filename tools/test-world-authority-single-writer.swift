@@ -123,16 +123,22 @@ func runVisible(_ path: String, _ arguments: [String]) -> Int32 {
     return process.terminationStatus
 }
 
-let worldRuntime = "apps/macos/Packages/WorldRuntime"
-let buildRoot = "\(worldRuntime)/.build/arm64-apple-macosx/debug"
-if !fileManager.fileExists(atPath: "\(buildRoot)/Modules/WorldRuntime.swiftmodule") {
-    _ = run("/usr/bin/env", ["swift", "build", "--package-path", worldRuntime])
+// WorldRuntime 的模块搜索路径 + 目标文件**只有一处定义**：tools/world-runtime-harness-flags.sh。
+// 不要在这里拼 `.build/...`：27 份各自拼写正是 SwiftPM 与 xcodebuild 两份模块并存的根因。
+// `--ensure` 保留本 harness 原有的"缺产物就先 swift build 一次"的自愈；路径本身仍只有那一处。
+func worldRuntimeHarnessFlags() -> [String] {
+    let process = Process(), pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = [FileManager.default.currentDirectoryPath + "/tools/world-runtime-harness-flags.sh", "--ensure"]
+    process.standardOutput = pipe
+    try? process.run(); process.waitUntilExit()
+    guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
+    return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .split(separator: "\n").map(String.init)
 }
-guard fileManager.fileExists(atPath: "\(buildRoot)/Modules/WorldRuntime.swiftmodule") else {
-    fail("WorldRuntime module missing; run \(worldRuntime) build first")
-}
-let objects = (try? fileManager.contentsOfDirectory(atPath: "\(buildRoot)/WorldRuntime.build"))
-    .map { $0.filter { $0.hasSuffix(".o") }.map { "\(buildRoot)/WorldRuntime.build/\($0)" } } ?? []
+let worldRuntimeFlags = worldRuntimeHarnessFlags()
+let buildRoot = URL(fileURLWithPath: worldRuntimeFlags[1]).deletingLastPathComponent().path
+let objects = Array(worldRuntimeFlags.dropFirst(2))
 require(!objects.isEmpty, "WorldRuntime object files missing")
 
 let daemon = "services/gmgn-taskd/target/debug/gmgn-taskd"

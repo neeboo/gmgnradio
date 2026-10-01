@@ -293,13 +293,28 @@ func run(_ binary: String, _ arguments: [String]) throws -> Int32 {
     process.waitUntilExit()
     return process.terminationStatus
 }
+// WorldRuntime 的模块搜索路径 + 目标文件**只有一处定义**：tools/world-runtime-harness-flags.sh。
+// 不要在这里拼 `.build/...`：27 份各自拼写正是 SwiftPM 与 xcodebuild 两份模块并存的根因。
+func worldRuntimeHarnessFlags() -> [String] {
+    let process = Process(), pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = [FileManager.default.currentDirectoryPath + "/tools/world-runtime-harness-flags.sh"]
+    process.standardOutput = pipe
+    try? process.run(); process.waitUntilExit()
+    guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
+    return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .split(separator: "\n").map(String.init)
+}
+let worldRuntimeFlags = worldRuntimeHarnessFlags()
+let worldRuntimeObjects = URL(fileURLWithPath: worldRuntimeFlags[1])
+    .deletingLastPathComponent().appendingPathComponent("WorldRuntime.build")
 let compiled = try run("/usr/bin/swiftc", ["-j1", "-parse-as-library",
-    "-I", root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug/Modules").path,
+    "-I", worldRuntimeFlags[1],
     sources.appendingPathComponent("Agent/WorldAgentContext.swift").path,
     sources.appendingPathComponent("Agent/WorldAgentToolContract.swift").path,
     sources.appendingPathComponent("Agent/WorldAgentToolDispatcher.swift").path,
     bridge.path, program.path, "-o", executable.path] + FileManager.default.contentsOfDirectory(
-        at: root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug/WorldRuntime.build"),
+        at: worldRuntimeObjects,
         includingPropertiesForKeys: nil).filter { $0.pathExtension == "o" }.map(\.path))
 guard compiled == 0 else { exit(compiled) }
 exit(try run(executable.path, []))

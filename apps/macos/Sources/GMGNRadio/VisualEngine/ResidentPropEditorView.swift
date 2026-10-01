@@ -7,7 +7,8 @@ import WorldRuntime
 /// （射线命中哪一层就放哪一层；点地面放下；`R` / `⇧R` / `,` / `.` 或物件旁的圆环转
 /// 45°；`Esc` 放回）。面板只留下"选哪一件"和几个不可替代的次要动作：撤销、收回，
 /// 以及**居民右手**那一套（拿着看/放回/微调）——那是"居民真的把东西拿在手里"
-/// （会持久化、要求 2B 角色、最长边 >0.45 m 直接拒绝），和鼠标携带是两件事。
+/// （会持久化、要求 2B 角色、最长边超过
+/// `ResidentPropAttachmentEligibility.holdableLongestEdgeText` 直接拒绝），和鼠标携带是两件事。
 struct ResidentPropEditorView: View {
     @ObservedObject var state: ResidentPropEditorState
     /// 尺寸滑块的手上草稿：拖动过程**不改世界**，松手才提交一次（提交要走摆放判定，
@@ -62,7 +63,12 @@ struct ResidentPropEditorView: View {
             if state.selectedID != nil {
                 Divider().overlay(.white.opacity(0.08))
                 if state.isSelectedHeld {
-                    Text("右手展示微调").foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        Text("\(PropAttachmentSlots.displayName(for: state.selectedHoldPoint))展示微调")
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        slotPicker
+                    }
                     HStack(spacing: 7) {
                         holdStep("向前", z: -0.02); holdStep("向后", z: 0.02)
                         holdStep("向上", y: 0.02); holdStep("向下", y: -0.02)
@@ -80,6 +86,8 @@ struct ResidentPropEditorView: View {
                             .disabled(state.selectedHoldUnavailableReason != nil || state.isSaving)
                         Button("收回") { Task { await state.withdraw() } }
                             .disabled(state.selectedObject?.isEnabled != true)
+                        Spacer()
+                        slotPicker
                     }.controlSize(.small)
                     if let reason = state.selectedHoldUnavailableReason {
                         Text(reason).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2)
@@ -93,7 +101,11 @@ struct ResidentPropEditorView: View {
             // 一行、极短；颜色小方块直接取自格子渲染的同一份 `CellState.tint`
             // （`PropSupportGridPresentation.Legend`），这里**不写第二份 RGB**。
             HStack(spacing: 10) {
-                ForEach(Array(PropSupportGridPresentation.Legend.entries.enumerated()), id: \.offset) { _, entry in
+                // 蓝色那一枚只在**真的派生出竖直面**时才出现：平房间里多一个"能靠墙放"
+                // 的图例，用户会去找一堵根本不存在的墙。
+                ForEach(Array(PropSupportGridPresentation.Legend.entries
+                    .filter { $0.state != .wallPlaceable || state.snapshot.wallFaces > 0 }
+                    .enumerated()), id: \.offset) { _, entry in
                     HStack(spacing: 4) {
                         RoundedRectangle(cornerRadius: 2)
                             .fill(Color(
@@ -108,6 +120,13 @@ struct ResidentPropEditorView: View {
                 Spacer(minLength: 0)
             }
             if !state.notice.isEmpty { Text(state.notice).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+            // 「靠墙」：读的是**判据说可以**的格子数，不是"几何上看起来能靠"。一堵墙都没派生
+            // 出来时如实说"没有竖直面"，而不是显示一个 0 让人以为"有墙但放不了"。
+            Text(state.snapshot.wallFaces == 0
+                 ? "靠墙 · 这个空间里没有识别到竖直面"
+                 : "靠墙 · \(state.snapshot.wallFaces) 面墙，\(state.snapshot.wallPlaceableCells) 格可背朝墙放置")
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+                .accessibilityIdentifier("resident.prop-editor.wall-placement")
             HStack {
                 Button("撤销上次") { Task { await state.undo() } }.disabled(!state.snapshot.canUndo || state.isSaving)
                 Spacer()
@@ -124,6 +143,26 @@ struct ResidentPropEditorView: View {
         .onExitCommand { state.escape() }
         .disabled(state.isSaving)
     }
+    /// 挂点：手里 / 背后 / 腰间。
+    ///
+    /// 改一下就是一次**世界命令**（没拿时是「拿起」，已经拿在手上时是就地换挂点），
+    /// 不是本地开关：找不到那个挂点的骨骼时世界会拒绝并给出读得懂的理由，选中格自己会弹回
+    /// （`selectedHoldPoint` 读的是世界状态那一份，不是这里记的一份）。
+    private var slotPicker: some View {
+        Picker("挂点", selection: Binding(
+            get: { state.selectedHoldPoint },
+            set: { point in Task { await state.holdSelected(at: point) } }
+        )) {
+            ForEach(PropAttachmentPoint.allCases, id: \.self) { point in
+                Text(PropAttachmentSlots.displayName(for: point)).tag(point)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .frame(width: 156)
+        .controlSize(.small)
+    }
+
     private func holdStep(_ title: String, y: Float = 0, z: Float = 0) -> some View {
         Button(title) { Task { await state.nudgeHeld(y: y, z: z) } }
             .help("微调 2 厘米")

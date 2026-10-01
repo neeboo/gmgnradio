@@ -1,5 +1,19 @@
 import Foundation
 
+// WorldRuntime 的模块搜索路径与目标文件**只有一处定义**：tools/world-runtime-harness-flags.sh。
+// harness 一律调用它，绝不自己拼 `.build/...`（27 份各自拼写正是 SwiftPM 模块与 xcodebuild
+// `Products/Debug` 旧模块两份并存的根因，后者报 `WorldQuaternion` 没有 `identity`）。
+func worldRuntimeHarnessFlags() -> [String] {
+    let process = Process(), pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = [FileManager.default.currentDirectoryPath + "/tools/world-runtime-harness-flags.sh"]
+    process.standardOutput = pipe
+    try? process.run(); process.waitUntilExit()
+    guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
+    return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .split(separator: "\n").map(String.init)
+}
+
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let sources = ["Presence/PropGenerationClient", "Presence/PropGenerationStore", "Presence/PropImagePreparation",
                "Presence/WishMachineOutputDescriptor", "Presence/WishMachineCoordinator",
@@ -952,6 +966,6 @@ defer { try? FileManager.default.removeItem(at: tmp) }
 let checks = tmp.appendingPathComponent("checks.swift"), binary = tmp.appendingPathComponent("checks")
 try program.write(to: checks, atomically: true, encoding: .utf8)
 let compiler = Process(); compiler.executableURL = URL(fileURLWithPath: "/usr/bin/nice")
-compiler.arguments = ["-n", "15", "swiftc", "-j1", "-parse-as-library"] + sources.map(\.path) + [checks.path, "-o", binary.path]
+compiler.arguments = ["-n", "15", "swiftc", "-j1", "-parse-as-library"] + worldRuntimeHarnessFlags() + sources.map(\.path) + [checks.path, "-o", binary.path]
 try compiler.run(); compiler.waitUntilExit(); guard compiler.terminationStatus == 0 else { exit(compiler.terminationStatus) }
 let run = Process(); run.executableURL = binary; try run.run(); run.waitUntilExit(); exit(run.terminationStatus)

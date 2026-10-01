@@ -37,6 +37,9 @@ enum ResidentPropPlacementError: Error, Equatable, LocalizedError {
     case inactiveContext, environmentNotReady, unknownSurface, outsideSurface, collision(String), blockedRoute(String)
     case blockedBySupport(PropSupportBlockReason)
     case avatarUnavailable, avatarChanged, attachmentUnsupported(String), propTooLarge(String), activityActive, notHeld
+    /// 判据分层的**类型前提**被违反：一次被当成"入库登记"的提交，候选状态里那件东西却在空间里。
+    /// 分类错了就必须 fail-closed 拒绝，而不是悄悄跳过空间判据（见 `ResidentPropLayoutIntent`）。
+    case inventoryRegistrationInSpace(String)
     var errorDescription: String? {
         switch self {
         case .inactiveContext: "当前空间或编辑操作已结束。"
@@ -49,9 +52,63 @@ enum ResidentPropPlacementError: Error, Equatable, LocalizedError {
         case .avatarUnavailable: "当前没有可用于手持展示的居民。"
         case .avatarChanged: "居民已经更换，这次手持操作没有保存。"
         case .attachmentUnsupported(let reason): reason
-        case .propTooLarge(let name): "\(name) 最长边超过 45 厘米，只能摆放，暂时不能拿在手里。"
+        // 拒绝文案与判据**同源**：上限只有一个定义，文案插值的就是它 ——
+        // 改数字时文案自动跟着改，不可能再出现"判据与嘴上说的不是同一个数"。
+        case .propTooLarge(let name): "\(name) 最长边超过 \(ResidentPropAttachmentEligibility.holdableLongestEdgeText)，只能摆放，暂时不能拿在手里。"
         case .activityActive: "居民正在进行正式活动，请先停止活动再拿起物件。"
         case .notHeld: "这个物件当前没有拿在手里。"
+        case .inventoryRegistrationInSpace(let name): "入库登记只收未摆出的物件，\(name) 现在在空间里。"
+        }
+    }
+}
+
+/// 一次布局提交的**意图**：它决定这次提交要过哪一层判据。
+///
+/// 为什么必须是**类型**、而不是 `validate` 里的一个 `if isRegister { skip }`：
+/// `WorldPropLayoutCommand` 是会长出新 case 的开放集合，而"这次提交碰不碰空间"是每加一个
+/// case 都必须回答的问题。把它收成**唯一一处**对命令的穷尽 `switch`（`resolve(_:in:)`），
+/// 编译器就会在有人加命令时逼他回答；散落的 `if` 只会让新命令悄悄沿用某一条默认值
+/// —— 那正是"第二种真相"长出来的形状。
+enum ResidentPropLayoutIntent: Equatable {
+    /// **入库登记**：这件东西**不在空间里**（未摆出、也没拿在手上），没有落点可言。
+    /// 判据只有归属与资产：物件身份 / 尺寸合法 / 资产存在且哈希自洽 / 请求幂等。
+    /// **不得**要求承托面、可达、通道、与已摆物件不重叠 —— 库存里的东西不在空间里。
+    case inventoryRegistration(objectID: String)
+    /// **空间变更**：候选状态里"空间里有什么、它在哪"变了（新摆 / 移动 / 收起 / 手持 /
+    /// 改尺寸 / 加能力 / 撤销）。判据是**全部**空间判据（`ResidentPropPlacementService.validate(_:)`，
+    /// 一个字不放宽）。
+    case spatialChange(objectID: String)
+}
+
+extension ResidentPropLayoutIntent {
+    /// 命令 + 现状 → 意图的**唯一一份**换算。默认方向是 `.spatialChange`（fail-closed）：
+    /// 只有能证明"这次提交不碰空间"的命令才是登记。
+    ///
+    /// `state` 是**提交前**的现状（`ResidentPropPlacementService.commit` 读的是
+    /// `context.state`）：这里要回答的是"这件东西**现在**在不在空间里"。
+    static func resolve(_ command: WorldPropLayoutCommand, in state: WorldState) -> Self {
+        switch command {
+        case let .register(prop):
+            // `applyPropLayout(.register)` 写下的候选条目是 `isEnabled == false`：只多一条
+            // 库存记录，空间里没有它 —— 承托面/互斥/通路这些判据连输入都没有。
+            return .inventoryRegistration(objectID: prop.objectID)
+        case let .resize(objectID, _):
+            // 改**库存里那件**的尺寸：没摆出来、也没拿在手里 ⇒ 空间里没有它。
+            // 已摆出/在手的那一件仍然要走空间判据（footprint 变了）。
+            guard let item = state.objectStates[objectID], !item.isEnabled,
+                  state.heldProp?.objectID != objectID
+            else { return .spatialChange(objectID: objectID) }
+            return .inventoryRegistration(objectID: objectID)
+        case let .place(objectID, _), let .withdraw(objectID), let .hold(objectID, _, _),
+             let .adjustGrip(objectID, _, _), let .returnHeld(objectID, _),
+             let .enableCapability(objectID, _):
+            // 全部会改变"空间里有什么 / 它在哪"：place/hold/returnHeld 让物件进出空间，
+            // withdraw 把它收起来，enableCapability 增删功能点锚点（通路判据的输入），
+            // adjustGrip 只动手里那一份状态 —— 但它与 `returnState` 同族，一并保守处理。
+            return .spatialChange(objectID: objectID)
+        case .undo:
+            // 撤销恢复的是**上一件物件在空间里的位置**（`layoutUndo`），默认保守。
+            return .spatialChange(objectID: state.layoutUndo?.objectID ?? "")
         }
     }
 }
@@ -64,13 +121,13 @@ final class ResidentPropPlacementService {
     private let prepare: (WorldGeneratedProp) throws -> Void
     private let isCurrent: () -> Bool
     private let currentAvatarAssetID: () -> String?
-    private let makeGripCalibration: (WorldGeneratedProp, String) throws -> WorldPropGripCalibration
+    private let makeGripCalibration: (WorldGeneratedProp, String, PropAttachmentPoint) throws -> WorldPropGripCalibration
     init(context: WorldAgentContext,
          support: @escaping () -> ResidentPropPlacementSupport? = { nil },
          prepare: @escaping (WorldGeneratedProp) throws -> Void = { _ in },
          isCurrent: @escaping () -> Bool = { true },
          currentAvatarAssetID: @escaping () -> String? = { nil },
-         makeGripCalibration: @escaping (WorldGeneratedProp, String) throws -> WorldPropGripCalibration = { _,_ in
+         makeGripCalibration: @escaping (WorldGeneratedProp, String, PropAttachmentPoint) throws -> WorldPropGripCalibration = { _,_,_ in
              throw ResidentPropPlacementError.attachmentUnsupported("当前居民还没有右手展示适配。")
          }) {
         self.context = context; self.support = support; self.prepare = prepare; self.isCurrent = isCurrent
@@ -128,23 +185,46 @@ final class ResidentPropPlacementService {
         }
     }
 
-    func holdCommand(objectID: String) throws -> WorldPropLayoutCommand {
+    /// 拿起来（默认右手）**或**把这件已经在手上的物件换到别的挂点。
+    ///
+    /// 换挂点走的还是 `.hold` 那条世界命令族里既有的 `.adjustGrip`：同一条归属轴、同一份
+    /// `returnState`（放回哪儿仍然是拿起前那一处），所以"换挂点"不会顺手改掉"从哪儿来回哪儿去"。
+    func holdCommand(objectID: String, point: PropAttachmentPoint = .rightHand) throws -> WorldPropLayoutCommand {
         guard isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
         guard context.state.activeActivity == nil else { throw ResidentPropPlacementError.activityActive }
         guard let avatarID = currentAvatarAssetID() else { throw ResidentPropPlacementError.avatarUnavailable }
         guard let prop = context.state.objectStates[objectID]?.generatedProp else { throw WorldPropLayoutError.invalidObject }
+        // 已经挂在身上的是**同一件**物件 ⇒ 这是"换挂点"，不是"再拿一次"（`.hold` 会以
+        // `heldPropAlreadyExists` 拒绝，而用户说的正是"把它挂到背后去"）。
+        if let held = context.state.heldProp, held.objectID == objectID {
+            guard held.avatarAssetID == avatarID else { throw ResidentPropPlacementError.avatarChanged }
+            return try remountCommand(objectID: objectID, point: point, avatarID: avatarID, prop: prop)
+        }
         guard context.state.heldProp == nil else {
             throw ResidentPropPlacementError.attachmentUnsupported("居民一次只能拿一件物件，请先放回手里的物件。")
         }
-        guard max(prop.size.x, max(prop.size.y, prop.size.z)) <= 0.45 else {
+        // 手持尺寸闸门：**上限只有一处定义**（`ResidentPropAttachmentEligibility.holdableLongestEdgeMeters`），
+        // 拒绝文案（本文件上面那条 `propTooLarge`）、系统提示词、面板注释读的都是它。
+        // `holdEligibility` 也走这个方法 ⇒ 判据没有第二个入口。
+        guard max(prop.size.x, max(prop.size.y, prop.size.z))
+            <= ResidentPropAttachmentEligibility.holdableLongestEdgeMeters else {
             throw ResidentPropPlacementError.propTooLarge(prop.displayName)
         }
         return .hold(objectID: objectID, avatarAssetID: avatarID,
-                     calibration: try makeGripCalibration(prop, avatarID))
+                     calibration: try makeGripCalibration(prop, avatarID, point))
     }
 
-    func holdEligibility(objectID: String) -> String? {
-        do { _ = try holdCommand(objectID: objectID); return nil }
+    /// 就地把这件已挂载的物件换到另一个挂点：新标定整份由**挂点定义**给出
+    /// （偏移/朝向/握点都是那个挂点的默认值，不是把手的默认值套上去），
+    /// 走 `.adjustGrip` —— 既有命令，不动摆放轴与归属轴，`returnState` 一个字不改。
+    private func remountCommand(objectID: String, point: PropAttachmentPoint,
+                                avatarID: String, prop: WorldGeneratedProp) throws -> WorldPropLayoutCommand {
+        .adjustGrip(objectID: objectID, avatarAssetID: avatarID,
+                    calibration: try makeGripCalibration(prop, avatarID, point))
+    }
+
+    func holdEligibility(objectID: String, point: PropAttachmentPoint = .rightHand) -> String? {
+        do { _ = try holdCommand(objectID: objectID, point: point); return nil }
         catch { return error.localizedDescription }
     }
 
@@ -155,11 +235,13 @@ final class ResidentPropPlacementService {
         guard let held = context.state.heldProp, held.objectID == objectID else { throw ResidentPropPlacementError.notHeld }
         guard held.avatarAssetID == avatarID else { throw ResidentPropPlacementError.avatarChanged }
         guard let item = context.state.objectStates[objectID], let existing = item.gripCalibration,
-              existing.avatarAssetID == avatarID, existing.hand == .rightHand else {
-            throw ResidentPropPlacementError.attachmentUnsupported("这个物件还没有当前居民的右手握点。")
+              existing.avatarAssetID == avatarID else {
+            throw ResidentPropPlacementError.attachmentUnsupported("这个物件还没有当前居民的挂点标定。")
         }
+        // 微调**只动偏移与朝向**，挂点跟着既有标定走（`existing.hand`）：在背后微调不会
+        // 把东西挪回手里。
         return .adjustGrip(objectID: objectID, avatarAssetID: avatarID,
-            calibration: .init(avatarAssetID: avatarID, hand: .rightHand,
+            calibration: .init(avatarAssetID: avatarID, hand: existing.hand,
                 normalizedGrip: existing.normalizedGrip, localOffset: localOffset, localRotation: localRotation))
     }
 
@@ -198,14 +280,60 @@ final class ResidentPropPlacementService {
     func commit(_ command: WorldPropLayoutCommand, expectedLayoutRevision: UInt64, requestID: String) throws -> WorldState {
         guard isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
         try validateAttachmentAuthorization(command)
+        // 这次提交要过哪一层判据 —— 换算只有一处（`ResidentPropLayoutIntent.resolve`）。
+        // 基线取**提交前**的现状："这件东西现在在不在空间里"是这条命令的属性。
+        let baseline = context.state
+        let intent = ResidentPropLayoutIntent.resolve(command, in: baseline)
         return try context.commitPropLayout(command, expectedLayoutRevision: expectedLayoutRevision, requestID: requestID) { state in
-            try validate(state)
-            for item in state.objectStates.values where item.isEnabled || state.heldProp?.objectID == item.generatedProp?.objectID {
-                if let prop = item.generatedProp { try prepare(prop) }
+            switch intent {
+            case let .inventoryRegistration(objectID):
+                // 入库登记：**不**跑空间判据（见该函数的说明）。
+                try validateInventoryRegistration(objectID: objectID, in: state, baseline: baseline)
+            case .spatialChange:
+                // 摆放/移动/收起/手持/能力/撤销：**今天全部**判据，一个字不放宽。
+                try validate(state)
+                for item in state.objectStates.values where item.isEnabled || state.heldProp?.objectID == item.generatedProp?.objectID {
+                    if let prop = item.generatedProp { try prepare(prop) }
+                }
             }
             guard isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
             try validateAttachmentAuthorization(command)
         }
+    }
+
+    /// **入库登记那一层**的判据：只回答"这件东西属于谁、它的资产在不在"。
+    ///
+    /// 它回答的**不是**"这件东西摆不摆得下"：库存里的东西不在空间里
+    /// （`applyPropLayout(.register)` 写下的候选条目是 `isEnabled == false`），没有落点可判。
+    /// 真机 2026-10-01 `2B 白色长剑` 的登记被"这里不是可以摆放的承托面"拒掉，而那句话判的
+    /// 其实是**房间里已经摆出的斧头** —— 与这次登记毫无关系：那把剑在 `state.json` 里连一条
+    /// `objectStates` 都没有，更谈不上落点（实测见 `tools/test-resident-prop-placement.swift`
+    /// 的"已领取但入库被拒"那一节：把空间判据接回登记，它就会带着那个缺陷变红）。
+    ///
+    /// 判据清单（与"归属与资产"一一对应）：
+    /// - **物件身份**：候选状态里必须有这条带 `generatedProp` 的库存条目，且 `objectID` 与这次
+    ///   登记一致（尺寸合法性由 `WorldGeneratedProp.isValid` 回答，越界尺寸由
+    ///   `WorldPropSizePolicy` 在 `applyPropLayout(.resize)` 里拒绝）；
+    /// - **归属 / 资产存在且哈希自洽**：由宿主注入的 `prepare` 回答（生产宿主读的是
+    ///   `residentOwnedPropAssets` 与渲染器已备好的那一份，两者都以回执的产物哈希为准）；
+    /// - **请求幂等**：由 `WorldSimulation.applyPropLayout` 的 `layoutReceipts` 回答
+    ///   （同一 `claimed.<jobID>` 重放不会写第二遍，也不会再涨 `layoutRevision`）。
+    ///
+    /// 另有一条**类型前提**在运行时被钉住：既然意图是"入库登记"，这次**新建**的那条库存条目
+    /// 就必须不在空间里。分类错了（将来有人把一条会启用物件的命令归成登记）会在这里
+    /// fail-closed 拒绝，而不是悄悄跳过空间判据。已有条目（幂等重放：`.register` 对已存在的
+    /// 物件只补一条回执、从不改动它）不在候选里被改动，所以不在这里重判。
+    private func validateInventoryRegistration(objectID: String,
+                                               in state: WorldState,
+                                               baseline: WorldState) throws {
+        guard let item = state.objectStates[objectID], let prop = item.generatedProp,
+              prop.objectID == objectID else {
+            throw WorldPropLayoutError.invalidObject
+        }
+        if baseline.objectStates[objectID] == nil, item.isEnabled {
+            throw ResidentPropPlacementError.inventoryRegistrationInSpace(prop.displayName)
+        }
+        try prepare(prop)
     }
 
     private func validateAttachmentAuthorization(_ command: WorldPropLayoutCommand) throws {
@@ -242,8 +370,10 @@ final class ResidentPropPlacementService {
         placed.sort { $0.0 < $1.0 }
         // 承托几何拿不到就一律拒绝（fail-closed），而不是"随便放"。
         //
-        // 守卫在**循环里**是刻意的：`register`（只把物件收进库存、还没摆出来）没有承托面可判，
-        // 于是它不需要承托几何也能成立；只有真的要判定"摆在哪"时才要求几何。
+        // 这个循环只会看到**空间里**的物件（`WorldLayoutObstacles` 只报 `isEnabled` 的，
+        // 外加手持物的保留放回位）。入库登记（`.register`）根本走不到这里 ——
+        // 它走的是 `ResidentPropLayoutIntent.inventoryRegistration` 那一层，判据只有
+        // 归属与资产（见 `validateInventoryRegistration`）。
         for (id,item,obstacle) in placed {
             guard item.generatedProp?.objectID == id, let prop = item.generatedProp else {
                 throw WorldPropLayoutError.invalidObject

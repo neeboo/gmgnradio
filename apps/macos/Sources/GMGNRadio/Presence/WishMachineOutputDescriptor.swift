@@ -1,5 +1,6 @@
 import Foundation
 import simd
+import WorldRuntime
 
 @MainActor final class ResidentPropRenderOwner {}
 
@@ -33,6 +34,12 @@ struct ResidentPropRenderDescriptor: Equatable, Sendable {
     let targetHeightMeters: Float
     var position: SIMD3<Float>
     var yaw: Float
+    /// **资产级**摆正旋转（`WorldGeneratedProp.orientationRotation`）。
+    ///
+    /// 它与 `yaw` 是两件事、也是两份数据：`yaw` 是"用户在房间里把它转到哪边"（放置级，
+    /// 存在 `transform.rotation` 里），这里是"这件网格生成出来就是躺着的"（资产级，
+    /// 存在物件元数据里）。缺省 = 单位四元数 ⇒ 与改造前逐字节相同。
+    var orientation: WorldQuaternion = .identity
     var assetKey: String { assetID + "|" + modelURL.standardizedFileURL.path }
 }
 
@@ -45,10 +52,12 @@ extension ResidentPropRenderDescriptor {
     /// 排查时的第一嫌疑）。它只依赖 Foundation + simd，离线 harness 能直接跑。
     static func residentProp(objectID: String, worldID: String, assetID: String, modelURL: URL,
                              targetHeightMeters: Float, position: SIMD3<Float>,
-                             rotation: SIMD4<Float>) -> Self {
+                             rotation: SIMD4<Float>,
+                             orientation: WorldQuaternion = .identity) -> Self {
         .init(objectID: objectID, worldID: worldID, assetID: assetID, modelURL: modelURL,
               targetHeightMeters: targetHeightMeters, position: position,
-              yaw: atan2(2 * rotation.w * rotation.y, 1 - 2 * rotation.y * rotation.y))
+              yaw: atan2(2 * rotation.w * rotation.y, 1 - 2 * rotation.y * rotation.y),
+              orientation: orientation)
     }
 }
 
@@ -83,16 +92,60 @@ enum ResidentPropRenderSelection {
 }
 
 enum ResidentPropPlacementMatrix {
-    static func transform(minimum: SIMD3<Float>, maximum: SIMD3<Float>, targetHeight: Float, position: SIMD3<Float>, yaw: Float) throws -> simd_float4x4 {
+    /// 已摆物件在世界里的**唯一**一份变换：
+    /// `T(position) · Ry(yaw) · orientation · 归一化(原始包围盒)`。
+    ///
+    /// `orientation` 是**资产级**的摆正旋转（`WorldGeneratedProp.orientationRotation`）：
+    /// 网格躺着生成时把它转正，`yaw` 才是用户在房间里选的那个朝向。两者相乘**只在这里**
+    /// 发生一次 —— 判据/碰撞盒读的是已经转正的那一份 `effectiveSize` + 同一个 `yaw`，
+    /// 所以画面与判定不可能各转各的。
+    ///
+    /// `orientation` 为单位四元数时走的仍是原来那一行（`rotation * normalized`），
+    /// 逐位不变：已经立着的资产（绝大多数）画面一个像素都不差。
+    static func transform(minimum: SIMD3<Float>, maximum: SIMD3<Float>, targetHeight: Float,
+                          position: SIMD3<Float>, yaw: Float,
+                          orientation: WorldQuaternion = .identity) throws -> simd_float4x4 {
         guard yaw.isFinite else { throw WishMachineOutputError.invalidDimensions }
-        let normalized = try WishMachineOutputPlacement.transform(minimum: minimum, maximum: maximum, targetHeight: targetHeight, outlet: .zero)
-        var rotation = matrix_identity_float4x4
+        guard !WorldPropRotation.isIdentity(orientation) else {
+            let normalized = try WishMachineOutputPlacement.transform(minimum: minimum, maximum: maximum, targetHeight: targetHeight, outlet: .zero)
+            var rotation = matrix_identity_float4x4
+            let c = cos(yaw), s = sin(yaw)
+            rotation.columns.0 = SIMD4(c, 0, -s, 0)
+            rotation.columns.2 = SIMD4(s, 0, c, 0)
+            rotation.columns.3 = SIMD4(position, 1)
+            guard position.x.isFinite, position.y.isFinite, position.z.isFinite else { throw WishMachineOutputError.invalidDimensions }
+            return rotation * normalized
+        }
+        // 转正之后重新量一次包围盒：缩放/居中必须按**转正后**的盒算，否则躺着的物件
+        // 会被按"原始 Y 跨度"缩放（真机那把剑：1.1 / 0.133 = 8.24 倍，8.28 m 长）。
+        let oriented = WorldPropOrientationPolicy.orientedBounds(
+            minimum: minimum, maximum: maximum, rotation: orientation)
+        let height = oriented.maximum.y - oriented.minimum.y
+        guard height.isFinite, height > 0.00001,
+              targetHeight.isFinite, targetHeight > 0, targetHeight <= 10,
+              [position.x, position.y, position.z, oriented.minimum.x, oriented.maximum.x,
+               oriented.minimum.z, oriented.maximum.z, oriented.minimum.y].allSatisfy(\.isFinite)
+        else { throw WishMachineOutputError.invalidDimensions }
+        let scale = targetHeight / height
+        guard scale.isFinite, scale > 0 else { throw WishMachineOutputError.invalidDimensions }
+        let centreX = (oriented.minimum.x + oriented.maximum.x) / 2
+        let centreZ = (oriented.minimum.z + oriented.maximum.z) / 2
+        var translation = matrix_identity_float4x4
+        translation.columns.3 = SIMD4(position, 1)
+        var yawRotation = matrix_identity_float4x4
         let c = cos(yaw), s = sin(yaw)
-        rotation.columns.0 = SIMD4(c, 0, -s, 0)
-        rotation.columns.2 = SIMD4(s, 0, c, 0)
-        rotation.columns.3 = SIMD4(position, 1)
-        guard position.x.isFinite, position.y.isFinite, position.z.isFinite else { throw WishMachineOutputError.invalidDimensions }
-        return rotation * normalized
+        yawRotation.columns.0 = SIMD4(c, 0, -s, 0)
+        yawRotation.columns.2 = SIMD4(s, 0, c, 0)
+        var recentre = matrix_identity_float4x4
+        recentre.columns.3 = SIMD4(-centreX * scale, -oriented.minimum.y * scale, -centreZ * scale, 1)
+        var scaling = matrix_identity_float4x4
+        scaling.columns.0.x = scale; scaling.columns.1.y = scale; scaling.columns.2.z = scale
+        var upright = matrix_identity_float4x4
+        let (x, y, z, w) = (orientation.x, orientation.y, orientation.z, orientation.w)
+        upright.columns.0 = SIMD4(1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w), 0)
+        upright.columns.1 = SIMD4(2 * (x * y - z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w), 0)
+        upright.columns.2 = SIMD4(2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y), 0)
+        return translation * yawRotation * recentre * scaling * upright
     }
 }
 

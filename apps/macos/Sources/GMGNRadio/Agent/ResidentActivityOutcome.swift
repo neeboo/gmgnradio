@@ -3,6 +3,10 @@ import Foundation
 enum ResidentActivityOutcomeError: Error, LocalizedError, Equatable {
     case unsupportedPlaybackSource, effectAlreadyHandled, interrupted, timedOut
     case musicNotPrepared
+    /// 这一轮的点唱机操作**不是被取消**，而是它的授权上下文变了（换了世界 / 换了
+    /// 对话轮次 / 空间进了装修模式）。原因必须逐字带出来：真机上用户问的就是
+    /// "为什么没出声"，"已取消"不是答案。
+    case contextChanged(String)
     var errorDescription: String? {
         switch self {
         case .unsupportedPlaybackSource: "当前点唱机操作暂不支持该播放源，请使用播放器手动操作。"
@@ -10,6 +14,7 @@ enum ResidentActivityOutcomeError: Error, LocalizedError, Equatable {
         case .interrupted: "本次点唱机操作已取消或被其他活动替换。"
         case .timedOut: "居民未能及时完成点唱机操作。"
         case .musicNotPrepared: "当前没有已准备的曲目，音乐尚未播放。可通过可用音乐工具查询状态和已有歌单。"
+        case let .contextChanged(reason): "点唱机操作被提前结束：\(reason)。音乐尚未播放。"
         }
     }
 }
@@ -27,6 +32,7 @@ final class ResidentActivityOutcome {
     }
     private let context: WorldAgentContext
     private let isCurrent: @MainActor () -> Bool
+    private let currentBlocker: @MainActor () -> String?
     private let play: @MainActor (UUID) async throws -> Void
     private let pause: @MainActor (UUID?) async throws -> Void
     private let sleep: @MainActor () async throws -> Void
@@ -39,6 +45,7 @@ final class ResidentActivityOutcome {
     init(
         context: WorldAgentContext,
         isCurrent: @escaping @MainActor () -> Bool,
+        currentBlocker: @escaping @MainActor () -> String? = { nil },
         play: @escaping @MainActor (UUID) async throws -> Void,
         pause: @escaping @MainActor (UUID?) async throws -> Void,
         sleep: @escaping @MainActor () async throws -> Void = {
@@ -48,6 +55,7 @@ final class ResidentActivityOutcome {
     ) {
         self.context = context
         self.isCurrent = isCurrent
+        self.currentBlocker = currentBlocker
         self.play = play
         self.pause = pause
         self.sleep = sleep
@@ -115,7 +123,13 @@ final class ResidentActivityOutcome {
             if attempted { try? await pause(instance.playbackID) }
             let code: String
             let message: String
-            if error is CancellationError || aborted || !isCurrent() || (error as? ResidentActivityOutcomeError) == .interrupted {
+            if let changed = error as? ResidentActivityOutcomeError,
+               case let .contextChanged(reason) = changed {
+                // 先判它：`contextChanged` 也满足 `!isCurrent()`，混进下一个分支就
+                // 又变回"已取消"，原因再次丢失。
+                code = "activity_context_changed"
+                message = ResidentActivityOutcomeError.contextChanged(reason).localizedDescription
+            } else if error is CancellationError || aborted || !isCurrent() || (error as? ResidentActivityOutcomeError) == .interrupted {
                 code = "activity_cancelled"; message = "本次点唱机操作已取消或被其他活动替换。"
             } else if (error as? ResidentActivityOutcomeError) == .unsupportedPlaybackSource {
                 code = "playback_source_unsupported"; message = ResidentActivityOutcomeError.unsupportedPlaybackSource.localizedDescription
@@ -131,8 +145,15 @@ final class ResidentActivityOutcome {
     }
 
     private func requireCurrent(_ instance: OwnedActivity) throws {
-        guard !aborted, !Task.isCancelled, isCurrent(), owned?.callID == instance.callID,
+        guard !aborted, !Task.isCancelled, owned?.callID == instance.callID,
               ownsCurrentActivity() else { throw ResidentActivityOutcomeError.interrupted }
+        // 「不再 current」和「被取消」是两件事。混在一起报，用户只能听到"已取消"，
+        // 而真实原因（换了世界 / 换了轮次 / 空间进了装修模式）无人知晓。
+        guard isCurrent() else {
+            throw ResidentActivityOutcomeError.contextChanged(
+                currentBlocker() ?? "本轮点唱机操作的授权已经失效"
+            )
+        }
         guard Date() < deadline else { throw ResidentActivityOutcomeError.timedOut }
     }
 

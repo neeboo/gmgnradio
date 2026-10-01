@@ -37,6 +37,23 @@ import WorldRuntime
     @Published private(set) var cellStates: [PropSupportGridPresentation.Cell: PropSupportGridPresentation.CellState] = [:]
     /// 当前 footprint 朝向（弧度，已归一化）。45° 步进由 `rotateFootprint(bySteps:)` 驱动。
     @Published private(set) var footprintYaw: Float = 0
+    /// **靠墙可放**的格子数（面板读它）。与 `cellStates` 里 `.wallPlaceable` 的个数**同一个数**。
+    @Published private(set) var wallPlaceableCellCount = 0
+    /// 派生出来的竖直面（墙面）。**从既有几何派生**，与承托网格同一批三角形、同一份边界；
+    /// 不存档、不写回，每次重开建造模式重算。
+    private(set) var wallPatches: [WorldPropWallPatch] = []
+    /// 靠墙可放的那批格子（与 footprint/发光同一份 `cellStates`，写入口只有 `publishCellStates`）。
+    private var wallStates: [PropSupportGridPresentation.Cell: PropSupportGridPresentation.CellState] = [:]
+    /// 上一次算靠墙可放时的输入签名：只在**物件或网格变了**时重算，鼠标移动不重算。
+    private var wallVerdictKey: String?
+    /// 一次重算最多给**每面墙**试几个候选（防御：真实舱体的墙很长、候选很多）。
+    static let maximumWallCandidatesPerPatch = 12
+
+    /// 一次派生的两样产物：承托网格 + 从同一批三角形派生出来的竖直面。
+    private struct ResidentPropGridDerivation: Sendable {
+        let grid: PropSupportGrid
+        let walls: [WorldPropWallPatch]
+    }
     /// 光标正悬停的**已摆物件**（The Sims 的 white glow 语义）。nil = 光标不在任何已摆物件上。
     ///
     /// 由宿主在每次光标移动时设置（见 `setHoveredProp`）。它**不是**"选中"：
@@ -105,6 +122,8 @@ import WorldRuntime
     /// 值类型 `PropSupportGrid` 是 `Sendable` 的不可变快照，本类型又是 `@MainActor`，
     /// 所以这份持有不引入任何跨线程共享（`SWIFT_STRICT_CONCURRENCY: complete` 下合法）。
     private var cachedGrids: [String: PropSupportGrid] = [:]
+    /// 与 `cachedGrids` 同键的竖直面（同一次派生算出来的，命中缓存时一起复用）。
+    private var cachedWalls: [String: [WorldPropWallPatch]] = [:]
     private var cachedGridOrder: [String] = []
     /// 缓存上界：只保留最近这么多个世界的网格，避免换世界时无限增长。
     static let retainedGridLimit = 2
@@ -247,8 +266,9 @@ import WorldRuntime
             grid = cached
             report = cached.report
             gridKey = key
-            Self.log.notice("格子派生：命中缓存 key=\(key, privacy: .public) 层=\(cached.layers.count, privacy: .public)")
+            Self.log.notice("格子派生：命中缓存 key=\(key, privacy: .public) 层=\(cached.layers.count, privacy: .public) 墙面=\(self.cachedWalls[key]?.count ?? -1, privacy: .public)")
             rebuildCaches(from: cached)
+            setWallPatches(cachedWalls[key] ?? [])
             clearHover()
             onGridChanged?()
             return
@@ -260,17 +280,23 @@ import WorldRuntime
         // 派生是**纯计算**，且真实舱体一次要 0.5 s（-O）/ 6.6 s（-Onone）。
         // 同步做会把打开装修编辑器的那一帧卡住，所以放后台；`PropSupportGrid` 是 Sendable。
         let built = await Task.detached(priority: .userInitiated) {
-            PropSupportGridBuilder.build(
+            let grid = PropSupportGridBuilder.build(
                 collision: collision,
                 bounds: bounds,
                 seed: seed,
                 parameters: parameters
             )
+            // 竖直面从**同一批三角形**派生（与承托网格同一次范围查询），不新开一份世界几何。
+            let walls = WorldPropWallGrid.derive(
+                triangles: collision.triangles(in: bounds), bounds: bounds, grid: grid
+            )
+            return ResidentPropGridDerivation(grid: grid, walls: walls)
         }.value
         let elapsed = startedAt.duration(to: .now)
         // 算完的东西**先留在缓存里**：关掉面板不该丢掉一次已经跑完的派生（"同一世界算一遍就够"）。
         // 之前这里在写回之前就返回，于是"关掉再打开"每次都要从头再算一遍。
-        storeCachedGrid(built, key: key)
+        storeCachedGrid(built.grid, key: key)
+        cachedWalls[key] = built.walls
         // 派生期间编辑器可能已经被关掉（明确意图）或切到了别的世界：那就别把结果写回**激活状态**。
         guard activeKey == key, gridKey != key else {
             // 这条过去是完全静默的：一次算完的派生被丢掉，外面却还留着"请求过"的印记。
@@ -278,14 +304,15 @@ import WorldRuntime
             Self.log.notice("格子派生：结果已进缓存但未写回激活状态（建造模式开着=\(self.isBuildModeActive, privacy: .public) 缓存键相同=\(self.gridKey == key, privacy: .public) 激活键=\(self.activeKey ?? "nil", privacy: .public)）key=\(key, privacy: .public)")
             return
         }
-        grid = built
-        report = built.report
+        grid = built.grid
+        report = built.grid.report
         gridKey = key
-        rebuildCaches(from: built)
+        rebuildCaches(from: built.grid)
+        setWallPatches(built.walls)
         clearHover()
-        let report = built.report
+        let report = built.grid.report
         Self.log.notice(
-            "格子派生：完成 key=\(key, privacy: .public) 耗时=\(elapsed.description, privacy: .public) 层=\(built.layers.count, privacy: .public) 列=\(self.cells.count, privacy: .public) 种上=\(report.seeded, privacy: .public) 过滤前=\(report.layersBeforeFilter, privacy: .public)"
+            "格子派生：完成 key=\(key, privacy: .public) 耗时=\(elapsed.description, privacy: .public) 层=\(built.grid.layers.count, privacy: .public) 列=\(self.cells.count, privacy: .public) 种上=\(report.seeded, privacy: .public) 过滤前=\(report.layersBeforeFilter, privacy: .public)"
         )
         onGridChanged?()
     }
@@ -331,6 +358,10 @@ import WorldRuntime
         layerRefs = [:]
         hoveredPropID = nil
         hoverTarget = nil
+        wallPatches = []
+        wallStates = [:]
+        wallVerdictKey = nil
+        wallPlaceableCellCount = 0
         clearHover()
         onGridChanged?()
     }
@@ -472,6 +503,10 @@ import WorldRuntime
             blockingVolumes: blockingVolumes,
             placedProps: placedProps
         )
+        // 靠墙可放：与地板判定同一组输入（物件 + 尺寸 + 房间现状），同一**判定出口**。
+        refreshWallPlaceability(
+            objectID: objectID, footprintSize: footprintSize, height: height
+        )
         reevaluateFootprint()
     }
 
@@ -562,7 +597,9 @@ import WorldRuntime
     /// 发光**覆盖**在同一格上的判定色（那件物件所在的位置，用户此刻要的是"点它能拿起来"，
     /// 而不是"这里能不能放"）。
     private func publishCellStates() {
-        var states = footprintStates
+        // 层级：靠墙（蓝） < footprint 判定（黄/红） < 悬停发光（青白）。后写的赢。
+        var states = wallStates
+        for (cell, state) in footprintStates { states[cell] = state }
         for (cell, state) in hoverTargetStates() { states[cell] = state }
         cellStates = states
         onGridChanged?()
@@ -643,7 +680,76 @@ import WorldRuntime
     /// 判定依赖"现在房间里有什么"，revision 就是那条事实的版本号；缓存跨 revision 复用
     /// 会让红/绿与落地判定分叉 —— 那正是这次要修的缺陷，绝不能重新引入。
     func invalidateVerdicts() {
+        // 靠墙可放的答案同样依赖"房间里现在有什么" ⇒ 一起作废（下一次询问重算）。
+        wallVerdictKey = nil
         guard !verdicts.isEmpty else { return }
         verdicts.removeAll(keepingCapacity: true)
+    }
+
+    // MARK: - 靠墙
+
+    /// 装上一次派生出来的竖直面（与承托网格同一批三角形派生，见 `WorldPropWallGrid`）。
+    func setWallPatches(_ patches: [WorldPropWallPatch]) {
+        wallPatches = patches
+        wallStates = [:]
+        wallVerdictKey = nil
+        wallPlaceableCellCount = 0
+        publishCellStates()
+    }
+
+    /// 重算"这一件物件能不能靠着某面墙放"，并把可放的格子标成 `.wallPlaceable`。
+    ///
+    /// **判定出口与地板摆放是同一个**：`verdictForPlacement`（宿主包着摆放服务）。
+    /// 这里只做两件事：把"背朝墙"的候选落点算出来（`WorldPropWallGrid`），以及把判据说"可以"
+    /// 的那一个候选覆盖的格子染成蓝色。判据一个字都没放宽 —— 靠墙不是"另一种可放"，
+    /// 而是"同一个可放判定"的另一组候选落点。
+    ///
+    /// 只在物件/尺寸/网格变化时重算（`wallVerdictKey`）：本函数会被每次鼠标移动间接触发。
+    func refreshWallPlaceability(objectID: String, footprintSize: SIMD2<Float>, height: Float) {
+        guard isBuildModeActive, let grid, !wallPatches.isEmpty,
+              footprintSize.x.isFinite, footprintSize.y.isFinite, height.isFinite,
+              footprintSize.x > 0, footprintSize.y > 0, height > 0
+        else {
+            guard !wallStates.isEmpty || wallPlaceableCellCount != 0 else { return }
+            wallStates = [:]
+            wallPlaceableCellCount = 0
+            wallVerdictKey = nil
+            publishCellStates()
+            return
+        }
+        let key = "\(objectID)|\(footprintSize.x)|\(footprintSize.y)|\(height)|\(wallPatches.count)|\(grid.layers.count)"
+        guard key != wallVerdictKey else { return }
+        wallVerdictKey = key
+        var states: [PropSupportGridPresentation.Cell: PropSupportGridPresentation.CellState] = [:]
+        guard let provider = verdictForPlacement else {
+            wallStates = [:]
+            wallPlaceableCellCount = 0
+            publishCellStates()
+            return
+        }
+        let size = WorldVector3(x: footprintSize.x, y: height, z: footprintSize.y)
+        for patch in wallPatches {
+            let candidates = WorldPropWallGrid
+                .candidateAttachments(patch: patch, grid: grid, size: size)
+                .prefix(Self.maximumWallCandidatesPerPatch)
+            // 取**第一个**判据说"可以"的候选（候选顺序 = 离墙由近到远）：
+            // 越靠前越贴墙，越靠后越退进房间。
+            guard let accepted = candidates.first(where: { candidate in
+                provider(objectID, footprintSize, height, candidate.position, candidate.yaw) == nil
+            }) else { continue }
+            let footprint = WorldPlanarFootprint(size: footprintSize, yaw: accepted.yaw)
+            let covered = Set(
+                footprint.columns(anchoredAt: accepted.layer.column, spacing: grid.spacing)
+                    .map { PropSupportGridMapping.ColumnKey(x: $0.x, z: $0.z) }
+            )
+            guard !covered.isEmpty else { continue }
+            for cell in cells where cell.layer == accepted.layer.layer.layer
+                && covered.contains(PropSupportGridMapping.ColumnKey(x: cell.columnX, z: cell.columnZ)) {
+                states[cell] = .wallPlaceable
+            }
+        }
+        wallStates = states
+        wallPlaceableCellCount = states.count
+        publishCellStates()
     }
 }

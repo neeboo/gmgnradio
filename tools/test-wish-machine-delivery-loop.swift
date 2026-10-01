@@ -5,7 +5,21 @@ import Foundation
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let sources = root.appendingPathComponent("apps/macos/Sources/GMGNRadio")
 let products = root.appendingPathComponent("apps/macos/Build/Build/Products/Debug")
-let worldBuild = root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug")
+// WorldRuntime 的模块搜索路径 + 目标文件**只有一处定义**：tools/world-runtime-harness-flags.sh。
+// 不要在这里拼 `.build/...`：27 份各自拼写正是 SwiftPM 与 xcodebuild 两份模块并存的根因。
+// `worldBuild` 由那唯一一份定义**推出来**（= Modules 的上一级），本文件不持有路径字面量。
+func worldRuntimeHarnessFlags() -> [String] {
+    let process = Process(), pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = [FileManager.default.currentDirectoryPath + "/tools/world-runtime-harness-flags.sh"]
+    process.standardOutput = pipe
+    try? process.run(); process.waitUntilExit()
+    guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
+    return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .split(separator: "\n").map(String.init)
+}
+let worldRuntimeFlags = worldRuntimeHarnessFlags()
+let worldBuild = URL(fileURLWithPath: worldRuntimeFlags[1]).deletingLastPathComponent()
 let bootstrap = try String(contentsOf: sources.appendingPathComponent("App/LivingWorldBootstrap.swift"), encoding: .utf8)
 let collisionStart = bootstrap.range(of: "struct MarbleLivingCabinCollisionWorld:")!.lowerBound
 let collisionEnd = bootstrap.range(of: "/// An effect is keyed", range: collisionStart..<bootstrap.endIndex)!.lowerBound
@@ -917,7 +931,9 @@ let inputs = ["Presence/PropGenerationClient", "Presence/PropGenerationStore", "
     "Presence/ResidentPerformanceMotionPolicy",
     "Agent/WishMachineContract", "Agent/ResidentWishMachineTools", "Agent/ResidentPropToolBridge", "Agent/WorldAgentContext", "Agent/WorldAgentToolContract", "Agent/WorldAgentToolDispatcher"]
     .map { sources.appendingPathComponent($0 + ".swift").path }
-    + [root.appendingPathComponent("tools/fixtures/WishMachineDaemonFixture.swift").path]
+    + [root.appendingPathComponent("tools/fixtures/WishMachineDaemonFixture.swift").path,
+       // 手持上限的替身（见文件头注释）：`ResidentPropPlacementService` 与工具描述都读那一份定义。
+       root.appendingPathComponent("tools/fixtures/ResidentPropHoldLimitShim.swift").path]
 func run(_ path: String, _ arguments: [String]) throws -> Int32 {
     let process = Process(); process.executableURL = URL(fileURLWithPath: path); process.arguments = arguments
     try process.run(); process.waitUntilExit(); return process.terminationStatus

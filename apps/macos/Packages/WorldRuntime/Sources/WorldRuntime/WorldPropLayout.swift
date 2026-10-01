@@ -29,17 +29,36 @@ public struct WorldGeneratedProp: Codable, Equatable, Sendable {
     /// 并决定优先级里它排第几：用户手动覆盖 > 尺寸意图 > 工作流权威尺寸 > 自动推断。
     /// （正解是**提交前就说清楚**：真机那把剑的 8.28 m 就是"只按高度归一 + 事后猜"长出来的。）
     public let sizeIntent: WorldPropSizeIntent?
+    /// 把**原始网格**转正的旋转（`WorldPropOrientation`）：来自工作流声明的 `up_axis` /
+    /// `forward_axis`，或由网格主轴推断，或明确"无法确定、保留原样"。
+    ///
+    /// 它**不是第二份朝向**：房间里"朝哪边"仍然只有 `WorldObjectState.transform.rotation`
+    /// 那一份 yaw。这一份说的是"这件**资产**的网格本身是躺着的"，与放置位置无关；
+    /// 两者相乘的次数只有一次（`ResidentPropPlacementMatrix` 与 `WorldPropCollisionProxyMesh.placed`），
+    /// 所以渲染、碰撞代理、判据不可能各转各的。
+    ///
+    /// 可选、纯增量：为 nil 时合成 `Codable` 不编码这个键（`encodeIfPresent`），
+    /// 于是**已经立着的**资产（绝大多数）元数据 JSON 与改造前逐字节相同。
+    public let orientation: WorldPropOrientation?
     public init(objectID: String, sourceWishID: String, assetID: String, displayName: String,
                 size: WorldVector3, sourceHeight: Float, sizeLocked: Bool? = nil,
                 collision: WorldPropCollisionProxy? = nil,
                 authoritativeSize: WorldPropAuthoritativeSize? = nil,
-                sizeIntent: WorldPropSizeIntent? = nil) {
+                sizeIntent: WorldPropSizeIntent? = nil,
+                orientation: WorldPropOrientation? = nil) {
         self.objectID = objectID; self.sourceWishID = sourceWishID; self.assetID = assetID
         self.displayName = displayName; self.size = size; self.sourceHeight = sourceHeight
         self.sizeLocked = sizeLocked
         self.collision = collision; self.authoritativeSize = authoritativeSize
         self.sizeIntent = sizeIntent
+        self.orientation = orientation
     }
+    /// 摆正旋转的**唯一**出口（没有 orientation 就是单位四元数）。
+    ///
+    /// 渲染矩阵、碰撞代理、审计面板都读这里，谁都不许自己再算一遍。
+    public var orientationRotation: WorldQuaternion { orientation?.rotation ?? .identity }
+    /// 网格是躺着的、已经摆正过（要写进存档的那一种）。
+    public var isOrientationNormalized: Bool { orientation.map { !$0.isIdentity } ?? false }
     public var isSizeLocked: Bool { sizeLocked == true }
     /// 渲染后最长边（米）。**读 `effectiveSize`**：与判据、碰撞盒、渲染目标高度同一个出口。
     public var longestEdge: Float { WorldPropSizePolicy.longestEdge(of: effectiveSize) }
@@ -92,6 +111,8 @@ public struct WorldGeneratedProp: Codable, Equatable, Sendable {
             && (authoritativeSize?.isValid ?? true)
             // 尺寸意图同理：非法意图不能被当成"没有意图"（那就退回"让 app 猜"了）。
             && (sizeIntent?.isValid ?? true)
+            // 摆正旋转同理：坏掉的朝向不能被当成"不用摆正"（画面会躺着，而判据按立着算）。
+            && (orientation?.isValid ?? true)
     }
     /// 换一份尺寸并**记下"这是用户定的"**（唯一一份尺寸仍然是 `size`）。
     ///
@@ -106,14 +127,25 @@ public struct WorldGeneratedProp: Codable, Equatable, Sendable {
         WorldGeneratedProp(objectID: objectID, sourceWishID: sourceWishID, assetID: assetID,
                            displayName: displayName, size: size, sourceHeight: sourceHeight,
                            sizeLocked: true, collision: collision,
-                           authoritativeSize: nil, sizeIntent: sizeIntent)
+                           authoritativeSize: nil, sizeIntent: sizeIntent,
+                           // 摆正与"多大"是两件事：改尺寸不该把"这件网格是躺着的"这件事丢掉，
+                           // 否则改完尺寸画面又躺回去（存档/渲染会分叉）。
+                           orientation: orientation)
     }
     /// 是不是**同一件物件**（身份相同）。尺寸可以不同：用户手动定过尺寸的物件，
     /// 自动基线必然与存档里的那一份不等 —— 那不是"资产归属不一致"，不该被判成错误。
     /// 带尺寸意图的物件同理：意图是提交时说的，自动基线按它算，重新登记时不必逐位相等。
+    ///
+    /// **`sourceHeight` 与 `orientation` 刻意不参与身份**：
+    /// - `assetID` 就是模型字节的 sha256 ⇒ "是不是同一份网格"这一个问题它已经答完了，
+    ///   `sourceHeight` 只是同一份网格的一个**量法**；
+    /// - 而"怎么量"是会变的：摆正（`WorldPropOrientation`）落地之后，同一份网格的
+    ///   "高度"从"原始 Y 跨度"变成"摆正后的 Y 跨度"（真机那把躺着生成的剑：0.133 → 1.005 m）。
+    ///   把它算进身份，会让**每一条旧存档**在下一次资产准备时被判成归属不一致 ⇒ 从房间里消失。
+    ///   这正是 §`sizeLocked` 注释里记着的那次真机缺陷，绝不能靠改一个字段的语义把它带回来。
     public func matchesIdentity(of other: WorldGeneratedProp) -> Bool {
         objectID == other.objectID && sourceWishID == other.sourceWishID && assetID == other.assetID
-            && displayName == other.displayName && sourceHeight == other.sourceHeight
+            && displayName == other.displayName
             && (size == other.size || isSizeLocked || other.isSizeLocked
                 || sizeIntent != nil || other.sizeIntent != nil)
     }
@@ -128,9 +160,19 @@ public struct WorldPropPlacement: Codable, Equatable, Sendable {
     }
 }
 
-public enum WorldPropHand: String, Codable, Equatable, Sendable {
+/// 挂点：物件挂在角色的哪根骨头上 —— 手、背后、腰间。
+///
+/// **旧名字与旧字段名都不动**：`WorldPropGripCalibration.hand` 这个**字段名**保留（它就是
+/// 存档里的 JSON 键），`rightHand` 这个**原始值**也保留。于是旧存档里 `"hand":"rightHand"`
+/// 解出来逐字节不变，只是这个类型现在回答的问题从"哪只手"变成了"哪个挂点"。
+public enum WorldPropSlot: String, Codable, Equatable, Sendable {
     case rightHand
+    case back
+    case waist
 }
+
+/// 旧名保留：既有调用点与 harness 一行都不用改。
+public typealias WorldPropHand = WorldPropSlot
 
 /// A resident-specific grip in final, metre-scaled prop space.
 public struct WorldPropGripCalibration: Codable, Equatable, Sendable {
@@ -270,7 +312,10 @@ public extension WorldObjectState {
                   format: collision.format,
                   position: transform.position,
                   yaw: transform.rotation.yawAroundUp,
-                  heightMeters: prop.effectiveSize.y
+                  heightMeters: prop.effectiveSize.y,
+                  // 代理与模型必须共用**同一份**摆正旋转：只转模型不转代理，碰撞形状就与画面
+                  // 错位（"盒子挡空气"的同一族病）。这一份来自物件元数据，不是这里另算的。
+                  orientation: prop.orientation
               )
         else { return nil }
         return WorldPropObstacle(id: prop.objectID, isBlocking: true, shape: .proxyMesh(mesh))

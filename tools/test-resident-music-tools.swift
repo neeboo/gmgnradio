@@ -151,11 +151,23 @@ defer { try? FileManager.default.removeItem(at: work) }
 let main = work.appendingPathComponent("Main.swift")
 try harness.write(to: main, atomically: true, encoding: .utf8)
 let binary = work.appendingPathComponent("test")
-let modules = root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug")
-let objects = try FileManager.default.contentsOfDirectory(at: modules.appendingPathComponent("WorldRuntime.build"), includingPropertiesForKeys: nil).filter { $0.pathExtension == "o" }.map(\.path)
+// WorldRuntime 的模块搜索路径 + 目标文件**只有一处定义**：tools/world-runtime-harness-flags.sh。
+// 不要在这里拼 `.build/...`：27 份各自拼写正是 SwiftPM 与 xcodebuild 两份模块并存的根因。
+func worldRuntimeHarnessFlags() -> [String] {
+    let process = Process(), pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = [FileManager.default.currentDirectoryPath + "/tools/world-runtime-harness-flags.sh"]
+    process.standardOutput = pipe
+    try? process.run(); process.waitUntilExit()
+    guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
+    return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .split(separator: "\n").map(String.init)
+}
+let worldRuntimeFlags = worldRuntimeHarnessFlags()
+let objects = Array(worldRuntimeFlags.dropFirst(2))
 let files = ["WorldAgentContext", "WorldAgentToolContract", "WorldAgentToolDispatcher", "ResidentWorldToolSession", "DJAgentToolDispatcher", "ResidentMusicToolBridge"]
 let compile = Process(); compile.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
-compile.arguments = ["-j1", "-parse-as-library", "-I", modules.appendingPathComponent("Modules").path] + files.map { sources.appendingPathComponent($0 + ".swift").path } + objects + [main.path, "-o", binary.path]
+compile.arguments = ["-j1", "-parse-as-library", "-I", worldRuntimeFlags[1]] + files.map { sources.appendingPathComponent($0 + ".swift").path } + objects + [main.path, "-o", binary.path]
 try compile.run(); compile.waitUntilExit()
 guard compile.terminationStatus == 0 else { exit(compile.terminationStatus) }
 let test = Process(); test.executableURL = binary

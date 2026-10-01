@@ -136,12 +136,21 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     /// `false`（缺省）表示"格子还在派生"。这个字段只回答"还会不会好"，**不回答就绪与否** ——
     /// 就绪与否只看 `surfaces` 是不是空，所以两者不可能自相矛盾。
     let supportGeometryUnavailable: Bool
+    /// 派生出来的**竖直面**（墙面）数量，以及其中"背朝墙能放"的格子数。
+    ///
+    /// 两者都来自同一次派生（`ResidentPropGridEditorModel`），面板只读、不判定。
+    /// `wallPlaceableCells` 数的是**判据说可以**的格子（与地板摆放同一个出口），
+    /// 不是"几何上看起来能靠"的格子。
+    let wallFaces: Int
+    let wallPlaceableCells: Int
     init(worldID: String, revision: UInt64, objects: [WorldObjectState], surfaces: [ResidentPropEditorSurface],
          canUndo: Bool, heldProp: WorldHeldProp? = nil, holdUnavailableReasons: [String: String] = [:],
-         supportGeometryUnavailable: Bool = false) {
+         supportGeometryUnavailable: Bool = false,
+         wallFaces: Int = 0, wallPlaceableCells: Int = 0) {
         self.worldID = worldID; self.revision = revision; self.objects = objects; self.surfaces = surfaces
         self.canUndo = canUndo; self.heldProp = heldProp; self.holdUnavailableReasons = holdUnavailableReasons
         self.supportGeometryUnavailable = supportGeometryUnavailable
+        self.wallFaces = wallFaces; self.wallPlaceableCells = wallPlaceableCells
     }
     static let empty = Self(worldID: "", revision: 0, objects: [], surfaces: [], canUndo: false,
                             heldProp: nil, holdUnavailableReasons: [:], supportGeometryUnavailable: false)
@@ -189,6 +198,18 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     @Published private(set) var isSaving = false
     @Published private(set) var notice = ""
     @Published var showsPlacedOnly = false
+    /// 面板上"下一次拿/把它挪到哪"选中的挂点。
+    ///
+    /// **它只是面板上的选中格，不是挂载事实**：挂载事实住在 `WorldHeldProp.hand` 与标定里
+    /// （两者都是持久状态）。所以显示时优先读世界那一份（`selectedHoldPoint`），
+    /// 这里绝不复制一份"它现在挂在哪儿"。
+    @Published var holdPoint: PropAttachmentPoint = .rightHand
+
+    /// 那一行该显示哪个挂点：**已挂载就读世界状态**，否则读用户将要用的那一个。
+    var selectedHoldPoint: PropAttachmentPoint {
+        if isSelectedHeld, let held = snapshot.heldProp { return held.hand.attachmentPoint }
+        return holdPoint
+    }
     /// 「格子还没就绪时点的那一行」——一次**待办**，不是选中。
     ///
     /// 为什么需要它：真机一次格子派生 0.7 s（Debug 4.8 s），用户**打开装修就点行**，
@@ -217,7 +238,7 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     private let livingWorldLogger = Logger(subsystem: "ai.gmgn.radio", category: "LivingWorld")
     var preview: (@MainActor (String, WorldPropPlacement) async throws -> WorldObjectState)?
     var commit: (@MainActor (WorldPropLayoutCommand, UInt64, String) async throws -> ResidentPropEditorSnapshot)?
-    var hold: (@MainActor (String, UInt64, String) async throws -> ResidentPropEditorSnapshot)?
+    var hold: (@MainActor (String, PropAttachmentPoint, UInt64, String) async throws -> ResidentPropEditorSnapshot)?
     var adjustHeldGrip: (@MainActor (String, WorldVector3, WorldQuaternion, UInt64, String) async throws -> ResidentPropEditorSnapshot)?
     var returnHeld: (@MainActor (String, UInt64, String) async throws -> ResidentPropEditorSnapshot)?
     /// 按**现状**再要一份快照。宿主没有可答的上下文（没在装修、世界换了）时返回 nil。
@@ -260,8 +281,8 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     ///
     /// 这样 confirm / cancelPreview / save 这些既有清理路径会自动把它清掉，不存在
     /// "忘了复位"的失效 bug。与「居民把物件拿在手里」（`isSelectedHeld` / `holdSelected()`
-    /// 的 `WorldPropLayoutCommand.hold`，会持久化、绑居民右手、要求 2B 角色、最长边 >0.45 m
-    /// 拒绝）是**两件不同的事**，命名上不要混：「在手」=鼠标携带，「手持/拿着看/放回」=居民携带。
+    /// 的 `WorldPropLayoutCommand.hold`，会持久化、绑居民右手、要求 2B 角色、最长边超过
+    /// `ResidentPropAttachmentEligibility.holdableLongestEdgeText` 拒绝）是**两件不同的事**，命名上不要混：「在手」=鼠标携带，「手持/拿着看/放回」=居民携带。
     var isCarrying: Bool { isOpen && placement != nil && !isSelectedHeld }
     /// 当前摆放/建造模式算 footprint 用的物件尺寸：优先"正在拖动/待确认"的那个，否则用选中的。
     /// 没有选中任何物件时返回 nil，调用方退回"一格"。
@@ -688,10 +709,15 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
         handFocusBackToScene(trigger: "撤销上次")
         await save(.undo)
     }
-    func holdSelected() async {
-        guard let id = selectedID, snapshot.holdUnavailableReasons[id] == nil, let hold else { return }
-        await saveAction(key: "hold:\(id)", keepSelection: id) { revision, requestID in
-            try await hold(id, revision, requestID)
+    func holdSelected(at point: PropAttachmentPoint? = nil) async {
+        guard let id = selectedID, let hold else { return }
+        let target = point ?? holdPoint
+        holdPoint = target
+        // 已经挂在身上的是**同一件**：换挂点不必再过一次"能不能拿"（它已经在身上了），
+        // 能不能挂由世界那条命令自己的判据回答（找不到骨骼 ⇒ 可见失败）。
+        guard isSelectedHeld || snapshot.holdUnavailableReasons[id] == nil else { return }
+        await saveAction(key: "hold:\(id):\(target.rawValue)", keepSelection: id) { revision, requestID in
+            try await hold(id, target, revision, requestID)
         }
     }
     func returnSelected() async {

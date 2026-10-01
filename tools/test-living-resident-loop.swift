@@ -816,6 +816,8 @@ func jsonEqual(_ lhs: Any, _ rhs: Any) -> Bool {
             await runner.finish(0, reply: "stale", exit: staleExit)
             await old.value
             check(app.liveCamWindowController?.replies == ["current"], "UI never publishes a stale reply")
+            // 长期记忆决定不做之后，这里不再有任何"非错误的合法提示"需要排除
+            // —— 可见状态槽必须干干净净。
             check(app.liveCamWindowController?.statuses == [], "UI never publishes a stale error")
             check(app.agentSpeechAnnouncer.spoken == ["current"], "TTS never announces stale output")
         }
@@ -1034,8 +1036,23 @@ func run(_ binary: String, _ arguments: [String]) throws -> Int32 {
     process.waitUntilExit()
     return process.terminationStatus
 }
+// WorldRuntime 的模块搜索路径 + 目标文件**只有一处定义**：tools/world-runtime-harness-flags.sh。
+// 不要在这里拼 `.build/...`：27 份各自拼写正是 SwiftPM 与 xcodebuild 两份模块并存的根因。
+func worldRuntimeHarnessFlags() -> [String] {
+    let process = Process(), pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = [FileManager.default.currentDirectoryPath + "/tools/world-runtime-harness-flags.sh"]
+    process.standardOutput = pipe
+    try? process.run(); process.waitUntilExit()
+    guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
+    return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .split(separator: "\n").map(String.init)
+}
+let worldRuntimeFlags = worldRuntimeHarnessFlags()
+let worldRuntimeObjects = URL(fileURLWithPath: worldRuntimeFlags[1])
+    .deletingLastPathComponent().appendingPathComponent("WorldRuntime.build")
 let compilerArguments: [String] = ["-j1", "-parse-as-library",
-    "-I", root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug/Modules").path,
+    "-I", worldRuntimeFlags[1],
     sources.appendingPathComponent("Agent/CodexCLI.swift").path,
     sources.appendingPathComponent("Agent/AgentConversationService.swift").path,
     sources.appendingPathComponent("Agent/ResidentDSHAgentToolBridge.swift").path,
@@ -1083,9 +1100,13 @@ let compilerArguments: [String] = ["-j1", "-parse-as-library",
     sources.appendingPathComponent("Agent/WishMachineContract.swift").path,
     sources.appendingPathComponent("Agent/ResidentWishMachineTools.swift").path,
     sources.appendingPathComponent("Agent/ResidentWishReferenceTools.swift").path,
+    // `ResidentPropPlacementService` 的手持上限读 `ResidentPropAttachmentEligibility`，
+    // 而 `PropAttachment.swift` 依赖 app 目标的渲染侧类型、编不进离线 harness。
+    // 共用那一份替身（它从生产源码取那一行，本身不含数字），上限仍然只有一处定义。
+    root.appendingPathComponent("tools/fixtures/ResidentPropHoldLimitShim.swift").path,
     program.path, "-o", executable.path]
 let runtimeObjects = try FileManager.default.contentsOfDirectory(
-        at: root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug/WorldRuntime.build"),
+        at: worldRuntimeObjects,
         includingPropertiesForKeys: nil).filter { $0.pathExtension == "o" }.map(\.path)
 let compiled = try run("/usr/bin/swiftc", compilerArguments + runtimeObjects)
 guard compiled == 0 else { exit(compiled) }

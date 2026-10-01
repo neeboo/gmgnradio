@@ -391,11 +391,24 @@ import os
 enum ProductIdentity { static let displayName = "gmgn radio"; static let bundleIdentifier = "ai.gmgn.radio" }
 extension Logger { var showPrivacy: Bool { get { false } set {} } }
 """.write(to: prelude, atomically: true, encoding: .utf8)
-let build = root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug")
-let objects = try FileManager.default.contentsOfDirectory(at: build.appendingPathComponent("WorldRuntime.build"), includingPropertiesForKeys: nil).filter { $0.pathExtension == "o" }.map(\.path)
+// WorldRuntime 的模块搜索路径 + 目标文件**只有一处定义**：tools/world-runtime-harness-flags.sh。
+// 不要在这里拼 `.build/...`：27 份各自拼写正是 SwiftPM 与 xcodebuild 两份模块并存的根因。
+func worldRuntimeHarnessFlags() -> [String] {
+    let process = Process(), pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = [FileManager.default.currentDirectoryPath + "/tools/world-runtime-harness-flags.sh"]
+    process.standardOutput = pipe
+    try? process.run(); process.waitUntilExit()
+    guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
+    return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .split(separator: "\n").map(String.init)
+}
+let worldRuntimeFlags = worldRuntimeHarnessFlags()
+let worldRuntimeModules = worldRuntimeFlags[1]
+let objects = Array(worldRuntimeFlags.dropFirst(2))
 let executable = temporary.appendingPathComponent("onejudge")
 let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
-p.arguments = ["-j1","-parse-as-library","-O","-I",build.appendingPathComponent("Modules").path,
+p.arguments = ["-j1","-parse-as-library","-O","-I",worldRuntimeModules,
     sourceRoot.appendingPathComponent("Agent/WorldAgentContext.swift").path,
     sourceRoot.appendingPathComponent("Presence/ResidentPropPlacementService.swift").path,
     sourceRoot.appendingPathComponent("Presence/ResidentPropPlacementConfiguration.swift").path,
@@ -404,6 +417,8 @@ p.arguments = ["-j1","-parse-as-library","-O","-I",build.appendingPathComponent(
     sourceRoot.appendingPathComponent("Presence/PropSupportGridPresentation.swift").path,
     sourceRoot.appendingPathComponent("Presence/PropSupportGridPicker.swift").path,
     prelude.path,
+    // 手持上限的替身（见文件头注释）：`ResidentPropPlacementService` 读那一份定义。
+    root.appendingPathComponent("tools/fixtures/ResidentPropHoldLimitShim.swift").path,
     program.path,"-o",executable.path]+objects
 try p.run(); p.waitUntilExit()
 guard p.terminationStatus == 0 else { print("compile failed"); exit(1) }

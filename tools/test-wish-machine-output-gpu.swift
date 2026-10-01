@@ -1,6 +1,19 @@
 // Tiny offscreen GPU check only: no app host, window or user document access.
 // Requires the app's Debug build to have compiled the pinned GLTFMetalKit product.
 import Foundation
+// WorldRuntime 的模块搜索路径与目标文件**只有一处定义**：tools/world-runtime-harness-flags.sh。
+// harness 一律调用它，绝不自己拼 `.build/...`（27 份各自拼写正是 SwiftPM 模块与 xcodebuild
+// `Products/Debug` 旧模块两份并存的根因，后者报 `WorldQuaternion` 没有 `identity`）。
+func worldRuntimeHarnessFlags() -> [String] {
+    let process = Process(), pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = [FileManager.default.currentDirectoryPath + "/tools/world-runtime-harness-flags.sh"]
+    process.standardOutput = pipe
+    try? process.run(); process.waitUntilExit()
+    guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
+    return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .split(separator: "\n").map(String.init)
+}
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let products = root.appendingPathComponent("apps/macos/Build/Build/Products/Debug")
 guard FileManager.default.fileExists(atPath: products.appendingPathComponent("GLTFMetalKit.swiftmodule").path) else {
@@ -91,8 +104,13 @@ let bundle=products.appendingPathComponent("VRMMetalKit_GLTFMetalKit.bundle")
 if FileManager.default.fileExists(atPath:bundle.path) {try FileManager.default.copyItem(at:bundle,to:temp.appendingPathComponent(bundle.lastPathComponent))}
 let test=temp.appendingPathComponent("main.swift"),exe=temp.appendingPathComponent("check")
 try harness.write(to:test,atomically:true,encoding:.utf8)
-let sources=["WishMachineScene.swift","WishMachineOutputDescriptor.swift","WishMachineOutputRenderer.swift"].map {"apps/macos/Sources/GMGNRadio/Presence/"+$0}
+// `PropSizeIntent` 是 **App 侧**的类型（`PropGenerationClient.swift` 拥有它，不是 WorldRuntime 的）：
+// 描述符引用它，所以那份真源码必须一起编进来 —— 编同一份，不是补个同名 stub。
+// （这条与 WorldRuntime 无关，是本 harness 自己漏挂的旧账：HEAD 上就已经缺它。）
+let sources=["PropGenerationClient.swift","WishMachineScene.swift","WishMachineOutputDescriptor.swift","WishMachineOutputRenderer.swift"].map {"apps/macos/Sources/GMGNRadio/Presence/"+$0}
 func run(_ path:String,_ args:[String]) throws->Int32 {let p=Process();p.executableURL=URL(fileURLWithPath:path);p.arguments=args;try p.run();p.waitUntilExit();return p.terminationStatus}
-let result=try run("/usr/bin/nice",["-n","15","/usr/bin/swiftc","-j1","-swift-version","6","-target","arm64-apple-macosx26.0","-parse-as-library","-I",products.path]+sources+[test.path]+objects+["-framework","Metal","-framework","MetalKit","-framework","SceneKit","-framework","AppKit","-o",exe.path])
+// `-I products` 只给 GLTFCore / GLTFMetalKit；WorldRuntime 的模块与目标文件走唯一那一处定义
+// （worldRuntimeHarnessFlags，排在 products 前面所以优先命中，不会取到 xcodebuild 的旧 Debug 模块）。
+let result=try run("/usr/bin/nice",["-n","15","/usr/bin/swiftc","-j1","-swift-version","6","-target","arm64-apple-macosx26.0","-parse-as-library"]+worldRuntimeHarnessFlags()+["-I",products.path]+sources+[test.path]+objects+["-framework","Metal","-framework","MetalKit","-framework","SceneKit","-framework","AppKit","-o",exe.path])
 guard result == 0 else {exit(result)}
 exit(try run(exe.path,Array(CommandLine.arguments.dropFirst())))

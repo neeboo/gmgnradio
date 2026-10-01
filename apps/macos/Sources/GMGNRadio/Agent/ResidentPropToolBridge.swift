@@ -59,6 +59,13 @@ extension ResidentPropDelegationError: LocalizedError {
             if name == "enable_prop_capability" {
                 properties["capability"] = ["type": "string", "description": "受支持的使用能力模板，当前仅支持 coffee.brew"]
             }
+            if name == "hold_prop" {
+                // 挂点：三个字面量与 `WorldPropSlot.rawValue` 同一份（`PropAttachmentSlots.acceptedNames`）。
+                // **可省**（省缺 = rightHand）：既有调用点与旧提示词一个字都不用改。
+                properties["slot"] = ["type": "string", "enum": PropAttachmentSlots.acceptedNames,
+                    "description": "挂点：rightHand 拿在手里 / back 挂在背后 / waist 挂在腰间。用户说「挂背后 / 挂腰上 / 拿手里」时选对应项；不写就是 rightHand。已经拿在手上的同一件物件换挂点时也用它。"]
+
+            }
             if ["preview_prop_placement", "apply_prop_placement"].contains(name) {
                 properties["surface_id"] = ["type": "string", "description": "list_placement_surfaces 返回的承托层编号（layer.<n>）。摆放是否成立由坐标决定。"]
                 for key in ["x", "y", "z", "yaw"] { properties[key] = ["type": "number"] }
@@ -74,13 +81,18 @@ extension ResidentPropDelegationError: LocalizedError {
                 "apply_prop_placement": "按本轮人类摆放或移动委托提交已拥有物件的位置和朝向；后台仅可续办原生成任务仍有效的有限摆放委托，只能摆该产物到允许的支撑面。先查询布局版本和支撑面并预检，位置和朝向使用绝对值。",
                 "withdraw_prop": "仅按本轮人类委托收回已拥有摆件，保留物件和来源，不删除或重新生成。",
                 "undo_prop_placement": "仅按本轮人类要求撤销最近一次摆放或收回；只能撤销一步。",
-                "hold_prop": "仅按本轮人类明确要求，让当前已适配居民用右手拿起一件最长边不超过45厘米的小道具展示；物件保持同一身份并保留原放回位置。",
-                "adjust_held_prop_grip": "仅按本轮人类要求，微调当前右手道具相对手骨的米制偏移和局部旋转。先读取当前握点，参数为绝对值。",
-                "return_held_prop": "仅按本轮人类要求把当前右手道具精确放回拿起前的位置；原来在库存则回库存，不接受放回坐标。",
+                // 工具描述是 agent 真正读到的"能拿多大"：与判据**同源**（插值同一份上限），
+                // 否则提示词说 1.6 m、工具描述说另一个数，agent 会照着错的那一份拒绝用户。
+                "hold_prop": "仅按本轮人类明确要求，让当前已适配居民拿起 / 挂上一件最长边不超过\(ResidentPropAttachmentEligibility.holdableLongestEdgeText)的小道具展示；slot 决定挂点（rightHand 拿在手里 / back 挂在背后 / waist 挂在腰间），省缺为 rightHand。用户说「挂背后 / 挂腰上 / 拿手里」时就是选它。物件保持同一身份并保留原放回位置。",
+                "adjust_held_prop_grip": "仅按本轮人类要求，微调**当前挂点**上那件道具相对该挂点骨骼的米制偏移和局部旋转。先读取当前握点，参数为绝对值；它不会改变挂点本身（换挂点用 hold_prop 的 slot）。",
+                "return_held_prop": "仅按本轮人类要求把当前挂载的道具精确放回拿起前的位置；原来在库存则回库存，不接受放回坐标。",
                 "enable_prop_capability": "仅按本轮人类明确要求使用某物件时，为已拥有摆件启用受支持的使用能力模板（当前仅支持 coffee.brew 冲泡模板）。能力持久化；启用后通过 start_activity 走到物件前面向它执行按钮动作并等待播放完成，属于空间内模拟使用，不宣称物理冲煮结构。按名字猜想的物件不得启用。"
             ]
             return .init(name: name, description: descriptions[name]!, inputSchema: [
-                "type": "object", "properties": properties, "required": properties.keys.sorted(), "additionalProperties": false
+                "type": "object", "properties": properties,
+                // `slot` 是 hold_prop 上**唯一可省**的参数：不写就是右手。
+                "required": properties.keys.filter { !(name == "hold_prop" && $0 == "slot") }.sorted(),
+                "additionalProperties": false
             ], validate: { Self.validate($0, name: name) }, handle: { [self] id, data in await handle(name, id, data) })
         }
     }
@@ -95,10 +107,14 @@ extension ResidentPropDelegationError: LocalizedError {
         if ["preview_prop_placement", "apply_prop_placement"].contains(name) { keys.formUnion(["surface_id", "x", "y", "z", "yaw"]) }
         if name == "adjust_held_prop_grip" { keys.formUnion(["offset_x", "offset_y", "offset_z", "rotation_yaw"]) }
         if isMutation(name) { keys.insert("layout_revision") }
-        guard Set(values.keys) == keys else { return false }
-        for key in keys {
-            if ["object_id", "surface_id", "capability"].contains(key) {
+        // `slot` 只在 hold_prop 上存在，而且**可省**（省缺 = rightHand）。
+        let allowed = name == "hold_prop" ? keys.union(["slot"]) : keys
+        guard Set(values.keys) == keys || Set(values.keys) == allowed else { return false }
+        for key in values.keys {
+            if ["object_id", "surface_id", "capability", "slot"].contains(key) {
                 guard let text = values[key] as? String, !text.isEmpty, text.count <= 256 else { return false }
+                // 挂点名必须**认识**：认不出来的就地拒绝，绝不猜一个挂点出来。
+                if key == "slot", PropAttachmentSlots.resolve(name: text) == nil { return false }
             } else {
                 guard let number = values[key] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite else { return false }
                 if key == "layout_revision" {
@@ -158,7 +174,9 @@ extension ResidentPropDelegationError: LocalizedError {
                 guard !Task.isCancelled, isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
                 try service.commit(.undo, expectedLayoutRevision: (values["layout_revision"] as! NSNumber).uint64Value, requestID: callID)
             } else if name == "hold_prop" {
-                let command = try service.holdCommand(objectID: values["object_id"] as! String)
+                // 挂点由 `slot` 说；不写就是右手（与面板、系统提示词同一份字面量）。
+                let point = (values["slot"] as? String).flatMap(PropAttachmentSlots.resolve(name:)) ?? .rightHand
+                let command = try service.holdCommand(objectID: values["object_id"] as! String, point: point)
                 try await prepareMutation(command)
                 guard !Task.isCancelled, isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
                 try service.commit(command, expectedLayoutRevision: (values["layout_revision"] as! NSNumber).uint64Value, requestID: callID)
@@ -192,11 +210,23 @@ extension ResidentPropDelegationError: LocalizedError {
             var payload: [String: Any] = ["ok": true, "layout_revision": service.context.state.layoutRevision,
                 "objects": objects, "can_undo": service.context.state.layoutUndo != nil,
                 "mutation_authorized": allowsMutation, "interaction_status": interactionStatus]
+            // 挂在哪个挂点**只回执世界状态里那一份**（不读调用参数）：回执说的就是"它现在挂在哪儿"。
+            if let held = service.context.state.heldProp {
+                payload["held_slot"] = held.hand.rawValue
+                payload["held_slot_name"] = PropAttachmentSlots.displayName(for: held.hand.attachmentPoint)
+            }
             if let preview { payload["preview"] = Self.object(preview, heldObjectID: nil, holdEligibility: nil) }
             return result(payload)
         } catch {
-            return result(["ok": false, "code": "placement_rejected", "message": error.localizedDescription,
-                           "layout_revision": service.context.state.layoutRevision], error: true)
+            var failure: [String: Any] = ["ok": false, "code": "placement_rejected", "message": error.localizedDescription,
+                           "layout_revision": service.context.state.layoutRevision]
+            // 失败回执也带上挂点名：用户听到的那句话与回执里的名字是同一个。
+            if name == "hold_prop", let text = values["slot"] as? String,
+               let point = PropAttachmentSlots.resolve(name: text) {
+                failure["slot"] = point.worldSlot.rawValue
+                failure["slot_name"] = PropAttachmentSlots.displayName(for: point)
+            }
+            return result(failure, error: true)
         }
     }
     private func delegationAllows(_ name: String, _ values: [String: Any]) -> Bool {

@@ -3,6 +3,20 @@
 // machine is a valid hand-held product object.
 import Foundation
 
+// WorldRuntime 的模块搜索路径与目标文件**只有一处定义**：tools/world-runtime-harness-flags.sh。
+// harness 一律调用它，绝不自己拼 `.build/...`（27 份各自拼写正是 SwiftPM 模块与 xcodebuild
+// `Products/Debug` 旧模块两份并存的根因，后者报 `WorldQuaternion` 没有 `identity`）。
+func worldRuntimeHarnessFlags() -> [String] {
+    let process = Process(), pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = [FileManager.default.currentDirectoryPath + "/tools/world-runtime-harness-flags.sh"]
+    process.standardOutput = pipe
+    try? process.run(); process.waitUntilExit()
+    guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
+    return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .split(separator: "\n").map(String.init)
+}
+
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let products = root.appendingPathComponent("apps/macos/Build/Build/Products/Debug")
 let attachment = root.appendingPathComponent(
@@ -18,20 +32,13 @@ let harness = #"""
 import Foundation
 import Metal
 import simd
+// WorldRuntime 的类型不再手写 stub：模块与目标文件由 tools/world-runtime-harness-flags.sh
+// 这一处提供（见下方 worldRuntimeHarnessFlags()），`PropAttachment.swift` 也按**真源码**编。
+// 手写 stub 的老办法留不住 `WorldQuaternion.identity` / `WorldPropRotation` /
+// `WorldPropOrientationPolicy`（`test-prop-attachment.swift` 的文件头记着同一次迁移）。
+import WorldRuntime
 
-struct WorldVector3: Codable, Equatable, Sendable { let x: Float; let y: Float; let z: Float }
-struct WorldQuaternion: Codable, Equatable, Sendable { let x: Float; let y: Float; let z: Float; let w: Float }
-enum WorldPropHand: String, Codable, Equatable, Sendable { case rightHand }
-struct WorldPropGripCalibration: Codable, Equatable, Sendable {
-    let avatarAssetID: String; let hand: WorldPropHand
-    let normalizedGrip: WorldVector3; let localOffset: WorldVector3
-    let localRotation: WorldQuaternion
-}
-struct WorldGeneratedProp: Codable, Equatable, Sendable {
-    let objectID: String; let sourceWishID: String; let assetID: String
-    let displayName: String; let size: WorldVector3; let sourceHeight: Float
-    var isValid: Bool { true }
-}
+// 只有 App 侧那几个"世界里的大类型"仍是 stub —— 它们不属于 WorldRuntime，本 harness 也不编它们。
 enum StageAvatarFormat: String, Codable, Sendable { case vrm, pmx }
 struct StageAvatarAsset: Codable, Equatable, Sendable {
     let id: String; let name: String; let format: StageAvatarFormat
@@ -211,8 +218,9 @@ try FileManager.default.copyItem(
     at: resourceBundle,
     to: temp.appendingPathComponent(resourceBundle.lastPathComponent)
 )
-try attachmentSource.replacingOccurrences(of: "import WorldRuntime", with: "")
-    .write(to: attachmentCopy, atomically: true, encoding: .utf8)
+// `PropAttachment.swift` 按**真源码**编 —— 不再剥 `import WorldRuntime`。剥掉它就只能靠手写
+// stub 顶上，而 stub 留不住 `WorldPropRotation` / `WorldPropOrientationPolicy`。
+try attachmentSource.write(to: attachmentCopy, atomically: true, encoding: .utf8)
 try harness.write(to: harnessURL, atomically: true, encoding: .utf8)
 
 var objects: [String] = []
@@ -225,7 +233,11 @@ for name in ["GLTFMetalKit", "GLTFCore"] {
         includingPropertiesForKeys: nil
     ).filter { $0.pathExtension == "o" }.map(\.path)
 }
+// 第一项是 `PropSizeIntent` 的**真源码拥有者**（App 侧类型，描述符引用它；本 harness 在 HEAD
+// 上就漏了它，与 WorldRuntime 无关）。`PropGripInference.swift` 是 `PropAttachment.swift`
+// 现在真正依赖的握点推断（编同一份，不补 stub）。
 let sources = [
+    "PropGenerationClient.swift", "PropGripInference.swift",
     "WishMachineScene.swift", "WishMachineOutputDescriptor.swift",
     "WishMachineOutputRenderer.swift", "ResidentPropRenderer.swift",
 ].map { "apps/macos/Sources/GMGNRadio/Presence/" + $0 }
@@ -242,6 +254,10 @@ func run(_ executable: String, _ arguments: [String]) throws -> Int32 {
 let compile = try run("/usr/bin/nice", [
     "-n", "15", "/usr/bin/swiftc", "-j1", "-swift-version", "6",
     "-target", "arm64-apple-macosx26.0", "-parse-as-library",
+] + worldRuntimeHarnessFlags() + [
+    // 这里的 `-I products` 是给 GLTFCore / GLTFMetalKit 用的；WorldRuntime 的模块**不**从
+    // xcodebuild 产物里取（那份 Debug 是旧物）——它由上面的 worldRuntimeHarnessFlags() 提供，
+    // 排在前面所以优先命中。
     "-I", products.path,
 ] + sources + [attachmentCopy.path, harnessURL.path] + objects + [
     "-framework", "Metal", "-framework", "MetalKit",

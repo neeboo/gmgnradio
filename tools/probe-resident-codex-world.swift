@@ -252,7 +252,21 @@ let main = work.appendingPathComponent("Main.swift")
 try harness.write(to: main, atomically: true, encoding: .utf8)
 let binary = work.appendingPathComponent("probe")
 let compile = Process(); compile.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
-let runtime = root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug")
+// WorldRuntime 的模块搜索路径 + 目标文件**只有一处定义**：tools/world-runtime-harness-flags.sh。
+// 不要在这里拼 `.build/...`：27 份各自拼写正是 SwiftPM 与 xcodebuild 两份模块并存的根因。
+// `runtime` 由那唯一一份定义**推出来**（= Modules 的上一级），本文件不持有路径字面量。
+func worldRuntimeHarnessFlags() -> [String] {
+    let process = Process(), pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = [FileManager.default.currentDirectoryPath + "/tools/world-runtime-harness-flags.sh"]
+    process.standardOutput = pipe
+    try? process.run(); process.waitUntilExit()
+    guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
+    return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .split(separator: "\n").map(String.init)
+}
+let worldRuntimeFlags = worldRuntimeHarnessFlags()
+let runtime = URL(fileURLWithPath: worldRuntimeFlags[1]).deletingLastPathComponent()
 let names = ["CodexCLI", "AgentConversationService", "ResidentCodexTransport", "ResidentCodexPolicy", "ResidentCodexAgent", "ResidentSteeringDelivery", "ResidentDSHTransport", "ResidentDSHConfiguration", "WorldAgentContext", "WorldAgentToolContract", "WorldAgentToolDispatcher", "ResidentWorldToolSession", "ResidentActivityOutcome"]
 let files = names.map { sources.appendingPathComponent("Agent/\($0).swift").path }
 let objects = try FileManager.default.contentsOfDirectory(at: runtime.appendingPathComponent("WorldRuntime.build"), includingPropertiesForKeys: nil).filter { $0.pathExtension == "o" }.map(\.path)

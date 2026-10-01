@@ -162,6 +162,39 @@ enum ResidentTaskAxisProjection {
             generationDetail: generationDetail
         )
     }
+
+    // MARK: 三轴 → 一句现状
+
+    /// **三轴 → 一句现状**。全仓只有这一份：视图不按轴各拼一段文案，也不另存状态文案，
+    /// 所以"任务行说了什么"仍然只由三轴决定（与 `project` 同一处判据）。
+    ///
+    /// 取法是「**最靠后的、对用户最有意义的那一步**」，不是"最坏的那个"：
+    /// 沿 `生成 → 归属 → 摆放` 这条链**从后往前**看，走到哪一步就说哪一步。
+    /// 于是「已摆放」的任务不会因为生成轴上曾经失败而被说成"生成失败"。
+    ///
+    /// 唯一不由这里说的是**失败**：`.failed` 只说明"没做成"，说不出是失败、取消还是
+    /// 中断，所以任务行走既有失败通道（见 `WishMachineTaskPresentation.currentStatusLine`），
+    /// 原因仍在 `detail` 那一行 —— 不在这里另造一句。
+    static func currentStatus(_ axes: ResidentTaskAxes) -> String {
+        if axes.placement == .placed { return "已摆放" }
+        if axes.ownership == .inInventory { return "未摆放" }
+        if axes.ownership == .claimed { return "等待入库" }
+        switch axes.generation {
+        case .completed: return "可领取"
+        case .failed: return "生成失败"
+        case .generating: return "生成中"
+        case .queued: return "排队中"
+        }
+    }
+
+    /// 三轴上「已经走到头」的那一档：**进了库存**或**摆了出来**。
+    ///
+    /// 宿主把一件事判成终态（`isTerminal`），三轴却还没走到这一档 ⇒ 那一定是**没做成**
+    /// （生成失败 / 已取消 / 任务已中断 / 场景加载失败 / 摆放失败…）。此时任务行交回
+    /// 既有失败通道：绝不把"还没做成"说成轴上的下一步（例如把加载失败说成「可领取」）。
+    static func hasReachedTerminalStep(_ axes: ResidentTaskAxes) -> Bool {
+        axes.placement == .placed || axes.ownership == .inInventory
+    }
 }
 
 // MARK: - 连通性：全局事实，不是任务属性
@@ -261,7 +294,10 @@ enum ResidentAutonomyFact {
 struct WishMachineTaskPresentation: Identifiable, Equatable {
     let id: UUID
     let title: String
-    /// 三轴收敛之后的状态行。任务行渲染这一行（或 `axes`），不再渲染授权/连通性。
+    /// 宿主的**既有事实/失败通道**（"场景加载失败""已取消""生成中"…）。
+    /// 任务行不再直接渲染它，只经 `currentStatusLine` 使用：
+    /// 正常推进时那一句由三轴派生，三轴说不出的失败才回到这一句。
+    /// 授权/连通性仍然不在这里（见 `ResidentAutonomyFact` / `ResidentConnectivityFact`）。
     let status: String
     /// 任务**自己的**补充说明（生成进度、摆放原因、入库 backlog）。
     /// 连通性事实不会留在这里 —— 它由 `ResidentConnectivityFact` 摘到全局横幅，
@@ -274,6 +310,25 @@ struct WishMachineTaskPresentation: Identifiable, Equatable {
     /// 或同等证据）。**不按任务渲染**，只参与"全局开关是否被停过"的判定。
     var autoContinuationPaused: Bool = false
     var promptExpiresAt: Date? = nil
+}
+
+// MARK: - 任务行的唯一一句现状
+
+extension WishMachineTaskPresentation {
+    /// 任务行渲染的**唯一一句现状**（面板上每条任务只有这一句状态，不再是三个轴标签）。
+    ///
+    /// 判断只有一处：正常推进时它由三轴派生（`ResidentTaskAxisProjection.currentStatus`）。
+    /// 三轴说不出的失败仍然走**既有失败通道**：三轴还没走到头（没进库存、也没摆出来），
+    /// 宿主却已经把它判成终态 —— 那是没做成（生成失败 / 已取消 / 任务已中断 /
+    /// 场景加载失败 / 摆放失败…），这一句就用宿主那句话，原因仍在 `detail` 那一行。
+    /// 视图里因此**没有任何 if/else**，也没有第二份状态文案。
+    ///
+    /// `axes == nil` 时退回宿主那句话：这次简化只减去标签，不减去状态。
+    var currentStatusLine: String {
+        guard let axes else { return status }
+        if isTerminal, !ResidentTaskAxisProjection.hasReachedTerminalStep(axes) { return status }
+        return ResidentTaskAxisProjection.currentStatus(axes)
+    }
 }
 
 @MainActor
