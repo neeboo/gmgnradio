@@ -621,13 +621,35 @@ impl Service {
             .await
     }
 
+    /// 一次"取产物"要拿到的全部字节：模型，加上**回执声明了才会去取**的碰撞代理。
+    ///
+    /// 为什么先把两样都取完、核验完再落盘：声明了代理却只落盘模型，会让世界拿到一个
+    /// "看起来 ready、其实碰撞数据缺失"的产物；反过来先落模型再取代理失败，也是如此。
+    /// 所以这里要么两样都成功，要么整体失败（调用方写 `interrupted` + 可读错误码）。
+    ///
+    /// 回执**没有**碰撞字段时（今天所有后端都是这样）这里只会发一条模型请求，
+    /// 返回 `None` —— 线上请求字节与落盘结果和改造前完全一致。
+    async fn fetch_artifact(
+        &self,
+        job: &model::Job,
+        token: &str,
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+        let model = self.provider.fetch_model(job, token).await?;
+        let receipt = job.receipt.as_ref().ok_or("missing_receipt")?;
+        if !model::declares_collision(receipt)? {
+            return Ok((model, None));
+        }
+        let collision = self.provider.fetch_collision(job, token).await?;
+        Ok((model, Some(collision)))
+    }
+
     async fn step(&self, stored: Stored, token: String) -> Result<()> {
         let job = stored.job;
         let id = job.id.clone();
         let download = job.backend_stage == "downloading" && !job.cancel_requested;
         let submit = job.receipt.is_none();
         if download {
-            let result = self.provider.fetch_model(&job, &token).await;
+            let result = self.fetch_artifact(&job, &token).await;
             self.db
                 .call(move |s| {
                     let mut current = s.get(&id)?;
@@ -635,14 +657,27 @@ impl Service {
                         return Ok(());
                     }
                     match result {
-                        Ok(bytes) => {
+                        // `None` 只在回执**没有**碰撞字段时出现 —— 那条路上这里与今天逐字节一致。
+                        Ok((bytes, collision)) => {
                             let path = s.root.join(format!("{}.glb", id));
                             files::publish(&path, &bytes)?;
                             current.job.local_model_path = Some(path.to_string_lossy().into());
+                            current.job.local_collision_path = match collision {
+                                Some(bytes) => {
+                                    let path = s.root.join(format!("{}.collider.glb", id));
+                                    files::publish(&path, &bytes)?;
+                                    Some(path.to_string_lossy().into())
+                                }
+                                None => None,
+                            };
                             current.job.backend_stage = "ready".into();
                             current.job.last_error = None;
                         }
+                        // 声明了代理却拿不到/核验不过 ⇒ **可见失败**，不落盘半个产物，
+                        // 更不会退回 yaw 盒子（那会让碰撞形状在用户不知情下变掉）。
                         Err(code) => {
+                            current.job.local_model_path = None;
+                            current.job.local_collision_path = None;
                             current.job.backend_stage = "interrupted".into();
                             current.job.last_error = Some(code.into());
                         }
@@ -908,6 +943,36 @@ mod tests {
             "sourceWishID": wish,
             "generationProfile": {"resolution": 512, "decimation": 200000, "textureSize": 2048, "remesh": true},
         })
+    }
+
+    /// 尺寸意图穿过**请求边界**（而不是只在 `Submit::validate` 里成立）：
+    /// 提交时带意图 ⇒ 任务回执原样回显；类型非法 ⇒ 明确的错误码，不静默收下。
+    #[tokio::test]
+    async fn submit_carries_and_echoes_the_size_intent_or_rejects_it_by_name() {
+        let (service, dir) = service().await;
+        let mut params = submission("wish-sword");
+        params["heightMeters"] = json!(1.1);
+        params["sizeIntent"] = json!({"axis": "longest", "meters": 1.1, "source": "user"});
+        let submitted = service.request("submit", params).await.unwrap();
+        assert_eq!(submitted["job"]["sizeIntent"]["axis"], "longest");
+        assert_eq!(submitted["job"]["sizeIntent"]["meters"], 1.1);
+        assert_eq!(submitted["job"]["heightMeters"], 1.1);
+
+        // 轴名不在契约里 / 高度与 height_meters 矛盾 ⇒ 各自的明确错误码。
+        for (intent, code) in [
+            (json!({"axis": "width", "meters": 1.1, "source": "user"}), "invalid_size_intent"),
+            (json!({"axis": "height", "meters": 0.5, "source": "user"}), "size_intent_conflict"),
+        ] {
+            let mut params = submission("wish-2");
+            params["heightMeters"] = json!(1.1);
+            params["sizeIntent"] = intent.clone();
+            assert_eq!(
+                service.request("submit", params).await.err(),
+                Some(code),
+                "sizeIntent = {intent} 被静默收下了"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Read-only and offline: it describes the bound backend and every origin

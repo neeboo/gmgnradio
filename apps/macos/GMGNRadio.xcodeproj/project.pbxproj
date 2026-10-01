@@ -187,6 +187,7 @@
 		995518C0CBFC44D828848E40 /* ResidentPropPlacementConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = FEA756421C88CC46A0081E6E /* ResidentPropPlacementConfiguration.swift */; };
 		9A6370C989217374C167A4A7 /* AgentSettingsModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 17D3F971B9C0C562A1BAD3DB /* AgentSettingsModel.swift */; };
 		9D020777B554187459EA6617 /* ResidentWishMachineTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7335B9B5827729339174B18 /* ResidentWishMachineTools.swift */; };
+		9D2202699E9D276547189632 /* PropGenerationWorkflowCollision.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03A877215EBD7A9A904CDBD1 /* PropGenerationWorkflowCollision.swift */; };
 		9D577D64E80B133295B83130 /* SpatialStageStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4DAD314FA946D04CCDC3180A /* SpatialStageStoreTests.swift */; };
 		9FF9D21905FFC2498AA69591 /* MarbleWorldCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 64AD6CEA51CDFB9A0C88D625 /* MarbleWorldCache.swift */; };
 		A2AD6244F59B40C8CF7A30EB /* StageAvatarActivityExecutor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C3161E3B8CFAB319A4547F4 /* StageAvatarActivityExecutor.swift */; };
@@ -309,6 +310,7 @@
 		015185F407965D5142B0841B /* WorldAgentContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldAgentContext.swift; sourceTree = "<group>"; };
 		0281DD4F900FFD76446F5C1C /* StageVisualPresetTimeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageVisualPresetTimeline.swift; sourceTree = "<group>"; };
 		03943BE3B37D041CF6D86FE0 /* AppMenuActionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppMenuActionTests.swift; sourceTree = "<group>"; };
+		03A877215EBD7A9A904CDBD1 /* PropGenerationWorkflowCollision.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PropGenerationWorkflowCollision.swift; sourceTree = "<group>"; };
 		044DFDC6F60021056335F218 /* MarbleWorldClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarbleWorldClient.swift; sourceTree = "<group>"; };
 		05E0E7A7D738D3198909C409 /* AgentProgramPlannerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentProgramPlannerTests.swift; sourceTree = "<group>"; };
 		06098ED46674F874E30028A5 /* AgentShowProposal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentShowProposal.swift; sourceTree = "<group>"; };
@@ -974,6 +976,7 @@
 				E6B98D23C9CD0B46A51B0153 /* PropGenerationClient.swift */,
 				CB1CE401DC46221687D05BF6 /* PropGenerationConfiguration.swift */,
 				22092892913901B6B9A639FF /* PropGenerationStore.swift */,
+				03A877215EBD7A9A904CDBD1 /* PropGenerationWorkflowCollision.swift */,
 				7042ABB00311D453A5D5E557 /* PropImagePreparation.swift */,
 				A06778F3534FE1B87C9D3FC7 /* PropSupportGridMapping.swift */,
 				8C764576419E37F7B13BAB58 /* PropSupportGridPicker.swift */,
@@ -1511,6 +1514,7 @@
 				A5D9DB6B72442AA994536F5E /* PropGenerationConfiguration.swift in Sources */,
 				A6C74A559603EC578B1554EC /* PropGenerationSettingsSection.swift in Sources */,
 				F6DB346A7C0E9037A9199668 /* PropGenerationStore.swift in Sources */,
+				9D2202699E9D276547189632 /* PropGenerationWorkflowCollision.swift in Sources */,
 				977A6550B9EDEDE80B2D0915 /* PropImagePreparation.swift in Sources */,
 				68D169AB1772AA516F212FB1 /* PropSupportGrid.metal in Sources */,
 				CC440250E8A26020325CFFF4 /* PropSupportGridMapping.swift in Sources */,

@@ -360,7 +360,13 @@ private func nearestProjectedEdge(
     return result
 }
 
-private func segmentTriangleDistanceSquared(
+/// 「线段到三角形的最短距离²」——**唯一一份**实现。
+///
+/// 三个调用方共用它：房间网格的 `TriangleMeshCollisionWorld.canOccupy`（胶囊 × 房间）、
+/// 生成物件的 `WorldCapsuleClearance.isClear(_:at:of: WorldPropProxyObstacleMesh)`
+/// （胶囊 × 碰撞代理）。刻意**不做**成 `private`：代理碰撞若另写一份距离函数，
+/// 那就是"第二套几何"，正是这个项目反复踩的坑。
+func segmentTriangleDistanceSquared(
     start: SIMD3<Float>,
     end: SIMD3<Float>,
     triangle: WorldTriangle

@@ -24,6 +24,58 @@ struct PropGenerationSource: Codable, Equatable, Sendable {
     let license: String
 }
 
+/// 提交契约里的**尺寸意图**：`size_intent { axis, meters, source }` 的 app 侧镜像。
+///
+/// 「用户说的那个尺寸」必须**在提交之前**就说清楚——哪根轴、多少米、谁说的——而不是让
+/// 界面事后从网格猜。真机那把剑（2026-10-01「2B 白色长剑（外形摆件）」）就是反面教材：
+/// 只有一根"高度"轴，而生成回来的网格不保证立着，1.1 m 的请求被算成"厚度 1.1 m"
+/// ⇒ 场景里 8.28 m 长、比舱室还长、摆放被拒后从房间里消失。用户说的"一把 1.1 米的剑"，
+/// 他要的是**最长边** 1.1 m。
+///
+/// 词汇与守护进程 `model.rs::SizeIntent` **逐字相同**（`longest`/`height`、
+/// `user`/`suggested`/`default`）。缺失时整块不发：老路径的字节与行为都不变。
+struct PropSizeIntent: Codable, Equatable, Sendable {
+    /// 哪根轴。`longest` = 最长边（剑、扫帚、滑雪板这类横着放的东西）；
+    /// `height` = 高度（咖啡机、椅子这类立着的东西，也就是旧 `height_meters` 的语义）。
+    enum Axis: String, Codable, Equatable, Sendable { case longest, height }
+    /// 谁说的这个尺寸。`default` 在 Swift 里是关键字，所以 case 名与线上字面量分开写。
+    enum Source: String, Codable, Equatable, Sendable {
+        case user
+        case suggested
+        case fallback = "default"
+    }
+    let axis: Axis
+    let meters: Double
+    let source: Source
+
+    /// 契约允许的米数：与 `heightMeters` **同一条范围**（守护进程 `SIZE_INTENT_*_METERS`）。
+    static let minimumMeters: Double = 0.01
+    static let maximumMeters: Double = 3.0
+
+    init?(axis: Axis, meters: Double, source: Source) {
+        guard meters.isFinite, (Self.minimumMeters...Self.maximumMeters).contains(meters) else { return nil }
+        self.axis = axis; self.meters = meters; self.source = source
+    }
+
+    var isValid: Bool {
+        meters.isFinite && (Self.minimumMeters...Self.maximumMeters).contains(meters)
+    }
+    /// 提交给守护进程时 `height_meters` 要填的数字。
+    ///
+    /// 轴是高度时它**必须**就是那个高度（守护进程强制两者相等，否则 `size_intent_conflict`）；
+    /// 轴是最长边时它仍然是"生成请求的尺寸"这一个数字——远端只认它，而 app 按声明的轴归一。
+    var heightMetersForSubmission: Double { meters }
+    /// 面板/工具回执用的一句话（"用户指定的最长边 1.10 米"）。
+    var summary: String {
+        let who = switch source {
+        case .user: "用户指定"
+        case .suggested: "服务建议"
+        case .fallback: "默认值"
+        }
+        return "\(who)的\(axis == .longest ? "最长边" : "高度") \(String(format: "%.2f", meters)) 米"
+    }
+}
+
 struct PropGenerationResult: Codable, Sendable {
     let modelURL: String
     let suggestedHeightMeters: Double
@@ -34,12 +86,37 @@ struct PropGenerationResult: Codable, Sendable {
     let inspection: PropGenerationInspection
     let affordanceCandidates: [String]
     let interactionBindings: [String]
+    /// 生成工作流自带的**碰撞代理**（可选、纯增量）。整块缺失 ⇒ 与今天逐字节一致
+    /// （app 退回"尺寸 × 朝向"的偏航盒子）。出现时按它做碰撞。
+    let collisionURL: String?
+    let collisionFormat: String?
+    let collisionSHA256: String?
+    let collisionBytes: Int?
+    let collisionTriangles: Int?
+    /// 生成工作流给的**权威尺寸**（可选）。存在时尺寸以它为准，app 不再从网格量。
+    let authoritativeSize: PropGenerationAuthoritativeSize?
+
+    struct PropGenerationAuthoritativeSize: Codable, Sendable {
+        let dimensions: [Double]
+        let units: String
+        let upAxis: String
+        let forwardAxis: String
+        enum CodingKeys: String, CodingKey {
+            case dimensions, units
+            case upAxis = "up_axis", forwardAxis = "forward_axis"
+        }
+    }
+
     enum CodingKeys: String, CodingKey {
         case modelURL = "model_url", suggestedHeightMeters = "suggested_height_meters"
         case scaleRequiresConfirmation = "scale_requires_confirmation", interactionStatus = "interaction_status"
         case workflowProfile = "workflow_profile"
         case source, inspection, affordanceCandidates = "affordance_candidates", interactionBindings = "interaction_bindings"
+        case collisionURL = "collision_url", collisionFormat = "collision_format"
+        case collisionSHA256 = "collision_sha256", collisionBytes = "collision_bytes"
+        case collisionTriangles = "collision_triangles", authoritativeSize = "authoritative_size"
     }
+
 }
 
 struct PropGenerationInspection: Codable, Sendable {
@@ -156,11 +233,20 @@ final class PropGenerationClient: @unchecked Sendable {
         return try await receipt(request)
     }
 
-    static func validateInput(png: Data, name: String, source: PropGenerationSource, heightMeters: Double) throws {
+    static func validateInput(png: Data, name: String, source: PropGenerationSource, heightMeters: Double,
+                              sizeIntent: PropSizeIntent? = nil) throws {
         guard (1...100).contains(name.count), !name.contains(where: { "/\\\0".contains($0) }),
               [source.author, source.license].allSatisfy({ (1...200).contains($0.count) && !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }),
               heightMeters.isFinite, (0.01...3).contains(heightMeters), png.count >= 24, png.count <= 8 * 1024 * 1024,
               png.prefix(8) == Data([137,80,78,71,13,10,26,10]) else { throw PropGenerationError.invalidInput }
+        // 尺寸意图**存在时必须合法**，而且与 `height_meters` 不矛盾：轴是高度时两者就是
+        // 同一件事 ⇒ 数值必须相同，否则就是两份真相（守护进程侧同一条 `size_intent_conflict`）。
+        if let sizeIntent {
+            guard sizeIntent.isValid else { throw PropGenerationError.invalidInput }
+            if sizeIntent.axis == .height, sizeIntent.meters != heightMeters {
+                throw PropGenerationError.invalidInput
+            }
+        }
         for offset in [16,20] {
             let n = png[offset..<offset+4].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
             guard (1...2048).contains(n) else { throw PropGenerationError.invalidInput }

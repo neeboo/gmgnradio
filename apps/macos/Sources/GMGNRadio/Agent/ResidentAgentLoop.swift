@@ -586,6 +586,11 @@ final class ResidentAgentLoop {
     private let onFailure: @MainActor (String) -> Void
     private let onChange: @MainActor () -> Void
     private let onCancel: @MainActor () -> Void
+    /// 只有**用户按下停止**才会调用的宿主回调（`onCancel` 是每次取消都会调用的
+    /// 通用清理通道）。分工的理由：换空间、退出、可用性/网络回收、后台预算回收
+    /// 都会取消本轮，但它们不是"用户意图"，绝不能因此写出一个只有人工能解除的
+    /// 持久暂停。需要"用户停止过"这一事实的地方（例如许愿任务级自动续办）接这条。
+    private let onUserStop: @MainActor () -> Void
     private var intent: Intent?
     private var intentPausedByUser = false
     private var messages: [Message] = []
@@ -690,7 +695,8 @@ final class ResidentAgentLoop {
         onReply: @escaping @MainActor (String) -> Void = { _ in },
         onFailure: @escaping @MainActor (String) -> Void = { _ in },
         onChange: @escaping @MainActor () -> Void = {},
-        onCancel: @escaping @MainActor () -> Void = {}
+        onCancel: @escaping @MainActor () -> Void = {},
+        onUserStop: @escaping @MainActor () -> Void = {}
     ) {
         self.now = now
         self.configuration = configuration
@@ -701,6 +707,7 @@ final class ResidentAgentLoop {
         self.onFailure = onFailure
         self.onChange = onChange
         self.onCancel = onCancel
+        self.onUserStop = onUserStop
     }
 
     var snapshot: Snapshot {
@@ -843,7 +850,8 @@ final class ResidentAgentLoop {
         guard backgroundEnabled != enabled else { return }
         backgroundEnabled = enabled
         if !enabled && activeRunID != nil && activeRunIsBackground && activeRunContinuationIDs.isEmpty {
-            cancelCurrentRun(stopAutonomy: false)
+            // 自主可用性回收不是用户停止：它取消本轮，但不写"用户停止过"。
+            cancelCurrentRun(reason: .system)
         } else {
             onChange()
         }
@@ -944,6 +952,11 @@ final class ResidentAgentLoop {
         persistMemorySnapshot()
     }
 
+    /// 一次取消的成因。只有 `.userStop` 是"用户意图"：它可以持久停用自主续办并
+    /// 要求一次显式恢复；`.system` 只是宿主自己在回收本轮（换空间、退出、可用性/
+    /// 网络导致的自主关闭），它必须能自愈，绝不冒充"用户按过停止"。
+    private enum CancellationReason { case userStop, system }
+
     /// 停止：结束当前 run 的自主行动，并把自主续办标记为"被用户停止"。
     /// 语义边界（与任务级的 `autoContinuationPaused` 分工不同）：
     /// - 作用范围是本循环实例的**当前 run 与后续自主轮**，不是该任务的永久契约；
@@ -953,8 +966,17 @@ final class ResidentAgentLoop {
     ///   `pauseContinuations` 单独落盘，只有任务级恢复动作才会解除。
     /// - 解除是一个明确动作：人类在界面上的"恢复"（`resumeAutonomyByUser`）
     ///   或本轮人类明确要求恢复（`update_resident_intent(resume_paused_intent:)`）。
+    /// 只有真实用户停止（界面上的停止控件）才走这里；宿主自身的回收走 `cancel()`。
     func stop() {
-        cancelCurrentRun(stopAutonomy: true)
+        cancelCurrentRun(reason: .userStop)
+    }
+
+    /// 宿主取消本轮但**不**声明"用户停止过"：换空间、退出、自主可用性回收、
+    /// 后台预算回收都走这里。它结束当前 run 并保住排队中的引导，但 `stopped`
+    /// 与 `intentPausedByUser` 保持原样，因此既不会让界面出现"自主行动已停止"，
+    /// 也不会写出一个需要人工解除的持久暂停。
+    func cancel() {
+        cancelCurrentRun(reason: .system)
     }
 
     /// 宿主代人类执行的一次"恢复"操作（面板上的一个动作，不需要用户说对某句话）：
@@ -976,9 +998,15 @@ final class ResidentAgentLoop {
         return true
     }
 
-    private func cancelCurrentRun(stopAutonomy: Bool) {
-        stopped = stopAutonomy
-        if stopAutonomy { intentPausedByUser = true }
+    private func cancelCurrentRun(reason: CancellationReason) {
+        let stopAutonomy = reason == .userStop
+        // 一次取消只**声明**这次取消是不是用户停止：`.userStop` 记下用户意图，
+        // `.system` 只是回收本轮，既不伪造用户停止，也不替用户解除已有的停止
+        // （"取消这一轮"从来不等于"恢复自主"）。
+        if stopAutonomy {
+            stopped = true
+            intentPausedByUser = true
+        }
         noteMutation()
         // 取消一次仍在进行、尚未产出结果的模型轮次只记一次取消；迟到结果因 run
         // 失配不会再进入 finishIfReady，因此绝不重复计数，也不影响更新的轮次。
@@ -1019,6 +1047,7 @@ final class ResidentAgentLoop {
         steeringTask?.cancel(); steeringTask = nil
         steeringMessageID = nil
         onCancel()
+        if reason == .userStop { onUserStop() }
         onChange()
         persistMemorySnapshot()
         // Composers prepend submissions; reverse callbacks preserve their original order.
@@ -1153,7 +1182,8 @@ final class ResidentAgentLoop {
 
     func invalidate() {
         invalidated = true
-        stop()
+        // 换空间/退出应用不是"用户按了停止"：只回收本轮，不写持久的人工暂停。
+        cancelCurrentRun(reason: .system)
     }
 
     private func drainUserMessages() {

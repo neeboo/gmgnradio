@@ -150,6 +150,34 @@ public struct WorldSimulation: Sendable {
             next.layoutUndo = .init(objectID: id, previous: item, previousHeldProp: state.heldProp)
             item.isEnabled = false
             next.objectStates[id] = item
+        case let .resize(id, size):
+            objectID = id
+            guard var item = state.objectStates[id], let prop = item.generatedProp, prop.objectID == id else {
+                throw WorldPropLayoutError.invalidObject
+            }
+            guard state.heldProp?.objectID != id else { throw WorldPropLayoutError.objectIsHeld(objectID: id) }
+            // 越界（太小看不见 / 太大撑满房间）由**唯一**那份尺寸策略拒绝，原因可读。
+            _ = try WorldPropSizePolicy.manualSize(current: prop.effectiveSize,
+                                                   targetLongestEdge: WorldPropSizePolicy.longestEdge(of: size))
+            // 必须是当前尺寸的等比缩放：渲染端只有一份等比缩放，非等比会让碰撞盒与画面对不上。
+            guard WorldPropSizePolicy.uniformFactor(from: prop.effectiveSize, to: size) != nil else {
+                throw WorldPropLayoutError.invalidSize("尺寸必须等比缩放：画面用一份等比缩放，非等比会让碰撞盒与画面对不上。")
+            }
+            let resized = prop.withSize(size)
+            guard resized.isValid else { throw WorldPropLayoutError.invalidSize("尺寸必须是有限的正数。") }
+            // 尺寸变了 ⇒ 物件自身的字节变了。以物件字节为有效性前提的旧撤销记录必须作废，
+            // 否则「撤销上次」会拿一条已经不适用的记录去复原（`undo` 会判 invalidObject）。
+            // 与 hold / adjustGrip / enableCapability 同族：就地调整，不占用撤销槽。
+            next.layoutUndo = nil
+            item.metadata["gmgn.generated-prop.v1"] = String(decoding: try JSONEncoder().encode(resized), as: UTF8.self)
+            // 画面那一份缩放必须与"这件东西多大"的**唯一**出口一致（`effectiveSize`）。
+            let resizedScale = resized.effectiveSize.y / resized.sourceHeight
+            guard resizedScale.isFinite, resizedScale > 0 else {
+                throw WorldPropLayoutError.invalidSize("尺寸换算失败，请重新拖动。")
+            }
+            item.transform = .init(position: item.transform.position, rotation: item.transform.rotation,
+                                   scale: .init(x: resizedScale, y: resizedScale, z: resizedScale))
+            next.objectStates[id] = item
         case let .hold(id, avatarAssetID, calibration):
             objectID = id
             guard state.activeActivity == nil else {

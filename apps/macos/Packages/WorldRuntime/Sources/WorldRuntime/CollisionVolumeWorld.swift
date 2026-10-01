@@ -72,10 +72,18 @@ public enum WorldCapsuleClearance {
 }
 
 public struct CollisionVolumeWorld: WorldCollisionQuerying {
-    private let blockingVolumes: [WorldCollisionVolume]
+    private let obstacles: [WorldPropObstacle]
 
+    /// 旧入口：只有 yaw 盒子的地方（世界清单的固定体积、独立家具）走这一条。
+    /// 它把每个体积包成 `.orientedBox` 障碍，于是下面那**一个**循环就是全部几何。
     public init(volumes: [WorldCollisionVolume]) {
-        blockingVolumes = volumes.filter(\.isBlocking)
+        self.init(obstacles: volumes.map(WorldPropObstacle.init(volume:)))
+    }
+
+    /// 新入口：形状可以是 yaw 盒子**或**生成侧的碰撞代理。
+    /// 运行时移动/站立（`PropLayoutCollisionWorld` 的底座）用这一条。
+    public init(obstacles: [WorldPropObstacle]) {
+        self.obstacles = obstacles.filter(\.isBlocking)
     }
 
     public init(manifest: WorldManifest) {
@@ -88,11 +96,14 @@ public struct CollisionVolumeWorld: WorldCollisionQuerying {
     ) -> Bool {
         // 判据委托给 `WorldCapsuleClearance`（唯一一份几何）：这里不再各写一遍
         // 距离测试，否则"运行时"与"摆放预检"又会慢慢漂开。
+        //
+        // 障碍重载内部按形状分派：盒子分支逐字转交给原来那个 `WorldCollisionVolume`
+        // 重载，代理分支走胶囊 × 三角形。两条都在**同一个**函数里，调用方看不到分叉。
         guard capsule.isValid, position.isFinite else {
             return false
         }
-        for volume in blockingVolumes
-        where !WorldCapsuleClearance.isClear(capsule, at: position, of: volume) {
+        for obstacle in obstacles
+        where !WorldCapsuleClearance.isClear(capsule, at: position, of: obstacle) {
             return false
         }
         return true
@@ -102,13 +113,35 @@ public struct CollisionVolumeWorld: WorldCollisionQuerying {
         guard position.isFinite else {
             return nil
         }
-
-        return blockingVolumes.compactMap { volume -> Float? in
-            guard let box = OrientedBox(volume) else {
-                return nil
+        var best: Float?
+        for obstacle in obstacles {
+            guard let height = verticalIntersectionHeight(of: obstacle, x: position.x, z: position.z) else {
+                continue
             }
-            return box.verticalIntersectionHeight(x: position.x, z: position.z)
-        }.max()
+            best = best.map { max($0, height) } ?? height
+        }
+        return best
+    }
+
+    private func verticalIntersectionHeight(
+        of obstacle: WorldPropObstacle,
+        x: Float,
+        z: Float
+    ) -> Float? {
+        switch obstacle.shape {
+        case .orientedBox(let volume):
+            guard let box = OrientedBox(volume) else { return nil }
+            return box.verticalIntersectionHeight(x: x, z: z)
+        case .proxyMesh:
+            // 生成物件的碰撞代理**不提供可站顶面** —— 这是 `PropLayoutCollisionWorld` 与
+            // `PropLayoutCollisionWorld.groundHeight`（只转发 `base`，从不问 `props`）已经
+            // 写死的口径。给代理也"算一个顶面"需要竖直射线 × 三角形，那就是这个文件里的
+            // 第二套几何；而这条路径今天对已放物件根本不可达。
+            //
+            // 返回 nil（而不是包围盒顶面）是刻意的 **fail-closed**：拿不到真实的可站面就
+            // 说"这里没有承托"，绝不拿包围盒顶面冒充 —— 那会让居民站在斧头上方的空气里。
+            return nil
+        }
     }
 }
 

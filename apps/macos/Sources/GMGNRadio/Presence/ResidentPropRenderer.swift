@@ -149,6 +149,9 @@ import simd
         let minimum=asset.asset.worldBounds.min,maximum=asset.asset.worldBounds.max
         _=try ResidentPropPlacementMatrix.transform(minimum:minimum,maximum:maximum,targetHeight:item.targetHeightMeters,position:item.position,yaw:item.yaw)
         let sourceHeight=maximum.y-minimum.y
+        // 只按高度轴归一的尺寸（见 `ResidentPropPreparedAsset.size` 的说明）：真正的自动
+        // 尺寸由 `WorldPropSizePolicy` 在**拿到生成请求高度的那一处**算出（细长物件按最长边
+        // 归一）。渲染端不重复应用策略 —— 它拿到的 targetHeight 已经是定稿高度。
         return ResidentPropPreparedAsset(minimum:minimum,maximum:maximum,sourceHeight:sourceHeight,size:(maximum-minimum)*(item.targetHeightMeters/sourceHeight))
     }
 

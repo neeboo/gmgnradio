@@ -118,7 +118,11 @@ final class WishMachineDaemonFixture: PropTaskDaemonConnecting {
             } catch {
                 guard let index = jobs.firstIndex(where: { $0.id == id }) else { return }
                 jobs[index].backendStage = "submission_uncertain"
-                jobs[index].lastError = "fixture submission response was not confirmed"
+                // 与真实守护进程逐字一致：传输失败（含提交响应丢失）在 provider 层映射为
+                // `network_unavailable`（services/gmgn-taskd/src/provider.rs:45），调度器此后
+                // 不再自动重发 `submission_uncertain`（daemon.rs:770/:787）。宿主据此区分
+                // "网络类未知结果"（可在恢复后确认）与"真实被拒/未授权"（绝不重发）。
+                jobs[index].lastError = "network_unavailable"
                 try? publish(id)
             }
             if let current = jobs.first(where: { $0.id == id }),

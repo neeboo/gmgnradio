@@ -5,6 +5,31 @@ let presentation = "apps/macos/Sources/GMGNRadio/Presence/PropSupportGridPresent
 let hitTest = "apps/macos/Sources/GMGNRadio/Presence/ResidentPropHitTest.swift"
 let source = try String(contentsOfFile: descriptor, encoding: .utf8)
 guard source.contains("struct ResidentPropRenderDescriptor") else { print("FAIL: resident prop placement contract missing"); exit(1) }
+// 描述符带着**尺寸意图**（`size_intent`）。这一轮只编描述符、不整份编
+// `PropGenerationClient.swift`（那份依赖 WorldRuntime），所以按括号配平把
+// `PropSizeIntent` 这一段声明**从生产源码里原样抽出来**当成一份源码文件一起编 ——
+// 编的是同一份源码，不是在这儿抄一份类型定义。抽不到就 FAIL。
+func declaration(in text: String, _ signature: String) -> String? {
+    guard let start = text.range(of: signature)?.lowerBound,
+          let open = text[start...].firstIndex(of: "{") else { return nil }
+    var depth = 0
+    for index in text[open...].indices {
+        if text[index] == "{" { depth += 1 }
+        if text[index] == "}" { depth -= 1 }
+        if depth == 0 { return String(text[start...index]) }
+    }
+    return nil
+}
+let propGenerationClient = "apps/macos/Sources/GMGNRadio/Presence/PropGenerationClient.swift"
+let propGenerationClientSource = try String(contentsOfFile: propGenerationClient, encoding: .utf8)
+guard let sizeIntentDeclaration = declaration(in: propGenerationClientSource, "struct PropSizeIntent: Codable") else {
+    print("FAIL: 生产源码里找不到 PropSizeIntent 的声明（尺寸意图契约不能只存在于别处）"); exit(1)
+}
+let temporaryDirectoryForSizeIntentShim = FileManager.default.temporaryDirectory
+    .appendingPathComponent("gmgn-prop-render-contract-" + UUID().uuidString)
+try FileManager.default.createDirectory(at: temporaryDirectoryForSizeIntentShim, withIntermediateDirectories: true)
+let sizeIntentShim = temporaryDirectoryForSizeIntentShim.appendingPathComponent("PropSizeIntentContract.swift")
+try ("import Foundation\n\n" + sizeIntentDeclaration + "\n").write(to: sizeIntentShim, atomically: true, encoding: .utf8)
 // 拾取器刻意只依赖 Foundation + simd，所以这里能单独编译它做离线验证。
 let pickerSource = try String(contentsOfFile: picker, encoding: .utf8)
 guard pickerSource.contains("enum PropSupportGridPicker") else { print("FAIL: build-mode grid picker missing"); exit(1) }
@@ -435,7 +460,7 @@ defer {try? FileManager.default.removeItem(at:temp)}
 let file=temp.appendingPathComponent("main.swift"),exe=temp.appendingPathComponent("check")
 try harness.write(to:file,atomically:true,encoding:.utf8)
 func run(_ path:String,_ args:[String]) throws->Int32 {let p=Process();p.executableURL=URL(fileURLWithPath:path);p.arguments=args;try p.run();p.waitUntilExit();return p.terminationStatus}
-let result=try run("/usr/bin/nice",["-n","15","/usr/bin/swiftc","-j1","-parse-as-library",descriptor,picker,presentation,hitTest,blockLabel,file.path,"-o",exe.path])
+let result=try run("/usr/bin/nice",["-n","15","/usr/bin/swiftc","-j1","-parse-as-library",descriptor,sizeIntentShim.path,picker,presentation,hitTest,blockLabel,file.path,"-o",exe.path])
 guard result==0 else {exit(result)}
 let checks=try run(exe.path,[])
 guard checks==0 else {exit(checks)}
@@ -535,6 +560,6 @@ struct PreviewRejected: LocalizedError {
 let onHandFile=temp.appendingPathComponent("onhand.swift"),onHandExe=temp.appendingPathComponent("onhand")
 try onHandHarness.write(to:onHandFile,atomically:true,encoding:.utf8)
 let onHandCompile=try run("/usr/bin/nice",["-n","15","/usr/bin/swiftc","-j1","-parse-as-library","-swift-version","6",
-    "-I",worldBuild + "/Modules",descriptor,editorState,onHandFile.path,"-o",onHandExe.path] + worldObjects)
+    "-I",worldBuild + "/Modules",descriptor,sizeIntentShim.path,editorState,onHandFile.path,"-o",onHandExe.path] + worldObjects)
 guard onHandCompile==0 else {exit(onHandCompile)}
 exit(try run(onHandExe.path,[]))

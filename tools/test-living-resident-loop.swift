@@ -62,7 +62,7 @@ let loopMethods = ["private func ensureResidentLoop(", "private func synchronize
                    "private static func residentMemoryObservedAt(",
                    "private func performResidentTurn(",
                    "private func returnHeldPropBeforeResidentStop(reason: String) -> Bool",
-                   "private func stopResidentLoop(reason: String) -> Bool",
+                   "private func stopResidentLoop(reason: String, userIntent: Bool = false) -> Bool",
                    // 摆放读回（"已领产物是否真的在当前空间里摆好"）现在由面板的
                    // 一次"恢复"和后台续办共用同一份宿主事实，所以这里必须编译
                    // 同一份真实实现。
@@ -70,6 +70,14 @@ let loopMethods = ["private func ensureResidentLoop(", "private func synchronize
                    "private func cancelResidentMessage("].map {
     declaration($0, in: app)
 }.joined(separator: "\n")
+// `userIntent` 是**因果**，不是措辞：只有界面上的停止控件才是用户意图，那条取消才允许
+// 写持久的许愿/自主暂停。换空间、退出、可用性（网络）回收一律走 `cancel()`，绝不伪装成
+// "用户按过停止"——否则一次网络抖动就会留下一个只有人工能解除的暂停。
+let stopLoopMethod = declaration("private func stopResidentLoop(reason: String, userIntent: Bool = false) -> Bool", in: app)
+guard stopLoopMethod.contains("if userIntent { residentAgentLoop.stop() } else { residentAgentLoop.cancel() }") else {
+    print("FAIL: only an explicit user stop may mark user intent; availability/world-switch cancellation must not")
+    exit(1)
+}
 let contextMethod = app.contains("private func currentResidentWorldContext(")
     ? declaration("private func currentResidentWorldContext(", in: app) : ""
 let toolsMethod = app.contains("private func makeResidentWorldTools(")
@@ -240,6 +248,9 @@ typealias RealConversationService = AgentConversationService
     func setResidentProgress(_ value: String?) { progress = value }
     func setResidentDeliveryNotice(_ value: String?) { deliveryNotice = value }
     func setResidentCanStop(_ value: Bool) {}
+    /// 全局开关横幅的宿主推入口（状态收敛）：授权不再由任务行表达。
+    func setResidentAutonomyStop(_ stopped: Bool) {}
+    func setWishMachineConnectivity(_ text: String?) {}
     func restoreResidentSubmission(_ submission: ResidentChatSubmission, notice: String) { showChatStatus(notice) }
     \#(replyMethods)
 }
@@ -329,6 +340,10 @@ typealias RealConversationService = AgentConversationService
         func setResidentProgress(_ value: String?) { progress = value }
         func setResidentDeliveryNotice(_ notice: String?) {}
         func setResidentCanStop(_ canStop: Bool) {}
+        /// 全局开关横幅的宿主推入口（状态收敛）：授权不再由任务行表达，
+        /// 所以这两个表面各有一个全局推入口。这里补同名可编译的桩，不假装覆盖其行为。
+        func setResidentAutonomyStop(_ stopped: Bool) {}
+        func setWishMachineConnectivity(_ text: String?) {}
         func restoreResidentSubmission(_ submission: ResidentChatSubmission, notice: String) {}
     }
     var stageWindowController: StageReply? = StageReply()
@@ -398,7 +413,7 @@ typealias RealConversationService = AgentConversationService
     func setSpatialEnvironment(scene: SpatialScenePreset?, weather: SpatialWeather?) async throws { fatalError("unexpected world change") }
     func moveSpatialCamera(direction: SpatialCameraCommandDirection, distance: Float) async throws { fatalError("unexpected camera") }
     func enqueue(_ message: String) async { await sendLiveCamMessage(message) }
-    func stop() { cancelResidentMessage() }
+    func stop() { cancelResidentMessage(userIntent: true) }
     func waitUntilIdle() async {
         for _ in 0..<500_000 {
             if residentAgentLoop?.snapshot.isRunning != true { return }
@@ -1054,6 +1069,9 @@ let compilerArguments: [String] = ["-j1", "-parse-as-library",
     root.appendingPathComponent("tools/fixtures/WishMachineDaemonFixture.swift").path,
     sources.appendingPathComponent("Presence/PropImagePreparation.swift").path,
     sources.appendingPathComponent("Presence/WishMachineOutputDescriptor.swift").path,
+    // 连通性词汇只有**一份**：coordinator 的 `isNetworkClassSubmissionError` 现在委托给
+    // `ResidentConnectivityFact`，所以那份生产文件必须一起编进来（编同一份，不是抄一份）。
+    sources.appendingPathComponent("Presence/WishMachineTaskPresentation.swift").path,
     sources.appendingPathComponent("Presence/WishMachineCoordinator.swift").path,
     sources.appendingPathComponent("Agent/ResidentWishMachineTools.swift").path,
     sources.appendingPathComponent("Agent/ResidentWishReferenceTools.swift").path,

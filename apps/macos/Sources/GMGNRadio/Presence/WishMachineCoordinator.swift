@@ -15,6 +15,12 @@ struct WishMachineJob: Identifiable, Codable, Equatable, Sendable {
     let requestID: String
     let name: String
     let heightMeters: Double
+    /// 提交时声明的**尺寸意图**（守护进程 `sizeIntent`）。可选、纯增量：老档案里没有这个键
+    /// ⇒ 解出 nil，行为与今天逐字相同（尺寸仍按请求高度自动推断）。
+    ///
+    /// 它随任务一起持久化，因为"这件东西该多大"是用户的意图：`retry`（复用原身份重放）
+    /// 与托盘预览都必须看到**同一个**意图，不能一次重试把它丢掉。
+    var sizeIntent: PropSizeIntent?
     let objectID: String
     var jobID: UUID?
     var stage: WishMachineStage
@@ -24,11 +30,29 @@ struct WishMachineJob: Identifiable, Codable, Equatable, Sendable {
     var lastError: String?
     // Optional for histories written before this flag existed; absent means not paused.
     var autoContinuationPaused: Bool?
+    // Provenance of `autoContinuationPaused`. Only a positive `true` here is evidence of
+    // an explicit human stop, and only that may keep demanding a manual release. `nil`
+    // means "no proven user intent" — older archives, and any pause another code path
+    // wrote — so `discardPausesWithoutUserIntent()` lifts it as soon as the backend is
+    // healthy again. A network, submission, world-switch or availability failure must
+    // never be able to produce a state only a human can clear.
+    var autoContinuationStoppedByUser: Bool?
     var cancelRequested: Bool?
     // A stable owner ID alone is not evidence that Rust durably accepted the task.
     var daemonAccepted: Bool?
     // Each human resume grant is single-use across later stops and app restarts.
     var continuationResumeAuthorizationIDs: [UUID]?
+}
+
+/// 任务行/工具回执要显示的"这个任务的尺寸是怎么定的"一行。
+///
+/// **没有意图就是 `nil`**（老任务、以及只给了旧 `height_meters` 的调用）：任务行的
+/// `detail` 因此与今天逐字相同，不因为本契约上线而多出任何一行。
+extension WishMachineJob {
+    var sizeIntentLine: String? {
+        guard let sizeIntent else { return nil }
+        return "尺寸：\(sizeIntent.summary)"
+    }
 }
 
 struct WishMachineClaimEvidence {
@@ -431,7 +455,8 @@ enum WishMachineError: LocalizedError {
     }
 
     func submit(requestID: String, authorizationID: UUID, attachmentID: UUID, name: String,
-                heightMeters: Double, worldID: String, residentScope: String,
+                heightMeters: Double, sizeIntent: PropSizeIntent? = nil,
+                worldID: String, residentScope: String,
                 destination: WishPlacementDestination? = nil) async throws -> WishMachineJob {
         guard readable else { throw WishMachineError.unavailable }
         try Task.checkCancellation()
@@ -440,7 +465,12 @@ enum WishMachineError: LocalizedError {
         guard let image = authorization.attachments.first(where: { $0.id == attachmentID }) else { throw WishMachineError.unknownAttachment }
         if let existing = jobs.first(where: { $0.authorizationID == authorizationID }) {
             guard existing.requestID == requestID else { throw WishMachineError.consumedAuthorization }
-            guard existing.attachmentID == attachmentID, existing.name == name, existing.heightMeters == heightMeters else { throw WishMachineError.conflictingCall }
+            // 尺寸意图也要一致，但**老档案没有它**（升级前受理的任务）：
+            // 只要有一侧没说过意图，就按"没有意图"放过这次重放，不把合法重放判成冲突。
+            guard existing.attachmentID == attachmentID, existing.name == name,
+                  existing.heightMeters == heightMeters,
+                  existing.sizeIntent == sizeIntent || existing.sizeIntent == nil || sizeIntent == nil
+            else { throw WishMachineError.conflictingCall }
             if let destination {
                 guard let grant = delegations.first(where: { $0.authorizationID == authorizationID }),
                       grant.allowedSurfaceIDs == destination.surfaceIDs, grant.explicitTarget == destination.explicitTarget else { throw WishMachineError.conflictingCall }
@@ -460,9 +490,16 @@ enum WishMachineError: LocalizedError {
             }
         }
         guard !requestID.isEmpty, (1...100).contains(name.count), heightMeters.isFinite, (0.01...3).contains(heightMeters) else { throw PropGenerationError.invalidInput }
+        // 尺寸意图**存在时必须合法**，而且与请求高度不矛盾：轴是高度时两者就是同一件事。
+        // 非法/矛盾一律拒绝（`invalidInput` 的文案会说明范围），不静默按"没有意图"处理。
+        if let sizeIntent {
+            guard sizeIntent.isValid else { throw PropGenerationError.invalidInput }
+            if sizeIntent.axis == .height, sizeIntent.meters != heightMeters { throw PropGenerationError.invalidInput }
+        }
         let id = UUID()
         jobs.append(.init(id: id, worldID: worldID, residentScope: residentScope, authorizationID: authorizationID,
             attachmentID: attachmentID, requestID: requestID, name: name, heightMeters: heightMeters,
+            sizeIntent: sizeIntent,
             objectID: "wish-prop-" + id.uuidString.lowercased(), jobID: id, stage: .submitting))
         emit(index: jobs.count - 1, kind: .stateChanged)
         try persist() // Owner, grant and stable core identity precede both core persistence and network submission.
@@ -470,7 +507,7 @@ enum WishMachineError: LocalizedError {
         // Remote submission, observation and download belong exclusively to that process.
         let generationSource = webReferences.first { $0.attachmentID == attachmentID }?.source ?? authorization.source
         let coreID = await store.create(imageURL: image.url, name: name, author: generationSource.author,
-            license: generationSource.license, heightMeters: heightMeters, id: id,
+            license: generationSource.license, heightMeters: heightMeters, sizeIntent: sizeIntent, id: id,
             context: PropTaskContext(worldID: worldID, residentScope: residentScope))
         let index = try index(id: id, worldID: worldID, residentScope: residentScope)
         if coreID == nil {
@@ -546,8 +583,9 @@ enum WishMachineError: LocalizedError {
             guard let authorization = authorizations.first(where: { $0.id == job.authorizationID && $0.worldID == worldID && $0.residentScope == residentScope }),
                   let image = authorization.attachments.first(where: { $0.id == job.attachmentID }) else { throw WishMachineError.unknownAttachment }
             let generationSource = webReferences.first { $0.attachmentID == job.attachmentID }?.source ?? authorization.source
+            // 重放必须带上**原任务的**尺寸意图：换一次身份不等于换一个尺寸。
             _ = await store.create(imageURL: image.url, name: job.name, author: generationSource.author,
-                license: generationSource.license, heightMeters: job.heightMeters, id: coreID,
+                license: generationSource.license, heightMeters: job.heightMeters, sizeIntent: job.sizeIntent, id: coreID,
                 context: PropTaskContext(worldID: worldID, residentScope: residentScope))
         }
         reconcile(index: index)
@@ -565,10 +603,73 @@ enum WishMachineError: LocalizedError {
         return jobs[index]
     }
 
+    /// Bounded automatic confirmation of a network-class unknown submission.
+    ///
+    /// Why this exists: the daemon deliberately stops scheduling a submission whose outcome
+    /// is unknown (`submission_uncertain` is excluded from its due stages), so `last_error`
+    /// stays `network_unavailable` forever and the panel keeps showing a network failure long
+    /// after the network is back. Confirmation reuses the original identity (same wish, same
+    /// daemon job, same image, same idempotency key) through the exact `retry` path the
+    /// explicit `retry_wish_generation` tool uses: it never creates a second generation and
+    /// never consumes another authorization. Only genuinely network-class errors qualify —
+    /// a rejected or unauthenticated submission is a real outcome and is never reissued.
+    static let maximumNetworkConfirmationsPerJob = 3
+    /// Two automatic confirmations of the same task are at least this far apart, so a
+    /// still-broken remote endpoint cannot be hammered by the host's 5-second refresh.
+    static let minimumNetworkConfirmationInterval: TimeInterval = 30
+
+    static func isNetworkClassSubmissionError(_ message: String?) -> Bool {
+        guard let message else { return false }
+        // 「什么算连通性事实」只有**一份**判据（`ResidentConnectivityFact.vocabulary`）：
+        // 这里委托过去，不再各存一套词汇表 —— 否则"是不是网络类"会有两个答案，
+        // 而呈现侧（全局横幅）与判定侧（自愈确认）正好会因此互相矛盾。
+        return ResidentConnectivityFact.isConnectivityLine(message)
+    }
+
+    /// Injectable clock (same seam the resident loop uses) so the confirmation backoff is
+    /// deterministic in harnesses instead of depending on wall time.
+    var now: () -> Date = { Date() }
+
+    private var networkConfirmationAttempts: [UUID: Int] = [:]
+    private var lastNetworkConfirmationAt: [UUID: Date] = [:]
+
+    @discardableResult
+    func confirmNetworkUncertainSubmissions() async -> Int {
+        guard readable, store.errorMessage == nil else { return 0 }
+        let date = now()
+        let pending = jobs.filter { job in
+            guard job.stage == .submissionUncertain,
+                  Self.isNetworkClassSubmissionError(job.lastError),
+                  (networkConfirmationAttempts[job.id] ?? 0) < Self.maximumNetworkConfirmationsPerJob
+            else { return false }
+            guard let last = lastNetworkConfirmationAt[job.id] else { return true }
+            return date.timeIntervalSince(last) >= Self.minimumNetworkConfirmationInterval
+        }
+        var confirmed = 0
+        for job in pending {
+            networkConfirmationAttempts[job.id, default: 0] += 1
+            lastNetworkConfirmationAt[job.id] = date
+            _ = try? await retry(id: job.id, worldID: job.worldID, residentScope: job.residentScope)
+            guard let index = jobs.firstIndex(where: { $0.id == job.id }) else { continue }
+            try? persist()
+            if jobs[index].stage != .submissionUncertain || jobs[index].lastError != job.lastError { confirmed += 1 }
+        }
+        return confirmed
+    }
+
     func refreshPending(limit: Int = 2) async {
         guard readable, limit > 0 else { return }
         await store.refreshSnapshot()
         synchronizeBackendSnapshot()
+        // 暂停的重新校验**不依赖后端**：它纯本地、幂等，唯一的判据是"有没有用户意图证据"。
+        // 后端没配好时，遗留的非用户暂停同样必须自愈，而不是继续要求人工解除——那正是
+        // 用户抱怨的多余一步。run 级用户停止与"奉命轮"规则仍然各自把住每一次自主领取。
+        discardPausesWithoutUserIntent()
+        // 网络类未知提交的自动确认必须等后端真的可达：它要复用原幂等身份去确认/重发，
+        // 门槛之外只会制造无效请求。所以健康判定只留给这一条。
+        let healthy = store.errorMessage == nil
+        guard healthy else { return }
+        await confirmNetworkUncertainSubmissions()
     }
 
     @discardableResult func cancel(id: UUID, worldID: String, residentScope: String) async throws -> WishMachineJob {
@@ -604,7 +705,13 @@ enum WishMachineError: LocalizedError {
         return jobs.compactMap { job in
             guard job.worldID == worldID, job.stage == .ready, let path = job.modelPath,
                   FileManager.default.fileExists(atPath: path) else { return nil }
-            return .init(id: job.objectID, worldID: worldID, modelURL: URL(fileURLWithPath: path), targetHeightMeters: Float(job.heightMeters))
+            // `height_meters` 是**生成请求**的高度：托盘上这一件还没登记，所以必须带上
+            // "这是请求高度"这个事实，渲染端才会先过一遍尺度策略（细长物件按最长边归一）。
+            // 真机 2026-10-01 那把剑就是在这里按高度归一的：0.133 m 的"高度"被拉到 1.1 m，
+            // 于是 1.005 m 长的剑变成 8.285 m，横跨整个舱室。
+            return .init(id: job.objectID, worldID: worldID, modelURL: URL(fileURLWithPath: path),
+                         targetHeightMeters: Float(job.heightMeters),
+                         heightIsGenerationRequest: true, sizeIntent: job.sizeIntent)
         }
     }
     func pendingEvents(worldID: String, residentScope: String) -> [WishMachineEvent] {
@@ -670,6 +777,7 @@ enum WishMachineError: LocalizedError {
         }
         let priorDelegations = delegations, priorEvents = events
         jobs[index].autoContinuationPaused = false
+        jobs[index].autoContinuationStoppedByUser = nil
         jobs[index].continuationResumeAuthorizationIDs = (job.continuationResumeAuthorizationIDs ?? []) + [authorizationID]
         if let delegationIndex, delegations[delegationIndex].state == .revoked {
             delegations[delegationIndex].state = delegations[delegationIndex].objectID == nil ? .awaitingSubmission : .pending
@@ -688,12 +796,22 @@ enum WishMachineError: LocalizedError {
     }
 
     /// Stop automatic follow-through for existing commissions only. Keep their facts and assets intact.
+    ///
+    /// Host contract: call this **only** for an explicit user stop (the interface's stop
+    /// control). Everything else — a network/submission failure, a backend becoming
+    /// unavailable, a world switch, an app quit — must not write this pause, because the
+    /// only way back is a human action and the user never asked for one. The pause records
+    /// its own user-intent provenance so a pause written by an older build (or by any other
+    /// path) can be re-validated and lifted by `discardPausesWithoutUserIntent()`.
     func pauseContinuations(worldID: String, residentScope: String) throws {
         let indices = jobs.indices.filter { jobs[$0].worldID == worldID && jobs[$0].residentScope == residentScope }
         let delegationIndices = delegations.indices.filter { delegations[$0].worldID == worldID && delegations[$0].residentScope == residentScope && delegations[$0].state == .pending }
         guard !indices.isEmpty || !delegationIndices.isEmpty else { return }
         // Block in this process before touching disk; a failed save must not resume actions in memory.
-        for index in indices { jobs[index].autoContinuationPaused = true }
+        for index in indices {
+            jobs[index].autoContinuationPaused = true
+            jobs[index].autoContinuationStoppedByUser = true
+        }
         // Stop revokes incomplete placement delegations in the same durable record.
         for index in delegationIndices { delegations[index].state = .revoked }
         do { try persist() }
@@ -701,6 +819,52 @@ enum WishMachineError: LocalizedError {
             errorMessage = WishMachineError.pauseNotPersisted.localizedDescription
             throw WishMachineError.pauseNotPersisted
         }
+    }
+
+    /// Re-validate every persisted task-level pause against its provenance: a pause may only
+    /// keep demanding a manual release when an explicit user stop wrote it. Pauses written by
+    /// an older build (or by any non-user path) carry no such evidence, so they are lifted
+    /// here, together with the placements revoked by that same pause, and the change is
+    /// emitted as a durable fact. This is deliberately narrow: the run-level user stop
+    /// (`ResidentAgentLoop`) and the "human-ordered turn" rule still gate every autonomous
+    /// claim, so lifting a task pause can never start an unsupervised pickup.
+    ///
+    /// Returns how many tasks were released. Called only while the backend is healthy.
+    @discardableResult
+    func discardPausesWithoutUserIntent() -> Int {
+        guard readable else { return 0 }
+        let indices = jobs.indices.filter {
+            jobs[$0].autoContinuationPaused == true && jobs[$0].autoContinuationStoppedByUser != true
+        }
+        guard !indices.isEmpty else { return 0 }
+        let priorJobs = jobs, priorEvents = events, priorDelegations = delegations
+        for index in indices {
+            jobs[index].autoContinuationPaused = false
+            jobs[index].autoContinuationStoppedByUser = nil
+            events.append(.init(id: UUID(), wishID: jobs[index].id, worldID: jobs[index].worldID,
+                residentScope: jobs[index].residentScope, objectID: jobs[index].objectID, kind: .stateChanged,
+                computeMayContinue: jobs[index].computeMayContinue, stage: jobs[index].stage,
+                remoteState: jobs[index].remoteState,
+                message: "自动续办已恢复：此前的停止不是一次人工操作，不需要手动解除。",
+                cancelRequested: jobs[index].cancelRequested, autoContinuationPaused: false))
+        }
+        // A placement revoked by that same non-user pause is reopened with it. Delegations
+        // revoked explicitly (`revokePlacementDelegations`) belong to tasks that are not
+        // released here, so they stay revoked.
+        for index in delegations.indices where delegations[index].state == .revoked
+            && indices.contains(where: {
+                jobs[$0].authorizationID == delegations[index].authorizationID
+                    && jobs[$0].worldID == delegations[index].worldID
+                    && jobs[$0].residentScope == delegations[index].residentScope
+            }) {
+            delegations[index].state = delegations[index].objectID == nil ? .awaitingSubmission : .pending
+        }
+        do { try persist() }
+        catch {
+            jobs = priorJobs; events = priorEvents; delegations = priorDelegations
+            return 0
+        }
+        return indices.count
     }
     /// Stop revokes incomplete delegations durably; revocation never revives on restart or world switch.
     func revokePlacementDelegations(worldID: String, residentScope: String) throws {

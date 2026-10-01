@@ -270,7 +270,17 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     /// 场景内旋转手柄的外扩距离都读它——两处各抄一遍的话，手柄会偏离真正被判定/着色的 footprint。
     var footprint: (size: SIMD2<Float>, height: Float)? {
         guard let prop = (candidate ?? selectedObject)?.generatedProp else { return nil }
-        return (SIMD2(prop.size.x, prop.size.z), prop.size.y)
+        // 尺寸只有一个出口：`effectiveSize`（判据、碰撞盒、红/绿格、渲染目标高度都读它）。
+        return (SIMD2(prop.effectiveSize.x, prop.effectiveSize.z), prop.effectiveSize.y)
+    }
+    /// 列表里那一行的状态文案（**唯一**一份推导，`ResidentPropEditorView` 直接读它）。
+    ///
+    /// 真机 2026-10-01：一件**已入库但没摆出来**的物件在房间里看不见，列表里也只有名字、
+    /// 没有任何状态 —— 用户说"大剑还是消失了"。"在库存里"与"在房间里"是两件事实，
+    /// 两件都要说；"放不下"绝不允许看起来像"消失"。
+    static func rowStatus(isHeld: Bool, isPlaced: Bool) -> String {
+        if isHeld { return "手持中" }
+        return isPlaced ? "已摆出" : "尚未摆放"
     }
     var selectedGrip: WorldPropGripCalibration? { isSelectedHeld ? selectedObject?.gripCalibration : nil }
     var selectedHoldUnavailableReason: String? { selectedID.flatMap { snapshot.holdUnavailableReasons[$0] } }
@@ -596,6 +606,76 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
         guard canConfirm, let id = selectedID, let p = placement else { return }
         await save(.place(objectID: id, placement: p))
     }
+
+    // MARK: - 尺寸
+
+    /// 这件物件现在多大（最长边，米）。**只读 `prop.size`**，与碰撞盒/红绿格同一份。
+    var selectedLongestEdge: Float? {
+        selectedObject?.generatedProp.map { WorldPropSizePolicy.longestEdge(of: $0.effectiveSize) }
+    }
+
+    /// 这件物件的尺寸是**怎么定**的：手动改过 > 按你说的尺寸（提交时的意图）> 工作流权威尺寸
+    /// > 自动推断。面板必须说得出这一行 —— 用户看到的每个数字都要有出处，
+    /// 否则"为什么它这么大"只能靠猜。判据只有一份（`WorldGeneratedProp.sizeProvenance`），
+    /// 与 `effectiveSize` 同一个出口，所以两者不可能互相矛盾。
+    var selectedSizeProvenance: String? {
+        selectedObject?.generatedProp.map { "\($0.sizeProvenance.label)：\($0.sizeProvenanceSummary)" }
+    }
+
+    /// 用户改**这一件**物件自己的尺寸（唯一入口）。
+    ///
+    /// - 目标值以**最长边**（米）表达，整件东西**等比**缩放，写回它自己的那份元数据的
+    ///   `size`：渲染、碰撞盒、红/绿格、存档读的都是它 —— 没有第二份尺寸来源。
+    ///   （等比不是偏好而是架构要求：渲染端只有一份等比缩放，非等比会让碰撞盒与画面对不上。）
+    /// - 越界（低于 0.02 m 看不见 / 高于 3 m 撑满房间）**拒绝**并给可读原因，不静默夹取。
+    /// - 提交还要过一次**同一条摆放判定**（`commit` → 摆放服务的 `validate`）：改大之后
+    ///   插墙/挡通道的尺寸会在**提交那一步**被拒，原因可读，而不是静默失败。
+    func resize(toLongestEdge meters: Float) async {
+        guard isOpen, !isSaving, let id = selectedID, let prop = selectedObject?.generatedProp else { return }
+        if isSelectedHeld {
+            notice = "这件物件正在居民手里，先放回再改尺寸。"
+            return
+        }
+        let size: WorldVector3
+        do { size = try WorldPropSizePolicy.manualSize(current: prop.effectiveSize, targetLongestEdge: meters) }
+        catch { notice = error.localizedDescription; return }
+        await commitSize(id: id, size: size)
+    }
+
+    /// 尺寸那一次提交的**唯一出口**（与 `saveAction` 同一个形状：保住选中，撤销槽不动）。
+    private func commitSize(id: String, size: WorldVector3) async {
+        guard isOpen, !isSaving, let commit else { return }
+        isSaving = true; isMoving = false
+        // 保存中：世界随时可能换一份回来，这次待办一律作废（见 `clearPendingSelect`）。
+        clearPendingSelect(reason: "保存中")
+        submittedCommand = nil
+        let key = "resize:\(id):\(size.x):\(size.y):\(size.z)"
+        if submittedActionKey != key { requestID = UUID().uuidString }
+        submittedActionKey = key
+        let context = generation, revision = snapshot.revision, id2 = requestID, draft = placement
+        do {
+            let result = try await commit(.resize(objectID: id, size: size), revision, id2)
+            guard context == generation, isOpen else { return }
+            guard result.worldID == snapshot.worldID else {
+                isSaving = false; notice = "房间已切换，请重新打开摆放"; return
+            }
+            snapshot = result; isSaving = false; selectedID = id; draftRevision = result.revision
+            let saved = String(format: "尺寸已保存：最长边 %.2f m（高 %.2f m）",
+                               WorldPropSizePolicy.longestEdge(of: size), size.y)
+            // 尺寸变了 ⇒ 手上那个落点必须按**同一条判定**重新过一次：红/绿格与落地判据同步。
+            if let draft {
+                await validate(WorldPropPlacement(surfaceID: draft.surfaceID, position: draft.position, yaw: draft.yaw))
+                notice = "\(saved) · \(notice)"
+            } else {
+                notice = saved
+            }
+            requestID = UUID().uuidString
+        } catch {
+            guard context == generation, isOpen else { return }
+            isSaving = false; notice = error.localizedDescription
+        }
+    }
+
     func withdraw() async {
         guard !isSaving, let id = selectedID, selectedObject?.isEnabled == true else { return }
         // 收回是**面板**动作：用户接下来要接着在房间里挑/放，焦点交回场景。

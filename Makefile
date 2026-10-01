@@ -1,4 +1,4 @@
-.PHONY: generate test test-all test-install test-worlds test-daemon test-python test-harnesses build install install-debug install-universal
+.PHONY: generate test test-all test-install test-worlds test-daemon test-python test-harnesses _test-harnesses build install install-debug install-universal unregister-product
 
 # 默认 Release：只有 -O 下"承托网格派生"才是 0.5 s 量级（-Onone 是 6.6 s，
 # 真机一次要六秒多，用户等不了）。想最快编译走 make install-debug。
@@ -22,12 +22,68 @@ COMPILATION_MODE ?= SWIFT_COMPILATION_MODE=incremental
 PYTHON ?= python3
 CARGO ?= $(shell command -v cargo 2>/dev/null || echo $(HOME)/.cargo/bin/cargo)
 
+# ---------------------------------------------------------------------------
+# 构建互斥闸：同一个 DerivedData 上，同一时刻只跑一个重型编译。
+#
+# 2026-10-01 事故：7 个 agent 同时在同一个 DerivedData 上跑 `make build`，10 核机器
+# 被 15 路并行 swift-frontend 打到负载 36+，并且反复出现
+#
+#   error: unable to attach DB: error: accessing build database
+#   ".../apps/macos/Build/Build/Intermediates.noindex/XCBuildData/build.db":
+#   database is locked Possibly there are two concurrent builds running in the
+#   same filesystem location.
+#
+# —— xcodebuild 的 build database 是 DerivedData 里**独占**的 SQLite 文件，并发
+# attach 必然互锁：构建于是"莫名失败"，而 agent 会把这种失败误判成自己刚改的代码
+# 有问题（这正是这次事故里最贵的部分）。
+#
+# 闸门**只做互斥**，不改任何编译参数/产物/验证语义：拿不到锁就**排队等待**
+# （打印"等待另一个构建完成…"），不做"直接失败"——直接失败同样会被误判成代码错误。
+# 等待上限默认 3600 s，超时以退出码 75（EX_TEMPFAIL）结束并打印当前持有者，
+# 明确区分"临时排队"和"编译失败"：
+#
+#   make build                          # 排队上限 1 小时
+#   make build BUILD_LOCK_TIMEOUT=600   # 按需调整排队上限
+#
+# 锁文件放在 DerivedData 里（`Build/` 已在 .gitignore），跟着 DerivedData 走：换一个
+# -derivedDataPath（或另一个 worktree）就不会互相阻塞。锁由
+# tools/with-build-lock.py 的包装进程持有（构建子进程不继承锁 fd，所以 Xcode 的长驻
+# 构建服务占不住闸门），持有者一退出就由内核自动释放，不会有需要手工删的死锁文件。
+#
+# 任何新的"重编译"目标按同样方式接线即可：$(BUILD_LOCK) <命令>
+# ---------------------------------------------------------------------------
+BUILD_LOCK_TIMEOUT ?= 3600
+BUILD_LOCK_FILE ?= $(if $(filter /%,$(DERIVED_DATA)),$(DERIVED_DATA),$(CURDIR)/$(DERIVED_DATA))/.xcodebuild.lock
+BUILD_LOCK = $(PYTHON) "$(CURDIR)/tools/with-build-lock.py" --lock "$(BUILD_LOCK_FILE)" --timeout "$(BUILD_LOCK_TIMEOUT)" --label "$@" --
+
+# ---------------------------------------------------------------------------
+# 构建产物的 LaunchServices 注销（"两个 gmgn radio 图标"的根治点）。
+#
+# `Build/Build/Products/<配置>/gmgn radio.app` 是一个可启动 bundle，xcodebuild 一
+# 把它写到磁盘上，LaunchServices 就**自动注册**它 —— 于是聚焦/启动台里出现第二个
+# "gmgn radio"（用户 2026-09-29 起报过三次）。`make install` 拷完会删掉产物、
+# `make dedupe` 也会清，但**裸 `make build`**（agent 与日常最常跑的那条）两条路都
+# 不经过，所以每构建一次图标就回来一次 —— 清理挂在别处就永远追不上。
+# 因此注销必须挂在 build **自己**的末尾。
+#
+# 两条硬约束：
+#   * **只注销，不删文件**：产物马上要交给 `make install` 用（删了它就废了）。
+#   * **不跑 `-dump`**：dump 一次 6~9 s，而 `-u <路径>` 是毫秒级。`lsregister -u`
+#     对**文件还在**的注册是有效的（只有"路径已不存在"的死注册才清不掉、只能重建
+#     数据库，那条路走 dedupe/install）；这里产物刚写出来，文件必然在。
+#
+# 失败不影响构建结果：命令自带 `|| true`，调用处也不改退出码。
+PRODUCT_APP ?= $(DERIVED_DATA)/Build/Products/$(CONFIGURATION)/gmgn radio.app
+LSREGISTER ?= /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+UNREGISTER_PRODUCT = "$(LSREGISTER)" -u "$(PRODUCT_APP)" >/dev/null 2>&1 || true
+
+# xcodegen 也写同一份 .xcodeproj，两个并发 `make build` 会同时重写它，所以一并进闸门。
 generate:
-	cd apps/macos && xcodegen generate
+	cd apps/macos && $(BUILD_LOCK) xcodegen generate
 
 # Build only: never stop or launch the app or its task daemon.
 build: generate
-	xcodebuild build \
+	$(BUILD_LOCK) xcodebuild build \
 		-project apps/macos/GMGNRadio.xcodeproj \
 		-scheme GMGNRadio \
 		-configuration "$(CONFIGURATION)" \
@@ -38,13 +94,19 @@ build: generate
 		-onlyUsePackageVersionsFromResolvedFile \
 		-skipPackageUpdates \
 		$(ARCH_FLAGS) $(COMPILATION_MODE) \
-		CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+		CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO; \
+	status=$$?; $(UNREGISTER_PRODUCT); exit $$status
+
+# 可单独执行（`make unregister-product`，例如 daemon/网关之外另跑了一次 xcodebuild）；
+# `build` 末尾调用的就是上面同一条命令。想核对别的配置：CONFIGURATION=Debug。
+unregister-product:
+	-@$(UNREGISTER_PRODUCT)
 
 # One entry point: build the app + bundled helper, then install and switch both.
 # 日常迭代就用这一条：Release 的 -O 手感 + 单架构 + 增量编译。
 install: build
-	python3 tools/install-macos.py --source "$(DERIVED_DATA)/Build/Products/$(CONFIGURATION)/gmgn radio.app"
-	rm -rf "$(DERIVED_DATA)/Build/Products/$(CONFIGURATION)/gmgn radio.app"
+	python3 tools/install-macos.py --source "$(PRODUCT_APP)"
+	rm -rf "$(PRODUCT_APP)"
 
 # 分发形状：通用二进制（arm64 + x86_64）+ 整模块优化 —— 也就是改造前
 # `make install CONFIGURATION=Release` 的行为。给别人的机器用这条。
@@ -79,6 +141,10 @@ test-install:
 # the same cleanup as a standalone target. Unregister first (the file is about
 # to be deleted, and a registration whose bundle is gone cannot be removed with
 # `lsregister -u` afterwards), then delete.
+#
+# `make build` now unregisters its own product at the end of its recipe (see
+# `unregister-product`), so what is left for this target is the **deletion**:
+# build never deletes (install needs the product), dedupe and install do.
 dedupe:
 	-python3 tools/dedupe-app-registrations.py
 
@@ -98,8 +164,15 @@ test-python:
 # The resident-agent regression harnesses named in
 # docs/plans/2026-09-22-user-experience-fixes-and-acceptance.md. Each script
 # reads production source, compiles a temporary harness with swiftc and runs
-# it, so this target is slow (minutes, not seconds).
+# it, so this target is slow (minutes, not seconds) and each `swift` call is its
+# own little swift-frontend storm -- several agents running it at once is the
+# same machine-flattening event as several concurrent `make build`s. So the
+# whole list shares **one** gate acquisition: taking the lock per script would
+# serialise nothing (another build can slip in between any two of them).
 test-harnesses:
+	$(BUILD_LOCK) $(MAKE) --no-print-directory _test-harnesses
+
+_test-harnesses:
 	swift tools/test-first-use-guidance.swift
 	swift tools/test-space-first-defaults.swift
 	swift tools/test-stage-decoration-menu.swift
@@ -131,11 +204,16 @@ test-harnesses:
 	swift tools/test-resident-background-presentation.swift
 	swift tools/test-resident-agent-loop.swift
 	swift tools/test-resident-prop-world-collision.swift
+	swift tools/test-resident-prop-size.swift
+	swift tools/test-resident-prop-size-intent.swift
+	swift tools/test-resident-system-inbox-window.swift
+	swift tools/test-resident-prop-collision-proxy.swift
+	swift tools/test-resident-state-convergence.swift
 
 test-all: test-install test-worlds test-daemon test-python test-harnesses dedupe
 
 test: generate
-	xcodebuild test \
+	$(BUILD_LOCK) xcodebuild test \
 		-project apps/macos/GMGNRadio.xcodeproj \
 		-scheme GMGNRadio \
 		-destination 'platform=macOS'

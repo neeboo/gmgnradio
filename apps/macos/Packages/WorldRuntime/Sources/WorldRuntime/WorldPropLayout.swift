@@ -8,14 +8,114 @@ public struct WorldGeneratedProp: Codable, Equatable, Sendable {
     public let displayName: String
     public let size: WorldVector3
     public let sourceHeight: Float
-    public init(objectID: String, sourceWishID: String, assetID: String, displayName: String, size: WorldVector3, sourceHeight: Float) {
+    /// 这份 `size` 是不是**用户手动定过**的（`nil`/`false` = 生成时自动定的基线）。
+    ///
+    /// 它不是第二份尺寸 —— 尺寸永远只有 `size` 这一份（渲染、碰撞盒、红/绿格、存档全读它）。
+    /// 它只回答一个**出处**问题：自动基线重新算过之后，还要不要覆盖世界状态里那一份。
+    /// 手动改过 ⇒ 不再要求与自动基线逐位相等，否则下一次资产准备会判成"资产归属不一致"，
+    /// 那件物件会**从房间里消失**（正是这次要修的观感缺陷）。
+    public let sizeLocked: Bool?
+    /// 生成工作流自带的**碰撞代理**描述。可选、纯增量：为 nil 时合成 `Codable` 不会编码这个键
+    /// （`encodeIfPresent`），于是没有代理的物件其元数据 JSON 与改造前逐字节一致。
+    public let collision: WorldPropCollisionProxy?
+    /// 生成工作流给的**权威尺寸**。存在时 `effectiveSize` 用它，app 不再从网格量。
+    public let authoritativeSize: WorldPropAuthoritativeSize?
+    /// 提交时声明的**尺寸意图**（守护进程 `size_intent`）：这份 `size` 是按它定出来的。
+    ///
+    /// 可选、纯增量：为 nil 时合成 `Codable` 不编码这个键（`encodeIfPresent`），
+    /// 没有意图的产物其元数据与改造前逐字节相同。
+    ///
+    /// 它**不是**第二份尺寸 —— 尺寸仍只有 `size` 一份。它回答的是"这份尺寸是谁定的"，
+    /// 并决定优先级里它排第几：用户手动覆盖 > 尺寸意图 > 工作流权威尺寸 > 自动推断。
+    /// （正解是**提交前就说清楚**：真机那把剑的 8.28 m 就是"只按高度归一 + 事后猜"长出来的。）
+    public let sizeIntent: WorldPropSizeIntent?
+    public init(objectID: String, sourceWishID: String, assetID: String, displayName: String,
+                size: WorldVector3, sourceHeight: Float, sizeLocked: Bool? = nil,
+                collision: WorldPropCollisionProxy? = nil,
+                authoritativeSize: WorldPropAuthoritativeSize? = nil,
+                sizeIntent: WorldPropSizeIntent? = nil) {
         self.objectID = objectID; self.sourceWishID = sourceWishID; self.assetID = assetID
         self.displayName = displayName; self.size = size; self.sourceHeight = sourceHeight
+        self.sizeLocked = sizeLocked
+        self.collision = collision; self.authoritativeSize = authoritativeSize
+        self.sizeIntent = sizeIntent
+    }
+    public var isSizeLocked: Bool { sizeLocked == true }
+    /// 渲染后最长边（米）。**读 `effectiveSize`**：与判据、碰撞盒、渲染目标高度同一个出口。
+    public var longestEdge: Float { WorldPropSizePolicy.longestEdge(of: effectiveSize) }
+    /// 尺寸的**唯一**出口：用户手动覆盖 > 尺寸意图 > 权威尺寸 > app 自己量的那一份。
+    ///
+    /// 所有"这件东西多大"的下游（碰撞体积/footprint/互斥/承托/渲染目标高度）都必须读这里
+    /// 而不是直接读 `size`，否则这条优先级只会在一半判据里生效。
+    ///
+    /// 为什么手动与意图都读 `size`：这两条路都在**入世界之前**就把目标尺寸算成了唯一的
+    /// 那一份 `size`（意图在提交入库那一处、手动在 `withSize`），权威尺寸是**别人**给的
+    /// 候选值，只有在前两者都没说话时才轮到它。没有意图、没有权威尺寸时 `effectiveSize`
+    /// 与 `size` **逐位相同** ⇒ 旧资产行为不变。
+    public var effectiveSize: WorldVector3 {
+        if isSizeLocked || sizeIntent != nil { return size }
+        return authoritativeSize?.dimensions ?? size
+    }
+    /// 这份尺寸是谁给的（审计）：`app-measured` / `workflow-authoritative` / `submit-intent`。
+    ///
+    /// 注意它说的是"这个数字**来自哪份数据**"，不是"最后是谁说了算"——后者见
+    /// `sizeProvenance`。手动改过的尺寸仍然来自 app 量出来的那一份，所以这里不变。
+    public var sizeSource: WorldPropSizeSource {
+        switch sizeProvenance {
+        case .submitIntent: return .submitIntent
+        case .workflowAuthoritative: return .workflowAuthoritative
+        case .manual, .appMeasured: return .appMeasured
+        }
+    }
+    /// 「这件东西的尺寸是**怎么定**的」：手动 > 意图 > 权威 > 自动推断。面板/任务行读它。
+    public var sizeProvenance: WorldPropSizeProvenance {
+        if isSizeLocked { return .manual }
+        if sizeIntent != nil { return .submitIntent }
+        return authoritativeSize == nil ? .appMeasured : .workflowAuthoritative
+    }
+    /// 一行可读的出处说明（面板用），例如「用户指定的最长边 1.10 米」。
+    public var sizeProvenanceSummary: String {
+        switch sizeProvenance {
+        case .manual: return "手动改过尺寸（最长边 \(WorldPropSizePolicy.meters(longestEdge)) 米）"
+        case .submitIntent: return sizeIntent?.summary ?? "按提交时的尺寸意图"
+        case .workflowAuthoritative: return "生成工作流给的权威尺寸"
+        case .appMeasured: return "按生成请求自动推断"
+        }
     }
     public var isValid: Bool {
         [objectID, sourceWishID, assetID, displayName].allSatisfy { !$0.isEmpty && $0.count <= 256 }
             && [size.x, size.y, size.z, sourceHeight].allSatisfy { $0.isFinite && $0 > 0 && $0 <= 100 }
             && (size.y/sourceHeight).isFinite && size.y/sourceHeight > 0
+            // 可选字段**存在时**必须合法：一份坏的代理描述不能被当成"没有代理"
+            // （那会让碰撞形状在用户不知情下从代理退回盒子 —— 那正是 fail-open）。
+            && (collision?.isValid ?? true)
+            && (authoritativeSize?.isValid ?? true)
+            // 尺寸意图同理：非法意图不能被当成"没有意图"（那就退回"让 app 猜"了）。
+            && (sizeIntent?.isValid ?? true)
+    }
+    /// 换一份尺寸并**记下"这是用户定的"**（唯一一份尺寸仍然是 `size`）。
+    ///
+    /// 碰撞代理与权威尺寸**必须一起带过去**：改尺寸只改"多大"，不改"是哪一件产物、
+    /// 用哪一份代理"。漏掉它们会让一次尺寸调整把代理悄悄丢掉 ⇒ 碰撞退回盒子。
+    /// 尺寸意图**保留**：它是"这份产物当初是照谁的话做的"这一审计事实，
+    /// 用户手动改过尺寸只把它在优先级里压到第二（`isSizeLocked` 先判），不改写历史。
+    public func withSize(_ size: WorldVector3) -> WorldGeneratedProp {
+        // 用户手动定的这一份**覆盖**工作流的权威尺寸：不丢掉 `authoritativeSize` 的话，
+        // `effectiveSize` 会继续返回权威值 —— 于是判据/碰撞盒/画面全都还停在旧尺寸，
+        // 而 `size` 变了，那就是"两份尺寸"。形状（碰撞代理）与这次调整无关，原样保留。
+        WorldGeneratedProp(objectID: objectID, sourceWishID: sourceWishID, assetID: assetID,
+                           displayName: displayName, size: size, sourceHeight: sourceHeight,
+                           sizeLocked: true, collision: collision,
+                           authoritativeSize: nil, sizeIntent: sizeIntent)
+    }
+    /// 是不是**同一件物件**（身份相同）。尺寸可以不同：用户手动定过尺寸的物件，
+    /// 自动基线必然与存档里的那一份不等 —— 那不是"资产归属不一致"，不该被判成错误。
+    /// 带尺寸意图的物件同理：意图是提交时说的，自动基线按它算，重新登记时不必逐位相等。
+    public func matchesIdentity(of other: WorldGeneratedProp) -> Bool {
+        objectID == other.objectID && sourceWishID == other.sourceWishID && assetID == other.assetID
+            && displayName == other.displayName && sourceHeight == other.sourceHeight
+            && (size == other.size || isSizeLocked || other.isSizeLocked
+                || sizeIntent != nil || other.sizeIntent != nil)
     }
 }
 
@@ -90,6 +190,10 @@ public enum WorldPropLayoutCommand: Codable, Equatable, Sendable {
     case register(WorldGeneratedProp)
     case place(objectID: String, placement: WorldPropPlacement)
     case withdraw(objectID: String)
+    /// 用户改这一件物件自己的尺寸。传进来的 `size` 就是**最终**尺寸：渲染、碰撞盒、
+    /// 红/绿格、存档读的都是它（不引入第二份尺寸来源），并且必须是当前尺寸的**等比缩放**
+    /// （渲染端只有一份等比缩放，非等比会让碰撞盒与画面对不上 ⇒ 拒绝）。
+    case resize(objectID: String, size: WorldVector3)
     case hold(objectID: String, avatarAssetID: String, calibration: WorldPropGripCalibration)
     case adjustGrip(objectID: String, avatarAssetID: String, calibration: WorldPropGripCalibration)
     case returnHeld(objectID: String, avatarAssetID: String)
@@ -102,6 +206,8 @@ public enum WorldPropLayoutError: Error, Equatable, Sendable {
     case requestConflict
     case invalidObject
     case invalidPlacement
+    /// 尺寸越界 / 非等比。带上**读得懂的原因**（面板与光标旁的标签都显示它）。
+    case invalidSize(String)
     case nothingToUndo
     case heldPropAlreadyExists(objectID: String)
     case objectIsHeld(objectID: String)
@@ -135,11 +241,52 @@ public extension WorldObjectState {
               let value = try? JSONDecoder().decode(WorldPropGripCalibration.self, from: data), value.isValid else { return nil }
         return value
     }
+    /// **今天那条路**：yaw 包围盒。尺寸读 `effectiveSize`（有权威尺寸就以它为准）。
+    ///
+    /// 仍然保留：它是"没有代理"时的回退，也是所有只认盒子的旧消费者的输入。
     var generatedCollisionVolume: WorldCollisionVolume? {
         guard isEnabled, let prop = generatedProp else { return nil }
         let p = transform.position
-        return WorldCollisionVolume(id: prop.objectID, center: .init(x: p.x,y: p.y + prop.size.y/2,z: p.z),
-            halfExtents: .init(x: prop.size.x/2,y: prop.size.y/2,z: prop.size.z/2), rotation: transform.rotation, isBlocking: true)
+        let size = prop.effectiveSize
+        return WorldCollisionVolume(id: prop.objectID, center: .init(x: p.x,y: p.y + size.y/2,z: p.z),
+            halfExtents: .init(x: size.x/2,y: size.y/2,z: size.z/2), rotation: transform.rotation, isBlocking: true)
+    }
+
+    /// **权威形状**：有碰撞代理就用代理（摆到世界坐标的三角形），没有就用今天的 yaw 盒子。
+    ///
+    /// 返回 nil 的两种情形都必须被上层当成"解不出体积"（fail-closed / 可见拒绝）：
+    /// - `generatedProp` 解不出来（元数据坏了）；
+    /// - 元数据**声明了**代理、但那份代理不在注册表里（没安装 / 安装失败 / 不归一）。
+    ///   这里**绝不**退回盒子 —— 那会让碰撞形状在用户不知情下变掉。
+    var generatedCollisionObstacle: WorldPropObstacle? {
+        guard isEnabled, let prop = generatedProp else { return nil }
+        guard let collision = prop.collision else {
+            guard let volume = generatedCollisionVolume else { return nil }
+            return WorldPropObstacle(volume: volume)
+        }
+        guard let proxy = WorldPropCollisionProxyStore.shared.mesh(forSHA256: collision.sha256),
+              let mesh = proxy.placed(
+                  id: prop.objectID,
+                  format: collision.format,
+                  position: transform.position,
+                  yaw: transform.rotation.yawAroundUp,
+                  heightMeters: prop.effectiveSize.y
+              )
+        else { return nil }
+        return WorldPropObstacle(id: prop.objectID, isBlocking: true, shape: .proxyMesh(mesh))
+    }
+}
+
+extension WorldQuaternion {
+    /// 只有绕 Y 的旋转对"物件怎么站在地上"有意义（`WorldPropMeshClearance.canPlace` 与
+    /// `ResidentPropPlacementMatrix` 都是这个口径）。x/z 分量不为 0 的极端四元数按 yaw 投影处理。
+    var yawAroundUp: Float {
+        let lengthSquared = x * x + y * y + z * z + w * w
+        guard lengthSquared.isFinite, lengthSquared > 0.000001 else { return 0 }
+        let inverse = 1 / lengthSquared.squareRoot()
+        let ny = y * inverse, nw = w * inverse
+        let yaw = 2 * atan2(ny, nw)
+        return yaw.isFinite ? yaw : 0
     }
 }
 
@@ -156,18 +303,42 @@ public extension WorldObjectState {
 /// 家具。那正是这个项目反复踩的坑：**判定只能有一条，而且缺失必须可见**。
 ///
 /// 所以这里把"哪些物件有体积、哪些解不出来"一次性说清楚：
-/// - `volumes`：全部可用的阻挡体积（运行时与摆放预检共用）；
-/// - `unmodelledObjectIDs`：`isEnabled == true` 却解不出体积的物件编号。调用方**必须**
+/// - `obstacles`：全部可用的阻挡形状（运行时与摆放预检共用，含生成侧的碰撞代理）；
+/// - `volumes`：只认盒子的旧消费者的**保守**投影（见下面的说明）；
+/// - `unmodelledObjectIDs`：`isEnabled == true` 却解不出形状的物件编号。调用方**必须**
 ///   把它当成"判据不完整"来处理（拒绝并报告），不得当作"无障碍"继续。
 public enum WorldLayoutObstacles {
     public struct Resolution: Equatable, Sendable {
-        public let volumes: [WorldCollisionVolume]
-        /// 已摆出（`isEnabled`）却解不出碰撞体积的物件编号，字典序。
+        /// **权威**的一份：每个障碍带自己的形状（yaw 盒子**或**生成侧的碰撞代理）。
+        /// 三条判据（运行时移动、通路预检、互斥预检）都读它。
+        public let obstacles: [WorldPropObstacle]
+        /// 已摆出（`isEnabled`）却解不出碰撞形状的物件编号，字典序。
         public let unmodelledObjectIDs: [String]
 
-        public init(volumes: [WorldCollisionVolume], unmodelledObjectIDs: [String]) {
-            self.volumes = volumes
+        /// 只认盒子的旧消费者的输入：盒障碍**逐字**给出，代理障碍给出它的世界轴包围盒。
+        ///
+        /// 这个投影的性质是**只会多挡、不会漏挡**（包围盒包含代理本身），所以旧消费者
+        /// 不至于 fail-open。但它会**假拒绝**细长物件，所以新消费者一律用 `obstacles`。
+        /// 现存唯一的使用点是 `ResidentPropPlacementService`（它还在把体积交给
+        /// `PropPlacementEvaluator` / `WorldPlacementRouteMap` 的盒子入口）。
+        ///
+        /// 换成 `obstacles` 的清单见
+        /// `docs/plans/2026-10-02-workflow-side-collision-proxy-checklist.md`。
+        public var volumes: [WorldCollisionVolume] {
+            obstacles.map(\.conservativeBoxProjection)
+        }
+
+        public init(obstacles: [WorldPropObstacle], unmodelledObjectIDs: [String]) {
+            self.obstacles = obstacles
             self.unmodelledObjectIDs = unmodelledObjectIDs
+        }
+
+        /// 兼容入口：只有盒子时与旧签名逐字一致（`volumes` 就是传进来的那批）。
+        public init(volumes: [WorldCollisionVolume], unmodelledObjectIDs: [String]) {
+            self.init(
+                obstacles: volumes.map(WorldPropObstacle.init(volume:)),
+                unmodelledObjectIDs: unmodelledObjectIDs
+            )
         }
     }
 
@@ -178,23 +349,24 @@ public enum WorldLayoutObstacles {
     /// 处理，否则用户可以在居民手里那件物件的放回点上再摆一件，一放回就互相穿模。
     /// 运行时移动判据不需要这一条（那个位置此刻真的什么都没有），但体积来源仍是这一份。
     public static func resolve(_ state: WorldState) -> Resolution {
-        var volumes: [WorldCollisionVolume] = []
+        var obstacles: [WorldPropObstacle] = []
         var unmodelled: [String] = []
         for (id, item) in state.objectStates {
             guard item.isEnabled else { continue }
-            if let volume = item.generatedCollisionVolume {
-                volumes.append(volume)
-            } else if item.generatedProp == nil {
-                // `isEnabled` + 解析不出 `generatedProp`：元数据坏了（不认识/尺寸非法）。
+            // `generatedCollisionObstacle` 在"元数据坏了"**和**"声明了代理但代理解不出来"
+            // 两种情形下都返回 nil。两种都必须可见 —— 后者是本轮新增的 fail-closed 落点。
+            if let obstacle = item.generatedCollisionObstacle {
+                obstacles.append(obstacle)
+            } else {
                 unmodelled.append(id)
             }
         }
         if let held = state.heldProp, held.returnState.isEnabled,
-           let volume = held.returnState.generatedCollisionVolume {
-            volumes.append(volume)
+           let obstacle = held.returnState.generatedCollisionObstacle {
+            obstacles.append(obstacle)
         }
         return Resolution(
-            volumes: volumes.sorted { $0.id < $1.id },
+            obstacles: obstacles.sorted { $0.id < $1.id },
             unmodelledObjectIDs: unmodelled.sorted()
         )
     }
@@ -207,6 +379,7 @@ extension WorldPropLayoutError: LocalizedError {
         case .requestConflict: "物件请求与已经处理的请求冲突。"
         case .invalidObject: "物件不存在或物件资料无效。"
         case .invalidPlacement: "物件摆放位置无效。"
+        case let .invalidSize(reason): reason
         case .nothingToUndo: "没有可撤销的物件操作。"
         case let .heldPropAlreadyExists(objectID): "居民已经手持物件 \(objectID)。"
         case let .objectIsHeld(objectID): "物件 \(objectID) 正在手持中，请先放回。"

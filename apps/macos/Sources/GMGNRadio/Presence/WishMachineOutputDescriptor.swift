@@ -56,6 +56,11 @@ struct ResidentPropPreparedAsset: Equatable, Sendable {
     let minimum: SIMD3<Float>
     let maximum: SIMD3<Float>
     let sourceHeight: Float
+    /// 只按**高度轴**归一的尺寸（`请求高度 / 高度`）。
+    ///
+    /// ⚠️ 它**不是**最终尺寸：把"生成请求的高度"落成世界尺寸的只有一处
+    /// （`WorldPropSizePolicy.automatic`，在生成入库那一处调用）。细长物件（剑）在这一份
+    /// 里会是 8.28 m —— 那是真机缺陷本身，任何消费方都必须走策略，而不是直接读这里。
     let size: SIMD3<Float>
 }
 
@@ -114,6 +119,16 @@ struct WishMachineOutputDescriptor: Equatable, Sendable {
     let worldID: String
     let modelURL: URL
     let targetHeightMeters: Float
+    /// `true` = 这个高度是**生成请求**的高度，渲染前必须过一遍尺度策略
+    /// （`WorldPropSizePolicy`：细长物件按最长边归一）。托盘上那件还没登记的产物走这条。
+    ///
+    /// `false`（缺省）= 已经是**定稿的世界高度**（已登记物件的 `size.y`）：渲染端只做等比
+    /// 归一，**不再**重复应用策略 —— 策略不幂等，重复套用会把细长物件每帧再缩一次。
+    var heightIsGenerationRequest: Bool = false
+    /// 提交时声明的**尺寸意图**。有它时（且 `heightIsGenerationRequest == true`）渲染端按
+    /// 用户说的那根轴归一：`longest` ⇒ 最长边 = `meters`，`height` ⇒ 高度 = `meters`；
+    /// 没有它才走今天的自动推断。可选、纯增量：nil ⇒ 与今天逐字节相同。
+    var sizeIntent: PropSizeIntent?
 }
 
 enum WishMachineOutputStatus: Equatable, Sendable {

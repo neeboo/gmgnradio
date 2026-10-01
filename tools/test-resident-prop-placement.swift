@@ -10,6 +10,74 @@ let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let base = root.appendingPathComponent("apps/macos/Sources/GMGNRadio")
 let service = base.appendingPathComponent("Presence/ResidentPropPlacementService.swift")
 guard FileManager.default.fileExists(atPath: service.path) else { print("FAIL: no prop placement transaction service"); exit(1) }
+// 「已领取但入库被拒」的台账与文案住在 App 文件里，但它是**纯逻辑**（不依赖任何错误
+// 类型），所以这里逐字抽取生产文本一起编译 —— 断言的不是副本，而是真正跑在 App 里的那份。
+let appSource = try String(contentsOf: root.appendingPathComponent("apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift"), encoding: .utf8)
+func appDeclaration(_ signature: String) -> String {
+    guard let start = appSource.range(of: signature)?.lowerBound,
+          let open = appSource[start...].firstIndex(of: "{") else { fatalError("missing declaration: \(signature)") }
+    var depth = 0
+    for index in appSource[open...].indices {
+        if appSource[index] == "{" { depth += 1 }
+        if appSource[index] == "}" { depth -= 1 }
+        if depth == 0 { return String(appSource[start...index]) }
+    }
+    fatalError("unbalanced declaration: \(signature)")
+}
+let inventoryBacklogSource = appDeclaration("struct ResidentPropInventoryBacklog {")
+
+// ---- 生产接线判据（纯文本）------------------------------------------------
+// 行为断言在生成程序末尾（同一个 `ResidentPropInventoryBacklog` 生产文本上跑）。
+func fail(_ message: String) -> Never { print("FAIL: \(message)"); exit(1) }
+let syncSource = appDeclaration("private func synchronizeOwnedResidentProps()")
+guard syncSource.contains("residentPropInventoryBacklog.record(") else {
+    fail("a refused inventory registration must be remembered in the backlog (otherwise it is silent)")
+}
+guard syncSource.contains("residentPropInventoryBacklog.resolve(objectID:") else {
+    fail("a successful inventory registration must clear its pending entry (otherwise the waiting state stays)")
+}
+guard syncSource.contains("requestID: \"claimed.\" + job.id.uuidString") else {
+    fail("the idempotency key must stay the existing claim receipt (`claimed.<jobID>`)")
+}
+guard appSource.contains("(error as? ResidentPropPlacementError) == .environmentNotReady") else {
+    fail("the backlog must classify the service's own refusal value, not a copy of its text")
+}
+let finishDerivationSource = appDeclaration("private func finishResidentPropGridDerivation(")
+guard finishDerivationSource.contains("drainResidentPropInventoryBacklog(") else {
+    fail("the support-geometry-ready callback must drive the inventory retry")
+}
+let drainSource = appDeclaration("private func drainResidentPropInventoryBacklog(")
+guard drainSource.contains("await self?.synchronizeOwnedResidentProps()") else {
+    fail("the inventory retry must re-enter the existing synchronizeOwnedResidentProps path")
+}
+guard !drainSource.contains("Timer") && !drainSource.contains("Task.sleep") else {
+    fail("the inventory retry must not add polling or a timer")
+}
+guard !finishDerivationSource.contains("Timer") else {
+    fail("the inventory retry must not add a timer to the derivation-finish path")
+}
+// 「我的物件」列表与状态文字必须读**同一份**事实（库存记录）：列表不许以"资产是否就绪"
+// 过滤 —— 否则"状态说已入库、列表里却没有"会再次出现（真机 2026-10-01 的截图）。
+let editorStateSource = try String(contentsOf: base.appendingPathComponent("Presence/ResidentPropEditorState.swift"), encoding: .utf8)
+guard editorStateSource.contains("item.generatedProp != nil && (!showsPlacedOnly || item.isEnabled || snapshot.heldProp?.objectID == item.generatedProp?.objectID)") else {
+    fail("the \u{300C}\u{6211}\u{7684}\u{7269}\u{4EF6}\u{300D} list must filter on the inventory record only (the same fact as the status text)")
+}
+guard !editorStateSource.contains("residentOwnedPropAssets") else {
+    fail("the \u{300C}\u{6211}\u{7684}\u{7269}\u{4EF6}\u{300D} list must not read the model-asset table (that is how a stored object disappears)")
+}
+// fail-closed 判定**一个字都没放宽**：删掉任何一条承托守卫就死在这里。
+// （纯文本判据，所以放在外层：生成程序里 `service` 是那个摆放服务实例，不是 URL。）
+let serviceText = try String(contentsOf: service, encoding: .utf8)
+let failClosedGuards = serviceText.components(separatedBy: "throw ResidentPropPlacementError.environmentNotReady").count - 1
+guard failClosedGuards >= 4 else {
+    print("FAIL: the fail-closed environment guards were weakened (found \(failClosedGuards), expected 4)")
+    exit(1)
+}
+// 台账分类必须读**服务抛出来的那个错误值**，不许抄它的文案。
+guard appSource.contains("(error as? ResidentPropPlacementError) == .environmentNotReady") else {
+    print("FAIL: the backlog must classify the service's own refusal value, not a copy of its text")
+    exit(1)
+}
 let code = #"""
 import Foundation
 import WorldRuntime
@@ -91,6 +159,8 @@ let flatWorld=FlatSupport(minimumX:-1,maximumX:5.5,minimumZ:-1,maximumZ:10,heigh
    routeConstraint:routeConstraint(grid,manifest))
 }
 @MainActor func require(_ b:Bool,_ s:String) { if !b { print("FAIL: \(s)"); exit(1) } }
+// 生产里的那份台账/文案（逐字，见文件头 `appDeclaration`）。
+\#(inventoryBacklogSource)
 @main struct Test {
  @MainActor static func main() throws {
   let manifest = try JSONDecoder().decode(WorldManifest.self,from:Data(contentsOf:URL(fileURLWithPath:"apps/macos/Resources/Worlds/marble-living-cabin/world.json")))
@@ -238,7 +308,105 @@ let flatWorld=FlatSupport(minimumX:-1,maximumX:5.5,minimumZ:-1,maximumZ:10,heigh
     fatalError("oversized route accepted")
   }
   catch let error as ResidentPropPlacementError { require(error == .environmentNotReady,"wrong oversized route rejection: \(error)") }
+  // ---------------------------------------------------------------------------
+  // 「已领取但入库被拒」：确证卡在哪一步 + 补做台账（真机 2026-10-01 `2B 白色长剑`）
+  //
+  // 真机存档的形状：世界 `objectStates` 里**已经有**已摆出（`isEnabled`）的物件
+  // （存档 `marble-living-cabin/1.2.0/state.json`：斧头 + 咖啡机），此刻领取一件新物件、
+  // 而承托几何拿不到（装修会话没开 ⇒ `support()` 返回 nil，见 `activateResidentPropGrid`
+  // 是**唯一**的激活点）。判定 fail-closed 拒绝 —— 这是**对的**，本测试钉住它不许放宽。
+  // 要修的是"被拒之后没人补做"：由下面的台账断言覆盖。
+  let claimedSword = WorldGeneratedProp(objectID:"prop-sword", sourceWishID:"wish-sword",
+    assetID:"asset-sword", displayName:"2B 白色长剑（外形摆件）", size:prop.size, sourceHeight:2)
+  let swordRequestID = "claimed.4210DB95-9253-4CAF-83A3-3C45F090B099"
+  let stuckContext = try WorldAgentContext(manifest:fixture)
+  stuckContext.installCollisionWorld(Floor())
+  let alreadyPlaced = WorldGeneratedProp(objectID:"prop-axe", sourceWishID:"wish-axe",
+    assetID:"asset-axe", displayName:"斧头", size:prop.size, sourceHeight:2)
+  let stuckRouting = ResidentPropPlacementService(context:stuckContext, support:{routeFlat})
+  _ = try stuckRouting.commit(.register(alreadyPlaced), expectedLayoutRevision:0, requestID:"claimed.axe")
+  _ = try stuckRouting.commit(.place(objectID:"prop-axe", placement:.init(surfaceID:"floor",
+      position:.init(x:5,y:0,z:5),yaw:0)), expectedLayoutRevision:1, requestID:"place.axe")
+  let geometryless = ResidentPropPlacementService(context:stuckContext, support:{nil})
+  var refusedWithoutGeometry = false
+  do {
+    _ = try geometryless.commit(.register(claimedSword),
+        expectedLayoutRevision:stuckContext.state.layoutRevision, requestID:swordRequestID)
+  } catch let error as ResidentPropPlacementError {
+    refusedWithoutGeometry = (error == .environmentNotReady)
+    require(error.localizedDescription == "空间碰撞数据尚未准备好，请稍后再摆放。",
+            "the user-visible reason must stay the service's own text")
+  }
+  // 注入"未就绪也放行"（例如删掉 `validate` 里的承托守卫）就死在这一行。
+  require(refusedWithoutGeometry,
+          "registration without support geometry was accepted (fail-closed judgement was widened)")
+  require(stuckContext.state.objectStates["prop-sword"] == nil,
+          "a refused registration must leave no inventory record — this is the stuck state")
+  require(stuckContext.state.layoutReceipts[swordRequestID] == nil,
+          "a refused registration must leave no receipt (real device: no `claimed.4210DB95…` receipt)")
+  // 几何一到，同一条提交立刻成立：变量是"几何在不在"，不是服务、资产或物件本身。
+  _ = try stuckRouting.commit(.register(claimedSword),
+      expectedLayoutRevision:stuckContext.state.layoutRevision, requestID:swordRequestID)
+  require(stuckContext.state.objectStates["prop-sword"]?.generatedProp != nil,
+          "with support geometry the same registration must land in inventory")
+  // 幂等（既有幂等键 `claimed.<jobID>`）：同一回执再放一次**不写第二遍**。
+  let afterSwordRegister = stuckContext.state
+  _ = try stuckRouting.commit(.register(claimedSword),
+      expectedLayoutRevision:afterSwordRegister.layoutRevision, requestID:swordRequestID)
+  require(stuckContext.state == afterSwordRegister,
+          "a replayed `claimed.<jobID>` receipt must not write a second inventory record")
+
+  // 台账：被拒之后**记住**，几何就绪那一刻补做，且同一件只报一次。
+  var backlog = ResidentPropInventoryBacklog()
+  var inventory: [String: Bool] = ["prop-sword": false, "prop-axe": true]
+  func isInInventory(_ id: String) -> Bool { inventory[id] == true }
+  let swordPending = ResidentPropInventoryBacklog.Pending(objectID:"prop-sword",
+    name:"2B 白色长剑（外形摆件）", reason:"空间碰撞数据尚未准备好，请稍后再摆放。",
+    waitsForSupportGeometry:true)
+  backlog.record(swordPending)
+  backlog.record(swordPending)
+  require(backlog.count == 1, "recording the same object twice must keep exactly one pending entry")
+  require(backlog["prop-sword"] == swordPending, "the pending entry must keep the readable reason")
+  require(backlog.drain(isSupportGeometryReady:false, isInInventory:isInInventory).isEmpty,
+          "without support geometry nothing may be re-attempted")
+  require(backlog.count == 1,
+          "the pending entry must survive while geometry is missing (visible, never silent)")
+  require(backlog.drain(isSupportGeometryReady:true, isInInventory:isInInventory) == ["prop-sword"],
+          "geometry becoming ready must re-attempt the pending registration exactly once")
+  require(backlog.drain(isSupportGeometryReady:true, isInInventory:isInInventory) == ["prop-sword"],
+          "an entry that is still not in inventory must stay retryable (no lost write)")
+  inventory["prop-sword"] = true
+  require(backlog.drain(isSupportGeometryReady:true, isInInventory:isInInventory).isEmpty,
+          "an object already in inventory must never be written a second time")
+  require(backlog.isEmpty, "an object already in inventory must be pruned from the ledger")
+
+  // 可见状态：入库没完成 ⇒ 说得出来；入库完成 ⇒ 立刻转正；资产坏了 ⇒ 原因可读。
+  require(ResidentPropInventoryBacklog.status(isInInventory:false, hasAssetFailure:false, isWaitingForInventory:true)
+            == "已领取，等待入库",
+          "an unregistered claim must read as waiting for inventory, never as stored")
+  require(ResidentPropInventoryBacklog.status(isInInventory:false, hasAssetFailure:false, isWaitingForInventory:false)
+            == "领取后入库中",
+          "the first sync pass must read as in-progress, not as stored")
+  require(ResidentPropInventoryBacklog.isTerminal(isInInventory:false) == false,
+          "an unregistered claim must not be terminal (a terminal row expires off the panel)")
+  require(ResidentPropInventoryBacklog.status(isInInventory:true, hasAssetFailure:false, isWaitingForInventory:false)
+            == "已领取并入库",
+          "only a real inventory record may read as stored")
+  require(ResidentPropInventoryBacklog.isTerminal(isInInventory:true) == true,
+          "a real inventory record is terminal")
+  require(ResidentPropInventoryBacklog.status(isInInventory:true, hasAssetFailure:true, isWaitingForInventory:false)
+            == "已入库，资产未就绪",
+          "a stored object whose asset failed must say so instead of claiming it is ready")
+  require(ResidentPropInventoryBacklog.assetNotice("本地文件缺失或校验失败").hasPrefix("资产未就绪："),
+          "an asset failure must stay readable in the panel")
+  let notice = ResidentPropInventoryBacklog.pendingNotice(swordPending)
+  require(notice.hasPrefix("2B 白色长剑（外形摆件） 已领取，入库尚未保存：") && notice.contains("空间就绪后会自动补做"),
+          "the refusal must be visible and must say it self-heals: \(notice)")
+  require(ResidentPropInventoryBacklog.pendingDetail(swordPending).contains("空间就绪后会自动补做"),
+          "the task row detail must carry the same promise and the same reason")
+
   print("PASS: layout preview, atomic save including hold, reserved footprint, collision recovery, bounds and stop checks")
+  print("PASS: claimed-prop inventory backlog (refused register keeps a visible pending entry, re-attempts once, idempotent, fail-closed intact)")
  }
 }
 """#
@@ -251,4 +419,7 @@ let build=root.appendingPathComponent("apps/macos/Packages/WorldRuntime/.build/a
 let objects=try FileManager.default.contentsOfDirectory(at:build.appendingPathComponent("WorldRuntime.build"),includingPropertiesForKeys:nil).filter{$0.pathExtension=="o"}.map(\.path)
 let binary=tmp.appendingPathComponent("test")
 let result=try run("/usr/bin/swiftc",["-j1","-parse-as-library","-I",build.appendingPathComponent("Modules").path,base.appendingPathComponent("Agent/WorldAgentContext.swift").path,service.path,source.path,"-o",binary.path]+objects)
-guard result==0 else { exit(result) };exit(try run(binary.path,[]))
+guard result==0 else { exit(result) }
+let status=try run(binary.path,[])
+print("PASS: claimed-prop inventory wiring (refusal remembered, geometry-ready callback drains, existing receipt key, no timer, 「我的物件」 list reads the inventory record only)")
+exit(status)

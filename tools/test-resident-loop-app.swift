@@ -25,7 +25,7 @@ func declaration(_ signature: String) -> String {
 let send = declaration("private func sendLiveCamMessage(")
 let sendAttachments = declaration("private func sendResidentSubmission(")
 let submissionSource = declaration("private enum ResidentSubmissionSource")
-let stop = declaration("private func cancelResidentMessage()")
+let stop = declaration("private func cancelResidentMessage(userIntent: Bool)")
 let formalReturn = declaration("private func returnHeldPropBeforeResidentStop(reason: String) -> Bool")
 let voiceOnlyStop = declaration("func disconnectRealtimeVoice()")
 let loopSource = try String(
@@ -50,8 +50,9 @@ let chatTranscript = [
     loopDeclaration("struct ResidentChatTranscript {"),
 ].joined(separator: "\n")
 guard source.contains("private func returnHeldPropBeforeResidentStop(reason: String) -> Bool"),
-      source.contains("private func stopResidentLoop(reason: String) -> Bool"),
-      stop.contains("stopResidentLoop(reason:"),
+      source.contains("private func stopResidentLoop(reason: String, userIntent: Bool = false) -> Bool"),
+      stop.contains("stopResidentLoop(reason: userIntent ?"),
+      stop.contains("userIntent: userIntent"),
       formalReturn.contains("residentPropPlacementService(context:"),
       formalReturn.contains("returnHeldCommand(objectID:"),
       formalReturn.contains("service.commit("),
@@ -84,6 +85,7 @@ enum ResidentMemorySource: Equatable { case text, voice }
     var images: [[URL]] = []
     var failures: [(String) -> Void] = []
     var stops = 0
+    var cancels = 0
     // 镜像真实 ResidentAgentLoop：空闲时新消息开始一轮（分配 runID），运行中
     // 的新消息走 steering（不换 runID）。
     private func beginRunIfIdle() {
@@ -102,6 +104,12 @@ enum ResidentMemorySource: Equatable { case text, voice }
     func stop() {
         stops += 1
         snapshot.isStopped = true
+        snapshot.runID = nil
+    }
+    /// 系统取消（换空间/退出/可用性回收/后台预算回收）：结束本轮，但**不**声明
+    /// "用户停止过"，也不写任何需要人工解除的持久状态。镜像真实 `ResidentAgentLoop.cancel()`。
+    func cancel() {
+        cancels += 1
         snapshot.runID = nil
     }
 }
@@ -139,10 +147,12 @@ struct WorldContext { let sessionScope: String; var worldID: String? { sessionSc
     var formalReturns = 0
     var residentTurnSourceByRunID: [UUID: ResidentMemorySource] = [:]
     func disconnectRealtimeVoice() { voiceStops += 1 }
-    func stopResidentLoop(reason: String) -> Bool {
+    func stopResidentLoop(reason: String, userIntent: Bool = false) -> Bool {
         formalReturns += 1
-        if let residentAgentLoop { residentAgentLoop.stop() }
-        else { AgentConversationService.shared.cancel() }
+        if let residentAgentLoop {
+            // 与生产同一条因果：只有用户停止写"停止过"，系统取消只是回收本轮。
+            if userIntent { residentAgentLoop.stop() } else { residentAgentLoop.cancel() }
+        } else { AgentConversationService.shared.cancel() }
         return true
     }
     func ensureResidentLoop() -> Loop { residentAgentLoop! }
@@ -156,7 +166,9 @@ struct WorldContext { let sessionScope: String; var worldID: String? { sessionSc
     func submitImage(_ image: URL, liveCam: Bool = false) async throws {
         try await sendResidentSubmission(.init(text: "按图制作", attachments: [.init(url: image)]), source: liveCam ? .liveCam : .stage)
     }
-    func stopNow() { cancelResidentMessage() }
+    func stopNow() { cancelResidentMessage(userIntent: true) }
+    /// 系统取消（例如换播放曲目、换角色动作、换空间）：走同一方法的默认 `userIntent: false`。
+    func systemCancelLikeMusicToggle() { _ = stopResidentLoop(reason: "切换播放器状态") }
 }
 @main struct Test {
     @MainActor static func main() async {
@@ -174,9 +186,15 @@ struct WorldContext { let sessionScope: String; var worldID: String? { sessionSc
                      "ordinary guidance must not cancel the current run")
         app.stopNow()
         precondition(app.residentAgentLoop?.stops == 1, "stop acts without waiting for a model")
+        precondition(app.residentAgentLoop?.cancels == 0 && app.residentAgentLoop?.snapshot.isStopped == true,
+                     "the interface's stop is user intent: it marks the stop and never routes through system cancellation")
         precondition(app.formalReturns == 1, "explicit stop first enters the formal held-prop return boundary")
         precondition(app.voiceStops == 3)
         app.residentAgentLoop?.snapshot.isStopped = false
+        app.systemCancelLikeMusicToggle()
+        precondition(app.residentAgentLoop?.cancels == 1 && app.residentAgentLoop?.stops == 1
+                     && app.residentAgentLoop?.snapshot.isStopped == false,
+                     "switching tracks, avatar actions or worlds cancels the turn without marking a user stop")
         let photo = URL(fileURLWithPath: "/test/selected.png")
         try! await app.submitImage(photo)
         precondition(app.residentAgentLoop?.images == [[photo]], "attachment must reach resident loop with text")

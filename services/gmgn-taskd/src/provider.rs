@@ -1,6 +1,6 @@
 use crate::{
     files,
-    model::{self, Job, Result, MODEL_LIMIT, PNG_LIMIT},
+    model::{self, Job, Result, COLLIDER_LIMIT, MODEL_LIMIT, PNG_LIMIT},
 };
 use base64::Engine;
 use reqwest::{Client, Method};
@@ -152,6 +152,35 @@ pub async fn download(client: &Client, job: &Job, token: &str) -> Result<Vec<u8>
     )
     .await?;
     model::validate_glb(&bytes, receipt)?;
+    Ok(bytes)
+}
+
+/// 下载并核验**碰撞代理**。与 [`download`] 逐条同构：路径钉死在同一 origin 的固定任务
+/// 路径上、禁重定向、上限由契约给出、字节按 `collision_sha256`/`collision_bytes` 核验。
+///
+/// 调用方只在回执**声明了**代理时才会走到这里（`model::declares_collision`）。所以
+/// 回执没有碰撞字段的旧服务连一条请求都不会多出来 —— 与今天逐字节一致。
+pub async fn download_collision(client: &Client, job: &Job, token: &str) -> Result<Vec<u8>> {
+    let receipt = job.receipt.as_ref().ok_or("missing_receipt")?;
+    let id = model::remote_id(receipt)?;
+    let collision = model::collision_descriptor(&receipt["result"])?
+        .ok_or("missing_collision_descriptor")?;
+    let expected_path = format!("/v1/jobs/{}/collider.glb", id);
+    let expected = format!("{}{}", job.endpoint, expected_path);
+    if collision.url != expected_path && collision.url != expected {
+        return Err("unsafe_download");
+    }
+    let bytes = load(
+        client,
+        Method::GET,
+        expected,
+        Some(token),
+        None,
+        None,
+        COLLIDER_LIMIT,
+    )
+    .await?;
+    model::validate_collider_glb(&bytes, receipt)?;
     Ok(bytes)
 }
 
@@ -338,6 +367,18 @@ pub trait PropProvider: Send + Sync {
     /// Streams the verified GLB. Implementations must re-check integrity.
     fn fetch_model<'a>(&'a self, job: &'a Job, token: &'a str)
         -> ProviderFuture<'a, Result<Vec<u8>>>;
+    /// Streams the verified **collision proxy** GLB. Only called when the receipt
+    /// declared one, so a backend that never returns collision fields never sees
+    /// this call. Implementations must re-check integrity.
+    ///
+    /// The default is a **visible refusal**, not a silent "no proxy": if a
+    /// receipt declares a proxy and the bound backend cannot fetch it, the job
+    /// must fail with a readable reason rather than quietly fall back to the yaw
+    /// box (that fallback would change collision geometry behind the user's back).
+    fn fetch_collision<'a>(&'a self, _job: &'a Job, _token: &'a str)
+        -> ProviderFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move { Err("collision_not_supported") })
+    }
 }
 
 /// The only backend shipped so far: the remote job API the DGX service speaks.
@@ -361,7 +402,7 @@ impl PropProvider for RemoteHTTPProvider {
             ready: Some(true),
             reason: None,
             stages: Some(
-                ["submit", "status", "cancel", "fetch_model"]
+                ["submit", "status", "cancel", "fetch_model", "fetch_collision"]
                     .iter()
                     .map(|stage| (*stage).to_owned())
                     .collect(),
@@ -394,6 +435,13 @@ impl PropProvider for RemoteHTTPProvider {
         token: &'a str,
     ) -> ProviderFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move { download(&self.client, job, token).await })
+    }
+    fn fetch_collision<'a>(
+        &'a self,
+        job: &'a Job,
+        token: &'a str,
+    ) -> ProviderFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move { download_collision(&self.client, job, token).await })
     }
 }
 
@@ -534,10 +582,15 @@ mod tests {
             image_path: path.to_string_lossy().into(),
             image_sha256: fixture["png_sha256"].as_str().unwrap().into(),
             height_meters: job["height_meters"].as_f64().unwrap(),
+            size_intent: job
+                .get("sizeIntent")
+                .filter(|value| !value.is_null())
+                .and_then(|value| serde_json::from_value(value.clone()).ok()),
             source: serde_json::from_value(job["source"].clone()).unwrap(),
             idempotency_key: job["idempotency_key"].as_str().unwrap().into(),
             receipt: None,
             local_model_path: None,
+            local_collision_path: None,
             last_error: None,
             backend_stage: "queued".into(),
             cancel_requested: false,
@@ -730,6 +783,91 @@ mod tests {
         let capabilities = provider.capabilities();
         assert_eq!(capabilities.kind.as_deref(), Some("remote_http"));
         assert!(capabilities.is_ready());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 碰撞代理的取回与模型**逐条同构**：同一 origin、钉死的任务路径、禁重定向、
+    /// 声明字节数与摘要都要对得上。
+    ///
+    /// 关键断言是第一条：回执**没有**碰撞字段时 `download_collision` 连一条请求都不发
+    /// —— 这也正是 `fetch_artifact` 的行为（它先问 `declares_collision`）。
+    #[tokio::test]
+    async fn collision_download_is_pinned_and_byte_verified_or_refused() {
+        let recorded = read_fixture("remote_http.json");
+        let token = recorded["token"].as_str().unwrap();
+        let glb = base64::engine::general_purpose::STANDARD
+            .decode(recorded["glb_base64"].as_str().unwrap())
+            .unwrap();
+        let provider = RemoteHTTPProvider::new(client().unwrap());
+        let root = temp_root();
+        let mut job = job_from_fixture(&recorded, &root);
+        let mut receipt = recorded["receipt"].clone();
+
+        // 1) 没有碰撞字段：直接是 `missing_collision_descriptor`，不发任何请求。
+        job.receipt = Some(receipt.clone());
+        assert_eq!(
+            provider.fetch_collision(&job, token).await,
+            Err("missing_collision_descriptor")
+        );
+
+        // 2) 声明了代理：请求打到唯一合法的固定路径上。
+        let collider = glb.clone();
+        let remote_id = recorded["remote_id"].as_str().unwrap();
+        receipt["result"]["collision_url"] = json!(format!("/v1/jobs/{remote_id}/collider.glb"));
+        receipt["result"]["collision_format"] = json!("glb-hull");
+        receipt["result"]["collision_sha256"] = json!(model::digest(&collider));
+        receipt["result"]["collision_bytes"] = json!(collider.len() as u64);
+        receipt["result"]["collision_triangles"] = json!(1024);
+        job.receipt = Some(receipt.clone());
+        let (origin, server) = serve_once(200, vec![], collider.clone()).await;
+        job.endpoint = origin.clone();
+        assert_eq!(provider.fetch_collision(&job, token).await, Ok(collider.clone()));
+        let captured = wire(&server.await.unwrap(), &origin);
+        assert_eq!(captured["method"], "GET");
+        assert_eq!(captured["path"], format!("/v1/jobs/{remote_id}/collider.glb"));
+        assert_eq!(
+            captured["headers"],
+            recorded["wire"]["download"]["headers"],
+            "认证头必须与模型下载逐字一致"
+        );
+
+        // 3) 路径换到别的 origin / 别的 id：`unsafe_download`，连请求都不发。
+        for hostile in [
+            "/v1/jobs/ffffffffffffffffffffffffffffffff/collider.glb",
+            "/v1/jobs/0123456789abcdef0123456789abcdef/model.glb",
+            "https://evil.invalid/v1/jobs/0123456789abcdef0123456789abcdef/collider.glb",
+        ] {
+            let mut value = receipt.clone();
+            value["result"]["collision_url"] = json!(hostile);
+            job.receipt = Some(value);
+            job.endpoint = origin.clone();
+            assert_eq!(
+                provider.fetch_collision(&job, token).await,
+                Err("unsafe_download"),
+                "接受了 {hostile}"
+            );
+        }
+
+        // 4) 摘要不符 / 类型非法的声明：取回被拒，且错误码可读。
+        let mut wrong = receipt.clone();
+        wrong["result"]["collision_sha256"] = json!("d".repeat(64));
+        job.receipt = Some(wrong);
+        let (origin, server) = serve_once(200, vec![], collider.clone()).await;
+        job.endpoint = origin.clone();
+        assert_eq!(
+            provider.fetch_collision(&job, token).await,
+            Err("collision_integrity_failed")
+        );
+        let _ = server.await;
+
+        let mut illegal = receipt.clone();
+        illegal["result"]["collision_triangles"] = json!("1024");
+        job.receipt = Some(illegal);
+        assert_eq!(
+            provider.fetch_collision(&job, token).await,
+            Err("invalid_collision_descriptor")
+        );
+
         std::fs::remove_dir_all(&root).unwrap();
     }
 

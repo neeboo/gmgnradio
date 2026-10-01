@@ -130,12 +130,16 @@ struct ResidentUnconfirmedNoticePolicy { func reset() {} }
     let avatarRuntime: StageAvatarRuntimeStore
     let spatialStage = Spatial()
     var cancellations = 0
+    /// 每次取消都记录它是不是"用户按下停止"：换世界只能走系统取消（false），
+    /// 否则一次换空间会留下一个只有人工能解除的持久暂停。
+    var cancelUserIntents: [Bool] = []
     init(_ runtime: StageAvatarRuntimeStore) {
         self.avatarRuntime = runtime
         \#(worldBinding)
     }
-    func cancelResidentMessage() {
+    func cancelResidentMessage(userIntent: Bool) {
         cancellations += 1
+        cancelUserIntents.append(userIntent)
         // The speech dependency responds to stop with the same production callback.
         receive(AgentSpeechPlaybackState(isPlaying: false, level: 0))
     }
@@ -189,6 +193,8 @@ struct ResidentUnconfirmedNoticePolicy { func reset() {} }
         check(app.cancellations == 0, "reselecting same world does not interrupt speech")
         app.spatialStage.selectWorld(id: "another-world")
         check(app.cancellations == 1 && runtime.residentSpeechLevel == nil, "changing world stops old speech and clears only mouth overlay")
+        check(app.cancelUserIntents == [false],
+              "changing world is a system cancellation, never a user stop with a durable pause")
         check(runtime.worldActivity == worldActivity, "world selection speech cleanup does not mutate movement")
         print("\(failures == 0 ? "PASS" : "FAIL"): \(checks) resident speech avatar checks, \(failures) failures")
         exit(failures == 0 ? 0 : 1)

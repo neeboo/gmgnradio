@@ -154,15 +154,27 @@ public struct WorldPlacementRouteMap: Sendable {
         volume: WorldCollisionVolume,
         capsule: WorldCapsule? = nil
     ) -> Set<Int> {
+        blockedNodes(obstacle: WorldPropObstacle(volume: volume), capsule: capsule)
+    }
+
+    /// 与上面**同一个**循环，输入换成任意形状的障碍（yaw 盒子**或**生成侧的碰撞代理）。
+    ///
+    /// 「一个判据」的落点：分派只发生在 `WorldCapsuleClearance.isClear(_:at:of: WorldPropObstacle)`
+    /// 里 —— 盒子分支逐字转交原来那个体积重载，代理分支是胶囊 × 三角形。所以这里不是
+    /// 第二套几何，只是同一个判据多吃一种输入。
+    public func blockedNodes(
+        obstacle: WorldPropObstacle,
+        capsule: WorldCapsule? = nil
+    ) -> Set<Int> {
         let capsule = capsule ?? self.capsule
         guard capsule.isValid,
               spacing.isFinite, spacing > 0, columnStride > 0, !standable.isEmpty,
-              let halfExtents = WorldCapsuleClearance.worldHalfExtents(of: volume)
+              let halfExtents = WorldCapsuleClearance.worldHalfExtents(of: obstacle),
+              let center = WorldCapsuleClearance.worldCenter(of: obstacle)
         else { return [] }
-        let center = SIMD3(volume.center.x, volume.center.y, volume.center.z)
         // 只扫物件世界包围盒**外扩站姿胶囊**之后覆盖的那几列：代价随物件尺寸与胶囊半径
         // 有界，且一定是"可能被判阻挡"的节点的超集（|格心-中心| > 半尺寸+半径 时胶囊
-        // 绝不可能碰到盒子）。
+        // 绝不可能碰到它）。代理障碍走同一条：它的世界包围盒同样给出这个超集。
         let reachX = halfExtents.x + capsule.radius
         let reachZ = halfExtents.z + capsule.radius
         let xRange = Int(floor((center.x - reachX) / spacing))
@@ -178,7 +190,7 @@ public struct WorldPlacementRouteMap: Sendable {
                 let cz = (Float(z) + 0.5) * spacing
                 // 节点上的居民站在它自己的承托高度上（与运行时 `groundedDestination` 同形）。
                 guard !WorldCapsuleClearance.isClear(
-                    capsule, at: SIMD3(cx, layerHeight, cz), of: volume
+                    capsule, at: SIMD3(cx, layerHeight, cz), of: obstacle
                 ) else { continue }
                 result.insert(node)
             }

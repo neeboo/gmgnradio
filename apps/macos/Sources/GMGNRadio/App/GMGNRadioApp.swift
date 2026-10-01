@@ -896,7 +896,9 @@ final class AppDelegate:
         }
         spatialStage.onWorldSelectionChanged = { [weak self] in
             self?.safelyReturnHeldProp(reason: "换空间")
-            self?.cancelResidentMessage()
+            // 换空间不是"用户按了停止"：作废旧空间的对话与提示可以照做，但绝不能
+            // 因此写出许愿任务级的持久暂停（那会要求用户回到旧空间手动恢复）。
+            self?.cancelResidentMessage(userIntent: false)
             self?.residentAgentLoop?.invalidate()
             self?.residentAgentLoop = nil
             self?.residentWishImages.removeAll()
@@ -1713,7 +1715,11 @@ final class AppDelegate:
         stageWindowController?.showResidentFailureStatus(text, autoRevealsChat: !backgroundTurn)
     }
 
-    private func cancelResidentMessage() {
+    /// 用户按下停止控件。这是**唯一**的"用户停止过"入口：它同时取消本轮、
+    /// 让居民保持停止，并（经 `onUserStop`）落盘许愿任务级的自动续办暂停。
+    /// `userIntent: false` 只用于宿主自身的上下文切换（换空间）——那里仍要作废
+    /// 旧回合与旧提示，但不产生"用户停止"这一持久事实。
+    private func cancelResidentMessage(userIntent: Bool) {
         musicSelectionGeneration &+= 1
         disconnectRealtimeVoice()
         // 用户主动停止即已接手：旧的「未确认送达」提示不再显示。
@@ -1723,7 +1729,7 @@ final class AppDelegate:
         // 明确停止：历史里仍无结论的回合按「未送达」收尾，绝不冒充已送达。
         residentChatTranscript.cancelPendingTurns()
         publishResidentTranscript()
-        _ = stopResidentLoop(reason: "用户停止居民")
+        _ = stopResidentLoop(reason: userIntent ? "用户停止居民" : "换空间", userIntent: userIntent)
     }
 
     @discardableResult
@@ -1745,11 +1751,20 @@ final class AppDelegate:
         }
     }
 
+    /// 取消居民当前轮次。
+    ///
+    /// `userIntent` 是**因果**，不是措辞：只有用户按下停止控件才是 `true`。换播放曲目、
+    /// 切角色动作、进出生活活动、换空间、退出应用都只是宿主需要回收本轮，它们一律
+    /// `false` —— 否则这些动作会把"停止过"写成持久状态，让用户面对一个自己从没按过
+    /// 的「恢复自动领取」按钮，而且无人能自愈。
     @discardableResult
-    private func stopResidentLoop(reason: String) -> Bool {
+    private func stopResidentLoop(reason: String, userIntent: Bool = false) -> Bool {
         let returnedHeldProp = returnHeldPropBeforeResidentStop(reason: reason)
-        if let residentAgentLoop { residentAgentLoop.stop() }
-        else { AgentConversationService.shared.cancel() }
+        if let residentAgentLoop {
+            if userIntent { residentAgentLoop.stop() } else { residentAgentLoop.cancel() }
+        } else {
+            AgentConversationService.shared.cancel()
+        }
         return returnedHeldProp
     }
 
@@ -3055,7 +3070,7 @@ final class AppDelegate:
                 try await self?.sendResidentSubmission(message, source: .stage)
             },
             onCancelMessage: { [weak self] in
-                self?.cancelResidentMessage()
+                self?.cancelResidentMessage(userIntent: true)
             },
             onOpenSystemInbox: { [weak self] in
                 self?.openSystemInbox()
@@ -3128,7 +3143,7 @@ final class AppDelegate:
                     try await self.sendResidentSubmission(message, source: .liveCam)
                 },
                 onCancelMessage: { [weak self] in
-                    self?.cancelResidentMessage()
+                    self?.cancelResidentMessage(userIntent: true)
                 },
                 onToggleVoice: { [weak self] in
                     self?.toggleRealtimeVoiceFromStage()
@@ -3531,6 +3546,10 @@ final class AppDelegate:
     private var residentWishConsumed = Set<ResidentWishDelivery>()
     private var residentWishAcknowledging = Set<ResidentWishDelivery>()
     private var residentWishSnapshotPending = Set<UUID>()
+    /// 已经**本地直达**投递给居民循环的持久事实编号。守护进程消息往返是另一条
+    /// 通道，它不可用时（网络/守护进程没起来）这条本地通道仍然把"东西已经好了"
+    /// 这类事实送进循环；同一个事件只送一次，循环自己也按事件编号去重。
+    private var residentWishLocalFactsQueued = Set<UUID>()
     private var residentWishMessagesConfigured = false
     private var residentWishMessageRefreshRunning = false
     private var residentWishMessageRefreshRequested = false
@@ -3544,6 +3563,18 @@ final class AppDelegate:
     private var residentPropAssetContext: ObjectIdentifier?
     private var residentPropPreparationRunning = false
     private var residentPropNotices: [String: String] = [:]
+    /// 「已领取但还没写进库存」的补做台账（见 `ResidentPropInventoryBacklog`）。
+    ///
+    /// 判定本身不放宽：承托几何拿不到时 `ResidentPropPlacementService.validate` 仍然
+    /// fail-closed 拒绝。台账解决的是**被拒之后没人补做**：几何就绪那一刻补做一次，
+    /// 并且在此期间把"已领取、等待入库"说给用户，而不是让它隐形。
+    private var residentPropInventoryBacklog = ResidentPropInventoryBacklog()
+    /// 物件**资产**（模型文件）最近一次真实失败的原因：编号 → 可读原因。
+    ///
+    /// 与"库存"是两件事，必须分开说：库存里有它、模型却没备好时，面板那一条不能消失，
+    /// 但也不能假装它现在能摆。只在**真的失败过**时才有记录（不是"暂时还没准备好"），
+    /// 否则会在世界切换后的第一个同步周期里误报。
+    private var residentPropAssetFailures: [String: String] = [:]
     /// 建造模式的格子数据中枢。网格只在几何变化时派生（按 worldID 缓存），
     /// 已放物件的增删不改变网格。
     private let residentPropGridEditor = ResidentPropGridEditorModel()
@@ -3660,7 +3691,7 @@ final class AppDelegate:
                 )
             },
             prepare: { [weak self] prop in
-                guard let self, let asset = self.residentOwnedPropAssets[prop.objectID], asset.prop == prop,
+                guard let self, let asset = self.residentOwnedPropAssets[prop.objectID], asset.prop.matchesIdentity(of: prop),
                       self.spatialStage.isResidentPropPrepared(assetID: prop.assetID, modelURL: asset.descriptor.modelURL)
                 else { throw ResidentPropHostError.assetUnverified }
             }, isCurrent: isCurrent,
@@ -3672,7 +3703,7 @@ final class AppDelegate:
                 if let reason = ResidentPropAttachmentEligibility.rejectionReason(for: avatar) {
                     throw ResidentPropPlacementError.attachmentUnsupported(reason)
                 }
-                guard let asset = self.residentOwnedPropAssets[prop.objectID], asset.prop == prop else {
+                guard let asset = self.residentOwnedPropAssets[prop.objectID], asset.prop.matchesIdentity(of: prop) else {
                     throw ResidentPropHostError.assetUnverified
                 }
                 try self.spatialStage.validateResidentPropAttachment(avatarID: avatarID,
@@ -3689,6 +3720,11 @@ final class AppDelegate:
         guard let context = livingWorldContext, spatialStage.selectedWorldID == context.manifest.worldID,
               context.manifest.worldID == WishMachineScene.worldID else {
             residentOwnedPropAssets = [:]; residentPropAssetContext = nil
+            // 资产失败是**按上下文**记住的：换世界（或这一刻不是许愿机那个世界）时作废，
+            // 否则一个世界的坏资产会在另一个世界里继续冒充"资产未就绪"。
+            // 台账（`residentPropInventoryBacklog`）**刻意不在这里清**：领取与"还没入库"
+            // 是跨世界仍然成立的事实，回到那个世界后既有的 5 秒同步周期会继续补做。
+            residentPropAssetFailures = [:]
             spatialStage.residentPropOutputs = []; spatialStage.residentPropPreview = nil
             spatialStage.residentHeldProp = nil
             spatialStage.residentPropDisplayStand = nil
@@ -3697,7 +3733,7 @@ final class AppDelegate:
         }
         let contextID = ObjectIdentifier(context)
         if residentPropAssetContext != contextID {
-            residentOwnedPropAssets = [:]; residentPropNotices = [:]
+            residentOwnedPropAssets = [:]; residentPropNotices = [:]; residentPropAssetFailures = [:]
             residentPropAssetContext = contextID
         }
         guard !residentPropPreparationRunning else { return }
@@ -3738,14 +3774,55 @@ final class AppDelegate:
                     position: .zero, yaw: 0)
                 let prepared = try await spatialStage.prepareResidentProp(descriptor)
                 guard self.livingWorldContext === context, self.spatialStage.selectedWorldID == context.manifest.worldID else { return }
+                // 尺寸标定在**这一处**从"请求尺寸"落成世界尺寸，而且只用唯一那份策略
+                // （`WorldPropSizePolicy`）：`job.heightMeters` 是生成请求的高度，原始网格的
+                // 实测三维来自渲染器（`prepared.minimum/maximum`）。
+                //
+                // **用户说了尺寸就按他说的轴归一**（提交时的 `size_intent`）：真机那把剑
+                // （"一把 1.1 米的剑"）说的是**最长边** 1.1 m，原来按高度归一成了 8.285 m 长、
+                // 比舱室还长、摆放被拒后从房间里消失。没有意图时才走自动推断（细长物件 > 4 按最长边）。
+                let extent = prepared.maximum - prepared.minimum
+                let sourceExtent = WorldVector3(x: extent.x, y: extent.y, z: extent.z)
+                // 契约的意图 → 世界状态的意图：轴/出处就是同一批字面量，越界 ⇒ nil（不静默）。
+                let sizeIntent = job.sizeIntent.flatMap {
+                    WorldPropSizeIntent(axis: $0.axis.rawValue, meters: $0.meters, source: $0.source.rawValue)
+                }
+                // 有意图按用户的轴归一；没有意图才走今天的自动推断。
+                let intendedSize = sizeIntent.flatMap {
+                    WorldPropSizePolicy.intended(sourceExtent: sourceExtent, axis: $0.axis, meters: $0.meters)
+                }
+                guard let autoSize = intendedSize ?? WorldPropSizePolicy.automatic(
+                    sourceExtent: sourceExtent,
+                    requestedHeight: Float(job.heightMeters)) else {
+                    throw ResidentPropHostError.assetUnavailable
+                }
                 let prop = WorldGeneratedProp(objectID: job.objectID, sourceWishID: job.id.uuidString,
                     assetID: descriptor.assetID, displayName: job.name,
-                    size: .init(x: prepared.size.x, y: prepared.size.y, z: prepared.size.z), sourceHeight: prepared.sourceHeight)
-                if let existing = context.state.objectStates[job.objectID] {
-                    guard existing.generatedProp == prop else { throw ResidentPropHostError.ownershipMismatch }
+                    size: autoSize.size, sourceHeight: prepared.sourceHeight,
+                    sizeIntent: sizeIntent)
+                // 用户**手动定过尺寸**的物件：世界状态里那一份 `size` 是唯一定稿，自动基线不再
+                // 要求逐位相等 —— 要求相等就等于"改过尺寸的物件在下一次准备时被判成资产归属
+                // 不一致"，那件物件会从房间里消失（正是这次要修的观感缺陷）。
+                // 带尺寸意图的物件同理（它是"提交时说的"，不是"这次量出来的"）。
+                let storedProp = context.state.objectStates[job.objectID]?.generatedProp
+                if context.state.objectStates[job.objectID] != nil {
+                    guard let storedProp, storedProp.matchesIdentity(of: prop) else { throw ResidentPropHostError.ownershipMismatch }
                 }
-                residentOwnedPropAssets[job.objectID] = ResidentOwnedPropAsset(prop: prop, descriptor: descriptor)
+                residentOwnedPropAssets[job.objectID] = ResidentOwnedPropAsset(prop: storedProp ?? prop, descriptor: descriptor)
                 residentPropNotices.removeValue(forKey: job.objectID)
+                residentPropAssetFailures.removeValue(forKey: job.objectID)
+                // 夹取时**说出来**（夹取是"静默改数字"之外唯一诚实的做法）；
+                // 按用户说的尺寸落定时也说出来，让"尺寸是怎么定的"看得见。
+                if let reason = autoSize.reason {
+                    let message = "\(job.name)：\(reason)"
+                    residentPropNotices[job.objectID] = message
+                    showResidentVoiceStatus(message)
+                } else if let sizeIntent, sizeIntent.source == .user {
+                    let message = "\(job.name)：按你说的尺寸 \(sizeIntent.summary)（场景内最长边 "
+                        + String(format: "%.2f", autoSize.longestEdge) + " m）。"
+                    residentPropNotices[job.objectID] = message
+                    showResidentVoiceStatus(message)
+                }
             } catch {
                 // Losing the renderer or cancelling while switching worlds is
                 // not an asset failure; only real damage/size/GPU errors are.
@@ -3756,6 +3833,11 @@ final class AppDelegate:
                     error: error
                 ) {
                 case let .report(description):
+                    // 资产真的坏了（缺失/校验失败/尺寸/GPU）：原因**留住**。
+                    // 面板里那一条不能因为"模型没备好"就消失 —— 「已入库」与
+                    // 「我的物件里看得见」是同一条事实（库存记录），而"现在能不能摆"
+                    // 是另一条事实（资产）。两条都要说，不许互相冒充。
+                    residentPropAssetFailures[job.objectID] = description
                     let message = "\(job.name)：\(description)"
                     if residentPropNotices[job.objectID] != message { showResidentVoiceStatus(message); residentPropNotices[job.objectID] = message }
                 case .ignoreRendererLoss, .deferUntilRendererReady, .prepare:
@@ -3768,12 +3850,20 @@ final class AppDelegate:
             guard let self, let context else { return false }
             return self.livingWorldContext === context && self.spatialStage.selectedWorldID == context.manifest.worldID
         })
+        // 台账只认**库存记录**：已经进了库存的条目不该继续挂在"等待入库"上
+        // （换世界、存档回滚、或在别的路径上补做成功都会走到这里）。
+        residentPropInventoryBacklog.prune { context.state.objectStates[$0]?.generatedProp != nil }
         for job in jobs where context.state.objectStates[job.objectID] == nil {
             guard let asset = residentOwnedPropAssets[job.objectID] else { continue }
             do {
                 try await prepareResidentPropMutation(.register(asset.prop), context: context)
                 try service.commit(.register(asset.prop), expectedLayoutRevision: context.state.layoutRevision, requestID: "claimed." + job.id.uuidString)
                 residentPropNotices.removeValue(forKey: job.objectID)
+                if residentPropInventoryBacklog.resolve(objectID: job.objectID) {
+                    // 之前对用户说过"已领取，入库尚未保存"：补做成功必须**看得见结果**
+                    // （任务行/系统消息同时变成"已领取并入库"），旧那句话被这句取代。
+                    showResidentVoiceStatus("\(job.name) 已入库。")
+                }
             } catch {
                 guard self.livingWorldContext === context, self.spatialStage.selectedWorldID == context.manifest.worldID else { return }
                 switch ResidentPropStartupRecovery.action(
@@ -3781,7 +3871,22 @@ final class AppDelegate:
                     error: error
                 ) {
                 case let .report(description):
-                    let message = "\(job.name) 已领取，入库尚未保存：\(description)"
+                    // 「已领取但没进库存」**不许静默、不许冒充成功**：
+                    // 1) 记进补做台账（等承托几何就绪那一刻补做，见 `finishResidentPropGridDerivation`）；
+                    // 2) 把服务给出的原因原样说给用户。
+                    //
+                    // 判定一个字都没放宽：`environmentNotReady` 仍然是拒绝写入。这里修的
+                    // 是"被拒之后没人补做"——真机 2026-10-01 `2B 白色长剑` 的
+                    // `layoutReceipts` 里没有 `claimed.<jobID>`、`state.json` 的
+                    // `objectStates` 里也没有它，而任务行/系统消息却按"模型已备好"
+                    // 写着"已领取并入库"。
+                    let pending = ResidentPropInventoryBacklog.Pending(
+                        objectID: job.objectID, name: job.name, reason: description,
+                        // 分类只读**服务抛出来的那个错误值**，不放宽任何判定：
+                        // `environmentNotReady` 依旧是拒绝写入，只是它"还会好"。
+                        waitsForSupportGeometry: (error as? ResidentPropPlacementError) == .environmentNotReady)
+                    residentPropInventoryBacklog.record(pending)
+                    let message = ResidentPropInventoryBacklog.pendingNotice(pending)
                     if residentPropNotices[job.objectID] != message { showResidentVoiceStatus(message); residentPropNotices[job.objectID] = message }
                 case .ignoreRendererLoss, .deferUntilRendererReady, .prepare:
                     break
@@ -3789,6 +3894,29 @@ final class AppDelegate:
             }
         }
         synchronizeResidentPropPresentation()
+    }
+
+    /// 承托几何刚就绪：把"已领取但入库被拒"的待办补做一次。
+    ///
+    /// 这是**既有的**就绪信号（一次网格派生的收尾），不是新轮询、也不是定时器。
+    /// 幂等由三层一起保证：
+    /// 1. `drain` 只报"还不在库存里"的条目，几何没就绪时一件都不报；
+    /// 2. 真正写入的唯一出口仍是 `synchronizeOwnedResidentProps` → 摆放服务的
+    ///    `register`（同一份 fail-closed 判定），它按 `objectStates` 跳过已在库的；
+    /// 3. 提交用的回执键是既有的 `claimed.<jobID>`，`WorldSimulation.applyPropLayout`
+    ///    按回执去重，所以同一件东西写两遍在状态层就不可能发生。
+    private func drainResidentPropInventoryBacklog(reason: String) {
+        guard !residentPropInventoryBacklog.isEmpty else { return }
+        let attempted = residentPropInventoryBacklog.drain(
+            isSupportGeometryReady: residentPropGridEditor.isReady,
+            isInInventory: { [weak self] objectID in
+                self?.livingWorldContext?.state.objectStates[objectID]?.generatedProp != nil
+            })
+        guard !attempted.isEmpty else { return }
+        livingWorldLogger.notice(
+            "入库补做：\(reason, privacy: .public) 几何就绪，补做 \(attempted.count, privacy: .public) 件（\(attempted.joined(separator: ","), privacy: .public)）；写入仍走摆放服务的 register。"
+        )
+        Task { @MainActor [weak self] in await self?.synchronizeOwnedResidentProps() }
     }
 
     private func prepareResidentPropMutation(_ command: WorldPropLayoutCommand, context: WorldAgentContext) async throws {
@@ -3799,7 +3927,7 @@ final class AppDelegate:
         case .returnHeld(let id, _):
             if context.state.heldProp?.returnState.isEnabled == true { ids.insert(id) }
         case .undo: if let previous = context.state.layoutUndo?.previous, previous.isEnabled, let prop = previous.generatedProp { ids.insert(prop.objectID) }
-        case .register, .withdraw, .enableCapability: break
+        case .register, .withdraw, .enableCapability, .resize: break
         }
         for id in ids.sorted() {
             guard let asset = residentOwnedPropAssets[id] else { throw ResidentPropHostError.assetUnverified }
@@ -3811,12 +3939,16 @@ final class AppDelegate:
     }
 
     private func residentPropDescriptor(_ item: WorldObjectState) -> ResidentPropRenderDescriptor? {
-        guard let prop = item.generatedProp, let asset = residentOwnedPropAssets[prop.objectID], asset.prop == prop else { return nil }
+        // 归属校验按**身份**（尺寸可以不同）：用户手动定过尺寸之后，自动基线必然与存档
+        // 里那一份不等 —— 逐位相等会让改过尺寸的物件**从舞台上消失**。
+        guard let prop = item.generatedProp, let asset = residentOwnedPropAssets[prop.objectID],
+              asset.prop.matchesIdentity(of: prop) else { return nil }
         let p = item.transform.position, q = item.transform.rotation
         // 换算只有一份（`ResidentPropRenderDescriptor.residentProp`）：已摆那一件与在手预览
         // 走同一行代码，所以"预览被描述符判据挡掉、已摆的却画得出来"这种不对称不可能存在。
+        // 渲染目标高度必须与判据/碰撞盒同源（`effectiveSize`：有工作流权威尺寸时以它为准）。
         return .residentProp(objectID: prop.objectID, worldID: asset.descriptor.worldID, assetID: prop.assetID,
-                             modelURL: asset.descriptor.modelURL, targetHeightMeters: prop.size.y,
+                             modelURL: asset.descriptor.modelURL, targetHeightMeters: prop.effectiveSize.y,
                              position: SIMD3(p.x, p.y, p.z), rotation: SIMD4(q.x, q.y, q.z, q.w))
     }
 
@@ -3846,7 +3978,17 @@ final class AppDelegate:
                   surfaces, grid: residentPropGridEditor.grid, spawn: context.manifest.spawn.position),
               canUndo: context.state.layoutUndo != nil, heldProp: context.state.heldProp,
               holdUnavailableReasons: Dictionary(uniqueKeysWithValues: objects.compactMap { item in
-                  guard let id = item.generatedProp?.objectID, let reason = service.holdEligibility(objectID: id) else { return nil }
+                  guard let id = item.generatedProp?.objectID else { return nil }
+                  // 「现在为什么不能拿/摆」有**两个**都成立的事实，谁都不能冒充谁：
+                  // - 库存里有它（所以它出现在「我的物件」列表里，绝不消失）；
+                  // - 资产（模型文件）真的失败了 ⇒ 现在也确实摆不出来，原因如实说。
+                  // 这里并入的是**已有的**显示通道（面板选中该行时显示这一行），
+                  // 不新增字段、不改判定的归属：资产那条判定仍只在
+                  // `residentOwnedPropAssets`/`residentPropAssetFailures`。
+                  if let failure = residentPropAssetFailures[id] {
+                      return (id, ResidentPropInventoryBacklog.assetNotice(failure))
+                  }
+                  guard let reason = service.holdEligibility(objectID: id) else { return nil }
                   return (id, reason)
               }),
               // 面板要能区分"格子还在生成"与"这个空间永远拿不到几何"：前者的措辞要和
@@ -3895,9 +4037,9 @@ final class AppDelegate:
               avatarRuntime.snapshot.avatar?.id == held.avatarAssetID,
               let item = context.state.objectStates[held.objectID], let prop = item.generatedProp,
               let calibration = item.gripCalibration,
-              let asset = residentOwnedPropAssets[held.objectID], asset.prop == prop else { return nil }
+              let asset = residentOwnedPropAssets[held.objectID], asset.prop.matchesIdentity(of: prop) else { return nil }
         return .init(objectID: prop.objectID, worldID: context.manifest.worldID, assetID: prop.assetID,
-                     modelURL: asset.descriptor.modelURL, targetHeightMeters: prop.size.y,
+                     modelURL: asset.descriptor.modelURL, targetHeightMeters: prop.effectiveSize.y,
                      attachmentPoint: .rightHand, calibration: calibration)
     }
 
@@ -4091,6 +4233,9 @@ final class AppDelegate:
             "建造模式：格子派生结束，网格层=\(layers, privacy: .public) 可绘制列=\(self.residentPropGridEditor.renderCells.count, privacy: .public)"
         )
         publishResidentPropGrid()
+        // 这里就是"承托几何就绪"那条**既有回调**（一次派生的收尾，命中缓存也走这里）：
+        // 领取时被 `environmentNotReady` 拒掉的入库待办，此刻补做（幂等，见该函数）。
+        drainResidentPropInventoryBacklog(reason: "格子派生收尾")
     }
 
     /// 把格子的网格与着色转发给渲染层。模型每次变更后都会调用（见 `onGridChanged`）。
@@ -4790,8 +4935,11 @@ final class AppDelegate:
                 try? self?.residentActivityOwnership.stopOwnedActivity()
                 self?.agentSpeechAnnouncer.stop()
                 self?.avatarRuntime.clearResidentThinking()
-                self?.pauseResidentWishContinuations()
-            }
+                // 这里**不再**暂停许愿任务的自动续办：这条通道对每一次取消都会触发
+                // （换空间、退出、自主可用性/网络回收、后台预算回收），它们不是用户
+                // 意图。任务级暂停是持久的、只能人工解除的，因此只由 onUserStop 落盘。
+            },
+            onUserStop: { [weak self] in self?.pauseResidentWishContinuations() }
         )
         residentAgentLoop = loop
         bindResidentWishScope(currentResidentWorldContext(), loop: loop)
@@ -4812,13 +4960,19 @@ final class AppDelegate:
             || (loop?.backgroundEnabled == true && loop?.isStopped == false)
         liveCamWindowController?.setResidentCanStop(canStop)
         stageWindowController?.setResidentCanStop(canStop)
+        // 「能不能自主」是**一个全局开关**，不是任务属性：停止只驱动任务面板顶部
+        // 那一条全局横幅（`setResidentAutonomyStop`）+ 下面这条可读提示，
+        // 任何任务行上都不再出现按任务的停止/恢复控件。
+        let autonomyStopped = loop?.isAutonomyPausedByUser == true
+        liveCamWindowController?.setResidentAutonomyStop(autonomyStopped)
+        stageWindowController?.setResidentAutonomyStop(autonomyStopped)
         var notices: [String] = []
         let queuedCount = loop?.pendingUserMessages.count ?? 0
         if queuedCount > 0 { notices.append("\(queuedCount) 条消息排队中。") }
         // "停止"必须看得见：它在界面上不是隐形状态。这里说明停止只停自主续办，
-        // 并给出解除路径（许愿任务行的"恢复自动领取"，或设置里切换一次自主生活）。
+        // 并给出解除路径（任务面板顶部的"恢复自主行动"，或设置里打开自主生活）。
         if loop?.isAutonomyPausedByUser == true {
-            notices.append("自主行动已停止：后台不会自行续办、自行领取或摆放；直接下达指令仍会执行。点许愿任务行的「恢复自动领取」，或在设置里切换一次「允许居民自主安排活动」，即可解除。")
+            notices.append("自主行动已停止：后台不会自行续办、自行领取或摆放；直接下达指令仍会执行。点任务面板上的「恢复自主行动」，或在设置里打开「允许居民自主安排活动」，即可解除。")
         }
         // 交付未确认只在用户尚未接手时提示：用户下次发送/停止/换空间后旧提示不再
         // 显示；模型上下文里的 unconfirmedUserMessages 不变，仍避免重复执行。
@@ -5404,6 +5558,13 @@ final class AppDelegate:
             residentSystemInboxWindowController = controller
         }
         reloadSystemInboxWindow(controller)
+        // 本 app 是 LSUIElement（accessory），而系统消息多半是从 LiveCam 那块
+        // `.nonactivatingPanel` 上点开的 —— 此时 app 并没有被激活。少了这句，
+        // `makeKeyAndOrderFront` 只会把窗口排到最前却**不会**让它成为 key window：
+        // 标题栏是灰的、「打开」作为默认按钮也是灰的、列表点了没有选中态，于是
+        // "双击或按「打开」标记为已读"整条承诺都无从发生。舞台窗、登录窗、设置窗
+        // 都是先激活再显示，这里补齐同一句。
+        NSApplication.shared.activate(ignoringOtherApps: true)
         controller.showWindow(nil)
         controller.window?.makeKeyAndOrderFront(nil)
         Task { @MainActor [weak self] in
@@ -5482,11 +5643,13 @@ final class AppDelegate:
             spatialStage.wishMachineState = .idle
             stageWindowController?.setWishMachineTasks([])
             liveCamWindowController?.setWishMachineTasks([])
+            pushResidentConnectivityNotice(worldID: nil, scope: nil)
             pushSystemInboxSnapshots()
             return
         }
         let scope = currentResidentWorldContext().sessionScope
         let jobs = wishMachineCoordinator.residentJobs(worldID: worldID, residentScope: scope)
+        pushResidentConnectivityNotice(worldID: worldID, scope: scope)
         // Save the current renderer's failure before replacing its descriptor. The next
         // renderer status belongs to the next artifact and cannot recover this fact.
         if case .failed(let objectID, let message) = spatialStage.wishMachineOutputStatus,
@@ -5532,10 +5695,39 @@ final class AppDelegate:
         pushSystemInboxSnapshots()
     }
 
+    /// **连通性是一条全局提示，不是任务的属性。**
+    ///
+    /// 它刻意读**整个作用域**（`residentJobs`，不是面板上最近 20 条），所以网络类
+    /// 事实不会因为任务滚出面板窗口而消失；`nil` 表示连通正常 —— 横幅据此自动消失，
+    /// 不需要用户关掉它。
+    ///
+    /// 这里**不**把 `propGenerationStore.errorMessage` 也折进来：那条通道同时承载
+    /// "缺令牌""配置变更"这类与连通性无关的原因（`PropGenerationError`），
+    /// 把它们统一说成"连不上后台"就是换一种假话；本地任务后台 IPC 的原因本来
+    /// 已有自己的可见面（`showFailureStatus` / `refreshResidentBackendGuidance`）。
+    private func pushResidentConnectivityNotice(worldID: String?, scope: String?) {
+        guard let worldID, let scope else {
+            stageWindowController?.setWishMachineConnectivity(nil)
+            liveCamWindowController?.setWishMachineConnectivity(nil)
+            return
+        }
+        let line = wishMachineCoordinator.residentJobs(worldID: worldID, residentScope: scope)
+            .compactMap { ResidentConnectivityFact.firstConnectivityLine(in: $0.lastError) }
+            .first
+        let notice = line.map(ResidentConnectivityFact.bannerText(for:))
+        stageWindowController?.setWishMachineConnectivity(notice)
+        liveCamWindowController?.setWishMachineConnectivity(notice)
+    }
+
     private func wishMachineTaskPresentation(for job: WishMachineJob) -> WishMachineTaskPresentation {
         var status: String
-        var detail = job.lastError
+        // 连通性是**全局事实**，不是任务属性：它由面板顶部那一条横幅说一次
+        // （见 `pushResidentConnectivityNotice`），任务行只剩任务自己的说明。
+        var detail = ResidentConnectivityFact.strippingConnectivityLines(from: job.lastError)
         var terminal = false
+        // 三轴状态：这里只把事实读出来，判断全在 `ResidentTaskAxisProjection` 里。
+        var ownershipFact: ResidentTaskAxisProjection.OwnershipFact = .notClaimed
+        var placementFact: ResidentTaskAxisProjection.PlacementFact = .unknown
         switch job.stage {
         case .submitting: status = "正在提交后台"
         case .submissionUncertain: status = "提交待确认"
@@ -5560,22 +5752,60 @@ final class AppDelegate:
                 }
             } else { status = "等待托盘展示" }
         case .claimed:
+            // 「已领取 → 已入库」这一轴**只能**由**库存记录**决定 —— 也就是「我的物件」
+            // 列表读的同一份事实（`state.objectStates`，见 `residentPropEditorSnapshot`）。
+            // 两处读同一个事实，"说已入库"与"列表里看得见"因此不可能互相矛盾。
+            //
+            // 以前这里读的是 `residentOwnedPropAssets`（**模型已备好**），而入库
+            // 提交发生在模型备好之后：被 `environmentNotReady` 拒掉时模型是好的、
+            // 库存里却没有它。真机 2026-10-01 `2B 白色长剑`：`wishes.json` stage=claimed、
+            // 资产校验通过、`layoutReceipts` 里**没有** `claimed.<jobID>`、
+            // `state.json` 的 `objectStates` 里也没有它 —— 而任务行与系统消息写着
+            // "已领取并入库"（30 秒后连那句假话都过期消失）。
+            //
+            // 这一次读回同时供归属轴与摆放轴使用，所以两条轴不可能互相矛盾。
+            let inInventory = livingWorldContext.flatMap { world -> Bool? in
+                world.manifest.worldID == job.worldID
+                    ? world.state.objectStates[job.objectID]?.generatedProp != nil : nil
+            } ?? false
+            ownershipFact = inInventory ? .inInventory : .claimedNotInInventory
             if let world = livingWorldContext, world.manifest.worldID == job.worldID,
                let placedState = world.state.objectStates[job.objectID],
                placedState.generatedProp != nil, placedState.isEnabled {
                 status = "已摆放"; detail = nil; terminal = true
+                // 摆出来了：它当然在库存里，摆放轴到头。
+                ownershipFact = .inInventory
+                placementFact = .placed
                 break
             }
             let delegation = wishMachineCoordinator.placementDelegation(
                 worldID: job.worldID, residentScope: job.residentScope, objectID: job.objectID)
             switch delegation?.state {
-            case .placed: status = "已摆放"; terminal = true
-            case .pending: status = "已领取，等待摆放"
-            case .failed: status = "摆放失败"; detail = delegation?.lastError; terminal = true
-            case .revoked: status = "摆放已停止"; terminal = true
+            case .placed: status = "已摆放"; terminal = true; placementFact = .placed
+            case .pending: status = "已领取，等待摆放"; placementFact = .notPlaced
+            case .failed:
+                status = "摆放失败"; detail = delegation?.lastError; terminal = true
+                // 摆放失败不是摆放轴的取值：它只是"还停在低档"，原因由 status/detail 说。
+                placementFact = .failed
+            case .revoked: status = "摆放已停止"; terminal = true; placementFact = .stopped
             default:
-                terminal = residentOwnedPropAssets[job.objectID] != nil
-                status = terminal ? "已领取并入库" : "领取后入库中"
+                let assetFailure = residentPropAssetFailures[job.objectID]
+                status = ResidentPropInventoryBacklog.status(
+                    isInInventory: inInventory,
+                    hasAssetFailure: assetFailure != nil,
+                    isWaitingForInventory: residentPropInventoryBacklog[job.objectID] != nil)
+                // 只有**真的在库存里**才是终态：入库没完成的物件必须一直留在面板上，
+                // 不能被 30 秒终态过期藏起来。
+                terminal = ResidentPropInventoryBacklog.isTerminal(isInInventory: inInventory)
+                // 原因一律可读：要么是"资产没就绪"（模型缺失/校验失败），要么是
+                // "入库还没完成"（服务给出的原因 + 会不会自动补做）。
+                if let assetFailure {
+                    detail = [detail, ResidentPropInventoryBacklog.assetNotice(assetFailure)].compactMap { $0 }.joined(separator: "\n")
+                } else if !inInventory, let pending = residentPropInventoryBacklog[job.objectID] {
+                    // **只在还没进库存时**挂"等待入库"的详情：进了库存就不许再显示等待态
+                    // （台账的清理在同步那条路上；呈现侧也必须自己成立，不依赖清理的时机）。
+                    detail = [detail, ResidentPropInventoryBacklog.pendingDetail(pending)].compactMap { $0 }.joined(separator: "\n")
+                }
             }
         case .failed: status = "生成失败"; terminal = true
         case .cancelled: status = "已取消"; terminal = true
@@ -5588,14 +5818,37 @@ final class AppDelegate:
         if job.computeMayContinue {
             detail = [detail, "远端计算可能仍在继续。"].compactMap { $0 }.joined(separator: "\n")
         }
-        // 任务级自动续办停止：必须可见（不是只写在提示词里的隐形状态）。行内
-        // 由 autoContinuationPaused 驱动"自主行动已停止 + 恢复"控件；detail
-        // 说明它不影响本轮明确指令，也不影响任务与产物。
-        if job.autoContinuationPaused == true && !terminal {
-            detail = [detail, "自主行动已停止：不会自行前往领取或摆放；任务与产物保留，直接下达指令仍可当轮执行。"].compactMap { $0 }.joined(separator: "\n")
+        // 「这件东西的尺寸是**怎么定的**」：提交时说过的尺寸意图写进任务行（没有意图的老任务
+        // 不因为本契约多出任何一行 —— `sizeIntentLine` 那时是 nil）。用户越界/夹取的原因由
+        // 生成入库那一处写进 `residentPropNotices`，两处都不静默。
+        if let sizeLine = job.sizeIntentLine {
+            detail = [detail, sizeLine].compactMap { $0 }.joined(separator: "\n")
         }
+        // 任务级自动续办停止是**授权**，不是任务属性：它不再写进任务行的 detail，
+        // 也不再驱动任何按任务的控件；它只驱动面板顶部那条全局横幅
+        // （见 `setResidentAutonomyStop` 与 `store.isAutonomyStoppedByUser`）。
+        // 任务的 status/detail 从此只说任务自己。
+        var generationFact: ResidentTaskAxisProjection.GenerationFact
+        switch job.stage {
+        case .submitting: generationFact = .submitted
+        case .submissionUncertain: generationFact = .submissionUncertain
+        case .generating:
+            switch job.remoteState {
+            case .queued, .submitting, .remotePending: generationFact = .remoteQueued
+            case .preflight: generationFact = .remotePreflight
+            case .waitingResources: generationFact = .remoteWaitingResources
+            default: generationFact = .remoteRunning
+            }
+        case .generated: generationFact = .downloaded
+        case .ready, .claimed: generationFact = .completed
+        case .failed: generationFact = .failed
+        case .cancelled: generationFact = .cancelled
+        case .interrupted: generationFact = .interrupted
+        }
+        let axes = ResidentTaskAxisProjection.project(generationFact,
+            ownership: ownershipFact, placement: placementFact)
         return WishMachineTaskPresentation(id: job.id, title: job.name, status: status, detail: detail,
-            isTerminal: terminal, autoContinuationPaused: job.autoContinuationPaused == true)
+            isTerminal: terminal, axes: axes, autoContinuationPaused: job.autoContinuationPaused == true)
     }
 
     private func refreshWishMachine() async {
@@ -5644,6 +5897,9 @@ final class AppDelegate:
         residentWishMessageSubscriptions.removeAll()
         residentWishMessages.removeAll() // Rust retains anything not acknowledged in the old scope.
         residentWishSnapshotPending.removeAll()
+        // 本地直达是"本会话此作用域已经送过"的记账：换作用域（含换空间）后新的
+        // 居民循环还没见过这些持久事实，必须允许重投一次。
+        residentWishLocalFactsQueued.removeAll()
         Task { @MainActor [weak self] in await self?.refreshWishMachineMessages() }
     }
 
@@ -5719,18 +5975,7 @@ final class AppDelegate:
                 guard spatialStage.wishMachineOutput?.id == event.objectID,
                       spatialStage.wishMachineOutputStatus == .ready(id: event.objectID) else { continue }
             }
-            var payload: [String: PropTaskJSON] = ["wish_id": .string(event.wishID.uuidString),
-                "object_id": .string(event.objectID), "state": .string(event.kind.rawValue),
-                "compute_may_continue": .bool(event.computeMayContinue)]
-            if let stage = event.stage { payload["stage"] = .string(stage.rawValue) }
-            if let remoteState = event.remoteState { payload["remote_state"] = .string(remoteState.rawValue) }
-            if let message = event.message { payload["message"] = .string(message) }
-            if let cancelRequested = event.cancelRequested { payload["cancel_requested"] = .bool(cancelRequested) }
-            if let failureSource = event.failureSource { payload["failure_source"] = .string(failureSource) }
-            if let paused = event.autoContinuationPaused { payload["auto_continuation_paused"] = .bool(paused) }
-            if let authorizationID = event.continuationResumeAuthorizationID {
-                payload["resume_authorization_id"] = .string(authorizationID.uuidString)
-            }
+            let payload = wishMachineEventPayload(event)
             let published = try await propGenerationStore.publishMessage(id: event.id, taskId: taskID,
                 worldID: scope.worldID, residentScope: scope.residentScope, kind: "wish." + event.kind.rawValue, payload: payload)
             guard published.id == event.id, published.taskId == taskID, published.worldID == scope.worldID,
@@ -5738,6 +5983,24 @@ final class AppDelegate:
                   published.payload == payload else { throw PropTaskDaemonError.invalidFrame }
             try wishMachineCoordinator.markEventPublished(id: event.id)
         }
+    }
+
+    /// 一条持久事实在消息通道上的载荷。**发布**（守护进程往返）与**本地直达**必须
+    /// 用同一份形状，否则同一个事实会因为走哪条通道而给 agent 不同的上下文。
+    private func wishMachineEventPayload(_ event: WishMachineEvent) -> [String: PropTaskJSON] {
+        var payload: [String: PropTaskJSON] = ["wish_id": .string(event.wishID.uuidString),
+            "object_id": .string(event.objectID), "state": .string(event.kind.rawValue),
+            "compute_may_continue": .bool(event.computeMayContinue)]
+        if let stage = event.stage { payload["stage"] = .string(stage.rawValue) }
+        if let remoteState = event.remoteState { payload["remote_state"] = .string(remoteState.rawValue) }
+        if let message = event.message { payload["message"] = .string(message) }
+        if let cancelRequested = event.cancelRequested { payload["cancel_requested"] = .bool(cancelRequested) }
+        if let failureSource = event.failureSource { payload["failure_source"] = .string(failureSource) }
+        if let paused = event.autoContinuationPaused { payload["auto_continuation_paused"] = .bool(paused) }
+        if let authorizationID = event.continuationResumeAuthorizationID {
+            payload["resume_authorization_id"] = .string(authorizationID.uuidString)
+        }
+        return payload
     }
 
     private func projectWishMessages(_ scope: PropTaskContext) {
@@ -5763,17 +6026,50 @@ final class AppDelegate:
             } else if delivery.consumer == "ui" {
                 guard stageWindowController != nil || liveCamWindowController != nil else { continue }
             } else {
-                deliverWishMessageToAgent(message, job: job, context: context,
+                deliverWishFactToAgent(factID: message.id, kind: message.kind, taskID: message.taskId,
+                    payload: message.payload, job: job, context: context,
                     automatic: automaticEventIDs.contains(message.id), resumed: resumedEventIDs.contains(message.id))
                 continue // Receiving or queuing a notification is not successful consumption.
             }
             residentWishConsumed.insert(delivery)
             residentWishAcknowledgements.insert(delivery)
         }
+        // 守护进程消息往返只是**其中一条**通道。事实本身早就耐久地躺在协调器里，
+        // 所以这里再走一条**本地直达**：守护进程/隧道不可用时（正是网络故障那段
+        // 时间）"东西已经好了"仍然送进居民循环，而不是悄悄躺在磁盘上，等下一次
+        // 人类输入或等消息通道复活。授权仍与事实分开：暂停时只投递普通观察。
+        projectLocalWishFacts(scope, context: context, automaticEventIDs: automaticEventIDs,
+            resumedEventIDs: resumedEventIDs)
     }
 
-    private func deliverWishMessageToAgent(_ message: PropTaskMessage, job: WishMachineJob,
-                                          context: ResidentWorldContext, automatic: Bool, resumed: Bool = false) {
+    /// 本地持久事实直达 agent 循环。与消息通道共用同一份投递判据
+    /// （`deliverWishFactToAgent`），所以"事实通知 vs 自主授权"的分工在两条通道上
+    /// 完全一致：不会因为走哪条路而多给或少给一次自主授权。
+    private func projectLocalWishFacts(_ scope: PropTaskContext, context: ResidentWorldContext,
+                                       automaticEventIDs: Set<UUID>, resumedEventIDs: Set<UUID>) {
+        let jobs = wishMachineCoordinator.residentJobs(worldID: scope.worldID, residentScope: scope.residentScope)
+        for event in wishMachineCoordinator.pendingEvents(worldID: scope.worldID, residentScope: scope.residentScope) {
+            guard !residentWishLocalFactsQueued.contains(event.id) else { continue }
+            guard let job = jobs.first(where: { $0.id == event.wishID }), let taskID = job.jobID else { continue }
+            // 与发布侧同一条判据：托盘没有真的显示出来之前，"产物就绪"不是既成事实。
+            if event.kind == .outputReady {
+                guard spatialStage.wishMachineOutput?.id == event.objectID,
+                      spatialStage.wishMachineOutputStatus == .ready(id: event.objectID) else { continue }
+            }
+            deliverWishFactToAgent(factID: event.id, kind: "wish." + event.kind.rawValue, taskID: taskID,
+                payload: wishMachineEventPayload(event), job: job, context: context,
+                automatic: automaticEventIDs.contains(event.id), resumed: resumedEventIDs.contains(event.id))
+            residentWishLocalFactsQueued.insert(event.id)
+        }
+    }
+
+    /// 把一条已经发生的事实投递给居民循环，并在这里、也只在这里区分两件事：
+    /// - **事实通知**：无论暂停与否都入队，下一次人类轮次立刻看得见（不丢掉）；
+    /// - **自主行动授权**：只有未被用户停止、且任务级自动续办未被暂停时，才把它
+    ///   当成一次可信续办（`receiveContinuationEvent`）交给后台自行执行。
+    private func deliverWishFactToAgent(factID: UUID, kind: String, taskID: UUID, payload: [String: PropTaskJSON],
+                                        job: WishMachineJob, context: ResidentWorldContext,
+                                        automatic: Bool, resumed: Bool = false) {
         guard residentPropEditingWorldID == nil else { return }
         let loop = ensureResidentLoop()
         guard !loop.snapshot.isInvalidated else { return }
@@ -5785,23 +6081,23 @@ final class AppDelegate:
         // human input can see them. The loop still gates autonomous execution;
         // acknowledgement remains tied to successful consumption below.
         bindResidentWishScope(context, loop: loop)
-        if message.kind == "wish.outputReady" && job.stage != .claimed {
+        if kind == "wish.outputReady" && job.stage != .claimed {
             guard spatialStage.wishMachineOutput?.id == job.objectID,
                   spatialStage.wishMachineOutputStatus == .ready(id: job.objectID) else { return }
         }
-        var payload = message.payload
+        var payload = payload
         payload["wish_id"] = .string(job.id.uuidString)
         payload["object_id"] = .string(job.objectID)
         payload["auto_continuation_paused"] = .bool(job.autoContinuationPaused == true)
         let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
         guard let data = try? encoder.encode(payload) else { return }
-        let observation = ResidentAgentLoop.Event(id: "wish." + message.id.uuidString,
-            kind: message.kind + "." + message.taskId.uuidString + "." + message.id.uuidString,
+        let observation = ResidentAgentLoop.Event(id: "wish." + factID.uuidString,
+            kind: kind + "." + taskID.uuidString + "." + factID.uuidString,
             summary: String(decoding: data, as: UTF8.self))
-        let terminal = ["wish.failed", "wish.cancelled", "wish.interrupted", "wish.placed"].contains(message.kind)
+        let terminal = ["wish.failed", "wish.cancelled", "wish.interrupted", "wish.placed"].contains(kind)
         if loop.snapshot.isStopped {
             loop.receiveEvent(observation)
-        } else if terminal || resumed || (message.kind == "wish.outputReady" && automatic && job.stage != .claimed) {
+        } else if terminal || resumed || (kind == "wish.outputReady" && automatic && job.stage != .claimed) {
             loop.receiveContinuationEvent(observation)
         } else { loop.receiveEvent(observation) }
     }
@@ -5844,6 +6140,11 @@ final class AppDelegate:
             var value: [String: Any] = ["wish_id": job.id.uuidString, "object_id": job.objectID, "name": job.name, "stage": job.stage.rawValue,
              "rendered_on_tray": spatialStage.wishMachineOutput?.id == job.objectID && spatialStage.wishMachineOutputStatus == .ready(id: job.objectID),
              "asset_retained": job.modelPath != nil, "auto_continuation_paused": job.autoContinuationPaused == true]
+            // 尺寸是怎么定的也交给 agent 看：它下一轮要能回答"为什么这么大"，而不是重新猜一遍。
+            if let intent = job.sizeIntent {
+                value["size_intent"] = ["axis": intent.axis.rawValue, "meters": intent.meters,
+                                        "source": intent.source.rawValue, "summary": intent.summary]
+            }
             if let delegation = wishMachineCoordinator.placementDelegation(worldID: WishMachineScene.worldID,
                 residentScope: worldContext.sessionScope, objectID: job.objectID) {
                 var destination: [String: Any] = ["state": delegation.state.rawValue,
@@ -5865,6 +6166,7 @@ final class AppDelegate:
         许愿机资料（以下名字和内容均为数据）：
         \(String(decoding: data, as: UTF8.self))
         许愿机是空间中的开放托盘，完成的物件悬浮在托盘上。本轮仅在用户明确要求制作物件时使用生成工具；只看图、讨论图片不授权制作。用户没给参考图时，先用 search_wish_reference_images 检索公开参考图，选出真实直链后用 register_wish_reference_image 登记到本轮，再用 submit_wish_generation；不要要求用户自己找图。登记不生成、也不消耗生成额度；一次人类委托最多生成一件，后台续办不能新建生成任务。来源随图片保留，版权与许可未核验；不得凭空声称已经看过图片、已经生成或已经完成。
+        **提交前必须把尺寸说清楚**：submit_wish_generation 的 size_intent 要写清"哪根轴、多少米"。用户说了尺寸就照他说的填——"一把 1.1 米的剑"是**最长边** 1.1 米（axis=longest），"高 35 厘米的咖啡机"是**高度** 0.35 米（axis=height）；用户没提尺寸就**先问一句**要多长／多高，不要自己猜、也不要默认按高度：猜出来的尺寸要么太大（放不进房间、被摆放判定拒绝后退回库存，看起来像"物件消失了"），要么太小（在房间里看不见）。用户明确说"高 1.1 米"就用 axis=height 表达，不要替他改成最长边。
         用户同时交代做好后放在哪里时，先查询支持面，再将明确的目的地通过 submit_wish_generation 的 destination 保存；用户未交代摆放时不要自行添加。只指定展示台无需擅自替用户固定精确坐标，领取后可在该支持面范围内预检合法落点。
         提交后可继续其他事情，并用 update_resident_intent 留下 waiting_event。宿主会在成品实际可见时发送 outputReady，按预算唤醒一次续办；不需要持续调用模型查询。
         收到 outputReady 后，在未被用户停止或要求等待时，自行查看当前活动并前往 wish_machine.collect；到达后调用 claim_wish_output 核实领取。工具失败时根据真实原因调整，不要把开始活动当成领取成功。
@@ -6707,5 +7009,118 @@ private enum DJAgentRadioActionError: LocalizedError {
         case .busy:
             "播放器正在切歌，请稍后再试"
         }
+    }
+}
+
+/// 「已领取 → 入库」这条链**唯一的一份**事实与文案，外加"被拒之后补做"的台账。
+///
+/// 为什么必须收在一处：真机 2026-10-01 的缺陷是**两个投影各读各的事实**——
+/// 任务行与系统消息读"模型已备好"（`residentOwnedPropAssets`，由 prepare 写），于是显示
+/// "已领取并入库"；而「我的物件」列表读库存（`state.objectStates`），里面**没有**这件东西。
+/// 两处于是可以同时为真：用户看到"已进库存"，列表里却找不到（`2B 白色长剑`：
+/// `WishMachine/wishes.json` stage=claimed、资产 sha256 与回执一致、
+/// `layoutReceipts` 里没有 `claimed.<jobID>`、`state.json` 的 `objectStates` 里没有它）。
+///
+/// 现在两边都从**库存记录**派生（见 `status(isInInventory:hasAssetFailure:isWaitingForInventory:)`
+/// 与 `residentPropEditorSnapshot`），所以"说已入库"与"列表里有"不可能再矛盾。
+///
+/// 是 `struct` 而不是无 case 的 `enum`：它既是一组静态判定，也是**一份状态**
+/// （`pending`），而 `struct` 的隐式逐成员初始化让 `ResidentPropInventoryBacklog()`
+/// 直接成立（无 case 的 `enum` 没有隐式初始化器）。
+struct ResidentPropInventoryBacklog {
+    /// 一件"已领取但还没写进库存"的物件。幂等键是 `objectID`（同一件只留一条）。
+    struct Pending: Equatable, Sendable {
+        let objectID: String
+        let name: String
+        /// 服务给出的可读原因，**逐字保留**（fail-closed 的文案是判定的一部分）。
+        let reason: String
+        /// 这次被拒是不是"承托几何还没就绪"。是 ⇒ 几何一就绪就补做。
+        let waitsForSupportGeometry: Bool
+
+        init(objectID: String, name: String, reason: String, waitsForSupportGeometry: Bool) {
+            self.objectID = objectID; self.name = name; self.reason = reason
+            self.waitsForSupportGeometry = waitsForSupportGeometry
+        }
+    }
+
+    /// `environmentNotReady` 的**分类**（不是放宽）：拿不到承托几何/路线数据时，
+    /// 摆放服务仍然 fail-closed 拒绝写入，只是这条拒绝"还会好"。
+    ///
+    /// 判定一个字都没改，改的只是"被拒之后不许静默、不许没人补做"。分类在**调用点**
+    /// 做（`(error as? ResidentPropPlacementError) == .environmentNotReady`，见
+    /// `synchronizeOwnedResidentProps`），这里刻意不依赖任何错误类型 —— 于是这份
+    /// 台账与文案是纯逻辑，任何 harness 都能逐字编译它来验证。
+
+    /// 补做的条件：还不在库存里 **且** 承托几何已就绪。
+    static func shouldRetry(isInInventory: Bool, isSupportGeometryReady: Bool) -> Bool {
+        !isInInventory && isSupportGeometryReady
+    }
+
+    /// 任务行/系统消息的状态文字。
+    ///
+    /// 「已入库」字样**只在 `isInInventory`（= `objectStates` 里有带 `generatedProp` 的那一项，
+    /// 也就是「我的物件」列表读的同一份事实）时**才允许出现；资产没备好是**另一条**事实
+    /// （能不能摆），单独说，不冒充库存。
+    static func status(isInInventory: Bool, hasAssetFailure: Bool, isWaitingForInventory: Bool) -> String {
+        if isInInventory { return hasAssetFailure ? "已入库，资产未就绪" : "已领取并入库" }
+        return isWaitingForInventory ? "已领取，等待入库" : "领取后入库中"
+    }
+
+    /// 终态只由**库存记录**决定：入库没完成的物件必须一直留在面板上，不许被
+    /// 30 秒终态过期藏掉（真机缺陷的第二半：那句话本身是假的，随后连假话都看不见了）。
+    static func isTerminal(isInInventory: Bool) -> Bool { isInInventory }
+
+    /// 提示区的可见文案。**绝不静默**：说清原因，并说清会不会自己好。
+    static func pendingNotice(_ pending: Pending) -> String {
+        let tail = pending.waitsForSupportGeometry ? "空间就绪后会自动补做。" : "会在下一次同步时重试。"
+        return "\(pending.name) 已领取，入库尚未保存：\(pending.reason)\(tail)"
+    }
+
+    /// 任务行的详情：与 `pendingNotice` 同一份原因，只是不带名字（行上已有标题）。
+    static func pendingDetail(_ pending: Pending) -> String {
+        let tail = pending.waitsForSupportGeometry ? "空间就绪后会自动补做。" : "会在下一次同步时重试。"
+        return "入库尚未保存：\(pending.reason)\(tail)"
+    }
+
+    /// 资产（模型文件）真的坏了时的可读原因。库存里有它、现在却摆不出来的物件
+    /// 必须**说得出来为什么**，而不是从列表里消失或假装能用。
+    static func assetNotice(_ reason: String) -> String { "资产未就绪：\(reason)" }
+
+    /// 补做**一次**：返回这次该补做的物件编号（升序）。几何没就绪、或台账为空时返回 `[]`。
+    ///
+    /// 幂等的第 1 层：几何没就绪一件都不补；已经在库存里的条目顺手从台账移除
+    /// （不需要补，也不该继续挂着"等待入库"）。第 2、3 层在写入那条路上：
+    /// `synchronizeOwnedResidentProps` 按 `objectStates` 跳过已在库的，提交用的是
+    /// 既有的回执键 `claimed.<jobID>`（`WorldSimulation.applyPropLayout` 按回执去重）。
+    /// 所以"重复触发写两遍"在状态层不可能发生。
+    mutating func drain(isSupportGeometryReady: Bool, isInInventory: (String) -> Bool) -> [String] {
+        var attempted: [String] = []
+        for objectID in pending.keys.sorted() {
+            guard let entry = pending[objectID] else { continue }
+            if !Self.shouldRetry(isInInventory: isInInventory(entry.objectID), isSupportGeometryReady: isSupportGeometryReady) {
+                if isInInventory(entry.objectID) { pending.removeValue(forKey: entry.objectID) }
+                continue
+            }
+            attempted.append(entry.objectID)
+        }
+        return attempted
+    }
+
+    /// key = objectID：同一件东西重复记录只留一条（覆盖原因与名字）。
+    private(set) var pending: [String: Pending] = [:]
+    var isEmpty: Bool { pending.isEmpty }
+    var count: Int { pending.count }
+    subscript(objectID: String) -> Pending? { pending[objectID] }
+
+    mutating func record(_ value: Pending) { pending[value.objectID] = value }
+    /// 入库成功：清掉待办，并回答"之前是不是挂着一条待办"——是 ⇒ 调用方必须
+    /// **收回**那句"入库尚未保存"并给出结果，而不是让旧提示留在屏幕上。
+    @discardableResult mutating func resolve(objectID: String) -> Bool {
+        pending.removeValue(forKey: objectID) != nil
+    }
+    /// 库存里已经有它了（重启后第一次同步就补做成功、或在别的路径上进库）：
+    /// 台账不该再挂着它。**可见状态必须跟着事实消失**，而不是留在屏幕上。
+    mutating func prune(isInInventory: (String) -> Bool) {
+        pending = pending.filter { !isInInventory($0.key) }
     }
 }

@@ -203,6 +203,16 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
         (window as? LiveCamPanel)?.interactionView.setWishContinuationResumeHandler(handler)
     }
 
+    /// 宿主推来的**全局**连通性事实（后台连不上）。连通性不是任务属性。
+    func setWishMachineConnectivity(_ text: String?) {
+        (window as? LiveCamPanel)?.interactionView.setWishMachineConnectivity(text)
+    }
+
+    /// 宿主推来的**全局**自主停止事实（run 级用户停止）。
+    func setResidentAutonomyStop(_ stopped: Bool) {
+        (window as? LiveCamPanel)?.interactionView.setResidentAutonomyStop(stopped)
+    }
+
     func setSystemInboxHandler(
         _ handler: @escaping @MainActor () -> Void
     ) {

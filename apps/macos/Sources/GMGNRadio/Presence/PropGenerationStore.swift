@@ -8,10 +8,18 @@ struct PropGenerationRecord: Codable, Identifiable, Sendable {
     let imagePath: String
     let imageSHA256: String
     let heightMeters: Double
+    /// 提交时声明的**尺寸意图**（守护进程 `sizeIntent`）。可选、纯增量：守护进程在缺失时
+    /// 根本不写这个键，于是解码得到 nil —— 与今天逐字节一致（app 仍按请求高度自动推断）。
+    var sizeIntent: PropSizeIntent?
     let source: PropGenerationSource
     let idempotencyKey: String
     var receipt: PropGenerationReceipt?
     var localModelPath: String?
+    /// 守护进程已核验并落盘的**碰撞代理**路径（`<id>.collider.glb`）。
+    ///
+    /// 纯增量：回执里没有碰撞字段时守护进程根本不写这一位，于是解码得到 nil —— 与今天
+    /// 逐字节一致。有它才说明"生成侧给了代理，而且守护进程已经把它核验并落盘"。
+    var localCollisionPath: String?
     var lastError: String?
     var backendStage: String?
     var cancelRequested: Bool?
@@ -71,7 +79,7 @@ struct PropGenerationRecord: Codable, Identifiable, Sendable {
         daemon.clearConfiguration()
     }
     @discardableResult func create(imageURL: URL, name: String, author: String, license: String,
-        heightMeters: Double, id: UUID = UUID(), context: PropTaskContext? = nil) async -> UUID? {
+        heightMeters: Double, sizeIntent: PropSizeIntent? = nil, id: UUID = UUID(), context: PropTaskContext? = nil) async -> UUID? {
         guard !creating.contains(id), !jobs.contains(where: { $0.id == id }) else {
             errorMessage = PropGenerationError.knownSubmission.localizedDescription; return nil
         }
@@ -84,13 +92,14 @@ struct PropGenerationRecord: Codable, Identifiable, Sendable {
             try Task.checkCancellation()
             guard generation == configurationGeneration else { throw PropGenerationError.configurationChangedBeforeSubmit }
             let source = PropGenerationSource(author: author, license: license)
-            try PropGenerationClient.validateInput(png: png, name: name, source: source, heightMeters: heightMeters)
+            try PropGenerationClient.validateInput(png: png, name: name, source: source,
+                heightMeters: heightMeters, sizeIntent: sizeIntent)
             try await daemon.configure(endpoint: configuration.endpoint, token: configuration.token)
             try Task.checkCancellation()
             guard generation == configurationGeneration else { throw PropGenerationError.configurationChangedBeforeSubmit }
             let version = jobVersions[id]
             let record = try await daemon.submit(id: id, endpoint: configuration.endpoint, name: name, png: png,
-                source: source, heightMeters: heightMeters, context: context)
+                source: source, heightMeters: heightMeters, sizeIntent: sizeIntent, context: context)
             guard record.id == id, record.endpoint == configuration.endpoint, record.idempotencyKey == id.uuidString else {
                 throw PropGenerationError.invalidResponse
             }

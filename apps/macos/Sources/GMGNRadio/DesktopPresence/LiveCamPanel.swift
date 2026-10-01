@@ -279,9 +279,20 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate, NSGestureRecogn
         wishMachineTasks.update(tasks)
     }
 
-    /// 面板上的"恢复自动领取"动作接到宿主（不是模型工具）：解除不依赖措辞。
+    /// **全局开关的一个动作**的宿主侧接线（不是模型工具，解除不依赖措辞）：
+    /// 横幅把它按"一次点击 → 所有被用户停过的任务"扇出，用户不需要逐个恢复。
     func setWishContinuationResumeHandler(_ handler: @escaping (UUID) -> Void) {
         wishMachineTasks.onResumeAutomaticContinuation = handler
+    }
+
+    /// 宿主推来的**全局**连通性事实（后台连不上）。连通性不是任务属性。
+    func setWishMachineConnectivity(_ text: String?) {
+        wishMachineTasks.setConnectivityWarning(text)
+    }
+
+    /// 宿主推来的**全局**自主停止事实（run 级用户停止）。
+    func setResidentAutonomyStop(_ stopped: Bool) {
+        wishMachineTasks.setHostAutonomyStop(stopped)
     }
 
     func setResidentCanStop(_ canStop: Bool) {

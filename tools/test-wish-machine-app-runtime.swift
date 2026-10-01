@@ -18,13 +18,18 @@ let methods = ["private func wishMachineClaimEvidence(", "private func synchroni
                "private func configureWishMessageDelivery()", "private func updateWishMessageScope()",
                "private func receiveWishMessage(", "private func refreshWishMachineMessages()",
                "private func publishWishMachineEvents(", "private func projectWishMessages(",
-               "private func deliverWishMessageToAgent(", "private struct ResidentWishDelivery",
+               "private func wishMachineEventPayload(", "private func projectLocalWishFacts(",
+               "private func deliverWishFactToAgent(", "private struct ResidentWishDelivery",
                "private func registerWishImages(", "private func authorizeWishImages(",
                "private struct ResidentWishImageRegistration", "private func performResidentTurn(",
                "private struct ResidentWishScope", "private func bindResidentWishScope(",
                "private func pauseResidentWishContinuations()",
+               "private func pushResidentConnectivityNotice(",
                "private func residentWishPlacementAlreadyCompleted(",
                "private func resumeWishAutomaticContinuation("].map(declaration).joined(separator: "\n")
+// 「已领取 → 入库」的**唯一一份**事实与文案（生产文本，逐字抽取）：任务行/系统消息
+// 里那个"已领取并入库"就是它决定的，所以断言必须打在真正跑在 App 里的那份上。
+let inventoryBacklogSource = declaration("struct ResidentPropInventoryBacklog {")
 let messageStateStart = source.range(of: "    private var residentWishMessageScope:")!.lowerBound
 let messageStateEnd = source.range(of: "    private struct ResidentOwnedPropAsset")!.lowerBound
 let messageState = String(source[messageStateStart..<messageStateEnd])
@@ -32,9 +37,51 @@ let stageSource = try String(contentsOfFile: "apps/macos/Sources/GMGNRadio/Visua
 let outputStatusStart = stageSource.range(of: "    var wishMachineOutputStatus:")!.lowerBound
 let outputStatusEnd = stageSource.range(of: "    var residentPropOutputs:")!.lowerBound
 let outputStatusState = String(stageSource[outputStatusStart..<outputStatusEnd])
+// 三轴的判据、连通性词汇与任务投影：**逐字抽取生产声明**，不在 harness 里抄第二份。
+// 「任务行说了什么」必须由跑在 App 里的那一份决定 —— 连同 `WishMachineTaskPresentation`
+// 本身一起抽，省掉了原来那个手写副本（那里正是"另存一份"最容易被放过去的地方）。
+let presentationSource = try String(contentsOfFile:
+    "apps/macos/Sources/GMGNRadio/Presence/WishMachineTaskPresentation.swift", encoding: .utf8)
+func presentationDeclaration(_ name: String) -> String {
+    let start = presentationSource.range(of: name)!.lowerBound
+    let open = presentationSource[start...].firstIndex(of: "{")!
+    var depth = 0
+    for index in presentationSource[open...].indices {
+        if presentationSource[index] == "{" { depth += 1 }
+        if presentationSource[index] == "}" { depth -= 1 }
+        if depth == 0 { return String(presentationSource[start...index]) }
+    }
+    fatalError("unterminated declaration")
+}
+let taskAxisSource = ["enum ResidentGenerationAxis:", "enum ResidentOwnershipAxis:",
+                      "enum ResidentPlacementAxis:", "struct ResidentTaskAxes:",
+                      "enum ResidentTaskAxisProjection", "enum ResidentConnectivityFact",
+                      "struct WishMachineTaskPresentation:"]
+    .map(presentationDeclaration).joined(separator: "\n")
+// 尺寸意图（`size_intent`）：同样**逐字抽取生产声明**（类型 + 任务行那一行），
+// 不在 harness 里抄第二份 —— 抄一份正是"两份真相"最容易被放过去的地方。
+let propClientSource = try String(contentsOfFile:
+    "apps/macos/Sources/GMGNRadio/Presence/PropGenerationClient.swift", encoding: .utf8)
+func sourceDeclaration(_ text: String, _ name: String) -> String {
+    let start = text.range(of: name)!.lowerBound
+    let open = text[start...].firstIndex(of: "{")!
+    var depth = 0
+    for index in text[open...].indices {
+        if text[index] == "{" { depth += 1 }
+        if text[index] == "}" { depth -= 1 }
+        if depth == 0 { return String(text[start...index]) }
+    }
+    fatalError("unterminated declaration")
+}
+let sizeIntentSource = sourceDeclaration(propClientSource, "struct PropSizeIntent: Codable")
+let coordinatorSource = try String(contentsOfFile:
+    "apps/macos/Sources/GMGNRadio/Presence/WishMachineCoordinator.swift", encoding: .utf8)
+let sizeIntentLineSource = sourceDeclaration(coordinatorSource, "extension WishMachineJob {")
+
 let program = #"""
 import Foundation
 import Observation
+\#(sizeIntentSource)
 enum FixtureError: Error { case failed }
 enum WishMachineError: Error { case unknownAttachment }
 enum AgentConversationError: Error { case cancelled }
@@ -55,22 +102,31 @@ struct PropTaskMessage: Equatable {
 struct ResidentImageAttachment { let id: UUID; let url: URL; let displayName: String }
 struct PropGenerationSource { let author: String; let license: String }
 enum WishMachineStage: String { case submitting, submissionUncertain, generating, generated, ready, failed, cancelled, interrupted, claimed }
-enum PropGenerationState: String { case queued, waitingResources, preflight, running }
+enum PropGenerationState: String {
+    case queued, preflight, waitingResources, submitting, remotePending
+    case running, cancelRequested, completed, failed, cancelled, interrupted
+}
 struct WishMachineJob {
     let id: UUID; let worldID: String; let residentScope: String; let objectID: String
     var stage: WishMachineStage; var autoContinuationPaused: Bool? = nil
     var name = "测试愿望"; var lastError: String?; var remoteState: PropGenerationState?
     var cancelRequested: Bool?; var computeMayContinue = false
+    var sizeIntent: PropSizeIntent?
     var jobID: UUID? { id }
 }
+\#(sizeIntentLineSource)
 struct WishPlacementDelegation {
     enum State { case placed, pending, failed, revoked }
     var state: State; var lastError: String?
 }
-struct WishMachineTaskPresentation { let id: UUID; let title: String; let status: String; let detail: String?; let isTerminal: Bool; var autoContinuationPaused = false }
+\#(taskAxisSource)
 @MainActor final class TaskPanel {
     var tasks: [WishMachineTaskPresentation] = []
     func setWishMachineTasks(_ tasks: [WishMachineTaskPresentation]) { self.tasks = tasks }
+    /// 全局连通性是一条**全局提示**，不属于任何任务行；这里只记下宿主推了什么，
+    /// 好让断言能证明连通性事实真的走到了全局面，而不是"被谁吃掉了"。
+    var connectivityNotices: [String?] = []
+    func setWishMachineConnectivity(_ text: String?) { connectivityNotices.append(text) }
 }
 struct WishMachineEvent {
     enum Kind: String { case stateChanged, generationCompleted, outputReady, failed, cancelled, interrupted, claimed, placed }
@@ -257,6 +313,7 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
         return reply
     }
 }
+\#(inventoryBacklogSource)
 @MainActor final class App {
     var residentAgentLoop: ResidentAgentLoop? = ResidentAgentLoop()
     let spatialStage = Stage()
@@ -270,6 +327,8 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
     var residentPropEditingWorldID: String?
     var residentPropTemporaryCancellation = false
     var residentOwnedPropAssets: [String: Bool] = [:]
+    var residentPropAssetFailures: [String: String] = [:]
+    var residentPropInventoryBacklog = ResidentPropInventoryBacklog()
     var scope = "resident"
     private var residentWishImages: [URL: ResidentWishImageRegistration] = [:]
     private var residentWishScope: ResidentWishScope?
@@ -319,6 +378,8 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
     func register(_ image: ResidentImageAttachment) { registerWishImages([image], loop: residentAgentLoop!, worldScope: scope) }
     func prepare(_ input: ResidentAgentLoop.Input) throws -> UUID? { try authorizeWishImages(input, worldContext: currentResidentWorldContext()) }
     func pause() { pauseResidentWishContinuations() }
+    /// 本地直达的记账是私有的：这层只读包装让断言能看见"同一个事实只本地投递一次"。
+    func localFactsQueued() -> Set<UUID> { residentWishLocalFactsQueued }
 }
 @MainActor final class MessageStore {
     var subscriptions = Set<String>()
@@ -508,6 +569,47 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
         placedApp.livingWorldContext!.state.objectStates[job.objectID]!.isEnabled = false
         await placedApp.refresh()
         check(placedApp.stageWindowController!.tasks.first?.status == "摆放已停止", "disabled inventory state does not masquerade as a current placement")
+        // 「已领取 → 入库」的可见状态：**说"已入库"必须与「我的物件」列表读同一个事实**
+        // （库存记录 `objectStates`），而不是"模型已备好"（`residentOwnedPropAssets`）。
+        //
+        // 真机 2026-10-01 `2B 白色长剑`：`WishMachine/wishes.json` stage=claimed、资产
+        // sha256 与回执一致、`layoutReceipts` 里**没有** `claimed.<jobID>`、
+        // `state.json` 的 `objectStates` 里也没有它 —— 而任务行与系统消息写着
+        // "已领取并入库"，那句话还随终态 30 秒过期消失（用户："库存没有看到，
+        // 只看到左上角的状态说已进库存"）。
+        let pendingApp = App()
+        var pendingJob = job; pendingJob.stage = .claimed
+        pendingApp.wishMachineCoordinator.jobs = [pendingJob]
+        pendingApp.propGenerationStore.jobs = [pendingJob]
+        // 模型**已经**备好：旧口径（`residentOwnedPropAssets != nil`）正是在这里撒谎。
+        pendingApp.residentOwnedPropAssets[job.objectID] = true
+        await pendingApp.refresh()
+        check(pendingApp.stageWindowController!.tasks.first?.status == "领取后入库中",
+              "a prepared asset alone must never read as stored inventory")
+        pendingApp.residentPropInventoryBacklog.record(.init(objectID: job.objectID, name: pendingJob.name,
+            reason: "空间碰撞数据尚未准备好，请稍后再摆放。", waitsForSupportGeometry: true))
+        await pendingApp.refresh()
+        check(pendingApp.stageWindowController!.tasks.first?.status == "已领取，等待入库",
+              "a refused inventory registration must be visible as waiting, never as stored")
+        check(pendingApp.stageWindowController!.tasks.first?.isTerminal == false,
+              "an unregistered claim must stay on the panel (a terminal row expires after 30 seconds)")
+        check(pendingApp.stageWindowController!.tasks.first?.detail?.contains("空间就绪后会自动补做") == true,
+              "the waiting row must say it will self-heal instead of staying silent")
+        pendingApp.livingWorldContext!.state.objectStates[job.objectID] =
+            .init(generatedProp: .init(sourceWishID: job.id.uuidString), isEnabled: false)
+        await pendingApp.refresh()
+        check(pendingApp.stageWindowController!.tasks.first?.status == "已领取并入库",
+              "a real inventory record must turn the row into the stored state (the waiting state disappears)")
+        check(pendingApp.stageWindowController!.tasks.first?.isTerminal == true
+                && pendingApp.stageWindowController!.tasks.first?.detail == nil,
+              "the stored row is terminal and keeps no stale waiting reason")
+        // 资产没就绪是**另一条**事实：库存里有它 ⇒ 列表里不许消失，原因必须可读。
+        pendingApp.residentPropAssetFailures[job.objectID] = "已领取物件的本地文件缺失或校验失败，没有删除或重新生成，请检查许愿任务。"
+        await pendingApp.refresh()
+        check(pendingApp.stageWindowController!.tasks.first?.status == "已入库，资产未就绪",
+              "a stored object whose asset failed must say so instead of claiming it is ready")
+        check(pendingApp.stageWindowController!.tasks.first?.detail?.hasPrefix("资产未就绪：") == true,
+              "the asset failure reason must stay readable")
         let nextID = UUID()
         app.wishMachineCoordinator.jobs.append(.init(id: nextID, worldID: "room", residentScope: "resident", objectID: "new-item", stage: .ready))
         app.propGenerationStore.jobs = app.wishMachineCoordinator.jobs
@@ -596,10 +698,53 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
         releaseApp.residentAgentLoop!.intentPaused = true
         await releaseApp.refresh()
         let pausedTask = releaseApp.stageWindowController!.tasks.first!
-        check(pausedTask.autoContinuationPaused, "the task row carries the task-level pause as visible state")
-        check(pausedTask.detail?.contains("自主行动已停止") == true
-              && pausedTask.detail?.contains("直接下达指令仍可当轮执行") == true,
-              "the row explains that the stop only blocks autonomy, not this turn's explicit order")
+        // **新契约**（状态收敛，2026-10-01）：任务行只表达它自己的三轴状态，
+        // **不表达授权**。任务级暂停仍然是宿主读得到的内部事实（下面的
+        // `autoContinuationPaused` 断言保证它没丢），但它不再是任务行上的文案、
+        // 更不是按任务的"恢复"控件 —— 授权由全局开关横幅表达，解除只需一个动作。
+        check(pausedTask.autoContinuationPaused,
+              "the task-level pause stays an internal fact the host can still read")
+        check(pausedTask.detail?.contains("自主行动已停止") != true,
+              "the task row must not render authorization: the stop is a global banner, not a task property")
+        check(pausedTask.detail?.contains("直接下达指令仍可当轮执行") != true,
+              "the per-task reassurance text is gone from the row; it now lives in the global banner")
+        check(pausedTask.detail?.contains("恢复自动领取") != true,
+              "no per-task resume affordance or copy survives on the task row")
+        // 三轴状态本身仍然成立：这一件任务是 `.ready`（还没领取），所以归属轴停在
+        // 未领取，摆放轴还没开始 —— 它**不许**说「在库存」，那会是一句假话。
+        check(pausedTask.axes?.ownership == .unclaimed,
+              "a ready-but-unclaimed task's ownership axis is 未领取")
+        check(pausedTask.axes?.placement == .notYetPlaced,
+              "and its placement axis has not started: 未摆放, never a false 在库存")
+        // 已领取但库存里还没有它（真机 2026-10-01 `2B 白色长剑`）：归属轴前进到
+        // 「已领取」，摆放轴仍然不许说「在库存」——两条轴读的是同一份库存读回。
+        var notYetStoredJob = job
+        notYetStoredJob.stage = .claimed
+        let notYetStoredApp = App()
+        notYetStoredApp.wishMachineCoordinator.jobs = [notYetStoredJob]
+        notYetStoredApp.propGenerationStore.jobs = [notYetStoredJob]
+        await notYetStoredApp.refresh()
+        let notYetStoredTask = notYetStoredApp.stageWindowController!.tasks.first!
+        check(notYetStoredTask.axes?.ownership == .claimed,
+              "a claimed task whose artifact is not in inventory yet is 已领取, not 已入库")
+        check(notYetStoredTask.axes?.placement == .notYetPlaced,
+              "归属未到已入库时，摆放轴不许说在库存：两条轴读同一份库存读回")
+        check(notYetStoredTask.axes?.generation == .completed,
+              "a claimed task's generation axis is done: the artifact was generated and verified")
+        // 连通性事实**不再作为任务属性**：同一个作用域里有一件 `network_unavailable`
+        // 的任务时，它不会出现在任何任务行上，而是走到全局面（横幅）。
+        let connectivityApp = App()
+        var offlineJob = job
+        offlineJob.lastError = "network_unavailable"
+        connectivityApp.wishMachineCoordinator.jobs = [offlineJob]
+        connectivityApp.propGenerationStore.jobs = [offlineJob]
+        await connectivityApp.refresh()
+        check(connectivityApp.stageWindowController!.tasks.allSatisfy {
+            $0.detail?.contains("network_unavailable") != true
+        }, "connectivity facts must not be rendered as task properties on any task row")
+        check(connectivityApp.stageWindowController!.connectivityNotices.contains {
+            $0?.contains("连不上后台") == true && $0?.contains("network_unavailable") == true
+        }, "the same connectivity fact must appear once, globally, with a readable reason")
         check(releaseApp.residentAgentLoop!.snapshot.isAutonomyPausedByUser
               && releaseApp.wishMachineCoordinator.jobs[0].autoContinuationPaused == true,
               "run stop and task-level pause are two observably separate states")
@@ -789,6 +934,55 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
         failureCallbackApp.spatialStage.wishMachineOutputStatus = .failed(id: "item", message: "renderer rejected mesh")
         await failureCallbackApp.drainScheduledWork()
         check(failureCallbackApp.propGenerationStore.publishAttempts.count == attemptsBeforeSameState, "same renderer state does not republish an already forwarded fact")
+        // ── 事实通知 vs 自主授权：消息通道断掉时，本地持久事实照样送达 agent ─────
+        // 真机 2026-10-01：网络故障那段窗口里守护进程的发布与订阅都不可用，
+        // "产物已经好了"只躺在耐久事件里，agent 什么都没收到（面板却已经能写"可领取"）。
+        // 事实本该走两条通道：守护进程消息往返，以及本地持久事件直达。
+        let localFactApp = App()
+        localFactApp.wishMachineCoordinator.jobs = [job]
+        localFactApp.wishMachineCoordinator.events = [event]
+        localFactApp.propGenerationStore.jobs = [job]
+        localFactApp.spatialStage.wishMachineOutputStatus = .ready(id: "item")
+        localFactApp.propGenerationStore.publishFails = true
+        await localFactApp.refresh()
+        check(localFactApp.residentAgentLoop!.continuations.map(\.id) == ["wish." + event.id.uuidString],
+              "a ready fact reaches the resident locally even while the daemon message channel is down")
+        check(localFactApp.propGenerationStore.published.isEmpty && localFactApp.wishMachineCoordinator.published.isEmpty,
+              "local delivery never pretends the fact was published to the daemon")
+        check(localFactApp.propGenerationStore.acknowledged("agent").isEmpty
+                && localFactApp.localFactsQueued() == [event.id],
+              "local delivery is queuing once, not consumption")
+        localFactApp.propGenerationStore.publishFails = false
+        await localFactApp.settle()
+        check(localFactApp.residentAgentLoop!.continuations.count == 1
+                && localFactApp.propGenerationStore.published[event.id] != nil,
+              "the recovered daemon channel never grants a second continuation for the same durable fact")
+
+        // 同一个事实在任务级暂停下仍然要通知 agent，但**不得**变成自主授权。
+        let pausedFactApp = App()
+        var pausedFactJob = job; pausedFactJob.autoContinuationPaused = true
+        pausedFactApp.wishMachineCoordinator.jobs = [pausedFactJob]
+        pausedFactApp.wishMachineCoordinator.events = [event]
+        pausedFactApp.propGenerationStore.jobs = [pausedFactJob]
+        pausedFactApp.spatialStage.wishMachineOutputStatus = .ready(id: "item")
+        pausedFactApp.propGenerationStore.publishFails = true
+        await pausedFactApp.refresh()
+        check(pausedFactApp.residentAgentLoop!.observations.contains { $0.id == "wish." + event.id.uuidString },
+              "a paused task still gets the ready fact as a plain observation for the next human turn")
+        check(pausedFactApp.residentAgentLoop!.continuations.isEmpty,
+              "the same paused fact grants no autonomous continuation")
+
+        // 托盘没有真的显示出来之前，"产物就绪"不是既成事实：本地通道也必须守同一条判据。
+        let trayMissingApp = App()
+        trayMissingApp.wishMachineCoordinator.jobs = [job]
+        trayMissingApp.wishMachineCoordinator.events = [event]
+        trayMissingApp.propGenerationStore.jobs = [job]
+        trayMissingApp.propGenerationStore.publishFails = true
+        await trayMissingApp.refresh()
+        check(trayMissingApp.residentAgentLoop!.observations.isEmpty
+                && trayMissingApp.residentAgentLoop!.continuations.isEmpty,
+              "the local fact path obeys the same renderer gate as the published fact")
+
         print("PASS: \(count) wish-machine App runtime checks (local fixtures only)")
     }
 }

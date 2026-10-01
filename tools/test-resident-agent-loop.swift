@@ -92,6 +92,42 @@ enum PictureFailure: LocalizedError {
     check(runner.inputs.last!.events.isEmpty, "successful durable observations remain deduplicated")
     runner.finish(); await settle()
 }
+/// 取消的**成因**必须能被宿主区分：只有真实用户停止才是"用户意图"，它可以持久停用
+/// 自主续办并要求一次显式恢复；换空间、退出、自主可用性/网络回收、后台预算回收都只是
+/// 宿主回收本轮，绝不能写出一个只有人工能解除的状态。旧代码把这两件事都塞进 `onCancel`，
+/// 于是"网络抖动"最终变成许愿面板上的「[自主行动已停止] (恢复自动领取)」。
+@MainActor func checkCancellationProvenance() async throws {
+    let provenanceRunner = Runner()
+    var cancels = 0, userStops = 0
+    let provenanceClock = Clock()
+    let provenanceLoop = ResidentAgentLoop(now: { provenanceClock.date },
+        configuration: .init(minimumWakeInterval: 1, backgroundTurnsPerHour: 2),
+        run: { try await provenanceRunner.run($0) },
+        onCancel: { cancels += 1 },
+        onUserStop: { userStops += 1 })
+    provenanceLoop.setBackgroundEnabled(true)
+    provenanceLoop.tick(); await settle()
+    check(provenanceRunner.inputs.count == 1 && provenanceLoop.snapshot.isBackgroundRun,
+          "provenance fixture really started a background turn")
+    // 自主可用性/网络回收：取消本轮，但绝不是用户停止。
+    provenanceLoop.setBackgroundEnabled(false); await settle()
+    check(cancels == 1 && userStops == 0,
+          "availability/network reclamation cancels the turn without claiming a user stop")
+    check(!provenanceLoop.snapshot.isStopped && !provenanceLoop.snapshot.intentPausedByUser,
+          "availability/network reclamation never leaves a durable user-stop state")
+    // 换空间/退出走 invalidate()：同样不是用户停止。
+    provenanceLoop.invalidate(); await settle()
+    check(cancels == 2 && userStops == 0,
+          "world switch or app quit cancels the turn without claiming a user stop")
+    // 真实用户停止：两条通道都报，且只有它报用户意图。
+    let stopLoop = ResidentAgentLoop(run: { _ in "done" }, onCancel: { cancels += 1 }, onUserStop: { userStops += 1 })
+    stopLoop.stop()
+    check(userStops == 1 && stopLoop.snapshot.isStopped && stopLoop.snapshot.intentPausedByUser,
+          "only an explicit user stop reports user intent and leaves the resident stopped")
+    stopLoop.stop()
+    check(userStops == 2, "each explicit user stop is reported (host may repeat the durable pause)")
+}
+
 @MainActor func checkModelTurnStatistics() async throws {
     // ---- 每次模型轮次只计一次开始；成功、失败、取消是彼此区分的终态。
     let statsClock = Clock(), stats = Runner()
@@ -1384,6 +1420,7 @@ enum PictureFailure: LocalizedError {
             failLoop.stop()
         }
 
+        try await checkCancellationProvenance()
         try await checkModelTurnStatistics()
 
         print("\(failures == 0 ? "PASS" : "FAIL"): \(checks) resident loop checks, \(failures) failures")

@@ -5,7 +5,11 @@ let sources = ["Presence/PropGenerationClient", "Presence/PropGenerationStore", 
                "Presence/WishMachineOutputDescriptor", "Presence/WishMachineCoordinator", "Agent/ResidentWishMachineTools"]
     .map { root.appendingPathComponent("apps/macos/Sources/GMGNRadio/\($0).swift") }
     + [root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/PropTaskDaemonClient.swift"),
-       root.appendingPathComponent("tools/fixtures/WishMachineDaemonFixture.swift")]
+       root.appendingPathComponent("tools/fixtures/WishMachineDaemonFixture.swift"),
+       // 连通性词汇只有**一份**：coordinator 的 `isNetworkClassSubmissionError` 现在
+       // 委托给 `ResidentConnectivityFact`，所以那份生产文件必须一起编进来 ——
+       // 是编同一份，不是在这里抄一份词汇表。
+       root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/WishMachineTaskPresentation.swift")]
 guard sources.allSatisfy({ FileManager.default.fileExists(atPath: $0.path) }) else {
     print("FAIL: wish machine coordinator and tool primitives are missing"); exit(1)
 }
@@ -17,6 +21,16 @@ guard !coordinatorSource.contains("submissionTasks"), coordinatorSource.contains
 }
 guard coordinatorSource.contains("func unpublishedEvents("), coordinatorSource.contains("func markEventPublished(") else {
     print("FAIL: wish facts cannot be durably handed to the Rust message inbox")
+    exit(1)
+}
+// 暂停的重新校验**不依赖后端健康**：它纯本地、幂等，唯一判据是"有没有用户意图证据"。
+// 后端没配好时，遗留的非用户暂停同样必须自愈，而不是继续要求人工解除。只有网络类
+// 未知提交的自动确认才需要等后端可达（它要复用幂等身份重发/确认）。
+guard let refreshStart = coordinatorSource.range(of: "func refreshPending("),
+      let localLift = coordinatorSource.range(of: "discardPausesWithoutUserIntent()", range: refreshStart.upperBound..<coordinatorSource.endIndex),
+      let healthGate = coordinatorSource.range(of: "guard healthy else", range: refreshStart.upperBound..<coordinatorSource.endIndex),
+      localLift.lowerBound < healthGate.lowerBound else {
+    print("FAIL: lifting a pause nobody asked for must run before (and independently of) the backend health gate")
     exit(1)
 }
 let program = #"""
@@ -849,6 +863,78 @@ extension WishMachineCoordinator {
         check(!(await resumeTool(lateReceiptCoordinator, grant: UUID()).handle("explicit-late-resume", lateResumeData)).isError
             && lateReceiptCoordinator.placementDelegation(worldID: "world", residentScope: "resident", objectID: lateReceiptJob.objectID)?.state == .pending,
               "only new explicit authorization restores a late-bound revoked placement")
+        // ── 定因回归：只有"用户按过停止"才是用户意图 ─────────────────────────
+        // 真机 2026-10-01：许愿任务行出现「[自主行动已停止] (恢复自动领取)」+ `network_unavailable`，
+        // 而用户从没按过停止。旧接线把这条**持久、只能人工解除**的暂停挂在了循环的
+        // 通用取消通道上（换空间/退出/自主可用性回收/网络抖动都会走），于是"网络失败"
+        // 变成了"永久暂停 + 要求人工恢复"。这里注入那条旧路径会留下的档案：有暂停、
+        // 没有任何用户意图证据，并且守护进程侧就是网络类未知提交。把它退回去就会 FAIL。
+        let legacyProps = dir.appendingPathComponent("legacy-pause-props")
+        let legacyWishes = dir.appendingPathComponent("legacy-pause-wishes")
+        let legacyStore = fixtureWishStore(directory: legacyProps, session: URLSession(configuration: config))
+        try legacyStore.configure(endpoint: URL(string: "http://127.0.0.1:8191")!, token: "fixture")
+        let legacySource = WishMachineCoordinator(store: legacyStore, directory: legacyWishes, canClaim: { _ in nil })
+        let legacyGrant = UUID()
+        try legacySource.authorize(attachments: [attachment], worldID: "world", residentScope: "resident",
+            authorizationID: legacyGrant, source: .init(author: "user", license: "internal"))
+        HTTP.state = "queued"; HTTP.loseSubmitResponse = true
+        let unknown = try await legacySource.submitSettled(requestID: "legacy-network-unknown", authorizationID: legacyGrant,
+            attachmentID: attachment.id, name: "lamp", heightMeters: 1.5, worldID: "world", residentScope: "resident")
+        check(unknown.stage == .submissionUncertain && unknown.lastError == "network_unavailable",
+              "the fixture reproduces the real daemon's network-class unknown submission")
+        HTTP.loseSubmitResponse = false
+        // 注入旧行为：持久暂停（无用户意图证据）。旧代码就是这么留下的。
+        let legacyArchiveURL = legacyWishes.appendingPathComponent("wishes.json")
+        var legacyArchive = try JSONSerialization.jsonObject(with: Data(contentsOf: legacyArchiveURL)) as! [String: Any]
+        var legacyJobs = legacyArchive["jobs"] as! [[String: Any]]
+        legacyJobs[0]["autoContinuationPaused"] = true
+        legacyJobs[0].removeValue(forKey: "autoContinuationStoppedByUser")
+        legacyArchive["jobs"] = legacyJobs
+        try JSONSerialization.data(withJSONObject: legacyArchive).write(to: legacyArchiveURL, options: .atomic)
+        let selfHealedStore = fixtureWishStore(directory: legacyProps, session: URLSession(configuration: config))
+        try selfHealedStore.configure(endpoint: URL(string: "http://127.0.0.1:8191")!, token: "fixture")
+        let selfHealed = WishMachineCoordinator(store: selfHealedStore, directory: legacyWishes, canClaim: { _ in nil })
+        check(selfHealed.jobs.first?.autoContinuationPaused == true, "the injected legacy pause is really on disk")
+        await selfHealed.refreshPending()
+        check(selfHealed.jobs.first?.autoContinuationPaused != true,
+              "a network-class unknown submission must never keep a pause only a human can clear")
+        check(selfHealed.jobs.first?.autoContinuationStoppedByUser != true,
+              "no user-intent provenance is invented while self-healing")
+        check(selfHealed.jobs.contains { $0.autoContinuationPaused == false }
+              && selfHealed.pendingEvents(worldID: "world", residentScope: "resident")
+                  .contains { $0.autoContinuationPaused == false && $0.message?.contains("不需要手动解除") == true },
+              "the automatic release is a durable, visible fact rather than a silent flag flip")
+        for _ in 0..<200 { if selfHealed.jobs.first?.lastError != "network_unavailable" { break }; await Task.yield() }
+        check(selfHealed.jobs.first?.lastError != "network_unavailable",
+              "network_unavailable disappears once the backend is healthy again")
+        // 非网络类的真实结果绝不自动重发：认证失败是**结论**，不是"未知"。
+        var blockedArchive = try JSONSerialization.jsonObject(with: Data(contentsOf: legacyArchiveURL)) as! [String: Any]
+        var blockedJobs = blockedArchive["jobs"] as! [[String: Any]]
+        blockedJobs[0]["lastError"] = "authentication_required"
+        blockedJobs[0]["stage"] = "submissionUncertain"
+        blockedArchive["jobs"] = blockedJobs
+        try JSONSerialization.data(withJSONObject: blockedArchive).write(to: legacyArchiveURL, options: .atomic)
+        let blockedStore = fixtureWishStore(directory: legacyProps, session: URLSession(configuration: config))
+        try blockedStore.configure(endpoint: URL(string: "http://127.0.0.1:8191")!, token: "fixture")
+        let blocked = WishMachineCoordinator(store: blockedStore, directory: legacyWishes, canClaim: { _ in nil })
+        let blockedSubmissions = HTTP.requests.filter { $0.url?.path == "/v1/jobs" && $0.httpMethod == "POST" }.count
+        await blocked.confirmNetworkUncertainSubmissions()
+        check(HTTP.requests.filter { $0.url?.path == "/v1/jobs" && $0.httpMethod == "POST" }.count == blockedSubmissions,
+              "a rejected or unauthenticated submission is never silently reissued")
+        // 用户**显式**停止仍然是用户意图：自愈不得替用户解除它。
+        try selfHealed.pauseContinuations(worldID: "world", residentScope: "resident")
+        check(selfHealed.discardPausesWithoutUserIntent() == 0
+              && selfHealed.jobs.first?.autoContinuationPaused == true,
+              "an explicit user stop survives automatic re-validation")
+        let stopReloaded = WishMachineCoordinator(store: selfHealedStore, directory: legacyWishes, canClaim: { _ in nil })
+        check(stopReloaded.jobs.first?.autoContinuationPaused == true
+              && stopReloaded.jobs.first?.autoContinuationStoppedByUser == true,
+              "user-intent provenance is durable across restart")
+        await stopReloaded.refreshPending()
+        check(stopReloaded.jobs.first?.autoContinuationPaused == true
+              && stopReloaded.automaticContinuationEvents(worldID: "world", residentScope: "resident").isEmpty,
+              "a real user stop still needs its own explicit release and grants no continuation")
+
         print("PASS: \(count) wish machine coordinator checks")
     }
 }

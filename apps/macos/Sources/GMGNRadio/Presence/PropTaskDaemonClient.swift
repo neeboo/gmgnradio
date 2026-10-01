@@ -56,6 +56,10 @@ struct PropTaskMessage: Codable, Equatable, Sendable, Identifiable {
     func snapshot() async throws -> PropTaskDaemonSnapshot
     func submit(id: UUID, endpoint: URL, name: String, png: Data, source: PropGenerationSource, heightMeters: Double) async throws -> PropGenerationRecord
     func submit(id: UUID, endpoint: URL, name: String, png: Data, source: PropGenerationSource, heightMeters: Double, context: PropTaskContext?) async throws -> PropGenerationRecord
+    /// 带**尺寸意图**的提交（`sizeIntent`）。老调用方只实现上面两个：默认实现忽略意图并转调
+    /// 六参版本，于是"没有意图 = 今天"这条兼容性也在协议层成立。
+    func submit(id: UUID, endpoint: URL, name: String, png: Data, source: PropGenerationSource,
+                heightMeters: Double, sizeIntent: PropSizeIntent?, context: PropTaskContext?) async throws -> PropGenerationRecord
     func retry(id: UUID) async throws -> PropGenerationRecord
     func cancel(id: UUID) async throws -> PropGenerationRecord
     func clearConfiguration()
@@ -71,6 +75,13 @@ struct PropTaskMessage: Codable, Equatable, Sendable, Identifiable {
 extension PropTaskDaemonConnecting {
     func submit(id: UUID, endpoint: URL, name: String, png: Data, source: PropGenerationSource, heightMeters: Double, context: PropTaskContext?) async throws -> PropGenerationRecord {
         try await submit(id: id, endpoint: endpoint, name: name, png: png, source: source, heightMeters: heightMeters)
+    }
+    /// 默认实现：**丢弃**尺寸意图，按老路径提交。离线替身（`WishMachineDaemonFixture` 等）
+    /// 因此继续编译、行为与今天逐字相同；只有真客户端才把意图发到线上。
+    func submit(id: UUID, endpoint: URL, name: String, png: Data, source: PropGenerationSource,
+                heightMeters: Double, sizeIntent: PropSizeIntent?, context: PropTaskContext?) async throws -> PropGenerationRecord {
+        try await submit(id: id, endpoint: endpoint, name: name, png: png, source: source,
+                         heightMeters: heightMeters, context: context)
     }
 }
 
@@ -196,13 +207,23 @@ enum PropTaskDaemonError: LocalizedError {
         try await submit(id: id, endpoint: endpoint, name: name, png: png, source: source, heightMeters: heightMeters, context: nil)
     }
     func submit(id: UUID, endpoint: URL, name: String, png: Data, source: PropGenerationSource, heightMeters: Double, context: PropTaskContext?) async throws -> PropGenerationRecord {
+        try await submit(id: id, endpoint: endpoint, name: name, png: png, source: source,
+                         heightMeters: heightMeters, sizeIntent: nil, context: context)
+    }
+    func submit(id: UUID, endpoint: URL, name: String, png: Data, source: PropGenerationSource,
+                heightMeters: Double, sizeIntent: PropSizeIntent?, context: PropTaskContext?) async throws -> PropGenerationRecord {
         struct Submit: Encodable {
             let id: UUID; let endpoint: URL; let name: String; let pngBase64: String
-            let source: PropGenerationSource; let heightMeters: Double; let context: PropTaskContext?
+            let source: PropGenerationSource; let heightMeters: Double
+            /// nil ⇒ 这个键根本不出现（合成 `Encodable` 用 `encodeIfPresent`）：
+            /// 没有尺寸意图的提交在线上与今天**逐字节相同**。
+            let sizeIntent: PropSizeIntent?
+            let context: PropTaskContext?
         }
         try await ensureConnected()
         let result: JobResult = try await request("submit", Submit(id: id, endpoint: endpoint, name: name,
-            pngBase64: png.base64EncodedString(), source: source, heightMeters: heightMeters, context: context))
+            pngBase64: png.base64EncodedString(), source: source, heightMeters: heightMeters,
+            sizeIntent: sizeIntent, context: context))
         return result.job
     }
     func retry(id: UUID) async throws -> PropGenerationRecord {

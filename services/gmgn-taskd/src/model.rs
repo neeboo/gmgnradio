@@ -8,6 +8,21 @@ pub type Result<T> = std::result::Result<T, &'static str>;
 pub const PNG_LIMIT: usize = 8 * 1024 * 1024;
 pub const MODEL_LIMIT: usize = 32 * 1024 * 1024;
 pub const FRAME_LIMIT: usize = 12 * 1024 * 1024;
+/// 碰撞代理的文件上限。代理只用来做"胶囊 × 三角形"的实时判定，它**必须**是小规模的：
+/// 4 MiB 已经远超一个几千面凸包的需要，再大就说明生成侧导出的是完整网格而不是代理。
+pub const COLLIDER_LIMIT: usize = 4 * 1024 * 1024;
+/// 碰撞代理允许声明的三角形上限。app 侧一次 `canOccupy` 要遍历代理的三角形，
+/// 所以这个数字是"性能有界"这条要求的**契约**部分：超过就拒收回执，而不是让 app 卡住。
+/// 4096 个三角形在真机上是微秒量级（实测见 `tools/test-resident-prop-collision-proxy.swift`）。
+pub const COLLIDER_TRIANGLE_LIMIT: u64 = 4096;
+/// 允许的代理格式。两个都是 GLB（app 用同一个 `GLBColliderDecoder` 解），区别在导出方式：
+/// `glb-hull` = 凸包，`glb-decimated` = 降面到目标面数。这一位进审计，也告诉 app 该代理
+/// 是否**保证凸**（凸包可以用凸特有的快速路径）。
+pub const COLLISION_FORMATS: [&str; 2] = ["glb-hull", "glb-decimated"];
+/// 权威尺寸只接受米。世界本身就是米，收别的单位就必须在 app 里做换算，那是第二处口径。
+pub const AUTHORITATIVE_SIZE_UNITS: &str = "m";
+pub const UP_AXES: [&str; 2] = ["+Y", "-Y"];
+pub const FORWARD_AXES: [&str; 4] = ["+Z", "-Z", "+X", "-X"];
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Source {
@@ -23,6 +38,59 @@ pub struct Context {
     pub resident_scope: String,
 }
 
+/// 尺寸意图允许的米数。与 `height_meters` **同一条范围**：两个数字都能过关却互相矛盾，
+/// 才是真正会伤到用户的那种契约。
+pub const SIZE_INTENT_MIN_METERS: f64 = 0.01;
+pub const SIZE_INTENT_MAX_METERS: f64 = 3.0;
+
+/// 「这件东西该按**哪根轴**做成**多少米**」——提交时就说清楚，而不是让 app 事后从网格猜。
+///
+/// 为什么需要它（真机 2026-10-01「2B 白色长剑（外形摆件）」）：`height_meters` 只有一根
+/// 轴（高度），而生成回来的网格**不保证立着** —— 那把剑实测 1.005 × 0.133 × 0.057 m，
+/// Y 那 0.133 m 是**厚度**，请求高度 1.1 m 于是被算成"厚度 1.1 m"，场景里变成
+/// 8.28 × 1.10 × 0.47 m（比 7 × 8 × 3.2 m 的舱室还长）⇒ 没有任何落点能过摆放判定
+/// ⇒ 被拒、退回库存。用户说的是"一把 1.1 米的剑"，他要的是**最长边 1.1 m**；
+/// 这句话必须在提交那一刻随任务落盘，事后再靠界面自动缩放只是兜底。
+///
+/// `axis == "height"` 时本字段与 `height_meters` **语义完全相同**（数值也必须相同，
+/// 由 `Submit::validate` 强制）—— 于是"高 1.1 米"这种要求仍然表达得出来，
+/// 而且不可能出现两份互相矛盾的高度。
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SizeIntent {
+    pub axis: SizeIntentAxis,
+    pub meters: f64,
+    /// 谁说的这个尺寸：用户原话（`user`）／服务建议（`suggested`）／兜底默认（`default`）。
+    /// 没有默认值：缺了就是 `invalid_size_intent`，绝不替调用方编一个出处。
+    pub source: SizeIntentSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SizeIntentAxis {
+    Longest,
+    Height,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SizeIntentSource {
+    User,
+    Suggested,
+    Default,
+}
+
+impl SizeIntent {
+    pub fn validate(&self) -> Result<()> {
+        if !self.meters.is_finite()
+            || !(SIZE_INTENT_MIN_METERS..=SIZE_INTENT_MAX_METERS).contains(&self.meters)
+        {
+            return Err("invalid_size_intent");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Job {
@@ -32,13 +100,25 @@ pub struct Job {
     pub image_path: String,
     #[serde(rename = "imageSHA256")]
     pub image_sha256: String,
+    /// 生成请求的高度（**老路径，语义一位不变**）。远端服务收到的还是这一个数字。
     pub height_meters: f64,
+    /// 提交时声明的尺寸意图。**可选且纯增量**：缺失时整个键都不序列化（旧客户端看到的
+    /// job JSON 与今天逐字节一致），`effectiveSize` 于是仍然只按 `height_meters` 推断。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_intent: Option<SizeIntent>,
     pub source: Source,
     pub idempotency_key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receipt: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_model_path: Option<String>,
+    /// 已核验并落盘的碰撞代理路径（`<id>.collider.glb`）。
+    ///
+    /// **可选且纯增量**：回执里没有碰撞字段时这一位恒为 `None`，序列化时整个键都不出现，
+    /// 于是旧客户端看到的 job JSON 与今天逐字节一致。出现它只说明"生成侧给了代理，
+    /// 而且我们已经把它核验并落盘" —— app 侧据此用代理而不是 yaw 盒子做碰撞。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_collision_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     #[serde(default = "interrupted")]
@@ -159,6 +239,15 @@ pub struct Submit {
     pub png_base64: String,
     pub source: Source,
     pub height_meters: f64,
+    /// 尺寸意图（`sizeIntent`，兼容别名 `size_intent`）。**可选且纯增量**：老调用方不带它，
+    /// 行为与今天逐字节一致（app 仍按 `height_meters` 自动推断）。
+    ///
+    /// 这里刻意收成 `Option<Value>` 而不是直接 `Option<SizeIntent>`：`Submit` 的
+    /// `deny_unknown_fields` + serde 解析失败只会得到一个笼统的 `invalid_input`，而
+    /// "轴名/出处/米数非法"必须给出**明确的错误码**（`invalid_size_intent`），
+    /// 所以解析放在 `validate()` 里，与其它字段校验同一条路。
+    #[serde(default, rename = "sizeIntent", alias = "size_intent")]
+    pub size_intent: Option<Value>,
     #[serde(default)]
     pub context: Option<Context>,
     /// Additive: callers that predate the field simply omit it.
@@ -262,16 +351,44 @@ impl Submit {
                 .iter()
                 .any(|s| s.trim().is_empty() || s.chars().count() > 200)
             || !self.height_meters.is_finite()
-            || !(0.01..=3.0).contains(&self.height_meters)
+            || !(SIZE_INTENT_MIN_METERS..=SIZE_INTENT_MAX_METERS).contains(&self.height_meters)
             || self.png_base64.len() > PNG_LIMIT.div_ceil(3) * 4
         {
             return Err("invalid_input");
+        }
+        if let Some(intent) = self.parsed_size_intent()? {
+            intent.validate()?;
+            // `axis == "height"` 时两根轴说的是同一件事 ⇒ 两个数字必须相同。
+            // 不相同就拒绝（`size_intent_conflict`），而不是让 app 自己挑一个信 ——
+            // 那就是两份真相，而"用户看到太大/消失"正是从两份真相长出来的。
+            if intent.axis == SizeIntentAxis::Height && intent.meters != self.height_meters {
+                return Err("size_intent_conflict");
+            }
         }
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&self.png_base64)
             .map_err(|_| "invalid_png")?;
         validate_png(&bytes)?;
         Ok(bytes)
+    }
+
+    /// 把提交上来的 `sizeIntent` 解析成强类型。缺失/null ⇒ `Ok(None)`（老路径）。
+    ///
+    /// 类型非法（不是对象、轴名不是 `longest`/`height`、出处不是 `user`/`suggested`/
+    /// `default`、米数不是数、多了未知键）⇒ `Err("invalid_size_intent")`，
+    /// **明确错误码，不静默**：静默按"没有意图"处理，就等于又回到了"让 app 猜这把剑该多长"。
+    ///
+    /// 必须显式要求 JSON 对象：serde 的派生 `Deserialize` 对结构体同时接受"映射"和
+    /// "序列"两种输入，`["longest", 1.1, "user"]` 也会被它按字段顺序吃下去 ——
+    /// 那条路绕过了 `deny_unknown_fields` 想守的边界，不是本契约的形式。
+    pub fn parsed_size_intent(&self) -> Result<Option<SizeIntent>> {
+        match &self.size_intent {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) if value.is_object() => serde_json::from_value(value.clone())
+                .map(Some)
+                .map_err(|_| "invalid_size_intent"),
+            Some(_) => Err("invalid_size_intent"),
+        }
     }
 }
 
@@ -372,8 +489,143 @@ pub fn receipt(value: &Value, job: &Job) -> Result<()> {
         if !i["meters_per_model_unit"].is_null() && i["meters_per_model_unit"].as_f64().is_none() {
             return Err("invalid_response");
         }
+        // 可选的碰撞代理与权威尺寸。**整块缺失 ⇒ 与今天逐字节一致**（旧服务照常工作）；
+        // 出现时做严格的形状+类型校验，任何不合法都返回**专门的错误码**，绝不静默忽略
+        // —— 静默忽略会让碰撞形状在用户不知情的情况下从代理退回 yaw 盒子。
+        collision_descriptor(r)?;
+        authoritative_size(r)?;
     }
     Ok(())
+}
+
+/// 生成侧给出的**碰撞代理**描述。回执 `result` 上的五个平铺字段。
+///
+/// 五个字段**要么全在、要么全缺**。部分出现（例如有 `collision_url` 但没
+/// `collision_sha256`）是自相矛盾的描述：没有摘要就无法核验下载到的字节，接受它等于
+/// 允许一个无法验证的碰撞形状进世界。所以这种情况报 `invalid_collision_descriptor`。
+///
+/// 类型不合法也报同一个码；`null` 与"键不存在"等价，都算缺失。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CollisionDescriptor {
+    pub url: String,
+    pub format: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub triangles: u64,
+}
+
+const COLLISION_KEYS: [&str; 5] = [
+    "collision_url",
+    "collision_format",
+    "collision_sha256",
+    "collision_bytes",
+    "collision_triangles",
+];
+
+pub fn collision_descriptor(result: &Value) -> Result<Option<CollisionDescriptor>> {
+    let present = COLLISION_KEYS
+        .iter()
+        .filter(|key| !result[**key].is_null())
+        .count();
+    if present == 0 {
+        return Ok(None);
+    }
+    if present != COLLISION_KEYS.len() {
+        return Err("invalid_collision_descriptor");
+    }
+    let url = result["collision_url"]
+        .as_str()
+        .ok_or("invalid_collision_descriptor")?;
+    let format = result["collision_format"]
+        .as_str()
+        .ok_or("invalid_collision_descriptor")?;
+    let sha256 = result["collision_sha256"]
+        .as_str()
+        .ok_or("invalid_collision_descriptor")?;
+    let bytes = result["collision_bytes"]
+        .as_u64()
+        .ok_or("invalid_collision_descriptor")?;
+    let triangles = result["collision_triangles"]
+        .as_u64()
+        .ok_or("invalid_collision_descriptor")?;
+    if !COLLISION_FORMATS.contains(&format)
+        || sha256.len() != 64
+        || !sha256.bytes().all(|c| c.is_ascii_hexdigit())
+        || !(1..=COLLIDER_LIMIT as u64).contains(&bytes)
+        || !(1..=COLLIDER_TRIANGLE_LIMIT).contains(&triangles)
+    {
+        return Err("invalid_collision_descriptor");
+    }
+    Ok(Some(CollisionDescriptor {
+        url: url.to_owned(),
+        format: format.to_owned(),
+        sha256: sha256.to_owned(),
+        bytes,
+        triangles,
+    }))
+}
+
+/// 生成侧给出的**权威尺寸与朝向**（回执 `result.authoritative_size`）。
+///
+/// 存在的意义：app 今天从真实网格量 `size`/`sourceHeight`，于是**换一个生成后端就换一套
+/// 轮廓、也就换一套碰撞**。有了这一块，尺寸由生成侧一次说清，app 不再量。
+/// 同样是可选的：整块缺失 ⇒ app 继续量（今天的行为）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuthoritativeSize {
+    pub dimensions: [f64; 3],
+    pub units: String,
+    pub up_axis: String,
+    pub forward_axis: String,
+}
+
+pub fn authoritative_size(result: &Value) -> Result<Option<AuthoritativeSize>> {
+    let value = &result["authoritative_size"];
+    if value.is_null() {
+        return Ok(None);
+    }
+    let object = value.as_object().ok_or("invalid_authoritative_size")?;
+    // 多一个键就是"我们不知道它想要什么"——`deny_unknown_fields` 的等价物。
+    if object.len() != 4
+        || !["dimensions", "units", "up_axis", "forward_axis"]
+            .iter()
+            .all(|key| object.contains_key(*key))
+    {
+        return Err("invalid_authoritative_size");
+    }
+    let dimensions: Vec<f64> = value["dimensions"]
+        .as_array()
+        .filter(|a| a.len() == 3)
+        .and_then(|a| a.iter().map(|v| v.as_f64()).collect())
+        .ok_or("invalid_authoritative_size")?;
+    let units = value["units"]
+        .as_str()
+        .ok_or("invalid_authoritative_size")?;
+    let up_axis = value["up_axis"]
+        .as_str()
+        .ok_or("invalid_authoritative_size")?;
+    let forward_axis = value["forward_axis"]
+        .as_str()
+        .ok_or("invalid_authoritative_size")?;
+    if units != AUTHORITATIVE_SIZE_UNITS
+        || !UP_AXES.contains(&up_axis)
+        || !FORWARD_AXES.contains(&forward_axis)
+        || dimensions
+            .iter()
+            .any(|d| !d.is_finite() || *d <= 0.0 || *d > 100.0)
+    {
+        return Err("invalid_authoritative_size");
+    }
+    Ok(Some(AuthoritativeSize {
+        dimensions: [dimensions[0], dimensions[1], dimensions[2]],
+        units: units.to_owned(),
+        up_axis: up_axis.to_owned(),
+        forward_axis: forward_axis.to_owned(),
+    }))
+}
+
+/// 回执是否**声明**了碰撞代理。调用方用它决定"要不要去下载代理"。
+pub fn declares_collision(receipt: &Value) -> Result<bool> {
+    Ok(collision_descriptor(&receipt["result"])?.is_some())
 }
 
 fn validate_bounds(value: &Value) -> Result<()> {
@@ -400,22 +652,46 @@ fn validate_bounds(value: &Value) -> Result<()> {
     Ok(())
 }
 
-pub fn validate_glb(bytes: &[u8], receipt: &Value) -> Result<()> {
-    if bytes.len() > MODEL_LIMIT {
-        return Err("model_too_large");
+/// GLB 容器级核验（magic / version / 声明长度）。`oversized`/`invalid` 由调用方给出，
+/// 于是模型与碰撞代理各自保留**原来那套错误码**，不会因为共用一行而改变分类。
+fn glb_container(bytes: &[u8], limit: usize, oversized: &'static str, invalid: &'static str) -> Result<()> {
+    if bytes.len() > limit {
+        return Err(oversized);
     }
     if bytes.len() < 20
         || &bytes[..4] != b"glTF"
         || u32::from_le_bytes(bytes[4..8].try_into().unwrap()) != 2
         || u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize != bytes.len()
     {
-        return Err("invalid_glb");
+        return Err(invalid);
     }
+    Ok(())
+}
+
+pub fn validate_glb(bytes: &[u8], receipt: &Value) -> Result<()> {
+    glb_container(bytes, MODEL_LIMIT, "model_too_large", "invalid_glb")?;
     let inspection = &receipt["result"]["inspection"];
     if inspection["bytes"].as_u64() != Some(bytes.len() as u64)
         || inspection["sha256"].as_str() != Some(digest(bytes).as_str())
     {
         return Err("model_integrity_failed");
+    }
+    Ok(())
+}
+
+/// 碰撞代理的核验：**和模型同一条口径**（容器 + 声明 bytes + sha256），只是上限与
+/// 审计字段换成 `collision_*` 那一组。回执没声明代理时这里根本不会被调用。
+pub fn validate_collider_glb(bytes: &[u8], receipt: &Value) -> Result<()> {
+    let collision = collision_descriptor(&receipt["result"])?
+        .ok_or("missing_collision_descriptor")?;
+    glb_container(
+        bytes,
+        COLLIDER_LIMIT,
+        "collision_too_large",
+        "invalid_collision_glb",
+    )?;
+    if collision.bytes != bytes.len() as u64 || collision.sha256 != digest(bytes) {
+        return Err("collision_integrity_failed");
     }
     Ok(())
 }
@@ -451,6 +727,7 @@ mod tests {
             image_path: "/tmp/test.png".into(),
             image_sha256: "0".repeat(64),
             height_meters: 0.5,
+            size_intent: None,
             source: Source {
                 author: "test".into(),
                 license: "CC0".into(),
@@ -458,6 +735,7 @@ mod tests {
             idempotency_key: "unused".into(),
             receipt: None,
             local_model_path: None,
+            local_collision_path: None,
             last_error: None,
             backend_stage: "running".into(),
             cancel_requested: false,
@@ -587,5 +865,407 @@ mod tests {
             broken.pointer_mut(parent).unwrap()[key] = invalid;
             assert!(receipt(&broken, &job).is_err(), "accepted {pointer}");
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // 碰撞代理 / 权威尺寸：**缺失必须逐字节不变、存在必须被采纳、非法必须报专门错误**
+    // ---------------------------------------------------------------------
+
+    /// 录制下来的那份回执（`tests/fixtures/remote_http.json`，DGX 服务真实形状：
+    /// `workflow_profile` 还是 `dgx-mesh-v3`，**没有任何碰撞字段**）。
+    fn recorded() -> Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/remote_http.json");
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+    }
+
+    fn recorded_job(recorded: &Value) -> Job {
+        let (mut job, _) = fixture();
+        job.name = recorded["job"]["name"].as_str().unwrap().to_owned();
+        job.height_meters = recorded["job"]["height_meters"].as_f64().unwrap();
+        job.source = Source {
+            author: recorded["job"]["source"]["author"].as_str().unwrap().into(),
+            license: recorded["job"]["source"]["license"].as_str().unwrap().into(),
+        };
+        job
+    }
+
+    fn collision_block() -> Value {
+        json!({
+            "collision_url": "/v1/jobs/0123456789abcdef0123456789abcdef/collider.glb",
+            "collision_format": "glb-hull",
+            "collision_sha256": "b".repeat(64),
+            "collision_bytes": 1024,
+            "collision_triangles": 512,
+        })
+    }
+
+    fn size_block() -> Value {
+        json!({
+            "dimensions": [0.35069498, 0.42, 0.56627256],
+            "units": "m",
+            "up_axis": "+Y",
+            "forward_axis": "-Z",
+        })
+    }
+
+    /// 断言 1：**字段缺失 ⇒ 与今天逐字节一致**（用录制 fixture 锁住）。
+    #[test]
+    fn a_receipt_without_collision_fields_behaves_exactly_as_before() {
+        let recorded = recorded();
+        let job = recorded_job(&recorded);
+        let value = recorded["receipt"].clone();
+        // 录制的回执照常通过今天那套校验。
+        assert_eq!(receipt(&value, &job), Ok(()));
+        // 两处可选块都判为"不存在"，而不是"存在但空"。
+        assert_eq!(collision_descriptor(&value["result"]), Ok(None));
+        assert_eq!(authoritative_size(&value["result"]), Ok(None));
+        assert_eq!(declares_collision(&value), Ok(false));
+        // job 的序列化里**不得**出现新键：旧客户端读到的 JSON 与改造前逐字节一致。
+        assert!(!serde_json::to_string(&job).unwrap().contains("localCollisionPath"));
+        assert!(
+            !serde_json::to_string(&value)
+                .unwrap()
+                .contains("collision_url")
+        );
+        // 旧 job JSON（没有该键）仍然反序列化成 None —— 缺省就是"没有代理"。
+        let restored: Job = serde_json::from_str(&serde_json::to_string(&job).unwrap()).unwrap();
+        assert_eq!(restored.local_collision_path, None);
+        // 显式 null 与"键不存在"等价。
+        let mut nulled = value.clone();
+        nulled["result"]["collision_url"] = Value::Null;
+        assert_eq!(collision_descriptor(&nulled["result"]), Ok(None));
+        assert_eq!(receipt(&nulled, &job), Ok(()));
+    }
+
+    /// 断言 2：**字段存在 ⇒ 被采纳**，并且能被独立审计（不是只看有没有报错）。
+    #[test]
+    fn a_receipt_with_a_collision_proxy_and_authoritative_size_is_adopted() {
+        let recorded = recorded();
+        let job = recorded_job(&recorded);
+        let mut value = recorded["receipt"].clone();
+        for (key, item) in collision_block().as_object().unwrap() {
+            value["result"][key] = item.clone();
+        }
+        value["result"]["authoritative_size"] = size_block();
+        assert_eq!(receipt(&value, &job), Ok(()));
+        assert_eq!(declares_collision(&value), Ok(true));
+        let parsed = collision_descriptor(&value["result"]).unwrap().unwrap();
+        assert_eq!(
+            parsed,
+            CollisionDescriptor {
+                url: "/v1/jobs/0123456789abcdef0123456789abcdef/collider.glb".into(),
+                format: "glb-hull".into(),
+                sha256: "b".repeat(64),
+                bytes: 1024,
+                triangles: 512,
+            }
+        );
+        let size = authoritative_size(&value["result"]).unwrap().unwrap();
+        assert_eq!(size.units, "m");
+        assert_eq!(size.up_axis, "+Y");
+        assert_eq!(size.forward_axis, "-Z");
+        assert!((size.dimensions[1] - 0.42).abs() < 1e-9);
+        // 两个格式都要接受；`glb-decimated` 与 `glb-hull` 的差别只在审计语义。
+        value["result"]["collision_format"] = json!("glb-decimated");
+        assert_eq!(receipt(&value, &job), Ok(()));
+    }
+
+    /// 断言 3：**字段类型/形状非法 ⇒ 专门的错误码，绝不静默忽略**。
+    #[test]
+    fn a_malformed_collision_block_is_a_named_error_and_never_ignored() {
+        let recorded = recorded();
+        let job = recorded_job(&recorded);
+        // 部分出现（有 url 没 sha256）是自相矛盾的描述：必须报错，不能当成"没有代理"。
+        for missing in COLLISION_KEYS {
+            let mut value = recorded["receipt"].clone();
+            for (key, item) in collision_block().as_object().unwrap() {
+                value["result"][key] = item.clone();
+            }
+            value["result"][missing] = Value::Null;
+            assert_eq!(
+                receipt(&value, &job),
+                Err("invalid_collision_descriptor"),
+                "缺少 {missing} 却被接受了"
+            );
+        }
+        // 类型错：数字写成字符串、字符串写成数字、数组长度不对、摘要不是 64 位十六进制、
+        // 字节数超上限、三角形数超上限、格式不在白名单里。
+        for (key, invalid) in [
+            ("collision_url", json!(17)),
+            ("collision_format", json!(0)),
+            ("collision_sha256", json!(12345)),
+            ("collision_bytes", json!("1024")),
+            ("collision_triangles", json!("512")),
+            ("collision_format", json!("obj-mesh")),
+            ("collision_sha256", json!("b".repeat(63))),
+            ("collision_sha256", json!("z".repeat(64))),
+            ("collision_bytes", json!(0)),
+            ("collision_bytes", json!(COLLIDER_LIMIT as u64 + 1)),
+            ("collision_triangles", json!(0)),
+            ("collision_triangles", json!(COLLIDER_TRIANGLE_LIMIT + 1)),
+        ] {
+            let mut value = recorded["receipt"].clone();
+            for (entry, item) in collision_block().as_object().unwrap() {
+                value["result"][entry] = item.clone();
+            }
+            value["result"][key] = invalid.clone();
+            let outcome = receipt(&value, &job);
+            assert!(
+                outcome.is_err(),
+                "{key} = {invalid} 被静默接受了（结果 {outcome:?}）"
+            );
+            assert_eq!(
+                outcome,
+                Err("invalid_collision_descriptor"),
+                "{key} = {invalid} 的错误码不对"
+            );
+        }
+    }
+
+    /// 断言 3b：权威尺寸的**单位、轴向、数量、有限性**都必须是明确的。
+    #[test]
+    fn a_malformed_authoritative_size_is_a_named_error() {
+        let recorded = recorded();
+        let job = recorded_job(&recorded);
+        let cases: [(&str, Value); 9] = [
+            ("units", json!("cm")),
+            ("units", json!(1)),
+            ("up_axis", json!("up")),
+            ("up_axis", json!(null)),
+            ("forward_axis", json!("-W")),
+            ("dimensions", json!([1, 2])),
+            ("dimensions", json!([1, 2, "3"])),
+            ("dimensions", json!([1, 0, 3])),
+            ("dimensions", json!([1, 2, 101])),
+        ];
+        for (key, invalid) in cases {
+            let mut value = recorded["receipt"].clone();
+            value["result"]["authoritative_size"] = size_block();
+            value["result"]["authoritative_size"][key] = invalid.clone();
+            assert_eq!(
+                receipt(&value, &job),
+                Err("invalid_authoritative_size"),
+                "authoritative_size.{key} = {invalid} 被接受了"
+            );
+        }
+        // 不是对象、多一个未知键、少一个键都拒绝。
+        for invalid in [
+            json!("m"),
+            json!([]),
+            json!({"dimensions":[1,2,3],"units":"m","up_axis":"+Y","forward_axis":"-Z","extra":1}),
+            json!({"dimensions":[1,2,3],"units":"m","up_axis":"+Y"}),
+        ] {
+            let mut value = recorded["receipt"].clone();
+            value["result"]["authoritative_size"] = invalid.clone();
+            assert_eq!(
+                receipt(&value, &job),
+                Err("invalid_authoritative_size"),
+                "authoritative_size = {invalid} 被接受了"
+            );
+        }
+    }
+
+    /// 断言 4：代理的字节核验与模型**同一条口径**（容器 + 声明 bytes + sha256）。
+    #[test]
+    fn collider_bytes_are_verified_against_the_declared_digest() {
+        let recorded = recorded();
+        let glb = base64::engine::general_purpose::STANDARD
+            .decode(recorded["glb_base64"].as_str().unwrap())
+            .unwrap();
+        let mut value = recorded["receipt"].clone();
+        let mut block = collision_block();
+        block["collision_bytes"] = json!(glb.len() as u64);
+        block["collision_sha256"] = json!(digest(&glb));
+        for (key, item) in block.as_object().unwrap() {
+            value["result"][key] = item.clone();
+        }
+        assert_eq!(validate_collider_glb(&glb, &value), Ok(()));
+        // 少一个字节 / 摘要不符 ⇒ 完整性失败。
+        assert_eq!(
+            validate_collider_glb(&glb[..glb.len() - 1], &value),
+            Err("invalid_collision_glb")
+        );
+        let mut wrong = value.clone();
+        wrong["result"]["collision_sha256"] = json!("c".repeat(64));
+        assert_eq!(
+            validate_collider_glb(&glb, &wrong),
+            Err("collision_integrity_failed")
+        );
+        // 非 GLB 且长度对不上 ⇒ 容器级失败。
+        let mut short = value.clone();
+        short["result"]["collision_bytes"] = json!(20);
+        assert_eq!(
+            validate_collider_glb(&vec![0u8; 20], &short),
+            Err("invalid_collision_glb")
+        );
+        // 没有声明代理时不许"顺便"核验一个代理 —— 那会让调用方以为存在代理。
+        let plain = recorded["receipt"].clone();
+        assert_eq!(
+            validate_collider_glb(&glb, &plain),
+            Err("missing_collision_descriptor")
+        );
+    }
+
+    fn submission_with_intent(intent: Value, height_meters: f64) -> Submit {
+        let mut submit = Submit {
+            id: uuid::Uuid::new_v4().to_string(),
+            endpoint: "https://primary.invalid".into(),
+            name: "sword".into(),
+            png_base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=".into(),
+            source: Source { author: "resident".into(), license: "CC0-1.0".into() },
+            height_meters,
+            size_intent: Some(intent),
+            context: None,
+            source_wish_id: None,
+            generation_profile: None,
+        };
+        submit.validate().unwrap();
+        submit
+    }
+
+    /// 断言 1：`size_intent` 的词汇就是契约里那五个字面量，而且**随任务可回读**。
+    #[test]
+    fn size_intent_round_trips_with_the_contract_vocabulary() {
+        assert_eq!(serde_json::to_value(SizeIntentAxis::Longest).unwrap(), json!("longest"));
+        assert_eq!(serde_json::to_value(SizeIntentAxis::Height).unwrap(), json!("height"));
+        assert_eq!(serde_json::to_value(SizeIntentSource::User).unwrap(), json!("user"));
+        assert_eq!(serde_json::to_value(SizeIntentSource::Suggested).unwrap(), json!("suggested"));
+        assert_eq!(serde_json::to_value(SizeIntentSource::Default).unwrap(), json!("default"));
+
+        // 用户说的"一把 1.1 米的剑" = 最长边 1.1 m。
+        let submit = submission_with_intent(
+            json!({"axis": "longest", "meters": 1.1, "source": "user"}),
+            1.1,
+        );
+        assert_eq!(
+            submit.parsed_size_intent().unwrap(),
+            Some(SizeIntent {
+                axis: SizeIntentAxis::Longest,
+                meters: 1.1,
+                source: SizeIntentSource::User,
+            })
+        );
+        // 兼容别名：snake_case 也认（契约文档里写作 size_intent）。
+        let value: Submit = serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "endpoint": "https://primary.invalid",
+            "name": "sword",
+            "pngBase64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=",
+            "source": {"author": "resident", "license": "CC0-1.0"},
+            "heightMeters": 0.35,
+            "size_intent": {"axis": "height", "meters": 0.35, "source": "user"},
+        }))
+        .unwrap();
+        assert_eq!(
+            value.parsed_size_intent().unwrap().unwrap().axis,
+            SizeIntentAxis::Height
+        );
+    }
+
+    /// 断言 2（兼容）：**缺失**意图时序列化出去与今天逐字节一致 —— 键根本不出现。
+    #[test]
+    fn absent_size_intent_is_byte_identical_to_today() {
+        let submit = Submit {
+            id: uuid::Uuid::new_v4().to_string(),
+            endpoint: "https://primary.invalid".into(),
+            name: "cup".into(),
+            png_base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=".into(),
+            source: Source { author: "resident".into(), license: "CC0-1.0".into() },
+            height_meters: 0.5,
+            size_intent: None,
+            context: None,
+            source_wish_id: None,
+            generation_profile: None,
+        };
+        assert_eq!(submit.parsed_size_intent(), Ok(None));
+        // 显式 null 与缺失同义（老客户端不会发它，新客户端也可能发 null）。
+        let mut null_intent = Submit {
+            size_intent: Some(Value::Null),
+            ..serde_json::from_value(json!({
+                "id": uuid::Uuid::new_v4().to_string(),
+                "endpoint": "https://primary.invalid",
+                "name": "cup",
+                "pngBase64": "a",
+                "source": {"author": "resident", "license": "CC0-1.0"},
+                "heightMeters": 0.5,
+            })).unwrap()
+        };
+        assert_eq!(null_intent.parsed_size_intent(), Ok(None));
+        let job = Job {
+            id: "A".repeat(32),
+            name: "cup".into(),
+            endpoint: "https://primary.invalid".into(),
+            image_path: "/tmp/cup.png".into(),
+            image_sha256: "0".repeat(64),
+            height_meters: 0.5,
+            size_intent: None,
+            source: Source { author: "resident".into(), license: "CC0-1.0".into() },
+            idempotency_key: "A".repeat(32),
+            receipt: None,
+            local_model_path: None,
+            local_collision_path: None,
+            last_error: None,
+            backend_stage: "queued".into(),
+            cancel_requested: false,
+            context: None,
+            source_wish_id: None,
+            workflow_profile: None,
+        };
+        let text = serde_json::to_string(&job).unwrap();
+        assert!(!text.contains("sizeIntent") && !text.contains("size_intent"), "{text}");
+    }
+
+    /// 断言 4：非法的意图**明确拒绝**，不静默按"没有意图"处理。
+    #[test]
+    fn illegal_size_intent_is_rejected_with_its_own_code() {
+        for (intent, expected) in [
+            (json!({"axis": "width", "meters": 1.1, "source": "user"}), "invalid_size_intent"),
+            (json!({"axis": "longest", "meters": 1.1, "source": "guess"}), "invalid_size_intent"),
+            (json!({"axis": "longest", "meters": -1.0, "source": "user"}), "invalid_size_intent"),
+            (json!({"axis": "longest", "meters": 9.0, "source": "user"}), "invalid_size_intent"),
+            (json!({"axis": "longest", "meters": 1.1}), "invalid_size_intent"),
+            (json!({"axis": "longest", "meters": 1.1, "source": "user", "unit": "m"}), "invalid_size_intent"),
+            (json!(["longest", 1.1, "user"]), "invalid_size_intent"),
+        ] {
+            let mut submit = Submit {
+                id: uuid::Uuid::new_v4().to_string(),
+                endpoint: "https://primary.invalid".into(),
+                name: "sword".into(),
+                png_base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=".into(),
+                source: Source { author: "resident".into(), license: "CC0-1.0".into() },
+                height_meters: 1.1,
+                size_intent: Some(intent.clone()),
+                context: None,
+                source_wish_id: None,
+                generation_profile: None,
+            };
+            assert_eq!(submit.validate(), Err(expected), "size_intent = {intent} 被接受了");
+        }
+    }
+
+    /// 「高 1.1 米」与 `height_meters` 是同一件事：数值不一致就拒绝，不可能留下两份高度。
+    #[test]
+    fn height_intent_must_agree_with_height_meters() {
+        let mut submit = Submit {
+            id: uuid::Uuid::new_v4().to_string(),
+            endpoint: "https://primary.invalid".into(),
+            name: "machine".into(),
+            png_base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=".into(),
+            source: Source { author: "resident".into(), license: "CC0-1.0".into() },
+            height_meters: 0.35,
+            size_intent: Some(json!({"axis": "height", "meters": 0.5, "source": "user"})),
+            context: None,
+            source_wish_id: None,
+            generation_profile: None,
+        };
+        assert_eq!(submit.validate(), Err("size_intent_conflict"));
+        // 一致就通过（"高 35 厘米的咖啡机"）。
+        submit.height_meters = 0.5;
+        submit.validate().unwrap();
+        assert_eq!(
+            submit.parsed_size_intent().unwrap().unwrap().axis,
+            SizeIntentAxis::Height
+        );
     }
 }

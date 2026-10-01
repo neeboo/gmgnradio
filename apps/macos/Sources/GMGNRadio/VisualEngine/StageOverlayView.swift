@@ -121,74 +121,155 @@ struct WishMachineTaskStatusView: View {
                 guard let expiry = task.promptExpiresAt else { return true }
                 return timeline.date < expiry
             }
-            if !visible.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("许愿任务")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.55))
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 9) {
-                            ForEach(visible) { task in
-                                VStack(alignment: .leading, spacing: 3) {
-                                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                                        Image(systemName: task.isTerminal ? "circle.fill" : "clock")
-                                            .font(.system(size: 8))
-                                        Text(task.title).lineLimit(1)
-                                        Spacer(minLength: 2)
-                                        Text(task.status).foregroundStyle(.white.opacity(0.75)).lineLimit(1)
-                                    }
-                                    .font(.system(size: 11, weight: .medium))
-                                    // 停止不是看不见的状态：任务行必须自己说"自主行动
-                                    // 已停止"，并给一个动作就能解除，而不是等用户猜一句
-                                    // 能让居民调用恢复工具的话。紧凑行（Live Cam）只留
-                                    // 状态文字，完整面板给出恢复控件。
-                                    if task.autoContinuationPaused {
-                                        if compact {
-                                            Text("自主行动已停止")
-                                                .font(.system(size: 9))
-                                                .foregroundStyle(.orange.opacity(0.95))
-                                                .lineLimit(1)
-                                        } else {
-                                            HStack(spacing: 6) {
-                                                Text("自主行动已停止")
-                                                    .font(.system(size: 10))
-                                                    .foregroundStyle(.orange.opacity(0.95))
-                                                    .lineLimit(1)
-                                                Button("恢复自动领取") {
-                                                    state.onResumeAutomaticContinuation?(task.id)
-                                                }
-                                                .buttonStyle(.plain)
-                                                .font(.system(size: 10, weight: .medium))
-                                                .foregroundStyle(.white)
-                                                .padding(.horizontal, 6)
-                                                .padding(.vertical, 2)
-                                                .background(Color.white.opacity(0.16), in: Capsule())
-                                                .accessibilityIdentifier("resident.wish-task.\(task.id.uuidString).resume")
-                                                .disabled(state.onResumeAutomaticContinuation == nil)
+            VStack(alignment: .leading, spacing: 6) {
+                connectivityBanner
+                autonomyBanner
+                if !visible.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("许愿任务")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.55))
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 9) {
+                                ForEach(visible) { task in
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                            Image(systemName: task.isTerminal ? "circle.fill" : "clock")
+                                                .font(.system(size: 8))
+                                            Text(task.title).lineLimit(1)
+                                            Spacer(minLength: 2)
+                                            Text(task.status).foregroundStyle(.white.opacity(0.75)).lineLimit(1)
+                                        }
+                                        .font(.system(size: 11, weight: .medium))
+                                        // **任务行只表达它自己的三轴状态（生成/归属/摆放）。**
+                                        // 授权在全局开关（autonomyBanner）上，连通性在全局横幅
+                                        // （connectivityBanner）上；任务行上不存在任何按任务的
+                                        // "停止/恢复"控件 —— "能不能自主"不是任务状态。
+                                        if !compact, let axes = task.axes {
+                                            HStack(spacing: 4) {
+                                                axisChip("生成", axes.generation.label)
+                                                    .accessibilityIdentifier("resident.wish-task.\(task.id.uuidString).generation")
+                                                axisChip("归属", axes.ownership.label)
+                                                    .accessibilityIdentifier("resident.wish-task.\(task.id.uuidString).ownership")
+                                                axisChip("摆放", axes.placement.label)
+                                                    .accessibilityIdentifier("resident.wish-task.\(task.id.uuidString).placement")
                                             }
                                         }
+                                        if !compact, let detail = task.detail, !detail.isEmpty {
+                                            Text(detail)
+                                                .font(.system(size: 10))
+                                                .foregroundStyle(.white.opacity(0.6))
+                                                .lineLimit(2)
+                                        }
                                     }
-                                    if !compact, let detail = task.detail, !detail.isEmpty {
-                                        Text(detail)
-                                            .font(.system(size: 10))
-                                            .foregroundStyle(.white.opacity(0.6))
-                                            .lineLimit(2)
-                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .help([task.title, task.status, task.detail].compactMap { $0 }.joined(separator: "\n"))
+                                    .accessibilityElement(children: .combine)
+                                    .accessibilityIdentifier("resident.wish-task.\(task.id.uuidString)")
                                 }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .help([task.title, task.status, task.detail].compactMap { $0 }.joined(separator: "\n"))
-                                .accessibilityElement(children: .combine)
-                                .accessibilityIdentifier("resident.wish-task.\(task.id.uuidString)")
                             }
                         }
+                        .frame(height: min(maximumHeight, CGFloat(visible.count) * (compact ? 20 : 48)))
                     }
-                    .frame(height: min(maximumHeight, CGFloat(visible.count) * (compact ? 20 : 48)))
+                    .foregroundStyle(.white)
+                    .padding(compact ? 6 : 10)
+                    .background(Color(white: 0.1).opacity(0.96), in: RoundedRectangle(cornerRadius: 10))
+                    .accessibilityIdentifier("resident.wish-tasks")
                 }
-                .foregroundStyle(.white)
+            }
+        }
+    }
+
+    /// 三轴里的一格：只说"哪条轴 = 现在是什么"。任务行不在这里表达授权或连通性。
+    @ViewBuilder
+    private func axisChip(_ title: String, _ value: String) -> some View {
+        HStack(spacing: 3) {
+            Text(title).foregroundStyle(.white.opacity(0.45))
+            Text(value).foregroundStyle(.white.opacity(0.85))
+        }
+        .font(.system(size: 9))
+        .lineLimit(1)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 2)
+        .background(Color.white.opacity(0.08), in: Capsule())
+    }
+
+    /// **连通性是全局事实，不是任务属性。**
+    ///
+    /// 连不上后台（`network_unavailable` / `remote_unavailable` 这类连通性事实）时，
+    /// 舞台/小窗顶部出现这一条横幅：可读原因 + "恢复后会自己继续"。它由任务投影里的
+    /// 连通性事实**算出来**（`WishMachineTaskPresentationStore.update`），不另存一份；
+    /// 投影不再报连通性事实时它就自动消失，不需要用户关掉它。
+    @ViewBuilder
+    private var connectivityBanner: some View {
+        if let notice = state.connectivityNotice {
+            Label(notice, systemImage: "wifi.exclamationmark")
+                .font(.system(size: compact ? 9 : 11))
+                .foregroundStyle(.orange.opacity(0.95))
+                .lineLimit(compact ? 2 : 3)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(compact ? 6 : 10)
                 .background(Color(white: 0.1).opacity(0.96), in: RoundedRectangle(cornerRadius: 10))
-                .accessibilityIdentifier("resident.wish-tasks")
+                .accessibilityIdentifier("resident.connectivity-banner")
+        }
+    }
+
+    /// **一个全局开关**：允许居民自主行动。
+    ///
+    ///   - 关着 ⇒ 不自己动手，但你仍可下令；开着 ⇒ 它可以自己去领去摆。
+    ///   - 「用户显式停止」仍然有效（安全语义保留）：停止后不自主。停止的证据有
+    ///     三份（run 级停止 / 任务级持久暂停 / 投影文本里的停止事实），任意一份
+    ///     为真这里就亮 —— 但页面上的解除只有**一个**动作。
+    ///   - 解除只需这**一个**动作，且**不需要按任务逐个恢复**：一次点击打开开关、
+    ///     解除 run 级停止，并把所有被用户停过的任务一次解开。做不成时这里一定有话说。
+    ///
+    /// 这就是"能不能自主"的入口 —— 任务行上不再有任何按任务的停止/恢复控件。
+    /// 开关的值直接读设置里那**一个**键（`state.isAutonomySwitchOn`），不另存一份；
+    /// 外层 `TimelineView` 每秒重算，所以设置里改一下这里一秒内跟上。
+    @ViewBuilder
+    private var autonomyBanner: some View {
+        if !state.isAutonomySwitchOn || state.isAutonomyStoppedByUser {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Label(
+                        state.isAutonomySwitchOn ? "自主行动已停止" : "居民自主行动已关闭",
+                        systemImage: state.isAutonomySwitchOn ? "pause.circle" : "hand.raised"
+                    )
+                    .font(.system(size: compact ? 9 : 10))
+                    .foregroundStyle(.orange.opacity(0.95))
+                    .lineLimit(1)
+                    Spacer(minLength: 2)
+                    Button(state.isAutonomySwitchOn ? "恢复自主行动" : "打开自主行动") {
+                        state.resumeAutonomy()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: compact ? 9 : 10, weight: .medium))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.white.opacity(0.16), in: Capsule())
+                    .accessibilityIdentifier("resident.autonomy.resume")
+                }
+                if !compact {
+                    Text("不自主不等于不听话：直接下达的指令在任何开关状态下都会执行。")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.white.opacity(0.55))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let failure = state.autonomyResumeFailure {
+                    Text(failure)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.orange.opacity(0.95))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("resident.autonomy.resume-failure")
+                }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .foregroundStyle(.white)
+            .padding(compact ? 6 : 10)
+            .background(Color(white: 0.1).opacity(0.96), in: RoundedRectangle(cornerRadius: 10))
+            .accessibilityIdentifier("resident.autonomy-banner")
         }
     }
 }

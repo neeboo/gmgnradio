@@ -178,8 +178,12 @@ public enum PropPlacementEvaluator {
 
     /// 返回 nil 表示可放。
     ///
-    /// 参数里的 `blockingVolumes` / `placedProps` 都按"障碍"处理，本函数**不**再看
-    /// `isBlocking`：宁可多挡一件，也不因为元数据不一致漏挡（fail-closed）。
+    /// 参数里的 `blockingVolumes` / `placedProps` / `placedObstacles` 都按"障碍"处理，
+    /// 本函数**不**再看 `isBlocking`：宁可多挡一件，也不因为元数据不一致漏挡（fail-closed）。
+    ///
+    /// `placedObstacles` 是**权威**的一份（形状可以是 yaw 盒子**或**生成侧的碰撞代理）；
+    /// `placedProps` 是它的旧盒子入口。两者指向下面同一个障碍判定循环 —— 盒子入口只是
+    /// 一个输入适配器，不是第二套几何。
     public static func evaluate(
         footprint: WorldPlanarFootprint,
         height: Float,
@@ -187,7 +191,8 @@ public enum PropPlacementEvaluator {
         grid: PropSupportGrid,
         collision: any WorldPropSupportQuerying,
         blockingVolumes: [WorldCollisionVolume],
-        placedProps: [WorldCollisionVolume],
+        placedProps: [WorldCollisionVolume] = [],
+        placedObstacles: [WorldPropObstacle]? = nil,
         restingTolerance: Float = WorldPropMeshClearance.restingTolerance,
         supportHeightDeviation: Float = PropPlacementEvaluator.maximumSupportHeightDeviation
     ) -> PropSupportBlockReason? {
@@ -248,13 +253,16 @@ public enum PropPlacementEvaluator {
         }
 
         // 3. 独立阻挡体积（点唱机 / 许愿机 / 展示台）。
-        for volume in blockingVolumes where WorldPropBoxOverlap.overlaps(box, volume) {
-            return .blockedByBlockingVolume(volume.id)
+        for obstacle in blockingVolumes.map(WorldPropObstacle.init(volume:))
+        where WorldPropObstacleOverlap.overlaps(box: box, obstacle: obstacle) {
+            return .blockedByBlockingVolume(obstacle.id)
         }
 
-        // 4. 已放物件的包围盒互斥。
-        for placed in placedProps where WorldPropBoxOverlap.overlaps(box, placed) {
-            return .blockedByPlacedProp(placed.id)
+        // 4. 已放物件的互斥。形状来自**同一份** `WorldLayoutObstacles.Resolution.obstacles`
+        //    （盒子或碰撞代理），判定收在 `WorldPropObstacleOverlap` 里。
+        for obstacle in placedObstacles ?? placedProps.map(WorldPropObstacle.init(volume:))
+        where WorldPropObstacleOverlap.overlaps(box: box, obstacle: obstacle) {
+            return .blockedByPlacedProp(obstacle.id)
         }
 
         return nil

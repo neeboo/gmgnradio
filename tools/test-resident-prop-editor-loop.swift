@@ -8,6 +8,17 @@ func declaration(_ signature:String)->String {
     fatalError("declaration")
 }
 let methods=["private func temporarilyPauseResidentForPropEditing()","private func pauseResidentWishContinuations()","private struct ResidentWishScope"].map(declaration).joined(separator:"\n")
+// 接线守卫：任务级**持久、只能人工解除**的暂停只允许挂在"用户停止"这条回调上。
+// 旧代码把它挂在通用取消通道 `onCancel` 上，于是换空间/退出/自主可用性回收/网络回收
+// 都会写出一条暂停，用户从没按过停止却要手动点「恢复自动领取」。把这条接线退回去，
+// 下面两条断言（以及这里）就会 FAIL。
+let cancelClosure = source.contains("onCancel: { [weak self] in") ? declaration("onCancel: { [weak self] in") : ""
+let userStopClosure = source.contains("onUserStop: { [weak self] in") ? declaration("onUserStop: { [weak self] in") : ""
+guard !cancelClosure.contains("pauseResidentWishContinuations()"),
+      userStopClosure.contains("pauseResidentWishContinuations()") else {
+    print("FAIL: the task-level wish pause must hang off the explicit user-stop callback, never the generic cancellation channel")
+    exit(1)
+}
 let harness = #"""
 import Foundation
 @MainActor final class Coordinator {
@@ -27,7 +38,7 @@ import Foundation
         let loop=ResidentAgentLoop(now:{[weak self] in self?.now ?? Date()},configuration:.init(minimumWakeInterval:1),run:{[weak self] input in
             self?.runs += 1
             try await Task.sleep(for:.seconds(30));return "done"
-        },steer:{_ in .notDelivered},onReply:{_ in},onFailure:{_ in},onChange:{},onCancel:{[weak self] in self?.pauseResidentWishContinuations()})
+        },steer:{_ in .notDelivered},onReply:{_ in},onFailure:{_ in},onChange:{},onCancel:{},onUserStop:{[weak self] in self?.pauseResidentWishContinuations()})
         residentAgentLoop=loop
         residentWishScope=ResidentWishScope(loopID:ObjectIdentifier(loop),worldID:"room",residentScope:"resident")
     }
@@ -51,6 +62,11 @@ import Foundation
         precondition(app.wishMachineCoordinator.pauses == 1,"explicit stop during editing persists pause")
         loop.setBackgroundEnabled(true)
         precondition(loop.snapshot.isStopped && loop.snapshot.intentPausedByUser,"editor exit never undoes explicit stop")
+        // 换空间/退出走 invalidate()：作废本轮，但既不改用户停止状态，也不写持久暂停。
+        loop.invalidate()
+        precondition(app.wishMachineCoordinator.pauses == 1,"context switch or quit never persists a wish pause")
+        precondition(loop.snapshot.isStopped && loop.snapshot.intentPausedByUser,
+                     "context switch or quit never fabricates or clears a user stop")
         print("PASS: actual loop editor temporary cancellation and explicit stop")
     }
 }

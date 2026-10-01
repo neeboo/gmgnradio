@@ -317,6 +317,9 @@ impl Store {
         let bytes = input.validate()?;
         let hash = model::digest(&bytes);
         let profile = input.generation_profile.map(|profile| profile.fingerprint());
+        // 意图随任务一起落盘：它和 `height_meters` 一样是"决定这件东西多大"的输入，
+        // 重放（幂等命中）时也必须逐位相同，否则同一个 id 的两次提交会给出两个尺寸。
+        let size_intent = input.parsed_size_intent()?;
         let existing = match self.get(&input.id) {
             Ok(value) => Some(value),
             Err("missing_task") => None,
@@ -328,6 +331,7 @@ impl Store {
                 || j.name != input.name
                 || j.source != input.source
                 || j.height_meters != input.height_meters
+                || j.size_intent != size_intent
                 || j.image_sha256 != hash
                 || j.context != input.context
                 || j.source_wish_id != input.source_wish_id
@@ -346,10 +350,12 @@ impl Store {
             image_path: path.to_string_lossy().into(),
             image_sha256: hash,
             height_meters: input.height_meters,
+            size_intent,
             source: input.source,
             idempotency_key: input.id,
             receipt: None,
             local_model_path: None,
+            local_collision_path: None,
             last_error: None,
             backend_stage: "queued".into(),
             cancel_requested: false,
@@ -513,10 +519,14 @@ impl Store {
             image_path: path.to_string_lossy().into(),
             image_sha256: replaced.job.image_sha256.clone(),
             height_meters: replaced.job.height_meters,
+            // 换后端**不换尺寸意图**：failover 只是换一条生成通道，那件东西该多大是
+            // 用户的意图，不能被一次故障转移悄悄改掉（否则同一件产物在两个后端上尺寸不同）。
+            size_intent: replaced.job.size_intent,
             source: replaced.job.source.clone(),
             idempotency_key: format!("{root}-r{revision}"),
             receipt: None,
             local_model_path: None,
+            local_collision_path: None,
             last_error: None,
             backend_stage: "queued".into(),
             cancel_requested: false,
@@ -552,6 +562,27 @@ impl Store {
                     j.local_model_path = None;
                     j.backend_stage = "interrupted".into();
                     j.last_error = Some("local_model_unavailable".into());
+                }
+            }
+            // 碰撞代理与模型同一条口径：路径必须是那一个、内容必须仍然对得上回执。
+            // 对不上就**两样一起清掉**并让任务可见地失败 —— 留着一个 `localModelPath`
+            // 配一个消失的代理，会让 app 以为"代理可用"，那正是 fail-open。
+            if let Some(path) = j.local_collision_path.clone() {
+                let expected = self.root.join(format!("{}.collider.glb", j.id));
+                let valid = Path::new(&path) == expected
+                    && files::read(&expected, crate::model::COLLIDER_LIMIT)
+                        .and_then(|b| {
+                            model::validate_collider_glb(
+                                &b,
+                                j.receipt.as_ref().ok_or("missing_receipt")?,
+                            )
+                        })
+                        .is_ok();
+                if !valid {
+                    j.local_collision_path = None;
+                    j.local_model_path = None;
+                    j.backend_stage = "interrupted".into();
+                    j.last_error = Some("local_collision_unavailable".into());
                 }
             }
             self.save(&value)?;
@@ -691,6 +722,7 @@ mod tests {
                 license: "CC0-1.0".into(),
             },
             height_meters: 0.5,
+            size_intent: None,
             context: None,
             source_wish_id: wish.map(str::to_owned),
             generation_profile: profile,
@@ -788,6 +820,42 @@ mod tests {
             Some(profile(512).fingerprint().as_str())
         );
         assert_eq!(active_wishes(&store), vec!["wish-1".to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 尺寸意图**随任务保存**、随 job JSON **回显**（审计），并且换后端时原样带走。
+    #[test]
+    fn size_intent_is_persisted_echoed_and_survives_failover() {
+        let (mut store, dir) = new_store();
+        let mut input = submit(Some("wish-1"), Some(profile(512)));
+        input.height_meters = 1.1;
+        input.size_intent = Some(json!({"axis": "longest", "meters": 1.1, "source": "user"}));
+        let job = store.submit(input).unwrap();
+        assert_eq!(
+            store.get(&job.id).unwrap().job.size_intent,
+            Some(model::SizeIntent {
+                axis: model::SizeIntentAxis::Longest,
+                meters: 1.1,
+                source: model::SizeIntentSource::User,
+            })
+        );
+        let echo = serde_json::to_string(&store.get(&job.id).unwrap().job).unwrap();
+        assert!(
+            echo.contains(r#""sizeIntent":{"axis":"longest","meters":1.1,"source":"user"}"#),
+            "回执必须回显尺寸意图，便于审计：{echo}"
+        );
+        // 同一个 id 再提交一次**另一个**尺寸意图 ⇒ 幂等冲突（不许悄悄换尺寸）。
+        let mut changed = submit(Some("wish-1"), Some(profile(512)));
+        changed.id = job.id.clone();
+        changed.height_meters = 1.1;
+        changed.size_intent = Some(json!({"axis": "height", "meters": 1.1, "source": "user"}));
+        assert_eq!(store.submit(changed).err(), Some("idempotency_conflict"));
+        // 换后端不改尺寸意图。
+        let (replacement, _) = store
+            .failover(&job.id, "https://backup.invalid", Some(profile(512)))
+            .unwrap();
+        assert_eq!(replacement.size_intent, job.size_intent);
+        assert_eq!(replacement.height_meters, job.height_meters);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

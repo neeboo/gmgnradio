@@ -198,7 +198,7 @@ final class WorldAgentContext {
         }
 
         collisionWorld.replace(with: PropLayoutCollisionWorld(base: baseCollisionWorld,
-            volumes: simulation.state.objectStates.values.compactMap(\.generatedCollisionVolume)))
+            obstacles: WorldLayoutObstacles.resolve(simulation.state).obstacles))
 
         let transform = simulation.state.agentTransform
         activityExecutor = ActivityExecutor(
@@ -533,7 +533,7 @@ final class WorldAgentContext {
 
     func layoutCollisionWorld(for state: WorldState) -> any WorldCollisionQuerying {
         PropLayoutCollisionWorld(base: baseCollisionWorld,
-            volumes: state.objectStates.values.compactMap(\.generatedCollisionVolume))
+            obstacles: WorldLayoutObstacles.resolve(state).obstacles)
     }
 
     /// Conservative horizontal clearance against the currently installed environment.
@@ -563,7 +563,7 @@ final class WorldAgentContext {
         // executor, usage — completely untouched, and the old run keeps
         // receiving its receipts. No callback ever sees anything unsaved.
         let candidateCollision = PropLayoutCollisionWorld(base: baseCollisionWorld,
-            volumes: candidate.state.objectStates.values.compactMap(\.generatedCollisionVolume))
+            obstacles: WorldLayoutObstacles.resolve(candidate.state).obstacles)
         var executorStopped = false
         if let activeID = state.activeActivity?.activityID,
            let active = propActivities[activeID] {
@@ -630,7 +630,7 @@ final class WorldAgentContext {
         _ world: any WorldCollisionQuerying
     ) throws -> WorldVector3? {
         let world = PropLayoutCollisionWorld(base: world,
-            volumes: state.objectStates.values.compactMap(\.generatedCollisionVolume))
+            obstacles: WorldLayoutObstacles.resolve(state).obstacles)
         let current = state.agentTransform.position
         let resolved = groundedPosition(current, in: world)
             ?? manifest.waypoints
@@ -1373,14 +1373,17 @@ final class WorldAgentContext {
 
 /// Generated props block bodies but never contribute a walkable top surface.
 /// 摆放格子派生需要三角形几何。这个包装类型的地面与几何都来自 `base`，`props` 只是
-/// 已放物件的阻挡体积（没有三角形）。转发给 `base`，拿不到就返回空数组 —— 理由与
-/// `MarbleLivingCabinCollisionWorld` 的 conformance 相同：派生器会因此得到空网格
-/// （"不猜、不放行"），评估器会因此得到 `.noSupport`，两道都是 fail-closed。
+/// 已放物件的阻挡**形状**（yaw 盒子或生成侧的碰撞代理）。转发给 `base`，拿不到就返回
+/// 空数组 —— 理由与 `MarbleLivingCabinCollisionWorld` 的 conformance 相同：派生器会因此
+/// 得到空网格（"不猜、不放行"），评估器会因此得到 `.noSupport`，两道都是 fail-closed。
+///
+/// 形状来自**唯一一份** `WorldLayoutObstacles.resolve`：于是运行时拦人的东西与摆放预检
+/// 看到的完全同一批障碍（含碰撞代理），不存在"预检按盒子、运行时按代理"的分叉。
 private struct PropLayoutCollisionWorld: WorldCollisionQuerying, WorldPropSupportQuerying {
     let base: any WorldCollisionQuerying
     let props: CollisionVolumeWorld
-    init(base: any WorldCollisionQuerying, volumes: [WorldCollisionVolume]) {
-        self.base = base; props = CollisionVolumeWorld(volumes: volumes)
+    init(base: any WorldCollisionQuerying, obstacles: [WorldPropObstacle]) {
+        self.base = base; props = CollisionVolumeWorld(obstacles: obstacles)
     }
     func canOccupy(_ capsule: WorldCapsule, at position: SIMD3<Float>) -> Bool {
         base.canOccupy(capsule, at: position) && props.canOccupy(capsule, at: position)

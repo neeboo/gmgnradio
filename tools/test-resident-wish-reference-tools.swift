@@ -622,6 +622,9 @@ compile.arguments = ["-swift-version", "6", "-j1", "-parse-as-library",
     sources.appendingPathComponent("Presence/PropGenerationStore.swift").path,
     sources.appendingPathComponent("Presence/PropImagePreparation.swift").path,
     sources.appendingPathComponent("Presence/WishMachineOutputDescriptor.swift").path,
+    // 连通性词汇只有**一份**：coordinator 的 `isNetworkClassSubmissionError` 现在委托给
+    // `ResidentConnectivityFact`，所以那份生产文件必须一起编进来（编同一份，不是抄一份）。
+    sources.appendingPathComponent("Presence/WishMachineTaskPresentation.swift").path,
     sources.appendingPathComponent("Presence/WishMachineCoordinator.swift").path,
     sources.appendingPathComponent("Presence/PropTaskDaemonClient.swift").path,
     sources.appendingPathComponent("Agent/ResidentWishMachineTools.swift").path,

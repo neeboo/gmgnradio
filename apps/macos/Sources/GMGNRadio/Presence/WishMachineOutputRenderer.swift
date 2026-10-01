@@ -3,6 +3,7 @@ import Foundation
 import GLTFMetalKit
 import ImageIO
 import simd
+import WorldRuntime
 
 /// Uses the pinned VRMMetalKit package's general glTF renderer. No model
 /// conversion or per-frame parsing; geometry writes the avatar's depth space.
@@ -137,9 +138,35 @@ final class WishMachineOutputRenderer {
             guard let outlet = WishMachineScene.outletPosition else {
                 throw WishMachineOutputError.renderUnavailable
             }
+            // 托盘上那一件还没登记，`targetHeightMeters` 是**生成请求**的高度 ⇒ 先过一次
+            // 唯一那份尺度策略（细长物件按最长边归一），把"请求高度"落成**世界高度**；
+            // 已登记物件（`heightIsGenerationRequest == false`）拿到的已经是定稿高度，
+            // 策略**不重复应用**（它不幂等：重复套用会把细长物件每帧再缩一次）。
+            let extent = asset.worldBounds.max - asset.worldBounds.min
+            let requested = output.targetHeightMeters
+            let resolvedHeight: Float
+            if output.heightIsGenerationRequest {
+                // **有尺寸意图就按用户说的那根轴归一**（"一把 1.1 米的剑"= 最长边 1.1 m），
+                // 没有意图才退回今天的自动推断（细长物件按最长边）。两条路共用同一份策略、
+                // 同一段上下限夹取 —— 面板、碰撞盒、红绿格读到的仍是同一份尺寸。
+                let resolution: WorldPropSizePolicy.Resolution?
+                if let intent = output.sizeIntent, intent.isValid {
+                    resolution = WorldPropSizePolicy.intended(
+                        sourceExtent: .init(x: extent.x, y: extent.y, z: extent.z),
+                        axis: intent.axis.policyAxis, meters: Float(intent.meters))
+                } else {
+                    resolution = WorldPropSizePolicy.automatic(
+                        sourceExtent: .init(x: extent.x, y: extent.y, z: extent.z),
+                        requestedHeight: requested)
+                }
+                guard let resolution else { throw WishMachineOutputError.invalidDimensions }
+                resolvedHeight = resolution.size.y
+            } else {
+                resolvedHeight = requested
+            }
             let transform = try WishMachineOutputPlacement.transform(
                 minimum: asset.worldBounds.min, maximum: asset.worldBounds.max,
-                targetHeight: output.targetHeightMeters, outlet: outlet
+                targetHeight: resolvedHeight, outlet: outlet
             )
             let calls = asset.drawCalls.map { GLTFDrawCall(mesh: $0.mesh, material: $0.material, modelMatrix: transform * $0.modelMatrix, skinPalette: $0.skinPalette) }
             let renderer = try GLTFRenderer(device: device)
@@ -152,6 +179,17 @@ final class WishMachineOutputRenderer {
             }
             return Loaded(asset: asset, renderer: renderer, pipelines: pipelines, calls: calls,
                           forwardDepth: try makeDepth(.less), reverseDepth: try makeDepth(.greater))
+        }
+    }
+}
+
+extension PropSizeIntent.Axis {
+    /// 提交契约的轴 → 世界尺度策略的轴。两边的字面量本来就相同，所以这里只是**唯一**一处
+    /// 搬运：谁要消费意图，都必须经过它，而不是各自再写一遍 `if axis == "longest"`。
+    var policyAxis: WorldPropSizeAxis {
+        switch self {
+        case .longest: return .longest
+        case .height: return .height
         }
     }
 }
