@@ -1,7 +1,7 @@
 use crate::{
     files, memory, messages,
     model::{self, Job, Result, Stored, Submit, MODEL_LIMIT, PNG_LIMIT},
-    resident,
+    resident, world,
 };
 use base64::Engine;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -110,6 +110,9 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     }
     if applied < 3 {
         apply_step(connection, 3, "memory-storage-v1", memory::schema)?;
+    }
+    if applied < 4 {
+        apply_step(connection, 4, "world-authority-v1", world::schema)?;
     }
     Ok(())
 }
@@ -1028,7 +1031,8 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 3);
+        // v4 adds world-authority-v1 (world_records/world_facts/world_blobs/...).
+        assert_eq!(version, 4);
         // v1 rows and the full old message contract survive untouched.
         let jobs: i64 = connection
             .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))

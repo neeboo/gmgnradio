@@ -209,6 +209,18 @@ _test-harnesses:
 	swift tools/test-resident-system-inbox-window.swift
 	swift tools/test-resident-prop-collision-proxy.swift
 	swift tools/test-resident-state-convergence.swift
+	swift tools/test-world-authority-single-writer.swift
+	swift tools/test-world-authority-projection.swift
+	# 生成结果的**归属与身份**判据（P-B1）。
+	# B-1「状态声明的入库 ⇔ 权威里存在该条目」三层各自独立可断言；
+	# B-4 资产身份必须等于**产物**字节的 sha256、且不得等于输入图哈希。
+	# 三个负对照（改派生源 / 无条件报已入库 / 身份用输入哈希）在 harness 内部
+	# 对源码副本做手术，证明判据真的会红 —— 一个"从不 FAIL"的门禁等于没有门禁。
+	swift tools/test-generation-results-authority.swift
+	# 生成结果四方对账器的**自测**（反例必须 FAIL、正例必须不 FAIL）。
+	# 只挂 `--self-test`：默认那条读真机 root/真实存档（本身就是 B-1/B-2 的
+	# 现场），挂进 CI 门禁会变成"依赖用户当前数据"的非确定性红。
+	$(PYTHON) tools/reconcile-generation-results.py --self-test
 
 test-all: test-install test-worlds test-daemon test-python test-harnesses dedupe
 

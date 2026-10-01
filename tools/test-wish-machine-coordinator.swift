@@ -2,7 +2,10 @@ import Foundation
 
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let sources = ["Presence/PropGenerationClient", "Presence/PropGenerationStore", "Presence/PropImagePreparation",
-               "Presence/WishMachineOutputDescriptor", "Presence/WishMachineCoordinator", "Agent/ResidentWishMachineTools"]
+               "Presence/WishMachineOutputDescriptor", "Presence/WishMachineCoordinator",
+               // agent 现读的那份参数契约：`ResidentWishMachineTools` 的类型来自它，
+               // 所以必须一起编（编同一份，不是另写一个同名类型）。
+               "Agent/WishMachineContract", "Agent/ResidentWishMachineTools"]
     .map { root.appendingPathComponent("apps/macos/Sources/GMGNRadio/\($0).swift") }
     + [root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/PropTaskDaemonClient.swift"),
        root.appendingPathComponent("tools/fixtures/WishMachineDaemonFixture.swift"),
@@ -362,7 +365,11 @@ extension WishMachineCoordinator {
         check(!restored.unpublishedEvents(worldID: "world", residentScope: "resident").contains { $0.id == events[0].id }, "legacy consumed events are not broadcast anew during migration")
         check(restored.unpublishedEvents(worldID: "world", residentScope: "resident").contains { $0.kind == .claimed && $0.wishID == job.id }, "real claim emits a stable same-task fact for Rust delivery")
         let tools = ResidentWishMachineTools(coordinator: coordinator, worldID: "world", residentScope: "resident", authorizationID: nil, isCurrent: { true }).tools
-        check(tools.count == 6 && tools.contains { $0.name == "submit_wish_generation" }, "stable schema always registers all wish primitives")
+        // 六个动作 + 一个只读参数接口（`read_wish_machine_contract`）：参数只有它一处定义，
+        // 所以它必须与动作一起常驻注册，不能按授权有无增删。
+        check(tools.count == 7 && tools.contains { $0.name == "submit_wish_generation" }
+            && tools.contains { $0.name == "read_wish_machine_contract" },
+            "stable schema always registers all wish primitives")
         let allowedTools = ResidentWishMachineTools(coordinator: coordinator, worldID: "world", residentScope: "resident", authorizationID: authorization, isCurrent: { true }).tools
         let submit = allowedTools.first { $0.name == "submit_wish_generation" }!
         let props = submit.inputSchema["properties"] as! [String: Any]

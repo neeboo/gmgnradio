@@ -1,7 +1,7 @@
 use crate::{
     files, memory, messages,
     model::{self, Result, Stored, Submit, FRAME_LIMIT},
-    provider, resident,
+    provider, resident, world,
     store::Database,
 };
 use serde::Deserialize;
@@ -268,8 +268,105 @@ impl Service {
                             .map_err(|_| "storage_unavailable")?;
                         let result = resident::commit(&tx, &request).map_err(|e| e.code)?;
                         tx.commit().map_err(|_| "storage_unavailable")?;
+                        // G1: a state write must push. Every domain that commits
+                        // through `state_commit` (inbox, resident, world, ...) is
+                        // otherwise invisible to subscribers, and "event driven"
+                        // would be empty for the whole unified state contract.
+                        s.changed.send_modify(|v| *v = v.wrapping_add(1));
                         Ok(json!({"revision": result.revision, "replayed": result.replayed}))
                     })
+                    .await
+            }
+            "world_snapshot" => {
+                let request: world::SnapshotRequest =
+                    serde_json::from_value(params).map_err(|_| "invalid_world_snapshot")?;
+                self.db
+                    .call(move |s| world::snapshot(&s.connection, &request))
+                    .await
+            }
+            "world_commit" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("invalid_world_commit");
+                }
+                let request: world::CommitRequest =
+                    serde_json::from_value(params).map_err(|_| "invalid_world_commit")?;
+                self.db
+                    .call(move |s| {
+                        let tx = s
+                            .connection
+                            .transaction()
+                            .map_err(|_| "storage_unavailable")?;
+                        let result = world::commit(&tx, &request)?;
+                        tx.commit().map_err(|_| "storage_unavailable")?;
+                        s.changed.send_modify(|v| *v = v.wrapping_add(1));
+                        Ok(result)
+                    })
+                    .await
+            }
+            "world_import" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("invalid_world_import");
+                }
+                let request: world::ImportRequest =
+                    serde_json::from_value(params).map_err(|_| "invalid_world_import")?;
+                self.db
+                    .call(move |s| {
+                        let tx = s
+                            .connection
+                            .transaction()
+                            .map_err(|_| "storage_unavailable")?;
+                        let result = world::import(&tx, &request)?;
+                        tx.commit().map_err(|_| "storage_unavailable")?;
+                        s.changed.send_modify(|v| *v = v.wrapping_add(1));
+                        Ok(result)
+                    })
+                    .await
+            }
+            "world_facts_read" => {
+                let request: world::FactsRequest =
+                    serde_json::from_value(params).map_err(|_| "invalid_world_facts_read")?;
+                self.db
+                    .call(move |s| {
+                        let (facts, next) = world::read_facts(&s.connection, &request)?;
+                        Ok(json!({"facts": facts, "nextCursor": next}))
+                    })
+                    .await
+            }
+            "world_records" => {
+                let request: world::RecordsRequest =
+                    serde_json::from_value(params).map_err(|_| "invalid_world_records")?;
+                self.db
+                    .call(move |s| {
+                        let records = world::read_records(&s.connection, &request)?;
+                        Ok(json!({"records": records}))
+                    })
+                    .await
+            }
+            "world_cursors" => {
+                let request: world::CursorsRequest =
+                    serde_json::from_value(params).map_err(|_| "invalid_world_cursors")?;
+                self.db
+                    .call(move |s| {
+                        let cursors = world::read_cursors(&s.connection, &request.world_id)?;
+                        Ok(json!({"cursors": cursors}))
+                    })
+                    .await
+            }
+            "world_blob_put" => {
+                let request: world::BlobPutRequest =
+                    serde_json::from_value(params).map_err(|_| "invalid_world_blob_put")?;
+                self.db
+                    .call(move |s| {
+                        let root = s.root.clone();
+                        world::blob_put(&s.connection, &root, &request)
+                    })
+                    .await
+            }
+            "world_blob_get" => {
+                let request: world::BlobGetRequest =
+                    serde_json::from_value(params).map_err(|_| "invalid_world_blob_get")?;
+                self.db
+                    .call(move |s| world::blob_get(&s.connection, &s.root, &request))
                     .await
             }
             "event_read" => {
@@ -490,6 +587,40 @@ impl Service {
                 write(&writer, &failure(Value::Null, "invalid_request_id")).await?;
                 continue;
             }
+            if request.method == "world_subscribe" {
+                let world_id = request.params["worldID"].as_str().map(str::to_owned);
+                let after = request.params["after"].as_i64().filter(|n| *n >= 0);
+                let (Some(world_id), Some(after)) = (world_id, after) else {
+                    write(&writer, &failure(request.id, "invalid_cursor")).await?;
+                    continue;
+                };
+                if world_id.is_empty() || world_id.len() > world::TOKEN_LIMIT {
+                    write(&writer, &failure(request.id, "invalid_world_id")).await?;
+                    continue;
+                }
+                let changed = self.db.changed.subscribe();
+                // Read once before accepting the subscription: the watch receiver
+                // is already installed, so the replay and the live stream cannot
+                // leave a gap. Everything after this point reads the committed
+                // database, never this read.
+                if let Err(code) = self.world_pending(world_id.clone(), after).await {
+                    write(&writer, &failure(request.id, code)).await?;
+                    continue;
+                }
+                write(
+                    &writer,
+                    &json!({"id":request.id,"result":{"subscribed":true}}),
+                )
+                .await?;
+                let service = self.clone();
+                let writer = writer.clone();
+                subscriptions.spawn(async move {
+                    service
+                        .world_stream(world_id, after, changed, writer)
+                        .await
+                });
+                continue;
+            }
             if request.method == "subscribe" || request.method == "subscribe_messages" {
                 let changed = self.db.changed.subscribe();
                 let scope: Option<MessageScope> = if request.method == "subscribe_messages" {
@@ -595,6 +726,42 @@ impl Service {
                         json!({"event":entry})
                     };
                     write(&writer, &envelope).await?;
+                }
+                continue;
+            }
+            changed.changed().await.map_err(|_| "storage_unavailable")?;
+        }
+    }
+    async fn world_pending(&self, world_id: String, after: i64) -> Result<Vec<Value>> {
+        self.db
+            .call(move |s| {
+                let request = world::FactsRequest {
+                    world_id,
+                    after: Some(after),
+                    limit: Some(256),
+                };
+                let (facts, _) = world::read_facts(&s.connection, &request)?;
+                Ok(facts)
+            })
+            .await
+    }
+    /// The world event channel: push facts (each with `seq`, `revision` and its
+    /// idempotency key) to one subscriber. A dropped watch is not a lost event —
+    /// the loop always re-reads the committed database from its cursor.
+    async fn world_stream(
+        &self,
+        world_id: String,
+        mut cursor: i64,
+        mut changed: tokio::sync::watch::Receiver<u64>,
+        writer: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    ) -> Result<()> {
+        loop {
+            changed.borrow_and_update();
+            let batch = self.world_pending(world_id.clone(), cursor).await?;
+            if !batch.is_empty() {
+                for entry in batch {
+                    cursor = entry["seq"].as_i64().ok_or("history_unavailable")?;
+                    write(&writer, &json!({"worldFact": entry})).await?;
                 }
                 continue;
             }
@@ -972,6 +1139,118 @@ mod tests {
                 "sizeIntent = {intent} 被静默收下了"
             );
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn gmgn_state_hash(state: &Value) -> String {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(serde_json::to_string(state).unwrap().as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// G1: a `state_commit` must wake subscribers. Every domain that writes
+    /// through the unified state contract is otherwise invisible to an
+    /// event-driven client, which is exactly the gap this migration has to close
+    /// before world state can move onto that contract.
+    #[tokio::test]
+    async fn state_commit_wakes_subscribers() {
+        let (service, dir) = service().await;
+        let mut changed = service.db.changed.subscribe();
+        // Mark the current value as seen, or `changed()` would return at once
+        // and the assertion would pass without any notification at all.
+        changed.borrow_and_update();
+        let committed = service
+            .request(
+                "state_commit",
+                json!({
+                    "scope": {"worldID": "world-a", "residentScope": "resident-a"},
+                    "domain": "inbox",
+                    "key": "entries",
+                    "expectedRevision": 0,
+                    "requestID": uuid::Uuid::new_v4().to_string(),
+                    "value": {"entries": []},
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed["revision"], 1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), changed.changed())
+            .await
+            .expect("state_commit did not notify subscribers (G1)")
+            .expect("watch channel closed");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The world authority's own commit must push too: the event channel is the
+    /// only thing that makes a second client converge without polling.
+    #[tokio::test]
+    async fn world_commit_wakes_subscribers_and_appends_a_fact() {
+        let (service, dir) = service().await;
+        let world_id = "world-a";
+        let state = json!({
+            "worldID": world_id,
+            "revision": 1,
+            "weather": "clear",
+            "objectStates": {},
+        });
+        service
+            .request(
+                "world_import",
+                json!({
+                    "worldID": world_id,
+                    "requestID": "import-1",
+                    "packageID": "fixture",
+                    "packageVersion": "1.0.0",
+                    "stateSha256": gmgn_state_hash(&state),
+                    "stateJson": serde_json::to_string(&state).unwrap(),
+                }),
+            )
+            .await
+            .unwrap();
+        let mut changed = service.db.changed.subscribe();
+        changed.borrow_and_update();
+        let committed = service
+            .request(
+                "world_commit",
+                json!({
+                    "worldID": world_id,
+                    "requestID": "commit-1",
+                    "expectedRevision": 1,
+                    "ops": [{"op": "setWorldFacts", "facts": {"weather": "rain", "revision": 2}}],
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed["revision"], 2);
+        tokio::time::timeout(std::time::Duration::from_secs(2), changed.changed())
+            .await
+            .expect("world_commit did not notify subscribers")
+            .expect("watch channel closed");
+        let facts = service
+            .request("world_facts_read", json!({"worldID": world_id, "after": 0}))
+            .await
+            .unwrap();
+        let kinds: Vec<String> = facts["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|fact| fact["kind"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(kinds, vec!["world.imported", "world.stateCommitted"]);
+        // A stale commit is refused with a visible code, never silently applied.
+        let stale = service
+            .request(
+                "world_commit",
+                json!({
+                    "worldID": world_id,
+                    "requestID": "commit-2",
+                    "expectedRevision": 1,
+                    "ops": [{"op": "setWorldFacts", "facts": {"weather": "snow"}}],
+                }),
+            )
+            .await;
+        assert_eq!(stale.err(), Some("revision_conflict"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

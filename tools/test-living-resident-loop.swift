@@ -282,6 +282,13 @@ typealias RealConversationService = AgentConversationService
     // This suite exercises conversation/tool leases with no image or wish event.
     // Image grants, persistence, rendering and pause are exercised by the focused
     // test-wish-machine-app-runtime and coordinator suites, not simulated here.
+    //
+    // 只读参数接口（`read_wish_machine_contract`）的 `serviceFacts` 闭包要读这两个成员
+    // （生产里在 `GMGNRadioApp.swift:3518/3519`）。本仿真宿主既然原文抽编
+    // `makeResidentWorldTools`，就得照同一种方式把它们桩出来 —— 否则门禁红在一个
+    // 与断言无关的成员缺失上。
+    private var wishMachineConfiguration: PropGenerationConfiguration?
+    private var wishMachineServiceNotice = ""
     private func bindResidentWishScope(_ context: ResidentWorldContext, loop: ResidentAgentLoop) {}
     private func rebindResidentLoopMemory() {}
     private func residentSelfState() -> ResidentSelfState? { nil }
@@ -495,12 +502,12 @@ func jsonEqual(_ lhs: Any, _ rhs: Any) -> Bool {
                 "start_activity", "stop_activity", "look_at",
                 "read_resident_state", "update_resident_intent", "read_radio_state", "read_current_track",
                 "list_music_playlists", "read_music_playlist", "prepare_music_track"]
-            let wishNames: Set<String> = ["submit_wish_generation", "read_wish_generation", "retry_wish_generation", "cancel_wish_generation", "claim_wish_output", "resume_wish_continuation"]
+            let wishNames: Set<String> = ["submit_wish_generation", "read_wish_generation", "read_wish_machine_contract", "retry_wish_generation", "cancel_wish_generation", "claim_wish_output", "resume_wish_continuation"]
             let referenceNames: Set<String> = ["search_wish_reference_images", "register_wish_reference_image"]
             let propNames: Set<String> = ["read_owned_props", "list_placement_surfaces", "preview_prop_placement", "apply_prop_placement", "withdraw_prop", "undo_prop_placement",
                 "hold_prop", "adjust_held_prop_grip", "return_held_prop", "enable_prop_capability"]
             check(previousNames.isSubset(of: names), "\(mode): App retains eight world, two loop and five music tools")
-            check(names == previousNames.union(wishNames).union(referenceNames).union(propNames) && schemas.count == 33, "\(mode): App exposes six wish, two reference and ten owned-prop tools")
+            check(names == previousNames.union(wishNames).union(referenceNames).union(propNames) && schemas.count == 34, "\(mode): App exposes seven wish (six actions + one read-only parameter interface), two reference and ten owned-prop tools")
             check(formal.prompts[0].contains("这是居民生活循环的一轮"), "\(mode): actual App supplies generic loop instructions")
             let observed = await tools.call("loop-read", "read_resident_state", Data("{}".utf8))
             check(!observed.isError && !tools.allowsSilentCompletion(), "\(mode): reading state alone does not authorize silent completion")
@@ -927,7 +934,7 @@ func jsonEqual(_ lhs: Any, _ rhs: Any) -> Bool {
             let codexSchemas: [[String: Any]] = codexTools.flatMap {
                 try? JSONSerialization.jsonObject(with: $0.schemasJSON) as? [[String: Any]]
             } ?? []
-            check(codexSchemas.count == 33, "codex: actual App manifest exposes all 33 production schemas")
+            check(codexSchemas.count == 34, "codex: actual App manifest exposes all 34 production schemas")
             check(codexTools?.visionCapable == false
                   && !codexSchemas.contains { ($0["name"] as? String) == "capture_space_photo" },
                   "codex: absent GPU vision surface registers no capture schema")
@@ -953,7 +960,7 @@ func jsonEqual(_ lhs: Any, _ rhs: Any) -> Bool {
             let claudeSchemas: [[String: Any]] = claudeTools.flatMap {
                 try? JSONSerialization.jsonObject(with: $0.schemasJSON) as? [[String: Any]]
             } ?? []
-            check(claudeSchemas.count == 33, "claudeCode: actual App manifest exposes the same 33 production schemas")
+            check(claudeSchemas.count == 34, "claudeCode: actual App manifest exposes the same 34 production schemas")
             check((codexSchemas as NSArray).isEqual(claudeSchemas as NSArray),
                   "claudeCode: actual manifest equals codex manifest as a whole JSON value")
             var fieldsMatch = codexSchemas.count == claudeSchemas.count
@@ -1064,6 +1071,9 @@ let compilerArguments: [String] = ["-j1", "-parse-as-library",
     sources.appendingPathComponent("Presence/ResidentPropPlacementService.swift").path,
     sources.appendingPathComponent("Agent/ResidentPropToolBridge.swift").path,
     sources.appendingPathComponent("Presence/PropGenerationClient.swift").path,
+    // 抽编进来的 `makeResidentWorldTools` 会读 `wishMachineConfiguration`，所以它那份
+    // 生产类型也必须一起编（编同一份，不是另写一个同名结构）。
+    sources.appendingPathComponent("Presence/PropGenerationConfiguration.swift").path,
     sources.appendingPathComponent("Presence/PropGenerationStore.swift").path,
     sources.appendingPathComponent("Presence/PropTaskDaemonClient.swift").path,
     root.appendingPathComponent("tools/fixtures/WishMachineDaemonFixture.swift").path,
@@ -1073,6 +1083,7 @@ let compilerArguments: [String] = ["-j1", "-parse-as-library",
     // `ResidentConnectivityFact`，所以那份生产文件必须一起编进来（编同一份，不是抄一份）。
     sources.appendingPathComponent("Presence/WishMachineTaskPresentation.swift").path,
     sources.appendingPathComponent("Presence/WishMachineCoordinator.swift").path,
+    sources.appendingPathComponent("Agent/WishMachineContract.swift").path,
     sources.appendingPathComponent("Agent/ResidentWishMachineTools.swift").path,
     sources.appendingPathComponent("Agent/ResidentWishReferenceTools.swift").path,
     program.path, "-o", executable.path]

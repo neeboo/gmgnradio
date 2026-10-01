@@ -37,7 +37,10 @@ struct PropGenerationSource: Codable, Equatable, Sendable {
 struct PropSizeIntent: Codable, Equatable, Sendable {
     /// 哪根轴。`longest` = 最长边（剑、扫帚、滑雪板这类横着放的东西）；
     /// `height` = 高度（咖啡机、椅子这类立着的东西，也就是旧 `height_meters` 的语义）。
-    enum Axis: String, Codable, Equatable, Sendable { case longest, height }
+    ///
+    /// `CaseIterable` 是为了让 `WishMachineContract`（agent 现读的那份接口）能把轴词汇
+    /// **枚举出来**而不是再抄一遍字面量：轴名的唯一拥有者始终是这个 enum。
+    enum Axis: String, Codable, Equatable, Sendable, CaseIterable { case longest, height }
     /// 谁说的这个尺寸。`default` 在 Swift 里是关键字，所以 case 名与线上字面量分开写。
     enum Source: String, Codable, Equatable, Sendable {
         case user

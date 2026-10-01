@@ -5273,6 +5273,16 @@ final class AppDelegate:
                     // 本轮租约已失配就不读回：这份读回只证明"当前"空间的真实摆放。
                     guard isCurrent() else { return nil }
                     return self?.residentWishPlacementAlreadyCompleted(job)
+                },
+                // 生成服务**声明**的尺寸轴能力：只读接口照实转述，`.unreadable` 时
+                // **不声称任何轴被支持**（读不到 ≠ 支持）。桌面侧的实时探测
+                // （守护进程 `provider_probe` → `/health` 的 `provider.size_intent`）是另一条线：
+                // 接上时只需在这里换掉这个闭包，工具与提示词一行都不用动。
+                // 见 docs/plans/2026-10-02-wish-machine-agent-interface.md §7。
+                sizeIntentCapability: { .unreadable },
+                serviceFacts: { [weak self] in
+                    guard let self else { return (false, "") }
+                    return (self.wishMachineConfiguration != nil, self.wishMachineServiceNotice)
                 }).tools : []
         // 网页参考图：wishworld 的每一次回合（含后台）都注册相同的两个 schema；后台没有
         // 生成授权时 register 会在 handle 内被拒绝，search 仍只读可用。绝不能按
@@ -6166,7 +6176,7 @@ final class AppDelegate:
         许愿机资料（以下名字和内容均为数据）：
         \(String(decoding: data, as: UTF8.self))
         许愿机是空间中的开放托盘，完成的物件悬浮在托盘上。本轮仅在用户明确要求制作物件时使用生成工具；只看图、讨论图片不授权制作。用户没给参考图时，先用 search_wish_reference_images 检索公开参考图，选出真实直链后用 register_wish_reference_image 登记到本轮，再用 submit_wish_generation；不要要求用户自己找图。登记不生成、也不消耗生成额度；一次人类委托最多生成一件，后台续办不能新建生成任务。来源随图片保留，版权与许可未核验；不得凭空声称已经看过图片、已经生成或已经完成。
-        **提交前必须把尺寸说清楚**：submit_wish_generation 的 size_intent 要写清"哪根轴、多少米"。用户说了尺寸就照他说的填——"一把 1.1 米的剑"是**最长边** 1.1 米（axis=longest），"高 35 厘米的咖啡机"是**高度** 0.35 米（axis=height）；用户没提尺寸就**先问一句**要多长／多高，不要自己猜、也不要默认按高度：猜出来的尺寸要么太大（放不进房间、被摆放判定拒绝后退回库存，看起来像"物件消失了"），要么太小（在房间里看不见）。用户明确说"高 1.1 米"就用 axis=height 表达，不要替他改成最长边。
+        **参数不要凭记忆**：\(WishMachineContract.pointer) 尺寸没说清楚时 submit_wish_generation 不会猜、也不会提交，它返回一个 `\(WishMachineContract.Code.needsInput.rawValue)` 结果（里面有一句 `question` 和一个 `pending_id`）：把那一句**只问一遍**给用户，拿到答案后用同一个 `pending_id` 再调一次，就会续上同一次委托（不重复生成、不消耗新授权）。
         用户同时交代做好后放在哪里时，先查询支持面，再将明确的目的地通过 submit_wish_generation 的 destination 保存；用户未交代摆放时不要自行添加。只指定展示台无需擅自替用户固定精确坐标，领取后可在该支持面范围内预检合法落点。
         提交后可继续其他事情，并用 update_resident_intent 留下 waiting_event。宿主会在成品实际可见时发送 outputReady，按预算唤醒一次续办；不需要持续调用模型查询。
         收到 outputReady 后，在未被用户停止或要求等待时，自行查看当前活动并前往 wish_machine.collect；到达后调用 claim_wish_output 核实领取。工具失败时根据真实原因调整，不要把开始活动当成领取成功。

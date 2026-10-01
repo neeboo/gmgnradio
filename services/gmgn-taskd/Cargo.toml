@@ -12,7 +12,12 @@ png = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip` makes float parsing correctly rounded. Without it
+# serde_json's fast path can differ from the source text by one ulp
+# (observed: 1788523160607.4885 re-encoded as ...4883), and a world-state
+# authority must not perturb a stored number — the whole point of the
+# authority is that the bytes a client reads back are the bytes it wrote.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"
 sqlite-vec = "=0.1.9"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "signal"] }

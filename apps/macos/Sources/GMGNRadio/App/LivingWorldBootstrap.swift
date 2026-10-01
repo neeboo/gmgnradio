@@ -110,8 +110,15 @@ struct BundledMarbleLivingCabin {
 /// Reads may fall back once; every checkpoint writes the versioned 1.2 file.
 /// An existing broken 1.2 file must surface its error, never resurrect 1.1.
 struct LivingCabinVersion12Persistence: WorldStatePersisting {
-    let current: AtomicJSONWorldStatePersistence
-    let previous: AtomicJSONWorldStatePersistence
+    /// **private**：迁移后这两个文件写入口不再对外暴露（`save` 只会被
+    /// `LegacyWorldStatePreImage` 的只读包装读到，见 `makeContext`）。
+    private let current: AtomicJSONWorldStatePersistence
+    private let previous: AtomicJSONWorldStatePersistence
+
+    init(current: AtomicJSONWorldStatePersistence, previous: AtomicJSONWorldStatePersistence) {
+        self.current = current
+        self.previous = previous
+    }
 
     func load() throws -> WorldState? {
         if FileManager.default.fileExists(atPath: current.fileURL.path) {
@@ -527,6 +534,34 @@ enum LivingWorldBootstrap {
             }
     }
 
+    /// 迁移导入要读的**只读预像**候选（按优先级）。与 `statePersistence` 的读取
+    /// 回退口径一致：`marble-living-cabin` 1.2 优先、1.1 兜底，其余包只有自己那一版。
+    ///
+    /// 它只在两个时刻被读：一次性导入权威、以及权威不可达时的只读降级。
+    /// **任何路径都不会写它**（写入口见 `LegacyWorldStatePreImage.save`）。
+    static func preImageCandidateURLs(
+        manifest: WorldManifest,
+        fileManager: FileManager = .default,
+        applicationSupportBase: URL? = nil
+    ) throws -> [URL] {
+        let current = try stateFileURL(
+            packageID: manifest.packageID,
+            packageVersion: manifest.packageVersion,
+            fileManager: fileManager,
+            applicationSupportBase: applicationSupportBase
+        )
+        guard manifest.packageID == "marble-living-cabin",
+              manifest.worldID == "84503420-3010-4944-8fde-2f383cd08ebe",
+              manifest.packageVersion == "1.2.0"
+        else { return [current] }
+        return [current, try stateFileURL(
+            packageID: manifest.packageID,
+            packageVersion: "1.1.0",
+            fileManager: fileManager,
+            applicationSupportBase: applicationSupportBase
+        )]
+    }
+
     @MainActor
     static func makeContext(
         package: BundledLivingWorldPackage,
@@ -534,21 +569,43 @@ enum LivingWorldBootstrap {
         fileManager: FileManager = .default,
         applicationSupportBase: URL? = nil
     ) throws -> WorldAgentContext {
-        let persistence = try statePersistence(
+        // 权威边界（docs/plans/2026-10-02-rust-world-authority-and-mcp.md）：
+        // `gmgn-taskd` 是**唯一**写世界状态的进程；`state.json` 降级成只读预像
+        // （一次性导入 + 出事回滚）。Swift 侧不再有世界状态持久化路径。
+        let archive = try statePersistence(
             manifest: package.manifest,
             fileManager: fileManager,
             applicationSupportBase: applicationSupportBase
+        )
+        let preImage = LegacyWorldStatePreImage(
+            archive: archive,
+            candidateURLs: try preImageCandidateURLs(
+                manifest: package.manifest,
+                fileManager: fileManager,
+                applicationSupportBase: applicationSupportBase
+            )
+        )
+        let endpoint = WorldAuthorityEndpoint(applicationSupportBase: applicationSupportBase)
+        let persistence = AuthorityWorldStatePersistence(
+            manifest: package.manifest,
+            preImage: preImage,
+            socketPath: endpoint.socketPath,
+            helperPath: endpoint.helperPath
         )
         // 许愿机的视觉放置与取物/出货点也来自声明：App 里不再有第二份数字。
         WishMachineScene.install(
             proceduralDeclaration(id: WishMachineScene.propID, in: package, fileManager: fileManager)
         )
-        return try WorldAgentContext(
+        let context = try WorldAgentContext(
             manifest: package.manifest,
             persistence: persistence,
             walkingSpeed: walkingSpeed ?? fallbackWalkingSpeed,
             capsule: collisionCapsule(worldID: package.manifest.worldID),
             propFunctionSources: propFunctionSources(in: package, fileManager: fileManager)
         )
+        // 事件通道（推送）：权威一变就推进本地投影的 `basedOnRevision`。
+        // 渲染路径仍然只读内存里的投影，**永不同步 RPC**（设计 §4.1）。
+        persistence.startEventSubscription()
+        return context
     }
 }

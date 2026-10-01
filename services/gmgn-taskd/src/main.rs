@@ -1,3 +1,5 @@
+mod artifact;
+mod cli;
 mod daemon;
 mod files;
 mod memory;
@@ -6,12 +8,32 @@ mod model;
 mod provider;
 mod resident;
 mod store;
+mod world;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
 fn main() {
-    if std::env::args().any(|s| s == "--help" || s == "-h") {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|s| s == "--help" || s == "-h") {
         println!("gmgn-taskd --root <absolute-directory> --socket <absolute-socket> --concurrency 2 [--legacy-root <absolute-directory>]");
+        println!("gmgn-taskd world-import --root <absolute-directory> --bundle <worlds.json> [--producer <name>] [--out <file>]");
+        println!("gmgn-taskd world-dump --root <absolute-directory> [--out <file>]");
         return;
+    }
+    // Offline authority tooling: same root, same database, but it takes the
+    // daemon's exclusive lock, so it cannot become a second writer.
+    let offline: Option<fn(&[String]) -> Result<i32, String>> = match args.get(1).map(String::as_str) {
+        Some("world-import") => Some(cli::world_import),
+        Some("world-dump") => Some(cli::world_dump),
+        _ => None,
+    };
+    if let Some(command) = offline {
+        match command(&args[2..]) {
+            Ok(code) => std::process::exit(code),
+            Err(message) => {
+                eprintln!("gmgn-taskd: {message}");
+                std::process::exit(1);
+            }
+        }
     }
     // Applied before any thread exists; all private SQLite journals inherit 0600.
     unsafe {

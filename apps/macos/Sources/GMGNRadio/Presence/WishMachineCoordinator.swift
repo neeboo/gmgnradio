@@ -100,6 +100,48 @@ struct WishPlacementDestination: Equatable, Sendable {
     let explicitTarget: WishPlacementTarget?
 }
 
+/// 一次**还没提交**的人类委托：工具因为信息不足（例如用户没说尺寸）而没有发出提交，
+/// 但把原授权、原工具调用编号和原参数记在这里，等用户回答之后**续上同一份委托**。
+///
+/// 为什么必须记原授权与原 `requestID`：`submit` 按 `authorizationID` 幂等
+/// （下面 `submit()` 里 `jobs.first { $0.authorizationID == authorizationID }`）。
+/// 用户回答的那一轮是**新的 run**、新的 `authorizationID` —— 若用它提交，那就是另一次
+/// 委托：多出一份授权、多出一份摆放委托，而原来那一份永远悬空。记下 (authorityID,
+/// requestID) 这一对并且只认这一对，"同一个委托"才是结构性的，而不是靠提示词自觉。
+struct WishMachinePendingDraft: Identifiable, Codable, Equatable, Sendable {
+    /// 草稿有效期：超过就不再可续。fail-closed 的方向是"让用户重说一次"，
+    /// 绝不是"那就新建一次生成"。
+    static let lifetime: TimeInterval = 24 * 60 * 60
+
+    let id: UUID
+    /// 原那一轮的人类授权（= 那一轮的 runID）。
+    let authorityID: UUID
+    /// 原那次工具调用编号：同一份委托的重放必须逐字相同，否则 `consumedAuthorization`。
+    let requestID: String
+    let attachmentID: UUID
+    let name: String
+    /// 原样的目的地参数（`WishPlacementDestination` 本身不是 Codable，这里存它的两个字段）。
+    let destinationSurfaceIDs: [String]?
+    let destinationTarget: WishPlacementTarget?
+    let worldID: String
+    let residentScope: String
+    let createdAt: Date
+    /// 还缺什么（`WishMachineContract.Need` 的 rawValue）。
+    var needs: [String]
+    /// 已经为这一份草稿问过几次。
+    var attempt: Int
+    /// 这一份委托**已经**提交出来的那个任务。非 nil 之后这份草稿不再参与"按名字+图自动续"，
+    /// 只认显式 `pending_id`：对同一个 `pending_id` 的重试一律回同一个任务（幂等重放），
+    /// 于是"重复提交"在任何时序下都长不出第二件产物。
+    var submittedJobID: UUID?
+
+    var destination: WishPlacementDestination? {
+        destinationSurfaceIDs.map { WishPlacementDestination(surfaceIDs: $0, explicitTarget: destinationTarget) }
+    }
+
+    func isExpired(now: Date) -> Bool { now.timeIntervalSince(createdAt) > Self.lifetime }
+}
+
 enum WishPlacementDelegationState: String, Codable, Sendable {
     case awaitingSubmission, pending, placed, revoked, failed
 }
@@ -196,6 +238,8 @@ enum WishMachineError: LocalizedError {
         var imageRegistrations: [ImageRegistration]?
         var delegations: [WishPlacementDelegation]?
         var webReferences: [ResidentWebReference]?
+        /// 可选 ⇒ 旧档案照常解码（读到 nil 就是"没有草稿"，行为与今天逐位相同）。
+        var pendingDrafts: [WishMachinePendingDraft]?
     }
     @Published private(set) var jobs: [WishMachineJob] = []
     @Published private(set) var errorMessage: String?
@@ -209,6 +253,7 @@ enum WishMachineError: LocalizedError {
     private var imageRegistrations: [ImageRegistration] = []
     private var delegations: [WishPlacementDelegation] = []
     private var webReferences: [ResidentWebReference] = []
+    private var pendingDrafts: [WishMachinePendingDraft] = []
     private var readable = true
 
     init(store: PropGenerationStore, directory: URL? = nil, archiveFileManager: FileManager = .default,
@@ -231,6 +276,7 @@ enum WishMachineError: LocalizedError {
                 imageRegistrations = archive.imageRegistrations ?? []
                 delegations = archive.delegations ?? []
                 webReferences = archive.webReferences ?? []
+                pendingDrafts = archive.pendingDrafts ?? []
                 // An interrupted local submit is never automatically repeated. Its grant stays consumed.
                 for index in jobs.indices where jobs[index].stage == .submitting {
                     jobs[index].stage = .submissionUncertain
@@ -554,6 +600,54 @@ enum WishMachineError: LocalizedError {
     func attachmentChoices(authorizationID: UUID, worldID: String, residentScope: String) -> [(id: UUID, displayName: String)] {
         guard readable, let authorization = authorizations.first(where: { $0.id == authorizationID && $0.worldID == worldID && $0.residentScope == residentScope }) else { return [] }
         return authorization.attachments.map { (id: $0.id, displayName: $0.displayName) }
+    }
+
+    // MARK: - 还没提交的委托（信息不足 ⇒ 问一句 ⇒ 续同一份）
+
+    /// 记下/更新一份"还没提交"的委托：原授权、原 `requestID`、原参数。
+    ///
+    /// 同一份委托只有一条：按 `id` 或 `(authorityID, requestID)` 命中即更新（并让 `attempt` +1）。
+    /// 过期草稿顺手清掉 —— 过期之后不再可续，方向是"请用户重说一次"，不是"那就新建一次生成"。
+    @discardableResult
+    func recordPendingDraft(id: UUID = UUID(), authorityID: UUID, requestID: String, attachmentID: UUID,
+                            name: String, destination: WishPlacementDestination?, needs: [String],
+                            worldID: String, residentScope: String, now: Date = Date()) throws -> WishMachinePendingDraft {
+        guard readable else { throw WishMachineError.unavailable }
+        guard !requestID.isEmpty, !worldID.isEmpty, !residentScope.isEmpty else { throw WishMachineError.wrongScope }
+        pendingDrafts.removeAll { $0.isExpired(now: now) }
+        if let index = pendingDrafts.firstIndex(where: {
+            $0.id == id || ($0.authorityID == authorityID && $0.requestID == requestID)
+        }) {
+            pendingDrafts[index].needs = needs
+            pendingDrafts[index].attempt += 1
+            try persist()
+            return pendingDrafts[index]
+        }
+        let draft = WishMachinePendingDraft(id: id, authorityID: authorityID, requestID: requestID,
+            attachmentID: attachmentID, name: name, destinationSurfaceIDs: destination?.surfaceIDs,
+            destinationTarget: destination?.explicitTarget, worldID: worldID, residentScope: residentScope,
+            createdAt: now, needs: needs, attempt: 1)
+        pendingDrafts.append(draft)
+        try persist()
+        return draft
+    }
+
+    /// 本 scope 里还没过期的草稿。读不到记录时返回空（不是"猜一份"）。
+    func pendingDrafts(worldID: String, residentScope: String, now: Date = Date()) -> [WishMachinePendingDraft] {
+        guard readable else { return [] }
+        return pendingDrafts.filter {
+            $0.worldID == worldID && $0.residentScope == residentScope && !$0.isExpired(now: now)
+        }
+    }
+
+    /// 提交成功之后把这一份草稿标成"已提交"并**留着**：同一个 `pending_id` 的再次调用
+    /// 会被解析成同一个任务（幂等重放），而不是新建一件。崩在标记之前也没关系 ——
+    /// 复核看的是"这份授权下有没有任务"，标记只是让**自动**续办不再重复命中它。
+    func markPendingDraftSubmitted(id: UUID, jobID: UUID, now: Date = Date()) throws {
+        guard readable else { throw WishMachineError.unavailable }
+        guard let index = pendingDrafts.firstIndex(where: { $0.id == id }) else { return }
+        pendingDrafts[index].submittedJobID = jobID
+        try persist()
     }
 
     func claimEvidence(id: UUID, worldID: String, residentScope: String) throws -> WishMachineClaimEvidence? {
@@ -985,7 +1079,8 @@ enum WishMachineError: LocalizedError {
             try archiveFileManager.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             let file = directory.appendingPathComponent("wishes.json")
             try JSONEncoder().encode(Archive(authorizations: authorizations, jobs: jobs, events: events,
-                imageRegistrations: imageRegistrations, delegations: delegations, webReferences: webReferences))
+                imageRegistrations: imageRegistrations, delegations: delegations, webReferences: webReferences,
+                pendingDrafts: pendingDrafts))
                 .write(to: temporary, options: .withoutOverwriting)
             try archiveFileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
             // Preparation may fail without changing the old archive. Rename is the sole

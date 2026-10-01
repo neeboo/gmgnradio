@@ -915,7 +915,7 @@ let inputs = ["Presence/PropGenerationClient", "Presence/PropGenerationStore", "
     "Presence/WishMachineCoordinator", "Presence/WishMachineOutputDescriptor", "Presence/WishMachineOutputRenderer",
     "Presence/WishMachineScene", "Presence/ResidentPropPlacementService", "Presence/ResidentPropPlacementConfiguration",
     "Presence/ResidentPerformanceMotionPolicy",
-    "Agent/ResidentWishMachineTools", "Agent/ResidentPropToolBridge", "Agent/WorldAgentContext", "Agent/WorldAgentToolContract", "Agent/WorldAgentToolDispatcher"]
+    "Agent/WishMachineContract", "Agent/ResidentWishMachineTools", "Agent/ResidentPropToolBridge", "Agent/WorldAgentContext", "Agent/WorldAgentToolContract", "Agent/WorldAgentToolDispatcher"]
     .map { sources.appendingPathComponent($0 + ".swift").path }
     + [root.appendingPathComponent("tools/fixtures/WishMachineDaemonFixture.swift").path]
 func run(_ path: String, _ arguments: [String]) throws -> Int32 {

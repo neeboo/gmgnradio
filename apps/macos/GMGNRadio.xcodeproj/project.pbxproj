@@ -51,10 +51,12 @@
 		251B4EF8A51EF72D0E814A37 /* LiveCamPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18FEBEBDF5BD28DA798CE26C /* LiveCamPanel.swift */; };
 		26DE6183B12DE5D77D1763AD /* WishMachineOutputRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA7F9FDF7793356A5FEDD393 /* WishMachineOutputRenderer.swift */; };
 		2706F8FB62D1D7AD47F741A6 /* ResidentCodexAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6A2706F1096408AB7F075EA /* ResidentCodexAgent.swift */; };
+		275721C52EB2378645AE048D /* WishMachineContract.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6D3D91BCF20583E4035282C /* WishMachineContract.swift */; };
 		27E2FC5E6DCC32BD3EBE52AC /* PMXAvatarMetalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A6D2B6F929D4352B28477BF /* PMXAvatarMetalView.swift */; };
 		285A92ABFCB741A3A097E4F0 /* ResidentWorldObservation.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABAA7C464C8C13EA57082B04 /* ResidentWorldObservation.swift */; };
 		2A26F8968E03BC2900222337 /* DuckingEnvelopeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4DD12D460EA71333952EBAB /* DuckingEnvelopeTests.swift */; };
 		2BA9B1BEE7247E41156D4B53 /* CodexPlanningExecutor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 977A9FD8072469DD8A215BC8 /* CodexPlanningExecutor.swift */; };
+		2C9AEFE80D992E7CDBDA41B5 /* WorldAuthorityClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CD6F11948A8443229AD4E83 /* WorldAuthorityClient.swift */; };
 		2CAE7AC3DD788FE1CD3D0E59 /* MotionPackageStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 156B582F0FC7CCEDEBF3C16A /* MotionPackageStore.swift */; };
 		2D37209DE2C9436846F79D76 /* ResidentVisionCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEAA3EE93DD1EF8B9F73F37E /* ResidentVisionCapture.swift */; };
 		2D4E0673D2067888218B2BF5 /* DJStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBB583E2AA3BD7F6DA17AED6 /* DJStateTests.swift */; };
@@ -126,6 +128,7 @@
 		61BB35DA9B528F5AFC2CEBD6 /* StageOverlayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4F34AA02B66339224A58988 /* StageOverlayView.swift */; };
 		62752D964CF41A33D26E1F0A /* AudioGraphTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 924E63369530F9D30968DB09 /* AudioGraphTests.swift */; };
 		6457881F70FAC522542403A5 /* PresencePackageStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6928DE615B4CCBB86C03160 /* PresencePackageStoreTests.swift */; };
+		665EEC63C06CE7E466CA359F /* AuthorityWorldStatePersistence.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71266E37A62F209BB883C837 /* AuthorityWorldStatePersistence.swift */; };
 		6663E63CBD50E0B8BE5DF04C /* MusicProviderSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 19D1AC1EED8E537124163209 /* MusicProviderSession.swift */; };
 		6692E2E943A70B2A96CB57F0 /* CandidatePoolBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6140AFA7ADC6446BA3A1508C /* CandidatePoolBuilder.swift */; };
 		68928B80FD3BD85BC656E924 /* ElevenLabs in Frameworks */ = {isa = PBXBuildFile; productRef = C87548AD309AC59561DE9A6E /* ElevenLabs */; };
@@ -322,6 +325,7 @@
 		092847F744B03CB570080C5E /* PlaybackPreflightTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackPreflightTests.swift; sourceTree = "<group>"; };
 		09494436AADC40C3833A6FC5 /* VisualAudioInputPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VisualAudioInputPolicy.swift; sourceTree = "<group>"; };
 		0B9566EF5419AE430CF03314 /* ResidentMemoryClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentMemoryClient.swift; sourceTree = "<group>"; };
+		0CD6F11948A8443229AD4E83 /* WorldAuthorityClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldAuthorityClient.swift; sourceTree = "<group>"; };
 		0CF4BBDAD919719A1DBF7F9E /* ResidentPropRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentPropRenderer.swift; sourceTree = "<group>"; };
 		0D14F4B7076E6DE288719ECF /* MusicLibraryIndex.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicLibraryIndex.swift; sourceTree = "<group>"; };
 		0E16B502423D8CB2B119C833 /* RemoteMotionLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteMotionLibrary.swift; sourceTree = "<group>"; };
@@ -436,6 +440,7 @@
 		6F3F12D9FCEF10F8F3B6C395 /* FoliaSceneRuntimeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FoliaSceneRuntimeTests.swift; sourceTree = "<group>"; };
 		6F9A8C301E3E7F635CC216D7 /* InterruptionCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InterruptionCoordinator.swift; sourceTree = "<group>"; };
 		7042ABB00311D453A5D5E557 /* PropImagePreparation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PropImagePreparation.swift; sourceTree = "<group>"; };
+		71266E37A62F209BB883C837 /* AuthorityWorldStatePersistence.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthorityWorldStatePersistence.swift; sourceTree = "<group>"; };
 		72746C2E884A529073F5550A /* VMDBezierSampler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VMDBezierSampler.swift; sourceTree = "<group>"; };
 		7360AD86FFC5FB484F6B480C /* MMDSceneKit */ = {isa = PBXFileReference; lastKnownFileType = folder; name = MMDSceneKit; path = Packages/MMDSceneKit; sourceTree = SOURCE_ROOT; };
 		7454D982AE3249A42B198F3D /* MarbleWorld.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarbleWorld.swift; sourceTree = "<group>"; };
@@ -479,6 +484,7 @@
 		A4C1A38CFE1FE5149D76CC08 /* OrbUniformTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbUniformTests.swift; sourceTree = "<group>"; };
 		A4E48BCF663DCFB840547923 /* BailianRealtimeEventMapper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BailianRealtimeEventMapper.swift; sourceTree = "<group>"; };
 		A6BB37F2A8F0EA85DC0BB42E /* WishMachineTaskPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WishMachineTaskPresentation.swift; sourceTree = "<group>"; };
+		A6D3D91BCF20583E4035282C /* WishMachineContract.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WishMachineContract.swift; sourceTree = "<group>"; };
 		A961113D1516220877214877 /* CodexAgentAccountService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexAgentAccountService.swift; sourceTree = "<group>"; };
 		ABAA7C464C8C13EA57082B04 /* ResidentWorldObservation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentWorldObservation.swift; sourceTree = "<group>"; };
 		ABCECE81B89991B2CE5556C5 /* MMDMotions */ = {isa = PBXFileReference; lastKnownFileType = folder; name = MMDMotions; path = Resources/MMDMotions; sourceTree = SOURCE_ROOT; };
@@ -769,6 +775,7 @@
 				4C7A2D03F5D5146ABBED6DBA /* ResidentWishReferenceTools.swift */,
 				ABAA7C464C8C13EA57082B04 /* ResidentWorldObservation.swift */,
 				2B3D886F759F9B2EBE61D14B /* ResidentWorldToolSession.swift */,
+				A6D3D91BCF20583E4035282C /* WishMachineContract.swift */,
 				015185F407965D5142B0841B /* WorldAgentContext.swift */,
 				4979C002BFA7259332C1AF5A /* WorldAgentToolContract.swift */,
 				32A2EEC6990DDCC724DE137A /* WorldAgentToolDispatcher.swift */,
@@ -967,6 +974,7 @@
 		89F2AA25D318725B8CCE37D6 /* Presence */ = {
 			isa = PBXGroup;
 			children = (
+				71266E37A62F209BB883C837 /* AuthorityWorldStatePersistence.swift */,
 				B2CF2D3E1DDB2710C1854C97 /* MotionFormatFilter.swift */,
 				E3B27450671FA8F17944A1BC /* MotionLibraryCategory.swift */,
 				156B582F0FC7CCEDEBF3C16A /* MotionPackageStore.swift */,
@@ -1009,6 +1017,7 @@
 				BA7F9FDF7793356A5FEDD393 /* WishMachineOutputRenderer.swift */,
 				C5059330FDA14A7DEE4D57E5 /* WishMachineScene.swift */,
 				A6BB37F2A8F0EA85DC0BB42E /* WishMachineTaskPresentation.swift */,
+				0CD6F11948A8443229AD4E83 /* WorldAuthorityClient.swift */,
 			);
 			path = Presence;
 			sourceTree = "<group>";
@@ -1432,6 +1441,7 @@
 				F9E9274E334132FE64AFC6B0 /* AudioDeviceMonitor.swift in Sources */,
 				BC40F7C048A99BA508438443 /* AudioFeatureFrame.swift in Sources */,
 				ADBCA5536133900F3591140C /* AudioGraphController.swift in Sources */,
+				665EEC63C06CE7E466CA359F /* AuthorityWorldStatePersistence.swift in Sources */,
 				F7389A2ED65FC4849A86CEC4 /* BailianRealtimeEventMapper.swift in Sources */,
 				6692E2E943A70B2A96CB57F0 /* CandidatePoolBuilder.swift in Sources */,
 				DD34674AE84A35C15E3EB4A7 /* CodexAgentAccountService.swift in Sources */,
@@ -1605,6 +1615,7 @@
 				E07CACC669D4A648231EE3A0 /* VisualAudioFeatureExtractor.swift in Sources */,
 				D8CF6A2326DE3E3C6DA2F3E4 /* VisualAudioInputPolicy.swift in Sources */,
 				330C60A11D6B3849DFAFCE65 /* WindowPlacement.swift in Sources */,
+				275721C52EB2378645AE048D /* WishMachineContract.swift in Sources */,
 				FDE42F58BFC9B17F79A82107 /* WishMachineCoordinator.swift in Sources */,
 				B6A4696B49C6BBA8EDDB7B92 /* WishMachineOutputDescriptor.swift in Sources */,
 				26DE6183B12DE5D77D1763AD /* WishMachineOutputRenderer.swift in Sources */,
@@ -1613,6 +1624,7 @@
 				BB0112E2A1FB4A53193103FD /* WorldAgentContext.swift in Sources */,
 				7B5FE2C2BD09CA693E0FE5D3 /* WorldAgentToolContract.swift in Sources */,
 				FE33D1065264BA512AC4078F /* WorldAgentToolDispatcher.swift in Sources */,
+				2C9AEFE80D992E7CDBDA41B5 /* WorldAuthorityClient.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
