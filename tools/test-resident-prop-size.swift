@@ -86,6 +86,21 @@ guard editorViewSource.contains("state.resize(toLongestEdge:"),
     print("FAIL: the decoration panel must offer a size control (slider / fine steps) and read the row status from that single source")
     exit(1)
 }
+// 挂点（slot）：编辑器状态里那两行（"面板选中的挂点" / "已挂载就读世界状态"）读
+// `PropAttachmentPoint` 与 `WorldPropSlot.attachmentPoint`。它们的真定义在依赖渲染侧类型的
+// `PropAttachment.swift` / `PropAttachmentSlot.swift` 里 ⇒ 按本 harness 一贯的手法**逐字**
+// 切出来注入程序（不是在这儿抄一份映射）。
+let propAttachmentSource = try String(
+    contentsOf: sourceRoot.appendingPathComponent("Presence/PropAttachment.swift"), encoding: .utf8)
+let propAttachmentSlotSource = try String(
+    contentsOf: sourceRoot.appendingPathComponent("Presence/PropAttachmentSlot.swift"), encoding: .utf8)
+guard let propAttachmentPointDeclaration = declaration(in: propAttachmentSource, "enum PropAttachmentPoint:"),
+      let propAttachmentWorldSlotExtension = declaration(in: propAttachmentSlotSource, "extension PropAttachmentPoint {"),
+      let worldSlotAttachmentPointExtension = declaration(in: propAttachmentSlotSource, "extension WorldPropSlot {") else {
+    print("FAIL: 切不出挂点的类型声明（`enum PropAttachmentPoint:` / 两条映射的签名改了？）"); exit(1)
+}
+let propAttachmentShim = [propAttachmentPointDeclaration, propAttachmentWorldSlotExtension, worldSlotAttachmentPointExtension]
+    .joined(separator: "\n")
 
 let harness = #"""
 import Foundation
@@ -99,6 +114,8 @@ import simd
 \#(outputDescriptorSource)
 
 \#(editorStateSource)
+
+\#(propAttachmentShim)
 
 /// 真机那把剑的 GLB（尺寸标定的现场）。
 let swordModelPath = NSHomeDirectory() + "/Library/Application Support/gmgn radio/TaskService/4210DB95-9253-4CAF-83A3-3C45F090B099.glb"
@@ -500,6 +517,14 @@ viewCheck.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
 viewCheck.arguments = ["-j1", "-typecheck", "-swift-version", "6", "-I", build.appendingPathComponent("Modules").path,
     root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/ResidentPropEditorState.swift").path,
     root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/PropSupportGridPresentation.swift").path,
+    // 挂点（slot）：面板那一行读 `PropAttachmentSlots.displayName` / `PropAttachmentPoint.allCases`，
+    // 编辑器状态读 `held.hand.attachmentPoint`。挂点表的**真定义**在 PropAttachmentSlot.swift
+    // （它要 PropGripInference），而 `PropAttachmentPoint` 的真定义在依赖渲染侧类型的
+    // PropAttachment.swift 里 ⇒ 类型用只含三个 case 的替身（数值/骨名一条都不在它里面，
+    // 那些由 tools/test-resident-prop-hold.swift 切真源码钉住）。
+    root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/PropGripInference.swift").path,
+    root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/PropAttachmentSlot.swift").path,
+    root.appendingPathComponent("tools/fixtures/PropAttachmentPointShim.swift").path,
     root.appendingPathComponent("apps/macos/Sources/GMGNRadio/VisualEngine/ResidentPropEditorView.swift").path]
 try viewCheck.run(); viewCheck.waitUntilExit()
 guard viewCheck.terminationStatus == 0 else { print("FAIL: 摆放面板（尺寸控件那一段）编译不过"); exit(1) }
