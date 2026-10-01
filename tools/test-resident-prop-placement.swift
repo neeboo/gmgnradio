@@ -119,6 +119,24 @@ func attachmentLine(_ prefix: String, _ what: String) -> String {
 }
 let holdableMetersLine = attachmentLine("static let holdableLongestEdgeMeters", "手持上限")
 let holdableTextLine = attachmentLine("static var holdableLongestEdgeText", "手持上限文案")
+/// 从生产源码里**逐字**抽出一个完整声明（含花括号内全部内容）：同一个文件里的其它类型
+/// （`PropAttachmentPoint`）也被 `ResidentPropPlacementService` 读到，同样不许在这儿抄一份。
+/// 花括号配对取，所以它将来多几个 case 也照样跟着过来。
+func attachmentType(_ signature: String) -> String {
+    guard let start = attachmentText.range(of: signature)?.lowerBound,
+          let open = attachmentText[start...].firstIndex(of: "{") else {
+        print("FAIL: PropAttachment.swift 里找不到 \(signature)")
+        exit(1)
+    }
+    var depth = 0
+    for index in attachmentText[open...].indices {
+        if attachmentText[index] == "{" { depth += 1 }
+        if attachmentText[index] == "}" { depth -= 1 }
+        if depth == 0 { return String(attachmentText[start...index]) }
+    }
+    print("FAIL: \(signature) 的花括号不平衡")
+    exit(1)
+}
 guard serviceText.contains("<= ResidentPropAttachmentEligibility.holdableLongestEdgeMeters") else {
     print("FAIL: 手持判据必须读唯一那份上限（`holdableLongestEdgeMeters`），不许写死数字")
     exit(1)
@@ -159,6 +177,8 @@ enum ResidentPropAttachmentEligibility {
  \#(holdableMetersLine)
  \#(holdableTextLine)
 }
+/// 挂点类型同样是 `PropAttachment.swift` 里的生产声明，服务读它 —— 逐字抽出来，不抄一份。
+\#(attachmentType("enum PropAttachmentPoint:"))
 struct Floor: WorldCollisionQuerying {
  func canOccupy(_ c: WorldCapsule,at p: SIMD3<Float>)->Bool { p.x < 9 }
  func groundHeight(at p: SIMD3<Float>)->Float? { 0 }
@@ -288,7 +308,7 @@ let flatWorld=FlatSupport(minimumX:-1,maximumX:5.5,minimumZ:-1,maximumZ:10,heigh
   let placed=context.state
   var savedAvatarID = "pmx.2b-miss-0414-standard"
   let failingHold=ResidentPropPlacementService(context:context,support:{flat},
-    currentAvatarAssetID:{savedAvatarID},makeGripCalibration:{ prop,avatarID in
+    currentAvatarAssetID:{savedAvatarID},makeGripCalibration:{ prop,avatarID,_ in
       .init(avatarAssetID:avatarID,hand:.rightHand,normalizedGrip:.init(x:0.5,y:0.2,z:0.5),
         localOffset:.init(x:0,y:0,z:0),localRotation:.init(x:0,y:0,z:0,w:1))
     })
@@ -356,7 +376,7 @@ let flatWorld=FlatSupport(minimumX:-1,maximumX:5.5,minimumZ:-1,maximumZ:10,heigh
   do { _ = try routing.preview(objectID:"prop2",placement:.init(surfaceID:"floor",position:.init(x:5,y:0,z:5),yaw:0)); fatalError("overlapping props accepted") }
   catch let error as ResidentPropPlacementError { require(error == .blockedBySupport(.blockedByPlacedProp("prop1")) || error == .blockedBySupport(.blockedByPlacedProp("prop2")),"wrong overlap rejection: \(error)") }
   let holding=ResidentPropPlacementService(context:routeContext,support:{routeFlat},
-    currentAvatarAssetID:{"pmx.2b-miss-0414-standard"},makeGripCalibration:{ prop,avatarID in
+    currentAvatarAssetID:{"pmx.2b-miss-0414-standard"},makeGripCalibration:{ prop,avatarID,_ in
       .init(avatarAssetID:avatarID,hand:.rightHand,normalizedGrip:.init(x:0.5,y:0.2,z:0.5),
         localOffset:.init(x:0,y:0,z:0),localRotation:identity)
     })

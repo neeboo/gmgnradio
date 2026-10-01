@@ -112,13 +112,15 @@ check(definitionFiles == [gripPath],
       "握点缺省必须只有一处定义（\(gripPath)），实测 \(definitionFiles)")
 
 // 负对照：往**源码副本**里塞第二处来源 ⇒ 上面那条判据必须数得出两份。
-let secondSourceCopy = attachmentSource.replacingOccurrences(
-    of: "let suggestion = PropGripInference.suggestion(for: prop)",
-    with: "let suggestion = PropGripInference.suggestion(for: prop)\n        _ = WorldVector3(x: 0.5, y: 0.2, z: 0.5) // normalizedGrip: WorldVector3(x:"
+// 注入点放在挂点表上：那正是"手那套缺省被抄到第二个地方"最可能发生的地方。
+let secondSourceCopy = slotSource.replacingOccurrences(
+    of: "case .back, .waist: WorldVector3(x: 0.5, y: 0.5, z: 0.5)",
+    with: "case .back, .waist: WorldVector3(x: 0.5, y: 0.2, z: 0.5)   // normalizedGrip: WorldVector3(x:"
 )
+check(secondSourceCopy != slotSource, "负对照的注入点失效了（挂点表里那句默认握点找不到了）")
 let injectedDefinitions = try gripDefinitionFiles(
     in: swiftFiles(under: "apps/macos/Sources/GMGNRadio"),
-    overrides: [attachmentPath: secondSourceCopy]
+    overrides: [slotPath: secondSourceCopy]
 )
 check(injectedDefinitions.count == 2,
       "负对照失败：注入第二处握点来源之后判据居然还是 \(injectedDefinitions.count) 处")
@@ -655,21 +657,25 @@ import simd
               "吊在背上/腰上的东西挂的是网格中点，不是手那套柄端握点")
 
         /// 剑尖世界方向与"挂点要的方向"的夹角（同一份 `pose × 局部`，只是把标定换掉）。
-        func bladeDegrees(point: PropAttachmentPoint, calibration: WorldPropGripCalibration) throws -> Float {
+        ///
+        /// 探针必须沿**原始网格**的最长轴 —— 这把剑的 AABB 是 1.005(X) × 0.133(Y) × 0.057(Z)，
+        /// 最长轴是 X（与上面那条手持判据用的是同一根轴：`gripPoint + (0.4, 0, 0)`）。
+        func slotBladeDegrees(point: PropAttachmentPoint, calibration: WorldPropGripCalibration) throws -> Float {
             let descriptor = ResidentHeldPropDescriptor(
                 objectID: "prop", worldID: "world", assetID: "sha",
                 modelURL: URL(fileURLWithPath: "/tmp/sword.glb"),
                 targetHeightMeters: 1.1, attachmentPoint: point, calibration: calibration, orientation: upright)
             let matrix = try PropAttachmentMatrix.transform(
                 minimum: minimum, maximum: maximum, descriptor: descriptor, handPose: poseOne)
-            let origin = worldPoint(matrix, SIMD3<Float>(0, 0, 0))
-            let tip = worldPoint(matrix, SIMD3<Float>(0, 0.5, 0))
+            let meshCentre = minimum + (maximum - minimum) * SIMD3<Float>(0.5, 0.5, 0.5)
+            let origin = worldPoint(matrix, meshCentre)
+            let tip = worldPoint(matrix, meshCentre + SIMD3<Float>(0.1, 0, 0))
             let worldBlade = simd_normalize(tip - origin)
             let expected = simd_normalize(poseRotation * PropAttachmentSlots.bladeDirectionInBoneSpace(for: point))
             return acos(max(-1, min(1, simd_dot(worldBlade, expected)))) * 180 / .pi
         }
-        let backBlade = try bladeDegrees(point: .back, calibration: backCalibration)
-        let waistBlade = try bladeDegrees(point: .waist, calibration: waistCalibration)
+        let backBlade = try slotBladeDegrees(point: .back, calibration: backCalibration)
+        let waistBlade = try slotBladeDegrees(point: .waist, calibration: waistCalibration)
         check(backBlade < 1.0, "背后斜挂：刀身方向与挂点要的方向夹角 \(backBlade)°（必须 < 1°）")
         check(waistBlade < 1.0, "腰间横挂：刀身方向与挂点要的方向夹角 \(waistBlade)°（必须 < 1°）")
         // 负对照：不校准（直接用推断给手的那份旋转）⇒ 背后就不会是斜挂。
@@ -678,7 +684,7 @@ import simd
             normalizedGrip: WorldVector3(x: 0.5, y: 0.5, z: 0.5),
             localOffset: PropAttachmentSlots.defaultOffsetMeters(for: .back),
             localRotation: suggestion.localRotation)
-        let uncalibratedDegrees = try bladeDegrees(point: .back, calibration: uncalibrated)
+        let uncalibratedDegrees = try slotBladeDegrees(point: .back, calibration: uncalibrated)
         check(uncalibratedDegrees > 20,
               "负对照失败：不做挂点朝向校准，背后的刀身居然还贴着骨轴（实测 \(uncalibratedDegrees)°）")
 

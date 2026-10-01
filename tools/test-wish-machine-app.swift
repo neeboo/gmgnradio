@@ -33,7 +33,10 @@ check(app.contains("resume_wish_continuation") && app.contains("仅更新居民�
 // 提示词里写死任何一个数（哪怕恰好等于上限）都会红，因为上限改了它不会跟着改。
 check(app.contains("正式领取且最长边不超过 \\(ResidentPropAttachmentEligibility.holdableLongestEdgeText)的小道具"), "resident prompt must describe the actual hand-held size boundary by interpolating the single limit definition")
 check(!app.contains("45 厘米"), "resident prompt must not hardcode a second copy of the hand-held size boundary")
-check(app.contains("当前已适配的 2B 右手"), "resident prompt must identify the currently supported avatar hand")
+// 挂点（手 / 背后 / 腰间）落地后提示词的措辞变了：这里钉的是**它必须说的东西**
+// （已适配的角色 + 支持的挂点），不是某一句固定措辞 —— 措辞再改也不该让它变成
+// "红着没人管"，但少说一个挂点就会红。
+check(app.contains("当前已适配的 2B") && ["右手", "背后", "腰间"].allSatisfy { app.contains($0) }, "resident prompt must identify the currently supported avatar and every supported slot")
 check(app.contains("hold_prop、adjust_held_prop_grip、return_held_prop"), "resident prompt must direct the agent to formal held-prop tools")
 check(!app.contains("没有冲泡、战斗或手持功能"), "resident prompt must not deny the implemented hand-held capability")
 print("PASS: \(checks) wish-machine App wiring checks (no host launch)")

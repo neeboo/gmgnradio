@@ -4147,7 +4147,7 @@ final class AppDelegate:
                      modelURL: asset.descriptor.modelURL, targetHeightMeters: prop.effectiveSize.y,
                      // 挂在哪个挂点是**持久状态自己说的话**（`WorldHeldProp.hand` / 标定里的 `hand`），
                      // 不是这里再写死一个右手。
-                     attachmentPoint: held.attachmentPoint, calibration: calibration,
+                     attachmentPoint: held.hand.attachmentPoint, calibration: calibration,
                      // 手持与已摆共用同一份资产级摆正旋转（同一个出口）。
                      orientation: asset.prop.orientationRotation)
     }

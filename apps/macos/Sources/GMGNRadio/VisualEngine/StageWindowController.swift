@@ -283,7 +283,7 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     func configureResidentPropEditor(
         preview: @escaping @MainActor (String, WorldPropPlacement) async throws -> WorldObjectState,
         commit: @escaping @MainActor (WorldPropLayoutCommand, UInt64, String) async throws -> ResidentPropEditorSnapshot,
-        hold: (@MainActor (String, UInt64, String) async throws -> ResidentPropEditorSnapshot)? = nil,
+        hold: (@MainActor (String, PropAttachmentPoint, UInt64, String) async throws -> ResidentPropEditorSnapshot)? = nil,
         adjustHeldGrip: (@MainActor (String, WorldVector3, WorldQuaternion, UInt64, String) async throws -> ResidentPropEditorSnapshot)? = nil,
         returnHeld: (@MainActor (String, UInt64, String) async throws -> ResidentPropEditorSnapshot)? = nil,
         refreshSnapshot: (@MainActor () -> ResidentPropEditorSnapshot?)? = nil,

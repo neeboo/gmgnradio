@@ -88,9 +88,20 @@ enum PropAttachmentSlots {
     /// 用户/agent 说的那句话 → 挂点。认不出来就是 `nil`，**不许猜一个**。
     ///
     /// 认的既有工具参数用的英文标识（`rightHand` / `back` / `waist`），也有用户嘴里那几种说法
-    /// （"挂背后" / "挂腰上" / "拿手里"）—— 但只有这一处认识它们，别处不许再写一份别名表。
+    /// （"挂背后" / "挂腰上" / "拿手里"）。**别名表只有这一处**，别处不许再写一份。
     static func resolve(name: String) -> PropAttachmentPoint? {
-        switch name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let point = exactResolve(trimmed) { return point }
+        // "拿手里 / 挂背后 / 挂腰上"：去掉开头那个动词再认一次。**只在去掉之后认得出来时才认**，
+        // 所以"背后"这种本身就以动词字开头的说法不会被切坏。
+        for verb in ["拿", "挂", "放", "别", "戴", "系", "带"] where trimmed.hasPrefix(verb) {
+            if let point = exactResolve(String(trimmed.dropFirst())) { return point }
+        }
+        return nil
+    }
+
+    private static func exactResolve(_ text: String) -> PropAttachmentPoint? {
+        switch text {
         case "righthand", "right_hand", "hand", "手", "手里", "手上", "右手": .rightHand
         case "back", "背后", "背上", "后背": .back
         case "waist", "hip", "腰间", "腰上", "腰": .waist

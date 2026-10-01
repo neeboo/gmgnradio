@@ -125,6 +125,18 @@ struct WorldPropGripCalibration: Codable, Equatable, Sendable {
     let normalizedGrip: WorldVector3
     let localOffset: WorldVector3
     let localRotation: WorldQuaternion
+    /// 与生产 `WorldPropLayout.swift` 逐字同一套边界（挂点表造标定时要过它）。
+    var isValid: Bool {
+        guard !avatarAssetID.isEmpty, avatarAssetID.count <= 256 else { return false }
+        let grip = [normalizedGrip.x, normalizedGrip.y, normalizedGrip.z]
+        guard grip.allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= 1 }) else { return false }
+        let offset = [localOffset.x, localOffset.y, localOffset.z]
+        guard offset.allSatisfy({ $0.isFinite && abs($0) <= 2 }) else { return false }
+        let rotation = [localRotation.x, localRotation.y, localRotation.z, localRotation.w]
+        guard rotation.allSatisfy(\.isFinite) else { return false }
+        let lengthSquared = rotation.reduce(Float.zero) { $0 + $1 * $1 }
+        return lengthSquared.isFinite && abs(lengthSquared - 1) <= 0.01
+    }
 }
 struct WorldGeneratedProp: Codable, Equatable, Sendable {
     let objectID: String
@@ -253,11 +265,12 @@ func check(_ condition: Bool, _ message: String) {
               && PropAttachmentSlots.defaultOffsetMeters(for: .waist) != WorldVector3(x: 0, y: 0, z: 0),
               "背后/腰间必须有自己的默认偏移，不是把手那套 (0,0,0) 套上去")
         check(PropAttachmentSlots.resolve(name: "back") == .back
-              && PropAttachmentSlots.resolve(name: "挂背后") == nil
+              && PropAttachmentSlots.resolve(name: "挂背后") == .back
               && PropAttachmentSlots.resolve(name: "背后") == .back
-              && PropAttachmentSlots.resolve(name: "腰上") == .waist
+              && PropAttachmentSlots.resolve(name: "挂腰上") == .waist
               && PropAttachmentSlots.resolve(name: "拿手里") == .rightHand
-              && PropAttachmentSlots.resolve(name: "头顶") == nil,
+              && PropAttachmentSlots.resolve(name: "头顶") == nil
+              && PropAttachmentSlots.resolve(name: "帽子") == nil,
               "挂点别名表只有一处，认不出来就 nil（不许猜一个挂点）")
         check(PropAttachmentSlots.displayName(for: .rightHand) == "右手"
               && PropAttachmentSlots.displayName(for: .back) == "背后"

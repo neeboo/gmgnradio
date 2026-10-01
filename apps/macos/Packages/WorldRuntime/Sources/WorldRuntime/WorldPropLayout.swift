@@ -212,7 +212,10 @@ public struct WorldPropGripCalibration: Codable, Equatable, Sendable {
 public struct WorldHeldProp: Codable, Equatable, Sendable {
     public let objectID: String
     public let avatarAssetID: String
-    public let hand: WorldPropHand
+    /// **挂点**（旧字段名 `hand` 与原始值都不动 ⇒ 旧存档逐字节可解）。
+    /// `var` 是因为"换挂点"走既有的 `.adjustGrip`：就地把这件东西从手里挪到背后，
+    /// 而不是先放回再拿起。
+    public var hand: WorldPropSlot
     public var returnState: WorldObjectState
 
     public init(

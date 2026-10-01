@@ -43,8 +43,28 @@ func attachmentType(_ signature: String) -> String {
     print("FAIL: \(signature) 的花括号不平衡")
     exit(1)
 }
+/// `WorldRuntime` 的挂点 → 渲染侧挂点的换算（真实定义在 `PropAttachmentSlot.swift` 里，
+/// 那份文件也依赖 app 目标）。同样是**逐字**抽出来，不是抄一份映射。
+let attachmentSlotSource = try String(contentsOf: sourceRoot.appendingPathComponent("Presence/PropAttachmentSlot.swift"),
+                                      encoding: .utf8)
+func attachmentSlotType(_ signature: String) -> String {
+    guard let start = attachmentSlotSource.range(of: signature)?.lowerBound,
+          let open = attachmentSlotSource[start...].firstIndex(of: "{") else {
+        print("FAIL: PropAttachmentSlot.swift 里找不到 \(signature)")
+        exit(1)
+    }
+    var depth = 0
+    for index in attachmentSlotSource[open...].indices {
+        if attachmentSlotSource[index] == "{" { depth += 1 }
+        if attachmentSlotSource[index] == "}" { depth -= 1 }
+        if depth == 0 { return String(attachmentSlotSource[start...index]) }
+    }
+    print("FAIL: \(signature) 的花括号不平衡")
+    exit(1)
+}
 let attachmentEligibilityShim = """
 \(attachmentType("enum PropAttachmentPoint:"))
+\(attachmentSlotType("extension WorldPropSlot {"))
 enum ResidentPropAttachmentEligibility {
     \(attachmentDeclaration("static let holdableLongestEdgeMeters"))
     \(attachmentDeclaration("static var holdableLongestEdgeText"))
