@@ -207,6 +207,45 @@ check(writesTransforms(boneWriteCopy),
       "负对照失败：注入写骨骼之后 writesTransforms 居然没看出来")
 
 // ---------------------------------------------------------------------------
+// 【挂点 · 状态归属】换挂点必须写进**持久状态**，不是只活在内存/元数据里
+// ---------------------------------------------------------------------------
+let worldLayoutPath = "apps/macos/Packages/WorldRuntime/Sources/WorldRuntime/WorldPropLayout.swift"
+let simulationPath = "apps/macos/Packages/WorldRuntime/Sources/WorldRuntime/WorldSimulation.swift"
+let worldLayoutSource = try readSource(worldLayoutPath)
+let simulationSource = try readSource(simulationPath)
+
+check(worldLayoutSource.contains("public enum WorldPropSlot: String, Codable, Equatable, Sendable {")
+      && worldLayoutSource.contains("case rightHand")
+      && worldLayoutSource.contains("case back")
+      && worldLayoutSource.contains("case waist")
+      && worldLayoutSource.contains("public typealias WorldPropHand = WorldPropSlot"),
+      "挂点枚举必须保留 `rightHand` 这个**原始值**与旧名别名（旧存档逐字节可解）")
+check(!worldLayoutSource.contains(#"case rightHand = ""#),
+      "`rightHand` 不许被改名成别的原始值 —— 旧存档里写的就是 `\"hand\":\"rightHand\"`")
+check(worldLayoutSource.contains("public let hand: WorldPropHand"),
+      "标定里的挂点**字段名**必须还是 `hand`（旧存档的 JSON 键就是它，泛化时不许顺手改名）")
+
+/// 「换挂点是不是真的落进持久状态」。判据与负对照共用同一个函数。
+func slotChangeIsPersisted(worldLayout: String, simulation: String) -> Bool {
+    // ① 挂点住在 `WorldHeldProp` 里（Codable ⇒ 随世界状态一起落盘，重启仍在）。
+    worldLayout.contains("public var hand: WorldPropSlot")
+        // ② `.hold` 把标定里的挂点存进去（不再写死 rightHand）。
+        && simulation.contains("hand: calibration.hand")
+        // ③ 换挂点走 `.adjustGrip` 时就地更新**持久字段**，不是只改标定元数据。
+        && simulation.contains("held.hand = calibration.hand")
+}
+check(slotChangeIsPersisted(worldLayout: worldLayoutSource, simulation: simulationSource),
+      "换挂点必须写进 `WorldHeldProp.hand`（持久状态、Codable、重启仍在），只改内存/元数据不算")
+
+// 负对照：把「换挂点写进 heldProp」那一行删掉（= 只改标定元数据）。
+let memoryOnlySimulation = simulationSource.replacingOccurrences(
+    of: "held.hand = calibration.hand", with: "_ = calibration.hand")
+check(memoryOnlySimulation != simulationSource,
+      "负对照的前提没了：WorldSimulation 里找不到 `held.hand = calibration.hand`")
+check(!slotChangeIsPersisted(worldLayout: worldLayoutSource, simulation: memoryOnlySimulation),
+      "负对照失败：换挂点只改内存时判据居然还说它持久")
+
+// ---------------------------------------------------------------------------
 // 【断言 4】找不到手骨 / grip 缺失 ⇒ 可见失败
 // ---------------------------------------------------------------------------
 let failureBranchCount = heldRenderBody.map {
@@ -413,7 +452,7 @@ import simd
               "找不到腰骨必须点名**腰部**骨骼（不能一律说成手）")
         check(PropAttachmentError.missingBone(.back).errorDescription?.contains("背后骨骼") == true,
               "找不到背骨必须点名**背后**骨骼")
-        check(PropAttachmentPoint.rightHand.boneNameCandidates == ["右手首", "bone009"],
+        check(PropAttachmentSlots.boneNameCandidates(for: .rightHand) == ["右手首", "bone009"],
               "手骨名字就是 PMX 里的日文字面量（右手首），没有映射层")
 
         // ---- 【断言 1】物件世界变换 = 手骨世界变换 × grip ----
@@ -556,21 +595,21 @@ import simd
 
         /// 「背后跟胸骨/脊椎、腰间跟腰/骨盆，而且都不是手骨」。判据与负对照共用同一个函数。
         func mountsOnRightBones(back: [String], waist: [String]) -> Bool {
-            let hand = Set(PropAttachmentPoint.rightHand.boneNameCandidates)
+            let hand = Set(PropAttachmentSlots.boneNameCandidates(for: .rightHand))
             guard let backPrimary = back.first, let waistPrimary = waist.first else { return false }
             return Set(back).isDisjoint(with: hand) && Set(waist).isDisjoint(with: hand)
                 && backPrimary == "上半身2" && back.contains("bone002")
                 && waistPrimary == "腰" && waist.contains("下半身") && waist.contains("bone014")
         }
-        check(mountsOnRightBones(back: PropAttachmentPoint.back.boneNameCandidates,
-                                 waist: PropAttachmentPoint.waist.boneNameCandidates),
+        check(mountsOnRightBones(back: PropAttachmentSlots.boneNameCandidates(for: .back),
+                                 waist: PropAttachmentSlots.boneNameCandidates(for: .waist)),
               "背后必须挂在胸骨（上半身2 / bone002），腰间必须挂在腰/骨盆（腰 / 下半身 / bone014），都不是手骨")
         // 负对照①：把背后挂到**手骨**上。
-        check(!mountsOnRightBones(back: PropAttachmentPoint.rightHand.boneNameCandidates,
-                                  waist: PropAttachmentPoint.waist.boneNameCandidates),
+        check(!mountsOnRightBones(back: PropAttachmentSlots.boneNameCandidates(for: .rightHand),
+                                  waist: PropAttachmentSlots.boneNameCandidates(for: .waist)),
               "负对照失败：背后挂到手骨上居然没被抓到")
         // 负对照②：把腰间挂到**头/脖子**那一系。
-        check(!mountsOnRightBones(back: PropAttachmentPoint.back.boneNameCandidates, waist: ["首", "頭"]),
+        check(!mountsOnRightBones(back: PropAttachmentSlots.boneNameCandidates(for: .back), waist: ["首", "頭"]),
               "负对照失败：腰间挂错骨头居然没被抓到")
 
         // 每个挂点都必须走**同一条** `骨骼世界 × 局部` —— 用同一组标定数字、只换挂点，
@@ -693,8 +732,62 @@ import simd
         print("   [负对照] 背后不校准朝向 ⇒ \(String(format: "%.1f", uncalibratedDegrees))°（必须 > 20°）")
         print("   [正例]   三挂点相对位姿最大差：背后 \(backDrift)、腰间 \(waistDrift)（同一份公式）")
 
+        // ------------------------------------------------------------------
+        // 【断言 F】净空判据：贴数字、可判、失败读得懂
+        // ------------------------------------------------------------------
+        check(PropAttachmentSlots.bladeDirectionInBoneSpace(for: .back).z == 0
+              && PropAttachmentSlots.bladeDirectionInBoneSpace(for: .waist).z == 0,
+              "背后/腰间的刀身方向不许有 Z 分量（否则「半厚就是贴身子那一面」这一步不成立）")
+        let swordClearanceBack = PropAttachmentSlots.clearanceMeters(for: swordProp, point: .back)
+        let swordClearanceWaist = PropAttachmentSlots.clearanceMeters(for: swordProp, point: .waist)
+        check(swordClearanceBack != nil && swordClearanceBack! >= PropAttachmentSlots.recommendedClearanceMeters,
+              "1.1 m 的剑挂背后必须有 ≥ \(PropAttachmentSlots.recommendedClearanceMeters) 米净空，实测 \(swordClearanceBack.map { String(format: "%.4f", $0) } ?? "nil")")
+        check(swordClearanceWaist != nil && swordClearanceWaist! >= PropAttachmentSlots.recommendedClearanceMeters,
+              "1.1 m 的剑挂腰间必须有 ≥ \(PropAttachmentSlots.recommendedClearanceMeters) 米净空，实测 \(swordClearanceWaist.map { String(format: "%.4f", $0) } ?? "nil")")
+        check(PropAttachmentSlots.clearanceMeters(for: swordProp, point: .rightHand) == nil,
+              "手是攥着的：那个挂点不该有「离身体多远」这条判据")
+        check(PropAttachmentSlots.calibration(avatarAssetID: "pmx.2b-miss-0414-standard",
+                                              prop: swordProp, point: .back) != nil,
+              "负对照：同一份净空判据不能把细长的剑也拒掉（它必须分得清大小）")
+        // 大到吞掉整个偏移 ⇒ 拒绝，而且话里带数字（半厚 0.6 > 偏移 0.15）。
+        let hugeProp = WorldGeneratedProp(
+            objectID: "huge", assetID: "sha", displayName: "大箱子",
+            size: WorldVector3(x: 1.2, y: 1.2, z: 1.2), sourceHeight: 1.2)
+        check(PropAttachmentSlots.calibration(avatarAssetID: "pmx.2b-miss-0414-standard",
+                                              prop: hugeProp, point: .back) == nil,
+              "1.2 m 的方箱子挂背后必须被净空判据拒绝（半厚 0.6 米 > 默认偏移 0.15 米）")
+        let clearanceRejection = PropAttachmentSlots.clearanceRejection(for: hugeProp, point: .back)
+        check(clearanceRejection?.contains("净空") == true
+              && clearanceRejection?.contains("穿进身体") == true
+              && clearanceRejection?.contains("0.600") == true,
+              "净空不足必须给一句读得懂的话（带数字），实测 \(clearanceRejection ?? "nil")")
+        check(PropAttachmentSlots.notice(for: swordProp, point: .back)?.contains("净空") == true,
+              "挂点回执那句话必须带上净空数字")
+
+        // ------------------------------------------------------------------
+        // 【旧存档兼容】`"hand":"rightHand"` 的老标定：解得出、再编码回去逐字节相同
+        // ------------------------------------------------------------------
+        let legacyJSON = #"{"avatarAssetID":"pmx.2b-miss-0414-standard","hand":"rightHand","localOffset":{"x":0,"y":0,"z":0},"localRotation":{"w":1,"x":0,"y":0,"z":0},"normalizedGrip":{"x":0.5,"y":0.2,"z":0.5}}"#
+        let legacy = try JSONDecoder().decode(WorldPropGripCalibration.self, from: Data(legacyJSON.utf8))
+        check(legacy.hand == .rightHand
+              && legacy.normalizedGrip == WorldVector3(x: 0.5, y: 0.2, z: 0.5)
+              && legacy.localOffset == WorldVector3(x: 0, y: 0, z: 0)
+              && legacy.localRotation == WorldQuaternion(x: 0, y: 0, z: 0, w: 1),
+              "旧存档里 `\"hand\":\"rightHand\"` 的标定必须原样解得出来（挂点泛化不许动旧字段）")
+        let legacyEncoder = JSONEncoder()
+        legacyEncoder.outputFormatting = [.sortedKeys]
+        let reencoded = String(decoding: try legacyEncoder.encode(legacy), as: UTF8.self)
+        let legacySortedJSON = #"{"avatarAssetID":"pmx.2b-miss-0414-standard","hand":"rightHand","localOffset":{"x":0,"y":0,"z":0},"localRotation":{"w":1,"x":0,"y":0,"z":0},"normalizedGrip":{"x":0.5,"y":0.2,"z":0.5}}"#
+        check(reencoded == legacySortedJSON,
+              "旧标定解出来再编码回去必须**逐字节**相同，实测 \(reencoded)")
+        print("   [正例]   旧存档 `\"hand\":\"rightHand\"` 解出→编码 逐字节相同：\(reencoded == legacySortedJSON)")
+        print("   [正例]   净空（米）：背后 \(String(format: "%.4f", swordClearanceBack ?? -1))、腰间 \(String(format: "%.4f", swordClearanceWaist ?? -1))"
+            + "，建议 ≥ \(PropAttachmentSlots.recommendedClearanceMeters)")
+        print("   [正例]   1.2 m 方箱子挂背后被拒：\(clearanceRejection ?? "nil")")
+
         print("PASS: 手骨跟随（世界 = 手骨世界 × grip）、只读骨骼、握点单一来源 + 用户覆盖、"
-            + "缺失可见失败、细长物件刃轴压在骨轴上、三挂点（手/背后/腰间）同一公式且各跟对骨头")
+            + "缺失可见失败、细长物件刃轴压在骨轴上、三挂点（手/背后/腰间）同一公式且各跟对骨头、"
+            + "换挂点落持久状态、旧存档逐字节可解、净空判据带数字")
     }
 }
 """#

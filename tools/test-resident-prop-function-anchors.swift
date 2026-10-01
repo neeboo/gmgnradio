@@ -18,10 +18,45 @@ let sourceRoot = root.appendingPathComponent("apps/macos/Sources/GMGNRadio")
 let bootstrap = try String(contentsOf: sourceRoot.appendingPathComponent("App/LivingWorldBootstrap.swift"), encoding: .utf8)
 let collisionStart = bootstrap.range(of: "struct MarbleLivingCabinCollisionWorld:")!.lowerBound
 let collisionEnd = bootstrap.range(of: "/// An effect is keyed", range: collisionStart..<bootstrap.endIndex)!.lowerBound
+
+/// 挂点：`ResidentPropPlacementService` 的签名、以及 `ResidentPropEditorState` 里
+/// "已挂载就读世界状态"那一行都读 `PropAttachmentPoint` / `WorldPropSlot.attachmentPoint`，
+/// 而它们的定义在依赖 app 渲染侧类型（`StageAvatarAsset` 等）的文件里，离线 harness 编不动。
+/// 手法与 `tools/test-living-resident-loop.swift` 相同：**逐字**从生产源码抽出这两段声明，
+/// 在生成的程序里合成同名类型 —— 不是在这儿抄一份映射。
+let propAttachmentText = try String(
+    contentsOf: sourceRoot.appendingPathComponent("Presence/PropAttachment.swift"), encoding: .utf8)
+let propAttachmentSlotText = try String(
+    contentsOf: sourceRoot.appendingPathComponent("Presence/PropAttachmentSlot.swift"), encoding: .utf8)
+/// 从源码里切出 `signature` 开头的那**一个**花括号块（含嵌套）。切不出来就地崩，
+/// 不许悄悄用一份手写的替身顶上（那会让"定义在哪儿"变成两处）。
+func productionDeclaration(_ signature: String, in text: String) -> String {
+    guard let start = text.range(of: signature)?.lowerBound,
+          let open = text[start...].firstIndex(of: "{") else {
+        fatalError("切不出生产源码里的声明「\(signature)」——签名改了？")
+    }
+    var depth = 0
+    for index in text[open...].indices {
+        if text[index] == "{" { depth += 1 }
+        if text[index] == "}" {
+            depth -= 1
+            if depth == 0 { return String(text[start...index]) }
+        }
+    }
+    fatalError("生产源码里的声明「\(signature)」括号不配对")
+}
+let propAttachmentSlotDeclarations = [
+    productionDeclaration("enum PropAttachmentPoint:", in: propAttachmentText),
+    productionDeclaration("extension PropAttachmentPoint {", in: propAttachmentSlotText),
+    productionDeclaration("extension WorldPropSlot {", in: propAttachmentSlotText),
+].joined(separator: "\n")
+
 let harness = #"""
 import Foundation
 import WorldRuntime
 import simd
+
+\#(propAttachmentSlotDeclarations)
 
 \#(bootstrap[collisionStart..<collisionEnd])
 struct Config: Decodable {

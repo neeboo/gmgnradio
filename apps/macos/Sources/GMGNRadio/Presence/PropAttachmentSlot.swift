@@ -110,10 +110,28 @@ enum PropAttachmentSlots {
     }
 
     /// 这个挂点看哪些骨名（不同模型骨名不同；顺序就是查找顺序）。
-    /// 骨名候选表本身留在 `PropAttachment.swift` 的枚举里 —— 那是仓库里既有的唯一定义处，
-    /// harness 直接切那段源码编译；这里只回答"这个挂点有没有默认姿势"。
+    ///
+    /// 两代骨架都列：**标准命名在前**（真机当前激活的那份 PMX 就是它）、匿名 raw 骨名兜底
+    /// （`boneNNN` 那一代）—— 与手那条 `["右手首","bone009"]` 同一个手法。
     static func boneNameCandidates(for point: PropAttachmentPoint) -> [String] {
-        point.boneNameCandidates
+        switch point {
+        case .rightHand:
+            ["右手首", "bone009"]
+        case .back:
+            // 胸骨：标准命名 上半身2（真机 y=15.38）→ 匿名 raw 骨 bone002（真机 y=114.3）
+            // → 退化到脊椎根 上半身 / bone001（真机 y=101.6，是髋的高度、不是胸）。
+            ["上半身2", "bone002", "上半身", "bone001"]
+        case .waist:
+            // 腰/骨盆：标准命名 腰（真机 univ="waist"，y=12.85）→ 下半身（y=14.55）
+            // → 匿名 raw 骨的骨盆 bone014（真机 y=101.6，父 bone000）→ 骨架根 センター/bone000。
+            // 刻意**不含任何手骨**：腰间挂错到手骨上，画面上一眼能看出。
+            ["腰", "下半身", "bone014", "センター", "bone000"]
+        }
+    }
+
+    /// 失败文案里那串"找过哪些骨名"。只有一个出处：上面那张候选表。
+    static func candidatesText(for point: PropAttachmentPoint) -> String {
+        boneNameCandidates(for: point).joined(separator: " / ")
     }
 
     /// **默认挂载偏移**：米，作用在**骨骼局部空间**（与 `PropGripInference` 的 `localOffset`
@@ -159,6 +177,57 @@ enum PropAttachmentSlots {
         }
     }
 
+    /// 挂件离身体的**建议净空**（米）—— 判据的那个数。
+    ///
+    /// 含义：默认偏移在"离开身体"那根轴上的分量，减去物件沿该方向的半厚，必须还剩这么多。
+    /// 0.06 m 是按 2B 腰背处皮肉+衣服厚度量级取的**估计值（没有在真机上量过）**。
+    static let recommendedClearanceMeters: Float = 0.06
+
+    /// 净空**硬闸门**：小于 0 就是物件本身就吞掉了整个偏移（一定穿进身体）⇒ 拒绝挂载。
+    /// 0 与 0.06 之间只警告不拒绝：贴身穿戴本来就可能是有意的。
+    static let minimumClearanceMeters: Float = 0
+
+    /// 挂件也不许飘在空中：默认偏移的长度上限（米）。
+    static let maximumMountDistanceMeters: Float = 0.35
+
+    /// 挂件沿"身体前后轴"的半厚（米）。背后与腰间那个挂点的刀身方向都**没有 Z 分量**
+    /// （`bladeDirectionInBoneSpace` 的 z 恒为 0，harness 钉着这一条），所以贴身子那一面
+    /// 就是网格最薄的那一维 —— 这里读的就是它，不另立一份"厚度"。
+    static func halfThicknessMeters(for prop: WorldGeneratedProp) -> Float {
+        let extents = [prop.effectiveSize.x, prop.effectiveSize.y, prop.effectiveSize.z]
+        guard extents.allSatisfy({ $0.isFinite && $0 > 0 }) else { return 0 }
+        return (extents.min() ?? 0) / 2
+    }
+
+    /// **净空判据的唯一出口**：这件物件挂在这个挂点上，离身体还剩多少米。
+    ///
+    /// `nil` = 这个挂点不适用（手是攥着的，不问"离身体多远"）或读不出尺寸（fail-closed：
+    /// 调用方必须当"判不了"处理，而不是当 0）。
+    static func clearanceMeters(for prop: WorldGeneratedProp, point: PropAttachmentPoint) -> Float? {
+        guard point != .rightHand, prop.isValid else { return nil }
+        let offset = defaultOffsetMeters(for: point)
+        // 背后/腰间都是往 +Z（身后）挂。
+        let distance = offset.z
+        return distance - halfThicknessMeters(for: prop)
+    }
+
+    /// 净空不够时的**读得懂**的拒绝话（数字在里面）。够 / 不适用 ⇒ `nil`。
+    static func clearanceRejection(for prop: WorldGeneratedProp, point: PropAttachmentPoint) -> String? {
+        guard let clearance = clearanceMeters(for: prop, point: point) else { return nil }
+        guard clearance < minimumClearanceMeters else { return nil }
+        return String(
+            format: "这个物件挂不到%@：它最薄的一维有 %.3f 米（半厚 %.3f 米），而%@的默认挂载偏移只有 %.3f 米，"
+                + "净空 %.3f 米 ⇒ 会穿进身体。请先改小尺寸，或用手拿着。",
+            displayName(for: point), halfThicknessMeters(for: prop) * 2, halfThicknessMeters(for: prop),
+            displayName(for: point), defaultOffsetMeters(for: point).z, clearance)
+    }
+
+    /// 一句话说清"现在净空多少"。回执与面板那一行读它。
+    static func clearanceText(for prop: WorldGeneratedProp, point: PropAttachmentPoint) -> String? {
+        guard let clearance = clearanceMeters(for: prop, point: point) else { return nil }
+        return String(format: "离身体净空 %.3f 米（建议 ≥ %.3f 米）", clearance, recommendedClearanceMeters)
+    }
+
     /// 由「挂点 + 当前物件」造一份标定。**手那条路逐字节等于 `PropGripInference.suggestion`**。
     static func calibration(
         avatarAssetID: String,
@@ -166,6 +235,8 @@ enum PropAttachmentSlots {
         point: PropAttachmentPoint
     ) -> WorldPropGripCalibration? {
         guard prop.isValid, !avatarAssetID.isEmpty, avatarAssetID.count <= 256 else { return nil }
+        // 净空不够（物件自己就吞掉了整个偏移）⇒ 这里就拒绝，绝不让它穿进身体之后再"看起来像挂了"。
+        guard clearanceRejection(for: prop, point: point) == nil else { return nil }
         let suggestion = PropGripInference.suggestion(for: prop)
         let calibration: WorldPropGripCalibration
         switch point {
@@ -195,13 +266,21 @@ enum PropAttachmentSlots {
     }
 
     /// 挂点默认姿势的**人话**说明（面板那一行与 agent 回执读它）。手那条路没有要说的。
-    static func notice(for point: PropAttachmentPoint) -> String? {
+    ///
+    /// 挂件还带上**净空那个数**（`clearanceText`）：穿不穿模是用户在画面上第一眼要判断的事，
+    /// 回执里没有这个数就只能靠猜。
+    static func notice(for prop: WorldGeneratedProp, point: PropAttachmentPoint) -> String? {
+        let clearance = clearanceText(for: prop, point: point)
         switch point {
-        case .rightHand: nil
+        case .rightHand: return nil
         case .back:
-            "已挂到背后（骨骼：上半身2 / bone002 一系），斜挂、刀尖朝左肩上方，离胸骨 15 厘米。"
+            return "已挂到背后（骨骼：上半身2 / bone002 一系），斜挂、刀尖朝左肩上方，"
+                + "离胸骨 \(String(format: "%.2f", defaultOffsetMeters(for: .back).z)) 米"
+                + (clearance.map { "，\($0)。" } ?? "。")
         case .waist:
-            "已挂到腰间（骨骼：腰 / 下半身 / bone014 一系），横挂，离腰骨 12 厘米。"
+            return "已挂到腰间（骨骼：腰 / 下半身 / bone014 一系），横挂，"
+                + "离腰骨 \(String(format: "%.2f", defaultOffsetMeters(for: .waist).z)) 米"
+                + (clearance.map { "，\($0)。" } ?? "。")
         }
     }
 

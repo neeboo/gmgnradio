@@ -1823,7 +1823,7 @@ public final class PMXStageAvatarRenderer {
     func validateAttachmentPoint(_ point: PropAttachmentPoint) throws {
         guard let modelNode, Self.acceptsAttachmentRig(modelNode)
         else { throw PropAttachmentError.unsupportedAvatar }
-        guard point.boneNameCandidates.contains(where: {
+        guard PropAttachmentSlots.boneNameCandidates(for: point).contains(where: {
             modelNode.childNode(withName: $0, recursively: true) != nil
         }) else {
             throw PropAttachmentError.missingBone(point)
@@ -1854,7 +1854,7 @@ public final class PMXStageAvatarRenderer {
     ) throws -> simd_float4x4 {
         try validateAttachmentPoint(point)
         guard let modelNode,
-              let bone = point.boneNameCandidates.lazy.compactMap({
+              let bone = PropAttachmentSlots.boneNameCandidates(for: point).lazy.compactMap({
                   modelNode.childNode(withName: $0, recursively: true)
               }).first
         else {

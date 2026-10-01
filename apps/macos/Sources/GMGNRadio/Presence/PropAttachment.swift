@@ -4,29 +4,13 @@ import WorldRuntime
 
 /// 物件挂在角色的**哪个挂点**上：右手（既有）、背后、腰间。
 ///
-/// 手的两个候选骨名逐字未动。背后/腰间的**默认偏移与朝向**不在这里 —— 那是
-/// `PropAttachmentSlot.swift` 的挂点表（`PropAttachmentSlots`）。这里只回答
-/// "这个挂点看哪些骨名"这一件事，理由（真机静止坐标）写在那份挂点表的文件头。
+/// **候选骨名、默认偏移、默认朝向、净空判据全部在 `PropAttachmentSlot.swift` 的挂点表里**
+/// （`PropAttachmentSlots`，含真机静止坐标的证据）。这里只有"有哪几个挂点"这一件事 ——
+/// 于是挂点定义只有一处，而这一份离渲染最近的文件只留一个类型。
 enum PropAttachmentPoint: String, CaseIterable, Equatable, Sendable {
     case rightHand
     case back
     case waist
-
-    var boneNameCandidates: [String] {
-        switch self {
-        case .rightHand:
-            ["右手首", "bone009"]
-        case .back:
-            // 胸骨：标准命名 上半身2（真机 y=15.38）→ 匿名 raw 骨 bone002（真机 y=114.3）
-            // → 退化到脊椎根 上半身 / bone001（真机 y=101.6，是髋的高度、不是胸）。
-            ["上半身2", "bone002", "上半身", "bone001"]
-        case .waist:
-            // 腰/骨盆：标准命名 腰（真机 univ="waist"，y=12.85）→ 下半身（y=14.55）
-            // → 匿名 raw 骨的骨盆 bone014（真机 y=101.6，父 bone000）→ 骨架根 センター/bone000。
-            // 刻意**不含任何手骨**：腰间挂错到手骨上，画面上一眼能看出。
-            ["腰", "下半身", "bone014", "センター", "bone000"]
-        }
-    }
 }
 
 struct ResidentHeldPropDescriptor: Equatable, Sendable {
@@ -79,9 +63,9 @@ enum PropAttachmentError: Error, Equatable, LocalizedError, Sendable {
         }
     }
 
-    /// 失败文案里那串"找过哪些骨名"。只有一个出处：挂点自己的候选表。
+    /// 失败文案里那串"找过哪些骨名"。只有一个出处：挂点表那张候选骨名表。
     static func candidatesText(_ point: PropAttachmentPoint) -> String {
-        point.boneNameCandidates.joined(separator: " / ")
+        PropAttachmentSlots.candidatesText(for: point)
     }
 }
 

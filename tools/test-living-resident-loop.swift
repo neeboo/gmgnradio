@@ -1083,6 +1083,15 @@ let compilerArguments: [String] = ["-j1", "-parse-as-library",
     sources.appendingPathComponent("Agent/DJAgentToolDispatcher.swift").path,
     sources.appendingPathComponent("Agent/ResidentMusicToolBridge.swift").path,
     sources.appendingPathComponent("Presence/ResidentPropPlacementService.swift").path,
+    // 挂点（slot）：`ResidentPropPlacementService` 与 `ResidentPropToolBridge` 的签名/回执读
+    // `PropAttachmentPoint` 与 `PropAttachmentSlots`。挂点表的**真定义**在
+    // `Presence/PropAttachmentSlot.swift`（别名表、显示名、净空文案都要真的一份，回执断言才
+    // 不是测替身），它要 `PropGripInference`；`PropAttachmentPoint` 的真定义在依赖渲染侧类型的
+    // `PropAttachment.swift` 里，离线编不动 ⇒ 类型用 `tools/fixtures/PropAttachmentPointShim.swift`
+    // （只有三个 case，数值/骨名一条都不在它里面，那些由 tools/test-resident-prop-hold.swift 钉）。
+    sources.appendingPathComponent("Presence/PropGripInference.swift").path,
+    sources.appendingPathComponent("Presence/PropAttachmentSlot.swift").path,
+    root.appendingPathComponent("tools/fixtures/PropAttachmentPointShim.swift").path,
     sources.appendingPathComponent("Agent/ResidentPropToolBridge.swift").path,
     sources.appendingPathComponent("Presence/PropGenerationClient.swift").path,
     // 抽编进来的 `makeResidentWorldTools` 会读 `wishMachineConfiguration`，所以它那份

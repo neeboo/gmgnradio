@@ -127,8 +127,10 @@ struct FlatRoomAndTable: WorldPropSupportQuerying {
         let flat=flatSupport()
         let current=Current()
         let service=ResidentPropPlacementService(context:context,support:{flat},isCurrent:{current.value},
-            currentAvatarAssetID:{"pmx.2b-miss-0414-standard"},makeGripCalibration:{ prop, avatarID in
-                WorldPropGripCalibration(avatarAssetID:avatarID,hand:.rightHand,
+            currentAvatarAssetID:{"pmx.2b-miss-0414-standard"},makeGripCalibration:{ prop, avatarID, point in
+                // 挂点跟着调用方给的那一个走（`point.worldSlot`）：换挂点时标定里的挂点必须跟着变，
+                // 否则世界那条 `.adjustGrip` 会以"标定说的挂点不是它"为由拒绝。
+                WorldPropGripCalibration(avatarAssetID:avatarID,hand:point.worldSlot,
                     normalizedGrip:.init(x:0.5,y:0.5,z:0.5),localOffset:.init(x:0,y:0,z:0),
                     localRotation:.init(x:0,y:0,z:0,w:1))
             })
@@ -245,6 +247,44 @@ struct FlatRoomAndTable: WorldPropSupportQuerying {
         let decimalBridge = ResidentPropToolBridge(service: service, allowsMutation: false, isCurrent: { current.value }, delegatedGrant: decimalGrant)
         check(!(try await invoke(decimalBridge, "apply_prop_placement", ["object_id": "owned", "surface_id": "test", "x": -2.7, "y": 0.52, "z": -5, "yaw": 0.7, "layout_revision": context.state.layoutRevision], "decimal-place")).isError, "canonical float comparison accepts decimal target from JSON")
         check(try await invoke(decimalBridge, "apply_prop_placement", ["object_id": "owned", "surface_id": "test", "x": -2.7, "y": 0.52, "z": -5, "yaw": 0.8, "layout_revision": context.state.layoutRevision], "decimal-mismatch").isError, "nearby decimal does not pass for a different target")
+        // ---- 挂点（slot）：hold_prop 的 slot 参数 + 回执/错误文案里的挂点名 ----
+        // 放在最后：这里用**当前** revision，不去改动前面那些显式数字的算术。
+        let holdTool = human.tools.first { $0.name == "hold_prop" }!
+        let holdProperties = (holdTool.inputSchema["properties"] as? [String: Any]) ?? [:]
+        let slotSchema = holdProperties["slot"] as? [String: Any]
+        check(slotSchema?["enum"] as? [String] == ["rightHand", "back", "waist"],
+              "hold_prop 必须给出挂点参数（三个字面量与 WorldPropSlot.rawValue 同一份）")
+        check((holdTool.inputSchema["required"] as? [String])?.contains("slot") == false,
+              "slot 可省（省缺 = rightHand，既有调用点与旧提示词一个字都不用改）")
+        // 旧存档 / 旧调用点：不带 slot 仍然是右手。
+        check(!(try await invoke(human, "hold_prop", ["object_id": "owned", "layout_revision": context.state.layoutRevision], "hold-default-slot")).isError,
+              "不带 slot 的 hold_prop 必须照旧成功（省缺 = 右手）")
+        check(context.state.heldProp?.hand == .rightHand, "省缺挂点还是 rightHand（旧行为逐字节不变）")
+        // 说"挂背后" ⇒ 就地换挂点，回执里必须有挂点名。
+        let switched = try await invoke(human, "hold_prop",
+            ["object_id": "owned", "layout_revision": context.state.layoutRevision, "slot": "背后"], "hold-back")
+        check(!switched.isError, "「挂背后」必须被接受（用户嘴里那几种说法也认）")
+        check((payload(switched)["held_slot"] as? String) == "back"
+              && (payload(switched)["held_slot_name"] as? String) == "背后",
+              "回执必须说清它现在挂在哪个挂点（held_slot/hold_slot_name = back/背后）")
+        check(context.state.heldProp?.hand == .back, "换挂点必须落进**持久状态**（WorldHeldProp.hand == back）")
+        check(context.state.objectStates["owned"]?.gripCalibration?.hand == .back,
+              "标定里的挂点必须跟着换（渲染侧读的就是它）")
+        // 认不出来的挂点名：拒绝，且不许改动现状。
+        let bogus = try await invoke(human, "hold_prop",
+            ["object_id": "owned", "layout_revision": context.state.layoutRevision, "slot": "头顶"], "hold-bogus")
+        check(bogus.isError, "认不出来的挂点名必须拒绝（不许猜一个挂点）")
+        check(["invalid_arguments", "placement_rejected"].contains(payload(bogus)["code"] as? String ?? ""),
+              "拒绝回执必须走既有的错误通道（实测 \(payload(bogus)["code"] as? String ?? "nil")）")
+        check(context.state.heldProp?.hand == .back, "被拒的挂点不许改动现状")
+        // 微调只动偏移/朝向，不许把挂点挪回右手。
+        check(!(try await invoke(human, "adjust_held_prop_grip",
+            ["object_id": "owned", "layout_revision": context.state.layoutRevision,
+             "offset_x": 0.01, "offset_y": 0, "offset_z": 0.02, "rotation_yaw": 0], "grip-back")).isError,
+              "在背后微调握点必须成功")
+        check(context.state.heldProp?.hand == .back
+              && context.state.objectStates["owned"]?.gripCalibration?.hand == .back,
+              "微调不许悄悄把挂点改回右手")
         print("PASS: \(checks) resident prop tool checks")
     }
 }
@@ -270,6 +310,6 @@ func worldRuntimeHarnessFlags() -> [String] {
 }
 let worldRuntimeFlags = worldRuntimeHarnessFlags()
 let objects=Array(worldRuntimeFlags.dropFirst(2))
-let code=try run("/usr/bin/swiftc",["-j1","-parse-as-library","-I",worldRuntimeFlags[1],sources.appendingPathComponent("Agent/WorldAgentContext.swift").path,sources.appendingPathComponent("Presence/ResidentPropPlacementService.swift").path,bridge.path,root.appendingPathComponent("tools/fixtures/ResidentPropHoldLimitShim.swift").path,file.path,"-o",exe.path]+objects)
+let code=try run("/usr/bin/swiftc",["-j1","-parse-as-library","-I",worldRuntimeFlags[1],sources.appendingPathComponent("Agent/WorldAgentContext.swift").path,sources.appendingPathComponent("Presence/ResidentPropPlacementService.swift").path,root.appendingPathComponent("tools/fixtures/PropAttachmentPointShim.swift").path,sources.appendingPathComponent("Presence/PropGripInference.swift").path,sources.appendingPathComponent("Presence/PropAttachmentSlot.swift").path,bridge.path,root.appendingPathComponent("tools/fixtures/ResidentPropHoldLimitShim.swift").path,file.path,"-o",exe.path]+objects)
 guard code == 0 else{exit(code)}
 exit(try run(exe.path,[]))

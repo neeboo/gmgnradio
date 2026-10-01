@@ -3741,6 +3741,11 @@ final class AppDelegate:
                 // 这类读得懂的话（`PropAttachmentError.missingBone`），而不是静默挂不上。
                 try self.spatialStage.validateResidentPropAttachment(avatarID: avatarID,
                     assetID: prop.assetID, modelURL: asset.descriptor.modelURL, point: point)
+                // 净空判据在这一处**唯一**出口：物件自己就吞掉整个挂载偏移（净空 < 0）⇒
+                // 拒绝并把数字说出来（"净空 -0.45 米 ⇒ 会穿进身体"），而不是挂上去之后让它穿模。
+                if let reason = PropAttachmentSlots.clearanceRejection(for: prop, point: point) {
+                    throw ResidentPropPlacementError.attachmentUnsupported(reason)
+                }
                 guard let calibration = ResidentPropAttachmentEligibility.suggestedCalibration(
                     for: prop, avatar: avatar, point: point) else {
                     throw ResidentPropPlacementError.attachmentUnsupported(

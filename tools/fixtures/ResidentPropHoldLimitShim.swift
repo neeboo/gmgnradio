@@ -1,4 +1,4 @@
-// 手持尺寸上限的 harness 替身（**不含任何数字**）。
+// 手持尺寸上限 + 挂点（slot）的 harness 替身。
 //
 // 上限的**唯一一处定义**在
 // `apps/macos/Sources/GMGNRadio/Presence/PropAttachment.swift` 的
@@ -11,6 +11,7 @@
 // 为什么是运行期读源码、而不是在这里抄一个常量：抄一份就出现第二个出处，生产改了值
 // 这里不会跟着变（那正是"两种真相"）。harness 本来就在读生产源码，多读一行不多。
 import Foundation
+import WorldRuntime
 
 enum ResidentPropAttachmentEligibility {
     /// 生产源码里那一刻的唯一一份上限。读不出来就直接崩（fail-closed），

@@ -515,11 +515,34 @@ final class WorldAgentContext {
         try publish(forcePersistence: true)
     }
 
-    /// 建造模式派生格子用的几何入口。装进上下文的 world 可能是包装类型
-    /// （`MarbleLivingCabinCollisionWorld` 或 `PropLayoutCollisionWorld`），它们已转发
-    /// 三角形；拿不到时返回 nil，调用方必须按 fail-closed 处理（不能摆放）。
+    /// 建造模式派生格子用的几何入口 —— 交出去的是**世界几何**（`baseCollisionWorld`：
+    /// 环境网格 + manifest 里那批固定家具体积），**不是** `collisionWorld`（后者在 base
+    /// 之上又叠了 `WorldLayoutObstacles.resolve(state)` 的**已摆物件**体积，那是运行时
+    /// 拦人用的）。拿不到几何时返回 nil，调用方必须按 fail-closed 处理（不能摆放）。
+    ///
+    /// **为什么已摆物件的体积不许进派生世界**（真机 2026-10-01「舱室里什么都摆不了」）：
+    /// `PropLayoutCollisionWorld.canTraverse`（本文件 `1406-1416`）会沿着移动线段**采样
+    /// 已摆物件的体积**，而承托网格的连通性过滤问的正是它 —— 于是一件已摆物件会把它
+    /// **自己脚下那一列**从网格里挤掉。实测（真权威快照 + 真舱体几何）：斧头在
+    /// `(-2.625, -0.058583736, -2.375)`，列 `(-11,-10)` 整列没有承托层（0 层）；
+    /// 同一份几何下不把它的体积算进去，那一列立刻恢复 `[-0.058583736]`。而
+    /// `ResidentPropPlacementService.validate` 每次提交都会复算**房间里每一件**已摆物件
+    /// 的位置（那正是它该做的）⇒ 复算到斧头必然 `.unknownSurface` ⇒ 任何一次 `place`
+    /// 都被拒，且与"你想摆的那一件"毫无关系。
+    ///
+    /// 排除的是**这一类可移动体积**，所以每件物件自己的体积按构造就不在自己（也不在别人）
+    /// 的承托/可达判定里。**判据一个字都没放宽**：真正回答"别人挡不挡它"的两条判据原样
+    /// 保留，而且 `validate` 对**全部**已摆物件跑：
+    /// 1. `PropPlacementEvaluator.evaluate` 的 `placedObstacles` OBB 互斥（那里传的是
+    ///    `placed.filter { $0.0 != id }`，即除自己以外的每一件已摆物件）；
+    /// 2. `WorldPlacementRouteMap.decision(blockedNodes:)`（占位节点由**全部**已摆物件的
+    ///    `blockedNodes(obstacle:)` 给出）。
+    /// 运行时拦人那条路一个字没动：`collisionWorld` 里装的仍然是含已摆物件体积的那一份。
+    /// 这一份也正是 `PropSupportGrid` 自己的声明（"承托结构只依赖几何，建一次即可缓存"，
+    /// 见 `PropSupportGrid.swift` 的类型说明），以及 `ResidentPropGridEditorModel` 的网格
+    /// 缓存键（worldID）成立的前提。
     var propSupportQuerying: (any WorldPropSupportQuerying)? {
-        collisionWorld.propSupportQuerying()
+        baseCollisionWorld as? any WorldPropSupportQuerying
     }
 
     func installCollisionWorld(_ world: any WorldCollisionQuerying) {

@@ -212,8 +212,14 @@ extension ResidentPropDelegationError: LocalizedError {
                 "mutation_authorized": allowsMutation, "interaction_status": interactionStatus]
             // 挂在哪个挂点**只回执世界状态里那一份**（不读调用参数）：回执说的就是"它现在挂在哪儿"。
             if let held = service.context.state.heldProp {
+                let point = held.hand.attachmentPoint
                 payload["held_slot"] = held.hand.rawValue
-                payload["held_slot_name"] = PropAttachmentSlots.displayName(for: held.hand.attachmentPoint)
+                payload["held_slot_name"] = PropAttachmentSlots.displayName(for: point)
+                // 挂点那句话里带着**净空那个数**：agent 只有读到它，才能对用户说清"贴不贴身子"。
+                if let prop = service.context.state.objectStates[held.objectID]?.generatedProp,
+                   let notice = PropAttachmentSlots.notice(for: prop, point: point) {
+                    payload["slot_notice"] = notice
+                }
             }
             if let preview { payload["preview"] = Self.object(preview, heldObjectID: nil, holdEligibility: nil) }
             return result(payload)

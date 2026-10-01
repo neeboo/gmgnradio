@@ -509,6 +509,31 @@ guard checks==0 else {exit(checks)}
 //
 // 缺陷版本下 `onPreviewChanged` 只收到 nil（编辑器把预览整个丢掉了），于是 resolve 继续给出
 // **原地那一件** —— 用户看到的就是"物件站在原地不动、只有落点格子跟着鼠标跑"。
+// 挂点：`ResidentPropEditorState`（与摆放服务的签名）读 `PropAttachmentPoint` /
+// `PropAttachmentSlots`，它们的定义在 `PropAttachment.swift` / `PropAttachmentSlot.swift` 里，
+// 而这两份都依赖 app 目标的渲染侧类型（`StageAvatarAsset` 等），离线 harness 编不动。
+// 于是**逐字**抽出需要的那几段声明（不是在这儿抄一份映射；生产改了这里跟着变）。
+let propAttachmentSource = try String(contentsOfFile: "apps/macos/Sources/GMGNRadio/Presence/PropAttachment.swift", encoding: .utf8)
+let propAttachmentSlotSource = try String(contentsOfFile: "apps/macos/Sources/GMGNRadio/Presence/PropAttachmentSlot.swift", encoding: .utf8)
+func attachmentDeclaration(_ signature: String, in source: String) -> String {
+    guard let start = source.range(of: signature)?.lowerBound,
+          let open = source[start...].firstIndex(of: "{") else {
+        print("FAIL: 生产源码里找不到 \(signature)"); exit(1)
+    }
+    var depth = 0
+    for index in source[open...].indices {
+        if source[index] == "{" { depth += 1 }
+        if source[index] == "}" { depth -= 1 }
+        if depth == 0 { return String(source[start...index]) }
+    }
+    print("FAIL: \(signature) 的花括号不平衡"); exit(1)
+}
+let propAttachmentShim = """
+\(attachmentDeclaration("enum PropAttachmentPoint:", in: propAttachmentSource))
+\(attachmentDeclaration("extension PropAttachmentPoint {", in: propAttachmentSlotSource))
+\(attachmentDeclaration("extension WorldPropSlot {", in: propAttachmentSlotSource))
+\(attachmentDeclaration("enum PropAttachmentSlots {", in: propAttachmentSlotSource))
+"""
 let editorState = "apps/macos/Sources/GMGNRadio/Presence/ResidentPropEditorState.swift"
 guard !worldObjects.isEmpty else {
     print("FAIL: the in-hand preview probe needs the WorldRuntime build artefacts (run `swift build --package-path apps/macos/Packages/WorldRuntime` first)")
@@ -518,6 +543,7 @@ let onHandHarness = #"""
 import Foundation
 import WorldRuntime
 import simd
+\#(propAttachmentShim)
 func check(_ value: Bool, _ message: String) { if !value { print("FAIL:", message); exit(1) } }
 /// 摆放服务在真机上给出的那一条拒绝（`ResidentPropPlacementError.blockedRoute`）的等价物：
 /// 这条断言只关心"服务拒绝了这次落点"，所以这里自己抛一个同形状的错误，不引入服务文件。
@@ -586,6 +612,10 @@ struct PreviewRejected: LocalizedError {
 let onHandFile=temp.appendingPathComponent("onhand.swift"),onHandExe=temp.appendingPathComponent("onhand")
 try onHandHarness.write(to:onHandFile,atomically:true,encoding:.utf8)
 let onHandCompile=try run("/usr/bin/nice",["-n","15","/usr/bin/swiftc","-j1","-parse-as-library","-swift-version","6",
-    "-I",worldBuild + "/Modules",descriptor,sizeIntentShim.path,editorState,onHandFile.path,"-o",onHandExe.path] + worldObjects)
+    // 握点推断只依赖 WorldRuntime + simd，能独立编 ⇒ 编**同一份**生产文件（抽取只用于
+    // 编不动的那两份：`PropAttachment*.swift`）。
+    "-I",worldBuild + "/Modules",descriptor,sizeIntentShim.path,
+    "apps/macos/Sources/GMGNRadio/Presence/PropGripInference.swift",editorState,onHandFile.path,
+    "-o",onHandExe.path] + worldObjects)
 guard onHandCompile==0 else {exit(onHandCompile)}
 exit(try run(onHandExe.path,[]))

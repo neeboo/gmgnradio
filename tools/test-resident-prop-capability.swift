@@ -732,6 +732,11 @@ let compiled = try run("/usr/bin/swiftc", ["-j1", "-parse-as-library", "-I", wor
     sources.appendingPathComponent("Agent/ResidentPropToolBridge.swift").path,
     // 手持上限的替身（见文件头注释）：`ResidentPropPlacementService` 与工具描述都读那一份定义。
     root.appendingPathComponent("tools/fixtures/ResidentPropHoldLimitShim.swift").path,
+    root.appendingPathComponent("tools/fixtures/PropAttachmentPointShim.swift").path,
+    // 工具桥读的是**真**挂点表（别名表 / 显示名 / 净空文案 / 回执），所以这里编真文件，
+    // 而不是给 `PropAttachmentSlots` 再造一份替身（那会让回执断言测到假的）。
+    sources.appendingPathComponent("Presence/PropGripInference.swift").path,
+    sources.appendingPathComponent("Presence/PropAttachmentSlot.swift").path,
     program.path, "-o", executable.path] + objects)
 guard compiled == 0 else { exit(compiled) }
 exit(try run(executable.path, []))

@@ -419,6 +419,9 @@ p.arguments = ["-j1","-parse-as-library","-O","-I",worldRuntimeModules,
     prelude.path,
     // 手持上限的替身（见文件头注释）：`ResidentPropPlacementService` 读那一份定义。
     root.appendingPathComponent("tools/fixtures/ResidentPropHoldLimitShim.swift").path,
+    // 挂点（slot）的**类型**替身（见那个 fixture 的文件头）。
+    root.appendingPathComponent("tools/fixtures/PropAttachmentPointShim.swift").path,
+    root.appendingPathComponent("tools/fixtures/PropAttachmentSlotShim.swift").path,
     program.path,"-o",executable.path]+objects
 try p.run(); p.waitUntilExit()
 guard p.terminationStatus == 0 else { print("compile failed"); exit(1) }

@@ -248,17 +248,17 @@ func check(_ condition: Bool, _ message: String) {
             )
         )
         check(held.attachmentPoint == .rightHand && held.targetHeightMeters == 0.18, "held descriptor preserves adopted metre size")
-        check(PropAttachmentPoint.rightHand.boneNameCandidates == ["右手首", "bone009"], "2B right wrist uses the approved candidates")
+        check(PropAttachmentSlots.boneNameCandidates(for: .rightHand) == ["右手首", "bone009"], "2B right wrist uses the approved candidates")
 
         // ---- 挂点：背后跟胸骨/脊椎、腰间跟腰/骨盆，都不是手骨 ----
         check(PropAttachmentPoint.allCases == [.rightHand, .back, .waist], "挂点必须是 手 / 背后 / 腰间")
-        check(PropAttachmentPoint.back.boneNameCandidates == ["上半身2", "bone002", "上半身", "bone001"],
+        check(PropAttachmentSlots.boneNameCandidates(for: .back) == ["上半身2", "bone002", "上半身", "bone001"],
               "背后挂点必须挂在胸骨（上半身2 / bone002）一系，退化到脊椎根")
-        check(PropAttachmentPoint.waist.boneNameCandidates == ["腰", "下半身", "bone014", "センター", "bone000"],
+        check(PropAttachmentSlots.boneNameCandidates(for: .waist) == ["腰", "下半身", "bone014", "センター", "bone000"],
               "腰间挂点必须挂在腰/骨盆（腰 / 下半身 / bone014）一系")
-        let handBones = Set(PropAttachmentPoint.rightHand.boneNameCandidates)
-        check(Set(PropAttachmentPoint.back.boneNameCandidates).isDisjoint(with: handBones)
-              && Set(PropAttachmentPoint.waist.boneNameCandidates).isDisjoint(with: handBones),
+        let handBones = Set(PropAttachmentSlots.boneNameCandidates(for: .rightHand))
+        check(Set(PropAttachmentSlots.boneNameCandidates(for: .back)).isDisjoint(with: handBones)
+              && Set(PropAttachmentSlots.boneNameCandidates(for: .waist)).isDisjoint(with: handBones),
               "背后/腰间的候选骨名里**不许**出现手骨 —— 挂错骨一眼能看出")
         check(PropAttachmentSlots.defaultOffsetMeters(for: .rightHand) == WorldVector3(x: 0, y: 0, z: 0)
               && PropAttachmentSlots.defaultOffsetMeters(for: .back) != WorldVector3(x: 0, y: 0, z: 0)

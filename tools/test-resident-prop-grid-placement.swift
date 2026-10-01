@@ -11,73 +11,10 @@ let sourceRoot = root.appendingPathComponent("apps/macos/Sources/GMGNRadio")
 let bootstrap = try String(contentsOf: sourceRoot.appendingPathComponent("App/LivingWorldBootstrap.swift"), encoding: .utf8)
 let start = bootstrap.range(of: "struct MarbleLivingCabinCollisionWorld:")!.lowerBound
 let end = bootstrap.range(of: "/// An effect is keyed", range: start..<bootstrap.endIndex)!.lowerBound
-// 手持尺寸上限住在 `Presence/PropAttachment.swift` 里，而那份文件依赖 app 目标
-// （`StageAvatarAsset` 等），编不进离线 harness。所以与 `test-resident-prop-placement.swift`
-// 同一条做法：把那两行**声明逐字抽出来**，在本程序里合成同一个名字的类型。
-// 抄的是源码那一行，不是数字 —— 生产改了这里立刻跟着变。
-let attachmentSource = try String(contentsOf: sourceRoot.appendingPathComponent("Presence/PropAttachment.swift"),
-                                  encoding: .utf8)
-func attachmentDeclaration(_ prefix: String) -> String {
-    guard let line = attachmentSource.split(separator: "\n")
-        .map({ $0.trimmingCharacters(in: .whitespaces) })
-        .first(where: { $0.hasPrefix(prefix) }) else {
-        print("FAIL: PropAttachment.swift 里找不到以 \"\(prefix)\" 开头的声明")
-        exit(1)
-    }
-    return line
-}
-/// 从生产源码里**逐字**抽出一个完整声明（含花括号内全部内容），供 harness 里合成同名类型。
-/// 花括号配对取，所以类型里将来多几个 case 也照样跟着过来（不是抄一份）。
-func attachmentType(_ signature: String) -> String {
-    guard let start = attachmentSource.range(of: signature)?.lowerBound,
-          let open = attachmentSource[start...].firstIndex(of: "{") else {
-        print("FAIL: PropAttachment.swift 里找不到 \(signature)")
-        exit(1)
-    }
-    var depth = 0
-    for index in attachmentSource[open...].indices {
-        if attachmentSource[index] == "{" { depth += 1 }
-        if attachmentSource[index] == "}" { depth -= 1 }
-        if depth == 0 { return String(attachmentSource[start...index]) }
-    }
-    print("FAIL: \(signature) 的花括号不平衡")
-    exit(1)
-}
-/// `WorldRuntime` 的挂点 → 渲染侧挂点的换算（真实定义在 `PropAttachmentSlot.swift` 里，
-/// 那份文件也依赖 app 目标）。同样是**逐字**抽出来，不是抄一份映射。
-let attachmentSlotSource = try String(contentsOf: sourceRoot.appendingPathComponent("Presence/PropAttachmentSlot.swift"),
-                                      encoding: .utf8)
-func attachmentSlotType(_ signature: String) -> String {
-    guard let start = attachmentSlotSource.range(of: signature)?.lowerBound,
-          let open = attachmentSlotSource[start...].firstIndex(of: "{") else {
-        print("FAIL: PropAttachmentSlot.swift 里找不到 \(signature)")
-        exit(1)
-    }
-    var depth = 0
-    for index in attachmentSlotSource[open...].indices {
-        if attachmentSlotSource[index] == "{" { depth += 1 }
-        if attachmentSlotSource[index] == "}" { depth -= 1 }
-        if depth == 0 { return String(attachmentSlotSource[start...index]) }
-    }
-    print("FAIL: \(signature) 的花括号不平衡")
-    exit(1)
-}
-let attachmentEligibilityShim = """
-\(attachmentType("enum PropAttachmentPoint:"))
-\(attachmentSlotType("extension WorldPropSlot {"))
-enum ResidentPropAttachmentEligibility {
-    \(attachmentDeclaration("static let holdableLongestEdgeMeters"))
-    \(attachmentDeclaration("static var holdableLongestEdgeText"))
-}
-"""
 let harness = #"""
 import Foundation
 import WorldRuntime
 import simd
-/// 手持尺寸上限：**逐字**取自生产源码 `Presence/PropAttachment.swift` 的那两行（见本文件
-/// 上面的抽取器），因为 `ResidentPropPlacementService` 的拒绝文案与闸门都读它 —— 上限
-/// 全仓只有一处定义，这里不许抄数字。
-\#(attachmentEligibilityShim)
 \#(bootstrap[start..<end])
 struct Config: Decodable {
     struct Framing: Decodable { let origin: [Float]; let scale: Float }
@@ -442,6 +379,11 @@ let compiled = try run("/usr/bin/swiftc",["-j1","-parse-as-library","-I",worldRu
     sourceRoot.appendingPathComponent("Presence/ResidentPropPlacementService.swift").path,
     sourceRoot.appendingPathComponent("Presence/ResidentPropEditorState.swift").path,
     sourceRoot.appendingPathComponent("Presence/ResidentPropPlacementConfiguration.swift").path,
+    // 手持上限 + 挂点（slot）的替身：`ResidentPropPlacementService` 读那两份定义，
+    // 而它们的真定义依赖 app 的渲染侧类型，离线编不动（见那个 fixture 的文件头）。
+    root.appendingPathComponent("tools/fixtures/ResidentPropHoldLimitShim.swift").path,
+    root.appendingPathComponent("tools/fixtures/PropAttachmentPointShim.swift").path,
+    root.appendingPathComponent("tools/fixtures/PropAttachmentSlotShim.swift").path,
     program.path,"-o",executable.path]+objects)
 guard compiled == 0 else { exit(compiled) }
 exit(try run(executable.path,Array(CommandLine.arguments.dropFirst())))
