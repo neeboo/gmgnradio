@@ -217,6 +217,10 @@ _test-harnesses:
 	# 三个负对照（改派生源 / 无条件报已入库 / 身份用输入哈希）在 harness 内部
 	# 对源码副本做手术，证明判据真的会红 —— 一个"从不 FAIL"的门禁等于没有门禁。
 	swift tools/test-generation-results-authority.swift
+	# 「长期记忆」是**用户决定不做**的能力（2026-10-01），所以它必须是被钉住的，
+	# 而不是靠记忆：生产代码里不得再出现会让人以为存在该能力的类型/文案/状态。
+	# 判据带负对照（把策略或用户文案注入回来 ⇒ 必须 FAIL）。
+	swift tools/test-no-long-term-memory-capability.swift
 	# 生成结果四方对账器的**自测**（反例必须 FAIL、正例必须不 FAIL）。
 	# 只挂 `--self-test`：默认那条读真机 root/真实存档（本身就是 B-1/B-2 的
 	# 现场），挂进 CI 门禁会变成"依赖用户当前数据"的非确定性红。

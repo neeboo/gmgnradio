@@ -3501,6 +3501,11 @@ final class AppDelegate:
     /// 「补充消息交付未确认」的可见生命周期：用户下一次真实发送/停止/换空间后旧提示
     /// 不再显示；模型上下文（unconfirmedUserMessages）不变。
     private var residentUnconfirmedNotice = ResidentUnconfirmedNoticePolicy()
+    // **长期记忆已由用户决定不做**（2026-10-01）。这里原先有一个
+    // `ResidentLongTermMemoryNoticePolicy`，每轮给用户一句"长期记忆暂不可用"。
+    // 既然不做，就不该在界面上宣传一个不会有的能力（那会让人以为"以后会有"），
+    // 所以那句提示连同策略一起删除。「不搞」这件事由
+    // `tools/test-no-long-term-memory-capability.swift` 钉住（注入回来 ⇒ FAIL）。
     private let residentActivityOwnership = ResidentActivityOwnership()
     private var residentLoopSchedulingTask: Task<Void, Never>?
     private let propGenerationStore = PropGenerationStore()
@@ -6208,6 +6213,9 @@ final class AppDelegate:
         // 凭据的唯一用途是之后调 `confirmDeliveredTurn` 去 `memory_ingest`，那条链
         // 已整体删除。守卫本身保留——它仍然保护下面那些**真正写东西**的动作
         // （确认许愿通知、同步面板）。
+        //
+        // 这里**不再**给用户任何"记忆"提示：长期记忆已由用户决定不做，
+        // 界面上不该出现一个不会有的能力的说明（见 `test-no-long-term-memory-capability`）。
         if !reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || residentAgentLoop?.allowsSilentCompletion(runID: input.runID) == true {
             do { try await acknowledgeWishEvents(input.events, worldContext: worldContext) }

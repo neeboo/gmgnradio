@@ -69,6 +69,21 @@ enum ResidentStatusNoticeMerge {
     }
 }
 
+// **长期记忆已由用户决定不做**（2026-10-01）。
+//
+// 这里原先有 `ResidentLongTermMemoryNoticePolicy`：每轮记一笔"长期记忆暂不可用"，
+// 只在状态变化时给用户一句可读说明（诚实、不刷屏、不可被静默移除——那套判据当时
+// 都做了负对照）。用户拍板"长期记忆不要搞"之后它被整体删除，理由有两条：
+//
+// 1. 既然**不做**，就不该在界面上宣传一个不会有的能力 —— 那句"等压缩接上后自动
+//    恢复"会让人以为"以后会有"，属于噪音；
+// 2. 一个只报告"能力缺失"的常驻提示，本身也是要长期维护的状态机。
+//
+// **但"不搞"必须是被钉住的，而不是靠记忆**：生产代码里不得再出现会让人以为存在
+// 该能力的类型/文案/状态。判据在 `tools/test-no-long-term-memory-capability.swift`
+// （注入回来 ⇒ FAIL）。原文层的退役判据另在 `memory.rs`
+// （`raw_conversation_text_layer_is_gone_and_cannot_come_back_silently`）。
+
 /// 「补充消息交付未确认」这条界面提示的可见生命周期。
 ///
 /// `unconfirmedUserMessages` 是交给模型的长期核对上下文：一旦补充消息的交付结果

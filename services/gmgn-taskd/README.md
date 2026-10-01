@@ -27,6 +27,14 @@ SQLite 由专属存储线程单写。任务变更、事件和具有明确 scope 
 
 VoiceMem 选择性移植的长期记忆层留在 Rust daemon 内：`memory_status/read/query` 与本地 `memory_recall` 的协议、快照与幂等账本（`memory_snapshots`/`memory_requests`/`memory_vec_rows`）、sqlite-vec 静态链接都保留，出处与许可证见 `VoiceMem-NOTICE.md`；合同见 [VoiceMem Rust 记忆合同](../../docs/plans/2026-09-08-voicemem-rust-contract.md)。**外部 VoiceMem 服务层已整体拆除**：daemon 不再向任何 compaction/embedding endpoint 发 HTTP，也不再持有 endpoint/token/model 配置，只服务外部 provider 的两个 IPC 方法（配置 provider、语义压缩提交）已整体从 dispatch 删除（调用得到 `unknown_method`），后台压缩编排与断连取消管线一并移除。为后续在 Rust 内自行实现语义抽取，快照与向量代次账本的结构、三张表与 sqlite-vec 注册都原样保留，但不再写入向量。
 
+**长期记忆：保留但不在计划内**（2026-10-01，用户明确决定「长期记忆不要搞」）。`memory_snapshots` / `memory_requests` / `memory_vec_rows` 三张表**留着不动**（删表收益低于风险：老库里可能已有账本行，且结构本身是历史记录），但**长期记忆已由用户决定不做**：
+
+- `memory_compact`（冻结合同 §3.7）**不会接线**；`memory.rs` 里现已 dead 的快照提交与幂等账本（`commit` / `recorded_replay` / `CompactCommit`）**不接**，只在模块头写明理由。
+- 界面上**不再**出现任何「长期记忆暂不可用 / 等压缩接上后自动恢复」之类的提示——既然不做，就不该宣传一个不会有的能力。
+- 判据：`swift tools/test-no-long-term-memory-capability.swift`（把能力类型或面向用户的文案注入回来 ⇒ **FAIL**）。
+- **不影响对话连续性**：驻留 agent 的**会话内连续性来自 DSH 自己的 session**（以及 Claude 那条路的内存历史），**不来自**这套记忆库。所以"不做长期记忆"不需要为了对话再补任何东西。
+- **存储范围（最终口径）**：只持久化**空间状态**（世界 + 物件 + 资产引用）到本地 Rust 权威；长期记忆、消息投递迁移、云端同步均**不在计划内**。
+
 **原文层（volatile pending turns）也已整体移除**（2026-10-01）：`memory_turn` / `memory_pending` / `memory_ingest` 三个方法连同 `Buffer`/`VolatileTurn`/`clear_covered` 与三个上限常量一起删除，调用它们得到专门的 **`memory_original_text_layer_removed`**（不是含糊的 `unknown_method`——老客户端仍会调用，而"回合原文没能进记忆"必须说得出口；也**不是**接受后丢弃，静默成功正是要消灭的形状）。移除依据：真机 `pendingTurns` 恒为 0、三张记忆表 0 行、`memory_compact` 从未有 dispatch 分支，原文层唯一的生产用途（`freshSession` 恢复段）在 pending=0 时**恒为空转**，保留死代码 + 死合同本身就是负担。**压缩层不受影响**：`memory_snapshots`/`memory_requests` 与 `memory::commit` 原样保留。`memory_recall` 的 `pendingTurns` 保留在返回里但**恒为 0**（只为不改客户端解码契约，值已无来源）。进程级回归：`TASKD_BIN="$PWD/services/gmgn-taskd/target/debug/gmgn-taskd" python3 services/gmgn-taskd/tests/local_memory_process.py -v`（无任何 provider fixture：三个原文方法的**可见失败** + "原文绝不落盘"的逐字节搜索 + scope 隔离 + read 的显式 null + query/recall 的如实「语义检索不可用」应答）。注意：`tools/test-resident-state-daemon.py` 中的 v1 升级断言仍写死版本 2，v3 迁移后需改为 3（tools 归 Swift/tools owner，待其更新）。
 
 ## 本地记忆行为（provider 与原文层移除后）

@@ -1,5 +1,28 @@
 //! VoiceMem selective Rust port: scoped durable memory snapshots + retrieval.
 //!
+//! # ⚠️ 长期记忆已由用户决定**不做**（2026-10-01）
+//!
+//! 本模块的**压缩层**（`memory_snapshots` / `memory_requests` / `memory_vec_rows`
+//! 三张表、快照形状、代次账本、`commit` / `recorded_replay` / `CompactCommit`）
+//! **保留但不在计划内**：
+//!
+//! * **保留**是因为**删表收益低于风险** —— 老库里可能已有账本行，而结构本身是
+//!   一段历史记录；`schema()` 的 DDL 幂等且纯增量，留着不产生运行成本。
+//! * **不在计划内**是因为用户拍板「长期记忆不要搞」：`memory_compact`（冻结合同
+//!   §3.7）**不会接线**，这里现已 dead 的**写入方**（`commit` / `recorded_replay`
+//!   / `CompactCommit` / `VecEntry` 等）**不接**任何生产调用点。
+//! * 模块级 `#![allow(dead_code)]` 就是为这些保留结构开的豁免（见下方注释）。
+//!   **新增死代码请单独处理，不要依赖这条豁免。**
+//! * 界面上**不再**出现任何「长期记忆暂不可用 / 等压缩接上后自动恢复」之类的
+//!   提示——既然不做，就不该宣传一个不会有的能力。判据在
+//!   `tools/test-no-long-term-memory-capability.swift`（注入回来 ⇒ FAIL）。
+//! * **不影响对话连续性**：会话内连续性来自 DSH 自己的 session，不来自本模块。
+//! * **存储范围（最终口径）**：只持久化**空间状态**（世界 + 物件 + 资产引用）到
+//!   本地 Rust 权威；长期记忆、消息投递迁移、云端同步均**不在计划内**。
+//!
+//! 历史的原文层（volatile pending turns）已于同日整体退役，判据见本模块
+//! `raw_conversation_text_layer_is_gone_and_cannot_come_back_silently`。
+//!
 //! This module adds a third persistent layer beside the job store and the
 //! resident state/event/message store, all inside the one `tasks.sqlite3` and
 //! the one `taskd-storage` writer thread (no second database, no second
