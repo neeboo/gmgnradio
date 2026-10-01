@@ -26,6 +26,13 @@ public enum WorldEventKind: Codable, Equatable, Sendable {
     case movementFailed(requestID: String, destinationID: String, reason: String)
     case goalCompleted(goalID: String)
     case propLayoutChanged(objectID: String, layoutRevision: UInt64)
+    /// 一件生成资产被**永久删除**（墓碑 + 事实）。与权威 `world_facts` 里的
+    /// `object.removed` 同族：删除是一件**具名事实**，不是"布局数值变了一下"。
+    ///
+    /// 负载里带上名字、结算动作与被释放的内容引用：回执与对账要回答的
+    /// "删了什么、怎么收场的、释放了哪些共享内容" 在这一条事件里就齐了。
+    case propDeleted(objectID: String, displayName: String, layoutRevision: UInt64,
+                     settled: String, releasedBlobRefs: [String])
 }
 
 public struct WorldEvent: Codable, Equatable, Sendable {

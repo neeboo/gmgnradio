@@ -59,10 +59,14 @@ import CoreFoundation
                 // 这里只说形状与"去哪儿读"，不再各存一份。
                 "size_intent": [
                     "type": ["object", "null"],
-                    "description": "尺寸意图：\(WishMachineContract.pointer)",
+                    "description": "尺寸意图，**两种形状二选一**：给完整三维时用 mode=\(PropSizeIntent.dimensionsModeValue) + millimeters；只说得出一根轴时才用 axis + meters。\(WishMachineContract.pointer)",
                     "properties": [
-                        "axis": ["type": "string", "description": "哪根轴。合法取值与例子见 \(WishMachineContract.toolName)"],
-                        "meters": ["type": "number", "description": "米数。允许范围见 \(WishMachineContract.toolName)"],
+                        "axis": ["type": "string", "description": "哪根轴（**只给一根轴**时用）。合法取值与例子见 \(WishMachineContract.toolName)"],
+                        "meters": ["type": "number", "description": "米数（**只给一根轴**时用）。允许范围见 \(WishMachineContract.toolName)"],
+                        "mode": ["type": "string", "enum": [PropSizeIntent.dimensionsModeValue], "description": "三轴形状的标签：用户说了完整长宽高就必须给 \(PropSizeIntent.dimensionsModeValue)，并同时给 millimeters。与 axis/meters **只能给一种**。轴序与朝向见 \(WishMachineContract.toolName)"],
+                        "millimeters": ["type": ["object", "null"], "description": "三轴尺寸（毫米）：x = 宽、y = 高（上下，本仓 up 固定在 ±Y）、z = 深。用户说「1443 x 862 x 302 mm」就**照实**填这三个整数（不要换算成米、不要只挑最长边、不要改顺序）。",
+                            "properties": ["x": ["type": "number"], "y": ["type": "number"], "z": ["type": "number"]],
+                            "required": ["x", "y", "z"], "additionalProperties": false],
                         "source": ["type": "string", "description": "这个数字是谁说的。合法取值见 \(WishMachineContract.toolName)"]],
                     "required": [String](), "additionalProperties": false],
                 "height_meters": ["type": "number", "description": "\(WishMachineContract.legacyHeightField)：旧字段，等价于 \(PropSizeIntent.Axis.height.rawValue) 轴；与 size_intent 只能给一个。只给它的调用线上不出现 size_intent 这个键（逐字节兼容）。"],
@@ -80,7 +84,7 @@ import CoreFoundation
                 properties["confirm_resume"] = ["type": "boolean", "enum": [true], "description": "仅本轮用户明确要求恢复此原许愿任务的自动领取及原目的地摆放时设为 true；普通聊天、查询和后台事件不得确认。"]
             }
             let descriptions = [
-                "submit_wish_generation": "仅在用户本轮明确要求制作物件时，用登记图片提交一次异步生成。\(WishMachineContract.pointer) 尺寸没说清楚时本工具**不会**替你猜、也不会提交：它会返回一个 `\(WishMachineContract.Code.needsInput.rawValue)` 的结果，里面有一句 `question`（问给用户）和一个 `pending_id`；把那一句问给用户，拿到答案后用同一个 `pending_id` 再调一次本工具，就会续上**同一次**委托（不重复生成、不消耗新授权）。用户没给参考图时，先用 search_wish_reference_images 找图并用 register_wish_reference_image 登记，再提交；不要要求用户自己找图。用户只要求看图或描述图片时不得调用。本地持久受理即返回 wish_id；宿主后台提交，重要状态和终态按同一 wish_id 异步通知，无需反复查询。受理不代表远端接单或生成完成；不移动居民。",
+                "submit_wish_generation": "仅在用户本轮明确要求制作物件时，用登记图片提交一次异步生成。\(WishMachineContract.pointer) 尺寸：用户说了**完整长宽高**（例如「1443 x 862 x 302 mm」）就**照实**填 mode=\(PropSizeIntent.dimensionsModeValue) + millimeters 三个数（x 宽 / y 高 / z 深），**不要**只挑最长边、不要漏填另外两维；只有一个尺寸时才用 axis + meters。尺寸没说清楚时本工具**不会**替你猜、也不会提交：它会返回一个 `\(WishMachineContract.Code.needsInput.rawValue)` 的结果，里面有一句 `question`（问给用户）和一个 `pending_id`；把那一句问给用户，拿到答案后用同一个 `pending_id` 再调一次本工具，就会续上**同一次**委托（不重复生成、不消耗新授权）。用户没给参考图时，先用 search_wish_reference_images 找图并用 register_wish_reference_image 登记，再提交；不要要求用户自己找图。用户只要求看图或描述图片时不得调用。本地持久受理即返回 wish_id；宿主后台提交，重要状态和终态按同一 wish_id 异步通知，无需反复查询。受理不代表远端接单或生成完成；不移动居民。",
                 "read_wish_generation": "省略 wish_id 可查看当前居民任务、本轮登记的参考图和还没做完的委托（open_drafts，含续办要用的 pending_id）；提供 wish_id 可查询任务并下载完成产物。生成完成、可展示与实际领取分别记录。",
                 WishMachineContract.toolName: "只读地读回许愿机的**全部参数、限制与当前能力**（唯一真相，空参数调用）。填 submit_wish_generation 的任何参数之前先读它：轴的合法取值、米数范围、允许的出处、旧字段、错误与 `\(WishMachineContract.Code.needsInput.rawValue)` 的词汇、服务是否配置、生成服务**声明**的轴能力（读不到就明确说读不到，绝不会声称支持）、以及还没做完的委托。不产生任何副作用。",
                 "retry_wish_generation": "确认结果未明的原提交，复用原图片和幂等编号，不创建新任务、不额外消费生成授权。仅显式调用，不自动重试。",
@@ -147,16 +151,28 @@ import CoreFoundation
         return CFGetTypeID(number) != CFBooleanGetTypeID() && number.doubleValue.isFinite
     }
 
-    /// 尺寸字段的**形状**：`size_intent` 是对象、只有三个已知键、成员类型对；旧字段是米数。
-    /// 不判断"轴在不在词汇表里""米数在不在范围内" —— 那是语义，判据在 `sizeIntentVerdict`。
+    /// 尺寸字段的**形状**：`size_intent` 是对象、只有五个已知键、成员类型对；旧字段是米数。
+    /// 不判断"轴在不在词汇表里""米数在不在范围内""两种形状是不是都给了" —— 那是语义，
+    /// 判据在 `sizeIntentVerdict`（它才能说出"缺什么、该问哪一句"）。
     private static func isStructurallySoundSizeFields(_ arguments: [String: Any]) -> Bool {
         if let raw = arguments["height_meters"], !(raw is NSNull), !isFiniteNumber(raw) { return false }
         guard let rawIntent = arguments["size_intent"], !(rawIntent is NSNull) else { return true }
         guard let intent = rawIntent as? [String: Any],
-              Set(intent.keys).isSubset(of: ["axis", "meters", "source"]) else { return false }
+              Set(intent.keys).isSubset(of: ["axis", "meters", "mode", "millimeters", "source"]) else { return false }
         if let axis = intent["axis"], !(axis is NSNull), !(axis is String) { return false }
         if let meters = intent["meters"], !(meters is NSNull), !isFiniteNumber(meters) { return false }
         if let source = intent["source"], !(source is NSNull), !(source is String) { return false }
+        if let mode = intent["mode"], !(mode is NSNull), !(mode is String) { return false }
+        // 三轴的三个分量：只认 `{x, y, z}` 三个**有名字**的键。序列 `[1443, 862, 302]` 不是
+        // 本契约的形式（键名才是"哪一根轴"），所以这里连类型带键名一起判。
+        if let rawMillimeters = intent["millimeters"], !(rawMillimeters is NSNull) {
+            guard let millimeters = rawMillimeters as? [String: Any],
+                  Set(millimeters.keys).isSubset(of: ["x", "y", "z"]),
+                  ["x", "y", "z"].allSatisfy({ key in
+                      guard let value = millimeters[key], !(value is NSNull) else { return false }
+                      return isFiniteNumber(value)
+                  }) else { return false }
+        }
         return true
     }
 
@@ -209,10 +225,63 @@ import CoreFoundation
             return .needsInput(need: .size, reason: .unspecified)
         }
         guard let value = raw as? [String: Any] else {
-            return .invalid(reason: "size_intent 必须是一个对象：{axis, meters, source?}。")
+            return .invalid(reason: "size_intent 必须是一个对象：{axis, meters, source?} 或 {mode: \"\(PropSizeIntent.dimensionsModeValue)\", millimeters: {x, y, z}, source?}。")
         }
-        guard Set(value.keys).isSubset(of: ["axis", "meters", "source"]) else {
-            return .invalid(reason: "size_intent 只认 axis / meters / source 三个键。")
+        guard Set(value.keys).isSubset(of: ["axis", "meters", "mode", "millimeters", "source"]) else {
+            return .invalid(reason: "size_intent 只认 axis / meters / mode / millimeters / source 五个键。")
+        }
+        // 形状由 `mode` 这个**显式标签**分派（守护进程 `parsed_size_intent` 同一条：
+        // 有 mode 就走三轴，没有就是旧形状）。
+        if let rawMode = value["mode"].flatMap({ $0 is NSNull ? nil : $0 }) {
+            guard let mode = rawMode as? String else {
+                return .invalid(reason: "size_intent.mode 必须是字符串。")
+            }
+            guard mode == PropSizeIntent.dimensionsModeValue else {
+                return .invalid(reason: "size_intent.mode 只能是 \(PropSizeIntent.dimensionsModeValue)（收到 \(mode)）。")
+            }
+            // 两种形状**同时给** ⇒ 这个对象说不清自己是哪一种：具名拒绝，不挑一份信
+            // （守护进程侧同一个语义的码是 `size_intent_shape_conflict`）。
+            guard value["axis"] == nil, value["meters"] == nil else {
+                return .invalid(reason: "尺寸给了两种形状：mode=\(PropSizeIntent.dimensionsModeValue)（三轴）与 axis/meters（一根轴）只能给一种。")
+            }
+            let source: PropSizeIntent.Source
+            switch sizeIntentSource(value) {
+            case let .ok(parsed): source = parsed
+            case let .invalid(reason): return .invalid(reason: reason)
+            }
+            guard let rawMillimeters = value["millimeters"].flatMap({ $0 is NSNull ? nil : $0 }) else {
+                return .invalid(reason: "size_intent.millimeters 缺了：三轴形状必须给 x / y / z 三个毫米数（宽 / 高 / 深），不能只给一两根轴。")
+            }
+            guard let millimeters = rawMillimeters as? [String: Any],
+                  Set(millimeters.keys) == ["x", "y", "z"] else {
+                return .invalid(reason: "size_intent.millimeters 必须是 {x, y, z} 三个键（宽 / 高 / 深），不能只给一两根轴、也不能多给。")
+            }
+            var edges: [Double] = []
+            for key in ["x", "y", "z"] {
+                guard let number = millimeters[key] as? NSNumber,
+                      CFGetTypeID(number) != CFBooleanGetTypeID(),
+                      number.doubleValue.isFinite else {
+                    return .invalid(reason: "size_intent.millimeters.\(key) 必须是毫米数。")
+                }
+                guard number.doubleValue >= PropSizeIntent.minimumMillimeters,
+                      number.doubleValue <= PropSizeIntent.maximumMillimeters else {
+                    return .invalid(reason: "size_intent.millimeters.\(key) 超出范围：允许 \(millimetersRangeText()) 毫米（收到 \(number.doubleValue)）。")
+                }
+                edges.append(number.doubleValue)
+            }
+            guard let intent = PropSizeIntent(
+                millimeters: .init(x: edges[0], y: edges[1], z: edges[2]), source: source) else {
+                return .invalid(reason: "size_intent 无法构成合法的三轴尺寸意图。")
+            }
+            // 三轴意图**从不发给远端**：线上那个键只有"一根轴 + 一个米数"这一种形状，而远端
+            // 严格拒绝未知键（见 `SizeIntentSupport::accepts`）。所以这里**不查服务声明的轴** ——
+            // 那个清单描述的是一根轴，拿它拦三轴会凭空拦下一件本来能做的物件。远端拿到的仍然
+            // 只有 `height_meters` = 三轴的 y（高）。
+            return .ok(heightMeters: intent.heightMetersForSubmission, intent: intent)
+        }
+        // 没有 `mode` 却带了三轴的字段：形状不完整（三轴意图**必须**声明 `mode`）。
+        guard value["millimeters"] == nil else {
+            return .invalid(reason: "size_intent.millimeters 必须与 mode=\"\(PropSizeIntent.dimensionsModeValue)\" 一起给：三轴形状要显式说清是哪一种。")
         }
         let rawAxis = value["axis"].flatMap { $0 is NSNull ? nil : $0 }
         let axis: PropSizeIntent.Axis
@@ -233,19 +302,9 @@ import CoreFoundation
             return .needsInput(need: .sizeAxis, reason: .axisNotDeclared, unsupportedAxis: axis.rawValue)
         }
         let source: PropSizeIntent.Source
-        if let rawSource = value["source"].flatMap({ $0 is NSNull ? nil : $0 }) {
-            guard let text = rawSource as? String else {
-                return .invalid(reason: "size_intent.source 必须是字符串。")
-            }
-            guard let parsed = PropSizeIntent.Source(rawValue: text) else {
-                return .invalid(reason: "size_intent.source 只能是 \(sourceText())。")
-            }
-            guard WishMachineContract.acceptedSources.contains(parsed) else {
-                return .invalid(reason: "size_intent.source = \(parsed.rawValue) 不接受：那一位的语义是\"这个数字是猜的\"，而本契约存在的意义就是不许猜 —— 用户没说尺寸就先问他一句。")
-            }
-            source = parsed
-        } else {
-            source = .user
+        switch sizeIntentSource(value) {
+        case let .ok(parsed): source = parsed
+        case let .invalid(reason): return .invalid(reason: reason)
         }
         guard let rawMeters = value["meters"].flatMap({ $0 is NSNull ? nil : $0 }) else {
             return .needsInput(need: .sizeMeters, reason: .unspecified)
@@ -274,6 +333,42 @@ import CoreFoundation
     /// 契约范围（唯一硬边界）：`WishMachineContract` 从 `PropSizeIntent` 常量取。
     static func contractRangeContains(_ meters: Double) -> Bool {
         meters >= WishMachineContract.minimumMeters && meters <= WishMachineContract.maximumMeters
+    }
+
+    /// 三轴的毫米硬边界：与米数范围**同一条边界**（`10–3000 mm` ⇔ 契约的米数范围），
+    /// 常量属于 `PropSizeIntent`，这里不抄第二份。
+    static func millimetersRangeContains(_ millimeters: Double) -> Bool {
+        millimeters >= PropSizeIntent.minimumMillimeters
+            && millimeters <= PropSizeIntent.maximumMillimeters
+    }
+
+    static func millimetersRangeText() -> String {
+        "\(WishMachineContract.millimetersText(PropSizeIntent.minimumMillimeters))—"
+            + "\(WishMachineContract.millimetersText(PropSizeIntent.maximumMillimeters))"
+    }
+
+    /// `size_intent.source` 的判据（**两种形状共用**，所以只有这一份）。
+    ///
+    /// 缺省 `user`。`default` 一位的语义是"这个数字是猜的"，而本契约存在的意义就是不许猜。
+    enum SizeIntentSourceVerdict: Equatable {
+        case ok(PropSizeIntent.Source)
+        case invalid(reason: String)
+    }
+
+    static func sizeIntentSource(_ value: [String: Any]) -> SizeIntentSourceVerdict {
+        guard let rawSource = value["source"].flatMap({ $0 is NSNull ? nil : $0 }) else {
+            return .ok(.user)
+        }
+        guard let text = rawSource as? String else {
+            return .invalid(reason: "size_intent.source 必须是字符串。")
+        }
+        guard let parsed = PropSizeIntent.Source(rawValue: text) else {
+            return .invalid(reason: "size_intent.source 只能是 \(sourceText())。")
+        }
+        guard WishMachineContract.acceptedSources.contains(parsed) else {
+            return .invalid(reason: "size_intent.source = \(parsed.rawValue) 不接受：那一位的语义是\"这个数字是猜的\"，而本契约存在的意义就是不许猜 —— 用户没说尺寸就先问他一句。")
+        }
+        return .ok(parsed)
     }
 
     static func rangeText() -> String {
@@ -421,8 +516,16 @@ import CoreFoundation
             // 回执里回读尺寸是怎么定的：agent（和它转述给用户的话）不必猜"我说的是哪根轴"。
             if name == "submit_wish_generation" {
                 if let intent = job.sizeIntent {
-                    payload["size_intent"] = ["axis": intent.axis.rawValue, "meters": intent.meters,
-                                              "source": intent.source.rawValue, "summary": intent.summary]
+                    var readback: [String: Any] = ["axis": intent.axis.rawValue, "meters": intent.meters,
+                                                   "source": intent.source.rawValue, "summary": intent.summary]
+                    // 三轴形状把三根轴**原话**回读给 agent（和它转述给用户的话）：
+                    // 用户要能逐位核对自己说的「1443 x 862 x 302 mm」，而不是一个换算过的近似值。
+                    if case .dimensions = intent.mode, let millimeters = intent.millimeters {
+                        readback["mode"] = PropSizeIntent.dimensionsModeValue
+                        readback["millimeters"] = ["x": millimeters.x, "y": millimeters.y, "z": millimeters.z]
+                        readback["edges"] = ["x": "宽", "y": "高（up = ±Y）", "z": "深"]
+                    }
+                    payload["size_intent"] = readback
                 } else {
                     payload["size_intent"] = ["summary": "未声明尺寸意图：按生成请求高度自动推断"]
                 }
@@ -443,13 +546,20 @@ import CoreFoundation
                 payload["authorization"] = authorization
                 // 线上到底发不发这个键：读不到服务声明就**不声称**（守护进程按"没声明就不发"处理）。
                 let capability = sizeIntentCapability()
-                if job.sizeIntent == nil {
-                    payload["size_intent_forwarding"] = "legacy_height_only"
-                } else if capability.isReadable {
-                    payload["size_intent_forwarding"] = capability.declaredAxes.contains(job.sizeIntent!.axis.rawValue)
-                        ? "declared_by_service" : "not_declared_by_service"
+                if let intent = job.sizeIntent {
+                    if case .dimensions = intent.mode {
+                        // 三轴意图**恒定不发** `size_intent`（线上那个键只有"一根轴 + 一个米数"
+                        // 这一种形状，远端严格拒绝未知键 ⇒ 400 ⇒ 整件任务失败）。远端拿到的
+                        // 只有 `height_meters` = 三轴的 y。这是一条**确定的**结论，与能力探测无关。
+                        payload["size_intent_forwarding"] = "three_axis_never_forwarded_height_only"
+                    } else if capability.isReadable {
+                        payload["size_intent_forwarding"] = capability.declaredAxes.contains(intent.axis.rawValue)
+                            ? "declared_by_service" : "not_declared_by_service"
+                    } else {
+                        payload["size_intent_forwarding"] = "capability_unreadable_not_claimed"
+                    }
                 } else {
-                    payload["size_intent_forwarding"] = "capability_unreadable_not_claimed"
+                    payload["size_intent_forwarding"] = "legacy_height_only"
                 }
             }
             if name == "resume_wish_continuation" {

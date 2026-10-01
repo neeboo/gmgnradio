@@ -836,11 +836,11 @@ mod tests {
         let job = store.submit(input).unwrap();
         assert_eq!(
             store.get(&job.id).unwrap().job.size_intent,
-            Some(model::SizeIntent {
+            Some(model::SizeIntent::Axis(model::AxisSizeIntent {
                 axis: model::SizeIntentAxis::Longest,
                 meters: 1.1,
                 source: model::SizeIntentSource::User,
-            })
+            }))
         );
         let echo = serde_json::to_string(&store.get(&job.id).unwrap().job).unwrap();
         assert!(
@@ -859,6 +859,44 @@ mod tests {
             .unwrap();
         assert_eq!(replacement.size_intent, job.size_intent);
         assert_eq!(replacement.height_meters, job.height_meters);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// **断言（三轴，落库）**：用户原话给的 `1443 x 862 x 302 mm` 落到任务上、
+    /// 随 job JSON 原样回读，而且换后端时一位不丢 —— 三根轴都在，不是"只剩最长边"。
+    #[test]
+    fn three_axis_size_intent_is_persisted_echoed_and_survives_failover() {
+        let (mut store, dir) = new_store();
+        let mut input = submit(Some("wish-tv"), Some(profile(512)));
+        // 生成请求的高度就是三轴里的 y（862 mm）—— 守护进程强制两者相等。
+        input.height_meters = 0.862;
+        input.size_intent = Some(json!({
+            "mode": "dimensions",
+            "millimeters": {"x": 1443, "y": 862, "z": 302},
+            "source": "user",
+        }));
+        let job = store.submit(input).unwrap();
+        assert_eq!(
+            store.get(&job.id).unwrap().job.size_intent,
+            Some(model::SizeIntent::Dimensions(model::DimensionsSizeIntent {
+                mode: model::SizeIntentMode::Dimensions,
+                millimeters: model::SizeIntentMillimeters { x: 1443.0, y: 862.0, z: 302.0 },
+                source: model::SizeIntentSource::User,
+            }))
+        );
+        // 回读的那份 JSON 里三个整数都在（审计/面板照着这句话显示）。
+        let echo = serde_json::to_string(&store.get(&job.id).unwrap().job).unwrap();
+        assert!(
+            echo.contains(
+                r#""sizeIntent":{"mode":"dimensions","millimeters":{"x":1443.0,"y":862.0,"z":302.0},"source":"user"}"#
+            ),
+            "回执必须原样回显三轴尺寸，便于用户逐位核对：{echo}"
+        );
+        // 换后端不改三轴尺寸。
+        let (replacement, _) = store
+            .failover(&job.id, "https://backup.invalid", Some(profile(512)))
+            .unwrap();
+        assert_eq!(replacement.size_intent, job.size_intent);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

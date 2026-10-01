@@ -45,6 +45,11 @@ final class WorldScreenSurface: NSObject, WKNavigationDelegate {
     private(set) var requestedURL: String?
     /// 几何缺失/无法定位时的具名原因（由宿主写；`nil` = 几何正常）。
     var geometryIssue: WorldScreenGeometryIssue?
+    /// 本帧的遮挡掩码（`nil` = 还没算过 / 不算）。`isFullyVisible` 时**不挂掩码**。
+    private(set) var occlusionMask: WorldScreenOcclusionMask?
+    /// 最近一次掩码更新的耗时（诊断/回执用）。
+    private(set) var lastOcclusionCost: Duration?
+    private var occlusionMaskLayer: CAShapeLayer?
     var onStateChange: (@MainActor (WorldScreenSurfaceState) -> Void)?
     private var watchdog: Task<Void, Never>?
     private var isMediaSuspended = false
@@ -68,6 +73,56 @@ final class WorldScreenSurface: NSObject, WKNavigationDelegate {
         container.addSubview(webView)
         // 容器是**不吃事件**的；webView 作为子视图也因此收不到任何指针事件
         // （`WorldScreenOverlayContainer.hitTest` 恒 nil）。
+    }
+
+    /// 把"被更近的东西挡住"的那一部分**按区域裁掉**。
+    ///
+    /// 这是覆盖层"不参与深度测试"这个结构性缺口的**唯一**补法（另一条路是让覆盖层进
+    /// 渲染管线当纹理 —— 那要动 shader，是红线）。用的是 `CALayer.mask`：
+    ///
+    /// - **没被挡 ⇒ 直接摘掉掩码**（`mask = nil`）：正常观看时零裁切、零风险、零开销，
+    ///   这同时就是"无人遮挡时不闪烁"的实现方式 —— 没有掩码就没有边界可以抖；
+    /// - **被挡一部分 ⇒ 只裁被挡的那些格**：路径是**可见格**的并集，于是"人挡住左半边"
+    ///   是左半边不画、右半边照画（**区域级**），而不是整块开关；
+    /// - 路径写在容器**自己**的 bounds 坐标系里，跟着 `container.layer.transform`
+    ///   一起被投到屏幕四边形上 —— 与画面同一条变换，不可能与几何错位。
+    ///
+    /// - Parameter mask: `nil` 或全可见时摘掉掩码。
+    func applyOcclusion(_ mask: WorldScreenOcclusionMask?, cost: Duration?) {
+        occlusionMask = mask
+        lastOcclusionCost = cost
+        guard let mask, !mask.isFullyVisible else {
+            occlusionMaskLayer?.path = nil
+            container.layer?.mask = nil
+            occlusionMaskLayer = nil
+            return
+        }
+        let bounds = container.bounds
+        let size = SIMD2<Float>(Float(bounds.width), Float(bounds.height))
+        guard size.x > 0, size.y > 0 else { return }
+        let layer: CAShapeLayer
+        if let existing = occlusionMaskLayer {
+            layer = existing
+        } else {
+            let created = CAShapeLayer()
+            // 纯灰白而不是 `NSColor.white`：掩码要的是 alpha，动态颜色在这里没有意义。
+            created.fillColor = CGColor(gray: 1, alpha: 1)
+            created.fillRule = .nonZero
+            container.layer?.mask = created
+            occlusionMaskLayer = created
+            layer = created
+        }
+        let path = CGMutablePath()
+        for rect in mask.visibleRects(in: size) {
+            path.addRect(
+                CGRect(
+                    x: CGFloat(rect.x), y: CGFloat(rect.y),
+                    width: CGFloat(rect.width), height: CGFloat(rect.height)
+                )
+            )
+        }
+        layer.frame = bounds
+        layer.path = path
     }
 
     // MARK: 控制
@@ -204,6 +259,12 @@ final class WorldScreenOverlayController {
     /// 一块屏幕被"看不见"（世界不可见 / 背向 / 相机背后）而隐藏的**具名**原因，
     /// 供面板与诊断读取。`nil` = 当前可见。
     private(set) var hiddenReasons: [String: String] = [:]
+    /// 每块屏幕最近一次遮挡计算的账（格数 + 耗时）。
+    private(set) var occlusionStats: [String: WorldScreenOcclusionStat] = [:]
+    /// 房间三角面的 BVH。只在 `occluders.revision` 变了时重建。
+    private var occluderIndex: WorldScreenOccluderIndex?
+    /// 每块屏幕上一次算掩码时的输入签名：没变就**一格都不重算**。
+    private var occlusionKeys: [String: String] = [:]
     private weak var hostView: NSView?
     var onSurfaceStateChange: (@MainActor (String, WorldScreenSurfaceState) -> Void)?
 
@@ -248,6 +309,8 @@ final class WorldScreenOverlayController {
         surface.stop()
         surface.container.removeFromSuperview()
         hiddenReasons[objectID] = nil
+        occlusionKeys[objectID] = nil
+        occlusionStats[objectID] = nil
     }
 
     func removeAll() {
@@ -261,12 +324,22 @@ final class WorldScreenOverlayController {
     ///   - normals: `objectID` → 该屏的世界法向。
     ///   - projection: 本帧的相机投影。
     ///   - camera: 本帧相机（背向判据用）。
+    ///   - occluders: 本帧的遮挡物（房间三角面 + 物件盒 + 居民盒）。
+    ///     默认为空 = 不裁任何区域（旧调用点/离线驱动逐字不变）。
     func update(
         quads: [String: [SIMD3<Float>]],
         normals: [String: SIMD3<Float>],
         projection: WorldScreenProjection,
-        camera: WorldScreenCamera
+        camera: WorldScreenCamera,
+        occluders: WorldScreenOccluders = .empty
     ) {
+        if occluderIndex?.revision != occluders.revision {
+            occluderIndex = occluders.triangles.isEmpty
+                ? nil
+                : WorldScreenOccluderIndex(
+                    triangles: occluders.triangles, revision: occluders.revision
+                )
+        }
         for (objectID, surface) in surfaces {
             guard let worldCorners = quads[objectID], worldCorners.count == 4 else {
                 hide(surface, reason: "没有屏幕几何")
@@ -302,7 +375,77 @@ final class WorldScreenOverlayController {
             )
             surface.container.layer?.transform = placement.transform.cgTransform
             surface.resumeMediaIfNeeded()
+            updateOcclusion(
+                surface, worldCorners: worldCorners, camera: camera,
+                placement: placement, occluders: occluders
+            )
         }
+    }
+
+    // MARK: 前景遮挡
+
+    /// 掩码只在**输入真的变了**的时候重算。
+    ///
+    /// 这既是成本控制（相机不动、遮挡物不动、四边形没变 ⇒ 一格都不重算），
+    /// 也是"正常观看时不闪烁"的实现方式：**不重算就不可能抖**。
+    private func updateOcclusion(
+        _ surface: WorldScreenSurface,
+        worldCorners: [SIMD3<Float>],
+        camera: WorldScreenCamera,
+        placement: WorldScreenOverlayAlignment.Placement,
+        occluders: WorldScreenOccluders
+    ) {
+        let key = Self.occlusionKey(
+            corners: worldCorners, camera: camera, placement: placement,
+            occluders: occluders, owner: surface.objectID
+        )
+        guard key != occlusionKeys[surface.objectID] else { return }
+        occlusionKeys[surface.objectID] = key
+        let clock = ContinuousClock()
+        let start = clock.now
+        let mask = WorldScreenOcclusion.mask(
+            quadCorners: worldCorners,
+            cameraPosition: camera.position,
+            occluders: occluders,
+            index: occluderIndex,
+            excluding: surface.objectID
+        )
+        let cost = clock.now - start
+        surface.applyOcclusion(mask, cost: cost)
+        occlusionStats[surface.objectID] = WorldScreenOcclusionStat(
+            objectID: surface.objectID, columns: mask.columns, rows: mask.rows,
+            blockedCellCount: mask.blockedCellCount, cost: cost
+        )
+    }
+
+    /// 掩码的输入签名。相机位姿、四角、容器尺寸、遮挡物（含每个盒）都在里面 ——
+    /// 少一项就会"该重算的时候没重算"，多一项就会白算。
+    private static func occlusionKey(
+        corners: [SIMD3<Float>],
+        camera: WorldScreenCamera,
+        placement: WorldScreenOverlayAlignment.Placement,
+        occluders: WorldScreenOccluders,
+        owner: String
+    ) -> String {
+        var key = String(
+            format: "%.4f|%.4f|%.4f|%.4f|%.4f|%.3f|%.3f|%d|%llu|%@|",
+            camera.position.x, camera.position.y, camera.position.z,
+            camera.yaw, camera.pitch,
+            placement.frame.x, placement.frame.y,
+            occluders.boxes.count, occluders.revision, owner
+        )
+        for corner in corners {
+            key += String(format: "%.4f,%.4f,%.4f;", corner.x, corner.y, corner.z)
+        }
+        for box in occluders.boxes {
+            key += String(
+                format: "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%@;",
+                box.center.x, box.center.y, box.center.z,
+                box.halfExtents.x, box.halfExtents.y, box.halfExtents.z,
+                box.yaw, box.owner ?? "-"
+            )
+        }
+        return key
     }
 
     /// 世界不可见时（Live Cam / 世界未呈现）整块收起来，并**暂停**媒体。

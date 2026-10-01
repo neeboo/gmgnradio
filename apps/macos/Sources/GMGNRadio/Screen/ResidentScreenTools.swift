@@ -18,6 +18,12 @@ struct WorldScreenSnapshot: Equatable, Sendable {
     /// 状态的一行话。
     let stateText: String
     let isPlaying: Bool
+    /// **前景遮挡**的一行账（"挡了 63/336 格" + 掩码耗时）。`nil` = 还没算过。
+    ///
+    /// 它是"角色站在屏前时屏幕被裁掉哪一块"在**工具回执与面板上**的唯一出口 ——
+    /// 没有它，遮挡做没做在外面就是看不见的。刻意带默认值：既有构造点（含判据里的
+    /// 替身）一个都不用改，而新调用点显式给值。
+    var occlusionText: String? = nil
 }
 
 /// 一条命令的结果。`isError == false` 且 `code == insufficient_input` 表示**信息不足**：
@@ -267,6 +273,7 @@ extension WorldScreenSnapshot {
         object["geometry_note"] = note
         if let geometryIssue { object["geometry_problem"] = geometryIssue.errorDescription }
         if let contentURL { object["content_url"] = contentURL }
+        if let occlusionText { object["occlusion"] = occlusionText }
         return object
     }
 }

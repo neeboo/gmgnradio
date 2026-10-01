@@ -125,6 +125,28 @@ enum WishMachineContract {
     static var minimumMeters: Double { PropSizeIntent.minimumMeters }
     static var maximumMeters: Double { PropSizeIntent.maximumMeters }
 
+    /// 三轴的毫米边界：与米数**同一条边界**，常量属于 `PropSizeIntent`。
+    static var minimumMillimeters: Double { PropSizeIntent.minimumMillimeters }
+    static var maximumMillimeters: Double { PropSizeIntent.maximumMillimeters }
+    /// 线上 `mode` 的字面量（唯一拥有者是 `PropSizeIntent`）。
+    static var dimensionsModeValue: String { PropSizeIntent.dimensionsModeValue }
+
+    /// 三根轴的**名字与朝向**。轴序不是我们发明的：`up_axis` 在本仓钉死在 `±Y`
+    /// （守护进程 `UP_AXES = ["+Y","-Y"]`），所以"高"永远是 `y`。
+    static let dimensionEdges: [[String: String]] = [
+        ["id": "x", "title": "宽", "note": "左右方向（±X）。用户说「1443 x 862 x 302 mm」时它是第一个数 1443。"],
+        ["id": "y", "title": "高", "note": "上下方向（±Y；本仓 up 轴固定在 ±Y）。它是 862，也是提交里的 \(legacyHeightField)。"],
+        ["id": "z", "title": "深", "note": "前后方向。它是 302 —— 平面电视的 302 是**底座进深**（整体最深的那一维），不是面板厚度。"],
+    ]
+
+    /// 用户原话的「长 × 宽 × 高」怎么落到三根轴：按 x 宽 / y 高 / z 深**照实**填。
+    static let dimensionOrderNote = "用户说「1443 x 862 x 302 mm」时按 x=1443（宽）、y=862（高）、z=302（深）照实填，不要重排、不要换算成米、不要只挑最长边。"
+
+    /// 毫米数给人看的写法（整数不带小数点）。
+    static func millimetersText(_ value: Double) -> String {
+        value == value.rounded() ? String(Int(value)) : String(value)
+    }
+
     /// 旧字段：等价于 `axis=height`，与 `size_intent` 只能给一个。
     static let legacyHeightField = "height_meters"
 
@@ -132,7 +154,7 @@ enum WishMachineContract {
     static func question(for need: Need, name: String) -> String {
         switch need {
         case .size:
-            "你要的「\(name)」大约多大？说一个数就行（例如「1 米」或「35 厘米」），我按最长边算。"
+            "你要的「\(name)」大约多大？给**完整长宽高**最好（例如「1443 × 862 × 302 毫米」，宽 × 高 × 深），我照实填三轴；只说得出一根轴也行（例如「1 米」，我按最长边算）。"
         case .sizeAxis:
             "你要的「\(name)」是按最长边算，还是按高度算？顺便给个米数。"
         case .sizeMeters:
@@ -158,6 +180,23 @@ enum WishMachineContract {
             "instruction": pointer,
             "size_intent": [
                 "required": "size_intent 与旧字段 \(legacyHeightField) 二选一；一个都不给就是信息不足，不是默认值。",
+                "shapes": [
+                    "two_shapes_pick_one": "size_intent 有两种**形状**，只能给一种：给了完整三维就用 mode=\(dimensionsModeValue) + millimeters（三轴）；只说得出一根轴才用 axis + meters（旧形状）。两种同时给是畸形（守护进程码 size_intent_shape_conflict）。",
+                    "dimensions": [
+                        "shape": "{\"mode\": \"\(dimensionsModeValue)\", \"millimeters\": {\"x\": 1443, \"y\": 862, \"z\": 302}, \"source\": \"user\"}",
+                        "when": "用户说了**完整长宽高**时用这个（例如「1443 x 862 x 302 mm」「宽 1.4 米、高 0.86 米、深 0.3 米」）。**照实填三个数** —— 只挑一根轴报上来会让另外两维没有位置。",
+                        "edges": dimensionEdges,
+                        "order_note": dimensionOrderNote,
+                        "unit": "毫米（整数）。不要换算成米：契约里记的是**用户说的那个数**，面板会逐位显示给他核对。",
+                        "min_millimeters": minimumMillimeters,
+                        "max_millimeters": maximumMillimeters,
+                        "all_three_required": "x / y / z 三个都要给，缺一个就是畸形（缺的那一维「默认成什么」都是猜）。三根轴都必须落在 \(millimetersText(minimumMillimeters))—\(millimetersText(maximumMillimeters)) 毫米。",
+                        "height_field_rule": "三轴的 y（高）**必须**等于提交里的 \(legacyHeightField)（守护进程强制相等，否则 size_intent_conflict）。",
+                        "normalization": "场景里按**最长边等比**归一（三根轴同乘一个比例），另外两维只作为**期望值**记录：渲染端只有一份等比缩放，非等比会让碰撞盒与画面对不上。",
+                        "forwarding": "三轴意图**不会**发给生成服务（线上那个键只有「一根轴 + 一个米数」这一种形状）：远端只收到 \(legacyHeightField) = 三轴的 y。",
+                    ],
+                    "axes": "旧形状：{\"axis\": \"longest\", \"meters\": 1.1, \"source\": \"user\"}。只在用户确实只给了一个尺寸时用。",
+                ],
                 "legacy_field": [
                     "id": legacyHeightField,
                     "description": "旧字段，等价于 axis=\(PropSizeIntent.Axis.height.rawValue)；与 size_intent 只能给一个。只给它的调用线上不出现 size_intent 这个键（逐字节兼容）。",
@@ -169,8 +208,8 @@ enum WishMachineContract {
                 "max_meters": maximumMeters,
                 "when_unknown": [
                     "code": Code.needsInput.rawValue,
-                    "do": "只问一句（轴 + 一个米数），拿到答案后用 needs_input 回执里的 pending_id 再调一次 submit_wish_generation。",
-                    "never": "不要自己猜一个尺寸，不要默认按高度，不要把\"没说\"当成最后一次机会。",
+                    "do": "只问一句（三轴或轴 + 一个米数），拿到答案后用 needs_input 回执里的 pending_id 再调一次 submit_wish_generation。",
+                    "never": "不要自己猜一个尺寸，不要默认按高度，不要把「没说」当成最后一次机会，不要只挑最长边把另外两维丢掉。",
                 ],
             ],
             "codes": codesPayload,
@@ -192,7 +231,7 @@ enum WishMachineContract {
     static var codesPayload: [String: Any] {
         [
             Code.needsInput.rawValue: "信息不足（**不是错误**）：没有发出任何提交。按 needs 问用户一句，然后用 pending_id 续同一次委托。",
-            Code.invalidSizeIntent.rawValue: "尺寸本身畸形（轴不是契约词、米数不是数、出处是猜的、两个尺寸字段都给了）：这是调用方的问题，不是\"再问一句\"。",
+            Code.invalidSizeIntent.rawValue: "尺寸本身畸形（形状说不清：三轴的 mode=dimensions 与一根轴的 axis/meters 同时给；轴不是契约词；米数或毫米数不是数、越界；三轴缺一两维；出处是猜的；两个尺寸字段都给了）：这是调用方的问题，不是「再问一句」。（守护进程对「两种形状同时给」另有一个更具体的码：size_intent_shape_conflict。）",
             Code.invalidArguments.rawValue: "参数不符合工具 schema。",
             Code.staleWishSession.rawValue: "这一轮空间操作已停止。",
             Code.wishOperationFailed.rawValue: "宿主侧操作失败，原因见 message。",
@@ -249,6 +288,13 @@ enum WishMachineContract {
                 "axes": axes.map { ["id": $0.id, "title": $0.title, "example": $0.example] },
                 "min_meters": minimumMeters,
                 "max_meters": maximumMeters,
+                "dimensions": [
+                    "shape": "{\"mode\": \"\(dimensionsModeValue)\", \"millimeters\": {\"x\": 1443, \"y\": 862, \"z\": 302}, \"source\": \"user\"}",
+                    "edges": dimensionEdges,
+                    "order_note": dimensionOrderNote,
+                    "min_millimeters": minimumMillimeters,
+                    "max_millimeters": maximumMillimeters,
+                ],
             ],
             "attempt": attempt,
             "ask_again": attempt <= 2,

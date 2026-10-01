@@ -536,11 +536,11 @@ enum WishMachineError: LocalizedError {
             }
         }
         guard !requestID.isEmpty, (1...100).contains(name.count), heightMeters.isFinite, (0.01...3).contains(heightMeters) else { throw PropGenerationError.invalidInput }
-        // 尺寸意图**存在时必须合法**，而且与请求高度不矛盾：轴是高度时两者就是同一件事。
-        // 非法/矛盾一律拒绝（`invalidInput` 的文案会说明范围），不静默按"没有意图"处理。
+        // 尺寸意图**存在时必须合法**，而且与请求高度不矛盾：轴是高度（或三轴的 `y`）时两者就是
+        // 同一件事。非法/矛盾一律拒绝（`invalidInput` 的文案会说明范围），不静默按"没有意图"处理。
         if let sizeIntent {
             guard sizeIntent.isValid else { throw PropGenerationError.invalidInput }
-            if sizeIntent.axis == .height, sizeIntent.meters != heightMeters { throw PropGenerationError.invalidInput }
+            if let required = sizeIntent.requiredHeightMeters, required != heightMeters { throw PropGenerationError.invalidInput }
         }
         let id = UUID()
         jobs.append(.init(id: id, worldID: worldID, residentScope: residentScope, authorizationID: authorizationID,

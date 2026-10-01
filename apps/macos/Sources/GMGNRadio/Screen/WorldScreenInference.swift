@@ -62,17 +62,24 @@ enum WorldScreenResolution {
            size.x > 0, size.y > 0, size.z > 0 {
             let face = WorldScreenFaceInference.largestFace(size: size)
             if let rejection = WorldScreenFaceInference.rejection(size: size, objectID: objectID) {
-                // 有尺寸但判不出屏幕：只有调用方明确声明是电视时才给缺省，且缺省必须
-                // 把"为什么没走推断"写出来。
+                // 有尺寸但判不出屏幕：**不许糊一块与这件道具无关的平面**。
+                //
+                // 这里曾经落到"通用电视"缺省（1.10 m × 0.62 m、中心高 1.05 m）。那是错的，
+                // 理由是**真机数据**而不是偏好：真机那件 `超大荧幕电视`（生成道具
+                // `2F633C0F-…`，用户意图最长边 1.443 m ⇒ 尺寸 1.443 × 0.901 × 1.443 m）
+                // 三边 0.62 比 1 还粗，`notPanelLike` 成立；于是它被糊上一块固定
+                // 1.10 × 0.62、中心高 **1.05 m** 的平面 —— 比这件道具自己的顶（0.901 m）
+                // 还高 0.15 m。"屏幕"于是浮在电视**上方**，既不在它身上，也不跟它一样大。
+                //
+                // 两条纪律同时要求改：
+                // 1. `docs/plans/2026-10-02-stage-tv-screen.md` §1.2 写明缺省是
+                //    "**尺寸也没有时**"那一级；尺寸在手时把判定权交给一个固定尺寸，
+                //    等于让**名字**压过**几何**。
+                // 2. 屏幕是**物件上的一个面**。猜也必须猜这件道具自己的一个面。
                 guard allowsDefault else {
                     return .failure(rejection)
                 }
-                return .success(
-                    defaultDefinition(
-                        objectID: objectID,
-                        extraReason: "（这件道具判不出屏幕：\(rejection.errorDescription)）"
-                    )
-                )
+                return .success(fallbackDefinition(objectID: objectID, size: size))
             }
             return .success(inferredDefinition(objectID: objectID, size: size, face: face))
         }
@@ -99,6 +106,40 @@ enum WorldScreenResolution {
         )
         return WorldScreenDefinition(
             objectID: objectID, source: .inferred, quad: quad, note: note
+        )
+    }
+
+    // MARK: 判不出板形、但调用方已声明"这是电视"
+
+    /// "判不出板形"那一级的兜底：**这件道具自己的一个面**，而不是一台与它无关的通用电视。
+    ///
+    /// 为什么给面而不是什么都不给：走到这里说明调用方已经**明确声明**"这台是要装屏幕的
+    /// 电视"（名字里带电视/屏幕，或在面板里显式指定）。此时说"没有屏幕"，用户看到的是
+    /// 一台什么都放不了的电视；这一级本来就是允许猜的（`source = .default`，
+    /// `note` 里必须写"这是猜的"）。
+    ///
+    /// 为什么是**竖直面**（±Z 正面 / ±X 侧面里面积大的那一个）：屏幕在竖直面上覆盖
+    /// 绝大多数情形（电视、显示器、挂墙屏）。躺着的薄板走的不是这一级 —— 它板形成立，
+    /// `largestFace` 会正确地选中朝上的那一面；所以这一条不会把"躺着的屏幕"判错。
+    ///
+    /// 尺寸、比值、选中的面、最终宽高全部写进 `note`：这一份是猜的，但它**可以被复核**。
+    static func fallbackDefinition(
+        objectID: String,
+        size: SIMD3<Float>
+    ) -> WorldScreenDefinition {
+        let face = WorldScreenFaceInference.defaultFace(size: size)
+        let quad = face.quad(size: size)
+        let note = String(
+            format: "判不出板形（三边 %.2f × %.2f × %.2f m，最薄/最长 %.2f > %.2f）："
+                + "按它面积较大的**竖直面** %@ 取 %.2f m × %.2f m。这一份是猜的，"
+                + "不是标定值，请在面板里标定。",
+            size.x, size.y, size.z,
+            WorldScreenFaceInference.thinnestOverLongest(size: size),
+            WorldScreenResolution.maximumPanelThicknessRatio,
+            face.normalName, quad.width, quad.height
+        )
+        return WorldScreenDefinition(
+            objectID: objectID, source: .default, quad: quad, note: note
         )
     }
 
@@ -199,6 +240,24 @@ enum WorldScreenFaceInference {
         return best
     }
 
+    /// 最薄轴 / 最长轴。板形判据与被拒绝时给用户的数字都是它。
+    static func thinnestOverLongest(size: SIMD3<Float>) -> Float {
+        let longest = max(size.x, max(size.y, size.z))
+        let thinnest = min(size.x, min(size.y, size.z))
+        guard longest.isFinite, thinnest.isFinite, longest > 0 else { return .infinity }
+        return thinnest / longest
+    }
+
+    /// 判不出板形时，**这件道具自己的**哪一面当屏幕最少错：面积较大的**竖直面**
+    /// （`front` = ±Z 正面，`side` = ±X 侧面）。面积并列 ⇒ 正面（与 `largestFace` 同序）。
+    ///
+    /// 这一条**只**服务于"已经判不出板形"的那一级，所以不会改变任何一块真板子的结论：
+    /// 躺着的薄板板形成立，走的是 `largestFace`（正确地选中朝上的那一面）。
+    static func defaultFace(size: SIMD3<Float>) -> WorldScreenFace {
+        WorldScreenFace.front.area(size: size) >= WorldScreenFace.side.area(size: size)
+            ? .front : .side
+    }
+
     /// 判不出屏幕时的**具名**原因；判得出时 `nil`。
     ///
     /// 两条判据缺一不可：
@@ -210,8 +269,14 @@ enum WorldScreenFaceInference {
         guard longest.isFinite, thinnest.isFinite, longest > 0 else {
             return .missingGeometry(objectID: objectID)
         }
-        if thinnest / longest > WorldScreenResolution.maximumPanelThicknessRatio {
-            return .notPanelLike(objectID: objectID)
+        let ratio = thinnest / longest
+        if ratio > WorldScreenResolution.maximumPanelThicknessRatio {
+            return .notPanelLike(
+                objectID: objectID,
+                size: size,
+                thinnestOverLongest: ratio,
+                threshold: WorldScreenResolution.maximumPanelThicknessRatio
+            )
         }
         let area = largestFace(size: size).area(size: size)
         if area < WorldScreenResolution.minimumFaceArea {

@@ -59,6 +59,45 @@ public struct WorldPropSizeIntent: Codable, Equatable, Sendable {
     }
 }
 
+/// 提交时的**三轴尺寸意图**（守护进程 `size_intent {mode:"dimensions", millimeters:{x,y,z}}`
+/// 的 app 侧镜像，单位**毫米**）。
+///
+/// 为什么单开一个单位：用户嘴里和商品页上写的就是毫米（`1443 x 862 x 302 mm`）。
+/// 记**他说的那个数**、单位换算只发生一次，就没有"少乘/多乘 1000"的余地。
+///
+/// **轴序与朝向**（与守护进程 `SizeIntentMillimeters` 逐字相同）：`x` = 宽（左右）、
+/// **`y` = 高（上下；本仓 `up_axis` 钉死在 `±Y`）**、`z` = 深（前后）。
+public struct WorldPropSizeMillimeters: Codable, Equatable, Sendable {
+    /// 与 `axis/meters` 的 `0.01–3 m` **同一条边界**，只是换成毫米：`10–3000 mm`。
+    public static let minimumMillimeters: Float = 10
+    public static let maximumMillimeters: Float = 3000
+
+    public let x: Float
+    public let y: Float
+    public let z: Float
+
+    /// 三个分量按 `[x, y, z]` 排的唯一顺序。
+    public var edges: [Float] { [x, y, z] }
+    /// 最长边的毫米数。三轴意图派生的"一根轴"就是它。
+    public var longestEdgeMillimeters: Float { edges.max() ?? 0 }
+    /// 米制三元组（世界尺度用），顺序仍是 `[x, y, z]`。
+    public var meters: WorldVector3 {
+        WorldVector3(x: x / 1000, y: y / 1000, z: z / 1000)
+    }
+    public var isValid: Bool {
+        edges.allSatisfy { $0.isFinite && (Self.minimumMillimeters...Self.maximumMillimeters).contains($0) }
+    }
+    /// 三轴的 `y` 就是"高"，也就是提交里的 `height_meters`：两者**必须**相等。
+    public var heightMeters: Float { y / 1000 }
+
+    public init?(x: Float, y: Float, z: Float) {
+        guard [x, y, z].allSatisfy({
+            $0.isFinite && (Self.minimumMillimeters...Self.maximumMillimeters).contains($0)
+        }) else { return nil }
+        self.x = x; self.y = y; self.z = z
+    }
+}
+
 /// 「生成请求的目标尺寸 → 世界里真实尺寸」的**唯一**一份策略。
 ///
 /// 为什么需要它（真机 2026-10-01 的「2B 白色长剑（外形摆件）」）：
@@ -185,6 +224,53 @@ public enum WorldPropSizePolicy {
         case .longest:
             return clamp(shape: shape, scale: meters / shape.longest, basis: .longestEdge)
         }
+    }
+
+    /// 提交时的**三轴尺寸意图**（毫米）→ 世界尺寸。
+    ///
+    /// 这是"用户说了完整长宽高"那条路的权威入口（真机 2026-10-01「平面电视」：
+    /// `1443 x 862 x 302 mm`）。**轴序与朝向**（与守护进程 `SizeIntentMillimeters` 逐字相同）：
+    /// `x` = 宽（左右）、`y` = 高（上下，本仓 up 钉死在 `±Y`）、`z` = 深（前后）。
+    ///
+    /// ## 归一策略：按**最长边等比**，另外两维只当**期望值**
+    ///
+    /// 三根轴的**数字**都记在意图里（面板会逐位回读给用户），但**几何只按最长边等比缩放**：
+    ///
+    /// - 渲染端只有**一份等比缩放**（`WishMachineOutputPlacement.transform` 三个轴的 scale
+    ///   是同一个值），所以世界里的 `size` 只可能是原始网格的等比像；
+    /// - 存一个非等比的 `size` 会让碰撞盒（同一个 `size` 派生）与画面**当场分叉** ——
+    ///   这正是 `uniformFactor`/`manualSize` 一路在拒绝的东西；
+    /// - 生成器的网格本来也不保证长宽比与用户说的规格一致，非等比"拉"到三轴只是把
+    ///   网格的错误变形伪装成"照做了"。
+    ///
+    /// 于是：最长边 = 三轴里最大的那一维（1443 mm ⇒ 1.443 m），另外两维保持原始网格的比例，
+    /// 并且**在 `reason` 里明说它们是期望值**（不是悄悄丢掉）。用户要精确三轴时，正确做法是
+    /// 走**基础几何**那条路（`WorldPrimitiveTelevision`）：几何由我们按三轴拼出来，
+    /// bbox 天生就是 1.443 × 0.862 × 0.302。
+    ///
+    /// 之后同样只做一次统一的上下限夹取（越界给读得懂的原因，不静默）。
+    public static func intended(sourceExtent: WorldVector3, millimeters: WorldPropSizeMillimeters) -> Resolution? {
+        guard isFinite(sourceExtent), sourceExtent.x > 0, sourceExtent.y > 0, sourceExtent.z > 0,
+              millimeters.isValid else { return nil }
+        let longestMillimeters = millimeters.longestEdgeMillimeters
+        let targetMeters = longestMillimeters / 1000
+        guard let shape = shape(of: sourceExtent),
+              let resolution = clamp(shape: shape, scale: targetMeters / shape.longest, basis: .longestEdge)
+        else { return nil }
+        // 把"另外两维只是期望值"写进 reason：这是本策略**必须说出来**的一句话。
+        // 不写出来，用户看到的就是"我说了三轴，场景里却只有最长边对"。
+        let others = millimeters.edges.filter { $0 != longestMillimeters }
+        let expected = others.map { meters(Float($0) / 1000) }.joined(separator: " × ")
+        let reason = "三轴尺寸按最长边等比归一：最长边 \(meters(targetMeters)) 米（你说的 "
+            + "\(millimetersText(millimeters)) 毫米里最长的那一维），另外两维（期望 "
+            + "\(expected) 米）保持原始网格的比例 —— 渲染端只有一份等比缩放，非等比会让碰撞盒与画面对不上。"
+        return Resolution(size: resolution.size, basis: resolution.basis,
+                          aspectRatio: resolution.aspectRatio,
+                          reason: [reason, resolution.reason].compactMap { $0 }.joined(separator: " "))
+    }
+
+    private static func millimetersText(_ millimeters: WorldPropSizeMillimeters) -> String {
+        millimeters.edges.map { $0 == $0.rounded() ? String(Int($0)) : String($0) }.joined(separator: " × ")
     }
 
     /// 原始网格外形（最长边 / 高度 / 纵横比）的**一次**量取。两条归一入口都从它出发。

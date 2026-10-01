@@ -86,6 +86,7 @@
 		417C56526A743FF9DA9B0A1B /* MetalStageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 004DBF16E7B8E5F738731129 /* MetalStageView.swift */; };
 		417F1A64168BDFE69EE0E1F4 /* FoliaSceneDetailModelsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D4B3C1924BD2EFD8C20A529 /* FoliaSceneDetailModelsTests.swift */; };
 		418324132C3959E834E1FE9F /* SplatIO in Frameworks */ = {isa = PBXBuildFile; productRef = E66A39AF7A49132422ED8470 /* SplatIO */; };
+		429262DD9808149129C8FF52 /* WorldScreenOcclusion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79A4BDD205AF80A18FA23331 /* WorldScreenOcclusion.swift */; };
 		42E713B2D9B7289E6E4E31AC /* AgentSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49673EC0B6CB3CED267C02E9 /* AgentSettingsView.swift */; };
 		434E080112E7C2B0FD1052E8 /* LiveKit in Frameworks */ = {isa = PBXBuildFile; productRef = 90774BF1A310244C65F85C37 /* LiveKit */; };
 		438BA9B4CB787D277D267A23 /* ResidentVisionImageBox.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1BB8EACB340657AF2516A624 /* ResidentVisionImageBox.swift */; };
@@ -464,6 +465,7 @@
 		74CB5FDE714890B936EBFF0A /* MusicAccountsModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicAccountsModelTests.swift; sourceTree = "<group>"; };
 		77166FE9E4995A36C34A2D90 /* GMGNRadioTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = GMGNRadioTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		7871D3CE3289CAECC3492A64 /* WorldScreenMetadata.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldScreenMetadata.swift; sourceTree = "<group>"; };
+		79A4BDD205AF80A18FA23331 /* WorldScreenOcclusion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldScreenOcclusion.swift; sourceTree = "<group>"; };
 		7B688935989EC09F58088668 /* LocalMusicPlayerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalMusicPlayerTests.swift; sourceTree = "<group>"; };
 		7F0C99CC73DBA693F2E286F1 /* DJProgramStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DJProgramStore.swift; sourceTree = "<group>"; };
 		803EF0252493E88D98D89C61 /* GMGNSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GMGNSettingsView.swift; sourceTree = "<group>"; };
@@ -1159,6 +1161,7 @@
 				B80365D49F91EA266D079E63 /* WorldScreenGeometry.swift */,
 				1E1E3D433A085F3776DD2FAE /* WorldScreenInference.swift */,
 				7871D3CE3289CAECC3492A64 /* WorldScreenMetadata.swift */,
+				79A4BDD205AF80A18FA23331 /* WorldScreenOcclusion.swift */,
 				C0AE9BABDBADF3D475A635E0 /* WorldScreenOverlayController.swift */,
 				FD53CFC01FF713A675960925 /* WorldScreenProjection.swift */,
 				85490E20953D777A44BAF5D8 /* WorldScreenState.swift */,
@@ -1681,6 +1684,7 @@
 				CFA73B9B441C3D01031ACB5D /* WorldScreenGeometry.swift in Sources */,
 				70E21D456E4E84FF6958C930 /* WorldScreenInference.swift in Sources */,
 				CF257D49B7F7C39CB8BBE62B /* WorldScreenMetadata.swift in Sources */,
+				429262DD9808149129C8FF52 /* WorldScreenOcclusion.swift in Sources */,
 				C5B456BB3F40EBD534A86A28 /* WorldScreenOverlayController.swift in Sources */,
 				798F3E554E519E59B853D0F4 /* WorldScreenProjection.swift in Sources */,
 				9BE7615CA02A72040F6D0947 /* WorldScreenState.swift in Sources */,

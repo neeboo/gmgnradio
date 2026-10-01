@@ -116,6 +116,9 @@ public struct WorldSimulation: Sendable {
         }
         var next = state
         let objectID: String
+        /// 删除这一条命令留下的墓碑（其它命令一律 nil）。事件日志里那一条**具名事实**
+        /// 就读它 —— 「删除」在日志里是可查的一等公民，不是"布局变了一下"。
+        var deletionTombstone: WorldPropTombstone?
         switch command {
         case let .register(prop):
             guard prop.isValid else { throw WorldPropLayoutError.invalidObject }
@@ -295,6 +298,53 @@ public struct WorldSimulation: Sendable {
             next.layoutUndo = nil
             item.metadata["gmgn.prop-capability.v1"] = json
             next.objectStates[id] = item
+        case let .delete(id, reason):
+            objectID = id
+            // 「找不到」必须是**具名失败**：静默成功会让 agent 对用户说"删掉了"，
+            // 而东西还在。已经在墓碑里的那一件说得更具体（它确实删过了）。
+            guard let item = state.objectStates[id], let prop = item.generatedProp,
+                  prop.objectID == id else {
+                if state.propTombstones?[id] != nil {
+                    throw WorldPropLayoutError.objectAlreadyDeleted(objectID: id)
+                }
+                throw WorldPropLayoutError.objectNotFound(objectID: id)
+            }
+            let trimmedReason = reason?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let recordedReason = (trimmedReason?.isEmpty ?? true) ? nil : trimmedReason
+            guard (recordedReason?.count ?? 0) <= 200 else {
+                throw WorldPropLayoutError.deletionReasonTooLong
+            }
+            // ---- 收场：同一次提交里做完（见 `WorldPropDeletionSettlement`）----
+            // 手持/挂载**必须先放回**：直接抹掉记录会留下一条指向不存在物件的 `heldProp`，
+            // 渲染与回执都会去读一件没有的东西。放回的位置不需要新信息 ——
+            // `heldProp.returnState` 就是"拿起前那一处"（那个字段存在的全部理由）。
+            let settlement: WorldPropDeletionSettlement
+            if let held = state.heldProp, held.objectID == id {
+                settlement = .returnedFromSlot(slot: held.hand,
+                                               position: held.returnState.transform.position)
+                next.heldProp = nil
+            } else if item.isEnabled {
+                settlement = .withdrawn(surfaceID: item.supportSurfaceID ?? "",
+                                        position: item.transform.position)
+            } else {
+                settlement = .inventory
+            }
+            let tombstone = WorldPropTombstone(
+                objectID: id, displayName: prop.displayName,
+                releasedBlobRefs: WorldPropAssetReferences.blobRefs(of: prop),
+                settlement: settlement, reason: recordedReason,
+                deletedAt: state.worldTime, previous: prop)
+            guard tombstone.isValid else { throw WorldPropLayoutError.invalidObject }
+            // **记录层**：这一条离开文档（权威据此把它置墓碑并派生 `object.removed`），
+            // 但它不是硬删 —— 身份与释放的引用都留在墓碑里。
+            next.objectStates.removeValue(forKey: id)
+            var tombstones = next.propTombstones ?? [:]
+            tombstones[id] = tombstone
+            next.propTombstones = tombstones
+            deletionTombstone = tombstone
+            // 指向这一件的撤销记录作废（与 `.rebase` 同族）：留着它，"撤销上次"会去复原
+            // 一件已经不存在的物件 —— 那是一次看不懂的失败，而不是用户的意图。
+            if next.layoutUndo?.objectID == id { next.layoutUndo = nil }
         case .undo:
             if let held = state.heldProp {
                 throw WorldPropLayoutError.objectIsHeld(objectID: held.objectID)
@@ -310,7 +360,16 @@ public struct WorldSimulation: Sendable {
         next.layoutReceipts[requestID] = command
         try invalidateRunningUsage(after: &next)
         state = next
-        _ = record(.propLayoutChanged(objectID: objectID, layoutRevision: next.layoutRevision))
+        // 删除记**它自己的事实**（与权威的 `object.removed` 同族），不是笼统的"布局变了"：
+        // 一次提交恰好一条事件，`sequence`（= revision 水位）的节奏一个字不改。
+        if let tombstone = deletionTombstone {
+            _ = record(.propDeleted(objectID: objectID, displayName: tombstone.displayName,
+                                    layoutRevision: next.layoutRevision,
+                                    settled: tombstone.settlement.name,
+                                    releasedBlobRefs: tombstone.releasedBlobRefs))
+        } else {
+            _ = record(.propLayoutChanged(objectID: objectID, layoutRevision: next.layoutRevision))
+        }
     }
 
     /// A moved, withdrawn or re-held prop can no longer be operated in place.
@@ -587,7 +646,8 @@ public struct WorldSimulation: Sendable {
         case .worldLoaded, .worldRestored, .agentTransformUpdated, .weatherChanged,
              .liveCameraChanged, .activityStarted, .activityInterrupted,
              .activityResumed, .activityCompleted, .activityCancelled, .activityFailed,
-             .movementCompleted, .movementFailed, .goalCompleted, .propLayoutChanged:
+             .movementCompleted, .movementFailed, .goalCompleted, .propLayoutChanged,
+             .propDeleted:
             return false
         }
     }

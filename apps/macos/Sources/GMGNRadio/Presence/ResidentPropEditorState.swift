@@ -703,6 +703,18 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
         handFocusBackToScene(trigger: "收回")
         await save(.withdraw(objectID: id))
     }
+
+    /// 面板上那一次「删除」——**永久**（墓碑 + 事实，没有撤销）。
+    ///
+    /// 它走的是**既有那一条** `save(_:)`（同一个 `commit` 出口，与 agent 的
+    /// `delete_prop` 是同一条世界命令），所以"面板能删的"与"agent 能删的"是同一集合，
+    /// 判据也一个字不差；唯一的区别是这条路上再要说一句"永久"。
+    func deleteSelected(reason: String? = nil) async {
+        guard !isSaving, let id = selectedID, selectedObject?.generatedProp != nil else { return }
+        // 删除是**面板**动作：删完用户多半还要接着摆别的，焦点交回场景。
+        handFocusBackToScene(trigger: "删除")
+        await save(.delete(objectID: id, reason: reason))
+    }
     func undo() async {
         guard snapshot.canUndo, !isSaving else { return }
         // 撤销是**面板**动作：用户接下来还要接着摆放/转视角，焦点交回场景。
@@ -750,6 +762,9 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
         clearPendingSelect(reason: "保存中")
         submittedActionKey = nil
         if submittedCommand != command { requestID = UUID().uuidString; submittedCommand = command }
+        // `cancelPreview()` 会把选中清掉，所以"删了哪一件"要在提交**之前**记下来 ——
+        // 成功那句话必须说出名字（"已删除：2B 白色长剑"），而不是一句"已保存"。
+        let deletedName = deletedDisplayName(of: command)
         let context = generation, revision = snapshot.revision, id = requestID
         do {
             let result = try await commit(command, revision, id)
@@ -757,12 +772,27 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
             guard result.worldID == snapshot.worldID else {
                 isSaving = false; notice = "房间已切换，请重新打开摆放"; return
             }
-            snapshot = result; isSaving = false; cancelPreview(); notice = "已保存"
+            snapshot = result; isSaving = false; cancelPreview()
+            // **成功必须可见，而且说的是真话**：删除是永久的，不能读成"保存了一下"。
+            notice = deletedName.map(Self.deletedNotice) ?? "已保存"
             requestID = UUID().uuidString
         } catch {
             guard context == generation, isOpen else { return }
             isSaving = false; notice = error.localizedDescription
         }
+    }
+
+    /// 这条命令删的是哪一件（不是 `.delete` 就返回 nil，不猜）。
+    private func deletedDisplayName(of command: WorldPropLayoutCommand) -> String? {
+        guard case let .delete(objectID, _) = command else { return nil }
+        return selectedObject?.generatedProp?.objectID == objectID
+            ? selectedObject?.generatedProp?.displayName
+            : snapshot.objects.first { $0.generatedProp?.objectID == objectID }?.generatedProp?.displayName
+    }
+
+    /// 「永久删除」那句话说给用户听的样子（**唯一**一份文案）。
+    static func deletedNotice(_ name: String) -> String {
+        "已删除（永久）：\(name)。它不会再出现在「我的物件」里，也不能恢复。"
     }
 
     private func saveAction(key: String, keepSelection: String?,

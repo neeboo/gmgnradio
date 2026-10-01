@@ -56,6 +56,18 @@ public struct WorldState: Codable, Equatable, Sendable {
     public var layoutReceipts: [String: WorldPropLayoutCommand] = [:]
     public var layoutUndo: WorldPropLayoutUndo?
     public var heldProp: WorldHeldProp?
+    /// 被**有意删除**的生成资产留下的墓碑：物件编号 → 墓碑。
+    ///
+    /// 为什么它不是"objectStates 里少了一条"就够：
+    /// - "有意删掉"与"意外丢了"必须分得开（对账器、读回、面板都要按前者解释）；
+    /// - 被删物件引用过的内容（模型字节 / 碰撞代理）在删除之后仍要答得出来 —— 否则
+    ///   引用计数就无从派生，"共享文件该不该留"再没有输入；
+    /// - 权威 `world_records` 的墓碑是**记录级**的（行不删只标记），这一份是同一件事在
+    ///   世界文档里的对应物：删的是"它在这个世界里存在"，不是"它曾经存在过"。
+    ///
+    /// 可选、纯增量：为空时合成 `Codable` **不编码这个键**（`encodeIfPresent`），
+    /// 于是没有任何删除的存档其 JSON 与改造前逐字节相同。
+    public var propTombstones: [String: WorldPropTombstone]?
     public var worldID: String
     public var worldTime: Date
     public var lastObservedWallTime: Date
@@ -95,6 +107,7 @@ public struct WorldState: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case revision
         case layoutRevision, layoutReceipts, layoutUndo, heldProp
+        case propTombstones
         case worldID
         case worldTime
         case lastObservedWallTime
@@ -113,6 +126,10 @@ public struct WorldState: Codable, Equatable, Sendable {
         layoutReceipts = try container.decodeIfPresent([String: WorldPropLayoutCommand].self, forKey: .layoutReceipts) ?? [:]
         layoutUndo = try container.decodeIfPresent(WorldPropLayoutUndo.self, forKey: .layoutUndo)
         heldProp = try container.decodeIfPresent(WorldHeldProp.self, forKey: .heldProp)
+        // 旧存档没有这个键 ⇒ nil（= "没有任何删除"），不是空字典：编码时 nil 不写键，
+        // 于是没有删除的存档与改造前**逐字节相同**。
+        propTombstones = try container.decodeIfPresent(
+            [String: WorldPropTombstone].self, forKey: .propTombstones)
         worldID = try container.decode(String.self, forKey: .worldID)
         worldTime = try container.decode(Date.self, forKey: .worldTime)
         lastObservedWallTime = try container.decode(

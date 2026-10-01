@@ -145,7 +145,9 @@ struct FlatRoomAndTable: WorldPropSupportQuerying {
             return await tool.handle(id,try JSONSerialization.data(withJSONObject:arguments))
         }
         func payload(_ result:RealtimeDJToolResult)->[String:Any]{(try! JSONSerialization.jsonObject(with:result.resultJSON)) as! [String:Any]}
-        check(Set(human.tools.map(\.name)) == ["read_owned_props","list_placement_surfaces","preview_prop_placement","apply_prop_placement","withdraw_prop","undo_prop_placement","hold_prop","adjust_held_prop_grip","return_held_prop","enable_prop_capability"],"ten primitive tools")
+        // `delete_prop`（永久删除一件生成资产）是第十一个原语工具：它和别的原语一样
+        // 走同一条 grant/白名单与同一份契约，所以这里钉住"工具面就是这十一件、不多不少"。
+        check(Set(human.tools.map(\.name)) == ["read_owned_props","list_placement_surfaces","preview_prop_placement","apply_prop_placement","withdraw_prop","undo_prop_placement","hold_prop","adjust_held_prop_grip","return_held_prop","enable_prop_capability","delete_prop"],"eleven primitive tools")
         let schemas=try JSONSerialization.data(withJSONObject:human.tools.map{$0.inputSchema},options:.sortedKeys)
         check(schemas == (try JSONSerialization.data(withJSONObject:readonly.tools.map{$0.inputSchema},options:.sortedKeys)),"human/background schema stable")
         let read=try await invoke(readonly,"read_owned_props",[:])

@@ -229,23 +229,40 @@ enum WorldScreenGeometryIssue: Error, Equatable, Sendable {
     /// 既没有标定，也没有能推断的尺寸，连缺省都给不出 ⇒ 不猜。
     case missingGeometry(objectID: String)
     /// 有尺寸，但这件东西不像一块板（最薄轴 > 最长轴的 1/4），"最大面"就是掷骰子。
-    case notPanelLike(objectID: String)
+    ///
+    /// 三边、比值与**当时用的阈值**都是**载荷**而不是备注：用户看到"不像一块屏幕"时
+    /// 要能当场复核（"1.44 × 0.90 × 1.44 m，0.62 > 0.25"），否则这句话与"我觉得不行"
+    /// 没区别。阈值跟着载荷走而不是在这里引用 `WorldScreenResolution`：这一份是几何层，
+    /// 不该反过来依赖推断层。
+    case notPanelLike(
+        objectID: String, size: SIMD3<Float>, thinnestOverLongest: Float, threshold: Float
+    )
     /// 有尺寸，但最大面比阈值还小（低于 0.04 m²）。
     case belowAreaThreshold(objectID: String, largestFaceArea: Float)
     /// 标定块存在但非法（字段缺失 / 非有限 / 半宽高为 0）。
     case invalidCalibration(objectID: String)
 
     /// 给用户/agent 的**一句**人话。与面板那一行是同一份。
+    ///
+    /// 每个分支都显式 `return`：只要有一支要多条语句，隐式返回就不成立（实测会退化成
+    /// "string literal is unused" 的警告 + 类型检查器报错）。
     var errorDescription: String {
         switch self {
         case let .missingGeometry(objectID):
-            "「\(objectID)」还没有屏幕：既没有标定，也没有可推断的尺寸。请在面板里标定宽高。"
-        case let .notPanelLike(objectID):
-            "「\(objectID)」不像一块屏幕：三边里没有明显薄的那一边，最大面说明不了屏幕在哪。请手动标定。"
+            return "「\(objectID)」还没有屏幕：既没有标定，也没有可推断的尺寸。请在面板里标定宽高。"
+        case let .notPanelLike(objectID, size, ratio, threshold):
+            // 拆成几个 `let` 再拼：一整条 `String(format:)` 串起来的表达式会把
+            // 类型检查器拖爆（实测 "unable to type-check this expression in reasonable time"）。
+            let dimensions = String(format: "%.2f × %.2f × %.2f m", size.x, size.y, size.z)
+            let measured = String(format: "%.2f", ratio)
+            let limit = String(format: "%.2f", threshold)
+            return "「\(objectID)」不像一块屏幕：三边 \(dimensions) 里没有明显薄的那一边"
+                + "（最薄/最长 = \(measured) > \(limit)），最大面说明不了屏幕在哪。请手动标定。"
         case let .belowAreaThreshold(objectID, area):
-            "「\(objectID)」最大的一面只有 \(String(format: "%.3f", area)) m²，小于 0.04 m² 的阈值，不算屏幕。请手动标定。"
+            return "「\(objectID)」最大的一面只有 \(String(format: "%.3f", area)) m²，"
+                + "小于 0.04 m² 的阈值，不算屏幕。请手动标定。"
         case let .invalidCalibration(objectID):
-            "「\(objectID)」的屏幕标定块读不出来（字段缺失或数值非法）。请在面板里重新标定。"
+            return "「\(objectID)」的屏幕标定块读不出来（字段缺失或数值非法）。请在面板里重新标定。"
         }
     }
 }

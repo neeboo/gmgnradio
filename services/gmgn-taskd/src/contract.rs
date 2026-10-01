@@ -78,7 +78,8 @@ const ERROR_CODES: &[&str] = &[
     "remote_id_mismatch", "report_unserializable", "request_id_conflict", "request_rejected",
     "resident_history_unavailable", "resident_storage_failed", "response_too_large_or_unsafe",
     "retry_unavailable", "revision_conflict", "runtime_unavailable", "signal_unavailable",
-    "size_intent_conflict", "size_intent_echo_conflict", "socket_outside_private_root",
+    "size_intent_conflict", "size_intent_echo_conflict", "size_intent_shape_conflict",
+    "socket_outside_private_root",
     "socket_unavailable", "source_task_still_active", "state_value_too_large",
     "storage_unavailable", "subject_revision_regression", "subscription_failed",
     "task_not_found", "terminal_remote_task", "too_many_facts", "unknown_method",
@@ -94,9 +95,10 @@ const ERROR_CODES: &[&str] = &[
 /// never surfaces would be exactly the kind of second-hand truth the contract
 /// exists to remove.
 const ERROR_REASONS: &[(&str, &str)] = &[
-    ("invalid_size_intent", "尺寸意图的形状/轴/出处/米数不合法"),
-    ("size_intent_conflict", "sizeIntent 的 height 轴与 heightMeters 说的不是同一个数"),
+    ("invalid_size_intent", "尺寸意图的形状/轴/出处/米数/三轴毫米数不合法"),
+    ("size_intent_conflict", "sizeIntent 的 height 轴（或三轴的 y）与 heightMeters 说的不是同一个数"),
     ("size_intent_echo_conflict", "回执里的尺寸意图与已落盘的意图不是同一份"),
+    ("size_intent_shape_conflict", "sizeIntent 同时给了 axis/meters 与 mode=dimensions 两种形状，说不清是哪一种"),
     ("invalid_input", "提交字段本身不合法（名字、出处、heightMeters 范围、PNG 大小等）"),
     ("invalid_png", "参考图不是合法 PNG，或边长超出 1—2048"),
     ("invalid_endpoint", "生成服务 origin 不合法（必须 https，或 loopback 上的 http，且无路径/查询/凭据）"),

@@ -292,6 +292,27 @@ typealias RealConversationService = AgentConversationService
     // 与断言无关的成员缺失上。
     private var wishMachineConfiguration: PropGenerationConfiguration?
     private var wishMachineServiceNotice = ""
+    // 电视机：`App/GMGNRadioApp.swift` 的接线补丁（2026-10-01 22:16 落盘）让
+    // `makeResidentWorldTools` 里多了一段 `screenStore.map { … ResidentScreenTools … }`。
+    // 本仿真宿主既然**原文抽编**那个方法，就得照上面 `read_wish_machine_contract`
+    // 同一种方式把这两个名字桩出来 —— 否则门禁红在一个与断言无关的成员缺失上。
+    //
+    // 桩的语义刻意与生产一致：这里 `screenStore == nil`，正是生产里"没有接线 ⇒
+    // 不注册电视工具"的那一支（`?? []`）。三条屏幕工具本身由
+    // `tools/test-resident-screen-overlay.swift` 专测，不在本仿真里假装。
+    struct ScreenToolStub {
+        struct Reply { let payloadJSON: Data; let isError: Bool }
+        let name: String
+        let description: String
+        let inputSchema: [String: Any]
+        let handle: @MainActor (String, Data) async -> Reply
+    }
+    struct ResidentScreenTools {
+        init(control: WorldScreenStore, isCurrent: @escaping @MainActor () -> Bool) {}
+        var tools: [ScreenToolStub] { [] }
+    }
+    final class WorldScreenStore {}
+    private var screenStore: WorldScreenStore?
     private func bindResidentWishScope(_ context: ResidentWorldContext, loop: ResidentAgentLoop) {}
     private func rebindResidentLoopMemory() {}
     private func residentSelfState() -> ResidentSelfState? { nil }
@@ -510,9 +531,13 @@ func jsonEqual(_ lhs: Any, _ rhs: Any) -> Bool {
             let wishNames: Set<String> = ["submit_wish_generation", "read_wish_generation", "read_wish_machine_contract", "retry_wish_generation", "cancel_wish_generation", "claim_wish_output", "resume_wish_continuation"]
             let referenceNames: Set<String> = ["search_wish_reference_images", "register_wish_reference_image"]
             let propNames: Set<String> = ["read_owned_props", "list_placement_surfaces", "preview_prop_placement", "apply_prop_placement", "withdraw_prop", "undo_prop_placement",
-                "hold_prop", "adjust_held_prop_grip", "return_held_prop", "enable_prop_capability"]
+                "hold_prop", "adjust_held_prop_grip", "return_held_prop", "enable_prop_capability",
+                // 2026-10-01 22:16 落的 `delete_prop`（WorldRuntime 的 `WorldPropDeletion`）：
+                // 仿真宿主**原文抽编** `makeResidentWorldTools`，所以 App 一多一条工具，
+                // 这里的名单与总数就必须跟着走 —— 否则门禁红在一个与断言无关的数字上。
+                "delete_prop"]
             check(previousNames.isSubset(of: names), "\(mode): App retains eight world, two loop and five music tools")
-            check(names == previousNames.union(wishNames).union(referenceNames).union(propNames) && schemas.count == 34, "\(mode): App exposes seven wish (six actions + one read-only parameter interface), two reference and ten owned-prop tools")
+            check(names == previousNames.union(wishNames).union(referenceNames).union(propNames) && schemas.count == 35, "\(mode): App exposes seven wish (six actions + one read-only parameter interface), two reference and eleven owned-prop tools")
             check(formal.prompts[0].contains("这是居民生活循环的一轮"), "\(mode): actual App supplies generic loop instructions")
             let observed = await tools.call("loop-read", "read_resident_state", Data("{}".utf8))
             check(!observed.isError && !tools.allowsSilentCompletion(), "\(mode): reading state alone does not authorize silent completion")
@@ -938,7 +963,7 @@ func jsonEqual(_ lhs: Any, _ rhs: Any) -> Bool {
             let codexSchemas: [[String: Any]] = codexTools.flatMap {
                 try? JSONSerialization.jsonObject(with: $0.schemasJSON) as? [[String: Any]]
             } ?? []
-            check(codexSchemas.count == 34, "codex: actual App manifest exposes all 34 production schemas")
+            check(codexSchemas.count == 35, "codex: actual App manifest exposes all 35 production schemas")
             check(codexTools?.visionCapable == false
                   && !codexSchemas.contains { ($0["name"] as? String) == "capture_space_photo" },
                   "codex: absent GPU vision surface registers no capture schema")
@@ -964,7 +989,7 @@ func jsonEqual(_ lhs: Any, _ rhs: Any) -> Bool {
             let claudeSchemas: [[String: Any]] = claudeTools.flatMap {
                 try? JSONSerialization.jsonObject(with: $0.schemasJSON) as? [[String: Any]]
             } ?? []
-            check(claudeSchemas.count == 34, "claudeCode: actual App manifest exposes the same 34 production schemas")
+            check(claudeSchemas.count == 35, "claudeCode: actual App manifest exposes the same 35 production schemas")
             check((codexSchemas as NSArray).isEqual(claudeSchemas as NSArray),
                   "claudeCode: actual manifest equals codex manifest as a whole JSON value")
             var fieldsMatch = codexSchemas.count == claudeSchemas.count
@@ -1114,6 +1139,10 @@ let compilerArguments: [String] = ["-j1", "-parse-as-library",
     sources.appendingPathComponent("Agent/WishMachineContract.swift").path,
     sources.appendingPathComponent("Agent/ResidentWishMachineTools.swift").path,
     sources.appendingPathComponent("Agent/ResidentWishReferenceTools.swift").path,
+    // 参考图工具链的具名诊断（`WishReferenceDiagnosis` / `WishReferenceLog` /
+    // `WishReferenceAvailabilityNotice`）住在自己那份生产文件里；上面那个工具文件
+    // 引用它，所以这里必须**编同一份**，否则整个 harness 编译不过（编同一份，不是抄一份）。
+    sources.appendingPathComponent("Agent/ResidentWishReferenceDiagnosis.swift").path,
     // `ResidentPropPlacementService` 的手持上限读 `ResidentPropAttachmentEligibility`，
     // 而 `PropAttachment.swift` 依赖 app 目标的渲染侧类型、编不进离线 harness。
     // 共用那一份替身（它从生产源码取那一行，本身不含数字），上限仍然只有一处定义。

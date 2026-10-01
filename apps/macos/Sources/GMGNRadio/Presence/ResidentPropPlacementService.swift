@@ -78,6 +78,20 @@ enum ResidentPropLayoutIntent: Equatable {
     /// 改尺寸 / 加能力 / 撤销）。判据是**全部**空间判据（`ResidentPropPlacementService.validate(_:)`，
     /// 一个字不放宽）。
     case spatialChange(objectID: String)
+    /// **删除**：这一件离开世界，留下一条墓碑。
+    ///
+    /// 为什么它是**第三层**、而不是"又一种 spatialChange"：删除也会改变"空间里有什么"，
+    /// 但它的判据内容与空间那一层**正好相反**。空间判据的输入是"房间里有哪些障碍、
+    /// 够不够站、路通不通"，而删除只会**移走**一个障碍 ——
+    /// `WorldLayoutObstacles.resolve` 的清单只少不多、`blockedNodes` 只减不增、
+    /// `placed` 里不再有它，所以每一条空间判据在删除后的候选状态上只会更容易满足，
+    /// **不可能被一次删除破坏**（单调性）。反过来把空间判据接上去，代价是实打实的：
+    /// 承托几何拿不到时（换世界、装修面板没开、网格还在派生）就**删不掉**，而那恰恰
+    /// 是用户最想删掉一件东西的时刻。这一层自己的判据见 `validateDeletion`。
+    ///
+    /// 分层本身一个字没动：`.inventoryRegistration`（不在空间里：只判归属与资产）与
+    /// `.spatialChange`（在空间里：全部空间判据）与改造前逐字相同。
+    case removal(objectID: String)
 }
 
 extension ResidentPropLayoutIntent {
@@ -128,10 +142,56 @@ extension ResidentPropLayoutIntent {
             // withdraw 把它收起来，enableCapability 增删功能点锚点（通路判据的输入），
             // adjustGrip 只动手里那一份状态 —— 但它与 `returnState` 同族，一并保守处理。
             return .spatialChange(objectID: objectID)
+        case let .delete(objectID, _):
+            // 删除走它自己那一层（见 `.removal` 的说明）。默认方向仍然是 fail-closed：
+            // 只有**能证明**"这件东西确实离开了世界、而且留下了墓碑"的候选状态才通过。
+            return .removal(objectID: objectID)
         case .undo:
             // 撤销恢复的是**上一件物件在空间里的位置**（`layoutUndo`），默认保守。
             return .spatialChange(objectID: state.layoutUndo?.objectID ?? "")
         }
+    }
+}
+
+/// 一次删除的**回执形状**：agent 的面板与工具读的是同一份（同一份推导，不抄第二遍）。
+///
+/// 它回答三个问题，缺一不可（见设计 §6「删干净」的三层证明）：
+/// - 删了什么（记录层：墓碑 + 事件）；
+/// - 释放了哪些内容引用、还留着哪些（引用层：带数字）；
+/// - 哪些字节可以回收、哪些**必须留着**（文件层：计数 > 0 的一律不许删）。
+struct ResidentPropDeletionReceipt: Equatable {
+    let objectID: String
+    let displayName: String
+    let layoutRevision: UInt64
+    let settled: String
+    let settlement: String
+    let reason: String?
+    let tombstone: WorldPropTombstone
+    let reclamation: WorldPropReclamation
+
+    /// 内容寻址的字节由**存储拥有者**回收，不是本进程（App 不删 taskd 私有根里的文件）。
+    /// 这一句是回执的一部分：用户与 agent 都要知道"文件那层谁负责"。
+    static let storageOwner = "gmgn-taskd"
+
+    var payload: [String: Any] {
+        var value: [String: Any] = [
+            "object_id": objectID, "name": displayName, "layout_revision": layoutRevision,
+            "settled": settled, "settlement": settlement,
+            "record_layer": ["tombstone": true, "event": "propDeleted"],
+            "reference_layer": [
+                "released": reclamation.released,
+                "retained": reclamation.retainedCounts,
+                "unreferenced": reclamation.unreferenced,
+            ],
+            "file_layer": [
+                // 计数 > 0 的一律**留着**，并给出还在引用它的物件编号 —— 这是"共享文件不误删"的证据。
+                "kept": reclamation.retained.map { ["sha256": $0.key, "referenced_by": $0.value] },
+                "reclaimable": reclamation.unreferenced,
+                "storage_owner": Self.storageOwner,
+            ],
+        ]
+        if let reason { value["reason"] = reason }
+        return value
     }
 }
 
@@ -275,6 +335,46 @@ final class ResidentPropPlacementService {
         return .returnHeld(objectID: objectID, avatarAssetID: avatarID)
     }
 
+    /// 删掉一件生成资产（**永久**）。
+    ///
+    /// 这里只做"命令构造"那一半（归属 + 命名），判据在 `commit` → `validateDeletion` ——
+    /// 与 place/withdraw/hold 同一个出口，不新开通道。
+    ///
+    /// **刻意不查资产是否备好**（`prepare` 不在这条路上）：删除要能清掉一件**资产已经坏了**
+    /// 的物件。把"资产可用"当成删除的前提，会造出一个删不掉的坏物件 —— 那正是用户最想
+    /// 删掉的那一件。
+    func deleteCommand(objectID: String, reason: String? = nil) throws -> WorldPropLayoutCommand {
+        guard isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
+        guard let item = context.state.objectStates[objectID], let prop = item.generatedProp,
+              prop.objectID == objectID else {
+            // 墓碑还在 ⇒ 说得更具体：它已经删过了（agent 不该以为还能再删一次）。
+            if context.state.propTombstones?[objectID] != nil {
+                throw WorldPropLayoutError.objectAlreadyDeleted(objectID: objectID)
+            }
+            throw WorldPropLayoutError.objectNotFound(objectID: objectID)
+        }
+        let trimmed = reason?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let recorded = (trimmed?.isEmpty ?? true) ? nil : trimmed
+        guard (recorded?.count ?? 0) <= 200 else { throw WorldPropLayoutError.deletionReasonTooLong }
+        return .delete(objectID: objectID, reason: recorded)
+    }
+
+    /// 从**当前状态**读回一次删除的回执（墓碑 + 引用计数）。
+    ///
+    /// 唯一一份推导：工具回执、面板提示、harness 断言读的都是它 —— 于是"删了什么、
+    /// 保留了哪些共享文件、有没有收场动作"不可能三处说法不一。
+    func deletionReceipt(objectID: String) -> ResidentPropDeletionReceipt? {
+        guard let tombstone = context.state.propTombstones?[objectID] else { return nil }
+        return ResidentPropDeletionReceipt(
+            objectID: objectID, displayName: tombstone.displayName,
+            layoutRevision: context.state.layoutRevision,
+            settled: tombstone.settlement.name, settlement: tombstone.settlement.summary,
+            reason: tombstone.reason, tombstone: tombstone,
+            // 引用计数在**删除之后**的状态上派生：计数问的是"它走了之后还有谁在引用"。
+            reclamation: WorldPropAssetReferences.reclamation(deleting: objectID,
+                                                              from: context.state))
+    }
+
     func preview(objectID: String, placement: WorldPropPlacement) throws -> WorldObjectState {
         guard isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
         return try previewState(objectID: objectID, placement: placement)
@@ -317,6 +417,10 @@ final class ResidentPropPlacementService {
                 for item in state.objectStates.values where item.isEnabled || state.heldProp?.objectID == item.generatedProp?.objectID {
                     if let prop = item.generatedProp { try prepare(prop) }
                 }
+            case let .removal(objectID):
+                // 删除：只判"记录 + 资产身份"，**不跑空间判据**（见 `.removal` 的单调性说明），
+                // 也**不要求资产备好**（坏资产必须删得掉）。
+                try validateDeletion(objectID: objectID, in: state, baseline: baseline)
             }
             guard isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
             try validateAttachmentAuthorization(command)
@@ -363,11 +467,42 @@ final class ResidentPropPlacementService {
         switch command {
         case .hold(_, let avatarAssetID, _), .adjustGrip(_, let avatarAssetID, _), .returnHeld(_, let avatarAssetID):
             submittedAvatarID = avatarAssetID
-        case .register, .place, .withdraw, .undo, .enableCapability, .resize, .rebase:
+        // `.delete` 不携带角色身份：它删的是**世界里的记录**，与"此刻是谁在拿"
+        // 无关（在手上的那一件由世界层自己先放回再删，见 `WorldSimulation`）。
+        case .register, .place, .withdraw, .undo, .enableCapability, .resize, .rebase, .delete:
             submittedAvatarID = nil
         }
         if let submittedAvatarID {
             guard currentAvatarAssetID() == submittedAvatarID else { throw ResidentPropPlacementError.avatarChanged }
+        }
+    }
+
+    /// **删除那一层**的判据：只回答"这件东西确实离开了世界，而且留下了一条说得出身份的墓碑"。
+    ///
+    /// 三条前提，缺一 fail-closed：
+    /// 1. **现状里真的有这一件**（`baseline`）：拿一个不存在的编号来删是错的，不是幂等成功
+    ///    （幂等由**同一个** `requestID` 的 `layoutReceipts` 回答，不在这里放宽）；
+    /// 2. **候选状态里它已经不在了**：删除必须真的把它移出文档 —— 将来有人把一条"只写墓碑、
+    ///    不移出物件"的命令归到这一层，会在这里被拒（与 `.inventoryRegistration` 的
+    ///    "登记却已在空间里"对称的那条类型前提）；
+    /// 3. **候选状态里留下了一条墓碑**，而且墓碑冻的身份与**现状**里那一件逐位一致
+    ///    （objectID / 资产哈希 / 尺寸基线）：墓碑张冠李戴也是 fail-closed。
+    ///
+    /// 刻意**不判**的两件事，理由都是"判了会造成假拒绝"：
+    /// - **空间判据**（承托/碰撞/通路）：删除只会移走一个障碍，单调性保证它在删除后仍然成立
+    ///   （见 `.removal`）；
+    /// - **资产可用**（`prepare`）：坏掉的资产必须删得掉。
+    private func validateDeletion(objectID: String, in state: WorldState, baseline: WorldState) throws {
+        guard let previous = baseline.objectStates[objectID]?.generatedProp,
+              previous.objectID == objectID else {
+            throw WorldPropLayoutError.objectNotFound(objectID: objectID)
+        }
+        guard state.objectStates[objectID] == nil else {
+            throw WorldPropLayoutError.invalidObject
+        }
+        guard let tombstone = state.propTombstones?[objectID], tombstone.isValid,
+              tombstone.previous.matchesIdentity(of: previous) else {
+            throw WorldPropLayoutError.invalidObject
         }
     }
 

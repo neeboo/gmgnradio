@@ -176,6 +176,9 @@ let splicedScreenPoint: String = {
 let screenFiles = [
     "WorldScreenGeometry.swift", "WorldScreenInference.swift", "WorldScreenProjection.swift",
     "WorldScreenContent.swift", "WorldScreenState.swift", "ResidentScreenTools.swift",
+    // 前景遮挡（格级掩码）也钉在这里：它是覆盖层"不参与深度测试"这个结构性缺口的唯一补法，
+    // 判据必须能**直接驱动**它，而不是只看覆盖层那边的文本。
+    "WorldScreenOcclusion.swift",
 ]
 
 let innerProgram = ##"""
@@ -311,8 +314,14 @@ final class StubScreenControl: WorldScreenControlling {
             objectID: "cube", calibratedJSON: nil, size: cubeSize, allowsDefault: false
         ) {
         case let .failure(issue):
-            expect(issue == .notPanelLike(objectID: "cube"),
-                "断言1：② 方块柜子判不出屏幕 ⇒ 具名拒绝（\(issue.errorDescription)）")
+            if case let .notPanelLike(objectID, size, ratio, threshold) = issue {
+                expect(objectID == "cube" && simd_length(size - cubeSize) < 1e-6
+                        && abs(ratio - 1) < 1e-6
+                        && abs(threshold - WorldScreenResolution.maximumPanelThicknessRatio) < 1e-6,
+                    "断言1：② 方块柜子判不出屏幕 ⇒ 具名拒绝（\(issue.errorDescription)）")
+            } else {
+                expect(false, "断言1：② 方块柜子应当报 notPanelLike，却拿到 \(issue)")
+            }
         case .success:
             expect(false, "断言1：一个 1×1×1 的方块被当成了屏幕（最大面成了掷骰子）")
         }
@@ -497,7 +506,11 @@ final class StubScreenControl: WorldScreenControlling {
         // 断言 4：失败各自具名、可见、不静默
         // =============================================================
         let geometryIssues: [WorldScreenGeometryIssue] = [
-            .missingGeometry(objectID: "tv"), .notPanelLike(objectID: "tv"),
+            .missingGeometry(objectID: "tv"),
+            .notPanelLike(
+                objectID: "tv", size: SIMD3<Float>(1.44, 0.90, 1.44),
+                thinnestOverLongest: 0.624, threshold: 0.25
+            ),
             .belowAreaThreshold(objectID: "tv", largestFaceArea: 0.01),
             .invalidCalibration(objectID: "tv"),
         ]
@@ -638,6 +651,206 @@ final class StubScreenControl: WorldScreenControlling {
             expect(false, "断言5：哔哩哔哩公开观看链接应当被换写成官方播放器")
         }
 
+        // =============================================================
+        // 断言 6：前景遮挡 —— **区域级**，不是整块开关
+        // =============================================================
+        //
+        // 覆盖层是 native `CALayer`，**不参与深度测试**（这是第一版自己标注的限制，
+        // 真机表现："人身上糊着一块网页"）。这一节钉的就是补它的那一层：
+        // 从相机到每一格中心连线，先撞上更近的东西的那一格**不画**。
+        //
+        // 场景：屏幕 1.24 m × 0.70 m 立在 z = 0（BL/BR/TR/TL），相机在 z = +3；
+        // 角色用 `MarblePMXFraming` 缺省包围盒那一份（±0.5 × 1.7 × ±0.5 m × scale）。
+        let occlQuad: [SIMD3<Float>] = [
+            SIMD3(-0.62, 0.35, 0), SIMD3(0.62, 0.35, 0), SIMD3(0.62, 1.05, 0), SIMD3(-0.62, 1.05, 0),
+        ]
+        let occlViewer = SIMD3<Float>(0, 0.85, 3.0)
+        let occlColumns = 24
+        let occlRows = 14
+        func occlusion(_ occluders: WorldScreenOccluders) -> WorldScreenOcclusionMask {
+            WorldScreenOcclusion.mask(
+                quadCorners: occlQuad, cameraPosition: occlViewer, occluders: occluders,
+                columns: occlColumns, rows: occlRows
+            )
+        }
+        let noOccluders = occlusion(.empty)
+        expect(noOccluders.isFullyVisible && noOccluders.blockedCellCount == 0,
+            "断言6：没有遮挡物时 \(occlColumns) × \(occlRows) 格**全部可见**"
+                + "（\(noOccluders.blockedCellCount)/\(noOccluders.cellCount) 格被挡）")
+
+        // 角色站在屏前 0.6 m ⇒ 正中一片被挡，两侧仍然显示。
+        let occlResident = WorldScreenBox(
+            center: SIMD3(0, 0.85, 0.6), halfExtents: SIMD3(0.25, 0.85, 0.2), yaw: 0
+        )
+        let residentMask = occlusion(WorldScreenOccluders(boxes: [occlResident]))
+        expect(residentMask.blockedCellCount == 196 && residentMask.visibleCellCount == 140,
+            "断言6：角色站在屏前 ⇒ 被角色挡住的那部分（期望 196/336 格，约 58%）不画网页，"
+                + "两侧 140 格照画（实测 \(residentMask.blockedCellCount)/\(residentMask.cellCount)）")
+        expect(!residentMask.isBlocked(column: 0, row: 0)
+                && !residentMask.isBlocked(column: occlColumns - 1, row: occlRows - 1),
+            "断言6：区域级 —— 屏幕的 BL / TR 两角仍然显示（整块开关会把它们一起抹掉）")
+        expect(residentMask.isBlocked(
+            column: occlColumns / 2, row: occlRows / 2
+        ), "断言6：角色身后的正中心那一格必须被挡（格子 (12, 7)）")
+
+        // **部分遮挡**：左半边被挡时，右半边**仍然显示**（逐格核对，不是"差不多"）。
+        let occlLeftPanel = WorldScreenBox(
+            center: SIMD3(-0.31, 0.7, 1.5), halfExtents: SIMD3(0.31, 0.35, 0.05), yaw: 0
+        )
+        let halfMask = occlusion(WorldScreenOccluders(boxes: [occlLeftPanel]))
+        var leftHalfBlocked = 0
+        var rightHalfBlocked = 0
+        for row in 0 ..< occlRows {
+            for column in 0 ..< occlColumns where halfMask.isBlocked(column: column, row: row) {
+                if column < occlColumns / 2 { leftHalfBlocked += 1 } else { rightHalfBlocked += 1 }
+            }
+        }
+        expect(leftHalfBlocked == 168 && rightHalfBlocked == 0,
+            "断言6：部分遮挡是按**格**判的 —— 左半边 168 格全被挡、右半边 0 格被挡"
+                + "（实测 左 \(leftHalfBlocked) / 右 \(rightHalfBlocked)）")
+
+        // 与屏幕**同深**的东西不算遮挡：只算"在前面**进入**"的。
+        expect(WorldScreenOcclusion.isBlocked(
+            nearestOccluderDistance: 2.99, screenDistance: 3.0, depthMargin: 0.02
+        ) == false && WorldScreenOcclusion.isBlocked(
+            nearestOccluderDistance: 2.97, screenDistance: 3.0, depthMargin: 0.02
+        ), "断言6：遮挡物必须比屏幕**近** 2 cm 才作数（贴面/共面的东西不许把屏打花）")
+        expect(WorldScreenOcclusion.isBlocked(
+            nearestOccluderDistance: nil, screenDistance: 3.0, depthMargin: 0.02
+        ) == false, "断言6：射线没撞到任何东西 ⇒ 这一格可见")
+
+        // **正常观看（无人遮挡）时不闪烁**：连续 240 帧、相机有一点点手抖，
+        // 掩码必须逐位相同；屏幕**后面**的东西一律不参与。
+        let behindWall = WorldScreenOccluders(
+            triangles: [WorldScreenTriangle(SIMD3(-5, -1, -1), SIMD3(5, -1, -1), SIMD3(0, 5, -1))],
+            revision: 1
+        )
+        var flickers = 0
+        for frame in 0 ..< 240 {
+            let jitter = Float(frame % 2 == 0 ? 1 : -1) * 0.001
+            let shaky = WorldScreenOcclusion.mask(
+                quadCorners: occlQuad, cameraPosition: occlViewer + SIMD3(jitter, jitter, 0),
+                occluders: behindWall, columns: occlColumns, rows: occlRows
+            )
+            if shaky.blocked != noOccluders.blocked { flickers += 1 }
+        }
+        expect(flickers == 0,
+            "断言6：正常观看时不闪烁 —— 屏幕后面有墙、相机 1 mm 手抖，连续 240 帧掩码逐位相同"
+                + "（实测翻转 \(flickers) 帧）")
+        var worstJitterDelta = 0
+        for frame in 0 ..< 240 {
+            let jitter = Float(frame % 2 == 0 ? 1 : -1) * 0.001
+            let shaky = WorldScreenOcclusion.mask(
+                quadCorners: occlQuad, cameraPosition: occlViewer + SIMD3(jitter, jitter, 0),
+                occluders: WorldScreenOccluders(boxes: [occlResident]),
+                columns: occlColumns, rows: occlRows
+            )
+            var delta = 0
+            for index in 0 ..< shaky.blocked.count where shaky.blocked[index] != residentMask.blocked[index] {
+                delta += 1
+            }
+            worstJitterDelta = max(worstJitterDelta, delta)
+        }
+        expect(worstJitterDelta == 0,
+            "断言6：角色站在屏前时，相机 1 mm 手抖一帧都不翻（实测最多翻 \(worstJitterDelta) 格）")
+
+        // 屏幕**自己**那件不许挡自己（否则整块屏幕永远是被挡的）。
+        let ownBox = WorldScreenBox(
+            center: SIMD3(0, 0.85, 0.6), halfExtents: SIMD3(0.25, 0.85, 0.2), yaw: 0, owner: "tv-9"
+        )
+        let selfExcluded = WorldScreenOcclusion.mask(
+            quadCorners: occlQuad, cameraPosition: occlViewer,
+            occluders: WorldScreenOccluders(boxes: [ownBox]),
+            excluding: "tv-9", columns: occlColumns, rows: occlRows
+        )
+        expect(selfExcluded.isFullyVisible,
+            "断言6：屏幕自己那件物件的盒被排除（\(selfExcluded.blockedCellCount) 格被挡 —— 必须是 0）")
+
+        // 掩码 → `CALayer.mask` 的路径：可见格并集，坐标在容器的 bounds 里。
+        let maskRects = residentMask.visibleRects(in: SIMD2(1240, 700))
+        let maskedArea = maskRects.reduce(Float(0)) { $0 + $1.width * $1.height }
+        expect(maskRects.allSatisfy { $0.width > 0 && $0.height > 0 }
+                && maskRects.allSatisfy { $0.x >= 0 && $0.y >= 0 }
+                && maskRects.allSatisfy { $0.x + $0.width <= 1240.001 && $0.y + $0.height <= 700.001 },
+            "断言6：可见区矩形全部落在容器 bounds 内（\(maskRects.count) 条，1080p 下每格约 52 × 50 px）")
+        let expectedArea = Float(residentMask.visibleCellCount) / Float(residentMask.cellCount) * 1240 * 700
+        expect(abs(maskedArea - expectedArea) < 1,
+            "断言6：可见区矩形的总面积 = 可见格数占比 × 屏幕面积"
+                + "（\(Int(maskedArea)) px² vs \(Int(expectedArea)) px²，140/336 格）")
+        expect(residentMask.blockedRects(in: SIMD2(1240, 700)).isEmpty == false,
+            "断言6：被挡区同样能给出矩形（诊断/回执要说得出「哪一块不画」）")
+        let fullRects = noOccluders.visibleRects(in: SIMD2(1240, 700))
+        let fullArea = fullRects.reduce(Float(0)) { $0 + $1.width * $1.height }
+        expect(abs(fullArea - 1240 * 700) < 1,
+            "断言6：全可见时可见区矩形并集刚好铺满整块屏幕（\(fullRects.count) 条）")
+
+        // =============================================================
+        // 断言 7：真机那件电视道具的屏幕面**可复核**
+        // =============================================================
+        //
+        // 数字来自真机（不是编的）：生成任务 `2F633C0F-A868-4442-AD2A-C73D2A1D04E1`
+        // 「超大荧幕电视」，用户尺寸意图 `{axis: longest, meters: 1.443}`；网格 AABB
+        // 1.0079008 × 0.6289793 × 1.0079044（模型单位）⇒ 世界尺寸 1.443 × 0.901 × 1.443 m。
+        let realTVSize = SIMD3<Float>(1.443, 0.9007, 1.443)
+        let realTVRatio = WorldScreenFaceInference.thinnestOverLongest(size: realTVSize)
+        expect(abs(realTVRatio - 0.624) < 0.002,
+            "断言7：真机那件电视道具 最薄/最长 = \(String(format: "%.3f", realTVRatio))"
+                + "（1.443 × 0.901 × 1.443 m）⇒ 它**不是一块板**，所以它压根没有「最大平坦面」可言")
+        expect(WorldScreenFaceInference.defaultFace(size: realTVSize) == .front,
+            "断言7：判不出板形时的兜底面 = 面积较大的**竖直面**（+Z 正面），不是朝上的那一面")
+
+        // 不声明是电视 ⇒ 具名拒绝，且拒绝的话里能复核到数字。
+        switch WorldScreenResolution.resolve(
+            objectID: "wish-prop-2f633c0f", calibratedJSON: nil,
+            size: realTVSize, allowsDefault: false
+        ) {
+        case let .failure(issue):
+            if case let .notPanelLike(objectID, size, ratio, threshold) = issue {
+                expect(objectID == "wish-prop-2f633c0f"
+                        && simd_length(size - realTVSize) < 1e-6
+                        && abs(ratio - realTVRatio) < 1e-6
+                        && abs(threshold - WorldScreenResolution.maximumPanelThicknessRatio) < 1e-6,
+                    "断言7：拒绝时把三边、实测比值与阈值都带出来（可复核，不是「我觉得不行」）")
+            } else {
+                expect(false, "断言7：判不出板形应当报 notPanelLike，却拿到 \(issue)")
+            }
+            expect(issue.errorDescription.contains("1.44") && issue.errorDescription.contains("0.62"),
+                "断言7：拒绝的原话里能读到数字：「\(issue.errorDescription)」")
+        case .success:
+            expect(false, "断言7：没声明是电视时不该给出任何屏幕")
+        }
+
+        // 声明是电视 ⇒ 取的仍然是**这件道具自己的一个面**，不是那台与它无关的通用电视。
+        switch WorldScreenResolution.resolve(
+            objectID: "wish-prop-2f633c0f", calibratedJSON: nil,
+            size: realTVSize, allowsDefault: true
+        ) {
+        case let .success(definition):
+            let expected = WorldScreenFace.front.quad(size: realTVSize)
+            expect(definition.source == .default,
+                "断言7：兜底仍然**如实标注**成猜的（source=\(definition.source.rawValue)）")
+            expect(abs(definition.quad.center.y - realTVSize.y / 2) < 1e-5,
+                "断言7：屏幕中心落在**道具身上**（y = \(String(format: "%.4f", definition.quad.center.y)) m"
+                    + " ≤ 道具高 \(String(format: "%.3f", realTVSize.y)) m），不再浮在它上方 0.15 m")
+            expect(definition.quad.pitch == 0 && definition.quad.center.z > 0.7,
+                "断言7：选中的是 +Z **竖直面**（pitch = 0、中心在 z = "
+                    + "\(String(format: "%.3f", definition.quad.center.z))），不是朝上的那一面")
+            expect(abs(definition.quad.width - expected.width) < 1e-5
+                    && abs(definition.quad.height - expected.height) < 1e-5,
+                "断言7：面的大小跟着道具走：\(String(format: "%.3f", definition.quad.width)) m × "
+                    + "\(String(format: "%.3f", definition.quad.height)) m"
+                    + "（= 1.443 × 0.86 与 0.901 × 0.86，不是那台通用电视的 1.10 × 0.62）")
+            expect(abs(definition.quad.width - WorldScreenResolution.defaultWidth) > 1e-3,
+                "断言7：兜底**不可能**再落到那台与道具无关的通用电视（宽 "
+                    + "\(WorldScreenResolution.defaultWidth) m）")
+            expect(definition.note.contains("猜") && definition.note.contains("1.44"),
+                "断言7：出处原话可复核：「\(definition.note)」")
+            expect(definition.isValid,
+                "断言7：这份猜出来的定义本身必须合法（note 非空且 ≤ \(WorldScreenDefinition.maximumNoteLength) 字）")
+        case let .failure(issue):
+            expect(false, "断言7：声明是电视时应当给这块道具自己的面，却拿到 \(issue.errorDescription)")
+        }
+
         print("INNER-FAILURES=\(failuresTotal)")
         if failuresTotal > 0 { exit(1) }
     }
@@ -672,7 +885,122 @@ guard compiled == 0 else {
     exit(compiled)
 }
 let innerStatus = try run(executable.path, [])
-check(innerStatus == 0, "内层判据（断言 1/2/4/5-白名单）全部通过")
+check(innerStatus == 0, "内层判据（断言 1/2/4/5-白名单/6-遮挡/7-真机道具的面）全部通过")
+
+
+// ---------------------------------------------------------------------------
+// MARK: 断言 6（行为）：遮挡判据的**注入负对照**（在源码副本上做手术）
+// ---------------------------------------------------------------------------
+
+/// 只跑遮挡本身的探针。两份源码（原件 / 打了手术的副本）都必须编得起来：
+/// 原件 ⇒ 退出 0；手术版 ⇒ 必须 FAIL。这样"判据真的会红"才是被证明的。
+let occlusionProbeProgram = ##"""
+import Foundation
+import simd
+
+var probeFailures = 0
+func probe(_ condition: Bool, _ message: String) {
+    if condition {
+        print("PROBE-PASS \(message)")
+    } else {
+        print("PROBE-FAIL \(message)")
+        probeFailures += 1
+    }
+}
+
+@main struct OcclusionProbe {
+    static func main() {
+        let quad: [SIMD3<Float>] = [
+            SIMD3(-0.62, 0.35, 0), SIMD3(0.62, 0.35, 0),
+            SIMD3(0.62, 1.05, 0), SIMD3(-0.62, 1.05, 0),
+        ]
+        let viewer = SIMD3<Float>(0, 0.85, 3.0)
+        let resident = WorldScreenBox(
+            center: SIMD3(0, 0.85, 0.6), halfExtents: SIMD3(0.25, 0.85, 0.2), yaw: 0
+        )
+        let blocked = WorldScreenOcclusion.mask(
+            quadCorners: quad, cameraPosition: viewer,
+            occluders: WorldScreenOccluders(boxes: [resident]), columns: 24, rows: 14
+        )
+        probe(blocked.blockedCellCount > 0,
+              "角色站在屏前 ⇒ 有格被挡（实测 \(blocked.blockedCellCount)/336）")
+        probe(blocked.visibleCellCount > 0,
+              "角色站在屏前 ⇒ 不是整块消失（可见 \(blocked.visibleCellCount)/336 格）")
+
+        let panel = WorldScreenBox(
+            center: SIMD3(-0.31, 0.7, 1.5), halfExtents: SIMD3(0.31, 0.35, 0.05), yaw: 0
+        )
+        let half = WorldScreenOcclusion.mask(
+            quadCorners: quad, cameraPosition: viewer,
+            occluders: WorldScreenOccluders(boxes: [panel]), columns: 24, rows: 14
+        )
+        var left = 0
+        var right = 0
+        for row in 0 ..< 14 {
+            for column in 0 ..< 24 where half.isBlocked(column: column, row: row) {
+                if column < 12 { left += 1 } else { right += 1 }
+            }
+        }
+        probe(left == 168 && right == 0,
+              "左半边被挡 168 格、右半边 0 格（实测 \(left)/\(right)）")
+        exit(probeFailures == 0 ? 0 : 1)
+    }
+}
+"""##
+
+/// 把两份几何源码复制到临时目录、可选地对 `WorldScreenOcclusion.swift` 做一次文本替换，
+/// 编出探针跑一次，返回退出码（`-1` = 锚点没找到或没编起来，连同原因）。
+func runOcclusionProbe(patch: (from: String, to: String)?) throws -> (status: Int32, note: String) {
+    let directory = temporary.appendingPathComponent("occlusion-probe-\(UUID())")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    var sources: [String] = []
+    for name in ["WorldScreenGeometry.swift", "WorldScreenOcclusion.swift"] {
+        var text = try read(screenRoot.appendingPathComponent(name))
+        if name == "WorldScreenOcclusion.swift", let patch {
+            guard text.contains(patch.from) else {
+                return (-1, "注入锚点在源码里找不到（签名改过？）：\(patch.from)")
+            }
+            text = text.replacingOccurrences(of: patch.from, with: patch.to)
+        }
+        let destination = directory.appendingPathComponent(name)
+        try text.write(to: destination, atomically: true, encoding: .utf8)
+        sources.append(destination.path)
+    }
+    let probeProgram = directory.appendingPathComponent("Probe.swift")
+    try occlusionProbeProgram.write(to: probeProgram, atomically: true, encoding: .utf8)
+    let binary = directory.appendingPathComponent("probe")
+    let compileStatus = try run(
+        "/usr/bin/swiftc", ["-j1", "-parse-as-library"] + sources + [probeProgram.path, "-o", binary.path]
+    )
+    guard compileStatus == 0 else {
+        return (-1, "探针没编起来（exit \(compileStatus)）—— 注入把源码改坏了")
+    }
+    return (try run(binary.path, []), "")
+}
+
+let occlusionProbeClean = try runOcclusionProbe(patch: nil)
+check(occlusionProbeClean.status == 0,
+    "断言6（探针）：**原件**上跑遮挡判据通过（exit \(occlusionProbeClean.status)）"
+        + (occlusionProbeClean.note.isEmpty ? "" : " —— \(occlusionProbeClean.note)"))
+
+// 注入①「不遮挡」：把格判据改成永远 false ⇒ 探针必须 FAIL（上面那条 PROBE-FAIL 就是原话）。
+let occlusionProbeNoOcclusion = try runOcclusionProbe(patch: (
+    from: "        return hit > 0 && hit < screenDistance - max(depthMargin, 0)",
+    to: "        _ = hit; return false"
+))
+check(occlusionProbeNoOcclusion.status != 0,
+    "断言6（注入负对照①「不遮挡」）：探针 FAIL（exit \(occlusionProbeNoOcclusion.status)）"
+        + (occlusionProbeNoOcclusion.note.isEmpty ? "" : " —— \(occlusionProbeNoOcclusion.note)"))
+
+// 注入②「整块隐藏」：有任意一格被挡就整块隐藏 ⇒ 探针必须 FAIL。
+let occlusionProbeWholeBlock = try runOcclusionProbe(patch: (
+    from: "        return WorldScreenOcclusionMask(columns: columns, rows: rows, blocked: blocked)",
+    to: "        let anyBlocked = blocked.contains(true)\n"
+        + "        return WorldScreenOcclusionMask(columns: columns, rows: rows, blocked: [Bool](repeating: anyBlocked, count: blocked.count))"
+))
+check(occlusionProbeWholeBlock.status != 0,
+    "断言6（注入负对照②「整块隐藏」）：探针 FAIL（exit \(occlusionProbeWholeBlock.status)）"
+        + (occlusionProbeWholeBlock.note.isEmpty ? "" : " —— \(occlusionProbeWholeBlock.note)"))
 
 // ---------------------------------------------------------------------------
 // MARK: 断言 3 + 5（静态扫描）：文本级判据与**注入负对照**
@@ -703,6 +1031,64 @@ let injectedMouseDownProblems = overlayPointerVerdict(injectedMouseDown)
 check(!injectedMouseDownProblems.isEmpty,
     "断言3（注入负对照）：给覆盖层加一个 mouseDown ⇒ 判据 FAIL。原话："
         + injectedMouseDownProblems.joined(separator: "；"))
+
+// ---------------------------------------------------------------------------
+// MARK: 断言 6（覆盖层侧）：被挡的部分**真的会被裁掉**，且只走 `CALayer.mask`
+// ---------------------------------------------------------------------------
+
+/// 覆盖层侧的结构性判据（文本级：这一份不参与内层编译）。
+///
+/// 三条缺一不可：
+/// 1. 被挡时挂的是 `container.layer.mask` 的**可见格并集**路径 —— 区域级，
+///    既不是 `isHidden` 整块开关，也不碰 shader（红线）；
+/// 2. 一格都没被挡时**摘掉** mask（正常观看零裁切、零抖动）；
+/// 3. 屏幕自己那件被排除（否则它永远挡着自己）。
+func overlayOcclusionVerdict(_ source: String) -> [String] {
+    var problems: [String] = []
+    if !source.contains("container.layer?.mask = created") {
+        problems.append("被挡时没有挂 `CALayer.mask`")
+    }
+    if !source.contains("guard let mask, !mask.isFullyVisible else") {
+        problems.append("全可见时没有摘掉 mask 的早退回")
+    }
+    if !source.contains("mask.visibleRects(in: size)") {
+        problems.append("裁的不是可见格并集（区域级）")
+    }
+    if source.contains("if mask.blockedCellCount > 0 { container.isHidden = true") {
+        problems.append("把遮挡做成了整块开关")
+    }
+    if !source.contains("WorldScreenOcclusion.mask(")
+        || !source.contains("excluding: surface.objectID") {
+        problems.append("没有按屏幕自己那件排除遮挡物（会自己挡自己）")
+    }
+    if !source.contains("occluders: WorldScreenOccluders = .empty") {
+        problems.append("`update` 没有收遮挡物输入")
+    }
+    return problems
+}
+
+let overlayOcclusionProblems = overlayOcclusionVerdict(overlaySource)
+check(overlayOcclusionProblems.isEmpty,
+    "断言6：覆盖层按**区域**裁掉被挡的部分（`CALayer.mask` = 可见格并集；全可见时摘掉）"
+        + (overlayOcclusionProblems.isEmpty ? "" : " —— \(overlayOcclusionProblems.joined(separator: "；"))"))
+
+// 注入：把"全可见就摘掉 mask"改成"永远挂一块掩码" ⇒ 判据必须红。
+let injectedAlwaysMask = overlaySource.replacingOccurrences(
+    of: "guard let mask, !mask.isFullyVisible else",
+    with: "guard let mask, mask.cellCount > 0 else"
+)
+check(!overlayOcclusionVerdict(injectedAlwaysMask).isEmpty,
+    "断言6（注入负对照）：把「全可见就摘掉 mask」改掉 ⇒ 判据 FAIL。原话："
+        + overlayOcclusionVerdict(injectedAlwaysMask).joined(separator: "；"))
+
+// 注入：把"排除屏幕自己那件"去掉 ⇒ 判据必须红（真机上表现为整块屏幕永远被挡）。
+let injectedNoExclusion = overlaySource.replacingOccurrences(
+    of: "excluding: surface.objectID",
+    with: "excluding: nil"
+)
+check(!overlayOcclusionVerdict(injectedNoExclusion).isEmpty,
+    "断言6（注入负对照）：不再排除屏幕自己那件 ⇒ 判据 FAIL。原话："
+        + overlayOcclusionVerdict(injectedNoExclusion).joined(separator: "；"))
 
 // 静态扫描：生产源码里不许有抓流 / 绕登录的能力痕迹。
 let prohibitedHits = scanForProhibitedCapabilities(at: sourceRoot)

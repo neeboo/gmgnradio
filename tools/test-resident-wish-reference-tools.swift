@@ -20,6 +20,8 @@ func worldRuntimeHarnessFlags() -> [String] {
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let sources = root.appendingPathComponent("apps/macos/Sources/GMGNRadio")
 let referenceSource = sources.appendingPathComponent("Agent/ResidentWishReferenceTools.swift")
+// 具名诊断住在自己那份生产文件里（`Agent/ResidentWishReferenceDiagnosis.swift`）：
+// 工具文件引用它，所以这里必须**编同一份**，否则 harness 编译不过。
 let diagnosisSource = sources.appendingPathComponent("Agent/ResidentWishReferenceDiagnosis.swift")
 let sessionSource = sources.appendingPathComponent("Agent/ResidentWorldToolSession.swift")
 let coordinatorSource = sources.appendingPathComponent("Presence/WishMachineCoordinator.swift")

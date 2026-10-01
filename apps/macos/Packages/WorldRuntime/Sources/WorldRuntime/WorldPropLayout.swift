@@ -40,18 +40,33 @@ public struct WorldGeneratedProp: Codable, Equatable, Sendable {
     /// 可选、纯增量：为 nil 时合成 `Codable` 不编码这个键（`encodeIfPresent`），
     /// 于是**已经立着的**资产（绝大多数）元数据 JSON 与改造前逐字节相同。
     public let orientation: WorldPropOrientation?
+    /// **基础几何**拼出来的那件东西的记录（三轴毫米数 + 场景米数 + 那句解释）。
+    ///
+    /// 它回答的是"用户说的完整长宽高到底照做了没有"：这份 `size` 是**拼出来的几何**，
+    /// 逐位等于用户给的三轴（真机那台 `1443 × 862 × 302 mm` 的电视），而不是生成器交回来的
+    /// 网格按最长边等比缩放的结果。面板/回执逐位回读的就是 `summary` 那一句。
+    ///
+    /// 它不是第二份尺寸（尺寸仍只有 `size` 一份），也不是"尺寸意图"（那是提交时说的，
+    /// 存在 `sizeIntent` 里）：它说的是"这件的几何是按三轴**拼**出来的，拼的时候这几块料
+    /// 是怎么分的"。用户事后手动改过尺寸 ⇒ `withSize` 会把它清掉（见那里）。
+    ///
+    /// 可选、纯增量：为 nil 时合成 `Codable` 不编码这个键（`encodeIfPresent`），
+    /// 于是不是基础几何拼出来的物件（绝大多数）其元数据与改造前逐字节相同。
+    public let primitive: WorldPrimitiveTelevisionRecord?
     public init(objectID: String, sourceWishID: String, assetID: String, displayName: String,
                 size: WorldVector3, sourceHeight: Float, sizeLocked: Bool? = nil,
                 collision: WorldPropCollisionProxy? = nil,
                 authoritativeSize: WorldPropAuthoritativeSize? = nil,
                 sizeIntent: WorldPropSizeIntent? = nil,
-                orientation: WorldPropOrientation? = nil) {
+                orientation: WorldPropOrientation? = nil,
+                primitive: WorldPrimitiveTelevisionRecord? = nil) {
         self.objectID = objectID; self.sourceWishID = sourceWishID; self.assetID = assetID
         self.displayName = displayName; self.size = size; self.sourceHeight = sourceHeight
         self.sizeLocked = sizeLocked
         self.collision = collision; self.authoritativeSize = authoritativeSize
         self.sizeIntent = sizeIntent
         self.orientation = orientation
+        self.primitive = primitive
     }
     /// 摆正旋转的**唯一**出口（没有 orientation 就是单位四元数）。
     ///
@@ -88,12 +103,19 @@ public struct WorldGeneratedProp: Codable, Equatable, Sendable {
     }
     /// 「这件东西的尺寸是**怎么定**的」：手动 > 意图 > 权威 > 自动推断。面板/任务行读它。
     public var sizeProvenance: WorldPropSizeProvenance {
+        // **基础几何**拼出来的那件东西：这份 `size` 不是 app 从网格量出来的、也不是用户事后
+        // 拖出来的，它**就是**用户给的三轴本身（`primitive.millimeters`）⇒ 出处是"按你说的
+        // 尺寸"。用户事后拖过尺寸 ⇒ `withSize` 把 `primitive` 清掉，于是这里自然落回 `.manual`。
+        if primitive != nil { return .submitIntent }
         if isSizeLocked { return .manual }
         if sizeIntent != nil { return .submitIntent }
         return authoritativeSize == nil ? .appMeasured : .workflowAuthoritative
     }
     /// 一行可读的出处说明（面板用），例如「用户指定的最长边 1.10 米」。
     public var sizeProvenanceSummary: String {
+        // 基础几何那一份记录里就是**逐位回读**那一句（用户说的毫米数 + 场景里的米数 +
+        // "z 是底座进深、面板厚度是拼出来的"）。它是那句解释的唯一来源，面板不另算。
+        if let primitive { return primitive.summary }
         switch sizeProvenance {
         case .manual: return "手动改过尺寸（最长边 \(WorldPropSizePolicy.meters(longestEdge)) 米）"
         case .submitIntent: return sizeIntent?.summary ?? "按提交时的尺寸意图"
@@ -111,6 +133,9 @@ public struct WorldGeneratedProp: Codable, Equatable, Sendable {
             && (authoritativeSize?.isValid ?? true)
             // 尺寸意图同理：非法意图不能被当成"没有意图"（那就退回"让 app 猜"了）。
             && (sizeIntent?.isValid ?? true)
+            // 基础几何记录同理：坏记录不能被当成"不是拼出来的"（面板会退回最长边那一行，
+            // 而用户明明给过三轴 —— 那就是 fail-open）。
+            && (primitive?.isValid ?? true)
             // 摆正旋转同理：坏掉的朝向不能被当成"不用摆正"（画面会躺着，而判据按立着算）。
             && (orientation?.isValid ?? true)
     }
@@ -130,7 +155,12 @@ public struct WorldGeneratedProp: Codable, Equatable, Sendable {
                            authoritativeSize: nil, sizeIntent: sizeIntent,
                            // 摆正与"多大"是两件事：改尺寸不该把"这件网格是躺着的"这件事丢掉，
                            // 否则改完尺寸画面又躺回去（存档/渲染会分叉）。
-                           orientation: orientation)
+                           orientation: orientation,
+                           // 基础几何记录**必须一起丢掉**：它那句 `summary` 说的是
+                           // "场景里就是 1.443 × 0.862 × 0.302 米"，而用户刚刚把尺寸改成了
+                           // 别的数 —— 留着它就是在面板上写一句当场可证的假话。
+                           // 尺寸意图（"当初照谁的话做的"）是审计事实，原样保留。
+                           primitive: nil)
     }
     /// 是不是**同一件物件**（身份相同）。尺寸可以不同：用户手动定过尺寸的物件，
     /// 自动基线必然与存档里的那一份不等 —— 那不是"资产归属不一致"，不该被判成错误。
@@ -259,6 +289,18 @@ public enum WorldPropLayoutCommand: Codable, Equatable, Sendable {
     case adjustGrip(objectID: String, avatarAssetID: String, calibration: WorldPropGripCalibration)
     case returnHeld(objectID: String, avatarAssetID: String)
     case enableCapability(objectID: String, templateID: String)
+    /// **删掉一件生成资产**（永久，不可恢复）。
+    ///
+    /// 它不是"少了一行的 withdraw"：
+    /// - 世界文档里这一条**离开** `objectStates`（权威据此把记录置墓碑并派生
+    ///   `object.removed` 事实），但它**不是硬删** —— 身份冻结进
+    ///   `WorldState.propTombstones[objectID]`，历史与对账都还答得出"它去哪儿了"；
+    /// - 正在摆放 / 正在手持**在同一次提交里原子收场**（`WorldPropDeletionSettlement`）：
+    ///   摆放随删除结束，手持先按 `heldProp.returnState` 放回再删 —— 绝不留下悬空的手持记录；
+    /// - `reason` 可省（用户的理由），最多 200 字：它是审计事实的一部分。
+    ///
+    /// 幂等仍由**既有的** `layoutReceipts` 回答（同一个 `requestID` 重放不写第二遍）。
+    case delete(objectID: String, reason: String?)
     case undo
 }
 
@@ -266,6 +308,12 @@ public enum WorldPropLayoutError: Error, Equatable, Sendable {
     case staleRevision(submitted: UInt64, current: UInt64)
     case requestConflict
     case invalidObject
+    /// 删除时找不到那一件：**具名失败**，绝不静默成功（否则 agent 会以为删掉了）。
+    case objectNotFound(objectID: String)
+    /// 这件物件已经在墓碑里了（再删一次不是幂等成功，而是说清"它已经删了"）。
+    case objectAlreadyDeleted(objectID: String)
+    /// 删除理由过长（审计字段不接受任意长度的文本）。
+    case deletionReasonTooLong
     case invalidPlacement
     /// 尺寸越界 / 非等比。带上**读得懂的原因**（面板与光标旁的标签都显示它）。
     case invalidSize(String)
@@ -442,6 +490,9 @@ extension WorldPropLayoutError: LocalizedError {
         case let .staleRevision(_, current): "物件状态已经变化，请按版本 \(current) 重试。"
         case .requestConflict: "物件请求与已经处理的请求冲突。"
         case .invalidObject: "物件不存在或物件资料无效。"
+        case let .objectNotFound(objectID): "没有找到这件物件（\(objectID)），它可能已经被删除了。"
+        case let .objectAlreadyDeleted(objectID): "物件 \(objectID) 已经删除过了，墓碑还在，不必再删。"
+        case .deletionReasonTooLong: "删除理由太长了（最多 200 字）。"
         case .invalidPlacement: "物件摆放位置无效。"
         case let .invalidSize(reason): reason
         case .nothingToUndo: "没有可撤销的物件操作。"

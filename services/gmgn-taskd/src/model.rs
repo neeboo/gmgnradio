@@ -43,26 +43,149 @@ pub struct Context {
 pub const SIZE_INTENT_MIN_METERS: f64 = 0.01;
 pub const SIZE_INTENT_MAX_METERS: f64 = 3.0;
 
-/// 「这件东西该按**哪根轴**做成**多少米**」——提交时就说清楚，而不是让 app 事后从网格猜。
+/// 三轴尺寸意图允许的毫米数：与 `0.01–3 m` **同一条边界**，只是换成用户报规格时用的单位。
 ///
-/// 为什么需要它（真机 2026-10-01「2B 白色长剑（外形摆件）」）：`height_meters` 只有一根
-/// 轴（高度），而生成回来的网格**不保证立着** —— 那把剑实测 1.005 × 0.133 × 0.057 m，
-/// Y 那 0.133 m 是**厚度**，请求高度 1.1 m 于是被算成"厚度 1.1 m"，场景里变成
-/// 8.28 × 1.10 × 0.47 m（比 7 × 8 × 3.2 m 的舱室还长）⇒ 没有任何落点能过摆放判定
-/// ⇒ 被拒、退回库存。用户说的是"一把 1.1 米的剑"，他要的是**最长边 1.1 m**；
-/// 这句话必须在提交那一刻随任务落盘，事后再靠界面自动缩放只是兜底。
+/// 为什么三轴单开一个单位（而不是"米数的三元组"）：用户嘴里和商品页上写的就是毫米
+/// （真机 2026-10-01「平面电视」的规格原话就是 `1443 x 862 x 302mm`）。契约记**他说的那个数**、
+/// 单位换算只发生一次、而且写在键名上，就没有"少乘/多乘 1000"的余地 ——
+/// 1443 × 862 × 302 mm 落库就是 `1443`、`862`、`302` 三个整数，用户能在面板上逐字核对。
+pub const SIZE_INTENT_MIN_MILLIMETERS: f64 = 10.0;
+pub const SIZE_INTENT_MAX_MILLIMETERS: f64 = 3000.0;
+
+/// 提交时声明的**尺寸意图**。提交时就说清楚，而不是让 app 事后从网格猜。
 ///
-/// `axis == "height"` 时本字段与 `height_meters` **语义完全相同**（数值也必须相同，
-/// 由 `Submit::validate` 强制）—— 于是"高 1.1 米"这种要求仍然表达得出来，
+/// 两种形状，**二选一**（同时给是 `size_intent_shape_conflict`）：
+///
+/// 1. `{axis, meters, source}` —— **一根轴 + 一个米数**（改造前就有的那一份，逐字节不变）。
+///    为什么需要它（真机 2026-10-01「2B 白色长剑（外形摆件）」）：`height_meters` 只有一根
+///    轴（高度），而生成回来的网格**不保证立着** —— 那把剑实测 1.005 × 0.133 × 0.057 m，
+///    Y 那 0.133 m 是**厚度**，请求高度 1.1 m 于是被算成"厚度 1.1 m"，场景里变成
+///    8.28 × 1.10 × 0.47 m（比 7 × 8 × 3.2 m 的舱室还长）⇒ 没有任何落点能过摆放判定
+///    ⇒ 被拒、退回库存。用户说的是"一把 1.1 米的剑"，他要的是**最长边 1.1 m**；
+///    这句话必须在提交那一刻随任务落盘，事后再靠界面自动缩放只是兜底。
+///
+/// 2. `{mode:"dimensions", millimeters:{x,y,z}, source}` —— **完整三维**。
+///    为什么需要它（真机 2026-10-01「平面电视」）：用户的规格是 `1443 x 862 x 302 mm`，
+///    三根轴都说死了。旧形状只能上报**一根轴**，另外两维**在契约里没有位置**
+///    ⇒ agent 挑一根报上来，剩下两维就地丢掉 ⇒ 生成器给出一个大立方体。
+///    三根轴必须都能落进契约，否则"照实填"这件事根本写不出来。
+///
+/// **轴序与朝向**（与回执 `authoritative_size` 的 `up_axis`/`forward_axis` 同一套约定，
+/// 本仓把 up 钉死在 `±Y`）：`x` = 宽（左右，`±X`）、**`y` = 高（上下，`±Y`）**、
+/// `z` = 深（前后，正面朝 `+Z` 时就是从正面往后的进深）。
+/// 于是「1443 x 862 x 302 mm」= `x:1443`（宽）、`y:862`（高）、`z:302`（深）。
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SizeIntent {
+    /// 一根轴 + 一个米数（旧形状）。
+    Axis(AxisSizeIntent),
+    /// 完整三维（毫米）。
+    Dimensions(DimensionsSizeIntent),
+}
+
+/// 旧形状：一根轴 + 一个米数。`axis == "height"` 时与 `height_meters` **语义完全相同**
+/// （数值也必须相同，由 `Submit::validate` 强制）—— 于是"高 1.1 米"这种要求仍然表达得出来，
 /// 而且不可能出现两份互相矛盾的高度。
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SizeIntent {
+pub struct AxisSizeIntent {
     pub axis: SizeIntentAxis,
     pub meters: f64,
     /// 谁说的这个尺寸：用户原话（`user`）／服务建议（`suggested`）／兜底默认（`default`）。
     /// 没有默认值：缺了就是 `invalid_size_intent`，绝不替调用方编一个出处。
     pub source: SizeIntentSource,
+}
+
+/// 三轴形状：`{mode:"dimensions", millimeters:{x,y,z}, source}`。
+///
+/// `mode` 是**显式的形状标签**而不是可有可无的装饰：没有它，"两种形状同时给了"
+/// 就只能退化成一个笼统的 `invalid_size_intent`（未知键），说不清是"写错了"还是
+/// "说了两遍尺寸"。有了它，同时给 ⇒ `size_intent_shape_conflict` 这个具名错误。
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DimensionsSizeIntent {
+    pub mode: SizeIntentMode,
+    pub millimeters: SizeIntentMillimeters,
+    pub source: SizeIntentSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SizeIntentMode {
+    Dimensions,
+}
+
+/// 三轴尺寸（毫米），**轴序与朝向写死在这里**：`x` 宽、`y` 高、`z` 深。
+///
+/// 三个分量都必给：缺一个就是 `invalid_size_intent`。缺的那一维如果"默认成 0 或者
+/// 最长边"，就又回到了"契约里没有这一维"的老问题 —— 只不过这次是静默的。
+///
+/// `Deserialize` 是**手写**的，只收 JSON 对象：serde 派生对结构体同时接受"映射"和
+/// "序列"两种输入，`{"x":1443,"y":862,"z":302}` 与 `[1443,862,302]` 会解析成同一个值 ——
+/// 那条路绕过了键名想表达的"哪一根轴"，不是本契约的形式。与 `Submit::parsed_size_intent`
+/// 显式要求对象是同一条纪律。
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SizeIntentMillimeters {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+impl<'de> Deserialize<'de> for SizeIntentMillimeters {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct OnlyNamedEdges;
+
+        impl<'de> serde::de::Visitor<'de> for OnlyNamedEdges {
+            type Value = SizeIntentMillimeters;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("三轴尺寸对象 {x, y, z}（按名字给，不接受序列）")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let (mut x, mut y, mut z) = (None, None, None);
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "x" => {
+                            if x.is_some() {
+                                return Err(serde::de::Error::duplicate_field("x"));
+                            }
+                            x = Some(map.next_value::<f64>()?);
+                        }
+                        "y" => {
+                            if y.is_some() {
+                                return Err(serde::de::Error::duplicate_field("y"));
+                            }
+                            y = Some(map.next_value::<f64>()?);
+                        }
+                        "z" => {
+                            if z.is_some() {
+                                return Err(serde::de::Error::duplicate_field("z"));
+                            }
+                            z = Some(map.next_value::<f64>()?);
+                        }
+                        other => {
+                            return Err(serde::de::Error::unknown_field(other, &["x", "y", "z"]))
+                        }
+                    }
+                }
+                Ok(SizeIntentMillimeters {
+                    x: x.ok_or_else(|| serde::de::Error::missing_field("x"))?,
+                    y: y.ok_or_else(|| serde::de::Error::missing_field("y"))?,
+                    z: z.ok_or_else(|| serde::de::Error::missing_field("z"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(OnlyNamedEdges)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -82,10 +205,72 @@ pub enum SizeIntentSource {
 
 impl SizeIntent {
     pub fn validate(&self) -> Result<()> {
+        match self {
+            SizeIntent::Axis(intent) => intent.validate(),
+            SizeIntent::Dimensions(intent) => intent.validate(),
+        }
+    }
+
+    /// 旧形状的轴；三轴形状没有"一根轴"，返回 `None`。
+    pub fn axis(&self) -> Option<SizeIntentAxis> {
+        match self {
+            SizeIntent::Axis(intent) => Some(intent.axis),
+            SizeIntent::Dimensions(_) => None,
+        }
+    }
+
+    /// 三轴形状的毫米三元组（顺序 `[x, y, z]`）；旧形状返回 `None`。
+    pub fn millimeters(&self) -> Option<[f64; 3]> {
+        match self {
+            SizeIntent::Axis(_) => None,
+            SizeIntent::Dimensions(intent) => Some([
+                intent.millimeters.x,
+                intent.millimeters.y,
+                intent.millimeters.z,
+            ]),
+        }
+    }
+
+    pub fn source(&self) -> SizeIntentSource {
+        match self {
+            SizeIntent::Axis(intent) => intent.source,
+            SizeIntent::Dimensions(intent) => intent.source,
+        }
+    }
+
+    /// 提交里的 `height_meters` **必须**等于的那个数；`None` = 这一份意图不管 `height_meters`。
+    ///
+    /// 为什么三轴形状也要管：三轴的 `y` 就是"高"，而 `height_meters` 是生成请求的高度，
+    /// 两者是同一件事的两个写法。让它们各自为政，就又是两份高度 —— 与旧形状
+    /// `axis == height` 那条判据同一个道理。
+    pub fn required_height_meters(&self) -> Option<f64> {
+        match self {
+            SizeIntent::Axis(intent) if intent.axis == SizeIntentAxis::Height => Some(intent.meters),
+            SizeIntent::Axis(_) => None,
+            SizeIntent::Dimensions(intent) => Some(intent.millimeters.y / 1000.0),
+        }
+    }
+}
+
+impl AxisSizeIntent {
+    pub fn validate(&self) -> Result<()> {
         if !self.meters.is_finite()
             || !(SIZE_INTENT_MIN_METERS..=SIZE_INTENT_MAX_METERS).contains(&self.meters)
         {
             return Err("invalid_size_intent");
+        }
+        Ok(())
+    }
+}
+
+impl DimensionsSizeIntent {
+    pub fn validate(&self) -> Result<()> {
+        for edge in [self.millimeters.x, self.millimeters.y, self.millimeters.z] {
+            if !edge.is_finite()
+                || !(SIZE_INTENT_MIN_MILLIMETERS..=SIZE_INTENT_MAX_MILLIMETERS).contains(&edge)
+            {
+                return Err("invalid_size_intent");
+            }
         }
         Ok(())
     }
@@ -135,7 +320,16 @@ impl SizeIntentSupport {
     /// 这一条意图现在能不能发。三条全过才行：轴在清单里、区间自身合法、米数落在闭区间里。
     ///
     /// 区间不合法（非有限、上下颠倒）时**不**发：一份自相矛盾的声明不能当成"随便发"。
+    ///
+    /// **三轴形状恒定不发**：线上那个键只有"一根轴 + 一个米数"这一种形式，而远端
+    /// `validate_request` 的第一句就是严格拒绝未知键（见本类型的文档）。发过去就是
+    /// 400 ⇒ 整件任务失败。三轴意图的归一发生在 **app 侧**，远端拿到的仍然只有
+    /// `height_meters`（= 三轴的 `y`）那一个数 —— 与"服务声明读不到"时的方向一致：
+    /// fail-closed 的方向是"这一条不发"，不是"提交不发"。
     pub fn accepts(&self, intent: &SizeIntent) -> bool {
+        let SizeIntent::Axis(intent) = intent else {
+            return false;
+        };
         self.axes.contains(&intent.axis)
             && self.min_meters.is_finite()
             && self.max_meters.is_finite()
@@ -411,11 +605,14 @@ impl Submit {
         }
         if let Some(intent) = self.parsed_size_intent()? {
             intent.validate()?;
-            // `axis == "height"` 时两根轴说的是同一件事 ⇒ 两个数字必须相同。
+            // 意图里"高"这一位与 `height_meters` 说的是同一件事 ⇒ 两个数字必须相同
+            // （旧形状的 `axis == "height"`、三轴形状的 `y` 都算在内）。
             // 不相同就拒绝（`size_intent_conflict`），而不是让 app 自己挑一个信 ——
             // 那就是两份真相，而"用户看到太大/消失"正是从两份真相长出来的。
-            if intent.axis == SizeIntentAxis::Height && intent.meters != self.height_meters {
-                return Err("size_intent_conflict");
+            if let Some(required) = intent.required_height_meters() {
+                if required != self.height_meters {
+                    return Err("size_intent_conflict");
+                }
             }
         }
         let bytes = base64::engine::general_purpose::STANDARD
@@ -427,21 +624,46 @@ impl Submit {
 
     /// 把提交上来的 `sizeIntent` 解析成强类型。缺失/null ⇒ `Ok(None)`（老路径）。
     ///
-    /// 类型非法（不是对象、轴名不是 `longest`/`height`、出处不是 `user`/`suggested`/
-    /// `default`、米数不是数、多了未知键）⇒ `Err("invalid_size_intent")`，
-    /// **明确错误码，不静默**：静默按"没有意图"处理，就等于又回到了"让 app 猜这把剑该多长"。
+    /// 形状**二选一**，靠 `mode` 这个显式标签分派（没有它，"两种形状同时给"就只是一个
+    /// 笼统的 `invalid_size_intent`，说不清是写错了还是说了两遍尺寸）：
+    ///
+    /// - 有 `mode`：三轴形状。**同时给了 `axis`/`meters` ⇒ `size_intent_shape_conflict`**
+    ///   （具名，不猜哪一份才算数）；`mode` 值不是 `dimensions`、缺 `millimeters`、
+    ///   三个分量缺一个、多了未知键、毫米数不是数或越界 ⇒ `invalid_size_intent`。
+    /// - 没有 `mode`：旧形状，行为与改造前逐字节一致。
+    ///
+    /// 任何一条不过都是**明确错误码，不静默**：静默按"没有意图"处理，就等于又回到了
+    /// "让 app 猜这件东西该多大"。
     ///
     /// 必须显式要求 JSON 对象：serde 的派生 `Deserialize` 对结构体同时接受"映射"和
     /// "序列"两种输入，`["longest", 1.1, "user"]` 也会被它按字段顺序吃下去 ——
     /// 那条路绕过了 `deny_unknown_fields` 想守的边界，不是本契约的形式。
     pub fn parsed_size_intent(&self) -> Result<Option<SizeIntent>> {
-        match &self.size_intent {
-            None | Some(Value::Null) => Ok(None),
-            Some(value) if value.is_object() => serde_json::from_value(value.clone())
-                .map(Some)
-                .map_err(|_| "invalid_size_intent"),
-            Some(_) => Err("invalid_size_intent"),
+        let Some(value) = &self.size_intent else {
+            return Ok(None);
+        };
+        if value.is_null() {
+            return Ok(None);
         }
+        let object = value.as_object().ok_or("invalid_size_intent")?;
+        let has_mode = object.contains_key("mode");
+        let has_axis_shape = object.contains_key("axis") || object.contains_key("meters");
+        if has_mode {
+            // 两种形状同时给：这个对象说不清自己是哪一种，**具名拒绝**（不是未知键）。
+            if has_axis_shape {
+                return Err("size_intent_shape_conflict");
+            }
+            return serde_json::from_value::<DimensionsSizeIntent>(value.clone())
+                .map(|intent| Some(SizeIntent::Dimensions(intent)))
+                .map_err(|_| "invalid_size_intent");
+        }
+        // 没有 `mode` 却带了三轴的字段：形状不完整（三轴意图**必须**声明 `mode`）。
+        if object.contains_key("millimeters") {
+            return Err("invalid_size_intent");
+        }
+        serde_json::from_value::<AxisSizeIntent>(value.clone())
+            .map(|intent| Some(SizeIntent::Axis(intent)))
+            .map_err(|_| "invalid_size_intent")
     }
 }
 
@@ -703,6 +925,9 @@ pub fn authoritative_size(result: &Value) -> Result<Option<AuthoritativeSize>> {
 /// 判据（尺寸与 `up_axis`/`forward_axis` 同一坐标系，单位米）：
 /// - `axis == "height"`：上下轴那一维（`up_axis` 只可能是 `±Y` ⇒ `dimensions[1]`）等于意图米数；
 /// - `axis == "longest"`：三维里最大的一维等于意图米数。
+/// - `mode == "dimensions"`：**逐维**比对 —— `dimensions` 的分量序就是 `[x, y, z]`
+///   （与 `millimeters` 的轴序同一套，见 `SizeIntentMillimeters`），每一维都要对上。
+///
 /// 容差见 [`SIZE_INTENT_SIZE_TOLERANCE`]。
 ///
 /// 老任务（没有意图）与老服务（不发 `authoritative_size`）都不会走到这里 ⇒ 行为不变。
@@ -713,17 +938,39 @@ fn size_intent_agrees_with_authoritative_size(job: &Job, result: &Value) -> Resu
     let Some(authoritative) = authoritative_size(result)? else {
         return Ok(());
     };
-    let measured = match intent.axis {
-        SizeIntentAxis::Height => authoritative.dimensions[1],
-        SizeIntentAxis::Longest => authoritative
-            .dimensions
-            .iter()
-            .fold(0.0_f64, |longest, edge| longest.max(*edge)),
-    };
-    if (measured - intent.meters).abs() > SIZE_INTENT_SIZE_TOLERANCE.max(intent.meters * 1e-3) {
-        return Err("authoritative_size_conflicts_with_intent");
+    match intent {
+        SizeIntent::Axis(axis) => {
+            let measured = match axis.axis {
+                SizeIntentAxis::Height => authoritative.dimensions[1],
+                SizeIntentAxis::Longest => authoritative
+                    .dimensions
+                    .iter()
+                    .fold(0.0_f64, |longest, edge| longest.max(*edge)),
+            };
+            if !intent_agrees_with(measured, axis.meters) {
+                return Err("authoritative_size_conflicts_with_intent");
+            }
+        }
+        SizeIntent::Dimensions(dimensions) => {
+            let millimeters = [
+                dimensions.millimeters.x,
+                dimensions.millimeters.y,
+                dimensions.millimeters.z,
+            ];
+            for (measured, edge) in authoritative.dimensions.iter().zip(millimeters) {
+                if !intent_agrees_with(*measured, edge / 1000.0) {
+                    return Err("authoritative_size_conflicts_with_intent");
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// 量到的与说的算不算同一件事。绝对容差兜住 GLB 顶点只有 float32 精度这件事，
+/// 相对容差兜住 1.1 m 这种尺寸在毫米级四舍五入后的往返。
+fn intent_agrees_with(measured: f64, intended: f64) -> bool {
+    (measured - intended).abs() <= SIZE_INTENT_SIZE_TOLERANCE.max(intended.abs() * 1e-3)
 }
 
 /// 回执是否**声明**了碰撞代理。调用方用它决定"要不要去下载代理"。
@@ -1243,11 +1490,11 @@ mod tests {
         );
         assert_eq!(
             submit.parsed_size_intent().unwrap(),
-            Some(SizeIntent {
+            Some(SizeIntent::Axis(AxisSizeIntent {
                 axis: SizeIntentAxis::Longest,
                 meters: 1.1,
                 source: SizeIntentSource::User,
-            })
+            }))
         );
         // 兼容别名：snake_case 也认（契约文档里写作 size_intent）。
         let value: Submit = serde_json::from_value(json!({
@@ -1261,8 +1508,8 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            value.parsed_size_intent().unwrap().unwrap().axis,
-            SizeIntentAxis::Height
+            value.parsed_size_intent().unwrap().unwrap().axis(),
+            Some(SizeIntentAxis::Height)
         );
     }
 
@@ -1367,17 +1614,295 @@ mod tests {
         submit.height_meters = 0.5;
         submit.validate().unwrap();
         assert_eq!(
-            submit.parsed_size_intent().unwrap().unwrap().axis,
-            SizeIntentAxis::Height
+            submit.parsed_size_intent().unwrap().unwrap().axis(),
+            Some(SizeIntentAxis::Height)
         );
     }
 
+    /// **断言（三轴）**：用户给的 `1443 x 862 x 302 mm` 三根轴都进得来、读得回、
+    /// 落库字节就是那三个整数（毫秒不换算、不四舍五入、不丢维）。
+    ///
+    /// 真机现场：用户给的规格是 `1443 x 862 x 302mm`，旧契约只有"一根轴 + 一个米数"，
+    /// agent 只能挑一根上报，另外两维在契约里**没有位置** ⇒ 生成器交回一个大立方体。
+    #[test]
+    fn three_axis_size_intent_round_trips_and_reads_back() {
+        assert_eq!(
+            serde_json::to_value(SizeIntentMode::Dimensions).unwrap(),
+            json!("dimensions")
+        );
+        let mut submit = submission_with_intent(
+            json!({"mode": "dimensions", "millimeters": {"x": 1443, "y": 862, "z": 302}, "source": "user"}),
+            0.862,
+        );
+        let parsed = submit.parsed_size_intent().unwrap().unwrap();
+        // 三根轴**逐位**读回：宽 1443 / 高 862 / 深 302（毫米）。
+        assert_eq!(parsed.millimeters(), Some([1443.0, 862.0, 302.0]));
+        assert_eq!(parsed.source(), SizeIntentSource::User);
+        // 三轴形状没有"一根轴"：旧的那个问题在这里是**没有答案**，不是"随便挑一根"。
+        assert_eq!(parsed.axis(), None);
+        assert_eq!(parsed.required_height_meters(), Some(0.862));
+        // 落库/上线的字节：`mode` 是显式形状标签，三个整数原样带着走。
+        assert_eq!(
+            serde_json::to_string(&parsed).unwrap(),
+            r#"{"mode":"dimensions","millimeters":{"x":1443.0,"y":862.0,"z":302.0},"source":"user"}"#
+        );
+        // 读回来之后再序列化，还是一个合法的提交形状（幂等，不漂）。
+        let mut again: Submit = serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "endpoint": "https://primary.invalid",
+            "name": "television",
+            "pngBase64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=",
+            "source": {"author": "resident", "license": "CC0-1.0"},
+            "heightMeters": 0.862,
+            "sizeIntent": serde_json::from_str::<Value>(
+                &serde_json::to_string(&parsed).unwrap()
+            ).unwrap(),
+        }))
+        .unwrap();
+        assert_eq!(again.validate().map(|_| ()), Ok(()));
+        assert_eq!(again.parsed_size_intent().unwrap(), Some(parsed));
+        // 旧形状的字节与改造前**逐位相同** —— 这一串就是录制 fixture 里的那一份。
+        assert_eq!(
+            serde_json::to_string(&intent(SizeIntentAxis::Longest, 1.1)).unwrap(),
+            r#"{"axis":"longest","meters":1.1,"source":"user"}"#
+        );
+    }
+
+    /// **断言（兼容）**：三轴形状的存在**不改变**旧形状与"没有意图"的线上字节。
+    #[test]
+    fn adding_the_three_axis_shape_moves_no_existing_bytes() {
+        // ① 没有意图 ⇒ 键根本不出现（老客户端看到的 job JSON 与今天逐字节一致）。
+        let mut bare: Submit = serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "endpoint": "https://primary.invalid",
+            "name": "cup",
+            "pngBase64": "a",
+            "source": {"author": "resident", "license": "CC0-1.0"},
+            "heightMeters": 0.5,
+        }))
+        .unwrap();
+        assert_eq!(bare.parsed_size_intent(), Ok(None));
+        // ② 旧形状的三种轴/出处组合都还是老字节（多了个 enum 包装，线格式一个字节没动）。
+        for (parsed, text) in [
+            (
+                intent(SizeIntentAxis::Longest, 1.1),
+                r#"{"axis":"longest","meters":1.1,"source":"user"}"#,
+            ),
+            (
+                SizeIntent::Axis(AxisSizeIntent {
+                    axis: SizeIntentAxis::Height,
+                    meters: 0.35,
+                    source: SizeIntentSource::Suggested,
+                }),
+                r#"{"axis":"height","meters":0.35,"source":"suggested"}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&parsed).unwrap(), text);
+            // 反向也一样：老字节解出来就是那一位，没有"顺手补个 mode"这种事。
+            assert_eq!(
+                serde_json::from_str::<SizeIntent>(text).unwrap(),
+                parsed
+            );
+        }
+        // ③ 三轴形状**不会被**解成旧形状（`deny_unknown_fields` 守住了形状边界）。
+        assert!(serde_json::from_str::<AxisSizeIntent>(
+            r#"{"mode":"dimensions","millimeters":{"x":1,"y":2,"z":3},"source":"user"}"#
+        )
+        .is_err());
+        // ④ 提交里带了 `size_intent`（旧形状）时，序列化出去的 job JSON 与录制 fixture 一致。
+        bare.size_intent = Some(json!({"axis": "longest", "meters": 1.1, "source": "user"}));
+        assert_eq!(
+            serde_json::to_string(&bare.parsed_size_intent().unwrap().unwrap()).unwrap(),
+            r#"{"axis":"longest","meters":1.1,"source":"user"}"#
+        );
+    }
+
+    /// **断言（冲突）**：两种形状**同时给** ⇒ 具名 `size_intent_shape_conflict`，
+    /// 不是笼统的 `invalid_size_intent`，更不是"挑一份信"。
+    #[test]
+    fn giving_both_size_shapes_is_a_named_conflict() {
+        for both in [
+            json!({"axis": "longest", "meters": 1.443, "mode": "dimensions",
+                   "millimeters": {"x": 1443, "y": 862, "z": 302}, "source": "user"}),
+            // 只给 `meters`（轴的伴生字段）也算旧形状出现了一半。
+            json!({"meters": 1.443, "mode": "dimensions",
+                   "millimeters": {"x": 1443, "y": 862, "z": 302}, "source": "user"}),
+        ] {
+            let mut submit = Submit {
+                id: uuid::Uuid::new_v4().to_string(),
+                endpoint: "https://primary.invalid".into(),
+                name: "television".into(),
+                png_base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=".into(),
+                source: Source { author: "resident".into(), license: "CC0-1.0".into() },
+                height_meters: 0.862,
+                size_intent: Some(both.clone()),
+                context: None,
+                source_wish_id: None,
+                generation_profile: None,
+            };
+            assert_eq!(
+                submit.validate(),
+                Err("size_intent_shape_conflict"),
+                "两种形状同时给没有被具名拒绝：{both}"
+            );
+            // 解析这一层同样具名（不是"解析失败"）。
+            assert_eq!(submit.parsed_size_intent(), Err("size_intent_shape_conflict"));
+        }
+    }
+
+    /// **断言（越界/畸形）**：三轴里任何一根不是正有限数、或不在 `10–3000 mm`
+    /// （= 旧契约 `0.01–3 m` 的同一条边界）⇒ 具名 `invalid_size_intent`，绝不静默、绝不夹取。
+    #[test]
+    fn illegal_three_axis_intents_are_named_rejections() {
+        for illegal in [
+            // 缺一根轴：另外两维"默认成什么"都是猜，所以根本不接受。
+            json!({"mode": "dimensions", "millimeters": {"x": 1443, "y": 862}, "source": "user"}),
+            json!({"mode": "dimensions", "millimeters": {"x": 1443, "z": 302}, "source": "user"}),
+            json!({"mode": "dimensions", "millimeters": {"x": 1443, "y": 862, "z": 302}}),
+            // 零 / 负 / 非有限。
+            json!({"mode": "dimensions", "millimeters": {"x": 0, "y": 862, "z": 302}, "source": "user"}),
+            json!({"mode": "dimensions", "millimeters": {"x": 1443, "y": -862, "z": 302}, "source": "user"}),
+            json!({"mode": "dimensions", "millimeters": {"x": 1443, "y": 862, "z": "302"}, "source": "user"}),
+            json!({"mode": "dimensions", "millimeters": {"x": true, "y": 862, "z": 302}, "source": "user"}),
+            // 越界：低于 10 mm / 高于 3000 mm（两端都是**闭**区间的外侧一格）。
+            json!({"mode": "dimensions", "millimeters": {"x": 9.999, "y": 862, "z": 302}, "source": "user"}),
+            json!({"mode": "dimensions", "millimeters": {"x": 1443, "y": 862, "z": 3000.001}, "source": "user"}),
+            // 形状本身不对：mode 值不认识 / 缺 mode / 多未知键 / 不是对象。
+            json!({"mode": "axes", "millimeters": {"x": 1443, "y": 862, "z": 302}, "source": "user"}),
+            json!({"millimeters": {"x": 1443, "y": 862, "z": 302}, "source": "user"}),
+            json!({"mode": "dimensions", "millimeters": {"x": 1443, "y": 862, "z": 302, "w": 1}, "source": "user"}),
+            json!({"mode": "dimensions", "millimeters": {"x": 1443, "y": 862, "z": 302}, "source": "user", "unit": "mm"}),
+            json!({"mode": "dimensions", "millimeters": [1443, 862, 302], "source": "user"}),
+            json!({"mode": "dimensions", "millimeters": {"x": 1443, "y": 862, "z": 302}, "source": "guess"}),
+            // 一句话里说不清是哪一种形状：既没有 mode 也没有 axis。
+            json!({"x": 1443, "y": 862, "z": 302, "source": "user"}),
+        ] {
+            let mut submit = Submit {
+                id: uuid::Uuid::new_v4().to_string(),
+                endpoint: "https://primary.invalid".into(),
+                name: "television".into(),
+                png_base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=".into(),
+                source: Source { author: "resident".into(), license: "CC0-1.0".into() },
+                height_meters: 0.862,
+                size_intent: Some(illegal.clone()),
+                context: None,
+                source_wish_id: None,
+                generation_profile: None,
+            };
+            assert_eq!(
+                submit.validate(),
+                Err("invalid_size_intent"),
+                "非法三轴意图被接受了：{illegal}"
+            );
+        }
+        // 两个端点（闭区间）都得过 —— 拒绝的边界不能宽到把合法尺寸也扫掉。
+        for ok in [
+            json!({"mode": "dimensions", "millimeters": {"x": 10, "y": 862, "z": 302}, "source": "user"}),
+            json!({"mode": "dimensions", "millimeters": {"x": 1443, "y": 862, "z": 3000}, "source": "user"}),
+        ] {
+            let mut submit = submission_with_intent(ok.clone(), 0.862);
+            assert!(submit.validate().is_ok(), "闭区间端点被拒了：{ok}");
+        }
+    }
+
+    /// 三轴的 `y`（高）与 `height_meters` 是同一件事 ⇒ 不一致就 `size_intent_conflict`，
+    /// 与旧形状 `axis == "height"` 是**同一条**判据。
+    #[test]
+    fn three_axis_height_must_agree_with_height_meters() {
+        let mut submit = submission_with_intent(
+            json!({"mode": "dimensions", "millimeters": {"x": 1443, "y": 862, "z": 302}, "source": "user"}),
+            0.862,
+        );
+        submit.validate().unwrap();
+        submit.height_meters = 0.86;
+        assert_eq!(submit.validate(), Err("size_intent_conflict"));
+        submit.height_meters = 0.9;
+        assert_eq!(submit.validate(), Err("size_intent_conflict"));
+    }
+
+    /// 三轴意图**从不**发给远端：线上那个键只有"一根轴 + 一个米数"这一种形状，
+    /// 而服务端严格拒绝未知键 ⇒ 发过去就是 400、整件任务失败。
+    /// 归一在 app 侧做，远端拿到的仍然只有 `height_meters`。
+    #[test]
+    fn a_three_axis_intent_is_never_declared_as_forwardable() {
+        let both = support(
+            &[SizeIntentAxis::Longest, SizeIntentAxis::Height],
+            0.01,
+            3.0,
+            SizeIntentApplies::Normalize,
+        );
+        assert!(both.accepts(&intent(SizeIntentAxis::Longest, 1.1)));
+        assert!(
+            !both.accepts(&SizeIntent::Dimensions(DimensionsSizeIntent {
+                mode: SizeIntentMode::Dimensions,
+                millimeters: SizeIntentMillimeters { x: 1443.0, y: 862.0, z: 302.0 },
+                source: SizeIntentSource::User,
+            })),
+            "三轴意图被当成可以发给远端的了 —— 那会让整件任务 400"
+        );
+    }
+
+    /// 生成侧回执的 `authoritative_size` 与三轴意图必须**逐维**说同一件事。
+    #[test]
+    fn authoritative_size_must_match_all_three_axes() {
+        let recorded = recorded();
+        let base = recorded_job(&recorded);
+        let mut value = recorded["receipt"].clone();
+        value["result"]["authoritative_size"] = size_block(); // dims = [0.5?, 0.42, ...]
+
+        let dims = authoritative_size(&value["result"]).unwrap().unwrap().dimensions;
+        let millimeters = [
+            (dims[0] * 1000.0).round(),
+            (dims[1] * 1000.0).round(),
+            (dims[2] * 1000.0).round(),
+        ];
+        // 照实说 ⇒ 通过。
+        let mut job = base.clone();
+        job.size_intent = Some(SizeIntent::Dimensions(DimensionsSizeIntent {
+            mode: SizeIntentMode::Dimensions,
+            millimeters: SizeIntentMillimeters {
+                x: millimeters[0],
+                y: millimeters[1],
+                z: millimeters[2],
+            },
+            source: SizeIntentSource::User,
+        }));
+        assert_eq!(receipt(&value, &job), Ok(()));
+        // 任何**一维**被改掉（其它两维都对）⇒ 硬失败，不给"差不多就算同一件事"的余地。
+        for wrong in 0..3 {
+            let mut edges = millimeters;
+            edges[wrong] += 1.0;
+            job.size_intent = Some(SizeIntent::Dimensions(DimensionsSizeIntent {
+                mode: SizeIntentMode::Dimensions,
+                millimeters: SizeIntentMillimeters { x: edges[0], y: edges[1], z: edges[2] },
+                source: SizeIntentSource::User,
+            }));
+            assert_eq!(
+                receipt(&value, &job),
+                Err("authoritative_size_conflicts_with_intent"),
+                "第 {wrong} 维对不上却没有被判冲突"
+            );
+        }
+        // 没有权威尺寸（老服务）⇒ 三轴意图也不受影响。
+        let mut value_without = value.clone();
+        value_without["result"]
+            .as_object_mut()
+            .unwrap()
+            .remove("authoritative_size");
+        job.size_intent = Some(SizeIntent::Dimensions(DimensionsSizeIntent {
+            mode: SizeIntentMode::Dimensions,
+            millimeters: SizeIntentMillimeters { x: 1.0, y: 2.0, z: 3.0 },
+            source: SizeIntentSource::User,
+        }));
+        assert_eq!(receipt(&value_without, &job), Ok(()));
+    }
+
     fn intent(axis: SizeIntentAxis, meters: f64) -> SizeIntent {
-        SizeIntent {
+        SizeIntent::Axis(AxisSizeIntent {
             axis,
             meters,
             source: SizeIntentSource::User,
-        }
+        })
     }
 
     fn support(axes: &[SizeIntentAxis], min: f64, max: f64, applies: SizeIntentApplies) -> SizeIntentSupport {

@@ -58,6 +58,12 @@ enum ResidentWorldObservation {
         case let .propLayoutChanged(objectID, layoutRevision):
             kind = "prop_layout_changed"
             summary = "物件布局已更新：\(objectID)，布局版本 \(layoutRevision)。请查询物件当前状态和位置，不沿用旧布局。"
+        case let .propDeleted(objectID, displayName, layoutRevision, settled, _):
+            kind = "prop_deleted"
+            // 删除是一等事实：居民必须知道"这件东西**永久**没了"，否则它会照着旧清单
+            // 去找一件已经不存在的物件，并把它读成"丢了"。
+            summary = "物件已永久删除：\(displayName)（\(objectID)），布局版本 \(layoutRevision)，"
+                + "收场方式 \(settled)。它不会再出现在库存里；不要重新生成、也不要继续引用它。"
         case .timeAdvanced, .timeCaughtUp, .agentTransformUpdated, .liveCameraChanged:
             return nil
         }

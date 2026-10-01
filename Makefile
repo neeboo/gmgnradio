@@ -217,6 +217,10 @@ _test-harnesses:
 	swift tools/test-wish-machine-coordinator.swift
 	swift tools/test-wish-machine-app-runtime.swift
 	swift tools/test-resident-prop-placement.swift
+	# 删除一件生成资产：墓碑 + 事实（不是硬删行）、共享内容按**派生**引用计数保留、
+	# 摆放/手持原子收场、判据分层（`.removal` 不跑空间判据）、失败具名、未点名物件逐位不变，
+	# 以及"删干净"三层（记录 + 引用 + 文件）。见 docs/plans/2026-10-02-prop-deletion-semantics.md。
+	swift tools/test-resident-prop-delete.swift
 	swift tools/test-resident-prop-one-judge.swift
 	swift tools/test-resident-prop-tools.swift
 	swift tools/test-resident-prop-capability.swift
@@ -258,6 +262,12 @@ _test-harnesses:
 	# 覆盖层改成吃事件、源码里塞一条抓流路径、白名单开一个后门 —— 每一条都必须红。
 	# 见 docs/plans/2026-10-02-stage-tv-screen.md。
 	swift tools/test-resident-screen-overlay.swift
+	# 电视机**接线**的判据（App 侧唯一构造点 / 覆盖层接上舞台窗口 / 面板装上并可见 /
+	# 覆盖层容器在视图树里 / 三条工具并进 additionalTools）。存在的理由：上面那五条
+	# 是**类型级**的，它们可以全绿而 `WorldScreenStore` 在 App 侧一个构造点都没有 ——
+	# 编译得进、跑不起来。七条注入负对照在 harness 内部删掉/重复接线，每一条都必须红。
+	# 现场演示：`SCREEN_WIRING_INJECT=dropInstallCall swift tools/test-resident-screen-app-wiring.swift`。
+	swift tools/test-resident-screen-app-wiring.swift
 
 test-all: test-install test-worlds test-daemon test-python test-harnesses dedupe
 

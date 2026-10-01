@@ -768,6 +768,11 @@ final class AppDelegate:
     private var interruptionCoordinator: InterruptionCoordinator?
     private var orbWindowController: OrbWindowController?
     private var stageWindowController: StageWindowController?
+    /// 电视机：覆盖层 + 面板 + agent 工具共用的一份接线。
+    ///
+    /// 世界那一侧（读 `objectStates`、持久化）从外面注入，所以这一份不知道
+    /// `WorldSimulation` / 权威的存在 —— 见 `Screen/WorldScreenStore.swift` 的 `Source`。
+    private var screenStore: WorldScreenStore?
     private var liveCamWindowController: LiveCamWindowController?
     private var residentSystemInboxWindowController: ResidentSystemInboxWindowController?
     /// 迟到的旧一轮提示推送不得覆盖新一轮任务列表。
@@ -1160,8 +1165,62 @@ final class AppDelegate:
             },
             showStageWindow: { [weak self] in
                 self?.stageWindowController?.show()
+                self?.installScreenOverlayIfNeeded()
             }
         ).perform()
+    }
+
+    /// 把电视覆盖层接到舞台窗口上。**只接一次**。
+    ///
+    /// 这里刻意不做的事：
+    /// - 不往 `consumesScenePointer` 加任何输入（覆盖层容器 `hitTest` 恒 nil，不吃指针）；
+    /// - 不改渲染管线（画面是 native `WKWebView` 覆盖层，不是 Metal 纹理）；
+    /// - 不改世界状态（读写都经注入的闭包，见 `Source`）。
+    private func installScreenOverlayIfNeeded() {
+        guard screenStore == nil, let controller = stageWindowController,
+              let host = controller.screenOverlayHostView else { return }
+        let overlay = WorldScreenOverlayController(hostView: host)
+        let store = WorldScreenStore(
+            spatialStage: spatialStage,
+            overlay: overlay,
+            source: WorldScreenStore.Source(
+                objectStates: { [weak self] in
+                    self?.livingWorldContext?.state.objectStates ?? [:]
+                },
+                displayName: { [weak self] objectID in
+                    // 显示名的唯一来源与摆画面板一致：生成道具的 displayName，
+                    // 没有就用 objectID（绝不编一个名字）。
+                    self?.livingWorldContext?.state.objectStates[objectID]?
+                        .generatedProp?.displayName ?? objectID
+                },
+                // 持久化：本轮**留空**（见设计文末「没做的部分」）。为 nil 时标定与换片
+                // 只在本会话内生效，面板上照实显示。
+                persistDefinition: nil,
+                persistContent: nil
+            ),
+            projectionProvider: { [weak self] in
+                guard let self else {
+                    return WorldScreenProjection(
+                        camera: WorldScreenCamera(), profile: .fullStage,
+                        viewportSize: SIMD2(1, 1)
+                    )
+                }
+                let size = self.stageWindowController?.screenOverlayHostView?.bounds.size ?? .zero
+                return WorldScreenProjection(
+                    camera: WorldScreenCamera(
+                        position: self.spatialStage.camera.position,
+                        yaw: self.spatialStage.camera.yaw,
+                        pitch: self.spatialStage.camera.pitch
+                    ),
+                    profile: .fullStage,
+                    viewportSize: SIMD2(Float(size.width), Float(size.height))
+                )
+            }
+        )
+        store.startTracking()
+        controller.installScreenPanel(store)
+        controller.setScreenPanelVisible(true)
+        screenStore = store
     }
 
     func showPlayer() {
@@ -3900,6 +3959,79 @@ final class AppDelegate:
                 guard let record = propGenerationStore.jobs.first(where: { $0.id == job.jobID }),
                       let receipt = record.receipt, receipt.state == .completed, let inspection = receipt.result?.inspection,
                       let path = record.localModelPath, job.modelPath == path else { throw ResidentPropHostError.assetUnavailable }
+                // ---- 三轴尺寸 + 板形物件：用**基础几何**造，而不是拿生成器交回来的网格 ----
+                //
+                // 用户给了完整长宽高（真机 2026-10-01「平面电视」`1443 × 862 × 302 mm`）时，
+                // 这件东西的形状是**规格**、不是灵感：一块扁平面板 + 一圈边框 + 一个底座。
+                // 生成器交回来的那个大立方体（参考图贴在各面上）不是"参数没调好"，而是
+                // 这条路本来就该由基础几何走 —— 拼出来的包围盒**天生逐位等于**用户说的三轴，
+                // 而屏幕面就是那块大平面（最大面 ⇒ 屏幕推断必然选中它）。
+                //
+                // 判据用的是**既有那一份**：`WorldScreenFaceInference.rejection`（板形 +
+                // 最大平坦面面积），它吃的正是三轴的米制尺寸 —— 1443 × 862 × 302 ⇒
+                // 最薄/最长 = 302/1443 ≈ 0.21 ≤ 0.25、最大面 1.443 × 0.862 ≈ 1.24 m² ≥ 0.04。
+                // 不是板形（例如一个方块柜子）⇒ 落到下面**今天那条路**：生成网格按最长边
+                // 等比归一，另外两维只作期望值，并且把这件事说给用户（见紧跟着的那一支）。
+                let primitiveTelevision: WorldPrimitiveTelevision? = {
+                    guard let intent = job.sizeIntent, intent.mode == .dimensions,
+                          let millimeters = intent.millimeters,
+                          let spec = WorldPropSizeMillimeters(x: Float(millimeters.x),
+                                                              y: Float(millimeters.y),
+                                                              z: Float(millimeters.z)),
+                          let television = try? WorldPrimitiveTelevision(millimeters: spec)
+                    else { return nil }
+                    let meters = SIMD3<Float>(spec.x / 1000, spec.y / 1000, spec.z / 1000)
+                    return WorldScreenFaceInference.rejection(size: meters, objectID: job.objectID) == nil
+                        ? television : nil
+                }()
+                if let television = primitiveTelevision {
+                    // 资产字节走**同一个内容寻址的住处**：文件名就是字节的 sha256，
+                    // `assetID` 就是 `sha256:<hex>` —— 与生成产物同一种引用形式
+                    // （`WorldPropAssetReferences.blobRefs(of:)` 读的是同一个键），
+                    // 而且同样的字节永远落到同一个路径 ⇒ 重放不写第二遍。
+                    let blobURL = try Self.materializeContentAddressedAsset(television)
+                    let televisionDescriptor = ResidentPropRenderDescriptor(
+                        objectID: job.objectID, worldID: job.worldID,
+                        assetID: television.assetID, modelURL: blobURL,
+                        targetHeightMeters: television.size.y, position: .zero, yaw: 0)
+                    let preparedTelevision = try await spatialStage.prepareResidentProp(televisionDescriptor)
+                    guard self.livingWorldContext === context,
+                          self.spatialStage.selectedWorldID == context.manifest.worldID else { return }
+                    // 渲染端量出来的包围盒必须**逐位**是拼出来的那一份：这是"画面、判据与
+                    // 碰撞盒只有一份尺寸"在现场的机械判据 —— 差一个数就说明这份资产与这份
+                    // 几何不是同一件东西（宁可可见拒绝，也不画一台尺寸不对的电视）。
+                    let measured = preparedTelevision.maximum - preparedTelevision.minimum
+                    guard abs(measured.x - television.size.x) <= 0.002,
+                          abs(measured.y - television.size.y) <= 0.002,
+                          abs(measured.z - television.size.z) <= 0.002 else {
+                        throw ResidentPropHostError.assetUnavailable
+                    }
+                    // 依旧是一件**普通**的生成道具：同一个 `WorldGeneratedProp` 类型、同一条
+                    // 注册路径（下面 `.register(asset.prop)`），摆放/承托/手持/挂点/碰撞盒
+                    // 读到的都是这份 `size`。三轴随 `primitive` 一起落进世界状态 metadata。
+                    let televisionProp = WorldGeneratedProp(
+                        objectID: job.objectID, sourceWishID: job.id.uuidString,
+                        assetID: television.assetID, displayName: job.name,
+                        size: television.size, sourceHeight: television.size.y,
+                        sizeLocked: true, primitive: television.record)
+                    residentOwnedPropAssets[job.objectID] = ResidentOwnedPropAsset(
+                        prop: televisionProp, descriptor: televisionDescriptor)
+                    residentPropNotices.removeValue(forKey: job.objectID)
+                    residentPropAssetFailures.removeValue(forKey: job.objectID)
+                    // 逐位回读走**既有那条**可见通道（`orientationNotices` 在末尾统一发出，
+                    // 是这一轮里最后说话的那一条 ⇒ 不会被下面的"入库成功"冲掉）。
+                    orientationNotices[job.objectID] = "\(job.name)：" + television.dimensionsSummary
+                    continue
+                }
+                if job.sizeIntent?.mode == .dimensions {
+                    // 三轴**但**不是板形物件（或轴读不出来）：**保持今天的行为** ——
+                    // 生成网格、按最长边等比归一，另外两维只作期望值。
+                    // 这件事必须说出来：不说，用户看到的就是"我说了三轴，它却还是随便一个网格"。
+                    orientationNotices[job.objectID] = "\(job.name)：用户给了完整三轴尺寸，但这件"
+                        + "不是板形物件（最薄轴 / 最长轴超过 "
+                        + String(format: "%.2f", WorldScreenResolution.maximumPanelThicknessRatio)
+                        + "）⇒ 仍用生成的网格、按最长边等比归一，另外两维只作期望值。"
+                }
                 let url = URL(fileURLWithPath: path)
                 let hash = inspection.sha256
                 let bytes = inspection.bytes
@@ -4214,6 +4346,41 @@ final class AppDelegate:
         Task { @MainActor [weak self] in await self?.synchronizeOwnedResidentProps() }
     }
 
+    /// 把一段**基础几何**资产的字节落到内容寻址的住处，返回渲染端读得到的 URL。
+    ///
+    /// 住处与生成产物的模型文件是**同一个目录**（`PropTaskDaemonClient` 的 root：
+    /// `Application Support/gmgn radio/TaskService` —— 生成结果里 `local_model_path`
+    /// 就是这里的 `<job.id>.glb`），文件名是字节的 sha256。引用形式也**同一种**：
+    /// `assetID == "sha256:" + sha256(bytes)`，于是 `WorldPropAssetReferences.blobRefs(of:)`
+    /// 对生成产物与基础几何产出的是同一种内容寻址引用，删除那一条线释放的也是同一个键。
+    ///
+    /// **幂等**：同样的字节 ⇒ 同样的路径；已经存在且校验通过就不重写（内容寻址天然如此）。
+    /// 校验失败（文件被改过 / 上次写坏）⇒ 重写一次，绝不把坏字节当成"资产已就位"。
+    ///
+    /// 局限（如实说）：app 侧今天**没有** `world_blob_put` 的调用点（权威客户端只在
+    /// `LivingWorldBootstrap` 里构造，入库这一处够不到它），所以这里做的是"同一个住处、
+    /// 同一种命名、同一种引用形式"，而不是给 `world_blobs` 写一行。要让权威那一张表也
+    /// 认得这份字节，得先把 blob put 接到世界权威客户端上 —— 那是另一条线。
+    private static func materializeContentAddressedAsset(
+        _ television: WorldPrimitiveTelevision
+    ) throws -> URL {
+        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("gmgn radio/TaskService", isDirectory: true)
+        guard television.assetID.hasPrefix("sha256:") else { throw ResidentPropHostError.assetUnavailable }
+        let digest = String(television.assetID.dropFirst("sha256:".count))
+        guard digest.count == 64, digest.allSatisfy({ $0.isHexDigit }) else {
+            throw ResidentPropHostError.assetUnavailable
+        }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let url = root.appendingPathComponent(digest + ".glb")
+        if let existing = try? Data(contentsOf: url),
+           SHA256.hash(data: existing).map({ String(format: "%02x", $0) }).joined() == digest {
+            return url
+        }
+        try television.assetBytes.write(to: url, options: .atomic)
+        return url
+    }
+
     private func prepareResidentPropMutation(_ command: WorldPropLayoutCommand, context: WorldAgentContext) async throws {
         var ids = Set(context.state.objectStates.compactMap { $0.value.isEnabled && $0.value.generatedProp != nil ? $0.key : nil })
         switch command {
@@ -4225,7 +4392,9 @@ final class AppDelegate:
         // `.rebase`（历史存档自愈）不改变"空间里有什么"：位置/朝向/是否摆出/手持状态逐位不变，
         // 所以这里与 `.register` 同列 —— 它不需要额外把哪一件模型再备一次（自愈发生在
         // 那件资产**刚刚准备好**的那一轮里，`spatialStage.isResidentPropPrepared` 已经为真）。
-        case .register, .withdraw, .enableCapability, .resize, .rebase: break
+        // `.delete` 同列：删除**不能**以"资产可用"为前提（坏掉的资产必须删得掉），
+        // 而且它只会把物件移出空间，不引入任何需要预先备好的渲染资源。
+        case .register, .withdraw, .enableCapability, .resize, .rebase, .delete: break
         }
         for id in ids.sorted() {
             guard let asset = residentOwnedPropAssets[id] else { throw ResidentPropHostError.assetUnverified }
@@ -5559,6 +5728,29 @@ final class AppDelegate:
                     try self.recordResidentWishPlacement(grant, placement: placement,
                         worldID: worldID, residentScope: residentScope)
                 }).tools : []
+        // 电视机：三条工具（play_screen / stop_screen / read_screen）。
+        // 与点唱机同一条纪律 —— 只说"放个视频"而没给链接是**信息不足**，
+        // 走成功通道（`insufficient_input`，`isError: false`），不是失败。
+        // 适配层只有下面这一处：把 `WorldScreenToolReply` 折成 `RealtimeDJToolResult`。
+        //
+        // 没有接线（`screenStore == nil`）时是**空数组**：工具不注册，而不是注册一批
+        // 永远失败的工具 —— 那样 agent 会把"没接线"看成"电视坏了"。
+        let screenTools: [ResidentWorldToolSession.AdditionalTool] =
+            screenStore.map { store in
+                ResidentScreenTools(control: store, isCurrent: isCurrent).tools.map { tool in
+                    ResidentWorldToolSession.AdditionalTool(
+                        name: tool.name, description: tool.description,
+                        inputSchema: tool.inputSchema, validate: { _ in true },
+                        handle: { id, arguments in
+                            let reply = await tool.handle(id, arguments)
+                            return RealtimeDJToolResult(
+                                callID: id, resultJSON: reply.payloadJSON,
+                                isError: reply.isError
+                            )
+                        }
+                    )
+                }
+            } ?? []
         // This lease authorizes only registered world, loop and music-library tools for this turn.
         // It does not grant the wider DJ, account, shell or desktop capabilities.
         let dispatcher = WorldAgentToolDispatcher(takeoverEnabled: { true }, context: context,
@@ -5597,7 +5789,7 @@ final class AppDelegate:
                 return completed
             },
             onCancel: { outcome.abort(); visionImages.removeAll() },
-            additionalTools: additionalTools + musicTools.tools + visionTools + wishTools + referenceTools + propTools,
+            additionalTools: additionalTools + musicTools.tools + visionTools + wishTools + referenceTools + propTools + screenTools,
             maximumCalls: AgentConversationService.shared.effectiveBackendID == .dsh ? nil : 32
         )
         return ResidentConversationTools(
@@ -6531,6 +6723,7 @@ final class AppDelegate:
         当前支持面可用 list_placement_surfaces 查询，物件位置为底中心、yaw 为弧度。后台仅可续办 placement_delegation.state 为 pending 的原摆放委托：只摆本次产物、只用允许支持面，并遵守用户指定的精确位置和朝向。领取并用 read_owned_props 核实入库后，查询 layout_revision、预检、调用 apply_prop_placement，直到工具确认。放不下时在委托允许范围内调整；仍放不下就留在库存并说明。placed、revoked 或 failed 的委托不再自动执行。其他移动、收回、手持或撤销仍需本轮人类明确指令。
         resume_wish_continuation 只用于把该任务的**自动续办**（后台自行领取与摆放）重新打开，它不是领取已就绪产物的前置条件。用户本轮明确要求恢复指定许愿时，先调用 resume_wish_continuation（指定 wish_id 并确认恢复），仅在成功回执后说明该许愿授权已恢复；随后需要自主续办时，再调用 update_resident_intent 并设置 resume_paused_intent=true。仅更新居民意图不会恢复许愿授权。普通聊天或后台通知不得恢复暂停任务。已实际摆好的物件无需重复领取或摆放。
         生成物件目前只有外形，没有冲泡或战斗功能。正式领取且最长边不超过 \(ResidentPropAttachmentEligibility.holdableLongestEdgeText)的小道具，可由当前已适配的 2B 角色拿在右手、挂在背后或挂在腰间：hold_prop 的 slot 参数决定挂点（rightHand 拿在手里 / back 挂在背后 / waist 挂在腰间），用户说"挂背后 / 挂腰上 / 拿手里"时选对应项，已经拿在手上的同一件物件换挂点也用它；操作必须依次使用正式工具 hold_prop、adjust_held_prop_grip、return_held_prop，其中微调按需执行。只依据工具回执说明结果（回执里的 held_slot_name 就是它现在挂在哪儿），其他角色或更大物件仍只能摆放。
+        删除一件生成资产用 delete_prop（入参 object_id，理由是可选）。这是**永久删除、没有撤销**：只在本轮人类明确要求删掉某一件时才调用，且先用 read_owned_props 确认是哪一件（回执的 deleted 列出已经删掉的）。不需要先 withdraw_prop 或 return_held_prop —— 正在房间里摆着的、拿在手里的、挂在身上的都会在同一笔提交里先收场再删。只说回执真的说了的话：删除后它出现在 deleted 里、不再出现在 objects 里；回执的 reference_layer 与 file_layer 会说明释放了哪些共享内容、哪些因为还被别的物件引用而**保留**。不要删除用户没有点名的那一件，也不要把"删除"说成"收回"。
         """
     }
 

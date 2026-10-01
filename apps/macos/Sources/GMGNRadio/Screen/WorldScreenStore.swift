@@ -52,11 +52,19 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
     private var contents: [String: WorldScreenContent] = [:]
     /// 刷新时算好、每拍只做一次变换的缓存。避免每帧读世界状态。
     private var placements: [String: (position: SIMD3<Float>, yaw: Float)] = [:]
+    /// 房间遮挡三角面（静态）。只在 `spatialStage.sceneOccluderRevision` 变了时重取。
+    private var occluderTriangles: [WorldScreenTriangle] = []
+    private var occluderTrianglesRevision: UInt64 = .max
+    /// 已摆放物件的遮挡盒（随世界状态刷新，跟着 `rebuild()` 走）。
+    private var occluderPropBoxes: [WorldScreenBox] = []
     private var trackingTask: Task<Void, Never>?
     private var lastTrackingKey = ""
     private var tickCount = 0
     /// 最后一次覆盖层隐藏原因（诊断/面板可读）。
     var hiddenReasons: [String: String] { overlay.hiddenReasons }
+
+    /// 每块屏幕最近一次的**前景遮挡**账（格数 + 耗时）。面板/`read_screen`/诊断读它。
+    var occlusionStats: [String: WorldScreenOcclusionStat] { overlay.occlusionStats }
 
     init(
         spatialStage: SpatialStageStore,
@@ -128,6 +136,8 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
     /// **每一级来源与每一种拒绝都被记下来**，没有静默分支。
     func rebuild() {
         let states = source.objectStates()
+        // 遮挡盒跟着世界状态的刷新节拍（6 Hz）重建 —— 与屏幕几何同一份输入。
+        rebuildOccluderBoxes(from: states)
         var seen: Set<String> = []
         for (objectID, state) in states.sorted(by: { $0.key < $1.key }) where state.isEnabled {
             let displayName = source.displayName(objectID)
@@ -222,8 +232,67 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
     func updateOverlay(projection: WorldScreenProjection, camera: WorldScreenCamera) {
         let world = worldQuads()
         overlay.update(
-            quads: world.quads, normals: world.normals, projection: projection, camera: camera
+            quads: world.quads, normals: world.normals, projection: projection,
+            camera: camera, occluders: occluders()
         )
+    }
+
+    // MARK: 前景遮挡的输入
+
+    /// 本帧的遮挡物。三份来源，都是**已经在手上的同一份几何**：
+    ///
+    /// 1. **房间**：`spatialStage.sceneOccluderTriangles` —— 渲染器做深度遮挡用的就是这一份
+    ///    （`MarbleSpatialView` 的 GLB depth occluder pass），所以 CPU 判出来的"谁在前面"
+    ///    与画面是同一套几何。它只在 `sceneOccluderRevision` 变了时才重取。
+    /// 2. **物件**：`WorldObjectState.generatedCollisionVolume` 的同一套换算
+    ///    （盒心 `position.y + size.y/2`、半长 `size/2`、绕 Y 的摆放旋转）。
+    ///    跟着 `rebuild()`（6 Hz）走 —— 屏幕几何一轮装修最多变几次，没必要每帧读世界状态。
+    /// 3. **居民**：`spatialStage.avatarPlacement` + `MarblePMXFraming` 的缺省包围盒
+    ///    `±0.5 × 1.7 × ±0.5`（本地单位），乘上摆放 `scale` 就是世界尺寸。
+    ///    这就是"角色站在屏前"那一件 —— 每拍重取（读一个结构体，比读世界状态便宜几个数量级）。
+    private func occluders() -> WorldScreenOccluders {
+        if occluderTrianglesRevision != spatialStage.sceneOccluderRevision {
+            occluderTrianglesRevision = spatialStage.sceneOccluderRevision
+            occluderTriangles = spatialStage.sceneOccluderTriangles.map {
+                WorldScreenTriangle($0.first, $0.second, $0.third)
+            }
+        }
+        var boxes = occluderPropBoxes
+        let avatar = spatialStage.avatarPlacement
+        let scale = avatar.scale.isFinite && avatar.scale > 0 ? avatar.scale : 1
+        boxes.append(
+            WorldScreenBox(
+                center: avatar.position + SIMD3<Float>(0, 0.85 * scale, 0),
+                halfExtents: SIMD3<Float>(0.5 * scale, 0.85 * scale, 0.5 * scale),
+                yaw: avatar.yaw
+            )
+        )
+        return WorldScreenOccluders(
+            triangles: occluderTriangles, boxes: boxes,
+            revision: spatialStage.sceneOccluderRevision
+        )
+    }
+
+    /// 已摆放物件的遮挡盒。与 `WorldObjectState.generatedCollisionVolume` **逐字同式**。
+    private func rebuildOccluderBoxes(from states: [String: WorldObjectState]) {
+        var boxes: [WorldScreenBox] = []
+        for (objectID, state) in states.sorted(by: { $0.key < $1.key }) where state.isEnabled {
+            guard let prop = state.generatedProp else { continue }
+            let size = prop.effectiveSize
+            guard size.x > 0, size.y > 0, size.z > 0 else { continue }
+            let position = state.transform.position
+            boxes.append(
+                WorldScreenBox(
+                    center: SIMD3<Float>(
+                        position.x, position.y + size.y / 2, position.z
+                    ),
+                    halfExtents: SIMD3<Float>(size.x / 2, size.y / 2, size.z / 2),
+                    yaw: WorldPropAnchorRegistry.yaw(of: state.transform.rotation),
+                    owner: objectID
+                )
+            )
+        }
+        occluderPropBoxes = boxes
     }
 
     /// 只有一帧的机会（世界刚加载/刚装修完）也要贴上。
@@ -248,6 +317,7 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
     private func makeSnapshots() -> [WorldScreenSnapshot] {
         var ids = Set(definitions.keys)
         ids.formUnion(issues.keys)
+        let stats = overlay.occlusionStats
         return ids.sorted().map { objectID in
             let definition = definitions[objectID]
             let surface = overlay.surfaces[objectID]
@@ -263,7 +333,8 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
                 geometryIssue: issues[objectID],
                 contentURL: contents[objectID]?.url ?? surface?.requestedURL,
                 stateText: stateText,
-                isPlaying: surface?.state.isPlaying ?? false
+                isPlaying: surface?.state.isPlaying ?? false,
+                occlusionText: stats[objectID]?.displayText
             )
         }
     }

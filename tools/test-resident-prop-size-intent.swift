@@ -69,6 +69,13 @@ guard sourceContains("Presence/PropTaskDaemonClient.swift",
 guard sourceContains("Agent/ResidentWishMachineTools.swift",
     ["WishMachineContract", "func sizeIntentVerdict", "enum SizeIntentVerdict", "needsInput", "resolveDraft"],
     "许愿工具没有把参数收敛到唯一真相（WishMachineContract）与结构化信息不足上") else { exit(1) }
+// 三轴形状必须在工具面与只读契约上都能说出来（否则用户给的 1443 x 862 x 302 mm 又会丢两维）。
+guard sourceContains("Agent/ResidentWishMachineTools.swift",
+    ["PropSizeIntent.dimensionsModeValue", "\"millimeters\"", "sizeIntentSource"],
+    "提交工具没有暴露三轴形状（mode=dimensions + millimeters）") else { exit(1) }
+guard sourceContains("Agent/WishMachineContract.swift",
+    ["dimensionEdges", "min_millimeters", "dimensionOrderNote"],
+    "只读契约没有公布三轴形状与轴序（x 宽 / y 高 / z 深）") else { exit(1) }
 // 生成入库：意图优先于自动推断，而且落进世界状态的那一份尺寸就是按它算的。
 guard sourceContains("App/GMGNRadioApp.swift",
     ["WorldPropSizePolicy.intended(", "sizeIntent: sizeIntent"],
@@ -277,6 +284,13 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
   check(properties["size_intent"] != nil, "提交工具的 schema 必须带尺寸意图参数")
   check(intentProperties["axis"] != nil && intentProperties["meters"] != nil,
       "尺寸意图必须说得出轴与米数")
+  // 三轴形状必须在 schema 里：用户给「1443 x 862 x 302 mm」时 agent 要有地方**照实填**，
+  // 否则它只能挑一根轴上报，另外两维就地丢掉（真机那台电视就是这么变成大立方体的）。
+  check(intentProperties["mode"] != nil && intentProperties["millimeters"] != nil,
+      "尺寸意图必须说得出**完整三维**（mode + millimeters）")
+  let millimetersSchema = intentProperties["millimeters"] as? [String: Any] ?? [:]
+  check(Set(millimetersSchema["required"] as? [String] ?? []) == ["x", "y", "z"],
+      "三根轴必须都是必需的（缺一维不许有默认值，实测 \(String(describing: millimetersSchema["required"]))）")
   let requiredArguments = Set(schema["required"] as? [String] ?? [])
   check(requiredArguments == ["attachment_id", "name"],
       "尺寸是二选一，不能把旧字段列成必需（实测 \(requiredArguments.sorted())）")
@@ -441,6 +455,18 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
       ("米数越界", base.merging(["size_intent": ["axis": "longest", "meters": 9] as [String: Any]]) { _, new in new }, "0.01—3"),
       ("出处是猜的", base.merging(["size_intent": ["axis": "longest", "meters": 1.1, "source": "default"] as [String: Any]]) { _, new in new }, "先问"),
       ("尺寸给了两遍", base.merging(["height_meters": 1.1, "size_intent": ["axis": "height", "meters": 1.1] as [String: Any]]) { _, new in new }, "只能给一个"),
+      ("三轴与一根轴同时给",
+       base.merging(["size_intent": ["mode": "dimensions",
+           "millimeters": ["x": 1443, "y": 862, "z": 302] as [String: Any],
+           "axis": "longest", "meters": 1.443] as [String: Any]]) { _, new in new }, "只能给一种"),
+      ("三轴缺一维",
+       base.merging(["size_intent": ["mode": "dimensions",
+           "millimeters": ["x": 1443, "y": 862] as [String: Any]] as [String: Any]]) { _, new in new }, "三个键"),
+      ("三轴越界",
+       base.merging(["size_intent": ["mode": "dimensions",
+           "millimeters": ["x": 1443, "y": 862, "z": 9000] as [String: Any]] as [String: Any]]) { _, new in new }, "10—3000"),
+      ("三轴缺 mode",
+       base.merging(["size_intent": ["millimeters": ["x": 1443, "y": 862, "z": 302] as [String: Any]] as [String: Any]]) { _, new in new }, "mode"),
   ]
   for (label, args, needle) in malformed {
       let result = await submitTool().handle("invalid-" + label, arguments(args))
@@ -511,6 +537,70 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
   check(legacyJob.sizeIntent == nil, "旧调用不产生意图（尺寸推断与今天逐位相同）")
   check(legacyJob.sizeIntentLine == nil, "旧调用的任务行不许因为本契约多出一行")
 
+  // ── 三轴（真机那台「平面电视」）：用户给了 1443 x 862 x 302 mm ⇒ **照实填三轴** ──
+  // 旧契约只有"一根轴 + 一个米数"，agent 只能挑一根上报、另外两维没有位置 ⇒
+  // 生成器交回一个大立方体。这一条钉的就是"三根轴都要能进来、都要能读回"。
+  try freshGrant()
+  let televisionTool = submitTool()
+  let television: [String: Any] = ["attachment_id": attachment.id.uuidString, "name": "平面电视",
+      "size_intent": ["mode": "dimensions",
+                      "millimeters": ["x": 1443, "y": 862, "z": 302] as [String: Any],
+                      "source": "user"] as [String: Any]]
+  check(televisionTool.validate(television), "三轴意图必须放行（不许被结构校验拦成 invalid_arguments）")
+  let televisionResult = await televisionTool.handle("television", arguments(television))
+  let televisionPayload = parse(televisionResult)
+  check(!televisionResult.isError, "三轴意图必须受理（实测 \(televisionPayload)）")
+  try await until("电视的提交落到替身") { readSubmits(scratch).count == baseline + 4 }
+  let televisionWire = submitRow(baseline + 3)
+  // 这一份 fixture 记的是 **taskd** 收到的参数：守护进程要拿到**完整三轴**才存得下来。
+  // （"三轴意图从不转发给远端生成服务"是 taskd 内部的事，由 Rust
+  // `SizeIntentSupport::accepts` 那条判据钉住：远端严格拒绝未知键。）
+  let televisionWireIntent = televisionWire["sizeIntent"] as? [String: Any] ?? [:]
+  let televisionWireMM = televisionWireIntent["millimeters"] as? [String: Any] ?? [:]
+  check(televisionWireIntent["mode"] as? String == "dimensions"
+      && televisionWireMM["x"] as? Double == 1443
+      && televisionWireMM["y"] as? Double == 862
+      && televisionWireMM["z"] as? Double == 302,
+      "三轴意图必须**原话**上到守护进程（三个数一位不差，实测 \(televisionWireIntent)）")
+  check(televisionWireIntent["axis"] == nil && televisionWireIntent["meters"] == nil,
+      "三轴形状不许同时带 axis/meters（两种形状只能给一种，实测 \(televisionWireIntent.keys.sorted())）")
+  check(televisionWire["heightMeters"] as? Double == 0.862,
+      "生成请求的数字必须是三轴的 y（高）= 0.862（实测 \(String(describing: televisionWire["heightMeters"]))）")
+  // 三根轴**都**落进了任务：一根都不能丢。
+  let televisionJob = coordinator.residentJobs(worldID: world, residentScope: resident)
+      .first { $0.name == "平面电视" }!
+  check(televisionJob.sizeIntent?.mode == .dimensions, "任务上必须记得这是三轴形状")
+  check(televisionJob.sizeIntent?.millimeters?.x == 1443
+      && televisionJob.sizeIntent?.millimeters?.y == 862
+      && televisionJob.sizeIntent?.millimeters?.z == 302,
+      "三根轴必须原话落库（实测 \(String(describing: televisionJob.sizeIntent?.millimeters))）")
+  check(televisionJob.sizeIntent?.heightMetersForSubmission == 0.862, "提交高度必须取三轴的 y")
+  check(televisionJob.sizeIntentLine?.contains("1443 × 862 × 302") == true,
+      "任务行必须原话回读三个毫米数（实测 \(String(describing: televisionJob.sizeIntentLine))）")
+  // 工具回执也要能逐位核对（面板与 agent 转述读的就是它）。
+  let televisionReadback = televisionPayload["size_intent"] as? [String: Any] ?? [:]
+  let televisionReadbackMM = televisionReadback["millimeters"] as? [String: Any] ?? [:]
+  check(televisionReadback["mode"] as? String == "dimensions"
+      && televisionReadbackMM["x"] as? Double == 1443
+      && televisionReadbackMM["y"] as? Double == 862
+      && televisionReadbackMM["z"] as? Double == 302,
+      "工具回执必须回读三根轴（实测 \(televisionReadback)）")
+  check(televisionPayload["size_intent_forwarding"] as? String == "three_axis_never_forwarded_height_only",
+      "回执必须说清三轴意图没有发给远端（实测 \(String(describing: televisionPayload["size_intent_forwarding"]))）")
+  // 三轴的 y 与 height_meters 是同一件事：两者**同时给**就说不清是哪一份
+  // （守护进程侧同一个语义的码是 `size_intent_conflict`）。
+  try freshGrant()
+  let conflictBefore = readSubmits(scratch).count
+  let conflictResult = await submitTool().handle("television-conflict", arguments(
+      base.merging(["height_meters": 0.862,
+          "size_intent": ["mode": "dimensions",
+                          "millimeters": ["x": 1443, "y": 862, "z": 302] as [String: Any]] as [String: Any]]) { _, new in new }))
+  check(conflictResult.isError
+      && (parse(conflictResult)["message"] as? String)?.contains("只能给一个") == true,
+      "三轴意图与 height_meters 同时给必须具名拒绝（实测 \(parse(conflictResult))）")
+  try await Task.sleep(for: .milliseconds(200))
+  check(readSubmits(scratch).count == conflictBefore, "冲突时一个提交都不许发出去")
+
   // ── 意图回读：守护进程 job JSON → app 记录（面板与回执读同一份） ───────────
   await store.refreshSnapshot()
   let swordRecord = store.jobs.first { $0.id == swordJob.id }
@@ -519,6 +609,12 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
   check(swordRecord?.heightMeters == 1.1, "记录里的 height_meters 与意图同源")
   let legacyRecord = store.jobs.first { $0.id == legacyJob.id }
   check(legacyRecord?.sizeIntent == nil, "旧任务的记录里没有意图（是 nil，不是补一个按高度的意图）")
+  let televisionRecord = store.jobs.first { $0.id == televisionJob.id }
+  check(televisionRecord?.sizeIntent?.millimeters?.x == 1443
+      && televisionRecord?.sizeIntent?.millimeters?.y == 862
+      && televisionRecord?.sizeIntent?.millimeters?.z == 302,
+      "守护进程回显的三轴必须能解回 app（实测 \(String(describing: televisionRecord?.sizeIntent))）")
+  check(televisionRecord?.heightMeters == 0.862, "记录里的 height_meters 就是三轴的 y")
 
   finish()
  }

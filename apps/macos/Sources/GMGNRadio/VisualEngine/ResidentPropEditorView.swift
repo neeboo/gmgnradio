@@ -15,6 +15,8 @@ struct ResidentPropEditorView: View {
     /// 每拖动一格提交一次既贵又会让滑块和存档互相打架）。
     @State private var sizeDraft: Double = 0
     @State private var sizeDraftObjectID: String?
+    /// 「永久删除」的确认态（面板上那一次点击只把它置真，真正提交在确认之后）。
+    @State private var confirmingDelete = false
     var body: some View {
         ScrollView {
         VStack(alignment: .leading, spacing: 14) {
@@ -95,6 +97,16 @@ struct ResidentPropEditorView: View {
                     Text("移动指针选择落点，左键放下；右键旋转 45°（R / ⇧R / , / . 同）；Esc 放回")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
+                // 「删除」是**永久**的，所以它必须问一次。放在这里（而不是塞进那一排小按钮）
+                // 是为了让它读起来就是"不可逆"，而不是"又一个操作"。
+                HStack(spacing: 8) {
+                    Button(role: .destructive) { confirmingDelete = true } label: {
+                        Label("删除", systemImage: "trash")
+                    }
+                    .disabled(state.isSaving)
+                    .help("永久删除这一件生成资产：不可恢复。正在摆放或拿在手里的会先收场再删。")
+                    Spacer()
+                }.controlSize(.small)
                 sizeControl
             }
             // 图例：用户连着两轮问"这两个红色的是什么意思" —— 缺的不是原因，是**画面没有图例**。
@@ -142,6 +154,18 @@ struct ResidentPropEditorView: View {
         .shadow(color: .black.opacity(0.25), radius: 12, y: 3)
         .onExitCommand { state.escape() }
         .disabled(state.isSaving)
+        // 永久删除必须**问一次**：文案里说清它是什么、以及"正在摆放/在手里"会怎么收场，
+        // 确认按钮自己也写着「永久删除」（不是含糊的"确定"）。
+        .confirmationDialog(
+            "永久删除「\(state.selectedObject?.generatedProp?.displayName ?? "这一件")」？",
+            isPresented: $confirmingDelete, titleVisibility: .visible
+        ) {
+            Button("永久删除", role: .destructive) { Task { await state.deleteSelected() } }
+            Button("取消", role: .cancel) { }
+        } message: {
+            Text("删除不可恢复。它不会再出现在「我的物件」里；如果它正摆在房间里或拿在居民手里，"
+                 + "会在同一次操作里先收回/放回再删掉。还被别的物件引用的共享内容会保留。")
+        }
     }
     /// 挂点：手里 / 背后 / 腰间。
     ///

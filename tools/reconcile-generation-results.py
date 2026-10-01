@@ -174,10 +174,13 @@ def read_authority_objects(db_path: Path) -> dict[str, dict[str, dict]] | None:
     "还在不在"只由这一张表回答：`state.json` 降级成**只读前像**，只用于一次性导入
     与回滚，任何界面都不再读它。
 
-    返回 `{world_id: {objectID: {"tombstone": bool, "revision": int}}}`；
+    返回 `{world_id: {objectID: {"tombstone": bool, "revision": int, "value": dict|None}}}`；
     **读不到**（缺库/缺表/缺列/坏库）返回 `None` —— 那是"这一侧没有数据"，
     与"这一侧有数据但没有这一条"是两件事，绝不能混成同一个答案（前者 WARN，
     后者 FAIL）。只读打开，从不写入。
+
+    `value` 是那一行的记录值（墓碑行**保留**它的值 —— 这是"删了还能证明删干净"
+    的前提：被删物件引用过哪些内容，只有从它的冻结值里读得出来）。
     """
     if not db_path.exists():
         return None
@@ -194,7 +197,7 @@ def read_authority_objects(db_path: Path) -> dict[str, dict[str, dict]] | None:
         for row in connection.execute("SELECT DISTINCT world_id FROM world_records").fetchall():
             authority.setdefault(str(row["world_id"]), {})
         rows = connection.execute(
-            "SELECT world_id, key, revision, tombstone FROM world_records WHERE domain = ?",
+            "SELECT world_id, key, revision, tombstone, value FROM world_records WHERE domain = ?",
             ("objects",),
         ).fetchall()
     except sqlite3.Error:
@@ -202,9 +205,14 @@ def read_authority_objects(db_path: Path) -> dict[str, dict[str, dict]] | None:
     finally:
         connection.close()
     for row in rows:
+        try:
+            value = json.loads(row["value"]) if row["value"] is not None else None
+        except (TypeError, ValueError):
+            value = None
         authority.setdefault(str(row["world_id"]), {})[str(row["key"])] = {
             "tombstone": bool(row["tombstone"]),
             "revision": int(row["revision"]),
+            "value": value if isinstance(value, dict) else None,
         }
     return authority
 
@@ -310,6 +318,163 @@ def read_authority_states(db_path: Path) -> list[tuple[Path, dict]] | None:
     return merged
 
 
+def read_authority_removals(db_path: Path) -> dict[str, dict[str, dict]] | None:
+    """权威侧的**删除事实** —— `world_facts` 里 `kind='object.removed'` 的行。
+
+    为什么对账器必须读它，而不是只看 `tombstone=1`：墓碑只说明"这条记录被标掉了"，
+    说明不了**是谁、为什么**标的。这两种形状今天都存在，而且必须分得开：
+
+      * 有 `object.removed` 事实的墓碑 = **有意删除**（用户/agent 走了 `delete_prop`）：
+        这是设计内的结果，**不是**丢失；
+      * 没有事实的墓碑 = **无法解释的丢失**：没有任何一条命令认领过这次删除，
+        对账器必须 FAIL（这才是"墓碑当丢失"真正该报的那一半）。
+
+    返回 `{world_id: {objectID: {"facts": [factID...], "revision": int}}}`；
+    读不到（缺表/坏库）返回 `None` —— 与 `read_authority_objects` 同一条纪律：
+    "这一侧没有数据"与"这一侧有数据但没有这一条"是两件事。只读打开，从不写入。
+    """
+    if not db_path.exists():
+        return None
+    try:
+        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            "SELECT world_id, id, subject_key, revision FROM world_facts WHERE kind = ?",
+            ("object.removed",),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
+    removals: dict[str, dict[str, dict]] = {}
+    for row in rows:
+        world_id = str(row["world_id"])
+        object_id = str(row["subject_key"])
+        entry = removals.setdefault(world_id, {}).setdefault(
+            object_id, {"facts": [], "revision": int(row["revision"])}
+        )
+        entry["facts"].append(str(row["id"]))
+        entry["revision"] = max(entry["revision"], int(row["revision"]))
+    for world in removals.values():
+        for entry in world.values():
+            entry["facts"].sort()
+    return removals
+
+
+#: 被删物件引用过的内容：与 Swift `WorldPropAssetReferences.blobRefs(of:)` **同一口径**
+#: （`assetID` 的 sha256 后缀 + 碰撞代理 `collision.sha256`）。两处算法必须逐字同源，
+#: 否则"引用计数"会变成第二套事实 —— 那正是这份对账要防的东西。
+def prop_blob_refs(value: object) -> list[str]:
+    if not isinstance(value, dict):
+        return []
+    metadata = value.get("metadata")
+    if not isinstance(metadata, dict):
+        return []
+    raw = metadata.get(PROP_METADATA_KEY)
+    if not isinstance(raw, str):
+        return []
+    try:
+        prop = json.loads(raw)
+    except ValueError:
+        return []
+    if not isinstance(prop, dict):
+        return []
+    refs: set[str] = set()
+    asset = prop.get("assetID")
+    if isinstance(asset, str):
+        digest = canonical_hash(asset.split(":")[-1])
+        if digest:
+            refs.add(digest)
+    collision = prop.get("collision")
+    if isinstance(collision, dict):
+        digest = canonical_hash(collision.get("sha256"))
+        if digest:
+            refs.add(digest)
+    return sorted(refs)
+
+
+def live_blob_reference_counts(states: list[tuple[Path, dict]]) -> dict[str, list[str]]:
+    """**派生**引用计数：内容哈希 → 还引用它的活物件（"worldID/objectID"，字典序）。
+
+    与 Swift `WorldPropAssetReferences.referenceCounts(in:)` 同一件事：计数只知道
+    "今天还有谁引用它"，权威 `world_blobs` 里**没有** refcount 列（刻意的）。
+    墓碑不算引用（被删掉的东西不再让一份字节保持存活）。
+    """
+    counts: dict[str, list[str]] = {}
+    for _, state in states:
+        world_id = state.get("worldID")
+        objects = state.get("objectStates")
+        if not isinstance(objects, dict):
+            continue
+        for object_id, value in objects.items():
+            for digest in prop_blob_refs(value):
+                counts.setdefault(digest, []).append(f"{world_id}/{object_id}")
+    for holders in counts.values():
+        holders.sort()
+    return counts
+
+
+def removal_proofs(removals: dict[str, dict[str, dict]] | None,
+                   authority: dict[str, dict[str, dict]] | None,
+                   live_counts: dict[str, list[str]],
+                   files_by_hash: dict[str, list[Path]]) -> list[dict]:
+    """「删了要能证明删干净」：**记录 + 引用 + 文件**三层，逐件给结论。
+
+    * **记录层**：权威里那一行必须是墓碑（`tombstone=1`）**且**有 `object.removed` 事实；
+      只有墓碑没有事实 ⇒ FAIL（无法解释的丢失），有事实没有墓碑 ⇒ FAIL（记录没落）。
+    * **引用层**：被删物件引用过的每一份内容，今天还被谁引用（活物件里数出来）。
+    * **文件层**：计数 > 0 ⇒ 那份内容**必须还在磁盘上**（共享文件被误删 ⇒ FAIL）；
+      计数 = 0 ⇒ 已经不在是 OK（已回收），还在只是 WARN（可回收但没回收，不是缺陷）。
+    """
+    proofs: list[dict] = []
+    if removals is None:
+        return proofs
+    for world_id, objects in sorted(removals.items()):
+        for object_id, entry in sorted(objects.items()):
+            row = (authority or {}).get(world_id, {}).get(object_id)
+            tombstoned = bool(row and row.get("tombstone"))
+            refs = prop_blob_refs(row.get("value")) if row else []
+            checks: list[dict] = []
+            if not tombstoned:
+                checks.append({"level": FAIL, "code": "removed_without_tombstone",
+                               "detail": f"{world_id}/{object_id} 有 object.removed 事实"
+                                         f"（{entry['facts'][0]}），但权威那一行不是墓碑 —— "
+                                         f"删除只记了事实、记录没落"})
+            else:
+                checks.append({"level": OK, "code": "removal_recorded",
+                               "detail": f"{world_id}/{object_id}: 墓碑 + "
+                                         f"{len(entry['facts'])} 条 object.removed 事实"})
+            for digest in refs:
+                holders = live_counts.get(digest, [])
+                if holders:
+                    present = bool(files_by_hash.get(digest))
+                    if present:
+                        checks.append({"level": OK, "code": "shared_blob_retained",
+                                       "detail": f"{digest[:12]}… 仍被 {len(holders)} 件活物件引用，"
+                                                 f"文件保留：{'、'.join(holders)}"})
+                    else:
+                        checks.append({"level": FAIL, "code": "shared_blob_file_missing",
+                                       "detail": f"{digest[:12]}… 仍被 {len(holders)} 件活物件引用"
+                                                 f"（{'、'.join(holders)}），但磁盘上已经没有这份内容 —— "
+                                                 f"共享文件被误删"})
+                else:
+                    present = bool(files_by_hash.get(digest))
+                    # 「字节还在、计数已归零」不是缺陷，是**信息**：回收动作归存储拥有者，
+                    # 这里只如实报出它现在还在。所以这一条是 OK，不是 WARN ——
+                    # WARN 在本对账器里只有一个含义："这一项这一轮查不了"。
+                    checks.append({"level": OK,
+                                   "code": "blob_reclaimable" if present else "blob_reclaimed",
+                                   "detail": f"{digest[:12]}… 引用计数已归零"
+                                             + ("，但字节还在（可回收，回收归存储拥有者）"
+                                                if present else "，字节已不在")})
+            proofs.append({"worldID": world_id, "objectID": object_id,
+                           "facts": entry["facts"], "blobRefs": refs, "checks": checks})
+    return proofs
+
+
 def scan_files(roots: list[Path], recursive: bool = False) -> dict[str, list[Path]]:
     """来源 4：磁盘文件，按**实际内容**哈希归桶（不是按文件名）。
 
@@ -357,6 +522,7 @@ def reconcile(root: Path, world_base: Path, wishes_path: Path,
     # "悄悄拿前像当权威"正是这次事故的形状。
     authority = read_authority_objects(db_path)
     authority_states = read_authority_states(db_path)
+    removals = read_authority_removals(db_path)
     world_checks: list[dict] = []
     if authority_states is None:
         world_checks.append({
@@ -368,6 +534,9 @@ def reconcile(root: Path, world_base: Path, wishes_path: Path,
         state_sources = world_states
     else:
         state_sources = authority_states
+    # 「删了要能证明删干净」要的三样输入：删除事实（记录层）、活引用计数（引用层）、
+    # 按内容哈希归桶的磁盘文件（文件层）。引用计数在这里**派生**，权威里没有这一列。
+    live_counts = live_blob_reference_counts(authority_states or world_states)
     # 私根是扁平的（产物 + 输入图 + DB + socket）；额外目录要递归
     # （`ResidentAttachments/` 等直接放 PNG）。
     files_by_hash = scan_files([root])
@@ -507,15 +676,37 @@ def reconcile(root: Path, world_base: Path, wishes_path: Path,
                     claimed_receipt = True
 
         # ---- B-1 缺陷抓手：声明的入库 ⇔ 权威里存在该条目 ----
+        #
+        # 但「有意删除」**不是**这条缺陷：`stage=claimed` 的产物被用户/agent 永久删除之后，
+        # 它理所当然不在库存里。判据是**有没有一条删除事实认领它**（`object.removed`），
+        # 而不是"库里有几行" —— 否则每一次正常删除都会变成一条永久假警报，
+        # 而假警报会把真的那条淹掉（同一个文件头里的"永久假警报"教训）。
         declares_claimed = stage == "claimed"
+        removal_facts: list[str] = []
+        tombstoned_in_authority = False
+        if object_id and authority:
+            for world_id, objects in authority.items():
+                row = objects.get(object_id)
+                if row and row.get("tombstone"):
+                    tombstoned_in_authority = True
+                    removal_facts = (removals or {}).get(world_id, {}).get(object_id, {}).get("facts", [])
+                    break
         if declares_claimed:
             if in_inventory is True and claimed_receipt:
                 note(OK, "claimed_consistent", "stage=claimed 且库存里有它、且 claimed 回执在")
+            elif tombstoned_in_authority and removal_facts:
+                # 有意删除：**不看 claimed 回执**。回执是"当初领取过"的历史事实，
+                # 删除之后它当然还在 —— 拿它当"没删"的证据正是把墓碑当丢失的形状。
+                note(OK, "intentionally_removed",
+                     f"stage=claimed 的产物已被**有意删除**（墓碑 + {len(removal_facts)} 条 "
+                     f"object.removed 事实），不是丢失")
             else:
                 note(FAIL, "claimed_but_not_in_inventory",
                      f"stage=claimed 但"
                      f"{'世界状态里没有该 objectID' if in_inventory is not True else ''}"
-                     f"{'；layoutReceipts 里没有 claimed.' + artifact_id if not claimed_receipt else ''}")
+                     f"{'；layoutReceipts 里没有 claimed.' + artifact_id if not claimed_receipt else ''}"
+                     + (f"；权威里它是墓碑但**没有任何删除事实**（无法解释的丢失）"
+                        if tombstoned_in_authority and not removal_facts else ""))
 
         receipts.append({
             "artifactID": artifact_id,
@@ -559,11 +750,24 @@ def reconcile(root: Path, world_base: Path, wishes_path: Path,
                 if item["status"] == "world_absent":
                     continue
                 if item["status"] == "tombstoned":
-                    world_checks.append({
-                        "level": FAIL, "code": "preimage_object_tombstoned_in_authority",
-                        "detail": f"{item['objectID']} 在只读前像 {item['state']} 里，"
-                                  f"权威里却是墓碑（tombstone=1）—— 权威把它删了，前像不知道",
-                    })
+                    # 墓碑**不等于**丢失：有 `object.removed` 事实的墓碑是**有意删除**
+                    # （用户/agent 走了 `delete_prop`）—— 前像本来就该"不知道"，
+                    # 因为它冻结在导入那一刻。没有事实的墓碑才是无法解释的那一半。
+                    facts = (removals or {}).get(world_id, {}).get(item["objectID"], {}).get("facts", [])
+                    if facts:
+                        world_checks.append({
+                            "level": OK, "code": "preimage_object_removed_intentionally",
+                            "detail": f"{item['objectID']} 已被有意删除：权威墓碑 + "
+                                      f"{len(facts)} 条 object.removed 事实（只读前像停在导入那一刻，"
+                                      f"它当然还写着这一件）",
+                        })
+                    else:
+                        world_checks.append({
+                            "level": FAIL, "code": "preimage_object_tombstoned_in_authority",
+                            "detail": f"{item['objectID']} 在只读前像 {item['state']} 里，"
+                                      f"权威里却是墓碑（tombstone=1）而**没有任何删除事实** —— "
+                                      f"这不是一次有意删除，是丢失",
+                        })
                 else:
                     world_checks.append({
                         "level": FAIL, "code": "preimage_object_missing_from_authority",
@@ -576,6 +780,17 @@ def reconcile(root: Path, world_base: Path, wishes_path: Path,
                 "level": OK, "code": "preimage_objects_all_in_authority",
                 "detail": "只读前像里声明的每一件物件，权威里都有一条对应记录",
             })
+
+    # ---- 「删了要能证明删干净」：记录 + 引用 + 文件三层 ----
+    # 三层缺一不可，而且**各自独立可 FAIL**：
+    #   记录层（有事实的墓碑 ≠ 丢失）、引用层（谁还在引用，从活物件**派生**）、
+    #   文件层（计数 > 0 的内容必须还在磁盘上，计数归零才谈得上回收）。
+    # 这就是"删除"与"丢失"的分界：有事实认领 + 引用数对得上 + 该留的文件都在。
+    removal_proof_list: list[dict] = []
+    if removals is not None:
+        removal_proof_list = removal_proofs(removals, authority, live_counts, files_by_hash)
+        for proof in removal_proof_list:
+            world_checks.extend(proof["checks"])
 
     # ---- 孤立文件：磁盘上有，但没有任何一条产物事实认领它 ----
     # 注意**只对私根判孤立**：`ResidentAttachments/` 里是用户上传的原件，
@@ -648,6 +863,7 @@ def reconcile(root: Path, world_base: Path, wishes_path: Path,
         },
         "artifacts": receipts,
         "worldChecks": world_checks,
+        "removalProofs": removal_proof_list,
         "orphanFiles": orphans,
         "duplicateContents": duplicates,
         "authorizationsNeverSubmitted": never_submitted,
@@ -657,6 +873,7 @@ def reconcile(root: Path, world_base: Path, wishes_path: Path,
             "warn": warns,
             "orphans": len(orphans),
             "duplicateGroups": len(duplicates),
+            "removals": len(removal_proof_list),
             "leftoverGroups": sum(1 for item in duplicates if item["kind"] == "leftover"),
             "crossDirGroups": sum(1 for item in duplicates if item["kind"] != "leftover"),
             "wastedBytes": sum(item["wastedBytes"] for item in duplicates),
@@ -672,13 +889,19 @@ def reconcile(root: Path, world_base: Path, wishes_path: Path,
 def _selftest_fixture(base: Path, *, stage: str, in_inventory: bool,
                       claimed_receipt: bool, write_model: bool,
                       model_hash_matches: bool, asset_id_from_input: bool,
-                      authority: str = "mirrors") -> tuple[Path, Path, Path]:
+                      authority: str = "mirrors", removal: str = "none") -> tuple[Path, Path, Path]:
     """造一份最小四方数据。只写在 `base`（临时目录）里。
 
     `authority` 控制权威侧（`world_records`）长什么样，用来给"前像里有、权威里没有"
     这一条造反例：`mirrors`（逐件镜像前像）/ `missing_object`（有这个世界，缺那一件）/
     `tombstoned`（有那一行但是墓碑）/ `missing_world`（整个世界一行都没有）/
     `no_table`（权威库没有 `world_records` 表 ⇒ 应报 WARN 而不是通过）。
+
+    `removal` 控制**删除那一层**长什么样（`world_facts` 里的 `object.removed`）：
+    `none`（没有删除）/ `recorded`（墓碑 + 一条事实 ⇒ 有意删除，**不许** FAIL）/
+    `tombstone_without_fact`（墓碑但没有事实 ⇒ 无法解释的丢失，必须 FAIL）/
+    `fact_without_tombstone`（有事实但那一行不是墓碑 ⇒ 必须 FAIL）/
+    `shared_file_deleted`（有意删除，但同内容还被另一件活物件引用、文件却没了 ⇒ 必须 FAIL）。
     """
     root = base / "TaskService"
     worlds = base / "LivingWorld"
@@ -740,11 +963,14 @@ def _selftest_fixture(base: Path, *, stage: str, in_inventory: bool,
     }), encoding="utf-8")
 
     state = {"worldID": "world", "objectStates": {}, "layoutReceipts": {}}
+    # 那一件物件的**记录值**：不论它这次在不在前像里，删除那一层都需要它
+    # （墓碑保留冻结值 —— 释放了哪些内容引用只能从那里读）。
+    asset_suffix = image_hash if asset_id_from_input else model_hash
+    object_entry = {"isEnabled": True, "metadata": {
+        PROP_METADATA_KEY: json.dumps({"objectID": object_id, "assetID": f"sha256:{asset_suffix}"})
+    }}
     if in_inventory:
-        asset_suffix = image_hash if asset_id_from_input else model_hash
-        state["objectStates"][object_id] = {"isEnabled": True, "metadata": {
-            PROP_METADATA_KEY: json.dumps({"objectID": object_id, "assetID": f"sha256:{asset_suffix}"})
-        }}
+        state["objectStates"][object_id] = object_entry
     if claimed_receipt:
         state["layoutReceipts"][f"claimed.{artifact}"] = {"register": {"_0": {"objectID": object_id}}}
     (worlds / "pkg" / "1.0.0" / "state.json").write_text(json.dumps(state), encoding="utf-8")
@@ -764,6 +990,47 @@ def _selftest_fixture(base: Path, *, stage: str, in_inventory: bool,
                     ("world", "objects", object_id, 1, 0, "swift",
                      1 if authority == "tombstoned" else 0, "h",
                      json.dumps(state["objectStates"][object_id])))
+            connection.commit()
+        finally:
+            connection.close()
+
+    if removal != "none":
+        # 删除那一层的取数：`world_facts(domain='objects', kind='object.removed')`
+        # 与**墓碑行**（它保留被删物件的冻结值 —— 释放了哪些内容引用只能从那里读）。
+        connection = sqlite3.connect(root / "tasks.sqlite3")
+        try:
+            connection.execute("""CREATE TABLE world_facts (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT, world_id TEXT NOT NULL, id TEXT NOT NULL,
+                kind TEXT NOT NULL, subject_domain TEXT NOT NULL, subject_key TEXT NOT NULL,
+                revision INTEGER NOT NULL, payload TEXT NOT NULL, producer TEXT NOT NULL,
+                at_ms INTEGER NOT NULL, UNIQUE (world_id, id))""")
+            frozen = object_entry
+            # 被有意删除的那一件：那一行是墓碑（值保留）。用 REPLACE：上面那块可能已经
+            # 为了别的反例插过同一行（同一个 (world_id, domain, key) 是主键）。
+            connection.execute(
+                "INSERT OR REPLACE INTO world_records(world_id,domain,key,revision,updated_at_ms,"
+                "updated_by,tombstone,hash,value) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("world", "objects", object_id, 2, 0, "swift",
+                 0 if removal == "fact_without_tombstone" else 1, "h", json.dumps(frozen)))
+            if removal != "tombstone_without_fact":
+                connection.execute(
+                    "INSERT INTO world_facts(world_id,id,kind,subject_domain,subject_key,"
+                    "revision,payload,producer,at_ms) VALUES(?,?,?,?,?,?,?,?,?)",
+                    ("world", f"object:object.removed:{object_id}:2", "object.removed", "objects",
+                     object_id, 2, json.dumps({"objectID": object_id, "revision": 2}),
+                     "swift", 0))
+            if removal == "shared_file_deleted":
+                # **共享内容**：另一件活物件引用同一个 sha256（它的 assetID 就是同一个哈希）。
+                # 文件层要判的正是"计数 > 0 的内容必须还在" —— 这里把文件删掉。
+                model_path.unlink(missing_ok=True)
+                connection.execute(
+                    "INSERT INTO world_records(world_id,domain,key,revision,updated_at_ms,"
+                    "updated_by,tombstone,hash,value) VALUES(?,?,?,?,?,?,?,?,?)",
+                    ("world", "objects", "wish-prop-sharing-the-same-bytes", 1, 0, "swift", 0, "h",
+                     json.dumps({"isEnabled": True, "metadata": {
+                         PROP_METADATA_KEY: json.dumps({
+                             "objectID": "wish-prop-sharing-the-same-bytes",
+                             "assetID": f"sha256:{model_hash}"})}})))
             connection.commit()
         finally:
             connection.close()
@@ -815,6 +1082,29 @@ def self_test() -> int:
                                       write_model=True, model_hash_matches=True,
                                       asset_id_from_input=False, authority="no_table"),
          "authority_unreadable"),
+        # ---- 删除：墓碑**不是**丢失，但没有事实的墓碑是 ----
+        # 「有意删除」必须**没有任何 FAIL**（这正是"对账器不把墓碑当丢失"那条断言：
+        # 把这条判据退回去，它就是红的）。
+        ("removal_recorded", dict(stage="claimed", in_inventory=True, claimed_receipt=True,
+                                  write_model=True, model_hash_matches=True,
+                                  asset_id_from_input=False, authority="tombstoned",
+                                  removal="recorded"), None),
+        ("removal_tombstone_without_fact",
+         dict(stage="claimed", in_inventory=True, claimed_receipt=True, write_model=True,
+              model_hash_matches=True, asset_id_from_input=False, authority="mirrors",
+              removal="tombstone_without_fact"),
+         "preimage_object_tombstoned_in_authority"),
+        ("removal_fact_without_tombstone",
+         dict(stage="claimed", in_inventory=True, claimed_receipt=True, write_model=True,
+              model_hash_matches=True, asset_id_from_input=False, authority="mirrors",
+              removal="fact_without_tombstone"),
+         "removed_without_tombstone"),
+        # 共享内容还被别的活物件引用，文件却没了 ⇒ 文件层必须 FAIL。
+        ("removal_shared_file_deleted",
+         dict(stage="claimed", in_inventory=True, claimed_receipt=True, write_model=True,
+              model_hash_matches=True, asset_id_from_input=False, authority="tombstoned",
+              removal="shared_file_deleted"),
+         "shared_blob_file_missing"),
     ]
 
     failures = 0
@@ -889,6 +1179,13 @@ def render(report: dict, quiet: bool) -> None:
             print(f"  [{check['level']}] {check['code']}: {check['detail']}")
         print()
 
+    if report.get("removalProofs"):
+        print(f"删除证明（记录 + 引用 + 文件三层）：{len(report['removalProofs'])} 件")
+        for proof in report["removalProofs"]:
+            print(f"  {proof['worldID']}/{proof['objectID']}  "
+                  f"事实={len(proof['facts'])}  释放的内容引用={len(proof['blobRefs'])}")
+        print()
+
     if report["orphanFiles"]:
         print(f"孤立文件（磁盘上有、没有事实认领）：{len(report['orphanFiles'])}")
         for item in report["orphanFiles"]:
@@ -916,6 +1213,7 @@ def render(report: dict, quiet: bool) -> None:
     print(f"结论：artifact={summary['artifacts']}  "
           f"FAIL={summary['fail']}  WARN={summary['warn']}  "
           f"孤立={summary['orphans']}  重复组={summary['duplicateGroups']}  "
+          f"删除证明={summary.get('removals', 0)}  "
           f"（leftover={summary['leftoverGroups']} / cross-dir={summary['crossDirGroups']}）  "
           f"私根内浪费={summary['wastedBytes']} B")
     print("-" * 78)

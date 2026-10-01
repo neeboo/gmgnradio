@@ -140,6 +140,14 @@ struct ScreenPanelView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            // 前景遮挡的账：**看得见**才能被复核（"角色站在屏前"时这一行会从
+            // "全部可见"变成"挡了 N/M 格"）。
+            if let occlusionText = snapshot.occlusionText {
+                Text(occlusionText)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if calibratingObjectID == snapshot.objectID {
                 calibrationFields(snapshot)
             }
