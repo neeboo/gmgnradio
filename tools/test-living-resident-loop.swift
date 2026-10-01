@@ -57,9 +57,12 @@ let loopMethods = ["private func ensureResidentLoop(", "private func synchronize
                    // test-first-use-guidance 专测，这里必须编译同一份真实实现，
                    // 才能证明它不会盖掉真实失败状态。
                    "private func refreshResidentBackendGuidance(",
-                   "private struct ResidentMemoryTurnSlot", "private func registerResidentMemoryTurn(",
-                   "private func presentResidentReply(", "private func confirmResidentMemoryTurn(",
-                   "private static func residentMemoryObservedAt(",
+                   // 原文层已整体移除（2026-10-01）：原先这里还要抽编
+                   // `ResidentMemoryTurnSlot` / `registerResidentMemoryTurn` /
+                   // `confirmResidentMemoryTurn` / `residentMemoryObservedAt`。
+                   // 那四个生产声明已随 `memory_ingest` 一起删除，所以抽取列表
+                   // 也必须去掉它们 —— 抽取式宿主**不能**靠写死桩来假装它们还在。
+                   "private func presentResidentReply(",
                    "private func performResidentTurn(",
                    "private func returnHeldPropBeforeResidentStop(reason: String) -> Bool",
                    "private func stopResidentLoop(reason: String, userIntent: Bool = false) -> Bool",
@@ -313,14 +316,11 @@ typealias RealConversationService = AgentConversationService
     // service; the method itself is compiled unchanged, UI/TTS are inert sinks.
     enum AgentConversationService { static var shared: RealConversationService! }
     private var liveCamMessageID: UUID?
-    private var residentTurnSourceByRunID: [UUID: ResidentMemorySource] = [:]
-    private var residentMemoryTurnSlot: ResidentMemoryTurnSlot?
-    // Memory transport remains unbound. Record the real service's confirmation
-    // results instead of pretending that an external durable write succeeded.
-    var memoryDeliveryResults: [AgentConversationMemoryDeliveryResult] = []
-    private func presentResidentMemoryDeliveryFailure(_ result: AgentConversationMemoryDeliveryResult) {
-        memoryDeliveryResults.append(result)
-    }
+    // 原文层已移除：原先这里还桩着 `residentTurnSourceByRunID` /
+    // `residentMemoryTurnSlot` / `presentResidentMemoryDeliveryFailure` 与
+    // `memoryDeliveryResults`。生产里那一整条链（登记交付凭据 → 显示/语音完成后
+    // 确认 → `memory_ingest`）已经删掉，所以这里不再有可桩的东西：
+    // "记忆写没写" 这个观测点在生产里已经不存在了。
     private var residentAgentLoop: ResidentAgentLoop?
     // 「未确认送达」界面提示的生命周期策略：生产在 GMGNRadioApp 里就是
     // `private var residentUnconfirmedNotice = ResidentUnconfirmedNoticePolicy()`，
@@ -537,12 +537,9 @@ func jsonEqual(_ lhs: Any, _ rhs: Any) -> Bool {
             check(app.liveCamWindowController?.waiting == false, "\(mode): request always ends waiting bubble")
             check(app.liveCamWindowController?.replies == (mode == "finish" ? ["formal reply"] : []),
                   "\(mode): only current world receives formal reply")
-            check(app.memoryDeliveryResults.isEmpty, "\(mode): starting speech alone cannot confirm memory delivery")
             app.agentSpeechAnnouncer.complete(.finished)
             check(app.agentSpeechAnnouncer.spoken == (mode == "finish" ? ["formal reply"] : []),
                   "\(mode): only current successfully delivered reply reaches speech")
-            check(app.memoryDeliveryResults.isEmpty,
-                  "\(mode): unbound memory has no delivery receipt and never claims confirmation")
         }
         // Use the shipping manifest and actual WorldAgentContext, with only the
         // external CLI process mocked. No real backend or saved world is read.

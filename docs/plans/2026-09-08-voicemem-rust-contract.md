@@ -1,6 +1,41 @@
 # VoiceMem Rust 记忆快照 IPC 合同（Rust 后台 ↔ Swift 接线，冻结）
 
-冻结日期：2026-09-08。本文件是「VoiceMem 选择性 Rust 移植」新增记忆方法的唯一合同来源
+> ## ⚠️ 已移除：原文层（2026-10-01）
+>
+> 本文件原先冻结的**原文层**——`memory_turn`（§3.5）、`memory_pending`（§3.6）、
+> `memory_ingest`、易失 pending turns（§2.3）与「commit-after-durability」里
+> "清空已覆盖 pending"那一半（§2.4）——**已整体删除**。下面各节保留原文以便追溯，
+> 但**不再是有效合同**；读到它们时请以本节为准。
+>
+> **移除的理由（实测，不是推测）**：
+> 1. **真机 `pendingTurns` 恒为 0**：2026-10-01 14:18:59 对正在运行的 daemon 做只读
+>    `memory_recall` 探针（scope = 生产库里 `resident_states` 那条 `resident/plan`
+>    的真实 `worldID`/`residentScope`），返回
+>    `pendingTurns=0` / `revision=0` / `vectorGeneration=0` / `facts,notes` 空——四重一致。
+> 2. **三张记忆表 0 行**：`memory_snapshots` / `memory_requests` / `memory_vec_rows` 实测全为 0。
+> 3. **`memory_compact` 从未有实现**：本文件 §3.7 冻结了它，但 `daemon.rs` 与 Swift 侧
+>    grep 均为 0，连 dispatch 分支都不存在。
+> 4. **唯一生产用途恒空转**：原文层唯一被读的地方是 `memory_recall` 的
+>    `freshSession` 恢复段；`pendingTurns=0` 时那一段**恒为空**。
+> 5. **独立强化证据**：同一 scope、同一 transport、同一 `.state_commit` 通路写出的
+>    `resident/plan` 记录 revision 已达 **158** ⇒ 通路是通的，唯独这条没有活数据。
+>
+> **结论**：保留它的价值为零（死代码 + 死合同），而"留着等实现接手"的理由
+> **不成立**——因为从来就没有过数据可接手。
+>
+> **现在调用这三个方法会得到专门错误码 `memory_original_text_layer_removed`**
+> （不是 `unknown_method`：老客户端仍会调用它们，而"回合原文没能进记忆"必须是一个
+> **说得出口的失败**；也**不是**"接受后丢弃"，静默成功正是要消灭的形状）。
+>
+> **保留不动的是压缩层**：`memory_status`（§3.2，`pendingTurns` 恒为 0）、
+> `memory_read`（§3.3）、`memory_query`（§3.4）、`memory_recall`（§3.7 之外的增补）、
+> `memory_compact`（§3.7）与 §2.1 的快照形状、§2.2 双段语义、§2.5 原子一致性、
+> 三张表与 sqlite-vec 账本结构。
+>
+> **设计出处**：`docs/plans/2026-10-02-memory-and-generation-results-in-rust.md`
+> （P-A1/P-A2）。原文层的保留/折叠策略从此不再需要——因为不再有原文。
+
+冻结日期：2026-09-08（原文层于 2026-10-01 移除，见上）。本文件是「VoiceMem 选择性 Rust 移植」新增记忆方法的唯一合同来源
 （additive IPC），与 `docs/plans/2026-09-07-rust-taskd-contract.md`、
 `docs/plans/2026-09-08-resident-storage-contract.md`、`docs/plans/2026-09-08-voicemem-rust-port.md`
 并行使用。实现范围只在 `services/gmgn-taskd/**`；Swift 接线由后续 DSH 任务按本文件执行。

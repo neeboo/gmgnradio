@@ -189,6 +189,11 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
   func parse(_ result: RealtimeDJToolResult) -> [String: Any] {
       (try? JSONSerialization.jsonObject(with: result.resultJSON)) as? [String: Any] ?? [:]
   }
+  // 下标越界不许把整份 harness 崩掉：崩在 finish() 之前，累积的 FAIL 一条都印不出来。
+  func submitRow(_ index: Int) -> [String: Any] {
+      let rows = readSubmits(scratch)
+      return index >= 0 && index < rows.count ? rows[index] : [:]
+  }
   func arguments(_ object: [String: Any]) -> Data { try! JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) }
 
   let scratch = URL(fileURLWithPath: "/tmp/gmgn-size-intent-" + UUID().uuidString)
@@ -294,7 +299,11 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
   check((askPayload["missing"] as? [[String: Any]])?.first?["field"] as? String == "size_intent.axis",
       "missing[].field 必须与 schema 路径逐字一致")
   check(readSubmits(scratch).isEmpty, "信息不足时一个提交都不许发出去（实测 \(readSubmits(scratch).count) 条）")
-  let pendingID = askPayload["pending_id"] as! String
+  // 拿不到 pending_id 时**报 FAIL 退出**，而不是崩在 force-unwrap 上：
+  // 崩溃点看不出是哪一条契约坏了，而这条正是"信息不足必须能续办"的那一条。
+  guard let pendingID = askPayload["pending_id"] as? String else {
+      print("FAIL: 信息不足回执没有可用的 pending_id，无法续办（实测 \(askPayload)）"); exit(1)
+  }
 
   // 轴不明确（给了米数没给轴）同样是信息不足，而且**不填默认轴**。
   try freshGrant()
@@ -305,7 +314,9 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
   check((axisPayload["needs"] as? [String]) == ["size_axis"],
       "缺轴必须说缺轴（实测 \(String(describing: axisPayload["needs"]))）")
   check(readSubmits(scratch).isEmpty, "缺轴时一个提交都不许发出去")
-  let axisPendingID = axisPayload["pending_id"] as! String
+  guard let axisPendingID = axisPayload["pending_id"] as? String else {
+      print("FAIL: 缺轴的答复没有可用的 pending_id（实测 \(axisPayload)）"); exit(1)
+  }
 
   // ── 断言 4：用户回答后**续上同一次委托**（幂等、不重复生成、不消耗新授权）────
   // 回答发生在**新的一轮**：宿主会开一份新授权。续办必须用草稿里的**原**授权与原
@@ -336,11 +347,12 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
   check(resumeAuthorization["request_id"] as? String == "needs-size",
       "必须复用**原来**那次工具调用的编号（实测 \(String(describing: resumeAuthorization["request_id"]))）")
   let resumedJobs = coordinator.residentJobs(worldID: world, residentScope: resident)
-  check(resumedJobs.count == 1 && resumedJobs[0].authorizationID == firstAuthority,
-      "只许有**一件**产物，而且挂在原授权上（实测 \(resumedJobs.map(\.authorizationID))）")
+  check(resumedJobs.count == 1, "续办之后本空间只许有**一件**产物（实测 \(resumedJobs.count) 件）")
+  check(resumedJobs.first?.authorizationID == firstAuthority,
+      "产物必须挂在**原来**那一份授权上（实测 \(String(describing: resumedJobs.first?.authorizationID))）")
   check(!resumedJobs.contains { $0.authorizationID == answerAuthority },
       "回答那一轮的新授权**不许**被消耗")
-  check(resumedJobs[0].requestID == "needs-size", "任务的 requestID 必须是原委托那一个")
+  check(resumedJobs.first?.requestID == "needs-size", "任务的 requestID 必须是原委托那一个")
 
   // 幂等：同一次委托再调一次（新的 callID，同一个 pending_id）⇒ 回同一个任务，不新建。
   let repeatResult = await resumeTool.handle("needs-size-answer-again", arguments(resumeArgs))
@@ -441,7 +453,7 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
   let swordResult = await swordTool.handle("sword", arguments(sword))
   check(!swordResult.isError, "最长边意图必须受理（实测 \(parse(swordResult))）")
   try await until("剑的提交落到替身") { readSubmits(scratch).count == baseline + 1 }
-  let swordWire = readSubmits(scratch)[baseline]
+  let swordWire = submitRow(baseline)
   let swordIntent = swordWire["sizeIntent"] as? [String: Any] ?? [:]
   check(swordWire["heightMeters"] as? Double == 1.1,
       "生成请求的数字必须与用户说的一致（实测 \(String(describing: swordWire["heightMeters"]))）")
@@ -463,7 +475,7 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
   let machineResult = await machineTool.handle("machine", arguments(machine))
   check(!machineResult.isError, "高度意图必须受理（实测 \(parse(machineResult))）")
   try await until("咖啡机的提交落到替身") { readSubmits(scratch).count == baseline + 2 }
-  let machineWire = readSubmits(scratch)[baseline + 1]
+  let machineWire = submitRow(baseline + 1)
   let machineIntent = machineWire["sizeIntent"] as? [String: Any] ?? [:]
   check(machineWire["heightMeters"] as? Double == 0.35 && machineIntent["axis"] as? String == "height",
       "按高度的意图：height_meters 与 meters 必须是同一个数（实测 \(String(describing: machineWire["heightMeters"])) / \(machineIntent)）")
@@ -477,7 +489,7 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
   let legacyResult = await legacyTool.handle("legacy", arguments(legacy))
   check(!legacyResult.isError, "旧调用必须受理（实测 \(parse(legacyResult))）")
   try await until("旧调用落到替身") { readSubmits(scratch).count == baseline + 3 }
-  let legacyWire = readSubmits(scratch)[baseline + 2]
+  let legacyWire = submitRow(baseline + 2)
   check(!legacyWire.keys.contains("sizeIntent"),
       "没有意图时线上不许出现 sizeIntent 这个键（逐字节兼容，实测 \(legacyWire.keys.sorted())）")
   check(legacyWire["heightMeters"] as? Double == 0.42, "旧调用的 height_meters 必须原样保留")

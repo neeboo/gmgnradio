@@ -196,3 +196,58 @@ backups/world-state-migration/20261001T061021Z/rollback.sh --confirm
   （`id/scope/domain/key/revision/updatedAt/updatedBy/tombstone/hash/value`），但 `gmgn-mcpd` 未建。
 - **动作域（P3）/ 世界事实（P5）/ 任务与许愿（P4）**：按设计分阶段，本次只做世界与物件。
 - **事件驱动的渲染收敛**：见 §7 最后一条。
+
+---
+
+## 10. 验证结果（本次实际跑出来的）
+
+```sh
+$ make build 2>&1 | grep -E "error:|BUILD SUCCEEDED"
+** BUILD SUCCEEDED **
+
+$ cargo test --locked --manifest-path services/gmgn-taskd/Cargo.toml | tail -3
+test result: ok. 115 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+$ swift test --package-path apps/macos/Packages/WorldRuntime | tail -3
+✔ Test run with 211 tests in 0 suites passed after 161.569 seconds.
+```
+
+`make test-harnesses` 本机**被另一条实现线打断**，不是世界状态的红：
+
+```
+swift tools/test-living-resident-loop.swift
+main/test-living-resident-loop.swift:9: Fatal error: Missing private struct ResidentMemoryTurnSlot
+make[1]: *** [_test-harnesses] Trace/BPT trap: 5
+make: *** [test-harnesses] Error 2          # PASS=18 FAIL=0，后面的 harness 根本没跑
+```
+
+同一份 Makefile 列表里**除它以外**的 38 条逐条跑（`tools/test-world-authority-single-writer.swift`
+与 `tools/test-world-authority-projection.swift` 都在内）：
+
+```
+harnesses run: 38  OK: 37  FAILED: 1
+failed: ['tools/test-wish-machine-coordinator.swift']
+        └ error: input file '.../Agent/ResidentWishMachineTools.swift' was modified during the build
+          （许愿机那条线正在改它，编译期被打断，不是断言失败）
+```
+
+两条非绿都不是本迁移：
+
+| 现象 | 归属 | 证据 |
+| --- | --- | --- |
+| `test-harnesses` 中止 | memory-and-generation-results 线 | 崩溃发生在 `test-living-resident-loop.swift`（他们 15:19 刚改过），`Fatal error: Missing private struct ResidentMemoryTurnSlot` |
+| `test-wish-machine-coordinator` FAILED | 许愿机 MCP/skill 线 | `ResidentWishMachineTools.swift` 在编译期间被改（swiftc 拒绝） |
+| `test-living-cabin-state-upgrade` FAIL | 许愿机线 | 把**只有我那处** `LivingCabinVersion12Persistence` 的 edit 回退后，它**照样**以同一句话 FAIL（`FAIL: new machine comes from current manifest while old object state survives`）⇒ 与本迁移无关；这条 harness 不在 Makefile 列表里 |
+| WorldRuntime 首轮 1 issue | 机器负载（4 条线同时在编译） | 失败断言是 `evaluateElapsed < .seconds(20)`，实测 20.57 s；机器静下来重跑 **211 tests passed** |
+
+## 11. 一件必须说明的事
+
+本迁移的改动**已经被另一条实现线提交进 git**（commit `fb1a2ce`，
+`feat: give the world an authority and the artifacts a content-addressed home`，作者 neeboo）。
+我自己**没有**运行任何写 git 的命令（只用过 `status`/`log`/`diff`/`show` 这类只读命令）。
+该提交把本迁移的文件一并收进去了：`services/gmgn-taskd/src/{world.rs,cli.rs}`、
+`Cargo.toml`、`daemon.rs`、`main.rs`、`store.rs`、
+`Presence/{WorldAuthorityClient.swift,AuthorityWorldStatePersistence.swift}`、
+`App/LivingWorldBootstrap.swift`、`tools/world-migration/**`、
+`tools/test-world-authority-projection.swift`、以及本文档。
+`world.rs` 后来还被 review 那条线加了若干测试（总量 115 个 cargo 测试全绿）。

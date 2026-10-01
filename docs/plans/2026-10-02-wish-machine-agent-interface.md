@@ -158,3 +158,31 @@
 能力探测**不**做实时 `provider_probe`（那要打网络到 DGX，且属另一条线）——本轮
 `capability.readable` 恒为 `false`，这正是"读不到 ⇒ 不当成支持"的诚实实现，接上探测只需替换
 注入的那个闭包。
+
+---
+
+## 8. 实测（2026-10-02，落盘内容 `fb1a2ce` 的文件状态）
+
+门禁：
+
+```
+make build           → ** BUILD SUCCEEDED **   （error: 0 条）
+swift tools/test-resident-agent-loop.swift        → PASS: 274 resident loop checks, 0 failures
+swift tools/test-wish-machine-coordinator.swift   → PASS: 203 wish machine coordinator checks
+swift tools/test-resident-prop-size-intent.swift  → PASS: 73 size-intent checks
+make test-harnesses  → EXIT=0 PASS=77 FAIL=0
+```
+
+四条断言都用**注入法**实测过能抓缺陷（注入 → FAIL → 还原 → PASS，注入标记已全部清除）：
+
+| 断言 | 注入 | FAIL 原话 |
+| --- | --- | --- |
+| 尺寸缺失 ⇒ 结构化信息不足、不发提交、不填默认值 | `sizeIntentVerdict` 里把"没说尺寸"改成 `.ok(heightMeters: 0.5, intent: nil)`（落一个默认值） | `FAIL: 信息不足回执没有可用的 pending_id，无法续办（实测 ["auto_continuation_paused": 0, "wish_id": 39D22B73-…, "accepted": 1, "authorization": {…source = "this_turn";}, "object_id": wish-prop-785e448f-…, "size_intent_forwarding": legacy_height_only, … "size_intent": {summary = "未声明尺寸意图：按生成请求高度自动推断"}…]）` |
+| 参数只有一处定义 | ①工具 schema 的 axis 描述里塞回 `axis=longest / axis=height` | `FAIL: 工具 schema/文案里**又**存了一份尺寸参数 ["axis=longest", "axis=height"]：参数只允许在 WishMachineContract 一处` |
+| 同上（提示词那一半） | ②系统提示里塞回 `axis=longest / axis=height，0.01—3 米` | `FAIL: 系统提示里**又**存了一份尺寸参数 ["axis=longest", "axis=height", "0.01"]：参数只允许在 WishMachineContract 一处` |
+| 能力读不到 ⇒ 当作不支持 | `capabilityPayload(.unreadable)` 改成 `readable: true` + `axes: axes.map(\.id)` | `FAIL: 能力读不到时只读接口必须明确 readable=false、axes=[]（读不到 ≠ 支持，实测 ["max_meters": <null>, "min_meters": <null>, "axes": <__NSArrayI 0xbfd01c6a0>(…` |
+| 续上同一次委托（幂等、不重复生成、不消耗新授权） | 续办改用**用户回答那一轮**新开的授权与新的 callID 提交 | `FAIL: 续办之后本空间只许有**一件**产物（实测 0 件）` / `FAIL: 产物必须挂在**原来**那一份授权上（实测 nil）` / `FAIL: 回答那一轮的新授权**不许**被消耗` / `FAIL: 任务的 requestID 必须是原委托那一个` / `FAIL: 重复续办必须标成幂等重放` |
+
+顺带修掉一个 harness 自身的缺陷：注入后 `resumedJobs[0]` / `readSubmits(scratch)[baseline]`
+会先崩在下标越界上，而 `check` 的 FAIL 是**攒到 finish() 才打印**的 ⇒ 一条 FAIL 都看不到。
+已加 `submitRow()` 与 `guard let pendingID`，让缺陷以可读 FAIL 出现（check 数 72 → 73）。

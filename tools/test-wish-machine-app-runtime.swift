@@ -368,8 +368,9 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
         while residentWishMessageRefreshRunning { await Task.yield() }
     }
     func evidence(_ job: WishMachineJob) -> WishMachineClaimEvidence? { wishMachineClaimEvidence(for: job) }
-    /// 生产里的回合记忆登记只走语义记忆服务（本 harness 不覆盖），这里只补签名可编译。
-    func registerResidentMemoryTurn(runID: UUID, realUserText: String?, reply: String) {}
+    // 原文层已整体移除（2026-10-01）：这里原先桩着 `registerResidentMemoryTurn`
+    // 让 harness 能编译。生产里该方法已随 `memory_ingest` 一起删除，所以这个桩
+    // 也必须去掉 —— 留着一个生产里不存在的签名只会掩盖"抽取到的调用点已经没了"。
     func perform(_ input: ResidentAgentLoop.Input) async throws -> String { try await performResidentTurn(input) }
     /// 生产里作用域在 ensureResidentLoop()/回合入口绑定；harness 直接绑定一次。
     func bindWishScope() { bindResidentWishScope(currentResidentWorldContext(), loop: residentAgentLoop!) }

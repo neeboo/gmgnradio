@@ -2,12 +2,12 @@ import Foundation
 
 // MARK: - 值类型
 
-/// `memory_turn` / `memory_pending` 的发言方（合同 §2.3/§3.5）。只接受
-/// user/agent；CC 侧保证只投喂真实用户文字与已成功送达的回复。
-enum ResidentMemoryRole: String, Codable, Sendable {
-    case user
-    case agent
-}
+// 原文层已整体移除（2026-10-01，见 `docs/plans/2026-09-08-voicemem-rust-contract.md`
+// 的「已移除」一节）：`ResidentMemoryRole` / `ResidentMemoryPendingTurn` /
+// `ResidentMemoryTurnResult` / `ResidentMemoryIngestResult` / `ResidentMemorySource`
+// 与客户端方法 `memoryTurn` / `memoryPending` / `memoryIngest` 一起删除。
+// 理由是实测的：真机 `pendingTurns` 恒为 0、三张记忆表 0 行、`memory_compact`
+// 从未有 dispatch，原文层唯一的生产用途（`freshSession` 恢复段）恒为空转。
 
 /// 快照条目类别（合同 §2.1）：facts 段 ∈ fact|preference；notes 段 ∈
 /// relationship|experience。读取侧解析遇到白名单外的类别即畸形响应。
@@ -75,25 +75,6 @@ struct ResidentMemorySnapshot: Equatable, Sendable, Codable {
     let sections: ResidentMemorySections
 }
 
-/// `memory_pending` 里的一条易失 turn（合同 §3.6）。只用于拼「本会话尚未入库」
-/// 的即时上下文，禁止缓存为长期记忆。
-struct ResidentMemoryPendingTurn: Equatable, Sendable, Codable {
-    let turnID: String
-    let watermark: UInt64
-    let role: ResidentMemoryRole
-    let text: String
-    let interrupted: Bool
-}
-
-/// `memory_turn` 回复（合同 §3.5）。`accepted` 恒为 true；daemon 侧校验失败
-/// 走错误码，不会返回 accepted:false。
-struct ResidentMemoryTurnResult: Equatable, Sendable, Codable {
-    let accepted: Bool
-    let turnID: String
-    let watermark: UInt64
-    let pendingTurns: UInt64
-}
-
 /// `memory_query` 的一条命中（合同 §3.4）。`distance` 为 cosine 距离（升序），
 /// 只含拼 prompt 用的 text/id 类数据，不作为工具指令。
 struct ResidentMemoryQueryHit: Equatable, Sendable, Codable {
@@ -108,13 +89,6 @@ struct ResidentMemoryQueryHit: Equatable, Sendable, Codable {
 struct ResidentMemoryQueryResult: Equatable, Sendable, Codable {
     let status: ResidentMemoryQueryStatus
     let results: [ResidentMemoryQueryHit]
-}
-
-/// 发言来源（编排合同增补 `memory_ingest`）：`voice` 表示真实语音转写来源，
-/// 只证明来源是语音，不代表完成了声纹/情绪识别；缺省 `text`。
-enum ResidentMemorySource: String, Codable, Sendable {
-    case text
-    case voice
 }
 
 /// 后台整理/编排状态：**只由 `memory_recall` 的 `consolidation` 字段使用**
@@ -143,19 +117,6 @@ struct ResidentMemoryRecallResult: Equatable, Sendable, Codable {
     let facts: [ResidentMemoryQueryHit]
     let notes: [ResidentMemoryQueryHit]
     let context: String
-    let pendingTurns: UInt64
-}
-
-/// `memory_ingest` 回复：`accepted:true` 只代表已交付回合成对进入该 scope 的
-/// 易失缓冲，**绝不代表 durable 落库**——落库由 Rust 侧完成，客户端不得冒充
-/// 长期保存。`replayed:true` 表示同一 `(scope, requestID)` 幂等回放，未重复入队。
-///
-/// 回复**不再带 `consolidation`**：外部 provider 移除后没有语义压缩，daemon 侧
-/// 也不再回报本轮的整理去向（原来缺 provider 时是 `unconfigured`）。客户端若继续
-/// 严格解码该字段，每次投递都会抛 `invalidResponse` 而丢掉整轮记忆。
-struct ResidentMemoryIngestResult: Equatable, Sendable, Codable {
-    let accepted: Bool
-    let replayed: Bool
     let pendingTurns: UInt64
 }
 
@@ -219,31 +180,6 @@ final class ResidentMemoryClient {
         return ResidentMemoryQueryResult(status: status, results: results)
     }
 
-    /// `memory_turn`（合同 §3.5）：把真实用户文字/已送达回复追加进 scope 的
-    /// 易失 pending 缓冲。`interrupted` 只作渲染标记（默认 false，显式携带）。
-    func memoryTurn(scope: ResidentStateScope, role: ResidentMemoryRole, text: String,
-                    interrupted: Bool = false) async throws -> ResidentMemoryTurnResult {
-        var params = scopeParams(scope)
-        params["role"] = .string(role.rawValue)
-        params["text"] = .string(text)
-        params["interrupted"] = .bool(interrupted)
-        let response = try await transport.call(method: "memory_turn", params: params)
-        guard response["accepted"]?.boolValue == true else { throw ResidentStateError.invalidResponse }
-        let turnID = try requireString(response["turnID"])
-        let watermark = try strictUInt64(response["watermark"])
-        let pendingTurns = try strictUInt64(response["pendingTurns"])
-        return ResidentMemoryTurnResult(accepted: true, turnID: turnID,
-                                        watermark: watermark, pendingTurns: pendingTurns)
-    }
-
-    /// `memory_pending`（合同 §3.6）：按 watermark 升序返回该 scope 的易失
-    /// pending turns（daemon 排序，客户端不重排）。只作即时上下文，不代表已持久。
-    func memoryPending(scope: ResidentStateScope) async throws -> [ResidentMemoryPendingTurn] {
-        let response = try await transport.call(method: "memory_pending", params: scopeParams(scope))
-        guard case let .array(items) = response["turns"] else { throw ResidentStateError.invalidResponse }
-        return try items.map(decodePendingTurn)
-    }
-
     /// `memory_recall`（编排合同增补）：一次 embedding、双路检索与 Rust 有界
     /// 融合。`freshSession` 由调用方显式决定（全新会话 true / 原生续聊 false），
     /// 缺省 false；factLimit/noteLimit 缺省 6/4。本方法只严格解码——facts/notes
@@ -272,27 +208,6 @@ final class ResidentMemoryClient {
         return ResidentMemoryRecallResult(status: status, revision: revision,
                                           vectorGeneration: vectorGeneration, facts: facts,
                                           notes: notes, context: context, pendingTurns: pendingTurns)
-    }
-
-    /// `memory_ingest`（编排合同增补）：只接受调用方确认真实交付的成对
-    /// userText/agentReply（宿主 prompt、工具结果、图片、被打断/未播完的回复
-    /// 不得传入）。requestID 幂等；source=text/voice（缺省 text）；observedAt
-    /// 可选、≤32 字符。返回 accepted 只代表进入易失缓冲，不是 durable 落库。
-    func memoryIngest(scope: ResidentStateScope, requestID: String, userText: String,
-                      agentReply: String, source: ResidentMemorySource = .text,
-                      observedAt: String? = nil) async throws -> ResidentMemoryIngestResult {
-        var params = scopeParams(scope)
-        params["requestID"] = .string(requestID)
-        params["userText"] = .string(userText)
-        params["agentReply"] = .string(agentReply)
-        params["source"] = .string(source.rawValue)
-        if let observedAt { params["observedAt"] = .string(observedAt) }
-        let response = try await transport.call(method: "memory_ingest", params: params)
-        guard response["accepted"]?.boolValue == true else { throw ResidentStateError.invalidResponse }
-        let replayed = try requireBool(response["replayed"])
-        let pendingTurns = try strictUInt64(response["pendingTurns"])
-        return ResidentMemoryIngestResult(accepted: true, replayed: replayed,
-                                          pendingTurns: pendingTurns)
     }
 
     // MARK: - 严格解码助手
@@ -378,18 +293,6 @@ final class ResidentMemoryClient {
         let grounding = try optionalString(object["grounding"])
         return ResidentMemoryEntry(id: id, category: category, text: text,
                                    observedAt: observedAt, grounding: grounding)
-    }
-
-    private func decodePendingTurn(_ value: ResidentStateJSON) throws -> ResidentMemoryPendingTurn {
-        let object = try requireObject(value)
-        let turnID = try requireString(object["turnID"])
-        let watermark = try strictUInt64(object["watermark"])
-        let roleRaw = try requireString(object["role"])
-        guard let role = ResidentMemoryRole(rawValue: roleRaw) else { throw ResidentStateError.invalidResponse }
-        let text = try requireString(object["text"])
-        let interrupted = try requireBool(object["interrupted"])
-        return ResidentMemoryPendingTurn(turnID: turnID, watermark: watermark, role: role,
-                                         text: text, interrupted: interrupted)
     }
 
     private func decodeQueryHit(_ value: ResidentStateJSON) throws -> ResidentMemoryQueryHit {

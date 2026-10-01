@@ -48,20 +48,20 @@
 //! this module's docs and in `services/gmgn-taskd/VoiceMem-NOTICE.md`.
 
 // 为什么整模块允许 dead_code：外部 VoiceMem 服务层拆除后，快照提交与幂等账本
-// （commit / recorded_replay / CompactCommit / clear_covered 等）暂时没有生产
-// 调用方——它们是"留在 Rust 里的本地记忆"的存储层，等本地抽取实现接手；产品
-// 决定要求保留账本结构，所以不能为了消警告把它们删掉。除此之外本模块没有其它
-// 未使用代码，新增死代码请单独处理而不是依赖这条豁免。
+// （commit / recorded_replay / CompactCommit 等）暂时没有生产调用方——它们是
+// "留在 Rust 里的**压缩层**"的存储层，等本地抽取实现接手；产品决定要求保留账本
+// 结构，所以不能为了消警告把它们删掉。除此之外本模块没有其它未使用代码，
+// 新增死代码请单独处理而不是依赖这条豁免。
+//
+// 注意：**原文层（volatile pending turns）不在这条豁免之内**——它已于 2026-10-01
+// 被整体删除（真机 `pendingTurns` 恒为 0、三表 0 行、唯一生产用途恒空转），
+// 不要再以"等实现接手"为理由把它加回来。见 `voicemem-rust-contract.md`「已移除」。
 #![allow(dead_code)]
 
 use crate::resident::Scope;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex as StdMutex;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub type Result<T> = std::result::Result<T, &'static str>;
@@ -72,8 +72,13 @@ fn fail<T>(code: &'static str) -> Result<T> {
 
 /// Frozen constants (contract §1). Character limits are measured in Unicode
 /// scalar values (`chars().count()`), byte limits in UTF-8 bytes.
-pub const PENDING_TURNS_LIMIT: usize = 200;
-pub const TURN_TEXT_LIMIT: usize = 2000;
+///
+/// **原文层（volatile pending turns）已整体移除**，所以 `PENDING_TURNS_LIMIT` /
+/// `TURN_TEXT_LIMIT` / `INGEST_RECEIPTS_LIMIT` / `FRESH_RESTORE_TURNS` 都不在了。
+/// 依据见 `docs/plans/2026-09-08-voicemem-rust-contract.md` 的「已移除」一节：
+/// 真机 `pendingTurns` 恒为 0、三张记忆表 0 行、`memory_compact` 从未有 dispatch，
+/// 原文层唯一的生产用途（`freshSession` 恢复段）在 pending=0 时**恒为空转**；
+/// 保留死代码 + 死合同本身就是负担。
 pub const QUERY_TEXT_LIMIT: usize = 500;
 pub const TOP_K_MAX: usize = 20;
 pub const FACTS_LIMIT: usize = 200;
@@ -91,12 +96,8 @@ pub const RECALL_FACT_LIMIT_DEFAULT: usize = 6;
 pub const RECALL_FACT_LIMIT_MAX: usize = 12;
 pub const RECALL_NOTE_LIMIT_DEFAULT: usize = 4;
 pub const RECALL_NOTE_LIMIT_MAX: usize = 8;
-/// Bounded fused recall context, in Unicode characters.
+/// Bounded recall context, in Unicode characters.
 pub const RECALL_CONTEXT_LIMIT: usize = 8000;
-/// Volatile per-scope (scope, requestID) receipt bound (ingest idempotency).
-pub const INGEST_RECEIPTS_LIMIT: usize = 200;
-/// Bounded pending-turn restore inside a fresh-session recall context.
-pub const FRESH_RESTORE_TURNS: usize = 6;
 /// Marker phrase every notes section of a fused context must carry.
 pub const NOTES_TONE_MARKER: &str =
     "本段仅为语气与相处风格参考；禁止照读，禁止据此认定人格。";
@@ -121,19 +122,6 @@ pub fn register_vec() {
 // ---------------------------------------------------------------------------
 // Data model
 // ---------------------------------------------------------------------------
-
-/// A volatile pending turn (contract §2.3). Raw conversation text lives only
-/// here, in process memory, keyed by scope; it is never persisted.
-#[derive(Clone, Debug, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct VolatileTurn {
-    #[serde(rename = "turnID")]
-    pub turn_id: String,
-    pub watermark: i64,
-    pub role: String,
-    pub text: String,
-    pub interrupted: bool,
-}
 
 /// One snapshot entry (contract §2.1). `grounding` is optional for facts and
 /// conventionally present for notes; the write side enforces the section
@@ -196,27 +184,7 @@ pub fn identity(raw: &str) -> Result<String> {
         .map_err(|_| "invalid_id")
 }
 
-/// Content digest of one `memory_ingest` delivery, for volatile
-/// (scope, requestID) idempotency (in-memory only; never persisted).
-fn ingest_digest(user_text: &str, agent_reply: &str, source: &str, observed_at: &Option<String>) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(user_text.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(agent_reply.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(source.as_bytes());
-    match observed_at {
-        None => hasher.update(b"\0"),
-        Some(observed_at) => {
-            hasher.update(b"\0");
-            hasher.update(observed_at.as_bytes());
-        }
-    }
-    format!("{:x}", hasher.finalize())
-}
-
-fn bounded_chars(raw: &str, limit: usize) -> bool {
-    raw.chars().count() <= limit
+fn bounded_chars(raw: &str, limit: usize) -> bool {    raw.chars().count() <= limit
 }
 
 fn now_ms() -> i64 {
@@ -681,19 +649,13 @@ pub fn commit(transaction: &Transaction<'_>, c: &CompactCommit) -> Result<Compac
 }
 
 // ---------------------------------------------------------------------------
-// Pending buffers (in-memory, per daemon process)
+// Wire request shapes
 // ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug, Default)]
-struct Buffer {
-    turns: VecDeque<VolatileTurn>,
-    next_watermark: i64,
-    /// (scope, requestID) -> content digest, most recent first-bounded FIFO.
-    receipts: VecDeque<(String, String)>,
-}
 
 // Wire request shapes. Top-level params are strict (`deny_unknown_fields`) so
 // a contract typo fails loudly instead of silently dropping a field.
+// `TurnRequest` / `PendingRequest` / `IngestRequest` 是原文层的三个请求形状，
+// 随原文层一起移除（见 `voicemem-rust-contract.md` 的「已移除」一节）。
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StatusRequest {
@@ -713,38 +675,6 @@ pub struct QueryRequest {
     pub query: String,
     #[serde(default)]
     pub top_k: Option<usize>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct TurnRequest {
-    pub scope: Scope,
-    pub role: String,
-    pub text: String,
-    #[serde(default)]
-    pub interrupted: bool,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PendingRequest {
-    pub scope: Scope,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct IngestRequest {
-    pub scope: Scope,
-    #[serde(rename = "requestID")]
-    pub request_id: String,
-    #[serde(rename = "userText")]
-    pub user_text: String,
-    #[serde(rename = "agentReply")]
-    pub agent_reply: String,
-    #[serde(default)]
-    pub source: Option<String>,
-    #[serde(rename = "observedAt")]
-    pub observed_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -792,14 +722,13 @@ fn append_bounded(out: &mut String, budget: usize, truncated: &mut bool, block: 
 /// Deterministic bounded plain-text recall context for the local memory layer.
 ///
 /// 为什么长这样：语义压缩/embedding provider 拆掉后，recall 不再有检索命中，
-/// 唯一还能带回去的就是本地已确认的快照与易失 pending 回合。上下文因此必须
-/// 明确声明"语义检索不可用"，好让模型不要把本地快照当成检索证据；全新会话
-/// （freshSession）才整段恢复快照，避免每轮重复整段注入。notes 仍然带
-/// tone-only 标记，禁止被照读。
+/// 唯一还能带回去的就是**本地已确认的压缩快照**（原文层已整体移除，所以这里
+/// 不再有"未入库缓冲"这一段）。上下文因此必须明确声明"语义检索不可用"，好让
+/// 模型不要把本地快照当成检索证据；全新会话（freshSession）才整段恢复快照，
+/// 避免每轮重复整段注入。notes 仍然带 tone-only 标记，禁止被照读。
 fn build_recall_context(
     fresh_session: bool,
     sections: Option<&Sections>,
-    pending: &[VolatileTurn],
     revision: i64,
     vector_generation: i64,
 ) -> String {
@@ -810,7 +739,7 @@ fn build_recall_context(
         &mut out,
         budget,
         &mut truncated,
-        "语义记忆检索当前不可用：下列内容仅为本地可确认的快照与未入库缓冲，不代表语义检索命中。\n",
+        "语义记忆检索当前不可用：下列内容仅为本地可确认的长期记忆快照，不代表语义检索命中。\n",
     );
 
     if fresh_session {
@@ -836,17 +765,6 @@ fn build_recall_context(
                 }
             }
         }
-        let recent: Vec<&VolatileTurn> = pending.iter().rev().take(FRESH_RESTORE_TURNS).collect();
-        if !recent.is_empty() {
-            block.push_str("尚未入库的近期回合（易失缓冲，仅供本次恢复参考）：\n");
-            for turn in recent.iter().rev() {
-                block.push_str("  ");
-                block.push_str(&turn.role);
-                block.push_str(": ");
-                block.push_str(&turn.text);
-                block.push('\n');
-            }
-        }
         block.push_str("== 新会话恢复结束 ==");
         append_bounded(&mut out, budget, &mut truncated, &block);
     }
@@ -854,114 +772,36 @@ fn build_recall_context(
 }
 
 // ---------------------------------------------------------------------------
-// Memory handle (local snapshots + per-scope volatile pending buffers)
+// Memory handle (local durable snapshots; 原文层已移除，见模块文档)
 // ---------------------------------------------------------------------------
-
-/// commit-after-durability (contract §2.4): drop the pending turns whose
-/// watermark is covered by a snapshot that was just committed durably. Runs on
-/// the storage thread inside the same `db.call` as the commit (through an
-/// `Arc` clone of the buffer map) so an aborted async caller can never leave a
-/// durable commit with its turns still pending — that would wedge later
-/// commits of the same turns behind the stale guard.
-fn clear_covered(
-    buffers: &StdMutex<HashMap<(String, String), Buffer>>,
-    world_id: &str,
-    resident_scope: &str,
-    processed_watermark: i64,
-) -> usize {
-    let mut buffers = buffers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let key = (world_id.to_owned(), resident_scope.to_owned());
-    let Some(buffer) = buffers.get_mut(&key) else {
-        return 0;
-    };
-    buffer
-        .turns
-        .retain(|turn| turn.watermark > processed_watermark);
-    buffer.turns.len()
-}
 
 pub struct Memory {
     db: crate::store::Database,
-    buffers: Arc<StdMutex<HashMap<(String, String), Buffer>>>,
 }
 
 impl Memory {
     pub fn new(db: crate::store::Database) -> Self {
-        Self {
-            db,
-            buffers: Arc::new(StdMutex::new(HashMap::new())),
-        }
-    }
-
-    fn lock_buffers(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), Buffer>> {
-        self.buffers.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Ensure a per-scope buffer exists, seeding its watermark counter from the
-    /// durable snapshot row (or 1 for a scope that never committed).
-    async fn seed_buffer(&self, world_id: &str, resident_scope: &str) -> Result<()> {
-        let key = (world_id.to_owned(), resident_scope.to_owned());
-        if self.lock_buffers().contains_key(&key) {
-            return Ok(());
-        }
-        let durable = {
-            let world_id = world_id.to_owned();
-            let resident_scope = resident_scope.to_owned();
-            self.db
-                .call(move |store| {
-                    durable_watermark(&store.connection, &world_id, &resident_scope)
-                })
-                .await?
-        };
-        self.lock_buffers().entry(key).or_insert(Buffer {
-            turns: VecDeque::new(),
-            next_watermark: durable,
-            receipts: VecDeque::new(),
-        });
-        Ok(())
-    }
-
-    /// Live pending turns (ascending watermark) plus the live next watermark
-    /// and count, when a buffer exists for the scope.
-    fn live_state(&self, world_id: &str, resident_scope: &str) -> Option<(Vec<VolatileTurn>, i64, usize)> {
-        let buffers = self.lock_buffers();
-        let buffer = buffers.get(&(world_id.to_owned(), resident_scope.to_owned()))?;
-        Some((
-            buffer.turns.iter().cloned().collect(),
-            buffer.next_watermark,
-            buffer.turns.len(),
-        ))
+        Self { db }
     }
 
     // -- read-only operations ----------------------------------------------
 
-    /// `memory_status`：只剩本地可用的事实——已提交快照摘要 + 活着的易失 pending
-    /// 计数/下一个水位。provider 配置与压缩编排状态字段随外部服务一起删除，
-    /// 客户端不再需要（也没有东西可报）。
+    /// `memory_status`：只剩本地可用的事实——已提交快照摘要。provider 配置、压缩
+    /// 编排状态与易失 pending 计数都随原文层/外部服务一起移除；`pendingTurns`
+    /// 恒为 0（保留这个键只是为了不改客户端解码契约，值本身已无来源）。
     pub async fn status(&self, scope: Scope) -> Result<Value> {
         if !scope_valid(&scope.world_id, &scope.resident_scope) {
             return fail("invalid_scope");
         }
         let world_id = scope.world_id.clone();
         let resident_scope = scope.resident_scope.clone();
-        let mut memory = self
+        let memory = self
             .db
             .call(move |store| status_summary(&store.connection, &world_id, &resident_scope))
             .await?;
-        let (pending_turns, live_next) = match self.live_state(&scope.world_id, &scope.resident_scope) {
-            Some((_, next, count)) => (count, Some(next)),
-            None => (0, None),
-        };
-        // Report the live next watermark when this process has allocated any,
-        // so status matches what memory_turn will hand out next.
-        if let Some(memory) = memory.as_mut() {
-            if let Some(live_next) = live_next {
-                memory["nextWatermark"] = json!(live_next);
-            }
-        }
         Ok(json!({
             "memory": memory,
-            "pendingTurns": pending_turns,
+            "pendingTurns": 0,
         }))
     }
 
@@ -982,62 +822,6 @@ impl Memory {
             })
             .await?;
         Ok(json!({ "memory": memory }))
-    }
-
-    pub async fn pending(&self, scope: Scope) -> Result<Value> {
-        if !scope_valid(&scope.world_id, &scope.resident_scope) {
-            return fail("invalid_scope");
-        }
-        let turns = match self.live_state(&scope.world_id, &scope.resident_scope) {
-            Some((turns, _, _)) => turns,
-            None => Vec::new(),
-        };
-        Ok(json!({ "turns": turns }))
-    }
-
-    // -- memory_turn -------------------------------------------------------
-
-    pub async fn turn(&self, scope: Scope, role: &str, text: &str, interrupted: bool) -> Result<Value> {
-        if !scope_valid(&scope.world_id, &scope.resident_scope) {
-            return fail("invalid_scope");
-        }
-        if role != "user" && role != "agent" {
-            return fail("invalid_role");
-        }
-        let text = text.trim();
-        if text.is_empty() || text.chars().any(char::is_control) {
-            return fail("invalid_turn_text");
-        }
-        if text.chars().count() > TURN_TEXT_LIMIT {
-            return fail("turn_text_too_large");
-        }
-        self.seed_buffer(&scope.world_id, &scope.resident_scope).await?;
-        let mut buffers = self.lock_buffers();
-        let key = (scope.world_id.clone(), scope.resident_scope.clone());
-        let buffer = buffers
-            .get_mut(&key)
-            .ok_or("memory_storage_failed")?;
-        let watermark = buffer.next_watermark;
-        buffer.next_watermark += 1;
-        let turn_id = uuid::Uuid::new_v4().hyphenated().to_string();
-        buffer.turns.push_back(VolatileTurn {
-            turn_id: turn_id.clone(),
-            watermark,
-            role: role.to_owned(),
-            text: text.to_owned(),
-            interrupted,
-        });
-        while buffer.turns.len() > PENDING_TURNS_LIMIT {
-            buffer.turns.pop_front();
-        }
-        let pending_turns = buffer.turns.len();
-        drop(buffers);
-        Ok(json!({
-            "accepted": true,
-            "turnID": turn_id,
-            "watermark": watermark,
-            "pendingTurns": pending_turns,
-        }))
     }
 
     // -- memory_query ------------------------------------------------------
@@ -1066,112 +850,6 @@ impl Memory {
         Ok(json!({ "status": "unconfigured", "results": [] }))
     }
 
-    // -- memory_ingest (delivered-turn writes) ------------------------------
-
-    /// `memory_ingest`: accept one already-delivered (user, agent) turn pair
-    /// into the scope's volatile buffer, atomically. Raw text is never
-    /// persisted; the durable layer only changes through a later local commit.
-    /// `(scope, requestID)` idempotency is volatile and bounded.
-    ///
-    /// 为什么不再有第二个返回字段：原来的 `consolidation` 报的是后台压缩编排
-    /// 状态，编排随外部 provider 一起删除，这里只如实报告"是否已进易失缓冲"。
-    pub async fn ingest(
-        &self,
-        scope: Scope,
-        request_id: &str,
-        user_text: &str,
-        agent_reply: &str,
-        source: &str,
-        observed_at: Option<String>,
-    ) -> Result<Value> {
-        if !scope_valid(&scope.world_id, &scope.resident_scope) {
-            return fail("invalid_scope");
-        }
-        let request_id = identity(request_id).map_err(|_| "invalid_memory_ingest")?;
-        if source != "text" && source != "voice" {
-            return fail("invalid_memory_ingest");
-        }
-        let observed_at = match observed_at {
-            None => None,
-            Some(value) => {
-                let value = value.trim();
-                if value.is_empty() {
-                    None
-                } else if value.chars().any(char::is_control)
-                    || value.chars().count() > OBSERVED_AT_LIMIT
-                {
-                    return fail("invalid_memory_ingest");
-                } else {
-                    Some(value.to_owned())
-                }
-            }
-        };
-        for text in [user_text, agent_reply] {
-            let text = text.trim();
-            if text.is_empty() || text.chars().any(char::is_control) {
-                return fail("invalid_turn_text");
-            }
-            if text.chars().count() > TURN_TEXT_LIMIT {
-                return fail("turn_text_too_large");
-            }
-        }
-        self.seed_buffer(&scope.world_id, &scope.resident_scope).await?;
-
-        let digest = ingest_digest(user_text.trim(), agent_reply.trim(), source, &observed_at);
-        let key = (scope.world_id.clone(), scope.resident_scope.clone());
-
-        // Critical section (no awaits below): the pair is appended atomically and
-        // the idempotency receipt recorded while holding the buffers lock, so a
-        // task abort (client disconnect) can only land at the next await and can
-        // never split the pair.
-        let (replayed, count) = {
-            let mut buffers = self.lock_buffers();
-            let buffer = buffers
-                .get_mut(&key)
-                .ok_or("memory_storage_failed")?;
-            if let Some((_, recorded_digest)) = buffer
-                .receipts
-                .iter()
-                .find(|(id, _)| *id == request_id)
-            {
-                if *recorded_digest != digest {
-                    return fail("memory_request_conflict");
-                }
-                (true, buffer.turns.len())
-            } else {
-                let user_watermark = buffer.next_watermark;
-                buffer.turns.push_back(VolatileTurn {
-                    turn_id: uuid::Uuid::new_v4().hyphenated().to_string(),
-                    watermark: user_watermark,
-                    role: "user".into(),
-                    text: user_text.trim().to_owned(),
-                    interrupted: false,
-                });
-                buffer.turns.push_back(VolatileTurn {
-                    turn_id: uuid::Uuid::new_v4().hyphenated().to_string(),
-                    watermark: user_watermark + 1,
-                    role: "agent".into(),
-                    text: agent_reply.trim().to_owned(),
-                    interrupted: false,
-                });
-                buffer.next_watermark += 2;
-                buffer.receipts.push_back((request_id, digest));
-                while buffer.receipts.len() > INGEST_RECEIPTS_LIMIT {
-                    buffer.receipts.pop_front();
-                }
-                while buffer.turns.len() > PENDING_TURNS_LIMIT {
-                    buffer.turns.pop_front();
-                }
-                (false, buffer.turns.len())
-            }
-        };
-        Ok(json!({
-            "accepted": true,
-            "replayed": replayed,
-            "pendingTurns": count,
-        }))
-    }
-
     // -- memory_recall (local restore only) ---------------------------------
 
     /// `memory_recall`：请求形状与配额校验保持不变（客户端照旧发 factLimit/
@@ -1180,8 +858,8 @@ impl Memory {
     ///
     /// 为什么不做关键词/时间序兜底：合同语义是"检索命中的长期记忆证据"，用词法
     /// 巧合冒充语义命中会让模型把无关内容当成事实。真正还能带回去的是本地可确认
-    /// 的东西：已提交快照 + 易失 pending 回合，且只在 freshSession 时整段恢复，
-    /// 并在 context 里明确声明语义检索不可用。
+    /// 的东西：**已提交的压缩快照**（原文层已整体移除），且只在 freshSession 时
+    /// 整段恢复，并在 context 里明确声明语义检索不可用。
     pub async fn recall(
         &self,
         scope: Scope,
@@ -1207,11 +885,6 @@ impl Memory {
         let world_id = scope.world_id.clone();
         let resident_scope = scope.resident_scope.clone();
 
-        let (pending_turns, pending) = match self.live_state(&world_id, &resident_scope) {
-            Some((turns, _, count)) => (count, turns),
-            None => (0, Vec::new()),
-        };
-
         let row = self
             .db
             .call({
@@ -1228,7 +901,6 @@ impl Memory {
         let context = build_recall_context(
             fresh_session,
             sections.as_ref(),
-            &pending,
             revision,
             vector_generation,
         );
@@ -1239,7 +911,9 @@ impl Memory {
             "facts": [],
             "notes": [],
             "context": context,
-            "pendingTurns": pending_turns,
+            // 原文层已移除：这个键保留只为不改客户端解码契约，值恒为 0
+            // （不再有易失缓冲，也就没有"尚未入库的回合"可报）。
+            "pendingTurns": 0,
         }))
     }
 }
@@ -1248,7 +922,6 @@ impl Memory {
 mod tests {
     use super::*;
     use crate::store::Database;
-    use serde_json::{json, Value};
 
     const WORLD_A: &str = "world-a";
     const WORLD_B: &str = "world-b";
@@ -1349,19 +1022,18 @@ mod tests {
     }
 
     /// The local commit pipeline: one transaction writes the snapshot and the
-    /// requestID idempotency row, then the covered volatile pending turns are
-    /// cleared (commit-after-durability) through the same shared buffer map the
-    /// daemon uses. 为什么测试要自己驱动它：provider 拆掉后没有生产调用方能造出
-    /// 已确认快照，但本地记忆的读写/恢复行为全都建立在"快照已提交"之上。
+    /// requestID idempotency row. 为什么测试要自己驱动它：provider 拆掉后没有
+    /// 生产调用方能造出已确认快照，但本地记忆的读写/恢复行为全都建立在
+    /// "快照已提交"之上。（原文层移除后这里不再需要清理易失缓冲，所以返回值
+    /// 从 `(CompactResult, usize)` 收敛成 `CompactResult`。）
     async fn commit_snapshot(
         memory: &Memory,
         scope: &Scope,
         request_id: &str,
         entries: Vec<VecEntry>,
         processed: i64,
-    ) -> Result<(CompactResult, usize)> {
+    ) -> Result<CompactResult> {
         let operation = operation(scope, request_id, entries, processed, None);
-        let buffers = memory.buffers.clone();
         memory
             .db
             .call(move |store| {
@@ -1371,13 +1043,7 @@ mod tests {
                     .map_err(|_| "storage_unavailable")?;
                 let result = commit(&transaction, &operation)?;
                 transaction.commit().map_err(|_| "storage_unavailable")?;
-                let pending = clear_covered(
-                    &buffers,
-                    &operation.world_id,
-                    &operation.resident_scope,
-                    result.processed_watermark,
-                );
-                Ok((result, pending))
+                Ok(result)
             })
             .await
     }
@@ -1902,277 +1568,6 @@ mod tests {
         assert!(identity("not-a-uuid").is_err());
     }
 
-    // -- Memory handle (local IPC) -----------------------------------------
-
-    #[tokio::test]
-    async fn pending_turns_are_volatile_and_bounded_fifo() {
-        let (_dir, database) = temp_db("pending");
-        let memory = Memory::new(database);
-        let first = memory.turn(scope_a(), "user", "hello world", false).await.unwrap();
-        assert_eq!(first["watermark"], 1);
-        assert_eq!(first["pendingTurns"], 1);
-        let second = memory.turn(scope_a(), "agent", "hi there", false).await.unwrap();
-        assert_eq!(second["watermark"], 2);
-        let pending = memory.pending(scope_a()).await.unwrap();
-        assert_eq!(pending["turns"].as_array().unwrap().len(), 2);
-        assert_eq!(pending["turns"][0]["watermark"], 1);
-        assert_eq!(pending["turns"][1]["watermark"], 2);
-        assert_eq!(pending["turns"][0]["role"], "user");
-        assert_eq!(pending["turns"][1]["text"], "hi there");
-        // FIFO bound: oldest turns drop beyond the limit.
-        for index in 0..(PENDING_TURNS_LIMIT + 5) {
-            memory
-                .turn(scope_a(), "user", &format!("turn {index}"), false)
-                .await
-                .unwrap();
-        }
-        let pending = memory.pending(scope_a()).await.unwrap();
-        let turns = pending["turns"].as_array().unwrap();
-        assert_eq!(turns.len(), PENDING_TURNS_LIMIT);
-        assert_eq!(turns[0]["text"], "turn 5", "oldest entries dropped FIFO");
-        let status = memory.status(scope_a()).await.unwrap();
-        assert_eq!(status["pendingTurns"], PENDING_TURNS_LIMIT);
-        assert_eq!(status["memory"], Value::Null, "no snapshot before the first commit");
-        // status 只报本地字段：provider 配置与压缩编排状态已随外部服务删除。
-        assert!(status.get("configured").is_none());
-        assert!(status.get("orchestration").is_none());
-    }
-
-    #[tokio::test]
-    async fn turn_and_pending_respect_scope_isolation() {
-        let (_dir, database) = temp_db("isolated");
-        let memory = Memory::new(database);
-        memory.turn(scope_a(), "user", "only in a", false).await.unwrap();
-        memory
-            .turn(scope(WORLD_A, RESIDENT_B), "user", "only in b", false)
-            .await
-            .unwrap();
-        memory
-            .turn(scope(WORLD_B, RESIDENT_A), "user", "only in world b", false)
-            .await
-            .unwrap();
-        let pending_a = memory.pending(scope_a()).await.unwrap();
-        assert_eq!(pending_a["turns"].as_array().unwrap().len(), 1);
-        assert_eq!(pending_a["turns"][0]["text"], "only in a");
-        assert_eq!(
-            memory.pending(scope(WORLD_B, RESIDENT_A)).await.unwrap()["turns"][0]["text"],
-            "only in world b"
-        );
-    }
-
-    #[tokio::test]
-    async fn query_reports_unconfigured_and_validates_params() {
-        let (_dir, database) = temp_db("query");
-        let memory = Memory::new(database);
-        // 没有 embedding provider 就没有查询向量，也就没有语义命中：如实报
-        // unconfigured + 空 results，绝不退化成词法/时间序假检索。
-        assert_eq!(
-            memory.query(scope_a(), "anything", Some(4)).await.unwrap(),
-            json!({"status": "unconfigured", "results": []})
-        );
-        assert_eq!(
-            memory.query(scope_a(), "anything", None).await.unwrap(),
-            json!({"status": "unconfigured", "results": []})
-        );
-        // 协议校验仍然生效，坏参数不会被静默吞掉。
-        assert_eq!(
-            memory.query(scope_a(), "   ", None).await.unwrap_err(),
-            "invalid_query"
-        );
-        assert_eq!(
-            memory
-                .query(scope_a(), &"q".repeat(QUERY_TEXT_LIMIT + 1), None)
-                .await
-                .unwrap_err(),
-            "invalid_query"
-        );
-        assert_eq!(
-            memory.query(scope_a(), "q", Some(TOP_K_MAX + 1)).await.unwrap_err(),
-            "invalid_topk"
-        );
-        assert_eq!(
-            memory.query(scope_a(), "q", Some(0)).await.unwrap_err(),
-            "invalid_topk"
-        );
-        assert_eq!(
-            memory.query(scope("", RESIDENT_A), "q", None).await.unwrap_err(),
-            "invalid_scope"
-        );
-    }
-
-    #[tokio::test]
-    async fn ingest_pair_is_atomic_idempotent_and_volatile() {
-        let (dir, database) = temp_db("ingest-atomic");
-        let memory = Memory::new(database);
-        let request_id = uuid::Uuid::new_v4().hyphenated().to_string();
-        let marker = format!("raw-{}", uuid::Uuid::new_v4());
-
-        let accepted = memory
-            .ingest(
-                scope_a(),
-                &request_id,
-                &marker,
-                "确已交付的答复",
-                "voice",
-                Some("2026-09-08T11:00:00+08:00".into()),
-            )
-            .await
-            .unwrap();
-        // 只报本地事实：进易失缓冲的回合数；不再有 consolidation 字段。
-        assert_eq!(
-            accepted,
-            json!({"accepted": true, "replayed": false, "pendingTurns": 2})
-        );
-
-        // Same requestID replay is idempotent; different content conflicts.
-        let replay = memory
-            .ingest(
-                scope_a(),
-                &request_id,
-                &marker,
-                "确已交付的答复",
-                "voice",
-                Some("2026-09-08T11:00:00+08:00".into()),
-            )
-            .await
-            .unwrap();
-        assert_eq!(replay["replayed"], true);
-        assert_eq!(replay["pendingTurns"], 2);
-        assert_eq!(
-            memory
-                .ingest(scope_a(), &request_id, "其他内容", "确已交付的答复", "text", None)
-                .await
-                .unwrap_err(),
-            "memory_request_conflict"
-        );
-        // A half pair is rejected without leaving anything behind.
-        assert_eq!(
-            memory
-                .ingest(
-                    scope_a(),
-                    &uuid::Uuid::new_v4().hyphenated().to_string(),
-                    "would-be-half-pair",
-                    "",
-                    "text",
-                    None,
-                )
-                .await
-                .unwrap_err(),
-            "invalid_turn_text"
-        );
-        assert_eq!(
-            memory.pending(scope_a()).await.unwrap()["turns"].as_array().unwrap().len(),
-            2
-        );
-
-        // Raw transcript must not persist anywhere in the private root.
-        for path in std::fs::read_dir(&dir).unwrap().flatten() {
-            let bytes = std::fs::read(path.path()).unwrap();
-            assert!(
-                !bytes.windows(marker.len()).any(|window| window == marker.as_bytes()),
-                "raw ingest text leaked to disk in {}",
-                path.path().display()
-            );
-        }
-
-        // A local commit clears exactly the pending turns it covered
-        // (commit-after-durability) and leaves newer volatile turns alone.
-        memory.turn(scope_a(), "user", "volatile after commit", false).await.unwrap();
-        let (result, pending) = commit_snapshot(
-            &memory,
-            &scope_a(),
-            &uuid::Uuid::new_v4().to_string(),
-            vec![fact_entry("consolidated locally")],
-            2,
-        )
-        .await
-        .unwrap();
-        assert_eq!(result.revision, 1);
-        assert_eq!(pending, 1, "only turns at or below the committed watermark clear");
-        let pending = memory.pending(scope_a()).await.unwrap();
-        assert_eq!(pending["turns"][0]["text"], "volatile after commit");
-
-        // A restart loses the volatile buffer; the durable snapshot survives.
-        drop(memory);
-        let restarted = Memory::new(Database::open(dir.clone(), None).unwrap());
-        assert_eq!(
-            restarted.pending(scope_a()).await.unwrap()["turns"].as_array().unwrap().len(),
-            0
-        );
-        let read = restarted.read(scope_a()).await.unwrap();
-        assert_eq!(read["memory"]["revision"], 1);
-        assert_eq!(
-            read["memory"]["sections"]["facts"][0]["text"],
-            "consolidated locally"
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn ingest_rejects_malformed_deliveries_without_side_effects() {
-        let (_dir, database) = temp_db("ingest-invalid");
-        let memory = Memory::new(database);
-        let s = scope_a();
-
-        type Case = (String, String, String, &'static str, Option<String>, &'static str);
-        let cases: Vec<Case> = vec![
-            ("not-a-uuid".into(), "u".into(), "r".into(), "text", None, "invalid_memory_ingest"),
-            (
-                uuid::Uuid::new_v4().hyphenated().to_string(),
-                "u".into(),
-                "r".into(),
-                "system",
-                None,
-                "invalid_memory_ingest",
-            ),
-            (
-                uuid::Uuid::new_v4().hyphenated().to_string(),
-                "".into(),
-                "r".into(),
-                "text",
-                None,
-                "invalid_turn_text",
-            ),
-            (
-                uuid::Uuid::new_v4().hyphenated().to_string(),
-                "u".into(),
-                "".into(),
-                "text",
-                None,
-                "invalid_turn_text",
-            ),
-            (
-                uuid::Uuid::new_v4().hyphenated().to_string(),
-                "x".repeat(2001),
-                "r".into(),
-                "text",
-                None,
-                "turn_text_too_large",
-            ),
-            (
-                uuid::Uuid::new_v4().hyphenated().to_string(),
-                "u".into(),
-                "r".into(),
-                "text",
-                Some("o".repeat(OBSERVED_AT_LIMIT + 1)),
-                "invalid_memory_ingest",
-            ),
-        ];
-        for (request_id, user, reply, source, observed, code) in cases {
-            assert_eq!(
-                memory
-                    .ingest(s.clone(), &request_id, &user, &reply, source, observed)
-                    .await
-                    .unwrap_err(),
-                code
-            );
-        }
-        // 被拒的投递不留任何痕迹：既没有 pending 回合，也没有别的状态变化。
-        let status = memory.status(s).await.unwrap();
-        assert_eq!(status["pendingTurns"], 0);
-        assert_eq!(status["memory"], Value::Null);
-    }
-
     #[tokio::test]
     async fn recall_restores_the_local_snapshot_and_reports_semantics_unavailable() {
         let (_dir, database) = temp_db("recall-local");
@@ -2203,20 +1598,23 @@ mod tests {
         assert!(!context.contains("新会话恢复"));
         assert!(!context.contains("alice likes hiking near the cabin"));
 
-        // 全新会话：整段恢复已确认的本地快照与易失回合，并且仍然声明语义
-        // 检索不可用——恢复不是检索命中。
-        memory.turn(scope_a(), "user", "还没入库的一句", false).await.unwrap();
+        // 全新会话：整段恢复**已确认的压缩快照**，并且仍然声明语义检索不可用
+        // ——恢复不是检索命中。（原文层移除后这里不再有"易失回合"那一段，
+        // 所以 `pendingTurns` 恒为 0、context 里也不该出现未入库文本。）
         let fresh = memory.recall(scope_a(), "anything", true, Some(1), Some(1)).await.unwrap();
         assert_eq!(fresh["status"], "unconfigured");
-        assert_eq!(fresh["pendingTurns"], 1);
+        assert_eq!(fresh["pendingTurns"], 0, "原文层已移除：不再有未入库回合");
         let context = fresh["context"].as_str().unwrap();
         assert!(context.chars().count() <= RECALL_CONTEXT_LIMIT);
         assert!(context.contains("新会话恢复"));
         assert!(context.contains("alice likes hiking near the cabin"));
         assert!(context.contains("resident speaks in a calm tone when tired"));
         assert!(context.contains(NOTES_TONE_MARKER), "notes 必须带 tone-only 标记");
-        assert!(context.contains("还没入库的一句"));
         assert!(context.contains("语义记忆检索当前不可用"));
+        assert!(
+            !context.contains("尚未入库的近期回合"),
+            "原文层已移除：context 不得再提到未入库缓冲（那会宣称一份不存在的数据）"
+        );
 
         // 另一个 scope 没有已确认内容：revision/代次保持 0，也不越界读别人的快照。
         let other = memory
@@ -2269,47 +1667,5 @@ mod tests {
                 .unwrap_err(),
             "invalid_scope"
         );
-    }
-
-    #[tokio::test]
-    async fn restart_drops_volatile_pending_and_resumes_from_durable_watermarks() {
-        let dir = std::env::temp_dir().join(format!("gmgn-memory-restart-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let next_watermark_after_commit;
-        {
-            let memory = Memory::new(Database::open(dir.clone(), None).unwrap());
-            memory.turn(scope_a(), "user", "remember me across restarts", false).await.unwrap();
-            memory.turn(scope_a(), "user", "a second durable turn", false).await.unwrap();
-            let (result, pending) = commit_snapshot(
-                &memory,
-                &scope_a(),
-                &uuid::Uuid::new_v4().to_string(),
-                vec![fact_entry("remembered across restarts")],
-                2,
-            )
-            .await
-            .unwrap();
-            assert_eq!(result.processed_watermark, 2);
-            assert_eq!(pending, 0);
-            let durable = memory.status(scope_a()).await.unwrap();
-            next_watermark_after_commit = durable["memory"]["nextWatermark"].as_i64().unwrap();
-            assert_eq!(next_watermark_after_commit, 3);
-            memory.turn(scope_a(), "user", "this is lost on crash", false).await.unwrap();
-            assert_eq!(memory.status(scope_a()).await.unwrap()["pendingTurns"], 1);
-        }
-        // "Crash": the Database handle is dropped; reopen the same directory.
-        let memory = Memory::new(Database::open(dir.clone(), None).unwrap());
-        let status = memory.status(scope_a()).await.unwrap();
-        assert_eq!(status["pendingTurns"], 0, "volatile pending is gone after restart");
-        assert_eq!(status["memory"]["revision"], 1);
-        assert_eq!(status["memory"]["vectorGeneration"], 1);
-        assert_eq!(status["memory"]["processedWatermark"], 2);
-        assert_eq!(status["memory"]["entryCounts"]["facts"], 1);
-        assert_eq!(status["memory"]["embedding"]["model"], MODEL);
-        assert_eq!(status["memory"]["embedding"]["dimensions"], 4);
-        // Watermark counter resumes from the durable next watermark.
-        let turned = memory.turn(scope_a(), "user", "after restart", false).await.unwrap();
-        assert_eq!(turned["watermark"], next_watermark_after_commit);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

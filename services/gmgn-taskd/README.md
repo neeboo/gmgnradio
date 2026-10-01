@@ -25,14 +25,16 @@ SQLite 由专属存储线程单写。任务变更、事件和具有明确 scope 
 
 同一数据库同时承载 world/resident 作用域的持久状态、事件流与消息（`state_read`、`state_commit`、`event_read`、`message_read`、`message_ack`），由显式 `schema_migrations` 版本表升级：v1 旧库幂等保留，v2 新增 resident 表，v3（memory-storage-v1）新增记忆快照/向量表。JSON 合同与错误码见 [resident 存储合同](../../docs/plans/2026-09-08-resident-storage-contract.md)。resident 进程级回归：`TASKD_BIN="$PWD/services/gmgn-taskd/target/debug/gmgn-taskd" python3 tools/test-resident-state-daemon.py -v`。
 
-VoiceMem 选择性移植的长期记忆层留在 Rust daemon 内：`memory_status/read/query/turn/pending` 与本地 `memory_ingest/memory_recall` 的协议、快照与幂等账本（`memory_snapshots`/`memory_requests`/`memory_vec_rows`）、sqlite-vec 静态链接与易失 pending turns 都保留，出处与许可证见 `VoiceMem-NOTICE.md`；合同见 [VoiceMem Rust 记忆合同](../../docs/plans/2026-09-08-voicemem-rust-contract.md)。**外部 VoiceMem 服务层已整体拆除**：daemon 不再向任何 compaction/embedding endpoint 发 HTTP，也不再持有 endpoint/token/model 配置，只服务外部 provider 的两个 IPC 方法（配置 provider、语义压缩提交）已整体从 dispatch 删除（调用得到 `unknown_method`），后台压缩编排与断连取消管线一并移除。为后续在 Rust 内自行实现语义抽取，快照与向量代次账本的结构、三张表与 sqlite-vec 注册都原样保留，但不再写入向量。进程级回归：`TASKD_BIN="$PWD/services/gmgn-taskd/target/debug/gmgn-taskd" python3 services/gmgn-taskd/tests/local_memory_process.py -v`（无任何 provider fixture：易失回合缓冲、已交付回合原子幂等入队、scope 隔离、status/read/pending，以及 query/recall 的如实「语义检索不可用」应答）。注意：`tools/test-resident-state-daemon.py` 中的 v1 升级断言仍写死版本 2，v3 迁移后需改为 3（tools 归 Swift/tools owner，待其更新）。
+VoiceMem 选择性移植的长期记忆层留在 Rust daemon 内：`memory_status/read/query` 与本地 `memory_recall` 的协议、快照与幂等账本（`memory_snapshots`/`memory_requests`/`memory_vec_rows`）、sqlite-vec 静态链接都保留，出处与许可证见 `VoiceMem-NOTICE.md`；合同见 [VoiceMem Rust 记忆合同](../../docs/plans/2026-09-08-voicemem-rust-contract.md)。**外部 VoiceMem 服务层已整体拆除**：daemon 不再向任何 compaction/embedding endpoint 发 HTTP，也不再持有 endpoint/token/model 配置，只服务外部 provider 的两个 IPC 方法（配置 provider、语义压缩提交）已整体从 dispatch 删除（调用得到 `unknown_method`），后台压缩编排与断连取消管线一并移除。为后续在 Rust 内自行实现语义抽取，快照与向量代次账本的结构、三张表与 sqlite-vec 注册都原样保留，但不再写入向量。
 
-## 本地记忆行为（provider 拆除后）
+**原文层（volatile pending turns）也已整体移除**（2026-10-01）：`memory_turn` / `memory_pending` / `memory_ingest` 三个方法连同 `Buffer`/`VolatileTurn`/`clear_covered` 与三个上限常量一起删除，调用它们得到专门的 **`memory_original_text_layer_removed`**（不是含糊的 `unknown_method`——老客户端仍会调用，而"回合原文没能进记忆"必须说得出口；也**不是**接受后丢弃，静默成功正是要消灭的形状）。移除依据：真机 `pendingTurns` 恒为 0、三张记忆表 0 行、`memory_compact` 从未有 dispatch 分支，原文层唯一的生产用途（`freshSession` 恢复段）在 pending=0 时**恒为空转**，保留死代码 + 死合同本身就是负担。**压缩层不受影响**：`memory_snapshots`/`memory_requests` 与 `memory::commit` 原样保留。`memory_recall` 的 `pendingTurns` 保留在返回里但**恒为 0**（只为不改客户端解码契约，值已无来源）。进程级回归：`TASKD_BIN="$PWD/services/gmgn-taskd/target/debug/gmgn-taskd" python3 services/gmgn-taskd/tests/local_memory_process.py -v`（无任何 provider fixture：三个原文方法的**可见失败** + "原文绝不落盘"的逐字节搜索 + scope 隔离 + read 的显式 null + query/recall 的如实「语义检索不可用」应答）。注意：`tools/test-resident-state-daemon.py` 中的 v1 升级断言仍写死版本 2，v3 迁移后需改为 3（tools 归 Swift/tools owner，待其更新）。
 
-- `memory_recall`：请求形状不变（`freshSession`、`factLimit` 1–12、`noteLimit` 1–8），但语义检索那一侧已随 embedding provider 删除：`facts`/`notes` 恒为空数组、`status` 恒为 `unconfigured`，**不做关键词/时间序兜底**（词法巧合不是语义证据）。`freshSession=true` 时 context 仍带带标记的本地快照 + 易失 pending 有界恢复段（≤8000 Unicode 字符），并明确声明「语义记忆检索当前不可用」；notes 始终带「禁止照读/不据此认定人格」标记。
-- `memory_ingest`：只接受已交付回合，原子追加 user+agent 两条易失 turns 并按 scope 保持顺序（200 上限 FIFO）；`(scope, requestID)` 接收幂等只在内存有界保存（每 scope 最近 200 次），重放返回 `replayed:true`，同 requestID 不同内容返回 `memory_request_conflict`。原始对话文本永不落盘，重启后未提交原文与接收幂等一并丢失。回复只有 `{accepted, replayed, pendingTurns}`，不再有压缩状态字段。
+## 本地记忆行为（provider 与原文层移除后）
+
+- `memory_recall`：请求形状不变（`freshSession`、`factLimit` 1–12、`noteLimit` 1–8），但语义检索那一侧已随 embedding provider 删除：`facts`/`notes` 恒为空数组、`status` 恒为 `unconfigured`，**不做关键词/时间序兜底**（词法巧合不是语义证据）。`freshSession=true` 时 context 只带**已确认的压缩快照**（有个标记的 `新会话恢复` 段，≤8000 Unicode 字符），并明确声明「语义记忆检索当前不可用」；notes 始终带「禁止照读/不据此认定人格」标记。**不再有"未入库缓冲"那一段**（那是原文层的产物）。
+- `memory_turn` / `memory_pending` / `memory_ingest`：**已移除**，恒返回 `memory_original_text_layer_removed`。
 - `memory_query`：协议与参数校验保留，但没有查询向量可用，恒返回 `status:"unconfigured"` + 空 `results`。
-- 不再有后台自动整理、`memory_status.orchestration` 或 provider 配置状态；`memory_status` 只报 `{memory, pendingTurns}`。
+- 不再有后台自动整理、`memory_status.orchestration` 或 provider 配置状态；`memory_status` 只报 `{memory, pendingTurns}`，其中 `pendingTurns` 恒为 0。
 
 ## IPC
 

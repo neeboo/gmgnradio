@@ -784,30 +784,19 @@ final class AppDelegate:
     /// 这份快照，口径一致。不做持久化：现有唯一按回合存储的是模型长期记忆，
     /// 其冻结合同不允许 Swift 侧重组为界面历史（见体验修复文档）。
     private var residentChatTranscript = ResidentChatTranscript()
-    // MARK: 长期记忆（本地编排薄适配器；外部 provider 接线已移除）
-    /// 该轮已成功结束、等待「显示/语音完成」才确认入库的交付凭据。只调用显示
-    /// API 但没有任何显示表面（controller 全 nil）不算已显示；模型返回或语音
-    /// 启动成功都不算交付完成。
-    private struct ResidentMemoryTurnSlot {
-        let runID: UUID
-        let requestID: UUID
-        let userText: String
-        let reply: String
-        let source: ResidentMemorySource
-    }
-
-    /// 编排薄适配器（memory_recall / memory_ingest / memory_status /
-    /// recall / ingest 转发），复用 gmgn-taskd 统一状态合同运输。
+    // MARK: 长期记忆（本地编排薄适配器；外部 provider 与原文层接线均已移除）
+    /// 编排薄适配器（**只转发 `memory_recall`**），复用 gmgn-taskd 统一状态合同运输。
+    ///
+    /// 原文层已整体移除（2026-10-01）：原先这里还有「等待显示/语音完成才确认入库」
+    /// 的交付凭据（`ResidentMemoryTurnSlot`）、按 runID 记的来源
+    /// （`residentTurnSourceByRunID`）与 `confirmDeliveredTurn` 调用链。它们全部
+    /// 随 `memory_ingest` / `memory_turn` / `memory_pending` 一起删除了，
+    /// 依据见 `docs/plans/2026-09-08-voicemem-rust-contract.md` 的「已移除」一节。
     private lazy var residentConversationMemory: ResidentConversationMemory = {
         ResidentConversationMemory(
             transport: ResidentTaskDaemonStateTransport(client: PropTaskDaemonClient())
         )
     }()
-    /// 真实人类输入来源的最小 runID 绑定：语音转写入口登记 .voice，键盘入口
-    /// 缺省即 .text；新运行开始时绑定，供交付确认传 source。
-    private var residentTurnSourceByRunID: [UUID: ResidentMemorySource] = [:]
-    /// 最近一次成功结束、等待显示/语音交付完成的回合凭据（nil=无可确认）。
-    private var residentMemoryTurnSlot: ResidentMemoryTurnSlot?
     private var stageRenderSurfaceController: StageRenderSurfaceController?
     private var stageCameraCoordinator: StageCameraCoordinator?
     private var stageAvatarActivityExecutor: StageAvatarActivityExecutor?
@@ -4773,24 +4762,6 @@ final class AppDelegate:
         }
     }
 
-    /// performResidentTurn 在 run/world/当前引用守卫全部通过后登记本回合交付
-    /// 凭据。真实用户文字为空（后台/自驱轮）或没有 requestID 一律不登记。
-    private func registerResidentMemoryTurn(runID: UUID, realUserText: String?, reply: String) {
-        let trimmedReply = reply.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let realUserText, !realUserText.isEmpty, !trimmedReply.isEmpty,
-              let requestID = AgentConversationService.shared.lastTurnDeliveryRequestID else {
-            residentTurnSourceByRunID.removeValue(forKey: runID)
-            return
-        }
-        residentMemoryTurnSlot = ResidentMemoryTurnSlot(
-            runID: runID,
-            requestID: requestID,
-            userText: realUserText,
-            reply: trimmedReply,
-            source: residentTurnSourceByRunID.removeValue(forKey: runID) ?? .text
-        )
-    }
-
     /// 最近对话的作用域键：世界 + 居民会话 + 当前对话后端。任一变化（换空间、
     /// 换后端）都会让旧回合立即作废，绝不显示别的世界或别的后端会话的对话。
     private var residentTranscriptScopeKey: String {
@@ -4823,16 +4794,13 @@ final class AppDelegate:
         }
     }
 
-    /// 居民回复交付呈现（ensureResidentLoop 的 onReply）：先同步写入可见聊天表面，
-    /// 再按 autoSpeak 决定确认时机。autoSpeak 开启时只有整段语音自然播完才算
-    /// 交付（取消/失败/迟到不算）；静音文本以「至少一个显示表面真实存在并显示」
-    /// 为交付。模型返回或语音启动成功本身都不算交付。
+    /// 居民回复交付呈现（ensureResidentLoop 的 onReply）：把回复同步写入可见聊天
+    /// 表面。
     ///
-    /// 朗读与记忆确认解耦：autoSpeak 始终照常朗读——后台/自驱回复、未绑定记忆、
-    /// 未登记交付凭据的回合都没有 slot，但不能因此不再朗读（这是原 autoSpeak
-    /// 行为）。记忆确认只限定在「本回合已登记凭据且回复与凭据一致」的回合：
-    /// 语音通道只在整段播完（.finished）后确认，静音文本在真实显示后确认。
-    /// 没有匹配 slot 只是没有记忆可写，不是错误，也照常显示文本。
+    /// **原文层移除后这里不再有任何"记忆确认"**：原先它要按 autoSpeak 的结果挑时机
+    /// 调 `confirmDeliveredTurn`（语音整段播完 / 静音文本真实显示），并为此维护一份
+    /// 交付凭据。那份凭据与调用链已随 `memory_ingest` 一起删除，所以现在这里只做
+    /// 呈现——朗读照旧、显示照旧，且**不再有任何"写记忆"的动作**。
     private func presentResidentReply(_ reply: String) {
         // 先按真实回合身份登记「真正送达」：只更新已记录的用户提交，未知/迟到
         // 的身份不臆造回合，也不重复显示。
@@ -4848,65 +4816,13 @@ final class AppDelegate:
         let autoRevealsChat = residentAgentLoop?.lastFinishedRunWasBackground != true
         liveCamWindowController?.finishAgentReply(reply)
         stageWindowController?.finishResidentReply(reply, autoRevealsChat: autoRevealsChat)
-        let textDisplayed = liveCamWindowController != nil || stageWindowController != nil
-        let slot = residentMemoryTurnSlot
-        let memoryTurn = slot.map { $0.reply == reply.trimmingCharacters(in: .whitespacesAndNewlines) } ?? false
+        // 朗读照旧。原文层移除**不影响**这一条：原先这里用一个带回调的
+        // `announce`，回调里既数"语音交付"又去确认记忆写入；现在没有记忆写入要
+        // 确认了，但"整段播完才算语音交付"这个语义仍由 `AgentSpeechAnnouncer`
+        // 自己维护，所以直接用无回调的重载即可（不再需要为记忆挑时机）。
         if speechEnabled {
-            // 语音是本轮唯一交付通道：回调只以本次 announce 对应的 slot 确认，
-            // 绝不把旧回合的完成误确认到新回合；.cancelled/.failed 不计交付。
-            // 记忆 slot 缺失/不匹配时不确认，但朗读照常进行。
-            agentSpeechAnnouncer.announce(reply) { [weak self] outcome in
-                guard let self else { return }
-                if outcome == .finished, let slot, memoryTurn {
-                    self.confirmResidentMemoryTurn(slot)
-                }
-            }
-        } else if textDisplayed, let slot, memoryTurn {
-            confirmResidentMemoryTurn(slot)
+            agentSpeechAnnouncer.announce(reply)
         }
-    }
-
-    private func confirmResidentMemoryTurn(_ slot: ResidentMemoryTurnSlot) {
-        let result = AgentConversationService.shared.confirmDeliveredTurn(
-            requestID: slot.requestID,
-            userText: slot.userText,
-            reply: slot.reply,
-            source: slot.source,
-            observedAt: Self.residentMemoryObservedAt()
-        )
-        // accepted（已入队到易失缓冲）或 notCurrent（已被取消/新回合/scope 切换
-        // 取代）都表示该凭据已消费；只清当前 slot，绝不误清新回合已登记的凭据。
-        if (result == .accepted || result == .notCurrent),
-           residentMemoryTurnSlot?.runID == slot.runID {
-            residentMemoryTurnSlot = nil
-        }
-        // 其余结果一律是「本轮未写记忆」：超长/控制字符/队列满/未接线都不能让
-        // 已成功的聊天失败，但也绝不能默默冒充记忆已保存——可见提示里明确这是
-        // 易失入队失败（未写长期记忆），而不是 durable 落库成功。
-        presentResidentMemoryDeliveryFailure(result)
-    }
-
-    /// 交付确认失败结果的处理：.accepted/.notCurrent 静默（正常消费或已被取代）；
-    /// 其余失败**只记日志、不上屏** —— 本地记忆的交付细节不该变成聊天状态行。
-    private func presentResidentMemoryDeliveryFailure(
-        _ result: AgentConversationMemoryDeliveryResult
-    ) {
-        // **全部只进日志、不上屏**：这些是本地记忆的交付细节，不是用户需要处理的
-        // 事情，聊天也不受影响。产品要求：不要用状态行打扰用户。
-        switch result {
-        case .accepted, .notCurrent:
-            break
-        case .unavailable:
-            livingWorldLogger.notice("记忆交付失败：本地记忆服务不可用，本轮未写入。")
-        case .rejectedText:
-            livingWorldLogger.notice("记忆交付失败：内容含控制字符或超过 2000 字上限，未改写或截断。")
-        case .queueFull:
-            livingWorldLogger.notice("记忆交付失败：交付队列已满，本轮未进入易失缓冲。")
-        }
-    }
-
-    private static func residentMemoryObservedAt() -> String {
-        ISO8601DateFormatter().string(from: Date())
     }
 
     private func ensureResidentLoop() -> ResidentAgentLoop {
@@ -4929,8 +4845,6 @@ final class AppDelegate:
             onChange: { [weak self] in self?.synchronizeResidentLoopPresentation() },
             onCancel: { [weak self] in
                 AgentConversationService.shared.cancel()
-                // 取消/停止后旧回合不再等待交付确认：迟到的显示/语音完成不写。
-                self?.residentMemoryTurnSlot = nil
                 self?.residentActivityOutcome?.abort()
                 try? self?.residentActivityOwnership.stopOwnedActivity()
                 self?.agentSpeechAnnouncer.stop()
@@ -5411,7 +5325,6 @@ final class AppDelegate:
     private func sendLiveCamMessage(_ message: String) async {
         disconnectRealtimeVoice()
         let loop = ensureResidentLoop()
-        let previousRunID = loop.snapshot.runID
         // 语音最终转写也是真实用户提交：用稳定身份进入同一份可见历史。
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         let submissionID: UUID? = trimmed.isEmpty ? nil : UUID()
@@ -5421,13 +5334,9 @@ final class AppDelegate:
             publishResidentTranscript()
         }
         loop.receiveUserMessage(message, submissionID: submissionID)
-        // 语音最终转写入口：本消息真实来源是 voice。只有它真的启动了一个新的
-        // 人类轮次（runID 变化且非后台）才登记来源；正在进行的轮次内补发走
-        // steering，不另起回合。键盘/图片入口缺省即 .text，无需登记。
-        if let runID = loop.snapshot.runID, runID != previousRunID,
-           !loop.snapshot.isBackgroundRun {
-            residentTurnSourceByRunID[runID] = .voice
-        }
+        // 语音最终转写入口。**原文层移除后这里不再登记"来源"**：原先要按 runID
+        // 变化记 `.voice`（只有它真的启动新的人类轮次时），那份登记只为
+        // `memory_ingest` 的 `source` 参数服务，已随原文层一起删除。
     }
 
     @objc private func propGenerationConfigurationDidChange(_ notification: Notification) {
@@ -6295,8 +6204,10 @@ final class AppDelegate:
             finishCancellation()
             throw CancellationError()
         }
-        // 守卫全部通过才登记本轮交付凭据：迟到/取消/世界切换的回合不确认。
-        registerResidentMemoryTurn(runID: messageID, realUserText: realUserText, reply: reply)
+        // 原文层移除后这里不再登记"本轮交付凭据"（原 `registerResidentMemoryTurn`）：
+        // 凭据的唯一用途是之后调 `confirmDeliveredTurn` 去 `memory_ingest`，那条链
+        // 已整体删除。守卫本身保留——它仍然保护下面那些**真正写东西**的动作
+        // （确认许愿通知、同步面板）。
         if !reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || residentAgentLoop?.allowsSilentCompletion(runID: input.runID) == true {
             do { try await acknowledgeWishEvents(input.events, worldContext: worldContext) }

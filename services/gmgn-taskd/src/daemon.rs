@@ -444,40 +444,14 @@ impl Service {
                     .query(request.scope, &request.query, request.top_k)
                     .await
             }
-            "memory_turn" => {
-                if self.has_configured_secret(&params).await {
-                    return Err("invalid_memory_turn");
-                }
-                let request: memory::TurnRequest =
-                    serde_json::from_value(params).map_err(|_| "invalid_memory_turn")?;
-                self.memory
-                    .turn(request.scope, &request.role, &request.text, request.interrupted)
-                    .await
-            }
-            "memory_pending" => {
-                if self.has_configured_secret(&params).await {
-                    return Err("invalid_memory_pending");
-                }
-                let request: memory::PendingRequest =
-                    serde_json::from_value(params).map_err(|_| "invalid_memory_pending")?;
-                self.memory.pending(request.scope).await
-            }
-            "memory_ingest" => {
-                if self.has_configured_secret(&params).await {
-                    return Err("invalid_memory_ingest");
-                }
-                let request: memory::IngestRequest =
-                    serde_json::from_value(params).map_err(|_| "invalid_memory_ingest")?;
-                self.memory
-                    .ingest(
-                        request.scope,
-                        &request.request_id,
-                        &request.user_text,
-                        &request.agent_reply,
-                        request.source.as_deref().unwrap_or("text"),
-                        request.observed_at,
-                    )
-                    .await
+            // 原文层已整体移除（见 `voicemem-rust-contract.md` 的「已移除」一节）。
+            // 这三个方法**故意不静默变成 `unknown_method`**：老客户端仍然会调用它们，
+            // 而"回合原文没能进记忆"必须是一个**说得出口的失败**，不能是"看起来像
+            // 拼错了方法名"。所以给一个专门且自解释的错误码。
+            //
+            // 为什么不改成"接受但丢弃"：那正是用户点名要消灭的形状 —— 静默成功。
+            "memory_turn" | "memory_pending" | "memory_ingest" => {
+                Err("memory_original_text_layer_removed")
             }
             "memory_recall" => {
                 if self.has_configured_secret(&params).await {
@@ -1475,21 +1449,29 @@ mod tests {
             service.request("memory_status", scope.clone()).await.unwrap(),
             json!({"memory": null, "pendingTurns": 0})
         );
-        assert_eq!(
-            service
-                .request(
-                    "memory_ingest",
-                    json!({
-                        "scope": {"worldID": "install", "residentScope": "install"},
-                        "requestID": uuid::Uuid::new_v4().hyphenated().to_string(),
-                        "userText": "本地记忆仍然写入",
-                        "agentReply": "收到",
-                    }),
-                )
-                .await
-                .unwrap(),
-            json!({"accepted": true, "replayed": false, "pendingTurns": 2})
-        );
+        // 原文层已整体移除：这三个方法**必须给出一个说得出口的失败**，
+        // 而不是"接受但丢弃"（静默成功正是要消灭的形状），也不是含糊的
+        // `unknown_method`（老客户端会以为是自己拼错了方法名）。
+        for method in ["memory_turn", "memory_pending", "memory_ingest"] {
+            let params = match method {
+                "memory_turn" => json!({
+                    "scope": {"worldID": "install", "residentScope": "install"},
+                    "role": "user", "text": "不该被写入的原文",
+                }),
+                "memory_ingest" => json!({
+                    "scope": {"worldID": "install", "residentScope": "install"},
+                    "requestID": uuid::Uuid::new_v4().hyphenated().to_string(),
+                    "userText": "不该被写入的原文",
+                    "agentReply": "也不该",
+                }),
+                _ => json!({"scope": {"worldID": "install", "residentScope": "install"}}),
+            };
+            assert_eq!(
+                service.request(method, params).await,
+                Err("memory_original_text_layer_removed"),
+                "{method} 必须显式报告原文层已移除"
+            );
+        }
         // 语义检索一侧没有 provider，就如实报 unconfigured + 空结果，绝不假检索。
         let recall = service
             .request(
@@ -1505,6 +1487,7 @@ mod tests {
         assert_eq!(recall["status"], "unconfigured");
         assert_eq!(recall["facts"], json!([]));
         assert_eq!(recall["notes"], json!([]));
+        assert_eq!(recall["pendingTurns"], 0, "原文层已移除：恒为 0");
         assert_eq!(
             service
                 .request(
@@ -1518,18 +1501,9 @@ mod tests {
                 .unwrap(),
             json!({"status": "unconfigured", "results": []})
         );
+        // 被拒的原文投递不能留下任何痕迹：status 仍然说 0 个 pending。
         let status = service.request("memory_status", scope).await.unwrap();
-        assert_eq!(status["pendingTurns"], 2);
-        assert_eq!(
-            service
-                .request("memory_pending", json!({"scope": {"worldID": "install", "residentScope": "install"}}))
-                .await
-                .unwrap()["turns"]
-                .as_array()
-                .unwrap()
-                .len(),
-            2
-        );
+        assert_eq!(status["pendingTurns"], 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

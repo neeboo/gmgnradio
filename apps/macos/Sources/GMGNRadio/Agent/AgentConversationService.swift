@@ -609,40 +609,16 @@ struct AgentConversationOutcome: Sendable {
     let sessionID: String?
 }
 
-/// 已成功结束、等待 App 显式交付确认的一轮记忆凭据。只在 send 成功返回且该轮
-/// 有真实用户文字时登记；confirm 时校验 requestID/scope/generation 与用户文字
-/// 都仍是本轮的，否则视为迟到/串写，不写记忆。
-struct AgentConversationPendingDelivery: Equatable, Sendable {
-    let requestID: UUID
-    let storageScope: ResidentStateScope
-    /// 登记时的记忆代次：bind/reset（scope 切换/离开）推进后旧凭据立即失效。
-    let generation: UInt64
-    let userText: String
-}
-
-/// VoiceMem 文本长度上限（对齐 Rust 冻结合同：`TURN_TEXT_LIMIT` 2000 /
-/// `QUERY_TEXT_LIMIT` 500，按 Unicode scalar 计数）。
+/// VoiceMem 查询文本长度上限（对齐 Rust 冻结合同：`QUERY_TEXT_LIMIT` 500，
+/// 按 Unicode scalar 计数）。
+///
+/// `turn`（2000）与 `observedAt`（32）随原文层一起移除：它们只服务于已删除的
+/// `confirmDeliveredTurn` 入队路径。
 private enum ResidentMemoryTextLimits {
-    static let turn = 2000
     static let query = 500
-    static let observedAt = 32
 }
 
-/// confirmDeliveredTurn 的合同化结果：`.accepted` 只代表该已交付回合成对进入
-/// Rust 易失缓冲（memory_ingest 语义，不冒充 durable 落库）；其余均为「未写」。
-enum AgentConversationMemoryDeliveryResult: Equatable, Sendable {
-    case accepted
-    /// 已取消/被新一轮取代/scope 切换/未知 requestID/用户文字不匹配——未写。
-    case notCurrent
-    /// 记忆未接线——未写。
-    case unavailable
-    /// 文本违反 Rust 合同（trim 后空、含 C0/C1 控制字符、超过 2000 Unicode
-    /// scalar）——整对合理拒绝，不写、不持久原文，已成功的聊天不受影响。
-    case rejectedText
-    /// IPC 交付队列已满，未入队（后续可重试同一 requestID）。
-    case queueFull
-}
-
+/// 一轮居民对话要交给后端的工具集（schema + 调用入口 + 取消 + 本轮的能力声明）。
 struct ResidentConversationTools: Sendable {
     /// 本轮注册了原生视觉工具（capture_space_photo）。DSH 必须先走原生
     /// 会话路径（首帧视觉调用前生效），headless 文本通道不承载图片。
@@ -726,9 +702,6 @@ final class AgentConversationService {
     private var conversationMemory: ResidentConversationMemory?
     /// 记忆召回/交付失败的可见出口（聊天本身不受影响，仍正常返回）。
     private var conversationMemoryErrorHandler: ((String) -> Void)?
-    /// 最近一次成功结束且带真实用户文字的回合凭据：App 交付完成后据此显式确认。
-    /// 取消、重置、scope 切换或被新一轮取代后一律失效，绝不写旧 scope。
-    private var pendingDelivery: AgentConversationPendingDelivery?
     /// One live native ACP session per resident world scope. Its existence is
     /// what keeps later no-new-image turns inside the same image session; there
     /// is no separate visual resident.
@@ -930,8 +903,6 @@ final class AgentConversationService {
         currentTask?.cancel()
         currentTask = nil
         currentRequestID = nil
-        // 取消/新一轮开始都让上一轮「等待交付确认」的凭据失效：迟到的确认不写。
-        pendingDelivery = nil
         let handler = currentCancellationHandler
         currentCancellationHandler = nil
         handler?()
@@ -944,28 +915,18 @@ final class AgentConversationService {
 
     // MARK: - 居民记忆接线（VoiceMem 编排）
 
-    /// 宿主接线：挂载/替换/解除记忆适配器并指定可见错误出口。重复挂载会替换旧
-    /// 适配器并解绑其 onError。nil = 解除（后续轮次不再召回、不登记交付）。
+    /// 宿主接线：挂载/替换/解除记忆适配器并指定失败出口。
+    ///
+    /// 原文层移除后适配器**只读**（只剩 `restore`），所以这里不再挂 `onError`
+    /// ——没有"写记忆"的动作，也就没有交付失败要报。召回失败由
+    /// `recalledContext` 自己的出口报（`conversationMemoryErrorHandler`）。
     func attachConversationMemory(
         _ memory: ResidentConversationMemory?,
         onMemoryError: ((String) -> Void)? = nil
     ) {
-        conversationMemory?.onError = nil
         conversationMemory = memory
         conversationMemoryErrorHandler = onMemoryError
-        guard let memory else { return }
-        memory.onError = { [weak self] event in
-            guard let self, let detail = Self.memoryErrorDescription(event.code) else { return }
-            self.conversationMemoryErrorHandler?(
-                "已交付回合的记忆写入未完成：\(detail)。已成功的聊天不受影响。"
-            )
-        }
     }
-
-    /// 最近一次成功 send 且带真实用户文字的回合 requestID：App 在 run/world
-    /// 检查通过且显示/语音交付完成后，用它调用 confirmDeliveredTurn。新一轮
-    /// send / cancel / scope 切换会替换或清空它，迟到的旧值自然失效。
-    var lastTurnDeliveryRequestID: UUID? { pendingDelivery?.requestID }
 
     /// 世界/居民 scope 变化时把记忆绑定到新 scope（推进 generation，使旧 scope
     /// 尚未发送的交付失效）。无记忆 scope 的轮次不触碰绑定（纯文本聊天照常）。
@@ -1052,87 +1013,8 @@ final class AgentConversationService {
         return provided + [Self.memoryContextMessage(context)]
     }
 
-    /// send 成功返回后登记「待交付」凭据，绝不在此处 memory_ingest：真实入库由
-    /// App 在显示/语音交付完成后显式确认。没有真实用户文字/没有记忆 scope/记忆
-    /// 未接线都不登记——后台轮次不会因此伪造用户回合。
-    private func stageDeliveredTurn(
-        storageScope: ResidentStateScope?,
-        userText: String?,
-        reply: String
-    ) {
-        guard let memory = conversationMemory, let storageScope,
-              memory.activeScope == storageScope,
-              let userText, !userText.isEmpty,
-              !reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        pendingDelivery = AgentConversationPendingDelivery(
-            requestID: UUID(),
-            storageScope: storageScope,
-            generation: memory.generation,
-            userText: userText
-        )
-    }
-
-    /// App 显式「交付确认」入口：在 run/world 检查通过、回复已实际显示（静音
-    /// 文本以显示为交付）或语音播放完成后调用。校验 requestID/用户文字与本轮
-    /// scope/generation 一致后，才经薄适配器入队 memory_ingest；取消/重置/
-    /// scope 切换/新一轮开始后迟到的确认一律不写。文本违反合同（trim 后空、
-    /// 含 C0/C1 控制字符、超过 2000 Unicode scalar）合理拒绝，不让已成功的
-    /// 聊天失败，也不持久原文。
-    @discardableResult
-    func confirmDeliveredTurn(
-        requestID: UUID,
-        userText: String,
-        reply: String,
-        source: ResidentMemorySource = .text,
-        observedAt: String? = nil
-    ) -> AgentConversationMemoryDeliveryResult {
-        guard let memory = conversationMemory else { return .unavailable }
-        guard let pending = pendingDelivery, pending.requestID == requestID,
-              pending.userText == userText else { return .notCurrent }
-        // 本轮 scope/generation 校验：reset/scope 切换后旧凭据立即失效。
-        guard memory.activeScope == pending.storageScope,
-              memory.generation == pending.generation else { return .notCurrent }
-        guard Self.isValidMemoryTurnText(userText),
-              Self.isValidMemoryTurnText(reply) else { return .rejectedText }
-        let safeObservedAt = Self.sanitizedObservedAt(observedAt)
-        guard memory.recordDeliveredTurn(
-            requestID: requestID.uuidString,
-            userText: userText,
-            agentReply: reply,
-            source: source,
-            observedAt: safeObservedAt
-        ) else { return .queueFull }
-        // 一次成功确认即视为该 requestID 已入队，清空凭据防止重复入队。
-        pendingDelivery = nil
-        return .accepted
-    }
-
-    /// Rust 合同 turn 文本校验（memory.rs `trim_no_control` + TURN_TEXT_LIMIT）：
-    /// trim 后非空、无 C0/C1 控制字符、≤2000 Unicode scalar。
-    nonisolated private static func isValidMemoryTurnText(_ text: String) -> Bool {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return false }
-        guard trimmed.unicodeScalars.count <= ResidentMemoryTextLimits.turn else { return false }
-        return !trimmed.unicodeScalars.contains(where: { isC0C1Control($0) })
-    }
-
-    nonisolated private static func isC0C1Control(_ scalar: Unicode.Scalar) -> Bool {
-        scalar.value <= 0x1F || (0x7F...0x9F).contains(scalar.value)
-    }
-
-    /// observedAt 只是可选元数据：违反合同（控制字符/超 32）时丢弃为 nil，不
-    /// 让整个已交付回合因时间戳被拒。
-    nonisolated private static func sanitizedObservedAt(
-        _ observedAt: String?
-    ) -> String? {
-        guard let observedAt else { return nil }
-        let trimmed = observedAt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed.unicodeScalars.count <= ResidentMemoryTextLimits.observedAt,
-              !trimmed.unicodeScalars.contains(where: { isC0C1Control($0) }) else { return nil }
-        return trimmed
-    }
-
-    /// 按 Unicode scalar 数截断（对齐 Rust `chars().count()` 语义）。
+    /// 按 Unicode scalar 边界截断（**不是** `prefix` 的 Character 语义）：
+    /// 记忆召回 query 与 Claude 内存历史都用它，两边的上限都以 scalar 计。
     nonisolated private static func cappedTo(_ text: String, _ limit: Int) -> String {
         guard text.unicodeScalars.count > limit else { return text }
         return String(text.unicodeScalars.prefix(limit))
@@ -1142,15 +1024,14 @@ final class AgentConversationService {
         (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
 
-    /// 适配器 onError 的**日志**文案；不应出现的内部状态（notBound/emptyText）
-    /// 返回 nil 静默。宿主侧只把它写进日志、不上屏：记忆交付失败不影响聊天，
-    /// 用状态行告诉用户只会让人以为聊天坏了。
+    /// `memory_recall` 失败/未接线时的**日志**文案。原文层移除后只剩"读"这一条路，
+    /// 所以这里只可能拿到 `notBound` / `daemon` / `invalidResponse` / `transport`。
+    /// 宿主侧只把它写进日志：记忆召回失败不影响聊天。
     nonisolated private static func memoryErrorDescription(
         _ error: ResidentConversationMemoryError
     ) -> String? {
         switch error {
-        case .notBound, .emptyText: return nil
-        case .queueFull: return "记忆交付队列已满"
+        case .notBound: return nil
         case let .daemon(code): return "记忆后台拒绝（\(code)）"
         case .invalidResponse: return "记忆后台返回了无法识别的数据"
         case .transport: return "记忆传输失败"
@@ -1780,11 +1661,6 @@ final class AgentConversationService {
             if let sessionID = outcome.sessionID {
                 preferences.saveSessionID(sessionID, for: .codex, scope: scope)
             }
-            stageDeliveredTurn(
-                storageScope: storageScope,
-                userText: durableUserText,
-                reply: outcome.reply
-            )
             return outcome.reply
         case .dsh:
             let executableLocator = locator
@@ -1845,11 +1721,6 @@ final class AgentConversationService {
                         dshHistory = Array(dshHistory.suffix(6))
                     }
                     dshHistoryByScope[historyKey] = dshHistory
-                    stageDeliveredTurn(
-                        storageScope: storageScope,
-                        userText: durableUserText,
-                        reply: outcome.reply
-                    )
                     return outcome.reply
                 } catch AgentConversationError.dshTextTransportUnavailable where imageURLs.isEmpty {
                     // 纯文字世界回合：走原生只是因世界声明了视觉能力，缺原生 ACP
@@ -1888,11 +1759,6 @@ final class AgentConversationService {
                 dshHistory = Array(dshHistory.suffix(6))
             }
             dshHistoryByScope[historyKey] = dshHistory
-            stageDeliveredTurn(
-                storageScope: storageScope,
-                userText: durableUserText,
-                reply: outcome.reply
-            )
             return outcome.reply
         case .claudeCode:
             // Claude Code 专用安全分支：与通用 JSON CLI 完全分离，绝不 resume/
@@ -1911,11 +1777,6 @@ final class AgentConversationService {
             }
             self.recordClaudeTurn(
                 scope: historyKey, userText: durableUserText, reply: outcome.reply
-            )
-            stageDeliveredTurn(
-                storageScope: storageScope,
-                userText: durableUserText,
-                reply: outcome.reply
             )
             return outcome.reply
         case .workbuddy, .qoder:
@@ -1945,11 +1806,6 @@ final class AgentConversationService {
             if let sessionID = outcome.sessionID {
                 preferences.saveSessionID(sessionID, for: id, scope: scope)
             }
-            stageDeliveredTurn(
-                storageScope: storageScope,
-                userText: durableUserText,
-                reply: outcome.reply
-            )
             return outcome.reply
         case .pi:
             let storedSessionID = preferences.sessionID(for: .pi, scope: scope)
@@ -1976,11 +1832,6 @@ final class AgentConversationService {
             if let sessionID = outcome.sessionID {
                 preferences.saveSessionID(sessionID, for: .pi, scope: scope)
             }
-            stageDeliveredTurn(
-                storageScope: storageScope,
-                userText: durableUserText,
-                reply: outcome.reply
-            )
             return outcome.reply
         }
     }
