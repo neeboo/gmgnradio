@@ -1049,6 +1049,40 @@ mod tests {
         assert_eq!(probed["capabilities"]["reason"], "gpu busy");
         assert_eq!(probed["acceptsInputPx"], false);
 
+        // 「收不收得下尺寸意图」也要能被 app 看见：声明缺失时回给 app 的能力块里
+        // **没有**这一位（上一段就是），声明在时逐字带出去。app 据此知道这台服务是
+        // "只回显"还是"自己按轴归一" —— 这件事只有服务端说了才算，我们不许替它假设。
+        let (origin, server) = serve_once(
+            200,
+            vec![("Content-Type", "application/json".into())],
+            br#"{"status":"api_ready","generation":{"ready":true},"provider":{"id":"gmgn-prop-service","kind":"remote_http","size_intent":{"axes":["height","longest"],"min_meters":0.01,"max_meters":3.0,"applies":"echo"}}}"#.to_vec(),
+        )
+        .await;
+        let probed = service
+            .request("provider_probe", json!({"endpoint": origin, "inputPx": 2048}))
+            .await
+            .unwrap();
+        let _ = server.await;
+        assert_eq!(
+            probed["capabilities"]["size_intent"],
+            json!({"axes": ["height", "longest"], "min_meters": 0.01, "max_meters": 3.0, "applies": "echo"})
+        );
+
+        // 声明不合法 ⇒ 整块不可信，探测**明确报错**而不是当成"能力很强"。
+        let (origin, server) = serve_once(
+            200,
+            vec![("Content-Type", "application/json".into())],
+            br#"{"status":"api_ready","generation":{"ready":true},"provider":{"size_intent":{"axes":["width"],"min_meters":0.01,"max_meters":3.0,"applies":"echo"}}}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(
+            service
+                .request("provider_probe", json!({"endpoint": origin, "inputPx": 2048}))
+                .await,
+            Err("invalid_provider_capabilities")
+        );
+        let _ = server.await;
+
         // A backend whose health is not the shipped api_ready contract is
         // reported, never assumed ready.
         let (origin, server) = serve_once(

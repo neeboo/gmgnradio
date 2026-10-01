@@ -1,12 +1,21 @@
 use crate::{
     files,
-    model::{self, Job, Result, COLLIDER_LIMIT, MODEL_LIMIT, PNG_LIMIT},
+    model::{
+        self, Job, Result, SizeIntent, SizeIntentSupport, COLLIDER_LIMIT, MODEL_LIMIT, PNG_LIMIT,
+    },
 };
 use base64::Engine;
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{future::Future, path::Path, pin::Pin, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    path::Path,
+    pin::Pin,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 /// Boxed future so [`PropProvider`] stays object safe (`Arc<dyn PropProvider>`)
 /// while each backend keeps writing plain `async fn` bodies. `Send` is required
@@ -64,15 +73,40 @@ async fn load(
     }
     Ok(bytes)
 }
+/// 提交 body 的**唯一**构造点。
+///
+/// `intent` 是**协商之后**才可能非 `None` 的那一份（见
+/// [`RemoteHTTPProvider::accepted_size_intent`]）：调用方拿不准时一律传 `None`，
+/// 于是键根本不出现，线上字节与改造前逐位相同。
+fn submit_body(job: &Job, image_base64: String, intent: Option<&SizeIntent>) -> Result<Value> {
+    let mut body = json!({
+        "image_base64": image_base64,
+        "name": job.name,
+        "source": job.source,
+        "height_meters": job.height_meters,
+    });
+    if let Some(intent) = intent {
+        // 形状只有一处定义（`SizeIntent` 自己），线格式与提交契约、落盘 JSON 同一份。
+        body["size_intent"] =
+            serde_json::to_value(intent).map_err(|_| "invalid_size_intent")?;
+    }
+    Ok(body)
+}
+
 /// The wire layer behind [`RemoteHTTPProvider::submit`]/`status`/`cancel`: the
 /// exact pre-trait implementation, kept verbatim as the reference the
 /// fixture-driven regression test compares the trait path against.
+///
+/// 唯一的增量是 `intent`：它只在**协商声明收得下**时非 `None`，而录制基准
+/// （`record_remote_wire`）与所有不带意图的调用都传 `None` —— 所以"缺失 ⇒ 字节不变"
+/// 这件事是由这一条签名保证的，不是靠约定。
 pub async fn request(
     client: &Client,
     job: &Job,
     token: &str,
     submit: bool,
     cancel: bool,
+    intent: Option<&SizeIntent>,
 ) -> Result<Value> {
     let (method, url, body, key) = if submit {
         let path = job.image_path.clone();
@@ -86,9 +120,11 @@ pub async fn request(
         (
             Method::POST,
             format!("{}/v1/jobs", job.endpoint),
-            Some(
-                json!({"image_base64":base64::engine::general_purpose::STANDARD.encode(bytes),"name":job.name,"source":job.source,"height_meters":job.height_meters}),
-            ),
+            Some(submit_body(
+                job,
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+                intent,
+            )?),
             Some(job.idempotency_key.as_str()),
         )
     } else {
@@ -219,6 +255,10 @@ pub struct ProviderCapabilities {
     /// Free-form admission/quota block. Opaque to the daemon.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota: Option<Value>,
+    /// 「收得下尺寸意图」的自报。**纯增量**：缺失 ⇒ `None` ⇒ 我们**不发**
+    /// `size_intent`，提交字节与今天逐位相同（老 DGX 服务正是这种）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_intent: Option<SizeIntentSupport>,
 }
 
 impl ProviderCapabilities {
@@ -319,18 +359,30 @@ fn capabilities(block: &Value) -> Result<ProviderCapabilities> {
         est_seconds,
         uploads_data: flag("uploads_data")?,
         quota,
+        size_intent: size_intent_support(block)?,
     })
 }
 
-/// `GET /health` for a target backend. Read-only and never part of a task run.
-/// The bearer header is only attached when the caller actually holds a
-/// credential for that origin, so a local backend without auth is probed
+/// `provider` 块里的 `size_intent` 声明。与块里其它字段同一条口径：**键缺失或 `null`
+/// ⇒ `None`**（"没声明"就是"收不下"，这正是老服务）；**键在但不合法 ⇒
+/// `invalid_provider_capabilities`**（那一份声明整块不可信，绝不当成"能力很强"）。
+///
+/// 单独一个函数是为了让 `/health` 的**准入**解析（[`health`]）与**能力**解析
+/// （[`probe_size_intent`]）读的是同一份形状，不会漂成两套。
+fn size_intent_support(block: &Value) -> Result<Option<SizeIntentSupport>> {
+    match block.get("size_intent") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|_| "invalid_provider_capabilities"),
+    }
+}
+
+/// `GET /health` for a target backend, parsed to JSON. Read-only and never part
+/// of a task run. The bearer header is only attached when the caller actually
+/// holds a credential for that origin, so a local backend without auth is probed
 /// unauthenticated instead of sending `Bearer `.
-async fn probe_health(
-    client: &Client,
-    endpoint: &str,
-    token: Option<&str>,
-) -> Result<ProviderCapabilities> {
+async fn read_health(client: &Client, endpoint: &str, token: Option<&str>) -> Result<Value> {
     let url = format!("{}/health", endpoint);
     let bytes = load(client, Method::GET, url, token, None, None, 1024 * 1024).await?;
     if let Some(token) = token {
@@ -342,7 +394,37 @@ async fn probe_health(
     if token.is_some_and(|token| contains_secret(&value, token)) {
         return Err("invalid_response");
     }
-    health(&value)
+    Ok(value)
+}
+
+/// 准入判据：`status`/`generation.ready` 都要过，再看 `provider` 块。
+async fn probe_health(
+    client: &Client,
+    endpoint: &str,
+    token: Option<&str>,
+) -> Result<ProviderCapabilities> {
+    health(&read_health(client, endpoint, token).await?)
+}
+
+/// **只问能力**的一次探测：读 `/health` 的 `provider.size_intent`，但**不**把
+/// "服务忙不忙"当成"收不收得下这个键"。
+///
+/// 为什么不复用 [`probe_health`]：`health()` 是**准入**判据（GPU 忙 ⇒
+/// `generation_not_ready`），而协商问的是另一件事。若把两者混在一起，同一件任务在
+/// Comfy 空闲时会带上轴、在忙时不带 —— 线上字节随机器负载漂移，那是最难查的一类不一致。
+///
+/// 任何失败（网络、非 200、JSON 不合法、`provider` 块不合法）都映射成 `None`：
+/// **协商的问题绝不升级成任务失败**（fail-closed 的方向是"这条不发"，不是"提交不发"）。
+async fn probe_size_intent(
+    client: &Client,
+    endpoint: &str,
+    token: Option<&str>,
+) -> Option<SizeIntentSupport> {
+    let value = read_health(client, endpoint, token).await.ok()?;
+    match value.get("provider") {
+        None | Some(Value::Null) => None,
+        Some(block) => size_intent_support(block).ok().flatten(),
+    }
 }
 
 /// Everything the daemon needs from a generation backend. The daemon owns
@@ -381,16 +463,58 @@ pub trait PropProvider: Send + Sync {
     }
 }
 
+/// 尺寸意图协商结果的缓存时长。
+///
+/// 只有**带意图**的提交才会问一次 `/health`：没有意图的老任务连一个多出来的请求都不发。
+/// 所以这个窗口只决定"DGX 补丁上线后多久自动生效"（不必改任何配置），不决定稳态开销
+/// （每个 endpoint 最多每 60 s 一次）。缓存**正负都存**：老服务没有声明这件事本身也要记住，
+/// 否则每一件带意图的任务都要多花一次往返去确认同一个"没有"。
+const SIZE_INTENT_NEGOTIATION_TTL: Duration = Duration::from_secs(60);
+
 /// The only backend shipped so far: the remote job API the DGX service speaks.
 /// Every method delegates to the unchanged `request`/`download` functions
 /// above, so the wire behaviour is identical to the pre-trait daemon.
 pub struct RemoteHTTPProvider {
     client: Client,
+    /// endpoint → 上一次协商到的 `size_intent` 声明（`None` = 问过了，收不下），
+    /// 以及记下它的时刻。进程内共享，与 `daemon.rs` 里唯一那个 `Arc<dyn PropProvider>`
+    /// 同寿命。
+    size_intent: Mutex<HashMap<String, (Option<SizeIntentSupport>, Instant)>>,
 }
 
 impl RemoteHTTPProvider {
     pub fn new(client: Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            size_intent: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 这一条意图现在能不能发给这个 endpoint。
+    ///
+    /// 三道闸，任何一道不过就是 `None`（= 不发那个键，提交照常）：
+    /// 1. 任务上**没有**意图 ⇒ 立刻返回，连一次 `/health` 都不发；
+    /// 2. 缓存新鲜 ⇒ 直接用；
+    /// 3. 否则尽力探一次 `/health`，失败/缺失/不合法一律当"收不下"，并把结论缓存起来。
+    async fn accepted_size_intent(&self, job: &Job, token: &str) -> Option<SizeIntent> {
+        let intent = job.size_intent?;
+        // 独立作用域：`MutexGuard` 必须在任何 `.await` 之前析构，否则 future 不再是 Send。
+        let cached = {
+            let cache = self.size_intent.lock().ok()?;
+            cache.get(&job.endpoint).cloned()
+        };
+        if let Some((support, at)) = cached {
+            if at.elapsed() < SIZE_INTENT_NEGOTIATION_TTL {
+                return support.filter(|support| support.accepts(&intent)).map(|_| intent);
+            }
+        }
+        let support = probe_size_intent(&self.client, &job.endpoint, Some(token)).await;
+        if let Ok(mut cache) = self.size_intent.lock() {
+            cache.insert(job.endpoint.clone(), (support.clone(), Instant::now()));
+        }
+        support
+            .filter(|support| support.accepts(&intent))
+            .map(|_| intent)
     }
 }
 
@@ -411,6 +535,8 @@ impl PropProvider for RemoteHTTPProvider {
             est_seconds: None,
             uploads_data: Some(true),
             quota: None,
+            // 静态自述不替任何 endpoint 声明能力：这一位只由 `/health` 协商填。
+            size_intent: None,
         }
     }
     fn probe<'a>(
@@ -421,13 +547,16 @@ impl PropProvider for RemoteHTTPProvider {
         Box::pin(async move { probe_health(&self.client, endpoint, token).await })
     }
     fn submit<'a>(&'a self, job: &'a Job, token: &'a str) -> ProviderFuture<'a, Result<Value>> {
-        Box::pin(async move { request(&self.client, job, token, true, false).await })
+        Box::pin(async move {
+            let intent = self.accepted_size_intent(job, token).await;
+            request(&self.client, job, token, true, false, intent.as_ref()).await
+        })
     }
     fn status<'a>(&'a self, job: &'a Job, token: &'a str) -> ProviderFuture<'a, Result<Value>> {
-        Box::pin(async move { request(&self.client, job, token, false, false).await })
+        Box::pin(async move { request(&self.client, job, token, false, false, None).await })
     }
     fn cancel<'a>(&'a self, job: &'a Job, token: &'a str) -> ProviderFuture<'a, Result<Value>> {
-        Box::pin(async move { request(&self.client, job, token, false, true).await })
+        Box::pin(async move { request(&self.client, job, token, false, true, None).await })
     }
     fn fetch_model<'a>(
         &'a self,
@@ -486,60 +615,100 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let origin = format!("http://127.0.0.1:{port}");
         let handle = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut raw = Vec::new();
-            let mut buffer = [0u8; 8192];
-            let mut head_end = None;
-            let mut content_length = 0usize;
-            loop {
-                let count = socket.read(&mut buffer).await.unwrap();
-                if count == 0 {
-                    break;
-                }
-                raw.extend_from_slice(&buffer[..count]);
-                if head_end.is_none() {
-                    if let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
-                        head_end = Some(at + 4);
-                        let head = String::from_utf8_lossy(&raw[..at]).to_ascii_lowercase();
-                        content_length = head
-                            .lines()
-                            .find_map(|line| line.strip_prefix("content-length:"))
-                            .and_then(|value| value.trim().parse().ok())
-                            .unwrap_or(0);
-                    }
-                }
-                if head_end.is_some_and(|at| raw.len() >= at + content_length) {
-                    break;
-                }
-            }
-            let at = head_end.expect("request head");
-            let head = String::from_utf8_lossy(&raw[..at]).into_owned();
-            let request_body = String::from_utf8_lossy(&raw[at..]).into_owned();
-            let reason = match status {
-                200 => "OK",
-                302 => "Found",
-                400 => "Bad Request",
-                401 => "Unauthorized",
-                403 => "Forbidden",
-                409 => "Conflict",
-                422 => "Unprocessable Entity",
-                _ => "Error",
-            };
-            let mut response = format!("HTTP/1.1 {status} {reason}\r\n");
-            for (key, value) in extra {
-                response.push_str(&format!("{key}: {value}\r\n"));
-            }
-            response.push_str(&format!(
-                "Content-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            ));
-            let mut bytes = response.into_bytes();
-            bytes.extend_from_slice(&body);
-            let _ = socket.write_all(&bytes).await;
-            let _ = socket.flush().await;
-            Captured { head, body: request_body }
+            accept_one(&listener, status, extra, body).await
         });
         (origin, handle)
+    }
+
+    /// 同一端口上**按顺序**应答 N 个连接，逐条录下原始请求。
+    ///
+    /// 用在"一次 `submit()` 其实会先说一句 `/health`"的路径上：协商与提交必须落在
+    /// **同一个 origin**，否则缓存键不同、录下来的也不是同一条链路。
+    pub(crate) async fn serve_many(
+        responses: Vec<(u16, Vec<(&'static str, String)>, Vec<u8>)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<Captured>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let origin = format!("http://127.0.0.1:{port}");
+        let handle = tokio::spawn(async move {
+            let mut captured = Vec::new();
+            for (status, extra, body) in responses {
+                captured.push(accept_one(&listener, status, extra, body).await);
+            }
+            captured
+        });
+        (origin, handle)
+    }
+
+    /// Accepts exactly one connection on an already-bound listener, records the
+    /// request bytes, answers with the canned response and closes.
+    ///
+    /// `accept` 带超时：录制器与断言都靠"第 N 个连接真的来了"来表达事实，
+    /// 期望的连接没来时必须**当场失败**，而不是把测试挂死到 CI 超时。
+    async fn accept_one(
+        listener: &TcpListener,
+        status: u16,
+        extra: Vec<(&'static str, String)>,
+        body: Vec<u8>,
+    ) -> Captured {
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+            .await
+            .expect("no further request arrived on this listener (a probe or call is missing)")
+            .unwrap();
+        let mut raw = Vec::new();
+        let mut buffer = [0u8; 8192];
+        let mut head_end = None;
+        let mut content_length = 0usize;
+        loop {
+            let count = socket.read(&mut buffer).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            raw.extend_from_slice(&buffer[..count]);
+            if head_end.is_none() {
+                if let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    head_end = Some(at + 4);
+                    let head = String::from_utf8_lossy(&raw[..at]).to_ascii_lowercase();
+                    content_length = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse().ok())
+                        .unwrap_or(0);
+                }
+            }
+            if head_end.is_some_and(|at| raw.len() >= at + content_length) {
+                break;
+            }
+        }
+        let at = head_end.expect("request head");
+        let head = String::from_utf8_lossy(&raw[..at]).into_owned();
+        let request_body = String::from_utf8_lossy(&raw[at..]).into_owned();
+        let reason = match status {
+            200 => "OK",
+            302 => "Found",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            403 => "Forbidden",
+            409 => "Conflict",
+            422 => "Unprocessable Entity",
+            _ => "Error",
+        };
+        let mut response = format!("HTTP/1.1 {status} {reason}\r\n");
+        for (key, value) in extra {
+            response.push_str(&format!("{key}: {value}\r\n"));
+        }
+        response.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        ));
+        let mut bytes = response.into_bytes();
+        bytes.extend_from_slice(&body);
+        let _ = socket.write_all(&bytes).await;
+        let _ = socket.flush().await;
+        Captured {
+            head,
+            body: request_body,
+        }
     }
 
     /// Canonical view of what actually went over the socket: request line, all
@@ -624,7 +793,7 @@ mod tests {
         )
         .await;
         job.endpoint = origin.clone();
-        let submitted = request(&client, &job, token, true, false).await.unwrap();
+        let submitted = request(&client, &job, token, true, false, None).await.unwrap();
         let submit_wire = wire(&server.await.unwrap(), &origin);
 
         let mut polling = job.clone();
@@ -636,7 +805,7 @@ mod tests {
         )
         .await;
         polling.endpoint = origin.clone();
-        let status = request(&client, &polling, token, false, false).await.unwrap();
+        let status = request(&client, &polling, token, false, false, None).await.unwrap();
         let status_wire = wire(&server.await.unwrap(), &origin);
 
         let (origin, server) = serve_once(
@@ -646,7 +815,7 @@ mod tests {
         )
         .await;
         polling.endpoint = origin.clone();
-        let cancelled = request(&client, &polling, token, false, true).await.unwrap();
+        let cancelled = request(&client, &polling, token, false, true, None).await.unwrap();
         let cancel_wire = wire(&server.await.unwrap(), &origin);
 
         let (origin, server) = serve_once(200, vec![], glb.clone()).await;
@@ -907,7 +1076,7 @@ mod tests {
             )
             .await;
             job.endpoint = origin.clone();
-            let via_free = request(&client().unwrap(), &job, token, true, false).await;
+            let via_free = request(&client().unwrap(), &job, token, true, false, None).await;
             let _ = server.await;
 
             assert_eq!(via_trait, Err(expected), "status {status}");
@@ -1018,6 +1187,385 @@ mod tests {
             Err("provider_not_ready")
         );
         let _ = server.await;
+    }
+
+    /// 生成服务自报的「收得下尺寸意图」声明，与 DGX 补丁写进 `/health` 的那一份逐字相同。
+    /// 录制 fixture 与 DGX 补丁共用这一个形状：两边不会各自漂一套。
+    fn declared_health() -> Value {
+        json!({
+            "status": "api_ready",
+            "generation": {"ready": true, "available_gib": 88.0, "profile": "trellis2-prop-low-v1"},
+            "provider": {
+                "id": "gmgn-prop-service",
+                "kind": "remote_http",
+                "size_intent": {
+                    "axes": ["height", "longest"],
+                    "min_meters": 0.01,
+                    "max_meters": 3.0,
+                    "applies": "echo",
+                },
+            },
+        })
+    }
+
+    fn job_with_intent(recorded: &Value, root: &std::path::Path) -> Job {
+        job_from_fixture(recorded, root)
+    }
+
+    fn intent_value() -> Value {
+        json!({"axis": "longest", "meters": 1.1, "source": "user"})
+    }
+
+    /// `provider` 块口径的断言：**键缺失/null ⇒ 没声明**（老服务），**在但不合法 ⇒
+    /// 整块不可信**。两条都不会退化成"随便发"。
+    #[test]
+    fn the_provider_block_declaration_is_additive_and_strict() {
+        for block in [
+            json!({}),
+            json!({"size_intent": null}),
+            json!({"id": "dgx", "max_input_px": 512}),
+        ] {
+            assert_eq!(size_intent_support(&block), Ok(None), "{block}");
+        }
+        let declared = declared_health();
+        assert_eq!(
+            size_intent_support(&declared["provider"]),
+            Ok(Some(SizeIntentSupport {
+                axes: vec![
+                    crate::model::SizeIntentAxis::Height,
+                    crate::model::SizeIntentAxis::Longest,
+                ],
+                min_meters: 0.01,
+                max_meters: 3.0,
+                applies: crate::model::SizeIntentApplies::Echo,
+            }))
+        );
+        // 兼容性证据：老 fixture（没有 `provider` 块）解析结果与改造前**逐位相同**。
+        assert_eq!(
+            health(&read_fixture("health_legacy.json")).unwrap(),
+            ProviderCapabilities::default()
+        );
+        // 在但不合法 ⇒ 整块不可信，而不是"能力很强"。
+        for block in [
+            json!({"size_intent": {"axes": ["height"], "min_meters": 0.01, "max_meters": 3.0}}),
+            json!({"size_intent": {"axes": ["width"], "min_meters": 0.01, "max_meters": 3.0, "applies": "echo"}}),
+            json!({"size_intent": 2048}),
+        ] {
+            assert_eq!(
+                size_intent_support(&block),
+                Err("invalid_provider_capabilities"),
+                "{block}"
+            );
+            assert_eq!(
+                capabilities(&block),
+                Err("invalid_provider_capabilities"),
+                "{block}"
+            );
+        }
+        // 合法的声明要能一路穿过 `health()`（也就是 `provider_probe` 报给 app 的那一份）。
+        assert_eq!(
+            health(&declared_health()).unwrap().size_intent,
+            size_intent_support(&declared_health()["provider"]).unwrap()
+        );
+    }
+
+    /// Records the exact wire bytes of an **intent-bearing** submission into
+    /// `tests/fixtures/remote_http_size_intent.json`: the negotiation probe and
+    /// the submit, recorded from a real socket in order.
+    /// Run explicitly with `GMGN_RECORD_TASKD_FIXTURES=1 cargo test record_remote_size_intent_wire`.
+    #[tokio::test]
+    async fn record_remote_size_intent_wire() {
+        if std::env::var("GMGN_RECORD_TASKD_FIXTURES").as_deref() != Ok("1") {
+            return;
+        }
+        let baseline = read_fixture("remote_http.json");
+        let token = baseline["token"].as_str().unwrap();
+        let receipt = baseline["receipt"].clone();
+        let root = temp_root();
+
+        // 共享基线里的那一张图与那一份回执：新录的链路**只**多了"意图"这一件事。
+        let mut fixture = baseline.clone();
+        let mut job_json = baseline["job"].clone();
+        job_json["sizeIntent"] = intent_value();
+        fixture["job"] = job_json;
+
+        let capability = declared_health();
+        let mut job = job_with_intent(&fixture, &root);
+        let provider = RemoteHTTPProvider::new(client().unwrap());
+        let (origin, server) = serve_many(vec![
+            (
+                200,
+                json_headers(),
+                serde_json::to_vec(&capability).unwrap(),
+            ),
+            (200, json_headers(), serde_json::to_vec(&receipt).unwrap()),
+        ])
+        .await;
+        job.endpoint = origin.clone();
+        let submitted = provider.submit(&job, token).await.unwrap();
+        let captured = server.await.unwrap();
+        assert_eq!(captured.len(), 2, "带意图的提交必须先协商一次 /health");
+
+        let recorded = json!({
+            "token": token,
+            "job": fixture["job"].clone(),
+            "png_base64": fixture["png_base64"].clone(),
+            "png_sha256": fixture["png_sha256"].clone(),
+            "glb_base64": baseline["glb_base64"].clone(),
+            "glb_sha256": baseline["glb_sha256"].clone(),
+            "remote_id": baseline["remote_id"].clone(),
+            "receipt": receipt,
+            "capability": capability,
+            "wire": {
+                "health": wire(&captured[0], &origin),
+                "submit": wire(&captured[1], &origin),
+            },
+            "expected": {"submit_receipt": submitted},
+        });
+        let mut encoded = serde_json::to_vec_pretty(&recorded).unwrap();
+        encoded.push(b'\n');
+        std::fs::write(fixture_path("remote_http_size_intent.json"), encoded).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 断言 1（**存在 ⇒ 按它发**）：服务端声明收得下 ⇒ 提交字节**逐位**等于录制值，
+    /// 而且**先**问了一次 `/health`。
+    /// 断言 2（**缺失 ⇒ 字节不变**）：同一件任务去掉意图 ⇒ 一个多出来的请求都不发，
+    /// 字节逐位等于 `remote_http.json` 的录制值。
+    #[tokio::test]
+    async fn the_size_intent_is_sent_only_when_declared_and_absent_keeps_todays_bytes() {
+        let recorded = read_fixture("remote_http_size_intent.json");
+        let baseline = read_fixture("remote_http.json");
+        let token = recorded["token"].as_str().unwrap();
+        let root = temp_root();
+
+        // ---- 断言 2a，纯文本，不经过任何代码路径：把录制下来的那一份 body 去掉
+        // `size_intent` 成员，剩下的字节与基线**逐位**相同。也就是说这次改动只多了这一个键，
+        // 别的字节（`height_meters`、`name`、`source`、base64 图片）一个都没动。
+        let mut members: serde_json::Map<String, Value> = serde_json::from_str(
+            recorded["wire"]["submit"]["body"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            members.remove("size_intent").unwrap(),
+            intent_value(),
+            "发出去的轴必须就是任务上那一份"
+        );
+        assert_eq!(
+            serde_json::to_string(&Value::Object(members)).unwrap(),
+            baseline["wire"]["submit"]["body"].as_str().unwrap(),
+            "去掉 size_intent 之后与基线不再逐位相同"
+        );
+
+        // ---- 断言 2b，真实 trait 路径：不带意图 ⇒ 连 `/health` 都不问（`serve_once`
+        // 只应答一个连接，多问一次就会把回执吃掉 ⇒ 提交直接失败）。
+        let mut plain = job_with_intent(&recorded, &root);
+        plain.size_intent = None;
+        let provider = RemoteHTTPProvider::new(client().unwrap());
+        let (origin, server) = serve_once(
+            200,
+            json_headers(),
+            serde_json::to_vec(&recorded["receipt"]).unwrap(),
+        )
+        .await;
+        plain.endpoint = origin.clone();
+        let unchanged = provider.submit(&plain, token).await.unwrap();
+        let seen = wire(&server.await.unwrap(), &origin);
+        assert_eq!(seen["path"], "/v1/jobs");
+        assert_eq!(
+            seen["body"],
+            baseline["wire"]["submit"]["body"],
+            "没有意图的提交字节必须与今天逐位相同"
+        );
+        assert_fields_equal("", &unchanged, &baseline["expected"]["submit_receipt"]);
+
+        // ---- 断言 1：声明了 ⇒ 先协商、再按意图发，两条线上字节都与录制值相同。
+        let provider = RemoteHTTPProvider::new(client().unwrap());
+        let capability = recorded["capability"].clone();
+        let (origin, server) = serve_many(vec![
+            (
+                200,
+                json_headers(),
+                serde_json::to_vec(&capability).unwrap(),
+            ),
+            (
+                200,
+                json_headers(),
+                serde_json::to_vec(&recorded["receipt"]).unwrap(),
+            ),
+        ])
+        .await;
+        let mut job = job_with_intent(&recorded, &root);
+        job.endpoint = origin.clone();
+        let submitted = provider.submit(&job, token).await.unwrap();
+        let captured = server.await.unwrap();
+        assert_eq!(captured.len(), 2, "带意图的提交必须先协商一次 /health");
+        assert_eq!(wire(&captured[0], &origin), recorded["wire"]["health"]);
+        assert_eq!(wire(&captured[1], &origin), recorded["wire"]["submit"]);
+        assert_fields_equal("", &submitted, &recorded["expected"]["submit_receipt"]);
+        let sent: Value =
+            serde_json::from_str(captured[1].body.as_str()).unwrap();
+        assert_eq!(sent["size_intent"], intent_value());
+        assert_eq!(sent["height_meters"], baseline["job"]["height_meters"]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 协商的结果只有两种，**都不许把任务弄失败**：声明对不上（轴/区间/形状/探测失败）
+    /// ⇒ 不发那个键、提交照常；而且"问过了仍然不发"这件事是要看到那次 `/health` 才成立的。
+    #[tokio::test]
+    async fn a_missing_or_unusable_declaration_never_breaks_the_submission() {
+        let recorded = read_fixture("remote_http_size_intent.json");
+        let baseline = read_fixture("remote_http.json");
+        let token = recorded["token"].as_str().unwrap();
+        let root = temp_root();
+
+        let mut legacy_health = declared_health();
+        legacy_health.as_object_mut().unwrap().remove("provider");
+        let mut only_height = declared_health();
+        only_height["provider"]["size_intent"]["axes"] = json!(["height"]);
+        let mut narrow = declared_health();
+        narrow["provider"]["size_intent"]["min_meters"] = json!(0.2);
+        narrow["provider"]["size_intent"]["max_meters"] = json!(0.8);
+        let mut malformed = declared_health();
+        malformed["provider"]["size_intent"]["applies"] = json!("maybe");
+        let mut wrong_axis_word = declared_health();
+        wrong_axis_word["provider"]["size_intent"]["axes"] = json!(["width"]);
+
+        for (label, status, health) in [
+            ("老服务没有 provider 块", 200, legacy_health),
+            ("只声明了 height 这一根轴", 200, only_height),
+            ("声明的区间盖不住 1.1 m", 200, narrow),
+            ("声明不合法（applies 不认识）", 200, malformed),
+            ("声明里有个我们不认识的轴", 200, wrong_axis_word),
+            ("/health 直接 500", 500, json!({"error": "internal_error"})),
+        ] {
+            let provider = RemoteHTTPProvider::new(client().unwrap());
+            let (origin, server) = serve_many(vec![
+                (status, json_headers(), serde_json::to_vec(&health).unwrap()),
+                (
+                    200,
+                    json_headers(),
+                    serde_json::to_vec(&recorded["receipt"]).unwrap(),
+                ),
+            ])
+            .await;
+            let mut job = job_with_intent(&recorded, &root);
+            job.endpoint = origin.clone();
+            let submitted = provider.submit(&job, token).await.unwrap_or_else(|e| {
+                panic!("{label}：协商的问题被升级成了任务失败（{e}）")
+            });
+            let captured = server.await.unwrap();
+            assert_eq!(captured.len(), 2, "{label}：应当先问一次 /health");
+            assert_eq!(wire(&captured[0], &origin)["path"], "/health", "{label}");
+            let seen = wire(&captured[1], &origin);
+            assert_eq!(seen["path"], "/v1/jobs", "{label}");
+            assert_eq!(
+                seen["body"],
+                baseline["wire"]["submit"]["body"],
+                "{label}：不该发 size_intent，字节必须与今天逐位相同"
+            );
+            assert_fields_equal("", &submitted, &baseline["expected"]["submit_receipt"]);
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 一次协商管一段时间：同一 endpoint 的连续提交只问一次 `/health`（缓存），
+    /// 不会每件任务都多一次往返。
+    #[tokio::test]
+    async fn one_declaration_is_negotiated_once_per_endpoint() {
+        let recorded = read_fixture("remote_http_size_intent.json");
+        let token = recorded["token"].as_str().unwrap();
+        let root = temp_root();
+        let provider = RemoteHTTPProvider::new(client().unwrap());
+        let (origin, server) = serve_many(vec![
+            (
+                200,
+                json_headers(),
+                serde_json::to_vec(&recorded["capability"]).unwrap(),
+            ),
+            (
+                200,
+                json_headers(),
+                serde_json::to_vec(&recorded["receipt"]).unwrap(),
+            ),
+            (
+                200,
+                json_headers(),
+                serde_json::to_vec(&recorded["receipt"]).unwrap(),
+            ),
+        ])
+        .await;
+        for _ in 0..2 {
+            let mut job = job_with_intent(&recorded, &root);
+            job.endpoint = origin.clone();
+            provider.submit(&job, token).await.unwrap();
+        }
+        let captured = server.await.unwrap();
+        assert_eq!(captured.len(), 3, "第二次提交不该再问一次 /health");
+        assert_eq!(wire(&captured[0], &origin)["path"], "/health");
+        for index in [1, 2] {
+            assert_eq!(
+                wire(&captured[index], &origin),
+                recorded["wire"]["submit"],
+                "第 {index} 次提交的字节应当与录制值相同"
+            );
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 断言（任务书第 3 条，线上那一半）：回执回显的意图与发出去的不一致 ⇒ 明确错误码。
+    /// app 侧意图优先于权威尺寸，所以矛盾的那一份**不会被任何人看见** —— 必须在这里断住。
+    #[tokio::test]
+    async fn a_conflicting_echo_in_the_receipt_is_a_named_error() {
+        let recorded = read_fixture("remote_http_size_intent.json");
+        let token = recorded["token"].as_str().unwrap();
+        let root = temp_root();
+        let capability = recorded["capability"].clone();
+
+        for (label, echo, expected) in [
+            (
+                "回显的米数不是我们要的",
+                Some(json!({"axis": "longest", "meters": 1.2, "source": "user"})),
+                Err("size_intent_echo_conflict"),
+            ),
+            (
+                "回显的轴不是我们要的",
+                Some(json!({"axis": "height", "meters": 1.1, "source": "user"})),
+                Err("size_intent_echo_conflict"),
+            ),
+            (
+                "原样回显",
+                Some(intent_value()),
+                Ok(()),
+            ),
+            ("不回显", None, Ok(())),
+        ] {
+            let mut receipt = recorded["receipt"].clone();
+            if let Some(echo) = echo {
+                receipt["size_intent"] = echo;
+            }
+            let provider = RemoteHTTPProvider::new(client().unwrap());
+            let (origin, server) = serve_many(vec![
+                (
+                    200,
+                    json_headers(),
+                    serde_json::to_vec(&capability).unwrap(),
+                ),
+                (200, json_headers(), serde_json::to_vec(&receipt).unwrap()),
+            ])
+            .await;
+            let mut job = job_with_intent(&recorded, &root);
+            job.endpoint = origin.clone();
+            assert_eq!(
+                provider.submit(&job, token).await.map(|_| ()),
+                expected,
+                "{label}"
+            );
+            let captured = server.await.unwrap();
+            // 无论回执怎么回事，发出去的字节都按意图走 —— 冲突只在**收**的时候判。
+            assert_eq!(wire(&captured[1], &origin), recorded["wire"]["submit"], "{label}");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
 

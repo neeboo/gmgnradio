@@ -91,6 +91,59 @@ impl SizeIntent {
     }
 }
 
+/// 比较意图米数与权威尺寸时用的绝对容差（米）。1e-4 m = 0.1 mm：GLB 顶点本来就只有
+/// float32 精度，服务端把三维尺寸四舍五入到毫米也落在这个范围内；相对容差另取 1e-3，
+/// 于是 1.1 m 这种尺寸允许 1.1 mm 的往返误差。取严的理由：这一条比的是"同一件事"，
+/// 宽松到能把 1.0 和 1.1 混为一谈就失去意义了。
+pub const SIZE_INTENT_SIZE_TOLERANCE: f64 = 1e-4;
+
+/// 生成服务在 `/health` 的 `provider` 块里**自报**的「收得下尺寸意图」能力。
+///
+/// 为什么必须先协商再发（2026-10-02 只读勘察 `/home/spark/gmgn-prop-service/prop_service.py`）：
+/// 服务端 `validate_request` 第一句就是 `set(data) != allowed ⇒ invalid_fields`，即**严格拒绝
+/// 未知键**。所以"我们多带一个键、老服务忽略它"这条最省事的路在真机上会**当场打断全链路**
+/// （每个任务 400 ⇒ `request_rejected`）。于是：**只有服务端自己声明收得下，我们才发**；
+/// 声明缺失、探测失败、声明不合法，一律按"收不下"处理（fail-closed）—— 宁可这一件仍按
+/// 老办法（app 自己缩放），也不能让提交本身失败。
+///
+/// 与 `provider` 块里其它字段同一条口径：**块或这个键缺失 ⇒ `None` ⇒ 提交字节与今天逐位
+/// 相同**；键在但不合法 ⇒ `invalid_provider_capabilities`（那一份声明整块不可信）。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SizeIntentSupport {
+    /// 收得下的轴。空数组合法，但等于一根都不收。
+    pub axes: Vec<SizeIntentAxis>,
+    /// 收得下的米数闭区间。
+    pub min_meters: f64,
+    pub max_meters: f64,
+    /// 收到轴之后**做**什么：`normalize` = 服务端自己按轴把导出归一到米数；
+    /// `echo` = 只接受并原样回显，缩放仍由 app 负责。
+    ///
+    /// **必须明写**：缺这个字段就是"收不下"。不允许我们替服务端假设它归一了
+    /// —— 把"只回显"当成"已归一"会让 app 不再缩放，产物直接错尺寸。
+    pub applies: SizeIntentApplies,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SizeIntentApplies {
+    Normalize,
+    Echo,
+}
+
+impl SizeIntentSupport {
+    /// 这一条意图现在能不能发。三条全过才行：轴在清单里、区间自身合法、米数落在闭区间里。
+    ///
+    /// 区间不合法（非有限、上下颠倒）时**不**发：一份自相矛盾的声明不能当成"随便发"。
+    pub fn accepts(&self, intent: &SizeIntent) -> bool {
+        self.axes.contains(&intent.axis)
+            && self.min_meters.is_finite()
+            && self.max_meters.is_finite()
+            && self.min_meters <= self.max_meters
+            && (self.min_meters..=self.max_meters).contains(&intent.meters)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Job {
@@ -436,6 +489,20 @@ pub fn receipt(value: &Value, job: &Job) -> Result<()> {
     {
         return Err("invalid_response");
     }
+    // 回执**回显**的尺寸意图（服务端把我们发出去的那一份原样带回来）。它要么不在、
+    // 要么与任务上那一份**逐字段相同**：不同就说明服务端记下的不是我们要的，收下就等于
+    // 两套尺寸。缺失**不算**冲突（不是每个服务端都回显），所以老服务照常工作。
+    //
+    // 比较用**解析后的字段**而不是 JSON 值：`serde_json` 里 `Number(1) != Number(1.0)`，
+    // 而调用方完全可能把 1 米写成 `1`、服务端（Python）又会把整数原样带回来 —— 按值比较
+    // 会把"同一个 1 米"判成冲突。解析还顺带强制了恰好三个键的形状。
+    if !value["size_intent"].is_null() {
+        let echoed = serde_json::from_value::<SizeIntent>(value["size_intent"].clone())
+            .map_err(|_| "size_intent_echo_conflict")?;
+        if Some(echoed) != job.size_intent {
+            return Err("size_intent_echo_conflict");
+        }
+    }
     if state == "completed" || !value["result"].is_null() {
         let r = &value["result"];
         for key in ["model_url", "interaction_status", "workflow_profile"] {
@@ -494,6 +561,8 @@ pub fn receipt(value: &Value, job: &Job) -> Result<()> {
         // —— 静默忽略会让碰撞形状在用户不知情的情况下从代理退回 yaw 盒子。
         collision_descriptor(r)?;
         authoritative_size(r)?;
+        // 意图与权威尺寸并存时不许有两份真相。
+        size_intent_agrees_with_authoritative_size(job, r)?;
     }
     Ok(())
 }
@@ -621,6 +690,40 @@ pub fn authoritative_size(result: &Value) -> Result<Option<AuthoritativeSize>> {
         up_axis: up_axis.to_owned(),
         forward_axis: forward_axis.to_owned(),
     }))
+}
+
+/// 我们发出的**尺寸意图**与生成侧回执里的 `authoritative_size` 必须说同一件事。
+///
+/// 为什么（app 侧的优先级已经定死：`用户手动 > 尺寸意图 > 工作流权威尺寸 > 自动推断`，
+/// 见 `WorldPropLayout.sizeProvenance`/`effectiveSize`）：意图存在时 app 读的是**意图**，
+/// 权威尺寸被压到第二。于是两者矛盾时，回执里那个数字**永远不会被任何人看见**，却会被
+/// 当成"生成侧确认过"记进资产元数据 —— 那就是两份互相矛盾的真相，而且错的那份是静默的。
+/// 所以这里**硬失败**并给出专门的错误码，而不是让 app 自己挑一个信。
+///
+/// 判据（尺寸与 `up_axis`/`forward_axis` 同一坐标系，单位米）：
+/// - `axis == "height"`：上下轴那一维（`up_axis` 只可能是 `±Y` ⇒ `dimensions[1]`）等于意图米数；
+/// - `axis == "longest"`：三维里最大的一维等于意图米数。
+/// 容差见 [`SIZE_INTENT_SIZE_TOLERANCE`]。
+///
+/// 老任务（没有意图）与老服务（不发 `authoritative_size`）都不会走到这里 ⇒ 行为不变。
+fn size_intent_agrees_with_authoritative_size(job: &Job, result: &Value) -> Result<()> {
+    let Some(intent) = job.size_intent else {
+        return Ok(());
+    };
+    let Some(authoritative) = authoritative_size(result)? else {
+        return Ok(());
+    };
+    let measured = match intent.axis {
+        SizeIntentAxis::Height => authoritative.dimensions[1],
+        SizeIntentAxis::Longest => authoritative
+            .dimensions
+            .iter()
+            .fold(0.0_f64, |longest, edge| longest.max(*edge)),
+    };
+    if (measured - intent.meters).abs() > SIZE_INTENT_SIZE_TOLERANCE.max(intent.meters * 1e-3) {
+        return Err("authoritative_size_conflicts_with_intent");
+    }
+    Ok(())
 }
 
 /// 回执是否**声明**了碰撞代理。调用方用它决定"要不要去下载代理"。
@@ -1267,5 +1370,228 @@ mod tests {
             submit.parsed_size_intent().unwrap().unwrap().axis,
             SizeIntentAxis::Height
         );
+    }
+
+    fn intent(axis: SizeIntentAxis, meters: f64) -> SizeIntent {
+        SizeIntent {
+            axis,
+            meters,
+            source: SizeIntentSource::User,
+        }
+    }
+
+    fn support(axes: &[SizeIntentAxis], min: f64, max: f64, applies: SizeIntentApplies) -> SizeIntentSupport {
+        SizeIntentSupport {
+            axes: axes.to_vec(),
+            min_meters: min,
+            max_meters: max,
+            applies,
+        }
+    }
+
+    /// 能力声明是**唯一的发送闸门**：轴要在清单里、米数要落在闭区间里。任何一条不过就是
+    /// "不发这个键"——不是"提交失败"，也不是"照发然后让服务端 400"。
+    #[test]
+    fn a_declaration_only_accepts_the_axes_and_the_range_it_names() {
+        let both = support(
+            &[SizeIntentAxis::Longest, SizeIntentAxis::Height],
+            0.01,
+            3.0,
+            SizeIntentApplies::Normalize,
+        );
+        assert!(both.accepts(&intent(SizeIntentAxis::Longest, 1.1)));
+        assert!(both.accepts(&intent(SizeIntentAxis::Height, 0.42)));
+        // 区间是闭的：两个端点都算收得下。
+        assert!(both.accepts(&intent(SizeIntentAxis::Longest, 0.01)));
+        assert!(both.accepts(&intent(SizeIntentAxis::Longest, 3.0)));
+        assert!(!both.accepts(&intent(SizeIntentAxis::Longest, 0.009)));
+        assert!(!both.accepts(&intent(SizeIntentAxis::Longest, 3.001)));
+
+        // 只声明一根轴：另一根一发就会 400，所以**不能**发。
+        let only_height = support(
+            &[SizeIntentAxis::Height],
+            0.01,
+            3.0,
+            SizeIntentApplies::Echo,
+        );
+        assert!(only_height.accepts(&intent(SizeIntentAxis::Height, 1.1)));
+        assert!(!only_height.accepts(&intent(SizeIntentAxis::Longest, 1.1)));
+
+        // 窄区间同理：声明 0.2–0.8 就不许发 1.1。
+        let narrow = support(
+            &[SizeIntentAxis::Longest],
+            0.2,
+            0.8,
+            SizeIntentApplies::Normalize,
+        );
+        assert!(narrow.accepts(&intent(SizeIntentAxis::Longest, 0.5)));
+        assert!(!narrow.accepts(&intent(SizeIntentAxis::Longest, 1.1)));
+
+        // 空清单 / 自相矛盾的区间：一份坏声明不能被当成"随便发"。
+        assert!(!support(&[], 0.01, 3.0, SizeIntentApplies::Normalize)
+            .accepts(&intent(SizeIntentAxis::Longest, 1.1)));
+        assert!(!support(
+            &[SizeIntentAxis::Longest],
+            0.8,
+            0.2,
+            SizeIntentApplies::Normalize
+        )
+        .accepts(&intent(SizeIntentAxis::Longest, 0.5)));
+        assert!(!support(
+            &[SizeIntentAxis::Longest],
+            f64::NAN,
+            3.0,
+            SizeIntentApplies::Normalize
+        )
+        .accepts(&intent(SizeIntentAxis::Longest, 0.5)));
+    }
+
+    /// 声明本身的形状：`deny_unknown_fields` + 三根轴的词汇 + 语义必写。
+    #[test]
+    fn the_size_intent_declaration_is_strict_about_its_own_shape() {
+        // 完整声明解析成契约里的那一份。
+        assert_eq!(
+            serde_json::from_value::<SizeIntentSupport>(json!({
+                "axes": ["height", "longest"],
+                "min_meters": 0.01,
+                "max_meters": 3.0,
+                "applies": "echo",
+            }))
+            .unwrap(),
+            support(
+                &[SizeIntentAxis::Height, SizeIntentAxis::Longest],
+                0.01,
+                3.0,
+                SizeIntentApplies::Echo
+            )
+        );
+        // 未知键、未知轴、未知语义、缺字段、类型错 —— 一律拒收。**绝不**降级成"能力很强"：
+        // 把"只回显"读成"已归一"会让 app 不再缩放，产物直接错尺寸。
+        for block in [
+            json!({"axes": ["height"], "min_meters": 0.01, "max_meters": 3.0, "applies": "echo", "unit": "m"}),
+            json!({"axes": ["width"], "min_meters": 0.01, "max_meters": 3.0, "applies": "echo"}),
+            json!({"axes": ["height"], "min_meters": 0.01, "max_meters": 3.0, "applies": "maybe"}),
+            json!({"axes": ["height"], "min_meters": 0.01, "max_meters": 3.0, "applies": "normalize", "normalizes": true}),
+            json!({"axes": ["height"], "min_meters": 0.01, "max_meters": 3.0}),
+            json!({"axes": "height", "min_meters": 0.01, "max_meters": 3.0, "applies": "echo"}),
+            json!({"axes": [1], "min_meters": 0.01, "max_meters": 3.0, "applies": "echo"}),
+            json!("yes"),
+            json!(["height"]),
+            json!(null),
+        ] {
+            assert!(
+                serde_json::from_value::<SizeIntentSupport>(block.clone()).is_err(),
+                "{block} 被接受了"
+            );
+        }
+    }
+
+    /// 断言（任务书第 3 条）：意图与生成侧的 `authoritative_size` **并存时不许有两份真相**。
+    ///
+    /// app 的优先级是 `手动 > 意图 > 权威 > 自动推断`，意图在时权威尺寸被压到第二 ——
+    /// 于是矛盾的那一份永远不会被看见，却会被记进资产元数据。所以这里硬失败。
+    #[test]
+    fn authoritative_size_must_say_the_same_thing_as_the_intent() {
+        let recorded = recorded();
+        let base = recorded_job(&recorded);
+        let mut value = recorded["receipt"].clone();
+        value["result"]["authoritative_size"] = size_block(); // Y=0.42, longest≈0.56627256
+
+        // `axis == "height"`：比上下轴那一维。
+        let mut job = base.clone();
+        job.size_intent = Some(intent(SizeIntentAxis::Height, 0.42));
+        assert_eq!(receipt(&value, &job), Ok(()));
+        job.size_intent = Some(intent(SizeIntentAxis::Height, 0.5));
+        assert_eq!(
+            receipt(&value, &job),
+            Err("authoritative_size_conflicts_with_intent")
+        );
+
+        // `axis == "longest"`：比三维里最大的一维（0.56627256，不是 0.42）。
+        let mut job = base.clone();
+        job.size_intent = Some(intent(SizeIntentAxis::Longest, 0.56627256));
+        assert_eq!(receipt(&value, &job), Ok(()));
+        job.size_intent = Some(intent(SizeIntentAxis::Longest, 0.42));
+        assert_eq!(
+            receipt(&value, &job),
+            Err("authoritative_size_conflicts_with_intent"),
+            "最长边不能拿 Y 那一维顶替"
+        );
+
+        // 容差：float32 顶点 + 服务端四舍五入到毫米都要过得去，但 1 mm 以上的差不行。
+        let mut job = base.clone();
+        job.size_intent = Some(intent(SizeIntentAxis::Height, 0.4204));
+        assert_eq!(receipt(&value, &job), Ok(()));
+        job.size_intent = Some(intent(SizeIntentAxis::Height, 0.4220));
+        assert_eq!(
+            receipt(&value, &job),
+            Err("authoritative_size_conflicts_with_intent")
+        );
+
+        // 老任务（没有意图）与老服务（没有权威尺寸）都不受影响。
+        let mut job = base.clone();
+        job.size_intent = None;
+        assert_eq!(receipt(&value, &job), Ok(()));
+        let mut value_without = value.clone();
+        value_without["result"]
+            .as_object_mut()
+            .unwrap()
+            .remove("authoritative_size");
+        job.size_intent = Some(intent(SizeIntentAxis::Height, 0.99));
+        assert_eq!(receipt(&value_without, &job), Ok(()));
+
+        // 权威尺寸本身不合法时仍然是它自己的错误码，不会先报冲突。
+        value["result"]["authoritative_size"] = json!({"dimensions": [1.0], "units": "m", "up_axis": "+Y", "forward_axis": "-Z"});
+        assert_eq!(
+            receipt(&value, &job),
+            Err("invalid_authoritative_size")
+        );
+    }
+
+    /// 回执**回显**的意图要么不在，要么逐字段等于我们发出去的那一份。
+    #[test]
+    fn an_echoed_intent_must_match_what_we_sent() {
+        let recorded = recorded();
+        let mut job = recorded_job(&recorded);
+        let mut value = recorded["receipt"].clone();
+        let sent = intent(SizeIntentAxis::Longest, 1.1);
+        job.size_intent = Some(sent);
+
+        // 不回显 ⇒ 不是冲突（不是每个服务端都回显，老服务照常工作）。
+        assert_eq!(receipt(&value, &job), Ok(()));
+        // 原样回显 ⇒ 同一件事，两份数据一个值。
+        value["size_intent"] = serde_json::to_value(sent).unwrap();
+        assert_eq!(receipt(&value, &job), Ok(()));
+        // 整数写法与浮点写法是**同一个米数**：`1` 与 `1.0` 不能被判成冲突
+        // （服务端是 Python，会把调用方写的整数原样带回来）。
+        job.size_intent = Some(intent(SizeIntentAxis::Longest, 1.0));
+        value["size_intent"] = json!({"axis": "longest", "meters": 1, "source": "user"});
+        assert_eq!(receipt(&value, &job), Ok(()));
+        value["size_intent"] = json!({"axis": "longest", "meters": 1.0, "source": "user"});
+        assert_eq!(receipt(&value, &job), Ok(()));
+        job.size_intent = Some(sent);
+        value["size_intent"] = serde_json::to_value(sent).unwrap();
+        // 米数被改 / 轴被改 / 出处被改 ⇒ 服务端记下的不是我们要的，收下就是两套尺寸。
+        for wrong in [
+            json!({"axis": "longest", "meters": 1.2, "source": "user"}),
+            json!({"axis": "height", "meters": 1.1, "source": "user"}),
+            json!({"axis": "longest", "meters": 1.1, "source": "default"}),
+            json!({"axis": "longest", "meters": 1.1}),
+            json!("1.1m"),
+        ] {
+            value["size_intent"] = wrong.clone();
+            assert_eq!(
+                receipt(&value, &job),
+                Err("size_intent_echo_conflict"),
+                "回显 {wrong} 被接受了"
+            );
+        }
+        // 我们**没有**发过意图，服务端却回显了一个 ⇒ 那是它替我们编的，同样不接受。
+        value["size_intent"] = serde_json::to_value(sent).unwrap();
+        job.size_intent = None;
+        assert_eq!(receipt(&value, &job), Err("size_intent_echo_conflict"));
+        // 显式 null 与"键不存在"等价。
+        value["size_intent"] = Value::Null;
+        assert_eq!(receipt(&value, &job), Ok(()));
     }
 }

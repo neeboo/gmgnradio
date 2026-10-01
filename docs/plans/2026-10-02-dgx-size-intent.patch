@@ -1,0 +1,183 @@
+diff --git a/tools/assets/prop_service.py b/tools/assets/prop_service.py
+index 4a707a5..5d5664b 100644
+--- a/tools/assets/prop_service.py
++++ b/tools/assets/prop_service.py
+@@ -27,6 +27,56 @@ MAX_IMAGE_BYTES = 8 * 1024 * 1024
+ MAX_BODY_BYTES = 12 * 1024 * 1024
+ TERMINAL = {"completed", "failed", "cancelled", "interrupted"}
+ 
++# 尺寸意图：调用方说清"这件东西该按哪根轴做成多少米"。轴/出处/米数范围与守护进程
++# `services/gmgn-taskd/src/model.rs` 的 `SizeIntent` 是同一套词汇（同一个守护进程还会
++# 在**发送之前**用它自己的同一组边界再校验一次）。
++SIZE_INTENT_AXES = {"height", "longest"}
++SIZE_INTENT_SOURCES = {"user", "suggested", "default"}
++SIZE_INTENT_MIN_METERS = 0.01
++SIZE_INTENT_MAX_METERS = 3.0
++
++# `GET /health` 里自报的能力。守护进程**只在看到 `size_intent` 这个声明时**才会把轴发过来
++# （`services/gmgn-taskd/src/provider.rs` 的 `probe_size_intent`），所以这一段是整条链路
++# 用得上轴的前提；缺了它调用方一个字都不会多发，也不会有任何东西坏掉。
++#
++# `applies` 必须诚实：本服务**不**按轴归一生成的网格（网格是 Comfy 导出什么就是什么，
++# `ComfyBackend.collect()` 只做核验、快照与发布），只是接受、随任务落盘、再原样回显。
++# 缩放仍由调用方负责（`scale_requires_confirmation: True` 就是这个意思）。
++# 写成 "normalize" 会让调用方不再缩放 ⇒ 产物直接错尺寸，所以这里只能是 "echo"。
++PROVIDER_DECLARATION = {
++    "id": "gmgn-prop-service",
++    "kind": "remote_http",
++    "size_intent": {
++        "axes": ["height", "longest"],
++        "min_meters": SIZE_INTENT_MIN_METERS,
++        "max_meters": SIZE_INTENT_MAX_METERS,
++        "applies": "echo",
++    },
++}
++
++
++def validate_size_intent(intent, height):
++    """`{axis, meters, source}`，恰好三个键 —— 与守护进程 `SizeIntent` 同一条契约。
++
++    为什么要在这里校验而不是照收：这份意图会随任务落盘、并原样回显给调用方，调用方再拿它
++    与回执里的 `authoritative_size` 交叉核对。收下一个形状不对、或与 `height_meters`
++    互相矛盾的东西，等于替调用方编了一份尺寸。
++    """
++    if not isinstance(intent, dict) or set(intent) != {"axis", "meters", "source"}:
++        raise APIError("invalid_size_intent")
++    if intent["axis"] not in SIZE_INTENT_AXES or intent["source"] not in SIZE_INTENT_SOURCES:
++        raise APIError("invalid_size_intent")
++    meters = intent["meters"]
++    if (isinstance(meters, bool) or not isinstance(meters, (float, int))
++            or not math.isfinite(meters)
++            or not SIZE_INTENT_MIN_METERS <= meters <= SIZE_INTENT_MAX_METERS):
++        raise APIError("invalid_size_intent")
++    # `axis == "height"` 时它与 `height_meters` **语义完全相同**，数值也必须相同 ——
++    # 否则同一件东西有两份互相矛盾的高度。与守护进程 `Submit::validate` 同一条规则、
++    # 同一个错误码。
++    if intent["axis"] == "height" and float(meters) != float(height):
++        raise APIError("size_intent_conflict")
++
+ 
+ class APIError(Exception):
+     def __init__(self, code, status=400):
+@@ -54,8 +104,16 @@ class RootLease:
+ 
+ 
+ def validate_request(data):
+-    allowed = {"image_base64", "name", "source", "height_meters"}
+-    if not isinstance(data, dict) or set(data) != allowed:
++    # 四个必需键一个都不能少，`size_intent` 是这一版新增的**唯一**一个可选键，其余任何
++    # 未知键仍然**严格拒绝**。三点都必须同时成立：
++    #   * 写成 `set(data) != allowed`（把 `size_intent` 塞进同一个集合）会把它变成**必填**，
++    #     于是老调用方（四个键）当场全部 400 —— 那是最坏的一种"兼容"。
++    #   * 只判 `set(data) - allowed` 为空又会放行缺键的请求，让下面的 `data["name"]`
++    #     变成 500 而不是 400。
++    # 正因这里对未知键是硬拒绝，调用方必须在 `/health` 看到声明之后才允许把轴发过来。
++    required, optional = {"image_base64", "name", "source", "height_meters"}, {"size_intent"}
++    if (not isinstance(data, dict) or not required <= set(data)
++            or set(data) - required - optional):
+         raise APIError("invalid_fields")
+     name = data["name"]
+     if not isinstance(name, str) or not 1 <= len(name) <= 100 or any(c in name for c in "/\\\x00"):
+@@ -67,6 +125,8 @@ def validate_request(data):
+     height = data["height_meters"]
+     if isinstance(height, bool) or not isinstance(height, (float, int)) or not math.isfinite(height) or not 0.01 <= height <= 3:
+         raise APIError("invalid_height")
++    if "size_intent" in data:
++        validate_size_intent(data["size_intent"], height)
+     try:
+         encoded = data["image_base64"]
+         if not isinstance(encoded, str) or len(encoded) > MAX_BODY_BYTES:
+@@ -108,11 +168,16 @@ class JobStore:
+ 
+     def _public(self, row):
+         data = json.loads(row["data"])
+-        return dict(id=row["id"], state=row["state"], reason=row["reason"], name=data["name"],
+-                    source=data["source"], height_meters=data["height_meters"],
+-                    result=json.loads(row["result"]) if row["result"] else None,
+-                    compute_may_continue=row["state"] in {"cancel_requested", "interrupted"},
+-                    created_at=row["created"], updated_at=row["updated"])
++        public = dict(id=row["id"], state=row["state"], reason=row["reason"], name=data["name"],
++                      source=data["source"], height_meters=data["height_meters"],
++                      result=json.loads(row["result"]) if row["result"] else None,
++                      compute_may_continue=row["state"] in {"cancel_requested", "interrupted"},
++                      created_at=row["created"], updated_at=row["updated"])
++        # 尺寸意图**原样回显**（提交时已经随任务落盘在 `data` 里）。没有这个键就不加：
++        # 老任务、老调用方看到的回执与今天逐字节相同，调用方也不会看到凭空的意图。
++        if "size_intent" in data:
++            public["size_intent"] = data["size_intent"]
++        return public
+ 
+     def submit(self, key, data):
+         if not isinstance(key, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", key):
+@@ -200,7 +265,9 @@ def make_server(store, token, host="127.0.0.1", port=8191, readiness=None):
+                     raise APIError("unknown_route", 404)
+                 parts = path.path.strip("/").split("/")
+                 if self.command == "GET" and parts == ["health"]:
+-                    return self.reply(200, {"status": "api_ready", "generation": readiness() if readiness else {"ready": False, "reason": "worker_not_configured"}})
++                    return self.reply(200, {"status": "api_ready",
++                                            "provider": PROVIDER_DECLARATION,
++                                            "generation": readiness() if readiness else {"ready": False, "reason": "worker_not_configured"}})
+                 if self.command == "GET" and len(parts) == 3 and parts[:2] == ["v1", "jobs"]:
+                     return self.reply(200, store.get(parts[2]))
+                 if self.command == "GET" and len(parts) == 4 and parts[:2] == ["v1", "jobs"] and parts[3] == "model.glb":
+diff --git a/tools/assets/test_prop_service.py b/tools/assets/test_prop_service.py
+index 72ed09b..bd6973c 100644
+--- a/tools/assets/test_prop_service.py
++++ b/tools/assets/test_prop_service.py
+@@ -57,6 +57,56 @@ class JobsTest(unittest.TestCase):
+             with self.subTest(changed=changed), self.assertRaises(service.APIError):
+                 self.store.submit("invalid-1", request)
+ 
++    def test_size_intent_is_optional_strict_and_echoed(self):
++        # 缺失 ⇒ 键根本不出现：老调用方看到的回执与今天逐字节相同。
++        job = self.store.submit("intent-absent", self.request())
++        self.assertNotIn("size_intent", job)
++        # 合法意图随任务**落盘**并原样回显（重开一个 store 也一样）。
++        intent = {"axis": "longest", "meters": 1.1, "source": "user"}
++        job = self.store.submit("intent-longest", self.request(size_intent=intent))
++        self.assertEqual(job["size_intent"], intent)
++        self.assertEqual(self.store.get(job["id"])["size_intent"], intent)
++        reopened = service.JobStore(Path(self.temp.name))
++        self.addCleanup(reopened.close)
++        self.assertEqual(reopened.get(job["id"])["size_intent"], intent)
++        # `axis == "height"` 与 `height_meters`（这里 0.12）是同一件事：一致才行。
++        agreed = {"axis": "height", "meters": 0.12, "source": "user"}
++        self.assertEqual(self.store.submit("intent-height", self.request(size_intent=agreed))["size_intent"], agreed)
++        with self.assertRaisesRegex(service.APIError, "size_intent_conflict"):
++            self.store.submit("intent-height-conflict",
++                              self.request(size_intent={"axis": "height", "meters": 0.5, "source": "user"}))
++        # 形状 / 轴 / 出处 / 范围任何一处不对 ⇒ 它自己的错误码，绝不照收。
++        for invalid in [None, "longest 1.1m", [], {"axis": "longest", "meters": 1.1},
++                        {"axis": "width", "meters": 1.1, "source": "user"},
++                        {"axis": "longest", "meters": 1.1, "source": "guess"},
++                        {"axis": "longest", "meters": 1.1, "source": "user", "unit": "m"},
++                        {"axis": "longest", "meters": 0.0, "source": "user"},
++                        {"axis": "longest", "meters": 9.0, "source": "user"},
++                        {"axis": "longest", "meters": True, "source": "user"},
++                        {"axis": "longest", "meters": float("nan"), "source": "user"}]:
++            with self.subTest(invalid=invalid), self.assertRaisesRegex(service.APIError, "invalid_size_intent"):
++                self.store.submit("intent-invalid", self.request(size_intent=invalid))
++        # 未知键仍然**严格拒绝** —— 这正是调用方必须先协商、再发这个键的原因。
++        with self.assertRaisesRegex(service.APIError, "invalid_fields"):
++            self.store.submit("intent-unknown-key", self.request(size_axis="longest"))
++
++    def test_health_declares_size_intent_support_honestly(self):
++        server = service.make_server(self.store, "test-secret", "127.0.0.1", 0)
++        threading.Thread(target=server.serve_forever, daemon=True).start()
++        self.addCleanup(server.server_close); self.addCleanup(server.shutdown)
++        request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/health",
++                                         headers={"Authorization": "Bearer test-secret"})
++        with urllib.request.urlopen(request) as response:
++            health = json.load(response)
++        self.assertEqual(health["status"], "api_ready")
++        # 声明必须与守护进程 `SizeIntentSupport` 的字段名**逐字**一致
++        # （snake_case，`applies` 必写）。两边各自漂一套就永远不会生效。
++        self.assertEqual(health["provider"]["size_intent"], {
++            "axes": ["height", "longest"], "min_meters": 0.01, "max_meters": 3.0, "applies": "echo"})
++        # 只有真的按轴归一了才允许写 "normalize"。本服务只回显，所以必须是 "echo"：
++        # 写成 normalize 会让调用方不再缩放，产物直接错尺寸。
++        self.assertEqual(health["provider"]["size_intent"]["applies"], "echo")
++
+     def test_job_paths_cannot_escape(self):
+         for job_id in ["../secret", "a/../../secret", "", "a"*200]:
+             with self.subTest(job_id=job_id), self.assertRaises(service.APIError):
