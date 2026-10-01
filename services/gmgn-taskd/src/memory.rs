@@ -1048,6 +1048,110 @@ mod tests {
             .await
     }
 
+    // -- 原文层移除的机械判据（含负对照） -----------------------------------
+
+    /// 原文层移除的**机械判据**：源码里不得再存在"回合原文进缓冲/落库/落盘"的路径。
+    ///
+    /// 为什么做成独立函数而不是只写注释：这类"删掉了又被加回来"的退化，
+    /// 靠 code review 是抓不住的（当初它就是被"等实现接手"的理由留下的）。
+    /// 判据必须是**可执行**的，而且必须配一条负对照证明它真的会红 ——
+    /// 一个"从不失败"的判据等于没有判据。
+    ///
+    /// 先剥注释再匹配：被删符号的名字在文档注释里是**应该**出现的（记录"已移除"
+    /// 本身就是它的用途），所以只有**代码行**里出现才算违规。
+    fn raw_text_layer_violations(source: &str) -> Vec<&'static str> {
+        // 逐行剥掉 `//`、`//!`、`///` 之后的部分。本模块没有块注释，
+        // 字符串字面量里也没有 `//`，所以行级剥离在这里是安全的。
+        let code: String = source
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut found = Vec::new();
+        for (pattern, label) in [
+            ("VolatileTurn", "原文层类型 VolatileTurn 又出现了"),
+            ("struct Buffer", "原文层缓冲 struct Buffer 又出现了"),
+            ("PENDING_TURNS_LIMIT", "原文层上限常量 PENDING_TURNS_LIMIT 又出现了"),
+            ("TURN_TEXT_LIMIT", "原文层上限常量 TURN_TEXT_LIMIT 又出现了"),
+            ("INGEST_RECEIPTS_LIMIT", "原文层幂等上限 INGEST_RECEIPTS_LIMIT 又出现了"),
+            ("FRESH_RESTORE_TURNS", "原文层恢复段常量 FRESH_RESTORE_TURNS 又出现了"),
+            ("fn ingest_digest", "原文层内容摘要 fn ingest_digest 又出现了"),
+            ("fn clear_covered", "原文层清理 fn clear_covered 又出现了"),
+            ("struct TurnRequest", "原文层请求形状 TurnRequest 又出现了"),
+            ("struct PendingRequest", "原文层请求形状 PendingRequest 又出现了"),
+            ("struct IngestRequest", "原文层请求形状 IngestRequest 又出现了"),
+            ("fn ingest(", "原文层写入入口 fn ingest( 又出现了"),
+            ("fn turn(", "原文层写入入口 fn turn( 又出现了"),
+            ("fn pending(", "原文层读取入口 fn pending( 又出现了"),
+        ] {
+            if code.contains(pattern) {
+                found.push(label);
+            }
+        }
+        found
+    }
+
+    /// **② 的验收断言**：源码里不再存在"回合原文落盘/落库"的路径。
+    ///
+    /// 正对照：真实的**生产代码段**必须 0 违规。
+    /// 负对照：把一段原文层代码接回去 ⇒ 判据**必须**报出来。
+    ///
+    /// 两条必须注意的实现细节（第一版就栽在这里）：
+    /// 1. 只对**代码行**判 —— 注释里出现这些名字是应该的（那是在记录"已移除"）。
+    /// 2. 只扫 `memory.rs` 的**生产代码段**（测试模块之前那一段）。因为本判据的
+    ///    函数体与负对照里**必须**写着这些名字，整文件扫描会把判据自己当成违规。
+    ///    扫描范围在**编译期**用 `include_str!` 切好，不依赖运行时的工作目录。
+    #[test]
+    fn raw_conversation_text_layer_is_gone_and_cannot_come_back_silently() {
+        const SOURCE: &str = include_str!("memory.rs");
+        // 测试模块的开头就是"生产代码到此为止"的边界。
+        let production = SOURCE
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("memory.rs 必须可切出生产段");
+
+        let violations = raw_text_layer_violations(production);
+        assert!(
+            violations.is_empty(),
+            "原文层又回到了 memory.rs 的生产代码里：{violations:?}"
+        );
+
+        // 注释里提到这些名字**不算**违规（文档要记录"已移除"）。
+        let commented = "// VolatileTurn / PENDING_TURNS_LIMIT / struct Buffer / fn ingest(\nfn ok() {}\n";
+        assert!(
+            raw_text_layer_violations(commented).is_empty(),
+            "判据不得把注释里的历史记录当成违规（否则删干净以后反而永远红）"
+        );
+
+        // 负对照 1：把易失回合缓冲接回来。
+        let restored_buffer =
+            format!("{production}\n#[derive(Clone, Debug, Default)]\nstruct Buffer {{ turns: Vec<VolatileTurn> }}\n");
+        let found = raw_text_layer_violations(&restored_buffer);
+        assert!(
+            found.iter().any(|label| label.contains("VolatileTurn")),
+            "负对照失败：把 VolatileTurn 接回来竟然没被抓到（found={found:?}）"
+        );
+
+        // 负对照 2：把写入入口接回来。
+        let restored_write = format!("{production}\npub async fn ingest(&self) {{}}\n");
+        let found = raw_text_layer_violations(&restored_write);
+        assert!(
+            found.iter().any(|label| label.contains("fn ingest(")),
+            "负对照失败：把 memory_ingest 写入入口接回来竟然没被抓到（found={found:?}）"
+        );
+
+        // 负对照 3：把上限常量接回来。
+        let restored_limits = format!("{production}\npub const TURN_TEXT_LIMIT: usize = 2000;\n");
+        let found = raw_text_layer_violations(&restored_limits);
+        assert!(
+            found.iter().any(|label| label.contains("TURN_TEXT_LIMIT")),
+            "负对照失败：把 TURN_TEXT_LIMIT 接回来竟然没被抓到（found={found:?}）"
+        );
+    }
+
     // -- storage/commit unit tests -----------------------------------------
 
     #[test]
