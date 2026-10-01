@@ -1,5 +1,6 @@
 mod artifact;
 mod cli;
+mod contract;
 mod daemon;
 mod files;
 mod memory;

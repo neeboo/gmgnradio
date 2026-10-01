@@ -96,10 +96,41 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
             self?.onToggleVoice()
         }
         panel.setVoiceState(voiceState)
+        // 参考图链的**屏上出口**。工具那侧的唯一构造点在 `GMGNRadioApp.swift`
+        // （点唱机线正在改它），所以那条线只发通知，这里接住并落到居民状态行。
+        // 理由与"日志 + 屏上两个出口都必须有"的判据见
+        // `Agent/ResidentWishReferenceDiagnosis.swift`。
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(referenceAvailabilityDidChange(_:)),
+            name: WishReferenceAvailabilityNotice.didChangeNotification,
+            object: nil
+        )
     }
 
     required init?(coder: NSCoder) {
         nil
+    }
+
+    /// 参考图搜索的可用状态变化：不可用上失败行、"没有找到"上普通信息行，
+    /// 恢复时**只**撤掉自己那一条失败行。
+    @objc private func referenceAvailabilityDidChange(_ notification: Notification) {
+        guard let panel = window as? LiveCamPanel else { return }
+        let text = (notification.userInfo?[WishReferenceAvailabilityNotice.textKey] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let isFailure = (notification.userInfo?[WishReferenceAvailabilityNotice.isFailureKey] as? Bool) ?? true
+        if let text, !text.isEmpty {
+            // 空结果不是失败：它走普通信息这一档，绝不占失败行。
+            if isFailure { panel.showFailureStatus(text) } else { panel.showChatStatus(text) }
+            return
+        }
+        // 恢复。居民状态行的合并规则刻意让失败行不被普通信息盖掉，所以撤除必须显式做；
+        // 但只撤**就是这一条**的（带固定前缀），绝不误伤别的失败。
+        panel.dismissFailureStatus(matchingPrefix: WishReferenceDiagnosis.screenPrefix)
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
 
     var isPresented: Bool {

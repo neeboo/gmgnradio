@@ -1,0 +1,25 @@
+# Rust workspace root.
+#
+# `services/gmgn-taskd` was a standalone package until the MCP face landed. It
+# has to stay buildable by the Xcode helper script through its own manifest path
+# (`tools/build-taskd-helper.sh` runs `cargo build --locked --manifest-path
+# services/gmgn-taskd/Cargo.toml`), which keeps working from a workspace: cargo
+# walks up from the member and uses the workspace lock at this directory. The
+# helper passes an explicit `--target-dir`, so the two members never share a
+# build directory by accident.
+#
+# `gmgn-mcpd` is the MCP server process: stdio on one side, the taskd unix
+# socket on the other. It is deliberately a separate binary, never a second
+# face inside `gmgn-taskd`, because taskd holds an exclusive `flock` on its
+# private root (services/gmgn-taskd/src/main.rs) and an MCP client restart must
+# not be able to perturb the authority.
+[workspace]
+resolver = "2"
+members = ["services/gmgn-taskd", "services/gmgn-mcpd"]
+
+# A member's own `[profile.*]` is ignored once it belongs to a workspace, so the
+# values that used to shape the shipped `gmgn-taskd` release binary are declared
+# here, unchanged, and now apply to both binaries.
+[profile.release]
+strip = true
+lto = "thin"

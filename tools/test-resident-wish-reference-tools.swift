@@ -20,6 +20,7 @@ func worldRuntimeHarnessFlags() -> [String] {
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let sources = root.appendingPathComponent("apps/macos/Sources/GMGNRadio")
 let referenceSource = sources.appendingPathComponent("Agent/ResidentWishReferenceTools.swift")
+let diagnosisSource = sources.appendingPathComponent("Agent/ResidentWishReferenceDiagnosis.swift")
 let sessionSource = sources.appendingPathComponent("Agent/ResidentWorldToolSession.swift")
 let coordinatorSource = sources.appendingPathComponent("Presence/WishMachineCoordinator.swift")
 guard FileManager.default.fileExists(atPath: referenceSource.path) else {
@@ -125,6 +126,42 @@ final class HTTP: URLProtocol {
 @MainActor final class AttemptCounter {
     private(set) var count = 0
     func increment() -> Int { count += 1; return count }
+}
+
+// 线上那个错误的**形状**（不是它的定义）：`ResidentWebImageError` 属于 Presence 侧，
+// 不在本 harness 的编译单元里。诊断读的是 `String(describing:)`，所以只要能复刻
+// `transportFailure("curl-exit-28")` 这个形状，就足以驱动它。
+enum ScriptedTransportError: Error { case transportFailure(String) }
+
+// 参考图链**两个出口**的离线记录：日志行（经 `WishReferenceLog.startTestCapture`）
+// 与屏上通知（`WishReferenceAvailabilityNotice`）。
+@MainActor final class ReferenceReportRecorder {
+    var logged: [String] = []
+    var notices: [(text: String?, isFailure: Bool)] = []
+    private var token: NSObjectProtocol?
+
+    func startObservingScreen() {
+        token = NotificationCenter.default.addObserver(
+            forName: WishReferenceAvailabilityNotice.didChangeNotification, object: nil, queue: nil
+        ) { [self] note in
+            let info = note.userInfo ?? [:]
+            let text = info[WishReferenceAvailabilityNotice.textKey] as? String
+            let isFailure = (info[WishReferenceAvailabilityNotice.isFailureKey] as? Bool) ?? true
+            MainActor.assumeIsolated {
+                notices.append((text, isFailure))
+            }
+        }
+        WishReferenceLog.startTestCapture { [self] line in logged.append(line) }
+    }
+
+    func stopObservingScreen() {
+        if let token { NotificationCenter.default.removeObserver(token) }
+        token = nil
+        WishReferenceLog.stopTestCapture()
+    }
+
+    var failureNotices: [String] { notices.filter(\.isFailure).compactMap(\.text) }
+    func reset() { logged = []; notices = [] }
 }
 
 // A FileManager that fails exactly at the post-write chmod so the tool's cleanup
@@ -520,6 +557,11 @@ final class FailingChmodFileManager: FileManager, @unchecked Sendable {
         let cancelledRetry = await cancelTool.handle("cancel-b", cancelArgs)
         check(!cancelledRetry.isError, "a new registration call can retry the same URL after cancellation")
 
+        // ── 出口记录：后面每个断言都读这两个出口（日志行 + 屏上通知）。 ──
+        let reportRecorder = ReferenceReportRecorder()
+        reportRecorder.startObservingScreen()
+        defer { reportRecorder.stopObservingScreen() }
+
         // ── No results is an honest empty list, not a fabricated image. ──
         let emptyFetcher = ResidentWishReferenceTools.Fetcher(
             fetchPublicData: { _, _ in .init(data: emptySearch, mimeType: "application/json") }, download: { _ in png })
@@ -531,6 +573,63 @@ final class FailingChmodFileManager: FileManager, @unchecked Sendable {
         let emptyPayload = parse(empty)
         check(!empty.isError && (emptyPayload["results"] as? [[String: Any]])?.isEmpty == true,
               "no search result is reported as an empty list")
+        // ③ 结果为空 ≠ 失败：回执与屏幕两处都必须分得开。
+        check(emptyPayload["ok"] as? Bool == true && emptyPayload["code"] == nil,
+              "an empty result is a success payload: no failure code is attached")
+        check(WishReferenceDiagnosis.isEmptyResultsPayload(emptyPayload),
+              "the empty payload is recognisable as an honest empty result")
+        check((emptyPayload["message"] as? String) == WishReferenceDiagnosis.emptyResultsMessage
+              && !WishReferenceDiagnosis.emptyResultsMessage.contains("失败码"),
+              "the empty-result wording is its own sentence, never the failure wording")
+        check(reportRecorder.logged.contains { $0.contains("无可用结果（这不是失败）") },
+              "an empty result is logged as a completion, not as a failure: \(reportRecorder.logged)")
+        check(reportRecorder.notices.contains { $0.text == WishReferenceDiagnosis.emptyResultsScreenText && !$0.isFailure },
+              "an empty result reaches the screen as info, never as a failure line: \(reportRecorder.notices)")
+        check(reportRecorder.failureNotices.isEmpty,
+              "nothing about an empty result is pushed through the failure exit")
+        reportRecorder.reset()
+        // ── ① 每种失败都有具名原因；② 连不上时说清去哪里配、且不冒充在搜；
+        //      ④ 失败同时**上屏 + 落日志**（回执不是唯一出口）。 ──
+        // 复刻线上那条失败的形状：`transportFailure("curl-exit-28")` 正是被
+        // `localizedDescription` 压成 `error 17` 的那个原因。
+        let searchAttempts = AttemptCounter()
+        let scriptedFetcher = ResidentWishReferenceTools.Fetcher(
+            fetchPublicData: { _, _ in
+                _ = await searchAttempts.increment()
+                throw ScriptedTransportError.transportFailure("curl-exit-28")
+            }, download: { _ in png })
+        let scriptedTools = ResidentWishReferenceTools(coordinator: coordinator, authorizationID: UUID(),
+            worldID: world, residentScope: resident, isCurrent: { true }, fetcher: scriptedFetcher,
+            directory: dir.appendingPathComponent("references-scripted"))
+        let scriptedSession = makeSession(scriptedTools.tools)
+        let scripted = await call(scriptedSession, "search-scripted", "search_wish_reference_images",
+            ["query": "chair"])
+        let scriptedPayload = parse(scripted)
+        check(scripted.isError && (scriptedPayload["code"] as? String) == "reference_search_timeout",
+              "a curl connect timeout is named reference_search_timeout, not a generic failure: "
+                + "\(scriptedPayload["code"] ?? "nil")")
+        let scriptedMessage = (scriptedPayload["message"] as? String) ?? ""
+        check(scriptedMessage.contains("curl-exit-28"),
+              "the transport reason survives verbatim into the receipt (no more 'error 17'): \(scriptedMessage)")
+        check(scriptedMessage.contains("dns.google:443") && scriptedMessage.contains("commons.wikimedia.org:443"),
+              "a connectivity failure says exactly where to configure egress: \(scriptedMessage)")
+        check(scriptedMessage.contains("不会假装在搜"),
+              "a connectivity failure never pretends the search is still happening: \(scriptedMessage)")
+        // ④ 两个出口都必须有：注入"只写回执"（去掉 report 里的日志/上屏）⇒ FAIL。
+        check(reportRecorder.logged.contains { $0.contains("code=reference_search_timeout") && $0.contains("curl-exit-28") },
+              "the failure is logged with its named code and verbatim reason: \(reportRecorder.logged)")
+        check(reportRecorder.failureNotices.contains { $0.contains("curl-exit-28") },
+              "the failure is also pushed to the screen exit: \(reportRecorder.failureNotices)")
+        // 冷却：连不上之后不再重复撞墙，但必须说清"这一次没有发起搜索"。
+        let secondSearch = await call(scriptedSession, "search-scripted-2", "search_wish_reference_images",
+            ["query": "chair again"])
+        let secondMessage = (parse(secondSearch)["message"] as? String) ?? ""
+        check(searchAttempts.count == 1,
+              "a known-unreachable backend is not hit again inside the cooldown: \(searchAttempts.count) attempts")
+        check(secondSearch.isError && (parse(secondSearch)["code"] as? String) == "reference_search_timeout"
+              && secondMessage.contains("**没有**发起搜索"),
+              "the cooled-down receipt names the same cause and says it did not search: \(secondMessage)")
+
         // A search transport failure is an explicit error, never fabricated links.
         let brokenFetcher = ResidentWishReferenceTools.Fetcher(
             fetchPublicData: { _, _ in throw URLError(.cannotConnectToHost) }, download: { _ in png })
@@ -539,8 +638,10 @@ final class FailingChmodFileManager: FileManager, @unchecked Sendable {
             directory: dir.appendingPathComponent("references-broken"))
         let brokenSession = makeSession(brokenTools.tools)
         let broken = await call(brokenSession, "search-broken", "search_wish_reference_images", ["query": "chair"])
-        check(broken.isError && (parse(broken)["code"] as? String) == "reference_search_failed",
-              "a failed search returns an explicit error")
+        check(broken.isError && (parse(broken)["code"] as? String) == "reference_search_unreachable",
+              "a failed search returns an explicit, named error")
+        check(((parse(broken)["message"] as? String) ?? "").contains("urlerror(-1004)"),
+              "a URLError keeps its numeric code instead of being flattened to a sentence")
         // A structured API error object must never masquerade as an empty result set.
         let apiErrorSearch = try JSONSerialization.data(withJSONObject: ["error": ["code": "badvalue", "info": "invalid search"]])
         let apiErrorFetcher = ResidentWishReferenceTools.Fetcher(
@@ -550,8 +651,10 @@ final class FailingChmodFileManager: FileManager, @unchecked Sendable {
             directory: dir.appendingPathComponent("references-api-error"))
         let apiErrorSession = makeSession(apiErrorTools.tools)
         let apiError = await call(apiErrorSession, "search-error", "search_wish_reference_images", ["query": "chair"])
-        check(apiError.isError && (parse(apiError)["code"] as? String) == "reference_search_failed",
+        check(apiError.isError && (parse(apiError)["code"] as? String) == "reference_search_api_error",
               "a Wikimedia error object is an explicit search failure, never an empty result")
+        check(((parse(apiError)["message"] as? String) ?? "").contains("badvalue"),
+              "the API's own error code is carried through instead of being dropped")
         // A non-JSON response (even with valid-looking bytes) must be refused on MIME.
         let htmlFetcher = ResidentWishReferenceTools.Fetcher(
             fetchPublicData: { _, _ in .init(data: searchData, mimeType: "text/html; charset=utf-8") }, download: { _ in png })
@@ -560,8 +663,10 @@ final class FailingChmodFileManager: FileManager, @unchecked Sendable {
             directory: dir.appendingPathComponent("references-html"))
         let htmlSession = makeSession(htmlTools.tools)
         let htmlSearch = await call(htmlSession, "search-html", "search_wish_reference_images", ["query": "chair"])
-        check(htmlSearch.isError && (parse(htmlSearch)["code"] as? String) == "reference_search_failed",
+        check(htmlSearch.isError && (parse(htmlSearch)["code"] as? String) == "reference_search_not_json",
               "a non-JSON search MIME type is an explicit failure, never an empty result")
+        check(((parse(htmlSearch)["message"] as? String) ?? "").contains("text/html"),
+              "the refused MIME type is named, so an interception page is distinguishable from an outage")
         check(ResidentWishReferenceTools.isJSONMIMEType("Application/JSON; charset=utf-8")
               && ResidentWishReferenceTools.isJSONMIMEType("application/problem+json")
               && !ResidentWishReferenceTools.isJSONMIMEType("text/html"),
@@ -646,6 +751,7 @@ compile.arguments = ["-swift-version", "6", "-j1", "-parse-as-library"]
     sources.appendingPathComponent("Agent/ResidentWishMachineTools.swift").path,
     sessionSource.path,
     referenceSource.path,
+    diagnosisSource.path,
     root.appendingPathComponent("tools/fixtures/WishMachineDaemonFixture.swift").path,
     main.path, "-o", binary.path]
 try compile.run()

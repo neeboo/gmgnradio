@@ -22,11 +22,16 @@ enum PropSupportGridPresentation {
     ///   - **再远的格子一个实例都不生成** —— 过滤落在生成这一步，渲染器不必每帧
     ///     去丢弃几千个格子。
     ///
-    /// **锚点只有一处来源：`states` 的键。** 不需要新的状态源，因为：
+    /// **锚点 = `states` 里"当前落点"那一批**（footprint 本体 + 悬停发光），
+    /// **不含**靠墙提示（`.wallPlaceable`）。不需要新的状态源，因为：
     ///   - 携带物件时，`footprintStates` 已经把 footprint 覆盖的列写进 `states`；
     ///   - **没携带物件时**，编辑器仍然按"一格"的 footprint 做悬停判定
     ///     （`GMGNRadioApp.updateResidentPropGridHover` 在 `footprint == nil` 时
     ///     退回 `spacing` 见方），所以光标所在格同样会出现在 `states` 里。
+    ///
+    /// **靠墙提示为什么不算锚点**：它是一张全局表（每面墙一个可放落点），散落在整个房间里，
+    /// 拿它当锚点 ⇒ 窗口外包框覆盖全场 ⇒ 铺满地面（见 `focus` 的说明）。它仍然被着色，
+    /// 只是不再决定窗口大小。
     ///
     /// `states` 为空（光标没落在任何承托层上，或还没进场景）时**一个格子都不画** ——
     /// 这正是"空旷时不再铺满地面"。
@@ -46,9 +51,9 @@ enum PropSupportGridPresentation {
         /// 看得见但透底的染色，正好是辅助线的量级。
         static let ringAlpha: Float = 0.2
 
-        /// footprint 本体的格子（= `states` 的键），全对比。
+        /// 当前落点那一批格子（footprint 本体 + 悬停发光；**不含**靠墙提示），全对比。
         let core: Set<Cell>
-        /// 参与绘制的格子（本体 + 外圈），顺序与传入的 `cells` 一致。
+        /// 参与绘制的格子（锚点 + 外圈 + 落在窗口内的靠墙提示），顺序与传入的 `cells` 一致。
         let cells: [Cell]
     }
 
@@ -58,8 +63,21 @@ enum PropSupportGridPresentation {
     ///   同层的格子才进焦点：否则旁边桌面上会凭空浮出一片格子，比原来更乱。
     /// - 本体是矩形（可能斜放），用它的**轴对齐外包**外扩 `ringCount` 圈：形状规整、
     ///   代价是 O(1)。逐格算 Chebyshev 距离只在斜放 footprint 上略有差别，不值得多扫一遍。
+    ///
+    /// ## ⚠️ 锚点 = **当前落点**，不是"所有被着色的格子"（真机 2026-10-01「满地都是格子」）
+    ///
+    /// `states` 里除了当前 footprint / 悬停发光，还有**靠墙可放**那批（`.wallPlaceable`）
+    /// —— 它是**全局提示**：`refreshWallPlaceability` 给**每一面**墙的第一个可放候选着色，
+    /// 于是那批格子散落在房间各处（真机日志：`格子派生：命中缓存 … 墙面=194`，
+    /// 房间 14.4 × 23.9 米、3160 个可绘制列）。把这个散落的集合当作锚点，外包框就是**整个房间**
+    /// ⇒ 焦点窗口覆盖全部 3160 列 ⇒ 又变回铺满地面的地毯（用户的"满地都是格子"）。
+    ///
+    /// 所以锚点**只**取"当前落点"那一批（footprint 本体 + 悬停发光）：靠墙提示仍然会被
+    /// **着色**（它们在 `states` 里，落在窗口内的照画），但它不再决定窗口的大小 ——
+    /// 提示出现在"光标/选中物件附近那几面墙"上，正是用户会去找它的地方。
     static func focus(cells: [Cell], states: [Cell: CellState]) -> Focus {
-        let core = Set(states.keys)
+        // 锚点：排除 `.wallPlaceable`（全局提示）。`states` 为空时仍然一个格子都不画。
+        let core = Set(states.filter { $0.value != .wallPlaceable }.keys)
         guard !core.isEmpty else { return Focus(core: [], cells: []) }
 
         var layers: Set<Int> = []
@@ -99,8 +117,9 @@ enum PropSupportGridPresentation {
         /// 发光 = "这一件可以点起来"）。
         ///
         /// 它和 `validFootprint` 共用同一条绘制路径：`ResidentPropGridEditorModel` 把悬停物件的
-        /// footprint 格子写进 `states`，而 `focus` 的锚点**就是** `states` 的键 —— 于是发光
-        /// 自动落在"物件脚下那一小块 + 两圈淡格"里，不绕开焦点裁剪，也不需要第二个绘制入口。
+        /// footprint 格子写进 `states`，而 `focus` 的锚点取的就是 `states` 里"当前落点"那一批
+        /// —— 于是发光自动落在"物件脚下那一小块 + 两圈淡格"里，不绕开焦点裁剪，
+        /// 也不需要第二个绘制入口。
         case hoverTarget
         /// **靠墙可放**：这一格不是地板的整格玩法，而是"背朝墙、正面朝房间"的那个落点。
         ///
@@ -108,6 +127,10 @@ enum PropSupportGridPresentation {
         /// 而是"这里能不能靠着那面墙放"。判据仍然是那**唯一**一条
         /// （`PropPlacementEvaluator` / 摆放服务），颜色只是把它的答案按"靠墙"这个上下文
         /// 重画一次；颜色不同、**判定出口相同**。
+        ///
+        /// ⚠️ 它是**全局提示**（每面墙一个可放落点，散落在整个房间），所以它**不参与焦点锚点**
+        /// （`focus` 刻意把这一种状态排除在外）：否则那种"满地都是格子"的观感会立刻回来。
+        /// 它仍然被着色 —— 只是只在焦点窗口内画出来。
         case wallPlaceable
 
         /// 线性 RGBA。放在这里是为了让"哪种状态什么颜色"成为**可测的事实**，
@@ -277,7 +300,13 @@ enum PropSupportGridPresentation {
               spacing: spacing, options: options, alphaScale: { _ in 1 })
     }
 
-    /// **本帧实际要画的东西**：`focus` 圈定的那一小块，本体全对比、外圈压到 `Focus.ringAlpha`。
+    /// **本帧实际要画的东西**：`focus` 圈定的那一小块，本体与"有判据答案的格子"全对比、
+    /// 其余外圈压到 `Focus.ringAlpha`。
+    ///
+    /// 为什么用"有没有状态"而不是"在不在 `core` 里"来决定对比度：靠墙提示
+    /// （`.wallPlaceable`）**不在** `core` 里（它不决定窗口大小，见 `focus`），
+    /// 但它落在窗口内时仍然是一个**判据的答案**（"这里可以靠着墙放"）。按 `core` 决定对比度
+    /// 会把它压成 0.2 的淡蓝 —— 那等于把答案说小声，用户就分不清"能靠墙放"和"附近一格"。
     ///
     /// 这是建造模式唯一该走的入口 —— 直接调 `instances` 会画出整片地面（那是改动前的行为，
     /// 只在离线逐项验证距离淡出/预算时才有用）。
@@ -294,7 +323,7 @@ enum PropSupportGridPresentation {
         return build(
             cells: focus.cells, states: states, cameraPosition: cameraPosition,
             spacing: spacing, options: options,
-            alphaScale: { focus.core.contains($0) ? 1 : ringAlpha }
+            alphaScale: { focus.core.contains($0) || states[$0] != nil ? 1 : ringAlpha }
         )
     }
 

@@ -167,6 +167,149 @@ def generated_prop(state: dict, object_id: str) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def read_authority_objects(db_path: Path) -> dict[str, dict[str, dict]] | None:
+    """来源 5：权威侧的**物件条目** —— `world_records` 里 `domain='objects'` 的行。
+
+    迁移（世界状态的权威从 `state.json` 切到 Rust `gmgn-taskd`）之后，一件东西
+    "还在不在"只由这一张表回答：`state.json` 降级成**只读前像**，只用于一次性导入
+    与回滚，任何界面都不再读它。
+
+    返回 `{world_id: {objectID: {"tombstone": bool, "revision": int}}}`；
+    **读不到**（缺库/缺表/缺列/坏库）返回 `None` —— 那是"这一侧没有数据"，
+    与"这一侧有数据但没有这一条"是两件事，绝不能混成同一个答案（前者 WARN，
+    后者 FAIL）。只读打开，从不写入。
+    """
+    if not db_path.exists():
+        return None
+    try:
+        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    authority: dict[str, dict[str, dict]] = {}
+    try:
+        connection.row_factory = sqlite3.Row
+        # 先记下**哪些世界在权威里存在**（任何 domain 都算）。"这个世界一行都没有"
+        # 与"这个世界在、但那一件物件不在"是两条不同的缺陷，必须分得开 ——
+        # 只按物件行建索引的话，一个物件被删光的世界会被误报成"世界不存在"。
+        for row in connection.execute("SELECT DISTINCT world_id FROM world_records").fetchall():
+            authority.setdefault(str(row["world_id"]), {})
+        rows = connection.execute(
+            "SELECT world_id, key, revision, tombstone FROM world_records WHERE domain = ?",
+            ("objects",),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
+    for row in rows:
+        authority.setdefault(str(row["world_id"]), {})[str(row["key"])] = {
+            "tombstone": bool(row["tombstone"]),
+            "revision": int(row["revision"]),
+        }
+    return authority
+
+
+def preimage_only_objects(world_states: list[tuple[Path, dict]],
+                          authority: dict[str, dict[str, dict]] | None) -> list[dict]:
+    """**只读前像里有、权威里没有**的物件条目（迁移期间"东西静默消失"的那个形状）。
+
+    判据（逐件，不给"整份状态看起来对"留后门）：
+
+    * 前像的 `objectStates` 里有这个 `objectID`；
+    * 权威 `world_records(domain='objects')` 里**没有**它，或它的 `tombstone=1`；
+    * 前像里那个世界在权威里**一行都没有** ⇒ 整个世界的迁移没发生，同样逐件列出。
+
+    `authority is None`（权威库读不到）时返回 `[]`：这一轮查不了，由调用方
+    明确报 WARN，而不是假装通过。
+    """
+    if authority is None:
+        return []
+    found: list[dict] = []
+    for state_path, state in world_states:
+        world_id = state.get("worldID")
+        if not isinstance(world_id, str) or not world_id:
+            continue
+        objects = state.get("objectStates")
+        if not isinstance(objects, dict) or not objects:
+            continue
+        recorded = authority.get(world_id)
+        for object_id in sorted(str(key) for key in objects):
+            if recorded is None:
+                status = "world_absent"
+            elif object_id not in recorded:
+                status = "missing"
+            elif recorded[object_id]["tombstone"]:
+                status = "tombstoned"
+            else:
+                continue
+            found.append({
+                "worldID": world_id,
+                "state": str(state_path),
+                "objectID": object_id,
+                "status": status,
+            })
+    return found
+
+
+def read_authority_states(db_path: Path) -> list[tuple[Path, dict]] | None:
+    """权威侧的**世界状态投影**，形状与 `read_world_states` 一致。
+
+    与 Rust `world.rs` 的 `materialize()` **同一口径**：`worlds/state` 那一份 blob
+    **加上** `objects` 域里的每一条非墓碑物件（物件状态不在 blob 里，是投影出来的）。
+
+    为什么对账器必须读这里而不是 `state.json`：迁移之后 `state.json` 是**只读前像**
+    （冻结在导入那一刻），拿它当"世界现在长什么样"，会给每一件迁移之后才入库的
+    东西报一条**假** FAIL —— 真机 2026-10-01 的 `2B 白色长剑` 就是这样：它在权威里
+    好端端地摆着（`claimed.4210DB95…` 回执也在 `worlds/state` 里），对账器却因为
+    前像停留在它入库之前而一直喊"未入库"。
+
+    读不到（缺库/缺表/坏库）返回 `None` —— 调用方据此降级到只读前像，并**明确报
+    WARN**，绝不静默把前像当成权威。只读打开。
+    """
+    if not db_path.exists():
+        return None
+    try:
+        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            "SELECT world_id, domain, key, tombstone, value FROM world_records"
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
+
+    blobs: dict[str, dict] = {}
+    objects: dict[str, dict[str, object]] = {}
+    for row in rows:
+        world_id = str(row["world_id"])
+        domain = str(row["domain"])
+        key = str(row["key"])
+        if domain == "worlds" and key == "state":
+            try:
+                parsed = json.loads(row["value"])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                blobs[world_id] = parsed
+        elif domain == "objects" and not row["tombstone"]:
+            try:
+                parsed = json.loads(row["value"])
+            except (TypeError, ValueError):
+                continue
+            objects.setdefault(world_id, {})[key] = parsed
+
+    merged: list[tuple[Path, dict]] = []
+    for world_id in sorted(set(blobs) | set(objects)):
+        state = dict(blobs.get(world_id, {}))
+        state["objectStates"] = objects.get(world_id, {})
+        merged.append((Path(world_id), state))
+    return merged
+
+
 def scan_files(roots: list[Path], recursive: bool = False) -> dict[str, list[Path]]:
     """来源 4：磁盘文件，按**实际内容**哈希归桶（不是按文件名）。
 
@@ -208,6 +351,23 @@ def reconcile(root: Path, world_base: Path, wishes_path: Path,
         if isinstance(job, dict) and job.get("id")
     }
     world_states = read_world_states(world_base)
+    # ---- 权威侧：迁移之后"世界现在长什么样"只有它回答得了 ----
+    # `state.json` 是只读前像（冻结在导入那一刻），拿它当现状会给每一件迁移之后才
+    # 入库的东西报**假** FAIL。读不到就降级到前像，但**必须报 WARN** ——
+    # "悄悄拿前像当权威"正是这次事故的形状。
+    authority = read_authority_objects(db_path)
+    authority_states = read_authority_states(db_path)
+    world_checks: list[dict] = []
+    if authority_states is None:
+        world_checks.append({
+            "level": WARN, "code": "authority_unreadable",
+            "detail": f"权威库读不到（缺文件或缺 `world_records` 表）：{db_path} —— "
+                      f"这一轮**降级用只读前像**当现状，「前像里有、权威里没有」也**没查**；"
+                      f"这不是通过",
+        })
+        state_sources = world_states
+    else:
+        state_sources = authority_states
     # 私根是扁平的（产物 + 输入图 + DB + socket）；额外目录要递归
     # （`ResidentAttachments/` 等直接放 PNG）。
     files_by_hash = scan_files([root])
@@ -326,7 +486,7 @@ def reconcile(root: Path, world_base: Path, wishes_path: Path,
         asset_ids: list[dict] = []
         in_inventory: bool | None = None
         claimed_receipt = False
-        for state_path, state in world_states:
+        for state_path, state in state_sources:
             if object_id:
                 prop = generated_prop(state, object_id)
                 if prop is not None:
@@ -373,6 +533,49 @@ def reconcile(root: Path, world_base: Path, wishes_path: Path,
             "claimedReceiptPresent": claimed_receipt,
             "checks": checks,
         })
+
+    # ---- 迁移安全：**只读前像里有的，权威里必须也有** ----
+    # 这是"迁移期间东西会静默消失"的形状：权威切到 Rust 之后，`state.json` 只作只读
+    # 前像，某一件东西如果只活在前像里，**没有任何界面会再看见它** —— 而前像自己
+    # 永远是"完整"的，所以只看任何一侧都发现不了。真机 2026-10-01 的
+    # `2B 白色长剑` 就是这个形状：登记/摆放的"修复验证"跑在快照与临时 root 上，
+    # 剑到底有没有进**正在使用的**那一份权威库，只能靠人再去问一次。
+    if authority is not None:
+        preimage_only = preimage_only_objects(world_states, authority)
+        by_world: dict[str, list[dict]] = {}
+        for item in preimage_only:
+            by_world.setdefault(item["worldID"], []).append(item)
+        for world_id, items in sorted(by_world.items()):
+            absent = [item for item in items if item["status"] == "world_absent"]
+            if absent:
+                world_checks.append({
+                    "level": FAIL, "code": "preimage_world_absent_from_authority",
+                    "detail": f"权威里没有这个世界 {world_id}（一行都没有），但只读前像 "
+                              f"{absent[0]['state']} 里有它 —— 迁移没有发生，"
+                              f"{len(absent)} 件东西只活在前像里："
+                              + "、".join(item["objectID"] for item in absent),
+                })
+            for item in items:
+                if item["status"] == "world_absent":
+                    continue
+                if item["status"] == "tombstoned":
+                    world_checks.append({
+                        "level": FAIL, "code": "preimage_object_tombstoned_in_authority",
+                        "detail": f"{item['objectID']} 在只读前像 {item['state']} 里，"
+                                  f"权威里却是墓碑（tombstone=1）—— 权威把它删了，前像不知道",
+                    })
+                else:
+                    world_checks.append({
+                        "level": FAIL, "code": "preimage_object_missing_from_authority",
+                        "detail": f"{item['objectID']} 只在只读前像 {item['state']} 里，"
+                                  f"权威 `world_records(domain='objects')` 里没有它 —— "
+                                  f"这一件东西没有任何界面会再看见它",
+                    })
+        if not preimage_only:
+            world_checks.append({
+                "level": OK, "code": "preimage_objects_all_in_authority",
+                "detail": "只读前像里声明的每一件物件，权威里都有一条对应记录",
+            })
 
     # ---- 孤立文件：磁盘上有，但没有任何一条产物事实认领它 ----
     # 注意**只对私根判孤立**：`ResidentAttachments/` 里是用户上传的原件，
@@ -428,7 +631,8 @@ def reconcile(root: Path, world_base: Path, wishes_path: Path,
         )
     ]
 
-    levels = [check["level"] for record in receipts for check in record["checks"]]
+    levels = ([check["level"] for record in receipts for check in record["checks"]]
+              + [check["level"] for check in world_checks])
     fails = levels.count(FAIL)
     warns = levels.count(WARN)
 
@@ -443,6 +647,7 @@ def reconcile(root: Path, world_base: Path, wishes_path: Path,
             "distinctContents": len(files_by_hash),
         },
         "artifacts": receipts,
+        "worldChecks": world_checks,
         "orphanFiles": orphans,
         "duplicateContents": duplicates,
         "authorizationsNeverSubmitted": never_submitted,
@@ -466,8 +671,15 @@ def reconcile(root: Path, world_base: Path, wishes_path: Path,
 
 def _selftest_fixture(base: Path, *, stage: str, in_inventory: bool,
                       claimed_receipt: bool, write_model: bool,
-                      model_hash_matches: bool, asset_id_from_input: bool) -> tuple[Path, Path, Path]:
-    """造一份最小四方数据。只写在 `base`（临时目录）里。"""
+                      model_hash_matches: bool, asset_id_from_input: bool,
+                      authority: str = "mirrors") -> tuple[Path, Path, Path]:
+    """造一份最小四方数据。只写在 `base`（临时目录）里。
+
+    `authority` 控制权威侧（`world_records`）长什么样，用来给"前像里有、权威里没有"
+    这一条造反例：`mirrors`（逐件镜像前像）/ `missing_object`（有这个世界，缺那一件）/
+    `tombstoned`（有那一行但是墓碑）/ `missing_world`（整个世界一行都没有）/
+    `no_table`（权威库没有 `world_records` 表 ⇒ 应报 WARN 而不是通过）。
+    """
     root = base / "TaskService"
     worlds = base / "LivingWorld"
     wishes_dir = base / "WishMachine"
@@ -491,6 +703,14 @@ def _selftest_fixture(base: Path, *, stage: str, in_inventory: bool,
     (root / "tasks.sqlite3").unlink(missing_ok=True)
     connection = sqlite3.connect(root / "tasks.sqlite3")
     connection.execute("CREATE TABLE jobs(id TEXT PRIMARY KEY, data TEXT NOT NULL)")
+    if authority != "no_table":
+        # 迁移之后世界状态的唯一权威。物件条目**单独一行**（`domain='objects'`），
+        # 这正是"前像里有、权威里没有"这条对账项要盯的地方。
+        connection.execute("""CREATE TABLE world_records (
+            world_id TEXT NOT NULL, domain TEXT NOT NULL, key TEXT NOT NULL,
+            revision INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, updated_by TEXT NOT NULL,
+            tombstone INTEGER NOT NULL DEFAULT 0, hash TEXT NOT NULL, value TEXT NOT NULL,
+            PRIMARY KEY (world_id, domain, key)) WITHOUT ROWID""")
     connection.execute(
         "INSERT INTO jobs(id,data) VALUES(?,?)",
         (artifact, json.dumps({"job": {
@@ -529,6 +749,25 @@ def _selftest_fixture(base: Path, *, stage: str, in_inventory: bool,
         state["layoutReceipts"][f"claimed.{artifact}"] = {"register": {"_0": {"objectID": object_id}}}
     (worlds / "pkg" / "1.0.0" / "state.json").write_text(json.dumps(state), encoding="utf-8")
 
+    # 权威侧：把前像里的物件**镜像**过去，除非这次就是要造"没镜像上"的反例。
+    if authority != "no_table" and authority != "missing_world":
+        connection = sqlite3.connect(root / "tasks.sqlite3")
+        try:
+            connection.execute(
+                "INSERT INTO world_records(world_id,domain,key,revision,updated_at_ms,"
+                "updated_by,tombstone,hash,value) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("world", "worlds", "state", 1, 0, "import", 0, "h", json.dumps(state)))
+            if in_inventory and authority != "missing_object":
+                connection.execute(
+                    "INSERT INTO world_records(world_id,domain,key,revision,updated_at_ms,"
+                    "updated_by,tombstone,hash,value) VALUES(?,?,?,?,?,?,?,?,?)",
+                    ("world", "objects", object_id, 1, 0, "swift",
+                     1 if authority == "tombstoned" else 0, "h",
+                     json.dumps(state["objectStates"][object_id])))
+            connection.commit()
+        finally:
+            connection.close()
+
     return root, worlds, wishes_dir / "wishes.json"
 
 
@@ -556,6 +795,26 @@ def self_test() -> int:
         ("asset_id_is_input_hash", dict(stage="claimed", in_inventory=True, claimed_receipt=True,
                                         write_model=True, model_hash_matches=True,
                                         asset_id_from_input=True), "asset_id_is_input_hash"),
+        # ---- 迁移安全：只读前像里有、权威里没有 ----
+        ("preimage_mirrored", dict(stage="claimed", in_inventory=True, claimed_receipt=True,
+                                   write_model=True, model_hash_matches=True,
+                                   asset_id_from_input=False, authority="mirrors"), None),
+        ("preimage_object_missing_from_authority",
+         dict(stage="claimed", in_inventory=True, claimed_receipt=True, write_model=True,
+              model_hash_matches=True, asset_id_from_input=False, authority="missing_object"),
+         "preimage_object_missing_from_authority"),
+        ("preimage_object_tombstoned_in_authority",
+         dict(stage="claimed", in_inventory=True, claimed_receipt=True, write_model=True,
+              model_hash_matches=True, asset_id_from_input=False, authority="tombstoned"),
+         "preimage_object_tombstoned_in_authority"),
+        ("preimage_world_absent_from_authority",
+         dict(stage="claimed", in_inventory=True, claimed_receipt=True, write_model=True,
+              model_hash_matches=True, asset_id_from_input=False, authority="missing_world"),
+         "preimage_world_absent_from_authority"),
+        ("authority_unreadable", dict(stage="claimed", in_inventory=True, claimed_receipt=True,
+                                      write_model=True, model_hash_matches=True,
+                                      asset_id_from_input=False, authority="no_table"),
+         "authority_unreadable"),
     ]
 
     failures = 0
@@ -566,6 +825,9 @@ def self_test() -> int:
             report = reconcile(root, worlds, wishes)
             codes = {check["code"] for record in report["artifacts"] for check in record["checks"]
                      if check["level"] == FAIL}
+            codes |= {check["code"] for check in report["worldChecks"] if check["level"] == FAIL}
+            # WARN 级别的"这一项没查"也算没抓住：`authority_unreadable` 期望的就是这条。
+            codes |= {check["code"] for check in report["worldChecks"] if check["level"] == WARN}
             if expected is None:
                 good = not codes
             else:
@@ -620,6 +882,12 @@ def render(report: dict, quiet: bool) -> None:
                 ):
                     print(f"      [{check['level']}] {check['code']}: {check['detail']}")
             print()
+
+    if report["worldChecks"]:
+        print("世界状态：只读前像 ⇔ 权威（`world_records`）")
+        for check in report["worldChecks"]:
+            print(f"  [{check['level']}] {check['code']}: {check['detail']}")
+        print()
 
     if report["orphanFiles"]:
         print(f"孤立文件（磁盘上有、没有事实认领）：{len(report['orphanFiles'])}")

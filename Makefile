@@ -224,6 +224,10 @@ _test-harnesses:
 	swift tools/test-resident-chat-transcript.swift
 	swift tools/test-resident-voice-authorization.swift
 	swift tools/test-resident-dsh-world-loop.swift
+	# Rust 侧 MCP 面在 composition 里的挂载判据（默认关闭、真实字段、路径逐字、篡改即失败）。
+	# Rust 那一半（工具定义唯一来源、只读契约与权威逐字节一致、信息不足走成功通道、
+	# 杀掉 MCP 不影响权威）在 services/gmgn-mcpd 里，走 `cargo test -p gmgn-mcpd`。
+	swift tools/test-resident-dsh-mcp-mount.swift
 	swift tools/test-resident-tool-bridge-errors.swift
 	swift tools/test-resident-background-presentation.swift
 	swift tools/test-resident-agent-loop.swift
@@ -249,6 +253,11 @@ _test-harnesses:
 	# 只挂 `--self-test`：默认那条读真机 root/真实存档（本身就是 B-1/B-2 的
 	# 现场），挂进 CI 门禁会变成"依赖用户当前数据"的非确定性红。
 	$(PYTHON) tools/reconcile-generation-results.py --self-test
+	# 电视机的五条判据（屏幕几何只有一处定义 / 覆盖层几何一致 / 不吃场景鼠标 /
+	# 失败具名可见 / 只走官方嵌入）。三条注入负对照在 harness 内部做手术：
+	# 覆盖层改成吃事件、源码里塞一条抓流路径、白名单开一个后门 —— 每一条都必须红。
+	# 见 docs/plans/2026-10-02-stage-tv-screen.md。
+	swift tools/test-resident-screen-overlay.swift
 
 test-all: test-install test-worlds test-daemon test-python test-harnesses dedupe
 

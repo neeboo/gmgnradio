@@ -42,6 +42,36 @@ guard syncSource.contains("requestID: \"claimed.\" + job.id.uuidString") else {
 guard appSource.contains("(error as? ResidentPropPlacementError) == .environmentNotReady") else {
     fail("the backlog must classify the service's own refusal value, not a copy of its text")
 }
+// ---- 历史存档自愈的**接线**判据（真机 2026-10-01 那把「2B 白色长剑」）--------------
+// 行为判据在下面 (E) 那一节（真数字、真判据、真世界状态、真摆放）；这里钉的是
+// "App 真的走了那条自愈 + 到底有没有把改动**说出来**"。
+guard syncSource.contains("WorldPropArchiveRebase.decide(") else {
+    fail("入库那一处必须走唯一那份自愈判据（WorldPropArchiveRebase），不许自己拼一套规则")
+}
+guard syncSource.contains("orientationNotices[job.objectID] = record.summary") else {
+    fail("自愈必须留下**可见记录**（谁被修了、改了哪几个字段）：静默改写用户数据是红线")
+}
+guard syncSource.contains("throw ResidentPropHostError.archiveNotRepairable(detail)") else {
+    fail("不能安全对齐的存档必须**可见地拒绝**并说出具体差异，不许静默跳过")
+}
+guard syncSource.contains("requestID: record.requestID") else {
+    fail("自愈写回必须用内容寻址的幂等键（同一份修复重放不写第二条）")
+}
+guard syncSource.contains(".rebase(healed)") else {
+    fail("自愈必须走 `.rebase` 那条只换派生字段的命令，不许拿 `.resize`/`.register` 冒充")
+}
+// 顺序：**先说出来，再写**。反过来的话，一次写失败就会留下"说改过、其实没改"。
+if let noticeIndex = syncSource.range(of: "orientationNotices[job.objectID] = record.summary"),
+   let commitIndex = syncSource.range(of: ".rebase(healed)") {
+    guard noticeIndex.lowerBound < commitIndex.lowerBound else {
+        fail("可见记录必须写在提交之前（否则写失败时会说一句做不到的话）")
+    }
+} else {
+    fail("自愈写回必须同时有可见记录与 .rebase 提交")
+}
+guard appSource.contains("物件存档与领取记录不一致，而且这份存档不能安全对齐") else {
+    fail("不能对齐时的拒绝文案必须把'为什么'带给用户，而不是只说一句'不一致'")
+}
 let finishDerivationSource = appDeclaration("private func finishResidentPropGridDerivation(")
 guard finishDerivationSource.contains("drainResidentPropInventoryBacklog(") else {
     fail("the support-geometry-ready callback must drive the inventory retry")
@@ -536,6 +566,172 @@ let flatWorld=FlatSupport(minimumX:-1,maximumX:5.5,minimumZ:-1,maximumZ:10,heigh
           "a refused registration must leave no inventory record")
   require(offGridContext.state.layoutReceipts["claimed.third-sword"] == nil,
           "a refused registration must leave no receipt")
+
+  // (E) **历史存档自愈**：真机那把「2B 白色长剑（外形摆件）」的**真实数字**。
+  //
+  // 权威里那条存档是**朝向归一落地之前**登记的：`size` = 1.100 × 0.146 × 0.062 米
+  // （躺着的网格按最长边归一），`sourceHeight` = 原始 Y 跨度 0.133 米，**没有** `orientation`
+  // 键；而今天同一份网格（`assetID` = 模型字节的 sha256，1,722,692 字节，字节一个都没变）
+  // 从原始 GLB + 领取记录推出来的是**立着**的 0.146 × 1.100 × 0.062 米。
+  // 两边的三个数字只是**换了一次位置** —— 所以旧判据（`size` 逐位相等）为假，那把剑
+  // 永久进不了 `residentOwnedPropAssets`，用户"摆不了"。
+  let swordObjectID = "wish-prop-4210db95-9253-4caf-83a3-3c45f090b099"
+  let swordWishID = "4210DB95-9253-4CAF-83A3-3C45F090B099"
+  let swordAssetID = "sha256:e9dda009e47ca4c1ace5e8a6e4ccf18645a109556b4f4772e410815c2be05529"
+  let swordName = "2B 白色长剑（外形摆件）"
+  // 渲染器量出来的**原始** AABB（与回执 `inspection.bounds.dimensions`、GLB 字节级重算一致）。
+  let swordRawExtent = WorldVector3(x:1.005432426929474, y:0.1334928721189499, z:0.05656638368964195)
+  let swordRequestedHeight: Float = 1.1
+  let swordOrientation = WorldPropOrientationPolicy.resolve(sourceExtent: swordRawExtent)
+  let swordOrientedExtent = WorldPropOrientationPolicy.orientedExtent(of: swordRawExtent, by: swordOrientation)
+  let swordDerived = WorldGeneratedProp(objectID: swordObjectID, sourceWishID: swordWishID,
+    assetID: swordAssetID, displayName: swordName,
+    size: WorldPropSizePolicy.automatic(sourceExtent: swordOrientedExtent,
+                                        requestedHeight: swordRequestedHeight)!.size,
+    sourceHeight: swordOrientedExtent.y,
+    orientation: swordOrientation.shouldArchive ? swordOrientation : nil)
+  let swordArchived = WorldGeneratedProp(objectID: swordObjectID, sourceWishID: swordWishID,
+    assetID: swordAssetID, displayName: swordName,
+    size: WorldPropSizePolicy.automatic(sourceExtent: swordRawExtent,
+                                        requestedHeight: swordRequestedHeight)!.size,
+    sourceHeight: swordRawExtent.y)
+  // 这一组数字必须真的是旧判据会拒的那一组（否则这个 harness 就不再盯着那个缺陷了）。
+  require(!swordArchived.matchesIdentity(of: swordDerived),
+          "真机那把剑的两份尺寸必须真的逐位不等（旧判据才会拒）")
+  require(swordArchived.objectID == swordDerived.objectID && swordArchived.assetID == swordDerived.assetID,
+          "它必须是同一件物件、同一份网格 —— 否则'自愈'就变成'把另一件东西认成它'")
+  require(abs(swordArchived.size.x - 1.1) < 0.0001 && abs(swordArchived.size.y - 0.14604877) < 0.0001
+          && abs(swordDerived.size.y - 1.1) < 0.0001 && abs(swordDerived.size.x - 0.14604877) < 0.0001,
+          "真机数字：存档 (1.100, 0.146, 0.062) / 今天 (0.146, 1.100, 0.062)")
+  let swordDecision = WorldPropArchiveRebase.decide(stored: swordArchived, derived: swordDerived,
+    meshExtent: swordRawExtent, orientedExtent: swordOrientedExtent,
+    requestedHeight: swordRequestedHeight, requestIDPrefix: "rebase." + swordWishID)
+  guard case let .rebase(swordHealed, swordRecord) = swordDecision else {
+    require(false, "同一件物件 + 同一份网格 + 只是量法换了 ⇒ 必须判成可安全自愈（实测 \(swordDecision)）"); exit(1)
+  }
+  // 三个**派生**字段整体换成今天那一份（拆开取会让画面与碰撞盒分叉）。
+  require(swordHealed.size == swordDerived.size && swordHealed.sourceHeight == swordDerived.sourceHeight
+          && swordHealed.orientation == swordDerived.orientation,
+          "派生字段（尺寸/高度基准/朝向）必须整体对齐到今天，不许只换一半")
+  // 用户自己的字段一个都不许动。
+  require(swordHealed.sizeLocked == swordArchived.sizeLocked
+          && swordHealed.sizeIntent == swordArchived.sizeIntent
+          && swordHealed.collision == swordArchived.collision
+          && swordHealed.authoritativeSize == swordArchived.authoritativeSize,
+          "用户自己的字段（尺寸锁/尺寸意图/碰撞代理/权威尺寸）一个都不许动")
+  // **可见记录**：改了哪几个字段、从多少到多少、凭什么。
+  require(swordRecord.changes.count == 3, "三个派生字段都要出现在记录里（实测 \(swordRecord.changes.count) 条）")
+  require(swordRecord.summary.contains(swordName) && swordRecord.summary.contains("→")
+          && swordRecord.summary.contains("claimed."),
+          "记录必须说清楚'谁被修了、改了什么、原值在哪'（可回滚），实测：\(swordRecord.summary)")
+  require(swordRecord.requestID.hasPrefix("rebase." + swordWishID),
+          "幂等键必须可读且内容寻址：\(swordRecord.requestID)")
+  // 幂等：修完之后再判一次 ⇒ 什么都不做（下一次 5 秒周期就落在这里）。
+  require(WorldPropArchiveRebase.decide(stored: swordHealed, derived: swordDerived,
+            meshExtent: swordRawExtent, orientedExtent: swordOrientedExtent,
+            requestedHeight: swordRequestedHeight, requestIDPrefix: "rebase." + swordWishID) == .unchanged,
+          "修完之后必须幂等（再判一次是 .unchanged，不写第二条）")
+  // 自愈之后**身份判据真的放行** —— 这正是那件资产能进 `residentOwnedPropAssets` 的条件。
+  require(swordHealed.matchesIdentity(of: swordDerived),
+          "修完之后身份判据必须放行，否则那把剑还是摆不了")
+  // **不能安全对齐**时必须可见地拒绝（同一件物件，但存档那份尺寸不是这份网格的等比缩放）。
+  let foreignArchive = WorldGeneratedProp(objectID: swordObjectID, sourceWishID: swordWishID,
+    assetID: swordAssetID, displayName: swordName,
+    size: WorldVector3(x: 0.7, y: 0.9, z: 0.31), sourceHeight: 0.31)
+  guard case let .refuse(refusal) = WorldPropArchiveRebase.decide(stored: foreignArchive,
+      derived: swordDerived, meshExtent: swordRawExtent, orientedExtent: swordOrientedExtent,
+      requestedHeight: swordRequestedHeight, requestIDPrefix: "rebase." + swordWishID) else {
+    require(false, "不是这份网格的等比缩放的存档不许被'对齐'（那会静默改写一个来路不明的数字）"); exit(1)
+  }
+  require(refusal.contains("0.70") && refusal.contains("等比缩放"),
+          "拒绝必须把**具体差异**说出来（两份数字都在），实测：\(refusal)")
+  // 身份不同（另一份资产）也必须拒绝，而不是把这次推导按到它头上。
+  let otherAsset = WorldGeneratedProp(objectID: swordObjectID, sourceWishID: swordWishID,
+    assetID: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    displayName: swordName, size: swordArchived.size, sourceHeight: swordArchived.sourceHeight)
+  guard case .refuse = WorldPropArchiveRebase.decide(stored: otherAsset, derived: swordDerived,
+      meshExtent: swordRawExtent, orientedExtent: swordOrientedExtent,
+      requestedHeight: swordRequestedHeight, requestIDPrefix: "rebase." + swordWishID) else {
+    require(false, "另一份资产（assetID 不同）不许被当成同一件物件修"); exit(1)
+  }
+  // ---- 世界状态那一层：`.rebase` 只换派生字段，放置不动，`layoutRevision` 只 +1，重放不写第二条 ----
+  let healContext = try WorldAgentContext(manifest: fixture)
+  healContext.installCollisionWorld(Floor())
+  let healFlat = flatSupport(fixture)
+  let healService = ResidentPropPlacementService(context: healContext, support: { healFlat })
+  _ = try healService.commit(.register(swordArchived), expectedLayoutRevision: 0,
+                             requestID: "claimed." + swordWishID)
+  let healed = try healService.commit(.rebase(swordHealed),
+      expectedLayoutRevision: healContext.state.layoutRevision, requestID: swordRecord.requestID)
+  require(healed.layoutRevision == 2,
+          "一次自愈只许 +1（登记 0 → 1、自愈 1 → 2），实测 \(healed.layoutRevision)")
+  let healedItem = healed.objectStates[swordObjectID]!
+  require(healedItem.generatedProp == swordHealed, "存档里那一份必须变成今天推出来的那一份")
+  require(healedItem.isEnabled == false, "自愈不许把库存里的东西推进空间（isEnabled 一个字节都不改）")
+  require(abs(healedItem.transform.scale.x - swordHealed.effectiveSize.y / swordHealed.sourceHeight) < 1e-6,
+          "渲染色调必须跟着 effectiveSize 那唯一一份出口重算")
+  // 幂等重放：同一条回执**不写第二条**、不涨 revision、状态逐位不变。
+  let afterHeal = healContext.state
+  _ = try healService.commit(.rebase(swordHealed),
+      expectedLayoutRevision: afterHeal.layoutRevision, requestID: swordRecord.requestID)
+  require(healContext.state == afterHeal, "同一份修复重放不许写第二条")
+  require(healContext.state.layoutRevision == afterHeal.layoutRevision, "重放不许涨 layoutRevision")
+  // **真的能摆进空间**：自愈之后走今天**全部**空间判据（一个字没放宽）把它放到格子中心。
+  let swordPlacement = WorldPropPlacement(surfaceID:"floor", position:.init(x:5,y:0,z:5), yaw:0)
+  _ = try healService.preview(objectID: swordObjectID, placement: swordPlacement)
+  _ = try healService.commit(.place(objectID: swordObjectID, placement: swordPlacement),
+      expectedLayoutRevision: healContext.state.layoutRevision, requestID: "place." + swordWishID)
+  require(healContext.state.objectStates[swordObjectID]?.isEnabled == true,
+          "自愈之后那把剑必须真的能摆进空间（真机缺陷的终点）")
+  require(healContext.state.objectStates[swordObjectID]?.generatedProp == swordHealed,
+          "摆进去的仍然是自愈之后那一份（没有再被改写）")
+  // 只有派生字段能换：改身份 / 改用户字段一律 fail-closed 拒绝（`.rebase` 不是后门）。
+  let lockedTarget = WorldGeneratedProp(objectID: swordObjectID, sourceWishID: swordWishID,
+    assetID: swordAssetID, displayName: swordName, size: swordHealed.size,
+    sourceHeight: swordHealed.sourceHeight, sizeLocked: true, orientation: swordHealed.orientation)
+  do {
+    _ = try healService.commit(.rebase(lockedTarget),
+        expectedLayoutRevision: healContext.state.layoutRevision, requestID: "rebase.tampered-lock")
+    require(false, "`.rebase` 不许改动用户自己的字段（尺寸锁）")
+  } catch let error as WorldPropLayoutError {
+    require(error == .invalidObject, "改用户字段必须判 invalidObject，实测 \(error)")
+  }
+  let otherAssetTarget = WorldGeneratedProp(objectID: swordObjectID, sourceWishID: swordWishID,
+    assetID: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    displayName: swordName, size: swordHealed.size, sourceHeight: swordHealed.sourceHeight,
+    orientation: swordHealed.orientation)
+  do {
+    _ = try healService.commit(.rebase(otherAssetTarget),
+        expectedLayoutRevision: healContext.state.layoutRevision, requestID: "rebase.tampered-asset")
+    require(false, "`.rebase` 不许把一件物件换成另一份资产")
+  } catch let error as WorldPropLayoutError {
+    require(error == .invalidObject, "换资产必须判 invalidObject，实测 \(error)")
+  }
+  // 回归：斧头与咖啡机（同样已登记、立着的资产）不受影响 —— 它们的存档与今天的推导逐位一致，
+  // 判据是 `.unchanged`，一次写都不会发生。
+  let axe = WorldGeneratedProp(objectID:"wish-prop-02bfee6e-82ad-4680-8525-db2d86791bf1",
+    sourceWishID:"02BFEE6E-82AD-4680-8525-DB2D86791BF1",
+    assetID:"sha256:9d50e3d75f88f9c3aeca8fc6624045d6c31951e44ac5e24da19104b7267caeeb",
+    displayName:"斧头", size:WorldVector3(x:0.88547075, y:0.7, z:0.08647913), sourceHeight:0.79552174)
+  let axeExtent = WorldVector3(x:1.0062, y:0.79552174, z:0.0983)
+  require(WorldPropArchiveRebase.decide(stored: axe, derived: axe, meshExtent: axeExtent,
+            orientedExtent: axeExtent, requestedHeight: 0.7,
+            requestIDPrefix: "rebase.axe") == .unchanged,
+          "已登记且一致的物件（斧头）必须是 .unchanged：一次写都不许发生")
+  let coffee = WorldGeneratedProp(objectID:"wish-prop-ebfc07be-6af3-4e25-af6c-9e795c6e28c6",
+    sourceWishID:"EBFC07BE-6AF3-4E25-AF6C-9E795C6E28C6",
+    assetID:"sha256:d656c46b21ee0c6601f754d44643285538c7d7ed32271c9095eadb875cc689f8",
+    displayName:"E2E-0907 咖啡机", size:WorldVector3(x:0.29150167, y:0.35, z:0.4719286), sourceHeight:0.7465656)
+  require(WorldPropArchiveRebase.decide(stored: coffee, derived: coffee,
+            meshExtent: WorldVector3(x:0.622, y:0.7465656, z:1.007),
+            orientedExtent: WorldVector3(x:0.622, y:0.7465656, z:1.007),
+            requestedHeight: 0.35, requestIDPrefix: "rebase.coffee") == .unchanged,
+          "已登记且一致的物件（咖啡机）必须是 .unchanged")
+  // 这一节覆盖了什么（每个 harness 都把结论打出来，否则没人知道它跑过）。
+  print("PASS: 历史存档自愈（真机那把「2B 白色长剑」：同一件物件 + 同一份网格、只是量法换了 ⇒ "
+        + "只换派生字段 size/sourceHeight/orientation、可见记录、幂等、可回滚；来路不明的尺寸与另一份资产"
+        + "一律**可见拒绝**；世界状态那一层 layoutRevision 只 +1、重放不写第二条；修完之后真的能摆进空间；"
+        + "斧头/咖啡机 .unchanged）")
 
   // 台账：被拒之后**记住**，几何就绪那一刻补做，且同一件只报一次。
   var backlog = ResidentPropInventoryBacklog()

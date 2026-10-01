@@ -178,6 +178,32 @@ public struct WorldSimulation: Sendable {
             item.transform = .init(position: item.transform.position, rotation: item.transform.rotation,
                                    scale: .init(x: resizedScale, y: resizedScale, z: resizedScale))
             next.objectStates[id] = item
+        case let .rebase(prop):
+            objectID = prop.objectID
+            guard var item = state.objectStates[objectID], let existing = item.generatedProp else {
+                throw WorldPropLayoutError.invalidObject
+            }
+            // **只有派生字段可以换**：身份（objectID/sourceWishID/assetID/displayName）与
+            // 用户自己的字段（sizeLocked/sizeIntent/collision/authoritativeSize）逐位不许变。
+            // 少了这道守卫，`.rebase` 就成了一条"不搬位置但能改任何东西"的后门。
+            guard WorldPropArchiveRebase.isDerivedOnlyRewrite(from: existing, to: prop) else {
+                throw WorldPropLayoutError.invalidObject
+            }
+            guard prop.isValid else { throw WorldPropLayoutError.invalidObject }
+            // 渲染色调跟着"这件东西多大"的**唯一**出口走（与上面的 `.resize` 同一处换算）；
+            // 位置与朝向一个字节都不动 —— 修的是"档案对这份资产的描述"，不是它的落点。
+            let rebasedScale = prop.effectiveSize.y / prop.sourceHeight
+            guard rebasedScale.isFinite, rebasedScale > 0 else {
+                throw WorldPropLayoutError.invalidSize("对齐后的尺寸换算失败，已保留原记录。")
+            }
+            item.metadata["gmgn.generated-prop.v1"] = String(decoding: try JSONEncoder().encode(prop), as: UTF8.self)
+            item.transform = .init(position: item.transform.position, rotation: item.transform.rotation,
+                                   scale: .init(x: rebasedScale, y: rebasedScale, z: rebasedScale))
+            next.objectStates[objectID] = item
+            // 撤销记录里存着的是**这件物件的旧字节**（`.undo` 的守卫要求它与现状逐位相同），
+            // 一改就作废：那一槽只能作废，不能留着让"撤销上次"变成一次看不懂的失败。
+            // 指**别的**物件的那一槽不受影响，原样保留 —— 自动修复不该吃掉用户的撤销。
+            if next.layoutUndo?.objectID == objectID { next.layoutUndo = nil }
         case let .hold(id, avatarAssetID, calibration):
             objectID = id
             guard state.activeActivity == nil else {

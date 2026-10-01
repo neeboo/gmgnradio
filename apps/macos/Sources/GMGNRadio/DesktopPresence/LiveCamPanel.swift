@@ -333,6 +333,17 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate, NSGestureRecogn
         applyStatusNotice(nil, kind: .info)
     }
 
+    /// 只清除**带这个前缀**的失败提示，绝不误伤别的失败。
+    ///
+    /// `clearTransientStatus` 会把所有提示（含别人的失败与进度）一起抹掉，所以
+    /// "某个能力恢复了"这种局部事实必须有自己的撤除口：当前显示的失败行不以该前缀
+    /// 开头时，这里什么都不做。
+    func dismissFailureStatus(matchingPrefix prefix: String) {
+        guard residentStatusKind == .failure, let notice = residentStatusNotice,
+              notice.hasPrefix(prefix) else { return }
+        applyStatusNotice(nil, kind: .info)
+    }
+
     /// 换世界/换后端等上下文切换：清掉旧提示与旧进度，失败提示也不例外。
     func clearTransientStatus() {
         residentStatusNotice = nil
@@ -1286,6 +1297,11 @@ final class LiveCamPanel: NSPanel {
 
     func showFailureStatus(_ text: String) {
         interactionView.showFailureStatus(text)
+    }
+
+    /// 只撤掉带该前缀的失败提示；见 `interactionView` 上的同名方法。
+    func dismissFailureStatus(matchingPrefix prefix: String) {
+        interactionView.dismissFailureStatus(matchingPrefix: prefix)
     }
 
     func clearTransientStatus() {

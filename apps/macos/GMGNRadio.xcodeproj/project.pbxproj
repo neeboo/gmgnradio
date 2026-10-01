@@ -47,6 +47,7 @@
 		1FD8A95C07082287E5FD8394 /* MarbleWorldClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 044DFDC6F60021056335F218 /* MarbleWorldClient.swift */; };
 		20C8510B171A3F23D8C51635 /* ResidentPropRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CF4BBDAD919719A1DBF7F9E /* ResidentPropRenderer.swift */; };
 		217C5077C6A607B1E7EC9802 /* ProgramPlanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = E012C530DC089221A1FE34C1 /* ProgramPlanner.swift */; };
+		219F0A54C0FAEC08711AEC73 /* WorldScreenStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA93D02588A5BAF9CE9E4AD5 /* WorldScreenStore.swift */; };
 		2236962BAF9ACD7CF6087AA6 /* AgentSpeech.swift in Sources */ = {isa = PBXBuildFile; fileRef = F79B0FAAC220CE9FB6AC6D45 /* AgentSpeech.swift */; };
 		24121583DFD834F472556459 /* InterruptionCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6B6117A1B853082CD0F65CBD /* InterruptionCoordinatorTests.swift */; };
 		251B4EF8A51EF72D0E814A37 /* LiveCamPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18FEBEBDF5BD28DA798CE26C /* LiveCamPanel.swift */; };
@@ -122,6 +123,7 @@
 		5D57161677518A9A39EAB58C /* StageWindowModeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C0EE40A2A02D7B94512CC74 /* StageWindowModeTests.swift */; };
 		5DE946B4047F5D3C2A625EE1 /* DJAgentToolDispatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE58FD9A6686480F8592B8EF /* DJAgentToolDispatcher.swift */; };
 		5DF23352AF4CE0DD0F99380E /* TrackKnowledge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3023F129331001DBAEBAF6D0 /* TrackKnowledge.swift */; };
+		5F77A2799447177EC5EE50C9 /* ResidentWishReferenceDiagnosis.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02D4D4E869781BE7EE9DEACF /* ResidentWishReferenceDiagnosis.swift */; };
 		5F8E787A682533EA402207D8 /* DoubaoRTCEventMapper.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9758A4F0754760FA0AB854CA /* DoubaoRTCEventMapper.swift */; };
 		5FFAFEEC33DBC151B36CC48F /* AudioAnalyzer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28D2705070A09B46791FEE87 /* AudioAnalyzer.swift */; };
 		605F41B881683661843EA7A4 /* WorldAgentToolDispatcherTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E79A6B28B80DA8480CF4948 /* WorldAgentToolDispatcherTests.swift */; };
@@ -141,12 +143,14 @@
 		6F33A84A6365FF3418372AFC /* ElevenLabsAudioLevelRendererTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D61973FBC289CA1574CC7E72 /* ElevenLabsAudioLevelRendererTests.swift */; };
 		6F921A4A35CF802F31E85189 /* ProviderHTTPTransportStub.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FA17938904D7F8165360614 /* ProviderHTTPTransportStub.swift */; };
 		702843EC03BD6828068FAF56 /* StageVisualPresetTimeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0281DD4F900FFD76446F5C1C /* StageVisualPresetTimeline.swift */; };
+		70E21D456E4E84FF6958C930 /* WorldScreenInference.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E1E3D433A085F3776DD2FAE /* WorldScreenInference.swift */; };
 		713D04EED12D19C70EEED5AA /* AgentProgramPlannerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 05E0E7A7D738D3198909C409 /* AgentProgramPlannerTests.swift */; };
 		72B7EC84B01B3A957DD68A3F /* GMGNSettingsViewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E74010CC37B6418925BA0556 /* GMGNSettingsViewTests.swift */; };
 		737821750A36354308B9C7D2 /* ResidentSystemInboxUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95B431CD9CEAAC171CD00F0F /* ResidentSystemInboxUI.swift */; };
 		761481871644BCC5C68DF17C /* OrbMotionModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A9A0DF149EE2164BBDE40EB /* OrbMotionModelTests.swift */; };
 		763E6B11EDFEAE0C94AE33AD /* CandidatePoolBuilderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 29B18EF24D82A3E14E358738 /* CandidatePoolBuilderTests.swift */; };
 		76BBEAD957658757C0796FEC /* AgentSpeechTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAC9B7E070F14B0F816AE428 /* AgentSpeechTests.swift */; };
+		798F3E554E519E59B853D0F4 /* WorldScreenProjection.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD53CFC01FF713A675960925 /* WorldScreenProjection.swift */; };
 		7A17C5E01AC43CD75E7C7195 /* OrbState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43F2D91E87ABAC0F51F8C126 /* OrbState.swift */; };
 		7B5FE2C2BD09CA693E0FE5D3 /* WorldAgentToolContract.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4979C002BFA7259332C1AF5A /* WorldAgentToolContract.swift */; };
 		7BD9C88B72DF7E4C5BDB5946 /* StageVideoPlayback.swift in Sources */ = {isa = PBXBuildFile; fileRef = 62CA937FC34ED9EC46864B5D /* StageVideoPlayback.swift */; };
@@ -173,6 +177,7 @@
 		92BE917E053A2C7267FF1CB3 /* AcousticTrackAnalyzer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BBF9F8F8D467021C46B08F5 /* AcousticTrackAnalyzer.swift */; };
 		936430A6AC4FF9D7B3D62C5C /* GMGNRadioApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39FC866C894AFC1D958539BF /* GMGNRadioApp.swift */; };
 		93C46E6E2725D1F073DE8E8E /* NanoemVMDLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = B70D6D452CCF2867DEC5DA94 /* NanoemVMDLoader.swift */; };
+		94197FE36E938456755E1E25 /* ScreenPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 82B1BCCE72BBEE1B80958C87 /* ScreenPanel.swift */; };
 		945D31BFE773D529707B7F9E /* AgentShowProposal.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06098ED46674F874E30028A5 /* AgentShowProposal.swift */; };
 		94747BC9252F940E41F06DA8 /* SpatialEnvironmentEffectsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D40A78C216C16AF9A7BF4F96 /* SpatialEnvironmentEffectsView.swift */; };
 		94A2BC7B04AA84C9A463CED6 /* Orb.metal in Sources */ = {isa = PBXBuildFile; fileRef = 4374B4687559AEDE957A3117 /* Orb.metal */; };
@@ -191,6 +196,7 @@
 		98FA1863591C47A4ED8427FF /* PropGenerationClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6B98D23C9CD0B46A51B0153 /* PropGenerationClient.swift */; };
 		995518C0CBFC44D828848E40 /* ResidentPropPlacementConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = FEA756421C88CC46A0081E6E /* ResidentPropPlacementConfiguration.swift */; };
 		9A6370C989217374C167A4A7 /* AgentSettingsModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 17D3F971B9C0C562A1BAD3DB /* AgentSettingsModel.swift */; };
+		9BE7615CA02A72040F6D0947 /* WorldScreenState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85490E20953D777A44BAF5D8 /* WorldScreenState.swift */; };
 		9D020777B554187459EA6617 /* ResidentWishMachineTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7335B9B5827729339174B18 /* ResidentWishMachineTools.swift */; };
 		9D2202699E9D276547189632 /* PropGenerationWorkflowCollision.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03A877215EBD7A9A904CDBD1 /* PropGenerationWorkflowCollision.swift */; };
 		9D577D64E80B133295B83130 /* SpatialStageStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4DAD314FA946D04CCDC3180A /* SpatialStageStoreTests.swift */; };
@@ -233,15 +239,19 @@
 		C04254A6FF945016763D8B48 /* ResidentStateClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 19678E75760FF52C34D1F4BB /* ResidentStateClient.swift */; };
 		C10827D8D39E84E9E79DFFD9 /* DJProgramStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F0C99CC73DBA693F2E286F1 /* DJProgramStore.swift */; };
 		C3E9ADA40693BD1AB0C2F219 /* AppleMusicSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = 393199081906581B9CC18676 /* AppleMusicSource.swift */; };
+		C5B456BB3F40EBD534A86A28 /* WorldScreenOverlayController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0AE9BABDBADF3D475A635E0 /* WorldScreenOverlayController.swift */; };
 		C8AF3084ADEA152752C5EE7F /* OrbAppearance.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6B4ECE2281E5829AE3E02FE3 /* OrbAppearance.swift */; };
 		C8B225A7F271ACEB26A2CAB1 /* VMDHumanoidMap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C3F9B64C68EF0ED6C90F53C /* VMDHumanoidMap.swift */; };
 		CA7376BF0239E2E46824D607 /* ResidentClaudeProcessRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6F313F9AA07A438357513FA /* ResidentClaudeProcessRunner.swift */; };
 		CC440250E8A26020325CFFF4 /* PropSupportGridMapping.swift in Sources */ = {isa = PBXBuildFile; fileRef = A06778F3534FE1B87C9D3FC7 /* PropSupportGridMapping.swift */; };
 		CCB321AF1A35FDC741CF2B1F /* MotionPackageStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 285BEEED3B1193DF6448D871 /* MotionPackageStoreTests.swift */; };
+		CF257D49B7F7C39CB8BBE62B /* WorldScreenMetadata.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7871D3CE3289CAECC3492A64 /* WorldScreenMetadata.swift */; };
+		CFA73B9B441C3D01031ACB5D /* WorldScreenGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = B80365D49F91EA266D079E63 /* WorldScreenGeometry.swift */; };
 		D721C4D533DAA4D461CEF6D2 /* PlaybackContext.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2457A76CBF19C18E6D386EE /* PlaybackContext.swift */; };
 		D807A54C3784A2FF10D4278D /* MMDSceneKit in Frameworks */ = {isa = PBXBuildFile; productRef = 1F7DF91FFD2A650CA42087BD /* MMDSceneKit */; };
 		D8CF6A2326DE3E3C6DA2F3E4 /* VisualAudioInputPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09494436AADC40C3833A6FC5 /* VisualAudioInputPolicy.swift */; };
 		D8D0906855E8347D014683A6 /* StageWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC8DB2FC6BF5BF149BD893CC /* StageWindowController.swift */; };
+		D9CC285664E137376A3F8CCD /* ResidentScreenTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = 409F24B059BCB0E6E277D51E /* ResidentScreenTools.swift */; };
 		DA821C0D547E1BA3AF5464D0 /* ResidentVisionTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F6DF0E5038DD4BDC58A0D55 /* ResidentVisionTools.swift */; };
 		DD0E1B235354B4FFCA244364 /* VMDBezierSampler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 72746C2E884A529073F5550A /* VMDBezierSampler.swift */; };
 		DD34674AE84A35C15E3EB4A7 /* CodexAgentAccountService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A961113D1516220877214877 /* CodexAgentAccountService.swift */; };
@@ -273,6 +283,7 @@
 		F13C12A25890DFA6A57865C1 /* ResidentDSHHostToolsBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BC6A0897CCA1202FE5CC208 /* ResidentDSHHostToolsBridge.swift */; };
 		F16EF79D0AA7BC63E13BF3BC /* MusicProviderWebLoginPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 44880C8B10C7844B4E7DD74E /* MusicProviderWebLoginPolicy.swift */; };
 		F1EB3984A5FF0E2D1F44DC7B /* OrbUniforms.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47876636EF21649388CE59E3 /* OrbUniforms.swift */; };
+		F29D9CA04913442E4A025EF1 /* WorldScreenContent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 302784B9AFBD09593A9228E5 /* WorldScreenContent.swift */; };
 		F2B90F7075546203D861C121 /* AcousticTrackAnalyzerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EA377FC380DDC69C96FD8551 /* AcousticTrackAnalyzerTests.swift */; };
 		F3D79180A4B78F90ABD3FD5B /* MarbleWorldClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3F357B698E50BB31A5CEEAC /* MarbleWorldClientTests.swift */; };
 		F662D009BA9219E57CEA2E63 /* PMXStageAvatarRendererTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B056DAA4792BCFC8165FC587 /* PMXStageAvatarRendererTests.swift */; };
@@ -314,6 +325,7 @@
 		01325CEA7EA9A69A35350874 /* ResidentMemoryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentMemoryStore.swift; sourceTree = "<group>"; };
 		015185F407965D5142B0841B /* WorldAgentContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldAgentContext.swift; sourceTree = "<group>"; };
 		0281DD4F900FFD76446F5C1C /* StageVisualPresetTimeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageVisualPresetTimeline.swift; sourceTree = "<group>"; };
+		02D4D4E869781BE7EE9DEACF /* ResidentWishReferenceDiagnosis.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentWishReferenceDiagnosis.swift; sourceTree = "<group>"; };
 		03943BE3B37D041CF6D86FE0 /* AppMenuActionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppMenuActionTests.swift; sourceTree = "<group>"; };
 		03A877215EBD7A9A904CDBD1 /* PropGenerationWorkflowCollision.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PropGenerationWorkflowCollision.swift; sourceTree = "<group>"; };
 		044DFDC6F60021056335F218 /* MarbleWorldClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarbleWorldClient.swift; sourceTree = "<group>"; };
@@ -351,6 +363,7 @@
 		1BB8EACB340657AF2516A624 /* ResidentVisionImageBox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentVisionImageBox.swift; sourceTree = "<group>"; };
 		1C0EE40A2A02D7B94512CC74 /* StageWindowModeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageWindowModeTests.swift; sourceTree = "<group>"; };
 		1C3F9B64C68EF0ED6C90F53C /* VMDHumanoidMap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VMDHumanoidMap.swift; sourceTree = "<group>"; };
+		1E1E3D433A085F3776DD2FAE /* WorldScreenInference.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldScreenInference.swift; sourceTree = "<group>"; };
 		1F1ADE95832BAA10492DBF2F /* ResidentSystemInbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentSystemInbox.swift; sourceTree = "<group>"; };
 		1F341732E30CC1C3F05A7532 /* CodexTrackRankingAgentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexTrackRankingAgentTests.swift; sourceTree = "<group>"; };
 		1F7B6F4B8014DFB9AD76A24A /* SyncedMusicLibraryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncedMusicLibraryStore.swift; sourceTree = "<group>"; };
@@ -371,6 +384,7 @@
 		2B3D886F759F9B2EBE61D14B /* ResidentWorldToolSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentWorldToolSession.swift; sourceTree = "<group>"; };
 		2D6999758740371B4CC8758D /* StageWindowControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageWindowControllerTests.swift; sourceTree = "<group>"; };
 		3023F129331001DBAEBAF6D0 /* TrackKnowledge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrackKnowledge.swift; sourceTree = "<group>"; };
+		302784B9AFBD09593A9228E5 /* WorldScreenContent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldScreenContent.swift; sourceTree = "<group>"; };
 		30C49D1F8B1D6E86CA04C0B3 /* ResidentLocomotionMotionPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentLocomotionMotionPolicy.swift; sourceTree = "<group>"; };
 		31080F189374AC62C63D9FEB /* NanoemCore */ = {isa = PBXFileReference; lastKnownFileType = folder; name = NanoemCore; path = Packages/NanoemCore; sourceTree = SOURCE_ROOT; };
 		31B4ED03B824DB23844C3DB1 /* StageParticleGeometry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageParticleGeometry.swift; sourceTree = "<group>"; };
@@ -395,6 +409,7 @@
 		3EC30AFB44CBD4D6847AC1E3 /* MarbleAPIKeySettingsModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarbleAPIKeySettingsModel.swift; sourceTree = "<group>"; };
 		3ECC82D2CA5287308B9ACA45 /* PropSupportGridPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PropSupportGridPresentation.swift; sourceTree = "<group>"; };
 		3F6DF0E5038DD4BDC58A0D55 /* ResidentVisionTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentVisionTools.swift; sourceTree = "<group>"; };
+		409F24B059BCB0E6E277D51E /* ResidentScreenTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentScreenTools.swift; sourceTree = "<group>"; };
 		4374B4687559AEDE957A3117 /* Orb.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Orb.metal; sourceTree = "<group>"; };
 		43F2D91E87ABAC0F51F8C126 /* OrbState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbState.swift; sourceTree = "<group>"; };
 		44880C8B10C7844B4E7DD74E /* MusicProviderWebLoginPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicProviderWebLoginPolicy.swift; sourceTree = "<group>"; };
@@ -448,10 +463,13 @@
 		7454D982AE3249A42B198F3D /* MarbleWorld.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarbleWorld.swift; sourceTree = "<group>"; };
 		74CB5FDE714890B936EBFF0A /* MusicAccountsModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicAccountsModelTests.swift; sourceTree = "<group>"; };
 		77166FE9E4995A36C34A2D90 /* GMGNRadioTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = GMGNRadioTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		7871D3CE3289CAECC3492A64 /* WorldScreenMetadata.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldScreenMetadata.swift; sourceTree = "<group>"; };
 		7B688935989EC09F58088668 /* LocalMusicPlayerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalMusicPlayerTests.swift; sourceTree = "<group>"; };
 		7F0C99CC73DBA693F2E286F1 /* DJProgramStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DJProgramStore.swift; sourceTree = "<group>"; };
 		803EF0252493E88D98D89C61 /* GMGNSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GMGNSettingsView.swift; sourceTree = "<group>"; };
+		82B1BCCE72BBEE1B80958C87 /* ScreenPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenPanel.swift; sourceTree = "<group>"; };
 		842ED49DC38231DCE9CBF63D /* ResidentDSHTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentDSHTransport.swift; sourceTree = "<group>"; };
+		85490E20953D777A44BAF5D8 /* WorldScreenState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldScreenState.swift; sourceTree = "<group>"; };
 		85D5EE9963FDAFB9A0BEE96B /* StageUniformTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageUniformTests.swift; sourceTree = "<group>"; };
 		867C65B2F21DFB87387E73A2 /* StageAvatarRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageAvatarRuntime.swift; sourceTree = "<group>"; };
 		8A9A0DF149EE2164BBDE40EB /* OrbMotionModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbMotionModelTests.swift; sourceTree = "<group>"; };
@@ -504,6 +522,7 @@
 		B2CF2D3E1DDB2710C1854C97 /* MotionFormatFilter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MotionFormatFilter.swift; sourceTree = "<group>"; };
 		B43C3927253A50F50B106EC9 /* ResidentPropBlockReasonLabel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentPropBlockReasonLabel.swift; sourceTree = "<group>"; };
 		B70D6D452CCF2867DEC5DA94 /* NanoemVMDLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NanoemVMDLoader.swift; sourceTree = "<group>"; };
+		B80365D49F91EA266D079E63 /* WorldScreenGeometry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldScreenGeometry.swift; sourceTree = "<group>"; };
 		B8B2E1684E9AD716A583F585 /* SpatialStageStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpatialStageStore.swift; sourceTree = "<group>"; };
 		B8DE276D1E32F92A4062FE08 /* StageVideoPlaybackTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageVideoPlaybackTests.swift; sourceTree = "<group>"; };
 		BA7F9FDF7793356A5FEDD393 /* WishMachineOutputRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WishMachineOutputRenderer.swift; sourceTree = "<group>"; };
@@ -516,6 +535,7 @@
 		BCDF0B028ECB022DE9E68D0E /* StageRenderSurfaceController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageRenderSurfaceController.swift; sourceTree = "<group>"; };
 		BDCE4DF69A7F8E8FCB4244B2 /* StagePresentationModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StagePresentationModelTests.swift; sourceTree = "<group>"; };
 		BF9A4902E75F2E8D7081C852 /* OrbRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbRenderer.swift; sourceTree = "<group>"; };
+		C0AE9BABDBADF3D475A635E0 /* WorldScreenOverlayController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldScreenOverlayController.swift; sourceTree = "<group>"; };
 		C12A593D2E39AA38BDE94F2C /* ResidentImageAttachment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentImageAttachment.swift; sourceTree = "<group>"; };
 		C1A4CC83558EB44C696611C8 /* LiveCamWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveCamWindowController.swift; sourceTree = "<group>"; };
 		C2722FAA85733F1B941608F1 /* MarbleWorldLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarbleWorldLibrary.swift; sourceTree = "<group>"; };
@@ -533,6 +553,7 @@
 		C97C78D7E28F17F0C5C3362B /* MusicLibraryAgentService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicLibraryAgentService.swift; sourceTree = "<group>"; };
 		C9BED59FEA722CB9CBF88096 /* WindowPlacement.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowPlacement.swift; sourceTree = "<group>"; };
 		CA45B2F39C34F3F44A24A4FE /* ProviderEventMapperTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderEventMapperTests.swift; sourceTree = "<group>"; };
+		CA93D02588A5BAF9CE9E4AD5 /* WorldScreenStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldScreenStore.swift; sourceTree = "<group>"; };
 		CAC286B7D0E5D8E13DC06BD1 /* VMDMotionDocument.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VMDMotionDocument.swift; sourceTree = "<group>"; };
 		CB1CE401DC46221687D05BF6 /* PropGenerationConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PropGenerationConfiguration.swift; sourceTree = "<group>"; };
 		CB7307989361CD9BA9432B67 /* FoliaSceneRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FoliaSceneRuntime.swift; sourceTree = "<group>"; };
@@ -593,6 +614,7 @@
 		FB1A15690B115ECC57F64F9E /* RealtimeDJSessionController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeDJSessionController.swift; sourceTree = "<group>"; };
 		FB8A88527BC23EB19602B4AB /* StageCameraCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageCameraCoordinatorTests.swift; sourceTree = "<group>"; };
 		FC8DB2FC6BF5BF149BD893CC /* StageWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageWindowController.swift; sourceTree = "<group>"; };
+		FD53CFC01FF713A675960925 /* WorldScreenProjection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldScreenProjection.swift; sourceTree = "<group>"; };
 		FE58FD9A6686480F8592B8EF /* DJAgentToolDispatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DJAgentToolDispatcher.swift; sourceTree = "<group>"; };
 		FEA756421C88CC46A0081E6E /* ResidentPropPlacementConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentPropPlacementConfiguration.swift; sourceTree = "<group>"; };
 		FF4EF80770D71D3EC6B0D33D /* StreamingMusicCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamingMusicCache.swift; sourceTree = "<group>"; };
@@ -642,6 +664,7 @@
 				85A9751DFFFDA8729362F21A /* MusicKnowledge */,
 				19CC55771B2173DC737025A8 /* MusicSources */,
 				89F2AA25D318725B8CCE37D6 /* Presence */,
+				BB9A196806665DA807DA7F6B /* Screen */,
 				A3C7C5F9101A6D5033EE36BB /* Settings */,
 				1A0FDB0DF3340F453EE75B6C /* VisualEngine */,
 				1EC32E4E995C7CB6FC81AC28 /* VoiceSession */,
@@ -776,6 +799,7 @@
 				1BB8EACB340657AF2516A624 /* ResidentVisionImageBox.swift */,
 				3F6DF0E5038DD4BDC58A0D55 /* ResidentVisionTools.swift */,
 				C7335B9B5827729339174B18 /* ResidentWishMachineTools.swift */,
+				02D4D4E869781BE7EE9DEACF /* ResidentWishReferenceDiagnosis.swift */,
 				4C7A2D03F5D5146ABBED6DBA /* ResidentWishReferenceTools.swift */,
 				ABAA7C464C8C13EA57082B04 /* ResidentWorldObservation.swift */,
 				2B3D886F759F9B2EBE61D14B /* ResidentWorldToolSession.swift */,
@@ -1124,6 +1148,23 @@
 				E012C530DC089221A1FE34C1 /* ProgramPlanner.swift */,
 			);
 			path = DJCore;
+			sourceTree = "<group>";
+		};
+		BB9A196806665DA807DA7F6B /* Screen */ = {
+			isa = PBXGroup;
+			children = (
+				409F24B059BCB0E6E277D51E /* ResidentScreenTools.swift */,
+				82B1BCCE72BBEE1B80958C87 /* ScreenPanel.swift */,
+				302784B9AFBD09593A9228E5 /* WorldScreenContent.swift */,
+				B80365D49F91EA266D079E63 /* WorldScreenGeometry.swift */,
+				1E1E3D433A085F3776DD2FAE /* WorldScreenInference.swift */,
+				7871D3CE3289CAECC3492A64 /* WorldScreenMetadata.swift */,
+				C0AE9BABDBADF3D475A635E0 /* WorldScreenOverlayController.swift */,
+				FD53CFC01FF713A675960925 /* WorldScreenProjection.swift */,
+				85490E20953D777A44BAF5D8 /* WorldScreenState.swift */,
+				CA93D02588A5BAF9CE9E4AD5 /* WorldScreenStore.swift */,
+			);
+			path = Screen;
 			sourceTree = "<group>";
 		};
 		BBF952DA6DD9ACDCA0DD9C71 /* VisualEngine */ = {
@@ -1575,6 +1616,7 @@
 				20C8510B171A3F23D8C51635 /* ResidentPropRenderer.swift in Sources */,
 				3D797429E450227D21862C59 /* ResidentPropScene.swift in Sources */,
 				91B55E583C0A274F29063E6F /* ResidentPropToolBridge.swift in Sources */,
+				D9CC285664E137376A3F8CCD /* ResidentScreenTools.swift in Sources */,
 				C04254A6FF945016763D8B48 /* ResidentStateClient.swift in Sources */,
 				124DE75B028E61EFAFDC5712 /* ResidentStatusBadge.swift in Sources */,
 				E6EB719F55B52F1FE142E026 /* ResidentSteeringDelivery.swift in Sources */,
@@ -1588,9 +1630,11 @@
 				05BD9A1C7B744F91A293F87A /* ResidentWebImageDownloader.swift in Sources */,
 				17C5BBD2E7118EF559280DC7 /* ResidentWebImagePublicDNSResolver.swift in Sources */,
 				9D020777B554187459EA6617 /* ResidentWishMachineTools.swift in Sources */,
+				5F77A2799447177EC5EE50C9 /* ResidentWishReferenceDiagnosis.swift in Sources */,
 				377CDFED9B1812290C3CC8E4 /* ResidentWishReferenceTools.swift in Sources */,
 				285A92ABFCB741A3A097E4F0 /* ResidentWorldObservation.swift in Sources */,
 				B38CAD275CF9668811068E88 /* ResidentWorldToolSession.swift in Sources */,
+				94197FE36E938456755E1E25 /* ScreenPanel.swift in Sources */,
 				94747BC9252F940E41F06DA8 /* SpatialEnvironmentEffectsView.swift in Sources */,
 				8BB928788821FF8159F95422 /* SpatialStageStore.swift in Sources */,
 				E49527753955135A51F8363E /* Stage.metal in Sources */,
@@ -1633,6 +1677,14 @@
 				7B5FE2C2BD09CA693E0FE5D3 /* WorldAgentToolContract.swift in Sources */,
 				FE33D1065264BA512AC4078F /* WorldAgentToolDispatcher.swift in Sources */,
 				2C9AEFE80D992E7CDBDA41B5 /* WorldAuthorityClient.swift in Sources */,
+				F29D9CA04913442E4A025EF1 /* WorldScreenContent.swift in Sources */,
+				CFA73B9B441C3D01031ACB5D /* WorldScreenGeometry.swift in Sources */,
+				70E21D456E4E84FF6958C930 /* WorldScreenInference.swift in Sources */,
+				CF257D49B7F7C39CB8BBE62B /* WorldScreenMetadata.swift in Sources */,
+				C5B456BB3F40EBD534A86A28 /* WorldScreenOverlayController.swift in Sources */,
+				798F3E554E519E59B853D0F4 /* WorldScreenProjection.swift in Sources */,
+				9BE7615CA02A72040F6D0947 /* WorldScreenState.swift in Sources */,
+				219F0A54C0FAEC08711AEC73 /* WorldScreenStore.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

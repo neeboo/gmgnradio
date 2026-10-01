@@ -162,6 +162,58 @@ private func prop(sizeIntent: WorldPropSizeIntent? = nil,
     #expect(!rebased.matchesIdentity(of: other), "换了资产仍然是另一件物件")
 }
 
+/// 真机那把剑的**精确** Float32 实测三维：渲染器存 Float32 的 `min`/`max`，再在 Float32
+/// 里相减（`prepared.maximum - prepared.minimum`）。写全精度是因为下面那条断言要求**逐位相等**，
+/// 用上面那个手写圆整过的 `swordExtent` 会差在第七位有效数字上。
+private let swordMeasuredExtent = WorldVector3(
+    x: 1.005432367324829, y: 0.1334928721189499, z: 0.05656638368964195)
+
+@Test func aRecordWrittenBeforeOrientationLandedIsNotMistakenForAnotherAsset() throws {
+    // 真机事故（2026-10-01「白色大剑不见了」）：那把剑 **17:15** 登记时摆正政策还没落地
+    // （`WorldPropOrientation.swift` 是 **18:20** 才进代码的），所以那条存档里没有
+    // `orientation` 键，它的 `size` 是拿**原始** AABB 量的。今天同一份网格摆正之后再量，
+    // 同一件东西得到的是另一组数字（三个分量换了一次位置）⇒ `matchesIdentity` 的尺寸
+    // 那一腿逐位不等 ⇒ `ownershipMismatch` ⇒ 资产判成"未备好" ⇒ **剑从房间里消失**。
+    //
+    // 修法一个字没放宽判据：基线回到**存档自己的坐标系**里重算（`recordedBaseline`），
+    // 同一个坐标系里仍然逐位要求相等，`sizeLocked`/`sizeIntent` 那两条既有豁免原样保留。
+    let stored = prop(size: WorldVector3(x: 1.1, y: 0.14604877, z: 0.061886832))
+    #expect(stored.orientation == nil, "摆正政策落地之前登记的存档没有 `orientation` 键")
+
+    // 今天量出来的摆正：躺着的网格（最长水平边 1.005 m / 高度 0.133 m = 7.53 > 4）被转正。
+    // 注意转正后的 AABB **不是**干净的分量互换：四元数经八个角点算出来会带 1e-7 级的浮点尘
+    // （这正是"排序三个分量再比"也救不了、必须换坐标系重算的原因）。
+    let orientation = WorldPropOrientationPolicy.resolve(sourceExtent: swordMeasuredExtent)
+    #expect(orientation.source == .inferredPrincipalAxis, "这把剑今天仍然被判定为躺着生成")
+    let oriented = WorldPropOrientationPolicy.orientedExtent(of: swordMeasuredExtent, by: orientation)
+    #expect(oriented.y > oriented.x, "转正之后最长边落在 Y 轴上")
+
+    // 负对照 —— **这就是事故发生的那条路**：拿今天的坐标系当基线 ⇒ 必然不等。
+    let todaysFrame = try #require(WorldPropSizePolicy.automatic(
+        sourceExtent: oriented, requestedHeight: 1.1))
+    #expect(!stored.matchesIdentity(of: prop(size: todaysFrame.size)),
+            "坐标系不对时基线必然不等：剑消失走的就是这一条")
+
+    // 正解：基线在**存档自己的坐标系**里算 ⇒ 与存档逐位相等，剑留在房间里。
+    let recorded = try #require(WorldPropSizePolicy.recordedBaseline(
+        sourceExtent: swordMeasuredExtent, orientation: stored.orientation,
+        sizeIntent: nil, requestedHeight: 1.1), "存档坐标系里必须量得出尺寸")
+    #expect(recorded == stored.size, "存档坐标系里的基线必须与存档逐位相等（实测 \(recorded)）")
+    #expect(stored.matchesIdentity(of: prop(size: recorded)),
+            "摆正政策落地之前登记的存档不得被判成资产归属不一致")
+
+    // 反方向也要认：**带** `orientation` 的存档按它自己声明的那个坐标系量，结果与今天逐位相同。
+    let modern = WorldGeneratedProp(objectID: stored.objectID, sourceWishID: stored.sourceWishID,
+                                    assetID: stored.assetID, displayName: stored.displayName,
+                                    size: todaysFrame.size, sourceHeight: oriented.y,
+                                    orientation: orientation)
+    let modernBaseline = try #require(WorldPropSizePolicy.recordedBaseline(
+        sourceExtent: swordMeasuredExtent, orientation: modern.orientation,
+        sizeIntent: nil, requestedHeight: 1.1))
+    #expect(modernBaseline == modern.size, "有声明的存档也必须按自己声明的坐标系量")
+    #expect(modern.matchesIdentity(of: prop(size: modernBaseline)))
+}
+
 // MARK: - 契约字面量与 Codable 兼容
 
 @Test func theIntentVocabularyIsExactlyTheDaemonsContractVocabulary() throws {

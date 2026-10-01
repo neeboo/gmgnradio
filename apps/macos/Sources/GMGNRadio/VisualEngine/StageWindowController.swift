@@ -150,6 +150,21 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         stageContentView?.noteScenePickUp()
     }
 
+    // MARK: 电视机：覆盖层宿主 + 面板（世界那一侧由 App 注入）
+
+    /// 屏幕覆盖层的宿主容器。**它不吃指针**（`WorldScreenOverlayContainer.hitTest` 恒 `nil`），
+    /// 所以这里不需要、也**不允许**往 `consumesScenePointer` 那条判据里加任何东西。
+    var screenOverlayHostView: NSView? { stageContentView?.screenOverlayHostView }
+
+    /// 装上电视面板（宽度由宿主约束成 340）。
+    func installScreenPanel(_ store: WorldScreenStore) {
+        stageContentView?.installScreenPanel(store)
+    }
+
+    func setScreenPanelVisible(_ visible: Bool) {
+        stageContentView?.setScreenPanelVisible(visible)
+    }
+
     /// 建造模式：把预览挪到吸附后的格心（层名 + footprint 朝向）。
     func moveResidentPropGridPointer(to position: WorldVector3, layerName: String, yaw: Float) async {
         await residentPropEditor.moveGridPointer(to: position, layerName: layerName, yaw: yaw)
@@ -813,11 +828,42 @@ private final class StageContentView: NSView {
     func setSystemInboxUnread(_ count: Int) {
         transportControls?.setSystemInboxUnread(count)
     }
+
+    /// 电视覆盖层的宿主容器。`WorldScreenOverlayController` 把每块屏的容器挂进来。
+    var screenOverlayHostView: NSView { screenOverlayContainer }
+
+    /// 装上电视面板（一次性）。宽度 340 与既有面板同规格；放在**左下**，
+    /// 装修面板在右下 —— 两块面板能同时开着，不互相遮。
+    func installScreenPanel(_ store: WorldScreenStore) {
+        guard screenPanelHost == nil else { return }
+        let host = NSHostingView(rootView: ScreenPanelView(
+            store: store,
+            onClose: { [weak self] in self?.setScreenPanelVisible(false) }
+        ))
+        host.identifier = NSUserInterfaceItemIdentifier("stage.screen-panel")
+        host.translatesAutoresizingMaskIntoConstraints = false
+        host.wantsLayer = true
+        host.layer?.zPosition = 19
+        addSubview(host)
+        NSLayoutConstraint.activate([
+            host.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
+            host.bottomAnchor.constraint(equalTo: transportControls.topAnchor, constant: -12),
+            host.widthAnchor.constraint(equalToConstant: 340),
+            host.topAnchor.constraint(greaterThanOrEqualTo: topAnchor, constant: 16),
+        ])
+        screenPanelHost = host
+    }
+
+    func setScreenPanelVisible(_ visible: Bool) {
+        screenPanelHost?.isHidden = !visible
+    }
     private var destinationButton: StageDestinationButton!
     private var residentComposer: NSHostingView<StageResidentComposer>!
     private let residentTaskFeedback: NSHostingView<WishMachineTaskStatusView>
     private let residentPropEditor: ResidentPropEditorState
     private var propEditorPanel: NSHostingView<ResidentPropEditorView>!
+    private let screenOverlayContainer = WorldScreenOverlayContainer()
+    private var screenPanelHost: NSHostingView<ScreenPanelView>?
     private var editorVisibilitySubscription: AnyCancellable?
     private var editorSnapshotSubscription: AnyCancellable?
     /// 菜单栏「装修空间」在空间/世界快照还没就绪时挂起的意图。
@@ -951,6 +997,17 @@ private final class StageContentView: NSView {
         renderSurfaceContainer.wantsLayer = true
         renderSurfaceContainer.layer?.zPosition = 1.5
         addSubview(renderSurfaceContainer)
+
+        // 电视机覆盖层：世界渲染（1.5）之上、环境特效（2）之下。
+        // 它是唯一的覆盖层宿主；容器 `hitTest` 恒 nil，所以它不吃场景指针。
+        // 具体贴哪一块屏幕由 `WorldScreenOverlayController` 每帧决定
+        // （它拿的是 `SpatialStageStore.residentPropScreenPoint` 的同一份投影）。
+        screenOverlayContainer.frame = bounds
+        screenOverlayContainer.identifier = NSUserInterfaceItemIdentifier("stage.screen-overlay-host")
+        screenOverlayContainer.autoresizingMask = [.width, .height]
+        screenOverlayContainer.wantsLayer = true
+        screenOverlayContainer.layer?.zPosition = 1.6
+        addSubview(screenOverlayContainer)
 
         let metalView = MetalStageView(
             frame: bounds,

@@ -341,6 +341,53 @@ func check(_ value: Bool, _ message: String) { if !value { print("FAIL:",message
         cells:lawn,states:glow,cameraPosition:origin,spacing:0.25,options:grid).count
         < PropSupportGridPresentation.instances(cells:lawn,states:glow,cameraPosition:origin,spacing:0.25,options:grid).count,
         "the glow goes through the focus clip instead of flooding the floor")
+  // ── 靠墙提示（**全局**表）不许把焦点窗口拉成整片地面 ──────────────────────────
+  // 真机 2026-10-01「满地都是格子」的成因：`refreshWallPlaceability` 给**每一面**墙的第一个
+  // 可放候选着色（真机日志原文：`格子派生：命中缓存 key=… 层=3160 墙面=194` +
+  // `建造模式：格子派生结束，网格层=3160 可绘制列=3160`，房间 14.4 × 23.9 米），
+  // 这批格子散落在整个房间里；而焦点锚点当时取的是 `states` 的**全部**键 ⇒ 外包框 = 整个房间
+  // ⇒ 3160 列全画出来。所以这里量的是"锚点里有没有靠墙那一种状态"。
+  var wallHints:[PropSupportGridPresentation.Cell:PropSupportGridPresentation.CellState]=[:]
+  wallHints[anchorCell] = .validFootprint
+  // 一面就在 footprint 旁边的墙脚（必须照画），两面在房间另一头（必须不画）。
+  wallHints[gridCell(0,2,0,0)] = .wallPlaceable
+  wallHints[gridCell(-38,-38,0,0)] = .wallPlaceable
+  wallHints[gridCell(38,38,0,0)] = .wallPlaceable
+  let wallHinted=PropSupportGridPresentation.focusedInstances(
+      cells:lawn,states:wallHints,cameraPosition:origin,spacing:0.25,options:grid)
+  check(wallHinted.count==25,
+        "靠墙提示是全局表（真机 194 面墙、3160 列），它绝不能把焦点窗口拉成整片地面（实测画了 \(wallHinted.count) 格）")
+  check(wallHinted.allSatisfy { abs($0.center.x-0.125) <= ring*0.25+0.0001
+        && abs($0.center.z-0.125) <= ring*0.25+0.0001 },
+        "靠墙提示不能生成焦点窗口之外的实例")
+  let nearWall=wallHinted.filter { $0.state == .wallPlaceable }
+  check(nearWall.count==1,"落在窗口内的靠墙提示必须照画（实测 \(nearWall.count) 个）")
+  check(nearWall.allSatisfy { abs($0.alpha-1) < 0.00001 },
+        "靠墙提示要一眼可辨（全对比），不许被压成外圈那层淡色")
+  // 颜色语义：黄（当前落点·可放）/ 红（当前落点·放不下）/ 蓝（能靠墙）三色不许合并，
+  // 而且**当前落点**那两色在这个窗口里仍然全对比 —— 一眼可辨是这条判据的全部意义。
+  let footprintRed=PropSupportGridPresentation.focusedInstances(
+      cells:lawn,states:[anchorCell:.invalidFootprint,gridCell(0,2,0,0):.wallPlaceable],
+      cameraPosition:origin,spacing:0.25,options:grid)
+  check(footprintRed.contains { $0.state == .invalidFootprint && abs($0.alpha-1) < 0.00001 },
+        "当前落点·放不下必须仍然一眼可辨（红、全对比）")
+  let legendTints=[PropSupportGridPresentation.CellState.placeable.tint,
+             PropSupportGridPresentation.CellState.validFootprint.tint,
+             PropSupportGridPresentation.CellState.invalidFootprint.tint,
+             PropSupportGridPresentation.CellState.wallPlaceable.tint,
+             PropSupportGridPresentation.CellState.hoverTarget.tint]
+  check(Set(legendTints.map { [$0.x,$0.y,$0.z,$0.w] }).count==legendTints.count,
+        "黄（当前落点·可放）/ 红（放不下）/ 蓝（能靠墙）/ 绿（能放）/ 青白（能点起来）五色的语义不许被合并")
+  // 面板图例列的那几种颜色也必须两两不同：图例列了两种同色 = 用户分不清"能放"和"能靠墙放"。
+  let legendEntries=PropSupportGridPresentation.Legend.entries.map { [$0.tint.x,$0.tint.y,$0.tint.z,$0.tint.w] }
+  check(Set(legendEntries).count==legendEntries.count,"图例里的每一种颜色必须两两不同")
+  // 只有靠墙提示、**没有**当前落点时：一个格子都不画（它不构成锚点）。
+  check(PropSupportGridPresentation.focusedInstances(
+        cells:lawn,states:[gridCell(0,2,0,0):.wallPlaceable],cameraPosition:origin,spacing:0.25,options:grid).isEmpty,
+        "没有当前落点时不许拿靠墙提示当锚点把整片地面画回来")
+  check(!wallHinted.isEmpty && wallHinted.count < PropSupportGridPresentation.instances(
+        cells:lawn,states:wallHints,cameraPosition:origin,spacing:0.25,options:grid).count,
+        "靠墙提示必须走焦点裁剪，而不是绕过它铺满地面")
   // ── 场景内点已摆物件：射线 × yaw 包围盒（摆放校验用的同一个盒子）────────────────
   func target(_ id:String,_ x:Float,_ y:Float,_ z:Float,_ hx:Float,_ hy:Float,_ hz:Float,_ yaw:Float=0)
       -> ResidentPropHitTest.Target {
@@ -456,7 +503,7 @@ func check(_ value: Bool, _ message: String) { if !value { print("FAIL:",message
   check(ResidentPropBlockReasonLabel.frame(anchor:anchor,ringRadius:40,textSize:textSize,viewSize:viewSize).minY
         > ResidentPropBlockReasonLabel.frame(anchor:anchor,ringRadius:26,textSize:textSize,viewSize:viewSize).minY,
         "the label gives way to the ring: a bigger radius pushes it further up")
-  print("PASS: prop scale/yaw, unique preview/cancel, shared identity, world isolation, support ray, multi-layer grid picking, grid presentation, the focus patch that replaces the floor-wide carpet, the hover glow patch, the placed-prop hit test, the multi-colour legend that takes its colours from the grid tint itself, and the cursor-side block-reason label (drawn only when carrying with a reason, anchored above the ring)")
+  print("PASS: prop scale/yaw, unique preview/cancel, shared identity, world isolation, support ray, multi-layer grid picking, grid presentation, the focus patch that replaces the floor-wide carpet, the wall-hint table that must NOT become a focus anchor (real machine: 194 patches / 3160 columns — restoring the old anchor draws 1804 cells instead of 25), the hover glow patch, the placed-prop hit test, the multi-colour legend that takes its colours from the grid tint itself, and the cursor-side block-reason label (drawn only when carrying with a reason, anchored above the ring)")
  }
 }
 """#

@@ -141,6 +141,34 @@ public enum WorldPropSizePolicy {
         return clamp(shape: shape, scale: scale, basis: basis)
     }
 
+    /// 同一份网格、同一套归一策略，在**指定那个坐标系**里量出来的尺寸。
+    ///
+    /// 用途只有一个：身份判定（`WorldGeneratedProp.matchesIdentity(of:)` 的尺寸那一腿）。
+    /// 世界状态里的 `size` 是"登记**当时**那套量法"的结果，而量法会变：摆正
+    /// （`WorldPropOrientation`，2026-10-01 18:20 落地）之后，躺着生成的网格会被转正，
+    /// AABB 的三个分量跟着换位 —— 同一份网格，登记时量到 `1.1 × 0.146 × 0.062`，
+    /// 今天再量是 `0.146 × 1.1 × 0.062`。拿这两个数字互相要求逐位相等，等于**两个
+    /// 坐标系互相要求相等**：真机那把 `2B 白色长剑`（17:15 登记、政策 18:20 落地）
+    /// 就是这样被判成 `ownershipMismatch`、资产判成未备好，然后从房间里消失的。
+    ///
+    /// `orientation` 传**存档自己声明的那一份**（`WorldGeneratedProp.orientation`）：
+    /// `nil` 就是"摆正之前"那个坐标系 —— 也就是改造前登记的存档所用的量法。
+    /// 返回 nil = 这份网格量不出合法尺寸（与上面两条入口同一口径，调用方 fail-closed）。
+    public static func recordedBaseline(
+        sourceExtent: WorldVector3,
+        orientation: WorldPropOrientation?,
+        sizeIntent: WorldPropSizeIntent?,
+        requestedHeight: Float
+    ) -> WorldVector3? {
+        let extent = orientation.map {
+            WorldPropOrientationPolicy.orientedExtent(of: sourceExtent, by: $0)
+        } ?? sourceExtent
+        if let sizeIntent {
+            return intended(sourceExtent: extent, axis: sizeIntent.axis, meters: sizeIntent.meters)?.size
+        }
+        return automatic(sourceExtent: extent, requestedHeight: requestedHeight)?.size
+    }
+
     /// 提交时的**尺寸意图** → 世界尺寸。这是"用户说了尺寸"那条路的权威入口：
     ///
     /// - `axis == .longest`（"一把 1.1 米的剑"）：按**最长边**归一到 `meters`。

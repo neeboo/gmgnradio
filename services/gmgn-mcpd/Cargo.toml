@@ -1,0 +1,29 @@
+[package]
+name = "gmgn-mcpd"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "MCP stdio server for the gmgn living world: tool definitions live here (Rust), the bytes live in gmgn-taskd."
+
+[[bin]]
+name = "gmgn-mcpd"
+path = "src/main.rs"
+
+[dependencies]
+# The official Rust MCP SDK. `transport-io` is the server-side stdio transport;
+# `server` + `macros` give the `#[tool]` / `#[tool_router]` surface the design
+# plan pins (docs/plans/2026-10-02-rust-world-authority-and-mcp.md §6.1).
+rmcp = { version = "3.5", default-features = false, features = [
+    "server",
+    "macros",
+    "transport-io",
+] }
+serde = { version = "1", features = ["derive"] }
+# Same float-roundtrip setting as gmgn-taskd: the MCP face must hand back the
+# bytes the authority stored, not a one-ulp-different re-encoding.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "sync", "time", "macros"] }
+
+[profile.release]
+strip = true
+lto = "thin"

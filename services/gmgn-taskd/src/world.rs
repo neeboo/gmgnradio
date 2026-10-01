@@ -87,6 +87,18 @@ pub const BLOB_LIMIT: u64 = 64 * 1024 * 1024;
 
 pub const CONSUMERS: [&str; 5] = ["world", "ui", "agent", "cloud", "mcp"];
 
+/// The `op` vocabulary `apply` accepts. Kept next to the match that implements
+/// it so the published contract (`contract::describe`) and the code that decides
+/// cannot drift apart silently; `the_published_op_vocabulary_matches_the_match`
+/// fails if a name here loses its arm.
+pub const OPS: [&str; 5] = [
+    "replaceState",
+    "upsertObject",
+    "deleteObject",
+    "setWorldFacts",
+    "advanceCursor",
+];
+
 /// Metadata key holding the serialized generated-prop record.
 pub const GENERATED_PROP_KEY: &str = "gmgn.generated-prop.v1";
 /// Metadata key holding the support-surface id.

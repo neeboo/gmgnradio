@@ -159,6 +159,8 @@ enum ProbeError: Error { case expectationFailed }
                     }, pause: { _ in pauses += 1; playing = false }, sleep: {
                         try context.tick(deltaTime: 0.1)
                         await Task.yield()
+                    }, report: { report in
+                        print("JUKEBOX: \(report)")
                     })
                 let scope = ResidentWorldToolSession(scopeID: UUID(), worldID: manifest.worldID,
                     dispatcher: dispatcher, deadline: Date().addingTimeInterval(180), isCurrent: { true },

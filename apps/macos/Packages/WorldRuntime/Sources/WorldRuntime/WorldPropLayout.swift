@@ -239,6 +239,22 @@ public enum WorldPropLayoutCommand: Codable, Equatable, Sendable {
     /// 红/绿格、存档读的都是它（不引入第二份尺寸来源），并且必须是当前尺寸的**等比缩放**
     /// （渲染端只有一份等比缩放，非等比会让碰撞盒与画面对不上 ⇒ 拒绝）。
     case resize(objectID: String, size: WorldVector3)
+    /// **把一件已经登记的物件的派生字段对齐到今天**（历史存档自愈：真机 2026-10-01 的
+    /// 「2B 白色长剑（外形摆件）」在朝向归一落地**之前**登记，存档里的 `size` 是旧规则
+    /// 算的 ⇒ `matchesIdentity` 判成"资产归属不一致" ⇒ 那件资产永远进不了
+    /// `residentOwnedPropAssets`，用户**永久摆不了**它）。
+    ///
+    /// 它不是"另一种 register"，也不是"改尺寸"：
+    /// - **身份与用户字段逐位不许变**（`WorldPropArchiveRebase.isDerivedOnlyRewrite`）；
+    /// - 只有 `size` / `sourceHeight` / `orientation` 这三个**派生**字段可以被替换，
+    ///   而且新值必须由 `WorldPropArchiveRebase` 判为"同一份网格的另一种量法"（可解释）；
+    /// - **放置不动**：`isEnabled` / `transform.position` / `transform.rotation` / 手持状态
+    ///   一个字节都不改（渲染色调 `scale` 跟着 `effectiveSize` 那一份唯一出口重算，
+    ///   与 `.resize` 同一处换算）；
+    /// - 幂等由**既有的** `layoutReceipts` 回答：调用方给一个内容寻址的 `requestID`
+    ///   （`WorldPropArchiveRebase.Record.requestID`），同一份修复重放不写第二遍、
+    ///   也不再涨 `layoutRevision`。
+    case rebase(WorldGeneratedProp)
     case hold(objectID: String, avatarAssetID: String, calibration: WorldPropGripCalibration)
     case adjustGrip(objectID: String, avatarAssetID: String, calibration: WorldPropGripCalibration)
     case returnHeld(objectID: String, avatarAssetID: String)

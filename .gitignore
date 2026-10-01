@@ -30,3 +30,8 @@ dist/
 
 __pycache__/
 *.blend1
+
+# The Rust workspace root's build directory. `services/gmgn-taskd/target/` was
+# already ignored by that package's own .gitignore; the root one is new with the
+# workspace (the Xcode helper still passes its own explicit --target-dir).
+/target/

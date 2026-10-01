@@ -705,6 +705,12 @@ import WorldRuntime
     /// 而是"同一个可放判定"的另一组候选落点。
     ///
     /// 只在物件/尺寸/网格变化时重算（`wallVerdictKey`）：本函数会被每次鼠标移动间接触发。
+    ///
+    /// ⚠️ 写进 `cellStates` 的这批格子是**全局提示**（每面墙一个可放落点，散落在整个房间；
+    /// 真机日志：`墙面=194`）。它们因此**不参与焦点锚点**（`PropSupportGridPresentation.focus`
+    /// 刻意把 `.wallPlaceable` 排除在外）—— 参与的话，焦点窗口的外包框就是整个房间，
+    /// 3160 个可绘制列会全部画出来，正是真机 2026-10-01「满地都是格子」那一次的成因。
+    /// 它们仍然被着色：只是只在光标/选中物件附近那个窗口里画出来。
     func refreshWallPlaceability(objectID: String, footprintSize: SIMD2<Float>, height: Float) {
         guard isBuildModeActive, let grid, !wallPatches.isEmpty,
               footprintSize.x.isFinite, footprintSize.y.isFinite, height.isFinite,

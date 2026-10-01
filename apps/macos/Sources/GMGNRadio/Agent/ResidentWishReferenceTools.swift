@@ -175,10 +175,18 @@ final class ResidentWishReferenceTools {
     private var calls: [String: Registration] = [:]
     private var registeredByURL: [URL: Registration] = [:]
     private var inFlight: [URL: Flight] = [:]
+    /// 已知连不上时的冷却：连着撞墙没有意义（真机 2026-10-01 20:49–20:50 一个回合里
+    /// 撞了 3 次、每次 10 秒），但冷却**必须自愈**：到点自动失效，一旦成功立刻清掉。
+    /// 这不是放宽判据 —— 它只决定"要不要再发一次请求"，判据一条都没动。
+    private var cooldown: (fact: WishReferenceDiagnosis.Fact, until: Date)?
+    static let cooldownInterval: TimeInterval = 30
+    /// 上一次送上屏的那句话。状态**变化**才再上屏一次，避免每个失败都刷一条。
+    private var lastReportedScreen: String?
+    private let now: () -> Date
 
     init(coordinator: WishMachineCoordinator, authorizationID: UUID?, worldID: String, residentScope: String,
          isCurrent: @escaping @MainActor () -> Bool, fetcher: Fetcher = .live,
-         directory: URL? = nil, fileManager: FileManager = .default) {
+         directory: URL? = nil, fileManager: FileManager = .default, now: @escaping () -> Date = Date.init) {
         self.coordinator = coordinator
         self.authorizationID = authorizationID
         self.worldID = worldID
@@ -188,6 +196,7 @@ final class ResidentWishReferenceTools {
         self.directory = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("gmgn radio/ResidentWishReferences", isDirectory: true)
         self.fileManager = fileManager
+        self.now = now
     }
 
     var tools: [ResidentWorldToolSession.AdditionalTool] {
@@ -261,21 +270,30 @@ final class ResidentWishReferenceTools {
               let url = Self.searchURL(query: query) else {
             return failure(callID, "invalid_arguments", "参考图搜索参数不符合当前契约。")
         }
+        // 冷却期内不再撞墙，但回执必须说清"这一次没有发起搜索"，而不是假装搜过。
+        if let cooling = coolingDownSearchFact() {
+            WishReferenceLog.cooldownSkipped(code: cooling.code, reason: cooling.reason)
+            return failure(callID, cooling.code, cooling.message)
+        }
         let response: Fetcher.Response
         do {
             response = try await fetcher.fetchPublicData(url, Self.maximumResponseBytes)
         } catch {
-            return failure(callID, "reference_search_failed", "公开图片搜索暂时不可用：\(error.localizedDescription)")
+            return report(callID, .search, WishReferenceDiagnosis.transportFailure(.search, error: error))
         }
         guard !Task.isCancelled, isCurrent() else {
             return failure(callID, "stale_wish_reference_session", "会话已停止，搜索结果未采用。")
         }
         guard Self.isJSONMIMEType(response.mimeType) else {
-            return failure(callID, "reference_search_failed", "搜索返回的不是 JSON 内容，未采用任何结果。")
+            return report(callID, .search, WishReferenceDiagnosis.searchNotJSON(mimeType: response.mimeType))
         }
         guard let results = Self.parseSearchResults(response.data) else {
-            return failure(callID, "reference_search_failed", "搜索返回的内容无法解析或服务器返回错误，未采用任何结果。")
+            // 服务端自报的结构化错误把它的 code/info 逐字带出来；判据不变（仍是失败）。
+            let fact = Self.searchAPIErrorFact(response.data) ?? WishReferenceDiagnosis.searchUnparseable()
+            return report(callID, .search, fact)
         }
+        // 服务真的答了：清掉冷却，屏上那条"不可用"撤掉。
+        markReachable()
         let payload: [String: Any] = [
             "ok": true, "query": query, "total": results.count,
             "results": results.map { result -> [String: Any] in
@@ -284,10 +302,16 @@ final class ResidentWishReferenceTools {
                  "license_verified": false]
             },
             "license_notice": "图片来自公开网页，版权与许可未核验；仅供本机个人测试，不得声称已核验授权。",
+            // 结果为空 ≠ 失败：这是服务如实返回了空列表，`ok` 仍然是 true，没有失败码。
             "message": results.isEmpty
-                ? "没有找到可用图片；不要编造图片链接，可以换一个英文关键词或直接询问用户。"
+                ? WishReferenceDiagnosis.emptyResultsMessage
                 : "请选择其中一张真实直链，再用 register_wish_reference_image 登记。",
         ]
+        if results.isEmpty {
+            WishReferenceLog.emptyResults(query: query)
+            // 空结果也上屏，但走**普通信息**这一档：它绝不是失败。
+            WishReferenceAvailabilityNotice.postInfo(WishReferenceDiagnosis.emptyResultsScreenText)
+        }
         return success(callID, payload)
     }
 
@@ -343,12 +367,62 @@ final class ResidentWishReferenceTools {
             if inFlight[imageURL]?.token == flight.token { inFlight[imageURL] = nil }
             calls[callID] = registration
             registeredByURL[imageURL] = registration
+            markReachable()
             return registrationPayload(callID, registration)
         } catch {
             // Only clear the flight this call awaited; a replacement started meanwhile stays.
             if inFlight[imageURL]?.token == flight.token { inFlight[imageURL] = nil }
-            return failure(callID, Self.code(for: error), error.localizedDescription)
+            // 领域错误（授权、冲突、额度…）保持它们自己的名字；其余都是传输失败，
+            // 必须走具名诊断 —— `error.localizedDescription` 会把
+            // `transportFailure("curl-exit-28")` 压成 `error 17`，真机上就是这么丢掉原因的。
+            if error is ReferenceError || error is WishMachineError {
+                return failure(callID, Self.code(for: error), error.localizedDescription)
+            }
+            return report(callID, .registration, WishReferenceDiagnosis.transportFailure(.registration, error: error))
         }
+    }
+
+    // MARK: Named failure reporting: receipt + log + screen
+
+    /// 失败的**唯一出口**：回执、日志、屏上读的是同一份具名事实。
+    ///
+    /// 真机缺陷形态正是"只写回执"：`tool/result` 里有一句 `reference_search_failed`，
+    /// app 系统日志里一行都没有，用户听到的只有一句「找图失败」。
+    @discardableResult
+    private func report(_ callID: String, _ operation: WishReferenceDiagnosis.Operation,
+                        _ fact: WishReferenceDiagnosis.Fact) -> RealtimeDJToolResult {
+        WishReferenceLog.failure(fact, operation: operation.rawValue)
+        if fact.isConnectivity { cooldown = (fact, now().addingTimeInterval(Self.cooldownInterval)) }
+        if lastReportedScreen != fact.screen {
+            lastReportedScreen = fact.screen
+            WishReferenceLog.availabilityChanged(fact.screen, isFailure: true)
+            WishReferenceAvailabilityNotice.postFailure(fact.screen)
+        }
+        return failure(callID, fact.code, fact.message)
+    }
+
+    /// 冷却期内不再重复撞墙，但**必须说清这一次没有发起搜索**。
+    private func coolingDownSearchFact() -> WishReferenceDiagnosis.Fact? {
+        guard let cooldown, cooldown.until > now() else { return nil }
+        let remaining = max(1, Int(cooldown.until.timeIntervalSince(now()).rounded(.up)))
+        return WishReferenceDiagnosis.searchCoolingDown(fact: cooldown.fact, secondsRemaining: remaining)
+    }
+
+    /// 服务真的答了：冷却清掉，屏上那条"不可用"撤掉，日志留一行恢复。
+    private func markReachable() {
+        cooldown = nil
+        guard lastReportedScreen != nil else { return }
+        lastReportedScreen = nil
+        WishReferenceLog.availabilityChanged(nil, isFailure: false)
+        WishReferenceAvailabilityNotice.postRecovered()
+    }
+
+    /// 搜索响应里服务端自报的结构化错误。只读它，绝不把错误当空结果。
+    static func searchAPIErrorFact(_ data: Data) -> WishReferenceDiagnosis.Fact? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let error = root["error"] as? [String: Any] else { return nil }
+        return WishReferenceDiagnosis.searchAPIError(code: error["code"] as? String,
+            info: error["info"] as? String)
     }
 
     private func downloadAndRegister(imageURL: URL, displayName: String, authorizationID: UUID) async throws -> Registration {

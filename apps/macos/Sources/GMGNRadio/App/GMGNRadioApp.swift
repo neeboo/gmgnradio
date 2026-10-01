@@ -21,12 +21,19 @@ private enum MusicLibraryCacheError: LocalizedError {
 
 private enum ResidentPropHostError: LocalizedError {
     case editorOpen, assetUnverified, assetUnavailable, ownershipMismatch
+    /// 存档与领取记录不一致，而且**不能安全对齐**（`WorldPropArchiveRebase` 判为 refuse）。
+    /// 与 `ownershipMismatch` 分开：后者是"这不是同一件物件 / 同一份资产"，这条是"同一件
+    /// 物件、同一份网格，但存档里那份尺寸不是它的等比缩放" —— 两条都必须**可见**，
+    /// 而且都要把**具体差异**说出来（不许只说一句"不一致"）。
+    case archiveNotRepairable(String)
     var errorDescription: String? {
         switch self {
         case .editorOpen: "请先结束摆放，再发送给居民；输入内容会保留。"
         case .assetUnverified: "物件尚未完成本地显示检查，所有权已保留，请稍后重试。"
         case .assetUnavailable: "已领取物件的本地文件缺失或校验失败，没有删除或重新生成，请检查许愿任务。"
         case .ownershipMismatch: "物件存档与领取记录不一致，已保留原记录并停止摆放。"
+        case let .archiveNotRepairable(detail):
+            "物件存档与领取记录不一致，而且这份存档不能安全对齐：\(detail)已保留原记录并停止摆放。"
         }
     }
 }
@@ -807,6 +814,9 @@ final class AppDelegate:
     private var livingCabinJukeboxGate = LivingCabinJukeboxGate()
     /// 一次执行实例里已经报过的"点唱机没出声"原因（同一个原因只报一次）。
     private var reportedJukeboxSilenceInstance: String?
+    /// 同上，用于"还没出声但也没失败"的过程报告：这条链每次快照都会再问一次（30Hz），
+    /// 不去重会把屏上和日志刷爆。
+    private var reportedJukeboxProgressInstance: String?
     private var residentActivityOutcome: ResidentActivityOutcome?
     private var residentJukeboxPlaybackOwner: UUID?
     private var worldAgentToolDispatcher: WorldAgentToolDispatcher?
@@ -2878,11 +2888,23 @@ final class AppDelegate:
         }
     }
 
+    /// 「活动到达点唱机 ⇒ 必然有一次播放尝试」的自动那一半。
+    ///
+    /// 保证的形状（真机 2026-10-01 20:25 那条轨迹的对照）：到达（`enter`）就会触发一次；
+    /// 若这次执行实例由居民工具调用持有（`start_activity` 在途 / 工具的 `complete` 正在等
+    /// `loop`），自动这一半**不重复触发，但必须把"谁持有、为什么"报出来**——过去这里是一句
+    /// 静默 `return`，于是"工具侧尝试失败"与"效果压根没触发"在日志里完全同形。
+    /// 工具那一半在 `loop` 上尝试（`ResidentActivityOutcome.complete`），所以进入 `loop`
+    /// 时该实例必已发生过一次尝试。
     private func performLivingCabinJukeboxEffect(_ snapshot: WorldAgentSnapshot) {
-        if residentActivityOutcome?.suppressesAutomaticEffect(snapshot) == true { return }
-        guard let active = snapshot.activeActivity,
-              active.id == "music.listen",
-              active.phase == .enter || active.phase == .loop else { return }
+        if let outcome = residentActivityOutcome,
+           case let .held(reason) = outcome.automaticEffectOwnership(snapshot) {
+            return reportJukeboxProgress(
+                "这次播放尝试由居民工具调用持有：\(reason)",
+                snapshot: snapshot
+            )
+        }
+        guard let active = snapshot.activeActivity, Self.jukeboxEffectApplies(snapshot) else { return }
         // 从这里往下，每一条不成立都意味着"这一次不会出声"。过去它们共用同一个静默
         // return，真机上只能看到"操作被接受，然后什么都没发生"—— 原因既不上屏也不
         // 可分辨。现在每一条都有名字。
@@ -2905,10 +2927,11 @@ final class AppDelegate:
             worldID: snapshot.worldID, activityID: active.id,
             startedAt: startedAt, phase: active.phase.rawValue, requestID: requestID
         ) else {
-            livingWorldLogger.info(
-                "点唱机：这次执行实例已经处理过，跳过重复触发 request=\(requestID, privacy: .public)"
+            // 不是失败：同一个执行实例的这一次尝试已经发出去过（30Hz 的帧不算新实例）。
+            return reportJukeboxProgress(
+                "这次执行实例已经触发过一次播放尝试，重复帧不重复触发 request=\(requestID)",
+                snapshot: snapshot
             )
-            return
         }
         reportedJukeboxSilenceInstance = nil
         Task { @MainActor [weak self, weak context] in
@@ -2921,6 +2944,16 @@ final class AppDelegate:
                 return reportJukeboxSilence(snapshot, "等待播放结果期间世界或活动已经换掉了")
             }
             do {
+                // 与工具路径共用同一条冷队列恢复：世界包声明点唱机效果是
+                // `player.resume`，队列冷时先按当前节目备一首，别把"没有可 resume 的曲目"
+                // 当成点唱机的终局。
+                let route = await resolveJukeboxRouteWithColdQueueRecovery(snapshot: snapshot)
+                guard route != .unavailable else {
+                    return reportJukeboxSilence(
+                        snapshot,
+                        "点唱机上没有已经准备好的曲目，播放没有开始（节目单里也没有可播的曲子）"
+                    )
+                }
                 try await resumeMusic()
                 liveCamWindowController?.showChatStatus("点唱机开始播放音乐。")
             } catch {
@@ -2937,23 +2970,82 @@ final class AppDelegate:
                     snapshot,
                     isBenign
                         ? "点唱机上没有已经准备好的曲目（\(error.localizedDescription)）"
-                        : error.localizedDescription
+                        : jukeboxPlayerFailureName(error)
                 )
             }
         }
     }
 
+    /// 适用性过滤：这条自动效果只对"点唱机活动的到达（enter）/循环（loop）阶段"成立。
+    ///
+    /// 它**不是**"这一次没出声"：30Hz 的普通帧、别的活动、approach/exit 阶段都会从这里
+    /// 出去，全部上报会把屏上和日志淹掉。真正的失败守卫在它下面，每一条都具名。
+    /// harness 的守卫可见性判据按名字豁免这一条。
+    private static func jukeboxEffectApplies(_ snapshot: WorldAgentSnapshot) -> Bool {
+        guard let active = snapshot.activeActivity else { return false }
+        return active.id == "music.listen" && (active.phase == .enter || active.phase == .loop)
+    }
+
     /// 一次执行实例里同一条原因只报一次，但**一定**报：日志 + 屏上状态。
     /// 静默的失败在真机上与"什么都没发生"无法区分，这正是点唱机缺陷的形态。
-    private func reportJukeboxSilence(_ snapshot: WorldAgentSnapshot, _ reason: String) {
-        let phase = snapshot.activeActivity?.phase.rawValue ?? "nil"
-        let instance = "\(snapshot.worldID):\(snapshot.activeActivity?.id ?? "nil"):\(phase):\(reason)"
+    /// 世界上下文都已经不在时 `snapshot` 为 nil：也要报，只是实例键退化成世界未知。
+    private func reportJukeboxSilence(_ snapshot: WorldAgentSnapshot?, _ reason: String) {
+        let phase = snapshot?.activeActivity?.phase.rawValue ?? "nil"
+        let instance = "\(snapshot?.worldID ?? "nil"):\(snapshot?.activeActivity?.id ?? "nil"):\(phase):\(reason)"
         livingWorldLogger.error(
             "点唱机没有出声：\(reason, privacy: .public) instance=\(instance, privacy: .public)"
         )
         guard reportedJukeboxSilenceInstance != instance else { return }
         reportedJukeboxSilenceInstance = instance
         liveCamWindowController?.showChatStatus("点唱机没有出声：\(reason)")
+    }
+
+    /// 「这一次还没有出声，但也没失败」的具名报告（谁持有、已经在做、重复帧、取消）。
+    /// 同样**两个出口都要有**：只有日志的静默在真机上等于没有。
+    ///
+    /// 按"执行实例 + 原因"去重：这条链每次快照都会再问一次（30Hz），不去重会把屏上和
+    /// 日志刷爆——"原因被刷掉"和"原因从不出现"对用户是一样的。
+    private func reportJukeboxProgress(_ reason: String, snapshot: WorldAgentSnapshot?) {
+        let phase = snapshot?.activeActivity?.phase.rawValue ?? "nil"
+        let worldID = snapshot?.worldID ?? "nil"
+        let instance = "\(worldID):\(phase):\(reason)"
+        guard reportedJukeboxProgressInstance != instance else { return }
+        reportedJukeboxProgressInstance = instance
+        livingWorldLogger.notice(
+            "点唱机：\(reason, privacy: .public) instance=\(worldID, privacy: .public):\(phase, privacy: .public)"
+        )
+        liveCamWindowController?.showChatStatus("点唱机：\(reason)")
+    }
+
+    /// 播放器侧的具名失败：**音频引擎没起来** ≠ **播放位置没前进** ≠ 文件不能播。
+    /// 三者过去都会退化成同一句"点唱机未能开始播放"，用户拿不到可行动的原因。
+    private func jukeboxPlayerFailureName(_ error: Error) -> String {
+        guard let playbackError = error as? LocalMusicPlaybackError else {
+            return error.localizedDescription
+        }
+        switch playbackError {
+        case .trackNotLoaded:
+            return "点唱机里没有已加载的音轨"
+        case .graphNotPlaying:
+            return "音频引擎没有起来：音频图接受了播放请求，但自报不在播放"
+        case .playbackSilent:
+            return "播放位置没有前进：\(playbackError.localizedDescription)"
+        }
+    }
+
+    /// 工具路径（`ResidentActivityOutcome`）的报告出口：**日志 + 屏上**。
+    /// 两个出口都必须有，静默的失败在真机上与"什么都没发生"无法区分。
+    private func applyResidentJukeboxReport(_ report: JukeboxReport) {
+        let snapshot = livingWorldContext?.snapshot
+        switch report {
+        case let .progress(reason):
+            reportJukeboxProgress(reason, snapshot: snapshot)
+        case let .playing(reason):
+            livingWorldLogger.notice("点唱机开始播放：\(reason, privacy: .public)")
+            liveCamWindowController?.showChatStatus("点唱机开始播放音乐。")
+        case let .silence(reason):
+            reportJukeboxSilence(snapshot, reason)
+        }
     }
 
     private func refreshInstalledLivingWorldMotions() {
@@ -3779,8 +3871,17 @@ final class AppDelegate:
         guard !residentPropPreparationRunning else { return }
         residentPropPreparationRunning = true
         defer { residentPropPreparationRunning = false }
+        // 自愈要写世界状态，写路径与下面那条"已领取但入库被拒"的补做**同一条**
+        // （`prepareResidentPropMutation` + `service.commit`），所以服务在这里就建出来，
+        // 两个循环共用同一个（`isCurrent` 的判据一个字不改）。
+        let service = residentPropPlacementService(context: context, isCurrent: { [weak self, weak context] in
+            guard let self, let context else { return false }
+            return self.livingWorldContext === context && self.spatialStage.selectedWorldID == context.manifest.worldID
+        })
         /// 这一轮"摆正"要给用户看的话（按物件）。在**既有那几条会 removeValue 的路径之后**
         /// 统一发出去，否则"已按主轴摆正"会被"入库成功"冲掉 —— 用户就只看到结果、看不到原因。
+        /// **历史存档自愈**的说明走同一条通道：两者都是"这件东西的元数据被改过、凭什么"，
+        /// 而且都必须在那些 `removeValue` **之后**才发。
         var orientationNotices: [String: String] = [:]
         let scope = currentResidentWorldContext().sessionScope
         let jobs = wishMachineCoordinator.residentJobs(worldID: context.manifest.worldID, residentScope: scope).filter { $0.stage == .claimed }
@@ -3825,6 +3926,9 @@ final class AppDelegate:
                 // （"一把 1.1 米的剑"）说的是**最长边** 1.1 m，原来按高度归一成了 8.285 m 长、
                 // 比舱室还长、摆放被拒后从房间里消失。没有意图时才走自动推断（细长物件 > 4 按最长边）。
                 let extent = prepared.maximum - prepared.minimum
+                // **摆正之前**那一份测量（原始网格 AABB）。身份基线要在存档自己的坐标系里
+                // 算，而"摆正政策落地之前登记的存档"用的就是这个坐标系（见下面 `baseline`）。
+                let rawExtent = WorldVector3(x: extent.x, y: extent.y, z: extent.z)
                 // ---- 摆正（朝向归一）----------------------------------------------------
                 // 生成服务交回来的网格**不保证立着**（真机那把剑的 AABB 是 1.005 × 0.133 × 0.057，
                 // 躺着）。这一步只在**入库这一处**做一次，三条路按优先级，而且**都不许猜**：
@@ -3835,12 +3939,12 @@ final class AppDelegate:
                 // 于是 1.1 m 的请求得到一把立着的 1.1 m 剑，而不是 8.28 m 长的横棍。
                 let declared = receipt.result?.workflowAuthoritativeSize
                 let orientation = WorldPropOrientationPolicy.resolve(
-                    sourceExtent: WorldVector3(x: extent.x, y: extent.y, z: extent.z),
+                    sourceExtent: rawExtent,
                     declaredUpAxis: declared?.upAxis,
                     declaredForwardAxis: declared?.forwardAxis
                 )
                 let orientedExtent = WorldPropOrientationPolicy.orientedExtent(
-                    of: WorldVector3(x: extent.x, y: extent.y, z: extent.z), by: orientation
+                    of: rawExtent, by: orientation
                 )
                 let sourceExtent = orientedExtent
                 // 摆正这件事**必须说出来**（转了要说、"保留原样"更要说）：用户看到物件换了
@@ -3874,14 +3978,107 @@ final class AppDelegate:
                 // 不一致"，那件物件会从房间里消失（正是这次要修的观感缺陷）。
                 // 带尺寸意图的物件同理（它是"提交时说的"，不是"这次量出来的"）。
                 let storedProp = context.state.objectStates[job.objectID]?.generatedProp
+                // ---- 历史存档自愈：把**派生字段**对齐到今天，并且说出来 ----------------
+                // 真机 2026-10-01 的「2B 白色长剑（外形摆件）」是在**朝向归一**落地之前登记的：
+                // 权威里那条存档的 `size` 是"躺着生成的网格按最长边归一"的产物
+                // （1.100 × 0.146 × 0.062 米、`sourceHeight` = 原始 Y 跨度 0.133 米、没有
+                // `orientation` 键），而今天同一份网格（`assetID` 就是模型字节的 sha256，
+                // 字节一个都没变）从原始 GLB + 领取记录推出来的是**立着**的
+                // （0.146 × 1.100 × 0.062 米）。两边的三个数字只是换了一次位置。
+                //
+                // **为什么必须写回存档，而不是只在判据里换个坐标系比**：渲染目标高度是
+                // `prop.effectiveSize.y`（`residentPropDescriptor`），碰撞盒也读同一份
+                // `size`。留着躺着的 `size` 再按今天的旋转去画 ⇒ 画面里那把剑只有 0.146 米高
+                // （0.146 / 摆正后的 1.005 米 = 0.145 倍），而碰撞盒仍然是 1.1 米长躺着的盒子
+                // —— 画面与碰撞盒分叉，那正是"两份尺寸"这条架构禁令的形状。
+                //
+                // 判据与规则都在 `WorldPropArchiveRebase`（纯函数、可离线逐项断言）：
+                // 身份必须逐位相同、存档那份尺寸必须是同一份网格的等比缩放（可解释），
+                // 而且**只换** `size` / `sourceHeight` / `orientation`；`sizeLocked` /
+                // `sizeIntent` / `collision` / `authoritativeSize` 这些用户自己的字段原样保留。
+                // 修不了的一律**可见地拒绝**（把具体差异说出来），绝不静默硬改。
+                var healedStoredProp = storedProp
                 if context.state.objectStates[job.objectID] != nil {
-                    guard let storedProp, storedProp.matchesIdentity(of: prop) else { throw ResidentPropHostError.ownershipMismatch }
+                    guard let existing = storedProp else { throw ResidentPropHostError.ownershipMismatch }
+                    switch WorldPropArchiveRebase.decide(
+                        stored: existing, derived: prop,
+                        meshExtent: rawExtent, orientedExtent: sourceExtent,
+                        requestedHeight: Float(job.heightMeters),
+                        requestIDPrefix: "rebase." + job.id.uuidString
+                    ) {
+                    case .unchanged:
+                        break
+                    case let .refuse(detail):
+                        // 不静默：把**具体差异**说出来（身份不同 / 不是等比缩放 / 尺寸非法）。
+                        throw ResidentPropHostError.archiveNotRepairable(detail)
+                    case let .rebase(healed, record):
+                        // 一次修复必须**看得见**：说明走"摆正说明"那条既有通道（它在那几条
+                        // `removeValue` 之后统一发），权威里则留下内容寻址的回执
+                        // （`rebase.<jobID>.<指纹>`），于是"谁在什么时候把哪几个数字从多少
+                        // 改成了多少"查得到，而且同一份修复重放不会写第二遍。
+                        orientationNotices[job.objectID] = record.summary
+                        let previousAsset = residentOwnedPropAssets[job.objectID]
+                        var healedDescriptor = descriptor
+                        healedDescriptor.orientation = healed.orientationRotation
+                        // 内存里的这一份先换上，是为了让下面那次提交里的 `prepare(healed)`
+                        // 认得出**修好之后**的那一份（它按身份比对，不是按旧字节）；
+                        // 写失败就原样退回 —— 内存必须与落盘的那一份一致。
+                        residentOwnedPropAssets[job.objectID] =
+                            ResidentOwnedPropAsset(prop: healed, descriptor: healedDescriptor)
+                        do {
+                            try await prepareResidentPropMutation(.rebase(healed), context: context)
+                            try service.commit(.rebase(healed),
+                                               expectedLayoutRevision: context.state.layoutRevision,
+                                               requestID: record.requestID)
+                            healedStoredProp = healed
+                        } catch {
+                            if let previousAsset {
+                                residentOwnedPropAssets[job.objectID] = previousAsset
+                            } else {
+                                residentOwnedPropAssets.removeValue(forKey: job.objectID)
+                            }
+                            throw error
+                        }
+                    }
+                }
+                // ---- 身份基线必须落在**存档自己的坐标系**里 ----------------------------
+                // `size` 是一次**量法**的结果，而量法会变：摆正（`WorldPropOrientation`）
+                // 2026-10-01 18:20 才落地，而 `2B 白色长剑` 是 17:15 登记的 —— 那条存档里
+                // 没有 `orientation` 键，它的 `size` 是拿**原始** AABB 量的。今天同一份网格
+                // 摆正之后再量，同一件东西得到的是另一组数字（三个分量换了一次位置），
+                // 于是 `matchesIdentity` 的尺寸那一腿逐位不等 ⇒ `ownershipMismatch`
+                // ⇒ 资产被判成"未备好"（面板上那句"物件存档与领取记录不一致"）
+                // ⇒ 那把剑**从房间里消失**（用户报的"白色大剑不见了"）。
+                //
+                // `matchesIdentity` 的注释已经写明"怎么量不算身份"（`sourceHeight` 与
+                // `orientation` 刻意不参与），这里只是把同一句话在 `size` 上落实：基线回到
+                // 存档那个坐标系里重算一次。**判据一个字都没放宽** —— 同一个坐标系里仍然
+                // 逐位要求相等，`sizeLocked` / `sizeIntent` 那两条既有豁免原样保留。
+                // 上面那一步自愈成功之后，这里读的就是**修好之后**的那一份
+                // （`healedStoredProp`）；没被修（一致 / 有用户自己的尺寸 / 身份不同却仍能对上
+                // 坐标系）时它与 `storedProp` 是同一个值。
+                let baseline = healedStoredProp.map { stored in
+                    WorldGeneratedProp(
+                        objectID: prop.objectID, sourceWishID: prop.sourceWishID,
+                        assetID: prop.assetID, displayName: prop.displayName,
+                        size: WorldPropSizePolicy.recordedBaseline(
+                            sourceExtent: rawExtent, orientation: stored.orientation,
+                            sizeIntent: sizeIntent,
+                            requestedHeight: Float(job.heightMeters)) ?? autoSize.size,
+                        sourceHeight: rawExtent.y, sizeIntent: sizeIntent,
+                        orientation: stored.orientation
+                    )
+                } ?? prop
+                if context.state.objectStates[job.objectID] != nil {
+                    guard let stored = healedStoredProp, stored.matchesIdentity(of: baseline) else { throw ResidentPropHostError.ownershipMismatch }
                 }
                 // 旧存档（改造前登记的）没有 `orientation`，而它的 `sourceHeight` 是按**原始**
                 // 网格量的。网格字节没变（`assetID` 就是 sha256），所以这里把"同一份网格的新
                 // 量法"补上：尺寸/尺寸意图/代理/锁**全部以存档那一份为准**，只补朝向与高度基准。
                 // 不写回存档 ⇒ 不静默改用户已经保存的东西；渲染与碰撞本会话立刻正确。
-                let delivered = storedProp.map { stored in
+                // （自愈那一支例外：它**已经**把派生字段写回权威了，这里读到的就是那一份，
+                //   于是"画面高度"与"碰撞盒尺寸"仍然只有一份来源。）
+                let delivered = healedStoredProp.map { stored in
                     WorldGeneratedProp(
                         objectID: stored.objectID, sourceWishID: stored.sourceWishID,
                         assetID: stored.assetID, displayName: stored.displayName,
@@ -3941,10 +4138,6 @@ final class AppDelegate:
             }
         }
         guard self.livingWorldContext === context, self.spatialStage.selectedWorldID == context.manifest.worldID else { return }
-        let service = residentPropPlacementService(context: context, isCurrent: { [weak self, weak context] in
-            guard let self, let context else { return false }
-            return self.livingWorldContext === context && self.spatialStage.selectedWorldID == context.manifest.worldID
-        })
         // 台账只认**库存记录**：已经进了库存的条目不该继续挂在"等待入库"上
         // （换世界、存档回滚、或在别的路径上补做成功都会走到这里）。
         residentPropInventoryBacklog.prune { context.state.objectStates[$0]?.generatedProp != nil }
@@ -4029,7 +4222,10 @@ final class AppDelegate:
         case .returnHeld(let id, _):
             if context.state.heldProp?.returnState.isEnabled == true { ids.insert(id) }
         case .undo: if let previous = context.state.layoutUndo?.previous, previous.isEnabled, let prop = previous.generatedProp { ids.insert(prop.objectID) }
-        case .register, .withdraw, .enableCapability, .resize: break
+        // `.rebase`（历史存档自愈）不改变"空间里有什么"：位置/朝向/是否摆出/手持状态逐位不变，
+        // 所以这里与 `.register` 同列 —— 它不需要额外把哪一件模型再备一次（自愈发生在
+        // 那件资产**刚刚准备好**的那一轮里，`spatialStage.isResidentPropPrepared` 已经为真）。
+        case .register, .withdraw, .enableCapability, .resize, .rebase: break
         }
         for id in ids.sorted() {
             guard let asset = residentOwnedPropAssets[id] else { throw ResidentPropHostError.assetUnverified }
@@ -5290,6 +5486,9 @@ final class AppDelegate:
                 guard let self else { throw CancellationError() }
                 try await self.pauseResidentJukebox(owner: owner)
             },
+            report: { [weak self] report in
+                self?.applyResidentJukeboxReport(report)
+            },
             deadline: deadline
         )
         residentActivityOutcome = outcome
@@ -5420,36 +5619,137 @@ final class AppDelegate:
         )
     }
 
+    /// 工具路径（居民 `start_activity(music.listen)` → 抵达点唱机 → 播放）的**全部**守卫。
+    ///
+    /// 每一条不成立都具名上报（日志 + 屏上），一条都不许静默：真机 2026-10-01 20:25 的
+    /// 缺陷形态就是这里的第 6 条守卫（`route == .unavailable`）抛出 `music_not_prepared`，
+    /// 而调用方只在工具回执里写了一行 JSON —— 用户与小窗什么都看不到，
+    /// `resumeMusic()` 一次都没被调用，日志里连"尝试过"都读不出来。
     private func resumeResidentJukebox(owner: UUID) async throws {
         try Task.checkCancellation()
-        guard let context = livingWorldContext,
-              spatialStage.selectedWorldID == context.manifest.worldID,
-              let active = context.state.activeActivity,
-              active.activityID == "music.listen",
-              let requestID = context.currentActivityRequestID,
-              livingCabinJukeboxGate.consume(worldID: context.manifest.worldID, activityID: active.activityID,
-                startedAt: active.startedAt, phase: context.snapshot.activeActivity?.phase.rawValue ?? "", requestID: requestID) else {
+        guard let context = livingWorldContext else {
+            reportJukeboxSilence(nil, "生活空间上下文已经不存在")
+            throw ResidentActivityOutcomeError.interrupted
+        }
+        let snapshot = context.snapshot
+        guard spatialStage.selectedWorldID == context.manifest.worldID else {
+            reportJukeboxSilence(snapshot, "当前显示的不是这个世界（点唱机在别的世界）")
+            throw ResidentActivityOutcomeError.interrupted
+        }
+        guard let active = context.state.activeActivity, active.activityID == "music.listen" else {
+            reportJukeboxSilence(snapshot, "这次执行请求对应的点唱机活动已经不存在")
+            throw ResidentActivityOutcomeError.interrupted
+        }
+        guard let requestID = context.currentActivityRequestID else {
+            reportJukeboxSilence(snapshot, "这次活动没有执行请求编号")
+            throw ResidentActivityOutcomeError.interrupted
+        }
+        guard livingCabinJukeboxGate.consume(worldID: context.manifest.worldID, activityID: active.activityID,
+            startedAt: active.startedAt, phase: snapshot.activeActivity?.phase.rawValue ?? "", requestID: requestID) else {
+            reportJukeboxSilence(snapshot, "这一次执行实例已经触发过播放，不重复触发（请求 \(requestID)）")
             throw ResidentActivityOutcomeError.effectAlreadyHandled
         }
-        let route = ProgramPlaybackStartRoute.resolve(playerState: localMusicPlayer.state,
-            hasPreparedProgram: activeProgram != nil && programPlaybackQueue.current != nil)
-        if route == .unavailable { throw ResidentActivityOutcomeError.musicNotPrepared }
+        let route = await resolveJukeboxRouteWithColdQueueRecovery(snapshot: snapshot)
+        guard route != .unavailable else {
+            reportJukeboxSilence(
+                snapshot,
+                "没有已准备的曲目，而且节目单里也没有可播的曲子（点唱机无从 resume）"
+            )
+            throw ResidentActivityOutcomeError.musicNotPrepared
+        }
         if route == .startPreparedProgram, let prepared = programPlaybackQueue.current,
            case .providerReference = prepared.target {
+            reportJukeboxSilence(snapshot, "点唱机不支持这种播放源：曲目只有在线音源引用")
             throw ResidentActivityOutcomeError.unsupportedPlaybackSource
         }
-        try await ResidentActivityOutcome.$playbackOwner.withValue(owner) {
-            try await resumeMusic()
+        do {
+            try await ResidentActivityOutcome.$playbackOwner.withValue(owner) {
+                try await resumeMusic()
+            }
+        } catch {
+            // 「点了播放但没出声」在这一层就具名：音频引擎没起来 / 播放位置没前进 /
+            // 文件不能播，三者过去都会退化成同一句通用文案。
+            reportJukeboxSilence(snapshot, jukeboxPlayerFailureName(error))
+            throw error
         }
         try Task.checkCancellation()
-        guard localMusicPlayer.state == .playing,
-              route == .alreadyPlaying || residentJukeboxPlaybackOwner == owner else {
+        guard localMusicPlayer.state == .playing else {
+            reportJukeboxSilence(
+                snapshot,
+                "播放器没有进入播放状态（state=\(String(describing: localMusicPlayer.state))）"
+            )
+            throw ResidentActivityOutcomeError.interrupted
+        }
+        guard route == .alreadyPlaying || residentJukeboxPlaybackOwner == owner else {
+            reportJukeboxSilence(snapshot, "这次播放的所有权已经被别的调用拿走了")
             throw ResidentActivityOutcomeError.interrupted
         }
     }
 
+    /// 冷队列恢复的注入点。真机默认实现见 `prepareJukeboxProgramForResume()`：
+    /// 让这条守卫链不直接依赖 `programStore`，hostless harness 才能用替身断言
+    /// "冷队列 ⇒ 先备好再播"。
+    private lazy var jukeboxProgramPreparer: @MainActor () async -> Bool = { [weak self] in
+        guard let self else { return false }
+        return await self.prepareJukeboxProgramForResume()
+    }
+
+    /// 点唱机在世界包里声明的效果是 `player.resume`
+    /// （`apps/macos/Resources/Worlds/marble-living-cabin/jukebox.json` 的 `effect`）。
+    /// 队列为冷时（真机形态：重启只恢复了节目**界面**，`programPlaybackQueue.current`
+    /// 始终为 nil，"resume"无可 resume）先按当前节目把当前槽备好（`select` 内含预检），
+    /// 再把新的 route 交回调用方。
+    ///
+    /// 这里只报**过程**：具名的"没出声"由调用方按自己的语义说（工具路径抛工具错误码并
+    /// 上屏，自动路径自己上屏；两处都不许静默）。
+    private func resolveJukeboxRouteWithColdQueueRecovery(
+        snapshot: WorldAgentSnapshot?
+    ) async -> ProgramPlaybackStartRoute {
+        var route = ProgramPlaybackStartRoute.resolve(playerState: localMusicPlayer.state,
+            hasPreparedProgram: activeProgram != nil && programPlaybackQueue.current != nil)
+        guard route == .unavailable else { return route }
+        reportJukeboxProgress("播放队列是冷的，先按当前节目备一首再播放", snapshot: snapshot)
+        // 备不出来就原样把 `.unavailable` 还回去，由调用方具名上报（不在这里吞掉）。
+        guard await jukeboxProgramPreparer() else { return route }
+        route = ProgramPlaybackStartRoute.resolve(playerState: localMusicPlayer.state,
+            hasPreparedProgram: activeProgram != nil && programPlaybackQueue.current != nil)
+        reportJukeboxProgress(
+            "冷队列恢复完成：current=\(programPlaybackQueue.current?.slot.track.id ?? "nil")，route=\(String(describing: route))",
+            snapshot: snapshot
+        )
+        return route
+    }
+
+    /// 存档里有节目、但播放队列里没有已备曲目时的恢复：按 `activeSlotIndex` 选好当前槽
+    /// （`ProgramPlaybackQueue.select` 内含预检与锁定），成功返回 true。
+    /// 备不出来一律返回 false，由调用方具名上报，不在这里静默吞掉。
+    private func prepareJukeboxProgramForResume() async -> Bool {
+        guard let plan = activeProgram ?? programStore.plan, !plan.slots.isEmpty else {
+            return false
+        }
+        let index = min(max(programStore.activeSlotIndex ?? 0, 0), plan.slots.count - 1)
+        do {
+            try await programPlaybackQueue.select(plan, at: index)
+        } catch {
+            playbackLogger.error(
+                "点唱机冷队列恢复失败：index=\(index)，error=\(error.localizedDescription, privacy: .public)"
+            )
+            return false
+        }
+        guard programPlaybackQueue.current != nil else { return false }
+        activeProgram = plan
+        return true
+    }
+
     private func pauseResidentJukebox(owner: UUID?) async throws {
-        guard owner == nil || residentJukeboxPlaybackOwner == owner else { return }
+        guard owner == nil || residentJukeboxPlaybackOwner == owner else {
+            // 别人的播放不能被这一次暂停：这是**有意**的空操作（幂等），不是"没出声"。
+            // 仍然具名进日志，免得它和静默失败同形。
+            livingWorldLogger.notice(
+                "点唱机暂停不属于这次调用：播放所有权在别处，忽略（不是故障）"
+            )
+            return
+        }
         let route = ProgramPlaybackStartRoute.resolve(playerState: localMusicPlayer.state,
             hasPreparedProgram: activeProgram != nil && programPlaybackQueue.current != nil)
         if route == .startPreparedProgram, let prepared = programPlaybackQueue.current,

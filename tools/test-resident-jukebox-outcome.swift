@@ -62,6 +62,105 @@ let pauseMethod = declaration("private func pauseResidentJukebox(", in: appSourc
 let toggleMethod = declaration("func toggleLocalPlayback() {", in: appSource)
 let automaticEffectMethod = declaration("private func performLivingCabinJukeboxEffect(", in: appSource)
 let silenceReportMethod = declaration("private func reportJukeboxSilence(", in: appSource)
+// 冷队列恢复（世界包声明点唱机效果是 `player.resume`，但重启后队列是冷的）与它的进度
+// 报告出口。两者都必须真的进 harness：否则"冷队列 ⇒ 先备好再播"与"守卫具名可见"
+// 就只是在测测试自己写的替身。
+let progressReportMethod = declaration("private func reportJukeboxProgress(", in: appSource)
+let coldQueueMethod = declaration("private func resolveJukeboxRouteWithColdQueueRecovery(", in: appSource)
+let playerFailureNameMethod = declaration("private func jukeboxPlayerFailureName(", in: appSource)
+let appliesMethod = declaration("private static func jukeboxEffectApplies(", in: appSource)
+// 守卫可见性的**源码判据**：这条链里每一个 `guard ... else` 的 else 体里都必须有具名
+// 上报出口；`performLivingCabinJukeboxEffect` 不许再出现"布尔抑制 ⇒ 静默 return"。
+let reportingSymbols = ["reportJukeboxSilence", "reportJukeboxProgress"]
+func unreportedGuards(in text: String) -> [String] {
+    var offenders: [String] = []
+    var scan = text.startIndex
+    while let guardRange = text.range(of: "guard ", range: scan..<text.endIndex) {
+        // else 体：参数表闭合后的第一个 `{` 起算（默认参数里也可能有花括号）。
+        var parenDepth = 0
+        var cursor = guardRange.upperBound
+        var opening: String.Index?
+        while cursor < text.endIndex, opening == nil {
+            switch text[cursor] {
+            case "(", "[": parenDepth += 1
+            case ")", "]": parenDepth -= 1
+            case "{": if parenDepth == 0 { opening = cursor }
+            default: break
+            }
+            cursor = text.index(after: cursor)
+        }
+        guard let opening else { break }
+        var depth = 0
+        var end: String.Index?
+        for index in text[opening...].indices {
+            if text[index] == "{" { depth += 1 }
+            if text[index] == "}" { depth -= 1 }
+            if depth == 0 { end = index; break }
+        }
+        guard let end else { break }
+        let body = String(text[opening...end])
+        guard !body.isEmpty else { break }
+        let condition = String(text[guardRange.upperBound..<opening])
+        // 唯一豁免：适用性过滤（`jukeboxEffectApplies`）—— 它筛的是"这条效果适不适用"，
+        // 不是"这一次没出声"（30Hz 的每一帧都报会把屏上和日志淹掉）。
+        let applicabilityFilter = condition.contains("jukeboxEffectApplies")
+        // `guard let self, ... else { return }`：宿主都没了，没有可上报的日志器与屏。
+        let unreportableHost = condition.contains("let self") && body.replacingOccurrences(of: " ", with: "") == "{return}"
+        if !applicabilityFilter, !unreportableHost, !reportingSymbols.contains(where: { body.contains($0) }) {
+            let line = text[..<guardRange.lowerBound].filter { $0 == "\n" }.count + 1
+            offenders.append("line \(line): \(body.split(separator: "\n").first.map(String.init) ?? body)")
+        }
+        scan = text.index(after: end)
+    }
+    return offenders
+}
+for (name, method) in [("resumeResidentJukebox", resumeMethod), ("performLivingCabinJukeboxEffect", automaticEffectMethod)] {
+    let offenders = unreportedGuards(in: method)
+    guard offenders.isEmpty else {
+        print("FAIL: \(name) has guards that return without a named report: \(offenders)")
+        exit(1)
+    }
+}
+// 自动效果**不许**再对"工具持有这次尝试"静默返回：注入静默 return 必须在这里红。
+guard !appSource.contains("suppressesAutomaticEffect(snapshot) == true { return }"),
+      appSource.contains("automaticEffectOwnership("),
+      automaticEffectMethod.contains("reportJukeboxProgress(") else {
+    print("FAIL: the automatic jukebox effect must report, by name, that a tool call owns this attempt")
+    exit(1)
+}
+// 「失败时屏上与日志都有具名原因」：两个出口的**唯一**实现就是这两个漏斗，它们必须
+// 一个落 os_log、一个上屏。去掉任何一半（注入「删掉日志」/「删掉上屏」）都必须红。
+guard silenceReportMethod.contains("livingWorldLogger.error"),
+      silenceReportMethod.contains("showChatStatus"),
+      progressReportMethod.contains("livingWorldLogger.notice"),
+      progressReportMethod.contains("showChatStatus") else {
+    print("FAIL: every named jukebox reason must land in both the log and the on-screen status")
+    exit(1)
+}
+// 「真正出声」的判据必须在**真机那条链**里：`resumeMusic` 的两条起播路线都要走
+// `confirmAudiblePlayback`（isPlaying + 位置前进 ≥0.05s），否则"只标完成不播"又回来了。
+let resumeMusicMethod = declaration("func resumeMusic() async throws {", in: appSource)
+let confirmMethod = declaration("private func confirmAudiblePlayback(", in: appSource)
+guard resumeMusicMethod.contains("confirmAudiblePlayback(reason: \"resumeLocal\")"),
+      resumeMusicMethod.contains("confirmAudiblePlayback(reason: \"startPreparedProgram\")"),
+      confirmMethod.contains("confirmPlaybackProgress()") else {
+    print("FAIL: jukebox playback success must be proven by the audible evidence (isPlaying + advancing position)")
+    exit(1)
+}
+// 「到达 loop ⇒ 必然有一次播放尝试」的源码那一半：工具的 `complete` 只能在**等到 loop
+// 之后**、对**这一次 owned 实例**发出 play。删掉/绕过这次调用（注入"不触发"）必须红——
+// 光有行为断言不够：真机 20:25 的形态正是"回执说成功/失败，却没有任何人尝试过"。
+let outcomeSource = try String(contentsOf: outcome, encoding: .utf8)
+let completeMethod = declaration(
+    "func complete(name: String, argumentsJSON: Data, result: RealtimeDJToolResult) async -> RealtimeDJToolResult {",
+    in: outcomeSource
+)
+guard completeMethod.contains("if phase == .loop { break }"),
+      completeMethod.contains("owned?.playbackAttempted = true"),
+      completeMethod.contains("try await play(instance.playbackID)") else {
+    print("FAIL: reaching the jukebox loop must attempt playback through the owned instance (no silent skip)")
+    exit(1)
+}
 let playerSource = try String(contentsOf: sources.appendingPathComponent("AudioEngine/LocalMusicPlayer.swift"), encoding: .utf8)
 let queueSource = try String(contentsOf: sources.appendingPathComponent("AudioEngine/ProgramPlaybackQueue.swift"), encoding: .utf8)
 // 播放器**整份**原样进 harness（协议、错误、玩家）。要断言的是"接受了一次 play
@@ -125,10 +224,17 @@ enum PlayerError: Error { case missingTrack, pauseFailed }
     var programPlaybackQueue = Queue(current: Prepared(target: .localFile))
     var livingCabinJukeboxGate = LivingCabinJukeboxGate()
     var reportedJukeboxSilenceInstance: String?
+    var reportedJukeboxProgressInstance: String?
     var residentJukeboxPlaybackOwner: UUID?
     var musicSelectionGeneration: UInt64 = 0
     var resumes = 0
     var pauses = 0
+    /// 冷队列恢复的替身：真机默认实现按存档节目 `select` 当前槽；这里由测试注入，
+    /// 断言"冷队列 ⇒ 先备好再播"而不是"没有已准备曲目就结束"。
+    lazy var jukeboxProgramPreparer: @MainActor () async -> Bool = { false }
+    /// 每一次**试图播放**都记一笔（不管最后出没出声）。"到达 loop ⇒ 必然有一次尝试"
+    /// 的判据就是它，而不是 `resumes`（后者只数成功）。
+    var attempts = 0
     init(_ context: WorldAgentContext) {
         livingWorldContext = context
         spatialStage = Stage(selectedWorldID: context.manifest.worldID, marbleLivingCabin: Cabin(worldID: context.manifest.worldID))
@@ -150,9 +256,14 @@ enum PlayerError: Error { case missingTrack, pauseFailed }
     \#(toggleMethod)
     \#(automaticEffectMethod)
     \#(silenceReportMethod)
-    func play(_ owner: UUID) async throws { try await resumeResidentJukebox(owner: owner) }
+    \#(progressReportMethod)
+    \#(coldQueueMethod)
+    \#(playerFailureNameMethod)
+    \#(appliesMethod)
+    func play(_ owner: UUID) async throws { attempts += 1; try await resumeResidentJukebox(owner: owner) }
     func pause(_ owner: UUID?) async throws { try await pauseResidentJukebox(owner: owner) }
     func scheduleAutomaticEffect(_ snapshot: WorldAgentSnapshot) { performLivingCabinJukeboxEffect(snapshot) }
+    var screenMessages: [String] { liveCamWindowController?.messages ?? [] }
 }
 @MainActor var checks = 0
 @MainActor var failures = 0
@@ -180,6 +291,10 @@ func code(_ result: RealtimeDJToolResult) -> String? { (try? JSONSerialization.j
     var playbackOwner: UUID?
     var gate = LivingCabinJukeboxGate()
     var suppressed = 0
+    /// `outcome` 每一条具名上报都记下来：真机要求"守卫可见"，这里就是判据。
+    /// 只数 `play` 闭包被真正叫到的次数（"必然有一次播放尝试"）。
+    var attempts = 0
+    var reports: [JukeboxReport] = []
     var outcome: ResidentActivityOutcome!
     var session: ResidentWorldToolSession!
     init(deadline: Date = Date().addingTimeInterval(180)) throws {
@@ -214,6 +329,7 @@ func code(_ result: RealtimeDJToolResult) -> String? { (try? JSONSerialization.j
             currentBlocker: { [unowned self] in self.currentBlockerReason },
             play: { [unowned self] owner in
                 let active = self.context.state.activeActivity!
+                self.attempts += 1
                 check(self.gate.consume(worldID: manifest.worldID, activityID: active.activityID,
                     startedAt: active.startedAt, phase: self.context.snapshot.activeActivity!.phase.rawValue,
                     requestID: self.context.currentActivityRequestID), "tracked playback consumes existing gate once")
@@ -233,6 +349,8 @@ func code(_ result: RealtimeDJToolResult) -> String? { (try? JSONSerialization.j
                 try Task.checkCancellation()
                 if !self.navigationHeld { try self.context.tick(deltaTime: 0.1) }
                 await Task.yield()
+            }, report: { [unowned self] report in
+                self.reports.append(report)
             }, deadline: deadline)
         context.onSnapshotChanged = { [unowned self] snapshot in
             if snapshot.activeActivity?.id == "music.listen", self.outcome.suppressesAutomaticEffect(snapshot) { self.suppressed += 1 }
@@ -339,6 +457,20 @@ func code(_ result: RealtimeDJToolResult) -> String? { (try? JSONSerialization.j
                   "missing preparation describes actual state and available tool recovery")
             check(!f.playing && f.starts == 0 && f.context.state.activeActivity == nil,
                   "missing preparation ends owned activity without claiming playback")
+            // 真机 2026-10-01 20:25 那条轨迹的形状：居民工具 start_activity(music.listen)
+            // → 20:25:42 走到 loop → 队列里没有已备曲目 → 工具回执 music_not_prepared。
+            // 真机上"播放的链一次都没被走到"、日志里也一条都没有。这里把它钉死：
+            // ① 到达 loop **必然**有一次播放尝试（attempts >= 1，不是"接受就完事"）；
+            // ② 每一步都具名可见（谁持有 / 已抵达 loop 开始尝试）。
+            check(f.attempts >= 1, "arriving at the jukebox loop must always produce one playback attempt, got \(f.attempts)")
+            check(f.reports.contains { report in
+                if case let .progress(reason) = report { return reason.contains("开始这一次播放尝试") }
+                return false
+            }, "the attempt itself must be named, got \(f.reports)")
+            check(f.reports.contains { report in
+                if case let .progress(reason) = report { return reason.contains("接管这次点唱机播放") }
+                return false
+            }, "who owns the attempt must be named, got \(f.reports)")
         }
         do {
             let f = try Fixture(); f.unsupported = true
@@ -468,10 +600,55 @@ func code(_ result: RealtimeDJToolResult) -> String? { (try? JSONSerialization.j
             do { try await absent.play(UUID()); check(false, "missing program must fail") }
             catch { check(error as? ResidentActivityOutcomeError == .musicNotPrepared && absent.resumes == 0,
                           "actual App reports missing preparation before calling player") }
+            // 「到达 loop ⇒ 必然有一次播放尝试」：连"备不出来"的那一次也必须是**尝试过**的，
+            // 而且屏上要有具名原因（真机 2026-10-01 20:25 的形态是"连尝试都没有、也没有原因"）。
+            check(absent.attempts == 1, "arriving at the jukebox must always produce one playback attempt, got \(absent.attempts)")
+            check(absent.screenMessages.contains { $0.contains("没有已准备的曲目") },
+                  "a jukebox with nothing prepared must name that on screen, got \(absent.screenMessages)")
+            // 冷队列恢复：世界包把点唱机效果声明为 `player.resume`，重启后队列是冷的
+            // （只恢复了节目界面）。这时必须先按存档节目备好当前槽再播，而不是报
+            // "没有已准备的曲目"结束——真机上人类问的正是"点唱机怎么没声音"。
+            let cold = AppPlaybackHarness(f.context)
+            cold.programPlaybackQueue.current = nil
+            cold.jukeboxProgramPreparer = { [weak cold] in
+                cold?.programPlaybackQueue.current = .init(target: .localFile)
+                return true
+            }
+            let coldOwner = UUID()
+            try await cold.play(coldOwner)
+            check(cold.attempts == 1 && cold.resumes == 1 && cold.localMusicPlayer.state == .playing,
+                  "a cold queue with a saved program must be prepared then really played, attempts=\(cold.attempts) resumes=\(cold.resumes)")
+            check(cold.residentJukeboxPlaybackOwner == coldOwner,
+                  "cold-queue recovery must keep playback ownership on the requesting call")
+            check(cold.screenMessages.contains { $0.contains("播放队列是冷的") },
+                  "cold-queue recovery must be visible on screen, got \(cold.screenMessages)")
             let provider = AppPlaybackHarness(f.context)
             provider.programPlaybackQueue.current = .init(target: .providerReference)
             do { try await provider.pause(nil); check(false, "unsupported provider cannot be reported paused") }
             catch { check(provider.pauses == 0, "provider pause is rejected before local-only pause function") }
+        }
+        // ── 「谁持有这次尝试」也必须具名可见；自动效果不许再静默 return ──────────
+        do {
+            let f = try Fixture()
+            try f.context.startActivity(id: "music.listen")
+            try f.context.tick(deltaTime: 0.1)
+            let app = AppPlaybackHarness(f.context)
+            // 工具调用在途（`prepare` 已登记、还没回执）：正是真机 20:25:39–20:25:43 的形状。
+            let holder = ResidentActivityOutcome(context: f.context, isCurrent: { true },
+                play: { _ in }, pause: { _ in }, report: { _ in })
+            holder.prepare(callID: "call-1", name: "start_activity",
+                argumentsJSON: Data(#"{"activity_id":"music.listen"}"#.utf8))
+            app.residentActivityOutcome = holder
+            app.scheduleAutomaticEffect(f.context.snapshot)
+            // 同一条事实在 30Hz 的下一帧会再问一次：必须去重，否则屏上和日志被刷爆
+            // （"原因被刷掉"和"原因从不出现"对用户是一样的）。
+            app.scheduleAutomaticEffect(f.context.snapshot)
+            check(app.resumes == 0 && app.attempts == 0,
+                  "the automatic effect must not double-trigger while a tool call owns the attempt")
+            check(app.screenMessages.contains { $0.contains("由居民工具调用持有") },
+                  "a delegated attempt must be named on screen instead of silently returning, got \(app.screenMessages)")
+            check(app.screenMessages.filter { $0.contains("由居民工具调用持有") }.count == 1,
+                  "the 30Hz repeat of one delegated attempt must be reported once, got \(app.screenMessages)")
         }
         // ── 「请求被接受 ⇒ 播放器真的开始播放」的判据在**真实播放器**上 ─────────
         do {

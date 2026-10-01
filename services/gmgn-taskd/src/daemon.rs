@@ -1,5 +1,5 @@
 use crate::{
-    files, memory, messages,
+    contract, files, memory, messages,
     model::{self, Result, Stored, Submit, FRAME_LIMIT},
     provider, resident, world,
     store::Database,
@@ -277,6 +277,11 @@ impl Service {
                     })
                     .await
             }
+            // 只读能力契约：由权威按自己的常量生成，MCP 面原样转述。
+            // 无参数、不读也不写任何状态，因此不需要授权，也不推进任何游标。
+            // 见 `contract.rs`：转述者不得自带一份数字，否则 agent 读到的是
+            // 一份校验器并不执行的契约。
+            "capability_contract" => Ok(contract::describe()),
             "world_snapshot" => {
                 let request: world::SnapshotRequest =
                     serde_json::from_value(params).map_err(|_| "invalid_world_snapshot")?;

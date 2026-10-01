@@ -91,6 +91,28 @@ extension ResidentPropLayoutIntent {
         case let .register(prop):
             // `applyPropLayout(.register)` 写下的候选条目是 `isEnabled == false`：只多一条
             // 库存记录，空间里没有它 —— 承托面/互斥/通路这些判据连输入都没有。
+            //
+            // `.rebase`（历史存档自愈）走**同一层**：它改的不是"空间里有什么、它在哪"
+            // （那条命令逐位钉住 `isEnabled`/位置/朝向/手持状态），而是"这件**已经登记过**
+            // 的资产是什么"。判据清单因此与登记完全相同：物件身份 + 尺寸合法 + 资产存在且
+            // 哈希自洽 + 请求幂等（见 `validateInventoryRegistration`）。
+            return .inventoryRegistration(objectID: prop.objectID)
+        case let .rebase(prop):
+            // 历史存档自愈（`.rebase`）**不加新的一层**：它回答的仍然是登记那一层的问题
+            // ——"这件东西属于谁、它的资产在不在"，而**不是**"它摆得下吗"。
+            //
+            // 为什么空间判据在这里判不了（而且不该判）：`validate(_:)` 的输入是承托几何
+            // （`support()`，装修模式派生出来的那份网格），而自愈发生在**每一次资产准备**
+            // （`synchronizeOwnedResidentProps` 的 5 秒周期）—— 那时候装修模式多半没开、
+            // 网格是 nil ⇒ `validate` 一定抛 `environmentNotReady` ⇒ 自动修复**永远完不成**，
+            // 那正是要修的缺陷（"永久卡住"）。所以这里与 `.register` 同层：身份 + 资产 +
+            // 幂等，一个字都不放宽（`validateInventoryRegistration` 还是那一条判据）。
+            //
+            // 落点与"空间里有什么"**一个字节都没变**：`applyPropLayout(.rebase)` 只换派生
+            // 字段（尺寸/高度基准/朝向），`isEnabled`/位置/朝向/手持状态逐位保持，
+            // 而且那道"只许换派生字段"的守卫在世界状态那一层（fail-closed）。
+            // 空间判据在**每一次**摆放/移动时照旧全跑（`spatialChange` 那一层没动）——
+            // 修复之后用户把剑拿起来再放下，走的就是那条一个字不放宽的判据。
             return .inventoryRegistration(objectID: prop.objectID)
         case let .resize(objectID, _):
             // 改**库存里那件**的尺寸：没摆出来、也没拿在手里 ⇒ 空间里没有它。
@@ -341,7 +363,7 @@ final class ResidentPropPlacementService {
         switch command {
         case .hold(_, let avatarAssetID, _), .adjustGrip(_, let avatarAssetID, _), .returnHeld(_, let avatarAssetID):
             submittedAvatarID = avatarAssetID
-        case .register, .place, .withdraw, .undo, .enableCapability, .resize:
+        case .register, .place, .withdraw, .undo, .enableCapability, .resize, .rebase:
             submittedAvatarID = nil
         }
         if let submittedAvatarID {

@@ -404,6 +404,11 @@ typealias RealConversationService = AgentConversationService
     func currentResidentRunID() -> UUID? { residentAgentLoop?.snapshot.runID }
     private func resumeResidentJukebox(owner: UUID) async throws { fatalError("Use the jukebox outcome suite for playback") }
     private func pauseResidentJukebox(owner: UUID?) async throws { fatalError("Use the jukebox outcome suite for playback") }
+    /// 抽编进来的 `makeResidentWorldTools` 把点唱机报告出口接到这个方法上
+    /// （生产里是"日志 + 屏上"的唯一漏斗）。本仿真宿主不跑播放，所以这里只记下来：
+    /// 与那两行 `resumeResidentJukebox`/`pauseResidentJukebox` 是同一类桩。
+    private var jukeboxReports: [JukeboxReport] = []
+    private func applyResidentJukeboxReport(_ report: JukeboxReport) { jukeboxReports.append(report) }
     func snapshot(takeoverEnabled: Bool) -> DJAgentRadioState { .init(takeoverEnabled: takeoverEnabled, playbackState: "idle", activeTrackID: nil, activeSlotIndex: nil, program: []) }
     func currentTrackSnapshot() -> DJAgentCurrentTrackSnapshot? { nil }
     func playProgramTrack(trackID: String?, slotIndex: Int?) async throws { fatalError("unexpected playback") }
