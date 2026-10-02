@@ -15,7 +15,7 @@
 # * `WorldRuntime.swiftmodule` 在本仓**同时存在两份独立编译的产物**：
 #
 #       apps/macos/Packages/WorldRuntime/.build/arm64-apple-macosx/debug/Modules  (SwiftPM)
-#       apps/macos/Build/Build/Products/<配置>/WorldRuntime.swiftmodule           (xcodebuild)
+#       apps/macos/Build.noindex/Build/Products/<配置>/WorldRuntime.swiftmodule  (xcodebuild)
 #
 #   后者是 `make build` 的产物；`CONFIGURATION ?= Release`，所以 `Products/Debug`
 #   那一份会长期停在旧物上。认错它得到的不是"找不到模块"，而是更难认的：

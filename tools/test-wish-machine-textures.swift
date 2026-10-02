@@ -69,8 +69,8 @@ func check(_ value:Bool,_ message:String) {if !value {print("FAIL:",message);exi
 }
 """#
 let root=URL(fileURLWithPath:FileManager.default.currentDirectoryPath)
-let products=root.appendingPathComponent("apps/macos/Build/Build/Products/Debug")
-let directory=root.appendingPathComponent("apps/macos/Build/Build/Intermediates.noindex/VRMMetalKit.build/Debug/GLTFCore.build/Objects-normal/arm64")
+let products=root.appendingPathComponent("apps/macos/Build.noindex/Build/Products/Debug")
+let directory=root.appendingPathComponent("apps/macos/Build.noindex/Build/Intermediates.noindex/VRMMetalKit.build/Debug/GLTFCore.build/Objects-normal/arm64")
 let objects=try FileManager.default.contentsOfDirectory(at:directory,includingPropertiesForKeys:nil).filter {$0.pathExtension == "o"}.map(\.path)
 let temp=FileManager.default.temporaryDirectory.appendingPathComponent("gmgn-texture-test-\(UUID())")
 try FileManager.default.createDirectory(at:temp,withIntermediateDirectories:true)

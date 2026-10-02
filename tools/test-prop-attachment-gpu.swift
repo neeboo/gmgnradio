@@ -18,7 +18,7 @@ func worldRuntimeHarnessFlags() -> [String] {
 }
 
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-let products = root.appendingPathComponent("apps/macos/Build/Build/Products/Debug")
+let products = root.appendingPathComponent("apps/macos/Build.noindex/Build/Products/Debug")
 let attachment = root.appendingPathComponent(
     "apps/macos/Sources/GMGNRadio/Presence/PropAttachment.swift"
 )
@@ -225,7 +225,7 @@ try harness.write(to: harnessURL, atomically: true, encoding: .utf8)
 
 var objects: [String] = []
 let intermediates = root.appendingPathComponent(
-    "apps/macos/Build/Build/Intermediates.noindex/VRMMetalKit.build/Debug"
+    "apps/macos/Build.noindex/Build/Intermediates.noindex/VRMMetalKit.build/Debug"
 )
 for name in ["GLTFMetalKit", "GLTFCore"] {
     objects += try FileManager.default.contentsOfDirectory(

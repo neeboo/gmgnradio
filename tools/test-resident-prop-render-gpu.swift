@@ -14,7 +14,7 @@ func worldRuntimeHarnessFlags() -> [String] {
         .split(separator: "\n").map(String.init)
 }
 let root=URL(fileURLWithPath:FileManager.default.currentDirectoryPath)
-let products=root.appendingPathComponent("apps/macos/Build/Build/Products/Debug")
+let products=root.appendingPathComponent("apps/macos/Build.noindex/Build/Products/Debug")
 let harness = #"""
 import Foundation
 import Metal
@@ -111,7 +111,7 @@ try FileManager.default.copyItem(at:bundle,to:temp.appendingPathComponent(bundle
 let source=temp.appendingPathComponent("main.swift"),exe=temp.appendingPathComponent("check")
 try harness.write(to:source,atomically:true,encoding:.utf8)
 var objects:[String]=[]
-let intermediates=root.appendingPathComponent("apps/macos/Build/Build/Intermediates.noindex/VRMMetalKit.build/Debug")
+let intermediates=root.appendingPathComponent("apps/macos/Build.noindex/Build/Intermediates.noindex/VRMMetalKit.build/Debug")
 for name in ["GLTFMetalKit","GLTFCore"] {
  objects += try FileManager.default.contentsOfDirectory(at:intermediates.appendingPathComponent("\(name).build/Objects-normal/arm64"),includingPropertiesForKeys:nil).filter {$0.pathExtension=="o"}.map(\.path)
 }

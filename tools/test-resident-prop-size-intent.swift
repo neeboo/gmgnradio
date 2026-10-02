@@ -81,6 +81,151 @@ guard sourceContains("App/GMGNRadioApp.swift",
     ["WorldPropSizePolicy.intended(", "sizeIntent: sizeIntent"],
     "生成入库没有把尺寸意图落成世界尺寸（那把剑仍会按高度被算成 8.28 m）") else { exit(1) }
 
+// ── 断言 6：三轴尺寸 + **板形**物件 ⇒ 用基础几何造，而不是拿生成网格 ──────────────
+//
+// 这一条要抓住的形状只有一个：**用户说了三根轴，结果拿到的还是那个任意网格**。
+// 真机 2026-10-01「平面电视」就是这个形状 —— `1443 × 862 × 302 mm` 进了契约、进了任务
+// 记录、进了面板回读，而生成器交回来一个大立方体（参考图贴在各面上），
+// `WorldGeneratedProp.sizeIntent` 里也只有"最长边"那一根轴。
+//
+// 判据是**接线本身**（文本级），因为类型级判据可以全绿而 App 侧一个构造点都没有：
+// 编译得进、跑不起来。每一条都配**注入负对照** —— 在源码副本上做手术，判据必须变红；
+// 一个从不 FAIL 的门禁等于没有门禁。
+let appSourcePath = "App/GMGNRadioApp.swift"
+guard let appSourceText = readSource(appSourcePath) else {
+    print("FAIL: 读不到 \(appSourcePath)"); exit(1)
+}
+
+/// 「三轴 + 板形 ⇒ 基础几何」这条接线在不在。空数组 = 接线完整。
+func primitiveTelevisionWiringProblems(_ app: String) -> [String] {
+    var problems: [String] = []
+    // ① 真的调了基础几何那条入口（`WorldPrimitiveTelevision(millimeters:)`）。
+    if !app.contains("WorldPrimitiveTelevision(millimeters: spec)") {
+        problems.append("① 入库这一处没有构造 `WorldPrimitiveTelevision(millimeters:)`："
+            + "用户说的 1443 × 862 × 302 还是只会落成一个生成网格")
+    }
+    // ② 门是**三轴形状**，不是"只要有尺寸意图"（一根轴/最长边那条路不许被改成走几何）。
+    if !app.contains("intent.mode == .dimensions") {
+        problems.append("② 没有按 `mode == .dimensions` 区分形状：三轴与单轴会走同一条路")
+    }
+    // ③ 板形判据必须是**既有那一份**（`WorldScreenFaceInference.rejection`：板形 + 最大面面积），
+    //    不许在这里另写一套"最薄轴 ≤ 最长轴 1/4"。
+    if !app.contains("WorldScreenFaceInference.rejection(size: meters, objectID: job.objectID) == nil") {
+        problems.append("③ 没有用既有的板形判据（`WorldScreenFaceInference.rejection`）："
+            + "方块柜子会被当成电视去拼")
+    }
+    // ④ 三根轴必须**进世界状态 metadata**（`primitive: television.record`），面板才回读得出。
+    if !app.contains("primitive: television.record") {
+        problems.append("④ 三轴没有随物件落进世界状态（缺 `primitive: television.record`）："
+            + "面板回读不出 1443 × 862 × 302")
+    }
+    // ⑤ 资产字节必须走内容寻址那一个 put（同一个住处、同一种命名、同一种引用形式）。
+    if !app.contains("materializeContentAddressedAsset(television)") {
+        problems.append("⑤ 基础几何的资产字节没有走内容寻址的 put")
+    }
+    // ⑥ 拼出来的几何与**渲染端量出来**的包围盒必须逐位相同（画面/判据/碰撞盒只有一份尺寸），
+    //    不相等要可见拒绝，绝不画一台尺寸不对的电视。三根轴一根都不能少。
+    for axis in ["x", "y", "z"] where !app.contains("abs(measured.\(axis) - television.size.\(axis))") {
+        problems.append("⑥ 没有校验「渲染端量出来的包围盒就是拼出来的那一份」的 \(axis) 轴")
+    }
+    // ⑦ **不满足条件时必须保持今天的行为，并且说出来**（"仍用生成的网格、按最长边等比"）。
+    //    两件事都要：那句话在，而且它那一支是**无条件**的（有条件就等于没说）。
+    if !app.contains("仍用生成的网格、按最长边等比归一") {
+        problems.append("⑦ 不是板形时的回退没有可见说明：用户会以为「它照做了」")
+    }
+    if !app.contains("if job.sizeIntent?.mode == .dimensions {") {
+        problems.append("⑦ 回退说明那一支不是无条件的（找不到 `if job.sizeIntent?.mode == .dimensions {`）："
+            + "三轴落成生成网格这件事不会说给用户")
+    }
+    // ⑧ 基础几何那一支必须是**无条件**的，而且排在生成网格那条路**之前**、自己收场（`continue`）。
+    guard let primitiveBranch = app.range(of: "if let television = primitiveTelevision {") else {
+        problems.append("⑧ 基础几何那一支不是无条件的（找不到 `if let television = primitiveTelevision {`）："
+            + "三轴只会在有条件时才拼几何 —— 条件不成立就照旧落成生成网格")
+        return problems
+    }
+    guard let meshPath = app.range(of: "let url = URL(fileURLWithPath: path)") else {
+        problems.append("⑧ 找不到既有那条生成网格的落点")
+        return problems
+    }
+    if primitiveBranch.lowerBound > meshPath.lowerBound {
+        problems.append("⑧ 基础几何那一支排在生成网格那条路**之后**：先按网格算出尺寸再拼几何，"
+            + "两份尺寸都会落盘")
+    }
+    if !app[primitiveBranch.upperBound...].contains("continue") {
+        problems.append("⑧ 基础几何那一支没有收场（缺 `continue`）：会继续按生成网格再算一遍")
+    }
+    return problems
+}
+
+/// 注入负对照：把源码副本改成**已知会坏**的样子，判据必须变红。
+/// 每一条都对应一种真实的"悄悄退化"。
+let primitiveWiringInjections: [(name: String, old: String, new: String)] = [
+    // 最要命的那一条：用户说了三轴，结果还是拿那个任意网格（本轮的现场缺陷）。
+    ("grid-not-primitive",
+     "if let television = primitiveTelevision {",
+     "if false, let television = primitiveTelevision {"),
+    // 三轴与单轴不分：一根轴的意图也会被拿去拼几何（咖啡机会变成一台电视）。
+    ("intent-shape-not-checked",
+     "guard let intent = job.sizeIntent, intent.mode == .dimensions,",
+     "guard let intent = job.sizeIntent,"),
+    // 丢掉既有的板形判据：方块柜子也去拼电视。
+    ("drop-panel-criterion",
+     "return WorldScreenFaceInference.rejection(size: meters, objectID: job.objectID) == nil\n                        ? television : nil",
+     "return television"),
+    // 三轴不进世界状态：面板回读不出三个数（只有最长边）。
+    ("drop-primitive-record",
+     "sizeLocked: true, primitive: television.record)",
+     "sizeLocked: true)"),
+    // 资产字节不走内容寻址：`assetID` 与文件对不上，删除那条引用也释放不掉。
+    ("drop-content-addressed-put",
+     "let blobURL = try Self.materializeContentAddressedAsset(television)",
+     "let blobURL = URL(fileURLWithPath: path)"),
+    // 不做"量出来的就是拼出来的"这一校：画出来的尺寸可以与判据/碰撞盒分叉。
+    ("drop-measured-match",
+     "abs(measured.x - television.size.x) <= 0.002,",
+     "true,"),
+    // 回退时不说：用户以为"它照做了"。
+    ("silent-grid-fallback",
+     "if job.sizeIntent?.mode == .dimensions {",
+     "if false, job.sizeIntent?.mode == .dimensions {"),
+]
+
+// 现场演示：`SIZE_INTENT_INJECT=grid-not-primitive swift tools/test-resident-prop-size-intent.swift`
+// 会把**真源码**当成"三轴却仍用生成网格"的那一份来判，于是主判据自己打出一条 FAIL。
+var observedAppSource = appSourceText
+if let name = ProcessInfo.processInfo.environment["SIZE_INTENT_INJECT"],
+   let injection = primitiveWiringInjections.first(where: { $0.name == name }) {
+    print("·· SIZE_INTENT_INJECT=\(name)：把真源码当成被注入过的那一份来判")
+    guard observedAppSource.contains(injection.old) else {
+        print("FAIL: 注入锚点在真源码里找不到：\(injection.old)"); exit(1)
+    }
+    observedAppSource = observedAppSource.replacingOccurrences(of: injection.old, with: injection.new)
+}
+
+let primitiveWiringIssues = primitiveTelevisionWiringProblems(observedAppSource)
+for issue in primitiveWiringIssues { print("FAIL: \(issue)") }
+guard primitiveWiringIssues.isEmpty else {
+    print("FAIL: 三轴尺寸 + 板形物件没有接到基础几何上（判据见上）"); exit(1)
+}
+print("PASS: 三轴尺寸 + 板形物件接到基础几何（WorldPrimitiveTelevision）上，三轴进世界状态 metadata")
+
+for injection in primitiveWiringInjections {
+    var injected = appSourceText
+    guard injected.contains(injection.old) else {
+        print("FAIL: 注入负对照「\(injection.name)」的锚点在源码里找不到：\(injection.old)"); exit(1)
+    }
+    injected = injected.replacingOccurrences(of: injection.old, with: injection.new)
+    guard injected != appSourceText else {
+        print("FAIL: 注入负对照「\(injection.name)」没有改到源码副本"); exit(1)
+    }
+    let issues = primitiveTelevisionWiringProblems(injected)
+    guard !issues.isEmpty else {
+        print("FAIL: 注入负对照「\(injection.name)」（\(injection.new)）⇒ 判据必须变红，它却全绿")
+        exit(1)
+    }
+    print("PASS: 注入负对照「\(injection.name)」⇒ 判据变红（\(issues[0])）")
+}
+
 // ── 断言 2：参数与规则**只有一处**定义 ──────────────────────────────────────
 // 唯一允许写这些事实的文件是 Agent/WishMachineContract.swift（agent 用只读工具
 // `read_wish_machine_contract` 现读）。工具文件与系统提示里再存一份就是旧病复发：

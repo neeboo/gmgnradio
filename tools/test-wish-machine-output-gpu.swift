@@ -15,7 +15,7 @@ func worldRuntimeHarnessFlags() -> [String] {
         .split(separator: "\n").map(String.init)
 }
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-let products = root.appendingPathComponent("apps/macos/Build/Build/Products/Debug")
+let products = root.appendingPathComponent("apps/macos/Build.noindex/Build/Products/Debug")
 guard FileManager.default.fileExists(atPath: products.appendingPathComponent("GLTFMetalKit.swiftmodule").path) else {
     print("FAIL: first compile the app with its pinned GLTFMetalKit product");exit(1)
 }
@@ -91,7 +91,7 @@ func check(_ value: Bool, _ message: String) { if !value { print("FAIL:",message
     }
 }
 """#
-let intermediates=root.appendingPathComponent("apps/macos/Build/Build/Intermediates.noindex/VRMMetalKit.build/Debug")
+let intermediates=root.appendingPathComponent("apps/macos/Build.noindex/Build/Intermediates.noindex/VRMMetalKit.build/Debug")
 var objects:[String]=[]
 for product in ["GLTFMetalKit","GLTFCore"] {
     let path=intermediates.appendingPathComponent("\(product).build/Objects-normal/arm64")

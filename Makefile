@@ -1,11 +1,17 @@
-.PHONY: generate test test-all test-install test-worlds test-daemon test-python test-harnesses _test-harnesses build install install-debug install-universal unregister-product
+.PHONY: generate test test-all test-install test-worlds test-daemon test-python test-harnesses _test-harnesses build install install-debug install-universal unregister-product dedupe verify-registrations
 
 # 默认 Release：只有 -O 下"承托网格派生"才是 0.5 s 量级（-Onone 是 6.6 s，
 # 真机一次要六秒多，用户等不了）。想最快编译走 make install-debug。
 CONFIGURATION ?= Release
-DERIVED_DATA ?= apps/macos/Build
+# 目录名以 `.noindex` 结尾 —— Spotlight 不索引这整棵子树（2026-10-02 本机实测），
+# 于是 mdworker 不会把 `Build/Products/<配置>/gmgn radio.app` 注册进 LaunchServices，
+# 聚焦/启动台里不会再冒出第二个图标。这是"两个 gmgn radio"的**根治**：裸 `make build`
+# 也不需要再靠"注销 + 删产物"兜底（那条路只赢几秒，见下面 unregister-product 一段）。
+# 代价：本目录改名时每个 worktree 要一次冷编译。
+DERIVED_DATA ?= apps/macos/Build.noindex
 # SwiftPM 的检出/仓库/产物放在 DerivedData **之外**。过去它们在
-# apps/macos/Build/SourcePackages 里，`rm -rf apps/macos/Build` 会一并删掉
+# $(DERIVED_DATA)/SourcePackages 里（当时是 apps/macos/Build/SourcePackages），
+# `rm -rf $(DERIVED_DATA)` 会一并删掉
 # 734 MB 检出，下一次冷编译要重新 git clone 并跑 `submodule update
 # --init --recursive`（实测 252 s，而且必须联网）。这四个目录名本来就在
 # .gitignore 里（apps/macos/Packages/{checkouts,repositories,artifacts}）。
@@ -45,7 +51,7 @@ CARGO ?= $(shell command -v cargo 2>/dev/null || echo $(HOME)/.cargo/bin/cargo)
 #   make build                          # 排队上限 1 小时
 #   make build BUILD_LOCK_TIMEOUT=600   # 按需调整排队上限
 #
-# 锁文件放在 DerivedData 里（`Build/` 已在 .gitignore），跟着 DerivedData 走：换一个
+# 锁文件放在 DerivedData 里（`Build.noindex/` 已在 .gitignore），跟着 DerivedData 走：换一个
 # -derivedDataPath（或另一个 worktree）就不会互相阻塞。锁由
 # tools/with-build-lock.py 的包装进程持有（构建子进程不继承锁 fd，所以 Xcode 的长驻
 # 构建服务占不住闸门），持有者一退出就由内核自动释放，不会有需要手工删的死锁文件。
@@ -57,20 +63,34 @@ BUILD_LOCK_FILE ?= $(if $(filter /%,$(DERIVED_DATA)),$(DERIVED_DATA),$(CURDIR)/$
 BUILD_LOCK = $(PYTHON) "$(CURDIR)/tools/with-build-lock.py" --lock "$(BUILD_LOCK_FILE)" --timeout "$(BUILD_LOCK_TIMEOUT)" --label "$@" --
 
 # ---------------------------------------------------------------------------
-# 构建产物的 LaunchServices 注销（"两个 gmgn radio 图标"的根治点）。
+# 构建产物的 LaunchServices 注销（"两个 gmgn radio 图标"的**第二层**保险）。
 #
-# `Build/Build/Products/<配置>/gmgn radio.app` 是一个可启动 bundle，xcodebuild 一
-# 把它写到磁盘上，LaunchServices 就**自动注册**它 —— 于是聚焦/启动台里出现第二个
-# "gmgn radio"（用户 2026-09-29 起报过三次）。`make install` 拷完会删掉产物、
-# `make dedupe` 也会清，但**裸 `make build`**（agent 与日常最常跑的那条）两条路都
-# 不经过，所以每构建一次图标就回来一次 —— 清理挂在别处就永远追不上。
-# 因此注销必须挂在 build **自己**的末尾。
+# 根治在目录名那一处：DERIVED_DATA = `apps/macos/Build.noindex`，`.noindex` 后缀
+# 让 Spotlight **不索引**整棵子树，于是 `Build/Products/<配置>/gmgn radio.app` 这个
+# 可启动 bundle 不会被 mdworker 注册进 LaunchServices（2026-10-02 实测：冷编译之后
+# 再跑一次裸 `make build`、等 60 s，注册表里仍只有 `/Applications/gmgn radio.app`）。
+# 这一段留着是因为它只花毫秒：产物一旦被挪到**会**被索引的位置（手工拷贝、别的
+# DerivedData、老路径），注册仍会自动发生，多一层注销就少一次"再报一次图标"。
+#
+# 历史（用户 2026-09-29 起报过三次）：产物曾在 `apps/macos/Build`（不带 `.noindex`），
+# xcodebuild 一把它写到磁盘上，LaunchServices 就自动注册它 —— 于是聚焦/启动台里出现
+# 第二个 "gmgn radio"。`make install` 拷完会删掉产物、`make dedupe` 也会清，但**裸
+# `make build`**（agent 与日常最常跑的那条）两条路都不经过，所以每构建一次图标就回来
+# 一次 —— 清理挂在别处就永远追不上。因此注销挂在 build **自己**的末尾。
 #
 # 两条硬约束：
 #   * **只注销，不删文件**：产物马上要交给 `make install` 用（删了它就废了）。
 #   * **不跑 `-dump`**：dump 一次 6~9 s，而 `-u <路径>` 是毫秒级。`lsregister -u`
 #     对**文件还在**的注册是有效的（只有"路径已不存在"的死注册才清不掉、只能重建
 #     数据库，那条路走 dedupe/install）；这里产物刚写出来，文件必然在。
+#
+# 2026-10-02 补：单靠这条注销**只是赢得几秒**，不是终点。实测（新建一个 bundle 放进
+# `$HOME`、完全不碰 lsregister）Spotlight 的索引在 30 s 内自己就把同一 id 注册了
+# 回去 —— 只要产物文件还在、位置会被索引，注销就会被 mdworker 撤销。后来实测
+# `.noindex` 后缀的目录整棵不进索引、不会注册，所以落点从"注销产物"改成"换个不被
+# 索引的 DerivedData"（本次改动，代价是每个 worktree 一次冷编译）。`make dedupe`
+# （删文件 + "除正规路径外全部注销"的规则 + 断言）仍然保留，它管的是老路径与别的
+# DerivedData 里已经存在的那些同 id 副本。
 #
 # 失败不影响构建结果：命令自带 `|| true`，调用处也不改退出码。
 PRODUCT_APP ?= $(DERIVED_DATA)/Build/Products/$(CONFIGURATION)/gmgn radio.app
@@ -134,19 +154,41 @@ install-debug: install
 test-install:
 	$(PYTHON) tools/test-install-macos.py
 
-# Build products are launchable bundles, so LaunchServices registers every one
-# of them the moment Xcode writes it -- and Spotlight then offers a second
-# "gmgn radio" next to the installed app. `make install` deletes its product
-# after copying it into place; routine verification builds one too, so this is
-# the same cleanup as a standalone target. Unregister first (the file is about
-# to be deleted, and a registration whose bundle is gone cannot be removed with
-# `lsregister -u` afterwards), then delete.
+# LaunchServices 里这个 bundle id 只允许一条注册，路径必须是
+# `/Applications/gmgn radio.app` —— 这是**规则**，不是清一次。
 #
-# `make build` now unregisters its own product at the end of its recipe (see
-# `unregister-product`), so what is left for this target is the **deletion**:
-# build never deletes (install needs the product), dedupe and install do.
+# 已知来源（2026-10-02 复核）：
+#   * `$(DERIVED_DATA)/Build/Products/<配置>/gmgn radio.app`。DERIVED_DATA 现在是
+#     `apps/macos/Build.noindex` —— `.noindex` 子树不进索引也不注册（本次实测），
+#     所以这里 `--products` 扫的是那份**不会被注册**的产物；它仍在扫描列表里，
+#     是为了"注册表必须只有一条"这条断言不被路径变化绕过；
+#   * `apps/macos/Build/Build/Products/<配置>/gmgn radio.app` —— 迁移前的旧路径，
+#     目录只作回退保留，里面的 app bundle 已经删掉（`find apps/macos/Build -name
+#     'gmgn radio.app'` 为空）；删掉旧目录时这一条也一起作废；
+#   * `~/Library/Developer/Xcode/DerivedData/*/...`（`make test` 走默认 DerivedData，
+#     TEST_HOST 会**真的启动**那个产物，启动即注册 —— 那条路不经过 `unregister-product`）；
+#   * `/Applications/.gmgn-install-*/previous.backup`（装机留的回滚备份：隐藏目录，当前
+#     不在注册表里，但里面是一份同 id 的完整 bundle，交给 dedupe/install **从形态上**根治）。
+#
+# 为什么 `make build` 末尾那条注销不够（本机实测）：新建一个 bundle 放进 `$HOME`，
+# 什么都不做，30 s 内 Spotlight 的索引就把它注册进了 LaunchServices。文件还在、
+# 位置会被索引，注销就是暂时的。所以除了注销，落点是**让位置不被索引**
+# （DERIVED_DATA 的 `.noindex` 后缀，已落地）；对老的、仍会被索引的副本，则必须
+# **删掉产物文件**。
+#
+# 顺序：先注销再删（文件已不在的注册用 `-u` 清不掉，只能重建数据库，那一步在
+# `tools/install-macos.py:ensure_single_registration` 里）。产物删除走构建闸门，
+# 免得把别人正在编译/正在用的产物删掉。
+#
+# 退出码是有意义的：**收敛+删除之后注册表仍不是唯一正规路径就非 0** —— 这就是防复发
+# 断言（注入一份同 id 的副本必须能把 `make dedupe` 顶红）。删不掉文件不算失败。
 dedupe:
-	-python3 tools/dedupe-app-registrations.py
+	$(BUILD_LOCK) $(PYTHON) tools/dedupe-app-registrations.py --products "$(if $(filter /%,$(DERIVED_DATA)),$(DERIVED_DATA),$(CURDIR)/$(DERIVED_DATA))/Build/Products"
+
+# 只读复核（不改任何东西，不删任何文件）：注册表里是不是只剩正规安装那一条。
+# 想看将要做什么而不动手用 `--dry-run`。
+verify-registrations:
+	$(PYTHON) tools/dedupe-app-registrations.py --check
 
 test-worlds:
 	swift test --package-path apps/macos/Packages/WorldRuntime

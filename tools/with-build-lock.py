@@ -5,7 +5,7 @@
 `make build`，10 核机器被 15 路并行 `swift-frontend` 打到负载 36+，并且反复出现
 
     error: unable to attach DB: error: accessing build database
-    ".../apps/macos/Build/Build/Intermediates.noindex/XCBuildData/build.db":
+    ".../apps/macos/Build.noindex/Build/Intermediates.noindex/XCBuildData/build.db":
     database is locked Possibly there are two concurrent builds running in the
     same filesystem location.
 

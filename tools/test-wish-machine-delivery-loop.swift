@@ -4,7 +4,7 @@ import Foundation
 
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let sources = root.appendingPathComponent("apps/macos/Sources/GMGNRadio")
-let products = root.appendingPathComponent("apps/macos/Build/Build/Products/Debug")
+let products = root.appendingPathComponent("apps/macos/Build.noindex/Build/Products/Debug")
 // WorldRuntime 的模块搜索路径 + 目标文件**只有一处定义**：tools/world-runtime-harness-flags.sh。
 // 不要在这里拼 `.build/...`：27 份各自拼写正是 SwiftPM 与 xcodebuild 两份模块并存的根因。
 // `worldBuild` 由那唯一一份定义**推出来**（= Modules 的上一级），本文件不持有路径字面量。
@@ -921,7 +921,7 @@ let bundle = products.appendingPathComponent("VRMMetalKit_GLTFMetalKit.bundle")
 try FileManager.default.copyItem(at: bundle, to: directory.appendingPathComponent(bundle.lastPathComponent))
 var objects = try FileManager.default.contentsOfDirectory(at: worldBuild.appendingPathComponent("WorldRuntime.build"), includingPropertiesForKeys: nil).filter { $0.pathExtension == "o" }.map(\.path)
 for module in ["GLTFMetalKit", "GLTFCore"] {
-    let path = root.appendingPathComponent("apps/macos/Build/Build/Intermediates.noindex/VRMMetalKit.build/Debug/\(module).build/Objects-normal/arm64")
+    let path = root.appendingPathComponent("apps/macos/Build.noindex/Build/Intermediates.noindex/VRMMetalKit.build/Debug/\(module).build/Objects-normal/arm64")
     objects += try FileManager.default.contentsOfDirectory(at: path, includingPropertiesForKeys: nil).filter { $0.pathExtension == "o" }.map(\.path)
 }
 let inputs = ["Presence/PropGenerationClient", "Presence/PropGenerationStore", "Presence/PropTaskDaemonClient", "Presence/PropImagePreparation",

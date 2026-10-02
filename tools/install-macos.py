@@ -138,7 +138,7 @@ def validate(app, require_helper=True):
             info = plistlib.load(stream)
     except (OSError, ValueError) as error:
         raise RuntimeError(f'Invalid app bundle: {app}') from error
-    if info.get('CFBundleIdentifier') != 'ai.gmgn.radio' or info.get('CFBundleExecutable') != 'gmgn radio':
+    if info.get('CFBundleIdentifier') != BUNDLE_IDENTIFIER or info.get('CFBundleExecutable') != 'gmgn radio':
         raise RuntimeError('Unexpected application identity')
     for relative in ['Contents/MacOS/gmgn radio', 'Contents/Helpers/gmgn-taskd']:
         if not require_helper and relative.startswith('Contents/Helpers/'):
@@ -176,7 +176,234 @@ def ensure_signature(app, timings=None):
     return True
 
 
-def prune_install_workspaces(parent, keep=None):
+# ---------------------------------------------------------------------------
+# LaunchServices 注册表：规则是"同一个 bundle id 只允许 /Applications 那份"。
+#
+# 2026-10-02 本机实测（`lsregister -f` + `-dump` + `mdls` + `mdfind`，探针用一次性
+# bundle id，见 tools/test-install-macos.py）：
+#   * bundle 是按**结构**认的：`previous.backup`（没有 `.app` 后缀）在 /Applications 里
+#     被 `mdls` 认成 `com.apple.application-bundle` —— 它今天没进注册表，只是因为父目录
+#     是隐藏目录（Spotlight/`lsregister -f` 都不进隐藏目录）；
+#   * 去掉 `Contents/MacOS/<exec>` 的可执行位**没用**：实测 `lsregister -f` 照样注册成功；
+#   * **去掉 `Contents/Info.plist` 有用**：没有 plist 就没有 CFBundleIdentifier，
+#     dump 里再也不会出现这个 id（`-f` 返回 0，但没有记录）；
+#   * **Spotlight 索引本身就会注册**：把一个新 bundle 放进 `$HOME` 下不碰
+#     `lsregister`，30 s 内 `mdls` 认得它、dump 里也多了一条记录。这解释了为什么
+#     `make build` 末尾的 `-u` 会被"撤销"——文件名还在，mdworker 索引它时会再注册一次；
+#   * 目录名带 `.noindex` 后缀的子树不会进索引，也不会被注册（实测）。
+# 结论：只要**文件还在**、且在一个会被索引的位置，注销就是暂时的；根治要么删文件，
+# 要么把产物放进 `.noindex` 路径（那是 DerivedData 迁移，不在本次落点）。
+# ---------------------------------------------------------------------------
+LSREGISTER = ('/System/Library/Frameworks/CoreServices.framework/Frameworks/'
+              'LaunchServices.framework/Support/lsregister')
+# 本项目唯一的应用身份（`validate` 用它判定"这是不是我们的 bundle"）。
+BUNDLE_IDENTIFIER = 'ai.gmgn.radio'
+SEALED_INFO_PLIST = 'Info.plist.rollback'
+ROLLBACK_NOTES = 'ROLLBACK.txt'
+
+
+def lsregister_path(override=None):
+    """`lsregister` 的路径，可覆盖 —— 测试必须能注入替身。
+
+    2026-10-02：`tools/test-install-macos.py` 以前通过 `install()` 直接调用**真机**
+    `lsregister`：把注册表里 ai.gmgn.radio 的其它路径（包含 `/Applications` 那份正式
+    安装）逐个注销，再把临时 fixture 注册进去；fixture 目录随测试清理消失，留下一条
+    指向不存在路径的死注册，而正式安装被注销。测试永远不该碰真机注册表。
+    `GMGN_LSREGISTER=<路径>` 或调用参数都能替换掉它。
+    """
+    return Path(override or os.environ.get('GMGN_LSREGISTER') or LSREGISTER)
+
+
+def bundle_identifier(app):
+    """bundle 的 CFBundleIdentifier。
+
+    读不出来（目录已不在/没有 plist）时返回本项目固定的身份而不是 None：调用方
+    （dedupe/装机收尾）要的语义是"清掉不属于正规安装的同 id 注册"，即使正规安装
+    本身暂时不在磁盘上，这个 id 也仍然是我们必须独占的那一个。
+    """
+    try:
+        with (Path(app) / 'Contents/Info.plist').open('rb') as handle:
+            return plistlib.load(handle).get('CFBundleIdentifier') or BUNDLE_IDENTIFIER
+    except (OSError, ValueError):
+        return BUNDLE_IDENTIFIER
+
+
+def _lsregister(lsregister, arguments, timeout=60):
+    return subprocess.run([str(lsregister), *arguments], capture_output=True, text=True,
+                          timeout=timeout)
+
+
+def registered_paths(app, lsregister=None):
+    """当前注册到 `app` 这个 bundle id 的**所有**路径（可能不止一条）。
+
+    `lsregister -dump` 的每条记录里 `path:` 出现在 `identifier:` **之前**（实测），
+    所以不能"先看到 id 再收 path" —— 必须按 `----------` 分隔的区块整体判断。
+    """
+    app = Path(app)
+    identifier = bundle_identifier(app)
+    dump = _lsregister(lsregister_path(lsregister), ['-dump'])
+    paths = []
+    for block in dump.stdout.split('\n----------'):
+        if identifier not in block:
+            continue
+        for line in block.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith('path:'):
+                continue
+            # dump 里路径后面跟着注册表的句柄，例如
+            # `path:   /Applications/gmgn radio.app (0x7b2c)` —— 不去掉尾巴
+            # 就会去注销一个不存在的文件名，静默失败（2026-09-29 实测）。
+            text = stripped.split('path:', 1)[1].strip()
+            if text.endswith(')') and ' (0x' in text:
+                text = text[:text.rindex(' (0x')]
+            paths.append(Path(text))
+    return paths
+
+
+def audit_single_registration(app, lsregister=None):
+    """可复核的判据：这个 bundle id 只注册了 `app` 这一条。
+
+    返回 `(ok, others)`：`others` 是除 `app` 之外仍注册着的路径。读操作，不改注册表，
+    所以可以随时跑（`tools/dedupe-app-registrations.py --check`）。
+    """
+    app = Path(app)
+    try:
+        others = sorted({path for path in registered_paths(app, lsregister) if path != app})
+    except Exception:
+        return False, []
+    return not others, others
+
+
+def ensure_single_registration(app, extra_paths=(), lsregister=None, verify=True):
+    """按"除正规安装外全部注销"这条**规则**收敛注册表，而不是清一次。
+
+    真机上曾出现两个 "gmgn radio"：一份是 /Applications 里的正式安装，另一份是
+    构建产物路径。这里把同一 bundle id 的**其它每一条**注册逐个注销，再注册本安装。
+
+    顺序与死注册：
+      * 文件还在的注册 `lsregister -u` 就能清掉；
+      * 路径已经不在磁盘上的（产物被删后留下的）`-u` 会失败 —— 只能重建数据库；
+      * `extra_paths`（安装工作区/回滚备份）**无论 dump 里有没有**都注销一次：它们是
+        同一 bundle id 的第二份候选，不该出现在任何"打开方式"列表里。
+    尽力而为：任何一步失败都不影响安装结果，返回值告诉调用方还剩什么。
+    """
+    app = Path(app)
+    lsregister = lsregister_path(lsregister)
+    try:
+        stale = [path for path in registered_paths(app, lsregister) if path != app]
+    except Exception:
+        stale = []
+    for path in [*stale, *(Path(p) for p in extra_paths)]:
+        if path == app:
+            continue
+        try:
+            _lsregister(lsregister, ['-u', str(path)], timeout=30)
+        except Exception:
+            pass
+    # `lsregister -u` 对**已经不在磁盘上**的路径是拒绝的（它会说
+    # "Bundle node not found on disk"），所以死注册只能靠重建数据库清掉。
+    # 正规安装自己也算：装机被删/回滚掉之后，它那条记录同样清不掉。
+    #
+    # 2026-09-30：这里过去是"只要 stale 非空就重建"，而装机时最常见的 stale
+    # 恰恰是 **xcodebuild 刚注册、文件还在** 的构建产物（`lsregister -u` 对它
+    # 有效）。为它重建整个 LaunchServices 数据库，每次装机白付约 8 s
+    # （实测 registration 阶段 15.0 s 对 6.9 s）。现在只有"文件已不在磁盘上"
+    # 的死注册才触发重建。
+    if any(not path.exists() for path in [*stale, app]):
+        try:
+            _lsregister(lsregister, ['-kill', '-r', '-domain', 'local',
+                                     '-domain', 'system', '-domain', 'user'], timeout=120)
+        except Exception:
+            pass
+    try:
+        _lsregister(lsregister, ['-f', str(app)], timeout=30)
+    except Exception:
+        pass
+    if not verify:
+        return []
+    try:
+        return [path for path in registered_paths(app, lsregister) if path != app]
+    except Exception:
+        return []
+
+
+def seal_rollback_backup(backup, lsregister=None):
+    """把回滚备份改成**不可注册**的形态：整个 bundle 去掉 Info.plist（只改名）。
+
+    为什么是这个形态（2026-10-02 本机实测）：
+      * 改扩展名/目录名挡不住：`previous.backup` 明明没有 `.app` 后缀，`mdls` 在
+        /Applications 里照样把它认成 `com.apple.application-bundle`。它目前没被注册
+        只是因为父目录是隐藏目录 —— 一旦备份出现在别的位置（或被 `open`/`mdimport`
+        碰一次），名字救不了；
+      * 去掉可执行位无效：实测 `lsregister -f` 仍然注册成功（探针 C）；
+      * 打包成 zip 有效，但每次装机都要压一份上百 MB 的产物（安装循环是热点路径，
+        见 034ea94），而且失败回滚要多一步解压 —— 回滚是安全关键路径，动作越少越好。
+    改名是零拷贝且**不可注册**：没有 Info.plist 就没有 CFBundleIdentifier，
+    LaunchServices 读不出这是哪个 app（实测 `-f` 之后 dump 里没有该 id 的记录），
+    所以它不可能再变成第二个 "gmgn radio"。字节一个没动，回滚只是把名字改回来。
+    """
+    backup = Path(backup)
+    plist = backup / 'Contents/Info.plist'
+    if not plist.is_file():
+        return False
+    try:
+        plist.rename(backup / 'Contents' / SEALED_INFO_PLIST)
+    except OSError:
+        return False
+    try:
+        (backup / ROLLBACK_NOTES).write_text(
+            '这是 gmgn radio 的回滚备份（装机时替换下来的上一份 /Applications/gmgn radio.app）。\n'
+            '为了不让 Spotlight/LaunchServices 把它当成第二个 "gmgn radio"，它的\n'
+            f'Contents/Info.plist 被改名为 Contents/{SEALED_INFO_PLIST} —— 没有 Info.plist 的\n'
+            '目录不可能被注册成这个 bundle id 的应用。**文件内容一个字没改**。\n'
+            '\n'
+            '回滚（两条 mv，不需要重新编译）：\n'
+            f'  mv "{backup}/Contents/{SEALED_INFO_PLIST}" "{backup}/Contents/Info.plist"\n'
+            '  # 先退出正在运行的 gmgn radio，然后：\n'
+            '  mv "/Applications/gmgn radio.app" "/Applications/previous.gmgn-radio.app"\n'
+            f'  mv "{backup}" "/Applications/gmgn radio.app"\n'
+            '  # 需要的话再注册一次：\n'
+            '  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "/Applications/gmgn radio.app"\n',
+            encoding='utf-8')
+    except OSError:
+        pass
+    try:
+        _lsregister(lsregister_path(lsregister), ['-u', str(backup)], timeout=30)
+    except Exception:
+        pass
+    return True
+
+
+def restore_rollback_backup(backup):
+    """`seal_rollback_backup` 的逆操作（回滚/测试用）。"""
+    backup = Path(backup)
+    sealed = backup / 'Contents' / SEALED_INFO_PLIST
+    if not sealed.is_file():
+        return False
+    try:
+        sealed.rename(backup / 'Contents/Info.plist')
+    except OSError:
+        return False
+    with contextlib.suppress(OSError):
+        (backup / ROLLBACK_NOTES).unlink()
+    return True
+
+
+def seal_install_workspaces(parent, lsregister=None):
+    """把 `/Applications/.gmgn-install-*` 里遗留的回滚备份逐个"封口"。
+
+    这些目录是隐藏目录（`ls` 看不见、Spotlight 不进），所以它们**当前**并没有被注册；
+    但里面躺着的是一份同 bundle id 的完整 bundle，谁把它索引/点开一次就会变成
+    第二个图标。按"只有一个正规路径"这条规则，它们不该保持可注册形态。
+    """
+    sealed = []
+    for workspace in sorted(Path(parent).glob('.gmgn-install-*')):
+        if seal_rollback_backup(workspace / 'previous.backup', lsregister):
+            sealed.append(workspace / 'previous.backup')
+    return sealed
+
+
+def prune_install_workspaces(parent, keep=None, lsregister=None):
     """删除历次安装留下的临时工作区，只保留 keep 那一个（= 最近一次可回滚的备份）。
 
     2026-09-29：每次 `make install` 都会在 `/Applications` 下留一个
@@ -184,74 +411,22 @@ def prune_install_workspaces(parent, keep=None):
     真机上攒到 19 个、2.4 GB，而且这些目录里各装着一个 app bundle，会被 Spotlight/
     LaunchServices 当成候选，于是"打开方式"里出现第二个 gmgn radio。
     安装成功时保留一个（回滚用），其余一律删掉；删不掉不算安装失败。
+
+    2026-10-02：删之前先**封口**（去掉 Info.plist）—— 万一 rmtree 失败（权限、占用），
+    留下的也是不可注册的形态，而不是又一份候选 app。
     """
     keep = Path(keep) if keep is not None else None
     for candidate in Path(parent).glob('.gmgn-install-*'):
         if keep is not None and candidate == keep:
             continue
+        seal_rollback_backup(candidate / 'previous.backup', lsregister)
         try:
             shutil.rmtree(candidate)
         except OSError:
             pass
 
 
-def ensure_single_registration(app):
-    """让这个 bundle id 在 LaunchServices 里**只剩本安装这一条**注册。
-
-    真机上曾出现两个 "gmgn radio"：一份是 /Applications 里的正式安装，另一份是
-    构建产物路径（文件早删了，注册还留着）。这里把同一 bundle id 的其它注册逐个注销，
-    再注册本安装。尽力而为：任何一步失败都不影响安装结果。
-    """
-    app = Path(app)
-    lsregister = ('/System/Library/Frameworks/CoreServices.framework/Frameworks/'
-                  'LaunchServices.framework/Support/lsregister')
-    try:
-        with (app / 'Contents/Info.plist').open('rb') as handle:
-            bundle_id = plistlib.load(handle).get('CFBundleIdentifier')
-        if not bundle_id:
-            return False
-        dump = subprocess.run([lsregister, '-dump'], capture_output=True, text=True, timeout=60)
-        # `lsregister -dump` 的每条记录里 `path:` 出现在 `bundle id:` **之前**（实测），
-        # 所以不能"先看到 bundle id 再收 path" —— 必须按 `-----` 分隔的区块整体判断。
-        stale = []
-        for block in dump.stdout.split('\n----------'):
-            if bundle_id not in block:
-                continue
-            for line in block.splitlines():
-                stripped = line.strip()
-                if not stripped.startswith('path:'):
-                    continue
-                # dump 里路径后面跟着注册表的句柄，例如
-                # `path:   /Applications/gmgn radio.app (0x7b2c)` —— 不去掉尾巴
-                # 就会去注销一个不存在的文件名，静默失败（2026-09-29 实测）。
-                text = stripped.split('path:', 1)[1].strip()
-                if text.endswith(')') and ' (0x' in text:
-                    text = text[:text.rindex(' (0x')]
-                path = Path(text)
-                if path != app:
-                    stale.append(path)
-        for path in stale:
-            subprocess.run([lsregister, '-u', str(path)], capture_output=True, timeout=30)
-        # `lsregister -u` 对**已经不在磁盘上**的路径是拒绝的（dump 里会写
-        # "Bundle node not found on disk"），所以死注册用 `-u` 清不掉 ——
-        # 实测只能重建数据库。只在确实有死注册时才做。
-        #
-        # 2026-09-30：这里过去是"只要 stale 非空就重建"，而装机时最常见的 stale
-        # 恰恰是 **xcodebuild 刚注册、文件还在** 的构建产物（`lsregister -u` 对它
-        # 有效）。为它重建整个 LaunchServices 数据库，每次装机白付约 8 s
-        # （实测 registration 阶段 15.0 s 对 6.9 s）。现在只有"文件已不在磁盘上"
-        # 的死注册才触发重建。
-        if any(not path.exists() for path in stale):
-            subprocess.run([lsregister, '-kill', '-r', '-domain', 'local',
-                            '-domain', 'system', '-domain', 'user'],
-                           capture_output=True, timeout=120)
-        subprocess.run([lsregister, '-f', str(app)], capture_output=True, timeout=30)
-        return True
-    except Exception:
-        return False
-
-
-def install(source, destination, root, runtime=None, timeout=15, timings=None):
+def install(source, destination, root, runtime=None, timeout=15, timings=None, lsregister=None):
     source, destination, root = (Path(p).expanduser().resolve() for p in (source, destination, root))
     if source == destination or source in destination.parents or destination in source.parents:
         raise RuntimeError('Source and destination must be separate bundles')
@@ -309,15 +484,27 @@ def install(source, destination, root, runtime=None, timeout=15, timings=None):
         # token，安装器也不再读取任何记忆 provider 环境变量。安装只负责替换
         # bundle、拉起 daemon 并验证套接字归属；记忆模块在 daemon 内部自行工作。
         #
-        # 安装成功后的两项收尾（都不影响返回值，也都不算失败）：LaunchServices 里
-        # 只留这一条注册；历次安装的工作区只留本次这一个（回滚用），其余删掉。
+        # 安装成功后的三项收尾（都不影响返回值，也都不算失败）：
+        #   1. LaunchServices 里**只留这一条**注册（规则，不是清一次：别的路径逐个注销）；
+        #   2. 本次回滚备份"封口"——去掉 Info.plist，让它不可能再被注册成第二个图标
+        #      （字节不动，回滚只需把名字改回来，见 seal_rollback_backup）；
+        #   3. 历次安装的工作区只留本次这一个（回滚用），其余封口后删掉。
         with stage(timings, 'registration'):
-            ensure_single_registration(destination)
+            remaining = ensure_single_registration(destination, extra_paths=[backup],
+                                                   lsregister=lsregister)
+        with stage(timings, 'seal_backup'):
+            sealed = seal_rollback_backup(backup, lsregister) if backup.exists() else False
         with stage(timings, 'prune_workspaces'):
-            prune_install_workspaces(destination.parent, keep=workspace)
+            prune_install_workspaces(destination.parent, keep=workspace, lsregister=lsregister)
         return {'destination': str(destination), 'backup': str(backup) if backup.exists() else None,
                 'daemon_verified': True, 'signature_repaired': signature_repaired,
-                'app_stopped': bool(apps), 'open_app_manually': True}
+                'app_stopped': bool(apps), 'open_app_manually': True,
+                # 可复核的判据：装机结束时注册表里这个 bundle id 只剩正规安装这一条。
+                # False 说明还有别的路径（构建产物/临时副本/死注册）占着同一个 id。
+                'registration_clean': not remaining,
+                # 回滚备份的新形态：目录还在、字节没动，只是 Contents/Info.plist 被改名成
+                # Contents/Info.plist.rollback（因此不可注册）。回滚步骤写在同目录 ROLLBACK.txt。
+                'sealed_backup': str(backup) if sealed else None}
     except Exception as error:
         if swapped:
             try:

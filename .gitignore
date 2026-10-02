@@ -6,6 +6,13 @@
 DerivedData/
 .derived-data/
 build/
+# 构建输出（DerivedData）。名字以 `.noindex` 结尾是有意的：Spotlight 不索引这棵
+# 子树，产物 app bundle 因此不会被 mdworker 注册进 LaunchServices（见 Makefile
+# 顶部 DERIVED_DATA）。
+Build.noindex/
+# 旧路径。`apps/macos/Build/` 只剩 2026-10-02 迁移前的回退目录（产物 app bundle 已
+# 删），保留这一行只是为了 git status 干净；确认 Build.noindex 无误、删掉旧目录时
+# 把这一行一起删。
 Build/
 *.xcuserstate
 xcuserdata/
