@@ -164,10 +164,30 @@ struct WorldScreenCommandOutcome: Equatable, Sendable {
     }
 }
 
+/// 一件**看起来该有屏幕、但还没被认成屏幕**的物件（从运行时注册的物件状态里来）。
+///
+/// `read_screen` 靠它回答「有没有、是哪一件」里那个「哪一件」：没有它，工具只能说
+/// "这个空间里没有电视"，而说不出**是哪件**物件、为什么。
+///
+/// `reason` 必须是**运行时**给出的具名原因（名字不像电视 / 板形或尺寸不够 / 已收回）。
+/// 工具层与表述层都不得自己编一句 —— 编出来的原因会让居民把"名字里没有电视"说成
+/// "这台电视坏了"，用户据此去修一台根本没坏的东西。
+struct WorldScreenCandidate: Equatable, Sendable {
+    let objectID: String
+    let displayName: String
+    /// 具名原因（人话，来自运行时注册与几何判据）。
+    let reason: String
+}
+
 /// 屏幕的**控制面**。`WorldScreenStore` 是生产实现；harness 用替身。
 @MainActor
 protocol WorldScreenControlling: AnyObject {
     func listScreens() -> [WorldScreenSnapshot]
+    /// 空间里**还没被认成屏幕**的物件（各带一句具名原因），只从运行时注册表来。
+    ///
+    /// 刻意是**必答**的（没有默认实现）：一个拿不到这份信息的实现不许猜 —— 猜出来
+    /// 的"是哪一件"与编造没有区别。
+    func unrecognizedScreenCandidates() -> [WorldScreenCandidate]
     /// `rawContent` 可以是官方嵌入链接、公开观看链接或裸 id；白名单校验由实现负责。
     ///
     /// 异步的：实现会等一小段时间（≤3 s）看嵌入页是**立刻**失败（网络不通 / 4xx /
@@ -230,10 +250,15 @@ final class ResidentScreenTools {
         return [
             WorldScreenTool(
                 name: Self.playName,
-                description: "让这个空间里的一台电视播放官方嵌入页（YouTube / 哔哩哔哩 / Twitch）。"
-                    + "参数 url 接受官方嵌入链接、公开观看链接或视频 id。"
-                    + "只说「放个视频」而没给内容时，会返回 insufficient_input（信息不足，不是失败），"
-                    + "这时应当问用户要一个链接。不许抓流、不许绕过登录或地区限制。",
+                description: "把这个空间里的一台电视打开、放用户给的视频链接。"
+                    + "用户说「用电视放这个链接」「投到电视上」「电视播放这个链接」时就用它，"
+                    + "url 直接给用户给的那个链接就行（YouTube、哔哩哔哩、Twitch 的官方嵌入链接、"
+                    + "公开观看链接或视频 id 都接受）。"
+                    + "空间里只有一台电视时可以省略 object_id。"
+                    + "放不了时回执会说明是哪一件物件、为什么放不了、该怎么改，把这三样转告用户。"
+                    + "只说「放个视频」而没给内容时会返回 insufficient_input（信息不足，不是失败），"
+                    + "这时问用户要一个链接。"
+                    + "不许抓流、不许绕过登录或地区限制。",
                 inputSchema: Self.schema(
                     properties: [
                         "object_id": [
@@ -253,7 +278,8 @@ final class ResidentScreenTools {
             ),
             WorldScreenTool(
                 name: Self.stopName,
-                description: "关掉一台电视（停止播放并回到黑屏）。object_id 省略时作用于唯一的那一台。",
+                description: "关掉这个空间里的一台电视：停止播放并回到黑屏。"
+                    + "用户说「关掉电视」「别放了」时用它。object_id 省略时关掉唯一的那一台。",
                 inputSchema: Self.schema(
                     properties: ["object_id": ["type": "string", "description": "哪一台电视。"]],
                     required: []
@@ -264,8 +290,10 @@ final class ResidentScreenTools {
             ),
             WorldScreenTool(
                 name: Self.readName,
-                description: "读这个空间里所有电视的状态：几何出处（标定 / 推断 / 缺省）、出处原话、"
-                    + "宽高比、当前内容、播放状态、以及几何缺失的具名原因。只读，不改变任何东西。",
+                description: "先看这个空间里有没有带屏幕的物件、是哪一件、现在放的是什么。"
+                    + "用户让你放视频而你不确定哪一件能放时，先调它看一眼。"
+                    + "它会列出每件的屏幕范围是怎么来的、当前的视频和播放状态。"
+                    + "一件都没有时会说明是哪件物件还没被认成屏幕、以及怎么改。只读，不改变任何东西。",
                 inputSchema: Self.schema(properties: [:], required: []),
                 handle: { _, _ in Self.read(control: control) }
             ),
@@ -306,21 +334,51 @@ final class ResidentScreenTools {
 
     private static func read(control: any WorldScreenControlling) -> WorldScreenToolReply {
         let screens = control.listScreens()
+        // 「是哪一件」只能从**运行时注册表**来：`listScreens()` 是能被放的，候选是
+        // 看起来像屏幕但还没被认成屏幕的。两条都从 control 现取，一个字都不写死。
+        let candidates = control.unrecognizedScreenCandidates()
         guard !screens.isEmpty else {
             return reply(.needsInput(
-                "这个空间里没有电视。先在面板里把一件物件标定成屏幕，或生成一件电视。",
-                details: ["screens": "0"]
+                screenlessMessage(candidates),
+                details: [
+                    "screens": "0",
+                    "unrecognized": String(candidates.count),
+                    "unrecognized_ids": candidates.map(\.objectID).joined(separator: ","),
+                ]
             ))
         }
         // 只读工具**必须真的把状态带回去**：只报一个数量，agent 就拿不到
         // "这块屏的几何是猜的 / 现在放的是什么 / 失败原因是什么"这几件它要判断的事。
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "code": WorldScreenCommandOutcome.Code.ok.rawValue,
             "message": "读到 \(screens.count) 块屏幕。",
             "ok": true,
             "screens": screens.map(\.jsonObject),
         ]
+        // 已经被认成屏幕的之外还有"看起来像屏幕"的物件时，一并说清楚是哪几件 ——
+        // 否则居民只知道"有电视"，用户问"那台大的呢"就没有答案。
+        if !candidates.isEmpty {
+            payload["unrecognized"] = candidates.map(\.jsonObject)
+        }
         return reply(payload: payload, isError: false, code: WorldScreenCommandOutcome.Code.ok.rawValue)
+    }
+
+    /// 「这个空间里没有能放的屏幕」时给模型的**具名 + 可行动**答复。
+    ///
+    /// 三条纪律，缺一不可：
+    /// - 具名：说得出**是哪一件**物件还没被认成屏幕（名字与原因都来自运行时）；
+    /// - 可行动：说得出**怎么改**（名字里带上「电视」或「屏幕」，或换一件）；
+    /// - 不编：候选为空时就说"一件都没有"，绝不替用户认领一件。
+    private static func screenlessMessage(_ candidates: [WorldScreenCandidate]) -> String {
+        guard !candidates.isEmpty else {
+            return "这个空间里现在没有电视：没有一件物件被认成屏幕。"
+                + "先生成一件名字里带「电视」或「屏幕」的物件，它就会被认成屏幕。"
+        }
+        let named = candidates.prefix(3)
+            .map { "「\($0.displayName)」（\($0.reason)）" }
+            .joined(separator: "；")
+        return "这个空间里现在没有电视。"
+            + "这些物件还没被认成屏幕：\(named)。把名字里带上「电视」或「屏幕」，或者换一件。"
     }
 
     // MARK: 回执编码
@@ -377,5 +435,15 @@ extension WorldScreenSnapshot {
         if let contentURL { object["content_url"] = contentURL }
         if let occlusionText { object["occlusion"] = occlusionText }
         return object
+    }
+}
+
+extension WorldScreenCandidate {
+    /// `read_screen` 载荷里"还没被认成屏幕"的那一条。
+    ///
+    /// 键名与屏幕快照分开（`object_id` 而不是 `screen_id`）：它不是一块屏幕，
+    /// 消费方不该把它当屏幕读 —— 这正是"不编"在载荷形状上的落地。
+    var jsonObject: [String: Any] {
+        ["object_id": objectID, "name": displayName, "reason": reason]
     }
 }

@@ -23,10 +23,36 @@ enum WorldScreenResolution {
     static let minimumFaceArea: Float = 0.04
     /// "像一块板"的判据：最薄轴 / 最长轴。
     static let maximumPanelThicknessRatio: Float = 0.25
-    /// 推断出的屏幕相对该面留的边框比例（面板边框）。
-    static let panelInset: Float = 0.86
+    /// 推断出的屏幕相对该面**每边**留的边框余量，取该面**短边**的这个比例。
+    ///
+    /// 为什么不是"一个固定毫米数"，也不是一个把屏幕整体缩到某个百分比的常数
+    /// （真机 2026-10-02，用户原话「屏幕也没有 filled」）：
+    ///
+    /// 这一级是**推断**：手上只有这件道具的包围盒（`effectiveSize`），不知道它的边框
+    /// 在网格里有多宽。所以余量只能由**这一面自己的尺寸**派生 —— 于是三轴怎么变，
+    /// 余量同倍跟着变，屏幕占正面的比例与尺寸无关。固定毫米数做不到这一点：
+    /// 同一份 8.6 mm 在 0.862 m 高的电视上是 1%，在 0.34 m 高的小电视上就是 2.5%。
+    ///
+    /// 这里曾经是一个把屏幕缩到 **86%** 的常数（`panelInset = 0.86`，每边吃掉该轴的
+    /// 7%）。真机那台 `1443 × 862 × 302 mm` 的电视正面是 `1.443 × 0.862 m`，屏幕
+    /// 四边形却只有 `1.241 × 0.741 m`：左右各缩进 **101 mm**、上下各 **60 mm**，
+    /// 面积只占正面的 **73.96%** —— 截图里那块"缩在正面中间、还偏下的暗矩形"就是它。
+    /// 而这件机身的正面**就是屏幕本身**（参考图那张产品图里屏幕几乎顶到画幅边缘）。
+    static let bezelMarginFraction: Float = 0.01
     /// 屏幕面相对包围盒表面外移的一点点，避免与自身表面共面闪烁。
     static let surfaceOffset: Float = 0.001
+
+    /// 这一面**每边**该留的边框余量（米）。派生，不存 —— 于是"这块屏幕多大"仍然只有
+    /// `halfWidth/halfHeight` 一处定义，这里只是它唯一的推导入口。
+    ///
+    /// 取**短边**而不是各轴各按自己的比例：真实电视的边框是**等宽**的，四边留一样宽
+    /// 最像一台电视。`2 × 余量` 恒小于短边（1% ≪ 100%），四边形不可能被余量吃成负的。
+    ///
+    /// 于是覆盖率有一个与尺寸无关的下界：两条边各自留下的比例都 ≤ 2%（短边那一侧恰好
+    /// 2%，长边那一侧更小），最坏是正方形那一份 `0.98 × 0.98 = 96.04%`。
+    static func bezelMargin(faceWidth: Float, faceHeight: Float) -> Float {
+        min(faceWidth, faceHeight) * bezelMarginFraction
+    }
 
     /// 缺省的"一台通用电视"（米）。只在 `allowsDefault` 为真时使用。
     static let defaultWidth: Float = 1.10
@@ -100,9 +126,16 @@ enum WorldScreenResolution {
     ) -> WorldScreenDefinition {
         let quad = face.quad(size: size)
         let area = face.area(size: size)
+        let extents = face.extents(size: size)
+        let margin = WorldScreenResolution.bezelMargin(
+            faceWidth: extents.x, faceHeight: extents.y
+        )
+        // 一整条字面量（不拆成 `+`）：`test-user-facing-copy.swift` 的豁免是按**字面量**
+        // 匹配的，拆开之后后半句会以"新文案"的身份进入用户可见那一档 —— 但它不是面板文案，
+        // 它是标定工程注记（面板那一句在 `ScreenPanelCopy.screenRangeLine`）。
         let note = String(
-            format: "由最大平坦面推断：法向 %@，面积 %.3f m²（%.2f m × %.2f m）。不是标定值，可在面板里改。",
-            face.normalName, area, quad.width, quad.height
+            format: "由最大平坦面推断：法向 %@，面积 %.3f m²（%.2f m × %.2f m），屏幕铺满这一面、四边各留边框 %.0f mm。不是标定值，可在面板里改。",
+            face.normalName, area, quad.width, quad.height, margin * 1000
         )
         return WorldScreenDefinition(
             objectID: objectID, source: .inferred, quad: quad, note: note
@@ -183,12 +216,19 @@ enum WorldScreenFace: String, Equatable, Sendable {
         }
     }
 
-    func area(size: SIMD3<Float>) -> Float {
+    /// 这一面的**宽 × 高**（米）。它是"这一面多大"的**唯一**一处说法：面积由它派生，
+    /// 屏幕四边形与它的边框余量也都读它 —— 三处不可能各说各的尺寸。
+    func extents(size: SIMD3<Float>) -> SIMD2<Float> {
         switch self {
-        case .front: size.x * size.y
-        case .side: size.z * size.y
-        case .top: size.x * size.z
+        case .front: SIMD2(size.x, size.y)
+        case .side: SIMD2(size.z, size.y)
+        case .top: SIMD2(size.x, size.z)
         }
+    }
+
+    func area(size: SIMD3<Float>) -> Float {
+        let extents = extents(size: size)
+        return extents.x * extents.y
     }
 
     /// 这一面在本体坐标系里的屏幕四边形。
@@ -196,28 +236,37 @@ enum WorldScreenFace: String, Equatable, Sendable {
     /// 局部包围盒的约定来自生产：`WorldObjectState.generatedCollisionVolume` 把盒心放在
     /// `position.y + size.y/2`、半长是 `size/2`，也就是 **x/z 以落地点为中心、y 从 0 到 size.y**。
     /// 屏幕作为"物件上的一个面"必须与它同口径，否则屏幕会浮在半空。
+    ///
+    /// **铺满这一面**：半宽高 = 该面半尺寸 − `bezelMargin`（四边等宽的一圈边框余量）。
+    /// 这里曾经是"该面半尺寸 × 0.86"（每边吃掉该轴 7%），真机上就是那块缩在正面中间的
+    /// 暗矩形 —— 屏幕与它所在的**面**之间只该差一圈边框，不该差 14%。
+    /// 四角仍然**派生**（`WorldScreenQuad.corners`），这里只给 中心 / 朝向 / 半宽高。
     func quad(size: SIMD3<Float>) -> WorldScreenQuad {
+        let extents = extents(size: size)
+        let margin = WorldScreenResolution.bezelMargin(
+            faceWidth: extents.x, faceHeight: extents.y
+        )
         switch self {
         case .front:
-            WorldScreenQuad(
+            return WorldScreenQuad(
                 center: SIMD3<Float>(0, size.y / 2, size.z / 2 + WorldScreenResolution.surfaceOffset),
                 yaw: 0, pitch: 0,
-                halfWidth: size.x / 2 * WorldScreenResolution.panelInset,
-                halfHeight: size.y / 2 * WorldScreenResolution.panelInset
+                halfWidth: extents.x / 2 - margin,
+                halfHeight: extents.y / 2 - margin
             )
         case .side:
-            WorldScreenQuad(
+            return WorldScreenQuad(
                 center: SIMD3<Float>(size.x / 2 + WorldScreenResolution.surfaceOffset, size.y / 2, 0),
                 yaw: .pi / 2, pitch: 0,
-                halfWidth: size.z / 2 * WorldScreenResolution.panelInset,
-                halfHeight: size.y / 2 * WorldScreenResolution.panelInset
+                halfWidth: extents.x / 2 - margin,
+                halfHeight: extents.y / 2 - margin
             )
         case .top:
-            WorldScreenQuad(
+            return WorldScreenQuad(
                 center: SIMD3<Float>(0, size.y + WorldScreenResolution.surfaceOffset, 0),
                 yaw: 0, pitch: .pi / 2,
-                halfWidth: size.x / 2 * WorldScreenResolution.panelInset,
-                halfHeight: size.z / 2 * WorldScreenResolution.panelInset
+                halfWidth: extents.x / 2 - margin,
+                halfHeight: extents.y / 2 - margin
             )
         }
     }

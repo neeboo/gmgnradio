@@ -1,5 +1,7 @@
 // ---------------------------------------------------------------------------
-// 许愿任务 = **一条条消息**（用户 2026-10-02：「许愿任务变成消息提示，不要单独做窗口了」）。
+// 许愿任务 = **一条条系统消息**，出口是**收件箱**（用户 2026-10-02 原话：
+// 「许愿任务变成消息提示，不要单独做窗口了」＋「这个任务消息变成了 append 到对话了……
+// 如果不放，就放收件箱啊」）。
 //
 // 这一份钉七件事，**每一条都带注入负对照**（注入回内存 / 临时副本必须 FAIL）：
 //
@@ -7,9 +9,11 @@
 //    许愿任务列表标识（`resident.wish-tasks` / `resident.wish-task.`），
 //    `WishMachineTaskStatusView` 里也没有 `state.tasks` / `ForEach` / 「许愿任务」标题。
 //    注入「把列表装回去」⇒ FAIL。
-// 2. **消息通道才是出口**：宿主把 `wishTaskMessageFeed` 的消息接进**既有的**对话
-//    通道（`ResidentChatTranscriptLine`，`speaker: .notice`），不新造面板/窗口。
-//    注入「把这条接线摘掉」⇒ FAIL。
+// 2. **出口是收件箱、不再是对话记录**：宿主把消息经**既有**的收件箱入口
+//    （`residentSystemInboxStore.apply` / `kind: "wish.task"`）落库，而
+//    `publishResidentTranscript` 里**一个**许愿任务消息的痕迹都没有（`wishTaskMessageFeed` /
+//    `speaker: .notice` / `ResidentChatTranscriptLine`）。注入「追加回对话」或
+//    「摘掉收件箱那条线」⇒ 两个方向都必须 FAIL。
 // 3. **状态变化各发一条、同一状态不重复**（幂等）：真源码编译起来驱动。
 //    注入「去掉去重」⇒ FAIL。
 // 4. **失败消息不自动消失**（留到用户处理完）：用的是**唯一投影**的
@@ -84,13 +88,41 @@ func panelViolations(overlay: String, repositorySources: [String: String]) -> [S
 
 func channelViolations(app: String) -> [String] {
     var out: [String] = []
-    for token in ["wishTaskMessageFeed.sync(", "wishTaskMessageFeed.messages",
-                  "message.transcriptTurnID", "message.text"] where !app.contains(token) {
-        out.append("消息通道没接上：宿主里找不到「\(token)」—— 许愿任务的状态变化必须进既有的对话通道")
+    // ① 出口必须是**既有**的收件箱入口：条目自带时间戳、按时间倒序、未读由它自己算。
+    for token in ["residentSystemInboxStore.apply(", "kind: \"wish.task\"",
+                  "residentSystemInboxStore.restore(", "pushSystemInboxSnapshots()"]
+    where !app.contains(token) {
+        out.append("许愿任务的状态消息没有走收件箱：宿主里找不到「\(token)」")
     }
-    // 出口必须是**既有**的对话记录行（`speaker: .notice`），不是新造的面板/窗口。
-    if !app.contains("speaker: .notice") {
-        out.append("消息没有走既有对话通道（找不到 speaker: .notice）")
+    guard let push = declaration(app, "private func pushWishTaskMessages(") else {
+        out.append("抽不出 `pushWishTaskMessages` —— 那是把唯一投影的消息送进收件箱的那一处")
+        return out
+    }
+    // ② 送进收件箱的那一条必须是唯一投影的消息（既有幂等键 + 既有一句话模板），
+    //    不是在这里另拼一份文案、也不是退回任务行那条原始字段通道（那会把字段名/原因
+    //    原样带进用户可见的那一行）。
+    for token in ["wishTaskMessageFeed.sync(", "message.id", "message.text",
+                  "title: message.text", "taskID: jobID.uuidString",
+                  "residentSystemInboxStore.apply("] where !push.contains(token) {
+        out.append("收件箱那条出口没有用唯一投影的消息：`pushWishTaskMessages` 里找不到「\(token)」")
+    }
+    for token in ["task.detail", "task.status"] where push.contains(token) {
+        out.append("收件箱那一行的文案又回到任务行的原始字段了：`pushWishTaskMessages` 里还有「\(token)」")
+    }
+    // ③ 出口**不是**对话记录：那里不许再追加许愿任务消息（用户 2026-10-02 真机原话）。
+    guard let publish = declaration(app, "private func publishResidentTranscript()") else {
+        out.append("抽不出 `publishResidentTranscript` —— 那是「对话里只有人和居民」的宿主")
+        return out
+    }
+    for token in ["wishTaskMessageFeed", "speaker: .notice", "ResidentChatTranscriptLine"]
+    where publish.contains(token) {
+        out.append("对话记录里又追加了许愿任务消息：`publishResidentTranscript` 里还有「\(token)」"
+            + " —— 系统通知不许 append 进对话，它该走收件箱（跟着收件箱的时间走）")
+    }
+    // ④ 消息的类别只有一个：同一个收件箱条目不许被两处按两套文案写（"两边都放一半"）。
+    let appliers = app.components(separatedBy: "residentSystemInboxStore.apply(").count - 1
+    if appliers != 1 {
+        out.append("投递许愿任务消息的写入者有 \(appliers) 处 —— 收件箱条目只许有一个写入者")
     }
     return out
 }
@@ -121,7 +153,7 @@ guard cleanChannelFailures.isEmpty else {
     for failure in cleanChannelFailures { print("FAIL: " + failure) }
     exit(1)
 }
-print("PASS[message-channel]: 状态变化走既有的对话记录通道（ResidentChatTranscriptLine / speaker: .notice）")
+print("PASS[inbox-channel]: 状态变化走既有的收件箱入口（residentSystemInboxStore.apply / kind: wish.task），对话记录里零追加")
 
 // ---------------------------------------------------------------------------
 // 判据 1 / 2 的注入负对照（只在内存副本上做手术）
@@ -140,22 +172,51 @@ func injectWishTaskPanel(into overlay: String) -> String {
         """)
 }
 
-/// 把消息通道的接线摘掉 —— 状态变化于是没有出口。
-func injectDetachedChannel(into app: String) -> String {
-    app.replacingOccurrences(of: "wishTaskMessageFeed.sync(", with: "// 注入：出口摘掉\n            _ = (")
-        .replacingOccurrences(of: "wishTaskMessageFeed.messages", with: "[]")
+/// 注入回**旧行为**：把许愿任务消息又 append 到对话记录末尾（没有会话时间的那些行）。
+func injectTranscriptAppend(into app: String) -> String {
+    app.replacingOccurrences(
+        of: "        let lines = residentChatTranscript.lines()\n",
+        with: """
+                let lines = residentChatTranscript.lines() + wishTaskMessageFeed.messages.map { message in
+                    ResidentChatTranscriptLine(
+                        turnID: UUID(),
+                        speaker: .notice,
+                        text: message.text)
+                }
+        """)
+}
+
+/// 把收件箱那条出口摘掉 —— 状态变化于是哪里都没有出口。
+func injectDetachedInbox(into app: String) -> String {
+    app.replacingOccurrences(of: "residentSystemInboxStore.apply(", with: "// 注入：收件箱出口摘掉\n            _ = (")
+}
+
+/// 把收件箱那一行的文案退回任务行的**原始字段**（原因里带着字段名/数值的那种）。
+func injectRawFieldCopy(into app: String) -> String {
+    app.replacingOccurrences(of: "                title: message.text,\n",
+                             with: "                title: tasks.first?.status ?? \"\",\n")
+        .replacingOccurrences(of: "                taskID: jobID.uuidString,\n",
+                              with: "                taskID: jobID.uuidString, detail: task.detail ?? \"\",\n")
 }
 
 let panelInjection = ("把许愿任务列表装回去", injectWishTaskPanel(into: overlaySource), { (source: String) in
     panelViolations(overlay: source, repositorySources: repositorySources)
 }) as (String, String, (String) -> [String])
-let channelInjection = ("把消息出口摘掉", injectDetachedChannel(into: appSource), { (source: String) in
+let appendInjection = ("把许愿任务消息追加回对话", injectTranscriptAppend(into: appSource), { (source: String) in
+    channelViolations(app: source)
+}) as (String, String, (String) -> [String])
+let detachedInjection = ("把收件箱那条出口摘掉", injectDetachedInbox(into: appSource), { (source: String) in
+    channelViolations(app: source)
+}) as (String, String, (String) -> [String])
+let rawFieldInjection = ("把收件箱那一行的文案退回原始字段", injectRawFieldCopy(into: appSource), { (source: String) in
     channelViolations(app: source)
 }) as (String, String, (String) -> [String])
 
 for (name, injected, violations, pristine) in [
     (panelInjection.0, panelInjection.1, panelInjection.2, overlaySource),
-    (channelInjection.0, channelInjection.1, channelInjection.2, appSource)
+    (appendInjection.0, appendInjection.1, appendInjection.2, appSource),
+    (detachedInjection.0, detachedInjection.1, detachedInjection.2, appSource),
+    (rawFieldInjection.0, rawFieldInjection.1, rawFieldInjection.2, appSource)
 ] {
     check(injected != pristine, "注入负对照「\(name)」确实改到了源码副本")
     let injectedFailures = violations(injected)
@@ -413,9 +474,10 @@ if let unnamed = WishMachineTaskMessageBuilder.message(unnamedRow) {
     expect(false, "没有名字的那一行也该有一条消息")
 }
 
-// ── 展示层的回合标识是**稳定派生**的，不是每次随机 ──
-expect(messages[0].transcriptTurnID == messages[0].transcriptTurnID, "同一条消息的回合标识稳定")
-expect(Set(messages.map(\.transcriptTurnID)).count == messages.count, "不同消息的回合标识互不相同")
+// ── 幂等键是**稳定派生**的（同一个状态每次同步都得到同一个 id）──
+expect(messages[0].id == WishMachineTaskMessageBuilder.identifier(rows[0]),
+    "同一条消息的幂等键稳定：\(messages[0].id)")
+expect(Set(messages.map(\.id)).count == messages.count, "不同状态的幂等键互不相同")
 
 print(failures == 0 ? "PASS 许愿任务消息判据全部通过" : "FAIL 许愿任务消息判据有 \(failures) 条不通过")
 exit(failures == 0 ? 0 : 1)

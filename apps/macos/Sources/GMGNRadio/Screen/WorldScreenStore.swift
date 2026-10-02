@@ -348,6 +348,46 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
         return snapshots
     }
 
+    /// 「还没被认成屏幕的物件」——`read_screen` 回答「是哪一件」的唯一来源。
+    ///
+    /// 判据全部取自**运行时**：物件状态（`source.objectStates()`，与屏幕几何同一份输入）、
+    /// 名称判据（`WorldScreenEligibility`）与几何判据（`WorldScreenFaceInference.rejection`）。
+    /// 它**只报事实**：不让任何物件变成能放的屏幕，也不改任何状态。
+    ///
+    /// 只报"像一块板"的物件：把屋里每一件东西（斧头、椅子、零件）都说成"还没被认成屏幕"
+    /// 等于没有信息；像一块屏的那些才是用户可能指的那一件。
+    func unrecognizedScreenCandidates() -> [WorldScreenCandidate] {
+        rebuild()
+        var candidates: [WorldScreenCandidate] = []
+        for (objectID, state) in source.objectStates().sorted(by: { $0.key < $1.key }) {
+            guard state.isEnabled,
+                  definitions[objectID] == nil,
+                  issues[objectID] == nil else { continue }
+            let displayName = source.displayName(objectID)
+            if WorldScreenEligibility.isScreenCandidate(objectID: objectID, displayName: displayName) {
+                // 名字像电视却不在上面两个集合里：这一帧的世界状态与几何对不上
+                // （刚被收回 / 刚换过）。如实说"没读出来"，不硬猜一个原因。
+                candidates.append(WorldScreenCandidate(
+                    objectID: objectID, displayName: displayName,
+                    reason: "名字像电视，但这一帧没读出可用的屏幕范围"
+                ))
+                continue
+            }
+            guard let prop = state.generatedProp else { continue }
+            let size = SIMD3<Float>(
+                prop.effectiveSize.x, prop.effectiveSize.y, prop.effectiveSize.z
+            )
+            guard size.x > 0, size.y > 0, size.z > 0,
+                  WorldScreenFaceInference.rejection(size: size, objectID: objectID) == nil
+            else { continue }
+            candidates.append(WorldScreenCandidate(
+                objectID: objectID, displayName: displayName,
+                reason: "这块面像一块屏幕，但名字里没有「电视」或「屏幕」"
+            ))
+        }
+        return candidates
+    }
+
     private func makeSnapshots() -> [WorldScreenSnapshot] {
         var ids = Set(definitions.keys)
         ids.formUnion(issues.keys)
@@ -400,11 +440,31 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
     func playScreen(objectID: String?, rawContent: String) async -> WorldScreenCommandOutcome {
         rebuild()
         guard let target = resolveTarget(objectID) else {
+            // 放不了时**具名且可行动**：「是哪一件还没被认成屏幕」+「怎么改」。
+            // 一句笼统的"没有电视"会让居民只能回一句"我做不到"（真机 2026-10-02 现场）。
+            let candidates = unrecognizedScreenCandidates()
+            let named = candidates.prefix(3)
+                .map { "「\($0.displayName)」（\($0.reason)）" }
+                .joined(separator: "；")
+            let message: String
+            if let objectID {
+                message = "这个空间里没有「\(objectID)」这台电视。"
+                    + (candidates.isEmpty
+                        ? "现在没有一件物件被认成屏幕。"
+                        : "看起来像屏幕的有：\(named)，但它们还没被认成屏幕。")
+            } else if candidates.isEmpty {
+                message = "这个空间里现在没有电视：没有一件物件被认成屏幕。"
+                    + "先生成一件名字里带「电视」或「屏幕」的物件，它就会被认成屏幕。"
+            } else {
+                message = "这个空间里现在没有电视。"
+                    + "这些物件还没被认成屏幕：\(named)。把名字里带上「电视」或「屏幕」，或者换一件。"
+            }
             return .failure(
-                .screenNotFound,
-                objectID == nil
-                    ? "这个空间里没有电视。先生成一件电视，或者在面板里把一件物件指定成电视。"
-                    : "这个空间里没有「\(objectID ?? "")」这台电视。"
+                .screenNotFound, message,
+                details: [
+                    "unrecognized": String(candidates.count),
+                    "unrecognized_ids": candidates.map(\.objectID).joined(separator: ","),
+                ]
             )
         }
         if let issue = issues[target] {

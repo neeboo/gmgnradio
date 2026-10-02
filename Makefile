@@ -379,15 +379,23 @@ _test-harnesses:
 	# 记录不许当可见性判据。四条判据 + 四条注入负对照（永久信记录 / 无条件清 /
 	# 两者分叉 / 手拼几何被接回产品路径），每条都实测会红；注入只改内存副本，跑完校验 sha256。
 	swift tools/test-wish-machine-output-rederivation.swift
-	# 许愿任务 = **一条条消息**（用户 2026-10-02：「许愿任务变成消息提示，不要单独做窗口了」）：
-	# 产品路径上零个许愿任务窗口/列表（210 个源文件扫过），状态变化各发一条、同一状态不重复
-	# （幂等），失败待办**不自动消失**（判据是唯一投影的 `OwnershipDisplayState.failed`；不是
-	# 第二份真相），其它终态按既有窗口过期，文案是人话（无 key=value / UUID / 路径 / 内部字段名 /
-	# 省略号堆叠）。八条注入负对照全部必须 FAIL。
+	# 许愿任务 = **一条条系统消息，出口是收件箱**（用户 2026-10-02：「许愿任务变成消息提示，
+	# 不要单独做窗口了」＋「这个任务消息变成了 append 到对话了……如果不放，就放收件箱啊」）：
+	# 产品路径上零个许愿任务窗口/列表（全仓源文件扫过），对话记录里零追加
+	# （`publishResidentTranscript` 里没有 `wishTaskMessageFeed` / `speaker: .notice`），消息经
+	# **既有**收件箱入口（`residentSystemInboxStore.apply` / `kind: wish.task`）落库且只有**一个**
+	# 写入者，状态变化各发一条、同一状态不重复（幂等），失败待办**不自动消失**（判据是唯一投影的
+	# `OwnershipDisplayState.failed`；不是第二份真相），其它终态按既有窗口过期，文案是人话
+	# （无 key=value / UUID / 路径 / 内部字段名 / 省略号堆叠）。注入负对照（装回列表 / 追加回对话 /
+	# 摘掉收件箱出口 / 去重 / 过期 / 旧文案）全部必须 FAIL。
 	swift tools/test-wish-task-messages.swift
 	# 「有事才出现、了结后收起」的判据跟着消息走（`WishMachineTaskPrompt`，只依赖 Foundation）：
 	# 规则体**逐字抽出来**真的编译起来驱动；注入「常驻」/「把许愿任务列表装回视图」⇒ FAIL。
 	swift tools/test-wish-task-panel-when-shown.swift
+	# 许愿任务消息的出口现在是**共享收件箱**，所以"带时间戳 / 按时间倒序 / 同一状态只发一次 /
+	# 未读角标跟着涨清 / 终态 30 秒锚点"全都成了这条通路的判据。这一份 `test-resident-system-inbox.swift`
+	# 一直都在仓库里、也一直绿着，却**从来没挂进来过** —— 通路改到它身上之后，它必须真的跑。
+	swift tools/test-resident-system-inbox.swift
 	swift tools/test-resident-system-inbox-window.swift
 	swift tools/test-resident-prop-collision-proxy.swift
 	swift tools/test-resident-state-convergence.swift

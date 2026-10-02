@@ -104,12 +104,19 @@ let wishTaskMessageSource = try String(contentsOfFile:
     .split(separator: "\n", omittingEmptySubsequences: false)
     .filter { !$0.hasPrefix("import ") }
     .joined(separator: "\n")
+// 许愿任务的状态消息**落进收件箱**：投递类型逐字抽取生产声明（`ResidentSystemDelivery`，
+// 只依赖 Foundation），不在 harness 里手抄一份形状 —— 宿主 `pushWishTaskMessages` 编的
+// 就是生产里那一个。
+let inboxSource = try String(contentsOfFile:
+    "apps/macos/Sources/GMGNRadio/Presence/ResidentSystemInbox.swift", encoding: .utf8)
+let deliverySource = sourceDeclaration(inboxSource, "public struct ResidentSystemDelivery: Equatable, Sendable {")
 
 let program = #"""
 import Foundation
 import Observation
 \#(ownershipProjectionSource)
 \#(wishTaskMessageSource)
+\#(deliverySource)
 \#(sizeIntentSource)
 enum FixtureError: Error { case failed }
 enum WishMachineError: Error { case unknownAttachment }
@@ -391,14 +398,14 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
     func wishMachinePromptContext(_ world: ResidentWorldContext) -> String { "" }
     func reconcileResidentWishPlacements(_ world: ResidentWorldContext) throws {}
     /// 生产里这两条是**呈现侧管道**：把系统信箱未读数推给两个表面、把许愿任务提示
-    /// 按代次投递给统一状态域。本 harness 断言的是**持久域**那一侧（MessageStore 的
+    /// 按代次投递给两个面板。本 harness 断言的是**持久域**那一侧（MessageStore 的
     /// subscriptions / acknowledged 由被抽取的方法直接驱动），不覆盖这两条管道，
     /// 所以只补签名可编译，不假装覆盖其行为。
     var wishTaskPromptGeneration = 0
     func pushSystemInboxSnapshots() {}
-    /// 生产里这条先落统一状态域（system inbox）再投影到两个表面。本 harness 断言的是
-    /// 两个表面看到同一份持久任务，不覆盖 inbox 落库，所以只按**同一个 tasks 值**
-    /// 同步投影到两个面板 —— 不假装覆盖 inbox 那条管道。
+    /// 生产里这条只把**同一个 tasks 值**投影到两个表面（收件箱那一份由
+    /// `pushWishTaskMessages` 送，见下）。本 harness 断言的是两个表面看到同一份持久任务，
+    /// 所以在这里按同一个值同步投影 —— 不假装覆盖收件箱那条管道。
     func pushWishTaskPrompts(_ tasks: [WishMachineTaskPresentation], worldID: String, scope: String) {
         wishTaskPromptGeneration += 1
         stageWindowController?.setWishMachineTasks(tasks)
@@ -407,24 +414,31 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
     /// 许愿任务消息的出口状态：**真源码** `WishMachineTaskMessageFeed`（生产里就是
     /// `GMGNRadioApp.wishTaskMessageFeed`）。抽取出来的 `pushWishTaskMessages` 直接驱动它。
     private var wishTaskMessageFeed = WishMachineTaskMessageFeed()
-    /// 生产里到期锚点来自共享系统收件箱（`ResidentSystemInboxStore.promptExpiry`，终态后
-    /// 30 秒）。本 harness 不落收件箱 ⇒ 锚点恒为 nil（= 投影说还没了结）。「失败不自动消失 /
-    /// 其它终态按既有窗口过期」这两条由 tools/test-wish-task-messages.swift 用真规则逐条驱动。
+    /// 生产里这条的出口是**共享系统收件箱**（`ResidentSystemInboxStore.apply`，终态后 30 秒
+    /// 的锚点也由它给）。本 harness 断言的是两个面板看到同一份持久任务、以及消息那一侧
+    /// 的状态机，不建模收件箱落库，所以这里只补**同签名**的两条管道（restore / apply）：
+    /// 时间戳、排序、未读计数、幂等都在收件箱那一侧，由
+    /// tools/test-resident-system-inbox.swift 与 tools/test-wish-task-messages.swift
+    /// 用真规则逐条驱动 —— 不在这里假装覆盖。
+    @MainActor
     final class ResidentSystemInboxStoreStub {
         func promptExpiry(taskKey: String, worldID: String, residentScope: String) -> Date? { nil }
+        func restore(worldID: String, residentScope: String) async {}
+        @discardableResult
+        func apply(_ delivery: ResidentSystemDelivery, worldID: String, residentScope: String) async -> Bool { true }
     }
     let residentSystemInboxStore = ResidentSystemInboxStoreStub()
     /// 生产里这条从**权威世界状态**投影出唯一投影的输入（jobs ∪ 世界物件）。本 harness
-    /// 断言的是消息通道/呈现那一侧，不建模世界文档 ⇒ 按**同一个签名**返回空事实；宿主真的
-    /// 把消息接进既有对话通道（`ResidentChatTranscriptLine` / `speaker: .notice`）由
+    /// 断言的是消息/呈现那一侧，不建模世界文档 ⇒ 按**同一个签名**返回空事实；宿主真的
+    /// 把消息送进**既有收件箱**（`residentSystemInboxStore.apply`）由
     /// tools/test-wish-task-messages.swift 判据 2 逐字钉住。
     func residentPropWishFacts(worldID: String, context: World) -> (facts: [OwnershipRowFacts], order: [String: Int]) {
         ([], [:])
     }
-    /// 生产里这条把最近对话 + 许愿任务消息推给两个聊天表面。本 harness 的两个面板是呈现
-    /// 替身（不建模转录行），所以与 `pushSystemInboxSnapshots` 同一个理由：只补呈现管道签名，
-    /// 不假装覆盖它 —— 消息本身仍由上面抽取的 `pushWishTaskMessages`（真源码）驱动，出口
-    /// 形状由 tools/test-wish-task-messages.swift 钉。
+    /// 生产里这条把最近对话推给两个聊天表面（**只有人和居民**，许愿任务消息不在里面）。
+    /// 本 harness 的两个面板是呈现替身（不建模转录行），所以与 `pushSystemInboxSnapshots`
+    /// 同一个理由：只补呈现管道签名，不假装覆盖它 —— 消息出口的形状由
+    /// tools/test-wish-task-messages.swift 钉。
     func publishResidentTranscript() {}
     \#(methods)
     func refresh() async { await refreshWishMachine() }

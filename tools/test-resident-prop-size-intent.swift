@@ -529,7 +529,9 @@ func readRuntimeSource(_ name: String) -> String? {
 /// 三轴契约的接线违规项。空数组 = 接线完整。
 func threeAxisContractProblems(app: String, descriptor: String, renderer: String,
                                placement: String, editor: String, policy: String,
-                               tools: String, contract: String) -> [String] {
+                               tools: String, contract: String,
+                               tray: String = "", coordinator: String = "",
+                               attachment: String = "") -> [String] {
     var problems: [String] = []
     // (a) 契约语义：三轴那一份**就是**用户给的三个数。
     if !policy.contains("return Resolution(size: target, scales: scales, basis: .dimensions") {
@@ -593,6 +595,38 @@ func threeAxisContractProblems(app: String, descriptor: String, renderer: String
     if !app.contains("case .unrealizable:") {
         problems.append("(e2) 三轴意图落不了地时没有可见说明（会静默退回单轴等比）")
     }
+    // (f) **四条路径读同一份尺寸**：预览 / 已摆 / 手持 走 `ResidentPropRenderDescriptor.targetSizeMeters`
+    //     （世界里那一份 `effectiveSize`），托盘走 `WishMachineOutputRenderer` 里**同一个裁决**
+    //     `dimensionsVerdict`。任何一条退回等比 ⇒ 画出来的是网格自己的形状：真机那台电视的网格是
+    //     个 1.0079 × 0.6287 × 1.0079 的方盒子，等比之后就是 1.3815 × 0.862 × 1.3815 的**厚方块**
+    //     （进深与宽度同量级）——正是用户 2026-10-02 说的「厚度不对啊」。
+    if !renderer.contains("targetSizeMeters: held.targetSizeMeters") {
+        problems.append("(f) 手持那一件没有把三轴目标带进渲染描述符"
+            + "（找不到 `targetSizeMeters: held.targetSizeMeters`）⇒ 手里退回等比厚方块")
+    }
+    if !attachment.contains("let scaleValues = perAxis.map {") {
+        problems.append("(f) 手持的缩放只剩一份等比（找不到 `let scaleValues = perAxis.map {`）"
+            + "⇒ 地上的电视是薄板、手里那块又变回厚方块")
+    }
+    if !tray.contains("case let .exact(exact) = WorldPropSizePolicy.dimensionsVerdict(") {
+        problems.append("(f) 托盘预览没有读**同一个裁决** `dimensionsVerdict`：三个数会只剩最长边")
+    }
+    if !tray.contains("resolvedSize = exact.size") {
+        problems.append("(f) 托盘预览没把裁决出来的三个数记下来（找不到 `resolvedSize = exact.size`）")
+    }
+    if !tray.contains("targetHeight: resolvedHeight, targetSize: resolvedSize, outlet: outlet") {
+        problems.append("(f) 托盘放置矩阵没有拿到三轴目标"
+            + "（找不到 `targetHeight: resolvedHeight, targetSize: resolvedSize, outlet: outlet`）⇒ 托盘按等比画")
+    }
+    if !coordinator.contains("heightIsGenerationRequest: true, sizeIntent: job.sizeIntent") {
+        problems.append("(f) 托盘描述符没有把尺寸意图带下去（找不到 "
+            + "`heightIsGenerationRequest: true, sizeIntent: job.sizeIntent`）")
+    }
+    // (f2) 托盘与已摆共用**同一份**逐轴实现（`WishMachineOutputPlacement.transform`）：那一条主线
+    //      在，三轴才可能在两条路上都成立。它被关掉 ⇒ 托盘只剩等比。
+    if !descriptor.contains("if let targetSize, WorldPropSizePolicy.uniformFactor(from: extent, to: targetSize) == nil {") {
+        problems.append("(f2) `WishMachineOutputPlacement.transform` 的逐轴分支没了：托盘会按等比画")
+    }
     return problems
 }
 
@@ -634,6 +668,22 @@ let threeAxisContractInjections: [(name: String, file: String, old: String, new:
     ("silent-unrealizable", "app",
      "case .unrealizable:",
      "case .unrealizableDisabled:"),
+    // (f) 托盘预览退回**等比**：那一整条逐轴分支被关掉 ⇒ 用户看到的就是网格自己的厚方块。
+    ("tray-uniform", "descriptor",
+     "if let targetSize, WorldPropSizePolicy.uniformFactor(from: extent, to: targetSize) == nil {",
+     "if let targetSize, perAxisDisabled {"),
+    // (f) 托盘不再把裁决出来的三个数交给放置矩阵（各推一份尺寸）。
+    ("tray-drops-size", "tray",
+     "targetHeight: resolvedHeight, targetSize: resolvedSize, outlet: outlet",
+     "targetHeight: resolvedHeight, targetSize: nil, outlet: outlet"),
+    // (f) 手持那一件不再带三轴目标（地上是三轴、手里退回等比）。
+    ("held-drops-size", "renderer",
+     "targetSizeMeters: held.targetSizeMeters",
+     "targetSizeMeters: nil"),
+    // (f) 手持的缩放退回一份等比（`scaleValues` 不再逐轴）。
+    ("held-scale-uniform", "attachment",
+     "let scaleValues = perAxis.map {",
+     "let scaleValues = Optional<SIMD3<Float>>.none.map {"),
 ]
 
 func readThreeAxisContractSources() -> [String: String] {
@@ -641,6 +691,11 @@ func readThreeAxisContractSources() -> [String: String] {
     let appFiles = ["app": "App/GMGNRadioApp.swift",
                     "descriptor": "Presence/WishMachineOutputDescriptor.swift",
                     "renderer": "Presence/ResidentPropRenderer.swift",
+                    // 手持那一件的**逐轴缩放**那一行（`PropAttachmentMatrix.transform`）。
+                    "attachment": "Presence/PropAttachment.swift",
+                    // 托盘那一条路：`WishMachineOutputRenderer`（画）+ `WishMachineCoordinator`（造描述符）。
+                    "tray": "Presence/WishMachineOutputRenderer.swift",
+                    "coordinator": "Presence/WishMachineCoordinator.swift",
                     "placement": "Presence/ResidentPropPlacementService.swift",
                     "editor": "Presence/ResidentPropEditorState.swift",
                     "tools": "Agent/ResidentWishMachineTools.swift",
@@ -661,7 +716,9 @@ func threeAxisContractIssues(_ files: [String: String]) -> [String] {
     threeAxisContractProblems(app: files["app"] ?? "", descriptor: files["descriptor"] ?? "",
                               renderer: files["renderer"] ?? "", placement: files["placement"] ?? "",
                               editor: files["editor"] ?? "", policy: files["policy"] ?? "",
-                              tools: files["tools"] ?? "", contract: files["contract"] ?? "")
+                              tools: files["tools"] ?? "", contract: files["contract"] ?? "",
+                              tray: files["tray"] ?? "", coordinator: files["coordinator"] ?? "",
+                              attachment: files["attachment"] ?? "")
 }
 
 let threeAxisFiles = readThreeAxisContractSources()
@@ -1491,6 +1548,94 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
   // 三轴那一档**也不许**退化成单轴：`axis=longest` 只兑现已一维，两者必须给出不同的 `size`。
   check(swordOne.map { $0.size != exactTarget } ?? true,
       "三轴与单轴必须给出不同的 world size（否则三轴那一档只是在冒充最长边）")
+
+  // ══ 断言 11（行为）：**画出来的三个轴逐轴等于用户给的三个数**（四条路径）══════════
+  //
+  // 用户 2026-10-02 原话「厚度不对啊」：真机那台电视的生成网格是个**方盒子**
+  // （逐顶点实测 1.007901 × 0.628927 × 1.007904），逐轴缩放之后必须是
+  // 1.443 × 0.862 × 0.302 的**薄板**；任何一条路径退回等比，画出来的就是
+  // 1.3815 × 0.862 × 1.3815 的厚方块（进深与宽度同量级）—— 正是用户看到的那一件。
+  //
+  // 判据不看源码字符串，看**画出来的包围盒**：把源网格 8 个角过一遍真正的放置矩阵。
+  // 已摆 / 预览 / 手持 走的是同一个 `ResidentPropPlacementMatrix`（手持那一件在
+  // `ResidentPropRenderer.renderDescriptor(for:)` 里换成 `ResidentPropRenderDescriptor`
+  // 之后走**同一行**渲染），托盘走 `WishMachineOutputPlacement`。
+  func renderedExtent(_ matrix: simd_float4x4) -> SIMD3<Float> {
+      var low = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+      var high = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+      for index in 0..<8 {
+          let corner = SIMD3<Float>(index & 1 == 0 ? measuredMeshMin.x : measuredMeshMax.x,
+                                    index & 2 == 0 ? measuredMeshMin.y : measuredMeshMax.y,
+                                    index & 4 == 0 ? measuredMeshMin.z : measuredMeshMax.z)
+          let projected = matrix * SIMD4<Float>(corner, 1)
+          let point = SIMD3<Float>(projected.x, projected.y, projected.z)
+          low = SIMD3<Float>(Swift.min(low.x, point.x), Swift.min(low.y, point.y), Swift.min(low.z, point.z))
+          high = SIMD3<Float>(Swift.max(high.x, point.x), Swift.max(high.y, point.y), Swift.max(high.z, point.z))
+      }
+      return high - low
+  }
+  func bboxIsThreeNumbers(_ extent: SIMD3<Float>) -> Bool {
+      abs(extent.x - exactTarget.x) <= 1e-4 && abs(extent.y - exactTarget.y) <= 1e-4
+          && abs(extent.z - exactTarget.z) <= 1e-4
+  }
+  // ── 已摆 / 预览（世界里那一份 `effectiveSize`）────────────────────────────────
+  if let placedMatrix = try? ResidentPropPlacementMatrix.transform(
+      minimum: measuredMeshMin, maximum: measuredMeshMax,
+      targetHeight: exactTarget.y, targetSize: exactTarget, position: .zero, yaw: 0) {
+      let extent = renderedExtent(placedMatrix)
+      print("实测 bbox[已摆/预览] = \(extent.x) × \(extent.y) × \(extent.z) 米"
+          + "（应为 \(exactTarget.x) × \(exactTarget.y) × \(exactTarget.z)；差 "
+          + "\(extent.x - exactTarget.x) / \(extent.y - exactTarget.y) / \(extent.z - exactTarget.z)）")
+      check(bboxIsThreeNumbers(extent),
+          "已摆/预览画出来的三个轴必须逐轴是 \(exactTarget)（实测 \(extent)）")
+  } else {
+      check(false, "已摆/预览那一件必须能算出放置矩阵（实测 nil ⇒ 画不出来）")
+  }
+  // ── 手持：手里那一件的**三个比例**是 `targetSize[i] / 摆正后跨度[i]`，不是一份等比 ──
+  //
+  // 手持的实际绘制走的是另一个矩阵（`PropAttachmentMatrix.transform` = 手骨位姿 × 标定 ×
+  // **逐轴缩放** × 抓握点），它的缩放三轴就是 `scaleValues`；那一段依赖 `PropAttachment.swift`
+  // 与真实骨骼位姿，本 harness 不编译它 —— 所以手持那一档由**源码判据**钉住（(f)：
+  // `targetSizeMeters: held.targetSizeMeters`、`targetSizeMeters: prop.effectiveSize)` 与
+  // `scaleValues = perAxis.map { … }` 三条都在，各有注入负对照）。
+  // 已摆 / 预览与手持读的是**同一组数字**（世界里那一份 `effectiveSize`），所以上面那次 bbox
+  // 实测对手持同样成立：它吃的就是 `targetSizeMeters` 这一个字段。
+  // ── 托盘（`WishMachineOutputPlacement`，还没登记的那一件）────────────────────
+  if let trayMatrix = try? WishMachineOutputPlacement.transform(
+      minimum: measuredMeshMin, maximum: measuredMeshMax,
+      targetHeight: exactTarget.y, targetSize: exactTarget, outlet: .zero) {
+      let extent = renderedExtent(trayMatrix)
+      print("实测 bbox[托盘] = \(extent.x) × \(extent.y) × \(extent.z) 米")
+      check(bboxIsThreeNumbers(extent), "托盘画出来的三个轴必须逐轴是 \(exactTarget)（实测 \(extent)）")
+  } else {
+      check(false, "托盘那一件必须能算出放置矩阵（实测 nil ⇒ 画不出来）")
+  }
+  // ── 注入负对照（数值）：把第三个数丢掉 / 走等比那一支 ⇒ 上面三条判据**必须**不成立 ──
+  if let uniformMatrix = try? ResidentPropPlacementMatrix.transform(
+      minimum: measuredMeshMin, maximum: measuredMeshMax,
+      targetHeight: exactTarget.y, targetSize: nil, position: .zero, yaw: 0) {
+      let extent = renderedExtent(uniformMatrix)
+      print("注入负对照 bbox[等比] = \(extent.x) × \(extent.y) × \(extent.z) 米")
+      check(!bboxIsThreeNumbers(extent),
+          "注入负对照：走等比那一支（`targetSize: nil`）必须与三个数不等 —— 实测却相等（\(extent)）")
+  } else {
+      check(false, "注入负对照：等比那一支必须算得出来（否则这条负对照空转）")
+  }
+  if let droppedMatrix = try? ResidentPropPlacementMatrix.transform(
+      minimum: measuredMeshMin, maximum: measuredMeshMax, targetHeight: exactTarget.y,
+      targetSize: WorldVector3(x: exactTarget.x, y: exactTarget.y, z: exactTarget.x),
+      position: .zero, yaw: 0) {
+      let extent = renderedExtent(droppedMatrix)
+      check(!bboxIsThreeNumbers(extent),
+          "注入负对照：把第三个数丢掉（z 借用 x）必须与三个数不等 —— 实测却相等（\(extent)）")
+  }
+  if let trayUniform = try? WishMachineOutputPlacement.transform(
+      minimum: measuredMeshMin, maximum: measuredMeshMax,
+      targetHeight: exactTarget.y, targetSize: nil, outlet: .zero) {
+      let extent = renderedExtent(trayUniform)
+      check(!bboxIsThreeNumbers(extent),
+          "注入负对照：托盘走等比必须与三个数不等 —— 实测却相等（\(extent)）")
+  }
 
   finish()
  }

@@ -5751,18 +5751,13 @@ final class AppDelegate:
 
     /// 把同一份快照推给两个聊天表面；它们是展示层，不做各自的回合判定。
     ///
-    /// 许愿任务的状态变化（用户 2026-10-02：「许愿任务变成消息提示，不要单独做窗口了」）
-    /// 就是**这条通道上的消息**：它们排在最近对话之后，作为 `speaker: .notice` 的行显示在
-    /// **与居民对话的地方**（舞台对话面板的「最近对话」、小窗展开后的完整记录）——
-    /// 没有许愿任务面板、没有新窗口。文案与去重全在 `WishMachineTaskMessageFeed` 里，
-    /// 这里只把消息翻成既有的行类型，一个字都不改。
+    /// 这条记录里**只有人和居民的回合**，按会话时间排。许愿任务的状态变化是**系统通知**，
+    /// 出口是收件箱（`residentSystemInboxStore`，见 `pushWishTaskMessages`），**不**追加在这里
+    /// —— 用户 2026-10-02 真机原话：「这个任务消息变成了 append 到对话了……如果不放，
+    /// 就放收件箱啊」。追加在末尾的行既没有会话时间、也不是谁说的话：它既不属于这段对话，
+    /// 也抢不到正确的位置，所以它换一条本来就为系统通知准备的通道。
     private func publishResidentTranscript() {
-        let lines = residentChatTranscript.lines() + wishTaskMessageFeed.messages.map { message in
-            ResidentChatTranscriptLine(
-                turnID: message.transcriptTurnID,
-                speaker: .notice,
-                text: message.text)
-        }
+        let lines = residentChatTranscript.lines()
         liveCamWindowController?.setResidentTranscript(lines)
         stageWindowController?.setResidentTranscript(lines)
     }
@@ -6661,26 +6656,20 @@ final class AppDelegate:
         }
     }
 
-    /// The inbox is the user-readable projection of formal wish state; the
-    /// on-site prompts take their 30-second terminal expiry from its anchors.
-    /// 投递逐条等待统一状态域持久化；同步的呈现路径不被 IPC 阻塞，带代次
-    /// 守卫避免旧一轮的迟到推送覆盖新一轮的任务列表。
+    /// 任务行（面板上那一份）的呈现：同一个 `tasks` 值推给两个表面。
+    ///
+    /// **收件箱那一份不在这里投递**：许愿任务的状态消息只有一个出口，就是
+    /// `pushWishTaskMessages`（它把唯一投影的消息落进收件箱）。这里再 apply 一次，
+    /// 同一件事就会有两个写入者、两句文案在同一个收件箱条目上互相覆盖 —— 那正是
+    /// "两边都放一半"。站内提示的 30 秒窗口仍然读收件箱那一个锚点（`promptExpiry`），
+    /// 所以锚点只有一个来源。
+    ///
+    /// 同步的呈现路径不被 IPC 阻塞，带代次守卫避免旧一轮的迟到推送覆盖新一轮的任务列表。
     private func pushWishTaskPrompts(_ tasks: [WishMachineTaskPresentation], worldID: String, scope: String) {
         wishTaskPromptGeneration += 1
         let generation = wishTaskPromptGeneration
         Task { @MainActor [weak self] in
             guard let self else { return }
-            // 每作用域恢复先于投递：CAS revision 校准后提交才不会自相冲突。
-            await self.residentSystemInboxStore.restore(worldID: worldID, residentScope: scope)
-            for task in tasks {
-                _ = await self.residentSystemInboxStore.apply(
-                    ResidentSystemDelivery(
-                        eventID: "\(task.id.uuidString)|\(task.status)|\(task.isTerminal)|\(task.detail ?? "")",
-                        taskID: task.id.uuidString, kind: "wish.task",
-                        title: task.title, status: task.status,
-                        detail: task.detail ?? "", terminal: task.isTerminal),
-                    worldID: worldID, residentScope: scope)
-            }
             guard self.wishTaskPromptGeneration == generation else { return }
             let projected = tasks.map { task -> WishMachineTaskPresentation in
                 var value = task
@@ -6694,7 +6683,8 @@ final class AppDelegate:
         }
     }
 
-    /// **许愿任务 = 消息**（用户 2026-10-02：「许愿任务变成消息提示，不要单独做窗口了」）。
+    /// **许愿任务的状态消息 = 收件箱里的一条系统通知**（用户 2026-10-02 真机原话：
+    /// 「这个任务消息变成了 append 到对话了……如果不放，就放收件箱啊」）。
     ///
     /// 每一次状态同步都喂一遍**唯一投影**现算出来的行；`WishMachineTaskMessageFeed` 负责
     /// 两件事，而且只有它负责：
@@ -6703,10 +6693,14 @@ final class AppDelegate:
     ///     其它终态按**既有**那一个窗口过期（`WishMachineTaskPrompt`，锚点就是共享收件箱
     ///     按 `updatedAt` 现算的到期时间）。
     ///
+    /// 出口是**既有**的收件箱入口（`residentSystemInboxStore.apply`）：条目自带 `updatedAt`
+    /// 与 `deliveredAt`、由收件箱自己按时间倒序、未读角标由**同一个** `unreadCount` 现算
+    /// —— 这里不新造计数、不新造时间、不 append。
+    ///
     /// 这里**不判断**任何状态：`ResidentOwnershipProjection.row` 给出 `state` 与那一句人话，
-    /// 宿主只是把它们读出来。通道也**不是新的**：消息由 `publishResidentTranscript` 与最近
-    /// 对话一起推给两个聊天表面（`ResidentChatTranscriptLine`）。
-    private func pushWishTaskMessages(worldID: String, scope: String) {
+    /// 宿主只是把它们读出来；终态那一个布尔也是从宿主**既有**的 `isTerminal` 读出来的，
+    /// 不是在这里另判一套。
+    private func pushWishTaskMessages(_ tasks: [WishMachineTaskPresentation], worldID: String, scope: String) {
         guard let context = livingWorldContext, context.manifest.worldID == worldID else { return }
         let rows = residentPropWishFacts(worldID: worldID, context: context)
             .facts.map(ResidentOwnershipProjection.row)
@@ -6723,9 +6717,41 @@ final class AppDelegate:
         }
         let before = wishTaskMessageFeed.messages
         wishTaskMessageFeed.sync(candidates, now: Date())
-        // 只有真的多了一条（或收起了一条）才重推对话，避免无谓的界面刷新。
+        // 只有真的多了一条（或收起了一条）才重投收件箱，避免无谓的落库与界面刷新。
         guard wishTaskMessageFeed.messages != before else { return }
-        publishResidentTranscript()
+        // 消息按**行**（`OwnershipRowKey.identifier`）产生，收件箱按 **job** 归并
+        // （`apply` 的 taskKey 就是 `job.id`）—— 这里用同一条 `identifier` 把两边对上，
+        // 收件箱项的标题与终态都从既有事实里读，一个字不另拼。
+        let rowsByTaskID = Dictionary(rows.map { ($0.key.identifier, $0) },
+                                      uniquingKeysWith: { first, _ in first })
+        let terminalByJob = Dictionary(tasks.map { ($0.id.uuidString, $0.isTerminal) },
+                                       uniquingKeysWith: { first, _ in first })
+        let deliveries: [ResidentSystemDelivery] = wishTaskMessageFeed.messages.compactMap { message in
+            guard let row = rowsByTaskID[message.taskID], let jobID = row.key.jobID else { return nil }
+            return ResidentSystemDelivery(
+                eventID: message.id,
+                taskID: jobID.uuidString,
+                kind: "wish.task",
+                // 文案就是那一句人话（`WishMachineTaskMessageBuilder` 的模板，逐字），
+                // 收件箱那一行显示的就是它。
+                title: message.text,
+                status: "",
+                detail: "",
+                terminal: terminalByJob[jobID.uuidString] ?? false)
+        }
+        guard !deliveries.isEmpty else { return }
+        let generation = wishTaskPromptGeneration
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            // 每作用域恢复先于投递：CAS revision 校准后提交才不会自相冲突。
+            await self.residentSystemInboxStore.restore(worldID: worldID, residentScope: scope)
+            guard self.wishTaskPromptGeneration == generation else { return }
+            for delivery in deliveries {
+                _ = await self.residentSystemInboxStore.apply(
+                    delivery, worldID: worldID, residentScope: scope)
+            }
+            self.pushSystemInboxSnapshots()
+        }
     }
 
     private func synchronizeWishMachinePresentation() {
@@ -6772,9 +6798,9 @@ final class AppDelegate:
             } catch {
                 // 记录改不动时**不许静默**：状态与任务行的原因照旧推出去（失败是可见的）。
                 spatialStage.wishMachineState = .failed
-                pushWishTaskPrompts(jobs.suffix(20).map { wishMachineTaskPresentation(for: $0) },
-                    worldID: worldID, scope: scope)
-                pushWishTaskMessages(worldID: worldID, scope: scope)
+                let presentations = jobs.suffix(20).map { wishMachineTaskPresentation(for: $0) }
+                pushWishTaskPrompts(presentations, worldID: worldID, scope: scope)
+                pushWishTaskMessages(presentations, worldID: worldID, scope: scope)
                 pushSystemInboxSnapshots()
                 return
             }
@@ -6814,9 +6840,9 @@ final class AppDelegate:
         } else if jobs.last?.stage == .failed || jobs.last?.stage == .interrupted {
             spatialStage.wishMachineState = .failed
         } else { spatialStage.wishMachineState = .idle }
-        pushWishTaskPrompts(jobs.suffix(20).map { wishMachineTaskPresentation(for: $0) },
-            worldID: worldID, scope: scope)
-        pushWishTaskMessages(worldID: worldID, scope: scope)
+        let presentations = jobs.suffix(20).map { wishMachineTaskPresentation(for: $0) }
+        pushWishTaskPrompts(presentations, worldID: worldID, scope: scope)
+        pushWishTaskMessages(presentations, worldID: worldID, scope: scope)
         pushSystemInboxSnapshots()
     }
 

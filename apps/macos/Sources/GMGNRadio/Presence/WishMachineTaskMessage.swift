@@ -1,15 +1,18 @@
 import Foundation
 
 // ---------------------------------------------------------------------------
-// 许愿任务 = **一条条消息**，不是一个窗口、也不是一块常驻列表。
+// 许愿任务 = **一条条系统消息**，不是一个窗口、也不是一块常驻列表。
 //
 // 用户 2026-10-02 原话：
 //   「小窗也是不要有遮挡」
 //   「许愿任务变成消息提示，不要单独做窗口了」
+//   「这个任务消息变成了 append 到对话了……如果不放，就放收件箱啊」
 //
-// 所以：许愿任务自己的窗口/列表**没有了**。它的每一次状态变化只生成**一条人话消息**，
-// 走进**既有的**消息通道（与居民对话的地方，见 `publishResidentTranscript`）——
-// 不新造面板、不新造窗口。
+// 所以：许愿任务自己的窗口/列表**没有了**，而且它的每一次状态变化**不进对话记录**
+// —— 对话记录里只有人和居民按时间说的话。它的出口是**既有的**收件箱
+// （`ResidentSystemInboxStore.apply`，见宿主 `pushWishTaskMessages`）：那里的条目
+// 自带时间戳、按时间倒序、未读角标由同一个 `unreadCount` 现算。
+// 不新造面板、不新造窗口、不新造计数。
 //
 // 三条纪律：
 //   1. **状态来源是唯一投影** `ResidentOwnershipProjection.row(_:)`。这里**不判断**
@@ -30,9 +33,9 @@ import Foundation
 /// 就一直留着。**失败待办不走这条时间窗**（见 `WishMachineTaskMessage.keepsUntilHandled`）。
 ///
 /// 它原来住在 `VisualEngine/StageOverlayView.swift` 里，跟着那块列表一起；列表按产品
-/// 决定整个删掉之后，规则搬到消息通道这边（**只有这一处实现** —— 消息通道与离线
-/// harness 问的是同一个它）。本文件只依赖 Foundation，所以这条规则可以在没有 app、
-/// 没有 UI 的情况下被逐条驱动。
+/// 决定整个删掉之后，规则搬到许愿任务消息这边（**只有这一处实现** —— 送到收件箱的
+/// 那一条出口与离线 harness 问的是同一个它）。本文件只依赖 Foundation，所以这条规则
+/// 可以在没有 app、没有 UI 的情况下被逐条驱动。
 enum WishMachineTaskPrompt {
     static func isShown(promptExpiresAt: Date?, at now: Date) -> Bool {
         guard let expiry = promptExpiresAt else { return true }
@@ -40,7 +43,10 @@ enum WishMachineTaskPrompt {
     }
 }
 
-/// 许愿任务的一条消息（给用户看的一句话）。
+/// 许愿任务的一条系统消息（给用户看的一句话）。
+///
+/// 它进收件箱：`ResidentSystemDelivery.eventID` 拿的就是 `id`，`title` 拿的就是 `text`，
+/// 其余的一切（时间戳、排序、未读数、已读）都由收件箱自己那一套现算。
 struct WishMachineTaskMessage: Equatable, Identifiable, Sendable {
     /// 幂等键 = 行标识 + 投影给出的那一档状态。同一状态永远同一个 id。
     let id: String
@@ -48,39 +54,13 @@ struct WishMachineTaskMessage: Equatable, Identifiable, Sendable {
     let taskID: String
     /// 投影给出的对外状态 + 那一句人话（幂等键的组成部分）。
     let stateKey: String
-    /// 一句话人话（界面上逐字显示这一句）。
+    /// 一句话人话（收件箱那一行逐字显示这一句）。
     let text: String
     /// **失败待办**：这条消息不自动消失，留到用户处理完。
     ///
     /// 判据就是唯一投影的 `OwnershipDisplayState.failed`（生成失败 / 已领取但入库没保存
     /// 都落在这一档）；已取消 / 已中断是 `.ended`，不在这里。**没有第二份真相**。
     let keepsUntilHandled: Bool
-
-    /// 展示层的回合标识：**稳定派生**，不是随机 UUID。
-    ///
-    /// 于是同一条消息每次推到聊天通道都得到同一个 id，重复推送不会让展示层以为
-    /// "又来了一条新消息"。它是一个内部标识，**永远不会出现在 `text` 里**。
-    var transcriptTurnID: UUID {
-        let first = Self.fnv1a(id, seed: 0xcbf2_9ce4_8422_2325)
-        let second = Self.fnv1a(id, seed: 0x9e37_79b9_7f4a_7c15)
-        var bytes: [UInt8] = []
-        for value in [first, second] {
-            withUnsafeBytes(of: value.bigEndian) { bytes.append(contentsOf: $0) }
-        }
-        return UUID(uuid: (bytes[0], bytes[1], bytes[2], bytes[3],
-                           bytes[4], bytes[5], bytes[6], bytes[7],
-                           bytes[8], bytes[9], bytes[10], bytes[11],
-                           bytes[12], bytes[13], bytes[14], bytes[15]))
-    }
-
-    private static func fnv1a(_ text: String, seed: UInt64) -> UInt64 {
-        var hash = seed
-        for byte in text.utf8 {
-            hash ^= UInt64(byte)
-            hash = hash &* 0x0000_0100_0000_01b3
-        }
-        return hash
-    }
 }
 
 /// 唯一投影的一行 → 一条消息。**判据全部来自投影**，这里只有措辞。
@@ -129,10 +109,11 @@ enum WishMachineTaskMessageBuilder {
     }
 }
 
-/// 消息通道的**去重与保留**规则（全仓唯一一处）。
+/// 许愿任务消息的**去重与保留**规则（全仓唯一一处）。
 ///
 /// - **同一状态只发一次**：幂等键 = 行标识 + 投影状态；已经发过的键**不再追加**，
-///   重复喂同一份投影是幂等的（这就是"状态没变不重复"）。
+///   重复喂同一份投影是幂等的（这就是"状态没变不重复"）。收件箱那一侧还有一层
+///   同样的判据（内容一字不变 ⇒ 不重写、不再翻未读），两层同源、不是两套状态。
 /// - **失败待办不自动消失**：`keepsUntilHandled` 的消息只在唯一投影**不再**把它判成
 ///   `.failed` 的那一刻收起 —— 也就是"用户处理完了"，与时钟无关。
 /// - **其它终态按既有窗口过期**：到期锚点就是**既有的**那一个（共享收件箱按
@@ -190,7 +171,7 @@ struct WishMachineTaskMessageFeed {
                 // 失败待办：它与时钟无关，只在投影不再说它失败时收起。
                 return failingTaskIDs.contains(message.taskID) ? message : nil
             }
-            // 非失败：只有"这一刻仍然是那一档"才显示（状态推进了就不再占着通道）。
+            // 非失败：只有"这一刻仍然是那一档"才显示（状态推进了就不再把旧的送进收件箱）。
             guard live.contains(id) else { return nil }
             // 到期锚点走**唯一**那一条规则（未了结 ⇒ 没有锚点 ⇒ 一直显示）。
             return WishMachineTaskPrompt.isShown(promptExpiresAt: anchors[id] ?? nil, at: now)

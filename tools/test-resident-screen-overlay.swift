@@ -217,13 +217,19 @@ func expect(_ condition: Bool, _ message: String) {
 @MainActor
 final class StubScreenControl: WorldScreenControlling {
     var screens: [WorldScreenSnapshot]
+    /// 「还没被认成屏幕」的物件：**运行时的另一份输入**。判据换一份它，答复就必须跟着换
+    /// —— 写死"是哪一件"的实现在这里立刻红。
+    var candidates: [WorldScreenCandidate]
     var playResult: WorldScreenCommandOutcome
     var stopResult: WorldScreenCommandOutcome
-    init(screens: [WorldScreenSnapshot] = [], playResult: WorldScreenCommandOutcome,
+    init(screens: [WorldScreenSnapshot] = [], candidates: [WorldScreenCandidate] = [],
+         playResult: WorldScreenCommandOutcome,
          stopResult: WorldScreenCommandOutcome) {
-        self.screens = screens; self.playResult = playResult; self.stopResult = stopResult
+        self.screens = screens; self.candidates = candidates
+        self.playResult = playResult; self.stopResult = stopResult
     }
     func listScreens() -> [WorldScreenSnapshot] { screens }
+    func unrecognizedScreenCandidates() -> [WorldScreenCandidate] { candidates }
     func playScreen(objectID: String?, rawContent: String) async -> WorldScreenCommandOutcome { playResult }
     func stopScreen(objectID: String?) -> WorldScreenCommandOutcome { stopResult }
     func calibrateScreen(objectID: String, widthMeters: Float, heightMeters: Float,
@@ -294,7 +300,11 @@ final class StubScreenControl: WorldScreenControlling {
             objectID: "tv-2", calibratedJSON: nil, size: tvSize, allowsDefault: false
         ) {
         case let .success(value):
-            let expectedWidth = tvSize.x * WorldScreenResolution.panelInset
+            // 期望值**从生产那一处派生**（`WorldScreenResolution.bezelMargin`），而不是在这儿
+            // 再写一个比例：屏幕多大只有一处定义。这里原来钉的是 `tvSize.x * panelInset`
+            // （0.86）—— 那一条把缺陷的数值钉进了门禁，屏幕铺不满正面时它反而是绿的。
+            let expectedWidth = tvSize.x
+                - 2 * WorldScreenResolution.bezelMargin(faceWidth: tvSize.x, faceHeight: tvSize.y)
             expect(value.source == .inferred,
                 "断言1：② 无标定时按最大平坦面推断（source=\(value.source.rawValue)）")
             expect(abs(value.quad.width - expectedWidth) < 1e-5
@@ -564,8 +574,9 @@ final class StubScreenControl: WorldScreenControlling {
         expect(tools.map(\.name) == ["play_screen", "stop_screen", "read_screen"],
             "断言4：三条工具的名字与顺序固定（\(tools.map(\.name).joined(separator: ", "))）")
         guard let playTool = tools.first(where: { $0.name == "play_screen" }),
-              let readTool = tools.first(where: { $0.name == "read_screen" })
-        else { expect(false, "断言4：找不到 play_screen / read_screen"); return }
+              let readTool = tools.first(where: { $0.name == "read_screen" }),
+              let stopTool = tools.first(where: { $0.name == "stop_screen" })
+        else { expect(false, "断言4：找不到 play_screen / stop_screen / read_screen"); return }
         let missingURLReply = await playTool.handle("call-1", Data("{}".utf8))
         expect(missingURLReply.isError == false && missingURLReply.code == "insufficient_input",
             "断言4：缺 URL ⇒ code=insufficient_input 且 isError=false（走成功通道，与既有 `insufficient_input` 同一字面量）")
@@ -598,6 +609,107 @@ final class StubScreenControl: WorldScreenControlling {
         let staleReply = await ResidentScreenTools(control: needsInputControl, isCurrent: { false })
             .tools[0].handle("call-5", Data(#"{"url":"https://www.youtube.com/embed/x"}"#.utf8))
         expect(staleReply.isError, "断言4：本轮已被替换时工具具名拒绝，而不是假装成功")
+
+        // =============================================================
+        // 断言 8：能力被看见 —— 工具说明教会它，答复说的是**运行时**那一件
+        // =============================================================
+        // 真机 2026-10-02：用户说「电视播放 <YouTube 链接>」，居民答「那台电视是我做出来的
+        // 外形摆件，没有播放功能」。工具在不在是一回事，**能力有没有被看见**是另一回事：
+        // 说明没写"什么时候用、放什么链接"，系统提示里一个字都没有 —— 模型只能自己推断出
+        // "外形摆件"。这两条断言钉的就是"它知道这件事"。
+
+        // ① 说明：这是什么、什么时候用、放什么链接。
+        expect(playTool.description.contains("官方嵌入")
+                && playTool.description.contains("YouTube")
+                && playTool.description.contains("哔哩哔哩"),
+            "断言8：play_screen 的说明写明放的是官方嵌入链接（YouTube / 哔哩哔哩）")
+        expect(playTool.description.contains("电视") && playTool.description.contains("用电视放这个链接"),
+            "断言8：play_screen 的说明写明什么时候用它（用户说「用电视放这个链接」）")
+        expect(readTool.description.contains("有没有") && readTool.description.contains("哪一件"),
+            "断言8：read_screen 的说明写明先看「有没有、是哪一件」")
+        expect(readTool.description.contains("还没被认成屏幕") && readTool.description.contains("怎么改"),
+            "断言8：read_screen 的说明写明一件都没有时会说清是哪一件、怎么改")
+        expect(!stopTool.description.isEmpty && stopTool.description.contains("电视"),
+            "断言8：stop_screen 的说明说清它关的是电视")
+
+        // ② 「是哪一件」必须从**运行时**来：换一份注册表 ⇒ 答复跟着换（写死就红）。
+        let namedCandidates = [WorldScreenCandidate(
+            objectID: "obj-大屏", displayName: "超大荧幕电视",
+            reason: "这块面像一块屏幕，但名字里没有「电视」或「屏幕」"
+        )]
+        let screenlessControl = StubScreenControl(
+            screens: [], candidates: namedCandidates,
+            playResult: .failure(.screenNotFound, "这个空间里现在没有电视。"),
+            stopResult: .failure(.screenNotFound, "没有可关的电视。")
+        )
+        let screenlessTools = ResidentScreenTools(control: screenlessControl, isCurrent: { true }).tools
+        let screenlessRead = await screenlessTools.first(where: { $0.name == "read_screen" })!
+            .handle("call-6", Data("{}".utf8))
+        let screenlessPayload = (try? JSONSerialization.jsonObject(
+            with: screenlessRead.payloadJSON)) as? [String: Any]
+        let screenlessMessage = (screenlessPayload?["message"] as? String) ?? ""
+        expect(screenlessRead.isError == false && screenlessRead.code == "insufficient_input",
+            "断言8：一件屏幕都没有时 read_screen 走信息不足通道（不是「我做不到」式的失败）")
+        expect(screenlessMessage.contains("超大荧幕电视") && screenlessMessage.contains("还没被认成屏幕"),
+            "断言8：read_screen 具名说出是哪一件还没被认成屏幕：「\(screenlessMessage)」")
+        expect(screenlessMessage.contains("名字里带上「电视」"),
+            "断言8：read_screen 给出可行动的下一步（怎么改）：「\(screenlessMessage)」")
+        expect(screenlessRead.isError == false
+                && screenlessMessage.contains("这块面像一块屏幕"),
+            "断言8：原因用的是运行时给的那一句，不是工具层自己编的")
+
+        // 换一份运行时注册（另一件物件、另一个原因）⇒ 同一份工具必须给出**另一句**答复。
+        let otherCandidates = [WorldScreenCandidate(
+            objectID: "obj-旧", displayName: "旧显示器",
+            reason: "名字像电视，但这一帧没读出可用的屏幕范围"
+        )]
+        let otherControl = StubScreenControl(
+            screens: [], candidates: otherCandidates,
+            playResult: .failure(.screenNotFound, "这个空间里现在没有电视。"),
+            stopResult: .failure(.screenNotFound, "没有可关的电视。")
+        )
+        let otherRead = await ResidentScreenTools(control: otherControl, isCurrent: { true })
+            .tools.first(where: { $0.name == "read_screen" })!.handle("call-7", Data("{}".utf8))
+        let otherMessage = ((try? JSONSerialization.jsonObject(with: otherRead.payloadJSON))
+            as? [String: Any])?["message"] as? String ?? ""
+        expect(otherMessage.contains("旧显示器") && !otherMessage.contains("超大荧幕电视"),
+            "断言8：换一份运行时注册 ⇒ 答复跟着换（写死「是哪一件」在这里必红）：「\(otherMessage)」")
+
+        // 候选为空 ⇒ 如实说"没有一件物件被认成屏幕" + 怎么改，绝不认领一件。
+        let bareControl = StubScreenControl(
+            screens: [], candidates: [],
+            playResult: .failure(.screenNotFound, "这个空间里现在没有电视。"),
+            stopResult: .failure(.screenNotFound, "没有可关的电视。")
+        )
+        let bareRead = await ResidentScreenTools(control: bareControl, isCurrent: { true })
+            .tools.first(where: { $0.name == "read_screen" })!.handle("call-8", Data("{}".utf8))
+        let bareMessage = ((try? JSONSerialization.jsonObject(with: bareRead.payloadJSON))
+            as? [String: Any])?["message"] as? String ?? ""
+        expect(bareMessage.contains("没有一件物件被认成屏幕")
+                && bareMessage.contains("名字里带「电视」")
+                && !bareMessage.contains("旧显示器"),
+            "断言8：一件候选都没有时如实说没有、并给出怎么改：「\(bareMessage)」")
+
+        // ③ 放不了时：工具**原样转达**运行时给的具名原因（不许改写成一句笼统拒绝）。
+        let namedPlayFailure = "这个空间里现在没有电视。"
+            + "这些物件还没被认成屏幕：「超大荧幕电视」（这块面像一块屏幕，但名字里没有「电视」或「屏幕」）。"
+            + "把名字里带上「电视」或「屏幕」，或者换一件。"
+        let namedFailureControl = StubScreenControl(
+            screens: [], candidates: namedCandidates,
+            playResult: .failure(.screenNotFound, namedPlayFailure),
+            stopResult: .failure(.screenNotFound, "没有可关的电视。")
+        )
+        let namedFailureReply = await ResidentScreenTools(control: namedFailureControl, isCurrent: { true })
+            .tools.first(where: { $0.name == "play_screen" })!
+            .handle("call-9", Data(#"{"url":"https://www.youtube.com/watch?v=aPcL35kgL6A"}"#.utf8))
+        let namedFailureMessage = ((try? JSONSerialization.jsonObject(
+            with: namedFailureReply.payloadJSON)) as? [String: Any])?["message"] as? String ?? ""
+        expect(namedFailureReply.isError && namedFailureReply.code == "screen_not_found",
+            "断言8：放不了 ⇒ 具名错误码 screen_not_found（不是静默成功）")
+        expect(namedFailureMessage == namedPlayFailure
+                && namedFailureMessage.contains("超大荧幕电视")
+                && namedFailureMessage.contains("把名字里带上"),
+            "断言8：放不了的答复是具名且可行动的，被工具原样转达：「\(namedFailureMessage)」")
 
         // =============================================================
         // 断言 5：只走官方嵌入
@@ -885,7 +997,141 @@ guard compiled == 0 else {
     exit(compiled)
 }
 let innerStatus = try run(executable.path, [])
-check(innerStatus == 0, "内层判据（断言 1/2/4/5-白名单/6-遮挡/7-真机道具的面）全部通过")
+check(innerStatus == 0, "内层判据（断言 1/2/4/5-白名单/6-遮挡/7-真机道具的面/8-能力可见）全部通过")
+
+// ---------------------------------------------------------------------------
+// MARK: 断言 8（文本）：居民系统提示里那条常识 + 放不了时的具名可行动
+// ---------------------------------------------------------------------------
+
+/// 系统提示里**必须**有的那条常识：物件可能带屏幕、先 read_screen 再 play_screen、
+/// 放不了要说清哪一件/为什么/怎么改。真机现场是"一句都没有"，模型只能推断成"外形摆件"。
+func screenCapabilityTeachingProblems(_ promptSource: String) -> [String] {
+    var problems: [String] = []
+    for needle in ["read_screen", "play_screen", "官方嵌入", "带屏幕"] {
+        if !promptSource.contains(needle) {
+            problems.append("系统提示里没有「\(needle)」：居民不知道空间里的物件可能带屏幕")
+        }
+    }
+    if !promptSource.contains("不要只说做不到") {
+        problems.append("系统提示没有要求放不了时说清是哪一件、为什么、怎么改（只剩一句「我做不到」）")
+    }
+    return problems
+}
+
+/// 「放不了」时那几句话**必须**具名且可行动。判据是文本级的，因为这些话住在
+/// `WorldScreenStore`（App 侧要 AppKit，编不进离线 harness），而它正是居民读到的原文。
+func screenFailureGuidanceProblems(_ storeSource: String) -> [String] {
+    var problems: [String] = []
+    for needle in ["还没被认成屏幕", "名字里带「电视」或「屏幕」", "unrecognized_ids"] {
+        if !storeSource.contains(needle) {
+            problems.append("放不了时的答复缺少「\(needle)」：既说不出是哪一件，也说不出怎么改")
+        }
+    }
+    // 只看**当作答复用的那一句**（`.screenNotFound, "…"`），不看注释里引用过的说法。
+    if storeSource.contains("screenNotFound, \"我做不到") || storeSource.contains("needsInput(\"我做不到") {
+        problems.append("放不了时的答复退化成了笼统拒绝（「我做不到」）")
+    }
+    return problems
+}
+
+let residentPromptSource = try read(
+    sourceRoot.appendingPathComponent("Agent/AgentConversationService.swift")
+)
+let storeSource = try read(screenRoot.appendingPathComponent("WorldScreenStore.swift"))
+
+let teachingProblems = screenCapabilityTeachingProblems(residentPromptSource)
+for problem in teachingProblems { print("   · \(problem)") }
+check(teachingProblems.isEmpty,
+    "断言8：居民系统提示教会了它「物件可能带屏幕、先 read_screen 再 play_screen、放不了要说清三样」")
+
+let guidanceProblems = screenFailureGuidanceProblems(storeSource)
+for problem in guidanceProblems { print("   · \(problem)") }
+check(guidanceProblems.isEmpty,
+    "断言8：放不了时的答复具名且可行动（说得出是哪一件、怎么改），不是笼统「我做不到」")
+
+// 注入负对照（在**源码副本**上做手术，真源码一个字节都不动）：
+// ① 把系统提示那条常识删掉 ⇒ 判据必须红。
+let promptWithoutTeaching = residentPromptSource.replacingOccurrences(
+    of: "空间里的物件可能带屏幕：用户让你放视频时，先用 read_screen 看这个空间里有没有、是哪一件，再用 play_screen 把用户给的官方嵌入链接（YouTube、哔哩哔哩等）放上去；\n        放不了就说清是哪一件、为什么、该怎么改，不要只说做不到。带屏幕的物件是真的能放，不是只能摆着看的外形。\n        ",
+    with: ""
+)
+check(promptWithoutTeaching != residentPromptSource,
+    "断言8（注入负对照）：系统提示那条常识确实被从副本里删掉了")
+check(!screenCapabilityTeachingProblems(promptWithoutTeaching).isEmpty,
+    "断言8（注入负对照）：删掉系统提示那条常识 ⇒ 判据必须红（第一条："
+        + "\(screenCapabilityTeachingProblems(promptWithoutTeaching).first ?? "（没有）")）")
+
+// ② 把"放不了"的答复换成一句笼统拒绝 ⇒ 判据必须红。
+let genericFailure = storeSource.replacingOccurrences(
+    of: ".failure(\n                .screenNotFound, message,",
+    with: ".failure(\n                .screenNotFound, \"我做不到。\","
+)
+check(genericFailure != storeSource, "断言8（注入负对照）：笼统拒绝确实被注入到了 store 副本里")
+check(!screenFailureGuidanceProblems(genericFailure).isEmpty,
+    "断言8（注入负对照）：放不了的答复改成笼统「我做不到」⇒ 判据必须红（第一条："
+        + "\(screenFailureGuidanceProblems(genericFailure).first ?? "（没有）")）")
+
+// ③ 把「是哪一件」写死 / 把空回执换成笼统拒绝 ⇒ **同一份内层判据**必须 FAIL。
+//    这里真的把源码副本编起来再跑一遍：判据能抓的缺陷，注入之后必须抓得到。
+//    注入版的输出**收起来加前缀**：那几行红是"判据抓到了"，不是"门禁不过"，
+//    不许混进门禁日志的 `^FAIL` 计数里（与 `PROBE-FAIL` 同一纪律）。
+func runCapturingInner(_ executable: String) throws -> Int32 {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: executable)
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = pipe
+    try process.run()
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    for line in String(decoding: data, as: UTF8.self)
+        .split(separator: "\n", omittingEmptySubsequences: false) where !line.isEmpty {
+        print("   · [注入内层] \(line)")
+    }
+    return process.terminationStatus
+}
+
+func innerJudgementStatus(patching file: String, _ surgery: (String) -> String) throws
+    -> (changed: Bool, status: Int32) {
+    let original = try read(screenRoot.appendingPathComponent(file))
+    let patched = surgery(original)
+    guard patched != original else { return (false, -3) }
+    let patchedURL = temporary.appendingPathComponent("patched-\(file)")
+    try patched.write(to: patchedURL, atomically: true, encoding: .utf8)
+    let sources = screenFiles.map { name in
+        name == file ? patchedURL.path : screenRoot.appendingPathComponent(name).path
+    }
+    let patchedExecutable = temporary.appendingPathComponent("patched-\(UUID().uuidString)")
+    let patchedCompiled = try run(
+        "/usr/bin/swiftc",
+        ["-j1", "-parse-as-library"] + sources + [program.path, "-o", patchedExecutable.path]
+    )
+    // 编译不过 = 这次注入没能跑成判据：返回 -2，调用方的 `== 1` 断言必须红（不许把
+    // "没跑起来"当成"判据抓到了"）。
+    guard patchedCompiled == 0 else { return (true, -2) }
+    return (true, try runCapturingInner(patchedExecutable.path))
+}
+
+let hardcodedNames = try innerJudgementStatus(patching: "ResidentScreenTools.swift") { source in
+    source.replacingOccurrences(
+        of: "let candidates = control.unrecognizedScreenCandidates()",
+        with: "let candidates = [WorldScreenCandidate(objectID: \"写死的\", "
+            + "displayName: \"写死的电视\", reason: \"编的原因\")]"
+    )
+}
+check(hardcodedNames.changed, "断言8（注入负对照）：写死「是哪一件」的手术确实改到了源码副本")
+check(hardcodedNames.status == 1,
+    "断言8（注入负对照）：把「是哪一件」写死 ⇒ 内层判据必须 FAIL（exit 1，实测 \(hardcodedNames.status)）")
+
+let genericInner = try innerJudgementStatus(patching: "ResidentScreenTools.swift") { source in
+    source.replacingOccurrences(
+        of: "screenlessMessage(candidates),",
+        with: "\"我做不到。\","
+    )
+}
+check(genericInner.changed, "断言8（注入负对照）：笼统拒绝的手术确实改到了源码副本")
+check(genericInner.status == 1,
+    "断言8（注入负对照）：空回执改成笼统「我做不到」⇒ 内层判据必须 FAIL（exit 1，实测 \(genericInner.status)）")
 
 
 // ---------------------------------------------------------------------------
@@ -1141,6 +1387,301 @@ if bypassCompiled != 0 {
     let bypassStatus = try run(bypassExecutable.path, [])
     check(bypassStatus == 0,
         "断言5（注入负对照）：给白名单开后门之后，`googlevideo.com` 直链**会被放行** ⇒ 证明拒绝确实来自白名单")
+}
+
+// ---------------------------------------------------------------------------
+// MARK: 断言 9：屏幕**铺满**最终正面（真机 2026-10-02「屏幕也没有 filled」）
+// ---------------------------------------------------------------------------
+//
+// 修的是什么：屏幕四边形原来把每一面缩到 **86%**（`panelInset = 0.86`，每边吃掉该轴
+// 7%）。真机那台 `1443 × 862 × 302 mm` 的电视，最终正面是 `1.443 × 0.862 m`，屏幕
+// 四边形只有 `1.241 × 0.741 m`：左右各缩进 **101 mm**、上下各 **60 mm**，面积只占
+// 正面的 **73.96%** —— 截图里那块"缩在正面中间、还偏下"的暗矩形就是它。
+//
+// 根因是 **inset 的取值**，不是"算在未拉伸的坐标系里"：`WorldScreenStore.resolve`
+// 一直传的是 `generatedProp.effectiveSize`（**最终**尺寸），而**如果**它真按未拉伸的
+// 网格 AABB 算，真机那份 GLB 实测 `1.0079 × 0.6287 × 1.0079` 的最薄/最长 =
+// 0.62 > 0.25，会走 `notPanelLike` **具名拒绝** —— 连四边形都不会有。下面把这一条
+// 也钉住（"未拉伸的 AABB 必须是具名拒绝"）。
+//
+// 判据（面积阈值 / 板形判据 / 最大平坦面那套）**一个字都没放宽**：9.4 就是钉它们的，
+// 两条注入负对照（放宽任一条）必须红。
+//
+// 探针直接编**生产**的 `WorldScreenGeometry.swift` + `WorldScreenInference.swift`
+// （这两份只依赖 Foundation + simd），只读它们的公开几何出口：`resolve` / `quad` /
+// `corners` / `WorldScreenDefinitionCoding`。六条注入负对照在**临时副本**上做手术，
+// 生产源码一个字节都不动。
+
+let fitProbeProgram = ##"""
+import Foundation
+import simd
+
+var failures = 0
+func probe(_ condition: Bool, _ message: String) {
+    if condition { print("FIT-PASS \(message)") } else { print("FIT-FAIL \(message)"); failures += 1 }
+}
+func f(_ value: Float) -> String { String(format: "%.4f", value) }
+func percent(_ value: Float) -> String { String(format: "%.2f", value * 100) }
+
+@main struct FitProbe {
+    static func main() {
+        // ---- 9.4：「屏幕推断判据零放宽」 ----
+        probe(WorldScreenResolution.minimumFaceArea == 0.04,
+              "9.4：面积阈值仍是 0.04 m²（实测 \(WorldScreenResolution.minimumFaceArea)）")
+        probe(WorldScreenResolution.maximumPanelThicknessRatio == 0.25,
+              "9.4：板形判据仍是 最薄/最长 ≤ 0.25（实测 \(WorldScreenResolution.maximumPanelThicknessRatio)）")
+        if case let .failure(issue) = WorldScreenResolution.resolve(
+            objectID: "cube", calibratedJSON: nil, size: SIMD3(1, 1, 1), allowsDefault: false
+        ), case .notPanelLike = issue {
+            probe(true, "9.4：1 × 1 × 1 的方块仍然判不出屏幕（notPanelLike）")
+        } else {
+            probe(false, "9.4：一个 1 × 1 × 1 的方块被当成了屏幕 —— 判据被放宽了")
+        }
+        if case let .failure(issue) = WorldScreenResolution.resolve(
+            objectID: "tiny", calibratedJSON: nil, size: SIMD3(0.12, 0.12, 0.01), allowsDefault: false
+        ), case .belowAreaThreshold = issue {
+            probe(true, "9.4：12 cm 见方的面仍然低于面积阈值")
+        } else {
+            probe(false, "9.4：12 cm 见方的面被当成了屏幕 —— 面积阈值被放宽了")
+        }
+        // ---- 9.1：「在未拉伸的网格 AABB 里算」那一路不存在 ----
+        if case let .failure(issue) = WorldScreenResolution.resolve(
+            objectID: "raw", calibratedJSON: nil, size: SIMD3(1.0079, 0.6287, 1.0079),
+            allowsDefault: false
+        ), case .notPanelLike = issue {
+            probe(true, "9.1：未拉伸的网格 AABB（真机 GLB 实测 1.0079 × 0.6287 × 1.0079）"
+                + "走的是具名拒绝 ⇒ 现网那份四边形不可能算在这个坐标系里")
+        } else {
+            probe(false, "9.1：未拉伸的网格 AABB 被当成了屏幕 —— 屏幕几何回到未拉伸的坐标系了")
+        }
+
+        // ---- 9.1 / 9.2 / 9.3：三个尺寸各量一次 ----
+        let cases: [(String, SIMD3<Float>)] = [
+            ("真机 1443 × 862 × 302 mm", SIMD3(1.443, 0.862, 0.302)),
+            ("1000 × 500 × 80 mm", SIMD3(1.0, 0.5, 0.08)),
+            ("600 × 340 × 60 mm", SIMD3(0.6, 0.34, 0.06)),
+        ]
+        for (label, size) in cases {
+            guard case let .success(definition) = WorldScreenResolution.resolve(
+                objectID: "tv-fit", calibratedJSON: nil, size: size, allowsDefault: false
+            ) else {
+                probe(false, "\(label)：推断不出屏幕"); continue
+            }
+            let quad = definition.quad
+            let faceWidth = size.x
+            let faceHeight = size.y
+            let coverage = (quad.width * quad.height) / (faceWidth * faceHeight)
+            let marginX = (faceWidth - quad.width) / 2
+            let marginY = (faceHeight - quad.height) / 2
+            let corners = quad.corners
+            print("FIT-NUM \(label)：正面 \(f(faceWidth)) × \(f(faceHeight)) m"
+                + " ⇒ 四边形 \(f(quad.width)) × \(f(quad.height)) m"
+                + "，覆盖率 面积 \(percent(coverage))% / 线宽 \(percent(quad.width / faceWidth))%"
+                + " / 线高 \(percent(quad.height / faceHeight))%"
+                + "，边框余量 每边 x \(f(marginX)) y \(f(marginY)) m"
+                + "，中心 \(f(quad.center.x)), \(f(quad.center.y)), \(f(quad.center.z))")
+            print("FIT-CORNERS \(label)：BL \(f(corners[0].x)), \(f(corners[0].y)), \(f(corners[0].z))"
+                + " BR \(f(corners[1].x)), \(f(corners[1].y)), \(f(corners[1].z))"
+                + " TR \(f(corners[2].x)), \(f(corners[2].y)), \(f(corners[2].z))"
+                + " TL \(f(corners[3].x)), \(f(corners[3].y)), \(f(corners[3].z))")
+            probe(definition.source == .inferred, "\(label)：仍走推断那一级（\(definition.source.rawValue)）")
+            probe(coverage >= 0.95, "9.1 \(label)：屏幕占正面 ≥ 95%（实测 \(percent(coverage))%）")
+            probe(quad.width / faceWidth >= 0.95 && quad.height / faceHeight >= 0.95,
+                  "9.1 \(label)：两条边都铺到 ≥ 95%（线宽 \(percent(quad.width / faceWidth))%，"
+                    + "线高 \(percent(quad.height / faceHeight))%）")
+            probe(marginX > 0 && marginY > 0,
+                  "9.1 \(label)：四角落在正面边缘**内侧**（余量 \(f(marginX)) / \(f(marginY)) m > 0）")
+            probe(marginX <= faceWidth * 0.025 && marginY <= faceHeight * 0.025,
+                  "9.1 \(label)：边框余量每边 ≤ 该轴 2.5%（\(f(marginX)) ≤ \(f(faceWidth * 0.025))，"
+                    + "\(f(marginY)) ≤ \(f(faceHeight * 0.025))）")
+            probe(abs(quad.center.x) <= 1e-6 && abs(quad.center.y - faceHeight / 2) <= 1e-6,
+                  "9.1 \(label)：面内中心就是正面中心（偏移 \(f(quad.center.x)), "
+                    + "\(f(quad.center.y - faceHeight / 2))）")
+            probe(abs(quad.center.z - (size.z / 2 + WorldScreenResolution.surfaceOffset)) <= 1e-6,
+                  "9.1 \(label)：法向外移只有防共面闪烁的那 "
+                    + "\(WorldScreenResolution.surfaceOffset) m（实测 \(f(quad.center.z))）")
+            probe(abs(quad.normal.x) <= 1e-6 && abs(quad.normal.y) <= 1e-6
+                    && abs(quad.normal.z - 1) <= 1e-6,
+                  "9.1 \(label)：屏幕朝向仍是正面 +Z（\(f(quad.normal.x)), \(f(quad.normal.y)), "
+                    + "\(f(quad.normal.z))）")
+            probe(corners.allSatisfy {
+                abs($0.z - (size.z / 2 + WorldScreenResolution.surfaceOffset)) <= 1e-6
+            }, "9.1 \(label)：四角都贴在正面那一层（z = size.z/2 + surfaceOffset）")
+            // ---- 9.3：四角是**派生**的，不是第二份存货 ----
+            // 用四边形自己的右轴 / 上轴（含 pitch）：于是这条对任意朝向都成立，
+            // 而不是只在 pitch = 0 时恰好对。
+            let right = quad.right * quad.halfWidth
+            let up = quad.up * quad.halfHeight
+            let derived = [quad.center - right - up, quad.center + right - up,
+                           quad.center + right + up, quad.center - right + up]
+            let worst = zip(derived, corners).map { simd_length($0 - $1) }.max() ?? 1
+            probe(worst <= 1e-6, "9.3 \(label)：四角是派生的（最大偏差 \(worst)）")
+        }
+
+        // ---- 9.3：落盘的载荷里**只有一份**几何 ----
+        guard case let .success(value) = WorldScreenResolution.resolve(
+            objectID: "tv-fit", calibratedJSON: nil, size: SIMD3(1.443, 0.862, 0.302),
+            allowsDefault: false
+        ), let json = WorldScreenDefinitionCoding.encode(value) else {
+            probe(false, "9.3：推断出来的定义编码不出来")
+            print("FIT-FAILURES=\(failures)"); exit(1)
+        }
+        let expected: Set<String> = ["objectID", "source", "center", "yaw", "pitch",
+                                     "halfWidth", "halfHeight", "note"]
+        let object = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any]
+        let keys = Set(object?.keys.map { $0 } ?? [])
+        probe(keys == expected,
+              "9.3：`gmgn.screen.v1` 的载荷恰好 8 个键、只有一份几何（多出来 "
+                + "\(keys.subtracting(expected).sorted())，少了 \(expected.subtracting(keys).sorted())）")
+        probe(WorldScreenDefinitionCoding.decode(json, expecting: "tv-fit")?.quad == value.quad,
+              "9.3：编解码往返之后四边形逐位相同（尺寸仍然只有 halfWidth/halfHeight 一处定义）")
+
+        print("FIT-FAILURES=\(failures)")
+        exit(failures == 0 ? 0 : 1)
+    }
+}
+"""##
+
+/// 跑一个可执行文件并**收回它的全部输出**（父进程不直接继承子进程的 stdout：两者同时
+/// 写同一个 fd 会把行交错在一起，门禁的 `^FAIL` 就会数错行）。
+func runFitCapture(_ binary: String, _ arguments: [String]) throws -> (status: Int32, output: String) {
+    let process = Process(), pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: binary)
+    process.arguments = arguments
+    process.standardOutput = pipe
+    process.standardError = pipe
+    try process.run()
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+}
+
+/// 把两份**只依赖 Foundation + simd** 的屏幕几何源码复制到临时目录、按需做一组文本替换，
+/// 编出探针跑一次。返回 `(status, output, note)`：`note` 非空 = **探针压根没跑起来**
+/// （注入锚点找不到 / 编不过），此时 `status` 是 `-1` —— 判据必须把这两件事分开，
+/// 否则"锚点没找到"会被当成"注入被抓住了"（一个恒真的假门禁）。
+/// 注入只改**临时副本**：生产源码一个字节都不动（跑完随临时目录一起删）。
+func runFitProbe(
+    patches: [(file: String, from: String, to: String)]
+) throws -> (status: Int32, output: String, note: String) {
+    let directory = temporary.appendingPathComponent("fit-probe-\(UUID())")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    var sources: [String] = []
+    for name in ["WorldScreenGeometry.swift", "WorldScreenInference.swift"] {
+        var text = try read(screenRoot.appendingPathComponent(name))
+        for patch in patches where patch.file == name {
+            guard text.contains(patch.from) else {
+                return (-1, "", "注入锚点在 \(name) 里找不到（签名改过？）：\(patch.from)")
+            }
+            text = text.replacingOccurrences(of: patch.from, with: patch.to)
+        }
+        let destination = directory.appendingPathComponent(name)
+        try text.write(to: destination, atomically: true, encoding: .utf8)
+        sources.append(destination.path)
+    }
+    let program = directory.appendingPathComponent("FitProbe.swift")
+    try fitProbeProgram.write(to: program, atomically: true, encoding: .utf8)
+    let binary = directory.appendingPathComponent("fit-probe")
+    let compile = try runFitCapture(
+        "/usr/bin/swiftc",
+        ["-j1", "-parse-as-library"] + sources + [program.path, "-o", binary.path]
+    )
+    guard compile.status == 0 else {
+        return (-1, compile.output, "探针没编起来（exit \(compile.status)）—— 注入把源码改坏了")
+    }
+    let run = try runFitCapture(binary.path, [])
+    return (run.status, run.output, "")
+}
+
+/// 注入锚点就是**生产源码原文**（改签名会让它在这里具名报错，而不是静默跳过）。
+let fitMarginBody = """
+    static func bezelMargin(faceWidth: Float, faceHeight: Float) -> Float {
+        min(faceWidth, faceHeight) * bezelMarginFraction
+    }
+"""
+
+let fitProbeClean = try runFitProbe(patches: [])
+check(fitProbeClean.note.isEmpty && fitProbeClean.status == 0
+        && fitProbeClean.output.contains("FIT-FAILURES=0"),
+    "断言9：**原件**上跑屏幕铺满判据通过（exit \(fitProbeClean.status)，"
+        + "\(fitProbeClean.output.split(separator: "\n").last(where: { $0.hasPrefix("FIT-FAILURES=") }) ?? "没有结论"))"
+        + (fitProbeClean.note.isEmpty ? "" : " —— \(fitProbeClean.note)"))
+// 判据的**材料读数**必须看得见（审计不用去读源码）：尺寸 / 覆盖率 / 余量 / 四角。
+for line in fitProbeClean.output.split(separator: "\n")
+where line.hasPrefix("FIT-NUM") || line.hasPrefix("FIT-CORNERS") {
+    print("  · \(line)")
+}
+
+// 「四边形跟着逐轴缩放走」的**接线处**：屏幕推断读的必须是**最终**尺寸（`effectiveSize`
+// = 用户给的三轴），不是网格自己的包围盒。真机上它必须是 `1.443 × 0.862 × 0.302`；
+// 网格自身的 AABB 是 `1.0079 × 0.6287 × 1.0079`（实测那份 GLB），拿它当尺寸会被
+// 板形判据具名拒绝 —— 所以这一行要是被改成读网格包围盒，屏幕会直接消失，而不是变小。
+let screenStoreSource = try read(screenRoot.appendingPathComponent("WorldScreenStore.swift"))
+check(screenStoreSource.contains(
+        "SIMD3<Float>($0.effectiveSize.x, $0.effectiveSize.y, $0.effectiveSize.z)"),
+    "断言9：`WorldScreenStore.resolve` 传给屏幕推断的是**最终**尺寸 `generatedProp.effectiveSize`")
+check(!screenStoreSource.contains("worldBounds"),
+    "断言9：屏幕推断没有改读网格自身的 `worldBounds`（那一路会被板形判据具名拒绝，屏幕会消失）")
+
+// 六条注入负对照：每一条都必须让探针红**在它该红的那一条判据上**（`expected` 就是
+// 那一句的原话片段）。只看退出码不够 —— 锚点找不到 / 编不起来同样是"非零退出"。
+//
+// ① 覆盖"四边形算在未拉伸的坐标系里"那一路：0.86 是**比例**余量，与逐轴拉伸**可交换**
+//    —— "按旧坐标系算完再拉伸"与"按最终尺寸算"给出的是同一块四边形，
+//    所以它们本来就是同一个缺陷的两种写法（真机上都是 73.96%）。
+let fitInjections: [(name: String, patches: [(file: String, from: String, to: String)], expected: String)] = [
+    (name: "旧的四边 0.86（每边吃掉 7%）",
+     patches: [(file: "WorldScreenInference.swift", from: fitMarginBody,
+                to: "    static func bezelMargin(faceWidth: Float, faceHeight: Float) -> Float {\n"
+                    + "        min(faceWidth, faceHeight) * 0.07\n    }\n")],
+     expected: "屏幕占正面 ≥ 95%（实测 78.81%）"),
+    (name: "固定毫米数（只在真机那个尺寸成立）",
+     patches: [(file: "WorldScreenInference.swift", from: fitMarginBody,
+                to: "    static func bezelMargin(faceWidth: Float, faceHeight: Float) -> Float {\n"
+                    + "       0.00862\n    }\n")],
+     expected: "屏幕占正面 ≥ 95%（实测 94.89%）"),
+    (name: "写回第二份几何（四角）",
+     patches: [
+        (file: "WorldScreenGeometry.swift",
+         from: "        case objectID, source, center, yaw, pitch, halfWidth, halfHeight, note\n",
+         to: "        case objectID, source, center, yaw, pitch, halfWidth, halfHeight, note, corners\n"),
+        (file: "WorldScreenGeometry.swift",
+         from: "        try container.encode(note, forKey: .note)\n",
+         to: "        try container.encode(note, forKey: .note)\n"
+            + "        try container.encode(quad.corners, forKey: .corners)\n"),
+     ],
+     expected: "多出来 [\"corners\"]"),
+    (name: "放宽板形判据（0.25 → 1.0）",
+     patches: [(file: "WorldScreenInference.swift",
+                from: "    static let maximumPanelThicknessRatio: Float = 0.25",
+                to: "    static let maximumPanelThicknessRatio: Float = 1.0")],
+     expected: "板形判据仍是 最薄/最长 ≤ 0.25（实测 1.0）"),
+    (name: "放宽面积阈值（0.04 → 0）",
+     patches: [(file: "WorldScreenInference.swift",
+                from: "    static let minimumFaceArea: Float = 0.04",
+                to: "    static let minimumFaceArea: Float = 0.0")],
+     expected: "面积阈值仍是 0.04 m²（实测 0.0）"),
+    (name: "屏幕面加俯仰（法向不再是 +Z）",
+     patches: [(file: "WorldScreenInference.swift",
+                from: "                yaw: 0, pitch: 0,\n",
+                to: "                yaw: 0, pitch: 0.20,\n")],
+     expected: "屏幕朝向仍是正面 +Z（0.0000, 0.1987, 0.9801）"),
+]
+
+for injection in fitInjections {
+    let probe = try runFitProbe(patches: injection.patches)
+    let caught = probe.note.isEmpty && probe.status == 1
+        && probe.output.contains("FIT-FAILURES=")
+        && !probe.output.contains("FIT-FAILURES=0")
+        && probe.output.contains(injection.expected)
+    check(caught,
+        "断言9（注入负对照「\(injection.name)」）：探针必须红在「\(injection.expected)」这一条上"
+            + "（exit \(probe.status)）"
+            + (probe.note.isEmpty ? "" : " —— \(probe.note)"))
+    // 注入时的 FAIL 原话贴出来（红的是哪一条，当场看得见）。
+    for line in probe.output.split(separator: "\n").filter({ $0.hasPrefix("FIT-FAIL") }).prefix(3) {
+        print("  · \(line)")
+    }
 }
 
 print(failureCount == 0 ? "PASS 电视机判据全部通过" : "FAIL 电视机判据有 \(failureCount) 条不通过")
