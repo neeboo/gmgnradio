@@ -1,4 +1,4 @@
-.PHONY: generate test test-all test-install test-worlds test-daemon test-python test-harnesses _test-harnesses build install install-debug install-universal unregister-product dedupe verify-registrations
+.PHONY: generate test test-all test-install test-worlds test-daemon test-python test-harnesses _test-harnesses build install install-debug install-universal unregister-product test-icon dedupe verify-registrations
 
 # 默认 Release：只有 -O 下"承托网格派生"才是 0.5 s 量级（-Onone 是 6.6 s，
 # 真机一次要六秒多，用户等不了）。想最快编译走 make install-debug。
@@ -97,6 +97,33 @@ PRODUCT_APP ?= $(DERIVED_DATA)/Build/Products/$(CONFIGURATION)/gmgn radio.app
 LSREGISTER ?= /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 UNREGISTER_PRODUCT = "$(LSREGISTER)" -u "$(PRODUCT_APP)" >/dev/null 2>&1 || true
 
+# ---------------------------------------------------------------------------
+# 构建产物的**黑白测试 logo** —— **身份**上的第二重保险（用户 2026-10-02：
+# "别加角标了，你把原 logo 改成黑白吧，作为 test 的 logo"）。
+#
+# `.noindex` 是**路径级**的保证（Spotlight 够不到 `apps/macos/Build.noindex` 里的产物）；
+# 黑白 logo 是**身份级**的：产物一旦被拷到别处、被别的 DerivedData 产出、或者哪天约定
+# 变了，只看图标就知道哪份是构建产物，而不是靠名字一样去猜。
+#
+# 语义（别搞反）：
+#   * `make build` → 把 `$(PRODUCT_APP)`（DerivedData 里那份）的 icns 去色成黑白；
+#   * `make install` → 拷进 /Applications **之前** `--restore` 还原原始彩色 icns，
+#     所以装到 /Applications 的那份是**原来那张图**，日常图标不变样。
+#   * `TEST_ICON=` （空）→ 不再给产物换 logo（装进 /Applications 的 icns 仍然还原成
+#     原始文件，那一步与开关无关）。
+#
+# 只去色，不画角标/文字/描边：tools/test-app-icon.py 从
+# `apps/macos/Resources/AppIcon.icns` 现场生成黑白版（iconutil + Pillow），
+# **不改仓库里的原始 icns**。换 logo 是外观，失败不让 build 变红（日志里留 `FAIL:` 行）；
+# `--self-test` 可以单独验"逐像素无彩色 + alpha 不变 + restore 逐字节还原"。
+# ---------------------------------------------------------------------------
+TEST_ICON ?= 1
+ICON_TOOL ?= $(PYTHON) "$(CURDIR)/tools/test-app-icon.py"
+APPLY_TEST_ICON = if [ -n "$(TEST_ICON)" ] && [ -d "$(PRODUCT_APP)" ]; then $(ICON_TOOL) --apply "$(PRODUCT_APP)" || true; fi
+# 还原**不**跟着 TEST_ICON 开关走：装进 /Applications 的 icns 永远是仓库里那份原始
+# 文件（没换过 logo 时这一步就是一次等价拷贝，纯文件复制，不需要 Pillow）。
+RESTORE_ICON = $(ICON_TOOL) --restore "$(PRODUCT_APP)"
+
 # xcodegen 也写同一份 .xcodeproj，两个并发 `make build` 会同时重写它，所以一并进闸门。
 generate:
 	cd apps/macos && $(BUILD_LOCK) xcodegen generate
@@ -115,16 +142,22 @@ build: generate
 		-skipPackageUpdates \
 		$(ARCH_FLAGS) $(COMPILATION_MODE) \
 		CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO; \
-	status=$$?; $(UNREGISTER_PRODUCT); exit $$status
+	status=$$?; $(APPLY_TEST_ICON); $(UNREGISTER_PRODUCT); exit $$status
 
 # 可单独执行（`make unregister-product`，例如 daemon/网关之外另跑了一次 xcodebuild）；
 # `build` 末尾调用的就是上面同一条命令。想核对别的配置：CONFIGURATION=Debug。
 unregister-product:
 	-@$(UNREGISTER_PRODUCT)
 
+# 只给产物换黑白 logo（不动编译、不动注册表）：手工 xcodebuild 之后补一次。
+test-icon:
+	@$(APPLY_TEST_ICON)
+
 # One entry point: build the app + bundled helper, then install and switch both.
 # 日常迭代就用这一条：Release 的 -O 手感 + 单架构 + 增量编译。
+# 拷之前还原原始彩色 logo：`make build` 的黑白测试 logo 只属于构建产物，不该跟着进 /Applications。
 install: build
+	$(RESTORE_ICON)
 	python3 tools/install-macos.py --source "$(PRODUCT_APP)"
 	rm -rf "$(PRODUCT_APP)"
 
