@@ -77,10 +77,25 @@ let sizeIntentSource = sourceDeclaration(propClientSource, "struct PropSizeInten
 let coordinatorSource = try String(contentsOfFile:
     "apps/macos/Sources/GMGNRadio/Presence/WishMachineCoordinator.swift", encoding: .utf8)
 let sizeIntentLineSource = sourceDeclaration(coordinatorSource, "extension WishMachineJob {")
+// 托盘可见性 / 领取依据的**唯一**判据：逐字抽取生产声明（`WishMachineOutputReachability`
+// 与它依赖的 `WishMachineOutputStatus`）。任务行与托盘"说同一件事"靠的就是它，
+// 所以它绝不能在 harness 里再抄一份（抄一份正是"两份真相"最容易被放过去的地方）。
+let descriptorSource = try String(contentsOfFile:
+    "apps/macos/Sources/GMGNRadio/Presence/WishMachineOutputDescriptor.swift", encoding: .utf8)
+let reachabilitySource = sourceDeclaration(descriptorSource, "enum WishMachineOutputStatus")
+    + "\n" + sourceDeclaration(descriptorSource, "enum WishMachineOutputReachability")
+// 唯一投影**整份**编进来：任务行那一句现在委托给它（`OwnershipSentence` 是唯一出口），
+// 所以它不能在这里被抄成一份副本 —— 编的就是跑在 App 里的那一份。
+let ownershipProjectionSource = try String(contentsOfFile:
+    "apps/macos/Sources/GMGNRadio/Presence/ResidentOwnershipProjection.swift", encoding: .utf8)
+    .split(separator: "\n", omittingEmptySubsequences: false)
+    .filter { !$0.hasPrefix("import ") }
+    .joined(separator: "\n")
 
 let program = #"""
 import Foundation
 import Observation
+\#(ownershipProjectionSource)
 \#(sizeIntentSource)
 enum FixtureError: Error { case failed }
 enum WishMachineError: Error { case unknownAttachment }
@@ -139,7 +154,7 @@ struct WishMachineEvent {
 }
 struct WishMachineClaimEvidence { let worldID: String; let activityID: String?; let phase: String?; let distanceMeters: Double; let outputAvailable: Bool }
 struct WishMachineOutputDescriptor: Equatable { let id: String; let worldID: String }
-enum WishMachineOutputStatus: Equatable { case empty, loading(id: String), ready(id: String), failed(id: String, message: String) }
+\#(reachabilitySource)
 enum WishMachineScene {
     enum State { case idle, generating, ready, failed }
     static let worldID = "room"
@@ -245,10 +260,29 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
     func recordOutputRenderFailure(id: UUID, worldID: String, residentScope: String, message: String) throws {
         if renderFailurePersistenceFails { throw FixtureError.failed }
         guard let job = residentJobs(worldID: worldID, residentScope: residentScope).first(where: { $0.id == id && $0.stage == .ready }) else { throw FixtureError.failed }
-        guard !events.contains(where: { $0.wishID == id && $0.failureSource == "renderer" }) else { return }
+        let text = "成品场景加载失败：" + message
+        // 与真 coordinator **同一份**语义：记录是"最近一次推导"的结论，同一件产物永远只有
+        // 一条；结论变了就**替换**它，而不是"有了就不再记"（那会把旧文案永久留在盘上）。
+        if let index = events.firstIndex(where: { $0.wishID == id && $0.failureSource == "renderer" }) {
+            guard events[index].message != text else { return }
+            events[index].message = text
+            onChange?()
+            return
+        }
         events.append(.init(id: UUID(), wishID: id, worldID: worldID, residentScope: residentScope,
-            objectID: job.objectID, kind: .failed, message: "成品场景加载失败：" + message, failureSource: "renderer"))
+            objectID: job.objectID, kind: .failed, message: text, failureSource: "renderer"))
         onChange?()
+    }
+    /// 现场推导**成功** ⇒ 那条陈旧结论必须消失（同真 coordinator：幂等，没记录时不写入）。
+    @discardableResult
+    func clearOutputRenderFailure(id: UUID, worldID: String, residentScope: String) throws -> Bool {
+        if renderFailurePersistenceFails { throw FixtureError.failed }
+        let before = events.count
+        events.removeAll { $0.wishID == id && $0.worldID == worldID && $0.residentScope == residentScope
+            && $0.kind == .failed && $0.failureSource == "renderer" }
+        guard events.count != before else { return false }
+        onChange?()
+        return true
     }
     func outputRenderFailure(id: UUID, worldID: String, residentScope: String) -> WishMachineEvent? {
         events.first { $0.wishID == id && $0.worldID == worldID && $0.residentScope == residentScope && $0.kind == .failed && $0.failureSource == "renderer" }
@@ -898,7 +932,17 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
         await renderApp.drainScheduledWork()
         renderApp.spatialStage.wishMachineOutputStatus = .ready(id: "item")
         await renderApp.drainScheduledWork()
-        check(renderApp.propGenerationStore.published[event.id] == nil && renderApp.spatialStage.wishMachineOutput == nil, "a late ready callback cannot implicitly retry an artifact with a persisted renderer failure")
+        // **契约变更（2026-10-02 真机「超大荧幕电视」，HEAD 074ebd2 之前）**：旧断言写的是
+        // "一次 ready 回调**不许**把带持久化失败的产物弄回托盘"。那正是本次要修的缺陷 ——
+        // 派生结论（那条 `failureSource == "renderer"` 的失败）被当成持久事实，于是"推导逻辑
+        // 被修好了"这件事**永远不会被重新推导**，用户**永久**领不了（撞了两次）。
+        // 现在的契约：`.ready(id:)` 就是一次**重新推导成功**（渲染端用代次守卫丢掉了迟到的
+        // 旧回调之后才报的），它必须清掉那条陈旧结论、让托盘重新看得见它、也重新领得了。
+        check(renderApp.wishMachineCoordinator.outputRenderFailure(id: job.id, worldID: "room", residentScope: "resident") == nil
+              && renderApp.spatialStage.wishMachineOutput?.id == "item"
+              && renderApp.evidence(job)?.outputAvailable == true
+              && renderApp.wishMachineCoordinator.jobs[0].stage == .ready,
+              "重新推导成功 ⇒ 那条陈旧失败必须消失、托盘重新看得见它、也重新领得了（后端完成态不受影响）")
 
         let readyCallbackApp = App()
         readyCallbackApp.wishMachineCoordinator.jobs = [job]

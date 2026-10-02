@@ -26,7 +26,9 @@ let sources = ["Presence/PropGenerationClient", "Presence/PropGenerationStore", 
        // 连通性词汇只有**一份**：coordinator 的 `isNetworkClassSubmissionError` 现在
        // 委托给 `ResidentConnectivityFact`，所以那份生产文件必须一起编进来 ——
        // 是编同一份，不是在这里抄一份词汇表。
-       root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/WishMachineTaskPresentation.swift")]
+       root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/WishMachineTaskPresentation.swift"),
+       // 状态文案也只有**一份**：任务行那一句委托给唯一投影，一起编（编同一份）。
+       root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/ResidentOwnershipProjection.swift")]
 guard sources.allSatisfy({ FileManager.default.fileExists(atPath: $0.path) }) else {
     print("FAIL: wish machine coordinator and tool primitives are missing"); exit(1)
 }
@@ -273,8 +275,18 @@ extension WishMachineCoordinator {
             && coordinator.outputRenderFailure(id: UUID(), worldID: "world", residentScope: "resident") == nil, "renderer failure query isolates world resident and task")
         check(renderEvent.kind == .failed && renderEvent.stage == .ready && renderEvent.message?.hasPrefix("成品场景加载失败") == true, "renderer failure is a distinct local fact, never remote generation failure")
         check(try coordinator.read(id: job.id, worldID: "world", residentScope: "resident") == beforeRenderFailure, "renderer failure preserves downloaded backend state and model identity")
+        // 同一句话**不写第二遍**（重复渲染回调不许每帧落盘）。
+        try coordinator.recordOutputRenderFailure(id: job.id, worldID: "world", residentScope: "resident", message: "bad asset")
+        check(rendererNotifications == 1 && coordinator.unpublishedEvents(worldID: "world", residentScope: "resident").filter { $0.failureSource == "renderer" }.map(\.id) == [renderEvent.id], "repeated identical renderer callbacks retain one event and do not persist every frame")
+        // **结论变了**（重新推导给出另一句）⇒ 同一条记录被**替换**，不是"有了就不再记"。
+        // 旧行为会把修复前那句没有字段/数值的旧文案永久留在盘上，于是"重新推导仍然失败"
+        // 时用户读不到是哪一条判据、哪个数（新纪律要求具名）。
         try coordinator.recordOutputRenderFailure(id: job.id, worldID: "world", residentScope: "resident", message: "different per-frame detail")
-        check(rendererNotifications == 1 && coordinator.unpublishedEvents(worldID: "world", residentScope: "resident").filter { $0.failureSource == "renderer" }.map(\.id) == [renderEvent.id], "repeated renderer callbacks retain one event and do not persist every frame")
+        let refreshed = coordinator.outputRenderFailure(id: job.id, worldID: "world", residentScope: "resident")
+        check(rendererNotifications == 2 && refreshed?.id == renderEvent.id
+            && refreshed?.message == "成品场景加载失败：different per-frame detail"
+            && coordinator.unpublishedEvents(worldID: "world", residentScope: "resident").filter { $0.failureSource == "renderer" }.count == 1,
+            "a changed renderer conclusion replaces the same single event in place (never a second event)")
         coordinator.onChange = nil
         // A recovered download may retain an earlier failure fact; a scene failure is separate.
         var renderArchive = try JSONSerialization.jsonObject(with: Data(contentsOf: dir.appendingPathComponent("wishes/wishes.json"))) as! [String: Any]

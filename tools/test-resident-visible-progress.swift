@@ -160,7 +160,10 @@ try taskHarness.write(to: taskScript, atomically: true, encoding: .utf8)
 let taskExecutable = temporary.appendingPathComponent("tasks")
 let compiler = Process()
 compiler.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
-compiler.arguments = ["-j1", "-parse-as-library", taskModelPath, taskScript.path, "-o", taskExecutable.path]
+compiler.arguments = ["-j1", "-parse-as-library", taskModelPath,
+                      // 任务行那一句委托给唯一投影（`OwnershipSentence` 是唯一出口），一起编。
+                      root + "Presence/ResidentOwnershipProjection.swift",
+                      taskScript.path, "-o", taskExecutable.path]
 try compiler.run(); compiler.waitUntilExit()
 if compiler.terminationStatus != 0 { failures += 1 }
 else {

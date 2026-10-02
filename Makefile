@@ -290,12 +290,38 @@ _test-harnesses:
 	# stub，并多钉一条"矮胖物件的手感逐位不回归"。
 	swift tools/test-prop-attachment.swift
 	swift tools/test-wish-machine-coordinator.swift
+	# 许愿档案的**局部降级**（G6：一条坏 job 不许让整个列表消失；坏记录的原始 JSON 必须
+	# 留在档案里、不许被 persist 抹掉；别的段落坏了仍然 fail-closed）＋ **`.failed` 能重试**
+	# 而其它 guard 一个字不放宽（G2）＋ **领取判据只有一份**（按钮与 `claim()` 同一句话，G1）。
+	# 它单独立一份，是因为协调器那一份里另有一条与本判据无关、正在被并发线改动的断言。
+	swift tools/test-wish-machine-archive-degradation.swift
 	swift tools/test-wish-machine-app-runtime.swift
 	swift tools/test-resident-prop-placement.swift
+	# 「摆放 → 我的物件」= 全部许愿的目录：**唯一投影** `ResidentOwnershipProjection.row`。
+	# 对外只有五种状态（生成中/待领取/在库里（没摆）/已摆放/失败）+ 折叠的「已结束」；
+	# 一行 = 一次许愿（jobID 为主）∪ 一件世界物件（**只正向连接**，绝不反解 objectID）；
+	# 状态 = f(权威)（墓碑/heldProp/isEnabled 各自改变行状态）；派生结论**不实现 Codable**。
+	# 并拿**真机** `wishes.json`(7 条 job) + `state.json` 跑生产投影逐行复核：7 件一件都不许消失。
+	# 十条注入负对照，每条都必须让对应判据 FAIL（注入只改内存副本，跑完即弃）。
+	swift tools/test-ownership-list-projection.swift
 	# 删除一件生成资产：墓碑 + 事实（不是硬删行）、共享内容按**派生**引用计数保留、
 	# 摆放/手持原子收场、判据分层（`.removal` 不跑空间判据）、失败具名、未点名物件逐位不变，
 	# 以及"删干净"三层（记录 + 引用 + 文件）。见 docs/plans/2026-10-02-prop-deletion-semantics.md。
 	swift tools/test-resident-prop-delete.swift
+	# 「删掉之后重新入库」= 一次新的、合法的变更（真机 2026-10-02 `2F633C0F`：job stage=claimed、
+	# 权威 `world_records` 里那一行 tombstone=1、而 `layoutReceipts` 里 `claimed.<jobID>` 还在
+	# ⇒ 旧的"回执存在就在任何写入之前 `return`"把它永远挡住，「重试入库」点一次失败一次）。
+	# 回执的去重范围 = 它记下的那次变更**今天还立不立**（`WorldState.receiptIsStillInEffect`），
+	# 而「重试入库」的可用性读的是**同一个**来源（`canRedoInventoryRegistration`）。
+	# 五条判据（真机端到端落地 / 幂等 / 真重复仍去重 / 删除语义不变 / 按钮不撒谎）
+	# 各带注入负对照：旧回执判据、回执永远不去重、删除不写墓碑、判据放行墓碑、无条件给按钮、
+	# 补做循环退回按 `objectStates` 空不空判 —— 每条都实测让对应判据变红
+	# （注入只改临时副本里的源码，跑完即弃）。
+	swift tools/test-resident-reclaimed-prop-readd.swift
+	# 「我的物件」列表**只有一套投影**（2026-10-02 仲裁）：退役门禁钉住"第二套不许回来"
+	# ——全仓 0 处退役符号、唯一投影五态 + 折叠「已结束」且不实现 Codable、面板真的在读它、
+	# 列表 190 pt / 宽度 340 未变；两条注入负对照（塞回第二套投影 / 第四套文案）实测会红。
+	swift tools/test-resident-prop-catalog.swift
 	swift tools/test-resident-prop-one-judge.swift
 	swift tools/test-resident-prop-tools.swift
 	swift tools/test-resident-prop-capability.swift
@@ -313,6 +339,11 @@ _test-harnesses:
 	swift tools/test-resident-prop-world-collision.swift
 	swift tools/test-resident-prop-size.swift
 	swift tools/test-resident-prop-size-intent.swift
+	# 「等待入库，但托盘上什么都没有，也领不了」（真机 2026-10-02「超大荧幕电视」）：
+	# 派生结论（那条 `failureSource == "renderer"` 的失败）**必须能从权威重新推导**，
+	# 记录不许当可见性判据。四条判据 + 四条注入负对照（永久信记录 / 无条件清 /
+	# 两者分叉 / 三轴退回生成网格），每条都实测会红；注入只改内存副本，跑完校验 sha256。
+	swift tools/test-wish-machine-output-rederivation.swift
 	swift tools/test-resident-system-inbox-window.swift
 	swift tools/test-resident-prop-collision-proxy.swift
 	swift tools/test-resident-state-convergence.swift

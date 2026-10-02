@@ -166,6 +166,25 @@ struct FlatRoomAndTable: WorldPropSupportQuerying {
         let read=try await invoke(readonly,"read_owned_props",[:])
         check(!read.isError && (payload(read)["layout_revision"] as? Int) == 1,"read persisted inventory revision")
         check(String(decoding:read.resultJSON,as:UTF8.self).contains("摆件") && !String(decoding:read.resultJSON,as:UTF8.self).contains("/Users/"),"read inventory without paths")
+        // 回执里的状态那两句（`ownership_state` / `ownership_status`）**逐字**来自唯一投影：
+        // 桥自己不判状态、不编状态词，只把 `(String) -> OwnershipRow?` 的答案放进回执。
+        // 这里注入的就是**真投影**（`ResidentOwnershipProjection.row`），所以断言的是
+        // "agent 读到的与列表/任务行是同一句话"，不是"桥编了一句看起来差不多的"。
+        var ownershipProbe = OwnershipRowFacts(objectID: "owned")
+        ownershipProbe.objectPresent = true
+        ownershipProbe.objectHasGeneratedProp = true
+        ownershipProbe.objectName = "摆件"
+        ownershipProbe.objectIsEnabled = true
+        let probeRow = ResidentOwnershipProjection.row(ownershipProbe)
+        let ownershipBridge = ResidentPropToolBridge(service: service, allowsMutation: false,
+            isCurrent: { current.value },
+            ownershipRow: { id in id == "owned" ? probeRow : nil })
+        let ownershipRead = payload(try await invoke(ownershipBridge, "read_owned_props", [:], "read-ownership"))
+        let ownedEntry = (ownershipRead["objects"] as? [[String: Any]])?.first { $0["object_id"] as? String == "owned" }
+        check(ownedEntry?["ownership_status"] as? String == probeRow.statusText,
+              "read_owned_props 的 ownership_status 必须是唯一投影给的那一句（期望「\(probeRow.statusText)」，实测 \(ownedEntry?["ownership_status"] ?? "nil")）")
+        check(ownedEntry?["ownership_state"] as? String == OwnershipDisplayState.placed.rawValue,
+              "read_owned_props 的 ownership_state 必须是投影那一档（期望 \(OwnershipDisplayState.placed.rawValue)，实测 \(ownedEntry?["ownership_state"] ?? "nil")）")
         var place:[String:Any]=["object_id":"owned","surface_id":"test","x":-2.7,"y":0.52,"z":-5,"yaw":0]
         let before=context.state
         let preview=try await invoke(readonly,"preview_prop_placement",place)
@@ -394,7 +413,7 @@ let worldRuntimeFlags = worldRuntimeHarnessFlags()
 let objects=Array(worldRuntimeFlags.dropFirst(2))
 /// 编译内层程序（生产源码 / 注入副本共用同一条路）。
 func buildHarness(bridgePath:String,executable:URL)throws->Int32{
-    try run("/usr/bin/swiftc",["-j1","-parse-as-library","-I",worldRuntimeFlags[1],sources.appendingPathComponent("Agent/WorldAgentContext.swift").path,sources.appendingPathComponent("Presence/ResidentPropPlacementService.swift").path,root.appendingPathComponent("tools/fixtures/PropAttachmentPointShim.swift").path,sources.appendingPathComponent("Presence/PropGripInference.swift").path,sources.appendingPathComponent("Presence/PropAttachmentSlot.swift").path,bridgePath,root.appendingPathComponent("tools/fixtures/ResidentPropHoldLimitShim.swift").path,file.path,"-o",executable.path]+objects)
+    try run("/usr/bin/swiftc",["-j1","-parse-as-library","-I",worldRuntimeFlags[1],sources.appendingPathComponent("Agent/WorldAgentContext.swift").path,sources.appendingPathComponent("Presence/ResidentPropPlacementService.swift").path,root.appendingPathComponent("tools/fixtures/PropAttachmentPointShim.swift").path,sources.appendingPathComponent("Presence/PropGripInference.swift").path,sources.appendingPathComponent("Presence/PropAttachmentSlot.swift").path,sources.appendingPathComponent("Presence/ResidentOwnershipProjection.swift").path,bridgePath,root.appendingPathComponent("tools/fixtures/ResidentPropHoldLimitShim.swift").path,file.path,"-o",executable.path]+objects)
 }
 /// 跑内层程序并**收走**它的输出。负对照那两次跑必须收走：注入之后内层程序会打自己的
 /// `FAIL:` 行 —— 那是**注入生效的证据**，不是这次门禁失败。让它直接落到 stdout 上，

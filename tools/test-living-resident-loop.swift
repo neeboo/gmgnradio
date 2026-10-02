@@ -388,6 +388,10 @@ typealias RealConversationService = AgentConversationService
         ResidentPropPlacementService(context:context,isCurrent:isCurrent)
     }
     private func synchronizeResidentPropPresentation() {}
+    // `read_owned_props` 回执里那两句从**唯一投影**现算（生产里是
+    // `GMGNRadioApp.residentOwnershipRow`）。这个仿真宿主没有世界文档，
+    // 桩成"读不到"（nil ⇒ 回执里不写那两个键），语义与生产的"读不到 ⇒ 不编一句"一致。
+    private func residentOwnershipRow(objectID:String,context:WorldAgentContext) -> OwnershipRow? { nil }
     private func prepareResidentPropMutation(_ command:WorldPropLayoutCommand,context:WorldAgentContext) async throws {}
     private func synchronizeOwnedResidentProps() async {}
     private func residentWishPlacementGrant(objectID:String,placement:WorldPropPlacement,worldID:String,residentScope:String) throws -> ResidentPropDelegatedGrant {
@@ -1135,6 +1139,9 @@ let compilerArguments: [String] = ["-j1", "-parse-as-library",
     // 连通性词汇只有**一份**：coordinator 的 `isNetworkClassSubmissionError` 现在委托给
     // `ResidentConnectivityFact`，所以那份生产文件必须一起编进来（编同一份，不是抄一份）。
     sources.appendingPathComponent("Presence/WishMachineTaskPresentation.swift").path,
+    // 状态文案也只有**一份**：任务行那一句与 `read_owned_props` 回执都委托给唯一投影
+    // `ResidentOwnershipProjection`，所以那一份生产源码也必须一起编（编同一份）。
+    sources.appendingPathComponent("Presence/ResidentOwnershipProjection.swift").path,
     sources.appendingPathComponent("Presence/WishMachineCoordinator.swift").path,
     sources.appendingPathComponent("Agent/WishMachineContract.swift").path,
     sources.appendingPathComponent("Agent/ResidentWishMachineTools.swift").path,

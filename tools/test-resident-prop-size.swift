@@ -55,8 +55,17 @@ guard let sizeIntentDeclaration = declaration(in: propGenerationClientSource, "s
     print("FAIL: 生产源码里找不到 PropSizeIntent 的声明（尺寸意图契约不能只存在于别处）"); exit(1)
 }
 let editorStateSource = try String(contentsOf: sourceRoot.appendingPathComponent("Presence/ResidentPropEditorState.swift"), encoding: .utf8)
-guard editorStateSource.contains("static func rowStatus(isHeld: Bool, isPlaced: Bool)") else {
-    print("FAIL: the prop list has no single source for \"尚未摆放\" / \"已摆出\" / \"手持中\""); exit(1)
+// 状态文案**只有一份**，在唯一投影 `ResidentOwnershipProjection`（`OwnershipDisplayState.label`
+// / `OwnershipSentence`）。这里原先钉的是第二套 `rowStatus`（「尚未摆放 / 已摆出 / 手持中」）——
+// 2026-10-02 仲裁后它随第二套投影一起退场，于是断言改成：唯一投影在、第二套不许回来。
+let ownershipProjectionSource = try String(
+    contentsOf: sourceRoot.appendingPathComponent("Presence/ResidentOwnershipProjection.swift"), encoding: .utf8)
+guard ownershipProjectionSource.contains("enum OwnershipDisplayState: String, Sendable, CaseIterable {"),
+      ownershipProjectionSource.contains("case inInventory") else {
+    print("FAIL: the prop list has no single source for its status words (ResidentOwnershipProjection)"); exit(1)
+}
+guard !editorStateSource.contains("static func rowStatus(isHeld: Bool, isPlaced: Bool)") else {
+    print("FAIL: 第二套状态文案 rowStatus 又回来了（两套并存 = 两份真相）"); exit(1)
 }
 // ── 接线：策略必须真的挂在"请求高度"进系统的两处，而不是只存在于库里 ──────────
 // 1) 生成入库（`heightMeters` 是请求高度）；2) 许愿机托盘那一件（还没登记）。
@@ -82,7 +91,7 @@ _ = try wiring("Presence/WishMachineOutputRenderer.swift",
     "托盘渲染没有过尺寸策略")
 let editorViewSource = try String(contentsOf: sourceRoot.appendingPathComponent("VisualEngine/ResidentPropEditorView.swift"), encoding: .utf8)
 guard editorViewSource.contains("state.resize(toLongestEdge:"),
-      editorViewSource.contains("ResidentPropEditorState.rowStatus(") else {
+      editorViewSource.contains("state.ownershipList") else {
     print("FAIL: the decoration panel must offer a size control (slider / fine steps) and read the row status from that single source")
     exit(1)
 }
@@ -112,6 +121,8 @@ import simd
 \#(sizeIntentDeclaration)
 
 \#(outputDescriptorSource)
+
+\#(ownershipProjectionSource)
 
 \#(editorStateSource)
 
@@ -445,13 +456,21 @@ func measure(_ url: URL) -> (minimum: SIMD3<Float>, maximum: SIMD3<Float>)? {
         "碰撞盒必须跟着手动尺寸走（碰撞盒 \(f(authoritativeVolume.halfExtents.x * 2)) vs 尺寸 \(f(authoritativeProp.effectiveSize.x))）")
   print("PASS[9]: 权威尺寸与手动覆盖只有一份出口 —— 权威 \(v(authoritative.dimensions)) ⇒ 手动 \(v(authoritativeProp.effectiveSize))，碰撞盒同步")
 
-  // ---- A8：已入库但没摆出来，列表里必须写着「尚未摆放」----
-  check(ResidentPropEditorState.rowStatus(isHeld: false, isPlaced: false) == "尚未摆放",
-        "未摆放的已入库物件必须写着「尚未摆放」（实测「\(ResidentPropEditorState.rowStatus(isHeld: false, isPlaced: false))」）")
-  check(ResidentPropEditorState.rowStatus(isHeld: false, isPlaced: true) == "已摆出",
-        "已摆出的物件必须写着「已摆出」")
-  check(ResidentPropEditorState.rowStatus(isHeld: true, isPlaced: false) == "手持中",
-        "手持中的物件必须写着「手持中」")
+  // ---- A8：已入库但没摆出来，列表里必须写着「在库里（没摆）」（**唯一投影**的文案）----
+  var inventoryFacts = OwnershipRowFacts(objectID: resizedProp.objectID)
+  inventoryFacts.objectPresent = true
+  inventoryFacts.objectHasGeneratedProp = true
+  inventoryFacts.objectIsEnabled = false
+  let inventoryRow = ResidentOwnershipProjection.row(inventoryFacts)
+  check(inventoryRow.state == .inInventory
+        && inventoryRow.statusText == OwnershipSentence.inInventory.rawValue,
+        "未摆放的已入库物件必须写着「\(OwnershipSentence.inInventory.rawValue)」（实测「\(inventoryRow.statusText)」）")
+  var placedFacts = inventoryFacts; placedFacts.objectIsEnabled = true
+  check(ResidentOwnershipProjection.row(placedFacts).statusText == OwnershipSentence.placed.rawValue,
+        "已摆出的物件必须写着「\(OwnershipSentence.placed.rawValue)」")
+  var heldFacts = inventoryFacts; heldFacts.heldSlot = "rightHand"
+  check(ResidentOwnershipProjection.row(heldFacts).statusText == OwnershipSentence.heldByResident.rawValue,
+        "手持中的物件必须写着「\(OwnershipSentence.heldByResident.rawValue)」")
   let editor = ResidentPropEditorState()
   let unplaced = WorldObjectState(isEnabled: false,
       transform: .init(position: .init(x: 0, y: 0, z: 0), rotation: .init(x: 0, y: 0, z: 0, w: 1), scale: .init(x: 1, y: 1, z: 1)),
@@ -459,7 +478,7 @@ func measure(_ url: URL) -> (minimum: SIMD3<Float>, maximum: SIMD3<Float>)? {
   editor.update(.init(worldID: saved.worldID, revision: 1, objects: [unplaced], surfaces: [], canUndo: false))
   check(editor.objects.contains { $0.generatedProp?.objectID == resizedProp.objectID },
         "「我的物件」列表（默认筛选）必须能看见已入库但没摆出来的物件")
-  print("PASS[8]: 未摆放的已入库物件在列表里可见且写着「\(ResidentPropEditorState.rowStatus(isHeld: false, isPlaced: editor.objects.first?.isEnabled ?? true))」")
+  print("PASS[8]: 未摆放的已入库物件在列表里可见且写着「\(inventoryRow.statusText)」")
 
   print("PASS: \(checks) 项断言全部通过（真机那把剑 \(v(auto.size)) m、真实舱体 \(environment.count) 三角形 / \(grid.layers.count) 承托层）")
  }
@@ -525,6 +544,8 @@ viewCheck.arguments = ["-j1", "-typecheck", "-swift-version", "6", "-I", build.a
     root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/PropGripInference.swift").path,
     root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/PropAttachmentSlot.swift").path,
     root.appendingPathComponent("tools/fixtures/PropAttachmentPointShim.swift").path,
+    // 「我的物件」的唯一投影：`ResidentPropEditorState` 现在从它现算行，编面板状态就得一起编它。
+    root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/ResidentOwnershipProjection.swift").path,
     root.appendingPathComponent("apps/macos/Sources/GMGNRadio/VisualEngine/ResidentPropEditorView.swift").path]
 try viewCheck.run(); viewCheck.waitUntilExit()
 guard viewCheck.terminationStatus == 0 else { print("FAIL: 摆放面板（尺寸控件那一段）编译不过"); exit(1) }

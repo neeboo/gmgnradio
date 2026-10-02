@@ -1417,7 +1417,7 @@ let ui = "import SwiftUI\nimport AppKit\nimport Observation\n@MainActor\n@Observ
 try ui.write(to: uiSource, atomically: true, encoding: .utf8)
 // `ResidentStatusBadge.swift` 一并编进来：下面那些断言跑的是**生产那一份**状态→符号
 // 投影与气泡几何，不是 harness 里抄的一份副本。
-let attachmentSources = ["VisualEngine/ResidentStatusBadge.swift", "Presence/ResidentImageAttachment.swift", "Presence/PropImagePreparation.swift", "Presence/PropGenerationClient.swift", "Presence/WishMachineTaskPresentation.swift"].map { sources.appendingPathComponent($0).path }
+let attachmentSources = ["VisualEngine/ResidentStatusBadge.swift", "Presence/ResidentImageAttachment.swift", "Presence/PropImagePreparation.swift", "Presence/PropGenerationClient.swift", "Presence/WishMachineTaskPresentation.swift", "Presence/ResidentOwnershipProjection.swift"].map { sources.appendingPathComponent($0).path }
 let checked = try run("/usr/bin/swiftc", ["-j1", "-typecheck", "-target", "arm64-apple-macos14.0", uiSource.path] + attachmentSources)
 guard checked == 0 else { exit(checked) }
 let compiled = try run("/usr/bin/swiftc", ["-j1", "-parse-as-library", source.path, "-o", executable.path] + attachmentSources)

@@ -663,6 +663,9 @@ let onHandCompile=try run("/usr/bin/nice",["-n","15","/usr/bin/swiftc","-j1","-p
     // 编不动的那两份：`PropAttachment*.swift`）。
     "-I",worldBuild + "/Modules",descriptor,sizeIntentShim.path,
     "apps/macos/Sources/GMGNRadio/Presence/PropGripInference.swift",editorState,onHandFile.path,
+    // 「我的物件」的唯一投影：`ResidentPropEditorState` 现在从它现算行（`ownershipFacts` →
+    // `ResidentOwnershipProjection.row`），所以编面板状态就必须一起编它（编同一份，不抄）。
+    "apps/macos/Sources/GMGNRadio/Presence/ResidentOwnershipProjection.swift",
     "-o",onHandExe.path] + worldObjects)
 guard onHandCompile==0 else {exit(onHandCompile)}
 exit(try run(onHandExe.path,[]))

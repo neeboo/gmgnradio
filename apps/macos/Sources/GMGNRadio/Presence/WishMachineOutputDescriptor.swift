@@ -212,6 +212,52 @@ enum WishMachineOutputStatus: Equatable, Sendable {
     case failed(id: String, message: String)
 }
 
+/// 一件 `ready` 产物**此刻能不能领**：托盘可见性、任务行那一句、领取依据**三处共读的唯一判据**。
+///
+/// 为什么要有它（真机 2026-10-02「超大荧幕电视」）：托盘/领取原来读的是
+/// `outputRenderFailure` —— 一条**持久化的派生结论**（某次渲染推导失败，`failureSource == "renderer"`）。
+/// 于是"推导逻辑被修好"这件事**永远不会被重新推导**：那台电视 `stage == .ready`、资产完好、
+/// 尺寸意图今天能推出合法尺寸，却因为那条旧结论**永久**从托盘上消失、也永远领不了
+/// （用户已经撞了两次）。任务行另走一套（`job.stage` + 三轴），两者因此还能各说各的。
+///
+/// 这里的判据只有一条：**此刻的现场推导**（`WishMachineOutputStatus`）说了算。
+/// 持久化记录只是"上一次推导说了什么"的**记录**，不是权威 —— 它只在还没有现场结论时
+/// 供出同一句具名原因，**绝不决定可见性**。
+enum WishMachineOutputReachability: Equatable, Sendable {
+    /// 现场推导成功：托盘上真的画出来了，可以领。
+    case claimable
+    /// 现场推导失败：原因是渲染端刚给出的那一句（尺寸拒绝自带字段与数值）。
+    case unavailable(reason: String)
+    /// 还没有现场结论（还没接管 / 仍在装载）：托盘这一刻没有它，
+    /// 任务行因此也**不许**说"可领取"。`reason` = 上一次推导的记录（没有就是 nil）。
+    case deriving(reason: String?)
+
+    /// 判据的唯一一份实现。
+    ///
+    /// - `isTrayHolder`：这一刻托盘端的就是这件产物（`spatialStage.wishMachineOutput`）。
+    ///   **不是**托盘上那一件时，无论它自己推导成没成，都不能说"可领取" —— 那话只有托盘能说。
+    /// - `live`：渲染端**当前**的推导结论（不是记录）。
+    /// - `recordedFailure`：上一次推导留下的具名失败。**只是记录**，只用于"还没现场结论"时说话。
+    static func resolve(isTrayHolder: Bool, live: WishMachineOutputStatus,
+                        objectID: String, recordedFailure: String?) -> Self {
+        if isTrayHolder {
+            switch live {
+            case .ready(let id) where id == objectID: return .claimable
+            case .failed(let id, let message) where id == objectID: return .unavailable(reason: message)
+            default: return .deriving(reason: recordedFailure)
+            }
+        }
+        // 不是托盘上那一件：现场对**它**没有结论（渲染端一次只推导托盘上那一件）。
+        // "上一次那条还成不成立"只有它真的端上托盘、被**重新推导**一次才知道 ——
+        // 所以这里既不说"可领取"，也不凭记忆把它从托盘候选里减掉（那正是真机那台电视
+        // 永久领不了的原因）。上一次推导的结论仍然可读，让"为什么还没看见它"有话说。
+        return recordedFailure.map { .unavailable(reason: $0) } ?? .deriving(reason: nil)
+    }
+
+    /// 这一档能不能领取。**只有现场推导成功**才算 —— 陈旧记录不算、装载中也还不算。
+    var isClaimable: Bool { self == .claimable }
+}
+
 /// 尺寸判据的**字段级**具名拒绝：哪一个字段不成立、实测多少、期望什么。
 ///
 /// 为什么要有它（新纪律的一条）：真机 2026-10-02「超大荧幕电视」时，"尺寸无效"这四个字

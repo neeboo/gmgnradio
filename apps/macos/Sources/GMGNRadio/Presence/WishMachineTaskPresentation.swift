@@ -7,29 +7,17 @@ import Combine
 /// 网络只影响这条轴的**进度**，不影响别的轴，也不构成"需要人工解除的暂停"。
 enum ResidentGenerationAxis: String, Equatable, Sendable {
     case queued, generating, completed, failed
-
-    var label: String {
-        switch self {
-        case .queued: "排队中"
-        case .generating: "生成中"
-        case .completed: "已完成"
-        case .failed: "已失败"
-        }
-    }
+    // 三轴**没有**自己的 `label`（2026-10-02 收口）：原先那四个字面量
+    // （排队中 / 生成中 / 已完成 / 已失败）是与唯一投影并存的第二套状态词。
+    // 三轴 → 一句话只有**一个**出口：`ResidentTaskAxisProjection.currentStatus` →
+    // `ResidentOwnershipProjection.sentence(...)` → `OwnershipSentence`。
 }
 
 /// **归属轴**：未领取 → 已领取 → 已入库。
 /// **只前进**：网络、重启、重复刷新都不能把它推回去（见 `advance(_:to:)`）。
 enum ResidentOwnershipAxis: String, Equatable, Sendable, Comparable {
     case unclaimed, claimed, inInventory
-
-    var label: String {
-        switch self {
-        case .unclaimed: "未领取"
-        case .claimed: "已领取"
-        case .inInventory: "已入库"
-        }
-    }
+    // 同上：`label`（未领取 / 已领取 / 已入库）已删 —— 那一句话在唯一投影里。
 
     private var rank: Int {
         switch self {
@@ -54,14 +42,7 @@ enum ResidentOwnershipAxis: String, Equatable, Sendable, Comparable {
 /// （在库存 → 已摆放）原样保留，只是给它补了一个诚实的起点。
 enum ResidentPlacementAxis: String, Equatable, Sendable, Comparable {
     case notYetPlaced, inInventory, placed
-
-    var label: String {
-        switch self {
-        case .notYetPlaced: "未摆放"
-        case .inInventory: "在库存"
-        case .placed: "已摆放"
-        }
-    }
+    // 同上：`label`（未摆放 / 在库存 / 已摆放）已删 —— 那一句话在唯一投影里。
 
     private var rank: Int {
         switch self {
@@ -172,19 +153,23 @@ enum ResidentTaskAxisProjection {
     /// 沿 `生成 → 归属 → 摆放` 这条链**从后往前**看，走到哪一步就说哪一步。
     /// 于是「已摆放」的任务不会因为生成轴上曾经失败而被说成"生成失败"。
     ///
+    /// **字面量不再在这里**（2026-10-02 收口）：这一句委托给唯一投影
+    /// `ResidentOwnershipProjection.sentence(generation:ownership:placement:)`，
+    /// 于是任务行、列表、「房间里」、托盘、agent 回执取的是**同一份** `OwnershipSentence`。
+    /// 以前这里自己写着 可领取 / 等待入库 / 未摆放 —— 那是与投影并存的第二套状态词，
+    /// 同一件事在任务行与列表里能说成两句不同的话。
+    ///
+    /// 三轴语义一个字没动（`project` / `advance` / `hasReachedTerminalStep` 照旧）：
+    /// 变的只是这三轴**合成哪一句话**，而且那句话只有一个出口。
+    ///
     /// 唯一不由这里说的是**失败**：`.failed` 只说明"没做成"，说不出是失败、取消还是
     /// 中断，所以任务行走既有失败通道（见 `WishMachineTaskPresentation.currentStatusLine`），
     /// 原因仍在 `detail` 那一行 —— 不在这里另造一句。
     static func currentStatus(_ axes: ResidentTaskAxes) -> String {
-        if axes.placement == .placed { return "已摆放" }
-        if axes.ownership == .inInventory { return "未摆放" }
-        if axes.ownership == .claimed { return "等待入库" }
-        switch axes.generation {
-        case .completed: return "可领取"
-        case .failed: return "生成失败"
-        case .generating: return "生成中"
-        case .queued: return "排队中"
-        }
+        ResidentOwnershipProjection.sentence(
+            generation: axes.generation.rawValue,
+            ownership: axes.ownership.rawValue,
+            placement: axes.placement.rawValue)
     }
 
     /// 三轴上「已经走到头」的那一档：**进了库存**或**摆了出来**。
@@ -306,6 +291,19 @@ struct WishMachineTaskPresentation: Identifiable, Equatable {
     let isTerminal: Bool
     /// 三轴状态。宿主投影提供时，任务行按三轴渲染；为 `nil` 时退回 `status` 一行。
     var axes: ResidentTaskAxes? = nil
+    /// 宿主那句话**必须**盖过三轴那一档。
+    ///
+    /// 三轴说得出"走到了哪一步"（排队/生成/完成 → 未领取/已领取/已入库 → 未摆放/已摆放），
+    /// 说不出"**这一刻托盘上有没有它**"。而"可领取"这句话是关于托盘的：托盘上没有它时
+    /// 三轴照样会说"可领取"，任务行于是与空托盘自相矛盾（真机 2026-10-02「超大荧幕电视」：
+    /// 任务行说有下一步、托盘上什么都没有、也领不了）。
+    ///
+    /// 所以判据仍是**一处**（`currentStatusLine`），只是它现在能听到宿主那句从**现场推导**
+    /// （`WishMachineOutputReachability`）得来的话。它不是第二个状态来源：
+    /// `status` 本来就存在，这里只是允许它在三轴说得不完整时说话。
+    /// 与 `isTerminal` 分开是有意的：`isTerminal` 还会让**站内提示 30 秒后过期**，
+    /// 而"还在把产物放上托盘"不是终态，任务行不许因此消失。
+    var hostSentenceWins: Bool = false
     /// 内部事实：该任务被**用户显式停止**过（持久化的 `autoContinuationStoppedByUser`
     /// 或同等证据）。**不按任务渲染**，只参与"全局开关是否被停过"的判定。
     var autoContinuationPaused: Bool = false
@@ -324,8 +322,12 @@ extension WishMachineTaskPresentation {
     /// 视图里因此**没有任何 if/else**，也没有第二份状态文案。
     ///
     /// `axes == nil` 时退回宿主那句话：这次简化只减去标签，不减去状态。
+    ///
+    /// `hostSentenceWins` 时也走宿主那句：三轴给不出"托盘这一刻有没有它"，
+    /// 而"可领取"说的正是托盘。两者因此不可能一个说"可领取"、另一个空着。
     var currentStatusLine: String {
         guard let axes else { return status }
+        if hostSentenceWins { return status }
         if isTerminal, !ResidentTaskAxisProjection.hasReachedTerminalStep(axes) { return status }
         return ResidentTaskAxisProjection.currentStatus(axes)
     }

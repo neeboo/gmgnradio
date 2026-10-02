@@ -319,6 +319,33 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         residentPropEditor.update(snapshot)
     }
 
+    /// 列表上那两个许愿动作（「未领取」行的领取、失败行的重试）。**单独一个入口**，
+    /// 不并进 `configureResidentPropEditor`：那个函数被离线 harness 逐字抽取去编译，
+    /// 而它不知道许愿机协调器（见 `GMGNRadioApp.configureResidentPropWishActions`）。
+    ///
+    /// 这里只转交，不判定：能不能领 / 能不能重试由宿主注入的那两条**既有**路径回答。
+    func configureResidentPropWishActions(
+        claim: @escaping @MainActor (String) async throws -> Void,
+        retry: @escaping @MainActor (String) async throws -> Void
+    ) {
+        residentPropEditor.claimWishOutput = claim
+        residentPropEditor.retryWishOutput = retry
+    }
+
+    /// Q4：「领取」够不到许愿机时那一枚「让居民去取」。
+    ///
+    /// 与上面两条**分开**接线（上面那条签名一个字没动）：它接的是**既有的 agent 路径**
+    /// （居民自己走到取物点再用 `claim_when_arrived` 领），不是第三条世界命令，
+    /// 也**不放宽** `claim()` 的 0.25 m / activityID 判据。
+    func configureResidentPropFetchAction(_ ask: @escaping @MainActor (String) async throws -> Void) {
+        residentPropEditor.askResidentToFetchOutput = ask
+    }
+
+    /// 「已领取但没入库」那一行的「重试入库」：接**既有**的入库补做重入。
+    func configureResidentPropInventoryRetryAction(_ retry: @escaping @MainActor (String) async throws -> Void) {
+        residentPropEditor.retryInventoryOutput = retry
+    }
+
     /// 菜单栏要读的装修状态：装修面板此刻是否打开。
     var isDecorationEditorOpen: Bool {
         residentPropEditor.isOpen

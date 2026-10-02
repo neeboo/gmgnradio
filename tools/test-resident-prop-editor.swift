@@ -225,6 +225,10 @@ let livingWorldLogger = Logger(subsystem: ProductIdentity.bundleIdentifier, cate
 \#(method("enum ResidentPropSupportReadiness",in:appSource))
 \#(method("enum ResidentPropDecorationSessionRearm",in:appSource))
 \#(model.replacingOccurrences(of: "import WorldRuntime", with: ""))
+// 「我的物件」的**唯一**投影：`ResidentPropEditorState` 现在从它现算行
+// （`ownershipFacts` → `ResidentOwnershipProjection.row` / `.list`）。编同一份生产文件，
+// 不在这里抄一份同名替身 —— 抄了测到的就不是生产代码了。
+\#(try String(contentsOf: root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/ResidentOwnershipProjection.swift"), encoding: .utf8))
 \#(gridMapping)
 \#(gridPicker)
 \#(gridPresentation)

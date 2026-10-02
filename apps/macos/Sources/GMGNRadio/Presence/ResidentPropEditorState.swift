@@ -123,6 +123,11 @@ enum ResidentPropSceneClick {
     }
 }
 
+// 「我的物件」列表的状态推导**只有一处**：
+// `ResidentOwnershipProjection`（`Presence/ResidentOwnershipProjection.swift`），纯函数、
+// 不实现 `Codable`、不落盘。这里原先并存的第二套目录投影与它的第四套状态文案已在
+// 2026-10-02 仲裁后**逐字删除**：两套投影并存正是"东西静默消失"的形状，不许再回来。
+
 struct ResidentPropEditorSnapshot: Equatable, Sendable {
     let worldID: String
     let revision: UInt64
@@ -152,16 +157,32 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     /// 不是"几何上看起来能靠"的格子。
     let wallFaces: Int
     let wallPlaceableCells: Int
+    /// 「我的物件」的**全部事实**：`wishes.json` 的一条 job ∪ 世界文档的一件物件
+    /// （含已删除的墓碑 —— 它不再被"跳过"，而是折叠进「已结束」，见唯一投影）。
+    ///
+    /// 这一份**不是列表状态** —— 行、对外状态、分组、折叠、动作全由唯一投影
+    /// `ResidentOwnershipProjection` 从它**现算**。宿主只提供事实，一个字都不判断。
+    ///
+    /// 加它是因为真机 2026-10-02 用户那句「没领取也应该在这个列表，写着未领取啊」：
+    /// 列表以前只读库存记录，于是**还没领取的许愿产物在这个列表里根本不存在**。
+    let ownershipFacts: [OwnershipRowFacts]
+    /// 组内确定性顺序（行标识 → `wishes.json` 里的下标，越大越新）。
+    ///
+    /// `WishMachineJob` 没有时间字段，所以"最近在前"只能用这个**确定性**的替代，
+    /// 而不是假装有时间戳（见投影的 `ordered`）。
+    let ownershipOrder: [String: Int]
     init(worldID: String, revision: UInt64, objects: [WorldObjectState], surfaces: [ResidentPropEditorSurface],
          canUndo: Bool, heldProp: WorldHeldProp? = nil, holdUnavailableReasons: [String: String] = [:],
          holdUnavailableReasonsBySlot: [String: [String: String]] = [:],
          supportGeometryUnavailable: Bool = false,
-         wallFaces: Int = 0, wallPlaceableCells: Int = 0) {
+         wallFaces: Int = 0, wallPlaceableCells: Int = 0,
+         ownershipFacts: [OwnershipRowFacts] = [], ownershipOrder: [String: Int] = [:]) {
         self.worldID = worldID; self.revision = revision; self.objects = objects; self.surfaces = surfaces
         self.canUndo = canUndo; self.heldProp = heldProp; self.holdUnavailableReasons = holdUnavailableReasons
         self.holdUnavailableReasonsBySlot = holdUnavailableReasonsBySlot
         self.supportGeometryUnavailable = supportGeometryUnavailable
         self.wallFaces = wallFaces; self.wallPlaceableCells = wallPlaceableCells
+        self.ownershipFacts = ownershipFacts; self.ownershipOrder = ownershipOrder
     }
     static let empty = Self(worldID: "", revision: 0, objects: [], surfaces: [], canUndo: false,
                             heldProp: nil, holdUnavailableReasons: [:], supportGeometryUnavailable: false)
@@ -256,6 +277,28 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     ///
     /// 唯一消费者是 `select(objectID:)`：见那里对"快照是推送来的、格子却异步派生"的说明。
     var refreshSnapshot: (@MainActor () -> ResidentPropEditorSnapshot?)?
+    /// 列表里「未领取」那一行的动作 —— 接的是**既有**那条领取路径
+    /// （`WishMachineCoordinator.claim`，与 agent 的 `claim_wish_output` 同一个出口）。
+    ///
+    /// 判据一个字都没放宽：人要到许愿机领取位置、托盘真的显示出这一件 ——
+    /// 够不到时这里收到的是它自己那句具名原因（`WishMachineError.notAtMachine`），
+    /// 面板照原话显示，**不替它编一句更"友好"的话**，也不绕过它。
+    var claimWishOutput: (@MainActor (String) async throws -> Void)?
+    /// 失败那一行的「重试」——接的是**既有**的 `WishMachineCoordinator.retry`
+    /// （与 agent 的 `retry_wish_generation` 同一条）。能不能重试由那条路自己的 guard 回答
+    /// （对它不接受的 stage，回的是 `WishMachineError.retryUnavailable` 的原话）。
+    var retryWishOutput: (@MainActor (String) async throws -> Void)?
+    /// Q4：「领取」够不到许愿机时那一枚「让居民去取」——走**既有的 agent 路径**
+    /// （`claim_when_arrived`，居民自己走到取物点再领）。
+    ///
+    /// **不是**一条新的人类通道：这里只是替用户对居民说一句话，真正那一次领取仍然
+    /// 由 `WishMachineCoordinator.claim` 的三条判据（`activityID == "wish_machine.collect"`、
+    /// `distanceMeters ≤ 0.25`、`outputAvailable`）决定，一个字都没放宽。
+    var askResidentToFetchOutput: (@MainActor (String) async throws -> Void)?
+    /// 「已领取但没入库」那一行的下一步：走**既有**的入库补做重入
+    /// （`synchronizeOwnedResidentProps` → 摆放服务的 `register`，幂等键仍是
+    /// `claimed.<jobID>`）。它**不是** `retry`：`retryableStages` 刻意不含 `.claimed`。
+    var retryInventoryOutput: (@MainActor (String) async throws -> Void)?
     var onPreviewChanged: @MainActor (WorldObjectState?) -> Void = { _ in }
     var onEditingChanged: @MainActor (Bool) -> Void = { _ in }
     /// 一个**面板**动作做完之后，把键盘焦点交回场景交互视图（参数是动作名，只给诊断日志用）。
@@ -286,6 +329,23 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
             item.generatedProp != nil && (!showsPlacedOnly || item.isEnabled || snapshot.heldProp?.objectID == item.generatedProp?.objectID)
         }
     }
+    /// 「我的物件」这一页现在的**全部行** —— 由**唯一**投影 `ResidentOwnershipProjection`
+    /// 从 `snapshot.ownershipFacts` 现算。本类型不推导状态、不另存一份、不缓存。
+    ///
+    /// 「房间里」这一档仍然是**已摆放**（语义一个字没改）：只保留投影判定为 `inRoom`
+    /// 的那些行，于是未领取 / 失败 / 已删除的行不会污染这一页。
+    var ownershipList: OwnershipList {
+        var rows = snapshot.ownershipFacts.map(ResidentOwnershipProjection.row)
+        if showsPlacedOnly { rows = rows.filter { $0.group == .inRoom } }
+        return ResidentOwnershipProjection.list(rows, order: snapshot.ownershipOrder,
+                                                showsEnded: showsEnded)
+    }
+    /// 「已结束」那一组是否展开。**默认折叠**（Q1：已删除的折叠可见，不是隐藏）。
+    ///
+    /// 它只是这一次点击的界面状态：不进快照、不落盘。行的状态仍然只由权威推导。
+    @Published var showsEnded = false
+    /// 某一件物件现在是不是**居民拿在手里 / 挂在身上**（唯一一份既有的持有事实）。
+    func isHeld(_ objectID: String) -> Bool { snapshot.heldProp?.objectID == objectID }
     var selectedObject: WorldObjectState? { snapshot.objects.first { $0.generatedProp?.objectID == selectedID } }
     var isSelectedHeld: Bool { selectedID != nil && snapshot.heldProp?.objectID == selectedID }
     /// 「鼠标把物件拿在手上」——**派生**，不新增存储状态。
@@ -305,15 +365,11 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
         // 尺寸只有一个出口：`effectiveSize`（判据、碰撞盒、红/绿格、渲染目标高度都读它）。
         return (SIMD2(prop.effectiveSize.x, prop.effectiveSize.z), prop.effectiveSize.y)
     }
-    /// 列表里那一行的状态文案（**唯一**一份推导，`ResidentPropEditorView` 直接读它）。
-    ///
-    /// 真机 2026-10-01：一件**已入库但没摆出来**的物件在房间里看不见，列表里也只有名字、
-    /// 没有任何状态 —— 用户说"大剑还是消失了"。"在库存里"与"在房间里"是两件事实，
-    /// 两件都要说；"放不下"绝不允许看起来像"消失"。
-    static func rowStatus(isHeld: Bool, isPlaced: Bool) -> String {
-        if isHeld { return "手持中" }
-        return isPlaced ? "已摆出" : "尚未摆放"
-    }
+    // 行上的状态文案**只有一份**：`OwnershipDisplayState.label` / `OwnershipSentence`
+    // （都在 `ResidentOwnershipProjection`，视图直接读 `OwnershipRow.statusText`）。
+    // 这里原先另有一份「手持中 / 已摆出 / 尚未摆放」的第二套文案 —— 2026-10-02 仲裁后
+    // 随第二套投影一起退场：真机 2026-10-01「大剑还是消失了」要的是**可见**，
+    // 而"已摆出"与投影的"已摆放"并存本身就又是一份真相。
     var selectedGrip: WorldPropGripCalibration? { isSelectedHeld ? selectedObject?.gripCalibration : nil }
     /// 选中那一行现在显示的"为什么拿不了"：问的是**用户此刻选的挂点**（`holdPoint`），
     /// 不是省缺的右手 —— 否则用户把挂点切到"背后"时，那一行还在说右手的问题。
@@ -758,6 +814,70 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
         handFocusBackToScene(trigger: "撤销上次")
         await save(.undo)
     }
+
+    // MARK: - 许愿任务那一行上的动作（未领取 → 领取；生成失败 → 重试）
+
+    /// 列表里「未领取」那一行的**唯一出口**：走宿主注入的既有领取路径。
+    func claimWish(jobID: String) async {
+        await performWishAction(jobID: jobID, step: "claim", action: claimWishOutput)
+    }
+    /// 列表里失败那一行的**唯一出口**：走宿主注入的既有 retry。
+    func retryWish(jobID: String) async {
+        await performWishAction(jobID: jobID, step: "retry", action: retryWishOutput)
+    }
+    /// 列表里「待领取」但**够不到**许愿机那一行的出口：请居民去取（既有 agent 路径）。
+    func askResidentToFetch(jobID: String) async {
+        await performWishAction(jobID: jobID, step: "ask-resident", action: askResidentToFetchOutput)
+    }
+    /// 列表里「已领取，入库尚未保存」那一行的出口：走既有的入库补做重入。
+    func retryWishInventory(jobID: String) async {
+        await performWishAction(jobID: jobID, step: "retry-inventory", action: retryInventoryOutput)
+    }
+
+    /// 两个许愿动作的公共形状：防重入（`isSaving`）+ **失败绝不静默**（原话进 `notice` 与日志）。
+    ///
+    /// 这里刻意**不做**任何"能不能领/能不能重试"的预判：那个判定只有一份，在既有那条路上
+    /// （`claim` 的三条门槛、`retry` 的 stage guard）。面板只负责把结果说出来 ——
+    /// 多判一次就是第四套状态文案。
+    private func performWishAction(jobID: String, step: String,
+                                   action: (@MainActor (String) async throws -> Void)?) async {
+        guard isOpen, !isSaving else { return }
+        guard let action else {
+            notice = Self.wishActionNotWiredText
+            livingWorldLogger.notice("摆件面板拒绝 step=wish-\(step, privacy: .public)-not-wired 任务=\(jobID, privacy: .public)")
+            return
+        }
+        isSaving = true; isMoving = false
+        // 保存中：世界随时可能换一份回来，这次待办一律作废（与 `save` 同一条纪律）。
+        clearPendingSelect(reason: "许愿任务动作中")
+        do {
+            try await action(jobID)
+            isSaving = false
+            // 状态那一句由宿主推来的新快照说（列表读的是权威），这里只说"这次动作提交出去了"。
+            switch step {
+            case "claim": notice = Self.claimSubmittedText
+            case "ask-resident": notice = Self.askResidentSubmittedText
+            case "retry-inventory": notice = Self.retryInventorySubmittedText
+            default: notice = Self.retrySubmittedText
+            }
+            livingWorldLogger.notice("摆件面板许愿任务 step=wish-\(step, privacy: .public) 任务=\(jobID, privacy: .public) 结果=已提交")
+        } catch {
+            isSaving = false
+            // **原话**：既有那条路给出的具名原因，一个字都不改写。
+            notice = error.localizedDescription
+            livingWorldLogger.notice("摆件面板许愿任务 step=wish-\(step, privacy: .public) 任务=\(jobID, privacy: .public) 结果=拒绝 原因=\(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// 宿主还没把许愿动作接上时的那句话（绝不静默、绝不假装做过）。
+    static let wishActionNotWiredText = "摆放面板还没有接到许愿任务上（宿主还没接线），这一次没有提交。"
+    // 提交出去之后那句"接下来会怎样"：状态词**只允许**用唯一投影的那五个
+    // （`OwnershipDisplayState.label`），这里不再自己编第二套（原先写的「尚未摆放」
+    // 是随第二套投影一起退场的第四套文案）。
+    static let claimSubmittedText = "领取已登记。入库完成后这一行会改写成「\(OwnershipDisplayState.inInventory.label)」。"
+    static let retrySubmittedText = "已按原提交确认。结果会显示在这一行。"
+    static let askResidentSubmittedText = "已请居民去许愿机取这一件；它到达领取位置后按「领取」即可。"
+    static let retryInventorySubmittedText = "已重试入库。成功的话这一行会改写成「\(OwnershipDisplayState.inInventory.label)」。"
     func holdSelected(at point: PropAttachmentPoint? = nil) async {
         let target = point ?? holdPoint
         // **一次点击绝不允许什么都不发生**。原来这两条 guard 是裸 `return`：用户在

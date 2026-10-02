@@ -17,6 +17,9 @@ struct ResidentPropEditorView: View {
     @State private var sizeDraftObjectID: String?
     /// 「永久删除」的确认态（面板上那一次点击只把它置真，真正提交在确认之后）。
     @State private var confirmingDelete = false
+    /// 哪几行的「为什么」是展开的。**纯界面状态**：行的状态永远只来自唯一投影，
+    /// 这里只记"用户点开了哪一行的字段与数值"。默认全收起（列表本体只放一句人话）。
+    @State private var expandedRowIDs: Set<String> = []
     var body: some View {
         ScrollView {
         VStack(alignment: .leading, spacing: 14) {
@@ -30,38 +33,12 @@ struct ResidentPropEditorView: View {
                 Text("我的物件").tag(false)
                 Text("房间里").tag(true)
             }.pickerStyle(.segmented).labelsHidden()
-            if state.objects.isEmpty {
-                Text(state.showsPlacedOnly ? "房间里还没有摆放物件" : "领取许愿机的物件后，可以在这里摆放")
-                    .foregroundStyle(.secondary).font(.system(size: 12)).padding(.vertical, 14)
-            } else {
-                ScrollView {
-                    VStack(spacing: 4) {
-                        ForEach(state.objects, id: \.generatedProp?.objectID) { object in
-                            if let prop = object.generatedProp {
-                                Button { Task { await state.select(objectID: prop.objectID) } } label: {
-                                    HStack(spacing: 9) {
-                                        Image(systemName: "shippingbox")
-                                        Text(prop.displayName).lineLimit(1)
-                                        Spacer()
-                                        // 状态文案只有一份推导（`ResidentPropEditorState.rowStatus`）：
-                                        // **已入库但没摆出来**必须写着「尚未摆放」，不能只留一个空位 ——
-                                        // 真机 2026-10-01 用户就是因此说"大剑还是消失了"。
-                                        Text(ResidentPropEditorState.rowStatus(
-                                            isHeld: state.snapshot.heldProp?.objectID == prop.objectID,
-                                            isPlaced: object.isEnabled))
-                                            .font(.system(size: 10))
-                                            .foregroundStyle(state.snapshot.heldProp?.objectID == prop.objectID
-                                                             ? Color.cyan
-                                                             : (object.isEnabled ? Color.secondary : Color.orange.opacity(0.9)))
-                                        if state.selectedID == prop.objectID { Image(systemName: "checkmark").foregroundStyle(.cyan) }
-                                    }.padding(9).frame(maxWidth: .infinity)
-                                        .background(state.selectedID == prop.objectID ? Color.white.opacity(0.08) : .clear, in: RoundedRectangle(cornerRadius: 8))
-                                }.buttonStyle(.plain).disabled(state.isSaving)
-                            }
-                        }
-                    }
-                }.frame(maxHeight: 145)
-            }
+            // 「我的物件」是**你许愿过 / 拥有过的所有东西的目录**（每行一句状态）；
+            // 「房间里」仍然是**已摆放**（语义一个字没改，见 `ResidentPropEditorState.ownershipList`）。
+            //
+            // 分组、对外状态、折叠、动作**全部**来自唯一投影 `ResidentOwnershipProjection`：
+            // 视图不判状态、不拼状态文案（第二套投影与第四套文案已退场）。
+            ownershipList
             if state.selectedID != nil {
                 Divider().overlay(.white.opacity(0.08))
                 if state.isSelectedHeld {
@@ -167,8 +144,199 @@ struct ResidentPropEditorView: View {
                  + "会在同一次操作里先收回/放回再删掉。还被别的物件引用的共享内容会保留。")
         }
     }
-    /// 挂点：手里 / 背后 / 腰间。
+    /// 「我的物件」列表 = 唯一投影算出来的四组，一组一块。
     ///
+    /// 视图在这里**不做任何判断**：组的顺序、每组的行、行够不够显示（「还有 N 件」）、
+    /// 「已结束」折不折叠，全是 `OwnershipList` / `OwnershipSection` 说的。
+    @ViewBuilder
+    private var ownershipList: some View {
+        let list = state.ownershipList
+        if list.rowCount == 0 {
+            Text(state.showsPlacedOnly
+                 ? "房间里还没有摆放物件"
+                 : "还没有许愿。对居民说你想要什么，做好后会出现在这里。")
+                .foregroundStyle(.secondary).font(.system(size: 12)).padding(.vertical, 14)
+        } else {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(list.sections, id: \.group) { section in
+                        ownershipSection(section)
+                    }
+                    // 「看不见的列表」正是这次要修的病：放不下时说清楚还有几件，不静默截断。
+                    if list.remainingCount > 0 {
+                        Text("还有 \(list.remainingCount) 件")
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                            .padding(.horizontal, 9)
+                            .accessibilityIdentifier("resident.ownership.remaining")
+                    }
+                }
+            }
+            // 190 pt（宽度 340 不动）。放不下时上面那句「还有 N 件」兜住。
+            .frame(maxHeight: CGFloat(ResidentOwnershipProjection.panelListHeightPoints))
+        }
+    }
+
+    /// 一组：组头 + 这一组的行。「已结束」默认折叠（Q1：**折叠可见**，不是隐藏）。
+    @ViewBuilder
+    private func ownershipSection(_ section: OwnershipSection) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                if section.isFolded {
+                    Button { state.showsEnded = true } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "chevron.right")
+                            Text(ResidentOwnershipProjection.sectionTitle(section))
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("resident.ownership-section.\(section.group.rawValue)")
+                } else {
+                    Text(ResidentOwnershipProjection.sectionTitle(section))
+                    if section.group == .ended {
+                        Button("收起") { state.showsEnded = false }.buttonStyle(.plain)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+            ForEach(section.rows) { row in
+                ownershipRow(row)
+            }
+        }
+    }
+
+    /// 一行。**状态文案只有一份**：`row.statusText`（唯一投影给的 `OwnershipSentence`）。
+    /// 视图里因此没有任何状态字面量 —— 在这里拼一句就是第二份真相。
+    ///
+    /// 行内动作也由投影派生（`row.actions`），视图不判"能不能领 / 能不能重试"。
+    @ViewBuilder
+    private func ownershipRow(_ row: OwnershipRow) -> some View {
+        let isSelected = state.selectedID == row.key.objectID
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .firstTextBaseline, spacing: 9) {
+                Image(systemName: ownershipIcon(row))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(row.name).lineLimit(1)
+                    if !row.badges.isEmpty {
+                        Text(row.badges.joined(separator: " · "))
+                            .font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(2)
+                    }
+                }
+                Spacer(minLength: 2)
+                Text(row.statusText).font(.system(size: 10))
+                    .foregroundStyle(ownershipTint(row)).lineLimit(1)
+                if isSelected { Image(systemName: "checkmark").foregroundStyle(.cyan) }
+            }
+            .contentShape(Rectangle())
+            // 点行 = 既有的携带态入口（摆放 / 收回都在 3D 里完成），语义一个字没改。
+            .onTapGesture {
+                guard row.actions.contains(.place) || row.actions.contains(.withdraw) else { return }
+                Task { await state.select(objectID: row.key.objectID) }
+            }
+            HStack(spacing: 6) {
+                Spacer(minLength: 0)
+                ownershipActions(row)
+                if row.reasonText != nil || !row.evidence.isEmpty {
+                    Button(expandedRowIDs.contains(row.id) ? "收起" : "为什么") {
+                        if expandedRowIDs.contains(row.id) { expandedRowIDs.remove(row.id) }
+                        else { expandedRowIDs.insert(row.id) }
+                    }
+                    .buttonStyle(.plain).font(.system(size: 10)).foregroundStyle(.cyan)
+                    .accessibilityIdentifier("resident.ownership-row.\(row.id).why")
+                }
+            }.controlSize(.small)
+            // G4：失败原因在**行内展开**里给 字段 + 数值 + evidence；
+            // 列表本体只有上面那一句人话。
+            if expandedRowIDs.contains(row.id) {
+                VStack(alignment: .leading, spacing: 2) {
+                    if let reason = row.reasonText {
+                        Text(reason).font(.system(size: 10)).foregroundStyle(.orange.opacity(0.9))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    ForEach(Array(row.evidence.enumerated()), id: \.offset) { _, item in
+                        Text("\(item.field) = \(item.value)")
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
+                    if let size = row.sizeText {
+                        Text("尺寸 = \(size)").font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.leading, 20).padding(.trailing, 4)
+                .accessibilityIdentifier("resident.ownership-row.\(row.id).evidence")
+            }
+        }
+        .padding(9).frame(maxWidth: .infinity)
+        .background(isSelected ? Color.white.opacity(0.08) : Color.white.opacity(0.03),
+                    in: RoundedRectangle(cornerRadius: 8))
+        .disabled(state.isSaving)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("resident.ownership-row.\(row.id)")
+    }
+
+    /// 行内动作 → **既有**那几条路。视图只负责把投影给的动作摆出来。
+    @ViewBuilder
+    private func ownershipActions(_ row: OwnershipRow) -> some View {
+        HStack(spacing: 5) {
+            if row.actions.contains(.claim), let jobID = row.key.jobID?.uuidString {
+                Button("领取") { Task { await state.claimWish(jobID: jobID) } }
+                    .accessibilityIdentifier("resident.ownership-row.\(row.id).claim")
+            }
+            if row.actions.contains(.askResidentToFetch) {
+                // Q4：「领取」够不到许愿机 ⇒ 按钮**可见但置灰** + 一行可读原因
+                // （原因就是上面那句 `row.reasonText`）。`claim()` 判据一个字不改。
+                Button("领取") {}.disabled(true)
+                // 「让居民去取」走既有的 agent 路径（`claim_when_arrived`）：
+                // **不新增人类通道、不放宽 0.25 m / activityID 判据**。
+                Button("让居民去取") {
+                    Task { await state.askResidentToFetch(jobID: row.key.jobID?.uuidString ?? "") }
+                }
+                .accessibilityIdentifier("resident.ownership-row.\(row.id).ask-resident")
+            }
+            if row.actions.contains(.retry), let jobID = row.key.jobID?.uuidString {
+                Button("重试") { Task { await state.retryWish(jobID: jobID) } }
+                    .accessibilityIdentifier("resident.ownership-row.\(row.id).retry")
+            }
+            // 「已领取但没入库」的下一步**不是**重新生成（`retryableStages` 不含 `.claimed`，
+            // 重发会多出一件）：走既有的入库补做重入。
+            if row.actions.contains(.retryInventoryRegistration), let jobID = row.key.jobID?.uuidString {
+                Button("重试入库") { Task { await state.retryWishInventory(jobID: jobID) } }
+                    .accessibilityIdentifier("resident.ownership-row.\(row.id).retry-inventory")
+            }
+            if row.actions.contains(.withdraw) {
+                Button("收回") { Task { await state.select(objectID: row.key.objectID); await state.withdraw() } }
+            }
+            if row.actions.contains(.delete) {
+                Button("删除") {
+                    Task { await state.select(objectID: row.key.objectID); confirmingDelete = true }
+                }
+            }
+        }
+    }
+
+    /// 图标只承担**语义分组**（不是文案）：状态词一律读 `row.statusText`。
+    private func ownershipIcon(_ row: OwnershipRow) -> String {
+        switch row.state {
+        case .generating: return "hourglass"
+        case .awaitingClaim: return "arrow.down.circle"
+        case .inInventory: return "shippingbox"
+        case .placed: return "cube.box"
+        case .failed: return "exclamationmark.triangle"
+        case .ended: return "archivebox"
+        }
+    }
+
+    private func ownershipTint(_ row: OwnershipRow) -> Color {
+        switch row.state {
+        case .awaitingClaim: return .cyan
+        case .inInventory: return .orange.opacity(0.9)
+        case .failed: return .red.opacity(0.9)
+        case .generating, .placed, .ended: return .secondary
+        }
+    }
+
+    /// 挂点：手里 / 背后 / 腰间。
     /// 改一下就是一次**世界命令**（没拿时是「拿起」，已经拿在手上时是就地换挂点），
     /// 不是本地开关：找不到那个挂点的骨骼时世界会拒绝并给出读得懂的理由，选中格自己会弹回
     /// （`selectedHoldPoint` 读的是世界状态那一份，不是这里记的一份）。

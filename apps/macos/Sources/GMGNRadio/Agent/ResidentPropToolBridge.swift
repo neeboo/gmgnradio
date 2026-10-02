@@ -36,18 +36,27 @@ extension ResidentPropDelegationError: LocalizedError {
     private let prepareMutation: (WorldPropLayoutCommand) async throws -> Void
     private let resolveDelegatedGrant: (String, WorldPropPlacement) throws -> ResidentPropDelegatedGrant?
     private let recordDelegatedPlacement: (ResidentPropDelegatedGrant, WorldPropPlacement) throws -> Void
+    /// 「这一件现在是什么状态」——**唯一投影** `ResidentOwnershipProjection.row` 的注入点。
+    ///
+    /// 回执里那两句（`ownership_state` / `ownership_status`）必须与面板那一行、任务行
+    /// 那一句**逐字同源**：所以桥自己**不判**状态、不存状态，只问这一处。
+    /// 查不到（例如刚删掉的物件）就是 `nil` —— 那是"读不到"，回执里不写这两个键，
+    /// 绝不编一句。
+    private let ownershipRow: (String) -> OwnershipRow?
     init(service: ResidentPropPlacementService, allowsMutation: Bool,
          isCurrent: @escaping () -> Bool, onChange: @escaping () -> Void = {},
          prepareMutation: @escaping (WorldPropLayoutCommand) async throws -> Void = { _ in },
          delegatedGrant: ResidentPropDelegatedGrant? = nil,
          resolveDelegatedGrant: @escaping (String, WorldPropPlacement) throws -> ResidentPropDelegatedGrant? = { _,_ in nil },
-         recordDelegatedPlacement: @escaping (ResidentPropDelegatedGrant, WorldPropPlacement) throws -> Void = { _,_ in }) {
+         recordDelegatedPlacement: @escaping (ResidentPropDelegatedGrant, WorldPropPlacement) throws -> Void = { _,_ in },
+         ownershipRow: @escaping (String) -> OwnershipRow? = { _ in nil }) {
         self.service = service; self.allowsMutation = allowsMutation
         self.isCurrent = isCurrent; self.onChange = onChange
         self.prepareMutation = prepareMutation
         self.delegatedGrant = delegatedGrant
         self.resolveDelegatedGrant = resolveDelegatedGrant
         self.recordDelegatedPlacement = recordDelegatedPlacement
+        self.ownershipRow = ownershipRow
     }
 
     var tools: [ResidentWorldToolSession.AdditionalTool] {
@@ -82,7 +91,7 @@ extension ResidentPropDelegationError: LocalizedError {
             }
             if Self.isMutation(name) { properties["layout_revision"] = ["type": "integer", "minimum": 0] }
             let descriptions = [
-                "read_owned_props": "读取真实已拥有物件、是否摆出、位置、能力绑定、最近一次使用状态（running/completed/stopped/failed，以回执为准）与布局版本。每件物件的 `hold_slots` **逐挂点**给出「能不能挂在那个挂点上」以及那一个挂点自己的原因（手/背后/腰间各自具名，右手不行不代表背后不行）。`deleted` 列出已经被永久删除的物件（墓碑：名字、删除时的结算动作与理由、释放的内容引用）—— 已经删掉的东西不会出现在 objects 里。生成物件默认仅有外形；只有明确启用 coffee.brew 冲泡模板的咖啡机才可按模板在空间内模拟使用，不涉及现实硬件或物理结构。",
+                "read_owned_props": "读取真实已拥有物件、是否摆出、位置、能力绑定、最近一次使用状态（running/completed/stopped/failed，以回执为准）与布局版本。每件物件的 `ownership_state`（机器读的一档）与 `ownership_status`（界面上那句话）来自**同一个**唯一投影，与「我的物件」列表那一行、任务行那一句**逐字同源**——对用户说状态时照它说，别自己另编一个词。每件物件的 `hold_slots` **逐挂点**给出「能不能挂在那个挂点上」以及那一个挂点自己的原因（手/背后/腰间各自具名，右手不行不代表背后不行）。`deleted` 列出已经被永久删除的物件（墓碑：名字、删除时的结算动作与理由、释放的内容引用）—— 已经删掉的东西不会出现在 objects 里。生成物件默认仅有外形；只有明确启用 coffee.brew 冲泡模板的咖啡机才可按模板在空间内模拟使用，不涉及现实硬件或物理结构。",
                 "list_placement_surfaces": "读取可摆放的承托层：承托高度、格数与水平范围（不再逐个列出格子）。位置为底部中心，yaw 为弧度。",
                 "preview_prop_placement": "只验证候选摆放，不改变世界、不显示预览。碰撞或通道错误可用于调整计划。",
                 "apply_prop_placement": "按本轮人类摆放或移动委托提交已拥有物件的位置和朝向；后台仅可续办原生成任务仍有效的有限摆放委托，只能摆该产物到允许的支撑面。先查询布局版本和支撑面并预检，位置和朝向使用绝对值。",
@@ -239,7 +248,8 @@ extension ResidentPropDelegationError: LocalizedError {
             let objects = service.context.state.objectStates.values.compactMap { item -> [String: Any]? in
                 guard let objectID = item.generatedProp?.objectID else { return nil }
                 return Self.object(item, heldObjectID: service.context.state.heldProp?.objectID,
-                                   holdUnavailableBySlot: Self.holdUnavailableBySlot(service, objectID: objectID))
+                                   holdUnavailableBySlot: Self.holdUnavailableBySlot(service, objectID: objectID),
+                                   ownership: ownershipRow(objectID))
             }
             let interactionStatus = objects.contains { $0["capability"] != nil }
                 ? "capability_bound_use_only" : "appearance_only"
@@ -362,7 +372,8 @@ extension ResidentPropDelegationError: LocalizedError {
     }
 
     private static func object(_ item: WorldObjectState, heldObjectID: String?,
-                               holdUnavailableBySlot: [String: String]) -> [String: Any]? {
+                               holdUnavailableBySlot: [String: String],
+                               ownership: OwnershipRow? = nil) -> [String: Any]? {
         guard let prop = item.generatedProp else { return nil }
         let q = item.transform.rotation
         // 逐挂点的答案**单独拼**（不塞进下面那个大字典字面量里）：嵌套闭包 + `Any` 字面量
@@ -408,6 +419,17 @@ extension ResidentPropDelegationError: LocalizedError {
                               "rotation_yaw": rotationYaw]
         }
         if let id = item.supportSurfaceID { result["surface_id"] = id }
+        // 状态那两句**逐字**来自唯一投影（`OwnershipSentence`，与面板那一行、任务行那一句
+        // 同一份字面量）：agent 读到的状态与用户看到的因此不可能各说各的。
+        // `ownership_state` 是机器读的那一档（`OwnershipDisplayState.rawValue`），
+        // `ownership_status` 就是界面上那句话。
+        //
+        // 投影查不到这一件（例如刚被删掉）时**不写键**：那是"读不到"，
+        // 不是编一句"看起来差不多"的话。
+        if let ownership {
+            result["ownership_state"] = ownership.state.rawValue
+            result["ownership_status"] = ownership.statusText
+        }
         return result
     }
 }

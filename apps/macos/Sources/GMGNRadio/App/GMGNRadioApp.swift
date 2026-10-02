@@ -3286,6 +3286,10 @@ final class AppDelegate:
         }
         if let stageWindowController {
             configureResidentPropEditor(stageWindowController)
+            // 列表上那两个许愿动作（「领取」「重试」）单独接：`configureResidentPropEditor`
+            // 的签名被离线 harness **逐字抽取**（`tools/test-resident-prop-editor.swift`），
+            // 往那里塞只有宿主答得出来的闭包会让那份 harness 编不过。
+            configureResidentPropWishActions(stageWindowController)
             let liveCamWindowController = LiveCamWindowController(
                 renderSurfaceController: stageRenderSurfaceController,
                 cameraCoordinator: stageCameraCoordinator,
@@ -4394,7 +4398,30 @@ final class AppDelegate:
         // 台账只认**库存记录**：已经进了库存的条目不该继续挂在"等待入库"上
         // （换世界、存档回滚、或在别的路径上补做成功都会走到这里）。
         residentPropInventoryBacklog.prune { context.state.objectStates[$0]?.generatedProp != nil }
-        for job in jobs where context.state.objectStates[job.objectID] == nil {
+        // 用户**有意删掉**的那一件（墓碑还在）不再补做入库，也不再假装还欠着一次入库。
+        //
+        // 为什么：删除是永久的（`docs/plans/2026-10-02-prop-deletion-semantics.md` §4：
+        // 软删是为了可审计，不是为了可回滚），而**这一条重入路径同时也是面板上
+        // 「重试入库」按钮走的那一条**（`retryResidentPropInventory` → 这里）。放开它，
+        // 等于"用户每删一件，下一个同步周期它自己长回来"—— 那比卡住更坏。
+        //
+        // 所以这里做的是**收口**而不是静默跳过：台账里那条待办当场销掉，并给出人话。
+        // 旧行为（留着待办 + 那句"空间就绪后会自动补做"）是一句**永远做不到的承诺**，
+        // 正是这一轮要修的形状。
+        for job in jobs where context.state.propTombstones?[job.objectID] != nil {
+            guard residentPropInventoryBacklog.resolve(objectID: job.objectID) else { continue }
+            let message = "\(job.name) 已经删除（永久），不再补做入库。"
+            if residentPropNotices[job.objectID] != message {
+                showResidentVoiceStatus(message)
+                residentPropNotices[job.objectID] = message
+            }
+        }
+        // 「还欠一次入库」的判据**只有一处**：`WorldState.canRedoInventoryRegistration(objectID:)`
+        // —— 它与 `applyPropLayout(.register)` 的回执去重判据**同源**（见
+        // `WorldRuntime/WorldPropLayout.swift`）。面板上「重试入库」的可用性读的是
+        // **同一个函数**（`residentPropWishFacts` 里的 `canRedoInventoryRegistration`），
+        // 于是"按钮亮了却做不到"与"做不到却亮着"在结构上都不可能。
+        for job in jobs where context.state.canRedoInventoryRegistration(objectID: job.objectID) {
             guard let asset = residentOwnedPropAssets[job.objectID] else { continue }
             do {
                 try await prepareResidentPropMutation(.register(asset.prop), context: context)
@@ -4597,6 +4624,8 @@ final class AppDelegate:
             }
             holdUnavailableReasonsBySlot[id] = bySlot
         }
+        // 「我的物件」的**全部事实**（job ∪ 产物 ∪ 墓碑）。它是唯一投影的唯一输入。
+        let ownership = residentPropWishFacts(worldID: context.manifest.worldID, context: context)
         return .init(worldID: context.manifest.worldID, revision: context.state.layoutRevision,
               objects: objects,
               // 未摆出物件的初始落点候选（**纯顺序**，判定仍由 `preview` 给）：
@@ -4620,7 +4649,16 @@ final class AppDelegate:
               supportGeometryUnavailable: readiness.supportGeometryUnavailable,
               // 「靠墙」读的是派生出来的竖直面与**判据说可以**的那批格子（与地板摆放同一个出口）。
               wallFaces: residentPropGridEditor.wallPatches.count,
-              wallPlaceableCells: residentPropGridEditor.wallPlaceableCellCount)
+              wallPlaceableCells: residentPropGridEditor.wallPlaceableCellCount,
+              // 「我的物件」= **你许愿过 / 拥有过的所有东西的目录**：世界记录（上面那份
+              // `objects`）之外，还要把许愿任务、孤儿产物与墓碑一起交给列表 —— 否则未领取的
+              // 许愿产物、还没入库的失败任务在这个列表里根本不存在（真机 2026-10-02
+              // 用户的原话就是这一条）。
+              //
+              // 这里交出去的是**事实**，不是状态：哪一行、什么对外状态、进哪一组、
+              // 折不折叠，全部由唯一投影 `ResidentOwnershipProjection` 现算
+              // （`ResidentPropEditorState.ownershipList`），宿主一个字都不判。
+              ownershipFacts: ownership.facts, ownershipOrder: ownership.order)
     }
 
     /// 把当前快照推给面板。返回**是否真的推成功** —— 世界已切换/窗口不在时不算推成功，
@@ -4629,7 +4667,20 @@ final class AppDelegate:
     private func synchronizeResidentPropPresentation() -> Bool {
         guard let context = livingWorldContext, spatialStage.selectedWorldID == context.manifest.worldID,
               context.manifest.worldID == WishMachineScene.worldID else { return false }
-        spatialStage.residentPropOutputs = context.state.objectStates.values.filter(\.isEnabled).compactMap(residentPropDescriptor)
+        // 「托盘输出列表」= **唯一投影**里 `room == .placed` 的那些行。
+        //
+        // 语义与原先的 `objectStates.values.filter(\.isEnabled)` 等价
+        // （`room == .placed ⟺ 有 generatedProp && isEnabled && 不在手里`，
+        // `residentPropDescriptor` 也照样要求 `generatedProp`），但"什么算摆在房间里"
+        // 从此**只有投影一处判据** —— 托盘上有没有它不可能再与列表/任务行各说各的。
+        //
+        // 这一份 join 与 `residentPropEditorSnapshot` 里那一份读的是**同一个**函数
+        // （`residentPropWishFacts`）：事实只读一次口径，判断一个字都不在这里。
+        let rows = residentPropWishFacts(worldID: context.manifest.worldID, context: context)
+            .facts.map(ResidentOwnershipProjection.row)
+        spatialStage.residentPropOutputs = rows.filter { $0.room == .placed }
+            .compactMap { context.state.objectStates[$0.key.objectID] }
+            .compactMap(residentPropDescriptor)
         spatialStage.residentHeldProp = residentHeldPropDescriptor(context: context)
         // 展示台的视觉几何从 manifest 的碰撞体反推：几何只有一个来源（layout.json → world.json），
         // 视觉与碰撞不会各自漂移。世界没声明它就不画，碰撞也一并没有。
@@ -4785,6 +4836,232 @@ final class AppDelegate:
     private func isResidentPropEditorCurrent(context: WorldAgentContext, editorID: UUID) -> Bool {
         livingWorldContext === context && residentPropEditingWorldID == context.manifest.worldID
             && residentPropEditingID == editorID && spatialStage.selectedWorldID == context.manifest.worldID
+    }
+
+    // MARK: - 「我的物件」列表上的许愿动作（领取 / 重试）
+
+    /// 把列表上那两个动作接到**既有**那两条路上。
+    ///
+    /// 之所以单独一个入口而不是塞进 `configureResidentPropEditor`：那个函数被
+    /// `tools/test-resident-prop-editor.swift` **逐字抽取**去编译（那份 harness 里没有
+    /// 许愿机协调器），往它的函数体里加只有宿主答得出来的东西会让那份 harness 编不过。
+    private func configureResidentPropWishActions(_ controller: StageWindowController) {
+        controller.configureResidentPropWishActions(
+            claim: { [weak self] jobID in
+                guard let self else { throw ResidentPropPlacementError.inactiveContext }
+                try await self.claimResidentPropWish(jobID: jobID)
+            },
+            retry: { [weak self] jobID in
+                guard let self else { throw ResidentPropPlacementError.inactiveContext }
+                try await self.retryResidentPropWish(jobID: jobID)
+            }
+        )
+        controller.configureResidentPropFetchAction { [weak self] jobID in
+            guard let self else { throw ResidentPropPlacementError.inactiveContext }
+            try await self.askResidentToFetchProp(jobID: jobID)
+        }
+        controller.configureResidentPropInventoryRetryAction { [weak self] jobID in
+            guard let self else { throw ResidentPropPlacementError.inactiveContext }
+            try await self.retryResidentPropInventory(jobID: jobID)
+        }
+    }
+
+    /// 列表里「已领取，入库尚未保存」那一行的「重试入库」。
+    ///
+    /// 走的是**既有**那条入库补做重入（`synchronizeOwnedResidentProps`）：它按
+    /// `claimed.<jobID>` 幂等键重放摆放服务的 `register`，判定一个字不放宽
+    /// （承托几何拿不到时照样 fail-closed 拒绝，并把具名原因记进补做台账）。
+    /// 这里**不新增**任何注册通道，也不重发一次生成。
+    private func retryResidentPropInventory(jobID: String) async throws {
+        guard livingWorldContext != nil,
+              spatialStage.selectedWorldID == livingWorldContext?.manifest.worldID else {
+            throw ResidentPropPlacementError.inactiveContext
+        }
+        livingWorldLogger.notice("摆件面板重试入库 step=retry-inventory 任务=\(jobID, privacy: .public) 结果=已重入")
+        await synchronizeOwnedResidentProps()
+    }
+
+    /// 列表里「待领取」但**够不到**许愿机那一行的「让居民去取」。
+    ///
+    /// 走的是**既有的 agent 路径**：把这一句当成一次真实的人类提交交给居民，由它自己用
+    /// 既有的 `claim_when_arrived`（`claim_wish_output`）走到取物点再领。所以这里
+    /// **没有**新的人类领取通道 —— 人没有替居民领，`claim()` 的三条判据
+    /// （`activityID == "wish_machine.collect"` / `distanceMeters ≤ 0.25` / `outputAvailable`）
+    /// 一个字都没放宽。
+    ///
+    /// 它刻意**绕过** `sendResidentSubmission` 那条 `residentPropEditingWorldID == nil` 的门：
+    /// 那道门是给"场景里的自由聊天"用的，而这一次点击恰恰**来自**装修面板 ——
+    /// 用户就在面板上，请求发起方也是面板自己。
+    private func askResidentToFetchProp(jobID: String) async throws {
+        guard let context = livingWorldContext, spatialStage.selectedWorldID == context.manifest.worldID,
+              let wishID = UUID(uuidString: jobID) else { throw ResidentPropPlacementError.inactiveContext }
+        let scope = currentResidentWorldContext().sessionScope
+        let name = wishMachineCoordinator.residentJobs(worldID: context.manifest.worldID, residentScope: scope)
+            .first { $0.id == wishID }?.name ?? "那一件"
+        let text = "请去许愿机把已经做好的「\(name)」领回来。"
+        let loop = ensureResidentLoop()
+        let submissionID = UUID()
+        // 与语音那条同一条可见历史：这是一次真实的人类提交，不是系统旁白。
+        residentChatTranscript.activate(scopeKey: residentTranscriptScopeKey)
+        residentChatTranscript.beginTurn(id: submissionID, userText: text, at: Date())
+        publishResidentTranscript()
+        loop.receiveUserMessage(text, submissionID: submissionID)
+        livingWorldLogger.notice("摆件面板请求居民代取 step=ask-resident 任务=\(jobID, privacy: .public) 结果=已交给居民")
+    }
+
+    /// 列表里「未领取」那一行 → **既有那条领取路径**。
+    ///
+    /// 与 agent 的 `claim_wish_output` 是**同一个出口**（`WishMachineCoordinator.claim`），
+    /// 判据（人要到许愿机领取位置、托盘真的显示出这一件）一个字都没放宽；够不到时
+    /// `WishMachineError.notAtMachine` 的原话会成为行上那句可见原因。
+    ///
+    /// 领成之后走**既有**入库那条路（`synchronizeOwnedResidentProps`）——
+    /// 与工具领取成功后那次重入完全同一条，所以"领了但列表里不出现"不可能靠这条新入口发生。
+    private func claimResidentPropWish(jobID: String) async throws {
+        guard let context = livingWorldContext, spatialStage.selectedWorldID == context.manifest.worldID,
+              let wishID = UUID(uuidString: jobID) else { throw ResidentPropPlacementError.inactiveContext }
+        let scope = currentResidentWorldContext().sessionScope
+        _ = try wishMachineCoordinator.claim(id: wishID, worldID: context.manifest.worldID, residentScope: scope)
+        livingWorldLogger.notice("摆件面板领取 step=claim 任务=\(jobID, privacy: .public) 结果=已登记")
+        // 领成之后走**既有**入库那条路（它就是 agent 工具领完那次重入调用的同一个函数）。
+        await synchronizeOwnedResidentProps()
+    }
+
+    /// 列表里失败那一行 → **既有** retry（与 agent 的 `retry_wish_generation` 同一条）。
+    ///
+    /// 能不能重试由那条路自己的 guard 回答（它按 stage 放行），这里绝不替它放宽或加判。
+    private func retryResidentPropWish(jobID: String) async throws {
+        guard let context = livingWorldContext, spatialStage.selectedWorldID == context.manifest.worldID,
+              let wishID = UUID(uuidString: jobID) else { throw ResidentPropPlacementError.inactiveContext }
+        let scope = currentResidentWorldContext().sessionScope
+        _ = try await wishMachineCoordinator.retry(id: wishID, worldID: context.manifest.worldID, residentScope: scope)
+        livingWorldLogger.notice("摆件面板重试 step=retry 任务=\(jobID, privacy: .public) 结果=已提交")
+        synchronizeWishMachinePresentation()
+    }
+
+    /// 「我的物件」列表要的那一份**事实**：`wishes.json` 的一条 job ∪ 世界文档的一件产物
+    /// ∪ 墓碑。**宿主只读，不判断** —— 哪一行、什么对外状态、进哪一组、折不折叠，全部由
+    /// 唯一投影 `ResidentOwnershipProjection` 现算（`ResidentPropEditorState.ownershipList`）。
+    ///
+    /// 这里只做三件事：把两份权威并起来、把**会话内**事实（资产失败 / 入库台账 / 托盘 /
+    /// 两条动作判据）读出来、给出确定性的组内顺序。
+    ///
+    /// **一条 job 都不许丢**：进行中的那几档照样产生行（映射到「生成中」，取消 / 中断映射到
+    /// 折叠的「已结束」），不再像以前那样 `return nil` 静默跳过 —— "东西静默消失"正是
+    /// 这次要修的观感缺陷。
+    private func residentPropWishFacts(worldID: String, context: WorldAgentContext)
+        -> (facts: [OwnershipRowFacts], order: [String: Int]) {
+        let scope = currentResidentWorldContext().sessionScope
+        let jobs = wishMachineCoordinator.residentJobs(worldID: worldID, residentScope: scope)
+        let objectStates = context.state.objectStates
+        let tombstones = context.state.propTombstones ?? [:]
+        let heldObjectID = context.state.heldProp?.objectID
+        let trayObjectID = spatialStage.wishMachineOutput?.id
+
+        /// 归属权威那几项：**一处**读取，job 行与孤儿行走同一条。
+        func applyWorld(_ f: inout OwnershipRowFacts, objectID: String, jobID: UUID?) {
+            let prop = objectStates[objectID]?.generatedProp
+            // `objectPresent` = "世界文档里登记了这一件**产物**"。元数据里没有
+            // `gmgn.generated-prop.v1` 的条目（墙 / 地面 / 灯这些非产物）不算 ——
+            // 否则每一件布景都会冒出一行「已摆放」。
+            f.objectPresent = prop != nil
+            f.objectHasGeneratedProp = prop != nil
+            f.objectName = prop?.displayName
+            f.objectIsEnabled = objectStates[objectID]?.isEnabled ?? false
+            if let heldObjectID, heldObjectID == objectID {
+                f.heldSlot = context.state.heldProp?.hand.rawValue
+            }
+            if let tombstone = tombstones[objectID] {
+                f.tombstoneName = tombstone.displayName
+                f.tombstoneReason = tombstone.reason
+                f.tombstoneSettlement = tombstone.settlement.summary
+            }
+            // 第二线索：这一件不是靠 `objectID` 认到 job 的，而是靠 `sourceWishID`。
+            if let jobID, let prop, prop.objectID == objectID, prop.sourceWishID == jobID.uuidString {
+                f.matchedBySourceWishID = true
+            }
+            // 「重试入库」这条动作今天真的走得通吗 —— **世界层那一个函数**说了算
+            // （`WorldState.canRedoInventoryRegistration(objectID:)`，与
+            // `applyPropLayout(.register)` 的去重判据同源）。面板不自己编判据：
+            // 它读的就是这一个布尔。于是"按钮做不到"/"做得到却没按钮"都不可能。
+            f.canRedoInventoryRegistration = context.state.canRedoInventoryRegistration(objectID: objectID)
+        }
+
+        var facts: [OwnershipRowFacts] = []
+        var order: [String: Int] = [:]
+        var covered: Set<String> = []
+
+        for (index, job) in jobs.enumerated() {
+            let objectID = job.objectID
+            covered.insert(objectID)
+            var f = OwnershipRowFacts(objectID: objectID)
+            f.jobID = job.id
+            f.jobName = job.name
+            // stage **逐字**对应（同一个模块的 `WishMachineStage`）：将来多一个 stage，
+            // 唯一投影那个穷尽 `switch` 会红着要求表态，而不是静默少一行。
+            f.jobStage = OwnershipJobStage(rawValue: job.stage.rawValue)
+            f.remoteState = job.remoteState?.rawValue
+            f.lastError = job.lastError
+            f.cancelRequested = job.cancelRequested ?? false
+            // 「生成完成、场景加载失败」读的是**现场**（舞台这一刻的渲染状态），
+            // **不是** `wishes.json` 里那条历史记录 —— 记录只说明"上次推导说了什么"。
+            if case let .failed(_, message)? = spatialStage.residentPropRenderStatuses[objectID] {
+                f.renderFailureMessage = message
+            }
+            f.processOrder = index
+            applyWorld(&f, objectID: objectID, jobID: job.id)
+            f.claimReceiptPresent = context.state.layoutReceipts["claimed.\(job.id.uuidString)"] != nil
+            f.assetFailure = residentPropAssetFailures[objectID]
+            if let pending = residentPropInventoryBacklog[objectID] {
+                f.inventoryPendingNotice = ResidentPropInventoryBacklog.pendingNotice(pending)
+                f.inventoryPendingWaitsForSupportGeometry = pending.waitsForSupportGeometry
+            }
+            f.trayShowsThis = trayObjectID == objectID
+            // 两条**动作**判据都不是这里判的：`claimAvailability` 与 `retryableStages`
+            // 就是 `claim()` / `retry()` 自己读的同一个表达式 —— 于是"按钮亮了却做不到"
+            // 与"按钮灰着其实能做"在结构上都不可能。
+            if case .success = wishMachineCoordinator.claimAvailability(
+                id: job.id, worldID: worldID, residentScope: scope) {
+                f.canClaimNow = true
+            }
+            f.canRetryNow = WishMachineCoordinator.retryableStages.contains(job.stage) && job.jobID != nil
+            order[f.objectID] = index
+            facts.append(f)
+        }
+
+        // 世界里有、`wishes.json` 里没有的**产物**（老物件 / 许愿档案已经不在）：
+        // 照旧显示，并在展开里明写"找不到对应的许愿记录"。
+        for (objectID, entry) in objectStates
+        where !covered.contains(objectID) && entry.generatedProp != nil {
+            var f = OwnershipRowFacts(objectID: objectID)
+            applyWorld(&f, objectID: objectID, jobID: nil)
+            f.assetFailure = residentPropAssetFailures[objectID]
+            f.trayShowsThis = trayObjectID == objectID
+            facts.append(f)
+        }
+        // 墓碑里有、世界与档案里都**没有**的（删干净了）：**不跳过** —— 折进「已结束」，
+        // 默认折叠、点开可见并标着「已删除」（Q1：用户被"东西静默消失"咬过，透明优于消失）。
+        for (objectID, tombstone) in tombstones
+        where !covered.contains(objectID) && objectStates[objectID]?.generatedProp == nil {
+            var f = OwnershipRowFacts(objectID: objectID)
+            f.tombstoneName = tombstone.displayName
+            f.tombstoneReason = tombstone.reason
+            f.tombstoneSettlement = tombstone.settlement.summary
+            facts.append(f)
+        }
+        return (facts, order)
+    }
+
+    /// 一件物件的**那一行**（唯一投影现算）—— agent 的 `read_owned_props` 回执用的就是它。
+    ///
+    /// 与面板那一行（`ResidentPropEditorState.ownershipList`）、任务行那一句
+    /// （`ResidentTaskAxisProjection.currentStatus`）读的是**同一个** `row(_:)` /
+    /// `OwnershipSentence`，所以"agent 说它已摆放、面板说它没摆"这种分叉在结构上不可能。
+    /// 查不到（刚删掉 / 换世界）就返回 `nil`：那是"读不到"，不是"沿用上一次"。
+    private func residentOwnershipRow(objectID: String, context: WorldAgentContext) -> OwnershipRow? {
+        residentPropWishFacts(worldID: context.manifest.worldID, context: context).facts
+            .first { $0.objectID == objectID }
+            .map(ResidentOwnershipProjection.row)
     }
 
     /// 开启建造模式并派生格子。
@@ -5875,6 +6152,12 @@ final class AppDelegate:
                     guard let self, isCurrent() else { throw CancellationError() }
                     try self.recordResidentWishPlacement(grant, placement: placement,
                         worldID: worldID, residentScope: residentScope)
+                }, ownershipRow: { [weak self, weak context] objectID in
+                    // `read_owned_props` 回执里那两句（`ownership_state` /
+                    // `ownership_status`）从**唯一投影**现算 —— 与面板那一行、
+                    // 任务行那一句同一份字面量。读不到就是 nil（回执里不写这两个键）。
+                    guard let self, let context, isCurrent() else { return nil }
+                    return self.residentOwnershipRow(objectID: objectID, context: context)
                 }).tools : []
         // 电视机：三条工具（play_screen / stop_screen / read_screen）。
         // 与点唱机同一条纪律 —— 只说"放个视频"而没给链接是**信息不足**，
@@ -6192,9 +6475,17 @@ final class AppDelegate:
         guard let target = context.propAnchorRegistry.entry(activityID: WishMachineScene.activityID)?.position
         else { return nil }
         let dx = Double(position.x - target.x), dy = Double(position.y - target.y), dz = Double(position.z - target.z)
-        let outputAvailable = spatialStage.wishMachineOutput?.id == job.objectID
-            && spatialStage.wishMachineOutput?.worldID == job.worldID
-            && spatialStage.wishMachineOutputStatus == .ready(id: job.objectID)
+        // "任务行说可领取"与"手真的领得到"必须是**同一处判据**：两处都读
+        // `WishMachineOutputReachability`（现场推导），所以不可能出现
+        // "行说可领取、手却领不了"或"领得了、行却说看不见"。
+        let outputAvailable = WishMachineOutputReachability.resolve(
+            isTrayHolder: spatialStage.wishMachineOutput?.id == job.objectID
+                && spatialStage.wishMachineOutput?.worldID == job.worldID,
+            live: spatialStage.wishMachineOutputStatus,
+            objectID: job.objectID,
+            recordedFailure: wishMachineCoordinator.outputRenderFailure(
+                id: job.id, worldID: job.worldID, residentScope: job.residentScope)?.message
+        ).isClaimable
         // "在跑哪个活动、哪个相位"只认执行器**同一份**一手事实。`snapshot.activeActivity`
         // 把模拟状态的 id 与执行器的相位拼在一起：执行器空转时它给的是"没有 id + 安全待机
         // 的 loop"，于是 `phase == "loop"` 会在什么都没跑的时候成立。领取要的是"真的在跑"。
@@ -6346,16 +6637,30 @@ final class AppDelegate:
         let scope = currentResidentWorldContext().sessionScope
         let jobs = wishMachineCoordinator.residentJobs(worldID: worldID, residentScope: scope)
         pushResidentConnectivityNotice(worldID: worldID, scope: scope)
-        // Save the current renderer's failure before replacing its descriptor. The next
-        // renderer status belongs to the next artifact and cannot recover this fact.
-        if case .failed(let objectID, let message) = spatialStage.wishMachineOutputStatus,
-           spatialStage.wishMachineOutput?.id == objectID,
-           let job = jobs.first(where: { $0.objectID == objectID && $0.stage == .ready }),
-           wishMachineCoordinator.outputRenderFailure(id: job.id, worldID: worldID, residentScope: scope) == nil {
+        // 现场推导 ↔ 持久化记录的**唯一**同步点。派生结论**不许当权威**：
+        //
+        //   * 推导**成功** ⇒ 那条陈旧结论必须消失（否则"推导逻辑被修好"永远不会被重新推导，
+        //     真机 2026-10-02「超大荧幕电视」就是这样**永久**从托盘上消失、也永远领不了）；
+        //   * 推导**失败** ⇒ 记录被**替换**成这一次的具名原因（尺寸拒绝自带字段与数值）——
+        //     旧行为"已经有记录就不再记"会把修复前那句无字段的旧文案永久留在盘上；
+        //   * 仍在装载 / 还没接管 ⇒ **一个字都不改**：没有现场结论就不许下结论。
+        //
+        // 清与记都以**现场推导**为唯一判据，所以"不许无条件清失败"是成立的：
+        // 只有真的画出来了才清，真的推不出来就留下（并具名）。
+        if let objectID = spatialStage.wishMachineOutput?.id,
+           let job = jobs.first(where: { $0.objectID == objectID && $0.stage == .ready }) {
             do {
-                try wishMachineCoordinator.recordOutputRenderFailure(id: job.id, worldID: worldID,
-                    residentScope: scope, message: message)
+                switch spatialStage.wishMachineOutputStatus {
+                case .ready(let id) where id == job.objectID:
+                    try wishMachineCoordinator.clearOutputRenderFailure(id: job.id, worldID: worldID, residentScope: scope)
+                case .failed(let id, let message) where id == job.objectID:
+                    try wishMachineCoordinator.recordOutputRenderFailure(id: job.id, worldID: worldID,
+                        residentScope: scope, message: message)
+                default:
+                    break
+                }
             } catch {
+                // 记录改不动时**不许静默**：状态与任务行的原因照旧推出去（失败是可见的）。
                 spatialStage.wishMachineState = .failed
                 pushWishTaskPrompts(jobs.suffix(20).map { wishMachineTaskPresentation(for: $0) },
                     worldID: worldID, scope: scope)
@@ -6363,27 +6668,39 @@ final class AppDelegate:
                 return
             }
         }
-        let failedIDs = Set(jobs.filter {
-            wishMachineCoordinator.outputRenderFailure(id: $0.id, worldID: worldID, residentScope: scope) != nil
-        }.map(\.objectID))
-        let identities = Set(jobs.map(\.objectID)).subtracting(failedIDs)
-        let ready = wishMachineCoordinator.readyOutputs(worldID: worldID).filter { identities.contains($0.id) }
-        if let output = ready.first {
-            if !ready.contains(where: { $0.id == spatialStage.wishMachineOutput?.id }) {
-                spatialStage.wishMachineOutput = output
-            }
-        } else { spatialStage.wishMachineOutput = nil }
+        // 托盘端哪一件**只由 job 事实（stage/modelPath/尺寸意图）与现场推导决定**，
+        // 与那条持久化记录**无关**。这里曾经用 `identities.subtracting(failedIDs)` 把有记录的
+        // 产物整件减掉 —— 那正是"派生结论被当成持久事实"的现场（真机 2026-10-02「超大荧幕电视」）。
+        let objectIDs = Set(jobs.map(\.objectID))
+        let ready = wishMachineCoordinator.readyOutputs(worldID: worldID).filter { objectIDs.contains($0.id) }
+        // 现场推导**失败**的那一件不该占着托盘（托盘只有一件，它占着就把好的那一件也挡住了）。
+        // 但"一件都不剩"时**留住**它：托盘本来就是空的，而每次清空都会让渲染端重新装载
+        // ⇒「装载→失败→清空→再装载」的循环。留住它，渲染端就不会重来一遍。
+        let liveFailedObjectID: String? = {
+            if case .failed(let id, _) = spatialStage.wishMachineOutputStatus { return id }
+            return nil
+        }()
+        let healthy = ready.filter { $0.id != liveFailedObjectID }
+        let pool = healthy.isEmpty ? ready : healthy
+        // 谁上托盘：现场已经画出来的那一件 → 现在端着的那一件 → 第一件。
+        let liveReadyObjectID: String? = {
+            if case .ready(let id) = spatialStage.wishMachineOutputStatus { return id }
+            return nil
+        }()
+        let trayHolder = pool.first(where: { $0.id == liveReadyObjectID })
+            ?? pool.first(where: { $0.id == spatialStage.wishMachineOutput?.id })
+            ?? pool.first
+        if spatialStage.wishMachineOutput != trayHolder { spatialStage.wishMachineOutput = trayHolder }
         if case .failed(let id, _) = spatialStage.wishMachineOutputStatus, spatialStage.wishMachineOutput?.id == id {
             spatialStage.wishMachineState = .failed
         } else if let output = spatialStage.wishMachineOutput,
                   spatialStage.wishMachineOutputStatus == .ready(id: output.id) {
             spatialStage.wishMachineState = .ready
         } else if jobs.contains(where: {
-            [.submitting, .submissionUncertain, .generating, .generated].contains($0.stage)
-                || ($0.stage == .ready && !failedIDs.contains($0.objectID))
+            [.submitting, .submissionUncertain, .generating, .generated].contains($0.stage) || $0.stage == .ready
         }) {
             spatialStage.wishMachineState = .generating
-        } else if !failedIDs.isEmpty || jobs.last?.stage == .failed || jobs.last?.stage == .interrupted {
+        } else if jobs.last?.stage == .failed || jobs.last?.stage == .interrupted {
             spatialStage.wishMachineState = .failed
         } else { spatialStage.wishMachineState = .idle }
         pushWishTaskPrompts(jobs.suffix(20).map { wishMachineTaskPresentation(for: $0) },
@@ -6421,6 +6738,10 @@ final class AppDelegate:
         // （见 `pushResidentConnectivityNotice`），任务行只剩任务自己的说明。
         var detail = ResidentConnectivityFact.strippingConnectivityLines(from: job.lastError)
         var terminal = false
+        // 三轴说不出"这一刻托盘上有没有它"，而"可领取"说的正是托盘：这一档由宿主那句说。
+        // 与 `terminal` 分开是有意的 —— `terminal` 还会让站内提示 30 秒后过期，
+        // 而"还在把产物放上托盘"不是终态，任务行不许因此消失。
+        var hostSentenceWins = false
         // 三轴状态：这里只把事实读出来，判断全在 `ResidentTaskAxisProjection` 里。
         var ownershipFact: ResidentTaskAxisProjection.OwnershipFact = .notClaimed
         var placementFact: ResidentTaskAxisProjection.PlacementFact = .unknown
@@ -6436,17 +6757,37 @@ final class AppDelegate:
             }
         case .generated: status = "下载与校验中"
         case .ready:
-            if let failure = wishMachineCoordinator.outputRenderFailure(id: job.id, worldID: job.worldID,
-                residentScope: job.residentScope) {
-                status = "场景加载失败"; detail = failure.message; terminal = true
-            } else if spatialStage.wishMachineOutput?.id == job.objectID {
-                switch spatialStage.wishMachineOutputStatus {
-                case .ready(let id) where id == job.objectID: status = "可领取"
-                case .failed(let id, let message) where id == job.objectID:
-                    status = "场景加载失败"; detail = message
-                default: status = "载入场景中"
+            // **任务行与托盘说同一件事**，判据只有一处：`WishMachineOutputReachability`
+            // 读的是**现场推导**（渲染端此刻的结论），不是那条持久化的
+            // `outputRenderFailure` —— 记录只是"上一次推导说了什么"，见那类型上的注释。
+            // 旧代码在这里先信记录、再各走一套（行说"场景加载失败"、托盘空着；
+            // 或行说"可领取"、托盘还在装载），两者因此能各说各的。
+            let reachability = WishMachineOutputReachability.resolve(
+                isTrayHolder: spatialStage.wishMachineOutput?.id == job.objectID
+                    && spatialStage.wishMachineOutput?.worldID == job.worldID,
+                live: spatialStage.wishMachineOutputStatus,
+                objectID: job.objectID,
+                recordedFailure: wishMachineCoordinator.outputRenderFailure(
+                    id: job.id, worldID: job.worldID, residentScope: job.residentScope)?.message)
+            switch reachability {
+            case .claimable:
+                status = "可领取"
+            case .unavailable(let reason):
+                // 现场推导失败：短句给任务行，**具名原因**（字段 + 数值）给 detail ——
+                // 托盘这一刻是空的，任务行说的是同一件事，而且原因是可读的。
+                status = "场景加载失败"; detail = reason; terminal = true
+                hostSentenceWins = true
+            case .deriving(let reason):
+                // 还在把产物放上托盘：三轴此时会说"可领取"，而托盘上什么都没有 ——
+                // 所以这一档必须由宿主那句说，且**不是终态**（站内提示不许因此过期消失）。
+                status = "正在把产物放上托盘"
+                // "为什么还没看见它"必须可读：记录里那句（如果有）原样带出来，
+                // 不许塌成一句"载入中"。
+                if let reason {
+                    detail = [detail, "上一次推导：\(reason)"].compactMap { $0 }.joined(separator: "\n")
                 }
-            } else { status = "等待托盘展示" }
+                hostSentenceWins = true
+            }
         case .claimed:
             // 「已领取 → 已入库」这一轴**只能**由**库存记录**决定 —— 也就是「我的物件」
             // 列表读的同一份事实（`state.objectStates`，见 `residentPropEditorSnapshot`）。
@@ -6544,7 +6885,8 @@ final class AppDelegate:
         let axes = ResidentTaskAxisProjection.project(generationFact,
             ownership: ownershipFact, placement: placementFact)
         return WishMachineTaskPresentation(id: job.id, title: job.name, status: status, detail: detail,
-            isTerminal: terminal, axes: axes, autoContinuationPaused: job.autoContinuationPaused == true)
+            isTerminal: terminal, axes: axes, hostSentenceWins: hostSentenceWins,
+            autoContinuationPaused: job.autoContinuationPaused == true)
     }
 
     private func refreshWishMachine() async {

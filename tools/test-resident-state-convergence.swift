@@ -28,6 +28,10 @@ func productionSource(_ path: String) throws -> String {
 }
 
 let presentationPath = "apps/macos/Sources/GMGNRadio/Presence/WishMachineTaskPresentation.swift"
+/// 任务行那一句**委托**给唯一投影（`ResidentOwnershipProjection.sentence(...)` →
+/// `OwnershipSentence`），所以那一份生产源码必须一起编 —— 编的是**同一份**，
+/// 不是在这里抄一套文案（抄一份正是"两份真相"最容易被放过去的地方）。
+let projectionPath = "apps/macos/Sources/GMGNRadio/Presence/ResidentOwnershipProjection.swift"
 let overlayPath = "apps/macos/Sources/GMGNRadio/VisualEngine/StageOverlayView.swift"
 let liveCamPath = "apps/macos/Sources/GMGNRadio/DesktopPresence/LiveCamPanel.swift"
 let stageControllerPath = "apps/macos/Sources/GMGNRadio/VisualEngine/StageWindowController.swift"
@@ -38,6 +42,7 @@ let wishToolsPath = "apps/macos/Sources/GMGNRadio/Agent/ResidentWishMachineTools
 let coordinatorPath = "apps/macos/Sources/GMGNRadio/Presence/WishMachineCoordinator.swift"
 
 let presentationSource = try productionSource(presentationPath)
+let projectionSource = try productionSource(projectionPath)
 let overlaySource = try productionSource(overlayPath)
 let liveCamSource = try productionSource(liveCamPath)
 let stageControllerSource = try productionSource(stageControllerPath)
@@ -104,7 +109,12 @@ check(!rowItem.contains("resident.autonomy.resume") && !rowItem.contains("resume
 // 它从"三个轴各说一次"变成"三轴合起来正好说一次，而且只在这一处拼"：
 // 下面既有正向要求（那一句必须来自 `currentStatusLine` → 生产投影），
 // 也有反向要求（任务行里不许出现任何轴标签、任何轴的无障碍 id、任何自己拼的状态词）。
-let derivedVocabulary = ["排队中", "生成中", "可领取", "等待入库", "未摆放", "已摆放", "生成失败"]
+// 任务行**不许自己拼**任何状态词：那一句只能来自唯一投影。词表把**两套**都列上 ——
+// ① 现在投影在用的那几句；② 这次收口从任务行退役的第二套（可领取 / 等待入库 / 未摆放 /
+// 排队中）。第一套出现说明视图绕过了 `task.currentStatusLine`，第二套出现说明第二套文案
+// 又长回来了 —— 两种都是"同一件事两句话"。
+let derivedVocabulary = ["生成中", "未领取", "在库里（没摆）", "已摆放", "生成失败", "已结束",
+                         "可领取", "等待入库", "未摆放", "排队中"]
 check(rowItem.contains("Text(task.currentStatusLine)"),
       "任务行必须渲染由三轴派生的那一句现状（Text(task.currentStatusLine)）")
 check(!rowItem.contains("Text(task.status)"),
@@ -121,7 +131,7 @@ check(!rowItem.contains("resident.wish-task.\\(task.id.uuidString).generation")
 check(rowItem.contains("resident.wish-task.\\(task.id.uuidString).status"),
       "唯一那一句现状必须有自己的无障碍 id（resident.wish-task.<id>.status）")
 check(!derivedVocabulary.contains(where: { rowItem.contains($0) }),
-      "任务行不得自己拼状态词（排队中/生成中/可领取/等待入库/未摆放/已摆放/生成失败）：那一句只能来自三轴派生")
+      "任务行不得自己拼状态词（投影那几句 + 退役的第二套 可领取/等待入库/未摆放/排队中）：那一句只能来自唯一投影")
 check(rowItem.contains("let detail = task.detail") && rowItem.contains("Text(detail)"),
       "失败/等待原因那一行必须仍然渲染：简化的是标签，不是原因")
 // 派生点**只有一处**：三轴 → 一句现状 的判断在 `ResidentTaskAxisProjection.currentStatus`
@@ -132,6 +142,17 @@ check(occurrences(of: "var currentStatusLine: String", in: presentationSource) =
       "任务行那一句现状的组装必须只有一处（WishMachineTaskPresentation.currentStatusLine）")
 check(presentationSource.contains("ResidentTaskAxisProjection.currentStatus(axes)"),
       "任务行那一句必须真的来自三轴派生，而不是另写一份判断")
+// 三轴 → 那一句**只有唯一投影一个出口**（2026-10-02 收口）：正文里既要有委托，
+// 又不许再有第二套字面量（可领取 / 等待入库 / 未摆放 / 排队中）。
+guard let statusBody = declaration(in: presentationSource, "static func currentStatus(") else {
+    print("FAIL: 抽不出 ResidentTaskAxisProjection.currentStatus 的正文"); exit(1)
+}
+check(statusBody.contains("ResidentOwnershipProjection.sentence("),
+      "三轴那一句必须委托给唯一投影 ResidentOwnershipProjection.sentence(generation:ownership:placement:)")
+for retired in ["可领取", "等待入库", "未摆放", "排队中"] {
+    check(!statusBody.contains(retired),
+          "任务行那一句里还有第二套状态词「\(retired)」：那一句只有唯一投影一个出口")
+}
 check(occurrences(of: "static func hasReachedTerminalStep(", in: presentationSource) == 1,
       "『三轴走到头了没有』的判据必须只有一处（失败通道据此让位，不另写一套）")
 check(overlaySource.contains("task.currentStatusLine")
@@ -226,7 +247,7 @@ check(appSource.contains("humanOrderedClaim: {")
 // ── 断言 3 + 4：一个开关 / 用户显式停止仍然有效 —— 跑生产投影 ───────────────
 // 把生产文件原样读进来（去掉 import 行，由下面统一导入），
 // 所以下面这些断言检验的是真正跑在 App 里的那份判断。
-let productionBody = presentationSource
+let productionBody = (projectionSource + "\n" + presentationSource)
     .split(separator: "\n", omittingEmptySubsequences: false)
     .filter { !$0.hasPrefix("import ") }
     .joined(separator: "\n")
@@ -367,6 +388,9 @@ func storeChecks() -> Int {
 
     // ── 三轴 → 一句现状：完整对照表，逐条跑生产投影 ──────────────────────────
     // 取法是"最靠后的、对用户最有意义的那一步"：沿 生成 → 归属 → 摆放 从后往前看。
+    //
+    // 期望值**逐字**是唯一投影 `OwnershipSentence` 的那几句 —— 任务行与「我的物件」
+    // 列表因此说的是同一句话。这里不再有第二套（可领取 / 等待入库 / 未摆放）。
     func produced(_ generation: ResidentTaskAxisProjection.GenerationFact,
                   _ ownership: ResidentTaskAxisProjection.OwnershipFact,
                   _ placement: ResidentTaskAxisProjection.PlacementFact,
@@ -375,16 +399,18 @@ func storeChecks() -> Int {
             generation, ownership: ownership, placement: placement,
             previousOwnership: previousOwnership))
     }
-    storeCheck(produced(.remoteQueued, .notClaimed, .unknown) == "排队中",
-               "生成轴：排队 ⇒「排队中」")
+    // 生成轴的两档在投影里**只有一句话**（「生成中」）：队列细分（排队中）是远端进度，
+    // 不是对外状态 —— 那一档的细分仍在 `detail` 里说，不另造一个状态词。
+    storeCheck(produced(.remoteQueued, .notClaimed, .unknown) == "生成中",
+               "生成轴：排队 ⇒「生成中」（队列细分不是对外状态）")
     storeCheck(produced(.remoteRunning, .notClaimed, .unknown) == "生成中",
                "生成轴：生成中 ⇒「生成中」")
-    storeCheck(produced(.completed, .notClaimed, .notPlaced) == "可领取",
-               "生成完成但未领取 ⇒「可领取」")
-    storeCheck(produced(.downloaded, .claimedNotInInventory, .notPlaced) == "等待入库",
-               "已领取、未入库 ⇒「等待入库」")
-    storeCheck(produced(.completed, .inInventory, .unknown) == "未摆放",
-               "已入库、未摆放 ⇒「未摆放」")
+    storeCheck(produced(.completed, .notClaimed, .notPlaced) == "未领取",
+               "生成完成但未领取 ⇒「未领取」（用户拍板的那一档）")
+    storeCheck(produced(.downloaded, .claimedNotInInventory, .notPlaced) == "已领取，入库尚未保存",
+               "已领取、未入库 ⇒ 与列表同一句「已领取，入库尚未保存」")
+    storeCheck(produced(.completed, .inInventory, .unknown) == "在库里（没摆）",
+               "已入库、未摆放 ⇒ 与列表同一句「在库里（没摆）」")
     storeCheck(produced(.completed, .inInventory, .placed, previousOwnership: .inInventory) == "已摆放",
                "已摆放 ⇒「已摆放」")
     storeCheck(produced(.failed, .notClaimed, .unknown) == "生成失败",
@@ -404,12 +430,12 @@ func storeChecks() -> Int {
         id: taskID, title: "T", status: "场景加载失败", detail: "加载失败：…", isTerminal: true,
         axes: ResidentTaskAxisProjection.project(.completed, ownership: .notClaimed, placement: .unknown))
     storeCheck(renderFailed.currentStatusLine == "场景加载失败",
-               "三轴还没走到头、宿主已经终态 ⇒ 那是没做成：绝不能说成「可领取」（那是新的自相矛盾）")
+               "三轴还没走到头、宿主已经终态 ⇒ 那是没做成：绝不能说成「未领取」（那是新的自相矛盾）")
     let queuedRow = WishMachineTaskPresentation(
         id: taskID, title: "T", status: "后台排队中", detail: nil, isTerminal: false,
         axes: ResidentTaskAxisProjection.project(.remoteQueued, ownership: .notClaimed, placement: .unknown))
-    storeCheck(queuedRow.currentStatusLine == "排队中",
-               "正常推进时那唯一一句必须由三轴派生，而不是把宿主那句话照抄一遍")
+    storeCheck(queuedRow.currentStatusLine == "生成中",
+               "正常推进时那唯一一句必须由唯一投影派生（排队 ⇒「生成中」），而不是把宿主那句话照抄一遍")
     let legacyRow = WishMachineTaskPresentation(
         id: taskID, title: "T", status: "提交待确认", detail: nil, isTerminal: false)
     storeCheck(legacyRow.currentStatusLine == "提交待确认",

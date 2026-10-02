@@ -36,6 +36,8 @@ let sources = root.appendingPathComponent("apps/macos/Sources/GMGNRadio")
 let required = ["Presence/PropGenerationClient.swift", "Presence/PropGenerationStore.swift",
                 "Presence/PropImagePreparation.swift", "Presence/PropTaskDaemonClient.swift",
                 "Presence/WishMachineOutputDescriptor.swift", "Presence/WishMachineTaskPresentation.swift",
+                // 任务行那一句委托给唯一投影（`OwnershipSentence` 是唯一出口），一起编。
+                "Presence/ResidentOwnershipProjection.swift",
                 "Presence/WishMachineCoordinator.swift", "Agent/WishMachineContract.swift",
                 "Agent/ResidentWishMachineTools.swift"]
 guard required.allSatisfy({ FileManager.default.fileExists(atPath: sources.appendingPathComponent($0).path) }) else {

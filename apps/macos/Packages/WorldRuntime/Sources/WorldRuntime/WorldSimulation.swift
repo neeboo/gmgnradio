@@ -24,6 +24,75 @@ extension WorldSimulationError: LocalizedError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 「这条回执记下的那次变更今天还立着吗」与「重试入库这条路今天真的走得通吗」——
+// **一处**判据，两个消费者（世界层的去重、面板上的按钮）。
+//
+// 为什么必须有这一处：`layoutReceipts[requestID]` 的原始语义是"这条请求处理过了"，
+// 于是它被读成了**永久**。可真机上的事实会变：入库那一笔写下的物件，用户后来把它
+// **删了**（墓碑）。那一刻那条回执描述的已经不是现状，而是**上一轮**。把"处理过"
+// 当成永久，就等于"删掉之后再也补不回来"；而把它整个丢掉，又会让真正的重放写出
+// 第二条记录。两者之间只有一条线：**回执的效力 = 它记下的那次变更今天还立不立**。
+//
+// 它住在 `WorldSimulation.swift`（而不是命令类型所在的 `WorldPropLayout.swift`）是**刻意**的：
+// 本文件不被同模块的其它文件引用，于是它的负对照可以在离线 harness 里**真的注入**
+// （拿本文件的副本替掉 `WorldSimulation.swift.o` 重新链接）—— 一条注入不进去的判据
+// 等于没有判据。判据本身读的是 `WorldPropLayoutCommand` 的每一个 case，
+// 穷尽 `switch` 由编译器逼着新命令表态。
+// ---------------------------------------------------------------------------
+public extension WorldState {
+    /// `layoutReceipts[requestID]` 记下的那次变更**今天还立着吗**。
+    ///
+    /// 它同时是 `WorldSimulation.applyPropLayout` 的去重判据与
+    /// `canRedoInventoryRegistration(objectID:)` 的根据 —— 于是"按钮亮了却做不到"
+    /// 与"能做到却灰着"在结构上都不可能。
+    ///
+    /// 除入库（`.register`）以外的每一条命令**逐字保留今天的行为**（回执存在即去重）：
+    /// 那些命令写下的是一条**就地**的改动（摆放 / 收起 / 尺寸 / 朝向 / 挂点），
+    /// "改动还立不立"需要逐字段比对，一旦判成"不立着"就会把一次后来的合法改动**回滚**
+    /// —— 那是比本次缺陷更坏的 fail-open。所以这一轮只把入库那一条的生命周期修对，
+    /// 别的 case 一律返回 `true`（= 与改造前逐字节相同），并留下各自"为什么"。
+    func receiptIsStillInEffect(_ command: WorldPropLayoutCommand) -> Bool {
+        switch command {
+        case let .register(prop):
+            // 入库那一笔的效力 = **权威里这一条库存记录今天还在**。
+            //
+            // 它不在了（从未落盘，或者后来被删成墓碑）⇒ 那条回执是**上一轮**的：
+            // 这条 requestID 空出来，"重新入库"因此是一次**新的、合法的**变更
+            // （权威侧同样是 `object.registered` 的新 revision，墓碑行不删只标记）。
+            // 它还在 ⇒ 上一次入库**已经完成**，这次就是重放，照旧去重。
+            //
+            // 刻意**不看** `propTombstones`：墓碑是"删过"这件事的记录，它不随重新入库
+            // 消失（见 `canRedoInventoryRegistration` 的说明）。把它算进来，会让
+            // "重新入库成功了"之后的重放**永远去不了重** —— 那正好是幂等性的反面。
+            return objectStates[prop.objectID] != nil
+        case .place, .withdraw, .resize, .rebase, .hold, .adjustGrip, .returnHeld,
+             .enableCapability, .delete, .undo:
+            // 今天的行为：回执存在即去重。理由见上面的函数说明（就地改动的"还立不立"
+            // 无法在不引入回滚风险的前提下判定）。
+            return true
+        }
+    }
+
+    /// 「重试入库」这条路今天真的走得通吗 —— **与 `applyPropLayout(.register)` 同源**。
+    ///
+    /// 两个条件缺一不可：
+    /// 1. 库存里**没有**这一条。有 ⇒ `register` 是一次幂等空转（甚至请求冲突），
+    ///    不是"补做"；而且此时 `receiptIsStillInEffect(.register)` 必为真 ——
+    ///    也就是说**旧回执已经不再去重**这一件事，由这个条件直接蕴含，不需要第二份判据。
+    /// 2. 它**不是**用户有意删掉的那一件（墓碑还在）。删除是**永久**的
+    ///    （`docs/plans/2026-10-02-prop-deletion-semantics.md` §4：软删是为了可审计、
+    ///    不是为了可回滚），所以"删掉的东西重新长回来"不是这个按钮该做的事：
+    ///    自动补做与面板按钮走的是**同一条**重入路径（`synchronizeOwnedResidentProps`），
+    ///    放开这一条意味着用户每删一件、下一个同步周期它就自己回来。
+    ///
+    /// 于是它在**引擎能写**的基础上多了一条产品取舍（删除永久），而不是多一条"做不到"：
+    /// 面板只在它说 true 的时候摆出「重试入库」，所以那个按钮不会是一句做不到的承诺。
+    func canRedoInventoryRegistration(objectID: String) -> Bool {
+        objectStates[objectID] == nil && propTombstones?[objectID] == nil
+    }
+}
+
 public struct WorldSimulation: Sendable {
     public private(set) var state: WorldState
     /// Fixed capacity of the in-memory retained window, counted **including** the
@@ -107,7 +176,22 @@ public struct WorldSimulation: Sendable {
     /// Mutates a value candidate. Callers persist that candidate before publishing it.
     public mutating func applyPropLayout(_ command: WorldPropLayoutCommand, expectedLayoutRevision: UInt64, requestID: String) throws {
         guard !requestID.isEmpty, requestID.count <= 256 else { throw WorldPropLayoutError.requestConflict }
-        if let receipt = state.layoutReceipts[requestID] {
+        // 「这条 requestID 已经处理过」这句话的**有效期**，与它记下的那次变更**今天还立不立**
+        // 完全一致（判据只有一处：`WorldState.receiptIsStillInEffect(_:)`）。
+        //
+        // - 那次变更**还立着** ⇒ 这次是同一轮重放：内容必须逐位相同（否则是请求冲突），
+        //   然后一个字节都不写（幂等）。**真重复照旧去重，一个字不放宽。**
+        // - 那次变更**已经不在了** ⇒ 那条回执描述的是**上一轮**，这条 requestID 空出来了。
+        //   这次提交按今天的判据重新走一遍，写下**一条新的**变更（`layoutRevision += 1`、
+        //   一条新回执、一条新事件）。真机 `2F633C0F`（超大荧幕电视）正是这一支：用户把
+        //   那台电视**删掉了**（权威 `world_records` 里那一行 `tombstone=1`），而旧的
+        //   `claimed.2F633C0F-…` 回执还在 —— 入库那一笔的效力已经不在，可旧的"回执存在
+        //   就 `return`"把"补做入库"永远挡在写入之前，于是「重试入库」是一个点一次失败
+        //   一次的承诺。权威侧本来就支持这件事（`services/gmgn-taskd/src/world.rs` 的
+        //   `upsert_object`：墓碑行重新登记 ⇒ `revision+1`、`tombstone=0`、事实
+        //   `object.registered`），本轮**不动 `services/**`**，只把 Swift 这一侧的
+        //   去重判据修对。
+        if let receipt = state.layoutReceipts[requestID], state.receiptIsStillInEffect(receipt) {
             guard receipt == command else { throw WorldPropLayoutError.requestConflict }
             return
         }

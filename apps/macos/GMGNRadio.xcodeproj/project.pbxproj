@@ -187,6 +187,7 @@
 		964267DB09DF0C90FA77AA4B /* ResidentMusicToolBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = F904758C6A09AFB3E4669F60 /* ResidentMusicToolBridge.swift */; };
 		9653E38E38BFF4C976625281 /* AgentProgramPlanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91AE9B5CC47487FE7A0A86CE /* AgentProgramPlanner.swift */; };
 		966720FCB35C2DA9CD0439C1 /* PresenceSettingsModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07A8377E0830ED4ED8D57DB6 /* PresenceSettingsModel.swift */; };
+		96ACC20A40A49386BEF17736 /* ResidentOwnershipProjection.swift in Sources */ = {isa = PBXBuildFile; fileRef = E649160CE2CC908F992F6C40 /* ResidentOwnershipProjection.swift */; };
 		96CBD8107E93FEABEB75D0D3 /* PropAttachmentSlot.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFD4AFB29135D0E00D93E4E9 /* PropAttachmentSlot.swift */; };
 		976213343175CDB4D7634C92 /* ResidentLocomotionMotionPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30C49D1F8B1D6E86CA04C0B3 /* ResidentLocomotionMotionPolicy.swift */; };
 		977A6550B9EDEDE80B2D0915 /* PropImagePreparation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7042ABB00311D453A5D5E557 /* PropImagePreparation.swift */; };
@@ -590,6 +591,7 @@
 		E3B27450671FA8F17944A1BC /* MotionLibraryCategory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MotionLibraryCategory.swift; sourceTree = "<group>"; };
 		E3F357B698E50BB31A5CEEAC /* MarbleWorldClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarbleWorldClientTests.swift; sourceTree = "<group>"; };
 		E442A4484F6338F0288177A4 /* ElevenLabsRealtimeSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElevenLabsRealtimeSessionTests.swift; sourceTree = "<group>"; };
+		E649160CE2CC908F992F6C40 /* ResidentOwnershipProjection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentOwnershipProjection.swift; sourceTree = "<group>"; };
 		E6928DE615B4CCBB86C03160 /* PresencePackageStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresencePackageStoreTests.swift; sourceTree = "<group>"; };
 		E6B98D23C9CD0B46A51B0153 /* PropGenerationClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PropGenerationClient.swift; sourceTree = "<group>"; };
 		E74010CC37B6418925BA0556 /* GMGNSettingsViewTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GMGNSettingsViewTests.swift; sourceTree = "<group>"; };
@@ -1026,6 +1028,7 @@
 				0E16B502423D8CB2B119C833 /* RemoteMotionLibrary.swift */,
 				C12A593D2E39AA38BDE94F2C /* ResidentImageAttachment.swift */,
 				30C49D1F8B1D6E86CA04C0B3 /* ResidentLocomotionMotionPolicy.swift */,
+				E649160CE2CC908F992F6C40 /* ResidentOwnershipProjection.swift */,
 				193229015897C584DE49ABC2 /* ResidentPerformanceMotionPolicy.swift */,
 				B43C3927253A50F50B106EC9 /* ResidentPropBlockReasonLabel.swift */,
 				4B883AB50613AABC30AE090C /* ResidentPropEditorState.swift */,
@@ -1608,6 +1611,7 @@
 				365A884BFA2D7F315952DA46 /* ResidentMemoryClient.swift in Sources */,
 				189961BE3CFC288458F544EF /* ResidentMemoryStore.swift in Sources */,
 				964267DB09DF0C90FA77AA4B /* ResidentMusicToolBridge.swift in Sources */,
+				96ACC20A40A49386BEF17736 /* ResidentOwnershipProjection.swift in Sources */,
 				6B5712B6CB1BCDEE82542F67 /* ResidentPerformanceMotionPolicy.swift in Sources */,
 				7C0DCA5A91A6F22DF4DB4472 /* ResidentPropBlockReasonLabel.swift in Sources */,
 				B388D26A0C8A9CFC0FDE7946 /* ResidentPropEditorState.swift in Sources */,

@@ -729,6 +729,9 @@ let compiled = try run("/usr/bin/swiftc", ["-j1", "-parse-as-library", "-I", wor
     sources.appendingPathComponent("Agent/WorldAgentToolDispatcher.swift").path,
     sources.appendingPathComponent("Agent/ResidentWorldToolSession.swift").path,
     sources.appendingPathComponent("Presence/ResidentPropPlacementService.swift").path,
+    // 工具桥的 `read_owned_props` 回执把状态那两句交给**唯一投影**（`OwnershipRow`），
+    // 所以那一份生产源码必须一起编 —— 编同一份，不是抄一套状态词。
+    sources.appendingPathComponent("Presence/ResidentOwnershipProjection.swift").path,
     sources.appendingPathComponent("Agent/ResidentPropToolBridge.swift").path,
     // 手持上限的替身（见文件头注释）：`ResidentPropPlacementService` 与工具描述都读那一份定义。
     root.appendingPathComponent("tools/fixtures/ResidentPropHoldLimitShim.swift").path,

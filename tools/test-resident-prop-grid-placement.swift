@@ -378,6 +378,8 @@ let compiled = try run("/usr/bin/swiftc",["-j1","-parse-as-library","-I",worldRu
     sourceRoot.appendingPathComponent("Agent/WorldAgentContext.swift").path,
     sourceRoot.appendingPathComponent("Presence/ResidentPropPlacementService.swift").path,
     sourceRoot.appendingPathComponent("Presence/ResidentPropEditorState.swift").path,
+    // 「我的物件」的唯一投影：面板状态现在从它现算行，编它就得一起编这一份。
+    sourceRoot.appendingPathComponent("Presence/ResidentOwnershipProjection.swift").path,
     sourceRoot.appendingPathComponent("Presence/ResidentPropPlacementConfiguration.swift").path,
     // 手持上限 + 挂点（slot）的替身：`ResidentPropPlacementService` 读那两份定义，
     // 而它们的真定义依赖 app 的渲染侧类型，离线编不动（见那个 fixture 的文件头）。

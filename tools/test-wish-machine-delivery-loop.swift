@@ -50,6 +50,11 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
 // 宿主动作类型（只为复刻 App 的 `isResidentActivityAvailable` 分支）。
 enum StageAvatarFormat: String, Sendable { case vrm, pmx }
 enum StageMotionFormat: String, Sendable { case procedural, vrma, vmd }
+/// `ResidentPropAttachmentEligibility`（真源码 `PropAttachment.swift`）只读它的 `id` 与
+/// `format`。真 `StageAvatarAsset` 住在 `StageAvatarRuntime.swift`，那一份还会重声明上面的
+/// `StageAvatarFormat` / `StageMotionAsset`（本 harness 已按自己的口径 stub 了它们），
+/// 所以这里只补这**一个**类型 —— 与"世界里的大类型仍是 stub"的既有做法一致。
+struct StageAvatarAsset: Equatable, Sendable { let id: String; let format: StageAvatarFormat }
 struct StageMotionAsset: Equatable, Sendable {
     let id: String
     let name: String
@@ -926,14 +931,24 @@ for module in ["GLTFMetalKit", "GLTFCore"] {
 }
 let inputs = ["Presence/PropGenerationClient", "Presence/PropGenerationStore", "Presence/PropTaskDaemonClient", "Presence/PropImagePreparation",
     "Presence/PropGenerationConfiguration",
+    // `ResidentPropPlacementService` 的拒绝词汇里就有挂点（`PropAttachmentPoint` / `worldSlot`）
+    // 与握点推断（`PropGripInference`）。与上面那条同源：清单漏了真源码，整条门禁就红在
+    // 编译期、从来没跑过。
+    "Presence/PropAttachment", "Presence/PropAttachmentSlot", "Presence/PropGripInference",
     "Presence/WishMachineCoordinator", "Presence/WishMachineOutputDescriptor", "Presence/WishMachineOutputRenderer",
+    // `WishMachineCoordinator` 判连通性那一行读的就是这里面的 `ResidentConnectivityFact`：
+    // 这一份**从来没挂进过**编译清单，于是这个 harness 从 0899bd4 起一直红在
+    // `cannot find 'ResidentConnectivityFact' in scope` —— 一条从不跑的门禁等于没有门禁。
+    "Presence/WishMachineTaskPresentation",
     "Presence/WishMachineScene", "Presence/ResidentPropPlacementService", "Presence/ResidentPropPlacementConfiguration",
     "Presence/ResidentPerformanceMotionPolicy",
     "Agent/WishMachineContract", "Agent/ResidentWishMachineTools", "Agent/ResidentPropToolBridge", "Agent/WorldAgentContext", "Agent/WorldAgentToolContract", "Agent/WorldAgentToolDispatcher"]
     .map { sources.appendingPathComponent($0 + ".swift").path }
-    + [root.appendingPathComponent("tools/fixtures/WishMachineDaemonFixture.swift").path,
-       // 手持上限的替身（见文件头注释）：`ResidentPropPlacementService` 与工具描述都读那一份定义。
-       root.appendingPathComponent("tools/fixtures/ResidentPropHoldLimitShim.swift").path]
+    + [root.appendingPathComponent("tools/fixtures/WishMachineDaemonFixture.swift").path]
+    // `tools/fixtures/ResidentPropHoldLimitShim.swift`（手持上限的替身）**故意不挂**：
+    // 它的存在理由是"`PropAttachment.swift` 编不动"，而上面已经编真源码了。
+    // 两者一起挂会 `invalid redeclaration of 'ResidentPropAttachmentEligibility'`：
+    // 上限只有一个出处（真源码那一行），替身不许与真身并存。
 func run(_ path: String, _ arguments: [String]) throws -> Int32 {
     let process = Process(); process.executableURL = URL(fileURLWithPath: path); process.arguments = arguments
     try process.run(); process.waitUntilExit(); return process.terminationStatus

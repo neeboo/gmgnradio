@@ -6,6 +6,23 @@ enum WishMachineStage: String, Codable, Sendable {
     case submitting, submissionUncertain, generating, generated, ready, failed, cancelled, interrupted, claimed
 }
 
+/// `wishes.json` 里**一条解不出来的 job**。
+///
+/// 为什么它是档案的一部分而不是被丢掉：`wishes.json` 是**整份 decode** 的
+/// （`WishMachineCoordinator.init`），一条坏 job 会让整份读不出来（`readable = false`），
+/// 于是「我的物件」列表整个消失 —— 那正是这次要修的观感缺陷。现在改成**逐条降级**：
+/// 坏的那一条进这里，其余照常；而且它的**原始 JSON 原样留在档案里**
+/// （`Archive.unreadableJobs`），下一次 `persist()` 不会把它抹掉。
+struct WishMachineUnreadableJob: Codable, Equatable, Sendable {
+    /// 这一条在 `wishes.json` 里的原始 JSON（值逐字保留，格式可能被重排）。
+    let rawJSON: String
+    /// 能读出来的身份，只用来在界面上点名（读不出来就是 nil）。
+    let jobID: String?
+    let name: String?
+    /// 为什么读不出来（字段级的原因，不是"解析失败"这种没信息量的话）。
+    let reason: String
+}
+
 struct WishMachineJob: Identifiable, Codable, Equatable, Sendable {
     let id: UUID
     let worldID: String
@@ -203,7 +220,7 @@ enum WishMachineError: LocalizedError {
         case .busy: return "另一项生成请求仍在处理中，本次操作尚未发送，请稍后重试。"
         case .notReady: return "物品还未完成下载检查，暂时不能领取。"
         case .notAtMachine: return "请先走到许愿机领取位置；托盘实际显示物品后才能领取。"
-        case .retryUnavailable: return "只能确认结果未明的原提交；新生成需要用户重新发起。"
+        case .retryUnavailable: return "只有已经在后台存在的任务才能重试（复用原身份和原图，不会新建任务、也不会再消耗一次生成授权）。"
         case .pauseNotPersisted: return "当前运行已暂停自动领取，但暂停状态保存失败；重启后可能恢复，请先解决存储问题。"
         case .automaticContinuationPaused: return "该任务的自动续办已停止，后台不能自行领取或摆放；本轮人类明确下令的领取不受影响。"
         case .placementRevoked: return "该摆放委托已停止，需要用户新的摆放委托才能重试。"
@@ -240,8 +257,13 @@ enum WishMachineError: LocalizedError {
         var webReferences: [ResidentWebReference]?
         /// 可选 ⇒ 旧档案照常解码（读到 nil 就是"没有草稿"，行为与今天逐位相同）。
         var pendingDrafts: [WishMachinePendingDraft]?
+        /// 逐条降级时保留下来的坏 job。旧构建忽略这个键（合成的 `Codable` 不认识它），
+        /// 所以档案仍然向后兼容。
+        var unreadableJobs: [WishMachineUnreadableJob]?
     }
     @Published private(set) var jobs: [WishMachineJob] = []
+    /// **一条坏 job 不许让整个列表消失**：解不出来的那些在这里，原始 JSON 仍在档案里。
+    @Published private(set) var unreadableJobs: [WishMachineUnreadableJob] = []
     @Published private(set) var errorMessage: String?
     var onChange: (@MainActor () -> Void)?
     private let store: PropGenerationStore
@@ -266,7 +288,7 @@ enum WishMachineError: LocalizedError {
         let file = self.directory.appendingPathComponent("wishes.json")
         if FileManager.default.fileExists(atPath: file.path) {
             do {
-                let archive = try JSONDecoder().decode(Archive.self, from: Data(contentsOf: file))
+                let archive = try Self.loadArchive(from: try Data(contentsOf: file))
                 guard Set(archive.jobs.map(\.id)).count == archive.jobs.count,
                       Set(archive.authorizations.map(\.id)).count == archive.authorizations.count,
                       Set((archive.delegations ?? []).map(\.id)).count == (archive.delegations ?? []).count,
@@ -277,6 +299,7 @@ enum WishMachineError: LocalizedError {
                 delegations = archive.delegations ?? []
                 webReferences = archive.webReferences ?? []
                 pendingDrafts = archive.pendingDrafts ?? []
+                unreadableJobs = archive.unreadableJobs ?? []
                 // An interrupted local submit is never automatically repeated. Its grant stays consumed.
                 for index in jobs.indices where jobs[index].stage == .submitting {
                     jobs[index].stage = .submissionUncertain
@@ -288,6 +311,86 @@ enum WishMachineError: LocalizedError {
         }
         store.onChange = { [weak self] in self?.synchronizeBackendSnapshot() }
         synchronizeBackendSnapshot()
+    }
+
+    /// 逐条降级地读 `wishes.json`（G6）。
+    ///
+    /// - 第一遍是**整份严格解码**：绝大多数档案一次成功，行为与改造前逐字相同。
+    /// - 只有整份解不出来时才走第二遍：`jobs` 逐条解码，坏的那一条进 `unreadableJobs`
+    ///   （原始 JSON 原样留着，`persist()` 会把它写回去，**不丢数据**）；其余各段仍然
+    ///   是"整段成立，否则整份读不出来" —— 授权/事件/委托的完整性是整个档案的前提。
+    private static func loadArchive(from data: Data) throws -> Archive {
+        let decoder = JSONDecoder()
+        if let archive = try? decoder.decode(Archive.self, from: data) { return archive }
+        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            throw WishMachineError.unavailable
+        }
+        func payload(_ value: Any) throws -> Data {
+            guard JSONSerialization.isValidJSONObject(value),
+                  let data = try? JSONSerialization.data(withJSONObject: value) else {
+                throw WishMachineError.unavailable
+            }
+            return data
+        }
+        func section<T: Decodable>(_ key: String, _ type: T.Type) throws -> T {
+            guard let value = root[key] else { throw WishMachineError.unavailable }
+            return try decoder.decode(T.self, from: try payload(value))
+        }
+        func optionalSection<T: Decodable>(_ key: String, _ type: T.Type) -> T? {
+            guard let value = root[key] else { return nil }
+            guard let data = try? payload(value) else { return nil }
+            return try? decoder.decode(T.self, from: data)
+        }
+        var decoded: [WishMachineJob] = []
+        var unreadable: [WishMachineUnreadableJob] = []
+        for element in (root["jobs"] as? [Any]) ?? [] {
+            let object = element as? [String: Any]
+            let raw = (try? payload(element)).map { String(decoding: $0, as: UTF8.self) } ?? "null"
+            do {
+                decoded.append(try decoder.decode(WishMachineJob.self, from: Data(raw.utf8)))
+            } catch {
+                unreadable.append(.init(rawJSON: raw, jobID: object?["id"] as? String,
+                                        name: object?["name"] as? String,
+                                        reason: Self.readableDecodingReason(error)))
+            }
+        }
+        return Archive(authorizations: try section("authorizations", [Authorization].self),
+                       jobs: decoded,
+                       events: try section("events", [WishMachineEvent].self),
+                       imageRegistrations: optionalSection("imageRegistrations", [ImageRegistration].self),
+                       delegations: optionalSection("delegations", [WishPlacementDelegation].self),
+                       webReferences: optionalSection("webReferences", [ResidentWebReference].self),
+                       pendingDrafts: optionalSection("pendingDrafts", [WishMachinePendingDraft].self),
+                       unreadableJobs: unreadable.isEmpty ? nil : unreadable)
+    }
+
+    /// 「为什么这条读不出来」必须说得出**字段**，不是一句"解析失败"。
+    private static func readableDecodingReason(_ error: Error) -> String {
+        guard let error = error as? DecodingError else { return error.localizedDescription }
+        func path(_ context: DecodingError.Context) -> String {
+            let name = context.codingPath.map { $0.intValue.map { "[\($0)]" } ?? $0.stringValue }
+                .joined(separator: ".")
+            return name.isEmpty ? "（根）" : name
+        }
+        switch error {
+        case let .keyNotFound(key, context): return "缺少字段 \(path(context)).\(key.stringValue)"
+        case let .typeMismatch(_, context): return "字段 \(path(context)) 的类型不对"
+        case let .valueNotFound(_, context): return "字段 \(path(context)) 没有值"
+        case let .dataCorrupted(context): return "数据损坏：\(context.debugDescription)"
+        @unknown default: return "解析失败"
+        }
+    }
+
+    /// 档案现在读得出来吗（读不出来时列表**仍然**显示世界那一半，并顶一条横幅）。
+    var isReadable: Bool { readable }
+
+    /// 「有几条 job 坏了、被跳过」那一句可见说明（没有坏的就是 nil）。
+    var unreadableJobNotice: String? {
+        guard !unreadableJobs.isEmpty else { return nil }
+        let named = unreadableJobs.prefix(3).map { $0.jobID ?? $0.name ?? "（读不出编号）" }
+        let tail = unreadableJobs.count > named.count ? " 等" : ""
+        return "许愿记录里有 \(unreadableJobs.count) 条读不出来，已跳过（原件仍逐条保留在 wishes.json 里）："
+            + named.joined(separator: "、") + tail
     }
 
     /// Host-only: call for an explicit user generation request, never for an autonomous wakeup.
@@ -573,6 +676,10 @@ enum WishMachineError: LocalizedError {
     }
 
     /// Only durable, scope-matched scene failures may influence presentation selection.
+    ///
+    /// ⚠️ 它返回的是**记录**（上一次推导说了什么），不是权威。可见性判据是
+    /// `WishMachineOutputReachability`（读**现场**推导），记录只在还没有现场结论时
+    /// 供出同一句具名原因。真机 2026-10-02「超大荧幕电视」就是把它当权威用的后果。
     func outputRenderFailure(id: UUID, worldID: String, residentScope: String) -> WishMachineEvent? {
         guard readable else { return nil }
         return events.first { $0.wishID == id && $0.worldID == worldID && $0.residentScope == residentScope
@@ -580,17 +687,56 @@ enum WishMachineError: LocalizedError {
     }
 
     /// A local scene-loading failure preserves the valid downloaded task and its asset.
+    ///
+    /// 这条记录是**最近一次推导**的结论，所以每一次推导都要能改写它：
+    /// 旧行为是"已经有记录了就不再记"，于是修复前那句没有字段/数值的旧文案会永久留在盘上，
+    /// 重新推导**仍然失败**时用户也读不到是哪一条判据、哪个数（新纪律要求具名）。
+    /// 同一件产物永远只有一条 `failureSource == "renderer"` 的记录（幂等：同一句话不写第二遍）。
     func recordOutputRenderFailure(id: UUID, worldID: String, residentScope: String, message: String) throws {
         let job = jobs[try index(id: id, worldID: worldID, residentScope: residentScope)]
         guard job.stage == .ready, let path = job.modelPath, FileManager.default.fileExists(atPath: path) else {
             throw WishMachineError.notReady
         }
-        guard !events.contains(where: { $0.wishID == id && $0.kind == .failed && $0.failureSource == "renderer" }) else { return }
+        let text = "成品场景加载失败：" + message
+        if let index = events.firstIndex(where: { $0.wishID == id && $0.worldID == worldID
+            && $0.residentScope == residentScope && $0.kind == .failed && $0.failureSource == "renderer" }) {
+            guard events[index].message != text || events[index].stage != job.stage
+                || events[index].remoteState != job.remoteState else { return }
+            events[index].message = text
+            events[index].stage = job.stage
+            events[index].remoteState = job.remoteState
+            events[index].cancelRequested = job.cancelRequested
+            try persist()
+            return
+        }
         events.append(.init(id: UUID(), wishID: id, worldID: worldID, residentScope: residentScope,
             objectID: job.objectID, kind: .failed, computeMayContinue: job.computeMayContinue,
             stage: job.stage, remoteState: job.remoteState,
-            message: "成品场景加载失败：" + message, cancelRequested: job.cancelRequested, failureSource: "renderer"))
+            message: text, cancelRequested: job.cancelRequested, failureSource: "renderer"))
         try persist()
+    }
+
+    /// 现场推导**成功**了 ⇒ 那条陈旧结论必须消失：记录不是权威，推导才是。
+    ///
+    /// 判据**只能是**"重新推导成功"（调用方读的就是现场 `WishMachineOutputStatus.ready`）——
+    /// 无条件清会把真失败也抹掉，那是另一种假话（新纪律）。
+    /// 幂等：没有记录时一次写入都不发生，所以重复读取/重放不产生多余状态变更。
+    @discardableResult
+    func clearOutputRenderFailure(id: UUID, worldID: String, residentScope: String) throws -> Bool {
+        guard readable else { return false }
+        let matches: (WishMachineEvent) -> Bool = {
+            $0.wishID == id && $0.worldID == worldID && $0.residentScope == residentScope
+                && $0.kind == .failed && $0.failureSource == "renderer"
+        }
+        guard events.contains(where: matches) else { return false }
+        // 落盘失败就把内存改回去：宁可留着那条旧结论，也不许把一条真事实**只在内存里**删掉。
+        let before = events
+        events.removeAll(where: matches)
+        do { try persist() } catch {
+            events = before
+            throw error
+        }
+        return true
     }
 
     func residentJobs(worldID: String, residentScope: String) -> [WishMachineJob] {
@@ -654,6 +800,12 @@ enum WishMachineError: LocalizedError {
         canClaim(try read(id: id, worldID: worldID, residentScope: residentScope))
     }
 
+    /// 允许重试的阶段 —— **唯一一份**：`retry()` 的 guard 与界面上那一枚按钮读的是它，
+    /// 于是"按钮亮了却重试不了"与"按钮灰着其实能重试"在结构上都不可能。
+    ///
+    /// `.failed` 在里面（见 `retry()` 里那段说明）：重试照旧只复用**原身份**重放原提交。
+    static let retryableStages: Set<WishMachineStage> = [.submissionUncertain, .submitting, .generated, .failed]
+
     /// Explicit confirmation only. A persisted core request is replayed with its original image and key.
     @discardableResult func retry(id: UUID, worldID: String, residentScope: String) async throws -> WishMachineJob {
         let index = try index(id: id, worldID: worldID, residentScope: residentScope)
@@ -661,13 +813,32 @@ enum WishMachineError: LocalizedError {
         // A reopened app may not have received its first subscription snapshot yet.
         // Resolve the durable daemon identity before choosing retry versus local submission.
         await store.refreshSnapshot()
-        if let record = store.jobs.first(where: { $0.id == coreID }), record.receipt != nil,
+        // `.failed` **例外**：这一段是为了"确认守护进程已经认得这次提交"，而失败是已经
+        // 确认过的结局 —— 对它必须真的走到下面的重发/重试，否则「重试」会变成
+        // "点了没反应"（reconcile 只是把同一个失败读回来）。
+        if jobs[index].stage != .failed,
+           let record = store.jobs.first(where: { $0.id == coreID }), record.receipt != nil,
            !(record.receipt?.state == .completed && record.localModelPath == nil) {
             reconcile(index: index)
             try persist()
             return jobs[index]
         }
-        guard [.submissionUncertain, .submitting, .generated].contains(jobs[index].stage) else { throw WishMachineError.retryUnavailable }
+        // 「原提交结果未明」不是唯一该被确认的事：**`.failed` 也必须能重试**。
+        //
+        // 原判据只放行 `[.submissionUncertain, .submitting, .generated]`，于是"失败行上的
+        // 重试"今天根本不存在 —— 而失败恰恰是用户唯一有话可说的一种结局；对它只回一句
+        // "新生成需要用户重新发起"，等于把用户唯一的证据丢掉（真机两次"东西不见了"的
+        // 投诉都起因于此）。
+        //
+        // 为什么加 `.failed` **并没有放宽**这条 guard 的语义：它照旧只允许"复用**原身份**
+        // 重放原提交"——同一个 `jobs[index].jobID`（`coreID`）、同一张图（按 `attachmentID`
+        // 找回）、同一个幂等键（`id: coreID`）、同一个 `sizeIntent`（见下），既不新建任务、
+        // 也不多消费一次生成授权。也就是说它仍然是"重试那一次已经发生的提交"，不是
+        // "再生成一件新的"。
+        //
+        // 其余取值照旧拒绝：`.ready` / `.claimed` 已经有产物（重发会多出一件），
+        // `.cancelled` / `.interrupted` 是明确终止，都不在这次授权范围内。
+        guard Self.retryableStages.contains(jobs[index].stage) else { throw WishMachineError.retryUnavailable }
         try Task.checkCancellation()
         if store.jobs.contains(where: { $0.id == coreID }) {
             await store.retrySubmission(id: coreID)
@@ -780,18 +951,37 @@ enum WishMachineError: LocalizedError {
         return jobs[index]
     }
 
-    func claim(id: UUID, worldID: String, residentScope: String) throws -> WishMachineJob {
-        let index = try index(id: id, worldID: worldID, residentScope: residentScope)
+    /// 「这一件现在能不能领」——**唯一**一份判据。
+    ///
+    /// `claim()` 自己与界面上那一枚「领取」按钮读的是**同一个表达式**，所以
+    /// "按钮亮了却领不到"与"按钮灰着其实能领"在结构上都不可能。判据本身**一个字都没改**：
+    /// 仍然要求 `activityID == "wish_machine.collect"`、`phase == "loop"`、
+    /// `distanceMeters ∈ 0...0.25`、`outputAvailable`（`WishMachineCoordinator.claim` 的原文）。
+    func claimAvailability(id: UUID, worldID: String, residentScope: String) -> Result<WishMachineJob, WishMachineError> {
+        guard let index = try? index(id: id, worldID: worldID, residentScope: residentScope) else {
+            return .failure(.wrongScope)
+        }
         let job = jobs[index]
-        if job.stage == .claimed { return job }
-        guard job.stage == .ready, let path = job.modelPath, FileManager.default.fileExists(atPath: path) else { throw WishMachineError.notReady }
+        if job.stage == .claimed { return .success(job) }
+        guard job.stage == .ready, let path = job.modelPath, FileManager.default.fileExists(atPath: path) else { return .failure(.notReady) }
         guard let evidence = canClaim(job), evidence.worldID == worldID, evidence.activityID == "wish_machine.collect",
               evidence.phase == "loop", evidence.distanceMeters.isFinite, (0...0.25).contains(evidence.distanceMeters),
-              evidence.outputAvailable else { throw WishMachineError.notAtMachine }
-        jobs[index].stage = .claimed
-        emit(index: index, kind: .claimed)
-        try persist()
-        return jobs[index]
+              evidence.outputAvailable else { return .failure(.notAtMachine) }
+        return .success(job)
+    }
+
+    func claim(id: UUID, worldID: String, residentScope: String) throws -> WishMachineJob {
+        let index = try index(id: id, worldID: worldID, residentScope: residentScope)
+        switch claimAvailability(id: id, worldID: worldID, residentScope: residentScope) {
+        case let .failure(error):
+            throw error
+        case let .success(job):
+            if job.stage == .claimed { return job }
+            jobs[index].stage = .claimed
+            emit(index: index, kind: .claimed)
+            try persist()
+            return jobs[index]
+        }
     }
 
     func readyOutputs(worldID: String) -> [WishMachineOutputDescriptor] {
@@ -1080,7 +1270,8 @@ enum WishMachineError: LocalizedError {
             let file = directory.appendingPathComponent("wishes.json")
             try JSONEncoder().encode(Archive(authorizations: authorizations, jobs: jobs, events: events,
                 imageRegistrations: imageRegistrations, delegations: delegations, webReferences: webReferences,
-                pendingDrafts: pendingDrafts))
+                pendingDrafts: pendingDrafts,
+                unreadableJobs: unreadableJobs.isEmpty ? nil : unreadableJobs))
                 .write(to: temporary, options: .withoutOverwriting)
             try archiveFileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
             // Preparation may fail without changing the old archive. Rename is the sole
