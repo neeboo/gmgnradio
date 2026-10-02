@@ -148,7 +148,9 @@ guard liveCamPanel.contains("static let maximumClickDrift: CGFloat = 4") else {
 }
 let clickDriftPolicy = method("enum LiveCamSpaceEntryPolicy", in:liveCamPanel)
 // 面板那一行提示必须与新操作一致（只改文案；布局与其它控件不动）。
-guard editorView.contains("左键放下；右键旋转 45°") else {
+// 2026-10-02 文案简化：同一句提示改成「移动指针选位置，左键放下，右键转 45°，Esc 放回。」
+// —— 判据不变（左键放下、右键转 45°），只跟着新文案走。
+guard editorView.contains("左键放下，右键转 45°") else {
  print("FAIL: the placement panel hint must say the left button drops and the right button rotates");exit(1)
 }
 guard !editorView.contains("或圆环旋转") else {
