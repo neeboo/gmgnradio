@@ -20,7 +20,15 @@ private enum MusicLibraryCacheError: LocalizedError {
 }
 
 private enum ResidentPropHostError: LocalizedError {
-    case editorOpen, assetUnverified, assetUnavailable, ownershipMismatch
+    case editorOpen
+    /// 「资产未验证」**带腿、带字段、带期望与实际**（`ResidentPropAssetVerification`）。
+    ///
+    /// 为什么必须携带那五个词而不是一句"还没检查完"：真机 2026-10-02 12:28:21 那两行日志
+    /// 只说"物件尚未完成本地显示检查，所有权已保留，请稍后重试"，而真正不成立的那条腿是
+    /// **本地资产记录里还没有这一条**（这一进程的资产准备还没轮到它）——
+    /// 文件、字节数、哈希、身份当初样样都对。后果与原因混在一句话里，排障只能猜。
+    case assetUnverified(ResidentPropAssetVerification.Failure)
+    case assetUnavailable, ownershipMismatch
     /// 存档与领取记录不一致，而且**不能安全对齐**（`WorldPropArchiveRebase` 判为 refuse）。
     /// 与 `ownershipMismatch` 分开：后者是"这不是同一件物件 / 同一份资产"，这条是"同一件
     /// 物件、同一份网格，但存档里那份尺寸不是它的等比缩放" —— 两条都必须**可见**，
@@ -29,7 +37,7 @@ private enum ResidentPropHostError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .editorOpen: "请先结束摆放，再发送给居民；输入内容会保留。"
-        case .assetUnverified: "物件尚未完成本地显示检查，所有权已保留，请稍后重试。"
+        case let .assetUnverified(failure): failure.userText
         case .assetUnavailable: "已领取物件的本地文件缺失或校验失败，没有删除或重新生成，请检查许愿任务。"
         case .ownershipMismatch: "物件存档与领取记录不一致，已保留原记录并停止摆放。"
         case let .archiveNotRepairable(detail):
@@ -3742,6 +3750,12 @@ final class AppDelegate:
         let descriptor: ResidentPropRenderDescriptor
     }
     private var residentOwnedPropAssets: [String: ResidentOwnedPropAsset] = [:]
+    /// 每件资产**已经发生过**的那次字节校验的收据（字节数 + sha256），由准备路径写下。
+    ///
+    /// 「资产未验证」要能说出"文件？字节数？哈希？"这三条腿各自的**期望值**，而期望值就是
+    /// 准备路径当时真正量到的那两个数；在挂点可用性那种每帧级查询里重读 2 MB 文件算哈希
+    /// 是不可接受的代价。收据与 `residentOwnedPropAssets` 同生共死（一起写、一起清）。
+    private var residentPropAssetFacts: [String: ResidentPropAssetByteReceipt] = [:]
     private var residentPropAssetContext: ObjectIdentifier?
     private var residentPropPreparationRunning = false
     private var residentPropNotices: [String: String] = [:]
@@ -3873,9 +3887,14 @@ final class AppDelegate:
                 )
             },
             prepare: { [weak self] prop in
-                guard let self, let asset = self.residentOwnedPropAssets[prop.objectID], asset.prop.matchesIdentity(of: prop),
-                      self.spatialStage.isResidentPropPrepared(assetID: prop.assetID, modelURL: asset.descriptor.modelURL)
-                else { throw ResidentPropHostError.assetUnverified }
+                // `prepare` 是**证明**那一半（提交时跑）：它这一条路会把此刻的字节重算一遍
+                // （`observedSHA256`），于是"文件被动过"这条腿在这里是**实测**，不是抄收据。
+                guard let self else { throw ResidentPropHostError.assetUnavailable }
+                if let failure = self.residentPropAssetVerification(
+                    objectID: prop.objectID, prop: prop, rehashFile: true).failure {
+                    self.livingWorldLogger.notice("挂点拒绝 step=asset-unverified 来源=prepare（提交时证明，与挂点无关） 物件=\(prop.objectID, privacy: .public) 腿=\(failure.leg.rawValue, privacy: .public) 字段=\(failure.field, privacy: .public) 期望=\(failure.expected, privacy: .public) 实际=\(failure.actual, privacy: .public)")
+                    throw ResidentPropHostError.assetUnverified(failure)
+                }
             }, isCurrent: isCurrent,
             currentAvatarAssetID: { [weak self] in self?.avatarRuntime.snapshot.avatar?.id },
             makeGripCalibration: { [weak self] prop, avatarID, point in
@@ -3892,9 +3911,23 @@ final class AppDelegate:
                     self.livingWorldLogger.notice("挂点拒绝 step=avatar-ineligible 挂点=\(slotName, privacy: .public) 角色=\(avatar.id, privacy: .public) 原因=\(reason, privacy: .public)")
                     throw ResidentPropPlacementError.attachmentUnsupported(reason)
                 }
-                guard let asset = self.residentOwnedPropAssets[prop.objectID], asset.prop.matchesIdentity(of: prop) else {
-                    self.livingWorldLogger.notice("挂点拒绝 step=asset-unverified 挂点=\(slotName, privacy: .public) 物件=\(prop.objectID, privacy: .public)")
-                    throw ResidentPropHostError.assetUnverified
+                // 「资产未验证」的五条腿：本地资产记录 / 身份 / 文件 / 哈希 / 渲染器备好。
+                // 这条查询是**每帧级**的（面板快照对每件物件 × 三个挂点各问一次），所以
+                // 这里不重读文件算哈希（`rehashFile: false`）：哈希那条腿读的是准备路径
+                // 当时留下的校验收据。**判据一条都没放宽**，只是把"哪条腿没过、期望什么、
+                // 实际什么"写全 —— 真机 2026-10-02 12:28:21 不成立的那条腿是 `asset-record`
+                // （这一进程的资产准备还没轮到它），而不是"这把剑的资产坏了"。
+                let verification = self.residentPropAssetVerification(
+                    objectID: prop.objectID, prop: prop, rehashFile: false)
+                if let failure = verification.failure {
+                    self.livingWorldLogger.notice("挂点拒绝 step=asset-unverified 挂点=\(slotName, privacy: .public) 物件=\(prop.objectID, privacy: .public) 腿=\(failure.leg.rawValue, privacy: .public) 字段=\(failure.field, privacy: .public) 期望=\(failure.expected, privacy: .public) 实际=\(failure.actual, privacy: .public) 体检=\(failure.examination, privacy: .public)")
+                    throw ResidentPropHostError.assetUnverified(failure)
+                }
+                guard let asset = self.residentOwnedPropAssets[prop.objectID] else {
+                    // 五条腿全过就一定有记录（`asset-record` 是第一条腿）；真到这里说明
+                    // 记录在验证之后被换掉了 —— fail-closed，不静默继续。
+                    throw ResidentPropPlacementError.attachmentUnsupported(
+                        "资产记录在检查之后发生了变化（\(prop.objectID)），请重试。")
                 }
                 // 门槛问的是**这个挂点自己的骨骼**：找不到就报「这个角色没有可用的腰部骨骼」
                 // 这类读得懂的话（`PropAttachmentError.missingBone`），而不是静默挂不上。
@@ -3921,11 +3954,67 @@ final class AppDelegate:
             })
     }
 
+    /// 「资产未验证」的**全部事实**：五条腿（记录 / 身份 / 文件 / 哈希 / 渲染器备好）各自
+    /// 期望什么、实际什么。统一日志那一行、工具回执那句话、面板那行读的都是这一份。
+    ///
+    /// `rehashFile`：要不要**此刻**重读文件算 sha256。
+    /// - 挂点可用性是每帧级查询（面板快照对每件物件 × 三个挂点各问一次）⇒ `false`：
+    ///   哈希那条腿读准备路径留下的校验收据（`residentPropAssetFacts`）；
+    /// - 提交（`prepare`）那条"证明"路 ⇒ `true`：字节是被**实测**的，改过的文件在这里露头。
+    private func residentPropAssetVerification(objectID: String,
+                                               prop: WorldGeneratedProp?,
+                                               rehashFile: Bool) -> ResidentPropAssetVerification {
+        let asset = residentOwnedPropAssets[objectID]
+        let receipt = residentPropAssetFacts[objectID]
+        let path = asset?.descriptor.modelURL ?? receipt.map { URL(fileURLWithPath: $0.modelURL) }
+        let values = path.flatMap {
+            try? $0.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .isSymbolicLinkKey])
+        }
+        // 身份那条判据**只有一处**：`WorldGeneratedProp.matchesIdentity(of:)`（WorldRuntime）。
+        // 这里算结论，`ResidentPropAssetVerification` 只把它翻译成"哪个字段、期望什么、实际什么"。
+        let identityMatches: Bool? = (asset != nil && prop != nil)
+            ? asset!.prop.matchesIdentity(of: prop!) : nil
+        return ResidentPropAssetVerification(
+            objectID: objectID,
+            record: asset?.prop,
+            recordModelURL: asset?.descriptor.modelURL.path,
+            recordCount: residentOwnedPropAssets.count,
+            recordNames: residentOwnedPropAssets.values.map(\.prop.displayName).sorted(),
+            expected: prop,
+            identityMatches: identityMatches,
+            byteReceipt: receipt,
+            fileExists: path.map { FileManager.default.fileExists(atPath: $0.path) } ?? false,
+            fileIsRegularFile: values?.isRegularFile ?? false,
+            fileIsSymbolicLink: values?.isSymbolicLink ?? false,
+            fileBytes: values?.fileSize,
+            observedSHA256: rehashFile ? Self.residentPropFileSHA256(at: path) : nil,
+            prepared: asset.map {
+                spatialStage.isResidentPropPrepared(assetID: $0.prop.assetID, modelURL: $0.descriptor.modelURL)
+            } ?? false)
+    }
+
+    /// 一次通过的准备的**字节收据**：字节数来自实测，sha256 来自这份资产自己声明的 `assetID`
+    /// （`assetID` 就是模型字节的 sha256）。`assetID` 不是 `sha256:<64 hex>` 就不记 —— 绝不猜。
+    private static func residentPropByteReceipt(for descriptor: ResidentPropRenderDescriptor,
+                                                bytes: Int) -> ResidentPropAssetByteReceipt? {
+        guard let digest = ResidentPropAssetVerification.declaredSHA256(descriptor.assetID) else { return nil }
+        return ResidentPropAssetByteReceipt(modelURL: descriptor.modelURL.path, bytes: bytes, sha256: digest)
+    }
+
+    /// 此刻那份文件字节的 sha256（小写十六进制）。读不出来就 `nil`（**不猜**）。
+    private static func residentPropFileSHA256(at url: URL?) -> String? {
+        guard let url, let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
     /// Receipts and claim ownership are the only source of local asset paths.
     private func synchronizeOwnedResidentProps() async {
         guard let context = livingWorldContext, spatialStage.selectedWorldID == context.manifest.worldID,
               context.manifest.worldID == WishMachineScene.worldID else {
             residentOwnedPropAssets = [:]; residentPropAssetContext = nil
+            // 字节收据与资产记录**同生共死**：只留一边会让"资产未验证"的期望值指向一条
+            // 已经不存在的记录（那就是第二种真相）。
+            residentPropAssetFacts = [:]
             // 资产失败是**按上下文**记住的：换世界（或这一刻不是许愿机那个世界）时作废，
             // 否则一个世界的坏资产会在另一个世界里继续冒充"资产未就绪"。
             // 台账（`residentPropInventoryBacklog`）**刻意不在这里清**：领取与"还没入库"
@@ -3940,6 +4029,7 @@ final class AppDelegate:
         let contextID = ObjectIdentifier(context)
         if residentPropAssetContext != contextID {
             residentOwnedPropAssets = [:]; residentPropNotices = [:]; residentPropAssetFailures = [:]
+            residentPropAssetFacts = [:]
             residentPropAssetContext = contextID
         }
         guard !residentPropPreparationRunning else { return }
@@ -4031,6 +4121,10 @@ final class AppDelegate:
                         sizeLocked: true, primitive: television.record)
                     residentOwnedPropAssets[job.objectID] = ResidentOwnedPropAsset(
                         prop: televisionProp, descriptor: televisionDescriptor)
+                    // 这份资产刚在**这一处**通过字节校验（拼出来的几何逐位回读 + 字节数），
+                    // 把量到的两个数留成收据：以后任何一次"资产未验证"都能说出期望值。
+                    residentPropAssetFacts[job.objectID] = Self.residentPropByteReceipt(
+                        for: televisionDescriptor, bytes: television.assetBytes.count)
                     residentPropNotices.removeValue(forKey: job.objectID)
                     residentPropAssetFailures.removeValue(forKey: job.objectID)
                     // 逐位回读走**既有那条**可见通道（`orientationNotices` 在末尾统一发出，
@@ -4165,6 +4259,7 @@ final class AppDelegate:
                         // 改成了多少"查得到，而且同一份修复重放不会写第二遍。
                         orientationNotices[job.objectID] = record.summary
                         let previousAsset = residentOwnedPropAssets[job.objectID]
+                        let previousFacts = residentPropAssetFacts[job.objectID]
                         var healedDescriptor = descriptor
                         healedDescriptor.orientation = healed.orientationRotation
                         // 内存里的这一份先换上，是为了让下面那次提交里的 `prepare(healed)`
@@ -4172,6 +4267,9 @@ final class AppDelegate:
                         // 写失败就原样退回 —— 内存必须与落盘的那一份一致。
                         residentOwnedPropAssets[job.objectID] =
                             ResidentOwnedPropAsset(prop: healed, descriptor: healedDescriptor)
+                        // 自愈换的只是派生字段（尺寸/朝向），**资产字节一个都没变** ⇒ 收据照旧。
+                        residentPropAssetFacts[job.objectID] = Self.residentPropByteReceipt(
+                            for: healedDescriptor, bytes: bytes)
                         do {
                             try await prepareResidentPropMutation(.rebase(healed), context: context)
                             try service.commit(.rebase(healed),
@@ -4181,8 +4279,12 @@ final class AppDelegate:
                         } catch {
                             if let previousAsset {
                                 residentOwnedPropAssets[job.objectID] = previousAsset
+                                // 收据与资产记录**一起退回**：只退一边会让"资产未验证"的
+                                // 期望值指向一条已经不存在的记录。
+                                residentPropAssetFacts[job.objectID] = previousFacts
                             } else {
                                 residentOwnedPropAssets.removeValue(forKey: job.objectID)
+                                residentPropAssetFacts.removeValue(forKey: job.objectID)
                             }
                             throw error
                         }
@@ -4238,6 +4340,10 @@ final class AppDelegate:
                 var preparedDescriptor = descriptor
                 preparedDescriptor.orientation = delivered.orientationRotation
                 residentOwnedPropAssets[job.objectID] = ResidentOwnedPropAsset(prop: delivered, descriptor: preparedDescriptor)
+                // 上面那条 `Task.detached` 里刚刚**实测**过字节数与 sha256（`bytes` / `hash`）：
+                // 留成收据，"资产未验证"的期望值从此有出处。
+                residentPropAssetFacts[job.objectID] = Self.residentPropByteReceipt(
+                    for: preparedDescriptor, bytes: bytes)
                 residentPropNotices.removeValue(forKey: job.objectID)
                 residentPropAssetFailures.removeValue(forKey: job.objectID)
                 // 握点推断说了什么，同样**必须说出来**：这条说明走的就是上面
@@ -4412,7 +4518,17 @@ final class AppDelegate:
         case .register, .withdraw, .enableCapability, .resize, .rebase, .delete: break
         }
         for id in ids.sorted() {
-            guard let asset = residentOwnedPropAssets[id] else { throw ResidentPropHostError.assetUnverified }
+            // 这条 guard 以前只有一句 `throw .assetUnverified`（"物件尚未完成本地显示检查"）：
+            // 与挂点那条**同一族**的拒绝，现在也带腿、带字段、带期望与实际。
+            let verification = residentPropAssetVerification(
+                objectID: id, prop: context.state.objectStates[id]?.generatedProp, rehashFile: false)
+            if let failure = verification.failure {
+                livingWorldLogger.notice("资产未验证 step=asset-unverified 物件=\(id, privacy: .public) 腿=\(failure.leg.rawValue, privacy: .public) 字段=\(failure.field, privacy: .public) 期望=\(failure.expected, privacy: .public) 实际=\(failure.actual, privacy: .public)")
+                throw ResidentPropHostError.assetUnverified(failure)
+            }
+            guard let asset = residentOwnedPropAssets[id] else {
+                throw ResidentPropHostError.assetUnavailable
+            }
             if !spatialStage.isResidentPropPrepared(assetID: asset.prop.assetID, modelURL: asset.descriptor.modelURL) {
                 _ = try await spatialStage.prepareResidentProp(asset.descriptor)
             }
@@ -4457,6 +4573,30 @@ final class AppDelegate:
             hasSurfaces: !surfaces.isEmpty,
             isDeriving: residentPropGridDerivation != nil
         )
+        // **逐挂点**问可用性：不能再拿一份"按右手"的答案去回答"背后/腰间"。
+        //
+        // 真机 2026-10-02 12:28:21.388 那两条 `挂点拒绝 step=asset-unverified 挂点=右手`
+        // 就是从这里发出去的：这一处原来只调一次 `holdEligibility(objectID:)`——省缺
+        // `.rightHand`——却把结论当成"这件物件能不能挂在身上"，于是用户说的"挂到背后"
+        // 被右手（那一刻还是"本地资产记录还没轮到它"的时序事实）挡了回来。
+        // 现在对**每一个挂点各问一次**，判据一字未改：手/背后/腰间各自的失败各自具名。
+        var holdUnavailableReasonsBySlot: [String: [String: String]] = [:]
+        for item in objects {
+            guard let id = item.generatedProp?.objectID else { continue }
+            var bySlot: [String: String] = [:]
+            for point in PropAttachmentPoint.allCases {
+                // 「现在为什么不能拿/摆」有**两个**都成立的事实，谁都不能冒充谁：
+                // - 库存里有它（所以它出现在「我的物件」列表里，绝不消失）；
+                // - 资产（模型文件）真的失败了 ⇒ 现在也确实摆不出来，原因如实说。
+                // 资产那一族失败是**按物件**的事实（与挂点无关），三个挂点都说同一句原话。
+                if let failure = residentPropAssetFailures[id] {
+                    bySlot[point.worldSlot.rawValue] = ResidentPropInventoryBacklog.assetNotice(failure)
+                } else if let reason = service.holdEligibility(objectID: id, point: point) {
+                    bySlot[point.worldSlot.rawValue] = reason
+                }
+            }
+            holdUnavailableReasonsBySlot[id] = bySlot
+        }
         return .init(worldID: context.manifest.worldID, revision: context.state.layoutRevision,
               objects: objects,
               // 未摆出物件的初始落点候选（**纯顺序**，判定仍由 `preview` 给）：
@@ -4464,20 +4604,13 @@ final class AppDelegate:
               surfaces: ResidentPropInitialPlacement.fillingAnchors(
                   surfaces, grid: residentPropGridEditor.grid, spawn: context.manifest.spawn.position),
               canUndo: context.state.layoutUndo != nil, heldProp: context.state.heldProp,
-              holdUnavailableReasons: Dictionary(uniqueKeysWithValues: objects.compactMap { item in
-                  guard let id = item.generatedProp?.objectID else { return nil }
-                  // 「现在为什么不能拿/摆」有**两个**都成立的事实，谁都不能冒充谁：
-                  // - 库存里有它（所以它出现在「我的物件」列表里，绝不消失）；
-                  // - 资产（模型文件）真的失败了 ⇒ 现在也确实摆不出来，原因如实说。
-                  // 这里并入的是**已有的**显示通道（面板选中该行时显示这一行），
-                  // 不新增字段、不改判定的归属：资产那条判定仍只在
-                  // `residentOwnedPropAssets`/`residentPropAssetFailures`。
-                  if let failure = residentPropAssetFailures[id] {
-                      return (id, ResidentPropInventoryBacklog.assetNotice(failure))
-                  }
-                  guard let reason = service.holdEligibility(objectID: id) else { return nil }
-                  return (id, reason)
-              }),
+              // 旧字段（右手那一列）从**同一份**推导出来，不再多问一次：`ResidentPropEditorSnapshot`
+              // 的既有读者（面板那一行、harness）不必改，而且不可能与逐挂点那份分叉。
+              holdUnavailableReasons: holdUnavailableReasonsBySlot.compactMapValues {
+                  $0[PropAttachmentPoint.rightHand.worldSlot.rawValue]
+              },
+              // 逐挂点那一份才是"用户真正选的挂点"的答案（上面那段循环逐挂点问出来的）。
+              holdUnavailableReasonsBySlot: holdUnavailableReasonsBySlot,
               // 面板要能区分"格子还在生成"与"这个空间永远拿不到几何"：前者的措辞要和
               // 点击落地那条一致（见 `residentPropGridCommit`），后者不能说"请稍候"。
               //
@@ -6737,7 +6870,7 @@ final class AppDelegate:
         claimed 表示领取登记，宿主还需将校验过的物件保存进库存。用 read_owned_props 核对入库，不要因暂无库存再次生成。
         当前支持面可用 list_placement_surfaces 查询，物件位置为底中心、yaw 为弧度。后台仅可续办 placement_delegation.state 为 pending 的原摆放委托：只摆本次产物、只用允许支持面，并遵守用户指定的精确位置和朝向。领取并用 read_owned_props 核实入库后，查询 layout_revision、预检、调用 apply_prop_placement，直到工具确认。放不下时在委托允许范围内调整；仍放不下就留在库存并说明。placed、revoked 或 failed 的委托不再自动执行。其他移动、收回、手持或撤销仍需本轮人类明确指令。
         resume_wish_continuation 只用于把该任务的**自动续办**（后台自行领取与摆放）重新打开，它不是领取已就绪产物的前置条件。用户本轮明确要求恢复指定许愿时，先调用 resume_wish_continuation（指定 wish_id 并确认恢复），仅在成功回执后说明该许愿授权已恢复；随后需要自主续办时，再调用 update_resident_intent 并设置 resume_paused_intent=true。仅更新居民意图不会恢复许愿授权。普通聊天或后台通知不得恢复暂停任务。已实际摆好的物件无需重复领取或摆放。
-        生成物件目前只有外形，没有冲泡或战斗功能。正式领取且最长边不超过 \(ResidentPropAttachmentEligibility.holdableLongestEdgeText)的小道具，可由当前已适配的 2B 角色拿在右手、挂在背后或挂在腰间：hold_prop 的 slot 参数决定挂点（rightHand 拿在手里 / back 挂在背后 / waist 挂在腰间），用户说"挂背后 / 挂腰上 / 拿手里"时选对应项，已经拿在手上的同一件物件换挂点也用它；操作必须依次使用正式工具 hold_prop、adjust_held_prop_grip、return_held_prop，其中微调按需执行。只依据工具回执说明结果（回执里的 held_slot_name 就是它现在挂在哪儿），其他角色或更大物件仍只能摆放。
+        生成物件目前只有外形，没有冲泡或战斗功能。正式领取且最长边不超过 \(ResidentPropAttachmentEligibility.holdableLongestEdgeText)的小道具，可由当前已适配的 2B 角色拿在右手、挂在背后或挂在腰间：hold_prop 的 slot 参数决定挂点（rightHand 拿在手里 / back 挂在背后 / waist 挂在腰间），用户说"挂背后 / 挂腰上 / 拿手里"时选对应项，已经拿在手上的同一件物件换挂点也用它；read_owned_props 回执里的 hold_slots 逐挂点给出可用性与各自的具名原因——**用户说哪个挂点就按哪个挂点问**，别拿一个挂点（例如右手）的失败当成另外两个挂点的回答；操作必须依次使用正式工具 hold_prop、adjust_held_prop_grip、return_held_prop，其中微调按需执行。只依据工具回执说明结果（回执里的 held_slot_name 就是它现在挂在哪儿），其他角色或更大物件仍只能摆放。
         删除一件生成资产用 delete_prop（入参 object_id，理由是可选）。这是**永久删除、没有撤销**：只在本轮人类明确要求删掉某一件时才调用，且先用 read_owned_props 确认是哪一件（回执的 deleted 列出已经删掉的）。不需要先 withdraw_prop 或 return_held_prop —— 正在房间里摆着的、拿在手里的、挂在身上的都会在同一笔提交里先收场再删。只说回执真的说了的话：删除后它出现在 deleted 里、不再出现在 objects 里；回执的 reference_layer 与 file_layer 会说明释放了哪些共享内容、哪些因为还被别的物件引用而**保留**。不要删除用户没有点名的那一件，也不要把"删除"说成"收回"。
         """
     }

@@ -73,7 +73,14 @@ struct PropSizeIntent: Codable, Equatable, Sendable {
         /// 三个分量按 `[x, y, z]` 排（唯一的遍历顺序，避免各处各写一遍）。
         var edges: [Double] { [x, y, z] }
         /// 最长边的米数。三轴形状派生的 `axis`/`meters` 就是它。
-        var longestMeters: Double { edges.max() ?? 0 / 1000 }
+        ///
+        /// **必须带这层括号**：`??` 的优先级低于 `/`，`edges.max() ?? 0 / 1000` 会被读成
+        /// `edges.max() ?? (0 / 1000)` —— 也就是把**毫米数原样当成米数**（`1443` 而不是
+        /// `1.443`）。真机 2026-10-02「超大荧幕电视」就卡在这里：托盘归一
+        /// （`WorldPropSizePolicy.intended`）只接受 `0.01—100` 米 ⇒ 归不出合法尺寸 ⇒
+        /// 用户看到那句"许愿机产物的尺寸无效"，而那件东西**永远停在 `stage == .ready`**、
+        /// 走不到"三轴 + 板形 ⇒ 基础几何拼电视"那条已经写好的路。
+        var longestMeters: Double { (edges.max() ?? 0) / 1000 }
     }
 
     /// 线上 `mode` 的字面量（唯一一份）。

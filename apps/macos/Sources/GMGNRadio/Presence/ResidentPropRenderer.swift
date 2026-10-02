@@ -159,7 +159,13 @@ import simd
         )
         let orientedExtent = oriented.maximum - oriented.minimum
         let sourceHeight = orientedExtent.y
-        guard sourceHeight.isFinite, sourceHeight > 0.000_01 else { throw WishMachineOutputError.invalidDimensions }
+        guard sourceHeight.isFinite, sourceHeight > 0.000_01 else {
+            throw WishMachineOutputError.invalidDimensions(WishMachineDimensionRejection(
+                field: "sourceHeight（摆正后网格的高度）", value: sourceHeight,
+                expected: "> 0.00001 米（实测摆正后 y 从 "
+                    + "\(WishMachineDimensionRejection.text(oriented.minimum.y)) 到 "
+                    + "\(WishMachineDimensionRejection.text(oriented.maximum.y)) 米）"))
+        }
         // 只按高度轴归一的尺寸（见 `ResidentPropPreparedAsset.size` 的说明）：真正的自动
         // 尺寸由 `WorldPropSizePolicy` 在**拿到生成请求高度的那一处**算出（细长物件按最长边
         // 归一）。渲染端不重复应用策略 —— 它拿到的 targetHeight 已经是定稿高度。
@@ -183,7 +189,13 @@ import simd
                 let transform=try ResidentPropPlacementMatrix.transform(minimum:loaded.asset.worldBounds.min,maximum:loaded.asset.worldBounds.max,targetHeight:item.targetHeightMeters,position:item.position,yaw:item.yaw,orientation:item.orientation)
                 let calls=loaded.asset.drawCalls.map { GLTFDrawCall(mesh:$0.mesh,material:$0.material,modelMatrix:transform * $0.modelMatrix,skinPalette:$0.skinPalette) }
                 loaded.renderer.encodeOpaqueDrawCalls(calls,scene:GLTFSceneState(viewProjection:WishMachineOutputPlacement.projection(viewProjection,reversedDepth:reversedDepth),cameraPosition:cameraPosition),pipelineStates:loaded.pipelines,depthState:reversedDepth ? loaded.reverseDepth : loaded.forwardDepth,encoder:encoder)
-            } catch { failed.insert(item.objectID);onStatusChanged?(item.objectID,.failed(id:item.objectID,message:WishMachineOutputError.invalidDimensions.localizedDescription));continue }
+            } catch {
+                // 拒绝的理由就是**这一条**判据自己说的那句（字段 + 数值）：它原来在这里被换成
+                // 一句写死的"尺寸无效"，连抛出来的原因都不看 —— 现场能拿到的信息又少一层。
+                failed.insert(item.objectID)
+                onStatusChanged?(item.objectID,.failed(id:item.objectID,message:error.localizedDescription))
+                continue
+            }
             if submitted.insert(item.objectID).inserted {
                 let epoch=generation
                 commandBuffer.addCompletedHandler { [weak self] buffer in

@@ -508,6 +508,106 @@ check(editorStateSource.contains("step=hold-no-selection")
       "面板点挂点不许有静默出口：没选中 / 没接线 / 不可用三条都要说清并落日志")
 
 // ---------------------------------------------------------------------------
+// 【挂点语义门禁】用户选的挂点必须真的传下去；三个挂点各自具名
+//
+// 真机 2026-10-02 12:28:21 的两行日志：用户让居民"把 2B 白色长剑挂到**背后**"，
+// 而 `挂点=右手` / `挂点=rightHand` —— 系统在按右手算，然后拿右手的失败当成了对背后的回答。
+// 面板那条改过一半（`availabilityReason` 对非右手返回 nil，不冒充），但：
+//   ① 快照里那份可用性**仍然只按右手问一次**；② 工具回执里的 `hold_eligible` /
+//   `hold_unavailable_reason` 同样只是右手的答案 ⇒ agent 读到"挂不上"就根本不试背后。
+// 这一组判据把三件事钉住：挂点传下去 / 逐挂点各问一次 / 逐挂点各自具名。
+// ---------------------------------------------------------------------------
+let bridgeSource = (try? readSource("apps/macos/Sources/GMGNRadio/Agent/ResidentPropToolBridge.swift")) ?? ""
+
+/// 「用户选的挂点真的传到命令里了吗」：`hold_prop` 必须把 `slot` 解析成挂点，并把**那个**
+/// 挂点交给 `holdCommand`；失败回执必须**永远**带挂点（包括"调用方没给 slot"这一事实）。
+func slotIsCarried(_ bridge: String) -> Bool {
+    bridge.contains("let point = (values[\"slot\"] as? String).flatMap(PropAttachmentSlots.resolve(name:)) ?? .rightHand")
+        && bridge.contains("service.holdCommand(objectID: values[\"object_id\"] as! String, point: point)")
+        && bridge.contains("failure[\"slot\"] = point.worldSlot.rawValue")
+        && bridge.contains("failure[\"slot_source\"] =")
+}
+check(slotIsCarried(bridgeSource),
+      "hold_prop 必须把用户选的 slot 解析成挂点并**原样**交给 holdCommand；失败回执必须带 slot/slot_name/slot_source")
+let injectedHardcodedSlot = bridgeSource.replacingOccurrences(
+    of: "service.holdCommand(objectID: values[\"object_id\"] as! String, point: point)",
+    with: "service.holdCommand(objectID: values[\"object_id\"] as! String, point: .rightHand)")
+check(injectedHardcodedSlot != bridgeSource, "负对照的前提没了：找不到 holdCommand(objectID:point:) 那一行")
+check(!slotIsCarried(injectedHardcodedSlot),
+      "负对照失败：把命令里的挂点写死成右手（用户选的挂点被默认值盖住）之后判据居然还绿")
+
+/// 「三个挂点各自具名」：桥与宿主快照都必须**逐挂点各问一次**
+/// （`PropAttachmentPoint.allCases` × `holdEligibility(objectID:point:)`），回执给出 `hold_slots`，
+/// 面板按**用户真正选的那个挂点**读那一份。任何"合一"（拿一个挂点的答案代表三个）都必须 FAIL。
+func slotsAreNamedIndividually(_ bridge: String, _ app: String, _ editor: String) -> Bool {
+    bridge.contains("private static func holdUnavailableBySlot(")
+        && bridge.contains("for point in PropAttachmentPoint.allCases {")
+        && bridge.contains("service.holdEligibility(objectID: objectID, point: point)")
+        && bridge.contains("\"hold_slots\": slots")
+        && bridge.contains("\"eligible\": holdUnavailableBySlot[slot] == nil")
+        && app.contains("for point in PropAttachmentPoint.allCases {")
+        && app.contains("service.holdEligibility(objectID: id, point: point)")
+        && app.contains("holdUnavailableReasonsBySlot: holdUnavailableReasonsBySlot")
+        && editor.contains("snapshot.holdUnavailableReasonsBySlot[id]?[point.worldSlot.rawValue]")
+}
+check(slotsAreNamedIndividually(bridgeSource, holdAppSource, editorStateSource),
+      "手/背后/腰间必须**各自**问一次、各自具名：桥的 hold_slots + 宿主快照的逐挂点表 + 面板按用户选的挂点读")
+// 负对照①：桥只问一个挂点（合一）。
+let injectedSingleSlotBridge = bridgeSource.replacingOccurrences(
+    of: "for point in PropAttachmentPoint.allCases {",
+    with: "for point in [PropAttachmentPoint.rightHand] {")
+check(injectedSingleSlotBridge != bridgeSource, "负对照的前提没了：桥里找不到逐挂点那个循环")
+check(!slotsAreNamedIndividually(injectedSingleSlotBridge, holdAppSource, editorStateSource),
+      "负对照失败：桥改成只问一个挂点之后判据居然还绿")
+// 负对照②：宿主快照只按右手问一次（把逐挂点表塌成一份）。
+let injectedSingleSlotApp = holdAppSource.replacingOccurrences(
+    of: "for point in PropAttachmentPoint.allCases {",
+    with: "for point in [PropAttachmentPoint.rightHand] {")
+check(injectedSingleSlotApp != holdAppSource, "负对照的前提没了：宿主里找不到逐挂点那个循环")
+check(!slotsAreNamedIndividually(bridgeSource, injectedSingleSlotApp, editorStateSource),
+      "负对照失败：宿主快照改回「只按右手问一次」之后判据居然还绿")
+// 负对照③：面板拿别的挂点的答案冒充（删掉逐挂点那一次读取）。
+let injectedMergedEditor = editorStateSource.replacingOccurrences(
+    of: "snapshot.holdUnavailableReasonsBySlot[id]?[point.worldSlot.rawValue]",
+    with: "snapshot.holdUnavailableReasons[id]")
+check(injectedMergedEditor != editorStateSource, "负对照的前提没了：面板里找不到逐挂点那一次读取")
+check(!slotsAreNamedIndividually(bridgeSource, holdAppSource, injectedMergedEditor),
+      "负对照失败：面板改成拿一个挂点的答案冒充三个之后判据居然还绿")
+
+// ---------------------------------------------------------------------------
+// 【资产未验证门禁】必须带腿、带字段、带期望与实际；五条腿一条都不能少
+//
+// 真机那两行的 `原因=物件尚未完成本地显示检查，所有权已保留，请稍后重试。` 说的是**后果**：
+// 文件不在？字节数不对？哈希对不上？本地资产记录里根本没有它？渲染器还没备好？
+// 五件事四种修法，共用一句话 ⇒ 排障只能猜。这一组判据要的就是"哪一条腿、期望什么、实际什么"。
+// ---------------------------------------------------------------------------
+func assetFailureIsNamed(_ attachment: String, _ app: String) -> Bool {
+    ["asset-record", "asset-identity", "asset-file", "asset-hash", "asset-prepare"]
+        .allSatisfy { attachment.contains($0) }
+        && attachment.contains("struct ResidentPropAssetVerification")
+        && attachment.contains("struct ResidentPropAssetByteReceipt")
+        && attachment.contains("let field: String")
+        && attachment.contains("let expected: String")
+        && attachment.contains("let actual: String")
+        && app.contains("case assetUnverified(ResidentPropAssetVerification.Failure)")
+        && app.contains("case let .assetUnverified(failure): failure.userText")
+        && app.contains("腿=\\(failure.leg.rawValue, privacy: .public) 字段=\\(failure.field, privacy: .public) 期望=\\(failure.expected, privacy: .public) 实际=\\(failure.actual, privacy: .public)")
+        && app.contains("residentPropAssetVerification(")
+}
+let assetLogLine = "腿=\\(failure.leg.rawValue, privacy: .public) 字段=\\(failure.field, privacy: .public) 期望=\\(failure.expected, privacy: .public) 实际=\\(failure.actual, privacy: .public)"
+check(assetFailureIsNamed(attachmentSource, holdAppSource),
+      "「资产未验证」必须说出是哪条腿 + 字段 + 期望 + 实际（五条腿：记录/身份/文件/哈希/准备）")
+// 负对照：把那句"带字段与数值"塌回一句话 ⇒ FAIL。
+let injectedVagueAsset = holdAppSource.replacingOccurrences(
+    of: assetLogLine, with: "原因=\\(failure.userText, privacy: .public)")
+check(injectedVagueAsset != holdAppSource, "负对照的前提没了：宿主里找不到那条带字段的资产日志")
+check(!assetFailureIsNamed(attachmentSource, injectedVagueAsset),
+      "负对照失败：把资产拒绝塌回一句话之后判据居然还绿")
+// 旧那句"在说后果不是原因"的话不许再是挂点链上的答案。
+check(!holdAppSource.contains("物件尚未完成本地显示检查，所有权已保留，请稍后重试。"),
+      "「物件尚未完成本地显示检查」那句只说后果、不说原因的话不许留在资产拒绝链上")
+
+// ---------------------------------------------------------------------------
 // 编译真代码
 // ---------------------------------------------------------------------------
 guard let poseDeclaration = declaration(attachmentSource, "enum PropAttachmentPose"),

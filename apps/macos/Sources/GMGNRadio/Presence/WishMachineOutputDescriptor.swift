@@ -105,7 +105,10 @@ enum ResidentPropPlacementMatrix {
     static func transform(minimum: SIMD3<Float>, maximum: SIMD3<Float>, targetHeight: Float,
                           position: SIMD3<Float>, yaw: Float,
                           orientation: WorldQuaternion = .identity) throws -> simd_float4x4 {
-        guard yaw.isFinite else { throw WishMachineOutputError.invalidDimensions }
+        guard yaw.isFinite else {
+            throw WishMachineOutputError.invalidDimensions(WishMachineDimensionRejection(
+                field: "yaw", value: yaw, expected: "有限数（不是 NaN、也不是无穷）"))
+        }
         guard !WorldPropRotation.isIdentity(orientation) else {
             let normalized = try WishMachineOutputPlacement.transform(minimum: minimum, maximum: maximum, targetHeight: targetHeight, outlet: .zero)
             var rotation = matrix_identity_float4x4
@@ -113,7 +116,9 @@ enum ResidentPropPlacementMatrix {
             rotation.columns.0 = SIMD4(c, 0, -s, 0)
             rotation.columns.2 = SIMD4(s, 0, c, 0)
             rotation.columns.3 = SIMD4(position, 1)
-            guard position.x.isFinite, position.y.isFinite, position.z.isFinite else { throw WishMachineOutputError.invalidDimensions }
+            if let rejection = WishMachineDimensionRejection.nonFinite([
+                ("position.x", position.x), ("position.y", position.y), ("position.z", position.z),
+            ]) { throw WishMachineOutputError.invalidDimensions(rejection) }
             return rotation * normalized
         }
         // 转正之后重新量一次包围盒：缩放/居中必须按**转正后**的盒算，否则躺着的物件
@@ -121,13 +126,29 @@ enum ResidentPropPlacementMatrix {
         let oriented = WorldPropOrientationPolicy.orientedBounds(
             minimum: minimum, maximum: maximum, rotation: orientation)
         let height = oriented.maximum.y - oriented.minimum.y
-        guard height.isFinite, height > 0.00001,
-              targetHeight.isFinite, targetHeight > 0, targetHeight <= 10,
-              [position.x, position.y, position.z, oriented.minimum.x, oriented.maximum.x,
-               oriented.minimum.z, oriented.maximum.z, oriented.minimum.y].allSatisfy(\.isFinite)
-        else { throw WishMachineOutputError.invalidDimensions }
+        if let rejection = WishMachineDimensionRejection.nonFinite([
+            ("摆正后的高度", height), ("targetHeight", targetHeight),
+            ("position.x", position.x), ("position.y", position.y), ("position.z", position.z),
+            ("摆正后 minimum.x", oriented.minimum.x), ("摆正后 maximum.x", oriented.maximum.x),
+            ("摆正后 minimum.z", oriented.minimum.z), ("摆正后 maximum.z", oriented.maximum.z),
+            ("摆正后 minimum.y", oriented.minimum.y),
+        ]) { throw WishMachineOutputError.invalidDimensions(rejection) }
+        guard height > 0.00001 else {
+            throw WishMachineOutputError.invalidDimensions(WishMachineDimensionRejection(
+                field: "摆正后的高度", value: height,
+                expected: "> 0.00001 米（摆正之后网格不能在高度上塌成零）"))
+        }
+        guard targetHeight > 0, targetHeight <= 10 else {
+            throw WishMachineOutputError.invalidDimensions(WishMachineDimensionRejection(
+                field: "targetHeight", value: targetHeight,
+                expected: "0 < 目标高度 ≤ 10 米（房间只有 7 × 8 × 3.2 米）"))
+        }
         let scale = targetHeight / height
-        guard scale.isFinite, scale > 0 else { throw WishMachineOutputError.invalidDimensions }
+        guard scale.isFinite, scale > 0 else {
+            throw WishMachineOutputError.invalidDimensions(WishMachineDimensionRejection(
+                field: "scale（targetHeight / 摆正后的高度）", value: scale,
+                expected: "有限且 > 0"))
+        }
         let centreX = (oriented.minimum.x + oriented.maximum.x) / 2
         let centreZ = (oriented.minimum.z + oriented.maximum.z) / 2
         var translation = matrix_identity_float4x4
@@ -191,12 +212,55 @@ enum WishMachineOutputStatus: Equatable, Sendable {
     case failed(id: String, message: String)
 }
 
-enum WishMachineOutputError: LocalizedError {
-    case invalidAsset, invalidDimensions, renderUnavailable, textureBudget, invalidTexture
+/// 尺寸判据的**字段级**具名拒绝：哪一个字段不成立、实测多少、期望什么。
+///
+/// 为什么要有它（新纪律的一条）：真机 2026-10-02「超大荧幕电视」时，"尺寸无效"这四个字
+/// 底下压着**六条互不相干的不等式** —— 意图的米数越界、目标高度越界、包围盒某轴反向、
+/// 包围盒在高度上塌成零、源网格某轴退化、摆正后高度为零。它们原来全都塌成一句
+/// "许愿机产物的尺寸无效，暂时无法显示。"，于是用户与事后排查都读不出**是哪一条、哪个数字**
+/// （那台电视真正的字段是 `size_intent.longest.meters = 1443`，单位错了 1000 倍）。
+///
+/// 判据的**条件本身一个字都没放宽**：这里只承载"为什么被拒"。
+struct WishMachineDimensionRejection: Equatable, Sendable {
+    /// 不成立的字段名（就是源码里那个量的名字）。
+    let field: String
+    /// 那个字段的实测值。
+    let value: Float
+    /// 这条字段的允许范围 / 不变式（一句话，带数字）。
+    let expected: String
+
+    init(field: String, value: Float, expected: String) {
+        self.field = field; self.value = value; self.expected = expected
+    }
+
+    /// 一组字段里**第一个**非有限的（`nil` = 全部有限）。顺序就是调用方给的顺序。
+    static func nonFinite(_ fields: [(String, Float)]) -> WishMachineDimensionRejection? {
+        for (field, value) in fields where !value.isFinite {
+            return WishMachineDimensionRejection(
+                field: field, value: value, expected: "有限数（不是 NaN、也不是无穷）")
+        }
+        return nil
+    }
+
+    /// 用户看得到的那一句：**字段 + 实测值 + 期望**，一个都不少。
+    var summary: String { "\(field) = \(Self.text(value))，期望 \(expected)" }
+
+    /// 数值的可读写法（NaN/无穷也说得出来，不会被格式化成 "nan" 之外的东西）。
+    static func text(_ value: Float) -> String {
+        value.isFinite ? String(format: "%.6g", value) : String(describing: value)
+    }
+}
+
+enum WishMachineOutputError: LocalizedError, Equatable {
+    case invalidAsset
+    /// 尺寸判据拒绝：**永远**带着字段与数值（见 `WishMachineDimensionRejection`）。
+    case invalidDimensions(WishMachineDimensionRejection)
+    case renderUnavailable, textureBudget, invalidTexture
     var errorDescription: String? {
         switch self {
         case .invalidAsset: "许愿机产物文件不可用，请重新生成。"
-        case .invalidDimensions: "许愿机产物的尺寸无效，暂时无法显示。"
+        case .invalidDimensions(let rejection):
+            "许愿机产物的尺寸无效：\(rejection.summary)。暂时无法显示。"
         case .renderUnavailable: "许愿机产物暂时无法显示，请重新进入空间。"
         case .textureBudget: "许愿机产物贴图超出显示预算：最多 8 张，单边最多 2048 像素，总计最多 1600 万像素。"
         case .invalidTexture: "许愿机产物贴图损坏或缺失，暂时无法领取，请重新生成。"
@@ -205,16 +269,51 @@ enum WishMachineOutputError: LocalizedError {
 }
 
 enum WishMachineOutputPlacement {
+    /// 尺寸判据**逐字段**报名（`nil` = 全部成立）。
+    ///
+    /// 条件与改造前**逐条相同**（同一条 `guard` 里的六条不等式），只是现在每一条自己报名：
+    /// 字段名 + 实测值 + 期望。塌成一句"尺寸无效"正是真机那台电视查不出来的原因。
+    static func dimensionRejection(minimum: SIMD3<Float>, maximum: SIMD3<Float>,
+                                   targetHeight: Float,
+                                   outlet: SIMD3<Float>) -> WishMachineDimensionRejection? {
+        if let rejection = WishMachineDimensionRejection.nonFinite([
+            ("minimum.x", minimum.x), ("minimum.y", minimum.y), ("minimum.z", minimum.z),
+            ("maximum.x", maximum.x), ("maximum.y", maximum.y), ("maximum.z", maximum.z),
+            ("outlet.x", outlet.x), ("outlet.y", outlet.y), ("outlet.z", outlet.z),
+            ("targetHeight", targetHeight),
+        ]) { return rejection }
+        guard targetHeight > 0, targetHeight <= 10 else {
+            return WishMachineDimensionRejection(
+                field: "targetHeight", value: targetHeight,
+                expected: "0 < 目标高度 ≤ 10 米（房间只有 7 × 8 × 3.2 米）")
+        }
+        guard maximum.x >= minimum.x else {
+            return WishMachineDimensionRejection(
+                field: "maximum.x - minimum.x", value: maximum.x - minimum.x,
+                expected: "≥ 0 米（包围盒的 x 不能反向）")
+        }
+        guard maximum.z >= minimum.z else {
+            return WishMachineDimensionRejection(
+                field: "maximum.z - minimum.z", value: maximum.z - minimum.z,
+                expected: "≥ 0 米（包围盒的 z 不能反向）")
+        }
+        let height = maximum.y - minimum.y
+        guard height > 0.00001 else {
+            return WishMachineDimensionRejection(
+                field: "maximum.y - minimum.y", value: height,
+                expected: "> 0.00001 米（包围盒不能在高度上塌成零）")
+        }
+        return nil
+    }
+
     /// Respect GLB node transforms (the loader supplies world bounds), centre
     /// X/Z on the tray and place the lowest Y at the suspended output anchor.
     static func transform(minimum: SIMD3<Float>, maximum: SIMD3<Float>,
                           targetHeight: Float, outlet: SIMD3<Float>) throws -> simd_float4x4 {
-        guard [minimum.x,minimum.y,minimum.z,maximum.x,maximum.y,maximum.z,
-               outlet.x,outlet.y,outlet.z,targetHeight].allSatisfy(\.isFinite),
-              targetHeight > 0, targetHeight <= 10,
-              maximum.x >= minimum.x, maximum.z >= minimum.z,
-              maximum.y - minimum.y > 0.00001
-        else { throw WishMachineOutputError.invalidDimensions }
+        if let rejection = dimensionRejection(minimum: minimum, maximum: maximum,
+                                              targetHeight: targetHeight, outlet: outlet) {
+            throw WishMachineOutputError.invalidDimensions(rejection)
+        }
         let scale = targetHeight / (maximum.y - minimum.y)
         let centre = (minimum + maximum) / 2
         var matrix = matrix_identity_float4x4

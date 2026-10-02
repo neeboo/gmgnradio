@@ -150,16 +150,34 @@ final class WishMachineOutputRenderer {
                 // 没有意图才退回今天的自动推断（细长物件按最长边）。两条路共用同一份策略、
                 // 同一段上下限夹取 —— 面板、碰撞盒、红绿格读到的仍是同一份尺寸。
                 let resolution: WorldPropSizePolicy.Resolution?
+                // 归一是**按哪一条**判据做的、那个数是多少：具名拒绝要用它，所以两条路都先记下来。
+                let basisField: String
+                let basisMeters: Float
                 if let intent = output.sizeIntent, intent.isValid {
                     resolution = WorldPropSizePolicy.intended(
                         sourceExtent: .init(x: extent.x, y: extent.y, z: extent.z),
                         axis: intent.axis.policyAxis, meters: Float(intent.meters))
+                    basisField = "size_intent.\(intent.axis.rawValue).meters"
+                    basisMeters = Float(intent.meters)
                 } else {
                     resolution = WorldPropSizePolicy.automatic(
                         sourceExtent: .init(x: extent.x, y: extent.y, z: extent.z),
                         requestedHeight: requested)
+                    basisField = "height_meters"
+                    basisMeters = requested
                 }
-                guard let resolution else { throw WishMachineOutputError.invalidDimensions }
+                guard let resolution else {
+                    // **字段级**具名拒绝（新纪律）。真机 2026-10-02「超大荧幕电视」就停在这里：
+                    // 三轴意图派生的 `meters` 是 `1443`（毫米被当成米），归一策略只接受
+                    // `0.01—100` 米 ⇒ 归不出来。原来这一句只有"尺寸无效"，字段与数字一个都没有，
+                    // 于是那台电视"加载失败"查不出是哪一条判据、哪个数。
+                    throw WishMachineOutputError.invalidDimensions(WishMachineDimensionRejection(
+                        field: basisField, value: basisMeters,
+                        expected: "0.01—100 米，且源网格三轴都必须是 > 0 的有限数（实测源网格 "
+                            + "\(WishMachineDimensionRejection.text(extent.x)) × "
+                            + "\(WishMachineDimensionRejection.text(extent.y)) × "
+                            + "\(WishMachineDimensionRejection.text(extent.z)) 米）"))
+                }
                 resolvedHeight = resolution.size.y
             } else {
                 resolvedHeight = requested

@@ -131,6 +131,15 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     let canUndo: Bool
     let heldProp: WorldHeldProp?
     let holdUnavailableReasons: [String: String]
+    /// 每个物件 **× 每个挂点**的不可用原因（`objectID` → 挂点原始值 → 原因）。
+    ///
+    /// 为什么必须是二维的：真机 2026-10-02 用户说的是"把 2B 白色长剑挂到**背后**"，而当时
+    /// 面板/工具手里只有一份**按右手**问出来的答案（`holdEligibility` 的省缺是 `.rightHand`），
+    /// 于是右手的问题被当成了对背后的回答 —— 用户永远试不出背后到底行不行。
+    ///
+    /// 这一份里每一条都是**那个挂点自己**问出来的（`holdEligibility(objectID:point:)`），
+    /// 判据一个字没改。缺项 = 那个挂点这里判不了 ⇒ 让世界那条命令自己去判（不冒充）。
+    let holdUnavailableReasonsBySlot: [String: [String: String]]
     /// 承托几何**永远**不会来（派生的前置条件不成立：拿不到碰撞三角形或导航范围）。
     ///
     /// `false`（缺省）表示"格子还在派生"。这个字段只回答"还会不会好"，**不回答就绪与否** ——
@@ -145,10 +154,12 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     let wallPlaceableCells: Int
     init(worldID: String, revision: UInt64, objects: [WorldObjectState], surfaces: [ResidentPropEditorSurface],
          canUndo: Bool, heldProp: WorldHeldProp? = nil, holdUnavailableReasons: [String: String] = [:],
+         holdUnavailableReasonsBySlot: [String: [String: String]] = [:],
          supportGeometryUnavailable: Bool = false,
          wallFaces: Int = 0, wallPlaceableCells: Int = 0) {
         self.worldID = worldID; self.revision = revision; self.objects = objects; self.surfaces = surfaces
         self.canUndo = canUndo; self.heldProp = heldProp; self.holdUnavailableReasons = holdUnavailableReasons
+        self.holdUnavailableReasonsBySlot = holdUnavailableReasonsBySlot
         self.supportGeometryUnavailable = supportGeometryUnavailable
         self.wallFaces = wallFaces; self.wallPlaceableCells = wallPlaceableCells
     }
@@ -304,18 +315,30 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
         return isPlaced ? "已摆出" : "尚未摆放"
     }
     var selectedGrip: WorldPropGripCalibration? { isSelectedHeld ? selectedObject?.gripCalibration : nil }
-    var selectedHoldUnavailableReason: String? { selectedID.flatMap { snapshot.holdUnavailableReasons[$0] } }
+    /// 选中那一行现在显示的"为什么拿不了"：问的是**用户此刻选的挂点**（`holdPoint`），
+    /// 不是省缺的右手 —— 否则用户把挂点切到"背后"时，那一行还在说右手的问题。
+    var selectedHoldUnavailableReason: String? {
+        guard let selectedID else { return nil }
+        if let reason = snapshot.holdUnavailableReasonsBySlot[selectedID]?[holdPoint.worldSlot.rawValue] {
+            return reason
+        }
+        // 旧快照（没有逐挂点那一份）只有右手的答案：只在用户选的正是右手时读它，别拿它冒充别的挂点。
+        guard holdPoint == .rightHand else { return nil }
+        return snapshot.holdUnavailableReasons[selectedID]
+    }
     /// 「这件物件挂在**这个**挂点上现在行不行」。
     ///
-    /// 快照里那份 `holdUnavailableReasons` 是**按右手**问出来的（宿主的
-    /// `residentPropEditorSnapshot` 调 `holdEligibility(objectID:)` 用的是省缺挂点），
-    /// 所以它只能回答右手。背后/腰间**不拿它的答案冒充**：返回 nil = "这里判不了，
-    /// 让世界那条命令自己去判"，于是用户点「背后」时得到的是背后自己的具名原因，
-    /// 而不是右手的问题。
+    /// 快照里 `holdUnavailableReasonsBySlot` 的每一条都是**那个挂点自己**问出来的
+    /// （宿主对 `PropAttachmentPoint.allCases` 逐挂点调 `holdEligibility(objectID:point:)`）。
+    /// 所以这里能直接回答用户真正选的那一个；缺项（旧快照 / 宿主没给这个挂点的答案）时返回
+    /// nil = "这里判不了，让世界那条命令自己去判"，**绝不拿别的挂点的答案冒充**。
     private func availabilityReason(id: String, point: PropAttachmentPoint) -> String? {
-        guard point == .rightHand else { return nil }
-        guard let reason = snapshot.holdUnavailableReasons[id] else { return nil }
-        // 屏上那一行由 `notice` 显示；日志里必须有同一句，否则又只有屏幕、没有排障线索。
+        if let reason = snapshot.holdUnavailableReasonsBySlot[id]?[point.worldSlot.rawValue] {
+            // 屏上那一行由 `notice` 显示；日志里必须有同一句，否则又只有屏幕、没有排障线索。
+            livingWorldLogger.notice("摆件面板拒绝 step=hold-unavailable 挂点=\(point.rawValue, privacy: .public) 物件=\(id, privacy: .public) 原因=\(reason, privacy: .public)")
+            return reason
+        }
+        guard point == .rightHand, let reason = snapshot.holdUnavailableReasons[id] else { return nil }
         livingWorldLogger.notice("摆件面板拒绝 step=hold-unavailable 挂点=\(point.rawValue, privacy: .public) 物件=\(id, privacy: .public) 原因=\(reason, privacy: .public)")
         return reason
     }

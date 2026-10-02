@@ -82,7 +82,7 @@ extension ResidentPropDelegationError: LocalizedError {
             }
             if Self.isMutation(name) { properties["layout_revision"] = ["type": "integer", "minimum": 0] }
             let descriptions = [
-                "read_owned_props": "读取真实已拥有物件、是否摆出、位置、能力绑定、最近一次使用状态（running/completed/stopped/failed，以回执为准）与布局版本。`deleted` 列出已经被永久删除的物件（墓碑：名字、删除时的结算动作与理由、释放的内容引用）—— 已经删掉的东西不会出现在 objects 里。生成物件默认仅有外形；只有明确启用 coffee.brew 冲泡模板的咖啡机才可按模板在空间内模拟使用，不涉及现实硬件或物理结构。",
+                "read_owned_props": "读取真实已拥有物件、是否摆出、位置、能力绑定、最近一次使用状态（running/completed/stopped/failed，以回执为准）与布局版本。每件物件的 `hold_slots` **逐挂点**给出「能不能挂在那个挂点上」以及那一个挂点自己的原因（手/背后/腰间各自具名，右手不行不代表背后不行）。`deleted` 列出已经被永久删除的物件（墓碑：名字、删除时的结算动作与理由、释放的内容引用）—— 已经删掉的东西不会出现在 objects 里。生成物件默认仅有外形；只有明确启用 coffee.brew 冲泡模板的咖啡机才可按模板在空间内模拟使用，不涉及现实硬件或物理结构。",
                 "list_placement_surfaces": "读取可摆放的承托层：承托高度、格数与水平范围（不再逐个列出格子）。位置为底部中心，yaw 为弧度。",
                 "preview_prop_placement": "只验证候选摆放，不改变世界、不显示预览。碰撞或通道错误可用于调整计划。",
                 "apply_prop_placement": "按本轮人类摆放或移动委托提交已拥有物件的位置和朝向；后台仅可续办原生成任务仍有效的有限摆放委托，只能摆该产物到允许的支撑面。先查询布局版本和支撑面并预检，位置和朝向使用绝对值。",
@@ -90,7 +90,7 @@ extension ResidentPropDelegationError: LocalizedError {
                 "undo_prop_placement": "仅按本轮人类要求撤销最近一次摆放或收回；只能撤销一步。",
                 // 工具描述是 agent 真正读到的"能拿多大"：与判据**同源**（插值同一份上限），
                 // 否则提示词说 1.6 m、工具描述说另一个数，agent 会照着错的那一份拒绝用户。
-                "hold_prop": "仅按本轮人类明确要求，让当前已适配居民拿起 / 挂上一件最长边不超过\(ResidentPropAttachmentEligibility.holdableLongestEdgeText)的小道具展示；slot 决定挂点（rightHand 拿在手里 / back 挂在背后 / waist 挂在腰间），省缺为 rightHand。用户说「挂背后 / 挂腰上 / 拿手里」时就是选它。物件保持同一身份并保留原放回位置。",
+                "hold_prop": "仅按本轮人类明确要求，让当前已适配居民拿起 / 挂上一件最长边不超过\(ResidentPropAttachmentEligibility.holdableLongestEdgeText)的小道具展示；slot 决定挂点（rightHand 拿在手里 / back 挂在背后 / waist 挂在腰间），省缺为 rightHand。用户说「挂背后 / 挂腰上 / 拿手里」时就是选它。物件保持同一身份并保留原放回位置。read_owned_props 的回执里 `hold_slots` **逐挂点**给出可用性与各自的原因：右手不行**不代表**背后或腰间不行，别拿一个挂点的答案替用户回答另一个挂点；失败回执里的 slot/slot_name 是这次**真正**按哪个挂点算的（没给 slot 时就是省缺的右手）。",
                 "adjust_held_prop_grip": "仅按本轮人类要求，微调**当前挂点**上那件道具相对该挂点骨骼的米制偏移和局部旋转。先读取当前握点，参数为绝对值；它不会改变挂点本身（换挂点用 hold_prop 的 slot）。",
                 "return_held_prop": "仅按本轮人类要求把当前挂载的道具精确放回拿起前的位置；原来在库存则回库存，不接受放回坐标。",
                 "enable_prop_capability": "仅按本轮人类明确要求使用某物件时，为已拥有摆件启用受支持的使用能力模板（当前仅支持 coffee.brew 冲泡模板）。能力持久化；启用后通过 start_activity 走到物件前面向它执行按钮动作并等待播放完成，属于空间内模拟使用，不宣称物理冲煮结构。按名字猜想的物件不得启用。",
@@ -228,9 +228,18 @@ extension ResidentPropDelegationError: LocalizedError {
                 if let receipt = service.deletionReceipt(objectID: objectID) { deletion = receipt }
             }
             if Self.isMutation(name) { onChange() }
-            let objects = service.context.state.objectStates.values.compactMap { item in
-                Self.object(item, heldObjectID: service.context.state.heldProp?.objectID,
-                            holdEligibility: service.holdEligibility(objectID: item.generatedProp?.objectID ?? ""))
+            // **逐挂点**问可用性（与面板同一份推导：`holdEligibility(objectID:point:)`）。
+            //
+            // 以前这里对每件物件只问一次（省缺 = 右手），回执里的 `hold_eligible` /
+            // `hold_unavailable_reason` 于是是**右手**的答案。agent 读到 `hold_eligible:false`
+            // 就以为"这件东西挂不上"，用户说的"挂到背后"根本传不到 `hold_prop` 的 slot 上
+            // —— 真机 2026-10-02 12:28:21.388 那两条 `挂点=右手` 的拒绝就是这么发出去的。
+            // 现在三个挂点各问一次、各自具名；判据一个字没改。
+            // 多语句闭包的返回类型**不参与**类型推断（Swift 的既有约束），所以这里显式写出来。
+            let objects = service.context.state.objectStates.values.compactMap { item -> [String: Any]? in
+                guard let objectID = item.generatedProp?.objectID else { return nil }
+                return Self.object(item, heldObjectID: service.context.state.heldProp?.objectID,
+                                   holdUnavailableBySlot: Self.holdUnavailableBySlot(service, objectID: objectID))
             }
             let interactionStatus = objects.contains { $0["capability"] != nil }
                 ? "capability_bound_use_only" : "appearance_only"
@@ -265,7 +274,7 @@ extension ResidentPropDelegationError: LocalizedError {
                     payload["slot_notice"] = notice
                 }
             }
-            if let preview { payload["preview"] = Self.object(preview, heldObjectID: nil, holdEligibility: nil) }
+            if let preview { payload["preview"] = Self.object(preview, heldObjectID: nil, holdUnavailableBySlot: [:]) }
             return result(payload)
         } catch {
             // **失败具名**：`delete_prop` 的两种"找不到"各给一个机器读的 code（agent 据此
@@ -278,11 +287,14 @@ extension ResidentPropDelegationError: LocalizedError {
             }
             var failure: [String: Any] = ["ok": false, "code": code, "message": error.localizedDescription,
                            "layout_revision": service.context.state.layoutRevision]
-            // 失败回执也带上挂点名：用户听到的那句话与回执里的名字是同一个。
-            if name == "hold_prop", let text = values["slot"] as? String,
-               let point = PropAttachmentSlots.resolve(name: text) {
+            // 失败回执**总是**带上挂点名 —— 包括调用方**没给** `slot` 的时候（那时省缺是右手）。
+            // 只带一半（传了才带）会让"系统在按右手算"这件事在回执与日志里都看不见。
+            if name == "hold_prop" {
+                let declared = values["slot"] as? String
+                let point = declared.flatMap(PropAttachmentSlots.resolve(name:)) ?? .rightHand
                 failure["slot"] = point.worldSlot.rawValue
                 failure["slot_name"] = PropAttachmentSlots.displayName(for: point)
+                failure["slot_source"] = declared == nil ? "省缺（调用方没有给 slot）" : "参数 slot=\(declared!)"
             }
             // 回执是给 agent 看的；**日志是给排障的人看的**。这条工具调用失败时，
             // 统一日志里必须留下同一个名字与同一句话 —— 否则"用户说挂不上、日志里什么都没有"
@@ -333,13 +345,49 @@ extension ResidentPropDelegationError: LocalizedError {
         }
     }
     private static func vector(_ p: WorldVector3) -> [Float] { [p.x, p.y, p.z] }
-    private static func object(_ item: WorldObjectState, heldObjectID: String?, holdEligibility: String?) -> [String: Any]? {
+
+    /// 逐挂点问一次可用性：返回"**不可用**的挂点（`WorldPropSlot.rawValue`）→ 那个挂点自己的原因"。
+    ///
+    /// 可用的挂点不在表里（=`ok`）。与面板那一条读的是**同一个**判据出口
+    /// （`ResidentPropPlacementService.holdEligibility(objectID:point:)`），所以两边不可能分叉。
+    private static func holdUnavailableBySlot(_ service: ResidentPropPlacementService,
+                                               objectID: String) -> [String: String] {
+        var result: [String: String] = [:]
+        for point in PropAttachmentPoint.allCases {
+            if let reason = service.holdEligibility(objectID: objectID, point: point) {
+                result[point.worldSlot.rawValue] = reason
+            }
+        }
+        return result
+    }
+
+    private static func object(_ item: WorldObjectState, heldObjectID: String?,
+                               holdUnavailableBySlot: [String: String]) -> [String: Any]? {
         guard let prop = item.generatedProp else { return nil }
         let q = item.transform.rotation
+        // 逐挂点的答案**单独拼**（不塞进下面那个大字典字面量里）：嵌套闭包 + `Any` 字面量
+        // 会把类型检查器逼到报"generic parameter could not be inferred"那种假错误。
+        var slots: [String: [String: Any]] = [:]
+        for point in PropAttachmentPoint.allCases {
+            let slot = point.worldSlot.rawValue
+            var entry: [String: Any] = ["eligible": holdUnavailableBySlot[slot] == nil,
+                                        "name": PropAttachmentSlots.displayName(for: point)]
+            if let reason = holdUnavailableBySlot[slot] { entry["reason"] = reason }
+            slots[slot] = entry
+        }
+        // 「这件东西能不能挂在身上」= **至少有一个挂点**可用 —— 不是"右手可用"。
+        // 逐挂点的答案在 `hold_slots` 里：手不行**不代表**背后不行（真机 2026-10-02 的缺陷形状）。
         var result: [String: Any] = ["object_id": prop.objectID, "name": prop.displayName, "is_placed": item.isEnabled,
-            "is_held": heldObjectID == prop.objectID, "hold_eligible": holdEligibility == nil,
+            "is_held": heldObjectID == prop.objectID,
+            "hold_eligible": holdUnavailableBySlot.count < PropAttachmentPoint.allCases.count,
+            "hold_slots": slots,
             "position": vector(item.transform.position), "size": vector(prop.size), "yaw": atan2(2*q.w*q.y,1-2*q.y*q.y)]
-        if let holdEligibility { result["hold_unavailable_reason"] = holdEligibility }
+        // 只有**三个挂点都不行**时才有"这件东西整体挂不上"这句话；否则它会冒充别的挂点的答案。
+        if holdUnavailableBySlot.count == PropAttachmentPoint.allCases.count {
+            result["hold_unavailable_reason"] = PropAttachmentPoint.allCases
+                .map { "\(PropAttachmentSlots.displayName(for: $0))：\(holdUnavailableBySlot[$0.worldSlot.rawValue] ?? "不可用")" }
+                .joined(separator: "；")
+        }
         if let capability = item.propCapability {
             result["capability"] = [
                 "template_id": capability.templateID,

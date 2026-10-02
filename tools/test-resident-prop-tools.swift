@@ -125,12 +125,25 @@ struct FlatRoomAndTable: WorldPropSupportQuerying {
         let context=try WorldAgentContext(manifest:manifest)
         // 承托层由几何派生：范围与旧的具名面 `test` 相同（展示台桌面高度 0.52 m）。
         let flat=flatSupport()
+        // 真机那把 **2B 白色长剑（外形摆件）** 的权威身份（逐字段取自 2026-10-02 的
+        // `world_records.objects/wish-prop-4210db95-…`）：端到端那一条断言要的就是"对它说
+        // 挂到背后，真的挂得上"，所以夹具用**真身份**，不用一个抽象名字。
+        let swordID="wish-prop-4210db95-9253-4caf-83a3-3c45f090b099"
+        let swordName="2B 白色长剑（外形摆件）"
         let current=Current()
         let service=ResidentPropPlacementService(context:context,support:{flat},isCurrent:{current.value},
             currentAvatarAssetID:{"pmx.2b-miss-0414-standard"},makeGripCalibration:{ prop, avatarID, point in
                 // 挂点跟着调用方给的那一个走（`point.worldSlot`）：换挂点时标定里的挂点必须跟着变，
                 // 否则世界那条 `.adjustGrip` 会以"标定说的挂点不是它"为由拒绝。
-                WorldPropGripCalibration(avatarAssetID:avatarID,hand:point.worldSlot,
+                //
+                // `swordID` 那件**故意只有右手不可用**（背后/腰间都行）：真机 2026-10-02 的缺陷
+                // 形状正是"拿右手的失败回答背后"。夹具必须长得像它，那条断言才可能红。
+                if prop.objectID == swordID, point == .rightHand {
+                    throw ResidentPropPlacementError.attachmentUnsupported(
+                        "资产未验证（asset-record）：字段=residentOwnedPropAssets[\(swordID)] "
+                        + "期望=一条已准备的资产记录 实际=nil（这一刻资产准备还没轮到它）")
+                }
+                return WorldPropGripCalibration(avatarAssetID:avatarID,hand:point.worldSlot,
                     normalizedGrip:.init(x:0.5,y:0.5,z:0.5),localOffset:.init(x:0,y:0,z:0),
                     localRotation:.init(x:0,y:0,z:0,w:1))
             })
@@ -287,6 +300,73 @@ struct FlatRoomAndTable: WorldPropSupportQuerying {
         check(context.state.heldProp?.hand == .back
               && context.state.objectStates["owned"]?.gripCalibration?.hand == .back,
               "微调不许悄悄把挂点改回右手")
+        // ---- 【断言】说"挂到背后"就得按背后问：手部的失败不许冒充背后的回答 ----
+        //
+        // 真机 2026-10-02：用户说"把 2B 白色长剑挂到背后"，而回执里那件物件的
+        // `hold_eligible` 是**按右手**问出来的 false（那一刻右手不成立的是"本地资产记录
+        // 还没轮到它"），agent 于是根本没试背后。这里把三件事钉死：
+        //   ① 回执里的 `hold_slots` **逐挂点**给出可用性，右手那条带**它自己**的具名原因；
+        //   ② `hold_eligible` 是"至少有一个挂点可用"，不是"右手可用"；
+        //   ③ 用户选的那个挂点真的传下去：hold_prop(slot:"背后") 落进权威 heldProp.hand == back。
+        let swordProp = WorldGeneratedProp(objectID: swordID, sourceWishID: "4210DB95-9253-4CAF-83A3-3C45F090B099",
+            assetID: "sha256:e9dda009e47ca4c1ace5e8a6e4ccf18645a109556b4f4772e410815c2be05529",
+            displayName: swordName,
+            size: .init(x: 0.14604884, y: 1.1, z: 0.061886825), sourceHeight: 1.0054325)
+        _ = try service.commit(.register(swordProp),
+            expectedLayoutRevision: context.state.layoutRevision, requestID: "register-sword")
+        // 手里那件先放回去：这一组要的是"空手 + 一件右手不可用、背后可用的物件"，
+        // 否则所有挂载都会被「居民手里已经有别的东西」挡在前面（那是另一条腿）。
+        check(!(try await invoke(human, "return_held_prop",
+            ["object_id": "owned", "layout_revision": context.state.layoutRevision], "return-before-sword")).isError,
+              "先把手里那件放回去（sword 这一组要空手）")
+        let listed = payload(try await invoke(readonly, "read_owned_props", [:], "read-slots"))
+        guard let listedObjects = listed["objects"] as? [[String: Any]],
+              let swordEntry = listedObjects.first(where: { $0["object_id"] as? String == swordID }) else {
+            print("FAIL: read_owned_props 回执里没有那把剑（\(swordID)）"); exit(1)
+        }
+        let slots = swordEntry["hold_slots"] as? [String: Any] ?? [:]
+        check(Set(slots.keys) == ["rightHand", "back", "waist"],
+              "回执必须**逐挂点**给出可用性（实测 \(slots.keys.sorted())）")
+        check(((slots["rightHand"] as? [String: Any])?["eligible"] as? Bool) == false,
+              "右手不可用时 hold_slots.rightHand.eligible 必须是 false")
+        check(((slots["rightHand"] as? [String: Any])?["reason"] as? String)?.contains("asset-record") == true,
+              "右手那条必须带**它自己**的具名原因（腿 + 字段 + 期望/实际）")
+        check(((slots["back"] as? [String: Any])?["eligible"] as? Bool) == true,
+              "右手不可用**绝不代表**背后不可用（hold_slots.back.eligible 必须是 true）")
+        check(((slots["waist"] as? [String: Any])?["eligible"] as? Bool) == true,
+              "右手不可用**绝不代表**腰间不可用（hold_slots.waist.eligible 必须是 true）")
+        check((swordEntry["hold_eligible"] as? Bool) == true,
+              "hold_eligible 是「至少一个挂点可用」，不是「右手可用」")
+        check((swordEntry["hold_unavailable_reason"] as? String) == nil,
+              "三个挂点里还有可用的，就不许给「这件东西整体挂不上」那一句")
+        // 失败回执必须说清这次**真正**按哪个挂点算的 —— 包括调用方没给 slot 的时候。
+        let defaultHold = try await invoke(human, "hold_prop",
+            ["object_id": swordID, "layout_revision": context.state.layoutRevision], "hold-sword-default")
+        check(defaultHold.isError, "省缺 slot = 右手：这件物件右手确实不可用，必须被拒")
+        check((payload(defaultHold)["slot"] as? String) == "rightHand"
+              && (payload(defaultHold)["slot_source"] as? String)?.contains("省缺") == true,
+              "失败回执必须说清「没给 slot，按省缺的右手算」（实测 \(payload(defaultHold)["slot_source"] ?? "nil")）")
+        check(context.state.heldProp == nil, "被拒的挂载不许改动现状")
+        // 用户真正选的那一个：说"背后"就按背后算，而且**真的挂上去**。
+        let revision = context.state.layoutRevision
+        let back = try await invoke(human, "hold_prop",
+            ["object_id": swordID, "layout_revision": revision, "slot": "背后"], "hold-sword-back")
+        check(!back.isError, "说「挂背后」必须成功（实测 \(payload(back)["message"] ?? "")）")
+        check(context.state.heldProp?.objectID == swordID && context.state.heldProp?.hand == .back,
+              "用户选的挂点必须落进**权威状态**：heldProp.hand == back")
+        check((payload(back)["held_slot"] as? String) == "back"
+              && (payload(back)["held_slot_name"] as? String) == "背后",
+              "回执里的 held_slot/held_slot_name 必须是背后")
+        check(context.state.layoutRevision == revision + 1, "一次挂载 layoutRevision 只 +1")
+        let afterHold = context.state
+        // 幂等：**绝不产生第二条**。重放时世界状态已经变了（它已经在背后），`holdCommand`
+        // 因此把这一件解析成"换挂点"（`.adjustGrip`）而**不是**同一条 `.hold`；世界层以
+        // `requestConflict` 拒绝这条**不同的**命令 —— 判据是"状态逐位不变"，不是"回执必须成功"。
+        // 换句话说：同一个 requestID 一次写入都没有第二次，`layoutRevision` 也不再涨。
+        _ = try await invoke(human, "hold_prop",
+            ["object_id": swordID, "layout_revision": revision, "slot": "背后"], "hold-sword-back")
+        check(context.state == afterHold, "同一个 requestID 重放绝不产生第二条（权威状态逐位不变）")
+        check(context.state.layoutRevision == revision + 1, "重放不许再涨 layoutRevision")
         print("PASS: \(checks) resident prop tool checks")
     }
 }
@@ -312,6 +392,73 @@ func worldRuntimeHarnessFlags() -> [String] {
 }
 let worldRuntimeFlags = worldRuntimeHarnessFlags()
 let objects=Array(worldRuntimeFlags.dropFirst(2))
-let code=try run("/usr/bin/swiftc",["-j1","-parse-as-library","-I",worldRuntimeFlags[1],sources.appendingPathComponent("Agent/WorldAgentContext.swift").path,sources.appendingPathComponent("Presence/ResidentPropPlacementService.swift").path,root.appendingPathComponent("tools/fixtures/PropAttachmentPointShim.swift").path,sources.appendingPathComponent("Presence/PropGripInference.swift").path,sources.appendingPathComponent("Presence/PropAttachmentSlot.swift").path,bridge.path,root.appendingPathComponent("tools/fixtures/ResidentPropHoldLimitShim.swift").path,file.path,"-o",exe.path]+objects)
-guard code == 0 else{exit(code)}
-exit(try run(exe.path,[]))
+/// 编译内层程序（生产源码 / 注入副本共用同一条路）。
+func buildHarness(bridgePath:String,executable:URL)throws->Int32{
+    try run("/usr/bin/swiftc",["-j1","-parse-as-library","-I",worldRuntimeFlags[1],sources.appendingPathComponent("Agent/WorldAgentContext.swift").path,sources.appendingPathComponent("Presence/ResidentPropPlacementService.swift").path,root.appendingPathComponent("tools/fixtures/PropAttachmentPointShim.swift").path,sources.appendingPathComponent("Presence/PropGripInference.swift").path,sources.appendingPathComponent("Presence/PropAttachmentSlot.swift").path,bridgePath,root.appendingPathComponent("tools/fixtures/ResidentPropHoldLimitShim.swift").path,file.path,"-o",executable.path]+objects)
+}
+/// 跑内层程序并**收走**它的输出。负对照那两次跑必须收走：注入之后内层程序会打自己的
+/// `FAIL:` 行 —— 那是**注入生效的证据**，不是这次门禁失败。让它直接落到 stdout 上，
+/// 外层 `make test-harnesses` 的 `FAIL` 计数就会被自己的负对照污染。
+func runCapturing(_ binary:String)throws->(status:Int32,output:String){
+    let p=Process();p.executableURL=URL(fileURLWithPath:binary)
+    let pipe=Pipe();p.standardOutput=pipe;p.standardError=pipe
+    try p.run()
+    let data=pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return (p.terminationStatus,String(decoding:data,as:UTF8.self))
+}
+let productionStatus=try buildHarness(bridgePath:bridge.path,executable:exe)
+guard productionStatus == 0 else{exit(productionStatus)}
+let productionRun=try runCapturing(exe.path)
+FileHandle.standardOutput.write(Data(productionRun.output.utf8))
+guard productionRun.status == 0 else{exit(productionRun.status)}
+// ---- 负对照①：把"逐挂点 / 至少一个挂点可用"改回**旧行为**（右手一个挂点的答案代表整件物件）
+// ⇒ 上面那条"右手不可用绝不代表背后不可用"的断言必须红。注入点在**源码副本**上做手术，
+// 生产源码一个字都不动；注入点失效（找不到那一行）与"注入之后居然还绿"都算门禁失败。
+let productionBridgeSource=try String(contentsOf:bridge,encoding:.utf8)
+let injected=productionBridgeSource.replacingOccurrences(
+    of:"\"hold_eligible\": holdUnavailableBySlot.count < PropAttachmentPoint.allCases.count",
+    with:"\"hold_eligible\": holdUnavailableBySlot[PropAttachmentPoint.rightHand.worldSlot.rawValue] == nil")
+guard injected != productionBridgeSource else{
+    print("FAIL: 负对照的前提没了：生产源码里找不到「至少一个挂点可用」那一行")
+    exit(1)
+}
+let injectedBridge=temporary.appendingPathComponent("ResidentPropToolBridge.injected.swift")
+try injected.write(to:injectedBridge,atomically:true,encoding:.utf8)
+let injectedExe=temporary.appendingPathComponent("test-injected")
+guard try buildHarness(bridgePath:injectedBridge.path,executable:injectedExe) == 0 else{
+    print("FAIL: 负对照的注入副本编不过（注入点写坏了？）")
+    exit(1)
+}
+let injectedRun=try runCapturing(injectedExe.path)
+guard injectedRun.status != 0 else{
+    print("FAIL: 负对照失败：注入旧行为（右手一个挂点的答案代表整件物件）之后判据居然还绿")
+    exit(1)
+}
+let injectedFirstFailure=injectedRun.output.split(separator:"\n").first{ $0.hasPrefix("FAIL") }.map(String.init) ?? "（注入之后红了，但没有 FAIL 行）"
+print("[负对照] 注入旧行为（右手一个挂点的答案代表整件物件）⇒ 红：\(injectedFirstFailure)")
+// ---- 负对照②：把用户选的挂点**盖成默认值**（命令里写死右手）⇒「说挂背后真的挂得上」必须红。
+// 真机缺陷的另一半正是这个形状："用户说背后，系统在按右手算"。注入之后 `hold_prop(slot:"背后")`
+// 会拿着**右手**的标定去提交（右手在这件夹具上不可用）⇒ 端到端那条断言必须 FAIL。
+let injectedHardcoded=productionBridgeSource.replacingOccurrences(
+    of:"service.holdCommand(objectID: values[\"object_id\"] as! String, point: point)",
+    with:"service.holdCommand(objectID: values[\"object_id\"] as! String, point: .rightHand)")
+guard injectedHardcoded != productionBridgeSource else{
+    print("FAIL: 负对照的前提没了：生产源码里找不到「把 point 原样交给 holdCommand」那一行")
+    exit(1)
+}
+let hardcodedBridge=temporary.appendingPathComponent("ResidentPropToolBridge.hardcoded.swift")
+try injectedHardcoded.write(to:hardcodedBridge,atomically:true,encoding:.utf8)
+let hardcodedExe=temporary.appendingPathComponent("test-hardcoded")
+guard try buildHarness(bridgePath:hardcodedBridge.path,executable:hardcodedExe) == 0 else{
+    print("FAIL: 负对照的注入副本编不过（注入点写坏了？）")
+    exit(1)
+}
+let hardcodedRun=try runCapturing(hardcodedExe.path)
+guard hardcodedRun.status != 0 else{
+    print("FAIL: 负对照失败：把命令里的挂点写死成右手（用户选的挂点被默认值盖住）之后判据居然还绿")
+    exit(1)
+}
+let hardcodedFirstFailure=hardcodedRun.output.split(separator:"\n").first{ $0.hasPrefix("FAIL") }.map(String.init) ?? "（注入之后红了，但没有 FAIL 行）"
+print("[负对照] 把挂点写死成默认的右手（用户选的挂点被盖住）⇒ 红：\(hardcodedFirstFailure)")
+exit(0)

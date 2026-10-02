@@ -226,6 +226,113 @@ for injection in primitiveWiringInjections {
     print("PASS: 注入负对照「\(injection.name)」⇒ 判据变红（\(issues[0])）")
 }
 
+// ── 断言 8：三轴意图的**米数换算**与"尺寸无效"的字段级原因 ────────────────────
+//
+// 上面那条钉的是几何（拼出来的 == 声明出来的 == 量出来的）；这一条钉的是**意图那本账**：
+// 毫米 → 米的换算（真机 2026-10-02「超大荧幕电视」的根因）以及"是哪一条判据不成立"
+// 必须说得出来（用户原话只有一句"许愿机产物的尺寸无效"，字段与数字一个都没有）。
+//
+// 判据仍是接线本身（文本级）+ 注入负对照：一个从不 FAIL 的门禁等于没有门禁。
+func dimensionAccountingProblems(client: String, descriptor: String, renderer: String,
+                                 resident: String) -> [String] {
+    var problems: [String] = []
+    // ① 毫米 → 米：少一层括号就是 `edges.max() ?? (0 / 1000)`，1443 mm 会被当成 1443 米。
+    if !client.contains("var longestMeters: Double { (edges.max() ?? 0) / 1000 }") {
+        problems.append("① 三轴意图的 `longestMeters` 不是「(最长边) / 1000」："
+            + "1443 mm 会被当成 1443 米 ⇒ 托盘归一失败（现场那句「尺寸无效」）")
+    }
+    // ② 托盘归一失败必须说得出**哪个字段、什么数值**，而且不许退回裸抛。
+    if !renderer.contains("field: basisField, value: basisMeters") {
+        problems.append("② 托盘归一失败的拒绝没有字段与实测数值（用户只看到一句「尺寸无效」）")
+    }
+    if renderer.contains("guard let resolution else { throw WishMachineOutputError.invalidDimensions }") {
+        problems.append("② 托盘归一失败又回到了裸抛（判据塌成一句话）")
+    }
+    // ③ 尺寸判据的**唯一**出口必须带字段级原因，而且用户看得见那一句。
+    if !descriptor.contains("case invalidDimensions(WishMachineDimensionRejection)") {
+        problems.append("③ `WishMachineOutputError.invalidDimensions` 不带字段级原因")
+    }
+    if !descriptor.contains("许愿机产物的尺寸无效：\\(rejection.summary)") {
+        problems.append("③ 「尺寸无效」那一句没有把字段与数值拼进去（用户读不出是哪一条）")
+    }
+    // ④ 已登记物件那条（摆正后高度为零）也要说得出来。
+    if !resident.contains("field: \"sourceHeight（摆正后网格的高度）\"") {
+        problems.append("④ 已登记物件的尺寸拒绝没有字段与数值")
+    }
+    return problems
+}
+
+/// 注入负对照：每一条都对应一种真实的"悄悄退化"。
+let dimensionAccountingInjections: [(name: String, file: String, old: String, new: String)] = [
+    // 现场缺陷本身：少一层括号 ⇒ 毫米当米。
+    ("millimeters-as-meters", "client",
+     "var longestMeters: Double { (edges.max() ?? 0) / 1000 }",
+     "var longestMeters: Double { edges.max() ?? 0 / 1000 }"),
+    // 只留一句话：字段与数值又没了（这正是用户截图里那一行）。
+    ("one-sentence-dimension-failure", "descriptor",
+     "\"许愿机产物的尺寸无效：\\(rejection.summary)。暂时无法显示。\"",
+     "\"许愿机产物的尺寸无效，暂时无法显示。\""),
+    // 托盘那条又变回不说数字。
+    ("bare-tray-dimension-throw", "renderer",
+     "field: basisField, value: basisMeters,",
+     "field: \"尺寸\", value: 0,"),
+]
+
+func readAccountingSources() -> [String: String] {
+    var result: [String: String] = [:]
+    let files = ["client": "Presence/PropGenerationClient.swift",
+                 "descriptor": "Presence/WishMachineOutputDescriptor.swift",
+                 "renderer": "Presence/WishMachineOutputRenderer.swift",
+                 "resident": "Presence/ResidentPropRenderer.swift"]
+    for (key, path) in files {
+        guard let text = try? String(contentsOf: sources.appendingPathComponent(path), encoding: .utf8) else {
+            print("FAIL: 读不到 \(path)"); exit(1)
+        }
+        result[key] = text
+    }
+    return result
+}
+func dimensionAccountingIssues(_ files: [String: String]) -> [String] {
+    dimensionAccountingProblems(client: files["client"] ?? "", descriptor: files["descriptor"] ?? "",
+                                renderer: files["renderer"] ?? "", resident: files["resident"] ?? "")
+}
+
+let accountingFiles = readAccountingSources()
+// 现场演示：`SIZE_INTENT_INJECT=millimeters-as-meters swift tools/test-resident-prop-size-intent.swift`
+// 会把**真源码**当成"毫米当米"的那一份来判，于是主判据自己打出一条 FAIL。
+var observedAccountingFiles = accountingFiles
+if let name = ProcessInfo.processInfo.environment["SIZE_INTENT_INJECT"],
+   let injection = dimensionAccountingInjections.first(where: { $0.name == name }) {
+    print("·· SIZE_INTENT_INJECT=\(name)：把真源码当成被注入过的那一份来判")
+    guard let text = observedAccountingFiles[injection.file], text.contains(injection.old) else {
+        print("FAIL: 注入锚点在真源码里找不到：\(injection.old)"); exit(1)
+    }
+    observedAccountingFiles[injection.file] = text.replacingOccurrences(of: injection.old, with: injection.new)
+}
+let accountingIssues = dimensionAccountingIssues(observedAccountingFiles)
+for issue in accountingIssues { print("FAIL: \(issue)") }
+guard accountingIssues.isEmpty else {
+    print("FAIL: 三轴意图的米数换算 / 尺寸拒绝的字段级原因不成立（判据见上）"); exit(1)
+}
+print("PASS: 三轴意图按毫米 → 米换算，尺寸无效类失败带字段与数值（字段 + 实测值 + 期望）")
+
+for injection in dimensionAccountingInjections {
+    guard let text = accountingFiles[injection.file], text.contains(injection.old) else {
+        print("FAIL: 注入负对照「\(injection.name)」的锚点在源码里找不到：\(injection.old)"); exit(1)
+    }
+    var injected = accountingFiles
+    injected[injection.file] = text.replacingOccurrences(of: injection.old, with: injection.new)
+    guard injected[injection.file] != text else {
+        print("FAIL: 注入负对照「\(injection.name)」没有改到源码副本"); exit(1)
+    }
+    let issues = dimensionAccountingIssues(injected)
+    guard !issues.isEmpty else {
+        print("FAIL: 注入负对照「\(injection.name)」（\(injection.new)）⇒ 判据必须变红，它却全绿")
+        exit(1)
+    }
+    print("PASS: 注入负对照「\(injection.name)」⇒ 判据变红（\(issues[0])）")
+}
+
 // ── 断言 2：参数与规则**只有一处**定义 ──────────────────────────────────────
 // 唯一允许写这些事实的文件是 Agent/WishMachineContract.swift（agent 用只读工具
 // `read_wish_machine_contract` 现读）。工具文件与系统提示里再存一份就是旧病复发：
@@ -324,6 +431,66 @@ let program = #"""
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
+import simd
+import WorldRuntime
+
+/// 从**资产字节**里独立量一次包围盒（逐顶点；与渲染端 loader 的 `worldBounds` 同一件事）。
+///
+/// 它是"渲染端量出来的那一份"这条断言里**独立**的一腿：不读 `WorldPrimitiveTelevision.size`，
+/// 只读那串字节，所以"拼出来的 == 声明出来的 == 量出来的"不是同一份数据自证。
+enum PrimitiveGLBBounds {
+    static func measure(_ data: Data) -> (minimum: SIMD3<Float>, maximum: SIMD3<Float>)? {
+        let bytes = [UInt8](data)
+        guard bytes.count > 20, String(decoding: bytes[0..<4], as: UTF8.self) == "glTF" else { return nil }
+        func u32(_ offset: Int) -> Int {
+            Int(bytes[offset]) | Int(bytes[offset + 1]) << 8 | Int(bytes[offset + 2]) << 16 | Int(bytes[offset + 3]) << 24
+        }
+        var offset = 12
+        var document: [String: Any]?
+        var binary: [UInt8]?
+        while offset + 8 <= bytes.count {
+            let length = u32(offset), kind = u32(offset + 4)
+            offset += 8
+            guard length >= 0, offset + length <= bytes.count else { return nil }
+            let chunk = Array(bytes[offset..<(offset + length)])
+            if kind == 0x4E4F_534A { document = try? JSONSerialization.jsonObject(with: Data(chunk)) as? [String: Any] }
+            if kind == 0x004E_4942 { binary = chunk }
+            offset += length
+        }
+        guard let document, let bin = binary,
+              let accessors = document["accessors"] as? [[String: Any]],
+              let bufferViews = document["bufferViews"] as? [[String: Any]],
+              let meshes = document["meshes"] as? [[String: Any]] else { return nil }
+        var minimum = SIMD3<Float>(repeating: .infinity)
+        var maximum = SIMD3<Float>(repeating: -Float.infinity)
+        var found = false
+        for mesh in meshes {
+            for primitive in (mesh["primitives"] as? [[String: Any]]) ?? [] {
+                guard let attributes = primitive["attributes"] as? [String: Any],
+                      let index = attributes["POSITION"] as? Int, index < accessors.count else { continue }
+                let accessor = accessors[index]
+                guard accessor["componentType"] as? Int == 5126, accessor["type"] as? String == "VEC3",
+                      let count = accessor["count"] as? Int,
+                      let viewIndex = accessor["bufferView"] as? Int, viewIndex < bufferViews.count else { continue }
+                let view = bufferViews[viewIndex]
+                let start = (view["byteOffset"] as? Int ?? 0) + (accessor["byteOffset"] as? Int ?? 0)
+                let stride = view["byteStride"] as? Int ?? 12
+                for vertex in 0..<count {
+                    let base = start + vertex * stride
+                    guard base + 12 <= bin.count else { return nil }
+                    func float(_ at: Int) -> Float {
+                        Float(bitPattern: UInt32(bin[at]) | UInt32(bin[at + 1]) << 8
+                              | UInt32(bin[at + 2]) << 16 | UInt32(bin[at + 3]) << 24)
+                    }
+                    let point = SIMD3<Float>(float(base), float(base + 4), float(base + 8))
+                    minimum = simd_min(minimum, point); maximum = simd_max(maximum, point)
+                    found = true
+                }
+            }
+        }
+        return found ? (minimum, maximum) : nil
+    }
+}
 
 struct ResidentImageAttachment: Identifiable, Codable, Sendable, Equatable { let id: UUID; let url: URL; let displayName: String }
 struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isError: Bool }
@@ -760,6 +927,100 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
       && televisionRecord?.sizeIntent?.millimeters?.z == 302,
       "守护进程回显的三轴必须能解回 app（实测 \(String(describing: televisionRecord?.sizeIntent))）")
   check(televisionRecord?.heightMeters == 0.862, "记录里的 height_meters 就是三轴的 y")
+
+  // ── 真机缺陷（2026-10-02「超大荧幕电视」）：三轴意图派生的米数必须是**米** ──────
+  //
+  // 现场：用户在对话里给了参考图 + `1443 x 862 x 302 mm`，任务行最后是
+  //   "场景加载失败 / 成品场景加载失败：许愿机产物的尺寸无效，暂时无法显示。"
+  // 而那件东西**永远停在 `stage == .ready`**，走不到已经写好的
+  // "三轴 + 板形 ⇒ 用基础几何拼电视"那条路 —— 因为托盘归一先失败了。
+  //
+  // 根因不在几何，在**意图的记账**：`PropSizeIntent.Millimeters.longestMeters` 少了一层括号，
+  // `edges.max() ?? 0 / 1000` 被读成 `edges.max() ?? (0 / 1000)` ⇒ 派生的 `meters` 是
+  // `1443`（毫米当米）。下面每一条都跑**真源码 + 真数字 + 真机那份网格量出来的包围盒**。
+  let dimsIntent = PropSizeIntent(millimeters: .init(x: 1443, y: 862, z: 302), source: .user)!
+  check(dimsIntent.mode == .dimensions && dimsIntent.axis == .longest,
+      "三轴意图派生的轴必须是最长边（实测 \(dimsIntent.axis)）")
+  check(dimsIntent.isValid, "三轴意图必须合法（三个毫米数都在 10—3000）")
+  check(abs(dimsIntent.meters - 1.443) < 1e-9,
+      "三轴意图派生的 meters 必须是**米**（实测 \(dimsIntent.meters)；毫米当米就是现场那句「尺寸无效」）")
+  let worldDimsIntent = WorldPropSizeIntent(axis: dimsIntent.axis.rawValue, meters: dimsIntent.meters,
+                                            source: dimsIntent.source.rawValue)
+  check(worldDimsIntent != nil,
+      "三轴意图必须能落进世界状态（实测 \(String(describing: worldDimsIntent))：nil ⇒ 意图被静默丢掉）")
+
+  // 真机那份生成网格：`TaskService/0C285296-9164-4A2B-8FB7-6648E549A4AE.glb` 的**逐顶点**实测值。
+  let measuredMesh = WorldVector3(x: 1.007901, y: 0.628927, z: 1.007904)
+  let measuredMeshMin = SIMD3<Float>(-0.503954, -0.314110, -0.503955)
+  let measuredMeshMax = SIMD3<Float>(0.503946, 0.314817, 0.503950)
+  // 托盘那一步用的是同一个映射（`PropSizeIntent.Axis.policyAxis`，在 WishMachineOutputRenderer.swift）。
+  let trayAxis: WorldPropSizeAxis = dimsIntent.axis == .longest ? .longest : .height
+  let trayResolution = WorldPropSizePolicy.intended(
+      sourceExtent: measuredMesh, axis: trayAxis, meters: Float(dimsIntent.meters))
+  check(trayResolution != nil, "托盘必须能把这件电视归一成世界尺寸（实测 nil ⇒ 现场那句「尺寸无效」）")
+  check(trayResolution.map { abs(WorldPropSizePolicy.longestEdge(of: $0.size) - 1.443) < 1e-5 } ?? false,
+      "托盘归一后的最长边必须 = 1.443 米（实测 \(String(describing: trayResolution?.size))）")
+  // 「描述符非 nil」在这里的机械形态：能算出放置矩阵 = 这一件真的画得出来。
+  let trayTransform = trayResolution.flatMap { resolution in
+      try? WishMachineOutputPlacement.transform(
+          minimum: measuredMeshMin, maximum: measuredMeshMax,
+          targetHeight: resolution.size.y, outlet: .zero)
+  }
+  check(trayTransform != nil, "托盘上这件必须能算出放置矩阵（描述符非 nil）")
+  // 那条**不成立的不等式**本身：毫米当米（1443）超出了 `0.01—100` 米。
+  check(WorldPropSizePolicy.intended(sourceExtent: measuredMesh, axis: trayAxis, meters: 1443) == nil,
+      "毫米当米（1443 米）必须归不出来 —— 这就是现场那条判据")
+  let namedRejection = WishMachineOutputError.invalidDimensions(WishMachineDimensionRejection(
+      field: "size_intent.longest.meters", value: 1443, expected: "0.01—100 米"))
+  check(namedRejection.localizedDescription.contains("size_intent.longest.meters")
+      && namedRejection.localizedDescription.contains("1443"),
+      "尺寸无效类失败必须带字段与数值（实测 \(namedRejection.localizedDescription)）")
+
+  // ── 同一件电视在权威里的记录：拼出来的 == 声明出来的 == 渲染端量出来的 ──────────
+  //
+  // 几何侧那本账是**对的**（真机那份 assetID 就是 `sha256:05bc11fe…`、2408 字节）：这一条
+  // 把它逐位钉住，免得"修根因"顺手改坏几何，也钉住"画面、判据、碰撞盒只有一份尺寸"。
+  let tvSpec = WorldPropSizeMillimeters(x: 1443, y: 862, z: 302)!
+  let tv = try WorldPrimitiveTelevision(millimeters: tvSpec)
+  let tvProp = tv.generatedProp(objectID: "wish-prop-television", sourceWishID: "wish-television")
+  check(tvProp.isValid, "基础几何电视的物件记录必须合法")
+  check(tvProp.size == tv.size && tvProp.sourceHeight == tv.size.y,
+      "声明出来的 size 必须就是拼出来的那一份（实测 \(tvProp.size) / \(tvProp.sourceHeight)）")
+  check(abs(tvProp.size.x - 1.443) < 1e-5 && abs(tvProp.size.y - 0.862) < 1e-5
+        && abs(tvProp.size.z - 0.302) < 1e-5,
+      "三轴必须逐位是 1.443 × 0.862 × 0.302（实测 \(tvProp.size)）")
+  check(abs(tv.minimum.y) <= 1e-5 && abs(tvProp.size.y / tvProp.sourceHeight - 1) < 1e-6,
+      "必须落地（min.y = 0）且 size.y / sourceHeight = 1（画面、判据、碰撞盒同一个数）")
+  // 「量出来的 == 拼出来的」这条判据本身（与 app 侧那一行同一个口径：逐分量 ≤ 0.002 米）。
+  func tvBoundsMatches(_ extent: SIMD3<Float>, _ size: WorldVector3) -> Bool {
+      abs(extent.x - size.x) <= 0.002 && abs(extent.y - size.y) <= 0.002 && abs(extent.z - size.z) <= 0.002
+  }
+  if let measured = PrimitiveGLBBounds.measure(tv.assetBytes) {
+      let measuredExtent = measured.maximum - measured.minimum
+      check(tv.assetBytes.count == 2408
+            && tv.assetID == "sha256:05bc11fe2ece91bc6baa1cbb0866683cf01600386e456df9dcf497ef29ffd76f",
+          "基础几何电视的字节必须还是内容寻址那一份（实测 \(tv.assetBytes.count) 字节 / \(tv.assetID)）")
+      check(tvBoundsMatches(measuredExtent, tv.size),
+          "渲染端量出来的包围盒必须就是拼出来的那一份（实测 \(measuredExtent) vs \(tv.size)，容差 0.002）")
+      check(abs(measured.minimum.y - tv.minimum.y) <= 0.002,
+          "渲染端量出来的底必须落在 y = 0（实测 \(measured.minimum.y)）")
+      // 注入负对照（数值）：同一个判据，把**一个分量**改掉 0.01 米（> 0.002）⇒ 必须变红。
+      var perturbedExtent = measuredExtent; perturbedExtent.z += 0.01
+      check(!tvBoundsMatches(perturbedExtent, tv.size),
+          "注入负对照：把量出来的 z 改 0.01 米 ⇒ 「量出来的 == 拼出来的」必须不成立")
+      check(!tvBoundsMatches(measuredExtent, WorldVector3(x: tv.size.x, y: tv.size.y,
+                                                          z: tv.size.z + 0.01)),
+          "注入负对照：把声明的 z 改 0.01 米 ⇒ 同一条判据必须不成立")
+  } else {
+      check(false, "基础几何电视的资产字节量不出包围盒（GLB 解不开 ⇒ 画不出来）")
+  }
+  // 幂等：同一份记录编码两次逐字节相同 ⇒ 重放不会产生第二条。
+  let propEncoder = JSONEncoder(); propEncoder.outputFormatting = [.sortedKeys]
+  let tvFirst = try propEncoder.encode(tvProp), tvSecond = try propEncoder.encode(tvProp)
+  check(tvFirst == tvSecond, "同一份记录编码两次必须逐字节相同（幂等重放不产生第二条）")
+  let tvDecoded = try JSONDecoder().decode(WorldGeneratedProp.self, from: tvFirst)
+  check(tvDecoded == tvProp && tvDecoded.primitive?.sizeMeters == tv.size,
+      "同形编码必须读回同一份（三轴回读 \(String(describing: tvDecoded.primitive?.millimeters))）")
 
   finish()
  }

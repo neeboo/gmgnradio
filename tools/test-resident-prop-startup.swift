@@ -73,6 +73,8 @@ require(!sync.contains("Task.sleep"),
 let harness = #"""
 import Foundation
 
+\#(declaration("struct WishMachineDimensionRejection", in: descriptorSource))
+
 \#(declaration("enum WishMachineOutputError", in: descriptorSource))
 
 \#(declaration("enum ResidentPropStartupRecovery", in: storeSource))
@@ -133,7 +135,14 @@ struct CorruptLocalAsset: LocalizedError {
         check(ResidentPropStartupRecovery.action(rendererReady: true, error: CorruptLocalAsset()) ==
               .report("已领取物件的本地文件缺失或校验失败，没有删除或重新生成，请检查许愿任务。"),
               "corrupt local asset must still report")
-        for error: WishMachineOutputError in [.invalidAsset, .invalidDimensions, .textureBudget, .invalidTexture] {
+        // 尺寸拒绝现在**自己带字段与数值**（`WishMachineDimensionRejection`）：这里连那句
+        // 用户看得见的文案一起钉住 —— 只留一句"尺寸无效"就等于现场又回到查不出哪一条判据。
+        let dimensionRejection = WishMachineOutputError.invalidDimensions(
+            WishMachineDimensionRejection(field: "size.y", value: 0, expected: "> 0 米"))
+        check(dimensionRejection.localizedDescription.contains("size.y")
+              && dimensionRejection.localizedDescription.contains("期望"),
+              "尺寸无效类失败必须带字段与数值（实测 \(dimensionRejection.localizedDescription)）")
+        for error: WishMachineOutputError in [.invalidAsset, dimensionRejection, .textureBudget, .invalidTexture] {
             check(ResidentPropStartupRecovery.action(rendererReady: true, error: error) ==
                   .report(error.localizedDescription),
                   "\(error) must still report its real message")
