@@ -150,7 +150,11 @@ enum WorldScreenEmbedPolicy {
             guard path.hasPrefix("/video/") else { return nil }
             let id = String(path.dropFirst("/video/".count))
             guard isBilibiliVideoID(id) else { return nil }
-            return "https://player.bilibili.com/player.html?bvid=\(id)&autoplay=0"
+            // **不带任何播放参数**：换写只负责"把 id 搬到站方嵌入页"，自动播放这类
+            // 参数一个都不许从这里出去。它们的**唯一**出口是承载页
+            // （`WorldScreenEmbedPage.officialPlayerParameters`）—— 我们自己写进链接的
+            // 那个「不要自动播」正是真机 2026-10-02「B 站起得来但不播」的根因。
+            return "https://player.bilibili.com/player.html?bvid=\(id)"
         default:
             return nil
         }
@@ -160,7 +164,8 @@ enum WorldScreenEmbedPolicy {
     static func embedURL(forBareID raw: String) -> String? {
         let id = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if isBilibiliVideoID(id) {
-            return "https://player.bilibili.com/player.html?bvid=\(id)&autoplay=0"
+            // 同上：裸 id 也只换写成站方嵌入页，播放参数由承载页那一处追加。
+            return "https://player.bilibili.com/player.html?bvid=\(id)"
         }
         if isYouTubeVideoID(id) {
             return "https://www.youtube.com/embed/\(id)"

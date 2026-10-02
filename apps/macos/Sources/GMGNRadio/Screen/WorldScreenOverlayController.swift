@@ -11,27 +11,35 @@ private let overlaySignposter = OSSignposter(
     subsystem: "ai.gmgn.radio", category: .pointsOfInterest
 )
 
-// MARK: - 覆盖层宿主：**不吃任何指针事件**
+// MARK: - 覆盖层宿主：默认**不吃任何指针事件**
 
 /// 覆盖层的容器视图。
 ///
-/// `hitTest` 恒返回 `nil` —— 这个视图与它的整棵子树（包括 `WKWebView`）**永远收不到**
-/// 任何鼠标事件。这是"不抢场景鼠标"这条红线的**唯一**实现点，所以它只有一处。
+/// **默认关着**：`hitTest` 恒返回 `nil` —— 这个视图与它的整棵子树（包括 `WKWebView`）
+/// **永远收不到**任何鼠标事件。这是"不抢场景鼠标"这条红线的**唯一**实现点，所以它只有一处。
 ///
-/// 为什么不做"显式进入操作电视模式"那条路：场景指针的所有权由
-/// `ResidentPropEditorState.consumesScenePointer(isOpen:moving:inputOwnsFocus:)` 一处裁决，
-/// 它的**签名**是红线（`tools/test-stage-resident-chat.swift` 逐字断言），14 条
-/// `场景输入链[N]` 也全都锚在它周围。要在这里插一条"操作电视"分支，就得改那条判据的
-/// 输入或它的调用点 —— 收益（在电视上点网页）远小于风险（装修的点击/拖动/旋转
-/// 与相机操作同时失效，正是 2026-09-29 那三个症状的同一族）。
+/// 唯一能让它开始接事件的动作是**用户显式进入「操作屏幕」模式**
+/// （`WorldScreenOverlayController.setScreenOperation(_:)`），此时 `acceptsScreenPointer`
+/// 被置位、`hitTest` 才走 `super`，点击落到网页里；`Esc`（或再点一次那个开关）立刻退出。
+/// 开关本身是**一个显式输入**，不是"看情况自动判断"—— 默认值就是关，所以不进入这个模式时
+/// 覆盖层的行为与它出现之前逐字相同。
 ///
-/// 所以本切片里电视**是显示屏，不是输入设备**：开关与换片走面板（`ScreenPanel`）
-/// 与 agent 工具（`play_screen` / `stop_screen`）。将来要开交互，正确做法是给
-/// `consumesScenePointer` 增加一个**新的显式输入**并同步 14 条链的断言，
-/// 那是独立的一轮工作，不是顺带塞进来的。
+/// 为什么不在这里覆写 `mouseDown` / `keyDown` 这些入口：那会绕开场景的 14 条
+/// `场景输入链[N]`（`tools/test-resident-screen-overlay.swift` 的断言 3 逐字钉着
+/// "一个指针/键盘入口都不许有"）。这里只回答**一个**问题——"这个点是不是网页的？"——
+/// 而这个问题在场景那一侧早就有唯一答案：`StageWorldInteractionView.mouseMoved` 的
+/// hitTest 守卫（`场景输入链[3]`）本来就是为"上面有别的视图"写的。于是场景的指针链
+/// 让路**不需要第二处判据**，`consumesScenePointer` 的签名、调用点与语义一个字都不动。
 @MainActor
 final class WorldScreenOverlayContainer: NSView {
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    /// 「操作屏幕」模式的开关。**默认关闭**（`false` ⇒ `hitTest` 恒 `nil`）。
+    var acceptsScreenPointer = false
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard acceptsScreenPointer else { return nil }
+        return super.hitTest(point)
+    }
+
     override var acceptsFirstResponder: Bool { false }
 }
 
@@ -394,6 +402,64 @@ final class WorldScreenOverlayController {
     private weak var hostView: NSView?
     var onSurfaceStateChange: (@MainActor (String, WorldScreenSurfaceState) -> Void)?
 
+    /// 「操作屏幕」模式：**默认关闭**。只有它是 `true` 时，各屏的容器才接受鼠标事件。
+    ///
+    /// 这是"偶尔点一下网页里的按钮"与"默认绝不影响场景"之间**唯一**的开关：它不进
+    /// `consumesScenePointer`（那条判据的签名、调用点、语义一个字不改），也不给覆盖层
+    /// 加任何指针/键盘入口 —— 它只改一件事：容器 `hitTest` 从现在起会不会返回自己。
+    private(set) var isOperatingScreen = false
+    /// 进入/退出时通知宿主（按钮外观与"正在操作电视"提示条读它）。
+    var onScreenOperationChange: (@MainActor (Bool) -> Void)?
+    /// `Esc` 的局部监听器。只在模式开着的时候挂着，退出即摘。
+    private var escapeMonitor: Any?
+
+    /// 至少一块屏幕**有东西**（在放或在载）。入口按钮的可用性读它 —— 一块屏幕都没有时
+    /// 那个开关是灰的，所以它不会变成常驻噪音。
+    var hasLiveScreen: Bool {
+        surfaces.values.contains { $0.state.isPlaying || $0.state.isLoading }
+    }
+
+    /// 进入 / 退出「操作屏幕」。两个方向都是**显式**的：没有"看情况自动进入"。
+    func setScreenOperation(_ active: Bool) {
+        guard isOperatingScreen != active else { return }
+        isOperatingScreen = active
+        for surface in surfaces.values { surface.container.acceptsScreenPointer = active }
+        if active { installEscapeMonitor() } else { removeEscapeMonitor() }
+        onScreenOperationChange?(active)
+    }
+
+    /// `Esc`（或点「完成」）立刻退出，恢复"不吃事件"。
+    func endScreenOperation() {
+        setScreenOperation(false)
+    }
+
+    /// `Esc` 的局部监听器：**只读、只对 `Esc` 生效**，其它按键原样返回（不消费、不改写）。
+    ///
+    /// 为什么不能用容器的 `keyDown`：那会给覆盖层加一个键盘入口，正是断言 3 禁掉的东西；
+    /// 而且点击进网页之后第一响应者是 `WKWebView`，键盘根本不会走到容器。
+    private func installEscapeMonitor() {
+        guard escapeMonitor == nil else { return }
+        escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard event.keyCode == 53 else { return event }
+            guard let self, self.isOperatingScreen else { return event }
+            self.endScreenOperation()
+            return nil
+        }
+    }
+
+    private func removeEscapeMonitor() {
+        guard let escapeMonitor else { return }
+        NSEvent.removeMonitor(escapeMonitor)
+        self.escapeMonitor = nil
+    }
+
+    /// 屏幕上没有活的东西了（关掉 / 被收回 / 世界退出）⇒ 模式自动退出：
+    /// 留着它只会让"用户在操作一块已经不存在的屏幕"这个状态悬在那儿。
+    private func endScreenOperationIfNothingLive() {
+        guard isOperatingScreen, !hasLiveScreen else { return }
+        endScreenOperation()
+    }
+
     init(hostView: NSView) {
         self.hostView = hostView
     }
@@ -404,8 +470,11 @@ final class WorldScreenOverlayController {
         let surface = WorldScreenSurface(objectID: objectID)
         surface.onStateChange = { [weak self] state in
             self?.onSurfaceStateChange?(objectID, state)
+            self?.endScreenOperationIfNothingLive()
         }
         surface.container.identifier = NSUserInterfaceItemIdentifier("stage.screen-overlay")
+        // 模式开着的时候新建的屏幕也要跟上：否则"进入模式后再放一部"的那块屏点不到。
+        surface.container.acceptsScreenPointer = isOperatingScreen
         surface.container.wantsLayer = true
         surface.container.layer?.zPosition = 1.6
         surface.container.autoresizingMask = []
@@ -439,6 +508,8 @@ final class WorldScreenOverlayController {
         lastMaskRecompute[objectID] = nil
         renderedSizes[objectID] = nil
         occlusionStats[objectID] = nil
+        // 被移除的那块正好是最后一块活着的屏幕 ⇒ 模式跟着退出（Esc/开关之外的第三条收场路）。
+        endScreenOperationIfNothingLive()
     }
 
     func removeAll() {
@@ -708,6 +779,9 @@ final class WorldScreenOverlayController {
 
     /// 世界不可见时（Live Cam / 世界未呈现）整块收起来，并**暂停**媒体。
     func setWorldVisible(_ visible: Bool) {
+        // 世界都退出去了就没有"正在操作的那块屏"：模式必须跟着收，否则它会以"开着但
+        // 什么都点不到"的形态留到下一次进世界（用户看到的就是"场景坏了"）。
+        if !visible { endScreenOperation() }
         for surface in surfaces.values {
             if visible {
                 surface.container.isHidden = false

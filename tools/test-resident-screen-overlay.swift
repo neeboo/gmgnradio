@@ -4,10 +4,13 @@
 //
 //   1. 屏幕几何只有一处定义、可手动覆盖；推断不出来时**可见说明**（不硬猜）；
 //   2. 覆盖层与屏幕四边形**几何一致**（给数字与容差）；相机移动后仍对齐；
-//   3. **不抢场景鼠标**（注入"覆盖层吃事件" ⇒ 本 harness 必须 FAIL）；
+//   3. **默认不抢场景鼠标**（「操作屏幕」开关默认关 ⇒ 关着时 `hitTest` 恒 nil；
+//      注入"默认就是开" / "照常命中" / "进了模式也不给点" ⇒ 本 harness 必须 FAIL）；
 //   4. 加载失败 / 无 URL / 几何缺失 ⇒ 各自**具名可见**失败，不静默；
 //   5. 合规：只走**官方嵌入**；不许出现抓流 / 绕过登录的路径
-//      （注入一条抓流路径 ⇒ 必须 FAIL；注入一条白名单旁路 ⇒ 必须 FAIL）。
+//      （注入一条抓流路径 ⇒ 必须 FAIL；注入一条白名单旁路 ⇒ 必须 FAIL）；
+//   5b. 播放参数**只有一个出口**（`WorldScreenEmbedOrigin.officialPlayerParameters`）：
+//      换写/裸 id 交出来的链接里一个播放参数都不许有（注入"塞回一个" ⇒ 必须 FAIL）。
 //
 // 手法沿袭仓里既有的离线 harness：
 //   * 生产源码**原文**切片（不是在这儿抄一份）——`productionDeclaration` 按花括号配对切；
@@ -59,10 +62,33 @@ func productionDeclaration(_ signature: String, in text: String) -> String {
 
 /// 「这个覆盖层会不会抢场景鼠标」的**唯一**判据。文本级，因为要看的是
 /// "有没有覆写指针入口"这件事本身 —— 它一旦出现，14 条 `场景输入链[N]` 就会被绕开。
+///
+/// 2026-10-03：用户点不到网页里的按钮（覆盖层 `hitTest` 恒 `nil` 是红线的代价），
+/// 于是多了「操作屏幕」这个**显式、默认关**的开关。判据的三条不变强也不变弱：
+///   ① **默认必须是关**（`var acceptsScreenPointer = false`）；
+///   ② 关着的时候必须**明确宣称不吃事件**（`guard acceptsScreenPointer else { return nil }`）；
+///   ③ 开着的时候才把点交给子树（`return super.hitTest(point)`）—— 否则"进入后能点网页"
+///      是假的。
+/// 一个指针/键盘入口都不许新增（下表照旧），所以场景那 14 条链一个字都不用改。
 func overlayPointerVerdict(_ source: String) -> [String] {
     var problems: [String] = []
-    if !source.contains("override func hitTest(_ point: NSPoint) -> NSView? { nil }") {
-        problems.append("覆盖层容器没有 `override func hitTest(_ point: NSPoint) -> NSView? { nil }`：它没有明确宣称「不吃事件」")
+    if !source.contains("var acceptsScreenPointer = false") {
+        problems.append(
+            "覆盖层容器的「操作屏幕」开关不是**默认关闭**（`var acceptsScreenPointer = false`）"
+                + "：不进入这个模式时它必须恒不吃事件"
+        )
+    }
+    if !source.contains("guard acceptsScreenPointer else { return nil }") {
+        problems.append(
+            "覆盖层容器没有 `guard acceptsScreenPointer else { return nil }`："
+                + "它没有明确宣称「默认不吃事件」"
+        )
+    }
+    if !source.contains("return super.hitTest(point)") {
+        problems.append(
+            "覆盖层容器进入「操作屏幕」模式后没有把点交给子树（`return super.hitTest(point)`）："
+                + "网页永远收不到点击"
+        )
     }
     let forbidden = [
         "override func mouseDown", "override func mouseDragged", "override func mouseUp",
@@ -742,7 +768,7 @@ final class StubScreenControl: WorldScreenControlling {
             ("dQw4w9WgXcQ", "https://www.youtube.com/embed/dQw4w9WgXcQ"),
             ("https://player.bilibili.com/player.html?bvid=BV1xx411c7mD",
              "https://player.bilibili.com/player.html?bvid=BV1xx411c7mD"),
-            ("BV1xx411c7mD", "https://player.bilibili.com/player.html?bvid=BV1xx411c7mD&autoplay=0"),
+            ("BV1xx411c7mD", "https://player.bilibili.com/player.html?bvid=BV1xx411c7mD"),
         ]
         for (raw, expected) in accepted {
             switch WorldScreenEmbedPolicy.validate(raw) {
@@ -761,6 +787,41 @@ final class StubScreenControl: WorldScreenControlling {
                 "断言5：哔哩哔哩公开观看链接被换写成**站方播放器**（\(url.absoluteString)）")
         } else {
             expect(false, "断言5：哔哩哔哩公开观看链接应当被换写成官方播放器")
+        }
+
+        // =============================================================
+        // 断言 5b：播放参数**只有一个出口**
+        // =============================================================
+        //
+        // 白名单（`WorldScreenEmbedPolicy.validate`）交出来的链接里**一个播放参数都不许有**。
+        // 真机 2026-10-02：我们自己写进 B 站链接的 `autoplay=0` 就是「播放器起得来但不播」
+        // 的根因；而站方读的是**第一个**同名参数，所以"换写时塞一个、承载页再补一个"
+        // 这种两处出口的写法**必然**把承载页那一份废掉。播放参数的唯一出口是承载页的
+        // `WorldScreenEmbedOrigin.officialPlayerParameters`。
+        let playbackParameterNames: Set<String> = [
+            "autoplay", "mute", "muted", "controls", "loop", "start", "end",
+            "playsinline", "parent", "enablejsapi", "origin", "rel", "modestbranding",
+        ]
+        let sourceLinkInputs = [
+            "https://www.youtube.com/embed/dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "dQw4w9WgXcQ",
+            "https://www.bilibili.com/video/BV1xx411c7mD",
+            "https://player.bilibili.com/player.html?bvid=BV1xx411c7mD",
+            "BV1xx411c7mD",
+        ]
+        for input in sourceLinkInputs {
+            guard case let .success(url) = WorldScreenEmbedPolicy.validate(input) else {
+                expect(false, "断言5b：合法的官方嵌入「\(input)」被拒了")
+                continue
+            }
+            let names = (URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems ?? []).map(\.name)
+            let offenders = names.filter { playbackParameterNames.contains($0.lowercased()) }
+            expect(offenders.isEmpty,
+                "断言5b：换写/裸 id 交出来的链接里不许有播放参数（「\(input)」⇒ \(url.absoluteString)"
+                    + " 带 \(offenders)）：播放参数只有承载页一个出口")
         }
 
         // =============================================================
@@ -1262,28 +1323,129 @@ check(occlusionProbeWholeBlock.status != 0,
 let overlaySource = try read(screenRoot.appendingPathComponent("WorldScreenOverlayController.swift"))
 let overlayProblems = overlayPointerVerdict(overlaySource)
 check(overlayProblems.isEmpty,
-    "断言3：覆盖层不吃场景鼠标（容器 hitTest 恒 nil，且没有覆写任何指针/键盘入口）"
+    "断言3：覆盖层默认不吃场景鼠标（「操作屏幕」开关默认关、关着时 hitTest 恒 nil、"
+        + "进入后才把点交给网页，且没有覆写任何指针/键盘入口）"
         + (overlayProblems.isEmpty ? "" : " —— \(overlayProblems.joined(separator: "；"))"))
 
-// 注入：把 hitTest 改成"照常命中" ⇒ 判据必须红。
-let injectedHitTest = overlaySource.replacingOccurrences(
-    of: "override func hitTest(_ point: NSPoint) -> NSView? { nil }",
-    with: "override func hitTest(_ point: NSPoint) -> NSView? { super.hitTest(point) }"
+// 注入①：**默认改成开**（开关的初值不再是 false）⇒ 判据必须红。
+// 这是「默认绝不影响场景」那一条最直接的负对照。
+let injectedDefaultOn = overlaySource.replacingOccurrences(
+    of: "var acceptsScreenPointer = false",
+    with: "var acceptsScreenPointer = true"
 )
+check(injectedDefaultOn != overlaySource,
+    "断言3（注入负对照①）：开关的默认值确实被从 `false` 改成了 `true`")
+let injectedDefaultOnProblems = overlayPointerVerdict(injectedDefaultOn)
+check(!injectedDefaultOnProblems.isEmpty,
+    "断言3（注入负对照①「默认就是开」）：判据 FAIL。原话："
+        + injectedDefaultOnProblems.joined(separator: "；"))
+
+// 注入②：去掉"关着就不吃事件"的那道闸（照常命中）⇒ 判据必须红。
+let injectedHitTest = overlaySource.replacingOccurrences(
+    of: "        guard acceptsScreenPointer else { return nil }\n        return super.hitTest(point)",
+    with: "        return super.hitTest(point)"
+)
+check(injectedHitTest != overlaySource,
+    "断言3（注入负对照②）：`guard acceptsScreenPointer else { return nil }` 确实被从副本里拿掉了")
 let injectedHitTestProblems = overlayPointerVerdict(injectedHitTest)
 check(!injectedHitTestProblems.isEmpty,
-    "断言3（注入负对照）：把覆盖层的 hitTest 改成会命中 ⇒ 判据 FAIL。原话："
+    "断言3（注入负对照②「照常命中」）：判据 FAIL。原话："
         + injectedHitTestProblems.joined(separator: "；"))
 
-// 注入：加一个 mouseDown ⇒ 判据必须红。
+// 注入③：进入模式之后**也不**把点交给子树（hitTest 恒 nil）⇒ 判据必须红：
+// 否则"进入后网页能收到点击"就是一句空话。
+let injectedNeverHit = overlaySource.replacingOccurrences(
+    of: "        guard acceptsScreenPointer else { return nil }\n        return super.hitTest(point)",
+    with: "        guard acceptsScreenPointer else { return nil }\n        return nil"
+)
+check(injectedNeverHit != overlaySource,
+    "断言3（注入负对照③）：`return super.hitTest(point)` 确实被从副本里换成了 `return nil`")
+let injectedNeverHitProblems = overlayPointerVerdict(injectedNeverHit)
+check(!injectedNeverHitProblems.isEmpty,
+    "断言3（注入负对照③「进了模式也不给点」）：判据 FAIL。原话："
+        + injectedNeverHitProblems.joined(separator: "；"))
+
+// 注入④：加一个 mouseDown ⇒ 判据必须红。
 let injectedMouseDown = overlaySource.replacingOccurrences(
     of: "override var acceptsFirstResponder: Bool { false }",
     with: "override var acceptsFirstResponder: Bool { false }\n    override func mouseDown(with event: NSEvent) { super.mouseDown(with: event) }"
 )
 let injectedMouseDownProblems = overlayPointerVerdict(injectedMouseDown)
 check(!injectedMouseDownProblems.isEmpty,
-    "断言3（注入负对照）：给覆盖层加一个 mouseDown ⇒ 判据 FAIL。原话："
+    "断言3（注入负对照④）：给覆盖层加一个 mouseDown ⇒ 判据 FAIL。原话："
         + injectedMouseDownProblems.joined(separator: "；"))
+
+// ---------------------------------------------------------------------------
+// MARK: 断言 5b（静态扫描）：播放参数的**唯一出口**是 `WorldScreenEmbedOrigin`
+// ---------------------------------------------------------------------------
+
+/// 「播放参数有几个来源」的**唯一**判据（文本级：`Screen/` 整目录一起看）。
+///
+/// 判据是"文件级唯一"而不是"函数级唯一"：`Screen/` 是这块屏幕的全部生产源码，
+/// 只要播放参数还出现在**第二个文件**里，就说明链接上又长出了一处我们自己的参数来源
+/// —— 而站方读**第一个**同名参数，两处出口必然互相废掉（真机 2026-10-02 的
+/// 「B 站起得来但不播」正是这么来的）。
+///
+/// 用不着逐字匹参数值：`autoplay=` / `mute=` 这类字面量本身就在这里出现一次都嫌多。
+let playbackParameterLiterals = [
+    "autoplay=", "mute=", "muted=", "controls=", "loop=",
+    "playsinline=", "parent=", "enablejsapi=", "modestbranding=",
+]
+
+func playbackParameterSourceVerdict(_ sources: [String: String]) -> [String] {
+    var problems: [String] = []
+    for (name, text) in sources.sorted(by: { $0.key < $1.key })
+    where name != "WorldScreenEmbedOrigin.swift" {
+        for literal in playbackParameterLiterals where text.contains(literal) {
+            problems.append(
+                "\(name) 里出现了播放参数「\(literal)」：链接上的播放参数只允许"
+                    + " `WorldScreenEmbedOrigin.officialPlayerParameters` 一个出口"
+            )
+        }
+    }
+    return problems
+}
+
+let screenSourceTexts: [String: String] = try Dictionary(
+    uniqueKeysWithValues: (screenFiles + ["WorldScreenEmbedOrigin.swift"]).map {
+        ($0, try read(screenRoot.appendingPathComponent($0)))
+    }
+)
+let playbackSourceProblems = playbackParameterSourceVerdict(screenSourceTexts)
+check(playbackSourceProblems.isEmpty,
+    "断言5b：播放参数只有一个出口（`Screen/` 里除 `WorldScreenEmbedOrigin.swift` 外"
+        + "没有任何文件写播放参数）"
+        + (playbackSourceProblems.isEmpty ? "" : " —— \(playbackSourceProblems.joined(separator: "；"))"))
+check(screenSourceTexts["WorldScreenEmbedOrigin.swift"]?.contains("officialPlayerParameters") == true,
+    "断言5b：唯一出口确实是 `WorldScreenEmbedOrigin.officialPlayerParameters`（承重墙在那儿）")
+
+// 注入：把 `autoplay=0` 塞回换写那条路 ⇒ 判据必须红（这就是真机上发生过的那一次）。
+let injectedSecondSource = screenSourceTexts.mapValues { text in
+    text.replacingOccurrences(
+        of: "return \"https://player.bilibili.com/player.html?bvid=\\(id)\"",
+        with: "return \"https://player.bilibili.com/player.html?bvid=\\(id)&autoplay=0\""
+    )
+}
+let injectedSecondSourceProblems = playbackParameterSourceVerdict(injectedSecondSource)
+check(injectedSecondSourceProblems != playbackSourceProblems,
+    "断言5b（注入负对照）：`autoplay=0` 确实被塞回了 `WorldScreenContent.swift` 的副本里")
+check(!injectedSecondSourceProblems.isEmpty,
+    "断言5b（注入负对照）：链接上出现**第二个播放参数来源** ⇒ 判据 FAIL。原话："
+        + injectedSecondSourceProblems.joined(separator: "；"))
+
+// 同一条判据在**内层程序**里也跑一遍（这次是真编起来跑的）：
+// 把 `autoplay=0` 塞回换写那条路 ⇒ 内层断言 5b 必须 FAIL（exit 1）。
+let secondPlaybackSourceInner = try innerJudgementStatus(patching: "WorldScreenContent.swift") { source in
+    source.replacingOccurrences(
+        of: "return \"https://player.bilibili.com/player.html?bvid=\\(id)\"",
+        with: "return \"https://player.bilibili.com/player.html?bvid=\\(id)&autoplay=0\""
+    )
+}
+check(secondPlaybackSourceInner.changed,
+    "断言5b（注入负对照）：`autoplay=0` 的手术确实改到了 `WorldScreenContent.swift` 的副本")
+check(secondPlaybackSourceInner.status == 1,
+    "断言5b（注入负对照）：换写里塞回 `autoplay=0` ⇒ 内层断言必须 FAIL"
+        + "（exit 1，实测 \(secondPlaybackSourceInner.status)）")
 
 // ---------------------------------------------------------------------------
 // MARK: 断言 6（覆盖层侧）：被挡的部分**真的会被裁掉**，且只走 `CALayer.mask`

@@ -184,8 +184,17 @@ func screenAppWiringProblems(_ sources: ScreenWiringSources) -> [String] {
     if !stage.contains("let screenOverlayContainer = WorldScreenOverlayContainer()") {
         problems.append("④ 舞台内容视图没有覆盖层容器")
     }
-    if !stage.contains("addSubview(screenOverlayContainer)") {
-        problems.append("④ 覆盖层容器没有加进视图树（`addSubview(screenOverlayContainer)`）：覆盖层无处可贴")
+    // 容器**只在一处**进视图树，而且必须排在交互视图**之上**：AppKit 的 `hitTest` 只看
+    // 子视图顺序、不看 `layer.zPosition`（2026-10-03 离线实测），所以"操作屏幕"模式要
+    // 真的把点交给网页，这一句就不能停在容器自己的那段初始化里。
+    // 覆盖层关着时 `hitTest` 恒 nil，顺序对场景没有任何影响。
+    if !stage.contains(
+        "addSubview(screenOverlayContainer, positioned: .above, relativeTo: worldInteractionView)"
+    ) {
+        problems.append(
+            "④ 覆盖层容器没有加进视图树（`addSubview(screenOverlayContainer, positioned: .above,"
+                + " relativeTo: worldInteractionView)`）：覆盖层无处可贴，或排在交互视图之下"
+        )
     }
     if !stage.contains("var screenOverlayHostView: NSView") {
         problems.append("④ 没有把覆盖层宿主暴露给 App（`var screenOverlayHostView: NSView`）")
@@ -262,7 +271,11 @@ enum ScreenWiringInjection: String, CaseIterable {
         case .dropTracking:
             drop("        store.startTracking()\n", from: &sources.app)
         case .dropOverlayHostSubview:
-            drop("        addSubview(screenOverlayContainer)\n", from: &sources.stage)
+            drop(
+                "        addSubview(screenOverlayContainer, positioned: .above,"
+                    + " relativeTo: worldInteractionView)\n",
+                from: &sources.stage
+            )
         case .dropToolsRegistration:
             sources.app = sources.app.replacingOccurrences(of: " + screenTools,", with: ",")
         case .duplicateConstructor:

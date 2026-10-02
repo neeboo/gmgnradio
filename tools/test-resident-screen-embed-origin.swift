@@ -163,6 +163,12 @@ let capturedDirectLoadText = "视频播放器配置错误 视频播放器配置�
 /// Twitch 顶层直载后**地址栏**的原样（它把原因写在错误码里）。
 let capturedTwitchDirectURL = "https://player.twitch.tv/embed-error.html?errorCode=NoParent"
 
+/// 从 URL 里读一个查询参数的值。**独立实现**（不调生产里的任何东西）—— 用生产的
+/// `writing(_:into:)` 去验 `playerURL` 会变成自证。
+func queryValue(_ name: String, in url: String) -> String? {
+    URLComponents(string: url)?.queryItems?.first { $0.name == name }?.value
+}
+
 @main struct Test {
     static func main() {
         // =========================================================
@@ -345,6 +351,77 @@ let capturedTwitchDirectURL = "https://player.twitch.tv/embed-error.html?errorCo
             "断言5：失败状态读得出那句人话（实测「\(state.displayText)」）")
         expect(state.isPlaying == false,
             "断言5：播放器拒绝之后**不再**自称 playing")
+
+        // =========================================================
+        // 断言 6：Twitch 的 iframe 带**官方要求的 `parent`**，且只认回环域、不含端口
+        // =========================================================
+        //
+        // 依据：Twitch 官方嵌入要求 URL 上带 `parent=<嵌它的那个域>`（不带协议、不带端口）。
+        // 实测（`tools/probe-screen-embed-playback.swift`，同一份承载页）：
+        // 不带 `parent` ⇒ 帧内跳到 `embed-error.html?errorCode=NoParent`（原文
+        // 「哎哟！该嵌入配置错误」）；带 `parent=127.0.0.1` ⇒ 错误页消失、官方播放器
+        // 自己的界面（标题 / 频道 / LIVE）画出来。
+        let twitch = "https://player.twitch.tv/?channel=eslcs"
+        let twitchSrc = WorldScreenEmbedPage.playerURL(embedURL: twitch, origin: origin)
+        expect(queryValue("parent", in: twitchSrc) == "127.0.0.1",
+            "断言6：Twitch 的 iframe 带官方要求的 parent=<承载域>"
+                + "（实测 parent=\(queryValue("parent", in: twitchSrc) ?? "nil")）")
+        expect(!(queryValue("parent", in: twitchSrc) ?? "").contains(":"),
+            "断言6：parent 只认域、**不含端口**（端口每次随机，写死就会失效）：\(twitchSrc)")
+        expect(URL(string: twitchSrc)?.host?.lowercased() == "player.twitch.tv",
+            "断言6：加参数没有换域（仍然是官方嵌入域 player.twitch.tv）")
+        // 换一个端口 ⇒ `parent` 必须**一模一样**。写死端口的话，下一次载入（换了端口）
+        // 就会失效 —— 这正是"只认域"这条判据要挡住的缺陷。
+        let otherOrigin = WorldScreenEmbedOrigin.originString(port: 60123)
+        let twitchOther = WorldScreenEmbedPage.playerURL(embedURL: twitch, origin: otherOrigin)
+        expect(queryValue("parent", in: twitchOther) == queryValue("parent", in: twitchSrc),
+            "断言6：端口从 \(origin) 换成 \(otherOrigin)，parent 一个字不变"
+                + "（实测 \(queryValue("parent", in: twitchOther) ?? "nil")）")
+        expect(twitchOther != twitchSrc,
+            "断言6：两次载入的 `origin` 参数确实不同（随机端口真的进了 origin，没进 parent）")
+
+        // =========================================================
+        // 断言 7：B 站 / YouTube 的**官方嵌入参数**让播放真的开始
+        // =========================================================
+        //
+        // 为什么非自动播不可：覆盖层 `hitTest` 恒 `nil`（红线），**页面里的播放按钮
+        // 用户点不到**。实测（量 `currentTime` 有没有前进，见 `tools/probe-screen-embed-playback.swift`）：
+        //   * 哔哩哔哩 `BV1xx411c7mD`：`autoplay=0` ⇒ 停在 0.6 秒（播放器起来时那一次
+        //     预览 seek）不再前进；`autoplay=1` ⇒ 19.3 秒里前进 19.3 秒；
+        //   * YouTube `aPcL35kgL6A`：**不带参数** ⇒ 全程 0.0（只有封面，"出画"出的是封面）；
+        //     `autoplay=1` ⇒ 16.3 秒里前进 16.3 秒、`paused=false` / `readyState=4`，
+        //     而且**不静音**也照样播。
+        let bilibiliRaw = "https://player.bilibili.com/player.html?bvid=BV1xx411c7mD&autoplay=0"
+        let bilibiliSrc = WorldScreenEmbedPage.playerURL(embedURL: bilibiliRaw, origin: origin)
+        expect(queryValue("autoplay", in: bilibiliSrc) == "1",
+            "断言7：B 站的 iframe 自动播放 = 1（**覆盖**链接里那个 autoplay=0）：\(bilibiliSrc)")
+        expect(bilibiliSrc.components(separatedBy: "autoplay=").count - 1 == 1,
+            "断言7：autoplay 只出现一次（同名参数站方读第一个 ⇒ 只追加等于没写）：\(bilibiliSrc)")
+        expect(queryValue("bvid", in: bilibiliSrc) == "BV1xx411c7mD"
+                && URL(string: bilibiliSrc)?.host?.lowercased() == "player.bilibili.com",
+            "断言7：官方参数没有动视频 id 与主机（白名单零放宽）")
+        // 用户直接粘官方嵌入页（链接里没有 autoplay）也必须被补上。
+        let bilibiliBare = "https://player.bilibili.com/player.html?bvid=BV1xx411c7mD"
+        expect(queryValue("autoplay", in: WorldScreenEmbedPage.playerURL(
+                embedURL: bilibiliBare, origin: origin)) == "1",
+            "断言7：链接里没有 autoplay 时也补上 = 1（不靠站方的默认值）")
+
+        for host in ["www.youtube.com", "www.youtube-nocookie.com"] {
+            let youtubeSrc = WorldScreenEmbedPage.playerURL(
+                embedURL: "https://\(host)/embed/aPcL35kgL6A", origin: origin
+            )
+            expect(queryValue("autoplay", in: youtubeSrc) == "1",
+                "断言7：\(host) 的 iframe 自动播放 = 1（实测 \(youtubeSrc)）")
+            expect(queryValue("mute", in: youtubeSrc) == nil,
+                "断言7：\(host) **不**默认静音（实测不静音也能自动播；这块屏幕是电视、"
+                    + "这台 app 是电台，能出声就不该先把它静掉）")
+            expect(URL(string: youtubeSrc)?.path == "/embed/aPcL35kgL6A",
+                "断言7：官方参数没有动嵌入路径 / 视频 id")
+        }
+        // 加参数**不是**放行：不在表里的站一个参数都不加（放行与否只看白名单）。
+        expect(WorldScreenEmbedPage.officialPlayerParameters(
+                embedURL: "https://evil.example/watch", origin: origin).isEmpty,
+            "断言7：不在表里的站一个参数都不加（加参数不是放宽白名单）")
 
         // 给外层文本判据递材料：承载页原文（base64，避开换行）与实测来源取样。
         print("HTML-SAMPLE " + Data(html.utf8).base64EncodedString())
@@ -609,7 +686,7 @@ reportFailures(bypassInjection.output)
 /// ⑩ 承载页把 iframe 改指向别的域 ⇒ 断言 3 必须红。
 let rewriteInjection = try runEmbedProbe(patches: [(
     file: "WorldScreenEmbedOrigin.swift",
-    from: "return embedURL + separator + \"enablejsapi=1&origin=\" + encodedOrigin",
+    from: "return url + separator + \"enablejsapi=1&origin=\" + encodedOrigin",
     to: "return \"https://r1---sn-x.googlevideo.com/videoplayback\" + separator"
         + " + \"enablejsapi=1&origin=\" + encodedOrigin"
 )])
@@ -619,6 +696,60 @@ check(rewriteInjection.note.isEmpty && rewriteInjection.status == 1
         + "（exit \(rewriteInjection.status)）"
         + (rewriteInjection.note.isEmpty ? "" : " —— \(rewriteInjection.note)"))
 reportFailures(rewriteInjection.output)
+
+/// ⑪ 去掉 Twitch 的 `parent` ⇒ 断言 6 必须红（那就是回到 `NoParent`）。
+let parentDropInjection = try runEmbedProbe(patches: [(
+    file: "WorldScreenEmbedOrigin.swift",
+    from: "            return [\"parent=\" + parentDomain(of: origin)]",
+    to: "            return []"
+)])
+check(parentDropInjection.note.isEmpty && parentDropInjection.status == 1
+        && parentDropInjection.output.contains("带官方要求的 parent"),
+    "断言6（注入负对照「删掉 Twitch 的 parent」）：探针必须红在 parent 这一条上"
+        + "（exit \(parentDropInjection.status)）"
+        + (parentDropInjection.note.isEmpty ? "" : " —— \(parentDropInjection.note)"))
+reportFailures(parentDropInjection.output)
+
+/// ⑫ 把**随机端口**写进 `parent` ⇒ 断言 6 必须红。
+///
+/// 这条注入不是找茬：端口每次载入都换，写死它就是"这一次能放、下一次不能放"。
+let parentPortInjection = try runEmbedProbe(patches: [(
+    file: "WorldScreenEmbedOrigin.swift",
+    from: "        URL(string: origin)?.host?.lowercased() ?? WorldScreenEmbedOrigin.loopbackHost",
+    to: "        origin.replacingOccurrences(of: \"http://\", with: \"\")"
+)])
+check(parentPortInjection.note.isEmpty && parentPortInjection.status == 1
+        && parentPortInjection.output.contains("不含端口"),
+    "断言6（注入负对照「把随机端口写进 parent」）：探针必须红在「只认域、不含端口」这一条上"
+        + "（exit \(parentPortInjection.status)）"
+        + (parentPortInjection.note.isEmpty ? "" : " —— \(parentPortInjection.note)"))
+reportFailures(parentPortInjection.output)
+
+/// ⑬ 去掉 B 站的 `autoplay=1` ⇒ 断言 7 必须红（回到"停在封面上"那一次实测）。
+let bilibiliAutoplayInjection = try runEmbedProbe(patches: [(
+    file: "WorldScreenEmbedOrigin.swift",
+    from: "            return [\"autoplay=1\"]\n        case \"player.twitch.tv\":",
+    to: "            return []\n        case \"player.twitch.tv\":"
+)])
+check(bilibiliAutoplayInjection.note.isEmpty && bilibiliAutoplayInjection.status == 1
+        && bilibiliAutoplayInjection.output.contains("B 站的 iframe 自动播放 = 1"),
+    "断言7（注入负对照「去掉 B 站的 autoplay=1」）：探针必须红在 B 站自动播放这一条上"
+        + "（exit \(bilibiliAutoplayInjection.status)）"
+        + (bilibiliAutoplayInjection.note.isEmpty ? "" : " —— \(bilibiliAutoplayInjection.note)"))
+reportFailures(bilibiliAutoplayInjection.output)
+
+/// ⑭ 去掉 YouTube 的 `autoplay=1` ⇒ 断言 7 必须红（回到"只有封面"那一次实测）。
+let youtubeAutoplayInjection = try runEmbedProbe(patches: [(
+    file: "WorldScreenEmbedOrigin.swift",
+    from: "            return [\"autoplay=1\"]\n        case \"player.bilibili.com\":",
+    to: "            return []\n        case \"player.bilibili.com\":"
+)])
+check(youtubeAutoplayInjection.note.isEmpty && youtubeAutoplayInjection.status == 1
+        && youtubeAutoplayInjection.output.contains("www.youtube.com 的 iframe 自动播放 = 1"),
+    "断言7（注入负对照「去掉 YouTube 的 autoplay=1」）：探针必须红在 YouTube 自动播放这一条上"
+        + "（exit \(youtubeAutoplayInjection.status)）"
+        + (youtubeAutoplayInjection.note.isEmpty ? "" : " —— \(youtubeAutoplayInjection.note)"))
+reportFailures(youtubeAutoplayInjection.output)
 
 print(failureCount == 0 ? "PASS 嵌入来源判据全部通过" : "FAIL 嵌入来源判据有 \(failureCount) 条不通过")
 exit(failureCount == 0 ? 0 : 1)

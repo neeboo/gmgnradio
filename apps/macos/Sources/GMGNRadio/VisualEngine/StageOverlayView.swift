@@ -2668,7 +2668,10 @@ enum StageControlPanelLayout {
     static let sideInset: CGFloat = 4
     static let groupGap: CGFloat = 6
     static let settingsWidth: CGFloat = 68
-    static let transportWidth: CGFloat = 8 * controlSize + settingsWidth + 2 * sideInset + 2 * groupGap + 1
+    // 9 个常规按钮（含「操作屏幕」—— 只在有屏幕在放时才亮起）+「设置」的宽度 +
+    // 两侧内衬 + 两道分组间距。第 10 个常规按钮（窗口模式）由 `StageContentView`
+    // 那条约束里的 `+ controlSize` 记。
+    static let transportWidth: CGFloat = 9 * controlSize + settingsWidth + 2 * sideInset + 2 * groupGap + 1
 }
 
 enum StageActivityAvailability {

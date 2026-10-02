@@ -1252,6 +1252,20 @@ final class AppDelegate:
             }
         )
         store.startTracking()
+        // 「操作屏幕」那个入口：底部控制条上的按钮 → 覆盖层，覆盖层的进出 → 按钮与提示条。
+        // 两边都只认这一条线（舞台不认识覆盖层，覆盖层不认识舞台的控件），
+        // 而"要不要接受鼠标事件"这件事只有覆盖层自己那一处开关说了算。
+        controller.onToggleScreenOperation = { [weak overlay] in
+            overlay?.setScreenOperation(overlay?.isOperatingScreen != true)
+        }
+        overlay.onScreenOperationChange = { [weak self] active in
+            self?.stageWindowController?.setScreenOperationActive(active)
+        }
+        overlay.onSurfaceStateChange = { [weak self, weak overlay] _, _ in
+            self?.stageWindowController?.setScreenOperationAvailable(overlay?.hasLiveScreen == true)
+        }
+        stageWindowController?.setScreenOperationAvailable(overlay.hasLiveScreen)
+        stageWindowController?.setScreenOperationActive(overlay.isOperatingScreen)
         // 电视面板已从产品界面移除（用户要求：左下角那块电视面板不应该出现）。
         // 这里只接**覆盖层**（屏幕画面本体）与 store（三条 agent 工具的注入源）；
         // 面板视图保留在 `Screen/ScreenPanel.swift`，但产品路径上没有挂载 / 显示入口。

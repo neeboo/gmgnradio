@@ -115,14 +115,88 @@ enum WorldScreenEmbedPage {
     })();
     """
 
-    /// 官方嵌入 URL → 播放器 src。**只追加官方 API 的两个参数**，主机 / 路径 / 视频 id
-    /// 一个字节都不动（白名单判的是那三样，这里不许重写它们）。
+    /// 官方嵌入 URL → 播放器 src。
+    ///
+    /// **只追加站方公开的嵌入参数**，主机 / 路径 / 视频 id 一个字节都不动 —— 白名单判的
+    /// 就是那三样，`officialPlayerParameters` 里也没有任何一条能改变"放的是哪个视频"。
+    ///
+    /// 为什么播放参数必须由**承载页**加，而不是让用户自己在链接里带：覆盖层
+    /// `hitTest` 恒 `nil`（红线），**页面里的播放按钮用户点不到**。于是"要不要自动播"
+    /// 只能由链接自己回答 —— 一条带 `autoplay=0` 的链接在这块屏幕上必然是一张静止的封面。
+    /// 这不是用户的错，是这块屏幕的约束（真机 2026-10-02 哔哩哔哩「能起来但不播」）。
     static func playerURL(embedURL: String, origin: String) -> String {
-        let separator = embedURL.contains("?") ? "&" : "?"
+        var url = embedURL
+        for parameter in officialPlayerParameters(embedURL: embedURL, origin: origin) {
+            url = writing(parameter, into: url)
+        }
+        let separator = url.contains("?") ? "&" : "?"
         let encodedOrigin = origin.addingPercentEncoding(
             withAllowedCharacters: originQueryAllowed
         ) ?? ""
-        return embedURL + separator + "enablejsapi=1&origin=" + encodedOrigin
+        return url + separator + "enablejsapi=1&origin=" + encodedOrigin
+    }
+
+    /// 站方**官方嵌入参数**（每站一组）。**这不是放宽白名单**：表里没有一条能改变主机 /
+    /// 路径 / 视频 id，它们只开关播放行为；表里没有的站**一个参数都不加**，而"加不加参数"
+    /// 与"放不放行"是两件事 —— 白名单在上游 `WorldScreenEmbedPolicy.validate` 已经判过。
+    ///
+    /// 每一条都是**离屏实测**换来的，读数与结论记在各条注释里（量具：
+    /// `tools/probe-screen-embed-playback.swift`，同一份生产承载页 + 一个真的窗口）。
+    static func officialPlayerParameters(embedURL: String, origin: String) -> [String] {
+        switch URL(string: embedURL)?.host?.lowercased() {
+        case "www.youtube.com", "youtube.com", "www.youtube-nocookie.com", "youtube-nocookie.com":
+            // 实测（`aPcL35kgL6A`）：**不带参数**时 `currentTime` 全程 0.0（只有封面，
+            // 「能出画」出的其实是封面）；加 `autoplay=1` 之后 16.3 秒里前进 16.3 秒、
+            // `paused=false` / `readyState=4` ⇒ 真的在播。
+            //
+            // **不加 `mute=1`**：实测不静音也能自动播（`muted=false` 且 `currentTime` 前进），
+            // 而这块屏幕是给人看的电视、这台 app 是电台 —— 能出声就不该默认把它静掉。
+            return ["autoplay=1"]
+        case "player.bilibili.com":
+            // 实测（`BV1xx411c7mD`）：`autoplay=0` 停在 0.6 秒（播放器起来时那一次预览
+            // seek）不再前进 —— 用户看到的就是「播放器界面 + 播放按钮，但不开始播」；
+            // 换成 `autoplay=1` 之后 19.3 秒里前进 19.3 秒 ⇒ 真的在播，**而且不用静音**。
+            //
+            // 这一条同时**覆盖**我们自己写进去的那个 `autoplay=0`（见 `writing(_:into:)`）。
+            return ["autoplay=1"]
+        case "player.twitch.tv":
+            // Twitch 官方要求 URL 上带 `parent=<嵌它的那个域>`，缺了直接跳
+            // `embed-error.html?errorCode=NoParent`（实测页面原文「哎哟！该嵌入配置错误」）。
+            return ["parent=" + parentDomain(of: origin)]
+        default:
+            return []
+        }
+    }
+
+    /// 承载域：Twitch 的 `parent` **只认域**，不带协议、不带端口。
+    ///
+    /// 端口不能写死的理由不是洁癖：`WorldScreenEmbedOrigin.randomPort()` **每载入一次就换
+    /// 一个**，把某一次的随机端口写进链接，下一次载入（换了端口）就会失效。实测
+    /// `parent=127.0.0.1`（只有域）在随机端口下正常出播放器。
+    static func parentDomain(of origin: String) -> String {
+        URL(string: origin)?.host?.lowercased() ?? WorldScreenEmbedOrigin.loopbackHost
+    }
+
+    /// 把一个 `key=value` 参数**写进** URL：已有同名 key 就**替换**它，没有才追加。
+    ///
+    /// 为什么必须替换而不能只追加：同名 key 出现两次时站方读的是**第一个**
+    /// （`URLSearchParams.get` 的语义），把 `autoplay=1` 追在 `autoplay=0` 后面等于没写 ——
+    /// 而那个 `autoplay=0` 正是我们自己在 `WorldScreenEmbedPolicy.rewriteWatchURL`
+    /// 与 `embedURL(forBareID:)` 里写进去的。
+    static func writing(_ parameter: String, into url: String) -> String {
+        guard let equals = parameter.firstIndex(of: "=") else { return url }
+        let name = String(parameter[..<equals])
+        guard let question = url.firstIndex(of: "?") else { return url + "?" + parameter }
+        let head = String(url[...question])
+        var pieces = url[url.index(after: question)...]
+            .split(separator: "&", omittingEmptySubsequences: false)
+            .map(String.init)
+        if let index = pieces.firstIndex(where: { $0 == name || $0.hasPrefix(name + "=") }) {
+            pieces[index] = parameter
+        } else {
+            pieces.append(parameter)
+        }
+        return head + pieces.joined(separator: "&")
     }
 
     /// `origin` 参数允许原样保留的字符：字母、数字、`.`。

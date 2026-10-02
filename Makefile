@@ -438,6 +438,14 @@ _test-harnesses:
 	# 删掉 / 重复 / 把面板加回来，每一条都必须红。
 	# 现场演示：`SCREEN_WIRING_INJECT=dropInstallCall swift tools/test-resident-screen-app-wiring.swift`。
 	swift tools/test-resident-screen-app-wiring.swift
+	# 「操作屏幕」（用户 2026-10-03：能自动播了，但**网页里一个按钮都点不到**）。
+	# 默认关：不进入这个模式时覆盖层容器 `hitTest` 恒 nil、场景的 14 条输入链与
+	# `consumesScenePointer` 的签名/调用点/语义一个字不改；显式进入（底部控制条上那个
+	# 默认灰着的开关）之后网页才收得到点击，Esc / 再点一次立刻退出。判据含**离屏合成的
+	# 真点击**（屏幕外 NSWindow + 生产那一份容器 + 真 WKWebView：默认网页收到 0 次、
+	# 进入后 0 → 1 且场景收不到、退出后立刻恢复）与七条注入负对照（默认改成开 / 去掉闸门 /
+	# 进了模式也不给点 / 第二处写开关 / 另造一处判据 / 场景自己判断 / 给裁决点加输入）。
+	swift tools/test-screen-operation-mode.swift
 	# 电视的**观感**与**面板人话**（真机 2026-10-02「什么玩意儿」）：GLB 必须带 3 份深色材质
 	# （屏幕深灰偏黑、有一点反光，既不是纯黑也不是灰板）、立柱顶在面板背面上、三轴 / 盒子
 	# 数量 / 面板厚 / 底座进深 / 屏幕面逐位不变；入库与预览的 yaw = 0、屏幕面 pitch = 0

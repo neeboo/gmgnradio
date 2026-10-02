@@ -56,7 +56,9 @@ precondition(StageVisualPickerGroup.visibleGroups(for: .player) == [.lyricsEffec
 precondition(StageVisualPickerGroup.visibleGroups(for: .space) == [.worldSelection, .avatarPlacement, .loadingStatus])
 precondition(StageControlPanelLayout.maximumWidth == 590 && StageControlPanelLayout.maximumHeight == 458)
 precondition(StageControlPanelLayout.controlSize >= 44)
-precondition(StageControlPanelLayout.transportWidth == 8 * StageControlPanelLayout.controlSize + StageControlPanelLayout.settingsWidth + 2 * StageControlPanelLayout.sideInset + 2 * StageControlPanelLayout.groupGap + 1)
+// 9 = 8 个常规按钮 + 「操作屏幕」（2026-10-03：用户点不到网页里的按钮，于是底部控制条
+// 上多了一个**默认灰着**的显式开关；见 `tools/test-resident-screen-overlay.swift` 断言 3）。
+precondition(StageControlPanelLayout.transportWidth == 9 * StageControlPanelLayout.controlSize + StageControlPanelLayout.settingsWidth + 2 * StageControlPanelLayout.sideInset + 2 * StageControlPanelLayout.groupGap + 1)
 precondition(StageActivityAvailability.canRun(isWorldVisible: true, selectedWorldID: "a", activityWorldID: "a"))
 precondition(!StageActivityAvailability.canRun(isWorldVisible: false, selectedWorldID: "a", activityWorldID: "a"))
 precondition(!StageActivityAvailability.canRun(isWorldVisible: true, selectedWorldID: "b", activityWorldID: "a"))

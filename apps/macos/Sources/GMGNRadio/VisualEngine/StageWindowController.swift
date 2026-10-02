@@ -156,6 +156,22 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     /// 所以这里不需要、也**不允许**往 `consumesScenePointer` 那条判据里加任何东西。
     var screenOverlayHostView: NSView? { stageContentView?.screenOverlayHostView }
 
+    /// 「操作屏幕」入口（底部控制条上那个显式开关）。接线由 App 侧完成，见
+    /// `GMGNRadioApp.installScreenOverlayIfNeeded()` —— 舞台这一层不认识覆盖层。
+    var onToggleScreenOperation: (@MainActor () -> Void)? {
+        get { stageContentView?.onToggleScreenOperation }
+        set { stageContentView?.onToggleScreenOperation = newValue }
+    }
+
+    /// 有屏幕在放 ⇒ 入口可用；「操作屏幕」模式进出 ⇒ 按钮与提示条跟着变。
+    func setScreenOperationAvailable(_ available: Bool) {
+        stageContentView?.setScreenOperationAvailable(available)
+    }
+
+    func setScreenOperationActive(_ active: Bool) {
+        stageContentView?.setScreenOperationActive(active)
+    }
+
     // 电视面板已从产品界面移除（用户要求：左下角那块电视面板不应该出现）：
     // 这里不再有面板的挂载 / 显示入口；面板视图保留在 `Screen/ScreenPanel.swift`。
 
@@ -845,9 +861,27 @@ private final class StageContentView: NSView {
     private var programRail: StageProgramRailHostingView!
     private var visualPicker: StageVisualPickerHostingView!
     private var transportControls: StageTransportControlsView!
+    /// 「正在操作电视」提示条（默认隐藏）。用户看不见状态就会以为场景坏了 ——
+    /// 而这块屏幕在默认状态下**本来就不吃事件**，两件事必须分得清。
+    private let screenOperationBanner = StageScreenOperationBanner()
 
     func setSystemInboxUnread(_ count: Int) {
         transportControls?.setSystemInboxUnread(count)
+    }
+
+    /// 「操作屏幕」入口被按下。覆盖层住在 App 侧（`GMGNRadioApp`），所以这里只**转发**：
+    /// 舞台这一层不持有、也不知道那块屏现在能不能点。
+    var onToggleScreenOperation: (@MainActor () -> Void)?
+
+    /// 有屏幕在放 ⇒ 入口按钮可用（没有屏幕时它是灰的，不占注意力）。
+    func setScreenOperationAvailable(_ available: Bool) {
+        transportControls?.setScreenOperationAvailable(available)
+    }
+
+    /// 「操作屏幕」模式进出：按钮变色 + 提示条出现/消失。
+    func setScreenOperationActive(_ active: Bool) {
+        transportControls?.setScreenOperationActive(active)
+        screenOperationBanner.isHidden = !active
     }
 
     /// 电视覆盖层的宿主容器。`WorldScreenOverlayController` 把每块屏的容器挂进来。
@@ -961,6 +995,9 @@ private final class StageContentView: NSView {
             action: onOpenSystemInbox
         )
         let propEditorButton = StagePropEditorButton { [weak self] in self?.togglePropEditor() }
+        let screenOperationButton = StageScreenOperationButton { [weak self] in
+            self?.onToggleScreenOperation?()
+        }
         let windowModeButton = StageWindowModeButton(
             mode: .windowed,
             action: onToggleWindowMode
@@ -974,6 +1011,7 @@ private final class StageContentView: NSView {
             chatButton: chatButton,
             systemInboxButton: systemInboxButton,
             propEditorButton: propEditorButton,
+            screenOperationButton: screenOperationButton,
             visualButton: visualButton,
             windowModeButton: windowModeButton
         )
@@ -1005,7 +1043,6 @@ private final class StageContentView: NSView {
         screenOverlayContainer.autoresizingMask = [.width, .height]
         screenOverlayContainer.wantsLayer = true
         screenOverlayContainer.layer?.zPosition = 1.6
-        addSubview(screenOverlayContainer)
 
         let metalView = MetalStageView(
             frame: bounds,
@@ -1055,6 +1092,18 @@ private final class StageContentView: NSView {
         worldInteractionView.wantsLayer = true
         worldInteractionView.layer?.zPosition = 6
         addSubview(worldInteractionView)
+
+        // 电视覆盖层在**子视图顺序**上提到交互视图之上，并且**只在这一处**进视图树。
+        //
+        // 为什么必须显式提：AppKit 的 `hitTest` 只看**子视图顺序**，**不看
+        // `layer.zPosition`**（2026-10-03 离线实测：后加的下层视图照样先命中）。交互视图
+        // 是后加的那个，于是"操作屏幕"模式哪怕让覆盖层开始接事件，点也永远落不到网页上。
+        //
+        // 提到上面**不改变任何既有行为**：覆盖层关着的时候 `hitTest` 恒 `nil`，hitTest
+        // 会继续往下问，交互视图照旧拿走这个点（场景的 14 条输入链、`consumesScenePointer`
+        // 的签名与调用点一个字不动）；画面层级由 `layer.zPosition`（覆盖层 1.6 /
+        // 交互视图 6）决定，与子视图顺序无关。
+        addSubview(screenOverlayContainer, positioned: .above, relativeTo: worldInteractionView)
 
         let overlay = StageOverlayHostingView(
             rootView: StageOverlayView(
@@ -1120,6 +1169,13 @@ private final class StageContentView: NSView {
         transportControls.translatesAutoresizingMaskIntoConstraints = false
         transportControls.layer?.zPosition = 20
         addSubview(transportControls)
+
+        // 「正在操作电视」提示条：**只在**「操作屏幕」模式里出现，默认隐藏。
+        // 它自己 `hitTest` 恒 nil，所以它既不吃网页的点击、也不吃场景的点击。
+        screenOperationBanner.isHidden = true
+        screenOperationBanner.translatesAutoresizingMaskIntoConstraints = false
+        screenOperationBanner.layer?.zPosition = 19
+        addSubview(screenOperationBanner)
 
         residentComposer = NSHostingView(rootView: StageResidentComposer(
             state: residentChat,
@@ -1226,6 +1282,12 @@ private final class StageContentView: NSView {
             ),
             transportControls.widthAnchor.constraint(equalToConstant: StageControlPanelLayout.transportWidth + StageControlPanelLayout.controlSize),
             transportControls.heightAnchor.constraint(equalToConstant: 48),
+
+            screenOperationBanner.centerXAnchor.constraint(equalTo: transportControls.centerXAnchor),
+            screenOperationBanner.bottomAnchor.constraint(
+                equalTo: transportControls.topAnchor,
+                constant: -12
+            ),
 
             programRail.trailingAnchor.constraint(
                 equalTo: trailingAnchor,
@@ -2479,6 +2541,7 @@ private final class StageTransportControlsView: NSView {
     private let chatButton: StageResidentChatButton
     private let systemInboxButton: ResidentSystemMailBadgeButton
     private let propEditorButton: StagePropEditorButton
+    private let screenOperationButton: StageScreenOperationButton
     private let visualButton: StageVisualButton
     private let windowModeButton: StageWindowModeButton
 
@@ -2491,6 +2554,7 @@ private final class StageTransportControlsView: NSView {
         chatButton: StageResidentChatButton,
         systemInboxButton: ResidentSystemMailBadgeButton,
         propEditorButton: StagePropEditorButton,
+        screenOperationButton: StageScreenOperationButton,
         visualButton: StageVisualButton,
         windowModeButton: StageWindowModeButton
     ) {
@@ -2502,6 +2566,7 @@ private final class StageTransportControlsView: NSView {
         self.chatButton = chatButton
         self.systemInboxButton = systemInboxButton
         self.propEditorButton = propEditorButton
+        self.screenOperationButton = screenOperationButton
         self.visualButton = visualButton
         self.windowModeButton = windowModeButton
         super.init(frame: .zero)
@@ -2523,7 +2588,8 @@ private final class StageTransportControlsView: NSView {
 
         let buttons: [NSView] = [
             programButton, previousButton, playbackButton, nextButton,
-            voiceButton, chatButton, systemInboxButton, propEditorButton, visualButton, windowModeButton
+            voiceButton, chatButton, systemInboxButton, propEditorButton,
+            screenOperationButton, visualButton, windowModeButton
         ]
         for view in buttons + [groupDivider] {
             view.translatesAutoresizingMaskIntoConstraints = false
@@ -2550,7 +2616,8 @@ private final class StageTransportControlsView: NSView {
             chatButton.leadingAnchor.constraint(equalTo: voiceButton.trailingAnchor),
             systemInboxButton.leadingAnchor.constraint(equalTo: chatButton.trailingAnchor),
             propEditorButton.leadingAnchor.constraint(equalTo: systemInboxButton.trailingAnchor),
-            visualButton.leadingAnchor.constraint(equalTo: propEditorButton.trailingAnchor),
+            screenOperationButton.leadingAnchor.constraint(equalTo: propEditorButton.trailingAnchor),
+            visualButton.leadingAnchor.constraint(equalTo: screenOperationButton.trailingAnchor),
             windowModeButton.leadingAnchor.constraint(equalTo: visualButton.trailingAnchor),
             windowModeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -StageControlPanelLayout.sideInset)
         ])
@@ -2599,6 +2666,18 @@ private final class StageTransportControlsView: NSView {
     func setPropEditorExpanded(_ expanded: Bool) { propEditorButton.contentTintColor = expanded ? .systemCyan : .white }
     func setPropEditorAvailable(_ available: Bool) { propEditorButton.isEnabled = available }
 
+    /// 「操作屏幕」：没有屏幕在放时保持灰的（它不该变成常驻噪音）；模式开着时亮青色，
+    /// 与「摆放物件」用的是同一套"开了就变色"的读法。
+    func setScreenOperationAvailable(_ available: Bool) {
+        screenOperationButton.isEnabled = available
+        screenOperationButton.setAccessibilityLabel(screenOperationButton.toolTip)
+    }
+
+    func setScreenOperationActive(_ active: Bool) {
+        screenOperationButton.setActive(active)
+        screenOperationButton.setAccessibilityLabel(screenOperationButton.toolTip)
+    }
+
     func setResidentChatAvailable(_ isAvailable: Bool) {
         chatButton.isEnabled = isAvailable
         if !isAvailable { chatButton.toolTip = "进入空间后与居民聊天" }
@@ -2624,6 +2703,74 @@ private final class StagePropEditorButton: NSButton {
     }
     required init?(coder: NSCoder) { nil }
     @objc private func activate() { handler() }
+}
+
+/// 「操作屏幕」入口：底部控制条上一个显式开关（与「摆放物件」同族、同尺寸、同位置逻辑）。
+///
+/// 它**默认是灰的**：只有空间里真的有一块屏在放时才可用 —— 于是它不会变成常驻噪音，
+/// 而用户第一次看到它亮起来的时候，那台电视正好就在画面里。进入之后亮青色并变成
+/// 「完成操作（Esc）」，退出立刻恢复原样。
+@MainActor
+private final class StageScreenOperationButton: NSButton {
+    private let handler: @MainActor () -> Void
+    private(set) var isActive = false
+
+    init(action: @escaping @MainActor () -> Void) {
+        handler = action
+        super.init(frame: .zero)
+        title = ""
+        image = NSImage(systemSymbolName: "hand.tap", accessibilityDescription: "操作电视")
+        isBordered = false
+        contentTintColor = .white
+        target = self
+        self.action = #selector(activate)
+        toolTip = "这块空间里还没有在放的电视"
+        identifier = NSUserInterfaceItemIdentifier("stage.screen-operation-toggle")
+        isEnabled = false
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func setActive(_ active: Bool) {
+        isActive = active
+        contentTintColor = active ? .systemCyan : .white
+        toolTip = active ? "完成操作（Esc）" : "操作电视"
+    }
+
+    @objc private func activate() { handler() }
+}
+
+/// 「正在操作电视，按 Esc 退出」提示条。
+///
+/// 为什么必须有：默认状态下这块屏幕**点不到任何东西**，而进入模式之后场景的指针又让路
+/// 了 —— 用户在两边的感觉都是"场景坏了"。它把当前状态与唯一的出口（Esc / 再点一次那个
+/// 开关）直接说出来。`hitTest` 恒 nil：它只报状态，绝不吃网页或场景的指针。
+@MainActor
+private final class StageScreenOperationBanner: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = 12
+        layer?.backgroundColor = NSColor(calibratedRed: 0.04, green: 0.30, blue: 0.42, alpha: 0.92).cgColor
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.systemCyan.withAlphaComponent(0.45).cgColor
+
+        let label = NSTextField(labelWithString: "正在操作电视，按 Esc 退出")
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        label.textColor = .white
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            heightAnchor.constraint(equalToConstant: 30),
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
 @MainActor
