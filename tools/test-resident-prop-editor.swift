@@ -22,6 +22,37 @@ guard blockLabelSource.contains("enum ResidentPropBlockReasonLabel") else {
 }
 let controller = try String(contentsOf:root.appendingPathComponent("apps/macos/Sources/GMGNRadio/VisualEngine/StageWindowController.swift"),encoding:.utf8)
 let editorView = try String(contentsOf:root.appendingPathComponent("apps/macos/Sources/GMGNRadio/VisualEngine/ResidentPropEditorView.swift"),encoding:.utf8)
+// 挂点那一族的**真源码**出处：`PropAttachmentPoint`（"有哪几个挂点"）在 `PropAttachment.swift`，
+// 「挂点 ↔ 世界挂点」的两向映射在 `PropAttachmentSlot.swift`。`ResidentPropEditorState` 的
+// `holdPoint` / `selectedHoldPoint`（`held.hand.attachmentPoint`）与 `availabilityReason` 的
+// `point.worldSlot` 读的就是这两处 —— 缺了它们，抽取出来的 `configureResidentPropEditor`
+// 连签名都立不住（挂点类型推不出来 ⇒ 那一串闭包参数全部报"cannot infer type"）。
+//
+// 刻意**不整文件编** `PropAttachment.swift`：那 576 行会拖进 `PropAttachmentSlots`、
+// `PropGripInference`、`StageAvatarAsset` 一整条链，而这里只缺"有哪几个挂点"这一个类型。
+let propAttachment = try String(contentsOf:root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/PropAttachment.swift"),encoding:.utf8)
+let propAttachmentSlot = try String(contentsOf:root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/PropAttachmentSlot.swift"),encoding:.utf8)
+// 退避预算的唯一出处：`ResidentPropEditorState.initialPlacementAttemptLimit` 读
+// `RetryBackoffSite.propPlacement.policy.maximumAttempts`。这一份自包含（Foundation + os，
+// 文件头写明"可被 tools/* 离线 swiftc 直接编译"），所以按仓库既有形状**整文件**编进来，
+// 而不是把那个 32 抄成一份替身（抄了之后策略一改，harness 测的就不是生产了）。
+let retryBackoff = try String(contentsOf:root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift"),encoding:.utf8)
+// 视图那一趟（下面 `viewCheck`）要用的一小撮声明。`ResidentPropEditorView` 只读
+// `PropAttachmentPoint.allCases` 与 `PropAttachmentSlots.displayName(for:)`；而
+// `PropAttachmentPoint` 所在的 `PropAttachment.swift` 若整文件编，会把
+// `ResidentPropAttachmentEligibility → StageAvatarAsset → StageAvatarRuntime → MotionPackageStore /
+// PresencePackageStore / StageAvatarActivity…` 一整条链拖进来（实测：越编越多，最后等于编半个 app）。
+// 所以这里与主 harness **同一个 `method()` 手法**抽真源码 —— 不是手抄一份替身，
+// 生产改了挂点或显示名，这一份会跟着变（或者抽取失败而红）。
+let viewSupportDeclarations = """
+import Foundation
+import simd
+import WorldRuntime
+\(method("enum PropAttachmentPoint", in: propAttachment))
+\(method("extension PropAttachmentPoint", in: propAttachmentSlot))
+\(method("extension WorldPropSlot", in: propAttachmentSlot))
+\(method("enum PropAttachmentSlots", in: propAttachmentSlot))
+"""
 // ── 光标旁那枚标签的**绘制条件**只能来自那个纯判据 ────────────────────────────
 // 真机：红格的原因只写在面板右下角，用户看不见。现在它跟着光标走 —— 但"什么时候画"
 // 必须仍然由 `ResidentPropBlockReasonLabel.content` 回答（携带 + 真的有原因），
@@ -226,6 +257,13 @@ let livingWorldLogger = Logger(subsystem: ProductIdentity.bundleIdentifier, cate
 /// 文件作用域，测试直接调它们（而不是各写一份替身，那样就测不到生产代码了）。
 \#(method("enum ResidentPropSupportReadiness",in:appSource))
 \#(method("enum ResidentPropDecorationSessionRearm",in:appSource))
+/// 挂点类型与「挂点 ↔ 世界挂点」两向映射：**真源码逐字抽取**，不是替身
+/// （`ResidentPropEditorState` 与抽取出来的 `configureResidentPropEditor` 都靠它们才编得过）。
+\#(method("enum PropAttachmentPoint", in: propAttachment))
+\#(method("extension PropAttachmentPoint", in: propAttachmentSlot))
+\#(method("extension WorldPropSlot", in: propAttachmentSlot))
+/// 退避预算的唯一出处（自包含，整文件编）：策略数值只有生产那一份。
+\#(retryBackoff)
 \#(model.replacingOccurrences(of: "import WorldRuntime", with: ""))
 // 「我的物件」的**唯一**投影：`ResidentPropEditorState` 现在从它现算行
 // （`ownershipFacts` → `ResidentOwnershipProjection.row` / `.list`）。编同一份生产文件，
@@ -537,10 +575,14 @@ typealias WorldAgentContext = LayoutContext
   guard isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
   return context.state.objectStates[objectID]!
  }
- func holdCommand(objectID:String) throws -> WorldPropLayoutCommand {
+ /// 与生产 `ResidentPropPlacementService.holdCommand(objectID:point:)` **同一个签名**
+ /// （`apps/macos/Sources/GMGNRadio/Presence/ResidentPropPlacementService.swift:310`）：
+ /// 抽取出来的 `configureResidentPropEditor` 就是按 `point:` 调的，签名一漂就编不过。
+ /// 挂点走生产的 `PropAttachmentPoint.worldSlot` 映射（真源码），不在这里另写一份 switch。
+ func holdCommand(objectID:String, point:PropAttachmentPoint = .rightHand) throws -> WorldPropLayoutCommand {
   guard isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
   return .hold(objectID:objectID,avatarAssetID:"pmx.2b-miss-0414-standard",
-   calibration:.init(avatarAssetID:"pmx.2b-miss-0414-standard",hand:.rightHand,
+   calibration:.init(avatarAssetID:"pmx.2b-miss-0414-standard",hand:point.worldSlot,
     normalizedGrip:.init(x:0.5,y:0.2,z:0.5),localOffset:.init(x:0,y:0,z:0),
     localRotation:.init(x:0,y:0,z:0,w:1)))
  }
@@ -766,9 +808,16 @@ typealias WorldAgentContext = LayoutContext
    normalizedGrip:.init(x:0.5,y:0.2,z:0.5),localOffset:.init(x:0,y:0,z:0),
    localRotation:.init(x:0,y:0,z:0,w:1))
   handEditor.preview = { _, _ in object }
-  handEditor.hold = { id, revision, requestID in
+  handEditor.hold = { id, point, revision, requestID in
    var simulation = WorldSimulation(restoring:handWorld)
-   try simulation.applyPropLayout(.hold(objectID:id,avatarAssetID:"pmx.2b-miss-0414-standard",calibration:handCalibration),
+   // 挂点读**回调参数**：生产 `ResidentPropEditorState.hold` 的类型是
+   // `(String, PropAttachmentPoint, UInt64, String)`。以前这里只绑了三个形参名
+   // （`id, revision, requestID`），生产插进 `point` 之后 `revision`/`requestID`
+   // 全部向前错位一位 —— 形参表一漂，这个替身就是在替另一条签名。
+   let calibration = WorldPropGripCalibration(avatarAssetID:handCalibration.avatarAssetID,
+    hand:point.worldSlot,normalizedGrip:handCalibration.normalizedGrip,
+    localOffset:handCalibration.localOffset,localRotation:handCalibration.localRotation)
+   try simulation.applyPropLayout(.hold(objectID:id,avatarAssetID:"pmx.2b-miss-0414-standard",calibration:calibration),
     expectedLayoutRevision:revision,requestID:requestID)
    handWorld = simulation.state
    return handSnapshot()
@@ -1753,8 +1802,25 @@ let compile = Process(); compile.executableURL = URL(fileURLWithPath:"/usr/bin/x
 compile.arguments = ["swiftc","-j1","-parse-as-library","-swift-version","6","-I",products.appendingPathComponent("Modules").path,source.path,"-o",binary.path] + objects
 try compile.run();compile.waitUntilExit();guard compile.terminationStatus == 0 else { exit(compile.terminationStatus) }
 if !CommandLine.arguments.contains("--red-double-submit") {
+ // 视图/模型那一趟也**只编真源码**：三份被检查的文件 + 它们真正依赖的三份生产源码。
+ // `PropGripInference` / `RetryBackoff` / `ResidentOwnershipProjection` 都自包含（Foundation
+ // + WorldRuntime），所以按路径直接交给 swiftc；`PropAttachmentPoint` / `PropAttachmentSlots`
+ // 那一族的整文件会拖进 `StageAvatarRuntime → 包存储` 一整条链，故走
+ // `viewSupportDeclarations`（**逐字抽取**的真声明，见文件开头）。
+ //
+ // 这份清单是**依赖闭包**，不是装饰：生产里 `ResidentPropEditorState` / `ResidentPropEditorView`
+ // 新引用一个跨文件声明而这里没跟上，这一趟就会红 —— 而不是静默降级成"编过就算"。
+ let viewSupport = temp.appendingPathComponent("view-support.swift")
+ try viewSupportDeclarations.write(to:viewSupport,atomically:true,encoding:.utf8)
  let viewCheck = Process();viewCheck.executableURL = URL(fileURLWithPath:"/usr/bin/xcrun")
- viewCheck.arguments = ["swiftc","-j1","-typecheck","-swift-version","6","-I",products.appendingPathComponent("Modules").path,modelURL.path,root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/PropSupportGridPresentation.swift").path,root.appendingPathComponent("apps/macos/Sources/GMGNRadio/VisualEngine/ResidentPropEditorView.swift").path]
+ viewCheck.arguments = ["swiftc","-j1","-typecheck","-swift-version","6","-I",products.appendingPathComponent("Modules").path,
+  modelURL.path,
+  root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/PropSupportGridPresentation.swift").path,
+  root.appendingPathComponent("apps/macos/Sources/GMGNRadio/VisualEngine/ResidentPropEditorView.swift").path,
+  root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/PropGripInference.swift").path,
+  root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift").path,
+  root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/ResidentOwnershipProjection.swift").path,
+  viewSupport.path]
  try viewCheck.run();viewCheck.waitUntilExit();guard viewCheck.terminationStatus == 0 else { exit(viewCheck.terminationStatus) }
 }
 let run = Process();run.executableURL = binary;try run.run();run.waitUntilExit();exit(run.terminationStatus)

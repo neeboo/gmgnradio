@@ -286,6 +286,10 @@ _test-harnesses:
 	swift tools/test-living-resident-loop.swift
 	swift tools/test-resident-prop-render.swift
 	swift tools/test-resident-prop-grid-editor.swift
+	# 摆放面板 ↔ 场景那一整条接线（抽取式回调、左键放下/右键转 45°、输入门禁、焦点交还）。
+	# 它此前**从来没挂进来过**，于是三层漂移（缺声明 / viewCheck 依赖闭包缺文件 / 替身签名错位）
+	# 一直没人管，直到文案简化让它第一次真正跑到编译阶段。
+	swift tools/test-resident-prop-editor.swift
 	swift tools/test-resident-prop-grid-placement.swift
 	# 摆正（朝向归一）+ 靠墙（竖直面）：两件事各自的判据，见各自文件头。
 	swift tools/test-resident-prop-orientation-and-wall.swift
