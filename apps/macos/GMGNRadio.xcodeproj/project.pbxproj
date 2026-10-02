@@ -265,6 +265,7 @@
 		DFBB39349649A969874CAEEE /* ResidentPropGridEditorModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2AFE7612BD0C88006DB3BDC2 /* ResidentPropGridEditorModel.swift */; };
 		E07CACC669D4A648231EE3A0 /* VisualAudioFeatureExtractor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36C707778632484C921F090C /* VisualAudioFeatureExtractor.swift */; };
 		E0EF77C4410BA971E66381AE /* CodexTrackRankingAgentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F341732E30CC1C3F05A7532 /* CodexTrackRankingAgentTests.swift */; };
+		E1D5853C54083F03BAB5FE42 /* WorldScreenEmbedOrigin.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CBF097AE70456AFA2E548A3 /* WorldScreenEmbedOrigin.swift */; };
 		E1E72C29EB3D2A8256F43741 /* RealtimeDJSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 216A6D94509E4915BCC18C7C /* RealtimeDJSession.swift */; };
 		E49527753955135A51F8363E /* Stage.metal in Sources */ = {isa = PBXBuildFile; fileRef = E13F2FD5A9D73C17F8A9C25F /* Stage.metal */; };
 		E4AC55128B9A6FD23A25D914 /* MusicLibraryIndex.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D14F4B7076E6DE288719ECF /* MusicLibraryIndex.swift */; };
@@ -431,6 +432,7 @@
 		4C25006F47A0D72758A7B6B0 /* ProgramVisualDirector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgramVisualDirector.swift; sourceTree = "<group>"; };
 		4C3161E3B8CFAB319A4547F4 /* StageAvatarActivityExecutor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageAvatarActivityExecutor.swift; sourceTree = "<group>"; };
 		4C7A2D03F5D5146ABBED6DBA /* ResidentWishReferenceTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentWishReferenceTools.swift; sourceTree = "<group>"; };
+		4CBF097AE70456AFA2E548A3 /* WorldScreenEmbedOrigin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldScreenEmbedOrigin.swift; sourceTree = "<group>"; };
 		4D4B3C1924BD2EFD8C20A529 /* FoliaSceneDetailModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FoliaSceneDetailModelsTests.swift; sourceTree = "<group>"; };
 		4DAD314FA946D04CCDC3180A /* SpatialStageStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpatialStageStoreTests.swift; sourceTree = "<group>"; };
 		4EA2E1A48CBD8D8307D47212 /* AccountMusicSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountMusicSource.swift; sourceTree = "<group>"; };
@@ -1170,6 +1172,7 @@
 				409F24B059BCB0E6E277D51E /* ResidentScreenTools.swift */,
 				82B1BCCE72BBEE1B80958C87 /* ScreenPanel.swift */,
 				302784B9AFBD09593A9228E5 /* WorldScreenContent.swift */,
+				4CBF097AE70456AFA2E548A3 /* WorldScreenEmbedOrigin.swift */,
 				B80365D49F91EA266D079E63 /* WorldScreenGeometry.swift */,
 				1E1E3D433A085F3776DD2FAE /* WorldScreenInference.swift */,
 				7871D3CE3289CAECC3492A64 /* WorldScreenMetadata.swift */,
@@ -1697,6 +1700,7 @@
 				FE33D1065264BA512AC4078F /* WorldAgentToolDispatcher.swift in Sources */,
 				2C9AEFE80D992E7CDBDA41B5 /* WorldAuthorityClient.swift in Sources */,
 				F29D9CA04913442E4A025EF1 /* WorldScreenContent.swift in Sources */,
+				E1D5853C54083F03BAB5FE42 /* WorldScreenEmbedOrigin.swift in Sources */,
 				CFA73B9B441C3D01031ACB5D /* WorldScreenGeometry.swift in Sources */,
 				70E21D456E4E84FF6958C930 /* WorldScreenInference.swift in Sources */,
 				CF257D49B7F7C39CB8BBE62B /* WorldScreenMetadata.swift in Sources */,

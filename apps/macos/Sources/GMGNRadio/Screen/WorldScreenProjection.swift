@@ -222,13 +222,13 @@ struct WorldScreenLayerTransform: Equatable, Sendable {
         return SIMD2(x / w, y / w)
     }
 }
-
-/// 「把一块矩形内容贴到屏幕四边形上」的全部几何。
 enum WorldScreenOverlayAlignment {
     /// 覆盖层宿主视图的落位与变换。
     ///
     /// 约定（`WorldScreenOverlayController` 逐字照做）：
-    /// - 宿主视图的 `frame` 取目标四边形的**轴对齐包围盒**；
+    /// - 宿主视图的 `frame` 取目标四边形的**轴对齐包围盒**（给 `referenceSize` 时取那个固定
+    ///   尺寸、居中放在同一个包围盒中心上 —— 见 `placement(normalizedCorners:projection:
+    ///   minimumExtent:referenceSize:)`）；
     /// - 宿主视图的内容铺满自己的 `bounds`（`WKWebView` 用 `autoresizingMask` 跟着走）；
     /// - `layer.transform` 把 `bounds` 的四个角搬到目标四角。
     ///
@@ -247,15 +247,15 @@ enum WorldScreenOverlayAlignment {
         let isFullyInsideViewport: Bool
     }
 
-    /// 从归一化屏幕四角（左上原点）解出宿主的落位与变换。
+    /// 四边形在视口里的**轴对齐包围盒尺寸**（点）。
     ///
-    /// - Parameter normalizedCorners: 顺序 **BL, BR, TR, TL**（左上原点下的"视觉"左下角
-    ///   对应归一化 y 最大的那一个 —— 由调用方保证顺序，与 `WorldScreenQuad.corners` 同序）。
-    static func placement(
+    /// 不解释单应矩阵 ⇒ 比 `placement` 便宜一个量级，于是"这一帧要不要换宿主的渲染尺寸"
+    /// 可以在解矩阵**之前**先判。
+    static func boundingSize(
         normalizedCorners: [SIMD2<Float>],
         projection: WorldScreenProjection,
         minimumExtent: Float = 1
-    ) -> Placement? {
+    ) -> SIMD2<Float>? {
         guard normalizedCorners.count == 4 else { return nil }
         let points = normalizedCorners.map { projection.viewPoint(normalized: $0) }
         let xs = points.map(\.x)
@@ -266,9 +266,55 @@ enum WorldScreenOverlayAlignment {
         let width = max(maxX - minX, minimumExtent)
         let height = max(maxY - minY, minimumExtent)
         guard width.isFinite, height.isFinite, width > 0, height > 0 else { return nil }
+        return SIMD2(width, height)
+    }
 
-        let origin = SIMD2(minX, minY)
-        let centre = SIMD2(minX + width / 2, minY + height / 2)
+    /// 从归一化屏幕四角（左上原点）解出宿主的落位与变换。
+    ///
+    /// - Parameter normalizedCorners: 顺序 **BL, BR, TR, TL**（左上原点下的"视觉"左下角
+    ///   对应归一化 y 最大的那一个 —— 由调用方保证顺序，与 `WorldScreenQuad.corners` 同序）。
+    /// - Parameter referenceSize: 宿主的**固定渲染尺寸**（点）。给定时，宿主 `bounds` 就是它，
+    ///   `frameOrigin` 把它居中放到四边形包围盒的中心上，四角仍由 `transform` 精确搬过去。
+    ///
+    ///   为什么需要它：宿主 `bounds` 一变，里面的 `WKWebView` 就跟着换一次尺寸，而 WebKit
+    ///   会让**内容进程重新布局并重画整页**（视频页还要重建播放器层）。相机一帧动一下、
+    ///   宿主尺寸就跟着动一下，于是"推进镜头"变成每帧一次跨进程重排版 —— 真机上是爆卡。
+    ///   尺寸固定之后，相机移动全部由单应矩阵吸收：对齐**逐点不变**（变换与源矩形一起换），
+    ///   只有"网页被渲染成多大"这件事不再跟着相机抖。
+    ///
+    ///   为 `nil` 时逐字退化成"宿主 `bounds` = 四边形包围盒"，也就是这一处原本的语义。
+    static func placement(
+        normalizedCorners: [SIMD2<Float>],
+        projection: WorldScreenProjection,
+        minimumExtent: Float = 1,
+        referenceSize: SIMD2<Float>? = nil
+    ) -> Placement? {
+        guard normalizedCorners.count == 4 else { return nil }
+        let points = normalizedCorners.map { projection.viewPoint(normalized: $0) }
+        let xs = points.map(\.x)
+        let ys = points.map(\.y)
+        guard let minX = xs.min(), let maxX = xs.max(),
+              let minY = ys.min(), let maxY = ys.max()
+        else { return nil }
+        let boundsWidth = max(maxX - minX, minimumExtent)
+        let boundsHeight = max(maxY - minY, minimumExtent)
+        guard boundsWidth.isFinite, boundsHeight.isFinite,
+              boundsWidth > 0, boundsHeight > 0
+        else { return nil }
+        let width = referenceSize.map { max($0.x, minimumExtent) } ?? boundsWidth
+        let height = referenceSize.map { max($0.y, minimumExtent) } ?? boundsHeight
+        guard width.isFinite, height.isFinite, width > 0, height > 0 else { return nil }
+
+        // 层心：不给 `referenceSize` 时**逐字**是原来的那一处；给了就取包围盒的真实中心
+        // （固定尺寸的矩形要正落在四边形上，绕的必须是同一个中心）。
+        //
+        // 注意这只定义了解算口径：解出来的单应按"**绕层心**"施加。写进图层前要换成
+        // AppKit backing layer 的 `bounds` 原点口径（那一处在
+        // `WorldScreenLayerTransform.layerTransform(forAnchor:)`，只有一处）。
+        let centre = referenceSize == nil
+            ? SIMD2(minX + boundsWidth / 2, minY + boundsHeight / 2)
+            : SIMD2(minX + (maxX - minX) / 2, minY + (maxY - minY) / 2)
+        let origin = SIMD2(centre.x - width / 2, centre.y - height / 2)
         let size = SIMD2(width, height)
         let source: [SIMD2<Float>] = [
             SIMD2(0, 0), SIMD2(width, 0), SIMD2(width, height), SIMD2(0, height),

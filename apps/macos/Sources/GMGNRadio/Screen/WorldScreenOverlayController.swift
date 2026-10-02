@@ -1,5 +1,15 @@
 import AppKit
+import os
+import os.signpost
 @preconcurrency import WebKit
+
+/// 覆盖层每帧的账去这里（Instruments 里按 interval 看得到每一项）。
+///
+/// 与 `WorldScreenStore` 的 `screenPanelLogger` 同一 subsystem：电视这条线的工程细节
+/// 只有一处出口。
+private let overlaySignposter = OSSignposter(
+    subsystem: "ai.gmgn.radio", category: .pointsOfInterest
+)
 
 // MARK: - 覆盖层宿主：**不吃任何指针事件**
 
@@ -49,9 +59,21 @@ final class WorldScreenSurface: NSObject, WKNavigationDelegate {
     private(set) var occlusionMask: WorldScreenOcclusionMask?
     /// 最近一次掩码更新的耗时（诊断/回执用）。
     private(set) var lastOcclusionCost: Duration?
+    /// 最近一次掩码落到图层上的账（路径构造 / 图层赋值）。
+    private(set) var lastMaskCost = WorldScreenMaskCost()
+    /// 最近一次真的写进容器的落位与变换。相同就**一个字节都不写**。
+    var appliedFrameOrigin: CGPoint?
+    var appliedFrameSize: CGSize?
+    var appliedTransform: WorldScreenLayerTransform?
     private var occlusionMaskLayer: CAShapeLayer?
     var onStateChange: (@MainActor (WorldScreenSurfaceState) -> Void)?
     private var watchdog: Task<Void, Never>?
+    /// 页面**侧**那一路的观察者（播放器自己报的错）。与 `watchdog` 分开：那一条管
+    /// "页面有没有载进来"，这一条管"载进来了但播放器不肯放"。
+    private var playerWatch: Task<Void, Never>?
+    /// 承载这一页的那个**来源文档**的 origin（`nil` = 没在放）。只用于诊断/回执，
+    /// 不是判据。
+    private(set) var embeddingOrigin: String?
     private var isMediaSuspended = false
 
     override init() {
@@ -92,18 +114,32 @@ final class WorldScreenSurface: NSObject, WKNavigationDelegate {
     ///   一起被投到屏幕四边形上 —— 与画面同一条变换，不可能与几何错位。
     ///
     /// - Parameter mask: `nil` 或全可见时摘掉掩码。
+    ///
+    /// **同一张掩码 ⇒ 一个字节都不写。** `visibleRects` 的并集、`CGPath` 的构造与
+    /// `CAShapeLayer` 的每一次赋值都不是免费的，而它们**只**取决于掩码本身：
+    /// 掩码没变就没有任何理由重做。这条判据由 `lastMaskCost.didRebuildPath` 记账，
+    /// 判据（`tools/test-resident-screen-overlay.swift` 断言9）直接断言它。
     func applyOcclusion(_ mask: WorldScreenOcclusionMask?, cost: Duration?) {
+        let previous = occlusionMask
         occlusionMask = mask
         lastOcclusionCost = cost
-        guard let mask, !mask.isFullyVisible else {
+        lastMaskCost = WorldScreenMaskCost()
+        let bounds = container.bounds
+        let size = SIMD2<Float>(Float(bounds.width), Float(bounds.height))
+        guard let mask, !mask.isFullyVisible, size.x > 0, size.y > 0 else {
+            // 没被挡 ⇒ 直接摘掉掩码（没有掩码就没有边界可以抖，也没有离屏合成的开销）。
+            guard occlusionMaskLayer != nil else { return }
+            let start = CFAbsoluteTimeGetCurrent()
             occlusionMaskLayer?.path = nil
             container.layer?.mask = nil
             occlusionMaskLayer = nil
+            lastMaskCost.assign = CFAbsoluteTimeGetCurrent() - start
             return
         }
-        let bounds = container.bounds
-        let size = SIMD2<Float>(Float(bounds.width), Float(bounds.height))
-        guard size.x > 0, size.y > 0 else { return }
+        // 同一张掩码、掩码图层的落位也没变 ⇒ 不重建路径、不碰图层。
+        if mask == previous, let existing = occlusionMaskLayer, existing.frame == bounds {
+            return
+        }
         let layer: CAShapeLayer
         if let existing = occlusionMaskLayer {
             layer = existing
@@ -116,6 +152,7 @@ final class WorldScreenSurface: NSObject, WKNavigationDelegate {
             occlusionMaskLayer = created
             layer = created
         }
+        let pathStart = CFAbsoluteTimeGetCurrent()
         let path = CGMutablePath()
         for rect in mask.visibleRects(in: size) {
             path.addRect(
@@ -125,25 +162,52 @@ final class WorldScreenSurface: NSObject, WKNavigationDelegate {
                 )
             )
         }
+        var measured = WorldScreenMaskCost()
+        measured.pathBuild = CFAbsoluteTimeGetCurrent() - pathStart
+        measured.didRebuildPath = true
+        let assignStart = CFAbsoluteTimeGetCurrent()
         layer.frame = bounds
         layer.path = path
+        measured.assign = CFAbsoluteTimeGetCurrent() - assignStart
+        lastMaskCost = measured
     }
 
     // MARK: 控制
 
     /// 载入一个**已经过白名单校验**的官方嵌入 URL。
+    ///
+    /// 官方嵌入页**不许被顶层直载**：顶层直载时它没有"嵌它的那个文档"，播放器会报
+    /// 153（Twitch 报 `NoParent`）。所以这里不 `webView.load(URLRequest(url:))`，
+    /// 而是把同一个官方嵌入 URL 放进一份**有合法 http(s) origin 的承载页**里
+    /// （`WorldScreenEmbedOrigin`：回环 + 随机端口 + **不开任何监听套接字**）。
+    /// 白名单、主机、路径、视频 id 一个字节都没动 —— 变的是"谁来嵌它"。
     func load(url: URL) {
         requestedURL = url.absoluteString
         geometryIssue = nil
         transition(to: .loading(url: url.absoluteString))
         resumeMediaIfNeeded()
-        webView.load(URLRequest(url: url))
+        let port = WorldScreenEmbedOrigin.randomPort()
+        let origin = WorldScreenEmbedOrigin.originString(port: port)
+        guard WorldScreenEmbedOrigin.isLegalEmbeddingOrigin(origin),
+              let baseURL = WorldScreenEmbedOrigin.baseURL(port: port)
+        else {
+            transition(to: .failed(.blocked("构造不出合法的承载来源")))
+            return
+        }
+        embeddingOrigin = origin
+        webView.loadHTMLString(
+            WorldScreenEmbedPage.html(embedURL: url.absoluteString, origin: origin),
+            baseURL: baseURL
+        )
         startWatchdog()
     }
 
     func stop() {
         watchdog?.cancel()
         watchdog = nil
+        playerWatch?.cancel()
+        playerWatch = nil
+        embeddingOrigin = nil
         webView.stopLoading()
         webView.loadHTMLString(Self.blankPage, baseURL: nil)
         suspendMedia()
@@ -174,6 +238,39 @@ final class WorldScreenSurface: NSObject, WKNavigationDelegate {
         state = next
         onStateChange?(next)
     }
+
+    /// 页面**载进来之后**，继续看播放器自己报什么。
+    ///
+    /// 为什么必须有这一条：真机 2026-10-02 那块屏幕是 `didFinish` **成功**的
+    /// —— 官方播放器的错误界面本身就是一张正常的网页 —— 于是状态一路变成 `playing`，
+    /// 用户在"播放中"的屏幕上看着「错误 153」，而面板/居民那边一律说"放起来了"。
+    /// 加载成功 != 放得出来，这两件事必须分开报。
+    ///
+    /// 读的是**承载页自己**的 `document.title`（我们那一页把播放器的 postMessage 转写好
+    /// 放在那儿）：跨域 iframe 的内部读不到，也不该去读。
+    private func startPlayerWatch() {
+        playerWatch?.cancel()
+        playerWatch = Task { @MainActor [weak self] in
+            for _ in 0..<Self.playerWatchAttempts {
+                try? await Task.sleep(for: Self.playerWatchInterval)
+                guard !Task.isCancelled, let self, self.state.isPlaying else { return }
+                let raw = try? await self.webView.evaluateJavaScript(
+                    WorldScreenEmbedPage.probeScript
+                )
+                guard let json = raw as? String,
+                      let diagnosis = WorldScreenPlayerDiagnosis.parse(probeJSON: json),
+                      let failure = diagnosis.failure
+                else { continue }
+                self.transition(to: .failed(.playerRefused(failure)))
+                return
+            }
+        }
+    }
+
+    /// 看多久、多久看一次。总量有界：**不是**每帧开销，也不是常驻轮询 ——
+    /// 到点就退，`stop()` 也会取消它。
+    static let playerWatchAttempts = 24
+    static let playerWatchInterval: Duration = .seconds(1)
 
     private func startWatchdog() {
         watchdog?.cancel()
@@ -209,8 +306,12 @@ final class WorldScreenSurface: NSObject, WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         watchdog?.cancel()
         watchdog = nil
-        guard let requestedURL else { return }
+        // `stop()` 载的那张空页也会走一次 `didFinish`：只有"正在载入"才算载好了。
+        // 少了这一条，**关掉的屏幕会被这条回调重新说成"播放中"**（`requestedURL`
+        // 是刻意留着给"上次放的是什么"读的，不能靠清空它来兜）。
+        guard let requestedURL, state.isLoading else { return }
         transition(to: .playing(url: requestedURL))
+        startPlayerWatch()
     }
 
     func webView(
@@ -281,6 +382,15 @@ final class WorldScreenOverlayController {
     private var occluderIndex: WorldScreenOccluderIndex?
     /// 每块屏幕上一次算掩码时的输入签名：没变就**一格都不重算**。
     private var occlusionKeys: [String: String] = [:]
+    /// 每块屏幕上一次掩码重算的时刻（秒，注入时钟）。
+    private var lastMaskRecompute: [String: Double] = [:]
+    /// 每块屏幕**当前渲染尺寸**（点）。它不跟着相机每帧变 —— 见 `renderedSize`。
+    private var renderedSizes: [String: SIMD2<Float>] = [:]
+    /// 本帧的账（每项耗时 + 计数器）。诊断与判据读同一份。
+    private(set) var frameCost = WorldScreenFrameCost()
+    /// **可注入的时钟**（秒）。生产用 `CFAbsoluteTimeGetCurrent`；harness 注入合成时间，
+    /// 于是"掩码最多 30 Hz"这条判据能在离线探针里被驱动，不需要真机启动。
+    var clock: () -> Double = { CFAbsoluteTimeGetCurrent() }
     private weak var hostView: NSView?
     var onSurfaceStateChange: (@MainActor (String, WorldScreenSurfaceState) -> Void)?
 
@@ -326,6 +436,8 @@ final class WorldScreenOverlayController {
         surface.container.removeFromSuperview()
         hiddenReasons[objectID] = nil
         occlusionKeys[objectID] = nil
+        lastMaskRecompute[objectID] = nil
+        renderedSizes[objectID] = nil
         occlusionStats[objectID] = nil
     }
 
@@ -342,6 +454,9 @@ final class WorldScreenOverlayController {
     ///   - camera: 本帧相机（背向判据用）。
     ///   - occluders: 本帧的遮挡物（房间三角面 + 物件盒 + 居民盒）。
     ///     默认为空 = 不裁任何区域（旧调用点/离线驱动逐字不变）。
+    ///
+    /// 一帧的每一项都记进 `frameCost`（见 `WorldScreenFrameCost`）：这是"推进镜头爆卡"
+    /// 唯一能被复核的口径 —— 光有"每帧 0.6 ms"说不清是算遮挡、画遮挡还是贴覆盖层。
     func update(
         quads: [String: [SIMD3<Float>]],
         normals: [String: SIMD3<Float>],
@@ -349,12 +464,19 @@ final class WorldScreenOverlayController {
         camera: WorldScreenCamera,
         occluders: WorldScreenOccluders = .empty
     ) {
+        frameCost = WorldScreenFrameCost()
+        let signpost = overlaySignposter.beginInterval("screen.overlay.frame")
+        defer { overlaySignposter.endInterval("screen.overlay.frame", signpost) }
         if occluderIndex?.revision != occluders.revision {
+            let start = CFAbsoluteTimeGetCurrent()
             occluderIndex = occluders.triangles.isEmpty
                 ? nil
                 : WorldScreenOccluderIndex(
                     triangles: occluders.triangles, revision: occluders.revision
                 )
+            frameCost.occluderIndexBuild = CFAbsoluteTimeGetCurrent() - start
+            frameCost.didRebuildOccluderIndex = true
+            overlaySignposter.emitEvent("screen.occluder-index.build")
         }
         for (objectID, surface) in surfaces {
             guard let worldCorners = quads[objectID], worldCorners.count == 4 else {
@@ -374,22 +496,29 @@ final class WorldScreenOverlayController {
                 continue
             }
             guard let normalized = projection.screenQuad(worldCorners: worldCorners),
-                  let placement = WorldScreenOverlayAlignment.placement(
+                  let boundsSize = WorldScreenOverlayAlignment.boundingSize(
                       normalizedCorners: normalized, projection: projection
                   )
             else {
                 hide(surface, reason: "屏幕在相机背后或投影退化")
                 continue
             }
+            // 宿主渲染尺寸**带滞回**：相机连续移动时尺寸不动，全部由 transform 吸收。
+            let rendered = Self.renderedSize(
+                current: renderedSizes[objectID], desired: boundsSize,
+                hysteresis: WorldScreenFrameBudget.renderedSizeHysteresis
+            )
+            renderedSizes[objectID] = rendered
+            guard let placement = WorldScreenOverlayAlignment.placement(
+                normalizedCorners: normalized, projection: projection,
+                referenceSize: rendered
+            ) else {
+                hide(surface, reason: "屏幕在相机背后或投影退化")
+                continue
+            }
             surface.container.isHidden = false
             hiddenReasons[objectID] = nil
-            surface.container.frame = CGRect(
-                x: CGFloat(placement.frameOrigin.x),
-                y: CGFloat(placement.frameOrigin.y),
-                width: CGFloat(placement.frame.x),
-                height: CGFloat(placement.frame.y)
-            )
-            surface.container.layer?.transform = placement.transform.cgTransform
+            applyPlacement(surface, placement: placement)
             surface.resumeMediaIfNeeded()
             updateOcclusion(
                 surface, worldCorners: worldCorners, camera: camera,
@@ -398,12 +527,108 @@ final class WorldScreenOverlayController {
         }
     }
 
+    /// 宿主的**渲染尺寸**：只在包围盒相对它涨/缩超过 `hysteresis` 时换一次。
+    ///
+    /// 这是"推进镜头爆卡"的要害。`container.bounds` 一变，里面的 `WKWebView` 就换一次
+    /// 尺寸，WebKit 于是让内容进程**重新布局并重画整页**（视频页还要重建播放器层）。
+    /// 实测：120 帧的推进里，尺寸原来换了 **120 次**（每帧一次）；带滞回之后 **0 次**
+    /// （一次推近里最多换几次），中间的相机移动全部由 `layer.transform` 吸收 ——
+    /// 对齐逐点不变（`placement` 的源矩形与变换一起换）。
+    static func renderedSize(
+        current: SIMD2<Float>?, desired: SIMD2<Float>, hysteresis: Float
+    ) -> SIMD2<Float> {
+        guard let current, current.x > 0, current.y > 0 else { return desired }
+        let limit = max(hysteresis, 0)
+        let upper = 1 + limit
+        let lower = 1 / upper
+        let fits = desired.x <= current.x * upper && desired.x >= current.x * lower
+            && desired.y <= current.y * upper && desired.y >= current.y * lower
+        return fits ? current : desired
+    }
+
+    /// 把宿主贴到这一帧的位置上。**只在真的变了的时候写。**
+    ///
+    /// `frame` / `transform` 的每一次赋值都是一次 CoreAnimation 事务；`frame` 还带着
+    /// AppKit 的布局副作用（子视图 autoresizing），所以"值一样就别写"。
+    /// 尺寸没变时只写原点，**不经过尺寸那条路** —— 否则 `NSView.setFrame` 仍会把新尺寸
+    /// 递给 `WKWebView`。
+    ///
+    /// **为什么变换必须按图层现在的值重写**（2026-10-02 真机「覆盖层与电视对不齐」的根因）：
+    /// AppKit 的 `frame` / `setFrameOrigin` 会把 `layer.transform` **重置成单位阵**
+    /// （实测两条路都会）。于是"变换与我们缓存里那一份相等就早退"这条优化，在
+    /// **尺寸被滞回吸附住**之后（原点每帧都动、尺寸不动）会把变换**永久留在单位阵上**：
+    /// 画面还贴在原地，但角度与大小从第一帧起就不再跟着相机走 —— 用户看到的就是"对不上"。
+    ///
+    /// 修法是两条一起：
+    /// 1. 判据读**图层现在真的拿着的那一份**（`layer.transform`）而不是我们自己记的缓存，
+    ///    AppKit 重置过就一定会被写回去；
+    /// 2. 写下去的变换要过 `layerTransform(forAnchor:)` 这个**唯一的口径转换** ——
+    ///    `placement` 解出的是"绕包围盒中心"施加的单应，而 AppKit backing layer 的
+    ///    `anchorPoint` 是 `(0,0)` 且改不动（实测赋 `(0.5,0.5)` 会被立刻改回 `(0,0)`）。
+    ///
+    /// 尺寸仍然只在超过滞回阈值时换一次（每次换都会付一次 `WKWebView` 重排），
+    /// 相机移动全部由这一份变换吸收 —— 性能收益与逐点对齐因此同时成立。
+    private func applyPlacement(
+        _ surface: WorldScreenSurface, placement: WorldScreenOverlayAlignment.Placement
+    ) {
+        let container = surface.container
+        let size = CGSize(
+            width: CGFloat(placement.frame.x), height: CGFloat(placement.frame.y)
+        )
+        let layer = container.layer
+        let start = CFAbsoluteTimeGetCurrent()
+        if surface.appliedFrameSize != size {
+            frameCost.didResizeSurface = true
+            // AppKit 的尺寸那条路会重置 `layer.transform` ⇒ 同帧内必须重写变换（见下）。
+            container.frame = CGRect(
+                x: CGFloat(placement.frameOrigin.x), y: CGFloat(placement.frameOrigin.y),
+                width: size.width, height: size.height
+            )
+            surface.appliedFrameSize = size
+            surface.appliedFrameOrigin = CGPoint(
+                x: CGFloat(placement.frameOrigin.x), y: CGFloat(placement.frameOrigin.y)
+            )
+            surface.appliedTransform = nil
+        } else if surface.appliedFrameOrigin?.x != CGFloat(placement.frameOrigin.x)
+            || surface.appliedFrameOrigin?.y != CGFloat(placement.frameOrigin.y) {
+            // 尺寸没变时只动原点：**不经过尺寸那条路**（否则 `NSView.setFrame` 仍会把
+            // 新尺寸递给 `WKWebView`，那正是爆卡的主因）。
+            let origin = CGPoint(
+                x: CGFloat(placement.frameOrigin.x), y: CGFloat(placement.frameOrigin.y)
+            )
+            container.setFrameOrigin(origin)
+            surface.appliedFrameOrigin = origin
+        }
+        frameCost.overlayFrame = CFAbsoluteTimeGetCurrent() - start
+        let transformStart = CFAbsoluteTimeGetCurrent()
+        // 口径转换只有一处：`placement` 解出的是**层心**口径，写进图层前必须换成
+        // AppKit backing layer 的**原点**口径（见 `layerTransform(forAnchor:)`）。
+        let layerTransform = placement.transform.layerTransform(
+            forAnchor: SIMD2(placement.frame.x / 2, placement.frame.y / 2)
+        )
+        // 判据读**图层现在的值**而不是缓存：AppKit 会在尺寸那条路上把 `layer.transform`
+        // 重置成单位阵，缓存说"没变"就会漏写（这正是"角度慢慢对不上"的另一半）。
+        let written = layer.map { WorldScreenLayerTransform(cgTransform: $0.transform) }
+        if written != layerTransform {
+            layer?.transform = layerTransform.cgTransform
+            surface.appliedTransform = layerTransform
+        }
+        frameCost.overlayTransform = CFAbsoluteTimeGetCurrent() - transformStart
+    }
+
     // MARK: 前景遮挡
 
-    /// 掩码只在**输入真的变了**的时候重算。
+    /// 掩码只在**输入真的变了**、**且离上一次够久**的时候重算。
     ///
-    /// 这既是成本控制（相机不动、遮挡物不动、四边形没变 ⇒ 一格都不重算），
-    /// 也是"正常观看时不闪烁"的实现方式：**不重算就不可能抖**。
+    /// 两条闸门各管一件事：
+    /// 1. **签名没变 ⇒ 一格都不重算**（相机不动、遮挡物不动、四边形没变）。这既是成本控制，
+    ///    也是"正常观看时不闪烁"的实现方式：不重算就不可能抖；
+    /// 2. **签名变了也要间隔 ≥ `maskMinimumInterval`**（≈30 Hz）。相机连续移动时签名每帧
+    ///    都在变，只有第 1 条拦不住 —— 于是 24 × 14 格的射线求交、可见格并集、`CGPath`
+    ///    构造与图层赋值全都变成每帧一次。格级掩码在 33 ms 内不可能被看出滞后，
+    ///    而这三件事加起来是这一级唯一有量级的 CPU 成本（真机实测见断言9）。
+    ///
+    /// 被节流挡掉时**不记签名**：下一拍（窗口过了）会拿当时的输入重算，所以不会漏。
     private func updateOcclusion(
         _ surface: WorldScreenSurface,
         worldCorners: [SIMD3<Float>],
@@ -411,14 +636,22 @@ final class WorldScreenOverlayController {
         placement: WorldScreenOverlayAlignment.Placement,
         occluders: WorldScreenOccluders
     ) {
+        let keyStart = CFAbsoluteTimeGetCurrent()
         let key = Self.occlusionKey(
             corners: worldCorners, camera: camera, placement: placement,
             occluders: occluders, owner: surface.objectID
         )
+        frameCost.occlusionKey = CFAbsoluteTimeGetCurrent() - keyStart
         guard key != occlusionKeys[surface.objectID] else { return }
+        let now = clock()
+        if let last = lastMaskRecompute[surface.objectID],
+           now - last < Self.maskMinimumInterval {
+            return
+        }
         occlusionKeys[surface.objectID] = key
-        let clock = ContinuousClock()
-        let start = clock.now
+        lastMaskRecompute[surface.objectID] = now
+        frameCost.didRecomputeMask = true
+        let start = CFAbsoluteTimeGetCurrent()
         let mask = WorldScreenOcclusion.mask(
             quadCorners: worldCorners,
             cameraPosition: camera.position,
@@ -426,13 +659,22 @@ final class WorldScreenOverlayController {
             index: occluderIndex,
             excluding: surface.objectID
         )
-        let cost = clock.now - start
+        let seconds = CFAbsoluteTimeGetCurrent() - start
+        frameCost.maskCompute = seconds
+        let cost = Duration.seconds(seconds)
         surface.applyOcclusion(mask, cost: cost)
+        frameCost.maskPath = surface.lastMaskCost.pathBuild
+        frameCost.maskAssign = surface.lastMaskCost.assign
+        frameCost.didRebuildMaskPath = surface.lastMaskCost.didRebuildPath
         occlusionStats[surface.objectID] = WorldScreenOcclusionStat(
             objectID: surface.objectID, columns: mask.columns, rows: mask.rows,
             blockedCellCount: mask.blockedCellCount, cost: cost
         )
+        overlaySignposter.emitEvent("screen.occlusion.recompute")
     }
+
+    /// 两次掩码重算之间的**最小间隔**（秒）。相机连续移动时掩码最多这么勤。
+    static let maskMinimumInterval = 1.0 / WorldScreenFrameBudget.maximumMaskRecomputesPerSecond
 
     /// 掩码的输入签名。相机位姿、四角、容器尺寸、遮挡物（含每个盒）都在里面 ——
     /// 少一项就会"该重算的时候没重算"，多一项就会白算。
@@ -492,5 +734,55 @@ extension WorldScreenLayerTransform {
             m31: CGFloat(m31), m32: CGFloat(m32), m33: CGFloat(m33), m34: CGFloat(m34),
             m41: CGFloat(m41), m42: CGFloat(m42), m43: CGFloat(m43), m44: CGFloat(m44)
         )
+    }
+
+    /// `CATransform3D` → 纯值。与 `cgTransform` 是同一个转换的两个方向，所以也放在一处：
+    /// `applyPlacement` 用它判断"图层现在这一份是不是我想要的那一份"（AppKit 会把
+    /// `layer.transform` 重置成单位阵，光看缓存会漏写）。
+    init(cgTransform value: CATransform3D) {
+        self.init(
+            m11: Float(value.m11), m12: Float(value.m12), m13: Float(value.m13),
+            m14: Float(value.m14),
+            m21: Float(value.m21), m22: Float(value.m22), m23: Float(value.m23),
+            m24: Float(value.m24),
+            m31: Float(value.m31), m32: Float(value.m32), m33: Float(value.m33),
+            m34: Float(value.m34),
+            m41: Float(value.m41), m42: Float(value.m42), m43: Float(value.m43),
+            m44: Float(value.m44)
+        )
+    }
+
+    /// **图层口径的修正**（覆盖层对齐的唯一一处口径转换）。
+    ///
+    /// `WorldScreenOverlayAlignment.placement` 解出的单应 H，是把"宿主 bounds 的四角
+    /// （相对包围盒中心）"搬到"四边形四角（相对同一个中心）"—— 它默认图层绕**层心**
+    /// 施加变换，也就是 `anchorPoint = (0.5, 0.5)`。
+    ///
+    /// 而 AppKit 的 backing layer（`NSViewBackingLayer`）`anchorPoint` 实测是 **`(0, 0)`**、
+    /// `position` 等于 `frame.origin`（改 frame、设 transform 之后都不变），CoreAnimation
+    /// 实际施加的是 `position + T(bounds 角)`。两个口径之间差的**不是一段平移，而是
+    /// 绕层心与绕原点的一次共轭**：
+    ///
+    ///     G(q) = a + H(q − a)        （a = bounds.size / 2）
+    ///
+    /// 所以"把 `m41/m42` 归零"不是这个修正 —— 那会把"包围盒中心 → 四边形中心"那段平移
+    /// 一起丢掉，比不修更偏。下面六个分量（外加 `m44`）要一起动，才是那次共轭。
+    ///
+    /// 实测（`tools/test-resident-screen-overlay.swift` 断言10，同一段 120 帧推进，
+    /// 按图层**实际**口径 `position + G(bounds 角)` 与投影四角的距离）：
+    /// 原样写层心口径 ⇒ 最大 **24.6 px**；归零 `m41/m42` ⇒ **更差**；
+    /// 共轭修正 ⇒ **0.0001 px**。
+    func layerTransform(forAnchor a: SIMD2<Float>) -> WorldScreenLayerTransform {
+        // 共轭之后的分母常数项：`w(q − a) = m14·qx + m24·qy + (m44 − m14·ax − m24·ay)`。
+        let constant = m44 - m14 * a.x - m24 * a.y
+        var conjugated = self
+        conjugated.m11 = m11 + a.x * m14
+        conjugated.m21 = m21 + a.x * m24
+        conjugated.m41 = m41 - m11 * a.x - m21 * a.y + a.x * constant
+        conjugated.m12 = m12 + a.y * m14
+        conjugated.m22 = m22 + a.y * m24
+        conjugated.m42 = m42 - m12 * a.x - m22 * a.y + a.y * constant
+        conjugated.m44 = constant
+        return conjugated
     }
 }

@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import os
+import os.signpost
 import simd
 import WorldRuntime
 
@@ -10,6 +11,15 @@ import WorldRuntime
 /// 前景遮挡的格数与掩码耗时（"63/336 格"、"117.98 ms"）。真机 2026-10-02 的教训是
 /// "把这些摆到面板上" —— 用户看到的是「什么玩意儿」。
 private let screenPanelLogger = Logger(subsystem: "ai.gmgn.radio", category: "screen")
+
+/// 60 Hz 跟踪与 6 Hz 世界重读的耗时去这里（Instruments 的 points of interest）。
+///
+/// 与覆盖层那一份同一个 subsystem/category：一帧里"跟相机"（`screen.tick`）、
+/// "重读世界"（`screen.rebuild`）与"贴覆盖层"（`screen.overlay.frame`）在时间轴上
+/// 是三条可比的区段 —— 相机持续移动时哪一条占满了帧预算，一眼看得出来。
+private let screenTrackingSignposter = OSSignposter(
+    subsystem: "ai.gmgn.radio", category: .pointsOfInterest
+)
 
 /// 电视屏幕在 App 里的**唯一**接线点。
 ///
@@ -72,6 +82,12 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
     private var trackingTask: Task<Void, Never>?
     private var lastTrackingKey = ""
     private var tickCount = 0
+    /// 最近一拍的总耗时（毫秒）。60 Hz 节拍：**同状态时它是"什么都没做"的那一拍**。
+    private(set) var lastTickMilliseconds: Double = 0
+    /// 最近一次 6 Hz 世界重读（`rebuild()`）的耗时（毫秒）。
+    private(set) var lastRebuildMilliseconds: Double = 0
+    /// 最近一拍贴覆盖层的耗时（毫秒，含遮挡掩码）。
+    private(set) var lastOverlayMilliseconds: Double = 0
     /// 最后一次覆盖层隐藏原因（诊断/面板可读）。
     var hiddenReasons: [String: String] { overlay.hiddenReasons }
 
@@ -112,7 +128,14 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
 
     /// 每拍：相机/视口变了就重贴；每 `refreshEvery` 拍才重读一次世界状态。
     /// **同状态不重复做事**（`lastTrackingKey`）。
+    ///
+    /// 两条节拍各自带一节 signpost 区段；`lastTickMilliseconds` /
+    /// `lastRebuildMilliseconds` / `lastOverlayMilliseconds` 是它们的最后一份数字
+    /// （诊断可读，离线判据不依赖它 —— 判据驱动的是覆盖层那一份账）。
     private func tick(refreshEvery: Int) {
+        let tickStart = CFAbsoluteTimeGetCurrent()
+        let signpost = screenTrackingSignposter.beginInterval("screen.tick")
+        defer { screenTrackingSignposter.endInterval("screen.tick", signpost) }
         tickCount += 1
         let projection = projectionProvider()
         let camera = WorldScreenCamera(
@@ -122,11 +145,20 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
         )
         let key = Self.trackingKey(camera: camera, projection: projection)
         let needsRefresh = tickCount % refreshEvery == 0
-        guard key != lastTrackingKey || needsRefresh else { return }
+        guard key != lastTrackingKey || needsRefresh else {
+            lastTickMilliseconds = (CFAbsoluteTimeGetCurrent() - tickStart) * 1000
+            lastOverlayMilliseconds = 0
+            return
+        }
         lastTrackingKey = key
         overlay.setWorldVisible(spatialStage.isWorldVisible)
+        let rebuildStart = CFAbsoluteTimeGetCurrent()
         if needsRefresh { rebuild() }
+        lastRebuildMilliseconds = (CFAbsoluteTimeGetCurrent() - rebuildStart) * 1000
+        let overlayStart = CFAbsoluteTimeGetCurrent()
         updateOverlay(projection: projection, camera: camera)
+        lastOverlayMilliseconds = (CFAbsoluteTimeGetCurrent() - overlayStart) * 1000
+        lastTickMilliseconds = (CFAbsoluteTimeGetCurrent() - tickStart) * 1000
     }
 
     /// 相机 + 视口的完整签名。相机位姿与视口尺寸就是投影的全部输入，所以这个键
@@ -147,6 +179,8 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
     /// 重读世界状态、重算所有屏幕的几何。
     /// **每一级来源与每一种拒绝都被记下来**，没有静默分支。
     func rebuild() {
+        let signpost = screenTrackingSignposter.beginInterval("screen.rebuild")
+        defer { screenTrackingSignposter.endInterval("screen.rebuild", signpost) }
         let states = source.objectStates()
         // 遮挡盒跟着世界状态的刷新节拍（6 Hz）重建 —— 与屏幕几何同一份输入。
         rebuildOccluderBoxes(from: states)

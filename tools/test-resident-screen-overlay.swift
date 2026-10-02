@@ -988,10 +988,17 @@ let program = temporary.appendingPathComponent("Test.swift")
 try innerProgram.write(to: program, atomically: true, encoding: .utf8)
 let executable = temporary.appendingPathComponent("test")
 let screenSources = screenFiles.map { screenRoot.appendingPathComponent($0).path }
-let compiled = try run(
+let compiledCapture = try runFitCapture(
     "/usr/bin/swiftc",
     ["-j1", "-parse-as-library"] + screenSources + [program.path, "-o", executable.path]
 )
+if compiledCapture.status != 0 {
+    // 编译器原话要贴出来：只说"编译失败"等于没有信息（改坏了哪一处，当场看得见）。
+    for line in compiledCapture.output.split(separator: "\n").prefix(40) {
+        print("   · [内层编译] \(line)")
+    }
+}
+let compiled = compiledCapture.status
 guard compiled == 0 else {
     print("FAIL 内层程序编译失败（exit \(compiled)）—— 判据没能跑起来")
     exit(compiled)
@@ -1294,7 +1301,8 @@ func overlayOcclusionVerdict(_ source: String) -> [String] {
     if !source.contains("container.layer?.mask = created") {
         problems.append("被挡时没有挂 `CALayer.mask`")
     }
-    if !source.contains("guard let mask, !mask.isFullyVisible else") {
+    if !source.contains("guard let mask, !mask.isFullyVisible")
+        || !source.contains("container.layer?.mask = nil") {
         problems.append("全可见时没有摘掉 mask 的早退回")
     }
     if !source.contains("mask.visibleRects(in: size)") {
@@ -1320,8 +1328,8 @@ check(overlayOcclusionProblems.isEmpty,
 
 // 注入：把"全可见就摘掉 mask"改成"永远挂一块掩码" ⇒ 判据必须红。
 let injectedAlwaysMask = overlaySource.replacingOccurrences(
-    of: "guard let mask, !mask.isFullyVisible else",
-    with: "guard let mask, mask.cellCount > 0 else"
+    of: "guard let mask, !mask.isFullyVisible, size.x > 0, size.y > 0 else",
+    with: "guard let mask, mask.cellCount > 0, size.x > 0, size.y > 0 else"
 )
 check(!overlayOcclusionVerdict(injectedAlwaysMask).isEmpty,
     "断言6（注入负对照）：把「全可见就摘掉 mask」改掉 ⇒ 判据 FAIL。原话："
@@ -1680,6 +1688,399 @@ for injection in fitInjections {
             + (probe.note.isEmpty ? "" : " —— \(probe.note)"))
     // 注入时的 FAIL 原话贴出来（红的是哪一条，当场看得见）。
     for line in probe.output.split(separator: "\n").filter({ $0.hasPrefix("FIT-FAIL") }).prefix(3) {
+        print("  · \(line)")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MARK: 断言 10（行为 + 性能预算）：相机持续移动时**不**每帧重建 BVH / 不每帧重算掩码
+// ---------------------------------------------------------------------------
+
+/// 相机连续推进 120 帧，逐项量遮挡与覆盖层每帧花掉的时间与**次数**。
+///
+/// 驱动的是**生产里那一份 `WorldScreenOverlayController` 原文**（连同 `WorldScreenProjection`
+/// / `WorldScreenOcclusion` / `WorldScreenState` / `WorldScreenGeometry`），现编现跑：
+/// AppKit 只在进程里建视图与图层，**不开窗口、不起 App、不碰 Metal、不碰网络**。
+/// 节拍用**注入的时钟**驱动（`controller.clock`），所以"掩码最多 30 Hz"这条判据不需要
+/// 真机启动就能机器判定。
+///
+/// 为什么必须能抓：真机 2026-10-02「推进镜头爆卡」。同一段 120 帧推进（1200 个房间三角面
+/// + 居民盒，-O 编）的实测对比：
+///
+/// | 项 | 改造前 | 改造后 |
+/// |---|---|---|
+/// | 掩码重算 | 120 次（每帧） | 46 次（≈23 Hz） |
+/// | 掩码路径重建 | 120 次 | 8 次（只在掩码真的变了时） |
+/// | 宿主尺寸变化（⇒ WebKit 重排版） | 120 次 | 3 次 |
+/// | 每帧平均 | 0.62–0.65 ms | 0.23–0.25 ms |
+/// | 单帧峰值 | 2.03 ms | 0.68–1.03 ms |
+///
+/// 判据抓的就是这几个**量级**：`occluderIndexBuilds` 抬到帧数、`maskRecomputes` 超过
+/// 30 Hz、宿主尺寸每帧一变，任何一条都立刻红。
+///
+/// **必须 -O 编**：这几十行是紧的 simd 内层循环，debug 构建下同一段代码慢 ~70 倍
+/// （实测每帧 16.4 ms vs 0.23 ms）—— 用 debug 数字判性能预算等于判编译器。
+let performanceProbeProgram = ##"""
+import AppKit
+import Foundation
+import simd
+
+var perfFailures = 0
+func perf(_ condition: Bool, _ message: String) {
+    if condition {
+        print("PERF-PASS \(message)")
+    } else {
+        print("PERF-FAIL \(message)")
+        perfFailures += 1
+    }
+}
+
+/// 一间 6 × 2.6 × 8 的房间（地板 / 天花 / 四壁），1200 个三角面 ——
+/// 真机那一份碰撞 GLB 是用来做深度遮挡的同一份几何，就是这个量级。
+func perfRoom() -> [WorldScreenTriangle] {
+    var triangles: [WorldScreenTriangle] = []
+    let halfX: Float = 3, height: Float = 2.6, halfZ: Float = 4
+    let steps = 100
+    for index in 0 ..< steps {
+        let t0 = Float(index) / Float(steps) * 2 * halfZ - halfZ
+        let t1 = Float(index + 1) / Float(steps) * 2 * halfZ - halfZ
+        triangles.append(WorldScreenTriangle(
+            SIMD3(-halfX, 0, t0), SIMD3(halfX, 0, t0), SIMD3(halfX, 0, t1)))
+        triangles.append(WorldScreenTriangle(
+            SIMD3(-halfX, 0, t0), SIMD3(halfX, 0, t1), SIMD3(-halfX, 0, t1)))
+        triangles.append(WorldScreenTriangle(
+            SIMD3(-halfX, height, t0), SIMD3(halfX, height, t1), SIMD3(halfX, height, t0)))
+        triangles.append(WorldScreenTriangle(
+            SIMD3(-halfX, height, t0), SIMD3(-halfX, height, t1), SIMD3(halfX, height, t1)))
+    }
+    triangles.append(WorldScreenTriangle(
+        SIMD3(-halfX, 0, -halfZ), SIMD3(halfX, 0, -halfZ), SIMD3(halfX, height, -halfZ)))
+    triangles.append(WorldScreenTriangle(
+        SIMD3(-halfX, 0, -halfZ), SIMD3(halfX, height, -halfZ), SIMD3(-halfX, height, -halfZ)))
+    for index in 0 ..< 12 {
+        let y0 = Float(index) / 12 * height
+        let y1 = Float(index + 1) / 12 * height
+        triangles.append(WorldScreenTriangle(
+            SIMD3(-halfX, y0, -halfZ), SIMD3(-halfX, y0, halfZ), SIMD3(-halfX, y1, halfZ)))
+        triangles.append(WorldScreenTriangle(
+            SIMD3(-halfX, y0, -halfZ), SIMD3(-halfX, y1, halfZ), SIMD3(-halfX, y1, -halfZ)))
+        triangles.append(WorldScreenTriangle(
+            SIMD3(halfX, y0, -halfZ), SIMD3(halfX, y1, halfZ), SIMD3(halfX, y0, halfZ)))
+        triangles.append(WorldScreenTriangle(
+            SIMD3(halfX, y0, -halfZ), SIMD3(halfX, y1, -halfZ), SIMD3(halfX, y1, halfZ)))
+    }
+    return triangles
+}
+
+/// 一段相机推进的读数。
+struct PerfReading {
+    var frames = 0
+    var average = 0.0
+    var peak = 0.0
+    var bvhBuilds = 0
+    var maskRecomputes = 0
+    var maskPathRebuilds = 0
+    var surfaceSizeChanges = 0
+    var webViewResizes = 0
+    var worstAlignmentError: Float = 0
+    /// 图层实际用的锚点（`NSViewBackingLayer` 是 `(0, 0)`）—— 判据的口径出处。
+    var anchorPoint = CGPoint.zero
+    var blockedCells = 0
+    var cellCount = 0
+    var hiddenAfterTurnAround = false
+    var maskDetachedWhenClear = false
+}
+
+@main struct PerformanceProbe {
+    @MainActor static func main() {
+        let quad = WorldScreenQuad(center: SIMD3<Float>(0, 0.8, -3.95), yaw: 0, pitch: 0,
+                                   halfWidth: 0.62, halfHeight: 0.35)
+        let corners = quad.worldCorners(placedAt: SIMD3<Float>(0, 0, 0), yaw: 0)
+        let normal = quad.worldNormal(yaw: 0)
+        let resident = WorldScreenBox(center: SIMD3(0, 0.85, -2.9),
+                                      halfExtents: SIMD3(0.25, 0.85, 0.2), yaw: 0)
+
+        func drive(blocked: Bool) -> PerfReading {
+            var reading = PerfReading()
+            let host = NSView(frame: CGRect(x: 0, y: 0, width: 1600, height: 1000))
+            host.wantsLayer = true
+            let controller = WorldScreenOverlayController(hostView: host)
+            let surface = controller.surface(for: "tv-1")
+            let webView = surface.container.subviews.first
+            let occluders = WorldScreenOccluders(
+                triangles: perfRoom(), boxes: blocked ? [resident] : [], revision: 7)
+
+            let frames = 120
+            let dt = 1.0 / 60.0
+            var synthetic = 0.0
+            controller.clock = { synthetic }
+            var steadyTotal = 0.0
+            var steadyPeak = 0.0
+            var steadyFrames = 0
+            var lastWebFrame = webView?.frame ?? .zero
+
+            for frame in 0 ..< frames {
+                let t = Float(frame) / Float(frames - 1)
+                // 相机从 3.2 m 处推到 1.4 m 处，同时轻微转头 —— 用户说的「推进镜头」。
+                let camera = WorldScreenCamera(
+                    position: SIMD3(0.2 * t, 0.85, -0.8 + 2.4 * (1 - t)), yaw: 0.08 * t, pitch: 0)
+                let projection = WorldScreenProjection(
+                    camera: camera, profile: .fullStage, viewportSize: SIMD2(1600, 1000))
+                synthetic += dt
+                controller.update(quads: ["tv-1": corners], normals: ["tv-1": normal],
+                                  projection: projection, camera: camera, occluders: occluders)
+                let cost = controller.frameCost
+                if cost.didRebuildOccluderIndex { reading.bvhBuilds += 1 }
+                if cost.didRecomputeMask { reading.maskRecomputes += 1 }
+                if cost.didRebuildMaskPath { reading.maskPathRebuilds += 1 }
+                if cost.didResizeSurface { reading.surfaceSizeChanges += 1 }
+                if let webView, webView.frame != lastWebFrame {
+                    lastWebFrame = webView.frame
+                    reading.webViewResizes += 1
+                }
+                if frame > 0 {
+                    steadyTotal += cost.milliseconds
+                    steadyPeak = max(steadyPeak, cost.milliseconds)
+                    steadyFrames += 1
+                }
+                // 对齐：按图层**实际的口径**算它会画在哪 —— `NSViewBackingLayer` 的
+                // `anchorPoint` 是 (0,0)、`position` 是 `frame.origin`，CoreAnimation 施加的是
+                // `position + T(bounds 角)`。读的是**图层现在的值**，不是我们自己算的中间量：
+                // 这样这条判据第一次真的在验"CoreAnimation 会画在哪"，而不是自证一句空话。
+                guard let normalized = projection.screenQuad(worldCorners: corners),
+                      let layer = surface.container.layer
+                else { continue }
+                let points = normalized.map { projection.viewPoint(normalized: $0) }
+                let liveSize = surface.container.bounds.size
+                let liveAnchor = layer.anchorPoint
+                let livePosition = SIMD2(Float(layer.position.x), Float(layer.position.y))
+                reading.anchorPoint = liveAnchor
+                let writtenTransform = WorldScreenLayerTransform(cgTransform: layer.transform)
+                let source: [SIMD2<Float>] = [
+                    SIMD2(0, 0), SIMD2(Float(liveSize.width), 0),
+                    SIMD2(Float(liveSize.width), Float(liveSize.height)),
+                    SIMD2(0, Float(liveSize.height)),
+                ]
+                let anchorOffset = SIMD2(
+                    Float(liveAnchor.x) * Float(liveSize.width),
+                    Float(liveAnchor.y) * Float(liveSize.height)
+                )
+                for corner in 0 ..< 4 {
+                    guard let actual = writtenTransform.apply(to: source[corner] - anchorOffset)
+                    else { continue }
+                    let absolute = livePosition + anchorOffset + actual
+                    reading.worstAlignmentError = max(
+                        reading.worstAlignmentError, simd_length(absolute - points[corner]))
+                }
+            }
+            reading.frames = steadyFrames
+            reading.average = steadyFrames > 0 ? steadyTotal / Double(steadyFrames) : 0
+            reading.peak = steadyPeak
+
+            let stat = controller.occlusionStats["tv-1"]
+            reading.blockedCells = stat?.blockedCellCount ?? 0
+            reading.cellCount = stat?.cellCount ?? 0
+            reading.maskDetachedWhenClear = surface.occlusionMask?.isFullyVisible ?? true
+
+            // 背向仍剔除：转到屏幕后面，整块必须隐藏并给出具名原因。
+            let behind = WorldScreenCamera(position: SIMD3(0, 0.85, -5.2), yaw: .pi, pitch: 0)
+            let behindProjection = WorldScreenProjection(
+                camera: behind, profile: .fullStage, viewportSize: SIMD2(1600, 1000))
+            controller.update(quads: ["tv-1": corners], normals: ["tv-1": normal],
+                              projection: behindProjection, camera: behind,
+                              occluders: WorldScreenOccluders.empty)
+            reading.hiddenAfterTurnAround = surface.container.isHidden
+            return reading
+        }
+
+        let clear = drive(blocked: false)
+        let blockedReading = drive(blocked: true)
+        let seconds = Double(clear.frames) / 60.0
+
+        // MARK: 每帧预算（遮挡 + 覆盖层）
+        for (name, reading) in [("无遮挡", clear), ("居民挡在屏前", blockedReading)] {
+            let problems = WorldScreenFrameBudget.problems(
+                frames: reading.frames,
+                averageCostMilliseconds: reading.average,
+                peakCostMilliseconds: reading.peak,
+                occluderIndexBuilds: reading.bvhBuilds,
+                maskRecomputes: reading.maskRecomputes,
+                maskPathRebuilds: reading.maskPathRebuilds,
+                durationSeconds: seconds,
+                surfaceSizeChanges: reading.surfaceSizeChanges
+            )
+            for problem in problems {
+                perf(false, "\(name)：\(problem)")
+            }
+            let hertz = seconds > 0 ? Double(reading.maskRecomputes) / seconds : 0
+            print(String(format: "PERF-COST %@: 每帧平均 %.3f ms / 峰值 %.3f ms；"
+                         + "BVH 重建 %d 次、掩码重算 %d 次(%.1f Hz)、路径重建 %d 次、"
+                         + "宿主尺寸变化 %d 次、WKWebView 换尺寸 %d 次、"
+                         + "图层锚点 (%.1f,%.1f) 下最大对齐偏差 %.5f px",
+                         name, reading.average, reading.peak, reading.bvhBuilds,
+                         reading.maskRecomputes, hertz, reading.maskPathRebuilds,
+                         reading.surfaceSizeChanges, reading.webViewResizes,
+                         reading.anchorPoint.x, reading.anchorPoint.y,
+                         reading.worstAlignmentError))
+            perf(reading.anchorPoint == .zero,
+                 "\(name)：`NSViewBackingLayer` 的锚点仍是 (0,0)（实测 "
+                     + "(\(reading.anchorPoint.x),\(reading.anchorPoint.y))）—— "
+                     + "覆盖层的图层口径修正就是按这一条推出来的")
+            perf(reading.average <= WorldScreenFrameBudget.averageMilliseconds,
+                 "\(name)：每帧平均 \(String(format: "%.3f", reading.average)) ms ≤ "
+                     + "\(WorldScreenFrameBudget.averageMilliseconds) ms")
+            perf(reading.peak <= WorldScreenFrameBudget.peakMilliseconds,
+                 "\(name)：单帧峰值 \(String(format: "%.3f", reading.peak)) ms ≤ "
+                     + "\(WorldScreenFrameBudget.peakMilliseconds) ms")
+            perf(reading.bvhBuilds <= WorldScreenFrameBudget.maximumOccluderIndexBuilds,
+                 "\(name)：房间 BVH 只重建 \(reading.bvhBuilds) 次（120 帧推进，房间没变）")
+            perf(hertz <= WorldScreenFrameBudget.maximumMaskRecomputesPerSecond,
+                 "\(name)：掩码重算 \(String(format: "%.1f", hertz)) Hz ≤ "
+                     + "\(WorldScreenFrameBudget.maximumMaskRecomputesPerSecond) Hz")
+            perf(reading.maskPathRebuilds <= reading.maskRecomputes,
+                 "\(name)：掩码路径只重建 \(reading.maskPathRebuilds) 次，不多于掩码重算 "
+                     + "\(reading.maskRecomputes) 次（同一张掩码不重建路径）")
+            perf(reading.maskPathRebuilds < reading.maskRecomputes,
+                 "\(name)：掩码没变就不重建路径 —— \(reading.maskRecomputes) 次重算里只有 "
+                     + "\(reading.maskPathRebuilds) 次真的重建了路径")
+            perf(reading.surfaceSizeChanges <= WorldScreenFrameBudget.maximumSurfaceSizeChanges,
+                 "\(name)：宿主渲染尺寸只变 \(reading.surfaceSizeChanges) 次 ≤ "
+                     + "\(WorldScreenFrameBudget.maximumSurfaceSizeChanges) 次（不再每帧换 WKWebView 尺寸）")
+            perf(reading.worstAlignmentError <= 0.5,
+                 "\(name)：固定渲染尺寸下，写进图层的变换把 bounds 四角搬到四角，"
+                     + "最大偏差 \(reading.worstAlignmentError) px ≤ 0.5 px")
+        }
+
+        // MARK: 既有语义
+        perf(clear.maskDetachedWhenClear,
+             "无人遮挡 ⇒ 掩码整块摘掉（不挂 mask，正常观看没有可以抖的边界）")
+        perf(clear.blockedCells == 0, "无人遮挡 ⇒ 0 格被挡（实测 \(clear.blockedCells)）")
+        perf(blockedReading.blockedCells > 0 && blockedReading.blockedCells < blockedReading.cellCount,
+             "居民挡在屏前 ⇒ **按格**裁切：\(blockedReading.blockedCells)/\(blockedReading.cellCount) 格被挡，"
+                 + "不是整块消失")
+        perf(clear.hiddenAfterTurnAround && blockedReading.hiddenAfterTurnAround,
+             "相机转到屏幕背后 ⇒ 整块隐藏（背向剔除仍然生效）")
+
+        print("PERF-FAILURES=\(perfFailures)")
+        exit(perfFailures == 0 ? 0 : 1)
+    }
+}
+"""##
+
+/// 把屏幕那一组源码（含覆盖层宿主）复制到临时目录、按需做一组文本替换，编出探针跑一次。
+///
+/// **-O 是必须的**：这几项判据量的是紧的 simd 内层循环，debug 构建下同一段代码慢 ~70 倍。
+/// 返回 `(status, output, note)`：`note` 非空 = 探针压根没跑起来（锚点找不到 / 编不过），
+/// 此时 `status` 是 `-1` —— "锚点没找到"绝不能被当成"注入被抓住了"。
+func runPerformanceProbe(
+    patches: [(file: String, from: String, to: String)]
+) throws -> (status: Int32, output: String, note: String) {
+    let directory = temporary.appendingPathComponent("perf-probe-\(UUID())")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    // 覆盖层宿主还依赖一个**后来才加进来**的屏幕来源文件。它在就带上、不在就跳过：
+    // 判据不该因为"别人正在写的那一个文件存不存在"而红，也不该在它存在时编不过。
+    let optionalScreenFiles = ["WorldScreenEmbedOrigin.swift"].filter {
+        FileManager.default.fileExists(atPath: screenRoot.appendingPathComponent($0).path)
+    }
+    let names = screenFiles + ["WorldScreenOverlayController.swift"] + optionalScreenFiles
+    var sources: [String] = []
+    for name in names {
+        var text = try read(screenRoot.appendingPathComponent(name))
+        for patch in patches where patch.file == name {
+            guard text.contains(patch.from) else {
+                return (-1, "", "注入锚点在 \(name) 里找不到（签名改过？）：\(patch.from)")
+            }
+            text = text.replacingOccurrences(of: patch.from, with: patch.to)
+        }
+        let destination = directory.appendingPathComponent(name)
+        try text.write(to: destination, atomically: true, encoding: .utf8)
+        sources.append(destination.path)
+    }
+    let program = directory.appendingPathComponent("PerformanceProbe.swift")
+    try performanceProbeProgram.write(to: program, atomically: true, encoding: .utf8)
+    let binary = directory.appendingPathComponent("perf-probe")
+    let compile = try runFitCapture(
+        "/usr/bin/swiftc",
+        ["-j1", "-parse-as-library", "-O"] + sources + [program.path, "-o", binary.path]
+    )
+    guard compile.status == 0 else {
+        return (-1, compile.output, "探针没编起来（exit \(compile.status)）—— 注入把源码改坏了")
+    }
+    let run = try runFitCapture(binary.path, [])
+    return (run.status, run.output, "")
+}
+
+let performanceProbeClean = try runPerformanceProbe(patches: [])
+for line in performanceProbeClean.output.split(separator: "\n")
+    .filter({ $0.hasPrefix("PERF-COST") || $0.hasPrefix("PERF-PASS") }) {
+    print("  · \(line)")
+}
+let performanceProbeConclusion = performanceProbeClean.output.split(separator: "\n")
+    .last(where: { $0.hasPrefix("PERF-FAILURES=") }) ?? "没有结论"
+check(performanceProbeClean.note.isEmpty && performanceProbeClean.status == 0
+        && performanceProbeClean.output.contains("PERF-FAILURES=0"),
+    "断言10：原件上跑相机连续推进的每帧账全部通过（exit \(performanceProbeClean.status)，"
+        + "\(performanceProbeConclusion))"
+        + (performanceProbeClean.note.isEmpty ? "" : " —— \(performanceProbeClean.note)"))
+
+// 注入负对照：逐条把"每帧都做"的写法塞回去，判据必须抓得住（红的是哪一条，原话贴出来）。
+let performanceInjections: [(name: String, patches: [(file: String, from: String, to: String)], expected: String)] = [
+    (name: "每帧重建房间 BVH",
+     patches: [(file: "WorldScreenOverlayController.swift",
+                from: "        if occluderIndex?.revision != occluders.revision {",
+                to: "        if true {")],
+     expected: "（上限 1）"),
+    (name: "每帧重算掩码（去掉 30 Hz 节流）",
+     patches: [(file: "WorldScreenOverlayController.swift",
+                from: "        let now = clock()\n"
+                    + "        if let last = lastMaskRecompute[surface.objectID],\n"
+                    + "           now - last < Self.maskMinimumInterval {\n"
+                    + "            return\n"
+                    + "        }\n",
+                to: "        let now = clock()\n")],
+     expected: "超上限 30 Hz"),
+    (name: "每帧重算掩码路径（去掉签名闸门 + 节流）",
+     patches: [(file: "WorldScreenOverlayController.swift",
+                from: "        guard key != occlusionKeys[surface.objectID] else { return }\n"
+                    + "        let now = clock()\n"
+                    + "        if let last = lastMaskRecompute[surface.objectID],\n"
+                    + "           now - last < Self.maskMinimumInterval {\n"
+                    + "            return\n"
+                    + "        }\n",
+                to: "        let now = clock()\n")],
+     expected: "超上限 30 Hz"),
+    (name: "同一张掩码也重建路径",
+     patches: [(file: "WorldScreenOverlayController.swift",
+                from: "        if mask == previous, let existing = occlusionMaskLayer, existing.frame == bounds {\n"
+                    + "            return\n"
+                    + "        }\n",
+                to: "")],
+     expected: "掩码没变就不重建路径"),
+    (name: "宿主渲染尺寸跟着相机每帧变（去掉滞回）",
+     patches: [(file: "WorldScreenOverlayController.swift",
+                from: "        return fits ? current : desired",
+                to: "        _ = fits\n        return desired")],
+     expected: "（上限 8）"),
+    // 只**超预算**、不动任何计数器的注入：格级掩码从 24 × 14 放大到 240 × 140（每帧真算更多格）。
+    // 它证明"每帧平均 / 峰值"这两条本身是个会红的门禁，而不是一句恒真的空话。
+    (name: "格级掩码放大 100 倍（每帧真算更多格）",
+     patches: [(file: "WorldScreenOcclusion.swift",
+                from: "    static let defaultColumns = 24\n    static let defaultRows = 14",
+                to: "    static let defaultColumns = 240\n    static let defaultRows = 140")],
+     expected: "超预算"),
+]
+
+for injection in performanceInjections {
+    let probe = try runPerformanceProbe(patches: injection.patches)
+    let caught = probe.note.isEmpty && probe.status == 1
+        && probe.output.contains("PERF-FAILURES=")
+        && !probe.output.contains("PERF-FAILURES=0")
+        && probe.output.contains(injection.expected)
+    check(caught,
+        "断言10（注入负对照「\(injection.name)」）：探针必须红在「\(injection.expected)」这一条上"
+            + "（exit \(probe.status)）"
+            + (probe.note.isEmpty ? "" : " —— \(probe.note)"))
+    for line in probe.output.split(separator: "\n").filter({ $0.hasPrefix("PERF-FAIL") }).prefix(3) {
         print("  · \(line)")
     }
 }

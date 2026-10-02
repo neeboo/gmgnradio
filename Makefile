@@ -420,6 +420,15 @@ _test-harnesses:
 	# 覆盖层改成吃事件、源码里塞一条抓流路径、白名单开一个后门 —— 每一条都必须红。
 	# 见 docs/plans/2026-10-02-stage-tv-screen.md。
 	swift tools/test-resident-screen-overlay.swift
+	# 电视机「官方嵌入页的**来源**」判据（真机 2026-10-02「视频播放器配置错误 / 错误 153」）。
+	# 顶层直载 /embed/ 时文档 origin **本来就是合法的 https://www.youtube.com**，可播放器
+	# 照样报 153 —— 缺的是**嵌它的那个文档**（referrer 空、没有 parent frame）；Twitch 把
+	# 同一件事命名为 `NoParent`。判据钉的就是"嵌入页由一个拥有合法 http(s) origin 的承载页
+	# 载入"（回环 + 随机端口 + **不开任何监听套接字**），以及"页面侧的失败具名且说人话"
+	# （人话里一个数字都不许有）。十条注入负对照在 harness 内部做手术（回到 file:// /
+	# about:blank / 绑 0.0.0.0 / 固定端口 / 引入监听者 / 碰 cookie / 把「错误 153」丢给用户 /
+	# 回到顶层直载 / 白名单开后门 / 改指 googlevideo），每一条都必须红。
+	swift tools/test-resident-screen-embed-origin.swift
 	# 电视机**接线**的判据（App 侧唯一构造点 / 覆盖层接上舞台窗口 / **面板不出现** /
 	# 覆盖层容器在视图树里 / 三条工具并进 additionalTools）。2026-10-02 用户决定：
 	# 「左下角那块电视面板压根儿不应该出现」⇒ 判据③反过来钉"面板的挂载 / 显示入口

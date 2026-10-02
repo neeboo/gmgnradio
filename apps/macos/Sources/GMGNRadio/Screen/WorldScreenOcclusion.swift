@@ -181,6 +181,165 @@ struct WorldScreenOcclusionMask: Equatable, Sendable {
     }
 }
 
+// MARK: - 每帧的账与预算
+
+/// 掩码**落到图层上**的那一小段（路径构造 + 图层赋值）的账（秒）。
+///
+/// 与 `WorldScreenOcclusionStat.cost`（射线求交那一段）分开记：它们是两件不同的工作，
+/// 混在一个数字里就没人能说出"到底是算还是画贵"。
+struct WorldScreenMaskCost: Equatable, Sendable {
+    /// `visibleRects` 并集 → `CGPath` 构造。
+    var pathBuild: Double = 0
+    /// `CAShapeLayer.path` / `frame` / `layer.mask` 的赋值。
+    var assign: Double = 0
+    /// 这一帧**真的**重建了路径（同一张掩码时不该重建）。
+    var didRebuildPath = false
+}
+
+/// 覆盖层**一帧**里每一项工作的耗时（**秒**，`CFAbsoluteTimeGetCurrent` 的口径）与计数器。
+///
+/// 秒 → 毫秒的换算只在 `milliseconds` / `occlusionMilliseconds` / `overlayMilliseconds`
+/// 这三个访问器里发生一次：预算判据读的永远是毫秒（混用这两种单位会让门禁**恒真**）。
+///
+/// 这是"推进镜头爆卡"这类问题的**唯一**取证口径：它把一帧拆成"算遮挡 / 画遮挡 /
+/// 贴覆盖层"三项，而不是给一个笼统的"帧耗时"。计数器（重建了几次 BVH、重算了几次掩码、
+/// 换了几次宿主的渲染尺寸）与耗时**同等重要** —— 0.6 ms 的活干 120 次和干 4 次是两回事。
+struct WorldScreenFrameCost: Equatable, Sendable {
+    /// 重建房间三角面 BVH（只在 `occluders.revision` 变了时该发生）。
+    var occluderIndexBuild: Double = 0
+    /// 掩码输入签名（相机位姿 / 四角 / 容器尺寸 / 遮挡物 / revision）的构造。
+    var occlusionKey: Double = 0
+    /// 射线求交（24 × 14 格）。
+    var maskCompute: Double = 0
+    /// 可见格并集 → `CGPath`。
+    var maskPath: Double = 0
+    /// 路径 / 掩码图层落位 / `layer.mask` 的赋值。
+    var maskAssign: Double = 0
+    /// 宿主 `frame` 的赋值（**尺寸变**会连带换掉 `WKWebView` 的尺寸）。
+    var overlayFrame: Double = 0
+    /// 宿主 `layer.transform` 的赋值。
+    var overlayTransform: Double = 0
+
+    var didRebuildOccluderIndex = false
+    var didRecomputeMask = false
+    var didRebuildMaskPath = false
+    /// 这一帧宿主的 `bounds` 尺寸真的变了（⇒ WebKit 内容进程要重新布局）。
+    var didResizeSurface = false
+
+    /// 遮挡这一侧：算 + 画（**毫秒**）。字段本身是秒（`CFAbsoluteTimeGetCurrent` 的口径），
+    /// 换算只在下面这两个访问器里发生一次 —— 判据读的永远是毫秒。
+    var occlusionMilliseconds: Double {
+        (occlusionKey + maskCompute + maskPath + maskAssign) * 1000
+    }
+    /// 覆盖层这一侧：贴（**毫秒**）。
+    var overlayMilliseconds: Double { (overlayFrame + overlayTransform) * 1000 }
+    var milliseconds: Double { occlusionMilliseconds + overlayMilliseconds }
+}
+
+/// 相机**连续移动**时，遮挡 + 覆盖层在我们这一侧每帧的预算。
+///
+/// 数字来自 `tools/test-resident-screen-overlay.swift` 断言10 的离线实测（**-O** 编出来的
+/// 120 帧推进、1200 个房间三角面 + 居民盒、注入时钟 60 Hz）：改造后稳态每帧平均
+/// 0.22–0.27 ms、峰值 0.68–1.88 ms；改造前平均 0.62–0.65 ms、峰值 2.03 ms，
+/// 而且改造前**每帧**都换一次宿主尺寸（⇒ 每帧一次 WebKit 重排版）。
+///
+/// 阈值不是"贴着实测值"设的：耗时那两条是粗闸门（机器上还有别的编译在跑时会抖），
+/// 真正抓"每帧都做"的是**计数器与速率**那几条 —— 它们和负载无关。
+/// 判据必须用 `-O` 编：debug 构建下同一段代码慢 ~70 倍（实测每帧 16.4 ms）。
+///
+/// 判据被注入回"每帧重建 BVH"或"每帧重算掩码"时**必须红**：那两件事分别把
+/// `occluderIndexBuilds` 与 `maskRecomputes` 抬到帧数，下面的计数器与速率上限立刻报出来。
+enum WorldScreenFrameBudget {
+    /// 稳态每帧平均上限（毫秒）。**不含**第一帧的 BVH 冷建（那是一次性的）。
+    ///
+    /// 0.8 ms ≈ 60 Hz 一帧预算的 5%。实测改造后 0.22–0.27 ms ⇒ 约 3× 余量：
+    /// 这条判据要在**同一台机器上还有别的编译在跑**的时候也不假红。
+    static let averageMilliseconds: Double = 0.8
+    /// 稳态单帧峰值上限（毫秒）。
+    ///
+    /// 单帧最大值天然抖（实测同一段代码 0.68–1.88 ms），所以它只当**粗**闸门；
+    /// 真正抓"每帧都做"的是下面的计数器与速率（`occluderIndexBuilds` / `maskRecomputes`
+    /// / `surfaceSizeChanges`）—— 那几条不受机器负载影响。
+    static let peakMilliseconds: Double = 4.0
+    /// 掩码重算的频率上限（Hz）。相机连续移动时掩码最多这么勤 ——
+    /// 24 × 14 的格级掩码在 33 ms 内不可能被看出滞后。
+    static let maximumMaskRecomputesPerSecond: Double = 30
+    /// 宿主渲染尺寸的**滞回**：包围盒相对当前尺寸涨/缩超过这个比例才换一次。
+    /// 中间全部由单应矩阵吸收。
+    static let renderedSizeHysteresis: Float = 0.25
+    /// 一次连续相机移动里，BVH 最多允许重建几次（房间没变就该是 1）。
+    static let maximumOccluderIndexBuilds = 1
+    /// 一次连续相机移动（120 帧）里，宿主渲染尺寸最多允许变几次。
+    ///
+    /// 不是 0：推近本身会让包围盒跨过滞回阈值，那是设计内的（每次换尺寸都让 WebKit
+    /// 重新布局整页，所以它必须**稀**）。实测改造后 3 次、改造前 120 次 ——
+    /// 这条判据抓的是"每帧一次"这个量级。
+    static let maximumSurfaceSizeChanges = 8
+
+    /// 「这一段连续移动有没有超预算」的**唯一**判据。空数组 = 全绿。
+    ///
+    /// - Parameters:
+    ///   - frames: 参与统计的帧数（不含冷启那一帧）。
+    ///   - averageCostMilliseconds / peakCostMilliseconds: 逐帧 `milliseconds` 的平均与峰值。
+    ///   - occluderIndexBuilds / maskRecomputes / maskPathRebuilds: 区间内的计数器。
+    ///   - durationSeconds: 这一段的总时长（用于把掩码重算换算成 Hz）。
+    ///   - surfaceSizeChanges: 区间内宿主 `bounds` 尺寸变化的次数（= WebKit 重排版次数）。
+    static func problems(
+        frames: Int,
+        averageCostMilliseconds: Double,
+        peakCostMilliseconds: Double,
+        occluderIndexBuilds: Int,
+        maskRecomputes: Int,
+        maskPathRebuilds: Int,
+        durationSeconds: Double,
+        surfaceSizeChanges: Int
+    ) -> [String] {
+        var problems: [String] = []
+        guard frames > 0 else { return ["没有帧参与统计：判据没有被驱动"] }
+        if averageCostMilliseconds > averageMilliseconds {
+            problems.append(
+                String(format: "每帧平均 %.3f ms 超预算 %.3f ms",
+                       averageCostMilliseconds, averageMilliseconds)
+            )
+        }
+        if peakCostMilliseconds > peakMilliseconds {
+            problems.append(
+                String(format: "单帧峰值 %.3f ms 超预算 %.3f ms",
+                       peakCostMilliseconds, peakMilliseconds)
+            )
+        }
+        if occluderIndexBuilds > maximumOccluderIndexBuilds {
+            problems.append(
+                "房间 BVH 在 \(frames) 帧里重建了 \(occluderIndexBuilds) 次"
+                    + "（上限 \(maximumOccluderIndexBuilds)）—— 房间几何没变就不该重建"
+            )
+        }
+        if maskPathRebuilds > maskRecomputes {
+            problems.append(
+                "掩码路径重建 \(maskPathRebuilds) 次多于掩码重算 \(maskRecomputes) 次"
+                    + "—— 同一张掩码不该重建路径"
+            )
+        }
+        if durationSeconds > 0 {
+            let hertz = Double(maskRecomputes) / durationSeconds
+            if hertz > maximumMaskRecomputesPerSecond + 1e-9 {
+                problems.append(
+                    String(format: "掩码重算 %.1f Hz 超上限 %.0f Hz（%d 帧里重算了 %d 次）",
+                           hertz, maximumMaskRecomputesPerSecond, frames, maskRecomputes)
+                )
+            }
+        }
+        if surfaceSizeChanges > maximumSurfaceSizeChanges {
+            problems.append(
+                "相机连续移动期间宿主的渲染尺寸变了 \(surfaceSizeChanges) 次"
+                    + "（上限 \(maximumSurfaceSizeChanges)）—— 每次都会让 WebKit 内容进程"
+                    + "重新布局并重画整页"
+            )
+        }
+        return problems
+    }
+}
+
 // MARK: - 一次掩码更新的账
 
 /// 「这一帧算了几格、挡了几格、花了多久」——面板、`read_screen` 与判据**读同一份**。
