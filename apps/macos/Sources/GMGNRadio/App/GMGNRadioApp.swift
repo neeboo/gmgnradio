@@ -21,6 +21,11 @@ private enum MusicLibraryCacheError: LocalizedError {
 
 private enum ResidentPropHostError: LocalizedError {
     case editorOpen
+    /// 「让居民去取」的第一步（关掉摆放面板）**没有兑现**：呈现已停 / 内容视图不在。
+    ///
+    /// 它不是投递失败 —— 这一条**压根没有发出去**，所以既不写成「未送达」，也不静默：
+    /// 面板还开着，这句话就显示在面板上（`ResidentPropEditorState.performWishAction` 的 `notice`）。
+    case editorCloseFailed
     /// 「资产未验证」**带腿、带字段、带期望与实际**（`ResidentPropAssetVerification`）。
     ///
     /// 为什么必须携带那五个词而不是一句"还没检查完"：真机 2026-10-02 12:28:21 那两行日志
@@ -37,6 +42,7 @@ private enum ResidentPropHostError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .editorOpen: "请先结束摆放，再发送给居民；输入内容会保留。"
+        case .editorCloseFailed: "摆放面板没有关掉，这一条没有发给居民。请手动关掉摆放面板再点一次。"
         case let .assetUnverified(failure): failure.userText
         case .assetUnavailable: "已领取物件的本地文件缺失或校验失败，没有删除或重新生成，请检查许愿任务。"
         case .ownershipMismatch: "物件存档与领取记录不一致，已保留原记录并停止摆放。"
@@ -816,6 +822,13 @@ final class AppDelegate:
     /// 这份快照，口径一致。不做持久化：现有唯一按回合存储的是模型长期记忆，
     /// 其冻结合同不允许 Swift 侧重组为界面历史（见体验修复文档）。
     private var residentChatTranscript = ResidentChatTranscript()
+    /// 许愿任务的**消息通道**（用户 2026-10-02：「许愿任务变成消息提示，不要单独做窗口了」）。
+    ///
+    /// 许愿任务不再有自己的窗口/列表：每一次状态变化在 `WishMachineTaskMessageFeed` 里
+    /// 生成**一条人话消息**，由 `publishResidentTranscript` 与最近对话一起推给两个聊天表面
+    /// —— 走的是**既有**的 `ResidentChatTranscriptLine` 通道，不新造面板、不新造窗口。
+    /// 去重（同一状态只发一次）与「失败待办不自动消失」的规则都在那个类型里，这里只接线。
+    private var wishTaskMessageFeed = WishMachineTaskMessageFeed()
     // MARK: 长期记忆（本地编排薄适配器；外部 provider 与原文层接线均已移除）
     /// 编排薄适配器（**只转发 `memory_recall`**），复用 gmgn-taskd 统一状态合同运输。
     ///
@@ -1215,7 +1228,7 @@ final class AppDelegate:
                 },
                 // 持久化：本轮**留空**（见设计文末「没做的部分」）。为 nil 时标定与换片
                 // 只在本会话内生效（电视面板已从产品界面移除，标定的界面入口随之消失；
-                // 屏幕范围仍由 `Screen/**` 的推断几何负责）。
+                // 屏幕范围仍由 `Screen/` 里的推断几何负责）。
                 persistDefinition: nil,
                 persistContent: nil
             ),
@@ -2798,7 +2811,7 @@ final class AppDelegate:
                     .localCollider(for: worldID)
                 else {
                     if spatialStage.marbleLivingCabin?.worldID == worldID {
-                        throw LivingWorldBootstrapError.invalidMarbleCabin("没有找到生成舱体的碰撞网格。")
+                        throw LivingWorldBootstrapError.badCabin("没有找到生成舱体的碰撞网格。")
                     }
                     livingWorldLogger.notice(
                         "空间没有碰撞 GLB，继续使用包内碰撞体：world=\(worldID, privacy: .public)"
@@ -3028,7 +3041,7 @@ final class AppDelegate:
         ) else {
             // 不是失败：同一个执行实例的这一次尝试已经发出去过（30Hz 的帧不算新实例）。
             return reportJukeboxProgress(
-                "这次执行实例已经触发过一次播放尝试，重复帧不重复触发 request=\(requestID)",
+                "已经点过一次了，不重复触发",
                 snapshot: snapshot
             )
         }
@@ -4889,9 +4902,15 @@ final class AppDelegate:
     /// （`activityID == "wish_machine.collect"` / `distanceMeters ≤ 0.25` / `outputAvailable`）
     /// 一个字都没放宽。
     ///
-    /// 它刻意**绕过** `sendResidentSubmission` 那条 `residentPropEditingWorldID == nil` 的门：
-    /// 那道门是给"场景里的自由聊天"用的，而这一次点击恰恰**来自**装修面板 ——
-    /// 用户就在面板上，请求发起方也是面板自己。
+    /// **不绕门**：这一次点击来自装修面板，而提交那道门（`sendResidentSubmission` 与
+    /// `performResidentTurn` 各自的 `residentPropEditingWorldID == nil`）恰恰要求"面板别开着"。
+    /// 真机 2026-10-02 16:56 那两次点击原来直接 `loop.receiveUserMessage` 绕过提交门，可那一轮
+    /// **执行时**又被同一道判据在第一步拒掉（`editorOpen`）—— 面板开着时每一轮都发不出去。
+    /// 现在改成两步：**先用既有的关闭出口把面板关掉**（与用户按面板上的 X 等价：
+    /// `StageWindowController.toggleDecorationEditor()` → `StageContentView.togglePropEditor()`
+    /// → `residentPropEditor.close()` → `setResidentPropEditing(false)`，同一时刻在主线程完成），
+    /// 确认真的关掉之后，再用与聊天**完全同一条**提交路径把这一句发出去（同一个门、
+    /// 同一个 submissionID 语义）。判据一个字都没放宽，也没有新增人类通道。
     private func askResidentToFetchProp(jobID: String) async throws {
         guard let context = livingWorldContext, spatialStage.selectedWorldID == context.manifest.worldID,
               let wishID = UUID(uuidString: jobID) else { throw ResidentPropPlacementError.inactiveContext }
@@ -4899,14 +4918,43 @@ final class AppDelegate:
         let name = wishMachineCoordinator.residentJobs(worldID: context.manifest.worldID, residentScope: scope)
             .first { $0.id == wishID }?.name ?? "那一件"
         let text = "请去许愿机把已经做好的「\(name)」领回来。"
-        let loop = ensureResidentLoop()
-        let submissionID = UUID()
-        // 与语音那条同一条可见历史：这是一次真实的人类提交，不是系统旁白。
-        residentChatTranscript.activate(scopeKey: residentTranscriptScopeKey)
-        residentChatTranscript.beginTurn(id: submissionID, userText: text, at: Date())
-        publishResidentTranscript()
-        loop.receiveUserMessage(text, submissionID: submissionID)
+        // 第一步：关面板。关不掉就**没有第二步** —— 这一句话必须说出来（`notice` 显示在
+        // 还开着的面板上），既不静默、也不硬发一轮注定被 `editorOpen` 拒掉的请求。
+        guard closeResidentPropEditorForFetch() else {
+            livingWorldLogger.notice(
+                "摆件面板请求居民代取 step=ask-resident 任务=\(jobID, privacy: .public) 结果=没有发出去（摆放面板没有关掉）")
+            throw ResidentPropHostError.editorCloseFailed
+        }
+        // 第二步：与聊天里打同一句话**完全同一条**提交路径（同一个门、同一个 submissionID 语义）。
+        let submission = ResidentChatSubmission(text: text)
+        do {
+            try await sendResidentSubmission(submission, source: .stage)
+        } catch {
+            // 面板这时已经关了，`performWishAction` 的 `notice` 看不见 —— 失败**另有**一个
+            // 看得见的出口。口径是"没有发出去"，不是「未送达」（后者只留给真的开始过、
+            // 又没送到的那些轮次）；具体原因只进日志，不进用户那句话。
+            showResidentVoiceStatus("没有发出去：这一条没能交给居民，你可以直接在对话里说一遍。")
+            livingWorldLogger.notice(
+                "摆件面板请求居民代取 step=ask-resident 任务=\(jobID, privacy: .public) 结果=没有发出去 原因=\(error.localizedDescription, privacy: .public)")
+            throw error
+        }
         livingWorldLogger.notice("摆件面板请求居民代取 step=ask-resident 任务=\(jobID, privacy: .public) 结果=已交给居民")
+    }
+
+    /// 「让居民去取」的第一步：把摆放面板收掉。
+    ///
+    /// 走的是**既有**那一个关闭出口（菜单「结束装修」用的就是它；面板上的 X 走的也是
+    /// 同一个 `residentPropEditor.close()`）。`close()` 是同步的：它当场把
+    /// `residentPropEditingWorldID` 清成 nil（`onEditingChanged(false)` → `setResidentPropEditing(false)`），
+    /// 所以调用方**接着**提交时那两道门都已经放行。
+    ///
+    /// 这里不靠"应该已经关了"，而是**读回效果**：返回 false = 面板还开着（呈现已停 /
+    /// 内容视图不在），调用方必须把这一次点击说成"没有发出去"。
+    private func closeResidentPropEditorForFetch() -> Bool {
+        if stageWindowController?.isDecorationEditorOpen == true {
+            stageWindowController?.toggleDecorationEditor()
+        }
+        return stageWindowController?.isDecorationEditorOpen != true && residentPropEditingWorldID == nil
     }
 
     /// 列表里「未领取」那一行 → **既有那条领取路径**。
@@ -5025,7 +5073,12 @@ final class AppDelegate:
                 f.canClaimNow = true
             }
             f.canRetryNow = WishMachineCoordinator.retryableStages.contains(job.stage) && job.jobID != nil
-            order[f.objectID] = index
+            // 排序键必须与**唯一投影**查的那一个**逐字对上**：`ResidentOwnershipProjection.ordered`
+            // 查的是 `OwnershipRowKey.identifier`（`"<jobID>/<objectID>"`），而这里原来写的是
+            // 裸 `objectID` —— 两边永远查不到彼此，「新的排前面」于是从来没生效过（投影被冻结，
+            // 所以只能改提供事实的这一侧）。键由投影自己的类型现算，不在这里手拼字符串：
+            // 手拼一份就是第二份真相。
+            order[OwnershipRowKey(jobID: job.id, objectID: objectID).identifier] = index
             facts.append(f)
         }
 
@@ -5539,7 +5592,7 @@ final class AppDelegate:
                 residentAgentLoop?.setBackgroundEnabled(residentPropEditingBackgroundEnabled)
             } else { refreshResidentAutonomy() }
             residentAgentLoop?.receiveEvent(.init(id: UUID().uuidString, kind: "room.layout.changed",
-                summary: "用户已结束摆放。请重新观察真实物件位置；先前活动已中断，不恢复旧路径。"))
+                summary: "用户已结束摆放，请重新看一眼物件的实际位置。"))
         }
     }
 
@@ -5697,8 +5750,19 @@ final class AppDelegate:
     }
 
     /// 把同一份快照推给两个聊天表面；它们是展示层，不做各自的回合判定。
+    ///
+    /// 许愿任务的状态变化（用户 2026-10-02：「许愿任务变成消息提示，不要单独做窗口了」）
+    /// 就是**这条通道上的消息**：它们排在最近对话之后，作为 `speaker: .notice` 的行显示在
+    /// **与居民对话的地方**（舞台对话面板的「最近对话」、小窗展开后的完整记录）——
+    /// 没有许愿任务面板、没有新窗口。文案与去重全在 `WishMachineTaskMessageFeed` 里，
+    /// 这里只把消息翻成既有的行类型，一个字都不改。
     private func publishResidentTranscript() {
-        let lines = residentChatTranscript.lines()
+        let lines = residentChatTranscript.lines() + wishTaskMessageFeed.messages.map { message in
+            ResidentChatTranscriptLine(
+                turnID: message.transcriptTurnID,
+                speaker: .notice,
+                text: message.text)
+        }
         liveCamWindowController?.setResidentTranscript(lines)
         stageWindowController?.setResidentTranscript(lines)
     }
@@ -5809,7 +5873,7 @@ final class AppDelegate:
         // "停止"必须看得见：它在界面上不是隐形状态。这里说明停止只停自主续办，
         // 并给出解除路径（任务面板顶部的"恢复自主行动"，或设置里打开自主生活）。
         if loop?.isAutonomyPausedByUser == true {
-            notices.append("自主行动已停止：后台不会自行续办、自行领取或摆放；直接下达指令仍会执行。点任务面板上的「恢复自主行动」，或在设置里打开「允许居民自主安排活动」，即可解除。")
+            notices.append("自主行动已停止，你直接吩咐它还是会照做。想恢复就点任务面板上的「恢复自主行动」。")
         }
         // 交付未确认只在用户尚未接手时提示：用户下次发送/停止/换空间后旧提示不再
         // 显示；模型上下文里的 unconfirmedUserMessages 不变，仍避免重复执行。
@@ -5818,8 +5882,8 @@ final class AppDelegate:
         )
         if !pendingUnconfirmed.isEmpty {
             notices.append(
-                "有 \(pendingUnconfirmed.count) 条补充消息尚未确认送达，未重复发送。"
-                    + "如需重来，请在下一条消息里说明，或切换到别的对话后端新建会话。"
+                "有 \(pendingUnconfirmed.count) 条补充消息还没确认送到，没有重复发送。"
+                    + "想重来的话，在下一条消息里说一声就行。"
             )
         }
         let notice = notices.isEmpty ? nil : notices.joined(separator: "\n")
@@ -6306,7 +6370,7 @@ final class AppDelegate:
         guard localMusicPlayer.state == .playing else {
             reportJukeboxSilence(
                 snapshot,
-                "播放器没有进入播放状态（state=\(String(describing: localMusicPlayer.state))）"
+                "播放没有开始"
             )
             throw ResidentActivityOutcomeError.interrupted
         }
@@ -6344,7 +6408,7 @@ final class AppDelegate:
         route = ProgramPlaybackStartRoute.resolve(playerState: localMusicPlayer.state,
             hasPreparedProgram: activeProgram != nil && programPlaybackQueue.current != nil)
         reportJukeboxProgress(
-            "冷队列恢复完成：current=\(programPlaybackQueue.current?.slot.track.id ?? "nil")，route=\(String(describing: route))",
+            "准备好了，马上播",
             snapshot: snapshot
         )
         return route
@@ -6630,6 +6694,40 @@ final class AppDelegate:
         }
     }
 
+    /// **许愿任务 = 消息**（用户 2026-10-02：「许愿任务变成消息提示，不要单独做窗口了」）。
+    ///
+    /// 每一次状态同步都喂一遍**唯一投影**现算出来的行；`WishMachineTaskMessageFeed` 负责
+    /// 两件事，而且只有它负责：
+    ///   · **同一状态只发一次**（幂等键 = 行标识 + 投影状态）；
+    ///   · **失败待办不自动消失**（`OwnershipDisplayState.failed`，由投影判定），
+    ///     其它终态按**既有**那一个窗口过期（`WishMachineTaskPrompt`，锚点就是共享收件箱
+    ///     按 `updatedAt` 现算的到期时间）。
+    ///
+    /// 这里**不判断**任何状态：`ResidentOwnershipProjection.row` 给出 `state` 与那一句人话，
+    /// 宿主只是把它们读出来。通道也**不是新的**：消息由 `publishResidentTranscript` 与最近
+    /// 对话一起推给两个聊天表面（`ResidentChatTranscriptLine`）。
+    private func pushWishTaskMessages(worldID: String, scope: String) {
+        guard let context = livingWorldContext, context.manifest.worldID == worldID else { return }
+        let rows = residentPropWishFacts(worldID: worldID, context: context)
+            .facts.map(ResidentOwnershipProjection.row)
+            .filter { $0.key.jobID != nil }
+        let candidates = rows.map { row in
+            WishMachineTaskMessageFeed.Candidate(
+                row: row,
+                // 到期锚点复用**既有**那一份（共享收件箱按 `updatedAt` 现算，终态后 30 秒）；
+                // 没有终态记录时 `promptExpiry` 给 nil = 还没了结。
+                promptExpiresAt: row.key.jobID.flatMap {
+                    residentSystemInboxStore.promptExpiry(
+                        taskKey: $0.uuidString, worldID: worldID, residentScope: scope)
+                })
+        }
+        let before = wishTaskMessageFeed.messages
+        wishTaskMessageFeed.sync(candidates, now: Date())
+        // 只有真的多了一条（或收起了一条）才重推对话，避免无谓的界面刷新。
+        guard wishTaskMessageFeed.messages != before else { return }
+        publishResidentTranscript()
+    }
+
     private func synchronizeWishMachinePresentation() {
         updateWishMessageScope()
         guard let worldID = currentResidentWorldContext().worldID, worldID == WishMachineScene.worldID else {
@@ -6638,6 +6736,11 @@ final class AppDelegate:
             stageWindowController?.setWishMachineTasks([])
             liveCamWindowController?.setWishMachineTasks([])
             pushResidentConnectivityNotice(worldID: nil, scope: nil)
+            // 换世界/退出空间：旧空间的消息全部作废（消息是**这个空间**的许愿任务的状态）。
+            if !wishTaskMessageFeed.messages.isEmpty {
+                wishTaskMessageFeed.reset()
+                publishResidentTranscript()
+            }
             pushSystemInboxSnapshots()
             return
         }
@@ -6671,6 +6774,7 @@ final class AppDelegate:
                 spatialStage.wishMachineState = .failed
                 pushWishTaskPrompts(jobs.suffix(20).map { wishMachineTaskPresentation(for: $0) },
                     worldID: worldID, scope: scope)
+                pushWishTaskMessages(worldID: worldID, scope: scope)
                 pushSystemInboxSnapshots()
                 return
             }
@@ -6712,6 +6816,7 @@ final class AppDelegate:
         } else { spatialStage.wishMachineState = .idle }
         pushWishTaskPrompts(jobs.suffix(20).map { wishMachineTaskPresentation(for: $0) },
             worldID: worldID, scope: scope)
+        pushWishTaskMessages(worldID: worldID, scope: scope)
         pushSystemInboxSnapshots()
     }
 

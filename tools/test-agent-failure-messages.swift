@@ -40,10 +40,12 @@ if let body = conversationBody {
           "chat failure text never interpolates an exit code")
     check(body.contains("reason.userMessage"),
           "DSH execution failure reuses the classified, actionable reason text")
-    check(body.contains("请确认现场后重新发送") && body.contains("检查 Claude Code 的安装与凭证"),
+    // 2026-10-02 文案规则：失败必须可行动（重试 / 换一个），且**不许**让用户自己
+    // 判断现场（「请确认现场」这种已被删除）。技术细节进日志。
+    check(body.contains("请重新发送") && body.contains("检查 Claude Code 是否装好"),
           "Claude execution failure tells the user how to recover")
 }
-check(conversation.contains("若反复出现，请在设置里换一个后端"),
+check(conversation.contains("若反复出现，跟我说一声"),
       "unknown DSH failure offers a concrete fallback action")
 check(!conversation.contains("退出码 \\("),
       "no exit code is interpolated anywhere in the conversation service")
@@ -55,7 +57,7 @@ check(codexBody != nil, "CodexCLIError exposes a user-facing errorDescription")
 if let body = codexBody {
     check(!body.contains("message.isEmpty ?") && !body.contains(": message"),
           "Codex CLI raw output is not returned as the user message")
-    check(body.contains("请确认现场后重新发送") && body.contains("重新登录 Codex"),
+    check(body.contains("请重新发送") && body.contains("重新登录 Codex"),
           "Codex CLI failure tells the user how to recover")
 }
 
@@ -70,17 +72,18 @@ if let body = codexTransportBody {
           "codex connection failures tell the user to resend")
 }
 
-// 4) ResidentDSHTransportError：ACP stopReason 只用于诊断，连接类失败说明会自动重建。
+// 4) ResidentDSHTransportError：ACP stopReason 只用于诊断；界面只留「现在能做什么」。
+//    「系统会在下一条消息时重建连接」属于内部行为，按 2026-10-02 的文案规则不再上屏。
 let dshTransport = try read("apps/macos/Sources/GMGNRadio/Agent/ResidentDSHTransport.swift")
 let dshTransportBody = errorDescriptionBody(in: dshTransport, after: "enum ResidentDSHTransportError")
 check(dshTransportBody != nil, "ResidentDSHTransportError exposes a user-facing errorDescription")
 if let body = dshTransportBody {
     check(!body.contains("turnNotCompleted(reason)") && !body.contains("\\(reason)"),
           "ACP stopReason is not interpolated into the user message")
-    check(body.contains("系统会在下一条消息时重建连接"),
-          "DSH connection failures explain the automatic rebuild")
-    check(body.contains("请重新发送"),
-          "DSH connection failures tell the user to resend")
+    check(!body.contains("视觉会话") && !body.contains("DSH"),
+          "connection failures never name the internal transport")
+    check(body.contains("请重新发送") || body.contains("请稍后重试") || body.contains("请等它结束再发"),
+          "DSH connection failures tell the user what to do next")
 }
 
 print("\(failures == 0 ? "PASS" : "FAIL"): \(checks) agent failure message checks, \(failures) failures")

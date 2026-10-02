@@ -2526,4 +2526,72 @@ mod tests {
         .unwrap();
         assert_eq!(record["record"], Value::Null);
     }
+
+    /// 范围判据只有一份，住在权威实现里：`read_window`（`after` / `limit`）与 `commit`
+    /// （`expectedRevision`）。MCP 的 `inputSchema` 里删掉的 `minimum`/`maximum` 只是
+    /// 宿主校验器读不懂的第二份表述；删掉它**不许**放宽这里的任何一条 —— 越界、负值
+    /// 仍然必须被拒，错误码一个字不变。
+    ///
+    /// 非整数在这里的落点是 serde 反序列化失败：wire 形状是 `Option<i64>` / `usize` /
+    /// `i64`，`1.5` / `"3"` / `[1]` 不会被夹成整数，daemon 回 `invalid_world_facts_read`
+    /// / `invalid_world_commit`（`daemon.rs` 的 `from_value(...).map_err(...)`）。
+    #[test]
+    fn read_and_commit_ranges_are_still_refused_by_the_authority() {
+        // after：负值 invalid_cursor；0 与正数是合法边界。
+        assert_eq!(read_window(Some(-1), Some(1)), Err("invalid_cursor"));
+        assert_eq!(read_window(Some(i64::MIN), Some(1)), Err("invalid_cursor"));
+        assert_eq!(read_window(Some(0), Some(1)), Ok((0, 1)));
+        assert_eq!(read_window(Some(7), Some(1)), Ok((7, 1)));
+
+        // limit：0 与超过上限 invalid_limit；1 与 MAX_READ_LIMIT 是合法边界。
+        assert_eq!(read_window(None, Some(0)), Err("invalid_limit"));
+        assert_eq!(read_window(None, Some(MAX_READ_LIMIT + 1)), Err("invalid_limit"));
+        assert_eq!(read_window(None, Some(1)), Ok((0, 1)));
+        assert_eq!(read_window(None, Some(MAX_READ_LIMIT)), Ok((0, MAX_READ_LIMIT)));
+        // 缺省仍是权威的默认值（不是 0，也不是"不限制"）。
+        assert_eq!(read_window(None, None), Ok((0, DEFAULT_READ_LIMIT)));
+
+        // expectedRevision：负值 invalid_revision。
+        let mut connection = setup();
+        assert_eq!(
+            commit_err(&mut connection, "negative-revision", -1, vec![reload()]),
+            "invalid_revision"
+        );
+        assert_eq!(
+            commit_err(&mut connection, "very-negative-revision", i64::MIN, vec![reload()]),
+            "invalid_revision"
+        );
+
+        // 非整数 / 错类型的 wire 形状：反序列化直接失败，不会被夹成整数。
+        for bad in [json!(1.5), json!(-0.5), json!("3"), json!([1]), json!({})] {
+            assert!(
+                serde_json::from_value::<FactsRequest>(
+                    json!({"worldID": WORLD, "after": bad, "limit": 2})
+                )
+                .is_err(),
+                "facts_read 的 after={bad} 不该被反序列化成整数"
+            );
+            assert!(
+                serde_json::from_value::<FactsRequest>(json!({"worldID": WORLD, "limit": bad}))
+                    .is_err(),
+                "facts_read 的 limit={bad} 不该被反序列化成整数"
+            );
+            assert!(
+                serde_json::from_value::<CommitRequest>(
+                    json!({"worldID": WORLD, "requestID": "r", "expectedRevision": bad, "ops": []})
+                )
+                .is_err(),
+                "world_commit 的 expectedRevision={bad} 不该被反序列化成整数"
+            );
+        }
+        // 反向对照：合法形状必须仍然反序列化成功（判据不是"凡值皆拒"）。
+        assert!(serde_json::from_value::<FactsRequest>(
+            json!({"worldID": WORLD, "after": 0, "limit": 500})
+        )
+        .is_ok());
+        assert!(serde_json::from_value::<CommitRequest>(
+            json!({"worldID": WORLD, "requestID": "r", "expectedRevision": 0, "ops": []})
+        )
+        .is_ok());
+    }
 }

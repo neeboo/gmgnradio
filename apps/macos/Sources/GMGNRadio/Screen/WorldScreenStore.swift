@@ -67,6 +67,8 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
     private var occluderPropBoxes: [WorldScreenBox] = []
     /// 每块屏幕上一次写进日志的"被挡"状态。只在**翻转**时写一行，绝不刷屏。
     private var lastOcclusionLogged: [String: Bool] = [:]
+    /// 每块屏幕上一次写进日志的几何出处（`出处|原文`）。同样只在**变了**的时候写。
+    private var lastGeometryLogged: [String: String] = [:]
     private var trackingTask: Task<Void, Never>?
     private var lastTrackingKey = ""
     private var tickCount = 0
@@ -175,7 +177,29 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
             placements[objectID] = nil
             overlay.removeSurface(for: objectID)
         }
+        logGeometryIfChanged()
         snapshots = makeSnapshots()
+    }
+
+    /// 每块屏幕**几何出处的那句原文**（法向 / 面积 / m² / 三边比值）写进统一日志
+    /// （`subsystem = ai.gmgn.radio`）—— **只在它变了的那一次**。
+    ///
+    /// 面板上那句话是人话（`ScreenPanelCopy.screenRangeLine`：自动识别 / 你标定的）；
+    /// 工程口径的原文跟 agent 回执（`details["note"]`）和 metadata 一起走，也走这里。
+    /// 真机 2026-10-02 的教训是把这些摆到面板上 —— 用户看到的是「什么玩意儿」。
+    private func logGeometryIfChanged() {
+        for objectID in definitions.keys.sorted() {
+            guard let definition = definitions[objectID] else { continue }
+            let signature = "\(definition.source.rawValue)|\(definition.note)"
+            guard lastGeometryLogged[objectID] != signature else { continue }
+            lastGeometryLogged[objectID] = signature
+            screenPanelLogger.notice(
+                "电视屏幕范围 物件=\(objectID, privacy: .public) 出处=\(definition.source.rawValue, privacy: .public) 原文=\(definition.note, privacy: .public)"
+            )
+        }
+        for objectID in lastGeometryLogged.keys where definitions[objectID] == nil {
+            lastGeometryLogged[objectID] = nil
+        }
     }
 
     private func resolve(objectID: String, state: WorldObjectState) {

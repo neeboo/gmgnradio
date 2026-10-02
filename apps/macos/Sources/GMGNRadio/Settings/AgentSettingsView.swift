@@ -127,7 +127,7 @@ struct AgentSettingsView: View {
                         .frame(minHeight: 120)
 
                     HStack {
-                        Text("独立于上面的 DJ 主持偏好，统一用于居民会话。保存后下一轮生效，切换空间仍保留；人格只影响语气、措辞和关注点，不会扩大或改变工具权限。")
+                        Text("只影响居民，和上面的 DJ 偏好分开。人格只改语气和关注点，不改变它能做什么。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         Spacer()
@@ -139,9 +139,9 @@ struct AgentSettingsView: View {
                     }
                 }
 
-                Section("Agent 聊天后端") {
+                Section("聊天模型") {
                     Picker(
-                        "后端",
+                        "模型",
                         selection: Binding(
                             get: {
                                 model.selectedConversationBackendID
@@ -178,7 +178,7 @@ struct AgentSettingsView: View {
                         .onChange(of: residentAutonomyEnabled) { _, _ in
                             notifyResidentAutonomyChanged()
                         }
-                    Text("开启后，居民会在空闲或活动变化时用当前选定的、支持世界工具的思考后端（Codex、DSH 或 Claude Code）自主观察和行动，会消耗对应模型额度。每小时最多主动思考的轮数由下面的预算决定；设为 0 只表示不再发起新的后台思考，不会取消正在进行的一轮，要立即暂停当前轮请使用停止按钮。")
+                    Text("打开后，居民会自己观察和行动，会消耗模型额度。设为 0 就不再新起一轮，要先停下请按停止。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
@@ -210,7 +210,7 @@ struct AgentSettingsView: View {
                         .labelsHidden()
                         .frame(width: 160)
                     }
-                    Text("预算按本次居民会话的滚动一小时计算，默认 6，可选 0...6；额度只在本循环实例内累计，不跨循环重建或重启保留，不是跨重启的全局配额。这里的“轮”是后台思考轮数，不等于 HTTP 请求次数或费用。实际调度由居民循环读取该值。")
+                    Text("按最近一小时算，默认 6。这只数后台思考的次数，不等于请求次数或费用。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -413,11 +413,11 @@ struct AgentSettingsView: View {
     private var providerHelpText: String {
         switch model.realtimeProvider {
         case .elevenLabs:
-            "此服务尚未接入居民语音转写，请选择百炼或直接输入文字。原有配置可以保留。"
+            "这个服务还不能转写语音，请选百炼，或直接打字。"
         case .bailian:
-            "API Key 仅保存在本机配置中。百炼只负责语音转写，固定使用 Qwen3 ASR；无需配置回答模型或音色。"
+            "密钥只存在这台电脑上。百炼只用来说话转文字，不用再配别的。"
         case .doubao:
-            "此服务尚未接入居民语音转写，请选择百炼或直接输入文字。"
+            "这个服务还不能转写语音，请选百炼，或直接打字。"
         }
     }
 

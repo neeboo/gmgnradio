@@ -154,13 +154,13 @@ enum WishMachineContract {
     static func question(for need: Need, name: String) -> String {
         switch need {
         case .size:
-            "你要的「\(name)」大约多大？给**完整长宽高**最好（例如「1443 × 862 × 302 毫米」，宽 × 高 × 深），我照实填三轴；只说得出一根轴也行（例如「1 米」，我按最长边算）。"
+            "你要的「\(name)」大概多大？说得越全越好，只说得出一边也行。"
         case .sizeAxis:
-            "你要的「\(name)」是按最长边算，还是按高度算？顺便给个米数。"
+            "「\(name)」按最长边算，还是按高度算？给个米数就行。"
         case .sizeMeters:
             "「\(name)」要做多大？给我一个 \(metersText(minimumMeters))—\(metersText(maximumMeters)) 米之间的数。"
         case .pendingId:
-            "你刚才说的要做的是哪一件？后台有不止一件还没做完的委托，我需要你说是哪一件。"
+            "要做的是哪一件？还有几件没做完，我需要你说清是哪一件。"
         }
     }
 

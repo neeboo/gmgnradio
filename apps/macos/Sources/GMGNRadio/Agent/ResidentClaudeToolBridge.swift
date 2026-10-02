@@ -49,15 +49,15 @@ public enum ResidentClaudeMCPBridgeError: Error, LocalizedError, Equatable {
     public var errorDescription: String? {
         switch self {
         case .invalidRegistrations:
-            "本轮 Claude 世界工具清单无效，这次空间操作已停止。请重新发送这条消息。"
+            "工具清单无效，这次操作没有执行。请重新发送。"
         case .forbiddenToolName:
-            "本轮有工具不允许通过 Claude 使用，这次空间操作已停止。请在设置里改用支持该工具的后端。"
+            "这次要用的能力 Claude 不支持，请到设置里换个模型再试。"
         case .adapterUnavailable:
-            "Claude 世界工具适配器不可用，本轮空间操作没有执行。请检查 Claude Code 安装后重试。"
+            "Claude 没接上，这次操作没有执行。请检查它是否装好。"
         case .grantWriteFailed:
-            "Claude 世界工具授权文件写入失败，本轮空间操作没有执行。请重新发送；若反复出现，请重启应用。"
+            "授权没写成功，这次操作没有执行。请重新发送。"
         case .sessionStopped:
-            "Claude 世界工具会话已停止，请重新发送这条消息。"
+            "连接已停止，请重新发送。"
         }
     }
 

@@ -97,8 +97,8 @@ pub const TOOLS: &[ToolSpec] = &[
                 "type": "object",
                 "properties": {
                     "worldID": {"type": "string", "description": "世界编号"},
-                    "after": {"type": "integer", "minimum": 0, "description": "从该 seq 之后开始，默认 0"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "本页条数上限，默认 100，最大 500"}
+                    "after": {"type": "integer", "description": "从该 seq 之后开始读，默认 0。必须是整数且非负：负数会被权威拒绝，错误码 invalid_cursor。"},
+                    "limit": {"type": "integer", "description": "本页条数上限，默认 100，最大 500。必须是整数且落在 1 到 500：0 或超过 500 会被权威拒绝，错误码 invalid_limit。"}
                 },
                 "required": ["worldID"],
                 "additionalProperties": false
@@ -216,7 +216,7 @@ pub const TOOLS: &[ToolSpec] = &[
                 "properties": {
                     "worldID": {"type": "string", "description": "世界编号"},
                     "requestID": {"type": "string", "description": "幂等编号。同编号同内容重放返回同一结果，内容不同则 request_id_conflict。"},
-                    "expectedRevision": {"type": "integer", "minimum": 0, "description": "本次变更基于的世界修订号"},
+                    "expectedRevision": {"type": "integer", "description": "本次变更基于的世界修订号，从 0 开始。必须是整数且非负：负数会被权威拒绝，错误码 invalid_revision；与当前修订不一致则返回 revision_conflict。"},
                     "producer": {"type": "string", "description": "可选：谁提交的，默认 taskd"},
                     "intent": {"description": "可选：这次变更为了什么的说明，只记录不决定行为"},
                     "ops": {
@@ -355,5 +355,272 @@ mod tests {
             .collect();
         assert_eq!(listed, names());
         assert_eq!(block["naming"].as_str().unwrap(), "tools appear to the client as mcp__gmgn__<tool>");
+    }
+
+    // -----------------------------------------------------------------------
+    // 门禁：catalog 的每个 inputSchema 只能用宿主校验器认得的键。
+    //
+    // 判据**读 Swift 校验器自己的那一份白名单**（`ResidentDSHAgentToolBridge.swift`
+    // 的 `allowedSchemaKeys` 字面量），这里不手抄第二份：白名单放宽或收紧，这条门禁
+    // 自动跟随，不可能与校验器分叉。读不到源码 = 门禁失效（panic 报红，绝不静默放行）。
+    // -----------------------------------------------------------------------
+
+    /// 仓库根：`CARGO_MANIFEST_DIR` = `<root>/services/gmgn-mcpd`。
+    fn workspace_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+    }
+
+    fn host_allowed_schema_keys() -> BTreeSet<String> {
+        let path = workspace_root()
+            .join("apps/macos/Sources/GMGNRadio/Agent/ResidentDSHAgentToolBridge.swift");
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "读不到宿主校验器源码 {}：{error} —— 判据没有第二份，读不到就是门禁失效（不是没违规）",
+                path.display()
+            )
+        });
+        parse_allowed_schema_keys(&text).unwrap_or_else(|| {
+            panic!(
+                "宿主校验器源码 {} 里读不到 `allowedSchemaKeys: Set<String> = [...]` 字面量 —— 门禁失效",
+                path.display()
+            )
+        })
+    }
+
+    /// 逐字解析 Swift 里 `allowedSchemaKeys: Set<String> = [ ... ]` 的字面量。
+    /// 白名单变了这里自动跟随；`len >= 4` 只是"解析没被截断"的下限，不是第二份键表。
+    fn parse_allowed_schema_keys(text: &str) -> Option<BTreeSet<String>> {
+        let anchor = "allowedSchemaKeys: Set<String> = [";
+        let start = text.find(anchor)? + anchor.len();
+        let end = text[start..].find(']')? + start;
+        let mut keys = BTreeSet::new();
+        let mut current: Option<String> = None;
+        for character in text[start..end].chars() {
+            if character == '"' {
+                match current.take() {
+                    Some(key) => {
+                        keys.insert(key);
+                    }
+                    None => current = Some(String::new()),
+                }
+            } else if let Some(key) = current.as_mut() {
+                key.push(character);
+            }
+        }
+        (keys.len() >= 4).then_some(keys)
+    }
+
+    /// 收集 schema 里所有不在宿主白名单内的键，附 JSON 路径，供 FAIL 原话使用。
+    ///
+    /// 递归位置与宿主校验器一致：schema 自身 → `properties` 的每个值（属性**名**是
+    /// 调用方的参数名，不是 schema 键，不判）→ `items`。`additionalProperties` 是对象
+    /// 时也进去看：宿主只认它等于 `false`，多看一眼只会更严，不会漏。
+    fn unsupported_schema_keys(schema: &Value, allowed: &BTreeSet<String>) -> Vec<String> {
+        let mut hits = Vec::new();
+        collect_unsupported_keys(schema, "$", allowed, &mut hits);
+        hits
+    }
+
+    fn collect_unsupported_keys(
+        schema: &Value,
+        path: &str,
+        allowed: &BTreeSet<String>,
+        hits: &mut Vec<String>,
+    ) {
+        let Some(object) = schema.as_object() else { return };
+        for key in object.keys() {
+            if !allowed.contains(key) {
+                hits.push(format!("{path}: {key}"));
+            }
+        }
+        if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+            for (name, property) in properties {
+                collect_unsupported_keys(property, &format!("{path}.{name}"), allowed, hits);
+            }
+        }
+        if let Some(items) = object.get("items") {
+            collect_unsupported_keys(items, &format!("{path}[]"), allowed, hits);
+        }
+        if let Some(additional) = object.get("additionalProperties") {
+            if additional.is_object() {
+                collect_unsupported_keys(additional, &format!("{path}.*"), allowed, hits);
+            }
+        }
+    }
+
+    /// 往 schema 的**第一个参数**里塞一个键；`empty_object` 这种没有参数的返回 false。
+    fn inject_into_first_property(schema: &mut Value, key: &str, value: Value) -> bool {
+        let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) else {
+            return false;
+        };
+        let Some((_, first)) = properties.iter_mut().next() else { return false };
+        let Some(object) = first.as_object_mut() else { return false };
+        object.insert(key.to_owned(), value);
+        true
+    }
+
+    /// **门禁**：catalog 里每个 `inputSchema` 都只能用宿主校验器认得的键。
+    ///
+    /// 为什么必须有：`ResidentDSHOriginalSchemaValidator.allowedSchemaKeys` **故意不认**
+    /// 它实现不了的 JSON-Schema 约束键（`minimum`/`maximum`/`pattern`/`format`/`oneOf`…）。
+    /// schema 里出现一个，整条就被判 `schema_unsupported`，工具**一次都执行不到** ——
+    /// 不是"参数被拒"，而是"工具从来没跑"。而且它只在参数**真的传了**那个属性时才发作
+    /// （宿主的 `validateObject` 对未出现的属性 `continue`），所以是"用了就坏"。
+    ///
+    /// 真机 2026-09-28：`hold_prop` 的 `layout_revision.minimum` 连败 7 次；MCP 面
+    /// `after`/`limit`/`expectedRevision` 的 `minimum`/`maximum` 是同一个形状，已改写成
+    /// 说明（范围判据留在权威实现里，见 `ranged_parameters_explain_their_range_and_rejection`）。
+    #[test]
+    fn no_tool_schema_uses_a_key_the_host_validator_refuses() {
+        let allowed = host_allowed_schema_keys();
+        let mut violations = Vec::new();
+        for tool in TOOLS {
+            for hit in unsupported_schema_keys(&(tool.input_schema)(), &allowed) {
+                violations.push(format!("{} {hit}", tool.name));
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "工具 inputSchema 里出现宿主校验器不认的键（整条 schema 会被判 schema_unsupported，工具在真机上一次都跑不到）：{}",
+            violations.join(" | ")
+        );
+
+        // 注入自测（只在内存里改 schema，绝不碰工作树）：不红 = 门禁自己失效。
+        // 正向：`minimum` 塞进每个工具的第一个参数 ⇒ 必须逐个被抓到。
+        let mut injected = 0;
+        for tool in TOOLS {
+            let mut schema = (tool.input_schema)();
+            if !inject_into_first_property(&mut schema, "minimum", json!(0)) {
+                continue;
+            }
+            injected += 1;
+            let hits = unsupported_schema_keys(&schema, &allowed);
+            assert!(
+                hits.iter().any(|hit| hit.ends_with(": minimum")),
+                "往 `{}` 的第一个参数注入 minimum 没有被抓到（注入不红 = 门禁失效）：{hits:?}",
+                tool.name
+            );
+        }
+        assert!(injected >= 8, "注入覆盖面缩水：只有 {injected} 个工具的 schema 带参数");
+
+        // 嵌套位置必须也被抓到（`items` 下面的属性）——递归坏了就是漏检。
+        let commit = find("gmgn_world_commit").expect("gmgn_world_commit 必须在 catalog 里");
+        let mut nested = (commit.input_schema)();
+        nested["properties"]["ops"]["items"]["properties"]["op"]["maximum"] = json!(9);
+        assert!(
+            unsupported_schema_keys(&nested, &allowed)
+                .iter()
+                .any(|hit| hit == "$.ops[].op: maximum"),
+            "往 ops.items 嵌套位置注入 maximum 没有被抓到（递归失效 = 门禁失效）"
+        );
+
+        // 顶层位置（不在 `properties` 里）同样必须被抓到 —— `oneOf`/`anyOf` 这类整体
+        // 组合约束最常见的落点就在顶层。
+        let mut top = (find("gmgn_world_read").unwrap().input_schema)();
+        top["oneOf"] = json!([]);
+        assert!(
+            unsupported_schema_keys(&top, &allowed).iter().any(|hit| hit == "$: oneOf"),
+            "往 schema 顶层注入 oneOf 没有被抓到（顶层漏检 = 门禁失效）"
+        );
+
+        // 反向对照：白名单内的键不能被误判，否则这条门禁只是"凡键皆红"。
+        for tool in TOOLS {
+            let mut schema = (tool.input_schema)();
+            if !inject_into_first_property(&mut schema, "minLength", json!(1)) {
+                continue;
+            }
+            assert!(
+                unsupported_schema_keys(&schema, &allowed).is_empty(),
+                "白名单内的 minLength 被误判成违规：{}",
+                tool.name
+            );
+        }
+    }
+
+    struct AuthorityReadLimits {
+        default: usize,
+        max: usize,
+    }
+
+    /// 权威读取窗口的默认值与上限，**从实现源码里读**（`services/gmgn-taskd/src/world.rs`）。
+    /// 不手抄数值：权威改了常量，说明校验自动跟着改判。这两个常量也正是
+    /// `capability_contract` 的 `read_limits` 发布出去的那一份。
+    fn authority_read_limits() -> AuthorityReadLimits {
+        let path = workspace_root().join("services/gmgn-taskd/src/world.rs");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("读不到权威源码 {}：{error}", path.display()));
+        AuthorityReadLimits {
+            default: parse_usize_constant(&text, "DEFAULT_READ_LIMIT"),
+            max: parse_usize_constant(&text, "MAX_READ_LIMIT"),
+        }
+    }
+
+    fn parse_usize_constant(text: &str, name: &str) -> usize {
+        let anchor = format!("pub const {name}: usize =");
+        let start = text
+            .find(&anchor)
+            .unwrap_or_else(|| panic!("权威源码里找不到 `{anchor}`")) + anchor.len();
+        let digits: String = text[start..]
+            .trim_start()
+            .chars()
+            .take_while(|character: &char| character.is_ascii_digit())
+            .collect();
+        digits
+            .parse()
+            .unwrap_or_else(|error| panic!("`{anchor}` 后面的值不是整数：{error}"))
+    }
+
+    /// schema 里删掉的 `minimum`/`maximum` **不是**判据 —— 判据只有一份，住在权威实现里
+    /// （`world.rs` 的 `read_window` / `commit`）。但 agent 唯一能读到的范围来源就是
+    /// `description`，所以三个带范围的参数必须把**范围**与**越界会被拒**写清楚。
+    ///
+    /// `limit` 的上下界不另立一份数值判据：与权威常量同源比对，权威改常量、说明没跟上
+    /// 就报红。
+    #[test]
+    fn ranged_parameters_explain_their_range_and_rejection() {
+        let expectations = [
+            ("gmgn_world_facts_read", "after", "invalid_cursor", ["0", "负数"]),
+            ("gmgn_world_facts_read", "limit", "invalid_limit", ["1", "500"]),
+            ("gmgn_world_commit", "expectedRevision", "invalid_revision", ["0", "负数"]),
+        ];
+        for (tool_name, parameter, code, evidence) in expectations {
+            let schema = (find(tool_name)
+                .unwrap_or_else(|| panic!("catalog 里没有 {tool_name}"))
+                .input_schema)();
+            let description = schema["properties"][parameter]["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{tool_name}.{parameter} 没有 description"));
+            assert!(
+                description.contains("拒绝"),
+                "{tool_name}.{parameter} 的说明没说清越界会被拒：{description}"
+            );
+            assert!(
+                description.contains(code),
+                "{tool_name}.{parameter} 的说明没给出权威的错误码 {code}：{description}"
+            );
+            for needle in evidence {
+                assert!(
+                    description.contains(needle),
+                    "{tool_name}.{parameter} 的说明缺范围证据 `{needle}`：{description}"
+                );
+            }
+        }
+
+        let limits = authority_read_limits();
+        let description = (find("gmgn_world_facts_read").unwrap().input_schema)()["properties"]
+            ["limit"]["description"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            description.contains(&limits.default.to_string()),
+            "limit 说明里的默认值没说成权威常量 DEFAULT_READ_LIMIT = {}：{description}",
+            limits.default
+        );
+        assert!(
+            description.contains(&limits.max.to_string()),
+            "limit 说明里的上限没说成权威常量 MAX_READ_LIMIT = {}：{description}",
+            limits.max
+        );
     }
 }

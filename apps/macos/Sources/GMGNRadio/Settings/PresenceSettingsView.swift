@@ -60,7 +60,7 @@ struct PresenceSettingsView: View {
                 } header: {
                     Text("动作")
                 } footer: {
-                    Text("VRM 列表显示 VRMA 和自然待机；PMX 列表显示 VMD 和自然待机。切换角色格式时会分别记住动作选择。两类动作都保留安装，已有转接播放能力不变。")
+                    Text("两种角色各有自己的动作列表，切换时会分别记住你选的。")
                 }
 
                 Section("动作库") {

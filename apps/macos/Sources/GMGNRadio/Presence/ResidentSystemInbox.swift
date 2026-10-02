@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import os
 
 /// One user-readable system delivery (wish task progress/completion/failure).
 /// This is a projection only: applying it never acknowledges the background
@@ -85,6 +86,8 @@ public struct ResidentSystemInboxArchive: Codable, Equatable, Sendable {
 /// （ACK）混淆。
 @MainActor
 public final class ResidentSystemInboxStore: ObservableObject {
+    /// 界面只留**一句人话**；失败原因（哪一段、什么错）一条不少地进日志。
+    nonisolated static let diagnosticLog = Logger(subsystem: "ai.gmgn.radio", category: "ResidentSystemInbox")
     /// Terminal task prompts hide this many seconds after their last actual
     /// state change; the record itself stays in history and in the badge.
     public static let terminalPromptLifetime: TimeInterval = 30
@@ -235,7 +238,11 @@ public final class ResidentSystemInboxStore: ObservableObject {
                 return true
             } catch {
                 self.failedScopes.insert(scope)
-                self.persistenceError = "系统消息暂未保存，关闭应用后可能丢失；稍后会重试。（\(error.localizedDescription)）"
+                // 界面上只有一句人话；哪一段没存上、原始错误是什么，全部进日志。
+                Self.diagnosticLog.error(
+                    "收件箱落盘失败：scope=\(String(describing: scope), privacy: .public) 条数=\(self.buckets[scope]?.count ?? 0) error=\(error.localizedDescription, privacy: .public)"
+                )
+                self.persistenceError = "这条系统消息暂时没存上，稍后会自动重试。"
                 return false
             }
         }

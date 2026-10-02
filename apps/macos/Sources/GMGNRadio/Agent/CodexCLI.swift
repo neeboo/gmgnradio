@@ -21,10 +21,10 @@ enum CodexCLIError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .unavailable:
-            "未找到 Codex CLI，请先安装 Codex。"
+            "没找到 Codex，请先安装。"
         case .commandFailed:
-            "Codex 本次操作没有成功，已停止。请确认现场后重新发送；"
-                + "若反复失败，请在设置里重新登录 Codex。"
+            "这次没能完成，请重新发送。"
+                + "若反复出现，请在设置里重新登录 Codex。"
         }
     }
 }
@@ -122,8 +122,8 @@ enum DSHReplyTimeout: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .request: "等待 DSH 本次回复超时，已停止等待。部分操作可能已经发生，请先核对当前状态。"
-        case .turn: "DSH 本轮回复超时，已停止继续调用。部分操作可能已经发生，请先核对当前状态。"
+        case .request: "等回复等太久了，已经停下。请重新发送。"
+        case .turn: "这轮等太久了，已经停下。请重新发送。"
         }
     }
 }

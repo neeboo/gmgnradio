@@ -12,7 +12,7 @@ enum WorldStatePersistenceRetired: LocalizedError {
     case writeRetired
 
     var errorDescription: String? {
-        "世界状态已由 gmgn-taskd 独占写入；Swift 不再写 state.json（该文件只作只读预像）。"
+        "空间数据由后台服务统一写入，这里只读。"
     }
 }
 

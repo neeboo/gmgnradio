@@ -458,7 +458,7 @@ import CoreFoundation
                             worldID: worldID, residentScope: residentScope)
                             .contains(where: { $0.id == draft.attachmentID }) else {
                             return failure(callID, code: WishMachineContract.Code.delegationExpired.rawValue,
-                                message: "这份委托已经不能续了（原授权已不在或已换空间）。请让用户重新说一次要做什么；不会因此新建一次生成。")
+                                message: "这份委托已经不能续了，请让用户重新说一次要做什么。")
                         }
                         job = try await coordinator.submit(requestID: draft.requestID, authorizationID: draft.authorityID,
                             attachmentID: attachmentID, name: name,

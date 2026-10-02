@@ -68,7 +68,7 @@ struct ResidentPropEditorView: View {
                     if let reason = state.selectedHoldUnavailableReason {
                         Text(reason).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2)
                     }
-                    Text("移动指针选择落点，左键放下；右键旋转 45°（R / ⇧R / , / . 同）；Esc 放回")
+                    Text("移动指针选位置，左键放下，右键转 45°，Esc 放回。")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
                 // 「删除」是**永久**的，所以它必须问一次。放在这里（而不是塞进那一排小按钮）
@@ -137,8 +137,7 @@ struct ResidentPropEditorView: View {
             Button("永久删除", role: .destructive) { Task { await state.deleteSelected() } }
             Button("取消", role: .cancel) { }
         } message: {
-            Text("删除不可恢复。它不会再出现在「我的物件」里；如果它正摆在房间里或拿在居民手里，"
-                 + "会在同一次操作里先收回/放回再删掉。还被别的物件引用的共享内容会保留。")
+            Text("删除后不能恢复，它也不会再出现在「我的物件」里。")
         }
     }
     /// 「我的物件」列表 = 唯一投影算出来的四组，一组一块。

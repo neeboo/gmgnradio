@@ -619,7 +619,17 @@ guard let poseDeclaration = declaration(attachmentSource, "enum PropAttachmentPo
       let slotTableDeclaration = declaration(slotSource, "enum PropAttachmentSlots"),
       let rotationDeclaration = declaration(orientationSource, "public enum WorldPropRotation"),
       let quaternionExtension = declaration(orientationSource, "public extension WorldQuaternion"),
-      let orientedBoundsDeclaration = declaration(orientationSource, "public static func orientedBounds(", occurrence: 2)
+      let orientedBoundsDeclaration = declaration(orientationSource, "public static func orientedBounds(", occurrence: 2),
+      // `PropAttachment.swift` 现在真的会调 `WorldPropSizePolicy.uniformFactor(...)`
+      // （`targetSizeMeters` 那一档）。这两段**不手抄**：从 `WorldPropSizePolicy.swift`
+      // 逐字切进来。`isFinite(_:)` 必须一起切 —— 它就是 `uniformFactor` 第一句
+      // `isFinite(current)` 的那个 `Self.isFinite`，少切它这一句就编不过。
+      // 切出来是 `public`，而替身 `WorldVector3` 是 internal 的 ⇒ 去掉 `public ` 前缀，
+      // 只为让两者同处一个模块，**函数体一个字都不动**（容差 0.001 / 守卫因此构造上等于生产）。
+      let sizePolicyIsFinite = declaration(sizePolicySource, "public static func isFinite(")?
+          .replacingOccurrences(of: "public ", with: ""),
+      let uniformFactor = declaration(sizePolicySource, "public static func uniformFactor(")?
+          .replacingOccurrences(of: "public ", with: "")
 else {
     print("FAIL: 切不出需要的那几段真代码（切片签名变了？）")
     exit(1)
@@ -677,7 +687,18 @@ struct WorldGeneratedProp: Codable, Equatable, Sendable {
 }
 
 /// 与生产同名同值；harness 另外用源码断言钉住那个字面量。
-enum WorldPropSizePolicy { static let longThinAspectLimit: Float = 4 }
+///
+/// `uniformFactor`（连同它依赖的 `Self.isFinite(_:)`）**不手抄**：从
+/// `WorldPropSizePolicy.swift` 逐字切片编进来，理由见上面 `guard let` 处的注释 ——
+/// 手抄一份的话，判据测的是我抄的那一份，生产改了容差或守卫这里不会红，
+/// 那正是这个仓库反复踩过的"门禁从不 FAIL"。切片之后：手持那一件与地上那一件读
+/// 同一组三轴尺寸（`ResidentHeldPropDescriptor.targetSizeMeters` = 世界里那一份
+/// `effectiveSize`），两边过的是生产里那**唯一一份**判据（容差也相同）。
+enum WorldPropSizePolicy {
+    static let longThinAspectLimit: Float = 4
+\#(sizePolicyIsFinite)
+\#(uniformFactor)
+}
 /// 与生产同名同值；harness 另外用源码断言钉住那个字面量。
 enum ResidentPropAttachmentEligibility { static let supportedAvatarID = "pmx.2b-miss-0414-standard" }
 

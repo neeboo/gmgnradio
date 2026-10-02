@@ -40,6 +40,10 @@ let appPath = "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift"
 let loopPath = "apps/macos/Sources/GMGNRadio/Agent/ResidentAgentLoop.swift"
 let wishToolsPath = "apps/macos/Sources/GMGNRadio/Agent/ResidentWishMachineTools.swift"
 let coordinatorPath = "apps/macos/Sources/GMGNRadio/Presence/WishMachineCoordinator.swift"
+/// 许愿任务不再是窗口/列表（用户 2026-10-02：「许愿任务变成消息提示，不要单独做窗口了」）：
+/// 状态变化是一条条消息，读的是**唯一投影**的输出。这一份只被当**文本**校验（它依赖
+/// Foundation + 投影，由 `tools/test-wish-task-messages.swift` 编译驱动）。
+let messagePath = "apps/macos/Sources/GMGNRadio/Presence/WishMachineTaskMessage.swift"
 
 let presentationSource = try productionSource(presentationPath)
 let projectionSource = try productionSource(projectionPath)
@@ -51,6 +55,7 @@ let appSource = try productionSource(appPath)
 let loopSource = try productionSource(loopPath)
 let wishToolsSource = try productionSource(wishToolsPath)
 let coordinatorSource = try productionSource(coordinatorPath)
+let messageSource = try productionSource(messagePath)
 
 var failures = 0
 func check(_ condition: Bool, _ message: String) {
@@ -77,71 +82,52 @@ func occurrences(of needle: String, in text: String) -> Int {
     text.components(separatedBy: needle).count - 1
 }
 
-// ── 断言 1：任务行不含任何**按任务**的授权控件，只表达三轴状态 ──────────────
-guard let row = declaration(in: overlaySource, "struct WishMachineTaskStatusView") else {
-    print("FAIL: 找不到任务行视图 WishMachineTaskStatusView（任务行的三轴呈现必须存在且可被隔离校验）")
-    exit(1)
-}
-// 单条任务行的正文：授权/连通性必须在**这一层**缺席，而不是只在整份文件里缺席。
-guard let rowItem = declaration(in: row, "ForEach(visible) { task in") else {
-    print("FAIL: 找不到单条任务行的渲染体（ForEach(visible) { task in ... }）")
-    exit(1)
-}
-check(!rowItem.contains("onResumeAutomaticContinuation"),
-      "任务行不得调用按任务的自动续办恢复通道：授权不是任务状态")
-check(!rowItem.contains("resident.wish-task.\\(task.id.uuidString).resume"),
-      "任务行不得再有按任务展开的「恢复自动领取」控件（resident.wish-task.<id>.resume）")
-check(!rowItem.contains("恢复自动领取"),
-      "任务行不得再出现「恢复自动领取」文案：解除是一个全局动作，不按任务逐个恢复")
-check(!rowItem.contains("autoContinuationPaused"),
-      "任务行不得渲染任务级停止事实（autoContinuationPaused）：那是授权，不是三轴状态")
-check(!rowItem.contains("resident.wish-task.\\(task.id.uuidString).stop"),
-      "任务行不得有按任务的停止控件：停止由全局开关表达")
-check(!rowItem.contains("connectivityNotice") && !rowItem.contains("resident.connectivity-banner"),
-      "连通性事实不得出现在任务行里：它只能出现在全局横幅上")
-check(!rowItem.contains("resident.autonomy.resume") && !rowItem.contains("resumeAutonomy()"),
-      "全局开关的动作不得挂在任务行上：那是全局入口")
-// ── 断言 1（续）：任务行只渲染**一句**现状，且那一句由三轴派生 ────────────────
+// ── 断言 1：许愿任务**没有自己的窗口/列表**（用户 2026-10-02：「许愿任务变成消息提示，
+//    不要单独做窗口了」）─────────────────────────────────────────────────────────
 //
-// 这里原本断言"任务行必须能表达它自己的三轴状态（生成/归属/摆放 三个标签）"。
-// 数据模型一个字都没少（三轴类型、`project`、归属只前进全都照旧），少的是
-// **视觉噪音**：三个标签收敛成一句由三轴派生的现状。所以这条断言**没有放宽**——
-// 它从"三个轴各说一次"变成"三轴合起来正好说一次，而且只在这一处拼"：
-// 下面既有正向要求（那一句必须来自 `currentStatusLine` → 生产投影），
-// 也有反向要求（任务行里不许出现任何轴标签、任何轴的无障碍 id、任何自己拼的状态词）。
-// 任务行**不许自己拼**任何状态词：那一句只能来自唯一投影。词表把**两套**都列上 ——
-// ① 现在投影在用的那几句；② 这次收口从任务行退役的第二套（可领取 / 等待入库 / 未摆放 /
-// 排队中）。第一套出现说明视图绕过了 `task.currentStatusLine`，第二套出现说明第二套文案
-// 又长回来了 —— 两种都是"同一件事两句话"。
-let derivedVocabulary = ["生成中", "未领取", "在库里（没摆）", "已摆放", "生成失败", "已结束",
-                         "可领取", "等待入库", "未摆放", "排队中"]
-check(rowItem.contains("Text(task.currentStatusLine)"),
-      "任务行必须渲染由三轴派生的那一句现状（Text(task.currentStatusLine)）")
-check(!rowItem.contains("Text(task.status)"),
-      "任务行不得再把宿主原始 status 当作第二句状态渲染（它只经 currentStatusLine 使用）")
-check(!rowItem.contains(".generation.label") && !rowItem.contains(".ownership.label")
-      && !rowItem.contains(".placement.label"),
-      "三轴的值必须由投影合成**一句**，不许在视图里各自拼一份（.generation/.ownership/.placement.label）")
-check(!rowItem.contains("axisChip"),
-      "任务行不得再挂三个轴标签（axisChip）：一句现状就够了")
-check(!rowItem.contains("resident.wish-task.\\(task.id.uuidString).generation")
-      && !rowItem.contains("resident.wish-task.\\(task.id.uuidString).ownership")
-      && !rowItem.contains("resident.wish-task.\\(task.id.uuidString).placement"),
-      "三个轴标签的无障碍 id 不得再挂在任务行上（它们随标签一起收敛掉了）")
-check(rowItem.contains("resident.wish-task.\\(task.id.uuidString).status"),
-      "唯一那一句现状必须有自己的无障碍 id（resident.wish-task.<id>.status）")
-check(!derivedVocabulary.contains(where: { rowItem.contains($0) }),
-      "任务行不得自己拼状态词（投影那几句 + 退役的第二套 可领取/等待入库/未摆放/排队中）：那一句只能来自唯一投影")
-check(rowItem.contains("let detail = task.detail") && rowItem.contains("Text(detail)"),
-      "失败/等待原因那一行必须仍然渲染：简化的是标签，不是原因")
+// 这一节原来钉的是"单条任务行的正文里不许有按任务的授权控件、只表达三轴、只渲染一句现状"。
+// 用户拍板（许愿任务改成消息提示）之后，任务行与那块列表**整个从产品路径上删掉了** ——
+// 所以这里钉的是更强的那一件事：**没有任务行、没有列表**。
+//
+// 原来那些断言的**对象**（任务行）不存在了，但它们的内容一条都没有放宽，改在**消息通道**上
+// 继续成立，并由 `tools/test-wish-task-messages.swift` 逐条钉着：
+//   · 状态来源仍然是唯一投影（消息读 `OwnershipRow.statusText`，不自己拼状态词）；
+//   · 文案是人话（那一套词表 0 个 key=value / UUID / 路径 / 内部字段名 / 省略号堆叠）；
+//   · 状态变化各发一条、同一状态不重复；失败待办**不自动消失**、其它终态按既有窗口过期；
+//   · 消息落进**既有**的对话通道（`ResidentChatTranscriptLine`），不新造面板、不新造窗口。
+guard let row = declaration(in: overlaySource, "struct WishMachineTaskStatusView") else {
+    print("FAIL: 找不到许愿任务那块视图的宿主 WishMachineTaskStatusView")
+    exit(1)
+}
+check(!row.contains("ForEach"),
+      "许愿任务不再有自己的窗口/列表：视图里不许再出现按任务渲染的行（ForEach）")
+check(!row.contains("state.tasks"),
+      "视图不得再读任务列表（state.tasks）：产品路径对许愿任务列表**零调用**")
+check(!row.contains("Text(\"许愿任务\")"),
+      "视图里不许再有那块列表的标题（「许愿任务」）")
+check(!row.contains("resident.wish-tasks") && !row.contains("resident.wish-task."),
+      "视图里不许再有任何许愿任务列表/任务行的无障碍标识")
+// 视图里剩下的只有两条**全局**横幅：连通性与「能不能自主」。它们不是任务属性。
+check(row.contains("resident.connectivity-banner") && row.contains("resident.autonomy-banner"),
+      "视图里只剩两条全局横幅（连通性 resident.connectivity-banner / 自主 resident.autonomy-banner）")
+// 那一句现状的唯一出口仍然是唯一投影：任务行没了，取它的是**消息通道**
+// （`OwnershipRow.statusText` 就是投影自己的输出；这里不许出现任何自己拼的状态词）。
+check(messageSource.contains("row.statusText"),
+      "许愿任务那一句仍然只能来自唯一投影（消息通道读 OwnershipRow.statusText）")
+check(!messageSource.contains("ResidentTaskAxisProjection.currentStatus"),
+      "消息通道不得绕过投影自己去拼那一句（拼一份就是第二份真相）")
+for axisLabel in [".generation.label", ".ownership.label", ".placement.label", "axisChip"] {
+    check(!overlaySource.contains(axisLabel) && !messageSource.contains(axisLabel),
+          "任何界面/消息里都不得再出现轴标签文案（\(axisLabel)）：三轴只在投影里合成一句")
+}
 // 派生点**只有一处**：三轴 → 一句现状 的判断在 `ResidentTaskAxisProjection.currentStatus`
 // 里，任务行那一句的组装在 `WishMachineTaskPresentation.currentStatusLine` 里，各一份。
 check(occurrences(of: "static func currentStatus(", in: presentationSource) == 1,
       "三轴 → 一句现状 的派生必须只有一处定义（ResidentTaskAxisProjection.currentStatus）")
 check(occurrences(of: "var currentStatusLine: String", in: presentationSource) == 1,
-      "任务行那一句现状的组装必须只有一处（WishMachineTaskPresentation.currentStatusLine）")
+      "那一句现状的组装必须只有一处（WishMachineTaskPresentation.currentStatusLine）")
 check(presentationSource.contains("ResidentTaskAxisProjection.currentStatus(axes)"),
-      "任务行那一句必须真的来自三轴派生，而不是另写一份判断")
+      "那一句必须真的来自三轴派生，而不是另写一份判断")
 // 三轴 → 那一句**只有唯一投影一个出口**（2026-10-02 收口）：正文里既要有委托，
 // 又不许再有第二套字面量（可领取 / 等待入库 / 未摆放 / 排队中）。
 guard let statusBody = declaration(in: presentationSource, "static func currentStatus(") else {
@@ -151,16 +137,10 @@ check(statusBody.contains("ResidentOwnershipProjection.sentence("),
       "三轴那一句必须委托给唯一投影 ResidentOwnershipProjection.sentence(generation:ownership:placement:)")
 for retired in ["可领取", "等待入库", "未摆放", "排队中"] {
     check(!statusBody.contains(retired),
-          "任务行那一句里还有第二套状态词「\(retired)」：那一句只有唯一投影一个出口")
+          "那一句里还有第二套状态词「\(retired)」：那一句只有唯一投影一个出口")
 }
 check(occurrences(of: "static func hasReachedTerminalStep(", in: presentationSource) == 1,
       "『三轴走到头了没有』的判据必须只有一处（失败通道据此让位，不另写一套）")
-check(overlaySource.contains("task.currentStatusLine")
-      && !overlaySource.contains("ResidentTaskAxisProjection.currentStatus"),
-      "视图只能取呈现层那一句（task.currentStatusLine），不得绕过它自己去拼：拼一份就是第二份真相")
-check(!overlaySource.contains(".generation.label") && !overlaySource.contains(".ownership.label")
-      && !overlaySource.contains(".placement.label"),
-      "整个任务行视图里不得再出现任何轴标签文案：三轴只在投影里合成一句")
 
 // 全局开关必须存在且是**一个**：任务行没有了，全局就一定要有。
 check(row.contains("resident.autonomy.resume"),
@@ -274,12 +254,14 @@ func storeChecks() -> Int {
     store.update([WishMachineTaskPresentation(
         id: taskID, title: "测试愿望", status: "提交待确认",
         detail: "network_unavailable\n远端计算可能仍在继续。", isTerminal: false)])
-    storeCheck(store.connectivityNotice?.contains("连不上后台") == true,
-               "连通性事实必须出现在全局横幅里（连不上后台 + 可读原因）")
-    storeCheck(store.connectivityNotice?.contains("network_unavailable") == true,
-               "全局横幅必须带上可读原因本身，不能只说『出错了』")
-    storeCheck(store.connectivityNotice?.contains("自动消失") == true,
-               "全局横幅必须说明恢复后会自动消失")
+    // 2026-10-02 文案规则：横幅只给**一句人话**（发生了什么 + 要不要用户做什么），
+    // 原始原因码（network_unavailable 这类工程词）一律不上屏，只进日志。
+    storeCheck(store.connectivityNotice?.contains("暂时连不上") == true,
+               "连通性事实必须出现在全局横幅里（一句人话）")
+    storeCheck(store.connectivityNotice?.contains("network_unavailable") != true,
+               "全局横幅不得回显原始原因码（key=value 这类工程词不上屏）")
+    storeCheck(store.connectivityNotice?.contains("恢复后会自己继续") == true,
+               "全局横幅必须说明会自己恢复，用户不用做什么")
     storeCheck(store.tasks.first?.detail?.contains("network_unavailable") != true,
                "连通性事实不得再作为任务属性出现在任务行 detail 里")
     storeCheck(store.tasks.first?.detail == "远端计算可能仍在继续。",
@@ -293,14 +275,16 @@ func storeChecks() -> Int {
 
     // 宿主推来的权威连通性事实优先；推 nil 时退回投影推导（不会留下永远不亮的提示）。
     let fed = WishMachineTaskPresentationStore()
-    fed.setConnectivityWarning("连不上后台（daemon offline）。任务和产物都还在，恢复后会自己继续；这条提示会自动消失。")
-    storeCheck(fed.connectivityNotice?.contains("daemon offline") == true,
+    fed.setConnectivityWarning("暂时连不上，东西都还在，恢复后会自己继续。")
+    storeCheck(fed.connectivityNotice?.contains("暂时连不上") == true,
                "宿主推来的全局连通性事实必须驱动横幅")
     fed.setConnectivityWarning(nil)
     fed.update([WishMachineTaskPresentation(id: UUID(), title: "T", status: "提交待确认",
                                             detail: "remote_unavailable", isTerminal: false)])
-    storeCheck(fed.connectivityNotice?.contains("remote_unavailable") == true,
+    storeCheck(fed.connectivityNotice?.contains("暂时连不上") == true,
                "宿主没报连通性问题时，投影里的连通性事实仍然必须可见（不静默）")
+    storeCheck(fed.connectivityNotice?.contains("remote_unavailable") != true,
+               "投影推导出的横幅同样不得回显原始原因码")
 
     // 断言 1（跑生产投影）：授权文本同样被摘到全局横幅，任务行拿不到它。
     let authorized = WishMachineTaskPresentationStore()
@@ -465,4 +449,4 @@ process.waitUntilExit()
 
 if failures > 0 { exit(1) }
 guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
-print("PASS: 任务行只表达三轴状态、无按任务授权控件；连通性只在全局横幅；一个开关；人类下令任何开关状态下都能执行；用户显式停止仍有效")
+print("PASS: 许愿任务没有自己的窗口/列表（零 ForEach / 零 state.tasks / 零列表标识），只剩连通性与自主两条全局横幅；三轴仍然只在唯一投影里合成一句；一个开关；人类下令任何开关状态下都能执行；用户显式停止仍有效")

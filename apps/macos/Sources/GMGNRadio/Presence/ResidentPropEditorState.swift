@@ -324,6 +324,13 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     /// 关面板 / 换世界由 `close()` 清空（"用户不要这件事了"）。台账里没有判据，
     /// 只有一个事实："这个 `(任务, 动作)` 在这次意图里已经交出去过一次"。
     private var submittedWishActions = WishActionLedger()
+    /// **还在飞**的那一次许愿动作的键。与台账分开：台账记的是"已经交出去过"，
+    /// 这一条记的是"还没回来"。
+    ///
+    /// 为什么必须有它：「让居民去取」那一次是动作**自己**先把摆放面板关掉再提交的，
+    /// 而 `close()` 会清台账（"用户不要这件事了"）—— 关面板发生在 `record` 之前，
+    /// 所以在飞的那一次只有这个键认得出第二次点击，否则它就成了"点了没反应"。
+    private var inFlightWishActionKey: String?
     private var generation = UUID()
     private var previewGeneration = UUID()
     private var draftRevision: UInt64?
@@ -457,7 +464,15 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
         case .place, .withdraw, .delete: nil
         }
     }
-    func open() { guard !snapshot.worldID.isEmpty, !isOpen else { return }; isOpen = true; onEditingChanged(true) }
+    func open() {
+        guard !snapshot.worldID.isEmpty, !isOpen else { return }
+        // 打开面板 = **新一次意图**开始，台账在这里清：「让居民去取」那一次是动作自己
+        // 把面板关掉的，而 `close()` 清台账发生在 `record` 之前（关完面板才记账），
+        // 所以关面板那一次清不掉自己记下的那条 —— 不在这里再清一次，重开面板后
+        // 同一行会被误判成"重复提交"、再也点不动。
+        submittedWishActions.removeAll()
+        isOpen = true; onEditingChanged(true)
+    }
     func close() {
         generation = UUID(); isSaving = false
         // 关面板 / 退出装修 / 换世界走的是同一条 `close()`：都是"用户不要这件事了"。
@@ -650,7 +665,11 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     }
 
     /// 初始落点最多试几次 `preview`。见 `firstPlaceablePlacement` 的取舍说明。
-    static let initialPlacementAttemptLimit = 32
+    /// 上限**只有一处定义**：`RetryBackoff.swift` 的 `RetryBackoffSite.propPlacement`
+    /// （这是主线程预算，不是等待；读同一个策略，语义与数值都不变）。
+    static var initialPlacementAttemptLimit: Int {
+        RetryBackoffSite.propPlacement.policy.maximumAttempts
+    }
 
     /// 这一行现在能坐在哪一层承托面上。
     ///
@@ -885,36 +904,57 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     /// 04.928 与 06.346 / 07.414，同一个任务各两条 `ask-resident`。所以再加一层与既有风格
     /// 一致的台账：同一次用户意图内，`(jobID, step)` 只提交一次；重复调用走幂等出口，
     /// 返回同一次的结果（同一句 `notice`），绝不第二次交给居民。
+    ///
+    /// 幂等判据问在 `isOpen` **之前**：`askResidentToFetch` 那一次是动作自己先把面板
+    /// 关掉（见 `GMGNRadioApp.askResidentToFetchProp`），第二次点击落在 `isOpen == false`
+    /// 上；先问 `isOpen` 就会静默 return —— 那正是"点了没反应"。已记过账的与**还在飞**的
+    /// 同一次提交都走 `reportWishActionDuplicate`（同一句"重复提交已忽略"）。
     private func performWishAction(jobID: String, step: String,
                                    action: (@MainActor (String) async throws -> Void)?) async {
-        guard isOpen, !isSaving else { return }
-        guard submittedWishActions.admits(jobID: jobID, step: step) else {
-            // 幂等：同一次意图内的重复调用**不再提交**，只把同一次的结果再说一遍。
-            notice = Self.submittedText(for: step)
-            livingWorldLogger.notice("摆件面板拒绝 step=wish-\(step, privacy: .public)-duplicate 任务=\(jobID, privacy: .public) 结果=重复提交已忽略（同一次意图只提交一次）")
+        let key = WishActionLedger.key(jobID: jobID, step: step)
+        if inFlightWishActionKey == key {
+            reportWishActionDuplicate(jobID: jobID, step: step)
             return
         }
+        guard submittedWishActions.admits(jobID: jobID, step: step) else {
+            reportWishActionDuplicate(jobID: jobID, step: step)
+            return
+        }
+        guard isOpen, !isSaving else { return }
         guard let action else {
             notice = Self.wishActionNotWiredText
             livingWorldLogger.notice("摆件面板拒绝 step=wish-\(step, privacy: .public)-not-wired 任务=\(jobID, privacy: .public)")
             return
         }
         isSaving = true; isMoving = false
+        inFlightWishActionKey = key
         // 保存中：世界随时可能换一份回来，这次待办一律作废（与 `save` 同一条纪律）。
         clearPendingSelect(reason: "许愿任务动作中")
         do {
             try await action(jobID)
             isSaving = false
+            inFlightWishActionKey = nil
             submittedWishActions.record(jobID: jobID, step: step)
             // 状态那一句由宿主推来的新快照说（列表读的是权威），这里只说"这次动作提交出去了"。
             notice = Self.submittedText(for: step)
             livingWorldLogger.notice("摆件面板许愿任务 step=wish-\(step, privacy: .public) 任务=\(jobID, privacy: .public) 结果=已提交")
         } catch {
             isSaving = false
+            inFlightWishActionKey = nil
             // **原话**：既有那条路给出的具名原因，一个字都不改写。
             notice = error.localizedDescription
             livingWorldLogger.notice("摆件面板许愿任务 step=wish-\(step, privacy: .public) 任务=\(jobID, privacy: .public) 结果=拒绝 原因=\(error.localizedDescription, privacy: .public)")
         }
+    }
+
+    /// 同一次意图内第二次点击的**唯一**出口：不再提交，只把同一次的结果再说一遍。
+    ///
+    /// 界面上那一句可能看不见（面板刚被第一次点击关掉），所以**日志里那一行是硬要求**：
+    /// "重复提交已忽略"必须是可查的事实，不许静默。
+    private func reportWishActionDuplicate(jobID: String, step: String) {
+        // 幂等：同一次意图内的重复调用**不再提交**，只把同一次的结果再说一遍。
+        notice = Self.submittedText(for: step)
+        livingWorldLogger.notice("摆件面板拒绝 step=wish-\(step, privacy: .public)-duplicate 任务=\(jobID, privacy: .public) 结果=重复提交已忽略（同一次意图只提交一次）")
     }
 
     /// 宿主还没把许愿动作接上时的那句话（绝不静默、绝不假装做过）。

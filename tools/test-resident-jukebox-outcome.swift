@@ -468,7 +468,9 @@ func code(_ result: RealtimeDJToolResult) -> String? { (try? JSONSerialization.j
                 return false
             }, "the attempt itself must be named, got \(f.reports)")
             check(f.reports.contains { report in
-                if case let .progress(reason) = report { return reason.contains("接管这次点唱机播放") }
+                // 2026-10-02 文案规则：上屏的必须是**一句人话**（谁发起、要不要用户做什么），
+                // 不许把 call/phase/UUID 这些工程字段拼进去。判据本身一个字没动。
+                if case let .progress(reason) = report { return reason.contains("由居民自己发起") }
                 return false
             }, "who owns the attempt must be named, got \(f.reports)")
         }
@@ -736,6 +738,8 @@ let worldRuntimeFlags = worldRuntimeHarnessFlags()
 let worldRuntimeModules = worldRuntimeFlags[1]
 let files = ["WorldAgentContext", "WorldAgentToolContract", "WorldAgentToolDispatcher", "ResidentWorldToolSession", "ResidentActivityOutcome"]
 let sourcePaths = files.map { sources.appendingPathComponent("Agent/\($0).swift").path }
+    // 退避/重试预算的**唯一**定义（六处读它）—— 编它，不另抄一套常量。
+    + [sources.appendingPathComponent("Presence/RetryBackoff.swift").path]
 let objects = Array(worldRuntimeFlags.dropFirst(2))
 let arguments = ["-j1", "-parse-as-library", "-I", worldRuntimeModules] + sourcePaths +
     [program.path, "-o", temp.appendingPathComponent("test").path] + objects

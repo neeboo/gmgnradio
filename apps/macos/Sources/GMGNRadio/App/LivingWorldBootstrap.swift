@@ -1,5 +1,6 @@
 import Foundation
 import WorldRuntime
+import os
 
 /// The generated mesh supplies the floor; independent furniture only blocks.
 struct MarbleLivingCabinCollisionWorld: WorldCollisionQuerying {
@@ -138,16 +139,38 @@ enum LivingWorldBootstrapError: LocalizedError {
     case invalidMotionResource(id: String, kind: String, path: String)
     case invalidMarbleCabin(String)
 
+    /// 界面只留**一句人话**；校验明细、资源 id/kind/path、舱体失败原话全部进日志。
+    static let diagnosticLog = Logger(subsystem: "ai.gmgn.radio", category: "LivingWorldBootstrap")
+
+    static func badPackage(_ findings: [WorldPackageError]) -> LivingWorldBootstrapError {
+        diagnosticLog.error(
+            "生活舱包校验失败：\(findings.map(String.init(describing:)).joined(separator: " | "), privacy: .public)"
+        )
+        return .invalidPackage(findings)
+    }
+
+    static func badMotionResource(id: String, kind: String, path: String) -> LivingWorldBootstrapError {
+        diagnosticLog.error(
+            "动作资源不匹配：id=\(id, privacy: .public) kind=\(kind, privacy: .public) path=\(path, privacy: .public)"
+        )
+        return .invalidMotionResource(id: id, kind: kind, path: path)
+    }
+
+    static func badCabin(_ message: String) -> LivingWorldBootstrapError {
+        diagnosticLog.error("生活舱加载失败：\(message, privacy: .public)")
+        return .invalidMarbleCabin(message)
+    }
+
     var errorDescription: String? {
         switch self {
         case .bundledCanaryMissing:
-            "应用内没有找到生活舱示例空间。"
-        case let .invalidPackage(findings):
-            "生活舱示例空间校验失败：\(findings.map(String.init(describing:)).joined(separator: ", "))"
-        case let .invalidMotionResource(id, kind, path):
-            "生活空间动作资源格式不匹配：id=\(id)，kind=\(kind)，path=\(path)"
-        case let .invalidMarbleCabin(message):
-            "Marble 生活舱加载失败：\(message)"
+            "没找到生活舱空间，请重新安装应用。"
+        case .invalidPackage:
+            "生活舱空间不完整，请重新安装应用。"
+        case .invalidMotionResource:
+            "动作资源读不了，请重新安装应用。"
+        case .invalidMarbleCabin:
+            "生活舱加载失败，请重新打开。"
         }
     }
 }
@@ -230,7 +253,7 @@ enum LivingWorldBootstrap {
             packageRoot: packageRoot
         )
         guard findings.isEmpty else {
-            throw LivingWorldBootstrapError.invalidPackage(findings)
+            throw LivingWorldBootstrapError.badPackage(findings)
         }
         return BundledLivingWorldPackage(
             manifest: manifest,
@@ -266,13 +289,13 @@ enum LivingWorldBootstrap {
             from: Data(contentsOf: package.packageRoot.appendingPathComponent("marble.json"))
         )
         guard document.world.id == package.manifest.worldID else {
-            throw LivingWorldBootstrapError.invalidMarbleCabin("环境编号与空间规则编号不一致。")
+            throw LivingWorldBootstrapError.badCabin("环境编号与空间规则编号不一致。")
         }
         let splatURL = package.packageRoot.appendingPathComponent("scene-500k.spz")
         let colliderURL = package.packageRoot.appendingPathComponent("collider.glb")
         for url in [splatURL, colliderURL] {
             guard fileManager.fileExists(atPath: url.path) else {
-                throw LivingWorldBootstrapError.invalidMarbleCabin("缺少 \(url.lastPathComponent)")
+                throw LivingWorldBootstrapError.badCabin("缺少 \(url.lastPathComponent)")
             }
         }
         let spawn = package.manifest.spawn
@@ -429,7 +452,7 @@ enum LivingWorldBootstrap {
             let url = packageRoot.appendingPathComponent(resource.path)
                 .standardizedFileURL
             guard url.pathExtension.lowercased() == expectedExtension else {
-                throw LivingWorldBootstrapError.invalidMotionResource(
+                throw LivingWorldBootstrapError.badMotionResource(
                     id: resource.id,
                     kind: resource.kind,
                     path: resource.path

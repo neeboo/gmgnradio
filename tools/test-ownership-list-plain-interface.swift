@@ -20,8 +20,14 @@
 //    注入「多一层」（副标题 / 第三行）⇒ FAIL。
 // 4. **七个动作都还在**，只是不解释：领取 / 让居民去取 / 重试入库 / 重试 / 摆放 / 收回 / 删除。
 //    注入「删掉其中一个入口」⇒ FAIL。
-// 5. **投影一个字没改**（与 HEAD 逐字节相同），面板宽 340 / 列表高 190 未动。
-//    投影语义与五处消费的判据由 `tools/test-ownership-list-projection.swift` 负责。
+// 5. **投影：文案要能改，状态不许长第二套**。这里过去钉「与 HEAD 逐字节相同」，
+//    把**文案**也一起钉死了（于是三条大字面只能记成 `OPEN(frozen)` 欠账）。现在只钉
+//    **状态语义**：类型 / 函数签名逐字还在、五种对外状态的**集合** + 动作派生的**集合**
+//    不变、`Codable` / `init(rawValue:)` / 解码器仍然没有；**文案字符串逐条放开**。
+//    面板宽 340 / 列表高 190 未动。投影语义与五处消费的判据由
+//    `tools/test-ownership-list-projection.swift` 负责。
+//    注入「加 Codable / 加第六种对外状态 / 加 init(rawValue:) / 少一个动作」⇒ FAIL；
+//    正对照「文案整段作废」⇒ 语义判据必须依然绿。
 //
 // 注入只改**内存副本**（源码字符串）或**临时副本**（编译到 NSTemporaryDirectory），
 // 落盘的源码一个字不改。
@@ -193,17 +199,139 @@ for label in ["领取", "让居民去取", "重试", "重试入库", "摆放", "
 print("PASS[seven-actions]: 投影给的动作词就是那七个（领取 / 让居民去取 / 重试 / 重试入库 / 摆放 / 收回 / 删除）")
 
 // ---------------------------------------------------------------------------
-// 判据 5：投影**一个字没改**（与 HEAD 逐字节相同）；两条红线未动。
+// 判据 5：投影钉的是**状态语义**，不是整文件哈希。
+//
+// 这里过去是 `git diff --quiet HEAD`（与 HEAD 逐字节相同）。它的本意是「不许长出第二套
+// 状态推导」，但逐字节把**文案**也一起钉死了：2026-10-02 文案简化线扫到三条大字面
+// （投影 `:430` 按 sourceWishID 认到所属许愿 / `:491` 世界回执 claimed.<uuid> /
+// `:493` layoutReceipts…objectStates…）时只能记成 `OPEN(frozen)` 欠账。
+//
+// 现在钉的是语义那一半：类型 / 函数签名逐字还在、`OwnershipDisplayState` 的对外状态
+// **集合**还是那六个（五种 + 折叠的「已结束」）、`OwnershipRowAction` 的动作**集合**
+// 还是那七个、`Codable` / `Decodable` / `init(rawValue:)` / 解码器 / `UserDefaults`
+// 仍然一个都没有（派生的结论不许落盘，也不许从存档读回来）。
+// **文案字符串不在判据里** —— 它们要能改成人话。一句话：文案要能改，状态不许长第二套。
 // ---------------------------------------------------------------------------
-let gitDiff = Process()
-gitDiff.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-gitDiff.arguments = ["diff", "--quiet", "HEAD", "--", projectionPath]
-gitDiff.currentDirectoryURL = root
-try? gitDiff.run(); gitDiff.waitUntilExit()
-if gitDiff.terminationStatus != 0 {
-    print("FAIL: 唯一投影 \(projectionPath) 被改过了 —— 这次只许改它被画出来的样子")
+let semanticSignatures = [
+    "enum OwnershipDisplayState: String, Sendable, CaseIterable {",
+    "enum OwnershipRowAction: String, Sendable, CaseIterable {",
+    "struct OwnershipRow: Equatable, Sendable, Identifiable {",
+    "static func row(_ facts: OwnershipRowFacts) -> OwnershipRow {",
+    "static func roomPresence(_ facts: OwnershipRowFacts) -> OwnershipRoomPresence {",
+    "static func group(for state: OwnershipDisplayState) -> OwnershipGroup {",
+    "static func sentence(generation: String, ownership: String, placement: String,",
+    "static func inventoryNotSavedReason(_ facts: OwnershipRowFacts) -> String {",
+    "static func list(_ rows: [OwnershipRow], order: [String: Int] = [:],",
+    "static let panelListHeightPoints = 190",
+]
+/// 对外状态的**集合**：五种 + 折叠的「已结束」。多一个就是第六种对外状态。
+let expectedDisplayStates: Set<String> = ["generating", "awaitingClaim", "inInventory",
+                                          "placed", "failed", "ended"]
+/// 动作派生的**集合**：七个，一个都不许少、一个都不许多。
+let expectedRowActions: Set<String> = ["claim", "askResidentToFetch", "retry",
+                                       "retryInventoryRegistration", "place", "withdraw", "delete"]
+/// 派生的结论不许落盘、不许从存档读回来。
+let forbiddenStateDerivation = ["Codable", "Decodable", "Encodable", "init(rawValue:",
+                                "init?(rawValue:", "JSONDecoder", "JSONEncoder", "UserDefaults"]
+
+/// 一个 enum 声明的**顶层** case 名字集合（嵌套 `switch` 里的 `case .x:` 不算）。
+func enumCaseNames(_ source: String, _ signature: String) -> Set<String> {
+    guard let body = declaration(source, signature) else { return [] }
+    var names: Set<String> = []
+    for line in body.split(separator: "\n") {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard trimmed.hasPrefix("case ") else { continue }
+        for name in trimmed.dropFirst("case ".count).split(separator: ",") {
+            let token = name.trimmingCharacters(in: .whitespaces)
+            // 只认裸的 case 名：`case .placed:`（switch 分支）带点，`case ended` 不带。
+            guard !token.isEmpty, token.allSatisfy({ $0.isLetter || $0.isNumber }) else { continue }
+            names.insert(token)
+        }
+    }
+    return names
+}
+
+/// 唯一投影里的**语义**违规项。空数组 = 状态推导还是那一套。
+/// **注入负对照要的就是「这里非空」**。
+func semanticViolations(_ source: String) -> [String] {
+    var failures: [String] = []
+    let code = stripped(source)
+    for signature in semanticSignatures where !code.contains(signature) {
+        failures.append("唯一投影的声明/签名不见了：「\(signature)」—— 状态推导那一套是钉住的")
+    }
+    let states = enumCaseNames(code, "enum OwnershipDisplayState: String, Sendable, CaseIterable {")
+    if states != expectedDisplayStates {
+        failures.append("对外状态集合变了（多 \(states.subtracting(expectedDisplayStates).sorted())"
+            + " / 少 \(expectedDisplayStates.subtracting(states).sorted())）—— 只许那五种 + 折叠的「已结束」")
+    }
+    let actions = enumCaseNames(code, "enum OwnershipRowAction: String, Sendable, CaseIterable {")
+    if actions != expectedRowActions {
+        failures.append("动作派生集合变了（多 \(actions.subtracting(expectedRowActions).sorted())"
+            + " / 少 \(expectedRowActions.subtracting(actions).sorted())）—— 七个动作一个都不许丢")
+    }
+    for forbidden in forbiddenStateDerivation where code.contains(forbidden) {
+        failures.append("唯一投影里出现了「\(forbidden)」—— 派生的状态不许落盘、不许从存档读回来")
+    }
+    return failures
+}
+
+let semanticFailures = semanticViolations(projectionSource)
+guard semanticFailures.isEmpty else {
+    for failure in semanticFailures { print("FAIL: " + failure) }
     exit(1)
 }
+print("PASS[semantic-core]: 唯一投影的签名逐字还在；对外状态还是那六个（五种 + 折叠）；七个动作都在；没有 Codable / init(rawValue:) / 解码器")
+
+/// 语义负对照：每一条注入都必须红（只改**内存副本**）。
+func expectSemanticFailure(_ name: String, _ anchor: String, _ replacement: String) {
+    guard projectionSource.contains(anchor) else {
+        print("FAIL: 语义负对照「\(name)」的注入点找不到（等于没有负对照）"); exit(1)
+    }
+    let mutated = projectionSource.replacingOccurrences(of: anchor, with: replacement)
+    guard mutated != projectionSource else {
+        print("FAIL: 语义负对照「\(name)」注入没有改变源码"); exit(1)
+    }
+    let final = semanticViolations(mutated)
+    guard !final.isEmpty else {
+        print("FAIL: 语义负对照「\(name)」注入后没有报违规 —— 这个判据抓不到该缺陷"); exit(1)
+    }
+    print("PASS[negative-semantic-\(name)]: 注入 ⇒ FAIL：\(final[0])")
+}
+
+// 1) 给对外状态加 `Codable`（派生的结论开始能落盘）⇒ FAIL
+expectSemanticFailure("codable", "struct OwnershipRowKey: Hashable, Sendable {",
+                      "extension OwnershipDisplayState: Codable {}\n\nstruct OwnershipRowKey: Hashable, Sendable {")
+// 2) 长出**第六种**对外状态 ⇒ FAIL
+expectSemanticFailure("sixth-state", "    case generating\n",
+                      "    case generating\n    case pendingReview\n")
+// 3) 加一个 `init(rawValue:)`（从存档把状态读回来的入口）⇒ FAIL
+expectSemanticFailure("raw-value-init", "    var label: String {",
+                      "    init(rawValue: String) { self = .placed }\n    var label: String {")
+// 4) 唯一的「三轴 → 一句现状」出口被改名（五处消费的判据随之分叉）⇒ FAIL
+expectSemanticFailure("sentence-outlet",
+                      "    static func sentence(generation: String, ownership: String, placement: String,",
+                      "    static func sentenceText(generation: String, ownership: String, placement: String,")
+// 5) 少一个动作入口 ⇒ FAIL
+expectSemanticFailure("dropped-action", "    case withdraw\n", "")
+
+// 正对照：**文案**可以改。把整份投影里的汉字全部换成同一个占位字（文案整段作废，
+// 结构与签名一字不动），语义判据必须**依然绿** —— 它钉的是状态，不是文案。
+// 那三条大字面改不改由文案门禁（`tools/test-user-facing-copy.swift`）说了算。
+let copyNeutralized = String(projectionSource.map { character -> Character in
+    guard character.unicodeScalars.count == 1,
+          let scalar = character.unicodeScalars.first,
+          (0x4E00...0x9FFF).contains(scalar.value) else { return character }
+    return "文"
+})
+guard copyNeutralized != projectionSource else {
+    print("FAIL: 投影里一个汉字都没有 —— 文案正对照失去意义"); exit(1)
+}
+let copyNeutralizedFailures = semanticViolations(copyNeutralized)
+guard copyNeutralizedFailures.isEmpty else {
+    print("FAIL: 把文案整段作废竟然触发了语义判据（\(copyNeutralizedFailures[0])）—— 语义门禁不该管文案")
+    exit(1)
+}
+print("PASS[semantic-allows-copy]: 文案整段作废 ⇒ 语义判据依然绿（文案归文案门禁管）")
 guard projectionSource.contains("static let panelListHeightPoints = 190") else {
     print("FAIL: 列表高度必须是 190 pt"); exit(1)
 }
@@ -213,7 +341,7 @@ let controller = try read("apps/macos/Sources/GMGNRadio/VisualEngine/StageWindow
 guard controller.contains("propEditorPanel.widthAnchor.constraint(equalToConstant: 340)") else {
     print("FAIL: 摆放面板宽度必须仍是 340（propEditorPanel 那处约束）"); exit(1)
 }
-print("PASS[red-lines]: 唯一投影与 HEAD 逐字节相同；列表 190 pt、摆放面板宽 340 那处约束未动")
+print("PASS[red-lines]: 唯一投影的状态语义（不是整文件哈希）未变；列表 190 pt、摆放面板宽 340 那处约束未动")
 
 /// 下面那段真机复核里，「重试入库」摆不摆出来按生产那句判据镜像。
 /// 这里先钉住生产源码**就是**那一句 —— 镜像一旦与生产分叉，这条先红。

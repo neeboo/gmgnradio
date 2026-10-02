@@ -425,7 +425,7 @@ extension ResidentPropDelegationError: LocalizedError {
                 let point = declared.flatMap(PropAttachmentSlots.resolve(name:)) ?? .rightHand
                 failure["slot"] = point.worldSlot.rawValue
                 failure["slot_name"] = PropAttachmentSlots.displayName(for: point)
-                failure["slot_source"] = declared == nil ? "省缺（调用方没有给 slot）" : "参数 slot=\(declared!)"
+                failure["slot_source"] = declared == nil ? "省缺（调用方没有给挂点）" : "调用方指定的挂点：\(declared!)"
             }
             // 回执是给 agent 看的；**日志是给排障的人看的**。这条工具调用失败时，
             // 统一日志里必须留下同一个名字与同一句话 —— 否则"用户说挂不上、日志里什么都没有"

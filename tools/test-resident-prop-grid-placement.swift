@@ -378,6 +378,8 @@ let compiled = try run("/usr/bin/swiftc",["-j1","-parse-as-library","-I",worldRu
     sourceRoot.appendingPathComponent("Agent/WorldAgentContext.swift").path,
     sourceRoot.appendingPathComponent("Presence/ResidentPropPlacementService.swift").path,
     sourceRoot.appendingPathComponent("Presence/ResidentPropEditorState.swift").path,
+    // 摆放试算上限的唯一策略定义（`RetryBackoffSite.propPlacement`）。
+    sourceRoot.appendingPathComponent("Presence/RetryBackoff.swift").path,
     // 「我的物件」的唯一投影：面板状态现在从它现算行，编它就得一起编这一份。
     sourceRoot.appendingPathComponent("Presence/ResidentOwnershipProjection.swift").path,
     sourceRoot.appendingPathComponent("Presence/ResidentPropPlacementConfiguration.swift").path,

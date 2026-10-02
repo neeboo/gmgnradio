@@ -666,6 +666,8 @@ let onHandCompile=try run("/usr/bin/nice",["-n","15","/usr/bin/swiftc","-j1","-p
     // 「我的物件」的唯一投影：`ResidentPropEditorState` 现在从它现算行（`ownershipFacts` →
     // `ResidentOwnershipProjection.row`），所以编面板状态就必须一起编它（编同一份，不抄）。
     "apps/macos/Sources/GMGNRadio/Presence/ResidentOwnershipProjection.swift",
+    // 摆放试算上限的唯一策略定义（`RetryBackoffSite.propPlacement`）。
+    "apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift",
     "-o",onHandExe.path] + worldObjects)
 guard onHandCompile==0 else {exit(onHandCompile)}
 exit(try run(onHandExe.path,[]))

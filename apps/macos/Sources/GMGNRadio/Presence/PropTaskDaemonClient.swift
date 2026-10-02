@@ -91,11 +91,11 @@ enum PropTaskDaemonError: LocalizedError {
     case requestRejectedWith(code: String)
     var errorDescription: String? {
         switch self {
-        case .helperMissing: return "缺少独立任务后台，请重新安装包含 gmgn-taskd 的应用。"
-        case .unavailable: return "独立任务后台暂未连接；已受理任务不会因界面断开而取消。"
-        case .invalidFrame: return "独立任务后台返回了无法识别的数据。"
-        case .requestRejected, .requestRejectedWith: return "独立任务后台拒绝了请求，请检查任务和服务配置。"
-        case .timedOut: return "独立任务后台尚未确认请求，请先刷新任务状态。"
+        case .helperMissing: return "缺少后台服务，请重新安装应用。"
+        case .unavailable: return "后台服务还没连上，已经接下的任务不会丢。"
+        case .invalidFrame: return "后台服务返回了看不懂的数据。"
+        case .requestRejected, .requestRejectedWith: return "后台服务拒绝了这次请求，请稍后重试。"
+        case .timedOut: return "后台服务还没确认，请稍后刷新。"
         }
     }
 }

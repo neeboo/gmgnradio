@@ -80,10 +80,17 @@ final class ResidentActivityOutcome {
         play: @escaping @MainActor (UUID) async throws -> Void,
         pause: @escaping @MainActor (UUID?) async throws -> Void,
         sleep: @escaping @MainActor () async throws -> Void = {
-            try await Task.sleep(nanoseconds: 50_000_000)
+            // 轮询间隔（不是退避）：与一次尝试的总时限同源，都在 `RetryBackoff.swift`
+            // 的 `RetryBackoffSite.jukeboxActivity` 里。世界活动声明的冷却（点唱机 45 秒）
+            // 是**数据**，仍由世界定义决定，不搬进策略。
+            try await Task.sleep(for: .seconds(
+                RetryBackoffSite.jukeboxActivity.policy.baseDelay
+            ))
         },
         report: @escaping @MainActor (JukeboxReport) -> Void,
-        deadline: Date = Date().addingTimeInterval(180)
+        deadline: Date = Date().addingTimeInterval(
+            RetryBackoffSite.jukeboxActivity.policy.maximumDuration
+        )
     ) {
         self.context = context
         self.isCurrent = isCurrent
@@ -98,13 +105,11 @@ final class ResidentActivityOutcome {
     func prepare(callID: String, name: String, argumentsJSON: Data) {
         if name == "start_activity", isMusic(argumentsJSON) {
             pendingStarts.insert(callID)
-            report(.progress(
-                "居民工具调用 start_activity 接管这次点唱机播放（call=\(callID)），自动效果不再重复触发"
-            ))
+            report(.progress("这次播放由居民自己发起，不再重复触发。"))
         }
         if name == "stop_activity", context.state.activeActivity?.activityID == "music.listen" {
             musicStops.insert(callID)
-            report(.progress("居民工具调用 stop_activity 接管这次点唱机暂停（call=\(callID)）"))
+            report(.progress("这次暂停由居民自己发起。"))
         }
     }
 
@@ -143,7 +148,7 @@ final class ResidentActivityOutcome {
         pendingStarts.remove(result.callID)
         guard !result.isError else {
             if wasMusicStop || (name == "start_activity" && isMusic(argumentsJSON)) {
-                report(.progress("居民工具调用 \(name) 本身失败了，点唱机不做额外动作（call=\(result.callID)）"))
+                report(.progress("这次操作失败了，点唱机不再补做。"))
             }
             return result
         }
@@ -175,9 +180,7 @@ final class ResidentActivityOutcome {
                 if phase == .loop { break }
                 if let phase, phase.rawValue != announcedPhase {
                     announcedPhase = phase.rawValue
-                    report(.progress(
-                        "居民正在走向点唱机（phase=\(phase.rawValue)），抵达 loop 后开始播放（请求 \(requestID)）"
-                    ))
+                    report(.progress("居民正在走向点唱机，到了就开始播放。"))
                 }
                 try await sleep()
             }

@@ -83,7 +83,7 @@ import Foundation
         let missing = ResidentBackendReadiness.guidance(hasUsableBackend: false)
         check(missing != nil, "no usable backend yields guidance before the user types")
         if let missing {
-            check(missing.contains("设置 → DJ → Agent 聊天后端"),
+            check(missing.contains("设置 → DJ → 聊天模型"),
                   "backend guidance names the real settings path")
             check(!missing.contains("GMGN_") && !missing.contains("/Users/") && !missing.contains("环境变量"),
                   "backend guidance exposes no environment variables or paths")

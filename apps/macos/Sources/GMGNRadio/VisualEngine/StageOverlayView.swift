@@ -105,96 +105,32 @@ struct ResidentSpeechErrorNotice: View {
     }
 }
 
-/// 「许愿任务」那一块**什么时候占屏幕** —— 唯一一处判据。
+/// 许愿任务**不再有自己的窗口/列表**（用户 2026-10-02：「许愿任务变成消息提示，不要单独
+/// 做窗口了」）。原来那块「许愿任务」列表已经从产品路径上整个删掉：状态变化现在是一条条
+/// 消息（`WishMachineTaskMessage` → 与居民对话的地方）。
 ///
-/// 用户 2026-10-02 原话：「左上角这个也不应该常驻啊」。所以这块面板的规矩是
-/// **有事才出现、事情了结就收起**，而且收起必须可见、可预期（不是闪一下）：
+/// 「这一档状态此刻还占不占屏幕」的**唯一**一条规则也随列表一起搬到了
+/// `Presence/WishMachineTaskMessage.swift` 的 `WishMachineTaskPrompt`：那里只依赖
+/// Foundation，所以消息通道与离线 harness 问的是**同一处**判据，谁也不另写一遍。
+/// 本文件不再保留那份规则的副本。
 ///
-/// - **非终态**（排队 / 生成中 / 待领取 / 已领取未入库 / 摆放中）⇒ 出现：
-///   有事正在发生，或者有件事在等人。
-/// - **终态**（`isTerminal`）⇒ 事情了结了。提示窗由 `promptExpiresAt` 给出 ——
-///   它是**共享收件箱按 `updatedAt` 现算**的（`ResidentSystemInboxStore.promptExpiry`，
-///   终态后 30 秒），所以刷新、重开窗口、重启都不会把这个窗口往后推。
-/// - 终态但**算不出**到期时间（收件箱里已经没有那一条记录）⇒ 仍然出现。
-///   **这是故意的**：宁可多留一句，也不许把"没做成、等你处理"这种终态
-///   从屏幕上悄悄吞掉（理由见 `ResidentPropInventoryBacklog.isTerminal` 那一段）。
-///
-/// 这里**只**把判据收成一处、起个名字，语义与收口前**逐字相同** —— 没有放宽、
-/// 也没有收紧：任务该不该存在由宿主与投影回答，本函数只回答"此刻要不要占屏幕"。
-enum WishMachineTaskPrompt {
-    static func isShown(_ task: WishMachineTaskPresentation, at now: Date) -> Bool {
-        guard let expiry = task.promptExpiresAt else { return true }
-        return now < expiry
-    }
-}
-
-/// Async wish jobs remain visible independently of the resident's reply and thinking state.
-/// Terminal tasks hide 30 seconds after their stored prompt anchor; the expiry
-/// timestamp is persisted in the shared inbox, so refreshes and reopenings
-/// never keep a finished task resident. In-progress and pending tasks stay.
+/// 这个视图剩下的**不是**许愿任务列表，而是两条**全局**事实的横幅：
+/// **连通性**（连不上后台）与**能不能自主**（一个全局开关）。它们都不是任务属性，
+/// 也都不按任务渲染 —— 所以这里不再有任何 `ForEach`、不再有按任务的行、不再有
+/// `许愿任务` 这个标题，也就没有"常驻的列表"可言。
 @MainActor
 struct WishMachineTaskStatusView: View {
     @ObservedObject var state: WishMachineTaskPresentationStore
+    /// 保留给调用点（紧凑/最大高度的口径未变）；横幅本身按内容自适应高度。
     var maximumHeight: CGFloat = 132
     var compact = false
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 1)) { timeline in
-            // 「有事才出现」由**那一处**判据回答（`WishMachineTaskPrompt.isShown`）；
-            // 这里只负责在它说"一件事都没有"时整块**不渲染** —— 不留空壳占屏幕。
-            let visible = state.tasks.filter { WishMachineTaskPrompt.isShown($0, at: timeline.date) }
+        // 每秒重算：全局开关的值直接读设置里那**一个**键，所以设置里改一下这里一秒内跟上。
+        TimelineView(.periodic(from: .now, by: 1)) { _ in
             VStack(alignment: .leading, spacing: 6) {
                 connectivityBanner
                 autonomyBanner
-                if !visible.isEmpty {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("许愿任务")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.55))
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 9) {
-                                ForEach(visible) { task in
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        HStack(alignment: .firstTextBaseline, spacing: 6) {
-                                            Image(systemName: task.isTerminal ? "circle.fill" : "clock")
-                                                .font(.system(size: 8))
-                                            Text(task.title).lineLimit(1)
-                                            Spacer(minLength: 2)
-                                            // **一句现状**：整行只有这一句状态，由三轴派生
-                                            // （`WishMachineTaskPresentation.currentStatusLine`，
-                                            // 三轴 → 文案 的判断在投影里那唯一一处）。
-                                            // 这里不渲染"生成/归属/摆放"三个标签，也**不在这里
-                                            // 拼任何状态文案** —— 拼一份就是第二份真相。
-                                            Text(task.currentStatusLine)
-                                                .foregroundStyle(.white.opacity(0.75)).lineLimit(1)
-                                                .accessibilityIdentifier("resident.wish-task.\(task.id.uuidString).status")
-                                        }
-                                        .font(.system(size: 11, weight: .medium))
-                                        // **任务行只表达它自己的三轴状态（生成/归属/摆放）。**
-                                        // 授权在全局开关（autonomyBanner）上，连通性在全局横幅
-                                        // （connectivityBanner）上；任务行上不存在任何按任务的
-                                        // "停止/恢复"控件 —— "能不能自主"不是任务状态。
-                                        if !compact, let detail = task.detail, !detail.isEmpty {
-                                            Text(detail)
-                                                .font(.system(size: 10))
-                                                .foregroundStyle(.white.opacity(0.6))
-                                                .lineLimit(2)
-                                        }
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .help([task.title, task.currentStatusLine, task.detail].compactMap { $0 }.joined(separator: "\n"))
-                                    .accessibilityElement(children: .combine)
-                                    .accessibilityIdentifier("resident.wish-task.\(task.id.uuidString)")
-                                }
-                            }
-                        }
-                        .frame(height: min(maximumHeight, CGFloat(visible.count) * (compact ? 20 : 48)))
-                    }
-                    .foregroundStyle(.white)
-                    .padding(compact ? 6 : 10)
-                    .background(Color(white: 0.1).opacity(0.96), in: RoundedRectangle(cornerRadius: 10))
-                    .accessibilityIdentifier("resident.wish-tasks")
-                }
             }
         }
     }

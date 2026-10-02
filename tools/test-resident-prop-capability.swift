@@ -728,6 +728,8 @@ let compiled = try run("/usr/bin/swiftc", ["-j1", "-parse-as-library", "-I", wor
     sources.appendingPathComponent("Agent/WorldAgentToolContract.swift").path,
     sources.appendingPathComponent("Agent/WorldAgentToolDispatcher.swift").path,
     sources.appendingPathComponent("Agent/ResidentWorldToolSession.swift").path,
+    // 退避/重试预算的**唯一**定义（六处读它）—— 编它，不另抄一套常量。
+    sources.appendingPathComponent("Presence/RetryBackoff.swift").path,
     sources.appendingPathComponent("Presence/ResidentPropPlacementService.swift").path,
     // 工具桥的 `read_owned_props` 回执把状态那两句交给**唯一投影**（`OwnershipRow`），
     // 所以那一份生产源码必须一起编 —— 编同一份，不是抄一套状态词。

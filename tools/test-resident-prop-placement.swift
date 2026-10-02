@@ -809,7 +809,7 @@ let worldRuntimeFlags = worldRuntimeHarnessFlags()
 let build = URL(fileURLWithPath: worldRuntimeFlags[1]).deletingLastPathComponent()
 let objects=try FileManager.default.contentsOfDirectory(at:build.appendingPathComponent("WorldRuntime.build"),includingPropertiesForKeys:nil).filter{$0.pathExtension=="o"}.map(\.path)
 let binary=tmp.appendingPathComponent("test")
-let result=try run("/usr/bin/swiftc",["-j1","-parse-as-library","-I",build.appendingPathComponent("Modules").path,base.appendingPathComponent("Agent/WorldAgentContext.swift").path,service.path,source.path,"-o",binary.path]+objects)
+let result=try run("/usr/bin/swiftc",["-j1","-parse-as-library","-I",build.appendingPathComponent("Modules").path,base.appendingPathComponent("Agent/WorldAgentContext.swift").path,service.path,source.path,base.appendingPathComponent("Presence/RetryBackoff.swift").path,"-o",binary.path]+objects)
 guard result==0 else { exit(result) }
 let status=try run(binary.path,[])
 print("PASS: claimed-prop inventory wiring (judgement layering is a type, inventory layer never runs `validate`, spatial layer still runs it; geometry-ready callback drains; existing receipt key; no timer; 「我的物件」 list reads the inventory record only)")

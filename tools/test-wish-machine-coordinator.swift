@@ -28,7 +28,9 @@ let sources = ["Presence/PropGenerationClient", "Presence/PropGenerationStore", 
        // 是编同一份，不是在这里抄一份词汇表。
        root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/WishMachineTaskPresentation.swift"),
        // 状态文案也只有**一份**：任务行那一句委托给唯一投影，一起编（编同一份）。
-       root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/ResidentOwnershipProjection.swift")]
+       root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/ResidentOwnershipProjection.swift"),
+       // 生成确认的退避/预算读这一份唯一策略（编同一份，不抄常量）。
+       root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift")]
 guard sources.allSatisfy({ FileManager.default.fileExists(atPath: $0.path) }) else {
     print("FAIL: wish machine coordinator and tool primitives are missing"); exit(1)
 }

@@ -48,11 +48,11 @@ let dependencies = "import SwiftUI\nimport Observation\n"
     + declaration("final class ResidentSystemMailBadgeButton: NSView {", in: try read("Presence/ResidentSystemInboxUI.swift")) + "\n@MainActor\n@Observable\n"
     + declaration("final class AgentSpeechStatusStore", in: try read("Agent/AgentSpeech.swift")) + "\n@MainActor\n"
     + declaration("struct ResidentSpeechErrorNotice:", in: try read("VisualEngine/StageOverlayView.swift")) + "\n"
-    // 「许愿任务」那一块**什么时候占屏幕**的判据（`enum WishMachineTaskPrompt`）就在
-    // `WishMachineTaskStatusView` 上面，而视图现在**经它**过滤（唯一一处判据）。抽声明是
-    // **逐条**抽的，所以它必须一起抽进来 —— 否则这里会报 "cannot find 'WishMachineTaskPrompt'"
-    // 而把那一条断言整个编译掉。**不许**为了让编译过而把视图改回内联判据。
-    + declaration("enum WishMachineTaskPrompt", in: try read("VisualEngine/StageOverlayView.swift")) + "\n@MainActor\n"
+    // 许愿任务**不再有自己的窗口/列表**（用户 2026-10-02：「许愿任务变成消息提示，不要单独
+    // 做窗口了」）：`WishMachineTaskStatusView` 现在只剩两条全局横幅，已经不再引用那条
+    // 「什么时候占屏幕」的判据 —— 判据搬去了 `Presence/WishMachineTaskMessage.swift`
+    // （`WishMachineTaskPrompt`），由 `tools/test-wish-task-messages.swift` 驱动。
+    // 所以这里不再抽它：抽一份用不到的东西只会让编译依赖凭空变长。
     + declaration("struct WishMachineTaskStatusView:", in: try read("VisualEngine/StageOverlayView.swift"))
 let harness = #"""
 import AppKit

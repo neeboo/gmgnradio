@@ -36,7 +36,7 @@ final class ResidentLoopTools {
                 "properties": [
                     "summary": ["type": "string", "minLength": 1, "maxLength": 2000],
                     "status": ["type": "string", "enum": ["active", "waiting_user", "waiting_event", "completed"]],
-                    "wake_after_seconds": ["type": "number", "minimum": 1, "maximum": 86400],
+                    "wake_after_seconds": ["type": "number", "description": "等待多少秒后自动醒来。允许范围 1–86400 秒（含两端），超出范围或不是有限数字会被拒绝，需要重新给一个范围内的秒数。"],
                     "resume_paused_intent": ["type": "boolean", "description": "默认 false。仅本轮人类明确要求恢复、替换或结束已暂停意图时设为 true。"],
                     "goal": ["type": "string", "maxLength": 500, "description": "稳定目标；省略保持原值，空串清除。"],
                     "current_step": ["type": "string", "maxLength": 500, "description": "下一步要执行或验证的具体安排，只能引用当前可用活动与对象；省略保持原值，空串清除。"],

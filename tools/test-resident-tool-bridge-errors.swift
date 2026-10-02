@@ -18,7 +18,10 @@ let sourceNames = [
 ]
 let sources = sourceNames.map {
     root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/\($0).swift")
-}
+} + [
+    // 宿主桥退避的唯一策略定义（`RetryBackoffSite.hostToolBridge`）。
+    root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift"),
+]
 for url in sources where !FileManager.default.fileExists(atPath: url.path) {
     print("MISSING SOURCE: \(url.path)")
     exit(1)

@@ -25,6 +25,10 @@ let methods = ["private func wishMachineClaimEvidence(", "private func synchroni
                "private struct ResidentWishScope", "private func bindResidentWishScope(",
                "private func pauseResidentWishContinuations()",
                "private func pushResidentConnectivityNotice(",
+               // 许愿任务 = 消息：宿主把唯一投影喂给 `WishMachineTaskMessageFeed` 这条
+               // **真源码**（`synchronizeWishMachinePresentation` 现在就调它）。逐字抽取，
+               // 不在 harness 里抄一份宿主逻辑（抄一份正是"两份真相"最容易被放过去的地方）。
+               "private func pushWishTaskMessages(",
                "private func residentWishPlacementAlreadyCompleted(",
                "private func resumeWishAutomaticContinuation("].map(declaration).joined(separator: "\n")
 // 「已领取 → 入库」的**唯一一份**事实与文案（生产文本，逐字抽取）：任务行/系统消息
@@ -91,11 +95,21 @@ let ownershipProjectionSource = try String(contentsOfFile:
     .split(separator: "\n", omittingEmptySubsequences: false)
     .filter { !$0.hasPrefix("import ") }
     .joined(separator: "\n")
+// 许愿任务 = **一条条消息**：`WishMachineTaskMessageFeed` 的唯一实现在生产源码里，
+// 宿主（`pushWishTaskMessages`）与去重/保留规则读的是同一份 ⇒ 逐字编进来，不抄第二份。
+// 它只依赖 Foundation 与唯一投影（`OwnershipRow` / `OwnershipDisplayState` /
+// `OwnershipSentence`），所以能在没有 app、没有 UI 的情况下被驱动。
+let wishTaskMessageSource = try String(contentsOfFile:
+    "apps/macos/Sources/GMGNRadio/Presence/WishMachineTaskMessage.swift", encoding: .utf8)
+    .split(separator: "\n", omittingEmptySubsequences: false)
+    .filter { !$0.hasPrefix("import ") }
+    .joined(separator: "\n")
 
 let program = #"""
 import Foundation
 import Observation
 \#(ownershipProjectionSource)
+\#(wishTaskMessageSource)
 \#(sizeIntentSource)
 enum FixtureError: Error { case failed }
 enum WishMachineError: Error { case unknownAttachment }
@@ -390,6 +404,28 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
         stageWindowController?.setWishMachineTasks(tasks)
         liveCamWindowController?.setWishMachineTasks(tasks)
     }
+    /// 许愿任务消息的出口状态：**真源码** `WishMachineTaskMessageFeed`（生产里就是
+    /// `GMGNRadioApp.wishTaskMessageFeed`）。抽取出来的 `pushWishTaskMessages` 直接驱动它。
+    private var wishTaskMessageFeed = WishMachineTaskMessageFeed()
+    /// 生产里到期锚点来自共享系统收件箱（`ResidentSystemInboxStore.promptExpiry`，终态后
+    /// 30 秒）。本 harness 不落收件箱 ⇒ 锚点恒为 nil（= 投影说还没了结）。「失败不自动消失 /
+    /// 其它终态按既有窗口过期」这两条由 tools/test-wish-task-messages.swift 用真规则逐条驱动。
+    final class ResidentSystemInboxStoreStub {
+        func promptExpiry(taskKey: String, worldID: String, residentScope: String) -> Date? { nil }
+    }
+    let residentSystemInboxStore = ResidentSystemInboxStoreStub()
+    /// 生产里这条从**权威世界状态**投影出唯一投影的输入（jobs ∪ 世界物件）。本 harness
+    /// 断言的是消息通道/呈现那一侧，不建模世界文档 ⇒ 按**同一个签名**返回空事实；宿主真的
+    /// 把消息接进既有对话通道（`ResidentChatTranscriptLine` / `speaker: .notice`）由
+    /// tools/test-wish-task-messages.swift 判据 2 逐字钉住。
+    func residentPropWishFacts(worldID: String, context: World) -> (facts: [OwnershipRowFacts], order: [String: Int]) {
+        ([], [:])
+    }
+    /// 生产里这条把最近对话 + 许愿任务消息推给两个聊天表面。本 harness 的两个面板是呈现
+    /// 替身（不建模转录行），所以与 `pushSystemInboxSnapshots` 同一个理由：只补呈现管道签名，
+    /// 不假装覆盖它 —— 消息本身仍由上面抽取的 `pushWishTaskMessages`（真源码）驱动，出口
+    /// 形状由 tools/test-wish-task-messages.swift 钉。
+    func publishResidentTranscript() {}
     \#(methods)
     func refresh() async { await refreshWishMachine() }
     func settle() async {
@@ -778,8 +814,11 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
             $0.detail?.contains("network_unavailable") != true
         }, "connectivity facts must not be rendered as task properties on any task row")
         check(connectivityApp.stageWindowController!.connectivityNotices.contains {
-            $0?.contains("连不上后台") == true && $0?.contains("network_unavailable") == true
-        }, "the same connectivity fact must appear once, globally, with a readable reason")
+            $0?.contains("暂时连不上") == true
+        }, "the same connectivity fact must appear once, globally, as one human sentence")
+        check(connectivityApp.stageWindowController!.connectivityNotices.contains {
+            $0?.contains("network_unavailable") == true
+        } == false, "the raw reason code must never reach the banner (engineering words stay in the log)")
         check(releaseApp.residentAgentLoop!.snapshot.isAutonomyPausedByUser
               && releaseApp.wishMachineCoordinator.jobs[0].autoContinuationPaused == true,
               "run stop and task-level pause are two observably separate states")

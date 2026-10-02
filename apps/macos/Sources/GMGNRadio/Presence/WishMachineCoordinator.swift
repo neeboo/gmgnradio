@@ -389,11 +389,13 @@ enum WishMachineError: LocalizedError {
     var isReadable: Bool { readable }
 
     /// 「有几条 job 坏了、被跳过」那一句可见说明（没有坏的就是 nil）。
+    ///
+    /// 只报数量与名字：编号是内部标识（UUID），文件名是工程细节，都不上屏。
     var unreadableJobNotice: String? {
         guard !unreadableJobs.isEmpty else { return nil }
-        let named = unreadableJobs.prefix(3).map { $0.jobID ?? $0.name ?? "（读不出编号）" }
+        let named = unreadableJobs.prefix(3).map { $0.name ?? "未命名" }
         let tail = unreadableJobs.count > named.count ? " 等" : ""
-        return "许愿记录里有 \(unreadableJobs.count) 条读不出来，已跳过（原件仍逐条保留在 wishes.json 里）："
+        return "有 \(unreadableJobs.count) 条记录读不出来，已经跳过："
             + named.joined(separator: "、") + tail
     }
 
@@ -882,10 +884,17 @@ enum WishMachineError: LocalizedError {
     /// explicit `retry_wish_generation` tool uses: it never creates a second generation and
     /// never consumes another authorization. Only genuinely network-class errors qualify —
     /// a rejected or unauthenticated submission is a real outcome and is never reissued.
-    static let maximumNetworkConfirmationsPerJob = 3
+    /// 次数与间隔都来自**唯一**的策略定义（`RetryBackoff.swift` 的
+    /// `RetryBackoffSite.generationConfirmation`）：既有 3 次 / 30 秒逐位不变，
+    /// 之后的等待翻倍、带抖动、封顶。复用原幂等身份这条语义不搬进策略。
+    static var maximumNetworkConfirmationsPerJob: Int {
+        RetryBackoffSite.generationConfirmation.policy.maximumAttempts
+    }
     /// Two automatic confirmations of the same task are at least this far apart, so a
     /// still-broken remote endpoint cannot be hammered by the host's 5-second refresh.
-    static let minimumNetworkConfirmationInterval: TimeInterval = 30
+    static var minimumNetworkConfirmationInterval: TimeInterval {
+        RetryBackoffSite.generationConfirmation.policy.baseDelay
+    }
 
     static func isNetworkClassSubmissionError(_ message: String?) -> Bool {
         guard let message else { return false }
@@ -912,7 +921,13 @@ enum WishMachineError: LocalizedError {
                   (networkConfirmationAttempts[job.id] ?? 0) < Self.maximumNetworkConfirmationsPerJob
             else { return false }
             guard let last = lastNetworkConfirmationAt[job.id] else { return true }
-            return date.timeIntervalSince(last) >= Self.minimumNetworkConfirmationInterval
+            // 连续未确认的等待**递增**（30 → 60 → …），带抖动、封顶；第一跳与既有 30 秒同值。
+            let policy = RetryBackoffSite.generationConfirmation.policy
+            let interval = policy.delay(
+                afterFailure: max(1, networkConfirmationAttempts[job.id] ?? 0),
+                jitterUnit: RetryJitter.uniform.unit()
+            )
+            return date.timeIntervalSince(last) >= interval
         }
         var confirmed = 0
         for job in pending {

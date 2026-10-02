@@ -319,17 +319,21 @@ struct LocalDSHLocator: AgentExecutableLocating {
                 check((await silentScript.recordedPrompts()).count == 1, "empty output does not start a correction loop")
             }
         }
+        // 判据是「**分类**了、可行动、不回显退出码/原始输出」——分类本身一字未动。
+        // 2026-10-02 文案规则（所有提示 / 错误 / warning 简化）改了每一类的**说法**：
+        // 界面不再出现 DSH / 组件名 / 认证术语，只留一句人话 + 下一步。下面这几句就是
+        // 新说法里各自**独有**的那几个字，仍然把五类分开（分类判据不放宽）。
         let executionFailures: [(Int32, String, String)] = [
-            (1, "Error: dsh plugin tree failed to load: ERR_MODULE_NOT_FOUND Cannot find package '@deepseek-ai/dsh-web-fetch-http' imported from /private/user-session secret=sk-test-private-123", "启动组件缺失"),
-            (1, "Error [MODULE_NOT_FOUND]: Cannot find module '/private/user-session/plugin.js' secret=sk-test-private-123", "启动组件缺失"),
-            (1, "provider error: requested resource not found private-fixture-route", "未能确定原因"),
-            (1, "dsh: MISSING_CREDENTIAL: provider route private-fixture-route secret=sk-test-private-123", "缺少 DSH 凭证"),
-            (1, "no API key for provider route private-fixture-route /private/user-session", "缺少 DSH 凭证"),
-            (1, "401 Unauthorized api_key=sk-test-private-123 /private/user-session", "认证"),
+            (1, "Error: dsh plugin tree failed to load: ERR_MODULE_NOT_FOUND Cannot find package '@deepseek-ai/dsh-web-fetch-http' imported from /private/user-session secret=sk-test-private-123", "组件缺失"),
+            (1, "Error [MODULE_NOT_FOUND]: Cannot find module '/private/user-session/plugin.js' secret=sk-test-private-123", "组件缺失"),
+            (1, "provider error: requested resource not found private-fixture-route", "回复意外中断"),
+            (1, "dsh: MISSING_CREDENTIAL: provider route private-fixture-route secret=sk-test-private-123", "还没有配置密钥"),
+            (1, "no API key for provider route private-fixture-route /private/user-session", "还没有配置密钥"),
+            (1, "401 Unauthorized api_key=sk-test-private-123 /private/user-session", "密钥没通过验证"),
             (2, "insufficient_quota token=private-fixture-token", "额度"),
             (3, "ECONNREFUSED https://private-fixture-host.invalid secret=hidden", "网络"),
-            (9, "private-fixture-diagnostic sk-test-private-123", "未能确定原因"),
-            (7, "", "未能确定原因"),
+            (9, "private-fixture-diagnostic sk-test-private-123", "回复意外中断"),
+            (7, "", "回复意外中断"),
         ]
         for withTools in [false, true] {
             for (code, output, category) in executionFailures {
@@ -763,6 +767,8 @@ for agentName in ["CodexCLI", "AgentConversationService", "ResidentCodexTranspor
 }
 compileArguments.append(contentsOf: [
     root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/ResidentVisionCapture.swift").path,
+    // 宿主桥退避的唯一策略定义（`RetryBackoffSite.hostToolBridge`）。
+    root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift").path,
     main.path, "-o", binary.path,
 ])
 compile.arguments = compileArguments

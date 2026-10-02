@@ -41,7 +41,9 @@ let sources = ["Presence/PropGenerationClient", "Presence/PropGenerationStore", 
        root.appendingPathComponent("tools/fixtures/WishMachineDaemonFixture.swift"),
        root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/WishMachineTaskPresentation.swift"),
        // 任务行那一句委托给唯一投影（`OwnershipSentence` 是唯一出口），一起编。
-       root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/ResidentOwnershipProjection.swift")]
+       root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/ResidentOwnershipProjection.swift"),
+       // 生成确认的退避/预算读这一份唯一策略（编同一份，不抄常量）。
+       root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift")]
 guard sources.allSatisfy({ FileManager.default.fileExists(atPath: $0.path) }) else {
     print("FAIL: 许愿机协调器那一份源码清单不齐（少了文件）"); exit(1)
 }

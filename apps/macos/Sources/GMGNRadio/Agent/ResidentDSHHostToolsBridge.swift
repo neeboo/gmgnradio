@@ -68,13 +68,13 @@ public enum ResidentDSHHostToolsError: Error, LocalizedError, Equatable {
     public var errorDescription: String? {
         switch self {
         case .malformedToolSet:
-            "本轮世界工具清单无效，这次空间操作已停止。请重新发送这条消息。"
+            "工具清单无效，这次操作没有执行。请重新发送。"
         case .invalidConfiguration:
-            "本轮空间工具通道配置无效，这次空间操作已停止。请重新发送这条消息。"
+            "空间连接配置不对，这次操作没有执行。请重新发送。"
         case .startupFailed:
-            "空间工具通道启动失败，本轮空间操作没有执行。请重新发送；若反复出现，请重启应用。"
+            "空间连接没起来，这次操作没有执行。请重新发送。"
         case .notStarted:
-            "空间工具通道尚未就绪，请重新发送这条消息。"
+            "空间连接还没就绪，请重新发送。"
         }
     }
 
@@ -751,6 +751,11 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
         let listener = listenerFD
         lock.unlock()
         guard listener >= 0 else { return }
+        // 连续瞬时错误（EMFILE 等）的等待来自**唯一**的策略定义
+        // （`RetryBackoff.swift` 的 `RetryBackoffSite.hostToolBridge`）：第一跳与既有
+        // 一个心跳同值，之后递增、带抖动、封顶 —— 只可能等得更久，绝不忙转。
+        // 一次成功 accept 就清零：连续失败才递增。
+        var transientFailures = 0
         while true {
             lock.lock()
             let isStopped = stopped
@@ -774,10 +779,15 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
             let client = accept(listener, nil, nil)
             if client < 0 {
                 if errno == EINTR { continue }
-                // 瞬时错误（EMFILE 等）：退避一个心跳后继续，不忙转。
-                Thread.sleep(forTimeInterval: 0.05)
+                // 瞬时错误（EMFILE 等）：按共享策略退避后继续，不忙转。
+                transientFailures += 1
+                let policy = RetryBackoffSite.hostToolBridge.policy
+                Thread.sleep(forTimeInterval: policy.delay(
+                    afterFailure: transientFailures, jitterUnit: RetryJitter.uniform.unit()
+                ))
                 continue
             }
+            transientFailures = 0
             spawnConnection(client)
         }
     }

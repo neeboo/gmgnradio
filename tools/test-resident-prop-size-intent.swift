@@ -39,7 +39,11 @@ let required = ["Presence/PropGenerationClient.swift", "Presence/PropGenerationS
                 // 任务行那一句委托给唯一投影（`OwnershipSentence` 是唯一出口），一起编。
                 "Presence/ResidentOwnershipProjection.swift",
                 "Presence/WishMachineCoordinator.swift", "Agent/WishMachineContract.swift",
-                "Agent/ResidentWishMachineTools.swift"]
+                "Agent/ResidentWishMachineTools.swift",
+                // 统一退避的**唯一**定义：`WishMachineCoordinator` 自动确认那一处读
+                // `RetryBackoffSite.generationConfirmation` / `RetryJitter`，所以真源码必须
+                // 跟着编（编的是跑在 App 里的那一份，不在 harness 里抄一套策略）。
+                "Presence/RetryBackoff.swift"]
 guard required.allSatisfy({ FileManager.default.fileExists(atPath: sources.appendingPathComponent($0).path) }) else {
     print("FAIL: size-intent sources are missing"); exit(1)
 }
@@ -294,6 +298,11 @@ for injection in primitiveWiringInjections {
 // 唯一来源是 `Presence/ResidentPropTelevisionRepair.swift` —— 面板、任务行、agent 回执
 // 读的都是它（不另写一套），所以这里逐字扫它。
 let repairCopyPath = "Presence/ResidentPropTelevisionRepair.swift"
+// 2026-10-02 产品决定：手拼几何停用 ⇒ 这份文案也**整体停用**（文件已清空，只留一行说明）。
+// 所以本节**不再读它、也不再断言它** —— 这正是"引用改成不再需要它"。手拼几何一旦被接回
+// 产品路径（下面那道 `primitiveProductRuleRetired` 门失效），本节立刻按原样重新生效：
+// 原来那些断言一条都没删、也没放宽。
+if !primitiveProductRuleRetired {
 guard let repairCopyText = readSource(repairCopyPath) else {
     print("FAIL: 读不到 \(repairCopyPath)"); exit(1)
 }
@@ -369,6 +378,9 @@ for injection in televisionRepairCopyInjections {
         exit(1)
     }
     print("PASS: 文案注入负对照「\(injection.name)」⇒ 判据变红（\(issues[0])）")
+}
+} else {
+    print("PASS: 「生成器没做对」那两句话已随产品决定停用（文案判据见 tools/test-generation-only-props.swift）")
 }
 
 

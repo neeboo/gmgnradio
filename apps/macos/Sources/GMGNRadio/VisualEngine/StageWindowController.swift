@@ -1677,7 +1677,7 @@ private final class StageWorldInteractionView: NSView {
         self.spatialStage = spatialStage
         self.propEditor = propEditor
         super.init(frame: .zero)
-        toolTip = "拖动鼠标调整视角；滚轮拉近或拉远；W/S 沿视线前后移动，A/D 左右移动；双击复位"
+        toolTip = "拖动转视角，滚轮缩放，W/S 前后，A/D 左右，双击复位。"
         // 手柄画在本视图里（`draw(_:)`），位置完全由编辑器状态决定：状态一变就标脏即可，
         // **不需要任何每帧注册机制** —— 这正是把绘制放在 `draw(_:)` 的好处。
         // 少了这条，"点地即放 / Esc"之后鼠标不动的话，旧圆环会一直留在屏幕上。

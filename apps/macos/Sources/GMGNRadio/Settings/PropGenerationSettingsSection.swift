@@ -44,7 +44,7 @@ struct PropGenerationSettingsSection: View {
                     .disabled(endpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
 
-            Text("地址与密钥只保存在本机，不使用钥匙串。支持 HTTPS 或本机转发地址；保存不会提交生成任务。")
+            Text("地址和密钥只存在这台电脑上，保存后不会立刻开始生成。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             if let message {

@@ -114,9 +114,17 @@ check(projection.contains("static let panelListHeightPoints = 190"),
 check(view.contains("ResidentOwnershipProjection.panelListHeightPoints"),
       "面板必须读投影给的列表高度，而不是自己写一个数")
 let controller = source("VisualEngine/StageWindowController.swift") ?? ""
+// 红线是「**摆放面板**的宽度仍然是 340」，不是「这个文件里恰好有两处 340」。
+// 第二处是**电视面板**宿主的宽度约束（`host.widthAnchor.constraint(equalToConstant: 340)`），
+// 已随电视面板按用户要求整块移除（HEAD 66bcdfe 对同一文件 -35 行，删掉的就是它）。
+// 所以这里改成按**面板身份**逐字钉死那一处约束 —— 这比数个数**更强**：把摆放面板改窄、
+// 再在别处补一个 340 骗过计数，按名字钉的这一条会当场红。数字那一条留着，只用来防止
+// 340 在别的面板上悄悄长回来。
+check(controller.contains("propEditorPanel.widthAnchor.constraint(equalToConstant: 340)"),
+      "摆放面板的宽度约束必须仍是逐字的 340")
 let widthHits = controller.components(separatedBy: "equalToConstant: 340").count - 1
-check(widthHits == 2, "面板宽度必须仍是 340（两处约束），实测 \(widthHits) 处")
-print("PASS[R4]: 列表 190 pt（唯一投影给出）、面板宽度 340 两处约束逐字未动")
+check(widthHits == 1, "340 只许留在摆放面板那一处约束上（电视面板已于 66bcdfe 移除），实测 \(widthHits) 处")
+print("PASS[R4]: 列表 190 pt（唯一投影给出）、摆放面板宽度 340 那一处约束逐字未动（电视面板已移除 ⇒ 全文件 1 处）")
 
 // ── R5 / R6：注入负对照（同一棵扫描器必须能抓到） ──────────────────────────
 let temporary = FileManager.default.temporaryDirectory

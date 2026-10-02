@@ -443,7 +443,9 @@ let inputs = ["Presence/PropGenerationClient", "Presence/PropGenerationStore",
               "Presence/PropGenerationConfiguration", "Presence/WishMachineCoordinator",
               "Presence/WishMachineOutputDescriptor", "Presence/WishMachineTaskPresentation",
               // 任务行那一句委托给唯一投影（`OwnershipSentence` 是唯一出口），一起编。
-              "Presence/ResidentOwnershipProjection"]
+              "Presence/ResidentOwnershipProjection",
+              // 生成确认的退避/预算读这一份唯一策略。
+              "Presence/RetryBackoff"]
     .map { sourcesDir.appendingPathComponent($0 + ".swift").path }
 guard inputs.allSatisfy({ FileManager.default.fileExists(atPath: $0) }) else {
     print("FAIL: 许愿机的真源码不全"); exit(1)

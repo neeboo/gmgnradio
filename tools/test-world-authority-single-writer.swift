@@ -22,6 +22,8 @@ func text(_ path: String) -> String {
 }
 
 let clientPath = "apps/macos/Sources/GMGNRadio/Presence/WorldAuthorityClient.swift"
+// 退避/重试预算的**唯一**定义（权威重连读它）—— 编它，不另抄一套常量。
+let backoffPath = "apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift"
 let persistencePath = "apps/macos/Sources/GMGNRadio/Presence/AuthorityWorldStatePersistence.swift"
 let bootstrapPath = "apps/macos/Sources/GMGNRadio/App/LivingWorldBootstrap.swift"
 let clientSource = text(clientPath)
@@ -616,7 +618,7 @@ try driver.write(to: driverURL, atomically: true, encoding: .utf8)
 let executable = temporary.appendingPathComponent("probe")
 let compile = run("/usr/bin/nice", ["-n", "15", "/usr/bin/swiftc", "-j1", "-parse-as-library",
                                     "-I", "\(buildRoot)/Modules", clientPath, persistencePath,
-                                    driverURL.path] + objects + ["-o", executable.path])
+                                    backoffPath, driverURL.path] + objects + ["-o", executable.path])
 require(compile == 0, "the authority probe failed to compile (\(compile))")
 let status = runVisible(executable.path, [daemon, exported])
 guard status == 0 else { exit(status) }

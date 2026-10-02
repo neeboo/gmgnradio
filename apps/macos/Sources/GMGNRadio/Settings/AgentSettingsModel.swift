@@ -490,7 +490,7 @@ final class AgentSettingsModel {
     var conversationBackendStatusText: String {
         let installed = installedConversationBackendIDs
         if installed.isEmpty {
-            return "未检测到任何已安装的 Agent 后端。"
+            return "还没有安装可用的对话模型。"
         }
         return "已安装："
             + installed

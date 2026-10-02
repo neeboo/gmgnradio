@@ -15,6 +15,8 @@ func fail(_ message: String) -> Never { print("FAIL: \(message)"); exit(1) }
 func check(_ condition: Bool, _ message: String) { if !condition { fail(message) } }
 
 let clientPath = "apps/macos/Sources/GMGNRadio/Presence/WorldAuthorityClient.swift"
+// 退避/重试预算的**唯一**定义（权威重连读它）—— 编它，不另抄一套常量。
+let backoffPath = "apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift"
 let persistencePath = "apps/macos/Sources/GMGNRadio/Presence/AuthorityWorldStatePersistence.swift"
 let clientSource = (try? String(contentsOf: URL(fileURLWithPath: clientPath), encoding: .utf8)) ?? ""
 let persistenceSource = (try? String(contentsOf: URL(fileURLWithPath: persistencePath), encoding: .utf8)) ?? ""
@@ -150,6 +152,6 @@ func run(_ path: String, _ arguments: [String]) throws -> Int32 {
 
 let compile = try run("/usr/bin/nice", ["-n", "15", "/usr/bin/swiftc", "-j1", "-parse-as-library",
     "-I", build.appendingPathComponent("Modules").path,
-    clientPath, persistencePath, driverURL.path] + objects.map(\.path) + ["-o", executable.path])
+    clientPath, persistencePath, backoffPath, driverURL.path] + objects.map(\.path) + ["-o", executable.path])
 guard compile == 0 else { fail("投影/预像那段编译不过") }
 exit(try run(executable.path, []))

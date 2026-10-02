@@ -3,9 +3,13 @@
 //
 // 这一份钉四件事，每一条都带**注入负对照**（把缺陷注入回生产源码必须 FAIL）：
 //
-// 1. **许愿过的东西一件都不许消失**：真机 `wishes.json` 的 7 条 job ⇒ 7 行；
-//    2 条 `ready` 必须在「待你处理」里看得见（不是折叠掉），3 条"已领取但没入库存"
-//    必须看得见并说得出为什么。注入"把 job-only 的行塞进「已结束」" ⇒ FAIL。
+// 1. **许愿过的东西一件都不许消失**：真机 `wishes.json` 的每条 job ⇒ 一行；
+//    `stage == "ready"` 的必须在「待你处理」里看得见（不是折叠掉），"已领取但没入库存"的
+//    必须看得见并说得出为什么。**这两个期望值从同一份输入推导，不写死快照** ——
+//    现场已经漂过一次：2026-10-02 早上是 2 ready + 3 未入库，同一台机器 17:32 变成
+//    0 + 5（7 条全 `claimed`，只有 2 件真的进了世界）。写死旧数字，红的就只是快照过期，
+//    与产品无关；推导出来的期望值反而不会漏掉任何一条。
+//    注入"把 job-only 的行塞进「已结束」" ⇒ FAIL。
 // 2. **状态 = f(权威)**：改权威（`isEnabled` / `heldProp` / `propTombstones`）⇒ 行状态随之改变。
 //    注入"缓存上一次的状态" ⇒ FAIL。
 // 3. **删除后不再显示成已摆出**（G5）：列表必须读 `propTombstones`。
@@ -314,8 +318,19 @@ let authorityProgram = #"""
               "已领取未入库必须在「待你处理」里（绝不许折叠进「已结束」），实测 \(backlog.state)/\(backlog.group)")
         check(backlog.actions == [.retryInventoryRegistration],
               "没入库存那一行必须给「重试入库」（既有 register 路径），实测 \(backlog.actions)")
-        check(backlog.reasonText?.contains("layoutReceipts") == true,
-              "说「没保存」就必须同时说得出来是哪个字段没有，实测 \(backlog.reasonText ?? "nil")")
+        // 「说得出为什么」仍是判据，但说法是**人话**（2026-10-02：那三条大字面改成一句
+        // 人话，本文件不再要求原因里出现 `layoutReceipts` 这种字段名）：不出现字段名 /
+        // 回执键 / UUID，而且「回执在」与「回执不在」两档说的**不是同一句** —— 说得具体，
+        // 不是套一句模板。文案逐字归 `tools/test-user-facing-copy.swift` 管，这里不钉死。
+        let noReceiptReason = backlog.reasonText ?? ""
+        check(!noReceiptReason.isEmpty, "说「没保存」就必须说得出来为什么，实测 \(noReceiptReason)")
+        check(noReceiptReason.range(of: "[A-Za-z_]", options: .regularExpression) == nil,
+              "「没保存」的原因必须是人话（不出现字段名 / 回执键 / UUID），实测 \(noReceiptReason)")
+        var withReceipt = notSaved
+        withReceipt.claimReceiptPresent = true
+        let withReceiptReason = ResidentOwnershipProjection.row(withReceipt).reasonText ?? ""
+        check(!withReceiptReason.isEmpty && withReceiptReason != noReceiptReason,
+              "有回执 / 没回执两档的原因必须分得开（「是哪一个」说得出），实测 \(withReceiptReason) / \(noReceiptReason)")
         check(backlog.evidence.contains { $0.field.hasPrefix("layoutReceipts[claimed.") },
               "展开里必须有 layoutReceipts 的 evidence")
         // 同一行、同一条事实：补做**走不通**时按钮**不摆出来**（一句做不到的承诺比没有按钮更坏），
@@ -431,6 +446,13 @@ struct RealWorld: Decodable {
         var matchedObjectIDs: Set<String> = []
         var claimedWithoutReceipt: [String] = []
         var receiptWithoutObject: [String] = []
+        /// `stage == "claimed"` 而世界里**没有**它的那些 job：这正是投影里
+        /// `case .claimed:` 那一支（「已领取，入库尚未保存」）的**唯一**判据。
+        /// 期望值由它数出来，不写死某一天的 3。
+        var claimedWithoutObject: [String] = []
+        /// 「把存档回放当成现场渲染状态」的**可判定**记录（见下面 `f.renderFailureMessage = nil`
+        /// 那一行后面的检查）。单独收在一处，是因为 `failures` 在循环之后才声明。
+        var archiveRenderFailureLeaks: [String] = []
         for (index, job) in archive.jobs.enumerated() {
             var objectID = job.objectID
             var object = world.objectStates[job.objectID]
@@ -452,6 +474,16 @@ struct RealWorld: Decodable {
             // **现场语义**：离线复核读不到舞台，所以如实置 nil（= 读不到），
             // 而不是把存档里那条旧结论当成现场事实 —— 见上面 `archivedRenderFailures`。
             f.renderFailureMessage = nil
+            // 上面那句话必须**可判定**，不能只是一句注释：谁把这个字段填上（= 拿存档
+            // 回放当现场），这里当场记下来。为什么非要在这里判：文件尾那条
+            // `stale-archive-as-action-judge` 负对照注入的正是这一行，而它原来靠的是
+            // "未领取行必须给得出下一步" —— 现场 `wishes.json` 今天一条 `ready` 都没有
+            // （2026-10-02 17:32：7 条全 `claimed`），那条判据会**空转**，负对照于是
+            // 抓不到任何缺陷（"门禁从不 FAIL"）。这条不依赖现场有没有 ready：
+            // 只要谁把存档塞进这个字段，它就红。
+            if f.renderFailureMessage != nil {
+                archiveRenderFailureLeaks.append("\(job.name)｜\(job.objectID)")
+            }
             f.processOrder = index
             f.objectPresent = object?.generatedProp != nil
             f.objectHasGeneratedProp = object?.generatedProp != nil
@@ -470,6 +502,7 @@ struct RealWorld: Decodable {
             f.canRetryNow = true
             if job.stage.rawValue == "claimed", !receipt { claimedWithoutReceipt.append("\(job.name)｜\(job.objectID)") }
             if receipt, object?.generatedProp == nil { receiptWithoutObject.append("\(job.name)｜\(job.objectID)") }
+            if job.stage.rawValue == "claimed", object?.generatedProp == nil { claimedWithoutObject.append("\(job.name)｜\(job.objectID)") }
             if f.objectPresent { matchedObjectIDs.insert(objectID) }
             facts.append(f)
             order[OwnershipRowKey(jobID: job.id, objectID: objectID).identifier] = index
@@ -525,6 +558,11 @@ struct RealWorld: Decodable {
 
         // ── 判据：7 件东西一件都不许消失 ──
         var failures: [String] = []
+        // 「现场语义」那一条的判定（记录在循环里，见 `archiveRenderFailureLeaks`）：
+        // 一条都不许有 —— 有就是拿存档回放当了现场。
+        for leak in archiveRenderFailureLeaks {
+            failures.append("「\(leak)」的渲染失败来自**存档回放**，不是现场 —— 生产读的是 `spatialStage.residentPropRenderStatuses[objectID]`")
+        }
         let unbounded = ResidentOwnershipProjection.list(rows, order: order, showsEnded: true, rowBudget: rows.count + 8)
         let visible = Set(unbounded.sections.flatMap { $0.rows }.map(\.key.objectID))
         let foldedGroups = Set(unbounded.sections.filter(\.isFolded).map(\.group))
@@ -552,17 +590,22 @@ struct RealWorld: Decodable {
                 failures.append("未领取的「\(job.name)」被折叠进了「已结束」—— 用户正是为这个抱怨的")
             }
             if row.state == .ended, job.stage.rawValue == "claimed" {
-                failures.append("已领取但没入库的「\(job.name)」被折叠进了「已结束」—— 3 件里有它")
+                failures.append("已领取但没入库的「\(job.name)」被折叠进了「已结束」—— 那一档一件都不许折叠")
             }
         }
-        // 真机 7 件：5 claimed（其中 3 件没进库存）+ 2 ready。
+        // 期望值**从输入推导**（见文件头第 1 条与上面 `claimedWithoutObject` 的注释）：
+        // 判据强度一个字没变 —— 仍然是"**每一条**该在这一档的东西都必须真的在这一档、
+        // 一条都不许漏"，只是不再假设那一天的数字。旧写法把"输入快照"当成了判据：
+        // 现场从 2 + 3 漂到 0 + 5 之后，它红的理由与列表对不对毫无关系。
+        let expectedAwaiting = archive.jobs.filter { $0.stage.rawValue == "ready" }.count
+        let expectedNotSaved = claimedWithoutObject.count
         let awaiting = rows.filter { $0.state == .awaitingClaim }
         let notSaved = rows.filter { $0.statusText == "已领取，入库尚未保存" }
-        if awaiting.count != 2 {
-            failures.append("真机的 2 件未领取必须都在「未领取」里，实测 \(awaiting.count) 件")
+        if awaiting.count != expectedAwaiting {
+            failures.append("输入里有 \(expectedAwaiting) 件未领取（stage=ready），列表里只数得出 \(awaiting.count) 件 —— 一件都不许漏，也不许凭空多")
         }
-        if notSaved.count != 3 {
-            failures.append("真机的 3 件「已领取但没写进库存」必须都说得出来，实测 \(notSaved.count) 件")
+        if notSaved.count != expectedNotSaved {
+            failures.append("输入里有 \(expectedNotSaved) 件「已领取但没写进库存」（stage=claimed 且世界里没有它），列表里只数得出 \(notSaved.count) 件")
         }
         for row in notSaved where row.reasonText?.isEmpty != false {
             failures.append("「\(row.name)」说了入库尚未保存，却没说为什么")
@@ -599,7 +642,7 @@ let replay = compileAndRun(replayProgram, projection: projectionSource,
 print(replay.1.trimmingCharacters(in: .whitespacesAndNewlines))
 guard replay.0 == 0 else { print("FAIL: 真机逐行复核没通过"); exit(1) }
 print("")
-print("PASS[2-real]: 真机 7 条 job ⇒ 7 行、一件都不许消失（2 件未领取 + 3 件已领取未入库 + 2 件已摆出，逐行见上）")
+print("PASS[2-real]: 真机每条 job ⇒ 一行、一件都不许消失（未领取 / 已领取未入库的期望值都由同一份输入推导，逐行见上）")
 
 // ── 契约（C1-C5）：那一行真的能动手，而且走的是**既有**那条路；面板不长第二套文案 ──
 //

@@ -203,12 +203,12 @@ extension Notification.Name {
 /// 文案只描述用户能在界面里执行的下一步，绝不出现环境变量名、可执行文件路径或
 /// 安装目录；技术诊断只进日志。
 enum ResidentBackendReadiness {
-    /// 设置里真实存在的导航路径（GMGNSettingsView 的「DJ」页 →「Agent 聊天后端」）。
-    static let settingsPath = "设置 → DJ → Agent 聊天后端"
+    /// 设置里真实存在的导航路径（GMGNSettingsView 的「DJ」页 →「聊天模型」）。
+    static let settingsPath = "设置 → DJ → 聊天模型"
 
+    /// 一句话：先说发生了什么，再说要用户做什么。
     static let noBackendGuidance =
-        "还没有可用的对话后端。请打开\(settingsPath)，安装并选择一个后端"
-        + "（Codex、Claude Code 或 DSH）后再发送。"
+        "还没有可用的对话模型，请打开\(settingsPath)装一个。"
 
     /// 一个后端都不可用时返回可执行的配置指引，否则 nil。
     static func guidance(hasUsableBackend: Bool) -> String? {
@@ -243,38 +243,36 @@ enum AgentConversationError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case let .backendNotInstalled(id):
-            "\(AgentConversationBackends.backend(for: id).displayName) 尚未安装，"
-                + "请打开\(ResidentBackendReadiness.settingsPath)，安装或选择一个后端。"
+            "\(AgentConversationBackends.backend(for: id).displayName) 还没安装，"
+                + "请打开\(ResidentBackendReadiness.settingsPath)装一个。"
         case .emptyReply:
-            "Agent 没有返回内容，请稍后再试。"
+            "这次没有收到回复，请再发一次。"
         case .cancelled:
             "已取消本次回复。"
         case .worldToolsUnavailable:
-            "当前空间操作连接已失效，请重新发送消息。"
+            "空间连接断了，请重新发送。"
         case .invalidDSHToolProtocol:
-            "DSH 返回的空间工具协议无效，请重新发送消息。"
+            "收到的空间指令不完整，请重新发送。"
         case .dshSecurityPatchUnavailable:
-            "DSH 居民模式的安全配置无法验证，本次请求已停止。"
+            "安全配置没通过检查，这次没有执行。"
         case let .dshExecutionFailed(_, reason):
             reason.userMessage
         case let .imagesUnsupported(id):
-            "\(AgentConversationBackends.backend(for: id).displayName) 暂未接入图片输入，请在设置里切换到 Codex 后发送图片。"
+            "\(AgentConversationBackends.backend(for: id).displayName) 还不能看图，请换个模型再发图片。"
         case .imageTransportUnavailable:
-            "当前居民连接暂不支持图片输入，请切换到支持图片的 Codex 连接后重试。"
+            "这个连接传不了图片，请换个模型再试。"
         case .dshTextTransportUnavailable:
-            "居民连接组件未就绪，这条文字消息没有送达。请检查 DSH 安装后重试；"
-                + "若持续失败，可在设置里改用 Codex。"
+            "这条消息没发出去，请再发一次。"
         case .dshImageCapabilityUnavailable:
-            "当前 DSH 连接未同时具备图片握手能力与模型图片输入声明，图片没有发送。"
+            "图片没发出去，请再发一次。"
         case .imageFormatUnsupported:
-            "仅支持 PNG、JPEG、WebP 或 GIF 图片，请转换格式后重试。"
+            "这种图片格式不支持，请换一张再试。"
         case let .dshNativeTurnFailed(reason):
-            "DSH 视觉会话请求失败：\(reason.userMessage)"
+            reason.userMessage
         case .claudeExecutionFailed:
-            "Claude Code 本次未能完成回复，进程已停止并回收。"
-                + "请确认现场后重新发送；若反复失败，请在设置里检查 Claude Code 的安装与凭证。"
+            "这次没能回复，请重新发送。若反复出现，请检查 Claude Code 是否装好。"
         case .claudeInvalidResult:
-            "Claude Code 返回了无法识别的结果，本次回复已停止。"
+            "收到的回复看不懂，这次没有执行。"
         }
     }
 }
@@ -306,12 +304,12 @@ enum DSHExecutionFailureReason: Sendable {
 
     var userMessage: String {
         switch self {
-        case .dependencyUnavailable: "DSH 启动组件缺失，无法开始回复。请修复或更新 DSH 安装后重试。"
-        case .missingCredential: "当前应用缺少 DSH 凭证，请在 DSH 的凭证配置中保存 API Key，再重试。终端临时设置的密钥不会自动传入桌面应用。"
-        case .authentication: "认证未通过，请检查 DSH 的登录或服务配置。"
-        case .quota: "服务额度或请求频率受限，请检查额度或稍后重试。"
+        case .dependencyUnavailable: "聊天组件缺失，这次没能回复。请重新安装应用后重试。"
+        case .missingCredential: "还没有配置密钥，请在设置里填好再试。"
+        case .authentication: "密钥没通过验证，请到设置里检查后重试。"
+        case .quota: "额度不够或太频繁，请稍后重试。"
         case .network: "网络连接失败，请检查网络后重试。"
-        case .unknown: "DSH 意外结束，未能确定原因。请稍后重新发送；若反复出现，请在设置里换一个后端。"
+        case .unknown: "回复意外中断，请重新发送。若反复出现，跟我说一声。"
         }
     }
 }

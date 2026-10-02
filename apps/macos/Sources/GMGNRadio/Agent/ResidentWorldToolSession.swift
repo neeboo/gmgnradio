@@ -52,6 +52,9 @@ final class ResidentWorldToolSession {
     private var results: [String: RealtimeDJToolResult] = [:]
     private var pending: [String: Task<RealtimeDJToolResult, Never>] = [:]
     private(set) var records: [CallRecord] = []
+    /// 居民自主 iterate 的账本：同一个失败连续两次 ⇒ 必须换招；预算用尽才交给用户。
+    /// 每轮会话一份（`ResidentWorldToolSession` 就是一轮），随会话结束自然清空。
+    private var retryLedger = ResidentRetryLedger()
 
     init(
         scopeID: UUID,
@@ -152,7 +155,9 @@ final class ResidentWorldToolSession {
                         return self.failure(requestID, "tool_session_expired", "本次空间操作已超时")
                     }
                     if let tool = self.additionalTools[name] {
-                        return await tool.handle(requestID, canonical)
+                        return self.applyingRetryLedger(
+                            await tool.handle(requestID, canonical), toolName: name
+                        )
                     }
                     self.beforeDispatch?(requestID, name, canonical)
                     let dispatched = await self.dispatcher.handle(RealtimeDJToolCall(
@@ -160,8 +165,10 @@ final class ResidentWorldToolSession {
                         name: name, argumentsJSON: canonical
                     ))
                     let response = RealtimeDJToolResult(callID: requestID, resultJSON: dispatched.resultJSON, isError: dispatched.isError)
-                    if let afterDispatch = self.afterDispatch { return await afterDispatch(name, canonical, response) }
-                    return response
+                    if let afterDispatch = self.afterDispatch {
+                        return self.applyingRetryLedger(await afterDispatch(name, canonical, response), toolName: name)
+                    }
+                    return self.applyingRetryLedger(response, toolName: name)
                 }
                 pending[requestID] = task
                 result = await awaitResult(task)
@@ -189,6 +196,46 @@ final class ResidentWorldToolSession {
         } onCancel: {
             Task { @MainActor [weak self] in self?.cancel() }
         }
+    }
+
+    /// 把一次工具结果喂给居民账本（`ResidentRetryLedger`，策略与预算在 `RetryBackoff.swift`）：
+    ///   · 同一个失败连续两次 ⇒ 在回执里要求换招，不许原地重试第三次；
+    ///   · 需要人类确认的动作（`human_guidance_required`）⇒ 原样返回，照旧必须问用户；
+    ///   · 结构上不可能靠重试解决 ⇒ 第一次就具名说明，不空转、不占预算；
+    ///   · 预算用尽 ⇒ 只把**一句人话**交给用户，细节全部进日志。
+    private func applyingRetryLedger(_ result: RealtimeDJToolResult, toolName: String) -> RealtimeDJToolResult {
+        guard result.isError else {
+            retryLedger.noteSuccess()
+            return result
+        }
+        let code = Self.failureCode(in: result.resultJSON)
+        switch retryLedger.noteFailure(tool: toolName, code: code, at: now()) {
+        case .retrySameApproach, .needsHuman:
+            return result
+        case let .changeApproach(directive):
+            return Self.restating(result, appending: directive)
+        case let .structural(named):
+            return Self.restating(result, appending: "这条失败重试也不会变：\(named)")
+        case let .handOff(sentence):
+            return Self.restating(result, appending: "不要再试了，把这句话告诉用户：\(sentence)")
+        }
+    }
+
+    private static func failureCode(in data: Data) -> String {
+        ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["code"] as? String ?? "unknown"
+    }
+
+    /// 把账本的指令/人话并入回执的 `message`（模型读的就是它），不改其它字段、不改 `isError`。
+    private static func restating(_ result: RealtimeDJToolResult, appending notice: String) -> RealtimeDJToolResult {
+        guard var object = (try? JSONSerialization.jsonObject(with: result.resultJSON)) as? [String: Any] else {
+            return result
+        }
+        let existing = (object["message"] as? String) ?? ""
+        object["message"] = existing.isEmpty ? notice : existing + " " + notice
+        guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
+            return result
+        }
+        return RealtimeDJToolResult(callID: result.callID, resultJSON: data, isError: result.isError)
     }
 
     private func validatedArguments(name: String, data: Data) -> [String: Any]? {

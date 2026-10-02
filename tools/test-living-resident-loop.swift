@@ -879,8 +879,11 @@ func jsonEqual(_ lhs: Any, _ rhs: Any) -> Bool {
             // ResidentStatusNoticeMerge 的 (.failure, .failure) 规则覆盖它：发布日志
             // 因此会多出一条，可见槽里只剩预检失败。断言直接看可见提示本身，
             // 既不放过「指引冒充失败」，也不因为中间那条指引而误报。
+            // 2026-10-02 文案规则：预检失败那句是「<名字> 还没安装，请打开…装一个。」，
+            // 设置指引那句是「还没有可用的对话模型，请打开…装一个。」——「还没安装」
+            // 只出现在预检失败里，所以它仍然能把两者分开。
             let failureNotice = app.liveCamWindowController?.residentStatusText
-            check(failureNotice?.contains("尚未安装") == true, "new preflight failure is visible")
+            check(failureNotice?.contains("还没安装") == true, "new preflight failure is visible")
             await runner.finish(0, session: "stale-session", reply: "stale-reply", exit: staleExit)
             await old.value
             check(app.liveCamWindowController?.residentStatusText == failureNotice, "old failure cannot replace newer preflight error")
@@ -1100,6 +1103,8 @@ let compilerArguments: [String] = ["-j1", "-parse-as-library",
     sources.appendingPathComponent("Agent/AgentConversationService.swift").path,
     sources.appendingPathComponent("Agent/ResidentDSHAgentToolBridge.swift").path,
     sources.appendingPathComponent("Agent/ResidentDSHHostToolsBridge.swift").path,
+    // 退避/重试预算的**唯一**定义（六处读它）—— 编它，不另抄一套常量。
+    sources.appendingPathComponent("Presence/RetryBackoff.swift").path,
     sources.appendingPathComponent("Agent/ResidentClaudeToolBridge.swift").path,
     sources.appendingPathComponent("Agent/ResidentClaudeProcessRunner.swift").path,
     sources.appendingPathComponent("Agent/ResidentDSHTransport.swift").path,

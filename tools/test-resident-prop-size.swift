@@ -526,6 +526,10 @@ let executable = temporary.appendingPathComponent("propsize")
 let process = Process()
 process.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
 process.arguments = ["-j1", "-parse-as-library", "-O", "-I", build.appendingPathComponent("Modules").path,
+    // 摆放试算上限的**唯一**策略定义：`ResidentPropEditorState.swift`（整份 inline 进主程序）
+    // 读 `RetryBackoffSite.propPlacement`，所以那份真源码也要一起编 ——
+    // 在这里另写一份策略就是第二套真相（正是"退避参数散在六处"要修的病）。
+    root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift").path,
     prelude.path, program.path, "-o", executable.path] + objects
 try process.run()
 process.waitUntilExit()
@@ -534,6 +538,8 @@ guard process.terminationStatus == 0 else { print("compile failed"); exit(1) }
 let viewCheck = Process()
 viewCheck.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
 viewCheck.arguments = ["-j1", "-typecheck", "-swift-version", "6", "-I", build.appendingPathComponent("Modules").path,
+    // 摆放试算上限的唯一策略定义（`RetryBackoffSite.propPlacement`）。
+    root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift").path,
     root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/ResidentPropEditorState.swift").path,
     root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/PropSupportGridPresentation.swift").path,
     // 挂点（slot）：面板那一行读 `PropAttachmentSlots.displayName` / `PropAttachmentPoint.allCases`，

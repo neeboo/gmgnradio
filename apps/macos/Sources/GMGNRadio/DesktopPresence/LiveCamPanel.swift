@@ -843,7 +843,15 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate, NSGestureRecogn
             settingsButton.heightAnchor.constraint(equalToConstant: 30),
 
             composer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            composer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            // **控件列是保留区，任何东西都不许进去。**
+            //
+            // 用户 2026-10-02：「小窗也是不要有遮挡」（截图里那块「许愿任务」条压住了
+            // 右下角的设置按钮）。真机量出来的遮挡不止那一块：输入框那一层铺满整宽时，
+            // 它的发送 / 停止按钮正好压在控件列最下面两个按钮（语音、设置）上 ——
+            // `hitTest` 也真的被它抢走。所以这里不是把某一块藏起来，而是让**所有**
+            // 覆盖层（输入框、送达提示、横幅、回复气泡）在几何上就到控件列左边为止：
+            // 它们与控件列不可能相交，遮挡因此**结构上不可能**发生。
+            composer.trailingAnchor.constraint(equalTo: controls.leadingAnchor, constant: -8),
             composer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
             messageField.leadingAnchor.constraint(equalTo: attachButton.trailingAnchor, constant: 6),
             messageField.bottomAnchor.constraint(equalTo: composer.bottomAnchor, constant: -12),

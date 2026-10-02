@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import WorldRuntime
+import os
 
 /// 世界状态权威（`gmgn-taskd`）的**同步**客户端。
 ///
@@ -26,20 +27,41 @@ enum WorldAuthorityError: LocalizedError, Equatable {
     /// 读不到权威记录、也没有遗留预像 —— 冷启动 fail-closed，绝不凭空空造一个世界。
     case noAuthorityRecord
 
+    /// 界面只留**一句人话**；原始细节（原因、错误码、两侧 revision）一条不少地进日志。
+    /// 失败在这里构造，所以日志在这里落 —— 调用方不必记得再打一行。
+    static let diagnosticLog = Logger(subsystem: "ai.gmgn.radio", category: "WorldAuthority")
+
+    static func unreachable(_ detail: String) -> WorldAuthorityError {
+        diagnosticLog.error("世界状态权威不可达：\(detail, privacy: .public)")
+        return .unavailable(detail)
+    }
+
+    static func daemonCode(_ code: String) -> WorldAuthorityError {
+        diagnosticLog.error("世界状态权威拒绝：code=\(code, privacy: .public)")
+        return .daemon(code)
+    }
+
+    static func projectionBehind(local: UInt64, authority: UInt64) -> WorldAuthorityError {
+        diagnosticLog.error("本地投影落后于权威：local=\(local) authority=\(authority)")
+        return .staleProjection(local: local, authority: authority)
+    }
+
+    /// 界面只留一句人话。关联值里的原始细节（原因、错误码、两侧 revision）在
+    /// `unreachable` / `daemonCode` / `projectionBehind` 构造时已经落进日志。
     var errorDescription: String? {
         switch self {
-        case let .unavailable(detail):
-            "世界状态权威（gmgn-taskd）不可达：\(detail)。为避免出现第二份真相，本次不写任何世界状态。"
-        case let .daemon(code):
-            "世界状态权威拒绝了请求（\(code)）。"
+        case .unavailable:
+            "暂时连不上空间服务，这次没有保存。请稍后重试。"
+        case .daemon:
+            "空间服务拒绝了这次保存，请稍后重试。"
         case .invalidResponse:
-            "世界状态权威返回了无法识别的数据。"
+            "空间服务返回了看不懂的数据，这次没有保存。"
         case .stateEncodeFailed:
-            "世界状态无法编码成权威合同的 JSON。"
-        case let .staleProjection(local, authority):
-            "本地投影基于 revision \(local)，权威已到 \(authority)；拒绝用陈旧数据提交。"
+            "空间数据保存失败，请稍后重试。"
+        case .staleProjection:
+            "空间数据不是最新的，这次没有保存。请稍后重试。"
         case .noAuthorityRecord:
-            "权威里没有这个世界，且没有遗留 state.json 可导入。"
+            "找不到这个空间，请重新打开。"
         }
     }
 }
@@ -198,7 +220,7 @@ final class UnixSocketJSONClient: @unchecked Sendable {
             throw WorldAuthorityError.invalidResponse
         }
         if let error = object["error"] as? [String: Any], let code = error["code"] as? String {
-            throw WorldAuthorityError.daemon(code)
+            throw WorldAuthorityError.daemonCode(code)
         }
         guard let result = object["result"] as? [String: Any] else {
             throw WorldAuthorityError.invalidResponse
@@ -231,9 +253,9 @@ final class UnixSocketJSONClient: @unchecked Sendable {
             let count = read(descriptor, &buffer, buffer.count)
             if count < 0 {
                 if errno == EAGAIN || errno == EWOULDBLOCK { continue }
-                throw WorldAuthorityError.unavailable("subscription read failed")
+                throw WorldAuthorityError.unreachable("subscription read failed")
             }
-            if count == 0 { throw WorldAuthorityError.unavailable("authority closed the subscription") }
+            if count == 0 { throw WorldAuthorityError.unreachable("authority closed the subscription") }
             frame.append(contentsOf: buffer[0..<count])
             if frame.count > Self.maximumFrame { throw WorldAuthorityError.invalidResponse }
             while let newline = frame.firstIndex(of: 0x0A) {
@@ -273,7 +295,7 @@ final class UnixSocketJSONClient: @unchecked Sendable {
             lastError = "connect failed"
             Thread.sleep(forTimeInterval: 0.1)
         }
-        throw WorldAuthorityError.unavailable(lastError)
+        throw WorldAuthorityError.unreachable(lastError)
     }
 
     private func openSocket() -> Int32? {
@@ -327,7 +349,7 @@ final class UnixSocketJSONClient: @unchecked Sendable {
             var offset = 0
             while offset < raw.count {
                 let written = write(descriptor, base.advanced(by: offset), raw.count - offset)
-                guard written > 0 else { throw WorldAuthorityError.unavailable("write failed") }
+                guard written > 0 else { throw WorldAuthorityError.unreachable("write failed") }
                 offset += written
             }
         }
@@ -338,8 +360,8 @@ final class UnixSocketJSONClient: @unchecked Sendable {
         var buffer = [UInt8](repeating: 0, count: 64 * 1024)
         while true {
             let count = read(descriptor, &buffer, buffer.count)
-            if count < 0 { throw WorldAuthorityError.unavailable("read timed out") }
-            if count == 0 { throw WorldAuthorityError.unavailable("authority closed the connection") }
+            if count < 0 { throw WorldAuthorityError.unreachable("read timed out") }
+            if count == 0 { throw WorldAuthorityError.unreachable("authority closed the connection") }
             frame.append(contentsOf: buffer[0..<count])
             if frame.count > Self.maximumFrame { throw WorldAuthorityError.invalidResponse }
             if let newline = frame.firstIndex(of: 0x0A) {
@@ -514,7 +536,7 @@ final class WorldAuthorityClient: @unchecked Sendable {
             }
             if case let .daemon(code) = error, code == "revision_conflict" {
                 let authority = (try? snapshot())?.recordRevision ?? expectedRevision
-                throw WorldAuthorityError.staleProjection(local: expectedRevision, authority: authority)
+                throw WorldAuthorityError.projectionBehind(local: expectedRevision, authority: authority)
             }
             throw error
         }
@@ -664,6 +686,10 @@ final class WorldAuthoritySubscription: @unchecked Sendable {
     }
 
     private func run() {
+        // 断线重连的等待来自**唯一**的策略定义（`RetryBackoff.swift` 的
+        // `RetryBackoffSite.authorityReconnect`）：第一跳与既有 1 秒同值，之后递增、
+        // 带抖动、封顶。重连仍**从投影游标续**（那是本处的语义，不搬进策略）。
+        var reconnectFailures = 0
         while !isStopped {
             do {
                 try transport.stream(method: "world_subscribe", params: params(),
@@ -676,11 +702,16 @@ final class WorldAuthoritySubscription: @unchecked Sendable {
                     self.onFact(fact)
                 }
             } catch {
-                // 权威不可达：退避后重试（只影响投影新鲜度，不影响渲染）。
+                // 权威不可达：按共享策略退避后重试（只影响投影新鲜度，不影响渲染）。
                 if isStopped { return }
-                Thread.sleep(forTimeInterval: 1)
+                reconnectFailures += 1
+                let policy = RetryBackoffSite.authorityReconnect.policy
+                Thread.sleep(forTimeInterval: policy.delay(
+                    afterFailure: reconnectFailures, jitterUnit: RetryJitter.uniform.unit()
+                ))
                 continue
             }
+            reconnectFailures = 0
             if isStopped { return }
             Thread.sleep(forTimeInterval: 0.5)
         }

@@ -256,6 +256,13 @@ test-harnesses:
 
 _test-harnesses:
 	swift tools/test-first-use-guidance.swift
+	# 用户可见文案门禁（用户 2026-10-02：「所有的提示，所有的错误提示和 warning 都需要
+	# 简化」）：机械扫描全量中文文案，命中内部术语 / key=value / UUID / 文件路径 /
+	# 省略号堆叠 / 打勾打叉 / 超长（>60 汉字或 >2 句）⇒ 红。豁免逐条写明理由（日志出口、
+	# 模型面提示词、测试夹具），冻结文件记 OPEN 不算通过。每次**都**跑注入自测：
+	# 塞回一条长文案 / 一个 UUID / 一个 key=value / 一个勾叉 / 一段省略号堆叠 / 一条
+	# 文件路径，六种都必须红 —— 注入不红就是门禁失效。
+	swift tools/test-user-facing-copy.swift
 	swift tools/test-space-first-defaults.swift
 	swift tools/test-stage-decoration-menu.swift
 	swift tools/test-stage-control-actions.swift
@@ -263,6 +270,10 @@ _test-harnesses:
 	swift tools/test-space-presentation.swift
 	swift tools/test-livecam-avatar-framing.swift
 	swift tools/test-livecam-panel-sizing.swift
+	# 小窗里**没有任何元素遮挡控件**（用户 2026-10-02：「小窗也是不要有遮挡」）。判据是
+	# 真实 AppKit 布局：每个控件在自己中心点的 hitTest 必须是它自己，覆盖块与任何控件的
+	# frame 不许相交。两条负对照必须 FAIL：改前那一份（`FROM_HEAD`）与注入一个盖住控件列的元素。
+	swift tools/test-livecam-no-occlusion.swift
 	swift tools/test-livecam-auto-presentation.swift
 	swift tools/test-stage-avatar-follow-smoothing.swift
 	swift tools/test-resident-walk-motion-default.swift
@@ -302,6 +313,11 @@ _test-harnesses:
 	# 不许写在副标题里）；没有「为什么」入口、没有展开的证据面板。七个动作都还在，
 	# 只是不解释（工程细节留在统一日志与 agent 回执里）。七条注入负对照全部必须 FAIL。
 	swift tools/test-ownership-list-plain-interface.swift
+	# 「我的物件」列表"**新的排前面**"真的生效吗：宿主提供事实的那一行写的键必须与唯一投影
+	# `ResidentOwnershipProjection.ordered` 查的 `OwnershipRowKey.identifier`（`"<jobID>/<objectID>"`）
+	# 逐字对上。宿主那一行**逐字抽出来**在真源码编译起来的探针里驱动（最新 → 最旧），
+	# 并用旧写法（裸 `objectID`）当负对照证明这条判据抓得住那个 bug；注入「改回旧写法」⇒ FAIL。
+	swift tools/test-ownership-list-order.swift
 	# 「摆放 → 我的物件」= 全部许愿的目录：**唯一投影** `ResidentOwnershipProjection.row`。
 	# 对外只有五种状态（生成中/待领取/在库里（没摆）/已摆放/失败）+ 折叠的「已结束」；
 	# 一行 = 一次许愿（jobID 为主）∪ 一件世界物件（**只正向连接**，绝不反解 objectID）；
@@ -339,6 +355,11 @@ _test-harnesses:
 	# 杀掉 MCP 不影响权威）在 services/gmgn-mcpd 里，走 `cargo test -p gmgn-mcpd`。
 	swift tools/test-resident-dsh-mcp-mount.swift
 	swift tools/test-resident-tool-bridge-errors.swift
+	# 工具参数 schema 的约束键门禁：宿主校验器**不认**的键（minimum/maximum/pattern/format…）
+	# 会让整条 schema 被判 schema_unsupported，工具一次都执行不到（真机 hold_prop 的
+	# layout_revision 就是这么连败 7 次的）。判据读校验器自己的 allowedSchemaKeys，不手抄；
+	# 每次都跑注入自测（塞回 minimum / 抹掉范围说明 / 放宽实现边界都必须红）。
+	swift tools/test-resident-tool-schema-keys.swift
 	swift tools/test-resident-background-presentation.swift
 	swift tools/test-resident-agent-loop.swift
 	swift tools/test-resident-prop-world-collision.swift
@@ -354,6 +375,15 @@ _test-harnesses:
 	# 记录不许当可见性判据。四条判据 + 四条注入负对照（永久信记录 / 无条件清 /
 	# 两者分叉 / 手拼几何被接回产品路径），每条都实测会红；注入只改内存副本，跑完校验 sha256。
 	swift tools/test-wish-machine-output-rederivation.swift
+	# 许愿任务 = **一条条消息**（用户 2026-10-02：「许愿任务变成消息提示，不要单独做窗口了」）：
+	# 产品路径上零个许愿任务窗口/列表（210 个源文件扫过），状态变化各发一条、同一状态不重复
+	# （幂等），失败待办**不自动消失**（判据是唯一投影的 `OwnershipDisplayState.failed`；不是
+	# 第二份真相），其它终态按既有窗口过期，文案是人话（无 key=value / UUID / 路径 / 内部字段名 /
+	# 省略号堆叠）。八条注入负对照全部必须 FAIL。
+	swift tools/test-wish-task-messages.swift
+	# 「有事才出现、了结后收起」的判据跟着消息走（`WishMachineTaskPrompt`，只依赖 Foundation）：
+	# 规则体**逐字抽出来**真的编译起来驱动；注入「常驻」/「把许愿任务列表装回视图」⇒ FAIL。
+	swift tools/test-wish-task-panel-when-shown.swift
 	swift tools/test-resident-system-inbox-window.swift
 	swift tools/test-resident-prop-collision-proxy.swift
 	swift tools/test-resident-state-convergence.swift

@@ -198,9 +198,11 @@ enum ResidentConnectivityFact {
     }
 
     /// 连通性事实的人类可读横幅文案。`nil` 表示连通正常（横幅自动消失）。
+    ///
+    /// 原始原因码（`network_unavailable` 这类）是给工程看的，**不上屏**：它只进日志。
+    /// 屏上只留一句人话 —— 发生了什么 + 要不要用户做什么。
     static func bannerText(for line: String) -> String {
-        let reason = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        return "连不上后台（\(reason)）。任务和产物都还在，恢复后会自己继续；这条提示会自动消失。"
+        "暂时连不上，东西都还在，恢复后会自己继续。"
     }
 
     /// 从多行文本里挑出**第一条**连通性事实；`nil` 表示没有连通性问题。

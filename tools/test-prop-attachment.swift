@@ -84,8 +84,40 @@ func productionLine(_ text: String, prefix: String, _ what: String) -> String {
     }
     return line
 }
+/// 同上，但抽的是**整个函数体**（含嵌套花括号）。判据函数不许手抄一份 ——
+/// 手抄的副本会随着生产改动悄悄漂移，而门禁测的就变成了"我抄的那一份"。
+/// 抽出来的是 `public`，而 harness 里的替身类型是 internal 的 ⇒ 去掉 `public `
+/// 只为让两者同处一个模块，**函数体一个字都不动**。
+func productionBody(_ text: String, signature: String, _ what: String) -> String {
+    guard let start = text.range(of: signature)?.lowerBound,
+          let open = text[start...].firstIndex(of: "{") else {
+        print("FAIL: 生产源码里找不到\(what)（以 \"\(signature)\" 开头的声明）")
+        exit(1)
+    }
+    var depth = 0
+    for index in text[open...].indices {
+        if text[index] == "{" { depth += 1 }
+        if text[index] == "}" {
+            depth -= 1
+            if depth == 0 {
+                return String(text[start...index])
+                    .replacingOccurrences(of: "public ", with: "")
+            }
+        }
+    }
+    print("FAIL: \(what) 的声明没有闭合（花括号数不平）")
+    exit(1)
+}
 let aspectLimitLine = productionLine(
     sizePolicySource, prefix: "public static let longThinAspectLimit", "细长门槛")
+// `PropAttachment.swift` 现在真的会调 `WorldPropSizePolicy.uniformFactor(...)`；
+// 它读的是 `WorldVector3`，所以 `Self.isFinite` 那一个守卫也必须一起抽出来 ——
+// 少抽一个，`uniformFactor` 里那句 `isFinite(current)` 就编不过（这正是原来的红）。
+// 两段都从**生产源码逐字**抽，容差（0.001）与守卫条件因此不可能与生产不一致。
+let sizePolicyIsFiniteBody = productionBody(
+    sizePolicySource, signature: "public static func isFinite(", "尺寸有限性判据")
+let uniformFactorBody = productionBody(
+    sizePolicySource, signature: "public static func uniformFactor(", "等比缩放判据")
 let upAxesLine = productionLine(
     collisionProxySource, prefix: "public static let acceptedUpAxes", "up 轴白名单")
 let forwardAxesLine = productionLine(
@@ -103,9 +135,12 @@ import Foundation
 import simd
 
 // `WorldVector3` / `WorldQuaternion` 来自真的 `WorldGeometry.swift`（另一个文件，见下面编译参数），
-// 所以这里**不再**手写一份。下面两个 enum 的常量是逐字从生产源码里抽出来的行。
+// 所以这里**不再**手写一份。下面两个 enum 里的常量与判据函数都是逐字从生产源码里抽出来的
+// （常量抽行，函数抽整个函数体）—— 抽出来的东西不可能与生产漂移。
 enum WorldPropSizePolicy {
     \#(aspectLimitLine)
+    \#(sizePolicyIsFiniteBody)
+    \#(uniformFactorBody)
 }
 enum WorldPropAuthoritativeSize {
     \#(upAxesLine)

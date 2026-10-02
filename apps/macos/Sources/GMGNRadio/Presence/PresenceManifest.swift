@@ -68,9 +68,9 @@ enum PresencePackageError: Error, Equatable, LocalizedError {
         case .packageNotFound:
             "找不到这个桌宠。"
         case .manifestMissing:
-            "包内缺少 manifest.json。"
+            "这个桌宠的资源不完整，请重新安装。"
         case .invalidManifest:
-            "manifest.json 格式不正确。"
+            "这个桌宠的资源读不了，请重新安装。"
         case .invalidIdentifier:
             "桌宠 ID 只能包含字母、数字、点、横线和下划线。"
         case .invalidEntryPath:

@@ -51,11 +51,11 @@ enum LocalMusicPlaybackError: Error, LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .trackNotLoaded:
-            "还没有加载任何音轨，点唱机无法出声。"
+            "这里还没有可播的曲子，请先选一首。"
         case .graphNotPlaying:
-            "音频引擎没有真正开始播放（isPlaying=false）。"
-        case let .playbackSilent(position, waited):
-            "音频引擎报告在播放，但播放位置停在 \(String(format: "%.2f", position)) 秒没有前进（等待 \(String(format: "%.1f", waited)) 秒）：扬声器没有收到声音。"
+            "播放没有真正开始，请再试一次。"
+        case .playbackSilent:
+            "播放没有出声，请再试一次。"
         }
     }
 }

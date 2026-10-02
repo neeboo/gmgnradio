@@ -28,17 +28,17 @@ enum ResidentDSHTransportError: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .alreadyStarted: "居民视觉会话连接已经启动，请稍候再试。"
-        case .launchFailed: "无法启动居民视觉会话，系统会重试；请重新发送消息。"
-        case .notConnected: "居民视觉会话尚未连接，系统会在下一条消息时重建连接；请重新发送。"
-        case .connectionClosed: "居民视觉会话连接已中断，系统会在下一条消息时重建连接；请重新发送刚才的内容。"
-        case .invalidFrame: "居民视觉会话返回了无法识别的数据，系统会重建连接；请重新发送消息。"
-        case .frameTooLarge: "居民视觉会话数据超过安全上限，请重试或缩短内容。"
-        case .writeFailed: "无法发送居民视觉会话消息，系统会重建连接；请重新发送。"
-        case .timedOut: "居民视觉会话等待超时，连接已回收；请稍后重新发送。"
+        case .alreadyStarted: "连接已经启动，请稍候再试。"
+        case .launchFailed: "连接没起来，请重新发送。"
+        case .notConnected: "连接还没就绪，请重新发送。"
+        case .connectionClosed: "连接断了，请重新发送刚才的内容。"
+        case .invalidFrame: "收到看不懂的数据，请重新发送。"
+        case .frameTooLarge: "内容太大，请缩短后重试。"
+        case .writeFailed: "消息没发出去，请重新发送。"
+        case .timedOut: "等太久了，连接已经断开，请稍后重试。"
         // 关联的 stopReason 只供诊断，不拼接进用户文案。
-        case .turnNotCompleted: "居民视觉会话在回复完成前中断，连接已回收；请重新发送刚才的内容。"
-        case .promptConflict: "居民视觉会话已有进行中的请求，请等它结束后再发送。"
+        case .turnNotCompleted: "回复没完成，连接断了，请重新发送刚才的内容。"
+        case .promptConflict: "上一条还在处理，请等它结束再发。"
         }
     }
 }

@@ -427,7 +427,9 @@ enum ResidentOwnershipProjection {
         if facts.tombstoneName != nil, facts.objectPresent {
             badges.append("墓碑与库存并存（分叉）：这一件删过，之后又被重新登记回来")
         }
-        if facts.matchedBySourceWishID { badges.append("按 sourceWishID 认到所属许愿") }
+        // 这一枚徽标说的只有一件事：靠第二条线索认出了它属于哪一次许愿。
+        // 用户看不懂字段名（2026-10-02：「里面一堆 key-value 的东西」），所以只说人话。
+        if facts.matchedBySourceWishID { badges.append("来自你的许愿") }
 
         return OwnershipRow(
             key: key,
@@ -480,7 +482,7 @@ enum ResidentOwnershipProjection {
         }
     }
 
-    /// 「已领取，入库尚未保存」的**具名原因**：字段 + 实测值。
+    /// 「已领取，入库尚未保存」的**具名原因**：一句人话（不出现字段名 / 回执键 / UUID）。
     ///
     /// 会话内台账在时用它的**原话**（那是摆放服务给的判定文本）；不在时也必须答得出来
     /// —— 这一个窗口（`claim()` 与入库写入之间）本来就是长的，而"说得出为什么没保存"
@@ -488,9 +490,9 @@ enum ResidentOwnershipProjection {
     static func inventoryNotSavedReason(_ facts: OwnershipRowFacts) -> String {
         if let notice = facts.inventoryPendingNotice { return notice }
         if facts.claimReceiptPresent {
-            return "世界回执 claimed.\(facts.jobID?.uuidString ?? "?") 在，但库存里没有这一条；这次入库没有被库存接受。"
+            return "已经领到了，但还没进到库存。"
         }
-        return "世界没有接受这次入库：layoutReceipts 里没有 claimed.\(facts.jobID?.uuidString ?? "?")，objectStates 里也没有它。"
+        return "这次入库没有成功，东西还没进到库存。"
     }
 
     static func heldSlotName(_ slot: String) -> String {

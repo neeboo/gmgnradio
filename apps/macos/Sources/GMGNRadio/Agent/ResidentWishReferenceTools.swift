@@ -488,7 +488,7 @@ final class ResidentWishReferenceTools {
             "display_name": registration.displayName,
             "source_image_url": registration.imageURL.absoluteString,
             "source_kind": "public_web_reference", "license_verified": false,
-            "message": "已登记为本轮参考图，来源与许可未核验。只有用户明确要求制作时才可调用 submit_wish_generation；登记本身不生成、也不消耗生成额度。",
+            "message": "已登记为本轮参考图，来源和许可没有核实。用户明确要做的时候，再提交生成。",
         ])
     }
 
