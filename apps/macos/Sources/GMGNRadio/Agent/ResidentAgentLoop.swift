@@ -1,6 +1,16 @@
 import Foundation
 import os
 
+/// 宿主**没有**把这一轮发给居民时的具名拒绝（例如"摆放面板正开着，这一条没有发出去"）。
+///
+/// 为什么要有这个协议：这种结果既不是投递失败（压根没发），也不是用户停止，所以
+/// 它自己那一句必须原样进可见历史，而不是被套上「未送达：本轮未完成…」的失败口径。
+/// 由抛出它的那一方（宿主）给出那句话；循环只负责不把它当成失败。
+protocol ResidentTurnRefusal: Error {
+    /// 可以直接显示给用户的一句原因（不含"未送达"字样：这一轮没有发出去）。
+    var refusalNotice: String { get }
+}
+
 /// **居民图片链[3] 队列/轮次**：带图的提交进入队列后，有没有被带进真正的那一轮。
 ///
 /// 图片回合在队列里比纯文字多一条规则：正在跑的轮次不接受带图引导（引导通道只有
@@ -112,28 +122,68 @@ struct ResidentUnconfirmedNoticePolicy {
 /// 一次真实用户提交对应的对话回合。只由用户提交创建：后台/自驱回合没有人类
 /// 输入，不属于「最近对话」，也不会把内部轮次混进用户可回看的记录。
 struct ResidentChatTurn: Equatable, Sendable, Identifiable {
-    /// 回合的交付结论。四种口径互不冒充（静默完成仍记为 delivered，但无回复文本，
+    /// 回合的交付结论。五种口径互不冒充（静默完成仍记为 delivered，但无回复文本，
     /// 界面用独立的「没有回复文字」提示区分）：
     /// - `sending`：已发出但还没有真实结论（模型未返回或正在返回）；
     /// - `delivered`：居民回复已真实显示，算真正送达；
-    /// - `failed`：本轮失败，文字和图片已回到输入框，未自动重发；
-    /// - `cancelled`：用户停止/取消，或排队消息未送达。
+    /// - `failed`：**真的没送到**（连接/运行时/传输失败），文字和图片已回到输入框；
+    /// - `cancelled`：用户停止/取消，或排队消息在停止时退回；
+    /// - `interrupted`：宿主自己把这一轮**停下**了（更新的指令超车、进入装修、换空间，
+    ///   或面板开着根本没发出去）—— 它**不是**投递失败，界面上必须说清是哪一种。
     enum Delivery: Equatable, Sendable {
-        case sending, delivered, failed, cancelled
+        case sending, delivered, failed, cancelled, interrupted
+    }
+
+    /// 「这一轮为什么停下」——**只有** `interrupted` 用它，而且只有这几种：
+    /// 每一种都必须是一句用户读得懂、且与事实相符的话。
+    ///
+    /// 为什么必须分开写：真机 2026-10-02 16:56:03–07 面板连点两次「让居民去取」，
+    /// 每一次都在摆放面板开着的时候起了一轮，而那一轮在**第一行**就被
+    /// `ResidentPropHostError.editorOpen` 拒了；界面却按失败口径写成
+    /// 「未送达：本轮未完成，文字和图片已回到输入框，未自动重发。」—— 既说"未送达"
+    /// （其实压根没发），又说"回到输入框"（面板那句话根本不在输入框里）。
+    enum Interruption: Equatable, Sendable {
+        /// 用户紧接着又提交了一条新指令，把上一轮顶掉。
+        case newerInstruction
+        /// 用户紧接着做了另一件事（例如进入装修）。`clause` 是那件事的白话说法。
+        case hostAction(String)
+        /// 用户按了停止。
+        case userStopped
+        /// 宿主**没有**把这一轮发给居民（例如摆放面板正开着）。`clause` 说明原因。
+        case notSent(String)
+
+        /// 界面上的前置从句（后面统一接「，这一轮已经停下：…」）。
+        var clause: String {
+            switch self {
+            case .newerInstruction: "你紧接着又下了一条指令"
+            case let .hostAction(what): "你紧接着\(what)"
+            case .userStopped: "你停止了这一轮"
+            case let .notSent(why): why
+            }
+        }
+
+        /// 「没发出去」与「发出去又停下」是两件事：前者不许说"回到输入框"。
+        var reachedTheResident: Bool {
+            if case .notSent = self { return false }
+            return true
+        }
     }
 
     let id: UUID
     let userText: String
     var replyText: String?
     var delivery: Delivery
+    /// 只与 `.interrupted` 一起出现：这一轮停下的**确切**原因。
+    var interruption: Interruption?
     let createdAt: Date
 
     init(id: UUID, userText: String, replyText: String? = nil,
-         delivery: Delivery = .sending, createdAt: Date) {
+         delivery: Delivery = .sending, interruption: Interruption? = nil, createdAt: Date) {
         self.id = id
         self.userText = userText
         self.replyText = replyText
         self.delivery = delivery
+        self.interruption = interruption
         self.createdAt = createdAt
     }
 }
@@ -149,11 +199,26 @@ struct ResidentChatTranscriptLine: Equatable, Sendable {
 
     static let imageOnlyText = "（发送了图片）"
     static let waitingText = "已发出，等待回应…"
+    /// **只有真的没送到**（连接/运行时/传输失败）才用这一句。
     static let failedText = "未送达：本轮未完成，文字和图片已回到输入框，未自动重发。"
-    static let cancelledText = "未送达：已停止，未自动重发。"
+    /// 用户主动停止、或排队消息在停止时退回：这是**停止**，不是"没送到"。
+    static let cancelledText = "已停止：未自动重发，文字和图片已回到输入框。"
     /// 获准的静默完成（居民只更新了安排/等待，没有文字回复）：不是一个
     /// 「等待回应」的悬空回合，也不是失败或取消。
     static let silentCompletionText = "本轮已完成，居民没有回复文字。"
+
+    /// 「你紧接着的下一步把这一轮停下了」那一句。原因来自 `ResidentChatTurn.Interruption`，
+    /// 所以界面不会替用户编一个他没做过的动作。
+    ///
+    /// 与 `failedText` 的**分工**：`failedText` = 真的没送到（连接/运行时/传输失败）；
+    /// 这一句 = 送到了或压根没发出去，但**因为你紧接着的下一步**停下了，原因是具名的。
+    /// 两种都保留"文字回到输入框"这一行为，但只有前者允许说"未送达"。
+    static func interruptedText(_ interruption: ResidentChatTurn.Interruption) -> String {
+        if interruption.reachedTheResident {
+            return "\(interruption.clause)，这一轮已经停下：文字和图片已回到输入框，未自动重发。"
+        }
+        return "\(interruption.clause)，未自动重发。"
+    }
 
     static func speakerLabel(_ speaker: Speaker) -> String {
         switch speaker {
@@ -255,7 +320,21 @@ struct ResidentChatTranscript {
         settle(ids, as: .cancelled)
     }
 
-    /// 明确停止：所有仍无结论的回合按「未送达」收尾。
+    /// 宿主自己把这一轮停下了（更新的指令超车、进入装修、换空间，或面板开着没发出去）。
+    ///
+    /// 与 `markFailed` **分开**：这不是投递失败，所以既不许说"未送达"，也不许把
+    /// "真的没送到"和"因为你紧接着的下一步停下"混成一句。`interruption` 必须由
+    /// 真正做那件事的一方给出（宿主），界面不替用户编原因。
+    mutating func markInterrupted(ids: [UUID], interruption: ResidentChatTurn.Interruption) {
+        for id in ids {
+            guard let index = turns.firstIndex(where: { $0.id == id }),
+                  turns[index].delivery == .sending else { continue }
+            turns[index].delivery = .interrupted
+            turns[index].interruption = interruption
+        }
+    }
+
+    /// 明确停止：所有仍无结论的回合收尾为**已停止**（不是"未送达"）。
     mutating func cancelPendingTurns() {
         for index in turns.indices where turns[index].delivery == .sending {
             turns[index].delivery = .cancelled
@@ -296,6 +375,11 @@ struct ResidentChatTranscript {
             case .cancelled:
                 lines.append(ResidentChatTranscriptLine(
                     turnID: turn.id, speaker: .notice, text: ResidentChatTranscriptLine.cancelledText
+                ))
+            case .interrupted:
+                lines.append(ResidentChatTranscriptLine(
+                    turnID: turn.id, speaker: .notice,
+                    text: ResidentChatTranscriptLine.interruptedText(turn.interruption ?? .newerInstruction)
                 ))
             case .delivered:
                 // 已送达但没有文字回复 = 获准的静默完成：明确说明，不冒充等待。
@@ -591,6 +675,10 @@ final class ResidentAgentLoop {
         let submissionID: UUID?
         let onUndelivered: @MainActor () -> Void
         let onFailure: @MainActor (String) -> Void
+        /// 宿主自己把这一轮停下了（更新的指令超车 / 进入装修 / 换空间 / 面板开着没发出去）：
+        /// 与 `onFailure` **分开**，因为这不是投递失败，界面不能说"未送达"。
+        /// 参数是那一句可以直接显示的话（由 `ResidentChatTranscriptLine.interruptedText` 生成）。
+        let onInterrupted: @MainActor (String) -> Void
         var attemptedRunID: UUID?
     }
 
@@ -600,6 +688,11 @@ final class ResidentAgentLoop {
     private let steer: @MainActor (String) async -> ResidentSteeringDelivery
     private let onReply: @MainActor (String) -> Void
     private let onFailure: @MainActor (String) -> Void
+    /// 宿主自己把某一轮停下时的**具名原因**出口（不是失败出口）。
+    ///
+    /// 参数：这一轮覆盖的提交身份 + 那一轮为什么停下。宿主据此把可见历史写成
+    /// 「你紧接着又下了一条指令，这一轮已经停下…」而不是「未送达」。
+    private let onInterruption: @MainActor ([UUID], ResidentChatTurn.Interruption) -> Void
     private let onChange: @MainActor () -> Void
     private let onCancel: @MainActor () -> Void
     /// 只有**用户按下停止**才会调用的宿主回调（`onCancel` 是每次取消都会调用的
@@ -652,6 +745,16 @@ final class ResidentAgentLoop {
     private var lastFailure: String?
     private var lastTurnUserMessages: [String] = []
     private var lastTurnInterrupted = false
+    /// 宿主在**自己**中止在飞轮次之前写下的原因（`noteHostInterruption`）。
+    ///
+    /// 只影响界面怎么解释这一次中止：取消与交付的判据一个字都不动。用一次就清掉，
+    /// 绝不让上一轮的"旧原因"替下一轮说话。
+    private var pendingHostInterruption: ResidentChatTurn.Interruption?
+    /// 最近一次**已结束**回合是否是"宿主自己停下"（不是投递失败）。宿主在
+    /// `onInterruption` 回调里读它，与 `lastFinishedTurnWasBackground` 同一时机。
+    private(set) var lastFinishedTurnWasInterrupted = false
+    /// 那一轮停下的原因（与 `lastFinishedTurnWasInterrupted` 同时机写入）。
+    private(set) var lastFinishedTurnInterruption: ResidentChatTurn.Interruption?
     private var progress: String?
     /// 本循环实例会话的模型轮次统计：只统计真实调用开始与终态（成功不单列，
     /// 失败与取消互斥），不是 HTTP 请求数、Token 用量或计费数据；统计随本
@@ -710,6 +813,7 @@ final class ResidentAgentLoop {
         steer: @escaping @MainActor (String) async -> ResidentSteeringDelivery = { _ in .notDelivered },
         onReply: @escaping @MainActor (String) -> Void = { _ in },
         onFailure: @escaping @MainActor (String) -> Void = { _ in },
+        onInterruption: @escaping @MainActor ([UUID], ResidentChatTurn.Interruption) -> Void = { _, _ in },
         onChange: @escaping @MainActor () -> Void = {},
         onCancel: @escaping @MainActor () -> Void = {},
         onUserStop: @escaping @MainActor () -> Void = {}
@@ -721,6 +825,7 @@ final class ResidentAgentLoop {
         self.steer = steer
         self.onReply = onReply
         self.onFailure = onFailure
+        self.onInterruption = onInterruption
         self.onChange = onChange
         self.onCancel = onCancel
         self.onUserStop = onUserStop
@@ -780,7 +885,8 @@ final class ResidentAgentLoop {
 
     func receiveUserMessage(_ text: String, imageURLs: [URL] = [], submissionID: UUID? = nil,
                             onUndelivered: @escaping @MainActor () -> Void = {},
-                            onFailure: @escaping @MainActor (String) -> Void = { _ in }) {
+                            onFailure: @escaping @MainActor (String) -> Void = { _ in },
+                            onInterrupted: @escaping @MainActor (String) -> Void = { _ in }) {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !invalidated, !text.isEmpty || !imageURLs.isEmpty else {
             if !imageURLs.isEmpty {
@@ -815,7 +921,8 @@ final class ResidentAgentLoop {
         // A permission toggle must not cancel possibly delivered human guidance.
         if activeRunID != nil { activeRunIsBackground = false }
         messages.append(Message(text: text, imageURLs: imageURLs, submissionID: submissionID,
-                                onUndelivered: onUndelivered, onFailure: onFailure))
+                                onUndelivered: onUndelivered, onFailure: onFailure,
+                                onInterrupted: onInterrupted))
         onChange()
         if activeRunID != nil { beginSteering() }
         else { drainUserMessages() }
@@ -973,6 +1080,23 @@ final class ResidentAgentLoop {
     /// 网络导致的自主关闭），它必须能自愈，绝不冒充"用户按过停止"。
     private enum CancellationReason { case userStop, system }
 
+    /// 宿主**在自己中止在飞轮次之前**写下原因（进入装修、被新指令顶掉、换空间…）。
+    ///
+    /// 它只影响界面怎么解释这次中止 —— 取消判据、交付判据、许愿任务的暂停语义
+    /// 一个字都不动。真机 2026-10-02 16:56:00.786 / 16:58:15.398 两次 `turn/end
+    /// {aborted, reason:{user}}` 都是宿主自己按下的（16:56:00.785 / 16:58:15.394
+    /// 的「装修：请求进入装修」），而界面当时只有"失败"一种说法，于是把一次**中止**
+    /// 说成了"未送达"。
+    func noteHostInterruption(_ interruption: ResidentChatTurn.Interruption) {
+        pendingHostInterruption = interruption
+    }
+
+    /// 取出并清掉宿主写下的原因：用一次就走，绝不让上一轮的旧原因替下一轮说话。
+    private func takeHostInterruption() -> ResidentChatTurn.Interruption? {
+        defer { pendingHostInterruption = nil }
+        return pendingHostInterruption
+    }
+
     /// 停止：结束当前 run 的自主行动，并把自主续办标记为"被用户停止"。
     /// 语义边界（与任务级的 `autoContinuationPaused` 分工不同）：
     /// - 作用范围是本循环实例的**当前 run 与后续自主轮**，不是该任务的永久契约；
@@ -983,8 +1107,7 @@ final class ResidentAgentLoop {
     /// - 解除是一个明确动作：人类在界面上的"恢复"（`resumeAutonomyByUser`）
     ///   或本轮人类明确要求恢复（`update_resident_intent(resume_paused_intent:)`）。
     /// 只有真实用户停止（界面上的停止控件）才走这里；宿主自身的回收走 `cancel()`。
-    func stop() {
-        cancelCurrentRun(reason: .userStop)
+    func stop() {        cancelCurrentRun(reason: .userStop)
     }
 
     /// 宿主取消本轮但**不**声明"用户停止过"：换空间、退出、自主可用性回收、
@@ -1016,6 +1139,9 @@ final class ResidentAgentLoop {
 
     private func cancelCurrentRun(reason: CancellationReason) {
         let stopAutonomy = reason == .userStop
+        // 循环自己回收的这一轮**不会**经过 `finishIfReady`（`activeRunID` 立刻清零），
+        // 所以宿主写下的"为什么停下"在这里也必须丢掉，免得留给以后某一轮。
+        pendingHostInterruption = nil
         // 一次取消只**声明**这次取消是不是用户停止：`.userStop` 记下用户意图，
         // `.system` 只是回收本轮，既不伪造用户停止，也不替用户解除已有的停止
         // （"取消这一轮"从来不等于"恢复自主"）。
@@ -1347,6 +1473,9 @@ final class ResidentAgentLoop {
         // 回调（onReply/onFailure）里 activeRunIsBackground 已清零，先把本轮归属
         // 留给宿主读取，后台回合才不会在回调里被误当成用户回合抢开聊天。
         lastFinishedRunWasBackground = wasBackground
+        // 本轮的"停下"结论与"失败"结论互斥：先清，再由下面唯一那个分支写。
+        lastFinishedTurnWasInterrupted = false
+        lastFinishedTurnInterruption = nil
         let startIntent = runStartIntent
         let silentAllowed = controlledRunID == runID
         let continuationIDs = activeRunContinuationIDs
@@ -1391,7 +1520,14 @@ final class ResidentAgentLoop {
                 // 边界执行一次，不重复计数。空回复不是进展：后台轮次同样转入休息，
                 // 避免过期或续写的期限在每次 tick 重试同样的空结果。
                 discardFailedEventAcknowledgement(eventIDs: eventIDs)
-                reportFailure("居民本轮没有返回内容或安排等待", submissions: submissions)
+                // 但"空回复"也可能是**被中止**的中止面（DSH 的 `turn/end {aborted}`
+                // 在 ACP 上映射成 `end_turn`，于是 abort 会以空回复到达）：宿主已经
+                // 写明"是我停的这一轮"时，它按中止收尾，绝不按失败说"未送达"。
+                if let interruption = takeHostInterruption() {
+                    settleInterrupted(submissions: submissions, interruption: interruption)
+                } else {
+                    reportFailure("居民本轮没有返回内容或安排等待", submissions: submissions)
+                }
                 if wasBackground { restUntilTrigger = true }
             }
             if !reply.isEmpty { onReply(reply) }
@@ -1402,11 +1538,26 @@ final class ResidentAgentLoop {
             // 上报一次。迟到的失配完成不会进入 finishIfReady，因此这里绝不重复计数
             // 或上报。连续失败不得重新触发节奏或过期/续写的自主期限；宿主仍可重投
             // 未确认事件（到达即清除休息），新的用户请求也仍然执行。
-            if !(error is CancellationError) {
+            //
+            // **中止 ≠ 投递失败**（真机 2026-10-02 的缺陷就是这两件事被混成一句）：
+            // - `CancellationError`：宿主自己把这一轮停了（更新的指令超车 / 进入装修 /
+            //   换空间）。以前这里什么都不报，回合永远停在"已发出，等待回应…"，
+            //   而输入框里也不会拿到草稿。现在按**具名中止**收尾，并走同一条回填。
+            // - `ResidentTurnRefusal`：宿主压根没把这一轮发出去（面板正开着）。
+            // - 其它才是真的没送到（连接/运行时/传输失败）⇒ 保持原有失败口径。
+            if error is CancellationError {
+                settleInterrupted(submissions: submissions,
+                                  interruption: takeHostInterruption() ?? .newerInstruction)
+            } else if let refusal = error as? ResidentTurnRefusal {
+                settleInterrupted(submissions: submissions, interruption: .notSent(refusal.refusalNotice))
+            } else {
                 reportFailure(error.localizedDescription, submissions: submissions)
             }
             if wasBackground { restUntilTrigger = true }
         }
+        // 用不上就丢掉：一个"为什么被停下"的原因只属于**它那一刻**在飞的那一轮，
+        // 绝不能让它在后面某一轮（尤其是一次空回复）里替宿主说话。
+        pendingHostInterruption = nil
         onChange()
         persistMemorySnapshot()
         drainUserMessages()
@@ -1472,6 +1623,29 @@ final class ResidentAgentLoop {
         // 回滚后排队的人类消息立即以前台轮次执行，且旧引导任务已取消，不会写入
         // 未发生的后台轮次。
         drainUserMessages()
+    }
+
+    /// 宿主自己把这一轮停下了：写进可见历史的是**具名原因**，不是失败口径。
+    ///
+    /// 与 `reportFailure` 的分工是这次修复的核心：
+    /// - 这一条只说"你紧接着的下一步把这一轮停下了 / 这一轮没有发给居民"，原因由
+    ///   真正做那件事的一方给出（`ResidentChatTurn.Interruption`）；
+    /// - `reportFailure` 保留给**真的没送到**（连接/运行时/传输失败），只有它才可以说
+    ///   "未送达"。
+    /// 两条都走同一条"把草稿还给输入框"的回填（`onInterrupted` / `onFailure`），
+    /// 所以用户永远还能重发。
+    private func settleInterrupted(submissions: [Message], interruption: ResidentChatTurn.Interruption) {
+        lastFinishedTurnWasInterrupted = true
+        lastFinishedTurnInterruption = interruption
+        let text = ResidentChatTranscriptLine.interruptedText(interruption)
+        onInterruption(submissions.compactMap(\.submissionID), interruption)
+        // Composers prepend restored submissions ahead of the current draft.
+        // 关掉面板/换空间之后草稿仍要回到输入框（`!stopped` 不能挡：用户停止正是
+        // 最需要拿回草稿的那一次）。
+        for submission in submissions.reversed() {
+            guard !invalidated else { break }
+            submission.onInterrupted(text)
+        }
     }
 
     private func reportFailure(_ message: String, submissions: [Message]) {

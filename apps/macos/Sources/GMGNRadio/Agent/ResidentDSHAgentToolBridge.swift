@@ -370,6 +370,77 @@ public enum ResidentDSHOriginalSchemaValidator {
         return nil
     }
 
+    // MARK: - 拒绝回执的「可行动」那一半
+
+    /// 参数被拒时，回执里补上**该怎么改**：哪个参数、允许什么取值、类型是什么、说明怎么写。
+    ///
+    /// 铁律：这里**只加说明**。裁决（接受 / 拒绝）与 `reason` 一个字不变，`allowedSchemaKeys`
+    /// 一个键都不放宽；取值表与说明都**读工具自己的 schema**，所以不存第二份、也不可能分叉。
+    /// 读不出东西（路径里没有参数名、schema 里没这个属性且不是"未声明"）就返回 `nil`，
+    /// 回执退化成原来那一句 —— 宁可少说，绝不猜。
+    ///
+    /// 真机 2026-10-02：`hold_prop` 两次被挡回，回执只有
+    /// `$.slot: 值不在允许的 enum 内` / `$: 缺少必需属性 layout_revision` 这种"说了哪儿错、
+    /// 没说该怎么改"的话，agent 只能瞎试（去掉参数再试、撞上另一条）。对治就是这里。
+    ///
+    /// ⚠️ 只给 `.invalid`（**调用方的参数**不对）用。`.schemaUnsupported` 是**工具自己的
+    /// schema** 坏了，agent 改参数也修不好 —— 那种情况绝不给出"改参数"的指路，免得把它引偏。
+    public static func actionableGuidance(reason: String, originalSchemaJSON: Data) -> String? {
+        guard let schema = decodeJSONObject(originalSchemaJSON),
+              let properties = schema["properties"] as? [String: Any],
+              let parameter = offendingParameter(in: reason) else { return nil }
+        let required = ((schema["required"] as? [String]) ?? []).sorted()
+        var pieces: [String] = []
+        guard let propertySchema = properties[parameter] as? [String: Any] else {
+            // 未声明的属性：告诉他这个工具到底接受哪些参数、哪些是必填。
+            guard reason.contains("未声明属性") else { return nil }
+            pieces.append("本工具只接受这些参数：\(properties.keys.sorted().joined(separator: " / "))")
+            pieces.append("必填：\(required.isEmpty ? "无" : required.joined(separator: " / "))")
+            return "该怎么改：" + pieces.joined(separator: "；") + "。"
+        }
+        if reason.contains("缺少必需属性") { pieces.append("补上必填参数 \(parameter)") }
+        if let allowed = propertySchema["enum"] as? [String], !allowed.isEmpty {
+            pieces.append("\(parameter) 允许取值：\(allowed.joined(separator: " / "))")
+        }
+        if let type = propertySchema["type"] as? String {
+            pieces.append("\(parameter) 的类型是 \(type)")
+        } else if let types = propertySchema["type"] as? [String], !types.isEmpty {
+            pieces.append("\(parameter) 的类型是 \(types.joined(separator: "/"))")
+        }
+        if let description = propertySchema["description"] as? String, !description.isEmpty {
+            pieces.append("说明：\(description)")
+        }
+        guard !pieces.isEmpty else { return nil }
+        let sentence = "该怎么改：" + pieces.joined(separator: "；")
+        return sentence.hasSuffix("。") ? sentence : sentence + "。"
+    }
+
+    /// 拒绝回执的一句话：原始那句 + 可行动的那一半（读不出来就原样返回，绝不编）。
+    public static func refusalMessage(_ base: String, reason: String, originalSchemaJSON: Data) -> String {
+        guard let guidance = actionableGuidance(reason: reason, originalSchemaJSON: originalSchemaJSON) else {
+            return base
+        }
+        return "\(base) \(guidance)"
+    }
+
+    /// 从校验器的 reason 里取出**被拒的那个参数名**。
+    ///
+    /// reason 的形状只有两种（都在本文件里生成）：
+    ///   · 带路径：`$.slot: 值不在允许的 enum 内` / `$.destination.surface_ids: …`；
+    ///   · 顶层：`$: 缺少必需属性 layout_revision` / `$: 出现未声明属性 evil`。
+    private static func offendingParameter(in reason: String) -> String? {
+        if let range = reason.range(of: "缺少必需属性 ") { return token(after: range.upperBound, in: reason) }
+        if let range = reason.range(of: "出现未声明属性 ") { return token(after: range.upperBound, in: reason) }
+        guard reason.hasPrefix("$.") else { return nil }
+        let key = reason.dropFirst(2).prefix { $0 != "." && $0 != ":" && $0 != "[" }
+        return key.isEmpty ? nil : String(key)
+    }
+
+    private static func token(after index: String.Index, in text: String) -> String? {
+        let token = text[index...].prefix { !$0.isWhitespace && $0 != ":" && $0 != "，" && $0 != "。" }
+        return token.isEmpty ? nil : String(token)
+    }
+
     private static func declaredTypes(_ schemaObject: [String: Any], path: String) -> Verdict? {
         guard let type = schemaObject["type"] else {
             return .unsupported("\(path): 缺少 type")
@@ -563,9 +634,16 @@ public enum ResidentDSHAgentToolCallClassifier: Sendable {
             return .toolError(payload: ResidentDSHAgentToolResultJSON.typedPayload(
                 ok: false,
                 code: "invalid_arguments",
-                message: "工具参数未通过原 schema 校验：\(reason)"
+                // 回执要**可行动**：说清哪个参数、允许什么取值、该怎么改（读工具自己的 schema）。
+                message: ResidentDSHOriginalSchemaValidator.refusalMessage(
+                    "工具参数未通过原 schema 校验：\(reason)",
+                    reason: reason,
+                    originalSchemaJSON: entry.originalSchemaJSON
+                )
             ))
         case let .schemaUnsupported(reason):
+            // schema 本身超出支持子集：这是**工具定义**的问题，不是调用方的参数问题 ——
+            // 所以**不**在这里教 agent 改参数（那只会把它引偏）。
             return .toolError(payload: ResidentDSHAgentToolResultJSON.typedPayload(
                 ok: false,
                 code: "schema_unsupported",

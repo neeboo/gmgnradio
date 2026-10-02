@@ -52,6 +52,11 @@ let loopMethods = ["private func ensureResidentLoop(", "private func synchronize
                    // presentResidentLoopFailure：失败文本仍写进同一可见表面，
                    // 只是后台回合不再替用户展开聊天。整套方法原文抽取，行为不变。
                    "private func presentResidentLoopFailure(",
+                   // 宿主自己把一轮**停下**（更新的指令超车 / 进入装修）时的具名出口：
+                   // 与失败出口分开，所以这里也编译**真实**实现 —— 才能证明它不会
+                   // 被写成"未送达"。它用 livingWorldLogger 留一行真机可查的原因，
+                   // 所以仿真宿主也提供同名 Logger（真的会写日志，不是空桩）。
+                   "private func presentResidentInterruption(ids: [UUID],",
                    // synchronizeResidentLoopPresentation 现在还会在空闲时给出
                    // 「一个后端都没装」的设置指引；指引文案与判断逻辑由
                    // test-first-use-guidance 专测，这里必须编译同一份真实实现，
@@ -92,6 +97,7 @@ let replyMethods = ["func beginAgentReply(", "func finishAgentReply(", "func sho
                     "func showFailureStatus(", "var residentStatusText"].map { declaration($0, in: controller) }.joined(separator: "\n")
 let harness = #"""
 import Foundation
+import os
 import WorldRuntime
 // No render host is created; the real vision contracts compile below, while
 // this conversation fixture deliberately has no available capture surface.
@@ -348,6 +354,9 @@ typealias RealConversationService = AgentConversationService
     // 这里保留同名同类型，让抽取出的调用点编译到真实实现上（不是空桩）。
     private var residentUnconfirmedNotice = ResidentUnconfirmedNoticePolicy()
     private var residentChatTranscript = ResidentChatTranscript()
+    // 生产把"这一轮为什么被停下"写进真机可查的一行日志（`livingWorldLogger`）；
+    // 仿真宿主给同名的真实 Logger，让抽编的那份实现照原样编译并真的写日志。
+    private let livingWorldLogger = Logger(subsystem: "ai.gmgn.radio", category: "Harness")
     private var residentTranscriptScopeKey: String { "harness-scope" }
     private func publishResidentTranscript() {}
     private func settleSilentResidentTurnIfNeeded() {}

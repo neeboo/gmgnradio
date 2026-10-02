@@ -386,6 +386,179 @@ struct FlatRoomAndTable: WorldPropSupportQuerying {
             ["object_id": swordID, "layout_revision": revision, "slot": "背后"], "hold-sword-back")
         check(context.state == afterHold, "同一个 requestID 重放绝不产生第二条（权威状态逐位不变）")
         check(context.state.layoutRevision == revision + 1, "重放不许再涨 layoutRevision")
+
+        // ===================================================================================
+        // 工具面契约：schema / 描述 / 实现**三者逐项一致**，而且宿主的原 schema 校验器真的接受它
+        // ===================================================================================
+        //
+        // 真机 2026-10-02：居民两次调 `hold_prop` 都被系统在**派发之前**挡回，两条回执
+        //   · `工具原 schema 含宿主校验器不支持的描述，拒绝执行：$.layout_revision: 含无法核验的约束键 minimum`
+        //   · `工具参数未通过原 schema 校验：$: 缺少必需属性 layout_revision`
+        // 是**同一个根因**：`layout_revision` 的 schema 里写了宿主校验器不认的键（`minimum`），
+        // 整条 schema 被判 `schema_unsupported` ⇒ 这个工具一次都执行不到；agent 去掉那个参数再试，
+        // 又撞上"缺少必需属性"。下面每一组都配了注入负对照（见文件末尾），判据必须真的会红。
+        let registry = try ResidentDSHFormalToolRegistry(entries: try human.tools.map { tool in
+            ResidentDSHFormalToolRegistry.Entry(canonicalName: tool.name,
+                originalSchemaJSON: try JSONSerialization.data(withJSONObject: tool.inputSchema, options: [.sortedKeys]))
+        })
+        func toolSchemaJSON(_ tool: ResidentWorldToolSession.AdditionalTool) throws -> Data {
+            try JSONSerialization.data(withJSONObject: tool.inputSchema, options: [.sortedKeys])
+        }
+        func argumentsJSON(_ arguments: [String: Any]) throws -> Data {
+            try JSONSerialization.data(withJSONObject: arguments, options: [.sortedKeys])
+        }
+        /// 按 schema 自己的声明造一份"最小合法参数"：enum 取第一个、数字取 0、字符串取占位。
+        func declaredSample(_ schema: [String: Any]) -> [String: Any] {
+            let properties = (schema["properties"] as? [String: Any]) ?? [:]
+            var arguments: [String: Any] = [:]
+            for (key, value) in properties {
+                guard let property = value as? [String: Any] else { continue }
+                if let allowed = property["enum"] as? [String] { arguments[key] = allowed.first ?? "x"; continue }
+                switch property["type"] as? String {
+                case "string": arguments[key] = "x"
+                case "integer": arguments[key] = 0
+                case "number": arguments[key] = 0.0
+                default: break
+                }
+            }
+            return arguments
+        }
+        func hostRejects(_ arguments: [String: Any], _ schema: Data) -> Bool {
+            switch ResidentDSHOriginalSchemaValidator.validate(
+                argumentsJSON: (try? argumentsJSON(arguments)) ?? Data(), against: schema) {
+            case .valid: return false
+            case .invalid, .schemaUnsupported: return true
+            }
+        }
+        for tool in human.tools {
+            let schema = try toolSchemaJSON(tool)
+            let sample = declaredSample(tool.inputSchema)
+            // ① **工具定义本身**必须被宿主校验器接受。`.schemaUnsupported` 就是"工具定义本身把
+            //    agent 挡回"（`minimum` / `pattern` / `format` … 一律 fail-closed，不当没看见）。
+            switch ResidentDSHOriginalSchemaValidator.validate(
+                argumentsJSON: try argumentsJSON(sample), against: schema) {
+            case .valid: break
+            case .invalid(let reason):
+                print("FAIL: \(tool.name) 连按自己 schema 造的最小合法参数都被宿主拒绝：\(reason)"); exit(1)
+            case .schemaUnsupported(let reason):
+                print("FAIL: \(tool.name) 的工具定义被宿主校验器挡回（schema_unsupported）—— agent 一次都执行不到：\(reason)"); exit(1)
+            }
+            let properties = (tool.inputSchema["properties"] as? [String: Any]) ?? [:]
+            let required = Set((tool.inputSchema["required"] as? [String]) ?? [])
+            for key in properties.keys {
+                // ② 必填 / 可选：schema 的 `required` 与**实现的判据**逐项一致，两边不许各说一套。
+                var without = declaredSample(tool.inputSchema); without.removeValue(forKey: key)
+                check(hostRejects(without, schema) == !tool.validate(without),
+                      "\(tool.name).\(key)：schema 说它\(required.contains(key) ? "必填" : "可省")（宿主\(hostRejects(without, schema) ? "拒绝" : "放行")），实现在缺它时\(tool.validate(without) ? "放行" : "拒绝") —— 必填/可选标注必须与实现一致")
+                // ③ 类型：同一个错类型的取值，schema 与实现必须**同时**拒绝（或同时放行）。
+                if let property = properties[key] as? [String: Any], let type = property["type"] as? String {
+                    var wrong = declaredSample(tool.inputSchema)
+                    wrong[key] = type == "string" ? 7 : "not-a-number"
+                    check(hostRejects(wrong, schema) == !tool.validate(wrong),
+                          "\(tool.name).\(key)：错类型的取值上 schema 与实现不一致（schema \(hostRejects(wrong, schema) ? "拒绝" : "放行")，实现 \(tool.validate(wrong) ? "放行" : "拒绝")）—— 类型声明必须与实现一致")
+                }
+            }
+            // ④ `layout_revision` 是**必填**（实现直接取用），而且描述必须教 agent"去哪儿读它"。
+            //    真机缺陷：描述里从没提这个参数，agent 以为可以不传。
+            if let revisionSchema = properties["layout_revision"] as? [String: Any] {
+                check(required.contains("layout_revision"),
+                      "\(tool.name) 的 layout_revision 是实现直接取用的必填参数，schema 不许把它标成可省")
+                let text = revisionSchema["description"] as? String ?? ""
+                check(text.contains("read_owned_props"),
+                      "\(tool.name) 的 layout_revision 必须在描述里说清「从 read_owned_props 回执里原样取」（实测「\(text)」）")
+            }
+        }
+        // ⑤ 描述要**教得会**：挂点那一族（hold / adjust / return）的描述必须点名自己的必填参数；
+        //    `hold_prop` 还要把**每一个**挂点取值、人话名与"不传会怎样"写出来。
+        for name in ["hold_prop", "adjust_held_prop_grip", "return_held_prop"] {
+            let tool = human.tools.first { $0.name == name }!
+            for key in (tool.inputSchema["required"] as? [String]) ?? [] {
+                check(tool.description.contains(key),
+                      "\(name) 的描述必须点名必填参数 \(key)（真机缺陷：描述里从没提 layout_revision，agent 以为可以不传）")
+            }
+        }
+        for value in PropAttachmentSlots.acceptedNames {
+            check(holdTool.description.contains(value),
+                  "hold_prop 的描述必须写出挂点取值 \(value)（注入漏掉取值 ⇒ FAIL）")
+            if let point = PropAttachmentSlots.resolve(name: value) {
+                check(holdTool.description.contains(PropAttachmentSlots.displayName(for: point)),
+                      "hold_prop 的描述必须写出 \(value) 的人话名「\(PropAttachmentSlots.displayName(for: point))」")
+            }
+        }
+        check(holdTool.description.contains("省缺") || holdTool.description.contains("不写就是"),
+              "hold_prop 的描述必须说清「不传 slot 会怎样」（省缺 = rightHand）")
+        let slotDescription = (slotSchema?["description"] as? String) ?? ""
+        check((slotDescription.contains("省缺") || slotDescription.contains("不写就是")) && PropAttachmentSlots.acceptedNames.allSatisfy { slotDescription.contains($0) },
+              "slot 参数自己的 description 也必须说清三个取值与省缺行为（实测「\(slotDescription)」）")
+
+        // ===================================================================================
+        // 传错参数：回执必须指出**该改哪个参数、改成什么**（桥那一层 + 宿主那一层）
+        // ===================================================================================
+        let badSlot = try await invoke(human, "hold_prop",
+            ["object_id": swordID, "layout_revision": context.state.layoutRevision, "slot": "头顶"], "hold-bad-receipt")
+        let badSlotPayload = payload(badSlot)
+        let badSlotMessage = (badSlotPayload["message"] as? String) ?? ""
+        check(badSlotPayload["code"] as? String == "invalid_arguments", "传错挂点必须走 invalid_arguments")
+        check(badSlotMessage.contains("slot") && PropAttachmentSlots.acceptedNames.allSatisfy { badSlotMessage.contains($0) },
+              "传错挂点的回执必须说清是哪个参数、允许哪些取值（实测「\(badSlotMessage)」）")
+        check(((badSlotPayload["how_to_fix"] as? String) ?? "").isEmpty == false,
+              "传错挂点的回执必须带 how_to_fix")
+        let missingRevision = try await invoke(human, "hold_prop", ["object_id": swordID, "slot": "back"], "hold-missing-revision")
+        let missingPayload = payload(missingRevision)
+        let missingMessage = (missingPayload["message"] as? String) ?? ""
+        check((missingPayload["missing"] as? [String]) == ["layout_revision"],
+              "缺 layout_revision 的回执必须点名 missing=[layout_revision]（实测 \(missingPayload["missing"] ?? "nil")）")
+        check(missingMessage.contains("layout_revision") && missingMessage.contains("read_owned_props"),
+              "缺参数的回执必须说清补哪个参数、去哪儿读（实测「\(missingMessage)」）")
+        // 宿主那一层（真机走的就是它）：同样必须可行动。
+        let hostBadVerdict = ResidentDSHAgentToolCallClassifier.verdict(
+            forCall: "protocol-bad-slot", declaredName: "gmgn_hold_prop",
+            argumentsJSON: try argumentsJSON(["object_id": swordID, "layout_revision": context.state.layoutRevision, "slot": "头顶"]),
+            registry: registry)
+        guard case let .toolError(hostBadPayload) = hostBadVerdict else {
+            print("FAIL: 传错挂点在宿主那一层居然被判成可执行"); exit(1)
+        }
+        let hostBadMessage = String(decoding: hostBadPayload, as: UTF8.self)
+        check(hostBadMessage.contains("slot") && PropAttachmentSlots.acceptedNames.allSatisfy { hostBadMessage.contains($0) },
+              "宿主拒绝回执必须说清是 slot、以及允许的取值（实测「\(hostBadMessage)」）")
+        let hostMissingVerdict = ResidentDSHAgentToolCallClassifier.verdict(
+            forCall: "protocol-missing-revision", declaredName: "gmgn_hold_prop",
+            argumentsJSON: try argumentsJSON(["object_id": swordID, "slot": "back"]), registry: registry)
+        guard case let .toolError(hostMissingPayload) = hostMissingVerdict else {
+            print("FAIL: 缺 layout_revision 在宿主那一层居然被判成可执行"); exit(1)
+        }
+        let hostMissingMessage = String(decoding: hostMissingPayload, as: UTF8.self)
+        check(hostMissingMessage.contains("layout_revision") && hostMissingMessage.contains("read_owned_props"),
+              "宿主「缺参数」回执必须说清补哪个参数、去哪儿读（实测「\(hostMissingMessage)」）")
+
+        // ===================================================================================
+        // 端到端（协议层）：agent 照描述发起的 gmgn_hold_prop 必须真的把剑挂到背上
+        // ===================================================================================
+        //
+        // 上面那条走的是桥的 `handle`；这一条从**宿主分类器**开始（真机就是这么进的）：分类器
+        // 读的就是工具自己的原 schema，所以"schema 里塞了宿主不认的键"会在这里就断掉。
+        check(!(try await invoke(human, "return_held_prop",
+            ["object_id": swordID, "layout_revision": context.state.layoutRevision], "return-sword-for-protocol")).isError,
+              "协议层这一条要先空手（把剑放回去）")
+        check(context.state.heldProp == nil, "放回之后手里确实空了")
+        let protocolRevision = context.state.layoutRevision
+        guard case let .execute(protocolCall) = ResidentDSHAgentToolCallClassifier.verdict(
+            forCall: "protocol-hold-back", declaredName: "gmgn_hold_prop",
+            argumentsJSON: try argumentsJSON(["object_id": swordID, "layout_revision": protocolRevision, "slot": "back"]),
+            registry: registry) else {
+            print("FAIL: 照描述发起的 gmgn_hold_prop 没通过宿主原 schema 校验（工具定义本身把 agent 挡回了）"); exit(1)
+        }
+        let protocolTool = human.tools.first { $0.name == protocolCall.canonicalName }!
+        let protocolHold = await protocolTool.handle(protocolCall.callID, protocolCall.argumentsJSON)
+        check(!protocolHold.isError,
+              "照描述调用 gmgn_hold_prop 必须成功（实测「\(String(decoding: protocolHold.resultJSON, as: UTF8.self))」）")
+        check(context.state.heldProp?.objectID == swordID && context.state.heldProp?.hand == .back,
+              "协议层一条走通：权威 heldProp.hand == back")
+        check(context.state.layoutRevision == protocolRevision + 1, "协议层一次挂载 layoutRevision 只 +1")
+        let protocolState = context.state
+        _ = await protocolTool.handle(protocolCall.callID, protocolCall.argumentsJSON)
+        check(context.state == protocolState && context.state.layoutRevision == protocolRevision + 1,
+              "协议层同一个 callID 重放绝不产生第二条（权威逐位不变、revision 不再涨）")
         print("PASS: \(checks) resident prop tool checks")
     }
 }
@@ -413,7 +586,11 @@ let worldRuntimeFlags = worldRuntimeHarnessFlags()
 let objects=Array(worldRuntimeFlags.dropFirst(2))
 /// 编译内层程序（生产源码 / 注入副本共用同一条路）。
 func buildHarness(bridgePath:String,executable:URL)throws->Int32{
-    try run("/usr/bin/swiftc",["-j1","-parse-as-library","-I",worldRuntimeFlags[1],sources.appendingPathComponent("Agent/WorldAgentContext.swift").path,sources.appendingPathComponent("Presence/ResidentPropPlacementService.swift").path,root.appendingPathComponent("tools/fixtures/PropAttachmentPointShim.swift").path,sources.appendingPathComponent("Presence/PropGripInference.swift").path,sources.appendingPathComponent("Presence/PropAttachmentSlot.swift").path,sources.appendingPathComponent("Presence/ResidentOwnershipProjection.swift").path,bridgePath,root.appendingPathComponent("tools/fixtures/ResidentPropHoldLimitShim.swift").path,file.path,"-o",executable.path]+objects)
+    try run("/usr/bin/swiftc",["-j1","-parse-as-library","-I",worldRuntimeFlags[1],sources.appendingPathComponent("Agent/WorldAgentContext.swift").path,sources.appendingPathComponent("Presence/ResidentPropPlacementService.swift").path,root.appendingPathComponent("tools/fixtures/PropAttachmentPointShim.swift").path,sources.appendingPathComponent("Presence/PropGripInference.swift").path,sources.appendingPathComponent("Presence/PropAttachmentSlot.swift").path,sources.appendingPathComponent("Presence/ResidentOwnershipProjection.swift").path,bridgePath,root.appendingPathComponent("tools/fixtures/ResidentPropHoldLimitShim.swift").path,
+    // 工具面那一段断言要的是**真的宿主校验器**（`ResidentDSHOriginalSchemaValidator`），
+    // 不是它的第二份抄写：原 schema 被挡回（真机 2026-10-02 `minimum`）必须由本文件编出的
+    // 生产文件自己回答。它自包含（只依赖 Foundation），可以直接编进来。
+    sources.appendingPathComponent("Agent/ResidentDSHAgentToolBridge.swift").path,file.path,"-o",executable.path]+objects)
 }
 /// 跑内层程序并**收走**它的输出。负对照那两次跑必须收走：注入之后内层程序会打自己的
 /// `FAIL:` 行 —— 那是**注入生效的证据**，不是这次门禁失败。让它直接落到 stdout 上，
@@ -480,4 +657,59 @@ guard hardcodedRun.status != 0 else{
 }
 let hardcodedFirstFailure=hardcodedRun.output.split(separator:"\n").first{ $0.hasPrefix("FAIL") }.map(String.init) ?? "（注入之后红了，但没有 FAIL 行）"
 print("[负对照] 把挂点写死成默认的右手（用户选的挂点被盖住）⇒ 红：\(hardcodedFirstFailure)")
+// ---- 工具面那四条判据各自的注入负对照 ----
+//
+// 规矩与上面两条一样：注入点在**源码副本**上做手术，生产源码一个字都不动；注入点失效
+// （找不到那一句）与"注入之后居然还绿"都算门禁失败。红的原话必须打出来 —— 一个"从不 FAIL"
+// 的门禁等于没有门禁。
+func negativeControl(_ label:String, from source:String, replacing:String, with replacement:String,
+                     fileName:String) throws {
+    let mutated = source.replacingOccurrences(of: replacing, with: replacement)
+    guard mutated != source else {
+        print("FAIL: 负对照的前提没了（\(label)）：生产源码里找不到要注入的那一句")
+        exit(1)
+    }
+    let mutatedBridge = temporary.appendingPathComponent(fileName)
+    try mutated.write(to: mutatedBridge, atomically: true, encoding: .utf8)
+    let mutatedExe = temporary.appendingPathComponent("test-\(fileName)")
+    guard try buildHarness(bridgePath: mutatedBridge.path, executable: mutatedExe) == 0 else {
+        print("FAIL: 负对照的注入副本编不过（\(label)：注入点写坏了？）")
+        exit(1)
+    }
+    let mutatedRun = try runCapturing(mutatedExe.path)
+    guard mutatedRun.status != 0 else {
+        print("FAIL: 负对照失败：\(label) 之后判据居然还绿")
+        exit(1)
+    }
+    let first = mutatedRun.output.split(separator: "\n").first { $0.hasPrefix("FAIL") }.map(String.init) ?? "（注入之后红了，但没有 FAIL 行）"
+    print("[负对照] \(label) ⇒ 红：\(first)")
+}
+// ③ 把宿主校验器**不认**的约束键塞回 `layout_revision` 的 schema（真机 2026-10-02 的原样）：
+//    整条 schema 会被判 `schema_unsupported`，工具**一次都执行不到** ⇒「工具定义必须被宿主
+//    接受」与「协议层真的能把剑挂到背上」都必须红。
+try negativeControl("把 minimum 塞回 layout_revision 的 schema（真机那一次）",
+    from: productionBridgeSource,
+    replacing: "properties[\"layout_revision\"] = [\"type\": \"integer\",",
+    with: "properties[\"layout_revision\"] = [\"minimum\": 0, \"type\": \"integer\",",
+    fileName: "ResidentPropToolBridge.minimum.swift")
+// ④ 描述里漏掉一个挂点取值（waist）⇒「描述要教得会」必须红。
+try negativeControl("hold_prop 的描述漏掉挂点取值 waist",
+    from: productionBridgeSource,
+    replacing: "**挂点由 slot 决定，可省**：取值只有 \\(Self.slotChoicesText)",
+    with: "**挂点由 slot 决定，可省**：取值只有 rightHand（右手） / back（背后）",
+    fileName: "ResidentPropToolBridge.slottext.swift")
+// ⑤ 把传错参数的回执改回**笼统错误**（真机第二次那种"没说该怎么改"）⇒
+//    「传错参数的回执指出该怎么改」必须红。
+try negativeControl("把可行动的回执改回笼统错误",
+    from: productionBridgeSource,
+    replacing: "return result(Self.invalidArgumentsReceipt(verdict, name: name), error: true)",
+    with: "return result([\"ok\": false, \"code\": \"invalid_arguments\", \"message\": \"摆放参数无效，请查询当前物件和支撑面。\"], error: true)",
+    fileName: "ResidentPropToolBridge.generic.swift")
+// ⑥ 把其实**可省**的 `slot` 标成必填（"必填设置过严"那一种错）⇒
+//    「必填/可选标注与实现一致」必须红。
+try negativeControl("把可省的 slot 标成必填",
+    from: productionBridgeSource,
+    replacing: "\"required\": properties.keys.filter { !(name == \"hold_prop\" && $0 == \"slot\") }.sorted(),",
+    with: "\"required\": properties.keys.sorted(),",
+    fileName: "ResidentPropToolBridge.required.swift")
 exit(0)

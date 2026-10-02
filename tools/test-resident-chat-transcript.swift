@@ -68,6 +68,18 @@ let wiringChecks: [(Bool, String)] = [
      "the host marks a turn delivered only after the reply is shown"),
     (appSource.contains("residentChatTranscript.markFailed("),
      "the host marks a turn failed at the real turn-failure boundary"),
+    (appSource.contains("residentChatTranscript.markInterrupted("),
+     "the host marks a host-stopped turn interrupted instead of failed"),
+    (loopSource.contains("settleInterrupted(") && loopSource.contains("if error is CancellationError"),
+     "the loop separates a host cancellation from a real delivery failure"),
+    (loopSource.contains("as? ResidentTurnRefusal"),
+     "a turn the host never sent (panel open) is not reported as a delivery failure"),
+    (loopSource.contains("func noteHostInterruption(")
+        && appSource.contains("noteHostInterruption(.hostAction(\"进入了装修\"))"),
+     "the host writes the concrete reason before it stops an in-flight turn"),
+    (appSource.contains("onInterrupted: { [weak self, weak loop] text in")
+        && appSource.contains("restoreResidentSubmission(submission, notice: text)"),
+     "an interrupted turn still returns its text/images to the input box"),
     (appSource.contains("residentChatTranscript.cancelPendingTurns()"),
      "an explicit stop closes pending turns as cancelled"),
     (appSource.contains("residentChatTranscript.activate(scopeKey:"),
@@ -168,6 +180,57 @@ let base = Date(timeIntervalSince1970: 1_700_000_000)
                   $0.turnID == failed && $0.speaker == .notice
               }?.text,
               "failed backfill and cancellation are worded differently")
+
+        // 3c) 「宿主自己把这一轮停下」与「真的没送到」必须是**两句不同的话**。
+        //     真机 2026-10-02 16:56:03–07：面板连点两次「让居民去取」，每一轮都在
+        //     摆放面板开着时被 `ResidentPropHostError.editorOpen` 拒了，而界面套的是
+        //     失败口径 —— 于是"压根没发出去"被说成「未送达：…文字和图片已回到输入框…」，
+        //     面板那句"请去许愿机…"根本不在任何输入框里，后半句也是假的。
+        var interrupted = ResidentChatTranscript()
+        let superseded = UUID()
+        let refused = UUID()
+        interrupted.beginTurn(id: superseded, userText: "前一句话", at: base)
+        interrupted.markInterrupted(ids: [superseded], interruption: .newerInstruction)
+        interrupted.beginTurn(id: refused, userText: "请去许愿机把已经做好的「斧头」领回来。", at: base)
+        interrupted.markInterrupted(ids: [refused], interruption: .notSent("摆放面板正开着，这一条没有发给居民"))
+        check(interrupted.turns[0].delivery == .interrupted,
+              "a host-stopped turn is interrupted, not delivered")
+        let supersededNotice = interrupted.lines().first {
+            $0.turnID == superseded && $0.speaker == .notice
+        }?.text
+        check(supersededNotice == ResidentChatTranscriptLine.interruptedText(.newerInstruction),
+              "a superseded turn carries the newer-instruction notice")
+        check(supersededNotice?.contains("又下了一条指令") == true,
+              "a superseded turn says the newer instruction is why it stopped")
+        check(supersededNotice?.contains("未送达") == false,
+              "a superseded turn must not claim it was undelivered")
+        check(supersededNotice?.contains("回到输入框") == true,
+              "a superseded turn still returns the text to the input box")
+        let refusedNotice = interrupted.lines().first {
+            $0.turnID == refused && $0.speaker == .notice
+        }?.text
+        check(refusedNotice?.contains("摆放面板正开着") == true,
+              "a refused turn names the real reason instead of blaming delivery")
+        check(refusedNotice?.contains("未送达") == false,
+              "a turn that was never sent must not say undelivered either")
+        check(refusedNotice?.contains("回到输入框") == false,
+              "a turn that was never sent must not claim the text went back to the input box")
+        check(ResidentChatTranscriptLine.failedText.contains("未送达")
+                && !ResidentChatTranscriptLine.cancelledText.contains("未送达")
+                && !ResidentChatTranscriptLine.interruptedText(.newerInstruction).contains("未送达"),
+              "未送达 is reserved for a real delivery failure; cancelled/interrupted say something else")
+        let distinctNotices = Set([
+            ResidentChatTranscriptLine.failedText,
+            ResidentChatTranscriptLine.cancelledText,
+            ResidentChatTranscriptLine.interruptedText(.newerInstruction),
+            ResidentChatTranscriptLine.interruptedText(.notSent("摆放面板正开着，这一条没有发给居民")),
+        ])
+        check(distinctNotices.count == 4,
+              "failed / cancelled / interrupted / never-sent are four different sentences")
+        // 已收尾的回合不被迟到的中止改写（与失败/取消同一条纪律）。
+        interrupted.markInterrupted(ids: [superseded], interruption: .userStopped)
+        check(interrupted.turns[0].interruption == .newerInstruction,
+              "a settled turn keeps its original reason; a late interruption does not rewrite it")
 
         // 3b) 获准的静默完成：不是永久等待、不是失败、不是取消。
         var silent = ResidentChatTranscript()

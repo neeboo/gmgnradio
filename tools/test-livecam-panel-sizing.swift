@@ -41,10 +41,18 @@ let dependencies = "import SwiftUI\nimport Observation\n"
     // 表面口径一致）与系统消息入口按钮（AppKit，@MainActor）。此前缺失时编译器只会
     // 报 "cannot find type" 并连带退化成 "cannot infer contextual base"，因此必须把
     // 真实声明补进抽取清单，而不是放宽或删除任何断言。
+    // `ResidentChatTranscriptLine.interruptedText` 收的是 `ResidentChatTurn.Interruption`
+    // （"这一轮为什么被停下"的具名原因），所以回合声明也要一起抽进来。
+    + declaration("struct ResidentChatTurn:", in: try read("Agent/ResidentAgentLoop.swift")) + "\n"
     + declaration("struct ResidentChatTranscriptLine:", in: try read("Agent/ResidentAgentLoop.swift")) + "\n@MainActor\n"
     + declaration("final class ResidentSystemMailBadgeButton: NSView {", in: try read("Presence/ResidentSystemInboxUI.swift")) + "\n@MainActor\n@Observable\n"
     + declaration("final class AgentSpeechStatusStore", in: try read("Agent/AgentSpeech.swift")) + "\n@MainActor\n"
-    + declaration("struct ResidentSpeechErrorNotice:", in: try read("VisualEngine/StageOverlayView.swift")) + "\n@MainActor\n"
+    + declaration("struct ResidentSpeechErrorNotice:", in: try read("VisualEngine/StageOverlayView.swift")) + "\n"
+    // 「许愿任务」那一块**什么时候占屏幕**的判据（`enum WishMachineTaskPrompt`）就在
+    // `WishMachineTaskStatusView` 上面，而视图现在**经它**过滤（唯一一处判据）。抽声明是
+    // **逐条**抽的，所以它必须一起抽进来 —— 否则这里会报 "cannot find 'WishMachineTaskPrompt'"
+    // 而把那一条断言整个编译掉。**不许**为了让编译过而把视图改回内联判据。
+    + declaration("enum WishMachineTaskPrompt", in: try read("VisualEngine/StageOverlayView.swift")) + "\n@MainActor\n"
     + declaration("struct WishMachineTaskStatusView:", in: try read("VisualEngine/StageOverlayView.swift"))
 let harness = #"""
 import AppKit

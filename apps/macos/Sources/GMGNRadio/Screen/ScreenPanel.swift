@@ -1,14 +1,19 @@
+// 已从产品界面移除（用户要求：左下角那块电视面板不应该出现）；保留代码供将来用别的入口。
 import SwiftUI
 
-/// 电视面板：**开关 / 换片 / 标定**，以及"这块屏幕的几何是哪来的"。
+/// 电视面板：**放 / 停 / 换片 / 调整屏幕范围**，以及"这块屏幕的范围是哪来的"。
 ///
 /// 三条纪律写在这个视图里，不是写在注释里：
-/// - 几何出处是 `缺省` 或 `推断` 时，**必须**把 `note` 原文显示出来 ——
-///   "屏幕位置是猜的"这句话要看得见，不能只活在日志里；
-/// - 几何给不出来时显示**具名原因**，并且把"标定"三个输入放在同一行，
-///   让用户能当场把缺的那一级补上；
+/// - 面板上**只有人话**：这台叫什么、屏幕范围是自动认出来的还是你标定的、能做什么。
+///   出处原话（法向 / 面积 / 格数 / 毫秒）是**工程口径**，留在
+///   `WorldScreenSnapshot.note` / `.occlusionText` 那条线上（日志 `subsystem = ai.gmgn.radio`
+///   与 agent 工具），**不进这里** —— 真机 2026-10-02 用户原话：「什么玩意儿」，
+///   以及上一轮同一句：「不要搞为什么然后给展开折叠，普通人看得懂吗，里面一堆 key-value 的东西」；
+/// - 几何给不出来时显示**人话的下一步**（点「调整屏幕范围」），而不是把具名原因摆出来；
 /// - 换片只有一个输入框，接受的三种输入（嵌入链接 / 观看链接 / 裸 id）在
 ///   placeholder 里说清楚；不在白名单里的输入会被**具体**拒绝。
+///
+/// 每一个字都来自 `ScreenPanelCopy`（纯函数、可离线逐字断言），这里不另写一句话。
 ///
 /// 宽度由宿主（`StageContentView`）约束成 340，与既有面板同规格 —— 这里不设宽度。
 struct ScreenPanelView: View {
@@ -29,7 +34,7 @@ struct ScreenPanelView: View {
             header
             ScreenContentField(draftURL: $draftURL)
             if store.snapshots.isEmpty {
-                Text("这个空间里还没有电视。生成一件电视（名字里带 TV / 屏幕 / 电视），或在下面标定一件物件。")
+                Text("这个空间里还没有电视。生成一件电视（名字里带 TV / 屏幕 / 电视），或者在下面手动指定一件物件。")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -49,7 +54,7 @@ struct ScreenPanelView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            Text("同时最多放 \(WorldScreenStore.maximumSimultaneousScreens) 块屏幕；看不见的屏幕会自动暂停（不掉登录态）。")
+            Text(ScreenPanelCopy.capacityLine(maximum: WorldScreenStore.maximumSimultaneousScreens))
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -100,9 +105,8 @@ struct ScreenPanelView: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 Text(snapshot.displayName).font(.system(size: 12, weight: .medium))
-                sourceBadge(snapshot.source)
                 Spacer()
-                Button("放") {
+                Button(ScreenPanelCopy.playActionTitle) {
                     Task {
                         isBusy = true
                         lastNotice = await store.playScreen(
@@ -114,12 +118,12 @@ struct ScreenPanelView: View {
                 .buttonStyle(.plain)
                 .font(.system(size: 11))
                 .disabled(isBusy)
-                Button("停") {
+                Button(ScreenPanelCopy.stopActionTitle) {
                     lastNotice = store.stopScreen(objectID: snapshot.objectID).message
                 }
                 .buttonStyle(.plain)
                 .font(.system(size: 11))
-                Button(snapshot.geometryIssue == nil ? "标定" : "标定…") {
+                Button(ScreenPanelCopy.adjustRangeActionTitle) {
                     calibratingObjectID = calibratingObjectID == snapshot.objectID
                         ? nil : snapshot.objectID
                     if snapshot.aspect > 0 {
@@ -129,21 +133,26 @@ struct ScreenPanelView: View {
                 .buttonStyle(.plain)
                 .font(.system(size: 11))
             }
-            // 几何出处原话：**必须显示**。缺省/推断时这就是"我们在猜"的公告。
-            Text(snapshot.note.isEmpty ? snapshot.stateText : snapshot.note)
+            // 这块屏幕的范围是哪来的 —— **一句人话**。工程口径的 `snapshot.note`
+            // （法向 / 面积 / m²）不进面板：它在日志与 agent 回执里。
+            Text(ScreenPanelCopy.screenRangeLine(
+                source: snapshot.source, hasGeometryIssue: snapshot.geometryIssue != nil
+            ))
                 .font(.system(size: 10))
                 .foregroundStyle(snapshot.source == .calibrated ? Color.secondary : Color.orange)
                 .fixedSize(horizontal: false, vertical: true)
-            if !snapshot.isPlaying {
-                Text(snapshot.stateText)
+            if let status = ScreenPanelCopy.statusLine(
+                for: snapshot.surfaceState, isPlaying: snapshot.isPlaying
+            ) {
+                Text(status)
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            // 前景遮挡的账：**看得见**才能被复核（"角色站在屏前"时这一行会从
-            // "全部可见"变成"挡了 N/M 格"）。
-            if let occlusionText = snapshot.occlusionText {
-                Text(occlusionText)
+            // 画面被挡住时**只说一句**、只在真被挡时说，而且说不出格数与毫秒
+            // （那种每帧都在变的数才是刷屏的来源）。工程的账在 `snapshot.occlusionText`。
+            if let occlusion = ScreenPanelCopy.occlusionLine(isBlocked: snapshot.isBlocked) {
+                Text(occlusion)
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -170,7 +179,7 @@ struct ScreenPanelView: View {
                     .textFieldStyle(.roundedBorder).frame(width: 56)
             }
             HStack(spacing: 6) {
-                Button("写进这件物件") {
+                Button("就按这个大小") {
                     lastNotice = store.calibrateScreen(
                         objectID: snapshot.objectID,
                         widthMeters: Float(widthDraft),
@@ -180,7 +189,7 @@ struct ScreenPanelView: View {
                     calibratingObjectID = nil
                 }
                 .buttonStyle(.plain).font(.system(size: 11))
-                Button("按尺寸自动推断") {
+                Button("让系统自己认") {
                     lastNotice = store.designateScreen(objectID: snapshot.objectID, size: nil).message
                     calibratingObjectID = nil
                 }
@@ -189,20 +198,6 @@ struct ScreenPanelView: View {
         }
         .padding(.top, 2)
     }
-
-    private func sourceBadge(_ source: WorldScreenSource?) -> some View {
-        let (text, colour): (String, Color) = switch source {
-        case .calibrated: ("标定", .green)
-        case .inferred: ("推断", .orange)
-        case .default: ("缺省", .red)
-        case nil: ("无几何", .red)
-        }
-        return Text(text)
-            .font(.system(size: 9, weight: .semibold))
-            .padding(.horizontal, 5).padding(.vertical, 1)
-            .background(colour.opacity(0.22), in: Capsule())
-            .foregroundStyle(colour)
-    }
 }
 
 /// 换片输入框单独抽出来，是为了让"接受哪三种输入"只有一处说法。
@@ -210,11 +205,8 @@ struct ScreenContentField: View {
     @Binding var draftURL: String
 
     var body: some View {
-        TextField(
-            "官方嵌入链接 / 观看链接 / 视频 id（YouTube、哔哩哔哩、Twitch）",
-            text: $draftURL
-        )
-        .textFieldStyle(.roundedBorder)
-        .font(.system(size: 11))
+        TextField(ScreenPanelCopy.contentPlaceholder, text: $draftURL)
+            .textFieldStyle(.roundedBorder)
+            .font(.system(size: 11))
     }
 }

@@ -145,6 +145,8 @@ final class WishMachineOutputRenderer {
             let extent = asset.worldBounds.max - asset.worldBounds.min
             let requested = output.targetHeightMeters
             let resolvedHeight: Float
+            /// 托盘预览要用的**逐轴**目标尺寸；nil = 等比（既有产物逐位不变）。
+            var resolvedSize: WorldVector3?
             if output.heightIsGenerationRequest {
                 // **有尺寸意图就按用户说的那根轴归一**（"一把 1.1 米的剑"= 最长边 1.1 m），
                 // 没有意图才退回今天的自动推断（细长物件按最长边）。两条路共用同一份策略、
@@ -154,11 +156,26 @@ final class WishMachineOutputRenderer {
                 let basisField: String
                 let basisMeters: Float
                 if let intent = output.sizeIntent, intent.isValid {
-                    resolution = WorldPropSizePolicy.intended(
-                        sourceExtent: .init(x: extent.x, y: extent.y, z: extent.z),
-                        axis: intent.axis.policyAxis, meters: Float(intent.meters))
+                    let worldExtent = WorldVector3(x: extent.x, y: extent.y, z: extent.z)
                     basisField = "size_intent.\(intent.axis.rawValue).meters"
                     basisMeters = Float(intent.meters)
+                    // **完整三轴**：三个数就是三个数（与入库那一处读**同一个裁决**
+                    // `dimensionsVerdict`，所以预览与最终产物不可能长得不一样）。
+                    // 形状差得太远时裁决是 `.shapeTooFar` ⇒ 这里**不拉**，退回单轴那一份
+                    // （可见的两条路由入库那一处说给用户）。
+                    if intent.mode == .dimensions, let millimeters = intent.millimeters,
+                       let spec = WorldPropSizeMillimeters(x: Float(millimeters.x),
+                                                           y: Float(millimeters.y),
+                                                           z: Float(millimeters.z)),
+                       case let .exact(exact) = WorldPropSizePolicy.dimensionsVerdict(
+                           sourceExtent: worldExtent, millimeters: spec) {
+                        resolution = exact
+                        resolvedSize = exact.size
+                    } else {
+                        resolution = WorldPropSizePolicy.intended(
+                            sourceExtent: worldExtent,
+                            axis: intent.axis.policyAxis, meters: Float(intent.meters))
+                    }
                 } else {
                     resolution = WorldPropSizePolicy.automatic(
                         sourceExtent: .init(x: extent.x, y: extent.y, z: extent.z),
@@ -184,7 +201,7 @@ final class WishMachineOutputRenderer {
             }
             let transform = try WishMachineOutputPlacement.transform(
                 minimum: asset.worldBounds.min, maximum: asset.worldBounds.max,
-                targetHeight: resolvedHeight, outlet: outlet
+                targetHeight: resolvedHeight, targetSize: resolvedSize, outlet: outlet
             )
             let calls = asset.drawCalls.map { GLTFDrawCall(mesh: $0.mesh, material: $0.material, modelMatrix: transform * $0.modelMatrix, skinPalette: $0.skinPalette) }
             let renderer = try GLTFRenderer(device: device)

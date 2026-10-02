@@ -977,8 +977,12 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
                 authorization: snapshot
             ))
         case let .invalid(reason):
-            return .refusal(code: "invalid_arguments", message: "工具参数未通过原 schema 校验：\(reason)")
+            // 回执要**可行动**：说清哪个参数、允许什么取值、该怎么改（读工具自己的 schema）。
+            return .refusal(code: "invalid_arguments", message: ResidentDSHOriginalSchemaValidator.refusalMessage(
+                "工具参数未通过原 schema 校验：\(reason)", reason: reason, originalSchemaJSON: schemaData))
         case let .schemaUnsupported(reason):
+            // schema 本身超出支持子集：这是**工具定义**的问题，不是调用方的参数问题 ——
+            // 所以**不**在这里教 agent 改参数（那只会把它引偏）。
             return .refusal(code: "schema_unsupported", message: "工具原 schema 含宿主校验器不支持的描述，拒绝执行：\(reason)")
         }
     }

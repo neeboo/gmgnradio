@@ -137,6 +137,8 @@ public enum WorldPropSizePolicy {
         case height
         /// 细长物件：按最长边归一。
         case longestEdge
+        /// **用户给了完整三轴**：目标尺寸逐轴等于他给的那三个数（`mode:"dimensions"`）。
+        case dimensions
         /// 夹到最长边上限。
         case clampedMaximum
         /// 夹到最长边下限。
@@ -144,16 +146,34 @@ public enum WorldPropSizePolicy {
     }
 
     public struct Resolution: Equatable, Sendable {
-        /// 世界里真实尺寸（等比于原始网格）。
+        /// 世界里真实尺寸。**这是唯一的权威**：碰撞盒/承托/摆放判据/渲染端读的都是它。
         public let size: WorldVector3
+        /// **逐轴**缩放比例 `size[i] / 原始网格跨度[i]`。
+        ///
+        /// 渲染端必须用**这一份**（而不是"一份等比"）：三轴意图下三个数可以不同，
+        /// 而它们与 `size` 是同一组数字的两种写法（`size[i] = 跨度[i] · scales[i]`）。
+        /// 三条等比的路（height / longestEdge / 自动推断）里三个分量逐位相同。
+        public let scales: WorldVector3
         public let basis: Basis
         /// 原始网格的 最长边 / 高度。
         public let aspectRatio: Float
-        /// 被夹取时**读得懂**的原因；没夹取时为 nil。
+        /// 被夹取 / 逐轴兑现时**读得懂**的原因；没有可说的时为 nil。
         public let reason: String?
         public var longestEdge: Float { WorldPropSizePolicy.longestEdge(of: size) }
-        public init(size: WorldVector3, basis: Basis, aspectRatio: Float, reason: String?) {
-            self.size = size; self.basis = basis; self.aspectRatio = aspectRatio; self.reason = reason
+        /// 这一份是不是等比（三个比例逐位相同）—— 渲染端据此走原来那一份等比矩阵。
+        public var isUniform: Bool {
+            scales.x == scales.y && scales.y == scales.z
+        }
+        public init(size: WorldVector3, scales: WorldVector3, basis: Basis,
+                    aspectRatio: Float, reason: String?) {
+            self.size = size; self.scales = scales; self.basis = basis
+            self.aspectRatio = aspectRatio; self.reason = reason
+        }
+        /// 等比那一份的便利构造：三个比例是同一个数。
+        public init(size: WorldVector3, scale: Float, basis: Basis,
+                    aspectRatio: Float, reason: String?) {
+            self.init(size: size, scales: WorldVector3(x: scale, y: scale, z: scale),
+                      basis: basis, aspectRatio: aspectRatio, reason: reason)
         }
     }
 
@@ -232,41 +252,114 @@ public enum WorldPropSizePolicy {
     /// `1443 x 862 x 302 mm`）。**轴序与朝向**（与守护进程 `SizeIntentMillimeters` 逐字相同）：
     /// `x` = 宽（左右）、`y` = 高（上下，本仓 up 钉死在 `±Y`）、`z` = 深（前后）。
     ///
-    /// ## 归一策略：按**最长边等比**，另外两维只当**期望值**
+    /// ## 契约语义（2026-10-02 改）：三个数就是三个数
     ///
-    /// 三根轴的**数字**都记在意图里（面板会逐位回读给用户），但**几何只按最长边等比缩放**：
+    /// 目标尺寸**严格等于** `(x/1000, y/1000, z/1000)` 米（逐轴）：`Resolution.size` 就是
+    /// 那三个数本身，缩放比例 `scales[i] = target[i] / sourceExtent[i]`。
     ///
-    /// - 渲染端只有**一份等比缩放**（`WishMachineOutputPlacement.transform` 三个轴的 scale
-    ///   是同一个值），所以世界里的 `size` 只可能是原始网格的等比像；
-    /// - 存一个非等比的 `size` 会让碰撞盒（同一个 `size` 派生）与画面**当场分叉** ——
-    ///   这正是 `uniformFactor`/`manualSize` 一路在拒绝的东西；
-    /// - 生成器的网格本来也不保证长宽比与用户说的规格一致，非等比"拉"到三轴只是把
-    ///   网格的错误变形伪装成"照做了"。
+    /// 旧行为（按最长边等比缩放，另外两维只写进 `reason` 当"期望值"）是这一处的现场缺陷：
+    /// 用户给了 `1443 × 862 × 302`，场景里只有 1.443 米那一维是对的 —— **另外两维根本没兑现**。
     ///
-    /// 于是：最长边 = 三轴里最大的那一维（1443 mm ⇒ 1.443 m），另外两维保持原始网格的比例，
-    /// 并且**在 `reason` 里明说它们是期望值**（不是悄悄丢掉）。用户要精确三轴时，正确做法是
-    /// 走**基础几何**那条路（`WorldPrimitiveTelevision`）：几何由我们按三轴拼出来，
-    /// bbox 天生就是 1.443 × 0.862 × 0.302。
+    /// 旧注释里那条拒绝理由（"渲染端只有一份等比缩放，非等比会让碰撞盒与画面分叉"）**已经被
+    /// 消掉**：渲染端现在按 `scales` 逐轴缩放（`ResidentPropPlacementMatrix.transform`
+    /// 的 `targetSize` 那一支），而碰撞盒/承托/摆放判据读的是**同一份** `WorldGeneratedProp.size`
+    /// —— 两处读同一组数字，分叉在结构上不可能。分叉只可能来自"两处各推一份尺寸"。
     ///
-    /// 之后同样只做一次统一的上下限夹取（越界给读得懂的原因，不静默）。
+    /// ## 这里只回答"是哪三个数"，不回答"要不要拉"
+    ///
+    /// 网格形状离目标太远时（立方体 → 扁平面板），逐轴拉会把贴图/细节拉扭。用户 2026-10-02
+    /// 的决定是：**照样拉到位** —— "素材 + 他的尺寸"就是他明确要的取舍；物件的形状与外观只来自
+    /// 生成，绝不拿手拼几何替代。偏离度由 `dimensionShapeDistortion` 算出来**只为说出来**
+    /// （拉了多少倍），不再决定要不要拉；`dimensionsVerdict` 因此只给出 `.exact` / `.unrealizable`。
+    ///
+    /// ## 夹取不再是夹取：要么逐位成立，要么具名拒绝
+    ///
+    /// 目标尺寸越界 ⇒ 返回 nil（调用方 fail-closed、可读地说出是哪一条判据、哪个数）。
+    /// 静默把 10 mm 放大到 20 mm 就是"你给的不是你要的"，与三轴语义直接矛盾。
+    /// 上界结构上不可达（契约上界 3000 mm 就是渲染上界 3 m）；下界可达（10–20 mm）。
     public static func intended(sourceExtent: WorldVector3, millimeters: WorldPropSizeMillimeters) -> Resolution? {
         guard isFinite(sourceExtent), sourceExtent.x > 0, sourceExtent.y > 0, sourceExtent.z > 0,
               millimeters.isValid else { return nil }
-        let longestMillimeters = millimeters.longestEdgeMillimeters
-        let targetMeters = longestMillimeters / 1000
-        guard let shape = shape(of: sourceExtent),
-              let resolution = clamp(shape: shape, scale: targetMeters / shape.longest, basis: .longestEdge)
+        let target = millimeters.meters
+        guard isFinite(target) else { return nil }
+        // 与单轴那条路**同一条**上下限（`minimumExtentMeters` / `maximumExtentMeters`）。
+        let longest = longestEdge(of: target)
+        guard longest.isFinite, longest >= minimumExtentMeters, longest <= maximumExtentMeters else {
+            return nil
+        }
+        let scales = WorldVector3(x: target.x / sourceExtent.x,
+                                  y: target.y / sourceExtent.y,
+                                  z: target.z / sourceExtent.z)
+        guard isFinite(scales), scales.x > 0, scales.y > 0, scales.z > 0 else { return nil }
+        let reason = "三轴尺寸**逐轴**兑现：\(millimetersText(millimeters)) 毫米 ⇒ "
+            + "\(meters(target.x)) × \(meters(target.y)) × \(meters(target.z)) 米"
+            + "（逐轴缩放 \(scalesText(scales))；源网格 "
+            + "\(meters(sourceExtent.x)) × \(meters(sourceExtent.y)) × "
+            + "\(meters(sourceExtent.z)) 米）。"
+        return Resolution(size: target, scales: scales, basis: .dimensions,
+                          aspectRatio: longestEdge(of: sourceExtent) / sourceExtent.y,
+                          reason: reason)
+    }
+
+    /// 逐轴比例的**形状偏离度** = 最大比例 / 最小比例。`1` = 完全等比（网格就是目标的形状）。
+    ///
+    /// 用途只有一个：把这个比值**说出来**（面板/回执可以告诉用户"素材被拉了多少倍"）。
+    /// 比值越大，贴图与细节被拉扭得越厉害 —— 但**它不再决定要不要拉**：形状歪了也逐轴拉到位
+    /// （"素材 + 他的尺寸"是用户 2026-10-02 明确要的取舍），绝不拿手拼几何替代。
+    ///
+    /// 返回 nil = 三轴意图本身就不成立（越界 / 非法），与 `intended(millimeters:)` 同一口径。
+    public static func dimensionShapeDistortion(
+        sourceExtent: WorldVector3, millimeters: WorldPropSizeMillimeters
+    ) -> Float? {
+        guard let resolution = intended(sourceExtent: sourceExtent, millimeters: millimeters)
         else { return nil }
-        // 把"另外两维只是期望值"写进 reason：这是本策略**必须说出来**的一句话。
-        // 不写出来，用户看到的就是"我说了三轴，场景里却只有最长边对"。
-        let others = millimeters.edges.filter { $0 != longestMillimeters }
-        let expected = others.map { meters(Float($0) / 1000) }.joined(separator: " × ")
-        let reason = "三轴尺寸按最长边等比归一：最长边 \(meters(targetMeters)) 米（你说的 "
-            + "\(millimetersText(millimeters)) 毫米里最长的那一维），另外两维（期望 "
-            + "\(expected) 米）保持原始网格的比例 —— 渲染端只有一份等比缩放，非等比会让碰撞盒与画面对不上。"
-        return Resolution(size: resolution.size, basis: resolution.basis,
-                          aspectRatio: resolution.aspectRatio,
-                          reason: [reason, resolution.reason].compactMap { $0 }.joined(separator: " "))
+        let values = [resolution.scales.x, resolution.scales.y, resolution.scales.z]
+        guard let low = values.min(), let high = values.max(), low > 0, low.isFinite, high.isFinite
+        else { return nil }
+        let ratio = high / low
+        return ratio.isFinite ? ratio : nil
+    }
+
+    /// 允许**逐轴**拉伸的上限（最大比例 / 最小比例）。超过它只说明"形状差得远，值得说出来"，
+    /// **不再**阻止逐轴拉伸（用户 2026-10-02 的决定：形状歪了也按他的三个数拉到位）；
+    /// `dimensionsVerdict` 不再拿它当门。
+    ///
+    /// 取值依据：网格的长宽高比与用户说的规格差到这个倍数时，最短那一维被拉长（或最长那一维
+    /// 被压扁）到肉眼可见 —— 贴图会被拉成条纹、细节会歪。真机那份生成器交回来的立方体
+    /// （`1.008 × 0.629 × 1.008`）对 `1443 × 862 × 302` 的偏离度是 **4.78**，正是"网格是立方体、
+    /// 你要的是扁平面板"那个例子。`2` 落在"轻微校正（换一张参考图重生成的网格常有 1.1–1.5
+    /// 的形状差，逐轴拉正看不出）"与"这明显是另一种形状"之间。
+    public static let perAxisStretchLimit: Float = 2
+
+    /// 三轴意图该**怎么兑现**的**唯一**一份裁决。入库（登记世界尺寸）与托盘（预览）
+    /// 读的是同一个裁决，所以"预览长得和最终产物不一样"在结构上不可能。
+    public enum DimensionVerdict: Equatable, Sendable {
+        /// 逐轴兑现：`Resolution.size` **就是**用户给的那三个数（米）。
+        case exact(Resolution)
+        /// **已不再返回**（2026-10-02 用户决定：形状差得远**也**逐轴拉到位；手拼几何这条路整个清掉）。
+        /// 保留 case 只为既有读者与穷尽匹配：`dimensionsVerdict` 只给出 `.exact` / `.unrealizable`。
+        case shapeTooFar(distortion: Float, limit: Float)
+        /// 三轴意图本身落不了地（三个数越界 / 低于可见下限 / 网格量不出跨度）：
+        /// 调用方必须**可见地**说明，不许当成"没有意图"退回单轴。
+        case unrealizable
+    }
+
+    /// 三轴意图 → 裁决。调用方只允许按这个裁决行事，不许自己再判一遍"要不要拉"。
+    public static func dimensionsVerdict(
+        sourceExtent: WorldVector3, millimeters: WorldPropSizeMillimeters
+    ) -> DimensionVerdict {
+        guard let resolution = intended(sourceExtent: sourceExtent, millimeters: millimeters)
+        else { return .unrealizable }
+        // 用户 2026-10-02 的产品决定（原话「不能再用集合拼了」）：物件的形状与外观**只**来自
+        // 生成（图 → 3D），生成器把形状做歪时**按他给的三维尺寸逐轴缩放到位** —— 素材会被
+        // 拉伸，那正是"素材 + 他的尺寸"这个取舍本身。于是这里**不再**返回 `.shapeTooFar`：
+        // 形状差得远**也**逐轴兑现，绝不拿一个手拼的替代品糊上去，也不再给"重新生成 / 用几何拼"
+        // 这种二选一。那个 case 保留只为既有读者与穷尽匹配，没有任何调用点会拿到它。
+        return .exact(resolution)
+    }
+
+    private static func scalesText(_ scales: WorldVector3) -> String {
+        "\(meters(scales.x)) × \(meters(scales.y)) × \(meters(scales.z))"
     }
 
     private static func millimetersText(_ millimeters: WorldPropSizeMillimeters) -> String {
@@ -313,7 +406,8 @@ public enum WorldPropSizePolicy {
         guard scale.isFinite, scale > 0 else { return nil }
         let size = WorldVector3(x: shape.extent.x * scale, y: shape.extent.y * scale, z: shape.extent.z * scale)
         guard isFinite(size), size.x > 0, size.y > 0, size.z > 0 else { return nil }
-        return Resolution(size: size, basis: basis, aspectRatio: shape.aspect, reason: reason)
+        return Resolution(size: size, scale: scale, basis: basis,
+                          aspectRatio: shape.aspect, reason: reason)
     }
 
     /// 用户手动改尺寸：把**最长边**设为目标值，等比缩放**当前**尺寸。

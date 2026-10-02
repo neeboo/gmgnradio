@@ -151,6 +151,7 @@
 		761481871644BCC5C68DF17C /* OrbMotionModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A9A0DF149EE2164BBDE40EB /* OrbMotionModelTests.swift */; };
 		763E6B11EDFEAE0C94AE33AD /* CandidatePoolBuilderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 29B18EF24D82A3E14E358738 /* CandidatePoolBuilderTests.swift */; };
 		76BBEAD957658757C0796FEC /* AgentSpeechTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAC9B7E070F14B0F816AE428 /* AgentSpeechTests.swift */; };
+		76D3369FE2BFBD6795A9663E /* ResidentPropTelevisionRepair.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B67F93D1EFD50C944F26D5A /* ResidentPropTelevisionRepair.swift */; };
 		798F3E554E519E59B853D0F4 /* WorldScreenProjection.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD53CFC01FF713A675960925 /* WorldScreenProjection.swift */; };
 		7A17C5E01AC43CD75E7C7195 /* OrbState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43F2D91E87ABAC0F51F8C126 /* OrbState.swift */; };
 		7B5FE2C2BD09CA693E0FE5D3 /* WorldAgentToolContract.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4979C002BFA7259332C1AF5A /* WorldAgentToolContract.swift */; };
@@ -421,6 +422,7 @@
 		49673EC0B6CB3CED267C02E9 /* AgentSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentSettingsView.swift; sourceTree = "<group>"; };
 		4979C002BFA7259332C1AF5A /* WorldAgentToolContract.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldAgentToolContract.swift; sourceTree = "<group>"; };
 		4A2303EC6757768CBCDC8C43 /* RemoteMotionLibraryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteMotionLibraryTests.swift; sourceTree = "<group>"; };
+		4B67F93D1EFD50C944F26D5A /* ResidentPropTelevisionRepair.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentPropTelevisionRepair.swift; sourceTree = "<group>"; };
 		4B883AB50613AABC30AE090C /* ResidentPropEditorState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentPropEditorState.swift; sourceTree = "<group>"; };
 		4BC287B276AB0F4EDFACFE51 /* PresencePackageStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresencePackageStore.swift; sourceTree = "<group>"; };
 		4C25006F47A0D72758A7B6B0 /* ProgramVisualDirector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgramVisualDirector.swift; sourceTree = "<group>"; };
@@ -1038,6 +1040,7 @@
 				F6D9D44D3F0366183C6571C0 /* ResidentPropPlacementService.swift */,
 				0CF4BBDAD919719A1DBF7F9E /* ResidentPropRenderer.swift */,
 				1952AEC89F2EB509261F9EB9 /* ResidentPropScene.swift */,
+				4B67F93D1EFD50C944F26D5A /* ResidentPropTelevisionRepair.swift */,
 				1F1ADE95832BAA10492DBF2F /* ResidentSystemInbox.swift */,
 				6922C4A5824C1A1AA82A0B41 /* ResidentSystemInboxStateStorage.swift */,
 				95B431CD9CEAAC171CD00F0F /* ResidentSystemInboxUI.swift */,
@@ -1622,6 +1625,7 @@
 				4112603D7E0222EA77CBF228 /* ResidentPropPlacementService.swift in Sources */,
 				20C8510B171A3F23D8C51635 /* ResidentPropRenderer.swift in Sources */,
 				3D797429E450227D21862C59 /* ResidentPropScene.swift in Sources */,
+				76D3369FE2BFBD6795A9663E /* ResidentPropTelevisionRepair.swift in Sources */,
 				91B55E583C0A274F29063E6F /* ResidentPropToolBridge.swift in Sources */,
 				D9CC285664E137376A3F8CCD /* ResidentScreenTools.swift in Sources */,
 				C04254A6FF945016763D8B48 /* ResidentStateClient.swift in Sources */,

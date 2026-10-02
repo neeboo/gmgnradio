@@ -55,4 +55,23 @@ enum WorldScreenFailure: Error, Equatable, Sendable {
             "嵌入被拒绝（\(reason)）。"
         }
     }
+
+    /// **面板上那一句**：同一件事说给普通人听。
+    ///
+    /// 与 `errorDescription` 是两个听众、不是两份真相：那一份是**工具与日志**口径
+    /// （要带 HTTP 码、要带 WebKit 给的原因，工程师照着它才能定位），这一份只有一句
+    /// "放不出来，大概因为什么"。真机 2026-10-02 用户原话：「不要搞为什么然后给展开折叠，
+    /// 普通人看得懂吗，里面一堆 key-value 的东西」—— 所以底层的 `reason` 不进面板。
+    var panelText: String {
+        switch self {
+        case .network:
+            "这台电视连不上网络（可能断网了）。"
+        case .httpStatus:
+            "对方没让放（有时候得先在画面里自己登录）。"
+        case .timeout:
+            "等了 20 秒还没打开（网络慢，或者页面在等登录）。"
+        case .blocked:
+            "这个视频不让嵌进来放。"
+        }
+    }
 }

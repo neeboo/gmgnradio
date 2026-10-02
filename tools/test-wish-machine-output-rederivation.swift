@@ -155,13 +155,18 @@ func rederivationProblems(descriptor: String, presentation: String,
     require(task.contains("status = \"可领取\""),
             "A3: 任务行不再有「可领取」这一档")
 
-    // ── A4：可领取 ⇒ 入库（三轴 → 基础几何平面电视；回执键幂等） ───────────────
-    require(app.contains("WorldPrimitiveTelevision(millimeters: spec)"),
-            "A4: 三轴尺寸没有接到基础几何平面电视（会退回生成网格）")
-    require(app.contains("WorldScreenFaceInference.rejection(size: meters, objectID: job.objectID) == nil"),
-            "A4: 板形判据没有作为「走基础几何」的门槛")
-    require(app.contains("try? WorldPrimitiveTelevision(millimeters: spec)"),
-            "A4: 基础几何那一条路的构造不见了")
+    // ── A4：可领取 ⇒ 入库（**物件一律来自生成网格**；回执键幂等）───────────────
+    //
+    // 用户 2026-10-02 的产品决定（原话「不能再用集合拼了」）：三轴尺寸**不再**改走任何手拼几何
+    // （`WorldPrimitiveTelevision` 已停用、产品路径零调用），而是按用户给的三个数**逐轴**兑现
+    // —— 素材会被拉伸，那正是"素材 + 他的尺寸"这个取舍本身。这里钉的是**产品路径**：
+    // 生成网格那条路必须在，而且一个几何拼构造点都不许有。
+    require(!app.contains("WorldPrimitiveTelevision("),
+            "A4: 产品路径又在构造手拼几何（用户要求物件一律来自他的素材生成）")
+    require(app.contains("let url = URL(fileURLWithPath: path)"),
+            "A4: 生成网格那条路不见了 —— 素材的外观 / 贴图 / 细节就没人用了")
+    require(app.contains("WorldPropSizePolicy.dimensionsVerdict("),
+            "A4: 三轴尺寸没有走唯一一份裁决（`dimensionsVerdict(`）")
     require(app.contains("requestID: \"claimed.\" + job.id.uuidString"),
             "A4: 入库回执键不再是 claimed.<jobID>（幂等身份没了）")
     require(app.contains(".register(asset.prop)"),
@@ -208,10 +213,10 @@ let injections: [Injection] = [
     Injection(name: "两者分叉（任务行不看托盘的现场结论）", file: presentationPath,
         old: "        if hostSentenceWins { return status }",
         new: "        if false { return status }"),
-    // A4 反面：旧行为 —— 拿生成网格，不拼基础几何。
-    Injection(name: "旧行为（三轴尺寸仍用生成网格）", file: appPath,
-        old: "                    let television = try? WorldPrimitiveTelevision(millimeters: spec)",
-        new: "                    let television: WorldPrimitiveTelevision? = nil"),
+    // A4 反面：手拼几何又被接回产品路径（用户 2026-10-02 的产品决定：物件一律来自素材生成）。
+    Injection(name: "手拼几何被接回产品路径（App 侧又出现构造点）", file: appPath,
+        old: "                let url = URL(fileURLWithPath: path)",
+        new: "                let primitiveTelevision = try? WorldPrimitiveTelevision(millimeters: spec)\n                let url = URL(fileURLWithPath: path)"),
     // A1 反面：现场失败就直接把产物清出托盘 ⇒ 一次次重新装载（重试风暴）。
     Injection(name: "现场失败即清空托盘（重试风暴）", file: appPath,
         old: "        let pool = healthy.isEmpty ? ready : healthy",

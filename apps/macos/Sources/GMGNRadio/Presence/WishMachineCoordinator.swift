@@ -65,10 +65,14 @@ struct WishMachineJob: Identifiable, Codable, Equatable, Sendable {
 ///
 /// **没有意图就是 `nil`**（老任务、以及只给了旧 `height_meters` 的调用）：任务行的
 /// `detail` 因此与今天逐字相同，不因为本契约上线而多出任何一行。
+///
+/// 这一行**不再自己拼"尺寸："那个前缀**：前缀会让面板叠成
+/// 「尺寸：你说的大小：1443 × 862 × 302 毫米」——两个标签压在同一句话上。
+/// 那一句（含出处）由 `PropSizeIntent.summary` **一处**给出，这里只转交。
 extension WishMachineJob {
     var sizeIntentLine: String? {
         guard let sizeIntent else { return nil }
-        return "尺寸：\(sizeIntent.summary)"
+        return sizeIntent.summary
     }
 }
 

@@ -8,22 +8,124 @@ struct WorldScreenSnapshot: Equatable, Sendable {
     let displayName: String
     /// 几何出处（标定 / 推断 / 缺省）。
     let source: WorldScreenSource?
-    /// 几何出处的**原话**。缺省与推断时面板必须显示它（"不猜"要看得见）。
+    /// 几何出处的**原话**。缺省与推断时**日志与 agent 回执**必须显示它（"不猜"要看得见）。
+    ///
+    /// ⚠️ 它**不进面板**：那句话是给工程的（"法向 +Z、面积 1.244 m²、24 × 14 格、117.98 ms"
+    /// 这一族）。面板要的是 `ScreenPanelCopy.screenRangeLine(source:hasGeometryIssue:)`
+    /// 那一句人话 —— 真机 2026-10-02 用户原话：「不要搞为什么然后给展开折叠，普通人看得懂吗，
+    /// 里面一堆 key-value 的东西」。
     let note: String
     let aspect: Float
     /// 几何给不出来时的具名原因。
     let geometryIssue: WorldScreenGeometryIssue?
     /// 当前内容（官方嵌入 URL）。
     let contentURL: String?
-    /// 状态的一行话。
+    /// 状态的一行话（工具/日志口径）。
     let stateText: String
     let isPlaying: Bool
     /// **前景遮挡**的一行账（"挡了 63/336 格" + 掩码耗时）。`nil` = 还没算过。
     ///
-    /// 它是"角色站在屏前时屏幕被裁掉哪一块"在**工具回执与面板上**的唯一出口 ——
+    /// 它是"角色站在屏前时屏幕被裁掉哪一块"在**工具回执与日志上**的唯一出口 ——
     /// 没有它，遮挡做没做在外面就是看不见的。刻意带默认值：既有构造点（含判据里的
     /// 替身）一个都不用改，而新调用点显式给值。
+    ///
+    /// ⚠️ 与 `note` 同理：带格数与毫秒的账**不进面板**（面板读 `isBlocked`）。
     var occlusionText: String? = nil
+    /// 这一帧这块屏幕**是不是真的有一部分被前面的东西挡住了**。
+    ///
+    /// 面板据此说**一句**人话，而且只在真被挡时说（`ScreenPanelCopy.occlusionLine`）。
+    /// 它是个 `Bool` 而不是那句账：账里有格数、有毫秒，每帧都在变 —— 直接显示就是刷屏。
+    /// 默认 `false`，既有构造点一个都不用改。
+    var isBlocked: Bool = false
+    /// 状态的**值本身**，面板据此说人话（`ScreenPanelCopy.statusLine`）。
+    ///
+    /// 为什么不复用 `stateText`：那一份是工程口径（带 host、带 HTTP 码、带 WebKit 的原因），
+    /// 面板要的是"这台电视现在放不出来，大概因为什么"。默认 `nil`，既有构造点不用改。
+    /// 声明在最后（带默认值的那几个一起）：既有构造点的实参顺序一个都不用动。
+    var surfaceState: WorldScreenSurfaceState? = nil
+}
+
+// MARK: - 面板上给**普通人**看的那几句话
+
+/// 电视面板上所有给用户看的字 —— **唯一**一份，纯函数、无 UI、可离线逐字断言。
+///
+/// ## 为什么要把"字"抽出来
+///
+/// 真机 2026-10-02，面板上摆着的是这样的东西：
+///
+/// ```text
+/// 平面电视  [推断]
+/// 由最大平坦面推断：法向 +Z（正面），面积 1.244 m²（1.24 m × 0.74 m）。不是标定值，可在面板里改。
+/// 前景遮挡：24 × 14 格全部可见（117.98 ms）
+/// ```
+///
+/// 用户的原话是「**什么玩意儿**」，以及上一轮同一件事的说法：「不要搞为什么然后给展开折叠，
+/// 普通人看得懂吗，里面一堆 key-value 的东西」。这段话里**没有一个字**是用户要的：
+/// 他不知道"法向"、不关心"面积 1.244 m²"，"24 × 14 格 / 117.98 ms"更是**调试读数**。
+///
+/// 所以分工是这样切的，而且只有这一处切：
+///
+/// | 谁看 | 看什么 | 在哪 |
+/// |---|---|---|
+/// | 用户 | 这台叫什么 / 屏幕是自动认出来的还是你标定的 / 能不能放 | 本枚举 |
+/// | 工程 | 法向、面积、来源、格数、毫秒 | `WorldScreenSnapshot.note` /
+///   `.occlusionText` / `.stateText` → 日志（`subsystem = ai.gmgn.radio`）与 agent 工具 |
+///
+/// ## 三条纪律
+///
+/// 1. **没有人话就不说**：`occlusionLine` 在不被挡时返回 `nil`（面板一个像素都不占）；
+/// 2. **只说一次、不刷屏**：`occlusionLine` 返回的是一个**常量**句子 —— 没有格数、没有
+///    毫秒，所以它在被挡的整段时间里**逐字不变**（每帧都在变的数字才会刷屏）；
+/// 3. **不出现工程术语**：法向 / 面积 / m² / 格 / ms / `key=value` 一个都不许有，
+///    `tools/test-resident-screen-overlay.swift` 的"面板文案"那一条逐字扫。
+enum ScreenPanelCopy {
+    /// 「这块屏幕的范围是哪来的」——一句话，人话。
+    ///
+    /// 判据一字未动：`source` 还是那个三级出处（标定 / 推断 / 缺省），这里只换说法。
+    /// `hasGeometryIssue` 为真时出处根本不存在（连猜都猜不出来），所以单独一句。
+    static func screenRangeLine(source: WorldScreenSource?, hasGeometryIssue: Bool) -> String {
+        if hasGeometryIssue {
+            return "屏幕范围：还没认出来 —— 点「调整屏幕范围」告诉它屏幕在哪。"
+        }
+        switch source {
+        case .calibrated: return "屏幕范围：你标定的。"
+        case .inferred: return "屏幕范围：自动识别。"
+        case .default: return "屏幕范围：自动识别的（大致位置，可以调）。"
+        case nil: return "屏幕范围：还没认出来 —— 点「调整屏幕范围」告诉它屏幕在哪。"
+        }
+    }
+
+    /// 「这块屏幕现在怎么样」——一句话，人话。`nil` = 播放中，画面本身就是状态。
+    static func statusLine(for state: WorldScreenSurfaceState?, isPlaying: Bool) -> String? {
+        guard !isPlaying else { return nil }
+        guard let state else { return "还没放东西 —— 粘一个链接，按「放」。" }
+        switch state {
+        case .idle: return "还没放东西 —— 粘一个链接，按「放」。"
+        case .loading: return "正在打开，请稍等。"
+        case .playing: return nil
+        case .stopped: return "已经停了。"
+        case let .failed(failure): return failure.panelText
+        }
+    }
+
+    /// 「画面被挡住了」——**只在真的被挡时**给一句，而且每次都是**同一句**。
+    ///
+    /// 被挡是常态里的一件小事（居民从屏前走过），所以它不该有数字、不该有区域、
+    /// 更不该每帧换一个说法。面板把它显示成一行就好。
+    static func occlusionLine(isBlocked: Bool) -> String? {
+        isBlocked ? "画面有一部分被前面挡住了。" : nil
+    }
+
+    /// 面板上那三个动作的名字。放 / 停 / 标定 —— 第三个说人话。
+    static let playActionTitle = "放"
+    static let stopActionTitle = "停"
+    static let adjustRangeActionTitle = "调整屏幕范围"
+    /// 换片输入框的提示（"官方嵌入链接"是工程话，用户只知道"视频链接"）。
+    static let contentPlaceholder = "粘贴视频链接（YouTube、哔哩哔哩、Twitch）"
+    /// 面板上唯一一处提到"同时能放几台"的话。
+    static func capacityLine(maximum: Int) -> String {
+        "同时最多放 \(maximum) 台；看不见的会自动暂停（不影响登录）。"
+    }
 }
 
 /// 一条命令的结果。`isError == false` 且 `code == insufficient_input` 表示**信息不足**：

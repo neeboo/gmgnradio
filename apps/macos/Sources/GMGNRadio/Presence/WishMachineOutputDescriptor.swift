@@ -40,6 +40,17 @@ struct ResidentPropRenderDescriptor: Equatable, Sendable {
     /// 存在 `transform.rotation` 里），这里是"这件网格生成出来就是躺着的"（资产级，
     /// 存在物件元数据里）。缺省 = 单位四元数 ⇒ 与改造前逐字节相同。
     var orientation: WorldQuaternion = .identity
+    /// 世界里那一份**逐轴**目标尺寸（米）—— 就是 `WorldGeneratedProp.effectiveSize`。
+    ///
+    /// `nil`（缺省）= 只有高度轴（等比）：渲染端按 `targetHeightMeters / 摆正后高度` 缩，
+    /// 与改造前**逐位相同**。非 nil 且三个比例不同 = 用户给了完整三轴
+    /// （`size_intent.mode == "dimensions"`）：渲染端按 `targetSize[i] / 摆正后跨度[i]`
+    /// **逐轴**缩放 —— 与碰撞盒/承托/摆放判据读的是**同一组数字**（`effectiveSize`），
+    /// 所以"逐轴缩放让画面与判定分叉"在结构上不可能。
+    ///
+    /// 传进来的那一份必须与 `prop.effectiveSize` 是**同一个数**：这里是唯一一份尺寸的
+    /// 搬运，不是第二次推导。
+    var targetSizeMeters: WorldVector3? = nil
     var assetKey: String { assetID + "|" + modelURL.standardizedFileURL.path }
 }
 
@@ -53,11 +64,12 @@ extension ResidentPropRenderDescriptor {
     static func residentProp(objectID: String, worldID: String, assetID: String, modelURL: URL,
                              targetHeightMeters: Float, position: SIMD3<Float>,
                              rotation: SIMD4<Float>,
-                             orientation: WorldQuaternion = .identity) -> Self {
+                             orientation: WorldQuaternion = .identity,
+                             targetSizeMeters: WorldVector3? = nil) -> Self {
         .init(objectID: objectID, worldID: worldID, assetID: assetID, modelURL: modelURL,
               targetHeightMeters: targetHeightMeters, position: position,
               yaw: atan2(2 * rotation.w * rotation.y, 1 - 2 * rotation.y * rotation.y),
-              orientation: orientation)
+              orientation: orientation, targetSizeMeters: targetSizeMeters)
     }
 }
 
@@ -102,14 +114,31 @@ enum ResidentPropPlacementMatrix {
     ///
     /// `orientation` 为单位四元数时走的仍是原来那一行（`rotation * normalized`），
     /// 逐位不变：已经立着的资产（绝大多数）画面一个像素都不差。
+    ///
+    /// `targetSize`（三轴，米）= `WorldGeneratedProp.effectiveSize`，**缺省 nil**。
+    /// 非 nil **且**它不是这份网格的等比像时 ⇒ 逐轴缩放到那三个数
+    /// （`scale[i] = targetSize[i] / 摆正后跨度[i]`）。碰撞盒/承托/摆放判据读的就是同一个
+    /// `effectiveSize`，所以"逐轴缩放会让画面与判定分叉"在结构上不可能。
+    /// 三轴目标恰好是等比像（包括全部既有物件）⇒ 走下面**原来那一份**等比路径，逐位不变。
     static func transform(minimum: SIMD3<Float>, maximum: SIMD3<Float>, targetHeight: Float,
+                          targetSize: WorldVector3? = nil,
                           position: SIMD3<Float>, yaw: Float,
                           orientation: WorldQuaternion = .identity) throws -> simd_float4x4 {
         guard yaw.isFinite else {
             throw WishMachineOutputError.invalidDimensions(WishMachineDimensionRejection(
                 field: "yaw", value: yaw, expected: "有限数（不是 NaN、也不是无穷）"))
         }
-        guard !WorldPropRotation.isIdentity(orientation) else {
+        // 转正之后重新量一次包围盒：缩放/居中必须按**转正后**的盒算，否则躺着的物件
+        // 会被按"原始 Y 跨度"缩放（真机那把剑：1.1 / 0.133 = 8.24 倍，8.28 m 长）。
+        let oriented = WorldPropOrientationPolicy.orientedBounds(
+            minimum: minimum, maximum: maximum, rotation: orientation)
+        // 逐轴那一份（`nil` = 目标尺寸就是这份网格的等比像 ⇒ 下面原来那一份）。
+        let perAxis = try targetSize.flatMap {
+            try perAxisScales(targetSize: $0,
+                              extent: oriented.maximum - oriented.minimum,
+                              targetHeight: targetHeight)
+        }
+        guard !WorldPropRotation.isIdentity(orientation) || perAxis != nil else {
             let normalized = try WishMachineOutputPlacement.transform(minimum: minimum, maximum: maximum, targetHeight: targetHeight, outlet: .zero)
             var rotation = matrix_identity_float4x4
             let c = cos(yaw), s = sin(yaw)
@@ -121,10 +150,6 @@ enum ResidentPropPlacementMatrix {
             ]) { throw WishMachineOutputError.invalidDimensions(rejection) }
             return rotation * normalized
         }
-        // 转正之后重新量一次包围盒：缩放/居中必须按**转正后**的盒算，否则躺着的物件
-        // 会被按"原始 Y 跨度"缩放（真机那把剑：1.1 / 0.133 = 8.24 倍，8.28 m 长）。
-        let oriented = WorldPropOrientationPolicy.orientedBounds(
-            minimum: minimum, maximum: maximum, rotation: orientation)
         let height = oriented.maximum.y - oriented.minimum.y
         if let rejection = WishMachineDimensionRejection.nonFinite([
             ("摆正后的高度", height), ("targetHeight", targetHeight),
@@ -149,6 +174,8 @@ enum ResidentPropPlacementMatrix {
                 field: "scale（targetHeight / 摆正后的高度）", value: scale,
                 expected: "有限且 > 0"))
         }
+        // 等比那一份：三个分量逐位相同（`perAxis == nil`）⇒ 与改造前逐位相同。
+        let scales = perAxis ?? SIMD3<Float>(repeating: scale)
         let centreX = (oriented.minimum.x + oriented.maximum.x) / 2
         let centreZ = (oriented.minimum.z + oriented.maximum.z) / 2
         var translation = matrix_identity_float4x4
@@ -158,15 +185,54 @@ enum ResidentPropPlacementMatrix {
         yawRotation.columns.0 = SIMD4(c, 0, -s, 0)
         yawRotation.columns.2 = SIMD4(s, 0, c, 0)
         var recentre = matrix_identity_float4x4
-        recentre.columns.3 = SIMD4(-centreX * scale, -oriented.minimum.y * scale, -centreZ * scale, 1)
+        recentre.columns.3 = SIMD4(-centreX * scales.x, -oriented.minimum.y * scales.y,
+                                   -centreZ * scales.z, 1)
         var scaling = matrix_identity_float4x4
-        scaling.columns.0.x = scale; scaling.columns.1.y = scale; scaling.columns.2.z = scale
+        scaling.columns.0.x = scales.x; scaling.columns.1.y = scales.y; scaling.columns.2.z = scales.z
         var upright = matrix_identity_float4x4
         let (x, y, z, w) = (orientation.x, orientation.y, orientation.z, orientation.w)
         upright.columns.0 = SIMD4(1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w), 0)
         upright.columns.1 = SIMD4(2 * (x * y - z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w), 0)
         upright.columns.2 = SIMD4(2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y), 0)
         return translation * yawRotation * recentre * scaling * upright
+    }
+
+    /// 逐轴比例 `targetSize[i] / 摆正后跨度[i]`；`nil` = 目标尺寸就是这份网格的**等比像**
+    /// （判据复用既有那一份 `WorldPropSizePolicy.uniformFactor`，不另立一套容差）。
+    ///
+    /// 非 nil 时每一维都要过判据：有限正数、与 `targetHeight` **同一条边界**（0 < v ≤ 10 米）、
+    /// 跨度不能塌成零。任何一条不成立 ⇒ **具名拒绝**（字段 + 实测值 + 期望），
+    /// 绝不退回等比（那就等于"你给的三轴我们又挑了一维"）。
+    private static func perAxisScales(targetSize: WorldVector3, extent: SIMD3<Float>,
+                                      targetHeight: Float) throws -> SIMD3<Float>? {
+        let extentVector = WorldVector3(x: extent.x, y: extent.y, z: extent.z)
+        if WorldPropSizePolicy.uniformFactor(from: extentVector, to: targetSize) != nil { return nil }
+        for (field, value) in [("targetSize.x", targetSize.x), ("targetSize.y", targetSize.y),
+                               ("targetSize.z", targetSize.z)] {
+            guard value.isFinite, value > 0, value <= 10 else {
+                throw WishMachineOutputError.invalidDimensions(WishMachineDimensionRejection(
+                    field: field, value: value,
+                    expected: "0 < 目标尺寸 ≤ 10 米（房间只有 7 × 8 × 3.2 米）"))
+            }
+        }
+        guard targetHeight.isFinite, targetHeight > 0, targetHeight <= 10 else {
+            throw WishMachineOutputError.invalidDimensions(WishMachineDimensionRejection(
+                field: "targetHeight", value: targetHeight,
+                expected: "0 < 目标高度 ≤ 10 米（房间只有 7 × 8 × 3.2 米）"))
+        }
+        guard extent.x > 0.00001, extent.y > 0.00001, extent.z > 0.00001 else {
+            throw WishMachineOutputError.invalidDimensions(WishMachineDimensionRejection(
+                field: "摆正后跨度", value: Swift.min(extent.x, extent.y, extent.z),
+                expected: "三轴都 > 0.00001 米（逐轴缩放不能除以一个塌成零的跨度）"))
+        }
+        let scales = SIMD3<Float>(targetSize.x / extent.x, targetSize.y / extent.y,
+                                  targetSize.z / extent.z)
+        guard scales.x.isFinite, scales.y.isFinite, scales.z.isFinite,
+              scales.x > 0, scales.y > 0, scales.z > 0 else {
+            throw WishMachineOutputError.invalidDimensions(WishMachineDimensionRejection(
+                field: "逐轴缩放", value: scales.y, expected: "三个比例都是有限正数"))
+        }
+        return scales
     }
 }
 
@@ -354,17 +420,49 @@ enum WishMachineOutputPlacement {
 
     /// Respect GLB node transforms (the loader supplies world bounds), centre
     /// X/Z on the tray and place the lowest Y at the suspended output anchor.
+    ///
+    /// `targetSize`（三轴，米）缺省 nil。非 nil **且**它不是这份网格的等比像时 ⇒ 按
+    /// `targetSize[i] / 网格跨度[i]` **逐轴**缩放（托盘上那件还没登记，但用户给了完整三轴，
+    /// 预览就必须是他要的三个数 —— 与登记之后那一件、碰撞盒读的是同一组数字）。
+    /// 目标尺寸是网格的等比像（含所有既有产物）⇒ 走**原来那一行**，逐位不变。
     static func transform(minimum: SIMD3<Float>, maximum: SIMD3<Float>,
-                          targetHeight: Float, outlet: SIMD3<Float>) throws -> simd_float4x4 {
+                          targetHeight: Float, targetSize: WorldVector3? = nil,
+                          outlet: SIMD3<Float>) throws -> simd_float4x4 {
         if let rejection = dimensionRejection(minimum: minimum, maximum: maximum,
                                               targetHeight: targetHeight, outlet: outlet) {
             throw WishMachineOutputError.invalidDimensions(rejection)
         }
-        let scale = targetHeight / (maximum.y - minimum.y)
+        let extent = WorldVector3(x: maximum.x - minimum.x, y: maximum.y - minimum.y,
+                                  z: maximum.z - minimum.z)
+        let scale = targetHeight / extent.y
+        var scales = SIMD3<Float>(repeating: scale)
+        if let targetSize, WorldPropSizePolicy.uniformFactor(from: extent, to: targetSize) == nil {
+            for (field, value) in [("targetSize.x", targetSize.x), ("targetSize.y", targetSize.y),
+                                   ("targetSize.z", targetSize.z)] {
+                guard value.isFinite, value > 0, value <= 10 else {
+                    throw WishMachineOutputError.invalidDimensions(WishMachineDimensionRejection(
+                        field: field, value: value,
+                        expected: "0 < 目标尺寸 ≤ 10 米（房间只有 7 × 8 × 3.2 米）"))
+                }
+            }
+            guard extent.x > 0.00001, extent.y > 0.00001, extent.z > 0.00001 else {
+                throw WishMachineOutputError.invalidDimensions(WishMachineDimensionRejection(
+                    field: "网格跨度", value: Swift.min(extent.x, extent.y, extent.z),
+                    expected: "三轴都 > 0.00001 米（逐轴缩放不能除以一个塌成零的跨度）"))
+            }
+            scales = SIMD3<Float>(targetSize.x / extent.x, targetSize.y / extent.y,
+                                  targetSize.z / extent.z)
+            guard scales.x.isFinite, scales.y.isFinite, scales.z.isFinite,
+                  scales.x > 0, scales.y > 0, scales.z > 0 else {
+                throw WishMachineOutputError.invalidDimensions(WishMachineDimensionRejection(
+                    field: "逐轴缩放", value: scales.y, expected: "三个比例都是有限正数"))
+            }
+        }
         let centre = (minimum + maximum) / 2
         var matrix = matrix_identity_float4x4
-        matrix.columns.0.x = scale; matrix.columns.1.y = scale; matrix.columns.2.z = scale
-        matrix.columns.3 = SIMD4(outlet.x-centre.x*scale, outlet.y-minimum.y*scale, outlet.z-centre.z*scale, 1)
+        matrix.columns.0.x = scales.x; matrix.columns.1.y = scales.y; matrix.columns.2.z = scales.z
+        matrix.columns.3 = SIMD4(outlet.x-centre.x*scales.x, outlet.y-minimum.y*scales.y,
+                                 outlet.z-centre.z*scales.z, 1)
         return matrix
     }
 

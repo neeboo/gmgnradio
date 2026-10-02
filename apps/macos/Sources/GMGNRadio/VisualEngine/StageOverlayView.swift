@@ -105,6 +105,29 @@ struct ResidentSpeechErrorNotice: View {
     }
 }
 
+/// 「许愿任务」那一块**什么时候占屏幕** —— 唯一一处判据。
+///
+/// 用户 2026-10-02 原话：「左上角这个也不应该常驻啊」。所以这块面板的规矩是
+/// **有事才出现、事情了结就收起**，而且收起必须可见、可预期（不是闪一下）：
+///
+/// - **非终态**（排队 / 生成中 / 待领取 / 已领取未入库 / 摆放中）⇒ 出现：
+///   有事正在发生，或者有件事在等人。
+/// - **终态**（`isTerminal`）⇒ 事情了结了。提示窗由 `promptExpiresAt` 给出 ——
+///   它是**共享收件箱按 `updatedAt` 现算**的（`ResidentSystemInboxStore.promptExpiry`，
+///   终态后 30 秒），所以刷新、重开窗口、重启都不会把这个窗口往后推。
+/// - 终态但**算不出**到期时间（收件箱里已经没有那一条记录）⇒ 仍然出现。
+///   **这是故意的**：宁可多留一句，也不许把"没做成、等你处理"这种终态
+///   从屏幕上悄悄吞掉（理由见 `ResidentPropInventoryBacklog.isTerminal` 那一段）。
+///
+/// 这里**只**把判据收成一处、起个名字，语义与收口前**逐字相同** —— 没有放宽、
+/// 也没有收紧：任务该不该存在由宿主与投影回答，本函数只回答"此刻要不要占屏幕"。
+enum WishMachineTaskPrompt {
+    static func isShown(_ task: WishMachineTaskPresentation, at now: Date) -> Bool {
+        guard let expiry = task.promptExpiresAt else { return true }
+        return now < expiry
+    }
+}
+
 /// Async wish jobs remain visible independently of the resident's reply and thinking state.
 /// Terminal tasks hide 30 seconds after their stored prompt anchor; the expiry
 /// timestamp is persisted in the shared inbox, so refreshes and reopenings
@@ -117,10 +140,9 @@ struct WishMachineTaskStatusView: View {
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { timeline in
-            let visible = state.tasks.filter { task in
-                guard let expiry = task.promptExpiresAt else { return true }
-                return timeline.date < expiry
-            }
+            // 「有事才出现」由**那一处**判据回答（`WishMachineTaskPrompt.isShown`）；
+            // 这里只负责在它说"一件事都没有"时整块**不渲染** —— 不留空壳占屏幕。
+            let visible = state.tasks.filter { WishMachineTaskPrompt.isShown($0, at: timeline.date) }
             VStack(alignment: .leading, spacing: 6) {
                 connectivityBanner
                 autonomyBanner

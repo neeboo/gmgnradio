@@ -79,7 +79,7 @@ extension ResidentPropDelegationError: LocalizedError {
                 // 挂点：三个字面量与 `WorldPropSlot.rawValue` 同一份（`PropAttachmentSlots.acceptedNames`）。
                 // **可省**（省缺 = rightHand）：既有调用点与旧提示词一个字都不用改。
                 properties["slot"] = ["type": "string", "enum": PropAttachmentSlots.acceptedNames,
-                    "description": "挂点：rightHand 拿在手里 / back 挂在背后 / waist 挂在腰间。用户说「挂背后 / 挂腰上 / 拿手里」时选对应项；不写就是 rightHand。已经拿在手上的同一件物件换挂点时也用它。"]
+                    "description": "挂点（**可省**，不写就是 rightHand）。取值只有 \(Self.slotChoicesText)：用户说「挂背后 / 挂腰上 / 拿手里」时选对应项；已经拿在手上的同一件物件换挂点时也用它。"]
 
             }
             if ["preview_prop_placement", "apply_prop_placement"].contains(name) {
@@ -89,7 +89,20 @@ extension ResidentPropDelegationError: LocalizedError {
             if name == "adjust_held_prop_grip" {
                 for key in ["offset_x", "offset_y", "offset_z", "rotation_yaw"] { properties[key] = ["type": "number"] }
             }
-            if Self.isMutation(name) { properties["layout_revision"] = ["type": "integer", "minimum": 0] }
+            if Self.isMutation(name) {
+                // ⚠️ 这里**只能**出现宿主校验器认得的键
+                // （`ResidentDSHOriginalSchemaValidator.allowedSchemaKeys`）。`minimum` 属于
+                // "不支持也不猜"的那一族：它不会在执行时被忽略，而是让**整条** schema 在派发前
+                // 被判 `schema_unsupported`，于是这个工具**一次都执行不到**。
+                //
+                // 真机 2026-10-02 那两次"挂到身上被挡回"就是这么来的，逐字两条：
+                //   ① `$.layout_revision: 含无法核验的约束键 minimum`（"工具描述有问题"）
+                //   ② `$: 缺少必需属性 layout_revision`（agent 去掉它之后撞上的"缺参数"）
+                // 下界仍然只有**一份判据**（`argumentVerdict`：非负整数），只是改由
+                // `description` 教会 agent，而不是写一个宿主读不懂的键。
+                properties["layout_revision"] = ["type": "integer",
+                    "description": "布局版本（**必填**）：把 read_owned_props 回执里的 layout_revision **原样**填进来（非负整数；不许猜、不许用上一轮的旧值）。世界在这之间变过时会被拒绝，回执里会带最新版本号，读回来再试一次。"]
+            }
             let descriptions = [
                 "read_owned_props": "读取真实已拥有物件、是否摆出、位置、能力绑定、最近一次使用状态（running/completed/stopped/failed，以回执为准）与布局版本。每件物件的 `ownership_state`（机器读的一档）与 `ownership_status`（界面上那句话）来自**同一个**唯一投影，与「我的物件」列表那一行、任务行那一句**逐字同源**——对用户说状态时照它说，别自己另编一个词。每件物件的 `hold_slots` **逐挂点**给出「能不能挂在那个挂点上」以及那一个挂点自己的原因（手/背后/腰间各自具名，右手不行不代表背后不行）。`deleted` 列出已经被永久删除的物件（墓碑：名字、删除时的结算动作与理由、释放的内容引用）—— 已经删掉的东西不会出现在 objects 里。生成物件默认仅有外形；只有明确启用 coffee.brew 冲泡模板的咖啡机才可按模板在空间内模拟使用，不涉及现实硬件或物理结构。",
                 "list_placement_surfaces": "读取可摆放的承托层：承托高度、格数与水平范围（不再逐个列出格子）。位置为底部中心，yaw 为弧度。",
@@ -99,9 +112,9 @@ extension ResidentPropDelegationError: LocalizedError {
                 "undo_prop_placement": "仅按本轮人类要求撤销最近一次摆放或收回；只能撤销一步。",
                 // 工具描述是 agent 真正读到的"能拿多大"：与判据**同源**（插值同一份上限），
                 // 否则提示词说 1.6 m、工具描述说另一个数，agent 会照着错的那一份拒绝用户。
-                "hold_prop": "仅按本轮人类明确要求，让当前已适配居民拿起 / 挂上一件最长边不超过\(ResidentPropAttachmentEligibility.holdableLongestEdgeText)的小道具展示；slot 决定挂点（rightHand 拿在手里 / back 挂在背后 / waist 挂在腰间），省缺为 rightHand。用户说「挂背后 / 挂腰上 / 拿手里」时就是选它。物件保持同一身份并保留原放回位置。read_owned_props 的回执里 `hold_slots` **逐挂点**给出可用性与各自的原因：右手不行**不代表**背后或腰间不行，别拿一个挂点的答案替用户回答另一个挂点；失败回执里的 slot/slot_name 是这次**真正**按哪个挂点算的（没给 slot 时就是省缺的右手）。",
-                "adjust_held_prop_grip": "仅按本轮人类要求，微调**当前挂点**上那件道具相对该挂点骨骼的米制偏移和局部旋转。先读取当前握点，参数为绝对值；它不会改变挂点本身（换挂点用 hold_prop 的 slot）。",
-                "return_held_prop": "仅按本轮人类要求把当前挂载的道具精确放回拿起前的位置；原来在库存则回库存，不接受放回坐标。",
+                "hold_prop": "仅按本轮人类明确要求，让当前已适配居民拿起 / 挂上一件最长边不超过\(ResidentPropAttachmentEligibility.holdableLongestEdgeText)的小道具展示。**必填两个**：object_id（read_owned_props 回执里的物件编号）与 layout_revision（**同一份**回执里的布局版本，原样填）。**挂点由 slot 决定，可省**：取值只有 \(Self.slotChoicesText)；用户说「挂背后 / 挂腰上 / 拿手里」就选对应项，**不写就是 rightHand（拿在右手）**，已经拿在手上的同一件物件换挂点也用它。物件保持同一身份并保留原放回位置。read_owned_props 的回执里 `hold_slots` **逐挂点**给出可用性与各自的原因：右手不行**不代表**背后或腰间不行，别拿一个挂点的答案替用户回答另一个挂点；失败回执里的 slot/slot_name 是这次**真正**按哪个挂点算的（没给 slot 时就是省缺的右手）。",
+                "adjust_held_prop_grip": "仅按本轮人类要求，微调**当前挂点**上那件道具相对该挂点骨骼的米制偏移和局部旋转。**必填**：object_id（read_owned_props 回执里的物件编号）、layout_revision（同一份回执里的布局版本，原样填）、以及 offset_x / offset_y / offset_z（米）与 rotation_yaw（弧度）—— 四个都是**绝对值**，不是增量。先读取当前握点再给。它不会改变挂点本身（换挂点用 hold_prop 的 slot）。",
+                "return_held_prop": "仅按本轮人类要求把当前挂载的道具精确放回拿起前的位置。**必填**：object_id（read_owned_props 回执里的物件编号）与 layout_revision（同一份回执里的布局版本，原样填）。原来在库存则回库存，不接受放回坐标。",
                 "enable_prop_capability": "仅按本轮人类明确要求使用某物件时，为已拥有摆件启用受支持的使用能力模板（当前仅支持 coffee.brew 冲泡模板）。能力持久化；启用后通过 start_activity 走到物件前面向它执行按钮动作并等待播放完成，属于空间内模拟使用，不宣称物理冲煮结构。按名字猜想的物件不得启用。",
                 // 删除是**永久**的：描述里逐字写出来，agent 才不会把它当成又一次"收回"。
                 "delete_prop": "仅按本轮人类明确要求，**永久删除**一件已拥有的生成资产（不可恢复，没有撤销）。先用 read_owned_props 确认是哪一件。删除会自动收场：正在房间里摆着的、正拿在居民手里的或挂在身上的，都会在同一次提交里先收回/放回再删掉，不需要先调用 withdraw_prop 或 return_held_prop。回执里会说明删了什么、做了哪种收场、以及释放了哪些共享内容（还被别的物件引用的内容一律保留，不会误删）。只有这一件物件独占的内容才会进入可回收集合。删除后该物件不再出现在库存与回执的 objects 里，而是出现在 deleted 里。"
@@ -118,7 +131,36 @@ extension ResidentPropDelegationError: LocalizedError {
     private static func isMutation(_ name: String) -> Bool {
         ["apply_prop_placement", "withdraw_prop", "undo_prop_placement", "hold_prop", "adjust_held_prop_grip", "return_held_prop", "enable_prop_capability", "delete_prop"].contains(name)
     }
-    private static func validate(_ values: [String: Any], name: String) -> Bool {
+    /// 挂点那三个取值的**人话名**（"rightHand（右手） / back（背后） / waist（腰间）"）。
+    ///
+    /// 取值表只有一处来源 `PropAttachmentSlots`：schema 的 `enum`、参数与工具描述、
+    /// 传错参数时的失败回执，读的都是它 —— 三处不可能各说一套。
+    private static var slotChoicesText: String {
+        PropAttachmentPoint.allCases
+            .map { "\($0.worldSlot.rawValue)（\(PropAttachmentSlots.displayName(for: $0))）" }
+            .joined(separator: " / ")
+    }
+
+    /// 一次调用的**参数裁决**：不是一句 Bool，而是"哪儿不对、该怎么改"。
+    ///
+    /// 判据只有这一份：`validate`（宿主侧 `AdditionalTool.validate` 的 Bool 合同）与
+    /// 失败回执（agent 读到的那一句话）都从它派生。所以"拒绝的理由"与"回执教他怎么改"
+    /// 不可能分叉，也不会多出第二套必填 / 可选表。
+    ///
+    /// 真机 2026-10-02：`hold_prop` 两次被系统挡回，而回执只有一句笼统的
+    /// "摆放参数无效，请查询当前物件和支撑面"，agent 不知道该改哪个参数 —— 对治就是这里。
+    private enum ArgumentVerdict: Equatable {
+        case accepted
+        /// 缺的**必填**参数（按声明序）。
+        case missing([String])
+        /// **未声明**的参数（按键名序）。
+        case unknown([String])
+        /// 哪个参数、期望什么。
+        case badValue(parameter: String, expectation: String)
+    }
+
+    /// 这个工具的**必填**参数 —— 与 schema 的 `required` 是同一份（见 `tools` 里那行 filter）。
+    private static func declaredKeys(_ name: String) -> Set<String> {
         var keys = Set<String>()
         if ["preview_prop_placement", "apply_prop_placement", "withdraw_prop", "hold_prop", "adjust_held_prop_grip", "return_held_prop", "enable_prop_capability", "delete_prop"].contains(name) { keys.insert("object_id") }
         if name == "enable_prop_capability" { keys.insert("capability") }
@@ -126,28 +168,101 @@ extension ResidentPropDelegationError: LocalizedError {
         if ["preview_prop_placement", "apply_prop_placement"].contains(name) { keys.formUnion(["surface_id", "x", "y", "z", "yaw"]) }
         if name == "adjust_held_prop_grip" { keys.formUnion(["offset_x", "offset_y", "offset_z", "rotation_yaw"]) }
         if isMutation(name) { keys.insert("layout_revision") }
-        // 可省的业务参数只有两个：`hold_prop` 的 `slot`（省缺 = rightHand）与
-        // `delete_prop` 的 `reason`（省缺 = 没给理由）。别的参数一个都不许省。
-        var allowed = keys
-        if name == "hold_prop" { allowed.insert("slot") }
-        if name == "delete_prop" { allowed.remove("reason") }
-        guard Set(values.keys) == keys || Set(values.keys) == allowed else { return false }
-        for key in values.keys {
+        return keys
+    }
+    /// 可省的业务参数只有两个：`hold_prop` 的 `slot`（省缺 = rightHand）与
+    /// `delete_prop` 的 `reason`（省缺 = 没给理由）。别的参数一个都不许省。
+    private static func optionalKeys(_ name: String) -> Set<String> {
+        name == "hold_prop" ? ["slot"] : []
+    }
+
+    /// 传错参数时回执里"该怎么改"那句话。**取值表只有一处来源**：挂点读
+    /// `PropAttachmentSlots`（和 schema 的 `enum`、工具描述同一份），其余是"去哪儿读、什么类型"。
+    private static func guidance(parameter: String) -> String {
+        let templates = WorldPropActivityTemplate.supported.keys.sorted().joined(separator: " / ")
+        switch parameter {
+        case "slot":
+            return "slot 只能取 \(slotChoicesText)；用户说「挂背后 / 挂腰上 / 拿手里」时选对应项，**不写就是 rightHand**。"
+        case "layout_revision":
+            return "layout_revision 必须是**非负整数**，而且要**原样**取 read_owned_props 回执里的那一个（不是猜的、不是上一轮的旧值）；被拒时回执里带最新版本号，读回来再试。"
+        case "object_id":
+            return "object_id 取 read_owned_props 回执里 objects[].object_id 的**原文**（非空字符串）。"
+        case "surface_id":
+            return "surface_id 取 list_placement_surfaces 回执里的承托层编号（layer.<n>）。"
+        case "capability":
+            return "capability 取该物件 read_owned_props 回执里 capability.template_id（当前支持：\(templates)）。「按名字猜一个能力」一律不启用。"
+        case "reason":
+            return "reason 是（可省的）删除理由：用户说了为什么就照实写、最多 200 字；没说就不写，绝不替他编一个。"
+        default:
+            return "\(parameter) 必须是有限数字（number），不接受字符串、布尔或 null。"
+        }
+    }
+
+    private static func argumentVerdict(_ values: [String: Any], name: String) -> ArgumentVerdict {
+        let declared = declaredKeys(name)
+        let allowed = declared.union(optionalKeys(name))
+        // 键集合的判据（与旧 `validate` 逐位等价）：必填一个都不能少、未声明的键一个都不能多。
+        let missing = declared.subtracting(values.keys).sorted()
+        if !missing.isEmpty { return .missing(missing) }
+        let unknown = Set(values.keys).subtracting(allowed).sorted()
+        if !unknown.isEmpty { return .unknown(unknown) }
+        for key in values.keys.sorted() {
             if ["object_id", "surface_id", "capability", "slot", "reason"].contains(key) {
-                guard let text = values[key] as? String, !text.isEmpty, text.count <= 256 else { return false }
+                guard let text = values[key] as? String, !text.isEmpty, text.count <= 256 else {
+                    return .badValue(parameter: key, expectation: guidance(parameter: key))
+                }
                 // 删除理由的**判据只有一处**（世界层 `WorldSimulation` 的 200 字上限）：
                 // 这里只做"是个不空的字符串"，长度由那条命令自己拒绝并给出可读原因。
-                if key == "reason", name == "delete_prop", text.trimmingCharacters(in: .whitespacesAndNewlines).count > 200 { return false }
+                if key == "reason", name == "delete_prop", text.trimmingCharacters(in: .whitespacesAndNewlines).count > 200 {
+                    return .badValue(parameter: key, expectation: guidance(parameter: key))
+                }
                 // 挂点名必须**认识**：认不出来的就地拒绝，绝不猜一个挂点出来。
-                if key == "slot", PropAttachmentSlots.resolve(name: text) == nil { return false }
+                if key == "slot", PropAttachmentSlots.resolve(name: text) == nil {
+                    return .badValue(parameter: key, expectation: guidance(parameter: key))
+                }
             } else {
-                guard let number = values[key] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite else { return false }
+                guard let number = values[key] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite else {
+                    return .badValue(parameter: key, expectation: guidance(parameter: key))
+                }
                 if key == "layout_revision" {
-                    guard number.doubleValue >= 0, number.doubleValue < Double(UInt64.max), number.doubleValue.rounded() == number.doubleValue else { return false }
+                    guard number.doubleValue >= 0, number.doubleValue < Double(UInt64.max), number.doubleValue.rounded() == number.doubleValue else {
+                        return .badValue(parameter: key, expectation: guidance(parameter: key))
+                    }
                 }
             }
         }
-        return true
+        return .accepted
+    }
+    private static func validate(_ values: [String: Any], name: String) -> Bool {
+        argumentVerdict(values, name: name) == .accepted
+    }
+
+    /// 传错参数时的回执：**哪个参数、期望什么、该怎么改**，一句到位。
+    ///
+    /// `message` 保留既有的那句前缀（"摆放参数无效…"），后面接上可行动的那一半；
+    /// 机器读的字段（`missing` / `unknown` / `parameter` / `how_to_fix`）同时给出，
+    /// 别处不必解析中文，`code` 仍是既有的 `invalid_arguments`。
+    private static func invalidArgumentsReceipt(_ verdict: ArgumentVerdict, name: String) -> [String: Any] {
+        var payload: [String: Any] = ["ok": false, "code": "invalid_arguments"]
+        let howToFix: String
+        switch verdict {
+        case .accepted:
+            // 调用方只在非 accepted 时进来；这里仍给一句实话，不编。
+            howToFix = "参数没有通过本工具的校验。"
+        case let .missing(keys):
+            payload["missing"] = keys
+            howToFix = "缺少必填参数：" + keys.map { "\($0) —— \(guidance(parameter: $0))" }.joined(separator: "；")
+        case let .unknown(keys):
+            payload["unknown"] = keys
+            let declared = declaredKeys(name).union(optionalKeys(name)).sorted()
+            howToFix = "不认识参数 \(keys.joined(separator: " / "))；本工具只接受 \(declared.joined(separator: " / "))。"
+        case let .badValue(parameter, expectation):
+            payload["parameter"] = parameter
+            howToFix = "参数 \(parameter) 的取值不对：\(expectation)"
+        }
+        payload["how_to_fix"] = howToFix
+        payload["message"] = "摆放参数无效，请查询当前物件和支撑面。\(howToFix)"
+        return payload
     }
 
     private func handle(_ name: String, _ callID: String, _ data: Data) async -> RealtimeDJToolResult {
@@ -155,8 +270,14 @@ extension ResidentPropDelegationError: LocalizedError {
             .init(callID: callID, resultJSON: (try? JSONSerialization.data(withJSONObject: payload, options: .sortedKeys)) ?? Data("{}".utf8), isError: error)
         }
         guard !Task.isCancelled, isCurrent() else { return result(["ok": false, "code": "stale_prop_session", "message": "本轮空间操作已停止。"], error: true) }
-        guard let values = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any], Self.validate(values, name: name) else {
-            return result(["ok": false, "code": "invalid_arguments", "message": "摆放参数无效，请查询当前物件和支撑面。"], error: true)
+        guard let values = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return result(["ok": false, "code": "invalid_arguments",
+                "message": "摆放参数无效，请查询当前物件和支撑面。参数必须是一个 JSON 对象（键值对），本工具不接受数组或裸值。"], error: true)
+        }
+        let verdict = Self.argumentVerdict(values, name: name)
+        guard verdict == .accepted else {
+            // 失败信息必须**可行动**：agent 读了就知道该改哪个参数、改成什么。
+            return result(Self.invalidArgumentsReceipt(verdict, name: name), error: true)
         }
         if name == "preview_prop_placement", !allowsMutation, let grant = delegatedGrant,
            values["object_id"] as? String != grant.objectID {

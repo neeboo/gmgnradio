@@ -46,6 +46,17 @@ private enum ResidentPropHostError: LocalizedError {
     }
 }
 
+/// 「面板开着 ⇒ 这一轮根本没有发给居民」是一条**具名拒绝**，不是投递失败。
+///
+/// 它必须与 `failedText`（未送达，只留给连接/运行时/传输失败）分开：真机
+/// 2026-10-02 16:56:03–07 面板上「让居民去取」连点两次，每一次都在面板开着的时候
+/// 起了一轮，而这一轮在第一行就被这条拒绝挡住；界面当时套的是失败口径，于是把
+/// "压根没发出去"说成「未送达：本轮未完成，文字和图片已回到输入框，未自动重发。」——
+/// 面板那句"请去许愿机…"根本不在任何输入框里，这后半句也是假的。
+extension ResidentPropHostError: ResidentTurnRefusal {
+    var refusalNotice: String { "摆放面板正开着，这一条没有发给居民" }
+}
+
 enum ApplicationLaunchPolicy {
     private static let testEnvironmentKeys = [
         "XCTestConfigurationFilePath",
@@ -776,7 +787,8 @@ final class AppDelegate:
     private var interruptionCoordinator: InterruptionCoordinator?
     private var orbWindowController: OrbWindowController?
     private var stageWindowController: StageWindowController?
-    /// 电视机：覆盖层 + 面板 + agent 工具共用的一份接线。
+    /// 电视机：覆盖层 + agent 工具共用的一份接线（电视面板已从产品界面移除，
+    /// 见 `installScreenOverlayIfNeeded()` 与 `Screen/ScreenPanel.swift` 的文件头）。
     ///
     /// 世界那一侧（读 `objectStates`、持久化）从外面注入，所以这一份不知道
     /// `WorldSimulation` / 权威的存在 —— 见 `Screen/WorldScreenStore.swift` 的 `Source`。
@@ -1202,7 +1214,8 @@ final class AppDelegate:
                         .generatedProp?.displayName ?? objectID
                 },
                 // 持久化：本轮**留空**（见设计文末「没做的部分」）。为 nil 时标定与换片
-                // 只在本会话内生效，面板上照实显示。
+                // 只在本会话内生效（电视面板已从产品界面移除，标定的界面入口随之消失；
+                // 屏幕范围仍由 `Screen/**` 的推断几何负责）。
                 persistDefinition: nil,
                 persistContent: nil
             ),
@@ -1226,8 +1239,9 @@ final class AppDelegate:
             }
         )
         store.startTracking()
-        controller.installScreenPanel(store)
-        controller.setScreenPanelVisible(true)
+        // 电视面板已从产品界面移除（用户要求：左下角那块电视面板不应该出现）。
+        // 这里只接**覆盖层**（屏幕画面本体）与 store（三条 agent 工具的注入源）；
+        // 面板视图保留在 `Screen/ScreenPanel.swift`，但产品路径上没有挂载 / 显示入口。
         screenStore = store
     }
 
@@ -1781,6 +1795,24 @@ final class AppDelegate:
         let backgroundTurn = residentAgentLoop?.lastFinishedRunWasBackground == true
         liveCamWindowController?.showFailureStatus(text)
         stageWindowController?.showResidentFailureStatus(text, autoRevealsChat: !backgroundTurn)
+    }
+
+    /// 宿主自己把某一轮**停下**了（更新的指令超车 / 进入装修 / 换空间 / 面板开着没发出去）。
+    ///
+    /// 与 `presentResidentLoopFailure` 严格分工：这里**不是**投递失败，所以
+    /// （1）历史里写成具名中止，绝不写成「未送达」；
+    /// （2）不冒充失败状态（不改失败徽标、不展开失败提示）；
+    /// （3）仍然把日志写在真机上能一眼看到的地方 —— 这是这次缺陷里唯一缺的东西：
+    ///     真机上"这一轮为什么停了"当时在日志里一个字都没有。
+    private func presentResidentInterruption(ids: [UUID],
+                                             interruption: ResidentChatTurn.Interruption) {
+        if !ids.isEmpty {
+            residentChatTranscript.markInterrupted(ids: ids, interruption: interruption)
+            publishResidentTranscript()
+        }
+        livingWorldLogger.notice(
+            "居民本轮被宿主停下（不是未送达） 提交=\(ids.count, privacy: .public) 原因=\(ResidentChatTranscriptLine.interruptedText(interruption), privacy: .public)"
+        )
     }
 
     /// 用户按下停止控件。这是**唯一**的"用户停止过"入口：它同时取消本轮、
@@ -4068,83 +4100,19 @@ final class AppDelegate:
                 guard let record = propGenerationStore.jobs.first(where: { $0.id == job.jobID }),
                       let receipt = record.receipt, receipt.state == .completed, let inspection = receipt.result?.inspection,
                       let path = record.localModelPath, job.modelPath == path else { throw ResidentPropHostError.assetUnavailable }
-                // ---- 三轴尺寸 + 板形物件：用**基础几何**造，而不是拿生成器交回来的网格 ----
+                // ---- 物件**一律**来自用户的素材生成：不再手拼几何（用户 2026-10-02 的决定）----
                 //
-                // 用户给了完整长宽高（真机 2026-10-01「平面电视」`1443 × 862 × 302 mm`）时，
-                // 这件东西的形状是**规格**、不是灵感：一块扁平面板 + 一圈边框 + 一个底座。
-                // 生成器交回来的那个大立方体（参考图贴在各面上）不是"参数没调好"，而是
-                // 这条路本来就该由基础几何走 —— 拼出来的包围盒**天生逐位等于**用户说的三轴，
-                // 而屏幕面就是那块大平面（最大面 ⇒ 屏幕推断必然选中它）。
+                // 原话「不能再用集合拼了」：物件的形状与外观**只**来自生成（素材图 → 3D），
+                // 不再由我们用基础几何替他拼一个固定造型 —— 几何拼那条路已停用
+                // （`WorldPrimitiveTelevision` 类型保留、产品路径**零调用**，文件头写明了原因）。
                 //
-                // 判据用的是**既有那一份**：`WorldScreenFaceInference.rejection`（板形 +
-                // 最大平坦面面积），它吃的正是三轴的米制尺寸 —— 1443 × 862 × 302 ⇒
-                // 最薄/最长 = 302/1443 ≈ 0.21 ≤ 0.25、最大面 1.443 × 0.862 ≈ 1.24 m² ≥ 0.04。
-                // 不是板形（例如一个方块柜子）⇒ 落到下面**今天那条路**：生成网格按最长边
-                // 等比归一，另外两维只作期望值，并且把这件事说给用户（见紧跟着的那一支）。
-                let primitiveTelevision: WorldPrimitiveTelevision? = {
-                    guard let intent = job.sizeIntent, intent.mode == .dimensions,
-                          let millimeters = intent.millimeters,
-                          let spec = WorldPropSizeMillimeters(x: Float(millimeters.x),
-                                                              y: Float(millimeters.y),
-                                                              z: Float(millimeters.z)),
-                          let television = try? WorldPrimitiveTelevision(millimeters: spec)
-                    else { return nil }
-                    let meters = SIMD3<Float>(spec.x / 1000, spec.y / 1000, spec.z / 1000)
-                    return WorldScreenFaceInference.rejection(size: meters, objectID: job.objectID) == nil
-                        ? television : nil
-                }()
-                if let television = primitiveTelevision {
-                    // 资产字节走**同一个内容寻址的住处**：文件名就是字节的 sha256，
-                    // `assetID` 就是 `sha256:<hex>` —— 与生成产物同一种引用形式
-                    // （`WorldPropAssetReferences.blobRefs(of:)` 读的是同一个键），
-                    // 而且同样的字节永远落到同一个路径 ⇒ 重放不写第二遍。
-                    let blobURL = try Self.materializeContentAddressedAsset(television)
-                    let televisionDescriptor = ResidentPropRenderDescriptor(
-                        objectID: job.objectID, worldID: job.worldID,
-                        assetID: television.assetID, modelURL: blobURL,
-                        targetHeightMeters: television.size.y, position: .zero, yaw: 0)
-                    let preparedTelevision = try await spatialStage.prepareResidentProp(televisionDescriptor)
-                    guard self.livingWorldContext === context,
-                          self.spatialStage.selectedWorldID == context.manifest.worldID else { return }
-                    // 渲染端量出来的包围盒必须**逐位**是拼出来的那一份：这是"画面、判据与
-                    // 碰撞盒只有一份尺寸"在现场的机械判据 —— 差一个数就说明这份资产与这份
-                    // 几何不是同一件东西（宁可可见拒绝，也不画一台尺寸不对的电视）。
-                    let measured = preparedTelevision.maximum - preparedTelevision.minimum
-                    guard abs(measured.x - television.size.x) <= 0.002,
-                          abs(measured.y - television.size.y) <= 0.002,
-                          abs(measured.z - television.size.z) <= 0.002 else {
-                        throw ResidentPropHostError.assetUnavailable
-                    }
-                    // 依旧是一件**普通**的生成道具：同一个 `WorldGeneratedProp` 类型、同一条
-                    // 注册路径（下面 `.register(asset.prop)`），摆放/承托/手持/挂点/碰撞盒
-                    // 读到的都是这份 `size`。三轴随 `primitive` 一起落进世界状态 metadata。
-                    let televisionProp = WorldGeneratedProp(
-                        objectID: job.objectID, sourceWishID: job.id.uuidString,
-                        assetID: television.assetID, displayName: job.name,
-                        size: television.size, sourceHeight: television.size.y,
-                        sizeLocked: true, primitive: television.record)
-                    residentOwnedPropAssets[job.objectID] = ResidentOwnedPropAsset(
-                        prop: televisionProp, descriptor: televisionDescriptor)
-                    // 这份资产刚在**这一处**通过字节校验（拼出来的几何逐位回读 + 字节数），
-                    // 把量到的两个数留成收据：以后任何一次"资产未验证"都能说出期望值。
-                    residentPropAssetFacts[job.objectID] = Self.residentPropByteReceipt(
-                        for: televisionDescriptor, bytes: television.assetBytes.count)
-                    residentPropNotices.removeValue(forKey: job.objectID)
-                    residentPropAssetFailures.removeValue(forKey: job.objectID)
-                    // 逐位回读走**既有那条**可见通道（`orientationNotices` 在末尾统一发出，
-                    // 是这一轮里最后说话的那一条 ⇒ 不会被下面的"入库成功"冲掉）。
-                    orientationNotices[job.objectID] = "\(job.name)：" + television.dimensionsSummary
-                    continue
-                }
-                if job.sizeIntent?.mode == .dimensions {
-                    // 三轴**但**不是板形物件（或轴读不出来）：**保持今天的行为** ——
-                    // 生成网格、按最长边等比归一，另外两维只作期望值。
-                    // 这件事必须说出来：不说，用户看到的就是"我说了三轴，它却还是随便一个网格"。
-                    orientationNotices[job.objectID] = "\(job.name)：用户给了完整三轴尺寸，但这件"
-                        + "不是板形物件（最薄轴 / 最长轴超过 "
-                        + String(format: "%.2f", WorldScreenResolution.maximumPanelThicknessRatio)
-                        + "）⇒ 仍用生成的网格、按最长边等比归一，另外两维只作期望值。"
-                }
+                // 生成器把形状做歪时（真机 2026-10-01「平面电视」交回来的是把参考图贴在各面上的
+                // 大立方体），正确做法是**按用户给的三维尺寸逐轴缩放到位** —— 素材会被拉伸，
+                // 那正是"素材 + 他的尺寸"这个取舍本身；**不是**拿一个手拼的替代品糊上去，
+                // 也**不再**给"重新生成 / 手拼几何"两条路让他挑（那个选项整个清掉了）。
+                //
+                // 尺寸只走**唯一一份**策略（`WorldPropSizePolicy`，见下面 `dimensionResolution`）：
+                // app 不自己另写缩放，也不在这里再判一遍"要不要拉"。
                 let url = URL(fileURLWithPath: path)
                 let hash = inspection.sha256
                 let bytes = inspection.bytes
@@ -4203,8 +4171,62 @@ final class AppDelegate:
                 let sizeIntent = job.sizeIntent.flatMap {
                     WorldPropSizeIntent(axis: $0.axis.rawValue, meters: $0.meters, source: $0.source.rawValue)
                 }
-                // 有意图按用户的轴归一；没有意图才走今天的自动推断。
-                let intendedSize = sizeIntent.flatMap {
+                // ---- 三轴尺寸意图：**三个数就是三个数**（逐轴）--------------------------------
+                //
+                // 用户给了完整长宽高（`mode == "dimensions"`）时，世界里那一份 `size` **严格等于**
+                // 他给的三轴 `(x/1000, y/1000, z/1000)`：渲染端按 `size[i] / 摆正后网格跨度[i]`
+                // **逐轴**缩放，碰撞盒/承托/摆放判据读的是**同一份 `size`**（`effectiveSize`）——
+                // 分叉只可能来自"两处各推一份尺寸"，而这里只有一个出口。
+                //
+                // 用户 2026-10-02 的产品决定（「不能再用集合拼了」）：形状歪了就**逐轴拉到位** ——
+                // 素材会被拉伸，那正是"素材 + 他的尺寸"这个取舍本身；不拿手拼几何替代，也不再给
+                // 两条路让他挑（`dimensionsVerdict` 因此不再返回 `.shapeTooFar`，
+                // 托盘预览读的是同一个裁决 ⇒ 预览与最终产物不可能长得不一样）。
+                //
+                // 只有一件事会打扰用户：**拉过去明显不可用**（逐轴落不了地，或某根轴贴到契约下限）。
+                // 那时给**唯一**那条建议：换一张正面产品图重新生成。三个数兑现了就一个字都不说。
+                var dimensionResolution: WorldPropSizePolicy.Resolution?
+                if let intent = job.sizeIntent, intent.mode == .dimensions,
+                   let millimeters = intent.millimeters,
+                   let spec = WorldPropSizeMillimeters(x: Float(millimeters.x),
+                                                       y: Float(millimeters.y),
+                                                       z: Float(millimeters.z)) {
+                    let wanted = "\(String(format: "%g", millimeters.x)) × "
+                        + "\(String(format: "%g", millimeters.y)) × "
+                        + "\(String(format: "%g", millimeters.z)) 毫米"
+                    // 裁决**只有一处**（`dimensionsVerdict`）：托盘预览读的是同一个它。
+                    switch WorldPropSizePolicy.dimensionsVerdict(sourceExtent: sourceExtent,
+                                                                 millimeters: spec) {
+                    case let .exact(resolution):
+                        dimensionResolution = resolution
+                        // 有轴已经贴到契约下限：逐轴拉过去明显不可用 ⇒ 可见说明 + 那条唯一建议。
+                        if millimeters.edges.contains(where: {
+                            Float($0) <= WorldPropSizeMillimeters.minimumMillimeters
+                        }) {
+                            orientationNotices[job.objectID] = "\(job.name)：你要的 \(wanted)"
+                                + " 里有一根轴已经贴到下限（"
+                                + String(format: "%g", WorldPropSizeMillimeters.minimumMillimeters)
+                                + " 毫米），逐轴拉过去会明显不可用 ⇒ 建议换一张正面产品图重新生成。"
+                        }
+                    case .shapeTooFar:
+                        // 产品决定之后这一支**不可达**（`dimensionsVerdict` 只返回 `.exact` /
+                        // `.unrealizable`）。留着只为穷尽匹配；万一它回来，也照样逐轴兑现 ——
+                        // 绝不退回手拼几何，也绝不静默降级成等比。
+                        dimensionResolution = WorldPropSizePolicy.intended(
+                            sourceExtent: sourceExtent, millimeters: spec)
+                    case .unrealizable:
+                        // 逐轴落不了地（三个数越界 / 低于可见下限 / 网格量不出跨度）：说清楚，
+                        // **不**当"没有意图"静默退回单轴，也不再提"几何拼"。
+                        orientationNotices[job.objectID] = "\(job.name)：你要的 \(wanted) 没法逐轴"
+                            + "兑现（三个数越界、或整体小于 "
+                            + String(format: "%.2f", WorldPropSizePolicy.minimumExtentMeters)
+                            + " 米、或这份网格量不出三轴跨度）⇒ 先按原来那一份尺寸显示；"
+                            + "建议换一张正面产品图重新生成。"
+                    }
+                }
+                // 三轴意图优先（逐轴、就是那三个数）；只有单轴意图时才按那一根轴等比归一；
+                // 都没有才走今天的自动推断。
+                let intendedSize = dimensionResolution ?? sizeIntent.flatMap {
                     WorldPropSizePolicy.intended(sourceExtent: sourceExtent, axis: $0.axis, meters: $0.meters)
                 }
                 guard let autoSize = intendedSize ?? WorldPropSizePolicy.automatic(
@@ -4372,6 +4394,12 @@ final class AppDelegate:
                     residentPropNotices[job.objectID] = message
                     showResidentVoiceStatus(message)
                 }
+                // ---- 这里不再有"手拼几何"这个选项（用户 2026-10-02 的决定）------------------
+                // 原来这一处会在"生成器没做对"（生成网格不是板形）时把两条路摆给用户：
+                // ① 重新生成 ② 手拼几何。现在一律：素材生成 + 按他的三轴**逐轴拉到位**
+                // （形状差得远也拉，见上面 `dimensionResolution`）—— 不再提供手拼这条路，
+                // 也不再拿"生成器做得不像"去打扰他；只有**明显不可用**（逐轴落不了地 / 有轴
+                // 贴到契约下限）才可见地建议换一张正面产品图重新生成。
             } catch {
                 // Losing the renderer or cancelling while switching worlds is
                 // not an asset failure; only real damage/size/GPU errors are.
@@ -4494,41 +4522,6 @@ final class AppDelegate:
         Task { @MainActor [weak self] in await self?.synchronizeOwnedResidentProps() }
     }
 
-    /// 把一段**基础几何**资产的字节落到内容寻址的住处，返回渲染端读得到的 URL。
-    ///
-    /// 住处与生成产物的模型文件是**同一个目录**（`PropTaskDaemonClient` 的 root：
-    /// `Application Support/gmgn radio/TaskService` —— 生成结果里 `local_model_path`
-    /// 就是这里的 `<job.id>.glb`），文件名是字节的 sha256。引用形式也**同一种**：
-    /// `assetID == "sha256:" + sha256(bytes)`，于是 `WorldPropAssetReferences.blobRefs(of:)`
-    /// 对生成产物与基础几何产出的是同一种内容寻址引用，删除那一条线释放的也是同一个键。
-    ///
-    /// **幂等**：同样的字节 ⇒ 同样的路径；已经存在且校验通过就不重写（内容寻址天然如此）。
-    /// 校验失败（文件被改过 / 上次写坏）⇒ 重写一次，绝不把坏字节当成"资产已就位"。
-    ///
-    /// 局限（如实说）：app 侧今天**没有** `world_blob_put` 的调用点（权威客户端只在
-    /// `LivingWorldBootstrap` 里构造，入库这一处够不到它），所以这里做的是"同一个住处、
-    /// 同一种命名、同一种引用形式"，而不是给 `world_blobs` 写一行。要让权威那一张表也
-    /// 认得这份字节，得先把 blob put 接到世界权威客户端上 —— 那是另一条线。
-    private static func materializeContentAddressedAsset(
-        _ television: WorldPrimitiveTelevision
-    ) throws -> URL {
-        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("gmgn radio/TaskService", isDirectory: true)
-        guard television.assetID.hasPrefix("sha256:") else { throw ResidentPropHostError.assetUnavailable }
-        let digest = String(television.assetID.dropFirst("sha256:".count))
-        guard digest.count == 64, digest.allSatisfy({ $0.isHexDigit }) else {
-            throw ResidentPropHostError.assetUnavailable
-        }
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let url = root.appendingPathComponent(digest + ".glb")
-        if let existing = try? Data(contentsOf: url),
-           SHA256.hash(data: existing).map({ String(format: "%02x", $0) }).joined() == digest {
-            return url
-        }
-        try television.assetBytes.write(to: url, options: .atomic)
-        return url
-    }
-
     private func prepareResidentPropMutation(_ command: WorldPropLayoutCommand, context: WorldAgentContext) async throws {
         var ids = Set(context.state.objectStates.compactMap { $0.value.isEnabled && $0.value.generatedProp != nil ? $0.key : nil })
         switch command {
@@ -4579,7 +4572,11 @@ final class AppDelegate:
         return .residentProp(objectID: prop.objectID, worldID: asset.descriptor.worldID, assetID: prop.assetID,
                              modelURL: asset.descriptor.modelURL, targetHeightMeters: prop.effectiveSize.y,
                              position: SIMD3(p.x, p.y, p.z), rotation: SIMD4(q.x, q.y, q.z, q.w),
-                             orientation: asset.prop.orientationRotation)
+                             orientation: asset.prop.orientationRotation,
+                             // 渲染端读的三轴就是判据/碰撞盒读的那一份（`effectiveSize`）：
+                             // 用户给完整三轴时逐轴缩放到这三个数，否则它是网格的等比像 ⇒
+                             // 渲染矩阵落回原来那一份等比路径（逐位不变）。
+                             targetSizeMeters: prop.effectiveSize)
     }
 
     private func residentPropEditorSnapshot(context: WorldAgentContext) -> ResidentPropEditorSnapshot {
@@ -4718,7 +4715,10 @@ final class AppDelegate:
                      // 不是这里再写死一个右手。
                      attachmentPoint: held.hand.attachmentPoint, calibration: calibration,
                      // 手持与已摆共用同一份资产级摆正旋转（同一个出口）。
-                     orientation: asset.prop.orientationRotation)
+                     orientation: asset.prop.orientationRotation,
+                     // 也共用**同一组三轴尺寸**（`effectiveSize`）：地上是三轴、手里变回等比
+                     // 这种分叉在结构上不可能。
+                     targetSizeMeters: prop.effectiveSize)
     }
 
     private func safelyReturnHeldPropIfAvatarChanged(_ snapshot: StageAvatarRuntimeSnapshot) {
@@ -5508,6 +5508,10 @@ final class AppDelegate:
             residentPropEditingPreferenceEnabled = UserDefaults.standard.bool(forKey: "resident.autonomous.enabled.v1")
             temporarilyPauseResidentForPropEditing()
             liveCamMessageID = nil
+            // 先把**原因**写下来，再取消在飞的轮次：真机 2026-10-02 16:56:00.786 /
+            // 16:58:15.398 两次 `turn/end {aborted, reason:{user}}` 都是这一步按下的，
+            // 当时界面只能把它说成"未送达"。现在它是一句具名的中止。
+            residentAgentLoop?.noteHostInterruption(.hostAction("进入了装修"))
             AgentConversationService.shared.cancel()
             avatarRuntime.clearResidentThinking()
             residentActivityOutcome?.abort()
@@ -5758,6 +5762,9 @@ final class AppDelegate:
                 self.presentResidentReply(reply)
             },
             onFailure: { [weak self] message in self?.presentResidentLoopFailure(message) },
+            onInterruption: { [weak self] ids, interruption in
+                self?.presentResidentInterruption(ids: ids, interruption: interruption)
+            },
             onChange: { [weak self] in self?.synchronizeResidentLoopPresentation() },
             onCancel: { [weak self] in
                 AgentConversationService.shared.cancel()
@@ -7265,6 +7272,22 @@ final class AppDelegate:
             switch source {
             case .stage: self.stageWindowController?.restoreResidentSubmission(submission, notice: notice)
             case .liveCam: self.liveCamWindowController?.restoreResidentSubmission(submission, notice: notice)
+            }
+        }, onInterrupted: { [weak self, weak loop] text in
+            // 与 `onFailure` **分开**：这一轮是宿主自己停下的（更新的指令超车 /
+            // 进入装修 / 换空间），或压根没发出去（面板正开着）。历史里写具名中止，
+            // 草稿照样回到输入框，绝不写成「未送达」。
+            guard let self, let loop, self.residentAgentLoop === loop,
+                  !loop.snapshot.isInvalidated,
+                  self.currentResidentWorldContext().sessionScope == worldScope else { return }
+            self.residentChatTranscript.markInterrupted(
+                ids: [submission.id],
+                interruption: loop.lastFinishedTurnInterruption ?? .newerInstruction
+            )
+            self.publishResidentTranscript()
+            switch source {
+            case .stage: self.stageWindowController?.restoreResidentSubmission(submission, notice: text)
+            case .liveCam: self.liveCamWindowController?.restoreResidentSubmission(submission, notice: text)
             }
         })
     }

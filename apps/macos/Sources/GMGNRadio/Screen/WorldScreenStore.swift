@@ -1,7 +1,15 @@
 import AppKit
 import Foundation
+import os
 import simd
 import WorldRuntime
+
+/// 电视这条线的统一日志（`subsystem = ai.gmgn.radio`）。
+///
+/// 面板上只留人话，**工程细节全部走这里**：几何出处原话（法向 / 面积 / m²）、
+/// 前景遮挡的格数与掩码耗时（"63/336 格"、"117.98 ms"）。真机 2026-10-02 的教训是
+/// "把这些摆到面板上" —— 用户看到的是「什么玩意儿」。
+private let screenPanelLogger = Logger(subsystem: "ai.gmgn.radio", category: "screen")
 
 /// 电视屏幕在 App 里的**唯一**接线点。
 ///
@@ -57,6 +65,8 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
     private var occluderTrianglesRevision: UInt64 = .max
     /// 已摆放物件的遮挡盒（随世界状态刷新，跟着 `rebuild()` 走）。
     private var occluderPropBoxes: [WorldScreenBox] = []
+    /// 每块屏幕上一次写进日志的"被挡"状态。只在**翻转**时写一行，绝不刷屏。
+    private var lastOcclusionLogged: [String: Bool] = [:]
     private var trackingTask: Task<Void, Never>?
     private var lastTrackingKey = ""
     private var tickCount = 0
@@ -324,6 +334,7 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
             let stateText = issues[objectID]?.errorDescription
                 ?? surface?.state.displayText
                 ?? "未开始"
+            logOcclusionIfChanged(objectID: objectID, stat: stats[objectID])
             return WorldScreenSnapshot(
                 objectID: objectID,
                 displayName: source.displayName(objectID),
@@ -334,9 +345,32 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
                 contentURL: contents[objectID]?.url ?? surface?.requestedURL,
                 stateText: stateText,
                 isPlaying: surface?.state.isPlaying ?? false,
-                occlusionText: stats[objectID]?.displayText
+                occlusionText: stats[objectID]?.displayText,
+                isBlocked: (stats[objectID]?.blockedCellCount ?? 0) > 0,
+                // 几何给不出来时**不**把覆盖层那个状态交给面板：那一步会把"没有屏幕"
+                // 借道 `.blocked` 说成"这个视频不让嵌进来放"（误导）。此时面板由
+                // 上面那句"屏幕范围：还没认出来"负责说清楚。
+                surfaceState: issues[objectID] == nil ? surface?.state : nil
             )
         }
+    }
+
+    /// 「画面被挡住」这件事的**工程账**：只在**状态翻转**的那一次写一行日志。
+    ///
+    /// 面板上那句话是人话、且被挡期间逐字不变（`ScreenPanelCopy.occlusionLine`）；格数与
+    /// 掩码耗时（"63/336 格"、"117.98 ms"）是给工程用的，所以它们走这里去
+    /// `subsystem = ai.gmgn.radio` 的统一日志，**不进面板**（真机 2026-10-02「什么玩意儿」）。
+    ///
+    /// 为什么只在翻转时写：`makeSnapshots()` 每次刷新都会调它，而耗时每帧都在变 ——
+    /// 每次都写就是刷屏，日志也就没人看了。
+    private func logOcclusionIfChanged(objectID: String, stat: WorldScreenOcclusionStat?) {
+        let isBlocked = (stat?.blockedCellCount ?? 0) > 0
+        guard lastOcclusionLogged[objectID] != isBlocked else { return }
+        lastOcclusionLogged[objectID] = isBlocked
+        guard let stat else { return }
+        screenPanelLogger.notice(
+            "电视画面遮挡 物件=\(objectID, privacy: .public) 被挡=\(isBlocked, privacy: .public) \(stat.displayText, privacy: .public)"
+        )
     }
 
     func playScreen(objectID: String?, rawContent: String) async -> WorldScreenCommandOutcome {
@@ -345,13 +379,17 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
             return .failure(
                 .screenNotFound,
                 objectID == nil
-                    ? "这个空间里没有电视。先生成一件电视，或在面板里把一件物件标定成屏幕。"
+                    ? "这个空间里没有电视。先生成一件电视，或者在面板里把一件物件指定成电视。"
                     : "这个空间里没有「\(objectID ?? "")」这台电视。"
             )
         }
         if let issue = issues[target] {
+            // 面板与 agent 共用 `message` ⇒ 说人话（"还没认出来，点「调整屏幕范围」"）；
+            // 具名的几何原因（三边、比值、阈值）进 `details` 与日志。
             return .failure(
-                .screenGeometryMissing, issue.errorDescription, details: ["screen_id": target]
+                .screenGeometryMissing,
+                ScreenPanelCopy.screenRangeLine(source: nil, hasGeometryIssue: true),
+                details: ["screen_id": target, "cause": issue.errorDescription]
             )
         }
         let url: URL
@@ -370,7 +408,7 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
         guard surface.state.isPlaying || overlay.canLoad(anotherThan: target) else {
             return .failure(
                 .screenCapacityExceeded,
-                "同时最多放 \(Self.maximumSimultaneousScreens) 块屏幕，先关一块。",
+                "同时最多放 \(Self.maximumSimultaneousScreens) 台电视，先停一台。",
                 details: ["screen_id": target, "playing": String(overlay.playingCount)]
             )
         }
@@ -388,10 +426,16 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
         let deadline = ContinuousClock.now + Self.immediateFailureWindow
         while ContinuousClock.now < deadline {
             if case let .failed(failure) = surface.state {
+                // `message` 是**面板与 agent 共用**的那一句 ⇒ 说人话（`panelText`）。
+                // 工程口径的原因（HTTP 码 / WebKit 给的原话）进 `details` 与日志，
+                // 不摆到面板上 —— 真机 2026-10-02「什么玩意儿」。
                 return .failure(
                     .screenLoadFailed,
-                    failure.errorDescription,
-                    details: ["screen_id": target, "url": url.absoluteString]
+                    failure.panelText,
+                    details: [
+                        "screen_id": target, "url": url.absoluteString,
+                        "cause": failure.errorDescription,
+                    ]
                 )
             }
             if surface.state.isPlaying { break }
@@ -399,7 +443,9 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
         }
         snapshots = makeSnapshots()
         return .ok(
-            "\(source.displayName(target))：\(surface.state.displayText)",
+            "\(source.displayName(target))："
+                + (ScreenPanelCopy.statusLine(for: surface.state, isPlaying: surface.state.isPlaying)
+                   ?? "已经放起来了。"),
             details: [
                 "screen_id": target,
                 "url": url.absoluteString,
@@ -437,7 +483,7 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
         guard definition.isValid else {
             return .failure(
                 .invalidArguments,
-                "标定值不合理：宽高必须在 0.04–10 m，中心高必须在 ±100 m 内。"
+                "这个大小不合适：宽高要在 0.04–10 m 之间，中心高在 ±100 m 之内。"
             )
         }
         calibrationOverrides[objectID] = definition
@@ -446,7 +492,12 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
         overlay.surface(for: objectID).geometryIssue = nil
         source.persistDefinition?(definition)
         snapshots = makeSnapshots()
-        return .ok("已标定\(source.displayName(objectID))：\(note)", details: ["screen_id": objectID])
+        // `message` 是面板与 agent 共用的那一句 ⇒ 人话；`note`（工程口径的那份原文）
+        // 已经随定义落进 metadata，进 `details` 给工具看，不摆到面板上。
+        return .ok(
+            "\(source.displayName(objectID))的屏幕范围已经按你给的大小调好了。",
+            details: ["screen_id": objectID, "note": note]
+        )
     }
 
     /// 把一台电视**显式**指定成屏幕（给"名字里没有 tv 但确实是电视"的物件一条明路）。
@@ -461,8 +512,12 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
             source.persistDefinition?(definition)
             snapshots = makeSnapshots()
             return .ok(
-                "已把\(source.displayName(objectID))当屏幕：\(definition.note)",
-                details: ["screen_id": objectID, "geometry_source": definition.source.rawValue]
+                "已经把\(source.displayName(objectID))当成电视了。",
+                details: [
+                    "screen_id": objectID,
+                    "geometry_source": definition.source.rawValue,
+                    "note": definition.note,
+                ]
             )
         case let .failure(issue):
             return .failure(

@@ -148,7 +148,7 @@ import simd
         }
         try Task.checkCancellation()
         let minimum=asset.asset.worldBounds.min,maximum=asset.asset.worldBounds.max
-        _=try ResidentPropPlacementMatrix.transform(minimum:minimum,maximum:maximum,targetHeight:item.targetHeightMeters,position:item.position,yaw:item.yaw,orientation:item.orientation)
+        _=try ResidentPropPlacementMatrix.transform(minimum:minimum,maximum:maximum,targetHeight:item.targetHeightMeters,targetSize:item.targetSizeMeters,position:item.position,yaw:item.yaw,orientation:item.orientation)
         // `sourceHeight` 与 `size` 都是**摆正之后**的那一份：`WorldSimulation` 用
         // `size.y / sourceHeight` 算物件自己的等比缩放，渲染矩阵也按摆正后的高度归一 ——
         // 两处必须是同一个数，否则画面与存档各缩各的。躺着的网格（真机那把剑）在这一步
@@ -169,7 +169,21 @@ import simd
         // 只按高度轴归一的尺寸（见 `ResidentPropPreparedAsset.size` 的说明）：真正的自动
         // 尺寸由 `WorldPropSizePolicy` 在**拿到生成请求高度的那一处**算出（细长物件按最长边
         // 归一）。渲染端不重复应用策略 —— 它拿到的 targetHeight 已经是定稿高度。
-        return ResidentPropPreparedAsset(minimum:minimum,maximum:maximum,sourceHeight:sourceHeight,size:orientedExtent*(item.targetHeightMeters/sourceHeight))
+        //
+        // 三轴那一份（`targetSizeMeters`，就是世界里那一份 `effectiveSize`）：目标尺寸是
+        // 这份网格的等比像就落回上面那条（原有物件逐位不变），否则**逐轴** ——
+        // 与 `ResidentPropPlacementMatrix.transform` 读的是**同一个字段、同一个判据**，
+        // 于是"画面按等比、碰撞盒按三轴"这种分叉在结构上不可能。
+        let size: SIMD3<Float>
+        if let targetSize = item.targetSizeMeters,
+           WorldPropSizePolicy.uniformFactor(
+               from: WorldVector3(x: orientedExtent.x, y: orientedExtent.y, z: orientedExtent.z),
+               to: targetSize) == nil {
+            size = SIMD3<Float>(targetSize.x, targetSize.y, targetSize.z)
+        } else {
+            size = orientedExtent*(item.targetHeightMeters/sourceHeight)
+        }
+        return ResidentPropPreparedAsset(minimum:minimum,maximum:maximum,sourceHeight:sourceHeight,size:size)
     }
 
     @discardableResult func render(commandBuffer: MTLCommandBuffer, colorTexture: MTLTexture, depthTexture: MTLTexture,
@@ -186,7 +200,7 @@ import simd
         for item in drawable {
             guard let loaded=cache[item.assetKey] else { continue }
             do {
-                let transform=try ResidentPropPlacementMatrix.transform(minimum:loaded.asset.worldBounds.min,maximum:loaded.asset.worldBounds.max,targetHeight:item.targetHeightMeters,position:item.position,yaw:item.yaw,orientation:item.orientation)
+                let transform=try ResidentPropPlacementMatrix.transform(minimum:loaded.asset.worldBounds.min,maximum:loaded.asset.worldBounds.max,targetHeight:item.targetHeightMeters,targetSize:item.targetSizeMeters,position:item.position,yaw:item.yaw,orientation:item.orientation)
                 let calls=loaded.asset.drawCalls.map { GLTFDrawCall(mesh:$0.mesh,material:$0.material,modelMatrix:transform * $0.modelMatrix,skinPalette:$0.skinPalette) }
                 loaded.renderer.encodeOpaqueDrawCalls(calls,scene:GLTFSceneState(viewProjection:WishMachineOutputPlacement.projection(viewProjection,reversedDepth:reversedDepth),cameraPosition:cameraPosition),pipelineStates:loaded.pipelines,depthState:reversedDepth ? loaded.reverseDepth : loaded.forwardDepth,encoder:encoder)
             } catch {
@@ -301,7 +315,8 @@ import simd
             modelURL: held.modelURL,
             targetHeightMeters: held.targetHeightMeters,
             position: .zero,
-            yaw: 0
+            yaw: 0,
+            targetSizeMeters: held.targetSizeMeters
         )
     }
 }

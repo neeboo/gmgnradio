@@ -13,57 +13,92 @@ struct WorldPrimitiveTelevisionTests {
     /// 用户原话，逐字。
     private let television = WorldPropSizeMillimeters(x: 1443, y: 862, z: 302)!
 
-    // MARK: - 1. 三轴 → 世界尺寸：按最长边**等比**，另外两维只是期望值
+    // MARK: - 1. 三轴 → 世界尺寸：**三个数就是三个数**（逐轴）
 
-    @Test("三轴意图按最长边等比归一，绝不非等比拉伸")
-    func threeAxisIntentScalesUniformly() throws {
-        // 生成器交回来的那个**立方体**（真机现象）。
+    @Test("三轴意图逐轴兑现：size 严格等于用户给的那三个数")
+    func threeAxisIntentIsHonoredPerAxis() throws {
+        // 生成器交回来的那个**立方体**（真机现象）。旧行为按最长边等比 ⇒ 场景里只有一个
+        // 1.443 米那一维是对的，另外两维根本没兑现（用户："我都给了尺寸了为什么不能按照尺寸出"）。
         let cube = WorldVector3(x: 0.5, y: 0.5, z: 0.5)
         let fromCube = try #require(WorldPropSizePolicy.intended(sourceExtent: cube, millimeters: television))
-        #expect(fromCube.basis == .longestEdge)
-        #expect(abs(WorldPropSizePolicy.longestEdge(of: fromCube.size) - 1.443) <= 1e-4,
-                "最长边必须是用户说的 1443 mm（实测 \(fromCube.size)）")
-        // 立方体 → 仍然是立方体：三个轴同一个因子。
-        #expect(abs(fromCube.size.x - fromCube.size.y) <= 1e-5)
-        #expect(abs(fromCube.size.y - fromCube.size.z) <= 1e-5)
+        #expect(fromCube.basis == .dimensions)
+        #expect(abs(fromCube.size.x - 1.443) <= 1e-5
+                && abs(fromCube.size.y - 0.862) <= 1e-5
+                && abs(fromCube.size.z - 0.302) <= 1e-5,
+                "三个轴必须逐位是用户给的那三个数（实测 \(fromCube.size)）")
+        // 逐轴比例 = 目标 / 网格跨度，三个分量**可以**不同 —— 这正是"兑现到三个轴"。
+        #expect(abs(fromCube.scales.x - 1.443 / 0.5) <= 1e-4)
+        #expect(abs(fromCube.scales.y - 0.862 / 0.5) <= 1e-4)
+        #expect(abs(fromCube.scales.z - 0.302 / 0.5) <= 1e-4)
+        #expect(!fromCube.isUniform, "立方体 → 扁平面板本来就不是等比")
 
-        // 真实生成网格（细长）：三个轴的因子**必须逐位相同**，否则碰撞盒与画面就分叉了。
+        // 真实生成网格（细长）：同样逐位等于那三个数，而不是"最长边 1.443、其余保持原比例"。
         let sword = WorldVector3(x: 1.005, y: 0.133, z: 0.057)
         let resolution = try #require(WorldPropSizePolicy.intended(sourceExtent: sword, millimeters: television))
-        let fx = resolution.size.x / sword.x
-        let fy = resolution.size.y / sword.y
-        let fz = resolution.size.z / sword.z
-        #expect(abs(fx - fy) <= 1e-6 && abs(fy - fz) <= 1e-6,
-                "三个轴必须是同一个比例（实测 \(fx) / \(fy) / \(fz)）")
-        // 唯一一份等比缩放的存在性判据（生产里拒绝非等比 `size` 用的就是它）。
-        #expect(WorldPropSizePolicy.uniformFactor(from: sword, to: resolution.size) != nil,
-                "三轴归一的结果必须能过 `uniformFactor`（等比）")
-        // 另外两维是**期望值**，必须在 reason 里说出来 —— 不说就是静默丢掉。
+        #expect(abs(resolution.size.x - 1.443) <= 1e-5
+                && abs(resolution.size.y - 0.862) <= 1e-5
+                && abs(resolution.size.z - 0.302) <= 1e-5,
+                "细长网格也必须落到那三个数（实测 \(resolution.size)）")
+        // 三个比例确实是 size / 跨度：世界里那一份 `size` 与渲染端那一份缩放是同一组数字。
+        #expect(abs(resolution.scales.x - resolution.size.x / sword.x) <= 1e-5)
+        #expect(abs(resolution.scales.y - resolution.size.y / sword.y) <= 1e-5)
+        #expect(abs(resolution.scales.z - resolution.size.z / sword.z) <= 1e-5)
+        // reason 必须说出**逐轴**，而且三个数都在里面（不再有"另外两维只是期望值"这种话）。
         let reason = try #require(resolution.reason)
-        #expect(reason.contains("期望"), "reason 必须说明另外两维只是期望值（实测 \(reason)）")
-        #expect(reason.contains("等比"), "reason 必须说明是等比归一（实测 \(reason)）")
+        #expect(reason.contains("逐轴"), "reason 必须说明是逐轴兑现（实测 \(reason)）")
+        #expect(reason.contains("1.44") && reason.contains("0.86") && reason.contains("0.30"),
+                "reason 必须把三个数都写出来（实测 \(reason)）")
     }
 
-    @Test("三轴归一的夹取仍然是夹取，而且给得出理由")
-    func threeAxisIntentClampsWithAReadableReason() throws {
-        // 下夹取**够得着**：契约允许到 10 mm（0.01 m），而渲染可见下限是 20 mm（0.02 m）。
-        let smallest = WorldPropSizeMillimeters(x: 10, y: 10, z: 10)!
-        let raised = try #require(WorldPropSizePolicy.intended(
-            sourceExtent: WorldVector3(x: 0.5, y: 0.5, z: 0.5), millimeters: smallest))
-        #expect(raised.basis == .clampedMinimum,
-                "低于可见下限必须被夹取（实测 \(raised.basis)）")
-        #expect(abs(WorldPropSizePolicy.longestEdge(of: raised.size)
-                    - WorldPropSizePolicy.minimumExtentMeters) <= 1e-5)
-        #expect(raised.reason?.contains("低于下限") == true, "夹取必须给理由（实测 \(raised.reason ?? "nil")）")
+    @Test("形状偏离度可量（立方体 → 扁平面板 ≈ 4.78），而形状差得远**也**逐轴兑现")
+    func threeAxisShapeDistortionIsMeasurable() throws {
+        let cube = WorldVector3(x: 0.5, y: 0.5, z: 0.5)
+        let distortion = try #require(WorldPropSizePolicy.dimensionShapeDistortion(
+            sourceExtent: cube, millimeters: television))
+        // (1.443 / 0.5) / (0.302 / 0.5) = 1.443 / 0.302 ≈ 4.78
+        #expect(abs(distortion - 1.443 / 0.302) <= 1e-3, "实测 \(distortion)")
+        #expect(distortion > WorldPropSizePolicy.perAxisStretchLimit,
+                "立方体拉到扁平面板的偏离度必须超过上限（这个数是「素材被拉了多少」那个读数）")
+        // 2026-10-02 产品决定（用户原话「不能再用集合拼了」）：形状歪了**也**按他给的三个数
+        // 逐轴兑现 —— 不拿手拼几何替代，也不退回等比。所以裁决**不是** `shapeTooFar` 那道门，
+        // 而是 `.exact`：三个数一个都不许少。素材被拉伸正是"素材 + 他的尺寸"这个取舍本身。
+        guard case let .exact(resolution) = WorldPropSizePolicy.dimensionsVerdict(
+            sourceExtent: cube, millimeters: television) else {
+            Issue.record("形状差得远**也**必须逐轴兑现（实测 \(WorldPropSizePolicy.dimensionsVerdict(sourceExtent: cube, millimeters: television))）")
+            return
+        }
+        #expect(abs(resolution.size.x - 1.443) <= 1e-5
+                && abs(resolution.size.y - 0.862) <= 1e-5
+                && abs(resolution.size.z - 0.302) <= 1e-5,
+                "立方体网格也必须落到那三个数（实测 \(resolution.size)）")
+        // 形状本来就接近目标的网格 ⇒ 同样逐轴兑现（偏离度 1）。
+        let close = WorldVector3(x: 0.5, y: 0.862 / 1.443 * 0.5, z: 0.302 / 1.443 * 0.5)
+        guard case .exact = WorldPropSizePolicy.dimensionsVerdict(
+            sourceExtent: close, millimeters: television) else {
+            Issue.record("形状接近的网格必须逐轴兑现")
+            return
+        }
+    }
 
-        // 上夹取**够不着**：契约上界与渲染上界**是同一个数**（3000 mm = 3 m），
-        // 所以从三轴入口走进来的最长边永远不可能 "> 3"。这一条是**否定断言**：
-        // 端点不该被误判成越界（否则 3000 mm 的合法规格会被悄悄缩到 3 m 之下）。
+    @Test("三轴意图不再夹取：越界 / 低于可见下限就是具名拒绝（不是静默改数字）")
+    func threeAxisIntentRefusesInsteadOfClamping() throws {
+        // 契约允许到 10 mm（0.01 m），而渲染可见下限是 20 mm（0.02 m）：**不许**静默放大到
+        // 下限 —— 那等于"你给的不是你要的"，与"三个数就是三个数"直接矛盾。
+        let smallest = WorldPropSizeMillimeters(x: 10, y: 10, z: 10)!
+        #expect(WorldPropSizePolicy.intended(
+            sourceExtent: WorldVector3(x: 0.5, y: 0.5, z: 0.5), millimeters: smallest) == nil,
+            "低于可见下限必须具名拒绝，不许静默夹到 0.02 米")
+        #expect(WorldPropSizePolicy.dimensionsVerdict(
+            sourceExtent: WorldVector3(x: 0.5, y: 0.5, z: 0.5), millimeters: smallest) == .unrealizable)
+
+        // 上界：契约上界与渲染上界**是同一个数**（3000 mm = 3 m），端点合法且逐位兑现 ——
+        // 这一条是**否定断言**：端点不该被误判成越界（否则 3000 mm 的合法规格会被悄悄缩下去）。
         let largest = WorldPropSizeMillimeters(x: 1443, y: 862, z: 3000)!
         let atLimit = try #require(WorldPropSizePolicy.intended(
             sourceExtent: WorldVector3(x: 0.5, y: 0.5, z: 0.5), millimeters: largest))
-        #expect(atLimit.basis == .longestEdge, "闭区间端点不该被夹取（实测 \(atLimit.basis)）")
-        #expect(abs(WorldPropSizePolicy.longestEdge(of: atLimit.size) - 3) <= 1e-5)
+        #expect(atLimit.basis == .dimensions, "闭区间端点必须逐轴兑现（实测 \(atLimit.basis)）")
+        #expect(abs(atLimit.size.z - 3) <= 1e-5 && abs(atLimit.size.x - 1.443) <= 1e-5
+                && abs(atLimit.size.y - 0.862) <= 1e-5)
         // 而契约里的三轴**永远**不会超过渲染上限，所以 `clampedMaximum` 在这条路上不可达。
         #expect(WorldPropSizeMillimeters.maximumMillimeters
                     == WorldPropSizePolicy.maximumExtentMeters * 1000)

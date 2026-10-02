@@ -317,6 +317,13 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     /// 它们的效果是**居民手里**的东西，用户是在面板上连点微调，抢焦点没有收益（也刻意不动
     /// 那套既有行为）。
     var onSceneFocusRequested: (@MainActor (String) -> Void)?
+    /// 同一次用户意图内**已经提交过**的许愿动作（值来自 `WishActionLedger`）。
+    ///
+    /// 只由唯一那个动作出口 `performWishAction` 读写；行不再提供那个动作时由
+    /// `pruneSubmittedWishActions()` 放掉（"这一件已经不是那个状态了"），
+    /// 关面板 / 换世界由 `close()` 清空（"用户不要这件事了"）。台账里没有判据，
+    /// 只有一个事实："这个 `(任务, 动作)` 在这次意图里已经交出去过一次"。
+    private var submittedWishActions = WishActionLedger()
     private var generation = UUID()
     private var previewGeneration = UUID()
     private var draftRevision: UInt64?
@@ -416,9 +423,39 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
             notice = Self.supportReadyText
         }
         snapshot = value
+        // 「已经交出去过一次」的台账随**投影**剪枝：行不再提供那个动作（换了动作、
+        // 进了库存、已删除）就放掉，下一次点击是新的意图。
+        pruneSubmittedWishActions()
         // 承托面到了 ⇒ 把"格子还没就绪时点的那一行"补做掉（见 `completePendingSelectIfReady`）。
         // 这是**唯一**的补做触发点：宿主在就绪那一刻重推快照，正是那次点击被浪费的地方。
         completePendingSelectIfReady()
+    }
+    /// 把许愿动作台账剪到"此刻投影仍然提供的动作"这一集合上。
+    ///
+    /// 判据不在这里：哪一行、给哪些动作，全部来自**唯一投影**（`snapshot.ownershipFacts`
+    /// → `ResidentOwnershipProjection.row`）；本方法只做集合交集，不新增第二条可见性判据。
+    private func pruneSubmittedWishActions() {
+        let offered = Set(snapshot.ownershipFacts.map(ResidentOwnershipProjection.row).flatMap { row -> [String] in
+            guard let jobID = row.key.jobID?.uuidString else { return [] }
+            return row.actions.compactMap { action in
+                Self.wishActionStep(for: action).map { WishActionLedger.key(jobID: jobID, step: $0) }
+            }
+        })
+        submittedWishActions.keepOnly(offered)
+    }
+    /// 投影给的动作 → 唯一那个动作出口用的 `step` 名（与 `claimWish` / `retryWish` /
+    /// `askResidentToFetch` / `retryWishInventory` 传进去的字面量一一对应）。
+    ///
+    /// 不是"动作到状态的映射"：它只回答"这一行现在给的那个按钮，走的是哪一个出口"，
+    /// 仍然由投影决定**给不给**；给不出的动作（摆放/收回/删除）在这里返回 nil。
+    static func wishActionStep(for action: OwnershipRowAction) -> String? {
+        switch action {
+        case .claim: "claim"
+        case .askResidentToFetch: "ask-resident"
+        case .retry: "retry"
+        case .retryInventoryRegistration: "retry-inventory"
+        case .place, .withdraw, .delete: nil
+        }
     }
     func open() { guard !snapshot.worldID.isEmpty, !isOpen else { return }; isOpen = true; onEditingChanged(true) }
     func close() {
@@ -426,6 +463,8 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
         // 关面板 / 退出装修 / 换世界走的是同一条 `close()`：都是"用户不要这件事了"。
         // 待办必须在这里作废，否则格子就绪那一刻会**自己**拿起一件他从没在当前意图里选过的东西。
         clearPendingSelect(reason: "关闭面板、退出装修或换世界")
+        // 许愿动作台账同一条纪律：面板关了，"这一次意图"就结束了，重开面板可以再点一次。
+        submittedWishActions.removeAll()
         cancelPreview()
         if isOpen { isOpen = false; onEditingChanged(false) }
     }
@@ -834,14 +873,27 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
         await performWishAction(jobID: jobID, step: "retry-inventory", action: retryInventoryOutput)
     }
 
-    /// 两个许愿动作的公共形状：防重入（`isSaving`）+ **失败绝不静默**（原话进 `notice` 与日志）。
+    /// 两个许愿动作的公共形状：防重入（`isSaving`）+ 同一 `(任务, 动作)` 只提交一次
+    /// （`submittedWishActions`）+ **失败绝不静默**（原话进 `notice` 与日志）。
     ///
     /// 这里刻意**不做**任何"能不能领/能不能重试"的预判：那个判定只有一份，在既有那条路上
     /// （`claim` 的三条门槛、`retry` 的 stage guard）。面板只负责把结果说出来 ——
     /// 多判一次就是第四套状态文案。
+    ///
+    /// `isSaving` 只挡**在飞**的那一次：真机上相隔一秒多的第二次激活（连点 / 界面重放）
+    /// 落在它放开之后，于是同一个任务会**第二次**交给居民 —— 真机 2026-10-02 16:56:03.446 /
+    /// 04.928 与 06.346 / 07.414，同一个任务各两条 `ask-resident`。所以再加一层与既有风格
+    /// 一致的台账：同一次用户意图内，`(jobID, step)` 只提交一次；重复调用走幂等出口，
+    /// 返回同一次的结果（同一句 `notice`），绝不第二次交给居民。
     private func performWishAction(jobID: String, step: String,
                                    action: (@MainActor (String) async throws -> Void)?) async {
         guard isOpen, !isSaving else { return }
+        guard submittedWishActions.admits(jobID: jobID, step: step) else {
+            // 幂等：同一次意图内的重复调用**不再提交**，只把同一次的结果再说一遍。
+            notice = Self.submittedText(for: step)
+            livingWorldLogger.notice("摆件面板拒绝 step=wish-\(step, privacy: .public)-duplicate 任务=\(jobID, privacy: .public) 结果=重复提交已忽略（同一次意图只提交一次）")
+            return
+        }
         guard let action else {
             notice = Self.wishActionNotWiredText
             livingWorldLogger.notice("摆件面板拒绝 step=wish-\(step, privacy: .public)-not-wired 任务=\(jobID, privacy: .public)")
@@ -853,13 +905,9 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
         do {
             try await action(jobID)
             isSaving = false
+            submittedWishActions.record(jobID: jobID, step: step)
             // 状态那一句由宿主推来的新快照说（列表读的是权威），这里只说"这次动作提交出去了"。
-            switch step {
-            case "claim": notice = Self.claimSubmittedText
-            case "ask-resident": notice = Self.askResidentSubmittedText
-            case "retry-inventory": notice = Self.retryInventorySubmittedText
-            default: notice = Self.retrySubmittedText
-            }
+            notice = Self.submittedText(for: step)
             livingWorldLogger.notice("摆件面板许愿任务 step=wish-\(step, privacy: .public) 任务=\(jobID, privacy: .public) 结果=已提交")
         } catch {
             isSaving = false
@@ -878,6 +926,16 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     static let retrySubmittedText = "已按原提交确认。结果会显示在这一行。"
     static let askResidentSubmittedText = "已请居民去许愿机取这一件；它到达领取位置后按「领取」即可。"
     static let retryInventorySubmittedText = "已重试入库。成功的话这一行会改写成「\(OwnershipDisplayState.inInventory.label)」。"
+    /// "这次动作提交出去了"那句话的**唯一**出处：首次提交与幂等重复走同一句，
+    /// 于是重复调用返回的**就是**同一次的结果，界面不会因为点了第二下而改口。
+    static func submittedText(for step: String) -> String {
+        switch step {
+        case "claim": claimSubmittedText
+        case "ask-resident": askResidentSubmittedText
+        case "retry-inventory": retryInventorySubmittedText
+        default: retrySubmittedText
+        }
+    }
     func holdSelected(at point: PropAttachmentPoint? = nil) async {
         let target = point ?? holdPoint
         // **一次点击绝不允许什么都不发生**。原来这两条 guard 是裸 `return`：用户在
@@ -1000,4 +1058,35 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     static func consumesScenePointer(isOpen: Bool, moving: Bool, inputOwnsFocus: Bool) -> Bool {
         isOpen && moving && !inputOwnsFocus
     }
+}
+
+/// 「同一 `(任务, 动作)` 在一次用户意图内只提交一次」的**纯台账**。
+///
+/// 它不判断"能不能领 / 能不能重试"（那个判定只有一份，在既有那条路上），只记
+/// **事实**："这个动作已经交出去过一次"。故意做成值类型 + 纯函数，所以可以离线
+/// 复现"连点两次"与"界面重放一次"的判别力（`tools/test-ownership-list-projection.swift`）。
+///
+/// 键里同时带任务与动作：任务不同、或同一任务换成另一个动作（例如从「让居民去取」
+/// 变成「领取」），都是**新的一次意图**，各自可以提交一次。
+struct WishActionLedger: Equatable {
+    private var submitted: Set<String> = []
+
+    static func key(jobID: String, step: String) -> String { "\(jobID)|\(step)" }
+
+    /// 这次调用是不是**还没有**交出去过。返回 false = 重复提交，调用点必须走幂等出口。
+    func admits(jobID: String, step: String) -> Bool {
+        !submitted.contains(Self.key(jobID: jobID, step: step))
+    }
+
+    mutating func record(jobID: String, step: String) {
+        submitted.insert(Self.key(jobID: jobID, step: step))
+    }
+
+    /// 只保留**此刻仍然被提供**的键：行不再是那个状态（换了动作、进了库存、已删除）
+    /// 就说明上一次意图已经结束，用户下一次点击是新的意图，不必再被台账挡住。
+    mutating func keepOnly(_ offered: Set<String>) {
+        submitted.formIntersection(offered)
+    }
+
+    mutating func removeAll() { submitted.removeAll() }
 }

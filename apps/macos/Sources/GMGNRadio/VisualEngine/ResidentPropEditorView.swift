@@ -17,9 +17,6 @@ struct ResidentPropEditorView: View {
     @State private var sizeDraftObjectID: String?
     /// 「永久删除」的确认态（面板上那一次点击只把它置真，真正提交在确认之后）。
     @State private var confirmingDelete = false
-    /// 哪几行的「为什么」是展开的。**纯界面状态**：行的状态永远只来自唯一投影，
-    /// 这里只记"用户点开了哪一行的字段与数值"。默认全收起（列表本体只放一句人话）。
-    @State private var expandedRowIDs: Set<String> = []
     var body: some View {
         ScrollView {
         VStack(alignment: .leading, spacing: 14) {
@@ -209,19 +206,20 @@ struct ResidentPropEditorView: View {
     /// 视图里因此没有任何状态字面量 —— 在这里拼一句就是第二份真相。
     ///
     /// 行内动作也由投影派生（`row.actions`），视图不判"能不能领 / 能不能重试"。
+    ///
+    /// 一行的样子**只有三样**：名字 / 一句人话状态 / 能做的事（按钮）。
+    /// 2026-10-02 用户原话：「不要搞为什么然后给展开折叠，普通人看得懂吗，里面一堆
+    /// key-value 的东西」—— 所以这里**没有**「为什么」入口、**没有**展开的证据面板、
+    /// 也**没有**把内部 join 方式（`sourceWishID` 这类）写在副标题里。字段名、回执键、
+    /// UUID、路径是给我们和 agent 看的，留在统一日志（subsystem=ai.gmgn.radio）与
+    /// agent 回执里，不上界面。
     @ViewBuilder
     private func ownershipRow(_ row: OwnershipRow) -> some View {
         let isSelected = state.selectedID == row.key.objectID
         VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline, spacing: 9) {
                 Image(systemName: ownershipIcon(row))
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(row.name).lineLimit(1)
-                    if !row.badges.isEmpty {
-                        Text(row.badges.joined(separator: " · "))
-                            .font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(2)
-                    }
-                }
+                Text(row.name).lineLimit(1)
                 Spacer(minLength: 2)
                 Text(row.statusText).font(.system(size: 10))
                     .foregroundStyle(ownershipTint(row)).lineLimit(1)
@@ -233,39 +231,11 @@ struct ResidentPropEditorView: View {
                 guard row.actions.contains(.place) || row.actions.contains(.withdraw) else { return }
                 Task { await state.select(objectID: row.key.objectID) }
             }
+            // 第二样之外的**唯一**一层：能做的事。不再有第三个按钮来解释它们为什么在那里。
             HStack(spacing: 6) {
                 Spacer(minLength: 0)
                 ownershipActions(row)
-                if row.reasonText != nil || !row.evidence.isEmpty {
-                    Button(expandedRowIDs.contains(row.id) ? "收起" : "为什么") {
-                        if expandedRowIDs.contains(row.id) { expandedRowIDs.remove(row.id) }
-                        else { expandedRowIDs.insert(row.id) }
-                    }
-                    .buttonStyle(.plain).font(.system(size: 10)).foregroundStyle(.cyan)
-                    .accessibilityIdentifier("resident.ownership-row.\(row.id).why")
-                }
             }.controlSize(.small)
-            // G4：失败原因在**行内展开**里给 字段 + 数值 + evidence；
-            // 列表本体只有上面那一句人话。
-            if expandedRowIDs.contains(row.id) {
-                VStack(alignment: .leading, spacing: 2) {
-                    if let reason = row.reasonText {
-                        Text(reason).font(.system(size: 10)).foregroundStyle(.orange.opacity(0.9))
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    ForEach(Array(row.evidence.enumerated()), id: \.offset) { _, item in
-                        Text("\(item.field) = \(item.value)")
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    }
-                    if let size = row.sizeText {
-                        Text("尺寸 = \(size)").font(.system(size: 9, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .padding(.leading, 20).padding(.trailing, 4)
-                .accessibilityIdentifier("resident.ownership-row.\(row.id).evidence")
-            }
         }
         .padding(9).frame(maxWidth: .infinity)
         .background(isSelected ? Color.white.opacity(0.08) : Color.white.opacity(0.03),
@@ -284,8 +254,10 @@ struct ResidentPropEditorView: View {
                     .accessibilityIdentifier("resident.ownership-row.\(row.id).claim")
             }
             if row.actions.contains(.askResidentToFetch) {
-                // Q4：「领取」够不到许愿机 ⇒ 按钮**可见但置灰** + 一行可读原因
-                // （原因就是上面那句 `row.reasonText`）。`claim()` 判据一个字不改。
+                // Q4：「领取」够不到许愿机 ⇒ 按钮**可见但置灰**，并给「让居民去取」
+                // （既有 agent 路径）。为什么够不到**不在界面上解释**：那一句是投影里的
+                // 工程原因（可能要带字段与数值），只进统一日志与 agent 回执。
+                // `claim()` 判据一个字不改。
                 Button("领取") {}.disabled(true)
                 // 「让居民去取」走既有的 agent 路径（`claim_when_arrived`）：
                 // **不新增人类通道、不放宽 0.25 m / activityID 判据**。

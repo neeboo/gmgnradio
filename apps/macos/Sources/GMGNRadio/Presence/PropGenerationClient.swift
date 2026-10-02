@@ -160,25 +160,35 @@ struct PropSizeIntent: Codable, Equatable, Sendable {
         case .axes: axis == .height ? meters : nil
         }
     }
-    /// 面板/工具回执用的一句话。
+    /// 面板/工具回执用的一句话。**说人话**。
     ///
-    /// 三轴形状把**原话的三个毫米数**也写进去：用户要能逐位核对自己说的
-    /// 「1443 x 862 x 302 mm」，而不是看到一个换算过的近似值。
+    /// 用户 2026-10-02 原话：面板上那句
+    /// 「尺寸：用户指定的三轴尺寸 1.443 × 0.862 × 0.302 米（宽 × 高 × 深；你说的
+    /// 1443 × 862 × 302 毫米），按最长边等比归一，另外两维只是期望值」是**工程腔**，
+    /// 而且末尾那半句还是**假话**。所以这里只说一句短的、用**他原话里的数**：
+    /// 三轴说三个毫米数，单轴说那一根轴。两档是**同一句话的形状**。
+    ///
+    /// 三轴形状仍然把**原话的三个毫米数**写进去（不是换算过的近似值）：用户要能逐位
+    /// 核对自己说的「1443 x 862 x 302 mm」。米数不写了 —— 数多了反而看不清是哪一个。
+    ///
+    /// 末句"按最长边等比归一，另外两维只是期望值"**已作废**：三轴现在是**逐轴**兑现
+    /// （`WorldPropSizePolicy.intended(sourceExtent:millimeters:)` 的 `Resolution.size`
+    /// 就是那三个数本身，另外两维是**实打实**改掉的，不是"期望值"）。
+    ///
+    /// 出处只说**是谁说的**（`你说的大小` / `建议的大小` / `默认大小`）：`.suggested` 也在
+    /// 契约的合法取值里（`WishMachineContract.acceptedSources`），所以不能说成"你说的"。
     var summary: String {
         let who = switch source {
-        case .user: "用户指定"
-        case .suggested: "服务建议"
-        case .fallback: "默认值"
+        case .user: "你说的大小"
+        case .suggested: "建议的大小"
+        case .fallback: "默认大小"
         }
         switch mode {
         case .axes:
-            return "\(who)的\(axis == .longest ? "最长边" : "高度") \(String(format: "%.2f", meters)) 米"
+            return "\(who)：\(axis == .longest ? "最长边" : "高度") \(String(format: "%.2f", meters)) 米"
         case .dimensions:
-            guard let millimeters else { return "\(who)的三轴尺寸（读不出来）" }
-            return "\(who)的三轴尺寸 \(Self.metersText(millimeters.x)) × \(Self.metersText(millimeters.y))"
-                + " × \(Self.metersText(millimeters.z)) 米（宽 × 高 × 深；"
-                + "你说的 \(Self.millimetersText(millimeters)) 毫米），"
-                + "按最长边等比归一，另外两维只是期望值"
+            guard let millimeters else { return "\(who)：读不出来" }
+            return "\(who)：\(Self.millimetersText(millimeters)) 毫米"
         }
     }
 

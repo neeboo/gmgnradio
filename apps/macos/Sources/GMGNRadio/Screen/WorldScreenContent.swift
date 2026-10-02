@@ -57,7 +57,7 @@ enum WorldScreenContentIssue: Error, Equatable, Sendable {
         case let .notEmbedPath(host, path):
             "「\(host)」是允许的嵌入域名，但「\(path)」不是嵌入路径。请用官方嵌入链接（YouTube 的 /embed/、哔哩哔哩的 player.bilibili.com）。"
         case let .missingVideoID(host):
-            "「\(host)」的嵌入链接里没有可播放的视频 id。请给完整的嵌入链接（/embed/<id>、player.html?bvid=<BV…>），或直接给视频 id。"
+            "「\(host)」的链接里没有可播放的视频。请给完整的嵌入链接，或者直接给视频 id（哔哩哔哩就是 BV 号）。"
         }
     }
 }

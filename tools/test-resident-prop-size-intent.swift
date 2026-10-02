@@ -83,12 +83,20 @@ guard sourceContains("App/GMGNRadioApp.swift",
     ["WorldPropSizePolicy.intended(", "sizeIntent: sizeIntent"],
     "生成入库没有把尺寸意图落成世界尺寸（那把剑仍会按高度被算成 8.28 m）") else { exit(1) }
 
-// ── 断言 6：三轴尺寸 + **板形**物件 ⇒ 用基础几何造，而不是拿生成网格 ──────────────
+// ── 断言 6：生成**永远是作者路径**；几何拼必须由**用户**选（2026-10-02 产品规则）────
 //
-// 这一条要抓住的形状只有一个：**用户说了三根轴，结果拿到的还是那个任意网格**。
-// 真机 2026-10-01「平面电视」就是这个形状 —— `1443 × 862 × 302 mm` 进了契约、进了任务
-// 记录、进了面板回读，而生成器交回来一个大立方体（参考图贴在各面上），
-// `WorldGeneratedProp.sizeIntent` 里也只有"最长边"那一根轴。
+// 真机 2026-10-01「平面电视」：用户发了一张平面电视的产品图、给了 `1443 × 862 × 302 mm`，
+// 生成器交回来的是**一个大立方体**。当时那条"三轴 + 板形 ⇒ 直接用基础几何拼"的支路
+// **静默**把生成结果换掉了 —— 用户那张参考图（外观、贴图、细节）**一次都没被用上**。
+// 用户 2026-10-02 的反对原话：「**不行啊，这样用户就没办法自定义外观了啊**」。
+//
+// 所以这条门禁要抓的是**两个方向**，而且判据一条都不许放宽：
+//   · **生成是默认路径**：生成网格那条路必须真的走得到（外观 / 贴图 / 细节都来自那张素材）；
+//   · **几何拼只由用户开门**：`job.appearanceChoice == .primitiveTelevision`（走
+//     `build_primitive_television` 工具，形状上就要求 `confirm=true`），拼出来的仍是
+//     **正常物件**（同一个 `WorldGeneratedProp`、同一条登记路径），板形判据一个字不改；
+//   · **不许静默替换**：生成结果不是板形时，「生成器把它做成了方块」+ **两个选择**
+//     （①换张图重做，②用几何拼）必须说得出来。
 //
 // 判据是**接线本身**（文本级），因为类型级判据可以全绿而 App 侧一个构造点都没有：
 // 编译得进、跑不起来。每一条都配**注入负对照** —— 在源码副本上做手术，判据必须变红；
@@ -98,7 +106,7 @@ guard let appSourceText = readSource(appSourcePath) else {
     print("FAIL: 读不到 \(appSourcePath)"); exit(1)
 }
 
-/// 「三轴 + 板形 ⇒ 基础几何」这条接线在不在。空数组 = 接线完整。
+/// 「生成是默认路径 + 几何拼由用户开门」这条接线在不在。空数组 = 接线完整。
 func primitiveTelevisionWiringProblems(_ app: String) -> [String] {
     var problems: [String] = []
     // ① 真的调了基础几何那条入口（`WorldPrimitiveTelevision(millimeters:)`）。
@@ -130,31 +138,58 @@ func primitiveTelevisionWiringProblems(_ app: String) -> [String] {
     for axis in ["x", "y", "z"] where !app.contains("abs(measured.\(axis) - television.size.\(axis))") {
         problems.append("⑥ 没有校验「渲染端量出来的包围盒就是拼出来的那一份」的 \(axis) 轴")
     }
-    // ⑦ **不满足条件时必须保持今天的行为，并且说出来**（"仍用生成的网格、按最长边等比"）。
-    //    两件事都要：那句话在，而且它那一支是**无条件**的（有条件就等于没说）。
-    if !app.contains("仍用生成的网格、按最长边等比归一") {
-        problems.append("⑦ 不是板形时的回退没有可见说明：用户会以为「它照做了」")
+    // ⑦ **生成结果照旧入库**（作者路径）：生成网格那条路必须真的走得到 —— 它的字节、它的
+    //    `assetID`（就是**那份网格**的 sha256）都在。几何拼**不是**默认替代，所以下面这条
+    //    断言与 ⑧ 一起把"生成被用上"和"几何拼由用户开门"两件事钉死。
+    if !app.contains("let url = URL(fileURLWithPath: path)") {
+        problems.append("⑦ 生成网格那条路不见了：外观、贴图、细节都来自它（作者路径）")
     }
-    if !app.contains("if job.sizeIntent?.mode == .dimensions {") {
-        problems.append("⑦ 回退说明那一支不是无条件的（找不到 `if job.sizeIntent?.mode == .dimensions {`）："
-            + "三轴落成生成网格这件事不会说给用户")
+    if !app.contains("assetID: \"sha256:\" + hash.lowercased()") {
+        problems.append("⑦ 生成产物的资产引用不再是那份网格的字节：素材的贴图与细节会丢")
     }
-    // ⑧ 基础几何那一支必须是**无条件**的，而且排在生成网格那条路**之前**、自己收场（`continue`）。
-    guard let primitiveBranch = app.range(of: "if let television = primitiveTelevision {") else {
-        problems.append("⑧ 基础几何那一支不是无条件的（找不到 `if let television = primitiveTelevision {`）："
-            + "三轴只会在有条件时才拼几何 —— 条件不成立就照旧落成生成网格")
+    // ⑦b 「生成器把它做成了方块」+ **两个选择**必须说得出来（人话，唯一一份文案在
+    //     `Presence/ResidentPropTelevisionRepair.swift`；App 这一处只管调用它）。
+    if !app.contains(".shapeChoiceNotice(name: job.name, millimeters: millimeters)") {
+        problems.append("⑦b 生成结果不是板形时没有把「生成器把它做成了方块 + 两个选择」说给用户："
+            + "那就成了一次静默的观感缺陷（用户只看到「它没照我说的做」）")
+    }
+    // ⑦c 反向也要说：用户**选过**几何拼、可那三个数本身拼不出板形物件时，
+    //     不许静默落回生成网格（一次明确的选择"点了没反应"比不做更坏）。
+    if !app.contains(".geometryUnavailableNotice(name: job.name, millimeters: millimeters)") {
+        problems.append("⑦c 用户选了用几何拼、但那三个数拼不出来时没有可见说明"
+            + "（会静默落回生成网格 —— 用户会以为「点了没反应」）")
+    }
+    // ⑧ 几何拼那一支的**门 = 用户的那一次选择**（`guard job.appearanceChoice ==
+    //    .primitiveTelevision,`），而且它排在生成网格那条路**之前**、自己收场（`continue`）。
+    //    这道门就是本轮要修的那件事：没有它，三轴 + 板形就会**静默**把生成结果换掉。
+    guard let gate = app.range(of: "guard job.appearanceChoice == .primitiveTelevision,") else {
+        problems.append("⑧ 几何拼没有「用户选过」这道门：三轴 + 板形会**静默**替换掉生成结果 ——"
+            + "用户那张素材白给了（用户原话「这样用户就没办法自定义外观了啊」）")
         return problems
+    }
+    guard let primitiveBranch = app.range(of: "if let television = primitiveTelevision {") else {
+        problems.append("⑧ 找不到几何拼那一支（`if let television = primitiveTelevision {`）："
+            + "用户选过这条路也没人拼")
+        return problems
+    }
+    if gate.lowerBound > primitiveBranch.lowerBound {
+        problems.append("⑧ 门在拼几何那一支**之后**：等于没门（先拼出来再问用户）")
     }
     guard let meshPath = app.range(of: "let url = URL(fileURLWithPath: path)") else {
         problems.append("⑧ 找不到既有那条生成网格的落点")
         return problems
     }
     if primitiveBranch.lowerBound > meshPath.lowerBound {
-        problems.append("⑧ 基础几何那一支排在生成网格那条路**之后**：先按网格算出尺寸再拼几何，"
+        problems.append("⑧ 几何拼那一支排在生成网格那条路**之后**：先按网格算出尺寸再拼几何，"
             + "两份尺寸都会落盘")
     }
     if !app[primitiveBranch.upperBound...].contains("continue") {
-        problems.append("⑧ 基础几何那一支没有收场（缺 `continue`）：会继续按生成网格再算一遍")
+        problems.append("⑧ 几何拼那一支没有收场（缺 `continue`）：会继续按生成网格再算一遍")
+    }
+    // ⑨ 两件东西的**入库是同一条路**：同一个类型、同一条登记路径（两条路都是正常物件）。
+    if !app.contains("residentOwnedPropAssets[job.objectID] = ResidentOwnedPropAsset(") {
+        problems.append("⑨ 几何拼那一支没有走既有的资产记录：它会不是一件「正常物件」"
+            + "（摆放 / 承托 / 碰撞 / 删除 / 入库都读不到它）")
     }
     return problems
 }
@@ -162,10 +197,10 @@ func primitiveTelevisionWiringProblems(_ app: String) -> [String] {
 /// 注入负对照：把源码副本改成**已知会坏**的样子，判据必须变红。
 /// 每一条都对应一种真实的"悄悄退化"。
 let primitiveWiringInjections: [(name: String, old: String, new: String)] = [
-    // 最要命的那一条：用户说了三轴，结果还是拿那个任意网格（本轮的现场缺陷）。
-    ("grid-not-primitive",
-     "if let television = primitiveTelevision {",
-     "if false, let television = primitiveTelevision {"),
+    // 本轮要拆掉的那条形状：把"用户选过"这道门去掉 ⇒ 三轴 + 板形又变成**静默替换**。
+    ("silent-auto-replacement",
+     "guard job.appearanceChoice == .primitiveTelevision,",
+     ""),
     // 三轴与单轴不分：一根轴的意图也会被拿去拼几何（咖啡机会变成一台电视）。
     ("intent-shape-not-checked",
      "guard let intent = job.sizeIntent, intent.mode == .dimensions,",
@@ -186,14 +221,22 @@ let primitiveWiringInjections: [(name: String, old: String, new: String)] = [
     ("drop-measured-match",
      "abs(measured.x - television.size.x) <= 0.002,",
      "true,"),
-    // 回退时不说：用户以为"它照做了"。
-    ("silent-grid-fallback",
-     "if job.sizeIntent?.mode == .dimensions {",
-     "if false, job.sizeIntent?.mode == .dimensions {"),
+    // 不说"生成器把它做成了方块" + 两个选择：用户只看到"它没照我说的做"。
+    ("drop-shape-choice-notice",
+     ".shapeChoiceNotice(name: job.name, millimeters: millimeters)",
+     ".shapeChoiceNoticeDisabled(name: job.name, millimeters: millimeters)"),
+    // 用户选了几何拼、但那三个数拼不出来时不说 ⇒ 静默落回生成网格（"点了没反应"）。
+    ("silent-when-unbuildable",
+     ".geometryUnavailableNotice(name: job.name, millimeters: millimeters)",
+     ".geometryUnavailableNoticeDisabled(name: job.name, millimeters: millimeters)"),
+    // 几何拼那一支不走既有资产记录：它不是一件正常物件了。
+    ("geometry-not-a-normal-object",
+     "residentOwnedPropAssets[job.objectID] = ResidentOwnedPropAsset(",
+     "residentOwnedPropAssets[job.objectID] = nil; _ = ResidentOwnedPropAsset("),
 ]
 
-// 现场演示：`SIZE_INTENT_INJECT=grid-not-primitive swift tools/test-resident-prop-size-intent.swift`
-// 会把**真源码**当成"三轴却仍用生成网格"的那一份来判，于是主判据自己打出一条 FAIL。
+// 现场演示：`SIZE_INTENT_INJECT=silent-auto-replacement swift tools/test-resident-prop-size-intent.swift`
+// 会把**真源码**当成"没有用户那道门、三轴就静默换掉生成结果"的那一份来判，于是主判据自己打出一条 FAIL。
 var observedAppSource = appSourceText
 if let name = ProcessInfo.processInfo.environment["SIZE_INTENT_INJECT"],
    let injection = primitiveWiringInjections.first(where: { $0.name == name }) {
@@ -204,13 +247,28 @@ if let name = ProcessInfo.processInfo.environment["SIZE_INTENT_INJECT"],
     observedAppSource = observedAppSource.replacingOccurrences(of: injection.old, with: injection.new)
 }
 
-let primitiveWiringIssues = primitiveTelevisionWiringProblems(observedAppSource)
+// 2026-10-02 产品决定（用户原话「不能再用集合拼了」）：手拼几何**已停用** —— 产品路径零调用，
+// 也不再给用户"重新生成 / 用几何拼"两条路。下面这一节钉的是**已废止**的产品规则
+// （"三轴 + 板形 ⇒ 基础几何"与"几何拼由用户开门"）：只要 App 里再出现手拼几何的构造点，
+// 它就**立刻重新生效**（原来那些断言一条都没删、也没放宽）。
+//
+// 同一条产品规则的**反面**由 `tools/test-generation-only-props.swift` 钉着：
+// App 零构造点 / 零选项文案 + 三轴逐轴兑现（世界 size 逐位 1.443 × 0.862 × 0.302）+ 五条注入负对照。
+let primitiveProductRuleRetired = !appSourceText.contains("WorldPrimitiveTelevision(")
+if primitiveProductRuleRetired {
+    print("PASS: 手拼几何已停用（2026-10-02 产品决定）—— 本节判据改由 tools/test-generation-only-props.swift 承接")
+}
+let primitiveWiringIssues = primitiveProductRuleRetired
+    ? [] : primitiveTelevisionWiringProblems(observedAppSource)
 for issue in primitiveWiringIssues { print("FAIL: \(issue)") }
 guard primitiveWiringIssues.isEmpty else {
-    print("FAIL: 三轴尺寸 + 板形物件没有接到基础几何上（判据见上）"); exit(1)
+    print("FAIL: 生成不是默认路径 / 几何拼不是由用户选的（判据见上）"); exit(1)
 }
-print("PASS: 三轴尺寸 + 板形物件接到基础几何（WorldPrimitiveTelevision）上，三轴进世界状态 metadata")
+if !primitiveProductRuleRetired {
+    print("PASS: 生成是默认路径（作者路径照旧入库），几何拼只在用户选过时走，判据一个字没放宽")
+}
 
+if !primitiveProductRuleRetired {
 for injection in primitiveWiringInjections {
     var injected = appSourceText
     guard injected.contains(injection.old) else {
@@ -227,6 +285,92 @@ for injection in primitiveWiringInjections {
     }
     print("PASS: 注入负对照「\(injection.name)」⇒ 判据变红（\(issues[0])）")
 }
+}
+
+// ── 断言 7：「生成器没做对」那两句话**逐字**在这里（唯一一份文案）────────────────
+//
+// 人话一句 + **两个选择**：(a) 换张图重做（**给出建议**：正面、无背景、单件产品更容易出
+// 扁平面板），(b) 用几何拼一台标准电视（**尺寸按你说的三个数**）。文案是**纯函数**，
+// 唯一来源是 `Presence/ResidentPropTelevisionRepair.swift` —— 面板、任务行、agent 回执
+// 读的都是它（不另写一套），所以这里逐字扫它。
+let repairCopyPath = "Presence/ResidentPropTelevisionRepair.swift"
+guard let repairCopyText = readSource(repairCopyPath) else {
+    print("FAIL: 读不到 \(repairCopyPath)"); exit(1)
+}
+
+/// 文案里的违规项。空数组 = 两个选择都说清楚了。
+func televisionRepairCopyProblems(_ copy: String) -> [String] {
+    var problems: [String] = []
+    // ① 一句人话：**生成器把它做成了方块**（说的是形状，不是"逐轴比例相差 N 倍"这种读数）。
+    if !copy.contains("生成器把「\\(name)」做成了方块，不像一块扁平面板。") {
+        problems.append("① 没有那句人话（`生成器把「…」做成了方块`）：用户看到的就只是"
+            + "「它没照我说的做」，没人告诉他生成器交回来的是什么")
+    }
+    // ② 选择 (a)：重新生成，而且**给出建议**（正面、无背景、单件产品）。
+    if !copy.contains("①换张图重做") {
+        problems.append("② 没有选择 (a)（换张图重做）：用户没有第一条路可走")
+    }
+    if !copy.contains("正面、单件、无背景的图更容易出扁平面板") {
+        problems.append("② 选择 (a) 没给建议：用户不知道「换一张什么样的图」才容易出扁平面板")
+    }
+    // ③ 选择 (b)：用几何拼，而且**尺寸按用户说的三个数**（原话逐位回读，不是近似值）。
+    if !copy.contains("②对我说「拼一台标准电视」") {
+        problems.append("③ 没有选择 (b)（用几何拼一台标准电视）：用户没法自己把这件换掉")
+    }
+    if !copy.contains("我用几何按你说的 \\(axes) 毫米拼一台") {
+        problems.append("③ 选择 (b) 没有把**用户原话的三个数**写进去：拼出来会是另一样的尺寸")
+    }
+    // ④ 拼不出来时**也要说**（绝不静默落回生成网格）。
+    if !copy.contains("你选了用几何拼，但你给的") || !copy.contains("所以我**没有**拼") {
+        problems.append("④ 用户选了几何拼、但那三个数拼不出板形物件时没有可见说明"
+            + "（会静默落回生成网格）")
+    }
+    return problems
+}
+
+/// 注入负对照：每一条都对应"这句话没说"的一种真实退化。
+let televisionRepairCopyInjections: [(name: String, old: String, new: String)] = [
+    ("drop-plain-sentence",
+     "生成器把「\\(name)」做成了方块，不像一块扁平面板。",
+     "形状不太对。"),
+    ("drop-regenerate-advice",
+     "正面、单件、无背景的图更容易出扁平面板",
+     "换一张图"),
+    ("drop-geometry-option",
+     "②对我说「拼一台标准电视」",
+     "②换个办法"),
+    ("drop-geometry-dimensions",
+     "我用几何按你说的 \\(axes) 毫米拼一台",
+     "我用几何拼一台"),
+    ("silent-when-unbuildable",
+     "所以我**没有**拼",
+     "所以就算了"),
+]
+
+let repairCopyIssues = televisionRepairCopyProblems(repairCopyText)
+for issue in repairCopyIssues { print("FAIL: \(issue)") }
+guard repairCopyIssues.isEmpty else {
+    print("FAIL: 「生成器没做对」的两句话没有说全（判据见上）"); exit(1)
+}
+print("PASS: 「生成器把它做成了方块」+ 两个选择（①换张图重做并给建议 ②用几何拼、尺寸按你说的三个数）")
+
+for injection in televisionRepairCopyInjections {
+    var injected = repairCopyText
+    guard injected.contains(injection.old) else {
+        print("FAIL: 文案注入负对照「\(injection.name)」的锚点在源码里找不到：\(injection.old)"); exit(1)
+    }
+    injected = injected.replacingOccurrences(of: injection.old, with: injection.new)
+    guard injected != repairCopyText else {
+        print("FAIL: 文案注入负对照「\(injection.name)」没有改到源码副本"); exit(1)
+    }
+    let issues = televisionRepairCopyProblems(injected)
+    guard !issues.isEmpty else {
+        print("FAIL: 文案注入负对照「\(injection.name)」（\(injection.new)）⇒ 判据必须变红，它却全绿")
+        exit(1)
+    }
+    print("PASS: 文案注入负对照「\(injection.name)」⇒ 判据变红（\(issues[0])）")
+}
+
 
 // ── 断言 8：三轴意图的**米数换算**与"尺寸无效"的字段级原因 ────────────────────
 //
@@ -328,6 +472,217 @@ for injection in dimensionAccountingInjections {
         print("FAIL: 注入负对照「\(injection.name)」没有改到源码副本"); exit(1)
     }
     let issues = dimensionAccountingIssues(injected)
+    guard !issues.isEmpty else {
+        print("FAIL: 注入负对照「\(injection.name)」（\(injection.new)）⇒ 判据必须变红，它却全绿")
+        exit(1)
+    }
+    print("PASS: 注入负对照「\(injection.name)」⇒ 判据变红（\(issues[0])）")
+}
+
+// ── 断言 10：**三个数就是三个数**（逐轴）+「渲染与碰撞读同一组尺寸」+ 判据未放宽 ─────
+//
+// 用户 2026-10-02 的现场原话（连续两条）：「我都给了尺寸了为什么不能按照尺寸出」/「你改契约啊」。
+// 旧契约按**最长边等比**归一、另外两维只写进 `reason` 当"期望值" ⇒ 给了三个数，场景里只有
+// 最长边那一维兑现 —— 这就是用户抱怨的实质。这一节钉的是新契约的**接线**（行为判据在下面
+// 编译出来的那个程序里跑，用的是真机那份网格的逐顶点实测 AABB）：
+//
+//   (a) 三轴意图逐轴兑现（`Resolution(size: target, …)`），越界**具名拒绝**而不是静默夹取；
+//   (b) 渲染端读的**就是**世界里那一份 `effectiveSize`，并按 `size[i] / 网格跨度[i]` 逐轴缩放；
+//   (c) 碰撞 / 承托 / 摆放判据读**同一份** `effectiveSize`（尺寸只有一个出口）；
+//   (d) 单轴 `axis=longest` 那一档**一字不动**（只给一个数时等比到那个数）；
+//   (e) 范围与形状冲突校验**一条都没放宽**。
+//
+// 每条都配**注入负对照**：在源码副本上做手术，判据必须变红 —— 一个从不 FAIL 的门禁等于没有门禁。
+let worldRuntimeSources = root.appendingPathComponent(
+    "apps/macos/Packages/WorldRuntime/Sources/WorldRuntime")
+// **先挡一条假绿**：下面的行为判据链接的是 SwiftPM 预编译的 `WorldRuntime` 目标文件
+// （`tools/world-runtime-harness-flags.sh` 那一份，唯一一处定义）。它们比源文件旧 ⇒ 行为判据
+// 测的是**旧语义**，会绿得毫无意义（"给了三个数却只兑现最长边"在新旧语义下都可能绿）。
+// 判据看的是**真正被链进去的那些 `.o`**，不是 `.swiftmodule`：公开接口没变时它不会被重写。
+let threeAxisFlags = worldRuntimeHarnessFlags()
+let threeAxisObjectDates = threeAxisFlags.filter { $0.hasSuffix(".o") }.compactMap {
+    (try? FileManager.default.attributesOfItem(atPath: $0)[.modificationDate]) as? Date
+}
+let threeAxisSourceDate = (try? FileManager.default.attributesOfItem(
+    atPath: worldRuntimeSources.appendingPathComponent("WorldPropSizePolicy.swift").path)[.modificationDate]) as? Date
+if let threeAxisSourceDate, let newest = threeAxisObjectDates.max(), threeAxisSourceDate > newest {
+    print("FAIL: SwiftPM 的 WorldRuntime 目标文件比源文件旧（三轴的行为判据会测旧语义）："
+        + "先跑 swift build --package-path apps/macos/Packages/WorldRuntime")
+    exit(1)
+}
+func readRuntimeSource(_ name: String) -> String? {
+    try? String(contentsOf: worldRuntimeSources.appendingPathComponent(name), encoding: .utf8)
+}
+
+/// 三轴契约的接线违规项。空数组 = 接线完整。
+func threeAxisContractProblems(app: String, descriptor: String, renderer: String,
+                               placement: String, editor: String, policy: String,
+                               tools: String, contract: String) -> [String] {
+    var problems: [String] = []
+    // (a) 契约语义：三轴那一份**就是**用户给的三个数。
+    if !policy.contains("return Resolution(size: target, scales: scales, basis: .dimensions") {
+        problems.append("(a) 三轴意图没有逐轴兑现（找不到 "
+            + "`Resolution(size: target, scales: scales, basis: .dimensions)`）：另外两维又只是期望值了")
+    }
+    if policy.contains("三轴尺寸按最长边等比归一") {
+        problems.append("(a) 三轴意图又回到「按最长边等比归一」：给了三个数只有一维兑现")
+    }
+    if !policy.contains("guard longest.isFinite, longest >= minimumExtentMeters, longest <= maximumExtentMeters else {") {
+        problems.append("(a2) 三轴那一份没有上下限判据："
+            + "「三个数就是三个数」要求越界**具名拒绝**，不许静默夹取")
+    }
+    // (b) 渲染端：描述符带三轴目标，矩阵有逐轴那一支，而且调用点给的就是 `effectiveSize`。
+    if !descriptor.contains("var targetSizeMeters: WorldVector3? = nil") {
+        problems.append("(b) 渲染描述符没有三轴目标（`targetSizeMeters`）：渲染端只能继续等比")
+    }
+    if !descriptor.contains("let scales = perAxis ?? SIMD3<Float>(repeating: scale)") {
+        problems.append("(b) 放置矩阵没有逐轴缩放那一支：三轴意图画出来还是等比（画面与碰撞盒分叉）")
+    }
+    if !descriptor.contains("scaling.columns.0.x = scales.x; scaling.columns.1.y = scales.y; scaling.columns.2.z = scales.z") {
+        problems.append("(b) 矩阵对角线没有用三个比例（画面按等比、判定按三轴 ⇒ 两处各推一份尺寸）")
+    }
+    if !renderer.contains("targetSize:item.targetSizeMeters") {
+        problems.append("(b) 渲染端实际绘制那一行没有把三轴目标传进矩阵（会按等比画）")
+    }
+    // 已摆那一件与手持那一件**都要**共用世界里那一份 `effectiveSize`（两处，缺一不可）。
+    let targetSizeWiring = app.components(separatedBy: "targetSizeMeters: prop.effectiveSize)").count - 1
+    if targetSizeWiring != 2 {
+        problems.append("(b) 渲染端拿到的三轴尺寸不是世界里那一份（`targetSizeMeters: prop.effectiveSize` "
+            + "实测 \(targetSizeWiring) 处，应为 2：已摆 + 手持）⇒ 渲染与碰撞各读一份尺寸")
+    }
+    // (c) 碰撞 / 承托 / 摆放 / 红绿格读的是**同一份** `effectiveSize`。
+    if !placement.contains("let size = prop.effectiveSize") {
+        problems.append("(c) 摆放/承托判据没有读 `prop.effectiveSize`：碰撞盒会与画面分叉")
+    }
+    if !placement.contains("WorldPlanarFootprint(size: SIMD2(size.x, size.z), yaw: yaw)") {
+        problems.append("(c) footprint 没有按逐轴尺寸取 x/z：碰撞体积会退回一个等比盒子")
+    }
+    if !editor.contains("return (SIMD2(prop.effectiveSize.x, prop.effectiveSize.z), prop.effectiveSize.y)") {
+        problems.append("(c) 红/绿格（编辑器判据）没有读同一份 `effectiveSize`")
+    }
+    // (d) 单轴那一档**一字不动**。
+    if !policy.contains("case .longest:\n            return clamp(shape: shape, scale: meters / shape.longest, basis: .longestEdge)") {
+        problems.append("(d) 单轴 `axis=longest` 的等比归一被改了（只给一个数时行为必须不变）")
+    }
+    // (e) 合法性 / 形状冲突校验**一条都没放宽**。
+    if !tools.contains("guard value[\"axis\"] == nil, value[\"meters\"] == nil else {") {
+        problems.append("(e) 形状冲突校验没了：同时给 axis/meters 与 mode=dimensions 会被放行")
+    }
+    if !tools.contains("guard number.doubleValue >= PropSizeIntent.minimumMillimeters,") {
+        problems.append("(e) 三轴毫米数的范围下界没了")
+    }
+    if !tools.contains("number.doubleValue <= PropSizeIntent.maximumMillimeters else {") {
+        problems.append("(e) 三轴毫米数的范围上界没了")
+    }
+    if !contract.contains("two_shapes_pick_one") {
+        problems.append("(e) 只读契约不再公布「两种形状只能给一种」")
+    }
+    // (e2) 三轴目标落不了地时必须**可见地**说（不许当成"没有意图"静默退回单轴）。
+    if !app.contains("case .unrealizable:") {
+        problems.append("(e2) 三轴意图落不了地时没有可见说明（会静默退回单轴等比）")
+    }
+    return problems
+}
+
+/// 注入负对照：每一条都对应一种真实的"悄悄退化"。
+let threeAxisContractInjections: [(name: String, file: String, old: String, new: String)] = [
+    // (a) 只取最长边那一维 —— 用户抱怨的那件事本身。
+    ("longest-edge-only", "policy",
+     "return Resolution(size: target, scales: scales, basis: .dimensions",
+     "return Resolution(size: WorldVector3(x: target.x, y: target.x, z: target.x), scales: scales, basis: .dimensions"),
+    // (a2) 夹取回来（静默改数字 = 你给的不是你要的）。
+    ("clamp-instead-of-refuse", "policy",
+     "guard longest.isFinite, longest >= minimumExtentMeters, longest <= maximumExtentMeters else {",
+     "guard longest.isFinite else {"),
+    // (b) 渲染端继续按**等比**画：画面与碰撞盒当场分叉（旧理由的形状）。
+    ("render-still-uniform", "descriptor",
+     "let scales = perAxis ?? SIMD3<Float>(repeating: scale)",
+     "let scales = SIMD3<Float>(repeating: scale)"),
+    // (b) 渲染端不再拿世界里那一份尺寸（各推一份）。
+    ("render-recomputes-size", "app",
+     "targetSizeMeters: prop.effectiveSize)",
+     "targetSizeMeters: nil)"),
+    // (c) 碰撞 / 承托不再读同一份 `effectiveSize`（退回按高度等比）。
+    ("collision-uniform", "placement",
+     "let size = prop.effectiveSize",
+     "let size = WorldVector3(x: prop.effectiveSize.y, y: prop.effectiveSize.y, z: prop.effectiveSize.y)"),
+    // (d) 单轴那一档被改：只给一个数时不再等比到那个数。
+    ("longest-axis-changed", "policy",
+     "case .longest:\n            return clamp(shape: shape, scale: meters / shape.longest, basis: .longestEdge)",
+     "case .longest:\n            return clamp(shape: shape, scale: meters / shape.height, basis: .height)"),
+    // (e) 放宽形状冲突：两种形状同时给也放行。
+    ("loosen-shape-conflict", "tools",
+     "guard value[\"axis\"] == nil, value[\"meters\"] == nil else {",
+     "guard true else {"),
+    // (e) 放宽三轴毫米数的范围。
+    ("loosen-millimeter-range", "tools",
+     "guard number.doubleValue >= PropSizeIntent.minimumMillimeters,\n                      number.doubleValue <= PropSizeIntent.maximumMillimeters else {",
+     "guard number.doubleValue.isFinite else {"),
+    // (e2) 三轴落不了地时不说了（静默退回单轴）。
+    ("silent-unrealizable", "app",
+     "case .unrealizable:",
+     "case .unrealizableDisabled:"),
+]
+
+func readThreeAxisContractSources() -> [String: String] {
+    var result: [String: String] = [:]
+    let appFiles = ["app": "App/GMGNRadioApp.swift",
+                    "descriptor": "Presence/WishMachineOutputDescriptor.swift",
+                    "renderer": "Presence/ResidentPropRenderer.swift",
+                    "placement": "Presence/ResidentPropPlacementService.swift",
+                    "editor": "Presence/ResidentPropEditorState.swift",
+                    "tools": "Agent/ResidentWishMachineTools.swift",
+                    "contract": "Agent/WishMachineContract.swift"]
+    for (key, path) in appFiles {
+        guard let text = readSource(path) else {
+            print("FAIL: 读不到 \(path)"); exit(1)
+        }
+        result[key] = text
+    }
+    guard let policy = readRuntimeSource("WorldPropSizePolicy.swift") else {
+        print("FAIL: 读不到 WorldRuntime/WorldPropSizePolicy.swift"); exit(1)
+    }
+    result["policy"] = policy
+    return result
+}
+func threeAxisContractIssues(_ files: [String: String]) -> [String] {
+    threeAxisContractProblems(app: files["app"] ?? "", descriptor: files["descriptor"] ?? "",
+                              renderer: files["renderer"] ?? "", placement: files["placement"] ?? "",
+                              editor: files["editor"] ?? "", policy: files["policy"] ?? "",
+                              tools: files["tools"] ?? "", contract: files["contract"] ?? "")
+}
+
+let threeAxisFiles = readThreeAxisContractSources()
+// 现场演示：`SIZE_INTENT_INJECT=longest-edge-only swift tools/test-resident-prop-size-intent.swift`
+// 会把**真源码**当成"三轴只取最长边"的那一份来判，于是主判据自己打出一条 FAIL。
+var observedThreeAxisFiles = threeAxisFiles
+if let name = ProcessInfo.processInfo.environment["SIZE_INTENT_INJECT"],
+   let injection = threeAxisContractInjections.first(where: { $0.name == name }) {
+    print("·· SIZE_INTENT_INJECT=\(name)：把真源码当成被注入过的那一份来判")
+    guard let text = observedThreeAxisFiles[injection.file], text.contains(injection.old) else {
+        print("FAIL: 注入锚点在真源码里找不到：\(injection.old)"); exit(1)
+    }
+    observedThreeAxisFiles[injection.file] = text.replacingOccurrences(of: injection.old, with: injection.new)
+}
+let threeAxisIssues = threeAxisContractIssues(observedThreeAxisFiles)
+for issue in threeAxisIssues { print("FAIL: \(issue)") }
+guard threeAxisIssues.isEmpty else {
+    print("FAIL: 三轴契约的接线不成立（三个数必须逐轴兑现，渲染与碰撞必须读同一组尺寸；判据见上）")
+    exit(1)
+}
+print("PASS: 三个数就是三个数（逐轴兑现）；渲染与碰撞/承托/红绿格读同一份 `effectiveSize`；"
+    + "单轴 `axis=longest` 一字未动；范围与形状冲突校验一条未放宽")
+
+for injection in threeAxisContractInjections {
+    guard let text = threeAxisFiles[injection.file], text.contains(injection.old) else {
+        print("FAIL: 注入负对照「\(injection.name)」的锚点在源码里找不到：\(injection.old)"); exit(1)
+    }
+    var injected = threeAxisFiles
+    injected[injection.file] = text.replacingOccurrences(of: injection.old, with: injection.new)
+    guard injected[injection.file] != text else {
+        print("FAIL: 注入负对照「\(injection.name)」没有改到源码副本"); exit(1)
+    }
+    let issues = threeAxisContractIssues(injected)
     guard !issues.isEmpty else {
         print("FAIL: 注入负对照「\(injection.name)」（\(injection.new)）⇒ 判据必须变红，它却全绿")
         exit(1)
@@ -980,8 +1335,15 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
 
   // ── 同一件电视在权威里的记录：拼出来的 == 声明出来的 == 渲染端量出来的 ──────────
   //
-  // 几何侧那本账是**对的**（真机那份 assetID 就是 `sha256:05bc11fe…`、2408 字节）：这一条
-  // 把它逐位钉住，免得"修根因"顺手改坏几何，也钉住"画面、判据、碰撞盒只有一份尺寸"。
+  // 几何侧那本账是**对的**：这一条把它逐位钉住，免得"修根因"顺手改坏几何，
+  // 也钉住"画面、判据、碰撞盒只有一份尺寸"。
+  //
+  // 指纹在 2026-10-02 变过一次，而且是**只动外观、不动几何**的那一次：
+  // 原来的 GLB **一个 `materials` 都没有** ⇒ 七块盒子全部落回渲染器缺省材质
+  // （白 + 全金属 + 全粗糙），真机上就是用户截图里那块「灰板 + 一个大黑矩形」。
+  // 现在每个部件带一份深色材质（`WorldPrimitiveTelevisionFinish`），字节 2408 → 4048，
+  // 引用从 `sha256:05bc11fe…` 变成 `sha256:1b2d2c37…`。**盒子数量、位置、三轴、三角形
+  // 一个都没动**（下面那几条逐位判据就是这件事的机械证据）。
   let tvSpec = WorldPropSizeMillimeters(x: 1443, y: 862, z: 302)!
   let tv = try WorldPrimitiveTelevision(millimeters: tvSpec)
   let tvProp = tv.generatedProp(objectID: "wish-prop-television", sourceWishID: "wish-television")
@@ -999,8 +1361,8 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
   }
   if let measured = PrimitiveGLBBounds.measure(tv.assetBytes) {
       let measuredExtent = measured.maximum - measured.minimum
-      check(tv.assetBytes.count == 2408
-            && tv.assetID == "sha256:05bc11fe2ece91bc6baa1cbb0866683cf01600386e456df9dcf497ef29ffd76f",
+      check(tv.assetBytes.count == 4048
+            && tv.assetID == "sha256:1b2d2c37d232aaa3eadb5e0e41afd811079866016e97680443d0ab800af52b38",
           "基础几何电视的字节必须还是内容寻址那一份（实测 \(tv.assetBytes.count) 字节 / \(tv.assetID)）")
       check(tvBoundsMatches(measuredExtent, tv.size),
           "渲染端量出来的包围盒必须就是拼出来的那一份（实测 \(measuredExtent) vs \(tv.size)，容差 0.002）")
@@ -1023,6 +1385,100 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
   let tvDecoded = try JSONDecoder().decode(WorldGeneratedProp.self, from: tvFirst)
   check(tvDecoded == tvProp && tvDecoded.primitive?.sizeMeters == tv.size,
       "同形编码必须读回同一份（三轴回读 \(String(describing: tvDecoded.primitive?.millimeters))）")
+
+  // ══ 断言 10（行为）：**三个数就是三个数**（逐轴）+ 渲染与碰撞读同一组尺寸 ══════════
+  //
+  // 用户 2026-10-02 的现场原话（连续两条）：「我都给了尺寸了为什么不能按照尺寸出」/「你改契约啊」。
+  // 旧契约是三轴意图**按最长边等比**归一、另外两维只写进 reason 当"期望值" ⇒ 给了三个数，
+  // 场景里只有最长边那一维兑现。这一节用**真源码 + 真机那份网格的逐顶点实测 AABB**跑行为判据。
+  let threeAxis = WorldPropSizeMillimeters(x: 1443, y: 862, z: 302)!
+  // 目标三轴（米）：与 `WorldPropSizeMillimeters.meters` 同一套算式，好做**逐位**比较。
+  let exactTarget = WorldVector3(x: Float(1443) / 1000, y: Float(862) / 1000, z: Float(302) / 1000)
+  let dimsResolution = WorldPropSizePolicy.intended(sourceExtent: measuredMesh, millimeters: threeAxis)
+  check(dimsResolution != nil, "三轴意图必须归得出世界尺寸（实测 nil）")
+  // **逐位**（`==`，不是"容差内"）：中间再走一次别的换算就会差出 ULP —— 那正是"两份尺寸"的形状。
+  check(dimsResolution?.size == exactTarget,
+      "世界 size 必须逐位是 1.443 × 0.862 × 0.302（实测 \(String(describing: dimsResolution?.size))）")
+  check(dimsResolution?.basis == .dimensions,
+      "走的必须是逐轴那一条（实测 \(String(describing: dimsResolution?.basis))）")
+  check(dimsResolution.map {
+      $0.scales == WorldVector3(x: exactTarget.x / measuredMesh.x,
+                                y: exactTarget.y / measuredMesh.y,
+                                z: exactTarget.z / measuredMesh.z)
+  } ?? false,
+      "逐轴比例必须逐位等于 size / 网格跨度（实测 \(String(describing: dimsResolution?.scales))）")
+
+  // ── 渲染端：放置矩阵的三个比例必须**逐位**是 size / 摆正后网格跨度 ──────────────
+  // 这是"画面按三个数画"的机械判据：矩阵对角线就是渲染端真正用的那一份缩放。
+  let renderMatrix = try? ResidentPropPlacementMatrix.transform(
+      minimum: measuredMeshMin, maximum: measuredMeshMax,
+      targetHeight: exactTarget.y, targetSize: exactTarget,
+      position: .zero, yaw: 0)
+  check(renderMatrix != nil, "三轴那一件必须能算出放置矩阵（实测 nil ⇒ 画不出来）")
+  if let renderMatrix {
+      let meshExtent = measuredMeshMax - measuredMeshMin
+      let renderScale = SIMD3<Float>(renderMatrix.columns.0.x, renderMatrix.columns.1.y,
+                                     renderMatrix.columns.2.z)
+      let wantedScale = SIMD3<Float>(exactTarget.x / meshExtent.x, exactTarget.y / meshExtent.y,
+                                     exactTarget.z / meshExtent.z)
+      check(renderScale == wantedScale,
+          "渲染端的三个比例必须逐位是 size / 网格跨度（实测 \(renderScale) vs \(wantedScale)）："
+          + "差一个数就是「画面与判定各推一份尺寸」")
+      check(abs(renderScale.x - renderScale.y) > 1e-3 && abs(renderScale.y - renderScale.z) > 1e-3,
+          "真机这件本来就不是等比（立方体网格 → 扁平面板），三个比例不该相同（实测 \(renderScale)）")
+  }
+
+  // ── 碰撞 / 承托：读的是**同一份** `effectiveSize`（世界里那一份 `size`） ───────────
+  let dimsWorldIntent = WorldPropSizeIntent(axis: "longest", meters: 1.443, source: "user")!
+  let dimsProp = WorldGeneratedProp(
+      objectID: "wish-prop-3axis", sourceWishID: "wish-3axis",
+      assetID: "sha256:" + String(repeating: "a", count: 64), displayName: "超大荧幕电视",
+      size: exactTarget, sourceHeight: measuredMesh.y, sizeIntent: dimsWorldIntent)
+  check(dimsProp.isValid, "三轴那一件必须是合法的世界物件（实测 false）")
+  check(dimsProp.effectiveSize == exactTarget,
+      "判据/碰撞读的 `effectiveSize` 必须逐位就是那三个数（实测 \(dimsProp.effectiveSize)）")
+  let dimsFootprint = WorldPlanarFootprint(size: SIMD2(dimsProp.effectiveSize.x,
+                                                       dimsProp.effectiveSize.z), yaw: 0)
+  check(dimsFootprint.size == SIMD2<Float>(exactTarget.x, exactTarget.z),
+      "footprint 的 x/z 必须就是那三个数里的 x/z（实测 \(dimsFootprint.size)）：碰撞盒与画面同一组数字")
+  check(abs(dimsFootprint.halfExtents.x - 0.7215) <= 1e-6
+        && abs(dimsFootprint.halfExtents.y - 0.151) <= 1e-6,
+      "碰撞盒半长必须由同一份尺寸派生（实测 \(dimsFootprint.halfExtents)）")
+
+  // ── 注入负对照（数值）：**只取最长边**那一条路必须被上面两条判据抓住 ──────────────
+  // 旧契约就是这一条：按最长边等比。它算出来的 `size` 与那三个数**不等**，放置矩阵的三个比例
+  // **全都相同** ⇒ 上面两条都会红。一个从不 FAIL 的门禁等于没有门禁。
+  let legacyUniform = WorldPropSizePolicy.intended(sourceExtent: measuredMesh, axis: .longest, meters: 1.443)
+  check(legacyUniform.map { $0.size != exactTarget } ?? true,
+      "注入负对照：只取最长边那一条路**必须**给不出那三个数（实测 \(String(describing: legacyUniform?.size))）")
+  if let legacyUniform,
+     let legacyMatrix = try? ResidentPropPlacementMatrix.transform(
+        minimum: measuredMeshMin, maximum: measuredMeshMax,
+        targetHeight: legacyUniform.size.y, targetSize: legacyUniform.size, position: .zero, yaw: 0) {
+      let legacyScale = SIMD3<Float>(legacyMatrix.columns.0.x, legacyMatrix.columns.1.y,
+                                     legacyMatrix.columns.2.z)
+      check(legacyScale.x == legacyScale.y && legacyScale.y == legacyScale.z,
+          "注入负对照：只取最长边那一条路的三个比例必须全都相同（实测 \(legacyScale)）"
+          + "⇒「三个比例逐位是 size / 网格跨度」那条判据必然 FAIL")
+  }
+
+  // ── 单轴那一档**一字不动**：`axis=longest` / `axis=height` 仍然等比到那个数 ────────
+  let swordMesh = WorldVector3(x: 1.005, y: 0.133, z: 0.057)
+  let swordOne = WorldPropSizePolicy.intended(sourceExtent: swordMesh, axis: .longest, meters: 1.1)
+  check(swordOne != nil, "单轴 `axis=longest` 必须仍然归得出尺寸（实测 nil ⇒ 那把剑又变回 8.28 m）")
+  check(swordOne.map { abs(WorldPropSizePolicy.longestEdge(of: $0.size) - 1.1) <= 1e-5 } ?? false,
+      "单轴 `axis=longest` 的最长边必须 = 1.1 米（实测 \(String(describing: swordOne?.size))）")
+  check(swordOne.map { WorldPropSizePolicy.uniformFactor(from: swordMesh, to: $0.size) != nil } ?? false,
+      "单轴 `axis=longest` 仍然必须**等比**（实测 \(String(describing: swordOne?.size))）")
+  let swordHeight = WorldPropSizePolicy.intended(sourceExtent: swordMesh, axis: .height, meters: 0.35)
+  check(swordHeight.map { abs($0.size.y - 0.35) <= 1e-5 } ?? false,
+      "单轴 `axis=height` 必须仍然按高度归一（实测 \(String(describing: swordHeight?.size))）")
+  // 同一根网格：三轴那一档**不是**等比，单轴那一档**是** —— 两种形状不许混。
+  check(WorldPropSizePolicy.uniformFactor(from: swordMesh, to: exactTarget) == nil,
+      "三轴那一档本来就不是等比：拿它去过 `uniformFactor` 必须不成立（否则说明又被等比了）")
+  // 三轴那一档**也不许**退化成单轴：`axis=longest` 只兑现已一维，两者必须给出不同的 `size`。
+  check(swordOne.map { $0.size != exactTarget } ?? true,
+      "三轴与单轴必须给出不同的 world size（否则三轴那一档只是在冒充最长边）")
 
   finish()
  }

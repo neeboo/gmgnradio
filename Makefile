@@ -297,6 +297,11 @@ _test-harnesses:
 	swift tools/test-wish-machine-archive-degradation.swift
 	swift tools/test-wish-machine-app-runtime.swift
 	swift tools/test-resident-prop-placement.swift
+	# 「我的物件」那一行**给普通人看**：一行只有三样（名字 / 一句人话状态 / 按钮），
+	# 界面上 0 个 `key=value` / UUID / 路径 / 内部字段名（`sourceWishID` 这类 join 方式
+	# 不许写在副标题里）；没有「为什么」入口、没有展开的证据面板。七个动作都还在，
+	# 只是不解释（工程细节留在统一日志与 agent 回执里）。七条注入负对照全部必须 FAIL。
+	swift tools/test-ownership-list-plain-interface.swift
 	# 「摆放 → 我的物件」= 全部许愿的目录：**唯一投影** `ResidentOwnershipProjection.row`。
 	# 对外只有五种状态（生成中/待领取/在库里（没摆）/已摆放/失败）+ 折叠的「已结束」；
 	# 一行 = 一次许愿（jobID 为主）∪ 一件世界物件（**只正向连接**，绝不反解 objectID）；
@@ -339,10 +344,15 @@ _test-harnesses:
 	swift tools/test-resident-prop-world-collision.swift
 	swift tools/test-resident-prop-size.swift
 	swift tools/test-resident-prop-size-intent.swift
+	# 物件**只从用户的素材生成**来（用户 2026-10-02 的决定：「不能再用集合拼了」）：
+	# App 侧零手拼几何构造点、零「用几何拼」这个选项的文案与分支；三轴尺寸**逐轴**兑现
+	# （世界 size 逐位 1.443 × 0.862 × 0.302），"形状差得远"不再挡住逐轴。
+	# 五条注入负对照（构造点接回 / 板形门槛回来 / 二选一文案回来 / 建议被删 / 绕过裁决）全部必须 FAIL。
+	swift tools/test-generation-only-props.swift
 	# 「等待入库，但托盘上什么都没有，也领不了」（真机 2026-10-02「超大荧幕电视」）：
 	# 派生结论（那条 `failureSource == "renderer"` 的失败）**必须能从权威重新推导**，
 	# 记录不许当可见性判据。四条判据 + 四条注入负对照（永久信记录 / 无条件清 /
-	# 两者分叉 / 三轴退回生成网格），每条都实测会红；注入只改内存副本，跑完校验 sha256。
+	# 两者分叉 / 手拼几何被接回产品路径），每条都实测会红；注入只改内存副本，跑完校验 sha256。
 	swift tools/test-wish-machine-output-rederivation.swift
 	swift tools/test-resident-system-inbox-window.swift
 	swift tools/test-resident-prop-collision-proxy.swift
@@ -368,12 +378,23 @@ _test-harnesses:
 	# 覆盖层改成吃事件、源码里塞一条抓流路径、白名单开一个后门 —— 每一条都必须红。
 	# 见 docs/plans/2026-10-02-stage-tv-screen.md。
 	swift tools/test-resident-screen-overlay.swift
-	# 电视机**接线**的判据（App 侧唯一构造点 / 覆盖层接上舞台窗口 / 面板装上并可见 /
-	# 覆盖层容器在视图树里 / 三条工具并进 additionalTools）。存在的理由：上面那五条
-	# 是**类型级**的，它们可以全绿而 `WorldScreenStore` 在 App 侧一个构造点都没有 ——
-	# 编译得进、跑不起来。七条注入负对照在 harness 内部删掉/重复接线，每一条都必须红。
+	# 电视机**接线**的判据（App 侧唯一构造点 / 覆盖层接上舞台窗口 / **面板不出现** /
+	# 覆盖层容器在视图树里 / 三条工具并进 additionalTools）。2026-10-02 用户决定：
+	# 「左下角那块电视面板压根儿不应该出现」⇒ 判据③反过来钉"面板的挂载 / 显示入口
+	# 一处都不许有"（面板视图仍保留在 Screen/ScreenPanel.swift，文件头写明原因）。
+	# 存在的理由：上面那五条是**类型级**的，它们可以全绿而 `WorldScreenStore`
+	# 在 App 侧一个构造点都没有 —— 编译得进、跑不起来。八条注入负对照在 harness 内部
+	# 删掉 / 重复 / 把面板加回来，每一条都必须红。
 	# 现场演示：`SCREEN_WIRING_INJECT=dropInstallCall swift tools/test-resident-screen-app-wiring.swift`。
 	swift tools/test-resident-screen-app-wiring.swift
+	# 电视的**观感**与**面板人话**（真机 2026-10-02「什么玩意儿」）：GLB 必须带 3 份深色材质
+	# （屏幕深灰偏黑、有一点反光，既不是纯黑也不是灰板）、立柱顶在面板背面上、三轴 / 盒子
+	# 数量 / 面板厚 / 底座进深 / 屏幕面逐位不变；入库与预览的 yaw = 0、屏幕面 pitch = 0
+	# （正立、屏幕朝房间）；面板上给用户看的字一个工程术语都不许有，遮挡只在**真被挡**时
+	# 说**一句**常量话（不刷屏、不说格数与毫秒）。七条注入负对照在 harness 内部做手术
+	# （改回旧材质 / 纯黑 / 抽掉材质 / 加俯仰 / yaw 漂移 / 塞回工程术语 / 刷屏），每条都必须红。
+	# 现场演示：`TVLOOK_INJECT=old-grey-material swift tools/test-resident-tv-look.swift`。
+	swift tools/test-resident-tv-look.swift
 
 test-all: test-install test-worlds test-daemon test-python test-harnesses dedupe
 

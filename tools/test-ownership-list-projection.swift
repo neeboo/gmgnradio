@@ -625,6 +625,19 @@ func contractViolations(state: String, view: String, app: String) -> [String] {
     contract(state.contains("private func performWishAction(jobID: String, step: String,")
              && state.contains("guard isOpen, !isSaving else { return }"),
              "许愿动作的出口不是唯一一处 / 没有进行中守卫（重复点击会提交多次）")
+    // 「同一 (任务, 动作) 在一次用户意图内只提交一次」：上面那条 `isSaving` 只挡**在飞**
+    // 的那一次，真机上相隔一秒多的第二次激活落在它放开之后，于是同一个任务第二次交给
+    // 居民（2026-10-02 16:56:03.446 / 04.928 同一任务两条 `ask-resident`）。幂等台账缺席 ⇒ FAIL。
+    contract(state.contains("private var submittedWishActions = WishActionLedger()"),
+             "许愿动作没有幂等台账（连点 / 界面重放会第二次交给居民）")
+    contract(state.contains("guard submittedWishActions.admits(jobID: jobID, step: step) else {"),
+             "重复提交没有被挡在唯一那个动作出口上")
+    contract(state.contains("submittedWishActions.record(jobID: jobID, step: step)"),
+             "提交成功没有记账，第二次点击仍然会再交给居民一次")
+    contract(state.contains("\n        pruneSubmittedWishActions()\n"),
+             "台账不随投影剪枝（行换了动作或已入库之后这一行就再也点不动了）")
+    contract(state.contains("notice = Self.submittedText(for: step)"),
+             "重复调用没有走幂等出口（同一次的结果应当原样返回，而不是改口或再发一次）")
     contract(state.contains("step: \"claim\", action: claimWishOutput"),
              "「领取」没有从唯一那个动作出口走")
     // Q4：够不到许愿机 ⇒ 按钮**可见但置灰** + 一行可读原因 + 「让居民去取」（既有 agent 路径）。
@@ -659,20 +672,74 @@ for (name, source, anchor, replacement) in [
     ("claim-not-existing-path", contractApp, "wishMachineCoordinator.claim(id: wishID",
      "wishMachineCoordinator.claimUnused(id: wishID"),
     ("fourth-vocabulary-in-panel", contractView, "Text(row.statusText)", "Text(\"已摆出\")"),
+    // 幂等台账三条注入：去掉放行判据 / 去掉记账 / 去掉剪枝。
+    ("ask-duplicate-never-blocked", contractState,
+     "guard submittedWishActions.admits(jobID: jobID, step: step) else {", "guard true else {"),
+    ("ask-duplicate-not-recorded", contractState,
+     "submittedWishActions.record(jobID: jobID, step: step)", "_ = step"),
+    ("ask-ledger-never-pruned", contractState, "\n        pruneSubmittedWishActions()\n", "\n"),
 ] {
     guard source.contains(anchor) else {
         print("FAIL: 契约负对照「\(name)」的注入点找不到（等于没有负对照）"); exit(1)
     }
     let mutated = source.replacingOccurrences(of: anchor, with: replacement)
-    let isView = source == contractView
-    let final = contractViolations(state: contractState,
-                                   view: isView ? mutated : contractView,
-                                   app: isView ? contractApp : mutated)
+    // 注入必须落在**它自己那一个槽位**上：早先这里按"不是视图就当 app"处理，
+    // 于是注入 `ResidentPropEditorState` 时被 app 槽位的检查先接住，报的是别人的
+    // 违规 —— 那等于这条负对照没有真的证明它要证的那一条。
+    let final = contractViolations(state: source == contractState ? mutated : contractState,
+                                   view: source == contractView ? mutated : contractView,
+                                   app: source == contractApp ? mutated : contractApp)
     guard !final.isEmpty else {
         print("FAIL: 契约负对照「\(name)」注入后没有报违规"); exit(1)
     }
     print("PASS[negative-\(name)]: 注入 ⇒ FAIL：\(final[0])")
 }
+
+// ── 同一 (任务, 动作) 只提交一次：台账的**行为**（不是源码里的字样） ────────────────
+//
+// 真机 2026-10-02 16:56:03.446 与 04.928 是**同一个任务**的两条 `ask-resident`：
+// 唯一那个出口上原来只有 `isSaving`，而它只挡"在飞"的那一次，所以第二次激活又提交
+// 了一遍。这里把生产里那份纯台账原文编译进来，按"连点 / 同步重放 / 行换了动作 /
+// 关面板重开"四种情形复现它。
+guard let ledgerSource = declaration(editorStateSource, "struct WishActionLedger: Equatable {") else {
+    print("FAIL: 找不到 WishActionLedger —— 幂等台账不在生产源码里"); exit(1)
+}
+let ledgerRun = compileAndRun(#"""
+@main struct Harness {
+    static func main() {
+        var checks = 0, failures = 0
+        func check(_ ok: Bool, _ message: String) {
+            checks += 1
+            if !ok { failures += 1; print("FAIL: \(message)") }
+        }
+        let job = "0C285296-9164-4A2B-8FB7-6648E549A4AE"
+        var ledger = WishActionLedger()
+        check(ledger.admits(jobID: job, step: "ask-resident"), "第一次提交必须放行")
+        ledger.record(jobID: job, step: "ask-resident")
+        check(!ledger.admits(jobID: job, step: "ask-resident"),
+              "连点第二次必须被挡下，否则同一个任务会再交给居民一次（真机 16:56:03.446 / 04.928）")
+        check(!ledger.admits(jobID: job, step: "ask-resident"),
+              "同步重放的第三次同样被挡下")
+        check(ledger.admits(jobID: job, step: "claim"),
+              "同一任务换成另一个动作是新的意图，必须放行")
+        check(ledger.admits(jobID: "AEFC68E1-91D4-42F6-AA6A-ED35EDDF9613", step: "ask-resident"),
+              "另一个任务必须独立放行")
+        ledger.record(jobID: job, step: "claim")
+        ledger.keepOnly([WishActionLedger.key(jobID: job, step: "claim")])
+        check(ledger.admits(jobID: job, step: "ask-resident"),
+              "行不再提供那个动作后必须放掉台账，否则这一行以后点不动")
+        check(!ledger.admits(jobID: job, step: "claim"), "此刻仍提供的动作依旧只提交一次")
+        ledger.removeAll()
+        check(ledger.admits(jobID: job, step: "claim"), "关面板 / 换世界后是新意图，必须重新放行")
+        print("\(failures == 0 ? "PASS" : "FAIL"): \(checks) wish action ledger checks, \(failures) failures")
+        exit(failures == 0 ? 0 : 1)
+    }
+}
+"""#, projection: ledgerSource)
+guard ledgerRun.0 == 0 else {
+    print("FAIL: 幂等台账行为复核失败\n\(ledgerRun.1)"); exit(1)
+}
+print("PASS[ask-dedup]: " + ledgerRun.1.trimmingCharacters(in: .whitespacesAndNewlines))
 
 // ── 「一个投影，五处消费」（设计 §8.3）+ **第四套状态词的全局门禁** ───────────────
 //

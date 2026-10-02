@@ -1,6 +1,10 @@
 import CryptoKit
 import Foundation
 
+/// **已停用（2026-10-02）**：原因 —— 用户要求物件一律来自素材生成（图 → 3D），
+/// 不再由我们手拼一个固定造型。**产品路径零调用**；类型与判据保留，只为本文件自身的
+/// 离线断言、以及历史存档 metadata（`WorldGeneratedProp.primitive`）读得回来。
+///
 /// 一台**由基础几何拼出来**的平面电视：扁平面板 + 边框 + 底座。
 ///
 /// ## 为什么要它（真机 2026-10-01「平面电视」）
@@ -49,6 +53,19 @@ public struct WorldPrimitiveTelevision: Equatable, Sendable {
         public let name: String
         public let center: WorldVector3
         public let size: WorldVector3
+
+        /// 这一块零件在画面里的**外观**（颜色 / 金属度 / 粗糙度）。
+        ///
+        /// 派生自 `role`，不新增输入：**盒子数量与尺寸判据一个字都没变**，变的只是
+        /// "这一块涂成什么颜色"（见 `WorldPrimitiveTelevisionFinish`）。这一份也是
+        /// GLB 里 `materials` 的唯一来源 —— 写字节的那一处不再自己挑颜色。
+        public var finish: WorldPrimitiveTelevisionFinish {
+            switch role {
+            case .panel: return .screen
+            case .bezel: return .body
+            case .standNeck, .standBase: return .stand
+            }
+        }
 
         public var minimum: WorldVector3 {
             WorldVector3(x: center.x - size.x / 2, y: center.y - size.y / 2, z: center.z - size.z / 2)
@@ -236,9 +253,12 @@ public struct WorldPrimitiveTelevision: Equatable, Sendable {
     ///        | +---------------+ |
     ///        |  bezel.bottom     |
     ///   ---- +---------+---------+  y = standTop
-    ///             | neck |
+    ///             | neck |            ← 立柱的**前表面**顶在面板的背面上（不悬在空气里）
     ///   ========= +------+ =========  stand.base（进深 = depth）
     /// ```
+    ///
+    /// 「每块零件长什么样」不在这里：那是 `Part.finish` →
+    /// `WorldPrimitiveTelevisionFinish`，本函数产生的**块数、位置、尺寸**全部照旧。
     static func parts(for millimeters: WorldPropSizeMillimeters) -> [Part]? {
         let width = millimeters.x / 1000
         let height = millimeters.y / 1000
@@ -263,12 +283,24 @@ public struct WorldPrimitiveTelevision: Equatable, Sendable {
         // 正面（前表面）就在 z = +depth/2：屏幕面与整体正面同平面。
         let slabCenterZ = depth / 2 - thickness / 2
         let panelCenterY = panelBottom + panelHeight / 2
+        // 立柱的**前表面**必须顶到面板的**背面**（`panel.min.z`）。不顶上去，立柱就悬在
+        // 面板后面 `0.081 m` 的空气里：面板看着像"支在半个底座前面的斜板"，那正是真机
+        // 2026-10-02 那句「歪着/后仰」的观感来源（姿态数据本身是正的，见文件头）。
+        //
+        // 上下夹一层只是**防御**：立柱永远不许越过底板的前后沿。越过了，整体进深就不再是
+        // 用户给的第三个数。所以这一步**不产生任何尺寸**，只是在已有尺寸里挑一个 z。
+        let panelBackZ = slabCenterZ - thickness / 2
+        let lowestNeckCenterZ = -depth / 2 + neckDepth / 2
+        let highestNeckCenterZ = depth / 2 - neckDepth / 2
+        let neckCenterZ = min(
+            max(panelBackZ - neckDepth / 2, lowestNeckCenterZ), highestNeckCenterZ
+        )
         return [
             Part(role: .standBase, name: "stand.base",
                  center: WorldVector3(x: 0, y: baseThickness / 2, z: 0),
                  size: WorldVector3(x: baseWidth, y: baseThickness, z: depth)),
             Part(role: .standNeck, name: "stand.neck",
-                 center: WorldVector3(x: 0, y: baseThickness + neckHeight / 2, z: 0),
+                 center: WorldVector3(x: 0, y: baseThickness + neckHeight / 2, z: neckCenterZ),
                  size: WorldVector3(x: neckWidth, y: neckHeight, z: neckDepth)),
             Part(role: .bezel, name: "bezel.top",
                  center: WorldVector3(x: 0, y: height - bezelWidth / 2, z: slabCenterZ),
@@ -340,57 +372,126 @@ public struct WorldPrimitiveTelevisionRecord: Codable, Equatable, Sendable {
 
 // MARK: - 资产字节：把零件拼成一个真实的 glTF 2.0 二进制
 
-/// 极简 glTF 2.0 `.glb` 写入器：一块 mesh（所有盒子合并成一份三角形表）、一个节点。
+/// 极简 glTF 2.0 `.glb` 写入器：一块 mesh（所有盒子合并成一份三角形表）、一个节点，
+/// 外加**每个部件一份材质**（`materials` + 每个 primitive 的 `material` 索引）。
 ///
-/// 为什么合并成一份而不是每块零件一个节点：资产只需要"能解码、包围盒对、面是平的"。
+/// 为什么盒子仍合并成**一块 mesh、一个节点**：资产只需要"能解码、包围盒对、面是平的"。
 /// 零件的**结构**（哪块是面板、哪块是底座）由 `WorldPrimitiveTelevision.parts` 承载，
 /// 那是审计与面板读的地方；在 GLB 里再存一份就是第二个真相。
 ///
-/// 输出是**确定性**的（`JSONSerialization` 的 `sortedKeys`、无时间戳、无随机数）：
-/// 同样的三轴永远得到同样的字节、同样的 `sha256:` 引用。内容寻址要求这一点。
+/// 为什么现在**要**写材质（真机 2026-10-02「什么玩意儿」）：一个 `materials` 都不写，
+/// 七块盒子就全都落回渲染器的缺省材质（白 + 全金属 + 全粗糙），在中性灰环境光下呈现为
+/// **一整块灰板** —— 边框、屏幕、底座一个都分不出来。材质是**外观**，不是判据：
+/// 盒子的数量、位置、尺寸与三角形一个都没动（`parts` 是唯一来源），屏幕推断那条路
+/// 读的是 `size`，与这里无关。
+///
+/// 分组是**确定性**的：按 `WorldPrimitiveTelevisionFinish.allCases` 的顺序，只留这台电视
+/// 真的有零件的那些 finish。于是同样的三轴永远得到同样的字节、同样的 `sha256:` 引用
+/// （`JSONSerialization` 的 `sortedKeys`、无时间戳、无随机数）。内容寻址要求这一点。
 enum PrimitiveGLBWriter {
-    static func encode(parts: [WorldPrimitiveTelevision.Part]) -> Data {
+    /// 一个 finish 一组：盒子 + 这一组的三角形表。
+    private struct Group {
+        let finish: WorldPrimitiveTelevisionFinish
         var positions: [Float] = []
         var indices: [UInt32] = []
-        for part in parts {
-            let base = UInt32(positions.count / 3)
-            let minimum = part.minimum
-            let maximum = part.maximum
-            let corners: [WorldVector3] = [
-                WorldVector3(x: minimum.x, y: minimum.y, z: minimum.z),
-                WorldVector3(x: maximum.x, y: minimum.y, z: minimum.z),
-                WorldVector3(x: maximum.x, y: maximum.y, z: minimum.z),
-                WorldVector3(x: minimum.x, y: maximum.y, z: minimum.z),
-                WorldVector3(x: minimum.x, y: minimum.y, z: maximum.z),
-                WorldVector3(x: maximum.x, y: minimum.y, z: maximum.z),
-                WorldVector3(x: maximum.x, y: maximum.y, z: maximum.z),
-                WorldVector3(x: minimum.x, y: maximum.y, z: maximum.z),
-            ]
-            for corner in corners {
-                positions.append(corner.x); positions.append(corner.y); positions.append(corner.z)
+    }
+
+    static func encode(parts: [WorldPrimitiveTelevision.Part]) -> Data {
+        // 分组：finish 的顺序取自 `allCases`（与 `parts` 的排列无关 ⇒ 确定性）。
+        var groups: [Group] = []
+        for finish in WorldPrimitiveTelevisionFinish.allCases {
+            let members = parts.filter { $0.finish == finish }
+            guard !members.isEmpty else { continue }
+            var group = Group(finish: finish)
+            for part in members {
+                let base = UInt32(group.positions.count / 3)
+                let minimum = part.minimum
+                let maximum = part.maximum
+                let corners: [WorldVector3] = [
+                    WorldVector3(x: minimum.x, y: minimum.y, z: minimum.z),
+                    WorldVector3(x: maximum.x, y: minimum.y, z: minimum.z),
+                    WorldVector3(x: maximum.x, y: maximum.y, z: minimum.z),
+                    WorldVector3(x: minimum.x, y: maximum.y, z: minimum.z),
+                    WorldVector3(x: minimum.x, y: minimum.y, z: maximum.z),
+                    WorldVector3(x: maximum.x, y: minimum.y, z: maximum.z),
+                    WorldVector3(x: maximum.x, y: maximum.y, z: maximum.z),
+                    WorldVector3(x: minimum.x, y: maximum.y, z: maximum.z),
+                ]
+                for corner in corners {
+                    group.positions.append(corner.x)
+                    group.positions.append(corner.y)
+                    group.positions.append(corner.z)
+                }
+                // glTF 的正面是逆时针；每个盒子 6 个面 × 2 个三角形。
+                for face in [
+                    [0, 2, 1, 0, 3, 2], // -Z
+                    [4, 5, 6, 4, 6, 7], // +Z（屏幕那一面朝这里）
+                    [0, 1, 5, 0, 5, 4], // -Y
+                    [3, 7, 6, 3, 6, 2], // +Y
+                    [0, 4, 7, 0, 7, 3], // -X
+                    [1, 2, 6, 1, 6, 5], // +X
+                ] {
+                    group.indices.append(contentsOf: face.map { base + UInt32($0) })
+                }
             }
-            // glTF 的正面是逆时针；每个盒子 6 个面 × 2 个三角形。
-            for face in [
-                [0, 2, 1, 0, 3, 2], // -Z
-                [4, 5, 6, 4, 6, 7], // +Z（屏幕那一面朝这里）
-                [0, 1, 5, 0, 5, 4], // -Y
-                [3, 7, 6, 3, 6, 2], // +Y
-                [0, 4, 7, 0, 7, 3], // -X
-                [1, 2, 6, 1, 6, 5], // +X
-            ] {
-                indices.append(contentsOf: face.map { base + UInt32($0) })
-            }
+            groups.append(group)
         }
 
-        let positionBytes = positions.withUnsafeBufferPointer { Data(buffer: $0) }
-        let indexBytes = indices.withUnsafeBufferPointer { Data(buffer: $0) }
-        var binary = positionBytes
-        binary.append(indexBytes)
-        while binary.count % 4 != 0 { binary.append(0) }
+        // 二进制：一组一段（顶点表 + 索引表）。两段都是 4 的整数倍（VEC3 float / UInt32），
+        // 所以顺序摆放天然满足 glTF 的对齐要求，不需要补零。
+        var binary = Data()
+        var accessors: [[String: Any]] = []
+        var bufferViews: [[String: Any]] = []
+        var primitives: [[String: Any]] = []
+        var materials: [[String: Any]] = []
+        for group in groups {
+            let positionBytes = group.positions.withUnsafeBufferPointer { Data(buffer: $0) }
+            let indexBytes = group.indices.withUnsafeBufferPointer { Data(buffer: $0) }
+            let positionView = bufferViews.count
+            let indexView = positionView + 1
+            let positionAccessor = accessors.count
+            let indexAccessor = positionAccessor + 1
+            let positionOffset = binary.count
+            binary.append(positionBytes)
+            let indexOffset = binary.count
+            binary.append(indexBytes)
 
-        let minimum = stride(from: 0, to: positions.count, by: 3).map { positions[$0] }
-        let maximumY = stride(from: 1, to: positions.count, by: 3).map { positions[$0] }
-        let maximumZ = stride(from: 2, to: positions.count, by: 3).map { positions[$0] }
+            let xs = stride(from: 0, to: group.positions.count, by: 3).map { group.positions[$0] }
+            let ys = stride(from: 1, to: group.positions.count, by: 3).map { group.positions[$0] }
+            let zs = stride(from: 2, to: group.positions.count, by: 3).map { group.positions[$0] }
+            bufferViews.append([
+                "buffer": 0, "byteOffset": positionOffset,
+                "byteLength": positionBytes.count, "target": 34962,
+            ])
+            bufferViews.append([
+                "buffer": 0, "byteOffset": indexOffset,
+                "byteLength": indexBytes.count, "target": 34963,
+            ])
+            accessors.append([
+                "bufferView": positionView, "componentType": 5126,
+                "count": group.positions.count / 3, "type": "VEC3",
+                "min": [xs.min() ?? 0, ys.min() ?? 0, zs.min() ?? 0],
+                "max": [xs.max() ?? 0, ys.max() ?? 0, zs.max() ?? 0],
+            ])
+            accessors.append([
+                "bufferView": indexView, "componentType": 5125,
+                "count": group.indices.count, "type": "SCALAR",
+            ])
+            let color = group.finish.baseColor
+            materials.append([
+                "name": group.finish.name,
+                "pbrMetallicRoughness": [
+                    "baseColorFactor": [color.x, color.y, color.z, color.w],
+                    "metallicFactor": group.finish.metallic,
+                    "roughnessFactor": group.finish.roughness,
+                ],
+                "doubleSided": false,
+            ])
+            primitives.append([
+                "attributes": ["POSITION": positionAccessor],
+                "indices": indexAccessor, "mode": 4, "material": materials.count - 1,
+            ])
+        }
 
         let document: [String: Any] = [
             "asset": ["version": "2.0", "generator": WorldPrimitiveTelevision.rendererName],
@@ -399,30 +500,17 @@ enum PrimitiveGLBWriter {
             "nodes": [["mesh": 0, "name": WorldPrimitiveTelevision.rendererName]],
             "meshes": [[
                 "name": WorldPrimitiveTelevision.rendererName,
-                "primitives": [["attributes": ["POSITION": 0], "indices": 1, "mode": 4]],
+                "primitives": primitives,
             ]],
-            "accessors": [
-                [
-                    "bufferView": 0, "componentType": 5126, "count": positions.count / 3,
-                    "type": "VEC3",
-                    "min": [minimum.min() ?? 0, maximumY.min() ?? 0, maximumZ.min() ?? 0],
-                    "max": [minimum.max() ?? 0, maximumY.max() ?? 0, maximumZ.max() ?? 0],
-                ],
-                [
-                    "bufferView": 1, "componentType": 5125, "count": indices.count,
-                    "type": "SCALAR",
-                ],
-            ],
-            "bufferViews": [
-                ["buffer": 0, "byteOffset": 0, "byteLength": positionBytes.count, "target": 34962],
-                ["buffer": 0, "byteOffset": positionBytes.count, "byteLength": indexBytes.count,
-                 "target": 34963],
-            ],
+            "materials": materials,
+            "accessors": accessors,
+            "bufferViews": bufferViews,
             "buffers": [["byteLength": binary.count]],
         ]
         var json = (try? JSONSerialization.data(withJSONObject: document, options: [.sortedKeys]))
             ?? Data("{}".utf8)
         while json.count % 4 != 0 { json.append(0x20) }
+        while binary.count % 4 != 0 { binary.append(0) }
 
         var glb = Data()
         appendUInt32(&glb, 0x4654_6C67) // "glTF"

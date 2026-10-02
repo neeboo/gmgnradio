@@ -67,7 +67,11 @@ final class WorldScreenSurface: NSObject, WKNavigationDelegate {
         webView = WKWebView(frame: .zero, configuration: configuration)
         super.init()
         webView.navigationDelegate = self
-        webView.underPageBackgroundColor = .black
+        // **不是纯黑**：这块 web 视图在"还没放东西"时就是用户看到的屏幕面。纯黑在画面里
+        // 是一个洞（真机 2026-10-02「灰板 + 一个大的黑色矩形」），而关着的屏幕是一块
+        // **深灰偏黑、带一点点反光**的玻璃。这里与 GLB 的
+        // `WorldPrimitiveTelevisionFinish.screen.baseColor` 取同一个观感，两处不能各说一套。
+        webView.underPageBackgroundColor = Self.idleScreenBackground
         webView.allowsBackForwardNavigationGestures = false
         webView.autoresizingMask = [.width, .height]
         container.addSubview(webView)
@@ -182,9 +186,21 @@ final class WorldScreenSurface: NSObject, WKNavigationDelegate {
         }
     }
 
+    /// 「没在放东西」那一面屏幕的颜色与底纹 —— **外观**，不是判据。
+    ///
+    /// 深灰偏黑（sRGB 约 #1b1e24 ⇒ 线性约 0.011–0.016），加一道很淡的斜向高光当"反光"：
+    /// 于是它读起来是一块关着的屏幕玻璃，而不是一个死黑的矩形。**唯一**一处取值，
+    /// `underPageBackgroundColor` 与空页 HTML 都读它，不各写一份。
+    static let idleScreenBackground = NSColor(
+        srgbRed: 0.106, green: 0.118, blue: 0.141, alpha: 1
+    )
+
     static let blankPage = """
         <!doctype html><html><head><meta charset="utf-8">
-        <style>html,body{margin:0;height:100%;background:#000}</style></head>
+        <style>html,body{margin:0;height:100%;background:#1b1e24;
+        background-image:linear-gradient(115deg,rgba(255,255,255,0.075) 0%,
+        rgba(255,255,255,0.020) 22%,rgba(255,255,255,0) 46%),
+        linear-gradient(#20242b,#12141a)}</style></head>
         <body></body></html>
         """
 

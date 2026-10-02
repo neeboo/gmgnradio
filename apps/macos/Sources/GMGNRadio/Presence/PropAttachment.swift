@@ -26,6 +26,12 @@ struct ResidentHeldPropDescriptor: Equatable, Sendable {
     /// 手里的这一件与地上那一件是同一份网格：躺着生成的东西必须两处都转正，
     /// 否则会出现"放在地上立着、拿在手里躺着"。缺省 = 单位四元数 ⇒ 与改造前逐字节相同。
     var orientation: WorldQuaternion = .identity
+    /// 世界里那一份**逐轴**目标尺寸（米）= `WorldGeneratedProp.effectiveSize`。
+    ///
+    /// `nil`（缺省）= 只有高度轴（等比，与改造前逐位相同）；非 nil 且不是这份网格的等比像
+    /// ⇒ 手里这一件也**逐轴**缩放 —— 与地上那一件、碰撞盒、承托判据读的是同一组数字，
+    /// 所以"放在地上是三轴、拿在手里变回等比"这种分叉在结构上不可能。
+    var targetSizeMeters: WorldVector3? = nil
 
     var assetKey: String {
         assetID + "|" + modelURL.standardizedFileURL.path
@@ -468,9 +474,16 @@ enum PropAttachmentMatrix {
         let bounds = WorldPropOrientationPolicy.orientedBounds(
             minimum: minimum, maximum: maximum, rotation: orientation
         )
-        let height = upright ? bounds.maximum.y - bounds.minimum.y : maximum.y - minimum.y
+        // 缩放要用的**摆正后**三轴跨度。手里这一件与地上那一件读的是同一组数字
+        // （`targetSizeMeters` = 世界里那一份 `effectiveSize`），所以形状不可能不一致。
+        let rawExtent = upright
+            ? SIMD3<Float>(bounds.maximum.x - bounds.minimum.x,
+                           bounds.maximum.y - bounds.minimum.y,
+                           bounds.maximum.z - bounds.minimum.z)
+            : SIMD3<Float>(maximum.x - minimum.x, maximum.y - minimum.y, maximum.z - minimum.z)
+        let height = rawExtent.y
         let calibration = descriptor.calibration
-        let values = [
+        var values = [
             minimum.x, minimum.y, minimum.z,
             maximum.x, maximum.y, maximum.z,
             descriptor.targetHeightMeters,
@@ -485,10 +498,25 @@ enum PropAttachmentMatrix {
             calibration.localRotation.z,
             calibration.localRotation.w,
         ]
+        if let targetSize = descriptor.targetSizeMeters {
+            values.append(contentsOf: [targetSize.x, targetSize.y, targetSize.z])
+        }
+        // 逐轴那一份：只有目标尺寸**不是**这份网格的等比像时才真的分叉（判据复用既有的
+        // `WorldPropSizePolicy.uniformFactor`，与已摆那一件同一处）。每一维都与
+        // `targetHeightMeters` **同一条边界**（0 < v ≤ 10 米）。
+        let perAxis: SIMD3<Float>? = descriptor.targetSizeMeters.flatMap { targetSize in
+            guard WorldPropSizePolicy.uniformFactor(
+                from: WorldVector3(x: rawExtent.x, y: rawExtent.y, z: rawExtent.z),
+                to: targetSize) == nil else { return nil }
+            return SIMD3<Float>(targetSize.x, targetSize.y, targetSize.z)
+        }
         guard values.allSatisfy(\.isFinite),
               height > 0.000_01,
+              rawExtent.x > 0.000_01, rawExtent.z > 0.000_01,
               descriptor.targetHeightMeters > 0,
               descriptor.targetHeightMeters <= 10,
+              perAxis.map({ $0.x > 0 && $0.x <= 10 && $0.y > 0 && $0.y <= 10 && $0.z > 0 && $0.z <= 10 })
+                  ?? true,
               calibration.avatarAssetID == ResidentPropAttachmentEligibility.supportedAvatarID,
               calibration.hand == descriptor.attachmentPoint.worldSlot,
               (0...1).contains(calibration.normalizedGrip.x),
@@ -507,7 +535,10 @@ enum PropAttachmentMatrix {
         guard simd_length_squared(rotationValue) > 0.000_000_1 else {
             throw PropAttachmentError.invalidHandPose
         }
-        let scaleValue = descriptor.targetHeightMeters / height
+        let uniformScaleValue = descriptor.targetHeightMeters / height
+        let scaleValues = perAxis.map {
+            SIMD3<Float>($0.x / rawExtent.x, $0.y / rawExtent.y, $0.z / rawExtent.z)
+        } ?? SIMD3<Float>(repeating: uniformScaleValue)
         let grip = minimum + (maximum - minimum) * SIMD3<Float>(
             calibration.normalizedGrip.x,
             calibration.normalizedGrip.y,
@@ -522,9 +553,9 @@ enum PropAttachmentMatrix {
         var localRotation = simd_float4x4(quaternion)
         localRotation.columns.3 = SIMD4<Float>(offset, 1)
         var scale = matrix_identity_float4x4
-        scale.columns.0.x = scaleValue
-        scale.columns.1.y = scaleValue
-        scale.columns.2.z = scaleValue
+        scale.columns.0.x = scaleValues.x
+        scale.columns.1.y = scaleValues.y
+        scale.columns.2.z = scaleValues.z
         // 抓握点先转到**摆正后**的坐标系里：`T(-R·grip) · R` 与"先转正再取原始 grip 点"
         // 是同一件事，于是手里握的还是网格上同一个物理位置。
         let anchoredGrip = upright
