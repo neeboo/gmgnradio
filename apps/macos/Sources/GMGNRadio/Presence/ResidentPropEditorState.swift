@@ -305,6 +305,20 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
     }
     var selectedGrip: WorldPropGripCalibration? { isSelectedHeld ? selectedObject?.gripCalibration : nil }
     var selectedHoldUnavailableReason: String? { selectedID.flatMap { snapshot.holdUnavailableReasons[$0] } }
+    /// 「这件物件挂在**这个**挂点上现在行不行」。
+    ///
+    /// 快照里那份 `holdUnavailableReasons` 是**按右手**问出来的（宿主的
+    /// `residentPropEditorSnapshot` 调 `holdEligibility(objectID:)` 用的是省缺挂点），
+    /// 所以它只能回答右手。背后/腰间**不拿它的答案冒充**：返回 nil = "这里判不了，
+    /// 让世界那条命令自己去判"，于是用户点「背后」时得到的是背后自己的具名原因，
+    /// 而不是右手的问题。
+    private func availabilityReason(id: String, point: PropAttachmentPoint) -> String? {
+        guard point == .rightHand else { return nil }
+        guard let reason = snapshot.holdUnavailableReasons[id] else { return nil }
+        // 屏上那一行由 `notice` 显示；日志里必须有同一句，否则又只有屏幕、没有排障线索。
+        livingWorldLogger.notice("摆件面板拒绝 step=hold-unavailable 挂点=\(point.rawValue, privacy: .public) 物件=\(id, privacy: .public) 原因=\(reason, privacy: .public)")
+        return reason
+    }
     var surface: ResidentPropEditorSurface? { snapshot.surfaces.first { $0.id == placement?.surfaceID } }
     var canConfirm: Bool { isOpen && !isSaving && candidate != nil && draftRevision == snapshot.revision }
 
@@ -722,12 +736,32 @@ struct ResidentPropEditorSnapshot: Equatable, Sendable {
         await save(.undo)
     }
     func holdSelected(at point: PropAttachmentPoint? = nil) async {
-        guard let id = selectedID, let hold else { return }
         let target = point ?? holdPoint
+        // **一次点击绝不允许什么都不发生**。原来这两条 guard 是裸 `return`：用户在
+        // 「手/背后/腰间」上点一下，既没有动作、也没有一句话、日志里也没有一行
+        // （真机 2026-10-02"剑挂不到背后"）。现在每一条不成立的出口都说清是哪一条。
+        guard let id = selectedID else {
+            notice = "请先选中一件物件，再选挂点。"
+            livingWorldLogger.notice("摆件面板拒绝 step=hold-no-selection 挂点=\(target.rawValue, privacy: .public)")
+            return
+        }
+        guard let hold else {
+            notice = "摆放面板还没有接到世界里（空间会话未就绪），这次挂点没有提交。请关掉面板重开一次。"
+            livingWorldLogger.notice("摆件面板拒绝 step=hold-not-wired 挂点=\(target.rawValue, privacy: .public) 物件=\(id, privacy: .public)")
+            return
+        }
         holdPoint = target
         // 已经挂在身上的是**同一件**：换挂点不必再过一次"能不能拿"（它已经在身上了），
         // 能不能挂由世界那条命令自己的判据回答（找不到骨骼 ⇒ 可见失败）。
-        guard isSelectedHeld || snapshot.holdUnavailableReasons[id] == nil else { return }
+        //
+        // 这里的可用性原因**是按用户真正选的挂点**问的，不是拿手的答案回答背后/腰间：
+        // `holdEligibility` 的省缺是 `.rightHand`，用它挡住"背后"会把一个手部的问题
+        // 说成"背后也不行"，用户永远试不出来。真的挂不上时下面那次提交会给出**那个挂点
+        // 自己的**具名原因（含统一日志一行）。
+        if !isSelectedHeld, let reason = availabilityReason(id: id, point: target) {
+            notice = reason
+            return
+        }
         await saveAction(key: "hold:\(id):\(target.rawValue)", keepSelection: id) { revision, requestID in
             try await hold(id, target, revision, requestID)
         }

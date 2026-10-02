@@ -38,6 +38,18 @@ enum PropAttachmentError: Error, Equatable, LocalizedError, Sendable {
     case missingBone(PropAttachmentPoint)
     case invalidHandPose
     case assetNotPrepared
+    /// 空间这一刻不可见（世界没推上台、舞台窗口被收起/最小化）。
+    ///
+    /// 为什么要把这四种从 `.assetNotPrepared` / `.unsupportedAvatar` 里**分出来**：
+    /// 真机 2026-10-02 的"剑挂不到背后"里，这一层的八条判据原来塌成同一句话
+    /// （"物件还没有准备好" / "当前角色还不能拿起物件"），而角色明明是受支持的 2B、
+    /// 资产明明已经备好 —— 用户在屏幕上看不出是哪一条，统一日志里也一条都没有。
+    /// **每一次拒绝都必须能指名道姓**（哪条判据、看着哪个世界/资产），否则"挂不上"
+    /// 就永远只能靠猜。
+    case worldNotVisible(worldID: String?)
+    case rendererNotActive(worldID: String?)
+    case assetNotRenderable(assetID: String)
+    case validationHandlerUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -60,6 +72,14 @@ enum PropAttachmentError: Error, Equatable, LocalizedError, Sendable {
             "当前挂点姿势无效，暂时无法显示物件。"
         case .assetNotPrepared:
             "物件还没有准备好，暂时无法拿起。"
+        case .worldNotVisible(let worldID):
+            "这个空间现在不在舞台上（世界 \(worldID ?? "未知") 没有在显示），暂时挂不上东西。请把空间窗口切到前台再试。"
+        case .rendererNotActive(let worldID):
+            "这个空间的显示还没接管（世界 \(worldID ?? "未知") 的渲染器这一刻不活动），暂时挂不上东西。请等空间画面出现后重试。"
+        case .assetNotRenderable(let assetID):
+            "这件物件的模型这一刻没有在渲染器里备好（资产 \(assetID)），暂时挂不上。请等它显示出来再试。"
+        case .validationHandlerUnavailable:
+            "空间显示还没有把挂点检查接上（渲染器尚未接管），暂时挂不上东西。请等空间画面出现后重试。"
         }
     }
 

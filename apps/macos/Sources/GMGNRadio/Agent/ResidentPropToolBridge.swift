@@ -1,5 +1,6 @@
 import Foundation
 import CoreFoundation
+import os
 import WorldRuntime
 
 /// Narrow background mutation grant: the completion round may apply only this object on the
@@ -283,9 +284,14 @@ extension ResidentPropDelegationError: LocalizedError {
                 failure["slot"] = point.worldSlot.rawValue
                 failure["slot_name"] = PropAttachmentSlots.displayName(for: point)
             }
+            // 回执是给 agent 看的；**日志是给排障的人看的**。这条工具调用失败时，
+            // 统一日志里必须留下同一个名字与同一句话 —— 否则"用户说挂不上、日志里什么都没有"
+            // 就会再次发生（真机 2026-10-02）。
+            Self.log.notice("挂件工具失败 tool=\(name, privacy: .public) code=\(code, privacy: .public) 物件=\((values["object_id"] as? String) ?? "nil", privacy: .public) 挂点=\((failure["slot_name"] as? String) ?? "-", privacy: .public) 原因=\(error.localizedDescription, privacy: .public)")
             return result(failure, error: true)
         }
     }
+    private static let log = Logger(subsystem: "ai.gmgn.radio", category: "LivingWorld")
     private func delegationAllows(_ name: String, _ values: [String: Any]) -> Bool {
         guard name == "apply_prop_placement", let grant = delegatedGrant,
               values["object_id"] as? String == grant.objectID,

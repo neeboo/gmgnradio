@@ -1,5 +1,37 @@
 import Foundation
+import os
 import WorldRuntime
+
+/// 「挂件为什么被拒」的**具名步骤表**：`holdCommand` / `remountCommand` 里每一条 guard
+/// 都必须带一个这里的名字走 `rejectHold`，绝不静默 `throw`。
+///
+/// 为什么要有它：真机 2026-10-02 用户报到"剑挂不到背后"，而统一日志里**一条挂载/拒绝的
+/// 行都没有** —— 八条 guard 全部静默抛错，于是"一次都没成功过"既无法复现也无法定位。
+/// 按本仓的纪律，**每一次拒绝都必须具名可见**；这张表就是"具名"的唯一一份名字来源。
+enum ResidentPropHoldStep: String, CaseIterable, Sendable {
+    case contextNotCurrent = "context-not-current"
+    case activityActive = "activity-active"
+    case avatarUnavailable = "avatar-unavailable"
+    case objectUnknown = "object-unknown"
+    case avatarChanged = "avatar-changed"
+    case otherPropHeld = "other-prop-held"
+    case propTooLarge = "prop-too-large"
+    case gripCalibration = "grip-calibration"
+
+    /// 屏幕/回执上那句人话（拒绝文案由**判据自己**给，这里只说"是哪一步"）。
+    var label: String {
+        switch self {
+        case .contextNotCurrent: "这次空间操作已经结束"
+        case .activityActive: "居民正在进行活动"
+        case .avatarUnavailable: "当前没有可用的手持角色"
+        case .objectUnknown: "这件物件不在世界里"
+        case .avatarChanged: "角色已经更换"
+        case .otherPropHeld: "居民手里已经有别的东西"
+        case .propTooLarge: "物件超过手持上限"
+        case .gripCalibration: "挂点标定算不出来（角色/资产/骨骼/净空之一不成立）"
+        }
+    }
+}
 
 /// 摆放校验需要的承托几何。
 ///
@@ -271,29 +303,56 @@ final class ResidentPropPlacementService {
     ///
     /// 换挂点走的还是 `.hold` 那条世界命令族里既有的 `.adjustGrip`：同一条归属轴、同一份
     /// `returnState`（放回哪儿仍然是拿起前那一处），所以"换挂点"不会顺手改掉"从哪儿来回哪儿去"。
+    ///
+    /// **每一条 guard 都走 `rejectHold`**（具名 + 统一日志），一条静默的都没有。
+    /// 这条纪律由 `tools/test-resident-prop-hold.swift` 逐条钉住：把任何一处的
+    /// `throw rejectHold(...)` 改回裸 `throw`，那条门禁就红。
     func holdCommand(objectID: String, point: PropAttachmentPoint = .rightHand) throws -> WorldPropLayoutCommand {
-        guard isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
-        guard context.state.activeActivity == nil else { throw ResidentPropPlacementError.activityActive }
-        guard let avatarID = currentAvatarAssetID() else { throw ResidentPropPlacementError.avatarUnavailable }
-        guard let prop = context.state.objectStates[objectID]?.generatedProp else { throw WorldPropLayoutError.invalidObject }
+        guard isCurrent() else {
+            throw rejectHold(.contextNotCurrent, ResidentPropPlacementError.inactiveContext, objectID, point)
+        }
+        if let activity = context.state.activeActivity {
+            // 「有活动在进行」这条拒绝必须**点名是哪个活动、什么状态**，否则用户与排障的人
+            // 都不知道该先结束什么（任务纪律：不许含糊拒绝）。
+            throw rejectHold(.activityActive, ResidentPropPlacementError.activityActive, objectID, point,
+                             detail: "activity=\(activity.activityID) status=\(activity.status.rawValue)")
+        }
+        guard let avatarID = currentAvatarAssetID() else {
+            throw rejectHold(.avatarUnavailable, ResidentPropPlacementError.avatarUnavailable, objectID, point)
+        }
+        guard let prop = context.state.objectStates[objectID]?.generatedProp else {
+            throw rejectHold(.objectUnknown, WorldPropLayoutError.invalidObject, objectID, point)
+        }
         // 已经挂在身上的是**同一件**物件 ⇒ 这是"换挂点"，不是"再拿一次"（`.hold` 会以
         // `heldPropAlreadyExists` 拒绝，而用户说的正是"把它挂到背后去"）。
         if let held = context.state.heldProp, held.objectID == objectID {
-            guard held.avatarAssetID == avatarID else { throw ResidentPropPlacementError.avatarChanged }
+            guard held.avatarAssetID == avatarID else {
+                throw rejectHold(.avatarChanged, ResidentPropPlacementError.avatarChanged, objectID, point)
+            }
             return try remountCommand(objectID: objectID, point: point, avatarID: avatarID, prop: prop)
         }
         guard context.state.heldProp == nil else {
-            throw ResidentPropPlacementError.attachmentUnsupported("居民一次只能拿一件物件，请先放回手里的物件。")
+            throw rejectHold(.otherPropHeld,
+                ResidentPropPlacementError.attachmentUnsupported("居民一次只能拿一件物件，请先放回手里的物件。"),
+                objectID, point)
         }
         // 手持尺寸闸门：**上限只有一处定义**（`ResidentPropAttachmentEligibility.holdableLongestEdgeMeters`），
         // 拒绝文案（本文件上面那条 `propTooLarge`）、系统提示词、面板注释读的都是它。
         // `holdEligibility` 也走这个方法 ⇒ 判据没有第二个入口。
         guard max(prop.size.x, max(prop.size.y, prop.size.z))
             <= ResidentPropAttachmentEligibility.holdableLongestEdgeMeters else {
-            throw ResidentPropPlacementError.propTooLarge(prop.displayName)
+            throw rejectHold(.propTooLarge,
+                ResidentPropPlacementError.propTooLarge(prop.displayName), objectID, point)
         }
-        return .hold(objectID: objectID, avatarAssetID: avatarID,
-                     calibration: try makeGripCalibration(prop, avatarID, point))
+        // 标定那一步的拒绝在 `makeGripCalibration` 里（宿主注入），这里只包一层具名日志：
+        // 它抛出的原因（角色未适配 / 资产没备好 / 没有骨骼 / 挂点检查没接线 / 没有挂点建议）
+        // 必须**带步骤名**落日志，否则又回到"用户说挂不上、日志里什么都没有"。
+        do {
+            return .hold(objectID: objectID, avatarAssetID: avatarID,
+                         calibration: try makeGripCalibration(prop, avatarID, point))
+        } catch {
+            throw rejectHold(.gripCalibration, error, objectID, point)
+        }
     }
 
     /// 就地把这件已挂载的物件换到另一个挂点：新标定整份由**挂点定义**给出
@@ -301,9 +360,35 @@ final class ResidentPropPlacementService {
     /// 走 `.adjustGrip` —— 既有命令，不动摆放轴与归属轴，`returnState` 一个字不改。
     private func remountCommand(objectID: String, point: PropAttachmentPoint,
                                 avatarID: String, prop: WorldGeneratedProp) throws -> WorldPropLayoutCommand {
-        .adjustGrip(objectID: objectID, avatarAssetID: avatarID,
-                    calibration: try makeGripCalibration(prop, avatarID, point))
+        do {
+            return .adjustGrip(objectID: objectID, avatarAssetID: avatarID,
+                               calibration: try makeGripCalibration(prop, avatarID, point))
+        } catch {
+            throw rejectHold(.gripCalibration, error, objectID, point)
+        }
     }
+
+    /// 挂载拒绝的**唯一出口**：返回**同一个** error（语义/类型一个字不改），
+    /// 只是强制每一次拒绝都留一条 `.notice`（不带 `--info` 也读得到）。
+    ///
+    /// 为什么返回而不是只记日志：`throw rejectHold(...)` 让"这条 guard 有没有可见出口"
+    /// 成为可以在源码上静态数出来的事实（门禁就是这么判的），而不是靠自觉。
+    private func rejectHold<E: Error>(_ step: ResidentPropHoldStep, _ error: E,
+                                      _ objectID: String, _ point: PropAttachmentPoint,
+                                      detail: String? = nil) -> E {
+        let extra = detail.map { " \($0)" } ?? ""
+        // 挂点用**原始值**（`rightHand`/`back`/`waist`）而不是 `PropAttachmentSlots.displayName`：
+        // 这份文件被若干离线 harness 单独编译，它们只 shim 了 `PropAttachmentPoint`，
+        // 没有 `PropAttachmentSlots`（挂点表在 `PropAttachmentSlot.swift` 里，只有手上那份
+        // 真源码才有）。日志里那个原始值与世界状态里存的 `hand` 是同一个字面量，
+        // 而显示名的唯一一份仍然只在 `PropAttachmentSlots` 里。
+        Self.holdLog.notice(
+            "挂件拒绝 step=\(step.rawValue, privacy: .public) 步骤=\(step.label, privacy: .public) 挂点=\(point.rawValue, privacy: .public) 物件=\(objectID, privacy: .public)\(extra, privacy: .public) 原因=\(error.localizedDescription, privacy: .public)"
+        )
+        return error
+    }
+
+    private static let holdLog = Logger(subsystem: "ai.gmgn.radio", category: "LivingWorld")
 
     func holdEligibility(objectID: String, point: PropAttachmentPoint = .rightHand) -> String? {
         do { _ = try holdCommand(objectID: objectID, point: point); return nil }
@@ -400,6 +485,16 @@ final class ResidentPropPlacementService {
 
     @discardableResult
     func commit(_ command: WorldPropLayoutCommand, expectedLayoutRevision: UInt64, requestID: String) throws -> WorldState {
+        // **提交被拒也必须具名可见**。`holdCommand` 只是"命令构造"那一半；真正的世界判据
+        // （`WorldSimulation.applyPropLayout` 的活动/已有手持/标定合法性，以及 `validate`
+        // 的全部空间判据）在这一层。它们原来一条日志都没有 —— 于是"命令构造过了、提交被拒"
+        // 这种失败在统一日志里完全不可见（真机 2026-10-02「剑挂不到背后」正是这一类）。
+        //
+        // 用 `do/catch` 包住**整段既有函数体**（而不是另拆一个 `commitValidated`）：
+        // 判据分层那张穷尽 switch 必须留在**这一个** `commit` 的函数体里 ——
+        // `tools/test-resident-prop-delete.swift` 正是切这一段来断言 `.removal` 走
+        // `validateDeletion`。拆出去会让"分层只有一处"的断言失效。
+        do {
         guard isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
         try validateAttachmentAuthorization(command)
         // 这次提交要过哪一层判据 —— 换算只有一处（`ResidentPropLayoutIntent.resolve`）。
@@ -424,6 +519,28 @@ final class ResidentPropPlacementService {
             }
             guard isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
             try validateAttachmentAuthorization(command)
+        }
+        } catch {
+            // 被拒那一刻的**具名一行**：命令种类 + 请求编号 + 判据自己说的话。
+            Self.holdLog.notice("摆放提交被拒 command=\(Self.commandLabel(command), privacy: .public) requestID=\(requestID, privacy: .public) 原因=\(error.localizedDescription, privacy: .public)")
+            throw error
+        }
+    }
+
+    /// 一次提交的短名字（日志用）。**穷尽 switch**：新命令忘了写名字，编译器会在这里拦住。
+    static func commandLabel(_ command: WorldPropLayoutCommand) -> String {
+        switch command {
+        case .register: "register"
+        case .place: "place"
+        case .withdraw: "withdraw"
+        case .undo: "undo"
+        case .hold: "hold"
+        case .adjustGrip: "adjustGrip"
+        case .returnHeld: "returnHeld"
+        case .enableCapability: "enableCapability"
+        case .resize: "resize"
+        case .rebase: "rebase"
+        case .delete: "delete"
         }
     }
 

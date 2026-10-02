@@ -278,6 +278,236 @@ check(orientationSource.contains("lyingDownAspectLimit: Float = WorldPropSizePol
       "朝向与尺寸必须共用同一个细长门槛")
 
 // ---------------------------------------------------------------------------
+// 【真骨名门禁】把"这份模型在真机 SceneKit 树里到底有哪些节点名"钉住
+// ---------------------------------------------------------------------------
+//
+// 为什么必须有这一段：上面全部断言跑的是 `PropAttachmentSlots` 的**源码文本**与
+// 我们自己 stub 的 `SceneNode`。于是"真机那份 PMX 的骨表里，背后/腰间/手这三个挂点的
+// 候选骨名到底存不存在"**一条门禁都没有覆盖** —— 候选表写成一组谁都不认识的名字，
+// 所有断言照样全绿，而真机上一次都挂不上（真机 2026-10-02「剑挂不到背后」）。
+//
+// 判据只有一条：**每个挂点至少有一条候选骨名真的在真骨表里**。
+// 真骨表有两个来源，缺一不可：
+//   ① `~/Library/Application Support/gmgn radio/.../na_2b_0414.pmx`（真机那份，若在）；
+//   ② `tools/fixtures/pmx-standard-bone-table.tsv`（①的骨表快照，带 sha256）。
+// ①在时必须与②的骨名序列**逐条相同**，否则说明快照过期（换过模型/换过包）。
+//
+// 骨名就是 SceneKit 节点名：`MMDPMXReader.readBone` 里那一行
+// `boneNode.name = getTextBuffer()`。这一行也要在源码里钉住 —— 否则"骨表里的名字
+// 等于节点名"这个前提没人保证。
+
+/// 按 PMX 2.0 的骨表格式解析骨名。锚点法：第一根骨 `全ての親` 的名字前缀前 4 字节
+/// 是 `boneCount`（这套文件里位置唯一、不会与顶点/材质数据撞车的锚）。
+func parsePMXBoneNames(_ data: Data) -> [String]? {
+    let anchorBytes = Array("全ての親".data(using: .utf16LittleEndian)!)
+    let bytes = [UInt8](data)
+    func readInt(_ offset: Int) -> Int32? {
+        guard offset >= 0, offset + 4 <= bytes.count else { return nil }
+        return Int32(bitPattern: UInt32(bytes[offset]) | UInt32(bytes[offset + 1]) << 8
+                     | UInt32(bytes[offset + 2]) << 16 | UInt32(bytes[offset + 3]) << 24)
+    }
+    var anchor = -1
+    if bytes.count >= anchorBytes.count {
+        var start = 0
+        while start + anchorBytes.count <= bytes.count {
+            if bytes[start] == anchorBytes[0],
+               Array(bytes[start..<(start + anchorBytes.count)]) == anchorBytes {
+                anchor = start
+                break
+            }
+            start += 1
+        }
+    }
+    guard anchor >= 8, let length = readInt(anchor - 4), Int(length) == anchorBytes.count,
+          let count = readInt(anchor - 8), count > 0, count < 100_000 else { return nil }
+    var position = anchor - 4
+    func readText() -> String? {
+        guard let length = readInt(position), length >= 0, length % 2 == 0,
+              position + 4 + Int(length) <= bytes.count else { return nil }
+        let raw = Data(bytes[(position + 4)..<(position + 4 + Int(length))])
+        position += 4 + Int(length)
+        return String(data: raw, encoding: .utf16LittleEndian)
+    }
+    func skip(_ n: Int) { position += n }
+    var names: [String] = []
+    for _ in 0..<Int(count) {
+        guard let name = readText(), readText() != nil else { return nil }
+        skip(12)                                                // 静止坐标 3×float
+        skip(2)                                                 // 父索引（boneIndexSize=2）
+        skip(4)                                                 // 层
+        guard let rawFlags = readInt(position) else { return nil }
+        let flags = UInt16(truncatingIfNeeded: rawFlags)
+        skip(2)
+        if flags & 0x0001 != 0 { skip(2) } else { skip(12) }     // 尾位置
+        if flags & 0x0300 != 0 { skip(6) }                       // 付与回転/移動
+        if flags & 0x0400 != 0 { skip(12) }                      // 轴固定
+        if flags & 0x0800 != 0 { skip(24) }                      // 局部轴
+        if flags & 0x2000 != 0 { skip(4) }                       // 外部親
+        if flags & 0x0020 != 0 {                                  // IK
+            skip(2 + 4 + 4)
+            guard let links = readInt(position) else { return nil }
+            skip(4)
+            for _ in 0..<max(0, Int(links)) {
+                skip(2)
+                guard position < bytes.count else { return nil }
+                let hasLimit = bytes[position]
+                skip(1)
+                if hasLimit != 0 { skip(24) }
+            }
+        }
+        names.append(name)
+    }
+    return names
+}
+
+let realPMXPath = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Application Support/gmgn radio/PresencePackages/"
+        + "pmx.2b-miss-0414-standard/na_2b_0414.pmx").path
+let boneTableFixturePath = "tools/fixtures/pmx-standard-bone-table.tsv"
+
+/// 快照里的骨名（去掉注释行，取第二列）。
+func fixtureBoneNames(_ text: String) -> [String] {
+    text.split(separator: "\n").compactMap { line -> String? in
+        guard !line.hasPrefix("#") else { return nil }
+        let columns = line.split(separator: "\t", omittingEmptySubsequences: false)
+        return columns.count >= 2 ? String(columns[1]) : nil
+    }
+}
+
+guard let fixtureText = try? String(contentsOfFile: boneTableFixturePath, encoding: .utf8) else {
+    print("FAIL: 读不到真骨表快照 \(boneTableFixturePath)（这条门禁的全部意义就是它）")
+    exit(1)
+}
+let fixtureNames = fixtureBoneNames(fixtureText)
+check(fixtureNames.count == 156,
+      "真骨表快照必须是一次完整解析（156 根），实测 \(fixtureNames.count) 根")
+
+// ①真机那份在 ⇒ 逐条比对（快照过期 = 红）。
+var boneNames = Set(fixtureNames)
+if let data = FileManager.default.contents(atPath: realPMXPath) {
+    guard let live = parsePMXBoneNames(data) else {
+        print("FAIL: 真机 PMX 在（\(realPMXPath)）但骨表解析失败 —— 门禁不许静默跳过")
+        exit(1)
+    }
+    check(live == fixtureNames,
+          "真机 PMX 的骨表与快照 \(boneTableFixturePath) 必须逐条相同"
+          + "（实测读到 \(live.count) 根；换过模型/包就要重生成快照）")
+    boneNames = Set(live)
+    print("   [正例]   真机 PMX 骨表在线核对：\(live.count) 根，逐条与快照相同")
+} else {
+    print("   [说明]   真机 PMX 不在（\(realPMXPath)）⇒ 只对快照断言；骨名序列仍被钉住")
+}
+
+// ②候选表 vs 真骨表的对照在**内层程序**里做 —— 那里编的是 `PropAttachmentSlot.swift` 的
+// 真源码（真的候选表），真骨名由外层生成为一个常量文件一起编进去。外层这里只准备数据。
+let bogusBoneNameProbe = "上半身2X"
+check(!boneNames.contains(bogusBoneNameProbe),
+      "负对照的前提：不存在的骨名 \(bogusBoneNameProbe) 必须真的不在真骨表里")
+
+// 骨名 == SceneKit 节点名：这一行必须在解析器源码里。
+let pmxReaderSource = (try? readSource("apps/macos/Packages/MMDSceneKit/Sources/MMDSceneKit/MMDPMXReader.swift")) ?? ""
+check(pmxReaderSource.contains("boneNode.name = getTextBuffer()"),
+      "骨表里的名字必须就是 SceneKit 节点名（MMDPMXReader 里 `boneNode.name = getTextBuffer()`）")
+
+// 真骨名交给内层程序（生成一个只含常量的文件）。
+let boneTableSwift = """
+import Foundation
+
+/// 真机那份 PMX 的骨名（外层按骨表逐根解析出来的，顺序与骨表一致）。
+/// 内层程序拿它对照 `PropAttachmentSlots` 的**真候选表** —— 这是"候选骨名到底找不找得到"
+/// 唯一一处把真数据与真源码绑在一起的断言。
+let realPMXBoneNames: [String] = [
+\(boneNames.sorted().map { "    \"\($0)\",\n" }.joined())
+]
+let realPMXBoneNameSet: Set<String> = Set(realPMXBoneNames)
+
+/// 内层要断言的负对照：这组名字**一个都不在**真骨表里。
+let bogusBoneNames = ["右手首X", "上半身2X", "腰X", "bone000", "bone002"]
+"""
+
+// ---------------------------------------------------------------------------
+// 【拒绝可见性门禁】`holdCommand` 里每一条 guard 都必须走具名出口
+// ---------------------------------------------------------------------------
+let holdPlacementSource = (try? readSource("apps/macos/Sources/GMGNRadio/Presence/ResidentPropPlacementService.swift")) ?? ""
+
+/// 数 `holdCommand` 函数体里"具名出口"与"裸 throw"各有几条。
+func holdOutletCounts(_ source: String) -> (named: Int, bare: Int)? {
+    guard let body = declaration(source, "func holdCommand(") else { return nil }
+    var named = 0, bare = 0
+    for line in body.split(separator: "\n") {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("throw rejectHold(") { named += 1 }
+        else if trimmed.contains("throw ") { bare += 1 }
+    }
+    return (named, bare)
+}
+if let outletCounts = holdOutletCounts(holdPlacementSource) {
+    check(outletCounts.named >= 7,
+          "holdCommand 的每一条 guard 都必须走 `throw rejectHold(...)`（实测具名出口 \(outletCounts.named) 条）")
+    check(outletCounts.bare == 0,
+          "holdCommand 里不许再有裸 `throw`（静默拒绝）；实测裸 throw \(outletCounts.bare) 条")
+} else {
+    print("FAIL: 切不出 holdCommand 的函数体（签名变了？）")
+    exit(1)
+}
+check(holdPlacementSource.contains("enum ResidentPropHoldStep: String, CaseIterable, Sendable"),
+      "具名步骤表 `ResidentPropHoldStep` 必须在生产代码里（唯一一份步骤名）")
+check(holdPlacementSource.contains("Self.holdLog.notice("),
+      "`rejectHold` 必须真的写统一日志（`.notice`），否则「具名」只存在于源码里")
+// 负对照：把一处换回裸 `throw` ⇒ 同一个判据必须红。
+let injectedSilent = holdPlacementSource.replacingOccurrences(
+    of: "throw rejectHold(.contextNotCurrent, ResidentPropPlacementError.inactiveContext, objectID, point)",
+    with: "throw ResidentPropPlacementError.inactiveContext")
+check(holdOutletCounts(injectedSilent)?.bare == 1,
+      "负对照：注入一条静默拒绝之后，裸 throw 计数必须变成 1（否则可见性门禁是假绿）")
+
+// `holdCommand` 只是"命令构造"那一半：真正会拒绝的是 `commit`（活动 / 已有手持 /
+// 世界层判据 / 空间判据）。那一条也必须有具名日志，否则"构造过了、提交被拒"仍然不可见。
+check(declaration(holdPlacementSource, "func commit(_ command: WorldPropLayoutCommand, expectedLayoutRevision: UInt64, requestID: String) throws -> WorldState")?.contains("摆放提交被拒 command=") == true
+      && holdPlacementSource.contains("func commandLabel(_ command: WorldPropLayoutCommand) -> String"),
+      "`commit` 被拒必须具名落日志（世界层的活动/手持/空间判据都在这一层）")
+// 负对照：把 `commit` 里那一条日志删掉 ⇒ 判据必须红。
+let commitBody = declaration(holdPlacementSource, "func commit(_ command: WorldPropLayoutCommand, expectedLayoutRevision: UInt64, requestID: String) throws -> WorldState") ?? ""
+check(!commitBody.replacingOccurrences(of: "摆放提交被拒 command=", with: "提交未通过 command=")
+        .contains("摆放提交被拒 command="),
+      "负对照失败：commit 的具名日志被改名之后判据居然还绿")
+// 负对照：把那一条日志改名 ⇒ 判据必须红。
+let injectedQuietCommit = holdPlacementSource.replacingOccurrences(
+    of: "摆放提交被拒 command=", with: "提交未通过 command=")
+check(!injectedQuietCommit.contains("摆放提交被拒 command="),
+      "负对照失败：commit 的具名日志被改名之后判据居然还绿")
+// 「有活动在进行」必须**点名活动**，不许含糊。
+check(holdPlacementSource.contains("detail: \"activity=\\(activity.activityID) status=\\(activity.status.rawValue)\""),
+      "活动挡住挂载时必须点名是哪个活动（不许只说「正在进行活动」）")
+
+// 宿主那条标定链（`makeGripCalibration`）的每一步也必须具名落日志。
+let holdAppSource = (try? readSource("apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift")) ?? ""
+for step in ["step=avatar-changed", "step=avatar-ineligible", "step=asset-unverified",
+             "step=attachment-gate", "step=clearance", "step=no-calibration"] {
+    check(holdAppSource.contains(step), "宿主标定链必须有具名出口 \(step)")
+}
+// 渲染器那一层（八条塌成一句的那处）也要逐条具名。
+let marbleViewSource = (try? readSource("apps/macos/Sources/GMGNRadio/VisualEngine/Metal/MarbleSpatialView.swift")) ?? ""
+check(marbleViewSource.contains("挂点拒绝：驻留物件渲染未激活")
+      && marbleViewSource.contains("挂点拒绝：渲染所有权已易主")
+      && marbleViewSource.contains("挂点拒绝：当前渲染档不画世界")
+      && marbleViewSource.contains("挂点拒绝：角色已更换")
+      && marbleViewSource.contains("挂点拒绝：当前角色不是已装载的 PMX"),
+      "驻留挂点校验那条 8 合 1 的 guard 必须拆成逐条具名（renderer/ownership/profile/avatar/pmx）")
+let stageStoreSource = (try? readSource("apps/macos/Sources/GMGNRadio/VisualEngine/SpatialStageStore.swift")) ?? ""
+check(stageStoreSource.contains("PropAttachmentError.worldNotVisible(")
+      && stageStoreSource.contains("PropAttachmentError.rendererNotActive(")
+      && stageStoreSource.contains("PropAttachmentError.assetNotRenderable(")
+      && stageStoreSource.contains("PropAttachmentError.validationHandlerUnavailable"),
+      "`validateResidentPropAttachment` 的四条前置必须各有具名 case，不再塌成 .assetNotPrepared")
+// 面板那几条静默 return 不许回来。
+let editorStateSource = (try? readSource("apps/macos/Sources/GMGNRadio/Presence/ResidentPropEditorState.swift")) ?? ""
+check(editorStateSource.contains("step=hold-no-selection")
+      && editorStateSource.contains("step=hold-not-wired")
+      && editorStateSource.contains("step=hold-unavailable"),
+      "面板点挂点不许有静默出口：没选中 / 没接线 / 不可用三条都要说清并落日志")
+
+// ---------------------------------------------------------------------------
 // 编译真代码
 // ---------------------------------------------------------------------------
 guard let poseDeclaration = declaration(attachmentSource, "enum PropAttachmentPose"),
@@ -612,6 +842,39 @@ import simd
         check(!mountsOnRightBones(back: PropAttachmentSlots.boneNameCandidates(for: .back), waist: ["首", "頭"]),
               "负对照失败：腰间挂错骨头居然没被抓到")
 
+        // ------------------------------------------------------------------
+        // 【断言 G】真骨名：候选骨名必须在**真机那份 PMX 的骨表**里找得到
+        // ------------------------------------------------------------------
+        //
+        // 这一段是这次「剑挂不到背后」修的东西之一：上面所有断言都只跑源码文本 + stub
+        // 的 `SceneNode`，"真机上 `childNode(withName:"上半身2")` 到底找不找得到"从来没被
+        // 判过。`realPMXBoneNameSet` 由外层从真机 PMX（或它的骨表快照）逐根解析而来，
+        // 而候选表读的是**真源码**（`PropAttachmentSlots`）—— 两者绑在一起才有意义。
+        check(realPMXBoneNameSet.count == 156,
+              "真骨名必须是完整一份骨表（156 根），实测 \(realPMXBoneNameSet.count) 根")
+        for (slot, point) in [("rightHand", PropAttachmentPoint.rightHand),
+                              ("back", PropAttachmentPoint.back),
+                              ("waist", PropAttachmentPoint.waist)] {
+            let candidates = PropAttachmentSlots.boneNameCandidates(for: point)
+            let found = candidates.filter(realPMXBoneNameSet.contains)
+            check(!found.isEmpty,
+                  "挂点 \(slot) 的候选骨名至少有一条必须真的在真机 PMX 的骨表里"
+                  + "（候选=\(candidates.joined(separator: "/"))，命中=\(found.joined(separator: "/"))）")
+            print("   [正例]   真骨表命中 \(slot)：\(found.joined(separator: "/"))（候选 \(candidates.count) 条）")
+        }
+        // `acceptsAttachmentRig` 要的三根也必须真的在。
+        for required in ["センター", "上半身", "右手首"] {
+            check(realPMXBoneNameSet.contains(required),
+                  "acceptsAttachmentRig 要求的 \(required) 必须在真骨表里")
+        }
+        // **负对照**：把候选换成一组不存在/别的骨架的名字 ⇒ 同一判据必须红。
+        // （`bogusBoneNames` 由外层证过"一个都不在真骨表里"。）
+        let bogusBack = ["上半身2X", "bone002"]
+        check(bogusBack.filter(realPMXBoneNameSet.contains).isEmpty,
+              "负对照失败：不存在的候选骨名居然在真骨表里命中了（正例就是假绿）")
+        check(realPMXBoneNameSet.isDisjoint(with: Set(bogusBoneNames)),
+              "负对照失败：那组不存在的名字必须一个都不在真骨表里")
+
         // 每个挂点都必须走**同一条** `骨骼世界 × 局部` —— 用同一组标定数字、只换挂点，
         // 相对位姿（pose⁻¹ · object）必须逐元素相同。谁要是给某个挂点另造一条公式，这条就红。
         func relativeToPose(_ point: PropAttachmentPoint) throws -> simd_float4x4 {
@@ -787,7 +1050,8 @@ import simd
 
         print("PASS: 手骨跟随（世界 = 手骨世界 × grip）、只读骨骼、握点单一来源 + 用户覆盖、"
             + "缺失可见失败、细长物件刃轴压在骨轴上、三挂点（手/背后/腰间）同一公式且各跟对骨头、"
-            + "换挂点落持久状态、旧存档逐字节可解、净空判据带数字")
+            + "换挂点落持久状态、旧存档逐字节可解、净空判据带数字、"
+            + "真机 PMX 骨表里三个挂点的候选骨名都真的找得到、每一次挂载拒绝都具名可见（日志 + 屏上）")
     }
 }
 """#
@@ -802,12 +1066,14 @@ let orientationURL = temp.appendingPathComponent("OrientationSlice.swift")
 let attachmentURL = temp.appendingPathComponent("AttachmentSlice.swift")
 let gripURL = temp.appendingPathComponent("PropGripInference.swift")
 let mainURL = temp.appendingPathComponent("main.swift")
+let boneTableURL = temp.appendingPathComponent("RealBoneTable.swift")
 let executableURL = temp.appendingPathComponent("check")
 try stubs.write(to: stubURL, atomically: true, encoding: .utf8)
 try orientationSlice.write(to: orientationURL, atomically: true, encoding: .utf8)
 try attachmentSlice.write(to: attachmentURL, atomically: true, encoding: .utf8)
 try gripSlice.write(to: gripURL, atomically: true, encoding: .utf8)
 try checks.write(to: mainURL, atomically: true, encoding: .utf8)
+try boneTableSwift.write(to: boneTableURL, atomically: true, encoding: .utf8)
 
 func run(_ executable: String, _ arguments: [String]) throws -> Int32 {
     let process = Process()
@@ -820,7 +1086,8 @@ func run(_ executable: String, _ arguments: [String]) throws -> Int32 {
 
 let compile = try run("/usr/bin/nice", [
     "-n", "15", "/usr/bin/swiftc", "-j1", "-swift-version", "6", "-parse-as-library",
-    stubURL.path, orientationURL.path, attachmentURL.path, gripURL.path, mainURL.path,
+    stubURL.path, orientationURL.path, attachmentURL.path, gripURL.path,
+    boneTableURL.path, mainURL.path,
     "-o", executableURL.path,
 ])
 guard compile == 0 else {

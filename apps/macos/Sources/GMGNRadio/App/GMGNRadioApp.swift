@@ -3879,28 +3879,43 @@ final class AppDelegate:
             }, isCurrent: isCurrent,
             currentAvatarAssetID: { [weak self] in self?.avatarRuntime.snapshot.avatar?.id },
             makeGripCalibration: { [weak self] prop, avatarID, point in
+                // 这条链上每一步都**具名落日志**（统一日志 category=LivingWorld）。
+                // `makeGripCalibration` 是"挂不挂得上"的最后一公里：角色资格 / 资产身份 /
+                // 挂点骨骼 / 净空 / 标定，五步全在这里。真机 2026-10-02「剑挂不到背后」
+                // 时这五步一条日志都没有，于是"一次都没成功过"查不出是哪一步。
+                let slotName = PropAttachmentSlots.displayName(for: point)
                 guard let self, let avatar = self.avatarRuntime.snapshot.avatar, avatar.id == avatarID else {
+                    self?.livingWorldLogger.notice("挂点拒绝 step=avatar-changed 挂点=\(slotName, privacy: .public) 期望角色=\(avatarID, privacy: .public) 当前角色=\(self?.avatarRuntime.snapshot.avatar?.id ?? "nil", privacy: .public)")
                     throw ResidentPropPlacementError.avatarChanged
                 }
                 if let reason = ResidentPropAttachmentEligibility.rejectionReason(for: avatar) {
+                    self.livingWorldLogger.notice("挂点拒绝 step=avatar-ineligible 挂点=\(slotName, privacy: .public) 角色=\(avatar.id, privacy: .public) 原因=\(reason, privacy: .public)")
                     throw ResidentPropPlacementError.attachmentUnsupported(reason)
                 }
                 guard let asset = self.residentOwnedPropAssets[prop.objectID], asset.prop.matchesIdentity(of: prop) else {
+                    self.livingWorldLogger.notice("挂点拒绝 step=asset-unverified 挂点=\(slotName, privacy: .public) 物件=\(prop.objectID, privacy: .public)")
                     throw ResidentPropHostError.assetUnverified
                 }
                 // 门槛问的是**这个挂点自己的骨骼**：找不到就报「这个角色没有可用的腰部骨骼」
                 // 这类读得懂的话（`PropAttachmentError.missingBone`），而不是静默挂不上。
-                try self.spatialStage.validateResidentPropAttachment(avatarID: avatarID,
-                    assetID: prop.assetID, modelURL: asset.descriptor.modelURL, point: point)
+                do {
+                    try self.spatialStage.validateResidentPropAttachment(avatarID: avatarID,
+                        assetID: prop.assetID, modelURL: asset.descriptor.modelURL, point: point)
+                } catch {
+                    self.livingWorldLogger.notice("挂点拒绝 step=attachment-gate 挂点=\(slotName, privacy: .public) 物件=\(prop.objectID, privacy: .public) 原因=\(error.localizedDescription, privacy: .public)")
+                    throw error
+                }
                 // 净空判据在这一处**唯一**出口：物件自己就吞掉整个挂载偏移（净空 < 0）⇒
                 // 拒绝并把数字说出来（"净空 -0.45 米 ⇒ 会穿进身体"），而不是挂上去之后让它穿模。
                 if let reason = PropAttachmentSlots.clearanceRejection(for: prop, point: point) {
+                    self.livingWorldLogger.notice("挂点拒绝 step=clearance 挂点=\(slotName, privacy: .public) 物件=\(prop.objectID, privacy: .public) 原因=\(reason, privacy: .public)")
                     throw ResidentPropPlacementError.attachmentUnsupported(reason)
                 }
                 guard let calibration = ResidentPropAttachmentEligibility.suggestedCalibration(
                     for: prop, avatar: avatar, point: point) else {
+                    self.livingWorldLogger.notice("挂点拒绝 step=no-calibration 挂点=\(slotName, privacy: .public) 物件=\(prop.objectID, privacy: .public) 角色=\(avatar.id, privacy: .public)")
                     throw ResidentPropPlacementError.attachmentUnsupported(
-                        "这个物件还没有当前居民的\(PropAttachmentSlots.displayName(for: point))挂点建议。")
+                        "这个物件还没有当前居民的\(slotName)挂点建议。")
                 }
                 return calibration
             })

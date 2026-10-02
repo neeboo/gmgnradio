@@ -1928,17 +1928,36 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                 return propRenderer?.isPrepared(assetID: assetID, modelURL: modelURL, worldID: worldID) ?? false
             }
             spatialStage.residentPropAttachmentValidationHandler = { [weak self, weak spatialStage, weak owner, weak view] avatarID, point in
-                guard let self, let spatialStage, let owner, let view,
-                      ResidentPropSurfaceEligibility.isActive(view),
-                      spatialStage.residentPropRenderOwnership.accepts(
-                          owner: owner,
-                          worldID: worldID,
-                          revision: revision
-                      ),
-                      self.renderProfile.drawsWorld,
-                      self.avatarRuntime.snapshot.avatar?.id == avatarID,
-                      let pmxAvatarRenderer = self.pmxAvatarRenderer
-                else {
+                // 八条判据原来塌成 `.unsupportedAvatar` 一句话（"当前角色还不能拿起物件。
+                // 首版仅支持已适配的 2B 角色。"）—— 角色明明是受支持的 2B 时，这句话
+                // 是**误导**，而且一条日志都没有。现在每一条自己报名，并落统一日志。
+                let slotName = PropAttachmentSlots.displayName(for: point)
+                guard let self, let spatialStage, let owner, let view else {
+                    Self.log.notice("挂点拒绝：舞台视图已释放 挂点=\(slotName, privacy: .public)")
+                    throw PropAttachmentError.validationHandlerUnavailable
+                }
+                guard ResidentPropSurfaceEligibility.isActive(view) else {
+                    Self.log.notice("挂点拒绝：驻留物件渲染未激活 world=\(worldID ?? "nil", privacy: .public) 挂点=\(slotName, privacy: .public)")
+                    throw PropAttachmentError.rendererNotActive(worldID: worldID)
+                }
+                guard spatialStage.residentPropRenderOwnership.accepts(
+                    owner: owner,
+                    worldID: worldID,
+                    revision: revision
+                ) else {
+                    Self.log.notice("挂点拒绝：渲染所有权已易主 world=\(worldID ?? "nil", privacy: .public) 挂点=\(slotName, privacy: .public)")
+                    throw PropAttachmentError.rendererNotActive(worldID: worldID)
+                }
+                guard self.renderProfile.drawsWorld else {
+                    Self.log.notice("挂点拒绝：当前渲染档不画世界 profile=\(String(describing: self.renderProfile), privacy: .public) 挂点=\(slotName, privacy: .public)")
+                    throw PropAttachmentError.rendererNotActive(worldID: worldID)
+                }
+                guard self.avatarRuntime.snapshot.avatar?.id == avatarID else {
+                    Self.log.notice("挂点拒绝：角色已更换 期望=\(avatarID, privacy: .public) 当前=\(self.avatarRuntime.snapshot.avatar?.id ?? "nil", privacy: .public)")
+                    throw PropAttachmentError.avatarMismatch
+                }
+                guard let pmxAvatarRenderer = self.pmxAvatarRenderer else {
+                    Self.log.notice("挂点拒绝：当前角色不是已装载的 PMX（avatarID=\(avatarID, privacy: .public)，没有 PMX 渲染器）")
                     throw PropAttachmentError.unsupportedAvatar
                 }
                 try pmxAvatarRenderer.validateAttachmentPoint(point)

@@ -681,17 +681,28 @@ final class SpatialStageStore {
         modelURL: URL,
         point: PropAttachmentPoint
     ) throws {
-        guard isWorldVisible,
-              residentPropActiveHandler?() == true,
-              let selectedWorldID,
-              residentPropPreparedHandler?(assetID, modelURL, selectedWorldID) == true
-        else {
-            throw PropAttachmentError.assetNotPrepared
+        // 这一层的每一条判据都**自己说自己是哪一条**（`PropAttachmentError` 里各有 case），
+        // 并且每一次拒绝都落统一日志。原来这四条塌成 `.assetNotPrepared` 一句话，
+        // 真机上"剑挂不到背后"因此既没有日志、也给不出任何可行动的线索。
+        guard isWorldVisible else {
+            Self.log.notice("挂点拒绝：空间不可见 world=\(self.selectedWorldID ?? "nil", privacy: .public) 挂点=\(PropAttachmentSlots.displayName(for: point), privacy: .public) asset=\(assetID, privacy: .public)")
+            throw PropAttachmentError.worldNotVisible(worldID: selectedWorldID)
         }
-        guard avatarID == ResidentPropAttachmentEligibility.supportedAvatarID,
-              let residentPropAttachmentValidationHandler
-        else {
+        guard residentPropActiveHandler?() == true, let selectedWorldID else {
+            Self.log.notice("挂点拒绝：渲染器未接管 world=\(self.selectedWorldID ?? "nil", privacy: .public) 挂点=\(PropAttachmentSlots.displayName(for: point), privacy: .public)")
+            throw PropAttachmentError.rendererNotActive(worldID: selectedWorldID)
+        }
+        guard residentPropPreparedHandler?(assetID, modelURL, selectedWorldID) == true else {
+            Self.log.notice("挂点拒绝：资产未备好 world=\(selectedWorldID, privacy: .public) asset=\(assetID, privacy: .public) url=\(modelURL.lastPathComponent, privacy: .public) 挂点=\(PropAttachmentSlots.displayName(for: point), privacy: .public)")
+            throw PropAttachmentError.assetNotRenderable(assetID: assetID)
+        }
+        guard avatarID == ResidentPropAttachmentEligibility.supportedAvatarID else {
+            Self.log.notice("挂点拒绝：角色未适配 avatarID=\(avatarID, privacy: .public) 受支持=\(ResidentPropAttachmentEligibility.supportedAvatarID, privacy: .public)")
             throw PropAttachmentError.unsupportedAvatar
+        }
+        guard let residentPropAttachmentValidationHandler else {
+            Self.log.notice("挂点拒绝：挂点检查未接线 world=\(selectedWorldID, privacy: .public) 挂点=\(PropAttachmentSlots.displayName(for: point), privacy: .public)")
+            throw PropAttachmentError.validationHandlerUnavailable
         }
         try residentPropAttachmentValidationHandler(avatarID, point)
     }
