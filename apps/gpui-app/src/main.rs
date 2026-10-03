@@ -536,7 +536,7 @@ impl Render for GMGNProductUI {
             }
             if self.chat_open {
                 let frame=composer_frame(false,width,height);let composer_width=frame[2];let composer_height=frame[3];
-                root=root.child(div().absolute().right(px(22.)).bottom(px(86.)).w(px(composer_width)).max_h(px(composer_height)).bg(background).rounded_xl().p_2().child(self.pane.clone()));
+                root=root.child(div().absolute().right(px(22.)).bottom(px(86.)).w(px(composer_width)).max_h(px(composer_height)).overflow_hidden().bg(background).rounded_xl().child(self.pane.clone()));
             }
             if self.stage_panel_open {
                 let panel_width=(width-36.).clamp(0.,590.);let panel_height=(height-92.).clamp(0.,458.);

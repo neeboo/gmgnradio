@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::Arc;
+use std::time::Instant;
 
 fn num(value: &Value, key: &str, default: f64) -> f64 {
     value[key]
@@ -61,7 +62,10 @@ struct Scene<'a> {
     primary: String,
     accent: String,
     secondary: String,
-    outlines: HashMap<(String, u64), outline::Line>,
+    outlines: HashMap<(String, u64, u16, u64), outline::Line>,
+    weight: u16,
+    tracking: f64,
+    projection: Option<(f64, f64, f64, (f64, f64, f64), f64)>,
 }
 impl<'a> Scene<'a> {
     fn new(snapshot: &'a Value, width: f64, height: f64) -> Self {
@@ -79,6 +83,9 @@ impl<'a> Scene<'a> {
             accent,
             secondary,
             outlines: HashMap::new(),
+            weight: 600,
+            tracking: 0.,
+            projection: None,
             svg,
         }
     }
@@ -109,10 +116,35 @@ impl<'a> Scene<'a> {
                 _ => 0.,
             };
             let baseline = y + (shaped.ascent - shaped.descent) / 2.;
-            let path = outline::svg_path(&shaped.commands, |point| outline::Point {
-                x: x + offset + point.x,
-                y: baseline - point.y,
-            });
+            let map = |point: outline::Point| {
+                let point = outline::Point {
+                    x: x + offset + point.x,
+                    y: baseline - point.y,
+                };
+                if let Some((cx, cy, angle, axis, width)) = self.projection {
+                    let projected = outline::project(
+                        outline::Point {
+                            x: point.x - cx,
+                            y: point.y - cy,
+                        },
+                        angle,
+                        axis,
+                        0.72,
+                        width,
+                    );
+                    outline::Point {
+                        x: cx + projected.x,
+                        y: cy + projected.y,
+                    }
+                } else {
+                    point
+                }
+            };
+            let path = if self.projection.is_some() {
+                outline::projected_path(&shaped.commands, map)
+            } else {
+                outline::svg_path(&shaped.commands, map)
+            };
             let _ = write!(
                 self.svg,
                 r#"<path aria-label="{}" d="{path}" fill="{color}" opacity="{opacity}" filter="url(#textShadow)"/>"#,
@@ -127,11 +159,16 @@ impl<'a> Scene<'a> {
         );
     }
     fn outlined(&mut self, text: &str, size: f64) -> Option<outline::Line> {
-        let key = (text.to_owned(), size.to_bits());
+        let key = (
+            text.to_owned(),
+            size.to_bits(),
+            self.weight,
+            self.tracking.to_bits(),
+        );
         if let Some(line) = self.outlines.get(&key) {
             return Some(line.clone());
         }
-        let line = outline::shape(text, size)?;
+        let line = outline::shape_styled(text, size, self.weight, self.tracking)?;
         self.outlines.insert(key, line.clone());
         Some(line)
     }
@@ -272,6 +309,10 @@ impl<'a> Scene<'a> {
         }
     }
     fn glyphs(&mut self, cx: f64, cy: f64, size: f64, arc: bool) {
+        let previous_style = (self.weight, self.tracking);
+        let projection = self.projection;
+        self.weight = 700;
+        self.tracking = size * -0.018;
         let flow = &self.snapshot["flow"];
         let glyphs = items(flow, "glyphs");
         let count = glyphs.len().max(1);
@@ -281,7 +322,7 @@ impl<'a> Scene<'a> {
             .iter()
             .map(|glyph| self.measured_width(&text(glyph, "text"), size))
             .collect();
-        let spacing = size * 0.015 - size * 0.018;
+        let spacing = size * if arc { 0.012 } else { 0.015 };
         let total = widths.iter().sum::<f64>() + spacing * count.saturating_sub(1) as f64;
         let mut cursor = cx - total / 2.;
         for (index, glyph) in glyphs.iter().enumerate() {
@@ -321,6 +362,8 @@ impl<'a> Scene<'a> {
             };
             let scale = scale * num(glyph, "restingScale", 1.);
             let rotation = num(glyph, "rotation", 0.) * motion;
+            self.projection =
+                projection.map(|(_, _, angle, axis, width)| (cx - x, cy - y, angle, axis, width));
             let _ = write!(
                 self.svg,
                 r#"<g transform="translate({x} {y}) rotate({rotation}) scale({} {scale})" opacity="{opacity}">"#,
@@ -332,11 +375,25 @@ impl<'a> Scene<'a> {
                 } else {
                     self.accent.clone()
                 };
-                let _ = write!(
-                    self.svg,
-                    r#"<text text-anchor="middle" dominant-baseline="middle" font-family="system-ui, PingFang SC, sans-serif" font-size="{size}" font-weight="700" fill="{glow}" filter="url(#glow)" opacity="0.7">{}</text>"#,
-                    escape(&text(glyph, "text"))
-                );
+                self.svg
+                    .push_str(r#"<g filter="url(#glow)" opacity="0.7">"#);
+                if arc {
+                    self.perspective_line(
+                        &text(glyph, "text"),
+                        0.,
+                        0.,
+                        size,
+                        1.,
+                        &glow,
+                        (unit - 0.5) * -34.,
+                        (0.12, 1., 0.),
+                        0.7,
+                        "middle",
+                    );
+                } else {
+                    self.line(&text(glyph, "text"), 0., 0., size, 1., &glow, "middle");
+                }
+                self.svg.push_str("</g>");
             }
             if arc {
                 self.perspective_line(
@@ -364,6 +421,8 @@ impl<'a> Scene<'a> {
             }
             self.svg.push_str("</g>");
         }
+        (self.weight, self.tracking) = previous_style;
+        self.projection = projection;
     }
     fn active_text(&self) -> String {
         text(&self.snapshot["flow"]["activeLine"], "text")
@@ -741,18 +800,28 @@ impl<'a> Scene<'a> {
                 "#ffffff",
                 0.025,
             );
-            self.line(
+            self.perspective_line(
                 &value,
                 cx + self.width * dx,
                 self.height * y,
                 24. * scale,
                 opacity,
                 &self.primary.clone(),
+                rotation,
+                (if key == "previousLine" { 0.08 } else { 0.06 }, 1., 0.),
+                0.68,
                 "middle",
             );
         }
         let size = font_size(&self.active_text(), self.width * 0.6);
         let cy = self.height * 0.5;
+        self.projection = Some((
+            0.,
+            0.,
+            (time * 0.23).sin() * 2.4,
+            (0.04, 1., 0.),
+            self.width * 0.6,
+        ));
         self.rect(
             cx - self.width * 0.3 - 34.,
             cy - size / 2. - 28.,
@@ -765,6 +834,7 @@ impl<'a> Scene<'a> {
         );
         self.glyphs(cx, cy, size, false);
         self.translation(cx, cy + size * 0.6 + 14., (size * 0.18).max(15.), "middle");
+        self.projection = None;
     }
     fn folding(&mut self) {
         let fold = &self.snapshot["fold"];
@@ -816,7 +886,8 @@ impl<'a> Scene<'a> {
                 } else {
                     0.22
                 };
-                self.line(
+                self.weight = if current { 900 } else { 700 };
+                self.perspective_line(
                     &text(line, "text"),
                     0.,
                     cy,
@@ -827,6 +898,9 @@ impl<'a> Scene<'a> {
                     } else {
                         self.primary.clone()
                     },
+                    if historical { direction * 7. * p } else { 0. },
+                    (0., 1., 0.),
+                    0.72,
                     "start",
                 );
                 cy += size + 8.;
@@ -882,6 +956,27 @@ pub struct StageLyricsPane {
     image: Option<Arc<RenderImage>>,
     render_key: String,
     render_error: Option<String>,
+    outgoing: Option<Value>,
+    transition_started: Instant,
+}
+fn spring_progress(seconds: f64, response: f64, damping: f64) -> f64 {
+    let omega = std::f64::consts::TAU / response;
+    let damped = omega * (1. - damping * damping).sqrt();
+    1. - (-damping * omega * seconds).exp()
+        * ((damped * seconds).cos() + damping * omega / damped * (damped * seconds).sin())
+}
+fn scene_layer(svg: &str, width: f64, height: f64, opacity: f64, scale: f64) -> String {
+    let body = svg
+        .split_once('>')
+        .map(|(_, body)| body.trim_end_matches("</svg>"))
+        .unwrap_or("");
+    format!(
+        r#"<g opacity="{opacity}" transform="translate({} {}) scale({scale}) translate({} {})">{body}</g>"#,
+        width / 2.,
+        height / 2.,
+        -width / 2.,
+        -height / 2.
+    )
 }
 impl StageLyricsPane {
     pub fn new(_window: &mut Window, _cx: &mut Context<Self>) -> Self {
@@ -893,6 +988,8 @@ impl StageLyricsPane {
             image: None,
             render_key: String::new(),
             render_error: None,
+            outgoing: None,
+            transition_started: Instant::now(),
         }
     }
     pub fn update_snapshot(
@@ -902,6 +999,12 @@ impl StageLyricsPane {
         cx: &mut Context<Self>,
     ) {
         if self.snapshot != snapshot {
+            if self.snapshot["flow"]["activeLine"]["id"] != snapshot["flow"]["activeLine"]["id"]
+                || self.snapshot["mode"] != snapshot["mode"]
+            {
+                self.outgoing = (!self.snapshot.is_null()).then(|| self.snapshot.clone());
+                self.transition_started = Instant::now();
+            }
             self.snapshot = snapshot;
             cx.notify();
         }
@@ -930,7 +1033,44 @@ impl Render for StageLyricsPane {
         } else {
             f64::from(size.height)
         };
-        let svg = Scene::new(&self.snapshot, w, h).finish();
+        let mut svg = Scene::new(&self.snapshot, w, h).finish();
+        let elapsed = self.transition_started.elapsed().as_secs_f64();
+        if elapsed < 1.5 {
+            let (response, damping) = match self.snapshot["mode"].as_str().unwrap_or("") {
+                "pendulum" => (0.72, 0.86),
+                "confession" => (0.55, 0.82),
+                _ => (0.44, 0.84),
+            };
+            let progress = spring_progress(elapsed, response, damping);
+            let scale_mode = matches!(self.snapshot["mode"].as_str(), Some("luminous" | "diorama"));
+            let mut body = String::new();
+            if let Some(old) = &self.outgoing {
+                body.push_str(&scene_layer(
+                    &Scene::new(old, w, h).finish(),
+                    w,
+                    h,
+                    (1. - progress).clamp(0., 1.),
+                    if scale_mode { 1. - 0.08 * progress } else { 1. },
+                ));
+            }
+            body.push_str(&scene_layer(
+                &svg,
+                w,
+                h,
+                progress.clamp(0., 1.),
+                if scale_mode {
+                    0.92 + 0.08 * progress
+                } else {
+                    1.
+                },
+            ));
+            svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">{body}</svg>"#
+            );
+            window.request_animation_frame();
+        } else {
+            self.outgoing = None;
+        }
         if self.render_key != svg {
             self.render_key = svg;
             match self
@@ -1230,8 +1370,12 @@ mod outline {
         }
         output
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), test))]
     pub fn shape(_text: &str, _size: f64) -> Option<Line> {
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    pub fn shape_styled(_text: &str, _size: f64, _weight: u16, _tracking: f64) -> Option<Line> {
         None
     }
     #[cfg(not(target_os = "macos"))]
@@ -1243,8 +1387,10 @@ mod outline {
             .map(|chunk| chunk.iter().collect())
             .collect()
     }
+    #[cfg(all(target_os = "macos", test))]
+    pub use native::shape;
     #[cfg(target_os = "macos")]
-    pub use native::{shape, wrap};
+    pub use native::{shape_styled, wrap};
     #[cfg(target_os = "macos")]
     mod native {
         use super::{Command, Line, Point};
@@ -1283,11 +1429,18 @@ mod outline {
             fn CFArrayGetCount(array: Ref) -> isize;
             fn CFArrayGetValueAtIndex(array: Ref, index: isize) -> Ref;
             fn CFRelease(value: Ref);
+            fn CFNumberCreate(allocator: Ref, kind: isize, value: *const c_void) -> Ref;
         }
         #[link(name = "CoreText", kind = "framework")]
         unsafe extern "C" {
             static kCTFontAttributeName: Ref;
-            fn CTFontCreateWithName(name: Ref, size: f64, matrix: Ref) -> Ref;
+            static kCTKernAttributeName: Ref;
+            static kCTFontWeightTrait: Ref;
+            static kCTFontTraitsAttribute: Ref;
+            fn CTFontCopyFontDescriptor(font: Ref) -> Ref;
+            fn CTFontDescriptorCreateCopyWithAttributes(descriptor: Ref, attributes: Ref) -> Ref;
+            fn CTFontCreateWithFontDescriptor(descriptor: Ref, size: f64, matrix: Ref) -> Ref;
+            fn CTFontCreateUIFontForLanguage(kind: u32, size: f64, language: Ref) -> Ref;
             fn CTLineCreateWithAttributedString(string: Ref) -> Ref;
             fn CTLineGetGlyphRuns(line: Ref) -> Ref;
             fn CTLineGetTypographicBounds(
@@ -1311,6 +1464,16 @@ mod outline {
                 info: *mut c_void,
                 callback: unsafe extern "C" fn(*mut c_void, *const PathElement),
             );
+        }
+        #[link(name = "AppKit", kind = "framework")]
+        unsafe extern "C" {
+            static NSFontDescriptorSystemDesignRounded: Ref;
+        }
+        #[link(name = "objc")]
+        unsafe extern "C" {
+            fn sel_registerName(name: *const std::ffi::c_char) -> Ref;
+            #[link_name = "objc_msgSend"]
+            fn descriptor_with_design(receiver: Ref, selector: Ref, design: Ref) -> Ref;
         }
         struct Owned(Ref);
         impl Drop for Owned {
@@ -1355,26 +1518,34 @@ mod outline {
             };
             collector.commands.push(command);
         }
+        #[cfg(test)]
         pub fn shape(text: &str, size: f64) -> Option<Line> {
+            shape_styled(text, size, 600, 0.)
+        }
+        pub fn shape_styled(text: &str, size: f64, weight: u16, tracking: f64) -> Option<Line> {
             if text.is_empty() || !size.is_finite() || size <= 0. {
                 return None;
             }
             // Every Create result is released; run fonts and glyph arrays are
             // borrowed only while their owning CTLine remains alive.
             unsafe {
-                let name = string("SFProRounded-Semibold");
-                let font = Owned(CTFontCreateWithName(name.0, size, ptr::null()));
+                let font = weighted_font(size, weight);
                 if font.0.is_null() {
                     return None;
                 }
                 let content = string(text);
-                let keys = [kCTFontAttributeName];
-                let values = [font.0];
+                let kern = Owned(CFNumberCreate(
+                    ptr::null(),
+                    13,
+                    &tracking as *const f64 as *const c_void,
+                ));
+                let keys = [kCTFontAttributeName, kCTKernAttributeName];
+                let values = [font.0, kern.0];
                 let attrs = Owned(CFDictionaryCreate(
                     ptr::null(),
                     keys.as_ptr(),
                     values.as_ptr(),
-                    1,
+                    2,
                     ptr::null(),
                     ptr::null(),
                 ));
@@ -1433,13 +1604,72 @@ mod outline {
                 })
             }
         }
+        unsafe fn weighted_font(size: f64, weight: u16) -> Owned {
+            unsafe {
+                // Obtain the UI font through the public API, then apply the
+                // public rounded design and descriptor weight trait.
+                let base = Owned(CTFontCreateUIFontForLanguage(2, size, ptr::null()));
+                if base.0.is_null() {
+                    return base;
+                }
+                let value: f64 = match weight {
+                    0..=399 => -0.4,
+                    400..=599 => 0.23,
+                    600..=699 => 0.3,
+                    700..=899 => 0.4,
+                    _ => 0.62,
+                };
+                let number = Owned(CFNumberCreate(
+                    ptr::null(),
+                    13,
+                    &value as *const f64 as *const c_void,
+                ));
+                let traits = Owned(CFDictionaryCreate(
+                    ptr::null(),
+                    [kCTFontWeightTrait].as_ptr(),
+                    [number.0].as_ptr(),
+                    1,
+                    ptr::null(),
+                    ptr::null(),
+                ));
+                let attrs = Owned(CFDictionaryCreate(
+                    ptr::null(),
+                    [kCTFontTraitsAttribute].as_ptr(),
+                    [traits.0].as_ptr(),
+                    1,
+                    ptr::null(),
+                    ptr::null(),
+                ));
+                let descriptor = Owned(CTFontCopyFontDescriptor(base.0));
+                // CTFontDescriptor and NSFontDescriptor are toll-free bridged.
+                // This +0 design result remains alive through this synchronous
+                // shaping call; only Create/Copy results are CF-released.
+                let rounded = descriptor_with_design(
+                    descriptor.0,
+                    sel_registerName(c"fontDescriptorWithDesign:".as_ptr()),
+                    NSFontDescriptorSystemDesignRounded,
+                );
+                let weighted = Owned(CTFontDescriptorCreateCopyWithAttributes(
+                    if rounded.is_null() {
+                        descriptor.0
+                    } else {
+                        rounded
+                    },
+                    attrs.0,
+                ));
+                Owned(CTFontCreateWithFontDescriptor(
+                    weighted.0,
+                    size,
+                    ptr::null(),
+                ))
+            }
+        }
         pub fn wrap(text: &str, size: f64, width: f64) -> Vec<String> {
             if text.is_empty() {
                 return vec![];
             }
             unsafe {
-                let name = string("SFProRounded-Semibold");
-                let font = Owned(CTFontCreateWithName(name.0, size, ptr::null()));
+                let font = weighted_font(size, 600);
                 let content = string(text);
                 let keys = [kCTFontAttributeName];
                 let values = [font.0];
@@ -1481,6 +1711,24 @@ mod outline {
 mod tests {
     use super::{Scene, escape};
     use serde_json::json;
+    #[test]
+    fn spring_enters_from_zero_and_settles_at_one() {
+        assert_eq!(super::spring_progress(0., 0.44, 0.84), 0.);
+        assert!(super::spring_progress(0.1, 0.44, 0.84) > 0.);
+        assert!((super::spring_progress(1.5, 0.44, 0.84) - 1.).abs() < 0.0001);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_tracking_changes_real_shaped_advances() {
+        let ordinary = super::outline::shape_styled("Lyrics", 32., 700, 0.).unwrap();
+        let tracked = super::outline::shape_styled("Lyrics", 32., 700, -0.576).unwrap();
+        assert!(tracked.width < ordinary.width);
+        let light = super::outline::shape_styled("Lyrics", 32., 300, 0.).unwrap();
+        assert_ne!(
+            super::outline::svg_path(&light.commands, |p| p),
+            super::outline::svg_path(&ordinary.commands, |p| p)
+        );
+    }
     #[test]
     fn perspective_projects_near_and_far_edges_at_different_heights() {
         let near = super::outline::project(

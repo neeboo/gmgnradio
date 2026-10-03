@@ -42,6 +42,10 @@ fn motion_format(value: &str) -> &str {
     }
 }
 
+fn tts_draft_change_requires_stop(section:&str,field:&str,previous:&Value,current:&Value)->bool {
+    section=="tts"&&matches!(field,"voiceID"|"modelID")&&previous!=current
+}
+
 fn orb_preview() -> impl IntoElement {
     div()
         .size(px(40.))
@@ -298,7 +302,7 @@ impl AgentSettingsPane {
         let personas = ["居民人格", "DJ 人格与偏好"]
             .map(|label| cx.new(|cx| TextareaState::new(window, cx).placeholder(label).rows(4)))
             .to_vec();
-        let extra_inputs = [
+        let extra_inputs:Vec<Entity<InputState>> = [
             "新的 TTS API Key",
             "新的 ASR API Key",
             "新的 Marble API Key",
@@ -331,7 +335,18 @@ impl AgentSettingsPane {
                 }
             });
         });
-        let subscriptions=vec![escape_subscription,cx.subscribe(&inputs[2],|this,input,event:&InputEvent,cx|{
+        let subscriptions=vec![escape_subscription,cx.subscribe(&inputs[3],|this,input,event:&InputEvent,cx|{
+            if matches!(event,InputEvent::Change)&&this.initialized{
+                let current=json!(input.read(cx).value().to_string());
+                if tts_draft_change_requires_stop("tts","voiceID",&this.draft["tts"]["voiceID"],&current){
+                    this.commands.push(json!({"op":"tts.stop"}));this.draft["tts"]["voiceID"]=current;cx.notify();
+                }
+            }
+        }),cx.subscribe(&extra_inputs[5],|this,_,event:&InputEvent,cx|{
+            if matches!(event,InputEvent::Change)&&this.initialized{this.commands.push(json!({"op":"space.prop.cancel","clearNotice":true}));cx.notify();}
+        }),cx.subscribe(&extra_inputs[6],|this,_,event:&InputEvent,cx|{
+            if matches!(event,InputEvent::Change)&&this.initialized{this.commands.push(json!({"op":"space.prop.cancel","clearNotice":true}));cx.notify();}
+        }),cx.subscribe(&inputs[2],|this,input,event:&InputEvent,cx|{
             if matches!(event,InputEvent::Change) && this.initialized {this.commands.push(json!({"op":"agent.save","planningModel":input.read(cx).value().to_string()}));}
         }),cx.subscribe(&orb_color,|this,_,event:&ColorPickerEvent,cx|{
             if let ColorPickerEvent::Change(Some(color))=event{let color=color.to_rgb();this.commands.push(json!({"op":"presence.orb.color","red":color.r,"green":color.g,"blue":color.b}));cx.notify();}
@@ -362,6 +377,7 @@ impl AgentSettingsPane {
         std::mem::take(&mut self.commands)
     }
     pub fn select_page(&mut self, page: &str, cx: &mut Context<Self>) {
+        if self.page==2{self.commands.push(json!({"op":"space.prop.cancel"}));}
         if self.page == 3 {
             self.commands.push(json!({"op":"shortcuts.cancel"}));
         }
@@ -378,6 +394,7 @@ impl AgentSettingsPane {
         cx.notify();
     }
     pub fn dismissed(&mut self, cx: &mut Context<Self>) {
+        self.commands.push(json!({"op":"space.prop.cancel"}));
         self.commands.push(json!({"op":"shortcuts.cancel"}));
         self.commands.push(json!({"op":"tts.stop"}));
         cx.notify();
@@ -483,6 +500,7 @@ impl AgentSettingsPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if tts_draft_change_requires_stop(section,field,&self.draft[section][field],&value){self.commands.push(json!({"op":"tts.stop"}));}
         self.draft[section][field] = value.clone();
         if matches!(section, "tts" | "asr") && field == "providerID" {
             self.extra_inputs[if section == "tts" { 0 } else { 1 }]
@@ -1090,7 +1108,7 @@ impl AgentSettingsPane {
                     .child(group("许愿机").child(Input::new(&self.extra_inputs[5])).child(Input::new(&self.extra_inputs[6]))
                     .child(div().flex().items_center().gap_2()
                         .child(div().flex_1().text_sm().child(if self.snapshot["space"]["propCredentialConfigured"].as_bool()==Some(true){"已配置"}else{"未配置"}))
-                        .child(Button::new("prop-check").label(if self.snapshot["space"]["propChecking"].as_bool()==Some(true){"检测中…"}else{"检测连接"}).disabled(self.snapshot["space"]["propCredentialConfigured"].as_bool()!=Some(true)||self.snapshot["space"]["propChecking"].as_bool()==Some(true)||!self.extra_inputs[6].read(cx).value().is_empty()).on_click(cx.listener(|this,_,_,_|this.commands.push(json!({"op":"space.prop.check"})))))
+                        .child(Button::new("prop-check").label(if self.snapshot["space"]["propChecking"].as_bool()==Some(true){"检测中…"}else{"检测连接"}).disabled(self.snapshot["space"]["propCredentialConfigured"].as_bool()!=Some(true)||self.snapshot["space"]["propChecking"].as_bool()==Some(true)||!self.extra_inputs[6].read(cx).value().is_empty()).on_click(cx.listener(|this,_,_,cx|this.commands.push(json!({"op":"space.prop.check","endpoint":this.extra_inputs[5].read(cx).value().to_string()})))))
                         .child(Button::new("prop-save").label("保存").disabled(self.extra_inputs[5].read(cx).value().trim().is_empty()).on_click(cx.listener(|this,_,_,cx|this.commands.push(json!({"op":"space.prop.save","endpoint":this.extra_inputs[5].read(cx).value().to_string(),"apiKey":this.extra_inputs[6].read(cx).value().to_string()}))))))
                     .child(div().text_xs().child("地址和密钥只存在这台电脑上，保存后不会立刻开始生成。")));
             }
@@ -1261,6 +1279,7 @@ impl Render for AgentSettingsPane {
                             .selected_index(self.page)
                             .children(titles.map(|title| Tab::new().flex_1().min_w(px(0.)).text_xs().label(title)))
                             .on_click(cx.listener(|this, index: &usize, _, cx| {
+                                if this.page==2&&*index!=2{this.commands.push(json!({"op":"space.prop.cancel"}));}
                                 if this.page == 3 && *index != 3 {
                                     this.commands.push(json!({"op":"shortcuts.cancel"}));
                                 }
@@ -1304,7 +1323,7 @@ impl Render for AgentSettingsPane {
 
 #[cfg(test)]
 mod settings_display_tests {
-    use super::{avatar_detail, motion_format};
+    use super::{avatar_detail, motion_format, tts_draft_change_requires_stop};
     use serde_json::json;
     #[test]
     fn built_in_character_detail_matches_original_display() {
@@ -1331,5 +1350,14 @@ mod settings_display_tests {
         assert_eq!(motion_format("procedural"), "内置动态");
         assert_eq!(motion_format("vmd"), "VMD");
         assert_eq!(motion_format("vrma"), "VRMA");
+    }
+    #[test]
+    fn changing_tts_voice_or_model_stops_old_preview_without_other_draft_changes() {
+        for field in ["voiceID", "modelID"] {
+            assert!(tts_draft_change_requires_stop("tts", field, &json!("old"), &json!("new")));
+            assert!(!tts_draft_change_requires_stop("tts", field, &json!("same"), &json!("same")));
+        }
+        assert!(!tts_draft_change_requires_stop("asr", "modelID", &json!("old"), &json!("new")));
+        assert!(!tts_draft_change_requires_stop("tts", "apiKey", &json!("old"), &json!("new")));
     }
 }

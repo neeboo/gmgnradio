@@ -17,6 +17,8 @@ final class GPUISettingsParity {
     private var propEndpoint = "http://127.0.0.1:8191"
     private var propConfigured = false
     private var propChecking = false
+    private var propCheckTask: Task<Void, Never>?
+    private var propCheckID: UUID?
     private var downloadRevision: UInt64 = 0
     private var downloadState = "idle"
 
@@ -181,19 +183,11 @@ final class GPUISettingsParity {
             guard let key = value["apiKey"] as? String else { return false }
             marble.replacementKey = key; marble.save(); spaceNotice = nil
         case "space.key.clear": marble.clear(); spaceNotice = nil
-        case "space.prop.save": return saveProps(value)
-        case "space.prop.check":
-            guard !propChecking, let saved = try? props.load() else { return false }
-            propChecking = true
-            operation("prop") { [weak self] in
-                guard let self else { return }
-                defer { propChecking = false }
-                do {
-                    let health = try await PropGenerationClient(endpoint: saved.endpoint, token: saved.token).health()
-                    try Task.checkCancellation()
-                    spaceNotice = health.message
-                } catch { if !Task.isCancelled { spaceNotice = "暂时无法连接生成服务，请检查连接后重试。" } }
-            }
+        case "space.prop.save": cancelPropCheck(); return saveProps(value)
+        case "space.prop.cancel":
+            cancelPropCheck()
+            if value["clearNotice"] as? Bool == true { spaceNotice = nil }
+        case "space.prop.check": checkProps(value)
         case "shortcuts.record":
             guard let action = GMGNShortcutAction(rawValue: id), let raw = value["scope"] as? String,
                   let scope = GMGNShortcutScope(rawValue: raw) else { return false }
@@ -265,6 +259,49 @@ final class GPUISettingsParity {
         }
     }
 
+    private func cancelPropCheck() {
+        propCheckID = nil
+        propCheckTask?.cancel()
+        propCheckTask = nil
+        propChecking = false
+    }
+
+    private func checkProps(_ value: [String: Any]) {
+        cancelPropCheck()
+        do {
+            guard let saved = try props.load(),
+                  let raw = value["endpoint"] as? String,
+                  let draftURL = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+                  try PropGenerationConfiguration(endpoint: draftURL, token: saved.token).endpoint == saved.endpoint else {
+                spaceNotice = "请先保存服务配置，再检测连接。"
+                return
+            }
+            let id = UUID()
+            propCheckID = id
+            propChecking = true
+            spaceNotice = nil
+            propCheckTask = Task { [weak self] in
+                guard let self else { return }
+                defer {
+                    if propCheckID == id {
+                        propCheckID = nil; propCheckTask = nil; propChecking = false
+                    }
+                }
+                do {
+                    let health = try await PropGenerationClient(endpoint: saved.endpoint, token: saved.token).health()
+                    guard !Task.isCancelled, propCheckID == id else { return }
+                    spaceNotice = health.message
+                } catch {
+                    guard !Task.isCancelled, propCheckID == id else { return }
+                    spaceNotice = (error as? PropGenerationError)?.errorDescription
+                        ?? "暂时无法连接生成服务，请检查连接后重试。"
+                }
+            }
+        } catch {
+            spaceNotice = "许愿机配置无法读取，请先重新保存服务配置。"
+        }
+    }
+
     private func installRecordingMonitor() {
         removeRecordingMonitor()
         recordMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -286,6 +323,7 @@ final class GPUISettingsParity {
     }
 
     func close() {
+        cancelPropCheck()
         for task in operations.values { task.cancel() }
         operations.removeAll()
         removeRecordingMonitor()

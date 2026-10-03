@@ -159,6 +159,7 @@ impl Render for ResidentChatPane {
         let mut history = div()
             .id("resident-transcript")
             .h(px(132.))
+            .flex_shrink_0()
             .flex_1()
             .flex()
             .flex_col()
@@ -334,7 +335,7 @@ impl Render for ResidentChatPane {
                             cx.notify();
                         })),
                 )
-                .child(div().flex_1().text_xs().child(status.clone()));
+                .child(div().flex_1().text_xs().child(self.state.status_line()));
         }
         controls = controls.child(voice);
         if self.state.can_stop() && self.state.has_draft() {
@@ -386,9 +387,12 @@ impl Render for ResidentChatPane {
                 cx.notify();
             }));
         if !self.compact {
+            pane = pane.overflow_y_scroll();
+            if !self.state.transcript.is_empty() || !self.state.reply.is_empty() {
             pane = pane.child(
                 div()
                     .flex()
+                    .flex_shrink_0()
                     .gap_2()
                     .child(history.overflow_y_scrollbar())
                     .child(
@@ -406,7 +410,8 @@ impl Render for ResidentChatPane {
                             })),
                     ),
             );
-            if self.state.status.is_some() {
+            }
+            if self.state.status.is_some() && self.state.host_notice.as_deref() != Some(status.as_str()) {
                 pane = pane.child(div().text_xs().child(status));
             }
             if let Some(error) = &self.state.attachments_error {
