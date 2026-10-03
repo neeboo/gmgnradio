@@ -10,6 +10,8 @@
 
 ### 主代理连续验收最新结果
 
+21:11 用户明确要求主代理使用 computer use 继续，不再停在音频采集询问。此前待确认状态已解除；仅允许本次隔离测试 App 输出声音验证，保留其他应用及现有 Loopback 混音配置。主代理通过既有 AppHost 启动测试 bundle `ai.gmgn.radio.e2e`，复用隔离根 `/tmp/gmgn-e2e-20261003-1838`，PID 53973，正式 `play_screen` 播放 Twitch 页面，真实解码帧持续增长且 rate=1；日志 `/tmp/gmgn-parent-scoped-audio-host.log`。DSH 正在实现限定目标 PID 的验收采样工具，日志 `/tmp/gmgn-dsh-scoped-audio-20261003.log`；主代理负责必要 GUI 授权与实际 HLS 输出开停对照。当前未获得 HLS 输出 PCM 证据，完整验收仍未完成；本次复用已有物件不计为新生成或新通知翻转。
+
 19:17 坐姿语义更正后当前宿主构建exit0（`/tmp/gmgn-parent-reacceptance-1917-build2.log`，主代理修新增Handler参数顺序），Python89pass。真实恢复流程137pass/1fail/2blocked，`/tmp/gmgn-parent-reacceptance-1917-real-app.log`。显式重启站姿实际clip=idle-loop-pmx，脚离参考面0.0036m、contact0.0175m，双边站姿判据通过；坐姿按骨盆稳定性/动作姿态检查，不再以脚离地误报站立浮地，不宣称几何座面支撑已验。物件电视恢复/非HLS PCM声音/真实chat继续通过。旧任务没有新未读导致恢复模式的翻转判据未重复验，前轮全新根通知已读和重启已验。HLS最终输出声音仍需实证；系统进程音频采集仅为候选方案，可能涉及macOS授权，未获用户进一步确认不得接入/调用TCC采集。
 
 用户纠正坐姿误判：已只读确认测试根MotionPackages/.selection.json activeID=`gmgn.motion.bones.chair-sit-loop-pmx`。此前主代理按无activeActivity即站姿、脚离地即悬空作判断不成立；撤回据此要求实际PMX强制落地的返工。坐姿允许脚离地，须检查凳子/座面支撑、骨盆对齐与身体穿模，不能按站姿脚贴地标准调整模型。站姿验收需显式选idle/站立动作，不能用复制包最后选中的chair-sit冒充站姿。DSH旧浮地返工已中止，重新限定为修动作语义和测试前置条件；保留默认坐姿行为，不扩大容差或硬压模型到地面。HLS声音仍未实证，整体验收继续未完成。
