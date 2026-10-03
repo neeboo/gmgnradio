@@ -204,7 +204,7 @@ struct WorldAuthorityEndpoint {
 
     init(applicationSupportBase: URL? = nil, bundle: Bundle = .main) {
         let root = Self.taskServiceRoot(applicationSupportBase: applicationSupportBase)
-        socketPath = root.appendingPathComponent("taskd.sock").path
+        socketPath = root.appendingPathComponent("taskd.endpoint.json").path
         helperPath = bundle.bundleURL
             .appendingPathComponent("Contents/Helpers/gmgn-taskd").path
     }

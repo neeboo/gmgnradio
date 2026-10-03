@@ -27,11 +27,12 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
-use tokio::net::UnixListener;
+use tokio::net::TcpListener;
 
 const CONTRACT_CANARY: &str = "AUTHORITY-CONTRACT-CANARY-9f3a";
 const SNAPSHOT_CANARY: &str = "AUTHORITY-SNAPSHOT-CANARY-4b71";
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+const ENDPOINT_TOKEN: &str = "6ef3b6dc-a90b-4df0-8b79-e79b94c30cd1";
 
 /// What the fake authority saw, so a test can prove the MCP face sent exactly
 /// what it was given and invented nothing.
@@ -77,7 +78,8 @@ fn spawn_authority(socket: PathBuf, seen: Arc<Seen>) -> std::thread::JoinHandle<
             .build()
             .unwrap();
         runtime.block_on(async move {
-            let listener = UnixListener::bind(&socket).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            std::fs::write(&socket, serde_json::to_vec(&json!({"version":1,"address":listener.local_addr().unwrap().to_string(),"token":ENDPOINT_TOKEN})).unwrap()).unwrap();
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
@@ -94,6 +96,7 @@ fn spawn_authority(socket: PathBuf, seen: Arc<Seen>) -> std::thread::JoinHandle<
                             continue;
                         }
                         let request: Value = serde_json::from_str(trimmed).unwrap();
+                        assert!(request["auth"].as_str() == Some(ENDPOINT_TOKEN), "every authority call must authenticate");
                         let id = request["id"].clone();
                         let method = request["method"].as_str().unwrap_or("").to_owned();
                         let params = request["params"].clone();
@@ -318,7 +321,7 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str) -> Self {
-        // Deliberately short: a unix socket path must fit in `sun_path`
+        // Isolated private root for the endpoint and grants.
         // (104 bytes on macOS), and `TMPDIR` on this machine is already long.
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -723,4 +726,24 @@ fn the_server_starts_without_an_authority_and_says_so() {
     let contract = session.call("gmgn_capability_contract", json!({}));
     assert_eq!(contract["result"]["isError"], json!(true), "{contract}");
     assert_eq!(result_of(&contract)["code"], json!("authority_unavailable"));
+}
+
+#[test]
+fn invalid_endpoint_never_reaches_the_authority() {
+    let fixture = Fixture::new("invalid-endpoint");
+    let original: Value = serde_json::from_slice(&std::fs::read(&fixture.socket).unwrap()).unwrap();
+    for (field, value) in [
+        ("address", json!("192.168.1.1:1234")),
+        ("address", json!("127.0.0.1:0")),
+        ("version", json!(2)),
+        ("token", json!("not-a-token")),
+    ] {
+        let mut endpoint = original.clone();
+        endpoint[field] = value;
+        std::fs::write(&fixture.socket, serde_json::to_vec(&endpoint).unwrap()).unwrap();
+        let mut session = Session::start(&fixture.socket, None);
+        let contract = session.call("gmgn_capability_contract", json!({}));
+        assert_eq!(result_of(&contract)["code"], json!("authority_protocol_error"));
+    }
+    assert_eq!(fixture.seen.count("capability_contract"), 0);
 }

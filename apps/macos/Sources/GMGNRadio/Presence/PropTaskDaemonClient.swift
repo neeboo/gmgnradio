@@ -136,7 +136,9 @@ enum PropTaskDaemonError: LocalizedError {
     private var helperProcess: Process?
     private static let maxFrame = 12 * 1024 * 1024
     private struct Configuration: Codable, Equatable { let endpoint: URL; let token: String }
-    private struct Request<P: Encodable>: Encodable { let id: String; let method: String; let params: P }
+    private struct Request<P: Encodable>: Encodable { let id: String; let auth: String; let method: String; let params: P }
+    private struct Endpoint: Decodable { let version: Int; let address: String; let token: String }
+    private var endpointToken: String?
     private struct Empty: Codable {}
     private struct ID: Codable { let id: UUID }
     private struct JobResult: Decodable { let job: PropGenerationRecord }
@@ -161,7 +163,7 @@ enum PropTaskDaemonError: LocalizedError {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("gmgn radio", isDirectory: true)
         self.root = root ?? support.appendingPathComponent("TaskService", isDirectory: true)
-        self.socketURL = socketURL ?? self.root.appendingPathComponent("taskd.sock")
+        self.socketURL = socketURL ?? self.root.appendingPathComponent("taskd.endpoint.json")
         self.helperURL = helperURL ?? Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/gmgn-taskd")
         self.legacyRoot = legacyRoot ?? (root == nil ? support.appendingPathComponent("PropGeneration", isDirectory: true) : nil)
         self.allowsLaunching = allowsLaunching
@@ -297,7 +299,7 @@ enum PropTaskDaemonError: LocalizedError {
         try await task.value
     }
     private func connectAndSubscribe() async throws {
-        guard socketURL.isFileURL, socketURL.path.utf8.count < 104 else { throw PropTaskDaemonError.unavailable }
+        guard socketURL.isFileURL else { throw PropTaskDaemonError.unavailable }
         do { try await openSocket() }
         catch {
             guard allowsLaunching else { throw error }
@@ -344,7 +346,7 @@ enum PropTaskDaemonError: LocalizedError {
         if helperProcess?.isRunning == true { return }
         let process = Process()
         process.executableURL = helperURL
-        process.arguments = ["--root", root.path, "--socket", socketURL.path, "--concurrency", "2"]
+        process.arguments = ["--root", root.path, "--endpoint-file", socketURL.path, "--concurrency", "2"]
         if let legacyRoot { process.arguments! += ["--legacy-root", legacyRoot.path] }
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
@@ -377,7 +379,16 @@ enum PropTaskDaemonError: LocalizedError {
     private func openSocket() async throws {
         tearDown()
         let identity = UUID(); connectionID = identity
-        let socket = NWConnection(to: .unix(path: socketURL.path), using: .tcp)
+        let endpoint = try JSONDecoder().decode(Endpoint.self, from: Data(contentsOf: socketURL))
+        let parts = endpoint.address.split(separator: ":")
+        guard endpoint.version == 1, parts.count == 2, parts[0] == "127.0.0.1",
+              let portNumber = UInt16(parts[1]), portNumber > 0,
+              let port = NWEndpoint.Port(rawValue: portNumber),
+              let token = UUID(uuidString: endpoint.token), token.uuidString.dropFirst(14).first == "4" else {
+            throw PropTaskDaemonError.unavailable
+        }
+        endpointToken = endpoint.token
+        let socket = NWConnection(host: "127.0.0.1", port: port, using: .tcp)
         connection = socket
         socket.stateUpdateHandler = { [weak self] state in
             Task { @MainActor in
@@ -435,9 +446,9 @@ enum PropTaskDaemonError: LocalizedError {
         if buffer.count > Self.maxFrame { lostConnection(identity: identity) }
     }
     private func request<P: Encodable, R: Decodable>(_ method: String, _ params: P) async throws -> R {
-        guard let socket = connection, connectionReady else { throw PropTaskDaemonError.unavailable }
+        guard let socket = connection, connectionReady, let endpointToken else { throw PropTaskDaemonError.unavailable }
         let id = UUID().uuidString
-        var data = try JSONEncoder().encode(Request(id: id, method: method, params: params))
+        var data = try JSONEncoder().encode(Request(id: id, auth: endpointToken, method: method, params: params))
         guard data.count <= Self.maxFrame else { throw PropTaskDaemonError.invalidFrame }
         data.append(10)
         let identity = connectionID
@@ -470,6 +481,7 @@ enum PropTaskDaemonError: LocalizedError {
         onSnapshot?(snapshot)
     }
     private func tearDown() {
+        endpointToken = nil
         connectionID = UUID()
         connection?.cancel(); connection = nil; connectionReady = false; buffer.removeAll(); scannedBytes = 0
         let requests = pending; pending.removeAll()

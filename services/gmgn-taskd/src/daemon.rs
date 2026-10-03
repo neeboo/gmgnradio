@@ -1,9 +1,11 @@
 use crate::{
     contract, files, memory, messages,
     model::{self, Result, Stored, Submit, FRAME_LIMIT},
-    provider, resident, world,
+    provider, resident,
     store::Database,
+    world,
 };
+use gmgn_protocol::{failure, valid_request_id, Request};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
@@ -14,7 +16,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{UnixListener, UnixStream},
+    net::{TcpListener, TcpStream},
     sync::{Mutex, RwLock, Semaphore},
     task::JoinSet,
 };
@@ -28,13 +30,6 @@ pub struct Service {
     /// bookkeeping, integrity checks and local storage stay here; the backend
     /// owns only the remote calls behind [`provider::PropProvider`].
     provider: Arc<dyn provider::PropProvider>,
-}
-#[derive(Deserialize)]
-struct Request {
-    id: Value,
-    method: String,
-    #[serde(default)]
-    params: Value,
 }
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -122,15 +117,18 @@ impl Service {
             }
             "failover" => {
                 let id = model::identity(params["id"].as_str().ok_or("invalid_id")?)?;
-                let endpoint = params["endpoint"].as_str().ok_or("invalid_endpoint")?.to_owned();
-                let profile: Option<model::GenerationProfile> = match params.get("generationProfile")
-                {
-                    None | Some(Value::Null) => None,
-                    Some(value) => Some(
-                        serde_json::from_value(value.clone())
-                            .map_err(|_| "invalid_generation_profile")?,
-                    ),
-                };
+                let endpoint = params["endpoint"]
+                    .as_str()
+                    .ok_or("invalid_endpoint")?
+                    .to_owned();
+                let profile: Option<model::GenerationProfile> =
+                    match params.get("generationProfile") {
+                        None | Some(Value::Null) => None,
+                        Some(value) => Some(
+                            serde_json::from_value(value.clone())
+                                .map_err(|_| "invalid_generation_profile")?,
+                        ),
+                    };
                 self.db
                     .call(move |s| {
                         let (job, replaced) = s.failover(&id, &endpoint, profile)?;
@@ -179,7 +177,9 @@ impl Service {
                 let capabilities = self.provider.probe(&endpoint, token.as_deref()).await?;
                 let ready = capabilities.is_ready();
                 let accepts_input_px = input_px.map(|px| capabilities.accepts_input_px(px));
-                Ok(json!({"endpoint":endpoint,"ready":ready,"acceptsInputPx":accepts_input_px,"capabilities":capabilities}))
+                Ok(
+                    json!({"endpoint":endpoint,"ready":ready,"acceptsInputPx":accepts_input_px,"capabilities":capabilities}),
+                )
             }
             "publish_message" => {
                 if self
@@ -478,7 +478,7 @@ impl Service {
         }
     }
 
-    async fn serve_connection(&self, stream: UnixStream) -> Result<()> {
+    async fn serve_connection(&self, stream: TcpStream, token: &str) -> Result<()> {
         let (reader, writer) = stream.into_split();
         let writer = Arc::new(Mutex::new(writer));
         let mut reader = BufReader::new(reader);
@@ -493,8 +493,7 @@ impl Service {
             End,
             Error(&'static str),
         }
-        let (frames_tx, mut frames_rx) =
-            tokio::sync::mpsc::unbounded_channel::<ReaderEvent>();
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::unbounded_channel::<ReaderEvent>();
         let reader_task = tokio::spawn(async move {
             loop {
                 match frame(&mut reader).await {
@@ -551,6 +550,19 @@ impl Service {
                 queued.push_back(line);
             }
             let line = queued.pop_front().expect("queue is non-empty");
+            // Authenticate every frame before parsing or dispatching business
+            // methods, including configure and subscriptions.
+            let envelope: Value = match serde_json::from_slice(&line) {
+                Ok(value) => value,
+                Err(_) => {
+                    write(&writer, &failure(Value::Null, "invalid_request")).await?;
+                    continue;
+                }
+            };
+            if envelope.get("auth").and_then(Value::as_str) != Some(token) {
+                write(&writer, &failure(Value::Null, "ipc_unauthorized")).await?;
+                return Err("ipc_unauthorized");
+            }
             let request: Request = match serde_json::from_slice(&line) {
                 Ok(r) => r,
                 Err(_) => {
@@ -558,11 +570,7 @@ impl Service {
                     continue;
                 }
             };
-            if !request
-                .id
-                .as_str()
-                .is_some_and(|id| (1..=200).contains(&id.len()))
-            {
+            if !valid_request_id(&request.id) {
                 write(&writer, &failure(Value::Null, "invalid_request_id")).await?;
                 continue;
             }
@@ -594,9 +602,7 @@ impl Service {
                 let service = self.clone();
                 let writer = writer.clone();
                 subscriptions.spawn(async move {
-                    service
-                        .world_stream(world_id, after, changed, writer)
-                        .await
+                    service.world_stream(world_id, after, changed, writer).await
                 });
                 continue;
             }
@@ -691,7 +697,7 @@ impl Service {
         scope: Option<MessageScope>,
         mut cursor: i64,
         mut changed: tokio::sync::watch::Receiver<u64>,
-        writer: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
+        writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     ) -> Result<()> {
         loop {
             changed.borrow_and_update();
@@ -732,7 +738,7 @@ impl Service {
         world_id: String,
         mut cursor: i64,
         mut changed: tokio::sync::watch::Receiver<u64>,
-        writer: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
+        writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     ) -> Result<()> {
         loop {
             changed.borrow_and_update();
@@ -949,30 +955,30 @@ impl Service {
     }
 }
 
-pub async fn run(listener: UnixListener, db: Database, concurrency: usize) -> Result<()> {
+pub async fn run(
+    listener: TcpListener,
+    db: Database,
+    concurrency: usize,
+    token: String,
+) -> Result<()> {
     let service = Service::new(db)?;
     let mut scheduler = tokio::spawn(service.clone().schedule(concurrency));
     let clients = Arc::new(Semaphore::new(64));
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(|_| "signal_unavailable")?;
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => return Ok(()),
-            _ = term.recv() => return Ok(()),
+            result = tokio::signal::ctrl_c() => return result.map_err(|_| "signal_unavailable"),
             result = &mut scheduler => return result.map_err(|_| "worker_failed")?,
             accepted = listener.accept() => {
                 let (stream, _) = accepted.map_err(|_| "socket_unavailable")?;
                 let Ok(permit) = clients.clone().try_acquire_owned() else { drop(stream); continue; };
                 let service = service.clone();
-                tokio::spawn(async move { let _permit = permit; let _ = service.serve_connection(stream).await; });
+                let token = token.clone();
+                tokio::spawn(async move { let _permit = permit; let _ = service.serve_connection(stream, &token).await; });
             }
         }
     }
 }
-fn failure(id: Value, code: &str) -> Value {
-    json!({"id":id,"error":{"code":code,"message":code}})
-}
-async fn write(writer: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>, value: &Value) -> Result<()> {
+async fn write(writer: &Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>, value: &Value) -> Result<()> {
     let mut bytes = serde_json::to_vec(value).map_err(|_| "invalid_response")?;
     bytes.push(b'\n');
     if bytes.len() > FRAME_LIMIT {
@@ -985,7 +991,7 @@ async fn write(writer: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>, value: &Va
     .map_err(|_| "client_timeout")?
     .map_err(|_| "client_disconnected")
 }
-async fn frame(reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>) -> Result<Option<Vec<u8>>> {
+async fn frame(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Result<Option<Vec<u8>>> {
     let mut frame = Vec::new();
     loop {
         let buffer = reader.fill_buf().await.map_err(|_| "client_disconnected")?;
@@ -1029,7 +1035,7 @@ pub fn options() -> Result<Options> {
         let next = args.next().ok_or("invalid_arguments")?;
         match arg.to_str() {
             Some("--root") => root = Some(PathBuf::from(next)),
-            Some("--socket") => socket = Some(PathBuf::from(next)),
+            Some("--socket" | "--endpoint-file") => socket = Some(PathBuf::from(next)),
             Some("--legacy-root") => legacy = Some(PathBuf::from(next)),
             Some("--concurrency") => {
                 concurrency = next
@@ -1041,14 +1047,8 @@ pub fn options() -> Result<Options> {
             _ => return Err("invalid_arguments"),
         }
     }
-    let root = root
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| {
-                PathBuf::from(h).join("Library/Application Support/gmgn radio/TaskService")
-            })
-        })
-        .ok_or("missing_root")?;
-    let socket = socket.unwrap_or_else(|| root.join("taskd.sock"));
+    let root = root.or_else(default_root).ok_or("missing_root")?;
+    let socket = socket.unwrap_or_else(|| root.join("taskd.endpoint.json"));
     if !root.is_absolute()
         || !socket.is_absolute()
         || legacy.as_ref().is_some_and(|p| !p.is_absolute())
@@ -1063,16 +1063,99 @@ pub fn options() -> Result<Options> {
     })
 }
 
+fn default_root() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .map(|base| PathBuf::from(base).join("gmgn radio/TaskService"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME").map(|base| {
+            PathBuf::from(base).join("Library/Application Support/gmgn radio/TaskService")
+        })
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|base| PathBuf::from(base).join(".local/share"))
+            })
+            .map(|base| base.join("gmgn-radio/TaskService"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, address) = listener.accept().await.unwrap();
+        assert!(address.ip().is_loopback());
+        (server, client)
+    }
+
+    #[tokio::test]
+    async fn tcp_authentication_precedes_configure_and_subscriptions() {
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-auth-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = Service::new(Database::open(dir.clone(), None).unwrap()).unwrap();
+        for method in ["configure", "subscribe", "world_subscribe", "snapshot"] {
+            for auth in [Value::Null, json!("wrong-token")] {
+                let (server, mut client) = tcp_pair().await;
+                let serving = service.clone();
+                let task =
+                    tokio::spawn(
+                        async move { serving.serve_connection(server, "correct-token").await },
+                    );
+                let mut request = serde_json::to_vec(&json!({"id":"auth-test","auth":auth,"method":method,"params":{"endpoint":"https://example.invalid","token":"should-not-be-stored"}})).unwrap();
+                request.push(b'\n');
+                client.write_all(&request).await.unwrap();
+                let mut reply = String::new();
+                BufReader::new(client).read_line(&mut reply).await.unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(&reply).unwrap()["error"]["code"],
+                    "ipc_unauthorized"
+                );
+                assert_eq!(task.await.unwrap(), Err("ipc_unauthorized"));
+                assert!(service.credentials.read().await.is_empty());
+            }
+        }
+        // A valid first frame does not authorize a subsequent frame lacking auth.
+        let (server, mut client) = tcp_pair().await;
+        let serving = service.clone();
+        let task =
+            tokio::spawn(async move { serving.serve_connection(server, "correct-token").await });
+        client.write_all(b"{\"id\":\"1\",\"auth\":\"correct-token\",\"method\":\"snapshot\"}\n{\"id\":\"2\",\"method\":\"configure\",\"params\":{\"endpoint\":\"https://example.invalid\",\"token\":\"never-stored\"}}\n").await.unwrap();
+        let mut reader = BufReader::new(client);
+        let mut reply = String::new();
+        reader.read_line(&mut reply).await.unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&reply).unwrap()["id"], "1");
+        reply.clear();
+        reader.read_line(&mut reply).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&reply).unwrap()["error"]["code"],
+            "ipc_unauthorized"
+        );
+        assert_eq!(task.await.unwrap(), Err("ipc_unauthorized"));
+        assert!(service.credentials.read().await.is_empty());
+        drop(service);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     use crate::provider::testwire::serve_once;
 
     const PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=";
 
     async fn service() -> (Service, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("gmgn-daemon-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-daemon-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let service = Service::new(Database::open(dir.clone(), None).unwrap()).unwrap();
         (service, dir)
@@ -1106,8 +1189,14 @@ mod tests {
 
         // 轴名不在契约里 / 高度与 height_meters 矛盾 ⇒ 各自的明确错误码。
         for (intent, code) in [
-            (json!({"axis": "width", "meters": 1.1, "source": "user"}), "invalid_size_intent"),
-            (json!({"axis": "height", "meters": 0.5, "source": "user"}), "size_intent_conflict"),
+            (
+                json!({"axis": "width", "meters": 1.1, "source": "user"}),
+                "invalid_size_intent",
+            ),
+            (
+                json!({"axis": "height", "meters": 0.5, "source": "user"}),
+                "size_intent_conflict",
+            ),
         ] {
             let mut params = submission("wish-2");
             params["heightMeters"] = json!(1.1);
@@ -1238,7 +1327,10 @@ mod tests {
     #[tokio::test]
     async fn providers_status_reports_the_bound_backend_without_network() {
         let (service, dir) = service().await;
-        let status = service.request("providers_status", json!({})).await.unwrap();
+        let status = service
+            .request("providers_status", json!({}))
+            .await
+            .unwrap();
         assert_eq!(status["provider"]["kind"], "remote_http");
         assert_eq!(status["provider"]["max_input_px"], 2048);
         assert_eq!(status["provider"]["uploads_data"], true);
@@ -1251,9 +1343,15 @@ mod tests {
             )
             .await
             .unwrap();
-        let submitted = service.request("submit", submission("wish-1")).await.unwrap();
+        let submitted = service
+            .request("submit", submission("wish-1"))
+            .await
+            .unwrap();
         let id = submitted["job"]["id"].as_str().unwrap().to_owned();
-        let status = service.request("providers_status", json!({})).await.unwrap();
+        let status = service
+            .request("providers_status", json!({}))
+            .await
+            .unwrap();
         assert_eq!(
             status["endpoints"],
             json!([
@@ -1263,7 +1361,10 @@ mod tests {
         );
         assert_eq!(status["endpoints"][1]["jobs"], 1);
         service.request("cancel", json!({"id": id})).await.unwrap();
-        let status = service.request("providers_status", json!({})).await.unwrap();
+        let status = service
+            .request("providers_status", json!({}))
+            .await
+            .unwrap();
         assert_eq!(status["endpoints"][1]["activeJobs"], 0);
         assert!(!serde_json::to_string(&status)
             .unwrap()
@@ -1284,7 +1385,10 @@ mod tests {
         )
         .await;
         let probed = service
-            .request("provider_probe", json!({"endpoint": origin, "inputPx": 2048}))
+            .request(
+                "provider_probe",
+                json!({"endpoint": origin, "inputPx": 2048}),
+            )
             .await
             .unwrap();
         let _ = server.await;
@@ -1299,7 +1403,10 @@ mod tests {
         )
         .await;
         let probed = service
-            .request("provider_probe", json!({"endpoint": origin, "inputPx": 2048}))
+            .request(
+                "provider_probe",
+                json!({"endpoint": origin, "inputPx": 2048}),
+            )
             .await
             .unwrap();
         let _ = server.await;
@@ -1317,7 +1424,10 @@ mod tests {
         )
         .await;
         let probed = service
-            .request("provider_probe", json!({"endpoint": origin, "inputPx": 2048}))
+            .request(
+                "provider_probe",
+                json!({"endpoint": origin, "inputPx": 2048}),
+            )
             .await
             .unwrap();
         let _ = server.await;
@@ -1335,7 +1445,10 @@ mod tests {
         .await;
         assert_eq!(
             service
-                .request("provider_probe", json!({"endpoint": origin, "inputPx": 2048}))
+                .request(
+                    "provider_probe",
+                    json!({"endpoint": origin, "inputPx": 2048})
+                )
                 .await,
             Err("invalid_provider_capabilities")
         );
@@ -1365,9 +1478,15 @@ mod tests {
     #[tokio::test]
     async fn failover_ipc_refuses_profile_drift_and_keeps_one_active_job() {
         let (service, dir) = service().await;
-        let submitted = service.request("submit", submission("wish-1")).await.unwrap();
+        let submitted = service
+            .request("submit", submission("wish-1"))
+            .await
+            .unwrap();
         let id = submitted["job"]["id"].as_str().unwrap().to_owned();
-        let source_key = submitted["job"]["idempotencyKey"].as_str().unwrap().to_owned();
+        let source_key = submitted["job"]["idempotencyKey"]
+            .as_str()
+            .unwrap()
+            .to_owned();
 
         assert_eq!(
             service
@@ -1403,12 +1522,17 @@ mod tests {
             replaced["job"]["workflowProfile"],
             "gmgn-mesh-v1;resolution=512;decimation=200000;texture_size=2048;remesh=true"
         );
-        assert_eq!(replaced["job"]["idempotencyKey"], format!("{source_key}-r1"));
+        assert_eq!(
+            replaced["job"]["idempotencyKey"],
+            format!("{source_key}-r1")
+        );
         let jobs = service.db.call(|s| s.all()).await.unwrap();
         assert_eq!(
             jobs.iter()
-                .filter(|value| value.job.source_wish_id.as_deref() == Some("wish-1")
-                    && model::is_active(&value.job))
+                .filter(
+                    |value| value.job.source_wish_id.as_deref() == Some("wish-1")
+                        && model::is_active(&value.job)
+                )
                 .count(),
             1
         );
@@ -1417,7 +1541,13 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_outbound_frames_are_rejected_before_writing() {
-        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
         let (_, writer) = socket.into_split();
         let writer = Arc::new(Mutex::new(writer));
         let drain = tokio::spawn(async move {
@@ -1441,17 +1571,22 @@ mod tests {
     /// 便于用 grep 直接验证 provider 层已经不存在。
     #[tokio::test]
     async fn local_memory_methods_report_local_fields_only() {
-        let dir = std::env::temp_dir().join(format!("gmgn-daemon-local-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-daemon-local-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let service = Service::new(Database::open(dir.clone(), None).unwrap()).unwrap();
         let scope = json!({"scope": {"worldID": "install", "residentScope": "install"}});
         assert_eq!(
-            service.request("memory_provider_configuration", json!({})).await,
+            service
+                .request("memory_provider_configuration", json!({}))
+                .await,
             Err("unknown_method")
         );
 
         assert_eq!(
-            service.request("memory_status", scope.clone()).await.unwrap(),
+            service
+                .request("memory_status", scope.clone())
+                .await
+                .unwrap(),
             json!({"memory": null, "pendingTurns": 0})
         );
         // 原文层已整体移除：这三个方法**必须给出一个说得出口的失败**，

@@ -4,11 +4,11 @@
 //!
 //! * **stdio** towards the MCP client (the agent host). The client spawns it on
 //!   demand and may kill it at any time.
-//! * **unix socket** towards `gmgn-taskd`, newline-delimited JSON, the daemon's
+//! * **authenticated loopback TCP** towards `gmgn-taskd`, newline-delimited JSON, the daemon's
 //!   existing protocol, untouched.
 //!
 //! It is deliberately **not** part of `gmgn-taskd`. The daemon holds an exclusive
-//! `flock` on its private root (`services/gmgn-taskd/src/main.rs`), so a second
+//! lock on its private root (`services/gmgn-taskd/src/main.rs`), so a second
 //! face inside it would make an MCP client restart reach into the authority. This
 //! process holds no database handle, no lock and no credential.
 //!
@@ -30,12 +30,13 @@ const USAGE: &str = "\
 gmgn-mcpd — MCP (stdio) face over the gmgn-taskd authority
 
 USAGE:
-    gmgn-mcpd --socket <absolute-taskd-socket> [--grant <absolute-grant.json>]
+    gmgn-mcpd --endpoint-file <absolute-taskd-endpoint.json> [--grant <absolute-grant.json>]
               [--server-name <name>] [--help]
     gmgn-mcpd --list-tools
 
 OPTIONS:
-    --socket <path>       gmgn-taskd unix socket. Required: this process has no
+    --endpoint-file <path> Private gmgn-taskd connection descriptor. Required.
+    --socket <path>       Compatibility alias for --endpoint-file; no Unix socket.
                           other way to reach the world, by design.
     --grant <path>        Armed-round grant document written by the host. When it
                           is absent the read-only tools still work and every
@@ -86,7 +87,7 @@ fn main() -> ExitCode {
                 );
                 return ExitCode::SUCCESS;
             }
-            "--socket" => match args.next() {
+            "--socket" | "--endpoint-file" => match args.next() {
                 Some(value) => socket = Some(PathBuf::from(value)),
                 None => return usage_error("--socket 需要一个路径"),
             },

@@ -439,7 +439,7 @@ mod tests {
     }
 
     fn temp_root(tag: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "gmgn-blob-verify-{tag}-{}",
             uuid::Uuid::new_v4()
         ));

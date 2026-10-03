@@ -182,12 +182,13 @@ struct WorldAuthorityProjection: Equatable, Sendable {
     }
 }
 
-/// 行分隔 JSON over UDS 的同步运输。
+/// 行分隔 JSON over authenticated loopback TCP 的 macOS 同步运输。
 ///
 /// 同一份合同（`{id, method, params}` → `{id, result|error}`），与
 /// `PropTaskDaemonClient` 走的是同一个 socket、同一帧上限（12 MiB）。
-final class UnixSocketJSONClient: @unchecked Sendable {
+final class LoopbackJSONClient: @unchecked Sendable {
     static let maximumFrame = 12 * 1024 * 1024
+    private struct Endpoint: Decodable { let version: Int; let address: String; let token: String }
 
     let socketPath: String
     let helperPath: String
@@ -213,9 +214,7 @@ final class UnixSocketJSONClient: @unchecked Sendable {
             return nextIdentifier
         }
         let request: [String: Any] = ["id": "world-\(identifier)", "method": method, "params": params]
-        let body = try JSONSerialization.data(withJSONObject: request)
-        guard body.count <= Self.maximumFrame else { throw WorldAuthorityError.invalidResponse }
-        let reply = try exchange(body)
+        let reply = try exchange(request)
         guard let object = try JSONSerialization.jsonObject(with: reply) as? [String: Any] else {
             throw WorldAuthorityError.invalidResponse
         }
@@ -243,9 +242,12 @@ final class UnixSocketJSONClient: @unchecked Sendable {
             return nextIdentifier
         }
         let request: [String: Any] = ["id": "world-\(identifier)", "method": method, "params": params]
-        let body = try JSONSerialization.data(withJSONObject: request)
-        let descriptor = try connectDescriptor()
+        let (descriptor, token) = try connectDescriptor()
         defer { close(descriptor) }
+        var authenticated = request
+        authenticated["auth"] = token
+        let body = try JSONSerialization.data(withJSONObject: authenticated)
+        guard body.count <= Self.maximumFrame else { throw WorldAuthorityError.invalidResponse }
         try writeFrame(descriptor, body)
         var frame = Data()
         var buffer = [UInt8](repeating: 0, count: 64 * 1024)
@@ -271,14 +273,18 @@ final class UnixSocketJSONClient: @unchecked Sendable {
 
     /// 打开一条连接、写一帧、读一帧、关掉。短连接让"没有订阅"的语义简单：
     /// 权威随时可用，Swift 不持有任何需要恢复的长连接状态。
-    private func exchange(_ body: Data) throws -> Data {
-        let descriptor = try connectDescriptor()
+    private func exchange(_ request: [String: Any]) throws -> Data {
+        let (descriptor, token) = try connectDescriptor()
         defer { close(descriptor) }
+        var authenticated = request
+        authenticated["auth"] = token
+        let body = try JSONSerialization.data(withJSONObject: authenticated)
+        guard body.count <= Self.maximumFrame else { throw WorldAuthorityError.invalidResponse }
         try writeFrame(descriptor, body)
         return try readFrame(descriptor)
     }
 
-    private func connectDescriptor() throws -> Int32 {
+    private func connectDescriptor() throws -> (Int32, String) {
         var lastError = "socket unavailable"
         let attempts = allowsLaunching ? 50 : 1
         var launched = false
@@ -298,36 +304,33 @@ final class UnixSocketJSONClient: @unchecked Sendable {
         throw WorldAuthorityError.unreachable(lastError)
     }
 
-    private func openSocket() -> Int32? {
-        guard socketPath.utf8.count < 104 else { return nil }
-        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+    private func openSocket() -> (Int32, String)? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: socketPath)),
+              let endpoint = try? JSONDecoder().decode(Endpoint.self, from: data) else { return nil }
+        let parts = endpoint.address.split(separator: ":")
+        guard endpoint.version == 1, parts.count == 2, parts[0] == "127.0.0.1",
+              let port = UInt16(parts[1]), port > 0,
+              let token = UUID(uuidString: endpoint.token), token.uuidString.dropFirst(14).first == "4" else { return nil }
+        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
         guard descriptor >= 0 else { return nil }
-        var address = sockaddr_un()
-        address.sun_family = sa_family_t(AF_UNIX)
-        address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
-        let bytes = Array(socketPath.utf8)
-        guard bytes.count < MemoryLayout.size(ofValue: address.sun_path) else {
-            close(descriptor)
-            return nil
-        }
-        withUnsafeMutablePointer(to: &address.sun_path) { pointer in
-            pointer.withMemoryRebound(to: CChar.self, capacity: bytes.count) { destination in
-                for (index, byte) in bytes.enumerated() { destination[index] = CChar(bitPattern: byte) }
-            }
-        }
+        var address = sockaddr_in()
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_port = port.bigEndian
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
         var tv = timeval(tv_sec: Int(self.timeout), tv_usec: 0)
         setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         let connected = withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
-                connect(descriptor, socketAddress, socklen_t(MemoryLayout<sockaddr_un>.size))
+                connect(descriptor, socketAddress, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
         guard connected == 0 else {
             close(descriptor)
             return nil
         }
-        return descriptor
+        return (descriptor, endpoint.token)
     }
 
     private func launchHelper() {
@@ -335,7 +338,7 @@ final class UnixSocketJSONClient: @unchecked Sendable {
         let root = URL(fileURLWithPath: socketPath).deletingLastPathComponent()
         let process = Process()
         process.executableURL = URL(fileURLWithPath: helperPath)
-        process.arguments = ["--root", root.path, "--socket", socketPath, "--concurrency", "2"]
+        process.arguments = ["--root", root.path, "--endpoint-file", socketPath, "--concurrency", "2"]
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         try? process.run()
@@ -377,7 +380,7 @@ final class WorldAuthorityClient: @unchecked Sendable {
     static let producer = "swift"
 
     let worldID: String
-    private let transport: UnixSocketJSONClient
+    private let transport: LoopbackJSONClient
     private let lock = NSLock()
     private var _projection = WorldAuthorityProjection()
 
@@ -397,7 +400,7 @@ final class WorldAuthorityClient: @unchecked Sendable {
 
     init(worldID: String, socketPath: String, helperPath: String, allowsLaunching: Bool = true) {
         self.worldID = worldID
-        self.transport = UnixSocketJSONClient(socketPath: socketPath, helperPath: helperPath,
+        self.transport = LoopbackJSONClient(socketPath: socketPath, helperPath: helperPath,
                                               allowsLaunching: allowsLaunching)
     }
 
@@ -638,7 +641,7 @@ final class WorldAuthorityClient: @unchecked Sendable {
 /// （`after = projection.lastAppliedSequence`），所以掉线期间的事实不会丢，
 /// 已经应用过的也不会二次应用（投影按 seq 去重）。
 final class WorldAuthoritySubscription: @unchecked Sendable {
-    private let transport: UnixSocketJSONClient
+    private let transport: LoopbackJSONClient
     private let params: @Sendable () -> [String: Any]
     private let onFact: @Sendable (WorldAuthorityFact) -> Void
     private let lock = NSLock()
@@ -651,7 +654,7 @@ final class WorldAuthoritySubscription: @unchecked Sendable {
         return running
     }
 
-    init(transport: UnixSocketJSONClient, params: @escaping @Sendable () -> [String: Any],
+    init(transport: LoopbackJSONClient, params: @escaping @Sendable () -> [String: Any],
          onFact: @escaping @Sendable (WorldAuthorityFact) -> Void) {
         self.transport = transport
         self.params = params

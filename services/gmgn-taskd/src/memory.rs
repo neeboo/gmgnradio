@@ -964,7 +964,7 @@ mod tests {
     }
 
     fn temp_db(prefix: &str) -> (std::path::PathBuf, Database) {
-        let dir = std::env::temp_dir().join(format!("gmgn-memory-{prefix}-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-memory-{prefix}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let database = Database::open(dir.clone(), None).unwrap();
         (dir, database)
@@ -1576,7 +1576,7 @@ mod tests {
     #[test]
     fn snapshot_survives_reopen_and_update_delete_on_temp_db() {
         let path =
-            std::env::temp_dir().join(format!("gmgn-memory-file-{}.sqlite", uuid::Uuid::new_v4()));
+            std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-memory-file-{}.sqlite", uuid::Uuid::new_v4()));
         {
             let mut connection = Connection::open(&path).unwrap();
             schema(&connection).unwrap();

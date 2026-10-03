@@ -1,21 +1,21 @@
-//! The one channel `gmgn-mcpd` has into the authority: the `gmgn-taskd` unix
-//! socket, newline-delimited JSON, exactly as the daemon already speaks it.
+//! The one channel into authority: a private authenticated loopback endpoint,
+//! with newline-delimited JSON. No storage access belongs in this process.
 //!
 //! There is deliberately no other backend here. The MCP process never opens the
 //! taskd private root, never links SQLite, and never takes `taskd.lock` — see
 //! `tests/no_direct_authority.rs`, which fails if any of those reappear. That is
 //! what makes "kill the MCP server" a non-event for the authority.
 
+use gmgn_protocol::{is_reply_to, reply_error_code, Endpoint};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::net::TcpStream;
 
-/// Same ceiling the daemon enforces on both directions
-/// (`services/gmgn-taskd/src/model.rs`: `FRAME_LIMIT = 12 * 1024 * 1024`).
+/// Shared ceiling the daemon enforces on both directions.
 /// A client that reads a longer frame than the authority would ever write is
 /// reading something that is not the authority.
-pub const FRAME_LIMIT: usize = 12 * 1024 * 1024;
+pub use gmgn_protocol::FRAME_LIMIT;
 
 /// A failure that came back from the authority, or the inability to reach it.
 ///
@@ -85,11 +85,18 @@ impl Client {
         id: u64,
     ) -> Result<Value, TaskdError> {
         let wire_id = id.to_string();
-        let stream = UnixStream::connect(&self.socket).await.map_err(|error| {
+        let bytes = std::fs::read(&self.socket).map_err(|error| {
+            TaskdError::Unavailable(format!("read endpoint: {error}"))
+        })?;
+        let endpoint: Endpoint = serde_json::from_slice(&bytes)
+            .map_err(|_| TaskdError::Protocol("invalid endpoint".to_owned()))?;
+        let address = endpoint.validate()
+            .map_err(|_| TaskdError::Protocol("invalid loopback endpoint".to_owned()))?;
+        let stream = TcpStream::connect(address).await.map_err(|error| {
             TaskdError::Unavailable(format!("connect {}: {error}", self.socket.display()))
         })?;
         let (read_half, mut write_half) = stream.into_split();
-        let request = json!({"id": wire_id, "method": method, "params": params});
+        let request = json!({"id": wire_id, "auth": endpoint.token, "method": method, "params": params});
         let mut bytes = serde_json::to_vec(&request)
             .map_err(|error| TaskdError::Protocol(format!("encode request: {error}")))?;
         bytes.push(b'\n');
@@ -115,17 +122,10 @@ impl Client {
             // Events and business messages are pushed on the same connection for
             // subscribers. This client never subscribes, but a reply that is not
             // addressed to this request must never be mistaken for one.
-            if value.get("event").is_some() || value.get("message").is_some() {
+            if !is_reply_to(&value, &wire_id) {
                 continue;
             }
-            if value.get("id").and_then(Value::as_str) != Some(wire_id.as_str()) {
-                continue;
-            }
-            if let Some(code) = value
-                .get("error")
-                .and_then(|error| error.get("code"))
-                .and_then(Value::as_str)
-            {
+            if let Some(code) = reply_error_code(&value) {
                 return Err(TaskdError::Code(code.to_owned()));
             }
             return Ok(value);
@@ -134,7 +134,7 @@ impl Client {
 }
 
 async fn read_frame(
-    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
 ) -> Result<Option<Vec<u8>>, TaskdError> {
     let mut frame = Vec::new();
     loop {

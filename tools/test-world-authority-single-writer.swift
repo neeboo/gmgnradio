@@ -143,8 +143,8 @@ let buildRoot = URL(fileURLWithPath: worldRuntimeFlags[1]).deletingLastPathCompo
 let objects = Array(worldRuntimeFlags.dropFirst(2))
 require(!objects.isEmpty, "WorldRuntime object files missing")
 
-let daemon = "services/gmgn-taskd/target/debug/gmgn-taskd"
-if !fileManager.fileExists(atPath: daemon) {
+let daemon = "target/debug/gmgn-taskd"
+do {
     let status = run("/usr/bin/env", ["cargo", "build", "--locked",
                                       "--manifest-path", "services/gmgn-taskd/Cargo.toml"])
     require(status == 0, "cargo build of services/gmgn-taskd failed (\(status))")
@@ -165,6 +165,7 @@ defer { try? fileManager.removeItem(at: temporary) }
 
 let driver = #"""
 import Foundation
+import Darwin
 import WorldRuntime
 
 // Independent S2/S3 verification probe. Drives the production Swift sources
@@ -196,9 +197,18 @@ func canonical(_ value: [String: Any]) -> String {
     static func section(_ title: String) { print("\n== \(title) ==") }
 
     static let fileManager = FileManager.default
-    // Short base: AF_UNIX sun_path is capped at 104 bytes, and a throwaway
-    // daemon root must fit under it.
-    static let base = URL(fileURLWithPath: "/tmp/gmgn-s23-\(UUID().uuidString.prefix(8))")
+    // Isolated throwaway authority root, never production Application Support.
+    // Foundation's resolvingSymlinksInPath deliberately shortens /private/var
+    // back to /var on macOS. taskd correctly rejects that symlink ancestor;
+    // use the physical POSIX path for this macOS-only fixture.
+    static let base: URL = {
+        guard let physical = realpath(NSTemporaryDirectory(), nil) else {
+            fatalError("cannot resolve isolated temporary directory")
+        }
+        defer { free(physical) }
+        return URL(fileURLWithPath: String(cString: physical))
+            .appendingPathComponent("gmgn-s23-\(UUID().uuidString.prefix(8))")
+    }()
     static var daemons: [Process] = []
     static var manifest: WorldManifest!
 
@@ -212,14 +222,14 @@ func canonical(_ value: [String: Any]) -> String {
     static func startWorld(tag: String, legacyText: String) throws -> World {
         let root = base.appendingPathComponent("root-\(tag)/TaskService", isDirectory: true)
         try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
-        let socketPath = root.appendingPathComponent("taskd.sock").path
+        let socketPath = root.appendingPathComponent("taskd.endpoint.json").path
         let support = base.appendingPathComponent("support-\(tag)", isDirectory: true)
         try fileManager.createDirectory(at: support, withIntermediateDirectories: true)
         let legacyURL = support.appendingPathComponent("state.json")
         try Data(legacyText.utf8).write(to: legacyURL)
         let process = Process()
         process.executableURL = daemonBinary
-        process.arguments = ["--root", root.path, "--socket", socketPath, "--concurrency", "2"]
+        process.arguments = ["--root", root.path, "--endpoint-file", socketPath, "--concurrency", "2"]
         let logURL = base.appendingPathComponent("daemon-\(tag).log")
         fileManager.createFile(atPath: logURL.path, contents: nil)
         let log = try FileHandle(forWritingTo: logURL)
@@ -259,7 +269,7 @@ func canonical(_ value: [String: Any]) -> String {
         (try? fileManager.attributesOfItem(atPath: url.path)[.modificationDate]) as? Date
     }
 
-    static var daemonBinary = URL(fileURLWithPath: "services/gmgn-taskd/target/debug/gmgn-taskd")
+    static var daemonBinary = URL(fileURLWithPath: "target/debug/gmgn-taskd")
     static var exportStateURL = URL(fileURLWithPath:
         "backups/world-state-migration/20261001T061021Z/state/marble-living-cabin/1.2.0/state.json")
 
@@ -542,7 +552,7 @@ func canonical(_ value: [String: Any]) -> String {
         // MARK: J. authority unreachable ⇒ read-only downgrade, never a local write
 
         section("J. 权威不可达：只读降级 / fail-closed")
-        let deadSocket = base.appendingPathComponent("dead/taskd.sock").path
+        let deadSocket = base.appendingPathComponent("dead/taskd.endpoint.json").path
         let orphan = LegacyWorldStatePreImage(
             archive: AtomicJSONWorldStatePersistence(fileURL: world1.legacyURL),
             candidateURLs: [world1.legacyURL])
@@ -584,9 +594,9 @@ func canonical(_ value: [String: Any]) -> String {
         let endpoint = WorldAuthorityEndpoint(applicationSupportBase: nil, bundle: Bundle.main)
         print("       socket=\(endpoint.socketPath)")
         print("       helper=\(endpoint.helperPath)")
-        check(endpoint.socketPath.hasSuffix("gmgn radio/TaskService/taskd.sock"),
+        check(endpoint.socketPath.hasSuffix("gmgn radio/TaskService/taskd.endpoint.json"),
               "production socket path matches PropTaskDaemonClient's default")
-        let liveSocket = ("~/Library/Application Support/gmgn radio/TaskService/taskd.sock" as NSString)
+        let liveSocket = ("~/Library/Application Support/gmgn radio/TaskService/taskd.endpoint.json" as NSString)
             .expandingTildeInPath
         check(endpoint.socketPath == liveSocket, "endpoint resolves to the live daemon socket")
 

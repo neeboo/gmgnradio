@@ -41,7 +41,7 @@ const ERROR_CODES: &[&str] = &[
     "authoritative_size_conflicts_with_intent", "blob_hash_mismatch",
     "blob_outside_private_root", "client_disconnected", "client_timeout",
     "collision_integrity_failed", "collision_not_supported", "compaction_rejected",
-    "duplicate_active_source_wish", "embedding_dimension_mismatch", "fact_payload_too_large",
+    "duplicate_active_source_wish", "embedding_dimension_mismatch", "endpoint_unavailable", "fact_payload_too_large",
     "fallback_profile_mismatch_would_change_collision_box", "frame_too_large",
     "generation_not_ready", "history_record_too_large", "history_unavailable",
     "http_unavailable", "idempotency_conflict", "image_integrity_failed", "import_conflict",
@@ -67,7 +67,8 @@ const ERROR_CODES: &[&str] = &[
     "invalid_world_blob_put", "invalid_world_commit", "invalid_world_cursors",
     "invalid_world_facts", "invalid_world_facts_read", "invalid_world_id",
     "invalid_world_import", "invalid_world_records", "invalid_world_snapshot",
-    "invalid_world_state", "legacy_integrity_failed", "legacy_unavailable", "limit_exceeded",
+    "invalid_world_state",
+    "ipc_unauthorized", "legacy_integrity_failed", "legacy_unavailable", "limit_exceeded",
     "memory_conflict", "memory_history_unavailable", "memory_original_text_layer_removed",
     "memory_request_conflict", "memory_snapshot_too_large", "memory_storage_failed",
     "message_id_conflict", "message_not_found", "message_payload_too_large",
@@ -83,7 +84,8 @@ const ERROR_CODES: &[&str] = &[
     "socket_unavailable", "source_task_still_active", "state_value_too_large",
     "storage_unavailable", "subject_revision_regression", "subscription_failed",
     "task_not_found", "terminal_remote_task", "too_many_facts", "unknown_method",
-    "unsafe_download", "unsafe_legacy_path", "unsafe_path", "unsafe_socket_path",
+    "unsafe_download",
+    "unsafe_endpoint_path", "unsafe_legacy_path", "unsafe_path",
     "worker_failed", "world_fact_unreadable", "world_id_mismatch", "world_record_too_large",
     "world_record_unreadable", "world_request_unreadable"
 ];

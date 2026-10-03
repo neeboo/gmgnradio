@@ -731,7 +731,7 @@ mod tests {
 
     fn temp_root() -> std::path::PathBuf {
         let root =
-            std::env::temp_dir().join(format!("gmgn-provider-{}", uuid::Uuid::new_v4().simple()));
+            std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-provider-{}", uuid::Uuid::new_v4().simple()));
         files::directory(&root).unwrap();
         root
     }

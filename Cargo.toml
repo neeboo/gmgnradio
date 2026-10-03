@@ -15,7 +15,7 @@
 # not be able to perturb the authority.
 [workspace]
 resolver = "2"
-members = ["services/gmgn-taskd", "services/gmgn-mcpd"]
+members = ["services/gmgn-taskd", "services/gmgn-mcpd", "services/gmgn-protocol", "services/gmgn-voice-core"]
 
 # A member's own `[profile.*]` is ignored once it belongs to a workspace, so the
 # values that used to shape the shipped `gmgn-taskd` release binary are declared

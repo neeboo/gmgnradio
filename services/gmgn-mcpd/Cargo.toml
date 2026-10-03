@@ -10,6 +10,7 @@ name = "gmgn-mcpd"
 path = "src/main.rs"
 
 [dependencies]
+gmgn-protocol = { path = "../gmgn-protocol" }
 # The official Rust MCP SDK. `transport-io` is the server-side stdio transport;
 # `server` + `macros` give the `#[tool]` / `#[tool_router]` surface the design
 # plan pins (docs/plans/2026-10-02-rust-world-authority-and-mcp.md §6.1).

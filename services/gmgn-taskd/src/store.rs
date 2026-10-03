@@ -708,7 +708,7 @@ mod tests {
     const PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=";
 
     fn new_store() -> (Store, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("gmgn-failover-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-failover-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::open(dir.clone(), watch::channel(0).0).unwrap();
         (store, dir)
@@ -1022,7 +1022,7 @@ mod tests {
     fn migration_preserves_v1_database_and_enables_resident_ops() {
         use crate::resident::{self, CommitRequest, Item, Scope};
         use serde_json::json;
-        let dir = std::env::temp_dir().join(format!("gmgn-migrate-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-migrate-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tasks.sqlite3");
         let job_id = "91B2F6C2-96EE-4D4B-8593-7E9EBFC18263";

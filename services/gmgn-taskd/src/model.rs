@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 pub type Result<T> = std::result::Result<T, &'static str>;
 pub const PNG_LIMIT: usize = 8 * 1024 * 1024;
 pub const MODEL_LIMIT: usize = 32 * 1024 * 1024;
-pub const FRAME_LIMIT: usize = 12 * 1024 * 1024;
+pub use gmgn_protocol::FRAME_LIMIT;
 /// 碰撞代理的文件上限。代理只用来做"胶囊 × 三角形"的实时判定，它**必须**是小规模的：
 /// 4 MiB 已经远超一个几千面凸包的需要，再大就说明生成侧导出的是完整网格而不是代理。
 pub const COLLIDER_LIMIT: usize = 4 * 1024 * 1024;

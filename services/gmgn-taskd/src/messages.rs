@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn unacknowledged_message_and_sequence_survive_reopen() {
         let path =
-            std::env::temp_dir().join(format!("gmgn-message-test-{}.sqlite", Uuid::new_v4()));
+            std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-message-test-{}.sqlite", Uuid::new_v4()));
         let first;
         {
             let mut connection = Connection::open(&path).unwrap();

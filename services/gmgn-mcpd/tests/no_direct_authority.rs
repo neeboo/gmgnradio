@@ -2,9 +2,8 @@
 //!
 //! The claim is structural, not a matter of timing: `gmgn-mcpd` cannot hold the
 //! authority's state because it never opens it. `gmgn-taskd` keeps its world in
-//! a SQLite database under a private root guarded by an exclusive `flock`
-//! (`services/gmgn-taskd/src/main.rs`), and its only supported way in is the unix
-//! socket the daemon owns.
+//! a SQLite database under a private root guarded by an exclusive portable lock.
+//! Its only supported way in is the authenticated loopback endpoint it owns.
 //!
 //! This test fails the moment somebody gives the MCP process a direct path in —
 //! a database handle, the lock, or the storage crate. That is the injection this
@@ -129,12 +128,12 @@ fn the_manifest_does_not_depend_on_the_storage_stack() {
             "gmgn-mcpd 的依赖里出现了 `{forbidden}`：它不该有能力直接碰权威存储"
         );
     }
-    // It does need exactly one transport to the authority, and no network stack.
+    // It needs one loopback transport; no HTTP server/client stack belongs here.
     assert!(manifest.contains("rmcp"));
     for forbidden in ["reqwest", "hyper", "axum", "tiny_http", "warp"] {
         assert!(
             !manifest.contains(forbidden),
-            "gmgn-mcpd 引入了网络栈 `{forbidden}`：本设计明确不新增端口"
+            "gmgn-mcpd 引入了 HTTP 栈 `{forbidden}`：仅允许 taskd 的 loopback 通道"
         );
     }
 }
@@ -145,16 +144,16 @@ fn the_only_way_into_the_world_is_the_daemon_socket() {
     // client has exactly one constructor and one call path.
     let client = std::fs::read_to_string(crate_root().join("src/taskd.rs")).unwrap();
     assert!(
-        client.contains("UnixStream::connect"),
-        "the transport must be the unix socket the daemon owns"
+        client.contains("TcpStream::connect") && client.contains("Endpoint"),
+        "the transport must use the daemon-owned authenticated endpoint"
     );
     assert!(
-        !client.contains("TcpStream") && !client.contains("TcpListener"),
-        "the MCP face must not open a TCP connection"
+        !client.contains("UnixStream") && !client.contains("TcpListener"),
+        "the MCP face cannot use Unix transport or listen itself"
     );
 
     // And the MCP face opens no listener of its own: stdio only. (The *tests*
-    // stand up a unix listener to play the daemon; the product must not.)
+    // stand up a loopback listener to play the daemon; the product must not.)
     let product: String = scanned_sources()
         .iter()
         .map(|(_, text)| text.as_str())
@@ -175,7 +174,7 @@ fn the_only_way_into_the_world_is_the_daemon_socket() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        tests.contains("UnixListener::bind"),
+        tests.contains("TcpListener::bind"),
         "the integration test must exercise a real socket peer"
     );
 }

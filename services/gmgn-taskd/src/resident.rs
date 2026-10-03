@@ -1031,7 +1031,7 @@ mod tests {
 
     #[test]
     fn message_consumers_are_independent_and_acks_survive_reopen() {
-        let path = std::env::temp_dir().join(format!("gmgn-resident-{}.sqlite", Uuid::new_v4()));
+        let path = std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-resident-{}.sqlite", Uuid::new_v4()));
         let message_id;
         let sequence;
         {
@@ -1402,7 +1402,7 @@ mod tests {
 
     #[tokio::test]
     async fn racing_commits_with_same_expected_and_value_only_one_wins() {
-        let dir = std::env::temp_dir().join(format!("gmgn-resident-race-{}", Uuid::new_v4()));
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-resident-race-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let database = crate::store::Database::open(dir.clone(), None).unwrap();
         let seeded = database

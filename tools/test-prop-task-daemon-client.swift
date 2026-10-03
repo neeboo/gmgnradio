@@ -7,7 +7,10 @@ let sources = ["PropGenerationClient", "PropImagePreparation", "PropGenerationSt
 let fixture = #"""
 import socket,threading,json,os,time,sys,uuid
 root,path=sys.argv[1:]
-server=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);server.bind(path);os.chmod(path,0o600);server.listen()
+server=socket.socket(socket.AF_INET,socket.SOCK_STREAM);server.bind(('127.0.0.1',0));server.listen()
+auth=str(uuid.uuid4())
+with open(path,'w') as f:json.dump({'version':1,'address':'127.0.0.1:'+str(server.getsockname()[1]),'token':auth},f)
+os.chmod(path,0o600)
 lock=threading.RLock(); jobs={};events=[]; messages={};acks=set();connections=[];subscriptions=[];snapshots={};seq=0;msgseq=0
 def send(c,value):
  try:
@@ -20,6 +23,7 @@ def event(job):
   for c in connections: send(c,{'event':e})
 def handle(c,q):
  global msgseq
+ assert q.get('auth')==auth,'request authentication missing'
  p=q['params'];m=q['method'];r={}
  if m=='configure': r={'configured':True}
  elif m=='snapshot':

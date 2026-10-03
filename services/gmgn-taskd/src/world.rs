@@ -2314,7 +2314,7 @@ mod tests {
     #[test]
     fn blob_put_is_content_addressed_and_verifies_the_hash() {
         let connection = setup();
-        let root = std::env::temp_dir().join(format!("gmgn-world-blob-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-world-blob-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let bytes = b"glTF\x02\x00\x00\x00 fake model bytes";
         let path = root.join("model.glb");
@@ -2356,7 +2356,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(code, "blob_hash_mismatch");
         // and bytes outside the private root are refused by path, not by hash
-        let outside = std::env::temp_dir().join(format!("gmgn-outside-{}", uuid::Uuid::new_v4()));
+        let outside = std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-outside-{}", uuid::Uuid::new_v4()));
         std::fs::write(&outside, bytes).unwrap();
         let code = blob_put(&connection, &root, &BlobPutRequest {
             sha256: digest_text_bytes(bytes),
@@ -2374,7 +2374,7 @@ mod tests {
     fn blob_get_reports_a_missing_local_file_and_appends_a_visible_fact() {
         let mut connection = setup();
         import(&mut connection, "import-1", fixture()).unwrap();
-        let root = std::env::temp_dir().join(format!("gmgn-world-blob-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-world-blob-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let bytes = b"glTF\x02\x00\x00\x00 fake model bytes";
         let path = root.join("model.glb");
@@ -2444,7 +2444,7 @@ mod tests {
     #[test]
     fn blob_get_reports_a_truncated_local_file_as_corrupt() {
         let connection = setup();
-        let root = std::env::temp_dir().join(format!("gmgn-world-blob-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-world-blob-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let bytes = b"glTF\x02\x00\x00\x00 fake model bytes";
         let path = root.join("model.glb");
