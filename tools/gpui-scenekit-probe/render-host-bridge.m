@@ -35,8 +35,13 @@ int probe_production_requested(void) {
     const char *root = getenv("GMGN_RENDER_HOST_DATA_ROOT");
     const char *suite = getenv("GMGN_RENDER_HOST_DEFAULTS_SUITE");
     const char *backend = getenv("GMGN_PROBE_CHAT_BACKEND");
-    if (backend && strcmp(backend, "codex") != 0 && strcmp(backend, "claude-code") != 0)
-        failConfiguration("chat backend must explicitly be codex or claude-code");
+    if (backend && strcmp(backend, "dsh") != 0)
+        failConfiguration("chat backend must be the existing dsh agent");
+    const char *disabled = getenv("GMGN_PROBE_CHAT_DISABLED");
+    if (disabled && strcmp(disabled, "1") != 0)
+        failConfiguration("chat disabled diagnostic must explicitly equal 1");
+    if (backend && disabled)
+        failConfiguration("chat backend and disabled diagnostic conflict");
     BOOL required = [NSBundle.mainBundle objectForInfoDictionaryKey:@"GMGNProductionRenderHostRequired"] != nil;
     BOOL any = library || root || suite || required || backend;
     if (!any) return 0;
@@ -65,7 +70,7 @@ void probe_production_attach(NSView *container, BOOL fullStage) {
     LOAD_HOST_SYMBOL(hostDiagnostics, "gmgn_render_host_diagnostics");
     LOAD_HOST_SYMBOL(freeHostString, "gmgn_render_host_string_free");
     LOAD_HOST_SYMBOL(destroyHost, "gmgn_render_host_destroy");
-    if (getenv("GMGN_PROBE_CHAT_BACKEND")) {
+    if (!getenv("GMGN_PROBE_CHAT_DISABLED")) {
         LOAD_HOST_SYMBOL(configureChat, "gmgn_render_host_chat_configure");
         LOAD_HOST_SYMBOL(sendChat, "gmgn_render_host_chat_send");
         LOAD_HOST_SYMBOL(cancelChat, "gmgn_render_host_chat_cancel");
@@ -86,10 +91,10 @@ void probe_production_attach(NSView *container, BOOL fullStage) {
         failConfiguration("host view is not attached to the isolated container");
     NSLog(@"PROBE_RENDER_HOST_ATTACHED mode=%@ fixtureFallback=0", fullStage ? @"fullStage" : @"liveCam");
     if (configureChat) {
-        if (configureChat(hostHandle, getenv("GMGN_PROBE_CHAT_BACKEND")) != 1)
-            failConfiguration("explicit chat backend configuration failed");
+        if (configureChat(hostHandle, "dsh") != 1)
+            failConfiguration("existing dsh agent configuration failed");
         chatConfigured = YES;
-        NSLog(@"PROBE_CHAT_BACKEND_CONFIGURED deliveryMode=final-response");
+        NSLog(@"PROBE_CHAT_BACKEND_CONFIGURED backend=dsh deliveryMode=final-response");
     }
 }
 

@@ -10,7 +10,8 @@ char *gmgn_render_host_diagnostics(void *handle);
 void gmgn_render_host_string_free(char *string);
 int32_t gmgn_render_host_destroy(void *handle);
 // Optional real conversation adapter. Never starts a backend by default.
-// backend: "codex" or "claude-code". No world tools; final response, not tokens.
+// backend: "dsh" (the existing native ACP Agent). No headless fallback or keys.
+// No world tools; final response, not tokens.
 int32_t gmgn_render_host_chat_configure(void *handle, const char *backend);
 int32_t gmgn_render_host_chat_send(void *handle, uint64_t request_id, const char *text);
 int32_t gmgn_render_host_chat_cancel(void *handle, uint64_t request_id);

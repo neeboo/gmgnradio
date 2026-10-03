@@ -6,7 +6,11 @@ import Foundation
 @MainActor
 final class RenderHostResidentConversation {
     let backend: String
-    private let service: AgentConversationService
+    private var service: AgentConversationService
+    private var connector: RenderHostDSHConnector
+    private let dataRoot: URL
+    private let defaults: UserDefaults
+    private var rebuildConnection = false
     private var task: Task<Void, Never>?
     private var generation: UInt64 = 0
     private var sequence: UInt64 = 0
@@ -21,23 +25,29 @@ final class RenderHostResidentConversation {
 
     init(backend: String, dataRoot: URL, defaults: UserDefaults) throws {
         self.backend = backend
-        let directory = dataRoot.appendingPathComponent("chat/cwd", isDirectory: true)
-        let codexHome = dataRoot.appendingPathComponent("chat/codex", isDirectory: true)
-        for url in [directory, codexHome] {
-            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true,
-                                                    attributes: [.posixPermissions: 0o700])
-        }
-        let environment = RenderHostCodexRunner.environment(codexHome: codexHome)
-        service = AgentConversationService(
+        guard backend == "dsh" else { throw RenderHostDSHConnectionError.unsupportedBackend }
+        let directory = dataRoot.appendingPathComponent("chat", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        self.dataRoot = directory
+        self.defaults = defaults
+        let connector = try RenderHostDSHConnector(dataRoot: directory)
+        self.connector = connector
+        service = Self.makeService(connector: connector, defaults: defaults)
+    }
+
+    private static func makeService(connector: RenderHostDSHConnector, defaults: UserDefaults) -> AgentConversationService {
+        let service = AgentConversationService(
             defaults: defaults,
-            runnerFactory: { executable in
-                RenderHostCodexRunner(executable: executable, directory: directory, environment: environment)
-            },
+            // Fail closed if a future service change attempts a CLI fallback.
+            runnerFactory: { _ in RenderHostForbiddenHeadlessRunner() },
+            residentDSHImageConnector: connector,
             useResidentAgent: false
         )
-        service.selectBackend(backend == "codex" ? .codex : .claudeCode)
+        service.selectBackend(.dsh)
         service.setAutoSpeakReplies(false)
         service.resetSession()
+        return service
     }
 
     func send(requestID: UInt64, text: String) -> Bool {
@@ -50,6 +60,17 @@ final class RenderHostResidentConversation {
             enqueue(kind: "failure", requestID: requestID, message: "请先输入消息。")
             return false
         }
+        if rebuildConnection {
+            do {
+                let replacement = try RenderHostDSHConnector(dataRoot: dataRoot)
+                connector = replacement
+                service = Self.makeService(connector: replacement, defaults: defaults)
+                rebuildConnection = false
+            } catch {
+                enqueue(kind: "failure", requestID: requestID, message: error.localizedDescription)
+                return false
+            }
+        }
         generation &+= 1
         let lease = generation
         activeSubmission = submission
@@ -59,18 +80,16 @@ final class RenderHostResidentConversation {
         statusNotice = nil
         recovery = ResidentDraftRecovery()
         enqueue(kind: "accepted", requestID: requestID, text: submission.text)
-        // Each Codex invocation has an ephemeral isolated session. Preserve
-        // only our actual bounded conversation text, never an unrelated session.
+        // The native ACP session keeps its real continuity; only a newly
+        // rebuilt session receives this bounded actual-history bootstrap.
         let previous = Array(transcript.suffix(12))
-        let prompt = backend == "codex" && !previous.isEmpty
-            ? previous.map { "\($0.role.rawValue): \($0.text)" }.joined(separator: "\n")
-                + "\nuser: " + submission.text
-            : submission.text
-        if backend == "codex" { service.resetSession() }
+        // Cancellation can replace the service before this Task resumes.
+        // Every old operation must retain only its original service/connector.
+        let turnService = service
         task = Task { [weak self] in
             guard let self else { return }
             do {
-                let response = try await service.send(prompt, history: previous, userMessage: submission.text)
+                let response = try await turnService.send(submission.text, history: previous, userMessage: submission.text)
                 guard lease == generation, !Task.isCancelled else { return }
                 reply = response
                 transcript += [.init(role: .user, text: submission.text), .init(role: .agent, text: response)]
@@ -86,7 +105,7 @@ final class RenderHostResidentConversation {
                 statusNotice = notice
                 enqueue(kind: error is CancellationError ? "cancelled" : "failure",
                         requestID: requestID, message: notice,
-                        category: (error as? RenderHostConversationFailure)?.rawValue)
+                        category: error is RenderHostDSHConnectionError ? "config" : "connection")
                 activeSubmission = nil
                 activeRequestID = nil
                 task = nil
@@ -103,6 +122,9 @@ final class RenderHostResidentConversation {
         generation &+= 1
         task?.cancel()
         service.cancel()
+        service.resetSession()
+        connector.close()
+        rebuildConnection = true
         task = nil
         activeSubmission = nil
         activeRequestID = nil
@@ -110,6 +132,12 @@ final class RenderHostResidentConversation {
         statusNotice = "已停止本次回复。"
         enqueue(kind: "cancelled", requestID: cancelledID, message: statusNotice)
         return true
+    }
+
+    func close() {
+        cancel()
+        service.resetSession()
+        connector.close()
     }
 
     var state: [String: Any] {
@@ -138,78 +166,83 @@ final class RenderHostResidentConversation {
     }
 }
 
-/// Only safe categories leave the process boundary. Raw CLI output remains
-/// in memory and never becomes a UI message, log line, or persisted document.
-enum RenderHostConversationFailure: String, Error, LocalizedError {
-    case auth, model, network, rate, config, unknown
-
+enum RenderHostDSHConnectionError: Error, LocalizedError {
+    case unavailable, unsupportedBackend, headlessForbidden
     var errorDescription: String? {
         switch self {
-        case .auth: "当前接口凭证不可用，请检查应用启动环境里的 API 配置。消息已保留。"
-        case .model: "当前模型不可用，请检查所选模型和接口权限。消息已保留。"
-        case .network: "暂时连不上对话服务，请检查网络后重试。消息已保留。"
-        case .rate: "对话服务当前额度不足或请求过于频繁，请稍后重试。消息已保留。"
-        case .config: "对话连接配置未能通过检查。消息已保留，请修正配置后重试。"
-        case .unknown: "对话服务没有完成本次回复，消息已保留，请重试。"
+        case .unavailable: "现有 Agent 的原生连接尚未就绪，请检查 DeepSeek Harness 安装。"
+        case .unsupportedBackend: "当前界面只连接现有 DeepSeek Harness Agent。"
+        case .headlessForbidden: "原生 Agent 连接未能完成，消息已保留；不会切换到其他连接方式。"
         }
-    }
-
-    static func classify(_ output: String) -> Self {
-        let text = output.lowercased()
-        if ["rate_limit", "rate limit", "too many requests", "429", "insufficient_quota", "quota exceeded"].contains(where: text.contains) { return .rate }
-        if ["model_not_found", "model not found", "unsupported model", "does not exist", "model is not supported", "invalid model"].contains(where: text.contains) { return .model }
-        if ["unauthorized", "401", "invalid_api_key", "incorrect api key", "authentication", "not logged in", "missing api key", "missing bearer"].contains(where: text.contains) { return .auth }
-        if ["connection refused", "connection reset", "timed out", "timeout", "dns", "failed to connect", "network", "error sending request", "stream disconnected"].contains(where: text.contains) { return .network }
-        if ["invalid configuration", "unknown variant", "unrecognized", "unexpected argument", "error parsing", "invalid value", "config.toml", "unsupported feature"].contains(where: text.contains) { return .config }
-        return .unknown
     }
 }
 
-/// Reuses the existing bounded, cancellable process operation, but only its
-/// generic Process mechanics; these arguments still execute real Codex and
-/// AgentConversationService parses its actual JSON result.
-private struct RenderHostCodexRunner: CodexCommandRunning {
-    let executable: URL
-    let directory: URL
-    let environment: [String: String]
+private struct RenderHostForbiddenHeadlessRunner: CodexCommandRunning {
+    func run(arguments: [String], standardInput: String?) async throws -> CodexCommandResult {
+        throw RenderHostDSHConnectionError.headlessForbidden
+    }
+}
 
-    static func environment(codexHome: URL) -> [String: String] {
-        let inherited = ProcessInfo.processInfo.environment
-        let allowed = Set(["PATH", "HOME", "TMPDIR", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL",
-                           "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR",
-                           "OPENAI_API_KEY"])
-        var result = inherited.filter { allowed.contains($0.key) }
-        result["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + (result["PATH"] ?? "")
-        result["CODEX_HOME"] = codexHome.path
-        result["CODEX_EXEC_SERVER_URL"] = "none"
-        return result
+/// A lifecycle/cwd adapter around the real production ACP connector. It owns
+/// no authentication policy, key or provider override. Composition emission,
+/// verification, mounted modules and managed credentials remain production DSH.
+@MainActor
+private final class RenderHostDSHConnector: ResidentDSHImageConnecting {
+    private let node: URL
+    private let entry: URL
+    private let dataRoot: URL
+    private var native: ResidentDSHConnector?
+    private var sandbox: ResidentDSHSandbox?
+
+    init(dataRoot: URL) throws {
+        guard let transport = ResidentDSHComposition.locateNativeTransport(using: AgentExecutableLocator()) else {
+            throw RenderHostDSHConnectionError.unavailable
+        }
+        self.node = transport.node
+        self.entry = transport.entry
+        self.dataRoot = dataRoot
     }
 
-    func run(arguments: [String], standardInput: String?) async throws -> CodexCommandResult {
-        guard arguments.first == "exec", !arguments.contains("resume") else {
-            throw ResidentCodexPolicyError.unsafeConfiguration
+    var isUsable: Bool { native?.isUsable ?? true }
+
+    func openSession(cwd: URL) async throws -> ResidentDSHSessionHandle {
+        close()
+        try Task.checkCancellation()
+        let box = try ResidentDSHComposition.makeResidentSandbox(resolvingFrom: entry, rootDirectory: dataRoot)
+        let connection = ResidentDSHConnector(nodeExecutable: node, entryPoint: entry,
+            compositionFileURL: box.compositionFileURL, requestTimeout: 120)
+        sandbox = box
+        native = connection
+        do {
+            // The service's injected-connector fallback cwd is intentionally
+            // ignored: both the Process and ACP session use the owned sandbox.
+            let handle = try await connection.openSession(cwd: box.workspace)
+            guard native === connection, !Task.isCancelled else { throw CancellationError() }
+            return handle
+        } catch {
+            if native === connection {
+                close()
+            } else {
+                // A cancelled handshake can finish after a replacement has
+                // started. Release only the old operation's owned resources.
+                connection.close()
+                box.removeAll()
+            }
+            throw error
         }
-        guard environment["OPENAI_API_KEY"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
-            throw RenderHostConversationFailure.auth
-        }
-        // These flags and feature names were verified against this host's
-        // `codex exec --help` and `codex features list`, not assumed from docs.
-        let features = ["plugins", "apps", "hooks", "multi_agent", "multi_agent_v2", "shell_tool", "image_generation"]
-        var safe = ["exec", "--sandbox", "read-only", "--cd", directory.path,
-                    "--ephemeral", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check"]
-        safe += features.flatMap { ["--disable", $0] }
-        safe += ["-c", "cli_auth_credentials_store=\"file\"", "-c", "mcp_oauth_credentials_store=\"file\"",
-                 "-c", "mcp_servers={}", "-c", "notify=[]", "-c", "agents.enabled=false"]
-        // The built-in OpenAI provider may select stored ChatGPT/API auth.
-        // This explicit provider bypasses auth-store selection entirely and
-        // resolves only the already supplied environment API key.
-        safe += ["-c", "model_provider=\"gmgn_probe_openai\"",
-                 "-c", "model_providers.gmgn_probe_openai={name=\"OpenAI API\",base_url=\"https://api.openai.com/v1\",env_key=\"OPENAI_API_KEY\",wire_api=\"responses\",requires_openai_auth=false}"]
-        safe += Array(arguments.dropFirst())
-        let result = try await ResidentClaudeProcessRunner(executableURL: executable,
-            environment: environment, workingDirectoryURL: directory).run(arguments: safe, standardInput: standardInput)
-        guard result.exitCode == 0 else { throw RenderHostConversationFailure.classify(result.output) }
-        return result
+    }
+
+    func prompt(sessionID: String, blocks: [ResidentDSHPromptBlock]) async throws -> String {
+        guard let native else { throw ResidentDSHTransportError.notConnected }
+        return try await native.prompt(sessionID: sessionID, blocks: blocks)
+    }
+    func cancelActivePrompt() { native?.cancelActivePrompt() }
+    func awaitCancellationSettled() async { await native?.awaitCancellationSettled() }
+    func close() {
+        native?.close()
+        native = nil
+        sandbox?.removeAll()
+        sandbox = nil
     }
 }
 
@@ -224,11 +257,11 @@ func gmgnRenderHostChatConfigure(_ pointer: UnsafeMutableRawPointer?, _ backendP
     guard Thread.isMainThread, let pointer, let backendPointer else { return 0 }
     let address = UInt(bitPattern: pointer)
     let backend = String(cString: backendPointer)
-    guard ["codex", "claude-code"].contains(backend) else { return 0 }
+    guard backend == "dsh" else { return 0 }
     return MainActor.assumeIsolated {
         let host = Unmanaged<GPUIRenderHost>.fromOpaque(UnsafeMutableRawPointer(bitPattern: address)!).takeUnretainedValue()
         do {
-            host.chat?.cancel()
+            host.chat?.close()
             host.chat = try RenderHostResidentConversation(backend: backend, dataRoot: host.dataRoot, defaults: host.defaults)
             return 1
         } catch { return 0 }

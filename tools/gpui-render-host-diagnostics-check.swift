@@ -1,26 +1,20 @@
 import Foundation
 @testable import GPUIRenderHost
 
-// Offline classifier checks. These are synthetic errors, never raw provider
-// diagnostics or credentials. No model request or render-host create occurs.
-let examples: [(String, RenderHostConversationFailure)] = [
-    ("HTTP 401 unauthorized", .auth),
-    ("invalid_api_key", .auth),
-    ("model_not_found", .model),
-    ("unsupported model", .model),
-    ("error sending request: network unreachable", .network),
-    ("stream disconnected", .network),
-    ("HTTP 429 insufficient_quota", .rate),
-    ("error parsing config.toml", .config),
-    ("unexpected argument", .config),
-    ("opaque failure", .unknown),
-    ("", .unknown),
-]
-for (input, expected) in examples {
-    precondition(RenderHostConversationFailure.classify(input) == expected)
+// Offline production-DSH policy checks. Every input below is synthetic;
+// this never reads credentials, creates a render host or starts an Agent.
+let blocked = ["DSH_HOME", "DSH_SNAPSHOT", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL",
+               "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "NODE_OPTIONS", "UNTRUSTED_OVERRIDE"]
+var synthetic = Dictionary(uniqueKeysWithValues: blocked.map { ($0, "synthetic-blocked") })
+synthetic["HOME"] = "/synthetic-home"
+synthetic["TMPDIR"] = "/synthetic-tmp"
+synthetic["PATH"] = "/synthetic-untrusted-path"
+let environment = ResidentDSHTransport.residentEnvironment(base: synthetic)
+for key in blocked { precondition(environment[key] == nil) }
+precondition(environment["HOME"] == synthetic["HOME"])
+precondition(environment["TMPDIR"] == synthetic["TMPDIR"])
+precondition(environment["PATH"]?.contains("synthetic") == false)
+for error in [RenderHostDSHConnectionError.unavailable, .unsupportedBackend, .headlessForbidden] {
+    precondition(error.errorDescription?.isEmpty == false)
 }
-for category in [RenderHostConversationFailure.auth, .model, .network, .rate, .config, .unknown] {
-    let message = category.errorDescription ?? ""
-    precondition(!message.isEmpty && !message.contains("登录"))
-}
-print("PASS: 11 safe failure classifications; 6 fixed user messages; no network/model request")
+print("PASS: 8 blocked environment overrides; 3 production environment invariants; 3 safe DSH messages; no Agent/request/credential access")

@@ -137,7 +137,7 @@ func gmgnRenderHostDestroy(_ handle: UnsafeMutableRawPointer?) -> Int32 {
     return MainActor.assumeIsolated {
         let handle = UnsafeMutableRawPointer(bitPattern: handleAddress)!
         let host = Unmanaged<GPUIRenderHost>.fromOpaque(handle).takeRetainedValue()
-        host.chat?.cancel()
+        host.chat?.close()
         host.controller.detach(from: host.controller.owner)
         return 1
     }

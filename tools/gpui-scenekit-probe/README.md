@@ -1,8 +1,9 @@
 # GPUI Kit / SceneKit native overlay probe
 
 This is an isolated macOS executable. It does not use the production App's data,
-settings or microphone. Explicit chat opt-in uses the selected local CLI's own
-existing authentication; the probe never reads or logs those credentials. It is outside the parent Cargo
+settings or microphone. Production chat connects the existing DSH agent using
+its own authentication configuration; the probe never reads, supplies or logs
+those credentials. It is outside the parent Cargo
 workspace. Dependencies: GPUI Kit **0.7.0**, GPUI snapshot **0.3.7** (lockfile),
 Rust **1.95.0**, Apple AppKit / SceneKit / Metal.
 
@@ -134,7 +135,7 @@ can enable it explicitly with `GMGN_PROBE_CHAT_UI=1`. All production preflight
 guards, real rendering, native focus rules and AccessKit hierarchy remain intact.
 
 A foreground `spawn_in` task uses a weak entity and drains `take_commands` every
-100ms, outside rendering. By default there is no chat transport: it shows
+100ms, outside rendering. With `GMGN_PROBE_CHAT_DISABLED=1` there is no chat transport: it shows
 “对话服务尚未接入此验证窗口”, and Send calls the component's `failed` API with
 that actual not-connected condition. It never invents a response or clears the
 draft on send. Only request ID / event type / character count are logged, never
@@ -150,14 +151,18 @@ option. Its bundle ID remains `ai.gmgn.gpui-scenekit-probe.production`; bind the
 explicit new artifact path for testing rather than confusing it with older
 production probe processes.
 
-## Explicit real chat backend
+## Existing DSH agent chat
 
-Set `GMGN_PROBE_CHAT_BACKEND=codex` or `claude-code` together with all three
-isolated render-host settings to use the actual Swift conversation service.
-Invalid or incomplete configuration exits 78 before creating a window; there
-is no implicit CLI launch or fake-success fallback. Build the separate artifact
-`target/GPUI Chat Connected Final Probe.app` with the `production` option and
-package its actual Swift host dependencies before starting it.
+Production mode defaults to the actual existing DSH agent through its native
+ACP transport. Keep all three isolated render-host settings; no key or model
+override is supplied. `GMGN_PROBE_CHAT_BACKEND=dsh` is optional; former codex /
+claude-code selectors are rejected. `GMGN_PROBE_CHAT_DISABLED=1` explicitly
+selects the offline diagnostic and cannot be combined with a backend selector.
+Invalid or incomplete configuration exits 78 before creating a window. There
+is no headless or fake-success fallback. Build the separate artifact
+`target/GPUI DSH Agent Probe.app` with the `production` option and package its
+actual Swift host dependencies before starting it. ACP connection, real reply,
+session continuity and cancellation require actual app acceptance.
 
 The main-thread C ABI preserves each UI request ID as an exact `uint64_t`.
 Polling consumes owned event JSON and frees every allocation, including empty

@@ -65,9 +65,11 @@ validation before any production migration gate is declared passed.
 ## Optional real resident conversation
 
 The five `gmgn_render_host_chat_*` functions expose the existing
-`AgentConversationService.send` pipeline. The adapter is disconnected until
-`chat_configure` explicitly selects `codex` or `claude-code`; it never chooses
-DSH headless or a discovered CLI automatically. `chat_send` and `chat_cancel`
+`AgentConversationService.send` pipeline. `chat_configure` accepts only `dsh`,
+connecting the existing DeepSeek Harness Agent over production native ACP.
+The GPUI test host defaults to this connection; explicit offline mode is a
+caller-side option. There is no Codex/Claude/custom API provider, key field,
+environment key guard, or headless CLI fallback. `chat_send` and `chat_cancel`
 take the caller's `uint64_t request_id`; event request IDs remain identical.
 All calls require the main thread and returned JSON strings use the existing
 string-free function. `chat_poll` drains bounded events and includes a complete
@@ -82,22 +84,24 @@ launching anything. Late results from a cancelled generation are discarded.
 The bounded transcript contains only completed actual user/reply pairs.
 Cancellation and failure restore the submitted draft.
 
-Codex uses an injected bounded cancellable process operation with explicit
-isolated cwd, read-only sandbox, ephemeral sessions, no inherited user config
-or exec rules, and a private `CODEX_HOME` under the isolated data root. The
-current host's CLI help/feature list was checked for the actual flags; shell,
-plugins, hooks, apps, image generation, and multi-agent features are disabled,
-and the MCP server table is empty. Credentials can only come from an already
-provided process environment key, with credential storage explicitly set to
-file; no auth/config file is copied and no Keychain lookup is requested.
-The Codex probe now explicitly selects an OpenAI Responses provider with
-`env_key = "OPENAI_API_KEY"` and `requires_openai_auth = false`, avoiding the
-built-in provider's stored-auth selection. Failed CLI results are classified
-in memory into `auth`, `model`, `network`, `rate`, `config`, or `unknown`;
-only the category and fixed safe user text appear in failure events. Raw
-output never enters UI, logs or documents. The existing bounded process runner
-discards stderr, so a stderr-only failure is honestly classified `unknown`.
-Claude uses the existing dedicated safe runner and environment whitelist.
+The lifecycle wrapper constructs the real `ResidentDSHConnector` using
+`ResidentDSHComposition.makeResidentSandbox`, with the production composition,
+model/provider selection, mounted-module verification and managed-credential
+service unchanged. The bridge does not read, copy or specify any key or auth
+file. It passes no connector environment overrides or stderr log destination;
+the existing production allowlist excludes provider-key and boot-mode overrides.
+The new sandbox is rooted under the caller's isolated `dataRoot/chat` via
+the optional `rootDirectory` seam. The wrapper's `openSession` ignores the
+service's generic injected-connector cwd and uses that sandbox's workspace
+for the actual Process and ACP session. No shared conversation/world scope
+or Keychain access is introduced.
+
+The injected connector forces text messages through native ACP. A fail-closed
+runner explicitly rejects any attempted headless fallback. Ordinary stop,
+reconfigure and host destroy close the actual connector and remove only its
+owned sandbox; a later send can create a new production sandbox/connector and
+bootstrap only the bounded actual transcript. There are no fake Agent replies
+or substituted model requests.
 
 `StageResidentChatState` is not constructed: its attachment store currently
 has a fixed root. The bridge instead reuses `ResidentChatSubmission` and
@@ -110,8 +114,8 @@ checks.
 ## Offline diagnostics check
 
 After building the Debug render host, run these commands from the repository
-root. This imports the actual compiled module and exercises 11 synthetic
-failure classifications plus all 6 fixed user messages. It does not create
+root. This imports the actual compiled module and exercises production DSH
+environment exclusions/invariants plus safe connection messages. It does not create
 a render host, launch a backend, send a model request, or read credentials.
 
 ```sh
@@ -130,7 +134,7 @@ DYLD_LIBRARY_PATH="$probe_products" DYLD_FRAMEWORK_PATH="$probe_products" \
 Expected successful output:
 
 ```text
-PASS: 11 safe failure classifications; 6 fixed user messages; no network/model request
+PASS: 8 blocked environment overrides; 3 production environment invariants; 3 safe DSH messages; no Agent/request/credential access
 ```
 
 The executable is `tmp/gpui-render-host/diagnostics-check`; it is a local

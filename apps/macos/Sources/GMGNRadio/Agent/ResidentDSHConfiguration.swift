@@ -196,10 +196,11 @@ enum ResidentDSHComposition {
         persona: String = residentPersona,
         resolvingFrom entryPoint: URL? = nil,
         fileManager: FileManager = .default,
+        rootDirectory: URL? = nil,
         hostToolsPluginPath: String? = nil,
         mcpServer: ResidentDSHMCPServer? = nil
     ) throws -> ResidentDSHSandbox {
-        let root = fileManager.temporaryDirectory.appendingPathComponent(
+        let root = (rootDirectory ?? fileManager.temporaryDirectory).appendingPathComponent(
             "gmgn-resident-dsh-\(UUID().uuidString)", isDirectory: true
         )
         let workspace = root.appendingPathComponent("workspace", isDirectory: true)

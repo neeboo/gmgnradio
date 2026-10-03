@@ -79,6 +79,20 @@ v5保留原始AccessKit content-view wrapper和GPUIView父层级，将SCNView插
 
 ## Rust同构候选的名称边界
 
+### 用户纠正后端：直接连接现有 DSH Agent
+
+用户明确要求“不指定 key，直接连 agent”。上一轮 Codex/OpenAI API 密钥失败是主代理选错验证后端，不能代表产品 DSH 链路不可用，也不要求用户配置 OpenAI 密钥。
+
+本轮删除 GPUI 宿主的 OpenAI runner/custom provider/key guards，默认连接现有 DeepSeek Harness 原生 ACP。继续复用生产 `ResidentDSHComposition` 与 `ResidentDSHConnector`，由 Harness 自己管理认证；不指定/复制/输出 key，不调用 DeepSeek HTTP API，不回退 headless。独立验证窗口只隔离会话、composition、workspace 和渲染数据，保留现有 agent 的认证方式。`makeResidentSandbox` 增加可选rootDirectory，默认生产行为不变，测试会话可归属隔离根。
+
+新版宿主实际构建成功。`/tmp/gpui-dsh-final-runtime.log` 中 request1 收到真实回复、request2 正确续聊，request3 实际停止后 request4 立即重发并收到真实回复；均未指定 key。此结果仅证明独立宿主的 DSH 连接和回复展示，不能作为主应用 UI、世界功能或完整迁移验收。
+
+### 用户要求转入真实产品验收
+
+独立宿主验收停止扩展。正式接入必须保留原 `AppDelegate`、`ResidentAgentLoop`、空间工具、持久化、音频与人物状态，不能复用 probe 的独立业务 stores 或 chat service。GPUI 管理应用窗口，Swift 产品运行时通过窄 C ABI 接入；默认 SwiftUI 入口继续保留，避免提前删除尚未迁移的设置、附件和播放器功能。
+
+当前实现分工：Rust 正式入口与打包；Swift 产品运行时、编译目标及原菜单/设置入口适配。主代理负责实际主应用的聊天、普通窗口/小窗、缩放、设置和播放操作复验。正式业务验收产物沿用已有 E2ERuntime 的数据隔离机制保护用户数据，业务代码与状态链保持完整。未完成的界面与功能不得标为通过。
+
 ### 真实对话接线续作门禁
 
 已核对 taskd 当前仅提供任务、状态、记忆与语音接口，未实现模型对话 RPC。现阶段 GPUI 复用 Swift `AgentConversationService.send`，返回最终整段回复；不声称 token 流式或 Rust 对话核心替换完成。独立验证宿主显式启用后端，使用隔离 cwd、独立配置、环境凭据和只读运行策略，不读取 Keychain 或复制用户认证目录。
