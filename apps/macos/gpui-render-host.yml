@@ -1,0 +1,39 @@
+include:
+  - project.yml
+name: GPUIRenderHost
+targets:
+  GPUIRenderHost:
+    type: library.dynamic
+    platform: macOS
+    sources:
+      - path: Sources/GMGNRadio
+        excludes:
+          - App/GMGNRadioApp.swift
+      - path: RenderHost
+    dependencies:
+      - package: NanoemCore
+        product: CNanoem
+      - package: MMDSceneKit
+      - package: WorldRuntime
+      - package: MotionDistribution
+      - package: ElevenLabs
+      - package: LiveKit
+      - package: MetalSplatter
+        product: MetalSplatter
+      - package: MetalSplatter
+        product: SplatIO
+      - package: VRMMetalKit
+      - package: VRMMetalKit
+        product: GLTFMetalKit
+    settings:
+      base:
+        PRODUCT_NAME: GPUIRenderHost
+        PRODUCT_MODULE_NAME: GPUIRenderHost
+        CODE_SIGNING_ALLOWED: NO
+        SKIP_INSTALL: YES
+        SWIFT_COMPILATION_MODE: incremental
+schemes:
+  GPUIRenderHost:
+    build:
+      targets:
+        GPUIRenderHost: all

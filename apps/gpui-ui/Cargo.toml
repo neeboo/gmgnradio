@@ -1,0 +1,9 @@
+[package]
+name = "gmgn-gpui-ui"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+gpui-kit = "=0.7.0"

@@ -3,17 +3,50 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #include <stdatomic.h>
+#import "render-host-bridge.h"
 
 static atomic_ulong sceneFrames;
 static unsigned long scenePointerEvents;
 static BOOL chatActive;
 static BOOL compactMode;
+static BOOL productionMode;
 static void probeSetChatActive(NSWindow *window, BOOL enabled) {
     chatActive = enabled;
     if (enabled) [window makeKeyWindow];
     else [window resignKeyWindow];
 }
 @interface ProbeSceneView : SCNView <SCNSceneRendererDelegate>
+@end
+
+@interface ProbeProductionContainer : NSView
+@end
+@implementation ProbeProductionContainer
+- (BOOL)acceptsFirstMouse:(NSEvent *)event { (void)event; return YES; }
+- (NSView *)hitTest:(NSPoint)point {
+    NSView *hit = [super hitTest:point];
+    // Full-stage events stay with the actual production view / interaction system.
+    // LiveCam uses its host's explicit orbit ABI, not an invented Metal scene.
+    return compactMode && hit ? self : hit;
+}
+- (void)mouseDown:(NSEvent *)event {
+    if (!compactMode) { [super mouseDown:event]; return; }
+    probeSetChatActive(self.window, NO);
+    scenePointerEvents++;
+    NSLog(@"PROBE_RENDER_HOST_POINTER kind=mouseDown count=%lu", scenePointerEvents);
+}
+- (void)mouseDragged:(NSEvent *)event {
+    if (!compactMode) { [super mouseDragged:event]; return; }
+    scenePointerEvents++;
+    probe_production_rotate((float)event.deltaX * 0.01f, (float)event.deltaY * 0.01f);
+    NSLog(@"PROBE_RENDER_HOST_POINTER kind=drag count=%lu", scenePointerEvents);
+}
+- (void)scrollWheel:(NSEvent *)event {
+    if (!compactMode) { [super scrollWheel:event]; return; }
+    scenePointerEvents++;
+    // Host ABI currently exposes orbit only; this is not a production zoom claim.
+    probe_production_rotate(0, (float)event.scrollingDeltaY * 0.01f);
+    NSLog(@"PROBE_RENDER_HOST_POINTER kind=scrollOrbit count=%lu", scenePointerEvents);
+}
 @end
 @implementation ProbeSceneView
 - (void)renderer:(id<SCNSceneRenderer>)renderer updateAtTime:(NSTimeInterval)time {
@@ -40,21 +73,52 @@ static void probeSetChatActive(NSWindow *window, BOOL enabled) {
 static BOOL routeScene = YES;
 static BOOL modalOpen = NO;
 static SCNView *activeSceneView;
+static NSView *activeProductionContainer;
 static NSTimer *statusTimer;
 static id closeObserver;
+static NSMutableArray *visibilityObservers;
+static __weak NSWindow *attachedWindow;
+static NSTimer *hideRestoreTimer;
+static void probeSyncVisibility(NSWindow *window) {
+    if (!productionMode || !window) return;
+    // Match production: hidden/minimized stops; mere ordinary overlap does not.
+    probe_production_visibility(window.visible, window.visible && window.miniaturized);
+}
+void probe_hide_briefly(void) {
+    NSWindow *window = attachedWindow;
+    if (!productionMode || !window) return;
+    [window orderOut:nil];
+    probeSyncVisibility(window);
+    [hideRestoreTimer invalidate];
+    __weak NSWindow *weakWindow = window;
+    hideRestoreTimer = [NSTimer scheduledTimerWithTimeInterval:4 repeats:NO block:^(NSTimer *timer) {
+        (void)timer;
+        NSWindow *currentWindow = weakWindow;
+        if (currentWindow) { [currentWindow orderFront:nil]; probeSyncVisibility(currentWindow); }
+    }];
+}
 void probe_cleanup(void) {
-    if (!statusTimer && !activeSceneView && !closeObserver) return;
+    if (!statusTimer && !activeSceneView && !activeProductionContainer && !closeObserver) return;
     [statusTimer invalidate];
     statusTimer = nil;
+    [hideRestoreTimer invalidate];
+    hideRestoreTimer = nil;
+    for (id observer in visibilityObservers) [NSNotificationCenter.defaultCenter removeObserver:observer];
+    visibilityObservers = nil;
+    attachedWindow = nil;
     activeSceneView.playing = NO;
     activeSceneView.delegate = nil;
     [activeSceneView removeFromSuperview];
     activeSceneView = nil;
+    if (productionMode) probe_production_destroy();
+    [activeProductionContainer removeFromSuperview];
+    activeProductionContainer = nil;
     if (closeObserver) [NSNotificationCenter.defaultCenter removeObserver:closeObserver];
     closeObserver = nil;
     NSLog(@"PROBE_SCENE_CLOSED timerInvalidated=1 sceneStopped=1");
 }
 void probe_reset_camera(void) {
+    if (productionMode) return; // No reset-camera ABI: never substitute a fixture camera.
     SCNNode *camera = [SCNNode node];
     camera.camera = [SCNCamera camera];
     camera.position = SCNVector3Make(0, 2, 7);
@@ -98,11 +162,13 @@ void probe_modal(int enabled) { modalOpen = enabled != 0; }
 void probe_attach(void *pointer) {
     NSView *gpui = (__bridge NSView *)pointer;
     NSWindow *window = gpui.window;
+    attachedWindow = window;
     NSView *originalContentView = window.contentView;
     // Preserve GPUI's original content-view hierarchy, including AccessKit's
     // wrapper. Keyboard equivalents and accessibility depend on that wrapper.
     NSView *parent = gpui.superview;
     compactMode = getenv("GMGN_PROBE_COMPACT") && strcmp(getenv("GMGN_PROBE_COMPACT"), "1") == 0;
+    productionMode = probe_production_requested() != 0;
     if (compactMode) {
         Class windowBase = object_getClass(window);
         Class panelAdapter = objc_allocateClassPair(windowBase, "GMGNProbeChatFocusPanel", 0);
@@ -122,11 +188,19 @@ void probe_attach(void *pointer) {
         parent.layer.cornerRadius = 28;
         parent.layer.masksToBounds = YES;
     }
-    ProbeSceneView *sceneView = [[ProbeSceneView alloc] initWithFrame:gpui.frame];
+    NSRect nativeFrame = gpui.frame;
     if (compactMode) {
         CGFloat localY = gpui.isFlipped ? 32 : NSHeight(gpui.bounds) - 192;
-        sceneView.frame = [gpui convertRect:NSMakeRect(0, localY, NSWidth(gpui.bounds), 160) toView:parent];
+        nativeFrame = [gpui convertRect:NSMakeRect(0, localY, NSWidth(gpui.bounds), 160) toView:parent];
     }
+    if (productionMode) {
+        ProbeProductionContainer *container = [[ProbeProductionContainer alloc] initWithFrame:nativeFrame];
+        container.autoresizingMask = compactMode ? NSViewNotSizable : NSViewWidthSizable | NSViewHeightSizable;
+        activeProductionContainer = container;
+        [parent addSubview:container positioned:NSWindowBelow relativeTo:gpui];
+        probe_production_attach(container, !compactMode);
+    } else {
+    ProbeSceneView *sceneView = [[ProbeSceneView alloc] initWithFrame:nativeFrame];
     sceneView.delegate = sceneView;
     activeSceneView = sceneView;
     sceneView.autoresizingMask = compactMode ? NSViewNotSizable : NSViewWidthSizable | NSViewHeightSizable;
@@ -149,6 +223,7 @@ void probe_attach(void *pointer) {
     floor.geometry.firstMaterial.diffuse.contents = [NSColor darkGrayColor];
     [sceneView.scene.rootNode addChildNode:floor];
     [parent addSubview:sceneView positioned:NSWindowBelow relativeTo:gpui];
+    }
     gpui.layer.opaque = NO;
     window.opaque = NO;
     Class base = object_getClass(gpui);
@@ -162,12 +237,23 @@ void probe_attach(void *pointer) {
     objc_registerClassPair(adapter);
     object_setClass(gpui, adapter);
     [window makeFirstResponder:gpui];
-    NSLog(@"GPUI_SCENEKIT_PROBE attached live SCNView below GPUI %@ contentViewPreserved=%d parent=%@", gpui, window.contentView == originalContentView, NSStringFromClass(object_getClass(parent)));
+    NSLog(@"GPUI_SCENEKIT_PROBE source=%@ contentViewPreserved=%d parent=%@", productionMode ? @"productionRenderHost" : @"SceneKitFixture", window.contentView == originalContentView, NSStringFromClass(object_getClass(parent)));
     __weak NSWindow *weakWindow = window;
+    if (productionMode) {
+        visibilityObservers = [NSMutableArray array];
+        for (NSNotificationName name in @[NSWindowDidMiniaturizeNotification, NSWindowDidDeminiaturizeNotification, NSWindowDidChangeOcclusionStateNotification]) {
+            id observer = [NSNotificationCenter.defaultCenter addObserverForName:name object:window queue:nil usingBlock:^(NSNotification *notification) {
+                (void)notification;
+                probeSyncVisibility(weakWindow);
+            }];
+            [visibilityObservers addObject:observer];
+        }
+    }
     statusTimer = [NSTimer scheduledTimerWithTimeInterval:2 repeats:YES block:^(NSTimer *timer) {
         NSWindow *currentWindow = weakWindow;
         if (!currentWindow) { [timer invalidate]; return; }
         NSLog(@"PROBE_SCENE_STATUS frames=%lu pointer=%lu routing=%d modal=%d firstResponder=%@ chatActive=%d key=%d main=%d appActive=%d canKey=%d canMain=%d level=%ld nonactivating=%d", atomic_load(&sceneFrames), scenePointerEvents, routeScene, modalOpen, NSStringFromClass(object_getClass(currentWindow.firstResponder)), chatActive, currentWindow.keyWindow, currentWindow.mainWindow, NSApp.active, currentWindow.canBecomeKeyWindow, currentWindow.canBecomeMainWindow, (long)currentWindow.level, (currentWindow.styleMask & NSWindowStyleMaskNonactivatingPanel) != 0);
+        if (productionMode) { probeSyncVisibility(currentWindow); probe_production_diagnostics(); }
     }];
     closeObserver = [NSNotificationCenter.defaultCenter addObserverForName:NSWindowWillCloseNotification object:window queue:nil usingBlock:^(NSNotification *notification) {
         (void)notification;

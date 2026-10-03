@@ -55,6 +55,36 @@ v5保留原始AccessKit content-view wrapper和GPUIView父层级，将SCNView插
 
 生产接入审计核对gpui-pre0.3.7源码：Application::run_embedded仍进入MacPlatform::run，后者配置GPUI专属NSApplication/委托并run；窗口创建API不提供接收现有NSWindow的入口。不得直接把Swift运行中的NSHostingView替换为GPUIView并视为受支持嵌入。当前接入方向为GPUI拥有App/窗口、Swift原渲染宿主以C ABI导出生产StageRenderSurfaceController及MarbleSpatialView；此桥接尚未实现/验收。原有SceneKit/Metal管线不改。
 
+## 生产渲染宿主实现断点
+
+独立 `apps/macos/gpui-render-host.yml`、`RenderHost/RenderHost.swift` 和 `tools/build-gpui-render-host.sh` 已开始实现。复用生产Swift源/包/Metal shader，排除应用@main，显式注入隔离defaults、缓存、人物/动作store，以本地LivingPod避免预热下载。未使用共享avatar runtime，不实例化ResidentChatState，不读Keychain或麦克风。
+
+实际构建日志 `/tmp/gpui-render-host-build.log`、`build2.log`、`build3.log`、`build4.log` 均记录首次拆分暴露的编译问题：@main同文件中的ProductIdentity和菜单声明依赖，以及Swift6 raw-pointer跨MainActor闭包约束。继续修复，不能将这些失败记录为门禁通过。菜单编译支持副本未实例化，不构成生产业务迁移。新的GPUI接线只允许显式指定真实dylib、隔离数据根和defaults suite，加载失败不得回退SCNView并假报生产验证。
+
+第六轮 `/tmp/gpui-render-host-build6.log` 实际BUILD SUCCEEDED/exit0；产物 `tmp/gpui-render-host/DerivedData/Build/Products/Debug/GPUIRenderHost.dylib`（无lib前缀）及 `default.metallib`。主代理nm核对8个C ABI导出齐全，otool确认全量编译源还链接LiveKit两个framework，仅供当前验证目标打包，并未启用实时通话。下一门禁为GPUI进程实际加载该库并显示生产LivingPod/真实MTKView，尚未通过。隔离人物store首轮为空，不算人物或小窗完整业务验证。
+
+## 真实生产渲染面第一轮通过范围
+
+主代理执行受限打包脚本；负向对compact-focus bundle执行被bundle ID门禁拒绝，未改其内容。正向production bundle实际打包与签名exit0，日志 `/tmp/gpui-render-host-package.log`。生产探针missing/partial/NATIVE0启动均exit78，日志 `/tmp/gpui-production-negative-{missing,partial,native0}.log`，不会以fixture代替真实宿主。
+
+主代理正向运行PID75384/session99071，使用mktemp隔离数据根与唯一defaults suite，日志 `/tmp/gpui-production-render-runtime.log`：真实LivingPod房间可见（床、舱门、电视与灯），Kit Dark主题面板叠在同一窗口；AX中文全选粘贴“生产渲染测试”、字符6、按钮1，Kit弹窗可见并Escape关闭。zoom后截图3840×1912，真实drawable3840×1848，控件与房间可见。诊断surfaceClass=MarbleSpatialView/owner=fullStage/attached=true/hasWindow=true/loopActive=true，未替换渲染器或复制静态场景截图。
+
+120样本的一次窗口采样：CPU encoding p95约1.98ms，GPU p95约3.92ms，drawable间隔p50约16.67ms/p95约33.34ms；启动前两帧world encoding约140/94ms。仅空人物、无视频内容/无splat的LivingPod，不宣称复杂场景或输入延迟达标。关闭实际exit0，destroy accepted=1，计时器停止；Swift库保留至进程退出，避免未结束Task执行卸载代码。
+
+基础生产叠放通过后按用户授权开始首个GPUI Kit聊天面板组件迁移；生产窗口最小化停帧/恢复、完整小窗轮廓与人物、世界操作输入和真实taskd聊天接线仍需逐项验证，未宣布全部UI迁移完成。
+
+生产生命周期修正版PID78832/session74602实际复验：Kit“最小化宿主窗口”触发visible=0、diagnostics.loopActive=false；CUA Raise恢复后visible=1/loopActive=true，真实房间仍显示。“隐藏4秒后恢复”期间日志采样两次loopActive=false，4秒后visible=1/loopActive=true。关闭exit0/destroy accepted=1。证据 `/tmp/gpui-production-lifecycle-runtime.log` 与 `/tmp/gpui-production-lifecycle-package.log`。此项生产停帧/恢复门禁通过。
+
+首个2D切片 `apps/gpui-ui`：实际Kit Input/Button/scroll与内置theme tokens，Typed Send/Cancel事件及草稿、回调、进度/失败恢复状态。主代理Rust1.95测试7项通过（失败保留、accepted后失败恢复、并发编辑保留、过期回复拒绝、重复回调拒绝、空白/重复发送拒绝）。从根目录误用默认Rust1.91首次编译失败slice_as_array，显式cargo+1.95复验exit0；生产工具链未改。组件尚未连真实transport，图片附件明确不可用；不删除原Swift界面/附件能力。继续在真实渲染宿主中实际验证此组件，不用假回复充当端到端通过。
+
 ## Rust同构候选的名称边界
+
+### 首个聊天切片真实窗口验收
+
+`GPUI Chat Migration Probe.app` 实际打包签名通过。全尺寸 PID80847 使用独立数据根/defaults suite，真实 LivingPod 与 ResidentChatPane 同时显示；中文粘贴、回车发送、按钮重试后显示真实未接入提示，原文字保留，未生成假回复。关闭 exit0。证据 `/tmp/gpui-chat-migration-package.log`、`/tmp/gpui-chat-migration-runtime.log`。
+
+紧凑模式 PID80879 实际224×336（Retina截图448×672），Kit关闭按钮、输入与发送/停止控件可见；“小窗中文测试”回车失败与按钮重试后草稿仍在，错误区域限高滚动，发送按钮保持可见。关闭 exit0。证据 `/tmp/gpui-chat-compact-runtime.log`。生产 liveCam 渲染面已挂载、循环运行，但隔离人物库为空，截图场景区为空白；不算人物、小窗完整视觉或业务验收通过。中文仅测试粘贴与编辑，未验证输入法组合输入。
+
+当前交付是可复用 Kit 聊天组件与独立真实渲染宿主接线，保留原Swift产品入口。真实taskd对话、附件、人物/世界操作及复杂场景性能仍待接入验收；不能将此验证App标记为正式产品UI迁移完成。
 
 用户提供的 https://docs.rs/scenekit/latest/scenekit/ 对应scenekit0.1.0，是独立Rust/wgpu场景框架，并非Apple SceneKit绑定。未来采用它需另做引擎与资产兼容验收，当前不替换引擎。https://docs.rs/objc2-scene-kit/latest/objc2_scene_kit/ 才是Apple SceneKit的Rust绑定；能统一调用语言，不会使Apple渲染后端跨平台。

@@ -106,6 +106,8 @@ TTS 以及 ASR 设置的模型改为下拉，候选与默认值由 Rust voice_ca
 
 ## Unity + GPUI讨论范围（保持原决定）
 
+GPUI第一切片已经开始：`apps/gpui-ui` 使用Kit0.7内置主题和Input/Button/scroll，7项状态测试通过。独立动态Swift渲染宿主复用现有SceneKit/Metal代码，真实LivingPod叠放、最小化/隐藏停帧恢复已通过；全尺寸与224×336聊天输入、发送失败保留及关闭实际验证通过。正式Swift入口未替换，taskd业务、附件、小窗人物视觉仍待验证。详细证据见 [叠放验收](2026-10-04-gpui-scenekit-overlay-probe.md)。
+
 目前只是候选调研，没有授权启动引擎替换。Unity官方Unity as a Library支持列表包含Android/iOS/Windows/UWP，不包含macOS/Linux；因此不能把Unity嵌入GPUI单窗口视为已有统一跨平台方案。独立窗口+Rust服务通信可以先验证业务分工；同窗口GPU共享需要另做平台桥接原型。当前继续保持SceneKit/Metal不变。
 
 - [Unity官方库嵌入支持与限制](https://docs.unity.com/en-us/engine/6000.3/manual/platform-specific/cross-platform-features/unityasa-library)
