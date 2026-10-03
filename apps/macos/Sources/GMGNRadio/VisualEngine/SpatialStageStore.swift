@@ -1087,7 +1087,48 @@ final class SpatialStageStore {
         camera.move(direction, distance: min(max(distance, 0.5), 10))
     }
 
-    func dollyCamera(scrollDelta: Float, precise: Bool) {
+    @ObservationIgnored private var cameraScrollInputCount = 0
+    @ObservationIgnored private var cameraScrollInvalidTimestampCount = 0
+    @ObservationIgnored private var cameraScrollDispatchMilliseconds: [Double] = []
+
+    /// OS event timestamp to main-thread handling only; not input-to-display latency.
+    var cameraInputDiagnostics: [String: Any] {
+        let samples = cameraScrollDispatchMilliseconds.sorted()
+        var result: [String: Any] = [
+            "scrollInputCount": cameraScrollInputCount,
+            "invalidOrMissingTimestampCount": cameraScrollInvalidTimestampCount,
+            "sampleCount": samples.count,
+            "sampleCapacity": 120,
+            "latencyScope": "os-event-to-main-thread-handler"
+        ]
+        if !samples.isEmpty {
+            func percentile(_ fraction: Double) -> Double {
+                samples[max(0, Int(ceil(Double(samples.count) * fraction)) - 1)]
+            }
+            result["dispatchLatencyP50Milliseconds"] = percentile(0.50)
+            result["dispatchLatencyP95Milliseconds"] = percentile(0.95)
+            result["dispatchLatencyMaxMilliseconds"] = samples.last!
+        }
+        return result
+    }
+
+    func dollyCamera(scrollDelta: Float, precise: Bool, eventTimestamp: TimeInterval? = nil) {
+        cameraScrollInputCount += 1
+        let uptime = ProcessInfo.processInfo.systemUptime
+        if let eventTimestamp, eventTimestamp.isFinite, eventTimestamp > 0,
+           uptime.isFinite, eventTimestamp <= uptime {
+            let milliseconds = max(0, (uptime - eventTimestamp) * 1_000)
+            if milliseconds.isFinite {
+                cameraScrollDispatchMilliseconds.append(milliseconds)
+                if cameraScrollDispatchMilliseconds.count > 120 {
+                    cameraScrollDispatchMilliseconds.removeFirst()
+                }
+            } else {
+                cameraScrollInvalidTimestampCount += 1
+            }
+        } else {
+            cameraScrollInvalidTimestampCount += 1
+        }
         camera.dolly(scrollDelta: scrollDelta, precise: precise)
     }
 

@@ -1767,7 +1767,8 @@ private final class StageWorldInteractionView: NSView {
         }
         spatialStage.dollyCamera(
             scrollDelta: Float(event.scrollingDeltaY),
-            precise: event.hasPreciseScrollingDeltas
+            precise: event.hasPreciseScrollingDeltas,
+            eventTimestamp: event.timestamp
         )
     }
 
