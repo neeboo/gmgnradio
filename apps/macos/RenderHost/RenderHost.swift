@@ -11,10 +11,11 @@ enum ProductIdentity {
 /// Probe-only ownership boundary. No App bootstrap, singleton avatar store,
 /// standard defaults, credential lookup, microphone or installed App access.
 @MainActor
-private final class GPUIRenderHost {
+final class GPUIRenderHost {
     let controller: StageRenderSurfaceController
     let defaults: UserDefaults
     let dataRoot: URL
+    var chat: RenderHostResidentConversation?
 
     init(dataRoot: URL, defaults: UserDefaults) {
         self.dataRoot = dataRoot
@@ -136,6 +137,7 @@ func gmgnRenderHostDestroy(_ handle: UnsafeMutableRawPointer?) -> Int32 {
     return MainActor.assumeIsolated {
         let handle = UnsafeMutableRawPointer(bitPattern: handleAddress)!
         let host = Unmanaged<GPUIRenderHost>.fromOpaque(handle).takeRetainedValue()
+        host.chat?.cancel()
         host.controller.detach(from: host.controller.owner)
         return 1
     }

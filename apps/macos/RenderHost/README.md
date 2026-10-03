@@ -61,3 +61,78 @@ Build/symbol success alone does not establish rendered output, character,
 music effects, video/audio, small-window behavior, or UI migration readiness.
 The GPUI process must attach this real surface and undergo visual/interaction
 validation before any production migration gate is declared passed.
+
+## Optional real resident conversation
+
+The five `gmgn_render_host_chat_*` functions expose the existing
+`AgentConversationService.send` pipeline. The adapter is disconnected until
+`chat_configure` explicitly selects `codex` or `claude-code`; it never chooses
+DSH headless or a discovered CLI automatically. `chat_send` and `chat_cancel`
+take the caller's `uint64_t request_id`; event request IDs remain identical.
+All calls require the main thread and returned JSON strings use the existing
+string-free function. `chat_poll` drains bounded events and includes a complete
+state snapshot; `chat_context` reads state without draining events.
+
+Events are `accepted`, `reply`, `failure`, and `cancelled`. The service returns
+a whole final response, so `deliveryMode` is `final-response`: there is no
+token streaming or fabricated progress. Acceptance means a request entered
+the adapter, not successful model delivery. Busy and empty requests return
+zero with a failure event; a disconnected adapter returns zero without
+launching anything. Late results from a cancelled generation are discarded.
+The bounded transcript contains only completed actual user/reply pairs.
+Cancellation and failure restore the submitted draft.
+
+Codex uses an injected bounded cancellable process operation with explicit
+isolated cwd, read-only sandbox, ephemeral sessions, no inherited user config
+or exec rules, and a private `CODEX_HOME` under the isolated data root. The
+current host's CLI help/feature list was checked for the actual flags; shell,
+plugins, hooks, apps, image generation, and multi-agent features are disabled,
+and the MCP server table is empty. Credentials can only come from an already
+provided process environment key, with credential storage explicitly set to
+file; no auth/config file is copied and no Keychain lookup is requested.
+The Codex probe now explicitly selects an OpenAI Responses provider with
+`env_key = "OPENAI_API_KEY"` and `requires_openai_auth = false`, avoiding the
+built-in provider's stored-auth selection. Failed CLI results are classified
+in memory into `auth`, `model`, `network`, `rate`, `config`, or `unknown`;
+only the category and fixed safe user text appear in failure events. Raw
+output never enters UI, logs or documents. The existing bounded process runner
+discards stderr, so a stderr-only failure is honestly classified `unknown`.
+Claude uses the existing dedicated safe runner and environment whitelist.
+
+`StageResidentChatState` is not constructed: its attachment store currently
+has a fixed root. The bridge instead reuses `ResidentChatSubmission` and
+`ResidentDraftRecovery`; image attachment UI is outside this first text-only
+bridge. There are no world tools, world persistence scope, memory adapter,
+automatic speech, microphone, or ASR in this lane. Real GPUI/cloud reply and
+cancellation verification remains an end-to-end gate distinct from ABI/build
+checks.
+
+## Offline diagnostics check
+
+After building the Debug render host, run these commands from the repository
+root. This imports the actual compiled module and exercises 11 synthetic
+failure classifications plus all 6 fixed user messages. It does not create
+a render host, launch a backend, send a model request, or read credentials.
+
+```sh
+probe_products="$PWD/tmp/gpui-render-host/DerivedData/Build/Products/Debug"
+xcrun swiftc \
+  -I "$probe_products" -F "$probe_products" \
+  -Xcc "-fmodule-map-file=$PWD/tmp/gpui-render-host/DerivedData/Build/Intermediates.noindex/GeneratedModuleMaps/CNanoem.modulemap" \
+  -Xcc "-I$PWD/apps/macos/Packages/NanoemCore/Sources/CNanoem/include" \
+  tools/gpui-render-host-diagnostics-check.swift \
+  -Xlinker "$probe_products/GPUIRenderHost.dylib" \
+  -o tmp/gpui-render-host/diagnostics-check
+DYLD_LIBRARY_PATH="$probe_products" DYLD_FRAMEWORK_PATH="$probe_products" \
+  tmp/gpui-render-host/diagnostics-check
+```
+
+Expected successful output:
+
+```text
+PASS: 11 safe failure classifications; 6 fixed user messages; no network/model request
+```
+
+The executable is `tmp/gpui-render-host/diagnostics-check`; it is a local
+build artifact and must not be committed. These checks do not establish a
+successful cloud reply or a passed GUI end-to-end conversation.

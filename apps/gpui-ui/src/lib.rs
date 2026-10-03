@@ -70,8 +70,11 @@ impl ResidentChatPane {
         self.state.transcript = lines;
         cx.notify();
     }
-    pub fn reset_context(&mut self, cx: &mut Context<Self>) {
+    pub fn reset_context(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.state.reset_context();
+        let draft = self.state.draft.clone();
+        self.input
+            .update(cx, |input, cx| input.set_value(draft, window, cx));
         cx.notify();
     }
 }
@@ -128,7 +131,17 @@ impl Render for ResidentChatPane {
                         })),
                 ),
             )
-            .children(self.state.status.clone().map(|status| {
+            .children((self.compact || self.state.status.is_some()).then(|| {
+                let status = self.state.status.clone().unwrap_or_else(|| {
+                    if !self.state.reply.is_empty() {
+                        self.state.reply.clone()
+                    } else {
+                        self.state
+                            .progress
+                            .clone()
+                            .unwrap_or_else(|| "可以和居民聊聊".into())
+                    }
+                });
                 if self.compact {
                     let compact_notice = if let Some(reason) = status.strip_suffix("\n文字已保留。")
                     {
@@ -147,14 +160,14 @@ impl Render for ResidentChatPane {
                 }
             }))
             .child(Input::new(&self.input).when(self.compact, |input| input.small()))
-            .child(
+            .children((!self.compact).then(|| {
                 div().child(
                     self.state
                         .progress
                         .clone()
                         .unwrap_or_else(|| "可以和居民聊聊".into()),
-                ),
-            )
+                )
+            }))
             .child(
                 div()
                     .flex()
@@ -184,8 +197,11 @@ impl Render for ResidentChatPane {
                             .when(self.compact, |button| button.small())
                             .label("停止")
                             .disabled(!self.state.thinking())
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.state.cancel();
+                                let draft = this.state.draft.clone();
+                                this.input
+                                    .update(cx, |input, cx| input.set_value(draft, window, cx));
                                 cx.notify();
                             })),
                     ),

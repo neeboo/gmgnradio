@@ -1,7 +1,8 @@
 # GPUI Kit / SceneKit native overlay probe
 
 This is an isolated macOS executable. It does not use the production App's data,
-settings, helpers, microphone, or credentials. It is outside the parent Cargo
+settings or microphone. Explicit chat opt-in uses the selected local CLI's own
+existing authentication; the probe never reads or logs those credentials. It is outside the parent Cargo
 workspace. Dependencies: GPUI Kit **0.7.0**, GPUI snapshot **0.3.7** (lockfile),
 Rust **1.95.0**, Apple AppKit / SceneKit / Metal.
 
@@ -133,22 +134,46 @@ can enable it explicitly with `GMGN_PROBE_CHAT_UI=1`. All production preflight
 guards, real rendering, native focus rules and AccessKit hierarchy remain intact.
 
 A foreground `spawn_in` task uses a weak entity and drains `take_commands` every
-100ms, outside rendering. There is deliberately no chat transport in this
-validation host: it shows “对话服务尚未接入此验证窗口”, and a Send command calls the
-component's `failed` API with that actual not-connected condition. It never
-calls `accepted`, invents a resident response, or clears the draft on send.
-Only request ID / character count are logged, never message text. The owned
-poller is cancelled when its view drops and stops if the window/entity disappears.
+100ms, outside rendering. By default there is no chat transport: it shows
+“对话服务尚未接入此验证窗口”, and Send calls the component's `failed` API with
+that actual not-connected condition. It never invents a response or clears the
+draft on send. Only request ID / event type / character count are logged, never
+message text. Closing explicitly drops the poller before native host destruction.
 
 The component's `reset_context` invalidates old pending callbacks and retains
 the current draft; it is not a general input-clear API and is not invoked in
-this transport-free probe. Actual Enter / send failure / preserved draft UI
+this probe. Actual Enter / send failure / preserved draft UI
 acceptance remains separate from business chat end-to-end acceptance.
 
 Build to `target/GPUI Chat Migration Probe.app` with the `production` packaging
 option. Its bundle ID remains `ai.gmgn.gpui-scenekit-probe.production`; bind the
 explicit new artifact path for testing rather than confusing it with older
 production probe processes.
+
+## Explicit real chat backend
+
+Set `GMGN_PROBE_CHAT_BACKEND=codex` or `claude-code` together with all three
+isolated render-host settings to use the actual Swift conversation service.
+Invalid or incomplete configuration exits 78 before creating a window; there
+is no implicit CLI launch or fake-success fallback. Build the separate artifact
+`target/GPUI Chat Connected Final Probe.app` with the `production` option and
+package its actual Swift host dependencies before starting it.
+
+The main-thread C ABI preserves each UI request ID as an exact `uint64_t`.
+Polling consumes owned event JSON and frees every allocation, including empty
+batches and malformed replies. Actual accepted, final reply, failure and cancel
+events update the Kit component. This backend delivers final responses, not
+token streaming; accepted alone is never reported as completion. Missing reply
+text or malformed protocol cancels the current request and displays a safe
+failure. The actual bounded transcript is displayed; old-request events are
+ignored. Stop targets the actual backend request, and closing drops the GPUI
+poll task before cancelling/destroying the host. The dylib stays loaded until
+process exit so cancelled Swift Tasks can unwind safely.
+
+Four parser tests cover exact request IDs, real final text, missing/malformed
+reply rejection and empty batches. They do not replace actual CLI response,
+cancel, draft recovery or close-lifecycle acceptance. This slice does not attach
+world tools or prove taskd/world business integration.
 
 SceneKit pointer events and its independently running frame count are emitted
 to stderr (`PROBE_SCENE_POINTER`). They supplement visual acceptance, never

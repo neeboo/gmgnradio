@@ -17,6 +17,13 @@ static int32_t (*destroyHost)(void *);
 static BOOL lastVisible;
 static BOOL lastOccluded;
 static BOOL hasVisibilityState;
+static BOOL chatConfigured;
+static uint64_t activeChatRequest;
+static int32_t (*configureChat)(void *, const char *);
+static int32_t (*sendChat)(void *, uint64_t, const char *);
+static int32_t (*cancelChat)(void *, uint64_t);
+static char *(*pollChat)(void *);
+static char *(*chatContext)(void *);
 
 static void failConfiguration(const char *reason) {
     fprintf(stderr, "PROBE_RENDER_HOST_ERROR %s; no SceneKit fixture fallback\n", reason);
@@ -27,8 +34,11 @@ int probe_production_requested(void) {
     const char *library = getenv("GMGN_RENDER_HOST_LIBRARY");
     const char *root = getenv("GMGN_RENDER_HOST_DATA_ROOT");
     const char *suite = getenv("GMGN_RENDER_HOST_DEFAULTS_SUITE");
+    const char *backend = getenv("GMGN_PROBE_CHAT_BACKEND");
+    if (backend && strcmp(backend, "codex") != 0 && strcmp(backend, "claude-code") != 0)
+        failConfiguration("chat backend must explicitly be codex or claude-code");
     BOOL required = [NSBundle.mainBundle objectForInfoDictionaryKey:@"GMGNProductionRenderHostRequired"] != nil;
-    BOOL any = library || root || suite || required;
+    BOOL any = library || root || suite || required || backend;
     if (!any) return 0;
     if (!library || !*library || !root || !*root || !suite || !*suite)
         failConfiguration("all three explicit isolated host settings are required");
@@ -55,6 +65,13 @@ void probe_production_attach(NSView *container, BOOL fullStage) {
     LOAD_HOST_SYMBOL(hostDiagnostics, "gmgn_render_host_diagnostics");
     LOAD_HOST_SYMBOL(freeHostString, "gmgn_render_host_string_free");
     LOAD_HOST_SYMBOL(destroyHost, "gmgn_render_host_destroy");
+    if (getenv("GMGN_PROBE_CHAT_BACKEND")) {
+        LOAD_HOST_SYMBOL(configureChat, "gmgn_render_host_chat_configure");
+        LOAD_HOST_SYMBOL(sendChat, "gmgn_render_host_chat_send");
+        LOAD_HOST_SYMBOL(cancelChat, "gmgn_render_host_chat_cancel");
+        LOAD_HOST_SYMBOL(pollChat, "gmgn_render_host_chat_poll");
+        LOAD_HOST_SYMBOL(chatContext, "gmgn_render_host_chat_context");
+    }
 #undef LOAD_HOST_SYMBOL
     hostHandle = createHost(getenv("GMGN_RENDER_HOST_DATA_ROOT"), getenv("GMGN_RENDER_HOST_DEFAULTS_SUITE"));
     if (!hostHandle) failConfiguration("host creation failed");
@@ -68,7 +85,26 @@ void probe_production_attach(NSView *container, BOOL fullStage) {
     if (!view || ![view isKindOfClass:NSView.class] || ![view isDescendantOf:container])
         failConfiguration("host view is not attached to the isolated container");
     NSLog(@"PROBE_RENDER_HOST_ATTACHED mode=%@ fixtureFallback=0", fullStage ? @"fullStage" : @"liveCam");
+    if (configureChat) {
+        if (configureChat(hostHandle, getenv("GMGN_PROBE_CHAT_BACKEND")) != 1)
+            failConfiguration("explicit chat backend configuration failed");
+        chatConfigured = YES;
+        NSLog(@"PROBE_CHAT_BACKEND_CONFIGURED deliveryMode=final-response");
+    }
 }
+
+int32_t probe_chat_enabled(void) { return chatConfigured && hostHandle ? 1 : 0; }
+int32_t probe_chat_send(uint64_t requestID, const char *text) {
+    if (!probe_chat_enabled()) return 0;
+    int32_t result = sendChat(hostHandle, requestID, text);
+    if (result == 1) activeChatRequest = requestID;
+    return result;
+}
+int32_t probe_chat_cancel(uint64_t requestID) {
+    return probe_chat_enabled() ? cancelChat(hostHandle, requestID) : 0;
+}
+char *probe_chat_poll(void) { return probe_chat_enabled() ? pollChat(hostHandle) : NULL; }
+void probe_chat_string_free(char *string) { if (string && freeHostString) freeHostString(string); }
 
 void probe_production_rotate(float yaw, float pitch) {
     if (!hostHandle) return;
@@ -125,6 +161,8 @@ void probe_production_diagnostics(void) {
 }
 void probe_production_destroy(void) {
     if (!hostHandle) return;
+    if (chatConfigured) cancelChat(hostHandle, activeChatRequest);
+    chatConfigured = NO;
     setVisibility(hostHandle, 0, 1);
     int32_t destroyed = destroyHost(hostHandle);
     hostHandle = NULL;

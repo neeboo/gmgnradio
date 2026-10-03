@@ -118,8 +118,16 @@ impl ChatState {
     pub fn cancel(&mut self) {
         if let Some(p) = self.pending.take() {
             self.commands.push(ChatCommand::Cancel { request_id: p.id });
+            if self.draft != p.submitted {
+                self.draft = if self.draft.is_empty() {
+                    p.submitted
+                } else {
+                    format!("{}\n{}", p.submitted, self.draft)
+                };
+                self.revision += 1;
+            }
             self.progress = None;
-            self.status = Some("已停止本次回复。".into());
+            self.status = Some("已停止本次回复。\n文字已保留。".into());
         }
     }
     /// Context changes invalidate old callbacks without recycling request IDs.
@@ -213,5 +221,34 @@ mod tests {
         s.send();
         assert!(!s.fail(1, "过期".into()));
         assert!(s.thinking());
+    }
+    #[test]
+    fn cancellation_restores_accepted_draft_and_rejects_late_reply() {
+        let mut s = ChatState::default();
+        s.edit("重试这条".into());
+        s.send();
+        s.accepted(1);
+        s.cancel();
+        assert_eq!(s.draft, "重试这条");
+        assert!(!s.finish(1, "迟到回复".into()));
+        assert!(!s.accepted(1));
+        assert!(s.can_send());
+        s.cancel();
+        assert_eq!(s.draft, "重试这条");
+    }
+    #[test]
+    fn cancellation_keeps_concurrent_edit_without_duplicate_original() {
+        let mut s = ChatState::default();
+        s.edit("旧文".into());
+        s.send();
+        s.cancel();
+        assert_eq!(s.draft, "旧文");
+        s.send();
+        s.accepted(2);
+        s.edit("新文".into());
+        s.cancel();
+        assert_eq!(s.draft, "旧文\n新文");
+        assert!(!s.finish(2, "迟到".into()));
+        assert!(!s.thinking());
     }
 }

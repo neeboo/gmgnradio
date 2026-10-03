@@ -4,7 +4,10 @@ use gpui_kit::component::{button::*, input::*, *};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use std::ffi::{CStr, CString, c_char};
 use std::time::Duration;
+use std::{cell::RefCell, rc::Rc};
+mod chat_events;
 
 unsafe extern "C" {
     fn probe_attach(view: *mut std::ffi::c_void);
@@ -14,6 +17,11 @@ unsafe extern "C" {
     fn probe_cleanup();
     fn probe_production_requested() -> i32;
     fn probe_hide_briefly();
+    fn probe_chat_enabled() -> i32;
+    fn probe_chat_send(request_id: u64, text: *const c_char) -> i32;
+    fn probe_chat_cancel(request_id: u64) -> i32;
+    fn probe_chat_poll() -> *mut c_char;
+    fn probe_chat_string_free(string: *mut c_char);
 }
 
 struct Probe {
@@ -24,9 +32,100 @@ struct Probe {
     production: bool,
     chat: Option<Entity<ResidentChatPane>>,
     chat_warning_visible: bool,
-    _chat_poller: Option<Task<()>>,
+    _chat_poller: Rc<RefCell<Option<Task<()>>>>,
+    chat_backend: bool,
+    chat_pending: Option<u64>,
+    chat_accepted: bool,
+    chat_sequence: u64,
+    chat_transcript: Vec<gmgn_gpui_ui::state::TranscriptLine>,
 }
 impl Probe {
+    fn fail_chat(&mut self, id: u64, notice: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(chat) = self.chat.clone() {
+            chat.update(cx, |chat, cx| chat.failed(id, notice.into(), window, cx));
+        }
+        if self.chat_pending == Some(id) {
+            self.chat_pending = None;
+            self.chat_accepted = false;
+        }
+        self.chat_warning_visible = false;
+        cx.notify();
+    }
+    fn poll_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.chat_backend {
+            return;
+        }
+        let pointer = unsafe { probe_chat_poll() };
+        let parsed = if pointer.is_null() {
+            Err(())
+        } else {
+            let bytes = unsafe { CStr::from_ptr(pointer) }.to_bytes().to_vec();
+            unsafe {
+                probe_chat_string_free(pointer);
+            }
+            chat_events::parse(&bytes)
+        };
+        let Ok(batch) = parsed else {
+            if let Some(id) = self.chat_pending {
+                unsafe {
+                    probe_chat_cancel(id);
+                }
+                eprintln!("PROBE_CHAT_EVENT_PARSE_FAILURE request_id={id}");
+                self.fail_chat(id, "对话服务返回了无法读取的状态", window, cx);
+            }
+            return;
+        };
+        let Some(chat) = self.chat.clone() else {
+            return;
+        };
+        for event in batch.events {
+            if event.sequence <= self.chat_sequence {
+                continue;
+            }
+            self.chat_sequence = event.sequence;
+            let id = event.request_id;
+            eprintln!(
+                "PROBE_CHAT_EVENT kind={} request_id={id} sequence={} characters={}",
+                event.kind,
+                event.sequence,
+                event.text.as_ref().map_or(0, |text| text.chars().count())
+            );
+            if self.chat_pending != Some(id) {
+                continue;
+            }
+            match event.kind.as_str() {
+                "accepted" => {
+                    self.chat_accepted = true;
+                    chat.update(cx, |chat, cx| chat.accepted(id, window, cx));
+                }
+                "reply" if self.chat_accepted => {
+                    if let Some(text) = event.text {
+                        chat.update(cx, |chat, cx| chat.reply(id, text, cx));
+                    }
+                    self.chat_pending = None;
+                    self.chat_accepted = false;
+                }
+                "reply" => self.fail_chat(id, "对话尚未确认接收，无法交付回复", window, cx),
+                "failure" => self.fail_chat(
+                    id,
+                    event.message.as_deref().unwrap_or("本次对话未能完成"),
+                    window,
+                    cx,
+                ),
+                "cancelled" => self.fail_chat(id, "本次回复已取消", window, cx),
+                "progress" => {
+                    if let Some(text) = event.text {
+                        chat.update(cx, |chat, cx| chat.progress(id, text, cx));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if batch.transcript != self.chat_transcript {
+            self.chat_transcript = batch.transcript.clone();
+            chat.update(cx, |chat, cx| chat.set_transcript(batch.transcript, cx));
+        }
+    }
     fn consume_chat_commands(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(chat) = self.chat.clone() else {
             return;
@@ -35,6 +134,23 @@ impl Probe {
         for command in commands {
             match command {
                 ChatCommand::Send { request_id, text } => {
+                    if self.chat_backend {
+                        self.chat_pending = Some(request_id);
+                        self.chat_accepted = false;
+                        match CString::new(text) {
+                            Ok(text) => {
+                                let accepted =
+                                    unsafe { probe_chat_send(request_id, text.as_ptr()) };
+                                eprintln!(
+                                    "PROBE_CHAT_SUBMIT request_id={request_id} accepted={accepted}"
+                                );
+                            }
+                            Err(_) => {
+                                self.fail_chat(request_id, "文字包含无法发送的字符", window, cx)
+                            }
+                        }
+                        continue;
+                    }
                     // No transport is connected: never acknowledge or invent a reply.
                     eprintln!(
                         "PROBE_CHAT_NOT_CONNECTED request_id={request_id} characters={}",
@@ -47,10 +163,20 @@ impl Probe {
                     cx.notify();
                 }
                 ChatCommand::Cancel { request_id } => {
+                    if self.chat_backend {
+                        let cancelled = unsafe { probe_chat_cancel(request_id) };
+                        eprintln!("PROBE_CHAT_CANCEL request_id={request_id} accepted={cancelled}");
+                        if self.chat_pending == Some(request_id) {
+                            self.chat_pending = None;
+                            self.chat_accepted = false;
+                        }
+                        continue;
+                    }
                     eprintln!("PROBE_CHAT_CANCEL_NO_TRANSPORT request_id={request_id}");
                 }
             }
         }
+        self.poll_chat(window, cx);
     }
     fn render_chat(&self, chat: Entity<ResidentChatPane>, cx: &App) -> AnyElement {
         let pane = div()
@@ -308,7 +434,11 @@ fn main() {
         let compact = std::env::var("GMGN_PROBE_COMPACT").as_deref() == Ok("1");
         let chat_ui = production || std::env::var("GMGN_PROBE_CHAT_UI").as_deref() == Ok("1");
         Theme::change(ThemeMode::Dark, None, cx);
-        cx.on_window_closed(|cx, _| {
+        let chat_poller_handle: Rc<RefCell<Option<Task<()>>>> = Rc::new(RefCell::new(None));
+        let close_poller = chat_poller_handle.clone();
+        cx.on_window_closed(move |cx, _| {
+            // Stop GPUI event polling before destroying its native backend handle.
+            close_poller.borrow_mut().take();
             unsafe {
                 probe_cleanup();
             }
@@ -375,6 +505,7 @@ fn main() {
                         }
                     })
                 });
+                *chat_poller_handle.borrow_mut() = chat_poller;
                 Probe {
                     input,
                     count: 0,
@@ -382,8 +513,13 @@ fn main() {
                     compact,
                     production,
                     chat,
-                    chat_warning_visible: true,
-                    _chat_poller: chat_poller,
+                    chat_warning_visible: unsafe { probe_chat_enabled() == 0 },
+                    _chat_poller: chat_poller_handle.clone(),
+                    chat_backend: unsafe { probe_chat_enabled() != 0 },
+                    chat_pending: None,
+                    chat_accepted: false,
+                    chat_sequence: 0,
+                    chat_transcript: Vec::new(),
                 }
             });
             // Kit's default component RootPlugin paints a solid theme background.

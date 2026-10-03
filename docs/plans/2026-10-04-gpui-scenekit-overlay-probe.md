@@ -79,6 +79,22 @@ v5保留原始AccessKit content-view wrapper和GPUIView父层级，将SCNView插
 
 ## Rust同构候选的名称边界
 
+### 真实对话接线续作门禁
+
+已核对 taskd 当前仅提供任务、状态、记忆与语音接口，未实现模型对话 RPC。现阶段 GPUI 复用 Swift `AgentConversationService.send`，返回最终整段回复；不声称 token 流式或 Rust 对话核心替换完成。独立验证宿主显式启用后端，使用隔离 cwd、独立配置、环境凭据和只读运行策略，不读取 Keychain 或复制用户认证目录。
+
+继续验收项目：真实全尺寸发送和回复、二轮上下文、取消并恢复草稿、拒绝迟到回复、窗口关闭回收后端进程、小窗真实回复可见及滚动、未启用后端时明确失败。状态测试已增至9项并由主代理复跑通过，真实后端接线门禁仍待产物与窗口验证。
+
+实际首轮接线 `GPUI Chat Connected Probe.app`，主代理受限打包、显式codex启动PID91187，日志 `/tmp/gpui-chat-connected-runtime.log`。真实中文输入request1收到accepted并实际启动后端，最终failure，界面恢复完整草稿；没有真实回复，因此成功门禁未通过。request2按钮重试启动子进程PID91488，实际点击Kit停止后cancel accepted=1、收到cancelled，原稿恢复且PID91488及宿主直接子进程均消失。关闭宿主exit0。4项事件解析测试通过，含缺回复不得成功、非法JSON/交付类型拒绝和精确64位请求ID。继续定位安全错误分类并复验，不把accepted或失败恢复当云端成功。
+
+最终版本关闭前先停止GPUI轮询，再取消并销毁原生宿主。主代理补正过期cancel返回0，`chat-build3.log`构建exit0。诊断修正版`chat-build4.log`构建exit0，Codex显式环境key provider/`requires_openai_auth=false`，不login、不复制auth、不读Keychain；失败仅在内存按auth/model/network/rate/config/unknown分类，原始CLI输出不进入UI/日志。
+
+Final真实复验PID91872：request1界面收到固定安全auth提示并恢复草稿，当前环境API凭证未获接受；并非配置已经正常或完整成功。request2已accepted且CLI PID92398仍运行时实际关闭窗口，App exit0、PID91872及92398均消失，destroy accepted=1。证据 `/tmp/gpui-chat-diagnostic-runtime.log`、`/tmp/gpui-chat-diagnostic-package.log`。另一后端claude-code PID91700也实际accepted后failure、保留草稿并关闭exit0，证据 `/tmp/gpui-chat-claude-runtime.log`；未查出该分支具体云端失败因，不能推广Codex的auth分类。
+
+Final小窗PID92798实际224×336：中文发送、accepted清稿、真实auth失败恢复；32px stock scroll内可滚动读完安全错误，输入和发送按钮一直可见。关闭exit0，证据 `/tmp/gpui-chat-final-compact-runtime.log`。未能收到云端真实回复，因此最新reply滚动展示仅实现/状态测试验证，尚无真实回复视觉验收；空人物liveCam依旧不能算人物视觉通过。默认未启用、缺host配置与非法后端三项CLI负向均exit78：`/tmp/gpui-chat-negative-{missing,backend-missing,backend-invalid}.log`。
+
+当前断点：代码接通真实文本服务、实际失败/停止/关闭回收已经验证；成功回复与二轮上下文仍被凭据可用性阻断。需要可用的环境API配置才可继续此成功门禁，不使用fixture或装机认证替代，也不扩大到世界工具/附件/自动TTS/ASR。其余正式产品入口与设置面板迁移尚未完成。
+
 ### 首个聊天切片真实窗口验收
 
 `GPUI Chat Migration Probe.app` 实际打包签名通过。全尺寸 PID80847 使用独立数据根/defaults suite，真实 LivingPod 与 ResidentChatPane 同时显示；中文粘贴、回车发送、按钮重试后显示真实未接入提示，原文字保留，未生成假回复。关闭 exit0。证据 `/tmp/gpui-chat-migration-package.log`、`/tmp/gpui-chat-migration-runtime.log`。
