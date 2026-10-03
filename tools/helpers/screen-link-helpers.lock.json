@@ -1,0 +1,70 @@
+{
+  "schema": 1,
+  "comment": "电视链接解析 helper 的**打包钉死清单**（唯一一处可复现来源）。BundledHelperManifest.pinned 是运行时权威；tools/test-screen-link-helper-lock.swift 机械核对两边逐字段一致。空 sha256 / 空版本一律拒绝。",
+  "notices_path": "apps/macos/Resources/Helpers/THIRD_PARTY_LICENSES.txt",
+  "helpers": [
+    {
+      "name": "yt-dlp",
+      "required": true,
+      "version": "2026.06.09",
+      "distribution": "pyinstaller_standalone",
+      "format": "raw_binary",
+      "arch": "universal",
+      "source_url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.06.09/yt-dlp_macos",
+      "source_checksums_url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.06.09/SHA2-256SUMS",
+      "sha256": "b82c3626952e6c14eaf654cc565866775ffd0b9ffb7021628ac59b42c2f4f244",
+      "upstream_license_spdx": "Unlicense",
+      "combined_work_license_spdx": "GPL-3.0-or-later",
+      "license_note": "yt-dlp 上游是 Unlicense；PyInstaller 独立二进制内含 GPLv3+ 代码，组合作品按 GPLv3+ 分发，必须随包带第三方许可声明。"
+    },
+    {
+      "name": "deno",
+      "required": false,
+      "version": "2.9.7",
+      "distribution": "javascript_runtime",
+      "format": "zip_member",
+      "arch": "arm64",
+      "source_url": "https://github.com/denoland/deno/releases/download/v2.9.7/deno-aarch64-apple-darwin.zip",
+      "source_checksums_url": "https://github.com/denoland/deno/releases/download/v2.9.7/deno-aarch64-apple-darwin.zip.sha256sum",
+      "archive_sha256": "5cd46d6268f6f78f5d88bdc7159d20bd44cdaa4b3303474839f87ec6fe7ae25c",
+      "member": "deno",
+      "sha256": "b73737579d5a84c160e3316487594783fa5c15f4e13252a6a07050b755317f1a",
+      "upstream_license_spdx": "MIT",
+      "combined_work_license_spdx": "MIT",
+      "license_note": "官方推荐的 JavaScript 运行时，用于执行 yt-dlp-ejs 解 YouTube 的 nsig。默认不随包；--include deno 时按此哈希校验后内置。"
+    }
+  ],
+  "source_components": [
+    {
+      "name": "yt-dlp-ejs",
+      "version": "2026.06.09",
+      "source_url": "https://github.com/yt-dlp/ejs",
+      "license_spdx": "Unlicense",
+      "note": "源码树（不是单个可执行文件），随 yt-dlp 的 zipimport / tarball 分发；内含 MIT（astring）与 ISC（meriyah）组件。它没有单文件 sha256，所以不作 helper 打包，只作许可与版本登记。"
+    },
+    {
+      "name": "meriyah",
+      "version": "2026.06.09",
+      "license_spdx": "ISC",
+      "note": "随 yt-dlp 的 zipimport / tarball 分发（JavaScript 解析器）。"
+    },
+    {
+      "name": "astring",
+      "version": "2026.06.09",
+      "license_spdx": "MIT",
+      "note": "随 yt-dlp 的 zipimport / tarball 分发（AST 生成）。"
+    },
+    {
+      "name": "Python",
+      "version": "3.x (随 yt-dlp 独立二进制)",
+      "license_spdx": "PSF-2.0",
+      "note": "独立二进制内含 Python 解释器。"
+    },
+    {
+      "name": "ffmpeg",
+      "version": "not-bundled",
+      "license_spdx": "LGPL-2.1-or-later / GPL-2.0-or-later",
+      "note": "合并分轨时需要；许可以实际构建为准。本 App 不内置，分轨合并走 AVFoundation。"
+    }
+  ]
+}

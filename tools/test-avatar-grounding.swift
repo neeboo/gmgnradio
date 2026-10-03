@@ -54,6 +54,7 @@ struct StageAvatarPlacement: Equatable {
 }
 
 __PMX_ANIMATED_GROUNDING__
+__PMX_CONTACT_GROUNDING__
 __PMX_FULL_STAGE_GROUNDING__
 __MARBLE_FRAMING__
 
@@ -152,6 +153,36 @@ let faintSole = faintTransform * SIMD4<Float>(faintBounds.center.x, faintAnimate
 check(faintSole.y >= faintPlacement.position.y - 0.0001,
       "measured recovery-faint sole no longer sinks below the floor")
 
+// 全身最低接触（坐 / 跪 / 盘腿）：脚可能比静止姿态更高，只看脚会漏掉膝 / 小腿 / 臀。
+// 复现"脚抬起、膝下沉"的接触姿态：脚参考偏移 <= 0（不抬升），而全身最低点低于地面。
+let contactFootOffset = PMXAnimatedGrounding.localOffsetY(
+    restFootReferenceY: 0.1,
+    animatedFootReferenceY: 0.3
+)
+check(contactFootOffset < 0, "kneeling pose: soles sit above rest (foot-only offset is negative)")
+let footOnlyLift = PMXFullStageGroundingPolicy.offset(
+    rootMotionEnabled: false,
+    animatedOffset: contactFootOffset
+)
+check(footOnlyLift == 0, "kneeling pose: foot-only policy never lifts the body")
+let bodyPenetration: Float = -0.2445
+let contactLift = max(0, PMXContactGrounding.penetrationOffset(
+    restGlobalMinY: 0,
+    animatedGlobalMinY: bodyPenetration
+))
+check(abs(contactLift - 0.2445) < 0.0001,
+      "whole-body contact lifts exactly the penetrated depth")
+let groundedBodyY = bodyPenetration + contactLift
+check(groundedBodyY >= -0.0001,
+      "after whole-body compensation the lowest vertex is at or above the floor")
+// 负对照：只取脚时最低顶点仍在地面以下（这条必须在脚-only 修复下红）。
+check(bodyPenetration + footOnlyLift < -0.0001,
+      "negative control: foot-only grounding leaves the lowest non-foot vertex below the floor")
+check(PMXContactGrounding.penetrationOffset(restGlobalMinY: 4, animatedGlobalMinY: 7) == -3,
+      "contact offset is rest minus animated (body above rest is negative)")
+check(PMXContactGrounding.penetrationOffset(restGlobalMinY: .nan, animatedGlobalMinY: 1) == 0,
+      "non-finite contact reference refuses compensation")
+
 print("\(failures == 0 ? "PASS" : "FAIL"): \(checks) avatar grounding checks, \(failures) failures")
 exit(failures == 0 ? 0 : 1)
 """#
@@ -159,6 +190,8 @@ exit(failures == 0 ? 0 : 1)
 let program = harness
     .replacingOccurrences(of: "__PMX_ANIMATED_GROUNDING__",
                           with: declaration("enum PMXAnimatedGrounding", in: pmx))
+    .replacingOccurrences(of: "__PMX_CONTACT_GROUNDING__",
+                          with: declaration("enum PMXContactGrounding", in: pmx))
     .replacingOccurrences(of: "__PMX_FULL_STAGE_GROUNDING__",
                           with: declaration("enum PMXFullStageGroundingPolicy", in: pmx))
     .replacingOccurrences(of: "__MARBLE_FRAMING__",
@@ -193,4 +226,24 @@ if !installMotion.contains("localGroundingOffsetY = 0") {
     exit(1)
 }
 print("PASS: installMotion clears the previous clip's grounding offset")
+
+// 4) 全身接触项必须真的接在每帧接地计算里，而不只是"存在一个纯逻辑枚举"。
+let groundingUpdate = declaration("private func updateAnimatedGroundingOffset(", in: pmx)
+guard groundingUpdate.contains("PMXContactGrounding.penetrationOffset"),
+      groundingUpdate.contains("max(soleOffset, rootDrop, contactLift)") else {
+    print("FAIL: updateAnimatedGroundingOffset no longer folds whole-body contact into the offset")
+    exit(1)
+}
+print("PASS: per-frame grounding folds whole-body contact into the offset")
+// 注入负对照：把接触项抽掉之后，判据必须能看出差别（只取脚 = 穿地）。
+let injectedFootOnly = groundingUpdate.replacingOccurrences(
+    of: "contactLift = max(0, PMXContactGrounding.penetrationOffset(",
+    with: "contactLift = 0 // injected foot-only"
+)
+guard injectedFootOnly != groundingUpdate,
+      !injectedFootOnly.contains("PMXContactGrounding.penetrationOffset") else {
+    print("FAIL: whole-body contact injection negative control did not take")
+    exit(1)
+}
+print("PASS: whole-body contact injection negative control (foot-only) changes the source")
 exit(run.terminationStatus)

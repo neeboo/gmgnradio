@@ -44,3 +44,12 @@ fi
 if [[ "${CODE_SIGNING_ALLOWED:-NO}" == YES && -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ]]; then
   /usr/bin/codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" --options runtime "$task_destination/gmgn-taskd"
 fi
+
+# Fail-closed integrity manifest: the installed helper's own digest, never a
+# placeholder. `tools/verify-helper-manifest.py` re-checks it before install.
+task_hash="$(/usr/bin/shasum -a 256 "$task_destination/gmgn-taskd" | /usr/bin/awk '{print $1}')"
+if [[ -z "$task_hash" ]]; then
+  echo 'error: empty sha256 for gmgn-taskd; refusing to bundle an unverifiable helper.' >&2
+  exit 1
+fi
+printf '%s  %s\n' "$task_hash" "gmgn-taskd" > "$task_destination/gmgn-taskd.sha256"

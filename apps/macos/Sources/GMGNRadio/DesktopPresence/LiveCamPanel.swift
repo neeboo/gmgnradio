@@ -125,7 +125,9 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate, NSGestureRecogn
     let voiceButton = NSButton()
     let settingsButton = NSButton()
     let messageField = ResidentAttachmentTextField()
-    private let images = ResidentAttachmentStore()
+    private let images = ResidentAttachmentStore(
+        directory: E2ERuntime.applicationSupportBase?
+            .appendingPathComponent("gmgn radio/ResidentAttachments", isDirectory: true))
     private var recovery = ResidentDraftRecovery()
     private let attachButton = NSButton()
     private var composerHeight: NSLayoutConstraint?

@@ -32,6 +32,16 @@ enum WorldScreenSurfaceState: Equatable, Sendable {
     }
 }
 
+/// 原生链接播放的具名失败。
+///
+/// 刻意用**值类型**而不是直接引用 `ScreenLinkFailure`：那会把 `WorldScreenState`
+/// 拖去依赖 `Screen/LinkResolver/` 整个目录，离线 harness 只切 `Screen/` 就编不过。
+/// 解析器把 `ScreenLinkFailure` 映射成它，两个听众的文案（人话 / 工程口径）一字不改。
+struct NativeLinkFailureInfo: Equatable, Sendable {
+    let panelText: String
+    let technicalDescription: String
+}
+
 /// 加载失败的原因。**每一句都要能指认到底断在哪一关**。
 enum WorldScreenFailure: Error, Equatable, Sendable {
     /// 网络层：DNS / 连不上 / TLS / 连接被重置。
@@ -47,6 +57,8 @@ enum WorldScreenFailure: Error, Equatable, Sendable {
     /// `didFinish` 成功、状态就变成 `playing`，于是用户看到的是一块**显示着错误页的
     /// "播放中"**。载荷是**已经说成人话**的那一句（`WorldScreenPlayerFailure.panelText`）。
     case playerRefused(WorldScreenPlayerFailure)
+    /// 网站链接原生播放失败（解析器/播放器具名原因）。
+    case nativeLink(NativeLinkFailureInfo)
 
     var errorDescription: String {
         switch self {
@@ -61,6 +73,8 @@ enum WorldScreenFailure: Error, Equatable, Sendable {
         case let .playerRefused(reason):
             // 工具与日志口径：要带得上播放器给的那个码，工程师照着它才能定位。
             reason.technicalDescription
+        case let .nativeLink(failure):
+            failure.technicalDescription
         }
     }
 
@@ -82,6 +96,8 @@ enum WorldScreenFailure: Error, Equatable, Sendable {
             "这个视频不让嵌进来放。"
         case let .playerRefused(reason):
             reason.panelText
+        case let .nativeLink(failure):
+            failure.panelText
         }
     }
 }

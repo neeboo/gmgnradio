@@ -42,6 +42,12 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
         let persistDefinition: (@MainActor (WorldScreenDefinition) -> Void)?
         /// 把屏幕内容**持久化**。为 nil 时同上。
         let persistContent: (@MainActor (WorldScreenContent) -> Void)?
+        /// 从本机持久化恢复屏幕定义（标定 / 来源）。为 nil 时不恢复。
+        let restoreDefinition: (@MainActor (String) -> WorldScreenDefinition?)?
+        /// 从本机持久化恢复屏幕内容。为 nil 时不恢复。
+        let restoreContent: (@MainActor (String) -> WorldScreenContent?)?
+        /// 物件不再存在时清掉它的持久化记录（过期内容不许复活）。
+        let removePersisted: (@MainActor (String) -> Void)?
     }
 
     /// 同时播放的上限（与覆盖层同一份数字）。
@@ -63,6 +69,9 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
     private let overlay: WorldScreenOverlayController
     private let source: Source
     private let projectionProvider: @MainActor () -> WorldScreenProjection
+    /// 网站链接原生播放：解析器 + AVPlayer 会话 + 场景取帧注册表。
+    private let nativeRegistry: WorldScreenNativeVideoRegistry
+    private let nativeCoordinator: NativeScreenPlaybackCoordinator
     /// 本次会话里的标定覆盖（① 那一级的即时形态）。持久化成功时与 metadata 等价。
     private var calibrationOverrides: [String: WorldScreenDefinition] = [:]
     private var definitions: [String: WorldScreenDefinition] = [:]
@@ -104,7 +113,30 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
         self.overlay = overlay
         self.source = source
         self.projectionProvider = projectionProvider
+        // 链接优先、原生播放：生产走内置 helper（未钉哈希时 fail-closed）；显式给了
+        // `GMGN_SCREEN_LINK_HELPER` 的开发覆盖路径才允许跑未钉副本。
+        let registry = WorldScreenNativeVideoRegistry()
+        self.nativeRegistry = registry
+        let resolver = ScreenLinkResolverService.live(
+            allowDevOverride: ProcessInfo.processInfo
+                .environment["GMGN_SCREEN_LINK_HELPER"]?.isEmpty == false
+        )
+        self.nativeCoordinator = NativeScreenPlaybackCoordinator(
+            resolver: resolver, registry: registry
+        )
+        nativeCoordinator.onChange = { [weak self] in
+            guard let self else { return }
+            self.snapshots = self.makeSnapshots()
+        }
     }
+
+    /// 原生播放的真实解码度量（E2E / 诊断只读）。没有原生会话时 `nil`。
+    func nativeMetrics(objectID: String) -> NativeScreenPlaybackCoordinator.Metrics? {
+        nativeCoordinator.metrics(for: objectID)
+    }
+
+    /// 场景取帧注册表：渲染器每帧读它。没有登记屏幕时为空，既有画面逐字节不变。
+    var nativeVideoRegistry: WorldScreenNativeVideoRegistry { nativeRegistry }
 
     // MARK: 生命周期
 
@@ -204,11 +236,16 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
             contents[objectID] = nil
             calibrationOverrides[objectID] = nil
             placements[objectID] = nil
+            // 物件没了：原生会话连播放器一起彻底清掉，过期解析结果不许复活它。
+            nativeCoordinator.remove(objectID)
+            source.removePersisted?(objectID)
             overlay.removeSurface(for: objectID)
         }
         for objectID in Array(issues.keys) where !seen.contains(objectID) {
             issues[objectID] = nil
             placements[objectID] = nil
+            nativeCoordinator.remove(objectID)
+            source.removePersisted?(objectID)
             overlay.removeSurface(for: objectID)
         }
         logGeometryIfChanged()
@@ -240,8 +277,14 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
         let calibratedJSON: String?
         if let override = calibrationOverrides[objectID] {
             calibratedJSON = WorldScreenDefinitionCoding.encode(override)
+        } else if let stored = state.metadata[WorldScreenMetadataKey.definition] {
+            calibratedJSON = stored
+        } else if let restored = source.restoreDefinition?(objectID) {
+            // 本机持久化的标定 / 来源：只补会话缓存，不冒充世界状态。
+            calibrationOverrides[objectID] = restored
+            calibratedJSON = WorldScreenDefinitionCoding.encode(restored)
         } else {
-            calibratedJSON = state.metadata[WorldScreenMetadataKey.definition]
+            calibratedJSON = nil
         }
         let size = state.generatedProp.map {
             SIMD3<Float>($0.effectiveSize.x, $0.effectiveSize.y, $0.effectiveSize.z)
@@ -274,13 +317,20 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
     private func loadContent(objectID: String, state: WorldObjectState) -> String? {
         // 会话内的内容优先（刚在面板里换的片），其次是落盘的那一份。
         if let content = contents[objectID] { return content.url }
-        guard let json = state.metadata[WorldScreenMetadataKey.content],
-              let data = json.data(using: .utf8),
-              let stored = try? JSONDecoder().decode(WorldScreenContent.self, from: data),
-              stored.isValid, stored.objectID == objectID
-        else { return nil }
-        contents[objectID] = stored
-        return stored.url
+        if let json = state.metadata[WorldScreenMetadataKey.content],
+           let data = json.data(using: .utf8),
+           let stored = try? JSONDecoder().decode(WorldScreenContent.self, from: data),
+           stored.isValid, stored.objectID == objectID {
+            contents[objectID] = stored
+            return stored.url
+        }
+        // 本机持久化恢复（重启后仍记得上次放的是什么）。
+        if let restored = source.restoreContent?(objectID),
+           restored.isValid, restored.objectID == objectID {
+            contents[objectID] = restored
+            return restored.url
+        }
+        return nil
     }
 
     /// 本帧的屏幕四边形。只包含**几何成立**的屏幕 —— 缺几何的走具名失败，不是画一块空气。
@@ -425,13 +475,24 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
     private func makeSnapshots() -> [WorldScreenSnapshot] {
         var ids = Set(definitions.keys)
         ids.formUnion(issues.keys)
+        // 原生链接会话也投影出来（停掉之后仍可见"上次放的是什么、已停"）。
+        ids.formUnion(nativeCoordinator.objectIDs)
         let stats = overlay.occlusionStats
         return ids.sorted().map { objectID in
             let definition = definitions[objectID]
             let surface = overlay.surfaces[objectID]
+            let native = nativeCoordinator.snapshot(for: objectID)
+            let nativeState = native?.state
             let stateText = issues[objectID]?.errorDescription
+                ?? nativeState?.displayText
                 ?? surface?.state.displayText
                 ?? "未开始"
+            let isPlaying = native?.isPlaying ?? surface?.state.isPlaying ?? false
+            // 面板/回执优先看原生状态；官方嵌入没有原生会话时才回落到覆盖层。
+            let surfaceState: WorldScreenSurfaceState? = {
+                if issues[objectID] != nil { return nil }
+                return nativeState ?? surface?.state
+            }()
             logOcclusionIfChanged(objectID: objectID, stat: stats[objectID])
             return WorldScreenSnapshot(
                 objectID: objectID,
@@ -440,15 +501,15 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
                 note: definition?.note ?? "",
                 aspect: definition?.quad.aspect ?? 0,
                 geometryIssue: issues[objectID],
-                contentURL: contents[objectID]?.url ?? surface?.requestedURL,
+                contentURL: contents[objectID]?.url ?? native?.contentURL ?? surface?.requestedURL,
                 stateText: stateText,
-                isPlaying: surface?.state.isPlaying ?? false,
+                isPlaying: isPlaying,
                 occlusionText: stats[objectID]?.displayText,
                 isBlocked: (stats[objectID]?.blockedCellCount ?? 0) > 0,
                 // 几何给不出来时**不**把覆盖层那个状态交给面板：那一步会把"没有屏幕"
                 // 借道 `.blocked` 说成"这个视频不让嵌进来放"（误导）。此时面板由
                 // 上面那句"屏幕范围：还没认出来"负责说清楚。
-                surfaceState: issues[objectID] == nil ? surface?.state : nil
+                surfaceState: surfaceState
             )
         }
     }
@@ -510,6 +571,14 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
                 details: ["screen_id": target, "cause": issue.errorDescription]
             )
         }
+        // **链接优先**：受支持的公开观看页先走原生（链接解析器 + AVPlayer）。
+        // 只有原生理不了的东西（裸 id、站方嵌入页之外的输入）才回落到官方嵌入。
+        if ScreenLinkSitePolicy.accepts(rawContent) {
+            return await playNativeLink(
+                target: target,
+                pageURL: rawContent.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
         let url: URL
         switch WorldScreenEmbedPolicy.validate(rawContent) {
         case let .success(value):
@@ -522,6 +591,8 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
                 .screenContentRejected, issue.errorDescription, details: ["screen_id": target]
             )
         }
+        // 官方嵌入接管同一块屏时，先撤掉可能还活着的原生会话（过期结果不许复活）。
+        nativeCoordinator.remove(target)
         let surface = overlay.surface(for: target)
         guard surface.state.isPlaying || overlay.canLoad(anotherThan: target) else {
             return .failure(
@@ -577,11 +648,42 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
         )
     }
 
+    /// 网站链接原生播放：解析 → AVPlayer → 场景纹理登记。落盘只写**原始页面 URL**，
+    /// 解析出来的签名媒资地址永远只活在内存里。
+    private func playNativeLink(target: String, pageURL: String) async -> WorldScreenCommandOutcome {
+        // 同一块屏可能还挂着官方的网页视图：先撤掉，避免双重画面。
+        overlay.surface(for: target).stop()
+        let nativePlaying = nativeCoordinator.playingObjectIDs().count
+        if nativeCoordinator.snapshot(for: target)?.isPlaying != true,
+           nativePlaying >= Self.maximumSimultaneousScreens {
+            return .failure(
+                .screenCapacityExceeded,
+                "同时最多放 \(Self.maximumSimultaneousScreens) 台电视，先停一台。",
+                details: ["screen_id": target, "playing": String(nativePlaying)]
+            )
+        }
+        let site = ScreenLinkSitePolicy.site(forPageURL: pageURL)
+        let content = WorldScreenContent(
+            objectID: target, kind: .nativeLink, url: pageURL,
+            title: site?.displayName ?? "网站链接"
+        )
+        contents[target] = content
+        source.persistContent?(content)
+        overlay.surface(for: target).geometryIssue = nil
+        let outcome = await nativeCoordinator.play(
+            objectID: target, pageURL: pageURL,
+            quadProvider: { [weak self] in self?.worldQuads().quads[target] }
+        )
+        snapshots = makeSnapshots()
+        return outcome
+    }
+
     func stopScreen(objectID: String?) -> WorldScreenCommandOutcome {
         rebuild()
         guard let target = resolveTarget(objectID) else {
             return .failure(.screenNotFound, "这个空间里没有可关的电视。")
         }
+        nativeCoordinator.stop(target)
         overlay.surface(for: target).stop()
         snapshots = makeSnapshots()
         return .ok("已关掉\(source.displayName(target))。", details: ["screen_id": target])

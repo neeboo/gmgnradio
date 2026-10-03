@@ -4,27 +4,41 @@ import Foundation
 
 /// 一台电视**现在放什么**。落盘在 `metadata["gmgn.screen-content.v1"]`。
 struct WorldScreenContent: Equatable, Sendable, Codable {
-    /// 内容的种类。本切片**只有**官方嵌入一种。
-    ///
-    /// `direct`（用户给的直链）与 `local`（本地文件）是**设计上留的位置**、
-    /// **本切片不做** —— 先把"官方嵌入 + 白名单 + 具名失败"这条钉死，
-    /// 再谈别的。留一个不做事的枚举成员比事后补一个"其实还有一条路"要诚实。
+    /// 内容的种类。**链接优先**：公开观看页走 `.nativeLink`（用户已授权的原生播放），站方嵌入页走 `.officialEmbed`。两种都只落盘**原始页面 URL**，运行期才
+    /// 解析；解析出来的签名媒资地址只活在内存里。
     enum Kind: String, Codable, Equatable, Sendable {
         case officialEmbed = "official_embed"
+        case nativeLink = "native_link"
     }
 
     let objectID: String
     let kind: Kind
-    /// 最终要交给 `WKWebView` 的那个**官方嵌入页** URL。
+    /// 要交给播放后端的那条 URL。
+    ///
+    /// `.officialEmbed` = 官方嵌入页；`.nativeLink` = 用户粘的**原始公开观看页**
+    /// （绝不是解析出来的签名媒资地址 —— 那是派生结论，不落盘）。
     let url: String
     /// 给人看的一句（视频标题 / BV 号 / 视频 id）。可以为空。
     let title: String
 
     var isValid: Bool {
-        if case .success = WorldScreenEmbedPolicy.validate(url) {
-            return !objectID.isEmpty && objectID.count <= 256 && url.count <= 2048
+        guard !objectID.isEmpty, objectID.count <= 256, url.count <= 2048 else {
+            return false
         }
-        return false
+        switch kind {
+        case .officialEmbed:
+            if case .success = WorldScreenEmbedPolicy.validate(url) { return true }
+            return false
+        case .nativeLink:
+            // 这里只做**机械**校验（https + 有主机）；站点白名单由解析器
+            // `ScreenLinkSitePolicy` 在运行时判，不支持的站会得到具名失败。
+            // 这样 `WorldScreenState` / `WorldScreenContent` 不必依赖解析器目录，
+            // 离线 harness 仍只切 `Screen/` 就能编译。
+            guard let url = URL(string: url),
+                  url.scheme?.lowercased() == "https",
+                  let host = url.host, !host.isEmpty else { return false }
+            return true
+        }
     }
 }
 

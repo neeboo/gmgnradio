@@ -428,8 +428,12 @@ let agentFiles = ["ResidentCodexTransport", "ResidentCodexPolicy", "AgentConvers
     root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/\($0).swift").path
 }
 let visionFile = root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/ResidentVisionCapture.swift")
+// `ResidentDSHHostToolsBridge` reads the repo's single retry-backoff policy from
+// `Presence/RetryBackoff.swift`; that source is self-contained and must ride along
+// or the harness stops at "cannot find 'RetryBackoffSite' in scope".
+let retryBackoffFile = root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift")
 compiler.arguments = ["swiftc", "-j1", "-swift-version", "6", "-parse-as-library", source.path]
-    + agentFiles + [visionFile.path] + [main.path, "-o", binary.path]
+    + agentFiles + [visionFile.path, retryBackoffFile.path] + [main.path, "-o", binary.path]
 try compiler.run(); compiler.waitUntilExit()
 guard compiler.terminationStatus == 0 else { exit(compiler.terminationStatus) }
 let test = Process(); test.executableURL = binary; try test.run(); test.waitUntilExit(); exit(test.terminationStatus)

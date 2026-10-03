@@ -18,7 +18,7 @@ func marbleCabinPackageUsesGeneratedAssets() throws {
     #expect(manifest.packageVersion == "1.2.0", "Wish-machine package uses its versioned state migration")
     #expect(manifest.calibration.metersPerUnit == 1)
     #expect(WorldPackageValidator().validate(manifest, packageRoot: root).isEmpty)
-    #expect(Set(manifest.activities.map(\.id)) == ["home.idle", "home.walk", "music.listen", "wish_machine.collect", "performance.backflip", "performance.jumping_jacks"])
+    #expect(Set(manifest.activities.map(\.id)) == ["home.idle", "home.walk", "music.listen", "wish_machine.collect", "performance.backflip", "performance.jumping_jacks", "chair.sit"])
     #expect(manifest.resources.contains { $0.path == "scene-500k.spz" })
     #expect(manifest.resources.contains { $0.path == "collider.glb" })
     #expect(manifest.collisionVolumes.contains { $0.id == "collision.jukebox" })

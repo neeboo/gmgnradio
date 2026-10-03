@@ -386,29 +386,50 @@ struct AgentExecutableLocator: AgentExecutableLocating, @unchecked Sendable {
         return directories
     }
 
-    /// WorkBuddy 的 CLI 通常打包在应用内：
-    /// <app>.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy。
+    /// 应用内自带的 CLI：WorkBuddy 的 `codebuddy`，以及 Codex Desktop / ChatGPT 自带的
+    /// `codex`。后者的版本通常比 PATH 上的 npm 安装新（2026-10-03 实测：ChatGPT.app 内
+    /// 0.160.0 支持用户配置的模型，而 PATH 上的 0.153.4 会以
+    /// “model not supported when using Codex with a ChatGPT account” 400 拒绝），
+    /// 所以 resident 优先用它，避免继承用户的模型配置却在旧 CLI 上必然失败。
     private func locateAppBundledCLI(named name: String) -> URL? {
-        guard name == "codebuddy" else { return nil }
         let home = fileManager.homeDirectoryForCurrentUser
         let appContainers = [
             URL(filePath: "/Applications"),
             home.appending(path: "Applications"),
         ]
-        let appNames = ["WorkBuddy.app", "WorkBuddy AI.app"]
-        let relativePath =
-            "Contents/Resources/app.asar.unpacked/cli/bin/codebuddy"
-        for container in appContainers {
-            for appName in appNames {
-                let candidate = container
-                    .appending(path: appName)
-                    .appending(path: relativePath)
-                if fileManager.isExecutableFile(atPath: candidate.path) {
-                    return candidate
+        switch name {
+        case "codebuddy":
+            let appNames = ["WorkBuddy.app", "WorkBuddy AI.app"]
+            let relativePath =
+                "Contents/Resources/app.asar.unpacked/cli/bin/codebuddy"
+            for container in appContainers {
+                for appName in appNames {
+                    let candidate = container
+                        .appending(path: appName)
+                        .appending(path: relativePath)
+                    if fileManager.isExecutableFile(atPath: candidate.path) {
+                        return candidate
+                    }
                 }
             }
+            return nil
+        case "codex":
+            let bundledPaths = [
+                "ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+                "Codex.app/Contents/Resources/codex",
+            ]
+            for relativePath in bundledPaths {
+                for container in appContainers {
+                    let candidate = container.appending(path: relativePath)
+                    if fileManager.isExecutableFile(atPath: candidate.path) {
+                        return candidate
+                    }
+                }
+            }
+            return nil
+        default:
+            return nil
         }
-        return nil
     }
 }
 
@@ -689,6 +710,21 @@ final class AgentConversationService {
     /// ACP session because every later prompt is appended by the server.
     private var dshHistoryByScope: [String: [AgentConversationMessage]] = [:]
     private var currentSessionScope: String?
+    /// E2E / 诊断只读：`send` 真正被进入的次数（后端可用性 guard **之前**自增）。
+    /// 它回答"真实对话回合有没有走到对话服务"，而不是"命令回执 ok 不 ok"。
+    private(set) var sendEnteredCount = 0
+    /// 最近一次 `send` 的真实回执（后端 / scope / 是否带世界工具 / 图片数 / 真实用户文字）。
+    private(set) var lastSendReceipt: [String: Any] = [:]
+    /// 最近一次居民 Codex 轮次的**内部失败因**（stage / code / category / detail）。
+    /// 只读诊断：UI 仍然只用一句人话，但 E2E 与日志能拿到"到底为什么失败"，
+    /// 而不是只有"居民未能完成本轮回复"。绝不写入模型名、工具名或凭据。
+    private(set) var lastResidentFailure: [String: Any] = [:]
+    /// 有界的失败因历史。`lastResidentFailure` 会被下一轮成功发送清空，也会被
+    /// 更晚的失败覆盖；失败发生在真实 App 的哪一轮需要能往回查，所以每次失败
+    /// 都追加一条（只保留最近 `residentFailureHistoryLimit` 条）。同样只含安全
+    /// 投影后的字段，绝不带 stderr / 认证配置 / 凭据。
+    private(set) var residentFailureHistory: [[String: Any]] = []
+    static let residentFailureHistoryLimit = 8
     /// Claude Code 无原生续聊：以独立内存有界历史保持最近对话。只存真实
     /// userMessage 与模型 reply；绝不存组装 world prompt、旧人格或记忆注入文本。
     /// scope 维度有界（超出淘汰最旧 scope），reset/换后端清理。
@@ -1048,10 +1084,63 @@ final class AgentConversationService {
         defer { try? FileManager.default.removeItem(at: directory) }
         let agent = residentAgentFactory(executable, directory)
         currentResidentAgent = agent
-        defer { if currentResidentAgent === agent { currentResidentAgent = nil } }
-        let outcome = try await agent.send(prompt: prompt, imageURLs: imageURLs, sessionID: sessionID, toolsJSON: tools.schemasJSON,
-                                          allowsSilentCompletion: tools.allowsSilentCompletion, onToolCall: tools.call)
-        return AgentConversationOutcome(reply: outcome.reply, sessionID: outcome.sessionID)
+        // 保存内部失败因必须发生在**清 `currentResidentAgent` 之前**：agent 一旦被
+        // 释放，`failureStage/Code/Category/Detail` 就再也没有别的出口，E2E 只会剩
+        // 下 UI 那句「居民未能完成本轮回复」。这个 defer 在成功/抛错/取消三条路径
+        // 上都会执行，所以失败因一定会先落进只读诊断（snapshot + chat 账本）。
+        // 只保存安全投影后的字段，绝不带 stderr、认证配置或凭据。
+        var thrownError: Error?
+        defer {
+            if let failure = Self.residentFailureRecord(from: agent, error: thrownError) {
+                lastResidentFailure = failure
+                residentFailureHistory.append(failure)
+                if residentFailureHistory.count > Self.residentFailureHistoryLimit {
+                    residentFailureHistory.removeFirst(
+                        residentFailureHistory.count - Self.residentFailureHistoryLimit
+                    )
+                }
+            } else {
+                lastResidentFailure = [:]
+            }
+            if currentResidentAgent === agent { currentResidentAgent = nil }
+        }
+        do {
+            let agentOutcome = try await agent.send(
+                prompt: prompt, imageURLs: imageURLs, sessionID: sessionID,
+                toolsJSON: tools.schemasJSON,
+                allowsSilentCompletion: tools.allowsSilentCompletion, onToolCall: tools.call
+            )
+            return AgentConversationOutcome(
+                reply: agentOutcome.reply, sessionID: agentOutcome.sessionID
+            )
+        } catch {
+            thrownError = error
+            throw error
+        }
+    }
+
+    /// 把一轮真实居民 Codex 的失败因从 agent 上安全拷出来。四个字段全空且没有
+    /// 抛出错误时返回 nil（成功轮次），调用方据此清空 `lastResidentFailure`。
+    private static func residentFailureRecord(
+        from agent: ResidentCodexAgent, error: Error?
+    ) -> [String: Any]? {
+        guard agent.failureStage != nil || agent.failureCode != nil
+                || agent.failureCategory != nil || agent.failureDetail != nil
+                || error != nil else { return nil }
+        var record: [String: Any] = [
+            "stage": agent.failureStage ?? "",
+            "code": agent.failureCode ?? "",
+            "category": agent.failureCategory ?? "",
+            "detail": agent.failureDetail ?? "",
+            "turnStatus": agent.failureTurnStatus ?? "",
+            "errorShape": agent.failureErrorShape ?? "",
+            "at": Date().timeIntervalSince1970,
+        ]
+        if let error {
+            record["errorType"] = String(describing: type(of: error))
+            record["message"] = error.localizedDescription
+        }
+        return record
     }
 
     // MARK: DSH native image transport
@@ -1571,6 +1660,7 @@ final class AgentConversationService {
         cancel()
         defer { worldTools?.cancel() }
         let id = effectiveBackendID
+        sendEnteredCount += 1
         if !imageURLs.isEmpty {
             AgentConversationService.imageChainNote(
                 "居民图片链[4] 发送入口 后端=\(id.rawValue) 图片=\(imageURLs.count) 有世界工具=\(worldTools != nil) worldID=\(worldContext?.worldID ?? "nil") 文件=[\(imageURLs.map(\.lastPathComponent).joined(separator: ","))]"
@@ -1594,6 +1684,14 @@ final class AgentConversationService {
         // v8 adds the resident web-reference tools, so an old v7 thread is never reused.
         let scope = worldContext.map { $0.sessionScope + (worldTools == nil ? "" : ".tools.v8") }
         currentSessionScope = scope
+        lastSendReceipt = [
+            "backend": id.rawValue,
+            "scope": scope ?? "",
+            "hasWorldTools": worldTools != nil,
+            "imageCount": imageURLs.count,
+            "userMessage": userMessage ?? "",
+            "at": Date().timeIntervalSince1970,
+        ]
         // 记忆只认「真实用户文字」：只读聊天里 text 就是人类消息，可直接作为召回
         // query/交付对；工具会话的 text 是宿主拼装的居民轮次上下文，须由调用方
         // 显式传入 userMessage（真实的人类输入），否则本轮不召回、也不把组装

@@ -317,6 +317,12 @@ struct GMGNRadioApp: App {
     /// （和 `LivingWorldActivityMenuStore.shared` 同一套做法，只是这里只需要一个 Bool）。
     @StateObject private var stageDecorationMenu = StageDecorationMenuStore.shared
 
+    /// 尽可能早地建立测试隔离根：`@NSApplicationDelegateAdaptor` 构造 AppDelegate
+    /// 时会按属性默认值创建一批 store，所以 `CFFIXED_USER_HOME` 必须在它之前设好。
+    init() {
+        E2ERuntime.bootstrap()
+    }
+
     var body: some Scene {
         MenuBarExtra(ProductIdentity.displayName, systemImage: "waveform.circle.fill") {
             ForEach(
@@ -799,13 +805,42 @@ final class AppDelegate:
     /// 世界那一侧（读 `objectStates`、持久化）从外面注入，所以这一份不知道
     /// `WorldSimulation` / 权威的存在 —— 见 `Screen/WorldScreenStore.swift` 的 `Source`。
     private var screenStore: WorldScreenStore?
+    /// 显式 root 注入：E2E 下 taskd 的 socket/状态根必须落在测试根里。
+    /// 生产为 `nil`，`PropTaskDaemonClient` 自己回落到真实 Application Support。
+    ///
+    /// 根口径**只有一处**：`WorldAuthorityEndpoint.taskServiceRoot`。世界权威端点用的
+    /// 是同一个函数，所以生成服务与世界权威一定连到同一个 `taskd.sock`
+    /// （上一轮 E2E 的拒收项：同一测试根里出现两个 taskd）。
+    private var injectedTaskDaemonRoot: URL? {
+        guard let base = E2ERuntime.applicationSupportBase else { return nil }
+        return WorldAuthorityEndpoint.taskServiceRoot(applicationSupportBase: base)
+    }
+
+    /// 显式 root 注入：E2E 下生成服务配置从测试根读（驱动器把真实配置复制到这里，
+    /// 不打印内容、不改真实用户目录）。生产为 `nil`，回落到真实 home。
+    private var injectedPropGenerationConfigURL: URL? {
+        E2ERuntime.applicationSupportBase?
+            .appendingPathComponent("ai.gmgn.radio/secrets", isDirectory: true)
+            .appendingPathComponent("prop-generation.json")
+    }
+
+    /// 电视来源 / 标定 / 内容的持久化（显式 root 注入，E2E 下落在测试根）。
+    private lazy var screenPersistence = WorldScreenPersistence(
+        fileURL: E2ERuntime.applicationSupportDirectory()
+            .appendingPathComponent("gmgn radio/ScreenState.json", isDirectory: false)
+    )
+
+    /// 当前世界编号：屏幕记录按世界隔离，切世界不会串。
+    private var currentScreenWorldID: String {
+        livingWorldContext?.manifest.worldID ?? spatialStage.selectedWorldID ?? ""
+    }
     private var liveCamWindowController: LiveCamWindowController?
     private var residentSystemInboxWindowController: ResidentSystemInboxWindowController?
     /// 迟到的旧一轮提示推送不得覆盖新一轮任务列表。
     private var wishTaskPromptGeneration = 0
     /// 居民跨重启记忆的统一状态合同客户端（gmgn-taskd state_* 域）。
     private lazy var residentMemoryStore: ResidentMemoryStore = {
-        let transport = ResidentTaskDaemonStateTransport(client: PropTaskDaemonClient())
+        let transport = ResidentTaskDaemonStateTransport(client: PropTaskDaemonClient(root: injectedTaskDaemonRoot))
         let store = ResidentMemoryStore(client: ResidentStateClient(transport: transport))
         store.onPersistenceError = { [weak self] message in self?.showResidentVoiceStatus(message) }
         return store
@@ -839,7 +874,7 @@ final class AppDelegate:
     /// 依据见 `docs/plans/2026-09-08-voicemem-rust-contract.md` 的「已移除」一节。
     private lazy var residentConversationMemory: ResidentConversationMemory = {
         ResidentConversationMemory(
-            transport: ResidentTaskDaemonStateTransport(client: PropTaskDaemonClient())
+            transport: ResidentTaskDaemonStateTransport(client: PropTaskDaemonClient(root: injectedTaskDaemonRoot))
         )
     }()
     private var stageRenderSurfaceController: StageRenderSurfaceController?
@@ -849,6 +884,9 @@ final class AppDelegate:
     private var livingWorldApprovedMotions: [String: StageMotionAsset] = [:]
     private var desktopPresenceObserverID: UUID?
     private var livingWorldContext: WorldAgentContext?
+    /// 显式测试（`GMGN_E2E_DATA_ROOT`）时的文件邮箱控制面；生产恒为 nil。
+    private var e2eHostControl: E2EHostControl?
+    private var e2eWishAuthorizationID: UUID?
     private var livingCabinJukeboxGate = LivingCabinJukeboxGate()
     /// 一次执行实例里已经报过的"点唱机没出声"原因（同一个原因只报一次）。
     private var reportedJukeboxSilenceInstance: String?
@@ -904,6 +942,9 @@ final class AppDelegate:
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let environment = ProcessInfo.processInfo.environment
+        // 显式测试（GMGN_E2E_DATA_ROOT）在**任何持久化/偏好读取之前**建立隔离根；
+        // 未设置时是一次零副作用的 no-op，生产行为逐字节不变。
+        E2ERuntime.bootstrap()
         ApplicationIconInstaller().install()
         let shortcuts = GMGNShortcutCoordinator(
             settings: shortcutSettings,
@@ -1038,9 +1079,13 @@ final class AppDelegate:
                 presentPlaybackError(error)
             }
         }
+        // 控制面最后启动：等世界/舞台/收件箱都接好线再置 ready，驱动器读到 ready
+        // 时保证所有既有入口可用。未启用测试根时为 no-op。
+        installE2EHostControlIfEnabled()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        e2eHostControl?.stop()
         residentLoopSchedulingTask?.cancel()
         _ = returnHeldPropBeforeResidentStop(reason: "退出应用")
         residentAgentLoop?.invalidate()
@@ -1226,11 +1271,39 @@ final class AppDelegate:
                     self?.livingWorldContext?.state.objectStates[objectID]?
                         .generatedProp?.displayName ?? objectID
                 },
-                // 持久化：本轮**留空**（见设计文末「没做的部分」）。为 nil 时标定与换片
-                // 只在本会话内生效（电视面板已从产品界面移除，标定的界面入口随之消失；
-                // 屏幕范围仍由 `Screen/` 里的推断几何负责）。
-                persistDefinition: nil,
-                persistContent: nil
+                // 持久化：写进 App 数据根下的 `gmgn radio/ScreenState.json`（显式 root
+                // 注入）。**只落盘原始页面 URL 与屏幕定义**，解析器产出的签名媒资地址
+                // 永远只在内存里。重启后由 restore* 补回会话缓存。
+                persistDefinition: { [weak self] definition in
+                    guard let self else { return }
+                    self.screenPersistence.setDefinition(
+                        definition, objectID: definition.objectID,
+                        worldID: self.currentScreenWorldID
+                    )
+                },
+                persistContent: { [weak self] content in
+                    guard let self else { return }
+                    self.screenPersistence.setContent(
+                        content, objectID: content.objectID,
+                        worldID: self.currentScreenWorldID
+                    )
+                },
+                restoreDefinition: { [weak self] objectID in
+                    guard let self else { return nil }
+                    return self.screenPersistence
+                        .record(worldID: self.currentScreenWorldID).definitions[objectID]
+                },
+                restoreContent: { [weak self] objectID in
+                    guard let self else { return nil }
+                    return self.screenPersistence
+                        .record(worldID: self.currentScreenWorldID).contents[objectID]
+                },
+                removePersisted: { [weak self] objectID in
+                    guard let self else { return }
+                    self.screenPersistence.remove(
+                        objectID: objectID, worldID: self.currentScreenWorldID
+                    )
+                }
             ),
             projectionProvider: { [weak self] in
                 guard let self else {
@@ -1270,6 +1343,11 @@ final class AppDelegate:
         // 这里只接**覆盖层**（屏幕画面本体）与 store（三条 agent 工具的注入源）；
         // 面板视图保留在 `Screen/ScreenPanel.swift`，但产品路径上没有挂载 / 显示入口。
         screenStore = store
+        // 原生视频帧 → 场景像素：把 store 手里的取帧注册表交给渲染器。这是两者之间
+        // **唯一**的一处接线 —— 渲染器不认识 WKWebView、不认识解析器、也不知道 URL，
+        // 它只拿到"世界四角 + 一张纹理"。
+        stageRenderSurfaceController?.surfaceView.worldScreenNativeVideoRegistry =
+            store.nativeVideoRegistry
     }
 
     /// 三条屏幕工具的 control：**真有调用进来时**才去找覆盖层 store。
@@ -2714,6 +2792,10 @@ final class AppDelegate:
                     spatialStage: spatialStage, library: marbleWorldLibrary,
                     avatarRuntime: avatarRuntime
                 )
+                // 屏幕 store 可能先于渲染面建好（或反过来）：这里补接一次，
+                // 与 `installScreenOverlayIfNeeded` 那一处幂等。
+                stageRenderSurfaceController?.surfaceView.worldScreenNativeVideoRegistry =
+                    screenStore?.nativeVideoRegistry
             }
             if stageCameraCoordinator == nil {
                 stageCameraCoordinator = StageCameraCoordinator(spatialStage: spatialStage)
@@ -2744,7 +2826,10 @@ final class AppDelegate:
                 walkingSpeed: LivingWorldBootstrap.walkingSpeed(
                     approvedMotions: livingWorldApprovedMotions,
                     avatarFormat: avatarRuntime.snapshot.avatar?.format
-                )
+                ),
+                // 显式 root 注入：E2E 下世界预像与 taskd socket/helper 全部落在测试根，
+                // 不靠 `CFFIXED_USER_HOME`（Foundation 可能已经缓存了真实 home）。
+                applicationSupportBase: E2ERuntime.applicationSupportBase
             )
             livingWorldContext = context
             avatarRuntime.removeMotionPlaybackObserver(residentMotionPlaybackObserverID)
@@ -2931,6 +3016,9 @@ final class AppDelegate:
                 livingWorldLogger.notice(
                     "碰撞与遮挡 GLB 已接管生活空间：world=\(worldID, privacy: .public)，triangles=\(prepared.1.count, privacy: .public)"
                 )
+                // 承托几何与装修面板无关：碰撞世界一装好就把摆放服务要的那份备起来，
+                // 否则 agent 的自动摆放/入库落位在用户没开面板时永远 fail-closed。
+                prepareResidentPlacementSupport(context: context)
             } catch is CancellationError {
                 return
             } catch {
@@ -3830,6 +3918,8 @@ final class AppDelegate:
     private var wishMachineConfiguration: PropGenerationConfiguration?
     private var wishMachineServiceNotice = "许愿机服务尚未配置，请在空间设置中配置。"
     private lazy var wishMachineCoordinator = WishMachineCoordinator(store: propGenerationStore,
+        directory: E2ERuntime.applicationSupportBase?
+            .appendingPathComponent("gmgn radio/WishMachine", isDirectory: true),
         canClaim: { [weak self] job in self?.wishMachineClaimEvidence(for: job) })
     private struct ResidentWishImageRegistration {
         let attachment: ResidentImageAttachment
@@ -3996,13 +4086,16 @@ final class AppDelegate:
                                               isCurrent: @escaping @MainActor () -> Bool) -> ResidentPropPlacementService {
         ResidentPropPlacementService(context: context,
             // 承托几何来自建造模式的格子模型：派生好的网格 + 能给出三角形的碰撞世界。
-            // 建造模式没开或几何不可用时返回 nil，摆放一律被拒绝（fail-closed）。
+            // **与装修面板是否打开无关**：世界加载后 `prepareResidentPlacementSupport`
+            // 已经把当前世界的几何备进保留位，所以 agent 的自动摆放/入库落位不必等
+            // 用户先打开装修面板。拿不到几何时返回 nil，摆放一律被拒绝（fail-closed）。
             support: { [weak self] in
-                guard let self, let grid = self.residentPropGridEditor.grid,
-                      let collision = self.residentPropGridEditor.supportCollision else { return nil }
+                guard let self, let context = self.livingWorldContext,
+                      let support = self.residentPropGridEditor.supportForPlacement(
+                          key: context.manifest.worldID) else { return nil }
                 return ResidentPropPlacementSupport(
-                    grid: grid,
-                    collision: collision,
+                    grid: support.grid,
+                    collision: support.collision,
                     // 「别把唯一通路堵死」这条判据的全部输入（收窄后）。
                     // 拿不到就返回 nil ⇒ 服务拒绝摆放（fail-closed）。
                     routeConstraint: self.residentPropRouteConstraint()
@@ -5188,6 +5281,40 @@ final class AppDelegate:
         residentPropWishFacts(worldID: context.manifest.worldID, context: context).facts
             .first { $0.objectID == objectID }
             .map(ResidentOwnershipProjection.row)
+    }
+
+    /// 世界加载后把**摆放需要的承托几何**备好（与装修面板是否打开无关）。
+    ///
+    /// `list_placement_surfaces`、agent 的 `apply_prop_placement` 与领取后的入库落位
+    /// 都要这份几何，而它过去只在用户打开装修面板（`activateResidentPropGrid`）时才派生
+    /// —— 于是面板关着时 agent 永远拿不到承托层，摆放一律 fail-closed。这里在碰撞几何
+    /// 装好之后主动准备一次：命中缓存立即返回，否则后台派生。
+    ///
+    /// 它**不进入装修会话**：不打开面板、不向渲染层发布格子，只是把几何备进模型的
+    /// 保留位（`supportForPlacement(key:)`）。判据一个字没放宽 —— 拿不到碰撞几何或
+    /// 导航范围时什么都不准备，服务照旧 fail-closed 拒绝。
+    private func prepareResidentPlacementSupport(context: WorldAgentContext) {
+        let worldID = context.manifest.worldID
+        guard let base = context.propSupportQuerying,
+              let bounds = residentPropGridBounds(context: context) else {
+            livingWorldLogger.notice(
+                "摆放承托几何：拿不到碰撞几何或导航范围，保持 fail-closed world=\(worldID, privacy: .public)"
+            )
+            return
+        }
+        // 与 `activateResidentPropGrid` 同一条"可站带"判据（居民只在这些高度上站立/行走）。
+        residentPropGridEditor.setRouteBand(fromWaypoints: context.manifest.waypoints)
+        // 家具体积的顶面也算承托面（桌面/柜顶），与建造模式那份派生同源。
+        let collision = PropSupportDerivationWorld(
+            base: base,
+            topVolumes: context.manifest.collisionVolumes.filter(\.isBlocking)
+        )
+        let seed = context.manifest.spawn.position
+        Task { @MainActor [weak self] in
+            await self?.residentPropGridEditor.preparePlacementSupport(
+                collision: collision, seed: seed, bounds: bounds, key: worldID
+            )
+        }
     }
 
     /// 开启建造模式并派生格子。
@@ -6566,7 +6693,10 @@ final class AppDelegate:
     private func configureWishMachineService() {
         configureWishMessageDelivery()
         do {
-            let configuration = try PropGenerationConfigurationStore().load()
+            let configuration = try PropGenerationConfigurationStore(
+                fileURL: injectedPropGenerationConfigURL
+                    ?? PropGenerationConfigurationStore.defaultFileURL
+            ).load()
             guard configuration != wishMachineConfiguration else { return }
             wishMachineConfiguration = nil
             propGenerationStore.clearConfiguration()
@@ -6662,7 +6792,7 @@ final class AppDelegate:
     /// 尚无落库记录时只读导入一次，绝不改写、绝不删除旧文件。
     private lazy var residentSystemInboxStore: ResidentSystemInboxStore = {
         let storage = ResidentSystemInboxStateStorage(client: ResidentStateClient(
-            transport: ResidentTaskDaemonStateTransport(client: PropTaskDaemonClient())))
+            transport: ResidentTaskDaemonStateTransport(client: PropTaskDaemonClient(root: injectedTaskDaemonRoot))))
         let legacyArchiveURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
             .first?.appendingPathComponent("GMGNRadio", isDirectory: true)
             .appendingPathComponent("ResidentSystemInbox.json")
@@ -8295,6 +8425,453 @@ final class AppDelegate:
         case .finished:
             "finished"
         }
+    }
+
+    // MARK: - 显式测试宿主控制（GMGN_E2E_DATA_ROOT）
+    //
+    // 只有在测试根显式启用时才存在。所有命令都转发现有生产入口：
+    //   · submit_wish → `sendResidentSubmission`（UI 的同一个提交门）
+    //   · tool_call   → `makeResidentWorldTools` 的 `ResidentConversationTools.call`
+    //                   （居民当轮租约里的同一个工具入口；绝不直接写 world_commit）
+    //   · capture_frames → 居民视觉那条无权限 Metal drawable 回读
+    //   · playback/inbox/status → 只读投影
+    // 生产（未设环境变量）时 `installE2EHostControlIfEnabled` 是 no-op。
+
+    private func installE2EHostControlIfEnabled() {
+        guard E2ERuntime.isEnabled else { return }
+        let handler = E2EHostControl.Handler(
+            status: { [weak self] in
+                guard let self else { return ["error": "host_released"] }
+                return self.e2eStatusSnapshot()
+            },
+            submitWish: { [weak self] text, attachmentPaths in
+                guard let self else { throw E2EHostControlError.runtimeUnavailable("宿主已释放") }
+                return try await self.e2eSubmitWish(text: text, attachmentPaths: attachmentPaths)
+            },
+            authorizeWish: { [weak self] attachmentPaths in
+                guard let self else { throw E2EHostControlError.runtimeUnavailable("宿主已释放") }
+                return try self.e2eAuthorizeWish(attachmentPaths: attachmentPaths)
+            },
+            invokeTool: { [weak self] name, arguments in
+                guard let self else { throw E2EHostControlError.runtimeUnavailable("宿主已释放") }
+                return try await self.e2eInvokeWorldTool(name: name, arguments: arguments)
+            },
+            captureFrames: { [weak self] count, interval, trackGrounding in
+                guard let self else { return ["error": "host_released", "captured": 0, "frames": []] }
+                return await self.e2eCaptureFrames(
+                    count: count, intervalMilliseconds: interval, trackGrounding: trackGrounding
+                )
+            },
+            playbackState: { [weak self] in
+                guard let self else { return ["error": "host_released"] }
+                return self.e2ePlaybackState()
+            },
+            inboxState: { [weak self] in
+                guard let self else { return ["error": "host_released"] }
+                return await self.e2eInboxState()
+            },
+            markInboxRead: { [weak self] taskKey in
+                guard let self else { throw E2EHostControlError.runtimeUnavailable("宿主已释放") }
+                return try await self.e2eMarkInboxRead(taskKey: taskKey)
+            },
+            terminate: { [weak self] in self?.e2eTerminate() }
+        )
+        e2eHostControl = E2EHostControl.startIfEnabled(handler: handler)
+        livingWorldLogger.info("显式测试控制面已启动：root=\(E2ERuntime.dataRoot?.path ?? "", privacy: .public)")
+    }
+
+    private func e2eStatusSnapshot() -> [String: Any] {
+        var snapshot: [String: Any] = [
+            "e2e": E2ERuntime.isEnabled,
+            "dataRoot": E2ERuntime.dataRoot?.path ?? "",
+            "stageVisible": stageWindowController?.isPresented ?? false,
+            "selectedWorldID": spatialStage.selectedWorldID ?? "",
+            "livingWorldLoaded": livingWorldContext != nil,
+        ]
+        let world = currentResidentWorldContext()
+        snapshot["residentWorldID"] = world.worldID ?? ""
+        snapshot["residentScope"] = world.sessionScope
+        snapshot["residentPosition"] = world.residentPosition ?? []
+        snapshot["activeActivity"] = world.activeActivity ?? ""
+        // 执行器**同一份**一手事实里的相位。领取判据要求 `phase == "loop"`，
+        // 而 `activeActivity` 只回答"在跑哪个活动" —— 少这一项，驱动器无法区分
+        // "刚起步"与"已经到位等候"。
+        snapshot["activityPhase"] = livingWorldContext?.runningActivity?.phase.rawValue ?? ""
+        // 当前真正装载的人物：驱动器据此确认 PMX 人物（而不是内置光球）真的被选中，
+        // 以及活动动作是否落在 PMX 上。没有人物时如实给空串，不编造。
+        let avatar = avatarRuntime.snapshot.avatar
+        snapshot["avatarID"] = avatar?.id ?? ""
+        snapshot["avatarFormat"] = avatar.map { String(describing: $0.format) } ?? ""
+        // 角色地面接触入口：渲染器只读诊断（最低接触点 / 接地偏移 / 穿透补偿）。
+        // 驱动器据此做"人物不穿地"的端到端断言，而不是只看命令成功。
+        snapshot["avatarGrounding"] =
+            stageRenderSurfaceController?.surfaceView.avatarGroundingDiagnostics ?? [:]
+        // 角色逐帧结构化动作（真实 clip / 播放器 / 播放时钟 / 骨骼姿态角度）。这是
+        // "动作真的在播、姿态真的在变"的唯一证据；绝不拿资源 revision / GPU 帧号冒充。
+        snapshot["avatarMotion"] =
+            stageRenderSurfaceController?.surfaceView.avatarMotionDiagnostics ?? [:]
+        // 电视画面的渲染侧证据（真的画了 / 真的被深度挡住）。与 `playback_state` 同一份。
+        snapshot["screenVideo"] =
+            stageRenderSurfaceController?.surfaceView.screenVideoDiagnostics ?? [:]
+        if let revision = world.revision {
+            snapshot["revision"] = NSNumber(value: revision)
+        } else {
+            snapshot["revision"] = NSNull()
+        }
+        if let context = livingWorldContext {
+            let jobs = wishMachineCoordinator.residentJobs(
+                worldID: context.manifest.worldID, residentScope: world.sessionScope
+            )
+            snapshot["wishJobs"] = jobs.map { job -> [String: Any] in
+                var row: [String: Any] = [
+                    "id": job.id.uuidString,
+                    "name": job.name,
+                    "stage": job.stage.rawValue,
+                    "objectID": job.objectID,
+                    "jobID": job.jobID?.uuidString ?? "",
+                    "heightMeters": job.heightMeters,
+                    "daemonAccepted": job.daemonAccepted ?? false,
+                ]
+                row["lastError"] = job.lastError ?? ""
+                // 「下载检查真的完成了吗」的直接证据：只有 `ready` 才会带本地模型路径。
+                row["modelPath"] = job.modelPath ?? ""
+                row["modelFileExists"] = job.modelPath.map { FileManager.default.fileExists(atPath: $0) } ?? false
+                // 领取判据**唯一一份**（`claimAvailability` 与工具/界面同源）。
+                // 驱动器据此等"真的能领"再领，而不是看命令成功。
+                switch wishMachineCoordinator.claimAvailability(
+                    id: job.id, worldID: context.manifest.worldID, residentScope: world.sessionScope
+                ) {
+                case .success:
+                    row["claimReady"] = true
+                    row["claimError"] = ""
+                case let .failure(error):
+                    row["claimReady"] = false
+                    row["claimError"] = error.localizedDescription
+                }
+                if let evidence = try? wishMachineCoordinator.claimEvidence(
+                    id: job.id, worldID: context.manifest.worldID, residentScope: world.sessionScope
+                ) {
+                    row["claimActivity"] = evidence.activityID ?? ""
+                    row["claimPhase"] = evidence.phase ?? ""
+                    row["claimDistanceMeters"] = evidence.distanceMeters
+                    row["claimOutputAvailable"] = evidence.outputAvailable
+                }
+                return row
+            }
+            snapshot["heldPropObjectID"] = context.state.heldProp?.objectID ?? ""
+            snapshot["wishMachineOutputID"] = spatialStage.wishMachineOutput?.id ?? ""
+            snapshot["wishMachineOutputStatus"] = Self.e2eOutputStatusText(spatialStage.wishMachineOutputStatus)
+            snapshot["placementSupportReady"] =
+                residentPropGridEditor.supportForPlacement(key: context.manifest.worldID) != nil
+        }
+        snapshot["screens"] = (screenStore?.listScreens() ?? []).map { screen -> [String: Any] in
+            ["objectID": screen.objectID, "isPlaying": screen.isPlaying, "stateText": screen.stateText]
+        }
+        // 真实聊天回合链路的只读证据：`submit_wish` 走的是生产提交门，这里把
+        // "回合已登记 / 有没有真的进入对话服务 / 终态是什么" 三项分开上报。它们都
+        // 不是世界写入，也不改变任何行为。
+        let transcript = residentChatTranscript
+        snapshot["chatScopeKey"] = transcript.scopeKey ?? ""
+        snapshot["chatTurns"] = transcript.turns.map { turn -> [String: Any] in
+            [
+                "id": turn.id.uuidString,
+                "userText": turn.userText,
+                "delivery": String(describing: turn.delivery),
+                "replyText": turn.replyText ?? "",
+                "interruption": turn.interruption.map { String(describing: $0) } ?? "",
+                "createdAt": turn.createdAt.timeIntervalSince1970,
+            ]
+        }
+        if let loop = residentAgentLoop {
+            let loopSnapshot = loop.snapshot
+            snapshot["residentLoop"] = [
+                "runID": loopSnapshot.runID?.uuidString ?? "",
+                "isRunning": loopSnapshot.isRunning,
+                "isBackgroundRun": loopSnapshot.isBackgroundRun,
+                "isStopped": loopSnapshot.isStopped,
+                "modelTurnsStarted": loopSnapshot.modelTurnsStarted,
+                "backgroundModelTurnsStarted": loopSnapshot.backgroundModelTurnsStarted,
+                "failedModelTurns": loopSnapshot.failedModelTurns,
+                "cancelledModelTurns": loopSnapshot.cancelledModelTurns,
+                "lastFailure": loopSnapshot.lastFailure ?? "",
+                "pendingUserMessages": loopSnapshot.pendingUserMessages,
+                "lastTurnUserMessages": loopSnapshot.lastTurnUserMessages,
+                "lastTurnInterrupted": loopSnapshot.lastTurnInterrupted,
+            ]
+        } else {
+            snapshot["residentLoop"] = [:]
+        }
+        let conversation = AgentConversationService.shared
+        snapshot["agentConversation"] = [
+            "effectiveBackendID": conversation.effectiveBackendID.rawValue,
+            "hasUsableConversationBackend": conversation.hasUsableConversationBackend,
+            "installedBackends": conversation.installedBackends().map { $0.kind.rawValue },
+            "sendEnteredCount": conversation.sendEnteredCount,
+            "lastSend": conversation.lastSendReceipt,
+            // 内部失败因（stage/code/category/detail）：终态 failed 时用它具名定位，
+            // 不再只有"居民未能完成本轮回复"这一句概述。
+            "lastResidentFailure": conversation.lastResidentFailure,
+            // 有界失败历史：最近一次失败可能被后续轮次覆盖，具体哪一轮失败、为什么，
+            // 靠这份历史在 App 运行结束后仍能回看（只含安全投影字段）。
+            "recentResidentFailures": conversation.residentFailureHistory,
+        ]
+        return snapshot
+    }
+
+    /// 渲染端托盘产物状态的**机器可读**字面量（驱动器据此等"真的端上托盘并可领"）。
+    private static func e2eOutputStatusText(_ status: WishMachineOutputStatus) -> String {
+        switch status {
+        case .empty: return "empty"
+        case .loading: return "loading"
+        case .ready: return "ready"
+        case .failed: return "failed"
+        }
+    }
+
+    private func e2eSubmitWish(text: String, attachmentPaths: [String]) async throws -> [String: Any] {
+        let attachments = attachmentPaths.map { path -> ResidentImageAttachment in
+            let url = URL(fileURLWithPath: path)
+            return ResidentImageAttachment(id: UUID(), url: url, displayName: url.lastPathComponent)
+        }
+        let submission = ResidentChatSubmission(text: text, attachments: attachments)
+        // UI 的同一个提交门：registerWishImages / authorizeWishImages / 对话回合都由它完成。
+        try await sendResidentSubmission(submission, source: .stage)
+        return ["submitted": true, "submissionID": submission.id.uuidString,
+                "attachmentCount": attachments.count]
+    }
+
+    /// 只读引用现有素材，按**生产**的 `WishMachineCoordinator.registerImages` +
+    /// `authorize(registeredImageIDs:...)` 打开一次生成授权；随后由 `tool_call`
+    /// 调 `submit_wish_generation`（居民同一工具入口）真正提交。它不写世界状态，
+    /// 只把"用户这一轮允许用这张素材生成"这件事登记下来。
+    private func e2eAuthorizeWish(attachmentPaths: [String]) throws -> [String: Any] {
+        guard livingWorldContext != nil else {
+            throw E2EHostControlError.runtimeUnavailable("世界尚未加载")
+        }
+        let world = currentResidentWorldContext()
+        guard let worldID = world.worldID, !attachmentPaths.isEmpty else {
+            throw E2EHostControlError.missingParameter("attachments")
+        }
+        let attachments = attachmentPaths.map { path -> ResidentImageAttachment in
+            let url = URL(fileURLWithPath: path)
+            return ResidentImageAttachment(id: UUID(), url: url, displayName: url.lastPathComponent)
+        }
+        let conversationID = UUID().uuidString
+        let authorizationID = UUID()
+        try wishMachineCoordinator.registerImages(
+            attachments,
+            worldID: worldID,
+            residentScope: world.sessionScope,
+            conversationID: conversationID
+        )
+        try wishMachineCoordinator.authorize(
+            registeredImageIDs: attachments.map(\.id),
+            worldID: worldID,
+            residentScope: world.sessionScope,
+            conversationID: conversationID,
+            authorizationID: authorizationID,
+            source: PropGenerationSource(author: "E2E 只读素材引用", license: "用户提供，仅限本机测试")
+        )
+        e2eWishAuthorizationID = authorizationID
+        return [
+            "authorizationID": authorizationID.uuidString,
+            "conversationID": conversationID,
+            "worldID": worldID,
+            "residentScope": world.sessionScope,
+            "attachmentIDs": attachments.map(\.id.uuidString),
+        ]
+    }
+
+    private func e2eInvokeWorldTool(name: String, arguments: [String: Any]) async throws -> [String: Any] {
+        guard livingWorldContext != nil else {
+            throw E2EHostControlError.runtimeUnavailable("世界尚未加载")
+        }
+        let leaseID = UUID()
+        liveCamMessageID = leaseID
+        defer { if liveCamMessageID == leaseID { liveCamMessageID = nil } }
+        guard let tools = makeResidentWorldTools(
+            messageID: leaseID,
+            wishAuthorizationID: name == "submit_wish_generation" ? e2eWishAuthorizationID : nil,
+            allowsPausedWishClaim: true,
+            allowsPropMutation: true
+        ) else {
+            throw E2EHostControlError.runtimeUnavailable("本轮没有可用的世界工具（服务或空间未就绪）")
+        }
+        let requestID = "e2e-" + UUID().uuidString
+        let payloadData = try JSONSerialization.data(withJSONObject: arguments, options: [.sortedKeys])
+        let reply = await tools.call(requestID, name, payloadData)
+        let raw = String(decoding: reply.resultJSON, as: UTF8.self)
+        var payload: [String: Any] = [
+            "ok": !reply.isError,
+            "isError": reply.isError,
+            "requestID": requestID,
+            "resultJSON": raw,
+        ]
+        if let object = (try? JSONSerialization.jsonObject(with: reply.resultJSON)) as? [String: Any] {
+            payload["result"] = object
+        }
+        return payload
+    }
+
+    private func e2eCaptureFrames(
+        count: Int, intervalMilliseconds: Int, trackGrounding: Bool
+    ) async -> [String: Any] {
+        guard let surface = stageRenderSurfaceController?.surfaceView.residentVisionSurfaceHandle else {
+            return ["error": "metal_surface_unavailable", "captured": 0, "frames": []]
+        }
+        guard let context = livingWorldContext, let evidenceRoot = E2ERuntime.evidenceRoot else {
+            return ["error": "world_or_evidence_unavailable", "captured": 0, "frames": []]
+        }
+        // 只有驱动器显式要求接地采样时才附带角色状态：`metal_frames` 那条老判据
+        // 的载荷逐字段不变。采样与抓帧同在主 actor 上串行，读到的就是**那一帧**的
+        // 位置 / 活动 / 接地诊断。
+        let sampleProvider: (@MainActor @Sendable () -> [String: Any])? = trackGrounding
+            ? { @MainActor [weak self] () -> [String: Any] in
+                guard let self else { return [:] }
+                let world = self.currentResidentWorldContext()
+                var sample: [String: Any] = [
+                    "residentPosition": world.residentPosition ?? [],
+                    "activeActivity": world.activeActivity ?? "",
+                    "activityPhase": world.activityPhase ?? "",
+                ]
+                sample["avatarGrounding"] =
+                    self.stageRenderSurfaceController?.surfaceView.avatarGroundingDiagnostics ?? [:]
+                sample["avatarMotion"] =
+                    self.stageRenderSurfaceController?.surfaceView.avatarMotionDiagnostics ?? [:]
+                return sample
+            }
+            : nil
+        return await E2EFrameRecorder.captureSequence(
+            surface: surface,
+            worldID: context.manifest.worldID,
+            evidenceRoot: evidenceRoot,
+            count: count,
+            intervalMilliseconds: intervalMilliseconds,
+            sampleProvider: sampleProvider
+        )
+    }
+
+    private func e2ePlaybackState() -> [String: Any] {
+        var state: [String: Any] = [
+            "stageVideoActive": stageVideos.isActive,
+            "stageVideoAssetID": stageVideos.activeAssetID ?? "",
+        ]
+        // 电视**画面**的渲染侧度量：`drawPasses` / `encodedQuads` 证明原生视频纹理被
+        // 真的编码进场景；`fragments` 是 GPU 可见性查询（真的通过了深度测试的片元）。
+        // 驱动器据此判"有画面"，而不是只看解码统计。
+        state["screenVideo"] =
+            stageRenderSurfaceController?.surfaceView.screenVideoDiagnostics ?? [:]
+        if stageVideos.isActive {
+            state["stageVideoTime"] = stageVideos.player.currentTime().seconds
+            state["stageVideoRate"] = stageVideos.player.rate
+        }
+        state["screens"] = (screenStore?.listScreens() ?? []).map { screen -> [String: Any] in
+            var row: [String: Any] = [
+                "objectID": screen.objectID,
+                "displayName": screen.displayName,
+                "isPlaying": screen.isPlaying,
+                "stateText": screen.stateText,
+                "contentURL": screen.contentURL ?? "",
+            ]
+            if let surface = screen.surfaceState {
+                switch surface {
+                case .idle: row["surface"] = "idle"
+                case .loading: row["surface"] = "loading"
+                case .playing: row["surface"] = "playing"
+                case .stopped: row["surface"] = "stopped"
+                case let .failed(failure): row["surface"] = "failed:\(failure)"
+                }
+            }
+            // 原生播放器的**真实解码**度量：驱动器据此判"持续视频帧/时间"，
+            // 而不是只看播放命令成功。
+            if let metrics = screenStore?.nativeMetrics(objectID: screen.objectID) {
+                row["nativeLink"] = [
+                    "decodedFrames": metrics.decodedFrames,
+                    "gpuCopies": metrics.gpuCopies,
+                    "pixelWidth": metrics.pixelWidth,
+                    "pixelHeight": metrics.pixelHeight,
+                    "currentSeconds": metrics.currentSeconds,
+                    "itemStatus": metrics.itemStatus,
+                    "isLive": metrics.isLive,
+                    // 声音链：静音开关 / 音量 / 速率，以及**真实解码 PCM 采样**
+                    // （MTAudioProcessingTap 的缓冲数、帧数与峰值）。不是"命令成功"。
+                    "hasAudio": metrics.hasAudio,
+                    "isMuted": metrics.isMuted,
+                    "volume": metrics.volume,
+                    "rate": metrics.playbackRate,
+                    "sampledAudioBuffers": metrics.sampledAudioBuffers,
+                    "sampledAudioFrames": metrics.sampledAudioFrames,
+                    "audioPeakAmplitude": metrics.audioPeakAmplitude,
+                    "audioTapAttached": metrics.audioTapAttached,
+                    "audioTapInstallDetail": metrics.audioTapInstallDetail,
+                ]
+            }
+            return row
+        }
+        return state
+    }
+
+    /// 收件箱只读投影。
+    ///
+    /// **先恢复再读**：持久化走 gmgn-taskd 的 inbox 域，进程刚起来时内存里是空的。
+    /// 上一轮驱动器在重启后立刻读，拿到的是"空列表 + 未读 0"，于是把"记录丢了"和
+    /// "本来就没有"混为一谈。这里把作用域的 **durable 记录**先恢复出来（与
+    /// `openSystemInbox` / `pushWishTaskMessages` 走同一条 `restore`），再投影；
+    /// `restored` 如实说明这次读之前有没有真的从持久层恢复过。
+    private func e2eInboxState() async -> [String: Any] {
+        let world = currentResidentWorldContext()
+        guard let worldID = world.worldID else {
+            return ["unread": 0, "entries": [], "restored": false,
+                    "worldID": "", "residentScope": world.sessionScope]
+        }
+        await residentSystemInboxStore.restore(worldID: worldID, residentScope: world.sessionScope)
+        let entries = residentSystemInboxStore.entries(
+            worldID: worldID, residentScope: world.sessionScope
+        )
+        return [
+            "worldID": worldID,
+            "residentScope": world.sessionScope,
+            "restored": true,
+            "unread": residentSystemInboxStore.unreadCount(
+                worldID: worldID, residentScope: world.sessionScope
+            ),
+            "entries": entries.map { entry -> [String: Any] in
+                [
+                    "taskKey": entry.taskKey,
+                    "title": entry.title,
+                    "status": entry.status,
+                    "detail": entry.detail,
+                    "isRead": entry.isRead,
+                    "terminal": entry.terminal,
+                    "updatedAt": entry.updatedAt.timeIntervalSince1970,
+                ]
+            },
+        ]
+    }
+
+    private func e2eMarkInboxRead(taskKey: String) async throws -> [String: Any] {
+        let world = currentResidentWorldContext()
+        guard let worldID = world.worldID else {
+            throw E2EHostControlError.runtimeUnavailable("世界尚未加载")
+        }
+        // 与只读投影同一条纪律：先恢复持久层再标记，否则重启后内存为空会把一次
+        // 真实存在的已读操作变成 no-op（`markRead` 找不到条目直接返回 false）。
+        await residentSystemInboxStore.restore(worldID: worldID, residentScope: world.sessionScope)
+        let marked = await residentSystemInboxStore.markRead(
+            taskKey: taskKey, worldID: worldID, residentScope: world.sessionScope
+        )
+        return [
+            "taskKey": taskKey,
+            "markedRead": marked,
+            "unread": residentSystemInboxStore.unreadCount(
+                worldID: worldID, residentScope: world.sessionScope
+            ),
+        ]
+    }
+
+    private func e2eTerminate() {
+        e2eHostControl?.stop()
+        NSApp.terminate(nil)
     }
 }
 

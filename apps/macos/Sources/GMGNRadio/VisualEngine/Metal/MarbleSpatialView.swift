@@ -616,6 +616,89 @@ final class MarbleSpatialView: MTKView {
         residentVisionSurface
     }
 
+    /// 角色地面接触诊断（E2E / 日志只读）。没有 PMX 渲染器时返回空字典，
+    /// 由调用方如实报"入口不可用"，绝不编造 0。
+    var avatarGroundingDiagnostics: [String: Any] {
+        guard let renderer = spatialRenderer?.groundingRenderer else { return [:] }
+        let minimum = renderer.minimumContactY
+        let rest = renderer.restGlobalReferenceY
+        let penetration: Float
+        if let minimum, let rest {
+            penetration = PMXContactGrounding.penetrationOffset(
+                restGlobalMinY: rest,
+                animatedGlobalMinY: minimum
+            )
+        } else {
+            penetration = 0
+        }
+        var diagnostics: [String: Any] = [
+            "groundingOffsetY": renderer.localGroundingOffsetY,
+            // 真实乘进最近一帧模型变换的补偿（渲染事实）。`groundingOffsetY` 是策略前
+            // 原始值；E2E 用 `appliedGroundingOffsetY` 判"补偿真的施加了"，用
+            // `renderedAvatarFrameCount`/`renderedSceneTime` 判采样落在真实渲染帧上。
+            "appliedGroundingOffsetY": renderer.lastAppliedGroundingOffsetY,
+            "renderedSceneTime": renderer.lastRenderedSceneTime,
+            "renderedAvatarFrameCount": renderer.renderedAvatarFrameCount,
+            "rootOffsetY": renderer.animatedRootOffset.y,
+            "penetrationOffsetY": penetration,
+            // 运行时实际采用的抬升量（安全地板，只抬不压）。
+            "contactLiftY": max(0, penetration),
+        ]
+        if let minimum { diagnostics["minimumContactY"] = minimum }
+        if let rest {
+            diagnostics["restGlobalReferenceY"] = rest
+            // 未补偿的穿透深度（静止最低点 - 当前最低点，钳到 >= 0）。
+            diagnostics["uncompensatedPenetrationY"] = max(0, rest - (minimum ?? rest))
+        }
+        return diagnostics
+    }
+
+    /// 角色**逐帧结构化动作**事实（E2E / 诊断只读）。
+    ///
+    /// 读的是 `PMXStageAvatarRenderer.motionPlaybackSnapshot`：真实 clip / 播放器 /
+    /// 播放时钟 / 每根诊断骨骼相对静止姿态的角度。没有 PMX 渲染器时返回空字典，
+    /// 由调用方如实报"入口不可用"，绝不编造动作。
+    var avatarMotionDiagnostics: [String: Any] {
+        guard let renderer = spatialRenderer?.groundingRenderer else { return [:] }
+        return renderer.motionPlaybackSnapshot
+    }
+
+    /// 电视原生视频取帧表：App 组合在 `WorldScreenStore` 建好之后注入
+    /// （`WorldScreenStore.nativeVideoRegistry`）。它是渲染器取原生视频帧的**唯一**接缝。
+    ///
+    /// 注入之前 / 没有登记任何屏幕时 `frames()` 为空，渲染器一个视频 pass 都不加，
+    /// 既有画面逐字节不变。
+    var worldScreenNativeVideoRegistry: WorldScreenNativeVideoRegistry? {
+        didSet {
+#if arch(arm64)
+            spatialRenderer?.screenVideoRegistry = worldScreenNativeVideoRegistry
+#endif
+        }
+    }
+
+    /// 电视视频**真的画进场景**的只读度量（E2E / 诊断）。
+    ///
+    /// `drawPasses` / `encodedQuads` 证明渲染器消费了注册表并编码了视频纹理；
+    /// `fragments` 是 GPU 可见性查询（真的通过了深度测试的片元数）。没有渲染器时返回
+    /// 空字典，由调用方如实报"入口不可用"，绝不编造 0。
+    var screenVideoDiagnostics: [String: Any] {
+#if arch(arm64)
+        guard let stats = spatialRenderer?.screenVideoStats else { return [:] }
+        return [
+            "drawPasses": stats.drawPasses,
+            "encodedQuads": stats.encodedQuads,
+            "fragments": stats.fragments,
+            "skippedNotReady": stats.skippedNotReady,
+            "lastObjectIDs": stats.lastObjectIDs,
+            "lastPixelWidth": stats.lastPixelWidth,
+            "lastPixelHeight": stats.lastPixelHeight,
+            "registryRegistered": spatialRenderer?.screenVideoRegistry?.isEmpty == false,
+        ]
+#else
+        return [:]
+#endif
+    }
+
     func setResidentPropRenderingActive(_ active: Bool) {
         residentPropRenderingActive = active
         if !active {
@@ -1548,6 +1631,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
     private var appliedVRMLocomotionGait: StageLocomotionGait?
     private var avatarRestRotations: [VRMHumanoidBone: simd_quatf] = [:]
     private var pmxAvatarRenderer: PMXStageAvatarRenderer?
+    var groundingRenderer: PMXStageAvatarRenderer? { pmxAvatarRenderer }
     private var appliedVRMResolvedMotion: StageAvatarResolvedMotion?
     private var appliedPMXResolvedMotion: StageAvatarResolvedMotion?
     private var appliedVRMPlaybackIdentity: StageMotionPlaybackIdentity?
@@ -1577,6 +1661,17 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
     private var wishMachineOutputRenderer: WishMachineOutputRenderer?
     private var residentPropRenderer: ResidentPropRenderer?
     private var propSupportGridRenderer: PropSupportGridRenderer?
+    /// 电视的原生视频帧 → 场景像素。**这是 `WorldScreenNativeVideoRegistry` 的唯一消费者**。
+    private var worldScreenVideoRenderer: WorldScreenVideoRenderer?
+    /// 建过一次就不反复重试（shader 编不出来时只报一次错，不逐帧刷屏）。
+    private var didAttemptWorldScreenVideoRenderer = false
+    /// 由 App 组合注入（`WorldScreenStore.nativeVideoRegistry`）。为空 = 没有电视，
+    /// 视频 pass 一个都不加，既有画面逐字节不变。
+    var screenVideoRegistry: WorldScreenNativeVideoRegistry?
+    /// 电视视频**真的画进场景**的只读度量（E2E / 诊断）。
+    var screenVideoStats: WorldScreenVideoRenderer.Stats {
+        worldScreenVideoRenderer?.stats ?? WorldScreenVideoRenderer.Stats()
+    }
     private let residentPropRenderOwner = ResidentPropRenderOwner()
     private var residentPropRenderRevision: UInt64?
     private var residentDisplayStandNode: SCNNode?
@@ -2096,20 +2191,24 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         )
 
         var hasGeneratedOutputDepth = false
+        var screenVideoDrew = false
         if renderProfile.drawsWorld, let depthTexture = view.depthStencilTexture {
             let camera = spatialStage.camera
             let cameraView = rotationX(-camera.pitch) * rotationY(-camera.yaw) * translation(-camera.position)
             if propLease != nil { spatialStage.residentPropViewProjection = projection * cameraView }
+            let depthConvention = MarbleSceneDepthConvention.resolve(
+                avatarFormat: avatarRuntime.snapshot.avatar?.format
+            )
             hasGeneratedOutputDepth = wishMachineOutputRenderer?.render(
                 commandBuffer: commandBuffer, colorTexture: drawable.texture, depthTexture: depthTexture,
                 viewProjection: projection * cameraView, cameraPosition: camera.position,
-                reversedDepth: MarbleSceneDepthConvention.resolve(avatarFormat: avatarRuntime.snapshot.avatar?.format) == .sceneKitReverse,
+                reversedDepth: depthConvention == .sceneKitReverse,
                 preservesDepth: hasPreparedOccluder
             ) ?? false
             let hasPlacedProps = residentPropRenderer?.render(
                 commandBuffer: commandBuffer, colorTexture: drawable.texture, depthTexture: depthTexture,
                 viewProjection: projection * cameraView, cameraPosition: camera.position,
-                reversedDepth: MarbleSceneDepthConvention.resolve(avatarFormat: avatarRuntime.snapshot.avatar?.format) == .sceneKitReverse,
+                reversedDepth: depthConvention == .sceneKitReverse,
                 preservesDepth: hasPreparedOccluder || hasGeneratedOutputDepth
             ) ?? false
             hasGeneratedOutputDepth = hasGeneratedOutputDepth || hasPlacedProps
@@ -2120,10 +2219,36 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                 propSupportGridRenderer.render(
                     commandBuffer: commandBuffer, colorTexture: drawable.texture, depthTexture: depthTexture,
                     viewProjection: projection * cameraView,
-                    reversedDepth: MarbleSceneDepthConvention.resolve(avatarFormat: avatarRuntime.snapshot.avatar?.format) == .sceneKitReverse,
+                    reversedDepth: depthConvention == .sceneKitReverse,
                     preservesDepth: hasPreparedOccluder || hasGeneratedOutputDepth,
                     instances: spatialStage.residentPropGridInstances(cameraPosition: camera.position)
                 )
+            }
+
+            // 电视的原生视频帧**真的画进场景**：与房间遮挡网格 / 已摆放道具共用同一张
+            // 深度缓冲。画在道具之后、角色之前 —— 前墙/道具挡住电视，电视挡住身后的角色。
+            // 没有登记任何屏幕时这里是空操作（`frames()` 为空 ⇒ 一个 pass 都不加）。
+            if let registry = screenVideoRegistry {
+                let frames = registry.frames()
+                if !frames.isEmpty {
+                    if worldScreenVideoRenderer == nil, !didAttemptWorldScreenVideoRenderer {
+                        didAttemptWorldScreenVideoRenderer = true
+                        worldScreenVideoRenderer = WorldScreenVideoRenderer(
+                            device: renderer.device,
+                            colorFormat: view.colorPixelFormat,
+                            depthFormat: view.depthStencilPixelFormat
+                        )
+                    }
+                    screenVideoDrew = worldScreenVideoRenderer?.render(
+                        commandBuffer: commandBuffer,
+                        colorTexture: drawable.texture,
+                        depthTexture: depthTexture,
+                        viewProjection: projection * cameraView,
+                        reversedDepth: depthConvention == .sceneKitReverse,
+                        preservesDepth: hasPreparedOccluder || hasGeneratedOutputDepth,
+                        frames: frames
+                    ) ?? false
+                }
             }
         }
 
@@ -2133,7 +2258,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                 drawable: drawable,
                 commandBuffer: commandBuffer,
                 projection: projection,
-                hasPreparedOccluder: hasPreparedOccluder || hasGeneratedOutputDepth,
+                hasPreparedOccluder: hasPreparedOccluder || hasGeneratedOutputDepth || screenVideoDrew,
                 deltaTime: max(delta, 0)
             )
         }
@@ -2559,6 +2684,9 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             let pmxCameraView: simd_float4x4
             let pmxProjection: simd_float4x4
             let pmxModelTransform: simd_float4x4
+            // 真实乘进模型变换的接地补偿（liveCam 为 0）。它随帧交给渲染器，作为
+            // "补偿真的施加了"的渲染事实；`localGroundingOffsetY` 只是策略前的原始值。
+            var appliedGroundingOffsetY: Float = 0
             if renderProfile == .liveCam {
                 var localCamera = DesktopPMXCameraState.default
                 localCamera.yaw = liveCamOrbit.yaw - placement.yaw
@@ -2587,6 +2715,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                     rootMotionEnabled: pmxAvatarRenderer.rootMotionEnabled,
                     animatedOffset: pmxAvatarRenderer.localGroundingOffsetY
                 )
+                appliedGroundingOffsetY = groundingOffset
                 let matrices = MarblePMXRenderMatrices.fullStage(
                     bounds: pmxAvatarRenderer.localBounds,
                     placement: placement,
@@ -2638,6 +2767,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                 viewMatrix: pmxCameraView,
                 projectionMatrix: pmxProjection,
                 modelTransform: pmxModelTransform,
+                groundingOffsetY: appliedGroundingOffsetY,
                 time: Date.timeIntervalSinceReferenceDate,
                 diagnosticProfile: shouldLogPMXFrame ? profileName : nil
             )

@@ -34,6 +34,11 @@ enum ResidentCodexAgentError: Error, LocalizedError {
     private(set) var failureCode: String?
     private(set) var failureCategory: String?
     private(set) var failureDetail: String?
+    /// 失败那一轮在协议里的状态，以及错误体的**形状**（只列协议字段名，绝不含值）：
+    /// 当安全投影只能给出 `unclassified` 时，靠它区分「`turn.error` 缺失」和
+    /// 「错误体不是预期字典」。只进 E2E/日志，不进用户界面。
+    private(set) var failureTurnStatus: String?
+    private(set) var failureErrorShape: String?
     private(set) var didSendTurnStart = false
     private var stage = "preflight"
     private var lastSafeErrorCode: String?
@@ -83,7 +88,8 @@ enum ResidentCodexAgentError: Error, LocalizedError {
         successfulToolCall = false
         let token = UUID()
         operationID = token
-        failureStage = nil; failureCode = nil; failureCategory = nil; failureDetail = nil; didSendTurnStart = false
+        failureStage = nil; failureCode = nil; failureCategory = nil; failureDetail = nil
+        failureTurnStatus = nil; failureErrorShape = nil; didSendTurnStart = false
         stage = "preflight"; lastSafeErrorCode = nil; lastSafeErrorCategory = nil; lastSafeErrorDetail = nil
         terminal = nil; threadID = nil; turnID = nil; acceptingTurn = false; finalMessages = []
         let deadline = Task { [weak self] in
@@ -253,11 +259,8 @@ enum ResidentCodexAgentError: Error, LocalizedError {
             guard let turnID, let threadID, let turn = params["turn"] as? [String: Any],
                   turn["id"] as? String == turnID else { return }
             guard turn["status"] as? String == "completed" else {
-                if let error = turn["error"] as? [String: Any] {
-                    lastSafeErrorCode = ResidentCodexSafeError.code(from: error["codexErrorInfo"])
-                    lastSafeErrorCategory = ResidentCodexSafeError.category(message: error["message"] as? String)
-                    lastSafeErrorDetail = ResidentCodexSafeError.detail(message: error["message"] as? String)
-                }
+                failureTurnStatus = turn["status"] as? String
+                recordSafeError(turn["error"])
                 complete(.failure(ResidentCodexAgentError.turnFailed)); return
             }
             let reply = finalMessages.map(\.text).joined(separator: "\n\n")
@@ -267,15 +270,26 @@ enum ResidentCodexAgentError: Error, LocalizedError {
             complete(.success(ResidentCodexAgentOutcome(reply: reply, sessionID: threadID)))
         } else if method == "error" {
             guard let turnID, params["turnId"] as? String == turnID else { return }
-            if let error = params["error"] as? [String: Any] {
-                lastSafeErrorCode = ResidentCodexSafeError.code(from: error["codexErrorInfo"])
-                // The transport constructs this value from the fixed local classifier.
-                lastSafeErrorCategory = error["category"] as? String
-                lastSafeErrorDetail = error["detail"] as? String
-            }
+            if params["error"] != nil { recordSafeError(params["error"]) }
             if params["willRetry"] as? Bool == true { return }
             complete(.failure(ResidentCodexAgentError.turnFailed))
         }
+    }
+
+    /// 只记录**安全投影**后的失败因与错误形状（协议字段名集合，绝不含值/文案）。
+    /// 形状是最后一个诊断出口：当 `category`/`detail` 只能给出 `unclassified`
+    /// 时，它能说明错误体到底是缺失、是字符串、还是带了未识别的 `codexErrorInfo`。
+    private func recordSafeError(_ raw: Any?) {
+        guard let error = raw as? [String: Any] else {
+            failureErrorShape = raw == nil ? "absent" : "non-object"
+            return
+        }
+        failureErrorShape = error.keys.sorted().joined(separator: ",")
+        lastSafeErrorCode = ResidentCodexSafeError.code(from: error["codexErrorInfo"])
+        lastSafeErrorCategory = error["category"] as? String
+            ?? ResidentCodexSafeError.category(message: error["message"] as? String)
+        lastSafeErrorDetail = error["detail"] as? String
+            ?? ResidentCodexSafeError.detail(message: error["message"] as? String)
     }
 
     private func performTool(_ data: Data, token: UUID, handler: ToolHandler) async -> Data {

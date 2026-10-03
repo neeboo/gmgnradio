@@ -144,7 +144,7 @@ class InstallTests(unittest.TestCase):
             (app / 'Contents/Helpers').mkdir(parents=True)
             (app / 'Contents/MacOS').mkdir()
             (app / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier': 'ai.gmgn.radio', 'CFBundleExecutable': 'gmgn radio'}))
-            for relative in ['Contents/Helpers/gmgn-taskd', 'Contents/MacOS/gmgn radio']:
+            for relative in ['Contents/Helpers/gmgn-taskd', 'Contents/Helpers/gmgn-mcpd', 'Contents/MacOS/gmgn radio']:
                 p = app / relative
                 p.write_text(marker)
                 p.chmod(0o755)
@@ -366,7 +366,8 @@ class InstallTests(unittest.TestCase):
         签名是嵌在文件里的，复制不会丢，才测得到。
         """
         echo = Path('/bin/echo').read_bytes()
-        for relative in ['Contents/Helpers/gmgn-taskd', 'Contents/MacOS/gmgn radio']:
+        for relative in ['Contents/Helpers/gmgn-taskd', 'Contents/Helpers/gmgn-mcpd',
+                         'Contents/MacOS/gmgn radio']:
             target = self.source / relative
             target.unlink()
             # 只写字节、不抄标志：copy2 会连 /bin/echo 的受限文件标志一起抄，

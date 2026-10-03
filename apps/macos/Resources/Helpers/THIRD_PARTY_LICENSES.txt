@@ -1,0 +1,52 @@
+gmgn radio — 内置电视链接解析 helper 的第三方许可声明
+=====================================================
+
+本文件随 `gmgn radio.app/Contents/Helpers/` 里内置的网站链接解析 helper 一起分发。
+它由 `tools/bundle-screen-link-helper.py` 在打包时复制进 `Contents/Helpers/`；
+运行时不联网、不更新，只执行与仓库钉死 sha256 逐字节一致的副本。
+
+仓库里的钉死清单（版本 / 来源 / sha256 / 许可）：
+  tools/helpers/screen-link-helpers.lock.json
+运行时权威：apps/macos/Sources/GMGNRadio/Screen/LinkResolver/BundledHelperManifest.swift
+
+--------------------------------------------------------------------------
+yt-dlp（Helper：yt-dlp）
+--------------------------------------------------------------------------
+版本：2026.06.09
+来源：https://github.com/yt-dlp/yt-dlp/releases/download/2026.06.09/yt-dlp_macos
+sha256：b82c3626952e6c14eaf654cc565866775ffd0b9ffb7021628ac59b42c2f4f244
+上游许可：Unlicense（public domain）
+分发形态：PyInstaller 独立可执行文件（`yt-dlp_macos`，universal，x86_64 + arm64）
+组合作品许可：GPL-3.0-or-later
+
+说明：yt-dlp 源码仓库、sdist 与 wheel 是 Unlicense；但官方 PyInstaller 独立二进制
+内含 GPLv3+ 代码，因此**整个分发的组合作品按 GPLv3+ 分发**。这不是一条
+“Unlicense 随便用”的路。完整 GPLv3 文本见 https://www.gnu.org/licenses/gpl-3.0.txt
+
+内部组件：
+  - Python 解释器（PSF-2.0）
+  - meriyah（ISC）— JavaScript 解析器
+  - astring（MIT）— AST 生成
+  - yt-dlp-ejs（Unlicense；源码树，非单文件）— YouTube 完整支持所需
+  - ffmpeg / ffprobe（LGPL-2.1-or-later 或 GPL-2.0-or-later，随构建而变）：
+    本 App 不内置 ffmpeg；合并分轨由 AVFoundation 的 AVMutableComposition 完成。
+
+--------------------------------------------------------------------------
+deno（Helper：deno，默认不内置）
+--------------------------------------------------------------------------
+版本：2.9.7
+来源：https://github.com/denoland/deno/releases/download/v2.9.7/deno-aarch64-apple-darwin.zip
+zip sha256：5cd46d6268f6f78f5d88bdc7159d20bd44cdaa4b3303474839f87ec6fe7ae25c
+二进制 sha256：b73737579d5a84c160e3316487594783fa5c15f4e13252a6a07050b755317f1a
+许可：MIT
+用途：yt-dlp-ejs 解 YouTube nsig 所需的 JavaScript 运行时（官方推荐）。
+默认不随包；只有显式 `--include deno` 时才按上表校验后内置。
+
+--------------------------------------------------------------------------
+再分发义务
+--------------------------------------------------------------------------
+任何随 App 分发上述 helper 的构建，都必须：
+  1. 保留本声明文件（`Contents/Helpers/THIRD_PARTY_LICENSES.txt`）；
+  2. 提供 GPLv3+ 组合作品对应的完整源码获取方式（yt-dlp 上游源码仓库）；
+  3. 不改写 helper 的许可字段（`BundledHelperManifest` 区分
+     `upstreamLicenseSPDX` 与 `combinedWorkLicenseSPDX`，不许把 GPL 组合作品写成只有 Unlicense）。

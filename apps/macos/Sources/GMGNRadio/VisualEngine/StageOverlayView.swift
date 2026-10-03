@@ -21,7 +21,9 @@ final class StageResidentChatState: ObservableObject {
     /// 最近对话（宿主持有的同一份快照）：用户提交的回合 + 居民回复，按回合可
     /// 回看。展示层只渲染，不做回合判定，与 LiveCam 口径一致。
     @Published private(set) var transcript: [ResidentChatTranscriptLine] = []
-    let images = ResidentAttachmentStore()
+    let images = ResidentAttachmentStore(
+        directory: E2ERuntime.applicationSupportBase?
+            .appendingPathComponent("gmgn radio/ResidentAttachments", isDirectory: true))
     private var recovery = ResidentDraftRecovery()
 
     init() { images.onChange = { [weak self] in self?.objectWillChange.send() } }

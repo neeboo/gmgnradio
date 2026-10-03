@@ -173,20 +173,37 @@ final class AuthorityWorldStatePersistence: WorldStatePersisting, @unchecked Sen
 /// （Application Support/gmgn radio/TaskService/taskd.sock + 应用内 helper）。
 ///
 /// `applicationSupportBase` 只给测试/夹具换根用；生产传 nil。
+///
+/// **唯一根**：`taskServiceRoot` 是 taskd 状态/socket 根的唯一拼接口。世界权威端点、
+/// `PropTaskDaemonClient` 的 E2E 显式注入都从这里取。上一轮 E2E 的拒收项正是这里：
+/// 端点以为传进来的 base 已经是 `.../gmgn radio`，于是把 socket 落在
+/// `<base>/TaskService/taskd.sock`，而 `PropTaskDaemonClient(root:)` 落在
+/// `<base>/gmgn radio/TaskService/taskd.sock` —— 同一个测试根里出现两个 taskd，
+/// 世界权威与生成服务各连各的。现在只有一个函数能拼这个根。
 struct WorldAuthorityEndpoint {
     let socketPath: String
     let helperPath: String
 
-    init(applicationSupportBase: URL? = nil, bundle: Bundle = .main) {
+    /// taskd 的 socket/状态根：`<Application Support>/gmgn radio/TaskService`。
+    /// 传 nil 时用真实用户 Application Support（生产）；传 base 时只换最外层根。
+    static func taskServiceRoot(
+        applicationSupportBase: URL? = nil,
+        fileManager: FileManager = .default
+    ) -> URL {
         let support: URL
         if let applicationSupportBase {
             support = applicationSupportBase
         } else {
-            support = FileManager.default
+            support = fileManager
                 .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-                .appendingPathComponent("gmgn radio", isDirectory: true)
         }
-        let root = support.appendingPathComponent("TaskService", isDirectory: true)
+        return support
+            .appendingPathComponent("gmgn radio", isDirectory: true)
+            .appendingPathComponent("TaskService", isDirectory: true)
+    }
+
+    init(applicationSupportBase: URL? = nil, bundle: Bundle = .main) {
+        let root = Self.taskServiceRoot(applicationSupportBase: applicationSupportBase)
         socketPath = root.appendingPathComponent("taskd.sock").path
         helperPath = bundle.bundleURL
             .appendingPathComponent("Contents/Helpers/gmgn-taskd").path

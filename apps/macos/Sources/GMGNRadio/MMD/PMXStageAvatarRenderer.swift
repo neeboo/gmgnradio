@@ -937,6 +937,25 @@ enum PMXAnimatedGrounding {
     }
 }
 
+/// 全身最低接触点的接地补偿。
+///
+/// 脚部探针只能回答"脚底离地了没有"：坐、盘腿、跪的真实最低接触是膝 / 小腿 / 臀，
+/// 脚可能比静止姿态**更高**，于是 `restFoot - animatedFoot <= 0`，单向策略
+/// （`max(0, …)`）永远不抬升 ⇒ 真正的最低网格顶点穿地。这里用**全身**最低顶点
+/// 做参考量，补掉这一类姿态的穿透。
+///
+/// 纯逻辑、无 SceneKit 依赖：判据（`tools/test-avatar-grounding.swift`）直接抽取它。
+enum PMXContactGrounding {
+    /// `restGlobalMinY - animatedGlobalMinY`。非有限值一律 0（拒绝补偿，不猜）。
+    static func penetrationOffset(
+        restGlobalMinY: Float,
+        animatedGlobalMinY: Float
+    ) -> Float {
+        guard restGlobalMinY.isFinite, animatedGlobalMinY.isFinite else { return 0 }
+        return restGlobalMinY - animatedGlobalMinY
+    }
+}
+
 enum PMXFullStageGroundingPolicy {
     /// `preparedMotion` preserves every authored root-translation axis regardless
     /// of `rootMotionEnabled`, so the full-stage framing anchors the *rest* sole at
@@ -1357,6 +1376,92 @@ enum PMXSoleGrounding {
             .prefix(maximumProbeCount)
             .map { result[$0] }
     }
+
+    /// 全身**非脚**接触探针：从全部蒙皮顶点按固定步长抽样，用于捕捉坐 / 跪 / 盘腿时
+    /// 由膝、小腿、臀决定的最低接触点。与 `makeProbes` 同一套影响权重换算，唯一区别是
+    /// **不筛脚骨**、只按步长抽样。上限 512 保证每帧 `referenceY` 的成本可控。
+    static func makeContactProbes(
+        in model: MMDNode,
+        stride: Int = 8,
+        maximumProbeCount: Int = 512
+    ) -> [PMXSoleProbe] {
+        var result: [PMXSoleProbe] = []
+        let step = max(stride, 1)
+        model.enumerateHierarchy { node, _ in
+            guard let skinner = node.skinner,
+                  let geometry = skinner.baseGeometry,
+                  let vertexSource = geometry.sources(for: .vertex).first
+            else {
+                return
+            }
+            let weightsSource = skinner.boneWeights
+            let indicesSource = skinner.boneIndices
+            let vertexReader = PMXGeometrySourceReader(source: vertexSource)
+            let weightsReader = PMXGeometrySourceReader(source: weightsSource)
+            let indicesReader = PMXGeometrySourceReader(source: indicesSource)
+            let count = min(
+                vertexReader.vectorCount,
+                weightsReader.vectorCount,
+                indicesReader.vectorCount
+            )
+            guard count > 0 else {
+                return
+            }
+            var index = 0
+            while index < count {
+                defer { index += step }
+                guard let localPosition = vertexReader.vector3(at: index) else {
+                    continue
+                }
+                let modelPosition = node.simdConvertPosition(localPosition, to: model)
+                guard modelPosition.x.isFinite,
+                      modelPosition.y.isFinite,
+                      modelPosition.z.isFinite
+                else {
+                    continue
+                }
+                var influences: [PMXSoleProbe.Influence] = []
+                let componentCount = min(
+                    weightsReader.componentsPerVector,
+                    indicesReader.componentsPerVector
+                )
+                for component in 0 ..< componentCount {
+                    guard let weight = weightsReader.floatComponent(
+                        vector: index,
+                        component: component
+                    ), weight > 0.001,
+                    let boneIndex = indicesReader.unsignedComponent(
+                        vector: index,
+                        component: component
+                    ), boneIndex < skinner.bones.count
+                    else {
+                        continue
+                    }
+                    let bone = skinner.bones[boneIndex]
+                    influences.append(
+                        PMXSoleProbe.Influence(
+                            bone: bone,
+                            localPosition: bone.simdConvertPosition(
+                                modelPosition,
+                                from: model
+                            ),
+                            weight: weight
+                        )
+                    )
+                }
+                if !influences.isEmpty {
+                    result.append(PMXSoleProbe(influences: influences))
+                }
+            }
+        }
+        guard result.count > maximumProbeCount else {
+            return result
+        }
+        let samplingStride = max(result.count / maximumProbeCount, 1)
+        return Swift.stride(from: 0, to: result.count, by: samplingStride)
+            .prefix(maximumProbeCount)
+            .map { result[$0] }
+    }
 }
 
 struct PMXRenderTimeline: Equatable, Sendable {
@@ -1701,12 +1806,45 @@ public final class PMXStageAvatarRenderer {
     private var trackingRootRestPosition = SIMD3<Float>.zero
     public private(set) var restFootReferenceY: Float?
     private var soleProbes: [PMXSoleProbe] = []
+    /// 全身非脚接触探针 + 静止姿态最低点（坐 / 跪 / 盘腿的接地参考）。
+    private var contactProbes: [PMXSoleProbe] = []
+    public private(set) var restGlobalReferenceY: Float?
+    /// 探针为空的具名原因只上报一次，避免每帧刷屏。
+    private var didReportContactProbeGap = false
+
+    /// 当前全身最低接触点的模型局部 Y（诊断 / E2E 只读）。探针不可用时 `nil`，
+    /// 不假装 0。
+    public var minimumContactY: Float? {
+        guard let modelNode else { return nil }
+        return PMXSoleGrounding.referenceY(
+            probes: contactProbes,
+            in: modelNode,
+            usesPresentationTree: true
+        )
+    }
     private var renderTimeline = PMXRenderTimeline()
     private var oneShotMotionPlayback: PMXOneShotMotionPlayback?
     private var motionPlaybackProbe: PMXMotionPlaybackProbe?
     private weak var motionPlaybackProbeBone: SCNNode?
     private weak var coffeeCupNode: SCNNode?
     public private(set) var isCoffeeCupVisible = false
+
+    /// 最近一帧**真正画进 drawable** 时叠加到模型变换里的接地补偿（渲染事实）。
+    ///
+    /// `localGroundingOffsetY` 是策略前的原始值；这个字段是走完
+    /// `PMXFullStageGroundingPolicy` 后真实用于 `modelTransform` 的那一个。两者分开上报，
+    /// 是为了让"算出来了"与"真的施加了"不再混为一谈。
+    public private(set) var lastAppliedGroundingOffsetY: Float = 0
+    /// 最近一帧交给 SceneKit 的本地动画时钟（`renderTimeline` 的值）。
+    public private(set) var lastRenderedSceneTime: TimeInterval = 0
+    /// 只随**真实角色帧**递增的计数器。它绝不来自世界资源 revision，也不是 GPU 帧号；
+    /// E2E 用它证明"这一段采样窗口里角色真的被渲染了 N 帧"。
+    public private(set) var renderedAvatarFrameCount: UInt64 = 0
+    /// 播放 epoch：每次安装/清除 motion 会重置本地动画时钟（`sceneTime` 归零），
+    /// 这里同时递增。E2E 用 `(clip, motionInstallEpoch)` 把采样切成"同一个播放器/
+    /// 同一段 clip"的连续段：段内 sceneTime 必须推进，跨 epoch 的归零不算倒退，
+    /// 从而既不允许"重置冒充推进"，也不把 clip 切换误报成时钟倒退。
+    public private(set) var motionInstallEpoch: UInt64 = 0
 
     public init(
         device: MTLDevice,
@@ -2225,6 +2363,21 @@ public final class PMXStageAvatarRenderer {
             in: model,
             usesPresentationTree: false
         )
+        contactProbes = PMXSoleGrounding.makeContactProbes(in: model)
+        restGlobalReferenceY = PMXSoleGrounding.referenceY(
+            probes: contactProbes,
+            in: model,
+            usesPresentationTree: false
+        )
+        didReportContactProbeGap = false
+        if contactProbes.isEmpty || restGlobalReferenceY == nil {
+            // **具名上报**，不再静默把偏移当 0：探针为空 = 全身接地补偿没有生效，
+            // 这类"看不见的失效"正是穿地缺陷能藏住的地方。
+            Self.log.notice(
+                "PMX 全身接触探针不可用 probes=\(self.contactProbes.count, privacy: .public) reference=\(self.restGlobalReferenceY == nil, privacy: .public)；坐/跪类姿态的穿地补偿将不生效"
+            )
+            didReportContactProbeGap = true
+        }
         localGroundingOffsetY = 0
         trackingRootBone = Self.trackingRootBone(in: model)
         trackingRootRestPosition = trackingRootBone?.simdConvertPosition(
@@ -2284,6 +2437,50 @@ public final class PMXStageAvatarRenderer {
         return "clip=\(clip) hasPlayer=\(hasPlayer) speed=\(String(format: "%.2f", speed)) pose[\(bones.joined(separator: " "))]"
     }
 
+    /// 逐帧**结构化**播放事实（E2E / 诊断）：真实 clip、播放器、播放时钟与每根诊断骨骼
+    /// 相对静止姿态的角度。
+    ///
+    /// 与 `motionPlaybackDiagnostics` 读的是同一份事实，只是不再压成一个字符串：
+    /// 驱动器可以逐帧比较 `boneAnglesDegrees` / `poseDigest` 证明姿态真的在变，并用
+    /// `sceneTime` / `renderedAvatarFrameCount` 证明采样发生在真实渲染帧上。
+    ///
+    /// 这里**不**制造任何"运动"：没有播放器时 `hasPlayer=false`，骨骼停在静止姿态时
+    /// 所有角度为 0 —— 它们正是"选了动作但没在播"的判据，绝不用 GPU 帧号冒充。
+    public var motionPlaybackSnapshot: [String: Any] {
+        let player = modelNode?.animationPlayer(forKey: Self.motionKey)
+        let clip = loadedMotionURL?.deletingPathExtension().lastPathComponent
+            ?? (isUsingNaturalIdle ? "natural-idle(rest)" : "none")
+        var angles: [String: Float] = [:]
+        var digest: Float = 0
+        var maximum: Float = 0
+        for name in Self.diagnosticBoneNames {
+            guard let node = modelNode?.childNode(withName: name, recursively: true),
+                  let rest = restBoneOrientations[name]
+            else { continue }
+            let current = node.presentation.simdOrientation
+            let dot = min(abs(simd_dot(
+                simd_normalize(current).vector,
+                simd_normalize(rest).vector
+            )), 1)
+            let degrees = 2 * acos(dot) * 180 / .pi
+            angles[name] = degrees
+            digest += degrees
+            maximum = max(maximum, degrees)
+        }
+        return [
+            "clip": clip,
+            "hasPlayer": player != nil,
+            "speed": Float(player?.speed ?? 0),
+            "sceneTime": lastRenderedSceneTime,
+            "motionInstallEpoch": motionInstallEpoch,
+            "renderedAvatarFrameCount": renderedAvatarFrameCount,
+            "boneAnglesDegrees": angles,
+            "maximumBoneAngleDegrees": maximum,
+            "poseDigest": digest,
+            "restBoneCount": restBoneOrientations.count,
+        ]
+    }
+
     private func validateMotionRequest(_ url: URL) throws {
         let fileName = url.lastPathComponent
         guard url.pathExtension.lowercased() == "vmd" else {
@@ -2306,6 +2503,7 @@ public final class PMXStageAvatarRenderer {
         // evaluated at the old scene age and can remain at its rest frame.
         renderTimeline.restartAnimationClock()
         sceneRenderer.sceneTime = 0
+        motionInstallEpoch &+= 1
         modelNode.removeAnimation(
             forKey: Self.naturalIdleKey,
             blendOutDuration: 0
@@ -2366,6 +2564,7 @@ public final class PMXStageAvatarRenderer {
         localGroundingOffsetY = 0
         renderTimeline.restartAnimationClock()
         sceneRenderer.sceneTime = 0
+        motionInstallEpoch &+= 1
         if let modelNode {
             installNaturalIdle(on: modelNode)
         } else {
@@ -2379,12 +2578,17 @@ public final class PMXStageAvatarRenderer {
         viewMatrix: simd_float4x4,
         projectionMatrix: simd_float4x4,
         modelTransform: simd_float4x4 = matrix_identity_float4x4,
+        groundingOffsetY: Float = 0,
         time: TimeInterval,
         diagnosticProfile: String? = nil
     ) {
         guard let modelNode else {
             return
         }
+        // 渲染事实：这一帧模型变换真实使用的接地补偿。`localGroundingOffsetY` 是策略前的
+        // 原始值，`groundingOffsetY` 是调用方走完 `PMXFullStageGroundingPolicy` 后真正
+        // 乘进 `modelTransform` 的那一个；分开记，E2E 才能判"算出来"与"施加了"。
+        lastAppliedGroundingOffsetY = groundingOffsetY
         let viewportSize: (width: Int, height: Int)
         if let colorTexture = renderPassDescriptor.colorAttachments[0].texture {
             viewportSize = (colorTexture.width, colorTexture.height)
@@ -2430,6 +2634,10 @@ public final class PMXStageAvatarRenderer {
             commandBuffer: commandBuffer,
             passDescriptor: renderPassDescriptor
         )
+        // 只有真的调用了 SceneKit 渲染才算一帧。这个计数与 GPU 帧号 / 世界资源 revision
+        // 无关，绝不用来冒充动画在播。
+        lastRenderedSceneTime = localTime
+        renderedAvatarFrameCount &+= 1
         if let diagnosticProfile {
             // Compare the authored node values with SceneKit's evaluated tree
             // after this render; a profile switch must update both together.
@@ -2540,29 +2748,51 @@ public final class PMXStageAvatarRenderer {
     }
 
     private func updateAnimatedGroundingOffset() {
-        guard let modelNode,
-              let restFootReferenceY,
-              let animatedFootReferenceY = PMXSoleGrounding.referenceY(
-                  probes: soleProbes,
-                  in: modelNode,
-                  usesPresentationTree: true
-              ) ?? Self.footReferenceY(
-                  in: modelNode,
-                  usesPresentationTree: true
-              )
-        else {
+        guard let modelNode else {
             localGroundingOffsetY = 0
             return
         }
-        let soleOffset = PMXAnimatedGrounding.localOffsetY(
-            restFootReferenceY: restFootReferenceY,
-            animatedFootReferenceY: animatedFootReferenceY
-        )
-        // A downward root/center translation can bury the torso while the sole band
-        // is still near the floor, so include it before the one-sided policy runs.
-        // Root rises and lifted feet stay excluded because both terms are negative.
+        // ① 脚底参考（既有）：站姿 / 走姿的接地与根运动补偿。
+        let soleOffset: Float
+        if let restFootReferenceY,
+           let animatedFootReferenceY = PMXSoleGrounding.referenceY(
+               probes: soleProbes,
+               in: modelNode,
+               usesPresentationTree: true
+           ) ?? Self.footReferenceY(
+               in: modelNode,
+               usesPresentationTree: true
+           )
+        {
+            soleOffset = PMXAnimatedGrounding.localOffsetY(
+                restFootReferenceY: restFootReferenceY,
+                animatedFootReferenceY: animatedFootReferenceY
+            )
+        } else {
+            soleOffset = 0
+        }
+        // ② 根下沉（既有）：向下根位移可能把躯干埋掉而脚跟还在地板附近。
         let rootDrop = -animatedRootOffset.y
-        localGroundingOffsetY = max(soleOffset, rootDrop)
+        // ③ 全身最低接触（新增）：坐 / 跪 / 盘腿时脚可能比静止姿态**更高**，只看脚
+        //    永远得到 <= 0 的偏移，真正的最低网格顶点（膝 / 小腿 / 臀）于是穿地。
+        //    这一项是**安全地板**：只抬升、绝不下压，所以取 `max(0, 穿透量)`。
+        var contactLift: Float = 0
+        if let restGlobalReferenceY,
+           let animatedGlobalMinY = PMXSoleGrounding.referenceY(
+               probes: contactProbes,
+               in: modelNode,
+               usesPresentationTree: true
+           )
+        {
+            contactLift = max(0, PMXContactGrounding.penetrationOffset(
+                restGlobalMinY: restGlobalReferenceY,
+                animatedGlobalMinY: animatedGlobalMinY
+            ))
+        } else if !didReportContactProbeGap {
+            didReportContactProbeGap = true
+            Self.log.notice("PMX 全身接触探针在运行时不可用；坐/跪类姿态的穿地补偿未生效")
+        }
+        localGroundingOffsetY = max(soleOffset, rootDrop, contactLift)
     }
 
     private static func footReferenceY(

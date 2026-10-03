@@ -106,17 +106,33 @@ func overlayPointerVerdict(_ source: String) -> [String] {
 // MARK: 断言 5（静态扫描）：生产源码里不许出现抓流 / 绕过登录的路径
 // ---------------------------------------------------------------------------
 
-/// 抓流、绕登录、绕地区的**能力痕迹**。这份表放在 harness 里而不是生产里：
-/// 生产里出现这些字面量本身就该红。
+/// 抓流、绕登录、绕地区的**能力痕迹**。
+///
+/// **范围已经更新**（用户本轮授权"链接优先 + 原生解析"）：这些字面量只允许出现在
+/// `Screen/LinkResolver/` 与 `Screen/NativeMedia/` 两个受控目录里 —— 它们是解析器
+/// 与原生播放器的实现细节。出现在别处（尤其是 `Screen/` 根、App、其它模块）一律红。
+///
+/// 凭据红线**不随范围放宽**：`cookie` / `Keychain` / `Authorization` 在受控目录里
+/// 也一条都不许有（见 `credentialCapabilityTokens`）。
 let prohibitedCapabilityTokens = [
     "yt-dlp", "youtube-dl", "ytdl", "googlevideo", "signatureCipher", "streamingData",
     "videoplayback", "n-sig", "decryptSignature", "widevine", "Widevine",
     "cookiesFromBrowser", "--cookies", "proxyStream", "bypassRegion", "geoBypass",
 ]
 
-/// 递归扫描一棵树，返回 `(文件, 命中词)`。只扫文本源码。
-func scanForProhibitedCapabilities(at directory: URL) -> [(String, String)] {
+/// 允许出现上面那些 token 的**受控目录**（相对 `apps/macos/Sources/GMGNRadio`）。
+let nativeLinkAllowedDirectories = ["Screen/LinkResolver", "Screen/NativeMedia"]
+
+/// 即便在受控目录里也不许出现的凭据 / 系统授权痕迹。
+let credentialCapabilityTokens = ["Keychain", "SecItem", "kSecClass", "Authorization: Bearer"]
+
+/// 递归扫描一棵树，返回 `(文件, 命中词)`。受控目录里的解析器 token 放行；
+/// 凭据 token 在任何地方都命中（含受控目录）。
+func scanForProhibitedCapabilities(
+    at directory: URL, controlledRoot: URL? = nil
+) -> [(String, String)] {
     var hits: [(String, String)] = []
+    let scopePath = (controlledRoot ?? sourceRoot).resolvingSymlinksInPath().standardizedFileURL.path
     let extensions: Set<String> = ["swift", "m", "mm", "c", "h", "py", "sh", "js", "ts", "json"]
     guard let enumerator = FileManager.default.enumerator(
         at: directory, includingPropertiesForKeys: [.isRegularFileKey]
@@ -124,6 +140,20 @@ func scanForProhibitedCapabilities(at directory: URL) -> [(String, String)] {
     for case let url as URL in enumerator {
         guard extensions.contains(url.pathExtension.lowercased()) else { continue }
         guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
+        let filePath = url.resolvingSymlinksInPath().standardizedFileURL.path
+        let relative = filePath.hasPrefix(scopePath + "/")
+            ? String(filePath.dropFirst(scopePath.count + 1))
+            : url.lastPathComponent
+        let isControlled = nativeLinkAllowedDirectories.contains {
+            relative.hasPrefix($0 + "/")
+        }
+        if isControlled {
+            // 受控目录：解析器 token 放行，但**凭据红线照旧**。
+            for token in credentialCapabilityTokens where text.contains(token) {
+                hits.append(("\(url.lastPathComponent):\(token)", token))
+            }
+            continue
+        }
         for token in prohibitedCapabilityTokens where text.contains(token) {
             hits.append(("\(url.lastPathComponent):\(token)", token))
         }
@@ -1520,6 +1550,39 @@ try "let fetcher = \"yt-dlp --cookies-from-browser safari -o out.mp4\"\n"
 let injectedHits = scanForProhibitedCapabilities(at: injectedTree)
 check(injectedHits.count >= 2,
     "断言5（注入负对照）：塞进一条抓流路径 ⇒ 扫描器报出 \(injectedHits.count) 条命中（\(injectedHits.map(\.1).joined(separator: ", "))）")
+
+// 范围注入 A：受控目录（`Screen/LinkResolver/`）里的解析器 token 必须**放行**。
+let controlledTree = temporary.appendingPathComponent("controlled-root")
+let controlledResolver = controlledTree.appendingPathComponent("Screen/LinkResolver")
+try FileManager.default.createDirectory(at: controlledResolver, withIntermediateDirectories: true)
+try "let helper = \"yt-dlp --no-cookies\"\n"
+    .write(to: controlledResolver.appendingPathComponent("Resolver.swift"),
+           atomically: true, encoding: .utf8)
+let controlledHits = scanForProhibitedCapabilities(at: controlledTree, controlledRoot: controlledTree)
+check(controlledHits.isEmpty,
+    "断言5（范围）：受控目录里的解析器 token 放行（命中 \(controlledHits.count) 条）")
+
+// 范围注入 B：同样的 token 出现在 `Screen/` 根（非受控）⇒ 必须红。
+let offScopeTree = temporary.appendingPathComponent("off-scope-root")
+let offScopeScreen = offScopeTree.appendingPathComponent("Screen")
+try FileManager.default.createDirectory(at: offScopeScreen, withIntermediateDirectories: true)
+try "let helper = \"yt-dlp\"\n"
+    .write(to: offScopeScreen.appendingPathComponent("Rip.swift"),
+           atomically: true, encoding: .utf8)
+let offScopeHits = scanForProhibitedCapabilities(at: offScopeTree, controlledRoot: offScopeTree)
+check(offScopeHits.contains { $0.1 == "yt-dlp" },
+    "断言5（范围负对照）：受控目录之外的解析器 token 必须红（命中 \(offScopeHits.count) 条）")
+
+// 凭据红线：即便在受控目录里，`Keychain` 也必须红。
+let credentialTree = temporary.appendingPathComponent("credential-root")
+let credentialResolver = credentialTree.appendingPathComponent("Screen/LinkResolver")
+try FileManager.default.createDirectory(at: credentialResolver, withIntermediateDirectories: true)
+try "let store = Keychain()\n"
+    .write(to: credentialResolver.appendingPathComponent("Bad.swift"),
+           atomically: true, encoding: .utf8)
+let credentialHits = scanForProhibitedCapabilities(at: credentialTree, controlledRoot: credentialTree)
+check(credentialHits.contains { $0.1 == "Keychain" },
+    "断言5（凭据红线）：受控目录里的 Keychain 也必须红（命中 \(credentialHits.count) 条）")
 
 // 白名单旁路注入：给 `WorldScreenEmbedPolicy` 开一个后门 ⇒ 不该放行的域名必须被放行，
 // 从而证明"拒绝"这件事真的来自那份白名单，而不是别处的巧合。

@@ -140,7 +140,8 @@ def validate(app, require_helper=True):
         raise RuntimeError(f'Invalid app bundle: {app}') from error
     if info.get('CFBundleIdentifier') != BUNDLE_IDENTIFIER or info.get('CFBundleExecutable') != 'gmgn radio':
         raise RuntimeError('Unexpected application identity')
-    for relative in ['Contents/MacOS/gmgn radio', 'Contents/Helpers/gmgn-taskd']:
+    for relative in ['Contents/MacOS/gmgn radio', 'Contents/Helpers/gmgn-taskd',
+                     'Contents/Helpers/gmgn-mcpd']:
         if not require_helper and relative.startswith('Contents/Helpers/'):
             continue
         if not (app / relative).is_file() or not os.access(app / relative, os.X_OK):

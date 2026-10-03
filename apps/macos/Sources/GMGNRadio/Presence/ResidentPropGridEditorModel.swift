@@ -112,6 +112,20 @@ import WorldRuntime
 
     private var collision: (any WorldPropSupportQuerying)?
     private var gridKey: String?
+    /// **与装修会话无关**的承托几何：许愿机的自动摆放（agent 的 `apply_prop_placement`、
+    /// 入库落位）不需要装修面板开着，但几何过去只在 `activate`（进入装修）时派生 ——
+    /// 于是面板关着时 `list_placement_surfaces` 为空、摆放一律 fail-closed。
+    ///
+    /// 这一份由 `preparePlacementSupport` 在**世界加载后**准备，`deactivate()` 不碰它：
+    /// 装修会话的开关只决定"画不画格子、拾不拾取"，不该决定"能不能摆放"。
+    /// 只按世界 key 生效（`supportForPlacement(key:)`），换世界时旧的几何不会冒充新的。
+    private var placementGrid: PropSupportGrid?
+    private var placementCollision: (any WorldPropSupportQuerying)?
+    /// **最近一次请求**摆放几何的世界（派生在飞时也会先写下）。
+    private var placementKey: String?
+    /// `placementGrid` **真的装的是哪个世界**的几何。只在网格写回时更新，
+    /// 于是"新世界的派生还没完成、旧世界的网格还在"不会被当成新世界的几何（fail-closed）。
+    private var placementGridKey: String?
     /// 当前**激活会话**的世界键（`activate` 一开始就写下，`deactivate` 清掉）。
     ///
     /// 与 `gridKey`（"已经就绪的那份网格属于谁"）分开：派生是异步的，一次派生跑完时
@@ -227,7 +241,9 @@ import WorldRuntime
 
     /// 当前的移动图（按需建、按网格缓存）。拿不到网格/范围时返回 nil ⇒ 服务拒绝摆放。
     func placementRouteMap() -> WorldPlacementRouteMap? {
-        guard let grid, let routeBand else { return nil }
+        // 移动图按**承托几何**建：装修会话激活时用激活中的那一份，否则用与面板无关的
+        // 保留位（世界加载后由 `preparePlacementSupport` 备好）。两者都是同一个世界的同一份网格。
+        guard let grid = placementGrid ?? grid, let routeBand else { return nil }
         if let routeMap, routeMapLayerCount == grid.layers.count { return routeMap }
         let map = WorldPlacementRouteMap(
             grid: grid,
@@ -257,6 +273,10 @@ import WorldRuntime
         parameters: PropSupportGridParameters = .default
     ) async {
         self.collision = collision
+        // 装修会话用的就是摆放服务的那一份几何：一起记进"与面板无关"的保留位，
+        // 于是退出装修之后 `list_placement_surfaces` / 摆放仍然可用。
+        // **碰撞世界与网格同生共死**（都只在装填时写），避免"网格还是 A、碰撞已是 B"。
+        placementKey = key
         isBuildModeActive = true
         activeKey = key
         if let cached = cachedGrids[key] {
@@ -264,6 +284,9 @@ import WorldRuntime
             // 不重新派生 —— 这就是"重开装修不再等 4.8 s"。
             touchCachedGrid(key)
             grid = cached
+            placementGrid = cached
+            placementCollision = collision
+            placementGridKey = key
             report = cached.report
             gridKey = key
             Self.log.notice("格子派生：命中缓存 key=\(key, privacy: .public) 层=\(cached.layers.count, privacy: .public) 墙面=\(self.cachedWalls[key]?.count ?? -1, privacy: .public)")
@@ -277,21 +300,7 @@ import WorldRuntime
             "格子派生：开始 key=\(key, privacy: .public) 已缓存网格=\(self.cachedGrids.count, privacy: .public)/\(Self.retainedGridLimit, privacy: .public)"
         )
         let startedAt = ContinuousClock.now
-        // 派生是**纯计算**，且真实舱体一次要 0.5 s（-O）/ 6.6 s（-Onone）。
-        // 同步做会把打开装修编辑器的那一帧卡住，所以放后台；`PropSupportGrid` 是 Sendable。
-        let built = await Task.detached(priority: .userInitiated) {
-            let grid = PropSupportGridBuilder.build(
-                collision: collision,
-                bounds: bounds,
-                seed: seed,
-                parameters: parameters
-            )
-            // 竖直面从**同一批三角形**派生（与承托网格同一次范围查询），不新开一份世界几何。
-            let walls = WorldPropWallGrid.derive(
-                triangles: collision.triangles(in: bounds), bounds: bounds, grid: grid
-            )
-            return ResidentPropGridDerivation(grid: grid, walls: walls)
-        }.value
+        let built = await Self.buildDerivation(collision: collision, seed: seed, bounds: bounds, parameters: parameters)
         let elapsed = startedAt.duration(to: .now)
         // 算完的东西**先留在缓存里**：关掉面板不该丢掉一次已经跑完的派生（"同一世界算一遍就够"）。
         // 之前这里在写回之前就返回，于是"关掉再打开"每次都要从头再算一遍。
@@ -305,6 +314,9 @@ import WorldRuntime
             return
         }
         grid = built.grid
+        placementGrid = built.grid
+        placementCollision = collision
+        placementGridKey = key
         report = built.grid.report
         gridKey = key
         rebuildCaches(from: built.grid)
@@ -317,6 +329,70 @@ import WorldRuntime
         onGridChanged?()
     }
 
+    /// 派生是**纯计算**，真实舱体一次要 0.5 s（-O）/ 6.6 s（-Onone）：放后台，别卡住调用帧。
+    /// `PropSupportGrid` 与 `WorldPropWallPatch` 都是 Sendable。
+    private static func buildDerivation(
+        collision: any WorldPropSupportQuerying,
+        seed: WorldVector3,
+        bounds: WorldPlanarBounds,
+        parameters: PropSupportGridParameters
+    ) async -> ResidentPropGridDerivation {
+        await Task.detached(priority: .userInitiated) {
+            let grid = PropSupportGridBuilder.build(
+                collision: collision,
+                bounds: bounds,
+                seed: seed,
+                parameters: parameters
+            )
+            // 竖直面从**同一批三角形**派生（与承托网格同一次范围查询），不新开一份世界几何。
+            let walls = WorldPropWallGrid.derive(
+                triangles: collision.triangles(in: bounds), bounds: bounds, grid: grid
+            )
+            return ResidentPropGridDerivation(grid: grid, walls: walls)
+        }.value
+    }
+
+    /// 为**摆放**准备好承托几何：与装修面板是否打开无关。
+    ///
+    /// 世界加载后由宿主调用（`GMGNRadioApp.prepareResidentPlacementSupport`），
+    /// 命中缓存立即返回，否则后台派生。它**不打开装修会话、不向渲染层发布格子**：
+    /// 面板的开关只决定"画不画、拾不拾取"，不该决定 agent 能不能摆放。
+    func preparePlacementSupport(
+        collision: any WorldPropSupportQuerying,
+        seed: WorldVector3,
+        bounds: WorldPlanarBounds,
+        key: String,
+        parameters: PropSupportGridParameters = .default
+    ) async {
+        placementKey = key
+        if let cached = cachedGrids[key] {
+            touchCachedGrid(key)
+            placementGrid = cached
+            placementCollision = collision
+            placementGridKey = key
+            Self.log.notice("摆放承托几何：命中缓存 key=\(key, privacy: .public) 层=\(cached.layers.count, privacy: .public)")
+            return
+        }
+        Self.log.notice("摆放承托几何：开始派生 key=\(key, privacy: .public)")
+        let built = await Self.buildDerivation(collision: collision, seed: seed, bounds: bounds, parameters: parameters)
+        storeCachedGrid(built.grid, key: key)
+        cachedWalls[key] = built.walls
+        // 派生期间可能已经换世界：只把结果写给**仍然是最新摆放目标**的那一个 key。
+        guard placementKey == key else { return }
+        placementGrid = built.grid
+        placementCollision = collision
+        placementGridKey = key
+        Self.log.notice("摆放承托几何：完成 key=\(key, privacy: .public) 层=\(built.grid.layers.count, privacy: .public)")
+    }
+
+    /// 摆放服务读取的承托几何。按世界 key 校验：拿不到就是 nil（服务 fail-closed），
+    /// 绝不拿上一个世界的几何冒充当前世界。装修会话激活中的那一份优先。
+    func supportForPlacement(key: String) -> (grid: PropSupportGrid, collision: any WorldPropSupportQuerying)? {
+        if let grid, let collision, gridKey == key { return (grid, collision) }
+        guard placementGridKey == key, let placementGrid, let placementCollision else { return nil }
+        return (placementGrid, placementCollision)
+    }
+
     /// 直接装一份**已经派生好的**网格（连同能给出三角形的碰撞世界）。
     ///
     /// 与 `activate` 的差别：`activate` 会自己去派生（真实舱体 -O 下约 8 s）。
@@ -327,6 +403,10 @@ import WorldRuntime
                             collision: any WorldPropSupportQuerying,
                             key: String) {
         self.collision = collision
+        placementCollision = collision
+        placementKey = key
+        placementGrid = grid
+        placementGridKey = key
         isBuildModeActive = true
         activeKey = key
         storeCachedGrid(grid, key: key)

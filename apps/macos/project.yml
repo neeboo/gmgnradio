@@ -65,6 +65,9 @@ targets:
       - name: Bundle Rust task daemon
         script: '"${SRCROOT}/../../tools/build-taskd-helper.sh"'
         basedOnDependencyAnalysis: false
+      - name: Bundle MCP stdio daemon
+        script: '"${SRCROOT}/../../tools/build-mcpd-helper.sh"'
+        basedOnDependencyAnalysis: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.gmgn.radio

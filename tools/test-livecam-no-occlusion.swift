@@ -295,7 +295,7 @@ func run(_ path: String, _ arguments: [String]) throws -> Int32 {
     return process.terminationStatus
 }
 
-let attachments = ["VisualEngine/ResidentStatusBadge.swift", "Presence/ResidentImageAttachment.swift",
+let attachments = ["App/E2ERuntime.swift", "VisualEngine/ResidentStatusBadge.swift", "Presence/ResidentImageAttachment.swift",
                    "Presence/PropImagePreparation.swift", "Presence/PropGenerationClient.swift",
                    "Presence/WishMachineTaskPresentation.swift", "Presence/ResidentOwnershipProjection.swift"]
     .map { sources.appendingPathComponent($0).path }

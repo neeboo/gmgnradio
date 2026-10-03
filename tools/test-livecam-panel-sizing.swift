@@ -254,7 +254,9 @@ func run(_ path: String, _ arguments: [String]) throws -> Int32 {
 // `ResidentStatusBadge.swift` 一并编进来：Live Cam 面板的状态行从那个类型取
 // 「思考 / 说话」符号（唯一来源，见 `tools/test-stage-resident-chat.swift`）。
 // `ResidentOwnershipProjection.swift` 一并编进来：任务行那一句委托给它（唯一出口）。
-let attachmentSources = ["VisualEngine/ResidentStatusBadge.swift", "Presence/ResidentImageAttachment.swift", "Presence/PropImagePreparation.swift", "Presence/PropGenerationClient.swift", "Presence/WishMachineTaskPresentation.swift", "Presence/ResidentOwnershipProjection.swift"].map { base.appendingPathComponent($0).path }
+// `E2ERuntime.swift` 一并编进来：面板的附件目录与草稿恢复走显式测试根注入
+// （`E2ERuntime.applicationSupportBase`），生产时它返回 nil、落到真实目录。
+let attachmentSources = ["App/E2ERuntime.swift", "VisualEngine/ResidentStatusBadge.swift", "Presence/ResidentImageAttachment.swift", "Presence/PropImagePreparation.swift", "Presence/PropGenerationClient.swift", "Presence/WishMachineTaskPresentation.swift", "Presence/ResidentOwnershipProjection.swift"].map { base.appendingPathComponent($0).path }
 let compiled = try run("/usr/bin/swiftc", ["-disable-sandbox", "-j1", "-parse-as-library", "-target", "arm64-apple-macos14.0", base.appendingPathComponent("DesktopPresence/LiveCamPanel.swift").path, deps.path, tests.path, "-o", binary.path] + attachmentSources)
 guard compiled == 0 else { exit(compiled) }
 if CommandLine.arguments.contains("--compile-only") { print("PASS: Live Cam attachment UI compiles; no AppKit runtime started"); exit(0) }

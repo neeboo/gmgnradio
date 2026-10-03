@@ -1739,6 +1739,32 @@ typealias WorldAgentContext = LayoutContext
   precondition(!cachedModel.renderCells.isEmpty,
     "the cached grid must be re-projected into cells on re-entry")
 
+  // 摆放承托几何与装修会话无关：世界加载后备好，退出装修后**仍然可用**，
+  // 换世界/未备好时按 key fail-closed。这是 agent 自动摆放（面板没开）能工作的前提。
+  let placementCollision = CountingFloorCollision(half:1.5)
+  let placementModel = ResidentPropGridEditorModel()
+  precondition(placementModel.supportForPlacement(key:"placement-world") == nil,
+    "before the world is prepared, placement support must be fail-closed, not an empty grid")
+  await placementModel.preparePlacementSupport(collision:placementCollision,seed:.init(x:0,y:0,z:0),
+    bounds:flatBounds,key:"placement-world")
+  precondition(!placementModel.isBuildModeActive,
+    "preparing placement support must NOT open the decoration session")
+  precondition(placementModel.supportForPlacement(key:"placement-world") != nil,
+    "the prepared world must expose placement support with the panel closed")
+  placementModel.deactivate()
+  precondition(!placementModel.isBuildModeActive && !placementModel.isReady
+      && placementModel.supportCollision == nil,
+    "deactivate still clears the decoration session state (build mode, grid, collision)")
+  precondition(placementModel.supportForPlacement(key:"placement-world") != nil,
+    "deactivate must NOT take the placement support away (the agent places without the panel open)")
+  precondition(placementModel.supportForPlacement(key:"other-world") == nil,
+    "placement support must be fail-closed for a different world (no stale geometry)")
+  let queriesAfterPlacementPrep = placementCollision.queryCount
+  await placementModel.preparePlacementSupport(collision:placementCollision,seed:.init(x:0,y:0,z:0),
+    bounds:flatBounds,key:"placement-world")
+  precondition(placementCollision.queryCount == queriesAfterPlacementPrep,
+    "re-preparing the same world must reuse the cached grid, not derive it again")
+
   // 派生**进行中**用户明确关掉面板（X / Esc）：结果一样不许丢，下次进来直接复用。
   let interruptedCollision = CountingFloorCollision(half:1.5,sleepSeconds:0.05)
   let interruptedModel = ResidentPropGridEditorModel()

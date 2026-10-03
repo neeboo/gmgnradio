@@ -27853,6 +27853,32 @@
       "motionID": null,
       "propIDs": [],
       "interruptible": true
+    },
+    {
+      "id": "chair.sit",
+      "action": "sit",
+      "entryWaypointID": "wp.spawn",
+      "transform": {
+        "position": {
+          "x": -1,
+          "y": -0.067853548,
+          "z": -5
+        },
+        "rotation": {
+          "x": 0,
+          "y": 0,
+          "z": 0,
+          "w": 1
+        },
+        "scale": {
+          "x": 1,
+          "y": 1,
+          "z": 1
+        }
+      },
+      "motionID": "gmgn.motion.bones.chair-sit-loop-pmx",
+      "propIDs": [],
+      "interruptible": true
     }
   ],
   "activityDefinitions": [
@@ -28213,6 +28239,68 @@
       ],
       "interruptible": true,
       "cooldownSeconds": 5
+    },
+    {
+      "id": "chair.sit",
+      "displayName": "在原地坐下休息",
+      "activity": {
+        "type": "sit",
+        "anchorID": "chair.sit"
+      },
+      "phases": [
+        {
+          "phase": "approach",
+          "requiredAnchorIDs": [
+            "chair.sit"
+          ],
+          "motionIDs": [
+            "gmgn.motion.bones.walk-loop-pmx",
+            "gmgn.motion.bones.walk-loop-vrm"
+          ],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "enter",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": 0.2
+        },
+        {
+          "phase": "loop",
+          "requiredAnchorIDs": [],
+          "motionIDs": [
+            "gmgn.motion.bones.chair-sit-loop-pmx",
+            "gmgn.motion.bones.chair-sit-loop-vrm"
+          ],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "exit",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": 0.2
+        },
+        {
+          "phase": "interrupt",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        },
+        {
+          "phase": "failed",
+          "requiredAnchorIDs": [],
+          "motionIDs": [],
+          "propIDs": [],
+          "durationSeconds": null
+        }
+      ],
+      "interruptible": true,
+      "cooldownSeconds": 5
     }
   ],
   "cameras": [
@@ -28248,7 +28336,8 @@
     "activity:music.listen",
     "camera:living.establishing",
     "activity:performance.backflip",
-    "activity:performance.jumping_jacks"
+    "activity:performance.jumping_jacks",
+    "activity:chair.sit"
   ],
   "resources": [
     {

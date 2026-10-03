@@ -1,4 +1,4 @@
-.PHONY: generate test test-all test-install test-worlds test-daemon test-python test-harnesses _test-harnesses e2e-acceptance build install install-debug install-universal unregister-product test-icon dedupe verify-registrations
+.PHONY: generate test test-all test-install test-worlds test-daemon test-python test-harnesses _test-harnesses e2e-acceptance build install install-debug install-universal unregister-product test-icon dedupe verify-registrations verify-helper-manifest verify-screen-link-helper bundle-screen-link-helper
 
 # 默认 Release：只有 -O 下"承托网格派生"才是 0.5 s 量级（-Onone 是 6.6 s，
 # 真机一次要六秒多，用户等不了）。想最快编译走 make install-debug。
@@ -158,6 +158,7 @@ test-icon:
 # 拷之前还原原始彩色 logo：`make build` 的黑白测试 logo 只属于构建产物，不该跟着进 /Applications。
 install: build
 	$(RESTORE_ICON)
+	$(PYTHON) tools/verify-helper-manifest.py --app "$(PRODUCT_APP)"
 	python3 tools/install-macos.py --source "$(PRODUCT_APP)"
 	rm -rf "$(PRODUCT_APP)"
 
@@ -186,6 +187,25 @@ install-debug: install
 
 test-install:
 	$(PYTHON) tools/test-install-macos.py
+
+# 内置 helper（gmgn-taskd / gmgn-mcpd）的独立完整性校验：存在、可执行、
+# sha256 与随包清单逐字节相同。打包由 project.yml 的两个 postBuildScript
+# 完成（每个都 fail-closed，绝不写空 hash）。生产装机前必跑（见 install）。
+verify-helper-manifest:
+	$(PYTHON) "$(CURDIR)/tools/verify-helper-manifest.py" --app "$(PRODUCT_APP)"
+
+# 电视链接解析 helper（yt-dlp）的打包入口：按 `tools/helpers/screen-link-helpers.lock.json`
+# 里钉死的版本/来源/sha256 下载 → 校验 → 内置到 `<app>/Contents/Helpers/` 并写
+# `<name>.sha256`。空哈希直接拒绝（不再 fail-closed 交付）。deno 可选：
+#   make bundle-screen-link-helper APP="/path/to/gmgn radio.app" INCLUDE=deno
+bundle-screen-link-helper:
+	@if [ -z "$(APP)" ]; then echo "用法：make bundle-screen-link-helper APP=\"/path/to/gmgn radio.app\" [INCLUDE=deno]" >&2; exit 2; fi
+	$(PYTHON) "$(CURDIR)/tools/bundle-screen-link-helper.py" --app "$(APP)" $(if $(INCLUDE),--include $(INCLUDE),)
+
+# 已内置的屏幕链接 helper 独立复核。默认（`verify-helper-manifest`）不要求它存在；
+# E2E 要真的播一条网站链接时用这一条，缺了就红。
+verify-screen-link-helper:
+	$(PYTHON) "$(CURDIR)/tools/verify-helper-manifest.py" --app "$(PRODUCT_APP)" --require-screen-link
 
 # LaunchServices 里这个 bundle id 只允许一条注册，路径必须是
 # `/Applications/gmgn radio.app` —— 这是**规则**，不是清一次。
@@ -235,6 +255,8 @@ test-python:
 	$(PYTHON) -m unittest discover -s tools/marble/tests -p 'test_*.py'
 	$(PYTHON) -m unittest discover -s tools/blender/tests -p 'test_*.py'
 	$(PYTHON) -m unittest discover -s tools/motion/tests -p 'test_*.py'
+	# 屏幕链接 helper 的打包 / 复核判据（空哈希直接拒、哈希不符拒、装完可复核）。
+	$(PYTHON) -m unittest discover -s tools/tests -p 'test_*.py'
 
 # The resident-agent regression harnesses named in
 # docs/plans/2026-09-22-user-experience-fixes-and-acceptance.md. Each script
@@ -430,10 +452,41 @@ _test-harnesses:
 	# 现场），挂进 CI 门禁会变成"依赖用户当前数据"的非确定性红。
 	$(PYTHON) tools/reconcile-generation-results.py --self-test
 	# 电视机的五条判据（屏幕几何只有一处定义 / 覆盖层几何一致 / 不吃场景鼠标 /
-	# 失败具名可见 / 只走官方嵌入）。三条注入负对照在 harness 内部做手术：
-	# 覆盖层改成吃事件、源码里塞一条抓流路径、白名单开一个后门 —— 每一条都必须红。
-	# 见 docs/plans/2026-10-02-stage-tv-screen.md。
+	# 失败具名可见 / **链接优先**：受控目录里的解析器 token 放行、目录之外必红、
+	# 凭据（Keychain）在受控目录里也必红）。注入负对照在 harness 内部做手术：
+	# 覆盖层改成吃事件、源码里塞一条抓流路径、白名单开一个后门、把 token 放到
+	# 受控目录之外、在受控目录里塞 Keychain —— 每一条都必须红。
+	# 见 docs/plans/2026-10-02-stage-tv-screen.md、2026-10-03-dsh-reacceptance-task.md。
 	swift tools/test-resident-screen-overlay.swift
+	# 网站链接原生播放：解析安全/行为判据（公开来源、不读 cookie、不落签名地址、
+	# 受控子进程、取消/超时/具名失败）。四条注入负对照必须红。
+	swift tools/test-screen-link-behavior.swift
+	# 内置 helper 的**打包钉死清单 ↔ 运行时清单**一致性（版本/来源/sha256/许可逐字段，
+	# 空哈希 / 版本漂移 / 许可漂移 / 少源码组件四种注入必须红）。补的是
+	# 2026-10-03 "yt-dlp sha256 为空、生产 fail-closed" 那条缺口。
+	swift tools/test-screen-link-helper-lock.swift
+	# 原生播放离屏探针：分轨/合流描述派生 + 换片/停/删的过期结果作废（真 Metal 设备）。
+	swift tools/probe-native-link-playback.swift
+	# 电视**画面**离屏探针：`WorldScreenVideoRenderer` 把注册表里的解码纹理真的画到
+	# 世界四边形上（GPU 可见性查询片元数 > 0，像素颜色来自纹理），并且深度测试真的
+	# 在挡（更近的深度 ⇒ 片元 0；两台电视按深度分先后；没出画不画黑矩形）。
+	# 它把生产的 `WorldScreenVideoRenderer.swift` + `WorldScreenVideo.metal` 原文编起来跑，
+	# 补的正是"注册表没被渲染器消费、解码统计当播放"那条缺口。
+	swift tools/probe-screen-video-render.swift
+	# 角色接地：脚底 + **全身非脚接触**（坐/跪/盘腿）补偿；"只取脚"注入必须红。
+	swift tools/test-avatar-grounding.swift
+	# E2E 隔离：测试根 UserDefaults suite 每个根稳定独立、生产默认零副作用、
+	# E2E 关键持久化点全部显式注入测试根（不靠 CFFIXED_USER_HOME）。
+	swift tools/test-e2e-isolation.swift
+	# 单一 taskd 根：世界权威端点与生成服务必须连同一个 `taskd.sock`
+	# （`<base>/gmgn radio/TaskService`）。上一轮 E2E 在同一测试根里出现两个 taskd：
+	# 世界加载走一个、生成/入库走另一个。判据切出生产 `WorldAuthorityEndpoint` 原文
+	# 现编现跑，并有"抽掉 gmgn radio 一层必须红"的注入负对照 + 三处来源扫描。
+	swift tools/test-e2e-root-unification.swift
+	# 领取就绪 / 实际入库 / 承托层加载 / 重启已读恢复的接线（2026-10-03 E2E 拒收项）：
+	# 驱动器只认下载检查完成；收件箱先恢复再读；承托几何**与装修面板无关**地
+	# 在世界加载后备好（agent 关着面板也能摆放）。两条注入负对照必须红。
+	swift tools/test-resident-claim-restart-wiring.swift
 	# 电视机「官方嵌入页的**来源**」判据（真机 2026-10-02「视频播放器配置错误 / 错误 153」）。
 	# 顶层直载 /embed/ 时文档 origin **本来就是合法的 https://www.youtube.com**，可播放器
 	# 照样报 153 —— 缺的是**嵌它的那个文档**（referrer 空、没有 parent frame）；Twitch 把

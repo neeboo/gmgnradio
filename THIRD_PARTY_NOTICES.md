@@ -113,5 +113,21 @@ gmgn radio 的离线动作导入工具支持经过授权的
 - 未纳入仓库及应用：原始 BVH、USDA、完整数据集和查看器缓存
 - 分发限制：不得通过生成结果恢复或重新取得原始数据；面向产品或第三方发布前需确认许可范围
 
+## 内置 Rust helper
+
+`gmgn radio.app/Contents/Helpers/` 里有本仓库自己编译的两个 Rust 可执行文件：
+
+- `gmgn-taskd`：世界状态与许愿任务的唯一写入者（服务端）。
+- `gmgn-mcpd`：通过 stdio 暴露 MCP 工具面的服务器；它只读/转发到同一个
+  `gmgn-taskd`，不是第二个权威。
+
+两者都由 Xcode 构建阶段从本仓库的 `services/` 源码编译（`tools/build-taskd-helper.sh`、
+`tools/build-mcpd-helper.sh`），各自随包写入 `<name>.sha256`；
+`tools/verify-helper-manifest.py`（`make verify-helper-manifest`）在装机前独立复算摘要，
+清单为空或不一致时 fail-closed。
+
+- `gmgn-mcpd` 依赖 Rust MCP SDK [rmcp](https://github.com/modelcontextprotocol/rust-sdk) 3.5（Apache-2.0 / MIT 双许可）。
+- 两个 helper 的其余依赖见仓库根目录 `Cargo.lock`。
+
 原项目和本项目的完整许可证均可在仓库根目录的 `LICENSE` 中查看。
 本项目对应源码随应用公开提供。
