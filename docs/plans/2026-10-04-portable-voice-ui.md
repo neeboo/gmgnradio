@@ -92,6 +92,8 @@ Host-tools两通道已迁私有回环TCP，89项宿主通道/172项Node MCP桥�
 
 诊断确认同一合成接口返回HTTP402，响应同时包含insufficient/balance/credits，安全分类证据 `evidence/provider-status.json` 只记录状态码和布尔判据，不存远端正文或凭据。因此当前阻断为供应商账户余额/额度不足；Key可查询声音目录，但真实TTS有声、结束及取消链路仍待额度恢复后复验。不操作充值，不将目录成功当作播放成功；本轮没有ASR或麦克风请求。
 
+用户指出免费模型后更正验收范围：上述402是代码默认付费模型 `s2-pro` 的结果，不能推广到Fish全部模型。[官方TTS接口](https://docs.fish.audio/api-reference/endpoint/openapi-v1/text-to-speech) 明确支持请求头 `model: s2.1-pro-free`。本次通过内存环境 `GMGN_VOICE_FISH_TTS_MODEL=s2.1-pro-free` 覆盖进行真实App复验，未修改产品默认模型。`/private/tmp/gmgn-fish-free-tts-real-20261004/voice-report.json` 为ttsStatus=passed，有声、drain结束及取消后无声全部通过；仅PID5744输出rms=0.020403/peak=0.175827，globalTap=false。整体partial/exit2仅表示ASR仍暂停。免费模型无余额阻断，Fish真实TTS链已通过；之前付费失败证据保留。
+
 ## Unity + GPUI讨论范围
 
 目前只是候选调研，没有授权启动引擎替换。Unity官方Unity as a Library支持列表包含Android/iOS/Windows/UWP，不包含macOS/Linux；因此不能把Unity嵌入GPUI单窗口视为已有统一跨平台方案。独立窗口+Rust服务通信可以先验证业务分工；同窗口GPU共享需要另做平台桥接原型。当前继续保持SceneKit/Metal不变。
