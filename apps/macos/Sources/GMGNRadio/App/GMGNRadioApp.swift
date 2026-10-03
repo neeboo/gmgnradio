@@ -8524,6 +8524,7 @@ final class AppDelegate:
         snapshot["renderPerformance"] =
             stageRenderSurfaceController?.surfaceView.renderPerformanceDiagnostics ?? [:]
         snapshot["cameraInput"] = spatialStage.cameraInputDiagnostics
+        snapshot["renderScheduling"] = stageRenderSurfaceController?.renderSchedulingDiagnostics ?? [:]
         // 角色逐帧结构化动作（真实 clip / 播放器 / 播放时钟 / 骨骼姿态角度）。这是
         // "动作真的在播、姿态真的在变"的唯一证据；绝不拿资源 revision / GPU 帧号冒充。
         snapshot["avatarMotion"] =

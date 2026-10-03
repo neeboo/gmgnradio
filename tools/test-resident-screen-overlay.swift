@@ -1950,6 +1950,21 @@ import AppKit
 import Foundation
 import simd
 
+// 使用生产 updateOverlay 原文验证内容类型路由；世界输入仅由此探针提供。
+@MainActor final class StoreOverlayRoutingProbe {
+    var contents: [String: WorldScreenContent] = [:]
+    let overlay: WorldScreenOverlayController
+    var quads: [String: [SIMD3<Float>]] = [:]
+    var normals: [String: SIMD3<Float>] = [:]
+    var blockers = WorldScreenOccluders.empty
+    init(overlay: WorldScreenOverlayController) { self.overlay = overlay }
+    func worldQuads() -> (quads: [String: [SIMD3<Float>]], normals: [String: SIMD3<Float>]) {
+        (quads, normals)
+    }
+    func occluders() -> WorldScreenOccluders { blockers }
+    \##(productionDeclaration("    func updateOverlay(", in: storeSource))
+}
+
 var perfFailures = 0
 func perf(_ condition: Bool, _ message: String) {
     if condition {
@@ -2124,6 +2139,56 @@ struct PerfReading {
 
         let clear = drive(blocked: false)
         let blockedReading = drive(blocked: true)
+        // 原生屏不应再承担网页层的 CPU 射线遮挡；切回网页时必须恢复原有遮挡。
+        let nativeHost = NSView(frame: CGRect(x: 0, y: 0, width: 1600, height: 1000))
+        nativeHost.wantsLayer = true
+        let nativeController = WorldScreenOverlayController(hostView: nativeHost)
+        let nativeSurface = nativeController.surface(for: "native-tv")
+        let camera = WorldScreenCamera(position: SIMD3(0, 0.85, 1.6), yaw: 0, pitch: 0)
+        let projection = WorldScreenProjection(
+            camera: camera, profile: .fullStage, viewportSize: SIMD2(1600, 1000))
+        let occluders = WorldScreenOccluders(triangles: perfRoom(), boxes: [resident], revision: 7)
+        let routing = StoreOverlayRoutingProbe(overlay: nativeController)
+        routing.blockers = occluders
+        routing.contents["native-tv"] = .init(objectID: "native-tv", kind: .nativeLink,
+            url: "https://www.twitch.tv/eslcs", title: "原生屏")
+        routing.updateOverlay(projection: projection, camera: camera)
+        perf(nativeSurface.container.isHidden && nativeController.hiddenReasons["native-tv"] == nil,
+            "原生屏收起遗留层，不误报缺几何")
+        perf(!nativeController.frameCost.didRebuildOccluderIndex
+            && !nativeController.frameCost.didRecomputeMask,
+            "只有原生屏时不建 CPU 索引、不计算掩码")
+        routing.quads = ["native-tv": corners]
+        routing.normals = ["native-tv": normal]
+        routing.contents["native-tv"] = .init(objectID: "native-tv", kind: .officialEmbed,
+            url: "https://player.bilibili.com/player.html?bvid=BV1xx411c7mD", title: "网页屏")
+        routing.updateOverlay(projection: projection, camera: camera)
+        perf(!nativeSurface.container.isHidden && nativeController.frameCost.didRecomputeMask
+            && (nativeController.occlusionStats["native-tv"]?.blockedCellCount ?? 0) > 0,
+            "切回网页屏后恢复 CPU 遮挡")
+        routing.contents["native-tv"] = .init(objectID: "native-tv", kind: .nativeLink,
+            url: "https://www.twitch.tv/eslcs", title: "原生屏")
+        routing.updateOverlay(projection: projection, camera: camera)
+        perf(nativeController.occlusionStats["native-tv"] == nil
+            && !nativeController.frameCost.didRecomputeMask,
+            "切回原生后清除旧遮挡统计且跳过 CPU 掩码")
+        routing.contents["native-tv"] = .init(objectID: "native-tv", kind: .officialEmbed,
+            url: "https://player.bilibili.com/player.html?bvid=BV1xx411c7mD", title: "网页屏")
+        routing.updateOverlay(projection: projection, camera: camera)
+        perf(nativeController.frameCost.didRecomputeMask,
+            "再次切回网页后旧签名和节流时间不会阻止掩码恢复")
+        let legacySurface = nativeController.surface(for: "legacy-tv")
+        routing.contents["native-tv"] = .init(objectID: "native-tv", kind: .nativeLink,
+            url: "https://www.twitch.tv/eslcs", title: "原生屏")
+        routing.contents["legacy-tv"] = .init(objectID: "legacy-tv", kind: .officialEmbed,
+            url: "https://player.bilibili.com/player.html?bvid=BV1xx411c7mD", title: "网页屏")
+        routing.quads["legacy-tv"] = corners
+        routing.normals["legacy-tv"] = normal
+        routing.updateOverlay(projection: projection, camera: camera)
+        perf(nativeSurface.container.isHidden && !legacySurface.container.isHidden
+            && nativeController.occlusionStats["native-tv"] == nil
+            && (nativeController.occlusionStats["legacy-tv"]?.blockedCellCount ?? 0) > 0,
+            "原生和网页混合时仅原生退出 CPU 遮挡，网页仍按格遮挡")
         let seconds = Double(clear.frames) / 60.0
 
         // MARK: 每帧预算（遮挡 + 覆盖层）
@@ -2256,8 +2321,8 @@ check(performanceProbeClean.note.isEmpty && performanceProbeClean.status == 0
 let performanceInjections: [(name: String, patches: [(file: String, from: String, to: String)], expected: String)] = [
     (name: "每帧重建房间 BVH",
      patches: [(file: "WorldScreenOverlayController.swift",
-                from: "        if occluderIndex?.revision != occluders.revision {",
-                to: "        if true {")],
+                from: "        if hasLegacySurface, occluderIndex?.revision != occluders.revision {",
+                to: "        if hasLegacySurface {")],
      expected: "（上限 1）"),
     (name: "每帧重算掩码（去掉 30 Hz 节流）",
      patches: [(file: "WorldScreenOverlayController.swift",

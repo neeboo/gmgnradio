@@ -141,6 +141,71 @@ final class StageRenderSurfaceController {
     private var liveCamOrbit = LiveCamCharacterOrbit()
     private var renderLoopTask: Task<Void, Never>?
     private var renderLoopMode = StageRenderLoopMode.stopped
+    private var schedulingIntervalsMS: [Double] = []
+    private var schedulingOvershootsMS: [Double] = []
+    private var schedulingDrawDurationsMS: [Double] = []
+    private var schedulingLongIntervals: [[String: Any]] = []
+
+    private func currentSchedulingRunLoopMode() -> String {
+        RunLoop.current.currentMode?.rawValue ?? "none"
+    }
+
+    /// Main-actor draw invocation timing only, not GPU completion or physical
+    /// display cadence. Wait overshoot includes main-actor Task resumption delay.
+    var renderSchedulingDiagnostics: [String: Any] {
+        func summary(_ values: [Double]) -> [String: Any] {
+            guard !values.isEmpty else { return ["samples": 0] }
+            let sorted = values.sorted()
+            return [
+                "samples": sorted.count,
+                "p50MS": sorted[(sorted.count - 1) / 2],
+                "p95MS": sorted[Int(ceil(Double(sorted.count) * 0.95)) - 1],
+                "maxMS": sorted.last ?? 0,
+            ]
+        }
+        return [
+            "timingScope": "main-actor-draw-invocation-not-physical-display",
+            "observedAtSystemUptime": ProcessInfo.processInfo.systemUptime,
+            "sampleCapacity": 120,
+            "longIntervalCapacity": 12,
+            "schedulerKind": "task-sleep",
+            "loopActive": renderLoopTask != nil,
+            "drawStartInterval": summary(schedulingIntervalsMS),
+            "waitResumeOvershoot": summary(schedulingOvershootsMS),
+            "drawDuration": summary(schedulingDrawDurationsMS),
+            "longDrawStartIntervals": schedulingLongIntervals,
+        ]
+    }
+
+    private func recordRenderScheduling(
+        intervalMS: Double?, overshootMS: Double, drawDurationMS: Double,
+        startedAtUptime: Double, runLoopMode: String, waited: Bool
+    ) {
+        func appendBounded(_ value: Double, to values: inout [Double]) {
+            values.append(value)
+            if values.count > 120 { values.removeFirst(values.count - 120) }
+        }
+        if let intervalMS {
+            appendBounded(intervalMS, to: &schedulingIntervalsMS)
+            if intervalMS > 50 {
+                schedulingLongIntervals.append([
+                    "startedAtSystemUptime": startedAtUptime,
+                    "drawStartIntervalMS": intervalMS,
+                    "runLoopMode": runLoopMode,
+                    "waitResumeOvershootMS": overshootMS,
+                    "drawDurationMS": drawDurationMS,
+                    "didWait": waited,
+                ])
+                if schedulingLongIntervals.count > 12 {
+                    schedulingLongIntervals.removeFirst(
+                        schedulingLongIntervals.count - 12
+                    )
+                }
+            }
+        }
+        if waited { appendBounded(overshootMS, to: &schedulingOvershootsMS) }
+        appendBounded(drawDurationMS, to: &schedulingDrawDurationsMS)
+    }
 
     init(
         spatialStage: SpatialStageStore,
@@ -326,10 +391,9 @@ final class StageRenderSurfaceController {
         renderLoopTask = Task { @MainActor [weak self] in
             let clock = ContinuousClock()
             let loopStart = clock.now
-            // Re-anchored on every loop start (paused → active, reparent,
-            // quality switch): a stale cadence from a stopped loop must never
-            // make the first frames sleep for a past deadline.
             var pacer = StageRenderFramePacer(interval: 0)
+            // Local to this task: stopped time cannot become a draw interval.
+            var previousFrameStart: TimeInterval?
             func elapsedSeconds(_ duration: Duration) -> TimeInterval {
                 Double(duration.components.seconds)
                     + Double(duration.components.attoseconds)
@@ -337,38 +401,38 @@ final class StageRenderSurfaceController {
             }
             while !Task.isCancelled {
                 guard let self else { return }
-                guard case let .manual(currentFramesPerSecond) =
-                    self.renderLoopMode,
-                    !self.surfaceView.isHidden
-                else {
-                    return
-                }
+                guard case let .manual(currentFramesPerSecond) = self.renderLoopMode,
+                      !self.surfaceView.isHidden else { return }
                 let interval = 1.0 / Double(max(currentFramesPerSecond, 1))
                 let now = elapsedSeconds(clock.now - loopStart)
                 if pacer.interval != interval {
-                    // Target cadence changed (quality switch): restart pacing
-                    // at the current time so a slower target never inherits a
-                    // stale, already-past next-start time.
-                    pacer = StageRenderFramePacer(
-                        interval: interval,
-                        firstFrameAt: now
-                    )
+                    pacer = StageRenderFramePacer(interval: interval, firstFrameAt: now)
                 }
                 let idle = pacer.idleTime(now: now)
+                let sleepDeadline = clock.now + .seconds(idle)
                 if idle > 0 {
                     try? await Task.sleep(for: .seconds(idle))
                 } else {
-                    // Over-budget frames still have to release the main
-                    // actor so input, cancellation and world ticks can run.
                     await Task.yield()
                 }
                 guard !Task.isCancelled,
                       case .manual = self.renderLoopMode,
-                      !self.surfaceView.isHidden
-                else { return }
+                      !self.surfaceView.isHidden else { return }
                 let frameStart = elapsedSeconds(clock.now - loopStart)
+                let resumeOvershootMS = idle > 0
+                    ? max(0, elapsedSeconds(clock.now - sleepDeadline) * 1000) : 0
+                let startedAtUptime = ProcessInfo.processInfo.systemUptime
+                let runLoopMode = self.currentSchedulingRunLoopMode()
                 self.surfaceView.draw()
                 let frameEnd = elapsedSeconds(clock.now - loopStart)
+                self.recordRenderScheduling(
+                    intervalMS: previousFrameStart.map { (frameStart - $0) * 1000 },
+                    overshootMS: resumeOvershootMS,
+                    drawDurationMS: (frameEnd - frameStart) * 1000,
+                    startedAtUptime: startedAtUptime,
+                    runLoopMode: runLoopMode, waited: idle > 0
+                )
+                previousFrameStart = frameStart
                 pacer.frameDrew(startedAt: frameStart, endedAt: frameEnd)
             }
         }

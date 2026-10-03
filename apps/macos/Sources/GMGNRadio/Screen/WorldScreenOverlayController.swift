@@ -682,6 +682,8 @@ final class WorldScreenOverlayController {
     ///   - camera: 本帧相机（背向判据用）。
     ///   - occluders: 本帧的遮挡物（房间三角面 + 物件盒 + 居民盒）。
     ///     默认为空 = 不裁任何区域（旧调用点/离线驱动逐字不变）。
+    ///   - nativeSceneScreenIDs: 已由原生场景深度渲染的屏幕，不再投影/遮挡网页层。
+    ///     默认为空，保留网页屏幕的现有路径。
     ///
     /// 一帧的每一项都记进 `frameCost`（见 `WorldScreenFrameCost`）：这是"推进镜头爆卡"
     /// 唯一能被复核的口径 —— 光有"每帧 0.6 ms"说不清是算遮挡、画遮挡还是贴覆盖层。
@@ -690,12 +692,14 @@ final class WorldScreenOverlayController {
         normals: [String: SIMD3<Float>],
         projection: WorldScreenProjection,
         camera: WorldScreenCamera,
-        occluders: WorldScreenOccluders = .empty
+        occluders: WorldScreenOccluders = .empty,
+        nativeSceneScreenIDs: Set<String> = []
     ) {
         frameCost = WorldScreenFrameCost()
         let signpost = overlaySignposter.beginInterval("screen.overlay.frame")
         defer { overlaySignposter.endInterval("screen.overlay.frame", signpost) }
-        if occluderIndex?.revision != occluders.revision {
+        let hasLegacySurface = surfaces.keys.contains { !nativeSceneScreenIDs.contains($0) }
+        if hasLegacySurface, occluderIndex?.revision != occluders.revision {
             let start = CFAbsoluteTimeGetCurrent()
             occluderIndex = occluders.triangles.isEmpty
                 ? nil
@@ -707,6 +711,16 @@ final class WorldScreenOverlayController {
             overlaySignposter.emitEvent("screen.occluder-index.build")
         }
         for (objectID, surface) in surfaces {
+            if nativeSceneScreenIDs.contains(objectID) {
+                // 只收起遗留网页层；suspendMedia 仅作用于 WKWebView，不接触原生播放器。
+                hide(surface, reason: "由原生场景渲染")
+                hiddenReasons[objectID] = nil
+                occlusionStats[objectID] = nil
+                occlusionKeys[objectID] = nil
+                lastMaskRecompute[objectID] = nil
+                renderedSizes[objectID] = nil
+                continue
+            }
             guard let worldCorners = quads[objectID], worldCorners.count == 4 else {
                 hide(surface, reason: "没有屏幕几何")
                 continue

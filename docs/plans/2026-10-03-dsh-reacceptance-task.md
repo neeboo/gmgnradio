@@ -1,5 +1,17 @@
 # DSH 返工与主代理验收
 
+## 15:28 接续：原生电视遮挡修复已实测，声音仍未闭环
+
+主代理已接手实现：nativeLink 电视不再进入遗留 WKWebView 覆盖层的 CPU 射线遮挡计算，画面仍由 AVPlayer + Metal 场景深度渲染；网页屏原有遮挡保留。新增有界渲染调用间隔诊断，不改变原 Task 节拍。common-mode Timer 对照没有改善，已撤回该实验行为。
+
+当前完整构建 `/tmp/gmgn-parent-native-mask-window-build.log` exit0；严格 Swift6 节拍提取检查 `/tmp/gmgn-parent-render-schedule-tests.log` exit0；实际内容类型的原生/网页路由及负对照检查 `/tmp/gmgn-native-overlay-production-content-test.log` exit0。这些检查不能代替完整业务 E2E。
+
+真实隔离 App PID89145，全屏稳定后80次实际滚轮、180状态快照：80有效/0缺失，输入处理P95 13.435ms、最大16.322ms。输入后59个快照中渲染调用间隔滚动最大43.752ms、Metal呈现间隔滚动最大50.003ms、呈现P95峰值33.335ms；此前约300ms反复停顿在该窗口未复现。更宽标记区间仍有51.699ms调用间隔，不能宣称恒定60fps或物理显示延迟通过。日志 `/tmp/gmgn-parent-native-mask-window-live.log`。
+
+声音未通过：初次修复 PID87775 指定PID播放RMS0.106416、正式stop后RMS0，日志 `/tmp/gmgn-parent-native-mask-bypass-live.log` exit0；后续 PID89145 与同源复验 PID89319 均有751采样buffer但RMS0，音频门禁失败。PID89319实际帧数26→258、rate1、volume1、未静音、hasAudio=true，仍不能证明有声音。替换公开来源 monstercat 未开播，测试超时失败，不能记通过。日志 `/tmp/gmgn-parent-native-mask-audio-recheck.log`、`/tmp/gmgn-parent-native-mask-audio-alternate.log`。来源静音或输出链路原因尚未判定。
+
+当前断点：提交推送本轮已验证的最小修复和证据；继续当前构建真实声音开停复验及最终完整业务流程。历史160项业务通过保持原构建范围，不能直接算作本轮所有修改完整通过。未暂停跟进、未更新已安装App、未清用户数据。
+
 用户明确要求：主代理负责验收，不合格就让 DSH 持续修，不能只汇报未验。
 
 用户再次明确：验收是端到端，不是只看单测。必须使用当前构建的真实 App（可隔离数据根），将用户输入、真实服务调用、资产加载、世界操作与实际画面/声音连成一次业务流程。源码切片、fixture服务、独立AVPlayer/WKWebView探针和单测不能代替最终验收。自动化不具备的宿主操作需要暴露可测入口或提供具体操作路径给主代理，不能仅重复权限限制。

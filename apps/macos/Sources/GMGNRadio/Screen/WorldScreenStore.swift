@@ -349,9 +349,14 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
 
     func updateOverlay(projection: WorldScreenProjection, camera: WorldScreenCamera) {
         let world = worldQuads()
+        // 原生链接的屏幕由 Metal 深度缓冲遮挡，停止/恢复时也不回到网页覆盖层。
+        let nativeSceneScreenIDs = Set(contents.compactMap { objectID, content in
+            content.kind == .nativeLink ? objectID : nil
+        })
         overlay.update(
             quads: world.quads, normals: world.normals, projection: projection,
-            camera: camera, occluders: occluders()
+            camera: camera, occluders: occluders(),
+            nativeSceneScreenIDs: nativeSceneScreenIDs
         )
     }
 

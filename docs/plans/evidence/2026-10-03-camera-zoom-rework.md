@@ -50,6 +50,26 @@
 
 ## 全屏连续输入复验
 
+### 手动渲染节拍的恢复延迟（接续中）
+
+源码确认MTKView已isPaused，fullStage/liveCam共用MainActor Task.sleep手动loop，不能归因于MTKView默认定时器。新增120样本draw开始间隔/计划sleep恢复延迟/draw耗时，以及12个>50ms间隔的uptime和恢复后的RunLoop mode，status `renderScheduling`可读。诊断版构建 `/tmp/gmgn-parent-render-schedule-build.log` exit0，生产提取节拍测试exit0。
+
+真实PID83891，实际HLS解码>=20且GPU fragments>0后，3840×2160同80次滚轮，180快照及指定PID声音开停 `/tmp/gmgn-parent-render-schedule-live.log` exit0。draw开始间隔窗口最大297.310ms/P95峰值291.149ms，sleep恢复超时最大280.643ms/P95峰值274.482ms；draw本身最大10.114ms/P95峰值1.333ms。最近异常267–293ms间隔对应250–276ms恢复延迟，恢复时mode default；证实延迟发生在渲染任务恢复，未证实停顿期间的RunLoop mode。Metal呈现最大316.686ms。音频播放RMS0.134761/751buffers，正式stop后RMS0/752buffers，均指定PID/globalTap=false。
+
+对照修改仅将手动节拍改主RunLoop .common单次Timer，保留pacer、质量动态、可见性、ownership、取消及无追赶burst；独立pacer/generation避免draw同步触发start/stop/restart产生双loop。诊断kind=timer-common，延迟字段改为waitResumeOvershoot，不虚称sleep。严格Swift6生产提取测试覆盖tracking mode、过载取消、重入、停启、质量降档exit0。首次完整构建 `/tmp/gmgn-parent-render-common-build.log` exit65，Timer对象跨assumeIsolated的数据竞态诊断；已改callback只带generation/deadline与MainActor self，不传Timer、不加 blanket concurrency绕过。第二轮完整构建和真实对照待完成。
+
+common Timer第二轮完整构建 `/tmp/gmgn-parent-render-common-build2.log` exit0，但真实PID84434同80次滚轮仍约270–290ms调用间隔、250–270ms唤醒延迟、Metal呈现最大316.686ms，`/tmp/gmgn-parent-render-common-live.log`。对照无改善，Timer行为已撤回，恢复原Task+pacer，保留有界诊断并统一标为schedulerKind=task-sleep/waitResumeOvershoot。恢复后严格Swift6提取测试及完整构建 `/tmp/gmgn-parent-render-schedule-restored-build.log` exit0。失败实验不作为修复提交。
+
+新同步滚轮12秒sample `/tmp/gmgn-scroll-blocked-sample.txt`，PID85057，CUA实际50次滚轮：主线程7482样本中screen.tick→overlay.update→updateOcclusion→WorldScreenOcclusion.mask为1976（约26.4%），内部射线firstHit；draw614、SwiftUI layout185、AX约29、currentDrawable18，没有copyFrameTexture热栈。可确认显著主线程CPU工作，尚不能精确对应某一次270ms异常。
+
+实际发现nativeLink屏仍进入遗留网页24×14射线掩码，虽然原生视频已经Metal深度遮挡。最小修复store传nativeSceneScreenIDs，overlay跳过这些屏幕投影/CPU遮挡、隐藏遗留层、清旧遮挡stats/签名/节流缓存；仅原生屏时不建CPU occluder index，网页屏保持原质量与遮挡逻辑。hide只暂停WKWebView，不接触nativeplayer。当前构建 `/tmp/gmgn-parent-native-mask-bypass-build.log`，真实同条件缩放及声音对照待复验。
+
+### 原生遮挡绕行的实际复验结果
+
+完整构建 `/tmp/gmgn-parent-native-mask-window-build.log` exit0，原生/网页实际内容路由与负对照检查 exit0。真实隔离PID89145，稳定全屏后80次实际滚轮、180快照，80有效/0缺失。输入P95 13.435ms/最大16.322ms；输入后59个快照渲染调用间隔滚动最大43.752ms，Metal呈现滚动最大50.003ms/P95峰值33.335ms。此前约300ms停顿未在该窗口复现。宽标记区间仍有51.699ms调用间隔，不宣称恒定60fps、物理显示或输入到光子测量。日志 `/tmp/gmgn-parent-native-mask-window-live.log`。
+
+音频保持拒收：首轮PID87775真实开停RMS0.106416→0；后续PID89145及同源PID89319指定PID有751buffer但RMS0，门禁失败。后者视频解码继续增长、rate1/volume1/未静音/hasAudio=true，不能以这些状态覆盖声音失败。替换monstercat来源未开播并超时，亦不算通过。当前声音原因未判定，最新完整流程尚待复验。
+
 ### 长帧分段定位与最小修复（接续中）
 
 新增有界诊断：最近12个超过33ms的draw，记录uptime/帧号/各阶段耗时；最近120个Metal drawable呈现间隔，不标为物理显示或输入到光子延迟。诊断类直接提取的21项Swift检查exit0，完整App `/tmp/gmgn-parent-zoom-phases-build.log` exit0。真实HLS解码>=20且GPU fragments>0后，全屏80次CUA往返，300快照 `/tmp/gmgn-parent-zoom-phases-live.log` exit0：输入P95=16.848ms，捕获72.936/73.024ms两帧，其中物件视频阶段71.718/71.913ms；首批初始化还有96.541ms人物/jukebox长帧。Metal滚动呈现间隔P95约33.335ms，不能因显式跳帧0宣称60fps。

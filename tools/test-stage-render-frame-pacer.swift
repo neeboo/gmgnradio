@@ -170,6 +170,10 @@ guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
 guard let startLoop = declaration("private func startRenderLoop()", in: source),
       let stopLoop = declaration("private func stopRenderLoop()", in: source)
 else { fatalError("Missing production render loop") }
+guard let diagnosticsStart = source.range(of: "    private var schedulingIntervalsMS:")?.lowerBound,
+      let diagnosticsEnd = source.range(of: "    init(", range: diagnosticsStart..<source.endIndex)?.lowerBound
+else { fatalError("Missing production scheduling diagnostics") }
+let diagnostics = String(source[diagnosticsStart..<diagnosticsEnd])
 let driverHarness = #"""
 import Foundation
 import Darwin
@@ -188,10 +192,19 @@ enum StageRenderLoopMode { case stopped, manual(framesPerSecond: Int) }
     let surfaceView = Surface()
     var renderLoopTask: Task<Void, Never>?
     var renderLoopMode = StageRenderLoopMode.manual(framesPerSecond: 100)
+    \#(diagnostics)
     \#(startLoop)
     \#(stopLoop)
     func start() { startRenderLoop() }
     func stop() { stopRenderLoop() }
+    func seedDiagnostics() {
+        for index in 0..<150 {
+            recordRenderScheduling(
+                intervalMS: 60, overshootMS: Double(index), drawDurationMS: 2,
+                startedAtUptime: Double(index), runLoopMode: "test", waited: true
+            )
+        }
+    }
 }
 @main struct Tests {
     @MainActor static func main() async throws {
@@ -220,8 +233,33 @@ enum StageRenderLoopMode { case stopped, manual(framesPerSecond: Int) }
         try await Task.sleep(for: .milliseconds(40))
         precondition(sleeping.surfaceView.frames == 1,
             "cancelled sleeping loop must not draw one extra frame")
+        let recorded = Driver()
+        recorded.seedDiagnostics()
+        let metrics = recorded.renderSchedulingDiagnostics
+        let intervals = metrics["drawStartInterval"] as! [String: Any]
+        precondition(intervals["samples"] as! Int == 120)
+        let longIntervals = metrics["longDrawStartIntervals"] as! [[String: Any]]
+        precondition(longIntervals.count == 12)
+        precondition(longIntervals.first?["startedAtSystemUptime"] as! Double == 138)
+        precondition(longIntervals.last?["waitResumeOvershootMS"] as! Double == 149)
+        sleeping.start()
+        try await Task.sleep(for: .milliseconds(40))
+        sleeping.stop()
+        let restartMetrics = sleeping.renderSchedulingDiagnostics
+        precondition((restartMetrics["drawStartInterval"] as! [String: Any])["samples"] as! Int == 0,
+            "stopped time must not become a draw interval on restart")
+        let quality = Driver()
+        quality.start()
+        try await Task.sleep(for: .milliseconds(40))
+        let beforeQualityChange = quality.surfaceView.frames
+        quality.renderLoopMode = .manual(framesPerSecond: 12)
+        quality.start()
+        try await Task.sleep(for: .milliseconds(120))
+        quality.stop()
+        precondition(quality.surfaceView.frames - beforeQualityChange <= 3,
+            "lower quality cadence must re-anchor without catch-up")
         watchdog.cancel()
-        print("PASS: production async render loop yields under load and stops without a late frame")
+        print("PASS: production async render loop yields under load, cancels/restarts and bounds diagnostics")
     }
 }
 """#
@@ -230,7 +268,7 @@ try driverHarness.write(to: driverURL, atomically: true, encoding: .utf8)
 let executable = temporaryDirectory.appendingPathComponent("driver")
 let compile = Process()
 compile.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
-compile.arguments = ["-parse-as-library", driverURL.path, "-o", executable.path]
+compile.arguments = ["-swift-version", "6", "-parse-as-library", driverURL.path, "-o", executable.path]
 try compile.run()
 compile.waitUntilExit()
 guard compile.terminationStatus == 0 else { exit(compile.terminationStatus) }
