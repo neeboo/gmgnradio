@@ -10,6 +10,8 @@
 
 ### 主代理连续验收最新结果
 
+最新真实全新流程已结束：`/tmp/gmgn-parent-full-zoom-final.log` exit0，160pass/0fail/0blocked。新生成任务 `BADB4C80-51A5-402C-8528-217E3226663D` 正式生成/下载/取物活动/领取入库/摆放手持放回/三类人物活动/原始Twitch链接GPU视频与指定PID输出声音开停对照/新通知已读及重启/摆放与屏幕内容恢复/真实chat全部通过，生产Application Support未写。当前版本1dd687d，构建build3成功。原业务全链已验，但用户新增缩放卡顿尚未闭环，不暂停跟进。真实CUA已对隔离App镜头滚轮往返，视角有变化；5秒CPU采样 `/tmp/gmgn-zoom-current-sample.txt` 主线程3209样本中2091事件等待，无持续同步GPU等待，不能据此宣称FPS通过。后台SPZ排序2881样本（Swift排序2598），依赖每render无条件请求全量排序，静止镜头也请求；PMX接地亦有开销。worker zoom_performance_metrics 正在仅调用侧补有界短窗CPU/GPU/跳帧/排序诊断，不改ignored依赖源码。接续先审该修改、E2E status暴露renderPerformanceDiagnostics，再构建真实App，针对同镜头轨迹电视开关测缩放数据；不能把160业务通过等同缩放流畅。
+
 最新接续：缩放同步阻塞修改整合并完成第三轮完整App构建exit0，日志 `/tmp/gmgn-parent-zoom-fix-build3.log`；前两轮跨actor错误已修，未省略失败。全新根 `/tmp/gmgn-e2e-20261003-zoom-final` 当前真实全流程运行，session60618，日志 `/tmp/gmgn-parent-full-zoom-final.log`，包含系统输出声音。下一步立即核对该运行结果，真实App电视播放时用computer use测试镜头缩放并取得输入/帧耗时证据；仅移除同步等待和构建成功不代表卡顿已解。详见 evidence/2026-10-03-camera-zoom-rework.md。DSH旧stale-session分析已停止，主代理租约修复已推送9100b8b。自动化保留ACTIVE，但已将通知设为failed_runs_only减少定时弹出，并强化完成即推进/长期分析主代理接手的指令。
 
 主代理已停止长期仅分析的 DSH stale-session进程并接手。实际冲突为 e2eInvokeWorldTool 将控制面租约写入居民 liveCamMessageID，后台回合可覆盖，控制退出也会清掉居民回合。改为独立有界调用期控制租约集合，保留世界identity/selectedWorld/装修状态校验；正常居民会话仍按 liveCamMessageID 授权。当前App构建 `/tmp/gmgn-parent-lease-fix-build.log` exit0；真实2125恢复运行 `/tmp/gmgn-parent-lease-recovery.log` 146pass/0fail/0blocked，含实际HLS按PID输出开停对照和重启恢复/通知已读/真实chat。注意该任务启动时已被后台领取，恢复运行不重复证明新领取，不能据此关闭全新生成竞争验收。用户另反馈对着屏幕缩放卡顿：已定位主线程视频blit waitUntilCompleted和renderer无限inflight等待，主代理改无空闲帧即跳帧；worker正修安全异步视频copy，尚未构建/实测缩放，最终全新流程待性能修改整合后再跑。
