@@ -134,6 +134,10 @@ v16 完整包构建退出 0，日志 `/tmp/gmgn-gpui-product-app-build-v16.log`�
 
 实际菜单“显示小窗”接受导航后崩溃，进程退出 134。日志明确 `cannot update gmgn_gpui_app::GMGNProductUI while it is already being updated`。小窗切换判失败，继续返工生命周期，不以导航 accepted 算完成。当前源代码和既有证据已提交推送 `57c6e32`；该提交不代表完整 UI 验收通过。
 
+### v17 小窗往返不再崩溃，视觉仍需返工
+
+v17 构建退出 0（`/tmp/gmgn-gpui-product-app-build-v17.log`），运行 `/tmp/gmgn-gpui-parity-v17-runtime.log`。实际菜单切小窗成功，448×672 Retina、真实 2B 继续渲染，六个 Kit 入口可达；点击空间恢复 2360×1520 舞台、同世界人物与物件，生命周期崩溃此往返路径复验修复。仍不能算小窗完整通过：背景显示白色、白色图标对比不足，提示黑框遮人物且文本裁切，已继续返工。人物朝向与灯光需原小窗对照，未作完成结论。
+
 ### v9 正式产品入口实际复验
 
 实际运行 `tmp/gpui-product-app-v9/gmgn radio.app/Contents/MacOS/gmgn-gpui-app`，沿用下文真实业务验收根。Swift 宿主与产品包构建均成功；日志分别为 `/tmp/gmgn-gpui-product-host-build-v9.log`、`/tmp/gmgn-gpui-product-app-build-v9.log`。运行日志 `/tmp/gmgn-gpui-product-v9-runtime.log` 记录 `mounted=true compact=false`。CUA 实际看到 Kit 左栏与原生活舱、2B 人物、已有物件同窗显示；实际拖动镜头与滚轮缩放可用，属于 L07 部分通过，摆放、窗口缩放与跨窗恢复仍待验。

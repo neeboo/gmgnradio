@@ -55,6 +55,7 @@ struct GMGNProductUI {
     surface_mounted: bool,
     navigation_revision:u64,
     main_window:Rc<RefCell<Option<AnyWindowHandle>>>,
+    profile_switch_pending:bool,
     _poll: Task<()>,
 }
 
@@ -305,6 +306,7 @@ impl GMGNProductUI {
         cx.notify();
     }
     fn switch_profile(&mut self, compact: bool, destination: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.profile_switch_pending {return;}
         if compact!=self.compact&&self.props_open {
             if !self.host.borrow().as_ref().is_some_and(|host|host.settings_command(&serde_json::json!({"op":"stage.props.close"}))) {
                 self.core_notice=Some("装修预览未关闭，当前窗口保持不变。".into());cx.notify();return;
@@ -323,6 +325,12 @@ impl GMGNProductUI {
         // Create the real GPUI window shape while retaining this entity and all
         // product state; the next window-ready tick moves the single surface.
         let entity=cx.entity();let location=window.bounds().origin;
+        let previous_window=Window::window_handle(window);
+        self.profile_switch_pending=true;
+        // Root::new installs observers on the content entity. It must run
+        // after this entity lease and the current window update are released.
+        App::defer(cx,move |cx| {
+        let content=entity.clone();
         let handle=cx.open_window(WindowOptions {
             window_bounds:Some(WindowBounds::Windowed(Bounds::new(location,if compact{size(px(224.),px(336.))}else{size(px(1180.),px(760.))}))),
             window_min_size:if compact{None}else{Some(size(px(760.),px(520.)))},
@@ -332,22 +340,28 @@ impl GMGNProductUI {
             ..Default::default()
         },move |window,cx| {
             window.set_window_title("gmgn radio");
-            cx.new(|cx|gpui_kit::base::Root::new(entity,window,cx).bg(rgba(0x00000000)))
+            cx.new(|cx|gpui_kit::base::Root::new(content,window,cx).bg(rgba(0x00000000)))
         });
-        let Ok(handle)=handle else {self.core_notice=Some("窗口切换未完成。".into());cx.notify();return;};
-        self.compact=compact;
-        self.pane.update(cx,|pane,cx|pane.set_compact(compact,cx));
-        self.stage_panel_open=false;self.program_open=false;self.props_open=false;
-        self.surface_mounted=false;
-        self._poll=cx.spawn(async move |view,cx| {
+        let Ok(handle)=handle else {entity.update(cx,|ui,cx|{ui.profile_switch_pending=false;ui.core_notice=Some("窗口切换未完成。".into());cx.notify();});return;};
+        entity.update(cx,|ui,cx| {
+        ui.compact=compact;
+        ui.profile_switch_pending=false;
+        ui.pane.update(cx,|pane,cx|pane.set_compact(compact,cx));
+        ui.stage_panel_open=false;ui.program_open=false;ui.props_open=false;
+        ui.surface_mounted=false;
+        ui._poll=cx.spawn(async move |view,cx| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(100)).await;
                 if handle.update(cx,|_,window,cx|view.update(cx,|view,cx|view.tick(window,cx))).is_err(){break;}
             }
         });
-        *self.main_window.borrow_mut()=Some(handle.into());
-        if let Some(host)=self.host.borrow_mut().as_mut(){host.clear_window_reference();}
-        window.remove_window();cx.notify();
+        *ui.main_window.borrow_mut()=Some(handle.into());
+        if let Some(host)=ui.host.borrow_mut().as_mut(){host.clear_window_reference();}
+        cx.notify();
+        });
+        let closed=previous_window.update(cx,|_,window,_|window.remove_window()).is_ok();
+        eprintln!("GMGN_GPUI_PROFILE_WINDOW compact={compact} created=true previous_closed={closed}");
+        });
     }
     fn control(&self,id:&'static str,label:&'static str,action:&'static str,width:f32,height:f32,cx:&mut Context<Self>)->impl IntoElement {
         let label=if id=="screen" {
@@ -593,7 +607,7 @@ fn main() {
                 GMGNProductUI { host: host.clone(), pane, settings_pane, settings_window:None, inbox_pane, inbox_window:None, stage_pane,stage_panel_open:false,
                     program_pane,program_open:false,prop_pane,props_open:false,chat_open:false, voice_held:false, pending: None, accepted: false,
                     transcript: vec![], compact, core_notice, runtime_state: serde_json::Value::Null,
-                    surface_mounted: false,navigation_revision:0,main_window:main_window.clone(), _poll: poll }
+                    surface_mounted: false,navigation_revision:0,main_window:main_window.clone(),profile_switch_pending:false, _poll: poll }
             });
             *main_ui.borrow_mut()=Some(view.clone());
             cx.new(|cx| gpui_kit::base::Root::new(view, window, cx).bg(rgba(0x00000000)))
