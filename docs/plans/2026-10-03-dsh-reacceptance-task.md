@@ -10,6 +10,8 @@
 
 ### 主代理连续验收最新结果
 
+后续接续：DSH 实际 session/lease 修复已启动，日志 `/tmp/gmgn-dsh-stale-world-session-20261003.log`，session48340；负责生产 Swift 生命周期与回归测试，禁止在 driver 盲重试。声音工具返工已结束，工具6项测试通过；主代理 driver79项测试通过、当前工具编译exit0，已独立验证真实App播放输出/正式关闭静音。下一轮应等此次生产修复结束后审阅、重构建真实App，优先恢复2125已生成任务验证取物，再做完整新流程；不得把恢复模式记为新生成。
+
 21:27 全新根2125运行结束：113pass/3fail/4blocked，日志 `/tmp/gmgn-parent-full-e2e-2125.log`。真实生成任务 `B24ED537-E0E3-4E4A-8BAA-817215632CC5` 已完成下载检查，但紧随生成的正式 start_activity 返回 `stale_world_session` /「空间或会话已经切换」，取物未执行；后续 screen_not_found 是未入库连带失败。主代理随后对同一真实测试 App 诊断重发 start_activity 可成功，但不覆盖原失败。需要 DSH 修复实际世界工具 lease/session 失效时序，禁止 driver 盲重试掩盖。通知/动作/真实聊天仍通过，物件与屏幕恢复因没有入库未验；已有根的声音实证保留，整体验收继续未完成。
 
 21:25 主代理限定 PID 53973 的 CoreAudio 输出采样通过：电视实际播放时 buffers751/frames384512/peak0.69524/rms0.11745；正式 stop_screen 成功后 buffers469/frames240128/peak0/rms0。两份报告均 globalTap=false、scopedProcesses=[53973]，报告 `/tmp/gmgn-parent-hls-output-audio-playing.json`、`/tmp/gmgn-parent-hls-output-audio-stopped.json`。未采集其他应用。新工具的先停再重开一键 A/B 因未等待 HLS 起播，8秒播放窗口全零，exit4；不得将该测试时序失败隐藏。主代理正式 driver 改为已有真实播放确认后采样，再 stop_screen 后采静音，最后恢复播放。已启动全新根 `/tmp/gmgn-e2e-20261003-2125` 完整真实生成流程（无 existing-wish-id），包含系统输出采样；日志 `/tmp/gmgn-parent-full-e2e-2125.log`，session18906，当前人物动作通过并进入真实生成。运行未结束，尚不能宣布完整验收完成。
