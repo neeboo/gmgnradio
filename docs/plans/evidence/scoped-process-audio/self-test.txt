@@ -1,0 +1,10 @@
+PASS 440Hz：采到音频缓冲
+PASS 440Hz：采到非静音峰值
+PASS 440Hz：RMS 显著大于 0
+PASS 440Hz：只绑定目标 PID
+PASS 440Hz：没有创建全系统 tap
+PASS 440Hz：目标进程对象存在
+PASS 静音：采到音频缓冲
+PASS 静音：峰值接近 0
+PASS 静音：只绑定目标 PID
+SELF-TEST PASS

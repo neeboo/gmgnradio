@@ -10,6 +10,10 @@
 
 ### 主代理连续验收最新结果
 
+21:27 全新根2125运行结束：113pass/3fail/4blocked，日志 `/tmp/gmgn-parent-full-e2e-2125.log`。真实生成任务 `B24ED537-E0E3-4E4A-8BAA-817215632CC5` 已完成下载检查，但紧随生成的正式 start_activity 返回 `stale_world_session` /「空间或会话已经切换」，取物未执行；后续 screen_not_found 是未入库连带失败。主代理随后对同一真实测试 App 诊断重发 start_activity 可成功，但不覆盖原失败。需要 DSH 修复实际世界工具 lease/session 失效时序，禁止 driver 盲重试掩盖。通知/动作/真实聊天仍通过，物件与屏幕恢复因没有入库未验；已有根的声音实证保留，整体验收继续未完成。
+
+21:25 主代理限定 PID 53973 的 CoreAudio 输出采样通过：电视实际播放时 buffers751/frames384512/peak0.69524/rms0.11745；正式 stop_screen 成功后 buffers469/frames240128/peak0/rms0。两份报告均 globalTap=false、scopedProcesses=[53973]，报告 `/tmp/gmgn-parent-hls-output-audio-playing.json`、`/tmp/gmgn-parent-hls-output-audio-stopped.json`。未采集其他应用。新工具的先停再重开一键 A/B 因未等待 HLS 起播，8秒播放窗口全零，exit4；不得将该测试时序失败隐藏。主代理正式 driver 改为已有真实播放确认后采样，再 stop_screen 后采静音，最后恢复播放。已启动全新根 `/tmp/gmgn-e2e-20261003-2125` 完整真实生成流程（无 existing-wish-id），包含系统输出采样；日志 `/tmp/gmgn-parent-full-e2e-2125.log`，session18906，当前人物动作通过并进入真实生成。运行未结束，尚不能宣布完整验收完成。
+
 21:11 用户明确要求主代理使用 computer use 继续，不再停在音频采集询问。此前待确认状态已解除；仅允许本次隔离测试 App 输出声音验证，保留其他应用及现有 Loopback 混音配置。主代理通过既有 AppHost 启动测试 bundle `ai.gmgn.radio.e2e`，复用隔离根 `/tmp/gmgn-e2e-20261003-1838`，PID 53973，正式 `play_screen` 播放 Twitch 页面，真实解码帧持续增长且 rate=1；日志 `/tmp/gmgn-parent-scoped-audio-host.log`。DSH 正在实现限定目标 PID 的验收采样工具，日志 `/tmp/gmgn-dsh-scoped-audio-20261003.log`；主代理负责必要 GUI 授权与实际 HLS 输出开停对照。当前未获得 HLS 输出 PCM 证据，完整验收仍未完成；本次复用已有物件不计为新生成或新通知翻转。
 
 19:17 坐姿语义更正后当前宿主构建exit0（`/tmp/gmgn-parent-reacceptance-1917-build2.log`，主代理修新增Handler参数顺序），Python89pass。真实恢复流程137pass/1fail/2blocked，`/tmp/gmgn-parent-reacceptance-1917-real-app.log`。显式重启站姿实际clip=idle-loop-pmx，脚离参考面0.0036m、contact0.0175m，双边站姿判据通过；坐姿按骨盆稳定性/动作姿态检查，不再以脚离地误报站立浮地，不宣称几何座面支撑已验。物件电视恢复/非HLS PCM声音/真实chat继续通过。旧任务没有新未读导致恢复模式的翻转判据未重复验，前轮全新根通知已读和重启已验。HLS最终输出声音仍需实证；系统进程音频采集仅为候选方案，可能涉及macOS授权，未获用户进一步确认不得接入/调用TCC采集。

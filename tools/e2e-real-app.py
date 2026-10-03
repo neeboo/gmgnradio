@@ -2382,6 +2382,44 @@ class RealAppE2E:
         self.ledger.check(float(last.get("rate") or 0) > 0, f"{label}播放器在真实播放速率",
                           nativeLink=last)
         if last.get("audioTapAttached") is not True:
+            sampler = getattr(self.args, "audio_output_sampler", None)
+            if sampler and last.get("audioTapInstallDetail") == "unsupported:hls-manifest":
+                assert self.host.process is not None
+                pid = self.host.process.pid
+                evidence = self.root / "evidence" / f"hls-output-{uuid.uuid4().hex}.json"
+                try:
+                    def sample(expect, path):
+                        run = subprocess.run(
+                            [sampler, "--pid", str(pid), "--seconds", "8",
+                             "--expect", expect, "--output", str(path)],
+                            capture_output=True, text=True, timeout=60, check=False)
+                        data = json.loads(path.read_text()) if path.exists() else {}
+                        scoped = (data.get("targetPid") == pid
+                                  and data.get("scopedProcesses") == [pid]
+                                  and data.get("globalTap") is False)
+                        return run.returncode == 0 and scoped, data
+                    playing_ok, playing = sample("audible", evidence)
+                    stopped = self.tool("stop_screen", {"object_id": object_id})
+                    time.sleep(1)
+                    quiet_ok, quiet = sample("silent", evidence.with_suffix(".quiet.json"))
+                    report = {"playing": playing, "quiet": quiet}
+                    passed = (playing_ok and quiet_ok and stopped.get("ok") is True
+                              and int(playing.get("tapBuffers") or 0) > 0
+                              and int(quiet.get("tapBuffers") or 0) > 0
+                              and float(playing.get("rms") or 0) >= 0.0005
+                              and float(playing.get("rms") or 0)
+                              >= 4 * max(float(quiet.get("rms") or 0), 0.000001))
+                    self.ledger.check(passed, f"{label}指定测试进程 HLS 输出开停对照",
+                                      report=report)
+                except (subprocess.TimeoutExpired, OSError, ValueError) as error:
+                    self.ledger.check(False, f"{label}系统输出采样未完成", error=str(error))
+                finally:
+                    restored = self.tool("play_screen", {"object_id": object_id,
+                                                          "url": self.args.video_url})
+                    self.ledger.check(restored.get("ok") is True,
+                                      "声音开停对照后恢复正式电视播放")
+                    self.wait_screen_playing(object_id, timeout=self.args.timeout)
+                return
             self.ledger.blocked(f"{label}音频采样 tap 没有挂上（平台/轨道协商），真实声音采样缺失",
                                 nativeLink=last)
             return
@@ -2898,6 +2936,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              "（**必须**与 --reuse-root 同用，避免重复生成花费；"
                              "本模式只证明「已有任务能接着走完」，不代表全新生成流程已通过）")
     parser.add_argument("--video-url", default=DEFAULT_VIDEO_URL)
+    parser.add_argument("--audio-output-sampler",
+                        help="可执行的按 PID 限定输出采样工具，用于 HLS 真实开停对照")
     parser.add_argument("--audio-reference-url", default=DEFAULT_AUDIO_REFERENCE_URL,
                         help="非 HLS 声音对照源：公开的 file-based、带音轨 mp4"
                              "（默认 W3C Sintel 预告片）。它只证明采样链可用，"

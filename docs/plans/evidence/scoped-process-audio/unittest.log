@@ -1,0 +1,12 @@
+test_ab_confirms_real_on_off_contrast (tools.tests.test_process_audio_sampler.ScopedAudioSamplerTests.test_ab_confirms_real_on_off_contrast) ... ok
+test_ab_rejects_playback_that_never_changes (tools.tests.test_process_audio_sampler.ScopedAudioSamplerTests.test_ab_rejects_playback_that_never_changes) ... ok
+test_host_mailbox_drives_play_and_stop (tools.tests.test_process_audio_sampler.ScopedAudioSamplerTests.test_host_mailbox_drives_play_and_stop) ... ok
+test_missing_target_reports_no_signal_not_a_hang (tools.tests.test_process_audio_sampler.ScopedAudioSamplerTests.test_missing_target_reports_no_signal_not_a_hang) ... ok
+test_self_check_advertises_scoping_safety (tools.tests.test_process_audio_sampler.ScopedAudioSamplerTests.test_self_check_advertises_scoping_safety) ... ok
+test_self_test_captures_tone_and_silence_by_pid (tools.tests.test_process_audio_sampler.ScopedAudioSamplerTests.test_self_test_captures_tone_and_silence_by_pid) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 57.131s
+
+OK
+EXIT=0
