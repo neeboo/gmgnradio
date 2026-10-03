@@ -24,6 +24,10 @@
 - 已排队在其结束后继续修领取/入库/重启失败，日志 `/tmp/gmgn-dsh-claim-restart-fixes-20261003.log`。同一生产区域串行写，避免两个 DSH 并发修改。
 - 线程自动跟进 automation id gmgnradio，10分钟间隔；无变化安静，实际失败/进展才通知。主代理不得等待用户催问才复验。
 - 验收未通过；继续当前引擎，不覆盖安装App、不操作用户真实状态或Keychain。
+# 19:17 坐姿语义更正后的真实复验
+
+宿主1917-build2 exit0，Python89pass，恢复流程137pass/1fail/2blocked。实际idle站姿脚离参考面3.6mm、contact17.5mm通过；坐姿独立姿态/骨盆稳定性检查，允许脚离地。真实GPU重启画面已查看。物件电视恢复、非HLS非静音PCM和chat delivered通过。旧已读通知不会制造新的未读翻转，前轮全新根已实证；HLS声音未关闭。坐姿骨盆稳定不是实物凳子支撑的几何证据，不夸大为座面验收通过。完整验收仍未完成。
+
 # 坐姿误判更正
 
 用户指出默认动作是坐在凳子的坐姿；主代理已确认测试根MotionPackages/.selection.json选中chair-sit-loop-pmx。此前截图和脚面离地数字仅证明坐姿脚高于参考面，不能证明站立悬空缺陷。撤回以此要求PMX强制落地的结论。后续显式idle站姿测试与座面支撑坐姿测试分开，不以activeActivity为空推断当前为站姿。

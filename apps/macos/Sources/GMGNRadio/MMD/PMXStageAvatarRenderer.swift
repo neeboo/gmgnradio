@@ -1286,6 +1286,42 @@ enum PMXSoleGrounding {
         .min()
     }
 
+    /// 单根骨骼原点在**世界坐标**的位置（经最近一帧真实 `modelTransform`）。
+    ///
+    /// 与 ``modelSpacePositions`` 用同一份模型空间换算：把骨骼原点从它的局部空间转到
+    /// `model.presentation`（模型空间），再乘 `transform`。按 `names` 顺序取第一根存在的
+    /// 骨骼；都不存在时返回 nil，绝不编造。
+    ///
+    /// 存在的理由是坐姿验收：坐姿的脚本来就可能离地，判"坐在座面上、骨盆对齐、没有穿模"
+    /// 要看**骨盆**相对世界根 / 脚面的位置，而不是脚面离地多少。
+    static func worldPosition(
+        ofBoneNamed names: [String],
+        in model: MMDNode,
+        transform: simd_float4x4
+    ) -> SIMD3<Float>? {
+        for name in names {
+            guard let bone = model.childNode(withName: name, recursively: true) else {
+                continue
+            }
+            let modelSpace = bone.presentation.simdConvertPosition(
+                .zero,
+                to: model.presentation
+            )
+            guard modelSpace.x.isFinite,
+                  modelSpace.y.isFinite,
+                  modelSpace.z.isFinite
+            else {
+                continue
+            }
+            let world = transform * SIMD4<Float>(modelSpace, 1)
+            guard world.x.isFinite, world.y.isFinite, world.z.isFinite else {
+                continue
+            }
+            return SIMD3<Float>(world.x, world.y, world.z)
+        }
+        return nil
+    }
+
     enum PMXSoleSide {
         case left
         case right
@@ -1947,6 +1983,38 @@ public final class PMXStageAvatarRenderer {
         }
         return diagnostics
     }
+
+    /// **世界坐标**骨架诊断（E2E / 人工视觉核验只读）。
+    ///
+    /// 坐姿验收不能拿"脚离地"当浮地：椅子/凳子的坐姿本来就可能双脚离地。要判"坐在座面上、
+    /// 骨盆对齐、身体没有穿模"，必须看**骨盆**（`下半身`）相对世界根 / 脚面的位置，以及它
+    /// 在循环内是否稳定。这里只把骨骼原点经最近一帧真实 `lastAppliedModelTransform` 投到
+    /// 世界，不施加任何位置补偿、不改姿态。找不到骨骼的名字就不上报，绝不编造。
+    public var worldSkeletonDiagnostics: [String: Any] {
+        guard let modelNode else { return [:] }
+        let transform = lastAppliedModelTransform
+        var diagnostics: [String: Any] = [:]
+        let groups: [(key: String, names: [String])] = [
+            ("pelvisWorld", ["下半身", "腰"]),
+            ("centerWorld", ["センター"]),
+            ("leftFootWorld", ["左足首", "左足"]),
+            ("rightFootWorld", ["右足首", "右足"]),
+            ("leftKneeWorld", ["左ひざ"]),
+            ("rightKneeWorld", ["右ひざ"]),
+        ]
+        for group in groups {
+            guard let point = PMXSoleGrounding.worldPosition(
+                ofBoneNamed: group.names,
+                in: modelNode,
+                transform: transform
+            ) else { continue }
+            diagnostics["\(group.key)X"] = point.x
+            diagnostics["\(group.key)Y"] = point.y
+            diagnostics["\(group.key)Z"] = point.z
+        }
+        return diagnostics
+    }
+
     private var renderTimeline = PMXRenderTimeline()
     private var oneShotMotionPlayback: PMXOneShotMotionPlayback?
     private var motionPlaybackProbe: PMXMotionPlaybackProbe?

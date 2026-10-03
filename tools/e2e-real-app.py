@@ -66,9 +66,15 @@ UserDefaults 全部隔离到一次性目录里；它不安装、不启动、不�
     **原始页面链接**（无签名媒资地址）；
   * 播放恢复：没有自动续播时**重走生产 `play_screen`**，再验解码帧与 GPU `fragments`
     真的恢复；
-  * 足部/姿态：渲染器新暴露**世界坐标**读数（左右脚 + 全身最低点 + 角色静止脚面），
-    静止站姿按双边容差判"贴地 / 浮地"（旧的 `min+offset >= rest` 是单边的，抓不到浮地），
-    并把 6 帧真实 GPU 回读另存到 `<root>/evidence/restart-frames/` 供人工视觉核验。
+  * 足部/姿态（**已按 2026-10-03 用户更正重写语义**）：**先显式区分站姿与坐姿**，绝不
+    以 `activeActivity` 为空假定站姿；
+      - 显式站姿：测试根 `.selection.json` 只选 `--stand-motion-id`（默认
+        `gmgn.motion.bones.idle-loop-pmx`），当前 clip 必须就是它，脚面按双边容差判
+        "贴地/浮地"（旧 `min+offset >= rest` 是单边，抓不到浮地）；复制包最后选中的
+        `chair-sit` 不得冒充站姿；
+      - 坐姿：世界坐姿活动（`chair.sit` / `bunk.rest`）或显式坐姿 clip 才判，**允许脚离地**；
+        改判座面支撑（骨盆在循环内稳定）/ 骨盆对齐（相对坐姿入口）/ 身体穿模（最低点不穿地），
+        并把 6 帧真实 GPU 回读另存到 `<root>/evidence/restart-frames/` 供人工视觉核验。
 
 **非 HLS 声音对照**（`audio_reference` 段，`--skip-audio-reference` 可关）：在同一块真实
 屏幕上放一条**公开、file-based、带音轨**的 mp4，做一次真实 PCM 链采样。HLS 的
@@ -127,12 +133,25 @@ DEFAULT_VIDEO_URL = "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
 # 下面这条是 W3C 的公开 CC 视频（`video/mp4`、`Accept-Ranges: bytes`、AAC 音轨），
 # 是主代理在真实 App 里做链采样的对照；它**不**把 HLS 那条 blocked 改成通过。
 DEFAULT_AUDIO_REFERENCE_URL = "https://media.w3.org/2010/05/sintel/trailer.mp4"
-# 重启静止站姿的**浮地**容差（米）：脚面高于角色自己的静止脚面超过它就算浮空。
-# 既有 `motion_grounding_ok` 只判"不低于静止参考"（单边，抓不到浮地），这里的双边判据
-# 才是重启后"有没有真的站在地上"的验收。
+# **显式**站姿（idle）与坐姿动作。2026-10-03 更正：测试根 `.selection.json` 曾经由
+# 复制包顺序决定（第一个包是 chair-sit），于是一个**坐姿** clip 被当成默认站姿去判"脚
+# 离地=浮地"。现在测试根只显式选这两个之一：站姿验收要求当前 clip 就是 `STAND_MOTION_ID`，
+# 坐姿验收要求当前 clip 是 `SIT_MOTION_ID` 或在跑世界坐姿活动。绝不写生产 selection。
+STAND_MOTION_ID = "gmgn.motion.bones.idle-loop-pmx"
+SIT_MOTION_ID = "gmgn.motion.bones.chair-sit-loop-pmx"
+# 世界声明的坐姿活动 ID（`action: sit`）。坐姿可以经由这些活动入口进入。
+SIT_ACTIVITY_IDS = ("chair.sit", "bunk.rest")
+# 显式站姿的**浮地**容差（米）：只在当前 clip 确实是 `<STAND_MOTION_ID>` 时使用；脚面
+# 高于角色自己的静止脚面超过它才算站姿浮空。它绝不套到坐姿上（坐姿脚离地是本来的姿态）。
 RESTART_FLOAT_TOLERANCE_M = 0.05
-# 重启静止站姿的单脚 stance 容差（米）：左右脚各自离静止脚面不能超过它。
+# 显式站姿的单脚 stance 容差（米）：左右脚各自离静止脚面不能超过它。
 RESTART_STANCE_TOLERANCE_M = 0.25
+# 坐姿骨盆在循环内的稳定容差（米）：坐着时骨盆不应下沉/弹跳超过它（座面支撑的只读判据）。
+SIT_PELVIS_SPAN_TOLERANCE_M = 0.12
+# 坐姿骨盆相对坐姿入口（世界根位置）的水平对齐容差（米）：骨盆不能整个滑离座位。
+SIT_PELVIS_ALIGNMENT_TOLERANCE_M = 0.60
+# 坐姿骨盆必须高于脚面的最小差（米）：证明躯干由座面托着、腿垂在下面。
+SIT_PELVIS_ABOVE_FOOT_M = 0.05
 
 # 测试根默认落在 `/tmp` 下**短**路径：taskd 用 AF_UNIX，`sockaddr_un.sun_path` 在
 # macOS 上只有 104 字节（含结尾 NUL）。上一轮默认根是仓库内
@@ -251,15 +270,19 @@ def read_source_selection(source: Path) -> str | None:
 
 
 def copy_package_source(
-    source: Path, destination_root: Path, allow_existing: bool = False
+    source: Path, destination_root: Path, allow_existing: bool = False,
+    preferred_selection: str | None = None,
 ) -> list[str]:
-    """把包**复制**到测试根，并把来源的选中项写进测试根自己的 `.selection.json`。
+    """把包**复制**到测试根，并把选中项写进测试根自己的 `.selection.json`。
 
     - 复制而不是 symlink：生产 PresencePackages/MotionPackages 的目录**绝不**连进
       测试根；App 选中人物/动作时写的是测试根里的 `.selection.json`，不会写生产。
     - 源里的 symlink 一律拒绝。
     - `allow_existing=True`（`--reuse-root`）时，测试根里已有的同名包不重拷，但仍然
       按来源/第一个包写选中项。
+    - `preferred_selection` 非空且确实拷进来了时**优先**选它（动作包走这条，显式选站姿，
+      不再让复制顺序里的 `chair-sit` 冒充站姿）；它不在包里时如实回落到来源/第一个包，
+      由调用方把"显式站姿缺失"记 blocked。
     - 返回复制（或复用）出来的包名列表。
     """
     source = Path(source).expanduser()
@@ -280,6 +303,8 @@ def copy_package_source(
         shutil.copytree(package, destination, symlinks=False)
         copied.append(name)
     selected = read_source_selection(source)
+    if preferred_selection and preferred_selection in copied:
+        selected = preferred_selection
     if selected not in copied:
         selected = copied[0]
     (destination_root / ".selection.json").write_text(
@@ -405,6 +430,59 @@ def extract_owned_object(response: dict, object_id: str) -> dict | None:
 def extract_number(mapping: dict, key: str) -> float | None:
     value = mapping.get(key) if isinstance(mapping, dict) else None
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def extract_motion_clip(status: dict | None) -> str:
+    """`status.avatarMotion.clip`（渲染器真正装载的 clip 名）。读不到给空串，不编造。"""
+    if not isinstance(status, dict):
+        return ""
+    motion = status.get("avatarMotion")
+    if not isinstance(motion, dict):
+        return ""
+    clip = motion.get("clip")
+    return clip if isinstance(clip, str) else ""
+
+
+def motion_role(clip: str | None, stand_motion_id: str, sit_motion_id: str) -> str:
+    """把一个 clip 名判成 `stand` / `sit` / `unknown`（**只按已装载的 clip**，不按
+    `activeActivity` 猜）。
+
+    用户 2026-10-03 更正的核心：没有活动（`activeActivity` 为空）时显示的可能是**坐姿**
+    默认动作，所以"空活动 = 站姿"不成立。角色判定只认：
+      * 显式站姿动作 ID，或 idle/stand 语义的名字 ⇒ `stand`；
+      * 显式坐姿动作 ID，或 sit / chair / cross-legged / kneeling 语义的名字 ⇒ `sit`；
+      * 其它 ⇒ `unknown`（由调用方具名 blocked，不冒充任何一侧）。
+    """
+    if not clip:
+        return "unknown"
+    if clip == stand_motion_id:
+        return "stand"
+    if clip == sit_motion_id:
+        return "sit"
+    normalized = clip.lower()
+    sit_tokens = ("sit", "chair", "cross-legged", "crosslegged", "kneel", "seiza")
+    if any(token in normalized for token in sit_tokens):
+        return "sit"
+    stand_tokens = ("idle", "stand", "natural-idle", "rest")
+    if any(token in normalized for token in stand_tokens):
+        return "stand"
+    return "unknown"
+
+
+def motion_is_explicit_sit(clip: str | None, active_activity: str | None,
+                           sit_motion_id: str) -> bool:
+    """坐姿前提：显式坐姿 clip，或正在跑世界声明的坐姿活动。"""
+    if isinstance(active_activity, str) and active_activity in SIT_ACTIVITY_IDS:
+        return True
+    if not clip:
+        return False
+    if clip == sit_motion_id:
+        return True
+    normalized = clip.lower()
+    return any(
+        token in normalized
+        for token in ("sit", "chair", "cross-legged", "crosslegged", "kneel", "seiza")
+    )
 
 
 # -- 非 HLS 声音对照源：只读可用性确认 ------------------------------------------
@@ -656,6 +734,11 @@ class RealAppE2E:
         self.root = Path(args.root).resolve() if args.root else default_e2e_root()
         self.ledger = Ledger()
         self.args = args
+        # 显式站姿 / 坐姿动作：CLI 可覆写，默认 BONES idle / chair-sit。站姿验收只认
+        # `stand_motion_id`，坐姿验收只认 `sit_motion_id` 或世界坐姿活动；绝不按
+        # `activeActivity` 为空猜站姿。测试根之外的任何 selection 都不写。
+        self.stand_motion_id = getattr(args, "stand_motion_id", None) or STAND_MOTION_ID
+        self.sit_motion_id = getattr(args, "sit_motion_id", None) or SIT_MOTION_ID
         self.host: AppHost | None = None
         self.app: Path | None = None
         self._read_keys: list[str] = []
@@ -762,10 +845,14 @@ class RealAppE2E:
         绝不 symlink 到生产 PresencePackages/MotionPackages：复制保证 App 选中人物/动作
         时写的 `.selection.json` 落在测试根，生产 selection 一个字节都不动。
         来源只读；源里的 symlink 直接拒绝。
+
+        **动作包额外一步**：复制完成后把测试根选中项显式写成 `--stand-motion-id`。上一轮
+        按复制顺序选，`chair-sit` 排在 `idle-loop` 前面，于是一个坐姿 clip 被当成默认站姿
+        去判"脚离地=浮地"。这里显式选站姿；缺包就具名 blocked，绝不用别的动作冒充。
         """
-        for kind, sources, relative in (
-            ("人物", self.args.avatar_source, AVATAR_PACKAGES_RELATIVE),
-            ("动作", self.args.motion_source, MOTION_PACKAGES_RELATIVE),
+        for kind, sources, relative, preferred in (
+            ("人物", self.args.avatar_source, AVATAR_PACKAGES_RELATIVE, None),
+            ("动作", self.args.motion_source, MOTION_PACKAGES_RELATIVE, self.stand_motion_id),
         ):
             if not sources:
                 continue
@@ -775,6 +862,7 @@ class RealAppE2E:
                     copied = copy_package_source(
                         Path(source), destination_root,
                         allow_existing=self.args.reuse_root,
+                        preferred_selection=preferred,
                     )
                 except E2ERealAppError as error:
                     raise SystemExit(str(error)) from error
@@ -785,6 +873,41 @@ class RealAppE2E:
                     packages=copied,
                     selected=read_source_selection(Path(source).expanduser()),
                 )
+            if kind == "动作":
+                self.select_explicit_stand_motion(destination_root)
+
+    def select_explicit_stand_motion(self, motion_root: Path) -> None:
+        """把测试根的站姿选中项**显式**写成 `--stand-motion-id`（只写测试根）。
+
+        多个 `--motion-source` 时最后一次复制会把选中项写成"来源里第一个包"；这里在全部
+        复制完成后统一覆盖成显式站姿，顺序不再影响语义。包不存在时具名 blocked。
+        """
+        stand_id = self.stand_motion_id
+        package = motion_root / stand_id
+        available = (
+            sorted(entry.name for entry in motion_root.iterdir() if entry.is_dir())
+            if motion_root.exists() else []
+        )
+        if not package.is_dir():
+            self.ledger.blocked(
+                f"测试根动作包缺少显式站姿 {stand_id}；站姿贴地无法验证"
+                "（拒绝用复制顺序里最后的动作冒充站姿）",
+                available=available,
+            )
+            return
+        (motion_root / ".selection.json").write_text(
+            json.dumps({"activeID": stand_id}), encoding="utf-8")
+        selection = motion_root / ".selection.json"
+        try:
+            relative = str(selection.relative_to(self.root))
+        except ValueError:
+            relative = str(selection)
+        self.ledger.info(
+            "测试根动作选中项已显式写成站姿（生产 selection 一个字节未动）",
+            activeID=stand_id,
+            relative=relative,
+            available=available,
+        )
 
     # -- steps ---------------------------------------------------------------
 
@@ -884,6 +1007,13 @@ class RealAppE2E:
                 f"复制进测试根的 PMX 人物真的被选中（avatarID={status.get('avatarID')}）",
                 avatarID=status.get("avatarID"), avatarFormat=status.get("avatarFormat"),
             )
+
+        if self.args.motion_source:
+            # **显式站姿 / 坐姿分开两段**：测试根已经在 inject_packages 里显式选了 idle，
+            # 这里先核对站姿贴地，再把持久动作显式切到凳上坐姿、按坐姿语义判支撑/对齐/穿模
+            # （允许脚离地），最后切回站姿。坐姿活动判据在活动/重启段再走一遍。
+            self.verify_pose_stand(status)
+            self.verify_pose_sit(status)
 
         self.ledger.section("metal_frames")
         frames = self.host.command("capture_frames", {"count": 6, "intervalMs": 150},
@@ -1234,120 +1364,290 @@ class RealAppE2E:
             bool(render) and int(render.get("fragments") or 0) > 0,
             "重启后电视画面重新有像素通过深度测试（fragments>0）", screenVideo=render)
 
-    def wait_restart_foot_settled(self, label: str, timeout: float) -> dict:
-        """等**世界坐标**脚面读数在真实渲染帧上收敛到静止脚面附近。
+    def wait_standing_settled(self, label: str, timeout: float) -> dict:
+        """等**显式站姿**在世界坐标上收敛：clip 是站姿动作，且脚面落在静止脚面附近。
 
-        `minimumContactY` 是模型空间读数，重启瞬间可能还没同步到最新一帧；直接拿一次
-        读数判"浮地"会把过渡帧当缺陷。这里按真实 `renderedAvatarFrameCount` 等脚面
-        （`lowestSoleWorldY`）与角色自己的静止脚面（`restFootPlaneWorldY`）收敛，超时返回
-        最后一次读数，由断言如实判红。
+        与旧 `wait_restart_foot_settled` 的区别：旧版不判 clip，坐姿也能在"脚面=静止脚面"
+        的过渡帧上瞬间命中，随后拿后面的坐姿帧判浮地 —— 那正是被用户纠正的错误前提。
+        这里先要求 clip 就是 `--stand-motion-id`，并在**至少两个不同的真实渲染帧**上看到
+        脚面贴地才返回；clip 读不到 / 不是站姿时不假装收敛，超时返回最后读数，由调用方
+        具名 blocked。
         """
         assert self.host is not None
         deadline = time.monotonic() + timeout
         last: dict = {}
         started = time.monotonic()
+        rendered_frames: set[int] = set()
         while time.monotonic() < deadline:
             response = self.host.command("status")
             status = response.get("result", {}) if response.get("ok") else {}
             last = status
+            clip = extract_motion_clip(status)
             grounding = status.get("avatarGrounding")
-            if isinstance(grounding, dict):
+            if clip == self.stand_motion_id and isinstance(grounding, dict):
                 sole = extract_number(grounding, "lowestSoleWorldY")
                 plane = extract_number(grounding, "restFootPlaneWorldY")
                 frames = grounding.get("renderedAvatarFrameCount")
-                if (sole is not None and plane is not None
-                        and abs(sole - plane) <= RESTART_FLOAT_TOLERANCE_M
-                        and isinstance(frames, int)):
-                    settled = dict(status)
-                    settled["footSettleSeconds"] = time.monotonic() - started
-                    return settled
+                if sole is not None and plane is not None and isinstance(frames, int):
+                    rendered_frames.add(frames)
+                    if (abs(sole - plane) <= RESTART_FLOAT_TOLERANCE_M
+                            and len(rendered_frames) >= 2):
+                        settled = dict(status)
+                        settled["footSettleSeconds"] = time.monotonic() - started
+                        return settled
             time.sleep(0.25)
         last = dict(last)
         last["footSettleSeconds"] = time.monotonic() - started
         return last
 
-    def verify_restart_foot_pose(self, status: dict) -> dict | None:
-        """重启后**足部/姿态**的世界坐标诊断 + 真实 GPU 抓帧。
-
-        旧判据 `min+offset >= rest` 是单边的：脚面高出静止参考再多也通过，抓不到"浮地"。
-        这里读渲染器新暴露的世界坐标读数（左右脚 + 全身最低点 + 角色静止脚面），
-        静止站姿要求脚面**贴地**（双边容差），并抓 6 帧真实 GPU 回读另存到
-        `evidence/restart-frames/` 供主代理视觉核验。不删任何既有 assert。
-        """
-        assert self.host is not None
-        status = self.wait_restart_foot_settled("重启后", timeout=min(self.args.timeout, 30)) or status
-        grounding = status.get("avatarGrounding") or {}
-        world_fields = {
+    @staticmethod
+    def pose_world_fields(status: dict) -> dict:
+        """世界坐标姿态读数（脚面 / 全身最低点 / 静止脚面 / 骨盆）的原样投影。"""
+        grounding = status.get("avatarGrounding") if isinstance(status, dict) else None
+        grounding = grounding if isinstance(grounding, dict) else {}
+        return {
             "lowestSoleWorldY": extract_number(grounding, "lowestSoleWorldY"),
             "lowestContactWorldY": extract_number(grounding, "lowestContactWorldY"),
             "restFootPlaneWorldY": extract_number(grounding, "restFootPlaneWorldY"),
             "leftSoleWorldY": extract_number(grounding, "leftSoleWorldY"),
             "rightSoleWorldY": extract_number(grounding, "rightSoleWorldY"),
+            "pelvisWorldX": extract_number(grounding, "pelvisWorldX"),
+            "pelvisWorldY": extract_number(grounding, "pelvisWorldY"),
+            "pelvisWorldZ": extract_number(grounding, "pelvisWorldZ"),
         }
-        core_readable = all(
-            world_fields[key] is not None
-            for key in ("lowestSoleWorldY", "lowestContactWorldY", "restFootPlaneWorldY"))
-        sided_readable = (world_fields["leftSoleWorldY"] is not None
-                          and world_fields["rightSoleWorldY"] is not None)
-        if str(status.get("avatarFormat") or "").lower() != "pmx":
-            self.ledger.blocked("当前人物不是 PMX，世界坐标足部诊断不可用（未验证浮地）",
-                                avatarFormat=status.get("avatarFormat"),
-                                worldGrounding=world_fields)
-            return status
-        self.ledger.check(
-            core_readable,
-            "重启后世界坐标足部/接触诊断可读（脚面 + 全身最低点 + 静止脚面）",
-            worldGrounding=world_fields,
-            avatarGrounding=grounding)
-        if not core_readable:
-            return status
-        sole = float(world_fields["lowestSoleWorldY"])
-        contact = float(world_fields["lowestContactWorldY"])
-        plane = float(world_fields["restFootPlaneWorldY"])
+
+    def check_standing_feet(self, status: dict, label: str) -> bool:
+        """**显式站姿**的贴地判据（双边）。
+
+        只在当前 clip 就是 `--stand-motion-id` 时成立：复制包最后选中的 `chair-sit` 不能
+        冒充站姿，`activeActivity` 为空也不能推断站姿。clip 不符 / 诊断缺失时具名 blocked，
+        返回是否通过。
+        """
+        clip = extract_motion_clip(status)
+        if clip != self.stand_motion_id:
+            self.ledger.blocked(
+                f"{label}未装载显式站姿动作，站姿贴地未验证"
+                f"（clip={clip or 'none'}，期望 {self.stand_motion_id}；"
+                "不以 activeActivity 为空假定站姿）",
+                clip=clip, activeActivity=status.get("activeActivity"),
+                standMotionID=self.stand_motion_id)
+            return False
+        avatar_format = str(status.get("avatarFormat") or "").lower()
+        if avatar_format and avatar_format != "pmx":
+            self.ledger.blocked(
+                f"{label}当前人物不是 PMX，世界坐标足部诊断不可用（站姿贴地未验证）",
+                avatarFormat=status.get("avatarFormat"))
+            return False
+        fields = self.pose_world_fields(status)
+        core = ("lowestSoleWorldY", "lowestContactWorldY", "restFootPlaneWorldY")
+        if not all(fields[key] is not None for key in core):
+            self.ledger.check(
+                False,
+                f"{label}世界坐标足部/接触诊断可读（脚面 + 全身最低点 + 静止脚面）",
+                worldGrounding=fields, avatarGrounding=status.get("avatarGrounding"))
+            return False
+        sole = float(fields["lowestSoleWorldY"])
+        contact = float(fields["lowestContactWorldY"])
+        plane = float(fields["restFootPlaneWorldY"])
         sole_clearance = sole - plane
         contact_clearance = contact - plane
-        left_clearance = (float(world_fields["leftSoleWorldY"]) - plane
-                          if sided_readable else None)
-        right_clearance = (float(world_fields["rightSoleWorldY"]) - plane
-                           if sided_readable else None)
-        active = status.get("activeActivity") or ""
+        sided = (fields["leftSoleWorldY"] is not None
+                 and fields["rightSoleWorldY"] is not None)
+        left_clearance = float(fields["leftSoleWorldY"]) - plane if sided else None
+        right_clearance = float(fields["rightSoleWorldY"]) - plane if sided else None
         self.ledger.info(
-            f"重启后世界坐标足部诊断（{status.get('footSettleSeconds', 0):.2f}s 收敛）",
-            soleClearance=sole_clearance, contactClearance=contact_clearance,
+            f"{label}显式站姿世界坐标足部诊断（{status.get('footSettleSeconds', 0):.2f}s 收敛）",
+            clip=clip, soleClearance=sole_clearance, contactClearance=contact_clearance,
             leftClearance=left_clearance, rightClearance=right_clearance,
-            activeActivity=active, worldGrounding=world_fields)
-        if sided_readable:
-            # 双脚都不能穿地（这一条对静止/运动都成立，属强判据）。
+            worldGrounding=fields)
+        if sided:
+            # 双脚都不能穿地（对静止/运动都成立，属强判据）。
             self.ledger.check(
                 min(left_clearance, right_clearance) >= -GROUNDING_TOLERANCE_M,
-                f"重启后双脚都没有穿地（左 {left_clearance:.4f} m / 右 {right_clearance:.4f} m）",
+                f"{label}双脚都没有穿地（左 {left_clearance:.4f} m / 右 {right_clearance:.4f} m）",
                 leftClearance=left_clearance, rightClearance=right_clearance)
         else:
-            self.ledger.info("重启后左右脚分侧诊断不可用（骨骼名未分侧），只按整体脚面判")
-        if not active:
-            # 静止站姿：脚面必须**贴地**，不能悬空（旧单边判据抓不到的那一类）。
+            self.ledger.info(f"{label}左右脚分侧诊断不可用（骨骼名未分侧），只按整体脚面判")
+        # 显式站姿：脚面必须**贴地**，不能悬空（旧单边判据抓不到的那一类）。
+        self.ledger.check(
+            -GROUNDING_TOLERANCE_M <= sole_clearance <= RESTART_FLOAT_TOLERANCE_M,
+            f"{label}脚面贴地（离地 {sole_clearance:.4f} m，"
+            f"容差 -{GROUNDING_TOLERANCE_M}…+{RESTART_FLOAT_TOLERANCE_M}）",
+            clip=clip, soleClearance=sole_clearance, worldGrounding=fields)
+        self.ledger.check(
+            -GROUNDING_TOLERANCE_M <= contact_clearance <= RESTART_FLOAT_TOLERANCE_M,
+            f"{label}全身最低点贴地（离地 {contact_clearance:.4f} m）",
+            clip=clip, contactClearance=contact_clearance, worldGrounding=fields)
+        self.ledger.check(
+            abs(contact - sole) <= RESTART_STANCE_TOLERANCE_M,
+            f"{label}全身接触探针与脚底一致（差 {abs(contact - sole):.4f} m，"
+            f"容差 {RESTART_STANCE_TOLERANCE_M}）",
+            contactWorldY=contact, soleWorldY=sole)
+        return True
+
+    def check_sit_support(self, label: str, status: dict,
+                          frames: list[dict] | None = None) -> bool:
+        """**坐姿**判据：允许脚离地，改判座面支撑 / 骨盆对齐 / 身体穿模。
+
+        前提（由 `motion_is_explicit_sit`）：当前 clip 是显式坐姿动作，或正在跑世界声明的
+        坐姿活动（`chair.sit` / `bunk.rest`）。只读诊断依据（渲染器 `worldSkeletonDiagnostics`
+        + 世界坐标接地）：
+
+          * **身体穿模**：脚面 / 全身最低接触点都不得低于静止脚面（地面参考）；
+          * **座面支撑**：骨盆必须高于脚面（躯干被座面托住、腿垂在下面），且骨盆在采样窗口
+            内高度稳定（不持续下沉 / 弹跳）；
+          * **骨盆对齐**：骨盆水平位置留在坐姿入口（世界根位置）附近，不整个滑离座位。
+
+        世界契约里没有可读的凳子网格，所以这里**不编造座面高度、不做任何位置补偿**；脚离地
+        只作为诊断记录（凳子上双脚本来就可能悬空），绝不是缺陷。
+        """
+        clip = extract_motion_clip(status)
+        active = status.get("activeActivity") or ""
+        if not motion_is_explicit_sit(clip, active, self.sit_motion_id):
+            self.ledger.blocked(
+                f"{label}坐姿前提不成立，坐姿支撑未验证"
+                f"（clip={clip or 'none'}，activeActivity={active or 'none'}，"
+                f"显式坐姿 {self.sit_motion_id} / 坐姿活动 {list(SIT_ACTIVITY_IDS)}）",
+                clip=clip, activeActivity=active, sitMotionID=self.sit_motion_id)
+            return False
+        avatar_format = str(status.get("avatarFormat") or "").lower()
+        if avatar_format and avatar_format != "pmx":
+            self.ledger.blocked(
+                f"{label}当前人物不是 PMX，世界坐标坐姿诊断不可用",
+                avatarFormat=status.get("avatarFormat"))
+            return False
+        fields = self.pose_world_fields(status)
+        needed = ("lowestSoleWorldY", "lowestContactWorldY", "restFootPlaneWorldY",
+                  "pelvisWorldX", "pelvisWorldY", "pelvisWorldZ")
+        if not all(fields[key] is not None for key in needed):
             self.ledger.check(
-                -GROUNDING_TOLERANCE_M <= sole_clearance <= RESTART_FLOAT_TOLERANCE_M,
-                f"重启静止站姿脚面贴地（离地 {sole_clearance:.4f} m，"
-                f"容差 -{GROUNDING_TOLERANCE_M}…+{RESTART_FLOAT_TOLERANCE_M}）",
-                soleClearance=sole_clearance, worldGrounding=world_fields)
-            # 全身最低点也不能悬空。两者与脚底不一致太多时，是"全身接触探针"本身失真，
-            # 会直接让坐/跪的穿地补偿失效 —— 具名判红，绝不略过。
+                False, f"{label}坐姿世界坐标诊断可读（脚面/接触/骨盆）",
+                worldGrounding=fields, avatarGrounding=status.get("avatarGrounding"))
+            return False
+        sole = float(fields["lowestSoleWorldY"])
+        contact = float(fields["lowestContactWorldY"])
+        plane = float(fields["restFootPlaneWorldY"])
+        pelvis_x = float(fields["pelvisWorldX"])
+        pelvis_y = float(fields["pelvisWorldY"])
+        pelvis_z = float(fields["pelvisWorldZ"])
+        sole_clearance = sole - plane
+        contact_clearance = contact - plane
+        self.ledger.info(
+            f"{label}坐姿世界坐标诊断（脚离地在坐姿里允许，只作记录）",
+            clip=clip, activeActivity=active, soleClearance=sole_clearance,
+            contactClearance=contact_clearance, pelvisWorldY=pelvis_y,
+            pelvisWorldX=pelvis_x, pelvisWorldZ=pelvis_z, worldGrounding=fields)
+        # 身体穿模：地面参考是角色自己的静止脚面；坐姿脚可以离地，但绝不能穿地。
+        self.ledger.check(
+            min(sole_clearance, contact_clearance) >= -GROUNDING_TOLERANCE_M,
+            f"{label}坐姿身体/脚都没有穿地（脚面 {sole_clearance:.4f} m / "
+            f"接触 {contact_clearance:.4f} m，容差 -{GROUNDING_TOLERANCE_M}）",
+            clip=clip, soleClearance=sole_clearance, contactClearance=contact_clearance)
+        # 座面支撑：骨盆高于脚面（躯干被座位托住，不是整个人趴/穿进地面）。
+        self.ledger.check(
+            pelvis_y >= sole + SIT_PELVIS_ABOVE_FOOT_M,
+            f"{label}坐姿骨盆高于脚面（骨盆 {pelvis_y:.4f} ≥ 脚面 {sole:.4f} + "
+            f"{SIT_PELVIS_ABOVE_FOOT_M}）",
+            pelvisWorldY=pelvis_y, soleWorldY=sole)
+        # 骨盆对齐：水平位置留在坐姿入口（世界根位置）附近。
+        position = status.get("residentPosition")
+        if is_valid_position(position):
+            offset = math.hypot(
+                pelvis_x - float(position[0]), pelvis_z - float(position[2]))
             self.ledger.check(
-                -GROUNDING_TOLERANCE_M <= contact_clearance <= RESTART_FLOAT_TOLERANCE_M,
-                f"重启静止全身最低点贴地（离地 {contact_clearance:.4f} m）",
-                contactClearance=contact_clearance, worldGrounding=world_fields)
-            self.ledger.check(
-                abs(contact - sole) <= RESTART_STANCE_TOLERANCE_M,
-                f"重启后全身接触探针与脚底一致（差 {abs(contact - sole):.4f} m，"
-                f"容差 {RESTART_STANCE_TOLERANCE_M}）",
-                contactWorldY=contact, soleWorldY=sole)
+                offset <= SIT_PELVIS_ALIGNMENT_TOLERANCE_M,
+                f"{label}坐姿骨盆与坐姿入口水平对齐（偏移 {offset:.4f} m ≤ "
+                f"{SIT_PELVIS_ALIGNMENT_TOLERANCE_M}）",
+                pelvisWorldX=pelvis_x, pelvisWorldZ=pelvis_z,
+                residentPosition=position)
         else:
-            self.ledger.info(f"重启后有活动 {active}，足部离地只作诊断（不按静止贴地判）",
-                             soleClearance=sole_clearance, contactClearance=contact_clearance)
-        # 真实 GPU 重启抓帧：另存到命名目录，供主代理视觉核验"到底站在地上没有"。
+            self.ledger.check(
+                False, f"{label}坐姿入口（residentPosition）可读（三维有限值）",
+                residentPosition=position)
+        # 座面支撑的循环稳定性：逐帧骨盆高度不能持续下沉 / 弹跳。只取**确实是坐姿**的帧，
+        # 避免站姿→坐姿的过渡帧把稳定性判红。
+        if frames:
+            sit_frames = [
+                frame for frame in frames
+                if motion_is_explicit_sit(
+                    extract_motion_clip(frame),
+                    frame.get("activeActivity"),
+                    self.sit_motion_id)
+            ]
+            pelvis_samples = [
+                extract_number(frame.get("avatarGrounding") or {}, "pelvisWorldY")
+                for frame in sit_frames
+            ]
+            pelvis_samples = [value for value in pelvis_samples if value is not None]
+            self.ledger.check(
+                len(pelvis_samples) >= 2,
+                f"{label}坐姿逐帧骨盆诊断可读（{len(pelvis_samples)}/{len(frames)}）",
+                pelvisWorldY=pelvis_samples)
+            if len(pelvis_samples) >= 2:
+                span = max(pelvis_samples) - min(pelvis_samples)
+                self.ledger.check(
+                    span <= SIT_PELVIS_SPAN_TOLERANCE_M,
+                    f"{label}坐姿骨盆在循环内稳定（跨度 {span:.4f} m ≤ "
+                    f"{SIT_PELVIS_SPAN_TOLERANCE_M}）",
+                    pelvisWorldY=pelvis_samples)
+        return True
+
+    def check_frame_no_penetration(self, label: str, frames: list[dict]) -> None:
+        """逐帧世界坐标穿地判据（站姿 / 坐姿都成立，单边）。"""
+        clearances = []
+        for frame in frames:
+            fg = frame.get("avatarGrounding") or {}
+            f_sole = extract_number(fg, "lowestSoleWorldY")
+            f_plane = extract_number(fg, "restFootPlaneWorldY")
+            if f_sole is not None and f_plane is not None:
+                clearances.append(f_sole - f_plane)
+        if not clearances:
+            self.ledger.check(False, f"{label}逐帧脚面诊断可读", frames=frames)
+            return
+        self.ledger.check(
+            min(clearances) >= -GROUNDING_TOLERANCE_M,
+            f"{label}逐帧脚面都不穿地（最低 {min(clearances):.4f} m）",
+            frameSoleClearances=clearances)
+
+    def verify_restart_foot_pose(self, status: dict) -> dict | None:
+        """重启后姿态语义判定：**先判 clip 角色**，再套站姿或坐姿判据 + 真实 GPU 抓帧。
+
+        用户 2026-10-03 更正：`activeActivity` 为空**不等于**站姿（默认动作可能就是坐在
+        凳子上的坐姿）。这里只按渲染器真正装载的 clip 判：
+          * 显式站姿 clip ⇒ 站姿贴地双边判据；
+          * 坐姿 clip / 在跑坐姿活动 ⇒ 坐姿支撑 / 对齐 / 穿模判据（允许脚离地）；
+          * 其它 ⇒ 具名 blocked，绝不默认站姿。
+        并抓 6 帧真实 GPU 回读另存到 `<root>/evidence/restart-frames/` 供人工核验。
+        """
+        assert self.host is not None
+        # 重启后显式回到站姿（生产入口，写测试根 selection）：坐姿/默认选择不得让"重启站姿
+        # 贴地"这条判据空跑，也不许把坐姿当站姿。之后才按真正装载的 clip 判角色。
+        self.activate_motion(self.stand_motion_id, timeout=min(self.args.timeout, 20))
+        status = self.wait_standing_settled(
+            "重启后", timeout=min(self.args.timeout, 30)) or status
+        clip = extract_motion_clip(status)
+        role = motion_role(clip, self.stand_motion_id, self.sit_motion_id)
+        active = status.get("activeActivity") or ""
+        self.ledger.info(
+            "重启后动作角色判定（不以 activeActivity 为空假定站姿）",
+            clip=clip, role=role, activeActivity=active,
+            standMotionID=self.stand_motion_id, sitMotionID=self.sit_motion_id)
         frames = self.capture_grounded_frames(count=6, interval_ms=150)
         self.save_labeled_frames("restart", frames)
+        if clip == self.stand_motion_id:
+            self.check_standing_feet(status, "重启后显式站姿")
+        elif motion_is_explicit_sit(clip, active, self.sit_motion_id):
+            self.check_sit_support("重启后", status, frames)
+            self.ledger.blocked(
+                "重启后装载的是坐姿 clip，显式站姿贴地未验证"
+                "（坐姿允许脚离地，已按坐姿支撑/对齐/穿模判据核验）",
+                clip=clip, activeActivity=active)
+        else:
+            self.ledger.blocked(
+                f"重启后既不是显式站姿 {self.stand_motion_id} 也不是坐姿，"
+                "接地语义无法判定（不以空 activeActivity 假定站姿）",
+                clip=clip, activeActivity=active, role=role)
+        # 真实 GPU 重启抓帧：另存到命名目录，供主代理视觉核验"到底站在地上没有"。
         if not frames:
             self.ledger.check(False, "重启后抓到真实 GPU 帧供视觉核验", frames=frames)
             return status
@@ -1357,20 +1657,78 @@ class RealAppE2E:
         self.ledger.check(len(hashes) >= 2,
                           f"重启抓帧画面确实在变（{len(hashes)} 个摘要）",
                           hashes=sorted(h for h in hashes if h)[:8])
-        # 逐帧世界坐标脚面：抓帧窗口内也不得穿地，并与静止读数一致。
-        frame_clearances = []
-        for frame in frames:
-            fg = frame.get("avatarGrounding") or {}
-            f_sole = extract_number(fg, "lowestSoleWorldY")
-            f_plane = extract_number(fg, "restFootPlaneWorldY")
-            if f_sole is not None and f_plane is not None:
-                frame_clearances.append(f_sole - f_plane)
-        if frame_clearances:
-            self.ledger.check(
-                min(frame_clearances) >= -GROUNDING_TOLERANCE_M,
-                f"重启抓帧逐帧脚面都不穿地（最低 {min(frame_clearances):.4f} m）",
-                frameSoleClearances=frame_clearances)
+        self.check_frame_no_penetration("重启抓帧", frames)
         return status
+
+    def activate_motion(self, motion_id: str, timeout: float) -> bool:
+        """走**生产**动作入口显式选中站姿 / 坐姿动作，并等渲染器真的装载它。
+
+        控制面 `activate_motion` 只在显式测试产物里存在，内部调用生产的
+        `playCharacterMotion(id:)`（用户菜单同一条路径），写的是**测试根** selection。
+        控制面回执不算成功：必须轮询 `status.avatarMotion.clip` 真的等于请求 ID。
+        """
+        assert self.host is not None
+        response = self.host.command(
+            "activate_motion", {"motionID": motion_id}, timeout=self.args.timeout)
+        self.ledger.record("activate_motion", motionID=motion_id, response=response)
+        if response.get("ok") is not True:
+            self.ledger.blocked(
+                f"测试根无法激活动作 {motion_id}（控制面报错）", response=response)
+            return False
+        deadline = time.monotonic() + timeout
+        last_clip = ""
+        while time.monotonic() < deadline:
+            status_response = self.host.command("status")
+            status = status_response.get("result", {}) if status_response.get("ok") else {}
+            last_clip = extract_motion_clip(status)
+            if last_clip == motion_id:
+                return True
+            time.sleep(0.25)
+        self.ledger.blocked(
+            f"激活动作 {motion_id} 后渲染器没有装载该 clip（最后 clip={last_clip or 'none'}）",
+            motionID=motion_id, lastClip=last_clip)
+        return False
+
+    def verify_pose_stand(self, status: dict) -> None:
+        """启动后的**显式站姿**判据（与坐姿分开）。
+
+        先经生产入口显式选 `--stand-motion-id`（不被上一轮遗留选择左右），再核对 App 真的
+        装载了它（复制包最后选中的 chair-sit 不得冒充站姿），最后判脚面贴地。clip 不符时
+        具名 blocked，不猜站姿。
+        """
+        assert self.host is not None
+        self.ledger.section("pose_stand")
+        self.activate_motion(self.stand_motion_id, timeout=min(self.args.timeout, 20))
+        status = self.wait_standing_settled(
+            "启动后", timeout=min(self.args.timeout, 20)) or status
+        self.check_standing_feet(status, "启动后显式站姿")
+
+    def verify_pose_sit(self, status: dict) -> None:
+        """启动后的**显式坐姿**判据（与站姿分开）。
+
+        经生产入口把持久动作显式选成 `--sit-motion-id`（凳上坐姿），**允许脚离地**，判座面
+        支撑 / 骨盆对齐 / 身体穿模。这就是用户指出的默认坐姿场景的直接覆盖（无活动时也可能
+        显示坐姿，不能当站姿）。跑完切回显式站姿，后续段与基线不被坐姿状态带偏。
+        """
+        assert self.host is not None
+        self.ledger.section("pose_sit")
+        activated = self.activate_motion(
+            self.sit_motion_id, timeout=min(self.args.timeout, 20))
+        status = self.wait_status(
+            lambda sample: extract_motion_clip(sample) == self.sit_motion_id,
+            timeout=min(self.args.timeout, 20)) or status
+        # 让站姿→坐姿的混合先走完，再抓"稳定坐姿"的帧供稳定性判据与人工核验。
+        time.sleep(0.4)
+        frames = self.capture_grounded_frames(count=6, interval_ms=150)
+        self.save_labeled_frames("pose-sit", frames)
+        if activated:
+            self.check_sit_support("启动后显式坐姿", status, frames)
+        else:
+            self.ledger.blocked(
+                "显式坐姿未激活，坐姿支撑/对齐/穿模未验证",
+                sitMotionID=self.sit_motion_id)
+        # 回到显式站姿：重启站姿判据与后续抓帧不被坐姿状态带偏。
+        self.activate_motion(self.stand_motion_id, timeout=min(self.args.timeout, 20))
 
     def save_labeled_frames(self, label: str, frames: list[dict]) -> None:
         """把抓帧 PNG 另存到 `<root>/evidence/<label>-frames/`，文件名加标签防覆盖。
@@ -1792,6 +2150,25 @@ class RealAppE2E:
             )
         else:
             self.ledger.info(f"{label}采样窗口内位移跨度 {span:.4f} m")
+        if category == "sit":
+            # 坐姿**不按站姿脚贴地**判：坐姿脚本来就可能离地。这里显式判座面支撑 / 骨盆
+            # 对齐 / 身体穿模。取一帧真的在跑该活动的样本作为 status 投影（帧里带接地 +
+            # 骨盆诊断），逐帧稳定性直接用整段 frames。
+            sample = next(
+                (frame for frame in frames
+                 if frame.get("activeActivity") == activity_id),
+                frames[0],
+            )
+            self.check_sit_support(
+                label,
+                {
+                    "avatarGrounding": sample.get("avatarGrounding"),
+                    "avatarMotion": sample.get("avatarMotion"),
+                    "residentPosition": sample.get("residentPosition"),
+                    "activeActivity": sample.get("activeActivity"),
+                },
+                frames,
+            )
 
     def scene_clock_segments(
         self, samples: list[tuple[dict, dict]]
@@ -2507,6 +2884,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="只读的人物包来源（单个包或包目录）；**复制**进测试根，绝不 symlink")
     parser.add_argument("--motion-source", action="append", default=None,
                         help="只读的动作包来源（单个包或包目录）；**复制**进测试根，绝不 symlink")
+    parser.add_argument("--stand-motion-id", default=STAND_MOTION_ID,
+                        help="显式站姿（idle）动作 ID：测试根只选它，站姿接地判据只认它"
+                             f"（默认 {STAND_MOTION_ID}）")
+    parser.add_argument("--sit-motion-id", default=SIT_MOTION_ID,
+                        help="显式坐姿动作 ID：坐姿判据认它或世界坐姿活动（chair.sit/bunk.rest）"
+                             f"（默认 {SIT_MOTION_ID}）")
     parser.add_argument("--asset-image", default=str(DEFAULT_IMAGE),
                         help="只读引用的许愿素材图片")
     parser.add_argument("--prop-name", default="E2E 端到端电视")

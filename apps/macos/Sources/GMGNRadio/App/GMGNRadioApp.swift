@@ -8466,6 +8466,10 @@ final class AppDelegate:
                 guard let self else { return ["error": "host_released"] }
                 return self.e2ePlaybackState()
             },
+            activateMotion: { [weak self] motionID in
+                guard let self else { return ["ok": false, "error": "host_released"] }
+                return self.e2eActivateMotion(motionID: motionID)
+            },
             playDirectMedia: { [weak self] objectID, url in
                 guard let self else { return ["ok": false, "error": "host_released"] }
                 return await self.e2ePlayDirectMedia(objectID: objectID, url: url)
@@ -8835,6 +8839,20 @@ final class AppDelegate:
             "code": outcome.code.rawValue,
             "message": outcome.message,
             "details": outcome.details,
+        ]
+    }
+
+    /// E2E 入口：走**生产**动作播放路径（`playCharacterMotion(id:)`）显式选中站姿 / 坐姿
+    /// 动作。用于把"显式 idle 站姿"与"坐姿"分开验证，避免上一轮按复制顺序选中的
+    /// `chair-sit` 被当成默认站姿判"脚离地 = 浮地"。生产入口本身就写**当前数据根**的
+    /// `.selection.json`（测试根），不碰生产用户状态。返回请求与当前装载的 clip；驱动器
+    /// 仍要轮询 `status.avatarMotion.clip` 核对真的装载，这里不假装请求即生效。
+    private func e2eActivateMotion(motionID: String) -> [String: Any] {
+        playCharacterMotion(id: motionID)
+        return [
+            "ok": true,
+            "requested": motionID,
+            "clip": avatarRuntime.snapshot.motion?.id ?? "",
         ]
     }
 

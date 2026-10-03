@@ -460,6 +460,207 @@ class MotionTrackTests(unittest.TestCase):
         self.assertGreater(runner.ledger.failed, 0)
 
 
+class PoseSemanticsTests(unittest.TestCase):
+    """2026-10-03 更正：站姿与坐姿必须**按已装载的 clip** 分开判。
+
+    旧的"`activeActivity` 为空 ⇒ 站姿 ⇒ 脚必须贴地"把测试根默认选中的 `chair-sit`
+    判成悬空缺陷。这里钉住：坐姿脚离地是允许的，站姿只认显式 idle clip。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.driver = load_driver()
+
+    def runner(self):
+        return make_runner(self.driver, motion_source=["/tmp/motions"],
+                           stand_motion_id=self.driver.STAND_MOTION_ID,
+                           sit_motion_id=self.driver.SIT_MOTION_ID)
+
+    def status(self, clip: str, activity: str = "", grounding: dict | None = None,
+               position: list | None = None) -> dict:
+        return {
+            "avatarFormat": "pmx",
+            "avatarMotion": {"clip": clip},
+            "activeActivity": activity,
+            "residentPosition": position if position is not None else [0.0, 0.0, 0.0],
+            "avatarGrounding": grounding if grounding is not None else self.grounding(),
+        }
+
+    def grounding(self, **overrides) -> dict:
+        base = {
+            "lowestSoleWorldY": 0.02,
+            "lowestContactWorldY": 0.01,
+            "restFootPlaneWorldY": 0.0,
+            "leftSoleWorldY": 0.02,
+            "rightSoleWorldY": 0.02,
+            "pelvisWorldX": 0.05,
+            "pelvisWorldY": 0.55,
+            "pelvisWorldZ": -0.05,
+        }
+        base.update(overrides)
+        return base
+
+    def test_motion_role_classifies_sit_and_stand(self) -> None:
+        driver = self.driver
+        stand = driver.STAND_MOTION_ID
+        sit = driver.SIT_MOTION_ID
+        self.assertEqual(driver.motion_role(stand, stand, sit), "stand")
+        self.assertEqual(driver.motion_role(sit, stand, sit), "sit")
+        self.assertEqual(
+            driver.motion_role("gmgn.motion.bones.cross-legged-loop-pmx", stand, sit), "sit")
+        self.assertEqual(driver.motion_role("", stand, sit), "unknown")
+        self.assertEqual(driver.motion_role("weird.clip", stand, sit), "unknown")
+
+    def test_explicit_sit_accepts_sit_activity_without_clip(self) -> None:
+        driver = self.driver
+        self.assertTrue(driver.motion_is_explicit_sit(
+            "", "chair.sit", driver.SIT_MOTION_ID))
+        self.assertTrue(driver.motion_is_explicit_sit(
+            driver.SIT_MOTION_ID, "", driver.SIT_MOTION_ID))
+        self.assertFalse(driver.motion_is_explicit_sit(
+            driver.STAND_MOTION_ID, "", driver.SIT_MOTION_ID))
+
+    def test_stand_check_blocks_when_chair_sit_masquerades(self) -> None:
+        # 复制包最后选中 chair-sit、activeActivity 为空 —— 不得当成站姿判贴地。
+        runner = self.runner()
+        runner.check_standing_feet(
+            self.status(self.driver.SIT_MOTION_ID), "启动后显式站姿")
+        self.assertEqual(runner.ledger.failed, 0)
+        self.assertGreater(runner.ledger.blocked_count, 0)
+
+    def test_explicit_stand_passes_with_feet_on_ground(self) -> None:
+        runner = self.runner()
+        runner.check_standing_feet(
+            self.status(self.driver.STAND_MOTION_ID), "启动后显式站姿")
+        self.assertEqual(runner.ledger.failed, 0, runner.ledger.entries)
+        self.assertEqual(runner.ledger.blocked_count, 0)
+
+    def test_explicit_stand_fails_when_feet_float(self) -> None:
+        runner = self.runner()
+        runner.check_standing_feet(
+            self.status(self.driver.STAND_MOTION_ID,
+                        grounding=self.grounding(lowestSoleWorldY=0.30,
+                                                 lowestContactWorldY=0.29)),
+            "启动后显式站姿")
+        self.assertGreater(runner.ledger.failed, 0)
+
+    def test_sit_allows_feet_off_ground_and_checks_support(self) -> None:
+        # 脚离地 0.27 m 是坐姿本来的姿态：必须通过，不能当浮地缺陷。
+        runner = self.runner()
+        ok = runner.check_sit_support(
+            "坐下", self.status(self.driver.SIT_MOTION_ID, activity="chair.sit",
+                                grounding=self.grounding(lowestSoleWorldY=0.27,
+                                                         lowestContactWorldY=0.09)),
+            frames=None)
+        self.assertTrue(ok)
+        self.assertEqual(runner.ledger.failed, 0, runner.ledger.entries)
+
+    def test_sit_fails_when_pelvis_below_feet(self) -> None:
+        runner = self.runner()
+        runner.check_sit_support(
+            "坐下", self.status(self.driver.SIT_MOTION_ID, activity="chair.sit",
+                                grounding=self.grounding(lowestSoleWorldY=0.27,
+                                                         pelvisWorldY=0.10)),
+            frames=None)
+        self.assertGreater(runner.ledger.failed, 0)
+
+    def test_sit_fails_when_body_clips_below_floor(self) -> None:
+        runner = self.runner()
+        runner.check_sit_support(
+            "坐下", self.status(self.driver.SIT_MOTION_ID, activity="chair.sit",
+                                grounding=self.grounding(lowestSoleWorldY=0.27,
+                                                         lowestContactWorldY=-0.08)),
+            frames=None)
+        self.assertGreater(runner.ledger.failed, 0)
+
+    def test_sit_fails_when_pelvis_leaves_seat(self) -> None:
+        runner = self.runner()
+        runner.check_sit_support(
+            "坐下", self.status(self.driver.SIT_MOTION_ID, activity="chair.sit",
+                                grounding=self.grounding(pelvisWorldX=2.0),
+                                position=[0.0, 0.0, 0.0]),
+            frames=None)
+        self.assertGreater(runner.ledger.failed, 0)
+
+    def test_sit_fails_when_pelvis_unstable_across_frames(self) -> None:
+        runner = self.runner()
+        frames = [
+            {
+                "avatarMotion": {"clip": self.driver.SIT_MOTION_ID},
+                "activeActivity": "chair.sit",
+                "avatarGrounding": self.grounding(pelvisWorldY=0.55 + index * 0.2),
+            }
+            for index in range(4)
+        ]
+        runner.check_sit_support(
+            "坐下", self.status(self.driver.SIT_MOTION_ID, activity="chair.sit"),
+            frames=frames)
+        self.assertGreater(runner.ledger.failed, 0)
+
+    def test_activate_motion_waits_until_renderer_loads_clip(self) -> None:
+        runner = self.runner()
+        target = self.driver.STAND_MOTION_ID
+        runner.host = FakeHost(statuses=[
+            {"avatarMotion": {"clip": self.driver.SIT_MOTION_ID}},
+            {"avatarMotion": {"clip": target}},
+        ])
+        self.assertTrue(runner.activate_motion(target, timeout=5))
+        self.assertEqual(runner.ledger.blocked_count, 0)
+
+    def test_activate_motion_blocks_when_clip_never_loads(self) -> None:
+        runner = self.runner()
+        runner.host = FakeHost(statuses=[{"avatarMotion": {"clip": "other.clip"}}])
+        self.assertFalse(
+            runner.activate_motion(self.driver.STAND_MOTION_ID, timeout=0.3))
+        self.assertGreater(runner.ledger.blocked_count, 0)
+
+    def test_copy_prefers_explicit_stand_over_chair_sit(self) -> None:
+        import tempfile
+        temporary = Path(tempfile.mkdtemp(prefix="gmgn-t-", dir="/tmp"))
+        self.addCleanup(shutil.rmtree, temporary, ignore_errors=True)
+        source = temporary / "source"
+        for name in ("gmgn.motion.bones.chair-sit-loop-pmx",
+                     "gmgn.motion.bones.idle-loop-pmx"):
+            package = source / name
+            package.mkdir(parents=True)
+            (package / "manifest.json").write_text("{}", encoding="utf-8")
+        (source / ".selection.json").write_text(
+            json.dumps({"activeID": "gmgn.motion.bones.chair-sit-loop-pmx"}),
+            encoding="utf-8")
+        destination = temporary / "dest"
+        self.driver.copy_package_source(
+            source, destination,
+            preferred_selection="gmgn.motion.bones.idle-loop-pmx")
+        self.assertEqual(
+            json.loads((destination / ".selection.json").read_text())["activeID"],
+            "gmgn.motion.bones.idle-loop-pmx")
+
+    def test_select_explicit_stand_writes_selection(self) -> None:
+        import tempfile
+        temporary = Path(tempfile.mkdtemp(prefix="gmgn-t-", dir="/tmp"))
+        self.addCleanup(shutil.rmtree, temporary, ignore_errors=True)
+        runner = self.runner()
+        motion_root = temporary / "MotionPackages"
+        (motion_root / runner.stand_motion_id).mkdir(parents=True)
+        runner.select_explicit_stand_motion(motion_root)
+        self.assertEqual(
+            json.loads((motion_root / ".selection.json").read_text())["activeID"],
+            runner.stand_motion_id)
+        self.assertEqual(runner.ledger.blocked_count, 0)
+
+    def test_select_explicit_stand_blocks_when_package_missing(self) -> None:
+        import tempfile
+        temporary = Path(tempfile.mkdtemp(prefix="gmgn-t-", dir="/tmp"))
+        self.addCleanup(shutil.rmtree, temporary, ignore_errors=True)
+        runner = self.runner()
+        motion_root = temporary / "MotionPackages"
+        (motion_root / "gmgn.motion.bones.chair-sit-loop-pmx").mkdir(parents=True)
+        runner.select_explicit_stand_motion(motion_root)
+        self.assertGreater(runner.ledger.blocked_count, 0)
+        # 缺站姿包时绝不写别的动作冒充站姿。
+        self.assertFalse((motion_root / ".selection.json").exists())
+
+
 class FakeHost:
     """Scripted stand-in for `AppHost` so polling logic can be tested without an app."""
 

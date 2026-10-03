@@ -29,6 +29,9 @@ final class E2EHostControl {
         var invokeTool: @MainActor (_ name: String, _ arguments: [String: Any]) async throws -> [String: Any]
         var captureFrames: @MainActor (_ count: Int, _ intervalMilliseconds: Int, _ trackGrounding: Bool) async -> [String: Any]
         var playbackState: @MainActor () async -> [String: Any]
+        /// 只在显式测试控制面存在：走**生产**动作播放路径（`playCharacterMotion`）显式选中
+        /// 站姿 / 坐姿动作，让驱动器确定性地分别验证两种姿态；只写测试根 selection，不写生产。
+        var activateMotion: @MainActor (_ motionID: String) async -> [String: Any]
         /// 只在显式测试控制面存在：把一条 file-based 媒体直链交给**生产**原生播放器，
         /// 用于非 HLS 声音采样链对照（不改 `play_screen` 白名单、不碰 HLS 判据）。
         var playDirectMedia: @MainActor (_ objectID: String, _ url: String) async -> [String: Any]
@@ -168,6 +171,11 @@ final class E2EHostControl {
             return await handler.captureFrames(count, interval, trackGrounding)
         case "playback_state":
             return await handler.playbackState()
+        case "activate_motion":
+            guard let motionID = params["motionID"] as? String, !motionID.isEmpty else {
+                throw E2EHostControlError.missingParameter("motionID")
+            }
+            return await handler.activateMotion(motionID)
         case "play_direct_media":
             guard let objectID = params["objectID"] as? String, !objectID.isEmpty else {
                 throw E2EHostControlError.missingParameter("objectID")

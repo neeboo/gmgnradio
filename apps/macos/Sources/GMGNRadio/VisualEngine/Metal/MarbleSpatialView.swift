@@ -655,6 +655,11 @@ final class MarbleSpatialView: MTKView {
         for (key, value) in renderer.worldGroundingDiagnostics {
             diagnostics[key] = value
         }
+        // 世界坐标骨盆 / 骨骼读数：坐姿验收判"骨盆对齐 / 座面支撑 / 穿模"用的就是它。
+        // 脚离地在坐姿里是本来的姿态，不能当浮地缺陷，所以必须有骨盆这一份。
+        for (key, value) in renderer.worldSkeletonDiagnostics {
+            diagnostics[key] = value
+        }
         return diagnostics
     }
 
