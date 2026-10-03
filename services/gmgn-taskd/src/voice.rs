@@ -8,7 +8,7 @@ use gmgn_protocol::failure;
 use gmgn_voice_core::{
     providers::{self, AudioEvent, ElevenLabsConfig, FishAudioConfig},
     tts_stream::{TtsStream, TtsStreamEvent},
-    BailianConfig, BailianVoice,
+    BailianConfig,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -63,13 +63,21 @@ pub struct Connection {
 }
 
 pub fn capabilities() -> Value {
-    json!({"version":1,"providers":[
+    let mut value = json!({"version":1,"providers":[
         {"id":"bailian","ttsStreaming":true,"asrStreaming":true,"voiceCatalog":true},
         {"id":"elevenlabs","ttsStreaming":true,"asrStreaming":true,"voiceCatalog":true},
         {"id":"fish","ttsStreaming":true,"asrStreaming":false,"voiceCatalog":true}],
         "voiceCatalogMaxResults":100,
         "asrRequiresReady":true,
-        "audio":{"encoding":"pcm16le","channels":1,"asrSampleRate":16000,"ttsSampleRate":24000,"maxPacketBytes":PACKET}})
+        "audio":{"encoding":"pcm16le","channels":1,"asrSampleRate":16000,"ttsSampleRate":24000,"maxPacketBytes":PACKET}});
+    for provider in value["providers"].as_array_mut().unwrap() {
+        let id = provider["id"].as_str().unwrap().to_owned();
+        provider["ttsModels"] = gmgn_voice_core::model_catalog::describe(&id, false);
+        provider["asrModels"] = gmgn_voice_core::model_catalog::describe(&id, true);
+        provider["defaultTTSModel"] = json!(gmgn_voice_core::model_catalog::default_model(&id, false));
+        provider["defaultASRModel"] = json!(gmgn_voice_core::model_catalog::default_model(&id, true));
+    }
+    value
 }
 fn validate(start: &Start, asr: bool) -> Result<()> {
     if start.session_id.is_empty()
@@ -90,9 +98,9 @@ fn validate(start: &Start, asr: bool) -> Result<()> {
     }
     if !asr
         && start.provider == "bailian"
-        && !matches!(
-            start.voice_id.as_str(),
-            "" | "Cherry" | "Serena" | "Ethan" | "Chelsie"
+        && !gmgn_voice_core::model_catalog::bailian_voice_supported(
+            start.model.as_deref().unwrap_or(gmgn_voice_core::model_catalog::BAILIAN_TTS),
+            if start.voice_id.is_empty() { "Cherry" } else { &start.voice_id },
         )
     {
         return Err("invalid_voice_input");
@@ -109,18 +117,7 @@ fn validate(start: &Start, asr: bool) -> Result<()> {
         return Err("invalid_voice_input");
     }
     if let Some(model) = start.model.as_deref() {
-        let expected = if asr {
-            match start.provider.as_str() {
-                "bailian" => Some("qwen3-asr-flash-realtime"),
-                "elevenlabs" => Some("scribe_v2_realtime"),
-                _ => None,
-            }
-        } else if start.provider == "bailian" {
-            Some("qwen3-tts-flash-realtime")
-        } else {
-            None
-        };
-        if expected.is_some_and(|expected| model != expected) {
+        if !gmgn_voice_core::model_catalog::supports(&start.provider, asr, model) {
             return Err("invalid_voice_input");
         }
     }
@@ -275,14 +272,10 @@ async fn run_tts(start: Start, writer: Writer) {
     let sid = start.session_id.clone();
     let result = async {
         if start.provider == "bailian" {
-            let voice = match start.voice_id.as_str() {
-                "Serena" => BailianVoice::Serena,
-                "Ethan" => BailianVoice::Ethan,
-                "Chelsie" => BailianVoice::Chelsie,
-                _ => BailianVoice::Cherry,
-            };
-            let config =
-                BailianConfig::new(start.api_key, voice).map_err(|_| "voice_provider_error")?;
+            let model = start.model.as_deref().unwrap_or(gmgn_voice_core::model_catalog::BAILIAN_TTS);
+            let voice = if start.voice_id.is_empty() { "Cherry" } else { &start.voice_id };
+            let config = BailianConfig::with_model_voice(start.api_key, model, voice)
+                .map_err(|_| "voice_provider_error")?;
             let mut stream = TtsStream::connect(config)
                 .await
                 .map_err(|_| "voice_provider_error")?;

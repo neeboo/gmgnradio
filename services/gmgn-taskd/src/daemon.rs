@@ -1269,6 +1269,9 @@ mod tests {
         reader.read_line(&mut line).await.unwrap();
         let result: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(result["result"]["providers"][2]["asrStreaming"], false);
+        assert_eq!(result["result"]["providers"][2]["defaultTTSModel"], "s2.1-pro-free");
+        assert_eq!(result["result"]["providers"][2]["ttsModels"].as_array().unwrap().len(), 3);
+        assert_eq!(result["result"]["providers"][2]["defaultASRModel"], Value::Null);
         for (params, expected) in [
             (json!({"provider":"bailian"}), "catalog"),
             (json!({"provider":"fish","apiKey":""}), "invalid_voice_input"),

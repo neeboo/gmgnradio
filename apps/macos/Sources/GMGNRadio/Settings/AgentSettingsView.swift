@@ -14,6 +14,9 @@ private struct RustSpeechConfigurationFields: View {
     @State private var preview: RustSpeechSynthesizer?
     @State private var previewStatus = AgentSpeechStatusStore()
     @State private var listTask: Task<Void, Never>?
+    @State private var capabilities: RustVoiceCapabilities?
+    @State private var capabilityMessage: String?
+    @State private var capabilityTask: Task<Void, Never>?
     private let preferences = RustSpeechPreferences(defaults: E2ERuntime.defaults)
     // Match the application's voice client root, including isolated E2E homes.
     private let voiceClient = RustVoiceClient(root: E2ERuntime.productSupportDirectory()
@@ -42,6 +45,7 @@ private struct RustSpeechConfigurationFields: View {
                 ?? (selection == .bailian ? defaults.string(forKey: "voice.bailian.apiKey") ?? "" : "")
             voiceID = defaults.string(forKey: prefix + "voiceID") ?? (selection == .bailian ? "Cherry" : "")
             model = defaults.string(forKey: prefix + purpose + ".model") ?? ""
+            if model.isEmpty { model = defaultModelID ?? "" }
             saved = false
             voices = []; voiceMessage = nil
         }
@@ -64,16 +68,41 @@ private struct RustSpeechConfigurationFields: View {
                 Button(previewStatus.isSpeaking ? "停止试听" : "试听声音") {
                     if previewStatus.isSpeaking { preview?.stopSpeaking() }
                     else { playPreview() }
-                }.disabled(voiceID.isEmpty)
+                }.disabled(voiceID.isEmpty || !modelSelectionIsValid)
             }
             if let voiceMessage { Text(voiceMessage).font(.caption).foregroundStyle(.secondary) }
             if let error = previewStatus.lastErrorMessage { Text(error).font(.caption).foregroundStyle(.secondary) }
-            DisclosureGroup("高级：自定义声音 ID") {
-                TextField(provider == .fish ? "Reference ID" : "Voice ID", text: $voiceID)
+            DisclosureGroup("自定义音色 ID") {
+                TextField(provider == .fish ? "自定义 Reference ID" : "自定义 Voice ID", text: $voiceID)
+                Text("填写该服务已有的音色 ID，无需重新上传；账号、模型及服务区域须与创建音色时一致。")
+                    .font(.caption).foregroundStyle(.secondary)
+                if provider == .bailian {
+                    Text("百炼复刻音色需要在模型列表选择对应的 VC Realtime 快照；创建音色时的 target_model 必须匹配。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
         }
-        TextField("模型（留空使用服务默认值）", text: $model)
-            .onChange(of: model) { _, _ in cancelPreviewAndList(); saved = false }
+        Picker("模型", selection: $model) {
+            if model.isEmpty { Text("正在加载模型选项").tag("") }
+            if !model.isEmpty && !supportedModels.contains(where: { $0.id == model }) {
+                Text("旧模型不受支持，请重新选择").tag(model)
+            }
+            ForEach(supportedModels) { option in
+                Text(option.name + (option.id == defaultModelID ? "（默认）" : "")).tag(option.id)
+            }
+        }
+            .disabled(capabilities == nil)
+            .onChange(of: model) { _, _ in
+                // Voice catalogs do not depend on the synthesis model. Keep
+                // that request alive when Rust supplies the initial default.
+                preview?.stopSpeaking(); preview = nil
+                previewStatus.lastErrorMessage = nil; saved = false
+            }
+        if let capabilityMessage { Text(capabilityMessage).font(.caption).foregroundStyle(.secondary) }
+        if capabilities != nil && !modelSelectionIsValid {
+            Text("原配置模型不在当前支持列表中，请选择后保存；不会自动改用其他模型。")
+                .font(.caption).foregroundStyle(.secondary)
+        }
         HStack {
             Button("保存配置") {
                 preferences.save(RustVoiceConfiguration(provider: provider,
@@ -82,12 +111,44 @@ private struct RustSpeechConfigurationFields: View {
                     model: model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : model), for: purpose)
                 saved = true
             }
+            .disabled(!modelSelectionIsValid)
             if saved { Text("已保存").font(.caption).foregroundStyle(.secondary) }
         }
         Text("传输：本机 TCP → Rust → 服务商；录放音留在系统设备层。")
             .font(.caption).foregroundStyle(.secondary)
-            .task { if purpose == "tts" { refreshVoices() } }
-            .onDisappear { cancelPreviewAndList() }
+            .task { loadCapabilities(); if purpose == "tts" { refreshVoices() } }
+            .onDisappear { cancelPreviewAndList(); capabilityTask?.cancel(); capabilityTask = nil }
+    }
+
+    private var providerCapabilities: RustVoiceProviderCapabilities? {
+        capabilities?.providers.first(where: { $0.id == provider.rawValue })
+    }
+    private var supportedModels: [RustVoiceOption] {
+        guard let selected = providerCapabilities else { return [] }
+        return purpose == "tts" ? selected.ttsModels : selected.asrModels
+    }
+    private var defaultModelID: String? {
+        guard let selected = providerCapabilities else { return nil }
+        return purpose == "tts" ? selected.defaultTTSModel : selected.defaultASRModel
+    }
+    private var modelSelectionIsValid: Bool {
+        guard defaultModelID != nil else { return false }
+        return supportedModels.contains(where: { $0.id == model })
+    }
+
+    private func loadCapabilities() {
+        capabilityTask?.cancel()
+        capabilityTask = Task { @MainActor in
+            do {
+                let result = try await voiceClient.capabilities()
+                try Task.checkCancellation()
+                capabilities = result; capabilityMessage = nil
+                if model.isEmpty { model = defaultModelID ?? "" }
+            } catch {
+                guard !Task.isCancelled else { return }
+                capabilityMessage = "模型列表暂时无法加载，请重新打开设置；不会更改已有配置。"
+            }
+        }
     }
 
     private var currentConfiguration: RustVoiceConfiguration {

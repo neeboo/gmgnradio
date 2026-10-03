@@ -4,7 +4,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
-pub const MODEL: &str = "qwen3-asr-flash-realtime";
+pub const MODEL: &str = crate::model_catalog::BAILIAN_ASR;
 pub const ENDPOINT: &str =
     "wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=qwen3-asr-flash-realtime";
 pub const SAMPLE_RATE: u32 = 16_000;

@@ -2,6 +2,7 @@
 pub mod asr;
 pub mod asr_stream;
 pub mod providers;
+pub mod model_catalog;
 pub mod voice_catalog;
 pub mod tts_stream;
 use reqwest::{Client, Response};
@@ -36,6 +37,8 @@ impl BailianVoice {
 pub struct BailianConfig {
     api_key: String,
     pub voice: BailianVoice,
+    realtime_model: String,
+    realtime_voice: Option<String>,
 }
 impl BailianConfig {
     pub fn new(api_key: impl Into<String>, voice: BailianVoice) -> Result<Self, SpeechError> {
@@ -43,7 +46,26 @@ impl BailianConfig {
         if api_key.is_empty() {
             return Err(SpeechError::MissingKey);
         }
-        Ok(Self { api_key, voice })
+        Ok(Self { api_key, voice, realtime_model: model_catalog::BAILIAN_TTS.into(), realtime_voice: None })
+    }
+    /// Consume an existing cloned voice only; creation/upload is outside this core.
+    pub fn with_model_voice(api_key: impl Into<String>, model: &str, voice_id: &str) -> Result<Self, SpeechError> {
+        if !model_catalog::bailian_voice_supported(model, voice_id) {
+            return Err(SpeechError::InvalidResponse);
+        }
+        let voice = match voice_id {
+            "Serena" => BailianVoice::Serena,
+            "Ethan" => BailianVoice::Ethan,
+            "Chelsie" => BailianVoice::Chelsie,
+            _ => BailianVoice::Cherry,
+        };
+        let mut config = Self::new(api_key, voice)?;
+        config.realtime_model = model.to_owned();
+        config.realtime_voice = Some(voice_id.to_owned());
+        Ok(config)
+    }
+    pub(crate) fn realtime_voice(&self) -> &str {
+        self.realtime_voice.as_deref().unwrap_or(self.voice.as_str())
     }
 }
 
@@ -162,6 +184,11 @@ impl BailianTts {
     /// Synthesize a single chunk. Drop this future to cancel its network work.
     /// Returning bytes does not imply playback or delivered-speech completion.
     pub async fn synthesize_chunk(&self, text: &str) -> Result<Vec<u8>, SpeechError> {
+        if self.config.realtime_model != model_catalog::BAILIAN_TTS
+            || self.config.realtime_voice() != self.config.voice.as_str()
+        {
+            return Err(SpeechError::InvalidResponse);
+        }
         if text.trim().is_empty() {
             return Err(SpeechError::EmptyText);
         }

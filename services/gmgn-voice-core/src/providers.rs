@@ -34,7 +34,7 @@ impl ElevenLabsConfig {
         Ok(Self {
             api_key,
             voice_id,
-            model_id: "eleven_flash_v2_5".into(),
+            model_id: crate::model_catalog::ELEVEN_TTS.into(),
         })
     }
 }
@@ -55,7 +55,7 @@ impl FishAudioConfig {
         Ok(Self {
             api_key: key(api_key.into())?,
             reference_id,
-            model: "s2-pro".into(),
+            model: crate::model_catalog::FISH_TTS.into(),
         })
     }
 }
@@ -189,6 +189,9 @@ pub async fn elevenlabs_tts(
     text: &str,
 ) -> Result<HttpAudioStream, SpeechError> {
     validate_text(text)?;
+    if !crate::model_catalog::supports("elevenlabs", false, &config.model_id) {
+        return Err(SpeechError::InvalidResponse);
+    }
     let endpoint = format!(
         "https://api.elevenlabs.io/v1/text-to-speech/{}/stream",
         config.voice_id
@@ -205,6 +208,9 @@ pub async fn fish_audio_tts(
     text: &str,
 ) -> Result<HttpAudioStream, SpeechError> {
     validate_text(text)?;
+    if !crate::model_catalog::supports("fish", false, &config.model) {
+        return Err(SpeechError::InvalidResponse);
+    }
     let request = client()?.post("https://api.fish.audio/v1/tts")
         .bearer_auth(&config.api_key).header("model", &config.model)
         .json(&json!({"text":text,"reference_id":config.reference_id,"format":"pcm","sample_rate":24000,"latency":"low"}));
@@ -394,5 +400,16 @@ mod tests {
         .await;
         assert!(matches!(result, Err(SpeechError::Http(302))));
         server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn tts_models_default_to_catalog_and_reject_unknown_before_network() {
+        let mut fish = FishAudioConfig::new("test-key", "voice").unwrap();
+        assert_eq!(fish.model, crate::model_catalog::FISH_TTS);
+        fish.model = "unknown-paid-fallback".into();
+        assert!(matches!(fish_audio_tts(&fish, "hello").await, Err(SpeechError::InvalidResponse)));
+        let mut eleven = ElevenLabsConfig::new("test-key", "voice").unwrap();
+        assert_eq!(eleven.model_id, crate::model_catalog::ELEVEN_TTS);
+        eleven.model_id = "unknown".into();
+        assert!(matches!(elevenlabs_tts(&eleven, "hello").await, Err(SpeechError::InvalidResponse)));
     }
 }

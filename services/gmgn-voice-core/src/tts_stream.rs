@@ -13,9 +13,7 @@ use tokio_tungstenite::{
 };
 use uuid::Uuid;
 
-pub const MODEL: &str = "qwen3-tts-flash-realtime";
-const ENDPOINT: &str =
-    "wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=qwen3-tts-flash-realtime";
+pub const MODEL: &str = crate::model_catalog::BAILIAN_TTS;
 const MAX_MESSAGE: usize = 262_144;
 const MAX_TEXT: usize = 16_384;
 const QUEUE: usize = 8;
@@ -64,8 +62,12 @@ pub struct TtsStream {
     cancelled: bool,
 }
 impl TtsStream {
+    fn endpoint(config: &BailianConfig) -> String {
+        format!("wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model={}", config.realtime_model)
+    }
     pub async fn connect(config: BailianConfig) -> Result<Self, TtsStreamError> {
-        Self::connect_endpoint(config, ENDPOINT).await
+        let endpoint = Self::endpoint(&config);
+        Self::connect_endpoint(config, &endpoint).await
     }
     async fn connect_endpoint(
         config: BailianConfig,
@@ -89,7 +91,7 @@ impl TtsStream {
         .map_err(|_| TtsStreamError::Timeout)?
         .map_err(|_| TtsStreamError::Transport)?;
         wait_event(&mut socket, "session.created").await?;
-        socket.send(Message::Text(json!({"event_id":Uuid::new_v4().to_string(),"type":"session.update","session":{"voice":config.voice.as_str(),"mode":"server_commit","language_type":"Auto","response_format":"pcm","sample_rate":24000}}).to_string().into())).await.map_err(|_| TtsStreamError::Transport)?;
+        socket.send(Message::Text(json!({"event_id":Uuid::new_v4().to_string(),"type":"session.update","session":{"voice":config.realtime_voice(),"mode":"server_commit","language_type":"Auto","response_format":"pcm","sample_rate":24000}}).to_string().into())).await.map_err(|_| TtsStreamError::Transport)?;
         let updated = wait_event(&mut socket, "session.updated").await?;
         if updated["session"]["response_format"] != "pcm"
             || updated["session"]["sample_rate"] != 24000
@@ -288,6 +290,31 @@ mod tests {
     }
     fn config() -> BailianConfig {
         BailianConfig::new("local-test-key", BailianVoice::Cherry).unwrap()
+    }
+    #[tokio::test]
+    async fn existing_cloned_voice_is_sent_unchanged_over_real_websocket_protocol() {
+        let model = "qwen3-tts-vc-realtime-2026-01-15";
+        let config = BailianConfig::with_model_voice("local-test-key", model, "qwen-custom-fixture").unwrap();
+        assert_eq!(TtsStream::endpoint(&config), format!("wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model={model}"));
+        let (endpoint, listener) = server_start().await;
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            send(&mut socket, json!({"type":"session.created"})).await;
+            let update = receive(&mut socket).await;
+            assert_eq!(update["type"], "session.update");
+            assert_eq!(update["session"]["voice"], "qwen-custom-fixture");
+            assert_eq!(update["session"]["mode"], "server_commit");
+            assert_eq!(update["session"]["response_format"], "pcm");
+            assert_eq!(update["session"]["sample_rate"], 24000);
+            send(&mut socket, json!({"type":"session.updated","session":{"response_format":"pcm","sample_rate":24000}})).await;
+            assert_eq!(receive(&mut socket).await["type"], "session.finish");
+            send(&mut socket, json!({"type":"session.finished"})).await;
+        });
+        let mut stream = TtsStream::connect_endpoint(config, &endpoint).await.unwrap();
+        stream.finish_input().await.unwrap();
+        assert_eq!(stream.next_event().await.unwrap().unwrap(), TtsStreamEvent::Finished { generation: stream.generation() });
+        server.await.unwrap();
     }
     #[tokio::test]
     async fn first_pcm_arrives_before_done_and_finish_is_not_audio_done() {

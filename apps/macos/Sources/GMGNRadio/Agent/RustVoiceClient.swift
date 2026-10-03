@@ -9,6 +9,19 @@ struct RustVoiceOption: Decodable, Identifiable, Equatable, Sendable {
     let name: String
 }
 
+struct RustVoiceProviderCapabilities: Decodable, Identifiable, Sendable {
+    let id: String
+    let ttsModels: [RustVoiceOption]
+    let asrModels: [RustVoiceOption]
+    let defaultTTSModel: String
+    let defaultASRModel: String?
+}
+
+struct RustVoiceCapabilities: Decodable, Sendable {
+    let version: Int
+    let providers: [RustVoiceProviderCapabilities]
+}
+
 struct RustVoiceConfiguration: Sendable {
     let provider: RustVoiceProvider
     let apiKey: String
@@ -67,6 +80,12 @@ struct RustVoiceEvent: Decodable, Sendable {
         let session = try await connect()
         defer { session.close() }
         return try await session.listVoices(configuration: configuration)
+    }
+
+    func capabilities() async throws -> RustVoiceCapabilities {
+        let session = try await connect()
+        defer { session.close() }
+        return try await session.capabilities()
     }
 
     func startASR(configuration: RustVoiceConfiguration, readyTimeout: TimeInterval = 10) async throws -> RustVoiceSession {
@@ -239,6 +258,27 @@ struct RustVoiceEvent: Decodable, Sendable {
         guard voices.allSatisfy({ !$0.id.isEmpty && $0.id.utf8.count <= 200 && !$0.name.isEmpty && $0.name.utf8.count <= 512 }),
               Set(voices.map(\.id)).count == voices.count else { throw RustVoiceError.invalidFrame }
         return voices
+    }
+
+    fileprivate func capabilities() async throws -> RustVoiceCapabilities {
+        let id = try await send(method: "voice_capabilities", params: [:])
+        let reply = try await readObject()
+        guard reply["id"] as? String == id else { throw RustVoiceError.invalidFrame }
+        try checkError(reply)
+        guard let result = reply["result"] as? [String: Any] else { throw RustVoiceError.invalidFrame }
+        let decoded = try JSONDecoder().decode(RustVoiceCapabilities.self, from: JSONSerialization.data(withJSONObject: result))
+        guard decoded.version == 1, decoded.providers.count <= 10,
+              Set(decoded.providers.map(\.id)).count == decoded.providers.count else { throw RustVoiceError.invalidFrame }
+        for provider in decoded.providers {
+            guard provider.ttsModels.count <= 30, provider.asrModels.count <= 30,
+                  provider.ttsModels.contains(where: { $0.id == provider.defaultTTSModel }),
+                  provider.defaultASRModel.map({ value in provider.asrModels.contains(where: { $0.id == value }) }) ?? provider.asrModels.isEmpty else { throw RustVoiceError.invalidFrame }
+            for models in [provider.ttsModels, provider.asrModels] {
+                guard Set(models.map(\.id)).count == models.count,
+                      models.allSatisfy({ !$0.id.isEmpty && $0.id.utf8.count <= 128 && !$0.name.isEmpty && $0.name.utf8.count <= 512 }) else { throw RustVoiceError.invalidFrame }
+            }
+        }
+        return decoded
     }
 
     func nextEvent() async throws -> RustVoiceEvent {

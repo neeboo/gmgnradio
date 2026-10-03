@@ -94,7 +94,15 @@ Host-tools两通道已迁私有回环TCP，89项宿主通道/172项Node MCP桥�
 
 用户指出免费模型后更正验收范围：上述402是代码默认付费模型 `s2-pro` 的结果，不能推广到Fish全部模型。[官方TTS接口](https://docs.fish.audio/api-reference/endpoint/openapi-v1/text-to-speech) 明确支持请求头 `model: s2.1-pro-free`。本次通过内存环境 `GMGN_VOICE_FISH_TTS_MODEL=s2.1-pro-free` 覆盖进行真实App复验，未修改产品默认模型。`/private/tmp/gmgn-fish-free-tts-real-20261004/voice-report.json` 为ttsStatus=passed，有声、drain结束及取消后无声全部通过；仅PID5744输出rms=0.020403/peak=0.175827，globalTap=false。整体partial/exit2仅表示ASR仍暂停。免费模型无余额阻断，Fish真实TTS链已通过；之前付费失败证据保留。
 
-## Unity + GPUI讨论范围
+## 模型下拉与已有自定义音色 ID（2026-10-04）
+
+三个 TTS 服务均保留账号声音下拉，并新增可展开的“自定义音色 ID”填写入口：百炼音色 ID、ElevenLabs Voice ID、Fish Reference ID。已有 ID 原样交给 Rust 流式请求，不创建或上传克隆音色。百炼复刻音色须选择与创建时 target_model 一致的 VC Realtime 快照；提供 2026-01-15、2025-11-27 两项。
+
+TTS 以及 ASR 设置的模型改为下拉，候选与默认值由 Rust voice_capabilities 返回；未知旧模型保留并提示，禁止保存/试听，避免静默更换模型。Fish 产品默认已改为 s2.1-pro-free，付费选项单独标明。ASR 只修改共享模型常量及设置元数据，未启动识别或麦克风测试。
+
+验证：最终隔离 App 构建成功（/tmp/gmgn-model-custom-final-build.log）；Swift RPC/安全检查17项、偏好持久化检查11项通过。Rust模型校验、TTS及真实本地WebSocket自定义音色协议检查通过；本地协议证据不等同于云端克隆音色验收。真实界面展开填写 Serena 后声音下拉同步、保存显示“已保存”，模型菜单显示两项 VC 快照。最新构建使用无模型覆盖的 Fish 默认免费模型，/private/tmp/gmgn-model-custom-final-fish-20261004/voice-report.json 的 ttsStatus=passed：Swift→Rust→云端→系统播放有声、结束及取消静音均通过，只采样测试App PID。整体partial仅表示用户暂停ASR。未提供可用百炼克隆 ID，其云端试听仍待验证；不宣称所有服务的自定义克隆音色已云端通过。
+
+## Unity + GPUI讨论范围（保持原决定）
 
 目前只是候选调研，没有授权启动引擎替换。Unity官方Unity as a Library支持列表包含Android/iOS/Windows/UWP，不包含macOS/Linux；因此不能把Unity嵌入GPUI单窗口视为已有统一跨平台方案。独立窗口+Rust服务通信可以先验证业务分工；同窗口GPU共享需要另做平台桥接原型。当前继续保持SceneKit/Metal不变。
 

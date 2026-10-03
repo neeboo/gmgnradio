@@ -21,6 +21,19 @@ guard settingsVoiceRootIsIsolated(settingsSource),
     fatalError("settings isolated voice root wiring or negative controls failed")
 }
 print("PASS: settings isolated-root wiring, stale-error reset and explicit voice selection with five negative controls")
+func modelsUseRustContract(_ source: String) -> Bool {
+    source.contains("Picker(\"模型\", selection: $model)")
+        && source.contains("voiceClient.capabilities()")
+        && source.contains("if model.isEmpty { model = defaultModelID ?? \"\" }")
+        && source.contains(".disabled(!modelSelectionIsValid)")
+        && !source.contains("TextField(\"模型")
+}
+guard modelsUseRustContract(settingsSource),
+      !modelsUseRustContract(settingsSource.replacingOccurrences(of: "voiceClient.capabilities()", with: "localHardcodedModelList()")),
+      !modelsUseRustContract(settingsSource + "\nTextField(\"模型\", text: $model)") else {
+    fatalError("Rust model contract picker wiring or negative controls failed")
+}
+print("PASS: Rust-owned model picker wiring with two negative controls")
 
 // This harness exercises TTS and endpoint validation only. It never starts ASR,
 // recording, an audio device, or the application.
@@ -36,6 +49,9 @@ def serve(c):
   for line in c.makefile('rb'):
    q=json.loads(line)
    assert q.get('auth')==token
+   if q['method']=='voice_capabilities':
+    caps={'version':1,'providers':[{'id':'fish','ttsModels':[{'id':'s2.1-pro-free','name':'S2.1 Pro · 免费'},{'id':'s2-pro','name':'S2 Pro · 付费'}],'asrModels':[],'defaultTTSModel':'s2.1-pro-free','defaultASRModel':None}]}
+    c.sendall((json.dumps({'id':q['id'],'result':caps})+'\n').encode());continue
    if q['method']=='voice_list':
     p=q['params'];key=p['apiKey'];voices=[{'id':'v1','name':'自然女声'},{'id':'v2','name':'清晰男声'}]
     provider=p['provider']
@@ -47,6 +63,10 @@ def serve(c):
     if key=='provider-failure':reply={'id':q['id'],'error':{'code':'voice_provider_error'}}
     c.sendall((json.dumps(reply)+'\n').encode());continue
    assert q['method']=='voice_tts_start'
+   if q['params'].get('text','').startswith('custom-'):
+    assert q['params']['voiceID']=='custom_voice_id'
+    assert q['params']['text']=='custom-'+q['params']['provider']
+    assert q['params']['model'] in ['qwen3-tts-vc-realtime-2026-01-15','eleven_flash_v2_5','s2.1-pro-free']
    sid=q['params']['sessionID']
    for reply in [{'id':q['id'],'result':{'started':True,'sessionID':sid}}, {'voice_event':{'sessionID':sid,'type':'finished'}}]:
     c.sendall((json.dumps(reply)+'\n').encode())
@@ -71,6 +91,12 @@ import Foundation
   let event=try await session.nextEvent()
   check(event.type=="finished","private owner-only endpoint connects")
   session.close()
+  for (provider,model) in [(RustVoiceProvider.bailian,"qwen3-tts-vc-realtime-2026-01-15"),(.elevenlabs,"eleven_flash_v2_5"),(.fish,"s2.1-pro-free")] {
+   let custom=try await valid.startTTS(text:"custom-"+provider.rawValue,configuration:.init(provider:provider,apiKey:"fixture-memory-only",voiceID:"custom_voice_id",model:model))
+   let finished=try await custom.nextEvent()
+   check(finished.type=="finished","custom voice and selected model forwarded unchanged through Swift RPC")
+   custom.close()
+  }
   let listed=try await valid.listVoices(configuration:.init(provider:.elevenlabs,apiKey:"fixture-memory-only"))
   check(listed.map(\.id)==["v1","v2"] && listed[0].name=="自然女声","voice names decoded through authenticated Rust RPC")
   for key in ["duplicate","empty-name","wrong-provider","too-many"] {
@@ -79,8 +105,10 @@ import Foundation
   }
   do {_ = try await valid.listVoices(configuration:.init(provider:.elevenlabs,apiKey:"provider-failure"));fatalError("provider failure accepted")}
   catch RustVoiceError.rejected {check(true,"provider failure surfaced without remote error text")}
+  let capabilities=try await valid.capabilities()
+  check(capabilities.providers[0].defaultTTSModel=="s2.1-pro-free" && capabilities.providers[0].ttsModels.count==2,"models and default read from authenticated Rust metadata RPC without API key")
   let initial=try String(contentsOf:marker,encoding:.utf8)
-  check(initial=="7","TTS and six catalog requests connect independently")
+  check(initial=="11","four TTS and six catalog plus model metadata requests connect independently")
   let link=root.appendingPathComponent("linked.endpoint.json")
   try manager.createSymbolicLink(at:link,withDestinationURL:endpoint)
   let large=root.appendingPathComponent("large.endpoint.json")
