@@ -50,6 +50,18 @@
 
 ## 全屏连续输入复验
 
+### 长帧分段定位与最小修复（接续中）
+
+新增有界诊断：最近12个超过33ms的draw，记录uptime/帧号/各阶段耗时；最近120个Metal drawable呈现间隔，不标为物理显示或输入到光子延迟。诊断类直接提取的21项Swift检查exit0，完整App `/tmp/gmgn-parent-zoom-phases-build.log` exit0。真实HLS解码>=20且GPU fragments>0后，全屏80次CUA往返，300快照 `/tmp/gmgn-parent-zoom-phases-live.log` exit0：输入P95=16.848ms，捕获72.936/73.024ms两帧，其中物件视频阶段71.718/71.913ms；首批初始化还有96.541ms人物/jukebox长帧。Metal滚动呈现间隔P95约33.335ms，不能因显式跳帧0宣称60fps。
+
+再细分生成道具/摆放道具/格子/取视频帧/视频编码，构建 `/tmp/gmgn-parent-zoom-subphases-build.log` exit0；PID78395真实同条件80次滚轮，捕获73.960ms长帧，其中 `videoFrameAcquisition` 72.670ms，即 `registry.frames()` 取视频帧。同步Time Profiler仅目标PID的聚合样本也显示draw中的NativeLinkPlayer.copyFrameTexture/AVPlayerItemVideoOutput.copyPixelBuffer；不是visibility completion主线程等待。raw trace含继承环境信息，禁止提交/分享，仅白名单聚合函数与数字。
+
+最小修复仅把provider改为读取已发布不可变纹理，AVPlayer/CoreVideo取帧由现有30Hz帧泵负责；stop/generation/资源保活/音频不变。帧泵仍MainActor，不能声称所有输入阻塞已解除。修后构建、同条件真实画面及按PID声音开停对照待完成。
+
+修后完整构建 `/tmp/gmgn-parent-video-readonly-build.log` exit0；真实PID78641，原始Twitch页正式起播，实际decoded>=20且GPU fragments>0，3840×2160同80次up/down300，300状态快照及音频开停完成exit0，日志 `/tmp/gmgn-parent-video-readonly-live.log`。80有效/0非法，输入P95=14.485ms/最大17.704ms；取帧阶段不再出现>33ms draw，输入后窗口CPU最大1.537ms。仅保留启动人物/jukebox104.800ms长帧。音频只绑定PID78641/globalTap=false：播放751buffers/384512frames/RMS0.093667/peak0.553750；正式stop后751buffers/384512frames/RMS0/peak0。测试App正常退出，未安装更新已装App。
+
+重要未通过项：修前与修后真实连续滚轮期间，Metal呈现间隔窗口最大分别316.686ms/333.353ms，窗口P95峰值均300.018ms；静止末窗P95约33.335ms。不能只取末窗掩盖滚轮过程停画，也不能由移除draw取帧推断整体体验通过。下一步核查MTKView/RunLoop滚轮期间调度与主线程帧泵，针对呈现停顿实际修复复验；没有物理显示测量，不宣称以上是输入到光子的精确延迟。性能技能要求按实测范围保留此拒收项。
+
 第一段 `/tmp/gmgn-parent-zoom-stress-live.log` 240个快照没有收到滚轮输入，只记全屏静态基线，不能计缩放通过。随后重新启动同隔离根、同构建，PID74741，正式play_screen返回ok；CUA截图确认3840×2160全屏，在实际场景坐标连续60次up/down120，约20.7秒。日志 `/tmp/gmgn-parent-zoom-stress2-live.log`。
 
 60输入/60有效/0非法：事件到主线程处理P50=7.391ms、P95=19.958ms、最大20.260ms。输入后的滚动窗口出现CPU编码最大69.321ms；不能因跳帧计数0判为流畅。该长帧没有同步栈证据，暂不归因于排序、PMX或视频。仍需捕获最终显示节奏与长帧对应调用栈，性能问题保持开放。本轮不重复生成，不替换已装App；正式播放返回ok也不单独作为本轮电视解码/声音新验收证据。

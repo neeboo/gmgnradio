@@ -11,8 +11,8 @@ import simd
 ///    解析回来时 generation 不对就**直接丢弃**（过期结果不可发布，更不许复活已删电视）；
 /// 2. **解析地址只在内存**：`ScreenLinkResolutionValue` 不落盘；落盘的是用户粘的原始链接
 ///    （由 `WorldScreenStore` 走 `WorldScreenContent(kind: .nativeLink)` 写）；
-/// 3. **帧由渲染器拉**：登记一个 provider，渲染器每帧读 `copyFrameTexture()`。
-///    没有渲染器消费时也能按"item 已就绪"报播放中（`read_screen` 不依赖画面）。
+/// 3. **渲染器只读已发布帧**：帧泵产出纹理，登记的 provider 每帧只读
+///    `currentFrameTexture`，不在 draw 中索取视频输出。没有渲染器消费时帧泵仍运行。
 @MainActor
 final class NativeScreenPlaybackCoordinator {
     /// `play_screen` 等"当场能报出来的失败"的窗口。与官方嵌入那一份同一个量级。
@@ -263,12 +263,12 @@ final class NativeScreenPlaybackCoordinator {
             publish(objectID, generation, .failed(.nativeLink(Self.mapScreenLinkFailure(.outputUnreadable("player_init")))))
             return
         }
-        // 帧由渲染器拉；`isReady` 只在真的有帧之后为真（没出画不画黑矩形）。
+        // provider 只读取帧泵已发布的纹理；draw 不参与解码或 blit 提交。
         registry.register(objectID) { [weak player] in
             guard let player else { return nil }
             return WorldScreenNativeVideoRegistry.Frame(
                 objectID: objectID,
-                texture: player.copyFrameTexture(),
+                texture: player.currentFrameTexture,
                 quad: quadProvider() ?? [],
                 isReady: player.decodedFrameCount > 0
             )

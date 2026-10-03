@@ -17,13 +17,36 @@ private final class MarbleRenderPerformanceWindow: @unchecked Sendable {
     private var gpu: [Double] = []
     private var attempts: [Bool] = []
     private var sorts: [(at: Double, milliseconds: Double)] = []
+    private var longFrames: [[String: Any]] = []
+    private var presentationIntervals: [Double] = []
+    private var lastPresentedTime: Double?
 
-    func recordCPU(_ milliseconds: Double, skipped: Bool) {
+    func recordCPU(_ milliseconds: Double, skipped: Bool, at: Double,
+                   frame: UInt64, stages: [(String, Double)]) {
         lock.lock(); defer { lock.unlock() }
         if !skipped { cpu.append(milliseconds) }
         attempts.append(skipped)
         if cpu.count > 120 { cpu.removeFirst() }
         if attempts.count > 120 { attempts.removeFirst() }
+        if milliseconds > 33 {
+            longFrames.append(["uptimeSeconds": at, "frameIndex": frame,
+                               "totalMS": milliseconds, "skipped": skipped,
+                               "stagesMS": Dictionary(uniqueKeysWithValues: stages)])
+            if longFrames.count > 12 { longFrames.removeFirst() }
+        }
+    }
+
+    /// Metal's reported presentation time, not physical display/input-to-photon timing.
+    func recordPresentation(_ seconds: Double) {
+        guard seconds.isFinite, seconds > 0 else { return }
+        lock.lock(); defer { lock.unlock() }
+        // Completion callbacks may arrive out of order; do not create negative intervals.
+        if let previous = lastPresentedTime {
+            guard seconds > previous else { return }
+            presentationIntervals.append((seconds - previous) * 1_000)
+            if presentationIntervals.count > 120 { presentationIntervals.removeFirst() }
+        }
+        lastPresentedTime = seconds
     }
 
     func recordGPU(_ milliseconds: Double) {
@@ -56,6 +79,10 @@ private final class MarbleRenderPerformanceWindow: @unchecked Sendable {
                 "cpuEncoding": distribution(cpu), "gpuExecution": distribution(gpu),
                 "sortWindowSeconds": 2, "sortCount": sorts.count,
                 "sortDuration": distribution(sorts.map(\.milliseconds)),
+                "longFrameThresholdMS": 33, "longFrameLimit": 12,
+                "longFrames": longFrames,
+                "presentationTimingScope": "metal-drawable-presented-time-not-physical-display",
+                "drawablePresentationInterval": distribution(presentationIntervals),
                 "splatCount": splatCount]
     }
 }
@@ -2068,11 +2095,24 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
 
     func draw(in view: MTKView) {
         let encodingStartedAt = ProcessInfo.processInfo.systemUptime
+        var stageStartedAt = encodingStartedAt
+        var encodingStages: [(String, Double)] = []
+        encodingStages.reserveCapacity(16)
+        var currentStage = "scenePreparation"
+        func finishStage(_ next: String) {
+            let now = ProcessInfo.processInfo.systemUptime
+            encodingStages.append((currentStage, (now - stageStartedAt) * 1_000))
+            stageStartedAt = now
+            currentStage = next
+        }
         var skippedFrame = true
         defer {
+            let endedAt = ProcessInfo.processInfo.systemUptime
+            encodingStages.append((currentStage, (endedAt - stageStartedAt) * 1_000))
             performanceWindow.recordCPU(
-                (ProcessInfo.processInfo.systemUptime - encodingStartedAt) * 1_000,
-                skipped: skippedFrame
+                (endedAt - encodingStartedAt) * 1_000,
+                skipped: skippedFrame, at: encodingStartedAt,
+                frame: renderedFrameCounter, stages: encodingStages
             )
         }
         renderedFrameCounter &+= 1
@@ -2175,12 +2215,14 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             spatialStage.wishMachineOutput, worldID: spatialStage.selectedWorldID,
             isVisible: spatialStage.isWorldVisible && WishMachineScene.shouldDisplay(worldID: spatialStage.selectedWorldID, drawsWorld: renderProfile.drawsWorld)
         )
+        finishStage("drawableAcquisition")
         guard let drawable = view.currentDrawable,
               let commandBuffer = commandQueue.makeCommandBuffer()
         else {
             return
         }
 
+        finishStage("cameraAndFramePreparation")
         let now = clock.now
         let duration = previousFrameAt.duration(to: now).components
         previousFrameAt = now
@@ -2220,6 +2262,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             spatialStage.finishWorldPresentation()
         }
 
+        finishStage("worldEncoding")
         if renderProfile.drawsWorld {
             if drawsLivingPodRoom {
                 guard drawLivingPodRoom(
@@ -2259,6 +2302,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                     commandBuffer.commit()
                     return
                 }
+                finishStage("jukeboxEncoding")
                 drawMarbleJukebox(
                     in: view,
                     drawable: drawable,
@@ -2273,6 +2317,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             )
         }
 
+        finishStage("occluderEncoding")
         let projection = projectionMatrix(for: view)
         let hasPreparedOccluder = drawSceneOccluder(
             in: view,
@@ -2281,6 +2326,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             projection: projection
         )
 
+        finishStage("propsAndVideoPreparation")
         var hasGeneratedOutputDepth = false
         var screenVideoDrew = false
         if renderProfile.drawsWorld, let depthTexture = view.depthStencilTexture {
@@ -2290,12 +2336,14 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             let depthConvention = MarbleSceneDepthConvention.resolve(
                 avatarFormat: avatarRuntime.snapshot.avatar?.format
             )
+            finishStage("generatedOutputEncoding")
             hasGeneratedOutputDepth = wishMachineOutputRenderer?.render(
                 commandBuffer: commandBuffer, colorTexture: drawable.texture, depthTexture: depthTexture,
                 viewProjection: projection * cameraView, cameraPosition: camera.position,
                 reversedDepth: depthConvention == .sceneKitReverse,
                 preservesDepth: hasPreparedOccluder
             ) ?? false
+            finishStage("placedPropsEncoding")
             let hasPlacedProps = residentPropRenderer?.render(
                 commandBuffer: commandBuffer, colorTexture: drawable.texture, depthTexture: depthTexture,
                 viewProjection: projection * cameraView, cameraPosition: camera.position,
@@ -2303,6 +2351,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                 preservesDepth: hasPreparedOccluder || hasGeneratedOutputDepth
             ) ?? false
             hasGeneratedOutputDepth = hasGeneratedOutputDepth || hasPlacedProps
+            finishStage("supportGridEncoding")
 
             // 建造模式的格子。只做深度测试、不写深度，所以它的返回值**不并入**
             // preservesDepth 链：它没有让后面的绘制多一层遮挡。
@@ -2319,8 +2368,10 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             // 电视的原生视频帧**真的画进场景**：与房间遮挡网格 / 已摆放道具共用同一张
             // 深度缓冲。画在道具之后、角色之前 —— 前墙/道具挡住电视，电视挡住身后的角色。
             // 没有登记任何屏幕时这里是空操作（`frames()` 为空 ⇒ 一个 pass 都不加）。
+            finishStage("videoFrameAcquisition")
             if let registry = screenVideoRegistry {
                 let frames = registry.frames()
+                finishStage("videoEncoding")
                 if !frames.isEmpty {
                     if worldScreenVideoRenderer == nil, !didAttemptWorldScreenVideoRenderer {
                         didAttemptWorldScreenVideoRenderer = true
@@ -2343,6 +2394,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             }
         }
 
+        finishStage("avatarEncoding")
         if renderProfile.drawsAvatar {
             drawAvatar(
                 in: view,
@@ -2353,6 +2405,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                 deltaTime: max(delta, 0)
             )
         }
+        finishStage("heldPropAndReadbackEncoding")
         renderResidentHeldProp(
             in: view,
             drawable: drawable,
@@ -2390,6 +2443,10 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             )
         }
 #endif
+        finishStage("presentAndCommit")
+        drawable.addPresentedHandler { presented in
+            performanceWindow.recordPresentation(presented.presentedTime)
+        }
         commandBuffer.present(drawable)
         skippedFrame = false
         commandBuffer.addCompletedHandler { completed in
@@ -2405,6 +2462,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             }
         }
         commandBuffer.commit()
+        finishStage("postCommit")
 
         if renderProfile == .fullStage,
            spatialStage.isWorldVisible,

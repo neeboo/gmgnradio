@@ -10,6 +10,10 @@
 
 ### 主代理连续验收最新结果
 
+修后真实复验已结束exit0：`/tmp/gmgn-parent-video-readonly-live.log`，PID78641，HLS实际解码及GPU可见像素确认后，全屏80次滚轮/300状态快照。输入P95=14.485ms/最大17.704ms，输入后draw CPU窗口最大1.537ms，不再出现取帧阶段长帧；声音绑定单PID/globalTap=false，播放RMS0.093667，正式stop后RMS0，双方751buffers有数据，App正常退出。当前仍拒收缩放流畅：修前/后滚轮期间Metal呈现间隔最大316.686/333.353ms，P95窗口峰值均300.018ms，末窗33ms不能覆盖过程异常。下一步定位MTKView/RunLoop滚轮期间调度及MainActor帧泵；本轮所有实际源码和证据需提交推送，不部署已装App。完整业务160项保持原范围，不暂停跟进。
+
+本轮实际定位并修复draw取帧路径：有界长帧阶段及Metal drawable呈现间隔诊断已接入，诊断类21项检查exit0。两个诊断构建及最小修复构建均exit0，分别 `/tmp/gmgn-parent-zoom-phases-build.log`、`/tmp/gmgn-parent-zoom-subphases-build.log`、`/tmp/gmgn-parent-video-readonly-build.log`。修前实际HLS解码>=20/GPU fragments>0、3840×2160同80次滚轮：73.957ms帧中videoFrameAcquisition=72.669ms。修复provider仅读已发布不可变纹理，现有30Hz帧泵负责取帧，保持stop/generation/资源保活/音频；帧泵仍MainActor，不宣称彻底后台化。修后真实App同条件80次滚轮目前未见取帧阶段长帧，输入P95=14.485ms（修前17.235ms）；Metal呈现P95仍33.335ms，启动人物初始化104.8ms，不关闭整体卡顿。修后记录 `/tmp/gmgn-parent-video-readonly-live.log`，指定PID音频开停对照正在接续。原业务160通过保留，不重复生成；raw trace含继承环境，禁止提交，仅记录白名单聚合数字。
+
 本轮最终完成exit0：全屏60次120幅度后追加40次300幅度，总100真实输入/100有效/0非法，360状态快照；最终分发P50=6.678ms/P95=18.945ms/最大20.260ms。末窗GPU P95=15.389ms，CPU P95=1.468ms，但历史69.321ms长帧仍为未关闭异常。隔离App正常退出，本轮无测试/构建遗留；证据文档已更新，下一轮应定位异常当帧和显示节奏，而非重复查看运行状态。
 
 全屏连续缩放已实际执行：第一段240快照无输入，仅静态基线；第二段隔离App PID74741、CUA确认3840×2160全屏，60次真实滚轮往返约20.7秒，60有效/0非法，分发P50=7.391ms/P95=19.958ms/最大20.260ms。输入后窗口CPU编码最大69.321ms，跳帧0不代表流畅，不关闭卡顿反馈。日志 `/tmp/gmgn-parent-zoom-stress2-live.log`，5秒补充CPU采样 `/tmp/gmgn-zoom-fullscreen-sample.txt`；长帧尚无同步栈，不直接归因。下一步捕获显示节奏及长帧对应栈，再决定最小修复；禁止反复生成来替代性能验收。完整业务160通过仍保留，已装App未更新。

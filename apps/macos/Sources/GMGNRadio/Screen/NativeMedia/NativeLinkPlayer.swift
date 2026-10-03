@@ -165,13 +165,9 @@ final class NativeLinkPlayer: NativeScreenMediaPlaying {
         if state != .failed(.cancelled) { state = .stopped }
     }
 
-    /// 帧泵：`AVPlayerItemVideoOutput` 只在被显式索取时才产出像素。渲染器每帧也会拉
-    /// （`WorldScreenVideoRenderer` 经注册表调用同一个入口）；**没有渲染器**时（例如
-    /// 命令行 / 控制面只读 `decodedFrames`）这里以 ~30 Hz 自己拉，保证解码真的在跑、
-    /// 统计真的在涨。
-    ///
-    /// 两侧同时拉是安全的：`copyFrameTexture()` 在没有新帧时返回**最近一帧**（不是
-    /// `nil`），所以谁先取到新帧都不会让另一个人画不出画面。
+    /// 帧泵以 ~30 Hz 索取视频输出并提交异步 blit。它仍在 MainActor 上运行；
+    /// 渲染器只读取已发布纹理，不在 draw 中调用 AVPlayer / CoreVideo 取帧。
+    /// 没有渲染器消费时，帧泵也继续产出帧和解码统计。
     private var framePump: Task<Void, Never>?
 
     private func startFramePump() {
@@ -189,12 +185,12 @@ final class NativeLinkPlayer: NativeScreenMediaPlaying {
     /// 有没有出过至少一帧。
     var hasFrame: Bool { destinationTexture != nil && decodedFrameCount > 0 }
 
-    /// 返回**最近一帧**纹理：有新像素就解一帧、blit 进私有纹理再返回它；没有新帧就返回
-    /// 上一张（`nil` = 还没出过画）。
-    ///
-    /// 这个方法是渲染器每帧调用的唯一入口；它不截图、不读网页，只读解码输出。
-    /// 返回"最近一帧"而不是严格"新帧"是刻意的：帧泵（~30 Hz）与渲染器（~60 Hz）会
-    /// 同时拉同一个视频输出，谁先取走新帧都不该让渲染器这一帧空手而归。
+    /// 只读最近完成 blit 的不可变纹理；尚未发布首帧时为 nil。
+    /// 不触发解码、CoreVideo 包装或 GPU 命令提交，供渲染器每帧读取。
+    var currentFrameTexture: MTLTexture? { destinationTexture }
+
+    /// 帧泵和播放器探针的生产入口：有新像素就提交异步 blit，返回上一张已发布纹理。
+    /// 渲染器应使用 `currentFrameTexture`，避免在 draw 路径索取解码输出。
     func copyFrameTexture() -> MTLTexture? {
         guard !copyInFlight else { return destinationTexture }
         guard let player, let output else { return destinationTexture }
