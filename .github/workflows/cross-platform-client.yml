@@ -35,4 +35,3 @@ jobs:
         run: cargo test --locked --manifest-path apps/cross-platform/Cargo.toml
       - name: Headless smoke
         run: cargo run --locked --manifest-path apps/cross-platform/Cargo.toml -- --headless-smoke
-
