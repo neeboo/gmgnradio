@@ -86,6 +86,12 @@ Host-tools两通道已迁私有回环TCP，89项宿主通道/172项Node MCP桥�
 
 最终产物百炼Serena中文复验 `/private/tmp/gmgn-tts-bailian-selector-final-20261004/voice-report.json` 为ttsStatus=passed：有声、正常结束、取消无声三项通过；整体partial/exit2仍仅指ASR暂停。ElevenLabs重启后输出rms=0.061152/peak=0.474559，取消后rms=0/peak=0，globalTap=false且仅PID93007。Fish尚缺Key，保持未验收。
 
+### Fish Key补充后的真实复验
+
+用户随后提供Key并明确要求保存到 `.zshrc`，已设置 `GMGN_VOICE_FISH_API_KEY`，仅本人读写；密钥不进入仓库、报告或日志。使用该配置启动实际隔离测试App，经生产Rust `voice_list` 成功返回100个声音，证据 `/private/tmp/gmgn-fish-catalog-real-20261004/evidence/catalog-report.json`。真实App Swift→Rust Fish TTS尝试未采到声音，报告 `/private/tmp/gmgn-fish-tts-real-20261004/voice-report.json` 保留failed，不能算通过。
+
+诊断确认同一合成接口返回HTTP402，响应同时包含insufficient/balance/credits，安全分类证据 `evidence/provider-status.json` 只记录状态码和布尔判据，不存远端正文或凭据。因此当前阻断为供应商账户余额/额度不足；Key可查询声音目录，但真实TTS有声、结束及取消链路仍待额度恢复后复验。不操作充值，不将目录成功当作播放成功；本轮没有ASR或麦克风请求。
+
 ## Unity + GPUI讨论范围
 
 目前只是候选调研，没有授权启动引擎替换。Unity官方Unity as a Library支持列表包含Android/iOS/Windows/UWP，不包含macOS/Linux；因此不能把Unity嵌入GPUI单窗口视为已有统一跨平台方案。独立窗口+Rust服务通信可以先验证业务分工；同窗口GPU共享需要另做平台桥接原型。当前继续保持SceneKit/Metal不变。
