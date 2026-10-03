@@ -8,6 +8,57 @@ import simd
 import SplatIO
 import VRMMetalKit
 import WorldRuntime
+
+/// Bounded telemetry shared with Metal/sorter completion threads, without actor hops.
+/// CPU encoding duration is separate from presentation cadence.
+private final class MarbleRenderPerformanceWindow: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cpu: [Double] = []
+    private var gpu: [Double] = []
+    private var attempts: [Bool] = []
+    private var sorts: [(at: Double, milliseconds: Double)] = []
+
+    func recordCPU(_ milliseconds: Double, skipped: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        if !skipped { cpu.append(milliseconds) }
+        attempts.append(skipped)
+        if cpu.count > 120 { cpu.removeFirst() }
+        if attempts.count > 120 { attempts.removeFirst() }
+    }
+
+    func recordGPU(_ milliseconds: Double) {
+        guard milliseconds.isFinite, milliseconds > 0 else { return }
+        lock.lock(); defer { lock.unlock() }
+        gpu.append(milliseconds)
+        if gpu.count > 120 { gpu.removeFirst() }
+    }
+
+    func recordSort(_ seconds: Double) {
+        lock.lock(); defer { lock.unlock() }
+        sorts.append((ProcessInfo.processInfo.systemUptime, seconds * 1_000))
+        if sorts.count > 120 { sorts.removeFirst() }
+    }
+
+    func snapshot(splatCount: Int) -> [String: Any] {
+        lock.lock(); defer { lock.unlock() }
+        func distribution(_ values: [Double]) -> [String: Any] {
+            let ordered = values.sorted()
+            guard !ordered.isEmpty else { return ["samples": 0] }
+            return ["samples": ordered.count,
+                    "p50MS": ordered[Int(Double(ordered.count - 1) * 0.50)],
+                    "p95MS": ordered[Int(Double(ordered.count - 1) * 0.95)],
+                    "maxMS": ordered.last!]
+        }
+        let cutoff = ProcessInfo.processInfo.systemUptime - 2
+        sorts.removeAll { $0.at < cutoff }
+        return ["windowFrameLimit": 120, "attemptSamples": attempts.count,
+                "skippedFrames": attempts.filter { $0 }.count,
+                "cpuEncoding": distribution(cpu), "gpuExecution": distribution(gpu),
+                "sortWindowSeconds": 2, "sortCount": sorts.count,
+                "sortDuration": distribution(sorts.map(\.milliseconds)),
+                "splatCount": splatCount]
+    }
+}
 #if DEBUG
 import ImageIO
 #endif
@@ -614,6 +665,11 @@ final class MarbleSpatialView: MTKView {
     /// 非空时表示本视图(arm64 渲染器)可为居民观察提供真实画面帧。
     var residentVisionSurfaceHandle: (any ResidentVisionSurface)? {
         residentVisionSurface
+    }
+
+    /// Short-window CPU/GPU/sort telemetry, not an FPS measurement.
+    var renderPerformanceDiagnostics: [String: Any] {
+        spatialRenderer?.renderPerformanceDiagnostics ?? [:]
     }
 
     /// 角色地面接触诊断（E2E / 日志只读）。没有 PMX 渲染器时返回空字典，
@@ -1660,6 +1716,10 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
     private var renderProfile = LiveCamRenderProfile.fullStage
     private var liveCamOrbit = LiveCamCharacterOrbit()
     private var fullStageFrameSampler = FrameRateSampler()
+    private let performanceWindow = MarbleRenderPerformanceWindow()
+    var renderPerformanceDiagnostics: [String: Any] {
+        performanceWindow.snapshot(splatCount: renderer.splatCount)
+    }
     private var nextFrameCompletions: [MarbleFrameCompletion] = []
     /// 居民视觉帧回读源(渲染器自身 drawable 的请求式导出)。
     var residentVisionSurface: MarbleResidentVisionSurface?
@@ -1750,6 +1810,10 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
             clearColor: view.clearColor
         )
         super.init()
+        let performanceWindow = self.performanceWindow
+        renderer.onSortComplete = { duration in
+            performanceWindow.recordSort(duration)
+        }
     }
 
     func load(url: URL) async throws {
@@ -2003,6 +2067,14 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
+        let encodingStartedAt = ProcessInfo.processInfo.systemUptime
+        var skippedFrame = true
+        defer {
+            performanceWindow.recordCPU(
+                (ProcessInfo.processInfo.systemUptime - encodingStartedAt) * 1_000,
+                skipped: skippedFrame
+            )
+        }
         renderedFrameCounter &+= 1
         if !ResidentPropSurfaceEligibility.isActive(view) { suspendResidentPropRendering() }
         if residentPropRenderer == nil, renderProfile.drawsWorld {
@@ -2130,6 +2202,7 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         // 没有取得许可就不访问该帧的共享缓冲，也不提交 commandBuffer。
         guard inFlightSemaphore.wait(timeout: .now()) == .success else { return }
         let semaphore = inFlightSemaphore
+        let performanceWindow = self.performanceWindow
         commandBuffer.addCompletedHandler { _ in
             semaphore.signal()
         }
@@ -2163,6 +2236,10 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                     return
                 }
                 do {
+                    // Library defaults can block this input-thread draw for 100 ms
+                    // each. A busy access gate or first sort instead drops this
+                    // frame; commit still releases our semaphore, while the
+                    // library owns sorted-buffer retention through completion.
                     let didRender = try renderer.render(
                         viewports: [viewport(for: view)],
                         colorTexture: drawable.texture,
@@ -2170,6 +2247,8 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
                         depthTexture: view.depthStencilTexture,
                         rasterizationRateMap: nil,
                         renderTargetArrayLength: 0,
+                        accessTimeout: 0,
+                        sortTimeout: 0,
                         to: commandBuffer
                     )
                     guard didRender else {
@@ -2312,6 +2391,12 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         }
 #endif
         commandBuffer.present(drawable)
+        skippedFrame = false
+        commandBuffer.addCompletedHandler { completed in
+            performanceWindow.recordGPU(
+                (completed.gpuEndTime - completed.gpuStartTime) * 1_000
+            )
+        }
         let frameCompletions = nextFrameCompletions
         nextFrameCompletions.removeAll(keepingCapacity: true)
         if !frameCompletions.isEmpty {

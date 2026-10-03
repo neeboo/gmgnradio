@@ -10,6 +10,8 @@
 
 ### 主代理连续验收最新结果
 
+短窗性能版真实测量结束：完整构建 `/tmp/gmgn-parent-zoom-metrics-build.log` exit0，实际App同root正式HLS播放/关闭及CUA滚轮，180状态快照 `/tmp/gmgn-parent-zoom-metrics-live.log` exit0。50万splats播放混合缩放段CPU滚动窗口P95中位1.565ms/GPU8.881ms，无跳帧，但CPU最大31.273ms；排序59–60次/2秒。没有输入延迟/显示帧率证据，不关闭卡顿反馈；已装App未更新，用户旧App体验不等于新测试构建。worker zoom_input_latency 正在StageWindowController.swift/SpatialStageStore.swift加有界滚轮事件分发延迟，主代理随后在E2E status暴露cameraInputDiagnostics并构建真实CUA验证。不能重复全新生成来替代该性能门槛；原业务160全通过已保留。
+
 最新真实全新流程已结束：`/tmp/gmgn-parent-full-zoom-final.log` exit0，160pass/0fail/0blocked。新生成任务 `BADB4C80-51A5-402C-8528-217E3226663D` 正式生成/下载/取物活动/领取入库/摆放手持放回/三类人物活动/原始Twitch链接GPU视频与指定PID输出声音开停对照/新通知已读及重启/摆放与屏幕内容恢复/真实chat全部通过，生产Application Support未写。当前版本1dd687d，构建build3成功。原业务全链已验，但用户新增缩放卡顿尚未闭环，不暂停跟进。真实CUA已对隔离App镜头滚轮往返，视角有变化；5秒CPU采样 `/tmp/gmgn-zoom-current-sample.txt` 主线程3209样本中2091事件等待，无持续同步GPU等待，不能据此宣称FPS通过。后台SPZ排序2881样本（Swift排序2598），依赖每render无条件请求全量排序，静止镜头也请求；PMX接地亦有开销。worker zoom_performance_metrics 正在仅调用侧补有界短窗CPU/GPU/跳帧/排序诊断，不改ignored依赖源码。接续先审该修改、E2E status暴露renderPerformanceDiagnostics，再构建真实App，针对同镜头轨迹电视开关测缩放数据；不能把160业务通过等同缩放流畅。
 
 最新接续：缩放同步阻塞修改整合并完成第三轮完整App构建exit0，日志 `/tmp/gmgn-parent-zoom-fix-build3.log`；前两轮跨actor错误已修，未省略失败。全新根 `/tmp/gmgn-e2e-20261003-zoom-final` 当前真实全流程运行，session60618，日志 `/tmp/gmgn-parent-full-zoom-final.log`，包含系统输出声音。下一步立即核对该运行结果，真实App电视播放时用computer use测试镜头缩放并取得输入/帧耗时证据；仅移除同步等待和构建成功不代表卡顿已解。详见 evidence/2026-10-03-camera-zoom-rework.md。DSH旧stale-session分析已停止，主代理租约修复已推送9100b8b。自动化保留ACTIVE，但已将通知设为failed_runs_only减少定时弹出，并强化完成即推进/长期分析主代理接手的指令。

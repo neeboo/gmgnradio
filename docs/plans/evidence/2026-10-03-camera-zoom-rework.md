@@ -25,3 +25,17 @@
 主代理 CUA 对实际隔离 App 在场景位置滚轮up120/down120，截图确认镜头发生变化；没有测得输入延迟或FPS，不计性能通过。实际5秒CPU采样 `/tmp/gmgn-zoom-current-sample.txt`：主线程3209样本中2091事件等待、场景draw246，PMX绘制144/接地53；后台SPZ sortLoop2881样本中Swift排序2598。镜头静止仍重复全量排序来自依赖updateCameraPose每render无条件needsSort，排序请求布尔合并。当前无法从CPU采样判断GPU填充率或FPS。
 
 后续只在调用侧添加有界短窗排序计数/耗时、CPU/GPU帧耗时/跳帧统计，以真实缩放对比验证；不修改可再生依赖checkout作为交付，不降低接地判据或画质掩盖卡顿。
+
+## 短窗真实测量
+
+调用侧已加入120帧有界CPU/GPU窗口、跳帧计数和最近2秒排序耗时，测试status的renderPerformance可读；SplatRenderer的accessTimeout/sortTimeout显式设0，忙时跳帧，不改排序资源保留逻辑。完整构建 `/tmp/gmgn-parent-zoom-metrics-build.log` exit0。
+
+同一真实隔离App（PID71623、50万splats）从正式play_screen起播并实际解码20帧后，采180次status，再通过正式stop_screen关闭电视。CUA在播放中实际滚轮up500两次，截图确认镜头变化。运行 `/tmp/gmgn-parent-zoom-metrics-live.log` exit0。分段如下，P95数值是多个重叠120帧窗口P95的中位数，不能当作全部帧的整体P95或FPS：
+
+| 段 | status快照 | CPU窗口P95中位(ms) | CPU单帧最大(ms) | GPU窗口P95中位(ms) | 窗口最大跳帧数 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 开播初始，sample5–30 | 26 | 1.297 | 10.571 | 8.341 | 0 |
+| 混合缩放播放，sample40–115 | 76 | 1.565 | 31.273 | 8.881 | 0 |
+| 停止电视，sample130–179 | 50 | 3.061 | 27.250 | 8.517 | 0 |
+
+三段排序窗口约59–60次/2秒，静止仍持续排序；当前不能归因“关闭电视更慢”，镜头轨迹与时间条件不一致，窗口亦重叠。没有输入分发延迟和最终显示延迟证据，暂不关闭用户卡顿反馈。worker正在加入只读滚轮事件到主线程处理的有界延迟诊断，下一轮须真实CUA测试；该指标也不等于显示延迟。已装App完全没有替换或重启。

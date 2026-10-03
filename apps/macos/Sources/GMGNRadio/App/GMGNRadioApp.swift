@@ -8521,6 +8521,8 @@ final class AppDelegate:
         // 驱动器据此做"人物不穿地"的端到端断言，而不是只看命令成功。
         snapshot["avatarGrounding"] =
             stageRenderSurfaceController?.surfaceView.avatarGroundingDiagnostics ?? [:]
+        snapshot["renderPerformance"] =
+            stageRenderSurfaceController?.surfaceView.renderPerformanceDiagnostics ?? [:]
         // 角色逐帧结构化动作（真实 clip / 播放器 / 播放时钟 / 骨骼姿态角度）。这是
         // "动作真的在播、姿态真的在变"的唯一证据；绝不拿资源 revision / GPU 帧号冒充。
         snapshot["avatarMotion"] =
