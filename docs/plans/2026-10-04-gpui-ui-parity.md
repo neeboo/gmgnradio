@@ -106,7 +106,7 @@ v12 实际包 `tmp/gpui-product-app-v12/gmgn radio.app` 已通过完整构建，
 
 本次真实失败：底栏所有 SVG 图标空白，⌘, 无响应，左上缺自主关闭卡；通知行的 Kit ListItem 内部容器将子项竖排，时间越出 44 高行。图标资源、设置快捷入口、任务卡已返工；通知行已改显式横排。组件状态测试 19 项退出 0（`/tmp/gmgn-gpui-parity-inbox-test.log`）；这些修复仍待新包实际复验，不把 v12 当作原布局已通过。
 
-当前源代码已实现五页 Kit 设置、真实附件/PTT/通知桥与原舞台布局，以及四分区舞台设置组件。节目轨道和物件组件已编译，其真实原宿主接口仍在接线；原 3D 曲目卡变换、实时能量图标和物件彩色图例仍缺完整对齐。ASR 实际麦克风仍按用户要求暂缓。
+当前源代码已实现五页 Kit 设置、真实附件/PTT/通知桥与原舞台布局，以及四分区舞台设置组件。节目轨道和物件组件已连接真实原宿主接口、实时能量字段和彩色图例，相关实际业务仍待逐项验收；原 3D 曲目卡旋转尚未完整对齐。最新实际失败为 v16 小窗切换崩溃，详见后续记录。ASR 实际麦克风仍按用户要求暂缓。
 
 v13 完整包构建退出 0（`/tmp/gmgn-gpui-product-app-build-v13.log`），运行 `/tmp/gmgn-gpui-parity-v13-runtime.log`。CUA 实际确认底栏 SVG 全部显示、⌘, 打开 Kit 五页设置、右上正确显示回到播放器、左上出现自主关闭与恢复入口；这些 v12 故障已复验修复。未打开自主行动，避免测试自动消耗模型额度。
 
@@ -127,6 +127,12 @@ v13 完整包构建退出 0（`/tmp/gmgn-gpui-product-app-build-v13.log`），�
 完整包 `/Users/ghostcorn/dev/gmgnradio/tmp/gpui-product-app-v15/gmgn radio.app` 构建退出 0，日志 `/tmp/gmgn-gpui-product-app-build-v15.log`，运行 `/tmp/gmgn-gpui-parity-v15-runtime.log`。实际截图舞台 2360×1520、设置 1160×1000（Retina），与原 1180×760、580×500 对齐；音乐三行卡约 181pt 高，原密度此视觉子项复验通过。底栏全屏切换及返回窗口可用。
 
 动作分类末项仍裁切；导入弹窗输入框获得焦点后 Esc 仍不关闭，均继续失败。设置源码已再次修标签独立字号与窗口限定 keystroke 拦截，编译通过，待下一完整包。菜单“显示小窗”点击后仍原舞台，实际切换尚未达成，已交原生窗口代理排查。上述故障与尚未执行的业务操作均不写通过。
+
+### v16 两项修复复验通过，小窗崩溃返工
+
+v16 完整包构建退出 0，日志 `/tmp/gmgn-gpui-product-app-build-v16.log`；实际运行 `/tmp/gmgn-gpui-parity-v16-runtime.log`。设置动作五类文字全部可见；链接弹窗输入框获得焦点后 Esc 实际移除弹窗，日志 `GMGN_GPUI_SETTINGS_LINK_ESCAPE closed=true`，这两项此前失败现通过。
+
+实际菜单“显示小窗”接受导航后崩溃，进程退出 134。日志明确 `cannot update gmgn_gpui_app::GMGNProductUI while it is already being updated`。小窗切换判失败，继续返工生命周期，不以导航 accepted 算完成。当前源代码和既有证据已提交推送 `57c6e32`；该提交不代表完整 UI 验收通过。
 
 ### v9 正式产品入口实际复验
 
