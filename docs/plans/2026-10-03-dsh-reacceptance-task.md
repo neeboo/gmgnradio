@@ -10,6 +10,8 @@
 
 ### 主代理连续验收最新结果
 
+全新根1838真实生成完整脚本运行结束，exit2，114pass/0fail/1blocked（日志 `/tmp/gmgn-parent-fresh-e2e-1838.log`）。真实新生成任务 `1536D3FF-C7DE-4C18-BC04-9529E7E3B2F2`，实际领取入库/摆放/手持放回/人物三类动作/电视真实GPU视频/通知未读转已读及重启已读/真实chat delivered通过。唯一脚本阻断仍是HLS声音采样；不能标整体验收通过。仍需实际App非HLS声音对照与HLS输出证据，并增强重启后物件摆放/屏幕内容恢复readback（已有脚本仅验世界加载/通知/接地，不可夸大）。重启最低接触点3.55m虽未穿地，浮地/姿态视觉尚需核对，不能仅凭单边接地断言关闭视觉验收。
+
 主代理已启动全新隔离根 `/tmp/gmgn-e2e-20261003-1838`，显式COPY只读PMX人物和四个BONES动作包，无existing-wish-id，日志 `/tmp/gmgn-parent-fresh-e2e-1838.log`，session99575。三类真实动作已通过，进入真实生成阶段；后续等待同一次业务链领取/摆放/电视/通知/重启/chat，不将尚在运行计为通过。当前已推送HLS停滞修复与边界文档（baf93f4、e604f4b），DSH实现轮已停止，主代理继续验收。
 
 18:35 主代理当前1833宿主构建 exit0，真实App恢复运行 exit1，102pass/1fail/2blocked（`/tmp/gmgn-parent-reacceptance-1833-real-app.log`）。HLS停滞已实际消除：decoded11→74/time+2.089s，GPUdraw177/quads177/fragments736497；后来实时读回decoded443/rate1/noError。三类动作/摆放/手持放回/重启接地与真实chat delivered通过。声音采样仍unsupported:hls-manifest阻断，不当作通过；旧任务已读导致本轮无新未读通知，翻转与重启已读判据不能空跑。继续DSH真实声音证据返工，并按用户授权提交推送当前修复检查点，最终仍须全新生成完整流程。

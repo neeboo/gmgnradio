@@ -24,6 +24,10 @@
 - 已排队在其结束后继续修领取/入库/重启失败，日志 `/tmp/gmgn-dsh-claim-restart-fixes-20261003.log`。同一生产区域串行写，避免两个 DSH 并发修改。
 - 线程自动跟进 automation id gmgnradio，10分钟间隔；无变化安静，实际失败/进展才通知。主代理不得等待用户催问才复验。
 - 验收未通过；继续当前引擎，不覆盖安装App、不操作用户真实状态或Keychain。
+# 全新根1838真实生成业务验收
+
+`/tmp/gmgn-parent-fresh-e2e-1838.log` exit2，114pass/0fail/1blocked。全新隔离根 `/tmp/gmgn-e2e-20261003-1838`，人物/动作COPY，实际新生成任务1536D3FF-C7DE-4C18-BC04-9529E7E3B2F2；领取入库/摆放手持放回/三类真实骨骼动作/真实GPU电视视频/新通知已读与重启保存/真实chat delivered通过。唯一脚本阻断为HLS声音采样。完整验收未通过：还需声音输出实证、物件屏幕重启readback，以及重启接触点3.55m的视觉浮地核对。
+
 # 18:35 HLS停滞修复后的真实恢复复验
 
 1833当前宿主构建exit0，`/tmp/gmgn-parent-reacceptance-1833-real-app.log` exit1，102pass/1fail/2blocked。HLS视频解码11→74、时钟+2.089s、GPUdraw177/quads177/fragments736497，后续实时443帧/rate1/noError。三类动作姿态/接地、摆放手持放回、重启接地和真实chat delivered通过；HLS声音采样不支持仍阻断，旧通知全已读不能重验新状态翻转。未完成全新生成端到端验收。
