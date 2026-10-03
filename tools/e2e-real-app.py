@@ -59,6 +59,26 @@ UserDefaults 全部隔离到一次性目录里；它不安装、不启动、不�
 一条真实可播的公开链接（实测 Twitch 直播可播）：
     python3 tools/e2e-real-app.py --app ... --video-url https://www.twitch.tv/eslcs
 
+**重启恢复不再只看"世界 loaded"**（`restart_recovery` 段）：
+  * 物件摆放：重启后从 `read_owned_props` 回读 `is_placed` / `position` / `surface_id` /
+    `yaw`，逐项对回重启前的最终摆放事实；
+  * 屏幕内容：重启后 `playback_state` 仍须投影出同一块屏，`contentURL` 仍是用户粘的
+    **原始页面链接**（无签名媒资地址）；
+  * 播放恢复：没有自动续播时**重走生产 `play_screen`**，再验解码帧与 GPU `fragments`
+    真的恢复；
+  * 足部/姿态：渲染器新暴露**世界坐标**读数（左右脚 + 全身最低点 + 角色静止脚面），
+    静止站姿按双边容差判"贴地 / 浮地"（旧的 `min+offset >= rest` 是单边的，抓不到浮地），
+    并把 6 帧真实 GPU 回读另存到 `<root>/evidence/restart-frames/` 供人工视觉核验。
+
+**非 HLS 声音对照**（`audio_reference` 段，`--skip-audio-reference` 可关）：在同一块真实
+屏幕上放一条**公开、file-based、带音轨**的 mp4，做一次真实 PCM 链采样。HLS 的
+`screen_audio` 仍按平台边界 `blocked`（`MTAudioProcessingTap` 不支持清单），**不**改判。
+只读确认对照源（不启动 App、不录系统声音）：
+
+    python3 tools/e2e-real-app.py --check-audio-reference        # 默认 W3C Sintel 预告片
+    python3 tools/e2e-real-app.py --check-audio-reference \
+        --audio-reference-url https://example.com/with-audio.mp4
+
 退出码 0 = 所有**数据链路**断言通过；未通过项在账本里具名。网络/凭据缺失这类
 环境问题会如实标记为 `blocked` 而不是 `pass`。
 
@@ -86,6 +106,8 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -97,6 +119,20 @@ DEFAULT_PROP_CONFIG = (
 )
 DEFAULT_IMAGE = ROOT / "docs/design/gmgn-radio-concept-v1.png"
 DEFAULT_VIDEO_URL = "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+# 非 HLS 声音对照源：**公开、file-based、带音轨**的 mp4。
+#
+# 平台边界：`AVPlayerItem.audioMix`（MTAudioProcessingTap 的挂载点）只支持 file-based
+# 媒体，HLS/直播清单一律 `unsupported:hls-manifest`（Apple 文档 + 本机实测，见
+# `NativeLinkPlayer.install`）。要证明**真实 PCM 采样链**可用，只能用 file-based 源。
+# 下面这条是 W3C 的公开 CC 视频（`video/mp4`、`Accept-Ranges: bytes`、AAC 音轨），
+# 是主代理在真实 App 里做链采样的对照；它**不**把 HLS 那条 blocked 改成通过。
+DEFAULT_AUDIO_REFERENCE_URL = "https://media.w3.org/2010/05/sintel/trailer.mp4"
+# 重启静止站姿的**浮地**容差（米）：脚面高于角色自己的静止脚面超过它就算浮空。
+# 既有 `motion_grounding_ok` 只判"不低于静止参考"（单边，抓不到浮地），这里的双边判据
+# 才是重启后"有没有真的站在地上"的验收。
+RESTART_FLOAT_TOLERANCE_M = 0.05
+# 重启静止站姿的单脚 stance 容差（米）：左右脚各自离静止脚面不能超过它。
+RESTART_STANCE_TOLERANCE_M = 0.25
 
 # 测试根默认落在 `/tmp` 下**短**路径：taskd 用 AF_UNIX，`sockaddr_un.sun_path` 在
 # macOS 上只有 104 字节（含结尾 NUL）。上一轮默认根是仓库内
@@ -348,6 +384,111 @@ def position_span(positions: list[list]) -> float:
     return best
 
 
+def same_position(a, b, tolerance: float = 0.02) -> bool:
+    """两个三维位置是否在容差内一致（重启前后摆放位置回读用）。"""
+    if not (is_valid_position(a) and is_valid_position(b)):
+        return False
+    return all(abs(float(x) - float(y)) <= tolerance for x, y in zip(a, b))
+
+
+def extract_owned_object(response: dict, object_id: str) -> dict | None:
+    """`read_owned_props` 回执里指定物件的投影（原样，含 position / surface_id / is_placed）。"""
+    inner = response.get("result", {}).get("result") if response.get("ok") else None
+    if not isinstance(inner, dict):
+        return None
+    for obj in inner.get("objects", []) or []:
+        if isinstance(obj, dict) and same_id(obj.get("object_id"), object_id):
+            return obj
+    return None
+
+
+def extract_number(mapping: dict, key: str) -> float | None:
+    value = mapping.get(key) if isinstance(mapping, dict) else None
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+# -- 非 HLS 声音对照源：只读可用性确认 ------------------------------------------
+
+def _http_probe(url: str, timeout: float) -> dict:
+    request = urllib.request.Request(
+        url, method="HEAD", headers={"User-Agent": "gmgn-e2e-readonly/1.0"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        headers = {k.lower(): v for k, v in response.headers.items()}
+        return {
+            "status": int(response.status),
+            "contentType": headers.get("content-type", ""),
+            "contentLength": headers.get("content-length", ""),
+            "acceptRanges": headers.get("accept-ranges", ""),
+            "finalURL": response.geturl(),
+        }
+
+
+def _ffprobe_audio_tracks(url: str, timeout: float) -> dict | None:
+    """用本机 ffprobe（若可用）只读确认音轨；失败返回 None，交由调用方具名报缺。"""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries",
+             "stream=index,codec_type,codec_name", "-of", "json", url],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        streams = json.loads(result.stdout or "{}").get("streams", [])
+    except json.JSONDecodeError:
+        return None
+    return {
+        "streams": streams,
+        "audioTracks": [s for s in streams if s.get("codec_type") == "audio"],
+        "videoTracks": [s for s in streams if s.get("codec_type") == "video"],
+    }
+
+
+def probe_audio_reference(url: str, timeout: float = 30) -> dict:
+    """只读确认 `url` 是公开的 **file-based mp4 且有音轨**（不播放、不录系统声音）。
+
+    返回 `{usable, reason, head, probe}`。`usable` 只在"HTTP 可取 + mp4 + 有音轨"时为真；
+    缺 ffprobe / 网络不可达时 `reason` 具名，绝不把"没确认"当"可用"。
+    """
+    report: dict = {"url": url, "usable": False, "reason": "", "head": {}, "probe": None}
+    if not url.lower().split("?")[0].endswith(".mp4"):
+        report["reason"] = "URL 不是 .mp4（file-based 媒体才支持 audioMix/tap）"
+        return report
+    try:
+        head = _http_probe(url, timeout)
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        report["reason"] = f"HTTP HEAD 失败：{error}"
+        return report
+    report["head"] = head
+    if head.get("status") != 200:
+        report["reason"] = f"HTTP 状态 {head.get('status')}（需要 200 公开可取）"
+        return report
+    content_type = str(head.get("contentType") or "").lower()
+    if "mp4" not in content_type and "video/" not in content_type:
+        report["reason"] = f"Content-Type 不是 mp4：{content_type or '(空)'}"
+        return report
+    probe = _ffprobe_audio_tracks(url, timeout)
+    report["probe"] = probe
+    if probe is None:
+        report["reason"] = "缺少可用的 ffprobe，无法只读确认音轨（不当作可用）"
+        return report
+    if not probe.get("videoTracks"):
+        report["reason"] = "没有视频轨"
+        return report
+    if not probe.get("audioTracks"):
+        report["reason"] = "没有音轨（声音对照需要带音轨的 file-based mp4）"
+        return report
+    audio = probe["audioTracks"][0]
+    report["usable"] = True
+    report["reason"] = f"公开 file-based mp4，有音轨 {audio.get('codec_name')}"
+    return report
+
+
 # 活动入口要真的触发非待机活动：类别 → 候选活动 ID（按世界声明择优）。
 ACTIVITY_CANDIDATES: list[tuple[str, str, list[str]]] = [
     ("行走", "walk", ["home.walk", "dining.walk", "kitchen.walk"]),
@@ -520,6 +661,12 @@ class RealAppE2E:
         self._read_keys: list[str] = []
         self._inbox_scope_before: tuple[str | None, str | None] | None = None
         self._current_activity: str | None = None
+        # 重启恢复的三份**重启前**回读：物件摆放位置、屏幕原始 contentURL、播放度量。
+        # 重启后逐项对回，绝不只看"世界 loaded"。
+        self._object_id: str | None = None
+        self._placement_readback: dict | None = None
+        self._screen_readback: dict | None = None
+        self._avatar_is_pmx = False
 
     # -- build ---------------------------------------------------------------
 
@@ -731,6 +878,7 @@ class RealAppE2E:
         if self.args.avatar_source:
             # 驱动器显式复制了 PMX 人物：确认被选中的**不是**内置光球，而是真的 PMX。
             avatar_format = str(status.get("avatarFormat") or "").lower()
+            self._avatar_is_pmx = avatar_format == "pmx"
             self.ledger.check(
                 bool(status.get("avatarID")) and avatar_format == "pmx",
                 f"复制进测试根的 PMX 人物真的被选中（avatarID={status.get('avatarID')}）",
@@ -850,7 +998,15 @@ class RealAppE2E:
                         f"fragments={render.get('fragments')} "
                         f"lastObjectIDs={render.get('lastObjectIDs')}",
                         screenVideo=render)
-                self.check_screen_audio(object_id)
+                # 重启前的屏幕回读：原始 contentURL + 真实播放度量。重启后逐项对回。
+                self._screen_readback = {
+                    "objectID": object_id,
+                    "contentURL": content_url,
+                    "decodedFrames": decoded_after,
+                    "drawPasses": int((render or {}).get("drawPasses") or 0),
+                    "fragments": int((render or {}).get("fragments") or 0),
+                }
+                self.check_screen_audio(object_id, label="电视", section=True)
         else:
             self.ledger.blocked("没有物件可用于电视播放")
 
@@ -938,11 +1094,347 @@ class RealAppE2E:
             "重启后", timeout=min(self.args.timeout, 30)) or status_after
         self.check_avatar_grounding(status_after, "重启后")
 
+        # 重启恢复不能只看"世界 loaded"：物件摆放位置、屏幕原始 contentURL、真实播放
+        # 恢复都要逐项回读对回；足部/姿态要世界坐标诊断 + 真实 GPU 抓帧供人工核验。
+        self.verify_restart_placement_readback()
+        self.verify_restart_screen_readback()
+        status_after = self.verify_restart_foot_pose(status_after) or status_after
+
+        # 非 HLS 声音对照：HLS 那条 `screen_audio` 仍然 blocked（平台 tap 边界，不改判）。
+        # 这段只在主代理显式要真实链采样时跑（默认跑；`--skip-audio-reference` 可关）。
+        if not self.args.skip_audio_reference:
+            if self._object_id:
+                self.verify_audio_reference(self._object_id)
+            else:
+                self.ledger.section("audio_reference")
+                self.ledger.blocked("没有已入库物件，非 HLS 对照无法在真实屏幕上采样")
+
         # 真实聊天回合提交链：放在最后，避免真实模型可能发出的工具调用干扰前面的
         # 世界/电视断言。它验证的是「生产提交门 → 对话服务」这条真实链路，不是
         # 直接 tool_call 生成工具（后者已经用过，只算生成通道）。
         if not self.args.skip_chat_turn:
             self.verify_chat_turn()
+
+    # -- 重启恢复：物件 / 屏幕 / 播放 / 足部姿态 --------------------------------
+
+    def verify_restart_placement_readback(self) -> None:
+        """重启后**物件摆放位置**真的从持久层读回来，并与重启前逐字段一致。
+
+        只断言"世界 loaded"回答不了"摆出去的物件没有复位/消失/被挂到手上"。判据全部读
+        `read_owned_props` 的生产回执（`is_placed` / `position` / `surface_id` / `yaw`），
+        没有回读就具名 blocked，绝不空跑通过。
+        """
+        assert self.host is not None
+        object_id = self._object_id
+        before = self._placement_readback or {}
+        if not object_id or not before:
+            self.ledger.blocked(
+                "重启前没有可用的摆放回读，重启物件摆放恢复未验证",
+                objectID=object_id, before=before)
+            return
+        owned = self.tool_quiet("read_owned_props", {})
+        after = extract_owned_object(owned, object_id)
+        self.ledger.check(
+            after is not None,
+            f"重启后库存仍含该物件（read_owned_props 含 {object_id}）",
+            objectID=object_id, owned=owned)
+        if after is None:
+            return
+        self.ledger.check(after.get("is_placed") is True,
+                          "重启后物件仍处于摆放态（不是只记在库存里）", object=after)
+        self.ledger.check(after.get("is_held") is not True,
+                          "重启后物件没有被误挂到居民手上", object=after)
+        self.ledger.check(
+            same_position(after.get("position"), before.get("position")),
+            f"重启后摆放位置与重启前一致"
+            f"（{before.get('position')} → {after.get('position')}）",
+            before=before.get("position"), after=after.get("position"))
+        if before.get("surface_id"):
+            self.ledger.check(
+                after.get("surface_id") == before.get("surface_id"),
+                f"重启后承托面与重启前一致（{before.get('surface_id')}）",
+                beforeSurface=before.get("surface_id"),
+                afterSurface=after.get("surface_id"))
+        before_yaw = before.get("yaw")
+        after_yaw = after.get("yaw")
+        if isinstance(before_yaw, (int, float)) and isinstance(after_yaw, (int, float)):
+            self.ledger.check(
+                abs(float(after_yaw) - float(before_yaw)) <= 0.02,
+                f"重启后物件朝向与重启前一致（{float(before_yaw):.4f} → {float(after_yaw):.4f} rad）",
+                beforeYaw=before_yaw, afterYaw=after_yaw)
+
+    def wait_restart_screen(self, object_id: str, timeout: float) -> dict | None:
+        """轮询 `playback_state`，等重启后这块屏重新出现在世界投影里（不看是否在播）。"""
+        assert self.host is not None
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            response = self.host.command("playback_state")
+            result = response.get("result", {}) if response.get("ok") else {}
+            for screen in result.get("screens", []):
+                if screen.get("objectID") == object_id:
+                    return screen
+            time.sleep(0.5)
+        return None
+
+    def verify_restart_screen_readback(self) -> None:
+        """重启后**屏幕原始 contentURL** 与真实播放恢复都回读对回。
+
+        `listScreens()` 重启后必须仍投影出这块屏、`contentURL` 仍是用户粘的原始页面链接
+        （没有签名媒资地址）。播放不会凭空续上时，**重走生产 `play_screen`** 再验解码帧
+        与 GPU 片元真的恢复；不把"URL 还记得"当成"画面恢复了"。
+        """
+        assert self.host is not None
+        before = self._screen_readback or {}
+        object_id = self._object_id
+        if not object_id or not before:
+            self.ledger.blocked("重启前没有可用的电视回读，重启屏幕/播放恢复未验证",
+                                objectID=object_id, before=before)
+            return
+        # 屏幕投影随世界恢复出现，晚一两拍是正常的；先等它出现再断言（别把恢复中的空窗
+        # 当成"屏幕丢了"）。
+        screen = self.wait_restart_screen(object_id, timeout=min(self.args.timeout, 30))
+        self.ledger.check(screen is not None,
+                          "重启后电视屏幕仍在世界投影里（不是丢失）", objectID=object_id)
+        if screen is None:
+            return
+        content_url = str(screen.get("contentURL") or "")
+        self.ledger.check(
+            content_url == before.get("contentURL"),
+            "重启后屏幕内容仍是重启前的原始页面链接",
+            before=before.get("contentURL"), after=content_url)
+        signed_markers = ("googlevideo", "expire=", "token=", "signature=", "&sig=")
+        self.ledger.check(
+            bool(content_url) and not any(marker in content_url for marker in signed_markers),
+            "重启后落盘内容仍是原始页面链接（没有签名媒资地址）",
+            contentURL=content_url)
+        native = screen.get("nativeLink") or {}
+        auto_resumed = (screen.get("surface") == "playing"
+                        and int(native.get("decodedFrames") or 0) >= 2)
+        if auto_resumed:
+            self.ledger.info("重启后原生播放已自动恢复", nativeLink=native)
+        else:
+            resumed = self.tool("play_screen",
+                                {"object_id": object_id, "url": before.get("contentURL")})
+            self.ledger.check(resumed.get("ok") is True,
+                              "重启后经生产播放入口重新起播被接受", result=resumed)
+            screen = self.wait_screen_playing(object_id, timeout=self.args.timeout)
+        self.ledger.check(screen is not None,
+                          "重启后电视播放真的恢复（真实解码，不是命令成功）", screen=screen)
+        if screen is None:
+            return
+        native = screen.get("nativeLink") or {}
+        decoded_before = int(before.get("decodedFrames") or 0)
+        decoded_after = int(native.get("decodedFrames") or 0)
+        self.ledger.check(
+            decoded_after >= 2,
+            f"重启后解码帧数可读且已恢复（重启前 {decoded_before} → 重启后 {decoded_after}）",
+            nativeLink=native)
+        render = self.wait_screen_render(timeout=min(self.args.timeout, 30))
+        self.ledger.check(
+            bool(render) and int(render.get("fragments") or 0) > 0,
+            "重启后电视画面重新有像素通过深度测试（fragments>0）", screenVideo=render)
+
+    def wait_restart_foot_settled(self, label: str, timeout: float) -> dict:
+        """等**世界坐标**脚面读数在真实渲染帧上收敛到静止脚面附近。
+
+        `minimumContactY` 是模型空间读数，重启瞬间可能还没同步到最新一帧；直接拿一次
+        读数判"浮地"会把过渡帧当缺陷。这里按真实 `renderedAvatarFrameCount` 等脚面
+        （`lowestSoleWorldY`）与角色自己的静止脚面（`restFootPlaneWorldY`）收敛，超时返回
+        最后一次读数，由断言如实判红。
+        """
+        assert self.host is not None
+        deadline = time.monotonic() + timeout
+        last: dict = {}
+        started = time.monotonic()
+        while time.monotonic() < deadline:
+            response = self.host.command("status")
+            status = response.get("result", {}) if response.get("ok") else {}
+            last = status
+            grounding = status.get("avatarGrounding")
+            if isinstance(grounding, dict):
+                sole = extract_number(grounding, "lowestSoleWorldY")
+                plane = extract_number(grounding, "restFootPlaneWorldY")
+                frames = grounding.get("renderedAvatarFrameCount")
+                if (sole is not None and plane is not None
+                        and abs(sole - plane) <= RESTART_FLOAT_TOLERANCE_M
+                        and isinstance(frames, int)):
+                    settled = dict(status)
+                    settled["footSettleSeconds"] = time.monotonic() - started
+                    return settled
+            time.sleep(0.25)
+        last = dict(last)
+        last["footSettleSeconds"] = time.monotonic() - started
+        return last
+
+    def verify_restart_foot_pose(self, status: dict) -> dict | None:
+        """重启后**足部/姿态**的世界坐标诊断 + 真实 GPU 抓帧。
+
+        旧判据 `min+offset >= rest` 是单边的：脚面高出静止参考再多也通过，抓不到"浮地"。
+        这里读渲染器新暴露的世界坐标读数（左右脚 + 全身最低点 + 角色静止脚面），
+        静止站姿要求脚面**贴地**（双边容差），并抓 6 帧真实 GPU 回读另存到
+        `evidence/restart-frames/` 供主代理视觉核验。不删任何既有 assert。
+        """
+        assert self.host is not None
+        status = self.wait_restart_foot_settled("重启后", timeout=min(self.args.timeout, 30)) or status
+        grounding = status.get("avatarGrounding") or {}
+        world_fields = {
+            "lowestSoleWorldY": extract_number(grounding, "lowestSoleWorldY"),
+            "lowestContactWorldY": extract_number(grounding, "lowestContactWorldY"),
+            "restFootPlaneWorldY": extract_number(grounding, "restFootPlaneWorldY"),
+            "leftSoleWorldY": extract_number(grounding, "leftSoleWorldY"),
+            "rightSoleWorldY": extract_number(grounding, "rightSoleWorldY"),
+        }
+        core_readable = all(
+            world_fields[key] is not None
+            for key in ("lowestSoleWorldY", "lowestContactWorldY", "restFootPlaneWorldY"))
+        sided_readable = (world_fields["leftSoleWorldY"] is not None
+                          and world_fields["rightSoleWorldY"] is not None)
+        if str(status.get("avatarFormat") or "").lower() != "pmx":
+            self.ledger.blocked("当前人物不是 PMX，世界坐标足部诊断不可用（未验证浮地）",
+                                avatarFormat=status.get("avatarFormat"),
+                                worldGrounding=world_fields)
+            return status
+        self.ledger.check(
+            core_readable,
+            "重启后世界坐标足部/接触诊断可读（脚面 + 全身最低点 + 静止脚面）",
+            worldGrounding=world_fields,
+            avatarGrounding=grounding)
+        if not core_readable:
+            return status
+        sole = float(world_fields["lowestSoleWorldY"])
+        contact = float(world_fields["lowestContactWorldY"])
+        plane = float(world_fields["restFootPlaneWorldY"])
+        sole_clearance = sole - plane
+        contact_clearance = contact - plane
+        left_clearance = (float(world_fields["leftSoleWorldY"]) - plane
+                          if sided_readable else None)
+        right_clearance = (float(world_fields["rightSoleWorldY"]) - plane
+                           if sided_readable else None)
+        active = status.get("activeActivity") or ""
+        self.ledger.info(
+            f"重启后世界坐标足部诊断（{status.get('footSettleSeconds', 0):.2f}s 收敛）",
+            soleClearance=sole_clearance, contactClearance=contact_clearance,
+            leftClearance=left_clearance, rightClearance=right_clearance,
+            activeActivity=active, worldGrounding=world_fields)
+        if sided_readable:
+            # 双脚都不能穿地（这一条对静止/运动都成立，属强判据）。
+            self.ledger.check(
+                min(left_clearance, right_clearance) >= -GROUNDING_TOLERANCE_M,
+                f"重启后双脚都没有穿地（左 {left_clearance:.4f} m / 右 {right_clearance:.4f} m）",
+                leftClearance=left_clearance, rightClearance=right_clearance)
+        else:
+            self.ledger.info("重启后左右脚分侧诊断不可用（骨骼名未分侧），只按整体脚面判")
+        if not active:
+            # 静止站姿：脚面必须**贴地**，不能悬空（旧单边判据抓不到的那一类）。
+            self.ledger.check(
+                -GROUNDING_TOLERANCE_M <= sole_clearance <= RESTART_FLOAT_TOLERANCE_M,
+                f"重启静止站姿脚面贴地（离地 {sole_clearance:.4f} m，"
+                f"容差 -{GROUNDING_TOLERANCE_M}…+{RESTART_FLOAT_TOLERANCE_M}）",
+                soleClearance=sole_clearance, worldGrounding=world_fields)
+            # 全身最低点也不能悬空。两者与脚底不一致太多时，是"全身接触探针"本身失真，
+            # 会直接让坐/跪的穿地补偿失效 —— 具名判红，绝不略过。
+            self.ledger.check(
+                -GROUNDING_TOLERANCE_M <= contact_clearance <= RESTART_FLOAT_TOLERANCE_M,
+                f"重启静止全身最低点贴地（离地 {contact_clearance:.4f} m）",
+                contactClearance=contact_clearance, worldGrounding=world_fields)
+            self.ledger.check(
+                abs(contact - sole) <= RESTART_STANCE_TOLERANCE_M,
+                f"重启后全身接触探针与脚底一致（差 {abs(contact - sole):.4f} m，"
+                f"容差 {RESTART_STANCE_TOLERANCE_M}）",
+                contactWorldY=contact, soleWorldY=sole)
+        else:
+            self.ledger.info(f"重启后有活动 {active}，足部离地只作诊断（不按静止贴地判）",
+                             soleClearance=sole_clearance, contactClearance=contact_clearance)
+        # 真实 GPU 重启抓帧：另存到命名目录，供主代理视觉核验"到底站在地上没有"。
+        frames = self.capture_grounded_frames(count=6, interval_ms=150)
+        self.save_labeled_frames("restart", frames)
+        if not frames:
+            self.ledger.check(False, "重启后抓到真实 GPU 帧供视觉核验", frames=frames)
+            return status
+        self.ledger.check(len(frames) >= 4,
+                          f"重启后抓到至少 4 帧真实 GPU 回读（实际 {len(frames)}）", frames=frames)
+        hashes = {f.get("sha256") for f in frames if f.get("sha256")}
+        self.ledger.check(len(hashes) >= 2,
+                          f"重启抓帧画面确实在变（{len(hashes)} 个摘要）",
+                          hashes=sorted(h for h in hashes if h)[:8])
+        # 逐帧世界坐标脚面：抓帧窗口内也不得穿地，并与静止读数一致。
+        frame_clearances = []
+        for frame in frames:
+            fg = frame.get("avatarGrounding") or {}
+            f_sole = extract_number(fg, "lowestSoleWorldY")
+            f_plane = extract_number(fg, "restFootPlaneWorldY")
+            if f_sole is not None and f_plane is not None:
+                frame_clearances.append(f_sole - f_plane)
+        if frame_clearances:
+            self.ledger.check(
+                min(frame_clearances) >= -GROUNDING_TOLERANCE_M,
+                f"重启抓帧逐帧脚面都不穿地（最低 {min(frame_clearances):.4f} m）",
+                frameSoleClearances=frame_clearances)
+        return status
+
+    def save_labeled_frames(self, label: str, frames: list[dict]) -> None:
+        """把抓帧 PNG 另存到 `<root>/evidence/<label>-frames/`，文件名加标签防覆盖。
+
+        同一轮里 `capture_frames` 会复用 `frames/frame-0000.png` 这套文件名；重启抓帧
+        若不另存，会被后面的动作抓帧覆盖，主代理就没法回看"重启那一刻到底什么样"。
+        """
+        if not frames:
+            return
+        target = self.root / "evidence" / f"{label}-frames"
+        target.mkdir(parents=True, exist_ok=True)
+        for frame in frames:
+            source_path = frame.get("path")
+            if not source_path:
+                continue
+            source = Path(str(source_path))
+            if not source.exists():
+                continue
+            destination = target / f"{label}-{int(frame.get('index', 0)):04d}.png"
+            try:
+                shutil.copy2(source, destination)
+                frame["labeledPath"] = str(destination)
+            except OSError:
+                continue
+        self.ledger.info(f"重启抓帧已另存供视觉核验（{label}）",
+                         directory=str(target),
+                         paths=[f.get("labeledPath") for f in frames if f.get("labeledPath")])
+
+    # -- 非 HLS 声音对照 --------------------------------------------------------
+
+    def verify_audio_reference(self, object_id: str) -> None:
+        """在同一块真实屏幕上放**公开 file-based mp4**，做一次真实 PCM 链采样。
+
+        与 HLS 那条分开：HLS 平台不支持 `audioMix`，`screen_audio` 仍 blocked、不改判。
+        这条对照源是 `video/mp4`（`--audio-reference-url`，默认 W3C Sintel 预告片，带 AAC
+        音轨），tap 能真的挂上并采到非静音 PCM；它证明"采样链本身可用"，不伪装成 HLS
+        声音输出通过，也不引入任何系统录音/TCC 授权。
+        """
+        assert self.host is not None
+        self.ledger.section("audio_reference")
+        url = self.args.audio_reference_url
+        self.ledger.info("非 HLS 公开 file-based mp4 音频对照源", url=url)
+        # 生产 `play_screen` 的白名单只放受支持的公开观看页，直链会被具名拒绝；这条对照
+        # 走宿主显式暴露的 `play_direct_media`（只在测试控制面存在），它交给**同一条**
+        # 生产原生播放器 / 同一个 MTAudioProcessingTap。这里不伪装成 `play_screen` 通过。
+        played = self.host.command(
+            "play_direct_media", {"objectID": object_id, "url": url},
+            timeout=self.args.timeout)
+        self.ledger.record("play_direct_media", result=played)
+        self.ledger.check(played.get("ok") is True, "对照源经生产原生播放器入口被接受",
+                          result=played)
+        if played.get("ok") is not True:
+            self.ledger.blocked("对照源没有进入播放，真实链采样未执行", url=url, result=played)
+            return
+        screen = self.wait_screen_playing(object_id, timeout=self.args.timeout)
+        self.ledger.check(screen is not None, "对照源真的在解码播放（不是命令成功）",
+                          screen=screen)
+        if screen is None:
+            self.ledger.blocked("对照源没有解码出帧，真实链采样未执行", url=url)
+            return
+        native = screen.get("nativeLink") or {}
+        self.ledger.check(native.get("isLive") is not True,
+                          "对照源是点播文件而不是 HLS 直播清单", nativeLink=native)
+        self.check_screen_audio(object_id, label="非 HLS 对照", section=False)
 
     def verify_chat_turn(self) -> None:
         """走**生产** `submit_wish` 提交门，验证真实 chat 回合链路。
@@ -1478,16 +1970,20 @@ class RealAppE2E:
             time.sleep(1.0)
         return None
 
-    def check_screen_audio(self, object_id: str) -> None:
-        """电视**声音链**的端到端判据：真实 PCM 采样，不是"命令成功"。
+    def check_screen_audio(self, object_id: str, label: str = "电视",
+                           section: bool = True) -> None:
+        """屏幕**声音链**的端到端判据：真实 PCM 采样，不是"命令成功"。
 
         读 `playback_state` 里这块屏的 `nativeLink`：`isMuted` / `volume` / `rate` 是
         AVPlayer 的直接读数；`sampledAudioBuffers` / `sampledAudioFrames` /
         `audioPeakAmplitude` 来自 `MTAudioProcessingTap` 在输出前取到的**解码 PCM**。
         没有采样缓冲 = 没有声音证据；tap 挂不上（平台/轨道协商）如实 blocked，不冒充通过。
+
+        `label` 只改日志主语：HLS 那条仍是"电视"且不改判；非 HLS 对照用"非 HLS 对照"。
         """
         assert self.host is not None
-        self.ledger.section("screen_audio")
+        if section:
+            self.ledger.section("screen_audio")
         deadline = time.monotonic() + min(self.args.timeout, 30)
         last: dict = {}
         while time.monotonic() < deadline:
@@ -1500,30 +1996,30 @@ class RealAppE2E:
                     and float(last.get("audioPeakAmplitude") or 0) > 0):
                 break
             time.sleep(0.5)
-        self.ledger.check(bool(last), "电视声音诊断可读（nativeLink）", nativeLink=last)
+        self.ledger.check(bool(last), f"{label}声音诊断可读（nativeLink）", nativeLink=last)
         if not last:
             return
-        self.ledger.check(last.get("isMuted") is False, "电视播放器没有静音", nativeLink=last)
-        self.ledger.check(float(last.get("volume") or 0) > 0, "电视播放器音量大于 0",
+        self.ledger.check(last.get("isMuted") is False, f"{label}播放器没有静音", nativeLink=last)
+        self.ledger.check(float(last.get("volume") or 0) > 0, f"{label}播放器音量大于 0",
                           nativeLink=last)
-        self.ledger.check(float(last.get("rate") or 0) > 0, "电视播放器在真实播放速率",
+        self.ledger.check(float(last.get("rate") or 0) > 0, f"{label}播放器在真实播放速率",
                           nativeLink=last)
         if last.get("audioTapAttached") is not True:
-            self.ledger.blocked("音频采样 tap 没有挂上（平台/轨道协商），真实声音采样缺失",
+            self.ledger.blocked(f"{label}音频采样 tap 没有挂上（平台/轨道协商），真实声音采样缺失",
                                 nativeLink=last)
             return
         buffers = int(last.get("sampledAudioBuffers") or 0)
         frames = int(last.get("sampledAudioFrames") or 0)
         peak = float(last.get("audioPeakAmplitude") or 0)
         if buffers == 0 and last.get("hasAudio") is False:
-            self.ledger.blocked("资源声明没有音频轨，无法验证声音", nativeLink=last)
+            self.ledger.blocked(f"{label}资源声明没有音频轨，无法验证声音", nativeLink=last)
             return
-        self.ledger.check(buffers > 0, f"真实音频采样缓冲在增长（buffers={buffers}）",
+        self.ledger.check(buffers > 0, f"{label}真实音频采样缓冲在增长（buffers={buffers}）",
                           nativeLink=last)
-        self.ledger.check(frames > 0, f"真实音频采样帧在增长（frames={frames}）",
+        self.ledger.check(frames > 0, f"{label}真实音频采样帧在增长（frames={frames}）",
                           nativeLink=last)
-        self.ledger.check(peak > 0, f"采样到非静音峰值（peak={peak:.4f}）", nativeLink=last)
-        self.ledger.info("电视声音证据：真实解码 PCM 采样（tap 直通，不静音不改音量）",
+        self.ledger.check(peak > 0, f"{label}采样到非静音峰值（peak={peak:.4f}）", nativeLink=last)
+        self.ledger.info(f"{label}声音证据：真实解码 PCM 采样（tap 直通，不静音不改音量）",
                          nativeLink=last)
 
     def wait_screen_render(self, timeout: float) -> dict | None:
@@ -1883,6 +2379,7 @@ class RealAppE2E:
         if owned is None:
             self.ledger.blocked("领取成功但库存里没出现这一件，摆放/手持不执行")
             return None
+        self._object_id = object_id
         layout_revision = extract_layout_revision(owned)
         # 5) 承托层真的加载出来（与装修面板无关：世界加载时就备好）。
         surfaces = self.wait_placement_surfaces(timeout=self.args.timeout)
@@ -1918,6 +2415,10 @@ class RealAppE2E:
         returned = self.tool("return_held_prop", {
             "object_id": object_id, "layout_revision": revision_held})
         self.ledger.check(world_tool_succeeded(returned), "正式放回工具回执", result=returned)
+        # 重启前回读"最终摆放事实"：位置 / 承托面 / 朝向 / 是否在手上。重启后逐项对回。
+        final = self.tool_quiet("read_owned_props", {})
+        self._placement_readback = extract_owned_object(final, object_id)
+        self._object_id = object_id
         return object_id
 
     def tool_quiet(self, name: str, arguments: dict) -> dict:
@@ -2014,6 +2515,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              "（**必须**与 --reuse-root 同用，避免重复生成花费；"
                              "本模式只证明「已有任务能接着走完」，不代表全新生成流程已通过）")
     parser.add_argument("--video-url", default=DEFAULT_VIDEO_URL)
+    parser.add_argument("--audio-reference-url", default=DEFAULT_AUDIO_REFERENCE_URL,
+                        help="非 HLS 声音对照源：公开的 file-based、带音轨 mp4"
+                             "（默认 W3C Sintel 预告片）。它只证明采样链可用，"
+                             "不把 HLS 那条 blocked 改判。")
+    parser.add_argument("--skip-audio-reference", action="store_true",
+                        help="跳过非 HLS 声音对照采样（默认在重启恢复后执行）")
+    parser.add_argument("--check-audio-reference", action="store_true",
+                        help="只读确认 --audio-reference-url 是公开 file-based mp4 且有音轨，"
+                             "不启动 App；打印 JSON 后退出（0=可用，2=不可用）")
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--generation-timeout", type=float, default=600)
     parser.add_argument("--chat-timeout", type=float, default=180,
@@ -2025,6 +2535,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    if args.check_audio_reference:
+        report = probe_audio_reference(args.audio_reference_url, timeout=min(args.timeout, 60))
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0 if report.get("usable") else 2
     return RealAppE2E(args).run()
 
 

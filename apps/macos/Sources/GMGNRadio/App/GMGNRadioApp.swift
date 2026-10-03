@@ -8466,6 +8466,10 @@ final class AppDelegate:
                 guard let self else { return ["error": "host_released"] }
                 return self.e2ePlaybackState()
             },
+            playDirectMedia: { [weak self] objectID, url in
+                guard let self else { return ["ok": false, "error": "host_released"] }
+                return await self.e2ePlayDirectMedia(objectID: objectID, url: url)
+            },
             inboxState: { [weak self] in
                 guard let self else { return ["error": "host_released"] }
                 return await self.e2eInboxState()
@@ -8815,6 +8819,23 @@ final class AppDelegate:
             return row
         }
         return state
+    }
+
+    /// E2E 诊断：把一条 file-based 媒体直链交给**生产**原生播放器（不经过 `play_screen`
+    /// 的网站白名单，也不改它）。用于非 HLS 声音采样链对照；只在测试控制面存在。
+    private func e2ePlayDirectMedia(objectID: String, url: String) async -> [String: Any] {
+        guard let screenStore else {
+            return ["ok": false, "error": "screen_store_unavailable"]
+        }
+        let outcome = await screenStore.playDirectFileMediaForDiagnostics(
+            objectID: objectID, url: url
+        )
+        return [
+            "ok": !outcome.code.isError,
+            "code": outcome.code.rawValue,
+            "message": outcome.message,
+            "details": outcome.details,
+        ]
     }
 
     /// 收件箱只读投影。

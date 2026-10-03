@@ -199,7 +199,66 @@ final class NativeScreenPlaybackCoordinator {
         value: ScreenLinkResolutionValue,
         quadProvider: @escaping @MainActor () -> [SIMD3<Float>]?
     ) {
-        let descriptor = NativeScreenMediaDescriptor(resolution: value)
+        install(
+            objectID: objectID, generation: generation, device: device,
+            descriptor: NativeScreenMediaDescriptor(resolution: value),
+            quadProvider: quadProvider
+        )
+    }
+
+    /// E2E 诊断专用：直接把一条**公开 file-based 媒体**（带音轨的 mp4 等）交给原生播放器，
+    /// 不经过网站链接解析器。
+    ///
+    /// 生产 `play_screen` 只接受受支持的公开观看页；file-based 直链不在白名单里。这个入口
+    /// 只在显式测试控制面（`GMGN_E2E_DATA_ROOT`）下被调用，用来证明 `MTAudioProcessingTap`
+    /// 的真实 PCM 采样链对 file-based 媒体可用。它复用与生产**完全同一条** `NativeLinkPlayer`
+    /// 与声音采样器，不碰 HLS 判据，也不引入任何系统录音 / TCC 权限。
+    func playDirectFileMedia(
+        objectID: String,
+        fileURL: String,
+        title: String,
+        quadProvider: @escaping @MainActor () -> [SIMD3<Float>]?
+    ) async -> WorldScreenCommandOutcome {
+        invalidate(objectID)
+        let generation = (sessions[objectID]?.generation ?? 0) + 1
+        sessions[objectID] = Session(
+            generation: generation, originalURL: fileURL, player: nil,
+            state: .loading(url: fileURL), task: nil
+        )
+        onChange?()
+        guard let device else {
+            publish(objectID, generation, .failed(.nativeLink(Self.mapScreenLinkFailure(.unsupportedPlatform))))
+            return .failure(
+                .screenSurfaceUnavailable,
+                NativeScreenPlaybackFailure.metalUnavailable.panelText,
+                details: ["screen_id": objectID]
+            )
+        }
+        let descriptor = NativeScreenMediaDescriptor(
+            pageURL: fileURL,
+            title: title,
+            site: .other,
+            isLive: false,
+            streams: [
+                NativeScreenMediaStream(
+                    url: fileURL, formatID: "file-media", headers: [:],
+                    isVideo: true, isAudio: true, isManifest: false
+                )
+            ],
+            note: "E2E 非 HLS file-based 声音对照（解析器不参与）"
+        )
+        install(
+            objectID: objectID, generation: generation, device: device,
+            descriptor: descriptor, quadProvider: quadProvider
+        )
+        return .ok("正在打开这条 file-based 媒体。", details: ["screen_id": objectID, "content_url": fileURL])
+    }
+
+    private func install(
+        objectID: String, generation: UInt64, device: MTLDevice,
+        descriptor: NativeScreenMediaDescriptor,
+        quadProvider: @escaping @MainActor () -> [SIMD3<Float>]?
+    ) {
         guard let player = NativeLinkPlayer(device: device, descriptor: descriptor) else {
             publish(objectID, generation, .failed(.nativeLink(Self.mapScreenLinkFailure(.outputUnreadable("player_init")))))
             return
@@ -220,11 +279,11 @@ final class NativeScreenPlaybackCoordinator {
             if case let .failed(failure) = state {
                 self.publish(objectID, generation, .failed(.nativeLink(Self.linkFailure(failure))))
             } else if state.isPlaying {
-                self.publish(objectID, generation, .playing(url: value.pageURL))
+                self.publish(objectID, generation, .playing(url: descriptor.pageURL))
             }
         }
         player.start()
-        publish(objectID, generation, .loading(url: value.pageURL))
+        publish(objectID, generation, .loading(url: descriptor.pageURL))
 
         // 等"item 就绪 / 第一帧"：到点没出画也不谎报（状态仍是 loading）。
         Task { @MainActor [weak self] in
@@ -233,7 +292,7 @@ final class NativeScreenPlaybackCoordinator {
                 guard let self, self.isCurrent(objectID, generation) else { return }
                 guard let session = sessions[objectID], let current = session.player else { return }
                 if current.decodedFrameCount > 0 || current.state.isPlaying || current.itemStatus == 1 {
-                    self.publish(objectID, generation, .playing(url: value.pageURL))
+                    self.publish(objectID, generation, .playing(url: descriptor.pageURL))
                     return
                 }
                 if case let .failed(failure) = current.state {

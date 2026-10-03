@@ -650,6 +650,11 @@ final class MarbleSpatialView: MTKView {
             // 未补偿的穿透深度（静止最低点 - 当前最低点，钳到 >= 0）。
             diagnostics["uncompensatedPenetrationY"] = max(0, rest - (minimum ?? rest))
         }
+        // 世界坐标足部 / 接触读数（经最近一帧真实 modelTransform）。模型空间的 min/max
+        // 判不出"浮地"；这一份才能与 `placement.position` 比较并区分"站高台"。
+        for (key, value) in renderer.worldGroundingDiagnostics {
+            diagnostics[key] = value
+        }
         return diagnostics
     }
 

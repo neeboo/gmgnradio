@@ -24,6 +24,10 @@
 - 已排队在其结束后继续修领取/入库/重启失败，日志 `/tmp/gmgn-dsh-claim-restart-fixes-20261003.log`。同一生产区域串行写，避免两个 DSH 并发修改。
 - 线程自动跟进 automation id gmgnradio，10分钟间隔；无变化安静，实际失败/进展才通知。主代理不得等待用户催问才复验。
 - 验收未通过；继续当前引擎，不覆盖安装App、不操作用户真实状态或Keychain。
+# 19:00 重启实证与非HLS声音对照
+
+1855宿主构建exit0、Python74pass，真实恢复流程125pass/1fail/3blocked。重启物件位置/承托面/朝向、电视内容与再起播GPU恢复通过，非HLS真实App声音buffers18/frames80532/peak0.0153通过。主代理修PMX格式缓存误判后追加足部专项，8pass1fail，日志 `/tmp/gmgn-parent-restart-foot-1900.log`。已查看真实GPU截图 `/tmp/gmgn-e2e-20261003-1838/evidence/restart-frames/restart-0001.png`，人物悬空；连续脚面离参考面0.2674m，启动早期单点sole0不能算连续贴地。浮地与HLS声音未关闭，仍未完整验收。
+
 # 全新根1838真实生成业务验收
 
 `/tmp/gmgn-parent-fresh-e2e-1838.log` exit2，114pass/0fail/1blocked。全新隔离根 `/tmp/gmgn-e2e-20261003-1838`，人物/动作COPY，实际新生成任务1536D3FF-C7DE-4C18-BC04-9529E7E3B2F2；领取入库/摆放手持放回/三类真实骨骼动作/真实GPU电视视频/新通知已读与重启保存/真实chat delivered通过。唯一脚本阻断为HLS声音采样。完整验收未通过：还需声音输出实证、物件屏幕重启readback，以及重启接触点3.55m的视觉浮地核对。

@@ -1208,13 +1208,28 @@ enum PMXSoleGrounding {
         in model: MMDNode,
         usesPresentationTree: Bool
     ) -> Float? {
+        modelSpacePositions(
+            probes: probes,
+            in: model,
+            usesPresentationTree: usesPresentationTree
+        )
+        .map(\.y)
+        .min()
+    }
+
+    /// 每个探针在**模型空间**的加权位置（与 ``referenceY`` 完全同一份换算）。
+    static func modelSpacePositions(
+        probes: [PMXSoleProbe],
+        in model: MMDNode,
+        usesPresentationTree: Bool
+    ) -> [SIMD3<Float>] {
         guard !probes.isEmpty else {
-            return nil
+            return []
         }
         let modelSpace: SCNNode = usesPresentationTree
             ? model.presentation
             : model
-        let values = probes.compactMap { probe -> Float? in
+        return probes.compactMap { probe -> SIMD3<Float>? in
             var position = SIMD3<Float>.zero
             var totalWeight: Float = 0
             for influence in probe.influences where influence.weight > 0 {
@@ -1237,9 +1252,62 @@ enum PMXSoleGrounding {
             guard totalWeight > 0 else {
                 return nil
             }
-            return (position / totalWeight).y
+            return position / totalWeight
         }
-        return values.min()
+    }
+
+    /// 世界坐标下的最低接触点 Y。
+    ///
+    /// `minimumContactY` / `referenceY` 是**模型空间**读数：它回答"脚相对静止姿态有没有被
+    /// 埋进去"，回答不了"角色离地板多高"。把同一批探针经最近一帧**真实**
+    /// `modelTransform` 变换到世界，才能区分"浮地"与"站在高台上"（站在高台时角色自己的
+    /// 脚面世界高度会跟着 `placement.position` 一起抬，离地间隙仍然是 0）。
+    ///
+    /// `side` 非空时只取主导骨骼属于该侧的探针（左右脚分开诊断）。
+    static func minimumWorldY(
+        probes: [PMXSoleProbe],
+        in model: MMDNode,
+        transform: simd_float4x4,
+        usesPresentationTree: Bool,
+        side: PMXSoleSide? = nil
+    ) -> Float? {
+        let selected = side.map { wanted in
+            probes.filter { soleSide(of: $0) == wanted }
+        } ?? probes
+        return modelSpacePositions(
+            probes: selected,
+            in: model,
+            usesPresentationTree: usesPresentationTree
+        )
+        .map { position -> Float in
+            (transform * SIMD4<Float>(position, 1)).y
+        }
+        .filter(\.isFinite)
+        .min()
+    }
+
+    enum PMXSoleSide {
+        case left
+        case right
+    }
+
+    /// 探针归属哪只脚：由权重最大的影响骨骼名字判定（左足首 / 右足首 / left / right）。
+    /// 判不出来时返回 nil，绝不硬塞一侧。
+    static func soleSide(of probe: PMXSoleProbe) -> PMXSoleSide? {
+        guard let name = probe.influences.max(by: { $0.weight < $1.weight })?.bone.name
+        else {
+            return nil
+        }
+        let normalized = name
+            .folding(options: [.caseInsensitive, .widthInsensitive], locale: nil)
+            .lowercased()
+        if normalized.contains("左") || normalized.contains("left") {
+            return .left
+        }
+        if normalized.contains("右") || normalized.contains("right") {
+            return .right
+        }
+        return nil
     }
 
     static func makeProbes(
@@ -1822,6 +1890,63 @@ public final class PMXStageAvatarRenderer {
             usesPresentationTree: true
         )
     }
+
+    /// **世界坐标**足部 / 接触诊断（E2E 与人工视觉核验只读）。
+    ///
+    /// 模型空间的 `minimumContactY` 回答"相对静止姿态有没有被埋"，回答不了"离地板多高"：
+    /// 重启后居民可能站在高处，也可能真的浮空，只有把探针经真实 `lastAppliedModelTransform`
+    /// 投到世界、再与角色自己的静止脚面（`restFootPlaneWorldY`，由 `placement.position`
+    /// 决定）比较，才能区分。左右脚分开给，供"单脚悬空 / 单脚穿地"诊断。
+    public var worldGroundingDiagnostics: [String: Any] {
+        guard let modelNode else { return [:] }
+        let transform = lastAppliedModelTransform
+        var diagnostics: [String: Any] = [
+            "soleProbeCount": soleProbes.count,
+            "contactProbeCount": contactProbes.count,
+            "modelOriginWorldY": transform.columns.3.y,
+        ]
+        if let restFootReferenceY {
+            let footPlane = transform * SIMD4<Float>(0, restFootReferenceY, 0, 1)
+            if footPlane.y.isFinite {
+                diagnostics["restFootPlaneWorldY"] = footPlane.y
+            }
+        }
+        if let sole = PMXSoleGrounding.minimumWorldY(
+            probes: soleProbes,
+            in: modelNode,
+            transform: transform,
+            usesPresentationTree: true
+        ) {
+            diagnostics["lowestSoleWorldY"] = sole
+        }
+        if let contact = PMXSoleGrounding.minimumWorldY(
+            probes: contactProbes,
+            in: modelNode,
+            transform: transform,
+            usesPresentationTree: true
+        ) {
+            diagnostics["lowestContactWorldY"] = contact
+        }
+        if let left = PMXSoleGrounding.minimumWorldY(
+            probes: soleProbes,
+            in: modelNode,
+            transform: transform,
+            usesPresentationTree: true,
+            side: .left
+        ) {
+            diagnostics["leftSoleWorldY"] = left
+        }
+        if let right = PMXSoleGrounding.minimumWorldY(
+            probes: soleProbes,
+            in: modelNode,
+            transform: transform,
+            usesPresentationTree: true,
+            side: .right
+        ) {
+            diagnostics["rightSoleWorldY"] = right
+        }
+        return diagnostics
+    }
     private var renderTimeline = PMXRenderTimeline()
     private var oneShotMotionPlayback: PMXOneShotMotionPlayback?
     private var motionPlaybackProbe: PMXMotionPlaybackProbe?
@@ -1835,6 +1960,12 @@ public final class PMXStageAvatarRenderer {
     /// `PMXFullStageGroundingPolicy` 后真实用于 `modelTransform` 的那一个。两者分开上报，
     /// 是为了让"算出来了"与"真的施加了"不再混为一谈。
     public private(set) var lastAppliedGroundingOffsetY: Float = 0
+    /// 最近一帧**真正乘进 `modelContainerNode`** 的模型→世界变换。
+    ///
+    /// 接地补偿 / 脚面探针都是模型空间读数；要判"浮地"必须把探针经这一份真实变换
+    /// 投到世界，才能与 `placement.position`（即居民世界位置）比较。它只在 `encode`
+    /// 真正渲染时更新，不猜、不复用上一帧。
+    public private(set) var lastAppliedModelTransform = matrix_identity_float4x4
     /// 最近一帧交给 SceneKit 的本地动画时钟（`renderTimeline` 的值）。
     public private(set) var lastRenderedSceneTime: TimeInterval = 0
     /// 只随**真实角色帧**递增的计数器。它绝不来自世界资源 revision，也不是 GPU 帧号；
@@ -2589,6 +2720,7 @@ public final class PMXStageAvatarRenderer {
         // 原始值，`groundingOffsetY` 是调用方走完 `PMXFullStageGroundingPolicy` 后真正
         // 乘进 `modelTransform` 的那一个；分开记，E2E 才能判"算出来"与"施加了"。
         lastAppliedGroundingOffsetY = groundingOffsetY
+        lastAppliedModelTransform = modelTransform
         let viewportSize: (width: Int, height: Int)
         if let colorTexture = renderPassDescriptor.colorAttachments[0].texture {
             viewportSize = (colorTexture.width, colorTexture.height)

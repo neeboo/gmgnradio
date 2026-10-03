@@ -678,6 +678,45 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
         return outcome
     }
 
+    /// E2E 诊断专用：把一条 **file-based 媒体直链**（带音轨的 mp4 等）交给原生播放器。
+    ///
+    /// 生产 `playScreen` 的白名单只放受支持的公开观看页，直链会被
+    /// `screenContentRejected` 拒绝；这个入口**只**在显式测试控制面
+    /// （`GMGN_E2E_DATA_ROOT`）下被调用，用来证明 `MTAudioProcessingTap` 的真实 PCM
+    /// 采样链对 file-based 媒体可用。它复用与生产**完全同一条** `NativeLinkPlayer`，
+    /// 不改 `playScreen` 的白名单，也不碰 HLS 判据。
+    func playDirectFileMediaForDiagnostics(
+        objectID: String, url: String
+    ) async -> WorldScreenCommandOutcome {
+        rebuild()
+        guard let target = resolveTarget(objectID) else {
+            return .failure(
+                .screenNotFound, "这个空间里没有「\(objectID)」这台电视。",
+                details: ["screen_id": objectID]
+            )
+        }
+        if let issue = issues[target] {
+            return .failure(
+                .screenGeometryMissing,
+                ScreenPanelCopy.screenRangeLine(source: nil, hasGeometryIssue: true),
+                details: ["screen_id": target, "cause": issue.errorDescription]
+            )
+        }
+        overlay.surface(for: target).stop()
+        let content = WorldScreenContent(
+            objectID: target, kind: .nativeLink, url: url, title: "非 HLS 声音对照"
+        )
+        contents[target] = content
+        source.persistContent?(content)
+        overlay.surface(for: target).geometryIssue = nil
+        let outcome = await nativeCoordinator.playDirectFileMedia(
+            objectID: target, fileURL: url, title: "非 HLS 声音对照",
+            quadProvider: { [weak self] in self?.worldQuads().quads[target] }
+        )
+        snapshots = makeSnapshots()
+        return outcome
+    }
+
     func stopScreen(objectID: String?) -> WorldScreenCommandOutcome {
         rebuild()
         guard let target = resolveTarget(objectID) else {
