@@ -4,7 +4,6 @@ use std::path::PathBuf;
 type Create = unsafe extern "C" fn() -> *mut c_void;
 type Lifecycle = unsafe extern "C" fn(*mut c_void) -> c_int;
 type Action = unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int;
-type Send = unsafe extern "C" fn(*mut c_void, u64, *const c_char) -> c_int;
 type Cancel = unsafe extern "C" fn(*mut c_void, u64) -> c_int;
 type Poll = unsafe extern "C" fn(*mut c_void) -> *mut c_char;
 type Free = unsafe extern "C" fn(*mut c_char);
@@ -18,7 +17,12 @@ unsafe extern "C" {
     fn gmgn_gpui_surface_container(view: *mut c_void, compact: c_int) -> *mut c_void;
     fn gmgn_gpui_window_visible(view: *mut c_void) -> c_int;
     fn gmgn_gpui_has_visible_windows() -> c_int;
-    fn gmgn_gpui_ui_overlay(view: *mut c_void, visible:c_int);
+    fn gmgn_gpui_hit_regions(view:*mut c_void,regions:*const f64,count:usize);
+    fn gmgn_gpui_set_outer_size(view:*mut c_void,width:f64,height:f64,min_width:f64,min_height:f64)->c_int;
+}
+
+pub fn set_window_outer_size(view:*mut c_void,width:f64,height:f64,min_width:f64,min_height:f64)->bool {
+    unsafe {gmgn_gpui_set_outer_size(view,width,height,min_width,min_height)!=0}
 }
 
 /// Lives only on the GPUI/AppKit main thread. The dylib stays loaded until
@@ -29,7 +33,6 @@ pub struct ProductHost {
     destroy: Lifecycle,
     action: Action,
     settings_command: Action,
-    send: Send,
     cancel: Cancel,
     poll: Poll,
     free: Free,
@@ -63,7 +66,6 @@ impl ProductHost {
                 destroy: symbol!("gmgn_product_host_destroy", Lifecycle),
                 action: symbol!("gmgn_product_host_action", Action),
                 settings_command: symbol!("gmgn_product_host_settings_command", Action),
-                send: symbol!("gmgn_product_host_chat_send", Send),
                 cancel: symbol!("gmgn_product_host_chat_cancel", Cancel),
                 poll: symbol!("gmgn_product_host_chat_poll", Poll),
                 free: symbol!("gmgn_product_host_string_free", Free),
@@ -77,9 +79,6 @@ impl ProductHost {
             if start(host.handle) == 0 { host.close(); return Err("真实应用启动未完成。".into()); }
             Ok(host)
         }
-    }
-    pub fn send(&self, id: u64, text: &str) -> bool {
-        CString::new(text).is_ok_and(|text| unsafe { (self.send)(self.handle, id, text.as_ptr()) != 0 })
     }
     pub fn cancel(&self, id: u64) -> bool { unsafe { (self.cancel)(self.handle, id) != 0 } }
     pub fn action(&self, action: &str) -> bool {
@@ -108,8 +107,14 @@ impl ProductHost {
     pub fn update_visibility(&self) {
         if !self.view.is_null() { unsafe { (self.visibility)(self.handle, gmgn_gpui_window_visible(self.view), 0); } }
     }
-    pub fn ui_overlay(&self, visible:bool) {
-        if !self.view.is_null() { unsafe {gmgn_gpui_ui_overlay(self.view,visible as c_int);} }
+    pub fn clear_window_reference(&mut self) {
+        // The real renderer remains owned by Swift until the next window-ready
+        // attach. Never send hit regions to the old, released GPUI NSView.
+        self.view=std::ptr::null_mut();
+    }
+    pub fn hit_regions(&self,regions:&[[f32;4]]) {
+        let values:Vec<f64>=regions.iter().flatten().map(|n|*n as f64).collect();
+        if !self.view.is_null() {unsafe{gmgn_gpui_hit_regions(self.view,values.as_ptr(),regions.len());}}
     }
     pub fn reopen(&self) { unsafe { (self.reopen)(self.handle, gmgn_gpui_has_visible_windows()); } }
     pub fn close(&mut self) {

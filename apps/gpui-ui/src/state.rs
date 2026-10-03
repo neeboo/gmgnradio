@@ -1,8 +1,27 @@
 //! UI-only state. The host owns transport, transcript persistence and synthesis.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChatCommand {
-    Send { request_id: u64, text: String },
-    Cancel { request_id: u64 },
+    Send {
+        request_id: u64,
+        text: String,
+        attachment_ids: Vec<String>,
+    },
+    Cancel {
+        request_id: u64,
+    },
+    PickAttachments,
+    PasteAttachments,
+    ImportAttachments {
+        paths: Vec<String>,
+    },
+    RemoveAttachment {
+        id: String,
+    },
+    BeginVoice,
+    FinishVoice,
+    StopSpeech,
+    StopTask,
+    FocusInput,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -11,12 +30,20 @@ pub struct TranscriptLine {
     pub text: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatAttachment {
+    pub id: String,
+    pub file_name: String,
+    pub preview_path: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct Pending {
     id: u64,
     revision: u64,
     accepted: bool,
     submitted: String,
+    attachments: Vec<ChatAttachment>,
 }
 
 #[derive(Default)]
@@ -26,6 +53,17 @@ pub struct ChatState {
     pub transcript: Vec<TranscriptLine>,
     pub progress: Option<String>,
     pub status: Option<String>,
+    pub attachments: Vec<ChatAttachment>,
+    pub attachments_preparing: bool,
+    pub attachments_error: Option<String>,
+    pub voice_active: bool,
+    pub is_speaking: bool,
+    pub host_can_stop: bool,
+    pub host_thinking: bool,
+    pub host_progress: Option<String>,
+    pub host_notice: Option<String>,
+    pub tts_error: Option<String>,
+    voice_pressed: bool,
     revision: u64,
     next_id: u64,
     pending: Option<Pending>,
@@ -42,8 +80,37 @@ impl ChatState {
     pub fn thinking(&self) -> bool {
         self.pending.is_some()
     }
+    pub fn has_draft(&self) -> bool {
+        !self.draft.trim().is_empty() || !self.attachments.is_empty()
+    }
+    pub fn can_stop(&self) -> bool {
+        self.thinking() || self.host_can_stop || self.is_speaking
+    }
+    pub fn primary_stops(&self) -> bool {
+        self.can_stop() && !self.has_draft()
+    }
+    pub fn stop_reply(&mut self) {
+        if self.is_speaking {
+            self.stop_speech();
+        } else {
+            self.stop_task();
+        }
+    }
+    pub fn primary_action(&mut self) {
+        if self.primary_stops() {
+            self.stop_reply();
+        } else {
+            self.send();
+        }
+    }
     pub fn can_send(&self) -> bool {
-        !self.thinking() && !self.draft.trim().is_empty()
+        !self
+            .pending
+            .as_ref()
+            .is_some_and(|p| !p.accepted && p.revision == self.revision)
+            && !self.attachments_preparing
+            && self.attachments.len() <= 4
+            && (!self.draft.trim().is_empty() || !self.attachments.is_empty())
     }
     pub fn send(&mut self) -> bool {
         if !self.can_send() {
@@ -55,6 +122,7 @@ impl ChatState {
             revision: self.revision,
             accepted: false,
             submitted: self.draft.clone(),
+            attachments: self.attachments.clone(),
         });
         self.reply.clear();
         self.status = None;
@@ -62,8 +130,12 @@ impl ChatState {
         self.commands.push(ChatCommand::Send {
             request_id: self.next_id,
             text: self.draft.trim().into(),
+            attachment_ids: self.attachments.iter().map(|a| a.id.clone()).collect(),
         });
         true
+    }
+    pub fn submit_enter(&mut self, shift: bool, composing: bool) -> bool {
+        !shift && !composing && self.send()
     }
     /// Call only after the actual host accepts delivery. Never clear a newer edit.
     pub fn accepted(&mut self, id: u64) -> bool {
@@ -73,6 +145,7 @@ impl ChatState {
         pending.accepted = true;
         if pending.revision == self.revision {
             self.draft.clear();
+            self.attachments.clear();
             self.revision += 1;
         }
         true
@@ -82,6 +155,7 @@ impl ChatState {
             return false;
         }
         let pending = self.pending.take().expect("matching pending request");
+        self.restore_attachments(pending.attachments);
         if self.draft != pending.submitted {
             self.draft = if self.draft.is_empty() {
                 pending.submitted
@@ -116,7 +190,13 @@ impl ChatState {
         true
     }
     pub fn complete_without_reply(&mut self, id: u64) -> bool {
-        if !self.pending.as_ref().is_some_and(|p| p.id == id && p.accepted) { return false; }
+        if !self
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.id == id && p.accepted)
+        {
+            return false;
+        }
         self.pending = None;
         self.reply.clear();
         self.progress = None;
@@ -126,6 +206,7 @@ impl ChatState {
     pub fn cancel(&mut self) {
         if let Some(p) = self.pending.take() {
             self.commands.push(ChatCommand::Cancel { request_id: p.id });
+            self.restore_attachments(p.attachments);
             if self.draft != p.submitted {
                 self.draft = if self.draft.is_empty() {
                     p.submitted
@@ -142,6 +223,8 @@ impl ChatState {
     pub fn reset_context(&mut self) {
         self.cancel();
         self.draft.clear();
+        self.attachments.clear();
+        self.finish_voice();
         self.revision += 1;
         self.reply.clear();
         self.transcript.clear();
@@ -150,11 +233,234 @@ impl ChatState {
     pub fn take_commands(&mut self) -> Vec<ChatCommand> {
         std::mem::take(&mut self.commands)
     }
+    fn restore_attachments(&mut self, attachments: Vec<ChatAttachment>) {
+        for attachment in attachments {
+            if !self.attachments.iter().any(|a| a.id == attachment.id) {
+                self.attachments.push(attachment);
+            }
+        }
+    }
+    pub fn set_attachments(&mut self, attachments: Vec<ChatAttachment>, preparing: bool) {
+        if self.attachments != attachments {
+            self.revision += 1;
+        }
+        self.attachments = attachments;
+        self.attachments_preparing = preparing;
+    }
+    pub fn pick_attachments(&mut self) {
+        if !self.attachments_preparing && self.attachments.len() < 4 {
+            self.commands.push(ChatCommand::PickAttachments);
+        }
+    }
+    pub fn paste_attachments(&mut self) {
+        if !self.attachments_preparing && self.attachments.len() < 4 {
+            self.commands.push(ChatCommand::PasteAttachments);
+        }
+    }
+    pub fn import_attachments(&mut self, paths: Vec<String>) {
+        if !paths.is_empty() && !self.attachments_preparing && self.attachments.len() < 4 {
+            self.commands.push(ChatCommand::ImportAttachments { paths });
+        }
+    }
+    pub fn remove_attachment(&mut self, id: String) {
+        if self.attachments.iter().any(|a| a.id == id) {
+            self.attachments.retain(|a| a.id != id);
+            self.revision += 1;
+            self.commands.push(ChatCommand::RemoveAttachment { id });
+        }
+    }
+    pub fn begin_voice(&mut self) {
+        if !self.voice_pressed {
+            self.voice_pressed = true;
+            self.commands.push(ChatCommand::BeginVoice);
+        }
+    }
+    pub fn finish_voice(&mut self) {
+        if self.voice_pressed {
+            self.voice_pressed = false;
+            self.commands.push(ChatCommand::FinishVoice);
+        }
+    }
+    pub fn stop_speech(&mut self) {
+        self.commands.push(ChatCommand::StopSpeech);
+    }
+    pub fn stop_task(&mut self) {
+        if self.thinking() {
+            self.cancel();
+        } else if self.host_can_stop {
+            self.commands.push(ChatCommand::StopTask);
+        }
+    }
+    pub fn focus_input(&mut self) {
+        self.commands.push(ChatCommand::FocusInput);
+    }
+    pub fn status_line(&self) -> String {
+        if self.is_speaking {
+            "🗣️ 正在说话…".into()
+        } else if self.thinking() || self.host_thinking {
+            format!(
+                "🤔 {}",
+                self.progress
+                    .as_deref()
+                    .or(self.host_progress.as_deref())
+                    .unwrap_or("等待居民回应…")
+            )
+        } else if self.voice_active {
+            "👂 正在听你说话…".into()
+        } else {
+            "你的居民".into()
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ime_confirmation_and_shift_enter_do_not_submit() {
+        let mut s = ChatState::default();
+        s.edit("中文草稿".into());
+        assert!(!s.submit_enter(false, true));
+        assert!(!s.submit_enter(true, false));
+        assert!(s.take_commands().is_empty());
+        assert_eq!(s.draft, "中文草稿");
+        assert!(s.submit_enter(false, false));
+    }
+    #[test]
+    fn new_draft_supersedes_pending_without_accepting_old_callbacks() {
+        let mut s = ChatState::default();
+        s.edit("第一句".into());
+        s.send();
+        assert!(!s.send());
+        s.edit("第二句".into());
+        assert!(s.send());
+        assert!(!s.accepted(1));
+        assert!(s.accepted(2));
+        assert!(!s.finish(1, "旧回复".into()));
+        assert!(s.finish(2, "新回复".into()));
+    }
+    #[test]
+    fn primary_stop_uses_voice_priority_and_draft_restores_send() {
+        let mut s = ChatState::default();
+        s.host_can_stop = true;
+        s.is_speaking = true;
+        assert!(s.primary_stops());
+        s.primary_action();
+        assert_eq!(s.take_commands(), vec![ChatCommand::StopSpeech]);
+        s.edit("新消息".into());
+        assert!(!s.primary_stops());
+        s.primary_action();
+        assert!(matches!(
+            s.take_commands().as_slice(),
+            [ChatCommand::Send { .. }]
+        ));
+        s.focus_input();
+        assert_eq!(s.take_commands(), vec![ChatCommand::FocusInput]);
+    }
+    #[test]
+    fn status_matches_original_voice_thinking_listening_priority() {
+        let mut s = ChatState::default();
+        assert_eq!(s.status_line(), "你的居民");
+        s.voice_active = true;
+        assert_eq!(s.status_line(), "👂 正在听你说话…");
+        s.host_thinking = true;
+        s.host_progress = Some("正在查询歌单…".into());
+        assert_eq!(s.status_line(), "🤔 正在查询歌单…");
+        s.is_speaking = true;
+        assert_eq!(s.status_line(), "🗣️ 正在说话…");
+    }
+    fn attachment(id: &str) -> ChatAttachment {
+        ChatAttachment {
+            id: id.into(),
+            file_name: format!("{id}.png"),
+            preview_path: None,
+        }
+    }
+    #[test]
+    fn attachment_only_submission_and_failure_preserve_original_ids() {
+        let mut s = ChatState::default();
+        s.set_attachments(vec![attachment("image")], false);
+        assert!(s.can_send());
+        assert!(s.send());
+        assert!(
+            matches!(&s.take_commands()[0], ChatCommand::Send { text, attachment_ids, .. } if text.is_empty() && attachment_ids == &["image"])
+        );
+        s.accepted(1);
+        assert!(s.attachments.is_empty());
+        s.fail(1, "失败".into());
+        assert_eq!(s.attachments, vec![attachment("image")]);
+    }
+    #[test]
+    fn attachment_preparation_and_limit_gate_all_import_paths() {
+        let mut s = ChatState::default();
+        s.set_attachments(vec![attachment("a")], true);
+        assert!(!s.can_send());
+        s.pick_attachments();
+        s.paste_attachments();
+        assert!(s.take_commands().is_empty());
+        s.set_attachments(
+            (0..5).map(|id| attachment(&id.to_string())).collect(),
+            false,
+        );
+        assert_eq!(s.attachments.len(), 5);
+        assert!(!s.can_send());
+        s.pick_attachments();
+        s.import_attachments(vec!["/tmp/image.png".into()]);
+        assert!(s.take_commands().is_empty());
+        s.remove_attachment("0".into());
+        assert_eq!(s.attachments.len(), 4);
+    }
+    #[test]
+    fn concurrent_attachments_and_failed_submission_are_all_retained() {
+        let mut s = ChatState::default();
+        s.set_attachments(vec![attachment("old")], false);
+        s.send();
+        s.accepted(1);
+        s.set_attachments(
+            (0..4).map(|id| attachment(&id.to_string())).collect(),
+            false,
+        );
+        s.pick_attachments();
+        s.fail(1, "失败".into());
+        assert_eq!(s.attachments.len(), 5);
+        assert!(s.attachments.iter().any(|a| a.id == "old"));
+        assert!(!s.can_send());
+        s.remove_attachment("old".into());
+        assert!(s.can_send());
+    }
+    #[test]
+    fn push_to_talk_release_outside_is_single_and_separate_from_stop_speech() {
+        let mut s = ChatState::default();
+        s.begin_voice();
+        s.begin_voice();
+        s.finish_voice();
+        s.finish_voice();
+        s.stop_speech();
+        assert_eq!(
+            s.take_commands(),
+            vec![
+                ChatCommand::BeginVoice,
+                ChatCommand::FinishVoice,
+                ChatCommand::StopSpeech
+            ]
+        );
+        s.begin_voice();
+        s.reset_context();
+        assert_eq!(
+            s.take_commands(),
+            vec![ChatCommand::BeginVoice, ChatCommand::FinishVoice]
+        );
+    }
+    #[test]
+    fn background_task_stop_is_available_without_pending_chat_and_does_not_stop_speech() {
+        let mut s = ChatState::default();
+        s.host_can_stop = true;
+        s.is_speaking = true;
+        s.stop_task();
+        assert_eq!(s.take_commands(), vec![ChatCommand::StopTask]);
+        s.stop_speech();
+        assert_eq!(s.take_commands(), vec![ChatCommand::StopSpeech]);
+    }
     #[test]
     fn failure_keeps_draft() {
         let mut s = ChatState::default();
@@ -273,10 +579,16 @@ mod tests {
         assert!(s.draft.is_empty());
         assert!(!s.thinking());
         assert!(!s.finish(1, "迟到".into()));
-        assert!(matches!(s.take_commands().as_slice(), [ChatCommand::Cancel { request_id: 1 }]));
+        assert!(matches!(
+            s.take_commands().as_slice(),
+            [ChatCommand::Cancel { request_id: 1 }]
+        ));
         s.edit("新世界".into());
         s.send();
-        assert!(matches!(s.take_commands().as_slice(), [ChatCommand::Send { request_id: 2, .. }]));
+        assert!(matches!(
+            s.take_commands().as_slice(),
+            [ChatCommand::Send { request_id: 2, .. }]
+        ));
     }
     #[test]
     fn silent_completed_turn_requires_acceptance_and_adds_no_reply() {

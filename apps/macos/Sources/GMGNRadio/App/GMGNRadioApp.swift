@@ -367,6 +367,461 @@ extension AppDelegate {
 
     func gpuiCancelResident() { cancelResidentMessage(userIntent: true) }
 
+    func gpuiMakeProgramSelection() -> StageProgramRailSelection {
+        StageProgramRailSelection(
+            onPlay: { [weak self] id, index in self?.playProgramTrack(programID: id, at: index) },
+            onPlayPlaylist: { [weak self] id, index in self?.playSyncedPlaylist(playlistID: id, at: index) },
+            onOpenPlaylist: { [weak self] id in self?.loadNextSyncedPlaylistPage(playlistID: id) },
+            onLoadMorePlaylist: { [weak self] id in self?.loadNextSyncedPlaylistPage(playlistID: id) },
+            onReplan: { [weak self] in self?.replanUpcomingProgramFromStage() })
+    }
+
+    private func gpuiVisiblePrograms() -> [SavedDJProgram] {
+        let candidates: [SavedDJProgram]
+        if !programStore.recentPrograms.isEmpty { candidates = programStore.recentPrograms }
+        else if let plan = programStore.plan {
+            candidates = [SavedDJProgram(plan: plan, activeSlotIndex: programStore.activeSlotIndex, updatedAt: plan.generatedAt)]
+        } else { candidates = [] }
+        return StageProgramRailCatalog.visiblePrograms(candidates, syncedPlaylists: musicLibraryStore.playlists)
+    }
+
+    func gpuiProgramSnapshot(_ selection: StageProgramRailSelection) -> [String: Any] {
+        let programs = gpuiVisiblePrograms()
+        let program = programs.first { $0.plan.brief.id == selection.selectedProgramID }
+        let playlist = selection.selectedPlaylistID.flatMap { musicLibraryStore.playlist(id: $0) }
+        let model: StageProgramRailModel
+        if let playlist {
+            model = StageProgramRailModel(playlist: playlist, activeTrackID: programStore.plan?.brief.id == playlist.id ? programStore.activeSlot?.track.id : nil)
+        } else {
+            model = StageProgramRailModel(plan: program?.plan, activeSlotIndex: program?.plan.brief.id == programStore.plan?.brief.id ? programStore.activeSlotIndex : nil)
+        }
+        let route: String
+        switch selection.route { case .programs: route = "programs"; case .tracks: route = "tracks"; case .playlistTracks: route = "playlistTracks" }
+        return ["route": route, "title": model.title as Any? ?? NSNull(),
+            "isPlaylist": playlist != nil, "hasMore": playlist.map { $0.tracks.count < $0.trackCount } ?? false,
+            "planning": programStore.status == .planning,
+            "audioFeatures": gpuiAudioFeaturesSnapshot(),
+            "emptyMessage": programStore.status == .planning ? "DJ 正在排歌" : playlist != nil ? "正在加载歌曲…" : "暂无节目",
+            "programs": programs.map { saved in
+                ["id": saved.plan.brief.id, "title": saved.plan.title.flatMap { $0.isEmpty ? nil : $0 } ?? "未命名节目",
+                 "subtitle": "\(saved.plan.slots.count) 首" + (saved.plan.direction.map { " · " + $0 } ?? ""),
+                 "isCurrent": saved.plan.brief.id == programStore.plan?.brief.id,
+                 "isPending": saved.plan.brief.id == programStore.pendingPlan?.brief.id] as [String: Any]
+            },
+            "playlists": musicLibraryStore.playlists.map {
+                ["id": $0.id, "title": $0.name, "subtitle": "\($0.trackCount) 首 · \($0.providerID.rawValue)"]
+            },
+            "tracks": model.cards.map { card in
+                ["slotIndex": card.slotIndex, "trackID": card.trackID, "title": card.title, "artist": card.artist,
+                 "isCurrent": card.isCurrent, "hasBoundVideo": stageVideos.boundAsset(for: card.trackID) != nil,
+                 "relativeIndex": card.relativeIndex, "depth": card.depth, "opacity": card.opacity,
+                 "scale": card.scale, "energy": card.energy,
+                 "isFocused": selection.selectedSlotIndex.map { $0 == card.slotIndex } ?? card.isCurrent,
+                 "horizontalOffset": StageProgramRailCardLayout.horizontalOffset(relativeIndex: card.relativeIndex,
+                    isFocused: selection.selectedSlotIndex.map { $0 == card.slotIndex } ?? card.isCurrent)] as [String: Any]
+            }]
+    }
+
+    func gpuiProgramCommand(_ command: [String: Any], selection: StageProgramRailSelection) -> Bool {
+        guard let op = command["op"] as? String else { return false }
+        switch op {
+        case "stage.program.load": break
+        case "stage.program.open":
+            guard let id = command["id"] as? String, gpuiVisiblePrograms().contains(where: { $0.plan.brief.id == id }) else { return false }
+            selection.openProgram(id)
+        case "stage.playlist.open":
+            guard let id = command["id"] as? String, musicLibraryStore.playlist(id: id) != nil else { return false }
+            selection.openPlaylist(id)
+        case "stage.program.back": selection.showPrograms()
+        case "stage.program.more":
+            guard selection.selectedPlaylistID != nil else { return false }
+            selection.loadMoreSelectedPlaylist()
+        case "stage.program.replan":
+            guard programStore.status != .planning, selection.selectedPlaylistID == nil else { return false }
+            selection.replan()
+        case "stage.program.play":
+            guard let index = command["slotIndex"] as? Int,
+                  let tracks = gpuiProgramSnapshot(selection)["tracks"] as? [[String: Any]],
+                  tracks.contains(where: { $0["slotIndex"] as? Int == index }) else { return false }
+            selection.activate(slotIndex: index)
+        case "stage.program.video":
+            guard let id = command["trackID"] as? String, id == programStore.activeSlot?.track.id,
+                  stageVideos.boundAsset(for: id) != nil else { return false }
+            stageVideos.playBoundVideo(for: id)
+        default: return false
+        }
+        return true
+    }
+
+    func gpuiPropSnapshot() -> [String: Any] {
+        guard let editor = stageWindowController?.gpuiPropEditorState else {
+            return ["available": false, "isOpen": false, "notice": "物件编辑器尚未准备好。"]
+        }
+        let list = editor.ownershipList
+        let selected: [String: Any]?
+        if let object = editor.selectedObject, let prop = object.generatedProp {
+            let size = prop.effectiveSize
+            selected = ["objectID": prop.objectID, "name": prop.displayName, "held": editor.isSelectedHeld,
+                "enabled": object.isEnabled, "holdPoint": editor.selectedHoldPoint.rawValue,
+                "holdUnavailableReason": editor.selectedHoldUnavailableReason as Any? ?? NSNull(),
+                "longestEdge": prop.longestEdge,
+                "sizeDescription": String(format: "长 %.2f × 高 %.2f × 深 %.2f m（等比缩放；0.02–3.00 m）", size.x, size.y, size.z),
+                "sizeProvenance": editor.selectedSizeProvenance as Any? ?? NSNull()]
+        } else { selected = nil }
+        return ["available": true, "isOpen": editor.isOpen, "worldID": editor.snapshot.worldID,
+            "revision": editor.snapshot.revision, "isSaving": editor.isSaving, "isCarrying": editor.isCarrying,
+            "placedOnly": editor.showsPlacedOnly, "notice": editor.notice, "canUndo": editor.snapshot.canUndo,
+            "rowCount": list.rowCount, "remainingCount": list.remainingCount,
+            "emptyMessage": editor.showsPlacedOnly ? "房间里还没有摆放物件" : "还没有许愿。对居民说你想要什么，做好后会出现在这里。",
+            "selected": selected as Any? ?? NSNull(),
+            "holdPoints": PropAttachmentPoint.allCases.map { ["id": $0.rawValue, "name": PropAttachmentSlots.displayName(for: $0)] },
+            "legendText": PropSupportGridPresentation.Legend.entries.filter { $0.state != .wallPlaceable || editor.snapshot.wallFaces > 0 }.map(\.label).joined(separator: " · "),
+            "legend": PropSupportGridPresentation.Legend.entries.filter { $0.state != .wallPlaceable || editor.snapshot.wallFaces > 0 }.map {
+                ["label": $0.label, "red": $0.srgbTint.x, "green": $0.srgbTint.y, "blue": $0.srgbTint.z] as [String: Any]
+            },
+            "wallPlacementText": editor.snapshot.wallFaces == 0 ? "靠墙 · 这个空间里没有识别到竖直面"
+                : "靠墙 · \(editor.snapshot.wallFaces) 面墙，\(editor.snapshot.wallPlaceableCells) 格可背朝墙放置",
+            "sections": list.sections.map { section in
+                ["group": section.group.rawValue, "title": ResidentOwnershipProjection.sectionTitle(section),
+                 "isFolded": section.isFolded, "totalCount": section.totalCount,
+                 "rows": section.rows.map { row in
+                     ["id": row.id, "objectID": row.key.objectID, "jobID": row.key.jobID?.uuidString as Any? ?? NSNull(),
+                      "name": row.name, "statusText": row.statusText, "reasonText": row.reasonText as Any? ?? NSNull(),
+                      "sizeText": row.sizeText as Any? ?? NSNull(), "sizeProvenance": row.sizeProvenance as Any? ?? NSNull(),
+                      "badges": row.badges, "actions": row.actions.map(\.rawValue)] as [String: Any]
+                 }] as [String: Any]
+            }]
+    }
+
+    func gpuiPropCommand(_ command: [String: Any]) -> Bool {
+        guard let op = command["op"] as? String, let editor = stageWindowController?.gpuiPropEditorState else { return false }
+        switch op {
+        case "stage.props.load":
+            if let fresh = editor.refreshSnapshot?() { editor.update(fresh) }
+        case "stage.props.toggle":
+            guard spatialStage.isWorldPresentationRequested else { return false }
+            stageWindowController?.toggleDecorationEditor()
+        case "stage.props.close": editor.close()
+        case "stage.props.escape": editor.escape()
+        case "stage.props.filter":
+            guard let placed = command["placedOnly"] as? Bool else { return false }; editor.showsPlacedOnly = placed
+        case "stage.props.fold":
+            guard command["group"] as? String == OwnershipGroup.ended.rawValue, let folded = command["folded"] as? Bool else { return false }
+            editor.showsEnded = !folded
+        default:
+            guard editor.isOpen, !editor.isSaving else { return false }
+            let objectID = command["objectID"] as? String
+            let rows = editor.snapshot.ownershipFacts.map(ResidentOwnershipProjection.row)
+            switch op {
+            case "stage.props.select":
+                guard let id = objectID, rows.contains(where: { $0.key.objectID == id && ($0.actions.contains(.place) || $0.actions.contains(.withdraw)) }) else { return false }
+                Task { await editor.select(objectID: id) }
+            case "stage.props.claim", "stage.props.askResidentToFetch", "stage.props.retry", "stage.props.retryInventoryRegistration":
+                guard let id = command["jobID"] as? String, let jobID = UUID(uuidString: id),
+                      let action = OwnershipRowAction(rawValue: String(op.dropFirst("stage.props.".count))),
+                      rows.contains(where: { $0.key.jobID == jobID && $0.actions.contains(action) }) else { return false }
+                Task {
+                    switch action {
+                    case .claim: await editor.claimWish(jobID: id)
+                    case .askResidentToFetch: await editor.askResidentToFetch(jobID: id)
+                    case .retry: await editor.retryWish(jobID: id)
+                    case .retryInventoryRegistration: await editor.retryWishInventory(jobID: id)
+                    default: break
+                    }
+                }
+            case "stage.props.withdraw", "stage.props.delete":
+                let id = objectID ?? editor.selectedID
+                let action: OwnershipRowAction = op == "stage.props.delete" ? .delete : .withdraw
+                guard let id, rows.contains(where: { $0.key.objectID == id && $0.actions.contains(action) }) else { return false }
+                Task {
+                    if editor.selectedID != id { await editor.select(objectID: id) }
+                    guard editor.selectedID == id else { return }
+                    if action == .delete { await editor.deleteSelected() } else { await editor.withdraw() }
+                }
+            case "stage.props.hold":
+                let point: PropAttachmentPoint?
+                if let raw = command["point"] as? String { guard let parsed = PropAttachmentPoint(rawValue: raw) else { return false }; point = parsed }
+                else { point = nil }
+                guard editor.selectedID != nil else { return false }
+                Task { await editor.holdSelected(at: point) }
+            case "stage.props.return": Task { await editor.returnSelected() }
+            case "stage.props.nudge":
+                let y = (command["y"] as? NSNumber)?.floatValue ?? 0
+                let z = (command["z"] as? NSNumber)?.floatValue ?? 0
+                guard y.isFinite, z.isFinite, abs(y) <= 0.02, abs(z) <= 0.02 else { return false }
+                Task { await editor.nudgeHeld(y: y, z: z) }
+            case "stage.props.rotate":
+                guard let direction = command["direction"] as? NSNumber, [-1, 1].contains(direction.intValue) else { return false }
+                Task { await editor.rotateHeld(direction.floatValue) }
+            case "stage.props.resize":
+                guard let value = command["value"] as? NSNumber, value.floatValue.isFinite else { return false }
+                Task { await editor.resize(toLongestEdge: value.floatValue) }
+            case "stage.props.undo": guard editor.snapshot.canUndo else { return false }; Task { await editor.undo() }
+            default: return false
+            }
+        }
+        return true
+    }
+
+    func gpuiToggleDestination() -> Bool {
+        guard let renderer = stageRenderSurfaceController,
+              renderer.owner == .gpuiFullStage || renderer.owner == .gpuiLiveCam else { return false }
+        // The original product actions call show() and transfer the single
+        // surface to native windows. This presentation seam keeps that same
+        // renderer mounted in GPUI while changing only the existing world mode.
+        stageWindowController?.gpuiPropEditorState.close()
+        if spatialStage.isWorldPresentationRequested { spatialStage.exitWorld() }
+        else {
+            if livingWorldContext == nil { configureLivingWorld() }
+            spatialStage.requestWorldPresentation()
+            if renderer.owner == .gpuiFullStage { stageCameraCoordinator?.activateFullStage() }
+            installScreenOverlayIfNeeded()
+        }
+        return true
+    }
+
+    func gpuiAutonomySnapshot() -> [String: Any] {
+        guard let presentation = stageWindowController?.gpuiWishTasks else {
+            return ["available": false, "tasks": []]
+        }
+        return ["available": true, "switchOn": presentation.isAutonomySwitchOn,
+            "stopped": presentation.isAutonomyStoppedByUser,
+            "resumeFailure": presentation.autonomyResumeFailure as Any? ?? NSNull(),
+            "connectivityNotice": presentation.connectivityNotice as Any? ?? NSNull(),
+            "tasks": presentation.tasks.map {
+                ["id": $0.id.uuidString, "title": $0.title, "status": $0.currentStatusLine,
+                 "detail": $0.detail as Any? ?? NSNull(), "isTerminal": $0.isTerminal,
+                 "autoContinuationPaused": $0.autoContinuationPaused] as [String: Any]
+            }]
+    }
+
+    func gpuiAutonomyCommand(_ command: [String: Any]) -> Bool {
+        guard let op = command["op"] as? String,
+              let presentation = stageWindowController?.gpuiWishTasks else { return false }
+        switch op {
+        case "stage.autonomy.resume": presentation.resumeAutonomy()
+        case "stage.autonomy.off":
+            UserDefaults.standard.set(false, forKey: ResidentAutonomySwitch.defaultsKey)
+            NotificationCenter.default.post(name: ResidentAutonomySwitch.didChangeNotification, object: nil)
+        default: return false
+        }
+        return true
+    }
+
+    func gpuiChatFocus() {
+        spatialStage.clearMovement()
+        spatialStage.setSpeedBoosted(false)
+    }
+
+    private func gpuiAudioFeaturesSnapshot() -> [String: Any] {
+        let features = audioFeatures.current
+        return ["amplitude": features.amplitude, "low": features.low, "mid": features.mid,
+            "high": features.high, "waveform": (0..<8).map { features.waveform[$0] }]
+    }
+
+    func gpuiInboxSnapshot() -> [String: Any] {
+        let context = currentResidentWorldContext()
+        let rows = context.worldID.map { worldID in
+            residentSystemInboxStore.entries(worldID: worldID, residentScope: context.sessionScope)
+        } ?? []
+        return ["scope": residentTranscriptScopeKey,
+                "persistenceError": residentSystemInboxStore.persistenceError as Any? ?? NSNull(),
+                "entries": rows.map { entry -> [String: Any] in
+                    ["id": entry.id, "title": entry.title, "status": entry.status,
+                     "detail": entry.detail, "isRead": entry.isRead,
+                     "updatedAt": entry.updatedAt.timeIntervalSince1970,
+                     "updatedAtText": entry.updatedAt.formatted(date: .abbreviated, time: .shortened)]
+                }]
+    }
+
+    func gpuiOpenInboxEntry(id: String, scope: String) -> Bool {
+        let context = currentResidentWorldContext()
+        guard scope == residentTranscriptScopeKey, let worldID = context.worldID,
+              residentSystemInboxStore.entries(worldID: worldID, residentScope: context.sessionScope)
+                .contains(where: { $0.id == id }) else { return false }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            _ = await self.residentSystemInboxStore.markRead(taskKey: id, worldID: worldID,
+                                                            residentScope: context.sessionScope)
+            self.pushSystemInboxSnapshots()
+        }
+        return true
+    }
+
+    func gpuiRestoreInbox() {
+        let context = currentResidentWorldContext()
+        guard let worldID = context.worldID else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.residentSystemInboxStore.restore(worldID: worldID, residentScope: context.sessionScope)
+            self.pushSystemInboxSnapshots()
+        }
+    }
+
+    func gpuiAttachmentSnapshot() -> [String: Any] {
+        guard let store = stageWindowController?.gpuiAttachmentStore else {
+            return ["attachments": [], "isPreparing": false, "error": "居民输入尚未准备好。"]
+        }
+        return ["attachments": store.attachments.map { image in
+            ["id": image.id.uuidString, "path": image.url.path, "name": image.displayName]
+        }, "isPreparing": store.isPreparing, "error": store.errorMessage as Any? ?? NSNull()]
+    }
+
+    func gpuiAttachmentCommand(_ command: [String: Any]) -> Bool {
+        guard let store = stageWindowController?.gpuiAttachmentStore,
+              let op = command["op"] as? String else { return false }
+        switch op {
+        case "chat.attachments.pick": store.chooseImages()
+        case "chat.attachments.paste": return store.paste(from: .general)
+        case "chat.attachments.remove":
+            guard let raw = command["id"] as? String, let id = UUID(uuidString: raw),
+                  store.attachments.contains(where: { $0.id == id }) else { return false }
+            store.remove(id: id)
+        case "chat.attachments.import":
+            guard let paths = command["paths"] as? [String], !paths.isEmpty,
+                  paths.allSatisfy({ $0.hasPrefix("/") }) else { return false }
+            Task { await store.add(urls: paths.map { URL(fileURLWithPath: $0) }) }
+        default: return false
+        }
+        return true
+    }
+
+    func gpuiBuildSubmission(text: String, attachmentIDs: [String]) -> ResidentChatSubmission? {
+        guard let store = stageWindowController?.gpuiAttachmentStore, store.canSubmit else { return nil }
+        let current = store.attachments
+        guard current.map({ $0.id.uuidString }) == attachmentIDs else { return nil }
+        let submission = ResidentChatSubmission(text: text, attachments: current)
+        guard submission.canSend else { return nil }
+        _ = store.takeAttachments()
+        return submission
+    }
+
+    func gpuiStopSpeech() { agentSpeechAnnouncer.stop() }
+
+    func gpuiRestoreAttachments(_ attachments: [ResidentImageAttachment]) {
+        stageWindowController?.gpuiAttachmentStore.restore(attachments)
+    }
+
+    func gpuiStageSnapshot() -> [String: Any] {
+        let position = spatialStage.avatarPlacement.position
+        let activities = LivingWorldActivityMenuStore.shared
+        let canRun = StageActivityAvailability.canRun(isWorldVisible: spatialStage.isWorldVisible,
+            selectedWorldID: spatialStage.selectedWorldID, activityWorldID: activities.worldID)
+        return [
+            "mode": spatialStage.isWorldPresentationRequested ? "space" : "player",
+            "space": [
+                "worlds": marbleWorldLibrary.publicExampleWorlds.map { ["id": $0.id, "name": $0.name] },
+                "presets": SpatialScenePreset.allCases.map { ["id": $0.rawValue, "name": $0.displayName] },
+                "selectedWorldID": spatialStage.selectedWorldID as Any? ?? NSNull(),
+                "worldLabel": marbleWorldLibrary.selectedWorld?.isPublicExample == true
+                    ? marbleWorldLibrary.selectedWorld?.name ?? "公开空间" : "公开空间 · 无需生成",
+                "position": ["X": position.x, "Y": position.y, "Z": position.z],
+                "isVisible": spatialStage.isWorldVisible,
+                "isRequested": spatialStage.isWorldPresentationRequested,
+                "notice": marbleWorldLibrary.generationMessage ?? marbleWorldLibrary.errorMessage as Any? ?? NSNull()
+            ] as [String: Any],
+            "activities": [
+                "items": activities.items.map { ["id": $0.id, "name": $0.name] },
+                "canRun": canRun, "activeID": activities.activeActivityID as Any? ?? NSNull(),
+                "message": canRun ? activities.message as Any? ?? NSNull()
+                    : StageActivityAvailability.unavailableMessage(isWorldVisible: spatialStage.isWorldVisible,
+                        isWorldPresentationRequested: spatialStage.isWorldPresentationRequested)
+            ] as [String: Any],
+            "player": [
+                "lyrics": StageLyricsVisualMode.allCases.map { ["id": $0.agentValue, "name": $0.displayName] },
+                "lyricID": stageLyrics.visualMode.agentValue,
+                "clouds": StagePointCloudChoice.allCases.map { ["id": $0.rawValue, "name": $0.title] },
+                "cloudID": stageVisualDirections.currentPointCloudChoice.rawValue,
+                "particleScale": stageVisualDirections.particleSizeMultiplier,
+                "particleMinimum": StageParticleSizing.manualRange.lowerBound,
+                "particleMaximum": StageParticleSizing.manualRange.upperBound,
+                "videoModes": StageVideoPlaybackMode.allCases.map { ["id": $0.rawValue, "name": $0.displayName] },
+                "videoMode": stageVideos.mode.rawValue, "videoActive": stageVideos.isActive,
+                "videoAssetID": stageVideos.activeAssetID as Any? ?? NSNull(),
+                "videoBrightness": stageVideos.brightness,
+                "videoAssets": stageVideos.assets.map { ["id": $0.id, "name": $0.displayName] },
+                "trackID": programStore.activeSlot?.track.id as Any? ?? NSNull(),
+                "boundVideoID": programStore.activeSlot.flatMap { stageVideos.boundAsset(for: $0.track.id)?.id } as Any? ?? NSNull()
+            ] as [String: Any]
+        ]
+    }
+
+    func gpuiStageCommand(_ command: [String: Any]) -> Bool {
+        guard let op = command["op"] as? String else { return false }
+        switch op {
+        case "stage.load": break
+        case "stage.world.enter":
+            guard let id = command["id"] as? String,
+                  marbleWorldLibrary.publicExampleWorlds.contains(where: { $0.id == id }) else { return false }
+            spatialStage.requestWorldPresentation()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if await self.marbleWorldLibrary.select(worldID: id) == nil { self.spatialStage.exitWorld() }
+            }
+        case "stage.scene.activate":
+            guard let id = command["id"] as? String, let preset = SpatialScenePreset(rawValue: id) else { return false }
+            spatialStage.requestWorldPresentation()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.marbleWorldLibrary.activate(preset: preset)
+                if self.marbleWorldLibrary.errorMessage != nil { self.spatialStage.exitWorld() }
+            }
+        case "stage.avatar.position":
+            guard let name = command["axis"] as? String, let axis = SpatialAvatarPositionAxis(rawValue: name.uppercased()),
+                  let value = command["value"] as? Double, value.isFinite else { return false }
+            let range: ClosedRange<Double> = axis == .z ? -3...3 : -2...2
+            guard range.contains(value) else { return false }
+            spatialStage.setAvatarPosition(Float(value), axis: axis)
+        case "stage.avatar.reset": spatialStage.resetAvatarPosition()
+        case "stage.camera.reset": spatialStage.resetCamera()
+        case "stage.activity.run":
+            guard let id = command["id"] as? String,
+                  LivingWorldActivityMenuStore.shared.items.contains(where: { $0.id == id }) else { return false }
+            runLivingWorldActivity(id: id)
+        case "stage.activity.stop": stopLivingWorldActivity()
+        case "stage.player.lyrics":
+            guard let id = command["id"] as? String,
+                  let mode = StageLyricsVisualMode.allCases.first(where: { $0.agentValue == id }) else { return false }
+            stageLyrics.setVisualMode(mode)
+        case "stage.player.cloud":
+            guard let id = command["id"] as? String, let choice = StagePointCloudChoice(rawValue: id) else { return false }
+            stageVisualDirections.selectPointCloud(choice)
+        case "stage.player.particles":
+            guard let value = command["value"] as? Double, value.isFinite,
+                  StageParticleSizing.manualRange.contains(Float(value)) else { return false }
+            stageVisualDirections.setParticleSizeMultiplier(Float(value))
+        case "stage.video.mode":
+            guard let id = command["id"] as? String, let mode = StageVideoPlaybackMode(rawValue: id) else { return false }
+            stageVideos.setMode(mode)
+        case "stage.video.brightness":
+            guard let value = command["value"] as? Double, value.isFinite, (0.15...1).contains(value) else { return false }
+            stageVideos.setBrightness(Float(value))
+        case "stage.video.stop": stageVideos.stop()
+        case "stage.video.import":
+            let panel = NSOpenPanel()
+            panel.allowedContentTypes = [.mpeg4Movie]; panel.allowsMultipleSelection = true
+            panel.canChooseDirectories = false; panel.canChooseFiles = true; panel.prompt = "导入"
+            panel.message = "选择要与 3D 点阵叠加的 MP4 片段"
+            panel.begin { [weak self] response in
+                guard response == .OK else { return }
+                Task { @MainActor in self?.stageVideos.add(panel.urls) }
+            }
+        case "stage.video.toggle", "stage.video.bind", "stage.video.remove":
+            guard let id = command["id"] as? String, stageVideos.assets.contains(where: { $0.id == id }) else { return false }
+            if op == "stage.video.toggle" { stageVideos.toggle(id) }
+            else if op == "stage.video.remove" { stageVideos.remove(id) }
+            else {
+                guard let track = programStore.activeSlot?.track else { return false }
+                stageVideos.bind(id, to: track.id)
+            }
+        case "stage.video.unbind":
+            guard let track = programStore.activeSlot?.track else { return false }
+            stageVideos.unbind(trackID: track.id)
+        default: return false
+        }
+        return true
+    }
+
     func gpuiAttachSurface(_ container: NSView, fullStage: Bool) -> Bool {
         guard let controller = stageRenderSurfaceController else { return false }
         // Existing native windows retain their .fullStage/.liveCam ownership;
@@ -374,9 +829,10 @@ extension AppDelegate {
         liveCamWindowController?.hide()
         stageWindowController?.window?.orderOut(nil)
         if fullStage {
-            spatialStage.requestWorldPresentation()
-            stageCameraCoordinator?.activateFullStage()
+            if spatialStage.isWorldPresentationRequested { stageCameraCoordinator?.activateFullStage() }
         } else {
+            stageWindowController?.detachGPUIWorldInteraction()
+            gpuiChatFocus()
             stageCameraCoordinator?.activateLiveCam()
         }
         if fullStage {
@@ -436,6 +892,8 @@ extension AppDelegate {
             "statusNotice": (stageWindowController?.residentStatusText ?? liveCamWindowController?.residentStatusText) as Any? ?? NSNull(),
             "ttsError": AgentSpeechStatusStore.shared.lastErrorMessage as Any? ?? NSNull(),
             "isSpeaking": AgentSpeechStatusStore.shared.isSpeaking,
+            "voiceActive": RealtimeVoiceStatusStore.shared.state == .listening,
+            "voiceState": String(describing: RealtimeVoiceStatusStore.shared.state),
             "autonomyStopped": loop?.isAutonomyPausedByUser ?? false,
             "queuedMessages": loop?.pendingUserMessages.count ?? 0,
             "unconfirmedMessages": loop?.unconfirmedUserMessages.count ?? 0,
@@ -449,6 +907,7 @@ extension AppDelegate {
             "worldToolsEnabled": true,
             "scope": residentTranscriptScopeKey,
             "surfaceOwner": String(describing: stageRenderSurfaceController?.owner ?? .detached),
+            "screenOperation": screenStore?.gpuiScreenOperationSnapshot ?? ["available": false, "active": false],
             "transcript": residentChatTranscript.lines().map { line in
                 ["turnID": line.turnID.uuidString,
                  "role": line.speaker == .user ? "user" : line.speaker == .resident ? "agent" : "notice",
@@ -475,6 +934,9 @@ extension AppDelegate {
         case "chooseLocalTrack": chooseLocalTrack()
         case "closeStage": closeStage()
         case "stopResident": gpuiCancelResident()
+        case "toggleScreenOperation":
+            guard let handler = stageWindowController?.onToggleScreenOperation else { return false }
+            handler()
         default: return false
         }
         return true

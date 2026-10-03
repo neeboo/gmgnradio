@@ -21,12 +21,16 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
     private var draft = ""
     private var statusNotice: String?
     private var observedScope: String?
+    private var navigationRevision: UInt64 = 0
+    private var navigationMode = "space"
+    private var navigationPanel: String?
     private lazy var settings = GPUIProductSettings(runtime: runtime)
+    private lazy var programSelection = runtime.gpuiMakeProgramSelection()
 
     override init() {
         runtime = AppDelegate()
         super.init()
-        runtime.gpuiOpenSettings = { [weak self] in self?.showSettings() }
+        runtime.gpuiOpenSettings = { [weak self] in _ = self?.action("showSettings") }
         runtime.gpuiResidentRecovery = { [weak self] submission, notice in
             guard let self, let id = submissions[submission.id], !completed.contains(submission.id) else { return }
             completed.insert(submission.id)
@@ -74,9 +78,14 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
         statusItem = nil
     }
 
-    func send(requestID: UInt64, text: String) -> Bool {
+    func send(requestID: UInt64, text: String, attachmentIDs: [String]? = nil) -> Bool {
         guard started, !stopped, !submissions.values.contains(requestID) else { return false }
-        let submission = ResidentChatSubmission(text: text.trimmingCharacters(in: .whitespacesAndNewlines))
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let submission: ResidentChatSubmission
+        if let attachmentIDs {
+            guard let built = runtime.gpuiBuildSubmission(text: trimmed, attachmentIDs: attachmentIDs) else { return false }
+            submission = built
+        } else { submission = ResidentChatSubmission(text: trimmed) }
         guard submission.canSend else { return false }
         submissions[submission.id] = requestID
         observedScope = runtime.gpuiChatSnapshot()["scope"] as? String
@@ -85,11 +94,16 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
         statusNotice = nil
         enqueue(["requestID": requestID, "kind": "accepted", "text": submission.text])
         tasks[requestID] = Task { [weak self] in
-            guard let self, !stopped, !Task.isCancelled else { return }
+            guard let self else { return }
+            guard !stopped, !Task.isCancelled else {
+                runtime.gpuiRestoreAttachments(submission.attachments)
+                return
+            }
             defer { tasks[requestID] = nil }
             do {
                 try await runtime.gpuiSubmit(submission)
             } catch {
+                runtime.gpuiRestoreAttachments(submission.attachments)
                 guard !stopped, !completed.contains(submission.id) else { return }
                 completed.insert(submission.id)
                 draft = submission.text
@@ -153,8 +167,35 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
             enqueue(["requestID": requestID, "kind": "completed"])
         }
         state["draft"] = draft
-        state["settings"] = settings.snapshot
+        let settingsState = settings.snapshot
+        state["settings"] = settingsState
+        var stageState = runtime.gpuiStageSnapshot()
+        if let presence = settingsState["presence"] as? [String: Any] {
+            stageState["motions"] = ["avatarName": presence["avatarName"] ?? NSNull(),
+                "categories": presence["categories"] ?? [], "items": presence["motions"] ?? [],
+                "activeID": presence["activeMotionID"] ?? NSNull(), "isWorking": presence["working"] ?? false,
+                "notice": presence["motionNotice"] ?? NSNull(), "message": presence["notice"] ?? NSNull()]
+        }
+        stageState["stageRadioPluginEnabled"] = RadioPluginAvailability.isEnabled()
+        state["stage"] = stageState
+        state["stageProgramRail"] = runtime.gpuiProgramSnapshot(programSelection)
+        state["propEditor"] = runtime.gpuiPropSnapshot()
+        let autonomy = runtime.gpuiAutonomySnapshot()
+        state["autonomy"] = autonomy
+        if let stopped = autonomy["stopped"] as? Bool { state["autonomyStopped"] = stopped }
+        state["inbox"] = runtime.gpuiInboxSnapshot()
+        let attachments = runtime.gpuiAttachmentSnapshot()
+        state["attachments"] = (attachments["attachments"] as? [[String: String]] ?? []).map { image in
+            ["id": image["id"] ?? "", "path": image["path"] ?? "", "name": image["name"] ?? "", "fileName": image["name"] ?? "",
+             "previewPath": image["path"] ?? ""]
+        }
+        state["attachmentsPreparing"] = attachments["isPreparing"]
+        state["attachmentError"] = attachments["error"]
+        state["isPreparing"] = attachments["isPreparing"]
+        state["error"] = attachments["error"]
         state["contextID"] = state["scope"]
+        state["uiNavigation"] = ["revision": navigationRevision, "mode": navigationMode,
+            "panel": navigationPanel as Any? ?? NSNull(), "settingsPage": navigationSettingsPage]
         if let latest = lines.last(where: { $0["role"] == "agent" })?["text"], (state["reply"] as? String ?? "").isEmpty {
             state["reply"] = latest
         }
@@ -171,11 +212,84 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
 
     func action(_ action: String) -> Bool {
         guard started, !stopped else { return false }
+        switch action {
+        case "showLiveCam": return navigate(mode: "liveCam")
+        case "showStage": return navigate(mode: "space")
+        case "showPlayer": return navigate(mode: "player")
+        case "showSettings": return navigate(mode: navigationMode, panel: "settings")
+        case "showNotifications": return navigate(mode: navigationMode, panel: "inbox")
+        case "toggleDecoration":
+            guard navigate(mode: "space") else { return false }
+            return runtime.gpuiPropCommand(["op": "stage.props.toggle"])
+        default: break
+        }
         return runtime.gpuiPerformAction(action)
+    }
+
+    private func navigate(mode: String, panel: String? = nil) -> Bool {
+        if mode == "space" || mode == "player" {
+            let actual = runtime.gpuiStageSnapshot()["mode"] as? String
+            if actual != mode, !runtime.gpuiToggleDestination() { return false }
+        }
+        navigationMode = mode; navigationPanel = panel
+        navigationRevision &+= 1
+        return true
+    }
+
+    private var navigationSettingsPage: String {
+        switch GMGNSettingsNavigation.shared.page {
+        case .presence: "presence"; case .music: "music"; case .space: "space"
+        case .shortcuts: "shortcuts"; case .agent: "agent"
+        }
+    }
+
+    func attachSurface(_ container: NSView, fullStage: Bool) -> Bool {
+        guard runtime.gpuiAttachSurface(container, fullStage: fullStage) else { return false }
+        navigationMode = fullStage ? runtime.gpuiStageSnapshot()["mode"] as? String ?? "space" : "liveCam"
+        return true
+    }
+
+    func reopen() -> Bool {
+        navigate(mode: navigationMode)
     }
 
     func settingsCommand(_ value: [String: Any]) -> Bool {
         guard started, !stopped else { return false }
+        if let op = value["op"] as? String, op.hasPrefix("stage.") {
+            if op == "stage.destination.toggle" { return runtime.gpuiToggleDestination() }
+            if op.hasPrefix("stage.autonomy.") { return runtime.gpuiAutonomyCommand(value) }
+            if op.hasPrefix("stage.program.") || op == "stage.playlist.open" {
+                return runtime.gpuiProgramCommand(value, selection: programSelection)
+            }
+            if op.hasPrefix("stage.props.") { return runtime.gpuiPropCommand(value) }
+            if op == "stage.motion.refresh" {
+                return settings.command(["op": "presence.load"])
+            }
+            if op == "stage.motion.activate" {
+                var command = value
+                command["op"] = "presence.motion"
+                return settings.command(command)
+            }
+            return runtime.gpuiStageCommand(value)
+        }
+        switch value["op"] as? String {
+        case "chat.send":
+            guard let id = value["requestID"] as? NSNumber, let text = value["text"] as? String,
+                  let ids = value["attachmentIDs"] as? [String] else { return false }
+            return send(requestID: id.uint64Value, text: text, attachmentIDs: ids)
+        case "chat.attachments.pick", "chat.attachments.paste", "chat.attachments.import", "chat.attachments.remove":
+            return runtime.gpuiAttachmentCommand(value)
+        case "chat.voice.begin": runtime.beginResidentVoiceFromStage(); return true
+        case "chat.voice.finish": runtime.finishResidentVoiceFromStage(); return true
+        case "chat.speech.stop": runtime.gpuiStopSpeech(); return true
+        case "chat.focus": runtime.gpuiChatFocus(); return true
+        case "chat.task.stop": return runtime.gpuiPerformAction("stopResident")
+        case "inbox.open":
+            guard let id = value["id"] as? String, let scope = value["scope"] as? String else { return false }
+            return runtime.gpuiOpenInboxEntry(id: id, scope: scope)
+        case "inbox.restore": runtime.gpuiRestoreInbox(); return true
+        default: break
+        }
         return settings.command(value)
     }
 
@@ -249,9 +363,11 @@ private final class GPUIProductSettings {
     private let client = RustVoiceClient(root: E2ERuntime.productSupportDirectory()
         .appendingPathComponent("TaskService", isDirectory: true))
     private let previewStatus = AgentSpeechStatusStore()
+    private lazy var parity = GPUISettingsParity(runtime: runtime)
     private var preview: RustSpeechSynthesizer?
     private var capabilities: RustVoiceCapabilities?
     private var capabilitiesTask: Task<Void, Never>?
+    private var accountTask: Task<Void, Never>?
     private var voicesTask: Task<Void, Never>?
     private var provider: RustVoiceProvider
     private var model: String
@@ -283,7 +399,7 @@ private final class GPUIProductSettings {
         let availableProviders = capabilities?.providers.filter { !$0.ttsModels.isEmpty }.map {
             ["id": $0.id, "name": providerName($0.id)]
         } ?? []
-        return [
+        var result: [String: Any] = [
             "agent": [
                 "backendID": service.effectiveBackendID.rawValue,
                 "backends": AgentConversationBackends.all.map { backend in
@@ -314,6 +430,19 @@ private final class GPUIProductSettings {
                 "catalogLoaded": capabilities != nil,
             ],
         ]
+        for (key, value) in parity.snapshot { result[key] = value }
+        let asr = speech.configuration(for: "asr", includesEnvironment: false)
+        let asrCaps = capabilities?.providers.first(where: { $0.id == asr.provider.rawValue })
+        result["asr"] = ["providerID": asr.provider.rawValue, "modelID": asr.model ?? "",
+            "providers": capabilities?.providers.filter { !$0.asrModels.isEmpty }.map { ["id": $0.id, "name": providerName($0.id)] } ?? [],
+            "models": (asrCaps?.asrModels ?? []).map { ["id": $0.id, "name": $0.name] },
+            "credentialConfigured": !speech.configuration(for: "asr").apiKey.isEmpty,
+            "catalogLoaded": capabilities != nil, "captureTestPaused": true] as [String: Any]
+        var agentValue = result["agent"] as? [String: Any] ?? [:]
+        agentValue["codexState"] = agent.codexState.isSignedIn ? "signedIn" : agent.codexState == .unavailable ? "unavailable" : "signedOut"
+        agentValue["working"] = agent.isWorking
+        result["agent"] = agentValue
+        return result
     }
 
     func command(_ value: [String: Any]) -> Bool {
@@ -322,6 +451,26 @@ private final class GPUIProductSettings {
         case "settings.load":
             agent.refreshConversationBackends()
             loadCapabilities()
+            parity.load()
+        case "agent.status", "agent.login", "agent.logout":
+            guard !agent.isWorking, accountTask == nil else { return false }
+            accountTask = Task { [weak self] in
+                guard let self else { return }
+                defer { accountTask = nil }
+                if op == "agent.login" { await agent.connectCodex() }
+                else if op == "agent.logout" { await agent.disconnectCodex() }
+                else { await agent.refresh() }
+            }
+        case "asr.provider", "asr.save":
+            guard let raw = (value["providerID"] ?? value["id"]) as? String,
+                  let selected = RustVoiceProvider(rawValue: raw),
+                  let caps = capabilities?.providers.first(where: { $0.id == raw }), !caps.asrModels.isEmpty else { return false }
+            let old = speech.configuration(provider: selected, for: "asr", includesEnvironment: false)
+            let chosen = value["modelID"] as? String ?? old.model ?? caps.defaultASRModel ?? ""
+            guard caps.asrModels.contains(where: { $0.id == chosen }) else { return false }
+            let replacement = (value["apiKey"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            speech.save(RustVoiceConfiguration(provider: selected, apiKey: replacement.isEmpty ? old.apiKey : replacement,
+                voiceID: old.voiceID, model: chosen), for: "asr")
         case "agent.save":
             // Use the original model validation/persistence and notify the
             // original runtime. No credentials, provider or login override.
@@ -354,7 +503,11 @@ private final class GPUIProductSettings {
             voiceID = saved.voiceID
             voices = []
             notice = nil
-        case "tts.refresh": refreshVoices()
+        case "tts.refresh":
+            if value["providerID"] != nil {
+                guard let configuration = selectedConfiguration(value) else { return false }
+                refreshVoices(configuration: configuration)
+            } else { refreshVoices() }
         case "tts.save", "tts.preview":
             guard let configuration = selectedConfiguration(value) else { return false }
             provider = configuration.provider
@@ -363,7 +516,8 @@ private final class GPUIProductSettings {
             preview?.stopSpeaking()
             if op == "tts.save" {
                 let savedKey = speech.configuration(provider: provider, for: "tts", includesEnvironment: false).apiKey
-                speech.save(RustVoiceConfiguration(provider: provider, apiKey: savedKey,
+                let replacement = (value["apiKey"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                speech.save(RustVoiceConfiguration(provider: provider, apiKey: replacement.isEmpty ? savedKey : replacement,
                     voiceID: voiceID, model: model), for: "tts")
                 notice = "已保存。"
             } else {
@@ -373,7 +527,7 @@ private final class GPUIProductSettings {
                 synthesizer.speak("你好，这是当前选中的声音。欢迎来到你的生活空间。")
             }
         case "tts.stop": preview?.stopSpeaking(); preview = nil
-        default: return false
+        default: return parity.command(value)
         }
         return true
     }
@@ -388,7 +542,8 @@ private final class GPUIProductSettings {
             return nil
         }
         let available = speech.configuration(provider: selected, for: "tts")
-        return RustVoiceConfiguration(provider: selected, apiKey: available.apiKey,
+        let replacement = (value["apiKey"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return RustVoiceConfiguration(provider: selected, apiKey: replacement.isEmpty ? available.apiKey : replacement,
             voiceID: voice.trimmingCharacters(in: .whitespacesAndNewlines), model: modelID)
     }
 
@@ -413,14 +568,14 @@ private final class GPUIProductSettings {
         }
     }
 
-    private func refreshVoices() {
+    private func refreshVoices(configuration override: RustVoiceConfiguration? = nil) {
         voicesTask?.cancel()
         generation &+= 1
         let lease = generation
         let available = speech.configuration(provider: provider, for: "tts")
-        let configuration = RustVoiceConfiguration(provider: provider, apiKey: available.apiKey,
+        let configuration = override ?? RustVoiceConfiguration(provider: provider, apiKey: available.apiKey,
             voiceID: voiceID, model: model.isEmpty ? nil : model)
-        guard provider == .bailian || !configuration.apiKey.isEmpty else {
+        guard configuration.provider == .bailian || !configuration.apiKey.isEmpty else {
             voices = []
             loadingVoices = false
             notice = "该服务尚未配置密钥，请在原语音设置中配置后刷新。"
@@ -453,6 +608,8 @@ private final class GPUIProductSettings {
     }
 
     func close() {
+        parity.close()
+        accountTask?.cancel(); accountTask = nil
         stopVoiceWork()
         capabilitiesTask?.cancel(); capabilitiesTask = nil
         loadingCapabilities = false
@@ -541,7 +698,7 @@ func gmgnProductHostStringFree(_ string: UnsafeMutablePointer<CChar>?) { free(st
 
 @_cdecl("gmgn_product_host_reopen")
 func gmgnProductHostReopen(_ pointer: UnsafeMutableRawPointer?, _ hasVisibleWindows: Int32) -> Int32 {
-    withProductHost(pointer) { $0.runtime.applicationShouldHandleReopen(NSApplication.shared, hasVisibleWindows: hasVisibleWindows != 0) ? 1 : 0 } ?? 0
+    withProductHost(pointer) { $0.reopen() ? 1 : 0 } ?? 0
 }
 
 @_cdecl("gmgn_product_host_attach_surface")
@@ -550,7 +707,7 @@ func gmgnProductHostAttachSurface(_ pointer: UnsafeMutableRawPointer?, _ contain
     let address = UInt(bitPattern: container)
     return withProductHost(pointer) {
         let view = Unmanaged<NSView>.fromOpaque(UnsafeMutableRawPointer(bitPattern: address)!).takeUnretainedValue()
-        return $0.runtime.gpuiAttachSurface(view, fullStage: fullStage != 0) ? 1 : 0
+        return $0.attachSurface(view, fullStage: fullStage != 0) ? 1 : 0
     } ?? 0
 }
 

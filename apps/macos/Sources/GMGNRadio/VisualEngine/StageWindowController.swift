@@ -469,6 +469,10 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     }
     var residentStatusText: String? { residentChat.statusNotice }
 #if GMGN_GPUI_PRODUCT_BOOTSTRAP
+    var gpuiAttachmentStore: ResidentAttachmentStore { residentChat.images }
+    var gpuiPropEditorState: ResidentPropEditorState { residentPropEditor }
+    var gpuiWishTasks: WishMachineTaskPresentationStore { wishMachineTasks }
+
     /// Reparent the existing production input surface alongside the same Metal
     /// surface. Its camera, placement and keyboard callbacks remain unchanged.
     func attachGPUIWorldInteraction(to container: NSView) -> Bool {
@@ -476,6 +480,10 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         guard let stageContentView else { return false }
         stageContentView.attachGPUIWorldInteraction(to: container)
         return true
+    }
+
+    func detachGPUIWorldInteraction() {
+        stageContentView?.restoreNativeWorldInteraction()
     }
 #endif
     func restoreResidentSubmission(_ submission: ResidentChatSubmission, notice: String) {
@@ -857,6 +865,10 @@ private final class StageContentView: NSView {
         worldInteractionView.frame = container.bounds
         worldInteractionView.autoresizingMask = [.width, .height]
         container.addSubview(worldInteractionView)
+        screenOverlayContainer.removeFromSuperview()
+        screenOverlayContainer.frame = container.bounds
+        screenOverlayContainer.autoresizingMask = [.width, .height]
+        container.addSubview(screenOverlayContainer, positioned: .above, relativeTo: worldInteractionView)
         container.window?.acceptsMouseMovedEvents = true
     }
 
@@ -865,6 +877,10 @@ private final class StageContentView: NSView {
         worldInteractionView.removeFromSuperview()
         worldInteractionView.frame = bounds
         addSubview(worldInteractionView, positioned: .above, relativeTo: renderSurfaceContainer)
+        screenOverlayContainer.removeFromSuperview()
+        screenOverlayContainer.frame = bounds
+        screenOverlayContainer.autoresizingMask = [.width, .height]
+        addSubview(screenOverlayContainer, positioned: .above, relativeTo: worldInteractionView)
         window?.acceptsMouseMovedEvents = true
     }
 #endif
@@ -1593,7 +1609,7 @@ private final class StageContentView: NSView {
     /// 开面板时同一个出口），不新造机制。`.notice` 打出**交回前**的 owner，与门禁那条配对：
     /// 真机上"点完行之后焦点有没有回到场景"一眼可读。
     private func returnSceneFocus(trigger: String) {
-        guard let window else { return }
+        guard let window = worldInteractionView.window else { return }
         let before = window.firstResponder.map { String(describing: type(of: $0)) } ?? "nil"
         window.makeFirstResponder(worldInteractionView)
         StageWindowController.log.notice(

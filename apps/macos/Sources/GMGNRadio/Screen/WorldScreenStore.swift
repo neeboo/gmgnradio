@@ -67,6 +67,11 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
 
     private let spatialStage: SpatialStageStore
     private let overlay: WorldScreenOverlayController
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+    var gpuiScreenOperationSnapshot: [String: Bool] {
+        ["available": overlay.hasLiveScreen, "active": overlay.isOperatingScreen]
+    }
+#endif
     private let source: Source
     private let projectionProvider: @MainActor () -> WorldScreenProjection
     /// 网站链接原生播放：解析器 + AVPlayer 会话 + 场景取帧注册表。

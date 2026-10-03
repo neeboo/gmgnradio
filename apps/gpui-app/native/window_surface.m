@@ -5,15 +5,32 @@
 // the actual production render surface; there is no alternate scene/store.
 static const void *containerKey = &containerKey;
 static const void *compactKey = &compactKey;
+
+int gmgn_gpui_set_outer_size(void *viewPointer, double width, double height, double minWidth, double minHeight) {
+    if (![NSThread isMainThread] || !viewPointer) return 0;
+    NSWindow *window = ((__bridge NSView *)viewPointer).window;
+    if (!window) return 0;
+    NSRect frame = window.frame;
+    // Preserve the upper-left corner. AppKit computes the actual content rect
+    // for this window style; no fixed titlebar-height assumption is involved.
+    frame.origin.y += frame.size.height - height;
+    frame.size = NSMakeSize(width, height);
+    window.minSize = NSMakeSize(minWidth, minHeight);
+    [window setFrame:frame display:YES];
+    fprintf(stderr,"GMGN_GPUI_OUTER_SIZE width=%.0f height=%.0f content_width=%.0f content_height=%.0f\n",window.frame.size.width,window.frame.size.height,window.contentView.bounds.size.width,window.contentView.bounds.size.height);
+    return 1;
+}
 static const void *originalHitKey = &originalHitKey;
 static const void *originalMouseKey = &originalMouseKey;
-static const void *overlayKey = &overlayKey;
+static const void *regionsKey = &regionsKey;
 
 static NSView *productHitTest(NSView *self, SEL selector, NSPoint point) {
-    BOOL compact = [objc_getAssociatedObject(self, compactKey) boolValue];
     CGFloat topY = self.isFlipped ? point.y : self.bounds.size.height - point.y;
-    BOOL scene = ![objc_getAssociatedObject(self, overlayKey) boolValue] && (compact ? (topY < 168 && !(topY<36 && point.x>118)) : point.x >= 340);
-    if (scene) return nil;
+    BOOL interface = NO;
+    for (NSValue *region in objc_getAssociatedObject(self, regionsKey)) {
+        if (NSPointInRect(NSMakePoint(point.x,topY),region.rectValue)) {interface=YES;break;}
+    }
+    if (!interface) return nil;
     IMP original = [objc_getAssociatedObject(self, originalHitKey) pointerValue];
     return ((NSView *(*)(id, SEL, NSPoint))original)(self, selector, point);
 }
@@ -44,6 +61,8 @@ void *gmgn_gpui_surface_container(void *viewPointer, int compact) {
             gpui == content, parent == content);
         return NULL;
     }
+    objc_setAssociatedObject(gpui, compactKey, @(compact != 0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    window.level = compact ? NSFloatingWindowLevel : NSNormalWindowLevel;
     NSView *existing = objc_getAssociatedObject(gpui, containerKey);
     if (existing) return (__bridge void *)existing;
     NSView *container = [[NSView alloc] initWithFrame:gpui.frame];
@@ -90,7 +109,12 @@ int gmgn_gpui_has_visible_windows(void) {
     return 0;
 }
 
-void gmgn_gpui_ui_overlay(void *viewPointer, int visible) {
-    if (![NSThread isMainThread] || !viewPointer) return;
-    objc_setAssociatedObject((__bridge NSView *)viewPointer, overlayKey, @(visible != 0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+void gmgn_gpui_hit_regions(void *viewPointer,const double *regions,size_t count) {
+    if (![NSThread isMainThread] || !viewPointer || count>32) return;
+    NSMutableArray *values=[NSMutableArray arrayWithCapacity:count];
+    for(size_t i=0;i<count;i++) {
+        const double *r=regions+i*4;
+        [values addObject:[NSValue valueWithRect:NSMakeRect(r[0],r[1],r[2],r[3])]];
+    }
+    objc_setAssociatedObject((__bridge NSView *)viewPointer,regionsKey,values,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }

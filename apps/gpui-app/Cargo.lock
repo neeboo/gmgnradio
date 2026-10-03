@@ -2206,6 +2206,7 @@ dependencies = [
  "gmgn-gpui-ui",
  "gpui-kit",
  "raw-window-handle",
+ "rust-embed",
  "serde_json",
 ]
 

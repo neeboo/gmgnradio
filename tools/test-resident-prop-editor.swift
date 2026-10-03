@@ -398,6 +398,7 @@ final class CountingFloorCollision: WorldPropSupportQuerying, @unchecked Sendabl
 /// 抽取出来的 `inputOwnsFocus` 读它；结构断言已经把生产那一行的类型钉死）。
 @MainActor final class SceneInteractionStandIn {
  var isTextInputFocused: (() -> Bool)?
+ var window: FocusWindow?
 }
 /// `StageContentView` 里 responder 相关的两处接线 + 门禁判据（生产实现，逐字抽取）：
 /// `wireSceneInputOwnership()` 是**唯一**的接线处，`returnSceneFocus` 是焦点交回的唯一出口，
@@ -411,6 +412,7 @@ final class CountingFloorCollision: WorldPropSupportQuerying, @unchecked Sendabl
  let worldInteractionView = SceneInteractionStandIn()
  var window: FocusWindow? = FocusWindow()
  var lastLoggedSceneInputFocusOwner: String?
+ init() { worldInteractionView.window = window }
  \#(method("private func wireSceneInputOwnership(").replacingOccurrences(of:"private func",with:"func"))
  \#(method("private func residentComposerOwnsFirstResponder(").replacingOccurrences(of:"private func",with:"func"))
  \#(method("private func noteSceneInputGateBlocked(").replacingOccurrences(of:"private func",with:"func"))
@@ -764,6 +766,15 @@ typealias WorldAgentContext = LayoutContext
   await ownership.residentPropEditor.select(objectID:"cup")
   precondition(ownership.window?.firstResponder === ownership.worldInteractionView,
     "clicking a row in the decoration panel must hand the keyboard focus back to the scene interaction view")
+  let reparentedWindow = FocusWindow()
+  ownership.worldInteractionView.window = reparentedWindow
+  ownership.window?.firstResponder = otherEditor
+  ownership.returnSceneFocus(trigger:"gpui-reparented-window")
+  precondition(reparentedWindow.firstResponder === ownership.worldInteractionView,
+    "scene focus must follow the reparented interaction view into its actual GPUI window")
+  precondition(ownership.window?.firstResponder === otherEditor,
+    "a reparented scene must not change the hidden native owner's first responder")
+  ownership.worldInteractionView.window = ownership.window
   precondition(ownership.residentPropEditor.isCarrying,
     "precondition: the row click really entered the carrying state")
   // 携带态 + 面板的 `NSTextView` 拿焦点 ⇒ 场景**仍然**收指针（旧判据在这里会误判成打字）。
