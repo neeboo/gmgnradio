@@ -2126,7 +2126,9 @@ private final class MarbleSpatialRenderer: NSObject, MTKViewDelegate {
         // stepping whole snapshot deltas every other 60 fps frame.
         spatialStage.advanceAvatarFollowRotation(deltaTime: delta)
 
-        _ = inFlightSemaphore.wait(timeout: .distantFuture)
+        // GPU 满载时跳过本帧，保持主线程可处理滚轮/镜头输入。
+        // 没有取得许可就不访问该帧的共享缓冲，也不提交 commandBuffer。
+        guard inFlightSemaphore.wait(timeout: .now()) == .success else { return }
         let semaphore = inFlightSemaphore
         commandBuffer.addCompletedHandler { _ in
             semaphore.signal()

@@ -3,6 +3,24 @@ import CoreVideo
 import Foundation
 import Metal
 
+/// Immutable ownership transferred to the GPU completion callback. The destination is
+/// published only after completion and never written again; the source resources are
+/// retained here because CVMetalTexture does not retain its backing pixel buffer.
+private final class NativeVideoFrameCopyResources: @unchecked Sendable {
+    let buffer: CVPixelBuffer
+    let wrapped: CVMetalTexture
+    let source: MTLTexture
+    let destination: MTLTexture
+
+    init(buffer: CVPixelBuffer, wrapped: CVMetalTexture, source: MTLTexture,
+         destination: MTLTexture) {
+        self.buffer = buffer
+        self.wrapped = wrapped
+        self.source = source
+        self.destination = destination
+    }
+}
+
 // MARK: - macOS 原生播放：AVPlayer + AVPlayerItemVideoOutput → Metal 纹理
 
 /// macOS 的原生媒体后端：**目标视频帧直接进 Metal 纹理**（不是每帧网页截图）。
@@ -92,6 +110,8 @@ final class NativeLinkPlayer: NativeScreenMediaPlaying {
     /// 一份私有的目标纹理。每帧从 `CVPixelBuffer` 拷进来一次（一次 GPU blit），
     /// 于是渲染器采样的那张纹理**不依赖** `CVPixelBuffer` 的生命周期（IOSurface 会被回收）。
     private var destinationTexture: MTLTexture?
+    private var frameGeneration: UInt64 = 0
+    private var copyInFlight = false
 
     init?(device: MTLDevice, descriptor: NativeScreenMediaDescriptor) {
         guard let queue = device.makeCommandQueue() else { return nil }
@@ -129,6 +149,7 @@ final class NativeLinkPlayer: NativeScreenMediaPlaying {
     }
 
     func stop() {
+        frameGeneration &+= 1
         framePump?.cancel()
         framePump = nil
         audioSampler.reset()
@@ -175,6 +196,7 @@ final class NativeLinkPlayer: NativeScreenMediaPlaying {
     /// 返回"最近一帧"而不是严格"新帧"是刻意的：帧泵（~30 Hz）与渲染器（~60 Hz）会
     /// 同时拉同一个视频输出，谁先取走新帧都不该让渲染器这一帧空手而归。
     func copyFrameTexture() -> MTLTexture? {
+        guard !copyInFlight else { return destinationTexture }
         guard let player, let output else { return destinationTexture }
         if let error = player.currentItem?.error {
             state = .failed(.assetUnreadable(error.localizedDescription))
@@ -197,15 +219,15 @@ final class NativeLinkPlayer: NativeScreenMediaPlaying {
         )
         guard created == kCVReturnSuccess, let wrapped,
               let source = CVMetalTextureGetTexture(wrapped) else { return destinationTexture }
-        if destinationTexture?.width != width || destinationTexture?.height != height {
-            let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false
-            )
-            descriptor.storageMode = .private
-            descriptor.usage = [.shaderRead, .renderTarget]
-            destinationTexture = device.makeTexture(descriptor: descriptor)
-        }
-        guard let destination = destinationTexture,
+        // Published frames are immutable: another command queue may still sample the old
+        // frame. Default retained-reference render commands keep it alive until GPU completion.
+        // The renderer bounds its in-flight commands; this producer permits only one blit.
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false
+        )
+        descriptor.storageMode = .private
+        descriptor.usage = [.shaderRead]
+        guard let destination = device.makeTexture(descriptor: descriptor),
               let command = commandQueue.makeCommandBuffer(),
               let blit = command.makeBlitCommandEncoder() else { return destinationTexture }
         blit.copy(
@@ -216,14 +238,27 @@ final class NativeLinkPlayer: NativeScreenMediaPlaying {
             destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
         )
         blit.endEncoding()
+        let generation = frameGeneration
+        copyInFlight = true
+        let resources = NativeVideoFrameCopyResources(
+            buffer: buffer, wrapped: wrapped, source: source, destination: destination
+        )
+        command.addCompletedHandler { @Sendable [weak self, resources] completed in
+            // CVMetalTexture alone does not own its CVPixelBuffer. Hold every source
+            // resource until the asynchronous copy finishes, even when stop() intervenes.
+            withExtendedLifetime(resources) {}
+            let succeeded = completed.status == .completed
+            Task { @MainActor [weak self, resources] in
+                guard let self else { return }
+                self.copyInFlight = false
+                guard self.frameGeneration == generation, succeeded else { return }
+                self.destinationTexture = resources.destination
+                self.gpuCopyCount += 1
+                if self.state != .playing { self.state = .playing }
+            }
+        }
         command.commit()
-        command.waitUntilCompleted()
-        // 有界生命周期：blit 完成前不能回收 `buffer` / `wrapped` / `source`。
-        withExtendedLifetime((buffer, wrapped, source)) {}
-        guard command.status == .completed else { return destinationTexture }
-        gpuCopyCount += 1
-        if state != .playing, decodedFrameCount >= 1 { state = .playing }
-        return destination
+        return destinationTexture
     }
 
     // MARK: 组装

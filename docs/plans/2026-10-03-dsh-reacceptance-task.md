@@ -10,6 +10,8 @@
 
 ### 主代理连续验收最新结果
 
+最新接续：缩放同步阻塞修改整合并完成第三轮完整App构建exit0，日志 `/tmp/gmgn-parent-zoom-fix-build3.log`；前两轮跨actor错误已修，未省略失败。全新根 `/tmp/gmgn-e2e-20261003-zoom-final` 当前真实全流程运行，session60618，日志 `/tmp/gmgn-parent-full-zoom-final.log`，包含系统输出声音。下一步立即核对该运行结果，真实App电视播放时用computer use测试镜头缩放并取得输入/帧耗时证据；仅移除同步等待和构建成功不代表卡顿已解。详见 evidence/2026-10-03-camera-zoom-rework.md。DSH旧stale-session分析已停止，主代理租约修复已推送9100b8b。自动化保留ACTIVE，但已将通知设为failed_runs_only减少定时弹出，并强化完成即推进/长期分析主代理接手的指令。
+
 主代理已停止长期仅分析的 DSH stale-session进程并接手。实际冲突为 e2eInvokeWorldTool 将控制面租约写入居民 liveCamMessageID，后台回合可覆盖，控制退出也会清掉居民回合。改为独立有界调用期控制租约集合，保留世界identity/selectedWorld/装修状态校验；正常居民会话仍按 liveCamMessageID 授权。当前App构建 `/tmp/gmgn-parent-lease-fix-build.log` exit0；真实2125恢复运行 `/tmp/gmgn-parent-lease-recovery.log` 146pass/0fail/0blocked，含实际HLS按PID输出开停对照和重启恢复/通知已读/真实chat。注意该任务启动时已被后台领取，恢复运行不重复证明新领取，不能据此关闭全新生成竞争验收。用户另反馈对着屏幕缩放卡顿：已定位主线程视频blit waitUntilCompleted和renderer无限inflight等待，主代理改无空闲帧即跳帧；worker正修安全异步视频copy，尚未构建/实测缩放，最终全新流程待性能修改整合后再跑。
 
 后续接续：DSH 实际 session/lease 修复已启动，日志 `/tmp/gmgn-dsh-stale-world-session-20261003.log`，session48340；负责生产 Swift 生命周期与回归测试，禁止在 driver 盲重试。声音工具返工已结束，工具6项测试通过；主代理 driver79项测试通过、当前工具编译exit0，已独立验证真实App播放输出/正式关闭静音。下一轮应等此次生产修复结束后审阅、重构建真实App，优先恢复2125已生成任务验证取物，再做完整新流程；不得把恢复模式记为新生成。
