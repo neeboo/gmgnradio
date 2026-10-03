@@ -10,6 +10,10 @@
 
 ### 主代理连续验收最新结果
 
+本轮最终完成exit0：全屏60次120幅度后追加40次300幅度，总100真实输入/100有效/0非法，360状态快照；最终分发P50=6.678ms/P95=18.945ms/最大20.260ms。末窗GPU P95=15.389ms，CPU P95=1.468ms，但历史69.321ms长帧仍为未关闭异常。隔离App正常退出，本轮无测试/构建遗留；证据文档已更新，下一轮应定位异常当帧和显示节奏，而非重复查看运行状态。
+
+全屏连续缩放已实际执行：第一段240快照无输入，仅静态基线；第二段隔离App PID74741、CUA确认3840×2160全屏，60次真实滚轮往返约20.7秒，60有效/0非法，分发P50=7.391ms/P95=19.958ms/最大20.260ms。输入后窗口CPU编码最大69.321ms，跳帧0不代表流畅，不关闭卡顿反馈。日志 `/tmp/gmgn-parent-zoom-stress2-live.log`，5秒补充CPU采样 `/tmp/gmgn-zoom-fullscreen-sample.txt`；长帧尚无同步栈，不直接归因。下一步捕获显示节奏及长帧对应栈，再决定最小修复；禁止反复生成来替代性能验收。完整业务160通过仍保留，已装App未更新。
+
 滚轮延迟接入并实测结束：完整构建 `/tmp/gmgn-parent-zoom-input-build.log` exit0，真实同root正式HLS播放时CUA9次滚轮上下事件，120状态快照 `/tmp/gmgn-parent-zoom-input-live.log` exit0。9有效/0非法，主线程分发P50=14.063ms/P95最大17.311ms；末窗CPU P95=9.849ms/最大22.108ms，GPU P95=8.648ms，跳帧0。未复现持续输入阻塞，但9个事件短测没有修复前同条件对照/最终显示FPS，不把全新业务160pass等同全部缩放情形通过；已装App未更新。所有worker已完成，本轮无构建/E2E仍跑。下一步是更高负载/连续快速缩放时序验证、可维护静止SPZ重复排序处理，避免重复生成已通过业务来替代性能门槛；任何新源码更改仍构建及真实App复验、提交推送。
 
 短窗性能版真实测量结束：完整构建 `/tmp/gmgn-parent-zoom-metrics-build.log` exit0，实际App同root正式HLS播放/关闭及CUA滚轮，180状态快照 `/tmp/gmgn-parent-zoom-metrics-live.log` exit0。50万splats播放混合缩放段CPU滚动窗口P95中位1.565ms/GPU8.881ms，无跳帧，但CPU最大31.273ms；排序59–60次/2秒。没有输入延迟/显示帧率证据，不关闭卡顿反馈；已装App未更新，用户旧App体验不等于新测试构建。worker zoom_input_latency 正在StageWindowController.swift/SpatialStageStore.swift加有界滚轮事件分发延迟，主代理随后在E2E status暴露cameraInputDiagnostics并构建真实CUA验证。不能重复全新生成来替代该性能门槛；原业务160全通过已保留。
