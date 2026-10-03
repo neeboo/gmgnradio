@@ -1968,6 +1968,10 @@ struct PerfReading {
             host.wantsLayer = true
             let controller = WorldScreenOverlayController(hostView: host)
             let surface = controller.surface(for: "tv-1")
+            // 待机时**不挂着**网页视图（断言11），而这一条量的是"挂着网页视图时宿主尺寸
+            // 换得稀不稀"（每次换都让 WebKit 重排整页）。所以这里显式挂上 —— 生产里
+            // `playScreen` / `load(url:)` 走的是同一句。
+            surface.attachWebViewIfNeeded()
             let webView = surface.container.subviews.first
             let occluders = WorldScreenOccluders(
                 triangles: perfRoom(), boxes: blocked ? [resident] : [], revision: 7)

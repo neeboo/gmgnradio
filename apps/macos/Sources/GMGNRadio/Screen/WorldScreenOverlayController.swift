@@ -45,11 +45,28 @@ final class WorldScreenOverlayContainer: NSView {
 
 // MARK: - 一块屏幕
 
-/// 一块屏幕 = 一个容器视图 + 一个 `WKWebView`。
+/// 一块屏幕 = 一个容器视图 + **要放东西时才挂上**的一个 `WKWebView`。
 ///
 /// 内容用 `WKWebsiteDataStore.default()`：用户在**这个 web 视图里自己登录**之后，
 /// 会话由 WebKit 自己保持。我们**不读 cookie、不导出、不代持**任何凭据，
 /// 也不为任何站点伪造 UA。
+///
+/// ## 待机时**不挂着**网页视图（2026-10-03 第二次「对着电视缩放还是爆卡」）
+///
+/// 真机量出来的第二条事实：`stop()` 只 `stopLoading` + 载一张空页，**视图还在树里、
+/// 内容进程也还在跑**（离线实测：`stop()` 之后 2.0 s 空转，`WebContent` 进程仍活着；
+/// 5.36 s 之后仍然没退）。一块"关着的屏幕"不该养着一个 WebKit 内容进程。
+///
+/// 所以这一块屏幕分成两半：
+/// * **待机**：屏幕上只有 `idleGlassLayer` / `idleHighlightLayer` 两层**纯 CALayer**
+///   （与 `idleScreenBackground` 同一个观感：深灰偏黑 + 一道很淡的斜向反光）。
+///   没有视图、没有内容进程、没有解码、没有网络，也没有任何东西需要每帧重新合成；
+/// * **播放**：`attachWebViewIfNeeded()` 才造 `WKWebView` 并挂上（一次性代价由
+///   `lastAttachCost` 记账），`stop()` 把它**摘下来并丢掉引用**。
+///
+/// 判据（`tools/test-resident-screen-overlay.swift` 断言11）读两样东西：容器子树里
+/// 有没有 `WKWebView`（`isWebViewAttached`），以及本进程**造过几个**网页视图
+/// （`constructedWebViewCount`）—— 后者是"有没有内容进程"的前置条件，待机时它必须不涨。
 @MainActor
 final class WorldScreenSurface: NSObject, WKNavigationDelegate {
     /// 页面没在 20 秒内 `didFinish` 就是失败 —— "一直转圈"不是一种状态。
@@ -57,7 +74,13 @@ final class WorldScreenSurface: NSObject, WKNavigationDelegate {
 
     let objectID: String
     let container = WorldScreenOverlayContainer()
-    let webView: WKWebView
+    /// 本进程里**造出来过**的网页视图个数。只增不减 —— 待机时它必须**不涨**：
+    /// WebKit 的内容进程是跟着视图走的，视图都没造，就没有进程可言。
+    private(set) static var constructedWebViewCount = 0
+    /// 现在挂着的网页视图。`nil` = 待机（屏幕上由那两层占位玻璃呈现）。
+    private(set) var webView: WKWebView?
+    /// 最近一次"把网页视图挂上"花掉的时间（一次性代价，诊断/回执读它）。
+    private(set) var lastAttachCost: Duration?
     private(set) var state: WorldScreenSurfaceState = .idle
     /// 最近一次请求的官方嵌入 URL（`stop` 之后仍然读得到"上次放的是什么"）。
     private(set) var requestedURL: String?
@@ -74,6 +97,9 @@ final class WorldScreenSurface: NSObject, WKNavigationDelegate {
     var appliedFrameSize: CGSize?
     var appliedTransform: WorldScreenLayerTransform?
     private var occlusionMaskLayer: CAShapeLayer?
+    /// 「关着的玻璃」：待机时呈现的那两层（**纯 CALayer**，不是网页视图）。
+    private let idleGlassLayer = CAGradientLayer()
+    private let idleHighlightLayer = CAGradientLayer()
     var onStateChange: (@MainActor (WorldScreenSurfaceState) -> Void)?
     private var watchdog: Task<Void, Never>?
     /// 页面**侧**那一路的观察者（播放器自己报的错）。与 `watchdog` 分开：那一条管
@@ -84,30 +110,145 @@ final class WorldScreenSurface: NSObject, WKNavigationDelegate {
     private(set) var embeddingOrigin: String?
     private var isMediaSuspended = false
 
+    /// 网页视图此刻**在不在视图树里**（待机判据读它）。
+    var isWebViewAttached: Bool {
+        guard let webView else { return false }
+        return webView.superview === container
+    }
+
+    /// 待机那两层占位玻璃此刻**在不在、铺没铺满**容器。
+    ///
+    /// 「关着的屏幕由占位层呈现」这件事唯一的可判据形态：待机时必须为真（观感不变），
+    /// 播放时必须为假（画面交给网页，占位层让位）。判据见
+    /// `tools/test-resident-screen-idle-and-motion.swift` 断言11。
+    var idleAppearanceIsReady: Bool {
+        guard !idleGlassLayer.isHidden, !idleHighlightLayer.isHidden,
+              let bounds = container.layer?.bounds, bounds.width > 0, bounds.height > 0
+        else { return false }
+        return idleGlassLayer.frame == bounds && idleHighlightLayer.frame == bounds
+    }
+
+    /// 图层现在**真的拿着**的那一份变换。`applyPlacement` 用它判断 AppKit 是不是把
+    /// `layer.transform` 重置成单位阵了（那时缓存说"没变"就会漏写）。
+    var currentLayerTransform: WorldScreenLayerTransform? {
+        guard let layer = container.layer else { return nil }
+        return WorldScreenLayerTransform(cgTransform: layer.transform)
+    }
+
     override init() {
         fatalError("使用 init(objectID:)")
     }
 
     init(objectID: String) {
         self.objectID = objectID
+        super.init()
+        // **这里不造 `WKWebView`**：待机时屏幕上只有那两层占位玻璃。见类型注释。
+        Self.installIdleAppearance(
+            glass: idleGlassLayer, highlight: idleHighlightLayer, on: container
+        )
+    }
+
+    /// 待机外观：一块**深灰偏黑、带一点点反光**的玻璃。
+    ///
+    /// 颜色与 `idleScreenBackground`（也就是 `underPageBackgroundColor`）取同一个观感，
+    /// 与 GLB 的 `WorldPrimitiveTelevisionFinish.screen.baseColor` 也是一套 —— 三处不能
+    /// 各说一套。这里的两层是**唯一**的待机呈现，`stop()` 之后屏幕上就是它们。
+    private static func installIdleAppearance(
+        glass: CAGradientLayer, highlight: CAGradientLayer, on container: NSView
+    ) {
+        container.wantsLayer = true
+        guard let host = container.layer else { return }
+        // 底：一层自上而下的深灰渐变（原来那张空页 `linear-gradient(#20242b,#12141a)`）。
+        glass.colors = [
+            NSColor(srgbRed: 0.1255, green: 0.1412, blue: 0.1686, alpha: 1).cgColor,
+            NSColor(srgbRed: 0.0706, green: 0.0784, blue: 0.1020, alpha: 1).cgColor,
+        ]
+        glass.locations = [0, 1]
+        glass.startPoint = CGPoint(x: 0.5, y: 1)
+        glass.endPoint = CGPoint(x: 0.5, y: 0)
+        glass.zPosition = 0
+        // 高光：一道很淡的斜向反光（原来是 `linear-gradient(115deg, rgba(255,255,255,.075) …)`）。
+        highlight.colors = [
+            NSColor(white: 1, alpha: 0.075).cgColor,
+            NSColor(white: 1, alpha: 0.020).cgColor,
+            NSColor(white: 1, alpha: 0).cgColor,
+        ]
+        highlight.locations = [0, 0.22, 0.46]
+        highlight.startPoint = CGPoint(x: 0.12, y: 1)
+        highlight.endPoint = CGPoint(x: 1, y: 0.12)
+        highlight.zPosition = 1
+        host.addSublayer(glass)
+        host.addSublayer(highlight)
+        // 底衬：两层都还没铺上时也不能是纯黑（真机 2026-10-02「灰板 + 一块死黑矩形」）。
+        host.backgroundColor = idleScreenBackground.cgColor
+        layoutIdleAppearance(glass: glass, highlight: highlight, host: host)
+    }
+
+    private static func layoutIdleAppearance(
+        glass: CAGradientLayer, highlight: CAGradientLayer, host: CALayer
+    ) {
+        for layer in [glass, highlight] {
+            if layer.frame != host.bounds { layer.frame = host.bounds }
+        }
+    }
+
+    /// 容器尺寸变了之后把两层占位玻璃铺满（只在**待机**且尺寸真的变了时调）。
+    func layoutIdleAppearanceIfNeeded() {
+        guard webView == nil, let host = container.layer else { return }
+        Self.layoutIdleAppearance(glass: idleGlassLayer, highlight: idleHighlightLayer, host: host)
+    }
+
+    /// 把网页视图**挂上**（要放东西了）。已经挂着就什么都不做。
+    ///
+    /// **一次性代价**：这一步会拉起一个 WebKit 内容进程。所以它在
+    /// `WorldScreenStore.playScreen` 里是**先于**载页发生的（用户按"播放"之前，
+    /// 造视图的钱已经付掉了），而不是压在视频第一帧上。
+    @discardableResult
+    func attachWebViewIfNeeded() -> Bool {
+        if webView != nil { return false }
+        let start = CFAbsoluteTimeGetCurrent()
         let configuration = WKWebViewConfiguration()
         // 默认数据存储：登录态是**用户自己**在这个视图里建的，我们只让它留在 WebKit 自己手里。
         configuration.websiteDataStore = .default()
         configuration.allowsAirPlayForMediaPlayback = false
-        webView = WKWebView(frame: .zero, configuration: configuration)
-        super.init()
-        webView.navigationDelegate = self
-        // **不是纯黑**：这块 web 视图在"还没放东西"时就是用户看到的屏幕面。纯黑在画面里
-        // 是一个洞（真机 2026-10-02「灰板 + 一个大的黑色矩形」），而关着的屏幕是一块
-        // **深灰偏黑、带一点点反光**的玻璃。这里与 GLB 的
-        // `WorldPrimitiveTelevisionFinish.screen.baseColor` 取同一个观感，两处不能各说一套。
-        webView.underPageBackgroundColor = Self.idleScreenBackground
-        webView.allowsBackForwardNavigationGestures = false
-        webView.autoresizingMask = [.width, .height]
-        container.addSubview(webView)
-        // 容器是**不吃事件**的；webView 作为子视图也因此收不到任何指针事件
-        // （`WorldScreenOverlayContainer.hitTest` 恒 nil）。
+        let view = WKWebView(frame: container.bounds, configuration: configuration)
+        view.navigationDelegate = self
+        // **不是纯黑**：这块 web 视图在"还没放东西"时也可能被看到（挂上到首帧之间）。
+        view.underPageBackgroundColor = Self.idleScreenBackground
+        view.allowsBackForwardNavigationGestures = false
+        view.autoresizingMask = [.width, .height]
+        container.addSubview(view)
+        webView = view
+        Self.constructedWebViewCount += 1
+        setIdleAppearanceHidden(true)
+        lastAttachCost = Duration.seconds(CFAbsoluteTimeGetCurrent() - start)
+        return true
     }
+
+    /// 把网页视图**摘下来并丢掉引用**（待机）。
+    ///
+    /// 只 `stopLoading` + 载空页是不够的（内容进程照旧活着）—— 这里连视图带引用一起放掉，
+    /// 屏幕上只剩那两层占位玻璃。
+    private func detachWebView() {
+        guard let view = webView else { return }
+        view.stopLoading()
+        view.pauseAllMediaPlayback(completionHandler: nil)
+        view.navigationDelegate = nil
+        view.removeFromSuperview()
+        webView = nil
+        isMediaSuspended = false
+        setIdleAppearanceHidden(false)
+        // 挂着网页视图的那些帧里，容器的尺寸照样在变（`applyPlacement` 那时**不**管占位层）
+        // —— 摘下来的这一刻要把两层占位玻璃按**现在**的 bounds 铺满，否则回到待机会看到
+        // 一块没铺满的旧尺寸玻璃。
+        layoutIdleAppearanceIfNeeded()
+    }
+
+    private func setIdleAppearanceHidden(_ hidden: Bool) {
+        idleGlassLayer.isHidden = hidden
+        idleHighlightLayer.isHidden = hidden
+    }
+
 
     /// 把"被更近的东西挡住"的那一部分**按区域裁掉**。
     ///
@@ -194,6 +335,10 @@ final class WorldScreenSurface: NSObject, WKNavigationDelegate {
         geometryIssue = nil
         transition(to: .loading(url: url.absoluteString))
         resumeMediaIfNeeded()
+        // **先把网页视图挂上，再谈载页**：造视图那一下（拉起 WebKit 内容进程）是这一条
+        // 通路上唯一的一次性代价，它不该叠在视频第一帧上。`playScreen` 会先调一次，
+        // 这里再调一次是幂等的（唯一保证"要载页就一定有视图"的地方是这里）。
+        attachWebViewIfNeeded()
         let port = WorldScreenEmbedOrigin.randomPort()
         let origin = WorldScreenEmbedOrigin.originString(port: port)
         guard WorldScreenEmbedOrigin.isLegalEmbeddingOrigin(origin),
@@ -203,6 +348,10 @@ final class WorldScreenSurface: NSObject, WKNavigationDelegate {
             return
         }
         embeddingOrigin = origin
+        guard let webView else {
+            transition(to: .failed(.blocked("网页视图没能挂上")))
+            return
+        }
         webView.loadHTMLString(
             WorldScreenEmbedPage.html(embedURL: url.absoluteString, origin: origin),
             baseURL: baseURL
@@ -210,27 +359,29 @@ final class WorldScreenSurface: NSObject, WKNavigationDelegate {
         startWatchdog()
     }
 
+    /// 关掉一块屏幕 ⇒ 回到**待机**：网页视图摘下来、引用丢掉，屏幕上只剩占位玻璃。
+    ///
+    /// 这里刻意**不**再载一张空页：那张空页会把内容进程留着（`stopLoading` + 载空页
+    /// 从来就不等于"关掉"）。待机的外观由 `idleGlassLayer` / `idleHighlightLayer` 给。
     func stop() {
         watchdog?.cancel()
         watchdog = nil
         playerWatch?.cancel()
         playerWatch = nil
         embeddingOrigin = nil
-        webView.stopLoading()
-        webView.loadHTMLString(Self.blankPage, baseURL: nil)
-        suspendMedia()
+        detachWebView()
         transition(to: .stopped)
     }
 
     /// 看不见的时候**暂停**（不是销毁）：回来不掉登录态，也不白烧解码与网络。
     func suspendMedia() {
-        guard !isMediaSuspended else { return }
+        guard let webView, !isMediaSuspended else { return }
         isMediaSuspended = true
         webView.pauseAllMediaPlayback(completionHandler: nil)
     }
 
     func resumeMediaIfNeeded() {
-        guard isMediaSuspended else { return }
+        guard let webView, isMediaSuspended else { return }
         isMediaSuspended = false
         webView.setAllMediaPlaybackSuspended(false, completionHandler: nil)
     }
@@ -261,8 +412,10 @@ final class WorldScreenSurface: NSObject, WKNavigationDelegate {
         playerWatch = Task { @MainActor [weak self] in
             for _ in 0..<Self.playerWatchAttempts {
                 try? await Task.sleep(for: Self.playerWatchInterval)
-                guard !Task.isCancelled, let self, self.state.isPlaying else { return }
-                let raw = try? await self.webView.evaluateJavaScript(
+                // 网页视图被摘掉了（`stop()`）就没有"播放器在里面说什么"可言。
+                guard !Task.isCancelled, let self, self.state.isPlaying, let webView = self.webView
+                else { return }
+                let raw = try? await webView.evaluateJavaScript(
                     WorldScreenEmbedPage.probeScript
                 )
                 guard let json = raw as? String,
@@ -294,29 +447,23 @@ final class WorldScreenSurface: NSObject, WKNavigationDelegate {
     /// 「没在放东西」那一面屏幕的颜色与底纹 —— **外观**，不是判据。
     ///
     /// 深灰偏黑（sRGB 约 #1b1e24 ⇒ 线性约 0.011–0.016），加一道很淡的斜向高光当"反光"：
-    /// 于是它读起来是一块关着的屏幕玻璃，而不是一个死黑的矩形。**唯一**一处取值，
-    /// `underPageBackgroundColor` 与空页 HTML 都读它，不各写一份。
+    /// 于是它读起来是一块关着的屏幕玻璃，而不是一个死黑的矩形。**唯一**一处取值：
+    /// `underPageBackgroundColor` 与待机那两层占位玻璃都读它，不各写一份。
+    ///
+    /// （2026-10-03 之前"待机那一面"是通过往 `WKWebView` 里载一张空页画出来的；现在
+    /// 待机**没有**网页视图，那一面由 `installIdleAppearance` 的两层 `CAGradientLayer`
+    /// 画出来 —— 同一份颜色，两个出口，都在这一处取值。）
     static let idleScreenBackground = NSColor(
         srgbRed: 0.106, green: 0.118, blue: 0.141, alpha: 1
     )
-
-    static let blankPage = """
-        <!doctype html><html><head><meta charset="utf-8">
-        <style>html,body{margin:0;height:100%;background:#1b1e24;
-        background-image:linear-gradient(115deg,rgba(255,255,255,0.075) 0%,
-        rgba(255,255,255,0.020) 22%,rgba(255,255,255,0) 46%),
-        linear-gradient(#20242b,#12141a)}</style></head>
-        <body></body></html>
-        """
 
     // MARK: WKNavigationDelegate
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         watchdog?.cancel()
         watchdog = nil
-        // `stop()` 载的那张空页也会走一次 `didFinish`：只有"正在载入"才算载好了。
-        // 少了这一条，**关掉的屏幕会被这条回调重新说成"播放中"**（`requestedURL`
-        // 是刻意留着给"上次放的是什么"读的，不能靠清空它来兜）。
+        // 只有"正在载入"才算载好了。少了这一条，**关掉的屏幕会被这条回调重新说成
+        // "播放中"**（`requestedURL` 是刻意留着给"上次放的是什么"读的，不能靠清空它来兜）。
         guard let requestedURL, state.isLoading else { return }
         transition(to: .playing(url: requestedURL))
         startPlayerWatch()
@@ -394,6 +541,13 @@ final class WorldScreenOverlayController {
     private var lastMaskRecompute: [String: Double] = [:]
     /// 每块屏幕**当前渲染尺寸**（点）。它不跟着相机每帧变 —— 见 `renderedSize`。
     private var renderedSizes: [String: SIMD2<Float>] = [:]
+    /// 每块屏幕**上一帧**四角在视图里的位置（点）。本帧与它的最大距离就是"相机在不在动"。
+    private var previousScreenPoints: [String: [SIMD2<Float>]] = [:]
+    /// 每块屏幕**上一次真的写下去**时四角在视图里的位置。与现在这一帧的距离就是"图层的
+    /// 滞后"——小于对齐容差就不用重写（跳过的那些帧屏幕上也分辨不出来）。
+    private var lastWrittenPoints: [String: [SIMD2<Float>]] = [:]
+    /// 每块屏幕上一帧**是不是在按运动降载**（判断"这一帧算不算恢复"）。
+    private var wasSheddingForMotion: [String: Bool] = [:]
     /// 本帧的账（每项耗时 + 计数器）。诊断与判据读同一份。
     private(set) var frameCost = WorldScreenFrameCost()
     /// **可注入的时钟**（秒）。生产用 `CFAbsoluteTimeGetCurrent`；harness 注入合成时间，
@@ -508,6 +662,9 @@ final class WorldScreenOverlayController {
         lastMaskRecompute[objectID] = nil
         renderedSizes[objectID] = nil
         occlusionStats[objectID] = nil
+        previousScreenPoints[objectID] = nil
+        lastWrittenPoints[objectID] = nil
+        wasSheddingForMotion[objectID] = nil
         // 被移除的那块正好是最后一块活着的屏幕 ⇒ 模式跟着退出（Esc/开关之外的第三条收场路）。
         endScreenOperationIfNothingLive()
     }
@@ -574,12 +731,35 @@ final class WorldScreenOverlayController {
                 hide(surface, reason: "屏幕在相机背后或投影退化")
                 continue
             }
-            // 宿主渲染尺寸**带滞回**：相机连续移动时尺寸不动，全部由 transform 吸收。
+            // ---- 镜头在不在动（2026-10-03：对着电视缩放还是爆卡）----
+            //
+            // 判据是四角在**视图里**的像素位移，不是相机位姿的米/弧度：真正要保证的是
+            // "写下去的那一份与图层上现成的那一份在屏幕上分辨不出来"，而那个分辨率的
+            // 单位就是像素。没有上一帧（这块屏刚出现）时**不算动** —— 第一帧必须是全质量，
+            // 它也是对齐判据要看的那一帧。
+            let viewPoints = normalized.map { projection.viewPoint(normalized: $0) }
+            let motion = Self.maximumPointDistance(viewPoints, previousScreenPoints[objectID]) ?? 0
+            previousScreenPoints[objectID] = viewPoints
+            let moving = motion > WorldScreenFrameBudget.motionPixelThreshold
+            frameCost.motionPixels = max(frameCost.motionPixels, motion)
+            frameCost.didShedForMotion = frameCost.didShedForMotion || moving
+            if wasSheddingForMotion[objectID] == true, !moving {
+                frameCost.didRestoreFromMotion = true
+            }
+            wasSheddingForMotion[objectID] = moving
+
+            // 宿主渲染尺寸：**运动中降到低分辨率档位**，相机一停就回到全质量（下一帧内）。
+            // 中间仍由单应矩阵吸收（滞回），所以尺寸换得稀 —— 每次换都让 WebKit 重排版。
+            let desiredSize = Self.motionAwareRenderedSize(boundsSize, moving: moving)
             let rendered = Self.renderedSize(
-                current: renderedSizes[objectID], desired: boundsSize,
+                current: renderedSizes[objectID], desired: desiredSize,
                 hysteresis: WorldScreenFrameBudget.renderedSizeHysteresis
             )
             renderedSizes[objectID] = rendered
+            // 渲染档位（1.0 = 全质量）。判据读它判"backing 真的降了、停下真的回来了"。
+            frameCost.renderScale = min(
+                frameCost.renderScale, rendered.x / max(boundsSize.x, 0.0001)
+            )
             guard let placement = WorldScreenOverlayAlignment.placement(
                 normalizedCorners: normalized, projection: projection,
                 referenceSize: rendered
@@ -589,13 +769,61 @@ final class WorldScreenOverlayController {
             }
             surface.container.isHidden = false
             hiddenReasons[objectID] = nil
-            applyPlacement(surface, placement: placement)
+            // 这一帧要不要真的写下去。三条里有一条成立就必须写：
+            //   ① 尺寸要换（AppKit 那条路会连带把 `layer.transform` 重置成单位阵）；
+            //   ② 图层被 AppKit 重置过（现在拿着的不是我们上次写的那一份）；
+            //   ③ 离上次写下的位置已经超过**对齐容差**（跳过的帧屏幕上就分辨不出来）。
+            // 三条都不成立 ⇒ `frame` 与 `transform` 一个字节都不写。
+            let targetSize = CGSize(
+                width: CGFloat(placement.frame.x), height: CGFloat(placement.frame.y)
+            )
+            let layerWasReset = surface.appliedTransform == nil
+                || surface.currentLayerTransform != surface.appliedTransform
+            let lag = Self.maximumPointDistance(viewPoints, lastWrittenPoints[objectID])
+                ?? .greatestFiniteMagnitude
+            if surface.appliedFrameSize != targetSize || layerWasReset
+                || lag >= WorldScreenFrameBudget.motionPixelThreshold {
+                applyPlacement(surface, placement: placement)
+                lastWrittenPoints[objectID] = viewPoints
+                frameCost.didApplyPlacement = true
+            }
             surface.resumeMediaIfNeeded()
             updateOcclusion(
                 surface, worldCorners: worldCorners, camera: camera,
                 placement: placement, occluders: occluders
             )
         }
+    }
+
+    /// 两块四角列表逐点的最大距离（点）。任一边缺（或点数对不上）⇒ `nil`：
+    /// 调用方各自决定"没有参照"是什么意思（运动判据当 0，滞后判据当"必须写"）。
+    static func maximumPointDistance(
+        _ points: [SIMD2<Float>], _ reference: [SIMD2<Float>]?
+    ) -> Float? {
+        guard let reference, points.count == reference.count, !points.isEmpty else { return nil }
+        var worst: Float = 0
+        for index in points.indices {
+            let dx = points[index].x - reference[index].x
+            let dy = points[index].y - reference[index].y
+            worst = max(worst, (dx * dx + dy * dy).squareRoot())
+        }
+        return worst
+    }
+
+    /// 运动中把宿主的**渲染尺寸**降一档（低分辨率 backing），停下立刻回到全质量。
+    ///
+    /// 屏幕上的四边形由 `layer.transform` 放大回原位 —— 位置与对齐**不变**，变小的只是
+    /// 合成器每帧要重采样的那张纹理。档位有下限（`minimumShedDimension`）：**短边**不许
+    /// 小于它（再小就只剩马赛克了）。下限是**两轴一起**抬的 —— 只夹住一边会把纹理各向
+    /// 异性地压扁（长宽比一变，画面就变形）。所以很远的、本来就很小的屏不降档：
+    /// 那张纹理已经没什么可省的。
+    static func motionAwareRenderedSize(_ fullSize: SIMD2<Float>, moving: Bool) -> SIMD2<Float> {
+        guard moving else { return fullSize }
+        let shorter = min(fullSize.x, fullSize.y)
+        guard shorter > 0 else { return fullSize }
+        let floorScale = WorldScreenFrameBudget.minimumShedDimension / shorter
+        let scale = min(1, max(WorldScreenFrameBudget.motionRenderScale, floorScale))
+        return fullSize * scale
     }
 
     /// 宿主的**渲染尺寸**：只在包围盒相对它涨/缩超过 `hysteresis` 时换一次。
@@ -679,12 +907,17 @@ final class WorldScreenOverlayController {
         )
         // 判据读**图层现在的值**而不是缓存：AppKit 会在尺寸那条路上把 `layer.transform`
         // 重置成单位阵，缓存说"没变"就会漏写（这正是"角度慢慢对不上"的另一半）。
-        let written = layer.map { WorldScreenLayerTransform(cgTransform: $0.transform) }
-        if written != layerTransform {
+        if surface.currentLayerTransform != layerTransform {
             layer?.transform = layerTransform.cgTransform
-            surface.appliedTransform = layerTransform
         }
+        // `appliedTransform` 记的是"我们要图层拿着的那一份"（写没写都算数）：它是下一帧
+        // 判断"AppKit 是不是把它重置了"的参照 —— 只在真的写了时才更新，会让值恒等的那一份
+        // 每帧都被当成"被重置过"而白写一遍。
+        surface.appliedTransform = layerTransform
         frameCost.overlayTransform = CFAbsoluteTimeGetCurrent() - transformStart
+        // 待机时屏幕上就是那两层占位玻璃，尺寸换了要把它们铺满（挂上网页视图之后不用管：
+        // 那时它们整层是隐藏的）。
+        surface.layoutIdleAppearanceIfNeeded()
     }
 
     // MARK: 前景遮挡
@@ -795,6 +1028,11 @@ final class WorldScreenOverlayController {
         surface.container.isHidden = true
         hiddenReasons[surface.objectID] = reason
         surface.suspendMedia()
+        // 上一帧那两份参照跟着一起作废：藏起来这段里的位姿变化与"现在这一刻"无关。
+        // 少了这一句，重新出现的第一帧会被当成"一直在动"而降档，而它本该是全质量。
+        previousScreenPoints[surface.objectID] = nil
+        lastWrittenPoints[surface.objectID] = nil
+        wasSheddingForMotion[surface.objectID] = false
     }
 }
 

@@ -136,6 +136,11 @@ let speechSource = try String(contentsOf: sources.appendingPathComponent("Agent/
 let speechStore = declaration("final class AgentSpeechStatusStore", in: speechSource)
 let loopSource = try String(contentsOf: sources.appendingPathComponent("Agent/ResidentAgentLoop.swift"), encoding: .utf8)
 let noticeTypes = [
+    // `ResidentChatTranscriptLine.interruptedText` 的形参是 `ResidentChatTurn.Interruption`，
+    // 而 `struct ResidentChatTurn` 只依赖 Foundation —— 必须一并切进来，否则编出的
+    // `UI.swift` 找不到 `ResidentChatTurn`（2026-10-03 的既有红）。与
+    // `test-livecam-panel-sizing.swift` / `test-resident-chat-transcript.swift` 同一手法。
+    declaration("struct ResidentChatTurn:", in: loopSource),
     declaration("enum ResidentStatusNoticeKind:", in: loopSource),
     declaration("struct ResidentStatusNoticeDecision:", in: loopSource),
     declaration("enum ResidentStatusNoticeMerge", in: loopSource),
@@ -1418,8 +1423,12 @@ try ui.write(to: uiSource, atomically: true, encoding: .utf8)
 // `ResidentStatusBadge.swift` 一并编进来：下面那些断言跑的是**生产那一份**状态→符号
 // 投影与气泡几何，不是 harness 里抄的一份副本。
 let attachmentSources = ["VisualEngine/ResidentStatusBadge.swift", "Presence/ResidentImageAttachment.swift", "Presence/PropImagePreparation.swift", "Presence/PropGenerationClient.swift", "Presence/WishMachineTaskPresentation.swift", "Presence/ResidentOwnershipProjection.swift"].map { sources.appendingPathComponent($0).path }
-let checked = try run("/usr/bin/swiftc", ["-j1", "-typecheck", "-target", "arm64-apple-macos14.0", uiSource.path] + attachmentSources)
+// `-disable-sandbox`：Swift 编译器默认用 `sandbox-exec` 隔离宏插件进程，而受限环境下
+// 嵌套 sandbox 会被拒（`sandbox_apply: Operation not permitted`），`@Observable` 于是
+// 编不过。与 `tools/test-agent-speech-playback.swift` / `test-agent-speech-completion.swift`
+// 同一手法 —— 只关编译器自己的插件沙箱，产物与判据一字不变。
+let checked = try run("/usr/bin/swiftc", ["-disable-sandbox", "-j1", "-typecheck", "-target", "arm64-apple-macos14.0", uiSource.path] + attachmentSources)
 guard checked == 0 else { exit(checked) }
-let compiled = try run("/usr/bin/swiftc", ["-j1", "-parse-as-library", source.path, "-o", executable.path] + attachmentSources)
+let compiled = try run("/usr/bin/swiftc", ["-disable-sandbox", "-j1", "-parse-as-library", source.path, "-o", executable.path] + attachmentSources)
 guard compiled == 0 else { exit(compiled) }
 exit(try run(executable.path, []))

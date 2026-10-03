@@ -137,12 +137,15 @@ mod tests {
     }
 
     fn uuid() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        format!("{nanos}-{:?}", std::process::id())
+        let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        format!("{nanos}-{}-{sequence}", std::process::id())
     }
 
     const SOCKET: &str = "/tmp/gmgn-test/taskd.sock";

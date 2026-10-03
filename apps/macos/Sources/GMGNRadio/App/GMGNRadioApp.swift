@@ -1272,6 +1272,65 @@ final class AppDelegate:
         screenStore = store
     }
 
+    /// 三条屏幕工具的 control：**真有调用进来时**才去找覆盖层 store。
+    ///
+    /// 它与"三条工具在不在本轮 lease 里"是**两件**事：后者已经无条件（见
+    /// `makeResidentWorldTools` 里 `WorldScreenControlRelay` 那一段），
+    /// 因为"清单里没有"会让模型直接说"我没有能力"——那正是真机 2026-10-03 的那句话。
+    ///
+    /// 这里只负责在调用那一刻尽量把画面接上：
+    /// - store 已经在了就直接用；
+    /// - 还没接线就顺手补装一次（舞台窗口已经出现过时这一步就成立）；
+    /// - 仍然没有 = "画面还没接上"，由 `WorldScreenControlRelay` 报**具名且可行动**的
+    ///   原因（是哪一台、先打开一次空间窗口），而不是从清单里消失。
+    private func residentScreenControl() -> (any WorldScreenControlling)? {
+        if screenStore == nil {
+            installScreenOverlayIfNeeded()
+        }
+        return screenStore
+    }
+
+    /// 屏幕功能点的**运行时注册表**：这批物件里哪几件真的有屏幕、能播。
+    ///
+    /// 只读物件状态，与覆盖层 / 窗口 / 视图树**无关** —— 所以它能在"覆盖层还没接上"的
+    /// 那一轮里照样回答"这台电视有没有屏幕"（真机 2026-10-03 的断点就在这里）。
+    /// 判据只有一处：`WorldScreenCapabilityRegistry.derive`（内部走
+    /// `WorldScreenResolution.resolve`，与覆盖层贴面读的是同一个函数）。
+    private func residentScreenRegistrySnapshot(
+        objectStates: [String: WorldObjectState]
+    ) -> WorldScreenRegistrySnapshot {
+        WorldScreenCapabilityRegistry.derive(
+            objectStates: objectStates,
+            // 显示名的唯一来源与摆画面板一致：生成道具的 displayName，没有就用 objectID
+            // （绝不编一个名字）。
+            displayName: { objectStates[$0]?.generatedProp?.displayName ?? $0 }
+        )
+    }
+
+    /// 当前世界状态的注册表快照（三条工具的 control 用）。
+    private func residentScreenRegistrySnapshot() -> WorldScreenRegistrySnapshot {
+        residentScreenRegistrySnapshot(
+            objectStates: livingWorldContext?.state.objectStates ?? [:]
+        )
+    }
+
+    /// 一件物件**真的有屏幕、能播**吗 —— `read_owned_props` 回执里 `screen` 那一行的
+    /// 唯一来源。与 `read_screen` / 覆盖层同源（同一份派生），且读的是**同一份**世界状态
+    /// （回执自己的那个 `context`）。查不到就是 nil：回执里不写这个键。
+    private func residentScreenCapability(
+        objectID: String, context: WorldAgentContext
+    ) -> ResidentPropScreenCapability? {
+        let snapshot = residentScreenRegistrySnapshot(objectStates: context.state.objectStates)
+        guard let capability = snapshot.registered.first(where: { $0.objectID == objectID })
+        else { return nil }
+        return ResidentPropScreenCapability(
+            key: WorldScreenMetadataKey.definition,
+            source: capability.source.rawValue,
+            note: capability.note,
+            aspect: capability.aspect
+        )
+    }
+
     func showPlayer() {
         promoteToForeground()
         if livingWorldContext == nil {
@@ -6238,30 +6297,51 @@ final class AppDelegate:
                     // 任务行那一句同一份字面量。读不到就是 nil（回执里不写这两个键）。
                     guard let self, let context, isCurrent() else { return nil }
                     return self.residentOwnershipRow(objectID: objectID, context: context)
+                }, screenCapability: { [weak self, weak context] objectID in
+                    // 屏幕功能点：这一件物件**真的有屏幕、能播**吗。与 `read_screen` /
+                    // 覆盖层走**同一份**派生（`WorldScreenCapabilityRegistry`，内部是
+                    // 同一个 `WorldScreenResolution.resolve`）。读不到就是 nil ——
+                    // 回执里不写 `screen` 这个键，绝不替一件没有屏幕的物件说"能播"。
+                    guard let self, let context, isCurrent() else { return nil }
+                    return self.residentScreenCapability(objectID: objectID, context: context)
                 }).tools : []
         // 电视机：三条工具（play_screen / stop_screen / read_screen）。
         // 与点唱机同一条纪律 —— 只说"放个视频"而没给链接是**信息不足**，
         // 走成功通道（`insufficient_input`，`isError: false`），不是失败。
         // 适配层只有下面这一处：把 `WorldScreenToolReply` 折成 `RealtimeDJToolResult`。
         //
-        // 没有接线（`screenStore == nil`）时是**空数组**：工具不注册，而不是注册一批
-        // 永远失败的工具 —— 那样 agent 会把"没接线"看成"电视坏了"。
-        let screenTools: [ResidentWorldToolSession.AdditionalTool] =
-            screenStore.map { store in
-                ResidentScreenTools(control: store, isCurrent: isCurrent).tools.map { tool in
-                    ResidentWorldToolSession.AdditionalTool(
-                        name: tool.name, description: tool.description,
-                        inputSchema: tool.inputSchema, validate: { _ in true },
-                        handle: { id, arguments in
-                            let reply = await tool.handle(id, arguments)
-                            return RealtimeDJToolResult(
-                                callID: id, resultJSON: reply.payloadJSON,
-                                isError: reply.isError
-                            )
-                        }
+        // **三条工具无条件进本轮 lease**（真机 2026-10-03 的现场）。
+        // 它们原先挂在 `screenStore` 上（`screenStore.map { … } ?? []`），而 store 只在
+        // `installScreenOverlayIfNeeded()` 里创建、那一条路要求舞台窗口**已经出现过**。
+        // 于是"覆盖层有没有装好"这个**纯画面时机**决定了"agent 这一轮有没有 play_screen"：
+        // 居民开机后的自主那一轮比人类打开空间窗口早，那一轮的清单里就没有这三条；
+        // 而 DSH 的会话清单是**建会话时**定的（`ResidentDSHHostToolSet.parse` 读的是
+        // 那一刻的 `schemasJSON`），人类两分钟后说话时清单里仍然没有 —— 居民只能回
+        // "我这轮没有能把视频投到屏幕上的能力"。
+        //
+        // 现在 control 是一个**无条件存在**的转发器（`WorldScreenControlRelay`）：
+        // 真有调用进来时才去找 store（那时窗口多半已经开了），拿不到就返回**具名且可
+        // 行动**的答复（"是哪一台 + 先打开一次空间窗口"），而不是从清单里消失 ——
+        // "清单里没有"才会让模型说"我没有能力"。
+        let screenTools: [ResidentWorldToolSession.AdditionalTool] = ResidentScreenTools(
+            control: WorldScreenControlRelay(
+                live: { [weak self] in self?.residentScreenControl() },
+                registered: { [weak self] in self?.residentScreenRegistrySnapshot() ?? .empty }
+            ),
+            isCurrent: isCurrent
+        ).tools.map { tool in
+            ResidentWorldToolSession.AdditionalTool(
+                name: tool.name, description: tool.description,
+                inputSchema: tool.inputSchema, validate: { _ in true },
+                handle: { id, arguments in
+                    let reply = await tool.handle(id, arguments)
+                    return RealtimeDJToolResult(
+                        callID: id, resultJSON: reply.payloadJSON,
+                        isError: reply.isError
                     )
                 }
-            } ?? []
+            )
+        }
         // This lease authorizes only registered world, loop and music-library tools for this turn.
         // It does not grant the wider DJ, account, shell or desktop capabilities.
         let dispatcher = WorldAgentToolDispatcher(takeoverEnabled: { true }, context: context,

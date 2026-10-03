@@ -23,14 +23,30 @@
 //   ⑥ `screenTools` 真的并进了本轮的 `additionalTools`（否则 agent 看不见这三条工具：
 //      play_screen / stop_screen / read_screen）；
 //   ⑦ 面板文件仍在仓库里、文件头保留「已从产品界面移除」的原文。
+//   ⑧ **三条工具不依赖覆盖层 / 宿主视图的时机**（真机 2026-10-03）：接线里不许再有
+//      `screenStore.map { … } ?? []` 那种"store 不存在 ⇒ 整批不注册"，必须是
+//      "无条件构造转发器 + 真有调用进来时才去找 store"；
+//   ⑨ 三条工具的 canonical 名只有一处定义（`ResidentScreenTools`）；
+//   ⑩ **屏幕功能点真的注册到物件上**：注册表从物件状态派生，判据只有一处
+//      （`WorldScreenResolution.resolve`），与窗口/覆盖层无关；
+//   ⑪ 那份注册结果在**物件描述里读得到**（`read_owned_props` 的 `screen` 那一行）；
+//   ⑫ 顶层 `interaction_status` 跟着事实走：有屏幕功能点就不许再说 `appearance_only`
+//      （居民那句"这台电视登记的是纯外形摆件"就是读它读出来的）；
+//   ⑬ **有屏幕才说能播**：那一行是条件写入，且没有任何"没注册也兜一份"的路径。
 //
-// 判据是文本级的，因为它要回答的正是"接线在不在"；每一条都配**注入负对照** ——
-// 在源码副本上做手术（删掉那一行 / 把面板加回来），判据必须变红。
+// 判据是文本级的，因为它要回答的正是"接线在不在、**什么时候**在"；每一条都配
+// **注入负对照** —— 在源码副本上做手术（删掉那一行 / 把面板加回来 / 把接线退回时机依赖 /
+// 不注册屏幕功能点 / 描述仍写无功能 / 无条件宣称能播），判据必须变红。
 // 一个从不 FAIL 的门禁等于没有门禁。
+//
+// ⑧ 另有一条**真编译**的复核：`tools/test-living-resident-loop.swift` 原文抽编
+// `makeResidentWorldTools`，在 `screenStore == nil`（= 覆盖层还没接上）的那一支下数清单 ——
+// 退回时机依赖 ⇒ 那里少 3 条 schema、红。
 //
 // 现场演示：`SCREEN_WIRING_INJECT=dropInstallCall swift tools/test-resident-screen-app-wiring.swift`
 // 会把**真源码**当成"接线被删掉"的那一份来判，于是主判据自己打出一条 FAIL。
 // 面板那一条的现场：`SCREEN_WIRING_INJECT=restorePanelInstall …`（面板又回来了 ⇒ FAIL）。
+// 时机依赖那一条的现场：`SCREEN_WIRING_INJECT=timingDependency …`（三条工具退回时机 ⇒ FAIL）。
 import Foundation
 
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
@@ -118,18 +134,27 @@ func productPanelEntryPoints() -> [String] {
 // MARK: 判据
 // ---------------------------------------------------------------------------
 
-/// 判据只看这两份 App 侧源码。`Screen/**` 内部逻辑（遮挡 / 选面那一条线）不在范围内 ——
-/// 接线判据只回答"有没有接上"，不回答"接上之后对不对"。
+/// 判据只看这几份 App 侧源码。`Screen/**` 内部逻辑（遮挡 / 选面那一条线）不在范围内 ——
+/// 接线判据只回答"有没有接上、**什么时候**接上"，不回答"接上之后对不对"。
 struct ScreenWiringSources: Equatable {
     /// `App/GMGNRadioApp.swift`
     var app: String
     /// `VisualEngine/StageWindowController.swift`
     var stage: String
+    /// `Agent/ResidentPropToolBridge.swift`：`read_owned_props` 回执的产地。
+    var bridge: String
+    /// `Screen/WorldScreenMetadata.swift`：屏幕功能点**运行时注册表**的产地。
+    var metadata: String
+    /// `Screen/ResidentScreenTools.swift`：三条工具与 `WorldScreenControlRelay` 的产地。
+    var tools: String
 
     static func load() throws -> ScreenWiringSources {
         ScreenWiringSources(
             app: try read(appRoot.appendingPathComponent("App/GMGNRadioApp.swift")),
-            stage: try read(appRoot.appendingPathComponent("VisualEngine/StageWindowController.swift"))
+            stage: try read(appRoot.appendingPathComponent("VisualEngine/StageWindowController.swift")),
+            bridge: try read(appRoot.appendingPathComponent("Agent/ResidentPropToolBridge.swift")),
+            metadata: try read(appRoot.appendingPathComponent("Screen/WorldScreenMetadata.swift")),
+            tools: try read(appRoot.appendingPathComponent("Screen/ResidentScreenTools.swift"))
         )
     }
 }
@@ -139,6 +164,12 @@ func screenAppWiringProblems(_ sources: ScreenWiringSources) -> [String] {
     var problems: [String] = []
     let app = sources.app
     let stage = sources.stage
+    // 屏幕功能点那三条判据（⑩⑪⑫⑬）读的是**另外三份**生产源码：
+    // 注册表在 `Screen/WorldScreenMetadata.swift`，回执在 `Agent/ResidentPropToolBridge.swift`，
+    // 三条工具的 canonical 名在 `Screen/ResidentScreenTools.swift`。
+    let bridge = sources.bridge
+    let metadata = sources.metadata
+    let tools = sources.tools
 
     // ① App 侧唯一构造点 + 只接一次。
     let constructors = occurrences(of: "WorldScreenStore(", in: app)
@@ -206,13 +237,116 @@ func screenAppWiringProblems(_ sources: ScreenWiringSources) -> [String] {
     }
 
     // ⑥ 三条 agent 工具真的注册进本轮 lease。
-    if !app.contains("ResidentScreenTools(control: store, isCurrent: isCurrent)") {
-        problems.append("⑥ 没有把 store 折成 `ResidentScreenTools`")
+    if !app.contains("control: WorldScreenControlRelay(") {
+        problems.append(
+            "⑥ 没有把控制面折成 `ResidentScreenTools(control: WorldScreenControlRelay(…))`"
+        )
     }
     if !app.contains("+ screenTools") {
         problems.append(
             "⑥ `screenTools` 没有并进 `additionalTools`：play_screen / stop_screen / read_screen 对 agent 不可见"
         )
+    }
+
+    // ⑧ **三条工具不依赖覆盖层 / 宿主视图的时机**（真机 2026-10-03 的现场）。
+    //
+    // 缺陷形状：`screenStore.map { … } ?? []` —— store 只在
+    // `installScreenOverlayIfNeeded()` 里建，而那条路要求舞台窗口已经出现过
+    // （`StageWindowController.stageContentView != nil`）。于是"覆盖层有没有装好"这个
+    // 纯画面时机决定了"agent 这一轮有没有 play_screen"：居民开机后的自主那一轮比人类
+    // 打开空间窗口早 ⇒ 那一轮的清单里没有这三条；DSH 的会话清单是**建会话时**定的
+    // （`ResidentDSHHostToolSet.parse(schemasJSON:)` 读那一刻的 schemasJSON），
+    // 人类两分钟后说话时清单里仍然没有 ⇒ 居民只能答"我这轮没有能把视频投到屏幕上的能力"。
+    //
+    // 所以接线必须是"无条件构造一个转发器、真有调用进来时才去找 store"。
+    // `tools/test-living-resident-loop.swift` 在同一条断言上做了**真编译**的复核：
+    // 它在 `screenStore == nil` 的那一支下数 `makeResidentWorldTools` 的清单，
+    // 退回时机依赖 ⇒ 那里少 3 条、红。
+    // 只在**代码行**上找这个形状：注释里逐字引用这个缺陷形状是文档，不是接线。
+    // （判据不看注释，也不许被注释骗过去。）
+    let timingDependencyHits = app.components(separatedBy: .newlines).filter { line in
+        !line.trimmingCharacters(in: .whitespaces).hasPrefix("//") && line.contains("screenStore.map {")
+    }
+    if !timingDependencyHits.isEmpty {
+        problems.append(
+            "⑧ 三条屏幕工具又挂回了 `screenStore` 的存在性上（`screenStore.map {`，代码行 "
+                + "\(timingDependencyHits.count) 处）：覆盖层/宿主视图的时机一不成立，"
+                + "这一轮的 lease 里就没有这三条工具"
+        )
+    }
+    if !app.contains("let screenTools: [ResidentWorldToolSession.AdditionalTool] = ResidentScreenTools(") {
+        problems.append("⑧ `screenTools` 不是**无条件**构造的（不是 `= ResidentScreenTools(…)`）")
+    }
+    if !app.contains("private func residentScreenControl()") {
+        problems.append(
+            "⑧ 没有 `residentScreenControl()`：control 必须在**调用那一刻**才去找 store / 补装覆盖层"
+        )
+    }
+
+    // ⑨ 三条工具的 canonical 名只有一处定义（`ResidentScreenTools`）。
+    for needle in ["static let playName = \"play_screen\"",
+                   "static let stopName = \"stop_screen\"",
+                   "static let readName = \"read_screen\""] {
+        if !tools.contains(needle) {
+            problems.append("⑨ 三条工具的 canonical 名不在 `ResidentScreenTools` 里：\(needle)")
+        }
+    }
+
+    // ⑩ **屏幕功能点真的注册到物件上**：注册表从**物件状态**派生
+    // （与覆盖层贴面读的是同一个 `WorldScreenResolution.resolve`），
+    // 不依赖窗口、视图树、覆盖层。
+    if !metadata.contains("enum WorldScreenCapabilityRegistry") {
+        problems.append("⑩ 没有屏幕功能点的运行时注册表（`WorldScreenCapabilityRegistry`）")
+    }
+    if !metadata.contains("WorldScreenResolution.resolve(") {
+        problems.append("⑩ 注册表没有走**唯一**那一份几何判据（`WorldScreenResolution.resolve`）")
+    }
+    if !metadata.contains("WorldScreenEligibility.isScreenCandidate(") {
+        problems.append("⑩ 注册表没有走**唯一**那一份入场词法判据（`WorldScreenEligibility.isScreenCandidate`）")
+    }
+    if !metadata.contains("objectStates: [String: WorldObjectState]") {
+        problems.append("⑩ 注册表的输入不是物件状态（读不出世界就又会挂回覆盖层的时机上）")
+    }
+
+    // ⑪ 那份注册结果**在物件描述里读得到**（`read_owned_props` 的 `screen` 那一行）。
+    if !app.contains("screenCapability: { [weak self, weak context] objectID in") {
+        problems.append("⑪ `read_owned_props` 的产地没有拿到屏幕功能点（没接 `screenCapability:`）")
+    }
+    if !bridge.contains("screenCapability: @escaping (String) -> ResidentPropScreenCapability?") {
+        problems.append("⑪ 摆件工具桥没有屏幕功能点的注入点（桥自己不许判屏幕）")
+    }
+    if !bridge.contains("screen: screenCapability(objectID)") {
+        problems.append("⑪ `read_owned_props` 没有把屏幕功能点算进每一件物件")
+    }
+    if !bridge.contains("result[\"screen\"] = screen.payload") {
+        problems.append("⑪ 回执里没有写 `screen` 那一行：agent 读不到「它有屏幕、能播」")
+    }
+
+    // ⑫ 「纯外形摆件 / 无功能」那句必须跟着**事实**走：只要有物件真的有屏幕功能点，
+    // 顶层 `interaction_status` 就不许再说 `appearance_only`。
+    if !bridge.contains("$0[\"capability\"] != nil || $0[\"screen\"] != nil") {
+        problems.append(
+            "⑫ `interaction_status` 没有把屏幕功能点算进去：屋里摆着一台能播的电视时，"
+                + "它照样说 `appearance_only`（真机 2026-10-03 居民就是读着它答出"
+                + "「这台电视在空间里登记的是纯外形摆件」的）"
+        )
+    }
+
+    // ⑬ **有屏幕才说能播**：回执那一行必须是条件写入，且没有任何"兜一份"的路径 ——
+    // 判据是"注册表里有没有这一件"，不是"名字里像不像电视"。
+    if !bridge.contains("if let screen {") {
+        problems.append("⑬ `screen` 那一行不是条件写入的（没注册的物件也会被说成能播）")
+    }
+    for (label, text) in [("App", app), ("摆件工具桥", bridge)] {
+        if text.contains("?? ResidentPropScreenCapability(") {
+            problems.append("⑬ \(label) 里有一条「没注册也兜一份屏幕功能点」的路径：这就是夸口")
+        }
+    }
+    if !app.contains("guard let capability = snapshot.registered.first(where: { $0.objectID == objectID })") {
+        problems.append("⑬ 屏幕功能点不是从**这一件在注册表里**判出来的")
+    }
+    if !app.contains("residentScreenRegistrySnapshot()") {
+        problems.append("⑬ 没有 `residentScreenRegistrySnapshot()`：注册表没有接到 App 这一侧")
     }
     // ⑦ 面板文件**保留**在仓库里（不许 rm），文件头写明它为什么不在产品界面里。
     let panelFile = appRoot.appendingPathComponent("Screen/ScreenPanel.swift")
@@ -247,6 +381,14 @@ enum ScreenWiringInjection: String, CaseIterable {
     case dropToolsRegistration
     /// 再插一个构造点（第二个事实源）。
     case duplicateConstructor
+    /// **把三条工具退回"覆盖层/store 的存在性"这个时机依赖**（真机 2026-10-03 的缺陷形状）。
+    case timingDependency
+    /// **不注册屏幕功能点**：回执里不再写 `screen` 那一行。
+    case dropScreenRegistration
+    /// **描述仍写"无功能"**：不管有没有屏幕功能点，`interaction_status` 都还说 `appearance_only`。
+    case appearanceOnlyAlways
+    /// **无条件宣称能播**：没注册也兜一份屏幕功能点。
+    case unconditionalScreenClaim
 
     func apply(to sources: inout ScreenWiringSources) {
         func drop(_ needle: String, from text: inout String) {
@@ -281,6 +423,34 @@ enum ScreenWiringInjection: String, CaseIterable {
         case .duplicateConstructor:
             // 文本级注入：只要**多一个构造点**，判据①就该红。
             sources.app += "\n// 注入负对照：第二个构造点\nlet injectedSecondScreenStore = WorldScreenStore(\n"
+        case .timingDependency:
+            // 文本级注入：把"无条件转发器"退回 store 的存在性上 —— 判据⑧必须红。
+            // 刻意**保住** `control: WorldScreenControlRelay(` 那一行（否则先红的是判据⑥，
+            // 证明不了⑧这一条真的会抓），只在前面插一条真正的时机守卫。
+            // （不需要编得过：接线判据是文本级的，它回答的正是"接线长什么样"。）
+            sources.app = sources.app.replacingOccurrences(
+                of: "        let screenTools: [ResidentWorldToolSession.AdditionalTool] = ResidentScreenTools(",
+                with: "        // 负对照：三条工具退回「store 存在才注册」\n"
+                    + "        let injectedTimingGuard = screenStore.map { store in store }\n"
+                    + "        let screenTools: [ResidentWorldToolSession.AdditionalTool] = ResidentScreenTools("
+            )
+        case .dropScreenRegistration:
+            // 文本级注入：屏幕功能点不再出现在回执里 —— 判据⑪必须红。
+            drop("result[\"screen\"] = screen.payload\n", from: &sources.bridge)
+        case .appearanceOnlyAlways:
+            // 文本级注入：有屏幕也还说"纯外形" —— 判据⑫必须红。
+            sources.bridge = sources.bridge.replacingOccurrences(
+                of: "$0[\"capability\"] != nil || $0[\"screen\"] != nil",
+                with: "false"
+            )
+        case .unconditionalScreenClaim:
+            // 文本级注入：没注册也兜一份屏幕功能点（夸口）—— 判据⑬必须红。
+            sources.app = sources.app.replacingOccurrences(
+                of: "guard let capability = snapshot.registered.first(where: { $0.objectID == objectID })",
+                with: "let capability = snapshot.registered.first(where: { $0.objectID == objectID })"
+                    + " ?? ResidentPropScreenCapability("
+                    + "key: \"\", source: \"\", note: \"\", aspect: 0)"
+            )
         }
     }
 }
@@ -304,7 +474,9 @@ let problems = screenAppWiringProblems(observed)
 for problem in problems { print("   · \(problem)") }
 check(
     problems.isEmpty,
-    "接线判据：App 侧唯一构造点 + 覆盖层接上舞台窗口 + 面板不出现 + 覆盖层容器在视图树里 + 三条工具注册"
+    "接线判据：App 侧唯一构造点 + 覆盖层接上舞台窗口 + 面板不出现 + 覆盖层容器在视图树里"
+        + " + 三条工具注册且**不依赖覆盖层时机** + 屏幕功能点注册到物件上并在物件描述里读得到"
+        + " + 有屏幕才说能播"
 )
 
 // 判据③的**全树**版本：只看真源码（含菜单 / 所有产品文件）。注入负对照走上面那个

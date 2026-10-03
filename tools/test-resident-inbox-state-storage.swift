@@ -312,6 +312,92 @@ final class TaskdProcess {
     await verifier.restore(worldID: world, residentScope: scopeC.residentScope)
     check(verifier.entry(taskKey: "task-1", worldID: world, residentScope: scopeC.residentScope)?.isRead == true,
         "the read state is durable on the daemon, not a background ACK")
+
+    // 9. 「两次启动」实测：8 条**真机形状**的消息（文案 / 幂等键 / 终态逐字取自
+    //    2026-10-03 真机那份 inbox 记录）。第一次启动：8 条新消息；读一条；
+    //    第二次启动：重新载入 ⇒ 已读保持、条目不重复；同一条消息**终态漂移**
+    //    再投一遍（宿主呈现的会话事实变了）⇒ 仍然不翻未读、不重锚。
+    func realDelivery(_ taskID: String, state: String, sentence: String,
+                      name: String, terminal: Bool) -> ResidentSystemDelivery {
+        ResidentSystemDelivery(
+            eventID: "\(taskID)/wish-prop-\(taskID.lowercased())#\(state)|\(sentence)",
+            taskID: taskID, kind: "wish.task",
+            title: "「\(name)」\(sentence)。", status: "", detail: "", terminal: terminal)
+    }
+    let realDeliveries = [
+        realDelivery("F9682580-DA52-47B5-B10A-B549F09CD23B", state: "placed", sentence: "已摆放",
+                     name: "超大荧幕电视", terminal: true),
+        realDelivery("AEFC68E1-91D4-42F6-AA6A-ED35EDDF9613", state: "ended", sentence: "已删除",
+                     name: "超大荧幕电视", terminal: false),
+        realDelivery("0C285296-9164-4A2B-8FB7-6648E549A4AE", state: "ended", sentence: "已删除",
+                     name: "超大荧幕电视", terminal: false),
+        realDelivery("2F633C0F-A868-4442-AD2A-C73D2A1D04E1", state: "ended", sentence: "已删除",
+                     name: "超大荧幕电视", terminal: false),
+        realDelivery("4210DB95-9253-4CAF-83A3-3C45F090B099", state: "placed", sentence: "已摆放",
+                     name: "2B 白色长剑（外形摆件）", terminal: true),
+        realDelivery("02BFEE6E-82AD-4680-8525-DB2D86791BF1", state: "placed", sentence: "已摆放",
+                     name: "斧头", terminal: true),
+        realDelivery("B8594EB9-AD6C-46D4-A754-99BE7F510042", state: "placed", sentence: "已摆放",
+                     name: "暖光落地灯", terminal: true),
+        realDelivery("EBFC07BE-6AF3-4E25-AF6C-9E795C6E28C6", state: "placed", sentence: "已摆放",
+                     name: "E2E-0907 咖啡机", terminal: true),
+    ]
+    let relaunchScope = "resident-relaunch"
+    let relaunchStorage = storage(socket)
+    let makeRelaunchStore = {
+        ResidentSystemInboxStore(
+            restore: { scope in try await relaunchStorage.restore(scope: ResidentStateScope(
+                worldID: scope.worldID, residentScope: scope.residentScope)) },
+            persist: { scope, entries in try await relaunchStorage.persist(scope: ResidentStateScope(
+                worldID: scope.worldID, residentScope: scope.residentScope), entries: entries) })
+    }
+    let firstLaunch = makeRelaunchStore()
+    for delivery in realDeliveries {
+        _ = await firstLaunch.apply(delivery, worldID: world, residentScope: relaunchScope)
+    }
+    print("· 第一次启动：条目 \(firstLaunch.entries(worldID: world, residentScope: relaunchScope).count) 条，"
+        + "未读 \(firstLaunch.unreadCount(worldID: world, residentScope: relaunchScope))")
+    check(firstLaunch.entries(worldID: world, residentScope: relaunchScope).count == realDeliveries.count,
+        "第一次启动：8 条真机形状的消息各一条，没有重复")
+    check(firstLaunch.unreadCount(worldID: world, residentScope: relaunchScope) == realDeliveries.count,
+        "第一次启动：8 条都未读，角标 8")
+    let readTask = realDeliveries[0].taskID
+    check(await firstLaunch.markRead(taskKey: readTask, worldID: world, residentScope: relaunchScope),
+        "第一次启动：读一条（可靠落盘才算成功）")
+    print("· 读一条之后：未读 \(firstLaunch.unreadCount(worldID: world, residentScope: relaunchScope))")
+    check(firstLaunch.unreadCount(worldID: world, residentScope: relaunchScope) == realDeliveries.count - 1,
+        "第一次启动：读一条之后角标 7")
+
+    let secondLaunch = makeRelaunchStore()
+    await secondLaunch.restore(worldID: world, residentScope: relaunchScope)
+    print("· 第二次启动（重新载入）：条目 \(secondLaunch.entries(worldID: world, residentScope: relaunchScope).count) 条，"
+        + "未读 \(secondLaunch.unreadCount(worldID: world, residentScope: relaunchScope))")
+    check(secondLaunch.entries(worldID: world, residentScope: relaunchScope).count == realDeliveries.count,
+        "第二次启动：条目仍然是 8 条（没有重复）")
+    check(secondLaunch.unreadCount(worldID: world, residentScope: relaunchScope) == realDeliveries.count - 1,
+        "第二次启动：已读仍然是已读，角标仍然是 7")
+    check(secondLaunch.entry(taskKey: readTask, worldID: world, residentScope: relaunchScope)?.isRead == true,
+        "第二次启动：读过的那一条 isRead 仍然是 true")
+    let relaunchAnchor = secondLaunch.entry(taskKey: readTask, worldID: world, residentScope: relaunchScope)?.updatedAt
+    // 终态漂移：同一条消息的 eventID 不变，只有宿主呈现的终态那一栏变了。
+    for delivery in realDeliveries {
+        _ = await secondLaunch.apply(ResidentSystemDelivery(
+            eventID: delivery.eventID, taskID: delivery.taskID, kind: delivery.kind,
+            title: delivery.title, status: delivery.status, detail: delivery.detail,
+            terminal: !delivery.terminal), worldID: world, residentScope: relaunchScope)
+    }
+    print("· 终态漂移后再投一遍：未读 \(secondLaunch.unreadCount(worldID: world, residentScope: relaunchScope))，"
+        + "条目 \(secondLaunch.entries(worldID: world, residentScope: relaunchScope).count)")
+    check(secondLaunch.unreadCount(worldID: world, residentScope: relaunchScope) == realDeliveries.count - 1,
+        "终态漂移后再投一遍：已读没有翻回未读，角标仍然是 7")
+    check(secondLaunch.entries(worldID: world, residentScope: relaunchScope).count == realDeliveries.count,
+        "终态漂移后再投一遍：条目没有多出来")
+    check(secondLaunch.entry(taskKey: readTask, worldID: world, residentScope: relaunchScope)?.updatedAt == relaunchAnchor,
+        "终态漂移后再投一遍：不重锚 30 秒提示窗（updatedAt 一个字不动）")
+    let relaunchVerifier = makeRelaunchStore()
+    await relaunchVerifier.restore(worldID: world, residentScope: relaunchScope)
+    check(relaunchVerifier.unreadCount(worldID: world, residentScope: relaunchScope) == realDeliveries.count - 1,
+        "再开一次（第三次启动）：落库的已读状态仍然是 7 条未读")
 }
 
 @main struct Tests {

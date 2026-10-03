@@ -226,6 +226,24 @@ struct WorldScreenFrameCost: Equatable, Sendable {
     /// 这一帧宿主的 `bounds` 尺寸真的变了（⇒ WebKit 内容进程要重新布局）。
     var didResizeSurface = false
 
+    /// 这一帧**真的**把 `frame` / `layer.transform` 写下去了。
+    ///
+    /// 相机停在原地（或只挪了不到半个像素）时它必须是 `false`：那时写下去的那一份与
+    /// 图层上现成的那一份在屏幕上**分辨不出来**，而每一次写都是一次 CoreAnimation 事务
+    /// （跨进程那一半还要重采样一遍视频层）。这条计数器就是"没白写"的唯一凭据。
+    var didApplyPlacement = false
+    /// 这一帧的相机运动（四角在**视图里**的最大像素位移）。判据读它判"在不在动"。
+    var motionPixels: Float = 0
+    /// 这一帧的**渲染档位**：渲染尺寸 ÷ 全质量尺寸（1.0 = 全质量，0.5 = 半线性）。
+    ///
+    /// 这是"低分辨率 backing 到底降没降、停下有没有回来"的**唯一**口径：光看
+    /// `didShedForMotion` 只说明"判成在动了"，说明不了 backing 真的小了。
+    var renderScale: Float = 1
+    /// 这一帧按**运动降载档位**渲染（低分辨率 backing）。相机停下后必须立刻是 `false`。
+    var didShedForMotion = false
+    /// 这一帧**从降载档位回到了全质量**（上帧在降载、这帧不在）。
+    var didRestoreFromMotion = false
+
     /// 遮挡这一侧：算 + 画（**毫秒**）。字段本身是秒（`CFAbsoluteTimeGetCurrent` 的口径），
     /// 换算只在下面这两个访问器里发生一次 —— 判据读的永远是毫秒。
     var occlusionMilliseconds: Double {
@@ -275,6 +293,25 @@ enum WorldScreenFrameBudget {
     /// 重新布局整页，所以它必须**稀**）。实测改造后 3 次、改造前 120 次 ——
     /// 这条判据抓的是"每帧一次"这个量级。
     static let maximumSurfaceSizeChanges = 8
+
+    // MARK: 镜头运动时降载（2026-10-03「对着电视缩放还是爆卡」）
+
+    /// 相机"在动"的判据：四角在**视图里**的最大像素位移超过它才算动。
+    ///
+    /// 用**像素**而不是相机位姿的米/弧度：真正要保证的是"写下去的那一份与图层上现成的
+    /// 那一份在屏幕上分辨不出来"，而那个分辨率的单位就是像素。取 `0.5 px` 与对齐容差
+    /// **同一个数**，于是"没超过容差就不重写"这条优化**不可能**把对齐判据顶破：
+    /// 跳过的那些帧，屏幕上的偏差本来就 ≤ 0.5 px。
+    static let motionPixelThreshold: Float = 0.5
+    /// 运动中宿主渲染尺寸的档位（1.0 = 全质量）。
+    ///
+    /// 相机连续移动时把 backing 降到 **0.5 线性 ⇒ 1/4 像素**：合成器每帧要重采样的那张
+    /// 纹理小四倍，而屏幕上的四边形被 `layer.transform` 放大回同样的位置 —— 对齐不变、
+    /// 观感在运动中几乎看不出（停下那一帧就回到全质量）。**不是**把覆盖层当纹理：
+    /// 走的仍是 `container.bounds`，渲染管线与 shader 一个字节都没碰。
+    static let motionRenderScale: Float = 0.5
+    /// 降载档位的**下限**（点）：再小就只剩马赛克了，宁可多花那点钱。
+    static let minimumShedDimension: Float = 96
 
     /// 「这一段连续移动有没有超预算」的**唯一**判据。空数组 = 全绿。
     ///
@@ -335,6 +372,91 @@ enum WorldScreenFrameBudget {
                     + "（上限 \(maximumSurfaceSizeChanges)）—— 每次都会让 WebKit 内容进程"
                     + "重新布局并重画整页"
             )
+        }
+        return problems
+    }
+
+    // MARK: 镜头运动这一段的两条闸门（2026-10-03）
+
+    /// 亚像素漂移里，变换更新占的**比例**上限。
+    ///
+    /// 相机每帧只挪不到 `motionPixelThreshold`（半像素）时，写下去的那一份与图层上现成
+    /// 的那一份在屏幕上**分辨不出来** —— 那些写是纯浪费（每一次都是跨进程的一次重采样）。
+    /// 120 帧的亚像素漂移里"写满 120 次"必须红，所以这条闸门是**比例**而不是次数：
+    /// 与帧率、与这一段跑多久都无关。
+    static let maximumSubPixelTransformWriteRatio: Double = 1.0 / 3.0
+
+    /// 「运动中降了载、停下之后一帧内回到全质量」的**唯一**判据。空数组 = 全绿。
+    ///
+    /// - Parameters:
+    ///   - motionFrames: 这一段"相机在动"的帧数（`didShedForMotion` 为真的帧数由
+    ///     `shedFrames` 给）。
+    ///   - shedFrames: 其中**真的按降载档位渲染**的帧数：运动中它必须等于 `motionFrames`
+    ///     （少一帧就是"那一帧没降载"）。
+    ///   - minimumRenderScale: 运动中渲染尺寸相对全质量的最小档位（1.0 = 没降）。
+    ///   - restoredWithinOneFrame: 相机停下的**第一帧**是不是就回到了全质量。
+    ///   - restoredRenderScale: 停下那一帧的渲染档位（1.0 = 全质量）。
+    ///   - averageCostMilliseconds / peakCostMilliseconds: 运动期间我们这一侧每帧的账。
+    ///   - subPixelFrames / subPixelTransformWrites: 亚像素漂移那一段的帧数与变换更新次数。
+    static func motionProblems(
+        motionFrames: Int,
+        shedFrames: Int,
+        minimumRenderScale: Float,
+        restoredWithinOneFrame: Bool,
+        restoredRenderScale: Float,
+        averageCostMilliseconds: Double,
+        peakCostMilliseconds: Double,
+        subPixelFrames: Int,
+        subPixelTransformWrites: Int
+    ) -> [String] {
+        var problems: [String] = []
+        guard motionFrames > 0 else { return ["没有运动帧参与统计：判据没有被驱动"] }
+        if shedFrames < motionFrames {
+            problems.append(
+                "相机在动的 \(motionFrames) 帧里只有 \(shedFrames) 帧按降载档位渲染"
+                    + " —— 运动中的每一帧都该降"
+            )
+        }
+        // 滞回允许它在档位附近浮动一次，所以上界带 `1 + hysteresis`。
+        let ceiling = motionRenderScale * (1 + renderedSizeHysteresis) + 0.02
+        if minimumRenderScale > ceiling {
+            problems.append(
+                String(format: "运动中渲染档位最小只到 %.3f（应当 ≤ %.2f）—— backing 没变小，"
+                       + "合成器每帧重采样的还是全尺寸那张纹理",
+                       minimumRenderScale, ceiling)
+            )
+        }
+        if !restoredWithinOneFrame {
+            problems.append("相机停下之后**没有**在那一帧内恢复（判据没看到恢复那一帧）")
+        }
+        if restoredRenderScale < 1 - 0.01 {
+            problems.append(
+                String(format: "相机停下之后渲染档位还停在 %.3f —— 画面会一直糊着",
+                       restoredRenderScale)
+            )
+        }
+        if averageCostMilliseconds > averageMilliseconds {
+            problems.append(
+                String(format: "运动中每帧平均 %.3f ms 超预算 %.3f ms",
+                       averageCostMilliseconds, averageMilliseconds)
+            )
+        }
+        if peakCostMilliseconds > peakMilliseconds {
+            problems.append(
+                String(format: "运动中单帧峰值 %.3f ms 超预算 %.3f ms",
+                       peakCostMilliseconds, peakMilliseconds)
+            )
+        }
+        if subPixelFrames > 0 {
+            let ratio = Double(subPixelTransformWrites) / Double(subPixelFrames)
+            if ratio > maximumSubPixelTransformWriteRatio + 1e-9 {
+                problems.append(
+                    String(format: "亚像素漂移的 %d 帧里写了 %d 次变换（%.0f%%，上限 %.0f%%）"
+                           + " —— 每帧不到半个像素的位移不该每帧都写",
+                           subPixelFrames, subPixelTransformWrites, ratio * 100,
+                           maximumSubPixelTransformWriteRatio * 100)
+                )
+            }
         }
         return problems
     }

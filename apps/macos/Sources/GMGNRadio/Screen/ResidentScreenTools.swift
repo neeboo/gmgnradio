@@ -139,6 +139,13 @@ struct WorldScreenCommandOutcome: Equatable, Sendable {
         case screenNotFound = "screen_not_found"
         case screenLoadFailed = "screen_load_failed"
         case screenCapacityExceeded = "screen_capacity_exceeded"
+        /// 屏幕**功能点是真的**（几何解析出来了、`read_owned_props` 里读得到），
+        /// 但贴画面的那一层还没接上（舞台窗口一次都还没出现过）。
+        ///
+        /// 它与 `screenNotFound` 是两件事，必须分开：前者说"这件东西不是屏幕"，
+        /// 后者说"这件东西是屏幕，画面还挂不上去"。混成一句会让居民把"窗口没开"
+        /// 说成"这台电视不能放" —— 真机 2026-10-03 用户撞到的正是这个形状。
+        case screenSurfaceUnavailable = "screen_surface_unavailable"
         case invalidArguments = "invalid_arguments"
 
         /// 只有"信息不足"走成功通道。其余都是错误 —— 不许把失败伪装成成功。
@@ -369,7 +376,9 @@ final class ResidentScreenTools {
     /// - 具名：说得出**是哪一件**物件还没被认成屏幕（名字与原因都来自运行时）；
     /// - 可行动：说得出**怎么改**（名字里带上「电视」或「屏幕」，或换一件）；
     /// - 不编：候选为空时就说"一件都没有"，绝不替用户认领一件。
-    private static func screenlessMessage(_ candidates: [WorldScreenCandidate]) -> String {
+    /// `fileprivate`（不是 `private`）：`WorldScreenControlRelay` 没有 live 覆盖层时
+    /// 用的是**同一句**话 —— 两条路的"是哪一件、怎么改"必须逐字同源，不许各写一份。
+    fileprivate static func screenlessMessage(_ candidates: [WorldScreenCandidate]) -> String {
         guard !candidates.isEmpty else {
             return "这个空间里现在没有电视：没有一件物件被认成屏幕。"
                 + "先生成一件名字里带「电视」或「屏幕」的物件，它就会被认成屏幕。"
@@ -445,5 +454,154 @@ extension WorldScreenCandidate {
     /// 消费方不该把它当屏幕读 —— 这正是"不编"在载荷形状上的落地。
     var jsonObject: [String: Any] {
         ["object_id": objectID, "name": displayName, "reason": reason]
+    }
+}
+
+// MARK: - 屏幕功能点的**运行时**注册
+
+/// 一件物件**真的有屏幕、能播**这件事，在运行时的注册结果。
+///
+/// ## 为什么是派生，而不是落一份新存档
+///
+/// 与 `WorldPropAnchorRegistry`（`WorldPropFunctionAnchors.swift`，文件头写明
+/// "锚点不落盘：每次布局变化都从当前物件状态重新派生"）**逐字同一条纪律**：
+/// 纯值、每次重读物件状态重新注册、永不写权威。屏幕走同一条路 ——
+/// - 判据只有一处：`WorldScreenResolution.resolve`（标定 → 推断 → 缺省），
+///   与 `WorldScreenStore.rebuild()` 调的是**同一个函数**，所以"agent 读到它有屏幕"
+///   与"覆盖层真的贴上去"不可能各说各的；
+/// - 入场词法判据也只有一处：`WorldScreenEligibility.isScreenCandidate`；
+/// - 于是**没有任何第二份"这台电视有没有屏幕"**，也没有一个新的落盘键。
+///
+/// 为什么它必须能从**没有覆盖层**的地方派生：真机 2026-10-03 那一轮，居民的工具清单里
+/// 一条屏幕工具都没有（因此它答"我这轮没有能把视频投到屏幕上的能力"），而它读到的
+/// 物件描述又写着 `interaction_status: appearance_only`（因此它答"这台电视登记的是
+/// 纯外形摆件"）。两句话是**同一个断点**的两面：屏幕这件事原先只活在覆盖层 store 里。
+/// 本结构只读 `WorldObjectState`，与窗口、视图树、覆盖层**无关**。
+struct WorldScreenCapability: Equatable, Sendable {
+    let objectID: String
+    let displayName: String
+    /// 几何出处（标定 / 推断 / 缺省）—— 逐字来自 `WorldScreenDefinition.source`。
+    let source: WorldScreenSource
+    /// 出处原话（`WorldScreenDefinition.note`）：不确定就必须说得出来。
+    let note: String
+    /// 屏幕面宽高比（`WorldScreenDefinition.quad.aspect`）。
+    let aspect: Float
+
+    /// 覆盖层还没接上时 `read_screen` 用的只读快照。
+    ///
+    /// 它**不是**"假装有一块屏"：几何与出处来自**同一份** `WorldScreenDefinition`，
+    /// 只有"现在放的是什么"这一栏是空的 —— 覆盖层确实还没接上，确实什么都还没放。
+    var snapshot: WorldScreenSnapshot {
+        WorldScreenSnapshot(
+            objectID: objectID, displayName: displayName,
+            source: source, note: note, aspect: aspect,
+            geometryIssue: nil, contentURL: nil,
+            stateText: Self.surfacePendingText, isPlaying: false
+        )
+    }
+
+    /// 「画面还没接上」那一句：只有覆盖层不存在时会读到它。
+    static let surfacePendingText = "画面还没接上：先打开一次空间窗口。"
+}
+
+/// 一个空间里屏幕功能点的**全部**运行时注册结果。
+struct WorldScreenRegistrySnapshot: Equatable, Sendable {
+    /// 真的有屏幕、能播的物件。
+    var registered: [WorldScreenCapability] = []
+    /// 看起来该有屏幕、但这一帧还没读出可用屏幕范围的物件
+    /// （`read_screen` 回答"是哪一件"的唯一来源）。
+    var candidates: [WorldScreenCandidate] = []
+
+    static let empty = WorldScreenRegistrySnapshot()
+}
+
+/// 三条工具持有的**无条件存在**的 control。
+///
+/// ## 为什么需要它（真机 2026-10-03 的现场）
+///
+/// 之前 App 侧是 `screenStore.map { … } ?? []`，而 `screenStore` 只在
+/// `installScreenOverlayIfNeeded()` 里创建 —— 那一条路要求舞台窗口**已经出现过**
+/// （`StageWindowController.stageContentView != nil`）。居民开机后的自主那一轮
+/// （08:53:45）比人类打开空间窗口早，于是那一轮的 lease 里**没有**这三条工具；
+/// 而 DSH 的会话清单是**建会话时**定的，人类两分钟后说话时清单里依然没有它们 ——
+/// 居民只能回一句"我这轮没有能把视频投到屏幕上的能力"。
+///
+/// 所以"三条工具在不在"这件事**不许**再挂在"覆盖层有没有装好"这个纯画面时机上。
+/// 转发器在任何时刻都构造得出来，因此三条工具**永远在当轮 lease 里**；真有调用进来时
+/// 才去问 `live`（那时窗口可能已经开了）。拿不到 live 时返回**具名且可行动**的答复，
+/// 而不是从清单里消失 —— "清单里没有"会让模型说"我没有能力"，"清单里有但答复具名"
+/// 才会让它把"是哪一件、为什么、怎么改"转告用户。
+@MainActor
+final class WorldScreenControlRelay: WorldScreenControlling {
+    private let live: @MainActor () -> (any WorldScreenControlling)?
+    private let registered: @MainActor () -> WorldScreenRegistrySnapshot
+
+    init(
+        live: @escaping @MainActor () -> (any WorldScreenControlling)?,
+        registered: @escaping @MainActor () -> WorldScreenRegistrySnapshot
+    ) {
+        self.live = live
+        self.registered = registered
+    }
+
+    /// 覆盖层真的接上了没有。只读，不改任何状态。
+    var hasLiveOverlay: Bool { live() != nil }
+
+    func listScreens() -> [WorldScreenSnapshot] {
+        if let live = live() { return live.listScreens() }
+        return registered().registered.map(\.snapshot)
+    }
+
+    func unrecognizedScreenCandidates() -> [WorldScreenCandidate] {
+        if let live = live() { return live.unrecognizedScreenCandidates() }
+        return registered().candidates
+    }
+
+    func playScreen(objectID: String?, rawContent: String) async -> WorldScreenCommandOutcome {
+        guard let live = live() else { return surfaceUnavailable(objectID: objectID) }
+        return await live.playScreen(objectID: objectID, rawContent: rawContent)
+    }
+
+    func stopScreen(objectID: String?) -> WorldScreenCommandOutcome {
+        guard let live = live() else {
+            return .failure(.screenSurfaceUnavailable, "现在没有正在放的电视。")
+        }
+        return live.stopScreen(objectID: objectID)
+    }
+
+    func calibrateScreen(
+        objectID: String, widthMeters: Float, heightMeters: Float, centerHeightMeters: Float
+    ) -> WorldScreenCommandOutcome {
+        guard let live = live() else {
+            return .failure(.screenSurfaceUnavailable, "画面还没接上，现在标定不了屏幕范围。")
+        }
+        return live.calibrateScreen(
+            objectID: objectID, widthMeters: widthMeters,
+            heightMeters: heightMeters, centerHeightMeters: centerHeightMeters
+        )
+    }
+
+    /// 放不了时**具名 + 可行动**：是哪一件、为什么、怎么改。
+    ///
+    /// 两件事必须分开说：
+    /// - 空间里**没有**能播的屏幕 ⇒ 复用 `screenlessMessage`（与 `read_screen` 逐字同源）；
+    /// - 空间里**有**屏幕、只是画面还没接上 ⇒ 说出**是哪一台** + 怎么改（打开一次空间窗口）。
+    private func surfaceUnavailable(objectID: String?) -> WorldScreenCommandOutcome {
+        let snapshot = registered()
+        guard let screen = snapshot.registered.first(where: {
+            objectID == nil || $0.objectID == objectID
+        }) else {
+            return .failure(
+                .screenNotFound,
+                ResidentScreenTools.screenlessMessage(snapshot.candidates),
+                details: ["unrecognized": String(snapshot.candidates.count)]
+            )
+        }
+        return .failure(
+            .screenSurfaceUnavailable,
+            "「\(screen.displayName)」的画面还没接上：空间窗口还没打开过。"
+                + "先打开一次空间窗口，我就能把这条链接放上去。",
+            details: ["screen_id": screen.objectID]
+        )
     }
 }

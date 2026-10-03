@@ -255,7 +255,7 @@ func run(_ path: String, _ arguments: [String]) throws -> Int32 {
 // 「思考 / 说话」符号（唯一来源，见 `tools/test-stage-resident-chat.swift`）。
 // `ResidentOwnershipProjection.swift` 一并编进来：任务行那一句委托给它（唯一出口）。
 let attachmentSources = ["VisualEngine/ResidentStatusBadge.swift", "Presence/ResidentImageAttachment.swift", "Presence/PropImagePreparation.swift", "Presence/PropGenerationClient.swift", "Presence/WishMachineTaskPresentation.swift", "Presence/ResidentOwnershipProjection.swift"].map { base.appendingPathComponent($0).path }
-let compiled = try run("/usr/bin/swiftc", ["-j1", "-parse-as-library", "-target", "arm64-apple-macos14.0", base.appendingPathComponent("DesktopPresence/LiveCamPanel.swift").path, deps.path, tests.path, "-o", binary.path] + attachmentSources)
+let compiled = try run("/usr/bin/swiftc", ["-disable-sandbox", "-j1", "-parse-as-library", "-target", "arm64-apple-macos14.0", base.appendingPathComponent("DesktopPresence/LiveCamPanel.swift").path, deps.path, tests.path, "-o", binary.path] + attachmentSources)
 guard compiled == 0 else { exit(compiled) }
 if CommandLine.arguments.contains("--compile-only") { print("PASS: Live Cam attachment UI compiles; no AppKit runtime started"); exit(0) }
 exit(try run(binary.path, []))

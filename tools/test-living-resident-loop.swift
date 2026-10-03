@@ -298,14 +298,16 @@ typealias RealConversationService = AgentConversationService
     // 与断言无关的成员缺失上。
     private var wishMachineConfiguration: PropGenerationConfiguration?
     private var wishMachineServiceNotice = ""
-    // 电视机：`App/GMGNRadioApp.swift` 的接线补丁（2026-10-01 22:16 落盘）让
-    // `makeResidentWorldTools` 里多了一段 `screenStore.map { … ResidentScreenTools … }`。
-    // 本仿真宿主既然**原文抽编**那个方法，就得照上面 `read_wish_machine_contract`
-    // 同一种方式把这两个名字桩出来 —— 否则门禁红在一个与断言无关的成员缺失上。
+    // 电视机：`App/GMGNRadioApp.swift` 的接线让 `makeResidentWorldTools` 里拼出
+    // `WorldScreenControlRelay` + `ResidentScreenTools`。本仿真宿主既然**原文抽编**
+    // 那个方法，就得照上面 `read_wish_contract` 同一种方式把这些名字桩出来 ——
+    // 否则门禁红在一个与断言无关的成员缺失上。
     //
-    // 桩的语义刻意与生产一致：这里 `screenStore == nil`，正是生产里"没有接线 ⇒
-    // 不注册电视工具"的那一支（`?? []`）。三条屏幕工具本身由
-    // `tools/test-resident-screen-overlay.swift` 专测，不在本仿真里假装。
+    // **桩的语义刻意与生产一致的那一点**：这里 `screenStore == nil`（舞台窗口从没出现过，
+    // 正是生产里"覆盖层还没接上"的那一支）。旧接线（`screenStore.map { … } ?? []`）在这一支
+    // 下会给出 **0** 条屏幕工具 —— 那正是真机 2026-10-03 的缺陷形状。新接线里 control 是
+    // 一个无条件存在的转发器，所以三条工具**照样在**。下面的名单与总数因此把
+    // play_screen / stop_screen / read_screen 算进去：把接线退回时机依赖 ⇒ 这份门禁必须红。
     struct ScreenToolStub {
         struct Reply { let payloadJSON: Data; let isError: Bool }
         let name: String
@@ -313,12 +315,32 @@ typealias RealConversationService = AgentConversationService
         let inputSchema: [String: Any]
         let handle: @MainActor (String, Data) async -> Reply
     }
+    struct WorldScreenRegistrySnapshot { static let empty = WorldScreenRegistrySnapshot() }
+    struct WorldScreenControlRelay {
+        init(live: @escaping @MainActor () -> WorldScreenStore?,
+             registered: @escaping @MainActor () -> WorldScreenRegistrySnapshot) {}
+    }
     struct ResidentScreenTools {
-        init(control: WorldScreenStore, isCurrent: @escaping @MainActor () -> Bool) {}
-        var tools: [ScreenToolStub] { [] }
+        init(control: WorldScreenControlRelay, isCurrent: @escaping @MainActor () -> Bool) {}
+        // 名字与生产 `ResidentScreenTools.toolNames` 逐字一致（由
+        // `tools/test-resident-screen-app-wiring.swift` 的判据 ⑨ 钉住，改一边就红）。
+        var tools: [ScreenToolStub] {
+            ["play_screen", "stop_screen", "read_screen"].map { name in
+                ScreenToolStub(name: name, description: "", inputSchema: ["type": "object"],
+                               handle: { _, _ in ScreenToolStub.Reply(payloadJSON: Data("{}".utf8), isError: false) })
+            }
+        }
     }
     final class WorldScreenStore {}
     private var screenStore: WorldScreenStore?
+    private func residentScreenControl() -> WorldScreenStore? { screenStore }
+    private func residentScreenRegistrySnapshot() -> WorldScreenRegistrySnapshot { .empty }
+    /// `read_owned_props` 回执里 `screen` 那一行的来源。仿真宿主这一支**没有屏幕**
+    /// （`screenStore == nil`），所以它如实返回 nil —— 回执里不写 `screen` 这个键。
+    /// 与 `residentOwnershipRow`（同样 `nil`）同一种桩法：判据不在这里，
+    /// 屏幕功能点注册本身由 `tools/test-resident-screen-capability.swift` 专测。
+    private func residentScreenCapability(objectID: String,
+                                          context: WorldAgentContext) -> ResidentPropScreenCapability? { nil }
     private func bindResidentWishScope(_ context: ResidentWorldContext, loop: ResidentAgentLoop) {}
     private func rebindResidentLoopMemory() {}
     private func residentSelfState() -> ResidentSelfState? { nil }
@@ -549,8 +571,18 @@ func jsonEqual(_ lhs: Any, _ rhs: Any) -> Bool {
                 // 仿真宿主**原文抽编** `makeResidentWorldTools`，所以 App 一多一条工具，
                 // 这里的名单与总数就必须跟着走 —— 否则门禁红在一个与断言无关的数字上。
                 "delete_prop"]
+            // 电视机：三条工具**不依赖覆盖层时机**（真机 2026-10-03 时 lease 里一条都没有，
+            // 居民因此答"我这轮没有能把视频投到屏幕上的能力"）。仿真宿主这一支的
+            // `screenStore == nil` 正是"覆盖层还没接上"；旧接线在这里会给出 0 条 ⇒ 本行红。
+            let screenNames: Set<String> = ["play_screen", "stop_screen", "read_screen"]
             check(previousNames.isSubset(of: names), "\(mode): App retains eight world, two loop and five music tools")
-            check(names == previousNames.union(wishNames).union(referenceNames).union(propNames) && schemas.count == 35, "\(mode): App exposes seven wish (six actions + one read-only parameter interface), two reference and eleven owned-prop tools")
+            check(names == previousNames.union(wishNames).union(referenceNames).union(propNames).union(screenNames) && schemas.count == 38, "\(mode): App exposes seven wish (six actions + one read-only parameter interface), two reference, eleven owned-prop and three screen tools -- 屏幕三条与覆盖层时机无关")
+            // 这一行是**这一轮真实 lease 的清单原文**。仿真宿主从不建 `screenStore`
+            // （恒 nil），所以它就是"覆盖层还没接上"那一支 —— 真机 2026-10-03 的那一轮
+            // 正是这一支，而那里的清单是 35 条、没有 screen 三条。
+            let overlayState = "nil=覆盖层还没接上（仿真宿主从不建 store）"
+            let manifestNames = names.sorted().joined(separator: ",")
+            print("MANIFEST[\(mode)] screenStore=\(overlayState) toolCount=\(schemas.count) tools=\(manifestNames)")
             check(formal.prompts[0].contains("这是居民生活循环的一轮"), "\(mode): actual App supplies generic loop instructions")
             let observed = await tools.call("loop-read", "read_resident_state", Data("{}".utf8))
             check(!observed.isError && !tools.allowsSilentCompletion(), "\(mode): reading state alone does not authorize silent completion")
@@ -979,7 +1011,7 @@ func jsonEqual(_ lhs: Any, _ rhs: Any) -> Bool {
             let codexSchemas: [[String: Any]] = codexTools.flatMap {
                 try? JSONSerialization.jsonObject(with: $0.schemasJSON) as? [[String: Any]]
             } ?? []
-            check(codexSchemas.count == 35, "codex: actual App manifest exposes all 35 production schemas")
+            check(codexSchemas.count == 38, "codex: actual App manifest exposes all 38 production schemas")
             check(codexTools?.visionCapable == false
                   && !codexSchemas.contains { ($0["name"] as? String) == "capture_space_photo" },
                   "codex: absent GPU vision surface registers no capture schema")
@@ -1005,7 +1037,7 @@ func jsonEqual(_ lhs: Any, _ rhs: Any) -> Bool {
             let claudeSchemas: [[String: Any]] = claudeTools.flatMap {
                 try? JSONSerialization.jsonObject(with: $0.schemasJSON) as? [[String: Any]]
             } ?? []
-            check(claudeSchemas.count == 35, "claudeCode: actual App manifest exposes the same 35 production schemas")
+            check(claudeSchemas.count == 38, "claudeCode: actual App manifest exposes the same 38 production schemas")
             check((codexSchemas as NSArray).isEqual(claudeSchemas as NSArray),
                   "claudeCode: actual manifest equals codex manifest as a whole JSON value")
             var fieldsMatch = codexSchemas.count == claudeSchemas.count
@@ -1097,7 +1129,7 @@ func worldRuntimeHarnessFlags() -> [String] {
 let worldRuntimeFlags = worldRuntimeHarnessFlags()
 let worldRuntimeObjects = URL(fileURLWithPath: worldRuntimeFlags[1])
     .deletingLastPathComponent().appendingPathComponent("WorldRuntime.build")
-let compilerArguments: [String] = ["-j1", "-parse-as-library",
+let compilerArguments: [String] = ["-disable-sandbox", "-j1", "-parse-as-library",
     "-I", worldRuntimeFlags[1],
     sources.appendingPathComponent("Agent/CodexCLI.swift").path,
     sources.appendingPathComponent("Agent/AgentConversationService.swift").path,

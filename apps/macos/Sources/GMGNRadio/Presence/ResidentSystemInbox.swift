@@ -30,7 +30,9 @@ public struct ResidentSystemDelivery: Equatable, Sendable {
 /// entry; a genuinely new state flips it back to unread and re-anchors the
 /// on-site prompt clock. `updatedAt` — not wall time — is that anchor, so
 /// refreshes, window reopenings and restarts never extend or reset a terminal
-/// prompt's 30-second lifetime.
+/// prompt's 30-second lifetime. `lastEventID` 是那条消息**自己**的幂等键：
+/// 同一个 id 就是同一个状态，哪怕文案/终态这一轮漂移了，也不翻回未读、不重锚
+/// —— 这正是"重启之后不许再变成未读"的判据。
 public struct ResidentSystemInboxEntry: Codable, Equatable, Sendable, Identifiable {
     public var id: String { taskKey }
     public let taskKey: String
@@ -139,11 +141,11 @@ public final class ResidentSystemInboxStore: ObservableObject {
         await task.value
     }
 
-    /// Applies one delivery. Duplicate or content-identical projections are
-    /// no-ops: they never reset read state and never re-anchor the prompt
-    /// (unless a previous save failed — then the identical projection retries
-    /// it). A genuinely new state merges in place, flips the entry unread and
-    /// only reports success once the merged state is durably persisted.
+    /// Applies one delivery. **同一条消息的身份是它自己的幂等键 `eventID`**：
+    /// id 相同就是同一状态 —— 即使文案或终态这一轮因为会话事实漂移，也绝不翻未读、
+    /// 绝不重锚（只把展示字段刷成最新投影）。id 不同而内容一字不差同样是 no-op：
+    /// 重复投递不重复、不重复落库（除非上一次保存失败 —— 那时由同一条重试）。
+    /// 只有**真的**新状态才原地合并、翻未读，并且只在合并后的状态可靠落库后才报成功。
     @discardableResult
     public func apply(_ delivery: ResidentSystemDelivery, worldID: String, residentScope: String) async -> Bool {
         let scope = ResidentSystemInboxScope(worldID: worldID, residentScope: residentScope)
@@ -151,6 +153,24 @@ public final class ResidentSystemInboxStore: ObservableObject {
         let now = clock()
         if let index = bucket.firstIndex(where: { $0.taskKey == delivery.taskID }) {
             let entry = bucket[index]
+            // 同一事件 ⇒ 同一状态。`isRead` / `readAt` / `updatedAt` / `deliveredAt`
+            // 一个字都不许动：终态那一栏来自宿主呈现（会话事实、面板最近 20 条窗口），
+            // 它今天与上次不同并不代表"这件事又有了新进展"。
+            if entry.lastEventID == delivery.eventID {
+                var refreshed = entry
+                refreshed.kind = delivery.kind
+                refreshed.title = delivery.title
+                refreshed.status = delivery.status
+                refreshed.detail = delivery.detail
+                refreshed.terminal = delivery.terminal
+                guard refreshed != entry else {
+                    guard failedScopes.contains(scope) else { return false }
+                    return await persistIfNeeded(scope)
+                }
+                bucket[index] = refreshed
+                buckets[scope] = bucket
+                return await persistIfNeeded(scope)
+            }
             let unchanged = entry.title == delivery.title && entry.status == delivery.status
                 && entry.detail == delivery.detail && entry.kind == delivery.kind
                 && entry.terminal == delivery.terminal

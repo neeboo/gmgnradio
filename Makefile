@@ -1,4 +1,4 @@
-.PHONY: generate test test-all test-install test-worlds test-daemon test-python test-harnesses _test-harnesses build install install-debug install-universal unregister-product test-icon dedupe verify-registrations
+.PHONY: generate test test-all test-install test-worlds test-daemon test-python test-harnesses _test-harnesses e2e-acceptance build install install-debug install-universal unregister-product test-icon dedupe verify-registrations
 
 # 默认 Release：只有 -O 下"承托网格派生"才是 0.5 s 量级（-Onone 是 6.6 s，
 # 真机一次要六秒多，用户等不了）。想最快编译走 make install-debug。
@@ -254,6 +254,14 @@ test-python:
 test-harnesses:
 	$(BUILD_LOCK) $(MAKE) --no-print-directory _test-harnesses
 
+# 端到端验收：真实 `gmgn-taskd`（UDS）+ 真实回环 HTTP 生成后端 + 真实 `gmgn-mcpd`
+# （stdio）+ Swift 业务层（现编现跑生产源码）+ 真实 WKWebView 官方播放器。
+# 账本（每次 request/回执/id/前后状态/断言）写到 `tmp/e2e-acceptance/ledger.json`。
+# 不需要 Xcode 构建锁；不触发 Keychain/系统授权、不启动已装宿主、不读用户数据。
+# 跑之前先 `cargo build`（提供 target/debug/{gmgn-taskd,gmgn-mcpd}）。
+e2e-acceptance:
+	$(PYTHON) tools/e2e-acceptance.py --ledger tmp/e2e-acceptance/ledger.json
+
 _test-harnesses:
 	swift tools/test-first-use-guidance.swift
 	# 用户可见文案门禁（用户 2026-10-02：「所有的提示，所有的错误提示和 warning 都需要
@@ -397,6 +405,12 @@ _test-harnesses:
 	# 一直都在仓库里、也一直绿着，却**从来没挂进来过** —— 通路改到它身上之后，它必须真的跑。
 	swift tools/test-resident-system-inbox.swift
 	swift tools/test-resident-system-inbox-window.swift
+	# 已读**跨重启**的判据（真机 2026-10-03：同一状态只发一次、重启不重复不重新未读）。
+	# 它拿**真的** `gmgn-taskd` 子进程 + 私有临时 root + Unix socket 驱动
+	# `ResidentSystemInboxStateStorage`：空作用域恢复、CAS 落库、未变内容跳过提交、
+	# 已读翻转、重启后已读仍在、旧 JSON 只读导入、断电可见失败与恢复重试。`TASKD_BIN`
+	# 缺省指向本仓 `services/gmgn-taskd/target/debug/gmgn-taskd`（跑门禁前先 `cargo build`）。
+	swift tools/test-resident-inbox-state-storage.swift
 	swift tools/test-resident-prop-collision-proxy.swift
 	swift tools/test-resident-state-convergence.swift
 	swift tools/test-world-authority-single-writer.swift
@@ -438,6 +452,16 @@ _test-harnesses:
 	# 删掉 / 重复 / 把面板加回来，每一条都必须红。
 	# 现场演示：`SCREEN_WIRING_INJECT=dropInstallCall swift tools/test-resident-screen-app-wiring.swift`。
 	swift tools/test-resident-screen-app-wiring.swift
+	# 电视机「屏幕功能点**真的注册到物件上**」的行为判据（真机 2026-10-03：用户说
+	# 「电视播放这个」，居民答「这台电视在空间里登记的是纯外形摆件，我这一轮也没有能把
+	# 视频投到屏幕上的能力」）。两句话是同一个断点的两面 —— 屏幕这件事原先只活在
+	# `WorldScreenStore` 里，而 store 要等舞台窗口出现过才建。这一份把生产的
+	# `WorldScreenCapabilityRegistry` 与 `WorldScreenControlRelay` 原文切进来**现编现跑**，
+	# 用真机那一轮屋里那五件物件（尺寸逐位来自当时的 `gmgn_read_owned_props` 回执）
+	# 当夹具：物件真的有屏幕才注册、不像屏幕的一件都不许说成能播、覆盖层没接上时
+	# 照样说得清是哪一台且怎么改。四条注入负对照（不注册 / 无条件宣称能播 /
+	# 没有也照说有一台在放 / 退回笼统「我做不到」）每条都必须红。
+	swift tools/test-resident-screen-capability.swift
 	# 「操作屏幕」（用户 2026-10-03：能自动播了，但**网页里一个按钮都点不到**）。
 	# 默认关：不进入这个模式时覆盖层容器 `hitTest` 恒 nil、场景的 14 条输入链与
 	# `consumesScenePointer` 的签名/调用点/语义一个字不改；显式进入（底部控制条上那个
@@ -446,6 +470,17 @@ _test-harnesses:
 	# 进入后 0 → 1 且场景收不到、退出后立刻恢复）与七条注入负对照（默认改成开 / 去掉闸门 /
 	# 进了模式也不给点 / 第二处写开关 / 另造一处判据 / 场景自己判断 / 给裁决点加输入）。
 	swift tools/test-screen-operation-mode.swift
+	# 覆盖层的**两个结构性缺口**（真机 2026-10-03 第二次「镜头对着电视去缩放还是爆卡」）：
+	#   ① 待机不该养着一个 WebKit 内容进程 —— `stop()` 原来只 `stopLoading` + 载空页，
+	#      视图与进程都还在（离线实测：`stop()` 之后 2 s 空转进程仍活着，5.36 s 后仍未退）。
+	#      判据钉"待机时容器子树里没有 WKWebView、本进程一个网页视图都没造过、屏幕上由
+	#      同色占位玻璃呈现"；开始播放才挂上（一次性代价记账），`stop()` 摘下来丢掉引用。
+	#   ② 镜头运动时要降载 —— 相机在动的每一帧按低分辨率 backing 渲染（档位 ≤ 0.5×1.25），
+	#      停下**第一帧**回到全质量；亚像素漂移里变换更新不超过帧数的 1/3；被跳过的帧
+	#      屏幕上偏差本来就 ≤ 0.5 px（对齐判据一个字没放宽）。
+	# 五条注入负对照（待机也挂着 / 关掉不摘视图 / 运动中不降载 / 停在低质量 / 变换每帧都写）
+	# 每一条都必须 FAIL。**-O 现编现跑**：不启动 App、不碰 Metal、不碰网络。
+	swift tools/test-resident-screen-idle-and-motion.swift
 	# 电视的**观感**与**面板人话**（真机 2026-10-02「什么玩意儿」）：GLB 必须带 3 份深色材质
 	# （屏幕深灰偏黑、有一点反光，既不是纯黑也不是灰板）、立柱顶在面板背面上、三轴 / 盒子
 	# 数量 / 面板厚 / 底座进深 / 屏幕面逐位不变；入库与预览的 yaw = 0、屏幕面 pitch = 0

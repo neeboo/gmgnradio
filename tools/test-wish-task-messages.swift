@@ -124,6 +124,23 @@ func channelViolations(app: String) -> [String] {
     if appliers != 1 {
         out.append("投递许愿任务消息的写入者有 \(appliers) 处 —— 收件箱条目只许有一个写入者")
     }
+    // ⑤ 幂等键就是**消息自己的 id**（`WishMachineTaskMessageBuilder.identifier` = 行标识 +
+    //    投影状态）：不许在这里另造一个，尤其不许掺时间/随机 —— 那会让同一条消息每次启动
+    //    都变成"另一条"，于是已读永远回不来、条目还会重复。注入「掺时间/随机」⇒ 必须红。
+    guard let deliveryStart = app.range(of: "let deliveries: [ResidentSystemDelivery]")?.lowerBound,
+          let deliveryEnd = app.range(of: "guard !deliveries.isEmpty", range: deliveryStart..<app.endIndex)?.lowerBound else {
+        out.append("抽不出投递构造（`let deliveries: [ResidentSystemDelivery]` … `guard !deliveries.isEmpty`）")
+        return out
+    }
+    let construction = String(app[deliveryStart..<deliveryEnd])
+    if !construction.contains("eventID: message.id") {
+        out.append("收件箱那条消息的幂等键不是消息自己的 id：投递构造里找不到「eventID: message.id」")
+    }
+    for token in ["UUID()", "Date()", "arc4random", "randomElement", "timeIntervalSince", ".now"]
+    where construction.contains(token) {
+        out.append("消息的幂等键掺了时间/随机：投递构造里出现「\(token)」"
+            + " —— 同一条消息每次启动都会变成另一条，已读永远回不来")
+    }
     return out
 }
 
@@ -199,6 +216,12 @@ func injectRawFieldCopy(into app: String) -> String {
                               with: "                taskID: jobID.uuidString, detail: task.detail ?? \"\",\n")
 }
 
+/// 幂等键掺**时间**：同一条消息每次启动都变成另一条 —— 已读永远回不来、条目重复。
+func injectUnstableEventID(into app: String) -> String {
+    app.replacingOccurrences(of: "                eventID: message.id,\n",
+        with: "                eventID: message.id + \"-\" + String(Date().timeIntervalSince1970),\n")
+}
+
 let panelInjection = ("把许愿任务列表装回去", injectWishTaskPanel(into: overlaySource), { (source: String) in
     panelViolations(overlay: source, repositorySources: repositorySources)
 }) as (String, String, (String) -> [String])
@@ -211,12 +234,16 @@ let detachedInjection = ("把收件箱那条出口摘掉", injectDetachedInbox(i
 let rawFieldInjection = ("把收件箱那一行的文案退回原始字段", injectRawFieldCopy(into: appSource), { (source: String) in
     channelViolations(app: source)
 }) as (String, String, (String) -> [String])
+let unstableEventIDInjection = ("幂等键掺时间（每次启动都是另一条消息）", injectUnstableEventID(into: appSource), { (source: String) in
+    channelViolations(app: source)
+}) as (String, String, (String) -> [String])
 
 for (name, injected, violations, pristine) in [
     (panelInjection.0, panelInjection.1, panelInjection.2, overlaySource),
     (appendInjection.0, appendInjection.1, appendInjection.2, appSource),
     (detachedInjection.0, detachedInjection.1, detachedInjection.2, appSource),
-    (rawFieldInjection.0, rawFieldInjection.1, rawFieldInjection.2, appSource)
+    (rawFieldInjection.0, rawFieldInjection.1, rawFieldInjection.2, appSource),
+    (unstableEventIDInjection.0, unstableEventIDInjection.1, unstableEventIDInjection.2, appSource)
 ] {
     check(injected != pristine, "注入负对照「\(name)」确实改到了源码副本")
     let injectedFailures = violations(injected)
@@ -479,6 +506,26 @@ expect(messages[0].id == WishMachineTaskMessageBuilder.identifier(rows[0]),
     "同一条消息的幂等键稳定：\(messages[0].id)")
 expect(Set(messages.map(\.id)).count == messages.count, "不同状态的幂等键互不相同")
 
+// ── 幂等键在**两次启动**里必须是同一个：同一个投影行、**独立重建**的事实、
+//    不同的时刻；不掺 UUID、不掺时间。注入「掺随机/时间」⇒ 必须 FAIL。──
+var relaunchFacts = job(.claimed, objectID: "prop-e", name: "超大荧幕电视")
+relaunchFacts.objectPresent = true
+relaunchFacts.objectHasGeneratedProp = true
+relaunchFacts.objectIsEnabled = true
+let relaunchedRow = ResidentOwnershipProjection.row(relaunchFacts)
+expect(relaunchedRow.key.identifier == placedRow.key.identifier,
+    "重启后同一行的行标识不变（都是 \(relaunchedRow.key.identifier)）")
+let relaunchID = WishMachineTaskMessageBuilder.identifier(relaunchedRow)
+let earlierID = WishMachineTaskMessageBuilder.identifier(placedRow)
+expect(relaunchID == earlierID,
+    "重启后同一条消息的幂等键不变：两次独立推导都是 \(relaunchID)")
+expect(WishMachineTaskMessageBuilder.message(relaunchedRow)?.id == relaunchID,
+    "消息的 id 就是那一个稳定派生的幂等键")
+let rowIdentity = "11111111-2222-3333-4444-555555555555"
+let withoutRowIdentity = relaunchID.replacingOccurrences(of: rowIdentity, with: "")
+expect(withoutRowIdentity.range(of: uuidPattern, options: .regularExpression) == nil,
+    "幂等键里除了这一行的许愿编号，没有第二个 UUID（不掺随机）：\(relaunchID)")
+
 print(failures == 0 ? "PASS 许愿任务消息判据全部通过" : "FAIL 许愿任务消息判据有 \(failures) 条不通过")
 exit(failures == 0 ? 0 : 1)
 """#
@@ -539,6 +586,8 @@ enum MessageInjection: String, CaseIterable {
     case failureExpires
     /// 把旧文案塞回去：原始 reason（`key=value`）+ 省略号堆叠。
     case oldCopy
+    /// 幂等键掺随机 —— 同一条消息每次启动都是另一条（已读永远回不来）。
+    case unstableID
 
     func apply(to source: String) -> String {
         switch self {
@@ -554,6 +603,10 @@ enum MessageInjection: String, CaseIterable {
             return source.replacingOccurrences(
                 of: "var text = \"「\\(displayName(row))」\\(sentence)。\"",
                 with: "var text = \"「\\(displayName(row))」\\(sentence)：\\(row.reasonText ?? \"\")……\"")
+        case .unstableID:
+            return source.replacingOccurrences(
+                of: "    static func identifier(_ row: OwnershipRow) -> String {\n        \"\\(row.key.identifier)#\\(stateKey(row))\"\n    }",
+                with: "    static func identifier(_ row: OwnershipRow) -> String {\n        \"\\(row.key.identifier)#\\(stateKey(row))#\\(UUID().uuidString)\"\n    }")
         }
     }
 }

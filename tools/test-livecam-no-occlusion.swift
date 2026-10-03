@@ -300,7 +300,7 @@ let attachments = ["VisualEngine/ResidentStatusBadge.swift", "Presence/ResidentI
                    "Presence/WishMachineTaskPresentation.swift", "Presence/ResidentOwnershipProjection.swift"]
     .map { sources.appendingPathComponent($0).path }
 let compiled = try run("/usr/bin/swiftc",
-    ["-j1", "-parse-as-library", "-target", "arm64-apple-macos14.0",
+    ["-disable-sandbox", "-j1", "-parse-as-library", "-target", "arm64-apple-macos14.0",
      panel.path, deps.path, tests.path, "-o", binary.path] + attachments)
 guard compiled == 0 else {
     print("FAIL: 小窗遮挡 harness 编译失败（退出码 \(compiled)）")

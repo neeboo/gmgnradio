@@ -1091,6 +1091,6 @@ defer { try? FileManager.default.removeItem(at: directory) }
 let main = directory.appendingPathComponent("main.swift"), binary = directory.appendingPathComponent("checks")
 try program.write(to: main, atomically: true, encoding: .utf8)
 let compiler = Process(); compiler.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
-compiler.arguments = ["-j1", "-swift-version", "6", "-parse-as-library", main.path, "-o", binary.path]
+compiler.arguments = ["-disable-sandbox", "-j1", "-swift-version", "6", "-parse-as-library", main.path, "-o", binary.path]
 try compiler.run(); compiler.waitUntilExit(); guard compiler.terminationStatus == 0 else { exit(compiler.terminationStatus) }
 let run = Process(); run.executableURL = binary; try run.run(); run.waitUntilExit(); exit(run.terminationStatus)

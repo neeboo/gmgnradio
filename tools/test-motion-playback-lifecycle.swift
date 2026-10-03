@@ -357,5 +357,5 @@ func run(_ executable: String, _ arguments: [String]) throws {
     let process = Process(); process.executableURL = URL(fileURLWithPath: executable); process.arguments = arguments
     try process.run(); process.waitUntilExit(); guard process.terminationStatus == 0 else { exit(process.terminationStatus) }
 }
-try run("/usr/bin/xcrun", ["swiftc", "-parse-as-library", source.path, "-o", directory.appendingPathComponent("test").path])
+try run("/usr/bin/xcrun", ["swiftc", "-disable-sandbox", "-parse-as-library", source.path, "-o", directory.appendingPathComponent("test").path])
 try run(directory.appendingPathComponent("test").path, [])

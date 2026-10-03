@@ -12,6 +12,38 @@ struct ResidentPropDelegatedGrant: Equatable, Sendable {
     let requestID: String
 }
 
+/// 一件物件身上「**它有屏幕、能播**」这件事，在 `read_owned_props` 回执里的形态。
+///
+/// 刻意定义在本文件里、只用 Foundation 类型：`tools/test-resident-prop-tools.swift`
+/// 单独编译本文件 + 夹具，把 `Screen/**` 整条几何推断链拖进来只会让门禁红在与断言无关
+/// 的地方。屏幕几何的**判据**仍然只有一处（`WorldScreenResolution.resolve`），
+/// 这里只是它在回执里的那一行字。
+///
+/// ⚠️ 它**不是**"夸口"：只有屏幕功能点真的注册到这件物件上（几何解析成立）时才存在。
+/// 没注册的物件根本构造不出这个值，回执里也就不写 `screen` 这个键。
+struct ResidentPropScreenCapability: Equatable, Sendable {
+    /// 物件元数据里那个键。字面量与 `WorldScreenMetadataKey.definition` 同一份。
+    let key: String
+    /// 几何出处（标定 / 推断 / 缺省）。不确定时**必须**说得出来源。
+    let source: String
+    /// 出处原话（`WorldScreenDefinition.note`）。
+    let note: String
+    /// 屏幕面宽高比。
+    let aspect: Float
+
+    /// 回执里那一行。`can_play: true` 是**结论**，不是承诺：
+    /// 它只在几何成立时出现（见类型说明）。
+    var payload: [String: Any] {
+        [
+            "key": key,
+            "can_play": true,
+            "source": source,
+            "note": note,
+            "aspect": String(format: "%.4f", aspect),
+        ]
+    }
+}
+
 enum ResidentPropDelegationError: Error, Equatable {
     case inactiveDelegation, surfaceNotAllowed, targetMismatch, requestChanged
 }
@@ -43,13 +75,23 @@ extension ResidentPropDelegationError: LocalizedError {
     /// 查不到（例如刚删掉的物件）就是 `nil` —— 那是"读不到"，回执里不写这两个键，
     /// 绝不编一句。
     private let ownershipRow: (String) -> OwnershipRow?
+    /// 「这一件物件自己**有没有屏幕、能不能播**」——屏幕功能点运行时注册表的注入点。
+    ///
+    /// 与 `ownershipRow` 同一条纪律：桥**不判**、**不存**、**不猜**。真注册了才写
+    /// `screen` 那一行；没注册就是 `nil`，回执里就不写这个键 —— 于是
+    /// "居民敢不敢说能播"与"物件上到底有没有屏幕功能点"是同一件事，不可能各说各的。
+    ///
+    /// 现场（真机 2026-10-03）：居民读到 `interaction_status: appearance_only`、
+    /// 回执里一件带功能的物件都没有，于是它答"这台电视在空间里登记的是纯外形摆件"。
+    private let screenCapability: (String) -> ResidentPropScreenCapability?
     init(service: ResidentPropPlacementService, allowsMutation: Bool,
          isCurrent: @escaping () -> Bool, onChange: @escaping () -> Void = {},
          prepareMutation: @escaping (WorldPropLayoutCommand) async throws -> Void = { _ in },
          delegatedGrant: ResidentPropDelegatedGrant? = nil,
          resolveDelegatedGrant: @escaping (String, WorldPropPlacement) throws -> ResidentPropDelegatedGrant? = { _,_ in nil },
          recordDelegatedPlacement: @escaping (ResidentPropDelegatedGrant, WorldPropPlacement) throws -> Void = { _,_ in },
-         ownershipRow: @escaping (String) -> OwnershipRow? = { _ in nil }) {
+         ownershipRow: @escaping (String) -> OwnershipRow? = { _ in nil },
+         screenCapability: @escaping (String) -> ResidentPropScreenCapability? = { _ in nil }) {
         self.service = service; self.allowsMutation = allowsMutation
         self.isCurrent = isCurrent; self.onChange = onChange
         self.prepareMutation = prepareMutation
@@ -57,6 +99,7 @@ extension ResidentPropDelegationError: LocalizedError {
         self.resolveDelegatedGrant = resolveDelegatedGrant
         self.recordDelegatedPlacement = recordDelegatedPlacement
         self.ownershipRow = ownershipRow
+        self.screenCapability = screenCapability
     }
 
     var tools: [ResidentWorldToolSession.AdditionalTool] {
@@ -370,9 +413,19 @@ extension ResidentPropDelegationError: LocalizedError {
                 guard let objectID = item.generatedProp?.objectID else { return nil }
                 return Self.object(item, heldObjectID: service.context.state.heldProp?.objectID,
                                    holdUnavailableBySlot: Self.holdUnavailableBySlot(service, objectID: objectID),
-                                   ownership: ownershipRow(objectID))
+                                   ownership: ownershipRow(objectID),
+                                   screen: screenCapability(objectID))
             }
-            let interactionStatus = objects.contains { $0["capability"] != nil }
+            // 「这个空间里有没有一件东西是**真的能用**的」——`appearance_only` 的意思是
+            // "每一件都只是外形"。这句话原先只数 `capability`（咖啡机那条绑定能力），
+            // 于是屋里摆着一台**有屏幕、能播**的电视时它照样说 `appearance_only`：
+            // 真机 2026-10-03 居民就是读着它答出"这台电视在空间里登记的是纯外形摆件"的。
+            // 屏幕功能点注册了 ⇒ 这句话就不再成立。判据仍然只有一处（有没有那个键），
+            // 不为屏幕另造一套状态词。
+            let hasUsableCapability = objects.contains {
+                $0["capability"] != nil || $0["screen"] != nil
+            }
+            let interactionStatus = hasUsableCapability
                 ? "capability_bound_use_only" : "appearance_only"
             var payload: [String: Any] = ["ok": true, "layout_revision": service.context.state.layoutRevision,
                 "objects": objects, "can_undo": service.context.state.layoutUndo != nil,
@@ -494,7 +547,8 @@ extension ResidentPropDelegationError: LocalizedError {
 
     private static func object(_ item: WorldObjectState, heldObjectID: String?,
                                holdUnavailableBySlot: [String: String],
-                               ownership: OwnershipRow? = nil) -> [String: Any]? {
+                               ownership: OwnershipRow? = nil,
+                               screen: ResidentPropScreenCapability? = nil) -> [String: Any]? {
         guard let prop = item.generatedProp else { return nil }
         let q = item.transform.rotation
         // 逐挂点的答案**单独拼**（不塞进下面那个大字典字面量里）：嵌套闭包 + `Any` 字面量
@@ -526,6 +580,12 @@ extension ResidentPropDelegationError: LocalizedError {
                 "activity_id": WorldPropActivityTemplate.activityID(
                     objectID: capability.objectID, templateID: capability.templateID),
             ]
+        }
+        // 屏幕功能点：**只有这件物件真的有屏幕**时才写这一行（`screen` 由运行时注册表
+        // 现取，桥自己不判）。没有屏幕的物件不会被说成"能播" —— 判据是"注册表里有没有
+        // 这一件"，不是"名字里像不像电视"。
+        if let screen {
+            result["screen"] = screen.payload
         }
         if let usage = item.propUsage {
             var usagePayload: [String: Any] = ["template_id": usage.templateID,

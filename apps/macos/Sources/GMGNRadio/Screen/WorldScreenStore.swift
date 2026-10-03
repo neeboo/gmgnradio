@@ -537,6 +537,10 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
         contents[target] = content
         source.persistContent?(content)
         surface.geometryIssue = nil
+        // **先挂网页视图，再载页**（2026-10-03：待机不再挂着网页视图，所以"挂上"这一步
+        // 被挪到了播放这条路上）。造的这一次 WebKit 内容进程是这条通路唯一的**一次性**代价，
+        // 它发生在页面开始加载**之前** —— 不叠在视频第一帧上。已经挂着时它是空操作。
+        surface.attachWebViewIfNeeded()
         surface.load(url: url)
 
         // 等一小段时间：能当场具名报出来的失败，就在这**一次**调用里报出去，

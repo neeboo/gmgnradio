@@ -741,7 +741,7 @@ let sourcePaths = files.map { sources.appendingPathComponent("Agent/\($0).swift"
     // 退避/重试预算的**唯一**定义（六处读它）—— 编它，不另抄一套常量。
     + [sources.appendingPathComponent("Presence/RetryBackoff.swift").path]
 let objects = Array(worldRuntimeFlags.dropFirst(2))
-let arguments = ["-j1", "-parse-as-library", "-I", worldRuntimeModules] + sourcePaths +
+let arguments = ["-disable-sandbox", "-j1", "-parse-as-library", "-I", worldRuntimeModules] + sourcePaths +
     [program.path, "-o", temp.appendingPathComponent("test").path] + objects
 let compiled = try run("/usr/bin/swiftc", arguments)
 guard compiled == 0 else { exit(compiled) }
