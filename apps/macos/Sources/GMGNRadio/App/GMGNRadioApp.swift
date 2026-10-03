@@ -887,6 +887,7 @@ final class AppDelegate:
     /// 显式测试（`GMGN_E2E_DATA_ROOT`）时的文件邮箱控制面；生产恒为 nil。
     private var e2eHostControl: E2EHostControl?
     private var e2eWishAuthorizationID: UUID?
+    private var e2eWorldToolLeaseIDs: Set<UUID> = []
     private var livingCabinJukeboxGate = LivingCabinJukeboxGate()
     /// 一次执行实例里已经报过的"点唱机没出声"原因（同一个原因只报一次）。
     private var reportedJukeboxSilenceInstance: String?
@@ -6310,7 +6311,8 @@ final class AppDelegate:
     /// 那一轮才给恢复授权），恢复与领取是两件事。
     private func makeResidentWorldTools(messageID: UUID, wishAuthorizationID: UUID? = nil, allowsPausedWishClaim: Bool = false,
                                        humanOrderedClaim: @escaping @MainActor () -> Bool = { false },
-                                       allowsPropMutation: Bool = false) -> ResidentConversationTools? {
+                                       allowsPropMutation: Bool = false,
+                                       isControlLease: Bool = false) -> ResidentConversationTools? {
         guard AgentConversationService.shared.supportsWorldTools,
               let context = livingWorldContext,
               spatialStage.selectedWorldID == context.manifest.worldID else { return nil }
@@ -6318,7 +6320,9 @@ final class AppDelegate:
         residentActivityOutcome?.abort()
         let isCurrent: @MainActor () -> Bool = { [weak self, weak context] in
             guard let self, let context else { return false }
-            return self.liveCamMessageID == messageID
+            return (isControlLease
+                    ? self.e2eWorldToolLeaseIDs.contains(messageID)
+                    : self.liveCamMessageID == messageID)
                 && self.spatialStage.selectedWorldID == worldID
                 && self.livingWorldContext === context
                 && self.residentPropEditingWorldID == nil
@@ -6327,7 +6331,10 @@ final class AppDelegate:
         // 只能说"已取消或被替换"，而真正的原因（比如空间正在装修）既不上屏也不进日志。
         let currentBlocker: @MainActor () -> String? = { [weak self, weak context] in
             guard let self else { return "应用状态已经释放" }
-            if self.liveCamMessageID != messageID { return "本轮对话已经被新的一轮替换" }
+            let leaseIsCurrent = isControlLease
+                ? self.e2eWorldToolLeaseIDs.contains(messageID)
+                : self.liveCamMessageID == messageID
+            if !leaseIsCurrent { return "本轮对话已经被新的一轮替换" }
             if self.spatialStage.selectedWorldID != worldID { return "已经切换到别的世界" }
             guard let context, self.livingWorldContext === context else { return "生活空间已经重新加载" }
             if self.residentPropEditingWorldID != nil { return "空间正在装修（摆放模式），居民的点唱机操作已失去授权" }
@@ -8695,13 +8702,16 @@ final class AppDelegate:
             throw E2EHostControlError.runtimeUnavailable("世界尚未加载")
         }
         let leaseID = UUID()
-        liveCamMessageID = leaseID
-        defer { if liveCamMessageID == leaseID { liveCamMessageID = nil } }
+        // 控制面与真实居民回合独立持有租约。生成完成的后台回合不得覆盖控制调用，
+        // 控制调用退出也不得清空居民的 liveCamMessageID；世界/装修校验仍由工具执行。
+        e2eWorldToolLeaseIDs.insert(leaseID)
+        defer { e2eWorldToolLeaseIDs.remove(leaseID) }
         guard let tools = makeResidentWorldTools(
             messageID: leaseID,
             wishAuthorizationID: name == "submit_wish_generation" ? e2eWishAuthorizationID : nil,
             allowsPausedWishClaim: true,
-            allowsPropMutation: true
+            allowsPropMutation: true,
+            isControlLease: true
         ) else {
             throw E2EHostControlError.runtimeUnavailable("本轮没有可用的世界工具（服务或空间未就绪）")
         }
