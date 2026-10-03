@@ -73,8 +73,15 @@ final class NativeScreenPlaybackCoordinator {
         let sampledAudioFrames: Int
         let audioPeakAmplitude: Float
         let audioTapAttached: Bool
-        /// 挂载方式（`all-tracks` / `track`）或失败原因，只读诊断。
+        /// 挂载方式（`track:<id>`）或未挂原因（`unsupported:hls-manifest` /
+        /// `disabled:env` / `create_failed:<n>`），只读诊断。
         let audioTapInstallDetail: String
+        /// 卡顿定位：timeControlStatus / 等待原因 / 缓冲健康度。不参与"通过"判定。
+        let timeControlStatus: Int
+        let waitingReason: String
+        let isPlaybackLikelyToKeepUp: Bool
+        let isPlaybackBufferEmpty: Bool
+        let isPlaybackBufferFull: Bool
     }
 
     func metrics(for objectID: String) -> Metrics? {
@@ -95,7 +102,12 @@ final class NativeScreenPlaybackCoordinator {
             sampledAudioFrames: player.audioSampleFrameCount,
             audioPeakAmplitude: player.audioPeakAmplitude,
             audioTapAttached: player.isAudioTapAttached,
-            audioTapInstallDetail: player.audioTapInstallDetail
+            audioTapInstallDetail: player.audioTapInstallDetail,
+            timeControlStatus: player.timeControlStatus,
+            waitingReason: player.waitingReason,
+            isPlaybackLikelyToKeepUp: player.isPlaybackLikelyToKeepUp,
+            isPlaybackBufferEmpty: player.isPlaybackBufferEmpty,
+            isPlaybackBufferFull: player.isPlaybackBufferFull
         )
     }
 

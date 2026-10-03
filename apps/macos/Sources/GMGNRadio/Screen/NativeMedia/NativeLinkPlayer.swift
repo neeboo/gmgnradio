@@ -44,6 +44,12 @@ final class NativeLinkPlayer: NativeScreenMediaPlaying {
     var itemStatus: Int { player?.currentItem?.status.rawValue ?? -1 }
     var currentItemError: String? { player?.currentItem?.error?.localizedDescription }
     var timeControlStatus: Int { player?.timeControlStatus.rawValue ?? -1 }
+    /// 正在等待播放的原因（`AVPlayer.WaitingReason`）；空串 = 没在等。
+    var waitingReason: String { player?.reasonForWaitingToPlay?.rawValue ?? "" }
+    /// 播放管线健康度：卡顿定位用（不参与"通过"判定，只做诊断）。
+    var isPlaybackLikelyToKeepUp: Bool { player?.currentItem?.isPlaybackLikelyToKeepUp ?? false }
+    var isPlaybackBufferEmpty: Bool { player?.currentItem?.isPlaybackBufferEmpty ?? false }
+    var isPlaybackBufferFull: Bool { player?.currentItem?.isPlaybackBufferFull ?? false }
     /// 有没有过至少一帧真正解码出来的画面。**"准备好了"不算**。
     private(set) var decodedFrameCount = 0
     private(set) var gpuCopyCount = 0
@@ -81,7 +87,6 @@ final class NativeLinkPlayer: NativeScreenMediaPlaying {
     /// 真实音频采样器：把解码后的 PCM 计数并测峰值（无麦克风权限）。它按当前 item
     /// 挂一次 `MTAudioProcessingTap`；清单（HLS）要等轨道协商出来后再挂。
     private let audioSampler = NativeAudioSampleTap()
-    private var audioTapTask: Task<Void, Never>?
     /// 资源加载器必须由我们保活（`AVAssetResourceLoader` 不强引用 delegate）。
     private var assetLoaders: [ScreenLinkAssetLoader] = []
     /// 一份私有的目标纹理。每帧从 `CVPixelBuffer` 拷进来一次（一次 GPU blit），
@@ -126,8 +131,6 @@ final class NativeLinkPlayer: NativeScreenMediaPlaying {
     func stop() {
         framePump?.cancel()
         framePump = nil
-        audioTapTask?.cancel()
-        audioTapTask = nil
         audioSampler.reset()
         player?.pause()
         if let output, let item = player?.currentItem {
@@ -239,36 +242,29 @@ final class NativeLinkPlayer: NativeScreenMediaPlaying {
         self.output = output
         self.player = player
         isFrameOutputAttached = true
-        // 有音频轨就**在起播前同步挂**：`AVPlayerItem.audioMix` 必须在播放管线建立
-        // 之前设置才可靠生效；HLS（清单）协商前拿不到 `AVAssetTrack`，用
-        // `AVMutableAudioMixInputParameters()`（trackID 无效 = 作用于全部音轨）。
-        // 挂不上再退回等轨道协商后补挂（分轨 item / 罕见的协商延迟）。
-        if prepared.hasAudio,
-           ProcessInfo.processInfo.environment["GMGN_DISABLE_SCREEN_AUDIO_TAP"] == nil {
-            audioSampler.install(on: item, track: prepared.audioTrack)
-            if !audioSampler.isAttached {
-                attachAudioTapWhenReady(to: item)
-            }
+        // 声音采样 tap **只挂 file-based 媒体**。Apple 对 `AVPlayerItem.audioMix` 的文档
+        // 写得很死：「An audio mix can only be used with file-based media and is not
+        // supported for use with media served using HTTP Live Streaming.」
+        // 本机实测（macOS 26.5.2，同一台 Twitch HLS / Apple VOD HLS / 本地 MP4）：
+        // - 无轨 `AVMutableAudioMixInputParameters()`：HLS 与本地文件**都**把 item 卡在
+        //   preparing（decodedFrames=1、rate=0、tap 只回调 22 次且 PCM 全 0）；
+        // - 带真实轨的混音：本地文件正常采样（peak≈0.157），HLS 被静默忽略（tap 0 次）。
+        // 所以清单/HLS 一律**不设 `audioMix`**，由 `AVPlayer` 原生输出真实声音（不静音、
+        // 不改音量）；只有 file-based（单文件合流 / 分轨 composition）才用真实轨挂 tap。
+        let tapEnabled = ProcessInfo.processInfo.environment["GMGN_DISABLE_SCREEN_AUDIO_TAP"] == nil
+        if !prepared.hasAudio {
+            audioSampler.noteUnavailable("no-audio-declared")
+        } else if !tapEnabled {
+            audioSampler.noteUnavailable("disabled:env")
+        } else if let track = prepared.audioTrack {
+            // file-based：轨道在起播前就已知，同步挂真实轨混音。
+            audioSampler.install(on: item, track: track)
+        } else {
+            // 清单（HLS / 直播）：平台不支持 audioMix，如实记录，不伪造、不卡死播放。
+            audioSampler.noteUnavailable("unsupported:hls-manifest")
         }
         player.play()
         startFramePump()
-    }
-
-    /// 清单 / 直播的音频轨要等 item ready 才出现；等到之后补挂音频采样 tap。
-    private func attachAudioTapWhenReady(to item: AVPlayerItem) {
-        audioTapTask?.cancel()
-        audioTapTask = Task { @MainActor [weak self] in
-            for _ in 0..<60 {
-                if Task.isCancelled { return }
-                if item.status == .readyToPlay { break }
-                try? await Task.sleep(nanoseconds: 100_000_000)
-            }
-            guard !Task.isCancelled, item.status == .readyToPlay else { return }
-            // 协商后能拿到具体音轨就用它；拿不到就退回"全部音轨"参数，绝不因为
-            // 枚举不到 AVAssetTrack 就放弃真实 PCM 采样。
-            let track = (try? await item.asset.loadTracks(withMediaType: .audio))?.first
-            self?.audioSampler.install(on: item, track: track)
-        }
     }
 
     /// 组装好的 item + 它到底有没有声音 + 音频轨（挂采样用）+ 需要保活的资源加载器。
@@ -406,15 +402,30 @@ final class NativeAudioSampleTap: @unchecked Sendable {
         }
     }
 
+    /// 如实记录"为什么没有挂 tap"（诊断用），不改变已挂状态、不伪造采样。
+    /// 例如 HLS/清单：平台文档明确 `AVPlayerItem.audioMix` 不支持 HLS。
+    func noteUnavailable(_ reason: String) {
+        lock.withLock {
+            if !attached { installDetailStorage = reason }
+        }
+    }
+
     /// 把直通 `MTAudioProcessingTap` 挂到 item 的音频混合上。
     ///
-    /// `track` 为 nil 时（HLS/清单在协商前枚举不到 `AVAssetTrack`）使用
-    /// `AVMutableAudioMixInputParameters()`：按 AVFoundation 语义，trackID 为
-    /// `kCMPersistentTrackID_Invalid` 的输入参数**作用于该 item 的全部音频轨**。
-    /// 必须在 `AVPlayer` 起播前设置 `audioMix` 才可靠生效，所以 `NativeLinkPlayer`
-    /// 在 `install(_:)` 里同步调用它，而不是等 `readyToPlay`。
+    /// **只支持 file-based 媒体**。Apple 对 `AVPlayerItem.audioMix` 的原文：
+    /// 「An audio mix can only be used with file-based media and is not supported
+    /// for use with media served using HTTP Live Streaming.」
+    ///
+    /// `track == nil`（HLS/清单协商前拿不到 `AVAssetTrack`）时**绝不**退化成无轨的
+    /// `AVMutableAudioMixInputParameters()`：本机实测那会把播放管线卡死在 preparing
+    /// （`decodedFrames=1`、`rate=0`、PCM 全 0）。这里只记录原因并返回，让 `AVPlayer`
+    /// 用原生音频输出真实声音。
     func install(on item: AVPlayerItem, track: AVAssetTrack?) {
         guard !isAttached else { return }
+        guard let track else {
+            noteUnavailable("unsupported:no-track")
+            return
+        }
         var callbacks = MTAudioProcessingTapCallbacks(
             version: kMTAudioProcessingTapCallbacksVersion_0,
             clientInfo: Unmanaged.passUnretained(self).toOpaque(),
@@ -454,20 +465,12 @@ final class NativeAudioSampleTap: @unchecked Sendable {
             lock.withLock { installDetailStorage = "create_failed:\(createStatus)" }
             return
         }
-        let parameters: AVMutableAudioMixInputParameters
-        let detail: String
-        if let track {
-            parameters = AVMutableAudioMixInputParameters(track: track)
-            detail = "track"
-        } else {
-            parameters = AVMutableAudioMixInputParameters()
-            detail = "all-tracks"
-        }
+        let parameters = AVMutableAudioMixInputParameters(track: track)
         parameters.audioTapProcessor = tap
         let mix = AVMutableAudioMix()
         mix.inputParameters = [parameters]
         item.audioMix = mix
-        lock.withLock { attached = true; installDetailStorage = detail }
+        lock.withLock { attached = true; installDetailStorage = "track:\(track.trackID)" }
     }
 
     /// tap 的 `prepare` 回调给出的真实处理格式。`record` 按它选择正确的采样宽度：

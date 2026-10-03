@@ -24,6 +24,10 @@
 - 已排队在其结束后继续修领取/入库/重启失败，日志 `/tmp/gmgn-dsh-claim-restart-fixes-20261003.log`。同一生产区域串行写，避免两个 DSH 并发修改。
 - 线程自动跟进 automation id gmgnradio，10分钟间隔；无变化安静，实际失败/进展才通知。主代理不得等待用户催问才复验。
 - 验收未通过；继续当前引擎，不覆盖安装App、不操作用户真实状态或Keychain。
+# 18:35 HLS停滞修复后的真实恢复复验
+
+1833当前宿主构建exit0，`/tmp/gmgn-parent-reacceptance-1833-real-app.log` exit1，102pass/1fail/2blocked。HLS视频解码11→74、时钟+2.089s、GPUdraw177/quads177/fragments736497，后续实时443帧/rate1/noError。三类动作姿态/接地、摆放手持放回、重启接地和真实chat delivered通过；HLS声音采样不支持仍阻断，旧通知全已读不能重验新状态翻转。未完成全新生成端到端验收。
+
 # 18:14 真实 App 对话专项复验
 
 当前宿主1813构建exit0，真实App chat专项exit0，7pass0fail0blocked，日志 `/tmp/gmgn-parent-reacceptance-1813-chat.log`。真实输入→可见历史→sendEnteredCount→modelTurnsStarted→delivered终态通过。未将此计为整体验收；此前failed未复现，新增安全失败诊断保留。DSH当前继续音频停滞返工。

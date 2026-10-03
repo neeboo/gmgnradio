@@ -10,6 +10,8 @@
 
 ### 主代理连续验收最新结果
 
+18:35 主代理当前1833宿主构建 exit0，真实App恢复运行 exit1，102pass/1fail/2blocked（`/tmp/gmgn-parent-reacceptance-1833-real-app.log`）。HLS停滞已实际消除：decoded11→74/time+2.089s，GPUdraw177/quads177/fragments736497；后来实时读回decoded443/rate1/noError。三类动作/摆放/手持放回/重启接地与真实chat delivered通过。声音采样仍unsupported:hls-manifest阻断，不当作通过；旧任务已读导致本轮无新未读通知，翻转与重启已读判据不能空跑。继续DSH真实声音证据返工，并按用户授权提交推送当前修复检查点，最终仍须全新生成完整流程。
+
 用户最新明确授权「所有的修改都要提交推送」。本次按两个现有分支分别提交推送主仓库返工与独立Bevy原型，不合并、不替换引擎。此授权取代此前本任务禁止commit/push的边界；禁止reset、清生产数据、Keychain操作和覆盖已装App继续有效。提交是当前进度检查点，不代表完整端到端验收通过。DSH音频返工已暂时停止以稳定提交快照，推送后继续返工。
 
 18:14 chat安全诊断版当前宿主构建 exit0（`/tmp/gmgn-parent-reacceptance-1813-build.log`）；真实App对话专项复验 exit0，7pass0fail0blocked，日志 `/tmp/gmgn-parent-reacceptance-1813-chat.log`。真实输入进入可见历史/sendEnteredCount/modelTurnsStarted，收到delivered终态。此前failed未复现，不能凭此认定原始根因已修；安全诊断保留用于后续复现。该专项运行不计为生成/声音/完整流程通过。DSH音频停滞返工已自动启动，日志 `/tmp/gmgn-dsh-audio-stall-1810.log`，当前查HLS真实tap兼容边界。

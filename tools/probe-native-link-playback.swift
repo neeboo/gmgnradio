@@ -394,13 +394,32 @@ func runLive(pageURL: String, observationSeconds: Double) -> Int32 {
     let isMutedBeforeStop = player.isMuted
     let volumeBeforeStop = player.volume
     let rateBeforeStop = player.playbackRate
+    // timeControlStatus / waitingReason / 缓冲健康度也必须在 stop() 之前读：
+    // stop() 会把 player 置 nil，读到的 -1 会把"播放中"误报成"未播放"。
+    let timeControlStatusBeforeStop = player.timeControlStatus
+    let waitingReasonBeforeStop = player.waitingReason
+    let likelyToKeepUpBeforeStop = player.isPlaybackLikelyToKeepUp
+    let bufferEmptyBeforeStop = player.isPlaybackBufferEmpty
     player.stop()
-    let passed = value.hasAudio && player.hasAudio && player.decodedFrameCount >= 2
+    // 画面判据与声音判据分开：HLS（`videoIsManifest`）平台**不支持**
+    // `AVPlayerItem.audioMix`（Apple 文档原文："An audio mix can only be used with
+    // file-based media and is not supported for use with media served using HTTP Live
+    // Streaming."），所以 HLS 上 tap 一定挂不上。只要画面真的在放，就不能把
+    // "平台不支持声音采样"误报成"播放停滞"，也不能反过来把没采样当声音通过。
+    let videoPassed = value.hasAudio && player.hasAudio && player.decodedFrameCount >= 2
         && player.gpuCopyCount >= 2 && timeAdvanced >= 0.5
-        && audioTapAttached && sampledAudioBuffers > 0 && sampledAudioFrames > 0
+    let audioPassed = audioTapAttached && sampledAudioBuffers > 0 && sampledAudioFrames > 0
         && audioPeakAmplitude > 0
+    let verdict: String
+    if videoPassed && audioPassed {
+        verdict = "PLAYING_NATIVE_SITE_TEXTURE"
+    } else if videoPassed && value.video.isManifest {
+        verdict = "PLAYING_VIDEO_HLS_AUDIO_TAP_UNSUPPORTED"
+    } else {
+        verdict = "FAILED_OR_STALLED"
+    }
     let report: [String: Any] = [
-        "verdict": passed ? "PLAYING_NATIVE_SITE_TEXTURE" : "FAILED_OR_STALLED",
+        "verdict": verdict,
         "site": value.site.rawValue,
         "splitStreams": value.audio != nil,
         "videoFormatID": value.video.formatID,
@@ -425,7 +444,10 @@ func runLive(pageURL: String, observationSeconds: Double) -> Int32 {
         "pixelHeight": player.pixelHeight,
         "timeAdvancedSeconds": timeAdvanced,
         "itemStatus": itemStatusBeforeStop,
-        "timeControlStatus": player.timeControlStatus,
+        "timeControlStatus": timeControlStatusBeforeStop,
+        "waitingReason": waitingReasonBeforeStop,
+        "likelyToKeepUp": likelyToKeepUpBeforeStop,
+        "bufferEmpty": bufferEmptyBeforeStop,
         "playerError": player.currentItemError ?? "",
         "playerState": stateBeforeStop,
         "playerLastError": errorBeforeStop,
@@ -436,7 +458,7 @@ func runLive(pageURL: String, observationSeconds: Double) -> Int32 {
        let json = String(data: data, encoding: .utf8) {
         print(json)
     }
-    return passed ? 0 : 2
+    return verdict == "FAILED_OR_STALLED" ? 2 : 0
 }
 
 @main struct Probe {

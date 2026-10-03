@@ -8804,6 +8804,12 @@ final class AppDelegate:
                     "audioPeakAmplitude": metrics.audioPeakAmplitude,
                     "audioTapAttached": metrics.audioTapAttached,
                     "audioTapInstallDetail": metrics.audioTapInstallDetail,
+                    // 卡顿定位（不参与通过判定）：播放器时间控制状态、等待原因、缓冲健康度。
+                    "timeControlStatus": metrics.timeControlStatus,
+                    "waitingReason": metrics.waitingReason,
+                    "likelyToKeepUp": metrics.isPlaybackLikelyToKeepUp,
+                    "bufferEmpty": metrics.isPlaybackBufferEmpty,
+                    "bufferFull": metrics.isPlaybackBufferFull,
                 ]
             }
             return row
