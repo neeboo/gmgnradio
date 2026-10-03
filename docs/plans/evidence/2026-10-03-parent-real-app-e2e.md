@@ -24,6 +24,10 @@
 - 已排队在其结束后继续修领取/入库/重启失败，日志 `/tmp/gmgn-dsh-claim-restart-fixes-20261003.log`。同一生产区域串行写，避免两个 DSH 并发修改。
 - 线程自动跟进 automation id gmgnradio，10分钟间隔；无变化安静，实际失败/进展才通知。主代理不得等待用户催问才复验。
 - 验收未通过；继续当前引擎，不覆盖安装App、不操作用户真实状态或Keychain。
+# 坐姿误判更正
+
+用户指出默认动作是坐在凳子的坐姿；主代理已确认测试根MotionPackages/.selection.json选中chair-sit-loop-pmx。此前截图和脚面离地数字仅证明坐姿脚高于参考面，不能证明站立悬空缺陷。撤回以此要求PMX强制落地的结论。后续显式idle站姿测试与座面支撑坐姿测试分开，不以activeActivity为空推断当前为站姿。
+
 # 19:00 重启实证与非HLS声音对照
 
 1855宿主构建exit0、Python74pass，真实恢复流程125pass/1fail/3blocked。重启物件位置/承托面/朝向、电视内容与再起播GPU恢复通过，非HLS真实App声音buffers18/frames80532/peak0.0153通过。主代理修PMX格式缓存误判后追加足部专项，8pass1fail，日志 `/tmp/gmgn-parent-restart-foot-1900.log`。已查看真实GPU截图 `/tmp/gmgn-e2e-20261003-1838/evidence/restart-frames/restart-0001.png`，人物悬空；连续脚面离参考面0.2674m，启动早期单点sole0不能算连续贴地。浮地与HLS声音未关闭，仍未完整验收。

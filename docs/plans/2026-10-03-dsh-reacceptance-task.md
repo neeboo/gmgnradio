@@ -10,6 +10,8 @@
 
 ### 主代理连续验收最新结果
 
+用户纠正坐姿误判：已只读确认测试根MotionPackages/.selection.json activeID=`gmgn.motion.bones.chair-sit-loop-pmx`。此前主代理按无activeActivity即站姿、脚离地即悬空作判断不成立；撤回据此要求实际PMX强制落地的返工。坐姿允许脚离地，须检查凳子/座面支撑、骨盆对齐与身体穿模，不能按站姿脚贴地标准调整模型。站姿验收需显式选idle/站立动作，不能用复制包最后选中的chair-sit冒充站姿。DSH旧浮地返工已中止，重新限定为修动作语义和测试前置条件；保留默认坐姿行为，不扩大容差或硬压模型到地面。HLS声音仍未实证，整体验收继续未完成。
+
 19:00 当前1855宿主构建exit0/Python74pass；真实恢复流程exit1，125pass/1fail/3blocked（`/tmp/gmgn-parent-reacceptance-1855-real-app.log`）。重启物件摆放位置/承托面/朝向及电视原始链接/GPU恢复通过（播放需重走生产入口）；实际App非HLS声音对照采到buffers18/frames80532/peak0.0153。浮地诊断被错误缓存_avatar_is_pmx=false跳过，虽然实际avatarFormat=pmx；主代理改用当前status格式。随后专项真实App `/tmp/gmgn-parent-restart-foot-1900.log` exit1，8pass1fail；实际GPU截图 `/tmp/gmgn-e2e-20261003-1838/evidence/restart-frames/restart-0001.png` 已由主代理查看，人物确有悬空。连续采样脚面离参考面约0.2674m；启动早期sole=0的单点通过不能替代连续贴地。contact单点离地0.0871m也失败。需修实际PMX渲染/姿态补偿，并在无活动时逐帧对浮地给双边判据；禁止仅删全身断言或扩大容差。HLS声音输出仍未实证，完整验收继续拒收。
 
 全新根1838真实生成完整脚本运行结束，exit2，114pass/0fail/1blocked（日志 `/tmp/gmgn-parent-fresh-e2e-1838.log`）。真实新生成任务 `1536D3FF-C7DE-4C18-BC04-9529E7E3B2F2`，实际领取入库/摆放/手持放回/人物三类动作/电视真实GPU视频/通知未读转已读及重启已读/真实chat delivered通过。唯一脚本阻断仍是HLS声音采样；不能标整体验收通过。仍需实际App非HLS声音对照与HLS输出证据，并增强重启后物件摆放/屏幕内容恢复readback（已有脚本仅验世界加载/通知/接地，不可夸大）。重启最低接触点3.55m虽未穿地，浮地/姿态视觉尚需核对，不能仅凭单边接地断言关闭视觉验收。
