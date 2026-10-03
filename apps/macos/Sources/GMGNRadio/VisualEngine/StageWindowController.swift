@@ -485,6 +485,11 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     func detachGPUIWorldInteraction() {
         stageContentView?.restoreNativeWorldInteraction()
     }
+    func attachGPUIPlayerSurface(to container: NSView) -> Bool {
+        if window == nil { window = makeWindow() }
+        guard let stageContentView else { return false }
+        return stageContentView.attachGPUIPlayerSurface(to: container)
+    }
 #endif
     func restoreResidentSubmission(_ submission: ResidentChatSubmission, notice: String) {
         residentChat.restore(submission, notice: notice)
@@ -861,6 +866,7 @@ enum ResidentPropRotationHandleAnchor {
 private final class StageContentView: NSView {
 #if GMGN_GPUI_PRODUCT_BOOTSTRAP
     func attachGPUIWorldInteraction(to container: NSView) {
+        restoreNativePlayerSurface()
         worldInteractionView.removeFromSuperview()
         worldInteractionView.frame = container.bounds
         worldInteractionView.autoresizingMask = [.width, .height]
@@ -873,6 +879,7 @@ private final class StageContentView: NSView {
     }
 
     func restoreNativeWorldInteraction() {
+        restoreNativePlayerSurface()
         guard worldInteractionView.superview !== self else { return }
         worldInteractionView.removeFromSuperview()
         worldInteractionView.frame = bounds
@@ -882,6 +889,22 @@ private final class StageContentView: NSView {
         screenOverlayContainer.autoresizingMask = [.width, .height]
         addSubview(screenOverlayContainer, positioned: .above, relativeTo: worldInteractionView)
         window?.acceptsMouseMovedEvents = true
+    }
+    func attachGPUIPlayerSurface(to container: NSView) -> Bool {
+        restoreNativeWorldInteraction()
+        guard let metalView else { return false }
+        metalView.removeFromSuperview()
+        metalView.frame = container.bounds
+        metalView.autoresizingMask = [.width, .height]
+        container.addSubview(metalView)
+        metalView.isHidden = false
+        return true
+    }
+    private func restoreNativePlayerSurface() {
+        guard let metalView, metalView.superview !== self else { return }
+        metalView.removeFromSuperview()
+        metalView.frame = bounds
+        addSubview(metalView, positioned: .below, relativeTo: renderSurfaceContainer)
     }
 #endif
     /// 建造模式的光标回调，转给真正处理鼠标的交互视图。

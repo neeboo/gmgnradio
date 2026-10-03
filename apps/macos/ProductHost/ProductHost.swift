@@ -24,6 +24,7 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
     private var navigationRevision: UInt64 = 0
     private var navigationMode = "space"
     private var navigationPanel: String?
+    private var programRailVisible = false
     private lazy var settings = GPUIProductSettings(runtime: runtime)
     private lazy var programSelection = runtime.gpuiMakeProgramSelection()
 
@@ -179,6 +180,9 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
         stageState["stageRadioPluginEnabled"] = RadioPluginAvailability.isEnabled()
         state["stage"] = stageState
         state["stageProgramRail"] = runtime.gpuiProgramSnapshot(programSelection)
+        state["lyrics"] = runtime.gpuiLyricsSnapshot(isProgramRailVisible: programRailVisible)
+        state["boundVideoPrompt"] = runtime.gpuiBoundVideoPromptSnapshot() as Any? ?? NSNull()
+        state["liveCamPlayerMenu"] = runtime.gpuiLiveCamPlayerMenuSnapshot()
         state["propEditor"] = runtime.gpuiPropSnapshot()
         let autonomy = runtime.gpuiAutonomySnapshot()
         state["autonomy"] = autonomy
@@ -256,6 +260,12 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
     func settingsCommand(_ value: [String: Any]) -> Bool {
         guard started, !stopped else { return false }
         if let op = value["op"] as? String, op.hasPrefix("stage.") {
+            if op == "stage.overlay.state" {
+                guard let visible = value["isProgramRailVisible"] as? Bool else { return false }
+                programRailVisible = visible
+                return true
+            }
+            if op.hasPrefix("stage.video.pending.") { return runtime.gpuiBoundVideoPromptCommand(value) }
             if op == "stage.destination.toggle" { return runtime.gpuiToggleDestination() }
             if op.hasPrefix("stage.autonomy.") { return runtime.gpuiAutonomyCommand(value) }
             if op.hasPrefix("stage.program.") || op == "stage.playlist.open" {
@@ -277,7 +287,7 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
             guard let id = value["requestID"] as? NSNumber, let text = value["text"] as? String,
                   let ids = value["attachmentIDs"] as? [String] else { return false }
             return send(requestID: id.uint64Value, text: text, attachmentIDs: ids)
-        case "chat.attachments.pick", "chat.attachments.paste", "chat.attachments.import", "chat.attachments.remove":
+        case "chat.attachments.pick", "chat.attachments.paste", "chat.attachments.import", "chat.attachments.remove", "chat.attachments.bitmap":
             return runtime.gpuiAttachmentCommand(value)
         case "chat.voice.begin": runtime.beginResidentVoiceFromStage(); return true
         case "chat.voice.finish": runtime.finishResidentVoiceFromStage(); return true
@@ -663,8 +673,9 @@ func gmgnProductHostAction(_ pointer: UnsafeMutableRawPointer?, _ action: Unsafe
 @_cdecl("gmgn_product_host_settings_command")
 func gmgnProductHostSettingsCommand(_ pointer: UnsafeMutableRawPointer?, _ json: UnsafePointer<CChar>?) -> Int32 {
     guard Thread.isMainThread, let json,
-          let data = String(cString: json).data(using: .utf8), data.count <= 256 * 1024,
+          let data = String(cString: json).data(using: .utf8), data.count <= 90 * 1024 * 1024,
           let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return 0 }
+    guard data.count <= 256 * 1024 || value["op"] as? String == "chat.attachments.bitmap" else { return 0 }
     return withProductHost(pointer) { $0.settingsCommand(value) ? 1 : 0 } ?? 0
 }
 

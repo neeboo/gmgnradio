@@ -23,6 +23,90 @@ int gmgn_gpui_set_outer_size(void *viewPointer, double width, double height, dou
 static const void *originalHitKey = &originalHitKey;
 static const void *originalMouseKey = &originalMouseKey;
 static const void *regionsKey = &regionsKey;
+static const void *bitmapRegionKey = &bitmapRegionKey;
+static const void *bitmapQueueKey = &bitmapQueueKey;
+static const void *dragOriginalKey = &dragOriginalKey;
+
+static BOOL bitmapDrag(id<NSDraggingInfo> sender) {
+    NSPasteboard *board = sender.draggingPasteboard;
+    // File drags stay on GPUI's existing ExternalPaths route, even when they
+    // also advertise an image representation.
+    if ([board canReadObjectForClasses:@[NSURL.class] options:@{NSPasteboardURLReadingFileURLsOnlyKey:@YES}]) return NO;
+    return [board availableTypeFromArray:@[NSPasteboardTypePNG, NSPasteboardTypeTIFF]] != nil
+        || [board canReadObjectForClasses:@[NSImage.class] options:@{}];
+}
+
+static BOOL insideBitmapRegion(NSView *view, id<NSDraggingInfo> sender) {
+    NSValue *region = objc_getAssociatedObject(view, bitmapRegionKey);
+    if (!region) return NO;
+    NSPoint point = [view convertPoint:sender.draggingLocation fromView:nil];
+    if (!view.isFlipped) point.y = view.bounds.size.height - point.y;
+    return NSPointInRect(point, region.rectValue);
+}
+
+static IMP originalDrag(NSView *view, SEL selector) {
+    return [objc_getAssociatedObject(view, dragOriginalKey)[NSStringFromSelector(selector)] pointerValue];
+}
+
+static NSDragOperation productDragging(NSView *view, SEL selector, id<NSDraggingInfo> sender) {
+    if (bitmapDrag(sender)) return insideBitmapRegion(view, sender) ? NSDragOperationCopy : NSDragOperationNone;
+    IMP original = originalDrag(view, selector);
+    return original ? ((NSDragOperation (*)(id,SEL,id))original)(view,selector,sender) : NSDragOperationNone;
+}
+
+static BOOL productDrop(NSView *view, SEL selector, id<NSDraggingInfo> sender) {
+    if (!bitmapDrag(sender)) {
+        IMP original = originalDrag(view, selector);
+        return original ? ((BOOL (*)(id,SEL,id))original)(view,selector,sender) : NO;
+    }
+    if (!insideBitmapRegion(view, sender)) return NO;
+    NSPasteboard *board = sender.draggingPasteboard;
+    NSString *type = [board availableTypeFromArray:@[NSPasteboardTypePNG, NSPasteboardTypeTIFF]];
+    NSData *data = type ? [board dataForType:type] : nil;
+    if (!data) {
+        NSImage *image = [[board readObjectsForClasses:@[NSImage.class] options:@{}] firstObject];
+        data = image.TIFFRepresentation;
+        type = NSPasteboardTypeTIFF;
+    }
+    if (!data.length || data.length > 64 * 1024 * 1024) return NO;
+    NSMutableArray *queue = objc_getAssociatedObject(view, bitmapQueueKey);
+    if (!queue) {
+        queue = [NSMutableArray array];
+        objc_setAssociatedObject(view, bitmapQueueKey, queue, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (queue.count >= 4) return NO;
+    NSDictionary *command = @{ @"op":@"chat.attachments.bitmap", @"dataBase64":[data base64EncodedStringWithOptions:0],
+        @"encoding":[type isEqualToString:NSPasteboardTypePNG] ? @"png" : @"tiff" };
+    NSData *json = [NSJSONSerialization dataWithJSONObject:command options:0 error:nil];
+    if (!json) return NO;
+    [queue addObject:json];
+    return YES;
+}
+
+void gmgn_gpui_bitmap_drop_region(void *pointer, double x, double y, double width, double height, int enabled) {
+    if (![NSThread isMainThread] || !pointer) return;
+    objc_setAssociatedObject((__bridge NSView *)pointer, bitmapRegionKey,
+        enabled ? [NSValue valueWithRect:NSMakeRect(x,y,width,height)] : nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// Caller owns the returned C string. Bytes are the actual dragging pasteboard
+// snapshot, never a later read of the general clipboard.
+char *gmgn_gpui_take_bitmap_drop(void *pointer) {
+    if (![NSThread isMainThread] || !pointer) return NULL;
+    NSMutableArray *queue = objc_getAssociatedObject((__bridge NSView *)pointer, bitmapQueueKey);
+    NSData *data = queue.firstObject;
+    if (!data) return NULL;
+    char *result = malloc(data.length + 1);
+    if (!result) return NULL;
+    memcpy(result, data.bytes, data.length);
+    result[data.length] = 0;
+    [queue removeObjectAtIndex:0];
+    return result;
+}
+
+void gmgn_gpui_bitmap_drop_string_free(char *value) {
+    free(value);
+}
 
 static NSView *productHitTest(NSView *self, SEL selector, NSPoint point) {
     CGFloat topY = self.isFlipped ? point.y : self.bounds.size.height - point.y;
@@ -83,6 +167,12 @@ void *gmgn_gpui_surface_container(void *viewPointer, int compact) {
         Method down = class_getInstanceMethod(originalClass, @selector(mouseDown:));
         class_addMethod(routed, @selector(hitTest:), (IMP)productHitTest, method_getTypeEncoding(hit));
         class_addMethod(routed, @selector(mouseDown:), (IMP)productMouseDown, method_getTypeEncoding(down));
+        for (NSString *selectorName in @[@"draggingEntered:", @"draggingUpdated:", @"performDragOperation:"]) {
+            SEL selector = NSSelectorFromString(selectorName);
+            Method method = class_getInstanceMethod(originalClass, selector);
+            class_addMethod(routed, selector, [selectorName isEqualToString:@"performDragOperation:"] ? (IMP)productDrop : (IMP)productDragging,
+                method ? method_getTypeEncoding(method) : ([selectorName isEqualToString:@"performDragOperation:"] ? "c@:@" : "Q@:@"));
+        }
         objc_registerClassPair(routed);
     }
     objc_setAssociatedObject(gpui, originalHitKey,
@@ -90,6 +180,13 @@ void *gmgn_gpui_surface_container(void *viewPointer, int compact) {
     objc_setAssociatedObject(gpui, originalMouseKey,
         [NSValue valueWithPointer:class_getMethodImplementation(originalClass, @selector(mouseDown:))], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     object_setClass(gpui, routed);
+    NSMutableDictionary *dragMethods = [NSMutableDictionary dictionary];
+    for (NSString *selectorName in @[@"draggingEntered:", @"draggingUpdated:", @"performDragOperation:"]) {
+        IMP implementation = class_getMethodImplementation(originalClass, NSSelectorFromString(selectorName));
+        if (implementation) dragMethods[selectorName] = [NSValue valueWithPointer:implementation];
+    }
+    objc_setAssociatedObject(gpui, dragOriginalKey, dragMethods, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [gpui registerForDraggedTypes:@[NSPasteboardTypeFileURL, @"NSFilenamesPboardType", NSPasteboardTypePNG, NSPasteboardTypeTIFF]];
     window.opaque = NO;
     window.backgroundColor = NSColor.clearColor;
     if (compact) window.level = NSFloatingWindowLevel;

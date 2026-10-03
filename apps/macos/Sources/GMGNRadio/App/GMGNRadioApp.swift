@@ -569,6 +569,7 @@ extension AppDelegate {
         // The original product actions call show() and transfer the single
         // surface to native windows. This presentation seam keeps that same
         // renderer mounted in GPUI while changing only the existing world mode.
+        let gpuiContainer = renderer.surfaceView.superview
         stageWindowController?.gpuiPropEditorState.close()
         if spatialStage.isWorldPresentationRequested { spatialStage.exitWorld() }
         else {
@@ -576,6 +577,9 @@ extension AppDelegate {
             spatialStage.requestWorldPresentation()
             if renderer.owner == .gpuiFullStage { stageCameraCoordinator?.activateFullStage() }
             installScreenOverlayIfNeeded()
+        }
+        if renderer.owner == .gpuiFullStage, let gpuiContainer {
+            return gpuiAttachSurface(gpuiContainer, fullStage: true)
         }
         return true
     }
@@ -613,10 +617,117 @@ extension AppDelegate {
         spatialStage.setSpeedBoosted(false)
     }
 
+    func gpuiLiveCamPlayerMenuSnapshot() -> [String: Any] {
+        let value = liveCamPlayerMenuSnapshot()
+        return ["menuTitle": value.menuTitle, "canSelectPrevious": value.canSelectPrevious,
+            "canTogglePlayback": value.canTogglePlayback, "canSelectNext": value.canSelectNext,
+            "playPauseTitle": value.playPauseTitle, "isPlaying": value.isPlaying]
+    }
+
+    func gpuiBoundVideoPromptSnapshot() -> [String: Any]? {
+        guard let prompt = stageVideos.pendingBoundVideo else { return nil }
+        return ["id": prompt.id, "name": prompt.asset.displayName, "assetID": prompt.asset.id,
+            "trackID": prompt.trackID, "trackTitle": prompt.trackTitle, "title": "这首歌有专属画面"]
+    }
+
+    func gpuiBoundVideoPromptCommand(_ command: [String: Any]) -> Bool {
+        guard let op = command["op"] as? String, let id = command["id"] as? String,
+              stageVideos.pendingBoundVideo?.id == id else { return false }
+        switch op {
+        case "stage.video.pending.play": stageVideos.playPendingBoundVideo()
+        case "stage.video.pending.dismiss": stageVideos.dismissBoundVideoPrompt(id: id)
+        default: return false
+        }
+        return true
+    }
+
+    func gpuiLyricsSnapshot(isProgramRailVisible: Bool) -> [String: Any] {
+        let time = audioGraphStorage?.playbackPosition ?? 0
+        let animationTime = Date().timeIntervalSinceReferenceDate
+        let mode = StageLyricModeDirector.resolve(configuredMode: stageLyrics.visualMode,
+            trackID: stageLyrics.trackID, lines: stageLyrics.lines, playbackTime: time)
+        let motion = StageLyricAudioMotion(features: audioFeatures.current, animationTime: animationTime, mode: mode)
+        let flow = StageLyricFlowSceneModel(lines: stageLyrics.lines, playbackTime: time)
+        let depth = StageLyricSceneModel(lines: stageLyrics.lines, playbackTime: time)
+        let fold = StageLyricFoldSceneModel(lines: stageLyrics.lines, playbackTime: time)
+        let partita = flow.activeLine.map { StagePartitaLayoutModel(glyphIDs: flow.glyphs.map(\.id), lineID: $0.id, isChorus: flow.isChorus) }
+        let tilt = flow.activeLine.map { StageTiltLayoutModel(line: $0) }
+        let monet = StageMonetRailModel(lines: stageLyrics.lines, activeLineID: flow.activeLine?.id)
+        let article = StageFumeArticleModel(lines: stageLyrics.lines, activeLineID: flow.activeLine?.id)
+        let wheel = StagePendoloWheelModel(lines: stageLyrics.lines, activeLineID: flow.activeLine?.id)
+        let theme = stageLyrics.activeTheme ?? .gmgnDefaultDark
+        var result: [String: Any] = ["trackID": stageLyrics.trackID as Any? ?? NSNull(),
+            "configuredMode": stageLyrics.visualMode.agentValue, "mode": mode.agentValue,
+            "playbackTime": time, "animationTime": animationTime,
+            "isProgramRailVisible": isProgramRailVisible,
+            "minimumFrameInterval": StageLyricRenderPolicy.minimumFrameInterval,
+            "lines": stageLyrics.lines.map(Self.gpuiLyricLine),
+            "audioFeatures": gpuiAudioFeaturesSnapshot(),
+            "audioMotion": ["expansion": motion.expansion, "beatLift": motion.beatLift,
+                "glow": motion.glow, "particleEnergy": motion.particleEnergy,
+                "low": motion.low, "mid": motion.mid, "high": motion.high, "beat": motion.beat,
+                "onset": motion.onset, "amplitude": motion.amplitude, "sceneEnergy": motion.sceneEnergy],
+            "theme": ["name": theme.name, "primaryHex": theme.primaryHex, "accentHex": theme.accentHex,
+                "secondaryHex": theme.secondaryHex, "backgroundHex": theme.backgroundHex,
+                "primary": Self.gpuiThemeColor(theme.primaryColor), "accent": Self.gpuiThemeColor(theme.accentColor),
+                "secondary": Self.gpuiThemeColor(theme.secondaryColor)] as [String: Any]]
+        result["flow"] = ["activeLine": flow.activeLine.map(Self.gpuiLyricLine) as Any? ?? NSNull(),
+            "previousLine": flow.previousLine.map(Self.gpuiLyricLine) as Any? ?? NSNull(),
+            "nextLine": flow.nextLine.map(Self.gpuiLyricLine) as Any? ?? NSNull(),
+            "translation": flow.translation as Any? ?? NSNull(), "lineProgress": flow.lineProgress,
+            "isChorus": flow.isChorus,
+            "glyphs": flow.glyphs.map { glyph in
+                ["id": glyph.id, "text": glyph.text, "phase": String(describing: glyph.phase),
+                 "progress": glyph.progress, "xOffset": glyph.xOffset, "yOffset": glyph.yOffset,
+                 "rotation": glyph.rotation, "restingScale": glyph.restingScale,
+                 "semanticColorHex": StageLyricKeywordColorResolver(theme: theme).colorHex(for: glyph.text) as Any? ?? NSNull()] as [String: Any]
+            }] as [String: Any]
+        result["depth"] = ["lines": depth.lines.map {
+            ["id": $0.id, "text": $0.text, "position": $0.position, "depth": $0.depth,
+             "opacity": $0.opacity, "blurRadius": $0.blurRadius, "scale": $0.scale] as [String: Any]
+        }]
+        result["fold"] = ["previousLines": fold.previousLines.map(Self.gpuiLyricLine),
+            "currentLines": fold.currentLines.map(Self.gpuiLyricLine), "activeLineID": fold.activeLineID as Any? ?? NSNull(),
+            "direction": String(describing: fold.foldDirection), "transitionProgress": fold.transitionProgress,
+            "groupIndex": fold.groupIndex] as [String: Any]
+        result["partita"] = ["placements": (partita?.placements ?? []).map {
+            ["glyphID": $0.glyphID, "x": $0.x, "y": $0.y, "scale": $0.scale, "rotationDegrees": $0.rotationDegrees] as [String: Any]
+        }]
+        result["tilt"] = ["segments": (tilt?.segments ?? []).map {
+            ["id": $0.id, "text": $0.text, "revealAt": $0.revealAt, "isTilted": $0.isTilted,
+             "xOffset": $0.xOffset, "yOffset": $0.yOffset] as [String: Any]
+        }]
+        result["monet"] = ["entries": monet.entries.map {
+            ["line": Self.gpuiLyricLine($0.line), "offset": $0.offset, "status": String(describing: $0.status)] as [String: Any]
+        }]
+        result["article"] = ["blocks": article.blocks.map {
+            ["lineID": $0.lineID, "text": $0.text, "x": $0.position.x, "y": $0.position.y,
+             "width": $0.width, "emphasis": $0.emphasis] as [String: Any]
+        }, "cameraTarget": ["x": article.cameraTarget.x, "y": article.cameraTarget.y]] as [String: Any]
+        result["wheel"] = ["items": wheel.items.map {
+            ["line": Self.gpuiLyricLine($0.line), "angleDegrees": $0.angleDegrees, "x": $0.x, "y": $0.y,
+             "opacity": $0.opacity, "scale": $0.scale, "isActive": $0.isActive] as [String: Any]
+        }]
+        return result
+    }
+
+    private static func gpuiLyricLine(_ line: StageLyricLine) -> [String: Any] {
+        ["id": line.id, "text": line.text, "translation": line.translation as Any? ?? NSNull(),
+            "start": line.startsAt, "end": line.endsAt,
+            "words": line.words.map { ["id": $0.id, "text": $0.text, "start": $0.startsAt, "end": $0.endsAt] as [String: Any] }]
+    }
+
+    private static func gpuiThemeColor(_ color: Color) -> [String: Double] {
+        let value = NSColor(color).usingColorSpace(.sRGB) ?? NSColor(color)
+        return ["red": Double(value.redComponent), "green": Double(value.greenComponent), "blue": Double(value.blueComponent)]
+    }
+
     private func gpuiAudioFeaturesSnapshot() -> [String: Any] {
         let features = audioFeatures.current
         return ["amplitude": features.amplitude, "low": features.low, "mid": features.mid,
-            "high": features.high, "waveform": (0..<8).map { features.waveform[$0] }]
+            "high": features.high, "bass": features.bass, "lowMid": features.lowMid, "sceneMid": features.sceneMid,
+            "vocal": features.vocal, "treble": features.treble, "beat": features.beat, "onset": features.onset,
+            "waveform": (0..<8).map { features.waveform[$0] }, "spectrum": (0..<8).map { features.spectrum[$0] }]
     }
 
     func gpuiInboxSnapshot() -> [String: Any] {
@@ -673,6 +784,15 @@ extension AppDelegate {
         switch op {
         case "chat.attachments.pick": store.chooseImages()
         case "chat.attachments.paste": return store.paste(from: .general)
+        case "chat.attachments.bitmap":
+            let maximumBytes = 64 * 1024 * 1024
+            guard let encoding = command["encoding"] as? String,
+                  encoding == "png" || encoding == "tiff",
+                  let encoded = command["dataBase64"] as? String,
+                  !encoded.isEmpty, encoded.utf8.count <= ((maximumBytes + 2) / 3) * 4,
+                  let imageData = Data(base64Encoded: encoded),
+                  !imageData.isEmpty, imageData.count <= maximumBytes else { return false }
+            Task { await store.add(imageData: imageData) }
         case "chat.attachments.remove":
             guard let raw = command["id"] as? String, let id = UUID(uuidString: raw),
                   store.attachments.contains(where: { $0.id == id }) else { return false }
@@ -707,7 +827,22 @@ extension AppDelegate {
         let activities = LivingWorldActivityMenuStore.shared
         let canRun = StageActivityAvailability.canRun(isWorldVisible: spatialStage.isWorldVisible,
             selectedWorldID: spatialStage.selectedWorldID, activityWorldID: activities.worldID)
+        let presentation = StageSurfacePresentationState.resolve(
+            isWorldPresentationRequested: spatialStage.isWorldPresentationRequested,
+            isWorldVisible: spatialStage.isWorldVisible)
         return [
+            "presentation": [
+                "isWorldPresentationRequested": spatialStage.isWorldPresentationRequested,
+                "isWorldVisible": spatialStage.isWorldVisible,
+                "isDestinationButtonHidden": presentation.isDestinationButtonHidden,
+                "isWorldInteractionHidden": presentation.isWorldInteractionHidden,
+                "isPointCloudHidden": presentation.isPointCloudHidden,
+                "isLoadingIndicatorHidden": presentation.isLoadingIndicatorHidden,
+                "isSpatialWorldHidden": presentation.isSpatialWorldHidden,
+                "chatAvailable": spatialStage.isWorldPresentationRequested,
+                "propsAvailable": spatialStage.isWorldPresentationRequested,
+                "taskFeedbackVisible": spatialStage.isWorldPresentationRequested
+            ],
             "mode": spatialStage.isWorldPresentationRequested ? "space" : "player",
             "space": [
                 "worlds": marbleWorldLibrary.publicExampleWorlds.map { ["id": $0.id, "name": $0.name] },
@@ -845,7 +980,10 @@ extension AppDelegate {
         }
         controller.attachToGPUI(container, fullStage: fullStage)
         if fullStage {
-            guard stageWindowController?.attachGPUIWorldInteraction(to: container) == true else {
+            let attached = spatialStage.isWorldPresentationRequested
+                ? stageWindowController?.attachGPUIWorldInteraction(to: container)
+                : stageWindowController?.attachGPUIPlayerSurface(to: container)
+            guard attached == true else {
                 controller.detach(from: controller.owner)
                 return false
             }

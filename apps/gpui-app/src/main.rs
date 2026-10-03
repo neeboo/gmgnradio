@@ -1,15 +1,22 @@
 use gmgn_gpui_ui::{ResidentChatPane, state::{ChatCommand, TranscriptLine}};
 use gpui_kit::component::{button::*, *};
+use gpui_kit::component::menu::{DropdownMenu,PopupMenuItem};
 use gmgn_gpui_ui::settings::AgentSettingsPane;
 use gmgn_gpui_ui::inbox::InboxPane;
 use gmgn_gpui_ui::stage_panels::{StagePanelsPane,StageProgramRailPane,ResidentPropEditorPane};
+use gmgn_gpui_ui::lyrics::{StageLyricsPane,StageBoundVideoPromptPane};
 use gpui_kit::*;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use std::{cell::RefCell, rc::Rc, time::Duration};
+use std::{cell::RefCell, rc::Rc, time::Duration,ffi::{c_void,c_char,CStr}};
 mod host_events;
 mod product_host;
 use product_host::ProductHost;
 gpui_kit::actions!(gmgn_product, [Quit,ShowSettings,ShowLiveCam,EscapeStage]);
+unsafe extern "C" {
+    fn gmgn_gpui_bitmap_drop_region(view:*mut c_void,x:f64,y:f64,w:f64,h:f64,enabled:i32);
+    fn gmgn_gpui_take_bitmap_drop(view:*mut c_void)->*mut c_char;
+    fn gmgn_gpui_bitmap_drop_string_free(value:*mut c_char);
+}
 
 fn composer_frame(compact:bool,width:f32,height:f32)->[f32;4] {
     if compact {[10.,height-80.,(width-58.).max(0.),70.]} else {
@@ -20,13 +27,17 @@ fn composer_frame(compact:bool,width:f32,height:f32)->[f32;4] {
 fn inbox_unread(state:&serde_json::Value)->usize {
     state["inbox"]["entries"].as_array().map_or(0,|entries|entries.iter().filter(|entry|entry["isRead"].as_bool()==Some(false)).count())
 }
+fn latest_reply_revision(state:&serde_json::Value)->Option<String> {
+    let reply=state["transcript"].as_array()?.iter().rev().find(|line|line["role"].as_str()==Some("agent"))?;
+    Some(format!("{}:{}:{}",state["contextID"].as_str().unwrap_or(""),reply["turnID"].as_str().unwrap_or(""),reply["text"].as_str()?))
+}
 fn control_icon(id:&str)->gpui_kit::assets::IconName {
     use gpui_kit::assets::IconName;
     match id {
         "space"=>IconName::House,"player"=>IconName::Music,"program"=>IconName::ListMusic,
         "previous"=>IconName::SkipBack,"next"=>IconName::SkipForward,"play"=>IconName::Play,
         "voice"=>IconName::Mic,"chat"=>IconName::MessageCircle,"inbox"=>IconName::Mail,
-        "props"=>IconName::Package,"screen"=>IconName::Monitor,"visual"=>IconName::Settings,
+        "props"=>IconName::Package,"screen"=>IconName::Monitor,"visual"=>IconName::SlidersHorizontal,
         "mode"=>IconName::Maximize,_=>IconName::Settings,
     }
 }
@@ -43,6 +54,8 @@ struct GMGNProductUI {
     program_pane: Entity<StageProgramRailPane>,
     program_open: bool,
     prop_pane: Entity<ResidentPropEditorPane>,
+    lyrics_pane:Entity<StageLyricsPane>,
+    bound_video_pane:Entity<StageBoundVideoPromptPane>,
     props_open: bool,
     chat_open: bool,
     voice_held: bool,
@@ -56,6 +69,9 @@ struct GMGNProductUI {
     navigation_revision:u64,
     main_window:Rc<RefCell<Option<AnyWindowHandle>>>,
     profile_switch_pending:bool,
+    dismissed_reply_revision:Option<String>,
+    player_menu_open:bool,
+    program_visibility_reported:Option<bool>,
     _poll: Task<()>,
 }
 
@@ -66,10 +82,29 @@ impl GMGNProductUI {
         self.accepted = false;
     }
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Ok(handle)=HasWindowHandle::window_handle(window) {
+            if let RawWindowHandle::AppKit(handle)=handle.as_raw() {
+                for _ in 0..4 {
+                    let packet=unsafe{gmgn_gpui_take_bitmap_drop(handle.ns_view.as_ptr())};
+                    if packet.is_null(){break;}
+                    let command=unsafe{serde_json::from_slice::<serde_json::Value>(CStr::from_ptr(packet).to_bytes())};
+                    unsafe{gmgn_gpui_bitmap_drop_string_free(packet)};
+                    let accepted=command.ok().filter(|command|command["op"].as_str()==Some("chat.attachments.bitmap"))
+                        .is_some_and(|command|self.host.borrow().as_ref().is_some_and(|host|host.settings_command(&command)));
+                    if !accepted{self.core_notice=Some("这张拖入的图片未能导入，请重试。".into());cx.notify();}
+                }
+            }
+        }
+        if self.program_visibility_reported!=Some(self.program_open) {
+            if self.host.borrow().as_ref().is_some_and(|host|host.settings_command(&serde_json::json!({"op":"stage.overlay.state","isProgramRailVisible":self.program_open}))) {
+                self.program_visibility_reported=Some(self.program_open);
+            }
+        }
         let stage_commands=self.stage_pane.update(cx,|pane,_|pane.take_commands());
         let program_commands=self.program_pane.update(cx,|pane,_|pane.take_commands());
         let prop_commands=self.prop_pane.update(cx,|pane,_|pane.take_commands());
-        for command in stage_commands.into_iter().chain(program_commands).chain(prop_commands) {
+        let bound_commands=self.bound_video_pane.update(cx,|pane,_|pane.take_commands());
+        for command in stage_commands.into_iter().chain(program_commands).chain(prop_commands).chain(bound_commands) {
             if !self.host.borrow().as_ref().is_some_and(|host|host.settings_command(&command)) {
                 self.core_notice=Some("场景操作未完成，原状态保持不变。".into());cx.notify();
             }
@@ -189,10 +224,14 @@ impl GMGNProductUI {
             self.stage_pane.update(cx,|pane,cx|pane.update_snapshot(batch.state["stage"].clone(),window,cx));
             self.program_pane.update(cx,|pane,cx|pane.update_snapshot(batch.state["stageProgramRail"].clone(),window,cx));
             self.prop_pane.update(cx,|pane,cx|pane.update_snapshot(batch.state["propEditor"].clone(),window,cx));
+            self.lyrics_pane.update(cx,|pane,cx|pane.update_snapshot(batch.state["lyrics"].clone(),window,cx));
+            self.bound_video_pane.update(cx,|pane,cx|pane.update_snapshot(batch.state["boundVideoPrompt"].clone(),window,cx));
             if let Some(open)=batch.state["propEditor"]["isOpen"].as_bool() {self.props_open=open;}
             self.settings_pane.update(cx,|pane,cx|pane.update_snapshot(batch.state["settings"].clone(),window,cx));
             self.runtime_state = batch.state; cx.notify();
         }
+        if !self.compact&&self.runtime_state["stage"]["presentation"]["chatAvailable"].as_bool()==Some(false){self.chat_open=false;}
+        if self.runtime_state["stage"]["presentation"]["propsAvailable"].as_bool()==Some(false){self.props_open=false;}
         let navigation=self.runtime_state["uiNavigation"].clone();
         if let Some(revision)=navigation["revision"].as_u64().filter(|revision|*revision>self.navigation_revision) {
             self.navigation_revision=revision;
@@ -364,24 +403,45 @@ impl GMGNProductUI {
         });
     }
     fn control(&self,id:&'static str,label:&'static str,action:&'static str,width:f32,height:f32,cx:&mut Context<Self>)->impl IntoElement {
-        let label=if id=="screen" {
+        let label=if id=="chat"&&!self.compact&&self.runtime_state["stage"]["presentation"]["chatAvailable"].as_bool()!=Some(true){"进入空间后与居民聊天"}else if id=="visual" {if self.stage_panel_open{"收起设置"}else{"舞台设置：播放器、空间、角色与活动"}}else if id=="screen" {
             if self.runtime_state["screenOperation"]["active"].as_bool()==Some(true){"完成操作（Esc）"}
             else if self.runtime_state["screenOperation"]["available"].as_bool()==Some(true){"操作电视"}
             else {"这块空间里还没有在放的电视"}
         }else{label};
-        let button=Button::new(id).ghost().icon(if id=="play"&&self.runtime_state["playbackState"].as_str()==Some("playing"){gpui_kit::assets::IconName::Pause}else{control_icon(id)})
+        let button=Button::new(id).ghost().icon(if id=="visual"&&self.stage_panel_open {gpui_kit::assets::IconName::X}else if id=="play"&&self.runtime_state["playbackState"].as_str()==Some("playing"){gpui_kit::assets::IconName::Pause}else{control_icon(id)})
             .accessibility_label(label).tooltip(label).w(px(width)).h(px(height));
+        let button=if id=="visual"{button.px(px(6.)).child(div().text_size(px(12.)).whitespace_nowrap().child(if self.stage_panel_open{"收起"}else{"设置"}))}else{button};
+        let button=if self.compact {button.rounded(px(15.)).bg(rgba(0x1f1f1ff0)).border_1().border_color(rgba(0xffffff2e)).text_color(rgb(0xffffff))}else{button};
         let button=if id=="screen"{button.disabled(self.runtime_state["screenOperation"]["available"].as_bool()!=Some(true))}else{button};
-        let button=if action=="voice" {
+        let button=if id=="chat"&&!self.compact{button.disabled(self.runtime_state["stage"]["presentation"]["chatAvailable"].as_bool()!=Some(true))}else if id=="props"{button.disabled(self.runtime_state["stage"]["presentation"]["propsAvailable"].as_bool()!=Some(true))}else{button};
+        let button=if !self.compact {
+            match id {
+                "previous"=>button.disabled(self.runtime_state["liveCamPlayerMenu"]["canSelectPrevious"].as_bool()!=Some(true)),
+                "play"=>button.disabled(self.runtime_state["liveCamPlayerMenu"]["canTogglePlayback"].as_bool()!=Some(true)),
+                "next"=>button.disabled(self.runtime_state["liveCamPlayerMenu"]["canSelectNext"].as_bool()!=Some(true)),
+                _=>button
+            }
+        }else{button};
+        let button=if id=="player"&&self.compact {
+            let snapshot=self.runtime_state["liveCamPlayerMenu"].clone();let weak=cx.entity().downgrade();let popup_weak=weak.clone();
+            button.dropdown_menu(move |menu,_,_| {
+                let mut menu=menu.item(PopupMenuItem::new(snapshot["menuTitle"].as_str().unwrap_or("播放器尚未准备好").to_owned()).disabled(true)).separator();
+                for (title,action,flag) in [("上一首","previousTrack","canSelectPrevious"),(snapshot["playPauseTitle"].as_str().unwrap_or("播放"),"togglePlayback","canTogglePlayback"),("下一首","nextTrack","canSelectNext")] {
+                    let weak=weak.clone();
+                    menu=menu.item(PopupMenuItem::new(title.to_owned()).disabled(snapshot[flag].as_bool()!=Some(true)).on_click(move |_,_,cx|{let _=weak.update(cx,|ui,cx|ui.native_action(action,cx));}));
+                }
+                let weak=weak.clone();menu.separator().item(PopupMenuItem::new("进入播放器").on_click(move |_,_,cx|{let _=weak.update(cx,|ui,cx|ui.native_action("showPlayer",cx));}))
+            }).on_open_change(move |open,_,cx|{let _=popup_weak.update(cx,|ui,cx|{ui.player_menu_open=*open;cx.notify();});}).into_any_element()
+        }else if action=="voice" {
             button.on_mouse_down(MouseButton::Left,cx.listener(|this,_,_,cx|this.voice_gesture(true,cx)))
                 .on_mouse_up(MouseButton::Left,cx.listener(|this,_,_,cx|this.voice_gesture(false,cx)))
-                .on_mouse_up_out(MouseButton::Left,cx.listener(|this,_,_,cx|this.voice_gesture(false,cx)))
+                .on_mouse_up_out(MouseButton::Left,cx.listener(|this,_,_,cx|this.voice_gesture(false,cx))).into_any_element()
         } else {button.on_click(cx.listener(move |this,_,window,cx|{
             if action=="mode" {window.toggle_fullscreen();cx.notify();}
             else if action=="showStage" {this.switch_profile(false,Some("space"),window,cx);}
             else if action=="showPlayer" {this.switch_profile(false,Some("player"),window,cx);}
             else {this.overlay_action(action,cx);}
-        }))};
+        })).into_any_element()};
         let mut control=div().relative().w(px(width)).h(px(height)).child(button);
         let count=inbox_unread(&self.runtime_state);
         if id=="inbox"&&count>0 {
@@ -395,23 +455,34 @@ impl Render for GMGNProductUI {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let background = cx.theme().tokens.background;
         let foreground = cx.theme().foreground;
-        let mut notices = div().id("product-runtime-notices").max_h(px(220.)).overflow_y_scroll().p_2();
+        let mut notices = if self.compact {
+            div().id("product-runtime-notices").flex().flex_col().gap(px(6.)).text_size(px(10.))
+        }else{div().id("product-runtime-notices").max_h(px(220.)).overflow_y_scroll().p_2()};
         let mut notice_count=0;
-        for field in ["statusNotice", "ttsError", "speechError", "inboxPersistenceError"] {
+        let task_feedback_visible=self.compact||self.runtime_state["stage"]["presentation"]["taskFeedbackVisible"].as_bool()==Some(true);
+        let mut seen_notices=Vec::new();
+        let notice_fields=if self.compact {["ttsError","speechError","inboxPersistenceError","statusNotice"]}else{["statusNotice","ttsError","speechError","inboxPersistenceError"]};
+        for field in notice_fields {
             if let Some(notice) = self.runtime_state[field].as_str().filter(|s| !s.is_empty()) {
-                notices = notices.child(div().text_sm().child(notice.to_owned()));
+                if seen_notices.contains(&notice){continue;}
+                seen_notices.push(notice);
+                let item=if self.compact {
+                    let item=div().min_h(px(24.)).px(px(8.)).py(px(8.)).rounded(px(10.)).bg(rgba(0x1f1f1ff0)).text_size(px(if field=="statusNotice"{10.}else{11.})).text_color(rgb(0xff9f0a)).child(notice.to_owned());
+                    if field=="statusNotice"{item}else{item.line_clamp(3)}
+                }else{div().text_sm().child(notice.to_owned())};
+                notices = notices.child(item);
                 notice_count+=1;
             }
         }
-        if let Some(message)=self.runtime_state["autonomy"]["connectivityNotice"].as_str().filter(|s|!s.is_empty()) {
-            notices=notices.child(div().id("resident.connectivity-banner").rounded(px(10.)).p(px(if self.compact{6.}else{10.})).bg(rgba(0x1a1a1af5)).text_size(px(if self.compact{9.}else{11.})).text_color(rgb(0xff9f0a)).child(message.to_owned()));notice_count+=1;
+        if let Some(message)=self.runtime_state["autonomy"]["connectivityNotice"].as_str().filter(|s|task_feedback_visible&&!s.is_empty()) {
+            notices=notices.child(div().id("resident.connectivity-banner").rounded(px(10.)).p(px(if self.compact{6.}else{10.})).bg(rgba(0x1a1a1af5)).text_size(px(if self.compact{9.}else{11.})).text_color(rgb(0xff9f0a)).line_clamp(if self.compact{2}else{3}).child(message.to_owned()));notice_count+=1;
         }
         let autonomy=self.runtime_state["autonomy"]["switchOn"].as_bool();
-        if autonomy==Some(false)||self.runtime_state["autonomy"]["stopped"].as_bool()==Some(true) {
+        if task_feedback_visible&&(autonomy==Some(false)||self.runtime_state["autonomy"]["stopped"].as_bool()==Some(true)) {
             let enabled=autonomy==Some(true);
-            let mut banner=div().id("resident.autonomy-banner").flex().flex_col().gap(px(4.)).rounded(px(10.)).p(px(if self.compact{6.}else{10.})).bg(rgba(0x1a1a1af5)).text_size(px(if self.compact{9.}else{10.})).child(div().flex().items_center().justify_between()
+            let mut banner=div().id("resident.autonomy-banner").flex().flex_col().gap(px(4.)).rounded(px(10.)).p(px(if self.compact{6.}else{10.})).bg(rgba(0x1a1a1af5)).text_size(px(if self.compact{9.}else{10.})).child(div().flex().items_center().justify_between().text_color(rgb(0xff9f0a))
                 .child(if enabled{"自主行动已停止"}else{"居民自主行动已关闭"})
-                .child(Button::new("resident.autonomy.resume").ghost().small().label(if enabled{"恢复自主行动"}else{"打开自主行动"}).on_click(cx.listener(|this,_,_,cx|this.overlay_action("resume-autonomy",cx)))));
+                .child(Button::new("resident.autonomy.resume").ghost().small().w(px(if self.compact{66.}else{72.})).h(px(if self.compact{14.}else{16.})).p_0().flex_shrink_0().rounded_full().bg(rgba(0xffffff29)).accessibility_label(if enabled{"恢复自主行动"}else{"打开自主行动"}).child(div().text_size(px(if self.compact{9.}else{10.})).whitespace_nowrap().text_color(rgb(0xffffff)).child(if enabled{"恢复自主行动"}else{"打开自主行动"})).on_click(cx.listener(|this,_,_,cx|this.overlay_action("resume-autonomy",cx)))));
             if !self.compact {banner=banner.child(div().text_size(px(9.)).text_color(rgba(0xffffff8c)).child("不自主不等于不听话：直接下达的指令在任何开关状态下都会执行。"));}
             if let Some(message)=self.runtime_state["autonomy"]["resumeFailure"].as_str().filter(|s|!s.is_empty()) {
                 banner=banner.child(div().id("resident.autonomy.resume-failure").text_size(px(9.)).text_color(rgb(0xff9f0a)).child(message.to_owned()));
@@ -419,9 +490,16 @@ impl Render for GMGNProductUI {
             notices=notices.child(banner);
             notice_count+=1;
         }
-        if let Some(notice)=&self.core_notice { notices=notices.child(notice.clone());notice_count+=1; }
+        if let Some(notice)=&self.core_notice {
+            notices=if self.compact{notices.child(div().rounded(px(10.)).p(px(8.)).bg(rgba(0x1f1f1ff0)).text_size(px(10.)).text_color(rgb(0xff9f0a)).child(notice.clone()))}else{notices.child(notice.clone())};notice_count+=1;
+        }
         let viewport=window.viewport_size();let width=viewport.width.as_f32();let height=viewport.height.as_f32();
+        let compact_composer_height=if self.runtime_state["attachments"].as_array().is_some_and(|images|!images.is_empty()){140.}else{70.};
         let mut root=div().size_full().relative().text_color(foreground);
+        if !self.compact {
+            self.lyrics_pane.update(cx,|pane,_|pane.set_viewport_size(width,height));
+            root=root.child(div().absolute().size_full().child(self.lyrics_pane.clone()));
+        }
         if self.compact {
             let mut controls=div().absolute().top(px(10.)).right(px(10.)).w(px(30.)).flex().flex_col().gap(px(6.));
             for (id,label,action) in [("space","空间","showStage"),("player","音乐","showPlayer"),("chat","聊天","chat"),("inbox","通知","showNotifications"),("voice","语音","voice"),("settings","设置","settings")] {
@@ -429,13 +507,19 @@ impl Render for GMGNProductUI {
             }
             root=root.child(controls);
             if notice_count>0 {
-                root=root.child(notices.absolute().left(px(10.)).right(px(48.)).bottom(px(86.)).max_h(px(64.)).bg(background));
+                root=root.child(notices.absolute().left(px(10.)).right(px(48.)).bottom(px(compact_composer_height+16.)));
             }
             if self.chat_open {
-                root=root.child(div().absolute().left(px(10.)).right(px(48.)).bottom(px(10.)).h(px(70.)).child(self.pane.clone()));
-            } else if let Some(reply)=self.transcript.iter().rev().find(|line|line.speaker=="居民") {
-                root=root.child(div().id("compact-reply-bubble").absolute().left(px(10.)).right(px(48.)).bottom(px(10.)).max_h(px(74.)).overflow_y_scroll().p_2().bg(background)
-                    .on_click(cx.listener(|this,_,_,cx|{this.chat_open=true;cx.notify();})).child(reply.text.clone()));
+                root=root.child(div().absolute().left(px(10.)).right(px(48.)).bottom(px(10.)).h(px(compact_composer_height)).child(self.pane.clone()));
+            }
+            if let Some(reply)=self.transcript.iter().rev().find(|line|line.speaker=="居民").filter(|_|latest_reply_revision(&self.runtime_state)!=self.dismissed_reply_revision) {
+                let content=if self.chat_open{div().id("livecam.full-reply").flex_1().min_h(px(0.)).overflow_y_scroll().text_size(px(12.)).child(self.transcript.iter().map(|line|format!("{}：\n{}",line.speaker,line.text)).collect::<Vec<_>>().join("\n\n")).into_any_element()}else{div().flex_1().text_size(px(12.)).line_clamp(3).child(reply.text.clone()).into_any_element()};
+                let bubble=div().id("compact-reply-bubble").absolute().left(px(10.)).right(px(48.)).top(px(10.)).p_2().rounded(px(10.)).bg(background).flex().items_start().gap(px(5.));
+                let bubble=if self.chat_open{bubble.h(px(136.))}else{bubble.max_h(px(74.))};
+                root=root.child(bubble
+                    .on_click(cx.listener(|this,_,_,cx|{this.chat_open=true;cx.notify();}))
+                    .child(content)
+                    .child(Button::new("livecam.reply-dismiss").ghost().icon(gpui_kit::assets::IconName::X).w(px(20.)).h(px(20.)).accessibility_label("关闭回复气泡").tooltip("关闭回复气泡").on_click(cx.listener(|this,_,_,cx|{cx.stop_propagation();this.dismissed_reply_revision=latest_reply_revision(&this.runtime_state);cx.notify();}))));
             }
         } else {
             let mut transport=div().absolute().right(px(22.)).bottom(px(22.)).w(px(529.)).h(px(48.)).flex().items_center().px(px(4.)).rounded_xl().bg(background);
@@ -466,15 +550,35 @@ impl Render for GMGNProductUI {
                 let h=390_f32.min(height-98.);
                 root=root.child(div().absolute().right(px(22.)).bottom(px(82.)).w(px(340.)).h(px(h)).child(self.prop_pane.clone()));
             }
+            if self.bound_video_pane.read(cx).is_visible() {
+                root=root.child(div().absolute().top(px(28.)).right(px(32.)).w(px(330.)).h(px(58.)).child(self.bound_video_pane.clone()));
+            }
         }
         let host=self.host.clone();
+        let menu_open=self.player_menu_open;
+        let composer_index=if self.chat_open {
+            Some(if self.compact{1+usize::from(notice_count>0)}else{3+usize::from(self.runtime_state["screenOperation"]["active"].as_bool()==Some(true))+usize::from(notice_count>0)})
+        }else{None};
         // The original screen-operation banner never takes scene pointer
         // events. All other overlay hit regions use actual computed bounds,
         // including wrapped notices and the complete autonomy card.
-        let passive_banner=(!self.compact&&self.runtime_state["screenOperation"]["active"].as_bool()==Some(true)).then_some(2);
-        root.on_children_prepainted(move |bounds,_,_| {
-            let rects:Vec<[f32;4]>=bounds.into_iter().enumerate().filter(|(index,_)|Some(*index)!=passive_banner)
-                .map(|(_,bounds)|[bounds.origin.x.as_f32(),bounds.origin.y.as_f32(),bounds.size.width.as_f32(),bounds.size.height.as_f32()]).collect();
+        let mut passive_indices=Vec::new();
+        if !self.compact {passive_indices.push(0);if self.runtime_state["screenOperation"]["active"].as_bool()==Some(true){passive_indices.push(3);}}
+        root.on_children_prepainted(move |bounds,window,_| {
+            if let Ok(handle)=HasWindowHandle::window_handle(window) {
+                if let RawWindowHandle::AppKit(handle)=handle.as_raw() {
+                    let region=composer_index.and_then(|index|bounds.get(index)).filter(|_|!menu_open);
+                    let (x,y,w,h,enabled)=region.map_or((0.,0.,0.,0.,0),|bounds|(bounds.origin.x.as_f32() as f64,bounds.origin.y.as_f32() as f64,bounds.size.width.as_f32() as f64,bounds.size.height.as_f32() as f64,1));
+                    unsafe{gmgn_gpui_bitmap_drop_region(handle.ns_view.as_ptr(),x,y,w,h,enabled)};
+                }
+            }
+            let rects:Vec<[f32;4]>=if menu_open {
+                // Like the original NSMenu, a live Kit popup owns pointer
+                // dismissal while open. Restore scene passthrough on close.
+                let viewport=window.viewport_size();vec![[0.,0.,viewport.width.as_f32(),viewport.height.as_f32()]]
+            }else{bounds.into_iter().enumerate().filter(|(index,_)|!passive_indices.contains(index))
+                .map(|(_,bounds)|[bounds.origin.x.as_f32(),bounds.origin.y.as_f32(),bounds.size.width.as_f32(),bounds.size.height.as_f32()]).collect()
+            };
             if let Some(host)=host.borrow().as_ref(){host.hit_regions(&rects);}
         }).into_any_element()
     }
@@ -482,6 +586,15 @@ impl Render for GMGNProductUI {
 
 #[cfg(test)]
 mod layout_tests {
+    #[test]
+    fn closing_reply_keeps_history_and_only_hides_that_real_turn() {
+        let original=serde_json::json!({"contextID":"world-a","transcript":[{"role":"agent","turnID":"turn-a","text":"相同回复"}]});
+        let dismissed=super::latest_reply_revision(&original);
+        assert_eq!(super::latest_reply_revision(&original),dismissed);
+        let next=serde_json::json!({"contextID":"world-a","transcript":[{"role":"agent","turnID":"turn-a","text":"相同回复"},{"role":"agent","turnID":"turn-b","text":"相同回复"}]});
+        assert_ne!(super::latest_reply_revision(&next),dismissed);
+        assert_eq!(original["transcript"].as_array().unwrap().len(),1);
+    }
     #[test]
     fn inbox_badge_uses_read_state_not_delivery_ack() {
         assert_eq!(super::inbox_unread(&serde_json::json!({"inbox":{"entries":[
@@ -598,6 +711,8 @@ fn main() {
                 let stage_pane=cx.new(|cx|StagePanelsPane::new(window,cx));
                 let program_pane=cx.new(|cx|StageProgramRailPane::new(window,cx));
                 let prop_pane=cx.new(|cx|ResidentPropEditorPane::new(window,cx));
+                let lyrics_pane=cx.new(|cx|StageLyricsPane::new(window,cx));
+                let bound_video_pane=cx.new(|cx|StageBoundVideoPromptPane::new(window,cx));
                 let poll = cx.spawn_in(window, async move |view, cx| {
                     loop {
                         cx.background_executor().timer(Duration::from_millis(100)).await;
@@ -605,9 +720,9 @@ fn main() {
                     }
                 });
                 GMGNProductUI { host: host.clone(), pane, settings_pane, settings_window:None, inbox_pane, inbox_window:None, stage_pane,stage_panel_open:false,
-                    program_pane,program_open:false,prop_pane,props_open:false,chat_open:false, voice_held:false, pending: None, accepted: false,
+                    program_pane,program_open:false,prop_pane,lyrics_pane,bound_video_pane,props_open:false,chat_open:false, voice_held:false, pending: None, accepted: false,
                     transcript: vec![], compact, core_notice, runtime_state: serde_json::Value::Null,
-                    surface_mounted: false,navigation_revision:0,main_window:main_window.clone(),profile_switch_pending:false, _poll: poll }
+                    surface_mounted: false,navigation_revision:0,main_window:main_window.clone(),profile_switch_pending:false,dismissed_reply_revision:None,player_menu_open:false,program_visibility_reported:None, _poll: poll }
             });
             *main_ui.borrow_mut()=Some(view.clone());
             cx.new(|cx| gpui_kit::base::Root::new(view, window, cx).bg(rgba(0x00000000)))
