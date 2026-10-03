@@ -2,6 +2,7 @@
 pub mod asr;
 pub mod asr_stream;
 pub mod providers;
+pub mod voice_catalog;
 pub mod tts_stream;
 use reqwest::{Client, Response};
 use serde_json::{json, Value};

@@ -68,6 +68,24 @@ Host-tools两通道已迁私有回环TCP，89项宿主通道/172项Node MCP桥�
 2. 将剩余宿主能力逐项纳入有版本、可发现、统一错误和事件的接口，保留权威与平台实现的边界。
 3. 实际验证GPUI Kit承载现有场景；桥接与体验达标后迁移聊天、资产、设置及其它界面，不替换引擎。
 
+## 2026-10-04 三供应商TTS与声音选择补验
+
+用户要求补测全部TTS供应商并实现界面声音选择；ASR暂停指令继续有效。本轮仅检查相关环境变量与App偏好是否配置，不输出凭据、不读Keychain。ElevenLabs环境密钥和百炼既有偏好可用；Fish环境变量与App偏好未找到Key，真实App配置检查 `/private/tmp/gmgn-tts-fish-config-check-20261004/voice-report.json` 为blocked/missing_voice_configuration，未调用Fish云端。
+
+已有产物的真实App百炼链路 `/private/tmp/gmgn-tts-bailian-real-20261004/voice-report.json` 通过有声、结束、取消无声；输出仅PID87623，rms=0.050518/peak=0.382777。ElevenLabs复测 `/private/tmp/gmgn-tts-eleven-repeat-20261004/voice-report.json` 同样三项通过。两个报告整体status=partial仅表示ASR仍暂停，不代表TTS失败。声音列表与选择UI的新产物验收另行记录。
+
+声音选择已实现：Swift通过鉴权 `voice_list` RPC查询Rust目录；百炼返回当前实现支持的4个TTS声音，ElevenLabs官方 `/v2/voices` 和Fish官方 `/model` 最多100项。只返回ID/名称，1MiB/20秒上限、禁重定向，不保存远端错误正文或凭据。界面支持名称选择、刷新、保存、试听/停止及高级自定义ID；不自动选首项，不把目录存在等同于当前账户可播放。`voice_capabilities`公开目录能力及上限。
+
+真实界面初验失败：CUA按文件路径额外启动了不带隔离环境的测试实例，后续已关闭；没有安装或重启已装App。改按 `ai.gmgn.radio.e2e` 绑定并核对实际PID后复验。设置列表及试听客户端同时补上显式隔离根，与生产App注入路径一致。不能依据早先界面失败推断供应商不可用。保存空密钥会遮住环境配置的问题已修复，8项生产配置测试证明空值继续环境/旧配置回退且环境Key不写偏好。
+
+构建3的实际隔离App PID90363、根 `/private/tmp/gmgn-tts-selector-ui3-20261004`：CUA确认百炼4声音、ElevenLabs28声音，选择Serena、试听、保存；百炼界面试听采样rms=0.017080/peak=0.196240。ElevenLabs首个自建声音试听曾显示失败，未判为通过；Roger保存后试听复验rms=0.026410/peak=0.577086、无错误且正常结束。一次10秒采样无声，延长到覆盖播放的25秒窗口后通过，首次失败保留在证据目录。所有采样globalTap=false且仅该PID。Fish界面缺Key提示与禁用未选声音试听已核对，没有云端Fish验收。最终构建与重启恢复结果待补。
+
+非ASR验证：taskd138项、目录3项、契约7项、Swift目录与端点13项、PCM/TTS20项、配置8项，以及设置隔离根/试听接线/错误清理/显式选择负例通过。没有运行ASR、录音或麦克风请求。
+
+最终构建4 `/tmp/gmgn-tts-selector-build4.log` BUILD SUCCEEDED，helper清单校验通过。重启同一隔离根，PID93007，CUA确认已保存的ElevenLabs/Roger名称恢复、SecureField未显示环境密钥；生产AgentSpeech默认读取保存配置，无provider/voiceID环境覆盖。`evidence/final-ui-tts-report.json` 为ttsStatus=passed：真实有声、drain无错误、取消后PID输出无声全部通过。仅ASR仍暂停。界面不再自动选择目录首项，切服务清空旧试听错误。
+
+最终产物百炼Serena中文复验 `/private/tmp/gmgn-tts-bailian-selector-final-20261004/voice-report.json` 为ttsStatus=passed：有声、正常结束、取消无声三项通过；整体partial/exit2仍仅指ASR暂停。ElevenLabs重启后输出rms=0.061152/peak=0.474559，取消后rms=0/peak=0，globalTap=false且仅PID93007。Fish尚缺Key，保持未验收。
+
 ## Unity + GPUI讨论范围
 
 目前只是候选调研，没有授权启动引擎替换。Unity官方Unity as a Library支持列表包含Android/iOS/Windows/UWP，不包含macOS/Linux；因此不能把Unity嵌入GPUI单窗口视为已有统一跨平台方案。独立窗口+Rust服务通信可以先验证业务分工；同窗口GPU共享需要另做平台桥接原型。当前继续保持SceneKit/Metal不变。

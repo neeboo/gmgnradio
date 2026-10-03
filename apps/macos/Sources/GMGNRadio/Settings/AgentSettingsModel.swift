@@ -12,14 +12,23 @@ final class RustSpeechPreferences {
     }
     func configuration(for purpose: String, includesEnvironment: Bool = true) -> RustVoiceConfiguration {
         let provider = provider(for: purpose, includesEnvironment: includesEnvironment)
+        return configuration(provider: provider, for: purpose, includesEnvironment: includesEnvironment)
+    }
+    func configuration(provider: RustVoiceProvider, for purpose: String, includesEnvironment: Bool = true) -> RustVoiceConfiguration {
         let prefix = "speech.rust.\(provider.rawValue)."
         let environment = includesEnvironment ? ProcessInfo.processInfo.environment : [:]
         let environmentPrefix = "GMGN_VOICE_\(provider.rawValue.uppercased())_"
+        func usableKey(_ value: String?) -> String? {
+            guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else { return nil }
+            return trimmed
+        }
         // Existing Bailian credentials remain reusable without moving or exposing them.
         let legacy = provider == .bailian ? defaults.string(forKey: "voice.bailian.apiKey") : nil
         let sharedElevenKey = provider == .elevenlabs ? environment["ELEVENLABS_API_KEY"] : nil
         return RustVoiceConfiguration(provider: provider,
-            apiKey: environment[environmentPrefix + "API_KEY"] ?? defaults.string(forKey: prefix + "apiKey") ?? sharedElevenKey ?? legacy ?? "",
+            apiKey: usableKey(environment[environmentPrefix + "API_KEY"])
+                ?? usableKey(defaults.string(forKey: prefix + "apiKey"))
+                ?? usableKey(sharedElevenKey) ?? usableKey(legacy) ?? "",
             voiceID: environment[environmentPrefix + "VOICE_ID"] ?? defaults.string(forKey: prefix + "voiceID")
                 ?? (provider == .bailian ? defaults.string(forKey: RealtimeVoicePreferences.replyVoiceIDKey) ?? "Cherry" : ""),
             model: environment[environmentPrefix + purpose.uppercased() + "_MODEL"] ?? defaults.string(forKey: prefix + purpose + ".model"))

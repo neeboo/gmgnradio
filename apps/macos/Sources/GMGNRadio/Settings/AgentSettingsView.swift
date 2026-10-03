@@ -8,7 +8,16 @@ private struct RustSpeechConfigurationFields: View {
     @State private var voiceID: String
     @State private var model: String
     @State private var saved = false
+    @State private var voices: [RustVoiceOption] = []
+    @State private var loadingVoices = false
+    @State private var voiceMessage: String?
+    @State private var preview: RustSpeechSynthesizer?
+    @State private var previewStatus = AgentSpeechStatusStore()
+    @State private var listTask: Task<Void, Never>?
     private let preferences = RustSpeechPreferences(defaults: E2ERuntime.defaults)
+    // Match the application's voice client root, including isolated E2E homes.
+    private let voiceClient = RustVoiceClient(root: E2ERuntime.productSupportDirectory()
+        .appendingPathComponent("TaskService", isDirectory: true))
 
     init(purpose: String) {
         self.purpose = purpose
@@ -25,6 +34,7 @@ private struct RustSpeechConfigurationFields: View {
             if purpose == "tts" { Text("Fish Audio").tag(RustVoiceProvider.fish) }
         }
         .onChange(of: provider) { _, selection in
+            cancelPreviewAndList()
             // Load that provider's saved credentials, never silently reuse another provider's key.
             let defaults = E2ERuntime.defaults
             let prefix = "speech.rust.\(selection.rawValue)."
@@ -33,12 +43,37 @@ private struct RustSpeechConfigurationFields: View {
             voiceID = defaults.string(forKey: prefix + "voiceID") ?? (selection == .bailian ? "Cherry" : "")
             model = defaults.string(forKey: prefix + purpose + ".model") ?? ""
             saved = false
+            voices = []; voiceMessage = nil
         }
         SecureField("API Key", text: $apiKey)
+            .onChange(of: apiKey) { _, _ in
+                cancelPreviewAndList(); voices = []; voiceMessage = nil; saved = false
+            }
         if purpose == "tts" {
-            TextField(provider == .fish ? "Reference ID" : "Voice ID", text: $voiceID)
+            Picker("声音", selection: $voiceID) {
+                if !voices.contains(where: { $0.id == voiceID }) {
+                    Text(voiceID.isEmpty ? "请选择声音" : "当前声音（\(voiceID)）").tag(voiceID)
+                }
+                ForEach(voices) { voice in Text(voice.name).tag(voice.id) }
+            }
+            .disabled(loadingVoices)
+            .onChange(of: voiceID) { _, _ in preview?.stopSpeaking(); saved = false }
+            HStack {
+                Button("刷新声音") { refreshVoices() }.disabled(loadingVoices)
+                if loadingVoices { ProgressView().controlSize(.small) }
+                Button(previewStatus.isSpeaking ? "停止试听" : "试听声音") {
+                    if previewStatus.isSpeaking { preview?.stopSpeaking() }
+                    else { playPreview() }
+                }.disabled(voiceID.isEmpty)
+            }
+            if let voiceMessage { Text(voiceMessage).font(.caption).foregroundStyle(.secondary) }
+            if let error = previewStatus.lastErrorMessage { Text(error).font(.caption).foregroundStyle(.secondary) }
+            DisclosureGroup("高级：自定义声音 ID") {
+                TextField(provider == .fish ? "Reference ID" : "Voice ID", text: $voiceID)
+            }
         }
         TextField("模型（留空使用服务默认值）", text: $model)
+            .onChange(of: model) { _, _ in cancelPreviewAndList(); saved = false }
         HStack {
             Button("保存配置") {
                 preferences.save(RustVoiceConfiguration(provider: provider,
@@ -51,6 +86,54 @@ private struct RustSpeechConfigurationFields: View {
         }
         Text("传输：本机 TCP → Rust → 服务商；录放音留在系统设备层。")
             .font(.caption).foregroundStyle(.secondary)
+            .task { if purpose == "tts" { refreshVoices() } }
+            .onDisappear { cancelPreviewAndList() }
+    }
+
+    private var currentConfiguration: RustVoiceConfiguration {
+        let enteredKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let available = preferences.configuration(provider: provider, for: purpose)
+        return RustVoiceConfiguration(provider: provider,
+            apiKey: enteredKey.isEmpty ? available.apiKey : enteredKey,
+            voiceID: voiceID.trimmingCharacters(in: .whitespacesAndNewlines),
+            model: model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : model)
+    }
+
+    private func refreshVoices() {
+        listTask?.cancel()
+        let configuration = currentConfiguration
+        guard configuration.provider == .bailian || !configuration.apiKey.isEmpty else {
+            voices = []; voiceMessage = "请先填写该服务的 API Key，再刷新声音。"; loadingVoices = false
+            return
+        }
+        loadingVoices = true; voiceMessage = nil
+        listTask = Task { @MainActor in
+            defer { if !Task.isCancelled { loadingVoices = false } }
+            do {
+                let result = try await voiceClient.listVoices(configuration: configuration)
+                try Task.checkCancellation()
+                guard provider == configuration.provider else { return }
+                voices = result
+                voiceMessage = result.isEmpty ? "当前列表没有可用声音；也可展开高级设置填写声音 ID。" : "已加载 \(result.count) 个声音（最多 100 个）；选择后请保存。"
+            } catch {
+                guard !Task.isCancelled else { return }
+                voiceMessage = "声音列表暂时无法加载，请检查密钥、额度或网络后刷新。"
+            }
+        }
+    }
+
+    private func playPreview() {
+        preview?.stopSpeaking()
+        let configuration = currentConfiguration
+        let synthesizer = RustSpeechSynthesizer(configuration: { configuration }, statusStore: previewStatus, client: voiceClient)
+        preview = synthesizer
+        synthesizer.speak("你好，这是当前选中的声音。欢迎来到你的生活空间。")
+    }
+
+    private func cancelPreviewAndList() {
+        listTask?.cancel(); listTask = nil; loadingVoices = false
+        preview?.stopSpeaking(); preview = nil
+        previewStatus.lastErrorMessage = nil
     }
 }
 

@@ -1,5 +1,27 @@
 import Foundation
 
+// Production settings must use the same isolated service root for both catalog
+// and preview; replacing either with a default client recreates the UI failure.
+let settingsSource = try String(contentsOfFile: "apps/macos/Sources/GMGNRadio/Settings/AgentSettingsView.swift", encoding: .utf8)
+func settingsVoiceRootIsIsolated(_ source: String) -> Bool {
+    source.contains("RustVoiceClient(root: E2ERuntime.productSupportDirectory()")
+        && source.contains(".appendingPathComponent(\"TaskService\", isDirectory: true)")
+        && source.contains("voiceClient.listVoices(configuration: configuration)")
+        && source.contains("statusStore: previewStatus, client: voiceClient)")
+        && source.contains("preview?.stopSpeaking(); preview = nil\n        previewStatus.lastErrorMessage = nil")
+        && !source.contains("RustVoiceClient().listVoices")
+        && !source.contains("voiceID = result.first")
+}
+guard settingsVoiceRootIsIsolated(settingsSource),
+      !settingsVoiceRootIsIsolated(settingsSource.replacingOccurrences(of: "root: E2ERuntime.productSupportDirectory()", with: "root: FileManager.default.temporaryDirectory")),
+      !settingsVoiceRootIsIsolated(settingsSource.replacingOccurrences(of: "voiceClient.listVoices", with: "RustVoiceClient().listVoices")),
+      !settingsVoiceRootIsIsolated(settingsSource.replacingOccurrences(of: "previewStatus.lastErrorMessage = nil", with: "/* stale preview error retained */")),
+      !settingsVoiceRootIsIsolated(settingsSource + "\nvoiceID = result.first?.id ?? \"\""),
+      !settingsVoiceRootIsIsolated(settingsSource.replacingOccurrences(of: "statusStore: previewStatus, client: voiceClient)", with: "statusStore: previewStatus)")) else {
+    fatalError("settings isolated voice root wiring or negative controls failed")
+}
+print("PASS: settings isolated-root wiring, stale-error reset and explicit voice selection with five negative controls")
+
 // This harness exercises TTS and endpoint validation only. It never starts ASR,
 // recording, an audio device, or the application.
 let fixture = #"""
@@ -13,7 +35,18 @@ def serve(c):
  try:
   for line in c.makefile('rb'):
    q=json.loads(line)
-   assert q.get('auth')==token and q['method']=='voice_tts_start'
+   assert q.get('auth')==token
+   if q['method']=='voice_list':
+    p=q['params'];key=p['apiKey'];voices=[{'id':'v1','name':'自然女声'},{'id':'v2','name':'清晰男声'}]
+    provider=p['provider']
+    if key=='duplicate':voices[1]['id']='v1'
+    if key=='empty-name':voices[0]['name']=''
+    if key=='wrong-provider':provider='fish'
+    if key=='too-many':voices=[{'id':str(i),'name':'声线'} for i in range(201)]
+    reply={'id':q['id'],'result':{'provider':provider,'voices':voices}}
+    if key=='provider-failure':reply={'id':q['id'],'error':{'code':'voice_provider_error'}}
+    c.sendall((json.dumps(reply)+'\n').encode());continue
+   assert q['method']=='voice_tts_start'
    sid=q['params']['sessionID']
    for reply in [{'id':q['id'],'result':{'started':True,'sessionID':sid}}, {'voice_event':{'sessionID':sid,'type':'finished'}}]:
     c.sendall((json.dumps(reply)+'\n').encode())
@@ -38,8 +71,16 @@ import Foundation
   let event=try await session.nextEvent()
   check(event.type=="finished","private owner-only endpoint connects")
   session.close()
+  let listed=try await valid.listVoices(configuration:.init(provider:.elevenlabs,apiKey:"fixture-memory-only"))
+  check(listed.map(\.id)==["v1","v2"] && listed[0].name=="自然女声","voice names decoded through authenticated Rust RPC")
+  for key in ["duplicate","empty-name","wrong-provider","too-many"] {
+   do {_ = try await valid.listVoices(configuration:.init(provider:.elevenlabs,apiKey:key));fatalError("malformed voice catalog accepted")}
+   catch RustVoiceError.invalidFrame {check(true,"malformed voice catalog rejected")}
+  }
+  do {_ = try await valid.listVoices(configuration:.init(provider:.elevenlabs,apiKey:"provider-failure"));fatalError("provider failure accepted")}
+  catch RustVoiceError.rejected {check(true,"provider failure surfaced without remote error text")}
   let initial=try String(contentsOf:marker,encoding:.utf8)
-  check(initial=="1","one baseline connection")
+  check(initial=="7","TTS and six catalog requests connect independently")
   let link=root.appendingPathComponent("linked.endpoint.json")
   try manager.createSymbolicLink(at:link,withDestinationURL:endpoint)
   let large=root.appendingPathComponent("large.endpoint.json")

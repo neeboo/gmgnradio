@@ -4,6 +4,11 @@ import Darwin
 
 enum RustVoiceProvider: String, Sendable, CaseIterable { case bailian, elevenlabs, fish }
 
+struct RustVoiceOption: Decodable, Identifiable, Equatable, Sendable {
+    let id: String
+    let name: String
+}
+
 struct RustVoiceConfiguration: Sendable {
     let provider: RustVoiceProvider
     let apiKey: String
@@ -58,6 +63,12 @@ struct RustVoiceEvent: Decodable, Sendable {
         try await start(method: "voice_tts_start", text: text, configuration: configuration)
     }
 
+    func listVoices(configuration: RustVoiceConfiguration) async throws -> [RustVoiceOption] {
+        let session = try await connect()
+        defer { session.close() }
+        return try await session.listVoices(configuration: configuration)
+    }
+
     func startASR(configuration: RustVoiceConfiguration, readyTimeout: TimeInterval = 10) async throws -> RustVoiceSession {
         guard readyTimeout.isFinite, readyTimeout > 0 else { throw RustVoiceError.invalidFrame }
         let session = try await start(method: "voice_asr_start", text: nil, configuration: configuration)
@@ -86,6 +97,18 @@ struct RustVoiceEvent: Decodable, Sendable {
         guard !configuration.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw RustVoiceError.rejected("missing_key")
         }
+        let session = try await connect()
+        do {
+            var params: [String: Any] = ["sessionID": session.sessionID, "provider": configuration.provider.rawValue,
+                                      "apiKey": configuration.apiKey, "voiceID": configuration.voiceID]
+            if let text { params["text"] = text }
+            if let model = configuration.model { params["model"] = model }
+            try await session.start(method: method, params: params)
+            return session
+        } catch { session.close(); throw error }
+    }
+
+    private func connect() async throws -> RustVoiceSession {
         var session: RustVoiceSession?
         do { session = try await RustVoiceSession.open(endpointURL: endpointURL) }
         catch {
@@ -108,14 +131,7 @@ struct RustVoiceEvent: Decodable, Sendable {
             }
         }
         guard let session else { throw RustVoiceError.unavailable }
-        do {
-            var params: [String: Any] = ["sessionID": session.sessionID, "provider": configuration.provider.rawValue,
-                                      "apiKey": configuration.apiKey, "voiceID": configuration.voiceID]
-            if let text { params["text"] = text }
-            if let model = configuration.model { params["model"] = model }
-            try await session.start(method: method, params: params)
-            return session
-        } catch { session.close(); throw error }
+        return session
     }
 }
 
@@ -209,6 +225,20 @@ struct RustVoiceEvent: Decodable, Sendable {
         try checkError(reply)
         guard let result = reply["result"] as? [String: Any], result["started"] as? Bool == true,
               result["sessionID"] as? String == sessionID else { throw RustVoiceError.invalidFrame }
+    }
+
+    fileprivate func listVoices(configuration: RustVoiceConfiguration) async throws -> [RustVoiceOption] {
+        let id = try await send(method: "voice_list", params: ["provider": configuration.provider.rawValue, "apiKey": configuration.apiKey])
+        let reply = try await readObject()
+        guard reply["id"] as? String == id else { throw RustVoiceError.invalidFrame }
+        try checkError(reply)
+        guard let result = reply["result"] as? [String: Any],
+              result["provider"] as? String == configuration.provider.rawValue,
+              let raw = result["voices"] as? [[String: Any]], raw.count <= 200 else { throw RustVoiceError.invalidFrame }
+        let voices = try JSONDecoder().decode([RustVoiceOption].self, from: JSONSerialization.data(withJSONObject: raw))
+        guard voices.allSatisfy({ !$0.id.isEmpty && $0.id.utf8.count <= 200 && !$0.name.isEmpty && $0.name.utf8.count <= 512 }),
+              Set(voices.map(\.id)).count == voices.count else { throw RustVoiceError.invalidFrame }
+        return voices
     }
 
     func nextEvent() async throws -> RustVoiceEvent {

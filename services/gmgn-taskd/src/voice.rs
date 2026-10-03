@@ -22,6 +22,14 @@ const PACKET: usize = 32_768;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct List {
+    provider: String,
+    #[serde(default)]
+    api_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Start {
     #[serde(rename = "sessionID")]
     session_id: String,
@@ -56,9 +64,10 @@ pub struct Connection {
 
 pub fn capabilities() -> Value {
     json!({"version":1,"providers":[
-        {"id":"bailian","ttsStreaming":true,"asrStreaming":true},
-        {"id":"elevenlabs","ttsStreaming":true,"asrStreaming":true},
-        {"id":"fish","ttsStreaming":true,"asrStreaming":false}],
+        {"id":"bailian","ttsStreaming":true,"asrStreaming":true,"voiceCatalog":true},
+        {"id":"elevenlabs","ttsStreaming":true,"asrStreaming":true,"voiceCatalog":true},
+        {"id":"fish","ttsStreaming":true,"asrStreaming":false,"voiceCatalog":true}],
+        "voiceCatalogMaxResults":100,
         "asrRequiresReady":true,
         "audio":{"encoding":"pcm16le","channels":1,"asrSampleRate":16000,"ttsSampleRate":24000,"maxPacketBytes":PACKET}})
 }
@@ -139,6 +148,18 @@ impl Connection {
         writer: &Writer,
     ) -> Result<()> {
         match method {
+            "voice_list" => {
+                let list: List = serde_json::from_value(params).map_err(|_| "invalid_voice_input")?;
+                if !matches!(list.provider.as_str(), "bailian" | "elevenlabs" | "fish") {
+                    return Err("unsupported_voice_provider");
+                }
+                if list.api_key.len() > 8192 || (list.provider != "bailian" && list.api_key.trim().is_empty()) {
+                    return Err("invalid_voice_input");
+                }
+                let result = gmgn_voice_core::voice_catalog::list(&list.provider, &list.api_key)
+                    .await.map_err(|_| "voice_provider_error")?;
+                write(writer, &json!({"id":id,"result":result})).await
+            }
             "voice_capabilities" => write(writer, &json!({"id":id,"result":capabilities()})).await,
             "voice_tts_start" | "voice_asr_start" => {
                 let start: Start =

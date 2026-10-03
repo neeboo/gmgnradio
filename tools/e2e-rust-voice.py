@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Actual isolated App microphone/cloud/Rust/playback acceptance; no fixture server.
 
-Requires inherited ElevenLabs credentials. Never copies or prints credentials.
+Requires inherited provider credentials. Never copies or prints credentials.
 Only the test App's own output engine may select the explicit speaker UID.
 An empty physical microphone is BLOCKED, never counted as successful ASR.
 """
@@ -18,6 +18,8 @@ def main():
     parser.add_argument("--app", required=True, type=Path)
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--voice-id", required=True)
+    parser.add_argument("--provider", choices=("bailian", "elevenlabs", "fish"), default="elevenlabs")
+    parser.add_argument("--text", default="This is a real streaming audio test. The Rust core creates speech in small pieces, and the app plays each piece immediately.")
     parser.add_argument("--sampler", required=True, type=Path)
     parser.add_argument("--speaker-uid")
     parser.add_argument("--tts-only", action="store_true", help="Do not start recording or ASR; report the ASR gate as pending.")
@@ -31,14 +33,14 @@ def main():
         raise SystemExit("A fresh isolated test root is required; existing data is never overwritten.")
     environment = {
         "GMGN_VOICE_ASR_PROVIDER": "elevenlabs",
-        "GMGN_VOICE_TTS_PROVIDER": "elevenlabs",
-        "GMGN_VOICE_ELEVENLABS_VOICE_ID": args.voice_id,
+        "GMGN_VOICE_TTS_PROVIDER": args.provider,
+        "GMGN_VOICE_" + args.provider.upper() + "_VOICE_ID": args.voice_id,
     }
     if args.speaker_uid:
         environment["GMGN_E2E_VOICE_OUTPUT_DEVICE_UID"] = args.speaker_uid
     host = module.AppHost(args.app.resolve(), root, extra_env=environment)
     checks = []
-    report = {"checks": checks, "status": "failed", "root": str(root)}
+    report = {"checks": checks, "status": "failed", "root": str(root), "ttsProvider": args.provider}
 
     def voice(action="status", **params):
         reply = host.command("voice_control", {"action": action, **params})
@@ -72,7 +74,7 @@ def main():
             exit_code = 2
             return exit_code
         checks.append("actual_app_rust_core_configured")
-        voice("speak", text="This is a real streaming audio test. The Rust core creates speech in small pieces, and the app plays each piece immediately.")
+        voice("speak", text=args.text)
         sample("audible", "tts-audible.json", 8)
         drained = wait(lambda state: not state["isSpeaking"], 30)
         if drained["speechError"]:
@@ -84,6 +86,7 @@ def main():
         wait(lambda state: not state["isSpeaking"], 5)
         sample("silent", "tts-cancel-silent.json")
         checks.append("cancel_stops_own_process_output")
+        report["ttsStatus"] = "passed"
         if args.tts_only:
             report.update(status="partial", pending="asr_paused_by_user")
             exit_code = 2

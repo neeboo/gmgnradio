@@ -1269,6 +1269,26 @@ mod tests {
         reader.read_line(&mut line).await.unwrap();
         let result: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(result["result"]["providers"][2]["asrStreaming"], false);
+        for (params, expected) in [
+            (json!({"provider":"bailian"}), "catalog"),
+            (json!({"provider":"fish","apiKey":""}), "invalid_voice_input"),
+            (json!({"provider":"unknown"}), "unsupported_voice_provider"),
+            (json!({"provider":"bailian","unexpected":"secret-never-echoed"}), "invalid_voice_input"),
+        ] {
+            let mut bytes = serde_json::to_vec(&json!({"auth":"voice-auth","id":"list","method":"voice_list","params":params})).unwrap();
+            bytes.push(b'\n');
+            write_half.write_all(&bytes).await.unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            assert!(!line.contains("secret-never-echoed"));
+            let reply: Value = serde_json::from_str(&line).unwrap();
+            if expected == "catalog" {
+                assert_eq!(reply["result"]["provider"], "bailian");
+                assert_eq!(reply["result"]["voices"].as_array().unwrap().len(), 4);
+            } else {
+                assert_eq!(reply["error"]["code"], expected);
+            }
+        }
         // The voice ID is invalid locally: exercise asynchronous failure without cloud calls.
         let key = "secret-never-echoed";
         let mut bytes=serde_json::to_vec(&json!({"auth":"voice-auth","id":"s","method":"voice_tts_start","params":{"sessionID":"speech-1","provider":"elevenlabs","apiKey":key,"voiceID":"invalid voice","text":"hello"}})).unwrap();
