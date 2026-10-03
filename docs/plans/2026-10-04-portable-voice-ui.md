@@ -26,6 +26,8 @@ Rust workspace测试包括MCP 13单元/7 stdio/4隔离，共享协议3、taskd13
 
 ## GPUI与3D边界调研
 
+2026-10-04接入推进：独立GPUI Kit 0.7.0叠放原型的大窗已通过中文粘贴/全选/回删、按钮、弹窗隔离、SceneKit拖动缩放与关闭释放；224×336小窗第一轮通过布局与输入/场景操作。详见 `2026-10-04-gpui-scenekit-overlay-probe.md`，尚不等于生产MTKView验收。继续修复小窗非激活/聊天焦点语义，并建立生产StageRenderSurfaceController/MarbleSpatialView的Swift C ABI验证宿主。当前GPUI macOS公开入口自行拥有NSApplication和窗口，不能直接嵌入既有Swift窗口；后续由GPUI负责外壳、Swift保持3D渲染。通过生产桥接门禁后按用户授权直接迁移2D界面，使用Kit现成组件与主题，保留现有3D音乐特效。
+
 GPUI Kit的paint/canvas是UI绘制接口，不提供SceneKit等价的完整场景图、物理和角色动画引擎。GPUI上游已有 `surface(CVPixelBuffer)`，但当前该入口限定macOS/iOS，不能直接当成统一跨平台3D纹理接口。现有工程已使用SCNRenderer与Metal组合，迁UI应继续让原引擎渲染，再解决共享画面、GPU同步、焦点和输入，不重写人物与播放器。
 
 没有做同场景性能对比，无法断言GPUI合成会更快或更慢。验收门禁应包含真实3840×2160场景、持续缩放、人物动作、电视画面声音、UI叠加和输入焦点，避免GPU→CPU逐帧读回。
