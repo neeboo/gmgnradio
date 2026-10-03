@@ -2199,6 +2199,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gmgn-gpui-app"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "gmgn-gpui-ui",
+ "gpui-kit",
+ "raw-window-handle",
+ "serde_json",
+]
+
+[[package]]
 name = "gmgn-gpui-ui"
 version = "0.1.0"
 dependencies = [

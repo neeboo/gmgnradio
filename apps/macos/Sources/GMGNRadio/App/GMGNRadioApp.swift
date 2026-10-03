@@ -309,6 +309,7 @@ struct DockReopenAction {
     }
 }
 
+#if !GMGN_GPUI_PRODUCT_BOOTSTRAP
 @main
 struct GMGNRadioApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
@@ -353,6 +354,133 @@ struct GMGNRadioApp: App {
         .defaultSize(width: 580, height: 500)
     }
 }
+
+#endif
+
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+/// Narrow presentation seam for the GPUI product entry. All mutations use the
+/// same AppDelegate methods as the original AppKit/SwiftUI surfaces.
+extension AppDelegate {
+    func gpuiSubmit(_ submission: ResidentChatSubmission) async throws {
+        try await sendResidentSubmission(submission, source: .stage)
+    }
+
+    func gpuiCancelResident() { cancelResidentMessage(userIntent: true) }
+
+    func gpuiAttachSurface(_ container: NSView, fullStage: Bool) -> Bool {
+        guard let controller = stageRenderSurfaceController else { return false }
+        // Existing native windows retain their .fullStage/.liveCam ownership;
+        // their visibility notifications cannot stop these dedicated owners.
+        liveCamWindowController?.hide()
+        stageWindowController?.window?.orderOut(nil)
+        if fullStage {
+            spatialStage.requestWorldPresentation()
+            stageCameraCoordinator?.activateFullStage()
+        } else {
+            stageCameraCoordinator?.activateLiveCam()
+        }
+        if fullStage {
+            // Construct the native StageContentView before claiming GPUI
+            // ownership: its initial visibility observer attaches its own
+            // surface. The second attach below brings the input view above
+            // the renderer after the single surface is moved to GPUI.
+            guard stageWindowController?.attachGPUIWorldInteraction(to: container) == true else { return false }
+            installScreenOverlayIfNeeded()
+        }
+        controller.attachToGPUI(container, fullStage: fullStage)
+        if fullStage {
+            guard stageWindowController?.attachGPUIWorldInteraction(to: container) == true else {
+                controller.detach(from: controller.owner)
+                return false
+            }
+            stageWindowController?.window?.orderOut(nil)
+        }
+        controller.setOwnerVisibility(container.window?.isVisible == true, owner: controller.owner)
+        return true
+    }
+
+    func gpuiSurfaceVisibility(_ visible: Bool, occluded: Bool) -> Bool {
+        guard let controller = stageRenderSurfaceController,
+              controller.owner == .gpuiFullStage || controller.owner == .gpuiLiveCam else { return false }
+        controller.setOwnerVisibility(visible, occluded: occluded, owner: controller.owner)
+        return true
+    }
+
+    func gpuiDetachSurface() {
+        guard let controller = stageRenderSurfaceController,
+              controller.owner == .gpuiFullStage || controller.owner == .gpuiLiveCam else { return }
+        controller.detach(from: controller.owner)
+    }
+
+    func gpuiRotateSurface(yaw: Float, pitch: Float) {
+        stageRenderSurfaceController?.rotateLiveCam(deltaYaw: yaw, deltaPitch: pitch)
+    }
+
+    func gpuiChatSnapshot() -> [String: Any] {
+        let loop = residentAgentLoop?.snapshot
+        let context = currentResidentWorldContext()
+        let unread = context.worldID.map {
+            residentSystemInboxStore.unreadCount(worldID: $0, residentScope: context.sessionScope)
+        } ?? 0
+        let connectivity = context.worldID.flatMap { worldID in
+            wishMachineCoordinator.residentJobs(worldID: worldID, residentScope: context.sessionScope)
+                .compactMap { ResidentConnectivityFact.firstConnectivityLine(in: $0.lastError) }.first
+        }
+        return [
+            "configured": true,
+            "backend": AgentConversationService.shared.effectiveBackendID.rawValue,
+            "isThinking": loop?.isRunning ?? false,
+            "canStop": (loop?.isRunning ?? false) || residentActivityOwnership.hasActiveActivity
+                || (loop?.backgroundEnabled == true && loop?.isStopped == false),
+            "progress": loop?.progress as Any? ?? NSNull(),
+            "statusNotice": (stageWindowController?.residentStatusText ?? liveCamWindowController?.residentStatusText) as Any? ?? NSNull(),
+            "ttsError": AgentSpeechStatusStore.shared.lastErrorMessage as Any? ?? NSNull(),
+            "isSpeaking": AgentSpeechStatusStore.shared.isSpeaking,
+            "autonomyStopped": loop?.isAutonomyPausedByUser ?? false,
+            "queuedMessages": loop?.pendingUserMessages.count ?? 0,
+            "unconfirmedMessages": loop?.unconfirmedUserMessages.count ?? 0,
+            "connectivityNotice": connectivity as Any? ?? NSNull(),
+            "inboxUnread": unread,
+            "inboxPersistenceError": residentSystemInboxStore.persistenceError as Any? ?? NSNull(),
+            "playbackState": String(describing: localMusicPlayer.state),
+            "isDecorating": StageDecorationMenuStore.shared.isDecorating,
+            "deliveryMode": "final-response",
+            "reply": gpuiLatestResidentReply,
+            "worldToolsEnabled": true,
+            "scope": residentTranscriptScopeKey,
+            "surfaceOwner": String(describing: stageRenderSurfaceController?.owner ?? .detached),
+            "transcript": residentChatTranscript.lines().map { line in
+                ["turnID": line.turnID.uuidString,
+                 "role": line.speaker == .user ? "user" : line.speaker == .resident ? "agent" : "notice",
+                 "text": line.text]
+            },
+        ]
+    }
+
+    func gpuiPerformAction(_ action: String) -> Bool {
+        switch action {
+        case "showStage": showStage()
+        case "showLiveCam": showLiveCam()
+        case "showPlayer": showPlayer()
+        case "showSettings": openSystemSettings()
+        case "showPresenceSettings": openPresenceSettings()
+        case "showSpaceSettings": GMGNSettingsNavigation.shared.page = .space; openSystemSettings()
+        case "showMusicSettings": GMGNSettingsNavigation.shared.page = .music; openSystemSettings()
+        case "showAgentSettings": GMGNSettingsNavigation.shared.page = .agent; openSystemSettings()
+        case "showNotifications": openSystemInbox()
+        case "toggleDecoration": toggleDecorationEditor()
+        case "togglePlayback": toggleLocalPlayback()
+        case "previousTrack": playPreviousProgramTrack()
+        case "nextTrack": playNextProgramTrack()
+        case "chooseLocalTrack": chooseLocalTrack()
+        case "closeStage": closeStage()
+        case "stopResident": gpuiCancelResident()
+        default: return false
+        }
+        return true
+    }
+}
+#endif
 
 enum SystemResidentMenuEntry: Hashable, Sendable {
     case showLiveCam
@@ -403,6 +531,7 @@ final class StageDecorationMenuStore: ObservableObject {
     }
 }
 
+#if !GMGN_GPUI_PRODUCT_BOOTSTRAP
 extension GMGNRadioApp {
     @ViewBuilder
     private func systemResidentMenuItem(
@@ -444,6 +573,8 @@ extension GMGNRadioApp {
         }
     }
 }
+
+#endif
 
 @MainActor
 protocol GMGNApplicationControlling: AnyObject {
@@ -725,6 +856,13 @@ final class AppDelegate:
     GMGNApplicationControlling,
     DJAgentRadioActions
 {
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+    /// Presentation-only recovery sink; submission and execution stay in the
+    /// existing resident loop with the same world/session authorization.
+    var gpuiResidentRecovery: ((ResidentChatSubmission, String) -> Void)?
+    var gpuiOpenSettings: (() -> Void)?
+    private var gpuiLatestResidentReply = ""
+#endif
     private let playbackLogger = Logger(
         subsystem: ProductIdentity.bundleIdentifier,
         category: "DJPlayback"
@@ -1072,6 +1210,7 @@ final class AppDelegate:
         if environment["GMGN_BASELINE_IMMERSIVE"] == "1" {
             controller.enterImmersiveVisuals()
         }
+#if !GMGN_GPUI_PRODUCT_BOOTSTRAP
         if environment["GMGN_STAGE"] == "1" {
             showStage()
         } else if ApplicationLaunchPolicy.shouldShowDesktopPresenceOnLaunch(
@@ -1081,6 +1220,7 @@ final class AppDelegate:
             // 所以它是唯一允许使用的非显式触发源。
             showLiveCam(trigger: .launchDefault)
         }
+#endif
         if let trackPath = environment["GMGN_LOCAL_TRACK"] {
             do {
                 try playLocalTrack(URL(fileURLWithPath: trackPath))
@@ -1661,6 +1801,10 @@ final class AppDelegate:
     }
 
     func openSystemSettings() {
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+        gpuiOpenSettings?()
+        return
+#endif
         makeSettingsMenuAction(openSettings: { [weak self] in
             let revealedExistingWindow = NSApplication.shared.windows.contains(
                 where: SettingsWindowMatcher.matches
@@ -5980,6 +6124,9 @@ final class AppDelegate:
 
     /// 换世界/换后端等上下文切换：旧对话立即作废（activate 只在作用域变化时清空）。
     private func resetResidentTranscriptForContextSwitch() {
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+        gpuiLatestResidentReply = ""
+#endif
         residentChatTranscript.activate(scopeKey: residentTranscriptScopeKey)
         publishResidentTranscript()
     }
@@ -6016,6 +6163,9 @@ final class AppDelegate:
     /// 交付凭据。那份凭据与调用链已随 `memory_ingest` 一起删除，所以现在这里只做
     /// 呈现——朗读照旧、显示照旧，且**不再有任何"写记忆"的动作**。
     private func presentResidentReply(_ reply: String) {
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+        gpuiLatestResidentReply = reply
+#endif
         // 先按真实回合身份登记「真正送达」：只更新已记录的用户提交，未知/迟到
         // 的身份不臆造回合，也不重复显示。
         let deliveredIDs = residentAgentLoop?.lastFinishedTurnSubmissionIDs ?? []
@@ -7654,6 +7804,9 @@ final class AppDelegate:
             self.residentChatTranscript.markCancelled(ids: [submission.id])
             self.publishResidentTranscript()
             let notice = "已停止，未送达图文已回到输入框，未自动重发。"
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+            self.gpuiResidentRecovery?(submission, notice)
+#endif
             switch source {
             case .stage: self.stageWindowController?.restoreResidentSubmission(submission, notice: notice)
             case .liveCam: self.liveCamWindowController?.restoreResidentSubmission(submission, notice: notice)
@@ -7665,6 +7818,9 @@ final class AppDelegate:
             self.residentChatTranscript.markFailed(ids: [submission.id])
             self.publishResidentTranscript()
             let notice = "本轮未完成：\(failure)\n可能已有部分操作发生。请确认现场后再发送。"
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+            self.gpuiResidentRecovery?(submission, notice)
+#endif
             switch source {
             case .stage: self.stageWindowController?.restoreResidentSubmission(submission, notice: notice)
             case .liveCam: self.liveCamWindowController?.restoreResidentSubmission(submission, notice: notice)
@@ -7681,6 +7837,9 @@ final class AppDelegate:
                 interruption: loop.lastFinishedTurnInterruption ?? .newerInstruction
             )
             self.publishResidentTranscript()
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+            self.gpuiResidentRecovery?(submission, text)
+#endif
             switch source {
             case .stage: self.stageWindowController?.restoreResidentSubmission(submission, notice: text)
             case .liveCam: self.liveCamWindowController?.restoreResidentSubmission(submission, notice: text)

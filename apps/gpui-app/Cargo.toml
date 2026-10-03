@@ -1,0 +1,15 @@
+[package]
+name = "gmgn-gpui-app"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+gpui-kit = "=0.7.0"
+gmgn-gpui-ui = { path = "../gpui-ui" }
+raw-window-handle = "0.6"
+serde_json = "=1.0.151"
+
+[build-dependencies]
+cc = "1"

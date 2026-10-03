@@ -40,6 +40,10 @@ enum StageRenderSurfaceOwner: Equatable, Sendable {
     case detached
     case liveCam
     case fullStage
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+    case gpuiLiveCam
+    case gpuiFullStage
+#endif
 }
 
 enum StageRenderQuality: Equatable, Sendable {
@@ -88,6 +92,12 @@ struct StageRenderActivityState: Equatable, Sendable {
             isWorldPresentationRequested || isWorldPresentationVisible
         case .detached:
             false
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+        case .gpuiLiveCam:
+            true
+        case .gpuiFullStage:
+            isWorldPresentationRequested || isWorldPresentationVisible
+#endif
         }
         let active = owner != .detached
             && isOwnerVisible
@@ -250,6 +260,16 @@ final class StageRenderSurfaceController {
         surfaceView.prepareSelectedWorldForFullStage()
     }
 
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+    func attachToGPUI(_ container: NSView, fullStage: Bool) {
+        surfaceView.applyRenderProfile(fullStage ? .fullStage : .liveCam)
+        if !fullStage { surfaceView.updateLiveCamOrbit(liveCamOrbit) }
+        attach(to: container, owner: fullStage ? .gpuiFullStage : .gpuiLiveCam,
+               quality: fullStage ? .full : qualityForLiveCam)
+        if fullStage { surfaceView.prepareSelectedWorldForFullStage() }
+    }
+#endif
+
     func rotateLiveCam(deltaYaw: Float, deltaPitch: Float) {
         liveCamOrbit.rotate(
             deltaYaw: deltaYaw,
@@ -299,19 +319,27 @@ final class StageRenderSurfaceController {
     func setLiveCamQuality(_ quality: StageRenderQuality) {
         guard quality != .full else {
             self.quality = .balanced
-            if owner == .liveCam {
+            if ownsLiveCamProfile {
                 applyRenderState()
             }
             return
         }
         self.quality = quality
-        if owner == .liveCam {
+        if ownsLiveCamProfile {
             applyRenderState()
         }
     }
 
     private var qualityForLiveCam: StageRenderQuality {
         quality == .full ? .balanced : quality
+    }
+
+    private var ownsLiveCamProfile: Bool {
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+        owner == .liveCam || owner == .gpuiLiveCam
+#else
+        owner == .liveCam
+#endif
     }
 
     private func attach(
@@ -363,6 +391,12 @@ final class StageRenderSurfaceController {
             qualityForLiveCam
         case .detached:
             qualityForLiveCam
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+        case .gpuiFullStage:
+            .full
+        case .gpuiLiveCam:
+            qualityForLiveCam
+#endif
         }
         surfaceView.applyRenderQuality(
             framesPerSecond: activeQuality.framesPerSecond,

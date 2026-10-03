@@ -468,6 +468,16 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         residentChat.clearTransient()
     }
     var residentStatusText: String? { residentChat.statusNotice }
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+    /// Reparent the existing production input surface alongside the same Metal
+    /// surface. Its camera, placement and keyboard callbacks remain unchanged.
+    func attachGPUIWorldInteraction(to container: NSView) -> Bool {
+        if window == nil { window = makeWindow() }
+        guard let stageContentView else { return false }
+        stageContentView.attachGPUIWorldInteraction(to: container)
+        return true
+    }
+#endif
     func restoreResidentSubmission(_ submission: ResidentChatSubmission, notice: String) {
         residentChat.restore(submission, notice: notice)
         stageContentView?.showResidentChat()
@@ -506,6 +516,13 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         guard let window else {
             return
         }
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+        if renderSurfaceController.owner == .gpuiFullStage
+            || renderSurfaceController.owner == .gpuiLiveCam {
+            renderSurfaceController.detach(from: renderSurfaceController.owner)
+        }
+        stageContentView?.restoreNativeWorldInteraction()
+#endif
 
         NSApplication.shared.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
@@ -834,6 +851,23 @@ enum ResidentPropRotationHandleAnchor {
 
 @MainActor
 private final class StageContentView: NSView {
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+    func attachGPUIWorldInteraction(to container: NSView) {
+        worldInteractionView.removeFromSuperview()
+        worldInteractionView.frame = container.bounds
+        worldInteractionView.autoresizingMask = [.width, .height]
+        container.addSubview(worldInteractionView)
+        container.window?.acceptsMouseMovedEvents = true
+    }
+
+    func restoreNativeWorldInteraction() {
+        guard worldInteractionView.superview !== self else { return }
+        worldInteractionView.removeFromSuperview()
+        worldInteractionView.frame = bounds
+        addSubview(worldInteractionView, positioned: .above, relativeTo: renderSurfaceContainer)
+        window?.acceptsMouseMovedEvents = true
+    }
+#endif
     /// 建造模式的光标回调，转给真正处理鼠标的交互视图。
     var onGridCursor: ((SIMD2<Float>) -> Void)? {
         didSet { worldInteractionView.onGridCursor = onGridCursor }
@@ -1581,6 +1615,13 @@ private final class StageContentView: NSView {
     }
 
     func attachRenderSurface() {
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+        // Async world readiness also updates this retained native view. Only
+        // explicit native presentation may take the shared surface back.
+        guard worldInteractionView.superview === self else { return }
+        guard renderSurfaceController.owner != .gpuiFullStage,
+              renderSurfaceController.owner != .gpuiLiveCam else { return }
+#endif
         renderSurfaceController.attachToFullStage(renderSurfaceContainer)
     }
 

@@ -1,5 +1,6 @@
 //! First reusable GPUI Kit migration slice; no network or production configuration access.
 pub mod state;
+pub mod settings;
 use gpui_kit::prelude::FluentBuilder;
 
 use gpui_kit::component::input::InputEvent;
@@ -66,6 +67,9 @@ impl ResidentChatPane {
             cx.notify();
         }
     }
+    pub fn complete_without_reply(&mut self, id: u64, cx: &mut Context<Self>) {
+        if self.state.complete_without_reply(id) { cx.notify(); }
+    }
     pub fn set_transcript(&mut self, lines: Vec<TranscriptLine>, cx: &mut Context<Self>) {
         self.state.transcript = lines;
         cx.notify();
@@ -84,7 +88,7 @@ impl Render for ResidentChatPane {
         let theme = cx.theme();
         let mut history = div()
             .id("resident-transcript")
-            .h(px(if self.compact { 64. } else { 132. }))
+            .h(px(if self.compact { 32. } else { 132. }))
             .flex()
             .flex_col()
             .gap_2();

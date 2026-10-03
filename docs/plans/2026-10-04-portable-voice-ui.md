@@ -106,6 +106,12 @@ TTS 以及 ASR 设置的模型改为下拉，候选与默认值由 Rust voice_ca
 
 ## Unity + GPUI讨论范围（保持原决定）
 
+### 真实产品入口与完整对齐续作
+
+用户要求直接接现有 DSH、不指定 key，并要求 Swift UI 与 GPUI Kit 完整功能对齐。上一轮 Codex/Claude 验证选错后端；最新独立宿主实际 DSH 真实回复、上下文续聊及取消重试通过，但仅为技术证据。完整原主应用本轮实际重新构建并启动，复用已有真实人物、动作、世界/生成库存验收数据；原聊天入口收到真实居民回复，该运行对照仍使用原配置的 Codex。随后通过原设置显式切换 DSH，正式 GPUI v9 实际两轮回复与暗号续聊通过，不能据此提前认定 GPUI 全量通过。
+
+当前实现正式 GPUI 产品入口：保留真实 AppDelegate、ResidentAgentLoop、空间工具、TTS、taskd/mcpd、持久化和单一 SceneKit 渲染面；补菜单/设置/原窗口入口，尚未迁移的 Swift 界面继续保留。完整对齐与验收定义见 [45 项清单](2026-10-04-gpui-ui-parity.md)。使用 Kit 成熟组件与主题不允许删除附件、语音配置、音乐控制、小窗或错误恢复能力；原界面仍可达仅为过渡，不算已迁为 GPUI。ASR 真实麦克风验收仍暂停。
+
 GPUI第一切片已经开始：`apps/gpui-ui` 使用Kit0.7内置主题和Input/Button/scroll，7项状态测试通过。独立动态Swift渲染宿主复用现有SceneKit/Metal代码，真实LivingPod叠放、最小化/隐藏停帧恢复已通过；全尺寸与224×336聊天输入、发送失败保留及关闭实际验证通过。正式Swift入口未替换，taskd业务、附件、小窗人物视觉仍待验证。详细证据见 [叠放验收](2026-10-04-gpui-scenekit-overlay-probe.md)。
 
 续作已将GPUI文本Send/Cancel接到现有Swift AgentConversationService：真实后端事件、最终回复接口、有界历史及取消代际隔离已实现。9项组件状态和4项事件协议测试通过，真实App失败恢复、停止子进程、活跃请求关闭回收、小窗错误滚动均通过。Codex修正为显式环境API凭据后真实返回auth失败，成功回复与二轮上下文仍未通过；Claude分支同样未收到真实回复。Rust taskd当前无完整模型对话RPC，本轮不声称对话核心已下沉Rust，不删除Swift入口。后端仅显式启用，无Keychain、装机登录拷贝、世界工具、自动TTS或ASR。

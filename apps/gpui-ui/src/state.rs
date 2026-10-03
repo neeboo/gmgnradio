@@ -115,6 +115,14 @@ impl ChatState {
         self.progress = Some(progress);
         true
     }
+    pub fn complete_without_reply(&mut self, id: u64) -> bool {
+        if !self.pending.as_ref().is_some_and(|p| p.id == id && p.accepted) { return false; }
+        self.pending = None;
+        self.reply.clear();
+        self.progress = None;
+        self.status = None;
+        true
+    }
     pub fn cancel(&mut self) {
         if let Some(p) = self.pending.take() {
             self.commands.push(ChatCommand::Cancel { request_id: p.id });
@@ -133,6 +141,8 @@ impl ChatState {
     /// Context changes invalidate old callbacks without recycling request IDs.
     pub fn reset_context(&mut self) {
         self.cancel();
+        self.draft.clear();
+        self.revision += 1;
         self.reply.clear();
         self.transcript.clear();
         self.status = None;
@@ -250,5 +260,34 @@ mod tests {
         assert_eq!(s.draft, "旧文\n新文");
         assert!(!s.finish(2, "迟到".into()));
         assert!(!s.thinking());
+    }
+    #[test]
+    fn scope_change_discards_old_draft_and_cancels_only_old_request() {
+        let mut s = ChatState::default();
+        s.edit("旧世界消息".into());
+        s.send();
+        s.take_commands();
+        s.accepted(1);
+        s.edit("旧世界草稿".into());
+        s.reset_context();
+        assert!(s.draft.is_empty());
+        assert!(!s.thinking());
+        assert!(!s.finish(1, "迟到".into()));
+        assert!(matches!(s.take_commands().as_slice(), [ChatCommand::Cancel { request_id: 1 }]));
+        s.edit("新世界".into());
+        s.send();
+        assert!(matches!(s.take_commands().as_slice(), [ChatCommand::Send { request_id: 2, .. }]));
+    }
+    #[test]
+    fn silent_completed_turn_requires_acceptance_and_adds_no_reply() {
+        let mut s = ChatState::default();
+        s.edit("做一件事".into());
+        s.send();
+        assert!(!s.complete_without_reply(1));
+        s.accepted(1);
+        assert!(s.complete_without_reply(1));
+        assert!(!s.thinking());
+        assert!(s.reply.is_empty());
+        assert!(!s.complete_without_reply(1));
     }
 }

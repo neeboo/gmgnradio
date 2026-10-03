@@ -1,0 +1,38 @@
+include:
+  - project.yml
+name: GPUIProductHost
+targets:
+  GPUIProductHost:
+    type: library.dynamic
+    platform: macOS
+    sources:
+      - path: Sources/GMGNRadio
+      - path: ProductHost
+    dependencies:
+      - package: NanoemCore
+        product: CNanoem
+      - package: MMDSceneKit
+      - package: WorldRuntime
+      - package: MotionDistribution
+      - package: ElevenLabs
+      - package: LiveKit
+      - package: MetalSplatter
+        product: MetalSplatter
+      - package: MetalSplatter
+        product: SplatIO
+      - package: VRMMetalKit
+      - package: VRMMetalKit
+        product: GLTFMetalKit
+    settings:
+      base:
+        PRODUCT_NAME: GPUIProductHost
+        PRODUCT_MODULE_NAME: GPUIProductHost
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) GMGN_GPUI_PRODUCT_BOOTSTRAP"
+        CODE_SIGNING_ALLOWED: NO
+        SKIP_INSTALL: YES
+        SWIFT_COMPILATION_MODE: incremental
+schemes:
+  GPUIProductHost:
+    build:
+      targets:
+        GPUIProductHost: all
