@@ -4,14 +4,14 @@
 
 先下沉 TTS/ASR 与标准化 Rust MCP/客户端协议，再迁移 GPUI Kit 界面。现有 SceneKit、Metal 空间、人物和 3D 音乐播放器不替换。当前交互是按住说话、松开提交，回答正常播放；音频上传与输出保持流式，不做双向实时通话、不新增 LiveKit。供应商涵盖百炼、ElevenLabs、Fish Audio；能力以各家的实际接口为准。
 
-## 第一批已实现，尚未完成 App 接入
+## 实现状态（真实ASR验收按用户要求暂停）
 
 - `gmgn-protocol`：共享帧上限、请求ID、回复/事件判据和私有端点格式。保持现有业务 wire 字段和 MCP 工具权限。
 - taskd 与 MCP 通信改为仅绑定127.0.0.1随机端口的TCP，每条请求鉴权；token只在私有端点文件及内存中使用，不进入日志或能力合同。默认 `taskd.endpoint.json`，启动支持 `--endpoint-file`，旧 `--socket` 参数保留为路径参数别名，旧socket文件不删除、不覆盖。
 - 单写入继续使用 fs2 锁；Unix权限作为条件实现，Windows使用当前用户SID私有DACL、重解析点拒绝与原子文件替换。Windows文件模块和条件测试跨目标编译通过，完整Windows构建仍缺C SDK，未做Windows运行验收。
-- Swift世界与生成客户端已切回环TCP，未改其他独立host-tools桥接；因此整个应用仍有尚未迁移的Unix宿主接口，不能宣称整个应用已跨平台。
+- Swift世界、生成和语音客户端及独立host-tools桥接均已切私有回环TCP。SceneKit和设备录放音仍是平台宿主实现；这不等于整个应用已经完成跨平台迁移。
 - `gmgn-voice-core`：百炼真实WebSocket流式TTS协议；ElevenLabs/Fish Audio HTTP流式TTS。首个音频块即可交付，有界队列、generation与取消隔离，均不等待完整音频下载。输出为PCM16单声道24kHz，播放设备和嘴型仍由宿主接入。
-- 百炼ASR已移植手动commit协议与转写去重；ElevenLabs已移植Scribe手动commit消息。ASR socket transport、App按住说话流程、Rust服务暴露与真正播放集成仍待做。
+- 百炼/ElevenLabs ASR socket transport、手动commit、转写去重、taskd服务和App按住说话流程已集成；完整非空语句→Agent回复→播放的真实ASR验收尚未完成，并已按用户要求暂停。
 - Fish官方 `/v1/asr` 为音频文件上传，当前没有确认的公开流式ASR接口，未虚构这项能力。
 
 ## 实际验证与失败记录
@@ -22,7 +22,7 @@ Rust workspace测试包括MCP 13单元/7 stdio/4隔离，共享协议3、taskd13
 
 主代理Swift生成客户端检查28项通过。真实taskd单写入探针首次因 `/tmp` 别名拒绝启动（exit5），日志 `/tmp/gmgn-parent-portable-world-tests.log`；Foundation规范化仍会缩回 `/var`，第二次日志 `/tmp/gmgn-parent-portable-world-tests2.log` 仍失败。macOS测试夹具最终使用POSIX realpath，实际复验 `/tmp/gmgn-private-fixture-world-check.log` exit0、failures=0/warnings=0，私有文件安全规则未放宽。不掩盖首次失败。
 
-没有启动或替换已安装App、没有读Keychain或凭据、没有清用户数据。全套宿主构建、真实ASR录音、真实供应商首音频与播放、打断取消、人物嘴型与恢复流程尚未验收。GPUI尚未迁移。
+没有启动或替换已安装App、没有读Keychain、没有输出凭据或清用户数据。独立宿主构建和真实ElevenLabs TTS播放/取消已验收，真实非空ASR完整链路尚未验收。GPUI尚未迁移。
 
 ## GPUI与3D边界调研
 
@@ -37,6 +37,32 @@ GPUI Kit的paint/canvas是UI绘制接口，不提供SceneKit等价的完整场�
 - 供应商具体协议与验证范围见 `services/gmgn-voice-core/PROVIDERS.md`。
 
 ## 后续顺序
+
+### 2026-10-04 当前整合断点（未完成验收）
+
+Rust 已加入百炼/ElevenLabs 手动提交 ASR WebSocket transport，taskd 增加按连接隔离的流式语音 RPC。App 默认 TTS/ASR 已接 Rust，宿主仅负责麦克风 PCM 与设备播放；设置及 Stage/LiveCam 的按住/松开入口已接入。旧进程测试迁移到 TCP，业务19项、记忆5项、鉴权与 token 轮换1项通过。
+
+主代理全工作区测试 `/tmp/gmgn-rust-voice-integrated-tests3.log` 通过；前两次错误码排序测试失败已修正。宿主第一次构建因 LiveCam 松开回调缺失失败，第二次 `/tmp/gmgn-rust-core-app-build2.log` BUILD SUCCEEDED。
+
+实际隔离 App 根 `/private/tmp/gmgn-rust-voice-real-20261004`：启动及语音配置状态读回成功，使用内存 ElevenLabs 配置，无 Keychain 读取。真实 TTS 开始后 App 崩溃，不能算通过。崩溃证据 `gmgn radio-2026-10-04-003401.ips`：音频 tap 回调错误继承 MainActor，触发 Swift executor/dispatch 队列断言；已交回播放适配器修复，随后必须重建并复验真实声音与 ASR。
+
+剩余独立 host-tools 的 Unix 传输正在迁移，Windows 实机运行门禁仍未通过；GPUI 尚未开始迁移。
+
+播放回调修复后，第三、四次宿主构建通过。隔离根 `/private/tmp/gmgn-rust-voice-real2-20261004` 的实际 ElevenLabs → Rust → App TTS 完整播放结束且无错误；按 PID68560 输出采样 `evidence/tts-audible.json` exit0，rms=0.05169、peak=0.48251、globalTap=false、scopedProcesses仅该PID。ASR 开始采集后仅送3050字节即失败，完整语音链仍未通过。独立安全连接检查收到 ElevenLabs `session_started`，并发送同长度 PCM 后4秒内无服务错误；正在修复 App 与云端握手就绪时序，不能将该检查算 App ASR 验收。
+
+ASR ready 门禁完成后，第五、六次构建通过，主代理 Rust 全工作区 `/tmp/gmgn-rust-voice-ready-workspace3.log` exit0，共186项。真实 App `/private/tmp/gmgn-rust-voice-speaker-20261004` 采集263486字节并手动提交，收到空final且没有误送Agent；capturedPeak=0、lastFinalReceived=true、emptyFinalCount=1。设备诊断确认 AppleClamshellState=Yes、默认内置麦克风。Apple 官方说明合盖时会硬件断开内置麦克风：[说明](https://support.apple.com/guide/security/secbbd20b00b/web)。仅隔离App的语音engine选择扬声器，没有修改系统默认设备；原始麦克风音频未保存。
+
+用户随后明确要求“先不测ASR，等我起床再测”：ASR全部测试与录音暂停，不再请求麦克风或云端ASR；保留未完成门禁，等用户恢复后继续。继续TTS、接口取消安全修复与真实业务回归，不把硬件阻断计为通过。
+
+非ASR业务实跑：新根 `/private/tmp/gmgn-rust-core-business-20261004` 首次137通过/2失败/1阻断，真实生成、入库、摆放、动作、通知已读及聊天通过；失败是直接HLS地址不在当前视频来源策略内，未放宽策略。换已支持的Twitch链接、复用已生成任务后149通过/1失败/1阻断，原生电视画面、按PID声音及恢复通过；该次复用任务没有新未读通知，通知翻转门禁具名失败，不能把复用流程冒充全新完整通过。日志分别 `/tmp/gmgn-rust-core-business-e2e2.log`、`/tmp/gmgn-rust-core-business-twitch-retry.log`。
+
+Host-tools两通道已迁私有回环TCP，89项宿主通道/172项Node MCP桥接检查通过。审阅发现取消时直接abort生产者可能截断NDJSON，已改每连接8帧专属writer完成整帧，并限制in-flight请求队列；非ASR慢读取消、超限、64请求顺序等检查通过。
+
+最终构建 `/tmp/gmgn-rust-core-final-app-build.log` BUILD SUCCEEDED；ASR暂停后仅运行非ASR任务服务138项和MCP/协议27项，全部通过。新端点读取负对照7项、设备PCM/TTS20项通过，安全复审未发现新的具体阻断问题。端点读取的no-follow保护最后分量，仍依赖taskd私有目录边界。
+
+最终产物真实TTS-only `/private/tmp/gmgn-rust-tts-final-20261004/voice-report.json`：有声、drain结束、取消后无声均通过。PID80979的输出采样 rms=0.048738/peak=0.422445，取消后 rms=0/peak=0；globalTap=false且scopedProcesses仅该PID。驱动器整体exit2、status=partial、pending=asr_paused_by_user，明确不将TTS通过升级为完整语音通过。该次没有录音或ASR请求。
+
+最终产物全新真实业务回归 `/private/tmp/gmgn-rust-core-final-business-20261004/evidence/summary.json`：160通过、0失败、0阻断，进程exit0。日志 `/tmp/gmgn-rust-core-final-business-e2e.log`。真实生成任务 `1578662C-4F47-4ABB-B70E-8724746823C4` 完成生成、世界入库、摆放手持、人物动作、Twitch原生电视画面与声音、通知已读、重启恢复和真实聊天；隔离检查确认没有写真实用户Application Support。本轮不包含ASR，完整Rust语音链仍待用户恢复后验收。
 
 1. 完成Rust ASR transport与语音服务接口，接回Swift录放音桥接并验收真实按住说话流程。
 2. 将剩余宿主能力逐项纳入有版本、可发现、统一错误和事件的接口，保留权威与平台实现的边界。

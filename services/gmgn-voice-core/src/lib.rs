@@ -1,5 +1,6 @@
 //! Portable speech synthesis protocol. No audio device or application runtime.
 pub mod asr;
+pub mod asr_stream;
 pub mod providers;
 pub mod tts_stream;
 use reqwest::{Client, Response};

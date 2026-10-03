@@ -62,6 +62,7 @@
 		285A92ABFCB741A3A097E4F0 /* ResidentWorldObservation.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABAA7C464C8C13EA57082B04 /* ResidentWorldObservation.swift */; };
 		2A26F8968E03BC2900222337 /* DuckingEnvelopeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4DD12D460EA71333952EBAB /* DuckingEnvelopeTests.swift */; };
 		2BA9B1BEE7247E41156D4B53 /* CodexPlanningExecutor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 977A9FD8072469DD8A215BC8 /* CodexPlanningExecutor.swift */; };
+		2C1FEDCF125E3E984445A4AF /* RustVoiceClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F219BE73E18D39620ABC253 /* RustVoiceClient.swift */; };
 		2C9AEFE80D992E7CDBDA41B5 /* WorldAuthorityClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CD6F11948A8443229AD4E83 /* WorldAuthorityClient.swift */; };
 		2CAE7AC3DD788FE1CD3D0E59 /* MotionPackageStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 156B582F0FC7CCEDEBF3C16A /* MotionPackageStore.swift */; };
 		2D37209DE2C9436846F79D76 /* ResidentVisionCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEAA3EE93DD1EF8B9F73F37E /* ResidentVisionCapture.swift */; };
@@ -256,6 +257,7 @@
 		BEB4C8BCA7C17AD706CD5267 /* GLTFMetalKit in Frameworks */ = {isa = PBXBuildFile; productRef = C3FCCC8D1C10983C138146E3 /* GLTFMetalKit */; };
 		C04254A6FF945016763D8B48 /* ResidentStateClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 19678E75760FF52C34D1F4BB /* ResidentStateClient.swift */; };
 		C10827D8D39E84E9E79DFFD9 /* DJProgramStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F0C99CC73DBA693F2E286F1 /* DJProgramStore.swift */; };
+		C291DC6978A8AF9ECE627079 /* StreamingPCMPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AD054DE8DB0A8A99F454434 /* StreamingPCMPlayer.swift */; };
 		C3E9ADA40693BD1AB0C2F219 /* AppleMusicSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = 393199081906581B9CC18676 /* AppleMusicSource.swift */; };
 		C5B456BB3F40EBD534A86A28 /* WorldScreenOverlayController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0AE9BABDBADF3D475A635E0 /* WorldScreenOverlayController.swift */; };
 		C8AF3084ADEA152752C5EE7F /* OrbAppearance.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6B4ECE2281E5829AE3E02FE3 /* OrbAppearance.swift */; };
@@ -384,6 +386,7 @@
 		19D1AC1EED8E537124163209 /* MusicProviderSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicProviderSession.swift; sourceTree = "<group>"; };
 		1A5EDA2BEFBB8C23CC031079 /* VMDToVRMClipAdapterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VMDToVRMClipAdapterTests.swift; sourceTree = "<group>"; };
 		1A6D2B6F929D4352B28477BF /* PMXAvatarMetalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PMXAvatarMetalView.swift; sourceTree = "<group>"; };
+		1AD054DE8DB0A8A99F454434 /* StreamingPCMPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamingPCMPlayer.swift; sourceTree = "<group>"; };
 		1B2A3586C14E9FEC3F15B9AF /* StageCameraModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageCameraModel.swift; sourceTree = "<group>"; };
 		1B2AAC89D19825EE7D4ABFCD /* MarbleSpatialView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarbleSpatialView.swift; sourceTree = "<group>"; };
 		1BB8EACB340657AF2516A624 /* ResidentVisionImageBox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentVisionImageBox.swift; sourceTree = "<group>"; };
@@ -530,6 +533,7 @@
 		9AE1C62891D06F5AAEE8F1BD /* AudioFeatureFrame.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioFeatureFrame.swift; sourceTree = "<group>"; };
 		9BBCD27EB577935FFD6A28AC /* Worlds */ = {isa = PBXFileReference; lastKnownFileType = folder; name = Worlds; path = Resources/Worlds; sourceTree = SOURCE_ROOT; };
 		9DC0013373B44A5DFD680348 /* VRMAvatarMetalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VRMAvatarMetalView.swift; sourceTree = "<group>"; };
+		9F219BE73E18D39620ABC253 /* RustVoiceClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustVoiceClient.swift; sourceTree = "<group>"; };
 		9F772420CF42B6F465A7F93A /* ProgramPlaybackQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgramPlaybackQueueTests.swift; sourceTree = "<group>"; };
 		9FE339024D9CADE22E3549D1 /* LivingWorldBootstrapTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LivingWorldBootstrapTests.swift; sourceTree = "<group>"; };
 		A054BF4EB9B407D4E3BE532C /* ResidentDSHConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentDSHConfiguration.swift; sourceTree = "<group>"; };
@@ -851,6 +855,8 @@
 				4C7A2D03F5D5146ABBED6DBA /* ResidentWishReferenceTools.swift */,
 				ABAA7C464C8C13EA57082B04 /* ResidentWorldObservation.swift */,
 				2B3D886F759F9B2EBE61D14B /* ResidentWorldToolSession.swift */,
+				9F219BE73E18D39620ABC253 /* RustVoiceClient.swift */,
+				1AD054DE8DB0A8A99F454434 /* StreamingPCMPlayer.swift */,
 				A6D3D91BCF20583E4035282C /* WishMachineContract.swift */,
 				015185F407965D5142B0841B /* WorldAgentContext.swift */,
 				4979C002BFA7259332C1AF5A /* WorldAgentToolContract.swift */,
@@ -1751,6 +1757,7 @@
 				285A92ABFCB741A3A097E4F0 /* ResidentWorldObservation.swift in Sources */,
 				B38CAD275CF9668811068E88 /* ResidentWorldToolSession.swift in Sources */,
 				2E832C415DE812A98AA914DB /* RetryBackoff.swift in Sources */,
+				2C1FEDCF125E3E984445A4AF /* RustVoiceClient.swift in Sources */,
 				1CE6FFEC4077B8A06CE52D92 /* ScreenLinkAssetLoader.swift in Sources */,
 				9782E204E11B073EC02DE58D /* ScreenLinkContract.swift in Sources */,
 				D64C1CE7F4A4CBC78737228B /* ScreenLinkHelperLocator.swift in Sources */,
@@ -1779,6 +1786,7 @@
 				D8D0906855E8347D014683A6 /* StageWindowController.swift in Sources */,
 				E4B42BCA37A2E6ACCFD8C3E8 /* StageWindowMode.swift in Sources */,
 				119696923E6727DCFC6373AD /* StreamingMusicCache.swift in Sources */,
+				C291DC6978A8AF9ECE627079 /* StreamingPCMPlayer.swift in Sources */,
 				DDDEBAB15217CC1A60061CDE /* SyncedMusicLibraryStore.swift in Sources */,
 				5DF23352AF4CE0DD0F99380E /* TrackKnowledge.swift in Sources */,
 				583709DB2BCEF0293ECDCD8B /* UnifiedMusicSearch.swift in Sources */,

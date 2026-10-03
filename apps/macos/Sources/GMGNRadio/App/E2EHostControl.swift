@@ -39,6 +39,7 @@ final class E2EHostControl {
         /// 收件箱"显式已读"：与收件箱详情里那一次用户点击走同一个 `markRead`。
         var markInboxRead: @MainActor (_ taskKey: String) async throws -> [String: Any]
         var terminate: @MainActor () -> Void
+        var voiceControl: @MainActor (_ action: String, _ text: String?) async throws -> [String: Any] = { _, _ in [:] }
     }
 
     private let fileManager: FileManager
@@ -186,6 +187,11 @@ final class E2EHostControl {
             return await handler.playDirectMedia(objectID, url)
         case "inbox_state":
             return await handler.inboxState()
+        case "voice_control":
+            guard let action = params["action"] as? String else {
+                throw E2EHostControlError.missingParameter("action")
+            }
+            return try await handler.voiceControl(action, params["text"] as? String)
         case "inbox_mark_read":
             guard let taskKey = params["taskKey"] as? String, !taskKey.isEmpty else {
                 throw E2EHostControlError.missingParameter("taskKey")

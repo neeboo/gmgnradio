@@ -472,6 +472,7 @@ dependencies = [
  "base64",
  "fs2",
  "gmgn-protocol",
+ "gmgn-voice-core",
  "libc",
  "png",
  "reqwest",

@@ -242,6 +242,117 @@ final class AgentSpeechAnnouncer {
 
 // MARK: - Bailian text-to-speech (never a conversation model)
 
+/// Production cloud speech uses taskd exclusively. Platform code only plays
+/// streamed PCM; provider requests, segmentation and cancellation live in Rust.
+@MainActor final class RustSpeechSynthesizer: SpeechSynthesizing {
+    private let configuration: @MainActor () -> RustVoiceConfiguration
+    private let statusStore: AgentSpeechStatusStore
+    private let start: @MainActor (String, RustVoiceConfiguration) async throws -> any RustVoiceStreaming
+    private let player: any StreamingPCMPlaying
+    private let onPlaybackChanged: @MainActor (AgentSpeechPlaybackState) -> Void
+    private var session: (any RustVoiceStreaming)?
+    private var generation = UUID()
+    private var operation: Task<Void, Never>?
+    private var completion: AgentSpeechCompletion?
+    private(set) var isSpeaking = false { didSet { statusStore.isSpeaking = isSpeaking } }
+
+    init(configuration: @escaping @MainActor () -> RustVoiceConfiguration,
+         statusStore: AgentSpeechStatusStore = .shared,
+         client: RustVoiceClient = RustVoiceClient(),
+         player: any StreamingPCMPlaying = StreamingPCMPlayer(),
+         onPlaybackChanged: @escaping @MainActor (AgentSpeechPlaybackState) -> Void = { _ in },
+         start: (@MainActor (String, RustVoiceConfiguration) async throws -> any RustVoiceStreaming)? = nil) {
+        self.configuration = configuration; self.statusStore = statusStore
+        self.start = start ?? { text, settings in try await client.startTTS(text: text, configuration: settings) }
+        self.player = player; self.onPlaybackChanged = onPlaybackChanged
+    }
+
+    @discardableResult func speak(_ text: String) -> Bool { begin(text, completion: nil) }
+    @discardableResult func speak(_ text: String, completion: @escaping AgentSpeechCompletion) -> Bool {
+        begin(text, completion: completion)
+    }
+    private func begin(_ text: String, completion: AgentSpeechCompletion?) -> Bool {
+        stopSpeaking()
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { completion?(.cancelled); return false }
+        let settings = configuration()
+        guard !settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            statusStore.lastErrorMessage = "请先在语音设置中填写服务密钥；文字回复不受影响。"
+            completion?(.failed); return false
+        }
+        statusStore.lastErrorMessage = nil
+        self.completion = completion; isSpeaking = true
+        let identity = generation
+        operation = Task { [weak self] in
+            guard let self else { return }
+            var stream: (any RustVoiceStreaming)?
+            defer {
+                stream?.close()
+                if generation == identity {
+                    session = nil; player.stop(); onPlaybackChanged(.idle)
+                    isSpeaking = false; operation = nil
+                }
+            }
+            do {
+                let opened = try await start(text, settings)
+                stream = opened
+                try requireCurrent(identity)
+                session = opened
+                var beganPlayback = false
+                while true {
+                    let event = try await opened.nextEvent()
+                    try requireCurrent(identity)
+                    switch event.type {
+                    case "audio":
+                        guard event.sampleRate == 24_000, event.channels == 1, event.encoding == "pcm16le",
+                              let encoded = event.audioBase64, encoded.utf8.count <= 43_692,
+                              let pcm = Data(base64Encoded: encoded), !pcm.isEmpty, pcm.count <= 32_768 else {
+                            throw RustVoiceError.invalidFrame
+                        }
+                        if !beganPlayback {
+                            try player.begin { [weak self] state in
+                                guard let self, self.generation == identity else { return }
+                                self.onPlaybackChanged(state)
+                            }
+                            beganPlayback = true
+                        }
+                        try await player.append(pcm)
+                    case "finished":
+                        guard beganPlayback else { throw RustVoiceError.invalidFrame }
+                        try await player.finish() // cloud finished is NOT audio delivered
+                        try requireCurrent(identity)
+                        resolve(identity, .finished)
+                        return
+                    case "error": throw RustVoiceError.rejected(event.code ?? "voice_failed")
+                    default: throw RustVoiceError.invalidFrame
+                    }
+                }
+            } catch {
+                guard generation == identity, !Task.isCancelled, !(error is CancellationError) else { return }
+                statusStore.lastErrorMessage = (error as? LocalizedError)?.errorDescription
+                    ?? "语音朗读失败，请检查语音设置；文字回复不受影响。"
+                resolve(identity, .failed)
+            }
+        }
+        return true
+    }
+    func stopSpeaking() {
+        generation = UUID()
+        session?.cancel(); session = nil
+        operation?.cancel(); operation = nil
+        player.stop(); onPlaybackChanged(.idle); isSpeaking = false
+        let previous = completion; completion = nil; previous?(.cancelled)
+    }
+    private func requireCurrent(_ identity: UUID) throws {
+        try Task.checkCancellation()
+        guard generation == identity else { throw CancellationError() }
+    }
+    private func resolve(_ identity: UUID, _ outcome: AgentSpeechOutcome) {
+        guard generation == identity else { return }
+        let previous = completion; completion = nil; previous?(outcome)
+    }
+}
+
 enum BailianTTSVoice: String, CaseIterable, Identifiable, Sendable {
     case cherry = "Cherry", serena = "Serena", ethan = "Ethan", chelsie = "Chelsie"
     var id: String { rawValue }

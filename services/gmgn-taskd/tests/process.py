@@ -17,7 +17,8 @@ import unittest
 import uuid
 import zlib
 
-BIN = os.environ.get("TASKD_BIN", "/tmp/gmgn-taskd-target-rust-worker/debug/gmgn-taskd")
+DEFAULT_BIN = Path(__file__).resolve().parents[3] / "target" / "debug" / ("gmgn-taskd.exe" if os.name == "nt" else "gmgn-taskd")
+BIN = os.environ.get("TASKD_BIN", str(DEFAULT_BIN))
 TOKEN = "offline-secret-do-not-persist"
 
 
@@ -150,12 +151,12 @@ class Remote:
 
 class Daemon:
     def __init__(self, root):
-        self.root = Path(root)
-        self.path = str(self.root / "taskd.sock")
+        self.root = Path(root).resolve()
+        self.path = str(self.root / "taskd.endpoint.json")
         self.start()
 
     def start(self, extra=()):
-        self.p = subprocess.Popen([BIN, "--root", str(self.root), "--socket", self.path, "--concurrency", "2", *extra], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.p = subprocess.Popen([BIN, "--root", str(self.root), "--endpoint-file", self.path, "--concurrency", "2", *extra], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         for _ in range(500):
             if self.p.poll() is not None:
                 break
@@ -166,21 +167,29 @@ class Daemon:
                 time.sleep(.02)
         if self.p.poll() is None:
             self.p.kill()
-        raise AssertionError("daemon did not expose its socket: " + self.p.communicate(timeout=2)[1].decode())
+        raise AssertionError("daemon did not expose its TCP endpoint: " + self.p.communicate(timeout=2)[1].decode())
 
     def connect(self):
-        s = socket.socket(socket.AF_UNIX)
+        endpoint = json.loads(Path(self.path).read_text())
+        host, port = endpoint["address"].rsplit(":", 1)
+        if endpoint["version"] != 1 or host != "127.0.0.1" or not 0 < int(port) < 65536:
+            raise OSError("invalid local endpoint")
+        self.auth = endpoint["token"]
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(8)
         try:
-            s.connect(self.path)
+            s.connect((host, int(port)))
         except Exception:
             s.close()
             raise
         return s
 
+    def frame(self, value):
+        return json.dumps(dict(value, auth=self.auth)).encode() + b"\n"
+
     def request(self, method, params={}):
         with self.connect() as s:
-            s.sendall(json.dumps(dict(id="test", method=method, params=params)).encode() + b"\n")
+            s.sendall(self.frame(dict(id="test", method=method, params=params)))
             with s.makefile("rb") as stream:
                 return json.loads(stream.readline())
 
@@ -208,7 +217,7 @@ class Daemon:
 
 class ProcessTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="taskd-", dir="/tmp")
+        self.temp = tempfile.TemporaryDirectory(prefix="taskd-", dir=Path(tempfile.gettempdir()).resolve())
         self.remote = Remote()
         self.daemon = None
 
@@ -230,7 +239,7 @@ class ProcessTests(unittest.TestCase):
         second = d.submit(self.remote.endpoint)["result"]["job"]
         self.assertLess(time.monotonic() - start, 1)
         sub = d.connect()
-        sub.sendall(b'{"id":"s","method":"subscribe","params":{"after":0}}\n')
+        sub.sendall(d.frame(dict(id="s", method="subscribe", params=dict(after=0))))
         stream = sub.makefile("rb")
         self.assertTrue(json.loads(stream.readline())["result"]["subscribed"])
         end = time.monotonic() + 3
@@ -254,7 +263,7 @@ class ProcessTests(unittest.TestCase):
         d.stop()
         d.start()
         replay = d.connect()
-        replay.sendall(b'{"id":"s","method":"subscribe","params":{"after":0}}\n')
+        replay.sendall(d.frame(dict(id="s", method="subscribe", params=dict(after=0))))
         with replay.makefile("rb") as rs:
             rs.readline()
             self.assertGreater(json.loads(rs.readline())["event"]["sequence"], 0)
@@ -275,6 +284,30 @@ class ProcessTests(unittest.TestCase):
         self.assertNotEqual(cancelled["backendStage"], "cancelled")
         self.remote.release.set()
         self.assertEqual(d.wait_stage(identity, {"cancelled"})["receipt"]["state"], "cancelled")
+
+    def test_tcp_endpoint_authentication_and_restart_rotation(self):
+        d = self.start()
+        previous = d.auth
+        for auth in (None, "wrong-local-token"):
+            with d.connect() as connection:
+                frame = dict(id="unauthorized", method="configure", params=dict(endpoint="https://blocked.invalid", token="never-configured"))
+                if auth is not None:
+                    frame["auth"] = auth
+                connection.sendall(json.dumps(frame).encode() + b"\n")
+                with connection.makefile("rb") as stream:
+                    response = json.loads(stream.readline())
+                self.assertEqual(response.get("error", {}).get("code"), "ipc_unauthorized")
+        providers = d.request("providers_status")["result"]["endpoints"]
+        self.assertFalse(any(p["endpoint"] == "https://blocked.invalid" for p in providers))
+        d.stop()
+        d.start()
+        self.assertTrue(previous != d.auth, "restart must rotate private authentication")
+        with d.connect() as connection:
+            connection.sendall(json.dumps(dict(auth=previous,id="old",method="snapshot",params={})).encode()+b"\n")
+            with connection.makefile("rb") as stream:
+                response=json.loads(stream.readline())
+            self.assertEqual(response.get("error",{}).get("code"),"ipc_unauthorized")
+        self.assertIn("result",d.request("snapshot"))
 
     def test_restart_running_waits_for_credentials(self):
         self.remote.mode = "running"
@@ -357,7 +390,7 @@ class ProcessTests(unittest.TestCase):
 
         def receive(consumer, until):
             s = d.connect()
-            s.sendall(json.dumps(dict(id="subscription", method="subscribe_messages", params=dict(consumer=consumer, **context))).encode()+b"\n")
+            s.sendall(d.frame(dict(id="subscription", method="subscribe_messages", params=dict(consumer=consumer, **context))))
             found = []
             with s.makefile("rb") as stream:
                 self.assertTrue(json.loads(stream.readline())["result"]["subscribed"])
@@ -409,7 +442,7 @@ class ProcessTests(unittest.TestCase):
         legacy.mkdir()
         tasks = legacy / "tasks.json"
         tasks.write_bytes(b"corrupt")
-        p = subprocess.run([BIN, "--root", self.temp.name, "--socket", str(Path(self.temp.name)/"taskd.sock"), "--legacy-root", str(legacy)], capture_output=True, timeout=5)
+        p = subprocess.run([BIN, "--root", self.temp.name, "--endpoint-file", str(Path(self.temp.name)/"taskd.endpoint.json"), "--legacy-root", str(legacy)], capture_output=True, timeout=5)
         self.assertNotEqual(p.returncode, 0)
         self.assertIn(b"legacy_unavailable", p.stderr)
         self.assertEqual(tasks.read_bytes(), b"corrupt")
@@ -439,9 +472,9 @@ class ProcessTests(unittest.TestCase):
         d = self.start()
         with d.connect() as connection:
             with connection.makefile("rb") as stream:
-                connection.sendall(b'{"id":"subscribe","method":"subscribe","params":{"after":0}}\n')
+                connection.sendall(d.frame(dict(id="subscribe", method="subscribe", params=dict(after=0))))
                 self.assertTrue(json.loads(stream.readline())["result"]["subscribed"])
-                connection.sendall(b'{"id":"snapshot","method":"snapshot","params":{}}\n')
+                connection.sendall(d.frame(dict(id="snapshot", method="snapshot", params={})))
                 line = stream.readline()
                 self.assertTrue(line, "daemon closed multiplexed connection after subscribe")
                 response = json.loads(line)
@@ -478,7 +511,7 @@ class ProcessTests(unittest.TestCase):
 
         def page(params):
             with d.connect() as socket_:
-                socket_.sendall(json.dumps(dict(id="page", method="snapshot", params=params)).encode()+b"\n")
+                socket_.sendall(d.frame(dict(id="page", method="snapshot", params=params)))
                 with socket_.makefile("rb") as stream:
                     raw = stream.readline()
                 self.assertLessEqual(len(raw), 2 * 1024 * 1024)
@@ -502,7 +535,7 @@ class ProcessTests(unittest.TestCase):
         self.assertNotIn(new_identity, {j["id"] for j in all_jobs})
         self.assertFalse(next(j for j in all_jobs if j["id"] == target)["cancelRequested"])
         with d.connect() as connection:
-            connection.sendall(json.dumps(dict(id="events", method="subscribe", params=dict(after=frozen_sequence))).encode()+b"\n")
+            connection.sendall(d.frame(dict(id="events", method="subscribe", params=dict(after=frozen_sequence))))
             with connection.makefile("rb") as stream:
                 stream.readline()
                 while True:
@@ -558,7 +591,7 @@ class ProcessTests(unittest.TestCase):
         d = self.start()
         for identity in (None, 42, {}, [], "", "i"*201, "界"*100, "i"*(12*1024*1024-100)):
             with d.connect() as connection:
-                connection.sendall(json.dumps(dict(id=identity,method="snapshot",params={})).encode()+b"\n")
+                connection.sendall(d.frame(dict(id=identity,method="snapshot",params={})))
                 with connection.makefile("rb") as stream:
                     raw = stream.readline()
                 self.assertLess(len(raw), 1024)

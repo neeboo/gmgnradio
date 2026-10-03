@@ -1,6 +1,6 @@
 // 首次语音授权的纯逻辑回归（无麦克风 / 无网络 / 无宿主 App）：
 //   1) 抽取生产 `MicrophoneAuthorizationGate`（可注入状态与系统请求）；
-//   2) 抽取生产 `enqueueResidentVoiceShutdown`，验证连接任务被取消后
+//   2) 抽取生产 `disconnectRealtimeVoice`，验证连接任务被取消后
 //      shutdown 一定落地（旧实现会挂住，见 docs/plans/evidence）。
 // 覆盖：已授权 / 已拒绝 / 允许 / 拒绝 / 迟到结果 / 取消 / 重试 / 超时后重试。
 import Foundation
@@ -25,7 +25,7 @@ func declaration(_ signature: String, _ text: String) -> String {
 let app = try String(contentsOf: sources.appendingPathComponent("App/GMGNRadioApp.swift"), encoding: .utf8)
 let gate = "@MainActor\n" + declaration("final class MicrophoneAuthorizationGate", app)
 let setupError = declaration("enum RealtimeVoiceSetupError", app)
-let shutdown = declaration("private func enqueueResidentVoiceShutdown(", app)
+let shutdown = declaration("func disconnectRealtimeVoice()", app)
 
 let harness = #"""
 import Foundation
@@ -37,6 +37,7 @@ import Foundation
 enum VoiceState: Equatable { case disconnected, connecting, listening, failed(String) }
 
 @MainActor protocol RealtimeDJSession: AnyObject {
+    func cancel()
     func setMicrophoneCaptureEnabled(_ enabled: Bool) async throws
     func setMicrophoneTransmissionEnabled(_ enabled: Bool) async throws
     func disconnect() async
@@ -47,6 +48,7 @@ enum VoiceState: Equatable { case disconnected, connecting, listening, failed(St
     var beforeDisconnect: (() -> Void)?
     var suspendDisconnect = false
     var disconnectGate: CheckedContinuation<Void, Never>?
+    func cancel() { trace.append("disconnect") }
     func setMicrophoneCaptureEnabled(_ enabled: Bool) async throws { trace.append("capture:\(enabled)") }
     func setMicrophoneTransmissionEnabled(_ enabled: Bool) async throws { trace.append("transmit:\(enabled)") }
     func disconnect() async {
@@ -78,6 +80,10 @@ enum VoiceState: Equatable { case disconnected, connecting, listening, failed(St
 }
 
 @MainActor final class Flag { var value = false }
+struct RealtimeDJAudioLevel: Sendable { let peak: Double }
+@MainActor final class Capture { func cancel() async {} }
+@MainActor final class Announcer { func stop() {} }
+@MainActor final class Panel { func setVoiceLevel<T: BinaryFloatingPoint>(_ level: T) {} }
 
 @MainActor final class App {
     var residentVoiceRequestID: UUID?
@@ -86,6 +92,16 @@ enum VoiceState: Equatable { case disconnected, connecting, listening, failed(St
     var residentVoiceShutdownTask: Task<Void, Never>?
     var residentVoiceShutdownGeneration: UInt64 = 0
     var realtimeVoiceConnectionTask: Task<Void, Never>?
+    var realtimeVoiceTimeoutTask: Task<Void, Never>?
+    var residentVoiceEventTask: Task<Void, Never>?
+    var residentVoiceCommitTask: Task<Void, Never>?
+    var residentVoiceAudioTask: Task<Void, Never>?
+    var residentVoiceAudioContinuation: AsyncStream<(Data, RealtimeDJAudioLevel)>.Continuation?
+    var residentVoiceDidCommit = false
+    var residentVoiceCapture: Capture?
+    let agentSpeechAnnouncer = Announcer()
+    var orbWindowController: Panel? = Panel()
+    var stageWindowController: Panel? = Panel()
     var state = VoiceState.disconnected
     var statuses: [String] = []
     var prompts = 0
@@ -93,17 +109,7 @@ enum VoiceState: Equatable { case disconnected, connecting, listening, failed(St
     func setRealtimeVoiceState(_ value: VoiceState) { state = value }
     func showResidentVoiceStatus(_ text: String) { statuses.append(text) }
 
-    func disconnectRealtimeVoice() {
-        residentVoiceRequestID = nil
-        residentVoiceAcceptsFinal = false
-        let connectingTask = realtimeVoiceConnectionTask
-        connectingTask?.cancel()
-        realtimeVoiceConnectionTask = nil
-        let session = residentVoiceSession
-        residentVoiceSession = nil
-        enqueueResidentVoiceShutdown(session, after: connectingTask)
-        setRealtimeVoiceState(.disconnected)
-    }
+    \#(shutdown)
 
     @discardableResult
     private func clearResidentVoiceShutdown(generation: UInt64) -> Bool {
@@ -112,12 +118,6 @@ enum VoiceState: Equatable { case disconnected, connecting, listening, failed(St
         return true
     }
 
-    @discardableResult
-    \#(shutdown)
-
-    func stopSession(_ session: (any RealtimeDJSession)?, after task: Task<Void, Never>?) -> Task<Void, Never> {
-        enqueueResidentVoiceShutdown(session, after: task)
-    }
 }
 
 @MainActor var checks = 0
@@ -250,7 +250,7 @@ enum VoiceState: Equatable { case disconnected, connecting, listening, failed(St
             controller.answer(true)
         }
 
-        // 第 6 组：真实 enqueueResidentVoiceShutdown 在连接任务被取消后必须落地。
+        // 第 6 组：Rust 会话关闭与设备 shutdown 在连接取消后必须落地。
         do {
             let app = App()
             let session = Session()

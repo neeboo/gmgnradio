@@ -225,8 +225,10 @@ struct StageResidentComposer: View {
     let onSendMessage: @MainActor (ResidentChatSubmission) async throws -> Void
     let onCancelMessage: @MainActor () -> Void
     let onToggleVoice: @MainActor () -> Void
+    let onFinishVoice: @MainActor () -> Void
     let onFocusInput: @MainActor () -> Void
     @FocusState private var inputFocused: Bool
+    @State private var voicePressed = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -344,15 +346,29 @@ struct StageResidentComposer: View {
                         .foregroundStyle(.white.opacity(0.43))
                         .accessibilityIdentifier("stage.resident-progress")
                     Spacer(minLength: 8)
-                    Button(action: onToggleVoice) {
+                    Button(action: {}) {
                         Image(systemName: state.voiceActive ? "mic.fill" : "mic")
                             .font(.system(size: 15, weight: .medium))
                             .frame(width: 30, height: 30)
                     }
                     .buttonStyle(.plain)
+                    .simultaneousGesture(DragGesture(minimumDistance: 0)
+                        .onChanged { _ in
+                            guard !voicePressed else { return }
+                            voicePressed = true
+                            onToggleVoice()
+                        }
+                        .onEnded { _ in
+                            guard voicePressed else { return }
+                            voicePressed = false
+                            onFinishVoice()
+                        })
+                    .onDisappear {
+                        if voicePressed { voicePressed = false; onFinishVoice() }
+                    }
                     .foregroundStyle(state.voiceActive ? Color.cyan : .white.opacity(0.72))
-                    .help(state.voiceActive ? "结束语音输入" : "语音输入")
-                    .accessibilityLabel(state.voiceActive ? "结束语音输入" : "语音输入")
+                    .help("按住说话，松开发送")
+                    .accessibilityLabel("按住说话，松开发送")
                     if canStopReply && hasDraft {
                         Button(action: stopReply) {
                             if speechStatus.isSpeaking {

@@ -9,6 +9,7 @@ mod model;
 mod provider;
 mod resident;
 mod store;
+mod voice;
 mod world;
 
 fn main() {

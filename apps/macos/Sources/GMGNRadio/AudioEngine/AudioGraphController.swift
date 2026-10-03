@@ -2,6 +2,138 @@ import AVFoundation
 import Foundation
 import os
 
+/// Device-only adapter. All capture state and callbacks belong to `queue`.
+/// It never starts/stops the shared music engine or implements an ASR protocol.
+final class PushToTalkAudioCapture: NSObject,
+    AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable
+{
+    private let session = AVCaptureSession()
+    private let queue = DispatchQueue(label: "ai.gmgn.radio.push-to-talk.capture", qos: .userInitiated)
+    private let receive: @Sendable (Data, RealtimeDJAudioLevel) -> Void
+    private let onFailure: @Sendable (Error) -> Void
+    private var accepting = false
+    private var timeout: DispatchWorkItem?
+
+    init(
+        preferredDeviceID: String? = nil,
+        receive: @escaping @Sendable (Data, RealtimeDJAudioLevel) -> Void,
+        onFailure: @escaping @Sendable (Error) -> Void
+    ) throws {
+        self.receive = receive
+        self.onFailure = onFailure
+        super.init()
+        // Permission is deliberately owned by MicrophoneAuthorizationGate in App.
+        let devices = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.microphone], mediaType: .audio, position: .unspecified
+        ).devices
+        let selectedID = BailianMicrophoneDeviceSelector.preferredID(
+            requestedID: preferredDeviceID,
+            defaultID: AVCaptureDevice.default(for: .audio)?.uniqueID,
+            devices: devices.map { BailianMicrophoneDeviceOption(id: $0.uniqueID, name: $0.localizedName) }
+        )
+        guard let device = devices.first(where: { $0.uniqueID == selectedID }) else {
+            throw BailianMicrophoneCaptureError.noMicrophone
+        }
+        let input = try AVCaptureDeviceInput(device: device)
+        let output = AVCaptureAudioDataOutput()
+        // AVCapture performs device-format conversion before delivering samples.
+        output.audioSettings = BailianMicrophoneCapture.audioSettings
+        output.setSampleBufferDelegate(self, queue: queue)
+        session.beginConfiguration()
+        defer { session.commitConfiguration() }
+        guard session.canAddInput(input) else { throw BailianMicrophoneCaptureError.cannotAddInput }
+        session.addInput(input)
+        guard session.canAddOutput(output) else { throw BailianMicrophoneCaptureError.cannotAddOutput }
+        session.addOutput(output)
+    }
+
+    func start() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.async { [self] in
+                session.startRunning()
+                guard session.isRunning else {
+                    continuation.resume(throwing: BailianMicrophoneCaptureError.cannotAddInput)
+                    return
+                }
+                accepting = true
+                let timeout = DispatchWorkItem { [weak self] in
+                    guard let self, self.accepting else { return }
+                    self.accepting = false
+                    self.session.stopRunning()
+                    self.onFailure(PushToTalkCaptureError.timeout)
+                }
+                self.timeout = timeout
+                queue.asyncAfter(deadline: .now() + 60, execute: timeout)
+                continuation.resume()
+            }
+        }
+    }
+
+    /// Returns only after every accepted receive callback has returned. The caller
+    /// must then drain its bounded Rust-send queue before issuing ASR commit.
+    func stop() async {
+        await withCheckedContinuation { continuation in
+            queue.async { [self] in
+                accepting = false
+                timeout?.cancel()
+                timeout = nil
+                session.stopRunning()
+                continuation.resume()
+            }
+        }
+    }
+
+    /// Cancellation drains the device callback queue but never commits transcription.
+    func cancel() async { await stop() }
+
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didOutput sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        guard accepting else { return }
+        guard let description = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let format = CMAudioFormatDescriptionGetStreamBasicDescription(description),
+              format.pointee.mSampleRate == 16_000,
+              format.pointee.mChannelsPerFrame == 1,
+              format.pointee.mFormatID == kAudioFormatLinearPCM,
+              format.pointee.mBitsPerChannel == 16,
+              format.pointee.mFormatFlags & kAudioFormatFlagIsSignedInteger != 0,
+              format.pointee.mFormatFlags & kAudioFormatFlagIsBigEndian == 0,
+              let block = CMSampleBufferGetDataBuffer(sampleBuffer)
+        else { fail(BailianMicrophoneCaptureError.invalidAudioBuffer); return }
+        let length = CMBlockBufferGetDataLength(block)
+        guard length > 0, length.isMultiple(of: 2) else {
+            fail(BailianMicrophoneCaptureError.invalidAudioBuffer); return
+        }
+        // No unbounded capture buffer: copy and deliver one protocol-sized chunk at a time.
+        for offset in stride(from: 0, to: length, by: 32_768) {
+            let count = min(32_768, length - offset)
+            var data = Data(count: count)
+            let status = data.withUnsafeMutableBytes { bytes in
+                CMBlockBufferCopyDataBytes(block, atOffset: offset, dataLength: count, destination: bytes.baseAddress!)
+            }
+            guard status == noErr else { fail(BailianMicrophoneCaptureError.invalidAudioBuffer); return }
+            receive(data, BailianPCMCodec.audioLevel(for: data))
+        }
+    }
+
+    private func fail(_ error: Error) {
+        guard accepting else { return }
+        accepting = false
+        timeout?.cancel()
+        timeout = nil
+        // Stop outside the delegate invocation, after the current sample has returned.
+        queue.async { [self] in session.stopRunning() }
+        onFailure(error)
+    }
+}
+
+enum PushToTalkCaptureError: LocalizedError {
+    case timeout
+    var errorDescription: String? { "录音超过一分钟，请松开后重新说话。" }
+}
+
 enum BailianPCMCodecError: LocalizedError {
     case invalidPCM
     case unavailableAudioFormat

@@ -53,6 +53,7 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     private let onNextTrack: @MainActor () -> Void
     private let onReplanProgram: @MainActor () -> Void
     private let onToggleVoice: @MainActor () -> Void
+    private let onFinishVoice: @MainActor () -> Void
     private let onRunActivity: @MainActor (String) -> Void
     private let onStopActivity: @MainActor () -> Void
     private let onManageAssets: @MainActor () -> Void
@@ -242,6 +243,7 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         onNextTrack: @escaping @MainActor () -> Void = {},
         onReplanProgram: @escaping @MainActor () -> Void = {},
         onToggleVoice: @escaping @MainActor () -> Void = {},
+        onFinishVoice: @escaping @MainActor () -> Void = {},
         onRunActivity: @escaping @MainActor (String) -> Void = { _ in },
         onStopActivity: @escaping @MainActor () -> Void = {},
         onManageAssets: @escaping @MainActor () -> Void = {},
@@ -283,6 +285,7 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         self.onNextTrack = onNextTrack
         self.onReplanProgram = onReplanProgram
         self.onToggleVoice = onToggleVoice
+        self.onFinishVoice = onFinishVoice
         self.onRunActivity = onRunActivity
         self.onStopActivity = onStopActivity
         self.onManageAssets = onManageAssets
@@ -640,6 +643,7 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
             onNextTrack: onNextTrack,
             onReplanProgram: onReplanProgram,
             onToggleVoice: onToggleVoice,
+            onFinishVoice: onFinishVoice,
             onRunActivity: onRunActivity,
             onStopActivity: onStopActivity,
             onManageAssets: onManageAssets,
@@ -934,6 +938,7 @@ private final class StageContentView: NSView {
         onNextTrack: @escaping @MainActor () -> Void,
         onReplanProgram: @escaping @MainActor () -> Void,
         onToggleVoice: @escaping @MainActor () -> Void,
+        onFinishVoice: @escaping @MainActor () -> Void,
         onRunActivity: @escaping @MainActor (String) -> Void,
         onStopActivity: @escaping @MainActor () -> Void,
         onManageAssets: @escaping @MainActor () -> Void,
@@ -982,7 +987,8 @@ private final class StageContentView: NSView {
         )
         let voiceButton = StageVoiceButton(
             state: voiceState,
-            action: onToggleVoice
+            action: onToggleVoice,
+            finish: onFinishVoice
         )
         let visualButton = StageVisualButton { [weak self] in
             self?.toggleVisualPicker()
@@ -1182,6 +1188,7 @@ private final class StageContentView: NSView {
             onSendMessage: onSendMessage,
             onCancelMessage: onCancelMessage,
             onToggleVoice: onToggleVoice,
+            onFinishVoice: onFinishVoice,
             onFocusInput: { [spatialStage] in
                 spatialStage.clearMovement()
                 spatialStage.setSpeedBoosted(false)
@@ -3251,6 +3258,8 @@ private final class StagePlaybackButton: NSButton {
 @MainActor
 private final class StageVoiceButton: NSButton {
     private let handler: @MainActor () -> Void
+    private let finishHandler: @MainActor () -> Void
+    private var isHolding = false
     private var pointerIsInside = false
     private var voiceState = RealtimeVoiceConnectionState.disconnected
 
@@ -3260,9 +3269,11 @@ private final class StageVoiceButton: NSButton {
 
     init(
         state: RealtimeVoiceConnectionState,
-        action: @escaping @MainActor () -> Void
+        action: @escaping @MainActor () -> Void,
+        finish: @escaping @MainActor () -> Void
     ) {
         handler = action
+        finishHandler = finish
         super.init(frame: .zero)
         identifier = NSUserInterfaceItemIdentifier("stage.voice-toggle")
         target = self
@@ -3284,19 +3295,19 @@ private final class StageVoiceButton: NSButton {
         let content: (symbol: String, label: String)
         switch state {
         case .disconnected:
-            content = ("mic.slash.fill", "麦克风已关闭，点击开麦")
+            content = ("mic.fill", "按住说话，松开发送")
         case .connecting:
-            content = ("hourglass", "正在开启麦克风，点击取消")
+            content = ("hourglass", "正在准备收音，松开发送")
         case .connected:
-            content = ("mic.fill", "麦克风已开启，点击关闭")
+            content = ("mic.fill", "按住说话，松开发送")
         case .listening:
-            content = ("waveform.circle.fill", "麦克风已开启，DJ 正在听")
+            content = ("waveform.circle.fill", "正在收音，松开发送")
         case .speaking:
             content = ("speaker.wave.2.fill", "DJ 正在说话")
         case let .failed(message):
             content = (
                 "exclamationmark.triangle.fill",
-                "开麦失败：\(message)；点击重试"
+                "收音失败：\(message)；按住重试"
             )
         }
         image = NSImage(
@@ -3342,7 +3353,21 @@ private final class StageVoiceButton: NSButton {
 
     @objc
     private func performAction() {
+        guard !isHolding else { return }
         handler()
+        finishHandler()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard isEnabled else { return }
+        isHolding = true
+        handler()
+        defer {
+            isHolding = false
+            finishHandler()
+        }
+        // AppKit tracks release even when the pointer leaves the button.
+        super.mouseDown(with: event)
     }
 
     private func updateAppearance() {

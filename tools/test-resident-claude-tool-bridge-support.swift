@@ -207,18 +207,18 @@ func residentClaudeMCPUDSClient(
     argumentsJSON: Data,
     callID: String = "direct"
 ) -> Data? {
-    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    let fd = socket(AF_INET, SOCK_STREAM, 0)
     guard fd >= 0 else { return nil }
     defer { close(fd) }
-    var address = sockaddr_un()
-    address.sun_family = sa_family_t(AF_UNIX)
-    withUnsafeMutableBytes(of: &address.sun_path) { raw in
-        let count = min(raw.count, socketPath.utf8.count)
-        for (index, byte) in socketPath.utf8.prefix(count).enumerated() { raw[index] = byte }
-    }
+    guard let port = UInt16(socketPath.split(separator: ":").last ?? "") else { return nil }
+    var address = sockaddr_in()
+    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_addr.s_addr = inet_addr("127.0.0.1")
+    address.sin_port = port.bigEndian
     let connected = withUnsafePointer(to: &address) { pointer in
         pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
         }
     }
     guard connected == 0 else { return nil }
@@ -485,7 +485,7 @@ func residentClaudeMCPCraftedGrant(
         ? "\"pad\":\"" + String(repeating: "a", count: paddingBytes) + "\","
         : ""
     return "{\"protocol\":1,\"state\":\"armed\",\(expires)\(padding)"
-        + "\"secret\":\"\(secret)\",\"round\":\"\(round)\",\"socketPath\":\"\(socketPath)\","
+        + "\"secret\":\"\(secret)\",\"round\":\"\(round)\",\"endpoint\":{\"version\":1,\"address\":\"\(socketPath)\",\"token\":\"\(secret)\"},"
         + "\"tools\":[{\"name\":\"\(declaredName)\",\"canonical\":\"read_wish_generation\"}]}"
 }
 
@@ -851,7 +851,7 @@ struct ResidentClaudeMCPBridgeTests {
         checks.expectContains(textContent(expiredResponse), "expired", "R15 过期通用文本")
         let grantObject = ResidentClaudeMCPFixture.object(try Data(contentsOf: session.grantFileURL))
         let secret = grantObject?["secret"] as? String ?? ""
-        let socketPath = grantObject?["socketPath"] as? String ?? ""
+        let socketPath = (grantObject?["endpoint"] as? [String: Any])?["address"] as? String ?? ""
         let directFrame = await residentClaudeMCPUDSFrameAsync(
             socketPath: socketPath, secret: secret,
             name: "gmgn_read_wish_generation", arguments: [:]
@@ -952,7 +952,7 @@ struct ResidentClaudeMCPBridgeTests {
             let probeGrant = ResidentClaudeMCPFixture.object(try Data(contentsOf: probeSession.grantFileURL))
             let probeSecret = probeGrant?["secret"] as? String ?? ""
             let probeRound = probeGrant?["round"] as? String ?? ""
-            let probeSocket = probeGrant?["socketPath"] as? String ?? ""
+            let probeSocket = (probeGrant?["endpoint"] as? [String: Any])?["address"] as? String ?? ""
             checks.check(!probeSecret.isEmpty && !probeRound.isEmpty && !probeSocket.isEmpty, "R18 probe grant 完整")
 
             let futureExpiry = "\(Int64((Date().addingTimeInterval(120).timeIntervalSince1970 * 1000).rounded()))"
@@ -991,6 +991,18 @@ struct ResidentClaudeMCPBridgeTests {
                 ),
                 expectError: false, expectedText: "wish_id"
             )
+            let validEndpointGrant = residentClaudeMCPCraftedGrant(
+                secret: probeSecret, round: probeRound, socketPath: probeSocket,
+                declaredName: "gmgn_read_wish_generation", expiresAtLiteral: futureExpiry
+            )
+            for (label, invalidGrant) in [
+                ("非 loopback", validEndpointGrant.replacingOccurrences(of: "127.0.0.1:", with: "192.0.2.1:")),
+                ("协议版本", validEndpointGrant.replacingOccurrences(of: "\"version\":1", with: "\"version\":2")),
+                ("鉴权不匹配", validEndpointGrant.replacingOccurrences(of: "\"token\":\"\(probeSecret)\"", with: "\"token\":\"\(UUID().uuidString.lowercased())\"")),
+            ] {
+                try await probeCall(label: "R18 endpoint \(label)", grantJSON: invalidGrant,
+                                    expectError: true, expectedText: "tool bridge unavailable")
+            }
             for (offset, literal) in [nil, "\"soon\"", "1e999", "null", "true"].enumerated() {
                 try await probeCall(
                     label: "R18 非法 expiresAt #\(offset)",

@@ -17,6 +17,7 @@ try FileManager.default.createDirectory(at: work, withIntermediateDirectories: t
 defer { try? FileManager.default.removeItem(at: work) }
 
 let relativeSources = [
+    "apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift",
     "apps/macos/Sources/GMGNRadio/Agent/ResidentDSHAgentToolBridge.swift",
     "apps/macos/Sources/GMGNRadio/Agent/ResidentDSHHostToolsBridge.swift",
     "apps/macos/Sources/GMGNRadio/Agent/ResidentClaudeToolBridge.swift",

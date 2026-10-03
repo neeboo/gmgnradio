@@ -39,8 +39,8 @@ UserDefaults 全部隔离到一次性目录里；它不安装、不启动、不�
         --avatar-source "$HOME/Library/Application Support/gmgn radio/PresencePackages/pmx.2b-miss-0414-standard" \\
         --motion-source "$HOME/Library/Application Support/gmgn radio/MotionPackages"
 
-测试根默认是 `/tmp/gmgn-e2e-<时间戳>`：taskd 走 AF_UNIX，socket 路径超过
-`sockaddr_un.sun_path`（macOS 104 字节）就起不来；驱动器会在启动前拒绝过深的根。
+测试根默认是解析符号链接后的系统临时目录下的 `gmgn-e2e-<时间戳>`。
+taskd 使用私有 `taskd.endpoint.json` 描述鉴权 loopback TCP，不再受 Unix socket 路径长度限制。
 **已有 root 默认拒绝覆盖**：要复用加 `--reuse-root`，要删掉重建加 `--overwrite-root`。
 
 驱动器会真的触发非待机活动（行走 / 跳跃 / 坐下，取当前世界声明的那几项），并在
@@ -111,6 +111,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -153,13 +154,9 @@ SIT_PELVIS_ALIGNMENT_TOLERANCE_M = 0.60
 # 坐姿骨盆必须高于脚面的最小差（米）：证明躯干由座面托着、腿垂在下面。
 SIT_PELVIS_ABOVE_FOOT_M = 0.05
 
-# 测试根默认落在 `/tmp` 下**短**路径：taskd 用 AF_UNIX，`sockaddr_un.sun_path` 在
-# macOS 上只有 104 字节（含结尾 NUL）。上一轮默认根是仓库内
-# `tmp/e2e-real-app/<时间戳>`，socket 路径超过 104 字节 ⇒ taskd 起不来、世界加载失败。
-DEFAULT_ROOT_PARENT = Path("/tmp")
+# 解析系统临时目录别名，满足 taskd 私有存储的祖先路径安全检查。
+DEFAULT_ROOT_PARENT = Path(tempfile.gettempdir()).resolve()
 DEFAULT_ROOT_PREFIX = "gmgn-e2e-"
-# `sun_path` 的总字节数（含结尾 NUL）。可用路径最长 103。
-AF_UNIX_SUN_PATH_BYTES = 104
 # 接地数值容差（米）：补偿后接触点只要低于静止参考这么多就算穿地。补偿本身是精确的
 # （offset >= rest - minimum），所以这里可以收得很紧，5 mm 只留给蒙皮数值噪声。
 GROUNDING_TOLERANCE_M = 0.005
@@ -170,11 +167,11 @@ GROUNDING_TOLERANCE_M = 0.005
 # 就能通过。绝不为了让某一次通过而放宽判据：只有预检放行的位置才会去 apply。
 PLACEMENT_PROBE_BUDGET = 160
 
-# taskd 的 socket 相对测试根的路径。**必须**与生产
+# taskd 的 endpoint 文件相对测试根的路径。**必须**与生产
 # `WorldAuthorityEndpoint.taskServiceRoot` / `PropTaskDaemonClient(root:)` 同一口径：
-#   <root>/Library/Application Support/gmgn radio/TaskService/taskd.sock
-TASKD_SOCKET_RELATIVE = Path(
-    "Library/Application Support/gmgn radio/TaskService/taskd.sock"
+#   <root>/Library/Application Support/gmgn radio/TaskService/taskd.endpoint.json
+TASKD_ENDPOINT_RELATIVE = Path(
+    "Library/Application Support/gmgn radio/TaskService/taskd.endpoint.json"
 )
 # 人物 / 动作包在测试根里的落点（复制，绝不 symlink 到生产）。
 AVATAR_PACKAGES_RELATIVE = Path("Library/Application Support/gmgn radio/PresencePackages")
@@ -186,25 +183,13 @@ class E2ERealAppError(RuntimeError):
 
 
 def default_e2e_root() -> Path:
-    """默认测试根：`/tmp/gmgn-e2e-<时间戳>`（短到 AF_UNIX 放得下）。"""
+    """默认测试根位于解析后的系统临时目录。"""
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return DEFAULT_ROOT_PARENT / f"{DEFAULT_ROOT_PREFIX}{stamp}"
+    return (DEFAULT_ROOT_PARENT / f"{DEFAULT_ROOT_PREFIX}{stamp}").resolve()
 
 
-def taskd_socket_path(root: Path) -> Path:
-    return Path(root) / TASKD_SOCKET_RELATIVE
-
-
-def validate_taskd_socket_path(root: Path) -> None:
-    """拒绝 socket 路径超过 AF_UNIX 上限的测试根，并给出可用的短根建议。"""
-    socket = taskd_socket_path(root)
-    encoded = len(str(socket).encode("utf-8")) + 1  # 含结尾 NUL
-    if encoded > AF_UNIX_SUN_PATH_BYTES:
-        raise E2ERealAppError(
-            f"测试根太深：taskd socket 路径 {socket} 有 {encoded} 字节，"
-            f"超过 AF_UNIX 的 {AF_UNIX_SUN_PATH_BYTES} 字节上限。"
-            f"请改用短根，例如 {default_e2e_root()}。"
-        )
+def taskd_endpoint_path(root: Path) -> Path:
+    return Path(root).resolve() / TASKD_ENDPOINT_RELATIVE
 
 
 def assert_test_root_is_not_production(root: Path) -> None:
@@ -789,7 +774,6 @@ class RealAppE2E:
 
     def prepare_root(self) -> None:
         try:
-            validate_taskd_socket_path(self.root)
             assert_test_root_is_not_production(self.root)
         except E2ERealAppError as error:
             raise SystemExit(str(error)) from error
@@ -811,7 +795,7 @@ class RealAppE2E:
         support = self.root / "Library/Application Support"
         support.mkdir(parents=True, exist_ok=True)
         self.ledger.info("测试根已就绪", root=str(self.root),
-                         taskdSocket=str(taskd_socket_path(self.root)))
+                         taskdEndpointFile=str(taskd_endpoint_path(self.root)))
         # 真实生成服务的配置**真的注入**到 App 显式读取的那条路径下：
         #   <root>/Library/Application Support/ai.gmgn.radio/secrets/prop-generation.json
         # App 侧 `PropGenerationConfigurationStore` 在 E2E 下读的正是这个根（显式 root
@@ -949,7 +933,7 @@ class RealAppE2E:
     def production_fingerprint() -> dict[str, str]:
         """真实用户 Application Support 下关键路径的指纹。
 
-        只读 `mtime_ns` 与条目数/size：E2E 若回落写生产（新增 taskd socket、
+        只读 `mtime_ns` 与条目数/size：E2E 若回落写生产（新增 taskd endpoint 文件、
         wishes.json、世界预像、**人物/动作 selection**……），目录 mtime 必然变。
         真实配置的**读取**不动 mtime，所以这条判据不会把"只读复用配置"误判成写生产。
 
@@ -2912,7 +2896,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--app", help="已构建的独立测试产物路径")
     parser.add_argument("--build", action="store_true", help="调用 tools/e2e-app-build.sh 先构建")
     parser.add_argument("--configuration", default="Release")
-    parser.add_argument("--root", help="测试数据根（默认 /tmp/gmgn-e2e-<时间戳>，短到 AF_UNIX 放得下）")
+    parser.add_argument("--root", help="测试数据根（默认解析后的系统临时目录/gmgn-e2e-<时间戳>；taskd 使用鉴权 TCP）")
     parser.add_argument("--reuse-root", action="store_true",
                         help="复用已有 root（默认：root 已存在就拒绝覆盖）")
     parser.add_argument("--overwrite-root", action="store_true",

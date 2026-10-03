@@ -1,6 +1,38 @@
 import Foundation
 import Observation
 
+/// Portable voice choices are independent of the retired realtime-conversation SDK.
+final class RustSpeechPreferences {
+    private let defaults: UserDefaults
+    init(defaults: UserDefaults = E2ERuntime.defaults) { self.defaults = defaults }
+    func provider(for purpose: String, includesEnvironment: Bool = true) -> RustVoiceProvider {
+        let explicit = includesEnvironment ? ProcessInfo.processInfo.environment["GMGN_VOICE_\(purpose.uppercased())_PROVIDER"] : nil
+        return (explicit ?? defaults.string(forKey: "speech.rust.\(purpose).provider"))
+            .flatMap(RustVoiceProvider.init(rawValue:)) ?? .bailian
+    }
+    func configuration(for purpose: String, includesEnvironment: Bool = true) -> RustVoiceConfiguration {
+        let provider = provider(for: purpose, includesEnvironment: includesEnvironment)
+        let prefix = "speech.rust.\(provider.rawValue)."
+        let environment = includesEnvironment ? ProcessInfo.processInfo.environment : [:]
+        let environmentPrefix = "GMGN_VOICE_\(provider.rawValue.uppercased())_"
+        // Existing Bailian credentials remain reusable without moving or exposing them.
+        let legacy = provider == .bailian ? defaults.string(forKey: "voice.bailian.apiKey") : nil
+        let sharedElevenKey = provider == .elevenlabs ? environment["ELEVENLABS_API_KEY"] : nil
+        return RustVoiceConfiguration(provider: provider,
+            apiKey: environment[environmentPrefix + "API_KEY"] ?? defaults.string(forKey: prefix + "apiKey") ?? sharedElevenKey ?? legacy ?? "",
+            voiceID: environment[environmentPrefix + "VOICE_ID"] ?? defaults.string(forKey: prefix + "voiceID")
+                ?? (provider == .bailian ? defaults.string(forKey: RealtimeVoicePreferences.replyVoiceIDKey) ?? "Cherry" : ""),
+            model: environment[environmentPrefix + purpose.uppercased() + "_MODEL"] ?? defaults.string(forKey: prefix + purpose + ".model"))
+    }
+    func save(_ configuration: RustVoiceConfiguration, for purpose: String) {
+        defaults.set(configuration.provider.rawValue, forKey: "speech.rust.\(purpose).provider")
+        let prefix = "speech.rust.\(configuration.provider.rawValue)."
+        defaults.set(configuration.apiKey, forKey: prefix + "apiKey")
+        if purpose == "tts" { defaults.set(configuration.voiceID, forKey: prefix + "voiceID") }
+        defaults.set(configuration.model, forKey: prefix + purpose + ".model")
+    }
+}
+
 struct BailianRealtimeModelOption: Identifiable, Equatable, Sendable {
     let id: String
     let title: String

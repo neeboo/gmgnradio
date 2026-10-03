@@ -3,8 +3,8 @@
 
 These cover the 2026-10-03 reacceptance items:
 
-  * the default test root is short enough for AF_UNIX (`sockaddr_un.sun_path` is
-    104 bytes on macOS) and an over-long `--root` is refused **before** launch;
+  * the default test root is canonical and taskd uses an endpoint JSON file;
+    long isolated roots are accepted without the removed Unix socket limit;
   * an existing root is refused by default (explicit `--reuse-root` /
     `--overwrite-root` are required);
   * `--avatar-source` / `--motion-source` **copy** packages into the test root
@@ -45,17 +45,19 @@ class RootSafetyTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.driver = load_driver()
 
-    def test_default_root_is_short_enough_for_af_unix(self) -> None:
+    def test_default_root_is_canonical_and_uses_tcp_endpoint_file(self) -> None:
         root = self.driver.default_e2e_root()
-        self.assertEqual(root.parent, Path("/tmp"))
-        socket = self.driver.taskd_socket_path(root)
-        self.assertLessEqual(len(str(socket).encode()) + 1, 104)
-        self.driver.validate_taskd_socket_path(root)
+        self.assertEqual(root.parent, Path(tempfile.gettempdir()).resolve())
+        self.assertEqual(root, root.resolve())
+        endpoint = self.driver.taskd_endpoint_path(root)
+        self.assertEqual(endpoint.name,"taskd.endpoint.json")
 
-    def test_overlong_root_is_refused(self) -> None:
+    def test_long_root_is_not_subject_to_unix_socket_limit(self) -> None:
         deep = Path("/Users/someone/dev/gmgnradio/tmp/e2e-real-app/20261003-171000")
-        with self.assertRaises(self.driver.E2ERealAppError):
-            self.driver.validate_taskd_socket_path(deep)
+        self.driver.assert_test_root_is_not_production(deep)
+        endpoint = self.driver.taskd_endpoint_path(deep)
+        self.assertGreater(len(str(endpoint).encode())+1,104)
+        self.assertEqual(endpoint.name,"taskd.endpoint.json")
 
     def test_production_roots_are_refused(self) -> None:
         home = Path.home()
@@ -73,7 +75,7 @@ class RootSafetyTests(unittest.TestCase):
         temporary = Path(tempfile.mkdtemp(prefix="gmgn-t-", dir="/tmp"))
         self.addCleanup(shutil.rmtree, temporary, ignore_errors=True)
         self.driver.assert_test_root_is_not_production(temporary)
-        self.driver.validate_taskd_socket_path(temporary)
+        self.assertEqual(self.driver.taskd_endpoint_path(temporary).name,"taskd.endpoint.json")
 
 
 class PackageCopyTests(unittest.TestCase):
@@ -224,6 +226,13 @@ class PrepareRootTests(unittest.TestCase):
         runner = self.driver_for(self.root)
         runner.prepare_root()
         self.assertTrue((self.root / "Library/Application Support").is_dir())
+
+    def test_long_isolated_root_is_prepared_without_socket_length_gate(self) -> None:
+        deep = self.root / ("long-isolated-directory-" * 4) / "business"
+        runner = self.driver_for(deep)
+        self.assertGreater(len(str(self.driver.taskd_endpoint_path(deep)).encode())+1,104)
+        runner.prepare_root()
+        self.assertTrue((deep / "Library/Application Support").is_dir())
 
 
 class FingerprintTests(unittest.TestCase):

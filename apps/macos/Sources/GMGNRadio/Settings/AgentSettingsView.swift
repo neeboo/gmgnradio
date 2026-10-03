@@ -1,6 +1,60 @@
 import SwiftUI
 
 @MainActor
+private struct RustSpeechConfigurationFields: View {
+    let purpose: String
+    @State private var provider: RustVoiceProvider
+    @State private var apiKey: String
+    @State private var voiceID: String
+    @State private var model: String
+    @State private var saved = false
+    private let preferences = RustSpeechPreferences(defaults: E2ERuntime.defaults)
+
+    init(purpose: String) {
+        self.purpose = purpose
+        let configuration = RustSpeechPreferences(defaults: E2ERuntime.defaults).configuration(for: purpose, includesEnvironment: false)
+        _provider = State(initialValue: configuration.provider)
+        _apiKey = State(initialValue: configuration.apiKey)
+        _voiceID = State(initialValue: configuration.voiceID)
+        _model = State(initialValue: configuration.model ?? "")
+    }
+    var body: some View {
+        Picker("服务", selection: $provider) {
+            Text("百炼").tag(RustVoiceProvider.bailian)
+            Text("ElevenLabs").tag(RustVoiceProvider.elevenlabs)
+            if purpose == "tts" { Text("Fish Audio").tag(RustVoiceProvider.fish) }
+        }
+        .onChange(of: provider) { _, selection in
+            // Load that provider's saved credentials, never silently reuse another provider's key.
+            let defaults = E2ERuntime.defaults
+            let prefix = "speech.rust.\(selection.rawValue)."
+            apiKey = defaults.string(forKey: prefix + "apiKey")
+                ?? (selection == .bailian ? defaults.string(forKey: "voice.bailian.apiKey") ?? "" : "")
+            voiceID = defaults.string(forKey: prefix + "voiceID") ?? (selection == .bailian ? "Cherry" : "")
+            model = defaults.string(forKey: prefix + purpose + ".model") ?? ""
+            saved = false
+        }
+        SecureField("API Key", text: $apiKey)
+        if purpose == "tts" {
+            TextField(provider == .fish ? "Reference ID" : "Voice ID", text: $voiceID)
+        }
+        TextField("模型（留空使用服务默认值）", text: $model)
+        HStack {
+            Button("保存配置") {
+                preferences.save(RustVoiceConfiguration(provider: provider,
+                    apiKey: apiKey.trimmingCharacters(in: .whitespacesAndNewlines),
+                    voiceID: voiceID.trimmingCharacters(in: .whitespacesAndNewlines),
+                    model: model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : model), for: purpose)
+                saved = true
+            }
+            if saved { Text("已保存").font(.caption).foregroundStyle(.secondary) }
+        }
+        Text("传输：本机 TCP → Rust → 服务商；录放音留在系统设备层。")
+            .font(.caption).foregroundStyle(.secondary)
+    }
+}
+
+@MainActor
 struct AgentSettingsView: View {
     @State private var model = AgentSettingsModel()
     @State private var voiceStatus = RealtimeVoiceStatusStore.shared
@@ -216,106 +270,20 @@ struct AgentSettingsView: View {
                 }
 
                 Section("回复语音") {
-                    Toggle(
-                        isOn: Binding(
-                            get: { model.autoSpeakAgentReplies },
-                            set: {
-                                model.setAutoSpeakAgentReplies($0)
-                            }
-                        )
-                    ) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("自动朗读 Agent 回复")
-                            Text("选定的 Agent 回答后，使用百炼语音朗读；开麦会停止旧朗读。")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    LabeledContent("朗读服务", value: "百炼 Qwen3 TTS")
-                    Picker("回复音色", selection: Binding(
-                        get: { model.selectedReplyVoiceID },
-                        set: { model.selectReplyVoice($0) }
-                    )) {
-                        ForEach(BailianTTSVoice.allCases) { voice in
-                            Text(voice.title).tag(voice.rawValue)
-                        }
-                    }
-                    Text("与下方百炼转写共用本机 API Key。只朗读选定 Agent 的回答，失败时保留文字，不切换到其它回答模型。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    Toggle("自动朗读 Agent 回复", isOn: Binding(
+                        get: { model.autoSpeakAgentReplies },
+                        set: { model.setAutoSpeakAgentReplies($0) }))
+                    RustSpeechConfigurationFields(purpose: "tts")
+                    Text("Rust 流式合成，开麦停止旧朗读；失败保留文字，不自动切换服务。")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
-
-                Section("语音输入") {
-                    Picker(
-                        "服务",
-                        selection: Binding(
-                            get: { model.realtimeProvider },
-                            set: { model.selectRealtimeProvider($0) }
-                        )
-                    ) {
-                        ForEach(
-                            RealtimeDJProvider.allCases,
-                            id: \.self
-                        ) { provider in
-                            Text(provider.displayName)
-                                .tag(provider)
-                        }
+                Section("按住说话") {
+                    RustSpeechConfigurationFields(purpose: "asr")
+                    Text("在空间或 Live Cam 按住麦克风录音，松开后将完整转写交给当前 Agent。没有双向实时通话。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if voiceStatus.state.isConversationOpen {
+                        Button("取消录音", action: disconnectRealtimeVoice)
                     }
-
-                    providerConfigurationFields
-
-                    LabeledContent("传输") {
-                        Text(model.realtimeProvider.transportLabel)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    HStack {
-                        Label(voiceStatusText, systemImage: voiceStatusIcon)
-                            .font(.caption)
-                            .foregroundStyle(voiceStatusColor)
-
-                        Spacer()
-
-                        if model.realtimeProvider == .bailian {
-                            Button("保存配置") {
-                                _ = model.saveVoiceConfiguration()
-                            }
-                            .buttonStyle(.bordered)
-                        }
-                        if voiceStatus.state.isConversationOpen {
-                            Button("取消录音") {
-                                disconnectRealtimeVoice()
-                            }
-                            .buttonStyle(.bordered)
-                        } else if model.realtimeProvider.canConnectLocally {
-                            Button("录制一句") {
-                                guard
-                                    let configuration =
-                                        model.saveVoiceConfiguration()
-                                else {
-                                    return
-                                }
-                                connectRealtimeVoice(configuration)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(
-                                voiceStatus.state == .connecting
-                            )
-                        } else {
-                            Button("保存配置") {
-                                _ = model.saveVoiceConfiguration()
-                            }
-                            .buttonStyle(.bordered)
-                        }
-                    }
-
-                    Text(providerHelpText)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    Text("语音转文字 → 选定的 Agent → 百炼朗读。说完一句后麦克风自动关闭，转写服务不生成回答。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
 
             }

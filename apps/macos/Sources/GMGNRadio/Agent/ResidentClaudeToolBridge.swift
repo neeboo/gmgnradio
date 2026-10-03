@@ -9,10 +9,10 @@
 //  IPC、shell、文件读写或第二套授权：
 //
 //    · 复用既有会话级宿主通道 ResidentDSHHostToolsChannel：同一个短名 0700 私有目录、
-//      同一个 UDS loopback、同一把每轮随机 secret、同一套名称边界 + 原 schema 复核 +
+//      同一个私有 TCP loopback、同一把每轮随机 token、同一套名称边界 + 原 schema 复核 +
 //      授权代（epoch）复核。本文件不新建 IPC、不新增 daemon、不注册 shell/read/write。
 //    · adapter 源码在会话启动时写入该私有目录（0600），`--mcp-config` 以绝对路径引用；
-//      adapter 只作 MCP↔UDS 的受限翻译，未在正式 schema 中的名字（含 shell/read/write）
+//      adapter 只作 MCP↔TCP 的受限翻译，未在正式 schema 中的名字（含 shell/read/write）
 //      在 adapter 侧即被拒绝。
 //    · adapter 进程启动时**钉住**当时的 grant 身份（secret + round），之后每次
 //      tools/call 前与宿主回包前都重读同目录授权文件（0600，读取有界）并要求身份
@@ -210,7 +210,7 @@ public enum ResidentClaudeMCPAdapter {
         return text
     }
 
-    // MARK: Adapter template (restricted; stdio MCP ↔ reused session UDS)
+    // MARK: Adapter template (restricted; stdio MCP ↔ reused private TCP session)
 
     static let template = #"""
 import net from 'node:net'
@@ -353,9 +353,9 @@ function grantAllows(grant, name) {
   return false
 }
 
-function hostCall(socketPath, secret, name, args) {
+function hostCall(endpoint, secret, name, args) {
   return new Promise(function (resolve) {
-    const socket = net.connect(socketPath)
+    const socket = net.connect({ host: '127.0.0.1', port: Number(endpoint.address.split(':')[1]) })
     let settled = false
     let buffer = Buffer.alloc(0)
     const deadline = setTimeout(function () { finish(null) }, REQUEST_TIMEOUT_MS)
@@ -423,9 +423,10 @@ async function handleToolsCall(id, params) {
     return
   }
   if (!grantAllows(before.grant, name)) { respondResult(id, toolErrorResult('unknown tool')); return }
-  const socketPath = typeof before.grant.socketPath === 'string' ? before.grant.socketPath : ''
-  if (socketPath.length === 0) { respondResult(id, toolErrorResult('tool bridge unavailable')); return }
-  const reply = await hostCall(socketPath, before.grant.secret, name, args)
+  const endpoint = before.grant.endpoint
+  if (!endpoint || endpoint.version !== 1 || typeof endpoint.address !== 'string' || !/^127\.0\.0\.1:([1-9][0-9]{0,4})$/.test(endpoint.address) || Number(endpoint.address.split(':')[1]) > 65535 || typeof endpoint.token !== 'string' || endpoint.token.length === 0) { respondResult(id, toolErrorResult('tool bridge unavailable')); return }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(endpoint.token) || endpoint.token !== before.grant.secret) { respondResult(id, toolErrorResult('tool bridge unavailable')); return }
+  const reply = await hostCall(endpoint, endpoint.token, name, args)
   // 回包前复核：授权在等待宿主期间被撤销/轮换/过期时，迟到的结果绝不回给模型。
   const after = evaluateGrant()
   if (after.status === 'expired') { respondResult(id, toolErrorResult('tool session expired')); return }
@@ -789,7 +790,7 @@ public final class ResidentClaudeMCPHostSession: @unchecked Sendable {
             "protocol": 1,
             "state": "armed",
             "expiresAt": NSNumber(value: Int64((deadline.timeIntervalSince1970 * 1000).rounded())),
-            "socketPath": channel.socketPath,
+            "endpoint": channel.endpoint(token: secret),
             "secret": secret,
             "round": round,
             "scope": configuration.scope,

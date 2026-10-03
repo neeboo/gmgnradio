@@ -54,17 +54,17 @@ final class ClientResultBox: @unchecked Sendable {
         }
         // 只连不发（挂死客户端）：连接后保持打开但不写请求。
         func rawConnect(path: String) -> Int32 {
-            let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+            let fd = socket(AF_INET, SOCK_STREAM, 0)
             guard fd >= 0 else { return -1 }
-            var address = sockaddr_un()
-            address.sun_family = sa_family_t(AF_UNIX)
-            withUnsafeMutableBytes(of: &address.sun_path) { raw in
-                let count = min(raw.count, path.utf8.count)
-                for (index, byte) in path.utf8.prefix(count).enumerated() { raw[index] = byte }
-            }
+            guard let port = UInt16(path.split(separator: ":").last ?? "") else { close(fd); return -1 }
+            var address = sockaddr_in()
+            address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            address.sin_family = sa_family_t(AF_INET)
+            address.sin_addr.s_addr = inet_addr("127.0.0.1")
+            address.sin_port = port.bigEndian
             let result = withUnsafePointer(to: &address) { pointer in
                 pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                    connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
                 }
             }
             if result != 0 { close(fd); return -1 }
@@ -146,7 +146,7 @@ final class ClientResultBox: @unchecked Sendable {
         checks.expectEqual(grantObject?["state"] as? String, "armed", "C2 grant state=armed")
         let secret = grantObject?["secret"] as? String ?? ""
         checks.check(!secret.isEmpty, "C2 grant 有 secret")
-        let socketFromGrant = grantObject?["socketPath"] as? String ?? ""
+        let socketFromGrant = (grantObject?["endpoint"] as? [String: Any])?["address"] as? String ?? ""
         checks.expectEqual(socketFromGrant, channel.socketPath, "C2 grant socketPath 与通道一致")
         let toolsInGrant = grantObject?["tools"] as? [[String: Any]] ?? []
         checks.expectEqual(toolsInGrant.count, 2, "C2 grant 携带两个工具")
@@ -634,7 +634,7 @@ let productionChannel = root.appendingPathComponent("apps/macos/Sources/GMGNRadi
 let supportFile = root.appendingPathComponent("tools/resident-dsh-host-tools-support.swift").path
 // 编译门与主代理验收命令一致：`-swift-version 6 -parse-as-library` 真实编译（含链接），
 // 再运行该 Swift 6 二进制。默认语言模式或仅 -typecheck 不能替代。
-compile.arguments = ["-swift-version", "6", "-parse-as-library", "-j1", productionBridge, productionChannel, supportFile, main.path, "-o", binary.path]
+compile.arguments = ["-swift-version", "6", "-parse-as-library", "-j1", root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift").path, productionBridge, productionChannel, supportFile, main.path, "-o", binary.path]
 compile.currentDirectoryURL = work
 try compile.run()
 compile.waitUntilExit()

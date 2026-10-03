@@ -136,6 +136,9 @@ defer { try? FileManager.default.removeItem(at: folder) }
 let harness = folder.appendingPathComponent("Checks.swift"), binary = folder.appendingPathComponent("checks")
 try program.write(to: harness, atomically: true, encoding: .utf8)
 let compile = Process(); compile.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
-compile.arguments = ["-j1", "-swift-version", "6", "-parse-as-library", base.appendingPathComponent("Agent/AgentSpeech.swift").path, base.appendingPathComponent("AudioEngine/DuckingEnvelope.swift").path, harness.path, "-o", binary.path]
+compile.arguments = ["-j1", "-swift-version", "6", "-parse-as-library", base.appendingPathComponent("Agent/AgentSpeech.swift").path,
+    base.appendingPathComponent("Agent/RustVoiceClient.swift").path,
+    base.appendingPathComponent("Agent/StreamingPCMPlayer.swift").path,
+    base.appendingPathComponent("AudioEngine/DuckingEnvelope.swift").path, harness.path, "-o", binary.path]
 try compile.run(); compile.waitUntilExit(); guard compile.terminationStatus == 0 else { exit(compile.terminationStatus) }
 let test = Process(); test.executableURL = binary; try test.run(); test.waitUntilExit(); exit(test.terminationStatus)

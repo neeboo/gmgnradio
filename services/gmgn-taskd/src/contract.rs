@@ -63,7 +63,7 @@ const ERROR_CODES: &[&str] = &[
     "invalid_response", "invalid_revision", "invalid_scope", "invalid_size_intent",
     "invalid_source_wish_id", "invalid_state_commit", "invalid_state_key",
     "invalid_state_read", "invalid_state_value", "invalid_task_id", "invalid_token",
-    "invalid_topk", "invalid_vector", "invalid_workflow_profile", "invalid_world_blob_get",
+    "invalid_topk", "invalid_vector", "invalid_voice_input", "invalid_workflow_profile", "invalid_world_blob_get",
     "invalid_world_blob_put", "invalid_world_commit", "invalid_world_cursors",
     "invalid_world_facts", "invalid_world_facts_read", "invalid_world_id",
     "invalid_world_import", "invalid_world_records", "invalid_world_snapshot",
@@ -85,7 +85,9 @@ const ERROR_CODES: &[&str] = &[
     "storage_unavailable", "subject_revision_regression", "subscription_failed",
     "task_not_found", "terminal_remote_task", "too_many_facts", "unknown_method",
     "unsafe_download",
-    "unsafe_endpoint_path", "unsafe_legacy_path", "unsafe_path",
+    "unsafe_endpoint_path", "unsafe_legacy_path", "unsafe_path", "unsupported_voice_provider",
+    "voice_backpressure", "voice_not_ready", "voice_protocol_error", "voice_provider_error",
+    "voice_session_not_found", "voice_timeout", "voice_transport_error",
     "worker_failed", "world_fact_unreadable", "world_id_mismatch", "world_record_too_large",
     "world_record_unreadable", "world_request_unreadable"
 ];
@@ -262,6 +264,7 @@ mod tests {
         ("resident.rs", include_str!("resident.rs")),
         ("store.rs", include_str!("store.rs")),
         ("world.rs", include_str!("world.rs")),
+        ("voice.rs", include_str!("voice.rs")),
     ];
 
     /// Tokens that mark a line as an error site.
@@ -333,6 +336,13 @@ mod tests {
                 for literal in shaped_literals(line) {
                     codes.insert(literal);
                 }
+            }
+            // ASR maps typed core errors through a single static match helper;
+            // its returned literals are wire errors even without an inline Err.
+            if let Some(start) = text.find("fn asr_error(") {
+                let helper = &text[start..];
+                let end = helper.find("\n}").expect("ASR error mapper has a closing brace");
+                codes.extend(shaped_literals(&helper[..end]));
             }
         }
         codes

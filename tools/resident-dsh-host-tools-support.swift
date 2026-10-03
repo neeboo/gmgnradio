@@ -171,20 +171,18 @@ public func residentDSHHostClientCall(
     arguments: [String: Any],
     callID: String = "test-call"
 ) -> (payload: NSDictionary?, error: String?) {
-    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    let fd = socket(AF_INET, SOCK_STREAM, 0)
     guard fd >= 0 else { return (nil, "socket() 失败") }
     defer { close(fd) }
-    var address = sockaddr_un()
-    address.sun_family = sa_family_t(AF_UNIX)
-    withUnsafeMutableBytes(of: &address.sun_path) { raw in
-        let count = min(raw.count, socketPath.utf8.count)
-        for (index, byte) in socketPath.utf8.prefix(count).enumerated() {
-            raw[index] = byte
-        }
-    }
+    guard let port = UInt16(socketPath.split(separator: ":").last ?? "") else { return (nil, "invalid endpoint") }
+    var address = sockaddr_in()
+    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_addr.s_addr = inet_addr("127.0.0.1")
+    address.sin_port = port.bigEndian
     let connectResult = withUnsafePointer(to: &address) { pointer in
         pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
         }
     }
     guard connectResult == 0 else { return (nil, "connect() 失败 errno=\(errno)") }

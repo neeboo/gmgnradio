@@ -752,13 +752,9 @@ final class AppDelegate:
     private let realtimeVoicePreferences = RealtimeVoicePreferences()
     private let realtimeDJSessionController = RealtimeDJSessionController()
     private lazy var agentSpeechAnnouncer = AgentSpeechAnnouncer(
-        synthesizer: BailianSpeechSynthesizer(configuration: {
-            let preferences = RealtimeVoicePreferences()
-            return BailianTTSConfiguration(
-                apiKey: preferences.load(provider: .bailian).apiKey ?? "",
-                voiceID: preferences.replyVoiceID
-            )
-        }, onPlaybackChanged: { [weak self] state in
+        synthesizer: RustSpeechSynthesizer(configuration: {
+            RustSpeechPreferences(defaults: E2ERuntime.defaults).configuration(for: "tts")
+        }, client: RustVoiceClient(root: injectedTaskDaemonRoot), onPlaybackChanged: { [weak self] state in
             self?.audioGraph.setResidentSpeechPlaying(state.isPlaying)
             self?.avatarRuntime.setResidentSpeechPlayback(
                 isPlaying: state.isPlaying, level: state.level
@@ -907,7 +903,19 @@ final class AppDelegate:
     private var realtimeVoiceTimeoutTask: Task<Void, Never>?
     private var residentVoiceRequestID: UUID?
     private var residentVoiceAcceptsFinal = false
-    private var residentVoiceSession: (any RealtimeDJSession)?
+    private lazy var residentVoiceClient = RustVoiceClient(root: injectedTaskDaemonRoot)
+    private var residentVoiceSession: RustVoiceSession?
+    private var residentVoiceCapture: PushToTalkAudioCapture?
+    private var residentVoiceAudioContinuation: AsyncStream<(Data, RealtimeDJAudioLevel)>.Continuation?
+    private var residentVoiceAudioTask: Task<Void, Never>?
+    private var residentVoiceCommitTask: Task<Void, Never>?
+    private var residentVoiceDidCommit = false
+    private var residentVoiceAudioBytes = 0
+    private var residentVoiceCapturedPeak: Double = 0
+    private var residentVoiceLastFinalReceived = false
+    private var residentVoiceEmptyFinalCount = 0
+    private var residentVoiceSubmittedFinalCount = 0
+    private var residentVoiceLastFinal = ""
     private var residentVoiceEventTask: Task<Void, Never>?
     private var residentVoiceShutdownTask: Task<Void, Never>?
     /// shutdown 链的代次：只有最新一代落地后才允许把任务指针清空。
@@ -1754,26 +1762,28 @@ final class AppDelegate:
         return plan
     }
 
-    /// 系统权限弹窗的有界等待上限：只限制「等用户回答授权」这一段，不覆盖连接阶段；
-    /// 超时/取消都不丢弃迟到的授权结果（见 `MicrophoneAuthorizationGate`）。
     private static let residentVoiceAuthorizationDeadline: Duration = .seconds(60)
 
-    func connectRealtimeVoice(
-        _ configuration: RealtimeVoiceConfiguration
-    ) {
+    // Legacy settings callers still enter the same Rust-owned push-to-talk path.
+    func connectRealtimeVoice(_ configuration: RealtimeVoiceConfiguration) {
+        beginResidentVoiceFromStage()
+    }
+
+    func beginResidentVoiceFromStage() {
         disconnectRealtimeVoice()
         AgentConversationService.shared.cancel()
-        guard configuration.provider == .bailian else {
-            showResidentVoiceStatus("当前语音输入仅支持百炼转写；其它服务尚未接入，请使用文字。")
-            return
-        }
-        guard configuration.isReadyForResidentTranscription, let apiKey = configuration.apiKey else {
-            showResidentVoiceFailure("请在设置中填写百炼 API Key，语音只用于转文字。")
+        let configuration = RustSpeechPreferences(defaults: E2ERuntime.defaults).configuration(for: "asr")
+        guard configuration.provider != .fish, !configuration.apiKey.isEmpty else {
+            showResidentVoiceFailure("请在设置中选择百炼或 ElevenLabs 转写并填写 API Key。")
             return
         }
         let requestID = UUID()
         residentVoiceRequestID = requestID
         residentVoiceAcceptsFinal = true
+        residentVoiceDidCommit = false
+        residentVoiceAudioBytes = 0
+        residentVoiceCapturedPeak = 0
+        residentVoiceLastFinalReceived = false
         setRealtimeVoiceState(.connecting)
         let previousShutdown = residentVoiceShutdownTask
         realtimeVoiceConnectionTask = Task { [weak self] in
@@ -1781,77 +1791,127 @@ final class AppDelegate:
             await previousShutdown?.value
             guard residentVoiceRequestID == requestID else { return }
             do {
-                // 授权在连接超时窗口之外单独有界等待：系统弹窗未回答不再表现为
-                // 「连接超时」，也不会挂住 shutdown 链。
                 try await microphoneAuthorizationGate.resolveOrFail(
                     deadline: Self.residentVoiceAuthorizationDeadline
                 ) { [weak self] in
                     self?.showResidentVoiceStatus("首次使用麦克风：请在系统弹窗里点「允许」。")
                 }
                 guard residentVoiceRequestID == requestID, !Task.isCancelled else { return }
-                realtimeVoiceTimeoutTask?.cancel()
-                realtimeVoiceTimeoutTask = Task { [weak self] in
-                    do { try await Task.sleep(for: .seconds(12)) } catch { return }
-                    guard let self, self.residentVoiceRequestID == requestID else { return }
-                    self.disconnectRealtimeVoice()
-                    self.showResidentVoiceFailure("连接语音转写超时，请重试。")
-                }
-                let payload = BailianSessionPayload(
-                    apiKey: apiKey,
-                    model: "qwen3-asr-flash-realtime",
-                    voiceID: "",
-                    microphoneDeviceID: configuration.microphoneDeviceID,
-                    purpose: .residentTranscription
-                )
-                let session = BailianRealtimeSession.live(audioGraph: audioGraph, providerTools: [])
-                residentVoiceSession = session
-                let ticket = RealtimeDJSessionTicket(
-                    provider: .bailian,
-                    sessionID: "resident-asr-\(requestID.uuidString)",
-                    expiresAt: Date(timeIntervalSinceNow: 3_600),
-                    providerPayload: try JSONEncoder().encode(payload)
-                )
-                try await session.connect(ticket: ticket)
+                armResidentVoiceTimeout(requestID: requestID, seconds: 12, message: "连接语音转写超时，请重试。")
+                let session = try await residentVoiceClient.startASR(configuration: configuration)
                 guard residentVoiceRequestID == requestID, !Task.isCancelled else {
-                    await session.disconnect()
-                    return
+                    session.cancel(); return
                 }
-                let events = await session.eventStream()
-                residentVoiceEventTask = Task { [weak self] in
-                    for await event in events {
-                        guard let self, !Task.isCancelled,
-                              self.residentVoiceRequestID == requestID else { return }
-                        await self.consumeResidentVoiceEvent(event, requestID: requestID, session: session)
-                        guard !Task.isCancelled,
-                              self.residentVoiceRequestID == requestID else { return }
+                residentVoiceSession = session
+                let audio = AsyncStream<(Data, RealtimeDJAudioLevel)>.makeStream(bufferingPolicy: .bufferingOldest(8))
+                residentVoiceAudioContinuation = audio.continuation
+                residentVoiceAudioTask = Task { [weak self] in
+                    do {
+                        for await (pcm, level) in audio.stream {
+                            guard let self, residentVoiceRequestID == requestID, !Task.isCancelled else { return }
+                            try await session.sendAudio(pcm)
+                            guard residentVoiceRequestID == requestID, !Task.isCancelled else { return }
+                            residentVoiceAudioBytes += pcm.count
+                            residentVoiceCapturedPeak = max(residentVoiceCapturedPeak, level.peak)
+                            orbWindowController?.setVoiceLevel(level.peak)
+                            stageWindowController?.setVoiceLevel(Float(level.peak))
+                        }
+                    } catch {
+                        guard let self, residentVoiceRequestID == requestID else { return }
+                        failResidentVoice(error.localizedDescription, requestID: requestID)
                     }
                 }
-                try await session.setMicrophoneCaptureEnabled(true)
-                guard residentVoiceRequestID == requestID, !Task.isCancelled else { return }
-                try await session.setMicrophoneTransmissionEnabled(true)
-                guard residentVoiceRequestID == requestID, !Task.isCancelled else { return }
-                setRealtimeVoiceState(.listening)
-                showResidentVoiceStatus("正在听，说完一句会自动发送。再次点击麦克风可取消。")
-                realtimeVoiceTimeoutTask?.cancel()
-                realtimeVoiceTimeoutTask = Task { [weak self] in
-                    do { try await Task.sleep(for: .seconds(60)) } catch { return }
-                    guard let self, self.residentVoiceRequestID == requestID else { return }
-                    self.disconnectRealtimeVoice()
-                    self.showResidentVoiceFailure("本次录音已超时，请重新点击麦克风。")
+                residentVoiceEventTask = Task { [weak self] in
+                    do {
+                        while !Task.isCancelled {
+                            let event = try await session.nextEvent()
+                            guard let self, residentVoiceRequestID == requestID else { return }
+                            await consumeResidentVoiceEvent(event, requestID: requestID, session: session)
+                        }
+                    } catch {
+                        guard let self, residentVoiceRequestID == requestID else { return }
+                        failResidentVoice(error.localizedDescription, requestID: requestID)
+                    }
                 }
+                let capture = try PushToTalkAudioCapture(
+                    preferredDeviceID: realtimeVoicePreferences.load().microphoneDeviceID,
+                    receive: { pcm, level in
+                        if case .dropped = audio.continuation.yield((pcm, level)) {
+                            audio.continuation.finish()
+                            Task { @MainActor [weak self] in
+                                self?.failResidentVoice("录音发送未能跟上，请重新录音。", requestID: requestID)
+                            }
+                        }
+                    },
+                    onFailure: { [weak self] error in
+                        Task { @MainActor in
+                            self?.failResidentVoice(error.localizedDescription, requestID: requestID)
+                        }
+                    })
+                residentVoiceCapture = capture
+                try await capture.start()
+                guard residentVoiceRequestID == requestID, !Task.isCancelled else {
+                    await capture.cancel(); return
+                }
+                realtimeVoiceConnectionTask = nil
+                setRealtimeVoiceState(.listening)
+                showResidentVoiceStatus("正在录音，松开后发送。")
+                armResidentVoiceTimeout(requestID: requestID, seconds: 60, message: "本次录音已超时，请重新按住麦克风。")
             } catch is CancellationError {
-                // 用户取消或新请求取代：disconnectRealtimeVoice 已经更新过状态，
-                // 这里静默收尾，绝不覆盖成失败。
                 return
             } catch {
                 guard residentVoiceRequestID == requestID else { return }
-                // 清理不能等待正在执行本分支的连接任务自身。
                 realtimeVoiceConnectionTask = nil
-                disconnectRealtimeVoice()
-                setRealtimeVoiceState(.failed(error.localizedDescription))
-                showResidentVoiceFailure(error.localizedDescription)
+                failResidentVoice(error.localizedDescription, requestID: requestID)
             }
         }
+    }
+
+    func finishResidentVoiceFromStage() {
+        guard let requestID = residentVoiceRequestID else { return }
+        // Releasing during authorization/connection cancels; it never starts a late recording.
+        guard realtimeVoiceConnectionTask == nil, let capture = residentVoiceCapture,
+              let session = residentVoiceSession else {
+            disconnectRealtimeVoice()
+            showResidentVoiceStatus("尚未开始录音，请按住麦克风并等待录音提示。")
+            return
+        }
+        guard residentVoiceCommitTask == nil, !residentVoiceDidCommit else { return }
+        residentVoiceCommitTask = Task { [weak self] in
+            await capture.stop()
+            guard let self, residentVoiceRequestID == requestID, !Task.isCancelled else { return }
+            residentVoiceCapture = nil
+            residentVoiceAudioContinuation?.finish()
+            await residentVoiceAudioTask?.value
+            guard residentVoiceRequestID == requestID, !Task.isCancelled else { return }
+            guard residentVoiceAudioBytes > 0 else {
+                disconnectRealtimeVoice()
+                showResidentVoiceStatus("没有录到声音，请重新按住麦克风。")
+                return
+            }
+            do {
+                residentVoiceDidCommit = true
+                try await session.commit()
+                guard residentVoiceRequestID == requestID else { return }
+                showResidentVoiceStatus("正在完成转写…")
+                armResidentVoiceTimeout(requestID: requestID, seconds: 20, message: "转写等待超时，请重新录音。")
+            } catch { failResidentVoice(error.localizedDescription, requestID: requestID) }
+        }
+    }
+
+    private func armResidentVoiceTimeout(requestID: UUID, seconds: Int, message: String) {
+        realtimeVoiceTimeoutTask?.cancel()
+        realtimeVoiceTimeoutTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(seconds)) } catch { return }
+            self?.failResidentVoice(message, requestID: requestID)
+        }
+    }
+
+    private func failResidentVoice(_ message: String, requestID: UUID) {
+        guard residentVoiceRequestID == requestID else { return }
+        disconnectRealtimeVoice()
+        setRealtimeVoiceState(.failed(message))
+        showResidentVoiceFailure(message)
     }
 
     private func prepareInterruptionCoordinator() {
@@ -1879,62 +1939,45 @@ final class AppDelegate:
     func disconnectRealtimeVoice() {
         residentVoiceRequestID = nil
         residentVoiceAcceptsFinal = false
-        let connectingTask = realtimeVoiceConnectionTask
-        connectingTask?.cancel()
+        residentVoiceDidCommit = false
+        realtimeVoiceConnectionTask?.cancel()
         realtimeVoiceConnectionTask = nil
         realtimeVoiceTimeoutTask?.cancel()
         realtimeVoiceTimeoutTask = nil
         residentVoiceEventTask?.cancel()
         residentVoiceEventTask = nil
-        agentSpeechAnnouncer.stop()
-        let session = residentVoiceSession
+        residentVoiceCommitTask?.cancel()
+        residentVoiceCommitTask = nil
+        residentVoiceAudioContinuation?.finish()
+        residentVoiceAudioContinuation = nil
+        residentVoiceAudioTask?.cancel()
+        residentVoiceAudioTask = nil
+        residentVoiceSession?.cancel()
         residentVoiceSession = nil
-        enqueueResidentVoiceShutdown(session, after: connectingTask)
+        let capture = residentVoiceCapture
+        residentVoiceCapture = nil
+        let previous = residentVoiceShutdownTask
+        residentVoiceShutdownGeneration &+= 1
+        let generation = residentVoiceShutdownGeneration
+        residentVoiceShutdownTask = Task { [weak self] in
+            await previous?.value
+            await capture?.cancel()
+            self?.clearResidentVoiceShutdown(generation: generation)
+        }
+        agentSpeechAnnouncer.stop()
         setRealtimeVoiceState(.disconnected)
         orbWindowController?.setVoiceLevel(0)
         stageWindowController?.setVoiceLevel(0)
     }
 
-    @discardableResult
-    private func enqueueResidentVoiceShutdown(
-        _ session: (any RealtimeDJSession)?,
-        after connectingTask: Task<Void, Never>? = nil
-    ) -> Task<Void, Never> {
-        let previousShutdown = residentVoiceShutdownTask
-        residentVoiceShutdownGeneration &+= 1
-        let generation = residentVoiceShutdownGeneration
-        let shutdown = Task { [weak self] in
-            await previousShutdown?.value
-            // 先关闭连接解除可能不响应 Task.cancel 的握手，再等待其清理完成。
-            try? await session?.setMicrophoneCaptureEnabled(false)
-            try? await session?.setMicrophoneTransmissionEnabled(false)
-            await session?.disconnect()
-            if let connectingTask {
-                await connectingTask.value
-                try? await session?.setMicrophoneCaptureEnabled(false)
-                try? await session?.setMicrophoneTransmissionEnabled(false)
-                await session?.disconnect()
-            }
-            // 落地后清零，下一次连接不必再穿过已完成的历史链。
-            self?.clearResidentVoiceShutdown(generation: generation)
-        }
-        residentVoiceShutdownTask = shutdown
-        return shutdown
-    }
-
-    /// 只有仍是最新一代 shutdown 时才能清空指针，避免清掉刚入队的更新一代。
     private func clearResidentVoiceShutdown(generation: UInt64) {
         guard residentVoiceShutdownGeneration == generation else { return }
         residentVoiceShutdownTask = nil
     }
 
     func toggleRealtimeVoiceFromStage() {
-        if residentVoiceRequestID != nil {
-            disconnectRealtimeVoice()
-            showResidentVoiceStatus("已取消本次录音。")
-        } else {
-            connectRealtimeVoice(realtimeVoicePreferences.load())
-        }
+        if residentVoiceRequestID != nil { finishResidentVoiceFromStage() }
+        else { beginResidentVoiceFromStage() }
     }
 
     private func showResidentVoiceStatus(_ text: String) {
@@ -2034,50 +2077,35 @@ final class AppDelegate:
     }
 
     private func consumeResidentVoiceEvent(
-        _ event: RealtimeDJEvent,
-        requestID: UUID,
-        session: any RealtimeDJSession
+        _ event: RustVoiceEvent, requestID: UUID, session: RustVoiceSession
     ) async {
         guard residentVoiceRequestID == requestID else { return }
-        switch event {
-        case let .userTranscriptFinal(text):
-            guard residentVoiceAcceptsFinal else { return }
+        switch event.type {
+        case "final":
+            guard residentVoiceAcceptsFinal, residentVoiceDidCommit else { return }
             residentVoiceAcceptsFinal = false
-            realtimeVoiceTimeoutTask?.cancel()
-            await enqueueResidentVoiceShutdown(session).value
-            guard residentVoiceRequestID == requestID else { return }
-            residentVoiceRequestID = nil
-            residentVoiceSession = nil
-            // 当前监听还要把最终稿交给 Agent；避免共享发送入口取消自身。
+            residentVoiceLastFinalReceived = true
+            let transcript = (event.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            // Clear ownership before entering the shared Agent sender, which cancels voice.
             residentVoiceEventTask = nil
-            setRealtimeVoiceState(.disconnected)
-            orbWindowController?.setVoiceLevel(0)
-            stageWindowController?.setVoiceLevel(0)
-            let transcript = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            disconnectRealtimeVoice()
             guard !transcript.isEmpty else {
+                residentVoiceEmptyFinalCount += 1
                 showResidentVoiceStatus("没有听清内容，请重新录音或输入文字。")
                 return
             }
+            residentVoiceLastFinal = transcript
+            residentVoiceSubmittedFinalCount += 1
             await sendLiveCamMessage(transcript)
-        case let .userTranscriptDelta(text):
-            guard residentVoiceAcceptsFinal else { return }
-            showResidentVoiceStatus(text.isEmpty ? "正在转写…" : "正在转写：\(text)")
-        case let .userAudioLevel(level):
-            orbWindowController?.setVoiceLevel(level.peak)
-            stageWindowController?.setVoiceLevel(Float(level.peak))
-        case .userSpeechStarted:
-            setRealtimeVoiceState(.listening)
-        case .userSpeechFinished:
-            orbWindowController?.setVoiceLevel(0)
-            stageWindowController?.setVoiceLevel(0)
-        case let .failure(failure):
-            disconnectRealtimeVoice()
-            showResidentVoiceFailure(failure.message)
-        case .connectionChanged(.disconnected):
-            disconnectRealtimeVoice()
-            showResidentVoiceFailure("语音转写连接已断开，请重试。")
-        default:
-            break
+        case "partial":
+            showResidentVoiceStatus(event.text.map { "正在转写：\($0)" } ?? "正在转写…")
+        case "error":
+            failResidentVoice("语音转写失败，请检查服务配置和额度后重试。", requestID: requestID)
+        case "finished":
+            if residentVoiceAcceptsFinal {
+                failResidentVoice("转写结束但没有收到完整文字，请重新录音。", requestID: requestID)
+            }
+        default: break
         }
     }
 
@@ -3447,7 +3475,10 @@ final class AppDelegate:
                 self?.replanUpcomingProgramFromStage()
             },
             onToggleVoice: { [weak self] in
-                self?.toggleRealtimeVoiceFromStage()
+                self?.beginResidentVoiceFromStage()
+            },
+            onFinishVoice: { [weak self] in
+                self?.finishResidentVoiceFromStage()
             },
             onRunActivity: { [weak self] id in
                 self?.runLivingWorldActivity(id: id)
@@ -3542,7 +3573,10 @@ final class AppDelegate:
                     self?.cancelResidentMessage(userIntent: true)
                 },
                 onToggleVoice: { [weak self] in
-                    self?.toggleRealtimeVoiceFromStage()
+                    self?.beginResidentVoiceFromStage()
+                },
+                onFinishVoice: { [weak self] in
+                    self?.finishResidentVoiceFromStage()
                 }
             )
             liveCamWindowController.connect(
@@ -8489,10 +8523,43 @@ final class AppDelegate:
                 guard let self else { throw E2EHostControlError.runtimeUnavailable("宿主已释放") }
                 return try await self.e2eMarkInboxRead(taskKey: taskKey)
             },
-            terminate: { [weak self] in self?.e2eTerminate() }
+            terminate: { [weak self] in self?.e2eTerminate() },
+            voiceControl: { [weak self] action, text in
+                guard let self else { throw E2EHostControlError.runtimeUnavailable("宿主已释放") }
+                switch action {
+                case "start": self.beginResidentVoiceFromStage()
+                case "commit": self.finishResidentVoiceFromStage()
+                case "cancel": self.disconnectRealtimeVoice()
+                case "speak":
+                    guard let text, !text.isEmpty else { throw E2EHostControlError.missingParameter("text") }
+                    self.agentSpeechAnnouncer.isEnabled = true
+                    self.agentSpeechAnnouncer.announce(text)
+                case "stop_speech": self.agentSpeechAnnouncer.stop()
+                case "status": break
+                default: throw E2EHostControlError.runtimeUnavailable("未知语音操作")
+                }
+                return self.e2eVoiceState()
+            }
         )
         e2eHostControl = E2EHostControl.startIfEnabled(handler: handler)
         livingWorldLogger.info("显式测试控制面已启动：root=\(E2ERuntime.dataRoot?.path ?? "", privacy: .public)")
+    }
+
+    private func e2eVoiceState() -> [String: Any] {
+        ["core": "rust", "requestActive": residentVoiceRequestID != nil,
+         "capturing": residentVoiceCapture != nil && realtimeVoiceConnectionTask == nil,
+         "committed": residentVoiceDidCommit, "sentAudioBytes": residentVoiceAudioBytes,
+         "capturedPeak": residentVoiceCapturedPeak,
+         "lastFinalReceived": residentVoiceLastFinalReceived,
+         "emptyFinalCount": residentVoiceEmptyFinalCount,
+         "submittedFinalCount": residentVoiceSubmittedFinalCount,
+         "lastFinal": residentVoiceLastFinal,
+         "isSpeaking": AgentSpeechStatusStore.shared.isSpeaking,
+         "speechError": AgentSpeechStatusStore.shared.lastErrorMessage ?? "",
+         "asrConfigured": !RustSpeechPreferences(defaults: E2ERuntime.defaults).configuration(for: "asr").apiKey.isEmpty,
+         "ttsConfigured": !RustSpeechPreferences(defaults: E2ERuntime.defaults).configuration(for: "tts").apiKey.isEmpty,
+         "asrProvider": RustSpeechPreferences(defaults: E2ERuntime.defaults).provider(for: "asr").rawValue,
+         "ttsProvider": RustSpeechPreferences(defaults: E2ERuntime.defaults).provider(for: "tts").rawValue]
     }
 
     private func e2eStatusSnapshot() -> [String: Any] {
@@ -8504,6 +8571,7 @@ final class AppDelegate:
             "livingWorldLoaded": livingWorldContext != nil,
         ]
         let world = currentResidentWorldContext()
+        snapshot["voice"] = e2eVoiceState()
         snapshot["residentWorldID"] = world.worldID ?? ""
         snapshot["residentScope"] = world.sessionScope
         snapshot["residentPosition"] = world.residentPosition ?? []

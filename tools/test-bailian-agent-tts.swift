@@ -185,6 +185,9 @@ defer { try? FileManager.default.removeItem(at: folder) }
 let main = folder.appendingPathComponent("Checks.swift"), binary = folder.appendingPathComponent("checks")
 try program.write(to: main, atomically: true, encoding: .utf8)
 let compile = Process(); compile.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
-compile.arguments = ["-j1", "-swift-version", "6", "-parse-as-library", source.path, main.path, "-o", binary.path]
+compile.arguments = ["-j1", "-swift-version", "6", "-parse-as-library", source.path,
+    source.deletingLastPathComponent().appendingPathComponent("RustVoiceClient.swift").path,
+    source.deletingLastPathComponent().appendingPathComponent("StreamingPCMPlayer.swift").path,
+    main.path, "-o", binary.path]
 try compile.run(); compile.waitUntilExit(); guard compile.terminationStatus == 0 else { exit(compile.terminationStatus) }
 let run = Process(); run.executableURL = binary; try run.run(); run.waitUntilExit(); exit(run.terminationStatus)

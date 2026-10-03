@@ -17,7 +17,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, RwLock, Semaphore},
+    sync::{RwLock, Semaphore},
     task::JoinSet,
 };
 
@@ -480,7 +480,7 @@ impl Service {
 
     async fn serve_connection(&self, stream: TcpStream, token: &str) -> Result<()> {
         let (reader, writer) = stream.into_split();
-        let writer = Arc::new(Mutex::new(writer));
+        let (writer, _writer_guard) = writer_queue(writer);
         let mut reader = BufReader::new(reader);
         // A dedicated reader task assembles request frames and pushes them over
         // a channel. Request handling is decoupled from frame assembly so
@@ -493,21 +493,21 @@ impl Service {
             End,
             Error(&'static str),
         }
-        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::unbounded_channel::<ReaderEvent>();
+        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel::<ReaderEvent>(8);
         let reader_task = tokio::spawn(async move {
             loop {
                 match frame(&mut reader).await {
                     Ok(Some(line)) => {
-                        if frames_tx.send(ReaderEvent::Frame(line)).is_err() {
+                        if frames_tx.send(ReaderEvent::Frame(line)).await.is_err() {
                             break;
                         }
                     }
                     Ok(None) => {
-                        let _ = frames_tx.send(ReaderEvent::End);
+                        let _ = frames_tx.send(ReaderEvent::End).await;
                         break;
                     }
                     Err(code) => {
-                        let _ = frames_tx.send(ReaderEvent::Error(code));
+                        let _ = frames_tx.send(ReaderEvent::Error(code)).await;
                         break;
                     }
                 }
@@ -525,6 +525,7 @@ impl Service {
         // Subscriptions and request replies share one serialized writer, while the
         // reader task remains available for subsequent commands on this connection.
         let mut subscriptions = JoinSet::new();
+        let mut voice = crate::voice::Connection::default();
         // Frames the client pipelined while an earlier request was still in
         // flight; they are processed in order after it completes.
         let mut queued: VecDeque<Vec<u8>> = VecDeque::new();
@@ -572,6 +573,12 @@ impl Service {
             };
             if !valid_request_id(&request.id) {
                 write(&writer, &failure(Value::Null, "invalid_request_id")).await?;
+                continue;
+            }
+            if request.method.starts_with("voice_") {
+                voice
+                    .handle(&request.method, request.params, request.id, &writer)
+                    .await?;
                 continue;
             }
             if request.method == "world_subscribe" {
@@ -659,7 +666,10 @@ impl Service {
             let outcome = loop {
                 tokio::select! {
                     outcome = &mut task => break outcome,
-                    received = frames_rx.recv() => match received {
+                    // Stop draining the bounded reader into the pending deque
+                    // once eight frames are queued. The reader and ultimately
+                    // TCP then apply backpressure while this request finishes.
+                    received = frames_rx.recv(), if queued.len() < 8 => match received {
                         Some(ReaderEvent::Frame(line)) => queued.push_back(line),
                         Some(ReaderEvent::End) => {
                             // Client disconnected while the request was in
@@ -697,7 +707,7 @@ impl Service {
         scope: Option<MessageScope>,
         mut cursor: i64,
         mut changed: tokio::sync::watch::Receiver<u64>,
-        writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+        writer: Writer,
     ) -> Result<()> {
         loop {
             changed.borrow_and_update();
@@ -738,7 +748,7 @@ impl Service {
         world_id: String,
         mut cursor: i64,
         mut changed: tokio::sync::watch::Receiver<u64>,
-        writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+        writer: Writer,
     ) -> Result<()> {
         loop {
             changed.borrow_and_update();
@@ -978,18 +988,58 @@ pub async fn run(
         }
     }
 }
-async fn write(writer: &Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>, value: &Value) -> Result<()> {
+struct OutboundFrame {
+    bytes: Vec<u8>,
+    completion: tokio::sync::oneshot::Sender<Result<()>>,
+}
+#[derive(Clone)]
+pub(crate) struct Writer {
+    frames: tokio::sync::mpsc::Sender<OutboundFrame>,
+}
+pub(crate) struct WriterGuard(tokio::task::JoinHandle<()>);
+impl Drop for WriterGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+/// Connection-owned bounded writer. A producer cancellation cannot interrupt
+/// a partially transmitted frame and splice its next reply into that frame.
+pub(crate) fn writer_queue(mut socket: tokio::net::tcp::OwnedWriteHalf) -> (Writer, WriterGuard) {
+    let (frames, mut receiver) = tokio::sync::mpsc::channel::<OutboundFrame>(8);
+    let task = tokio::spawn(async move {
+        while let Some(frame) = receiver.recv().await {
+            let result =
+                tokio::time::timeout(Duration::from_secs(60), socket.write_all(&frame.bytes))
+                    .await
+                    .map_err(|_| "client_timeout")
+                    .and_then(|result| result.map_err(|_| "client_disconnected"));
+            let failed = result.is_err();
+            let _ = frame.completion.send(result);
+            // A partial write failure closes this half. No next frame follows.
+            if failed {
+                break;
+            }
+        }
+    });
+    (Writer { frames }, WriterGuard(task))
+}
+pub(crate) async fn write(writer: &Writer, value: &Value) -> Result<()> {
     let mut bytes = serde_json::to_vec(value).map_err(|_| "invalid_response")?;
     bytes.push(b'\n');
     if bytes.len() > FRAME_LIMIT {
         return Err("frame_too_large");
     }
+    let (completion, completed) = tokio::sync::oneshot::channel();
     tokio::time::timeout(Duration::from_secs(60), async {
-        writer.lock().await.write_all(&bytes).await
+        writer
+            .frames
+            .send(OutboundFrame { bytes, completion })
+            .await
+            .map_err(|_| "client_disconnected")?;
+        completed.await.map_err(|_| "client_disconnected")?
     })
     .await
     .map_err(|_| "client_timeout")?
-    .map_err(|_| "client_disconnected")
 }
 async fn frame(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Result<Option<Vec<u8>>> {
     let mut frame = Vec::new();
@@ -1089,6 +1139,161 @@ fn default_root() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn bounded_pipeline_replies_remain_ordered_after_slow_request() {
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("gmgn-pipeline-{}", uuid::Uuid::new_v4()));
+        crate::files::directory(&dir).unwrap();
+        let service = Service::new(Database::open(dir.clone(), None).unwrap()).unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let db = service.db.clone();
+        let blocker = tokio::spawn(async move {
+            db.call(move |_store| {
+                let _ = entered_tx.send(());
+                release_rx.recv().unwrap();
+                Ok(json!({}))
+            })
+            .await
+        });
+        entered_rx.await.unwrap();
+        let (server, mut client) = tcp_pair().await;
+        let serving = service.clone();
+        let connection =
+            tokio::spawn(async move { serving.serve_connection(server, "pipeline-auth").await });
+        let mut batch = Vec::new();
+        for index in 0..64 {
+            batch.extend(serde_json::to_vec(&json!({"auth":"pipeline-auth","id":index.to_string(),"method":"snapshot","params":{}})).unwrap());
+            batch.push(b'\n');
+        }
+        client.write_all(&batch).await.unwrap();
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        let mut reader = BufReader::new(client);
+        for index in 0..64 {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            let response: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(response["id"], index.to_string());
+            assert!(response.get("result").is_some());
+        }
+        drop(reader);
+        assert_eq!(connection.await.unwrap(), Ok(()));
+        drop(service);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn writer_cancellation_preserves_complete_frames_with_slow_reader() {
+        use tokio::io::AsyncReadExt;
+        let (server, mut client) = tcp_pair().await;
+        let (_, half) = server.into_split();
+        let (writer, _guard) = writer_queue(half);
+        for generation in 0..4 {
+            let sender = writer.clone();
+            let large = tokio::spawn(async move {
+                write(
+                    &sender,
+                    &json!({"generation":generation,"payload":"x".repeat(8*1024*1024)}),
+                )
+                .await
+            });
+            // Reading the first byte proves a frame is in progress. Leave the
+            // remainder unread so write_all cannot finish into the small TCP buffer.
+            let mut first = [0; 1];
+            tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut first))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !large.is_finished(),
+                "large frame must still be backpressured"
+            );
+            large.abort();
+            let _ = large.await;
+            let sender = writer.clone();
+            let next = tokio::spawn(async move {
+                write(
+                    &sender,
+                    &json!({"id":"replacement","generation":generation}),
+                )
+                .await
+            });
+            let mut reader = BufReader::new(&mut client);
+            let mut line = vec![first[0]];
+            tokio::time::timeout(Duration::from_secs(5), reader.read_until(b'\n', &mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            let frame: Value = serde_json::from_slice(&line).unwrap();
+            assert_eq!(frame["generation"], generation);
+            assert_eq!(frame["payload"].as_str().unwrap().len(), 8 * 1024 * 1024);
+            line.clear();
+            reader.read_until(b'\n', &mut line).await.unwrap();
+            let ack: Value = serde_json::from_slice(&line).unwrap();
+            assert_eq!(ack["id"], "replacement");
+            assert_eq!(next.await.unwrap(), Ok(()));
+            // Do not discard BufReader's read-ahead between frame pairs.
+            assert!(reader.buffer().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_rpc_uses_authenticated_tcp_and_separate_events() {
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("gmgn-voice-rpc-{}", uuid::Uuid::new_v4()));
+        crate::files::directory(&dir).unwrap();
+        let service = Service::new(Database::open(dir.clone(), None).unwrap()).unwrap();
+        let (server, client) = tcp_pair().await;
+        let serving = service.clone();
+        let task =
+            tokio::spawn(async move { serving.serve_connection(server, "voice-auth").await });
+        let (read, mut write_half) = client.into_split();
+        let mut reader = BufReader::new(read);
+        let mut bytes = serde_json::to_vec(
+            &json!({"auth":"voice-auth","id":"c","method":"voice_capabilities"}),
+        )
+        .unwrap();
+        bytes.push(b'\n');
+        write_half.write_all(&bytes).await.unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let result: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(result["result"]["providers"][2]["asrStreaming"], false);
+        // The voice ID is invalid locally: exercise asynchronous failure without cloud calls.
+        let key = "secret-never-echoed";
+        let mut bytes=serde_json::to_vec(&json!({"auth":"voice-auth","id":"s","method":"voice_tts_start","params":{"sessionID":"speech-1","provider":"elevenlabs","apiKey":key,"voiceID":"invalid voice","text":"hello"}})).unwrap();
+        bytes.push(b'\n');
+        write_half.write_all(&bytes).await.unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let ack: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(ack["id"], "s");
+        assert_eq!(ack["result"]["started"], true);
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(!line.contains(key));
+        let event: Value = serde_json::from_str(&line).unwrap();
+        assert!(event.get("id").is_none());
+        assert_eq!(event["voice_event"]["sessionID"], "speech-1");
+        assert_eq!(event["voice_event"]["type"], "error");
+        assert_eq!(event["voice_event"]["code"], "voice_provider_error");
+        assert!(service.credentials.read().await.is_empty());
+        drop(reader);
+        drop(write_half);
+        assert_eq!(task.await.unwrap(), Ok(()));
+        drop(service);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     async fn tcp_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -1104,7 +1309,10 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_authentication_precedes_configure_and_subscriptions() {
-        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-auth-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("gmgn-auth-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let service = Service::new(Database::open(dir.clone(), None).unwrap()).unwrap();
         for method in ["configure", "subscribe", "world_subscribe", "snapshot"] {
@@ -1155,7 +1363,10 @@ mod tests {
     const PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=";
 
     async fn service() -> (Service, PathBuf) {
-        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-daemon-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("gmgn-daemon-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let service = Service::new(Database::open(dir.clone(), None).unwrap()).unwrap();
         (service, dir)
@@ -1549,7 +1760,7 @@ mod tests {
             .unwrap();
         let (socket, _) = listener.accept().await.unwrap();
         let (_, writer) = socket.into_split();
-        let writer = Arc::new(Mutex::new(writer));
+        let (writer, writer_guard) = writer_queue(writer);
         let drain = tokio::spawn(async move {
             tokio::io::copy(&mut peer, &mut tokio::io::sink())
                 .await
@@ -1557,6 +1768,7 @@ mod tests {
         });
         let result = write(&writer, &json!({"value":"x".repeat(FRAME_LIMIT)})).await;
         drop(writer);
+        drop(writer_guard);
         let count = drain.await.unwrap();
         assert_eq!(result, Err("frame_too_large"));
         assert_eq!(count, 0);
@@ -1571,7 +1783,10 @@ mod tests {
     /// 便于用 grep 直接验证 provider 层已经不存在。
     #[tokio::test]
     async fn local_memory_methods_report_local_fields_only() {
-        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-daemon-local-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("gmgn-daemon-local-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let service = Service::new(Database::open(dir.clone(), None).unwrap()).unwrap();
         let scope = json!({"scope": {"worldID": "install", "residentScope": "install"}});

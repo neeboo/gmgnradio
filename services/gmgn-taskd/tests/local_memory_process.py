@@ -1,6 +1,6 @@
 """Offline process tests for the local VoiceMem memory IPC.
 
-Drives the real gmgn-taskd child over its Unix socket with **no provider at
+Drives the real gmgn-taskd child over authenticated loopback TCP with **no provider at
 all**: the external compaction/embedding service layer has been removed, and so
 has the **原文层** (volatile pending turns / delivered-pair ingest). What this
 suite proves end to end is therefore:
@@ -15,7 +15,7 @@ suite proves end to end is therefore:
   answers, with `pendingTurns` pinned at 0 because there is no longer a buffer
   to count.
 
-Private temp roots and local Unix sockets only: never starts the macOS app,
+Private temp roots and local loopback endpoints only: never starts the macOS app,
 never touches the keychain, never opens a network fixture.
 """
 import json
@@ -29,7 +29,7 @@ import time
 import unittest
 import uuid
 
-DEFAULT_BIN = Path(__file__).resolve().parents[1] / "target" / "debug" / "gmgn-taskd"
+DEFAULT_BIN = Path(__file__).resolve().parents[3] / "target" / "debug" / ("gmgn-taskd.exe" if os.name == "nt" else "gmgn-taskd")
 BIN = os.environ.get("TASKD_BIN", str(DEFAULT_BIN))
 WORLD = "world-a"
 RESIDENT = "resident-a"
@@ -43,13 +43,13 @@ def scope(world=WORLD, resident=RESIDENT):
 
 class Daemon:
     def __init__(self, root):
-        self.root = Path(root)
-        self.path = str(self.root / "taskd.sock")
+        self.root = Path(root).resolve()
+        self.path = str(self.root / "taskd.endpoint.json")
         self.start()
 
     def start(self, extra=()):
         self.p = subprocess.Popen(
-            [BIN, "--root", str(self.root), "--socket", self.path, "--concurrency", "2", *extra],
+            [BIN, "--root", str(self.root), "--endpoint-file", self.path, "--concurrency", "2", *extra],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         for _ in range(500):
             if self.p.poll() is not None:
@@ -61,14 +61,19 @@ class Daemon:
                 time.sleep(.02)
         if self.p.poll() is None:
             self.p.kill()
-        raise AssertionError("daemon did not expose its socket: " +
+        raise AssertionError("daemon did not expose its TCP endpoint: " +
                              self.p.communicate(timeout=2)[1].decode())
 
     def connect(self):
-        s = socket.socket(socket.AF_UNIX)
+        endpoint = json.loads(Path(self.path).read_text())
+        host, port = endpoint["address"].rsplit(":", 1)
+        if endpoint["version"] != 1 or host != "127.0.0.1" or not 0 < int(port) < 65536:
+            raise OSError("invalid local endpoint")
+        self.auth = endpoint["token"]
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(8)
         try:
-            s.connect(self.path)
+            s.connect((host, int(port)))
         except Exception:
             s.close()
             raise
@@ -77,7 +82,7 @@ class Daemon:
     def request(self, method, params=None, request_id="t"):
         params = params or {}
         with self.connect() as s:
-            s.sendall(json.dumps({"id": request_id, "method": method,
+            s.sendall(json.dumps({"auth": self.auth, "id": request_id, "method": method,
                                   "params": params}).encode() + b"\n")
             with s.makefile("rb") as stream:
                 return json.loads(stream.readline())
@@ -90,7 +95,7 @@ class Daemon:
 
 class LocalMemoryProcessTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="taskd-local-memory-", dir="/tmp")
+        self.temp = tempfile.TemporaryDirectory(prefix="taskd-local-memory-", dir=Path(tempfile.gettempdir()).resolve())
         self.daemon = None
 
     def tearDown(self):

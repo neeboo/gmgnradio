@@ -159,7 +159,7 @@ impl HttpAudioStream {
                         }
                     }
                 }
-                if received == 0 || received % 2 != 0 {
+                if received == 0 || !received.is_multiple_of(2) {
                     return Err(SpeechError::InvalidResponse);
                 }
                 let _ = sender.send(Ok(AudioEvent::Finished { generation })).await;
@@ -217,7 +217,7 @@ pub mod elevenlabs_asr {
     use super::*;
     pub const ENDPOINT: &str = "wss://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v2_realtime&audio_format=pcm_16000&commit_strategy=manual";
     pub fn audio_chunk(pcm: &[u8]) -> Result<Value, SpeechError> {
-        if pcm.is_empty() || pcm.len() % 2 != 0 || pcm.len() > 32_768 {
+        if pcm.is_empty() || !pcm.len().is_multiple_of(2) || pcm.len() > 32_768 {
             return Err(SpeechError::InvalidResponse);
         }
         Ok(
@@ -257,8 +257,20 @@ pub mod elevenlabs_asr {
                     .ok_or(SpeechError::InvalidResponse)?
                     .into(),
             )),
-            "error" | "auth_error" | "quota_exceeded" | "rate_limited" | "input_error"
-            | "commit_throttled" | "transcriber_error" => Some(Event::Failure),
+            "error"
+            | "auth_error"
+            | "quota_exceeded"
+            | "rate_limited"
+            | "input_error"
+            | "commit_throttled"
+            | "transcriber_error"
+            | "invalid_request"
+            | "unaccepted_terms"
+            | "queue_overflow"
+            | "resource_exhausted"
+            | "session_time_limit_exceeded"
+            | "chunk_size_exceeded"
+            | "insufficient_audio_activity" => Some(Event::Failure),
             _ => None,
         })
     }
@@ -268,6 +280,36 @@ pub mod elevenlabs_asr {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[test]
+    fn scribe_errors_fail_immediately_without_remote_message() {
+        for kind in [
+            "auth_error",
+            "quota_exceeded",
+            "transcriber_error",
+            "input_error",
+            "invalid_request",
+            "error",
+            "commit_throttled",
+            "unaccepted_terms",
+            "rate_limited",
+            "queue_overflow",
+            "resource_exhausted",
+            "session_time_limit_exceeded",
+            "chunk_size_exceeded",
+            "insufficient_audio_activity",
+        ] {
+            let payload = json!({"message_type":kind,"error":"remote-secret"}).to_string();
+            assert_eq!(
+                elevenlabs_asr::decode(payload.as_bytes()).unwrap(),
+                Some(elevenlabs_asr::Event::Failure)
+            );
+        }
+        assert_eq!(
+            elevenlabs_asr::decode(br#"{"message_type":"warning","warning":"remote-secret"}"#)
+                .unwrap(),
+            None
+        );
+    }
     #[test]
     fn push_to_talk_manual_commit() {
         assert!(elevenlabs_asr::ENDPOINT.contains("commit_strategy=manual"));

@@ -3,6 +3,30 @@ import CoreGraphics
 import SwiftUI
 import Observation
 
+@MainActor
+private final class LiveCamHoldVoiceButton: NSButton {
+    var onPress: @MainActor () -> Void = {}
+    var onRelease: @MainActor () -> Void = {}
+    private var isHolding = false
+
+    override func mouseDown(with event: NSEvent) {
+        guard isEnabled else { return }
+        isHolding = true
+        onPress()
+        defer {
+            isHolding = false
+            onRelease()
+        }
+        super.mouseDown(with: event)
+    }
+
+    func activateWithoutHold() {
+        guard !isHolding else { return }
+        onPress()
+        onRelease()
+    }
+}
+
 enum LiveCamFeed: Equatable, Sendable {
     case virtualWorld
 }
@@ -122,7 +146,7 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate, NSGestureRecogn
     let playerButton = NSButton()
     let chatButton = NSButton()
     let mailButton = ResidentSystemMailBadgeButton(identifier: "livecam.button.system-inbox")
-    let voiceButton = NSButton()
+    private let voiceButton = LiveCamHoldVoiceButton()
     let settingsButton = NSButton()
     let messageField = ResidentAttachmentTextField()
     private let images = ResidentAttachmentStore(
@@ -175,6 +199,7 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate, NSGestureRecogn
     private var onSendMessage: @MainActor (ResidentChatSubmission) -> Void
     private var onCancelMessage: @MainActor () -> Void = {}
     private var onToggleVoice: @MainActor () -> Void
+    private var onFinishVoice: @MainActor () -> Void
     var onComposerVisibilityChanged: @MainActor (Bool) -> Void = { _ in }
 
     var isComposerVisible: Bool {
@@ -200,7 +225,8 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate, NSGestureRecogn
             .noProgram
         },
         onSendMessage: @escaping @MainActor (ResidentChatSubmission) -> Void = { _ in },
-        onToggleVoice: @escaping @MainActor () -> Void = {}
+        onToggleVoice: @escaping @MainActor () -> Void = {},
+        onFinishVoice: @escaping @MainActor () -> Void = {}
     ) {
         self.onEnterSpace = onEnterSpace
         self.onOpenPlayer = onOpenPlayer
@@ -211,7 +237,10 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate, NSGestureRecogn
         self.playerMenuSnapshotProvider = playerMenuSnapshotProvider
         self.onSendMessage = onSendMessage
         self.onToggleVoice = onToggleVoice
+        self.onFinishVoice = onFinishVoice
         super.init(frame: .zero)
+        voiceButton.onPress = { [weak self] in self?.onToggleVoice() }
+        voiceButton.onRelease = { [weak self] in self?.onFinishVoice() }
         configureViews()
         observeSpeechPlayback()
     }
@@ -235,6 +264,10 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate, NSGestureRecogn
         _ handler: @escaping @MainActor () -> Void
     ) {
         onToggleVoice = handler
+    }
+
+    func setFinishVoiceHandler(_ handler: @escaping @MainActor () -> Void) {
+        onFinishVoice = handler
     }
 
     func setCancelMessageHandler(_ handler: @escaping @MainActor () -> Void) {
@@ -592,16 +625,16 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate, NSGestureRecogn
         switch state {
         case .disconnected:
             symbolName = "mic"
-            label = "开始语音"
+            label = "按住说话，松开发送"
         case .connecting:
             symbolName = "ellipsis.circle"
-            label = "正在连接语音"
+            label = "正在准备收音，松开发送"
         case .connected:
             symbolName = "mic.fill"
-            label = "语音已连接"
+            label = "按住说话，松开发送"
         case .listening:
             symbolName = "waveform"
-            label = "正在听"
+            label = "正在收音，松开发送"
         case .speaking:
             symbolName = "waveform.circle.fill"
             label = "Agent 正在说话"
@@ -1101,7 +1134,7 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate, NSGestureRecogn
 
     @objc
     private func toggleVoice() {
-        onToggleVoice()
+        voiceButton.activateWithoutHold()
     }
 }
 
@@ -1161,7 +1194,8 @@ final class LiveCamPanel: NSPanel {
             .noProgram
         },
         onSendMessage: @escaping @MainActor (ResidentChatSubmission) -> Void = { _ in },
-        onToggleVoice: @escaping @MainActor () -> Void = {}
+        onToggleVoice: @escaping @MainActor () -> Void = {},
+        onFinishVoice: @escaping @MainActor () -> Void = {}
     ) {
         self.onEnterSpace = onEnterSpace
         interactionView = LiveCamInteractionView(
@@ -1172,7 +1206,8 @@ final class LiveCamPanel: NSPanel {
             onNextTrack: onNextTrack,
             playerMenuSnapshotProvider: playerMenuSnapshotProvider,
             onSendMessage: onSendMessage,
-            onToggleVoice: onToggleVoice
+            onToggleVoice: onToggleVoice,
+            onFinishVoice: onFinishVoice
         )
         apertureView = LiveCamApertureView(
             frame: CGRect(origin: .zero, size: frame.size),
@@ -1267,6 +1302,10 @@ final class LiveCamPanel: NSPanel {
         _ handler: @escaping @MainActor () -> Void
     ) {
         interactionView.setToggleVoiceHandler(handler)
+    }
+
+    func setFinishVoiceHandler(_ handler: @escaping @MainActor () -> Void) {
+        interactionView.setFinishVoiceHandler(handler)
     }
 
     func setCancelMessageHandler(_ handler: @escaping @MainActor () -> Void) {

@@ -20,6 +20,7 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
     private var onCancelMessage: @MainActor () -> Void
     private var messageRevision: UInt64 = 0
     private var onToggleVoice: @MainActor () -> Void
+    private var onFinishVoice: @MainActor () -> Void
     private var isTransitioningToFullStage = false
     private var presentationRevision: UInt64 = 0
     private var agentReplyBuffer = ""
@@ -48,7 +49,8 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
         },
         onSendMessage: @escaping @MainActor (ResidentChatSubmission) async throws -> Void = { _ in },
         onCancelMessage: @escaping @MainActor () -> Void = {},
-        onToggleVoice: @escaping @MainActor () -> Void = {}
+        onToggleVoice: @escaping @MainActor () -> Void = {},
+        onFinishVoice: @escaping @MainActor () -> Void = {}
     ) {
         self.renderSurfaceController = renderSurfaceController
         self.cameraCoordinator = cameraCoordinator
@@ -58,6 +60,7 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
         self.onSendMessage = onSendMessage
         self.onCancelMessage = onCancelMessage
         self.onToggleVoice = onToggleVoice
+        self.onFinishVoice = onFinishVoice
 
         surfaceContainer.wantsLayer = true
         surfaceContainer.layer?.backgroundColor = NSColor.clear.cgColor
@@ -94,6 +97,9 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
         }
         panel.setToggleVoiceHandler { [weak self] in
             self?.onToggleVoice()
+        }
+        panel.setFinishVoiceHandler { [weak self] in
+            self?.onFinishVoice()
         }
         panel.setVoiceState(voiceState)
         // 参考图链的**屏上出口**。工具那侧的唯一构造点在 `GMGNRadioApp.swift`

@@ -13,7 +13,7 @@
 //      现有的 `--patch` insert 机制挂进 headless/ACP composition；插件在 DSH 进程内
 //      `ctx.tools.register(...)` 原生注册（schema 自动进入模型工具列表）。
 //    · 模型在 DSH 里**原生函数调用** gmgn_* 工具 → DSH 工具运行时派发到插件
-//      execute → 插件经**受限本地 IPC**（私有目录内 Unix domain socket + 每轮随机
+//      execute → 插件经**受限本地 IPC**（127.0.0.1 随机端口 + 每轮随机
 //      secret）把 {callId, name, arguments} 送回宿主 → 宿主做「名称边界 + 原 schema
 //      复核 + 每轮/世界授权闸」后调用本轮 worldTools（tools.call）→ 规范 JSON 结果
 //      经 IPC 回到插件 execute → DSH agent loop 在同一运行里把结果回灌模型并继续，
@@ -198,7 +198,7 @@ public struct ResidentDSHHostToolReply: Sendable, Equatable {
     }
 }
 
-// MARK: - Wire framing helpers (newline-delimited JSON over UDS)
+// MARK: - Wire framing helpers (newline-delimited JSON over private loopback TCP)
 
 enum ResidentDSHHostWire {
     static let protocolVersion = 1
@@ -244,7 +244,7 @@ enum ResidentDSHHostWire {
 
 /// 真实 DSH 原生工具插件（gmgn-host-tools）源码。运行期写入私有目录并以
 /// `--patch` 的 insert 行加载；插件在 DSH 进程内 `ctx.tools.register` 原生注册
-/// 宿主本轮正式工具，execute 经私有 UDS + 每轮 secret 回宿主，宿主复核后执行
+/// 宿主本轮正式工具，execute 经 loopback TCP + 每轮 token 回宿主，宿主复核后执行
 /// worldTools，规范结果回到同一 DSH 运行继续。
 ///
 /// 插件每次 execute 都重读 grant 文件：授权以「调用时」快照为准——取消/世界切换
@@ -274,9 +274,9 @@ public enum ResidentDSHHostToolsPlugin {
       try { return JSON.parse(raw) } catch (_) { return null }
     }
 
-    function rpc(socketPath, secret, payload, signal) {
+    function rpc(endpoint, secret, payload, signal) {
       return new Promise((resolve, reject) => {
-        const socket = net.connect(socketPath)
+        const socket = net.connect({ host: '127.0.0.1', port: Number(endpoint.address.split(':')[1]) })
         let settled = false
         let buffer = Buffer.alloc(0)
         const deadline = setTimeout(onTimeout, 120000)
@@ -382,12 +382,13 @@ public enum ResidentDSHHostToolsPlugin {
               if (candidate && candidate.name === declared) { allowed = true; break }
             }
             if (!allowed) throw new Error('gmgn-host-tools: 本轮未开放工具 ' + declared)
-            const socketPath = typeof current.socketPath === 'string' ? current.socketPath : null
-            const secret = typeof current.secret === 'string' ? current.secret : ''
-            if (!socketPath) throw new Error('gmgn-host-tools: bootstrap lacks socket path')
+            const endpoint = current.endpoint
+            if (!endpoint || endpoint.version !== 1 || typeof endpoint.address !== 'string' || !/^127\.0\.0\.1:([1-9][0-9]{0,4})$/.test(endpoint.address) || Number(endpoint.address.split(':')[1]) > 65535 || typeof endpoint.token !== 'string' || endpoint.token.length === 0) throw new Error('gmgn-host-tools: invalid private endpoint')
+            const secret = endpoint.token
+            if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(secret) || secret !== current.secret) throw new Error('gmgn-host-tools: invalid private authorization')
             const callId = exec && typeof exec.callId === 'string' ? exec.callId : ''
             const signal = exec && exec.signal ? exec.signal : null
-            const reply = await rpc(socketPath, secret, { callId: callId, name: declared, arguments: args || {} }, signal)
+            const reply = await rpc(endpoint, secret, { callId: callId, name: declared, arguments: args || {} }, signal)
             if (!reply || reply.ok !== true) {
               const error = reply && reply.error
               const message = error && typeof error.message === 'string' ? error.message : 'gmgn-host-tools: host refused the call'
@@ -469,7 +470,12 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
     public let directoryURL: URL
     public let pluginFileURL: URL
     public let grantFileURL: URL
-    public let socketPath: String
+    public private(set) var address: String = ""
+    /// Source compatibility for existing callers; this is a TCP address, never a file path.
+    public var socketPath: String { address }
+    public func endpoint(token: String) -> [String: Any] {
+        ["version": 1, "address": address, "token": token]
+    }
 
     private var listenerFD: Int32 = -1
     private var currentSecret: String = ""
@@ -486,9 +492,7 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
     private let removesDirectoryOnStop: Bool
 
     private static func randomToken() -> String {
-        var bytes = [UInt8](repeating: 0, count: 16)
-        arc4random_buf(&bytes, bytes.count)
-        return bytes.map { String(format: "%02x", $0) }.joined()
+        UUID().uuidString.lowercased()
     }
 
     /// 注册集合按 declaredName / canonicalName 索引（start 时构建，只读）。
@@ -498,12 +502,8 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
     // MARK: Lifecycle
 
     /// 启动宿主通道：在系统临时目录下创建**短名**私有目录（0700），写入插件与
-    /// grant（0600）、启动 UDS 监听，初始授权为 armed。
-    ///
-    /// 为什么自己建短目录：AF_UNIX socket 路径上限约 104 字节，而宿主既有私有
-    /// 目录（如 `gmgn-resident-<uuid>`）在系统临时根下往往超过该长度；因此 socket
-    /// 必须放在短路径下。插件/grant 由 `--patch` overlay 与插件 config 以绝对路径
-    /// 引用，不受该限制。stop() 会整目录清理。
+    /// grant（0600）、启动 127.0.0.1 随机端口监听，初始授权为 armed。
+    /// 插件/grant 由 overlay 以绝对路径引用，stop() 清理本通道创建的目录。
     public static func start(configuration: Configuration) throws -> ResidentDSHHostToolsChannel {
         guard !configuration.registrations.isEmpty else {
             throw ResidentDSHHostToolsError.invalidConfiguration("本轮没有正式工具")
@@ -537,17 +537,12 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
     ) throws -> ResidentDSHHostToolsChannel {
         let pluginURL = directoryURL.appendingPathComponent(ResidentDSHHostToolsPlugin.filename)
         let grantURL = directoryURL.appendingPathComponent(ResidentDSHHostToolsPlugin.grantFilename)
-        let socket = directoryURL.appendingPathComponent(ResidentDSHHostToolsPlugin.socketFilename)
-        guard socket.path.utf8.count < 100 else {
-            throw ResidentDSHHostToolsError.invalidConfiguration("socket 路径过长")
-        }
         let manager = FileManager.default
         let channel = ResidentDSHHostToolsChannel(
             configuration: configuration,
             directoryURL: directoryURL,
             pluginFileURL: pluginURL,
             grantFileURL: grantURL,
-            socketPath: socket.path,
             removesDirectoryOnStop: removesDirectoryOnStop
         )
         do {
@@ -561,14 +556,12 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
             channel.stop()
             try? manager.removeItem(at: pluginURL)
             try? manager.removeItem(at: grantURL)
-            try? manager.removeItem(at: URL(fileURLWithPath: socket.path))
             throw error
         }
         return channel
     }
 
-    /// 在调用方提供的目录内启动（该目录必须足够短以容纳 AF_UNIX socket；
-    /// 生产路径一律用 `start(configuration:)`）。
+    /// 在调用方提供的目录内启动；停止时不删除该目录。
     public static func start(
         configuration: Configuration,
         in directoryURL: URL
@@ -581,14 +574,12 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
         directoryURL: URL,
         pluginFileURL: URL,
         grantFileURL: URL,
-        socketPath: String,
         removesDirectoryOnStop: Bool
     ) {
         self.configuration = configuration
         self.directoryURL = directoryURL
         self.pluginFileURL = pluginFileURL
         self.grantFileURL = grantFileURL
-        self.socketPath = socketPath
         self.removesDirectoryOnStop = removesDirectoryOnStop
         var declaredToCanonical: [String: String] = [:]
         var canonicalToSchemaJSON: [String: Data] = [:]
@@ -651,7 +642,6 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
             try? FileManager.default.removeItem(at: directoryURL)
         } else {
             try? FileManager.default.removeItem(at: grantFileURL)
-            try? FileManager.default.removeItem(at: URL(fileURLWithPath: socketPath))
         }
     }
 
@@ -679,7 +669,7 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
             "round": Self.randomToken(),
             "scope": configuration.scope,
             "worldID": configuration.worldID,
-            "socketPath": socketPath,
+            "endpoint": endpoint(token: secret),
             "tools": tools,
         ]
         if let worldRevision {
@@ -702,24 +692,21 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
         }
     }
 
-    // MARK: UDS listener
+    // MARK: Private loopback TCP listener
 
     private func startListener() throws {
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else {
             throw ResidentDSHHostToolsError.startupFailed("无法创建 socket")
         }
-        var address = sockaddr_un()
-        address.sun_family = sa_family_t(AF_UNIX)
-        withUnsafeMutableBytes(of: &address.sun_path) { raw in
-            let count = min(raw.count, socketPath.utf8.count)
-            for (index, byte) in socketPath.utf8.prefix(count).enumerated() {
-                raw[index] = byte
-            }
-        }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = 0
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
         let bindResult = withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
         guard bindResult == 0 else {
@@ -732,8 +719,17 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
             close(fd)
             throw ResidentDSHHostToolsError.startupFailed("listen 失败：\(detail)")
         }
-        // 目录与 socket 仅本进程可访问：目录 0700、socket 0600。
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: socketPath)
+        var addressLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let queried = withUnsafeMutablePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(fd, $0, &addressLength)
+            }
+        }
+        guard queried == 0 else {
+            close(fd)
+            throw ResidentDSHHostToolsError.startupFailed("无法读取私有端口")
+        }
+        self.address = "127.0.0.1:\(UInt16(bigEndian: address.sin_port))"
 
         lock.lock()
         listenerFD = fd
