@@ -313,3 +313,15 @@ v27完整包构建exit0（`/tmp/gmgn-gpui-product-app-build-v27.log`），实际
 program直接render事件注册已改成熟div.capture_any_mouse_down（实际paint注册），新增GPUI test-support dev-only回归真的创建Root/Pane并执行draw，空目录及整卡两帧draw通过；完整75测试通过的worker结果与主代理最终日志另记。新test依赖只新增锁项，没有升级已有crate。实际完整节目曲目/歌词仍因无真实曲目未验收；磨砂、blur/shadow、scrollTransition、原动画/限幅、歌单真实封面仍欠。没有把正常打开空目录计完整播放视觉通过。
 
 主代理最终复跑UI75/75、App10/10均exit0，日志`/tmp/gmgn-gpui-v27-ui-tests.log`、`/tmp/gmgn-gpui-v27-app-tests.log`；差异检查及敏感模式扫描通过。UI原布局完整对齐目标继续，真实完整业务与视觉验收未完成。
+
+### v28 滚动效果、设置保存与快捷键继续对齐
+
+上一轮56794d964b73f56a8f856ebd6511285cbf8ab13d已提交推送并核对远端。v27实际录制应用内播放快捷键后按Esc，原空格保留；系统消息现有电视通知详情点击后输入字母无变化，源码Textarea.readonly(true)。未创建新未读消息，不能计未读减少或重启恢复通过。
+
+整卡投影补原内卡缩放/Y旋转/偏移与外层scrollTransition的顺序组合、真实视口phase、X轴与Y分量旋转、透明padding、整RGBA模糊和阴影；阴影不参与点击。新增缓存及线性大半径滤镜后，完整测试从初版77项30.10秒降至83项2.79秒，单独真实GPUI Window绘制回归3.36秒。两次整套case数不同，这些debug测试耗时不能当实际App帧率。原磨砂、歌单封面、动画曲线、速度限幅与真实曲目视觉仍待完成。
+
+设置补成功revision回执才清除未被重新编辑的密钥草稿、规范服务地址回填；失败保留输入，不实际写测试凭据。动作目录Enter提交及id@version精确安装接线、原音色provider说明、配置状态图标/配色、保存/清除样式、DJ真实登录状态文字均补。纯内存生产save回调及8项health回调通过。快捷键生产回调补全局无modifier拒绝、持续录制及旧值保留，本地字母允许、Esc取消；独立回归通过。
+
+主代理App10/10、保存回调、health回调和快捷键回调均exit0；宿主构建exit0，日志`/tmp/gmgn-gpui-v28-app-tests.log`、`/tmp/gmgn-gpui-v28-host-build.log`。v28完整包构建exit0（`/tmp/gmgn-gpui-product-app-build-v28.log`），路径`tmp/gpui-product-app-v28/gmgn radio.app`，PID1856，仍用同一真实业务根，runtime`/tmp/gmgn-gpui-parity-v28-runtime.log`。仅退出v27测试App，不碰安装版。
+
+CUA实际进入580×500设置、快捷键页，点击全局播放组合后输入a，显示原“全局快捷键至少需要一个修饰键。”并继续录制；Esc后原⌥⌘P恢复，未保存新组合。随后DJ页真实状态“策划引擎未登录”与原说明可见，没有登录或录音。此路径通过；截图另揭示validation仍为灰check底栏，原Swift为橙色纯文案且与恢复默认同行，录制cyan视觉也需复核，不能计完整快捷键视觉通过。真实保存凭据、动作下载安装、节目滚动帧率等未在本包实际操作，目标继续。

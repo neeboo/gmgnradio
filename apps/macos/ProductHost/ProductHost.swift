@@ -475,6 +475,12 @@ private final class GPUIProductSettings {
             "catalogLoaded": capabilities != nil, "defaultModelID": asrCaps?.defaultASRModel as Any? ?? NSNull(), "captureTestPaused": true] as [String: Any]
         var agentValue = result["agent"] as? [String: Any] ?? [:]
         agentValue["codexState"] = agent.codexState.isSignedIn ? "signedIn" : agent.codexState == .unavailable ? "unavailable" : "signedOut"
+        switch agent.codexState {
+        case .unavailable: agentValue["codexStatus"] = "策划引擎当前不可用"
+        case .signedOut: agentValue["codexStatus"] = "策划引擎未登录"
+        case .signedIn(let method): agentValue["codexStatus"] = "策划引擎已使用 \(method) 登录"
+        }
+        agentValue["hasError"] = agent.hasError
         agentValue["working"] = agent.isWorking
         result["agent"] = agentValue
         return result

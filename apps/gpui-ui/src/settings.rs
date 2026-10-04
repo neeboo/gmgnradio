@@ -45,6 +45,9 @@ fn motion_format(value: &str) -> &str {
 fn tts_draft_change_requires_stop(section:&str,field:&str,previous:&Value,current:&Value)->bool {
     section=="tts"&&matches!(field,"voiceID"|"modelID")&&previous!=current
 }
+fn save_ack_clear(revision:u64,ack:u64,submitted:&str,current:&str)->bool{
+    ack>revision&&submitted==current
+}
 
 fn orb_preview() -> impl IntoElement {
     div()
@@ -223,6 +226,8 @@ pub struct AgentSettingsPane {
     import_link_window: Option<AnyWindowHandle>,
     import_link_pending: bool,
     import_link_revision: u64,
+    pending_marble:Option<(u64,String)>,
+    pending_prop:Option<(u64,String,String)>,
 }
 impl AgentSettingsPane {
     fn open_import_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -344,6 +349,10 @@ impl AgentSettingsPane {
             }
         }),cx.subscribe(&extra_inputs[0],|this,_,event:&InputEvent,cx|{
             if matches!(event,InputEvent::Change)&&this.initialized{this.commands.push(json!({"op":"speech.settings.cancel","clearVoices":true,"cancelCapabilities":false}));cx.notify();}
+        }),cx.subscribe(&extra_inputs[3],|this,input,event:&InputEvent,cx|{
+            if matches!(event,InputEvent::PressEnter{..})&&this.snapshot["presence"]["working"].as_bool()!=Some(true){
+                let url=input.read(cx).value().to_string();if !url.trim().is_empty(){this.commands.push(json!({"op":"presence.catalog","url":url}));cx.notify();}
+            }
         }),cx.subscribe(&extra_inputs[5],|this,_,event:&InputEvent,cx|{
             if matches!(event,InputEvent::Change)&&this.initialized{this.commands.push(json!({"op":"space.prop.cancel","clearNotice":true}));cx.notify();}
         }),cx.subscribe(&extra_inputs[6],|this,_,event:&InputEvent,cx|{
@@ -373,6 +382,8 @@ impl AgentSettingsPane {
             import_link_window: None,
             import_link_pending: false,
             import_link_revision: 0,
+            pending_marble:None,
+            pending_prop:None,
         }
     }
     pub fn take_commands(&mut self) -> Vec<Value> {
@@ -411,6 +422,21 @@ impl AgentSettingsPane {
     ) {
         if snapshot.is_null() || self.snapshot == snapshot {
             return;
+        }
+        self.extra_inputs[2].update(cx,|input,cx|input.set_placeholder(if snapshot["space"]["credentialConfigured"].as_bool()==Some(true){"粘贴新的 API Key 可覆盖现有配置"}else{"粘贴 API Key"},window,cx));
+        self.extra_inputs[6].update(cx,|input,cx|input.set_placeholder(if snapshot["space"]["propCredentialConfigured"].as_bool()==Some(true){"填写新密钥可替换；留空保留现有密钥"}else{"生成服务密钥"},window,cx));
+        if let Some((revision,submitted))=&self.pending_marble{
+            if snapshot["space"]["marbleMutationRevision"].as_u64().is_some_and(|ack|ack>*revision){
+                if save_ack_clear(*revision,snapshot["space"]["marbleMutationRevision"].as_u64().unwrap_or(0),submitted,self.extra_inputs[2].read(cx).value().as_str()){self.extra_inputs[2].update(cx,|input,cx|input.set_value("",window,cx));}
+                self.pending_marble=None;
+            }
+        }
+        if let Some((revision,endpoint,key))=&self.pending_prop{
+            if snapshot["space"]["propSaveRevision"].as_u64().is_some_and(|ack|ack>*revision){
+                if self.extra_inputs[5].read(cx).value().as_str()==endpoint{let normalized=snapshot["space"]["propEndpoint"].as_str().unwrap_or(endpoint).to_owned();self.extra_inputs[5].update(cx,|input,cx|input.set_value(normalized,window,cx));}
+                if save_ack_clear(*revision,snapshot["space"]["propSaveRevision"].as_u64().unwrap_or(0),key,self.extra_inputs[6].read(cx).value().as_str()){self.extra_inputs[6].update(cx,|input,cx|input.set_value("",window,cx));}
+                self.pending_prop=None;
+            }
         }
         if !self.initialized {
             self.draft = snapshot.clone();
@@ -656,7 +682,7 @@ impl AgentSettingsPane {
         let group = |title: &'static str| SettingsGroup::new(title, border);
         form=form.child(group("DJ 内核")
             .child(div().flex().items_center().gap(px(12.)).child(div().size(px(32.)).rounded_lg().bg(cx.theme().muted).flex().items_center().justify_center().child(Icon::new(IconName::Terminal).size(px(20.))))
-                .child(div().flex_1().flex().flex_col().child("gmgn DJ").child(match self.snapshot["agent"]["codexState"].as_str(){Some("signedIn")=>"已登录",Some("unavailable")=>"未安装",_=>"未登录"}))
+                .child(div().flex_1().flex().flex_col().child("gmgn DJ").child(self.snapshot["agent"]["codexStatus"].as_str().unwrap_or("策划引擎未登录").to_owned()))
                 .child(Button::new("codex-login").label(if self.snapshot["agent"]["codexState"].as_str()==Some("signedIn"){"退出登录"}else{"登录"})
                     .disabled(self.snapshot["agent"]["working"].as_bool()==Some(true)||self.snapshot["agent"]["codexState"].as_str()==Some("unavailable"))
                     .on_click(cx.listener(|this,_,_,_|this.commands.push(json!({"op":if this.snapshot["agent"]["codexState"].as_str()==Some("signedIn"){"agent.logout"}else{"agent.login"}}))))))
@@ -690,7 +716,10 @@ impl AgentSettingsPane {
                 .child(Button::new("preview-tts").label(if self.snapshot["tts"]["isSpeaking"].as_bool()==Some(true){"停止试听"}else{"试听声音"}).disabled(!valid_model||self.inputs[3].read(cx).value().trim().is_empty()).on_click(cx.listener(|this,_,_,cx|this.tts_action(if this.snapshot["tts"]["isSpeaking"].as_bool()==Some(true){"tts.stop"}else{"tts.preview"},cx)))))
             .child(gpui_kit::component::collapsible::Collapsible::new().open(self.custom_voice_open)
                 .child(Button::new("custom-voice-disclosure").label("自定义音色 ID").icon(if self.custom_voice_open{IconName::ChevronDown}else{IconName::ChevronRight}).on_click(cx.listener(|this,_,_,cx|{this.custom_voice_open=!this.custom_voice_open;cx.notify();})))
-                .content(div().flex().flex_col().gap_2().child(Input::new(&self.inputs[3])).child(div().text_xs().child("填写该服务已有的音色 ID，无需重新上传；账号、模型及服务区域须与创建音色时一致。"))))
+                .content(div().flex().flex_col().gap_2()
+                    .child(div().text_xs().child(if self.draft["tts"]["providerID"].as_str()==Some("fish"){"自定义 Reference ID"}else{"自定义 Voice ID"}))
+                    .child(Input::new(&self.inputs[3])).child(div().text_xs().child("填写该服务已有的音色 ID，无需重新上传；账号、模型及服务区域须与创建音色时一致。"))
+                    .children((self.draft["tts"]["providerID"].as_str()==Some("bailian")).then(||div().text_xs().child("百炼复刻音色需要在模型列表选择对应的 VC Realtime 快照；创建音色时的 target_model 必须匹配。")))))
             .child(self.dropdown("tts-model","模型","tts","modelID",self.options("tts","models"),cx))
             .children((self.snapshot["tts"]["catalogLoaded"].as_bool()==Some(true)&&!valid_model).then(||div().text_xs().child("原配置模型不在当前支持列表中，请选择后保存；不会自动改用其他模型。")))
             .child(if self.snapshot["tts"]["credentialConfigured"].as_bool()==Some(true) { "沿用原应用已配置凭据" } else { "该服务尚未配置凭据，请填写后保存" })
@@ -723,7 +752,9 @@ impl AgentSettingsPane {
     ) -> AnyElement {
         Button::new(id)
             .label(label)
+            .when(command["op"]=="space.key.clear",|button|button.danger())
             .on_click(cx.listener(move |this, _, _, cx| {
+                if command["op"]=="space.key.clear"{this.pending_marble=Some((this.snapshot["space"]["marbleMutationRevision"].as_u64().unwrap_or(0),this.extra_inputs[2].read(cx).value().to_string()));}
                 this.commands.push(command.clone());
                 cx.notify();
             }))
@@ -776,7 +807,7 @@ impl AgentSettingsPane {
                     } else if package["rendererAvailable"].as_bool() == Some(false) {
                         row = row.child(div().text_xs().child(format!(
                             "等待 {} 渲染",
-                            package["engine"].as_str().unwrap_or("当前引擎")
+                            match package["engine"].as_str(){Some("orb")=>"呼吸球",Some("pmx")=>"PMX",Some("vrm")=>"VRM",Some("live2d")=>"Live2D",_=>"当前引擎"}
                         )));
                     } else {
                         row =
@@ -937,7 +968,7 @@ impl AgentSettingsPane {
                     .into_iter()
                     .flatten()
                 {
-                    let id = motion["id"].clone();
+                    let identity=motion["catalogIdentity"].clone();
                     let mut row = div()
                         .flex()
                         .items_center()
@@ -983,14 +1014,14 @@ impl AgentSettingsPane {
                         );
                     } else {
                         row = row.child(
-                            Button::new(format!("install-motion-{id}"))
+                            Button::new(format!("install-motion-{identity}"))
                                 .label(motion["installLabel"].as_str().unwrap_or("安装").to_owned())
                                 .disabled(
                                     self.snapshot["presence"]["working"].as_bool() == Some(true),
                                 )
                                 .on_click(cx.listener(move |this, _, _, _| {
                                     this.commands
-                                        .push(json!({"op":"presence.motion.install","id":id}))
+                                        .push(json!({"op":"presence.motion.install","catalogIdentity":identity}))
                                 })),
                         );
                     }
@@ -1115,17 +1146,24 @@ impl AgentSettingsPane {
                     .child(group("Marble 空间")
                         .child(div().flex().items_center().gap(px(12.)).child(div().w(px(28.)).flex_shrink_0().child(Icon::new(IconName::Box).size(px(22.))))
                             .child(div().flex_1().flex().flex_col().gap(px(2.)).child("World Labs Marble").child(div().text_xs().child("用于同步和生成可探索的 3D 空间")))
-                            .child(div().text_sm().child(if configured{"已配置"}else{"未配置"})))
+                            .child(div().flex().items_center().gap_1().text_sm().text_color(if configured{cx.theme().success}else{cx.theme().muted_foreground})
+                                .child(Icon::new(if configured{IconName::CircleCheck}else{IconName::Circle}).size(px(14.))).child(if configured{"已配置"}else{"未配置"})))
                         .child(div().flex().items_center().gap_3().child("API Key").child(div().flex_1().min_w(px(0.)).child(Input::new(&self.extra_inputs[2]))))
                         .child(div().flex().items_center().gap_2().child(div().flex_1().text_xs().child("只保存在本机，不使用钥匙串。"))
                             .when(configured,|row|row.child(self.command_button("marble-clear","清除",json!({"op":"space.key.clear"}),cx)))
-                            .child(Button::new("marble-save").label("保存 Key").disabled(self.extra_inputs[2].read(cx).value().trim().is_empty()).on_click(cx.listener(|this,_,_,cx|this.commands.push(json!({"op":"space.key.save","apiKey":this.extra_inputs[2].read(cx).value().to_string()})))))))
+                            .child(Button::new("marble-save").primary().label("保存 Key").disabled(self.extra_inputs[2].read(cx).value().trim().is_empty()).on_click(cx.listener(|this,_,_,cx|{
+                                let key=this.extra_inputs[2].read(cx).value().to_string();this.pending_marble=Some((this.snapshot["space"]["marbleMutationRevision"].as_u64().unwrap_or(0),key.clone()));this.commands.push(json!({"op":"space.key.save","apiKey":key}));
+                            })))))
                     .child(group("许愿机").child(Input::new(&self.extra_inputs[5])).child(Input::new(&self.extra_inputs[6]))
                     .child(div().flex().items_center().gap_2()
-                        .child(div().flex_1().text_sm().child(if self.snapshot["space"]["propCredentialConfigured"].as_bool()==Some(true){"已配置"}else{"未配置"}))
+                        .child(div().flex_1().flex().items_center().gap_1().text_sm().text_color(cx.theme().muted_foreground)
+                            .child(Icon::new(if self.snapshot["space"]["propCredentialConfigured"].as_bool()==Some(true){IconName::CircleCheck}else{IconName::Circle}).size(px(14.)))
+                            .child(if self.snapshot["space"]["propCredentialConfigured"].as_bool()==Some(true){"已配置"}else{"未配置"}))
                         .child(Button::new("prop-check").label(if self.snapshot["space"]["propChecking"].as_bool()==Some(true){"检测中…"}else{"检测连接"}).disabled(self.snapshot["space"]["propCredentialConfigured"].as_bool()!=Some(true)||self.snapshot["space"]["propChecking"].as_bool()==Some(true)||!self.extra_inputs[6].read(cx).value().is_empty()).on_click(cx.listener(|this,_,_,cx|this.commands.push(json!({"op":"space.prop.check","endpoint":this.extra_inputs[5].read(cx).value().to_string()})))))
-                        .child(Button::new("prop-save").label("保存").disabled(self.extra_inputs[5].read(cx).value().trim().is_empty()).on_click(cx.listener(|this,_,_,cx|this.commands.push(json!({"op":"space.prop.save","endpoint":this.extra_inputs[5].read(cx).value().to_string(),"apiKey":this.extra_inputs[6].read(cx).value().to_string()}))))))
-                    .child(div().text_xs().child("地址和密钥只存在这台电脑上，保存后不会立刻开始生成。")));
+                        .child(Button::new("prop-save").primary().label("保存").disabled(self.extra_inputs[5].read(cx).value().trim().is_empty()).on_click(cx.listener(|this,_,_,cx|{
+                            let endpoint=this.extra_inputs[5].read(cx).value().to_string();let key=this.extra_inputs[6].read(cx).value().to_string();this.pending_prop=Some((this.snapshot["space"]["propSaveRevision"].as_u64().unwrap_or(0),endpoint.clone(),key.clone()));this.commands.push(json!({"op":"space.prop.save","endpoint":endpoint,"apiKey":key}));
+                        })))))
+                    .child(div().text_xs().child("地址和密钥只存在这台电脑上，保存后不会立刻开始生成。"));
             }
             3 => {
                 let mut shortcuts = group("")
@@ -1323,14 +1361,18 @@ impl Render for AgentSettingsPane {
             [["presence", "music", "space", "shortcuts", "agent"][self.page]]["notice"]
             .as_str()
         {
+            let error=self.snapshot[["presence","music","space","shortcuts","agent"][self.page]]["hasError"].as_bool()==Some(true);
             root = root.child(
                 div()
+                    .flex().items_center().gap(px(7.))
                     .flex_shrink_0()
                     .px(px(20.))
                     .pb(px(14.))
                     .max_h(px(42.))
                     .overflow_hidden()
                     .text_xs()
+                    .text_color(if error{cx.theme().danger}else{cx.theme().muted_foreground})
+                    .child(Icon::new(if error{IconName::CircleAlert}else{IconName::CircleCheck}).size(px(14.)))
                     .child(notice.to_owned()),
             );
         }
@@ -1340,7 +1382,7 @@ impl Render for AgentSettingsPane {
 
 #[cfg(test)]
 mod settings_display_tests {
-    use super::{avatar_detail, motion_format, tts_draft_change_requires_stop};
+    use super::{avatar_detail, motion_format, tts_draft_change_requires_stop,save_ack_clear};
     use serde_json::json;
     #[test]
     fn built_in_character_detail_matches_original_display() {
@@ -1376,5 +1418,12 @@ mod settings_display_tests {
         }
         assert!(!tts_draft_change_requires_stop("asr", "modelID", &json!("old"), &json!("new")));
         assert!(!tts_draft_change_requires_stop("tts", "apiKey", &json!("old"), &json!("new")));
+    }
+    #[test]
+    fn successful_save_ack_clears_only_the_submitted_unchanged_draft(){
+        assert!(save_ack_clear(3,4,"submitted","submitted"));
+        assert!(!save_ack_clear(3,3,"submitted","submitted"));
+        assert!(!save_ack_clear(3,4,"submitted","new edit"));
+        assert!(!save_ack_clear(3,2,"submitted","submitted"));
     }
 }

@@ -14,6 +14,7 @@ final class GPUISettingsParity {
     private var syncObserver: NSObjectProtocol?
     private var recordMonitor: Any?
     private var spaceNotice: String?
+    private var shortcutValidationMessage: String?
     private var propEndpoint = "http://127.0.0.1:8191"
     private var propConfigured = false
     private var propChecking = false
@@ -21,6 +22,9 @@ final class GPUISettingsParity {
     private var propCheckID: UUID?
     private var downloadRevision: UInt64 = 0
     private var downloadState = "idle"
+    private var marbleMutationRevision: UInt64 = 0
+    private var propSaveRevision: UInt64 = 0
+    private var spaceHasError = false
 
     init(runtime: AppDelegate) {
         self.runtime = runtime
@@ -75,7 +79,7 @@ final class GPUISettingsParity {
                      "reason": motionReason(motion) as Any? ?? NSNull()] as [String: Any]
                 },
                 "publishedMotions": presence.availablePublishedMotions.map { motion in
-                    ["id": motion.id, "name": motion.name, "format": motion.format,
+                    ["id": motion.id, "catalogIdentity": motion.id + "@" + motion.version, "name": motion.name, "format": motion.format,
                      "version": motion.version, "bytes": motion.bytes, "duration": motion.duration, "loop": motion.loop,
                      "installState": String(describing: presence.publishedMotionInstallState(motion)),
                      "installLabel": installLabel(motion)] as [String: Any]
@@ -105,6 +109,8 @@ final class GPUISettingsParity {
                 "credentialConfigured": marble.isConfigured,
                 "notice": spaceNotice ?? marble.message as Any? ?? NSNull(),
                 "propEndpoint": propEndpoint, "propCredentialConfigured": propConfigured, "propChecking": propChecking,
+                "marbleMutationRevision": marbleMutationRevision, "propSaveRevision": propSaveRevision,
+                "hasError": spaceNotice == nil ? marble.hasError : spaceHasError,
             ],
             "shortcuts": [
                 "assignments": shortcuts.assignments.map {
@@ -114,7 +120,7 @@ final class GPUISettingsParity {
                 "globalEnabled": shortcuts.globalEnabled, "mediaKeysEnabled": shortcuts.mediaKeysEnabled,
                 "recordingID": recording?.action.rawValue as Any? ?? NSNull(),
                 "recordingScope": recording?.scope.rawValue as Any? ?? NSNull(),
-                "notice": recording == nil ? NSNull() : "按下快捷键；Esc 取消。重复组合会与原动作交换。" as Any,
+                "notice": shortcutValidationMessage as Any? ?? (recording == nil ? NSNull() : "按下快捷键；Esc 取消。重复组合会与原动作交换。" as Any),
             ],
         ]
     }
@@ -143,7 +149,8 @@ final class GPUISettingsParity {
             guard !presence.isWorking else { return false }
             operation("presence") { [weak self] in await self?.presence.refreshPublishedMotions() }
         case "presence.catalog.install", "presence.motion.install":
-            guard !presence.isWorking, let motion = presence.publishedMotions.first(where: { $0.id == id }) else { return false }
+            guard let identity = value["catalogIdentity"] as? String, !presence.isWorking,
+                  let motion = presence.publishedMotions.first(where: { $0.id + "@" + $0.version == identity }) else { return false }
             operation("presence") { [weak self] in await self?.presence.installPublishedMotion(motion) }
         case "presence.download", "presence.import.link":
             guard let url = value["url"] as? String, !presence.isWorking, operations["presence"] == nil else {
@@ -182,18 +189,22 @@ final class GPUISettingsParity {
         case "space.key.save":
             guard let key = value["apiKey"] as? String else { return false }
             marble.replacementKey = key; marble.save(); spaceNotice = nil
-        case "space.key.clear": marble.clear(); spaceNotice = nil
+            if !marble.hasError { marbleMutationRevision &+= 1 }
+        case "space.key.clear":
+            marble.clear(); spaceNotice = nil
+            if !marble.hasError { marbleMutationRevision &+= 1 }
         case "space.prop.save": cancelPropCheck(); return saveProps(value)
         case "space.prop.cancel":
             cancelPropCheck()
-            if value["clearNotice"] as? Bool == true { spaceNotice = nil }
+            if value["clearNotice"] as? Bool == true { spaceNotice = nil; spaceHasError = false }
         case "space.prop.check": checkProps(value)
         case "shortcuts.record":
+            shortcutValidationMessage = nil
             guard let action = GMGNShortcutAction(rawValue: id), let raw = value["scope"] as? String,
                   let scope = GMGNShortcutScope(rawValue: raw) else { return false }
             runtime.shortcutSettingsStore.beginRecording(action: action, scope: scope)
             installRecordingMonitor()
-        case "shortcuts.cancel": runtime.shortcutSettingsStore.cancelRecording(); removeRecordingMonitor()
+        case "shortcuts.cancel": shortcutValidationMessage = nil; runtime.shortcutSettingsStore.cancelRecording(); removeRecordingMonitor()
         case "shortcuts.reset": runtime.shortcutSettingsStore.reset(); removeRecordingMonitor()
         case "shortcuts.save":
             if let enabled = value["globalEnabled"] as? Bool { runtime.shortcutSettingsStore.globalEnabled = enabled }
@@ -208,20 +219,23 @@ final class GPUISettingsParity {
     }
 
     private func saveProps(_ value: [String: Any]) -> Bool {
-        guard let text = value["endpoint"] as? String, let url = URL(string: text.trimmingCharacters(in: .whitespacesAndNewlines)) else { return false }
+        guard let text = value["endpoint"] as? String, let url = URL(string: text.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            spaceNotice = PropGenerationError.invalidEndpoint.localizedDescription; spaceHasError = true; return false
+        }
         let replacement = (value["apiKey"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         do {
             operations["prop"]?.cancel()
             let previous = replacement.isEmpty ? try props.load() : nil
             let candidate = try PropGenerationConfiguration(endpoint: url, token: replacement.isEmpty ? previous?.token ?? "" : replacement)
             guard !replacement.isEmpty || candidate.endpoint == previous?.endpoint else {
-                spaceNotice = "更换服务地址时请同时填写密钥。"; return false
+                spaceNotice = "更换服务地址时请同时填写密钥。"; spaceHasError = true; return false
             }
             try props.save(candidate)
-            loadPropConfiguration(); spaceNotice = "许愿机配置已保存。"
+            loadPropConfiguration(); spaceNotice = "许愿机配置已保存。"; spaceHasError = false; propSaveRevision &+= 1
             NotificationCenter.default.post(name: .propGenerationConfigurationDidChange, object: nil)
             return true
-        } catch { spaceNotice = "许愿机配置无法保存，请检查地址、密钥和本机存储权限。"; return false }
+        } catch let error as PropGenerationError { spaceNotice = error.localizedDescription; spaceHasError = true; return false }
+        catch { spaceNotice = "许愿机配置无法保存，请检查本机存储权限。"; spaceHasError = true; return false }
     }
 
     private func installLabel(_ motion: PublishedMotion) -> String {
@@ -248,7 +262,7 @@ final class GPUISettingsParity {
             let saved = try props.load()
             propConfigured = saved != nil
             if let saved { propEndpoint = saved.endpoint.absoluteString }
-        } catch { spaceNotice = "许愿机配置读取失败，现有文件已保留。" }
+        } catch { propConfigured = false; spaceNotice = "许愿机配置读取失败，现有文件已保留。"; spaceHasError = true }
     }
 
     private func operation(_ key: String, _ body: @escaping @MainActor () async -> Void) {
@@ -274,12 +288,14 @@ final class GPUISettingsParity {
                   let draftURL = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
                   try PropGenerationConfiguration(endpoint: draftURL, token: saved.token).endpoint == saved.endpoint else {
                 spaceNotice = "请先保存服务配置，再检测连接。"
+                spaceHasError = true
                 return
             }
             let id = UUID()
             propCheckID = id
             propChecking = true
             spaceNotice = nil
+            spaceHasError = false
             propCheckTask = Task { [weak self] in
                 guard let self else { return }
                 defer {
@@ -291,14 +307,17 @@ final class GPUISettingsParity {
                     let health = try await PropGenerationClient(endpoint: saved.endpoint, token: saved.token).health()
                     guard !Task.isCancelled, propCheckID == id else { return }
                     spaceNotice = health.message
+                    spaceHasError = false
                 } catch {
                     guard !Task.isCancelled, propCheckID == id else { return }
                     spaceNotice = (error as? PropGenerationError)?.errorDescription
                         ?? "暂时无法连接生成服务，请检查连接后重试。"
+                    spaceHasError = true
                 }
             }
         } catch {
             spaceNotice = "许愿机配置无法读取，请先重新保存服务配置。"
+            spaceHasError = true
         }
     }
 
@@ -306,15 +325,32 @@ final class GPUISettingsParity {
         removeRecordingMonitor()
         recordMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             let handled = MainActor.assumeIsolated {
-                guard let self, let target = self.runtime.shortcutSettingsStore.recordingTarget else { return false }
-                if event.keyCode == 53 { self.runtime.shortcutSettingsStore.cancelRecording(); self.removeRecordingMonitor(); return true }
-                guard let combination = GMGNKeyCombination(event: event) else { return false }
-                self.runtime.shortcutSettingsStore.assign(combination, to: target.action, scope: target.scope)
-                self.removeRecordingMonitor()
-                return true
+                self?.handleRecordingEvent(event) ?? false
             }
             return handled ? nil : event
         }
+    }
+
+    private func handleRecordingEvent(_ event: NSEvent) -> Bool {
+        guard let target = runtime.shortcutSettingsStore.recordingTarget else { return false }
+        if event.keyCode == 53 {
+            shortcutValidationMessage = nil
+            runtime.shortcutSettingsStore.cancelRecording()
+            removeRecordingMonitor()
+            return true
+        }
+        guard let combination = GMGNKeyCombination(event: event) else {
+            shortcutValidationMessage = "请按一个完整的按键组合。"
+            return true
+        }
+        if target.scope == .global && combination.modifiers.isEmpty {
+            shortcutValidationMessage = "全局快捷键至少需要一个修饰键。"
+            return true
+        }
+        runtime.shortcutSettingsStore.assign(combination, to: target.action, scope: target.scope)
+        shortcutValidationMessage = nil
+        removeRecordingMonitor()
+        return true
     }
 
     private func removeRecordingMonitor() {

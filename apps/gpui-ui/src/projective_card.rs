@@ -94,6 +94,113 @@ impl RailMask {
         (t / 0.08).min((1. - t) / 0.08).clamp(0., 1.)
     }
 }
+/// The outer Swift scrollTransition, applied after the inner card transform.
+#[derive(Clone, Copy, Debug)]
+pub struct ScrollTransition {
+    pub scale: f64,
+    pub degrees: f64,
+    pub axis: [f64; 3],
+    pub perspective: f64,
+    pub offset_before: [f64; 2],
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CardShadow {
+    pub radius: f64,
+    pub offset: [f64; 2],
+    pub rgba: [u8; 4],
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CardEffects {
+    pub blur_radius: f64,
+    pub shadow: Option<CardShadow>,
+}
+#[derive(Clone, Copy)]
+struct Homography([[f64; 3]; 3]);
+impl Homography {
+    fn multiply(self, b: Self) -> Self {
+        let mut m = [[0.; 3]; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                for k in 0..3 {
+                    m[i][j] += self.0[i][k] * b.0[k][j];
+                }
+            }
+        }
+        Self(m)
+    }
+    fn translate(x: f64, y: f64) -> Self {
+        Self([[1., 0., x], [0., 1., y], [0., 0., 1.]])
+    }
+    fn apply(self, p: [f64; 2]) -> Option<[f64; 2]> {
+        let m = self.0;
+        let w = m[2][0] * p[0] + m[2][1] * p[1] + m[2][2];
+        if w <= 1e-8 || !w.is_finite() {
+            return None;
+        }
+        Some([
+            (m[0][0] * p[0] + m[0][1] * p[1] + m[0][2]) / w,
+            (m[1][0] * p[0] + m[1][1] * p[1] + m[1][2]) / w,
+        ])
+    }
+    fn inverse(self) -> Option<Self> {
+        let m = self.0;
+        let mut c = [[0.; 3]; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                let r = [(i + 1) % 3, (i + 2) % 3];
+                let s = [(j + 1) % 3, (j + 2) % 3];
+                c[i][j] = m[r[0]][s[0]] * m[r[1]][s[1]] - m[r[0]][s[1]] * m[r[1]][s[0]];
+            }
+        }
+        let d = (0..3).map(|j| m[0][j] * c[0][j]).sum::<f64>();
+        if d.abs() < 1e-10 {
+            return None;
+        }
+        let mut inverse = [[0.; 3]; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                inverse[i][j] = c[j][i] / d;
+            }
+        }
+        Some(Self(inverse))
+    }
+    fn rotation(
+        width: f64,
+        height: f64,
+        scale: f64,
+        degrees: f64,
+        axis: [f64; 3],
+        perspective: f64,
+    ) -> Option<Self> {
+        let n = axis.iter().map(|a| a * a).sum::<f64>().sqrt();
+        if n <= 0. || !n.is_finite() || scale <= 0. {
+            return None;
+        }
+        let [x, y, z] = axis.map(|a| a / n);
+        let (s, c) = degrees.to_radians().sin_cos();
+        let a = 1. - c;
+        let r00 = c + x * x * a;
+        let r01 = x * y * a - z * s;
+        let r10 = y * x * a + z * s;
+        let r11 = c + y * y * a;
+        let r20 = z * x * a - y * s;
+        let r21 = z * y * a + x * s;
+        let p = Self([
+            [r00 * scale, r01 * scale, 0.],
+            [r10 * scale, r11 * scale, 0.],
+            [
+                -perspective * r20 * scale / width,
+                -perspective * r21 * scale / width,
+                1.,
+            ],
+        ]);
+        Some(
+            Self::translate(width, height / 2.)
+                .multiply(p)
+                .multiply(Self::translate(-width, -height / 2.)),
+        )
+    }
+}
 pub struct ProjectedCard {
     pub texture: RgbaTexture,
     /// World logical coordinates; texture covers exactly this clipped rectangle.
@@ -103,6 +210,7 @@ pub struct ProjectedCard {
     source: RgbaTexture,
     opacity: f64,
     mask: Option<RailMask>,
+    mapping: Option<Homography>,
 }
 impl ProjectedCard {
     pub fn render(
@@ -199,7 +307,173 @@ impl ProjectedCard {
             source: source.clone(),
             opacity: opacity.clamp(0., 1.),
             mask,
+            mapping: None,
         })
+    }
+    /// Shadow is inside the original card; blur follows inner scale/opacity and
+    /// precedes Y rotation. The outer transition is composed, never added to Y.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with_effects(
+        source: &RgbaTexture,
+        t: CardTransform,
+        origin: [f64; 2],
+        viewport: [f64; 2],
+        ppp: f64,
+        opacity: f64,
+        mask: Option<RailMask>,
+        transition: Option<ScrollTransition>,
+        effects: CardEffects,
+    ) -> Result<Self, &'static str> {
+        if !source.valid()
+            || !t.valid()
+            || !ppp.is_finite()
+            || ppp <= 0.
+            || !opacity.is_finite()
+            || origin.iter().chain(viewport.iter()).any(|v| !v.is_finite())
+            || viewport.iter().any(|v| *v <= 0.)
+            || mask.is_some_and(|m| !m.top.is_finite() || !m.height.is_finite() || m.height <= 0.)
+        {
+            return Err("invalid raster geometry");
+        }
+        let mut card = Self {
+            texture: RgbaTexture {
+                width: 0,
+                height: 0,
+                pixels: vec![],
+            },
+            bounds: [0.; 4],
+            transform: t,
+            origin,
+            source: source.clone(),
+            opacity: opacity.clamp(0., 1.),
+            mask,
+            mapping: None,
+        };
+        if !effects.blur_radius.is_finite() || effects.blur_radius < 0. {
+            return Err("invalid blur");
+        }
+        let mut matrix = Homography::rotation(
+            t.width,
+            t.height,
+            t.scale,
+            t.y_degrees,
+            [0., 1., 0.],
+            t.perspective,
+        )
+        .ok_or("invalid rotation")?;
+        if let Some(outer) = transition {
+            if ![
+                outer.scale,
+                outer.degrees,
+                outer.perspective,
+                outer.offset_before[0],
+                outer.offset_before[1],
+            ]
+            .iter()
+            .all(|n| n.is_finite())
+            {
+                return Err("invalid transition");
+            }
+            matrix = Homography::rotation(
+                t.width,
+                t.height,
+                outer.scale,
+                outer.degrees,
+                outer.axis,
+                outer.perspective,
+            )
+            .ok_or("invalid transition")?
+            .multiply(Homography::translate(
+                outer.offset_before[0],
+                outer.offset_before[1],
+            ))
+            .multiply(matrix);
+        }
+        let inverse = matrix.inverse().ok_or("singular projection")?;
+        let density = source.width as f64 / t.width;
+        let blur = effects.blur_radius / t.scale * density;
+        let mut shadow = effects.shadow;
+        if let Some(s) = shadow.as_mut() {
+            if !s.radius.is_finite() || s.radius < 0. || s.offset.iter().any(|x| !x.is_finite()) {
+                return Err("invalid shadow");
+            }
+            s.radius *= density;
+            s.offset = s.offset.map(|x| x * density);
+        }
+        let padding_size = (blur * 3.
+            + shadow.map_or(0., |s| {
+                s.radius * 3. + s.offset[0].abs().max(s.offset[1].abs())
+            }))
+        .ceil();
+        if padding_size > 2048. {
+            return Err("effects exceed raster limit");
+        }
+        let padding = padding_size as u32 + 2;
+        let raster = cached_effects_texture(source, blur, shadow, padding)?;
+        let pad = padding as f64 / density;
+        let corners = [
+            [-pad, -pad],
+            [t.width + pad, -pad],
+            [t.width + pad, t.height + pad],
+            [-pad, t.height + pad],
+        ]
+        .map(|p| matrix.apply(p));
+        let corners = corners
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or("projection crosses near plane")?;
+        let left = (corners.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min) + origin[0]).max(0.);
+        let top = (corners.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min) + origin[1]).max(0.);
+        let right = (corners
+            .iter()
+            .map(|p| p[0])
+            .fold(f64::NEG_INFINITY, f64::max)
+            + origin[0])
+            .min(viewport[0]);
+        let bottom = (corners
+            .iter()
+            .map(|p| p[1])
+            .fold(f64::NEG_INFINITY, f64::max)
+            + origin[1])
+            .min(viewport[1]);
+        if right <= left || bottom <= top {
+            return Err("projection outside viewport");
+        }
+        let w = ((right - left) * ppp).ceil() as u32;
+        let h = ((bottom - top) * ppp).ceil() as u32;
+        if w as u64 * h as u64 > 16_777_216 {
+            return Err("projection exceeds raster limit");
+        }
+        let mut pixels = vec![0; w as usize * h as usize * 4];
+        let padded_t = CardTransform {
+            width: raster.width as f64 / density,
+            height: raster.height as f64 / density,
+            ..t
+        };
+        for y in 0..h {
+            for x in 0..w {
+                let world = [left + (x as f64 + 0.5) / ppp, top + (y as f64 + 0.5) / ppp];
+                let Some(local) = inverse.apply([world[0] - origin[0], world[1] - origin[1]])
+                else {
+                    continue;
+                };
+                let rgba = sample(&raster, [local[0] + pad, local[1] + pad], padded_t);
+                let i = (y as usize * w as usize + x as usize) * 4;
+                pixels[i..i + 3].copy_from_slice(&rgba[..3]);
+                pixels[i + 3] = (rgba[3] as f64
+                    * opacity.clamp(0., 1.)
+                    * mask.map_or(1., |m| m.alpha(world[1])))
+                .round() as u8;
+            }
+        }
+        card.texture = RgbaTexture {
+            width: w,
+            height: h,
+            pixels,
+        };
+        card.bounds = [left, top, w as f64 / ppp, h as f64 / ppp];
+        card.mapping = Some(inverse);
+        Ok(card)
     }
     /// Inverse hit testing uses the same projection and true source/mask alpha as paint.
     pub fn inverse_hit(&self, world: [f64; 2]) -> Option<[f64; 2]> {
@@ -211,9 +485,12 @@ impl ProjectedCard {
         {
             return None;
         }
-        let local = self
-            .transform
-            .inverse_point([world[0] - self.origin[0], world[1] - self.origin[1]])?;
+        let point = [world[0] - self.origin[0], world[1] - self.origin[1]];
+        let local = if let Some(inverse) = self.mapping {
+            inverse.apply(point)?
+        } else {
+            self.transform.inverse_point(point)?
+        };
         let alpha = sample(&self.source, local, self.transform)[3] as f64
             * self.opacity
             * self.mask.map_or(1., |m| m.alpha(world[1]));
@@ -225,6 +502,238 @@ impl ProjectedCard {
             .clone()
             .into_render_image()
             .expect("validated projected texture")
+    }
+}
+// Straight pixels enter/leave; all filtering and source-over use premultiplied RGBA.
+struct EffectsCacheEntry {
+    source: RgbaTexture,
+    blur: f64,
+    shadow: Option<CardShadow>,
+    pad: u32,
+    raster: Arc<RgbaTexture>,
+}
+thread_local! {static EFFECTS_CACHE:std::cell::RefCell<std::collections::VecDeque<EffectsCacheEntry>>=const{std::cell::RefCell::new(std::collections::VecDeque::new())};}
+fn cached_effects_texture(
+    source: &RgbaTexture,
+    blur: f64,
+    shadow: Option<CardShadow>,
+    pad: u32,
+) -> Result<Arc<RgbaTexture>, &'static str> {
+    EFFECTS_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(i) = cache.iter().position(|e| {
+            e.blur == blur
+                && e.shadow == shadow
+                && e.pad == pad
+                && e.source.width == source.width
+                && e.source.height == source.height
+                && e.source.pixels == source.pixels
+        }) {
+            let entry = cache.remove(i).unwrap();
+            let result = entry.raster.clone();
+            cache.push_front(entry);
+            return Ok(result);
+        }
+        let raster = Arc::new(effects_texture(source, blur, shadow, pad)?);
+        cache.push_front(EffectsCacheEntry {
+            source: source.clone(),
+            blur,
+            shadow,
+            pad,
+            raster: raster.clone(),
+        });
+        // Geometry-only scrolling reuses prepared pixels; memory stays bounded
+        // to sixteen cards and sixteen million prepared/source pixels per UI thread.
+        while cache.len() > 16
+            || cache
+                .iter()
+                .map(|e| e.raster.pixels.len() + e.source.pixels.len())
+                .sum::<usize>()
+                > 16_777_216 * 4
+        {
+            cache.pop_back();
+        }
+        Ok(raster)
+    })
+}
+fn effects_texture(
+    source: &RgbaTexture,
+    blur: f64,
+    shadow: Option<CardShadow>,
+    pad: u32,
+) -> Result<RgbaTexture, &'static str> {
+    let w = source
+        .width
+        .checked_add(pad * 2)
+        .ok_or("effects exceed raster limit")?;
+    let h = source
+        .height
+        .checked_add(pad * 2)
+        .ok_or("effects exceed raster limit")?;
+    if w as u64 * h as u64 > 16_777_216 {
+        return Err("effects exceed raster limit");
+    }
+    let mut layer = vec![[0_f32; 4]; w as usize * h as usize];
+    for y in 0..source.height {
+        for x in 0..source.width {
+            let i = (y as usize * source.width as usize + x as usize) * 4;
+            let a = source.pixels[i + 3] as f32 / 255.;
+            let j = (y + pad) as usize * w as usize + (x + pad) as usize;
+            layer[j] = [
+                source.pixels[i] as f32 / 255. * a,
+                source.pixels[i + 1] as f32 / 255. * a,
+                source.pixels[i + 2] as f32 / 255. * a,
+                a,
+            ];
+        }
+    }
+    if let Some(s) = shadow {
+        let mut background = vec![[0.; 4]; layer.len()];
+        // Keep fractional shadow offsets; interpolate the original alpha field.
+        for y in 0..h {
+            for x in 0..w {
+                let px = x as f64 - pad as f64 - s.offset[0] + 0.5;
+                let py = y as f64 - pad as f64 - s.offset[1] + 0.5;
+                let t = CardTransform {
+                    width: source.width as f64,
+                    height: source.height as f64,
+                    scale: 1.,
+                    y_degrees: 0.,
+                    perspective: 0.,
+                };
+                let a = sample(source, [px, py], t)[3] as f32 / 255. * s.rgba[3] as f32 / 255.;
+                background[y as usize * w as usize + x as usize] = [
+                    s.rgba[0] as f32 / 255. * a,
+                    s.rgba[1] as f32 / 255. * a,
+                    s.rgba[2] as f32 / 255. * a,
+                    a,
+                ];
+            }
+        }
+        gaussian(&mut background, w, h, s.radius);
+        for (front, back) in layer.iter_mut().zip(background) {
+            let coverage = 1. - front[3];
+            for c in 0..4 {
+                front[c] += back[c] * coverage;
+            }
+        }
+    }
+    gaussian(&mut layer, w, h, blur);
+    let mut pixels = Vec::with_capacity(layer.len() * 4);
+    for p in layer {
+        let a = p[3].clamp(0., 1.);
+        if a <= 0. {
+            pixels.extend([0; 4]);
+        } else {
+            pixels.extend([
+                (p[0] / a * 255.).round().clamp(0., 255.) as u8,
+                (p[1] / a * 255.).round().clamp(0., 255.) as u8,
+                (p[2] / a * 255.).round().clamp(0., 255.) as u8,
+                (a * 255.).round() as u8,
+            ]);
+        }
+    }
+    Ok(RgbaTexture {
+        width: w,
+        height: h,
+        pixels,
+    })
+}
+fn gaussian(layer: &mut Vec<[f32; 4]>, w: u32, h: u32, sigma: f64) {
+    if sigma <= 0.001 {
+        return;
+    }
+    // Three variance-matched box passes approximate the Gaussian blur with
+    // linear work. Wide original shadows must not cost O(pixels * radius).
+    if sigma > 2. {
+        let ideal = (4. * sigma * sigma + 1.).sqrt();
+        let mut low = ideal.floor() as i32;
+        if low % 2 == 0 {
+            low -= 1;
+        }
+        low = low.max(1);
+        let high = low + 2;
+        let n = ((12. * sigma * sigma - 3. * (low * low) as f64 - 12. * low as f64 - 9.)
+            / (-4. * low as f64 - 4.))
+            .round()
+            .clamp(0., 3.) as usize;
+        for pass in 0..3 {
+            let radius = (if pass < n { low } else { high }) / 2;
+            box_blur(layer, w, h, radius);
+        }
+        return;
+    }
+    let radius = (sigma * 3.).ceil() as i32;
+    let mut weights = (-radius..=radius)
+        .map(|x| (-(x as f64).powi(2) / (2. * sigma * sigma)).exp() as f32)
+        .collect::<Vec<_>>();
+    let total = weights.iter().sum::<f32>();
+    for x in &mut weights {
+        *x /= total;
+    }
+    let mut output = vec![[0.; 4]; layer.len()];
+    for horizontal in [true, false] {
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                let mut p = [0.; 4];
+                for (k, weight) in (-radius..=radius).zip(&weights) {
+                    let sx = x + if horizontal { k } else { 0 };
+                    let sy = y + if horizontal { 0 } else { k };
+                    if sx >= 0 && sy >= 0 && sx < w as i32 && sy < h as i32 {
+                        let sample = layer[sy as usize * w as usize + sx as usize];
+                        for c in 0..4 {
+                            p[c] += sample[c] * weight;
+                        }
+                    }
+                }
+                output[y as usize * w as usize + x as usize] = p;
+            }
+        }
+        std::mem::swap(layer, &mut output);
+    }
+}
+fn box_blur(layer: &mut Vec<[f32; 4]>, w: u32, h: u32, r: i32) {
+    if r == 0 {
+        return;
+    }
+    let mut output = vec![[0.; 4]; layer.len()];
+    let weight = 1. / (2 * r + 1) as f32;
+    for horizontal in [true, false] {
+        let length = if horizontal { w } else { h } as i32;
+        let rows = if horizontal { h } else { w } as i32;
+        for row in 0..rows {
+            let index = |column: i32| {
+                if horizontal {
+                    row as usize * w as usize + column as usize
+                } else {
+                    column as usize * w as usize + row as usize
+                }
+            };
+            let mut sum = [0.; 4];
+            for column in 0..=r.min(length - 1) {
+                for c in 0..4 {
+                    sum[c] += layer[index(column)][c];
+                }
+            }
+            for column in 0..length {
+                for c in 0..4 {
+                    output[index(column)][c] = sum[c] * weight;
+                }
+                let remove = column - r;
+                let add = column + r + 1;
+                if remove >= 0 {
+                    for c in 0..4 {
+                        sum[c] -= layer[index(remove)][c];
+                    }
+                }
+                if add < length {
+                    for c in 0..4 {
+                        sum[c] += layer[index(add)][c];
+                    }
+                }
+            }
+        }
+        std::mem::swap(layer, &mut output);
     }
 }
 // Interpolate premultiplied samples, then unpremultiply. Transparent colored edges cannot halo.
@@ -266,6 +775,151 @@ fn sample(source: &RgbaTexture, p: [f64; 2], t: CardTransform) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prepared_effects_reuse_pixels_when_only_scroll_geometry_changes() {
+        let source = texture();
+        let shadow = Some(CardShadow {
+            radius: 3.,
+            offset: [0., 2.],
+            rgba: [0, 0, 0, 120],
+        });
+        let a = cached_effects_texture(&source, 0.16, shadow, 12).unwrap();
+        let b = cached_effects_texture(&source, 0.16, shadow, 12).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        let c = cached_effects_texture(&source, 0.32, shadow, 12).unwrap();
+        assert!(!Arc::ptr_eq(&a, &c));
+    }
+    #[test]
+    fn wide_shadow_blur_preserves_color_and_spreads_real_alpha() {
+        let source = RgbaTexture {
+            width: 8,
+            height: 8,
+            pixels: vec![255; 8 * 8 * 4],
+        };
+        let raster = effects_texture(
+            &source,
+            0.,
+            Some(CardShadow {
+                radius: 4.,
+                offset: [0., 4.],
+                rgba: [0, 0, 255, 128],
+            }),
+            20,
+        )
+        .unwrap();
+        let i = (34 * raster.width as usize + 24) * 4;
+        assert!(raster.pixels[i + 3] > 0);
+        assert!(raster.pixels[i + 2] > raster.pixels[i]);
+    }
+    #[test]
+    fn outer_scroll_rotation_composes_and_inverse_hit_returns_original_local_point() {
+        let t = transform();
+        let outer = ScrollTransition {
+            scale: 0.9,
+            degrees: -13.,
+            axis: [1., 0.16, 0.],
+            perspective: 0.72,
+            offset_before: [-9., 0.],
+        };
+        let matrix = Homography::rotation(
+            t.width,
+            t.height,
+            outer.scale,
+            outer.degrees,
+            outer.axis,
+            outer.perspective,
+        )
+        .unwrap()
+        .multiply(Homography::translate(-9., 0.))
+        .multiply(
+            Homography::rotation(
+                t.width,
+                t.height,
+                t.scale,
+                t.y_degrees,
+                [0., 1., 0.],
+                t.perspective,
+            )
+            .unwrap(),
+        );
+        let expected = matrix.apply([110., 50.]).unwrap();
+        let card = ProjectedCard::render_with_effects(
+            &texture(),
+            t,
+            [30., 30.],
+            [400., 200.],
+            1.,
+            1.,
+            None,
+            Some(outer),
+            CardEffects::default(),
+        )
+        .unwrap();
+        let hit = card
+            .inverse_hit([expected[0] + 30., expected[1] + 30.])
+            .unwrap();
+        assert!((hit[0] - 110.).abs() < 1e-8 && (hit[1] - 50.).abs() < 1e-8);
+        assert!(matrix.apply([0., 0.]).unwrap() != t.project_point([0., 0.]));
+    }
+    #[test]
+    fn whole_card_shadow_has_transparent_padding_but_never_owns_pointer() {
+        let source = RgbaTexture {
+            width: 8,
+            height: 8,
+            pixels: vec![255; 8 * 8 * 4],
+        };
+        let t = CardTransform {
+            width: 8.,
+            height: 8.,
+            scale: 1.,
+            y_degrees: 0.,
+            perspective: 0.72,
+        };
+        let card = ProjectedCard::render_with_effects(
+            &source,
+            t,
+            [20., 20.],
+            [80., 80.],
+            1.,
+            1.,
+            None,
+            None,
+            CardEffects {
+                blur_radius: 0.,
+                shadow: Some(CardShadow {
+                    radius: 1.,
+                    offset: [0., 4.],
+                    rgba: [0, 200, 255, 128],
+                }),
+            },
+        )
+        .unwrap();
+        assert!(card.bounds[0] < 20. && card.bounds[1] < 20.);
+        assert_eq!(card.inverse_hit([23., 30.]), None);
+        assert_eq!(card.inverse_hit([23., 23.]), Some([3., 3.]));
+        let x = ((23.5 - card.bounds[0]) as u32).min(card.texture.width - 1);
+        let y = ((30.5 - card.bounds[1]) as u32).min(card.texture.height - 1);
+        let i = (y as usize * card.texture.width as usize + x as usize) * 4;
+        assert!(card.texture.pixels[i + 3] > 0);
+        assert!(card.texture.pixels[i + 2] > card.texture.pixels[i]);
+    }
+    #[test]
+    fn outer_blur_filters_complete_rgba_before_projection_without_black_halo() {
+        let source = RgbaTexture {
+            width: 1,
+            height: 1,
+            pixels: vec![255, 0, 0, 255],
+        };
+        let raster = effects_texture(&source, 1., None, 4).unwrap();
+        let center = (4 * raster.width as usize + 4) * 4;
+        let neighbor = (4 * raster.width as usize + 5) * 4;
+        assert!(
+            raster.pixels[neighbor + 3] > 0
+                && raster.pixels[neighbor + 3] < raster.pixels[center + 3]
+        );
+        assert_eq!(raster.pixels[neighbor], 255);
+        assert_eq!(raster.pixels[neighbor + 1], 0);
+    }
     fn transform() -> CardTransform {
         CardTransform {
             width: 294.,

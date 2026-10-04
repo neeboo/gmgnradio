@@ -43,6 +43,7 @@ struct PropGenerationConfiguration {
 @MainActor final class Settings {
     let props = Store()
     var spaceNotice: String?
+    var spaceHasError = false
     var propCheckID: UUID?
     var propCheckTask: Task<Void, Never>?
     var propChecking = false

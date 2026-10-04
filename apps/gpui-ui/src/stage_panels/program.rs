@@ -1,4 +1,44 @@
-use crate::projective_card::{CardTransform, ProjectedCard, RailMask, RgbaTexture};
+use crate::projective_card::{
+    CardEffects, CardShadow, CardTransform, ProjectedCard, RailMask, RgbaTexture, ScrollTransition,
+};
+
+fn scroll_phase(card_top: f64, card_height: f64, viewport_top: f64, viewport_height: f64) -> f64 {
+    if card_height <= 0. || viewport_height <= 0. {
+        return 0.;
+    }
+    if card_top < viewport_top {
+        ((card_top - viewport_top) / card_height).clamp(-1., 0.)
+    } else {
+        ((card_top + card_height - viewport_top - viewport_height) / card_height).clamp(0., 1.)
+    }
+}
+fn card_effects(card: &Value, catalog: bool) -> CardEffects {
+    let current = card["isCurrent"].as_bool() == Some(true);
+    let focused = card["isFocused"].as_bool().unwrap_or(current);
+    CardEffects {
+        blur_radius: if catalog || focused {
+            0.
+        } else {
+            card["relativeIndex"]
+                .as_i64()
+                .unwrap_or(0)
+                .unsigned_abs()
+                .min(2) as f64
+                * 0.16
+        },
+        shadow: Some(CardShadow {
+            radius: if !catalog && current { 24. } else { 13. },
+            offset: [0., 7.],
+            rgba: if catalog {
+                [0, 0, 0, 97]
+            } else if current {
+                [0, 255, 255, 51]
+            } else {
+                [0, 0, 0, 107]
+            },
+        }),
+    }
+}
 fn icon_svg(icon: gpui_kit::assets::IconName, x: f64, y: f64, size: f64, color: &str) -> String {
     let Ok(Some(bytes)) = gpui_kit::assets::AllAssets.load(&icon.path()) else {
         return String::new();
@@ -349,6 +389,7 @@ impl StageProgramRailPane {
             json!({"op":"stage.program.play","slotIndex":card["slotIndex"]})
         };
         let video_command = json!({"op":"stage.program.video","trackID":card["trackID"]});
+        let effects = card_effects(card, catalog);
         let scroll = self.scroll.clone();
         let view = cx.weak_entity();
         let width = transform.width as f32;
@@ -367,13 +408,17 @@ impl StageProgramRailPane {
             move |bounds, window, _| {
                 let viewport = scroll.bounds();
                 let origin = [
-                    f64::from(f32::from(bounds.origin.x)) + offset,
+                    f64::from(f32::from(bounds.origin.x)),
                     f64::from(f32::from(bounds.origin.y)),
                 ];
                 let mask = RailMask {
                     top: f64::from(f32::from(viewport.origin.y)),
                     height: f64::from(f32::from(viewport.size.height)),
                 };
+                let phase=if catalog {0.}else{scroll_phase(f64::from(f32::from(bounds.origin.y)),transform.height,mask.top,mask.height)};
+                let amount=phase.abs();
+                let transition=if catalog {None}else{Some(ScrollTransition{scale:1.-0.1*amount,degrees:phase*-13.,axis:[1.,0.16,0.],perspective:0.72,offset_before:[offset,0.]})};
+                let opacity=opacity*(1.-0.44*amount);
                 let corners = [
                     [0., 0.],
                     [transform.width, 0.],
@@ -389,7 +434,8 @@ impl StageProgramRailPane {
                     .iter()
                     .map(|p| p[1] + origin[1])
                     .fold(f64::NEG_INFINITY, f64::max);
-                if bottom <= mask.top || top >= mask.top + mask.height {
+                let padding=(effects.shadow.as_ref().map_or(0.,|shadow|shadow.radius*3.+shadow.offset[1].abs())+effects.blur_radius*3.)*transform.scale;
+                if bottom+padding <= mask.top || top-padding >= mask.top + mask.height {
                     cache.borrow_mut().remove(&cache_id);
                     return None;
                 }
@@ -398,7 +444,7 @@ impl StageProgramRailPane {
                     f64::from(f32::from(window.viewport_size().height)),
                 ];
                 let cache_key = format!(
-                    "{:p}/{transform:?}/{origin:?}/{window_size:?}/{}/{opacity}/{mask:?}",
+                    "{:p}/{transform:?}/{origin:?}/{window_size:?}/{}/{opacity}/{mask:?}/{transition:?}/{effects:?}",
                     Arc::as_ptr(&texture),
                     window.scale_factor()
                 );
@@ -411,7 +457,7 @@ impl StageProgramRailPane {
                     return Some((projected.clone(), image.clone()));
                 }
                 let projected = Arc::new(
-                    ProjectedCard::render(
+                    ProjectedCard::render_with_effects(
                         &texture,
                         transform,
                         origin,
@@ -419,6 +465,8 @@ impl StageProgramRailPane {
                         window.scale_factor() as f64,
                         opacity,
                         Some(mask),
+                        transition,
+                        effects,
                     )
                     .ok()?,
                 );
@@ -797,8 +845,8 @@ fn active_center_offset(index: usize, viewport: f32, maximum: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        PROGRAM_SPACING, TRACK_SPACING, active_center_offset, card_priority, card_svg,
-        card_transform, energy_height, snap_offset,
+        PROGRAM_SPACING, TRACK_SPACING, active_center_offset, card_effects, card_priority,
+        card_svg, card_transform, energy_height, scroll_phase, snap_offset,
     };
     use serde_json::json;
     #[test]
@@ -833,6 +881,34 @@ mod tests {
         });
         cx.update_window(projected.into(), |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
+        let track_pane = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let stored = track_pane.clone();
+        let tracks=cx.add_window(move|window,cx|{
+            let pane=cx.new(|cx|{
+                let mut pane=super::StageProgramRailPane::new(window,cx);
+                pane.snapshot=json!({"route":"tracks","tracks":[{"slotIndex":0,"trackID":"phase-only","title":"整内容投影","artist":"字段","isCurrent":true,"hasBoundVideo":true,"scale":1.,"relativeIndex":0}],"audioFeatures":{"amplitude":0.5}});
+                pane
+            });
+            *stored.borrow_mut()=Some(pane.clone());
+            gpui_kit::base::Root::new(pane,window,cx)
+        });
+        cx.update_window(tracks.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        cx.update_window(tracks.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        cx.update(|cx| {
+            assert!(
+                !track_pane
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .projection_cache
+                    .borrow()
+                    .is_empty(),
+                "real track draw must render the full projected image, not an empty canvas"
+            )
+        });
         cx.update_window(projected.into(), |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
     }
@@ -899,6 +975,38 @@ mod tests {
         let card = json!({"isFocused":true,"scale":0.89,"depth":-144,"opacity":0.68});
         assert!((card_transform(&card, false).scale - 0.945).abs() < 1e-12);
         assert_eq!(card["opacity"], 0.68);
+    }
+    #[test]
+    fn scroll_transition_phase_uses_real_viewport_overlap() {
+        assert_eq!(scroll_phase(100., 76., 100., 300.), 0.);
+        assert_eq!(scroll_phase(62., 76., 100., 300.), -0.5);
+        assert_eq!(scroll_phase(362., 76., 100., 300.), 0.5);
+        assert_eq!(scroll_phase(-100., 76., 100., 300.), -1.);
+        assert_eq!(scroll_phase(500., 76., 100., 300.), 1.);
+        let phase = scroll_phase(362., 76., 100., 300.);
+        assert_eq!(phase * -13., -6.5);
+        assert_eq!(1. - 0.1 * phase.abs(), 0.95);
+        assert_eq!(1. - 0.44 * phase.abs(), 0.78);
+    }
+    #[test]
+    fn original_shadow_and_outer_blur_parameters_remain_independent_of_layout() {
+        let current = card_effects(&json!({"isCurrent":true}), false);
+        assert_eq!(current.blur_radius, 0.);
+        let shadow = current.shadow.unwrap();
+        assert_eq!(
+            (shadow.radius, shadow.offset, shadow.rgba),
+            (24., [0., 7.], [0, 255, 255, 51])
+        );
+        assert_eq!(
+            card_effects(&json!({"relativeIndex":-5}), false).blur_radius,
+            0.32
+        );
+        assert_eq!(
+            card_effects(&json!({"relativeIndex":2,"isFocused":true}), false).blur_radius,
+            0.
+        );
+        let catalog = card_effects(&json!({}), true).shadow.unwrap();
+        assert_eq!((catalog.radius, catalog.rgba), (13., [0, 0, 0, 97]));
     }
     #[test]
     fn complete_card_content_rasterizes_before_projecting() {
