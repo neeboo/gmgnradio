@@ -244,7 +244,7 @@ impl AgentSettingsPane {
                 })
                 .child(div().text_sm().child("支持 HTTPS 地址指向 VRM、ZIP 或 gmgnpet 模型包。"))
                 .child(Input::new(&input));
-            if let Some(notice)=notice{body=body.child(div().text_xs().child(notice));}
+            if let Some(notice)=notice{body=body.child(div().flex().items_center().gap_1().text_xs().text_color(cx.theme().danger).child(Icon::new(IconName::CircleAlert).size(px(14.))).child(notice));}
             dialog.w(px(460.)).h(px(230.)).p(px(24.)).title("从链接导入角色").close_button(false).overlay_closable(false).child(body)
                 .footer(div().flex().justify_end().items_center().gap_2().capture_key_down(move|event,window,cx|{
                     if event.keystroke.key=="escape"{_=escape_footer.update(cx,|this,cx|{this.import_link_open=false;cx.notify();});window.close_dialog(cx);cx.stop_propagation();}
@@ -342,6 +342,8 @@ impl AgentSettingsPane {
                     this.commands.push(json!({"op":"tts.stop"}));this.draft["tts"]["voiceID"]=current;cx.notify();
                 }
             }
+        }),cx.subscribe(&extra_inputs[0],|this,_,event:&InputEvent,cx|{
+            if matches!(event,InputEvent::Change)&&this.initialized{this.commands.push(json!({"op":"speech.settings.cancel","clearVoices":true,"cancelCapabilities":false}));cx.notify();}
         }),cx.subscribe(&extra_inputs[5],|this,_,event:&InputEvent,cx|{
             if matches!(event,InputEvent::Change)&&this.initialized{this.commands.push(json!({"op":"space.prop.cancel","clearNotice":true}));cx.notify();}
         }),cx.subscribe(&extra_inputs[6],|this,_,event:&InputEvent,cx|{
@@ -377,6 +379,7 @@ impl AgentSettingsPane {
         std::mem::take(&mut self.commands)
     }
     pub fn select_page(&mut self, page: &str, cx: &mut Context<Self>) {
+        if self.page==4&&!matches!(page,"agent"|"dj"){self.commands.push(json!({"op":"speech.settings.cancel"}));}
         if self.page==2{self.commands.push(json!({"op":"space.prop.cancel"}));}
         if self.page == 3 {
             self.commands.push(json!({"op":"shortcuts.cancel"}));
@@ -391,12 +394,13 @@ impl AgentSettingsPane {
         if self.page == 0 {
             self.commands.push(json!({"op":"presence.load"}));
         }
+        if self.page==4{self.commands.push(json!({"op":"speech.settings.load"}));}
         cx.notify();
     }
     pub fn dismissed(&mut self, cx: &mut Context<Self>) {
         self.commands.push(json!({"op":"space.prop.cancel"}));
         self.commands.push(json!({"op":"shortcuts.cancel"}));
-        self.commands.push(json!({"op":"tts.stop"}));
+        self.commands.push(json!({"op":"speech.settings.cancel"}));
         cx.notify();
     }
     pub fn update_snapshot(
@@ -541,6 +545,7 @@ impl AgentSettingsPane {
                     ))
                 } else {
                     let mut name = v.get("name")?.as_str()?.to_owned();
+                    if key=="models"&&v["id"]==self.snapshot[section]["defaultModelID"]{name.push_str("（默认）");}
                     if v.get("installed").and_then(Value::as_bool) == Some(false) {
                         name.push_str("（未安装）");
                     }
@@ -567,8 +572,8 @@ impl AgentSettingsPane {
                 value
                     .as_str()
                     .filter(|s| !s.is_empty())
-                    .unwrap_or("请选择")
-                    .into()
+                    .map(|raw|if field=="modelID"{"旧模型不受支持，请重新选择".to_owned()}else if field=="voiceID"{format!("当前声音（{raw}）")}else{raw.to_owned()})
+                    .unwrap_or_else(||if field=="modelID"{"正在加载模型选项".to_owned()}else{"请选择".to_owned()})
             });
         let weak = cx.entity().downgrade();
         div()
@@ -581,7 +586,7 @@ impl AgentSettingsPane {
                 Button::new(id)
                     .label(selected)
                     .dropdown_caret(true)
-                    .disabled(items.is_empty())
+                    .disabled(items.is_empty()||(section=="tts"&&field=="voiceID"&&self.snapshot["tts"]["loading"].as_bool()==Some(true)))
                     .dropdown_menu(move |mut menu, _, _| {
                         for (value, name) in &items {
                             let weak = weak.clone();
@@ -650,23 +655,26 @@ impl AgentSettingsPane {
         }
         let group = |title: &'static str| SettingsGroup::new(title, border);
         form=form.child(group("DJ 内核")
-            .child(div().flex().justify_between().child(div().flex().flex_col().child("gmgn DJ").child(match self.snapshot["agent"]["codexState"].as_str(){Some("signedIn")=>"已登录",Some("unavailable")=>"未安装",_=>"未登录"}))
+            .child(div().flex().items_center().gap(px(12.)).child(div().size(px(32.)).rounded_lg().bg(cx.theme().muted).flex().items_center().justify_center().child(Icon::new(IconName::Terminal).size(px(20.))))
+                .child(div().flex_1().flex().flex_col().child("gmgn DJ").child(match self.snapshot["agent"]["codexState"].as_str(){Some("signedIn")=>"已登录",Some("unavailable")=>"未安装",_=>"未登录"}))
                 .child(Button::new("codex-login").label(if self.snapshot["agent"]["codexState"].as_str()==Some("signedIn"){"退出登录"}else{"登录"})
                     .disabled(self.snapshot["agent"]["working"].as_bool()==Some(true)||self.snapshot["agent"]["codexState"].as_str()==Some("unavailable"))
                     .on_click(cx.listener(|this,_,_,_|this.commands.push(json!({"op":if this.snapshot["agent"]["codexState"].as_str()==Some("signedIn"){"agent.logout"}else{"agent.login"}}))))))
+            .child(div().text_xs().child("Codex 提供策划和推理能力；它与下面的声音共同属于同一个 DJ。"))
             .child(self.toggle("takeover","允许 DJ 自动接管","takeoverEnabled",cx))
             .child(div().text_xs().child("可以自主切歌、暂停、继续、重排节目和调整视觉。"))
             .child(div().flex().justify_between().items_center().child("策划模型").child(div().w(px(220.)).child(Input::new(&self.inputs[2])))))
             .child(group("DJ 人格与偏好").child(div().h(px(150.)).min_h(px(150.)).flex_shrink_0()
                 .child(Textarea::new(&self.personas[1]).h(px(150.)).aria_label("DJ 人格与偏好").accessibility_id("dj-host-prompt")))
-            .child(div().flex().justify_between().items_center().child(div().flex_1().text_sm().child("用自然语言告诉 DJ 怎么策划和主持。"))
-                .child(Button::new("save-dj").label("保存").on_click(cx.listener(|this,_,_,cx|this.commands.push(json!({"op":"agent.save","hostPrompt":this.personas[1].read(cx).value().to_string()})))))))
+            .child(div().flex().justify_between().items_center().gap_3().child(div().flex_1().min_w(px(0.)).text_sm().child("用自然语言告诉 DJ 怎么策划和主持。"))
+                .child(Button::new("save-dj").flex_shrink_0().primary().label("保存").on_click(cx.listener(|this,_,_,cx|this.commands.push(json!({"op":"agent.save","hostPrompt":this.personas[1].read(cx).value().to_string()})))))))
             .child(group("居民人格").child(div().h(px(120.)).min_h(px(120.)).flex_shrink_0()
                 .child(Textarea::new(&self.personas[0]).h(px(120.)).aria_label("居民人格").accessibility_id("resident-persona")))
-            .child(div().flex().justify_between().items_center().child(div().flex_1().text_sm().child("只影响居民，和上面的 DJ 偏好分开。人格只改语气和关注点，不改变它能做什么。"))
-                .child(Button::new("save-resident").label("保存").on_click(cx.listener(|this,_,_,cx|this.commands.push(json!({"op":"agent.save","residentPersona":this.personas[0].read(cx).value().to_string()})))))))
+            .child(div().flex().justify_between().items_center().gap_3().child(div().flex_1().min_w(px(0.)).text_sm().child("只影响居民，和上面的 DJ 偏好分开。人格只改语气和关注点，不改变它能做什么。"))
+                .child(Button::new("save-resident").flex_shrink_0().primary().label("保存").on_click(cx.listener(|this,_,_,cx|this.commands.push(json!({"op":"agent.save","residentPersona":this.personas[0].read(cx).value().to_string()})))))))
             .child(group("聊天模型")
             .child(self.dropdown("backend","模型","agent","backendID",self.options("agent","backends"),cx))
+            .children(self.snapshot["agent"]["backendStatus"].as_str().map(|status|div().text_xs().child(status.to_owned())))
             .child(div().text_xs().child("空间和 Live Cam 共用这里选定的 Agent；文字和语音转写进入同一个会话。"))
             .child(self.toggle("autonomy","允许居民自主安排活动","autonomyEnabled",cx))
             .child(div().text_xs().child("打开后，居民会自己观察和行动，会消耗模型额度。设为 0 就不再新起一轮，要先停下请按停止。"))
@@ -684,6 +692,7 @@ impl AgentSettingsPane {
                 .child(Button::new("custom-voice-disclosure").label("自定义音色 ID").icon(if self.custom_voice_open{IconName::ChevronDown}else{IconName::ChevronRight}).on_click(cx.listener(|this,_,_,cx|{this.custom_voice_open=!this.custom_voice_open;cx.notify();})))
                 .content(div().flex().flex_col().gap_2().child(Input::new(&self.inputs[3])).child(div().text_xs().child("填写该服务已有的音色 ID，无需重新上传；账号、模型及服务区域须与创建音色时一致。"))))
             .child(self.dropdown("tts-model","模型","tts","modelID",self.options("tts","models"),cx))
+            .children((self.snapshot["tts"]["catalogLoaded"].as_bool()==Some(true)&&!valid_model).then(||div().text_xs().child("原配置模型不在当前支持列表中，请选择后保存；不会自动改用其他模型。")))
             .child(if self.snapshot["tts"]["credentialConfigured"].as_bool()==Some(true) { "沿用原应用已配置凭据" } else { "该服务尚未配置凭据，请填写后保存" })
             .child(div().flex().flex_wrap().gap_2()
                 .child(Button::new("save-tts").label("保存配置").disabled(!valid_model).on_click(cx.listener(|this,_,_,cx|this.tts_action("tts.save",cx)))))
@@ -694,6 +703,7 @@ impl AgentSettingsPane {
             .child(self.dropdown("asr-provider","服务","asr","providerID",self.options("asr","providers"),cx))
             .child(div().flex().items_center().justify_between().child("API Key").child(div().w(px(280.)).child(Input::new(&self.extra_inputs[1]).aria_label("新的 ASR API Key"))))
             .child(self.dropdown("asr-model","模型","asr","modelID",self.options("asr","models"),cx))
+            .children((self.snapshot["asr"]["catalogLoaded"].as_bool()==Some(true)&&!self.snapshot["asr"]["models"].as_array().is_some_and(|models|models.iter().any(|model|model["id"]==self.draft["asr"]["modelID"]))).then(||div().text_xs().child("原配置模型不在当前支持列表中，请选择后保存；不会自动改用其他模型。")))
             .child(Button::new("save-asr").label("保存配置").disabled(!self.snapshot["asr"]["models"].as_array().is_some_and(|models|models.iter().any(|model|model["id"]==self.draft["asr"]["modelID"]))).on_click(cx.listener(|this,_,_,cx|{
                 let mut value=this.draft["asr"].clone();value["op"]=json!("asr.save");value["apiKey"]=json!(this.extra_inputs[1].read(cx).value().to_string());this.commands.push(value);
             })))
@@ -825,6 +835,10 @@ impl AgentSettingsPane {
                 if let Some(notice) = self.snapshot["presence"]["motionNotice"].as_str() {
                     motions = motions.child(div().text_xs().child(notice.to_owned()));
                 }
+                if !self.motion_category.is_empty()&&self.snapshot["presence"]["motionNotice"].is_null()
+                    &&!self.snapshot["presence"]["motions"].as_array().into_iter().flatten().any(|m|m["category"].as_str()==Some(&self.motion_category)){
+                    motions=motions.child(div().text_xs().child("这个分类下暂无当前角色可用的动作。"));
+                }
                 for motion in self.snapshot["presence"]["motions"]
                     .as_array()
                     .into_iter()
@@ -852,6 +866,7 @@ impl AgentSettingsPane {
                                 .justify_center()
                                 .rounded_lg()
                                 .bg(cx.theme().muted)
+                                .text_color(if compatible{cx.theme().primary}else{cx.theme().muted_foreground})
                                 .child(Icon::new(IconName::Activity).size(px(20.))),
                         )
                         .child(
@@ -865,7 +880,7 @@ impl AgentSettingsPane {
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
+                                        .text_color(if compatible{cx.theme().muted_foreground}else{cx.theme().warning})
                                         .child(format!(
                                             "{}{}",
                                             motion_format(motion["format"].as_str().unwrap_or("")),
@@ -1279,6 +1294,7 @@ impl Render for AgentSettingsPane {
                             .selected_index(self.page)
                             .children(titles.map(|title| Tab::new().flex_1().min_w(px(0.)).text_xs().label(title)))
                             .on_click(cx.listener(|this, index: &usize, _, cx| {
+                                if this.page==4&&*index!=4{this.commands.push(json!({"op":"speech.settings.cancel"}));}
                                 if this.page==2&&*index!=2{this.commands.push(json!({"op":"space.prop.cancel"}));}
                                 if this.page == 3 && *index != 3 {
                                     this.commands.push(json!({"op":"shortcuts.cancel"}));
@@ -1287,6 +1303,7 @@ impl Render for AgentSettingsPane {
                                 if *index == 0 {
                                     this.commands.push(json!({"op":"presence.load"}));
                                 }
+                                if *index==4{this.commands.push(json!({"op":"speech.settings.load"}));}
                                 cx.notify();
                             })),
                     ),

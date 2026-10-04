@@ -13,18 +13,11 @@ fn project_card(card: &Value) -> CardProjection {
     let focused = card["isFocused"]
         .as_bool()
         .unwrap_or(card["isCurrent"].as_bool() == Some(true));
-    let scale = card["scale"].as_f64().unwrap_or(1.) as f32 + if focused { 0.055 } else { 0. };
-    let depth = card["depth"].as_f64().unwrap_or(0.) as f32;
-    let perspective = 500. / (500. - depth);
-    let relative = card["relativeIndex"].as_i64().unwrap_or(0).clamp(-2, 2);
-    let angle = if focused {
-        -4.
-    } else {
-        -10. - relative as f32 * 2.5
-    };
+    // Swift applies scale/3D rotation after layout, not by shrinking the
+    // measured card. GPUI's 2D div cannot faithfully reproduce that projection.
     CardProjection {
-        width: 294. * scale * perspective * angle.to_radians().cos(),
-        height: 76. * scale,
+        width: 294.,
+        height: 76.,
         opacity: if focused {
             1.
         } else {
@@ -40,12 +33,16 @@ fn energy_height(energy: f32, index: usize) -> f32 {
 pub struct StageProgramRailPane {
     snapshot: Value,
     commands: Vec<Value>,
+    scroll: ScrollHandle,
+    center_active: bool,
 }
 impl StageProgramRailPane {
     pub fn new(_window: &mut Window, _cx: &mut Context<Self>) -> Self {
         Self {
             snapshot: Value::Null,
             commands: vec![json!({"op":"stage.program.load"})],
+            scroll: ScrollHandle::new(),
+            center_active: true,
         }
     }
     pub fn update_snapshot(
@@ -55,6 +52,21 @@ impl StageProgramRailPane {
         cx: &mut Context<Self>,
     ) {
         if self.snapshot != snapshot {
+            let active = |state: &Value| {
+                state["tracks"]
+                    .as_array()
+                    .and_then(|cards| {
+                        cards
+                            .iter()
+                            .find(|card| card["isCurrent"].as_bool() == Some(true))
+                    })
+                    .map(|card| card["slotIndex"].clone())
+            };
+            if self.snapshot["route"] != snapshot["route"]
+                || active(&self.snapshot) != active(&snapshot)
+            {
+                self.center_active = true;
+            }
             self.snapshot = snapshot;
             cx.notify();
         }
@@ -77,26 +89,83 @@ impl StageProgramRailPane {
             }))
             .into_any_element()
     }
+    fn icon_button(
+        &self,
+        id: impl Into<ElementId>,
+        icon: gpui_kit::assets::IconName,
+        tooltip: &'static str,
+        command: Value,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        Button::new(id)
+            .icon(icon)
+            .tooltip(tooltip)
+            .w(px(26.))
+            .h(px(26.))
+            .rounded_full()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.commands.push(command.clone());
+                cx.notify();
+            }))
+            .into_any_element()
+    }
 }
 impl Render for StageProgramRailPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tracks = self.snapshot["route"]
             .as_str()
             .is_some_and(|r| r != "programs");
-        let mut content = div().flex().flex_col().gap_2();
+        let mut content = div()
+            .flex()
+            .flex_col()
+            .items_end()
+            .gap(px(if tracks { -7. } else { 8. }))
+            .py(px(18.));
+        let mut header = div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px(px(14.))
+            .w_full();
         if tracks {
-            content = content.child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .child(self.button(
-                        "program-back",
-                        "‹ 返回歌单",
-                        json!({"op":"stage.program.back"}),
-                        cx,
-                    ))
-                    .child(self.snapshot["title"].as_str().unwrap_or("").to_owned()),
-            );
+            header = header
+                .child(self.icon_button(
+                    "program-back",
+                    gpui_kit::assets::IconName::ChevronLeft,
+                    "返回节目单",
+                    json!({"op":"stage.program.back"}),
+                    cx,
+                ))
+                .child(div().flex_1())
+                .child(self.snapshot["title"].as_str().unwrap_or("").to_uppercase());
+            if self.snapshot["isPlaylist"].as_bool() != Some(true) {
+                header = header.child(self.icon_button(
+                    "program-replan",
+                    gpui_kit::assets::IconName::RefreshCw,
+                    "重新编排",
+                    json!({"op":"stage.program.replan"}),
+                    cx,
+                ));
+            }
+            if self.center_active {
+                if let Some(index) = self.snapshot["tracks"].as_array().and_then(|cards| {
+                    cards
+                        .iter()
+                        .position(|card| card["isCurrent"].as_bool() == Some(true))
+                }) {
+                    let scroll = self.scroll.clone();
+                    window.on_next_frame(move |window, _| {
+                        let viewport: f32 = scroll.bounds().size.height.into();
+                        let maximum: f32 = scroll.max_offset().y.into();
+                        scroll.set_offset(point(
+                            px(0.),
+                            px(active_center_offset(index, viewport, maximum.abs())),
+                        ));
+                        window.refresh();
+                    });
+                }
+                self.center_active = false;
+            }
             for card in self.snapshot["tracks"].as_array().into_iter().flatten() {
                 let index = card["slotIndex"].clone();
                 let projection = project_card(card);
@@ -169,7 +238,9 @@ impl Render for StageProgramRailPane {
                     .id(format!("track-{index}"))
                     .w(px(projection.width))
                     .h(px(projection.height))
-                    .ml(px(projection.offset))
+                    .relative()
+                    .left(px(projection.offset))
+                    .flex_shrink_0()
                     .opacity(projection.opacity)
                     .px(px(14.))
                     .rounded(px(23.))
@@ -220,12 +291,21 @@ impl Render for StageProgramRailPane {
                 if card["hasBoundVideo"].as_bool() == Some(true)
                     && card["isCurrent"].as_bool() == Some(true)
                 {
-                    row = row.child(self.button(
-                        format!("track-video-{index}"),
-                        "播放绑定视频",
-                        json!({"op":"stage.program.video","trackID":card["trackID"]}),
-                        cx,
-                    ));
+                    row = row.child(
+                        div()
+                            .absolute()
+                            .right(px(9.))
+                            .top(px(8.))
+                            .w(px(26.))
+                            .h(px(26.))
+                            .child(self.icon_button(
+                                format!("track-video-{index}"),
+                                gpui_kit::assets::IconName::Video,
+                                "播放这首歌绑定的视频",
+                                json!({"op":"stage.program.video","trackID":card["trackID"]}),
+                                cx,
+                            )),
+                    );
                 }
                 content = content.child(row);
             }
@@ -234,14 +314,6 @@ impl Render for StageProgramRailPane {
                     "program-load-more",
                     "加载更多",
                     json!({"op":"stage.program.more"}),
-                    cx,
-                ));
-            }
-            if self.snapshot["isPlaylist"].as_bool() != Some(true) {
-                content = content.child(self.button(
-                    "program-replan",
-                    "重新编排",
-                    json!({"op":"stage.program.replan"}),
                     cx,
                 ));
             }
@@ -257,7 +329,16 @@ impl Render for StageProgramRailPane {
                 );
             }
         } else {
-            content = content.child(div().text_base().child("歌单"));
+            header = header
+                .child(self.icon_button(
+                    "program-replan",
+                    gpui_kit::assets::IconName::RefreshCw,
+                    "重新编排",
+                    json!({"op":"stage.program.replan"}),
+                    cx,
+                ))
+                .child(div().flex_1())
+                .child("歌单");
             for (key, op) in [
                 ("programs", "stage.program.open"),
                 ("playlists", "stage.playlist.open"),
@@ -267,8 +348,9 @@ impl Render for StageProgramRailPane {
                     content = content.child(
                         div()
                             .w(px(306.))
-                            .min_h(px(74.))
-                            .p_3()
+                            .h(px(74.))
+                            .flex_shrink_0()
+                            .px(px(14.))
                             .rounded(px(22.))
                             .bg(rgb(0x1c252d))
                             .border_1()
@@ -307,30 +389,49 @@ impl Render for StageProgramRailPane {
             .h(px(430.))
             .pt(px(42.))
             .pr(px(10.))
+            .flex()
+            .flex_col()
+            .gap(px(8.))
             .text_color(rgb(0xe5e7ea))
+            .child(header)
             .child(
                 div()
                     .id("stage-program-scroll")
-                    .size_full()
+                    .w_full()
+                    .flex_1()
+                    .min_h(px(0.))
                     .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
                     .child(content),
             )
     }
 }
 
+fn active_center_offset(index: usize, viewport: f32, maximum: f32) -> f32 {
+    -(18. + index as f32 * (76. - 7.) + 38. - viewport / 2.).clamp(0., maximum)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{energy_height, project_card};
+    use super::{active_center_offset, energy_height, project_card};
     use serde_json::json;
     #[test]
-    fn real_depth_and_scale_reduce_distant_cards() {
+    fn visual_depth_does_not_change_original_card_layout() {
         let current = project_card(&json!({"isCurrent":true,"scale":1.,"depth":0,"opacity":1.}));
         let distant = project_card(
             &json!({"isCurrent":false,"scale":0.89,"depth":-144,"opacity":0.68,"relativeIndex":2}),
         );
-        assert!(distant.width < current.width);
-        assert!(distant.height < current.height);
+        assert_eq!(distant.width, 294.);
+        assert_eq!(current.width, 294.);
+        assert_eq!(distant.height, 76.);
+        assert_eq!(current.height, 76.);
         assert_eq!(distant.opacity, 0.68);
+    }
+    #[test]
+    fn active_card_centers_using_original_overlap_and_margins() {
+        assert_eq!(active_center_offset(0, 300., 900.), 0.);
+        assert_eq!(active_center_offset(4, 300., 900.), -182.);
+        assert_eq!(active_center_offset(30, 300., 900.), -900.);
     }
     #[test]
     fn focus_restores_visibility_without_mutating_host_card() {

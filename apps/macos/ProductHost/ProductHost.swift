@@ -32,6 +32,7 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
         runtime = AppDelegate()
         super.init()
         runtime.gpuiOpenSettings = { [weak self] in _ = self?.action("showSettings") }
+        runtime.gpuiNavigate = { [weak self] action in _ = self?.action(action) }
         runtime.gpuiResidentRecovery = { [weak self] submission, notice in
             guard let self, let id = submissions[submission.id], !completed.contains(submission.id) else { return }
             completed.insert(submission.id)
@@ -218,6 +219,8 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
     func action(_ action: String) -> Bool {
         guard started, !stopped else { return false }
         switch action {
+        case "toggleStage":
+            return self.action(navigationMode == "liveCam" ? "showStage" : "showLiveCam")
         case "showLiveCam":
             guard runtime.gpuiDesktopPresenceSnapshot()["hasAvatar"] as? Bool == true else {
                 navigationPanel = "presenceGuidance"
@@ -394,6 +397,7 @@ private final class GPUIProductSettings {
     private var loadingCapabilities = false
     private var loadingVoices = false
     private var generation: UInt64 = 0
+    private var asrDraftProvider: RustVoiceProvider?
 
     init(runtime: AppDelegate) {
         self.runtime = runtime
@@ -419,6 +423,7 @@ private final class GPUIProductSettings {
         var result: [String: Any] = [
             "agent": [
                 "backendID": service.effectiveBackendID.rawValue,
+                "backendStatus": agent.conversationBackendStatusText,
                 "backends": AgentConversationBackends.all.map { backend in
                     ["id": backend.kind.rawValue, "name": backend.displayName,
                      "installed": installed.contains(backend.kind)] as [String: Any]
@@ -445,16 +450,18 @@ private final class GPUIProductSettings {
                 "isSpeaking": previewStatus.isSpeaking,
                 "credentialConfigured": credentialConfigured,
                 "catalogLoaded": capabilities != nil,
+                "defaultModelID": providerCaps?.defaultTTSModel as Any? ?? NSNull(),
             ],
         ]
         for (key, value) in parity.snapshot { result[key] = value }
-        let asr = speech.configuration(for: "asr", includesEnvironment: false)
+        let asr = asrDraftProvider.map { speech.configuration(provider: $0, for: "asr", includesEnvironment: false) }
+            ?? speech.configuration(for: "asr", includesEnvironment: false)
         let asrCaps = capabilities?.providers.first(where: { $0.id == asr.provider.rawValue })
-        result["asr"] = ["providerID": asr.provider.rawValue, "modelID": asr.model ?? "",
+        result["asr"] = ["providerID": asr.provider.rawValue, "modelID": asr.model ?? asrCaps?.defaultASRModel ?? "",
             "providers": capabilities?.providers.filter { !$0.asrModels.isEmpty }.map { ["id": $0.id, "name": providerName($0.id)] } ?? [],
             "models": (asrCaps?.asrModels ?? []).map { ["id": $0.id, "name": $0.name] },
-            "credentialConfigured": !speech.configuration(for: "asr").apiKey.isEmpty,
-            "catalogLoaded": capabilities != nil, "captureTestPaused": true] as [String: Any]
+            "credentialConfigured": !speech.configuration(provider: asr.provider, for: "asr").apiKey.isEmpty,
+            "catalogLoaded": capabilities != nil, "defaultModelID": asrCaps?.defaultASRModel as Any? ?? NSNull(), "captureTestPaused": true] as [String: Any]
         var agentValue = result["agent"] as? [String: Any] ?? [:]
         agentValue["codexState"] = agent.codexState.isSignedIn ? "signedIn" : agent.codexState == .unavailable ? "unavailable" : "signedOut"
         agentValue["working"] = agent.isWorking
@@ -478,7 +485,11 @@ private final class GPUIProductSettings {
                 else if op == "agent.logout" { await agent.disconnectCodex() }
                 else { await agent.refresh() }
             }
-        case "asr.provider", "asr.save":
+        case "asr.provider":
+            guard let raw = value["id"] as? String, let selected = RustVoiceProvider(rawValue: raw),
+                  capabilities?.providers.contains(where: { $0.id == raw && !$0.asrModels.isEmpty }) == true else { return false }
+            asrDraftProvider = selected
+        case "asr.save":
             guard let raw = (value["providerID"] ?? value["id"]) as? String,
                   let selected = RustVoiceProvider(rawValue: raw),
                   let caps = capabilities?.providers.first(where: { $0.id == raw }), !caps.asrModels.isEmpty else { return false }
@@ -488,6 +499,7 @@ private final class GPUIProductSettings {
             let replacement = (value["apiKey"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             speech.save(RustVoiceConfiguration(provider: selected, apiKey: replacement.isEmpty ? old.apiKey : replacement,
                 voiceID: old.voiceID, model: chosen), for: "asr")
+            asrDraftProvider = selected
         case "agent.save":
             // Use the original model validation/persistence and notify the
             // original runtime. No credentials, provider or login override.
@@ -544,6 +556,13 @@ private final class GPUIProductSettings {
                 synthesizer.speak("你好，这是当前选中的声音。欢迎来到你的生活空间。")
             }
         case "tts.stop": preview?.stopSpeaking(); preview = nil
+        case "speech.settings.cancel":
+            stopVoiceWork()
+            if value["cancelCapabilities"] as? Bool != false {
+                capabilitiesTask?.cancel(); capabilitiesTask = nil; loadingCapabilities = false
+            }
+            if value["clearVoices"] as? Bool == true { voices = []; notice = nil }
+        case "speech.settings.load": loadCapabilities()
         default: return parity.command(value)
         }
         return true

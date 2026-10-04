@@ -61,13 +61,14 @@ struct Scene<'a> {
     primary: String,
     accent: String,
     secondary: String,
-    outlines: HashMap<(String, u64, u16, u64), outline::Line>,
+    outlines: HashMap<(String, u64, u16, u64, bool), outline::Line>,
     weight: u16,
     tracking: f64,
     projection: Option<(f64, f64, f64, (f64, f64, f64), f64)>,
     panel: Option<PanelTransform>,
     local: Option<(f64, f64, f64, f64)>,
     text_filter: String,
+    italic: bool,
 }
 #[derive(Clone, Copy, Debug)]
 struct PanelTransform {
@@ -100,6 +101,22 @@ impl PanelTransform {
             x: self.position.x + self.scale_anchor.x + (point.x - self.scale_anchor.x) * self.scale,
             y: self.position.y + self.scale_anchor.y + (point.y - self.scale_anchor.y) * self.scale,
         }
+    }
+}
+fn confession_panel(width: f64, height: f64) -> PanelTransform {
+    PanelTransform {
+        anchor: outline::Point {
+            x: 0.,
+            y: height / 2.,
+        },
+        angle: -4.,
+        axis: (0.02, 1., 0.),
+        perspective: 0.76,
+        width: width * 0.78 + (width * 0.08).max(62.),
+        rotation: 0.,
+        scale: 1.,
+        scale_anchor: outline::Point::default(),
+        position: outline::Point::default(),
     }
 }
 #[derive(Clone, Copy, Debug)]
@@ -196,6 +213,7 @@ impl<'a> Scene<'a> {
             panel: None,
             local: None,
             text_filter: "url(#textShadow)".to_owned(),
+            italic: false,
             svg,
         }
     }
@@ -277,8 +295,9 @@ impl<'a> Scene<'a> {
         }
         let _ = write!(
             self.svg,
-            r#"<text x="{x}" y="{y}" text-anchor="{anchor}" dominant-baseline="middle" font-family="system-ui, PingFang SC, sans-serif" font-size="{size}" font-weight="{}" letter-spacing="{}" fill="{color}" opacity="{opacity}">{}</text>"#,
+            r#"<text x="{x}" y="{y}" text-anchor="{anchor}" dominant-baseline="middle" font-family="system-ui, PingFang SC, sans-serif" font-size="{size}" font-weight="{}" font-style="{}" letter-spacing="{}" fill="{color}" opacity="{opacity}">{}</text>"#,
             self.weight,
+            if self.italic { "italic" } else { "normal" },
             self.tracking,
             escape(text)
         );
@@ -289,11 +308,12 @@ impl<'a> Scene<'a> {
             size.to_bits(),
             self.weight,
             self.tracking.to_bits(),
+            self.italic,
         );
         if let Some(line) = self.outlines.get(&key) {
             return Some(line.clone());
         }
-        let line = outline::shape_styled(text, size, self.weight, self.tracking)?;
+        let line = outline::shape_font(text, size, self.weight, self.tracking, self.italic)?;
         self.outlines.insert(key, line.clone());
         Some(line)
     }
@@ -486,6 +506,8 @@ impl<'a> Scene<'a> {
     }
     fn glyphs(&mut self, cx: f64, cy: f64, size: f64, arc: bool) {
         let previous_style = (self.weight, self.tracking);
+        let previous_filter = self.text_filter.clone();
+        self.text_filter = "none".to_owned();
         let projection = self.projection;
         self.weight = 700;
         self.tracking = size * -0.018;
@@ -516,6 +538,12 @@ impl<'a> Scene<'a> {
             let phase = glyph["phase"].as_str().unwrap_or("waiting");
             let progress = num(glyph, "progress", 0.).clamp(0., 1.);
             let pulse = (progress * std::f64::consts::PI).sin();
+            let glow_id = format!("glyphGlow{index}");
+            let _ = write!(
+                self.svg,
+                r#"<defs><filter id="{glow_id}" x="-150%" y="-150%" width="400%" height="400%"><feGaussianBlur stdDeviation="{}"/></filter><filter id="glyphWaiting"><feGaussianBlur stdDeviation="0.55"/></filter></defs>"#,
+                10. + pulse * 8.
+            );
             let (opacity, scale, lift, motion) = match phase {
                 "active" => (1., 1.04 + pulse * 0.035, -2. - pulse * 4., 0.18),
                 "passed" => (0.96, 1., 0., 0.04),
@@ -547,11 +575,24 @@ impl<'a> Scene<'a> {
                 projection.map(|(_, _, angle, axis, width)| (cx - x, cy - y, angle, axis, width));
             if self.panel.is_some() {
                 self.local = Some((x, y, rotation, scale));
-                let _ = write!(self.svg, r#"<g opacity="{opacity}">"#);
+                let _ = write!(
+                    self.svg,
+                    r#"<g opacity="{opacity}" filter="{}">"#,
+                    if phase == "waiting" {
+                        "url(#glyphWaiting)"
+                    } else {
+                        "none"
+                    }
+                );
             } else {
                 let _ = write!(
                     self.svg,
-                    r#"<g transform="translate({x} {y}) rotate({rotation}) scale({scale})" opacity="{opacity}">"#
+                    r#"<g transform="translate({x} {y}) rotate({rotation}) scale({scale})" opacity="{opacity}" filter="{}">"#,
+                    if phase == "waiting" {
+                        "url(#glyphWaiting)"
+                    } else {
+                        "none"
+                    }
                 );
             }
             if phase == "active" {
@@ -560,8 +601,7 @@ impl<'a> Scene<'a> {
                 } else {
                     self.accent.clone()
                 };
-                self.svg
-                    .push_str(r#"<g filter="url(#glow)" opacity="0.7">"#);
+                let _ = write!(self.svg, r#"<g filter="url(#{glow_id})" opacity="0.7">"#);
                 if arc {
                     self.perspective_line(
                         &text(glyph, "text"),
@@ -586,7 +626,13 @@ impl<'a> Scene<'a> {
                     0.,
                     0.,
                     size,
-                    if phase == "waiting" { 0.26 } else { 1. },
+                    if phase == "waiting" {
+                        0.26
+                    } else if phase == "passed" {
+                        0.88
+                    } else {
+                        1.
+                    },
                     &fill,
                     (unit - 0.5) * -34.,
                     (0.12, 1., 0.),
@@ -599,7 +645,13 @@ impl<'a> Scene<'a> {
                     0.,
                     0.,
                     size,
-                    if phase == "waiting" { 0.26 } else { 1. },
+                    if phase == "waiting" {
+                        0.26
+                    } else if phase == "passed" {
+                        0.88
+                    } else {
+                        1.
+                    },
                     &fill,
                     "middle",
                 );
@@ -608,6 +660,7 @@ impl<'a> Scene<'a> {
             self.local = None;
         }
         (self.weight, self.tracking) = previous_style;
+        self.text_filter = previous_filter;
         self.projection = projection;
     }
     fn active_text(&self) -> String {
@@ -771,8 +824,11 @@ impl<'a> Scene<'a> {
     fn cinematic(&mut self) {
         let size = font_size(&self.active_text(), self.width * 0.76);
         let time = num(self.snapshot, "playbackTime", 0.);
-        let mut row = 0;
-        let x = (self.width * 0.08).max(62.) + self.rail(104.);
+        let padding = (self.width * 0.08).max(62.);
+        let frame_width = self.width * 0.78;
+        let mut rows = vec![];
+        let mut content_height = 0.;
+        let spacing = size * 0.08;
         for segment in items(&self.snapshot["tilt"], "segments") {
             if time < num(&segment, "revealAt", f64::MAX) {
                 continue;
@@ -783,39 +839,105 @@ impl<'a> Scene<'a> {
                 &text(&segment, "id"),
                 1.,
             );
-            let sx = x
-                + self.width * num(&segment, "xOffset", 0.)
-                + (if tilted { 34. } else { -22. }) * (1. - progress);
-            let y = self.height * 0.38 + row as f64 * size * 1.08 - 14.;
-            let _ = write!(
-                self.svg,
-                r#"<g transform="translate({sx} {y}) rotate({})" opacity="{}">"#,
-                if tilted { -7. } else { 0. },
-                progress.clamp(0., 1.)
-            );
-            let fill = if tilted {
-                "url(#tiltGradient)".to_owned()
+            self.weight = if tilted { 300 } else { 700 };
+            self.tracking = 0.;
+            self.italic = tilted;
+            let value = text(&segment, "text");
+            let font = size * if tilted { 1.14 } else { 1. };
+            let height = self.text_height(&value, font, frame_width, usize::MAX);
+            if !rows.is_empty() {
+                content_height += spacing * progress;
+            }
+            content_height += height * progress;
+            rows.push((segment, tilted, progress, font, height, value));
+        }
+        self.weight = 500;
+        self.tracking = 0.;
+        self.italic = false;
+        let translation = text(&self.snapshot["flow"], "translation");
+        let translation_size = (size * 0.2).max(15.);
+        let translation_height = self.text_height(
+            &translation,
+            translation_size,
+            620f64.min(frame_width),
+            usize::MAX,
+        );
+        if translation_height > 0. {
+            content_height += translation_height + 8. + if rows.is_empty() { 0. } else { spacing };
+        }
+        self.panel = Some(confession_panel(self.width, self.height));
+        let _ = write!(
+            self.svg,
+            r#"<defs><linearGradient id="confessionStraight" x1="0" y1="0" x2="0" y2="1"><stop stop-color="{}"/><stop offset="1" stop-color="{}" stop-opacity="0.76"/></linearGradient><filter id="confessionPlainShadow" x="-50%" y="-100%" width="200%" height="300%"><feDropShadow dx="0" dy="0" stdDeviation="2.5" flood-color="black" flood-opacity="0.72"/></filter><filter id="confessionTiltShadow" x="-100%" y="-100%" width="300%" height="300%"><feDropShadow dx="0" dy="0" stdDeviation="9" flood-color="{}" flood-opacity="0.32"/></filter></defs>"#,
+            self.primary, self.primary, self.accent
+        );
+        let mut top = (self.height - content_height) / 2.;
+        let row_count = rows.len();
+        for (index, (segment, tilted, progress, font, height, value)) in
+            rows.into_iter().enumerate()
+        {
+            if index > 0 {
+                top += spacing * progress;
+            }
+            self.weight = if tilted { 300 } else { 700 };
+            self.italic = tilted;
+            self.text_filter = if tilted {
+                "url(#confessionTiltShadow)"
             } else {
-                self.primary.clone()
+                "url(#confessionPlainShadow)"
+            }
+            .to_owned();
+            let rotation: f64 = if tilted { -7. } else { 0. };
+            let scale = if tilted {
+                1. + self.audio("mid", 0.) * 0.045
+            } else {
+                1.
             };
-            self.line(
-                &text(&segment, "text"),
+            let offset_x = self.width * num(&segment, "xOffset", 0.);
+            let offset_y = self.audio("beatLift", 0.) * if tilted { 0.22 } else { 0.08 };
+            let (s, c) = rotation.to_radians().sin_cos();
+            self.local = Some((
+                padding
+                    + self.rail(104.)
+                    + scale * (offset_x * c - offset_y * s)
+                    + (if tilted { 34. } else { -22. }) * (1. - progress),
+                top + height * progress / 2. - 14. + scale * (offset_x * s + offset_y * c),
+                rotation,
+                scale,
+            ));
+            self.paragraph(
+                &value,
                 0.,
                 0.,
-                size * if tilted { 1.14 } else { 1. },
+                font,
+                frame_width,
+                usize::MAX,
                 1.,
-                &fill,
+                progress.clamp(0., 1.),
+                if tilted {
+                    "url(#tiltGradient)"
+                } else {
+                    "url(#confessionStraight)"
+                },
                 "start",
             );
-            self.svg.push_str("</g>");
-            row += 1;
+            self.local = None;
+            top += height * progress;
         }
-        self.translation(
-            x,
-            self.height * 0.38 + row as f64 * size * 1.08 + 8.,
-            (size * 0.2).max(15.),
-            "start",
-        );
+        self.italic = false;
+        self.text_filter = "url(#textShadow)".to_owned();
+        if translation_height > 0. {
+            top += 8. + if row_count > 0 { spacing } else { 0. };
+            self.translation(
+                padding + self.rail(104.),
+                top + translation_height / 2. - 14.,
+                translation_size,
+                "start",
+            );
+        }
+        self.panel = None;
+        self.weight = 600;
+        self.tracking = 0.;
     }
     fn orbit(&mut self) {
         let count = items(&self.snapshot["flow"], "glyphs").len().max(1);
@@ -1893,8 +2015,18 @@ mod outline {
     pub fn shape(_text: &str, _size: f64) -> Option<Line> {
         None
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), test))]
     pub fn shape_styled(_text: &str, _size: f64, _weight: u16, _tracking: f64) -> Option<Line> {
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    pub fn shape_font(
+        _text: &str,
+        _size: f64,
+        _weight: u16,
+        _tracking: f64,
+        _italic: bool,
+    ) -> Option<Line> {
         None
     }
     #[cfg(not(target_os = "macos"))]
@@ -1917,11 +2049,11 @@ mod outline {
         wrap(text, size, width / (1. + tracking / (size * 0.6)).max(0.1))
     }
     #[cfg(all(target_os = "macos", test))]
-    pub use native::shape;
-    #[cfg(all(target_os = "macos", test))]
     pub use native::wrap;
+    #[cfg(all(target_os = "macos", test))]
+    pub use native::{shape, shape_styled};
     #[cfg(target_os = "macos")]
-    pub use native::{shape_styled, wrap_styled};
+    pub use native::{shape_font, wrap_styled};
     #[cfg(target_os = "macos")]
     mod native {
         use super::{Command, Line, Point};
@@ -1972,6 +2104,20 @@ mod outline {
             fn CTFontDescriptorCreateCopyWithAttributes(descriptor: Ref, attributes: Ref) -> Ref;
             fn CTFontCreateWithFontDescriptor(descriptor: Ref, size: f64, matrix: Ref) -> Ref;
             fn CTFontCreateUIFontForLanguage(kind: u32, size: f64, language: Ref) -> Ref;
+            fn CTFontCreateCopyWithSymbolicTraits(
+                font: Ref,
+                size: f64,
+                matrix: Ref,
+                traits: u32,
+                mask: u32,
+            ) -> Ref;
+            fn CTFontGetSlantAngle(font: Ref) -> f64;
+            fn CTFontCreateCopyWithAttributes(
+                font: Ref,
+                size: f64,
+                matrix: Ref,
+                descriptor: Ref,
+            ) -> Ref;
             fn CTLineCreateWithAttributedString(string: Ref) -> Ref;
             fn CTLineGetGlyphRuns(line: Ref) -> Ref;
             fn CTLineGetTypographicBounds(
@@ -2004,7 +2150,7 @@ mod outline {
         unsafe extern "C" {
             fn sel_registerName(name: *const std::ffi::c_char) -> Ref;
             #[link_name = "objc_msgSend"]
-            fn descriptor_with_design(receiver: Ref, selector: Ref, design: Ref) -> Ref;
+            fn objc_message(receiver: Ref, selector: Ref, design: Ref) -> Ref;
         }
         struct Owned(Ref);
         impl Drop for Owned {
@@ -2053,15 +2199,35 @@ mod outline {
         pub fn shape(text: &str, size: f64) -> Option<Line> {
             shape_styled(text, size, 600, 0.)
         }
+        #[cfg(test)]
         pub fn shape_styled(text: &str, size: f64, weight: u16, tracking: f64) -> Option<Line> {
+            shape_font(text, size, weight, tracking, false)
+        }
+        pub fn shape_font(
+            text: &str,
+            size: f64,
+            weight: u16,
+            tracking: f64,
+            italic: bool,
+        ) -> Option<Line> {
             if text.is_empty() || !size.is_finite() || size <= 0. {
                 return None;
             }
             // Every Create result is released; run fonts and glyph arrays are
             // borrowed only while their owning CTLine remains alive.
             unsafe {
-                let font = weighted_font(size, weight);
-                if font.0.is_null() {
+                let base = weighted_font(size, weight);
+                let italic_font = if italic {
+                    italic_font(&base, size)
+                } else {
+                    Owned(ptr::null())
+                };
+                let font = if italic && !italic_font.0.is_null() {
+                    italic_font.0
+                } else {
+                    base.0
+                };
+                if font.is_null() {
                     return None;
                 }
                 let content = string(text);
@@ -2071,7 +2237,7 @@ mod outline {
                     &tracking as *const f64 as *const c_void,
                 ));
                 let keys = [kCTFontAttributeName, kCTKernAttributeName];
-                let values = [font.0, kern.0];
+                let values = [font, kern.0];
                 let attrs = Owned(CFDictionaryCreate(
                     ptr::null(),
                     keys.as_ptr(),
@@ -2135,6 +2301,57 @@ mod outline {
                 })
             }
         }
+        unsafe fn italic_font(base: &Owned, size: f64) -> Owned {
+            unsafe {
+                let font = Owned(CTFontCreateCopyWithSymbolicTraits(
+                    base.0,
+                    size,
+                    ptr::null(),
+                    1,
+                    1,
+                ));
+                if !font.0.is_null() && CTFontGetSlantAngle(font.0).abs() > 0.01 {
+                    return font;
+                }
+                // Rounded UI fonts have no italic face. Preserve their design,
+                // using the system UI italic font's actual slant angle rather
+                // than a hardcoded synthetic skew.
+                let system = Owned(CTFontCreateUIFontForLanguage(2, size, ptr::null()));
+                let italic = Owned(CTFontCreateCopyWithSymbolicTraits(
+                    system.0,
+                    size,
+                    ptr::null(),
+                    1,
+                    1,
+                ));
+                if italic.0.is_null() {
+                    return italic;
+                }
+                #[repr(C)]
+                struct Matrix {
+                    a: f64,
+                    b: f64,
+                    c: f64,
+                    d: f64,
+                    tx: f64,
+                    ty: f64,
+                }
+                let matrix = Matrix {
+                    a: 1.,
+                    b: 0.,
+                    c: (-CTFontGetSlantAngle(italic.0)).to_radians().tan(),
+                    d: 1.,
+                    tx: 0.,
+                    ty: 0.,
+                };
+                Owned(CTFontCreateCopyWithAttributes(
+                    base.0,
+                    size,
+                    &matrix as *const Matrix as Ref,
+                    ptr::null(),
+                ))
+            }
+        }
         unsafe fn weighted_font(size: f64, weight: u16) -> Owned {
             unsafe {
                 // Obtain the UI font through the public API, then apply the
@@ -2175,7 +2392,7 @@ mod outline {
                 // CTFontDescriptor and NSFontDescriptor are toll-free bridged.
                 // This +0 design result remains alive through this synchronous
                 // shaping call; only Create/Copy results are CF-released.
-                let rounded = descriptor_with_design(
+                let rounded = objc_message(
                     descriptor.0,
                     sel_registerName(c"fontDescriptorWithDesign:".as_ptr()),
                     NSFontDescriptorSystemDesignRounded,
@@ -2257,6 +2474,63 @@ mod outline {
 mod tests {
     use super::{Scene, escape};
     use serde_json::json;
+    #[test]
+    fn confession_uses_original_leading_frame_projection() {
+        let panel = super::confession_panel(1000., 700.);
+        assert_eq!(
+            (panel.angle, panel.perspective, panel.axis, panel.width),
+            (-4., 0.76, (0.02, 1., 0.), 860.)
+        );
+        assert_eq!((panel.anchor.x, panel.anchor.y), (0., 350.));
+        let anchor = panel.map(panel.anchor);
+        assert_eq!((anchor.x, anchor.y), (0., 350.));
+        assert_ne!(
+            panel.map(super::outline::Point { x: 700., y: 200. }).y,
+            200.
+        );
+    }
+    #[test]
+    fn confession_segments_keep_native_styles_and_reset_after_drawing() {
+        let snapshot = json!({"mode":"confession","playbackTime":2.,"flow":{"activeLine":{"id":"line","text":"正常倾斜"},"translation":"真实翻译"},"tilt":{"segments":[{"id":"normal","text":"正常","isTilted":false,"revealAt":0.,"xOffset":0.},{"id":"tilted","text":"倾斜","isTilted":true,"revealAt":1.,"xOffset":0.1},{"id":"future","text":"未入场","revealAt":3.}]},"audioMotion":{"beatLift":5.,"mid":0.4}});
+        let mut scene = Scene::new(&snapshot, 1000., 700.);
+        scene.cinematic();
+        assert!(scene.svg.contains("url(#confessionStraight)"));
+        assert!(scene.svg.contains("url(#tiltGradient)"));
+        assert!(scene.svg.contains("url(#confessionPlainShadow)"));
+        assert!(scene.svg.contains("url(#confessionTiltShadow)"));
+        assert!(scene.svg.contains("aria-label=\"正常\""));
+        assert!(scene.svg.contains("aria-label=\"倾斜\""));
+        assert!(!scene.svg.contains("未入场"));
+        assert_eq!(
+            (scene.weight, scene.tracking, scene.italic),
+            (600, 0., false)
+        );
+        assert!(scene.local.is_none());
+        assert!(scene.panel.is_none());
+    }
+    #[test]
+    fn glyph_phase_filters_keep_original_waiting_glow_and_passed_opacity() {
+        let snapshot = json!({"mode":"luminous","flow":{"activeLine":{"id":"a","text":"等待活动经过"},"glyphs":[{"id":"wait","text":"等","phase":"waiting"},{"id":"active","text":"活","phase":"active","progress":0.5},{"id":"passed","text":"过","phase":"passed"}]}});
+        let svg = Scene::new(&snapshot, 1000., 700.).finish();
+        assert!(svg.contains("stdDeviation=\"0.55\""));
+        assert!(svg.contains("stdDeviation=\"18\""));
+        assert!(svg.contains("filter=\"url(#glyphWaiting)\""));
+        assert!(svg.contains("filter=\"url(#glyphGlow1)\""));
+        assert!(svg.contains("opacity=\"0.88\""));
+        assert!(svg.contains("opacity=\"0.96\""));
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_italic_changes_the_actual_glyph_contours() {
+        for text in ["Confession", "中文倾斜"] {
+            let straight = super::outline::shape_font(text, 32., 300, 0., false).unwrap();
+            let italic = super::outline::shape_font(text, 32., 300, 0., true).unwrap();
+            assert_ne!(
+                super::outline::svg_path(&straight.commands, |p| p),
+                super::outline::svg_path(&italic.commands, |p| p)
+            );
+        }
+    }
     #[test]
     fn translation_styles_preserve_original_mode_parameters() {
         let luminous = super::translation_style("luminous", 1000.);

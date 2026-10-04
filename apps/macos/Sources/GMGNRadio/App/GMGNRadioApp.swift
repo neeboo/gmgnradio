@@ -1471,6 +1471,7 @@ final class AppDelegate:
     /// existing resident loop with the same world/session authorization.
     var gpuiResidentRecovery: ((ResidentChatSubmission, String) -> Void)?
     var gpuiOpenSettings: (() -> Void)?
+    var gpuiNavigate: ((String) -> Void)?
     private var gpuiLatestResidentReply = ""
 #endif
     private let playbackLogger = Logger(
@@ -1885,6 +1886,10 @@ final class AppDelegate:
         case .toggleVoice:
             toggleRealtimeVoiceFromStage()
         case .toggleStage:
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+            gpuiNavigate?("toggleStage")
+            return
+#endif
             if stageWindowController?.isPresented == true {
                 closeStage()
             } else {
@@ -1989,6 +1994,10 @@ final class AppDelegate:
     }
 
     func showStage() {
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+        gpuiNavigate?("showStage")
+        return
+#endif
         promoteToForeground()
         if livingWorldContext == nil {
             configureLivingWorld()
@@ -2169,6 +2178,10 @@ final class AppDelegate:
     }
 
     func showPlayer() {
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+        gpuiNavigate?("showPlayer")
+        return
+#endif
         promoteToForeground()
         if livingWorldContext == nil {
             configureLivingWorld()
@@ -2210,6 +2223,11 @@ final class AppDelegate:
     }
 
     private func showLiveCam(trigger: LiveCamPresentationTrigger) {
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+        guard trigger.mayPresentLiveCam else { return }
+        gpuiNavigate?("showLiveCam")
+        return
+#endif
         if stageWindowController?.isPresented == true {
             stageWindowController?.close()
             return

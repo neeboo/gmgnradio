@@ -261,3 +261,27 @@ Kit音乐页实际显示网易云/QQ未连接、Apple Music已连接；主代理
 设置缓存按实际窗口inventory判断是否存活，延迟激活，避免dispatch借用时update失败被误判为已关闭。App测试9/9、check、Swift宿主build17通过。完整包v22构建exit0，日志`/tmp/gmgn-gpui-product-app-build-v22.log`。v21测试进程Cmd+Q退出0，v22 PID85622继续同一业务根，日志`/tmp/gmgn-gpui-parity-v22-runtime.log`。
 
 CUA实际打开设置、再次Cmd+,、关闭一次，直接回到主窗口，没有残留第二设置；此复现路径通过，菜单重复及所有窗口生命周期仍待验。实际选择Orb后从应用菜单“显示小窗”，Kit显示原“还没有可显示的角色”与原指导文案，没有切到空Marble小窗；点击“打开角色设置”进入角色页，恢复原2B并关闭设置。此无人物检查与跳设置子路径通过；取消、初始compact无人物、独立Orb及原弹窗视觉仍未整体通过。弹窗期间CUA原生场景区域呈灰色，背景合成是否与原Swift一致须继续对照，不将功能入口通过扩大为视觉通过。误点主界面“窗口”实际进入全屏，尚未将此次操作算完整全屏验收。
+
+### v22 渲染所有权故障定位与下一批返工
+
+继续真实复验，恢复2B并关闭设置后场景持续白色，退出全屏仍白，点击回播放器报告“本次操作未完成，原状态保持不变”。日志明确PID85622在08:25:41由gpuiFullStage持有surface，08:27:00原StageWindowController.show把owner改为fullStage。此时主代理曾按Ctrl+Cmd+F尝试退出全屏；原GMGNKeyboardShortcuts定义该组合为toggleStage，因此触发旧Swift舞台抢占渲染面，证据支持入口路由故障，不能将本次白屏单独归因于Kit弹窗遮罩。已把GPUI启动模式下原showStage/showPlayer/显式showLiveCam及toggleStage接回同一产品导航；宿主build19通过，实际快捷键往返仍待新包复验。
+
+另源码确认Kit modal/sheet未参与原生hit-region控制，有UI点击透场景风险。已按Kit真实WindowState栈设置全窗交互区域，关闭任一路径自动恢复，不新增独立modal标记，不改颜色或布局；App测试10/10、check通过，真实点击/场景复验仍待新包。
+
+当前五页设置对原源码审计补齐：ASR换provider仅草稿、显式保存才持久化；新TTS key编辑取消试听/声音列表而保留能力请求，离页/关闭取消三者；下拉默认模型、旧模型失效、当前自定义声音与加载禁用；动作空分类及不兼容配色、链接错误图标、DJ说明和真实后端状态。settings测试4项与生产回调10断言、宿主final2构建通过；这些是回归/构建证据，未运行录音，也未把真实ASR或所有设置写通过。
+
+节目轨道审计仍有确定遗漏：cos缩窄卡片改变排版，不能替代原绘制层3D投影；原右对齐、负间距、header重排入口、角落视频图标、滚动居中等位置/行为必须恢复。歌词confession及waiting/passed光效也有精确差异，正在按原参数修复。所有UI完整对齐仍未完成。
+
+### v23/v24 实际导航、语音设置与窄布局复验
+
+v23完整包构建exit0，PID89187同一业务根；v22测试App退出0。CUA按原Ctrl+Cmd+F从正常窗切224×336小窗，2B实际可见，再按同组合回1180×760生活空间，原人物与物件实际恢复，没有再出现旧舞台抢面导致白屏。日志`/tmp/gmgn-gpui-parity-v23-runtime.log`三次mount依次compact=false/true/false且成功；此复现路径通过，不扩为全部窗口/热键通过。原空戏剧动作分类实际显示“这个分类下暂无当前角色可用的动作。”，随后恢复全部分类。DJ原terminal图标、说明、真实DSH可用状态及默认模型标签实际可见。
+
+实际ASR下拉从百炼改ElevenLabs草稿，模型显示Scribe v2 Realtime默认，不点保存。隔离UserDefaults域ai.gmgn.radio.e2e.c0105cb25be9a920的plist存在，单字段`speech.rust.asr.provider`仍不存在（原默认百炼），证明此实际草稿操作没有提前持久化provider；随后恢复百炼草稿。未读取整域、任何密钥或Keychain，未录音。实际Fish免费模型开始试听按钮变停止试听，立即切角色页，返回DJ按钮为试听声音。仅PID89187的20秒音频采样exit0、audible=true、410个非零buffer、peak0.5005599856376648，末窗口零样本，证据`/tmp/gmgn-gpui-v23-leave-preview-audio.jsonl`。未记录精确点击时间，不能据此报告停止延迟；实际离页状态恢复子路径通过。
+
+v23发现居民人格说明挤出保存按钮，原HStack换行约束仍有差异；已窄修两个人格footer允许文字收缩换行、保存按钮不收缩，不改文本/窗口。v24完整包构建exit0，PID89871同一业务根；v23仅测试App退出0。日志`/tmp/gmgn-gpui-product-app-build-v24.log`与`/tmp/gmgn-gpui-parity-v24-runtime.log`。CUA在580×500及实际拖到540×440（Retina1080×880）看到居民说明两行、保存按钮完整留在卡内；此长说明布局复验通过，DJ footer及全部小尺寸页面仍待完整验收。
+
+v24实际选择Orb→应用菜单显示小窗，Kit引导覆盖真实船舱且背景仍可见；取消后原场景恢复无白屏。重开角色设置恢复2B，关闭后人物与世界继续实际可见。这证明此前白屏修复及此模态取消/角色恢复子路径通过，尚未用正在携带资产的场景证明所有模态点击不穿透，相关命中控制仍需业务验收。设置重开恢复原580×500窗口。
+
+本批歌词confession按原整体投影/实际行高/斜体/分段参数及glyph phase补齐；节目恒294×76/306×74、右对齐负间距、header重排、角落视频与实际当前曲目居中已实现。完整UI50测试通过的前轮证据不等于真实歌词和曲目视觉；真3D卡投影、渐隐/层级/吸附、歌词seek退出及投影前滤镜、真实歌曲11模式、其余全部业务验收仍未完成。继续保持完整目标，不能报告所有UI对齐完成。
+
+本批最终源代码复验：gpui-ui完整50测试通过、gpui-app完整10测试通过，均exit0；日志分别为`/tmp/gmgn-gpui-v24-ui-tests.log`和`/tmp/gmgn-gpui-v24-app-tests.log`。`git diff --check`通过。上述单测与真实App子路径证据分别记录，不替代尚未完成的完整布局和功能验收。ASR录音仍暂停。

@@ -16,6 +16,10 @@ gpui_kit::actions!(gmgn_product, [Quit,ShowSettings,ShowLiveCam,EscapeStage]);
 fn window_still_registered<T: PartialEq>(cached: T, live: impl IntoIterator<Item=T>) -> bool {
     live.into_iter().any(|id| id == cached)
 }
+
+fn modal_owns_scene_input(menu: bool, dialog: bool, sheet: bool) -> bool {
+    menu || dialog || sheet
+}
 unsafe extern "C" {
     fn gmgn_gpui_bitmap_drop_region(view:*mut c_void,x:f64,y:f64,w:f64,h:f64,enabled:i32);
     fn gmgn_gpui_take_bitmap_drop(view:*mut c_void)->*mut c_char;
@@ -590,15 +594,18 @@ impl Render for GMGNProductUI {
         // including wrapped notices and the complete autonomy card.
         let mut passive_indices=Vec::new();
         if !self.compact {passive_indices.push(0);if self.runtime_state["screenOperation"]["active"].as_bool()==Some(true){passive_indices.push(3);}}
-        root.on_children_prepainted(move |bounds,window,_| {
+        root.on_children_prepainted(move |bounds,window,cx| {
+            // Read Kit's real modal stack at paint time: all close routes
+            // restore passthrough without maintaining a second modal flag.
+            let modal_open=modal_owns_scene_input(menu_open,window.has_active_dialog(cx),window.has_active_sheet(cx));
             if let Ok(handle)=HasWindowHandle::window_handle(window) {
                 if let RawWindowHandle::AppKit(handle)=handle.as_raw() {
-                    let region=composer_index.and_then(|index|bounds.get(index)).filter(|_|!menu_open);
+                    let region=composer_index.and_then(|index|bounds.get(index)).filter(|_|!modal_open);
                     let (x,y,w,h,enabled)=region.map_or((0.,0.,0.,0.,0),|bounds|(bounds.origin.x.as_f32() as f64,bounds.origin.y.as_f32() as f64,bounds.size.width.as_f32() as f64,bounds.size.height.as_f32() as f64,1));
                     unsafe{gmgn_gpui_bitmap_drop_region(handle.ns_view.as_ptr(),x,y,w,h,enabled)};
                 }
             }
-            let rects:Vec<[f32;4]>=if menu_open {
+            let rects:Vec<[f32;4]>=if modal_open {
                 // Like the original NSMenu, a live Kit popup owns pointer
                 // dismissal while open. Restore scene passthrough on close.
                 let viewport=window.viewport_size();vec![[0.,0.,viewport.width.as_f32(),viewport.height.as_f32()]]
@@ -612,6 +619,15 @@ impl Render for GMGNProductUI {
 
 #[cfg(test)]
 mod layout_tests {
+    #[test]
+    fn kit_modal_stack_blocks_scene_and_restores_after_last_close() {
+        assert!(!super::modal_owns_scene_input(false,false,false));
+        assert!(super::modal_owns_scene_input(false,true,false));
+        assert!(super::modal_owns_scene_input(false,true,true));
+        assert!(super::modal_owns_scene_input(false,false,true));
+        assert!(!super::modal_owns_scene_input(false,false,false));
+        assert!(super::modal_owns_scene_input(true,false,false));
+    }
     #[test]
     fn singleton_uses_window_inventory_not_reentrant_update_result() {
         assert!(super::window_still_registered(7_u64,[3,7]));
