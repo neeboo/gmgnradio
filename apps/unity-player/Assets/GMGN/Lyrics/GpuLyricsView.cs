@@ -192,10 +192,10 @@ namespace GMGN.UnityPlayer
                 var hasTranslation=!string.IsNullOrEmpty(line.translation);
                 var baseline=logicalHeight*.5f-8+fontSize*.5f-(hasTranslation?translationSize*.5f+11:0);
                 AddLine(line,fontSize,logicalWidth*.5f,baseline,primary,true);
-                var contextWidth=Mathf.Min(680,Mathf.Max(1,logicalWidth-84));
-                if(activeIndex>0)AddFlowContext(lines[activeIndex-1],contextSize,contextWidth,logicalWidth*.5f-contextWidth*.5f-42,baseline-fontSize-22,WithAlpha(primary,.18f),false);
+                var contextLayout=FlowContextLayout(logicalWidth);
+                if(activeIndex>0)AddFlowContext(lines[activeIndex-1],contextSize,contextLayout.x,contextLayout.y,baseline-fontSize-22,WithAlpha(primary,.18f),false);
                 AddTranslation(line,translationSize,logicalWidth*.5f,baseline+translationSize+22,.66f);
-                if(activeIndex+1<lines.Length)AddFlowContext(lines[activeIndex+1],contextSize,contextWidth,logicalWidth*.5f+contextWidth*.5f+42,baseline+(hasTranslation?translationSize*2:0)+44+contextSize,WithAlpha(primary,.28f),true);
+                if(activeIndex+1<lines.Length)AddFlowContext(lines[activeIndex+1],contextSize,contextLayout.x,contextLayout.z,baseline+(hasTranslation?translationSize*2:0)+44+contextSize,WithAlpha(primary,.28f),true);
             }
             if (descriptors.Count == 0) return;
             if (descriptors.Count > MaximumGlyphs) { Status = "GPU lyric glyph limit exceeded"; descriptors.Clear(); return; }
@@ -315,6 +315,13 @@ namespace GMGN.UnityPlayer
         }
         // Swift contextualLine: bounded 680-point frame, minimumScaleFactor(.72),
         // lineLimit(1). Work happens only on a line/viewport boundary, never per frame.
+        static Vector3 FlowContextLayout(float viewport){
+            // Narrow windows retain a 24-point readable gutter (the maximum
+            // contextual font size). Wide windows preserve Swift's exact frame
+            // and offsets; only the constrained frame width changes.
+            var frame=Mathf.Min(680,Mathf.Max(1,viewport-2*(42+24)));
+            return new Vector3(frame,viewport*.5f-frame*.5f-42,viewport*.5f+frame*.5f+42);
+        }
         void AddFlowContext(LyricPointLine line,float size,float width,float anchor,float y,Color color,bool trailing) {
             var text=line.text??"";
             var measured=Measure(text,size);
@@ -335,7 +342,7 @@ namespace GMGN.UnityPlayer
             if(descriptors.Count>begin){
                 var bounds=GlyphRangeBounds(begin);
                 var viewport=this.width/scale;
-                if(bounds.x<-.01f||bounds.y>viewport+.01f)
+                if(bounds.x<24-.01f||bounds.y>viewport-24+.01f)
                     Debug.LogError($"Flow context outside viewport: logical={viewport}, bounds={bounds}, anchor={anchor}, frame={width}, scale={scale}",this);
                 Debug.Log($"GPU Flow context {(trailing?"next":"previous")}: screen={this.width} scale={scale} logical={viewport} bounds=[{bounds.x:F2},{bounds.y:F2}] anchor={anchor:F2}",this);
             }
