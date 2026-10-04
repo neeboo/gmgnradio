@@ -1,0 +1,44 @@
+include:
+  - ../gpui-render-host.yml
+name: UnityMediaHost
+targets:
+  UnityMediaHost:
+    type: library.dynamic
+    platform: macOS
+    sources:
+      - path: ../Sources/GMGNRadio
+        excludes:
+          - App/GMGNRadioApp.swift
+      - path: ../RenderHost
+      - path: ../../../apps/macos/UnityHost
+        excludes:
+          - README.md
+          - project.yml
+          - abi-smoke.c
+    dependencies:
+      - package: NanoemCore
+        product: CNanoem
+      - package: MMDSceneKit
+      - package: WorldRuntime
+      - package: MotionDistribution
+      - package: ElevenLabs
+      - package: LiveKit
+      - package: MetalSplatter
+        product: MetalSplatter
+      - package: MetalSplatter
+        product: SplatIO
+      - package: VRMMetalKit
+      - package: VRMMetalKit
+        product: GLTFMetalKit
+    settings:
+      base:
+        PRODUCT_NAME: UnityMediaHost
+        PRODUCT_MODULE_NAME: UnityMediaHost
+        CODE_SIGNING_ALLOWED: NO
+        SKIP_INSTALL: YES
+        SWIFT_COMPILATION_MODE: incremental
+schemes:
+  UnityMediaHost:
+    build:
+      targets:
+        UnityMediaHost: all
