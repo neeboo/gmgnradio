@@ -7,7 +7,7 @@ use gpui_kit::*;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 fn num(value: &Value, key: &str, default: f64) -> f64 {
     value[key]
@@ -1746,9 +1746,12 @@ pub struct StageLyricsPane {
     snapshot: Value,
     width: f64,
     height: f64,
-    renderer: SvgRenderer,
+    worker: Option<LatestWorker<LyricFrame, Result<Arc<RenderImage>, String>>>,
+    active: bool,
+    generation: u64,
+    scope: Option<(String, String, u64, u64, u32)>,
+    submitted: Option<(Value, u64, u64, u32)>,
     image: Option<Arc<RenderImage>>,
-    render_key: String,
     render_error: Option<String>,
     outgoing: Option<Value>,
     transition_started: f64,
@@ -1796,7 +1799,7 @@ impl SegmentTransition {
         self.started = now;
     }
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct SegmentLifecycle {
     scope: Option<(String, String, String)>,
     states: HashMap<String, SegmentTransition>,
@@ -2020,15 +2023,199 @@ fn depth_transition(current: &Value, old: &Value, progress: f64) -> Value {
     snapshot["depth"]["lines"] = json!(lines);
     snapshot
 }
+/// A single consumer, one replaceable pending request, and one completed result.
+/// Same-generation completed frames remain publishable under continuous input.
+struct LatestQueue<P, R> {
+    pending: Option<(u64, P)>,
+    completed: Option<(u64, R)>,
+    generation: u64,
+    closed: bool,
+    stopped: bool,
+    inflight: bool,
+}
+struct LatestWorker<P, R> {
+    shared: Arc<(Mutex<LatestQueue<P, R>>, Condvar)>,
+}
+impl<P: Send + 'static, R: Send + 'static> LatestWorker<P, R> {
+    fn new(mut process: impl FnMut(P) -> R + Send + 'static) -> Self {
+        let shared = Arc::new((
+            Mutex::new(LatestQueue {
+                pending: None,
+                completed: None,
+                generation: 0,
+                closed: false,
+                stopped: false,
+                inflight: false,
+            }),
+            Condvar::new(),
+        ));
+        let state = shared.clone();
+        std::thread::Builder::new()
+            .name("stage-lyrics-render".into())
+            .spawn(move || {
+                loop {
+                    let (generation, input) = {
+                        let (lock, wake) = &*state;
+                        let mut queue = lock.lock().unwrap();
+                        while queue.pending.is_none() && !queue.closed {
+                            queue = wake.wait(queue).unwrap();
+                        }
+                        if queue.closed {
+                            break;
+                        }
+                        queue.inflight = true;
+                        queue.pending.take().unwrap()
+                    };
+                    let result = process(input);
+                    let mut queue = state.0.lock().unwrap();
+                    queue.inflight = false;
+                    if queue.closed {
+                        break;
+                    }
+                    if generation == queue.generation {
+                        queue.completed = Some((generation, result));
+                    }
+                }
+                state.0.lock().unwrap().stopped = true;
+            })
+            .expect("stage lyric worker creation failed");
+        Self { shared }
+    }
+    fn submit(&self, generation: u64, input: P) {
+        let mut queue = self.shared.0.lock().unwrap();
+        if queue.closed {
+            return;
+        }
+        if queue.generation != generation {
+            queue.completed = None;
+        }
+        queue.generation = generation;
+        queue.pending = Some((generation, input));
+        self.shared.1.notify_one();
+    }
+    fn take(&self, generation: u64) -> Option<R> {
+        let mut queue = self.shared.0.lock().unwrap();
+        queue
+            .completed
+            .take()
+            .and_then(|(epoch, result)| (epoch == generation).then_some(result))
+    }
+    fn close(&self) {
+        let mut queue = self.shared.0.lock().unwrap();
+        queue.closed = true;
+        queue.pending = None;
+        queue.completed = None;
+        self.shared.1.notify_one();
+    }
+    fn stopped(&self) -> bool {
+        self.shared.0.lock().unwrap().stopped
+    }
+    fn closed(&self) -> bool {
+        self.shared.0.lock().unwrap().closed
+    }
+    fn needs_poll(&self) -> bool {
+        let queue = self.shared.0.lock().unwrap();
+        queue.inflight || queue.pending.is_some() || queue.completed.is_some()
+    }
+}
+impl<P, R> Drop for LatestWorker<P, R> {
+    fn drop(&mut self) {
+        let mut queue = self.shared.0.lock().unwrap();
+        queue.closed = true;
+        queue.pending = None;
+        queue.completed = None;
+        self.shared.1.notify_one();
+    }
+}
+struct LyricFrame {
+    snapshot: Value,
+    outgoing: Option<Value>,
+    segments: SegmentLifecycle,
+    started: f64,
+    width: f64,
+    height: f64,
+    scale: f32,
+}
+impl LyricFrame {
+    fn svg(&self) -> String {
+        let (w, h) = (self.width, self.height);
+        let now = num(&self.snapshot, "animationTime", 0.);
+        let elapsed = (now - self.started).max(0.);
+        let spec = transition_spec(self.snapshot["mode"].as_str().unwrap_or(""));
+        let mut snapshot = self.snapshot.clone();
+        snapshot["_presentation"] = self.segments.presentation(now);
+        if spec.depth && elapsed < spec.duration() {
+            if let Some(old) = &self.outgoing {
+                snapshot = depth_transition(&snapshot, old, spec.progress(elapsed));
+            }
+        }
+        let svg = Scene::new(&snapshot, w, h).finish();
+        if !spec.fold && !spec.depth && elapsed < spec.duration() {
+            let progress = spec.progress(elapsed);
+            let mut body = String::new();
+            if let Some(old) = &self.outgoing {
+                body.push_str(&scene_layer(
+                    &Scene::new(&advance_outgoing(old, &snapshot), w, h).finish(),
+                    w,
+                    h,
+                    (1. - progress).clamp(0., 1.),
+                    1. - (1. - spec.scale) * progress,
+                    spec.move_x * w * progress,
+                    spec.move_y * h * progress,
+                ));
+            }
+            body.push_str(&scene_layer(
+                &svg,
+                w,
+                h,
+                progress.clamp(0., 1.),
+                spec.scale + (1. - spec.scale) * progress,
+                spec.move_x * w * (1. - progress),
+                spec.move_y * h * (1. - progress),
+            ));
+            format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">{body}</svg>"#
+            )
+        } else {
+            svg
+        }
+    }
+}
+fn new_lyric_worker() -> LatestWorker<LyricFrame, Result<Arc<RenderImage>, String>> {
+    LatestWorker::new({
+        // Renderer construction, native shaping, SVG parsing and blur rasterization
+        // all execute on this worker, never in GPUI's Render callback.
+        let mut renderer = None;
+        move |frame: LyricFrame| {
+            let renderer = renderer.get_or_insert_with(|| SvgRenderer::new(Arc::new(())));
+            let svg = frame.svg();
+            renderer
+                .render_single_frame(svg.as_bytes(), frame.scale)
+                .map_err(|_| "lyrics_svg_render_failed".to_owned())
+        }
+    })
+}
 impl StageLyricsPane {
-    pub fn new(_window: &mut Window, _cx: &mut Context<Self>) -> Self {
+    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+        cx.on_release(|this, app| {
+            if let Some(image) = this.image.take() {
+                app.drop_image(image, None);
+            }
+            if let Some(worker) = &this.worker {
+                worker.close();
+            }
+        })
+        .detach();
         Self {
             snapshot: Value::Null,
             width: 0.,
             height: 0.,
-            renderer: SvgRenderer::new(Arc::new(())),
+            worker: None,
+            active: true,
+            generation: 0,
+            scope: None,
+            submitted: None,
             image: None,
-            render_key: String::new(),
             render_error: None,
             outgoing: None,
             transition_started: 0.,
@@ -2057,6 +2244,21 @@ impl StageLyricsPane {
         self.width = width.max(0.) as f64;
         self.height = height.max(0.) as f64;
     }
+    pub fn set_visible(&mut self, active: bool, cx: &mut Context<Self>) {
+        if self.active == active {
+            return;
+        }
+        self.active = active;
+        self.generation += 1;
+        if let Some(worker) = &self.worker {
+            worker.close();
+        }
+        self.submitted = None;
+        self.scope = None;
+        if let Some(image) = self.image.take() {
+            cx.drop_image(image, None);
+        }
+    }
     pub fn take_commands(&mut self) -> Vec<Value> {
         vec![]
     }
@@ -2077,62 +2279,76 @@ impl Render for StageLyricsPane {
         } else {
             f64::from(size.height)
         };
-        let now = num(&self.snapshot, "animationTime", 0.);
-        let elapsed = (now - self.transition_started).max(0.);
-        let spec = transition_spec(self.snapshot["mode"].as_str().unwrap_or(""));
-        let mut snapshot = self.snapshot.clone();
-        snapshot["_presentation"] = self.segments.presentation(now);
-        if spec.depth && elapsed < spec.duration() {
-            if let Some(old) = &self.outgoing {
-                snapshot = depth_transition(&snapshot, old, spec.progress(elapsed));
+        if !self.active || self.snapshot.is_null() {
+            if let Some(worker) = &self.worker {
+                worker.close();
+            }
+            self.submitted = None;
+            if let Some(image) = self.image.take() {
+                _ = window.drop_image(image);
+            }
+            return div().size_full();
+        }
+        if self.worker.as_ref().is_some_and(|worker| worker.closed()) {
+            if self.worker.as_ref().is_some_and(|worker| !worker.stopped()) {
+                window.request_animation_frame();
+                return div().size_full();
+            }
+            self.worker = None;
+        }
+        let scale = window.scale_factor();
+        let scope = (
+            text(&self.snapshot, "trackID"),
+            text(&self.snapshot, "mode"),
+            w.to_bits(),
+            h.to_bits(),
+            scale.to_bits(),
+        );
+        if self.scope.as_ref() != Some(&scope) {
+            self.generation += 1;
+            self.scope = Some(scope);
+            self.submitted = None;
+            if let Some(image) = self.image.take() {
+                _ = window.drop_image(image);
             }
         }
-        let mut svg = Scene::new(&snapshot, w, h).finish();
-        if !spec.fold && !spec.depth && elapsed < spec.duration() {
-            let progress = spec.progress(elapsed);
-            let mut body = String::new();
-            if let Some(old) = &self.outgoing {
-                body.push_str(&scene_layer(
-                    &Scene::new(&advance_outgoing(old, &snapshot), w, h).finish(),
-                    w,
-                    h,
-                    (1. - progress).clamp(0., 1.),
-                    1. - (1. - spec.scale) * progress,
-                    spec.move_x * w * progress,
-                    spec.move_y * h * progress,
-                ));
-            }
-            body.push_str(&scene_layer(
-                &svg,
-                w,
-                h,
-                progress.clamp(0., 1.),
-                spec.scale + (1. - spec.scale) * progress,
-                spec.move_x * w * (1. - progress),
-                spec.move_y * h * (1. - progress),
-            ));
-            svg = format!(
-                r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">{body}</svg>"#
-            );
-            window.request_animation_frame();
-        } else {
-            self.outgoing = None;
-        }
-        if self.render_key != svg {
-            self.render_key = svg;
-            match self
-                .renderer
-                .render_single_frame(self.render_key.as_bytes(), window.scale_factor())
-            {
+        let worker = self.worker.get_or_insert_with(new_lyric_worker);
+        if let Some(result) = worker.take(self.generation) {
+            match result {
                 Ok(image) => {
-                    self.image = Some(image);
+                    if let Some(old) = self.image.replace(image) {
+                        _ = window.drop_image(old);
+                    }
                     self.render_error = None;
                 }
-                Err(_) => {
-                    self.image = None;
-                    self.render_error = Some("lyrics_svg_render_failed".to_owned());
+                Err(error) => {
+                    self.render_error = Some(error);
                 }
             }
+        }
+        let key = (
+            self.snapshot.clone(),
+            w.to_bits(),
+            h.to_bits(),
+            scale.to_bits(),
+        );
+        if self.submitted.as_ref() != Some(&key) {
+            worker.submit(
+                self.generation,
+                LyricFrame {
+                    snapshot: self.snapshot.clone(),
+                    outgoing: self.outgoing.clone(),
+                    segments: self.segments.clone(),
+                    started: self.transition_started,
+                    width: w,
+                    height: h,
+                    scale,
+                },
+            );
+            self.submitted = Some(key);
+        }
+        if worker.needs_poll() {
+            window.request_animation_frame();
         }
         let mut root = div().size_full();
         if let Some(image) = self.image.clone() {
@@ -2880,6 +3096,122 @@ mod outline {
 mod tests {
     use super::{Scene, escape};
     use serde_json::json;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn production_lyric_worker_shapes_and_rasterizes_real_scene() {
+        let worker = super::new_lyric_worker();
+        worker.submit(
+            1,
+            super::LyricFrame {
+                snapshot: json!({"mode":"luminous","animationTime":1.,"flow":{
+                    "activeLine":{"id":"actual","text":"真实歌词"},
+                    "glyphs":[{"id":"g1","text":"真","phase":"active","progress":0.5}]
+                }}),
+                outgoing: None,
+                segments: super::SegmentLifecycle::default(),
+                started: 0.,
+                width: 160.,
+                height: 100.,
+                scale: 1.,
+            },
+        );
+        wait_until(|| worker.shared.0.lock().unwrap().completed.is_some());
+        let image = worker
+            .take(1)
+            .expect("completed frame")
+            .expect("native SVG frame");
+        assert_eq!(image.frame_count(), 1);
+        worker.close();
+        wait_until(|| worker.stopped());
+    }
+
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not reach boundary"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn lyric_worker_bounds_pending_and_publishes_under_continuous_input() {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let caller = std::thread::current().id();
+        let worker = super::LatestWorker::new(move |input: u32| {
+            assert_ne!(std::thread::current().id(), caller);
+            entered_tx.send(input).unwrap();
+            released.recv().unwrap();
+            input
+        });
+        worker.submit(1, 0);
+        assert_eq!(
+            entered
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap(),
+            0
+        );
+        for frame in 1..10_000 {
+            worker.submit(1, frame);
+        }
+        assert_eq!(worker.shared.0.lock().unwrap().pending, Some((1, 9999)));
+        release.send(()).unwrap();
+        assert_eq!(
+            entered
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap(),
+            9999
+        );
+        assert_eq!(
+            worker.take(1),
+            Some(0),
+            "newer input must not starve completed same-scope frames"
+        );
+        release.send(()).unwrap();
+        wait_until(|| worker.shared.0.lock().unwrap().completed.is_some());
+        assert_eq!(worker.take(1), Some(9999));
+    }
+
+    #[test]
+    fn lyric_worker_rejects_old_generation_and_close_drops_pending() {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let worker = super::LatestWorker::new(move |input: u32| {
+            entered_tx.send(input).unwrap();
+            released.recv().unwrap();
+            input
+        });
+        worker.submit(1, 10);
+        assert_eq!(
+            entered
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap(),
+            10
+        );
+        worker.submit(2, 20);
+        release.send(()).unwrap();
+        assert_eq!(
+            entered
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap(),
+            20
+        );
+        assert_eq!(worker.take(2), None);
+        worker.submit(2, 30);
+        worker.close();
+        assert!(worker.shared.0.lock().unwrap().pending.is_none());
+        release.send(()).unwrap();
+        wait_until(|| worker.stopped());
+        assert_eq!(worker.take(2), None);
+        assert!(
+            entered.try_recv().is_err(),
+            "closing must not execute queued frames"
+        );
+    }
     #[cfg(target_os = "macos")]
     #[test]
     fn luminous_context_keeps_real_tracking_leading_trailing_and_blur() {

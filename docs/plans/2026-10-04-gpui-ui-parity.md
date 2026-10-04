@@ -346,6 +346,14 @@ v30完整包exit0，实际PID12373，runtime`/tmp/gmgn-gpui-parity-v30-runtime.l
 
 v31完整包exit0（`/tmp/gmgn-gpui-product-app-build-v31.log`），PID12710，同一数据根，runtime`/tmp/gmgn-gpui-parity-v31-runtime.log`。CUA先通过原装修面板Esc结束摆放，再小窗提交同一句真实请求，request1 accepted→reply；截图文字在气泡内换行，右侧关闭X和六圆入口完整可见。此用户回复换行子路径通过，不计自主后台交付实际通过。未注入语音密钥，本轮原语音提示缺凭据，声音未验收；未录音/登录/删除资产。最后源码复核去掉展开时绕过dismiss的条件，保留关闭语义；此最后窄修仍需新包真实关闭/恢复复验，不能把v31截图扩大为该行为通过。
 
+### 歌词渲染后台背压阶段修复（GPU 迁移继续）
+
+用户报告v39 Release歌词仍严重卡顿，真实采样 `/tmp/gmgn-gpui-v39-lyrics-stutter-sample.txt` 主线程1517样本，其中1317在StageLyricsPane.render、1299在SVG/resvg光栅，进程footprint6.1GB；不计性能通过，已恢复Swift UI使用。随后核实误开的Swift进程未带隔离根，已纠正至PID97010、原 `/private/tmp/gmgn-rust-core-final-business-20261004`，未导入/删除/重试入库用户资产。
+
+用户明确继续修GPUI歌词。当前阶段Scene、CoreText、SVG解析/光栅移单工作线程；仅执行中1帧+最新待处理1帧+至多1完成结果，歌曲/模式/尺寸generation拒旧帧，同generation完成帧仍可发布防持续输入饿死。隐藏/释放关队列，等待旧worker结束才重建，旧纹理明确drop_image，main接小窗可见生命周期。完整UI102/102、App13/13+ABI1/1、cargo check及Release build均exit0；日志 `/tmp/gmgn-gpui-lyrics-async-app-tests.log`、`/tmp/gmgn-gpui-lyrics-async-release-build.log`。此阶段仍整屏CPU绘制，尚未真实歌曲性能/RSS验收，不宣称最终修好、不切换正在使用的Swift。
+
+独立GPU歌词基础模块正在 `tools/gpui-lyrics-metal-probe` 实现被动透明CAMetalLayer、受限字形atlas和GPU形变/光效；现GPUI公共paint_glyph没有glyph blur/glow与透视，paint_surface仅YCbCr不透明，不能直接忠实代换全部11模式。基础模块与最终全部模式视觉/真实业务验收分开，不用探针代替端到端。
+
 ### 歌单与歌词严重卡顿：性能优先，未通过就恢复 Swift UI
 
 用户实际登录网易云后已有50歌单，报告全界面、滚动和歌词卡住；暂停外观对齐，优先性能修复。v36 PID83263五秒采样 `/tmp/gmgn-gpui-v36-playlist-scroll-sample.txt`：主线程100ms tick/poll重复执行settings.snapshot→installedBackends→可执行目录扫描。已加5秒安装元信息缓存及显式刷新，不缓存凭据/连接，实际启动仍即时检查。另修登录重复全量歌单请求，真实账号轻量验证保留；排序/编码/写盘/读回移后台，每provider同步状态独立，失败保持连接，取消与迟到覆盖受控。
