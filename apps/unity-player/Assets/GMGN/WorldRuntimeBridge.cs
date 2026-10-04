@@ -23,6 +23,7 @@ namespace GMGN.UnityPlayer
         Quaternion playerRotation;
         JObject recoveredCamera;
         float playerFieldOfView;
+        float playerNearPlane, playerFarPlane;
         public JObject AuthorityProjection { get; private set; }
         public bool Configured => !string.IsNullOrEmpty(worldID) && !string.IsNullOrEmpty(packageDirectory);
 
@@ -87,7 +88,11 @@ namespace GMGN.UnityPlayer
         void SetVisible(bool value)
         {
             var camera = Camera.main;
-            if (value && !visible && camera != null) { playerPosition = camera.transform.position; playerRotation = camera.transform.rotation; playerFieldOfView = camera.fieldOfView; }
+            if (value && !visible && camera != null) {
+                playerPosition = camera.transform.position; playerRotation = camera.transform.rotation;
+                playerFieldOfView = camera.fieldOfView;
+                playerNearPlane = camera.nearClipPlane; playerFarPlane = camera.farClipPlane;
+            }
             visible = value;
             worldRoot.SetActive(value);
             sculpture.enabled = !value;
@@ -99,10 +104,15 @@ namespace GMGN.UnityPlayer
             {
                 if (value && recoveredCamera != null) {
                     camera.transform.SetPositionAndRotation(WorldCoordinates.Position(recoveredCamera["transform"]?["position"]),
-                        WorldCoordinates.Rotation(recoveredCamera["transform"]?["rotation"]) * Quaternion.Euler(0, 180, 0));
+                        WorldCoordinates.Rotation(recoveredCamera["transform"]?["rotation"]));
                     camera.fieldOfView = (float?)recoveredCamera["fieldOfViewDegrees"] ?? 60;
+                    camera.nearClipPlane = (float?)recoveredCamera["nearPlane"] ?? .05f;
+                    camera.farClipPlane = (float?)recoveredCamera["farPlane"] ?? 250;
                 } else if (value) { camera.transform.position = new Vector3(0, 1.6f, -4); camera.transform.LookAt(new Vector3(0, 1, 0)); }
-                else { camera.transform.SetPositionAndRotation(playerPosition, playerRotation); camera.fieldOfView = playerFieldOfView; }
+                else {
+                    camera.transform.SetPositionAndRotation(playerPosition, playerRotation); camera.fieldOfView = playerFieldOfView;
+                    camera.nearClipPlane = playerNearPlane; camera.farClipPlane = playerFarPlane;
+                }
             }
             ModeChanged?.Invoke(value);
         }

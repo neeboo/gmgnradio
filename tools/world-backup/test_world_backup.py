@@ -123,6 +123,58 @@ class WorldBackupTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             backup.backup(self.db, self.bundle)
 
+    def explicit_blob_fixture(self):
+        # A complete small GLB container; no live service or user data.
+        payload = b'{"asset":{"version":"2.0"}}  '
+        self.blob.write_bytes(b"glTF" + (2).to_bytes(4, "little") + (20 + len(payload)).to_bytes(4, "little") + len(payload).to_bytes(4, "little") + b"JSON" + payload)
+        sha = backup.digest(self.blob)
+        value = {"metadata": {"gmgn.generated-prop.v1": json.dumps({"assetID": "sha256:" + sha})}}
+        conn = sqlite3.connect(self.db)
+        conn.execute("DELETE FROM world_blobs")
+        conn.execute("UPDATE world_records SET value=?", (json.dumps(value),))
+        conn.commit()
+        conn.close()
+        return sha
+
+    def test_explicit_legacy_blob_cli_and_relocation(self):
+        sha = self.explicit_blob_fixture()
+        result = self.cli("backup", "--database", self.db, "--out", self.bundle, "--blob-file", self.blob, "--blob-file", self.blob)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        worlds = backup.load(self.bundle / "worlds.json")
+        self.assertEqual(len(worlds["blobs"]), 1)
+        self.assertEqual(worlds["blobs"][0]["sha256"], sha)
+        self.assertEqual(backup.digest(self.bundle / worlds["blobs"][0]["path"]), sha)
+        self.assertFalse(any(p.suffix == ".sqlite3" for p in backup.files(self.bundle)))
+        self.assertNotIn(b"NEVER_EXPORT_THIS_CREDENTIAL", b"".join(p.read_bytes() for p in backup.files(self.bundle)))
+        shutil.rmtree(self.source)
+        recovered = self.root / "recovered"
+        backup.recover(self.bundle, recovered)
+        self.assertEqual(backup.digest(recovered / f"blobs/{sha}"), sha)
+
+    def test_explicit_blob_unreferenced_or_corrupt_rejected(self):
+        self.explicit_blob_fixture()
+        self.blob.write_bytes(self.blob.read_bytes().replace(b"version", b"versioN"))
+        with self.assertRaisesRegex(ValueError, "not referenced"):
+            backup.backup(self.db, self.bundle, blob_files=[self.blob])
+        self.assertFalse(self.bundle.exists())
+        self.blob.write_bytes(b"NEVER_EXPORT_THIS_CREDENTIAL")
+        with self.assertRaisesRegex(ValueError, "not a GLB"):
+            backup.backup(self.db, self.bundle, blob_files=[self.blob])
+
+    def test_explicit_blob_symlink_directory_and_wrong_type_rejected(self):
+        self.explicit_blob_fixture()
+        link = self.source / "linked.glb"
+        link.symlink_to(self.blob)
+        for path in (link, self.source, self.db):
+            with self.assertRaises(ValueError):
+                backup.backup(self.db, self.bundle, blob_files=[path])
+
+    def test_taskservice_root_still_forbidden(self):
+        directory = self.source / "TaskService"
+        directory.mkdir()
+        with self.assertRaisesRegex(ValueError, "broad asset root"):
+            backup.backup(self.db, self.bundle, [f"task={directory}"])
+
     def test_sensitive_asset_rejected(self):
         for name in (".env", "private.pem", "private.key"):
             file = self.assets / name

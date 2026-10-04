@@ -23,6 +23,8 @@ python3 -m unittest discover -s tools/world-backup -p 'test_*.py' -v
 
 另外保守纳入数据库全部 `world_blobs` 登记的原始本地文件，校验登记大小及 SHA256；没有本地资产（包括仅 remote_key 的登记）或内容损坏则失败，需先通过现有资产链路完成下载。当前没有推测引用可达性，因此未引用的旧 blob 也可能阻止备份，不能宣称支持单世界选择备份。`local_path` 与 `remote_key` 不作为 blob 元数据导出。
 
+旧生成物件可能只在世界记录的 `assetID` 中保存 `sha256:<hash>`，没有 `world_blobs` 登记。此时重复传入 `--blob-file /explicit/one-generated-model.glb`：只纳入该常规 GLB 2.0 文件，计算出的 SHA256 必须匹配世界记录中的资产编号，并加入同一 blob 索引；重复哈希只登记一次。此参数不会扫描父目录，也不允许把 TaskService 整根作为资产目录。没有匹配、错误文件类型、符号链接或损坏 GLB 头部均拒绝。资产编号允许位于 metadata 的 JSON 字符串中，原始记录仍不重写。
+
 记录的原始 authority hash 作为来源信息保留，不与重新序列化的 Python JSON 字节比较；这里只验证基础记录字段与包内文件完整性，不执行 taskd 的全部世界语义校验。macOS 系统 `/tmp`、`/var` 别名接受并归一到 `/private`，任意资产或包内符号链接仍拒绝。
 
 ## 格式与恢复边界

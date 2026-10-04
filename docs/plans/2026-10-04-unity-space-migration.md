@@ -14,6 +14,8 @@
 - Swift 宿主 Release 构建退出码 0：tmp/unity-world-host-build.log。
 - 独立 Unity v15 Release 构建退出码 0：tmp/unity-world-player-v15-build.log。
 - 上述结果不代表真实用户空间运行验收通过。
+- v16 实际启动，便携备份 v3 内 7 个真实 GLB 哈希匹配；加载 5 个启用物件。当前画面空黑，定位为相机额外旋转 180 度，正在修复，尚未视觉通过。
+- 备份工具新增显式 --blob-file，避免导出整个 TaskService；18 个测试通过，实际 7 个引用模型缺失数 0。用户备份只在 tmp，不进入 Git。
 
 ## 下一步
 

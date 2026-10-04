@@ -129,7 +129,28 @@ def snapshot(database):
         connection.close()
 
 
-def backup(database, destination, asset_roots=()):
+def referenced_asset_hashes(value):
+    result = set()
+    def visit(child):
+        if isinstance(child, dict):
+            asset = child.get("assetID")
+            if isinstance(asset, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", asset):
+                result.add(asset[7:])
+            for nested in child.values():
+                visit(nested)
+        elif isinstance(child, list):
+            for nested in child:
+                visit(nested)
+        elif isinstance(child, str) and child.startswith(("{", "[")):
+            try:
+                visit(json.loads(child))
+            except json.JSONDecodeError:
+                pass
+    visit(value)
+    return result
+
+
+def backup(database, destination, asset_roots=(), blob_files=()):
     out = reserve_destination(destination)
     worlds, blobs = snapshot(database)
     sources = {}
@@ -166,6 +187,31 @@ def backup(database, destination, asset_roots=()):
         target = f"blobs/{sha}"
         sources[target] = source
         blob_entries.append({"sha256": sha, "bytes": blob["bytes"], "mime": blob["mime"], "path": target})
+    # Legacy generated props may carry a verified content ID without a
+    # world_blobs registry entry. Explicit GLB files bridge that gap without
+    # enumerating/exporting the operational TaskService directory.
+    references = referenced_asset_hashes(worlds)
+    indexed = {entry["sha256"] for entry in blob_entries}
+    for raw in blob_files:
+        source = safe_path(raw)
+        # A file in TaskService is allowed, but credential-like file names are
+        # still forbidden. Do not treat its parent as an asset directory.
+        asset_name_safe(source)
+        if not source.is_file() or source.suffix.lower() != ".glb":
+            fail("explicit blob file must be a regular GLB file")
+        size = source.stat().st_size
+        with source.open("rb") as stream:
+            header = stream.read(12)
+        if size < 20 or len(header) != 12 or header[:4] != b"glTF" or int.from_bytes(header[4:8], "little") != 2 or int.from_bytes(header[8:12], "little") != size:
+            fail("explicit blob file is not a GLB 2.0 container")
+        sha = digest(source)
+        if sha not in references:
+            fail("explicit blob hash is not referenced by any world assetID")
+        target = f"blobs/{sha}"
+        sources[target] = source
+        if sha not in indexed:
+            blob_entries.append({"sha256": sha, "bytes": size, "mime": "model/gltf-binary", "path": target})
+            indexed.add(sha)
     # Missing paths inside metadata cannot be silently accepted. Absolute paths
     # remain unchanged in the neutral records; adapters use referenceBindings.
     source_map = {str(source): target for target, source in sources.items()}
@@ -285,6 +331,7 @@ def main():
     b.add_argument("--database", required=True)
     b.add_argument("--out", required=True)
     b.add_argument("--asset-root", action="append", default=[])
+    b.add_argument("--blob-file", action="append", default=[], help="Explicit GLB file whose SHA256 matches a world assetID; repeat per file")
     v = subs.add_parser("verify")
     v.add_argument("--bundle", required=True)
     r = subs.add_parser("recover")
@@ -293,7 +340,7 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == "backup":
-            result = str(backup(args.database, args.out, args.asset_root))
+            result = str(backup(args.database, args.out, args.asset_root, args.blob_file))
         elif args.command == "recover":
             result = str(recover(args.bundle, args.out))
         else:
