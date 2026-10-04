@@ -35,10 +35,24 @@ must retain the timeline until the next revision. Every snapshot consumes chat
 events; use one polling owner and dispatch to UI consumers. Free every returned
 UTF-8 snapshot with `gmgn_unity_host_string_free`.
 
-Known sample gaps: seeking is explicitly unsupported; provider library/search selection and streaming reply deltas
-are not implemented here. Chat currently reports accepted/final reply/failure/
+Known sample gaps: seeking is explicitly unsupported; provider library/search selection
+is not implemented here. Chat reports accepted/delta/final reply/failure/
 cancelled with request IDs and sequence numbers. These gaps are not represented
 as successful or simulated functionality.
+
+Chat capabilities explicitly expose `streamingReplies:true`, `deltaTextMode:"replace"`,
+`cancelActiveReply:true`, `cancellationAcknowledgement:"local-turn-invalidated"`
+and `providerCancellationAcknowledgement:false`. The cancellation event confirms
+the local turn was invalidated and its native connector closed; it does not claim
+a remote provider cancellation acknowledgement or that the child process has
+already exited. UI should finish the matching request on `cancelled`, preserve
+the recovered draft from `chat.state.draft`, and reject late replies by request ID.
+Each `delta` event contains the cumulative genuine ACP text received so far;
+replace the matching message text, do not append. Final `reply` carries the
+complete response and ends the request. Cumulative text preserves correctness
+when bounded event polling drops intermediate updates. No final response is
+split into invented deltas. Native transport filters active session and prompt
+ownership; the bridge additionally filters request ID and generation after cancel.
 
 Validation: Release host build passed. `abi-smoke.c` passed real dylib load,
 creation, isolated snapshot, volume bounds, unsupported-seek rejection and

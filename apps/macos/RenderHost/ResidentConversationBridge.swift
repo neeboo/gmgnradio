@@ -86,12 +86,22 @@ final class RenderHostResidentConversation {
         // Cancellation can replace the service before this Task resumes.
         // Every old operation must retain only its original service/connector.
         let turnService = service
+        let turnConnector = connector
+        turnConnector.onTextDelta = { [weak self] text in
+            guard let self, lease == self.generation,
+                  self.activeRequestID == requestID, !text.isEmpty else { return }
+            self.reply += text
+            // Cumulative snapshots tolerate bounded polling queues dropping
+            // intermediate updates. Receivers replace, never append this text.
+            self.enqueue(kind: "delta", requestID: requestID, text: self.reply)
+        }
         task = Task { [weak self] in
             guard let self else { return }
             do {
                 let response = try await turnService.send(submission.text, history: previous, userMessage: submission.text)
                 guard lease == generation, !Task.isCancelled else { return }
                 reply = response
+                turnConnector.onTextDelta = nil
                 transcript += [.init(role: .user, text: submission.text), .init(role: .agent, text: response)]
                 transcript = Array(transcript.suffix(24))
                 enqueue(kind: "reply", requestID: requestID, text: response)
@@ -100,6 +110,7 @@ final class RenderHostResidentConversation {
                 task = nil
             } catch {
                 guard lease == generation else { return }
+                turnConnector.onTextDelta = nil
                 draft = recovery.restore(submission, text: draft, attachments: []).text
                 let notice = error is CancellationError ? "已停止本次回复。" : error.localizedDescription
                 statusNotice = notice
@@ -144,7 +155,7 @@ final class RenderHostResidentConversation {
         ["configured": true, "backend": backend, "isThinking": task != nil,
          "canStop": activeSubmission != nil, "draft": draft, "reply": reply,
          "statusNotice": statusNotice as Any? ?? NSNull(),
-         "deliveryMode": "final-response", "worldToolsEnabled": false,
+         "deliveryMode": "streamed-response", "deltaTextMode": "replace", "worldToolsEnabled": false,
          "transcript": transcript.map { ["role": $0.role.rawValue, "text": $0.text] }]
     }
 
@@ -188,6 +199,7 @@ private struct RenderHostForbiddenHeadlessRunner: CodexCommandRunning {
 /// verification, mounted modules and managed credentials remain production DSH.
 @MainActor
 private final class RenderHostDSHConnector: ResidentDSHImageConnecting {
+    var onTextDelta: (@MainActor (String) -> Void)?
     private let node: URL
     private let entry: URL
     private let dataRoot: URL
@@ -234,7 +246,7 @@ private final class RenderHostDSHConnector: ResidentDSHImageConnecting {
 
     func prompt(sessionID: String, blocks: [ResidentDSHPromptBlock]) async throws -> String {
         guard let native else { throw ResidentDSHTransportError.notConnected }
-        return try await native.prompt(sessionID: sessionID, blocks: blocks)
+        return try await native.prompt(sessionID: sessionID, blocks: blocks, onTextDelta: onTextDelta)
     }
     func cancelActivePrompt() { native?.cancelActivePrompt() }
     func awaitCancellationSettled() async { await native?.awaitCancellationSettled() }

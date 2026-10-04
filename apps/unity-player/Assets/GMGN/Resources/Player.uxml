@@ -26,11 +26,6 @@
         </ui:VisualElement>
       </ui:VisualElement>
       <ui:VisualElement class="player card">
-        <ui:VisualElement class="track-row row">
-          <ui:Label name="track" text="尚未播放" class="track-title" />
-          <ui:Label name="artist" class="artist muted" />
-          <ui:Label name="time" text="0:00 / 0:00" class="time muted" />
-        </ui:VisualElement>
         <ui:VisualElement class="toolbar row">
           <ui:Button name="chooseMusic" tooltip="打开本地音乐" class="icon-button" />
           <ui:Button name="previous" tooltip="上一首尚未接入" class="icon-button" enabled="false" />

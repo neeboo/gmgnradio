@@ -153,7 +153,11 @@ final class UnityMediaHost {
             music["lines"] = lines.map { ["id": $0.id, "text": $0.text, "start": $0.startsAt, "end": $0.endsAt] }
             emittedLyricRevision = lyricRevision
         }
-        return ["version": 1, "music": music, "chat": chat.poll()]
+        var conversation = chat.poll()
+        conversation["capabilities"] = ["streamingReplies": true, "deltaTextMode": "replace",
+            "cancelActiveReply": true, "cancellationAcknowledgement": "local-turn-invalidated",
+            "providerCancellationAcknowledgement": false]
+        return ["version": 1, "music": music, "chat": conversation]
     }
 
     func close() {

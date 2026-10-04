@@ -499,12 +499,17 @@ struct FixtureDSHLocator: AgentExecutableLocating {
             try await Task.sleep(nanoseconds: 2_500_000_000)
             check(connector.isUsable, "the grace window did not fire after a settled cancellation")
 
-            let second = try await connector.prompt(sessionID: handle.sessionID, blocks: [.text("第二轮")])
+            var observedDeltas: [String] = []
+            let second = try await connector.prompt(sessionID: handle.sessionID, blocks: [.text("第二轮")],
+                onTextDelta: { observedDeltas.append($0) })
             check(second == "second",
                   "cross-session chunk is filtered out of the reply (got \(second.debugDescription))")
-            let third = try await connector.prompt(sessionID: handle.sessionID, blocks: [.text("第三轮")])
+            check(observedDeltas == ["second"], "observer receives only genuine active-session text chunks")
+            let third = try await connector.prompt(sessionID: handle.sessionID, blocks: [.text("第三轮")],
+                onTextDelta: { observedDeltas.append($0) })
             check(third == "",
                   "a late chunk after settlement cannot pollute the reply (got \(third.debugDescription))")
+            check(observedDeltas == ["second"], "observer filters same-session chunks arriving after prompt settlement")
 
             let promptSessions = stateLines(state)
                 .filter { $0.hasPrefix("prompt ") }
@@ -601,8 +606,9 @@ let transportAgentFiles = [
     "ResidentClaudeToolBridge", "ResidentClaudeProcessRunner",
 ].map { root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/\($0).swift").path }
 let transportVisionFile = root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/ResidentVisionCapture.swift")
+let transportRetryFile = root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift")
 compile.arguments = ["-swift-version", "6", "-parse-as-library", "-j1"] + transportAgentFiles
-    + [transportVisionFile.path, transportCopy.path, main.path, "-o", binary.path]
+    + [transportVisionFile.path, transportRetryFile.path, transportCopy.path, main.path, "-o", binary.path]
 try compile.run()
 let compileDeadline = Date().addingTimeInterval(120)
 while compile.isRunning && Date() < compileDeadline {

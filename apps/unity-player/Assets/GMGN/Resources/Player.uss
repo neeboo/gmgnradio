@@ -40,6 +40,8 @@ Button:disabled { opacity: 0.4; }
 .message { padding: 8px 12px; margin-bottom: 8px; background-color: #1b2026; border-radius: 8px; }
 .message-role { font-size: var(--caption); color: var(--accent); margin-bottom: 4px; }
 .message-text { font-size: var(--body); white-space: normal; }
+.message-error .message-text { color: #ffb4ad; }
+.retry-message { align-self: flex-start; margin-top: 8px; height: 32px; color: var(--accent); }
 .draft { height: 64px; flex-shrink: 0; font-size: var(--body); margin: 0; }
 .draft .unity-text-field__input { padding: 8px 12px; background-color: #13161b; color: var(--text); border-width: 1px; border-color: var(--line); border-radius: 8px; white-space: normal; }
 .composer-footer { margin-top: 8px; flex-shrink: 0; }

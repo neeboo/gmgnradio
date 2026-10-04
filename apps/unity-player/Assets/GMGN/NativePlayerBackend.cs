@@ -67,7 +67,9 @@ namespace GMGN.UnityPlayer
             if (value.chat?.events == null) return;
             foreach (var item in value.chat.events) {
                 if (!requestIds.TryGetValue(item.requestID, out var id)) continue;
-                if (item.kind == "reply" || item.kind == "failure" || item.kind == "cancelled") {
+                if (item.kind == "delta") {
+                    Chat?.Invoke(new ChatUpdate { messageId = id, text = item.text ?? "", complete = false });
+                } else if (item.kind == "reply" || item.kind == "failure" || item.kind == "cancelled") {
                     Chat?.Invoke(new ChatUpdate { messageId = id, text = item.text ?? item.message ?? "", error = item.kind == "failure" ? item.message : null, complete = true });
                     requestIds.Remove(item.requestID);
                 }

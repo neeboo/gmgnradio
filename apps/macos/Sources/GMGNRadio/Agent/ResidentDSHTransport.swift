@@ -107,6 +107,7 @@ enum ResidentDSHTransport {
     private var promptInFlight = false
     private var activeSessionID: String?
     private var replyChunks: String = ""
+    private var activeTextDeltaObserver: (@MainActor (String) -> Void)?
     private struct Pending {
         let method: String
         let continuation: CheckedContinuation<Data, Error>
@@ -228,6 +229,13 @@ enum ResidentDSHTransport {
     }
 
     func prompt(sessionID: String, blocks: [ResidentDSHPromptBlock]) async throws -> String {
+        try await prompt(sessionID: sessionID, blocks: blocks, onTextDelta: nil)
+    }
+
+    /// Optional presentation observer; existing callers retain final-response
+    /// behavior. Only genuine ACP text updates for this prompt are delivered.
+    func prompt(sessionID: String, blocks: [ResidentDSHPromptBlock],
+                onTextDelta: (@MainActor (String) -> Void)?) async throws -> String {
         // Overlapping calls are rejected before any shared state is touched:
         // entering here would otherwise clear the old grace window and
         // overwrite activeSessionID/replyChunks of the in-flight turn.
@@ -237,6 +245,7 @@ enum ResidentDSHTransport {
         replyChunks = ""
         promptInFlight = true
         activeSessionID = sessionID
+        activeTextDeltaObserver = onTextDelta
         // A cancellation armed by an earlier turn must not leak into this one.
         cancellationSent = false
         cancellationGraceTask?.cancel()
@@ -244,6 +253,7 @@ enum ResidentDSHTransport {
         defer {
             promptInFlight = false
             activeSessionID = nil
+            activeTextDeltaObserver = nil
             // A settled turn — end_turn or a graceful cancelled stop — must
             // disarm this round's grace window so it can never hard-close a
             // healthy session afterwards.
@@ -468,6 +478,7 @@ enum ResidentDSHTransport {
                     return
                 }
                 replyChunks += text
+                activeTextDeltaObserver?(text)
             }
             return
         }
@@ -504,6 +515,7 @@ enum ResidentDSHTransport {
     private func finish(_ error: Error) {
         guard !closed else { return }
         closed = true
+        activeTextDeltaObserver = nil
         cancellationGraceTask?.cancel()
         cancellationGraceTask = nil
         output?.readabilityHandler = nil

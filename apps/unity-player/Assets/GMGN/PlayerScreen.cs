@@ -9,18 +9,20 @@ namespace GMGN.UnityPlayer
 {
     public sealed class PlayerScreen : MonoBehaviour
     {
-        sealed class Message { public string id, role, text; }
+        sealed class Message { public string id, role, text, requestText; public bool failed; }
         readonly List<Message> messages = new();
         readonly Dictionary<string, int> indices = new();
         IPlayerBackend backend;
         ListView list;
         TextField draft;
-        Label status, track, artist, lyric, translation, time;
+        Label status, lyric, translation;
         Button play, send, cancel, newMessages;
         Slider volume;
         string pending;
         double duration;
-        bool follow = true, dirty;
+        bool follow = true, dirty, refreshing;
+        ScrollView chatScroll;
+        IVisualElementScheduledItem followScroll;
         AudioSculpture sculpture;
         VisualElement root, chatPanel;
         ToolbarIcon playIcon;
@@ -48,15 +50,15 @@ namespace GMGN.UnityPlayer
             root.AddToClassList("document-root");
             root.styleSheets.Add(Resources.Load<StyleSheet>("Player"));
             root.RegisterCallback<GeometryChangedEvent>(e => root.EnableInClassList("compact", e.newRect.width < 780 || e.newRect.height < 600));
-            status = root.Q<Label>("status"); track = root.Q<Label>("track"); artist = root.Q<Label>("artist");
-            lyric = root.Q<Label>("lyric"); translation = root.Q<Label>("translation"); time = root.Q<Label>("time");
+            status = root.Q<Label>("status");
+            lyric = root.Q<Label>("lyric"); translation = root.Q<Label>("translation");
             draft = root.Q<TextField>("draft"); draft.textEdition.placeholder = "和角色聊聊…";
             BindKeyboard();
             send = root.Q<Button>("send"); cancel = root.Q<Button>("cancel"); play = root.Q<Button>("play");
             chatPanel = root.Q("chatPanel");
             root.Q<Button>("chatToggle").clicked += () => ToggleChat(chatPanel.ClassListContains("hidden"));
             root.Q<Button>("closeChat").clicked += () => ToggleChat(false);
-            root.Q<Button>("fullscreen").clicked += () => Screen.fullScreen = !Screen.fullScreen;
+            root.Q<Button>("fullscreen").clicked += NativeUIScale.ToggleFullscreen;
             AddIcon("chooseMusic", "music"); AddIcon("previous", "previous");
             playIcon = AddIcon("play", "play"); AddIcon("next", "next");
             AddIcon("microphone", "microphone"); AddIcon("chatToggle", "chat");
@@ -70,17 +72,25 @@ namespace GMGN.UnityPlayer
             list.makeItem = () => { var box = new VisualElement(); box.AddToClassList("message");
                 var role = new Label(); role.AddToClassList("message-role"); box.Add(role);
                 var body = new Label { enableRichText = false }; body.AddToClassList("message-text");
-                body.selection.isSelectable = true; box.Add(body); return box; };
-            list.bindItem = (row, i) => { ((Label)row[0]).text = messages[i].role; ((Label)row[1]).text = messages[i].text; };
-            var chatScroll = list.Q<ScrollView>();
+                body.selection.isSelectable = true; box.Add(body);
+                var retry = new Button { text = "重新编辑并发送" }; retry.AddToClassList("retry-message");
+                retry.clicked += () => { if (retry.userData is Message message) RestoreDraft(message); };
+                box.Add(retry); return box; };
+            list.bindItem = (row, i) => { var message = messages[i]; ((Label)row[0]).text = message.role; ((Label)row[1]).text = message.text;
+                row.EnableInClassList("message-error", message.failed);
+                var retry = (Button)row[2]; retry.userData = message; retry.EnableInClassList("hidden", !message.failed); };
+            chatScroll = list.Q<ScrollView>();
             chatScroll.verticalScroller.valueChanged += value => {
+                if (refreshing) return;
                 follow = value >= chatScroll.verticalScroller.highValue - 36;
                 if (follow) newMessages.AddToClassList("hidden");
             };
-            newMessages.clicked += () => { follow = true; list.ScrollToItem(-1); newMessages.AddToClassList("hidden"); };
+            newMessages.clicked += () => { follow = true; ScrollToLatest(); };
             send.clicked += Send;
             draft.RegisterValueChangedCallback(_ => UpdateComposer());
-            cancel.clicked += () => { if (pending != null) backend?.Cancel(pending); };
+            cancel.clicked += () => { if (pending == null) return;
+                try { backend?.Cancel(pending); }
+                catch (Exception) { status.text = "暂时无法停止回复，请稍后重试。"; } };
             draft.RegisterCallback<KeyDownEvent>(e => {
                 if ((e.keyCode != KeyCode.Return && e.keyCode != KeyCode.KeypadEnter) || e.shiftKey) return;
                 if (composition.Length > 0 || Time.frameCount <= compositionEndedFrame + 1) return;
@@ -99,13 +109,12 @@ namespace GMGN.UnityPlayer
             SetConnected(true); status.text = "音乐与角色已连接";
         }
         void SetConnected(bool ready) { connected = ready; play.SetEnabled(ready); volume.SetEnabled(ready); root.Q<Button>("next").SetEnabled(false); root.Q<Button>("previous").SetEnabled(false); root.Q<Button>("chooseMusic").SetEnabled(ready); UpdateComposer(); }
-        void ToggleChat(bool visible) { if (visible) queuePanel?.SetVisible(false); chatPanel.EnableInClassList("hidden", !visible); root.Q<Button>("chatToggle").EnableInClassList("selected", visible); if (visible) draft.Focus(); }
+        void ToggleChat(bool visible) { if (visible) queuePanel?.SetVisible(false); chatPanel.EnableInClassList("hidden", !visible); root.Q<Button>("chatToggle").EnableInClassList("selected", visible); if (visible) { draft.Focus(); if (follow) ScrollToLatest(); } }
         void UpdateComposer() { send.SetEnabled(connected && pending == null && !string.IsNullOrWhiteSpace(draft.value)); send.EnableInClassList("hidden", pending != null); cancel.EnableInClassList("hidden", pending == null); cancel.SetEnabled(connected && pending != null); }
         void OnStatus(string value) => status.text = value;
         void OnSnapshot(PlayerSnapshot snapshot)
         {
-            track.text = string.IsNullOrEmpty(snapshot.title) ? "尚未播放" : snapshot.title;
-            artist.text = snapshot.artist ?? ""; lyric.text = snapshot.lyric ?? ""; translation.text = snapshot.translation ?? "";
+            lyric.text = snapshot.lyric ?? ""; translation.text = snapshot.translation ?? "";
             duration = snapshot.duration;
             GetComponent<UIDocument>().rootVisualElement.Q<Button>("next").SetEnabled(snapshot.nextSupported);
             root.Q<Button>("previous").SetEnabled(snapshot.previousSupported);
@@ -114,7 +123,6 @@ namespace GMGN.UnityPlayer
             volume.SetValueWithoutNotify(snapshot.volume);
             play.tooltip = snapshot.playing ? "暂停" : "播放";
             playIcon.Kind = snapshot.playing ? "pause" : "play";
-            time.text = Format(snapshot.position) + " / " + Format(duration);
             sculpture.SetFeatures(snapshot.playing, snapshot.bass, snapshot.vocal, snapshot.treble);
         }
         static string Format(double seconds) { var span = TimeSpan.FromSeconds(Math.Max(0, seconds)); return $"{(int)span.TotalMinutes}:{span.Seconds:00}"; }
@@ -124,14 +132,19 @@ namespace GMGN.UnityPlayer
             pending = Guid.NewGuid().ToString("N"); var text = draft.value.Trim();
             messages.Add(new Message { role = "你", text = text });
             GetComponent<UIDocument>().rootVisualElement.Q<Label>("emptyChat").AddToClassList("hidden");
-            indices[pending] = messages.Count; messages.Add(new Message { id = pending, role = "角色", text = "正在回复…" });
+            indices[pending] = messages.Count; messages.Add(new Message { id = pending, role = "角色", text = "正在回复…", requestText = text });
             dirty = true; draft.SetValueWithoutNotify(""); UpdateComposer();
-            backend.Send(pending, text);
+            try { backend.Send(pending, text); }
+            catch (Exception) { OnChat(new ChatUpdate { messageId = pending, error = "消息未发送，请重试。", complete = true }); }
         }
         void OnChat(ChatUpdate update)
         {
             if (!indices.TryGetValue(update.messageId, out var index)) return;
-            messages[index].text = string.IsNullOrEmpty(update.error) ? update.text : "回复未完成：" + update.error;
+            var message = messages[index];
+            message.failed = !string.IsNullOrEmpty(update.error);
+            var text = message.failed ? "回复未完成：" + update.error : update.text;
+            if (message.text == text && !update.complete) return;
+            message.text = text;
             dirty = true;
             if (update.complete && pending == update.messageId) { pending = null; UpdateComposer(); }
         }
@@ -140,12 +153,27 @@ namespace GMGN.UnityPlayer
             BindKeyboard();
             backend?.Tick();
             if (!dirty) return;
-            dirty = false; list.RefreshItems();
-            if (follow) list.schedule.Execute(() => list.ScrollToItem(-1)); else newMessages.RemoveFromClassList("hidden");
+            dirty = false;
+            var offset = chatScroll.scrollOffset;
+            refreshing = true; list.RefreshItems();
+            if (follow) ScrollToLatest(); else { chatScroll.scrollOffset = offset; newMessages.RemoveFromClassList("hidden"); }
+            refreshing = false;
+        }
+        void ScrollToLatest()
+        {
+            newMessages.AddToClassList("hidden");
+            followScroll?.Pause();
+            followScroll = list.schedule.Execute(() => { if (!follow || chatPanel.ClassListContains("hidden")) return;
+                refreshing = true; list.ScrollToItem(-1); refreshing = false; });
+        }
+        void RestoreDraft(Message message)
+        {
+            if (!string.IsNullOrWhiteSpace(draft.value)) { status.text = "输入框里还有内容，请先发送或清空，再重新编辑这条消息。"; return; }
+            draft.value = message.requestText ?? ""; draft.Focus();
         }
         void BindKeyboard() { if (keyboard == Keyboard.current) return; if (keyboard != null) keyboard.onIMECompositionChange -= OnComposition; keyboard = Keyboard.current; if (keyboard != null) keyboard.onIMECompositionChange += OnComposition; }
         void OnComposition(IMECompositionString value) { var next = value.ToString(); if (composition.Length > 0 && next.Length == 0) compositionEndedFrame = Time.frameCount; composition = next; }
-        void OnDestroy() { queuePanel?.Dispose(); if (keyboard != null) keyboard.onIMECompositionChange -= OnComposition; if (backend == null) return; backend.Snapshot -= OnSnapshot; backend.Chat -= OnChat; backend.Status -= OnStatus; backend.Dispose(); }
+        void OnDestroy() { followScroll?.Pause(); queuePanel?.Dispose(); if (keyboard != null) keyboard.onIMECompositionChange -= OnComposition; if (backend == null) return; backend.Snapshot -= OnSnapshot; backend.Chat -= OnChat; backend.Status -= OnStatus; backend.Dispose(); }
 
         ToolbarIcon AddIcon(string name, string kind)
         {
