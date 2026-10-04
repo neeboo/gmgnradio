@@ -1,5 +1,6 @@
 //! Main-thread-only, passive native background material. GPUI owns all UI and hit tests.
 use std::{ffi::c_void, marker::PhantomData, rc::Rc};
+pub type MaterialFactory = unsafe extern "C" fn(f64, f64, f64) -> *mut c_void;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -22,6 +23,10 @@ unsafe extern "C" {
     ) -> i32;
     fn gmgn_gpui_program_backdrop_clear(context: *mut c_void) -> i32;
     fn gmgn_gpui_program_backdrop_set_fade_fraction(context: *mut c_void, fraction: f64) -> i32;
+    fn gmgn_gpui_program_backdrop_set_factory(
+        context: *mut c_void,
+        factory: Option<MaterialFactory>,
+    ) -> i32;
     fn gmgn_gpui_program_backdrop_destroy(context: *mut c_void) -> i32;
     fn gmgn_gpui_program_backdrop_diagnostics(context: *mut c_void, values: *mut f64) -> i32;
 }
@@ -30,6 +35,11 @@ pub struct ProgramBackdrop {
     _main_thread: PhantomData<Rc<()>>,
 }
 impl ProgramBackdrop {
+    /// The factory's dylib must outlive this context and all its returned views.
+    /// None explicitly disables the native material and activates the GPUI fallback.
+    pub unsafe fn set_factory(&mut self, factory: Option<MaterialFactory>) -> bool {
+        unsafe { gmgn_gpui_program_backdrop_set_factory(self.context, factory) != 0 }
+    }
     /// Set before apply: zero retains the viewport clip without edge fading.
     pub fn set_fade_fraction(&mut self, fraction: f64) -> bool {
         unsafe { gmgn_gpui_program_backdrop_set_fade_fraction(self.context, fraction) != 0 }

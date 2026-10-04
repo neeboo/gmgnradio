@@ -2,6 +2,15 @@
 
 更新时间：2026-10-04。此文档来自当前 Swift/GPUI 源码只读审计；不代表运行验收通过。
 
+### 本轮字体、间距与图标修复（v46）
+
+- 2D UI 接入 Kit 原生系统字体，统一正文14/说明12/分组16/标题20，行高20/16，间距4/8/12/16/24；保留小窗尺寸、原布局与歌词艺术字体。使用 frontend-design 技能整理共享视觉规范，没有新增字体包。
+- SF Symbols 原位图绘制格式无法建立有效 CGContext，曾返回全透明像素；修复预乘绘制与 GPUI BGRA 上传，4个符号×3种颜色非零像素验证通过。App测试16项及ABI1项通过，Release v46构建退出0。
+- v46 PID17009启动后核对隔离数据根与 mounted=true，实际截图确认聊天图标和右上播放器图标已显示；随后聊天点击遇到 noWindowsAvailable，聊天/设置全部排版与空间反向图标尚未完成实际复验，不标整体通过。
+- 节目卡片主线程SVG/模糊/投影后台化仍在集成验证，歌词/换歌卡顿未验收通过。未覆盖安装版，未清用户数据。
+- 后续刷新窗口绑定并使用原生“抬升”和 Cmd+,，实际设置页已显示系统字体层级及一致卡片间距；坐标点击仍遇到工具窗口绑定错误，不能据此标聊天全流程通过。
+- 后台节目卡片实现已冻结，UI完整113项通过；有界12个待处理ID/24个完成结果，旧代次拒绝，绘制与命中共用已完成投影。局部debug窗口绘制11.3ms/滚动5.3ms仅为回归数据。v47整包Release构建成功，实际播放采样待复验。
+
 ## 完成定义
 
 迁移对象为真实 gmgn 主应用的全部 2D UI，保留 SceneKit/Metal/人物/音乐和世界业务行为。用户最新明确要求布局也与原 Swift 对齐，不改变原布局；使用 GPUI Kit 成熟组件不能改入口位置、面板结构、窗口大小或显隐规则。原有功能、状态、快捷键、数据持久化和错误恢复不得丢失。独立 probe 的叠放、聊天或构建结果仅作技术证据。
@@ -409,3 +418,16 @@ v32真实CUA复验：切回空间后原房间与2B人物渲染可见，之前启
 完整 UI89/89（`/tmp/gmgn-gpui-v32-ui-tests.log`，1.71秒）、App12/12（`/tmp/gmgn-gpui-v32-app-tests.log`）通过；宿主构建及 v32完整包均exit0，日志`/tmp/gmgn-gpui-v32-host-build.log`、`/tmp/gmgn-gpui-product-app-build-v32.log`。仅退出v31测试App，v32 PID14204使用同一隔离真实业务根，runtime`/tmp/gmgn-gpui-parity-v32-runtime.log`；CUA实际切回播放器后原点阵渲染可见。启动空间首次截图白底，尚未验证其恢复，不能报空间渲染通过。误点窗口入口进入全屏，尚未完成本轮小窗关闭/恢复视觉复验。
 
 CUA实际从原系统文件选择器选择已有 playing-10s.mov 并导入，但素材库未出现新素材；该输入为MOV，原入口限定MP4，不能据此报视频导入成功，后续需有效MP4复验。未删除素材、录音、登录或改凭据。原滚动速度限幅、背景磨砂、真实非空节目切换动画与封面/分页继续待验收；完整UI对齐仍未完成。
+### v41 GPU 歌词真实运行失败，继续返工
+
+v44独立bundle id测试启动被现有E2ERuntime保护拒绝（exit78，`/tmp/gmgn-gpui-v44-runtime.log`）；随后CUA选择App自动启动了未带隔离变量的PID13410，已立即退出该测试进程。其屏幕及歌词观察全部排除验收证据，未清理或恢复生产数据。撤销自定义bundle id构建选项，后续沿用原专用测试bundle id，必须先验证进程存活、正确root与mounted，再绑定CUA，避免自动启动。
+
+v43 Release 构建 exit0（`/tmp/gmgn-gpui-v43-build.log`），App14+ABI1、UI108测试exit0。真实PID10890同业务根启动，实际歌词与SceneKit共显，但用户确认莫奈不显示、换歌及切风格仍严重卡顿，明确不通过。真实日志 `/tmp/gmgn-gpui-v43-runtime.log` 新增证据：luminous过渡depth9超过native8，以及gpu_atlas_tile_exceeds_page；此前测试未覆盖真实长句及过渡组合。继续修native有界深度、atlas长句分块与提交热路径。
+
+用户此前授权修不好回Swift UI，本轮已回同业务根Swift Release，PID11427（`/tmp/gmgn-swift-ui-fallback-v43-runtime.log`），环境只读核验root正确，CUA实际点击进入空间，AX读回360°舞台及完整原控件。未安装覆盖、未清数据，不把回退当GPUI修复完成；后续GPUI包由主代理先验后再供用户测试。
+
+v42 Release 构建 exit0（`/tmp/gmgn-gpui-v42-build.log`），真实测试 PID9862，同业务根。最终 presentation 清屏透明度修补后，CUA 实际截图中歌词、SceneKit 空间及设置面板同时可见，黑底遮挡子问题通过。卡顿尚未通过：真实 70 batch 中文帧原生同步验证约155ms（包括GPU等待，不能当App帧率），继续优化滤镜全屏重复计算；v42进程采样证据 `/tmp/gmgn-gpui-v42-lag.sample.txt`。快照缓存 Release build26 exit0已合入该包，尚需采样比较。
+
+Release 包构建 exit0：`/tmp/gmgn-gpui-v41-build.log`，实际测试 App PID8642，沿用 `/private/tmp/gmgn-rust-core-final-business-20261004`。App 14 项及 ABI 1 项测试通过，UI 104 项通过；这些不能替代实际运行验收。真实歌单播放时用户确认严重卡顿、歌词出现后底层空间被黑底遮挡，本轮明确不通过。
+
+采样证据 `/tmp/gmgn-gpui-v41-lag.sample.txt` 显示原生 GPU render_frame 已在真实 App 调用，同时主线程 gmgnProductHostSnapshot 存在大量 Foundation JSON 序列化。原生模块确认最终 drawable renderpass 未显式设置透明 clearColor，默认 alpha=1；此前离屏测试未覆盖最终 presentation。正在分别修最终合成透明度、补真实中文 Scene presentation 验证，并检查快照热路径。未清数据、未覆盖安装 App。

@@ -3,7 +3,9 @@
 #import <QuartzCore/QuartzCore.h>
 #include <assert.h>
 #include <math.h>
-int main(void) {
+#include <dlfcn.h>
+static void *failedFactory(double w,double h,double r) { (void)w; (void)h; (void)r; return NULL; }
+int main(int argc, char **argv) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         NSWindow *window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,600,500)
@@ -32,6 +34,35 @@ int main(void) {
         assert(!gmgn_gpui_program_backdrop_set_fade_fraction(context,-0.01));
         assert(!gmgn_gpui_program_backdrop_set_fade_fraction(context,0.51));
         assert(!gmgn_gpui_program_backdrop_set_fade_fraction(context,NAN));
+        if (argc > 1) {
+            void *library=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(library);
+            GMGNProgramMaterialFactory factory=(GMGNProgramMaterialFactory)dlsym(library,"gmgn_product_material_view_create");assert(factory);
+            assert(!factory(NAN,74,22));
+            assert(gmgn_gpui_program_backdrop_set_factory(context,factory));
+            __weak NSView *weakMaterial;
+            @autoreleasepool {
+                assert(gmgn_gpui_program_backdrop_apply(context,&card,1,viewport));
+                assert(gmgn_gpui_program_backdrop_diagnostics(context,values) && values[3]==2);
+                NSView *material=root.subviews.firstObject;
+                assert([NSStringFromClass(material.class) containsString:@"ProductPassiveMaterialHostingView"]);
+                assert(!material.isOpaque && [material hitTest:NSMakePoint(1,1)]==nil);
+                weakMaterial=material;
+                assert(gmgn_gpui_program_backdrop_clear(context));
+            }
+            assert(weakMaterial==nil);
+            assert(gmgn_gpui_program_backdrop_set_factory(context,failedFactory));
+            assert(!gmgn_gpui_program_backdrop_apply(context,&card,1,viewport));
+            assert(gmgn_gpui_program_backdrop_diagnostics(context,values) && values[0]==0 && values[2]==1);
+            assert(gmgn_gpui_program_backdrop_set_factory(context,NULL));
+            assert(!gmgn_gpui_program_backdrop_apply(context,&card,1,viewport));
+            assert(gmgn_gpui_program_backdrop_diagnostics(context,values) && values[3]==0);
+            assert(gmgn_gpui_program_backdrop_set_factory(context,factory));
+            assert(gmgn_gpui_program_backdrop_apply(context,&card,1,viewport));
+            // Keep library loaded until destroy has released every Swift view.
+            assert(gmgn_gpui_program_backdrop_clear(context));
+            assert(gmgn_gpui_program_backdrop_set_factory(context,NULL));
+            dlclose(library);
+        }
         NSArray *siblings=window.contentView.subviews;
         assert([siblings indexOfObject:renderer] < [siblings indexOfObject:gpui]-1);
         card.matrix[0]=NAN;
@@ -46,7 +77,7 @@ int main(void) {
         assert(gmgn_gpui_program_backdrop_diagnostics(context,values) && values[0]==0 && values[2]==1 && values[4]==0);
         assert(gmgn_gpui_program_backdrop_destroy(context));
         assert(window.contentView.subviews.count==originalCount);
-        fprintf(stderr,"GMGN_BACKDROP_STRUCTURAL_TEST passed=true fade_zero=true fade_008=true invalid_rejected=true visual_acceptance=false\n");
+        fprintf(stderr,"GMGN_BACKDROP_STRUCTURAL_TEST passed=true fade_zero=true fade_008=true invalid_rejected=true factory_test=%d visual_acceptance=false\n",argc>1);
     }
     return 0;
 }

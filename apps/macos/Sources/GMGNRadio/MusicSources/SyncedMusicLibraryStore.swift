@@ -4,7 +4,7 @@ import Observation
 @MainActor
 @Observable
 final class SyncedMusicLibraryStore {
-    private struct Cache: Codable {
+    private struct Cache: Codable, Sendable {
         var version = 1
         var playlists: [MusicPlaylistSnapshot]
     }
@@ -23,6 +23,71 @@ final class SyncedMusicLibraryStore {
     private(set) var loadingPlaylistIDs = Set<String>()
     private let cacheURL: URL?
     private let fileManager: FileManager
+    private var revision = 0
+
+    /// Build, encode, write and verify the complete library away from the UI actor.
+    /// Only the verified atomic-file publication and observable assignment run here.
+    func mergeAndVerifyInBackground(playlists incoming: [MusicPlaylistSnapshot]) async -> Bool {
+        let expectedRevision = revision
+        let previous = playlists
+        let destination = cacheURL
+        let prepared = await Task.detached(priority: .utility) {
+            let existing = Dictionary(uniqueKeysWithValues: previous.map { ($0.id, $0) })
+            let providers = Set(incoming.map(\.providerID))
+            var merged = previous.filter { !providers.contains($0.providerID) }
+            merged += incoming.map { item in
+                let old = existing[item.id]
+                return MusicPlaylistSnapshot(id: item.id, providerID: item.providerID,
+                    name: item.name, artworkURL: item.artworkURL ?? old?.artworkURL,
+                    tracks: item.tracks.isEmpty ? old?.tracks ?? [] : item.tracks,
+                    totalTrackCount: max(item.trackCount, old?.trackCount ?? 0))
+            }
+            merged.sort {
+                $0.providerID != $1.providerID
+                    ? $0.providerID.rawValue < $1.providerID.rawValue
+                    : $0.name.localizedStandardCompare($1.name) == .orderedAscending
+            }
+            guard let destination else { return (merged, Optional<URL>.none, true) }
+            let temporary = destination.deletingLastPathComponent()
+                .appendingPathComponent(".music-library-\(UUID()).json")
+            do {
+                try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys]
+                try encoder.encode(Cache(playlists: merged)).write(to: temporary, options: .atomic)
+                let verified = try JSONDecoder().decode(Cache.self, from: Data(contentsOf: temporary))
+                guard verified.playlists == merged else {
+                    try? FileManager.default.removeItem(at: temporary)
+                    return (merged, Optional<URL>.none, false)
+                }
+                return (merged, Optional(temporary), true)
+            } catch {
+                try? FileManager.default.removeItem(at: temporary)
+                return (merged, Optional<URL>.none, false)
+            }
+        }.value
+        guard prepared.2, revision == expectedRevision, !Task.isCancelled else {
+            if let temporary = prepared.1 {
+                Task.detached(priority: .utility) { try? FileManager.default.removeItem(at: temporary) }
+            }
+            return false
+        }
+        if let temporary = prepared.1, let destination {
+            do {
+                if fileManager.fileExists(atPath: destination.path) {
+                    _ = try fileManager.replaceItemAt(destination, withItemAt: temporary)
+                } else {
+                    try fileManager.moveItem(at: temporary, to: destination)
+                }
+            } catch {
+                Task.detached(priority: .utility) { try? FileManager.default.removeItem(at: temporary) }
+                return false
+            }
+        }
+        revision += 1
+        playlists = prepared.0
+        return true
+    }
 
     init(
         cacheURL: URL? = nil,
@@ -52,6 +117,7 @@ final class SyncedMusicLibraryStore {
     func mergeAndVerify(
         playlists incoming: [MusicPlaylistSnapshot]
     ) -> Bool {
+        revision += 1
         let previousPlaylists = playlists
         let existingByID = Dictionary(
             uniqueKeysWithValues: playlists.map { ($0.id, $0) }
@@ -90,6 +156,7 @@ final class SyncedMusicLibraryStore {
     }
 
     func remove(providerID: MusicProviderID) {
+        revision += 1
         playlists.removeAll { $0.providerID == providerID }
         _ = persist()
     }
@@ -110,6 +177,7 @@ final class SyncedMusicLibraryStore {
     }
 
     func append(_ page: MusicPlaylistPage) {
+        revision += 1
         guard let index = playlists.firstIndex(where: {
             $0.id == page.playlistID
         }) else {

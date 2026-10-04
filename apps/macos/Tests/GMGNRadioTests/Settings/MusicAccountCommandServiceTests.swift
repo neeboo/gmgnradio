@@ -150,6 +150,54 @@ private enum MusicAccountTestError: Error {
     case rejected
 }
 
+@MainActor
+@Test
+func musicAccountLoginValidatesOffMainWithoutFetchingTheLibrary() async throws {
+    let client = LoginOnlyMusicClient()
+    let store = InMemoryMusicProviderSessionStore()
+    let service = MusicAccountCommandService(sessions: store, neteaseClient: client, qqMusicClient: client)
+    try await service.connect(providerID: .netease, cookie: "MUSIC_U=test-only")
+    #expect(await client.validations == 1)
+    #expect(await client.libraryFetches == 0)
+    #expect(await client.validatedOnMain == false)
+    #expect(await store.session(for: .netease) != nil)
+}
+
+private actor LoginOnlyMusicClient: AccountMusicProviderClient {
+    private func isOnMainThread() -> Bool { Thread.isMainThread }
+    let rejectsValidation: Bool
+    init(rejectsValidation: Bool = false) { self.rejectsValidation = rejectsValidation }
+    var validations = 0
+    var libraryFetches = 0
+    var validatedOnMain = false
+    func capabilities(session: MusicProviderSession) async throws -> MusicAccountCapabilities {
+        MusicAccountCapabilities(canSearchCatalog: true, canReadLibrary: true, canReadPlaylists: true,
+            canReadRecentPlays: false, canPlay: true)
+    }
+    func validateAccount(session: MusicProviderSession) async throws {
+        validations += 1
+        validatedOnMain = isOnMainThread()
+        if rejectsValidation { throw MusicAccountTestError.rejected }
+    }
+    func fetchUserLibrary(session: MusicProviderSession) async throws -> MusicProviderLibrary {
+        libraryFetches += 1
+        throw MusicAccountTestError.rejected
+    }
+    func search(_ request: MusicSearchRequest, session: MusicProviderSession) async throws -> [MusicProviderTrack] { [] }
+}
+
+@Test
+func musicAccountValidationFailureDoesNotPersistAConnection() async {
+    let client = LoginOnlyMusicClient(rejectsValidation: true)
+    let store = InMemoryMusicProviderSessionStore()
+    let service = MusicAccountCommandService(sessions: store, neteaseClient: client, qqMusicClient: client)
+    await #expect(throws: MusicAccountTestError.self) {
+        try await service.connect(providerID: .netease, cookie: "MUSIC_U=test-only")
+    }
+    #expect(await store.session(for: .netease) == nil)
+    #expect(await client.libraryFetches == 0)
+}
+
 private struct MusicAccountClientStub: AccountMusicProviderClient {
     var error: MusicAccountTestError?
 

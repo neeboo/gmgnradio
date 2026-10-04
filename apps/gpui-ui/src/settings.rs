@@ -1,4 +1,5 @@
 //! Product settings controls. Catalogs and all side effects come from ProductHost.
+use crate::ui_tokens as ui;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::InputEvent;
 use gpui_kit::component::{button::*, input::*, menu::*, switch::Switch, *};
@@ -47,6 +48,13 @@ fn tts_draft_change_requires_stop(section:&str,field:&str,previous:&Value,curren
 }
 fn save_ack_clear(revision:u64,ack:u64,submitted:&str,current:&str)->bool{
     ack>revision&&submitted==current
+}
+fn presence_more_accessibility(action:&str,name:&str)->(Role,String){
+    (Role::Button,format!("{}「{name}」的更多操作",action.trim_start_matches("移除")))
+}
+fn music_sync_command(provider:&Value,working:bool)->Option<Value>{
+    if working||provider["syncing"].as_bool()==Some(true)||provider["connected"].as_bool()!=Some(true){return None;}
+    Some(json!({"op":"music.sync","id":provider["id"]}))
 }
 
 fn orb_preview() -> impl IntoElement {
@@ -194,12 +202,12 @@ impl ParentElement for SettingsGroup {
 }
 impl RenderOnce for SettingsGroup {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let mut group = div().flex().flex_col().gap(px(8.));
+        let mut group = div().flex().flex_col().gap(px(ui::SPACING_8));
         if !self.title.is_empty() {
             group = group.child(
                 div()
-                    .pl(px(12.))
-                    .text_sm()
+                    .pl(px(ui::SPACING_12))
+                    .text_size(px(ui::CAPTION))
                     .text_color(cx.theme().muted_foreground)
                     .child(self.title),
             );
@@ -267,11 +275,14 @@ impl AgentSettingsPane {
         &self,
         id: impl Into<ElementId>,
         label: &'static str,
+        asset_name:&str,
         command: Value,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let weak = cx.entity().downgrade();
+        let (role,name)=presence_more_accessibility(label,asset_name);
         Button::new(id)
+            .role(role).accessibility_label(name)
             .icon(IconName::Ellipsis)
             .w(px(22.))
             .h(px(22.))
@@ -826,6 +837,7 @@ impl AgentSettingsPane {
                         row = row.child(self.remove_menu(
                             format!("remove-avatar-{id}"),
                             "移除角色",
+                            package["name"].as_str().unwrap_or("未命名角色"),
                             json!({"op":"presence.remove","id":id}),
                             cx,
                         ));
@@ -950,6 +962,7 @@ impl AgentSettingsPane {
                         row = row.child(self.remove_menu(
                             format!("remove-motion-{id}"),
                             "移除动作",
+                            motion["name"].as_str().unwrap_or("未命名动作"),
                             json!({"op":"presence.motion.remove","id":id}),
                             cx,
                         ));
@@ -1061,6 +1074,7 @@ impl AgentSettingsPane {
                     let id = provider["id"].clone();
                     let connected = provider["connected"].as_bool().unwrap_or(false);
                     let working = self.snapshot["music"]["working"].as_bool().unwrap_or(false);
+                    let syncing=provider["syncing"].as_bool()==Some(true);
                     let (icon, tint) = match id.as_str() {
                         Some("qq-music") => (IconName::ListMusic, rgb(0x34c759)),
                         Some("apple-music") => (IconName::Apple, rgb(0xff2d55)),
@@ -1114,12 +1128,14 @@ impl AgentSettingsPane {
                             buttons = buttons.child(
                                 Button::new(format!("sync-{id}"))
                                     .ghost().small()
-                                    .label("同步")
-                                    .disabled(working)
+                                    .label(if syncing{"正在同步…"}else{"同步"})
+                                    .disabled(working||syncing)
                                     .on_click(cx.listener({
                                         let id = id.clone();
-                                        move |this, _, _, _| {
-                                            this.commands.push(json!({"op":"music.sync","id":id}))
+                                        move |this, _, _, cx| {
+                                            if let Some(provider)=this.snapshot["music"]["providers"].as_array().into_iter().flatten().find(|provider|provider["id"]==id){
+                                                if let Some(command)=music_sync_command(provider,this.snapshot["music"]["working"].as_bool()==Some(true)){this.commands.push(command);cx.notify();}
+                                            }
                                         }
                                     })),
                             );
@@ -1286,8 +1302,8 @@ impl Render for AgentSettingsPane {
                     .flex()
                     .flex_col()
                     .gap(px(3.))
-                    .child(div().text_lg().child(title))
-                    .child(div().text_sm().child(subtitle)),
+                    .child(div().text_size(px(ui::TITLE)).font_weight(FontWeight::SEMIBOLD).child(title))
+                    .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(subtitle)),
             );
         if self.page == 0 {
             let weak = cx.entity().downgrade();
@@ -1321,6 +1337,9 @@ impl Render for AgentSettingsPane {
         }
         let mut root = div()
             .size_full()
+            .font_family(cx.theme().font_family.clone())
+            .text_size(px(ui::BODY))
+            .line_height(px(ui::BODY_LINE_HEIGHT))
             .flex()
             .flex_col()
             .bg(cx.theme().tokens.background)
@@ -1392,7 +1411,7 @@ impl Render for AgentSettingsPane {
 
 #[cfg(test)]
 mod settings_display_tests {
-    use super::{avatar_detail, motion_format, tts_draft_change_requires_stop,save_ack_clear};
+    use super::{avatar_detail, motion_format, tts_draft_change_requires_stop,save_ack_clear,presence_more_accessibility,music_sync_command};
     use serde_json::json;
     #[test]
     fn built_in_character_detail_matches_original_display() {
@@ -1435,5 +1454,28 @@ mod settings_display_tests {
         assert!(!save_ack_clear(3,3,"submitted","submitted"));
         assert!(!save_ack_clear(3,4,"submitted","new edit"));
         assert!(!save_ack_clear(3,2,"submitted","submitted"));
+    }
+    #[test]
+    fn presence_more_buttons_have_button_role_and_named_asset(){
+        let(role,label)=presence_more_accessibility("移除角色","2B");
+        assert!(matches!(role,gpui_kit::Role::Button));
+        assert_eq!(label,"角色「2B」的更多操作");
+        let(role,label)=presence_more_accessibility("移除动作","优雅挥手");
+        assert!(matches!(role,gpui_kit::Role::Button));
+        assert_eq!(label,"动作「优雅挥手」的更多操作");
+    }
+    #[test]
+    fn provider_sync_busy_blocks_only_that_provider_without_disconnect(){
+        let busy=json!({"id":"netease","connected":true,"syncing":true});
+        let ready=json!({"id":"qq-music","connected":true,"syncing":false});
+        assert!(music_sync_command(&busy,false).is_none());
+        assert_eq!(music_sync_command(&ready,false),Some(json!({"op":"music.sync","id":"qq-music"})));
+        assert!(music_sync_command(&ready,true).is_none());
+        assert!(music_sync_command(&json!({"id":"netease","connected":false}),false).is_none());
+    }
+    #[test]
+    fn sync_failure_keeps_connected_provider_retry_as_sync_not_disconnect(){
+        let failed=json!({"id":"netease","connected":true,"syncing":false,"hasError":true});
+        assert_eq!(music_sync_command(&failed,false),Some(json!({"op":"music.sync","id":"netease"})));
     }
 }

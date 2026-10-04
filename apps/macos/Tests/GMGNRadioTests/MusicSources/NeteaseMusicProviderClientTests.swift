@@ -3,6 +3,18 @@ import Testing
 @testable import GMGNRadio
 
 @Test
+func neteaseLoginValidationDoesNotRequestPlaylistsOrTracks() async throws {
+    let transport = ProviderHTTPTransportStub(responses: [
+        providerResponse("{\"code\":200,\"profile\":{\"userId\":12345}}")
+    ])
+    let client = NeteaseMusicProviderClient(transport: transport)
+    try await client.validateAccount(session: providerSession("MUSIC_U=test-only"))
+    let requests = await transport.requests
+    #expect(requests.count == 1)
+    #expect(requests.first?.url?.path == "/weapi/w/nuser/account/get")
+}
+
+@Test
 func neteaseClientSearchesWithTheUsersCookieAndMapsTracks() async throws {
     let transport = ProviderHTTPTransportStub(responses: [
         providerResponse(

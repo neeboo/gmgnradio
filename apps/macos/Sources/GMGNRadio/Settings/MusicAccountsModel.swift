@@ -20,6 +20,7 @@ final class MusicAccountsModel {
     var qqMusicState: MusicAccountAuthorizationState = .disconnected
     var appleMusicState: MusicAccountAuthorizationState = .disconnected
     var isWorking = false
+    private(set) var syncingProviders = Set<MusicProviderID>()
     var message: String?
     var hasError = false
 
@@ -59,7 +60,7 @@ final class MusicAccountsModel {
         guard state(for: providerID) == .connected else {
             return
         }
-        isWorking = true
+        guard syncingProviders.insert(providerID).inserted else { return }
         show(message: "正在同步 \(providerName(providerID))歌单…")
         publishAccountChange(providerID, connected: true)
     }
@@ -72,7 +73,8 @@ final class MusicAccountsModel {
             return
         }
         let providerID = MusicProviderID(rawValue: rawProviderID)
-        isWorking = false
+        guard state(for: providerID) == .connected else { return }
+        syncingProviders.remove(providerID)
         if let error = notification.userInfo?["errorDescription"] as? String {
             show(error: MusicLibrarySyncUIError.failed(error))
             return
@@ -92,17 +94,19 @@ final class MusicAccountsModel {
         do {
             await webLogin.clearSession(providerID: providerID)
             let cookie = try await webLogin.login(providerID: providerID)
-            show(message: "正在同步 \(providerName(providerID))…")
+            show(message: "正在验证 \(providerName(providerID))登录…")
             try await service.connect(
                 providerID: providerID,
                 cookie: cookie
             )
             rememberConnection(providerID, connected: true)
             setState(.connected, for: providerID)
+            syncingProviders.insert(providerID)
+            show(message: "\(providerName(providerID))已连接，正在后台同步歌单…")
             publishAccountChange(providerID, connected: true)
-            show(message: "\(providerName(providerID))已连接。")
         } catch MusicProviderWebLoginError.cancelled {
             setState(.disconnected, for: providerID)
+            syncingProviders.remove(providerID)
             show(message: "已取消登录。")
         } catch {
             setState(.disconnected, for: providerID)
@@ -118,6 +122,7 @@ final class MusicAccountsModel {
             await webLogin.clearSession(providerID: providerID)
             rememberConnection(providerID, connected: false)
             setState(.disconnected, for: providerID)
+            syncingProviders.remove(providerID)
             publishAccountChange(providerID, connected: false)
             show(message: "\(providerName(providerID))已断开。")
         } catch {

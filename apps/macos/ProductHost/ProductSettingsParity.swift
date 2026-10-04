@@ -99,6 +99,7 @@ final class GPUISettingsParity {
                 "providers": [MusicProviderID.netease, .qqMusic, .appleMusic].map { id in
                     ["id": id.rawValue, "name": music.providerName(id),
                      "connected": music.state(for: id) == .connected,
+                     "syncing": music.syncingProviders.contains(id),
                      "status": music.state(for: id).rawValue] as [String: Any]
                 },
                 "working": music.isWorking, "notice": music.message as Any? ?? NSNull(), "hasError": music.hasError,

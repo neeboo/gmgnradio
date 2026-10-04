@@ -5,6 +5,9 @@ import os
 import Security
 
 struct NeteaseMusicProviderClient: AccountMusicProviderClient {
+    func validateAccount(session: MusicProviderSession) async throws {
+        _ = try await fetchUserID(cookie: session.cookieHeader())
+    }
     private static let logger = Logger(
         subsystem: "ai.gmgn.radio",
         category: "NeteasePlayback"

@@ -5,6 +5,7 @@ pub mod projective_card;
 pub mod settings;
 pub mod stage_panels;
 pub mod state;
+pub mod ui_tokens;
 
 use gpui_kit::component::input::InputEvent;
 use gpui_kit::component::tooltip::Tooltip;
@@ -329,7 +330,7 @@ impl Render for ResidentChatPane {
                 }
                 cx.notify();
             }));
-        let mut controls = div().flex().items_center().gap_1();
+        let mut controls = div().flex().items_center().gap(px(ui_tokens::SPACING_4));
         controls = controls
                 .child(
                     Button::new("resident-attachment")
@@ -347,7 +348,7 @@ impl Render for ResidentChatPane {
                         })),
                 );
         if !self.compact {
-            controls = controls.child(div().flex_1().text_xs().child(self.state.status_line()));
+            controls = controls.child(div().flex_1().text_size(px(ui_tokens::CAPTION)).line_height(px(ui_tokens::CAPTION_LINE_HEIGHT)).child(self.state.status_line()));
         } else {
             controls = controls.child(div().flex_1());
         }
@@ -374,16 +375,19 @@ impl Render for ResidentChatPane {
         controls = controls.child(send);
         let mut pane = div()
             .id("resident-composer")
+            .font_family(theme.font_family.clone())
+            .text_size(px(ui_tokens::BODY))
+            .line_height(px(ui_tokens::BODY_LINE_HEIGHT))
             .w_full()
             .max_w(px(620.))
             .max_h(px(320.))
-            .p_2()
+            .p(px(ui_tokens::SPACING_8))
             .rounded_lg()
             .bg(theme.tokens.background)
             .text_color(theme.foreground)
             .flex()
             .flex_col()
-            .gap_2()
+            .gap(px(ui_tokens::SPACING_8))
             .drag_over::<ExternalPaths>(|style, _, _, _| {
                 style
                     .border_2()

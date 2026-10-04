@@ -2,11 +2,18 @@ fn main() {
     cc::Build::new()
         .file("native/window_surface.m")
         .file("native/program_backdrop.m")
+        .file("native/system_symbol.m")
+        .file("../../tools/gpui-lyrics-metal-probe/lyrics_layer.m")
         .flag("-fobjc-arc")
         .compile("gmgn_gpui_native_surface");
     println!("cargo:rustc-link-lib=framework=AppKit");
     println!("cargo:rustc-link-lib=framework=QuartzCore");
+    println!("cargo:rustc-link-lib=framework=Metal");
     println!("cargo:rerun-if-changed=native/window_surface.m");
     println!("cargo:rerun-if-changed=native/program_backdrop.m");
     println!("cargo:rerun-if-changed=native/program_backdrop.h");
+    println!("cargo:rerun-if-changed=native/system_symbol.m");
+    println!("cargo:rerun-if-changed=native/system_symbol.h");
+    println!("cargo:rerun-if-changed=../../tools/gpui-lyrics-metal-probe/lyrics_layer.m");
+    println!("cargo:rerun-if-changed=../../tools/gpui-lyrics-metal-probe/lyrics_layer.h");
 }

@@ -19,6 +19,13 @@ func musicAccountsModelUsesOfficialWebLoginBeforeSavingTheAccount() async {
     #expect(service.connectedProvider == .netease)
     #expect(service.connectedCookie == "MUSIC_U=official-session")
     #expect(model.neteaseState == .connected)
+    #expect(!model.isWorking)
+    #expect(model.syncingProviders.contains(.netease))
+    model.handleSyncCompletion(Notification(name: .musicLibrarySyncDidFinish,
+        userInfo: ["providerID": MusicProviderID.netease.rawValue, "errorDescription": "test sync failure"]))
+    #expect(model.neteaseState == .connected)
+    #expect(!model.isWorking && model.syncingProviders.isEmpty)
+    #expect(model.hasError)
 }
 
 @MainActor

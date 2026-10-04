@@ -68,6 +68,7 @@ fn icon_svg(icon: gpui_kit::assets::IconName, x: f64, y: f64, size: f64, color: 
         svg[start + 1..end].replace("currentColor", color)
     )
 }
+use base64::Engine as _;
 use gpui_kit::base::Disableable;
 use gpui_kit::component::button::*;
 use gpui_kit::prelude::FluentBuilder;
@@ -79,6 +80,248 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
+use std::{
+    collections::VecDeque,
+    sync::{Condvar, Mutex},
+};
+
+#[derive(Clone)]
+struct CardPrepareJob {
+    id: String,
+    key: String,
+    source_key: String,
+    generation: u64,
+    renderer: SvgRenderer,
+    card: Value,
+    audio: Value,
+    artwork: Option<Arc<RenderImage>>,
+    catalog: bool,
+    playlist: bool,
+    material: bool,
+    transform: CardTransform,
+    origin: [f64; 2],
+    viewport: [f64; 2],
+    ppp: f64,
+    opacity: f64,
+    mask: Option<RailMask>,
+    transition: Option<ScrollTransition>,
+    effects: CardEffects,
+}
+struct CardReady {
+    key: String,
+    source_key: String,
+    origin: [f64; 2],
+    opacity: f64,
+    projected: Arc<ProjectedCard>,
+    image: Arc<RenderImage>,
+    foreground: Option<Arc<RenderImage>>,
+    source: Arc<RgbaTexture>,
+    material_source: Option<Arc<RgbaTexture>>,
+}
+struct CardPrepareQueue {
+    generation: u64,
+    pending: HashMap<String, CardPrepareJob>,
+    order: VecDeque<String>,
+    ready: HashMap<String, Arc<CardReady>>,
+    inflight: Option<(String, String)>,
+    closed: bool,
+}
+struct CardPrepareWorker {
+    shared: Arc<(Mutex<CardPrepareQueue>, Condvar)>,
+}
+impl CardPrepareWorker {
+    fn new() -> Arc<Self> {
+        let shared = Arc::new((
+            Mutex::new(CardPrepareQueue {
+                generation: 0,
+                pending: HashMap::new(),
+                order: VecDeque::new(),
+                ready: HashMap::new(),
+                inflight: None,
+                closed: false,
+            }),
+            Condvar::new(),
+        ));
+        let state = shared.clone();
+        std::thread::Builder::new()
+            .name("stage-program-card-prepare".into())
+            .spawn(move || {
+                let mut sources: HashMap<
+                    String,
+                    (String, Arc<RgbaTexture>, Option<Arc<RgbaTexture>>),
+                > = HashMap::new();
+                loop {
+                    let job = {
+                        let mut q = state.0.lock().unwrap();
+                        while q.order.is_empty() && !q.closed {
+                            q = state.1.wait(q).unwrap();
+                        }
+                        if q.closed {
+                            break;
+                        }
+                        let id = q.order.pop_front().unwrap();
+                        let Some(job) = q.pending.remove(&id) else {
+                            continue;
+                        };
+                        q.inflight = Some((id, job.key.clone()));
+                        job
+                    };
+                    let result = prepare_card_job(&job, &mut sources);
+                    // Single consumer + at most twelve latest pending visible rows.
+                    // Publish same-generation completions even under continuous
+                    // animation; discarding each superseded frame would starve.
+                    let mut q = state.0.lock().unwrap();
+                    q.inflight = None;
+                    if !q.closed && q.generation == job.generation {
+                        if let Some(result) = result {
+                            q.ready.insert(job.id.clone(), Arc::new(result));
+                        }
+                        if q.ready.len() > 24 {
+                            q.ready.retain(|id, _| id == &job.id);
+                        }
+                    }
+                    if sources.len() > 24 {
+                        sources.retain(|id, _| id == &job.id);
+                    }
+                }
+            })
+            .expect("program preparation worker");
+        Arc::new(Self { shared })
+    }
+    fn reset(&self, generation: u64) {
+        let mut q = self.shared.0.lock().unwrap();
+        q.generation = generation;
+        q.pending.clear();
+        q.order.clear();
+        q.ready.clear();
+    }
+    fn submit(&self, job: CardPrepareJob) {
+        let mut q = self.shared.0.lock().unwrap();
+        if q.closed
+            || q.generation != job.generation
+            || q.ready.get(&job.id).is_some_and(|r| r.key == job.key)
+            || q.inflight
+                .as_ref()
+                .is_some_and(|(id, key)| id == &job.id && key == &job.key)
+            || q.pending.get(&job.id).is_some_and(|p| p.key == job.key)
+        {
+            return;
+        }
+        if !q.pending.contains_key(&job.id) {
+            if q.pending.len() >= 12 {
+                return;
+            }
+            q.order.push_back(job.id.clone());
+        }
+        q.pending.insert(job.id.clone(), job);
+        self.shared.1.notify_one();
+    }
+    fn ready(&self, id: &str, generation: u64) -> Option<Arc<CardReady>> {
+        let q = self.shared.0.lock().unwrap();
+        (q.generation == generation)
+            .then(|| q.ready.get(id).cloned())
+            .flatten()
+    }
+    fn busy(&self) -> bool {
+        let q = self.shared.0.lock().unwrap();
+        q.inflight.is_some() || !q.pending.is_empty()
+    }
+}
+impl Drop for CardPrepareWorker {
+    fn drop(&mut self) {
+        let mut q = self.shared.0.lock().unwrap();
+        q.closed = true;
+        q.pending.clear();
+        q.order.clear();
+        self.shared.1.notify_one();
+    }
+}
+
+fn prepare_card_job(
+    job: &CardPrepareJob,
+    sources: &mut HashMap<String, (String, Arc<RgbaTexture>, Option<Arc<RgbaTexture>>)>,
+) -> Option<CardReady> {
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" {
+        fn objc_autoreleasePoolPush() -> *mut std::ffi::c_void;
+        fn objc_autoreleasePoolPop(pool: *mut std::ffi::c_void);
+    }
+    #[cfg(target_os = "macos")]
+    struct Pool(*mut std::ffi::c_void);
+    #[cfg(target_os = "macos")]
+    impl Drop for Pool {
+        fn drop(&mut self) {
+            unsafe { objc_autoreleasePoolPop(self.0) }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    let _pool = Pool(unsafe { objc_autoreleasePoolPush() });
+    let cached = sources
+        .get(&job.id)
+        .filter(|(key, _, mat)| key == &job.source_key && (!job.material || mat.is_some()))
+        .cloned();
+    let (_, source, material_source) = match cached {
+        Some(c) => c,
+        None => {
+            let source = raster_card_source(
+                &job.renderer,
+                &job.card,
+                &job.audio,
+                job.catalog,
+                job.playlist,
+                job.artwork.as_ref(),
+                false,
+            )?;
+            let material = if job.material {
+                raster_card_source(
+                    &job.renderer,
+                    &job.card,
+                    &job.audio,
+                    job.catalog,
+                    job.playlist,
+                    job.artwork.as_ref(),
+                    true,
+                )
+            } else {
+                None
+            };
+            let c = (job.source_key.clone(), source, material);
+            sources.insert(job.id.clone(), c.clone());
+            c
+        }
+    };
+    let render = |source: &RgbaTexture| {
+        ProjectedCard::render_with_effects(
+            source,
+            job.transform,
+            job.origin,
+            job.viewport,
+            job.ppp,
+            job.opacity,
+            job.mask,
+            job.transition,
+            job.effects,
+        )
+        .ok()
+    };
+    let projected = Arc::new(render(&source)?);
+    let image = projected.render_image();
+    let foreground = material_source
+        .as_ref()
+        .and_then(|source| render(source))
+        .map(|p| p.render_image());
+    Some(CardReady {
+        key: job.key.clone(),
+        source_key: job.source_key.clone(),
+        origin: job.origin,
+        opacity: job.opacity,
+        projected,
+        image,
+        foreground,
+        source,
+        material_source,
+    })
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct ProgramMaterialFrame {
@@ -99,6 +342,39 @@ pub struct ProgramMaterialCard {
     pub matrix: [f64; 9],
 }
 type MaterialRenderer = Rc<dyn Fn(&ProgramMaterialFrame) -> bool>;
+type CardSourceCache = Rc<RefCell<HashMap<String, (String, Arc<RgbaTexture>)>>>;
+
+fn raster_card_source(
+    renderer: &SvgRenderer,
+    card: &Value,
+    audio: &Value,
+    catalog: bool,
+    playlist: bool,
+    artwork: Option<&Arc<RenderImage>>,
+    material: bool,
+) -> Option<Arc<RgbaTexture>> {
+    let svg = card_svg_content(card, audio, catalog, playlist, artwork.is_some());
+    let svg = if material {
+        material_foreground_svg(svg)
+    } else {
+        svg
+    };
+    let image = renderer.render_single_frame(svg.as_bytes(), 1.).ok()?;
+    let dimensions = image.size(0);
+    let mut pixels = image.as_bytes(0)?.to_vec();
+    for p in pixels.chunks_exact_mut(4) {
+        p.swap(0, 2);
+    }
+    let mut texture = RgbaTexture {
+        width: dimensions.width.0 as u32,
+        height: dimensions.height.0 as u32,
+        pixels,
+    };
+    if let Some(artwork) = artwork {
+        composite_artwork(&mut texture, artwork);
+    }
+    Some(Arc::new(texture))
+}
 
 fn material_foreground_svg(svg: String) -> String {
     svg.replace("fill=\"#1c252d\"", "fill=\"#1c252d\" fill-opacity=\"0\"")
@@ -106,11 +382,86 @@ fn material_foreground_svg(svg: String) -> String {
 }
 fn empty_card_width(card: &Value) -> f64 {
     let text = card["title"].as_str().unwrap_or("暂无节目");
-    let text_width = crate::lyrics::shaped_text_svg(text, 16., 600, 0.)
-        .map_or(text.chars().count() as f64 * 16., |line| line.width);
+    let text_width = card["emptySymbol"]["labelWidth"]
+        .as_f64()
+        .unwrap_or_else(|| {
+            crate::lyrics::shaped_text_svg(text, 16., 600, 0.)
+                .map_or(text.chars().count() as f64 * 16., |line| line.width)
+        });
     // Original horizontal padding20, spacing12 and SF waveform.path intrinsic
     // width26 at font18 medium (actual AppKit SymbolConfiguration readback).
-    40. + 12. + 26. + text_width
+    40. + 12. + card["emptySymbol"]["logicalWidth"].as_f64().unwrap_or(26.) + text_width
+}
+
+#[allow(dead_code)] // System-symbol migration is explicitly paused during perf repair.
+fn composite_empty_symbol(texture: &mut RgbaTexture, card: &Value) -> bool {
+    let symbol = &card["emptySymbol"];
+    let Some(width) = symbol["pixelWidth"]
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())
+    else {
+        return false;
+    };
+    let Some(height) = symbol["pixelHeight"]
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())
+    else {
+        return false;
+    };
+    let (Some(logical_width), Some(logical_height), Some(encoded)) = (
+        symbol["logicalWidth"].as_f64(),
+        symbol["logicalHeight"].as_f64(),
+        symbol["rgbaBase64"].as_str(),
+    ) else {
+        return false;
+    };
+    if width == 0
+        || height == 0
+        || width as u64 * height as u64 > 262144
+        || !logical_width.is_finite()
+        || !logical_height.is_finite()
+        || logical_width <= 0.
+        || logical_height <= 0.
+    {
+        return false;
+    }
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return false;
+    };
+    let Some(source) = image::RgbaImage::from_raw(width, height, bytes) else {
+        return false;
+    };
+    let scale = texture.width as f64 / empty_card_width(card);
+    let target_width = (logical_width * scale).round().max(1.) as u32;
+    let target_height = (logical_height * scale).round().max(1.) as u32;
+    let source = image::imageops::resize(
+        &source,
+        target_width,
+        target_height,
+        image::imageops::FilterType::Triangle,
+    );
+    let x = (20. * scale).round() as u32;
+    let y = ((64. - logical_height) / 2. * scale).round().max(0.) as u32;
+    for (sx, sy, pixel) in source.enumerate_pixels() {
+        let (dx, dy) = (x + sx, y + sy);
+        if dx >= texture.width || dy >= texture.height {
+            continue;
+        }
+        let i = ((dy * texture.width + dx) * 4) as usize;
+        let a = pixel[3] as f64 / 255.;
+        let old_a = texture.pixels[i + 3] as f64 / 255.;
+        let output = a + old_a * (1. - a);
+        if output > 0. {
+            for c in 0..3 {
+                texture.pixels[i + c] = ((pixel[c] as f64 * a
+                    + texture.pixels[i + c] as f64 * old_a * (1. - a))
+                    / output)
+                    .round() as u8;
+            }
+            texture.pixels[i + 3] = (output * 255.).round() as u8;
+        }
+    }
+    true
 }
 
 fn video_material_card(card: &ProgramMaterialCard) -> ProgramMaterialCard {
@@ -254,12 +605,12 @@ fn card_svg_content(
         let inner_width = width - 1.;
         let label = svg_text(
             card["title"].as_str().unwrap_or("暂无节目"),
-            58.,
-            38.,
+            32. + card["emptySymbol"]["logicalWidth"].as_f64().unwrap_or(26.),
+            card["emptySymbol"]["labelBaseline"].as_f64().unwrap_or(38.),
             16.,
             600,
             "#ffffffd6",
-            width - 78.,
+            width - 52. - card["emptySymbol"]["logicalWidth"].as_f64().unwrap_or(26.),
         );
         return format!(
             r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="64" viewBox="0 0 {width} 64"><rect x=".5" y=".5" width="{inner_width}" height="63" rx="22" fill="#1c252d"/><rect x=".5" y=".5" width="{inner_width}" height="63" rx="22" fill="none" stroke="#00ffff" stroke-opacity=".24"/><path d="M20 32h3l2-6 3 12 3-18 3 20 2-8h2" transform="translate(-8.8889 0) scale(1.444444 1)" fill="none" stroke="#00ffff" stroke-opacity=".9" stroke-width="1.5"/>{label}</svg>"##
@@ -478,7 +829,7 @@ pub struct StageProgramRailPane {
     scroll_finger_active: bool,
     snap_task: Option<Task<()>>,
     renderer: SvgRenderer,
-    card_cache: HashMap<String, (String, Arc<RgbaTexture>)>,
+    card_cache: CardSourceCache,
     pressed_card: Option<(String, bool)>,
     projection_cache: ProjectionCache,
     focus_handles: HashMap<String, FocusHandle>,
@@ -487,8 +838,10 @@ pub struct StageProgramRailPane {
     material_frame: Rc<RefCell<ProgramMaterialFrame>>,
     material_applied: Rc<Cell<bool>>,
     material_ready: Rc<Cell<bool>>,
-    material_sources: HashMap<String, (String, Arc<RgbaTexture>)>,
+    material_sources: CardSourceCache,
     material_projections: Rc<RefCell<HashMap<String, (String, Arc<RenderImage>)>>>,
+    prepare_worker: Arc<CardPrepareWorker>,
+    prepare_generation: u64,
 }
 impl StageProgramRailPane {
     pub fn new(_window: &mut Window, _cx: &mut Context<Self>) -> Self {
@@ -504,7 +857,7 @@ impl StageProgramRailPane {
             scroll_finger_active: false,
             snap_task: None,
             renderer: SvgRenderer::new(Arc::new(())),
-            card_cache: HashMap::new(),
+            card_cache: Rc::new(RefCell::new(HashMap::new())),
             pressed_card: None,
             projection_cache: Rc::new(RefCell::new(HashMap::new())),
             focus_handles: HashMap::new(),
@@ -513,8 +866,10 @@ impl StageProgramRailPane {
             material_frame: Rc::new(RefCell::new(ProgramMaterialFrame::default())),
             material_applied: Rc::new(Cell::new(false)),
             material_ready: Rc::new(Cell::new(true)),
-            material_sources: HashMap::new(),
+            material_sources: Rc::new(RefCell::new(HashMap::new())),
             material_projections: Rc::new(RefCell::new(HashMap::new())),
+            prepare_worker: CardPrepareWorker::new(),
+            prepare_generation: 0,
         }
     }
     pub fn update_snapshot(
@@ -548,8 +903,10 @@ impl StageProgramRailPane {
                 self.scroll_finger_active = false;
             }
             if self.snapshot["route"] != snapshot["route"] {
+                self.prepare_generation = self.prepare_generation.wrapping_add(1);
+                self.prepare_worker.reset(self.prepare_generation);
                 self.pagination_request = None;
-                self.card_cache.clear();
+                self.card_cache.borrow_mut().clear();
                 self.pressed_card = None;
                 self.projection_cache.borrow_mut().clear();
                 self.focus_handles.clear();
@@ -577,24 +934,28 @@ impl StageProgramRailPane {
             let _ = old(&ProgramMaterialFrame::default());
         }
         self.material_renderer = renderer;
+        self.prepare_generation = self.prepare_generation.wrapping_add(1);
+        self.prepare_worker.reset(self.prepare_generation);
         self.material_applied.set(false);
-        self.material_sources.clear();
+        self.material_sources.borrow_mut().clear();
         self.material_projections.borrow_mut().clear();
         cx.notify();
     }
     pub fn native_material_frame(&self) -> ProgramMaterialFrame {
         self.material_frame.borrow().clone()
     }
-    fn material_publisher(&self) -> AnyElement {
+    fn material_publisher(&self, cx: &mut Context<Self>) -> AnyElement {
         let renderer = self.material_renderer.clone();
         let frame = self.material_frame.clone();
         let ready = self.material_ready.clone();
         let applied = self.material_applied.clone();
+        let worker = self.prepare_worker.clone();
+        let view = cx.weak_entity();
         // Card rows are deferred. This publisher must be deferred after ALL
         // their prepaints, while still preceding every foreground paint.
         deferred(
             canvas(
-                move |_, _, _| {
+                move |_, window, _| {
                     let success = renderer.as_ref().is_some_and(|renderer| {
                         if ready.get() {
                             renderer(&frame.borrow())
@@ -604,6 +965,12 @@ impl StageProgramRailPane {
                         }
                     });
                     applied.set(success);
+                    if worker.busy() {
+                        let view = view.clone();
+                        window.on_next_frame(move |_, cx| {
+                            let _ = view.update(cx, |_, cx| cx.notify());
+                        });
+                    }
                 },
                 |_, _, _, _| {},
             )
@@ -622,7 +989,7 @@ impl StageProgramRailPane {
         catalog: bool,
         playlist: bool,
         op: &'static str,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let empty = card["isEmpty"].as_bool() == Some(true);
@@ -636,97 +1003,16 @@ impl StageProgramRailPane {
         } else {
             Value::Null
         };
-        let artwork = if playlist {
-            card["artworkURL"]
-                .as_str()
-                .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
-                .and_then(|url| {
-                    window.use_asset::<ImageAssetLoader>(&Resource::Uri(url.to_owned().into()), cx)
-                })
-                .and_then(Result::ok)
-        } else {
-            None
-        };
-        let key = format!(
-            "{}/{audio}/{catalog}/{playlist}/{:?}",
-            json!({"title":card["title"],"artist":card["artist"],"subtitle":card["subtitle"],"isCurrent":card["isCurrent"],"hasBoundVideo":card["hasBoundVideo"],"isPending":card["isPending"],"energy":card["energy"]}),
-            artwork.as_ref().map(|image| image.id)
-        );
-        let texture =
-            if let Some((old, texture)) = self.card_cache.get(&id).filter(|(old, _)| old == &key) {
-                let _ = old;
-                texture.clone()
-            } else {
-                let svg = card_svg_content(card, &audio, catalog, playlist, artwork.is_some());
-                let Ok(image) = self.renderer.render_single_frame(svg.as_bytes(), 1.) else {
-                    return div()
-                        .w(px(if catalog { 306. } else { 294. }))
-                        .h(px(if catalog { 74. } else { 76. }))
-                        .child("卡片显示失败")
-                        .into_any_element();
-                };
-                let dimensions = image.size(0);
-                let mut pixels = image.as_bytes(0).unwrap_or_default().to_vec();
-                for pixel in pixels.chunks_exact_mut(4) {
-                    pixel.swap(0, 2);
-                }
-                let mut texture = RgbaTexture {
-                    width: dimensions.width.0 as u32,
-                    height: dimensions.height.0 as u32,
-                    pixels,
-                };
-                if let Some(artwork) = &artwork {
-                    composite_artwork(&mut texture, artwork);
-                }
-                let texture = Arc::new(texture);
-                self.card_cache
-                    .insert(id.clone(), (key.clone(), texture.clone()));
-                texture
-            };
-        let material_texture = if self.material_renderer.is_some() {
-            if let Some((_, source)) = self
-                .material_sources
-                .get(&id)
-                .filter(|(old, _)| old == &key)
-            {
-                Some(source.clone())
-            } else {
-                // Keep the complete opaque source for same-frame failure recovery
-                // and original rounded-card hit testing; only this foreground
-                // variant removes the base after the native apply succeeds.
-                let svg = material_foreground_svg(card_svg_content(
-                    card,
-                    &audio,
-                    catalog,
-                    playlist,
-                    artwork.is_some(),
-                ));
-                self.renderer
-                    .render_single_frame(svg.as_bytes(), 1.)
-                    .ok()
-                    .map(|image| {
-                        let dimensions = image.size(0);
-                        let mut pixels = image.as_bytes(0).unwrap_or_default().to_vec();
-                        for pixel in pixels.chunks_exact_mut(4) {
-                            pixel.swap(0, 2);
-                        }
-                        let mut source = RgbaTexture {
-                            width: dimensions.width.0 as u32,
-                            height: dimensions.height.0 as u32,
-                            pixels,
-                        };
-                        if let Some(artwork) = &artwork {
-                            composite_artwork(&mut source, artwork);
-                        }
-                        let source = Arc::new(source);
-                        self.material_sources
-                            .insert(id.clone(), (key.clone(), source.clone()));
-                        source
-                    })
-            }
-        } else {
-            None
-        };
+        // Keep every row's original layout, AX label and keyboard action, but
+        // defer HTTP/decode and CoreText/SVG work until its measured viewport
+        // intersection is known. Swift's original LazyVStack does this too.
+        let source_card = card.clone();
+        let renderer = self.renderer.clone();
+        let sources = self.card_cache.clone();
+        let material_sources = self.material_sources.clone();
+        let source_id = id.clone();
+        let prepare_worker = self.prepare_worker.clone();
+        let prepare_generation = self.prepare_generation;
         let focused = card["isFocused"]
             .as_bool()
             .unwrap_or(card["isCurrent"].as_bool() == Some(true));
@@ -784,7 +1070,7 @@ impl StageProgramRailPane {
         let keyboard_play = play.clone();
         let accessibility_id = id.clone();
         let canvas = canvas(
-            move |bounds, window, _| {
+            move |bounds, window, cx| {
                 let viewport = if empty { Bounds::new(point(px(0.),px(0.)),window.viewport_size()) } else {scroll.bounds()};
                 let origin = [
                     f64::from(f32::from(bounds.origin.x)),
@@ -820,69 +1106,47 @@ impl StageProgramRailPane {
                     material_cache.borrow_mut().remove(&material_id);
                     return None;
                 }
+                let artwork = if playlist {
+                    source_card["artworkURL"].as_str().filter(|u|u.starts_with("https://")||u.starts_with("http://"))
+                        .and_then(|u|window.use_asset::<ImageAssetLoader>(&Resource::Uri(u.to_owned().into()),cx)).and_then(Result::ok)
+                } else {None};
+                let source_key=format!("{}/{audio}/{catalog}/{playlist}/{:?}",json!({"title":source_card["title"],"artist":source_card["artist"],"subtitle":source_card["subtitle"],"isCurrent":source_card["isCurrent"],"hasBoundVideo":source_card["hasBoundVideo"],"isPending":source_card["isPending"],"energy":source_card["energy"]}),artwork.as_ref().map(|a|a.id));
                 let window_size = [
                     f64::from(f32::from(window.viewport_size().width)),
                     f64::from(f32::from(window.viewport_size().height)),
                 ];
-                let cache_key = format!(
-                    "{:p}/{transform:?}/{origin:?}/{window_size:?}/{}/{opacity}/{mask:?}/{transition:?}/{effects:?}",
-                    Arc::as_ptr(&texture),
-                    window.scale_factor()
-                );
-                let cached = cache
-                    .borrow()
-                    .get(&cache_id)
-                    .filter(|(key, _, _)| key == &cache_key)
-                    .map(|(_, projected, image)| (projected.clone(), image.clone()));
-                let (projected, image) = if let Some(cached) = cached { cached } else {
-                let projected = Arc::new(
-                    ProjectedCard::render_with_effects(
-                        &texture,
-                        transform,
-                        origin,
-                        window_size,
-                        window.scale_factor() as f64,
-                        opacity,
-                        projection_mask,
-                        transition,
-                        effects,
-                    )
-                    .ok()?,
-                );
-                let image = projected.render_image();
-                cache
-                    .borrow_mut()
-                    .insert(cache_id, (cache_key.clone(), projected.clone(), image.clone()));
-                (projected, image)
-                };
-                let mut foreground = None;
+                let cache_key=format!("{source_key}/{transform:?}/{origin:?}/{window_size:?}/{}/{opacity}/{mask:?}/{transition:?}/{effects:?}/{material_enabled}",window.scale_factor());
+                prepare_worker.submit(CardPrepareJob{id:source_id.clone(),key:cache_key,source_key,generation:prepare_generation,
+                    renderer:renderer.clone(),card:source_card.clone(),audio:audio.clone(),artwork,catalog,playlist,material:material_enabled,
+                    transform,origin,viewport:window_size,ppp:window.scale_factor() as f64,opacity,mask:projection_mask,transition,effects});
+                let ready=prepare_worker.ready(&source_id,prepare_generation)?;
+                let delta=[origin[0]-ready.origin[0],origin[1]-ready.origin[1]];
+                let projected=ready.projected.clone();
+                let image=ready.image.clone();
+                let foreground=ready.foreground.clone();
+                sources.borrow_mut().insert(source_id.clone(),(ready.source_key.clone(),ready.source.clone()));
+                if let Some(source)=&ready.material_source {material_sources.borrow_mut().insert(source_id.clone(),(ready.source_key.clone(),source.clone()));}
+                cache.borrow_mut().insert(cache_id,(ready.key.clone(),projected.clone(),image.clone()));
                 if material_enabled {
-                    if let Some(source) = &material_texture {
-                        let key = format!("{cache_key}/{:p}", Arc::as_ptr(source));
-                        foreground = material_cache.borrow().get(&material_id).filter(|(old,_)| old == &key).map(|(_,image)|image.clone());
-                        if foreground.is_none() {
-                            foreground = ProjectedCard::render_with_effects(source, transform, origin, window_size, window.scale_factor() as f64, opacity, projection_mask, transition, effects).ok().map(|p|p.render_image());
-                            if let Some(image) = &foreground { material_cache.borrow_mut().insert(material_id.clone(), (key, image.clone())); }
-                        }
-                    }
+                    if let Some(image)=&foreground {material_cache.borrow_mut().insert(material_id.clone(),(ready.key.clone(),image.clone()));}
                     if foreground.is_none() { material_ready.set(false); }
                     let mut frame = material_frame.borrow_mut();
                     frame.viewport = [f64::from(f32::from(viewport.origin.x)), mask.top, f64::from(f32::from(viewport.size.width)), mask.height];
                     frame.scale = window.scale_factor() as f64;
-                    let material_card = ProgramMaterialCard { id: material_id, width: transform.width, height: transform.height, radius: if catalog {22.}else{23.}, opacity, priority: material_priority as f64, matrix: projected.source_to_world_matrix() };
+                    let material_card = ProgramMaterialCard { id: material_id, width: transform.width, height: transform.height, radius: if catalog {22.}else{23.}, opacity: ready.opacity, priority: material_priority as f64, matrix: projected.shifted_source_to_world_matrix(delta) };
                     if video { frame.cards.push(video_material_card(&material_card)); }
                     frame.cards.push(material_card);
                 }
-                Some((projected, image, foreground))
+                Some((projected, image, foreground,delta))
             },
             move |_, projected, window, _| {
-                let Some((projected, fallback, foreground)) = projected else {
+                let Some((projected, fallback, foreground,delta)) = projected else {
                     return;
                 };
                 let image = if material_applied.get() { foreground.unwrap_or(fallback) } else { fallback };
                 let b = projected.bounds;
                 let bounds = Bounds::new(
-                    point(px(b[0] as f32), px(b[1] as f32)),
+                    point(px((b[0]+delta[0]) as f32), px((b[1]+delta[1]) as f32)),
                     size(px(b[2] as f32), px(b[3] as f32)),
                 );
                 let _ = window.paint_image(bounds, bounds, Corners::default(), image, 0, false);
@@ -898,7 +1162,7 @@ impl StageProgramRailPane {
                         f64::from(f32::from(event.position.x)),
                         f64::from(f32::from(event.position.y)),
                     ];
-                    if let Some(local) = down_projected.inverse_hit(point) {
+                    if let Some(local) = down_projected.inverse_hit_shifted(point,delta) {
                         window.focus(&mouse_focus, cx);
                         let video_hit = video
                             && local[0] >= 259.
@@ -919,7 +1183,7 @@ impl StageProgramRailPane {
                         f64::from(f32::from(event.position.x)),
                         f64::from(f32::from(event.position.y)),
                     ];
-                    if let Some(local) = projected.inverse_hit(point) {
+                    if let Some(local) = projected.inverse_hit_shifted(point,delta) {
                         let video_hit = video
                             && local[0] >= 259.
                             && local[0] <= 285.
@@ -1125,7 +1389,7 @@ impl Render for StageProgramRailPane {
                 .items_end()
                 .text_color(rgb(0xe5e7ea))
                 .child(div().mt(px(96.)).child(state))
-                .child(self.material_publisher());
+                .child(self.material_publisher(cx));
         }
         let mut content = div()
             .flex()
@@ -1396,7 +1660,7 @@ impl Render for StageProgramRailPane {
             // this final prepaint runs. Apply all native layers atomically, then
             // foreground paint selects transparent or opaque images in THIS
             // frame. No 100ms polling, deferred geometry, or failure blank frame.
-            .child(self.material_publisher())
+            .child(self.material_publisher(cx))
     }
 }
 
@@ -1433,6 +1697,157 @@ mod tests {
     };
     use serde_json::json;
     #[test]
+    fn background_queue_bounds_replaces_latest_and_rejects_old_generation() {
+        use super::*;
+        let worker = CardPrepareWorker {
+            shared: Arc::new((
+                Mutex::new(CardPrepareQueue {
+                    generation: 1,
+                    pending: HashMap::new(),
+                    order: VecDeque::new(),
+                    ready: HashMap::new(),
+                    inflight: None,
+                    closed: false,
+                }),
+                Condvar::new(),
+            )),
+        };
+        let job = |id: usize, key: &str, generation| CardPrepareJob {
+            id: id.to_string(),
+            key: key.into(),
+            source_key: key.into(),
+            generation,
+            renderer: SvgRenderer::new(Arc::new(())),
+            card: json!({}),
+            audio: json!({}),
+            artwork: None,
+            catalog: true,
+            playlist: false,
+            material: false,
+            transform: card_transform(&json!({}), true),
+            origin: [0., 0.],
+            viewport: [400., 400.],
+            ppp: 1.,
+            opacity: 1.,
+            mask: None,
+            transition: None,
+            effects: CardEffects::default(),
+        };
+        for i in 0..50 {
+            worker.submit(job(i, "initial", 1));
+        }
+        worker.submit(job(0, "newest", 1));
+        worker.submit(job(1, "stale", 0));
+        {
+            let queue = worker.shared.0.lock().unwrap();
+            assert_eq!(queue.pending.len(), 12);
+            assert_eq!(queue.order.len(), 12);
+            assert_eq!(queue.pending["0"].key, "newest");
+            assert_eq!(queue.pending["1"].key, "initial");
+        }
+        worker.reset(2);
+        worker.submit(job(0, "old route", 1));
+        assert!(!worker.busy());
+    }
+    #[test]
+    fn real_fifty_catalog_draw_bounds_source_work_to_visible_rows_and_reuses_textures() {
+        use gpui_kit::{AppContext, TestAppContext, point, px};
+        use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let stored = Rc::new(RefCell::new(None));
+        let entity = stored.clone();
+        let cold = std::time::Instant::now();
+        let handle=cx.add_window(move|window,cx|{
+            let pane=cx.new(|cx|{
+                let mut pane=super::StageProgramRailPane::new(window,cx);
+                // Unit regression only: no provider/library writes or requests.
+                pane.snapshot=json!({"route":"programs","programs":(0..50).map(|i|json!({"id":format!("perf-{i}"),"title":"回归布局字段","subtitle":"缓存工作量"})).collect::<Vec<_>>(),"playlists":[]});
+                pane.set_native_material_renderer(Some(Rc::new(|_|true)),cx);
+                pane
+            });
+            *entity.borrow_mut()=Some(pane.clone());
+            gpui_kit::base::Root::new(pane,window,cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        let cold_elapsed = cold.elapsed();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let busy = cx.update(|cx| {
+                stored
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .prepare_worker
+                    .busy()
+            });
+            if !busy {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bounded background prepare must complete"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        let initial = cx.update(|cx| {
+            let pane = stored.borrow().as_ref().unwrap().read(cx);
+            assert_eq!(
+                pane.focus_handles.len(),
+                50,
+                "offscreen rows retain original keyboard/AX entries and layout"
+            );
+            let sources = pane.card_cache.borrow();
+            assert!(!sources.is_empty());
+            assert!(
+                sources.len() <= 10,
+                "never rasterize the entire fifty-row library on first draw"
+            );
+            assert_eq!(sources.len(), pane.material_sources.borrow().len());
+            sources
+                .iter()
+                .map(|(id, (_, source))| (id.clone(), Arc::as_ptr(source)))
+                .collect::<HashMap<_, _>>()
+        });
+        let warm = std::time::Instant::now();
+        cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        let warm_elapsed = warm.elapsed();
+        cx.update(|cx| {
+            let pane = stored.borrow().as_ref().unwrap().read(cx);
+            let sources = pane.card_cache.borrow();
+            assert_eq!(sources.len(), initial.len());
+            for (id, pointer) in &initial {
+                assert_eq!(
+                    Arc::as_ptr(&sources[id].1),
+                    *pointer,
+                    "warm frame performs no text/SVG raster rebuild"
+                );
+            }
+        });
+        let scrolled = std::time::Instant::now();
+        cx.update_window(handle.into(), |_, window, cx| {
+            stored.borrow().as_ref().unwrap().update(cx, |pane, cx| {
+                pane.scroll.set_offset(point(px(0.), px(-1200.)));
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        let scroll_elapsed = scrolled.elapsed();
+        cx.update(|cx|{
+            let pane=stored.borrow().as_ref().unwrap().read(cx);
+            let count=pane.card_cache.borrow().len();
+            assert!(count<=initial.len()+10,"far scroll prepares only newly visible rows, not remaining fifty");
+            assert!(pane.native_material_frame().cards.len()<=10);
+            eprintln!("50-row Window coldWithSetup={cold_elapsed:?} warm={warm_elapsed:?} farScroll={scroll_elapsed:?}; initialSources={} totalAfterFarScroll={count}",initial.len());
+        });
+    }
+    #[test]
     fn real_material_frame_uses_foreground_geometry_and_same_frame_failure_fallback() {
         use gpui_kit::{AppContext, TestAppContext};
         let mut cx = TestAppContext::single();
@@ -1462,6 +1877,15 @@ mod tests {
         };
         draw(&mut cx);
         draw(&mut cx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while latest.borrow().cards.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "actual material prepare must complete"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            draw(&mut cx);
+        }
         assert_eq!(
             latest.borrow().cards.len(),
             1,
@@ -1479,8 +1903,10 @@ mod tests {
             let cache = pane.projection_cache.borrow();
             let projected = &cache.values().next().unwrap().1;
             assert_eq!(card.matrix, projected.source_to_world_matrix());
-            let opaque = &pane.card_cache.values().next().unwrap().1;
-            let transparent = &pane.material_sources.values().next().unwrap().1;
+            let sources = pane.card_cache.borrow();
+            let material_sources = pane.material_sources.borrow();
+            let opaque = &sources.values().next().unwrap().1;
+            let transparent = &material_sources.values().next().unwrap().1;
             let i = ((8 * opaque.width + 80) * 4 + 3) as usize;
             assert_eq!(opaque.pixels[i], 255);
             assert!(transparent.pixels[i] < opaque.pixels[i]);
@@ -1516,6 +1942,15 @@ mod tests {
             stored.borrow().as_ref().unwrap().update(cx, |pane,cx|pane.update_snapshot(json!({"route":"programs","programs":[],"playlists":[],"emptyMessage":"暂无节目"}),window,cx));
         }).unwrap();
         draw(&mut cx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while latest.borrow().cards.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "actual empty card preparation must complete"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            draw(&mut cx);
+        }
         let empty = latest.borrow().cards[0].clone();
         assert!(
             (empty.width - 142.).abs() < 1.,
@@ -1545,6 +1980,15 @@ mod tests {
         }).unwrap();
         draw(&mut cx);
         draw(&mut cx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while latest.borrow().cards.len() != 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "actual video material preparation must complete"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            draw(&mut cx);
+        }
         let frame = latest.borrow().clone();
         assert_eq!(
             frame.cards.len(),
@@ -1581,8 +2025,10 @@ mod tests {
         cx.update(|cx| {
             let pane = stored.borrow().as_ref().unwrap().read(cx);
             assert!(!pane.material_applied.get());
-            let opaque=&pane.card_cache["track-0"].1;
-            let transparent=&pane.material_sources["track-0"].1;
+            let sources = pane.card_cache.borrow();
+            let material_sources = pane.material_sources.borrow();
+            let opaque=&sources["track-0"].1;
+            let transparent=&material_sources["track-0"].1;
             let i=((10*opaque.width+272)*4+3) as usize;
             assert_eq!(opaque.pixels[i],255, "failed callback retains original circle background");
             assert!(transparent.pixels[i]<opaque.pixels[i], "native-success variant removes only opaque circle/base, preserves overlay and glyph");
@@ -1646,6 +2092,29 @@ mod tests {
         });
         cx.update_window(tracks.into(), |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let ready = cx.update(|cx| {
+                !track_pane
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .projection_cache
+                    .borrow()
+                    .is_empty()
+            });
+            if ready {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "real track background projection must complete"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            cx.update_window(tracks.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+        }
         cx.update_window(tracks.into(), |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
         cx.update(|cx| {

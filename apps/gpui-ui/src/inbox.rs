@@ -1,4 +1,5 @@
 //! The original system inbox presentation. Selection never acknowledges a task.
+use crate::ui_tokens as ui;
 use gpui_kit::component::{
     button::*,
     input::{Textarea, TextareaState},
@@ -207,7 +208,7 @@ impl Render for InboxPane {
                             .w_full()
                             .flex()
                             .items_center()
-                            .gap_2()
+                            .gap(px(ui::SPACING_8))
                             .child(
                                 div()
                                     .w(px(10.))
@@ -226,12 +227,12 @@ impl Render for InboxPane {
                                         div()
                                             .flex()
                                             .items_baseline()
-                                            .gap_2()
+                                            .gap(px(ui::SPACING_8))
                                             .child(
                                                 div()
                                                     .flex_1()
                                                     .min_w(px(0.))
-                                                    .text_size(px(12.))
+                                                    .text_size(px(ui::CAPTION))
                                                     .font_weight(FontWeight::MEDIUM)
                                                     .truncate()
                                                     .child(title),
@@ -261,7 +262,7 @@ impl Render for InboxPane {
             .h_full()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap(px(ui::SPACING_8))
             .pl_2()
             .pr_2()
             .child(
@@ -270,8 +271,8 @@ impl Render for InboxPane {
                     .flex_1()
                     .min_h(px(220.))
                     .overflow_y_scroll()
-                    .p_3()
-                    .text_size(px(12.))
+                    .p(px(ui::SPACING_12))
+                    .text_size(px(ui::CAPTION))
                     .child(
                         Textarea::new(self.detail.as_ref().expect("plain detail state"))
                             .readonly(true)
@@ -302,6 +303,9 @@ impl Render for InboxPane {
             details = details.child(div().text_sm().child(error.to_owned()));
         }
         div()
+            .font_family(theme.font_family.clone())
+            .text_size(px(ui::BODY))
+            .line_height(px(ui::BODY_LINE_HEIGHT))
             .key_context("ResidentInbox")
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &OpenSelected, _, cx| {

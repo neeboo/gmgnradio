@@ -6,6 +6,57 @@ import UniformTypeIdentifiers
 import WorldRuntime
 import CryptoKit
 
+@MainActor
+private enum GPUIProgramEmptySymbol {
+    private static var cache: [CGFloat: [String: Any]] = [:]
+
+    static func descriptor(scale: CGFloat, text: String) -> [String: Any]? {
+        guard scale.isFinite, scale > 0 else { return nil }
+        let font = NSFont.systemFont(ofSize: 16, weight: .semibold)
+        let rounded = font.fontDescriptor.withDesign(.rounded).flatMap { NSFont(descriptor: $0, size: 16) } ?? font
+        let textWidth = (text as NSString).size(withAttributes: [.font: rounded]).width
+        var result: [String: Any]
+        if let cached = cache[scale] { result = cached }
+        else {
+            guard let image = NSImage(systemSymbolName: "waveform.path", accessibilityDescription: nil)?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 18, weight: .medium)) else { return nil }
+            let logical = image.size
+            let width = Int(ceil(logical.width * scale))
+            let height = Int(ceil(logical.height * scale))
+            guard width > 0, height > 0 else { return nil }
+            var pixels = [UInt8](repeating: 0, count: width * height * 4)
+            let rendered = pixels.withUnsafeMutableBytes { bytes -> Bool in
+                guard let context = CGContext(data: bytes.baseAddress, width: width, height: height,
+                    bitsPerComponent: 8, bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue) else { return false }
+                context.scaleBy(x: scale, y: scale)
+                NSGraphicsContext.saveGraphicsState()
+                defer { NSGraphicsContext.restoreGraphicsState() }
+                NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+                let rect = NSRect(origin: .zero, size: logical)
+                image.draw(in: rect, from: .zero, operation: .copy, fraction: 1, respectFlipped: false, hints: nil)
+                NSColor(Color.cyan).withAlphaComponent(0.9).setFill()
+                rect.fill(using: .sourceIn)
+                return true
+            }
+            guard rendered else { return nil }
+            // CoreGraphics supplies premultiplied RGBA; the portable texture
+            // contract is straight RGBA, with source rows stored top-to-bottom.
+            for i in stride(from: 0, to: pixels.count, by: 4) where pixels[i + 3] != 0 {
+                let alpha = Int(pixels[i + 3])
+                for channel in 0..<3 { pixels[i + channel] = UInt8(min(255, (Int(pixels[i + channel]) * 255 + alpha / 2) / alpha)) }
+            }
+            result = ["logicalWidth": logical.width, "logicalHeight": logical.height,
+                "pixelWidth": width, "pixelHeight": height, "scale": scale,
+                "rgbaBase64": Data(pixels).base64EncodedString()]
+            cache[scale] = result
+        }
+        result["labelWidth"] = textWidth
+        result["labelBaseline"] = 32 + (rounded.ascender + rounded.descender) / 2
+        return result
+    }
+}
+
 enum ProductIdentity {
     static let displayName = "gmgn radio"
     static let bundleIdentifier = "ai.gmgn.radio"
@@ -1512,6 +1563,7 @@ final class AppDelegate:
     )
     private let programStore = DJProgramStore.shared
     private let musicLibraryStore = SyncedMusicLibraryStore.shared
+    private var musicLibrarySyncTasks: [MusicProviderID: Task<Void, Never>] = [:]
     private let stageLyrics = StageLyricsStore.shared
     private let agentPreferences = DJAgentPreferences()
     private let realtimeVoicePreferences = RealtimeVoicePreferences()
@@ -1934,6 +1986,7 @@ final class AppDelegate:
         if connected {
             refreshSyncedMusicLibrary(providerID: providerID)
         } else {
+            musicLibrarySyncTasks.removeValue(forKey: providerID)?.cancel()
             musicLibraryStore.remove(providerID: providerID)
         }
     }
@@ -1949,16 +2002,20 @@ final class AppDelegate:
             return
         }
         musicLibraryStore.setSyncing(true)
-        Task { [weak self] in
+        musicLibrarySyncTasks[providerID] = Task { [weak self] in
             guard let self else {
                 return
             }
-            defer { musicLibraryStore.setSyncing(false) }
+            defer {
+                musicLibraryStore.setSyncing(false)
+                musicLibrarySyncTasks[providerID] = nil
+            }
             do {
                 let library = try await musicRuntime.fetchLibrary(
                     providerID: providerID
                 )
-                guard musicLibraryStore.mergeAndVerify(
+                try Task.checkCancellation()
+                guard await musicLibraryStore.mergeAndVerifyInBackground(
                     playlists: library.playlists
                 ) else {
                     throw MusicLibraryCacheError.verificationFailed
@@ -1968,6 +2025,7 @@ final class AppDelegate:
                     playlistCount: library.playlists.count
                 )
             } catch {
+                guard !Task.isCancelled else { return }
                 playbackLogger.error(
                     "音乐歌单同步失败：provider=\(providerID.rawValue, privacy: .public)，error=\(error.localizedDescription, privacy: .public)"
                 )

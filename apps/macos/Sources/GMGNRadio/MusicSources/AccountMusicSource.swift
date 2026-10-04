@@ -89,6 +89,7 @@ struct MusicLyrics: Equatable, Sendable {
 }
 
 protocol AccountMusicProviderClient: Sendable {
+    func validateAccount(session: MusicProviderSession) async throws
     func capabilities(
         session: MusicProviderSession
     ) async throws -> MusicAccountCapabilities
@@ -121,6 +122,9 @@ protocol AccountMusicProviderClient: Sendable {
 }
 
 extension AccountMusicProviderClient {
+    func validateAccount(session: MusicProviderSession) async throws {
+        _ = try await fetchUserLibrary(session: session)
+    }
     func fetchPlaylistPage(
         playlistID: String,
         offset: Int,

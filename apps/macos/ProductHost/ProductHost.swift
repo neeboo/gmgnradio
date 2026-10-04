@@ -25,6 +25,7 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
     private var navigationMode = "space"
     private var navigationPanel: String?
     private var programRailVisible = false
+    fileprivate let snapshotEncoder = ProductSnapshotEncoder()
     private lazy var settings = GPUIProductSettings(runtime: runtime)
     private lazy var programSelection = runtime.gpuiMakeProgramSelection()
 
@@ -738,7 +739,7 @@ public func gmgnProductHostChatCancel(_ pointer: UnsafeMutableRawPointer?, _ req
 @_cdecl("gmgn_product_host_snapshot")
 public func gmgnProductHostSnapshot(_ pointer: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>? {
     let address: UInt? = withProductHost(pointer) { host in
-        guard let data = try? JSONSerialization.data(withJSONObject: host.snapshot(), options: [.sortedKeys]),
+        guard let data = try? host.snapshotEncoder.encode(host.snapshot()),
               let text = String(data: data, encoding: .utf8) else { return nil }
         return strdup(text).map { UInt(bitPattern: $0) }
     } ?? nil

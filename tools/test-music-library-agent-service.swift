@@ -95,6 +95,21 @@ func playlist(_ id: String = "netease:cozy", name: String = "Cozy 爵士", provi
 }
 @main struct Tests {
     @MainActor static func main() async throws {
+        let cacheRoot = FileManager.default.temporaryDirectory.appendingPathComponent("gmgn-background-library-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: cacheRoot) }
+        let cacheURL = cacheRoot.appendingPathComponent("library.json")
+        let backgroundStore = SyncedMusicLibraryStore(cacheURL: cacheURL)
+        let firstMerge = await backgroundStore.mergeAndVerifyInBackground(playlists: [playlist()])
+        check(firstMerge && backgroundStore.playlists.count == 1, "background merge publishes verified data")
+        check(SyncedMusicLibraryStore(cacheURL: cacheURL).playlists == backgroundStore.playlists, "background cache is reopenable")
+        let replacement = await backgroundStore.mergeAndVerifyInBackground(playlists: [playlist(name: "Updated", tracks: [], total: 3)])
+        check(replacement && backgroundStore.playlists.first?.tracks.count == 1, "background replacement retains cached tracks")
+        check(SyncedMusicLibraryStore(cacheURL: cacheURL).playlists == backgroundStore.playlists, "atomic replacement publishes verified readback")
+        let blockedURL = cacheRoot.appendingPathComponent("blocked")
+        try Data().write(to: blockedURL)
+        let blockedStore = SyncedMusicLibraryStore(cacheURL: blockedURL.appendingPathComponent("library.json"))
+        let blockedMerge = await blockedStore.mergeAndVerifyInBackground(playlists: [playlist()])
+        check(!blockedMerge && blockedStore.playlists.isEmpty, "background write failure cannot publish unverified library")
         let f = Fixture()
         let listing = try f.service.list(query: "cozy", offset: 0, limit: 10)
         check(listing.playlists.count == 1 && listing.playlists.first?.id == "netease:cozy", "local title query returns existing playlist")

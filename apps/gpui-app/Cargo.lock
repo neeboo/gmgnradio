@@ -2254,6 +2254,7 @@ dependencies = [
  "gmgn-gpui-ui",
  "gpui-kit",
  "gpui-pre-reqwest-client",
+ "image",
  "raw-window-handle",
  "rust-embed",
  "serde_json",
@@ -2263,6 +2264,7 @@ dependencies = [
 name = "gmgn-gpui-ui"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "gpui-kit",
  "image",
  "serde_json",

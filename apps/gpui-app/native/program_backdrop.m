@@ -12,7 +12,10 @@
 @interface GMGNProgramBackdropContext : NSObject
 @property(nonatomic, weak) NSView *gpui;
 @property(nonatomic, strong) GMGNProgramBackdropRoot *root;
-@property(nonatomic, strong) NSMutableArray<NSVisualEffectView *> *cards;
+@property(nonatomic, strong) NSMutableArray<NSView *> *cards;
+@property(nonatomic, strong) NSMutableArray<NSArray<NSNumber *> *> *geometry;
+@property(nonatomic) GMGNProgramMaterialFactory factory;
+@property(nonatomic) int backend; // 0 disabled, 1 explicit old HUD candidate, 2 Swift ultraThin primitive.
 @property(nonatomic) double fadeFraction;
 @end
 @implementation GMGNProgramBackdropContext
@@ -26,6 +29,8 @@ void *gmgn_gpui_program_backdrop_create(void *pointer) {
     GMGNProgramBackdropContext *context = [GMGNProgramBackdropContext new];
     context.gpui = gpui;
     context.cards = [NSMutableArray array];
+    context.geometry = [NSMutableArray array];
+    context.backend = 1;
     context.fadeFraction = 0.08;
     context.root = [[GMGNProgramBackdropRoot alloc] initWithFrame:gpui.frame];
     context.root.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
@@ -54,6 +59,7 @@ int gmgn_gpui_program_backdrop_apply(void *pointer, const GMGNProgramBackdropCar
     if (![NSThread isMainThread] || !pointer || !viewport || count > 128 || (count && !cards)) return 0;
     GMGNProgramBackdropContext *context = (__bridge GMGNProgramBackdropContext *)pointer;
     if (!context.gpui.window || context.root.superview != context.gpui.superview) return 0;
+    if (context.backend == 0) return 0;
     for (size_t i = 0; i < 4; i++) if (!isfinite(viewport[i])) return 0;
     if (viewport[2] <= 0 || viewport[3] <= 0) return 0;
     for (size_t i = 0; i < count; i++) if (!validCard(&cards[i])) return 0;
@@ -62,19 +68,29 @@ int gmgn_gpui_program_backdrop_apply(void *pointer, const GMGNProgramBackdropCar
     while (context.cards.count > count) {
         [context.cards.lastObject removeFromSuperview];
         [context.cards removeLastObject];
+        [context.geometry removeLastObject];
     }
     while (context.cards.count < count) {
-        NSVisualEffectView *view = [[NSVisualEffectView alloc] initWithFrame:NSZeroRect];
-        // Public AppKit candidate, not a claimed mapping of SwiftUI ultraThinMaterial.
-        view.material = NSVisualEffectMaterialHUDWindow;
-        view.blendingMode = NSVisualEffectBlendingModeWithinWindow;
-        view.state = NSVisualEffectStateActive;
-        view.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+        const GMGNProgramBackdropCard *card = &cards[context.cards.count];
+        NSView *view;
+        if (context.factory) {
+            void *owned = context.factory(card->width, card->height, card->radius);
+            if (!owned) { [CATransaction commit]; gmgn_gpui_program_backdrop_clear(pointer); return 0; }
+            view = (__bridge_transfer NSView *)owned;
+        } else {
+            NSVisualEffectView *candidate = [[NSVisualEffectView alloc] initWithFrame:NSZeroRect];
+            candidate.material = NSVisualEffectMaterialHUDWindow;
+            candidate.blendingMode = NSVisualEffectBlendingModeWithinWindow;
+            candidate.state = NSVisualEffectStateActive;
+            candidate.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+            view = candidate;
+        }
         view.wantsLayer = YES;
         view.layer.opaque = NO;
-        view.layer.masksToBounds = YES;
+        view.layer.masksToBounds = context.backend == 1;
         [context.root addSubview:view];
         [context.cards addObject:view];
+        [context.geometry addObject:@[@(card->width), @(card->height), @(card->radius)]];
     }
     context.root.frame = context.gpui.frame;
     CALayer *mask;
@@ -92,13 +108,24 @@ int gmgn_gpui_program_backdrop_apply(void *pointer, const GMGNProgramBackdropCar
     mask.frame = CGRectMake(viewport[0], viewport[1], viewport[2], viewport[3]);
     context.root.layer.mask = mask;
     for (size_t i = 0; i < count; i++) {
-        NSVisualEffectView *view = context.cards[i];
+        NSView *view = context.cards[i];
         const GMGNProgramBackdropCard *card = &cards[i];
+        NSArray *geometry = @[@(card->width), @(card->height), @(card->radius)];
+        if (context.factory && ![context.geometry[i] isEqualToArray:geometry]) {
+            void *owned = context.factory(card->width, card->height, card->radius);
+            if (!owned) { [CATransaction commit]; gmgn_gpui_program_backdrop_clear(pointer); return 0; }
+            NSView *replacement = (__bridge_transfer NSView *)owned;
+            replacement.wantsLayer = YES; replacement.layer.opaque = NO;
+            [view removeFromSuperview]; [context.root addSubview:replacement];
+            context.cards[i] = replacement; context.geometry[i] = geometry; view = replacement;
+        }
         view.layer.transform = CATransform3DIdentity;
         view.frame = NSMakeRect(0, 0, card->width, card->height);
         view.layer.anchorPoint = CGPointZero;
         view.layer.position = CGPointZero;
-        view.layer.cornerRadius = card->radius;
+        // Swift material owns its exact RoundedRectangle/Circle shape: do not
+        // apply a second CoreAnimation circular-corner clipping approximation.
+        view.layer.cornerRadius = context.backend == 1 ? card->radius : 0;
         view.layer.opacity = (float)card->opacity;
         view.layer.zPosition = card->priority;
         CATransform3D t = CATransform3DIdentity;
@@ -115,8 +142,8 @@ int gmgn_gpui_program_backdrop_apply(void *pointer, const GMGNProgramBackdropCar
 int gmgn_gpui_program_backdrop_clear(void *pointer) {
     if (![NSThread isMainThread] || !pointer) return 0;
     GMGNProgramBackdropContext *context = (__bridge GMGNProgramBackdropContext *)pointer;
-    for (NSVisualEffectView *view in context.cards) [view removeFromSuperview];
-    [context.cards removeAllObjects]; context.root.hidden = YES; context.root.layer.mask = nil;
+    for (NSView *view in context.cards) [view removeFromSuperview];
+    [context.cards removeAllObjects]; [context.geometry removeAllObjects]; context.root.hidden = YES; context.root.layer.mask = nil;
     return 1;
 }
 
@@ -127,10 +154,18 @@ int gmgn_gpui_program_backdrop_set_fade_fraction(void *pointer, double fraction)
     return 1;
 }
 
+int gmgn_gpui_program_backdrop_set_factory(void *pointer, GMGNProgramMaterialFactory factory) {
+    if (![NSThread isMainThread] || !pointer) return 0;
+    gmgn_gpui_program_backdrop_clear(pointer);
+    GMGNProgramBackdropContext *context = (__bridge GMGNProgramBackdropContext *)pointer;
+    context.factory = factory; context.backend = factory ? 2 : 0;
+    return 1;
+}
+
 int gmgn_gpui_program_backdrop_destroy(void *pointer) {
     if (![NSThread isMainThread] || !pointer) return 0;
     GMGNProgramBackdropContext *context = (__bridge_transfer GMGNProgramBackdropContext *)pointer;
-    [context.root removeFromSuperview]; [context.cards removeAllObjects];
+    [context.root removeFromSuperview]; [context.cards removeAllObjects]; [context.geometry removeAllObjects];
     return 1;
 }
 
@@ -140,7 +175,7 @@ int gmgn_gpui_program_backdrop_diagnostics(void *pointer, double values[6]) {
     values[0] = context.cards.count;
     values[1] = context.root.window != nil;
     values[2] = context.root.hidden;
-    values[3] = context.cards.count ? context.cards[0].blendingMode == NSVisualEffectBlendingModeWithinWindow : 0;
+    values[3] = context.backend;
     values[4] = context.root.layer.mask != nil;
     values[5] = [context.root hitTest:NSMakePoint(1, 1)] == nil;
     return 1;

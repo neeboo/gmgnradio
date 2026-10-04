@@ -5,9 +5,16 @@
 use gpui_kit::component::{button::*, *};
 use gpui_kit::*;
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex};
+#[path = "lyrics/gpu_scene.rs"]
+mod gpu_scene;
+pub use gpu_scene::{GpuLyricsAtlas, GpuLyricsBatch, GpuLyricsFrame, GpuLyricsGlyph};
+type ShapeKey = (String, u64, u16, u64, bool);
+thread_local! {static SHAPED_LINES:RefCell<HashMap<ShapeKey,outline::Line>>=RefCell::new(HashMap::new());}
 
 fn num(value: &Value, key: &str, default: f64) -> f64 {
     value[key]
@@ -100,6 +107,7 @@ struct Scene<'a> {
     local: Option<(f64, f64, f64, f64)>,
     text_filter: String,
     italic: bool,
+    gpu: Option<Vec<gpu_scene::Primitive>>,
 }
 #[derive(Clone, Copy, Debug)]
 struct PanelTransform {
@@ -249,6 +257,7 @@ impl<'a> Scene<'a> {
             text_filter: "url(#textShadow)".to_owned(),
             italic: false,
             svg,
+            gpu: None,
         }
     }
     fn rail(&self, amount: f64) -> f64 {
@@ -314,14 +323,47 @@ impl<'a> Scene<'a> {
                     point
                 }
             };
-            let path = if self.projection.is_some() || self.panel.is_some() {
+            let path = if self.gpu.is_some() {
+                String::new()
+            } else if self.projection.is_some() || self.panel.is_some() {
                 outline::projected_path(&shaped.commands, map)
             } else {
                 outline::svg_path(&shaped.commands, map)
             };
+            let gpu_id = if self.gpu.is_some() {
+                let padding = size * 0.3;
+                let width = (shaped.width + padding * 2.).max(1.);
+                let height = (shaped.ascent + shaped.descent + padding * 2.).max(1.);
+                let source = outline::svg_path(&shaped.commands, |p| outline::Point {
+                    x: p.x + padding,
+                    y: shaped.ascent + padding - p.y,
+                });
+                let matrix = gpu_scene::homography(width, height, |p| {
+                    map(outline::Point {
+                        x: p.x - padding,
+                        y: shaped.ascent + padding - p.y,
+                    })
+                });
+                let list = self.gpu.as_mut().unwrap();
+                let id = list.len();
+                list.push(gpu_scene::Primitive {
+                    path: source,
+                    width,
+                    height,
+                    matrix,
+                    fill: color.into(),
+                    stroke: "none".into(),
+                    stroke_width: 0.,
+                    opacity,
+                    filter: self.text_filter.clone(),
+                });
+                format!(r#" data-gpu="{id}""#)
+            } else {
+                String::new()
+            };
             let _ = write!(
                 self.svg,
-                r#"<path aria-label="{}" d="{path}" fill="{color}" opacity="{opacity}" filter="{}"/>"#,
+                r#"<path{gpu_id} aria-label="{}" d="{path}" fill="{color}" opacity="{opacity}" filter="{}"/>"#,
                 escape(text),
                 self.text_filter
             );
@@ -347,7 +389,26 @@ impl<'a> Scene<'a> {
         if let Some(line) = self.outlines.get(&key) {
             return Some(line.clone());
         }
-        let line = outline::shape_font(text, size, self.weight, self.tracking, self.italic)?;
+        let cached = SHAPED_LINES.with(|cache| cache.borrow().get(&key).cloned());
+        let line = if let Some(line) = cached {
+            line
+        } else {
+            let line = outline::shape_font(text, size, self.weight, self.tracking, self.italic)?;
+            SHAPED_LINES.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                if cache.len() >= 512
+                    || cache
+                        .values()
+                        .map(|line| line.commands.len())
+                        .sum::<usize>()
+                        > 100_000
+                {
+                    cache.clear();
+                }
+                cache.insert(key.clone(), line.clone());
+            });
+            line
+        };
         self.outlines.insert(key, line.clone());
         Some(line)
     }
@@ -384,11 +445,77 @@ impl<'a> Scene<'a> {
         stroke_width: f64,
     ) {
         let commands = rounded_rectangle(x, y, w, h, r);
-        let path = outline::projected_path(&commands, |point| self.panel_point(point));
+        let path = if self.gpu.is_some() {
+            String::new()
+        } else {
+            outline::projected_path(&commands, |point| self.panel_point(point))
+        };
+        if self.gpu.is_some() {
+            let fill_id = self.gpu_shape(&commands, x, y, w, h, fill, "none", 0., fill_opacity);
+            let stroke_id = self.gpu_shape(
+                &commands,
+                x,
+                y,
+                w,
+                h,
+                "none",
+                stroke,
+                stroke_width,
+                stroke_opacity,
+            );
+            let _ = write!(
+                self.svg,
+                r#"<path{fill_id} d="{path}"/><path{stroke_id} d="{path}"/>"#
+            );
+            return;
+        }
         let _ = write!(
             self.svg,
             r#"<path d="{path}" fill="{fill}" fill-opacity="{fill_opacity}" stroke="{stroke}" stroke-opacity="{stroke_opacity}" stroke-width="{stroke_width}"/>"#
         );
+    }
+    fn gpu_shape(
+        &mut self,
+        commands: &[outline::Command],
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        fill: &str,
+        stroke: &str,
+        stroke_width: f64,
+        opacity: f64,
+    ) -> String {
+        if self.gpu.is_none() {
+            return String::new();
+        }
+        let pad = stroke_width + 1.;
+        let width = (w + pad * 2.).max(1.);
+        let height = (h + pad * 2.).max(1.);
+        let path = outline::svg_path(commands, |p| outline::Point {
+            x: p.x - x + pad,
+            y: p.y - y + pad,
+        });
+        let matrix = gpu_scene::homography(width, height, |p| {
+            self.panel_point(outline::Point {
+                x: p.x + x - pad,
+                y: p.y + y - pad,
+            })
+        });
+        let list = self.gpu.as_mut().unwrap();
+        let id = list.len();
+        list.push(gpu_scene::Primitive {
+            path,
+            width,
+            height,
+            matrix,
+            fill: fill.into(),
+            stroke: stroke.into(),
+            stroke_width,
+            opacity,
+            filter: "none".into(),
+        });
+        format!(r#" data-gpu="{id}""#)
     }
     fn paragraph(
         &mut self,
@@ -478,21 +605,66 @@ impl<'a> Scene<'a> {
                 _ => 0.,
             };
             let baseline = (line.ascent - line.descent) / 2.;
-            let path = outline::projected_path(&line.commands, |point| {
-                let source = outline::Point {
-                    x: point.x + offset,
-                    y: baseline - point.y,
-                };
-                let projected =
-                    outline::project(source, angle, axis, perspective, line.width.max(size));
-                outline::Point {
-                    x: x + projected.x,
-                    y: y + projected.y,
-                }
-            });
+            let path = if self.gpu.is_some() {
+                String::new()
+            } else {
+                outline::projected_path(&line.commands, |point| {
+                    let source = outline::Point {
+                        x: point.x + offset,
+                        y: baseline - point.y,
+                    };
+                    let projected =
+                        outline::project(source, angle, axis, perspective, line.width.max(size));
+                    outline::Point {
+                        x: x + projected.x,
+                        y: y + projected.y,
+                    }
+                })
+            };
+            let gpu_id = if self.gpu.is_some() {
+                let padding = size * 0.3;
+                let width = (line.width + padding * 2.).max(1.);
+                let height = (line.ascent + line.descent + padding * 2.).max(1.);
+                let source = outline::svg_path(&line.commands, |p| outline::Point {
+                    x: p.x + padding,
+                    y: line.ascent + padding - p.y,
+                });
+                let matrix = gpu_scene::homography(width, height, |p| {
+                    let projected = outline::project(
+                        outline::Point {
+                            x: p.x - padding + offset,
+                            y: p.y - padding - (line.ascent + line.descent) / 2.,
+                        },
+                        angle,
+                        axis,
+                        perspective,
+                        line.width.max(size),
+                    );
+                    outline::Point {
+                        x: x + projected.x,
+                        y: y + projected.y,
+                    }
+                });
+                let list = self.gpu.as_mut().unwrap();
+                let id = list.len();
+                list.push(gpu_scene::Primitive {
+                    path: source,
+                    width,
+                    height,
+                    matrix,
+                    fill: color.into(),
+                    stroke: "none".into(),
+                    stroke_width: 0.,
+                    opacity,
+                    filter: "none".into(),
+                });
+                format!(r#" data-gpu="{id}""#)
+            } else {
+                String::new()
+            };
             let _ = write!(
                 self.svg,
-                r#"<path aria-label="{}" d="{path}" fill="{color}" opacity="{opacity}"/>"#,
+                r#"<path{gpu_id} aria-label="{}" d="{path}" fill="{color}" opacity="{opacity}"/>"#,
                 escape(text)
             );
         } else {
@@ -510,6 +682,17 @@ impl<'a> Scene<'a> {
         stroke: &str,
         opacity: f64,
     ) {
+        if self.gpu.is_some() {
+            let commands = rounded_rectangle(x, y, w, h, r);
+            let fill_id = self.gpu_shape(&commands, x, y, w, h, fill, "none", 0., 1.);
+            let stroke_id = self.gpu_shape(&commands, x, y, w, h, "none", stroke, 1., 1.);
+            let path = String::new();
+            let _ = write!(
+                self.svg,
+                r#"<g opacity="{opacity}"><path{fill_id} d="{path}"/><path{stroke_id} d="{path}"/></g>"#
+            );
+            return;
+        }
         if self.panel.is_some() {
             let commands = rounded_rectangle(x, y, w, h, r);
             let path = outline::projected_path(&commands, |point| self.panel_point(point));
@@ -1717,11 +1900,11 @@ impl<'a> Scene<'a> {
         self.weight = 600;
         self.tracking = 0.;
     }
-    fn finish(mut self) -> String {
+    fn draw(&mut self) {
         if self.snapshot["flow"]["activeLine"].is_null() && self.snapshot["mode"] != "folding_verse"
         {
             self.svg.push_str("</svg>");
-            return self.svg;
+            return;
         }
         match self.snapshot["mode"].as_str().unwrap_or("") {
             "luminous" => self.flow(),
@@ -1738,7 +1921,15 @@ impl<'a> Scene<'a> {
             _ => {}
         }
         self.svg.push_str("</svg>");
+    }
+    fn finish(mut self) -> String {
+        self.draw();
         self.svg
+    }
+    fn finish_gpu(mut self) -> (String, Vec<gpu_scene::Primitive>) {
+        self.gpu = Some(vec![]);
+        self.draw();
+        (self.svg, self.gpu.unwrap())
     }
 }
 
@@ -1746,7 +1937,8 @@ pub struct StageLyricsPane {
     snapshot: Value,
     width: f64,
     height: f64,
-    worker: Option<LatestWorker<LyricFrame, Result<Arc<RenderImage>, String>>>,
+    worker: Option<LatestWorker<LyricFrame, Result<LyricOutput, String>>>,
+    gpu_renderer: Option<Rc<dyn Fn(&GpuLyricsFrame) -> bool>>,
     active: bool,
     generation: u64,
     scope: Option<(String, String, u64, u64, u32)>,
@@ -2135,6 +2327,12 @@ struct LyricFrame {
     width: f64,
     height: f64,
     scale: f32,
+    generation: u64,
+    gpu: bool,
+}
+enum LyricOutput {
+    Cpu(Arc<RenderImage>),
+    Gpu(GpuLyricsFrame),
 }
 impl LyricFrame {
     fn svg(&self) -> String {
@@ -2181,16 +2379,94 @@ impl LyricFrame {
         }
     }
 }
-fn new_lyric_worker() -> LatestWorker<LyricFrame, Result<Arc<RenderImage>, String>> {
+fn new_lyric_worker() -> LatestWorker<LyricFrame, Result<LyricOutput, String>> {
     LatestWorker::new({
         // Renderer construction, native shaping, SVG parsing and blur rasterization
         // all execute on this worker, never in GPUI's Render callback.
         let mut renderer = None;
+        let mut atlases = gpu_scene::AtlasCache::default();
         move |frame: LyricFrame| {
             let renderer = renderer.get_or_insert_with(|| SvgRenderer::new(Arc::new(())));
+            if frame.gpu {
+                let now = num(&frame.snapshot, "animationTime", 0.);
+                let spec = transition_spec(frame.snapshot["mode"].as_str().unwrap_or(""));
+                let elapsed = (now - frame.started).max(0.);
+                let mut snapshot = frame.snapshot.clone();
+                snapshot["_presentation"] = frame.segments.presentation(now);
+                if spec.depth && elapsed < spec.duration() {
+                    if let Some(old) = &frame.outgoing {
+                        snapshot = depth_transition(&snapshot, old, spec.progress(elapsed));
+                    }
+                }
+                let (mut svg, mut primitives) =
+                    Scene::new(&snapshot, frame.width, frame.height).finish_gpu();
+                if !spec.depth && !spec.fold && elapsed < spec.duration() {
+                    let p = spec.progress(elapsed);
+                    let mut body = String::new();
+                    if let Some(old) = &frame.outgoing {
+                        let (old_svg, mut old_primitives) = Scene::new(
+                            &advance_outgoing(old, &snapshot),
+                            frame.width,
+                            frame.height,
+                        )
+                        .finish_gpu();
+                        let old_svg = old_svg
+                            .replace("id=\"", "id=\"outgoing-")
+                            .replace("url(#", "url(#outgoing-");
+                        for primitive in &mut old_primitives {
+                            primitive.fill = primitive.fill.replace("url(#", "url(#outgoing-");
+                            primitive.stroke = primitive.stroke.replace("url(#", "url(#outgoing-");
+                            primitive.filter = primitive.filter.replace("url(#", "url(#outgoing-");
+                        }
+                        let offset = old_primitives.len();
+                        for index in (0..primitives.len()).rev() {
+                            svg = svg.replace(
+                                &format!("data-gpu=\"{index}\""),
+                                &format!("data-gpu=\"{}\"", index + offset),
+                            );
+                        }
+                        old_primitives.append(&mut primitives);
+                        primitives = old_primitives;
+                        body.push_str(&scene_layer(
+                            &old_svg,
+                            frame.width,
+                            frame.height,
+                            (1. - p).clamp(0., 1.),
+                            1. - (1. - spec.scale) * p,
+                            spec.move_x * frame.width * p,
+                            spec.move_y * frame.height * p,
+                        ));
+                    }
+                    body.push_str(&scene_layer(
+                        &svg,
+                        frame.width,
+                        frame.height,
+                        p.clamp(0., 1.),
+                        spec.scale + (1. - spec.scale) * p,
+                        spec.move_x * frame.width * (1. - p),
+                        spec.move_y * frame.height * (1. - p),
+                    ));
+                    svg = format!(
+                        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}">{body}</svg>"#,
+                        frame.width, frame.height
+                    );
+                }
+                return atlases
+                    .frame(
+                        renderer,
+                        &svg,
+                        &primitives,
+                        frame.width,
+                        frame.height,
+                        frame.scale,
+                        frame.generation,
+                    )
+                    .map(LyricOutput::Gpu);
+            }
             let svg = frame.svg();
             renderer
                 .render_single_frame(svg.as_bytes(), frame.scale)
+                .map(LyricOutput::Cpu)
                 .map_err(|_| "lyrics_svg_render_failed".to_owned())
         }
     })
@@ -2211,6 +2487,7 @@ impl StageLyricsPane {
             width: 0.,
             height: 0.,
             worker: None,
+            gpu_renderer: None,
             active: true,
             generation: 0,
             scope: None,
@@ -2243,6 +2520,14 @@ impl StageLyricsPane {
     pub fn set_viewport_size(&mut self, width: f32, height: f32) {
         self.width = width.max(0.) as f64;
         self.height = height.max(0.) as f64;
+    }
+    pub fn set_gpu_renderer(&mut self, renderer: Rc<dyn Fn(&GpuLyricsFrame) -> bool>) {
+        self.gpu_renderer = Some(renderer);
+        self.generation += 1;
+        if let Some(worker) = &self.worker {
+            worker.close();
+        }
+        self.submitted = None;
     }
     pub fn set_visible(&mut self, active: bool, cx: &mut Context<Self>) {
         if self.active == active {
@@ -2308,6 +2593,25 @@ impl Render for StageLyricsPane {
             self.generation += 1;
             self.scope = Some(scope);
             self.submitted = None;
+            if let Some(renderer) = &self.gpu_renderer {
+                let cleared = renderer(&GpuLyricsFrame {
+                    width: w,
+                    height: h,
+                    scale,
+                    generation: self.generation,
+                    atlases: vec![],
+                    batches: vec![],
+                });
+                self.render_error = if cleared {
+                    None
+                } else {
+                    Some(format!(
+                        "lyrics_gpu_clear_failed mode={} generation={}",
+                        text(&self.snapshot, "mode"),
+                        self.generation
+                    ))
+                };
+            }
             if let Some(image) = self.image.take() {
                 _ = window.drop_image(image);
             }
@@ -2315,14 +2619,36 @@ impl Render for StageLyricsPane {
         let worker = self.worker.get_or_insert_with(new_lyric_worker);
         if let Some(result) = worker.take(self.generation) {
             match result {
-                Ok(image) => {
+                Ok(LyricOutput::Gpu(frame)) => {
+                    if self
+                        .gpu_renderer
+                        .as_ref()
+                        .is_some_and(|renderer| renderer(&frame))
+                    {
+                        if let Some(image) = self.image.take() {
+                            _ = window.drop_image(image);
+                        }
+                        self.render_error = None;
+                    } else {
+                        self.render_error = Some(format!(
+                            "lyrics_gpu_submit_failed mode={} {}",
+                            text(&self.snapshot, "mode"),
+                            frame.diagnostics()
+                        ));
+                    }
+                }
+                Ok(LyricOutput::Cpu(image)) => {
                     if let Some(old) = self.image.replace(image) {
                         _ = window.drop_image(old);
                     }
                     self.render_error = None;
                 }
                 Err(error) => {
-                    self.render_error = Some(error);
+                    self.render_error = Some(format!(
+                        "{error} mode={} generation={}",
+                        text(&self.snapshot, "mode"),
+                        self.generation
+                    ));
                 }
             }
         }
@@ -2343,6 +2669,8 @@ impl Render for StageLyricsPane {
                     width: w,
                     height: h,
                     scale,
+                    generation: self.generation,
+                    gpu: self.gpu_renderer.is_some(),
                 },
             );
             self.submitted = Some(key);
@@ -3097,6 +3425,258 @@ mod tests {
     use super::{Scene, escape};
     use serde_json::json;
 
+    #[test]
+    fn real_pane_generation_clears_gpu_before_new_song_and_exposes_submit_error() {
+        use gpui_kit::{AppContext, TestAppContext};
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+        let stored = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (events, entity) = (calls.clone(), stored.clone());
+        let handle = cx.add_window(move |window, cx| {
+            let pane = cx.new(|cx| {
+                let mut pane = super::StageLyricsPane::new(window, cx);
+                pane.snapshot = json!({"trackID":"first","mode":"luminous"});
+                pane.set_gpu_renderer(std::rc::Rc::new(move |frame| {
+                    events
+                        .borrow_mut()
+                        .push((frame.generation, frame.batches.is_empty()));
+                    frame.batches.is_empty()
+                }));
+                pane
+            });
+            *entity.borrow_mut() = Some(pane.clone());
+            gpui_kit::base::Root::new(pane, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        let pane = stored.borrow().clone().unwrap();
+        let previous = calls.borrow().last().unwrap().0;
+        cx.update_window(handle.into(), |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.update_snapshot(json!({"trackID":"second","mode":"mindscape"}), window, cx)
+            });
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        let generation = calls.borrow().last().unwrap().0;
+        assert!(generation > previous);
+        assert_eq!(
+            calls.borrow().last().unwrap().1,
+            true,
+            "new scope must immediately clear old GPU text"
+        );
+        cx.update_window(handle.into(), |_, window, cx| {
+            pane.update(cx, |pane, _| {
+                let mut queue = pane.worker.as_ref().unwrap().shared.0.lock().unwrap();
+                queue.completed = Some((
+                    generation,
+                    Ok(super::LyricOutput::Gpu(super::GpuLyricsFrame {
+                        width: 100.,
+                        height: 100.,
+                        scale: 1.,
+                        generation,
+                        atlases: vec![],
+                        batches: vec![super::GpuLyricsBatch {
+                            parent: None,
+                            glyphs: vec![],
+                            sigma: 88.,
+                            glow: [0.; 4],
+                            blur_mix: 0.,
+                            opacity: 1.,
+                        }],
+                    })),
+                ));
+            });
+            window.draw(cx).clear(cx);
+            pane.update(cx, |pane, cx| {
+                let error = pane.render_error().unwrap();
+                assert!(error.contains("mode=mindscape"));
+                assert!(error.contains("depth=1"));
+                assert!(error.contains("glyph_limit_exceeded=false"));
+                assert!(!error.contains("sigma="));
+                pane.set_visible(false, cx);
+            });
+        })
+        .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn production_gpu_luminous_keeps_effect_tree_and_reuses_packed_atlas() {
+        let phrase = "真实中文歌词保持辉光与等待逐字动画";
+        let glyphs:Vec<_>=phrase.chars().enumerate().map(|(i,c)|json!({"id":format!("g{i}"),"text":c.to_string(),"phase":if i%3==0{"active"}else if i%3==1{"waiting"}else{"passed"},"progress":0.4,"rotation":3.,"xOffset":4.,"yOffset":2.})).collect();
+        let mut snapshot = json!({"mode":"luminous","animationTime":10.,"flow":{"activeLine":{"id":"a","text":phrase},"previousLine":{"text":"上一句真实排版"},"nextLine":{"text":"下一句真实排版"},"translation":"Real shaped translation","glyphs":glyphs},"audioMotion":{"expansion":1.01,"beatLift":4.}});
+        let renderer = super::SvgRenderer::new(std::sync::Arc::new(()));
+        let mut cache = super::gpu_scene::AtlasCache::default();
+        let (svg, primitives) = Scene::new(&snapshot, 1180., 760.).finish_gpu();
+        let first = cache
+            .frame(&renderer, &svg, &primitives, 1180., 760., 2., 1)
+            .unwrap();
+        assert!(!first.atlases.is_empty() && first.atlases.len() <= 16);
+        assert!(first.batches.len() <= 256);
+        assert!(
+            first
+                .batches
+                .iter()
+                .any(|batch| batch.sigma > 10. && batch.blur_mix == 1.)
+        );
+        assert!(first.batches.iter().any(|batch| batch.glow[3] > 0.));
+        assert!(
+            first
+                .batches
+                .iter()
+                .any(|batch| (batch.opacity - 0.7).abs() < 1e-9)
+        );
+        for (index, batch) in first.batches.iter().enumerate() {
+            if let Some(parent) = batch.parent {
+                assert!(parent < index);
+            }
+            let mut depth = 1;
+            let mut parent = batch.parent;
+            while let Some(index) = parent {
+                depth += 1;
+                parent = first.batches[index].parent;
+            }
+            assert!(depth <= 8);
+        }
+        snapshot["animationTime"] = json!(10.2);
+        snapshot["audioMotion"]["expansion"] = json!(1.04);
+        snapshot["flow"]["glyphs"][0]["progress"] = json!(0.8);
+        let (svg, primitives) = Scene::new(&snapshot, 1180., 760.).finish_gpu();
+        let second = cache
+            .frame(&renderer, &svg, &primitives, 1180., 760., 2., 1)
+            .unwrap();
+        assert_eq!(first.atlases.len(), second.atlases.len());
+        for (a, b) in first.atlases.iter().zip(&second.atlases) {
+            assert_eq!(a.id, b.id);
+            assert!(
+                std::sync::Arc::ptr_eq(&a.rgba, &b.rgba),
+                "dynamic frames must not reraster or repack static glyphs"
+            );
+        }
+        assert_ne!(
+            first
+                .batches
+                .iter()
+                .flat_map(|b| b.glyphs.iter())
+                .next()
+                .unwrap()
+                .matrix,
+            second
+                .batches
+                .iter()
+                .flat_map(|b| b.glyphs.iter())
+                .next()
+                .unwrap()
+                .matrix
+        );
+        if let Ok(path) = std::env::var("GMGN_LYRICS_FRAME_EXPORT") {
+            use base64::Engine;
+            let atlases:Vec<_>=first.atlases.iter().map(|a|json!({"id":a.id,"width":a.width,"height":a.height,"rgba":base64::engine::general_purpose::STANDARD.encode(a.rgba.as_slice())})).collect();
+            let batches:Vec<_>=first.batches.iter().map(|b|json!({"parent":b.parent,"opacity":b.opacity,"sigma":b.sigma,"blur_mix":b.blur_mix,"glow":b.glow,"glyphs":b.glyphs.iter().map(|g|json!({"atlas_id":g.atlas_id,"width":g.width,"height":g.height,"matrix":g.matrix,"uv":g.uv,"rgba":g.rgba})).collect::<Vec<_>>()})).collect();
+            std::fs::write(path,serde_json::to_vec(&json!({"width":first.width,"height":first.height,"scale":first.scale,"atlases":atlases,"batches":batches})).unwrap()).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn production_gpu_mindscape_and_confession_preserve_actual_projection() {
+        for snapshot in [
+            json!({"mode":"mindscape","flow":{"activeLine":{"id":"a","text":"真实深度"}},"depth":{"lines":[{"id":"a","text":"真实深度","position":0,"opacity":1.,"scale":1.},{"id":"b","text":"背景投影","position":1,"opacity":0.5,"scale":0.9,"blurRadius":2.}]}}),
+            json!({"mode":"confession","flow":{"activeLine":{"id":"a","text":"真实倾斜"}},"playbackTime":5.,"tilt":{"segments":[{"id":"s","text":"真实倾斜","revealAt":0.,"isTilted":true,"xOffset":0.1,"yOffset":0.1}]}}),
+        ] {
+            let (svg, primitives) = Scene::new(&snapshot, 1000., 700.).finish_gpu();
+            let renderer = super::SvgRenderer::new(std::sync::Arc::new(()));
+            let frame = super::gpu_scene::AtlasCache::default()
+                .frame(&renderer, &svg, &primitives, 1000., 700., 1., 1)
+                .unwrap();
+            assert!(
+                frame
+                    .batches
+                    .iter()
+                    .flat_map(|b| b.glyphs.iter())
+                    .any(|g| g.matrix[6].abs() + g.matrix[7].abs() > 1e-6)
+            );
+            assert!(frame.batches.iter().any(|b| b.glow[3] > 0.));
+        }
+    }
+
+    #[test]
+    fn gpu_homography_preserves_real_panel_projection_inside_quad() {
+        let panel = super::confession_panel(1000., 700.);
+        let matrix = super::gpu_scene::homography(500., 80., |p| panel.map(p));
+        for (x, y) in [(0., 0.), (500., 80.), (125., 20.), (250., 60.), (490., 1.)] {
+            let denominator = matrix[6] * x + matrix[7] * y + matrix[8];
+            let actual = super::outline::Point {
+                x: (matrix[0] * x + matrix[1] * y + matrix[2]) / denominator,
+                y: (matrix[3] * x + matrix[4] * y + matrix[5]) / denominator,
+            };
+            let expected = panel.map(super::outline::Point { x, y });
+            assert!((actual.x - expected.x).abs() < 1e-8);
+            assert!((actual.y - expected.y).abs() < 1e-8);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn long_context_and_luminous_transition_fit_native_gpu_budgets() {
+        let text = "在很长的歌词里保留真正的文字轮廓与完整光影".repeat(5);
+        let worker = super::new_lyric_worker();
+        for (i, mode) in ["monet_poster", "diorama", "luminous"].iter().enumerate() {
+            let glyphs: Vec<_> = "真正的逐字辉光过渡".chars().enumerate().map(|(i,c)|
+                json!({"id":format!("g{i}"),"text":c.to_string(),"phase":"active","progress":0.5})).collect();
+            let snapshot = json!({"mode":mode,"animationTime":10.2,"playbackTime":5.,
+                "flow":{"activeLine":{"id":"new","text":"真正的逐字辉光过渡"},"previousLine":{"text":text},"nextLine":{"text":text},"translation":text,"glyphs":glyphs},
+                "monet":{"entries":[{"line":{"text":text,"translation":text},"offset":-1,"status":"passed"},{"line":{"text":text},"offset":0,"status":"active"},{"line":{"text":text},"offset":1,"status":"upcoming"}]}});
+            let mut old = snapshot.clone();
+            old["flow"]["activeLine"]["id"] = json!("old");
+            let generation = i as u64 + 1;
+            worker.submit(
+                generation,
+                super::LyricFrame {
+                    snapshot,
+                    outgoing: Some(old),
+                    segments: super::SegmentLifecycle::default(),
+                    started: 10.,
+                    width: 1180.,
+                    height: 760.,
+                    scale: 2.,
+                    generation,
+                    gpu: true,
+                },
+            );
+            wait_until(|| worker.shared.0.lock().unwrap().completed.is_some());
+            let super::LyricOutput::Gpu(frame) = worker
+                .take(generation)
+                .unwrap()
+                .unwrap_or_else(|error| panic!("{mode}: {error}"))
+            else {
+                panic!("GPU required")
+            };
+            assert!(!frame.atlases.is_empty(), "{mode}: missing text");
+            assert!(
+                frame.atlases.len() <= 16 && frame.batches.len() <= 256,
+                "{mode}: page/batch budget"
+            );
+            assert!(frame.batches.iter().map(|b| b.glyphs.len()).sum::<usize>() <= 4096);
+            for batch in &frame.batches {
+                let mut depth = 1;
+                let mut parent = batch.parent;
+                while let Some(index) = parent {
+                    depth += 1;
+                    parent = frame.batches[index].parent;
+                }
+                assert!(depth <= 8, "{mode}: depth={depth}");
+                for glyph in &batch.glyphs {
+                    assert!(frame.atlases.iter().any(|a| a.id == glyph.atlas_id));
+                }
+            }
+        }
+        worker.close();
+        wait_until(|| worker.stopped());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn production_lyric_worker_shapes_and_rasterizes_real_scene() {
@@ -3114,13 +3694,18 @@ mod tests {
                 width: 160.,
                 height: 100.,
                 scale: 1.,
+                generation: 1,
+                gpu: false,
             },
         );
         wait_until(|| worker.shared.0.lock().unwrap().completed.is_some());
-        let image = worker
+        let output = worker
             .take(1)
             .expect("completed frame")
             .expect("native SVG frame");
+        let super::LyricOutput::Cpu(image) = output else {
+            panic!("expected CPU frame");
+        };
         assert_eq!(image.frame_count(), 1);
         worker.close();
         wait_until(|| worker.stopped());
@@ -3693,6 +4278,26 @@ mod tests {
             let svg = Scene::new(&snapshot, 1280., 720.).finish();
             assert!(svg.contains("真实歌词") || svg.contains("真"));
             unique.insert(svg);
+            #[cfg(target_os = "macos")]
+            {
+                let (svg, primitives) = Scene::new(&snapshot, 1280., 720.).finish_gpu();
+                let renderer = super::SvgRenderer::new(std::sync::Arc::new(()));
+                let frame = super::gpu_scene::AtlasCache::default()
+                    .frame(&renderer, &svg, &primitives, 1280., 720., 1., 1)
+                    .unwrap_or_else(|error| panic!("{mode}: {error}"));
+                assert!(!frame.batches.is_empty(), "{mode}: lost scene");
+                assert!(frame.batches.len() <= 256, "{mode}: batch budget");
+                assert!(frame.atlases.len() <= 16, "{mode}: atlas page budget");
+                for batch in &frame.batches {
+                    let mut depth = 1;
+                    let mut parent = batch.parent;
+                    while let Some(index) = parent {
+                        depth += 1;
+                        parent = frame.batches[index].parent;
+                    }
+                    assert!(depth <= 8, "{mode}: nested effects exceed native budget");
+                }
+            }
         }
         assert_eq!(unique.len(), 11);
     }

@@ -6,11 +6,14 @@ use gmgn_gpui_ui::inbox::InboxPane;
 use gmgn_gpui_ui::stage_panels::{StagePanelsPane,StageProgramRailPane,ResidentPropEditorPane};
 use gmgn_gpui_ui::lyrics::{StageLyricsPane,StageBoundVideoPromptPane};
 use gpui_kit::*;
+use gpui_kit::prelude::FluentBuilder;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{cell::RefCell, rc::Rc, time::Duration,ffi::{c_void,c_char,CStr}};
 mod host_events;
 mod product_host;
 mod program_backdrop;
+mod lyrics_layer;
+mod system_symbol;
 use product_host::ProductHost;
 gpui_kit::actions!(gmgn_product, [Quit,ShowSettings,ShowLiveCam,EscapeStage]);
 
@@ -79,8 +82,10 @@ struct GMGNProductUI {
     program_pane: Entity<StageProgramRailPane>,
     program_open: bool,
     program_backdrop: Rc<RefCell<Option<program_backdrop::ProgramBackdrop>>>,
+    lyrics_layer: Rc<RefCell<Option<lyrics_layer::LyricsLayer>>>,
     prop_pane: Entity<ResidentPropEditorPane>,
     lyrics_pane:Entity<StageLyricsPane>,
+    lyrics_error_logged: Option<String>,
     bound_video_pane:Entity<StageBoundVideoPromptPane>,
     props_open: bool,
     chat_open: bool,
@@ -103,6 +108,21 @@ struct GMGNProductUI {
 }
 
 impl GMGNProductUI {
+    fn sync_lyrics_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.compact || !self.surface_mounted {
+            self.lyrics_layer.borrow_mut().take();
+            return;
+        }
+        if self.lyrics_layer.borrow().is_some() { return; }
+        let Ok(handle)=window.window_handle() else {return;};
+        let RawWindowHandle::AppKit(handle)=handle.as_raw() else {return;};
+        let Some(layer)=(unsafe {lyrics_layer::LyricsLayer::new(handle.ns_view.as_ptr())}) else {return;};
+        *self.lyrics_layer.borrow_mut()=Some(layer);
+        let context=self.lyrics_layer.clone();
+        self.lyrics_pane.update(cx,|pane,_|pane.set_gpu_renderer(Rc::new(move |frame| {
+            context.borrow_mut().as_mut().is_some_and(|layer|layer.apply(frame))
+        })));
+    }
     fn clear_program_backdrop(&mut self, cx: &mut Context<Self>) {
         self.program_pane.update(cx, |pane,cx| pane.set_native_material_renderer(None,cx));
         self.program_backdrop.borrow_mut().take();
@@ -276,7 +296,15 @@ impl GMGNProductUI {
             self.stage_pane.update(cx,|pane,cx|pane.update_snapshot(batch.state["stage"].clone(),window,cx));
             self.program_pane.update(cx,|pane,cx|pane.update_snapshot(batch.state["stageProgramRail"].clone(),window,cx));
             self.prop_pane.update(cx,|pane,cx|pane.update_snapshot(batch.state["propEditor"].clone(),window,cx));
-            self.lyrics_pane.update(cx,|pane,cx|pane.update_snapshot(batch.state["lyrics"].clone(),window,cx));
+            self.lyrics_pane.update(cx,|pane,cx|{
+                pane.set_visible(!self.compact,cx);
+                pane.update_snapshot(batch.state["lyrics"].clone(),window,cx);
+            });
+            let lyrics_error = self.lyrics_pane.read(cx).render_error().map(str::to_owned);
+            if lyrics_error != self.lyrics_error_logged {
+                if let Some(error) = &lyrics_error { eprintln!("GMGN_LYRICS_RENDER_ERROR {error}"); }
+                self.lyrics_error_logged = lyrics_error;
+            }
             self.bound_video_pane.update(cx,|pane,cx|pane.update_snapshot(batch.state["boundVideoPrompt"].clone(),window,cx));
             if let Some(open)=batch.state["propEditor"]["isOpen"].as_bool() {self.props_open=open;}
             self.settings_pane.update(cx,|pane,cx|pane.update_snapshot(batch.state["settings"].clone(),window,cx));
@@ -463,6 +491,7 @@ impl GMGNProductUI {
         ui.stage_panel_open=false;ui.program_open=false;ui.props_open=false;
         ui.surface_mounted=false;
         ui.clear_program_backdrop(cx);
+        ui.lyrics_layer.borrow_mut().take();
         ui._poll=cx.spawn(async move |view,cx| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(100)).await;
@@ -482,8 +511,13 @@ impl GMGNProductUI {
             if self.runtime_state["screenOperation"]["active"].as_bool()==Some(true){"完成操作（Esc）"}
             else if self.runtime_state["screenOperation"]["available"].as_bool()==Some(true){"操作电视"}
             else {"这块空间里还没有在放的电视"}
-        }else{label};
-        let button=Button::new(id).ghost().icon(if id=="visual"&&self.stage_panel_open {gpui_kit::assets::IconName::X}else if id=="play"&&self.runtime_state["playbackState"].as_str()==Some("playing"){gpui_kit::assets::IconName::Pause}else{control_icon(id)})
+        }else if id=="chat"&&!self.compact {if self.chat_open{"收起聊天"}else{"与居民聊天"}}else{label};
+        let button=Button::new(id).ghost();
+        let button=if id=="chat"&&!self.compact {
+            button.when_some(system_symbol::tinted_image(if self.chat_open{"bubble.left.fill"}else{"bubble.left"},if self.chat_open{1}else{2}),|button,image|button.child(img(image).w(px(16.)).h(px(16.)).object_fit(ObjectFit::Contain)))
+                .when(self.chat_open,|button|button.bg(rgba(system_symbol::system_blue_background())))
+        }else{button.icon(if id=="visual"&&self.stage_panel_open {gpui_kit::assets::IconName::X}else if id=="play"&&self.runtime_state["playbackState"].as_str()==Some("playing"){gpui_kit::assets::IconName::Pause}else{control_icon(id)})};
+        let button=button
             .accessibility_label(label).tooltip(label).w(px(width)).h(px(height));
         let button=if id=="visual"{button.px(px(6.)).child(div().text_size(px(12.)).whitespace_nowrap().child(if self.stage_panel_open{"收起"}else{"设置"}))}else{button};
         let button=if self.compact {button.rounded(px(15.)).bg(rgba(0x1f1f1ff0)).border_1().border_color(rgba(0xffffff2e)).text_color(rgb(0xffffff))}else{button};
@@ -529,6 +563,7 @@ impl GMGNProductUI {
 impl Render for GMGNProductUI {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_program_backdrop(window,cx);
+        self.sync_lyrics_layer(window,cx);
         if self.composer_focus_pending {
             self.composer_focus_pending=false;
             let pane=self.pane.downgrade();
@@ -576,7 +611,8 @@ impl Render for GMGNProductUI {
         }
         let viewport=window.viewport_size();let width=viewport.width.as_f32();let height=viewport.height.as_f32();
         let compact_composer_height=if self.runtime_state["attachments"].as_array().is_some_and(|images|!images.is_empty()) || self.runtime_state["attachmentsPreparing"].as_bool()==Some(true) || self.runtime_state["attachmentError"].as_str().is_some_and(|error|!error.is_empty()){140.}else{70.};
-        let mut root=div().size_full().relative().text_color(foreground);
+        let mut root=div().size_full().relative().font_family(cx.theme().font_family.clone()).text_size(px(gmgn_gpui_ui::ui_tokens::BODY)).line_height(px(gmgn_gpui_ui::ui_tokens::BODY_LINE_HEIGHT)).text_color(foreground);
+        self.lyrics_pane.update(cx,|pane,cx|pane.set_visible(!self.compact,cx));
         if !self.compact {
             self.lyrics_pane.update(cx,|pane,_|pane.set_viewport_size(width,height));
             root=root.child(div().absolute().size_full().child(self.lyrics_pane.clone()));
@@ -606,15 +642,15 @@ impl Render for GMGNProductUI {
             let mut transport=div().absolute().right(px(22.)).bottom(px(22.)).w(px(529.)).h(px(48.)).flex().items_center().px(px(4.)).rounded_xl().bg(background);
             for (id,label,action) in [("program","节目","program"),("previous","上首","previousTrack"),("play","播放","togglePlayback"),("next","下首","nextTrack"),("voice","语音","voice"),("chat","聊天","chat"),("inbox","通知","showNotifications"),("props","装修","toggleDecoration"),("screen","屏幕操作","screen"),("visual","舞台设置","visual"),("mode","窗口","mode")] {
                 transport=transport.child(self.control(id,label,action,if id=="visual"{68.}else{44.},44.,cx));
-                if id=="next" {transport=transport.child(div().w(px(13.)).flex_shrink_0());}
+                if id=="next" {transport=transport.child(div().w(px(13.)).flex_shrink_0().flex().items_center().justify_center().child(div().w(px(1.)).h(px(20.)).bg(rgba(0xffffff1f))));}
             }
             let in_space=self.runtime_state["stage"]["mode"].as_str()==Some("space");
             root=root.child(transport).child(Button::new("destination").ghost()
-                .label(if in_space{"播放器"}else{"空间"})
+                .child(div().flex().items_center().gap(px(4.)).when_some(system_symbol::image(if in_space{"circle.hexagongrid.fill"}else{"cube.transparent"}),|view,image|view.child(img(image).w(px(12.)).h(px(12.)).object_fit(ObjectFit::Contain))).child(if in_space{"播放器"}else{"空间"}))
                 .accessibility_label(if in_space{"切换到播放器"}else{"进入空间"})
                 .tooltip(if in_space{"返回播放器"}else{"进入空间"})
                 .w(px(112.)).h(px(38.)).rounded(px(19.)).bg(rgba(0x0a0a0ab8))
-                .border_1().border_color(rgba(0x47dbff7a)).text_color(rgb(0x7af2ff)).text_size(px(11.)).font_weight(FontWeight::SEMIBOLD)
+                .border_1().border_color(rgba(0x47dbff7a)).text_color(rgb(0x7af2ff)).text_size(px(gmgn_gpui_ui::ui_tokens::BODY)).font_weight(FontWeight::SEMIBOLD)
                 .absolute().right(px(22.)).top(px(28.)).on_click(cx.listener(|this,_,_,cx|this.overlay_action("destination",cx))));
             if self.runtime_state["screenOperation"]["active"].as_bool()==Some(true) {
                 root=root.child(div().id("stage.screen-operation-banner").absolute().right(px(173.5)).bottom(px(82.)).w(px(226.)).h(px(30.)).flex().items_center().justify_center().rounded_xl().bg(rgba(0x0a4d6beb)).text_sm().child("正在操作电视，按 Esc 退出"));
@@ -854,7 +890,7 @@ fn main() {
                     }
                 });
                 GMGNProductUI { host: host.clone(), pane, settings_pane, settings_window:None, inbox_pane, inbox_window:None, stage_pane,stage_panel_open:false,
-                    program_pane,program_open:false,program_backdrop:Rc::new(RefCell::new(None)),prop_pane,lyrics_pane,bound_video_pane,props_open:false,chat_open:false,composer_focus_pending:false, voice_held:false, pending: None, accepted: false,
+                    program_pane,program_open:false,program_backdrop:Rc::new(RefCell::new(None)),lyrics_layer:Rc::new(RefCell::new(None)),prop_pane,lyrics_pane,lyrics_error_logged:None,bound_video_pane,props_open:false,chat_open:false,composer_focus_pending:false, voice_held:false, pending: None, accepted: false,
                     transcript: vec![], compact, core_notice, runtime_state: serde_json::Value::Null,
                     surface_mounted: false,navigation_revision:0,main_window:main_window.clone(),profile_switch_pending:false,dismissed_reply_revision:None,player_menu_open:false,program_visibility_reported:None, _poll: poll }
             });

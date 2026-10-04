@@ -213,6 +213,19 @@ pub struct ProjectedCard {
     mapping: Option<Homography>,
 }
 impl ProjectedCard {
+    /// Repositions an already prepared frame without rerasterizing. Input,
+    /// native material and hit testing all follow the exact displayed frame.
+    pub fn shifted_source_to_world_matrix(&self, delta: [f64; 2]) -> [f64; 9] {
+        let mut m = self.source_to_world_matrix();
+        for c in 0..3 {
+            m[c] += delta[0] * m[6 + c];
+            m[3 + c] += delta[1] * m[6 + c];
+        }
+        m
+    }
+    pub fn inverse_hit_shifted(&self, world: [f64; 2], delta: [f64; 2]) -> Option<[f64; 2]> {
+        self.inverse_hit([world[0] - delta[0], world[1] - delta[1]])
+    }
     /// Exact foreground geometry, in logical points (not source raster pixels).
     /// Native materials use this same mapping, including final world origin.
     pub fn source_to_world_matrix(&self) -> [f64; 9] {
@@ -469,26 +482,38 @@ impl ProjectedCard {
         if w as u64 * h as u64 > 16_777_216 {
             return Err("projection exceeds raster limit");
         }
-        let mut pixels = vec![0; w as usize * h as usize * 4];
+        let local_left = if left == 0. {
+            -origin[0]
+        } else {
+            corners.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min)
+        };
+        let local_top = if top == 0. {
+            -origin[1]
+        } else {
+            corners.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min)
+        };
         let padded_t = CardTransform {
             width: raster.width as f64 / density,
             height: raster.height as f64 / density,
             ..t
         };
+        let projected = cached_projection(
+            &raster,
+            inverse,
+            [local_left, local_top],
+            padded_t,
+            pad,
+            ppp,
+            w,
+            h,
+        );
+        let mut pixels = projected.pixels.clone();
         for y in 0..h {
+            let alpha =
+                opacity.clamp(0., 1.) * mask.map_or(1., |m| m.alpha(top + (y as f64 + 0.5) / ppp));
             for x in 0..w {
-                let world = [left + (x as f64 + 0.5) / ppp, top + (y as f64 + 0.5) / ppp];
-                let Some(local) = inverse.apply([world[0] - origin[0], world[1] - origin[1]])
-                else {
-                    continue;
-                };
-                let rgba = sample(&raster, [local[0] + pad, local[1] + pad], padded_t);
                 let i = (y as usize * w as usize + x as usize) * 4;
-                pixels[i..i + 3].copy_from_slice(&rgba[..3]);
-                pixels[i + 3] = (rgba[3] as f64
-                    * opacity.clamp(0., 1.)
-                    * mask.map_or(1., |m| m.alpha(world[1])))
-                .round() as u8;
+                pixels[i + 3] = (pixels[i + 3] as f64 * alpha).round() as u8;
             }
         }
         card.texture = RgbaTexture {
@@ -528,6 +553,81 @@ impl ProjectedCard {
             .into_render_image()
             .expect("validated projected texture")
     }
+}
+struct ProjectionCacheEntry {
+    source: Arc<RgbaTexture>,
+    key: Vec<u64>,
+    raster: Arc<RgbaTexture>,
+}
+thread_local! {static PROJECTION_CACHE:std::cell::RefCell<std::collections::VecDeque<ProjectionCacheEntry>>=const{std::cell::RefCell::new(std::collections::VecDeque::new())};}
+#[allow(clippy::too_many_arguments)]
+fn cached_projection(
+    source: &Arc<RgbaTexture>,
+    inverse: Homography,
+    local_origin: [f64; 2],
+    transform: CardTransform,
+    pad: f64,
+    ppp: f64,
+    width: u32,
+    height: u32,
+) -> Arc<RgbaTexture> {
+    let mut key: Vec<u64> = inverse
+        .0
+        .iter()
+        .flatten()
+        .chain(local_origin.iter())
+        .map(|v| v.to_bits())
+        .collect();
+    key.extend([
+        transform.width.to_bits(),
+        transform.height.to_bits(),
+        pad.to_bits(),
+        ppp.to_bits(),
+        width as u64,
+        height as u64,
+    ]);
+    PROJECTION_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(index) = cache
+            .iter()
+            .position(|entry| Arc::ptr_eq(&entry.source, source) && entry.key == key)
+        {
+            let entry = cache.remove(index).unwrap();
+            let result = entry.raster.clone();
+            cache.push_front(entry);
+            return result;
+        }
+        let mut pixels = vec![0; width as usize * height as usize * 4];
+        for y in 0..height {
+            for x in 0..width {
+                let point = [
+                    local_origin[0] + (x as f64 + 0.5) / ppp,
+                    local_origin[1] + (y as f64 + 0.5) / ppp,
+                ];
+                if let Some(local) = inverse.apply(point) {
+                    let rgba = sample(source, [local[0] + pad, local[1] + pad], transform);
+                    let index = (y as usize * width as usize + x as usize) * 4;
+                    pixels[index..index + 4].copy_from_slice(&rgba);
+                }
+            }
+        }
+        let raster = Arc::new(RgbaTexture {
+            width,
+            height,
+            pixels,
+        });
+        cache.push_front(ProjectionCacheEntry {
+            source: source.clone(),
+            key,
+            raster: raster.clone(),
+        });
+        while cache.len() > 32
+            || cache.iter().map(|e| e.raster.pixels.len()).sum::<usize>() > 64 * 1024 * 1024
+        {
+            cache.pop_back();
+        }
+        raster
+    })
 }
 // Straight pixels enter/leave; all filtering and source-over use premultiplied RGBA.
 struct EffectsCacheEntry {
@@ -799,6 +899,124 @@ fn sample(source: &RgbaTexture, p: [f64; 2], t: CardTransform) -> [u8; 4] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn translated_projection_reuses_local_raster_preserving_mask_matrix_and_hit() {
+        use super::*;
+        PROJECTION_CACHE.with(|c| c.borrow_mut().clear());
+        let source = RgbaTexture {
+            width: 100,
+            height: 30,
+            pixels: vec![255; 100 * 30 * 4],
+        };
+        let t = CardTransform {
+            width: 100.,
+            height: 30.,
+            scale: 1.,
+            y_degrees: 0.,
+            perspective: 0.72,
+        };
+        let mask = Some(RailMask {
+            top: 0.,
+            height: 200.,
+        });
+        let a = ProjectedCard::render_with_effects(
+            &source,
+            t,
+            [30., 30.],
+            [500., 500.],
+            2.,
+            0.7,
+            mask,
+            None,
+            CardEffects::default(),
+        )
+        .unwrap();
+        let raster = PROJECTION_CACHE.with(|c| c.borrow().front().unwrap().raster.clone());
+        let b = ProjectedCard::render_with_effects(
+            &source,
+            t,
+            [30., 40.],
+            [500., 500.],
+            2.,
+            0.7,
+            mask,
+            None,
+            CardEffects::default(),
+        )
+        .unwrap();
+        assert!(
+            PROJECTION_CACHE.with(|c| Arc::ptr_eq(&raster, &c.borrow().front().unwrap().raster))
+        );
+        assert_eq!(b.bounds[1] - a.bounds[1], 10.);
+        assert_eq!(
+            b.source_to_world_matrix()[5] - a.source_to_world_matrix()[5],
+            10.
+        );
+        assert_eq!(a.inverse_hit([50., 40.]), b.inverse_hit([50., 50.]));
+        for y in 0..b.texture.height {
+            for x in 0..b.texture.width {
+                let i = (y as usize * b.texture.width as usize + x as usize) * 4;
+                let expected = (raster.pixels[i + 3] as f64
+                    * 0.7
+                    * mask.unwrap().alpha(b.bounds[1] + (y as f64 + 0.5) / 2.))
+                .round() as u8;
+                assert_eq!(b.texture.pixels[i + 3], expected);
+                assert_eq!(&a.texture.pixels[i..i + 3], &b.texture.pixels[i..i + 3]);
+            }
+        }
+    }
+    #[test]
+    fn projection_cache_reuses_translation_but_not_changed_geometry() {
+        use super::*;
+        PROJECTION_CACHE.with(|c| c.borrow_mut().clear());
+        let source = Arc::new(RgbaTexture {
+            width: 300,
+            height: 80,
+            pixels: vec![191; 300 * 80 * 4],
+        });
+        let t = CardTransform {
+            width: 300.,
+            height: 80.,
+            scale: 1.,
+            y_degrees: -7.,
+            perspective: 0.72,
+        };
+        let inverse = Homography::rotation(300., 80., 1., -7., [0., 1., 0.], 0.72)
+            .unwrap()
+            .inverse()
+            .unwrap();
+        let begin = std::time::Instant::now();
+        let cold = cached_projection(&source, inverse, [0., 0.], t, 0., 2., 600, 160);
+        let cold_time = begin.elapsed();
+        let begin = std::time::Instant::now();
+        let warm = cached_projection(&source, inverse, [0., 0.], t, 0., 2., 600, 160);
+        let warm_time = begin.elapsed();
+        assert!(Arc::ptr_eq(&cold, &warm));
+        for y in 0..160 {
+            for x in 0..600 {
+                let expected = inverse
+                    .apply([(x as f64 + 0.5) / 2., (y as f64 + 0.5) / 2.])
+                    .map_or([0; 4], |p| sample(&source, p, t));
+                assert_eq!(
+                    &cold.pixels[(y * 600 + x) * 4..(y * 600 + x) * 4 + 4],
+                    &expected
+                );
+            }
+        }
+        let changed = Homography::rotation(300., 80., 1., -8., [0., 1., 0.], 0.72)
+            .unwrap()
+            .inverse()
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            &cold,
+            &cached_projection(&source, changed, [0., 0.], t, 0., 2., 600, 160)
+        ));
+        eprintln!(
+            "projection_cache cold_us={} warm_us={} pixels_exact=true",
+            cold_time.as_micros(),
+            warm_time.as_micros()
+        );
+    }
     use super::*;
     #[test]
     fn native_material_matrix_matches_foreground_and_inverse_hit_in_world_points() {

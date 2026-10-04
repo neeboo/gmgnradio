@@ -1,4 +1,5 @@
 //! Native stage panels. Catalogs, availability and every mutation belong to the host.
+use crate::ui_tokens as ui;
 use gpui_kit::component::{
     button::*,
     menu::*,
@@ -15,6 +16,10 @@ pub use props::ResidentPropEditorPane;
 
 pub const STAGE_PANEL_WIDTH: f32 = 590.;
 pub const STAGE_PANEL_HEIGHT: f32 = 458.;
+
+pub(crate) fn style_choice_accessibility(title: &str, name: &str, selected: bool) -> (Role, String) {
+    (Role::Button, format!("{title}：{name}{}", if selected { "，已选择" } else { "" }))
+}
 
 fn video_asset_actions(player:&Value,asset:&Value)->Vec<(&'static str,Value,bool)>{
     let id=asset["id"].clone();
@@ -456,8 +461,11 @@ impl StagePanelsPane {
                 let id = item["id"].as_str().unwrap_or("");
                 let is_selected = player[selected] == item["id"];
                 let command = json!({"op":op,"id":id});
+                let (role, label) = style_choice_accessibility(title, item["name"].as_str().unwrap_or(""), is_selected);
                 let mut tile = div()
                     .id(format!("{key}-{id}"))
+                    .role(role)
+                    .aria_label(label)
                     .w(px(tile_width))
                     .min_h(px(48.))
                     .rounded(px(13.))
@@ -477,7 +485,7 @@ impl StagePanelsPane {
                     .items_center()
                     .justify_center()
                     .gap(px(5.))
-                    .text_size(px(12.))
+                    .text_size(px(ui::CAPTION))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(if is_selected {
                         rgb(0x7af2ff)
@@ -608,6 +616,9 @@ impl Render for StagePanelsPane {
             _ => self.space(cx),
         };
         div()
+            .font_family(cx.theme().font_family.clone())
+            .text_size(px(ui::BODY))
+            .line_height(px(ui::BODY_LINE_HEIGHT))
             .w(px(STAGE_PANEL_WIDTH))
             .h(px(STAGE_PANEL_HEIGHT))
             .p(px(7.))
@@ -616,21 +627,21 @@ impl Render for StagePanelsPane {
                     .size_full()
                     .flex()
                     .flex_col()
-                    .gap_3()
-                    .p_4()
+                    .gap(px(ui::SPACING_12))
+                    .p(px(ui::SPACING_16))
                     .rounded(px(18.))
                     .bg(rgb(0x13161b))
                     .border_1()
                     .border_color(rgb(0x34373c))
                     .text_color(rgb(0xe5e7ea))
-                    .text_xs()
+                    .text_size(px(ui::CAPTION))
                     .child(
                         div()
                             .flex()
                             .justify_between()
                             .child(
                                 div()
-                                    .text_size(px(16.))
+                                    .text_size(px(ui::SUBTITLE))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child("舞台设置"),
                             )

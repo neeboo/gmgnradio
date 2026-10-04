@@ -71,6 +71,15 @@ struct MusicAccountCommandService: Sendable {
         providerID: MusicProviderID,
         cookie: String
     ) async throws {
+        try await Task.detached(priority: .userInitiated) {
+            try await self.validateAndSave(providerID: providerID, cookie: cookie)
+        }.value
+    }
+
+    private nonisolated func validateAndSave(
+        providerID: MusicProviderID,
+        cookie: String
+    ) async throws {
         let trimmed = cookie.trimmingCharacters(in: .whitespacesAndNewlines)
         try validateCookieShape(trimmed, for: providerID)
         let session = MusicProviderSession(
@@ -83,7 +92,7 @@ struct MusicAccountCommandService: Sendable {
             throw MusicAccountConnectionError.accountCannotPlay
         }
 
-        _ = try await client.fetchUserLibrary(session: session)
+        try await client.validateAccount(session: session)
         try await sessions.save(session, for: providerID)
     }
 
@@ -91,7 +100,7 @@ struct MusicAccountCommandService: Sendable {
         try await sessions.removeSession(for: providerID)
     }
 
-    private func client(
+    private nonisolated func client(
         for providerID: MusicProviderID
     ) throws -> any AccountMusicProviderClient {
         switch providerID {
@@ -104,7 +113,7 @@ struct MusicAccountCommandService: Sendable {
         }
     }
 
-    private func validateCookieShape(
+    private nonisolated func validateCookieShape(
         _ cookie: String,
         for providerID: MusicProviderID
     ) throws {
