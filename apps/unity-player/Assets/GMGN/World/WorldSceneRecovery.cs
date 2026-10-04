@@ -96,7 +96,11 @@ namespace GMGN.UnityPlayer.World
                 {
                     if (loaded != null) UnityEngine.Object.Destroy(loaded);
                     item.Status = "failed";
-                    item.Message = error is InvalidDataException ? error.Message : "这个物件恢复失败，原数据仍保留在备份中。";
+                    item.Message = error is InvalidDataException || error is WorldMaterialException ? error.Message : "这个物件恢复失败，原数据仍保留在备份中。";
+                    // No exception stack/message here: IO errors can contain a
+                    // user's absolute path. IDs and bounded codes are sufficient.
+                    var code = error is WorldMaterialException material ? material.Code : error is InvalidDataException ? "invalid_asset" : error.GetType().Name;
+                    Debug.LogWarning("[WorldRecoveryFailure] object=" + entry.Name + " code=" + code);
                 }
             }
             return result;

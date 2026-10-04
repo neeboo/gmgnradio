@@ -27,7 +27,7 @@ namespace GMGN.UnityPlayer
         static void Register()
         {
             QualitySettings.vSyncCount = 0;
-            Application.targetFrameRate = 60;
+            Application.targetFrameRate = 101;
             new GameObject("Native UI scale").AddComponent<NativeUIScale>();
         }
         void Update()

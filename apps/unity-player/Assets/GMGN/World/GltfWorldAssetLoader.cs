@@ -6,8 +6,11 @@ using System.Threading;
 using System.Threading.Tasks;
 using GLTFast;
 using GLTFast.Logging;
+using GLTFast.Materials;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
 
 namespace GMGN.UnityPlayer.World
 {
@@ -28,7 +31,9 @@ namespace GMGN.UnityPlayer.World
             var content = new GameObject("Model");
             content.transform.SetParent(root.transform, false);
             var logger = new CollectingLogger();
-            var importer = new GltfImport(logger: logger);
+            var pipeline = (QualitySettings.renderPipeline != null ? QualitySettings.renderPipeline : GraphicsSettings.defaultRenderPipeline) as UniversalRenderPipelineAsset;
+            if (pipeline == null) { UnityEngine.Object.Destroy(root); throw new InvalidDataException("空间模型需要启用 URP 渲染管线。"); }
+            var importer = new GltfImport(materialGenerator: new WorldUrpMaterialGenerator(pipeline), logger: logger);
             try
             {
                 if (!await importer.LoadFile(packageLocalPath, cancellationToken: cancellation) ||
@@ -39,7 +44,7 @@ namespace GMGN.UnityPlayer.World
                     foreach (var material in renderer.sharedMaterials)
                     {
                         if (material == null || material.shader == null || !material.shader.isSupported || material.shader.name == "Hidden/InternalErrorShader")
-                            throw new InvalidDataException("模型材质着色器未正确打包，暂时无法显示这个物件。");
+                            throw new WorldMaterialException("shader_unavailable", "模型材质着色器未正确打包，暂时无法显示这个物件。");
                         Debug.Log("[WorldMaterial] shader=" + material.shader.name + " keywords=" + string.Join(",", material.shaderKeywords));
                     }
                 if (prop != null) Prepare(root.transform, content.transform, prop);
@@ -107,6 +112,29 @@ namespace GMGN.UnityPlayer.World
                             throw new InvalidDataException("这个模型引用了备份以外的资源，暂时无法恢复。");
                     }
             }
+        }
+    }
+
+    public sealed class WorldMaterialException : Exception
+    {
+        public string Code { get; }
+        public WorldMaterialException(string code, string message) : base(message) { Code = code; }
+    }
+
+    /// Retains glTFast's complete URP material conversion. Only shader lookup
+    /// changes: a Resources reference is loaded before Shader.Find would run.
+    sealed class WorldUrpMaterialGenerator : UniversalRPMaterialGenerator
+    {
+        public WorldUrpMaterialGenerator(UniversalRenderPipelineAsset pipeline) : base(pipeline) { }
+        protected override Shader LoadShaderByName(string shaderName)
+        {
+            var reference = Resources.Load<Material>("WorldShaders/" + shaderName + "-0");
+            if (reference == null || reference.shader == null)
+                throw new WorldMaterialException("shader_reference_missing", "模型材质资源未打包，请更新这个测试版本。");
+            Debug.Log("[WorldShader] loaded=" + reference.shader.name + " supported=" + reference.shader.isSupported);
+            if (!reference.shader.isSupported)
+                throw new WorldMaterialException("shader_unsupported", "模型着色器不支持当前图形设备。");
+            return reference.shader;
         }
     }
 
