@@ -37,3 +37,9 @@ GMGN_UNITY_CABIN_SPZ="$PWD/apps/macos/Resources/Worlds/marble-living-cabin/scene
 Prepare 成功必须同时满足：进程 exit0、日志无 job exception、生成资产 count500000且bounds非零、prefab持有真实Splats模式及校准矩阵。首次上游直读虽exit0，已判失败，不能复用全零输出。
 
 数值 readback：从仓库根执行 `node apps/unity-player/Assets/GMGN/GaussianWorld/verify-cabin-conversion.mjs`。2026-10-04 全部500000点对比通过：位置/log尺度/SH误差0，DC最大绝对误差1.052e-7、opacity 4.013e-8、四元数4.479e-6、单位四元数模长1.147e-7。此结果证明转换数据，不证明GPU画面或60fps。
+
+## Gaussian composite 的非有限值修复
+
+自有 `Resources/GaussianWorld/GuardedGaussianComposite.shader` 保留上游 MIT 声明（完整文本见 `UPSTREAM-LICENSE.md`），在除 alpha 前过滤透明/非有限像素，并限制输出到半精度 HDR 可表示范围。上游原 composite 对清屏 `(0,0,0,0)` 做 `rgb/alpha` 会产生 NaN；SrcAlpha 混合不能消除 NaN。
+
+Bootstrap 新 prefab 绑定此 shader；运行 `GaussianWorldView` 在 inactive staging 下实例化旧 prefab，先绑定再激活，确保旧生成资产也使用修复。没有修改 PackageCache。验收需六面真实 cubemap readback `nonfinite=0`，并核对主画面背景和物件反射；构建通过不能替代该验收。
