@@ -573,7 +573,7 @@ impl Render for GMGNProductUI {
         let foreground = cx.theme().foreground;
         let mut notices = if self.compact {
             div().id("product-runtime-notices").flex().flex_col().gap(px(6.)).text_size(px(10.))
-        }else{div().id("product-runtime-notices").max_h(px(220.)).overflow_y_scroll().p_2()};
+        }else{div().id("product-runtime-notices").max_h(px(220.)).overflow_y_scroll().p_2().text_sm().line_height(relative(1.4))};
         let mut notice_count=0;
         let task_feedback_visible=self.compact||self.runtime_state["stage"]["presentation"]["taskFeedbackVisible"].as_bool()==Some(true);
         let mut seen_notices=Vec::new();
@@ -585,7 +585,7 @@ impl Render for GMGNProductUI {
                 let item=if self.compact {
                     let item=div().min_h(px(24.)).px(px(8.)).py(px(8.)).rounded(px(10.)).bg(rgba(0x1f1f1ff0)).text_size(px(if field=="statusNotice"{10.}else{11.})).text_color(rgb(0xff9f0a)).child(notice.to_owned());
                     if field=="statusNotice"{item}else{item.line_clamp(3)}
-                }else{div().text_sm().child(notice.to_owned())};
+                }else{div().text_xs().text_color(cx.theme().muted_foreground).child(notice.to_owned())};
                 notices = notices.child(item);
                 notice_count+=1;
             }
@@ -596,10 +596,10 @@ impl Render for GMGNProductUI {
         let autonomy=self.runtime_state["autonomy"]["switchOn"].as_bool();
         if task_feedback_visible&&(autonomy==Some(false)||self.runtime_state["autonomy"]["stopped"].as_bool()==Some(true)) {
             let enabled=autonomy==Some(true);
-            let mut banner=div().id("resident.autonomy-banner").flex().flex_col().gap(px(4.)).rounded(px(10.)).p(px(if self.compact{6.}else{10.})).bg(rgba(0x1a1a1af5)).text_size(px(if self.compact{9.}else{10.})).child(div().flex().items_center().justify_between().text_color(rgb(0xff9f0a))
+            let mut banner=div().id("resident.autonomy-banner").flex().flex_col().gap_1().rounded_lg().p_2().bg(cx.theme().muted).text_xs().child(div().flex().items_center().justify_between().text_color(cx.theme().warning)
                 .child(if enabled{"自主行动已停止"}else{"居民自主行动已关闭"})
-                .child(Button::new("resident.autonomy.resume").ghost().small().w(px(if self.compact{66.}else{72.})).h(px(if self.compact{14.}else{16.})).p_0().flex_shrink_0().rounded_full().bg(rgba(0xffffff29)).accessibility_label(if enabled{"恢复自主行动"}else{"打开自主行动"}).child(div().text_size(px(if self.compact{9.}else{10.})).whitespace_nowrap().text_color(rgb(0xffffff)).child(if enabled{"恢复自主行动"}else{"打开自主行动"})).on_click(cx.listener(|this,_,_,cx|this.overlay_action("resume-autonomy",cx)))));
-            if !self.compact {banner=banner.child(div().text_size(px(9.)).text_color(rgba(0xffffff8c)).child("不自主不等于不听话：直接下达的指令在任何开关状态下都会执行。"));}
+                .child(Button::new("resident.autonomy.resume").ghost().xsmall().flex_shrink_0().label(if enabled{"恢复自主行动"}else{"打开自主行动"}).on_click(cx.listener(|this,_,_,cx|this.overlay_action("resume-autonomy",cx)))));
+            if !self.compact {banner=banner.child(div().text_xs().line_height(relative(1.4)).text_color(cx.theme().muted_foreground).child("关闭后，居民暂停自主安排；你发送的指令仍会执行。"));}
             if let Some(message)=self.runtime_state["autonomy"]["resumeFailure"].as_str().filter(|s|!s.is_empty()) {
                 banner=banner.child(div().id("resident.autonomy.resume-failure").text_size(px(9.)).text_color(rgb(0xff9f0a)).child(message.to_owned()));
             }

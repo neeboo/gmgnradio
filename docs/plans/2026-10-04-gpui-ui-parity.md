@@ -4,6 +4,14 @@
 
 ### 本轮字体、间距与图标修复（v46）
 
+#### v50：按 GPUI Kit 尺寸 API 修正
+
+用户实测指出 v47 舞台按钮大于正文、四页签 padding 错误。本轮阅读官方 0.7.0 Design Guides、Button、Tabs、Theme，并核对本地组件源码：Button 的标签字号按 Size 单独设置，外层字体无法覆盖；Tab 自有内部 padding，额外固定宽高会冲突。舞台按钮统一 small，四页签采用 segmented/small/w_full、子项 label/flex_1/min_w_0；去掉固定133宽、24高与标签强制字号。正文采用 text_sm，与 small 按钮一致；状态说明 text_xs。提示区采用 semantic muted/warning、text_xs 和 xsmall 恢复按钮，去掉手工按钮宽高与9/10px字号。
+
+UI完整114项通过，Release v50构建退出0。PID19735核对隔离根与 mounted=true，实际截图确认提示区新字号、颜色与说明生效。CUA读到了舞台设置入口，但AX点击未展开、坐标点击报 noWindowsAvailable；四页签和角色按钮实际视觉复验尚未通过，不将构建/样式回归算最终验收。v50测试App保留运行供用户查看；未修改安装版或清数据。
+
+规范来源：https://gpui-kit.com/docs/design-guides/ 、https://gpui-kit.com/component/button/ 、https://gpui-kit.com/docs/components/tabs/ 。
+
 - 2D UI 接入 Kit 原生系统字体，统一正文14/说明12/分组16/标题20，行高20/16，间距4/8/12/16/24；保留小窗尺寸、原布局与歌词艺术字体。使用 frontend-design 技能整理共享视觉规范，没有新增字体包。
 - SF Symbols 原位图绘制格式无法建立有效 CGContext，曾返回全透明像素；修复预乘绘制与 GPUI BGRA 上传，4个符号×3种颜色非零像素验证通过。App测试16项及ABI1项通过，Release v46构建退出0。
 - v46 PID17009启动后核对隔离数据根与 mounted=true，实际截图确认聊天图标和右上播放器图标已显示；随后聊天点击遇到 noWindowsAvailable，聊天/设置全部排版与空间反向图标尚未完成实际复验，不标整体通过。

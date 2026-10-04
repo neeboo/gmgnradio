@@ -17,6 +17,15 @@ pub const SPACING_24: f32 = 24.;
 #[cfg(test)]
 mod tests {
     #[test]
+    fn kit_small_control_uses_shared_semantic_text_size() {
+        use gpui_kit::{Styled, div};
+        use gpui_kit::component::Size;
+        use gpui_kit::component::StyleSized;
+        let mut label = div().button_text_size(Size::Small);
+        let mut semantic = div().text_sm();
+        assert_eq!(label.style().text_style().font_size, semantic.style().text_style().font_size);
+    }
+    #[test]
     fn hierarchy_and_spacing_are_stable() {
         assert_eq!([super::CAPTION, super::BODY, super::SUBTITLE, super::TITLE], [12., 14., 16., 20.]);
         assert_eq!([super::SPACING_4, super::SPACING_8, super::SPACING_12, super::SPACING_16, super::SPACING_24], [4., 8., 12., 16., 24.]);

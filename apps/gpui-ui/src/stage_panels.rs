@@ -159,6 +159,7 @@ impl StagePanelsPane {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         Button::new(id)
+            .small()
             .label(label)
             .disabled(disabled)
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -173,9 +174,8 @@ impl StagePanelsPane {
         let catalog = space.clone();
         let menu = Button::new("stage-world-menu")
             .w_full()
-            .h(px(36.))
+            .small()
             .rounded(px(12.))
-            .text_size(px(12.))
             .label(
                 space["worldLabel"]
                     .as_str()
@@ -318,7 +318,7 @@ impl StagePanelsPane {
             )
             .child("选择已安装动作；自然待机可结束当前表演。");
         let mut categories = div().flex().flex_wrap().gap_1();
-        categories = categories.child(Button::new("all-motion-categories").label("全部").on_click(
+        categories = categories.child(Button::new("all-motion-categories").small().label("全部").on_click(
             cx.listener(|this, _, _, cx| {
                 this.motion_category.clear();
                 cx.notify();
@@ -328,7 +328,7 @@ impl StagePanelsPane {
             let id = category["id"].as_str().unwrap_or("").to_owned();
             categories = categories.child(
                 Button::new(format!("motion-category-{id}"))
-                    .label(category["name"].as_str().unwrap_or("").to_owned())
+                    .small().label(category["name"].as_str().unwrap_or("").to_owned())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.motion_category = id.clone();
                         cx.notify();
@@ -485,7 +485,7 @@ impl StagePanelsPane {
                     .items_center()
                     .justify_center()
                     .gap(px(5.))
-                    .text_size(px(ui::CAPTION))
+                    .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(if is_selected {
                         rgb(0x7af2ff)
@@ -564,9 +564,9 @@ impl StagePanelsPane {
             let name=assets.iter().find(|asset|asset["id"]==player["videoAssetID"]).and_then(|asset|asset["name"].as_str()).unwrap_or("未加载视频").to_owned();
             let status=if active{"已加载".to_owned()}else{format!("{} 段",assets.len())};
             let weak=cx.entity().downgrade();let menu_player=player.clone();
-            form=form.child(Button::new("video-assets-menu").ghost().w_full().h(px(36.)).px(px(12.)).rounded_full()
+            form=form.child(Button::new("video-assets-menu").ghost().small().w_full().rounded_full()
                 .bg(rgba(0xffffff0b)).accessibility_label(format!("{name}，{status}"))
-                .child(div().flex().items_center().gap(px(8.)).w_full().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD)
+                .child(div().flex().items_center().gap(px(ui::SPACING_8)).w_full().text_sm()
                     .child(Icon::new(if active{gpui_kit::assets::IconName::Video}else{gpui_kit::assets::IconName::VideoOff}).size(px(14.)))
                     .child(div().flex_1().min_w(px(0.)).overflow_hidden().whitespace_nowrap().child(name))
                     .child(div().flex_shrink_0().child(status)))
@@ -594,13 +594,12 @@ impl Render for StagePanelsPane {
         use gpui_kit::component::tab::{Tab, TabBar};
         let tabs = TabBar::new("stage-tabs")
             .segmented()
-            .with_size(gpui_kit::component::Size::Small)
-            .w(px(544.))
-            .h(px(24.))
+            .small()
+            .w_full()
             .selected_index(self.tab)
             .children(
                 ["播放器", "空间", "角色", "活动"]
-                    .map(|label| Tab::new().label(label).w(px(133.)).text_size(px(12.))),
+                    .map(|label| Tab::new().label(label).flex_1().min_w_0()),
             )
             .on_click(cx.listener(|this, index: &usize, _, cx| {
                 this.tab = *index;
@@ -645,13 +644,13 @@ impl Render for StagePanelsPane {
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child("舞台设置"),
                             )
-                            .child(
+                            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(
                                 if self.snapshot["space"]["isRequested"].as_bool() == Some(true) {
                                     "正在空间中"
                                 } else {
                                     "正在播放器中"
                                 },
-                            ),
+                            )),
                     )
                     .child(tabs)
                     .child(
