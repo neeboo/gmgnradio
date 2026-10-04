@@ -1427,7 +1427,8 @@ impl Render for AgentSettingsPane {
             let active=items.iter().any(|(_,section)|*section==self.section);
             let children=items.into_iter().map(|(key,section)|SidebarMenuItem::new(section).active(self.section==section)
                 .on_click(cx.listener(move|this,_,_,cx|this.select_section(key,section,cx)))).collect::<Vec<_>>();
-            menu=menu.child(SidebarMenuItem::new(label).active(active).children(children));
+            menu=menu.child(SidebarMenuItem::new(label).active(active)
+                .default_open(active).click_to_toggle(true).children(children));
         }
         div().size_full().flex().bg(cx.theme().background).text_color(cx.theme().foreground)
             .child(Sidebar::new("settings-sidebar").w(px(200.)).child(menu))
@@ -1503,5 +1504,13 @@ mod settings_display_tests {
     fn sync_failure_keeps_connected_provider_retry_as_sync_not_disconnect(){
         let failed=json!({"id":"netease","connected":true,"syncing":false,"hasError":true});
         assert_eq!(music_sync_command(&failed,false),Some(json!({"op":"music.sync","id":"netease"})));
+    }
+    #[test]
+    fn category_rows_enable_whole_row_expansion() {
+        let source = include_str!("settings.rs");
+        let navigation = source.split("let mut menu=SidebarMenu::new();").nth(1).unwrap()
+            .split("div().size_full()").next().unwrap();
+        assert!(navigation.contains(".click_to_toggle(true)"), "category rows must expand on label clicks");
+        assert!(navigation.contains(".default_open(active)"), "current category starts expanded");
     }
 }
