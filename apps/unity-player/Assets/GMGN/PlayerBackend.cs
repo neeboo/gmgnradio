@@ -15,7 +15,22 @@ namespace GMGN.UnityPlayer
         public float volume, bass, vocal, treble;
         public int queueIndex, queueCount;
         public QueueItem[] queue = Array.Empty<QueueItem>();
+        public long lyricRevision;
+        public LyricPointLine[] lyricLines = Array.Empty<LyricPointLine>();
+        public LyricVisualSnapshot lyricVisual;
     }
+    [Serializable] public sealed class LyricVisualSnapshot
+    {
+        public long revision;
+        public string configuredMode, mode;
+        public LyricVisualTheme theme;
+    }
+    [Serializable] public sealed class LyricVisualTheme
+    {
+        public string name, description, backgroundColor, primaryColor, accentColor, secondaryColor;
+        public LyricWordColor[] wordColors = Array.Empty<LyricWordColor>();
+    }
+    [Serializable] public sealed class LyricWordColor { public string word, color; }
     public sealed class ChatUpdate
     {
         public string messageId, text, error;
@@ -32,6 +47,7 @@ namespace GMGN.UnityPlayer
         void Next();
         void Previous();
         void SelectQueueItem(int index);
+        void OpenSettings();
         void Seek(double seconds);
         void SetVolume(float volume);
         void Send(string messageId, string text);

@@ -39,7 +39,7 @@
           <ui:Button name="screen" tooltip="空间播放器尚未迁移" class="icon-button" enabled="false" />
           <ui:VisualElement class="toolbar-spacer" />
           <ui:Slider name="volume" tooltip="音量" low-value="0" high-value="1" value="0.8" class="volume" />
-          <ui:Button name="settings" text="设置" tooltip="外部设置窗口尚未接入" class="settings-button" enabled="false" />
+          <ui:Button name="settings" text="设置" tooltip="打开外部统一设置" class="settings-button" enabled="false" />
           <ui:Button name="fullscreen" tooltip="切换全屏" class="icon-button" />
         </ui:VisualElement>
       </ui:VisualElement>

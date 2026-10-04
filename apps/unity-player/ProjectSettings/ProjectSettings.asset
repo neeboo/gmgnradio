@@ -831,7 +831,8 @@ PlayerSettings:
   webWasm2023: 0
   webEnableSubmoduleStrippingCompatibility: 0
   webProgressiveAssetLoading: 0
-  scriptingDefineSymbols: {}
+  scriptingDefineSymbols:
+    Standalone: GMGN_UMT
   additionalCompilerArguments: {}
   platformArchitecture: {}
   scriptingBackend:

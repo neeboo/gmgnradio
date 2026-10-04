@@ -24,6 +24,8 @@ namespace GMGN.UnityPlayer
         ScrollView chatScroll;
         IVisualElementScheduledItem followScroll;
         AudioSculpture sculpture;
+        GpuLyricsView gpuLyrics;
+        string gpuLyricStatus;
         VisualElement root, chatPanel;
         ToolbarIcon playIcon;
         bool connected;
@@ -101,6 +103,8 @@ namespace GMGN.UnityPlayer
             root.Q<Button>("chooseMusic").clicked += () => { ToggleChat(false); queuePanel?.Toggle(); };
             volume.RegisterValueChangedCallback(e => backend?.SetVolume(e.newValue));
             sculpture = gameObject.AddComponent<AudioSculpture>();
+            gpuLyrics = gameObject.AddComponent<GpuLyricsView>();
+            root.Q<Button>("settings").clicked += () => { Debug.Log("External settings clicked"); backend?.OpenSettings(); };
             try { backend = PlayerBackend.Create?.Invoke(); }
             catch (Exception error) { status.text = "音乐与对话服务连接失败：" + error.Message; status.AddToClassList("status-error"); SetConnected(false); return; }
             if (backend == null) { status.text = "音乐与对话服务未连接"; SetConnected(false); return; }
@@ -128,13 +132,27 @@ namespace GMGN.UnityPlayer
             }
             SetConnected(true); status.text = "音乐与角色已连接";
         }
-        void SetConnected(bool ready) { connected = ready; play.SetEnabled(ready); volume.SetEnabled(ready); root.Q<Button>("next").SetEnabled(false); root.Q<Button>("previous").SetEnabled(false); root.Q<Button>("chooseMusic").SetEnabled(ready); UpdateComposer(); }
+        void SetConnected(bool ready) { connected = ready; play.SetEnabled(ready); volume.SetEnabled(ready); root.Q<Button>("next").SetEnabled(false); root.Q<Button>("previous").SetEnabled(false); root.Q<Button>("chooseMusic").SetEnabled(ready); root.Q<Button>("settings").SetEnabled(ready); UpdateComposer(); }
         void ToggleChat(bool visible) { if (visible) queuePanel?.SetVisible(false); chatPanel.EnableInClassList("hidden", !visible); root.Q<Button>("chatToggle").EnableInClassList("selected", visible); if (visible) { draft.Focus(); if (follow) ScrollToLatest(); } }
         void UpdateComposer() { send.SetEnabled(connected && pending == null && !string.IsNullOrWhiteSpace(draft.value)); send.EnableInClassList("hidden", pending != null); cancel.EnableInClassList("hidden", pending == null); cancel.SetEnabled(connected && pending != null); }
         void OnStatus(string value) => status.text = value;
         void OnSnapshot(PlayerSnapshot snapshot)
         {
             lyric.text = snapshot.lyric ?? ""; translation.text = snapshot.translation ?? "";
+            var lyricMode = snapshot.lyricVisual?.mode;
+            gpuLyrics.SetTheme(snapshot.lyricVisual?.theme);
+            gpuLyrics.SetLyrics(snapshot.sessionId, snapshot.lyricRevision,
+                snapshot.lyricLines, lyricMode ?? "");
+            gpuLyrics.SetPlayback(snapshot.position, snapshot.bass, snapshot.vocal, snapshot.treble);
+            bool gpuModeReady = gpuLyrics.SupportsMode(lyricMode ?? "");
+            gpuLyrics.SetVisible(gpuModeReady);
+            // Text labels remain only for genuinely unmigrated styles. Do not
+            // draw a second UI lyric over the active GPU presentation.
+            lyric.style.display = gpuModeReady ? DisplayStyle.None : DisplayStyle.Flex;
+            if (!gpuModeReady && gpuLyricStatus != lyricMode) {
+                gpuLyricStatus = lyricMode;
+                OnStatus("当前歌词风格的 GPU 渲染尚未完成迁移。");
+            }
             duration = snapshot.duration;
             GetComponent<UIDocument>().rootVisualElement.Q<Button>("next").SetEnabled(snapshot.nextSupported);
             root.Q<Button>("previous").SetEnabled(snapshot.previousSupported);

@@ -80,3 +80,21 @@ Snapshot also exposes `canNext`, `canPrevious`, `queueIndex`, `queueCount` and
 switch increments playback session and lyric revision and clears previous lyrics.
 Actual-component smoke tests with two different existing music-cache MP3s passed
 next/previous, real sample-clock advancement, session changes and boundaries.
+
+Full lyric transport preserves Swift `StageLyricsParser` output: each line has
+`id/text/translation/startsAt/endsAt/words`, each word has `id/text/startsAt/endsAt`.
+Legacy line `start/end` fields remain alongside canonical timing fields.
+Optional neighboring `<basename>.translation.lrc` and `<basename>.yrc` supply
+real translated / word-timed lyric inputs when present. Missing inputs stay absent;
+the existing LRC parser's timing behavior is preserved.
+
+`music.lyricVisual` projects the original configured/resolved mode and actual
+`StageAITheme` colors, with `revision`, `configuredMode`, `mode`, `theme` and
+`availableModes`. Existing `stage.player.lyrics` with `id` changes the configured
+mode through authenticated external GPUI settings, not a duplicate Unity toggle.
+`settings.open` opens that independent settings process. Its read-only snapshot
+does not drain chat events or single-publication lyric timelines.
+
+Unity caches the complete timeline only at session/lyric-revision boundaries and
+passes it to `GpuLyricsView`; it drives playback from the authoritative native
+audio clock. Unsupported GPU modes remain explicitly reported as unmigrated.

@@ -38,6 +38,10 @@ namespace GMGN.UnityPlayer.Characters
                 throw new FileNotFoundException("请选择有效的 PMX 角色文件。", modelPath);
             if (!float.IsFinite(heightMeters) || heightMeters <= 0) throw new ArgumentOutOfRangeException(nameof(heightMeters));
 #if GMGN_UMT
+            // Register the retained official URP shaders before UMT's runtime
+            // material builder resolves them with Shader.Find.
+            Resources.Load<Material>("WorldShaders/CharacterUrpUnlit-0");
+            Resources.Load<Material>("WorldShaders/CharacterUrpUnlit-1");
             loading = true;
             var request = ++generation;
             PMXImportResult next = null;

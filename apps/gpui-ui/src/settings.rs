@@ -227,6 +227,7 @@ pub struct AgentSettingsPane {
     personas: Vec<Entity<TextareaState>>,
     commands: Vec<Value>,
     initialized: bool,
+    unity_external: bool,
     page: usize,
     section: String,
     stage_pane: Option<Entity<crate::stage_panels::StagePanelsPane>>,
@@ -388,6 +389,7 @@ impl AgentSettingsPane {
             personas,
             commands: vec![json!({"op":"settings.load"})],
             initialized: false,
+            unity_external: false,
             page: 0,
             section: "角色管理".into(),
             stage_pane: None,
@@ -439,6 +441,10 @@ impl AgentSettingsPane {
     pub fn set_stage_pane(&mut self, pane: Entity<crate::stage_panels::StagePanelsPane>, cx: &mut Context<Self>) {
         pane.update(cx, |stage,cx| stage.set_embedded(true,cx));
         self.stage_pane = Some(pane);
+        cx.notify();
+    }
+    pub fn set_unity_external(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.unity_external = enabled;
         cx.notify();
     }
     pub fn select_section(&mut self,page:&str,section:&str,cx:&mut Context<Self>){
@@ -1314,7 +1320,12 @@ impl Render for AgentSettingsPane {
             7 => ("活动", "选择与控制空间生活活动"),
             _ => ("Agent 与语音", "文字和语音共用同一会话，回答后再朗读"),
         };
-        let content = if self.page>=5 {
+        let content = if self.unity_external && !(self.page == 5 && (self.section == "歌词" || (self.section == "视觉效果" && self.snapshot["unity"]["visualEffectsSupported"].as_bool() == Some(true)))) {
+            div().px(px(20.)).py(px(16.)).text_size(px(ui::BODY))
+                .text_color(cx.theme().muted_foreground)
+                .child("此功能尚未接入 Unity。原有应用的数据和配置保持不变。")
+                .into_any_element()
+        } else if self.page>=5 {
             self.stage_pane.as_ref().map(|pane| {
                 let mut content=div().flex().flex_col().gap_4().child(div().h(px(380.)).child(pane.clone()));
                 if self.page==6{content=content.child(SettingsGroup::new("默认空间",cx.theme().border)

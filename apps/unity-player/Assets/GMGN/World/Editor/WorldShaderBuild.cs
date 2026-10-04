@@ -16,6 +16,13 @@ namespace GMGN.UnityPlayer.World.Editor
 
         public static void Prepare()
         {
+            var selectedQuality = QualitySettings.GetQualityLevel();
+            for (var quality = 0; quality < QualitySettings.names.Length; quality++)
+            {
+                QualitySettings.SetQualityLevel(quality, false);
+                QualitySettings.realtimeReflectionProbes = true;
+            }
+            QualitySettings.SetQualityLevel(selectedQuality, false);
             const string folder = "Assets/GMGN/World/Resources/WorldShaders";
             EnsureFolder("Assets/GMGN/World", "Resources");
             EnsureFolder("Assets/GMGN/World/Resources", "WorldShaders");
@@ -37,6 +44,17 @@ namespace GMGN.UnityPlayer.World.Editor
                     if (name == "glTF-pbrSpecularGlossiness") material.EnableKeyword("_SPECULAR_SETUP");
                     EditorUtility.SetDirty(material);
                 }
+            }
+            var unlit = Shader.Find("Universal Render Pipeline/Unlit");
+            if (unlit == null) throw new BuildFailedException("Missing URP Unlit shader required by UMT.");
+            for (var transparent = 0; transparent <= 1; transparent++)
+            {
+                var path = folder + "/CharacterUrpUnlit-" + transparent + ".mat";
+                var material = AssetDatabase.LoadAssetAtPath<Material>(path);
+                if (material == null) { material = new Material(unlit); AssetDatabase.CreateAsset(material, path); }
+                material.shader = unlit;
+                material.shaderKeywords = transparent == 0 ? Array.Empty<string>() : new[] { "_SURFACE_TYPE_TRANSPARENT" };
+                EditorUtility.SetDirty(material);
             }
             AssetDatabase.SaveAssets();
             Debug.Log("[WorldShaderBuild] Retained official glTFast shader graphs and opaque occlusion/emission variants.");

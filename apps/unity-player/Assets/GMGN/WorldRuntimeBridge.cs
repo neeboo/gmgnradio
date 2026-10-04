@@ -32,6 +32,8 @@ namespace GMGN.UnityPlayer
         AmbientMode playerAmbientMode;
         Color playerAmbientLight;
         SphericalHarmonicsL2 playerAmbientProbe;
+        WorldInteractionController interactions;
+        GMGN.UnityPlayer.Characters.CharacterWorldAdapter character;
         public JObject AuthorityProjection { get; private set; }
         public bool Configured => !string.IsNullOrEmpty(worldID) && !string.IsNullOrEmpty(packageDirectory);
 
@@ -49,7 +51,10 @@ namespace GMGN.UnityPlayer
         void OnWorldUpdated(JObject update)
         {
             if ((string)update["status"] == "failed") { Status?.Invoke((string)update["message"]); return; }
-            if (update["result"]?["record"] is JObject record) AuthorityProjection = (JObject)record.DeepClone();
+            if (update["result"]?["record"] is JObject record) {
+                AuthorityProjection = (JObject)record.DeepClone();
+                if (character != null && record["state"] is JObject currentState) character.ApplyState(currentState);
+            }
         }
 
         public async void Toggle()
@@ -91,10 +96,23 @@ namespace GMGN.UnityPlayer
                 }
                 var recovery = new WorldSceneRecovery(loader);
                 var items = await recovery.Restore(package, worldID, worldRoot.transform, token);
+                interactions = gameObject.AddComponent<WorldInteractionController>();
+                interactions.Configure(backend, worldID, items, GetComponent<UnityEngine.UIElements.UIDocument>().rootVisualElement);
+                interactions.Status += value => Status?.Invoke(value);
+                try {
+                    character = await GMGN.UnityPlayer.Characters.CharacterWorldAdapter.RestoreAsync(
+                        AuthorityProjection?["state"] as JObject ?? package.State(worldID), worldRoot.transform, token);
+                    if (character != null) character.NoticeChanged += value => Status?.Invoke(value);
+                } catch (OperationCanceledException) { throw; }
+                catch (Exception error) {
+                    Debug.LogError($"Character restore failed: type={error.GetType().Name}");
+                    Status?.Invoke("角色恢复失败，空间物件已保留，原角色包未修改。");
+                }
                 token.ThrowIfCancellationRequested();
                 var restored = 0; foreach (var item in items) if (item.Status == "restored") restored++;
                 Debug.Log($"World recovery completed: restored={restored}; items={items.Count}");
                 SetVisible(true);
+                worldRoot.AddComponent<WorldLighting>().Initialize(Camera.main.transform.position);
                 Status?.Invoke(backgroundEnabled
                     ? $"空间背景已启用，已恢复 {restored} 个真实物件；人物与设备功能仍在迁移。"
                     : $"已恢复 {restored} 个真实物件；空间背景未成功载入，人物与设备功能仍在迁移。");
@@ -161,6 +179,7 @@ namespace GMGN.UnityPlayer
             }
             cameraControls.Configure(camera, GetComponent<UnityEngine.UIElements.UIDocument>());
             cameraControls.SetActive(value);
+            interactions?.SetActive(value);
             ModeChanged?.Invoke(value);
         }
 

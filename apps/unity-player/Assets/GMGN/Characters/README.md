@@ -1,6 +1,6 @@
 # PMX 角色运行时接入
 
-此模块读取真实用户 PMX 与 VMD，不包含示例角色、替代模型或伪动作。尚需安装依赖、接到角色资源投影并完成 Release 视觉验收，不能作为角色迁移完成的证据。
+此模块读取真实用户 PMX 与 VMD，不包含示例角色、替代模型或伪动作。UMT 固定版本已安装，`GMGN_UMT` 启用后的 Unity 6000.6 编译检查退出 0；仍需完成 Release 视觉验收，不能作为角色迁移完成的证据。
 
 ## 依赖
 
@@ -21,6 +21,8 @@ await runtime.PlayMotionAsync(motionId, vmdPath, loop, playbackRate);
 
 位置和世界移动由锚点父节点控制。`MotionCompleted` 仅在真实非循环曲线播放到末尾时发出；`StopMotion` 返回模型绑定姿态，没有伪造自然待机。
 
+世界接线使用 `await CharacterWorldAdapter.RestoreAsync(state, parent, cancellation)`；传入 `WorldState.agentTransform`，后续调用 `adapter.ApplyState(state)` 更新位置。角色和动作清单分别由 `GMGN_UNITY_CHARACTER_MANIFEST`、`GMGN_UNITY_MOTION_MANIFEST` 显式指定当前选中包。未指定角色时返回 null，不扫描用户目录、不自行改选中项。
+
 现有 Swift `StageAvatarAsset` 投影 `id/format/modelURL/resourceRootURL`，`StageMotionAsset` 投影 `id/format/url/loop/playbackRate/inPlace/strideSpeed`。Rust taskd 当前没有独立的 PMX/VRM 渲染或动作播放 API，须由权威世界与资源接口给出选中的角色/动作；本模块不扫描并替换用户选中项。
 
 ## 明确未完成
@@ -32,4 +34,4 @@ await runtime.PlayMotionAsync(motionId, vmdPath, loop, playbackRate);
 
 ## 验收
 
-用当前选中的真实 PMX 和已安装 BONES VMD，核对贴图、透明材质、角色尺寸、脚底落点、骨骼姿势、面部曲线、循环和一次动作完成回执。同时检查音乐与聊天在导入/切动作期间仍响应。Unity 6000.6 的编译、实际加载和视觉验收尚未执行。
+用当前选中的真实 PMX 和已安装 BONES VMD，核对贴图、透明材质、角色尺寸、脚底落点、骨骼姿势、面部曲线、循环和一次动作完成回执。同时检查音乐与聊天在导入/切动作期间仍响应。Unity 6000.6 编译已通过；实际加载与视觉验收尚未执行。

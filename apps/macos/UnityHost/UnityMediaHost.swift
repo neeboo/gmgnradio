@@ -11,6 +11,10 @@ final class UnityMediaHost {
     let player: LocalMusicPlayer
     let chat: RenderHostResidentConversation
     let world: UnityWorldBridge
+    private let root: URL
+    private let lyricsStore = StageLyricsStore()
+    private var visualRevision: UInt64 = 0
+    private var settingsBridge: UnitySettingsBridge?
     private var session: UInt64 = 0
     private var lines: [StageLyricLine] = []
     private var lyricRevision: UInt64 = 0
@@ -27,6 +31,7 @@ final class UnityMediaHost {
     private var queueIndex = 0
 
     init(root: URL, defaults: UserDefaults) throws {
+        self.root = root
         world = UnityWorldBridge(root: root)
         graph = AudioGraphController(visualStore: features)
         player = LocalMusicPlayer(graph: graph)
@@ -35,6 +40,12 @@ final class UnityMediaHost {
             guard let self, self.queueIndex + 1 < self.queue.count else { return }
             _ = self.command(["op": "music.next"])
         }
+        settingsBridge = try? UnitySettingsBridge(root: root,
+            command: { [weak self] value in self?.command(value) ?? false },
+            snapshot: { [weak self] in
+                guard let self else { return [:] }
+                return ["version": 1, "lyricVisual": self.playerVisualSettingsSnapshot()]
+            })
     }
 
     private func entry(path: String, lyricPath: String? = nil) -> QueueEntry {
@@ -51,12 +62,19 @@ final class UnityMediaHost {
         pausedPosition = nil
         lyricRevision &+= 1
         lines = []
+        lyricsStore.clear()
         player.stop()
         try player.load(selected.url)
         // A bad optional lyric must not prevent an otherwise valid song playing.
         if let lyric = selected.lyricURL,
            let text = try? String(contentsOf: lyric, encoding: .utf8) {
-            lines = StageLyricsParser().parse(MusicLyrics(original: text, translation: nil), trackDuration: player.track?.duration)
+            let translationURL = selected.url.deletingPathExtension().appendingPathExtension("translation.lrc")
+            let yrcURL = selected.url.deletingPathExtension().appendingPathExtension("yrc")
+            let translation = try? String(contentsOf: translationURL, encoding: .utf8)
+            let wordByWord = try? String(contentsOf: yrcURL, encoding: .utf8)
+            lyricsStore.publish(MusicLyrics(original: text, translation: translation, wordByWord: wordByWord),
+                                trackID: selected.url.path, trackDuration: player.track?.duration)
+            lines = lyricsStore.lines
         }
         if autoplay { try player.play() }
     }
@@ -64,6 +82,13 @@ final class UnityMediaHost {
     func command(_ value: [String: Any]) -> Bool {
         do {
             switch value["op"] as? String {
+            case "settings.open": return settingsBridge?.open() ?? false
+            case "stage.load": return true
+            case "stage.player.lyrics":
+                guard let id = value["id"] as? String,
+                      let mode = StageLyricsVisualMode.allCases.first(where: { $0.agentValue == id }) else { return false }
+                lyricsStore.setVisualMode(mode)
+                visualRevision &+= 1
             case "world.snapshot", "world.commit":
                 return world.command(value)
             case "music.choose":
@@ -148,13 +173,19 @@ final class UnityMediaHost {
             "queueIndex": queueIndex, "queueCount": queue.count,
             "queue": queue.enumerated().map { ["index": $0.offset, "title": $0.element.url.deletingPathExtension().lastPathComponent] },
             "features": ["amplitude": f.amplitude, "low": f.low, "mid": f.mid,
-                         "high": f.high, "beat": f.beat, "onset": f.onset],
+                         "high": f.high, "bass": f.bass, "vocal": f.vocal, "treble": f.treble,
+                         "beat": f.beat, "onset": f.onset],
             "lyricRevision": lyricRevision,
+            "lyricVisual": playerVisualSettingsSnapshot(),
             "notice": notice as Any? ?? NSNull()]
         // Raw timeline is sent once per song; no per-frame style layout or
         // full timeline retransmission. An empty lines array clears old lyrics.
         if emittedLyricRevision != lyricRevision {
-            music["lines"] = lines.map { ["id": $0.id, "text": $0.text, "start": $0.startsAt, "end": $0.endsAt] }
+            music["lines"] = lines.map { line in
+                ["id": line.id, "text": line.text, "translation": line.translation as Any? ?? NSNull(),
+                 "start": line.startsAt, "end": line.endsAt, "startsAt": line.startsAt, "endsAt": line.endsAt,
+                 "words": line.words.map { ["id": $0.id, "text": $0.text, "startsAt": $0.startsAt, "endsAt": $0.endsAt] }] as [String: Any]
+            }
             emittedLyricRevision = lyricRevision
         }
         var conversation = chat.poll()
@@ -171,6 +202,20 @@ final class UnityMediaHost {
         player.stop()
         chat.close()
         world.close()
+        settingsBridge?.close()
+    }
+
+    private func playerVisualSettingsSnapshot() -> [String: Any] {
+        let mode = StageLyricModeDirector.resolve(configuredMode: lyricsStore.visualMode,
+            trackID: lyricsStore.trackID, lines: lines, playbackTime: pausedPosition ?? player.playbackPosition)
+        let theme = lyricsStore.activeTheme ?? .gmgnDefaultDark
+        let themeValue = (try? JSONEncoder().encode(theme)).flatMap { try? JSONSerialization.jsonObject(with: $0) }
+        return ["revision": visualRevision, "configuredMode": lyricsStore.visualMode.agentValue,
+            "mode": mode.agentValue, "theme": themeValue ?? NSNull(),
+            "availableModes": StageLyricsVisualMode.allCases.map { ["id": $0.agentValue, "name": $0.displayName] },
+            // The external settings pane consumes the existing StagePanelsPane shape.
+            "player": ["lyricID": lyricsStore.visualMode.agentValue,
+                       "lyrics": StageLyricsVisualMode.allCases.map { ["id": $0.agentValue, "name": $0.displayName] }]]
     }
 }
 

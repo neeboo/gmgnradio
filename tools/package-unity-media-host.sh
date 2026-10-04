@@ -13,6 +13,11 @@ case "$identifier" in ai.gmgn.unity-sample*) ;; *) echo 'Refusing non-sample bun
 plugins="$app/Contents/Plugins"
 [[ ! -L "$app/Contents" && ! -L "$plugins" ]] || { echo 'Refusing symlinked plugin destination' >&2; exit 2; }
 [[ -f "$products/UnityMediaHost.dylib" ]] || { echo 'Build UnityMediaHost first' >&2; exit 1; }
+settings_binary="$repo_root/tools/gpui-scenekit-probe/target/release/gmgn-unity-settings"
+[[ -x "$settings_binary" ]] || { echo 'Build the gmgn-unity-settings Release binary first' >&2; exit 1; }
+settings_app="$app/Contents/Helpers/GMGN Unity Settings.app"
+[[ ! -e "$settings_app" && ! -e "$app/Contents/MacOS/gmgn-unity-settings" ]] || { echo 'Settings already packaged; use a fresh App build' >&2; exit 2; }
+[[ ! -L "$app/Contents/Helpers" ]] || { echo 'Refusing symlinked settings destination' >&2; exit 2; }
 [[ ! -e "$plugins/UnityMediaHost.dylib" ]] || { echo 'Host already packaged; use a fresh App build' >&2; exit 2; }
 for framework in LiveKitWebRTC.framework RustLiveKitUniFFI.framework; do
   [[ -d "$products/$framework" ]] || { echo "Missing required framework: $framework" >&2; exit 1; }
@@ -41,11 +46,16 @@ if ! otool -l "$plugins/UnityMediaHost.dylib" | rg 'path @loader_path ' >/dev/nu
   install_name_tool -add_rpath '@loader_path' "$plugins/UnityMediaHost.dylib"
 fi
 codesign --force --sign - "$plugins/UnityMediaHost.dylib"
+mkdir -p "$settings_app/Contents/MacOS"
+cp "$repo_root/tools/unity-settings-info.plist" "$settings_app/Contents/Info.plist"
+cp "$settings_binary" "$settings_app/Contents/MacOS/gmgn-unity-settings"
+codesign --force --sign - "$settings_app"
 # Preserve Unity's existing signed nested code; sign the new containing bundle.
 codesign --force --sign - "$app"
 for framework in LiveKitWebRTC.framework RustLiveKitUniFFI.framework; do
   codesign --verify --deep --strict "$plugins/$framework"
 done
 codesign --verify --strict "$plugins/UnityMediaHost.dylib"
+codesign --verify --deep --strict "$settings_app"
 codesign --verify --deep --strict "$app"
 printf 'Packaged independent Unity host: %s\n' "$app"

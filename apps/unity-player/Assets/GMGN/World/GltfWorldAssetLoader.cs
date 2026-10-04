@@ -41,12 +41,21 @@ namespace GMGN.UnityPlayer.World
                     throw new InvalidDataException("这个 GLB 模型没有成功加载。");
                 cancellation.ThrowIfCancellationRequested();
                 foreach (var renderer in content.GetComponentsInChildren<Renderer>(true))
+                {
+                    renderer.reflectionProbeUsage = ReflectionProbeUsage.BlendProbes;
+                    renderer.lightProbeUsage = LightProbeUsage.BlendProbes;
                     foreach (var material in renderer.sharedMaterials)
                     {
                         if (material == null || material.shader == null || !material.shader.isSupported || material.shader.name == "Hidden/InternalErrorShader")
                             throw new WorldMaterialException("shader_unavailable", "模型材质着色器未正确打包，暂时无法显示这个物件。");
-                        Debug.Log("[WorldMaterial] shader=" + material.shader.name + " keywords=" + string.Join(",", material.shaderKeywords));
+                        var baseColor = material.HasProperty("baseColorTexture") ? material.GetTexture("baseColorTexture") : null;
+                        Debug.Log("[WorldMaterial] shader=" + material.shader.name + " keywords=" + string.Join(",", material.shaderKeywords)
+                            + " baseTexture=" + (baseColor != null ? baseColor.width + "x" + baseColor.height : "none")
+                            + " factor=" + (material.HasProperty("baseColorFactor") ? material.GetColor("baseColorFactor").ToString() : "absent")
+                            + " metallic=" + (material.HasProperty("metallicFactor") ? material.GetFloat("metallicFactor") : -1)
+                            + " roughness=" + (material.HasProperty("roughnessFactor") ? material.GetFloat("roughnessFactor") : -1));
                     }
+                }
                 if (prop != null) Prepare(root.transform, content.transform, prop);
                 root.AddComponent<WorldGltfLifetime>().Importer = importer;
                 return root;

@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "com.candidumgames.unitymmdtools": "https://github.com/CandidumGames/UnityMMDTools.git#db35d9cb80ad57a8b2cbd40ad737a3c7bbe2d6c4",
     "com.unity.ai.navigation": "2.0.14",
     "com.unity.cloud.gltfast": "6.20.0",
     "com.unity.collab-proxy": "2.13.6",
