@@ -79,7 +79,7 @@ namespace GMGN.UnityPlayer.Editor
                 data.FindProperty("m_Asset").objectReferenceValue = asset;
                 const string shaders = "Packages/org.nesnausk.gaussian-splatting/Shaders/";
                 Bind(data, "m_ShaderSplats", shaders + "RenderGaussianSplats.shader");
-                Bind(data, "m_ShaderComposite", shaders + "GaussianComposite.shader");
+                Bind(data, "m_ShaderComposite", "Assets/GMGN/GaussianWorld/Resources/GaussianWorld/GuardedGaussianComposite.shader");
                 Bind(data, "m_ShaderDebugPoints", shaders + "GaussianDebugRenderPoints.shader");
                 Bind(data, "m_ShaderDebugBoxes", shaders + "GaussianDebugRenderBoxes.shader");
                 Bind(data, "m_CSSplatUtilities", shaders + "SplatUtilities.compute");

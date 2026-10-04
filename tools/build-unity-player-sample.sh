@@ -12,4 +12,8 @@ unity build "$repo_root/apps/unity-player" \
   --editor-version 6000.6.0f1 --output-path "$app" \
   --allow-dirty-build --no-tail --timeout 600 \
   --log-file "$repo_root/tmp/unity-player-build-$revision.log"
+if rg -q 'Shader error in|Scripts have compiler errors' "$repo_root/tmp/unity-player-build-$revision.log"; then
+  echo 'Unity reported shader or script compilation errors; refusing to package this build.' >&2
+  exit 1
+fi
 bash "$repo_root/tools/package-unity-media-host.sh" "$app"

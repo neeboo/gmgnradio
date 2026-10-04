@@ -175,7 +175,9 @@ namespace GMGN.UnityPlayer
                     var persisted = record["state"]?["objectStates"]?[selected.ObjectID]?["transform"];
                     var expected = submitted["objectStates"]?[selected.ObjectID]?["transform"];
                     saving = false; awaitingReadback = false;
-                    if (JToken.DeepEquals(persisted, expected)) {
+                    var matches = MatchesTransform(persisted, expected);
+                    Debug.Log($"World save readback: receiptRevision={savedRevision}; recordRevision={record["recordRevision"]}; geometryMatches={matches}; actual={persisted?.ToString(Newtonsoft.Json.Formatting.None)}; expected={expected?.ToString(Newtonsoft.Json.Formatting.None)}");
+                    if (matches) {
                         selected = null; message.text = "物件位置已保存，并已从空间服务重新读取确认。";
                         Status?.Invoke(message.text);
                     } else { Cancel(); message.text = "空间已有其他更新，预览已撤销，请重新操作。"; }
@@ -207,6 +209,29 @@ namespace GMGN.UnityPlayer
                 awaitingReadback = true;
                 if (!backend.RequestWorldSnapshot(worldID)) message.text = "已收到保存回执，但读回确认尚未完成。";
             }
+        }
+
+        static bool MatchesTransform(JToken actual, JToken expected)
+        {
+            // Rust JSON normalizes number spelling; integer 0 and float 0.0
+            // represent the same transform. Compare geometry at float precision,
+            // not JSON token type or representation. Quaternion signs may flip.
+            if (actual == null || expected == null) return false;
+            foreach (var component in new[] { "position", "scale" })
+                foreach (var axis in new[] { "x", "y", "z" }) {
+                    var a = (double?)actual[component]?[axis]; var b = (double?)expected[component]?[axis];
+                    if (a == null || b == null || double.IsNaN(a.Value) || double.IsNaN(b.Value) || double.IsInfinity(a.Value) || double.IsInfinity(b.Value) ||
+                        Math.Abs(a.Value - b.Value) > 0.000001 * Math.Max(1, Math.Abs(b.Value))) return false;
+                }
+            var qa = actual["rotation"]; var qb = expected["rotation"];
+            if (qa == null || qb == null) return false;
+            double dot = 0, normA = 0, normB = 0;
+            foreach (var axis in new[] { "x", "y", "z", "w" }) {
+                var a = (double?)qa[axis]; var b = (double?)qb[axis];
+                if (a == null || b == null || double.IsNaN(a.Value) || double.IsNaN(b.Value)) return false;
+                dot += a.Value * b.Value; normA += a.Value * a.Value; normB += b.Value * b.Value;
+            }
+            return normA > 0 && normB > 0 && Math.Abs(Math.Abs(dot / Math.Sqrt(normA * normB)) - 1) < .000001;
         }
 
         void OnDestroy() {
