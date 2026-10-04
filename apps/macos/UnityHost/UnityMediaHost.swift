@@ -100,6 +100,10 @@ final class UnityMediaHost {
                 guard queueIndex + 1 < queue.count else { return false }
                 queueIndex += 1
                 try loadQueueEntry(autoplay: true)
+            case "music.select":
+                guard let index = value["index"] as? Int, queue.indices.contains(index) else { return false }
+                queueIndex = index
+                try loadQueueEntry(autoplay: true)
             case "music.previous":
                 guard queueIndex > 0 else { return false }
                 queueIndex -= 1
@@ -230,3 +234,28 @@ public func gmgnUnityHostDestroy(_ handle: UnsafeMutableRawPointer?) -> Int32 {
 
 @_cdecl("gmgn_unity_host_string_free")
 public func gmgnUnityHostStringFree(_ text: UnsafeMutablePointer<CChar>?) { free(text) }
+
+@_cdecl("gmgn_unity_window_scale")
+public func gmgnUnityWindowScale() -> Double {
+    guard Thread.isMainThread else { return 1 }
+    return MainActor.assumeIsolated {
+        Double((NSApplication.shared.keyWindow ?? NSApplication.shared.windows.first(where: { $0.isVisible }))?.backingScaleFactor ?? 1)
+    }
+}
+
+@_cdecl("gmgn_unity_window_width")
+public func gmgnUnityWindowWidth() -> Double {
+    guard Thread.isMainThread else { return 0 }
+    return MainActor.assumeIsolated {
+        Double((NSApplication.shared.keyWindow ?? NSApplication.shared.windows.first(where: { $0.isVisible && $0.contentView != nil }))?.contentView?.bounds.width ?? 0)
+    }
+}
+
+@_cdecl("gmgn_unity_screen_pixels")
+public func gmgnUnityScreenPixels(_ axis: Int32) -> Double {
+    guard Thread.isMainThread else { return 0 }
+    return MainActor.assumeIsolated {
+        guard let screen = (NSApplication.shared.keyWindow ?? NSApplication.shared.windows.first(where: { $0.isVisible }))?.screen else { return 0 }
+        return Double((axis == 0 ? screen.frame.width : screen.frame.height) * screen.backingScaleFactor)
+    }
+}

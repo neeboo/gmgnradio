@@ -14,12 +14,12 @@ namespace GMGN.UnityPlayer
         [DllImport(Library)] static extern void gmgn_unity_host_string_free(IntPtr value);
         [DllImport(Library)] static extern int gmgn_unity_host_destroy(IntPtr host);
         [Serializable] sealed class Envelope { public Music music; public Conversation chat; }
-        [Serializable] sealed class Music { public ulong playbackSessionID; public string title, notice; public double duration, position; public bool isPlaying, canNext, canPrevious, seekSupported; public float volume; public Features features; public Line[] lines; }
+        [Serializable] sealed class Music { public ulong playbackSessionID; public string title, notice; public double duration, position; public bool isPlaying, canNext, canPrevious, seekSupported; public int queueIndex, queueCount; public QueueItem[] queue; public float volume; public Features features; public Line[] lines; }
         [Serializable] sealed class Features { public float low, mid, high; }
         [Serializable] sealed class Line { public string text; public double start, end; }
         [Serializable] sealed class Conversation { public Event[] events; }
         [Serializable] sealed class Event { public string kind, text, message; public ulong requestID; }
-        [Serializable] sealed class Command { public string op, text, path, lyricPath; public ulong requestID; public bool autoplay; public double value; }
+        [Serializable] sealed class Command { public string op, text, path, lyricPath; public ulong requestID; public int index; public bool autoplay; public double value; }
         readonly Dictionary<ulong, string> requestIds = new();
         IntPtr host;
         ulong sequence;
@@ -61,7 +61,7 @@ namespace GMGN.UnityPlayer
                 if (music.lines != null) lyrics = music.lines;
                 string lyric = "";
                 foreach (var line in lyrics) { if (music.position >= line.start && music.position < line.end) { lyric = line.text; break; } }
-                Snapshot?.Invoke(new PlayerSnapshot { sessionId = music.playbackSessionID.ToString(), title = music.title, duration = music.duration, position = music.position, playing = music.isPlaying, nextSupported = music.canNext, previousSupported = music.canPrevious, seekSupported = music.seekSupported, volume = music.volume, lyric = lyric, bass = music.features?.low ?? 0, vocal = music.features?.mid ?? 0, treble = music.features?.high ?? 0 });
+                Snapshot?.Invoke(new PlayerSnapshot { sessionId = music.playbackSessionID.ToString(), title = music.title, duration = music.duration, position = music.position, playing = music.isPlaying, nextSupported = music.canNext, previousSupported = music.canPrevious, seekSupported = music.seekSupported, volume = music.volume, lyric = lyric, queueIndex = music.queueIndex, queueCount = music.queueCount, queue = music.queue ?? Array.Empty<QueueItem>(), bass = music.features?.low ?? 0, vocal = music.features?.mid ?? 0, treble = music.features?.high ?? 0 });
                 if (!string.IsNullOrEmpty(music.notice)) Status?.Invoke(music.notice);
             }
             if (value.chat?.events == null) return;
@@ -77,6 +77,7 @@ namespace GMGN.UnityPlayer
         public void ChooseMusic() => Execute(new Command { op = "music.choose" });
         public void Next() => Execute(new Command { op = "music.next" });
         public void Previous() => Execute(new Command { op = "music.previous" });
+        public void SelectQueueItem(int index) { if (!Execute(new Command { op = "music.select", index = index })) Status?.Invoke("这首音乐暂时无法播放，请重新选择音乐。"); }
         public void Seek(double seconds) => Status?.Invoke("当前音乐后端尚未提供跳转。");
         public void SetVolume(float volume) => Execute(new Command { op = "music.volume", value = volume });
         public void Send(string messageId, string text) { var id = ++sequence; requestIds[id] = messageId; if (!Execute(new Command { op = "chat.send", requestID = id, text = text })) { requestIds.Remove(id); Chat?.Invoke(new ChatUpdate { messageId = messageId, error = "消息未发送，请重试。", complete = true }); } }

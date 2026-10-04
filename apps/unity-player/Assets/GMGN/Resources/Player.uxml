@@ -31,7 +31,6 @@
           <ui:Label name="artist" class="artist muted" />
           <ui:Label name="time" text="0:00 / 0:00" class="time muted" />
         </ui:VisualElement>
-        <ui:Slider name="seek" low-value="0" high-value="1" class="seek" />
         <ui:VisualElement class="toolbar row">
           <ui:Button name="chooseMusic" tooltip="打开本地音乐" class="icon-button" />
           <ui:Button name="previous" tooltip="上一首尚未接入" class="icon-button" enabled="false" />
@@ -45,7 +44,7 @@
           <ui:Button name="screen" tooltip="空间播放器尚未迁移" class="icon-button" enabled="false" />
           <ui:VisualElement class="toolbar-spacer" />
           <ui:Slider name="volume" tooltip="音量" low-value="0" high-value="1" value="0.8" class="volume" />
-          <ui:Button name="settings" text="设置" tooltip="统一设置尚未迁移" class="settings-button" enabled="false" />
+          <ui:Button name="settings" text="设置" tooltip="外部设置窗口尚未接入" class="settings-button" enabled="false" />
           <ui:Button name="fullscreen" tooltip="切换全屏" class="icon-button" />
         </ui:VisualElement>
       </ui:VisualElement>

@@ -17,7 +17,7 @@ namespace GMGN.UnityPlayer
         TextField draft;
         Label status, track, artist, lyric, translation, time;
         Button play, send, cancel, newMessages;
-        Slider seek, volume;
+        Slider volume;
         string pending;
         double duration;
         bool follow = true, dirty;
@@ -27,6 +27,7 @@ namespace GMGN.UnityPlayer
         bool connected;
         Keyboard keyboard;
         string composition = "";
+        QueuePanel queuePanel;
         int compositionEndedFrame = -10;
 
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
@@ -63,7 +64,7 @@ namespace GMGN.UnityPlayer
             AddIcon("settings", "settings"); AddIcon("fullscreen", "fullscreen");
             AddIcon("mode", "screen"); AddIcon("closeChat", "close");
             AddIcon("send", "send"); AddIcon("cancel", "stop");
-            seek = root.Q<Slider>("seek"); volume = root.Q<Slider>("volume");
+            volume = root.Q<Slider>("volume");
             list = root.Q<ListView>("messages"); newMessages = root.Q<Button>("newMessages");
             list.itemsSource = messages;
             list.makeItem = () => { var box = new VisualElement(); box.AddToClassList("message");
@@ -87,32 +88,30 @@ namespace GMGN.UnityPlayer
             }, TrickleDown.TrickleDown);
             play.clicked += () => backend?.PlayPause(); root.Q<Button>("next").clicked += () => backend?.Next();
             root.Q<Button>("previous").clicked += () => backend?.Previous();
-            root.Q<Button>("chooseMusic").clicked += () => backend?.ChooseMusic();
-            seek.RegisterValueChangedCallback(e => backend?.Seek(e.newValue));
+            root.Q<Button>("chooseMusic").clicked += () => { ToggleChat(false); queuePanel?.Toggle(); };
             volume.RegisterValueChangedCallback(e => backend?.SetVolume(e.newValue));
             sculpture = gameObject.AddComponent<AudioSculpture>();
             try { backend = PlayerBackend.Create?.Invoke(); }
             catch (Exception error) { status.text = "音乐与对话服务连接失败：" + error.Message; status.AddToClassList("status-error"); SetConnected(false); return; }
             if (backend == null) { status.text = "音乐与对话服务未连接"; SetConnected(false); return; }
             backend.Snapshot += OnSnapshot; backend.Chat += OnChat; backend.Status += OnStatus;
+            queuePanel = QueuePanel.Attach(root.Q(className: "body"), backend);
             SetConnected(true); status.text = "音乐与角色已连接";
         }
-        void SetConnected(bool ready) { connected = ready; play.SetEnabled(ready); seek.SetEnabled(false); volume.SetEnabled(ready); root.Q<Button>("next").SetEnabled(false); root.Q<Button>("previous").SetEnabled(false); root.Q<Button>("chooseMusic").SetEnabled(ready); UpdateComposer(); }
-        void ToggleChat(bool visible) { chatPanel.EnableInClassList("hidden", !visible); root.Q<Button>("chatToggle").EnableInClassList("selected", visible); if (visible) draft.Focus(); }
+        void SetConnected(bool ready) { connected = ready; play.SetEnabled(ready); volume.SetEnabled(ready); root.Q<Button>("next").SetEnabled(false); root.Q<Button>("previous").SetEnabled(false); root.Q<Button>("chooseMusic").SetEnabled(ready); UpdateComposer(); }
+        void ToggleChat(bool visible) { if (visible) queuePanel?.SetVisible(false); chatPanel.EnableInClassList("hidden", !visible); root.Q<Button>("chatToggle").EnableInClassList("selected", visible); if (visible) draft.Focus(); }
         void UpdateComposer() { send.SetEnabled(connected && pending == null && !string.IsNullOrWhiteSpace(draft.value)); send.EnableInClassList("hidden", pending != null); cancel.EnableInClassList("hidden", pending == null); cancel.SetEnabled(connected && pending != null); }
         void OnStatus(string value) => status.text = value;
         void OnSnapshot(PlayerSnapshot snapshot)
         {
             track.text = string.IsNullOrEmpty(snapshot.title) ? "尚未播放" : snapshot.title;
             artist.text = snapshot.artist ?? ""; lyric.text = snapshot.lyric ?? ""; translation.text = snapshot.translation ?? "";
-            duration = snapshot.duration; seek.highValue = (float)Math.Max(1, duration);
-            seek.SetEnabled(snapshot.seekSupported);
+            duration = snapshot.duration;
             GetComponent<UIDocument>().rootVisualElement.Q<Button>("next").SetEnabled(snapshot.nextSupported);
             root.Q<Button>("previous").SetEnabled(snapshot.previousSupported);
             root.Q<Button>("previous").tooltip = snapshot.previousSupported ? "上一首" : "当前队列没有上一首";
             root.Q<Button>("next").tooltip = snapshot.nextSupported ? "下一首" : "当前队列没有下一首";
-            seek.tooltip = snapshot.seekSupported ? "跳转播放位置" : "当前样板尚未支持跳转";
-            seek.SetValueWithoutNotify((float)snapshot.position); volume.SetValueWithoutNotify(snapshot.volume);
+            volume.SetValueWithoutNotify(snapshot.volume);
             play.tooltip = snapshot.playing ? "暂停" : "播放";
             playIcon.Kind = snapshot.playing ? "pause" : "play";
             time.text = Format(snapshot.position) + " / " + Format(duration);
@@ -146,7 +145,7 @@ namespace GMGN.UnityPlayer
         }
         void BindKeyboard() { if (keyboard == Keyboard.current) return; if (keyboard != null) keyboard.onIMECompositionChange -= OnComposition; keyboard = Keyboard.current; if (keyboard != null) keyboard.onIMECompositionChange += OnComposition; }
         void OnComposition(IMECompositionString value) { var next = value.ToString(); if (composition.Length > 0 && next.Length == 0) compositionEndedFrame = Time.frameCount; composition = next; }
-        void OnDestroy() { if (keyboard != null) keyboard.onIMECompositionChange -= OnComposition; if (backend == null) return; backend.Snapshot -= OnSnapshot; backend.Chat -= OnChat; backend.Status -= OnStatus; backend.Dispose(); }
+        void OnDestroy() { queuePanel?.Dispose(); if (keyboard != null) keyboard.onIMECompositionChange -= OnComposition; if (backend == null) return; backend.Snapshot -= OnSnapshot; backend.Chat -= OnChat; backend.Status -= OnStatus; backend.Dispose(); }
 
         ToolbarIcon AddIcon(string name, string kind)
         {

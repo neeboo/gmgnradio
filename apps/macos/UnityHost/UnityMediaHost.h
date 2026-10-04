@@ -8,3 +8,6 @@ int32_t gmgn_unity_host_command(void *handle, const char *json);
 char *gmgn_unity_host_snapshot(void *handle);
 void gmgn_unity_host_string_free(char *json);
 int32_t gmgn_unity_host_destroy(void *handle);
+double gmgn_unity_window_scale(void);
+double gmgn_unity_window_width(void);
+double gmgn_unity_screen_pixels(int32_t axis);

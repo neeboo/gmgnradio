@@ -28,7 +28,7 @@ Button:disabled { opacity: 0.4; }
 .track-title { font-size: var(--body); max-width: 48%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .artist { font-size: var(--caption); margin-left: 12px; flex-grow: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .time { font-size: var(--caption); margin-left: 8px; flex-shrink: 0; }
-.toolbar { flex-wrap: nowrap; }
+.toolbar { flex-wrap: wrap; }
 .toolbar-spacer { flex-grow: 1; }
 .separator { width: 1px; height: 20px; background-color: var(--line); margin: 0 8px; }
 .volume { width: 96px; margin-left: 8px; margin-right: 8px; }
@@ -54,7 +54,6 @@ Slider .unity-base-field__input { height: 20px; min-width: 40px; flex-grow: 1; p
 .unity-base-slider__dragger-border { display: none; }
 Slider:disabled { opacity: 0.4; }
 .compact .shell { padding: 12px; }
-.compact .volume, .compact #microphone, .compact #inbox, .compact #props, .compact #screen { display: none; }
 .compact .lyrics { top: 32%; }
 .compact .chat-column { height: 280px; margin-bottom: 8px; }
 .compact .lyric { font-size: 24px; }

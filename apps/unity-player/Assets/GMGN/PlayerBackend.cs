@@ -2,12 +2,19 @@ using System;
 
 namespace GMGN.UnityPlayer
 {
+    [Serializable] public sealed class QueueItem
+    {
+        public int index;
+        public string title;
+    }
     [Serializable] public sealed class PlayerSnapshot
     {
         public string sessionId, title, artist, lyric, translation;
         public double position, duration;
         public bool playing, seekSupported, nextSupported, previousSupported;
         public float volume, bass, vocal, treble;
+        public int queueIndex, queueCount;
+        public QueueItem[] queue = Array.Empty<QueueItem>();
     }
     public sealed class ChatUpdate
     {
@@ -24,6 +31,7 @@ namespace GMGN.UnityPlayer
         void ChooseMusic();
         void Next();
         void Previous();
+        void SelectQueueItem(int index);
         void Seek(double seconds);
         void SetVolume(float volume);
         void Send(string messageId, string text);

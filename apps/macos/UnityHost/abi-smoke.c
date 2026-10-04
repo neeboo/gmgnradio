@@ -74,6 +74,9 @@ int main(int argc, char **argv) {
         usleep(350000);
         value = snapshot(host); double previousIndex = number(value, "queueIndex"); release(value);
         if (previousIndex != 0 || command(host, "{\"op\":\"music.previous\"}") != 0) return 24;
+        if (!command(host, "{\"op\":\"music.select\",\"index\":1}")) return 25;
+        value = snapshot(host); double selectedIndex = number(value, "queueIndex"); release(value);
+        if (selectedIndex != 1 || command(host, "{\"op\":\"music.select\",\"index\":2}") != 0) return 26;
         command(host, "{\"op\":\"music.stop\"}");
         printf("PASS real local queue next/previous: sessions %.0f→%.0f, second-song clock=%.3f; lyric clear and queue boundaries\n", firstSession, secondSession, nextPosition);
     }
