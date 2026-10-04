@@ -81,6 +81,7 @@ enum ResidentMemorySource: Equatable { case text, voice }
         var unconfirmedUserMessages: [String] = []
     }
     var snapshot = Snapshot()
+    var lastFinishedTurnInterruption: ResidentChatTurn.Interruption?
     var messages: [String] = []
     var images: [[URL]] = []
     var failures: [(String) -> Void] = []
@@ -97,7 +98,8 @@ enum ResidentMemorySource: Equatable { case text, voice }
     }
     func receiveUserMessage(_ text: String, imageURLs: [URL] = [], submissionID: UUID? = nil,
                             onUndelivered: @escaping @MainActor () -> Void = {},
-                            onFailure: @escaping @MainActor (String) -> Void = { _ in }) {
+                            onFailure: @escaping @MainActor (String) -> Void = { _ in },
+                            onInterrupted: @escaping @MainActor (String) -> Void = { _ in }) {
         messages.append(text); if !imageURLs.isEmpty { images.append(imageURLs) }; failures.append(onFailure)
         beginRunIfIdle()
     }
@@ -143,6 +145,12 @@ struct WorldContext { let sessionScope: String; var worldID: String? { sessionSc
     let avatarRuntime = AvatarRuntime()
     var worldScope = "original"
     var residentPropEditingWorldID: String?
+    var editorCanClose = false
+    func closeResidentPropEditorForFetch() -> Bool {
+        guard editorCanClose else { return false }
+        residentPropEditingWorldID = nil
+        return true
+    }
     var voiceStops = 0
     var formalReturns = 0
     var residentTurnSourceByRunID: [UUID: ResidentMemorySource] = [:]
@@ -216,9 +224,13 @@ struct WorldContext { let sessionScope: String; var worldID: String? { sessionSc
         catch ResidentPropHostError.editorOpen { }
         catch { preconditionFailure("editor provides explicit reason") }
         precondition(app.residentAgentLoop?.images.count == imageCount, "editor rejection preserves text/image delivery boundary")
+        app.editorCanClose = true
+        try! await app.submitImage(photo)
+        precondition(app.residentPropEditingWorldID == nil, "human submission must close editing before delivery")
+        precondition(app.residentAgentLoop!.images.count == imageCount + 1, "closed editor permits exactly one submission")
         app.residentPropEditingWorldID = nil
         try! await app.submitImage(photo, liveCam: true)
-        app.residentAgentLoop?.failures[3]("图片后端失效")
+        app.residentAgentLoop?.failures[4]("图片后端失效")
         precondition(app.liveCamWindowController?.submissions.count == 1, "Live Cam failure restores only to Live Cam")
         app.worldScope = "new-world"
         app.residentAgentLoop?.failures[2]("迟到错误")

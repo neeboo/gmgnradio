@@ -1042,6 +1042,8 @@ enum WishMachineError: LocalizedError {
     func automaticContinuationEvents(worldID: String, residentScope: String) -> [WishMachineEvent] {
         pendingEvents(worldID: worldID, residentScope: residentScope).filter { event in
             guard let job = jobs.first(where: { $0.id == event.wishID }) else { return false }
+            if delegations.contains(where: { $0.authorizationID == job.authorizationID
+                && $0.worldID == worldID && $0.residentScope == residentScope && $0.state == .placed }) { return false }
             if let grant = event.continuationResumeAuthorizationID,
                job.continuationResumeAuthorizationIDs?.last != grant { return false }
             return job.autoContinuationPaused != true
@@ -1065,12 +1067,16 @@ enum WishMachineError: LocalizedError {
             $0.authorizationID == job.authorizationID && $0.worldID == worldID && $0.residentScope == residentScope
         }
         if let delegationIndex {
-            guard delegations[delegationIndex].state != .placed else { throw WishMachineError.continuationAlreadyPlaced }
+            if delegations[delegationIndex].state == .placed {
+                return try finishAlreadyPlacedContinuation(index: index, delegationIndex: delegationIndex)
+            }
             guard delegations[delegationIndex].state != .failed else { throw WishMachineError.continuationResumeUnavailable }
         }
         if job.stage == .claimed {
             guard let placementAlreadyCompleted else { throw WishMachineError.continuationResumeReadbackRequired }
-            guard !placementAlreadyCompleted else { throw WishMachineError.continuationAlreadyPlaced }
+            if placementAlreadyCompleted {
+                return try finishAlreadyPlacedContinuation(index: index, delegationIndex: delegationIndex)
+            }
             guard delegationIndex != nil else { throw WishMachineError.continuationResumeUnavailable }
         }
         let needsResume = job.autoContinuationPaused == true || delegationIndex.map { delegations[$0].state == .revoked } == true
@@ -1095,6 +1101,18 @@ enum WishMachineError: LocalizedError {
             jobs[index] = job; delegations = priorDelegations; events = priorEvents
             throw error
         }
+        return jobs[index]
+    }
+
+    /// Only a durable placed delegation or current host readback can reach this
+    /// path. Clear the stale pause without granting work or replaying effects.
+    private func finishAlreadyPlacedContinuation(index: Int, delegationIndex: Int?) throws -> WishMachineJob {
+        let priorJob = jobs[index], priorDelegations = delegations
+        jobs[index].autoContinuationPaused = false
+        jobs[index].autoContinuationStoppedByUser = nil
+        if let delegationIndex { delegations[delegationIndex].state = .placed }
+        do { try persist() }
+        catch { jobs[index] = priorJob; delegations = priorDelegations; throw error }
         return jobs[index]
     }
 

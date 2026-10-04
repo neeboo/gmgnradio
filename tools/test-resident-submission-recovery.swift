@@ -38,6 +38,14 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
 }
 @MainActor final class App {
     var residentPropEditingWorldID: String?
+    var editorCanClose = true
+    var closeCount = 0
+    func closeResidentPropEditorForFetch() -> Bool {
+        closeCount += 1
+        guard editorCanClose else { return false }
+        residentPropEditingWorldID = nil
+        return true
+    }
     var world = "room", scope = "resident"
     var residentAgentLoop: ResidentAgentLoop?
     var residentUnconfirmedNotice = ResidentUnconfirmedNoticePolicy()
@@ -74,7 +82,9 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
             let app = App()
             let loop = app.residentAgentLoop!
             loop.receiveUserMessage("正在处理的旧请求")
+            app.residentPropEditingWorldID = "room"
             try await app.send(submission, stage: stage)
+            check(app.closeCount == 1 && app.residentPropEditingWorldID == nil, "hidden editor closes before a human message enters the real loop")
             check(loop.snapshot.pendingUserMessages == [submission.text], "image is queued behind the active request")
             loop.stop()
             let target = stage ? app.stageWindowController! : app.liveCamWindowController!
@@ -97,6 +107,13 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
             if mutation == "invalidate" { loop.invalidate() } else { loop.stop() }
             check(app.stageWindowController!.attachments.isEmpty, "stale submission cannot restore across " + mutation)
         }
+        let blocked = App()
+        blocked.residentPropEditingWorldID = "room"
+        blocked.editorCanClose = false
+        do { try await blocked.send(submission, stage: true); check(false, "failed editor close must reject") }
+        catch ResidentPropHostError.editorOpen { }
+        check(blocked.residentPropEditingWorldID == "room" && blocked.residentAgentLoop!.snapshot.pendingUserMessages.isEmpty,
+              "failed close retains the world edit guard and never enqueues a message")
         for _ in 0..<20 { await Task.yield() }
         print("PASS: \(count) submission recovery checks (real Loop and App boundary, no host)")
     }

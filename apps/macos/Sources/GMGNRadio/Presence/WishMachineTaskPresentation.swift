@@ -236,6 +236,10 @@ enum ResidentConnectivityFact {
 enum ResidentAutonomySwitch {
     static let defaultsKey = "resident.autonomous.enabled.v1"
     static let didChangeNotification = Notification.Name("gmgnResidentAutonomyChanged")
+    static func registerDefaults(in defaults: UserDefaults = .standard) {
+        // Registration never overwrites a persisted explicit user choice.
+        defaults.register(defaults: [defaultsKey: true])
+    }
 }
 
 /// **授权事实的文本形态**。
@@ -368,7 +372,7 @@ final class WishMachineTaskPresentationStore: ObservableObject {
     /// 全局开关的当前值。直接读设置里那**一个**键，不另存一份状态；
     /// 呈现侧每秒重算，所以设置里改一下这里一秒内跟上。
     var isAutonomySwitchOn: Bool {
-        UserDefaults.standard.bool(forKey: ResidentAutonomySwitch.defaultsKey)
+        UserDefaults.standard.object(forKey: ResidentAutonomySwitch.defaultsKey) as? Bool ?? true
     }
 
     /// 宿主推来的权威连通性事实（后台连不上时的可读原因）。这是**一条全局提示**。

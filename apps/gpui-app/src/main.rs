@@ -15,7 +15,7 @@ mod program_backdrop;
 mod lyrics_layer;
 mod system_symbol;
 use product_host::ProductHost;
-gpui_kit::actions!(gmgn_product, [Quit,ShowSettings,ShowLiveCam,EscapeStage]);
+gpui_kit::actions!(gmgn_product, [Quit,ShowSettings,ShowActivities,ShowLiveCam,EscapeStage]);
 
 fn window_still_registered<T: PartialEq>(cached: T, live: impl IntoIterator<Item=T>) -> bool {
     live.into_iter().any(|id| id == cached)
@@ -23,6 +23,16 @@ fn window_still_registered<T: PartialEq>(cached: T, live: impl IntoIterator<Item
 
 fn modal_owns_scene_input(menu: bool, dialog: bool, sheet: bool) -> bool {
     menu || dialog || sheet
+}
+
+fn user_status_notice(message: &str) -> String {
+    if message.contains("原物件已摆放") {
+        "物件已经摆好了，无需再次摆放。".into()
+    } else if message.contains("revision_conflict") {
+        "空间有新的保存记录，这次修改尚未保存，仍保留在当前窗口。请稍后重试保存。".into()
+    } else {
+        message.to_owned()
+    }
 }
 unsafe extern "C" {
     fn gmgn_gpui_bitmap_drop_region(view:*mut c_void,x:f64,y:f64,w:f64,h:f64,enabled:i32);
@@ -343,7 +353,7 @@ impl GMGNProductUI {
         cx.notify();
     }
     fn open_settings(&mut self,cx:&mut Context<Self>) {
-        self.open_settings_page("presence",cx);
+        self.open_settings_page("player",cx);
     }
     fn show_presence_guidance(&mut self,window:&mut Window,cx:&mut Context<Self>) {
         let guidance=self.runtime_state["desktopPresence"]["guidance"].as_str().unwrap_or("").to_owned();
@@ -361,6 +371,7 @@ impl GMGNProductUI {
         });
     }
     fn open_settings_page(&mut self,page:&str,cx:&mut Context<Self>) {
+        self.stage_panel_open=false;
         self.settings_pane.update(cx,|pane,cx|pane.select_page(page,cx));
         if let Some(handle)=self.settings_window {
             // A dispatch callback may already lease this window. A failed
@@ -373,15 +384,15 @@ impl GMGNProductUI {
         }
         let pane=self.settings_pane.clone();
         self.settings_window=cx.open_window(WindowOptions {
-            window_bounds:Some(WindowBounds::Windowed(Bounds::new(point(px(120.),px(100.)),size(px(580.),px(500.))))),
-            window_min_size:Some(size(px(540.),px(440.))),
+            window_bounds:Some(WindowBounds::Windowed(Bounds::new(point(px(120.),px(100.)),size(px(880.),px(640.))))),
+            window_min_size:Some(size(px(760.),px(540.))),
             ..Default::default()
         },move |window,cx| {
             window.set_window_title("设置");
             window.defer(cx,|window,_| {
                 if let Ok(handle)=HasWindowHandle::window_handle(window) {
                     if let RawWindowHandle::AppKit(handle)=handle.as_raw() {
-                        product_host::set_window_outer_size(handle.ns_view.as_ptr(),580.,500.,540.,440.);
+                        product_host::set_window_outer_size(handle.ns_view.as_ptr(),880.,640.,760.,540.);
                     }
                 }
             });
@@ -399,7 +410,7 @@ impl GMGNProductUI {
         }
         match action {
             "chat" => {self.chat_open=!self.chat_open;if self.chat_open{self.composer_focus_pending=true;self.stage_panel_open=false;self.program_open=false;self.props_open=false;if self.compact{self.dismissed_reply_revision=None;}}cx.notify();},
-            "visual" => {self.stage_panel_open=!self.stage_panel_open;if self.stage_panel_open{self.chat_open=false;self.program_open=false;self.props_open=false;}cx.notify();},
+            "visual" => {self.open_settings(cx);cx.notify();},
             "program" => {self.program_open=!self.program_open;if self.program_open{self.chat_open=false;self.stage_panel_open=false;self.props_open=false;}cx.notify();},
             "toggleDecoration" => {
                 let value=serde_json::json!({"op":"stage.props.toggle"});
@@ -585,7 +596,7 @@ impl Render for GMGNProductUI {
                 let item=if self.compact {
                     let item=div().min_h(px(24.)).px(px(8.)).py(px(8.)).rounded(px(10.)).bg(rgba(0x1f1f1ff0)).text_size(px(if field=="statusNotice"{10.}else{11.})).text_color(rgb(0xff9f0a)).child(notice.to_owned());
                     if field=="statusNotice"{item}else{item.line_clamp(3)}
-                }else{div().text_xs().text_color(cx.theme().muted_foreground).child(notice.to_owned())};
+                }else{div().text_xs().text_color(cx.theme().muted_foreground).child(user_status_notice(notice))};
                 notices = notices.child(item);
                 notice_count+=1;
             }
@@ -831,8 +842,12 @@ fn main() {
             }
         });
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None),KeyBinding::new("cmd-,",ShowSettings,None),KeyBinding::new("escape",EscapeStage,None)]);
+        let activities_ui=main_ui.clone();
+        cx.on_action(move |_:&ShowActivities,cx| {
+            if let Some(ui)=activities_ui.borrow().as_ref(){ui.update(cx,|ui,cx|ui.open_settings_page("activities",cx));}
+        });
         cx.set_menus([
-            Menu::new("gmgn radio").items([MenuItem::action("显示小窗",ShowLiveCam),MenuItem::action("设置…",ShowSettings),MenuItem::separator(),MenuItem::action("退出 gmgn radio", Quit)]),
+            Menu::new("gmgn radio").items([MenuItem::action("显示小窗",ShowLiveCam),MenuItem::action("角色活动…",ShowActivities),MenuItem::action("设置…",ShowSettings),MenuItem::separator(),MenuItem::action("退出 gmgn radio", Quit)]),
             Menu::new("编辑").items([
                 MenuItem::action("撤销", gpui_kit::component::input::Undo),
                 MenuItem::action("重做", gpui_kit::component::input::Redo),
@@ -879,6 +894,7 @@ fn main() {
                 let settings_pane=cx.new(|cx|AgentSettingsPane::new(window,cx));
                 let inbox_pane=cx.new(InboxPane::new);
                 let stage_pane=cx.new(|cx|StagePanelsPane::new(window,cx));
+                settings_pane.update(cx,|pane,cx|pane.set_stage_pane(stage_pane.clone(),cx));
                 let program_pane=cx.new(|cx|StageProgramRailPane::new(window,cx));
                 let prop_pane=cx.new(|cx|ResidentPropEditorPane::new(window,cx));
                 let lyrics_pane=cx.new(|cx|StageLyricsPane::new(window,cx));

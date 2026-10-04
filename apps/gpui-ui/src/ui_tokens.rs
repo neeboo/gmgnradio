@@ -17,6 +17,13 @@ pub const SPACING_24: f32 = 24.;
 #[cfg(test)]
 mod tests {
     #[test]
+    fn embedded_player_sections_show_distinct_real_controls(){
+        use crate::stage_panels::player_section_includes as includes;
+        assert!(includes("歌词","lyrics"));assert!(!includes("歌词","clouds"));
+        assert!(includes("视觉效果","clouds"));assert!(!includes("视觉效果","videoModes"));
+        assert!(includes("视频","videoModes"));assert!(!includes("视频","lyrics"));
+    }
+    #[test]
     fn kit_small_control_uses_shared_semantic_text_size() {
         use gpui_kit::{Styled, div};
         use gpui_kit::component::Size;

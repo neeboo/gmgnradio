@@ -841,15 +841,25 @@ extension WishMachineCoordinator {
         check(try preparedFailureReload.read(id: resumeJob.id, worldID: "world", residentScope: "resident").autoContinuationPaused == true,
               "restart after permission preparation failure keeps the old pause")
         HTTP.state = "completed"
-        let claimedResume = WishMachineCoordinator(store: toolStore, directory: toolWishes, canClaim: { _ in
+        var claimedResume = WishMachineCoordinator(store: toolStore, directory: toolWishes, canClaim: { _ in
             .init(worldID: "world", activityID: "wish_machine.collect", phase: "loop", distanceMeters: 0.1, outputAvailable: true)
         })
         await claimedResume.refreshPending(limit: 1)
         _ = try claimedResume.claim(id: resumeJob.id, worldID: "world", residentScope: "resident")
         check((await resumeTool(claimedResume, grant: UUID(), placed: nil).handle("unverified-owned", resumeData)).isError,
               "claimed output cannot resume placement without a real host ownership readback")
-        check((await resumeTool(claimedResume, grant: UUID(), placed: true).handle("already-placed", resumeData)).isError,
-              "already manually placed output never restores automatic duplicate placement")
+        let unplacedArchive = try Data(contentsOf: toolWishes.appendingPathComponent("wishes.json"))
+        let oldGrants = try claimedResume.read(id: resumeJob.id, worldID: "world", residentScope: "resident").continuationResumeAuthorizationIDs
+        check(!(await resumeTool(claimedResume, grant: UUID(), placed: true).handle("already-placed", resumeData)).isError,
+              "already manually placed output ends stale pause successfully without duplicate placement")
+        let finished = try claimedResume.read(id: resumeJob.id, worldID: "world", residentScope: "resident")
+        check(finished.autoContinuationPaused == false && finished.continuationResumeAuthorizationIDs == oldGrants
+            && claimedResume.automaticContinuationEvents(worldID: "world", residentScope: "resident").allSatisfy { $0.wishID != resumeJob.id },
+              "completed placed item grants no new authorization and emits no automatic follow-through")
+        let verifiedUnplacedDirectory = toolWishes.appendingPathComponent("verified-unplaced-regression")
+        try FileManager.default.createDirectory(at: verifiedUnplacedDirectory, withIntermediateDirectories: true)
+        try unplacedArchive.write(to: verifiedUnplacedDirectory.appendingPathComponent("wishes.json"))
+        claimedResume = WishMachineCoordinator(store: toolStore, directory: verifiedUnplacedDirectory, canClaim: { _ in nil })
         check(!(await resumeTool(claimedResume, grant: UUID(), placed: false).handle("verified-unplaced", resumeData)).isError,
               "verified owned and unplaced item may resume its original revoked destination")
         try claimedResume.markPlacementFailed(worldID: "world", residentScope: "resident", objectID: resumeJob.objectID, reason: "fixture no legal spot")

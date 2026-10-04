@@ -364,6 +364,12 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         residentPropEditor.isOpen
     }
 
+    /// Explicit close works even when another panel has hidden the editor view.
+    /// It discards only the in-hand preview; committed room placement is retained.
+    func closeDecorationEditor() {
+        residentPropEditor.close()
+    }
+
     /// 菜单栏「装修空间 / 结束装修」的**窄入口**：只转交装修编辑器的开关，
     /// 不重排窗口生命周期（空间窗口的开/关仍由既有路径负责）。
     /// 空间还没呈现、世界快照还没到时由内容视图挂起意图，见 `StageContentView.toggleDecorationEditor()`。

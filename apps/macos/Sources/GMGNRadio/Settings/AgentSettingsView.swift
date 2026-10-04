@@ -202,7 +202,7 @@ private struct RustSpeechConfigurationFields: View {
 struct AgentSettingsView: View {
     @State private var model = AgentSettingsModel()
     @State private var voiceStatus = RealtimeVoiceStatusStore.shared
-    @AppStorage("resident.autonomous.enabled.v1") private var residentAutonomyEnabled = false
+    @AppStorage("resident.autonomous.enabled.v1") private var residentAutonomyEnabled = true
     private let connectRealtimeVoice:
         (RealtimeVoiceConfiguration) -> Void
     private let disconnectRealtimeVoice: () -> Void

@@ -444,7 +444,7 @@ private final class GPUIProductSettings {
                 "hostPrompt": dj.hostPrompt(),
                 "takeoverEnabled": dj.takeoverEnabled(),
                 "planningModel": dj.planningModel() ?? "",
-                "autonomyEnabled": UserDefaults.standard.bool(forKey: "resident.autonomous.enabled.v1"),
+                "autonomyEnabled": UserDefaults.standard.object(forKey: ResidentAutonomySwitch.defaultsKey) as? Bool ?? true,
                 "backgroundTurnsPerHour": resident.backgroundTurnsPerHour,
                 "budgetOptions": Array(0...ResidentPreferences.maximumBackgroundTurnsPerHour),
                 "autoSpeak": service.preferenceStore.autoSpeakReplies,
@@ -687,6 +687,7 @@ private func withProductHost<T: Sendable>(_ pointer: UnsafeMutableRawPointer?, _
 public func gmgnProductHostCreate() -> UnsafeMutableRawPointer? {
     guard Thread.isMainThread else { return nil }
     E2ERuntime.bootstrap()
+    ResidentAutonomySwitch.registerDefaults()
     let address = MainActor.assumeIsolated { UInt(bitPattern: Unmanaged.passRetained(GPUIProductHost()).toOpaque()) }
     return UnsafeMutableRawPointer(bitPattern: address)
 }

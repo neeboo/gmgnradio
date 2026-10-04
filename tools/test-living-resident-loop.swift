@@ -383,6 +383,7 @@ typealias RealConversationService = AgentConversationService
     private func publishResidentTranscript() {}
     private func settleSilentResidentTurnIfNeeded() {}
     private var residentPropEditingWorldID: String?
+    private func closeResidentPropEditorForFetch() -> Bool { residentPropEditingWorldID == nil }
     private let residentActivityOwnership = ResidentActivityOwnership()
     private var residentActivityOutcome: ResidentActivityOutcome?
     var liveCamWindowController: Surface? = Surface()

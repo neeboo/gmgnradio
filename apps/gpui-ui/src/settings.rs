@@ -178,12 +178,15 @@ fn presence_preview(package: &Value) -> AnyElement {
 struct SettingsGroup {
     title: &'static str,
     content: Div,
+    visible: bool,
 }
 impl SettingsGroup {
+    fn visible(mut self, visible:bool)->Self{self.visible=visible;self}
     fn row_gap(mut self,gap:Pixels)->Self{self.content=self.content.gap(gap);self}
     fn new(title: &'static str, border: Hsla) -> Self {
         Self {
             title,
+            visible:true,
             content: div()
                 .flex()
                 .flex_col()
@@ -202,6 +205,7 @@ impl ParentElement for SettingsGroup {
 }
 impl RenderOnce for SettingsGroup {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        if !self.visible{return div().into_any_element();}
         let mut group = div().flex().flex_col().gap(px(ui::SPACING_8));
         if !self.title.is_empty() {
             group = group.child(
@@ -212,7 +216,7 @@ impl RenderOnce for SettingsGroup {
                     .child(self.title),
             );
         }
-        group.child(self.content)
+        group.child(self.content).into_any_element()
     }
 }
 
@@ -224,6 +228,8 @@ pub struct AgentSettingsPane {
     commands: Vec<Value>,
     initialized: bool,
     page: usize,
+    section: String,
+    stage_pane: Option<Entity<crate::stage_panels::StagePanelsPane>>,
     extra_inputs: Vec<Entity<InputState>>,
     motion_category: String,
     orb_color: Entity<ColorPickerState>,
@@ -301,7 +307,7 @@ impl AgentSettingsPane {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let inputs: Vec<Entity<InputState>> = [
             "居民人格",
-            "DJ 人格与偏好",
+            "角色人格与偏好",
             "使用 Codex 默认模型",
             "自定义音色 ID",
         ]
@@ -315,7 +321,7 @@ impl AgentSettingsPane {
             })
         })
         .collect();
-        let personas = ["居民人格", "DJ 人格与偏好"]
+        let personas = ["居民人格", "角色人格与偏好"]
             .map(|label| cx.new(|cx| TextareaState::new(window, cx).placeholder(label).rows(4)))
             .to_vec();
         let extra_inputs:Vec<Entity<InputState>> = [
@@ -383,6 +389,8 @@ impl AgentSettingsPane {
             commands: vec![json!({"op":"settings.load"})],
             initialized: false,
             page: 0,
+            section: "角色管理".into(),
+            stage_pane: None,
             extra_inputs,
             motion_category: String::new(),
             orb_color,
@@ -408,16 +416,34 @@ impl AgentSettingsPane {
         }
         self.page = match page {
             "music" => 1,
-            "space" => 2,
+            "space-preferences" => 2,
+            "space" => 6,
+            "player" => 5,
+            "activities" => 7,
             "shortcuts" => 3,
             "agent" | "dj" => 4,
             _ => 0,
         };
+        let valid=match self.page {0=>matches!(self.section.as_str(),"角色管理"|"动作管理"),1=>self.section=="音乐账号与歌单同步",2=>self.section=="生成服务",3=>self.section=="快捷键",4=>matches!(self.section.as_str(),"Agent 连接"|"语音播放"|"按住说话"|"自主行动"),5=>matches!(self.section.as_str(),"歌词"|"视觉效果"|"视频"),6=>self.section=="我的空间",_=>true};
+        if !valid{self.section=match self.page{0=>"角色管理",1=>"音乐账号与歌单同步",2=>"生成服务",3=>"快捷键",4=>"Agent 连接",5=>"歌词",6=>"我的空间",_=>"活动"}.into();}
         if self.page == 0 {
             self.commands.push(json!({"op":"presence.load"}));
         }
         if self.page==4{self.commands.push(json!({"op":"speech.settings.load"}));}
+        if let Some(stage) = &self.stage_pane {
+            let tab = match self.page {5=>Some("player"),6=>Some("space"),7=>Some("activities"),_=>None};
+            if let Some(tab)=tab {stage.update(cx, |stage,cx| {stage.select_tab(tab,cx);stage.select_section(&self.section,cx);});}
+        }
         cx.notify();
+    }
+    pub fn set_stage_pane(&mut self, pane: Entity<crate::stage_panels::StagePanelsPane>, cx: &mut Context<Self>) {
+        pane.update(cx, |stage,cx| stage.set_embedded(true,cx));
+        self.stage_pane = Some(pane);
+        cx.notify();
+    }
+    pub fn select_section(&mut self,page:&str,section:&str,cx:&mut Context<Self>){
+        self.section=section.into();self.select_page(page,cx);
+        if let Some(stage)=&self.stage_pane{stage.update(cx,|stage,cx|stage.select_section(section,cx));}
     }
     pub fn dismissed(&mut self, cx: &mut Context<Self>) {
         self.commands.push(json!({"op":"space.prop.cancel"}));
@@ -690,29 +716,30 @@ impl AgentSettingsPane {
                 .child("正在读取原应用配置与 Rust 服务能力…")
                 .into_any_element();
         }
-        let group = |title: &'static str| SettingsGroup::new(title, border);
-        form=form.child(group("DJ 内核")
+        let group = |title: &'static str| SettingsGroup::new(title, border).visible(match self.section.as_str(){"语音播放"=>title=="回复语音","按住说话"=>title=="按住说话","自主行动"=>matches!(title,"角色人格与偏好"|"居民人格"|"自主行动"),_=>matches!(title,"角色内核"|"聊天模型")});
+        form=form.child(group("角色内核")
             .child(div().flex().items_center().gap(px(12.)).child(div().size(px(32.)).rounded_lg().bg(cx.theme().muted).flex().items_center().justify_center().child(Icon::new(IconName::Terminal).size(px(20.))))
-                .child(div().flex_1().flex().flex_col().child("gmgn DJ").child(self.snapshot["agent"]["codexStatus"].as_str().unwrap_or("策划引擎未登录").to_owned()))
+                .child(div().flex_1().flex().flex_col().child("gmgn 角色").child(self.snapshot["agent"]["codexStatus"].as_str().unwrap_or("策划引擎未登录").to_owned()))
                 .child(Button::new("codex-login").label(if self.snapshot["agent"]["codexState"].as_str()==Some("signedIn"){"退出登录"}else{"登录"})
                     .disabled(self.snapshot["agent"]["working"].as_bool()==Some(true)||self.snapshot["agent"]["codexState"].as_str()==Some("unavailable"))
                     .on_click(cx.listener(|this,_,_,_|this.commands.push(json!({"op":if this.snapshot["agent"]["codexState"].as_str()==Some("signedIn"){"agent.logout"}else{"agent.login"}}))))))
-            .child(div().text_xs().child("Codex 提供策划和推理能力；它与下面的声音共同属于同一个 DJ。"))
-            .child(self.toggle("takeover","允许 DJ 自动接管","takeoverEnabled",cx))
+            .child(div().text_xs().child("Codex 提供策划和推理能力；它与下面的声音共同属于同一个角色。"))
+            .child(self.toggle("takeover","允许角色自动接管","takeoverEnabled",cx))
             .child(div().text_xs().child("可以自主切歌、暂停、继续、重排节目和调整视觉。"))
             .child(div().flex().justify_between().items_center().child("策划模型").child(div().w(px(220.)).child(Input::new(&self.inputs[2])))))
-            .child(group("DJ 人格与偏好").child(div().h(px(150.)).min_h(px(150.)).flex_shrink_0()
-                .child(Textarea::new(&self.personas[1]).h(px(150.)).aria_label("DJ 人格与偏好").accessibility_id("dj-host-prompt")))
-            .child(div().flex().justify_between().items_center().gap_3().child(div().flex_1().min_w(px(0.)).text_sm().child("用自然语言告诉 DJ 怎么策划和主持。"))
+            .child(group("角色人格与偏好").child(div().h(px(150.)).min_h(px(150.)).flex_shrink_0()
+                .child(Textarea::new(&self.personas[1]).h(px(150.)).aria_label("角色人格与偏好").accessibility_id("dj-host-prompt")))
+            .child(div().flex().justify_between().items_center().gap_3().child(div().flex_1().min_w(px(0.)).text_sm().child("用自然语言告诉角色怎么策划和主持。"))
                 .child(Button::new("save-dj").flex_shrink_0().primary().label("保存").on_click(cx.listener(|this,_,_,cx|this.commands.push(json!({"op":"agent.save","hostPrompt":this.personas[1].read(cx).value().to_string()})))))))
             .child(group("居民人格").child(div().h(px(120.)).min_h(px(120.)).flex_shrink_0()
                 .child(Textarea::new(&self.personas[0]).h(px(120.)).aria_label("居民人格").accessibility_id("resident-persona")))
-            .child(div().flex().justify_between().items_center().gap_3().child(div().flex_1().min_w(px(0.)).text_sm().child("只影响居民，和上面的 DJ 偏好分开。人格只改语气和关注点，不改变它能做什么。"))
+            .child(div().flex().justify_between().items_center().gap_3().child(div().flex_1().min_w(px(0.)).text_sm().child("只影响居民，和上面的角色偏好分开。人格只改语气和关注点，不改变它能做什么。"))
                 .child(Button::new("save-resident").flex_shrink_0().primary().label("保存").on_click(cx.listener(|this,_,_,cx|this.commands.push(json!({"op":"agent.save","residentPersona":this.personas[0].read(cx).value().to_string()})))))))
             .child(group("聊天模型")
             .child(self.dropdown("backend","模型","agent","backendID",self.options("agent","backends"),cx))
             .children(self.snapshot["agent"]["backendStatus"].as_str().map(|status|div().text_xs().child(status.to_owned())))
-            .child(div().text_xs().child("空间和 Live Cam 共用这里选定的 Agent；文字和语音转写进入同一个会话。"))
+            .child(div().text_xs().child("空间和 Live Cam 共用这里选定的 Agent；文字和语音转写进入同一个会话。")))
+            .child(group("自主行动")
             .child(self.toggle("autonomy","允许居民自主安排活动","autonomyEnabled",cx))
             .child(div().text_xs().child("打开后，居民会自己观察和行动，会消耗模型额度。设为 0 就不再新起一轮，要先停下请按停止。"))
             .child(self.dropdown("budget","每小时后台思考预算","agent","backgroundTurnsPerHour",self.options("agent","budgetOptions"),cx))
@@ -774,7 +801,7 @@ impl AgentSettingsPane {
     fn basic_form(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut form = div().flex().flex_col().gap_3();
         let border = cx.theme().border;
-        let group = |title: &'static str| SettingsGroup::new(title, border);
+        let group = |title: &'static str| SettingsGroup::new(title, border).visible(match self.section.as_str(){"角色管理"=>matches!(title,"角色"|"呼吸球样式"),"动作管理"=>matches!(title,"动作"|"动作库"),"我的空间"=>title=="默认空间","生成服务"=>title!="默认空间",_=>true});
         match self.page {
             0 => {
                 let mut roles = group("角色");
@@ -1276,16 +1303,28 @@ impl AgentSettingsPane {
 
 impl Render for AgentSettingsPane {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        use gpui_kit::component::tab::{Tab, TabBar};
-        let titles = ["角色", "音乐", "空间", "快捷键", "DJ"];
-        let (title, subtitle) = match self.page {
-            0 => ("角色与动作", "选择 DJ 的形象与表演动作"),
-            1 => ("音乐", "DJ 可以使用的账号"),
+        use gpui_kit::component::sidebar::{Sidebar, SidebarMenu, SidebarMenuItem};
+        let (_title, subtitle) = match self.page {
+            0 => ("角色与动作", "选择角色的形象与表演动作"),
+            1 => ("音乐", "角色可以使用的账号"),
             2 => ("空间", "选择默认空间，并管理空间生成服务"),
             3 => ("快捷键", "点击按键框，再按下新的组合键"),
+            5 => ("播放器", "字幕、3D 点阵与视频效果"),
+            6 => ("空间", "选择生活空间，调整空间功能"),
+            7 => ("活动", "选择与控制空间生活活动"),
             _ => ("Agent 与语音", "文字和语音共用同一会话，回答后再朗读"),
         };
-        let content = if self.page == 4 {
+        let content = if self.page>=5 {
+            self.stage_pane.as_ref().map(|pane| {
+                let mut content=div().flex().flex_col().gap_4().child(div().h(px(380.)).child(pane.clone()));
+                if self.page==6{content=content.child(SettingsGroup::new("默认空间",cx.theme().border)
+                    .child(self.dropdown("default-space","启动时进入","space","defaultSpace",self.options("space","options"),cx))
+                    .child(div().text_xs().child(self.snapshot["space"]["options"].as_array().into_iter().flatten().find(|value|value["id"]==self.draft["space"]["defaultSpace"]).and_then(|value|value["detail"].as_str()).unwrap_or("").to_owned()))
+                    .child(div().text_xs().child("修改后下次启动生效。")));}
+                content.into_any_element()
+            })
+                .unwrap_or_else(|| div().into_any_element())
+        } else if self.page == 4 {
             self.dj_form(cx)
         } else {
             self.basic_form(cx)
@@ -1302,7 +1341,7 @@ impl Render for AgentSettingsPane {
                     .flex()
                     .flex_col()
                     .gap(px(3.))
-                    .child(div().text_size(px(ui::TITLE)).font_weight(FontWeight::SEMIBOLD).child(title))
+                    .child(div().text_size(px(ui::TITLE)).font_weight(FontWeight::SEMIBOLD).child(self.section.clone()))
                     .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(subtitle)),
             );
         if self.page == 0 {
@@ -1344,36 +1383,6 @@ impl Render for AgentSettingsPane {
             .flex_col()
             .bg(cx.theme().tokens.background)
             .text_color(cx.theme().foreground)
-            .child(
-                div()
-                    .flex()
-                    .justify_center()
-                    .pt(px(14.))
-                    .pb(px(8.))
-                    .flex_shrink_0()
-                    .child(
-                        TabBar::new("settings-tabs")
-                            .segmented()
-                            .small()
-                            .w(px(330.))
-                            .h(px(24.))
-                            .selected_index(self.page)
-                            .children(titles.map(|title| Tab::new().flex_1().min_w(px(0.)).text_xs().label(title)))
-                            .on_click(cx.listener(|this, index: &usize, _, cx| {
-                                if this.page==4&&*index!=4{this.commands.push(json!({"op":"speech.settings.cancel"}));}
-                                if this.page==2&&*index!=2{this.commands.push(json!({"op":"space.prop.cancel"}));}
-                                if this.page == 3 && *index != 3 {
-                                    this.commands.push(json!({"op":"shortcuts.cancel"}));
-                                }
-                                this.page = *index;
-                                if *index == 0 {
-                                    this.commands.push(json!({"op":"presence.load"}));
-                                }
-                                if *index==4{this.commands.push(json!({"op":"speech.settings.load"}));}
-                                cx.notify();
-                            })),
-                    ),
-            )
             .child(header)
             .child(
                 div()
@@ -1385,12 +1394,13 @@ impl Render for AgentSettingsPane {
                     .pb(px(14.))
                     .child(content),
             );
+        let notice_key=["presence", "music", "space", "shortcuts", "agent"].get(self.page).copied().unwrap_or("stage");
         if let Some(notice) = self.snapshot
-            [["presence", "music", "space", "shortcuts", "agent"][self.page]]["notice"]
+            [notice_key]["notice"]
             .as_str()
             .filter(|_|self.page!=3)
         {
-            let error=self.snapshot[["presence","music","space","shortcuts","agent"][self.page]]["hasError"].as_bool()==Some(true);
+            let error=self.snapshot[notice_key]["hasError"].as_bool()==Some(true);
             root = root.child(
                 div()
                     .flex().items_center().gap(px(7.))
@@ -1405,7 +1415,23 @@ impl Render for AgentSettingsPane {
                     .child(notice.to_owned()),
             );
         }
-        root
+        let mut menu=SidebarMenu::new();
+        for (label,items) in [
+            ("播放器",vec![("player","歌词"),("player","视觉效果"),("player","视频")]),
+            ("空间",vec![("space","我的空间"),("space-preferences","生成服务")]),
+            ("角色",vec![("presence","角色管理"),("presence","动作管理"),("agent","自主行动")]),
+            ("音乐",vec![("music","音乐账号与歌单同步")]),
+            ("对话与语音",vec![("agent","Agent 连接"),("agent","语音播放"),("agent","按住说话")]),
+            ("应用",vec![("shortcuts","快捷键")]),
+        ] {
+            let active=items.iter().any(|(_,section)|*section==self.section);
+            let children=items.into_iter().map(|(key,section)|SidebarMenuItem::new(section).active(self.section==section)
+                .on_click(cx.listener(move|this,_,_,cx|this.select_section(key,section,cx)))).collect::<Vec<_>>();
+            menu=menu.child(SidebarMenuItem::new(label).active(active).children(children));
+        }
+        div().size_full().flex().bg(cx.theme().background).text_color(cx.theme().foreground)
+            .child(Sidebar::new("settings-sidebar").w(px(200.)).child(menu))
+            .child(div().flex_1().min_w(px(0.)).h_full().child(root))
     }
 }
 

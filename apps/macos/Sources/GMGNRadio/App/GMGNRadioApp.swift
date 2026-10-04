@@ -373,6 +373,7 @@ struct GMGNRadioApp: App {
     /// 时会按属性默认值创建一批 store，所以 `CFFIXED_USER_HOME` 必须在它之前设好。
     init() {
         E2ERuntime.bootstrap()
+        ResidentAutonomySwitch.registerDefaults()
     }
 
     var body: some Scene {
@@ -1771,6 +1772,7 @@ final class AppDelegate:
         // 显式测试（GMGN_E2E_DATA_ROOT）在**任何持久化/偏好读取之前**建立隔离根；
         // 未设置时是一次零副作用的 no-op，生产行为逐字节不变。
         E2ERuntime.bootstrap()
+        ResidentAutonomySwitch.registerDefaults()
         ApplicationIconInstaller().install()
         let shortcuts = GMGNShortcutCoordinator(
             settings: shortcutSettings,
@@ -5999,7 +6001,7 @@ final class AppDelegate:
     /// 内容视图不在），调用方必须把这一次点击说成"没有发出去"。
     private func closeResidentPropEditorForFetch() -> Bool {
         if stageWindowController?.isDecorationEditorOpen == true {
-            stageWindowController?.toggleDecorationEditor()
+            stageWindowController?.closeDecorationEditor()
         }
         return stageWindowController?.isDecorationEditorOpen != true && residentPropEditingWorldID == nil
     }
@@ -6731,10 +6733,13 @@ final class AppDelegate:
                 synchronizeWishMachinePresentation()
                 return true
             }
+            let alreadyPlaced = existing.stage == .claimed ? residentWishPlacementAlreadyCompleted(existing) : nil
             _ = try wishMachineCoordinator.resumeContinuations(id: id, worldID: scope.worldID,
                 residentScope: scope.residentScope, authorizationID: UUID(),
-                placementAlreadyCompleted: existing.stage == .claimed
-                    ? residentWishPlacementAlreadyCompleted(existing) : nil)
+                placementAlreadyCompleted: alreadyPlaced)
+            if alreadyPlaced == true {
+                showResidentVoiceStatus("自主行动已恢复。原物件已摆放，无需重复领取或摆放。")
+            }
         } catch {
             showResidentVoiceStatus("恢复自动领取失败：\(error.localizedDescription)")
             synchronizeWishMachinePresentation()
@@ -8476,7 +8481,6 @@ final class AppDelegate:
     private enum ResidentSubmissionSource { case stage, liveCam }
 
     private func sendResidentSubmission(_ submission: ResidentChatSubmission, source: ResidentSubmissionSource) async throws {
-        guard residentPropEditingWorldID == nil else { throw ResidentPropHostError.editorOpen }
         let imageURLs = submission.attachments.map(\.url)
         // **居民图片链[2] 提交**的日志不在这里：这个方法被多个离线 harness 原文抽取
         // 编译（test-living-resident-loop / test-resident-loop-app /
@@ -8484,6 +8488,13 @@ final class AppDelegate:
         // [2] 由 `ResidentAgentLoop.receiveUserMessage`（紧跟其后的同一入口）与
         // [4]/[7]（`AgentConversationService.validateImageSupport` / `send`）打出。
         try AgentConversationService.shared.validateImageSupport(imageURLs: imageURLs)
+        // A human submission ends the manual placement session through its real
+        // close lifecycle, including when GPUI has hidden that panel. Do not
+        // clear the token alone: preview cancellation and grid shutdown belong
+        // to the editor callback. Execution/world-write guards remain intact.
+        if residentPropEditingWorldID != nil {
+            guard closeResidentPropEditorForFetch() else { throw ResidentPropHostError.editorOpen }
+        }
         disconnectRealtimeVoice()
         let loop = ensureResidentLoop()
         // 用户已接手：旧的「未确认送达」提示不再显示；模型上下文仍保留这些条目，

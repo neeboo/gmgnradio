@@ -20,6 +20,9 @@ pub const STAGE_PANEL_HEIGHT: f32 = 458.;
 pub(crate) fn style_choice_accessibility(title: &str, name: &str, selected: bool) -> (Role, String) {
     (Role::Button, format!("{title}：{name}{}", if selected { "，已选择" } else { "" }))
 }
+pub(crate) fn player_section_includes(section:&str,key:&str)->bool{
+    match section{"歌词"=>key=="lyrics","视觉效果"=>key=="clouds","视频"=>key=="videoModes",_=>true}
+}
 
 fn video_asset_actions(player:&Value,asset:&Value)->Vec<(&'static str,Value,bool)>{
     let id=asset["id"].clone();
@@ -59,6 +62,8 @@ pub struct StagePanelsPane {
     snapshot: Value,
     commands: Vec<Value>,
     tab: usize,
+    embedded: bool,
+    section: String,
     initialized: bool,
     motion_category: String,
     sliders: Vec<Entity<SliderState>>,
@@ -87,6 +92,8 @@ impl StagePanelsPane {
             snapshot: Value::Null,
             commands: vec![json!({"op":"stage.load"})],
             tab: 1,
+            embedded: false,
+            section: String::new(),
             initialized: false,
             motion_category: String::new(),
             sliders,
@@ -97,6 +104,11 @@ impl StagePanelsPane {
     pub fn take_commands(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.commands)
     }
+    pub fn set_embedded(&mut self, embedded: bool, cx: &mut Context<Self>) {
+        self.embedded = embedded;
+        cx.notify();
+    }
+    pub fn select_section(&mut self, section:&str,cx:&mut Context<Self>){self.section=section.into();cx.notify();}
     pub fn select_tab(&mut self, tab: &str, cx: &mut Context<Self>) {
         self.tab = match tab {
             "player" => 0,
@@ -454,6 +466,7 @@ impl StagePanelsPane {
             ("clouds", "3D 点阵", "stage.player.cloud", "cloudID"),
             ("videoModes", "MV 场景", "stage.video.mode", "videoMode"),
         ] {
+            if self.embedded && !player_section_includes(&self.section,key){continue;}
             let columns = if key == "lyrics" { 5 } else { 4 };
             let tile_width = (544. - 6. * (columns as f32 - 1.)) / columns as f32;
             let mut choices = div().flex().flex_wrap().gap(px(6.));
@@ -527,6 +540,7 @@ impl StagePanelsPane {
                 );
             }
         }
+        if !self.embedded || self.section=="视频" {
         form = form.child(
             div()
                 .flex()
@@ -586,6 +600,7 @@ impl StagePanelsPane {
                     menu
                 }));
         }
+        }
         form.into_any_element()
     }
 }
@@ -614,6 +629,12 @@ impl Render for StagePanelsPane {
             3 => self.activities(cx),
             _ => self.space(cx),
         };
+        if self.embedded {
+            return div().size_full().min_h(px(0.)).font_family(cx.theme().font_family.clone())
+                .text_size(px(ui::BODY)).text_color(cx.theme().foreground)
+                .child(div().id("embedded-stage-scroll").size_full().overflow_y_scroll().child(body))
+                .into_any_element();
+        }
         div()
             .font_family(cx.theme().font_family.clone())
             .text_size(px(ui::BODY))
@@ -660,6 +681,6 @@ impl Render for StagePanelsPane {
                             .overflow_y_scroll()
                             .child(body),
                     ),
-            )
+            ).into_any_element()
     }
 }
