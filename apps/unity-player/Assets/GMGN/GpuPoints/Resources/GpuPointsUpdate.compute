@@ -1,0 +1,20 @@
+#pragma kernel UpdatePoints
+struct Point { float4 position; float4 color; float4 timing; };
+StructuredBuffer<Point> _Seeds;
+RWStructuredBuffer<Point> _Points;
+uint _PointCount;
+float _Clock;
+float4 _Features;
+[numthreads(64, 1, 1)]
+void UpdatePoints(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _PointCount) return;
+    Point p = _Seeds[id.x];
+    uint band = (uint)clamp(p.timing.z, 0, 2);
+    float energy = _Features[band] * _Features.w;
+    float highlighted = step(p.timing.x, _Clock) * step(_Clock, p.timing.y);
+    p.position.y += sin(_Clock * 3 + p.timing.w) * energy * .12;
+    p.position.w *= 1 + energy * .5;
+    p.color.rgb = lerp(p.color.rgb, float3(.1, .85, 1), highlighted * .75);
+    _Points[id.x] = p;
+}

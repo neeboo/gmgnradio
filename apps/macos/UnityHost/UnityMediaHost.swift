@@ -10,6 +10,7 @@ final class UnityMediaHost {
     let graph: AudioGraphController
     let player: LocalMusicPlayer
     let chat: RenderHostResidentConversation
+    let world: UnityWorldBridge
     private var session: UInt64 = 0
     private var lines: [StageLyricLine] = []
     private var lyricRevision: UInt64 = 0
@@ -26,6 +27,7 @@ final class UnityMediaHost {
     private var queueIndex = 0
 
     init(root: URL, defaults: UserDefaults) throws {
+        world = UnityWorldBridge(root: root)
         graph = AudioGraphController(visualStore: features)
         player = LocalMusicPlayer(graph: graph)
         chat = try RenderHostResidentConversation(backend: "dsh", dataRoot: root, defaults: defaults)
@@ -62,6 +64,8 @@ final class UnityMediaHost {
     func command(_ value: [String: Any]) -> Bool {
         do {
             switch value["op"] as? String {
+            case "world.snapshot", "world.commit":
+                return world.command(value)
             case "music.choose":
                 guard openPanel == nil else { return false }
                 let panel = NSOpenPanel()
@@ -157,7 +161,7 @@ final class UnityMediaHost {
         conversation["capabilities"] = ["streamingReplies": true, "deltaTextMode": "replace",
             "cancelActiveReply": true, "cancellationAcknowledgement": "local-turn-invalidated",
             "providerCancellationAcknowledgement": false]
-        return ["version": 1, "music": music, "chat": conversation]
+        return ["version": 1, "music": music, "chat": conversation, "world": world.snapshot()]
     }
 
     func close() {
@@ -166,6 +170,7 @@ final class UnityMediaHost {
         openPanel = nil
         player.stop()
         chat.close()
+        world.close()
     }
 }
 

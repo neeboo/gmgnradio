@@ -106,6 +106,19 @@ namespace GMGN.UnityPlayer
             if (backend == null) { status.text = "音乐与对话服务未连接"; SetConnected(false); return; }
             backend.Snapshot += OnSnapshot; backend.Chat += OnChat; backend.Status += OnStatus;
             queuePanel = QueuePanel.Attach(root.Q(className: "body"), backend);
+            if (backend is NativePlayerBackend native) {
+                var world = gameObject.AddComponent<WorldRuntimeBridge>();
+                world.Initialize(native, sculpture);
+                world.Status += OnStatus;
+                var mode = root.Q<Button>("mode");
+                mode.SetEnabled(world.Configured);
+                mode.tooltip = world.Configured ? "切换播放器与空间" : "尚未指定空间备份";
+                mode.clicked += world.Toggle;
+                world.ModeChanged += visible => {
+                    // Preserve the vector icon created above; change only its label.
+                    var label = mode.Q<Label>(); if (label != null) label.text = visible ? "空间" : "播放器";
+                };
+            }
             SetConnected(true); status.text = "音乐与角色已连接";
         }
         void SetConnected(bool ready) { connected = ready; play.SetEnabled(ready); volume.SetEnabled(ready); root.Q<Button>("next").SetEnabled(false); root.Q<Button>("previous").SetEnabled(false); root.Q<Button>("chooseMusic").SetEnabled(ready); UpdateComposer(); }

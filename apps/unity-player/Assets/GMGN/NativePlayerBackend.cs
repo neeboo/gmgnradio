@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using UnityEngine;
+using Newtonsoft.Json.Linq;
 
 namespace GMGN.UnityPlayer
 {
@@ -13,7 +14,8 @@ namespace GMGN.UnityPlayer
         [DllImport(Library)] static extern IntPtr gmgn_unity_host_snapshot(IntPtr host);
         [DllImport(Library)] static extern void gmgn_unity_host_string_free(IntPtr value);
         [DllImport(Library)] static extern int gmgn_unity_host_destroy(IntPtr host);
-        [Serializable] sealed class Envelope { public Music music; public Conversation chat; }
+        [Serializable] sealed class Envelope { public Music music; public Conversation chat; public WorldPulse world; }
+        [Serializable] sealed class WorldPulse { public ulong generation; public bool pending; public string status; }
         [Serializable] sealed class Music { public ulong playbackSessionID; public string title, notice; public double duration, position; public bool isPlaying, canNext, canPrevious, seekSupported; public int queueIndex, queueCount; public QueueItem[] queue; public float volume; public Features features; public Line[] lines; }
         [Serializable] sealed class Features { public float low, mid, high; }
         [Serializable] sealed class Line { public string text; public double start, end; }
@@ -26,6 +28,14 @@ namespace GMGN.UnityPlayer
         Line[] lyrics = Array.Empty<Line>();
         float nextPoll;
         bool playing;
+        ulong? worldGeneration;
+        public JObject WorldProjection { get; private set; }
+        public event Action<JObject> WorldUpdated;
+        public bool RequestWorldSnapshot(string worldID) => ExecuteWorld(new JObject { ["op"] = "world.snapshot", ["worldID"] = worldID });
+        public bool CommitWorld(string worldID, string requestID, ulong expectedRevision, JObject state, JObject intent)
+            => ExecuteWorld(new JObject { ["op"] = "world.commit", ["worldID"] = worldID, ["requestID"] = requestID,
+                ["expectedRevision"] = expectedRevision, ["state"] = state, ["intent"] = intent });
+        bool ExecuteWorld(JObject command) => host != IntPtr.Zero && gmgn_unity_host_command(host, command.ToString(Newtonsoft.Json.Formatting.None)) == 1;
         public event Action<PlayerSnapshot> Snapshot;
         public event Action<ChatUpdate> Chat;
         public event Action<string> Status;
@@ -53,9 +63,17 @@ namespace GMGN.UnityPlayer
             if (Time.unscaledTime < nextPoll) return;
             nextPoll = Time.unscaledTime + .05f;
             var pointer = gmgn_unity_host_snapshot(host); if (pointer == IntPtr.Zero) return;
-            Envelope value;
-            try { value = JsonUtility.FromJson<Envelope>(Marshal.PtrToStringUTF8(pointer)); }
+            Envelope value; string json;
+            try { json = Marshal.PtrToStringUTF8(pointer); value = JsonUtility.FromJson<Envelope>(json); }
             finally { gmgn_unity_host_string_free(pointer); }
+            if (value.world != null && worldGeneration != value.world.generation) {
+                worldGeneration = value.world.generation;
+                var update = JObject.Parse(json)["world"] as JObject;
+                if (update != null && update["status"] != null) {
+                    WorldProjection = update;
+                    WorldUpdated?.Invoke(update);
+                }
+            }
             if (value.music != null) {
                 var music = value.music; playing = music.isPlaying;
                 if (music.lines != null) lyrics = music.lines;

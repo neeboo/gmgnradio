@@ -1,0 +1,117 @@
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using Newtonsoft.Json.Linq;
+using UnityEngine;
+using GMGN.UnityPlayer.World;
+
+namespace GMGN.UnityPlayer
+{
+    /// Explicit read-only recovery entry. Backup assets remain immutable and Rust
+    /// remains the write authority; no autonomous actions or import are implied.
+    public sealed class WorldRuntimeBridge : MonoBehaviour
+    {
+        public event Action<string> Status;
+        public event Action<bool> ModeChanged;
+        NativePlayerBackend backend;
+        AudioSculpture sculpture;
+        GameObject worldRoot;
+        CancellationTokenSource lifetime = new();
+        string worldID, packageDirectory;
+        bool loading, visible;
+        Vector3 playerPosition;
+        Quaternion playerRotation;
+        JObject recoveredCamera;
+        float playerFieldOfView;
+        public JObject AuthorityProjection { get; private set; }
+        public bool Configured => !string.IsNullOrEmpty(worldID) && !string.IsNullOrEmpty(packageDirectory);
+
+        public void Initialize(NativePlayerBackend native, AudioSculpture player)
+        {
+            backend = native; sculpture = player;
+            worldID = Environment.GetEnvironmentVariable("GMGN_UNITY_WORLD_ID");
+            packageDirectory = Environment.GetEnvironmentVariable("GMGN_UNITY_WORLD_PACKAGE");
+            backend.WorldUpdated += OnWorldUpdated;
+            if (Configured) backend.RequestWorldSnapshot(worldID);
+        }
+
+        void OnWorldUpdated(JObject update)
+        {
+            if ((string)update["status"] == "failed") { Status?.Invoke((string)update["message"]); return; }
+            if (update["result"]?["record"] is JObject record) AuthorityProjection = (JObject)record.DeepClone();
+        }
+
+        public async void Toggle()
+        {
+            if (loading) return;
+            if (!Configured) { Status?.Invoke("请先指定空间备份目录和空间编号，再打开空间。"); return; }
+            if (worldRoot != null) { SetVisible(!visible); return; }
+            loading = true;
+            Status?.Invoke("正在读取空间备份…");
+            try
+            {
+                var token = lifetime.Token;
+                // Integrity hashing and manifest IO do not occupy the UI thread.
+                var package = await Task.Run(() => PortableWorldPackage.Open(packageDirectory), token);
+                token.ThrowIfCancellationRequested();
+                recoveredCamera = package.State(worldID)["liveCamera"] as JObject;
+                var loader = new GltfWorldAssetLoader();
+                worldRoot = new GameObject("Recovered world " + worldID);
+                var light = new GameObject("Recovery lighting").AddComponent<Light>();
+                light.transform.SetParent(worldRoot.transform, false);
+                light.type = LightType.Directional; light.intensity = 1;
+                light.transform.rotation = Quaternion.Euler(45, -30, 0);
+                var sceneReference = Environment.GetEnvironmentVariable("GMGN_UNITY_WORLD_SCENE_REFERENCE");
+                if (!string.IsNullOrEmpty(sceneReference)) {
+                    var scene = await loader.LoadSceneAsset(package.ResolveReference(sceneReference), token);
+                    scene.transform.SetParent(worldRoot.transform, false);
+                }
+                var recovery = new WorldSceneRecovery(loader);
+                var items = await recovery.Restore(package, worldID, worldRoot.transform, token);
+                token.ThrowIfCancellationRequested();
+                var restored = 0; foreach (var item in items) if (item.Status == "restored") restored++;
+                SetVisible(true);
+                Status?.Invoke($"已恢复 {restored} 个真实物件；空间包设备与人物恢复仍在迁移。");
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception error)
+            {
+                if (worldRoot != null) Destroy(worldRoot);
+                worldRoot = null;
+                Status?.Invoke(error is System.IO.InvalidDataException || error is InvalidOperationException
+                    ? error.Message : "空间恢复失败，原备份数据未修改。");
+            }
+            finally { loading = false; }
+        }
+
+        void SetVisible(bool value)
+        {
+            var camera = Camera.main;
+            if (value && !visible && camera != null) { playerPosition = camera.transform.position; playerRotation = camera.transform.rotation; playerFieldOfView = camera.fieldOfView; }
+            visible = value;
+            worldRoot.SetActive(value);
+            sculpture.enabled = !value;
+            // Both components share PlayerScreen's object. Disable the GPU
+            // dispatch/draw component too, without disabling chat or UIDocument.
+            var cloud = sculpture.GetComponent<GpuPointCloud>();
+            if (cloud != null) cloud.enabled = !value;
+            if (camera != null)
+            {
+                if (value && recoveredCamera != null) {
+                    camera.transform.SetPositionAndRotation(WorldCoordinates.Position(recoveredCamera["transform"]?["position"]),
+                        WorldCoordinates.Rotation(recoveredCamera["transform"]?["rotation"]) * Quaternion.Euler(0, 180, 0));
+                    camera.fieldOfView = (float?)recoveredCamera["fieldOfViewDegrees"] ?? 60;
+                } else if (value) { camera.transform.position = new Vector3(0, 1.6f, -4); camera.transform.LookAt(new Vector3(0, 1, 0)); }
+                else { camera.transform.SetPositionAndRotation(playerPosition, playerRotation); camera.fieldOfView = playerFieldOfView; }
+            }
+            ModeChanged?.Invoke(value);
+        }
+
+        void OnDestroy()
+        {
+            lifetime.Cancel(); lifetime.Dispose();
+            if (backend != null) backend.WorldUpdated -= OnWorldUpdated;
+            if (worldRoot != null) Destroy(worldRoot);
+        }
+    }
+}
