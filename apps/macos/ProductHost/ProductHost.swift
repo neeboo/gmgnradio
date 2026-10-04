@@ -233,8 +233,15 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
         case "showSettings": return navigate(mode: navigationMode, panel: "settings")
         case "showNotifications": return navigate(mode: navigationMode, panel: "inbox")
         case "toggleDecoration":
-            guard navigate(mode: "space") else { return false }
-            return runtime.gpuiPropCommand(["op": "stage.props.toggle"])
+            var succeeded = true
+            StageDecorationEntryAction(
+                isDecorationEditorOpen: { self.runtime.gpuiPropSnapshot()["isOpen"] as? Bool == true },
+                showStage: { succeeded = self.navigate(mode: "space") },
+                toggleDecorationEditor: {
+                    if succeeded { succeeded = self.runtime.gpuiPropCommand(["op": "stage.props.toggle"]) }
+                }
+            ).perform()
+            return succeeded
         default: break
         }
         return runtime.gpuiPerformAction(action)
@@ -321,14 +328,18 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
             let title: String
             let action: String
             switch entry {
-            case .showLiveCam: title = "显示小窗"; action = "showLiveCam"
+            case .showLiveCam: title = "显示 Live Cam"; action = "showLiveCam"
             case .enterSpace: title = "进入空间"; action = "showStage"
             case .toggleDecoration:
                 title = StageDecorationMenuTitle.resolve(isDecorating: StageDecorationMenuStore.shared.isDecorating)
                 action = "toggleDecoration"
             case .openPlayer: title = "打开播放器"; action = "showPlayer"
-            case .settings: title = "设置…"; action = "showSettings"
-            case .quit: title = "退出 gmgn radio"; action = "quit"
+            case .settings:
+                menu.addItem(.separator())
+                title = "设置…"; action = "showSettings"
+            case .quit:
+                menu.addItem(.separator())
+                title = "退出 gmgn radio"; action = "quit"
             }
             let item = NSMenuItem(title: title, action: #selector(menuAction(_:)), keyEquivalent: "")
             item.representedObject = action

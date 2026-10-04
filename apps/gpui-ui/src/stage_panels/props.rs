@@ -8,15 +8,19 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use serde_json::{Value, json};
 
+fn finish_delete(pending: &mut Option<Value>, confirmed: bool, saving: bool) -> Option<Value> {
+    pending.take().filter(|_| confirmed && !saving)
+}
+
 pub struct ResidentPropEditorPane {
     snapshot: Value,
     commands: Vec<Value>,
     confirming_delete: Option<Value>,
     size: Entity<SliderState>,
-    _subscription: Subscription,
+    _subscriptions: Vec<Subscription>,
 }
 impl ResidentPropEditorPane {
-    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let size = cx.new(|_| SliderState::new().min(0.02).max(3.).step(0.01));
         let subscription = cx.subscribe(&size, |this, _, event: &SliderEvent, cx| {
             if let SliderEvent::Release(value) = event {
@@ -30,12 +34,18 @@ impl ResidentPropEditorPane {
                 }
             }
         });
+        let owner=Window::window_handle(window);let weak=cx.entity().downgrade();
+        let escape=cx.intercept_keystrokes(move|event,window,cx|{
+            if event.keystroke.key=="escape"&&Window::window_handle(window)==owner{
+                _=weak.update(cx,|this,cx|{if this.confirming_delete.take().is_some(){window.close_dialog(cx);cx.stop_propagation();cx.notify();}});
+            }
+        });
         Self {
             snapshot: Value::Null,
             commands: vec![json!({"op":"stage.props.load"})],
             confirming_delete: None,
             size,
-            _subscription: subscription,
+            _subscriptions: vec![subscription,escape],
         }
     }
     pub fn update_snapshot(
@@ -60,6 +70,29 @@ impl ResidentPropEditorPane {
     pub fn take_commands(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.commands)
     }
+    fn open_delete(&mut self, command: Value, window: &mut Window, cx: &mut Context<Self>) {
+        let id=command["objectID"].clone();
+        let name=self.snapshot["sections"].as_array().into_iter().flatten()
+            .flat_map(|s|s["rows"].as_array().into_iter().flatten())
+            .find(|row|row["objectID"]==id).and_then(|r|r["name"].as_str())
+            .or_else(||(self.snapshot["selected"]["objectID"]==id).then(||self.snapshot["selected"]["name"].as_str()).flatten()).unwrap_or("这一件").to_owned();
+        self.confirming_delete=Some(command);
+        let weak=cx.entity().downgrade();
+        window.open_dialog(cx,move|dialog,_,cx|{
+            let saving=weak.upgrade().is_none_or(|entity|entity.read(cx).snapshot["isSaving"].as_bool()==Some(true));
+            let cancel=weak.clone();let confirm=weak.clone();let closed=weak.clone();
+            dialog.title(format!("永久删除「{name}」？")).close_button(false).overlay_closable(false)
+                .child("删除后不能恢复，它也不会再出现在「我的物件」里。")
+                .footer(div().flex().justify_end().gap_2()
+                    .child(Button::new("prop-cancel-delete").label("取消").on_click(move|_,window,cx|{
+                        _=cancel.update(cx,|this,cx|{_=finish_delete(&mut this.confirming_delete,false,false);cx.notify();});window.close_dialog(cx);
+                    }))
+                    .child(Button::new("prop-confirm-delete").danger().disabled(saving).label("永久删除").on_click(move|_,window,cx|{
+                        _=confirm.update(cx,|this,cx|{if let Some(command)=finish_delete(&mut this.confirming_delete,true,this.snapshot["isSaving"].as_bool()==Some(true)){this.commands.push(command);}cx.notify();});window.close_dialog(cx);
+                    })))
+                .on_cancel(move|_,window,cx|{_=closed.update(cx,|this,cx|{this.confirming_delete=None;cx.notify();});window.close_dialog(cx);true})
+        });
+    }
     fn button(
         &self,
         id: impl Into<ElementId>,
@@ -72,15 +105,36 @@ impl ResidentPropEditorPane {
             .with_size(gpui_kit::component::Size::Small)
             .label(label)
             .disabled(disabled || self.snapshot["isSaving"].as_bool() == Some(true))
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 if command["op"] == "stage.props.delete" {
-                    this.confirming_delete = Some(command.clone());
+                    this.open_delete(command.clone(),window,cx);
                 } else {
                     this.commands.push(command.clone());
                 }
                 cx.notify();
             }))
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::finish_delete;
+    use serde_json::json;
+    #[test]
+    fn cancellation_never_emits_delete_and_clears_confirmation() {
+        let mut pending=Some(json!({"op":"stage.props.delete","objectID":"test-only"}));
+        assert!(finish_delete(&mut pending,false,false).is_none());
+        assert!(pending.is_none());
+    }
+    #[test]
+    fn confirm_emits_original_command_once_only_when_not_saving() {
+        let command=json!({"op":"stage.props.delete","objectID":"test-only"});
+        let mut pending=Some(command.clone());
+        assert_eq!(finish_delete(&mut pending,true,false),Some(command));
+        assert!(finish_delete(&mut pending,true,false).is_none());
+        pending=Some(json!({"op":"stage.props.delete"}));
+        assert!(finish_delete(&mut pending,true,true).is_none());
     }
 }
 impl Render for ResidentPropEditorPane {
@@ -107,25 +161,10 @@ impl Render for ResidentPropEditorPane {
                         cx,
                     )),
             )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(self.button(
-                        "props-owned",
-                        "我的物件",
-                        json!({"op":"stage.props.filter","placedOnly":false}),
-                        false,
-                        cx,
-                    ))
-                    .child(self.button(
-                        "props-placed",
-                        "房间里",
-                        json!({"op":"stage.props.filter","placedOnly":true}),
-                        false,
-                        cx,
-                    )),
-            );
+            .child(TabBar::new("props-filter").segmented().small().h(px(24.)).w_full()
+                .selected_index(usize::from(self.snapshot["placedOnly"].as_bool()==Some(true)))
+                .children(["我的物件","房间里"].map(|label|Tab::new().flex_1().min_w(px(0.)).label(label)))
+                .on_click(cx.listener(|this,index:&usize,_,cx|{this.commands.push(json!({"op":"stage.props.filter","placedOnly":*index==1}));cx.notify();})));
         let mut list = div().flex().flex_col().gap_2();
         for section in self.snapshot["sections"].as_array().into_iter().flatten() {
             let group = section["group"].as_str().unwrap_or("");
@@ -201,6 +240,7 @@ impl Render for ResidentPropEditorPane {
         );
         let selected = self.snapshot["selected"].clone();
         if !selected.is_null() {
+            content=content.child(div().h(px(1.)).bg(rgb(0x34373c)));
             let points = self.snapshot["holdPoints"]
                 .as_array()
                 .cloned()
@@ -277,6 +317,7 @@ impl Render for ResidentPropEditorPane {
                             false,
                             cx,
                         ))
+                        .child(div().flex_1())
                         .child(self.button(
                             "prop-return",
                             "放回",
@@ -311,21 +352,21 @@ impl Render for ResidentPropEditorPane {
                             ))
                             .child(div().flex_1())
                             .child(slots),
-                    )
-                    .child("移动指针选位置，左键放下，右键转 45°，Esc 放回。");
+                    );
                 if let Some(reason) = selected["holdUnavailableReason"].as_str() {
                     content = content.child(reason.to_owned());
                 }
+                content=content.child("移动指针选位置，左键放下，右键转 45°，Esc 放回。");
             }
-            content = content.child(self.button(
+            content = content.child(div().flex().gap(px(8.)).child(self.button(
                 "prop-delete",
                 "删除",
                 json!({"op":"stage.props.delete","objectID":selected["objectID"]}),
                 false,
                 cx,
-            ));
+            )).child(div().flex_1()));
             if selected["held"].as_bool() != Some(true) {
-                let mut sizes = div().flex().flex_wrap().gap_1();
+                let mut sizes = div().flex().items_center().gap(px(6.));
                 for (label, delta) in [
                     ("−10 cm", -0.1),
                     ("−1 cm", -0.01),
@@ -334,16 +375,14 @@ impl Render for ResidentPropEditorPane {
                 ] {
                     sizes=sizes.child(self.button(format!("prop-size-{label}"),label,json!({"op":"stage.props.resize","value":selected["longestEdge"].as_f64().unwrap_or(0.)+delta}),false,cx));
                 }
-                content = content
+                sizes=sizes.child(div().flex_1()).child(div().text_size(px(11.)).child(format!("最长边 {:.2} m",selected["longestEdge"].as_f64().unwrap_or(0.))));
+                content = content.child(div().h(px(1.)).bg(rgb(0x34373c)))
                     .child("尺寸")
                     .child(sizes)
-                    .child(format!(
-                        "最长边 {:.2} m",
-                        selected["longestEdge"].as_f64().unwrap_or(0.)
-                    ))
                     .child(
-                        Slider::new(&self.size)
-                            .disabled(self.snapshot["isSaving"].as_bool() == Some(true)),
+                        div().flex().items_center().gap(px(8.)).child(div().flex_1().min_w(px(0.)).child(Slider::new(&self.size)
+                            .disabled(self.snapshot["isSaving"].as_bool() == Some(true))))
+                            .child(div().w(px(52.)).text_size(px(11.)).child(format!("{:.2} m",selected["longestEdge"].as_f64().unwrap_or(0.)))),
                     );
                 for key in ["sizeDescription", "sizeProvenance"] {
                     if let Some(text) = selected[key].as_str() {
@@ -351,32 +390,6 @@ impl Render for ResidentPropEditorPane {
                     }
                 }
             }
-        }
-        if let Some(command) = self.confirming_delete.clone() {
-            content =
-                content.child(
-                    div()
-                        .p_2()
-                        .rounded_lg()
-                        .bg(rgb(0x432729))
-                        .child("永久删除这件物件？删除后不能恢复，它也不会再出现在「我的物件」里。")
-                        .child(
-                            Button::new("prop-confirm-delete")
-                                .disabled(self.snapshot["isSaving"].as_bool() == Some(true))
-                                .label("永久删除")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.commands.push(command.clone());
-                                    this.confirming_delete = None;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(Button::new("prop-cancel-delete").label("取消").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.confirming_delete = None;
-                                cx.notify();
-                            }),
-                        )),
-                );
         }
         let mut legend = div().flex().gap(px(10.));
         for item in self.snapshot["legend"].as_array().into_iter().flatten() {

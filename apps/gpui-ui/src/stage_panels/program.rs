@@ -30,11 +30,43 @@ fn energy_height(energy: f32, index: usize) -> f32 {
     5. + 13. * energy * (0.36 + ((index + 1) as f32 * 1.7).sin().abs() * 0.64)
 }
 
+const TRACK_HEIGHT: f32 = 76.;
+const TRACK_SPACING: f32 = -7.;
+const PROGRAM_SPACING: f32 = 4.;
+
+fn card_priority(card: &Value, distance_bias: usize) -> usize {
+    if card["isFocused"]
+        .as_bool()
+        .unwrap_or(card["isCurrent"].as_bool() == Some(true))
+        || card["isCurrent"].as_bool() == Some(true)
+    {
+        20 + distance_bias
+    } else {
+        (10 + distance_bias)
+            .saturating_sub(card["relativeIndex"].as_i64().unwrap_or(0).unsigned_abs() as usize)
+    }
+}
+
+// Restore view-aligned settling with the original 18pt inset. Swift's
+// `.always` velocity-dependent view limit is distinct from `.alwaysByOne`;
+// GPUI does not expose that native target calculation, so do not invent a
+// one-card restriction that would prevent browsing the real library.
+fn snap_offset(offset: f32, maximum: f32) -> f32 {
+    let stride = TRACK_HEIGHT + TRACK_SPACING;
+    if -offset >= maximum {
+        return -maximum;
+    }
+    let target = (-offset / stride).round();
+    -(target * stride).clamp(0., maximum)
+}
+
 pub struct StageProgramRailPane {
     snapshot: Value,
     commands: Vec<Value>,
     scroll: ScrollHandle,
     center_active: bool,
+    scroll_start: Option<f32>,
+    snap_task: Option<Task<()>>,
 }
 impl StageProgramRailPane {
     pub fn new(_window: &mut Window, _cx: &mut Context<Self>) -> Self {
@@ -43,6 +75,8 @@ impl StageProgramRailPane {
             commands: vec![json!({"op":"stage.program.load"})],
             scroll: ScrollHandle::new(),
             center_active: true,
+            scroll_start: None,
+            snap_task: None,
         }
     }
     pub fn update_snapshot(
@@ -66,6 +100,8 @@ impl StageProgramRailPane {
                 || active(&self.snapshot) != active(&snapshot)
             {
                 self.center_active = true;
+                self.snap_task = None;
+                self.scroll_start = None;
             }
             self.snapshot = snapshot;
             cx.notify();
@@ -119,7 +155,11 @@ impl Render for StageProgramRailPane {
             .flex()
             .flex_col()
             .items_end()
-            .gap(px(if tracks { -7. } else { 8. }))
+            .gap(px(if tracks {
+                TRACK_SPACING
+            } else {
+                PROGRAM_SPACING
+            }))
             .py(px(18.));
         let mut header = div()
             .flex()
@@ -128,6 +168,15 @@ impl Render for StageProgramRailPane {
             .px(px(14.))
             .w_full();
         if tracks {
+            // Preserve negative Swift zIndex values by shifting every priority
+            // equally, rather than collapsing all distant cards to zero.
+            let distance_bias = self.snapshot["tracks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|card| card["relativeIndex"].as_i64().unwrap_or(0).unsigned_abs() as usize)
+                .max()
+                .unwrap_or(0);
             header = header
                 .child(self.icon_button(
                     "program-back",
@@ -307,7 +356,10 @@ impl Render for StageProgramRailPane {
                             )),
                     );
                 }
-                content = content.child(row);
+                // GPUI deferred paint preserves measured order/positions and
+                // provides the original card zIndex without reordering tracks.
+                content =
+                    content.child(deferred(row).with_priority(card_priority(card, distance_bias)));
             }
             if self.snapshot["hasMore"].as_bool() == Some(true) {
                 content = content.child(self.button(
@@ -402,18 +454,57 @@ impl Render for StageProgramRailPane {
                     .min_h(px(0.))
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
+                    .on_scroll_wheel(cx.listener(
+                        move |this, event: &ScrollWheelEvent, window, cx| {
+                            if !tracks {
+                                return;
+                            }
+                            if this.scroll_start.is_none()
+                                || event.touch_phase == TouchPhase::Started
+                            {
+                                this.scroll_start = Some(this.scroll.offset().y.into());
+                            }
+                            if event.touch_phase == TouchPhase::Cancelled {
+                                this.snap_task = None;
+                                this.scroll_start = None;
+                                return;
+                            }
+                            // macOS GPUI does not expose momentumPhase. Wait for
+                            // wheel activity to cease, including momentum events.
+                            this.snap_task = Some(cx.spawn_in(window, async move |view, cx| {
+                                cx.background_executor()
+                                    .timer(std::time::Duration::from_millis(140))
+                                    .await;
+                                _ = view.update_in(cx, |this, _, cx| {
+                                    if this.scroll_start.take().is_some() {
+                                        let offset: f32 = this.scroll.offset().y.into();
+                                        let maximum: f32 = this.scroll.max_offset().y.into();
+                                        this.scroll.set_offset(point(
+                                            px(0.),
+                                            px(snap_offset(offset, maximum.abs())),
+                                        ));
+                                        cx.notify();
+                                    }
+                                });
+                            }));
+                        },
+                    ))
                     .child(content),
             )
     }
 }
 
 fn active_center_offset(index: usize, viewport: f32, maximum: f32) -> f32 {
-    -(18. + index as f32 * (76. - 7.) + 38. - viewport / 2.).clamp(0., maximum)
+    -(18. + index as f32 * (TRACK_HEIGHT + TRACK_SPACING) + TRACK_HEIGHT / 2. - viewport / 2.)
+        .clamp(0., maximum)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{active_center_offset, energy_height, project_card};
+    use super::{
+        PROGRAM_SPACING, TRACK_SPACING, active_center_offset, card_priority, energy_height,
+        project_card, snap_offset,
+    };
     use serde_json::json;
     #[test]
     fn visual_depth_does_not_change_original_card_layout() {
@@ -432,6 +523,39 @@ mod tests {
         assert_eq!(active_center_offset(0, 300., 900.), 0.);
         assert_eq!(active_center_offset(4, 300., 900.), -182.);
         assert_eq!(active_center_offset(30, 300., 900.), -900.);
+    }
+    #[test]
+    fn catalog_and_track_spacing_match_swift() {
+        assert_eq!(PROGRAM_SPACING, 4.);
+        assert_eq!(TRACK_SPACING, -7.);
+    }
+    #[test]
+    fn focused_and_current_cards_paint_above_neighbours_without_reordering() {
+        assert_eq!(
+            card_priority(&json!({"isFocused":true,"relativeIndex":2}), 0),
+            20
+        );
+        assert_eq!(
+            card_priority(
+                &json!({"isFocused":false,"isCurrent":true,"relativeIndex":0}),
+                0
+            ),
+            20
+        );
+        assert_eq!(card_priority(&json!({"relativeIndex":-2}), 0), 8);
+        assert_eq!(card_priority(&json!({"relativeIndex":1}), 0), 9);
+        assert!(
+            card_priority(&json!({"relativeIndex":-20}), 30)
+                > card_priority(&json!({"relativeIndex":30}), 30)
+        );
+    }
+    #[test]
+    fn snapping_aligns_card_preserves_browsing_and_reaches_end() {
+        assert_eq!(snap_offset(-90., 900.), -69.);
+        assert_eq!(snap_offset(-110., 900.), -138.);
+        assert_eq!(snap_offset(-600., 900.), -621.);
+        assert_eq!(snap_offset(40., 900.), 0.);
+        assert_eq!(snap_offset(-1000., 970.), -970.);
     }
     #[test]
     fn focus_restores_visibility_without_mutating_host_card() {

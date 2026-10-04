@@ -829,8 +829,12 @@ impl<'a> Scene<'a> {
         let mut rows = vec![];
         let mut content_height = 0.;
         let spacing = size * 0.08;
-        for segment in items(&self.snapshot["tilt"], "segments") {
-            if time < num(&segment, "revealAt", f64::MAX) {
+        let lifecycle_segments = self.snapshot["_presentation"]["renderSegments"].as_array();
+        let segments = lifecycle_segments
+            .cloned()
+            .unwrap_or_else(|| items(&self.snapshot["tilt"], "segments"));
+        for segment in segments {
+            if lifecycle_segments.is_none() && time < num(&segment, "revealAt", f64::MAX) {
                 continue;
             }
             let tilted = segment["isTilted"].as_bool() == Some(true);
@@ -846,9 +850,9 @@ impl<'a> Scene<'a> {
             let font = size * if tilted { 1.14 } else { 1. };
             let height = self.text_height(&value, font, frame_width, usize::MAX);
             if !rows.is_empty() {
-                content_height += spacing * progress;
+                content_height += spacing * progress.max(0.);
             }
-            content_height += height * progress;
+            content_height += height * progress.max(0.);
             rows.push((segment, tilted, progress, font, height, value));
         }
         self.weight = 500;
@@ -877,7 +881,7 @@ impl<'a> Scene<'a> {
             rows.into_iter().enumerate()
         {
             if index > 0 {
-                top += spacing * progress;
+                top += spacing * progress.max(0.);
             }
             self.weight = if tilted { 300 } else { 700 };
             self.italic = tilted;
@@ -901,7 +905,7 @@ impl<'a> Scene<'a> {
                     + self.rail(104.)
                     + scale * (offset_x * c - offset_y * s)
                     + (if tilted { 34. } else { -22. }) * (1. - progress),
-                top + height * progress / 2. - 14. + scale * (offset_x * s + offset_y * c),
+                top + height * progress.max(0.) / 2. - 14. + scale * (offset_x * s + offset_y * c),
                 rotation,
                 scale,
             ));
@@ -922,7 +926,7 @@ impl<'a> Scene<'a> {
                 "start",
             );
             self.local = None;
-            top += height * progress;
+            top += height * progress.max(0.);
         }
         self.italic = false;
         self.text_filter = "url(#textShadow)".to_owned();
@@ -1434,7 +1438,123 @@ pub struct StageLyricsPane {
     render_error: Option<String>,
     outgoing: Option<Value>,
     transition_started: f64,
-    segment_starts: HashMap<String, f64>,
+    segments: SegmentLifecycle,
+}
+const SEGMENT_RESPONSE: f64 = 0.55;
+const SEGMENT_DAMPING: f64 = 0.82;
+const SEGMENT_SETTLE: f64 = SEGMENT_RESPONSE * 3.;
+#[derive(Clone, Debug)]
+struct SegmentTransition {
+    segment: Value,
+    order: usize,
+    started: f64,
+    from: f64,
+    velocity: f64,
+    target: f64,
+}
+impl SegmentTransition {
+    fn sample(&self, now: f64) -> (f64, f64) {
+        let elapsed = (now - self.started).max(0.);
+        if elapsed >= SEGMENT_SETTLE {
+            return (self.target, 0.);
+        }
+        let omega = std::f64::consts::TAU / SEGMENT_RESPONSE;
+        let decay = SEGMENT_DAMPING * omega;
+        let frequency = omega * (1. - SEGMENT_DAMPING * SEGMENT_DAMPING).sqrt();
+        let a = self.from - self.target;
+        let b = (self.velocity + decay * a) / frequency;
+        let (s, c) = (frequency * elapsed).sin_cos();
+        let exponential = (-decay * elapsed).exp();
+        let displacement = a * c + b * s;
+        (
+            self.target + exponential * displacement,
+            exponential * ((-a * s + b * c) * frequency - decay * displacement),
+        )
+    }
+    fn retarget(&mut self, target: f64, now: f64) {
+        if self.target == target {
+            return;
+        }
+        let (from, velocity) = self.sample(now);
+        self.from = from;
+        self.velocity = velocity;
+        self.target = target;
+        self.started = now;
+    }
+}
+#[derive(Default)]
+struct SegmentLifecycle {
+    scope: Option<(String, String, String)>,
+    states: HashMap<String, SegmentTransition>,
+    last_time: f64,
+}
+impl SegmentLifecycle {
+    fn update(&mut self, snapshot: &Value) {
+        let now = num(snapshot, "animationTime", 0.);
+        let scope = (
+            text(snapshot, "trackID"),
+            text(&snapshot["flow"]["activeLine"], "id"),
+            text(snapshot, "mode"),
+        );
+        let reset = self.scope.as_ref() != Some(&scope) || now < self.last_time;
+        if reset {
+            self.states.clear();
+            self.scope = Some(scope);
+        }
+        self.last_time = now;
+        if snapshot["mode"] != "confession" {
+            self.states.clear();
+            return;
+        }
+        let playback = num(snapshot, "playbackTime", 0.);
+        let segments = items(&snapshot["tilt"], "segments");
+        for state in self.states.values_mut() {
+            if !segments
+                .iter()
+                .any(|segment| segment["id"] == state.segment["id"])
+            {
+                state.retarget(0., now);
+            }
+        }
+        for (order, segment) in segments.into_iter().enumerate() {
+            let id = text(&segment, "id");
+            let visible = playback >= num(&segment, "revealAt", f64::MAX);
+            if let Some(state) = self.states.get_mut(&id) {
+                state.segment = segment;
+                state.order = order;
+                state.retarget(if visible { 1. } else { 0. }, now);
+            } else if visible {
+                self.states.insert(
+                    id,
+                    SegmentTransition {
+                        segment,
+                        order,
+                        started: now,
+                        from: if reset { 1. } else { 0. },
+                        velocity: 0.,
+                        target: 1.,
+                    },
+                );
+            }
+        }
+        self.states
+            .retain(|_, state| state.target != 0. || now - state.started < SEGMENT_SETTLE);
+    }
+    fn presentation(&self, now: f64) -> Value {
+        let mut ordered: Vec<_> = self
+            .states
+            .iter()
+            .filter(|(_, state)| state.target != 0. || now - state.started < SEGMENT_SETTLE)
+            .collect();
+        ordered.sort_by_key(|(_, state)| state.order);
+        let mut progress = serde_json::Map::new();
+        let mut segments = vec![];
+        for (id, state) in ordered {
+            progress.insert(id.clone(), json!(state.sample(now).0));
+            segments.push(state.segment.clone());
+        }
+        json!({"segments":progress,"renderSegments":segments})
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum TransitionCurve {
@@ -1598,7 +1718,7 @@ impl StageLyricsPane {
             render_error: None,
             outgoing: None,
             transition_started: 0.,
-            segment_starts: HashMap::new(),
+            segments: SegmentLifecycle::default(),
         }
     }
     pub fn update_snapshot(
@@ -1614,28 +1734,7 @@ impl StageLyricsPane {
                 self.outgoing = (!self.snapshot.is_null()).then(|| self.snapshot.clone());
                 self.transition_started = num(&snapshot, "animationTime", 0.);
             }
-            if self.snapshot["trackID"] != snapshot["trackID"]
-                || self.snapshot["mode"] != snapshot["mode"]
-            {
-                self.segment_starts.clear();
-            }
-            let now = num(&snapshot, "animationTime", 0.);
-            let playback = num(&snapshot, "playbackTime", 0.);
-            let visible: Vec<String> = items(&snapshot["tilt"], "segments")
-                .iter()
-                .filter(|segment| playback >= num(segment, "revealAt", f64::MAX))
-                .map(|segment| text(segment, "id"))
-                .collect();
-            self.segment_starts.retain(|id, _| visible.contains(id));
-            for id in visible {
-                self.segment_starts
-                    .entry(id)
-                    .or_insert(if self.snapshot.is_null() {
-                        now - 2.
-                    } else {
-                        now
-                    });
-            }
+            self.segments.update(&snapshot);
             self.snapshot = snapshot;
             cx.notify();
         }
@@ -1668,14 +1767,7 @@ impl Render for StageLyricsPane {
         let elapsed = (now - self.transition_started).max(0.);
         let spec = transition_spec(self.snapshot["mode"].as_str().unwrap_or(""));
         let mut snapshot = self.snapshot.clone();
-        let mut segments = serde_json::Map::new();
-        for (id, start) in &self.segment_starts {
-            segments.insert(
-                id.clone(),
-                json!(spring_progress((now - start).max(0.), 0.55, 0.82)),
-            );
-        }
-        snapshot["_presentation"] = json!({"segments":segments});
+        snapshot["_presentation"] = self.segments.presentation(now);
         if spec.depth && elapsed < spec.duration() {
             if let Some(old) = &self.outgoing {
                 snapshot = depth_transition(&snapshot, old, spec.progress(elapsed));
@@ -2474,6 +2566,114 @@ mod outline {
 mod tests {
     use super::{Scene, escape};
     use serde_json::json;
+    fn segment_snapshot(animation: f64, playback: f64) -> serde_json::Value {
+        json!({"trackID":"track","mode":"confession","animationTime":animation,"playbackTime":playback,"flow":{"activeLine":{"id":"line","text":"test"}},"tilt":{"segments":[{"id":"first","text":"first","revealAt":0.,"isTilted":false},{"id":"second","text":"second","revealAt":2.,"isTilted":true},{"id":"third","text":"third","revealAt":4.,"isTilted":false}]}})
+    }
+    #[test]
+    fn seek_backward_keeps_exiting_segments_until_original_spring_settles() {
+        let mut lifecycle = super::SegmentLifecycle::default();
+        lifecycle.update(&segment_snapshot(10., 5.));
+        let mut reversed = segment_snapshot(11., 1.);
+        lifecycle.update(&reversed);
+        let start = lifecycle.presentation(11.);
+        assert_eq!(start["renderSegments"].as_array().unwrap().len(), 3);
+        assert_eq!(start["segments"]["second"], 1.);
+        let half = lifecycle.presentation(11.1);
+        let progress = half["segments"]["second"].as_f64().unwrap();
+        assert!(progress > 0. && progress < 1.);
+        // Original transition offsets are tilted +34 and normal -22; their
+        // existing renderer now receives exit progress instead of deletion.
+        reversed["_presentation"] = half;
+        let svg = Scene::new(&reversed, 1000., 700.).finish();
+        assert!(svg.contains("aria-label=\"second\""));
+        assert!(svg.contains("aria-label=\"third\""));
+        let end = 11. + super::SEGMENT_SETTLE;
+        let settled = lifecycle.presentation(end);
+        assert_eq!(settled["renderSegments"].as_array().unwrap().len(), 1);
+        reversed["_presentation"] = settled;
+        let svg = Scene::new(&reversed, 1000., 700.).finish();
+        assert!(!svg.contains("aria-label=\"second\""));
+        lifecycle.update(&segment_snapshot(end, 1.));
+        assert_eq!(lifecycle.states.len(), 1);
+    }
+    #[test]
+    fn segment_reentry_preserves_position_and_velocity_without_duplicate_rows() {
+        let mut lifecycle = super::SegmentLifecycle::default();
+        lifecycle.update(&segment_snapshot(10., 5.));
+        lifecycle.update(&segment_snapshot(11., 1.));
+        let before = lifecycle.states["second"].sample(11.1);
+        lifecycle.update(&segment_snapshot(11.1, 3.));
+        let after = lifecycle.states["second"].sample(11.1);
+        assert!((before.0 - after.0).abs() < 1e-12);
+        assert!((before.1 - after.1).abs() < 1e-12);
+        assert_eq!(lifecycle.states["second"].target, 1.);
+        assert_eq!(
+            lifecycle.presentation(11.1)["renderSegments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|segment| segment["id"] == "second")
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn exit_uses_animation_time_even_when_playback_is_paused() {
+        let mut lifecycle = super::SegmentLifecycle::default();
+        lifecycle.update(&segment_snapshot(10., 5.));
+        lifecycle.update(&segment_snapshot(11., 1.));
+        let first = lifecycle.presentation(11.)["segments"]["second"]
+            .as_f64()
+            .unwrap();
+        lifecycle.update(&segment_snapshot(11.2, 1.));
+        let next = lifecycle.presentation(11.2)["segments"]["second"]
+            .as_f64()
+            .unwrap();
+        assert!(next < first);
+    }
+    #[test]
+    fn segment_scope_changes_drop_old_track_line_and_mode_lifecycles() {
+        for key in ["trackID", "line", "mode"] {
+            let mut lifecycle = super::SegmentLifecycle::default();
+            lifecycle.update(&segment_snapshot(10., 5.));
+            lifecycle.update(&segment_snapshot(11., 1.));
+            let mut changed = segment_snapshot(11.1, 1.);
+            if key == "line" {
+                changed["flow"]["activeLine"]["id"] = json!("new-line");
+            } else {
+                changed[key] = json!(if key == "mode" {
+                    "luminous"
+                } else {
+                    "new-track"
+                });
+            }
+            lifecycle.update(&changed);
+            assert!(!lifecycle.states.contains_key("second"));
+            assert!(!lifecycle.states.contains_key("third"));
+        }
+    }
+    #[test]
+    fn missing_model_segment_can_exit_using_only_its_prior_real_snapshot() {
+        let mut lifecycle = super::SegmentLifecycle::default();
+        lifecycle.update(&segment_snapshot(10., 5.));
+        let mut changed = segment_snapshot(11., 5.);
+        changed["tilt"]["segments"]
+            .as_array_mut()
+            .unwrap()
+            .truncate(1);
+        lifecycle.update(&changed);
+        assert_eq!(
+            lifecycle.presentation(11.)["renderSegments"][1]["id"],
+            "second"
+        );
+        assert_eq!(
+            lifecycle.presentation(11. + super::SEGMENT_SETTLE)["renderSegments"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
     #[test]
     fn confession_uses_original_leading_frame_projection() {
         let panel = super::confession_panel(1000., 700.);

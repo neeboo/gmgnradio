@@ -210,7 +210,22 @@ try test.run()
 test.waitUntilExit()
 let testExit = test.terminationStatus
 
+let productHost = try String(contentsOf: root.appendingPathComponent("apps/macos/ProductHost/ProductHost.swift"), encoding: .utf8)
+let productAction = declaration("func action(_ action: String)", in: productHost)
+let productMenu = declaration("private func rebuildMenu(", in: productHost)
+let productChecks: [(Bool, String)] = [
+    (productAction.contains("StageDecorationEntryAction(") && productAction.contains("self.runtime.gpuiPropSnapshot()[\"isOpen\"]"),
+     "GPUI decoration uses the same production open/close policy and actual editor state"),
+    (productAction.contains("showStage: { succeeded = self.navigate(mode: \"space\") }") && productAction.contains("if succeeded { succeeded = self.runtime.gpuiPropCommand"),
+     "GPUI only navigates for opening and does not toggle after failed navigation"),
+    (productMenu.contains("title = \"显示 Live Cam\"") && productMenu.components(separatedBy: "menu.addItem(.separator())").count == 3,
+     "GPUI tray retains original Live Cam title and settings/quit separators")
+]
 var wiringFailures = 0
+for (ok, label) in productChecks where !ok {
+    wiringFailures += 1
+    print("FAIL: \(label)")
+}
 for (ok, label) in wiringChecks where !ok {
     wiringFailures += 1
     print("FAIL: \(label)")

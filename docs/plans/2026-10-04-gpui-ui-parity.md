@@ -285,3 +285,13 @@ v24实际选择Orb→应用菜单显示小窗，Kit引导覆盖真实船舱且�
 本批歌词confession按原整体投影/实际行高/斜体/分段参数及glyph phase补齐；节目恒294×76/306×74、右对齐负间距、header重排、角落视频与实际当前曲目居中已实现。完整UI50测试通过的前轮证据不等于真实歌词和曲目视觉；真3D卡投影、渐隐/层级/吸附、歌词seek退出及投影前滤镜、真实歌曲11模式、其余全部业务验收仍未完成。继续保持完整目标，不能报告所有UI对齐完成。
 
 本批最终源代码复验：gpui-ui完整50测试通过、gpui-app完整10测试通过，均exit0；日志分别为`/tmp/gmgn-gpui-v24-ui-tests.log`和`/tmp/gmgn-gpui-v24-app-tests.log`。`git diff --check`通过。上述单测与真实App子路径证据分别记录，不替代尚未完成的完整布局和功能验收。ASR录音仍暂停。
+
+### 原菜单与物件确认继续对齐
+
+上一轮属于实际进展：源代码dcbd203a222f6a2f752a6c83380bb7e2d830efe0已推送并远端读回一致，工作区干净。继续在v24/PID89871真实App打开装修→现有E2E端到端电视→删除确认，只点击取消；资产行与世界均保留。选中该资产后出现挂点/尺寸等原业务控件，按Esc后选中控件消失，恢复原摆放，未放置、修改尺寸或删除。实际确认当前为内嵌红块，与原Swift confirmationDialog有布局差异，已分配props.rs改用Kit真实弹窗；此项不能计完整对齐。
+
+源代码核对原StageDecorationEntryAction要求已装修时只关闭、不重新呈现空间；ProductHost原无条件navigate已修为复用原helper，并恢复原显示Live Cam文案和设置/退出前分隔线。原helper19checks与GPUI接线合同测试exit0，宿主build20 exit0，日志`/tmp/gmgn-gpui-decoration-menu-test.log`、`/tmp/gmgn-gpui-menu-build20.log`；新包实际菜单复验尚待执行。节目滚动/3D与歌词退出生命周期仍继续返工，未扩大完成声明。
+
+v25完整包构建exit0，日志`/tmp/gmgn-gpui-product-app-build-v25.log`；实际启动路径`tmp/gpui-product-app-v25/gmgn radio.app`、PID92957，同一业务数据根，日志`/tmp/gmgn-gpui-parity-v25-runtime.log`。只退出v24测试包，不碰安装版。CUA实际打开摆放，物件两格标签已为segmented；删除弹窗独立显示真实资产名、原不可恢复说明、取消及危险确认，底下面板未再被红块撑长。实际Escape关闭，重开后点取消也关闭；同一资产行、原人物与世界继续可见。没有执行永久删除。此取消/布局子路径通过，不代表全部摆放/手持或模态穿透验收通过。
+
+节目补原列表4pt间距、保序绘制层级、真实ScrollHandle停滚边界吸附；歌词confession补退出段生命周期、倒退/重入/换scope清理，使用实际snapshot而非生产fixture。最终完整UI测试exit0，日志`/tmp/gmgn-gpui-v25-ui-tests.log`。真实节目目录为空，这些卡片/歌词视觉仍未业务验收。原速度限幅、真3D投影/磨砂与alpha渐隐、歌词其他模式细节仍欠；props行横排/状态色、分组头及滑块草稿读数仍欠。菜单新包实际状态项未操作，继续待验。下一批真实投影可走Rust整卡RGBA+inverse homography合成，但只是只读可行性结论，尚未实现或实测。
