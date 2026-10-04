@@ -14,7 +14,7 @@ namespace GMGN.UnityPlayer
         [DllImport(Library)] static extern void gmgn_unity_host_string_free(IntPtr value);
         [DllImport(Library)] static extern int gmgn_unity_host_destroy(IntPtr host);
         [Serializable] sealed class Envelope { public Music music; public Conversation chat; }
-        [Serializable] sealed class Music { public ulong playbackSessionID; public string title, notice; public double duration, position; public bool isPlaying; public float volume; public Features features; public Line[] lines; }
+        [Serializable] sealed class Music { public ulong playbackSessionID; public string title, notice; public double duration, position; public bool isPlaying, canNext, canPrevious, seekSupported; public float volume; public Features features; public Line[] lines; }
         [Serializable] sealed class Features { public float low, mid, high; }
         [Serializable] sealed class Line { public string text; public double start, end; }
         [Serializable] sealed class Conversation { public Event[] events; }
@@ -39,7 +39,13 @@ namespace GMGN.UnityPlayer
             host = gmgn_unity_host_create(root, "ai.gmgn.unity-sample.player.preferences");
             if (host == IntPtr.Zero) throw new InvalidOperationException("无法启动隔离音乐与对话服务。");
             var path = Environment.GetEnvironmentVariable("GMGN_UNITY_MUSIC_PATH");
-            if (!string.IsNullOrEmpty(path)) Execute(new Command { op = "music.load", path = path, lyricPath = Environment.GetEnvironmentVariable("GMGN_UNITY_LRC_PATH"), autoplay = true });
+            if (!string.IsNullOrEmpty(path)) {
+                var lyricPath = Environment.GetEnvironmentVariable("GMGN_UNITY_LRC_PATH");
+                // JsonUtility serializes an unset string as empty, not JSON null.
+                if (string.IsNullOrEmpty(lyricPath)) lyricPath = System.IO.Path.ChangeExtension(path, ".lrc");
+                if (!Execute(new Command { op = "music.load", path = path, lyricPath = lyricPath, autoplay = true }))
+                    Debug.LogWarning("启动音乐未载入；请通过选择音乐重试。");
+            }
         }
         bool Execute(Command command) => gmgn_unity_host_command(host, JsonUtility.ToJson(command)) == 1;
         public void Tick()
@@ -55,7 +61,7 @@ namespace GMGN.UnityPlayer
                 if (music.lines != null) lyrics = music.lines;
                 string lyric = "";
                 foreach (var line in lyrics) { if (music.position >= line.start && music.position < line.end) { lyric = line.text; break; } }
-                Snapshot?.Invoke(new PlayerSnapshot { sessionId = music.playbackSessionID.ToString(), title = music.title, duration = music.duration, position = music.position, playing = music.isPlaying, volume = music.volume, lyric = lyric, bass = music.features?.low ?? 0, vocal = music.features?.mid ?? 0, treble = music.features?.high ?? 0 });
+                Snapshot?.Invoke(new PlayerSnapshot { sessionId = music.playbackSessionID.ToString(), title = music.title, duration = music.duration, position = music.position, playing = music.isPlaying, nextSupported = music.canNext, previousSupported = music.canPrevious, seekSupported = music.seekSupported, volume = music.volume, lyric = lyric, bass = music.features?.low ?? 0, vocal = music.features?.mid ?? 0, treble = music.features?.high ?? 0 });
                 if (!string.IsNullOrEmpty(music.notice)) Status?.Invoke(music.notice);
             }
             if (value.chat?.events == null) return;
@@ -69,7 +75,8 @@ namespace GMGN.UnityPlayer
         }
         public void PlayPause() => Execute(new Command { op = playing ? "music.pause" : "music.play" });
         public void ChooseMusic() => Execute(new Command { op = "music.choose" });
-        public void Next() => Status?.Invoke("此样板尚未接入曲目队列。");
+        public void Next() => Execute(new Command { op = "music.next" });
+        public void Previous() => Execute(new Command { op = "music.previous" });
         public void Seek(double seconds) => Status?.Invoke("当前音乐后端尚未提供跳转。");
         public void SetVolume(float volume) => Execute(new Command { op = "music.volume", value = volume });
         public void Send(string messageId, string text) { var id = ++sequence; requestIds[id] = messageId; if (!Execute(new Command { op = "chat.send", requestID = id, text = text })) { requestIds.Remove(id); Chat?.Invoke(new ChatUpdate { messageId = messageId, error = "消息未发送，请重试。", complete = true }); } }

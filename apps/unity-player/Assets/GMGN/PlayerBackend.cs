@@ -6,7 +6,7 @@ namespace GMGN.UnityPlayer
     {
         public string sessionId, title, artist, lyric, translation;
         public double position, duration;
-        public bool playing, seekSupported, nextSupported;
+        public bool playing, seekSupported, nextSupported, previousSupported;
         public float volume, bass, vocal, treble;
     }
     public sealed class ChatUpdate
@@ -23,6 +23,7 @@ namespace GMGN.UnityPlayer
         void PlayPause();
         void ChooseMusic();
         void Next();
+        void Previous();
         void Seek(double seconds);
         void SetVolume(float volume);
         void Send(string messageId, string text);

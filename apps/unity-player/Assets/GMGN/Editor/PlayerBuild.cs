@@ -12,6 +12,7 @@ namespace GMGN.UnityPlayer.Editor
         public static void Prepare()
         {
             PlayerSettings.productName = "GMGN Unity Sample";
+            PlayerSettings.runInBackground = true;
             PlayerSettings.SetApplicationIdentifier(NamedBuildTarget.Standalone, "ai.gmgn.unity-sample.player");
             PlayerSettings.fullScreenMode = FullScreenMode.Windowed;
             PlayerSettings.defaultScreenWidth = 1440;
@@ -25,7 +26,7 @@ namespace GMGN.UnityPlayer.Editor
             const string panelPath = "Assets/GMGN/Resources/PlayerPanel.asset";
             var panel = AssetDatabase.LoadAssetAtPath<PanelSettings>(panelPath);
             if (panel == null) { panel = ScriptableObject.CreateInstance<PanelSettings>(); AssetDatabase.CreateAsset(panel, panelPath); }
-            panel.scaleMode = PanelScaleMode.ScaleWithScreenSize;
+            panel.scaleMode = PanelScaleMode.ConstantPixelSize;
             panel.referenceResolution = new Vector2Int(1440, 900);
             var theme = AssetDatabase.LoadAssetAtPath<ThemeStyleSheet>("Assets/GMGN/Resources/PlayerTheme.tss");
             panel.themeStyleSheet = theme;

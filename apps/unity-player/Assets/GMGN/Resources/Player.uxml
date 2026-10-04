@@ -1,40 +1,52 @@
 <ui:UXML xmlns:ui="UnityEngine.UIElements">
   <ui:Style src="Player.uss" />
-  <ui:VisualElement class="shell">
-    <ui:VisualElement class="header">
-      <ui:Label text="GMGN · 音乐与角色" class="heading" />
-      <ui:Label name="status" text="正在连接音乐与对话服务…" class="status muted" />
+  <ui:VisualElement class="shell" picking-mode="Ignore">
+    <ui:VisualElement class="header" picking-mode="Ignore">
+      <ui:Label name="status" text="正在连接音乐与角色…" class="status muted" picking-mode="Ignore" />
+      <ui:Button name="mode" text="播放器" tooltip="当前为音乐播放器；空间尚未迁移" class="mode" enabled="false" />
     </ui:VisualElement>
-    <ui:VisualElement class="body">
-      <ui:VisualElement class="stage-column">
-        <ui:VisualElement class="stage-space" picking-mode="Ignore" />
-        <ui:VisualElement class="lyrics">
-          <ui:Label name="lyric" text="播放音乐后，歌词将在这里显示" class="lyric" />
-          <ui:Label name="translation" class="translation" />
+    <ui:VisualElement class="body" picking-mode="Ignore">
+      <ui:VisualElement class="lyrics" picking-mode="Ignore">
+        <ui:Label name="lyric" class="lyric" picking-mode="Ignore" />
+        <ui:Label name="translation" class="translation" picking-mode="Ignore" />
+      </ui:VisualElement>
+      <ui:VisualElement name="chatPanel" class="chat-column card hidden">
+        <ui:VisualElement class="chat-header row">
+          <ui:Label text="与角色聊天" class="subtitle" />
+          <ui:Button name="closeChat" tooltip="收起聊天" class="icon-button" />
         </ui:VisualElement>
-        <ui:VisualElement class="player card">
-          <ui:Label name="track" text="尚未播放" class="heading" />
-          <ui:Label name="artist" class="muted" />
-          <ui:Slider name="seek" low-value="0" high-value="1" />
-          <ui:VisualElement class="row">
-            <ui:Button name="chooseMusic" text="打开音乐" />
-            <ui:Button name="play" text="播放" />
-            <ui:Button name="next" text="下一首" />
-            <ui:Label name="time" text="0:00 / 0:00" class="time muted" />
-            <ui:Slider name="volume" label="音量" low-value="0" high-value="1" value="0.8" class="volume" />
-          </ui:VisualElement>
+        <ui:Label name="emptyChat" text="可以聊音乐，也可以说说今天的事。" class="empty-chat muted" />
+        <ui:ListView name="messages" virtualization-method="DynamicHeight" selection-type="None" class="messages" />
+        <ui:Button name="newMessages" text="查看新消息" class="hidden new-messages" />
+        <ui:TextField name="draft" multiline="true" class="draft" />
+        <ui:VisualElement class="composer-footer row">
+          <ui:Label text="Enter 发送 · Shift+Enter 换行" class="hint muted" />
+          <ui:Button name="cancel" tooltip="停止回复" class="icon-button hidden" />
+          <ui:Button name="send" tooltip="发送消息" class="icon-button primary" />
         </ui:VisualElement>
       </ui:VisualElement>
-      <ui:VisualElement class="chat-column card">
-        <ui:Label text="与角色聊天" class="heading" />
-        <ui:Label name="emptyChat" text="可以聊音乐，也可以和角色说说今天的事。" class="empty-chat muted" />
-        <ui:ListView name="messages" virtualization-method="DynamicHeight" selection-type="None" class="messages" />
-        <ui:Button name="newMessages" text="查看新消息 ↓" class="hidden" />
-        <ui:TextField name="draft" multiline="true" class="draft" />
-        <ui:VisualElement class="row">
-          <ui:Label text="Enter 发送 · Shift+Enter 换行" class="hint muted" />
-          <ui:Button name="cancel" text="停止" />
-          <ui:Button name="send" text="发送" class="primary" />
+      <ui:VisualElement class="player card">
+        <ui:VisualElement class="track-row row">
+          <ui:Label name="track" text="尚未播放" class="track-title" />
+          <ui:Label name="artist" class="artist muted" />
+          <ui:Label name="time" text="0:00 / 0:00" class="time muted" />
+        </ui:VisualElement>
+        <ui:Slider name="seek" low-value="0" high-value="1" class="seek" />
+        <ui:VisualElement class="toolbar row">
+          <ui:Button name="chooseMusic" tooltip="打开本地音乐" class="icon-button" />
+          <ui:Button name="previous" tooltip="上一首尚未接入" class="icon-button" enabled="false" />
+          <ui:Button name="play" tooltip="播放" class="icon-button" />
+          <ui:Button name="next" tooltip="下一首" class="icon-button" />
+          <ui:VisualElement class="separator" />
+          <ui:Button name="microphone" tooltip="按住说话尚未迁移" class="icon-button" enabled="false" />
+          <ui:Button name="chatToggle" tooltip="与角色聊天" class="icon-button" />
+          <ui:Button name="inbox" tooltip="通知尚未迁移" class="icon-button" enabled="false" />
+          <ui:Button name="props" tooltip="物件与摆放尚未迁移" class="icon-button" enabled="false" />
+          <ui:Button name="screen" tooltip="空间播放器尚未迁移" class="icon-button" enabled="false" />
+          <ui:VisualElement class="toolbar-spacer" />
+          <ui:Slider name="volume" tooltip="音量" low-value="0" high-value="1" value="0.8" class="volume" />
+          <ui:Button name="settings" text="设置" tooltip="统一设置尚未迁移" class="settings-button" enabled="false" />
+          <ui:Button name="fullscreen" tooltip="切换全屏" class="icon-button" />
         </ui:VisualElement>
       </ui:VisualElement>
     </ui:VisualElement>

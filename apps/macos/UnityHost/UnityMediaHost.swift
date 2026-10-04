@@ -18,11 +18,45 @@ final class UnityMediaHost {
     private var openPanel: NSOpenPanel?
     private var closed = false
     private var pausedPosition: TimeInterval?
+    private struct QueueEntry {
+        let url: URL
+        let lyricURL: URL?
+    }
+    private var queue: [QueueEntry] = []
+    private var queueIndex = 0
 
     init(root: URL, defaults: UserDefaults) throws {
         graph = AudioGraphController(visualStore: features)
         player = LocalMusicPlayer(graph: graph)
         chat = try RenderHostResidentConversation(backend: "dsh", dataRoot: root, defaults: defaults)
+        player.setCompletionHandler { [weak self] in
+            guard let self, self.queueIndex + 1 < self.queue.count else { return }
+            _ = self.command(["op": "music.next"])
+        }
+    }
+
+    private func entry(path: String, lyricPath: String? = nil) -> QueueEntry {
+        let url = URL(fileURLWithPath: path)
+        let adjacent = url.deletingPathExtension().appendingPathExtension("lrc")
+        let lyric = lyricPath.map { URL(fileURLWithPath: $0) }
+            ?? (FileManager.default.fileExists(atPath: adjacent.path) ? adjacent : nil)
+        return QueueEntry(url: url, lyricURL: lyric)
+    }
+
+    private func loadQueueEntry(autoplay: Bool) throws {
+        let selected = queue[queueIndex]
+        session &+= 1
+        pausedPosition = nil
+        lyricRevision &+= 1
+        lines = []
+        player.stop()
+        try player.load(selected.url)
+        // A bad optional lyric must not prevent an otherwise valid song playing.
+        if let lyric = selected.lyricURL,
+           let text = try? String(contentsOf: lyric, encoding: .utf8) {
+            lines = StageLyricsParser().parse(MusicLyrics(original: text, translation: nil), trackDuration: player.track?.duration)
+        }
+        if autoplay { try player.play() }
     }
 
     func command(_ value: [String: Any]) -> Bool {
@@ -33,17 +67,14 @@ final class UnityMediaHost {
                 let panel = NSOpenPanel()
                 panel.title = "选择音乐"
                 panel.allowedContentTypes = [.audio]
-                panel.allowsMultipleSelection = false
+                panel.allowsMultipleSelection = true
                 panel.canChooseDirectories = false
                 openPanel = panel
                 let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
                     guard let self else { return }
                     self.openPanel = nil
-                    guard !self.closed, response == .OK, let url = panel.url else { return }
-                    var load: [String: Any] = ["op": "music.load", "path": url.path, "autoplay": true]
-                    let lrc = url.deletingPathExtension().appendingPathExtension("lrc")
-                    if FileManager.default.fileExists(atPath: lrc.path) { load["lyricPath"] = lrc.path }
-                    _ = self.command(load)
+                    guard !self.closed, response == .OK, !panel.urls.isEmpty else { return }
+                    _ = self.command(["op": "music.queue", "paths": panel.urls.map(\.path), "autoplay": true])
                 }
                 if let window = NSApplication.shared.keyWindow {
                     panel.beginSheetModal(for: window, completionHandler: completion)
@@ -51,17 +82,28 @@ final class UnityMediaHost {
                 return true
             case "music.load":
                 guard let path = value["path"] as? String, path.hasPrefix("/") else { return false }
-                session &+= 1
-                pausedPosition = nil
-                lyricRevision &+= 1
-                lines = []
-                player.stop()
-                try player.load(URL(fileURLWithPath: path))
-                if let lyricPath = value["lyricPath"] as? String, lyricPath.hasPrefix("/") {
-                    let text = try String(contentsOfFile: lyricPath, encoding: .utf8)
-                    lines = StageLyricsParser().parse(MusicLyrics(original: text, translation: nil), trackDuration: player.track?.duration)
-                }
-                if value["autoplay"] as? Bool == true { try player.play() }
+                let rawLyric = value["lyricPath"] as? String
+                let lyric = rawLyric.flatMap { $0.isEmpty ? nil : $0 }
+                guard lyric == nil || lyric!.hasPrefix("/") else { return false }
+                queue = [entry(path: path, lyricPath: lyric)]
+                queueIndex = 0
+                try loadQueueEntry(autoplay: value["autoplay"] as? Bool == true)
+            case "music.queue":
+                guard let paths = value["paths"] as? [String], !paths.isEmpty,
+                      paths.allSatisfy({ $0.hasPrefix("/") }) else { return false }
+                let index = value["index"] as? Int ?? 0
+                guard paths.indices.contains(index) else { return false }
+                queue = paths.map { entry(path: $0) }
+                queueIndex = index
+                try loadQueueEntry(autoplay: value["autoplay"] as? Bool == true)
+            case "music.next":
+                guard queueIndex + 1 < queue.count else { return false }
+                queueIndex += 1
+                try loadQueueEntry(autoplay: true)
+            case "music.previous":
+                guard queueIndex > 0 else { return false }
+                queueIndex -= 1
+                try loadQueueEntry(autoplay: true)
             case "music.play":
                 try player.play()
                 pausedPosition = nil
@@ -94,6 +136,9 @@ final class UnityMediaHost {
             "title": player.track?.title ?? "", "duration": player.track?.duration ?? 0,
             "position": pausedPosition ?? player.playbackPosition, "isPlaying": player.isGraphPlaying,
             "volume": graph.musicVolume, "seekSupported": false,
+            "canNext": queueIndex + 1 < queue.count, "canPrevious": queueIndex > 0,
+            "queueIndex": queueIndex, "queueCount": queue.count,
+            "queue": queue.enumerated().map { ["index": $0.offset, "title": $0.element.url.deletingPathExtension().lastPathComponent] },
             "features": ["amplitude": f.amplitude, "low": f.low, "mid": f.mid,
                          "high": f.high, "beat": f.beat, "onset": f.onset],
             "lyricRevision": lyricRevision,

@@ -18,7 +18,9 @@ Commands are UTF-8 JSON, at most 256 KiB:
 
 - `music.load`: absolute `path`, optional real local `lyricPath` (LRC), `autoplay`.
 - `music.choose`: nonblocking native audio-file picker; automatically loads and
-  plays the selected real file and an adjacent same-basename `.lrc` when present.
+  plays selected real files as a queue and adjacent same-basename `.lrc` files.
+- `music.queue`: `paths` of absolute real files, optional `index` (default 0),
+  `autoplay`. `music.next` and `music.previous` switch this retained queue.
 - `music.play`, `music.pause`, `music.stop`.
 - `music.volume`: numeric `value` in 0–1.
 - `chat.send`: integer `requestID`, string `text`.
@@ -33,8 +35,7 @@ must retain the timeline until the next revision. Every snapshot consumes chat
 events; use one polling owner and dispatch to UI consumers. Free every returned
 UTF-8 snapshot with `gmgn_unity_host_string_free`.
 
-Known sample gaps: seeking is explicitly unsupported; next-track needs a real
-caller-owned queue; provider library/search selection and streaming reply deltas
+Known sample gaps: seeking is explicitly unsupported; provider library/search selection and streaming reply deltas
 are not implemented here. Chat currently reports accepted/final reply/failure/
 cancelled with request IDs and sequence numbers. These gaps are not represented
 as successful or simulated functionality.
@@ -59,3 +60,9 @@ actual audio graph play/pause/resume/stop clock, briefly producing audio. The
 pause regression check passed with the existing real music cache: 0.673 seconds
 before pause, 0.673 while paused, 0.998 after resume, 0 after stop. Unity window
 acceptance remains a separate check.
+
+Snapshot also exposes `canNext`, `canPrevious`, `queueIndex`, `queueCount` and
+`queue:[{index,title}]`; boundary commands fail without wrapping. Each queue
+switch increments playback session and lyric revision and clears previous lyrics.
+Actual-component smoke tests with two different existing music-cache MP3s passed
+next/previous, real sample-clock advancement, session changes and boundaries.
