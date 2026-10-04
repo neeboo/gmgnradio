@@ -882,8 +882,18 @@ final class AgentConversationService {
 
     // MARK: Installation
 
-    func installedBackends() -> [AgentConversationBackend] {
-        AgentConversationBackends.all.filter { isInstalled($0.kind) }
+    private var installedBackendCache: (checkedAt: Date, backends: [AgentConversationBackend])?
+
+    func installedBackends(refresh: Bool = false) -> [AgentConversationBackend] {
+        let now = Date()
+        if !refresh, let cached = installedBackendCache,
+           now.timeIntervalSince(cached.checkedAt) >= 0,
+           now.timeIntervalSince(cached.checkedAt) < 5 {
+            return cached.backends
+        }
+        let backends = AgentConversationBackends.all.filter { isInstalled($0.kind) }
+        installedBackendCache = (now, backends)
+        return backends
     }
 
     /// 是否至少有一个真正可用的对话后端。DSH 既可能通过 PATH 上的 `dsh` 安装，

@@ -490,6 +490,7 @@ private final class GPUIProductSettings {
         guard let op = value["op"] as? String else { return false }
         switch op {
         case "settings.load":
+            _ = AgentConversationService.shared.installedBackends(refresh: true)
             agent.refreshConversationBackends()
             loadCapabilities()
             parity.load()
@@ -682,7 +683,7 @@ private func withProductHost<T: Sendable>(_ pointer: UnsafeMutableRawPointer?, _
 }
 
 @_cdecl("gmgn_product_host_create")
-func gmgnProductHostCreate() -> UnsafeMutableRawPointer? {
+public func gmgnProductHostCreate() -> UnsafeMutableRawPointer? {
     guard Thread.isMainThread else { return nil }
     E2ERuntime.bootstrap()
     let address = MainActor.assumeIsolated { UInt(bitPattern: Unmanaged.passRetained(GPUIProductHost()).toOpaque()) }
@@ -690,13 +691,13 @@ func gmgnProductHostCreate() -> UnsafeMutableRawPointer? {
 }
 
 @_cdecl("gmgn_product_host_start")
-func gmgnProductHostStart(_ pointer: UnsafeMutableRawPointer?) -> Int32 { withProductHost(pointer) { $0.start() ? 1 : 0 } ?? 0 }
+public func gmgnProductHostStart(_ pointer: UnsafeMutableRawPointer?) -> Int32 { withProductHost(pointer) { $0.start() ? 1 : 0 } ?? 0 }
 
 @_cdecl("gmgn_product_host_shutdown")
-func gmgnProductHostShutdown(_ pointer: UnsafeMutableRawPointer?) -> Int32 { withProductHost(pointer) { $0.shutdown(); return 1 } ?? 0 }
+public func gmgnProductHostShutdown(_ pointer: UnsafeMutableRawPointer?) -> Int32 { withProductHost(pointer) { $0.shutdown(); return 1 } ?? 0 }
 
 @_cdecl("gmgn_product_host_destroy")
-func gmgnProductHostDestroy(_ pointer: UnsafeMutableRawPointer?) -> Int32 {
+public func gmgnProductHostDestroy(_ pointer: UnsafeMutableRawPointer?) -> Int32 {
     guard Thread.isMainThread, let pointer else { return 0 }
     let address = UInt(bitPattern: pointer)
     return MainActor.assumeIsolated {
@@ -707,14 +708,14 @@ func gmgnProductHostDestroy(_ pointer: UnsafeMutableRawPointer?) -> Int32 {
 }
 
 @_cdecl("gmgn_product_host_action")
-func gmgnProductHostAction(_ pointer: UnsafeMutableRawPointer?, _ action: UnsafePointer<CChar>?) -> Int32 {
+public func gmgnProductHostAction(_ pointer: UnsafeMutableRawPointer?, _ action: UnsafePointer<CChar>?) -> Int32 {
     guard let action else { return 0 }
     let name = String(cString: action)
     return withProductHost(pointer) { $0.action(name) ? 1 : 0 } ?? 0
 }
 
 @_cdecl("gmgn_product_host_settings_command")
-func gmgnProductHostSettingsCommand(_ pointer: UnsafeMutableRawPointer?, _ json: UnsafePointer<CChar>?) -> Int32 {
+public func gmgnProductHostSettingsCommand(_ pointer: UnsafeMutableRawPointer?, _ json: UnsafePointer<CChar>?) -> Int32 {
     guard Thread.isMainThread, let json,
           let data = String(cString: json).data(using: .utf8), data.count <= 90 * 1024 * 1024,
           let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return 0 }
@@ -723,19 +724,19 @@ func gmgnProductHostSettingsCommand(_ pointer: UnsafeMutableRawPointer?, _ json:
 }
 
 @_cdecl("gmgn_product_host_chat_send")
-func gmgnProductHostChatSend(_ pointer: UnsafeMutableRawPointer?, _ requestID: UInt64, _ text: UnsafePointer<CChar>?) -> Int32 {
+public func gmgnProductHostChatSend(_ pointer: UnsafeMutableRawPointer?, _ requestID: UInt64, _ text: UnsafePointer<CChar>?) -> Int32 {
     guard let text else { return 0 }
     let message = String(cString: text)
     return withProductHost(pointer) { $0.send(requestID: requestID, text: message) ? 1 : 0 } ?? 0
 }
 
 @_cdecl("gmgn_product_host_chat_cancel")
-func gmgnProductHostChatCancel(_ pointer: UnsafeMutableRawPointer?, _ requestID: UInt64) -> Int32 {
+public func gmgnProductHostChatCancel(_ pointer: UnsafeMutableRawPointer?, _ requestID: UInt64) -> Int32 {
     withProductHost(pointer) { $0.cancel(requestID: requestID) ? 1 : 0 } ?? 0
 }
 
 @_cdecl("gmgn_product_host_snapshot")
-func gmgnProductHostSnapshot(_ pointer: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>? {
+public func gmgnProductHostSnapshot(_ pointer: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>? {
     let address: UInt? = withProductHost(pointer) { host in
         guard let data = try? JSONSerialization.data(withJSONObject: host.snapshot(), options: [.sortedKeys]),
               let text = String(data: data, encoding: .utf8) else { return nil }
@@ -745,18 +746,18 @@ func gmgnProductHostSnapshot(_ pointer: UnsafeMutableRawPointer?) -> UnsafeMutab
 }
 
 @_cdecl("gmgn_product_host_chat_poll")
-func gmgnProductHostChatPoll(_ pointer: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>? { gmgnProductHostSnapshot(pointer) }
+public func gmgnProductHostChatPoll(_ pointer: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>? { gmgnProductHostSnapshot(pointer) }
 
 @_cdecl("gmgn_product_host_string_free")
-func gmgnProductHostStringFree(_ string: UnsafeMutablePointer<CChar>?) { free(string) }
+public func gmgnProductHostStringFree(_ string: UnsafeMutablePointer<CChar>?) { free(string) }
 
 @_cdecl("gmgn_product_host_reopen")
-func gmgnProductHostReopen(_ pointer: UnsafeMutableRawPointer?, _ hasVisibleWindows: Int32) -> Int32 {
+public func gmgnProductHostReopen(_ pointer: UnsafeMutableRawPointer?, _ hasVisibleWindows: Int32) -> Int32 {
     withProductHost(pointer) { $0.reopen() ? 1 : 0 } ?? 0
 }
 
 @_cdecl("gmgn_product_host_attach_surface")
-func gmgnProductHostAttachSurface(_ pointer: UnsafeMutableRawPointer?, _ container: UnsafeMutableRawPointer?, _ fullStage: Int32) -> Int32 {
+public func gmgnProductHostAttachSurface(_ pointer: UnsafeMutableRawPointer?, _ container: UnsafeMutableRawPointer?, _ fullStage: Int32) -> Int32 {
     guard let container else { return 0 }
     let address = UInt(bitPattern: container)
     return withProductHost(pointer) {
@@ -766,12 +767,12 @@ func gmgnProductHostAttachSurface(_ pointer: UnsafeMutableRawPointer?, _ contain
 }
 
 @_cdecl("gmgn_product_host_surface_visibility")
-func gmgnProductHostSurfaceVisibility(_ pointer: UnsafeMutableRawPointer?, _ visible: Int32, _ occluded: Int32) -> Int32 {
+public func gmgnProductHostSurfaceVisibility(_ pointer: UnsafeMutableRawPointer?, _ visible: Int32, _ occluded: Int32) -> Int32 {
     withProductHost(pointer) { $0.runtime.gpuiSurfaceVisibility(visible != 0, occluded: occluded != 0) ? 1 : 0 } ?? 0
 }
 
 @_cdecl("gmgn_product_host_surface_rotate")
-func gmgnProductHostSurfaceRotate(_ pointer: UnsafeMutableRawPointer?, _ yaw: Float, _ pitch: Float) -> Int32 {
+public func gmgnProductHostSurfaceRotate(_ pointer: UnsafeMutableRawPointer?, _ yaw: Float, _ pitch: Float) -> Int32 {
     guard yaw.isFinite, pitch.isFinite else { return 0 }
     return withProductHost(pointer) { $0.runtime.gpuiRotateSurface(yaw: yaw, pitch: pitch); return 1 } ?? 0
 }
