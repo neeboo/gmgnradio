@@ -4,13 +4,13 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 destination="${1:-$root/tmp/gpui-product-app/gmgn radio.app}"
 case "$destination" in "$root/tmp/"*.app) ;; *) echo 'Expected an absolute isolated tmp App destination' >&2; exit 2;; esac
 [[ ! -e "$destination" ]] || { echo 'Destination exists; use a fresh App path' >&2; exit 2; }
-products="$root/tmp/gpui-product-host/DerivedData/Build/Products/Debug"
+products="$root/tmp/gpui-product-host/DerivedData/Build/Products/Release"
 source_app="$root/tmp/e2e-app-build/DerivedData/Build/Products/Release/gmgn radio.app"
 [[ -f "$products/GPUIProductHost.dylib" && -f "$products/default.metallib" ]] || { echo 'Build ProductHost first' >&2; exit 1; }
 python3 "$root/tools/verify-helper-manifest.py" --app "$source_app" --require-screen-link
-cargo +1.95.0 build --manifest-path "$root/apps/gpui-app/Cargo.toml" --locked --offline --target-dir "$root/tools/gpui-scenekit-probe/target"
+cargo +1.95.0 build --release --manifest-path "$root/apps/gpui-app/Cargo.toml" --locked --offline --target-dir "$root/tools/gpui-scenekit-probe/target"
 mkdir -p "$destination/Contents/MacOS" "$destination/Contents/Frameworks" "$destination/Contents/Resources"
-cp "$root/tools/gpui-scenekit-probe/target/debug/gmgn-gpui-app" "$destination/Contents/MacOS/gmgn-gpui-app"
+cp "$root/tools/gpui-scenekit-probe/target/release/gmgn-gpui-app" "$destination/Contents/MacOS/gmgn-gpui-app"
 cp "$root/apps/gpui-app/Info.plist" "$destination/Contents/Info.plist"
 ditto "$source_app/Contents/Resources" "$destination/Contents/Resources"
 # Preserve Bundle.main/Helpers lookup and byte-identical helper manifests while

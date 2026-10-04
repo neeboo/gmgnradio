@@ -346,6 +346,14 @@ v30完整包exit0，实际PID12373，runtime`/tmp/gmgn-gpui-parity-v30-runtime.l
 
 v31完整包exit0（`/tmp/gmgn-gpui-product-app-build-v31.log`），PID12710，同一数据根，runtime`/tmp/gmgn-gpui-parity-v31-runtime.log`。CUA先通过原装修面板Esc结束摆放，再小窗提交同一句真实请求，request1 accepted→reply；截图文字在气泡内换行，右侧关闭X和六圆入口完整可见。此用户回复换行子路径通过，不计自主后台交付实际通过。未注入语音密钥，本轮原语音提示缺凭据，声音未验收；未录音/登录/删除资产。最后源码复核去掉展开时绕过dismiss的条件，保留关闭语义；此最后窄修仍需新包真实关闭/恢复复验，不能把v31截图扩大为该行为通过。
 
+### 歌单与歌词严重卡顿：性能优先，未通过就恢复 Swift UI
+
+用户实际登录网易云后已有50歌单，报告全界面、滚动和歌词卡住；暂停外观对齐，优先性能修复。v36 PID83263五秒采样 `/tmp/gmgn-gpui-v36-playlist-scroll-sample.txt`：主线程100ms tick/poll重复执行settings.snapshot→installedBackends→可执行目录扫描。已加5秒安装元信息缓存及显式刷新，不缓存凭据/连接，实际启动仍即时检查。另修登录重复全量歌单请求，真实账号轻量验证保留；排序/编码/写盘/读回移后台，每provider同步状态独立，失败保持连接，取消与迟到覆盖受控。
+
+节目仅为可见卡片准备source/封面，50行真实Window首屏5行，远滚累计12；投影纯平移缓存复用，形变改变仍重算，保留原像素/渐隐/命中。完整UI最终99/99（worker）、主代理前次98/98、App13/13+ABI1/1均exit0。新包v37构建exit0并以相同真实根启动PID86476，空间画面恢复且实际50歌单入口可读；一次CUA入口操作仍用时13秒，不能称真实流畅或歌词通过。
+
+关键构建缺口：原打包脚本Rust使用debug未优化、Swift宿主Debug。两脚本现改Release，bash语法检查通过；Release宿主session38387日志 `/tmp/gmgn-gpui-perf-release-host.log`、Rust session47694日志 `/tmp/gmgn-gpui-perf-release-rust.log` 已启动，尚未完成/启动Release包。下一步先读这两个实际会话结果，再打包新隔离版本、关闭仅测试实例并验证同50歌单滚动/实际歌词时间和界面响应。不能将debug缓存微秒数当FPS；真实修复不达标则用户授权恢复Swift UI，保留Rust核心、原播放/3D及测试数据。不录音、不重登、不触Keychain或已安装App。旧材质/系统图标partial dirty保留，未完整验证，不计对齐完成。
+
 ### v36 后续实际控件状态差异
 
 上一轮空态修复及桥接契约已推送，远端当前 `fe17d0afde2e45b0da55842f4999d3a5b03290bd`。本轮在仍运行的 v36 隔离 App 中点击聊天，输入区出现，但 AX 聊天按钮仍为“聊天”，没有原 `StageResidentChatButton.setExpanded` 的“收起聊天”和展开值；确认交互状态尚未对齐。只读原源码另确认目的地缺12pt系统符号、底栏缺6+1×20+6分隔、自主横幅缺状态符号。正在修复原系统图标和被动 ultraThinMaterial；未将派发工作当完成，未录音、重新授权或删除素材。
