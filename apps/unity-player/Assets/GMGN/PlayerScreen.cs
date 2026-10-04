@@ -113,11 +113,18 @@ namespace GMGN.UnityPlayer
                 var mode = root.Q<Button>("mode");
                 mode.SetEnabled(world.Configured);
                 mode.tooltip = world.Configured ? "切换播放器与空间" : "尚未指定空间备份";
-                mode.clicked += world.Toggle;
+                Debug.Log($"World mode initialized: configured={world.Configured}; enabled={mode.enabledInHierarchy}");
+                mode.RegisterCallback<PointerDownEvent>(e => Debug.Log($"World mode pointer down: button={e.button}; position={e.position}; enabled={mode.enabledInHierarchy}"), TrickleDown.TrickleDown);
+                mode.RegisterCallback<PointerUpEvent>(e => Debug.Log($"World mode pointer up: button={e.button}; position={e.position}"), TrickleDown.TrickleDown);
+                mode.RegisterCallback<GeometryChangedEvent>(_ => Debug.Log($"World mode bounds: {mode.worldBound}; panelScale={GetComponent<UIDocument>().panelSettings.scale}"));
+                mode.clicked += () => { Debug.Log("World mode clicked"); world.Toggle(); };
+                root.RegisterCallback<PointerDownEvent>(e => Debug.Log($"UI pointer down: target={(e.target as VisualElement)?.name}; position={e.position}; button={e.button}"), TrickleDown.TrickleDown);
                 world.ModeChanged += visible => {
                     // Preserve the vector icon created above; change only its label.
                     var label = mode.Q<Label>(); if (label != null) label.text = visible ? "空间" : "播放器";
                 };
+                if (Environment.GetEnvironmentVariable("GMGN_UNITY_OPEN_SPACE") == "1")
+                    root.schedule.Execute(() => { Debug.Log("World explicit startup requested; not a click acceptance"); world.Toggle(); });
             }
             SetConnected(true); status.text = "音乐与角色已连接";
         }

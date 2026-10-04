@@ -11,6 +11,7 @@ namespace GMGN.UnityPlayer.Editor
     {
         public static void Prepare()
         {
+            GMGN.UnityPlayer.World.Editor.WorldShaderBuild.Prepare();
             PlayerSettings.productName = "GMGN Unity Sample";
             PlayerSettings.runInBackground = true;
             PlayerSettings.SetApplicationIdentifier(NamedBuildTarget.Standalone, "ai.gmgn.unity-sample.player");

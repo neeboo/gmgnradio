@@ -5,6 +5,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using GLTFast;
+using GLTFast.Logging;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
 
@@ -26,18 +27,26 @@ namespace GMGN.UnityPlayer.World
             var root = new GameObject("Recovered asset");
             var content = new GameObject("Model");
             content.transform.SetParent(root.transform, false);
-            var importer = new GltfImport();
+            var logger = new CollectingLogger();
+            var importer = new GltfImport(logger: logger);
             try
             {
                 if (!await importer.LoadFile(packageLocalPath, cancellationToken: cancellation) ||
                     !await importer.InstantiateMainSceneAsync(content.transform, cancellation))
                     throw new InvalidDataException("这个 GLB 模型没有成功加载。");
                 cancellation.ThrowIfCancellationRequested();
+                foreach (var renderer in content.GetComponentsInChildren<Renderer>(true))
+                    foreach (var material in renderer.sharedMaterials)
+                    {
+                        if (material == null || material.shader == null || !material.shader.isSupported || material.shader.name == "Hidden/InternalErrorShader")
+                            throw new InvalidDataException("模型材质着色器未正确打包，暂时无法显示这个物件。");
+                        Debug.Log("[WorldMaterial] shader=" + material.shader.name + " keywords=" + string.Join(",", material.shaderKeywords));
+                    }
                 if (prop != null) Prepare(root.transform, content.transform, prop);
                 root.AddComponent<WorldGltfLifetime>().Importer = importer;
                 return root;
             }
-            catch { importer.Dispose(); UnityEngine.Object.Destroy(root); throw; }
+            catch { logger.LogAll(); importer.Dispose(); UnityEngine.Object.Destroy(root); throw; }
         }
 
         public static void Prepare(Transform root, Transform content, JObject prop)
