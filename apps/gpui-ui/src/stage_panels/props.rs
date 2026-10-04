@@ -7,9 +7,13 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 fn finish_delete(pending: &mut Option<Value>, confirmed: bool, saving: bool) -> Option<Value> {
     pending.take().filter(|_| confirmed && !saving)
+}
+fn row_key_selects(selectable:bool,saving:bool,modified:bool,key:&str)->bool{
+    selectable&&!saving&&!modified&&matches!(key,"enter"|"space")
 }
 
 pub struct ResidentPropEditorPane {
@@ -17,12 +21,14 @@ pub struct ResidentPropEditorPane {
     commands: Vec<Value>,
     confirming_delete: Option<Value>,
     size: Entity<SliderState>,
+    row_focus: HashMap<String,FocusHandle>,
     _subscriptions: Vec<Subscription>,
 }
 impl ResidentPropEditorPane {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let size = cx.new(|_| SliderState::new().min(0.02).max(3.).step(0.01));
         let subscription = cx.subscribe(&size, |this, _, event: &SliderEvent, cx| {
+            if matches!(event,SliderEvent::Change(_)){cx.notify();}
             if let SliderEvent::Release(value) = event {
                 if this.snapshot["isSaving"].as_bool() != Some(true)
                     && !this.snapshot["selected"].is_null()
@@ -45,6 +51,7 @@ impl ResidentPropEditorPane {
             commands: vec![json!({"op":"stage.props.load"})],
             confirming_delete: None,
             size,
+            row_focus:HashMap::new(),
             _subscriptions: vec![subscription,escape],
         }
     }
@@ -101,11 +108,14 @@ impl ResidentPropEditorPane {
         disabled: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let label:SharedString=label.into();
         Button::new(id)
             .with_size(gpui_kit::component::Size::Small)
-            .label(label)
+            .label(label.clone())
+            .when(command["op"]=="stage.props.resize",|button|button.min_w(px(0.)).px(px(4.)).label("").accessibility_label(label.clone()).child(div().text_size(px(10.)).child(label)))
             .disabled(disabled || self.snapshot["isSaving"].as_bool() == Some(true))
             .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
                 if command["op"] == "stage.props.delete" {
                     this.open_delete(command.clone(),window,cx);
                 } else {
@@ -119,7 +129,7 @@ impl ResidentPropEditorPane {
 
 #[cfg(test)]
 mod tests {
-    use super::finish_delete;
+    use super::{finish_delete,row_key_selects};
     use serde_json::json;
     #[test]
     fn cancellation_never_emits_delete_and_clears_confirmation() {
@@ -135,6 +145,15 @@ mod tests {
         assert!(finish_delete(&mut pending,true,false).is_none());
         pending=Some(json!({"op":"stage.props.delete"}));
         assert!(finish_delete(&mut pending,true,true).is_none());
+    }
+    #[test]
+    fn row_keyboard_selects_only_enabled_unmodified_enter_or_space(){
+        assert!(row_key_selects(true,false,false,"enter"));
+        assert!(row_key_selects(true,false,false,"space"));
+        assert!(!row_key_selects(false,false,false,"enter"));
+        assert!(!row_key_selects(true,true,false,"space"));
+        assert!(!row_key_selects(true,false,true,"enter"));
+        assert!(!row_key_selects(true,false,false,"escape"));
     }
 }
 impl Render for ResidentPropEditorPane {
@@ -168,34 +187,52 @@ impl Render for ResidentPropEditorPane {
         let mut list = div().flex().flex_col().gap_2();
         for section in self.snapshot["sections"].as_array().into_iter().flatten() {
             let group = section["group"].as_str().unwrap_or("");
-            list=list.child(self.button(format!("props-group-{group}"),section["title"].as_str().unwrap_or("").to_owned(),json!({"op":"stage.props.fold","group":group,"folded":section["isFolded"].as_bool()!=Some(true)}),false,cx));
+            let folded=section["isFolded"].as_bool()==Some(true);
+            let mut heading=div().flex().items_center().gap(px(6.)).text_size(px(10.)).font_weight(FontWeight::SEMIBOLD).text_color(cx.theme().muted_foreground);
+            if folded{
+                let command=json!({"op":"stage.props.fold","group":group,"folded":false});
+                heading=heading.child(Button::new(format!("props-group-{group}")).ghost().small().icon(IconName::ChevronRight)
+                    .label(section["title"].as_str().unwrap_or("").to_owned()).disabled(self.snapshot["isSaving"].as_bool()==Some(true))
+                    .on_click(cx.listener(move|this,_,_,cx|{this.commands.push(command.clone());cx.notify();})));
+            }else{
+                heading=heading.child(section["title"].as_str().unwrap_or("").to_owned());
+                if group=="ended"{heading=heading.child(Button::new("props-ended-fold").ghost().small().label("收起")
+                    .disabled(self.snapshot["isSaving"].as_bool()==Some(true)).on_click(cx.listener(|this,_,_,cx|{this.commands.push(json!({"op":"stage.props.fold","group":"ended","folded":true}));cx.notify();})));}
+            }
+            let mut section_content=div().flex().flex_col().gap(px(4.)).child(heading.child(div().flex_1()));
             for row in section["rows"].as_array().into_iter().flatten() {
                 let id = row["id"].as_str().unwrap_or("");
                 let object = row["objectID"].clone();
-                let mut item = div()
-                    .p_2()
+                let selected=self.snapshot["selected"]["objectID"]==object&&!object.is_null();
+                let selectable=row["actions"].as_array().is_some_and(|a|a.iter().any(|v|v=="place"||v=="withdraw"));
+                let state=row["state"].as_str().unwrap_or("");
+                let tint=match state{"awaitingClaim"=>rgb(0x32d3e8),"inInventory"=>rgb(0xeaa344),"failed"=>rgb(0xec6666),_=>cx.theme().muted_foreground.into()};
+                let icon=match state{"generating"=>gpui_kit::assets::IconName::Hourglass,"awaitingClaim"=>gpui_kit::assets::IconName::CircleArrowDown,"inInventory"=>gpui_kit::assets::IconName::Package,"placed"=>gpui_kit::assets::IconName::Box,"failed"=>gpui_kit::assets::IconName::TriangleAlert,_=>gpui_kit::assets::IconName::Archive};
+                let select_command=json!({"op":"stage.props.select","objectID":object});
+                let keyboard_command=select_command.clone();
+                let focus=self.row_focus.entry(id.to_owned()).or_insert_with(||cx.focus_handle()).clone();
+                let label=format!("{}，{}{}",row["name"].as_str().unwrap_or(""),row["statusText"].as_str().unwrap_or(""),if selected{"，已选中"}else{""});
+                let mut item = div().id(format!("props-row-{id}"))
+                    .role(Role::Button).aria_label(label)
+                    .when(selectable,|item|item.track_focus(&focus))
+                    .on_key_down(cx.listener(move|this,event:&KeyDownEvent,_,cx|{
+                        if row_key_selects(selectable,this.snapshot["isSaving"].as_bool()==Some(true),event.keystroke.modifiers.modified(),event.keystroke.key.as_str()){
+                            this.commands.push(keyboard_command.clone());cx.stop_propagation();cx.notify();
+                        }
+                    }))
+                    .p(px(9.))
                     .rounded(px(8.))
-                    .bg(rgb(0x20252b))
+                    .bg(if selected{rgb(0x262a30)}else{rgb(0x1b1e23)})
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .child(
-                        self.button(
-                            format!("props-select-{id}"),
-                            row["name"].as_str().unwrap_or("").to_owned(),
-                            json!({"op":"stage.props.select","objectID":object}),
-                            !row["actions"]
-                                .as_array()
-                                .is_some_and(|a| a.iter().any(|v| v == "place" || v == "withdraw")),
-                            cx,
-                        ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .child(row["statusText"].as_str().unwrap_or("").to_owned()),
-                    );
-                let mut actions = div().flex().flex_wrap().gap_1();
+                    .gap(px(3.))
+                    .child(div().flex().items_center().gap(px(9.))
+                        .child(Icon::new(icon).size(px(12.)))
+                        .child(div().flex_1().min_w(px(0.)).overflow_hidden().whitespace_nowrap().child(row["name"].as_str().unwrap_or("").to_owned()))
+                        .child(div().text_size(px(10.)).text_color(tint).overflow_hidden().whitespace_nowrap().child(row["statusText"].as_str().unwrap_or("").to_owned()))
+                        .children(selected.then(||Icon::new(IconName::Check).size(px(12.)).text_color(rgb(0x32d3e8)))))
+                    .on_click(cx.listener(move|this,_,_,cx|{if selectable&&this.snapshot["isSaving"].as_bool()!=Some(true){this.commands.push(select_command.clone());cx.notify();}}));
+                let mut actions = div().flex().justify_end().flex_wrap().gap(px(6.));
                 for action in row["actions"].as_array().into_iter().flatten() {
                     let action = action.as_str().unwrap_or("");
                     let label = match action {
@@ -217,8 +254,9 @@ impl Render for ResidentPropEditorPane {
                     actions=actions.child(self.button(format!("props-{id}-{action}"),label,json!({"op":format!("stage.props.{action}"),"objectID":object,"jobID":row["jobID"]}),false,cx));
                 }
                 item = item.child(actions);
-                list = list.child(item);
+                section_content = section_content.child(item);
             }
+            list=list.child(section_content);
         }
         if self.snapshot["rowCount"].as_u64() == Some(0) {
             list = list.child(
@@ -375,14 +413,14 @@ impl Render for ResidentPropEditorPane {
                 ] {
                     sizes=sizes.child(self.button(format!("prop-size-{label}"),label,json!({"op":"stage.props.resize","value":selected["longestEdge"].as_f64().unwrap_or(0.)+delta}),false,cx));
                 }
-                sizes=sizes.child(div().flex_1()).child(div().text_size(px(11.)).child(format!("最长边 {:.2} m",selected["longestEdge"].as_f64().unwrap_or(0.))));
+                sizes=sizes.child(div().flex_1().min_w(px(0.))).child(div().flex_shrink_0().whitespace_nowrap().text_size(px(11.)).child(format!("最长边 {:.2} m",selected["longestEdge"].as_f64().unwrap_or(0.))));
                 content = content.child(div().h(px(1.)).bg(rgb(0x34373c)))
                     .child("尺寸")
                     .child(sizes)
                     .child(
                         div().flex().items_center().gap(px(8.)).child(div().flex_1().min_w(px(0.)).child(Slider::new(&self.size)
                             .disabled(self.snapshot["isSaving"].as_bool() == Some(true))))
-                            .child(div().w(px(52.)).text_size(px(11.)).child(format!("{:.2} m",selected["longestEdge"].as_f64().unwrap_or(0.)))),
+                            .child(div().w(px(52.)).text_size(px(11.)).child(format!("{:.2} m",self.size.read(cx).value().start()))),
                     );
                 for key in ["sizeDescription", "sizeProvenance"] {
                     if let Some(text) = selected[key].as_str() {

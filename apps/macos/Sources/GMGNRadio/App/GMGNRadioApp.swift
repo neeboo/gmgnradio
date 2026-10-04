@@ -486,7 +486,7 @@ extension AppDelegate {
                  "isFolded": section.isFolded, "totalCount": section.totalCount,
                  "rows": section.rows.map { row in
                      ["id": row.id, "objectID": row.key.objectID, "jobID": row.key.jobID?.uuidString as Any? ?? NSNull(),
-                      "name": row.name, "statusText": row.statusText, "reasonText": row.reasonText as Any? ?? NSNull(),
+                      "name": row.name, "state": row.state.rawValue, "statusText": row.statusText, "reasonText": row.reasonText as Any? ?? NSNull(),
                       "sizeText": row.sizeText as Any? ?? NSNull(), "sizeProvenance": row.sizeProvenance as Any? ?? NSNull(),
                       "badges": row.badges, "actions": row.actions.map(\.rawValue)] as [String: Any]
                  }] as [String: Any]

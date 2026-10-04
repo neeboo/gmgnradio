@@ -53,6 +53,37 @@ fn color(theme: &Value, key: &str, default: &str) -> String {
     }
     default.to_owned()
 }
+pub(crate) struct ShapedSvgText {
+    pub(crate) width: f64,
+    pub(crate) path: String,
+}
+/// Shared contour seam for projected stage cards. The path is baseline-relative
+/// at (0, 0), with x to the right and y downward, ready for SVG transforms.
+pub(crate) fn shaped_text_svg(
+    text: &str,
+    size: f64,
+    weight: u16,
+    tracking: f64,
+) -> Option<ShapedSvgText> {
+    let line = outline::shape_font(text, size, weight, tracking, false)?;
+    Some(ShapedSvgText {
+        width: line.width,
+        path: outline::svg_path(&line.commands, |point| outline::Point {
+            x: point.x,
+            y: -point.y,
+        }),
+    })
+}
+struct ParagraphLayout {
+    lines: Vec<String>,
+    size: f64,
+    line_height: f64,
+}
+impl ParagraphLayout {
+    fn height(&self) -> f64 {
+        self.line_height * self.lines.len() as f64
+    }
+}
 struct Scene<'a> {
     snapshot: &'a Value,
     width: f64,
@@ -141,11 +172,11 @@ fn translation_style(mode: &str, width: f64) -> TranslationStyle {
         "luminous" => {
             style.tracking = 0.7;
             style.opacity = 0.66;
-            style.width = 720.;
+            style.width = 720f64.min(width);
         }
         "confession" => {
             style.opacity = 0.56;
-            style.width = 620.;
+            style.width = 620f64.min(width * 0.78);
             style.max_lines = usize::MAX;
         }
         "claddagh" => {
@@ -153,8 +184,11 @@ fn translation_style(mode: &str, width: f64) -> TranslationStyle {
             style.max_lines = usize::MAX;
             style.width = width;
         }
-        "monet_poster" => style.opacity = 0.54,
-        "article" => style.width = 680.,
+        "monet_poster" => {
+            style.opacity = 0.54;
+            style.width = width * 0.62;
+        }
+        "article" => style.width = 680f64.min(width * 0.64),
         "cloud_steps" => {
             style.tracking = 0.8;
             style.opacity = 0.48;
@@ -369,8 +403,34 @@ impl<'a> Scene<'a> {
         color: &str,
         anchor: &str,
     ) {
+        let layout = self.paragraph_layout(text, size, width, max_lines, min_scale);
+        let top = y - (layout.lines.len().saturating_sub(1) as f64) * layout.line_height / 2.;
+        for (index, line) in layout.lines.iter().enumerate() {
+            self.line(
+                line,
+                x,
+                top + index as f64 * layout.line_height,
+                layout.size,
+                opacity,
+                color,
+                anchor,
+            );
+        }
+    }
+    fn paragraph_layout(
+        &mut self,
+        text: &str,
+        size: f64,
+        width: f64,
+        max_lines: usize,
+        min_scale: f64,
+    ) -> ParagraphLayout {
         if text.is_empty() {
-            return;
+            return ParagraphLayout {
+                lines: vec![],
+                size,
+                line_height: 0.,
+            };
         }
         let mut resolved = size;
         let mut lines = outline::wrap_styled(text, size, width, self.weight, self.tracking);
@@ -392,17 +452,10 @@ impl<'a> Scene<'a> {
             .outlined("Ag中文", resolved)
             .map(|l| l.ascent + l.descent)
             .unwrap_or(resolved * 1.2);
-        let top = y - (lines.len().saturating_sub(1) as f64) * line_height / 2.;
-        for (index, line) in lines.iter().enumerate() {
-            self.line(
-                line,
-                x,
-                top + index as f64 * line_height,
-                resolved,
-                opacity,
-                color,
-                anchor,
-            );
+        ParagraphLayout {
+            lines,
+            size: resolved,
+            line_height,
         }
     }
     fn perspective_line(
@@ -521,7 +574,10 @@ impl<'a> Scene<'a> {
             .map(|glyph| self.measured_width(&text(glyph, "text"), size))
             .collect();
         let spacing = size
-            * if arc || self.snapshot["mode"] == "diorama" {
+            * if arc
+                || self.snapshot["mode"] == "diorama"
+                || self.snapshot["mode"] == "monet_poster"
+            {
                 0.012
             } else {
                 0.015
@@ -670,47 +726,158 @@ impl<'a> Scene<'a> {
         let size = font_size(&self.active_text(), self.width);
         let cx = self.width * 0.5 + self.rail(150.);
         let cy = self.height * 0.5 - 8.;
-        self.line(
-            &text(&self.snapshot["flow"]["previousLine"], "text"),
-            cx - 42.,
-            cy - size - 22.,
-            (size * 0.28).clamp(15., 24.),
-            0.18,
-            &self.primary.clone(),
-            "middle",
+        let previous = text(&self.snapshot["flow"]["previousLine"], "text");
+        let next = text(&self.snapshot["flow"]["nextLine"], "text");
+        let translation = text(&self.snapshot["flow"], "translation");
+        let context_size = (size * 0.28).clamp(15., 24.);
+        let context_width = 680f64.min(self.width);
+        self.weight = 600;
+        self.tracking = 0.5;
+        let previous_height = self
+            .paragraph_layout(&previous, context_size, context_width, 1, 0.72)
+            .height();
+        let next_height = self
+            .paragraph_layout(&next, context_size, context_width, 1, 0.72)
+            .height();
+        self.weight = 700;
+        self.tracking = size * -0.018;
+        let glyph_height = self
+            .outlined("Ag中文", size)
+            .map(|line| line.ascent + line.descent)
+            .unwrap_or(size * 1.2);
+        self.weight = 500;
+        self.tracking = 0.7;
+        let translation_size = (size * 0.22).max(16.);
+        let translation_height = self
+            .paragraph_layout(
+                &translation,
+                translation_size,
+                720f64.min(self.width),
+                2,
+                1.,
+            )
+            .height();
+        let count = 1
+            + usize::from(!previous.is_empty())
+            + usize::from(!next.is_empty())
+            + usize::from(!translation.is_empty());
+        let height = previous_height
+            + next_height
+            + glyph_height
+            + translation_height
+            + 22. * count.saturating_sub(1) as f64;
+        let expansion = self.audio("expansion", 1.);
+        let _ = write!(
+            self.svg,
+            r#"<g transform="translate({} {}) scale({expansion}) translate({} {})"><defs><filter id="flowPreviousBlur"><feGaussianBlur stdDeviation="1.5"/></filter><filter id="flowNextBlur"><feGaussianBlur stdDeviation="0.9"/></filter><filter id="flowCompositeShadow" x="-100%" y="-100%" width="300%" height="300%"><feDropShadow dx="0" dy="0" stdDeviation="{}" flood-color="{}" flood-opacity="{}"/><feDropShadow dx="0" dy="0" stdDeviation="3" flood-color="black" flood-opacity="0.78"/></filter></defs>"#,
+            self.width / 2.,
+            self.height / 2.,
+            -self.width / 2.,
+            -self.height / 2.,
+            if self.snapshot["flow"]["isChorus"] == true {
+                22.
+            } else {
+                14.
+            },
+            if self.snapshot["flow"]["isChorus"] == true {
+                &self.secondary
+            } else {
+                &self.accent
+            },
+            if self.snapshot["flow"]["isChorus"] == true {
+                0.3
+            } else {
+                0.22
+            }
         );
+        let mut top = cy - height / 2.;
+        self.text_filter = "none".to_owned();
+        if !previous.is_empty() {
+            self.weight = 600;
+            self.tracking = 0.5;
+            self.svg.push_str(r#"<g filter="url(#flowPreviousBlur)">"#);
+            self.paragraph(
+                &previous,
+                cx - context_width / 2. - 42.,
+                top + previous_height / 2.,
+                context_size,
+                context_width,
+                1,
+                0.72,
+                0.18,
+                &self.primary.clone(),
+                "start",
+            );
+            self.svg.push_str("</g>");
+            top += previous_height + 22.;
+        }
+        self.svg
+            .push_str(r#"<g filter="url(#flowCompositeShadow)">"#);
         self.glyphs(
             cx,
-            cy + (num(self.snapshot, "animationTime", 0.) * 0.72).sin() * 2.2,
+            top + glyph_height / 2.
+                + (num(self.snapshot, "animationTime", 0.) * 0.72).sin() * 2.2
+                + self.audio("beatLift", 0.) * 0.18,
             size,
             false,
         );
-        self.translation(cx, cy + size * 0.7 + 22., (size * 0.22).max(16.), "middle");
-        self.line(
-            &text(&self.snapshot["flow"]["nextLine"], "text"),
-            cx + 42.,
-            cy + size + 66.,
-            (size * 0.28).clamp(15., 24.),
-            0.28,
-            &self.primary.clone(),
-            "middle",
-        );
+        self.svg.push_str("</g>");
+        top += glyph_height;
+        if !translation.is_empty() {
+            top += 22.;
+            self.translation(
+                cx,
+                top + translation_height / 2.,
+                translation_size,
+                "middle",
+            );
+            top += translation_height;
+        }
+        if !next.is_empty() {
+            top += 22.;
+            self.weight = 600;
+            self.tracking = 0.5;
+            self.svg.push_str(r#"<g filter="url(#flowNextBlur)">"#);
+            self.paragraph(
+                &next,
+                cx + context_width / 2. + 42.,
+                top + next_height / 2.,
+                context_size,
+                context_width,
+                1,
+                0.72,
+                0.28,
+                &self.primary.clone(),
+                "end",
+            );
+            self.svg.push_str("</g>");
+        }
+        self.svg.push_str("</g>");
+        self.weight = 600;
+        self.tracking = 0.;
+        self.text_filter = "url(#textShadow)".to_owned();
     }
     fn depth(&mut self) {
         let mut lines = items(&self.snapshot["depth"], "lines");
         lines.sort_by_key(|line| num(line, "position", 1.) == 0.);
-        for line in lines {
+        let _ = write!(
+            self.svg,
+            r#"<defs><linearGradient id="depthContextGradient"><stop stop-color="{}" stop-opacity="0.76"/><stop offset="1" stop-color="{}" stop-opacity="0.5"/></linearGradient></defs>"#,
+            self.primary, self.accent
+        );
+        for (index, line) in lines.into_iter().enumerate() {
             let current = num(&line, "position", 0.) == 0.;
             let p = num(&line, "presentationPosition", num(&line, "position", 0.));
             self.weight = if current { 700 } else { 600 };
             self.tracking = if current { 0.4 } else { 0.1 };
-            let size = num(&line, "presentationSize", if current { 38. } else { 24. })
-                * num(&line, "scale", 1.)
+            let size = num(&line, "presentationSize", if current { 38. } else { 24. });
+            let scale = num(&line, "scale", 1.)
                 * if current {
                     self.audio("expansion", 1.)
                 } else {
                     1.
                 };
+            let width = (if current { 760f64 } else { 620f64 }).min(self.width);
             let cx = self.width * 0.5 + self.rail(150.) + p * 92.;
             let cy = self.height * 0.5
                 + p * 96.
@@ -719,19 +886,51 @@ impl<'a> Scene<'a> {
                 } else {
                     0.
                 };
-            self.perspective_line(
+            let _ = write!(
+                self.svg,
+                r#"<defs><filter id="depthShadow{index}" x="-100%" y="-100%" width="300%" height="300%"><feDropShadow dx="0" dy="0" stdDeviation="{}" flood-color="{}" flood-opacity="{}"/><feDropShadow dx="0" dy="0" stdDeviation="4" flood-color="black" flood-opacity="0.96"/></filter><filter id="depthBlur{index}" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="{}"/></filter></defs><g opacity="{}" filter="url(#depthBlur{index})"><g filter="url(#depthShadow{index})">"#,
+                if current { 18. } else { 7. },
+                if current { &self.accent } else { "black" },
+                if current { 0.5 } else { 0.72 },
+                num(&line, "blurRadius", 0.),
+                num(&line, "opacity", 1.)
+            );
+            self.panel = Some(PanelTransform {
+                anchor: outline::Point::default(),
+                angle: -p * 12.,
+                axis: (0.08, 1., 0.),
+                perspective: 0.68,
+                width,
+                rotation: 0.,
+                scale: 1.,
+                scale_anchor: outline::Point::default(),
+                position: outline::Point { x: cx, y: cy },
+            });
+            self.local = Some((0., 0., 0., scale));
+            self.text_filter = "none".to_owned();
+            self.paragraph(
                 &text(&line, "text"),
-                cx,
-                cy,
+                0.,
+                0.,
                 size,
-                num(&line, "opacity", 1.),
-                "url(#lyricGradient)",
-                -p * 12.,
-                (0.08, 1., 0.),
-                0.68,
+                width,
+                2,
+                1.,
+                1.,
+                if current {
+                    "url(#lyricGradient)"
+                } else {
+                    "url(#depthContextGradient)"
+                },
                 "middle",
             );
+            self.svg.push_str("</g></g>");
+            self.panel = None;
+            self.local = None;
         }
+        self.weight = 600;
+        self.tracking = 0.;
+        self.text_filter = "url(#textShadow)".to_owned();
     }
     fn cloud(&mut self) {
         let glyphs = items(&self.snapshot["flow"], "glyphs");
@@ -954,49 +1153,164 @@ impl<'a> Scene<'a> {
         let entries = items(&self.snapshot["monet"], "entries");
         let size = font_size(&self.active_text(), self.width * 0.58);
         let x = (self.width * 0.075).max(60.) + self.rail(96.);
-        let height = (self.height * 0.7).min(520.);
+        let height = (self.height * 0.7).min(520.) * self.audio("expansion", 1.);
+        let bar_width = 3. + self.audio("high", 0.) * 2.;
+        let max_width = self.width * 0.62;
         self.rect(
             x,
             self.height * 0.5 - height / 2.,
-            3. + self.audio("high", 0.) * 2.,
+            bar_width,
             height,
             2.,
             "url(#posterGradient)",
             "none",
-            0.9,
+            1.,
         );
+        let mut rows = vec![];
+        let mut total_height = 0.;
         for entry in entries {
+            let active = entry["status"] == "active";
+            let row_height = if active {
+                self.weight = 700;
+                self.tracking = size * -0.018;
+                let glyph_height = self
+                    .outlined("Ag中文", size)
+                    .map(|line| line.ascent + line.descent)
+                    .unwrap_or(size * 1.2);
+                self.weight = 500;
+                self.tracking = 0.;
+                let translation_size = (size * 0.2).max(15.);
+                let translation_height = self
+                    .paragraph_layout(
+                        &text(&self.snapshot["flow"], "translation"),
+                        translation_size,
+                        max_width,
+                        2,
+                        1.,
+                    )
+                    .height();
+                glyph_height
+                    + if translation_height > 0. {
+                        10. + translation_height
+                    } else {
+                        0.
+                    }
+                    + 20.
+            } else {
+                self.weight = if entry["status"] == "passed" {
+                    500
+                } else {
+                    600
+                };
+                self.tracking = 0.;
+                self.paragraph_layout(
+                    &text(&entry["line"], "text"),
+                    (size * 0.34).clamp(17., 28.),
+                    max_width * 0.82,
+                    2,
+                    0.72,
+                )
+                .height()
+            };
+            if !rows.is_empty() {
+                total_height += 14.;
+            }
+            total_height += row_height;
+            rows.push((entry, active, row_height));
+        }
+        let mut top = self.height / 2. - total_height / 2.;
+        for (index, (entry, active, row_height)) in rows.into_iter().enumerate() {
+            if index > 0 {
+                top += 14.;
+            }
             let offset = num(&entry, "offset", 0.);
-            let sx = x + 28. + offset.abs() * 18. + if offset > 0. { 12. } else { 0. };
+            let sx = x + bar_width + 28. + offset.abs() * 18. + if offset > 0. { 12. } else { 0. };
             let transition = &entry["_presentation"];
-            let y =
-                self.height * 0.5 + offset * (size * 0.6 + 14.) + num(transition, "offsetY", 0.);
+            let y = top + row_height / 2. + num(transition, "offsetY", 0.);
             let _ = write!(
                 self.svg,
-                r#"<g opacity="{}">"#,
+                r#"<defs><filter id="monetBlur{index}" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="{}"/></filter></defs><g opacity="{}" filter="url(#monetBlur{index})">"#,
+                if active { 0. } else { offset.abs() * 0.34 },
                 num(transition, "opacity", 1.)
             );
-            if offset == 0. {
-                self.glyphs(sx + self.width * 0.31, y, size, false);
-                self.translation(sx, y + size * 0.6, (size * 0.2).max(15.), "start");
+            self.text_filter = "none".to_owned();
+            if active {
+                self.weight = 700;
+                self.tracking = size * -0.018;
+                let glyphs = items(&self.snapshot["flow"], "glyphs");
+                let glyph_width = glyphs
+                    .iter()
+                    .map(|glyph| self.measured_width(&text(glyph, "text"), size))
+                    .sum::<f64>()
+                    + size * 0.012 * glyphs.len().saturating_sub(1) as f64;
+                let glyph_height = self
+                    .outlined("Ag中文", size)
+                    .map(|line| line.ascent + line.descent)
+                    .unwrap_or(size * 1.2);
+                let _ = write!(
+                    self.svg,
+                    r#"<defs><filter id="monetActiveShadow" x="-100%" y="-100%" width="300%" height="300%"><feDropShadow dx="0" dy="0" stdDeviation="22" flood-color="{}" flood-opacity="{}"/></filter></defs><g filter="url(#monetActiveShadow)"><g transform="translate({sx} {}) scale({} {})">"#,
+                    self.accent,
+                    0.18 + self.audio("glow", 0.) * 0.18,
+                    top + 10. + glyph_height / 2.,
+                    self.audio("expansion", 1.),
+                    1. + self.audio("mid", 0.) * 0.025
+                );
+                self.glyphs(glyph_width / 2., 0., size, false);
+                self.svg.push_str("</g>");
+                let translation_size = (size * 0.2).max(15.);
+                self.weight = 500;
+                self.tracking = 0.;
+                let translation_height = self
+                    .paragraph_layout(
+                        &text(&self.snapshot["flow"], "translation"),
+                        translation_size,
+                        max_width,
+                        2,
+                        1.,
+                    )
+                    .height();
+                if translation_height > 0. {
+                    self.translation(
+                        sx,
+                        top + 10. + glyph_height + 10. + translation_height / 2.,
+                        translation_size,
+                        "start",
+                    );
+                }
+                self.svg.push_str("</g>");
             } else {
-                let opacity = if offset < 0. {
+                let passed = entry["status"] == "passed";
+                self.weight = if passed { 500 } else { 600 };
+                self.tracking = 0.;
+                let opacity = if passed {
                     0.16 + 0.05 / offset.abs()
                 } else {
                     0.34 - (offset.abs() - 1.) * 0.07
                 };
-                self.line(
+                self.paragraph(
                     &text(&entry["line"], "text"),
                     sx,
                     y,
                     (size * 0.34).clamp(17., 28.),
+                    max_width * 0.82,
+                    2,
+                    0.72,
                     opacity,
-                    &self.primary.clone(),
+                    &if passed {
+                        self.secondary.clone()
+                    } else {
+                        self.primary.clone()
+                    },
                     "start",
                 );
             }
             self.svg.push_str("</g>");
+            top += row_height;
         }
+        self.weight = 600;
+        self.tracking = 0.;
+        self.text_filter = "url(#textShadow)".to_owned();
     }
     fn editorial(&mut self) {
         let target = &self.snapshot["article"]["cameraTarget"];
@@ -2566,6 +2880,108 @@ mod outline {
 mod tests {
     use super::{Scene, escape};
     use serde_json::json;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn luminous_context_keeps_real_tracking_leading_trailing_and_blur() {
+        let snapshot = json!({"mode":"luminous","flow":{"activeLine":{"text":"main"},"previousLine":{"text":"previous"},"nextLine":{"text":"next"},"translation":"translation","glyphs":[{"text":"main","phase":"passed"}]}});
+        let mut scene = Scene::new(&snapshot, 1000., 700.);
+        scene.flow();
+        assert!(
+            scene
+                .outlines
+                .keys()
+                .any(|key| key.0 == "previous" && key.2 == 600 && key.3 == 0.5f64.to_bits())
+        );
+        assert!(
+            scene
+                .outlines
+                .keys()
+                .any(|key| key.0 == "next" && key.2 == 600 && key.3 == 0.5f64.to_bits())
+        );
+        assert!(scene.svg.contains("filter=\"url(#flowPreviousBlur)\""));
+        assert!(scene.svg.contains("stdDeviation=\"1.5\""));
+        assert!(scene.svg.contains("filter=\"url(#flowNextBlur)\""));
+        assert!(scene.svg.contains("stdDeviation=\"0.9\""));
+        let x = |label: &str| {
+            let marker = format!("aria-label=\"{label}\" d=\"M");
+            let rest = scene.svg.split_once(&marker).unwrap().1;
+            rest.split_once(',').unwrap().0.parse::<f64>().unwrap()
+        };
+        assert!(x("previous") < 200.);
+        assert!(x("next") > 700.);
+        assert_eq!((scene.weight, scene.tracking), (600, 0.));
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mindscape_wraps_before_scaling_and_keeps_context_gradient_blur_and_shadows() {
+        let snapshot = json!({"mode":"mindscape","flow":{"activeLine":{"text":"active"}},"depth":{"lines":[{"id":"current","text":"当前文字".repeat(12),"position":0,"scale":0.9,"opacity":1.,"blurRadius":0.},{"id":"context","text":"上下文字".repeat(10),"position":1,"scale":0.8,"opacity":0.3,"blurRadius":2.}]}});
+        let mut scene = Scene::new(&snapshot, 1000., 700.);
+        scene.depth();
+        assert_eq!(scene.svg.matches("fill=\"url(#lyricGradient)\"").count(), 2);
+        assert_eq!(
+            scene
+                .svg
+                .matches("fill=\"url(#depthContextGradient)\"")
+                .count(),
+            2
+        );
+        assert!(scene.svg.contains("stop-opacity=\"0.76\""));
+        assert!(scene.svg.contains("stop-opacity=\"0.5\""));
+        assert!(scene.svg.contains("stdDeviation=\"18\""));
+        assert!(scene.svg.contains("stdDeviation=\"7\""));
+        assert!(scene.svg.contains("stdDeviation=\"4\""));
+        assert!(scene.svg.contains("stdDeviation=\"2\""));
+        assert!(
+            scene
+                .outlines
+                .keys()
+                .any(|key| key.1 == 38f64.to_bits() && key.2 == 700 && key.3 == 0.4f64.to_bits())
+        );
+        assert!(
+            scene
+                .outlines
+                .keys()
+                .any(|key| key.1 == 24f64.to_bits() && key.2 == 600 && key.3 == 0.1f64.to_bits())
+        );
+        assert!(
+            scene
+                .svg
+                .find("fill=\"url(#depthContextGradient)\"")
+                .unwrap()
+                < scene.svg.find("fill=\"url(#lyricGradient)\"").unwrap()
+        );
+        assert!(scene.panel.is_none());
+        assert!(scene.local.is_none());
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn monet_context_uses_original_status_weight_color_and_row_blur() {
+        let snapshot = json!({"mode":"monet_poster","theme":{"primary":"#112233","secondary":"#778899"},"flow":{"activeLine":{"text":"active"},"glyphs":[{"text":"active","phase":"active"}]},"monet":{"entries":[{"line":{"text":"passed"},"offset":-2,"status":"passed"},{"line":{"text":"active"},"offset":0,"status":"active"},{"line":{"text":"upcoming"},"offset":2,"status":"upcoming"}]}});
+        let mut scene = Scene::new(&snapshot, 1000., 700.);
+        scene.poster();
+        assert!(
+            scene
+                .outlines
+                .keys()
+                .any(|key| key.0 == "passed" && key.2 == 500 && key.3 == 0f64.to_bits())
+        );
+        assert!(
+            scene
+                .outlines
+                .keys()
+                .any(|key| key.0 == "upcoming" && key.2 == 600 && key.3 == 0f64.to_bits())
+        );
+        assert!(scene.svg.contains("fill=\"#778899\" opacity=\"0.185\""));
+        assert!(scene.svg.contains("fill=\"#112233\" opacity=\"0.27\""));
+        assert!(scene.svg.contains("stdDeviation=\"0.68\""));
+        assert!(scene.svg.contains("stdDeviation=\"22\""));
+        scene.weight = 500;
+        scene.tracking = 0.;
+        let layout = scene.paragraph_layout(&"多行文字".repeat(30), 28., 508.4, 2, 0.72);
+        assert_eq!(layout.lines.len(), 2);
+        assert!(layout.size >= 28. * 0.72);
+        assert!(layout.size < 28.);
+    }
     fn segment_snapshot(animation: f64, playback: f64) -> serde_json::Value {
         json!({"trackID":"track","mode":"confession","animationTime":animation,"playbackTime":playback,"flow":{"activeLine":{"id":"line","text":"test"}},"tilt":{"segments":[{"id":"first","text":"first","revealAt":0.,"isTilted":false},{"id":"second","text":"second","revealAt":2.,"isTilted":true},{"id":"third","text":"third","revealAt":4.,"isTilted":false}]}})
     }

@@ -1,29 +1,181 @@
+use crate::projective_card::{CardTransform, ProjectedCard, RailMask, RgbaTexture};
+fn icon_svg(icon: gpui_kit::assets::IconName, x: f64, y: f64, size: f64, color: &str) -> String {
+    let Ok(Some(bytes)) = gpui_kit::assets::AllAssets.load(&icon.path()) else {
+        return String::new();
+    };
+    let Ok(svg) = std::str::from_utf8(&bytes) else {
+        return String::new();
+    };
+    let Some(start) = svg.find('>') else {
+        return String::new();
+    };
+    let Some(end) = svg.rfind("</svg>") else {
+        return String::new();
+    };
+    format!(
+        r#"<g transform="translate({x} {y}) scale({})" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">{}</g>"#,
+        size / 24.,
+        svg[start + 1..end].replace("currentColor", color)
+    )
+}
 use gpui_kit::component::button::*;
 use gpui_kit::*;
 use serde_json::{Value, json};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
+type ProjectionCache = Rc<RefCell<HashMap<String, (String, Arc<ProjectedCard>, Arc<RenderImage>)>>>;
 
-#[derive(Debug)]
-struct CardProjection {
-    width: f32,
-    height: f32,
-    opacity: f32,
-    offset: f32,
+fn svg_text(
+    text: &str,
+    x: f64,
+    baseline: f64,
+    size: f64,
+    weight: u16,
+    color: &str,
+    max_width: f64,
+) -> String {
+    let mut display = text.to_owned();
+    if let Some(line) = crate::lyrics::shaped_text_svg(text, size, weight, 0.) {
+        if line.width > max_width {
+            let mut chars: Vec<char> = text.chars().collect();
+            while !chars.is_empty() {
+                chars.pop();
+                display = format!("{}…", chars.iter().collect::<String>());
+                if crate::lyrics::shaped_text_svg(&display, size, weight, 0.)
+                    .is_some_and(|line| line.width <= max_width)
+                {
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(line) = crate::lyrics::shaped_text_svg(&display, size, weight, 0.) {
+        format!(
+            r#"<path fill="{color}" transform="translate({x} {baseline})" d="{}"/>"#,
+            line.path
+        )
+    } else {
+        let escaped = display
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;");
+        format!(
+            r#"<text x="{x}" y="{baseline}" font-family="sans-serif" font-size="{size}" font-weight="{weight}" fill="{color}">{escaped}</text>"#
+        )
+    }
 }
-fn project_card(card: &Value) -> CardProjection {
+
+fn card_svg(card: &Value, audio: &Value, catalog: bool, playlist: bool) -> String {
+    let (w, h, r) = if catalog {
+        (306., 74., 22.)
+    } else {
+        (294., 76., 23.)
+    };
+    let current = card["isCurrent"].as_bool() == Some(true);
+    let border = if current { "#68d6e8" } else { "#ffffff" };
+    let border_alpha = if current { 0.52 } else { 0.12 };
+    let mut body = format!(
+        r##"<defs><linearGradient id="surface" x2="1" y2="1"><stop stop-color="#028ce0" stop-opacity="{}"/><stop offset="1" stop-color="#000000" stop-opacity=".12"/></linearGradient></defs><rect x=".6" y=".6" width="{}" height="{}" rx="{r}" fill="#1c252d"/><rect x=".6" y=".6" width="{}" height="{}" rx="{r}" fill="url(#surface)" stroke="{border}" stroke-opacity="{border_alpha}" stroke-width="{}"/>"##,
+        if current { 0.19 } else { 0.06 },
+        w - 1.2,
+        h - 1.2,
+        w - 1.2,
+        h - 1.2,
+        if current { 1.2 } else { 0.8 }
+    );
+    let circle = if playlist { "#ff5151" } else { "#7af2ff" };
+    body.push_str(&format!(r#"<rect x="14" y="16" width="44" height="44" rx="{}" fill="{circle}" fill-opacity=".12"/>"#,if playlist {12}else{22}));
+    if current && !catalog {
+        for i in 0..5 {
+            let sample = audio["waveform"][i].as_f64().unwrap_or(0.).abs();
+            let band = audio[if i < 2 {
+                "low"
+            } else if i == 2 {
+                "mid"
+            } else {
+                "high"
+            }]
+            .as_f64()
+            .unwrap_or(0.);
+            let amplitude = audio["amplitude"].as_f64().unwrap_or(0.);
+            let height = 5. + 18. * sample.max(band * 0.72).max(amplitude * 0.56);
+            body.push_str(&format!(
+                r##"<rect x="{}" y="{}" width="2.4" height="{height}" rx="1.2" fill="#7af2ff"/>"##,
+                25. + i as f64 * 4.4,
+                38. - height / 2.
+            ));
+        }
+    } else {
+        let icon = if catalog && !playlist {
+            gpui_kit::assets::IconName::Radio
+        } else if playlist {
+            gpui_kit::assets::IconName::ListMusic
+        } else {
+            gpui_kit::assets::IconName::Music
+        };
+        body.push_str(&icon_svg(icon, 25., 27., 22., circle));
+    }
+    let title_size = if current && !catalog { 17. } else { 16. };
+    body.push_str(&svg_text(
+        card["title"].as_str().unwrap_or(""),
+        71.,
+        33.,
+        title_size,
+        600,
+        "#ebeff2",
+        if catalog { 207. } else { 209. },
+    ));
+    body.push_str(&svg_text(
+        card[if catalog { "subtitle" } else { "artist" }]
+            .as_str()
+            .unwrap_or(""),
+        71.,
+        54.,
+        if catalog { 13. } else { 14. },
+        500,
+        "#ffffff7a",
+        if catalog { 207. } else { 164. },
+    ));
+    if catalog {
+        if card["isPending"].as_bool() == Some(true) {
+            body.push_str(r##"<path d="M286 29l2 7 7 2-7 2-2 7-2-7-7-2 7-2z" fill="#7af2ff"/>"##);
+        } else {
+            body.push_str(r##"<path d="M284 32l5 6-5 6" fill="none" stroke="#ffffff" stroke-opacity=".34" stroke-width="1.8"/>"##);
+        }
+    } else {
+        for i in 0..7 {
+            let height = energy_height(card["energy"].as_f64().unwrap_or(0.) as f32, i);
+            body.push_str(&format!(r##"<rect x="{}" y="{}" width="2" height="{height}" rx="1" fill="#00ffff" fill-opacity=".42"/>"##,252+i*4,49.-height/2.));
+        }
+        if current && card["hasBoundVideo"].as_bool() == Some(true) {
+            body.push_str(r##"<circle cx="272" cy="21" r="13" fill="#263641"/><path d="M265 17h10v8h-10z M275 19l5-2v8l-5-2z" fill="#a3b3bb"/>"##);
+        }
+    }
+    format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">{body}</svg>"#
+    )
+}
+
+fn card_transform(card: &Value, catalog: bool) -> CardTransform {
     let focused = card["isFocused"]
         .as_bool()
         .unwrap_or(card["isCurrent"].as_bool() == Some(true));
-    // Swift applies scale/3D rotation after layout, not by shrinking the
-    // measured card. GPUI's 2D div cannot faithfully reproduce that projection.
-    CardProjection {
-        width: 294.,
-        height: 76.,
-        opacity: if focused {
+    CardTransform {
+        width: if catalog { 306. } else { 294. },
+        height: if catalog { 74. } else { 76. },
+        scale: if catalog {
             1.
         } else {
-            card["opacity"].as_f64().unwrap_or(1.) as f32
+            card["scale"].as_f64().unwrap_or(1.) + if focused { 0.055 } else { 0. }
         },
-        offset: card["horizontalOffset"].as_f64().unwrap_or(0.) as f32,
+        y_degrees: if catalog {
+            -7.
+        } else if focused {
+            -4.
+        } else {
+            -10. - card["relativeIndex"].as_i64().unwrap_or(0).clamp(-2, 2) as f64 * 2.5
+        },
+        perspective: 0.72,
     }
 }
 fn energy_height(energy: f32, index: usize) -> f32 {
@@ -67,6 +219,11 @@ pub struct StageProgramRailPane {
     center_active: bool,
     scroll_start: Option<f32>,
     snap_task: Option<Task<()>>,
+    renderer: SvgRenderer,
+    card_cache: HashMap<String, (String, Arc<RgbaTexture>)>,
+    pressed_card: Option<(String, bool)>,
+    projection_cache: ProjectionCache,
+    focus_handles: HashMap<String, FocusHandle>,
 }
 impl StageProgramRailPane {
     pub fn new(_window: &mut Window, _cx: &mut Context<Self>) -> Self {
@@ -77,6 +234,11 @@ impl StageProgramRailPane {
             center_active: true,
             scroll_start: None,
             snap_task: None,
+            renderer: SvgRenderer::new(Arc::new(())),
+            card_cache: HashMap::new(),
+            pressed_card: None,
+            projection_cache: Rc::new(RefCell::new(HashMap::new())),
+            focus_handles: HashMap::new(),
         }
     }
     pub fn update_snapshot(
@@ -103,12 +265,298 @@ impl StageProgramRailPane {
                 self.snap_task = None;
                 self.scroll_start = None;
             }
+            if self.snapshot["route"] != snapshot["route"] {
+                self.card_cache.clear();
+                self.pressed_card = None;
+                self.projection_cache.borrow_mut().clear();
+                self.focus_handles.clear();
+            }
             self.snapshot = snapshot;
             cx.notify();
         }
     }
     pub fn take_commands(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.commands)
+    }
+    fn projected_card(
+        &mut self,
+        card: &Value,
+        catalog: bool,
+        playlist: bool,
+        op: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = if catalog {
+            format!("{op}-{}", card["id"].as_str().unwrap_or(""))
+        } else {
+            format!("track-{}", card["slotIndex"])
+        };
+        let audio = if !catalog && card["isCurrent"].as_bool() == Some(true) {
+            self.snapshot["audioFeatures"].clone()
+        } else {
+            Value::Null
+        };
+        let key = format!(
+            "{}/{audio}/{catalog}/{playlist}",
+            json!({"title":card["title"],"artist":card["artist"],"subtitle":card["subtitle"],"isCurrent":card["isCurrent"],"hasBoundVideo":card["hasBoundVideo"],"isPending":card["isPending"],"energy":card["energy"]})
+        );
+        let texture =
+            if let Some((old, texture)) = self.card_cache.get(&id).filter(|(old, _)| old == &key) {
+                let _ = old;
+                texture.clone()
+            } else {
+                let svg = card_svg(card, &audio, catalog, playlist);
+                let Ok(image) = self.renderer.render_single_frame(svg.as_bytes(), 1.) else {
+                    return div()
+                        .w(px(if catalog { 306. } else { 294. }))
+                        .h(px(if catalog { 74. } else { 76. }))
+                        .child("卡片显示失败")
+                        .into_any_element();
+                };
+                let dimensions = image.size(0);
+                let mut pixels = image.as_bytes(0).unwrap_or_default().to_vec();
+                for pixel in pixels.chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
+                }
+                let texture = Arc::new(RgbaTexture {
+                    width: dimensions.width.0 as u32,
+                    height: dimensions.height.0 as u32,
+                    pixels,
+                });
+                self.card_cache.insert(id.clone(), (key, texture.clone()));
+                texture
+            };
+        let focused = card["isFocused"]
+            .as_bool()
+            .unwrap_or(card["isCurrent"].as_bool() == Some(true));
+        let transform = card_transform(card, catalog);
+        let opacity = if focused || catalog {
+            1.
+        } else {
+            card["opacity"].as_f64().unwrap_or(1.)
+        };
+        let offset = if catalog {
+            0.
+        } else {
+            card["horizontalOffset"].as_f64().unwrap_or(0.)
+        };
+        let video = !catalog
+            && card["isCurrent"].as_bool() == Some(true)
+            && card["hasBoundVideo"].as_bool() == Some(true);
+        let play = if catalog {
+            json!({"op":op,"id":card["id"]})
+        } else {
+            json!({"op":"stage.program.play","slotIndex":card["slotIndex"]})
+        };
+        let video_command = json!({"op":"stage.program.video","trackID":card["trackID"]});
+        let scroll = self.scroll.clone();
+        let view = cx.weak_entity();
+        let width = transform.width as f32;
+        let height = transform.height as f32;
+        let cache = self.projection_cache.clone();
+        let cache_id = id.clone();
+        let focus = self
+            .focus_handles
+            .entry(id.clone())
+            .or_insert_with(|| cx.focus_handle())
+            .clone();
+        let mouse_focus = focus.clone();
+        let keyboard_play = play.clone();
+        let accessibility_id = id.clone();
+        let canvas = canvas(
+            move |bounds, window, _| {
+                let viewport = scroll.bounds();
+                let origin = [
+                    f64::from(f32::from(bounds.origin.x)) + offset,
+                    f64::from(f32::from(bounds.origin.y)),
+                ];
+                let mask = RailMask {
+                    top: f64::from(f32::from(viewport.origin.y)),
+                    height: f64::from(f32::from(viewport.size.height)),
+                };
+                let corners = [
+                    [0., 0.],
+                    [transform.width, 0.],
+                    [0., transform.height],
+                    [transform.width, transform.height],
+                ]
+                .map(|p| transform.project_point(p));
+                let top = corners
+                    .iter()
+                    .map(|p| p[1] + origin[1])
+                    .fold(f64::INFINITY, f64::min);
+                let bottom = corners
+                    .iter()
+                    .map(|p| p[1] + origin[1])
+                    .fold(f64::NEG_INFINITY, f64::max);
+                if bottom <= mask.top || top >= mask.top + mask.height {
+                    cache.borrow_mut().remove(&cache_id);
+                    return None;
+                }
+                let window_size = [
+                    f64::from(f32::from(window.viewport_size().width)),
+                    f64::from(f32::from(window.viewport_size().height)),
+                ];
+                let cache_key = format!(
+                    "{:p}/{transform:?}/{origin:?}/{window_size:?}/{}/{opacity}/{mask:?}",
+                    Arc::as_ptr(&texture),
+                    window.scale_factor()
+                );
+                if let Some((key, projected, image)) = cache
+                    .borrow()
+                    .get(&cache_id)
+                    .filter(|(key, _, _)| key == &cache_key)
+                {
+                    let _ = key;
+                    return Some((projected.clone(), image.clone()));
+                }
+                let projected = Arc::new(
+                    ProjectedCard::render(
+                        &texture,
+                        transform,
+                        origin,
+                        window_size,
+                        window.scale_factor() as f64,
+                        opacity,
+                        Some(mask),
+                    )
+                    .ok()?,
+                );
+                let image = projected.render_image();
+                cache
+                    .borrow_mut()
+                    .insert(cache_id, (cache_key, projected.clone(), image.clone()));
+                Some((projected, image))
+            },
+            move |_, projected, window, _| {
+                let Some((projected, image)) = projected else {
+                    return;
+                };
+                let b = projected.bounds;
+                let bounds = Bounds::new(
+                    point(px(b[0] as f32), px(b[1] as f32)),
+                    size(px(b[2] as f32), px(b[3] as f32)),
+                );
+                let _ = window.paint_image(bounds, bounds, Corners::default(), image, 0, false);
+                let down_projected = projected.clone();
+                let down_view = view.clone();
+                let down_id = id.clone();
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
+                        return;
+                    }
+                    let point = [
+                        f64::from(f32::from(event.position.x)),
+                        f64::from(f32::from(event.position.y)),
+                    ];
+                    if let Some(local) = down_projected.inverse_hit(point) {
+                        window.focus(&mouse_focus, cx);
+                        let video_hit = video
+                            && local[0] >= 259.
+                            && local[0] <= 285.
+                            && local[1] >= 8.
+                            && local[1] <= 34.;
+                        _ = down_view.update(cx, |this, _| {
+                            this.pressed_card = Some((down_id.clone(), video_hit))
+                        });
+                        cx.stop_propagation();
+                    }
+                });
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
+                        return;
+                    }
+                    let point = [
+                        f64::from(f32::from(event.position.x)),
+                        f64::from(f32::from(event.position.y)),
+                    ];
+                    if let Some(local) = projected.inverse_hit(point) {
+                        let video_hit = video
+                            && local[0] >= 259.
+                            && local[0] <= 285.
+                            && local[1] >= 8.
+                            && local[1] <= 34.;
+                        _ = view.update(cx, |this, cx| {
+                            if this.pressed_card.take() == Some((id.clone(), video_hit)) {
+                                this.commands.push(if video_hit {
+                                    video_command.clone()
+                                } else {
+                                    play.clone()
+                                });
+                                cx.notify();
+                            }
+                        });
+                        cx.stop_propagation();
+                    }
+                });
+            },
+        )
+        .w(px(width))
+        .h(px(height))
+        .flex_shrink_0();
+        let label = if catalog {
+            card["title"].as_str().unwrap_or("").to_owned()
+        } else {
+            format!(
+                "{}，{}，{}",
+                if card["isCurrent"].as_bool() == Some(true) {
+                    "正在播放"
+                } else {
+                    "选择"
+                },
+                card["title"].as_str().unwrap_or(""),
+                card["artist"].as_str().unwrap_or("")
+            )
+        };
+        let mut wrapper = div()
+            .id(accessibility_id)
+            .relative()
+            .w(px(width))
+            .h(px(height))
+            .flex_shrink_0()
+            .role(Role::Button)
+            .aria_label(label)
+            .track_focus(&focus)
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    this.commands.push(keyboard_play.clone());
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .child(canvas);
+        if video {
+            let video_focus = self
+                .focus_handles
+                .entry(format!("video-{}", card["trackID"]))
+                .or_insert_with(|| cx.focus_handle())
+                .clone();
+            let command = json!({"op":"stage.program.video","trackID":card["trackID"]});
+            wrapper = wrapper.child(
+                div()
+                    .id(format!("video-{}", card["trackID"]))
+                    .absolute()
+                    .right(px(9.))
+                    .top(px(8.))
+                    .w(px(26.))
+                    .h(px(26.))
+                    .role(Role::Button)
+                    .aria_label("播放绑定视频")
+                    .track_focus(&video_focus)
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if !event.keystroke.modifiers.modified()
+                            && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                        {
+                            this.commands.push(command.clone());
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    })),
+            );
+        }
+        wrapper.into_any_element()
     }
     fn button(
         &self,
@@ -215,147 +663,12 @@ impl Render for StageProgramRailPane {
                 }
                 self.center_active = false;
             }
-            for card in self.snapshot["tracks"].as_array().into_iter().flatten() {
-                let index = card["slotIndex"].clone();
-                let projection = project_card(card);
-                let current = card["isCurrent"].as_bool() == Some(true);
-                let command = json!({"op":"stage.program.play","slotIndex":index});
-                let mut icon = div()
-                    .w(px(44.))
-                    .h(px(44.))
-                    .rounded_full()
-                    .bg(if current {
-                        rgba(0x00ffff38)
-                    } else {
-                        rgba(0xffffff0f)
-                    })
-                    .flex()
-                    .items_center()
-                    .justify_center();
-                if current {
-                    let audio = &self.snapshot["audioFeatures"];
-                    let mut bars = div()
-                        .w(px(24.))
-                        .h(px(25.))
-                        .flex()
-                        .items_center()
-                        .gap(px(2.));
-                    for i in 0..5 {
-                        let sample = audio["waveform"][i].as_f64().unwrap_or(0.).abs() as f32;
-                        let band = audio[if i < 2 {
-                            "low"
-                        } else if i == 2 {
-                            "mid"
-                        } else {
-                            "high"
-                        }]
-                        .as_f64()
-                        .unwrap_or(0.) as f32;
-                        let amplitude = audio["amplitude"].as_f64().unwrap_or(0.) as f32;
-                        let height = 5. + 18. * sample.max(band * 0.72).max(amplitude * 0.56);
-                        bars = bars.child(
-                            div()
-                                .w(px(2.4))
-                                .h(px(height))
-                                .rounded_full()
-                                .bg(rgb(0x7af2ff)),
-                        );
-                    }
-                    icon = icon.child(bars);
-                } else {
-                    icon = icon.child("♫");
-                }
-                let mut trace = div()
-                    .w(px(28.))
-                    .h(px(22.))
-                    .flex()
-                    .items_center()
-                    .gap(px(2.));
-                for i in 0..7 {
-                    trace = trace.child(
-                        div()
-                            .w(px(2.))
-                            .h(px(energy_height(
-                                card["energy"].as_f64().unwrap_or(0.) as f32,
-                                i,
-                            )))
-                            .rounded_full()
-                            .bg(rgba(0x00ffff6b)),
-                    );
-                }
-                let mut row = div()
-                    .id(format!("track-{index}"))
-                    .w(px(projection.width))
-                    .h(px(projection.height))
-                    .relative()
-                    .left(px(projection.offset))
-                    .flex_shrink_0()
-                    .opacity(projection.opacity)
-                    .px(px(14.))
-                    .rounded(px(23.))
-                    .border_1()
-                    .border_color(if card["isCurrent"].as_bool() == Some(true) {
-                        rgb(0x68d6e8)
-                    } else {
-                        rgb(0x3d454c)
-                    })
-                    .bg(rgb(0x1c252d))
-                    .flex()
-                    .items_center()
-                    .gap(px(13.))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.commands.push(command.clone());
-                        cx.notify();
-                    }))
-                    .child(icon)
-                    .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .gap(px(5.))
-                            .child(
-                                div()
-                                    .text_size(px(if current { 17. } else { 16. }))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(card["title"].as_str().unwrap_or("").to_owned()),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(12.))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .text_size(px(14.))
-                                            .text_color(rgba(0xffffff7a))
-                                            .child(
-                                                card["artist"].as_str().unwrap_or("").to_owned(),
-                                            ),
-                                    )
-                                    .child(trace),
-                            ),
-                    );
-                if card["hasBoundVideo"].as_bool() == Some(true)
-                    && card["isCurrent"].as_bool() == Some(true)
-                {
-                    row = row.child(
-                        div()
-                            .absolute()
-                            .right(px(9.))
-                            .top(px(8.))
-                            .w(px(26.))
-                            .h(px(26.))
-                            .child(self.icon_button(
-                                format!("track-video-{index}"),
-                                gpui_kit::assets::IconName::Video,
-                                "播放这首歌绑定的视频",
-                                json!({"op":"stage.program.video","trackID":card["trackID"]}),
-                                cx,
-                            )),
-                    );
-                }
+            let track_cards = self.snapshot["tracks"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            for card in &track_cards {
+                let row = self.projected_card(card, false, false, "stage.program.play", cx);
                 // GPUI deferred paint preserves measured order/positions and
                 // provides the original card zIndex without reordering tracks.
                 content =
@@ -395,30 +708,10 @@ impl Render for StageProgramRailPane {
                 ("programs", "stage.program.open"),
                 ("playlists", "stage.playlist.open"),
             ] {
-                for item in self.snapshot[key].as_array().into_iter().flatten() {
-                    let id = item["id"].as_str().unwrap_or("");
-                    content = content.child(
-                        div()
-                            .w(px(306.))
-                            .h(px(74.))
-                            .flex_shrink_0()
-                            .px(px(14.))
-                            .rounded(px(22.))
-                            .bg(rgb(0x1c252d))
-                            .border_1()
-                            .border_color(rgb(0x3d454c))
-                            .child(self.button(
-                                format!("{key}-{id}"),
-                                item["title"].as_str().unwrap_or("").to_owned(),
-                                json!({"op":op,"id":id}),
-                                cx,
-                            ))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .child(item["subtitle"].as_str().unwrap_or("").to_owned()),
-                            ),
-                    );
+                let items = self.snapshot[key].as_array().cloned().unwrap_or_default();
+                for item in &items {
+                    let row = self.projected_card(item, true, key == "playlists", op, cx);
+                    content = content.child(row);
                 }
             }
             if self.snapshot["programs"]
@@ -437,6 +730,8 @@ impl Render for StageProgramRailPane {
             }
         }
         div()
+            .id("stage-program-rail")
+            .capture_any_mouse_down(cx.listener(|this, _, _, _| this.pressed_card = None))
             .w(px(350.))
             .h(px(430.))
             .pt(px(42.))
@@ -502,21 +797,63 @@ fn active_center_offset(index: usize, viewport: f32, maximum: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        PROGRAM_SPACING, TRACK_SPACING, active_center_offset, card_priority, energy_height,
-        project_card, snap_offset,
+        PROGRAM_SPACING, TRACK_SPACING, active_center_offset, card_priority, card_svg,
+        card_transform, energy_height, snap_offset,
     };
     use serde_json::json;
     #[test]
+    fn real_gpui_window_draw_empty_and_projected_catalog_obeys_paint_phase() {
+        use gpui_kit::{AppContext, TestAppContext};
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let handle = cx.add_window(|window, cx| {
+            let pane = cx.new(|cx| super::StageProgramRailPane::new(window, cx));
+            gpui_kit::base::Root::new(pane, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, _| {
+            let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                window.on_mouse_event(|_: &gpui_kit::MouseDownEvent, _, _, _| {});
+            }));
+            assert!(
+                rejected.is_err(),
+                "test window must exercise GPUI's real paint-phase guard"
+            );
+        })
+        .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        // Real production pane/layout/paint paths, not an extracted math probe.
+        let projected=cx.add_window(|window,cx|{
+            let pane=cx.new(|cx|{
+                let mut pane=super::StageProgramRailPane::new(window,cx);
+                pane.snapshot=json!({"route":"programs","programs":[{"id":"phase-regression","title":"绘制阶段","subtitle":"真实字段","isCurrent":true}],"playlists":[]});
+                pane
+            });
+            gpui_kit::base::Root::new(pane,window,cx)
+        });
+        cx.update_window(projected.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        cx.update_window(projected.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+    }
+    #[test]
     fn visual_depth_does_not_change_original_card_layout() {
-        let current = project_card(&json!({"isCurrent":true,"scale":1.,"depth":0,"opacity":1.}));
-        let distant = project_card(
+        let current = card_transform(
+            &json!({"isCurrent":true,"scale":1.,"depth":0,"opacity":1.}),
+            false,
+        );
+        let distant = card_transform(
             &json!({"isCurrent":false,"scale":0.89,"depth":-144,"opacity":0.68,"relativeIndex":2}),
+            false,
         );
         assert_eq!(distant.width, 294.);
         assert_eq!(current.width, 294.);
         assert_eq!(distant.height, 76.);
         assert_eq!(current.height, 76.);
-        assert_eq!(distant.opacity, 0.68);
+        assert_eq!(distant.y_degrees, -15.);
+        assert_eq!(current.y_degrees, -4.);
+        assert_eq!(current.scale, 1.055);
+        assert_eq!(distant.perspective, 0.72);
     }
     #[test]
     fn active_card_centers_using_original_overlap_and_margins() {
@@ -560,8 +897,61 @@ mod tests {
     #[test]
     fn focus_restores_visibility_without_mutating_host_card() {
         let card = json!({"isFocused":true,"scale":0.89,"depth":-144,"opacity":0.68});
-        assert_eq!(project_card(&card).opacity, 1.);
+        assert!((card_transform(&card, false).scale - 0.945).abs() < 1e-12);
         assert_eq!(card["opacity"], 0.68);
+    }
+    #[test]
+    fn complete_card_content_rasterizes_before_projecting() {
+        let card = json!({"title":"实际字段 中文 A","artist":"Artist","isCurrent":true,"hasBoundVideo":true,"energy":0.6});
+        let svg = card_svg(&card, &json!({"amplitude":0.5}), false, false);
+        let renderer = gpui_kit::SvgRenderer::new(std::sync::Arc::new(()));
+        let image = renderer
+            .render_single_frame(svg.as_bytes(), 1.)
+            .expect("full card SVG");
+        assert!(image.as_bytes(0).unwrap().iter().any(|v| *v != 0));
+        let dimensions = image.size(0);
+        let mut pixels = image.as_bytes(0).unwrap().to_vec();
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+        let texture = super::RgbaTexture {
+            width: dimensions.width.0 as u32,
+            height: dimensions.height.0 as u32,
+            pixels,
+        };
+        let transform = card_transform(&card, false);
+        let projected = super::ProjectedCard::render(
+            &texture,
+            transform,
+            [30., 50.],
+            [800., 600.],
+            2.,
+            1.,
+            Some(super::RailMask {
+                top: 0.,
+                height: 600.,
+            }),
+        )
+        .unwrap();
+        let point = transform.project_point([272., 21.]);
+        let hit = projected
+            .inverse_hit([point[0] + 30., point[1] + 50.])
+            .expect("same projected video content accepts inverse pointer");
+        assert!((hit[0] - 272.).abs() < 1e-8 && (hit[1] - 21.).abs() < 1e-8);
+        assert_ne!(projected.texture.pixels, texture.pixels);
+        assert!(svg.matches("<path").count() > 2);
+        let plain = card_svg(
+            &json!({"title":"","artist":"","isCurrent":false}),
+            &serde_json::Value::Null,
+            false,
+            false,
+        );
+        assert_ne!(svg, plain);
+        let catalog = card_transform(&card, true);
+        assert_eq!(
+            (catalog.width, catalog.height, catalog.y_degrees),
+            (306., 74., -7.)
+        );
     }
     #[test]
     fn energy_trace_uses_real_track_energy() {

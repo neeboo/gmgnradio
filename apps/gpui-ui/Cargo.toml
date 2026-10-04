@@ -8,3 +8,7 @@ edition = "2024"
 [dependencies]
 gpui-kit = "=0.7.0"
 serde_json = "=1.0.151"
+image = { version = "=0.25.10", default-features = false }
+
+[dev-dependencies]
+gpui-kit = { version = "=0.7.0", features = ["test-support"] }

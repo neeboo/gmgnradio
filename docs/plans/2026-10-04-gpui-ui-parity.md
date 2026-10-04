@@ -295,3 +295,21 @@ v24实际选择Orb→应用菜单显示小窗，Kit引导覆盖真实船舱且�
 v25完整包构建exit0，日志`/tmp/gmgn-gpui-product-app-build-v25.log`；实际启动路径`tmp/gpui-product-app-v25/gmgn radio.app`、PID92957，同一业务数据根，日志`/tmp/gmgn-gpui-parity-v25-runtime.log`。只退出v24测试包，不碰安装版。CUA实际打开摆放，物件两格标签已为segmented；删除弹窗独立显示真实资产名、原不可恢复说明、取消及危险确认，底下面板未再被红块撑长。实际Escape关闭，重开后点取消也关闭；同一资产行、原人物与世界继续可见。没有执行永久删除。此取消/布局子路径通过，不代表全部摆放/手持或模态穿透验收通过。
 
 节目补原列表4pt间距、保序绘制层级、真实ScrollHandle停滚边界吸附；歌词confession补退出段生命周期、倒退/重入/换scope清理，使用实际snapshot而非生产fixture。最终完整UI测试exit0，日志`/tmp/gmgn-gpui-v25-ui-tests.log`。真实节目目录为空，这些卡片/歌词视觉仍未业务验收。原速度限幅、真3D投影/磨砂与alpha渐隐、歌词其他模式细节仍欠；props行横排/状态色、分组头及滑块草稿读数仍欠。菜单新包实际状态项未操作，继续待验。下一批真实投影可走Rust整卡RGBA+inverse homography合成，但只是只读可行性结论，尚未实现或实测。
+
+### v26 对齐继续实施
+
+上一轮b4a82669321d6dbb3a6da18c0a239cc1599e66b8实际提交推送并核对远端，属于进展。生产props投影补原row.state.rawValue，避免根据中文状态猜颜色；宿主build21 exit0（`/tmp/gmgn-gpui-owner-state-host-build21.log`），原ownership投影回归exit0（`/tmp/gmgn-gpui-owner-state-projection.log`）。props补原名称/状态同排、状态色/icon/check、分组头及SliderState拖动草稿读数，原尺寸保持；新包实际视觉仍待验。
+
+v25/PID92957实际设置Cmd+逗号可达。居民人格追加测试行保存、关闭设置重开，居民字段保留该行，DJ字段可见文本未被改写；随后删除测试行保存恢复原人格，AX读回一致。未改登录、后台开关、凭据或麦克风。隔离suite单字段resident.persona.v1未返回值，这次仅证实设置重开状态，不能当进程重启持久化证明；待后续独立验证原默认存储实际路径。
+
+Rust整RGBA卡片投影模块已实现真实homography、trailing anchor/perspective.72、8%/92%alpha rail mask及inverse hit，直接image依赖复用已锁0.25.10无版本升级，模块9测试与App check exit0。节目生产接入仍在整合测试；不能把模块数学/纹理测试算真实卡片视觉或性能通过，磨砂、blur/shadow、scrollTransition与键盘/AX仍需核验。歌词contextual字体/对齐/宽度/渐变/滤镜按原参数继续补齐，未把源码实现计11模式验收。
+
+v26完整包构建exit0、最终UI73测试exit0，日志`/tmp/gmgn-gpui-product-app-build-v26.log`、`/tmp/gmgn-gpui-v26-ui-tests.log`。实际路径`tmp/gpui-product-app-v26/gmgn radio.app`、PID96477，同一业务根。真实物件横排/颜色/选中check已可见，但AX缺行标签及尺寸最长边同行裁切，已追加窄修且待v27复验。CUA只选择/按Esc，无resize/删除。
+
+v26从装修Esc取消预览后点击节目出现白屏，进程实际退出；runtime3293记录GPUI window.rs5250 panic“this method can only be called during paint”。独立日志/源码定位program.rs Render::render直接注册window.on_mouse_event，非Swift窗口抢面；已返工移到合法paint阶段。单测73通过未覆盖真实pane挂载，不能据此计节目可用。本轮真实发现失败，未报告完成。恢复原居民人格后单字段`ai.gmgn.radio.e2e/resident.persona.v1`读回原文字，原ResidentPreferences默认使用该测试包standard域，非语音用的每root suite；不读取整域或凭据。
+
+v27完整包构建exit0（`/tmp/gmgn-gpui-product-app-build-v27.log`），实际路径`tmp/gpui-product-app-v27/gmgn radio.app`、PID97960，同一业务根（`/tmp/gmgn-gpui-parity-v27-runtime.log`）。CUA打开节目空列表、收起、再次打开，进程仍运行，第二次场景/人物与空提示同屏，没有再次abort；首个启动后的打开截图背景暂白，随后船舱恢复，未将首帧加载状态当永久白屏，也未证明启动全时无空白。props真实AX行名称恢复“E2E端到端电视，已摆放”，点击后包含已选中，横排check可见；实际滚动到尺寸四按钮，最长边0.40m与滑块右0.40m完整显示，原340宽未改。按Esc退出预览，未改变尺寸/摆放/删除。行键盘选择及拖动草稿尚未实际操作。
+
+program直接render事件注册已改成熟div.capture_any_mouse_down（实际paint注册），新增GPUI test-support dev-only回归真的创建Root/Pane并执行draw，空目录及整卡两帧draw通过；完整75测试通过的worker结果与主代理最终日志另记。新test依赖只新增锁项，没有升级已有crate。实际完整节目曲目/歌词仍因无真实曲目未验收；磨砂、blur/shadow、scrollTransition、原动画/限幅、歌单真实封面仍欠。没有把正常打开空目录计完整播放视觉通过。
+
+主代理最终复跑UI75/75、App10/10均exit0，日志`/tmp/gmgn-gpui-v27-ui-tests.log`、`/tmp/gmgn-gpui-v27-app-tests.log`；差异检查及敏感模式扫描通过。UI原布局完整对齐目标继续，真实完整业务与视觉验收未完成。
