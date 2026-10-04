@@ -346,6 +346,10 @@ v30完整包exit0，实际PID12373，runtime`/tmp/gmgn-gpui-parity-v30-runtime.l
 
 v31完整包exit0（`/tmp/gmgn-gpui-product-app-build-v31.log`），PID12710，同一数据根，runtime`/tmp/gmgn-gpui-parity-v31-runtime.log`。CUA先通过原装修面板Esc结束摆放，再小窗提交同一句真实请求，request1 accepted→reply；截图文字在气泡内换行，右侧关闭X和六圆入口完整可见。此用户回复换行子路径通过，不计自主后台交付实际通过。未注入语音密钥，本轮原语音提示缺凭据，声音未验收；未录音/登录/删除资产。最后源码复核去掉展开时绕过dismiss的条件，保留关闭语义；此最后窄修仍需新包真实关闭/恢复复验，不能把v31截图扩大为该行为通过。
 
+### v36 后续实际控件状态差异
+
+上一轮空态修复及桥接契约已推送，远端当前 `fe17d0afde2e45b0da55842f4999d3a5b03290bd`。本轮在仍运行的 v36 隔离 App 中点击聊天，输入区出现，但 AX 聊天按钮仍为“聊天”，没有原 `StageResidentChatButton.setExpanded` 的“收起聊天”和展开值；确认交互状态尚未对齐。只读原源码另确认目的地缺12pt系统符号、底栏缺6+1×20+6分隔、自主横幅缺状态符号。正在修复原系统图标和被动 ultraThinMaterial；未将派发工作当完成，未录音、重新授权或删除素材。
+
 ### v36 修复原空态布局与同帧延迟卡材料
 
 按原Swift真实条件修复空态：内容自然宽141.501945pt、height64/radius22，根右对齐，42+96顶部偏移，无header/ScrollView/contentMargins/railMask。native增加fade_fraction setter，0保留viewport矩形裁剪而不渐隐，轨道.08保留原fade；非法值拒绝，native结构测试通过。材质发布改为最高priority deferred prepaint，保证所有延迟卡真实矩阵收集后、任何前景paint前整批apply，修原tracks frame0生产问题。绑定视频26×26/r13材质使用卡matrix*T(259,8)，同帧失效恢复完整背景，布局/命中/键盘不变。UI93/93 exit0（worker session14866，6.18秒，新增多阶段draw不能与旧测试总时长直接比性能）。App13/13+ABI1/1 exit0（`/tmp/gmgn-gpui-v36-app-tests.log`），完整v36包exit0（`/tmp/gmgn-gpui-product-app-build-v36.log`）。
