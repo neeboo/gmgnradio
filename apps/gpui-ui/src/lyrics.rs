@@ -1,14 +1,13 @@
 //! Original stage lyric compositions, rendered through GPUI's SVG drawing API.
 //! The host supplies the resolved mode and original scene models; no lyric clock or
 //! scene director is reconstructed here. SVG handles rotation, blur and glow;
-//! out-of-plane rotations use projected glyph positions and horizontal scale.
+//! out-of-plane rotations project shaped contours and complete panel geometry.
 use gpui_kit::component::{button::*, *};
 use gpui_kit::*;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::Arc;
-use std::time::Instant;
 
 fn num(value: &Value, key: &str, default: f64) -> f64 {
     value[key]
@@ -66,6 +65,114 @@ struct Scene<'a> {
     weight: u16,
     tracking: f64,
     projection: Option<(f64, f64, f64, (f64, f64, f64), f64)>,
+    panel: Option<PanelTransform>,
+    local: Option<(f64, f64, f64, f64)>,
+    text_filter: String,
+}
+#[derive(Clone, Copy, Debug)]
+struct PanelTransform {
+    anchor: outline::Point,
+    angle: f64,
+    axis: (f64, f64, f64),
+    perspective: f64,
+    width: f64,
+    rotation: f64,
+    scale: f64,
+    scale_anchor: outline::Point,
+    position: outline::Point,
+}
+impl PanelTransform {
+    fn map(self, point: outline::Point) -> outline::Point {
+        let (s, c) = self.rotation.to_radians().sin_cos();
+        let dx = point.x - self.anchor.x;
+        let dy = point.y - self.anchor.y;
+        let rotated = outline::Point {
+            x: dx * c - dy * s,
+            y: dx * s + dy * c,
+        };
+        let projected =
+            outline::project(rotated, self.angle, self.axis, self.perspective, self.width);
+        let point = outline::Point {
+            x: self.anchor.x + projected.x,
+            y: self.anchor.y + projected.y,
+        };
+        outline::Point {
+            x: self.position.x + self.scale_anchor.x + (point.x - self.scale_anchor.x) * self.scale,
+            y: self.position.y + self.scale_anchor.y + (point.y - self.scale_anchor.y) * self.scale,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug)]
+struct TranslationStyle {
+    weight: u16,
+    tracking: f64,
+    opacity: f64,
+    max_lines: usize,
+    min_scale: f64,
+    width: f64,
+}
+fn translation_style(mode: &str, width: f64) -> TranslationStyle {
+    let mut style = TranslationStyle {
+        weight: 500,
+        tracking: 0.,
+        opacity: 0.58,
+        max_lines: 2,
+        min_scale: 1.,
+        width: width * 0.64,
+    };
+    match mode {
+        "luminous" => {
+            style.tracking = 0.7;
+            style.opacity = 0.66;
+            style.width = 720.;
+        }
+        "confession" => {
+            style.opacity = 0.56;
+            style.width = 620.;
+            style.max_lines = usize::MAX;
+        }
+        "claddagh" => {
+            style.opacity = 0.58;
+            style.max_lines = usize::MAX;
+            style.width = width;
+        }
+        "monet_poster" => style.opacity = 0.54,
+        "article" => style.width = 680.,
+        "cloud_steps" => {
+            style.tracking = 0.8;
+            style.opacity = 0.48;
+            style.width = 520f64.min(width * 0.5);
+        }
+        "chorus_chat" => style.opacity = 0.56,
+        "diorama" => {
+            style.opacity = 0.54;
+            style.width = width * 0.6;
+        }
+        "folding_verse" => {
+            style.weight = 600;
+            style.max_lines = 1;
+            style.min_scale = 0.7;
+        }
+        _ => {}
+    }
+    style
+}
+fn rounded_rectangle(x: f64, y: f64, w: f64, h: f64, r: f64) -> Vec<outline::Command> {
+    use outline::{Command::*, Point};
+    let r = r.min(w / 2.).min(h / 2.);
+    let p = |x, y| Point { x, y };
+    vec![
+        Move(p(x + r, y)),
+        Line(p(x + w - r, y)),
+        Quad(p(x + w, y), p(x + w, y + r)),
+        Line(p(x + w, y + h - r)),
+        Quad(p(x + w, y + h), p(x + w - r, y + h)),
+        Line(p(x + r, y + h)),
+        Quad(p(x, y + h), p(x, y + h - r)),
+        Line(p(x, y + r)),
+        Quad(p(x, y), p(x + r, y)),
+        Close,
+    ]
 }
 impl<'a> Scene<'a> {
     fn new(snapshot: &'a Value, width: f64, height: f64) -> Self {
@@ -86,6 +193,9 @@ impl<'a> Scene<'a> {
             weight: 600,
             tracking: 0.,
             projection: None,
+            panel: None,
+            local: None,
+            text_filter: "url(#textShadow)".to_owned(),
             svg,
         }
     }
@@ -98,6 +208,16 @@ impl<'a> Scene<'a> {
     }
     fn audio(&self, key: &str, default: f64) -> f64 {
         num(&self.snapshot["audioMotion"], key, default)
+    }
+    fn panel_point(&self, mut point: outline::Point) -> outline::Point {
+        if let Some((x, y, rotation, scale)) = self.local {
+            let (s, c) = rotation.to_radians().sin_cos();
+            point = outline::Point {
+                x: x + scale * (point.x * c - point.y * s),
+                y: y + scale * (point.x * s + point.y * c),
+            };
+        }
+        self.panel.map(|panel| panel.map(point)).unwrap_or(point)
     }
     fn line(
         &mut self,
@@ -121,7 +241,9 @@ impl<'a> Scene<'a> {
                     x: x + offset + point.x,
                     y: baseline - point.y,
                 };
-                if let Some((cx, cy, angle, axis, width)) = self.projection {
+                if self.panel.is_some() {
+                    self.panel_point(point)
+                } else if let Some((cx, cy, angle, axis, width)) = self.projection {
                     let projected = outline::project(
                         outline::Point {
                             x: point.x - cx,
@@ -140,21 +262,24 @@ impl<'a> Scene<'a> {
                     point
                 }
             };
-            let path = if self.projection.is_some() {
+            let path = if self.projection.is_some() || self.panel.is_some() {
                 outline::projected_path(&shaped.commands, map)
             } else {
                 outline::svg_path(&shaped.commands, map)
             };
             let _ = write!(
                 self.svg,
-                r#"<path aria-label="{}" d="{path}" fill="{color}" opacity="{opacity}" filter="url(#textShadow)"/>"#,
-                escape(text)
+                r#"<path aria-label="{}" d="{path}" fill="{color}" opacity="{opacity}" filter="{}"/>"#,
+                escape(text),
+                self.text_filter
             );
             return;
         }
         let _ = write!(
             self.svg,
-            r#"<text x="{x}" y="{y}" text-anchor="{anchor}" dominant-baseline="middle" font-family="system-ui, PingFang SC, sans-serif" font-size="{size}" font-weight="600" fill="{color}" opacity="{opacity}">{}</text>"#,
+            r#"<text x="{x}" y="{y}" text-anchor="{anchor}" dominant-baseline="middle" font-family="system-ui, PingFang SC, sans-serif" font-size="{size}" font-weight="{}" letter-spacing="{}" fill="{color}" opacity="{opacity}">{}</text>"#,
+            self.weight,
+            self.tracking,
             escape(text)
         );
     }
@@ -177,6 +302,40 @@ impl<'a> Scene<'a> {
             .map(|line| line.width)
             .unwrap_or_else(|| text.chars().count() as f64 * size * 0.6)
     }
+    fn text_height(&mut self, text: &str, size: f64, width: f64, max_lines: usize) -> f64 {
+        let lines = outline::wrap_styled(text, size, width, self.weight, self.tracking);
+        self.outlined("Ag中文", size)
+            .map(|line| line.ascent + line.descent)
+            .unwrap_or(size * 1.2)
+            * lines.len().min(max_lines) as f64
+    }
+    fn fitted_size(&mut self, text: &str, size: f64, width: f64, minimum: f64) -> f64 {
+        let mut resolved = size;
+        while self.measured_width(text, resolved) > width && resolved > size * minimum + 0.1 {
+            resolved = (resolved - 0.5).max(size * minimum);
+        }
+        resolved
+    }
+    fn panel_rect(
+        &mut self,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        r: f64,
+        fill: &str,
+        fill_opacity: f64,
+        stroke: &str,
+        stroke_opacity: f64,
+        stroke_width: f64,
+    ) {
+        let commands = rounded_rectangle(x, y, w, h, r);
+        let path = outline::projected_path(&commands, |point| self.panel_point(point));
+        let _ = write!(
+            self.svg,
+            r#"<path d="{path}" fill="{fill}" fill-opacity="{fill_opacity}" stroke="{stroke}" stroke-opacity="{stroke_opacity}" stroke-width="{stroke_width}"/>"#
+        );
+    }
     fn paragraph(
         &mut self,
         text: &str,
@@ -194,10 +353,10 @@ impl<'a> Scene<'a> {
             return;
         }
         let mut resolved = size;
-        let mut lines = outline::wrap(text, size, width);
+        let mut lines = outline::wrap_styled(text, size, width, self.weight, self.tracking);
         while lines.len() > max_lines && resolved > size * min_scale + 0.1 {
             resolved = (resolved - 0.5).max(size * min_scale);
-            lines = outline::wrap(text, resolved, width);
+            lines = outline::wrap_styled(text, resolved, width, self.weight, self.tracking);
         }
         if lines.len() > max_lines {
             lines.truncate(max_lines);
@@ -278,6 +437,15 @@ impl<'a> Scene<'a> {
         stroke: &str,
         opacity: f64,
     ) {
+        if self.panel.is_some() {
+            let commands = rounded_rectangle(x, y, w, h, r);
+            let path = outline::projected_path(&commands, |point| self.panel_point(point));
+            let _ = write!(
+                self.svg,
+                r#"<path d="{path}" fill="{fill}" stroke="{stroke}" stroke-width="1" opacity="{opacity}"/>"#
+            );
+            return;
+        }
         let _ = write!(
             self.svg,
             r#"<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="{r}" fill="{fill}" stroke="{stroke}" stroke-width="1" opacity="{opacity}"/>"#
@@ -286,26 +454,34 @@ impl<'a> Scene<'a> {
     fn translation(&mut self, x: f64, y: f64, size: f64, anchor: &str) {
         let value = text(&self.snapshot["flow"], "translation");
         if !value.is_empty() {
-            let width = match self.snapshot["mode"].as_str().unwrap_or("") {
-                "luminous" => 720.,
-                "confession" => 620.,
-                "cloud_steps" => 520f64.min(self.width * 0.5),
-                "article" => 680.,
-                "diorama" => self.width * 0.6,
-                _ => self.width * 0.64,
-            };
+            let style = translation_style(self.snapshot["mode"].as_str().unwrap_or(""), self.width);
+            let previous = (self.weight, self.tracking);
+            let previous_filter = self.text_filter.clone();
+            (self.weight, self.tracking) = (style.weight, style.tracking);
+            if self.snapshot["mode"] == "luminous" {
+                self.svg.push_str(r#"<defs><filter id="translationShadow" x="-50%" y="-100%" width="200%" height="300%"><feDropShadow dx="0" dy="0" stdDeviation="2.5" flood-color="black" flood-opacity="0.9"/></filter></defs>"#);
+                self.text_filter = "url(#translationShadow)".to_owned();
+            } else {
+                self.text_filter = "none".to_owned();
+            }
             self.paragraph(
                 &value,
                 x,
                 y,
                 size,
-                width,
-                2,
-                1.,
-                0.58,
-                &self.primary.clone(),
+                style.width,
+                style.max_lines,
+                style.min_scale,
+                style.opacity,
+                &if self.snapshot["mode"] == "claddagh" {
+                    "#ffffff".to_owned()
+                } else {
+                    self.primary.clone()
+                },
                 anchor,
             );
+            (self.weight, self.tracking) = previous;
+            self.text_filter = previous_filter;
         }
     }
     fn glyphs(&mut self, cx: f64, cy: f64, size: f64, arc: bool) {
@@ -322,7 +498,12 @@ impl<'a> Scene<'a> {
             .iter()
             .map(|glyph| self.measured_width(&text(glyph, "text"), size))
             .collect();
-        let spacing = size * if arc { 0.012 } else { 0.015 };
+        let spacing = size
+            * if arc || self.snapshot["mode"] == "diorama" {
+                0.012
+            } else {
+                0.015
+            };
         let total = widths.iter().sum::<f64>() + spacing * count.saturating_sub(1) as f64;
         let mut cursor = cx - total / 2.;
         for (index, glyph) in glyphs.iter().enumerate() {
@@ -364,11 +545,15 @@ impl<'a> Scene<'a> {
             let rotation = num(glyph, "rotation", 0.) * motion;
             self.projection =
                 projection.map(|(_, _, angle, axis, width)| (cx - x, cy - y, angle, axis, width));
-            let _ = write!(
-                self.svg,
-                r#"<g transform="translate({x} {y}) rotate({rotation}) scale({} {scale})" opacity="{opacity}">"#,
-                scale
-            );
+            if self.panel.is_some() {
+                self.local = Some((x, y, rotation, scale));
+                let _ = write!(self.svg, r#"<g opacity="{opacity}">"#);
+            } else {
+                let _ = write!(
+                    self.svg,
+                    r#"<g transform="translate({x} {y}) rotate({rotation}) scale({scale})" opacity="{opacity}">"#
+                );
+            }
             if phase == "active" {
                 let glow = if chorus {
                     self.secondary.clone()
@@ -420,6 +605,7 @@ impl<'a> Scene<'a> {
                 );
             }
             self.svg.push_str("</g>");
+            self.local = None;
         }
         (self.weight, self.tracking) = previous_style;
         self.projection = projection;
@@ -461,9 +647,11 @@ impl<'a> Scene<'a> {
         let mut lines = items(&self.snapshot["depth"], "lines");
         lines.sort_by_key(|line| num(line, "position", 1.) == 0.);
         for line in lines {
-            let p = num(&line, "position", 0.);
-            let current = p == 0.;
-            let size = if current { 38. } else { 24. }
+            let current = num(&line, "position", 0.) == 0.;
+            let p = num(&line, "presentationPosition", num(&line, "position", 0.));
+            self.weight = if current { 700 } else { 600 };
+            self.tracking = if current { 0.4 } else { 0.1 };
+            let size = num(&line, "presentationSize", if current { 38. } else { 24. })
                 * num(&line, "scale", 1.)
                 * if current {
                     self.audio("expansion", 1.)
@@ -590,12 +778,20 @@ impl<'a> Scene<'a> {
                 continue;
             }
             let tilted = segment["isTilted"].as_bool() == Some(true);
-            let sx = x + self.width * num(&segment, "xOffset", 0.);
+            let progress = num(
+                &self.snapshot["_presentation"]["segments"],
+                &text(&segment, "id"),
+                1.,
+            );
+            let sx = x
+                + self.width * num(&segment, "xOffset", 0.)
+                + (if tilted { 34. } else { -22. }) * (1. - progress);
             let y = self.height * 0.38 + row as f64 * size * 1.08 - 14.;
             let _ = write!(
                 self.svg,
-                r#"<g transform="translate({sx} {y}) rotate({})">"#,
-                if tilted { -7. } else { 0. }
+                r#"<g transform="translate({sx} {y}) rotate({})" opacity="{}">"#,
+                if tilted { -7. } else { 0. },
+                progress.clamp(0., 1.)
             );
             let fill = if tilted {
                 "url(#tiltGradient)".to_owned()
@@ -646,7 +842,14 @@ impl<'a> Scene<'a> {
         for entry in entries {
             let offset = num(&entry, "offset", 0.);
             let sx = x + 28. + offset.abs() * 18. + if offset > 0. { 12. } else { 0. };
-            let y = self.height * 0.5 + offset * (size * 0.6 + 14.);
+            let transition = &entry["_presentation"];
+            let y =
+                self.height * 0.5 + offset * (size * 0.6 + 14.) + num(transition, "offsetY", 0.);
+            let _ = write!(
+                self.svg,
+                r#"<g opacity="{}">"#,
+                num(transition, "opacity", 1.)
+            );
             if offset == 0. {
                 self.glyphs(sx + self.width * 0.31, y, size, false);
                 self.translation(sx, y + size * 0.6, (size * 0.2).max(15.), "start");
@@ -666,6 +869,7 @@ impl<'a> Scene<'a> {
                     "start",
                 );
             }
+            self.svg.push_str("</g>");
         }
     }
     fn editorial(&mut self) {
@@ -789,52 +993,131 @@ impl<'a> Scene<'a> {
             ("nextLine", 0.28, 0.7, 0.82, 0.28, -38f64),
         ] {
             let value = text(&self.snapshot["flow"][key], "text");
-            let width = 520f64.min(self.width * 0.46) * scale * rotation.to_radians().cos();
-            self.rect(
-                cx + self.width * dx - width / 2.,
-                self.height * y - 34.,
+            if value.is_empty() {
+                continue;
+            }
+            self.weight = 600;
+            self.tracking = 0.;
+            let width = 520f64.min(self.width * 0.46);
+            let height = self.text_height(&value, 24., width, 2) + 44.;
+            self.panel = Some(PanelTransform {
+                anchor: outline::Point::default(),
+                angle: rotation,
+                axis: (if key == "previousLine" { 0.08 } else { 0.06 }, 1., 0.),
+                perspective: 0.68,
                 width,
-                68.,
+                rotation: 0.,
+                scale,
+                scale_anchor: outline::Point::default(),
+                position: outline::Point {
+                    x: cx + self.width * dx,
+                    y: self.height * y,
+                },
+            });
+            self.panel_rect(
+                -width / 2.,
+                -height / 2.,
+                width,
+                height,
                 24.,
                 "#ffffff",
-                "#ffffff",
                 0.025,
+                "#ffffff",
+                0.07,
+                0.8,
             );
-            self.perspective_line(
+            self.paragraph(
                 &value,
-                cx + self.width * dx,
-                self.height * y,
-                24. * scale,
+                0.,
+                0.,
+                24.,
+                width,
+                2,
+                1.,
                 opacity,
                 &self.primary.clone(),
-                rotation,
-                (if key == "previousLine" { 0.08 } else { 0.06 }, 1., 0.),
-                0.68,
                 "middle",
             );
+            self.panel = None;
         }
         let size = font_size(&self.active_text(), self.width * 0.6);
-        let cy = self.height * 0.5;
-        self.projection = Some((
-            0.,
-            0.,
-            (time * 0.23).sin() * 2.4,
-            (0.04, 1., 0.),
-            self.width * 0.6,
-        ));
-        self.rect(
-            cx - self.width * 0.3 - 34.,
-            cy - size / 2. - 28.,
-            self.width * 0.6 + 68.,
-            size + 84.,
+        self.weight = 700;
+        self.tracking = size * -0.018;
+        let glyphs = items(&self.snapshot["flow"], "glyphs");
+        let content_width = glyphs
+            .iter()
+            .map(|glyph| self.measured_width(&text(glyph, "text"), size))
+            .sum::<f64>()
+            + size * 0.012 * glyphs.len().saturating_sub(1) as f64;
+        let glyph_height = self
+            .outlined("Ag中文", size)
+            .map(|line| line.ascent + line.descent)
+            .unwrap_or(size * 1.2);
+        let translation = text(&self.snapshot["flow"], "translation");
+        let translation_size = (size * 0.18).max(15.);
+        self.weight = 500;
+        self.tracking = 0.;
+        let translation_height =
+            self.text_height(&translation, translation_size, self.width * 0.6, 2);
+        let content_height = glyph_height
+            + if translation.is_empty() {
+                0.
+            } else {
+                14. + translation_height
+            };
+        let width = content_width.max(if translation.is_empty() {
+            0.
+        } else {
+            self.measured_width(&translation, translation_size)
+                .min(self.width * 0.6)
+        }) + 68.;
+        let height = content_height + 56.;
+        self.panel = Some(PanelTransform {
+            anchor: outline::Point::default(),
+            angle: (time * 0.23).sin() * 2.4,
+            axis: (0.04, 1., 0.),
+            perspective: 0.72,
+            width,
+            rotation: 0.,
+            scale: self.audio("expansion", 1.),
+            scale_anchor: outline::Point::default(),
+            position: outline::Point {
+                x: cx,
+                y: self.height * 0.5 + self.audio("beatLift", 0.) * 0.22,
+            },
+        });
+        let shadow = 26. + self.audio("high", 0.) * 18.;
+        let glow = self.audio("glow", 0.) * 0.7;
+        let _ = write!(
+            self.svg,
+            r#"<defs><linearGradient id="dioramaBorder" x1="0" y1="0" x2="1" y2="1"><stop stop-color="{}" stop-opacity="0.5"/><stop offset="0.5" stop-color="{}" stop-opacity="0.24"/><stop offset="1" stop-color="{}" stop-opacity="0.38"/></linearGradient><filter id="dioramaShadow" x="-100%" y="-100%" width="300%" height="300%"><feDropShadow dx="0" dy="0" stdDeviation="{}" flood-color="{}" flood-opacity="{glow}"/></filter></defs><g filter="url(#dioramaShadow)">"#,
+            self.accent,
+            self.secondary,
+            self.primary,
+            shadow / 2.,
+            self.accent
+        );
+        self.panel_rect(
+            -width / 2.,
+            -height / 2.,
+            width,
+            height,
             28.,
             "#000000",
-            &self.accent.clone(),
             0.26,
+            "url(#dioramaBorder)",
+            1.,
+            1.,
         );
-        self.glyphs(cx, cy, size, false);
-        self.translation(cx, cy + size * 0.6 + 14., (size * 0.18).max(15.), "middle");
-        self.projection = None;
+        self.glyphs(0., -content_height / 2. + glyph_height / 2., size, false);
+        self.translation(
+            0.,
+            content_height / 2. - translation_height / 2.,
+            translation_size,
+            "middle",
+        );
+        self.svg.push_str("</g>");
+        self.panel = None;
     }
     fn folding(&mut self) {
         let fold = &self.snapshot["fold"];
@@ -867,61 +1150,132 @@ impl<'a> Scene<'a> {
             } else {
                 0.16 + p * 0.84
             };
-            let rotation = if historical { direction * 90. * p } else { 0. };
-            let _ = write!(
-                self.svg,
-                r#"<g transform="translate({x} {y}) rotate({rotation}) scale({scale})" opacity="{opacity}">"#
-            );
             let active = lines.iter().position(|l| l["id"] == fold["activeLineID"]);
-            let mut cy = -(lines.len() as f64) * 34.;
+            let mut rows = vec![];
+            let mut height = 0.;
             for (index, line) in lines.iter().enumerate() {
                 let current = !historical && line["id"] == fold["activeLineID"];
-                let size = (font_size(&text(line, "text"), width) * 0.72).clamp(28., 72.);
+                self.weight = if current { 900 } else { 700 };
+                self.tracking = if current { -1.2 } else { -0.6 };
+                let value = text(line, "text");
+                let size = (font_size(&value, width) * 0.72).clamp(28., 72.);
+                let size = self.fitted_size(&value, size, width, 0.56);
+                let text_height = self.text_height(&value, size, width, 1);
                 let alpha = if historical {
                     0.5
                 } else if current {
                     1.
                 } else if active.is_some_and(|i| index < i) {
                     0.82
+                } else if active.is_none() {
+                    0.26
                 } else {
                     0.22
                 };
-                self.weight = if current { 900 } else { 700 };
-                self.perspective_line(
-                    &text(line, "text"),
-                    0.,
-                    cy,
+                let translation = if current {
+                    text(line, "translation")
+                } else {
+                    String::new()
+                };
+                self.weight = 600;
+                self.tracking = 0.;
+                let translation_size = self.fitted_size(&translation, 16., width, 0.7);
+                let translation_height = self.text_height(&translation, translation_size, width, 1);
+                rows.push((
+                    value,
+                    current,
                     size,
+                    text_height,
+                    alpha,
+                    translation,
+                    translation_size,
+                    translation_height,
+                ));
+                height += text_height
+                    + if translation_height > 0. {
+                        3. + translation_height
+                    } else {
+                        0.
+                    }
+                    + if index + 1 < lines.len() { 8. } else { 0. };
+            }
+            self.panel = Some(PanelTransform {
+                anchor: outline::Point {
+                    x: if direction < 0. { 0. } else { width },
+                    y: height / 2.,
+                },
+                angle: if historical { direction * 7. * p } else { 0. },
+                axis: (0., 1., 0.),
+                perspective: 0.72,
+                width,
+                rotation: if historical { direction * 90. * p } else { 0. },
+                scale,
+                scale_anchor: outline::Point {
+                    x: width / 2.,
+                    y: if historical { height / 2. } else { height },
+                },
+                position: outline::Point {
+                    x,
+                    y: y - height / 2.,
+                },
+            });
+            let _ = write!(self.svg, r#"<g opacity="{opacity}">"#);
+            let mut top = 0.;
+            for (
+                value,
+                current,
+                size,
+                text_height,
+                alpha,
+                translation,
+                translation_size,
+                translation_height,
+            ) in rows
+            {
+                self.weight = if current { 900 } else { 700 };
+                self.tracking = if current { -1.2 } else { -0.6 };
+                self.paragraph(
+                    &value,
+                    0.,
+                    top + text_height / 2.,
+                    size,
+                    width,
+                    1,
+                    1.,
                     alpha,
                     &if current {
                         self.accent.clone()
                     } else {
                         self.primary.clone()
                     },
-                    if historical { direction * 7. * p } else { 0. },
-                    (0., 1., 0.),
-                    0.72,
                     "start",
                 );
-                cy += size + 8.;
-                if current {
-                    let translation = text(line, "translation");
-                    if !translation.is_empty() {
-                        self.line(
-                            &translation,
-                            0.,
-                            cy,
-                            16.,
-                            0.58,
-                            &self.primary.clone(),
-                            "start",
-                        );
-                        cy += 19.;
-                    }
+                top += text_height;
+                if translation_height > 0. {
+                    self.weight = 600;
+                    self.tracking = 0.;
+                    top += 3.;
+                    self.paragraph(
+                        &translation,
+                        0.,
+                        top + translation_height / 2.,
+                        translation_size,
+                        width,
+                        1,
+                        1.,
+                        0.58,
+                        &self.primary.clone(),
+                        "start",
+                    );
+                    top += translation_height;
                 }
+                top += 8.;
             }
             self.svg.push_str("</g>");
+            self.panel = None;
         }
+        self.weight = 600;
+        self.tracking = 0.;
     }
     fn finish(mut self) -> String {
         if self.snapshot["flow"]["activeLine"].is_null() && self.snapshot["mode"] != "folding_verse"
@@ -957,7 +1311,84 @@ pub struct StageLyricsPane {
     render_key: String,
     render_error: Option<String>,
     outgoing: Option<Value>,
-    transition_started: Instant,
+    transition_started: f64,
+    segment_starts: HashMap<String, f64>,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TransitionCurve {
+    Immediate,
+    Spring(f64, f64),
+    EaseOut(f64),
+}
+#[derive(Clone, Copy, Debug)]
+struct TransitionSpec {
+    curve: TransitionCurve,
+    scale: f64,
+    move_x: f64,
+    move_y: f64,
+    depth: bool,
+    fold: bool,
+}
+fn transition_key(snapshot: &Value) -> String {
+    match snapshot["mode"].as_str().unwrap_or("") {
+        "folding_verse" => String::new(),
+        "mindscape" => items(&snapshot["depth"], "lines")
+            .iter()
+            .find(|line| num(line, "position", 1.) == 0.)
+            .map(|line| text(line, "id"))
+            .unwrap_or_default(),
+        _ => text(&snapshot["flow"]["activeLine"], "id"),
+    }
+}
+fn transition_spec(mode: &str) -> TransitionSpec {
+    let mut spec = TransitionSpec {
+        curve: TransitionCurve::Immediate,
+        scale: 1.,
+        move_x: 0.,
+        move_y: 0.,
+        depth: false,
+        fold: false,
+    };
+    match mode {
+        "luminous" => {
+            spec.curve = TransitionCurve::Spring(0.44, 0.84);
+            spec.scale = 0.94;
+        }
+        "mindscape" => {
+            spec.curve = TransitionCurve::EaseOut(0.26);
+            spec.depth = true;
+        }
+        "cloud_steps" => spec.move_y = 1.,
+        "chorus_chat" | "article" => spec.scale = 0.96,
+        "confession" => spec.move_x = -1.,
+        "claddagh" => spec.scale = 0.9,
+        "pendulum" => spec.curve = TransitionCurve::Spring(0.72, 0.86),
+        "diorama" => spec.scale = 0.92,
+        "folding_verse" => spec.fold = true,
+        _ => {}
+    }
+    spec
+}
+impl TransitionSpec {
+    fn progress(self, elapsed: f64) -> f64 {
+        match self.curve {
+            TransitionCurve::Immediate => 1.,
+            TransitionCurve::Spring(response, damping) => {
+                spring_progress(elapsed.max(0.), response, damping)
+            }
+            TransitionCurve::EaseOut(duration) => {
+                let t = (elapsed / duration).clamp(0., 1.);
+                1. - (1. - t).powi(3)
+            }
+        }
+    }
+    fn duration(self) -> f64 {
+        match self.curve {
+            TransitionCurve::Immediate => 0.,
+            TransitionCurve::Spring(response, _) => response * 3.,
+            TransitionCurve::EaseOut(duration) => duration,
+        }
+    }
 }
 fn spring_progress(seconds: f64, response: f64, damping: f64) -> f64 {
     let omega = std::f64::consts::TAU / response;
@@ -965,18 +1396,73 @@ fn spring_progress(seconds: f64, response: f64, damping: f64) -> f64 {
     1. - (-damping * omega * seconds).exp()
         * ((damped * seconds).cos() + damping * omega / damped * (damped * seconds).sin())
 }
-fn scene_layer(svg: &str, width: f64, height: f64, opacity: f64, scale: f64) -> String {
+fn scene_layer(
+    svg: &str,
+    width: f64,
+    height: f64,
+    opacity: f64,
+    scale: f64,
+    dx: f64,
+    dy: f64,
+) -> String {
     let body = svg
         .split_once('>')
         .map(|(_, body)| body.trim_end_matches("</svg>"))
         .unwrap_or("");
     format!(
         r#"<g opacity="{opacity}" transform="translate({} {}) scale({scale}) translate({} {})">{body}</g>"#,
-        width / 2.,
-        height / 2.,
+        width / 2. + dx,
+        height / 2. + dy,
         -width / 2.,
         -height / 2.
     )
+}
+fn advance_outgoing(old: &Value, current: &Value) -> Value {
+    let mut old = old.clone();
+    for key in [
+        "animationTime",
+        "playbackTime",
+        "audioMotion",
+        "audioFeatures",
+        "isProgramRailVisible",
+        "theme",
+    ] {
+        old[key] = current[key].clone();
+    }
+    old
+}
+fn depth_transition(current: &Value, old: &Value, progress: f64) -> Value {
+    let mut snapshot = current.clone();
+    let old_lines = items(&old["depth"], "lines");
+    let mut lines = items(&current["depth"], "lines");
+    for line in &mut lines {
+        if let Some(previous) = old_lines
+            .iter()
+            .find(|previous| previous["id"] == line["id"])
+        {
+            let from = num(previous, "position", 0.);
+            let to = num(line, "position", 0.);
+            line["presentationPosition"] = json!(from + (to - from) * progress);
+            let from_size = if from == 0. { 38. } else { 24. };
+            let to_size = if to == 0. { 38. } else { 24. };
+            line["presentationSize"] = json!(from_size + (to_size - from_size) * progress);
+            for key in ["opacity", "scale", "blurRadius"] {
+                let a = num(previous, key, if key == "blurRadius" { 0. } else { 1. });
+                let b = num(line, key, if key == "blurRadius" { 0. } else { 1. });
+                line[key] = json!(a + (b - a) * progress);
+            }
+        } else {
+            line["opacity"] = json!(num(line, "opacity", 1.) * progress);
+        }
+    }
+    for mut line in old_lines {
+        if !lines.iter().any(|current| current["id"] == line["id"]) {
+            line["opacity"] = json!(num(&line, "opacity", 1.) * (1. - progress));
+            lines.push(line);
+        }
+    }
+    snapshot["depth"]["lines"] = json!(lines);
+    snapshot
 }
 impl StageLyricsPane {
     pub fn new(_window: &mut Window, _cx: &mut Context<Self>) -> Self {
@@ -989,7 +1475,8 @@ impl StageLyricsPane {
             render_key: String::new(),
             render_error: None,
             outgoing: None,
-            transition_started: Instant::now(),
+            transition_started: 0.,
+            segment_starts: HashMap::new(),
         }
     }
     pub fn update_snapshot(
@@ -999,11 +1486,33 @@ impl StageLyricsPane {
         cx: &mut Context<Self>,
     ) {
         if self.snapshot != snapshot {
-            if self.snapshot["flow"]["activeLine"]["id"] != snapshot["flow"]["activeLine"]["id"]
+            if transition_key(&self.snapshot) != transition_key(&snapshot)
                 || self.snapshot["mode"] != snapshot["mode"]
             {
                 self.outgoing = (!self.snapshot.is_null()).then(|| self.snapshot.clone());
-                self.transition_started = Instant::now();
+                self.transition_started = num(&snapshot, "animationTime", 0.);
+            }
+            if self.snapshot["trackID"] != snapshot["trackID"]
+                || self.snapshot["mode"] != snapshot["mode"]
+            {
+                self.segment_starts.clear();
+            }
+            let now = num(&snapshot, "animationTime", 0.);
+            let playback = num(&snapshot, "playbackTime", 0.);
+            let visible: Vec<String> = items(&snapshot["tilt"], "segments")
+                .iter()
+                .filter(|segment| playback >= num(segment, "revealAt", f64::MAX))
+                .map(|segment| text(segment, "id"))
+                .collect();
+            self.segment_starts.retain(|id, _| visible.contains(id));
+            for id in visible {
+                self.segment_starts
+                    .entry(id)
+                    .or_insert(if self.snapshot.is_null() {
+                        now - 2.
+                    } else {
+                        now
+                    });
             }
             self.snapshot = snapshot;
             cx.notify();
@@ -1033,24 +1542,36 @@ impl Render for StageLyricsPane {
         } else {
             f64::from(size.height)
         };
-        let mut svg = Scene::new(&self.snapshot, w, h).finish();
-        let elapsed = self.transition_started.elapsed().as_secs_f64();
-        if elapsed < 1.5 {
-            let (response, damping) = match self.snapshot["mode"].as_str().unwrap_or("") {
-                "pendulum" => (0.72, 0.86),
-                "confession" => (0.55, 0.82),
-                _ => (0.44, 0.84),
-            };
-            let progress = spring_progress(elapsed, response, damping);
-            let scale_mode = matches!(self.snapshot["mode"].as_str(), Some("luminous" | "diorama"));
+        let now = num(&self.snapshot, "animationTime", 0.);
+        let elapsed = (now - self.transition_started).max(0.);
+        let spec = transition_spec(self.snapshot["mode"].as_str().unwrap_or(""));
+        let mut snapshot = self.snapshot.clone();
+        let mut segments = serde_json::Map::new();
+        for (id, start) in &self.segment_starts {
+            segments.insert(
+                id.clone(),
+                json!(spring_progress((now - start).max(0.), 0.55, 0.82)),
+            );
+        }
+        snapshot["_presentation"] = json!({"segments":segments});
+        if spec.depth && elapsed < spec.duration() {
+            if let Some(old) = &self.outgoing {
+                snapshot = depth_transition(&snapshot, old, spec.progress(elapsed));
+            }
+        }
+        let mut svg = Scene::new(&snapshot, w, h).finish();
+        if !spec.fold && !spec.depth && elapsed < spec.duration() {
+            let progress = spec.progress(elapsed);
             let mut body = String::new();
             if let Some(old) = &self.outgoing {
                 body.push_str(&scene_layer(
-                    &Scene::new(old, w, h).finish(),
+                    &Scene::new(&advance_outgoing(old, &snapshot), w, h).finish(),
                     w,
                     h,
                     (1. - progress).clamp(0., 1.),
-                    if scale_mode { 1. - 0.08 * progress } else { 1. },
+                    1. - (1. - spec.scale) * progress,
+                    spec.move_x * w * progress,
+                    spec.move_y * h * progress,
                 ));
             }
             body.push_str(&scene_layer(
@@ -1058,11 +1579,9 @@ impl Render for StageLyricsPane {
                 w,
                 h,
                 progress.clamp(0., 1.),
-                if scale_mode {
-                    0.92 + 0.08 * progress
-                } else {
-                    1.
-                },
+                spec.scale + (1. - spec.scale) * progress,
+                spec.move_x * w * (1. - progress),
+                spec.move_y * h * (1. - progress),
             ));
             svg = format!(
                 r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">{body}</svg>"#
@@ -1387,10 +1906,22 @@ mod outline {
             .map(|chunk| chunk.iter().collect())
             .collect()
     }
+    #[cfg(not(target_os = "macos"))]
+    pub fn wrap_styled(
+        text: &str,
+        size: f64,
+        width: f64,
+        _weight: u16,
+        tracking: f64,
+    ) -> Vec<String> {
+        wrap(text, size, width / (1. + tracking / (size * 0.6)).max(0.1))
+    }
     #[cfg(all(target_os = "macos", test))]
     pub use native::shape;
+    #[cfg(all(target_os = "macos", test))]
+    pub use native::wrap;
     #[cfg(target_os = "macos")]
-    pub use native::{shape_styled, wrap};
+    pub use native::{shape_styled, wrap_styled};
     #[cfg(target_os = "macos")]
     mod native {
         use super::{Command, Line, Point};
@@ -1664,20 +2195,35 @@ mod outline {
                 ))
             }
         }
+        #[cfg(test)]
         pub fn wrap(text: &str, size: f64, width: f64) -> Vec<String> {
+            wrap_styled(text, size, width, 600, 0.)
+        }
+        pub fn wrap_styled(
+            text: &str,
+            size: f64,
+            width: f64,
+            weight: u16,
+            tracking: f64,
+        ) -> Vec<String> {
             if text.is_empty() {
                 return vec![];
             }
             unsafe {
-                let font = weighted_font(size, 600);
+                let font = weighted_font(size, weight);
                 let content = string(text);
-                let keys = [kCTFontAttributeName];
-                let values = [font.0];
+                let kern = Owned(CFNumberCreate(
+                    ptr::null(),
+                    13,
+                    &tracking as *const f64 as *const c_void,
+                ));
+                let keys = [kCTFontAttributeName, kCTKernAttributeName];
+                let values = [font.0, kern.0];
                 let attrs = Owned(CFDictionaryCreate(
                     ptr::null(),
                     keys.as_ptr(),
                     values.as_ptr(),
-                    1,
+                    2,
                     ptr::null(),
                     ptr::null(),
                 ));
@@ -1711,6 +2257,137 @@ mod outline {
 mod tests {
     use super::{Scene, escape};
     use serde_json::json;
+    #[test]
+    fn translation_styles_preserve_original_mode_parameters() {
+        let luminous = super::translation_style("luminous", 1000.);
+        assert_eq!(
+            (
+                luminous.weight,
+                luminous.tracking,
+                luminous.opacity,
+                luminous.width
+            ),
+            (500, 0.7, 0.66, 720.)
+        );
+        let cloud = super::translation_style("cloud_steps", 800.);
+        assert_eq!(
+            (cloud.tracking, cloud.opacity, cloud.width),
+            (0.8, 0.48, 400.)
+        );
+        for (mode, opacity) in [
+            ("confession", 0.56),
+            ("claddagh", 0.58),
+            ("monet_poster", 0.54),
+            ("article", 0.58),
+            ("chorus_chat", 0.56),
+            ("diorama", 0.54),
+        ] {
+            let style = super::translation_style(mode, 1000.);
+            assert_eq!((style.weight, style.opacity), (500, opacity));
+        }
+        let fold = super::translation_style("folding_verse", 1000.);
+        assert_eq!((fold.weight, fold.max_lines, fold.min_scale), (600, 1, 0.7));
+    }
+    #[test]
+    fn fold_group_anchors_stay_fixed_through_rotation_and_bottom_scale() {
+        use super::outline::Point;
+        for x in [0., 400.] {
+            let transform = super::PanelTransform {
+                anchor: Point { x, y: 150. },
+                angle: 7.,
+                axis: (0., 1., 0.),
+                perspective: 0.72,
+                width: 400.,
+                rotation: 90.,
+                scale: 1.,
+                scale_anchor: Point::default(),
+                position: Point::default(),
+            };
+            let projected = transform.map(Point { x, y: 150. });
+            assert_eq!((projected.x, projected.y), (x, 150.));
+        }
+        let bottom = Point { x: 200., y: 300. };
+        let transform = super::PanelTransform {
+            anchor: Point::default(),
+            angle: 0.,
+            axis: (0., 1., 0.),
+            perspective: 0.72,
+            width: 400.,
+            rotation: 0.,
+            scale: 0.92,
+            scale_anchor: bottom,
+            position: Point::default(),
+        };
+        let projected = transform.map(bottom);
+        assert_eq!((projected.x, projected.y), (bottom.x, bottom.y));
+        assert_eq!(transform.map(Point::default()).y, 24.);
+    }
+    #[test]
+    fn diorama_projects_background_and_text_as_one_panel() {
+        let snapshot = json!({"mode":"diorama","animationTime":10.,"flow":{"activeLine":{"id":"active","text":"当前"},"previousLine":{"id":"prev","text":"上一句"},"nextLine":{"id":"next","text":"下一句"},"translation":"translation","glyphs":[{"id":"g1","text":"当","phase":"active"},{"id":"g2","text":"前","phase":"waiting"}]},"audioMotion":{"expansion":1.03,"beatLift":5.}});
+        let svg = Scene::new(&snapshot, 1000., 700.).finish();
+        assert!(svg.contains("dioramaBorder"));
+        assert!(svg.contains("dioramaShadow"));
+        assert!(svg.contains("stroke-opacity=\"0.07\" stroke-width=\"0.8\""));
+        assert!(!svg.contains("<rect"));
+        assert!(svg.contains("aria-label=\"上一句\""));
+        assert!(svg.contains("aria-label=\"translation\""));
+    }
+    #[test]
+    fn transition_specs_and_triggers_follow_each_original_frame() {
+        use super::{TransitionCurve, transition_spec};
+        assert_eq!(transition_spec("luminous").scale, 0.94);
+        assert_eq!(transition_spec("claddagh").scale, 0.9);
+        assert_eq!(transition_spec("diorama").scale, 0.92);
+        for mode in ["article", "chorus_chat"] {
+            assert_eq!(transition_spec(mode).scale, 0.96);
+        }
+        assert_eq!(transition_spec("cloud_steps").move_y, 1.);
+        assert_eq!(transition_spec("confession").move_x, -1.);
+        assert_eq!(
+            transition_spec("confession").curve,
+            TransitionCurve::Immediate
+        );
+        assert_eq!(
+            transition_spec("pendulum").curve,
+            TransitionCurve::Spring(0.72, 0.86)
+        );
+        assert!(transition_spec("folding_verse").fold);
+        assert_eq!(
+            transition_spec("mindscape").curve,
+            TransitionCurve::EaseOut(0.26)
+        );
+        let depth = json!({"mode":"mindscape","flow":{"activeLine":{"id":"different"}},"depth":{"lines":[{"id":"actual","position":0}]}});
+        assert_eq!(super::transition_key(&depth), "actual");
+        assert_eq!(
+            super::transition_key(
+                &json!({"mode":"folding_verse","flow":{"activeLine":{"id":"irrelevant"}}})
+            ),
+            ""
+        );
+    }
+    #[test]
+    fn outgoing_scene_keeps_original_current_store_time_and_audio() {
+        let old = json!({"animationTime":10.,"playbackTime":4.,"flow":{"activeLine":{"id":"old"}},"audioMotion":{"beat":0.1}});
+        let current = json!({"animationTime":11.,"playbackTime":5.,"flow":{"activeLine":{"id":"new"}},"audioMotion":{"beat":0.8}});
+        let outgoing = super::advance_outgoing(&old, &current);
+        assert_eq!(outgoing["animationTime"], 11.);
+        assert_eq!(outgoing["playbackTime"], 5.);
+        assert_eq!(outgoing["audioMotion"]["beat"], 0.8);
+        assert_eq!(outgoing["flow"]["activeLine"]["id"], "old");
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_wrap_uses_the_same_weight_and_tracking_as_shaped_text() {
+        let text = "LLLL LLLL";
+        let regular = super::outline::shape_styled(text, 32., 500, 0.).unwrap();
+        let tracked = super::outline::shape_styled(text, 32., 500, -2.).unwrap();
+        let width = (regular.width + tracked.width) / 2.;
+        assert!(
+            super::outline::wrap_styled(text, 32., width, 500, 0.).len()
+                > super::outline::wrap_styled(text, 32., width, 500, -2.).len()
+        );
+    }
     #[test]
     fn spring_enters_from_zero_and_settles_at_one() {
         assert_eq!(super::spring_progress(0., 0.44, 0.84), 0.);
