@@ -16,6 +16,40 @@ pub use props::ResidentPropEditorPane;
 pub const STAGE_PANEL_WIDTH: f32 = 590.;
 pub const STAGE_PANEL_HEIGHT: f32 = 458.;
 
+fn video_asset_actions(player:&Value,asset:&Value)->Vec<(&'static str,Value,bool)>{
+    let id=asset["id"].clone();
+    let active=player["videoActive"].as_bool()==Some(true)&&player["videoAssetID"]==id;
+    let mut actions=vec![(if active{"取消加载"}else{"加载"},json!({"op":"stage.video.toggle","id":id}),false)];
+    if player["trackID"].as_str().is_some_and(|s|!s.is_empty()){
+        let bound=player["boundVideoID"]==id;
+        actions.push((if bound{"解除当前歌曲绑定"}else{"绑定到当前歌曲"},json!({"op":if bound{"stage.video.unbind"}else{"stage.video.bind"},"id":id}),false));
+    }
+    actions.push(("移出素材库",json!({"op":"stage.video.remove","id":id}),true));
+    actions
+}
+#[cfg(test)]
+mod video_menu_tests{
+    use super::video_asset_actions;
+    use serde_json::json;
+    #[test]
+    fn asset_submenu_preserves_active_toggle_and_bound_track_commands(){
+        let actions=video_asset_actions(&json!({"videoActive":true,"videoAssetID":"asset","trackID":"track","boundVideoID":"asset"}),&json!({"id":"asset"}));
+        assert_eq!(actions[0].0,"取消加载");
+        assert_eq!(actions[0].1,json!({"op":"stage.video.toggle","id":"asset"}));
+        assert_eq!(actions[1].0,"解除当前歌曲绑定");
+        assert_eq!(actions[1].1["op"],"stage.video.unbind");
+        assert_eq!(actions[2].0,"移出素材库");assert!(actions[2].2);
+    }
+    #[test]
+    fn no_track_omits_binding_and_inactive_asset_loads(){
+        let actions=video_asset_actions(&json!({"videoActive":false}),&json!({"id":"asset"}));
+        assert_eq!(actions.len(),2);assert_eq!(actions[0].0,"加载");
+        assert_eq!(actions[1].1,json!({"op":"stage.video.remove","id":"asset"}));
+        let actions=video_asset_actions(&json!({"trackID":"track","boundVideoID":"other"}),&json!({"id":"asset"}));
+        assert_eq!(actions[1].0,"绑定到当前歌曲");assert_eq!(actions[1].1["op"],"stage.video.bind");
+    }
+}
+
 pub struct StagePanelsPane {
     snapshot: Value,
     commands: Vec<Value>,
@@ -512,44 +546,37 @@ impl StagePanelsPane {
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .child("视频亮度")
-                    .child(div().flex_1().child(Slider::new(&self.sliders[4]))),
+                    .gap(px(10.)).px(px(10.)).min_h(px(36.))
+                    .child(Icon::new(gpui_kit::assets::IconName::SunDim).size(px(14.)))
+                    .child(div().id("video-brightness").role(Role::Slider).aria_label("视频亮度").flex_1().min_w(px(0.)).child(Slider::new(&self.sliders[4])))
+                    .child(div().w(px(38.)).flex_shrink_0().font_family("Menlo").text_size(px(12.)).child(format!("{}%",(self.sliders[4].read(cx).value().start()*100.)as u32))),
             );
-            for asset in player["videoAssets"].as_array().into_iter().flatten() {
-                let id = asset["id"].as_str().unwrap_or("");
-                let active = player["videoActive"].as_bool() == Some(true)
-                    && player["videoAssetID"] == asset["id"];
-                let mut row = div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(asset["name"].as_str().unwrap_or("").to_owned())
-                    .child(
-                        div()
-                            .flex()
-                            .gap_1()
-                            .child(self.button(
-                                format!("video-toggle-{id}"),
-                                if active { "取消加载" } else { "加载" },
-                                json!({"op":"stage.video.toggle","id":id}),
-                                false,
-                                cx,
-                            ))
-                            .child(self.button(
-                                format!("video-remove-{id}"),
-                                "移出素材库",
-                                json!({"op":"stage.video.remove","id":id}),
-                                false,
-                                cx,
-                            )),
-                    );
-                if player["trackID"].as_str().is_some_and(|s| !s.is_empty()) {
-                    let bound = player["boundVideoID"] == asset["id"];
-                    row=row.child(self.button(format!("video-bind-{id}"),if bound{"解除当前歌曲绑定"}else{"绑定到当前歌曲"},json!({"op":if bound{"stage.video.unbind"}else{"stage.video.bind"},"id":id}),false,cx));
-                }
-                form = form.child(row);
-            }
+            let assets=player["videoAssets"].as_array().cloned().unwrap_or_default();
+            let active=player["videoActive"].as_bool()==Some(true);
+            let name=assets.iter().find(|asset|asset["id"]==player["videoAssetID"]).and_then(|asset|asset["name"].as_str()).unwrap_or("未加载视频").to_owned();
+            let status=if active{"已加载".to_owned()}else{format!("{} 段",assets.len())};
+            let weak=cx.entity().downgrade();let menu_player=player.clone();
+            form=form.child(Button::new("video-assets-menu").ghost().w_full().h(px(36.)).px(px(12.)).rounded_full()
+                .bg(rgba(0xffffff0b)).accessibility_label(format!("{name}，{status}"))
+                .child(div().flex().items_center().gap(px(8.)).w_full().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD)
+                    .child(Icon::new(if active{gpui_kit::assets::IconName::Video}else{gpui_kit::assets::IconName::VideoOff}).size(px(14.)))
+                    .child(div().flex_1().min_w(px(0.)).overflow_hidden().whitespace_nowrap().child(name))
+                    .child(div().flex_shrink_0().child(status)))
+                .dropdown_menu(move|mut menu,window,cx|{
+                    for asset in &assets{
+                        let actions=video_asset_actions(&menu_player,asset);let weak=weak.clone();
+                        menu=menu.submenu(asset["name"].as_str().unwrap_or("").to_owned(),window,cx,move|mut sub,_,_|{
+                            for(label,command,dangerous)in &actions{
+                                if *dangerous{sub=sub.separator();}
+                                let weak=weak.clone();let command=command.clone();
+                                let item=if *dangerous{PopupMenuItem::element(|_,cx|div().text_color(cx.theme().danger).child("移出素材库"))}else{PopupMenuItem::new(*label)};
+                                sub=sub.item(item.on_click(move|_,_,cx|{_=weak.update(cx,|this,cx|{this.commands.push(command.clone());cx.notify();});}));
+                            }
+                            sub
+                        });
+                    }
+                    menu
+                }));
         }
         form.into_any_element()
     }

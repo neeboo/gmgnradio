@@ -399,6 +399,10 @@ extension AppDelegate {
         switch selection.route { case .programs: route = "programs"; case .tracks: route = "tracks"; case .playlistTracks: route = "playlistTracks" }
         return ["route": route, "title": model.title as Any? ?? NSNull(),
             "isPlaylist": playlist != nil, "hasMore": playlist.map { $0.tracks.count < $0.trackCount } ?? false,
+            "playlistID": playlist?.id as Any? ?? NSNull(),
+            "loadedTrackCount": playlist?.tracks.count ?? model.cards.count,
+            "totalTrackCount": playlist?.trackCount ?? model.cards.count,
+            "playlistLoading": playlist.map { musicLibraryStore.loadingPlaylistIDs.contains($0.id) } ?? false,
             "planning": programStore.status == .planning,
             "audioFeatures": gpuiAudioFeaturesSnapshot(),
             "emptyMessage": programStore.status == .planning ? "DJ 正在排歌" : playlist != nil ? "正在加载歌曲…" : "暂无节目",
@@ -1061,6 +1065,7 @@ extension AppDelegate {
             "isDecorating": StageDecorationMenuStore.shared.isDecorating,
             "deliveryMode": "final-response",
             "reply": gpuiLatestResidentReply,
+            "replyRevision": gpuiResidentReplyRevision,
             "worldToolsEnabled": true,
             "scope": residentTranscriptScopeKey,
             "surfaceOwner": String(describing: stageRenderSurfaceController?.owner ?? .detached),
@@ -1482,6 +1487,7 @@ final class AppDelegate:
     var gpuiOpenSettings: (() -> Void)?
     var gpuiNavigate: ((String) -> Void)?
     private var gpuiLatestResidentReply = ""
+    private var gpuiResidentReplyRevision: UInt64 = 0
 #endif
     private let playbackLogger = Logger(
         subsystem: ProductIdentity.bundleIdentifier,
@@ -6802,6 +6808,7 @@ final class AppDelegate:
     private func presentResidentReply(_ reply: String) {
 #if GMGN_GPUI_PRODUCT_BOOTSTRAP
         gpuiLatestResidentReply = reply
+        gpuiResidentReplyRevision &+= 1
 #endif
         // 先按真实回合身份登记「真正送达」：只更新已记录的用户提交，未知/迟到
         // 的身份不臆造回合，也不重复显示。

@@ -335,3 +335,13 @@ CUA实际进入580×500设置、快捷键页，点击全局播放组合后输入
 主代理完整UI85/85 exit0（`/tmp/gmgn-gpui-v29-ui-tests.log`，4.15秒），worker独立最终完整85/85 exit0（`/tmp/gmgn-program-artwork-ui-tests.log`，4.66秒）；App11/11、快捷键生产回调、宿主构建均exit0。宿主日志`/tmp/gmgn-gpui-v29-final-host-build.log`。完整v29包构建exit0（`/tmp/gmgn-gpui-product-app-build-v29.log`）；仅退出v28测试App，启动`tmp/gpui-product-app-v29/gmgn radio.app` PID7632，同一真实业务数据根，runtime`/tmp/gmgn-gpui-parity-v29-runtime.log`。
 
 CUA实际全局录制按钮呈青色等宽文字；录制激活后输入a、滚到表单底部，橙色“全局快捷键至少需要一个修饰键。”与恢复默认同行，无灰check底栏。Esc取消，不写新键位。打开系统消息列表显示“9小时前”，不点行直接Down后原电视消息选中，详情显示完整2026年10月4日1:23，打开按钮启用，AX读回list“系统消息列表”。这里只有一条已读通知，不能据此计多行滚动/未读减少/重启恢复通过。没有操作录音、凭据、登录或永久删除。
+
+### v30/v31 视频库布局、分页与小窗回复
+
+上一轮49cd35bd89178128050b7be3b19ef399b3927c15已提交推送并远端核对。原视频库的单菜单/逐素材子菜单替换当前常驻所有素材行，复用真实加载/歌曲绑定/解绑/危险移除命令；亮度恢复38宽百分比和可访问标签，不改变picker尺寸。节目补原标题数量、playlist loaded/total、空轨道无header、96顶部空态、Spinner及末4卡进入实际viewport自动分页；按真实playlistID/count/loading避免每帧重复加载。原速度限幅、动画曲线及磨砂仍欠，实际完整曲库为空不能报分页通过。
+
+小窗原latestReply允许后台/自主回复不在用户历史；此前GPUI仅读历史导致漏显示，已接真实state.reply与宿主交付revision，展开原规则只追加与最后居民回复不同的独立文本，不造历史；同文字新交付可重新呈现。新增回归包括无历史后台回复、同回复去重、不同回复追加。完整UI88/88、App12/12和宿主构建exit0，日志`/tmp/gmgn-gpui-v30-ui-tests.log`、`/tmp/gmgn-gpui-v30-app-tests.log`、`/tmp/gmgn-gpui-v30-host-build.log`。
+
+v30完整包exit0，实际PID12373，runtime`/tmp/gmgn-gpui-parity-v30-runtime.log`。CUA同一真实业务根在224×336小窗提交文字；原启动摆放状态拒绝且保留草稿。回空间打开装修按Esc后重试，request2 accepted→reply，真实DSH返回“小窗对齐验收。”，切小窗保持同一回复。截图揭示展开用户长文本撑出气泡并挤出关闭按钮，真实失败；补内容min_w(0)，原窗口/气泡宽高保持。
+
+v31完整包exit0（`/tmp/gmgn-gpui-product-app-build-v31.log`），PID12710，同一数据根，runtime`/tmp/gmgn-gpui-parity-v31-runtime.log`。CUA先通过原装修面板Esc结束摆放，再小窗提交同一句真实请求，request1 accepted→reply；截图文字在气泡内换行，右侧关闭X和六圆入口完整可见。此用户回复换行子路径通过，不计自主后台交付实际通过。未注入语音密钥，本轮原语音提示缺凭据，声音未验收；未录音/登录/删除资产。最后源码复核去掉展开时绕过dismiss的条件，保留关闭语义；此最后窄修仍需新包真实关闭/恢复复验，不能把v31截图扩大为该行为通过。

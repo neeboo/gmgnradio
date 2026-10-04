@@ -58,7 +58,9 @@ fn icon_svg(icon: gpui_kit::assets::IconName, x: f64, y: f64, size: f64, color: 
         svg[start + 1..end].replace("currentColor", color)
     )
 }
+use gpui_kit::base::Disableable;
 use gpui_kit::component::button::*;
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use serde_json::{Value, json};
 use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
@@ -306,6 +308,23 @@ fn energy_height(energy: f32, index: usize) -> f32 {
 
 const TRACK_HEIGHT: f32 = 76.;
 const TRACK_SPACING: f32 = -7.;
+fn pagination_key(
+    state: &Value,
+    viewport: f32,
+    offset: f32,
+    requested: Option<&(String, usize)>,
+) -> Option<(String, usize)> {
+    let count = state["tracks"].as_array().map_or(0, Vec::len);
+    let key = (state["playlistID"].as_str()?.to_owned(), count);
+    let last_four_top = 18. + count.saturating_sub(4) as f32 * (TRACK_HEIGHT + TRACK_SPACING);
+    (state["isPlaylist"].as_bool() == Some(true)
+        && !key.0.is_empty()
+        && (count == 0 || last_four_top < -offset + viewport)
+        && (count == 0 || state["hasMore"].as_bool() == Some(true))
+        && state["playlistLoading"].as_bool() != Some(true)
+        && requested != Some(&key))
+    .then_some(key)
+}
 const PROGRAM_SPACING: f32 = 4.;
 
 fn card_priority(card: &Value, distance_bias: usize) -> usize {
@@ -346,6 +365,7 @@ pub struct StageProgramRailPane {
     pressed_card: Option<(String, bool)>,
     projection_cache: ProjectionCache,
     focus_handles: HashMap<String, FocusHandle>,
+    pagination_request: Option<(String, usize)>,
 }
 impl StageProgramRailPane {
     pub fn new(_window: &mut Window, _cx: &mut Context<Self>) -> Self {
@@ -361,6 +381,7 @@ impl StageProgramRailPane {
             pressed_card: None,
             projection_cache: Rc::new(RefCell::new(HashMap::new())),
             focus_handles: HashMap::new(),
+            pagination_request: None,
         }
     }
     pub fn update_snapshot(
@@ -388,6 +409,7 @@ impl StageProgramRailPane {
                 self.scroll_start = None;
             }
             if self.snapshot["route"] != snapshot["route"] {
+                self.pagination_request = None;
                 self.card_cache.clear();
                 self.pressed_card = None;
                 self.projection_cache.borrow_mut().clear();
@@ -705,21 +727,6 @@ impl StageProgramRailPane {
         }
         wrapper.into_any_element()
     }
-    fn button(
-        &self,
-        id: impl Into<ElementId>,
-        label: impl Into<SharedString>,
-        command: Value,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        Button::new(id)
-            .label(label)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.commands.push(command.clone());
-                cx.notify();
-            }))
-            .into_any_element()
-    }
     fn icon_button(
         &self,
         id: impl Into<ElementId>,
@@ -728,9 +735,24 @@ impl StageProgramRailPane {
         command: Value,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let replan = command["op"].as_str() == Some("stage.program.replan");
+        let planning = replan && self.snapshot["planning"].as_bool() == Some(true);
         Button::new(id)
-            .icon(icon)
-            .tooltip(tooltip)
+            .icon(if planning {
+                gpui_kit::assets::IconName::Hourglass
+            } else {
+                icon
+            })
+            .disabled(planning)
+            .tooltip(if replan {
+                if planning {
+                    "DJ 正在重新编排"
+                } else {
+                    "让 DJ 重新编排后续歌曲"
+                }
+            } else {
+                tooltip
+            })
             .w(px(26.))
             .h(px(26.))
             .rounded_full()
@@ -746,6 +768,28 @@ impl Render for StageProgramRailPane {
         let tracks = self.snapshot["route"]
             .as_str()
             .is_some_and(|r| r != "programs");
+        let track_count = self.snapshot["tracks"].as_array().map_or(0, Vec::len);
+        let empty_tracks = tracks && track_count == 0;
+        if tracks && self.snapshot["isPlaylist"].as_bool() == Some(true) {
+            let view = cx.entity().downgrade();
+            window.on_next_frame(move |window, cx| {
+                _ = view.update(cx, |this, cx| {
+                    let viewport: f32 = this.scroll.bounds().size.height.into();
+                    let offset: f32 = this.scroll.offset().y.into();
+                    if let Some(key) = pagination_key(
+                        &this.snapshot,
+                        viewport,
+                        offset,
+                        this.pagination_request.as_ref(),
+                    ) {
+                        this.pagination_request = Some(key);
+                        this.commands.push(json!({"op":"stage.program.more"}));
+                        cx.notify();
+                    }
+                });
+                let _ = window;
+            });
+        }
         let mut content = div()
             .flex()
             .flex_col()
@@ -756,12 +800,7 @@ impl Render for StageProgramRailPane {
                 PROGRAM_SPACING
             }))
             .py(px(18.));
-        let mut header = div()
-            .flex()
-            .items_center()
-            .gap(px(10.))
-            .px(px(14.))
-            .w_full();
+        let mut header = div().flex().items_center().gap(px(8.)).px(px(14.)).w_full();
         if tracks {
             // Preserve negative Swift zIndex values by shifting every priority
             // equally, rather than collapsing all distant cards to zero.
@@ -782,6 +821,19 @@ impl Render for StageProgramRailPane {
                 ))
                 .child(div().flex_1())
                 .child(self.snapshot["title"].as_str().unwrap_or("").to_uppercase());
+            header = header.child(if self.snapshot["isPlaylist"].as_bool() == Some(true) {
+                format!(
+                    "· {} / {}",
+                    self.snapshot["loadedTrackCount"]
+                        .as_u64()
+                        .unwrap_or(track_count as u64),
+                    self.snapshot["totalTrackCount"]
+                        .as_u64()
+                        .unwrap_or(track_count as u64)
+                )
+            } else {
+                format!("· {track_count}")
+            });
             if self.snapshot["isPlaylist"].as_bool() != Some(true) {
                 header = header.child(self.icon_button(
                     "program-replan",
@@ -821,19 +873,31 @@ impl Render for StageProgramRailPane {
                 content =
                     content.child(deferred(row).with_priority(card_priority(card, distance_bias)));
             }
-            if self.snapshot["hasMore"].as_bool() == Some(true) {
-                content = content.child(self.button(
-                    "program-load-more",
-                    "加载更多",
-                    json!({"op":"stage.program.more"}),
-                    cx,
-                ));
+            if track_count > 0 && self.snapshot["hasMore"].as_bool() == Some(true) {
+                content = content.child(
+                    div()
+                        .w(px(306.))
+                        .h(px(44.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(gpui_kit::component::spinner::Spinner::new()),
+                );
             }
             if self.snapshot["tracks"]
                 .as_array()
                 .is_none_or(|a| a.is_empty())
             {
-                content = content.child(
+                if self.snapshot["isPlaylist"].as_bool() == Some(true) {
+                    content = content.child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .child(gpui_kit::component::spinner::Spinner::new()),
+                    );
+                }
+                content = content.pt(px(96.)).gap(px(10.)).items_center().child(
                     self.snapshot["emptyMessage"]
                         .as_str()
                         .unwrap_or("正在加载歌曲…")
@@ -850,7 +914,11 @@ impl Render for StageProgramRailPane {
                     cx,
                 ))
                 .child(div().flex_1())
-                .child("歌单");
+                .child(format!(
+                    "歌单 · {}",
+                    self.snapshot["programs"].as_array().map_or(0, Vec::len)
+                        + self.snapshot["playlists"].as_array().map_or(0, Vec::len)
+                ));
             for (key, op) in [
                 ("programs", "stage.program.open"),
                 ("playlists", "stage.playlist.open"),
@@ -887,7 +955,7 @@ impl Render for StageProgramRailPane {
             .flex_col()
             .gap(px(8.))
             .text_color(rgb(0xe5e7ea))
-            .child(header)
+            .when(!empty_tracks, |pane| pane.child(header))
             .child(
                 div()
                     .id("stage-program-scroll")
@@ -945,7 +1013,7 @@ fn active_center_offset(index: usize, viewport: f32, maximum: f32) -> f32 {
 mod tests {
     use super::{
         PROGRAM_SPACING, TRACK_SPACING, active_center_offset, card_effects, card_priority,
-        card_svg, card_transform, energy_height, scroll_phase, snap_offset,
+        card_svg, card_transform, energy_height, pagination_key, scroll_phase, snap_offset,
     };
     use serde_json::json;
     #[test]
@@ -1010,6 +1078,22 @@ mod tests {
         });
         cx.update_window(projected.into(), |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
+    }
+    #[test]
+    fn playlist_pagination_uses_real_busy_and_last_four_visibility_without_repeating() {
+        let mut state = json!({"playlistID":"actual-scope","isPlaylist":true,"hasMore":true,"playlistLoading":false,"tracks":vec![json!({});12]});
+        assert!(pagination_key(&state, 300., 0., None).is_none());
+        let first = pagination_key(&state, 300., -300., None).unwrap();
+        assert!(pagination_key(&state, 300., -300., Some(&first)).is_none());
+        state["playlistLoading"] = json!(true);
+        assert!(pagination_key(&state, 300., -300., None).is_none());
+        state["playlistLoading"] = json!(false);
+        // Failed or unchanged snapshots cannot create an automatic request storm.
+        assert!(pagination_key(&state, 300., -300., Some(&first)).is_none());
+        state["tracks"] = json!([]);
+        assert!(pagination_key(&state, 300., 0., Some(&first)).is_some());
+        state["isPlaylist"] = json!(false);
+        assert!(pagination_key(&state, 300., 0., None).is_none());
     }
     #[test]
     fn visual_depth_does_not_change_original_card_layout() {

@@ -36,8 +36,24 @@ fn inbox_unread(state:&serde_json::Value)->usize {
     state["inbox"]["entries"].as_array().map_or(0,|entries|entries.iter().filter(|entry|entry["isRead"].as_bool()==Some(false)).count())
 }
 fn latest_reply_revision(state:&serde_json::Value)->Option<String> {
+    if let Some(reply)=state["reply"].as_str().filter(|reply|!reply.trim().is_empty()) {
+        return Some(format!("{}:{}:{}",state["contextID"].as_str().unwrap_or(""),state["replyRevision"],reply));
+    }
     let reply=state["transcript"].as_array()?.iter().rev().find(|line|line["role"].as_str()==Some("agent"))?;
     Some(format!("{}:{}:{}",state["contextID"].as_str().unwrap_or(""),reply["turnID"].as_str().unwrap_or(""),reply["text"].as_str()?))
+}
+fn compact_reply_text(state:&serde_json::Value, transcript:&[TranscriptLine])->Option<String> {
+    state["reply"].as_str().map(str::trim).filter(|text|!text.is_empty()).map(str::to_owned)
+        .or_else(||transcript.iter().rev().find(|line|line.speaker=="居民").map(|line|line.text.clone()))
+}
+fn expanded_reply_text(transcript:&[TranscriptLine], latest:&str)->String {
+    let mut content=transcript.iter().map(|line|if line.speaker.is_empty(){line.text.clone()}else{format!("{}：{}",line.speaker,line.text)}).collect::<Vec<_>>().join("\n\n");
+    let normalized=latest.trim();
+    if !normalized.is_empty() && transcript.iter().rev().find(|line|line.speaker=="居民").map(|line|line.text.as_str())!=Some(normalized) {
+        if !content.is_empty(){content.push_str("\n\n");}
+        content.push_str(normalized);
+    }
+    content
 }
 fn control_icon(id:&str)->gpui_kit::assets::IconName {
     use gpui_kit::assets::IconName;
@@ -542,8 +558,8 @@ impl Render for GMGNProductUI {
             if self.chat_open {
                 root=root.child(div().absolute().left(px(10.)).right(px(48.)).bottom(px(10.)).h(px(compact_composer_height)).child(self.pane.clone()));
             }
-            if let Some(reply)=self.transcript.iter().rev().find(|line|line.speaker=="居民").filter(|_|latest_reply_revision(&self.runtime_state)!=self.dismissed_reply_revision) {
-                let content=if self.chat_open{div().id("livecam.full-reply").flex_1().min_h(px(0.)).overflow_y_scroll().text_size(px(12.)).child(self.transcript.iter().map(|line|format!("{}：\n{}",line.speaker,line.text)).collect::<Vec<_>>().join("\n\n")).into_any_element()}else{div().flex_1().text_size(px(12.)).line_clamp(3).child(reply.text.clone()).into_any_element()};
+            if let Some(reply)=compact_reply_text(&self.runtime_state,&self.transcript).filter(|_|latest_reply_revision(&self.runtime_state)!=self.dismissed_reply_revision) {
+                let content=if self.chat_open{div().id("livecam.full-reply").flex_1().min_w(px(0.)).min_h(px(0.)).overflow_y_scroll().text_size(px(12.)).child(expanded_reply_text(&self.transcript,&reply)).into_any_element()}else{div().flex_1().min_w(px(0.)).text_size(px(12.)).line_clamp(3).child(reply).into_any_element()};
                 let bubble=div().id("compact-reply-bubble").absolute().left(px(10.)).right(px(48.)).top(px(10.)).p_2().rounded(px(10.)).bg(background).flex().items_start().gap(px(5.));
                 let bubble=if self.chat_open{bubble.h(px(136.))}else{bubble.max_h(px(74.))};
                 root=root.child(bubble
@@ -619,6 +635,19 @@ impl Render for GMGNProductUI {
 
 #[cfg(test)]
 mod layout_tests {
+    #[test]
+    fn compact_background_reply_is_visible_without_fabricating_transcript() {
+        let state=serde_json::json!({"contextID":"world-a","reply":"后台回复","replyRevision":3});
+        let transcript=vec![];
+        assert_eq!(super::compact_reply_text(&state,&transcript).as_deref(),Some("后台回复"));
+        assert_eq!(super::expanded_reply_text(&transcript,"后台回复"),"后台回复");
+        let next=serde_json::json!({"contextID":"world-a","reply":"后台回复","replyRevision":4});
+        assert_ne!(super::latest_reply_revision(&state),super::latest_reply_revision(&next));
+        assert!(transcript.is_empty());
+        let transcript=vec![super::TranscriptLine{speaker:"居民".into(),text:"后台回复".into()}];
+        assert_eq!(super::expanded_reply_text(&transcript,"后台回复"),"居民：后台回复");
+        assert_eq!(super::expanded_reply_text(&transcript,"另一条回复"),"居民：后台回复\n\n另一条回复");
+    }
     #[test]
     fn configured_gpui_http_client_can_fetch_artwork_without_null_client() {
         use std::{io::{Read,Write},time::Duration};
