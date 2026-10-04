@@ -346,6 +346,12 @@ v30完整包exit0，实际PID12373，runtime`/tmp/gmgn-gpui-parity-v30-runtime.l
 
 v31完整包exit0（`/tmp/gmgn-gpui-product-app-build-v31.log`），PID12710，同一数据根，runtime`/tmp/gmgn-gpui-parity-v31-runtime.log`。CUA先通过原装修面板Esc结束摆放，再小窗提交同一句真实请求，request1 accepted→reply；截图文字在气泡内换行，右侧关闭X和六圆入口完整可见。此用户回复换行子路径通过，不计自主后台交付实际通过。未注入语音密钥，本轮原语音提示缺凭据，声音未验收；未录音/登录/删除资产。最后源码复核去掉展开时绕过dismiss的条件，保留关闭语义；此最后窄修仍需新包真实关闭/恢复复验，不能把v31截图扩大为该行为通过。
 
+### v33 手势结算及 v32 小窗真实复验
+
+v32真实CUA复验：切回空间后原房间与2B人物渲染可见，之前启动白底已恢复。小窗request1因遗留摆放状态拒绝并保留草稿；通过原装修面板打开后Esc结束摆放，回小窗重试request2 accepted→reply，实际回复“回复关闭验收。”。关闭回复气泡后AX关闭按钮消失且截图气泡隐藏；聊天入口收起再展开，同一回复及关闭按钮重新出现。原224×336布局、136高历史、六圆入口均保持，未录音或注入语音凭据，不能扩大为音频验收。
+
+节目滚动修复：Started/Moved手指仍按住时不创建140ms结算timer，Ended后等待，无phase鼠标滚轮与后续动量Moved延后结算；Cancelled及route/active切换清手势状态。未发明固定单卡限制。worker完整UI90/90 exit0（session71400，1.71秒），含原Window draw回归及手势状态测试；主代理已审阅差异。原.always精确限制及真实非空曲库触控板表现仍待验收。v33测试包构建日志`/tmp/gmgn-gpui-product-app-build-v33.log`，未启动即不计该包运行通过。
+
 ### v32 原居中动画与减少动态效果
 
 节目 active 切换恢复原 240ms easeOut(0,0,0.58,1) 居中动画；首次出现与路由进入仍立即居中。系统减少动态效果由原 NSWorkspace 设置投影，滚轮、新 active、路由切换取消旧任务，并以 generation 阻止旧 next-frame 回调覆盖新位置。小窗重新打开输入区清除已关闭回复 revision，符合原重新展开恢复回复行为，不改变窗口与气泡布局。

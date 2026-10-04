@@ -353,6 +353,28 @@ fn snap_offset(offset: f32, maximum: f32) -> f32 {
     -(target * stride).clamp(0., maximum)
 }
 
+// GPUI macOS forwards finger Started/Ended but not momentumPhase; ordinary
+// wheel and momentum updates both arrive as Moved. Never settle a live finger
+// gesture simply because the user pauses. Once released, debounce all Moved
+// updates so momentum cannot be interrupted by a premature alignment.
+fn schedule_scroll_settle(finger_active: &mut bool, phase: TouchPhase) -> bool {
+    match phase {
+        TouchPhase::Started => {
+            *finger_active = true;
+            false
+        }
+        TouchPhase::Ended => {
+            *finger_active = false;
+            true
+        }
+        TouchPhase::Cancelled => {
+            *finger_active = false;
+            false
+        }
+        TouchPhase::Moved => !*finger_active,
+    }
+}
+
 pub struct StageProgramRailPane {
     snapshot: Value,
     commands: Vec<Value>,
@@ -362,6 +384,7 @@ pub struct StageProgramRailPane {
     center_task: Option<Task<()>>,
     center_generation: u64,
     scroll_start: Option<f32>,
+    scroll_finger_active: bool,
     snap_task: Option<Task<()>>,
     renderer: SvgRenderer,
     card_cache: HashMap<String, (String, Arc<RgbaTexture>)>,
@@ -381,6 +404,7 @@ impl StageProgramRailPane {
             center_task: None,
             center_generation: 0,
             scroll_start: None,
+            scroll_finger_active: false,
             snap_task: None,
             renderer: SvgRenderer::new(Arc::new(())),
             card_cache: HashMap::new(),
@@ -418,6 +442,7 @@ impl StageProgramRailPane {
                 self.center_generation = self.center_generation.wrapping_add(1);
                 self.snap_task = None;
                 self.scroll_start = None;
+                self.scroll_finger_active = false;
             }
             if self.snapshot["route"] != snapshot["route"] {
                 self.pagination_request = None;
@@ -1031,6 +1056,14 @@ impl Render for StageProgramRailPane {
                             if event.touch_phase == TouchPhase::Cancelled {
                                 this.snap_task = None;
                                 this.scroll_start = None;
+                                this.scroll_finger_active = false;
+                                return;
+                            }
+                            this.snap_task = None;
+                            if !schedule_scroll_settle(
+                                &mut this.scroll_finger_active,
+                                event.touch_phase,
+                            ) {
                                 return;
                             }
                             // macOS GPUI does not expose momentumPhase. Wait for
@@ -1170,6 +1203,47 @@ mod tests {
                 assert!(pane.center_task.is_none());
             });
         }).unwrap();
+    }
+    #[test]
+    fn scrolling_waits_for_finger_release_and_accepts_wheel_and_momentum() {
+        use gpui_kit::TouchPhase;
+        let mut active = false;
+        assert!(!super::schedule_scroll_settle(
+            &mut active,
+            TouchPhase::Started
+        ));
+        assert!(active);
+        // A pause while fingers remain on the trackpad has no timer to fire.
+        for _ in 0..10 {
+            assert!(!super::schedule_scroll_settle(
+                &mut active,
+                TouchPhase::Moved
+            ));
+        }
+        assert!(super::schedule_scroll_settle(
+            &mut active,
+            TouchPhase::Ended
+        ));
+        assert!(!active);
+        // Subsequent momentum events reschedule settling, rather than snapping
+        // at the finger's Ended event. Mouse wheels (no Started) use this too.
+        assert!(super::schedule_scroll_settle(
+            &mut active,
+            TouchPhase::Moved
+        ));
+        assert!(!super::schedule_scroll_settle(
+            &mut active,
+            TouchPhase::Started
+        ));
+        assert!(!super::schedule_scroll_settle(
+            &mut active,
+            TouchPhase::Cancelled
+        ));
+        assert!(!active);
+        assert!(super::schedule_scroll_settle(
+            &mut active,
+            TouchPhase::Moved
+        ));
     }
     #[test]
     fn ease_out_matches_original_curve_and_240ms_endpoints() {
