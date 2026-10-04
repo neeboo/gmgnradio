@@ -190,20 +190,23 @@ namespace GMGN.UnityPlayer
             evaluationID = "unity-placement:" + Guid.NewGuid().ToString("D");
             var buildingID = evaluationID;
             JObject payload;
+            string rejectionMessage = null;
             buildingEvaluation = true;
             try {
                 payload = BuildPlacementRequestAsync != null
                     ? await BuildPlacementRequestAsync(selected.ObjectID, selected.Instance.transform.position, selected.Instance.transform.rotation, authority)
                     : BuildPlacementRequest?.Invoke(selected.ObjectID, selected.Instance.transform.position, selected.Instance.transform.rotation, authority);
             } catch (Exception error) {
-                Debug.LogWarning("Placement request preparation failed: " + error.GetType().Name);
+                rejectionMessage = error is PlacementPreparationException ? error.Message : "摆放校验准备失败，这次调整未保存。";
+                Debug.LogWarning($"Placement request rejected: objectID={selected?.ObjectID}; code={(error as PlacementPreparationException)?.Code ?? error.GetType().Name}");
                 payload = null;
             } finally { buildingEvaluation = false; }
             if (evaluationID != buildingID || selected == null) return;
             if (poseVersion != evaluatedPoseVersion) { evaluationID = null; return; }
             if (payload == null || ApplyValidatedPreview == null) {
                 evaluationID = null;
-                Status?.Invoke("空间摆放几何尚未就绪，这次调整不会保存。");
+                Status?.Invoke(rejectionMessage ?? "空间摆放校验尚未连接，这次调整不会保存。");
+                PreviewChanged?.Invoke(new JObject { ["canPlace"] = false, ["columns"] = new JArray() });
                 if (final) Cancel(); return;
             }
             evaluatedSupportHeight = (float?)payload["anchor"]?["supportHeight"];

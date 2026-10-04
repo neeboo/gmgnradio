@@ -2,6 +2,7 @@
 //! Coordinates retain the Swift right-handed convention; Unity must convert at its boundary.
 use serde::{Deserialize, Serialize};
 mod capsule;
+pub(crate) mod geometry_wire;
 pub use capsule::capsule_can_occupy;
 
 type V = [f32; 3];
@@ -48,6 +49,7 @@ pub enum Obstacle {
     /// World-space proxy triangles, not an AABB substitute. Empty proxy is invalid.
     Mesh {
         id: String,
+        #[serde(deserialize_with = "geometry_wire::deserialize_triangles")]
         triangles: Vec<[V; 3]>,
         #[serde(default, rename = "isClosed")]
         is_closed: bool,
@@ -61,6 +63,7 @@ pub struct EvaluateRequest {
     pub footprint: Footprint,
     pub height: f32,
     /// Local geometry query result. Missing geometry rejects rather than allowing placement.
+    #[serde(deserialize_with = "geometry_wire::deserialize_triangles")]
     pub triangles: Vec<[V; 3]>,
     #[serde(default)]
     pub blocking_volumes: Vec<Obstacle>,

@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System;
 using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
@@ -6,6 +7,11 @@ using GMGN.UnityPlayer.World;
 
 namespace GMGN.UnityPlayer
 {
+    public sealed class PlacementPreparationException : Exception
+    {
+        public string Code { get; }
+        public PlacementPreparationException(string code, string message) : base(message) { Code = code; }
+    }
     /// Mesh arrays are read once, on the main thread. All large JSON assembly
     /// and world-triangle projection run off the UI thread.
     public sealed class PlacementRequestBuilder
@@ -24,6 +30,7 @@ namespace GMGN.UnityPlayer
         readonly Dictionary<string, JObject> obstacleCache = new();
         readonly Dictionary<string, Matrix4x4> obstacleMatrices = new();
         string gridJSON, triangleJSON, blockingJSON;
+        readonly Dictionary<string, string> unavailable = new();
         public PlacementRequestBuilder(JObject grid, JArray triangles, JArray blocking, IReadOnlyList<RecoveryItem> items)
         {
             this.grid = grid; this.triangles = triangles; this.blocking = blocking; this.items = items;
@@ -33,45 +40,50 @@ namespace GMGN.UnityPlayer
                 var vertices = new List<Vector3>(); var indices = new List<int>(); var valid = true;
                 foreach (var filter in root.GetComponentsInChildren<MeshFilter>()) {
                     var mesh = filter.sharedMesh;
-                    if (mesh == null || !mesh.isReadable) { valid = false; break; }
+                    if (mesh == null || !mesh.isReadable) { valid = false; unavailable[item.ObjectID] = "nonreadableMesh"; break; }
                     var matrix = root.worldToLocalMatrix * filter.transform.localToWorldMatrix;
                     var offset = vertices.Count;
                     foreach (var point in mesh.vertices) vertices.Add(matrix.MultiplyPoint3x4(point));
                     foreach (var index in mesh.triangles) indices.Add(offset + index);
                 }
-                if (!valid || vertices.Count == 0 || indices.Count == 0) continue;
+                if (!valid || vertices.Count == 0 || indices.Count == 0) {
+                    if (!unavailable.ContainsKey(item.ObjectID)) unavailable[item.ObjectID] = "noMeshFilters";
+                    Debug.LogWarning($"Placement geometry unavailable: objectID={item.ObjectID}; code={unavailable[item.ObjectID]}; filters={root.GetComponentsInChildren<MeshFilter>().Length}; skinned={root.GetComponentsInChildren<SkinnedMeshRenderer>().Length}");
+                    continue;
+                }
                 var bounds = new Bounds(Vector3.Scale(vertices[0], root.lossyScale), Vector3.zero);
                 foreach (var p in vertices) bounds.Encapsulate(Vector3.Scale(p, root.lossyScale));
                 geometry[item.ObjectID] = new Geometry { Root = root, LocalVertices = vertices.ToArray(),
                     Indices = indices.ToArray(), Bounds = bounds,
                     BottomOffset = new Vector3(bounds.center.x, bounds.min.y, bounds.center.z) };
+                Debug.Log($"Placement geometry cached: objectID={item.ObjectID}; vertices={vertices.Count}; triangles={indices.Count/3}; bounds={bounds}; bottomOffset={geometry[item.ObjectID].BottomOffset}");
             }
         }
         public Task<JObject> BuildAsync(string id, Vector3 position, Quaternion rotation, JObject authority)
         {
-            if (!geometry.TryGetValue(id, out var selected)) return Task.FromResult<JObject>(null);
+            if (!geometry.TryGetValue(id, out var selected)) throw new PlacementPreparationException(unavailable.TryGetValue(id, out var code) ? code : "missingSelectedMesh", "这个物件的碰撞几何未载入，暂时不能移动。");
             var matrices = new Dictionary<string, Matrix4x4>();
             foreach (var item in items) {
                 if (item.ObjectID == id || item.Instance == null || !item.Instance.activeInHierarchy) continue;
-                if (!geometry.TryGetValue(item.ObjectID, out var mesh)) return Task.FromResult<JObject>(null);
+                if (!geometry.TryGetValue(item.ObjectID, out var mesh)) throw new PlacementPreparationException("missingObstacleMesh:" + item.ObjectID, "另一个物件缺少碰撞几何，这次调整已取消。");
                 matrices[item.ObjectID] = mesh.Root.localToWorldMatrix;
             }
             if (authority?["state"]?["objectStates"] is JObject states)
                 foreach (var state in states.Properties()) {
                     if (state.Name != id && (bool?)state.Value["isEnabled"] == true && !matrices.ContainsKey(state.Name))
-                        return Task.FromResult<JObject>(null);
+                        throw new PlacementPreparationException("unmodelledProp:" + state.Name, "有空间物件尚未载入，这次调整已取消。");
                 }
             // Only immutable JSON and copied value-type transforms cross threads.
             return Task.Run(() => BuildCore(id, position, rotation, selected, matrices));
         }
         JObject BuildCore(string id, Vector3 position, Quaternion rotation, Geometry selected, Dictionary<string, Matrix4x4> matrices)
         {
-            if (grid?["layers"] is not JArray layers || triangles == null || triangles.Count == 0) return null;
+            if (grid?["layers"] is not JArray layers || triangles == null || triangles.Count == 0) throw new PlacementPreparationException("missingGridGeometry", "空间碰撞几何未载入，暂时不能摆放。");
             var bounds = selected.Bounds;
-            if (bounds.size.x <= 0 || bounds.size.y <= 0 || bounds.size.z <= 0) return null;
+            if (bounds.size.x <= 0 || bounds.size.y <= 0 || bounds.size.z <= 0) throw new PlacementPreparationException("invalidBounds", "物件尺寸无效，调整已取消。");
             var spacing = (float?)grid["spacing"] ?? 0;
-            if (spacing <= 0) return null;
-            if (Vector3.Dot(rotation * Vector3.up, Vector3.up) < .9999f) return null;
+            if (spacing <= 0) throw new PlacementPreparationException("invalidSpacing", "空间网格无效，调整已取消。");
+            if (Vector3.Dot(rotation * Vector3.up, Vector3.up) < .9999f) throw new PlacementPreparationException("tiltedObject", "这个物件是倾斜姿态，当前摆放仅支持平放旋转。");
             var yaw = -Mathf.Round(rotation.eulerAngles.y / 45f) * 45f * Mathf.Deg2Rad;
             var snappedRotation = Quaternion.Euler(0, -yaw * Mathf.Rad2Deg, 0);
             var bottomCenter = position + snappedRotation * selected.BottomOffset;
@@ -86,7 +98,10 @@ namespace GMGN.UnityPlayer
                 var d = Mathf.Abs((float)layer["supportHeight"] - bottomCenter.y);
                 if (d < distance) { distance = d; anchor = layer as JObject; }
             }
-            if (anchor == null) return null;
+            if (anchor == null) {
+                Debug.Log($"Placement rejected: code=noAnchor; objectID={id}; column=({x},{z}); root={position}; bottomCenter={bottomCenter}; size={bounds.size}; yaw={yaw}; layerCount={layers.Count}");
+                throw new PlacementPreparationException("noAnchor", "这里没有可放置的支撑面，调整已取消。");
+            }
             // Static geometry is serialized once per derived-grid session. JRaw
             // preserves the actual arrays on the wire without copying 161k
             // triangle tokens on every gesture sample.

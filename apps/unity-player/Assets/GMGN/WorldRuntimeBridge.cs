@@ -229,6 +229,7 @@ namespace GMGN.UnityPlayer
             if ((string)update["status"] != "completed" || placementGrid == null) {
                 Status?.Invoke("真实空间网格生成失败，摆放尚未启用。"); return;
             }
+            Debug.Log($"Placement grid derived: layers={(placementGrid["layers"] as JArray)?.Count ?? 0}");
             interactions.ConfigurePlacementGeometry(placementGrid, (JArray)placementGeometry.DeriveRequest["triangles"],
                 (JArray)placementGeometry.DeriveRequest["blockingVolumes"]);
             var shader = Resources.Load<Shader>("PlacementGrid");

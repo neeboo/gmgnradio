@@ -192,9 +192,10 @@ namespace GMGN.UnityPlayer
                 var hasTranslation=!string.IsNullOrEmpty(line.translation);
                 var baseline=logicalHeight*.5f-8+fontSize*.5f-(hasTranslation?translationSize*.5f+11:0);
                 AddLine(line,fontSize,logicalWidth*.5f,baseline,primary,true);
-                if(activeIndex>0)AddLeftLine(lines[activeIndex-1],contextSize,logicalWidth*.5f-340-42,baseline-fontSize-22,WithAlpha(primary,.18f),false);
+                var contextWidth=Mathf.Min(680,Mathf.Max(1,logicalWidth-84));
+                if(activeIndex>0)AddFlowContext(lines[activeIndex-1],contextSize,contextWidth,logicalWidth*.5f-contextWidth*.5f-42,baseline-fontSize-22,WithAlpha(primary,.18f),false);
                 AddTranslation(line,translationSize,logicalWidth*.5f,baseline+translationSize+22,.66f);
-                if(activeIndex+1<lines.Length)AddRightLine(lines[activeIndex+1],contextSize,logicalWidth*.5f+340+42,baseline+(hasTranslation?translationSize*2:0)+44+contextSize,WithAlpha(primary,.28f),false);
+                if(activeIndex+1<lines.Length)AddFlowContext(lines[activeIndex+1],contextSize,contextWidth,logicalWidth*.5f+contextWidth*.5f+42,baseline+(hasTranslation?translationSize*2:0)+44+contextSize,WithAlpha(primary,.28f),true);
             }
             if (descriptors.Count == 0) return;
             if (descriptors.Count > MaximumGlyphs) { Status = "GPU lyric glyph limit exceeded"; descriptors.Clear(); return; }
@@ -312,18 +313,53 @@ namespace GMGN.UnityPlayer
                 AddLeftLine(context,18,cx+16,cy+29,WithAlpha(primary,.36f),false);
             }
         }
+        // Swift contextualLine: bounded 680-point frame, minimumScaleFactor(.72),
+        // lineLimit(1). Work happens only on a line/viewport boundary, never per frame.
+        void AddFlowContext(LyricPointLine line,float size,float width,float anchor,float y,Color color,bool trailing) {
+            var text=line.text??"";
+            var measured=Measure(text,size);
+            size*=Mathf.Clamp(width/Mathf.Max(1,measured),.72f,1);
+            if(Measure(text,size)>width){
+                var elements=StringInfo.GetTextElementEnumerator(text);var fitted=new StringBuilder();
+                while(elements.MoveNext()){
+                    var element=elements.GetTextElement();
+                    if(Measure(fitted.ToString()+element+"…",size)>width)break;
+                    fitted.Append(element);
+                }
+                text=fitted+"…";
+            }
+            var display=new LyricPointLine{text=text,startsAt=1,endsAt=-1};
+            var begin=descriptors.Count;
+            AddLine(display,size,anchor,y,color,false);
+            AlignGlyphRange(begin,anchor,trailing);
+            if(descriptors.Count>begin){
+                var bounds=GlyphRangeBounds(begin);
+                var viewport=this.width/scale;
+                if(bounds.x<-.01f||bounds.y>viewport+.01f)
+                    Debug.LogError($"Flow context outside viewport: logical={viewport}, bounds={bounds}, anchor={anchor}, frame={width}, scale={scale}",this);
+                Debug.Log($"GPU Flow context {(trailing?"next":"previous")}: screen={this.width} scale={scale} logical={viewport} bounds=[{bounds.x:F2},{bounds.y:F2}] anchor={anchor:F2}",this);
+            }
+        }
+        Vector2 GlyphRangeBounds(int begin){
+            var minimum=float.PositiveInfinity;var maximum=float.NegativeInfinity;
+            for(var i=begin;i<descriptors.Count;i++){var rect=descriptors[i].rectangle;minimum=Mathf.Min(minimum,rect.x);maximum=Mathf.Max(maximum,rect.x+rect.z);}
+            return new Vector2(minimum,maximum);
+        }
+        void AlignGlyphRange(int begin,float anchor,bool trailing){
+            if(descriptors.Count==begin)return;
+            var bounds=GlyphRangeBounds(begin);var shift=anchor-(trailing?bounds.y:bounds.x);
+            for(var i=begin;i<descriptors.Count;i++){var seed=descriptors[i];seed.rectangle.x+=shift;descriptors[i]=seed;}
+        }
         void AddTranslation(LyricPointLine line,float size,float x,float y,float alpha) {
             var saved=currentTransform;currentTransform=new Vector4(x,y,0,1);
             if(!string.IsNullOrEmpty(line.translation))AddLine(new LyricPointLine{text=line.translation,startsAt=1,endsAt=-1},size,x,y,WithAlpha(primary,alpha),false);
             currentTransform=saved;
         }
         void AddTranslationLeft(LyricPointLine line,float size,float x,float y,float alpha){if(!string.IsNullOrEmpty(line.translation))AddLeftLine(new LyricPointLine{text=line.translation,startsAt=1,endsAt=-1},size,x,y,WithAlpha(primary,alpha),false);}
-        void AddRightLine(LyricPointLine line,float size,float x,float y,Color color,bool animated){var begin=descriptors.Count;AddLine(line,size,x,y,color,animated);if(descriptors.Count==begin)return;var last=descriptors[descriptors.Count-1].rectangle;var shift=x-last.x-last.z;for(var i=begin;i<descriptors.Count;i++){var seed=descriptors[i];seed.rectangle.x+=shift;descriptors[i]=seed;}}
+        void AddRightLine(LyricPointLine line,float size,float x,float y,Color color,bool animated){var begin=descriptors.Count;AddLine(line,size,x,y,color,animated);AlignGlyphRange(begin,x,true);}
         void AddLeftLine(LyricPointLine line,float size,float x,float y,Color color,bool animated) {
             var begin=descriptors.Count;AddLine(line,size,x,y,color,animated);
-            if(descriptors.Count==begin)return;
-            var shift=x-descriptors[begin].rectangle.x;
-            for(var i=begin;i<descriptors.Count;i++){var seed=descriptors[i];seed.rectangle.x+=shift;descriptors[i]=seed;}
+            AlignGlyphRange(begin,x,false);
         }
         void AddLine(LyricPointLine line, float size, float centerX, float centerY, Color color, bool animated)
         {

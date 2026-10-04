@@ -1,5 +1,6 @@
 import Foundation
 import CoreFoundation
+import CryptoKit
 
 /// Unity projects the Rust authority; it never writes a parallel world archive.
 /// Explicit commands run off the render thread. No daemon or autonomy is started.
@@ -14,6 +15,9 @@ final class UnityWorldBridge: @unchecked Sendable {
     private var generation: UInt64 = 0
     private var emittedGeneration: UInt64?
     private var resultData = Data("{\"status\":\"idle\",\"version\":1}".utf8)
+    // Accessed only on the serial authority queue. One immutable geometry cached.
+    private var indexedGeometryDigest: Data?
+    private var indexedGeometry: [String: Any]?
 
     init(root: URL) {
         endpoint = WorldAuthorityEndpoint(applicationSupportBase: root)
@@ -66,12 +70,15 @@ final class UnityWorldBridge: @unchecked Sendable {
                 if operation == "world.placement.evaluate" || operation == "world.placement.derive" {
                     guard let requestID = request["requestID"] as? String,
                           !requestID.isEmpty, requestID.utf8.count <= 256,
-                          let payload = request["payload"] as? [String: Any] else {
+                          var payload = request["payload"] as? [String: Any] else {
                         throw WorldAuthorityError.daemon("invalid_request")
                     }
                     // Pure read-only evaluation, through the same authenticated
                     // taskd transport. The renderer cannot supply its own verdict.
                     let deriving = operation == "world.placement.derive"
+                    if let triangles = payload["triangles"] as? [[[NSNumber]]] {
+                        payload["triangles"] = try indexedTriangles(triangles)
+                    }
                     payloadByteCount = try JSONSerialization.data(withJSONObject: payload).count
                     // Keep the authenticated transport's 12 MiB limit unchanged.
                     // Leave bounded headroom for method/id/auth envelope.
@@ -163,6 +170,39 @@ final class UnityWorldBridge: @unchecked Sendable {
         lock.lock()
         closed = true
         lock.unlock()
+    }
+
+    private struct VertexBits: Hashable { let x: UInt32; let y: UInt32; let z: UInt32 }
+    private func indexedTriangles(_ triangles: [[[NSNumber]]]) throws -> [String: Any] {
+        let source = try JSONSerialization.data(withJSONObject: triangles)
+        let digest = Data(SHA256.hash(data: source))
+        if digest == indexedGeometryDigest, let indexedGeometry { return indexedGeometry }
+        var lookup: [VertexBits: UInt32] = [:]
+        var vertices: [[Float]] = []
+        var indices: [[UInt32]] = []
+        indices.reserveCapacity(triangles.count)
+        for triangle in triangles {
+            guard triangle.count == 3 else { throw WorldAuthorityError.daemon("invalid_placement_request") }
+            var face: [UInt32] = []
+            for point in triangle {
+                guard point.count == 3, point.allSatisfy({ CFGetTypeID($0) != CFBooleanGetTypeID() }) else {
+                    throw WorldAuthorityError.daemon("invalid_placement_request")
+                }
+                let xyz = point.map { $0.floatValue }
+                guard xyz.allSatisfy({ $0.isFinite }) else { throw WorldAuthorityError.daemon("invalid_placement_request") }
+                let bits = VertexBits(x: xyz[0].bitPattern, y: xyz[1].bitPattern, z: xyz[2].bitPattern)
+                if let index = lookup[bits] { face.append(index) }
+                else {
+                    guard vertices.count < Int(UInt32.max) else { throw WorldAuthorityError.daemon("invalid_placement_request") }
+                    let index = UInt32(vertices.count)
+                    lookup[bits] = index; vertices.append(xyz); face.append(index)
+                }
+            }
+            indices.append(face)
+        }
+        let result: [String: Any] = ["vertices": vertices, "indices": indices]
+        indexedGeometryDigest = digest; indexedGeometry = result
+        return result
     }
 
     private static func validPlacementReply(_ value: [String: Any]) -> Bool {

@@ -24,8 +24,9 @@ namespace GMGN.UnityPlayer.WorldPlacementGeometry
             var scale = (float)framing["scale"];
             var origin = UnityPoint(framing["origin"]);
             if (!float.IsFinite(scale) || scale <= 0) throw new InvalidDataException("碰撞包校准比例无效。");
-            // Same source-coordinate correction as Swift WorldMeshTransform:
-            // WorldLabs OpenCV flips Y/Z, then subtracts framing origin, then scales.
+            // Load first adapts glTFast's reflected-X scene to our reflected-Z
+            // scene basis. Then match Swift WorldLabs OpenCV flips Y/Z,
+            // subtract framing origin and scale.
             var matrix = Matrix4x4.TRS(-origin * scale, Quaternion.identity, new Vector3(scale, -scale, -scale));
             var geometry = await Load(package, root + "collider.glb", matrix,
                 WorldCoordinates.Position(world["spawn"]["position"]), cancellation);
@@ -51,7 +52,13 @@ namespace GMGN.UnityPlayer.WorldPlacementGeometry
                     if (mesh == null) continue;
                     if (!mesh.isReadable) throw new InvalidDataException("碰撞模型未保留几何数据，请启用 GLTFAST_KEEP_MESH_DATA 后重新构建。");
                     var vertices = mesh.vertices; var indices = mesh.triangles;
-                    var matrix = unityColliderToGameplay * model.transform.worldToLocalMatrix * filter.transform.localToWorldMatrix;
+                    // Installed glTFast 6.20 ConvertVector3FloatToFloatInterleavedJob
+                    // flips X (not Z), and NodeExtension reflects node transforms
+                    // in the same basis. Y180 maps that entire scene into the Z-
+                    // reflected Unity basis used by WorldCoordinates.
+                    var importedToWorldBasis = Matrix4x4.Scale(new Vector3(-1, 1, -1));
+                    var matrix = unityColliderToGameplay * importedToWorldBasis
+                        * model.transform.worldToLocalMatrix * filter.transform.localToWorldMatrix;
                     snapshots.Add(new MeshSnapshot { Vertices = vertices, Indices = indices, Matrix = matrix });
                     cancellation.ThrowIfCancellationRequested();
                     await Task.Yield();
@@ -73,8 +80,9 @@ namespace GMGN.UnityPlayer.WorldPlacementGeometry
                     for (var i = 0; i < indices.Length; i += 3)
                     {
                         if ((i & 1023) == 0) cancellation.ThrowIfCancellationRequested();
-                        // glTFast has already mirrored glTF into Unity. Reverse winding
-                        // together with Z when returning to the Swift/Rust convention.
+                        // glTFast already reverses winding for its X reflection;
+                        // Y180 is orientation preserving. Reverse winding with
+                        // the final Z reflection back to the Swift/Rust convention.
                         var face = new JArray();
                         for (int corner = 0; corner < 3; corner++)
                         {

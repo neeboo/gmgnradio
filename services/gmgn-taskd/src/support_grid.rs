@@ -42,6 +42,7 @@ pub struct Bounds {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeriveRequest {
+    #[serde(deserialize_with = "crate::placement::geometry_wire::deserialize_triangles")]
     pub triangles: Vec<Triangle>,
     #[serde(default)]
     pub blocking_volumes: Vec<Obstacle>,
