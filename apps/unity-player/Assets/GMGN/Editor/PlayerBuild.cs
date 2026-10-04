@@ -14,6 +14,9 @@ namespace GMGN.UnityPlayer.Editor
             GMGN.UnityPlayer.World.Editor.WorldShaderBuild.Prepare();
             PlayerSettings.productName = "GMGN Unity Sample";
             PlayerSettings.runInBackground = true;
+            var meshSymbols = PlayerSettings.GetScriptingDefineSymbols(NamedBuildTarget.Standalone);
+            if (!System.Array.Exists(meshSymbols.Split(';'), symbol => symbol == "GLTFAST_KEEP_MESH_DATA"))
+                PlayerSettings.SetScriptingDefineSymbols(NamedBuildTarget.Standalone, string.IsNullOrEmpty(meshSymbols) ? "GLTFAST_KEEP_MESH_DATA" : meshSymbols + ";GLTFAST_KEEP_MESH_DATA");
             PlayerSettings.SetApplicationIdentifier(NamedBuildTarget.Standalone, "ai.gmgn.unity-sample.player");
             PlayerSettings.fullScreenMode = FullScreenMode.Windowed;
             PlayerSettings.defaultScreenWidth = 1440;
@@ -55,6 +58,7 @@ namespace GMGN.UnityPlayer.Editor
         public static void BuildMac()
         {
             Prepare();
+            GpuLyricsValidation.Validate();
             if (AssetDatabase.LoadAssetAtPath<GameObject>("Assets/GMGN/GaussianWorld/Resources/GaussianWorld/Cabin.prefab") == null)
                 throw new System.InvalidOperationException("Prepare the Gaussian cabin with GaussianWorldBootstrap.PrepareCabin before building; missing assets must not produce an empty space.");
             var output = System.Environment.GetEnvironmentVariable("GMGN_UNITY_BUILD_PATH");

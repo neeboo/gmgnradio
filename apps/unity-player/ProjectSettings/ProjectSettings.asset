@@ -832,7 +832,7 @@ PlayerSettings:
   webEnableSubmoduleStrippingCompatibility: 0
   webProgressiveAssetLoading: 0
   scriptingDefineSymbols:
-    Standalone: GMGN_UMT
+    Standalone: GMGN_UMT;GLTFAST_KEEP_MESH_DATA
   additionalCompilerArguments: {}
   platformArchitecture: {}
   scriptingBackend:

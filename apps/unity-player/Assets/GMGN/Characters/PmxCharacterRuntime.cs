@@ -29,6 +29,7 @@ namespace GMGN.UnityPlayer.Characters
         Quaternion[] bindRotations;
         float elapsed, motionDuration, playbackRate = 1;
         bool looping, completed;
+        bool poseDiagnosticPending;
 #endif
 
         public async Task LoadAsync(string characterId, string modelPath, float heightMeters = 1.65f)
@@ -78,6 +79,7 @@ namespace GMGN.UnityPlayer.Characters
                 for (var i = 0; i < next.bones.Length; i++) { bindPositions[i] = next.bones[i].localPosition; bindRotations[i] = next.bones[i].localRotation; }
                 CharacterId = characterId; MotionId = null; IsLoaded = true;
                 staging.SetActive(true);
+                LogSkinningBounds("bind");
                 Notice?.Invoke("角色已载入；MMD 物理尚未接入。");
             }
             catch
@@ -107,6 +109,8 @@ namespace GMGN.UnityPlayer.Characters
             var animation = await VMDReader.ReadAsync(budget, File.ReadAllBytesAsync(vmdPath));
             try
             {
+                if (motionId.StartsWith("gmgn.motion.", StringComparison.Ordinal))
+                    GeneratedHumanoidRetarget.Apply(animation, model);
                 var converted = await VMDAnimationClipConverter.ConvertAsync(budget, animation, model, null,
                     new VMDAnimationClipOptions { bakeIKToFK = true, bakePhysicsToFK = false });
                 if (request != generation || imported?.model != model) return;
@@ -131,6 +135,7 @@ namespace GMGN.UnityPlayer.Characters
                 ResetBones();
                 targets = nextTargets; morphTargets = renderers; morphIndices = indices; motion = converted;
                 MotionId = motionId; elapsed = 0; motionDuration = end; looping = loop; playbackRate = rate; completed = false;
+                poseDiagnosticPending = true;
                 Notice?.Invoke("动作已载入。");
             }
             finally { Destroy(animation); }
@@ -158,6 +163,7 @@ namespace GMGN.UnityPlayer.Characters
                 result.texturesByIndex = PMXTextureLoader.Load(model, options, result);
                 await budget.YieldIfNeeded();
                 result.materials.AddRange(PMXMaterialBuilder.Build(model, options, result.root.name, result.texturesByIndex));
+                PrepareMaterials(model, result);
                 await budget.YieldIfNeeded();
                 result.bones = PMXBoneBuilder.BuildBones(model, result.root.transform);
                 var poses = PMXBoneBuilder.BuildBindposes(result.root.transform, result.bones);
@@ -166,10 +172,34 @@ namespace GMGN.UnityPlayer.Characters
                 result.meshes.AddRange(PMXMeshBuilder.Build(model, result.root.name, groups, poses));
                 await budget.YieldIfNeeded();
                 PMXRendererBuilder.Build(model, result.root, result.meshes, result.materials, result.bones);
+                foreach (var renderer in result.root.GetComponentsInChildren<SkinnedMeshRenderer>(true))
+                    renderer.quality = SkinQuality.Bone4;
                 await budget.YieldIfNeeded();
                 return result;
             }
             catch { DisposeImport(result, result.root); throw; }
+        }
+        static void PrepareMaterials(PMXModel model, PMXImportResult result)
+        {
+            // Match the existing Swift PMX compatibility path: original texture
+            // times authored tint, double-sided, lit cloth without grey emission.
+            // UMT's URP fallback sets _Color, whereas URP reads _BaseColor.
+            var shader = Resources.Load<Shader>("Characters/PmxStageLit");
+            if (shader == null) throw new InvalidDataException("角色材质资源没有打包，请重新构建应用。");
+            for (var i = 0; i < result.materials.Count; i++) {
+                var material = result.materials[i];
+                var authored = model.materials[i];
+                var texture = material.GetTexture("_BaseMap");
+                var transparent = material.renderQueue >= 3000;
+                material.shader = shader;
+                material.SetTexture("_BaseMap", texture ?? Texture2D.whiteTexture);
+                material.SetColor("_BaseColor", authored.diffuse);
+                material.SetFloat("_Cull", 0);
+                material.SetFloat("_SrcBlend", transparent ? 5 : 1);
+                material.SetFloat("_DstBlend", transparent ? 10 : 0);
+                material.SetFloat("_ZWrite", 1);
+                material.renderQueue = transparent ? 3000 : 2000;
+            }
         }
         void ResetBones()
         {
@@ -193,9 +223,26 @@ namespace GMGN.UnityPlayer.Characters
             }
             for (var i = 0; i < morphTargets.Length; i++) if (morphTargets[i] != null && morphIndices[i] >= 0 && motion.morphs.curves[i] != null)
                 morphTargets[i].SetBlendShapeWeight(morphIndices[i], motion.morphs.curves[i].Evaluate(t));
+            if (poseDiagnosticPending) { poseDiagnosticPending = false; LogSkinningBounds("motion"); }
             if (!looping && elapsed >= motionDuration) { completed = true; MotionCompleted?.Invoke(MotionId); }
         }
         float Evaluate(int index, float t, float fallback) => motion.bones.curves[index]?.Evaluate(t) ?? fallback;
+        void LogSkinningBounds(string stage)
+        {
+            if (imported == null) return;
+            foreach (var renderer in imported.root.GetComponentsInChildren<SkinnedMeshRenderer>(true)) {
+                var baked = new Mesh();
+                try {
+                    renderer.BakeMesh(baked, false);
+                    var vertices = baked.vertices;
+                    var source = renderer.sharedMesh.vertices;
+                    float maxDelta = 0;
+                    for (var i = 0; i < vertices.Length; i++) maxDelta = Mathf.Max(maxDelta, Vector3.Distance(vertices[i], source[i]));
+                    Debug.Log($"[CharacterSkin] stage={stage} mesh={renderer.name} vertices={vertices.Length} source={renderer.sharedMesh.bounds} baked={baked.bounds} maxDelta={maxDelta:F5}");
+                }
+                finally { Destroy(baked); }
+            }
+        }
         static Bounds BoundsOf(GameObject root)
         {
             var renderers = root.GetComponentsInChildren<SkinnedMeshRenderer>(true);

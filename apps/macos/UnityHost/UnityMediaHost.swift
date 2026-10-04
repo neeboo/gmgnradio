@@ -34,6 +34,9 @@ final class UnityMediaHost {
         self.root = root
         world = UnityWorldBridge(root: root)
         graph = AudioGraphController(visualStore: features)
+        if ProcessInfo.processInfo.environment["GMGN_UNITY_TEST_MUTED"] == "1" {
+            graph.musicVolume = 0
+        }
         player = LocalMusicPlayer(graph: graph)
         chat = try RenderHostResidentConversation(backend: "dsh", dataRoot: root, defaults: defaults)
         player.setCompletionHandler { [weak self] in
@@ -89,7 +92,7 @@ final class UnityMediaHost {
                       let mode = StageLyricsVisualMode.allCases.first(where: { $0.agentValue == id }) else { return false }
                 lyricsStore.setVisualMode(mode)
                 visualRevision &+= 1
-            case "world.snapshot", "world.commit":
+            case "world.snapshot", "world.commit", "world.placement.evaluate", "world.placement.derive":
                 return world.command(value)
             case "music.choose":
                 guard openPanel == nil else { return false }
@@ -263,6 +266,17 @@ public func gmgnUnityHostCommand(_ handle: UnsafeMutableRawPointer?, _ json: Uns
     guard let json, let data = String(cString: json).data(using: .utf8), data.count <= 256 * 1024,
           let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return 0 }
     return withUnityHost(handle) { $0.command(value) ? 1 : 0 } ?? 0
+}
+
+/// Dedicated bounded geometry path. No music/chat/general command is accepted.
+/// Main thread only obtains the lifetime-safe bridge reference and copies bytes.
+@_cdecl("gmgn_unity_host_placement")
+public func gmgnUnityHostPlacement(_ handle: UnsafeMutableRawPointer?, _ bytes: UnsafePointer<UInt8>?, _ count: Int32) -> Int32 {
+    guard Thread.isMainThread, let bytes, count > 0, count <= 64 * 1024 * 1024 else { return 0 }
+    let copied = Data(bytes: bytes, count: Int(count))
+    return withUnityHost(handle) { host in
+        return host.world.enqueueGeometry(copied) ? Int32(1) : Int32(0)
+    } ?? 0
 }
 
 @_cdecl("gmgn_unity_host_snapshot")

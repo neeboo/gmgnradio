@@ -149,6 +149,7 @@ namespace GMGN.UnityPlayer
             // Text labels remain only for genuinely unmigrated styles. Do not
             // draw a second UI lyric over the active GPU presentation.
             lyric.style.display = gpuModeReady ? DisplayStyle.None : DisplayStyle.Flex;
+            translation.style.display = gpuModeReady ? DisplayStyle.None : DisplayStyle.Flex;
             if (!gpuModeReady && gpuLyricStatus != lyricMode) {
                 gpuLyricStatus = lyricMode;
                 OnStatus("当前歌词风格的 GPU 渲染尚未完成迁移。");

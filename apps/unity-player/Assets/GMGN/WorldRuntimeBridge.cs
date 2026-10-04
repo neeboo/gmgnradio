@@ -33,6 +33,10 @@ namespace GMGN.UnityPlayer
         Color playerAmbientLight;
         SphericalHarmonicsL2 playerAmbientProbe;
         WorldInteractionController interactions;
+        WorldPlacementGeometry.PlacementGeometry placementGeometry;
+        WorldPlacementGeometry.PlacementGridView placementView;
+        string placementDeriveID;
+        JObject placementGrid;
         GMGN.UnityPlayer.Characters.CharacterWorldAdapter character;
         public JObject AuthorityProjection { get; private set; }
         public bool Configured => !string.IsNullOrEmpty(worldID) && !string.IsNullOrEmpty(packageDirectory);
@@ -45,6 +49,7 @@ namespace GMGN.UnityPlayer
             worldID = Environment.GetEnvironmentVariable("GMGN_UNITY_WORLD_ID");
             packageDirectory = Environment.GetEnvironmentVariable("GMGN_UNITY_WORLD_PACKAGE");
             backend.WorldUpdated += OnWorldUpdated;
+            backend.PlacementDerived += OnPlacementDerived;
             if (Configured) backend.RequestWorldSnapshot(worldID);
         }
 
@@ -99,6 +104,9 @@ namespace GMGN.UnityPlayer
                 interactions = gameObject.AddComponent<WorldInteractionController>();
                 interactions.Configure(backend, worldID, items, GetComponent<UnityEngine.UIElements.UIDocument>().rootVisualElement);
                 interactions.Status += value => Status?.Invoke(value);
+                try { await PreparePlacement(package, token); }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception error) { Debug.LogWarning("Placement geometry unavailable: " + error.Message); }
                 try {
                     character = await GMGN.UnityPlayer.Characters.CharacterWorldAdapter.RestoreAsync(
                         AuthorityProjection?["state"] as JObject ?? package.State(worldID), worldRoot.transform, token);
@@ -180,6 +188,7 @@ namespace GMGN.UnityPlayer
             cameraControls.Configure(camera, GetComponent<UnityEngine.UIElements.UIDocument>());
             cameraControls.SetActive(value);
             interactions?.SetActive(value);
+            if (!value) placementView?.Hide();
             ModeChanged?.Invoke(value);
         }
 
@@ -187,7 +196,57 @@ namespace GMGN.UnityPlayer
         {
             lifetime.Cancel(); lifetime.Dispose();
             if (backend != null) backend.WorldUpdated -= OnWorldUpdated;
+            if (backend != null) backend.PlacementDerived -= OnPlacementDerived;
             if (worldRoot != null) Destroy(worldRoot);
+        }
+        async Task PreparePlacement(PortableWorldPackage package, CancellationToken token)
+        {
+            var reference = Environment.GetEnvironmentVariable("GMGN_UNITY_WORLD_COLLIDER_REFERENCE");
+            if (string.IsNullOrEmpty(reference) && worldID == VerifiedCabinWorldID) {
+                placementGeometry = await WorldPlacementGeometry.PlacementGeometry.LoadBundledCabin(package, token);
+            } else {
+                if (string.IsNullOrEmpty(reference)) return;
+                var calibrationJSON = Environment.GetEnvironmentVariable("GMGN_UNITY_WORLD_COLLIDER_TRANSFORM");
+                if (string.IsNullOrEmpty(calibrationJSON)) throw new System.IO.InvalidDataException("真实碰撞模型缺少明确校准，摆放尚未启用。");
+                var calibration = JObject.Parse(calibrationJSON);
+                var matrix = Matrix4x4.TRS(WorldCoordinates.Position(calibration["position"]),
+                    WorldCoordinates.Rotation(calibration["rotation"]), WorldCoordinates.Scale(calibration["scale"]));
+                var seed = WorldCoordinates.Position((AuthorityProjection?["state"] ?? package.State(worldID))["agentTransform"]?["position"]);
+                placementGeometry = await WorldPlacementGeometry.PlacementGeometry.Load(package, reference, matrix, seed, token);
+            }
+            placementDeriveID = "unity-grid:" + Guid.NewGuid().ToString("D");
+            for (int attempt = 0; attempt < 50; attempt++) {
+                if (backend.RequestPlacementDerivation(placementGeometry.DeriveRequest, placementDeriveID)) return;
+                await Task.Delay(100, token);
+            }
+            throw new InvalidOperationException("空间网格校验服务忙，摆放尚未启用。");
+        }
+        void OnPlacementDerived(JObject update)
+        {
+            if ((string)update["requestID"] != placementDeriveID || placementGeometry == null) return;
+            placementDeriveID = null;
+            placementGrid = update["result"]?["grid"] as JObject;
+            if ((string)update["status"] != "completed" || placementGrid == null) {
+                Status?.Invoke("真实空间网格生成失败，摆放尚未启用。"); return;
+            }
+            interactions.ConfigurePlacementGeometry(placementGrid, (JArray)placementGeometry.DeriveRequest["triangles"],
+                (JArray)placementGeometry.DeriveRequest["blockingVolumes"]);
+            var shader = Resources.Load<Shader>("PlacementGrid");
+            if (shader == null) { Status?.Invoke("摆放网格着色器缺失，预览暂不可用。"); return; }
+            var display = new GameObject("Placement footprint"); display.transform.SetParent(worldRoot.transform, false);
+            placementView = display.AddComponent<WorldPlacementGeometry.PlacementGridView>();
+            placementView.Initialize(shader);
+            interactions.PreviewStarted += () => placementView.ShowGrid(placementGrid);
+            interactions.PreviewChanged += result => {
+                if (result?["columns"] is not JArray) { placementView.Hide(); return; }
+                var volume = result["volume"];
+                var support = (float?)result["previewSupportHeight"];
+                if (volume == null && !support.HasValue) { placementView.Hide(); return; }
+                var height = volume == null ? support.Value : (float)volume["center"][1] - (float)volume["halfExtents"][1];
+                placementView.ShowPreview(result, (float)placementGrid["spacing"], height);
+            };
+            interactions.PreviewEnded += placementView.Hide;
+            Status?.Invoke("空间摆放已就绪：左键拖动，右键旋转，松开校验保存，Esc取消。");
         }
     }
 }

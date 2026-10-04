@@ -282,6 +282,22 @@ impl Service {
             // 见 `contract.rs`：转述者不得自带一份数字，否则 agent 读到的是
             // 一份校验器并不执行的契约。
             "capability_contract" => Ok(contract::describe()),
+            "placement_evaluate" => {
+                let request: crate::placement::EvaluateRequest =
+                    serde_json::from_value(params).map_err(|_| "invalid_placement_request")?;
+                let result = tokio::task::spawn_blocking(move || crate::placement::evaluate(request))
+                    .await.map_err(|_| "invalid_placement_result")?;
+                serde_json::to_value(result)
+                    .map_err(|_| "invalid_placement_result")
+            }
+            "placement_derive" => {
+                let request: crate::support_grid::DeriveRequest =
+                    serde_json::from_value(params).map_err(|_| "invalid_placement_request")?;
+                let result = tokio::task::spawn_blocking(move || crate::support_grid::derive(request))
+                    .await.map_err(|_| "invalid_placement_result")?
+                    .map_err(|_| "invalid_placement_request")?;
+                serde_json::to_value(result).map_err(|_| "invalid_placement_result")
+            }
             "world_snapshot" => {
                 let request: world::SnapshotRequest =
                     serde_json::from_value(params).map_err(|_| "invalid_world_snapshot")?;

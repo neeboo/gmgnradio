@@ -6,9 +6,11 @@ mod files;
 mod memory;
 mod messages;
 mod model;
+mod placement;
 mod provider;
 mod resident;
 mod store;
+mod support_grid;
 mod voice;
 mod world;
 

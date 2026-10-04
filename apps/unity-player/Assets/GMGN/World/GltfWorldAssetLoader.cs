@@ -22,12 +22,16 @@ namespace GMGN.UnityPlayer.World
         public Task<GameObject> LoadSceneAsset(string packageLocalPath, CancellationToken cancellation)
             => Load(packageLocalPath, null, cancellation);
 
-        async Task<GameObject> Load(string packageLocalPath, JObject prop, CancellationToken cancellation)
+        public Task<GameObject> LoadCollisionAsset(string packageLocalPath, CancellationToken cancellation)
+            => Load(packageLocalPath, null, cancellation, false);
+
+        async Task<GameObject> Load(string packageLocalPath, JObject prop, CancellationToken cancellation, bool visible = true)
         {
             // Backup blobs have no extension. Validate the GLB container itself.
             // Reject remote/external resources: recovery only reads verified bytes.
             ValidateEmbeddedGlb(packageLocalPath);
             var root = new GameObject("Recovered asset");
+            if (!visible) root.SetActive(false);
             var content = new GameObject("Model");
             content.transform.SetParent(root.transform, false);
             var logger = new CollectingLogger();

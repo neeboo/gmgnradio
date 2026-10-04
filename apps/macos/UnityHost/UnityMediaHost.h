@@ -5,6 +5,8 @@
 // ai.gmgn.unity-sample. No default user data or Keychain is accessed.
 void *gmgn_unity_host_create(const char *root, const char *suite);
 int32_t gmgn_unity_host_command(void *handle, const char *json);
+// Main-thread submission; copied, decoded and evaluated asynchronously. 64 MiB max.
+int32_t gmgn_unity_host_placement(void *handle, const uint8_t *bytes, int32_t count);
 char *gmgn_unity_host_snapshot(void *handle);
 void gmgn_unity_host_string_free(char *json);
 int32_t gmgn_unity_host_destroy(void *handle);

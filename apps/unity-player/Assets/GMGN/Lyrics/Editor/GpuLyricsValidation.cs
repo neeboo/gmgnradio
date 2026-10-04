@@ -12,20 +12,24 @@ namespace GMGN.UnityPlayer.Editor
         public static void Validate()
         {
             var seedType = typeof(GpuLyricsView).Assembly.GetType("GMGN.UnityPlayer.LyricGlyphSeed", true);
-            if (Marshal.SizeOf(seedType) != 112)
+            if (Marshal.SizeOf(seedType) != 128)
                 throw new InvalidOperationException("GPU lyric seed stride mismatch");
             var compute = Resources.Load<ComputeShader>("GpuLyricsUpdate");
-            var shader = Resources.Load<Shader>("GpuLyricsDraw");
+            var shader = Resources.Load<Shader>("GpuLyricsGlyphDraw");
             if (compute == null || shader == null)
                 throw new InvalidOperationException("GPU lyric shader resources missing");
-            compute.FindKernel("UpdateLyrics");
+            // Batch build uses -nographics / Null device; runtime kernels are
+            // unavailable there. Player Metal compilation and runtime still
+            // have to validate the actual kernel.
+            if (SystemInfo.graphicsDeviceType != UnityEngine.Rendering.GraphicsDeviceType.Null)
+                compute.FindKernel("UpdateLyrics");
             foreach (var message in ShaderUtil.GetComputeShaderMessages(compute))
                 if (message.severity == ShaderCompilerMessageSeverity.Error)
                     throw new InvalidOperationException("GPU lyric Compute: " + message.message);
             foreach (var message in ShaderUtil.GetShaderMessages(shader))
                 if (message.severity == ShaderCompilerMessageSeverity.Error)
                     throw new InvalidOperationException("GPU lyric draw: " + message.message);
-            Debug.Log("GPU lyrics build diagnostics passed; 112-byte seed and shader resources present. Runtime capture still required.");
+            Debug.Log("GPU lyrics build diagnostics passed; 128-byte seed and shader resources present. Runtime capture still required.");
         }
     }
 }

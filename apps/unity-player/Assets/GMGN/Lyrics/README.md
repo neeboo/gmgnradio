@@ -1,10 +1,14 @@
 # GPU 歌词点阵迁移状态
 
-`GpuLyricsView` 在歌词revision、当前行或viewport改变时按字形排版；每个字形24×24采样格由Compute直接采样TextCore SDF atlas、更新点位置/颜色/透明度，单批procedural绘制。每帧没有CPU逐点更新或字形像素扫描。GPU绘制透明叠加，不切相机背景、不覆盖背景为黑色。
+`GpuLyricsView` 在歌词revision、当前行或viewport改变时按字形排版；Compute每字形仅更新一个描述，`GpuLyricsGlyphDraw`每字形一个procedural quad，fragment直接连续采样TextCore SDF atlas。正常字幕不再强行采样成24×24点阵。点阵及粒子仍使用各自GPU绘制，CPU没有逐点更新或字形像素扫描。GPU绘制透明叠加，不切相机背景、不覆盖背景为黑色。
 
 入口：`SetLyrics(sessionId, revision, LyricPointLine[], mode)`，`SetPlayback(seconds,bass,vocal,treble)`，`SetVisible(bool)`。所有行按startsAt排序。换session或revision首先释放旧点，避免换歌旧歌词残留；空内容清空。句/词秒数使用播放器真实时钟。
 
 11种样式已有独立几何布局及Compute动画候选，尚未与原Swift画面对照，不代表完整视觉对齐。`SetTheme(LyricVisualTheme)`消费真实primary/accent/secondary/wordColors。逐字时间按Unicode组合字符分配，UTF16代理对不再拆开。
+
+2026-10-05 对照修复（仍需下一次真实画面验收）：旧Swift歌词均使用连续字体，上一版全部点字不符合视觉语义，现恢复GPU SDF字体。流光按 `StageLyricTypography` 的可见字数/18..112字号公式、上下文15..24与0.18/0.28透明度、翻译max(16,size*.22)/0.66、22间隔和前左/后右对齐。莫奈字体按0.58宽度计算，上下文17..28、行间14、翻译max(15,size*.2)/0.54、左对齐；以实际字高安排行距避免与翻译重叠。TryAddCharacters成功时out参数仍可能返回全串，不再错误记录缺字。
+
+v33运行反馈修复候选：群唱原Swift确有三气泡，但上/下为轻色Capsule（填充0.045、描边0.08/0.8px），当前为黑0.32填充、不规则8/30圆角、描边0.34/1px或合唱0.46。现按实测字宽/字号算气泡、以当前气泡高度+18定位上下文、翻译max(14,size*.19)/0.56左对齐，shader连续SDF描边替代原粗点框。34/27声部圆圈已接，但声部图标及渐变尚未对齐。重复翻译还需PlayerScreen隐藏旧UI Toolkit translation标签（属整合模块，不能仅修改此shader解决）。
 
 完整映射来自StagePresentationModel/StageOverlayView：
 

@@ -1,25 +1,28 @@
 #pragma kernel UpdateLyrics
-struct Glyph { float4 rectangle; float4 atlas; float4 timing; float4 color; float4 metadata; float4 transform; float4 transition; };
+struct Glyph { float4 rectangle; float4 atlas; float4 timing; float4 color; float4 metadata; float4 transform; float4 transition; float4 motion; };
 struct Point { float4 position; float4 color; float4 timing; };
 StructuredBuffer<Glyph> _Glyphs;
 RWStructuredBuffer<Point> _Points;
 Texture2DArray<float4> _FontAtlas;
 SamplerState sampler_FontAtlas;
 uint _PointCount;
+uint _GlyphRendering;
 float _Clock;
 float4 _Audio;
-float4 _Accent, _Secondary;
+float4 _Accent, _Secondary, _Primary;
+uint _Chorus;
+float _AnimationClock;
 float4 _Viewport;
 [numthreads(64,1,1)]
 void UpdateLyrics(uint3 id : SV_DispatchThreadID)
 {
     if(id.x >= _PointCount) return;
-    Glyph g = _Glyphs[id.x / 576];
-    uint cell = id.x % 576;
-    float2 uv = (float2(cell%24,cell/24)+.5)/24;
+    Glyph g = _Glyphs[_GlyphRendering!=0?id.x:id.x / 576];
+    uint cell = _GlyphRendering!=0?0:id.x % 576;
+    float2 uv = _GlyphRendering!=0?float2(.5,.5):(float2(cell%24,cell/24)+.5)/24;
     // TextCore glyphRect and the copied atlas rows share top-down glyph-local
     // orientation here. Applying 1-uv.y mirrored every glyph vertically.
-    float sdf = _FontAtlas.SampleLevel(sampler_FontAtlas,float3(g.atlas.xy+uv*g.atlas.zw,max(0,g.metadata.z)),0).a;
+    float sdf = _GlyphRendering!=0?1:_FontAtlas.SampleLevel(sampler_FontAtlas,float3(g.atlas.xy+uv*g.atlas.zw,max(0,g.metadata.z)),0).a;
     float progress = saturate((_Clock-g.timing.x)/max(.01,g.timing.y-g.timing.x));
     float active = step(g.timing.x,_Clock)*step(_Clock,g.timing.y)*g.metadata.x;
     float passed = step(g.timing.y,_Clock)*g.metadata.x;
@@ -50,17 +53,20 @@ void UpdateLyrics(uint3 id : SV_DispatchThreadID)
         } else {pos+=float2(g.transition.z*.035*_Viewport.x,.68*_Viewport.y)*(1-t);opacity=.16+.84*t;}
     }
     pos = center+(pos-center)*(1+active*(.04+sin(progress*3.14159)*.035));
-    pos.y -= active*(2+sin(progress*3.14159)*4);
-    pos.y += g.metadata.x*(sin(_Clock*.72)*2.2 + _Audio.x*.35);
+    float motionAmount=waiting*.08+active*.18+passed*.04;
+    pos+=g.motion.xy*motionAmount;
+    pos.y += waiting*3-active*(2+sin(progress*3.14159)*4);
+    if(g.metadata.y==0)pos.y+=g.metadata.x*sin(_AnimationClock*.72)*2.2;
     p.position = float4(pos,0,max(.45,min(g.rectangle.z,g.rectangle.w)/24*.6));
     p.color = g.color;
-    p.color.rgb = lerp(p.color.rgb,_Accent.rgb,passed*.88);
-    p.color.rgb = lerp(p.color.rgb,_Secondary.rgb,active*sin(progress*3.14159)*.3);
-    p.color.a *= smoothstep(.48,.56,sdf)*(1-waiting*.74)*opacity;
+    p.color.rgb = lerp(p.color.rgb,_Chorus!=0?_Secondary.rgb:_Accent.rgb,passed);
+    p.color.rgb = lerp(p.color.rgb,_Primary.rgb,waiting);
+    p.color.a *= smoothstep(.48,.56,sdf)*(1-waiting*.8128-passed*.1552)*opacity;
     if(g.metadata.z<0) {p.position=float4(g.rectangle.xy+uv*g.rectangle.zw,0,max(.6,g.rectangle.z*.6));p.color=lerp(_Accent,_Secondary,uv.y);p.color.a*=.65;}
     if(g.metadata.z==-2){
         float angle=(float)cell/575*3.14159-1.570796;
         p.position=float4(g.rectangle.xy+float2(cos(angle),sin(angle))*g.rectangle.z,0,1+_Audio.z*.7);p.color=g.color;p.color.a*=.4;
+        if(_GlyphRendering!=0)p.position.xy=g.rectangle.xy;
     }
     if(g.metadata.z==-3){
         float seed=g.metadata.w*12.9898;float depth=.35+abs(sin(seed*.33))*.65;
@@ -70,9 +76,14 @@ void UpdateLyrics(uint3 id : SV_DispatchThreadID)
     }
     if(g.metadata.z==-4){
         // Rounded conversation bubble perimeter; interior stays transparent.
-        float2 edge=abs(uv-.5);float perimeter=step(.46,max(edge.x,edge.y));
+        float2 edge=abs(uv-.5);float perimeter=_GlyphRendering!=0?1:step(.46,max(edge.x,edge.y));
         p.position=float4(g.rectangle.xy+uv*g.rectangle.zw,0,1.5);p.color=g.color;p.color.a*=perimeter;
     }
-    p.timing=float4(g.metadata.z>=0?active*(.7+sin(progress*3.14159)*.5):0,0,0,0);
+    if(g.metadata.z<=-5){p.position=float4(g.rectangle.xy+uv*g.rectangle.zw,0,1);p.color=g.color;}
+    float glyphScale=(g.metadata.z>=0 && g.metadata.y>=3?g.transform.w:1)*(1+active*(.04+sin(progress*3.14159)*.035)-waiting*.02)*(g.metadata.x!=0?g.motion.w:1);
+    float glyphAngle=g.metadata.z>=0 && g.metadata.y>=3?g.transform.z:0;
+    glyphAngle+=g.motion.z*motionAmount;
+    if(g.metadata.y==2 && g.transition.w>.5){float fold=saturate((_Clock-g.transition.x)/max(.01,g.transition.y));fold=fold*fold*(3-2*fold);glyphAngle=g.transition.z*1.570796*fold;glyphScale*=1-.18*fold;}
+    p.timing=float4(g.metadata.z>=0?active*(.7+sin(progress*3.14159)*.5):0,glyphScale,glyphAngle,g.metadata.z<0?-g.metadata.z:0);
     _Points[id.x]=p;
 }

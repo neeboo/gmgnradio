@@ -1,5 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Text;
 using System.Runtime.InteropServices;
 using UnityEngine;
 using Newtonsoft.Json.Linq;
@@ -11,6 +15,7 @@ namespace GMGN.UnityPlayer
         const string Library = "UnityMediaHost";
         [DllImport(Library)] static extern IntPtr gmgn_unity_host_create([MarshalAs(UnmanagedType.LPUTF8Str)] string root, [MarshalAs(UnmanagedType.LPUTF8Str)] string suite);
         [DllImport(Library)] static extern int gmgn_unity_host_command(IntPtr host, [MarshalAs(UnmanagedType.LPUTF8Str)] string command);
+        [DllImport(Library)] static extern int gmgn_unity_host_placement(IntPtr host, byte[] bytes, int count);
         [DllImport(Library)] static extern IntPtr gmgn_unity_host_snapshot(IntPtr host);
         [DllImport(Library)] static extern void gmgn_unity_host_string_free(IntPtr value);
         [DllImport(Library)] static extern int gmgn_unity_host_destroy(IntPtr host);
@@ -32,6 +37,38 @@ namespace GMGN.UnityPlayer
         ulong? worldGeneration;
         public JObject WorldProjection { get; private set; }
         public event Action<JObject> WorldUpdated;
+        public event Action<JObject> PlacementEvaluated;
+        public event Action<JObject> PlacementDerived;
+        readonly ConcurrentQueue<(byte[] bytes, string operation, string requestID, string error)> placementCommands = new();
+        int placementSerializationPending;
+        // Ownership is transferred: callers must not mutate payload after acceptance.
+        // Serialization is background work; the Swift MainActor ABI is only called by Tick.
+        bool QueuePlacement(JObject payload, string requestID, string operation)
+        {
+            var worldID = (string)WorldProjection?["worldID"];
+            if (host == IntPtr.Zero || payload == null || string.IsNullOrWhiteSpace(requestID)
+                || string.IsNullOrWhiteSpace(worldID) || Interlocked.CompareExchange(ref placementSerializationPending, 1, 0) != 0) return false;
+            Task.Run(() => {
+                try {
+                    var command = new JObject { ["op"] = operation, ["worldID"] = worldID,
+                        ["requestID"] = requestID, ["payload"] = payload };
+                    var bytes = Encoding.UTF8.GetBytes(command.ToString(Newtonsoft.Json.Formatting.None));
+                    placementCommands.Enqueue((bytes.Length <= 64 * 1024 * 1024 ? bytes : null, operation, requestID,
+                        bytes.Length <= 64 * 1024 * 1024 ? null : "payload_too_large"));
+                } catch (Exception error) {
+                    placementCommands.Enqueue((null, operation, requestID, error.GetType().Name));
+                }
+            });
+            return true;
+        }
+        public bool RequestPlacementDerivation(JObject payload, string requestID)
+        {
+            return QueuePlacement(payload, requestID, "world.placement.derive");
+        }
+        public bool RequestPlacementEvaluation(JObject payload, string requestID)
+        {
+            return QueuePlacement(payload, requestID, "world.placement.evaluate");
+        }
         public bool RequestWorldSnapshot(string worldID) => ExecuteWorld(new JObject { ["op"] = "world.snapshot", ["worldID"] = worldID });
         public bool CommitWorld(string worldID, string requestID, ulong expectedRevision, JObject state, JObject intent)
             => ExecuteWorld(new JObject { ["op"] = "world.commit", ["worldID"] = worldID, ["requestID"] = requestID,
@@ -61,6 +98,16 @@ namespace GMGN.UnityPlayer
         bool Execute(Command command) => gmgn_unity_host_command(host, JsonUtility.ToJson(command)) == 1;
         public void Tick()
         {
+            if (placementCommands.TryDequeue(out var placement)) {
+                Interlocked.Exchange(ref placementSerializationPending, 0);
+                if (placement.error != null || host == IntPtr.Zero || gmgn_unity_host_placement(host, placement.bytes, placement.bytes.Length) != 1) {
+                    var failed = new JObject { ["operation"] = placement.operation, ["requestID"] = placement.requestID,
+                        ["status"] = "failed", ["code"] = placement.error != null ? "serialization_failed" : "placement_not_accepted",
+                        ["message"] = "摆放校验未能开始，请稍后重试。" };
+                    if (placement.operation == "world.placement.derive") PlacementDerived?.Invoke(failed);
+                    else PlacementEvaluated?.Invoke(failed);
+                }
+            }
             if (Time.unscaledTime < nextPoll) return;
             nextPoll = Time.unscaledTime + .05f;
             var pointer = gmgn_unity_host_snapshot(host); if (pointer == IntPtr.Zero) return;
@@ -71,8 +118,14 @@ namespace GMGN.UnityPlayer
                 worldGeneration = value.world.generation;
                 var update = JObject.Parse(json)["world"] as JObject;
                 if (update != null && update["status"] != null) {
-                    WorldProjection = update;
-                    WorldUpdated?.Invoke(update);
+                    if ((string)update["operation"] == "world.placement.evaluate") {
+                        PlacementEvaluated?.Invoke(update);
+                    } else if ((string)update["operation"] == "world.placement.derive") {
+                        PlacementDerived?.Invoke(update);
+                    } else {
+                        WorldProjection = update;
+                        WorldUpdated?.Invoke(update);
+                    }
                 }
             }
             if (value.music != null) {

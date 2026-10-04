@@ -60,6 +60,12 @@ namespace GMGN.UnityPlayer.World
             return new PortableWorldPackage(root, document, listed);
         }
 
+        public string ResolvePackageFile(string relative)
+        {
+            if (!files.Contains(relative)) throw new InvalidDataException("这个文件未包含在已校验的空间备份中。");
+            return Resolve(Root, relative);
+        }
+
         public string ResolveReference(string original)
         {
             var mapped = (string)Document["referenceBindings"]?[original];

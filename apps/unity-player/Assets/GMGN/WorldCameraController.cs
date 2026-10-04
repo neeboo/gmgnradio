@@ -25,6 +25,10 @@ namespace GMGN.UnityPlayer
         {
             if (!active || !Application.isFocused || view == null || Mouse.current == null) return;
             var mouse = Mouse.current;
+            var interaction = GetComponent<WorldInteractionController>();
+            if (interaction?.OwnsPointer == true || (mouse.rightButton.isPressed && interaction?.BlocksCameraAt(mouse.position.ReadValue()) == true)) {
+                dragging = false; return;
+            }
             if (mouse.rightButton.wasReleasedThisFrame) dragging = false;
             if (UIOwnsInput(mouse.position.ReadValue())) { dragging = false; return; }
             if (mouse.rightButton.wasPressedThisFrame) dragging = true;

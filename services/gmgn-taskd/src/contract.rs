@@ -58,7 +58,7 @@ const ERROR_CODES: &[&str] = &[
     "invalid_message_cursor", "invalid_message_id", "invalid_message_kind",
     "invalid_message_payload", "invalid_message_read", "invalid_message_scope",
     "invalid_object_id", "invalid_op", "invalid_op_count", "invalid_package_id",
-    "invalid_package_version", "invalid_png", "invalid_producer",
+    "invalid_package_version", "invalid_placement_request", "invalid_placement_result", "invalid_png", "invalid_producer",
     "invalid_provider_capabilities", "invalid_query", "invalid_request", "invalid_request_id",
     "invalid_response", "invalid_revision", "invalid_scope", "invalid_size_intent",
     "invalid_source_wish_id", "invalid_state_commit", "invalid_state_key",
