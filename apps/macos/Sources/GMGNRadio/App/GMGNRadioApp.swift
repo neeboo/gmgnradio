@@ -409,7 +409,15 @@ extension AppDelegate {
                  "isPending": saved.plan.brief.id == programStore.pendingPlan?.brief.id] as [String: Any]
             },
             "playlists": musicLibraryStore.playlists.map {
-                ["id": $0.id, "title": $0.name, "subtitle": "\($0.trackCount) 首 · \($0.providerID.rawValue)"]
+                let providerName: String
+                switch $0.providerID {
+                case .netease: providerName = "网易云"
+                case .qqMusic: providerName = "QQ 音乐"
+                case .appleMusic: providerName = "Apple Music"
+                default: providerName = "音乐库"
+                }
+                return ["id": $0.id, "title": $0.name, "subtitle": "\(providerName) · \($0.trackCount) 首",
+                        "artworkURL": $0.artworkURL?.absoluteString as Any? ?? NSNull()] as [String: Any]
             },
             "tracks": model.cards.map { card in
                 ["slotIndex": card.slotIndex, "trackID": card.trackID, "title": card.title, "artist": card.artist,
@@ -741,7 +749,8 @@ extension AppDelegate {
                     ["id": entry.id, "title": entry.title, "status": entry.status,
                      "detail": entry.detail, "isRead": entry.isRead,
                      "updatedAt": entry.updatedAt.timeIntervalSince1970,
-                     "updatedAtText": entry.updatedAt.formatted(date: .abbreviated, time: .shortened)]
+                     "updatedAtText": entry.updatedAt.formatted(date: .abbreviated, time: .shortened),
+                     "relativeTimeText": entry.updatedAt.formatted(.relative(presentation: .named))]
                 }]
     }
 

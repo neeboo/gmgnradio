@@ -12,6 +12,9 @@ for index in source[opening...].indices {
     if depth == 0 { end = source.index(after: index); break }
 }
 let callback = String(source[start..<end]).replacingOccurrences(of: "private func", with: "func")
+let resetStart=source.range(of:"        case \"shortcuts.reset\":")!.lowerBound
+let resetEnd=source.range(of:"        case \"shortcuts.save\":",range:resetStart..<source.endIndex)!.lowerBound
+let resetCallback=String(source[resetStart..<resetEnd])
 let harness = """
 import Foundation
 struct NSEvent { let keyCode: Int; let modified: Bool }
@@ -25,6 +28,7 @@ final class Store {
     var recordingTarget: Target?
     var assigned = 0
     func cancelRecording() { recordingTarget = nil }
+    func reset() { recordingTarget = nil; assigned = 0 }
     func assign(_ value: GMGNKeyCombination, to: String, scope: Scope) { assigned += 1; recordingTarget = nil }
 }
 final class Runtime { let shortcutSettingsStore = Store() }
@@ -33,6 +37,12 @@ final class Callback {
     var shortcutValidationMessage: String?
     var removed = 0
     func removeRecordingMonitor() { removed += 1 }
+    func reset() {
+        switch "shortcuts.reset" {
+        \(resetCallback)
+        default: break
+        }
+    }
 \(callback)
 }
 let callback = Callback()
@@ -49,7 +59,12 @@ precondition(store.assigned == 1 && store.recordingTarget == nil)
 store.recordingTarget = Target(scope: .global)
 precondition(callback.handleRecordingEvent(NSEvent(keyCode: 0, modified: true)))
 precondition(store.assigned == 2 && store.recordingTarget == nil)
-print("PASS: production callback global plain rejection, local plain acceptance, Escape cancellation and modified global acceptance")
+callback.shortcutValidationMessage="old validation"
+store.recordingTarget=Target(scope:.global)
+let previousRemoved=callback.removed
+callback.reset()
+precondition(callback.shortcutValidationMessage==nil && store.recordingTarget==nil && store.assigned==0 && callback.removed==previousRemoved+1)
+print("PASS: production shortcut callback rejection, acceptance, Escape cancellation and reset clears validation")
 """
 let directory = FileManager.default.temporaryDirectory.appendingPathComponent("gpui-shortcut-callback-\(UUID())")
 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

@@ -120,7 +120,8 @@ final class GPUISettingsParity {
                 "globalEnabled": shortcuts.globalEnabled, "mediaKeysEnabled": shortcuts.mediaKeysEnabled,
                 "recordingID": recording?.action.rawValue as Any? ?? NSNull(),
                 "recordingScope": recording?.scope.rawValue as Any? ?? NSNull(),
-                "notice": shortcutValidationMessage as Any? ?? (recording == nil ? NSNull() : "按下快捷键；Esc 取消。重复组合会与原动作交换。" as Any),
+                "validationMessage": shortcutValidationMessage as Any? ?? NSNull(),
+                "notice": NSNull(),
             ],
         ]
     }
@@ -205,7 +206,7 @@ final class GPUISettingsParity {
             runtime.shortcutSettingsStore.beginRecording(action: action, scope: scope)
             installRecordingMonitor()
         case "shortcuts.cancel": shortcutValidationMessage = nil; runtime.shortcutSettingsStore.cancelRecording(); removeRecordingMonitor()
-        case "shortcuts.reset": runtime.shortcutSettingsStore.reset(); removeRecordingMonitor()
+        case "shortcuts.reset": shortcutValidationMessage = nil; runtime.shortcutSettingsStore.reset(); removeRecordingMonitor()
         case "shortcuts.save":
             if let enabled = value["globalEnabled"] as? Bool { runtime.shortcutSettingsStore.globalEnabled = enabled }
             if let enabled = value["mediaKeysEnabled"] as? Bool { runtime.shortcutSettingsStore.mediaKeysEnabled = enabled }

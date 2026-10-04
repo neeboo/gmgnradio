@@ -351,7 +351,7 @@ impl GMGNProductUI {
                 }
                 let pane=self.inbox_pane.clone();
                 self.inbox_window=cx.open_window(WindowOptions{window_bounds:Some(WindowBounds::Windowed(Bounds::new(point(px(140.),px(120.)),size(px(720.),px(460.))))),..Default::default()},move |window,cx|{
-                    window.set_window_title("系统消息");cx.new(|cx|gpui_kit::base::Root::new(pane,window,cx))
+                    window.set_window_title("系统消息");window.focus(&pane.focus_handle(cx),cx);cx.new(|cx|gpui_kit::base::Root::new(pane,window,cx))
                 }).ok();
             },
             _ => self.native_action(action,cx),
@@ -620,6 +620,16 @@ impl Render for GMGNProductUI {
 #[cfg(test)]
 mod layout_tests {
     #[test]
+    fn configured_gpui_http_client_can_fetch_artwork_without_null_client() {
+        use std::{io::{Read,Write},time::Duration};
+        use gpui_kit::http_client::{HttpClient,AsyncBody};
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();let address=listener.local_addr().unwrap();
+        let server=std::thread::spawn(move||{let (mut stream,_)=listener.accept().unwrap();stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();let mut buffer=[0;4096];let n=stream.read(&mut buffer).unwrap();let request=std::str::from_utf8(&buffer[..n]).unwrap();assert!(request.starts_with("GET /artwork.png "));assert!(request.to_ascii_lowercase().contains("user-agent: gmgn radio"));stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntest").unwrap();});
+        let client=reqwest_client::ReqwestClient::user_agent("gmgn radio").unwrap();
+        let response=reqwest_client::runtime().block_on(client.get(&format!("http://{address}/artwork.png"),AsyncBody::empty(),true)).unwrap();
+        assert_eq!(response.status(),200);assert_eq!(response.headers()["content-type"],"image/png");server.join().unwrap();
+    }
+    #[test]
     fn kit_modal_stack_blocks_scene_and_restores_after_last_close() {
         assert!(!super::modal_owns_scene_input(false,false,false));
         assert!(super::modal_owns_scene_input(false,true,false));
@@ -685,7 +695,8 @@ fn main() {
     let main_ui=Rc::new(RefCell::new(None::<Entity<GMGNProductUI>>));
     let main_window=Rc::new(RefCell::new(None::<AnyWindowHandle>));
     let reopen_host = host.clone();
-    let application = gpui_kit::application().with_assets(gpui_kit::assets::AllAssets);
+    let http_client=reqwest_client::ReqwestClient::user_agent("gmgn radio").expect("initialize GPUI HTTP client");
+    let application = gpui_kit::application().with_http_client(std::sync::Arc::new(http_client)).with_assets(gpui_kit::assets::AllAssets);
     application.on_reopen(move |_| { if let Some(host) = reopen_host.borrow().as_ref() { host.reopen(); } });
     application.run(move |cx| {
         gpui_kit::init(cx);

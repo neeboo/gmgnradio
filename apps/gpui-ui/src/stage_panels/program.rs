@@ -64,6 +64,71 @@ use serde_json::{Value, json};
 use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 type ProjectionCache = Rc<RefCell<HashMap<String, (String, Arc<ProjectedCard>, Arc<RenderImage>)>>>;
 
+// Match AsyncImage: centered scaledToFill, 42pt square, 12pt rounded clip.
+fn composite_artwork(card: &mut RgbaTexture, artwork: &RenderImage) {
+    let dimensions = artwork.size(0);
+    let Some(bytes) = artwork.as_bytes(0) else {
+        return;
+    };
+    let mut pixels = bytes.to_vec();
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    let Some(source) = image::RgbaImage::from_raw(
+        dimensions.width.0 as u32,
+        dimensions.height.0 as u32,
+        pixels,
+    ) else {
+        return;
+    };
+    let edge = source.width().min(source.height());
+    if edge == 0 {
+        return;
+    }
+    let crop = image::imageops::crop_imm(
+        &source,
+        (source.width() - edge) / 2,
+        (source.height() - edge) / 2,
+        edge,
+        edge,
+    );
+    let factor = card.width as f64 / 306.;
+    let side = (42. * factor).round() as u32;
+    let cover = image::imageops::resize(
+        &crop.to_image(),
+        side,
+        side,
+        image::imageops::FilterType::Triangle,
+    );
+    let (x0, y0) = ((14. * factor).round() as u32, (16. * factor).round() as u32);
+    let radius = 12. * factor;
+    for y in 0..side {
+        for x in 0..side {
+            if x0 + x >= card.width || y0 + y >= card.height {
+                continue;
+            }
+            let (dx, dy) = (x as f64 + 0.5, y as f64 + 0.5);
+            let distance = ((dx - dx.clamp(radius, side as f64 - radius)).powi(2)
+                + (dy - dy.clamp(radius, side as f64 - radius)).powi(2))
+            .sqrt();
+            let src = cover.get_pixel(x, y).0;
+            let alpha = src[3] as f64 / 255. * (radius - distance + 0.5).clamp(0., 1.);
+            let i = ((y + y0) as usize * card.width as usize + (x + x0) as usize) * 4;
+            let destination = card.pixels[i + 3] as f64 / 255.;
+            let out_alpha = alpha + destination * (1. - alpha);
+            if out_alpha > 0. {
+                for c in 0..3 {
+                    card.pixels[i + c] = ((src[c] as f64 * alpha
+                        + card.pixels[i + c] as f64 * destination * (1. - alpha))
+                        / out_alpha)
+                        .round() as u8;
+                }
+            }
+            card.pixels[i + 3] = (out_alpha * 255.).round() as u8;
+        }
+    }
+}
+
 fn svg_text(
     text: &str,
     x: f64,
@@ -105,7 +170,17 @@ fn svg_text(
     }
 }
 
+#[cfg(test)]
 fn card_svg(card: &Value, audio: &Value, catalog: bool, playlist: bool) -> String {
+    card_svg_content(card, audio, catalog, playlist, false)
+}
+fn card_svg_content(
+    card: &Value,
+    audio: &Value,
+    catalog: bool,
+    playlist: bool,
+    has_artwork: bool,
+) -> String {
     let (w, h, r) = if catalog {
         (306., 74., 22.)
     } else {
@@ -124,7 +199,8 @@ fn card_svg(card: &Value, audio: &Value, catalog: bool, playlist: bool) -> Strin
         if current { 1.2 } else { 0.8 }
     );
     let circle = if playlist { "#ff5151" } else { "#7af2ff" };
-    body.push_str(&format!(r#"<rect x="14" y="16" width="44" height="44" rx="{}" fill="{circle}" fill-opacity=".12"/>"#,if playlist {12}else{22}));
+    let icon_edge = if catalog { 42 } else { 44 };
+    body.push_str(&format!(r#"<rect x="14" y="16" width="{icon_edge}" height="{icon_edge}" rx="{}" fill="{circle}" fill-opacity="{}"/>"#,if playlist {12}else{22},if playlist {0.1}else{0.12}));
     if current && !catalog {
         for i in 0..5 {
             let sample = audio["waveform"][i].as_f64().unwrap_or(0.).abs();
@@ -145,7 +221,7 @@ fn card_svg(card: &Value, audio: &Value, catalog: bool, playlist: bool) -> Strin
                 38. - height / 2.
             ));
         }
-    } else {
+    } else if !has_artwork {
         let icon = if catalog && !playlist {
             gpui_kit::assets::IconName::Radio
         } else if playlist {
@@ -153,12 +229,18 @@ fn card_svg(card: &Value, audio: &Value, catalog: bool, playlist: bool) -> Strin
         } else {
             gpui_kit::assets::IconName::Music
         };
-        body.push_str(&icon_svg(icon, 25., 27., 22., circle));
+        body.push_str(&icon_svg(
+            icon,
+            if catalog { 26.5 } else { 25. },
+            if catalog { 28.5 } else { 27. },
+            if catalog { 17. } else { 22. },
+            circle,
+        ));
     }
     let title_size = if current && !catalog { 17. } else { 16. };
     body.push_str(&svg_text(
         card["title"].as_str().unwrap_or(""),
-        71.,
+        if catalog { 69. } else { 71. },
         33.,
         title_size,
         600,
@@ -169,7 +251,7 @@ fn card_svg(card: &Value, audio: &Value, catalog: bool, playlist: bool) -> Strin
         card[if catalog { "subtitle" } else { "artist" }]
             .as_str()
             .unwrap_or(""),
-        71.,
+        if catalog { 69. } else { 71. },
         54.,
         if catalog { 13. } else { 14. },
         500,
@@ -324,6 +406,7 @@ impl StageProgramRailPane {
         catalog: bool,
         playlist: bool,
         op: &'static str,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = if catalog {
@@ -336,16 +419,28 @@ impl StageProgramRailPane {
         } else {
             Value::Null
         };
+        let artwork = if playlist {
+            card["artworkURL"]
+                .as_str()
+                .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
+                .and_then(|url| {
+                    window.use_asset::<ImageAssetLoader>(&Resource::Uri(url.to_owned().into()), cx)
+                })
+                .and_then(Result::ok)
+        } else {
+            None
+        };
         let key = format!(
-            "{}/{audio}/{catalog}/{playlist}",
-            json!({"title":card["title"],"artist":card["artist"],"subtitle":card["subtitle"],"isCurrent":card["isCurrent"],"hasBoundVideo":card["hasBoundVideo"],"isPending":card["isPending"],"energy":card["energy"]})
+            "{}/{audio}/{catalog}/{playlist}/{:?}",
+            json!({"title":card["title"],"artist":card["artist"],"subtitle":card["subtitle"],"isCurrent":card["isCurrent"],"hasBoundVideo":card["hasBoundVideo"],"isPending":card["isPending"],"energy":card["energy"]}),
+            artwork.as_ref().map(|image| image.id)
         );
         let texture =
             if let Some((old, texture)) = self.card_cache.get(&id).filter(|(old, _)| old == &key) {
                 let _ = old;
                 texture.clone()
             } else {
-                let svg = card_svg(card, &audio, catalog, playlist);
+                let svg = card_svg_content(card, &audio, catalog, playlist, artwork.is_some());
                 let Ok(image) = self.renderer.render_single_frame(svg.as_bytes(), 1.) else {
                     return div()
                         .w(px(if catalog { 306. } else { 294. }))
@@ -358,11 +453,15 @@ impl StageProgramRailPane {
                 for pixel in pixels.chunks_exact_mut(4) {
                     pixel.swap(0, 2);
                 }
-                let texture = Arc::new(RgbaTexture {
+                let mut texture = RgbaTexture {
                     width: dimensions.width.0 as u32,
                     height: dimensions.height.0 as u32,
                     pixels,
-                });
+                };
+                if let Some(artwork) = &artwork {
+                    composite_artwork(&mut texture, artwork);
+                }
+                let texture = Arc::new(texture);
                 self.card_cache.insert(id.clone(), (key, texture.clone()));
                 texture
             };
@@ -716,7 +815,7 @@ impl Render for StageProgramRailPane {
                 .cloned()
                 .unwrap_or_default();
             for card in &track_cards {
-                let row = self.projected_card(card, false, false, "stage.program.play", cx);
+                let row = self.projected_card(card, false, false, "stage.program.play", window, cx);
                 // GPUI deferred paint preserves measured order/positions and
                 // provides the original card zIndex without reordering tracks.
                 content =
@@ -758,7 +857,7 @@ impl Render for StageProgramRailPane {
             ] {
                 let items = self.snapshot[key].as_array().cloned().unwrap_or_default();
                 for item in &items {
-                    let row = self.projected_card(item, true, key == "playlists", op, cx);
+                    let row = self.projected_card(item, true, key == "playlists", op, window, cx);
                     content = content.child(row);
                 }
             }
@@ -1059,6 +1158,54 @@ mod tests {
         assert_eq!(
             (catalog.width, catalog.height, catalog.y_degrees),
             (306., 74., -7.)
+        );
+    }
+    #[test]
+    fn cover_composites_centered_scaled_fill_and_rounded_clip_before_projection() {
+        // Pixel-only unit input, never inserted into the production music store.
+        let buffer = image::RgbaImage::from_fn(120, 40, |x, _| {
+            image::Rgba(if x < 40 {
+                [0, 0, 255, 255]
+            } else if x < 80 {
+                [0, 255, 0, 255]
+            } else {
+                [255, 0, 0, 255]
+            })
+        });
+        let cover = gpui_kit::RenderImage::new(vec![image::Frame::new(buffer)]);
+        let mut card = super::RgbaTexture {
+            width: 306,
+            height: 74,
+            pixels: vec![0; 306 * 74 * 4],
+        };
+        super::composite_artwork(&mut card, &cover);
+        let sample =
+            |x: usize, y: usize| card.pixels[(y * 306 + x) * 4..(y * 306 + x) * 4 + 4].to_vec();
+        assert_eq!(
+            sample(35, 37),
+            vec![0, 255, 0, 255],
+            "scaledToFill crops real image center, not letterboxing"
+        );
+        assert_eq!(
+            sample(14, 16),
+            vec![0, 0, 0, 0],
+            "12pt corners remain truly transparent"
+        );
+        assert_eq!(
+            sample(69, 37),
+            vec![0, 0, 0, 0],
+            "original 42pt cover does not cover title/other fields"
+        );
+        let transform = card_transform(&json!({}), true);
+        let projected =
+            super::ProjectedCard::render(&card, transform, [30., 50.], [800., 600.], 1., 1., None)
+                .unwrap();
+        let location = transform.project_point([35., 37.]);
+        assert!(
+            projected
+                .inverse_hit([location[0] + 30., location[1] + 50.])
+                .is_some(),
+            "cover is inside the same whole-card projected image"
         );
     }
     #[test]

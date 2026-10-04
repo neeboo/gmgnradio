@@ -1193,7 +1193,13 @@ impl AgentSettingsPane {
                     for scope in ["local", "global"] {
                         let recording = self.snapshot["shortcuts"]["recordingID"] == id
                             && self.snapshot["shortcuts"]["recordingScope"].as_str() == Some(scope);
-                        row=row.child(div().w(px(136.)).flex_shrink_0().child(Button::new(format!("shortcut-{id}-{scope}")).w(px(136.)).label(if recording{"请按快捷键"}else{item[scope].as_str().unwrap_or("未设置")}.to_owned()).on_click(cx.listener({let id=id.clone();move|this,_,_,_|this.commands.push(json!({"op":"shortcuts.record","id":id,"scope":scope}))}))));
+                        let label=if recording{"请按快捷键"}else{item[scope].as_str().unwrap_or("未设置")}.to_owned();
+                        let tint=gpui_kit::component::button::ButtonCustomVariant::new(cx).color(rgb(0x32d3e8).opacity(0.14).into())
+                            .foreground(rgb(0x32d3e8).into()).hover(rgb(0x32d3e8).opacity(0.22).into()).active(rgb(0x32d3e8).opacity(0.3).into());
+                        row=row.child(div().w(px(136.)).flex_shrink_0().child(Button::new(format!("shortcut-{id}-{scope}")).w(px(136.)).px(px(12.))
+                            .when(recording,|button|button.custom(tint)).accessibility_label(label.clone())
+                            .child(div().w(px(112.)).font_family("Menlo").text_size(px(13.)).child(label))
+                            .on_click(cx.listener({let id=id.clone();move|this,_,_,_|this.commands.push(json!({"op":"shortcuts.record","id":id,"scope":scope}))}))));
                     }
                     shortcuts = shortcuts.child(row);
                 }
@@ -1235,7 +1241,10 @@ impl AgentSettingsPane {
                             ),
                     )
                     .child(
-                        group("").child(div().flex().justify_end().child(self.command_button(
+                        group("").child(div().flex().items_center().gap_3()
+                            .children(self.snapshot["shortcuts"]["validationMessage"].as_str().map(|message|div().min_w(px(0.)).text_xs().text_color(rgb(0xff9f0a)).child(message.to_owned())))
+                            .child(div().flex_1().min_w(px(0.)))
+                            .child(self.command_button(
                             "shortcuts-reset",
                             "恢复默认",
                             json!({"op":"shortcuts.reset"}),
@@ -1360,6 +1369,7 @@ impl Render for AgentSettingsPane {
         if let Some(notice) = self.snapshot
             [["presence", "music", "space", "shortcuts", "agent"][self.page]]["notice"]
             .as_str()
+            .filter(|_|self.page!=3)
         {
             let error=self.snapshot[["presence","music","space","shortcuts","agent"][self.page]]["hasError"].as_bool()==Some(true);
             root = root.child(

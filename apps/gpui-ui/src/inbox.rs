@@ -8,7 +8,7 @@ use gpui_kit::component::{
 use gpui_kit::*;
 use serde_json::{Value, json};
 
-actions!(resident_inbox, [OpenSelected]);
+actions!(resident_inbox, [OpenSelected, SelectPrevious, SelectNext]);
 
 #[derive(Default)]
 struct InboxState {
@@ -55,6 +55,25 @@ impl InboxState {
                 "scope":self.snapshot["scope"]}));
         }
     }
+    fn move_selection(&mut self, direction: isize) {
+        let ids: Vec<_> = self
+            .rows()
+            .iter()
+            .filter_map(|row| row["id"].as_str())
+            .map(str::to_owned)
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let index = self
+            .selected
+            .as_ref()
+            .and_then(|id| ids.iter().position(|candidate| candidate == id));
+        let next = index
+            .map(|index| (index as isize + direction).clamp(0, ids.len() as isize - 1) as usize)
+            .unwrap_or(0);
+        self.selected = Some(ids[next].clone());
+    }
     fn detail_text(&self) -> String {
         match self.selected_row() {
             Some(row) => [
@@ -77,20 +96,22 @@ pub struct InboxPane {
     detail: Option<Entity<TextareaState>>,
     detail_key: Option<String>,
     detail_text: String,
+    scroll: ScrollHandle,
 }
 impl InboxPane {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        cx.bind_keys([KeyBinding::new(
-            "enter",
-            OpenSelected,
-            Some("ResidentInbox"),
-        )]);
+        cx.bind_keys([
+            KeyBinding::new("enter", OpenSelected, Some("ResidentInbox")),
+            KeyBinding::new("up", SelectPrevious, Some("ResidentInbox")),
+            KeyBinding::new("down", SelectNext, Some("ResidentInbox")),
+        ]);
         Self {
             state: InboxState::default(),
             focus: cx.focus_handle(),
             detail: None,
             detail_key: None,
             detail_text: String::new(),
+            scroll: ScrollHandle::new(),
         }
     }
     pub fn update_snapshot(&mut self, snapshot: Value, cx: &mut Context<Self>) {
@@ -102,6 +123,18 @@ impl InboxPane {
     }
     pub fn take_commands(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.state.commands)
+    }
+    fn move_selection(&mut self, direction: isize, cx: &mut Context<Self>) {
+        self.state.move_selection(direction);
+        if let Some(index) = self
+            .state
+            .rows()
+            .iter()
+            .position(|row| row["id"].as_str() == self.state.selected.as_deref())
+        {
+            self.scroll.scroll_to_item(index);
+        }
+        cx.notify();
     }
 }
 impl Focusable for InboxPane {
@@ -135,10 +168,13 @@ impl Render for InboxPane {
         let theme = cx.theme();
         let mut list = div()
             .id("resident.system-inbox.list")
+            .role(Role::List)
+            .aria_label("系统消息列表")
             .w(px(300.))
             .h_full()
             .flex_shrink_0()
             .overflow_y_scroll()
+            .track_scroll(&self.scroll)
             .border_r_1()
             .border_color(theme.border);
         for row in self.state.rows() {
@@ -149,7 +185,7 @@ impl Render for InboxPane {
             let title = row["title"].as_str().unwrap_or("").to_owned();
             let status = row["status"].as_str().unwrap_or("").to_owned();
             let read = row["isRead"].as_bool() == Some(true);
-            let time = row["updatedAtText"].as_str().unwrap_or("").to_owned();
+            let time = row["relativeTimeText"].as_str().unwrap_or("").to_owned();
             list = list.child(
                 ListItem::new(SharedString::from(id.clone()))
                     .selected(self.state.selected.as_deref() == Some(&id))
@@ -272,6 +308,12 @@ impl Render for InboxPane {
                 this.state.open();
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| {
+                this.move_selection(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectNext, _, cx| {
+                this.move_selection(1, cx);
+            }))
             .size_full()
             .p(px(10.))
             .flex()
@@ -293,6 +335,21 @@ mod tests {
         let mut state = InboxState::default();
         state.update(snapshot("world-a"));
         state.select("one".into());
+        assert!(state.commands.is_empty());
+        assert_eq!(state.selected_row().unwrap()["isRead"], false);
+    }
+    #[core::prelude::v1::test]
+    fn arrows_select_without_ack_and_clamp_at_list_edges() {
+        let mut state = InboxState::default();
+        state.update(json!({"scope":"world-a","entries":[{"id":"one","isRead":false},{"id":"two","isRead":false}]}));
+        state.move_selection(1);
+        assert_eq!(state.selected.as_deref(), Some("one"));
+        state.move_selection(1);
+        state.move_selection(1);
+        assert_eq!(state.selected.as_deref(), Some("two"));
+        state.move_selection(-1);
+        state.move_selection(-1);
+        assert_eq!(state.selected.as_deref(), Some("one"));
         assert!(state.commands.is_empty());
         assert_eq!(state.selected_row().unwrap()["isRead"], false);
     }

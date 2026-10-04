@@ -325,3 +325,13 @@ program直接render事件注册已改成熟div.capture_any_mouse_down（实际pa
 主代理App10/10、保存回调、health回调和快捷键回调均exit0；宿主构建exit0，日志`/tmp/gmgn-gpui-v28-app-tests.log`、`/tmp/gmgn-gpui-v28-host-build.log`。v28完整包构建exit0（`/tmp/gmgn-gpui-product-app-build-v28.log`），路径`tmp/gpui-product-app-v28/gmgn radio.app`，PID1856，仍用同一真实业务根，runtime`/tmp/gmgn-gpui-parity-v28-runtime.log`。仅退出v27测试App，不碰安装版。
 
 CUA实际进入580×500设置、快捷键页，点击全局播放组合后输入a，显示原“全局快捷键至少需要一个修饰键。”并继续录制；Esc后原⌥⌘P恢复，未保存新组合。随后DJ页真实状态“策划引擎未登录”与原说明可见，没有登录或录音。此路径通过；截图另揭示validation仍为灰check底栏，原Swift为橙色纯文案且与恢复默认同行，录制cyan视觉也需复核，不能计完整快捷键视觉通过。真实保存凭据、动作下载安装、节目滚动帧率等未在本包实际操作，目标继续。
+
+### v29 快捷键样式、消息键盘与真实封面接线
+
+上一轮5e1037c898e18167d0931d99dd55deb58f31b617已推送并核对远端。快捷键校验改为独立validationMessage字段，恢复默认同行橙色纯文字；移除原Swift没有的录制指导底栏，按钮恢复cyan与Menlo等宽文字，reset清校验。系统消息分别投影列表相对时间与详情完整日期；补上下键选择、边界限制及选中行自动滚入可见区，选择不发ACK；新窗初始聚焦原同一个pane，列表具原“系统消息列表”可访问名称。消息状态5项回归通过。
+
+节目歌单真实artworkURL及provider展示名从原musicLibraryStore投影；成熟ImageAssetLoader异步加载，42×42中心scaledToFill裁切、12点圆角、合入整RGBA后投影，缓存包含图片identity。App补同版本成熟GPUI HTTP client，lock仅增加必要依赖，已有版本未升级。真实loopback HTTP请求回归通过，仅说明HTTP客户端可用，不能当正式封面网络显示验收。原磨砂/动画曲线/速度限幅继续欠缺。
+
+主代理完整UI85/85 exit0（`/tmp/gmgn-gpui-v29-ui-tests.log`，4.15秒），worker独立最终完整85/85 exit0（`/tmp/gmgn-program-artwork-ui-tests.log`，4.66秒）；App11/11、快捷键生产回调、宿主构建均exit0。宿主日志`/tmp/gmgn-gpui-v29-final-host-build.log`。完整v29包构建exit0（`/tmp/gmgn-gpui-product-app-build-v29.log`）；仅退出v28测试App，启动`tmp/gpui-product-app-v29/gmgn radio.app` PID7632，同一真实业务数据根，runtime`/tmp/gmgn-gpui-parity-v29-runtime.log`。
+
+CUA实际全局录制按钮呈青色等宽文字；录制激活后输入a、滚到表单底部，橙色“全局快捷键至少需要一个修饰键。”与恢复默认同行，无灰check底栏。Esc取消，不写新键位。打开系统消息列表显示“9小时前”，不点行直接Down后原电视消息选中，详情显示完整2026年10月4日1:23，打开按钮启用，AX读回list“系统消息列表”。这里只有一条已读通知，不能据此计多行滚动/未读减少/重启恢复通过。没有操作录音、凭据、登录或永久删除。
