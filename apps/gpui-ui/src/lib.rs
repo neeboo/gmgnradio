@@ -12,6 +12,14 @@ use gpui_kit::component::{button::*, input::*, scroll::ScrollableElement, *};
 use gpui_kit::*;
 use state::{ChatAttachment, ChatCommand, ChatState, TranscriptLine};
 
+fn compact_composer_height(state: &ChatState) -> f32 {
+    if !state.attachments.is_empty() || state.attachments_preparing || state.attachments_error.is_some() {
+        140.
+    } else {
+        70.
+    }
+}
+
 pub struct ResidentChatPane {
     input: Entity<TextareaState>,
     state: ChatState,
@@ -65,6 +73,9 @@ impl ResidentChatPane {
     }
     pub fn take_commands(&mut self) -> Vec<ChatCommand> {
         self.state.take_commands()
+    }
+    pub fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.input.read(cx).focus_handle(cx), cx);
     }
     pub fn accepted(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.accepted(id) {
@@ -319,8 +330,7 @@ impl Render for ResidentChatPane {
                 cx.notify();
             }));
         let mut controls = div().flex().items_center().gap_1();
-        if !self.compact {
-            controls = controls
+        controls = controls
                 .child(
                     Button::new("resident-attachment")
                         .small()
@@ -335,8 +345,11 @@ impl Render for ResidentChatPane {
                             this.state.pick_attachments();
                             cx.notify();
                         })),
-                )
-                .child(div().flex_1().text_xs().child(self.state.status_line()));
+                );
+        if !self.compact {
+            controls = controls.child(div().flex_1().text_xs().child(self.state.status_line()));
+        } else {
+            controls = controls.child(div().flex_1());
         }
         controls = controls.child(voice);
         if self.state.can_stop() && self.state.has_draft() {
@@ -415,31 +428,52 @@ impl Render for ResidentChatPane {
             if self.state.status.is_some() && self.state.host_notice.as_deref() != Some(status.as_str()) {
                 pane = pane.child(div().text_xs().child(status));
             }
-            if let Some(error) = &self.state.attachments_error {
-                pane = pane.child(div().text_xs().child(error.clone()));
-            }
-            if self.state.attachments_preparing {
-                pane = pane.child(div().text_xs().child("正在准备图片…"));
-            }
             if let Some(error) = &self.state.tts_error {
                 pane = pane.child(div().text_xs().child(error.clone()));
             }
             if let Some(notice) = &self.state.host_notice {
                 pane = pane.child(div().text_xs().child(format!("应用提示：{notice}")));
             }
-            if !self.state.attachments.is_empty() {
-                pane = pane.child(previews.overflow_x_scrollbar());
-                if self.state.attachments.len() > 4 {
-                    pane = pane.child(
-                        div()
-                            .text_xs()
-                            .child("图片已保留，请移除多余图片后再发送（最多4张）。"),
-                    );
-                }
-            }
         } else {
-            pane = pane.p_1().gap_1().h(px(70.));
+            pane = pane.p_1().gap_1().h(px(compact_composer_height(&self.state)));
+        }
+        if !self.state.attachments.is_empty() {
+            pane = pane.child(previews.flex_shrink_0().overflow_x_scrollbar());
+            if self.state.attachments.len() > 4 {
+                pane = pane.child(div().text_xs().child(
+                    "图片已保留，请移除多余图片后再发送（最多4张）。",
+                ));
+            }
+        }
+        if self.state.attachments_preparing {
+            pane = pane.child(div().text_xs().child("正在准备图片…"));
+        }
+        if let Some(error) = &self.state.attachments_error {
+            pane = pane.child(div().text_xs().text_color(rgb(0xfb923c)).child(error.clone()));
         }
         pane.child(input).child(controls)
+    }
+}
+
+#[cfg(test)]
+mod compact_attachment_tests {
+    use super::{compact_composer_height, ChatAttachment, ChatState};
+
+    #[test]
+    fn compact_height_matches_original_attachment_strip_visibility() {
+        let mut state = ChatState::default();
+        assert_eq!(compact_composer_height(&state), 70.);
+        state.attachments_preparing = true;
+        assert_eq!(compact_composer_height(&state), 140.);
+        state.attachments_preparing = false;
+        state.attachments_error = Some("图片无法读取".into());
+        assert_eq!(compact_composer_height(&state), 140.);
+        state.attachments_error = None;
+        state.attachments.push(ChatAttachment {
+            id: "one".into(), file_name: "one.png".into(), preview_path: None,
+        });
+        assert_eq!(compact_composer_height(&state), 140.);
+        state.attachments.clear();
+        assert_eq!(compact_composer_height(&state), 70.);
     }
 }

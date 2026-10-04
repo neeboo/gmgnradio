@@ -13,6 +13,16 @@ fn scroll_phase(card_top: f64, card_height: f64, viewport_top: f64, viewport_hei
     }
 }
 fn card_effects(card: &Value, catalog: bool) -> CardEffects {
+    if card["isEmpty"].as_bool() == Some(true) {
+        return CardEffects {
+            blur_radius: 0.,
+            shadow: Some(CardShadow {
+                radius: 24.,
+                offset: [0., 0.],
+                rgba: [0, 255, 255, 36],
+            }),
+        };
+    }
     let current = card["isCurrent"].as_bool() == Some(true);
     let focused = card["isFocused"].as_bool().unwrap_or(current);
     CardEffects {
@@ -63,7 +73,32 @@ use gpui_kit::component::button::*;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use serde_json::{Value, json};
-use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    rc::Rc,
+    sync::Arc,
+};
+
+#[derive(Clone, Debug, Default)]
+pub struct ProgramMaterialFrame {
+    pub viewport: [f64; 4],
+    pub scale: f64,
+    pub revision: u64,
+    pub fade_fraction: f64,
+    pub cards: Vec<ProgramMaterialCard>,
+}
+#[derive(Clone, Debug)]
+pub struct ProgramMaterialCard {
+    pub id: String,
+    pub width: f64,
+    pub height: f64,
+    pub radius: f64,
+    pub opacity: f64,
+    pub priority: usize,
+    pub matrix: [f64; 9],
+}
+type MaterialRenderer = Rc<dyn Fn(&ProgramMaterialFrame) -> bool>;
 type ProjectionCache = Rc<RefCell<HashMap<String, (String, Arc<ProjectedCard>, Arc<RenderImage>)>>>;
 
 // Match AsyncImage: centered scaledToFill, 42pt square, 12pt rounded clip.
@@ -183,6 +218,20 @@ fn card_svg_content(
     playlist: bool,
     has_artwork: bool,
 ) -> String {
+    if card["isEmpty"].as_bool() == Some(true) {
+        let label = svg_text(
+            card["title"].as_str().unwrap_or("暂无节目"),
+            50.,
+            38.,
+            16.,
+            600,
+            "#ffffffd6",
+            236.,
+        );
+        return format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="306" height="64" viewBox="0 0 306 64"><rect x=".5" y=".5" width="305" height="63" rx="22" fill="#1c252d"/><rect x=".5" y=".5" width="305" height="63" rx="22" fill="none" stroke="#00ffff" stroke-opacity=".24"/><path d="M20 32h3l2-6 3 12 3-18 3 20 2-8h2" fill="none" stroke="#00ffff" stroke-opacity=".9" stroke-width="1.5"/>{label}</svg>"##
+        );
+    }
     let (w, h, r) = if catalog {
         (306., 74., 22.)
     } else {
@@ -281,6 +330,15 @@ fn card_svg_content(
 }
 
 fn card_transform(card: &Value, catalog: bool) -> CardTransform {
+    if card["isEmpty"].as_bool() == Some(true) {
+        return CardTransform {
+            width: 306.,
+            height: 64.,
+            scale: 1.,
+            y_degrees: 0.,
+            perspective: 0.72,
+        };
+    }
     let focused = card["isFocused"]
         .as_bool()
         .unwrap_or(card["isCurrent"].as_bool() == Some(true));
@@ -392,6 +450,12 @@ pub struct StageProgramRailPane {
     projection_cache: ProjectionCache,
     focus_handles: HashMap<String, FocusHandle>,
     pagination_request: Option<(String, usize)>,
+    material_renderer: Option<MaterialRenderer>,
+    material_frame: Rc<RefCell<ProgramMaterialFrame>>,
+    material_applied: Rc<Cell<bool>>,
+    material_ready: Rc<Cell<bool>>,
+    material_sources: HashMap<String, (String, Arc<RgbaTexture>)>,
+    material_projections: Rc<RefCell<HashMap<String, (String, Arc<RenderImage>)>>>,
 }
 impl StageProgramRailPane {
     pub fn new(_window: &mut Window, _cx: &mut Context<Self>) -> Self {
@@ -412,6 +476,12 @@ impl StageProgramRailPane {
             projection_cache: Rc::new(RefCell::new(HashMap::new())),
             focus_handles: HashMap::new(),
             pagination_request: None,
+            material_renderer: None,
+            material_frame: Rc::new(RefCell::new(ProgramMaterialFrame::default())),
+            material_applied: Rc::new(Cell::new(false)),
+            material_ready: Rc::new(Cell::new(true)),
+            material_sources: HashMap::new(),
+            material_projections: Rc::new(RefCell::new(HashMap::new())),
         }
     }
     pub fn update_snapshot(
@@ -465,6 +535,23 @@ impl StageProgramRailPane {
     pub fn take_commands(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.commands)
     }
+    pub fn set_native_material_renderer(
+        &mut self,
+        renderer: Option<MaterialRenderer>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(old) = self.material_renderer.take() {
+            let _ = old(&ProgramMaterialFrame::default());
+        }
+        self.material_renderer = renderer;
+        self.material_applied.set(false);
+        self.material_sources.clear();
+        self.material_projections.borrow_mut().clear();
+        cx.notify();
+    }
+    pub fn native_material_frame(&self) -> ProgramMaterialFrame {
+        self.material_frame.borrow().clone()
+    }
     fn projected_card(
         &mut self,
         card: &Value,
@@ -474,6 +561,7 @@ impl StageProgramRailPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let empty = card["isEmpty"].as_bool() == Some(true);
         let id = if catalog {
             format!("{op}-{}", card["id"].as_str().unwrap_or(""))
         } else {
@@ -527,9 +615,49 @@ impl StageProgramRailPane {
                     composite_artwork(&mut texture, artwork);
                 }
                 let texture = Arc::new(texture);
-                self.card_cache.insert(id.clone(), (key, texture.clone()));
+                self.card_cache
+                    .insert(id.clone(), (key.clone(), texture.clone()));
                 texture
             };
+        let material_texture = if self.material_renderer.is_some() {
+            if let Some((_, source)) = self
+                .material_sources
+                .get(&id)
+                .filter(|(old, _)| old == &key)
+            {
+                Some(source.clone())
+            } else {
+                // Keep the complete opaque source for same-frame failure recovery
+                // and original rounded-card hit testing; only this foreground
+                // variant removes the base after the native apply succeeds.
+                let svg = card_svg_content(card, &audio, catalog, playlist, artwork.is_some())
+                    .replace("fill=\"#1c252d\"", "fill=\"#1c252d\" fill-opacity=\"0\"");
+                self.renderer
+                    .render_single_frame(svg.as_bytes(), 1.)
+                    .ok()
+                    .map(|image| {
+                        let dimensions = image.size(0);
+                        let mut pixels = image.as_bytes(0).unwrap_or_default().to_vec();
+                        for pixel in pixels.chunks_exact_mut(4) {
+                            pixel.swap(0, 2);
+                        }
+                        let mut source = RgbaTexture {
+                            width: dimensions.width.0 as u32,
+                            height: dimensions.height.0 as u32,
+                            pixels,
+                        };
+                        if let Some(artwork) = &artwork {
+                            composite_artwork(&mut source, artwork);
+                        }
+                        let source = Arc::new(source);
+                        self.material_sources
+                            .insert(id.clone(), (key.clone(), source.clone()));
+                        source
+                    })
+            }
+        } else {
+            None
+        };
         let focused = card["isFocused"]
             .as_bool()
             .unwrap_or(card["isCurrent"].as_bool() == Some(true));
@@ -560,6 +688,24 @@ impl StageProgramRailPane {
         let height = transform.height as f32;
         let cache = self.projection_cache.clone();
         let cache_id = id.clone();
+        let material_frame = self.material_frame.clone();
+        let material_ready = self.material_ready.clone();
+        let material_applied = self.material_applied.clone();
+        let material_cache = self.material_projections.clone();
+        let material_id = id.clone();
+        let material_enabled = self.material_renderer.is_some();
+        let distance_bias = self.snapshot["tracks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|c| c["relativeIndex"].as_i64().unwrap_or(0).unsigned_abs() as usize)
+            .max()
+            .unwrap_or(0);
+        let material_priority = if catalog {
+            0
+        } else {
+            card_priority(card, distance_bias)
+        };
         let focus = self
             .focus_handles
             .entry(id.clone())
@@ -601,6 +747,7 @@ impl StageProgramRailPane {
                 let padding=(effects.shadow.as_ref().map_or(0.,|shadow|shadow.radius*3.+shadow.offset[1].abs())+effects.blur_radius*3.)*transform.scale;
                 if bottom+padding <= mask.top || top-padding >= mask.top + mask.height {
                     cache.borrow_mut().remove(&cache_id);
+                    material_cache.borrow_mut().remove(&material_id);
                     return None;
                 }
                 let window_size = [
@@ -612,14 +759,12 @@ impl StageProgramRailPane {
                     Arc::as_ptr(&texture),
                     window.scale_factor()
                 );
-                if let Some((key, projected, image)) = cache
+                let cached = cache
                     .borrow()
                     .get(&cache_id)
                     .filter(|(key, _, _)| key == &cache_key)
-                {
-                    let _ = key;
-                    return Some((projected.clone(), image.clone()));
-                }
+                    .map(|(_, projected, image)| (projected.clone(), image.clone()));
+                let (projected, image) = if let Some(cached) = cached { cached } else {
                 let projected = Arc::new(
                     ProjectedCard::render_with_effects(
                         &texture,
@@ -637,19 +782,39 @@ impl StageProgramRailPane {
                 let image = projected.render_image();
                 cache
                     .borrow_mut()
-                    .insert(cache_id, (cache_key, projected.clone(), image.clone()));
-                Some((projected, image))
+                    .insert(cache_id, (cache_key.clone(), projected.clone(), image.clone()));
+                (projected, image)
+                };
+                let mut foreground = None;
+                if material_enabled {
+                    if let Some(source) = &material_texture {
+                        let key = format!("{cache_key}/{:p}", Arc::as_ptr(source));
+                        foreground = material_cache.borrow().get(&material_id).filter(|(old,_)| old == &key).map(|(_,image)|image.clone());
+                        if foreground.is_none() {
+                            foreground = ProjectedCard::render_with_effects(source, transform, origin, window_size, window.scale_factor() as f64, opacity, Some(mask), transition, effects).ok().map(|p|p.render_image());
+                            if let Some(image) = &foreground { material_cache.borrow_mut().insert(material_id.clone(), (key, image.clone())); }
+                        }
+                    }
+                    if foreground.is_none() { material_ready.set(false); }
+                    let mut frame = material_frame.borrow_mut();
+                    frame.viewport = [f64::from(f32::from(viewport.origin.x)), mask.top, f64::from(f32::from(viewport.size.width)), mask.height];
+                    frame.scale = window.scale_factor() as f64;
+                    frame.cards.push(ProgramMaterialCard { id: material_id, width: transform.width, height: transform.height, radius: if catalog {22.}else{23.}, opacity, priority: material_priority, matrix: projected.source_to_world_matrix() });
+                }
+                Some((projected, image, foreground))
             },
             move |_, projected, window, _| {
-                let Some((projected, image)) = projected else {
+                let Some((projected, fallback, foreground)) = projected else {
                     return;
                 };
+                let image = if material_applied.get() { foreground.unwrap_or(fallback) } else { fallback };
                 let b = projected.bounds;
                 let bounds = Bounds::new(
                     point(px(b[0] as f32), px(b[1] as f32)),
                     size(px(b[2] as f32), px(b[3] as f32)),
                 );
                 let _ = window.paint_image(bounds, bounds, Corners::default(), image, 0, false);
+                if empty { return; }
                 let down_projected = projected.clone();
                 let down_view = view.clone();
                 let down_id = id.clone();
@@ -706,6 +871,14 @@ impl StageProgramRailPane {
         .w(px(width))
         .h(px(height))
         .flex_shrink_0();
+        if empty {
+            return div()
+                .id("empty-program-state")
+                .role(Role::Label)
+                .aria_label(card["title"].as_str().unwrap_or("暂无节目").to_owned())
+                .child(canvas)
+                .into_any_element();
+        }
         let label = if catalog {
             card["title"].as_str().unwrap_or("").to_owned()
         } else {
@@ -808,6 +981,21 @@ impl StageProgramRailPane {
 }
 impl Render for StageProgramRailPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        {
+            let mut frame = self.material_frame.borrow_mut();
+            let revision = frame.revision.wrapping_add(1);
+            *frame = ProgramMaterialFrame {
+                revision,
+                fade_fraction: 0.08,
+                ..Default::default()
+            };
+        }
+        self.material_ready.set(true);
+        self.material_applied.set(false);
+        let material_renderer = self.material_renderer.clone();
+        let material_frame = self.material_frame.clone();
+        let material_ready = self.material_ready.clone();
+        let material_applied = self.material_applied.clone();
         let tracks = self.snapshot["route"]
             .as_str()
             .is_some_and(|r| r != "programs");
@@ -973,12 +1161,25 @@ impl Render for StageProgramRailPane {
                             .child(gpui_kit::component::spinner::Spinner::new()),
                     );
                 }
-                content = content.pt(px(96.)).gap(px(10.)).items_center().child(
-                    self.snapshot["emptyMessage"]
-                        .as_str()
-                        .unwrap_or("正在加载歌曲…")
-                        .to_owned(),
-                );
+                content = content.pt(px(96.)).gap(px(10.)).items_center();
+                if self.snapshot["isPlaylist"].as_bool() != Some(true) {
+                    let empty_card = json!({"id":"empty-state","isEmpty":true,"title":self.snapshot["emptyMessage"].as_str().unwrap_or("暂无节目")});
+                    content = content.child(self.projected_card(
+                        &empty_card,
+                        true,
+                        false,
+                        "",
+                        window,
+                        cx,
+                    ));
+                } else {
+                    content = content.child(
+                        self.snapshot["emptyMessage"]
+                            .as_str()
+                            .unwrap_or("正在加载歌曲…")
+                            .to_owned(),
+                    );
+                }
             }
         } else {
             header = header
@@ -1012,12 +1213,9 @@ impl Render for StageProgramRailPane {
                     .as_array()
                     .is_none_or(|a| a.is_empty())
             {
-                content = content.child(
-                    self.snapshot["emptyMessage"]
-                        .as_str()
-                        .unwrap_or("暂无歌单")
-                        .to_owned(),
-                );
+                let empty_card = json!({"id":"empty-state","isEmpty":true,"title":self.snapshot["emptyMessage"].as_str().unwrap_or("暂无节目")});
+                content =
+                    content.child(self.projected_card(&empty_card, true, false, "", window, cx));
             }
         }
         div()
@@ -1088,6 +1286,31 @@ impl Render for StageProgramRailPane {
                     ))
                     .child(content),
             )
+            // Every card's prepaint has published its actual homography before
+            // this final prepaint runs. Apply all native layers atomically, then
+            // foreground paint selects transparent or opaque images in THIS
+            // frame. No 100ms polling, deferred geometry, or failure blank frame.
+            .child(
+                canvas(
+                    move |_, _, _| {
+                        let success = material_renderer.as_ref().is_some_and(|renderer| {
+                            if material_ready.get() {
+                                renderer(&material_frame.borrow())
+                            } else {
+                                let _ = renderer(&ProgramMaterialFrame::default());
+                                false
+                            }
+                        });
+                        material_applied.set(success);
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .w(px(1.))
+                .h(px(1.)),
+            )
     }
 }
 
@@ -1123,6 +1346,115 @@ mod tests {
         card_svg, card_transform, energy_height, pagination_key, scroll_phase, snap_offset,
     };
     use serde_json::json;
+    #[test]
+    fn real_material_frame_uses_foreground_geometry_and_same_frame_failure_fallback() {
+        use gpui_kit::{AppContext, TestAppContext};
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let result = std::rc::Rc::new(std::cell::Cell::new(false));
+        let latest = std::rc::Rc::new(std::cell::RefCell::new(
+            super::ProgramMaterialFrame::default(),
+        ));
+        let stored = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (returned, frames, entity) = (result.clone(), latest.clone(), stored.clone());
+        let handle = cx.add_window(move |window, cx| {
+            let pane = cx.new(|cx| {
+                let mut pane = super::StageProgramRailPane::new(window, cx);
+                pane.snapshot = json!({"route":"programs","programs":[{"id":"material-geometry","title":"真实字段","subtitle":"内容"}],"playlists":[]});
+                pane.set_native_material_renderer(Some(std::rc::Rc::new(move |frame| {
+                    *frames.borrow_mut() = frame.clone();
+                    returned.get()
+                })), cx);
+                pane
+            });
+            *entity.borrow_mut() = Some(pane.clone());
+            gpui_kit::base::Root::new(pane, window, cx)
+        });
+        let draw = |cx: &mut TestAppContext| {
+            cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+        };
+        draw(&mut cx);
+        draw(&mut cx);
+        assert_eq!(
+            latest.borrow().cards.len(),
+            1,
+            "callback publishes all actual measured cards"
+        );
+        assert!(latest.borrow().viewport[3] > 0.);
+        let card = latest.borrow().cards[0].clone();
+        assert_eq!((card.width, card.height, card.radius), (306., 74., 22.));
+        cx.update(|cx| {
+            let pane = stored.borrow().as_ref().unwrap().read(cx);
+            assert!(
+                !pane.material_applied.get(),
+                "failed callback uses opaque foreground THIS paint"
+            );
+            let cache = pane.projection_cache.borrow();
+            let projected = &cache.values().next().unwrap().1;
+            assert_eq!(card.matrix, projected.source_to_world_matrix());
+            let opaque = &pane.card_cache.values().next().unwrap().1;
+            let transparent = &pane.material_sources.values().next().unwrap().1;
+            let i = ((8 * opaque.width + 80) * 4 + 3) as usize;
+            assert_eq!(opaque.pixels[i], 255);
+            assert!(transparent.pixels[i] < opaque.pixels[i]);
+        });
+        result.set(true);
+        draw(&mut cx);
+        cx.update(|cx| {
+            assert!(
+                stored
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .material_applied
+                    .get()
+            )
+        });
+        result.set(false);
+        draw(&mut cx);
+        cx.update(|cx| {
+            assert!(
+                !stored
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .material_applied
+                    .get()
+            )
+        });
+        result.set(true);
+        cx.update_window(handle.into(), |_, window, cx| {
+            stored.borrow().as_ref().unwrap().update(cx, |pane,cx|pane.update_snapshot(json!({"route":"programs","programs":[],"playlists":[],"emptyMessage":"暂无节目"}),window,cx));
+        }).unwrap();
+        draw(&mut cx);
+        let empty = latest.borrow().cards[0].clone();
+        assert_eq!((empty.width, empty.height, empty.radius), (306., 64., 22.));
+        assert_eq!(empty.matrix[0], 1.);
+        assert_eq!(empty.matrix[4], 1.);
+        assert_eq!(empty.matrix[6], 0.);
+        assert_eq!(empty.matrix[7], 0.);
+        assert_eq!(
+            latest.borrow().cards.len(),
+            1,
+            "real empty state replaces, not retains, old catalog layers"
+        );
+        cx.update_window(handle.into(), |_, window, cx| {
+            stored
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |pane, cx| pane.set_native_material_renderer(None, cx));
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        assert!(
+            latest.borrow().cards.is_empty(),
+            "renderer removal explicitly clears native cards"
+        );
+    }
     #[test]
     fn real_gpui_window_draw_empty_and_projected_catalog_obeys_paint_phase() {
         use gpui_kit::{AppContext, TestAppContext};

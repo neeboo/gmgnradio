@@ -346,6 +346,12 @@ v30完整包exit0，实际PID12373，runtime`/tmp/gmgn-gpui-parity-v30-runtime.l
 
 v31完整包exit0（`/tmp/gmgn-gpui-product-app-build-v31.log`），PID12710，同一数据根，runtime`/tmp/gmgn-gpui-parity-v31-runtime.log`。CUA先通过原装修面板Esc结束摆放，再小窗提交同一句真实请求，request1 accepted→reply；截图文字在气泡内换行，右侧关闭X和六圆入口完整可见。此用户回复换行子路径通过，不计自主后台交付实际通过。未注入语音密钥，本轮原语音提示缺凭据，声音未验收；未录音/登录/删除资产。最后源码复核去掉展开时绕过dismiss的条件，保留关闭语义；此最后窄修仍需新包真实关闭/恢复复验，不能把v31截图扩大为该行为通过。
 
+### v35 同帧节目磨砂与小窗附件/聚焦
+
+节目卡material接口从真实前景prepaint发布viewport和每卡source→window同源矩阵，native桥整批同帧apply；成功才用透明前景，失败同paint恢复完整不透明纹理，命中仍原圆角逆投影。main按当前原窗口挂载创建/关闭清理context，切profile重建，未改变原布局。真实空catalog卡306×64 radius22不旋转，未注入曲库。projective15/15及完整UI93/93 exit0（`/tmp/gmgn-gpui-v35-final-ui-tests.log`），App13/13及ABI1/1 exit0（`/tmp/gmgn-gpui-v35-final-app-tests.log`）；v35完整包exit0（`/tmp/gmgn-gpui-product-app-build-v35.log`），PID34475同隔离根，runtime`/tmp/gmgn-gpui-parity-v35-runtime.log`。CUA实际空间打开节目，空库“暂无节目”卡可见真实背后场景取色与模糊；尚无原Swift同根对照，HUDWindow候选不能称ultraThin材质完全一致，非空曲目滚动/视频圆按钮material仍欠。
+
+小窗恢复原添加图片入口、54×46缩略图/移除、准备和错误；内部/外层按附件/准备/错误70→140同步。公开真实Kit输入focus，展开动作下一帧聚焦。CUA小窗点聊天后不点击输入框直接paste，AX读回“聚焦验收草稿”（首个同批paste早于下一帧，后续不点击输入框paste成功）。原文件选择器选仓库playing.png，实际缩略图和移除按钮出现，224×336不变、composer140；移除待发送附件后缩略图消失、高度70、草稿保留。未发送图片给居民，未删除源文件，未录音/操作密钥。附件准备/失败状态测试通过，但未制造真实provider错误，不扩大验收范围。
+
 ### v34 生命周期修复及危险菜单真实复验
 
 GPUI编译配置下强持有原MetalStageView，普通Swift路径仍weak；原同实例未重建。生产attach/restore容器释放8次回归及宿主build22 exit0（`/tmp/gmgn-gpui-player-lifecycle-build22.log`）。v34完整包exit0（`/tmp/gmgn-gpui-product-app-build-v34.log`），PID23483同一隔离根。真实CUA full→compact→space→compact→player后原点阵播放器画面可见，每次runtime均PRODUCT_SURFACE mounted=true（`/tmp/gmgn-gpui-parity-v34-runtime.log`），本次先前重复切窗挂载失败子路径通过。素材保留一段，菜单AX实际读到“加载”和“移出素材库”；点击加载读回真实素材名已加载，未点击移除。截图点阵与视频叠加背景变化可见，但未独立核对视频连续帧，不报完整视频播放验收。

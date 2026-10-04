@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 mod program;
 mod props;
-pub use program::StageProgramRailPane;
+pub use program::{StageProgramRailPane, ProgramMaterialFrame, ProgramMaterialCard};
 pub use props::ResidentPropEditorPane;
 
 pub const STAGE_PANEL_WIDTH: f32 = 590.;

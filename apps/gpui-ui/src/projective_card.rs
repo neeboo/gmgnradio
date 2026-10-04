@@ -213,6 +213,31 @@ pub struct ProjectedCard {
     mapping: Option<Homography>,
 }
 impl ProjectedCard {
+    /// Exact foreground geometry, in logical points (not source raster pixels).
+    /// Native materials use this same mapping, including final world origin.
+    pub fn source_to_world_matrix(&self) -> [f64; 9] {
+        let forward = if let Some(inverse) = self.mapping {
+            inverse
+                .inverse()
+                .expect("validated projected-card homography")
+        } else {
+            Homography::rotation(
+                self.transform.width,
+                self.transform.height,
+                self.transform.scale,
+                self.transform.y_degrees,
+                [0., 1., 0.],
+                self.transform.perspective,
+            )
+            .expect("validated projected-card transform")
+        };
+        let m = Homography::translate(self.origin[0], self.origin[1])
+            .multiply(forward)
+            .0;
+        [
+            m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
+        ]
+    }
     pub fn render(
         source: &RgbaTexture,
         transform: CardTransform,
@@ -775,6 +800,57 @@ fn sample(source: &RgbaTexture, p: [f64; 2], t: CardTransform) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_material_matrix_matches_foreground_and_inverse_hit_in_world_points() {
+        let t = transform();
+        let transition = ScrollTransition {
+            scale: 0.9,
+            degrees: 11.,
+            axis: [1., 0.16, 0.],
+            perspective: 0.72,
+            offset_before: [-4., 0.],
+        };
+        for outer in [None, Some(transition)] {
+            let card = ProjectedCard::render_with_effects(
+                &texture(),
+                t,
+                [40., 20.],
+                [500., 200.],
+                2.,
+                1.,
+                None,
+                outer,
+                CardEffects::default(),
+            )
+            .unwrap();
+            let raw = card.source_to_world_matrix();
+            let m = Homography([
+                [raw[0], raw[1], raw[2]],
+                [raw[3], raw[4], raw[5]],
+                [raw[6], raw[7], raw[8]],
+            ]);
+            for local in [[45., 20.], [180., 50.], [290., 70.]] {
+                let world = m.apply(local).unwrap();
+                let hit = card.inverse_hit(world).unwrap();
+                assert!((hit[0] - local[0]).abs() < 1e-8 && (hit[1] - local[1]).abs() < 1e-8);
+            }
+        }
+        let plain =
+            ProjectedCard::render(&texture(), t, [40., 20.], [500., 200.], 2., 1., None).unwrap();
+        let raw = plain.source_to_world_matrix();
+        let m = Homography([
+            [raw[0], raw[1], raw[2]],
+            [raw[3], raw[4], raw[5]],
+            [raw[6], raw[7], raw[8]],
+        ]);
+        let local = [50., 25.];
+        let actual = m.apply(local).unwrap();
+        let expected = t.project_point(local);
+        assert!(
+            (actual[0] - expected[0] - 40.).abs() < 1e-8
+                && (actual[1] - expected[1] - 20.).abs() < 1e-8
+        );
+    }
     #[test]
     fn prepared_effects_reuse_pixels_when_only_scroll_geometry_changes() {
         let source = texture();

@@ -10,6 +10,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{cell::RefCell, rc::Rc, time::Duration,ffi::{c_void,c_char,CStr}};
 mod host_events;
 mod product_host;
+mod program_backdrop;
 use product_host::ProductHost;
 gpui_kit::actions!(gmgn_product, [Quit,ShowSettings,ShowLiveCam,EscapeStage]);
 
@@ -77,11 +78,13 @@ struct GMGNProductUI {
     stage_panel_open: bool,
     program_pane: Entity<StageProgramRailPane>,
     program_open: bool,
+    program_backdrop: Rc<RefCell<Option<program_backdrop::ProgramBackdrop>>>,
     prop_pane: Entity<ResidentPropEditorPane>,
     lyrics_pane:Entity<StageLyricsPane>,
     bound_video_pane:Entity<StageBoundVideoPromptPane>,
     props_open: bool,
     chat_open: bool,
+    composer_focus_pending: bool,
     voice_held: bool,
     pending: Option<u64>,
     accepted: bool,
@@ -100,6 +103,31 @@ struct GMGNProductUI {
 }
 
 impl GMGNProductUI {
+    fn clear_program_backdrop(&mut self, cx: &mut Context<Self>) {
+        self.program_pane.update(cx, |pane,cx| pane.set_native_material_renderer(None,cx));
+        self.program_backdrop.borrow_mut().take();
+    }
+    fn sync_program_backdrop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.compact || !self.program_open || !self.surface_mounted {
+            if self.program_backdrop.borrow().is_some() { self.clear_program_backdrop(cx); }
+            return;
+        }
+        if self.program_backdrop.borrow().is_some() { return; }
+        let Ok(handle)=window.window_handle() else {return;};
+        let RawWindowHandle::AppKit(handle)=handle.as_raw() else {return;};
+        let Some(backdrop)=(unsafe {program_backdrop::ProgramBackdrop::new(handle.ns_view.as_ptr())}) else {return;};
+        *self.program_backdrop.borrow_mut()=Some(backdrop);
+        let context=self.program_backdrop.clone();
+        self.program_pane.update(cx, |pane,cx| pane.set_native_material_renderer(Some(Rc::new(move |frame| {
+            if frame.cards.is_empty() {
+                return context.borrow_mut().as_mut().is_some_and(|backdrop|backdrop.clear());
+            }
+            let cards=frame.cards.iter().map(|card|program_backdrop::BackdropCard {
+                width:card.width,height:card.height,radius:card.radius,opacity:card.opacity,priority:card.priority as f64,matrix:card.matrix,
+            }).collect::<Vec<_>>();
+            context.borrow_mut().as_mut().is_some_and(|backdrop|backdrop.apply(&cards,frame.viewport))
+        })),cx));
+    }
     fn fail(&mut self, id: u64, notice: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.pane.update(cx, |pane, cx| pane.failed(id, notice.into(), window, cx));
         self.pending = None;
@@ -342,7 +370,7 @@ impl GMGNProductUI {
             self.props_open=false;
         }
         match action {
-            "chat" => {self.chat_open=!self.chat_open;if self.chat_open{self.stage_panel_open=false;self.program_open=false;self.props_open=false;if self.compact{self.dismissed_reply_revision=None;}}cx.notify();},
+            "chat" => {self.chat_open=!self.chat_open;if self.chat_open{self.composer_focus_pending=true;self.stage_panel_open=false;self.program_open=false;self.props_open=false;if self.compact{self.dismissed_reply_revision=None;}}cx.notify();},
             "visual" => {self.stage_panel_open=!self.stage_panel_open;if self.stage_panel_open{self.chat_open=false;self.program_open=false;self.props_open=false;}cx.notify();},
             "program" => {self.program_open=!self.program_open;if self.program_open{self.chat_open=false;self.stage_panel_open=false;self.props_open=false;}cx.notify();},
             "toggleDecoration" => {
@@ -434,6 +462,7 @@ impl GMGNProductUI {
         ui.pane.update(cx,|pane,cx|pane.set_compact(compact,cx));
         ui.stage_panel_open=false;ui.program_open=false;ui.props_open=false;
         ui.surface_mounted=false;
+        ui.clear_program_backdrop(cx);
         ui._poll=cx.spawn(async move |view,cx| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(100)).await;
@@ -499,6 +528,12 @@ impl GMGNProductUI {
 
 impl Render for GMGNProductUI {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_program_backdrop(window,cx);
+        if self.composer_focus_pending {
+            self.composer_focus_pending=false;
+            let pane=self.pane.downgrade();
+            window.on_next_frame(move |window,cx| { let _=pane.update(cx, |pane,cx|pane.focus_composer(window,cx)); });
+        }
         let background = cx.theme().tokens.background;
         let foreground = cx.theme().foreground;
         let mut notices = if self.compact {
@@ -540,7 +575,7 @@ impl Render for GMGNProductUI {
             notices=if self.compact{notices.child(div().rounded(px(10.)).p(px(8.)).bg(rgba(0x1f1f1ff0)).text_size(px(10.)).text_color(rgb(0xff9f0a)).child(notice.clone()))}else{notices.child(notice.clone())};notice_count+=1;
         }
         let viewport=window.viewport_size();let width=viewport.width.as_f32();let height=viewport.height.as_f32();
-        let compact_composer_height=if self.runtime_state["attachments"].as_array().is_some_and(|images|!images.is_empty()){140.}else{70.};
+        let compact_composer_height=if self.runtime_state["attachments"].as_array().is_some_and(|images|!images.is_empty()) || self.runtime_state["attachmentsPreparing"].as_bool()==Some(true) || self.runtime_state["attachmentError"].as_str().is_some_and(|error|!error.is_empty()){140.}else{70.};
         let mut root=div().size_full().relative().text_color(foreground);
         if !self.compact {
             self.lyrics_pane.update(cx,|pane,_|pane.set_viewport_size(width,height));
@@ -563,7 +598,7 @@ impl Render for GMGNProductUI {
                 let bubble=div().id("compact-reply-bubble").absolute().left(px(10.)).right(px(48.)).top(px(10.)).p_2().rounded(px(10.)).bg(background).flex().items_start().gap(px(5.));
                 let bubble=if self.chat_open{bubble.h(px(136.))}else{bubble.max_h(px(74.))};
                 root=root.child(bubble
-                    .on_click(cx.listener(|this,_,_,cx|{this.chat_open=true;cx.notify();}))
+                    .on_click(cx.listener(|this,_,_,cx|{this.chat_open=true;this.composer_focus_pending=true;cx.notify();}))
                     .child(content)
                     .child(Button::new("livecam.reply-dismiss").ghost().icon(gpui_kit::assets::IconName::X).w(px(20.)).h(px(20.)).accessibility_label("关闭回复气泡").tooltip("关闭回复气泡").on_click(cx.listener(|this,_,_,cx|{cx.stop_propagation();this.dismissed_reply_revision=latest_reply_revision(&this.runtime_state);cx.notify();}))));
             }
@@ -812,7 +847,7 @@ fn main() {
                     }
                 });
                 GMGNProductUI { host: host.clone(), pane, settings_pane, settings_window:None, inbox_pane, inbox_window:None, stage_pane,stage_panel_open:false,
-                    program_pane,program_open:false,prop_pane,lyrics_pane,bound_video_pane,props_open:false,chat_open:false, voice_held:false, pending: None, accepted: false,
+                    program_pane,program_open:false,program_backdrop:Rc::new(RefCell::new(None)),prop_pane,lyrics_pane,bound_video_pane,props_open:false,chat_open:false,composer_focus_pending:false, voice_held:false, pending: None, accepted: false,
                     transcript: vec![], compact, core_notice, runtime_state: serde_json::Value::Null,
                     surface_mounted: false,navigation_revision:0,main_window:main_window.clone(),profile_switch_pending:false,dismissed_reply_revision:None,player_menu_open:false,program_visibility_reported:None, _poll: poll }
             });
