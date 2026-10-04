@@ -54,6 +54,8 @@ namespace GMGN.UnityPlayer.Editor
         public static void BuildMac()
         {
             Prepare();
+            if (AssetDatabase.LoadAssetAtPath<GameObject>("Assets/GMGN/GaussianWorld/Resources/GaussianWorld/Cabin.prefab") == null)
+                throw new System.InvalidOperationException("Prepare the Gaussian cabin with GaussianWorldBootstrap.PrepareCabin before building; missing assets must not produce an empty space.");
             var output = System.Environment.GetEnvironmentVariable("GMGN_UNITY_BUILD_PATH");
             if (string.IsNullOrEmpty(output)) throw new System.InvalidOperationException("Set GMGN_UNITY_BUILD_PATH to an isolated .app output.");
             var report = BuildPipeline.BuildPlayer(new BuildPlayerOptions { scenes = new[] { "Assets/GMGN/Player.unity" }, locationPathName = output, target = BuildTarget.StandaloneOSX, options = BuildOptions.None });

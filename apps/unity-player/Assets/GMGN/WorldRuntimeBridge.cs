@@ -24,6 +24,9 @@ namespace GMGN.UnityPlayer
         JObject recoveredCamera;
         float playerFieldOfView;
         float playerNearPlane, playerFarPlane;
+        GaussianWorldView gaussianBackground;
+        bool backgroundEnabled;
+        const string VerifiedCabinWorldID = "84503420-3010-4944-8fde-2f383cd08ebe";
         public JObject AuthorityProjection { get; private set; }
         public bool Configured => !string.IsNullOrEmpty(worldID) && !string.IsNullOrEmpty(packageDirectory);
 
@@ -58,6 +61,8 @@ namespace GMGN.UnityPlayer
                 recoveredCamera = package.State(worldID)["liveCamera"] as JObject;
                 var loader = new GltfWorldAssetLoader();
                 worldRoot = new GameObject("Recovered world " + worldID);
+                if (string.Equals(worldID, VerifiedCabinWorldID, StringComparison.OrdinalIgnoreCase))
+                    gaussianBackground = worldRoot.AddComponent<GaussianWorldView>();
                 var light = new GameObject("Recovery lighting").AddComponent<Light>();
                 light.transform.SetParent(worldRoot.transform, false);
                 light.type = LightType.Directional; light.intensity = 1;
@@ -66,13 +71,16 @@ namespace GMGN.UnityPlayer
                 if (!string.IsNullOrEmpty(sceneReference)) {
                     var scene = await loader.LoadSceneAsset(package.ResolveReference(sceneReference), token);
                     scene.transform.SetParent(worldRoot.transform, false);
+                    backgroundEnabled = true;
                 }
                 var recovery = new WorldSceneRecovery(loader);
                 var items = await recovery.Restore(package, worldID, worldRoot.transform, token);
                 token.ThrowIfCancellationRequested();
                 var restored = 0; foreach (var item in items) if (item.Status == "restored") restored++;
                 SetVisible(true);
-                Status?.Invoke($"已恢复 {restored} 个真实物件；空间包设备与人物恢复仍在迁移。");
+                Status?.Invoke(backgroundEnabled
+                    ? $"空间背景已启用，已恢复 {restored} 个真实物件；人物与设备功能仍在迁移。"
+                    : $"已恢复 {restored} 个真实物件；空间背景未成功载入，人物与设备功能仍在迁移。");
             }
             catch (OperationCanceledException) { }
             catch (Exception error)
@@ -95,6 +103,10 @@ namespace GMGN.UnityPlayer
             }
             visible = value;
             worldRoot.SetActive(value);
+            if (gaussianBackground != null) {
+                if (value) backgroundEnabled = gaussianBackground.ShowCabin();
+                else gaussianBackground.Hide();
+            }
             sculpture.enabled = !value;
             // Both components share PlayerScreen's object. Disable the GPU
             // dispatch/draw component too, without disabling chat or UIDocument.
