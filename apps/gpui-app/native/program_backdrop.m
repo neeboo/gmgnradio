@@ -13,6 +13,7 @@
 @property(nonatomic, weak) NSView *gpui;
 @property(nonatomic, strong) GMGNProgramBackdropRoot *root;
 @property(nonatomic, strong) NSMutableArray<NSVisualEffectView *> *cards;
+@property(nonatomic) double fadeFraction;
 @end
 @implementation GMGNProgramBackdropContext
 @end
@@ -25,6 +26,7 @@ void *gmgn_gpui_program_backdrop_create(void *pointer) {
     GMGNProgramBackdropContext *context = [GMGNProgramBackdropContext new];
     context.gpui = gpui;
     context.cards = [NSMutableArray array];
+    context.fadeFraction = 0.08;
     context.root = [[GMGNProgramBackdropRoot alloc] initWithFrame:gpui.frame];
     context.root.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     context.root.wantsLayer = YES;
@@ -75,12 +77,19 @@ int gmgn_gpui_program_backdrop_apply(void *pointer, const GMGNProgramBackdropCar
         [context.cards addObject:view];
     }
     context.root.frame = context.gpui.frame;
-    CAGradientLayer *mask = [CAGradientLayer layer];
+    CALayer *mask;
+    if (context.fadeFraction > 0) {
+        CAGradientLayer *gradient = [CAGradientLayer layer];
+        gradient.startPoint = CGPointMake(0.5, 0); gradient.endPoint = CGPointMake(0.5, 1);
+        gradient.colors = @[(id)NSColor.clearColor.CGColor, (id)NSColor.blackColor.CGColor,
+                           (id)NSColor.blackColor.CGColor, (id)NSColor.clearColor.CGColor];
+        gradient.locations = @[@0, @(context.fadeFraction), @(1-context.fadeFraction), @1];
+        mask = gradient;
+    } else {
+        mask = [CALayer layer];
+        mask.backgroundColor = NSColor.blackColor.CGColor;
+    }
     mask.frame = CGRectMake(viewport[0], viewport[1], viewport[2], viewport[3]);
-    mask.startPoint = CGPointMake(0.5, 0); mask.endPoint = CGPointMake(0.5, 1);
-    mask.colors = @[(id)NSColor.clearColor.CGColor, (id)NSColor.blackColor.CGColor,
-                    (id)NSColor.blackColor.CGColor, (id)NSColor.clearColor.CGColor];
-    mask.locations = @[@0, @0.08, @0.92, @1];
     context.root.layer.mask = mask;
     for (size_t i = 0; i < count; i++) {
         NSVisualEffectView *view = context.cards[i];
@@ -108,6 +117,13 @@ int gmgn_gpui_program_backdrop_clear(void *pointer) {
     GMGNProgramBackdropContext *context = (__bridge GMGNProgramBackdropContext *)pointer;
     for (NSVisualEffectView *view in context.cards) [view removeFromSuperview];
     [context.cards removeAllObjects]; context.root.hidden = YES; context.root.layer.mask = nil;
+    return 1;
+}
+
+int gmgn_gpui_program_backdrop_set_fade_fraction(void *pointer, double fraction) {
+    if (![NSThread isMainThread] || !pointer || !isfinite(fraction) || fraction < 0 || fraction > 0.5) return 0;
+    GMGNProgramBackdropContext *context = (__bridge GMGNProgramBackdropContext *)pointer;
+    context.fadeFraction = fraction;
     return 1;
 }
 

@@ -1,5 +1,6 @@
 // Standalone structural test; never launches the product or reads user data.
 #import "program_backdrop.h"
+#import <QuartzCore/QuartzCore.h>
 #include <assert.h>
 #include <math.h>
 int main(void) {
@@ -19,6 +20,18 @@ int main(void) {
         assert(gmgn_gpui_program_backdrop_apply(context,&card,1,viewport));
         double values[6]; assert(gmgn_gpui_program_backdrop_diagnostics(context,values));
         assert(values[0]==1 && values[1]==1 && values[2]==0 && values[3]==1 && values[4]==1 && values[5]==1);
+        NSView *root=window.contentView.subviews[1];
+        assert([root.layer.mask isKindOfClass:CAGradientLayer.class]);
+        assert(gmgn_gpui_program_backdrop_set_fade_fraction(context,0));
+        assert(gmgn_gpui_program_backdrop_apply(context,&card,1,viewport));
+        assert(root.layer.mask && ![root.layer.mask isKindOfClass:CAGradientLayer.class]);
+        assert(CGRectEqualToRect(root.layer.mask.frame,CGRectMake(250,100,340,400)));
+        assert(gmgn_gpui_program_backdrop_set_fade_fraction(context,0.08));
+        assert(gmgn_gpui_program_backdrop_apply(context,&card,1,viewport));
+        assert([root.layer.mask isKindOfClass:CAGradientLayer.class]);
+        assert(!gmgn_gpui_program_backdrop_set_fade_fraction(context,-0.01));
+        assert(!gmgn_gpui_program_backdrop_set_fade_fraction(context,0.51));
+        assert(!gmgn_gpui_program_backdrop_set_fade_fraction(context,NAN));
         NSArray *siblings=window.contentView.subviews;
         assert([siblings indexOfObject:renderer] < [siblings indexOfObject:gpui]-1);
         card.matrix[0]=NAN;
@@ -33,7 +46,7 @@ int main(void) {
         assert(gmgn_gpui_program_backdrop_diagnostics(context,values) && values[0]==0 && values[2]==1 && values[4]==0);
         assert(gmgn_gpui_program_backdrop_destroy(context));
         assert(window.contentView.subviews.count==originalCount);
-        fprintf(stderr,"GMGN_BACKDROP_STRUCTURAL_TEST passed=8 visual_acceptance=false\n");
+        fprintf(stderr,"GMGN_BACKDROP_STRUCTURAL_TEST passed=true fade_zero=true fade_008=true invalid_rejected=true visual_acceptance=false\n");
     }
     return 0;
 }

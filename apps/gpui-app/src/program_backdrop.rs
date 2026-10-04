@@ -21,6 +21,7 @@ unsafe extern "C" {
         viewport: *const f64,
     ) -> i32;
     fn gmgn_gpui_program_backdrop_clear(context: *mut c_void) -> i32;
+    fn gmgn_gpui_program_backdrop_set_fade_fraction(context: *mut c_void, fraction: f64) -> i32;
     fn gmgn_gpui_program_backdrop_destroy(context: *mut c_void) -> i32;
     fn gmgn_gpui_program_backdrop_diagnostics(context: *mut c_void, values: *mut f64) -> i32;
 }
@@ -29,6 +30,10 @@ pub struct ProgramBackdrop {
     _main_thread: PhantomData<Rc<()>>,
 }
 impl ProgramBackdrop {
+    /// Set before apply: zero retains the viewport clip without edge fading.
+    pub fn set_fade_fraction(&mut self, fraction: f64) -> bool {
+        unsafe { gmgn_gpui_program_backdrop_set_fade_fraction(self.context, fraction) != 0 }
+    }
     /// Caller supplies a live borrowed GPUI NSView on the macOS main thread.
     pub unsafe fn new(view: *mut c_void) -> Option<Self> {
         let context = unsafe { gmgn_gpui_program_backdrop_create(view) };

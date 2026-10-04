@@ -125,7 +125,7 @@ impl GMGNProductUI {
             let cards=frame.cards.iter().map(|card|program_backdrop::BackdropCard {
                 width:card.width,height:card.height,radius:card.radius,opacity:card.opacity,priority:card.priority as f64,matrix:card.matrix,
             }).collect::<Vec<_>>();
-            context.borrow_mut().as_mut().is_some_and(|backdrop|backdrop.apply(&cards,frame.viewport))
+            context.borrow_mut().as_mut().is_some_and(|backdrop|backdrop.set_fade_fraction(frame.fade_fraction)&&backdrop.apply(&cards,frame.viewport))
         })),cx));
     }
     fn fail(&mut self, id: u64, notice: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -608,7 +608,14 @@ impl Render for GMGNProductUI {
                 transport=transport.child(self.control(id,label,action,if id=="visual"{68.}else{44.},44.,cx));
                 if id=="next" {transport=transport.child(div().w(px(13.)).flex_shrink_0());}
             }
-            root=root.child(transport).child(Button::new("destination").label(if self.runtime_state["stage"]["mode"].as_str()==Some("space"){"回到播放器"}else{"进入空间"}).w(px(112.)).h(px(38.)).absolute().right(px(22.)).top(px(28.)).on_click(cx.listener(|this,_,_,cx|this.overlay_action("destination",cx))));
+            let in_space=self.runtime_state["stage"]["mode"].as_str()==Some("space");
+            root=root.child(transport).child(Button::new("destination").ghost()
+                .label(if in_space{"播放器"}else{"空间"})
+                .accessibility_label(if in_space{"切换到播放器"}else{"进入空间"})
+                .tooltip(if in_space{"返回播放器"}else{"进入空间"})
+                .w(px(112.)).h(px(38.)).rounded(px(19.)).bg(rgba(0x0a0a0ab8))
+                .border_1().border_color(rgba(0x47dbff7a)).text_color(rgb(0x7af2ff)).text_size(px(11.)).font_weight(FontWeight::SEMIBOLD)
+                .absolute().right(px(22.)).top(px(28.)).on_click(cx.listener(|this,_,_,cx|this.overlay_action("destination",cx))));
             if self.runtime_state["screenOperation"]["active"].as_bool()==Some(true) {
                 root=root.child(div().id("stage.screen-operation-banner").absolute().right(px(173.5)).bottom(px(82.)).w(px(226.)).h(px(30.)).flex().items_center().justify_center().rounded_xl().bg(rgba(0x0a4d6beb)).text_sm().child("正在操作电视，按 Esc 退出"));
             }

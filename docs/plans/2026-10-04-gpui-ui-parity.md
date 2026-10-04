@@ -346,6 +346,12 @@ v30完整包exit0，实际PID12373，runtime`/tmp/gmgn-gpui-parity-v30-runtime.l
 
 v31完整包exit0（`/tmp/gmgn-gpui-product-app-build-v31.log`），PID12710，同一数据根，runtime`/tmp/gmgn-gpui-parity-v31-runtime.log`。CUA先通过原装修面板Esc结束摆放，再小窗提交同一句真实请求，request1 accepted→reply；截图文字在气泡内换行，右侧关闭X和六圆入口完整可见。此用户回复换行子路径通过，不计自主后台交付实际通过。未注入语音密钥，本轮原语音提示缺凭据，声音未验收；未录音/登录/删除资产。最后源码复核去掉展开时绕过dismiss的条件，保留关闭语义；此最后窄修仍需新包真实关闭/恢复复验，不能把v31截图扩大为该行为通过。
 
+### v36 修复原空态布局与同帧延迟卡材料
+
+按原Swift真实条件修复空态：内容自然宽141.501945pt、height64/radius22，根右对齐，42+96顶部偏移，无header/ScrollView/contentMargins/railMask。native增加fade_fraction setter，0保留viewport矩形裁剪而不渐隐，轨道.08保留原fade；非法值拒绝，native结构测试通过。材质发布改为最高priority deferred prepaint，保证所有延迟卡真实矩阵收集后、任何前景paint前整批apply，修原tracks frame0生产问题。绑定视频26×26/r13材质使用卡matrix*T(259,8)，同帧失效恢复完整背景，布局/命中/键盘不变。UI93/93 exit0（worker session14866，6.18秒，新增多阶段draw不能与旧测试总时长直接比性能）。App13/13+ABI1/1 exit0（`/tmp/gmgn-gpui-v36-app-tests.log`），完整v36包exit0（`/tmp/gmgn-gpui-product-app-build-v36.log`）。
+
+仅退出原隔离Swift测试App，v36 PID60270同一根，runtime`/tmp/gmgn-gpui-parity-v36-runtime.log`。真实CUA空间打开节目，AX仅“暂无节目”无额外header/refresh；截图约142×64空卡右边及纵向位置与原对照一致，旧306错误消失。仍有waveform形状/字体细节及material候选视觉差异，不能报完整材质一致。主窗口目的地恢复原“播放器/空间”文案、AX/tooltip、112×38/19圆角/原色边框；原系统图标尚未恢复，不能报该按钮全部像素对齐。非空曲库/圆视频按钮仍仅生产draw验证，未真实歌曲验收。
+
 ### 原 Swift 同根空态视觉对照发现布局失败
 
 仅退出v35测试App后，启动原Swift隔离Release包`tmp/e2e-app-build/DerivedData/Build/Products/Release/gmgn radio.app` PID47128，仍用同一隔离真实业务根；原安装App未操作，runtime`/tmp/gmgn-swift-ui-parity-original-runtime.log`。CUA小窗进入空间并打开节目，原截图空态仅waveform与“暂无节目”、约142×64内容宽卡，无“歌单·0”header和刷新按钮；GPUI v35先前306×64大卡及额外header是实际布局失败，不能算空态对齐。当前Swift源码3627–3659确认programList空catalog直接emptyState.padding(top96)，4031–4046仅height64和horizontal20，无306宽约束。正在修准确内容宽与原显隐/外层排布，不缩小完成定义。

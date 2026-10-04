@@ -95,10 +95,41 @@ pub struct ProgramMaterialCard {
     pub height: f64,
     pub radius: f64,
     pub opacity: f64,
-    pub priority: usize,
+    pub priority: f64,
     pub matrix: [f64; 9],
 }
 type MaterialRenderer = Rc<dyn Fn(&ProgramMaterialFrame) -> bool>;
+
+fn material_foreground_svg(svg: String) -> String {
+    svg.replace("fill=\"#1c252d\"", "fill=\"#1c252d\" fill-opacity=\"0\"")
+        .replace("fill=\"#263641\"", "fill=\"#263641\" fill-opacity=\"0\"")
+}
+fn empty_card_width(card: &Value) -> f64 {
+    let text = card["title"].as_str().unwrap_or("暂无节目");
+    let text_width = crate::lyrics::shaped_text_svg(text, 16., 600, 0.)
+        .map_or(text.chars().count() as f64 * 16., |line| line.width);
+    // Original horizontal padding20, spacing12 and SF waveform.path intrinsic
+    // width26 at font18 medium (actual AppKit SymbolConfiguration readback).
+    40. + 12. + 26. + text_width
+}
+
+fn video_material_card(card: &ProgramMaterialCard) -> ProgramMaterialCard {
+    // Original trailing 26pt button: 294 - 26 - 9 = 259; top offset 8.
+    // Compose local translation BEFORE the same final projective matrix.
+    let mut matrix = card.matrix;
+    matrix[2] += matrix[0] * 259. + matrix[1] * 8.;
+    matrix[5] += matrix[3] * 259. + matrix[4] * 8.;
+    matrix[8] += matrix[6] * 259. + matrix[7] * 8.;
+    ProgramMaterialCard {
+        id: format!("{}-video", card.id),
+        width: 26.,
+        height: 26.,
+        radius: 13.,
+        opacity: card.opacity,
+        priority: card.priority + 0.25,
+        matrix,
+    }
+}
 type ProjectionCache = Rc<RefCell<HashMap<String, (String, Arc<ProjectedCard>, Arc<RenderImage>)>>>;
 
 // Match AsyncImage: centered scaledToFill, 42pt square, 12pt rounded clip.
@@ -219,17 +250,19 @@ fn card_svg_content(
     has_artwork: bool,
 ) -> String {
     if card["isEmpty"].as_bool() == Some(true) {
+        let width = empty_card_width(card);
+        let inner_width = width - 1.;
         let label = svg_text(
             card["title"].as_str().unwrap_or("暂无节目"),
-            50.,
+            58.,
             38.,
             16.,
             600,
             "#ffffffd6",
-            236.,
+            width - 78.,
         );
         return format!(
-            r##"<svg xmlns="http://www.w3.org/2000/svg" width="306" height="64" viewBox="0 0 306 64"><rect x=".5" y=".5" width="305" height="63" rx="22" fill="#1c252d"/><rect x=".5" y=".5" width="305" height="63" rx="22" fill="none" stroke="#00ffff" stroke-opacity=".24"/><path d="M20 32h3l2-6 3 12 3-18 3 20 2-8h2" fill="none" stroke="#00ffff" stroke-opacity=".9" stroke-width="1.5"/>{label}</svg>"##
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="64" viewBox="0 0 {width} 64"><rect x=".5" y=".5" width="{inner_width}" height="63" rx="22" fill="#1c252d"/><rect x=".5" y=".5" width="{inner_width}" height="63" rx="22" fill="none" stroke="#00ffff" stroke-opacity=".24"/><path d="M20 32h3l2-6 3 12 3-18 3 20 2-8h2" transform="translate(-8.8889 0) scale(1.444444 1)" fill="none" stroke="#00ffff" stroke-opacity=".9" stroke-width="1.5"/>{label}</svg>"##
         );
     }
     let (w, h, r) = if catalog {
@@ -332,7 +365,7 @@ fn card_svg_content(
 fn card_transform(card: &Value, catalog: bool) -> CardTransform {
     if card["isEmpty"].as_bool() == Some(true) {
         return CardTransform {
-            width: 306.,
+            width: empty_card_width(card),
             height: 64.,
             scale: 1.,
             y_degrees: 0.,
@@ -552,6 +585,37 @@ impl StageProgramRailPane {
     pub fn native_material_frame(&self) -> ProgramMaterialFrame {
         self.material_frame.borrow().clone()
     }
+    fn material_publisher(&self) -> AnyElement {
+        let renderer = self.material_renderer.clone();
+        let frame = self.material_frame.clone();
+        let ready = self.material_ready.clone();
+        let applied = self.material_applied.clone();
+        // Card rows are deferred. This publisher must be deferred after ALL
+        // their prepaints, while still preceding every foreground paint.
+        deferred(
+            canvas(
+                move |_, _, _| {
+                    let success = renderer.as_ref().is_some_and(|renderer| {
+                        if ready.get() {
+                            renderer(&frame.borrow())
+                        } else {
+                            let _ = renderer(&ProgramMaterialFrame::default());
+                            false
+                        }
+                    });
+                    applied.set(success);
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .w(px(1.))
+            .h(px(1.)),
+        )
+        .with_priority(usize::MAX)
+        .into_any_element()
+    }
     fn projected_card(
         &mut self,
         card: &Value,
@@ -630,8 +694,13 @@ impl StageProgramRailPane {
                 // Keep the complete opaque source for same-frame failure recovery
                 // and original rounded-card hit testing; only this foreground
                 // variant removes the base after the native apply succeeds.
-                let svg = card_svg_content(card, &audio, catalog, playlist, artwork.is_some())
-                    .replace("fill=\"#1c252d\"", "fill=\"#1c252d\" fill-opacity=\"0\"");
+                let svg = material_foreground_svg(card_svg_content(
+                    card,
+                    &audio,
+                    catalog,
+                    playlist,
+                    artwork.is_some(),
+                ));
                 self.renderer
                     .render_single_frame(svg.as_bytes(), 1.)
                     .ok()
@@ -716,7 +785,7 @@ impl StageProgramRailPane {
         let accessibility_id = id.clone();
         let canvas = canvas(
             move |bounds, window, _| {
-                let viewport = scroll.bounds();
+                let viewport = if empty { Bounds::new(point(px(0.),px(0.)),window.viewport_size()) } else {scroll.bounds()};
                 let origin = [
                     f64::from(f32::from(bounds.origin.x)),
                     f64::from(f32::from(bounds.origin.y)),
@@ -725,6 +794,7 @@ impl StageProgramRailPane {
                     top: f64::from(f32::from(viewport.origin.y)),
                     height: f64::from(f32::from(viewport.size.height)),
                 };
+                let projection_mask = if empty { None } else {Some(mask)};
                 let phase=if catalog {0.}else{scroll_phase(f64::from(f32::from(bounds.origin.y)),transform.height,mask.top,mask.height)};
                 let amount=phase.abs();
                 let transition=if catalog {None}else{Some(ScrollTransition{scale:1.-0.1*amount,degrees:phase*-13.,axis:[1.,0.16,0.],perspective:0.72,offset_before:[offset,0.]})};
@@ -773,7 +843,7 @@ impl StageProgramRailPane {
                         window_size,
                         window.scale_factor() as f64,
                         opacity,
-                        Some(mask),
+                        projection_mask,
                         transition,
                         effects,
                     )
@@ -791,7 +861,7 @@ impl StageProgramRailPane {
                         let key = format!("{cache_key}/{:p}", Arc::as_ptr(source));
                         foreground = material_cache.borrow().get(&material_id).filter(|(old,_)| old == &key).map(|(_,image)|image.clone());
                         if foreground.is_none() {
-                            foreground = ProjectedCard::render_with_effects(source, transform, origin, window_size, window.scale_factor() as f64, opacity, Some(mask), transition, effects).ok().map(|p|p.render_image());
+                            foreground = ProjectedCard::render_with_effects(source, transform, origin, window_size, window.scale_factor() as f64, opacity, projection_mask, transition, effects).ok().map(|p|p.render_image());
                             if let Some(image) = &foreground { material_cache.borrow_mut().insert(material_id.clone(), (key, image.clone())); }
                         }
                     }
@@ -799,7 +869,9 @@ impl StageProgramRailPane {
                     let mut frame = material_frame.borrow_mut();
                     frame.viewport = [f64::from(f32::from(viewport.origin.x)), mask.top, f64::from(f32::from(viewport.size.width)), mask.height];
                     frame.scale = window.scale_factor() as f64;
-                    frame.cards.push(ProgramMaterialCard { id: material_id, width: transform.width, height: transform.height, radius: if catalog {22.}else{23.}, opacity, priority: material_priority, matrix: projected.source_to_world_matrix() });
+                    let material_card = ProgramMaterialCard { id: material_id, width: transform.width, height: transform.height, radius: if catalog {22.}else{23.}, opacity, priority: material_priority as f64, matrix: projected.source_to_world_matrix() };
+                    if video { frame.cards.push(video_material_card(&material_card)); }
+                    frame.cards.push(material_card);
                 }
                 Some((projected, image, foreground))
             },
@@ -992,10 +1064,6 @@ impl Render for StageProgramRailPane {
         }
         self.material_ready.set(true);
         self.material_applied.set(false);
-        let material_renderer = self.material_renderer.clone();
-        let material_frame = self.material_frame.clone();
-        let material_ready = self.material_ready.clone();
-        let material_applied = self.material_applied.clone();
         let tracks = self.snapshot["route"]
             .as_str()
             .is_some_and(|r| r != "programs");
@@ -1020,6 +1088,44 @@ impl Render for StageProgramRailPane {
                 });
                 let _ = window;
             });
+        }
+        let empty_catalog = !tracks
+            && self.snapshot["programs"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+            && self.snapshot["playlists"]
+                .as_array()
+                .is_none_or(Vec::is_empty);
+        if empty_catalog || empty_tracks {
+            self.material_frame.borrow_mut().fade_fraction = 0.;
+            let playlist = tracks && self.snapshot["isPlaylist"].as_bool() == Some(true);
+            let state: AnyElement = if playlist {
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(10.))
+                    .text_size(px(13.))
+                    .child(gpui_kit::component::spinner::Spinner::new())
+                    .child("正在加载歌曲…")
+                    .into_any_element()
+            } else {
+                let card = json!({"id":"empty-state","isEmpty":true,"title":if self.snapshot["planning"].as_bool()==Some(true){"DJ 正在排歌"}else{"暂无节目"}});
+                self.projected_card(&card, true, false, "", window, cx)
+            };
+            return div()
+                .id("stage-program-rail")
+                .capture_any_mouse_down(cx.listener(|this, _, _, _| this.pressed_card = None))
+                .w(px(350.))
+                .h(px(430.))
+                .pt(px(42.))
+                .pr(px(10.))
+                .flex()
+                .flex_col()
+                .items_end()
+                .text_color(rgb(0xe5e7ea))
+                .child(div().mt(px(96.)).child(state))
+                .child(self.material_publisher());
         }
         let mut content = div()
             .flex()
@@ -1290,27 +1396,7 @@ impl Render for StageProgramRailPane {
             // this final prepaint runs. Apply all native layers atomically, then
             // foreground paint selects transparent or opaque images in THIS
             // frame. No 100ms polling, deferred geometry, or failure blank frame.
-            .child(
-                canvas(
-                    move |_, _, _| {
-                        let success = material_renderer.as_ref().is_some_and(|renderer| {
-                            if material_ready.get() {
-                                renderer(&material_frame.borrow())
-                            } else {
-                                let _ = renderer(&ProgramMaterialFrame::default());
-                                false
-                            }
-                        });
-                        material_applied.set(success);
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .top(px(0.))
-                .left(px(0.))
-                .w(px(1.))
-                .h(px(1.)),
-            )
+            .child(self.material_publisher())
     }
 }
 
@@ -1431,7 +1517,20 @@ mod tests {
         }).unwrap();
         draw(&mut cx);
         let empty = latest.borrow().cards[0].clone();
-        assert_eq!((empty.width, empty.height, empty.radius), (306., 64., 22.));
+        assert!(
+            (empty.width - 142.).abs() < 1.,
+            "intrinsic source text/symbol width matches original live ~142pt card"
+        );
+        assert_eq!((empty.height, empty.radius), (64., 22.));
+        assert_eq!(
+            latest.borrow().fade_fraction,
+            0.,
+            "original empty state has no scroll rail mask"
+        );
+        assert!(
+            (empty.matrix[5] - 138.).abs() < 0.01,
+            "original root top42 plus empty padding96, without header or contentMargins18"
+        );
         assert_eq!(empty.matrix[0], 1.);
         assert_eq!(empty.matrix[4], 1.);
         assert_eq!(empty.matrix[6], 0.);
@@ -1441,6 +1540,53 @@ mod tests {
             1,
             "real empty state replaces, not retains, old catalog layers"
         );
+        cx.update_window(handle.into(), |_,window,cx| {
+            stored.borrow().as_ref().unwrap().update(cx, |pane,cx|pane.update_snapshot(json!({"route":"tracks","tracks":[{"slotIndex":0,"trackID":"video-material","title":"真实视频按钮字段","isCurrent":true,"hasBoundVideo":true,"scale":1.,"relativeIndex":0}]}),window,cx));
+        }).unwrap();
+        draw(&mut cx);
+        draw(&mut cx);
+        let frame = latest.borrow().clone();
+        assert_eq!(
+            frame.cards.len(),
+            2,
+            "bound video material is part of the same atomic native frame"
+        );
+        let video = frame
+            .cards
+            .iter()
+            .find(|c| c.id.ends_with("-video"))
+            .unwrap();
+        let track = frame
+            .cards
+            .iter()
+            .find(|c| !c.id.ends_with("-video"))
+            .unwrap();
+        assert_eq!((video.width, video.height, video.radius), (26., 26., 13.));
+        assert_eq!(video.opacity, track.opacity);
+        assert_eq!(video.priority, track.priority + 0.25);
+        let project = |m: &[f64; 9], x: f64, y: f64| {
+            let w = m[6] * x + m[7] * y + m[8];
+            [
+                (m[0] * x + m[1] * y + m[2]) / w,
+                (m[3] * x + m[4] * y + m[5]) / w,
+            ]
+        };
+        for local in [[0., 0.], [26., 0.], [0., 26.], [26., 26.], [13., 13.]] {
+            let a = project(&video.matrix, local[0], local[1]);
+            let b = project(&track.matrix, local[0] + 259., local[1] + 8.);
+            assert!((a[0] - b[0]).abs() < 1e-8 && (a[1] - b[1]).abs() < 1e-8);
+        }
+        result.set(false);
+        draw(&mut cx);
+        cx.update(|cx| {
+            let pane = stored.borrow().as_ref().unwrap().read(cx);
+            assert!(!pane.material_applied.get());
+            let opaque=&pane.card_cache["track-0"].1;
+            let transparent=&pane.material_sources["track-0"].1;
+            let i=((10*opaque.width+272)*4+3) as usize;
+            assert_eq!(opaque.pixels[i],255, "failed callback retains original circle background");
+            assert!(transparent.pixels[i]<opaque.pixels[i], "native-success variant removes only opaque circle/base, preserves overlay and glyph");
+        });
         cx.update_window(handle.into(), |_, window, cx| {
             stored
                 .borrow()
