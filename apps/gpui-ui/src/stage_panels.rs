@@ -569,7 +569,7 @@ impl StagePanelsPane {
                             for(label,command,dangerous)in &actions{
                                 if *dangerous{sub=sub.separator();}
                                 let weak=weak.clone();let command=command.clone();
-                                let item=if *dangerous{PopupMenuItem::element(|_,cx|div().text_color(cx.theme().danger).child("移出素材库"))}else{PopupMenuItem::new(*label)};
+                                let item=if *dangerous{PopupMenuItem::element(|_,cx|div().id("video-remove-menu-label").role(Role::MenuItem).aria_label("移出素材库").text_color(cx.theme().danger).child("移出素材库"))}else{PopupMenuItem::new(*label)};
                                 sub=sub.item(item.on_click(move|_,_,cx|{_=weak.update(cx,|this,cx|{this.commands.push(command.clone());cx.notify();});}));
                             }
                             sub

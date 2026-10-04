@@ -934,7 +934,14 @@ private final class StageContentView: NSView {
     private let renderSurfaceContainer = StageRenderSurfaceHostingView()
     private let worldLoadingView = StageWorldLoadingView()
     private let worldInteractionView: StageWorldInteractionView
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+    // GPUI closes the previous profile window before the next tick mounts the
+    // production surface in its replacement. Keep the original player alive
+    // across that ownerless interval, just like the shared spatial surface.
+    private var metalView: MetalStageView?
+#else
     private weak var metalView: MetalStageView?
+#endif
     private var programRail: StageProgramRailHostingView!
     private var visualPicker: StageVisualPickerHostingView!
     private var transportControls: StageTransportControlsView!

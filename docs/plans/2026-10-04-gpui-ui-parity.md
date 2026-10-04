@@ -346,6 +346,18 @@ v30完整包exit0，实际PID12373，runtime`/tmp/gmgn-gpui-parity-v30-runtime.l
 
 v31完整包exit0（`/tmp/gmgn-gpui-product-app-build-v31.log`），PID12710，同一数据根，runtime`/tmp/gmgn-gpui-parity-v31-runtime.log`。CUA先通过原装修面板Esc结束摆放，再小窗提交同一句真实请求，request1 accepted→reply；截图文字在气泡内换行，右侧关闭X和六圆入口完整可见。此用户回复换行子路径通过，不计自主后台交付实际通过。未注入语音密钥，本轮原语音提示缺凭据，声音未验收；未录音/登录/删除资产。最后源码复核去掉展开时绕过dismiss的条件，保留关闭语义；此最后窄修仍需新包真实关闭/恢复复验，不能把v31截图扩大为该行为通过。
 
+### v34 生命周期修复及危险菜单真实复验
+
+GPUI编译配置下强持有原MetalStageView，普通Swift路径仍weak；原同实例未重建。生产attach/restore容器释放8次回归及宿主build22 exit0（`/tmp/gmgn-gpui-player-lifecycle-build22.log`）。v34完整包exit0（`/tmp/gmgn-gpui-product-app-build-v34.log`），PID23483同一隔离根。真实CUA full→compact→space→compact→player后原点阵播放器画面可见，每次runtime均PRODUCT_SURFACE mounted=true（`/tmp/gmgn-gpui-parity-v34-runtime.log`），本次先前重复切窗挂载失败子路径通过。素材保留一段，菜单AX实际读到“加载”和“移出素材库”；点击加载读回真实素材名已加载，未点击移除。截图点阵与视频叠加背景变化可见，但未独立核对视频连续帧，不报完整视频播放验收。
+
+独立原生背景磨砂桥新增NSVisualEffectView withinWindow，场景与GPUI之间、被动hitTest、实际projective矩阵/viewport mask接口。native8项结构测试、严编译警告、App12/12及ABI1/1 exit0；桥尚未接入节目卡，HUDWindow候选未经原ultraThinMaterial实际视觉对照，不计磨砂通过。下一步接真实每卡几何和主窗生命周期，不改变原布局。
+
+### 后续视频库实际复验与多次切窗失败
+
+使用仓库已有 playing-10s.mov 经ffmpeg正常转码为隔离临时 `/tmp/gmgn-ui-parity-playing-10s.mp4`，通过真实系统文件选择器选中MPEG-4后导入。v32 AX读回真实素材名“gmgn-ui-parity-playing-10s，已加载”、视频亮度0.68；实际滚动到原底部，截图百分比68%，单素材胶囊、二级菜单取消加载及红色移出素材库均可见。取消加载后读回“未加载视频，1段”。未点击移除，未绑定歌曲（真实曲库为空）。危险item截图可见但AX欠标签，源码窄修已补MenuItem及原名称，菜单2测试/App构建通过，待新包AX复验。
+
+真实失败：v32多次full→compact→space→compact→player后仅MOUNT_STRUCTURE accepted，无PRODUCT_SURFACE mounted；播放器持续白底“正在连接原应用场景…”，视频虽入库及状态更新，不能计视频画面通过。检查原StageContentView weak metalView发现旧GPUI container释放、新容器挂载之前可能丢失唯一播放器view实例；修复范围限定GPUI编译配置的生命周期，待构建及反复切窗验证。原背景磨砂独立真实NSVisualEffectView桥正在开发，尚未接入/验收，不计完成。
+
 ### v33 手势结算及 v32 小窗真实复验
 
 v32真实CUA复验：切回空间后原房间与2B人物渲染可见，之前启动白底已恢复。小窗request1因遗留摆放状态拒绝并保留草稿；通过原装修面板打开后Esc结束摆放，回小窗重试request2 accepted→reply，实际回复“回复关闭验收。”。关闭回复气泡后AX关闭按钮消失且截图气泡隐藏；聊天入口收起再展开，同一回复及关闭按钮重新出现。原224×336布局、136高历史、六圆入口均保持，未录音或注入语音凭据，不能扩大为音频验收。
