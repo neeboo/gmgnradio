@@ -15,8 +15,11 @@ the live SceneKit/Metal backdrop is sampled correctly.
   priority. Its row-major 3×3 matrix maps source-local coordinates to GPUI-view
   top-left coordinates; reuse the exact matrix used for foreground projection.
 - The viewport is the actual scroll viewport `[left, top, width, height]`, in
-  the same coordinate system. The material alpha is 0→1 over the top 8%, stays
-  1 until 92%, then fades to 0. This is a transparency mask, not black paint.
+  the same coordinate system. Call `set_fade_fraction` before apply: `0.08`
+  yields alpha 0→1 over the top 8%, stays 1 until 92%, then fades to 0; `0`
+  retains the viewport rectangle clip with no fade (original empty state).
+  Fractions outside `[0,0.5]` or nonfinite values are rejected. These are
+  transparency masks, not black paint. The default is `0.08` for the rail.
 - The foreground must not contain an opaque simulated-material rectangle;
   keep the original translucent tint, border and foreground content.
 - `clear` hides/removes material cards on panel close. Destroy the context
