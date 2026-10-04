@@ -198,6 +198,7 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
         state["isPreparing"] = attachments["isPreparing"]
         state["error"] = attachments["error"]
         state["contextID"] = state["scope"]
+        state["desktopPresence"] = runtime.gpuiDesktopPresenceSnapshot()
         state["uiNavigation"] = ["revision": navigationRevision, "mode": navigationMode,
             "panel": navigationPanel as Any? ?? NSNull(), "settingsPage": navigationSettingsPage]
         if let latest = lines.last(where: { $0["role"] == "agent" })?["text"], (state["reply"] as? String ?? "").isEmpty {
@@ -217,7 +218,13 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
     func action(_ action: String) -> Bool {
         guard started, !stopped else { return false }
         switch action {
-        case "showLiveCam": return navigate(mode: "liveCam")
+        case "showLiveCam":
+            guard runtime.gpuiDesktopPresenceSnapshot()["hasAvatar"] as? Bool == true else {
+                navigationPanel = "presenceGuidance"
+                navigationRevision &+= 1
+                return true
+            }
+            return navigate(mode: "liveCam")
         case "showStage": return navigate(mode: "space")
         case "showPlayer": return navigate(mode: "player")
         case "showSettings": return navigate(mode: navigationMode, panel: "settings")

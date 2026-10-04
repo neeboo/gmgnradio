@@ -806,6 +806,16 @@ extension AppDelegate {
         return true
     }
 
+    func gpuiDesktopPresenceSnapshot() -> [String: Any] {
+        let snapshot = avatarRuntime.snapshot
+        let mode = DesktopPresenceMode.resolve(snapshot: snapshot,
+            isRadioPluginEnabled: RadioPluginAvailability.isEnabled())
+        return ["mode": mode == .orb ? "orb" : "liveCam",
+            "hasAvatar": snapshot.avatar != nil,
+            "guidance": LiveCamPresentationRequest.missingAvatarGuidance,
+            "orbVisible": orbWindowController?.window?.isVisible ?? false]
+    }
+
     func gpuiBuildSubmission(text: String, attachmentIDs: [String]) -> ResidentChatSubmission? {
         guard let store = stageWindowController?.gpuiAttachmentStore, store.canSubmit else { return nil }
         let current = store.attachments

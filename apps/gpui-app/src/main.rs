@@ -12,6 +12,10 @@ mod host_events;
 mod product_host;
 use product_host::ProductHost;
 gpui_kit::actions!(gmgn_product, [Quit,ShowSettings,ShowLiveCam,EscapeStage]);
+
+fn window_still_registered<T: PartialEq>(cached: T, live: impl IntoIterator<Item=T>) -> bool {
+    live.into_iter().any(|id| id == cached)
+}
 unsafe extern "C" {
     fn gmgn_gpui_bitmap_drop_region(view:*mut c_void,x:f64,y:f64,w:f64,h:f64,enabled:i32);
     fn gmgn_gpui_take_bitmap_drop(view:*mut c_void)->*mut c_char;
@@ -242,6 +246,7 @@ impl GMGNProductUI {
                 _=>{}
             }
             match navigation["panel"].as_str() {
+                Some("presenceGuidance")=>self.show_presence_guidance(window,cx),
                 Some("settings")=>self.open_settings_page(navigation["settingsPage"].as_str().unwrap_or("presence"),cx),
                 Some("inbox")=>self.overlay_action("showNotifications",cx),
                 _=>{}
@@ -264,10 +269,31 @@ impl GMGNProductUI {
     fn open_settings(&mut self,cx:&mut Context<Self>) {
         self.open_settings_page("presence",cx);
     }
+    fn show_presence_guidance(&mut self,window:&mut Window,cx:&mut Context<Self>) {
+        let guidance=self.runtime_state["desktopPresence"]["guidance"].as_str().unwrap_or("").to_owned();
+        let weak=cx.entity().downgrade();
+        window.open_dialog(cx,move|dialog,_,_|{
+            let settings=weak.clone();
+            dialog.title("还没有可显示的角色").w(px(420.)).child(div().text_sm().child(guidance.clone()))
+                .footer(div().flex().justify_end().gap_2()
+                    .child(Button::new("presence-guidance-cancel").label("取消").on_click(|_,window,cx|window.close_dialog(cx)))
+                    .child(Button::new("presence-guidance-settings").label("打开角色设置").on_click(move|_,window,cx|{
+                        window.close_dialog(cx);
+                        let settings=settings.clone();
+                        cx.defer(move|cx|{_=settings.update(cx,|this,cx|this.open_settings_page("presence",cx));});
+                    })))
+        });
+    }
     fn open_settings_page(&mut self,page:&str,cx:&mut Context<Self>) {
         self.settings_pane.update(cx,|pane,cx|pane.select_page(page,cx));
         if let Some(handle)=self.settings_window {
-            if handle.update(cx,|_,window,_|window.activate_window()).is_ok() {return;}
+            // A dispatch callback may already lease this window. A failed
+            // synchronous update does not imply that its singleton is closed.
+            if window_still_registered(handle.window_id(),cx.windows().into_iter().map(|window|window.window_id())) {
+                cx.defer(move |cx| {let _=handle.update(cx,|_,window,_|window.activate_window());});
+                return;
+            }
+            self.settings_window=None;
         }
         let pane=self.settings_pane.clone();
         self.settings_window=cx.open_window(WindowOptions {
@@ -587,6 +613,12 @@ impl Render for GMGNProductUI {
 #[cfg(test)]
 mod layout_tests {
     #[test]
+    fn singleton_uses_window_inventory_not_reentrant_update_result() {
+        assert!(super::window_still_registered(7_u64,[3,7]));
+        assert!(!super::window_still_registered(7_u64,[3]));
+        assert!(!super::window_still_registered(7_u64,[]));
+    }
+    #[test]
     fn closing_reply_keeps_history_and_only_hides_that_real_turn() {
         let original=serde_json::json!({"contextID":"world-a","transcript":[{"role":"agent","turnID":"turn-a","text":"相同回复"}]});
         let dismissed=super::latest_reply_revision(&original);
@@ -689,7 +721,11 @@ fn main() {
             quit_host.borrow_mut().take();
             async {}
         }).detach();
-        let compact = std::env::var("GMGN_GPUI_COMPACT").as_deref() == Ok("1");
+        // Initial compact requests use the same real avatar guard as the menu.
+        if std::env::var("GMGN_GPUI_COMPACT").as_deref() == Ok("1") {
+            if let Some(host)=host.borrow().as_ref(){host.action("showLiveCam");}
+        }
+        let compact = false;
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::new(point(px(80.), px(80.)),
                 if compact { size(px(224.), px(336.)) } else { size(px(1180.), px(760.)) }))),
