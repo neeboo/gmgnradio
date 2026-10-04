@@ -345,3 +345,11 @@ CUA实际全局录制按钮呈青色等宽文字；录制激活后输入a、滚�
 v30完整包exit0，实际PID12373，runtime`/tmp/gmgn-gpui-parity-v30-runtime.log`。CUA同一真实业务根在224×336小窗提交文字；原启动摆放状态拒绝且保留草稿。回空间打开装修按Esc后重试，request2 accepted→reply，真实DSH返回“小窗对齐验收。”，切小窗保持同一回复。截图揭示展开用户长文本撑出气泡并挤出关闭按钮，真实失败；补内容min_w(0)，原窗口/气泡宽高保持。
 
 v31完整包exit0（`/tmp/gmgn-gpui-product-app-build-v31.log`），PID12710，同一数据根，runtime`/tmp/gmgn-gpui-parity-v31-runtime.log`。CUA先通过原装修面板Esc结束摆放，再小窗提交同一句真实请求，request1 accepted→reply；截图文字在气泡内换行，右侧关闭X和六圆入口完整可见。此用户回复换行子路径通过，不计自主后台交付实际通过。未注入语音密钥，本轮原语音提示缺凭据，声音未验收；未录音/登录/删除资产。最后源码复核去掉展开时绕过dismiss的条件，保留关闭语义；此最后窄修仍需新包真实关闭/恢复复验，不能把v31截图扩大为该行为通过。
+
+### v32 原居中动画与减少动态效果
+
+节目 active 切换恢复原 240ms easeOut(0,0,0.58,1) 居中动画；首次出现与路由进入仍立即居中。系统减少动态效果由原 NSWorkspace 设置投影，滚轮、新 active、路由切换取消旧任务，并以 generation 阻止旧 next-frame 回调覆盖新位置。小窗重新打开输入区清除已关闭回复 revision，符合原重新展开恢复回复行为，不改变窗口与气泡布局。
+
+完整 UI89/89（`/tmp/gmgn-gpui-v32-ui-tests.log`，1.71秒）、App12/12（`/tmp/gmgn-gpui-v32-app-tests.log`）通过；宿主构建及 v32完整包均exit0，日志`/tmp/gmgn-gpui-v32-host-build.log`、`/tmp/gmgn-gpui-product-app-build-v32.log`。仅退出v31测试App，v32 PID14204使用同一隔离真实业务根，runtime`/tmp/gmgn-gpui-parity-v32-runtime.log`；CUA实际切回播放器后原点阵渲染可见。启动空间首次截图白底，尚未验证其恢复，不能报空间渲染通过。误点窗口入口进入全屏，尚未完成本轮小窗关闭/恢复视觉复验。
+
+CUA实际从原系统文件选择器选择已有 playing-10s.mov 并导入，但素材库未出现新素材；该输入为MOV，原入口限定MP4，不能据此报视频导入成功，后续需有效MP4复验。未删除素材、录音、登录或改凭据。原滚动速度限幅、背景磨砂、真实非空节目切换动画与封面/分页继续待验收；完整UI对齐仍未完成。

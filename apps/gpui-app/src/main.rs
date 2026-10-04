@@ -342,7 +342,7 @@ impl GMGNProductUI {
             self.props_open=false;
         }
         match action {
-            "chat" => {self.chat_open=!self.chat_open;if self.chat_open{self.stage_panel_open=false;self.program_open=false;self.props_open=false;}cx.notify();},
+            "chat" => {self.chat_open=!self.chat_open;if self.chat_open{self.stage_panel_open=false;self.program_open=false;self.props_open=false;if self.compact{self.dismissed_reply_revision=None;}}cx.notify();},
             "visual" => {self.stage_panel_open=!self.stage_panel_open;if self.stage_panel_open{self.chat_open=false;self.program_open=false;self.props_open=false;}cx.notify();},
             "program" => {self.program_open=!self.program_open;if self.program_open{self.chat_open=false;self.stage_panel_open=false;self.props_open=false;}cx.notify();},
             "toggleDecoration" => {

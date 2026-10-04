@@ -358,6 +358,9 @@ pub struct StageProgramRailPane {
     commands: Vec<Value>,
     scroll: ScrollHandle,
     center_active: bool,
+    animate_center: bool,
+    center_task: Option<Task<()>>,
+    center_generation: u64,
     scroll_start: Option<f32>,
     snap_task: Option<Task<()>>,
     renderer: SvgRenderer,
@@ -374,6 +377,9 @@ impl StageProgramRailPane {
             commands: vec![json!({"op":"stage.program.load"})],
             scroll: ScrollHandle::new(),
             center_active: true,
+            animate_center: false,
+            center_task: None,
+            center_generation: 0,
             scroll_start: None,
             snap_task: None,
             renderer: SvgRenderer::new(Arc::new(())),
@@ -405,6 +411,11 @@ impl StageProgramRailPane {
                 || active(&self.snapshot) != active(&snapshot)
             {
                 self.center_active = true;
+                self.animate_center = self.snapshot["route"] == snapshot["route"]
+                    && active(&self.snapshot) != active(&snapshot)
+                    && snapshot["reduceMotion"].as_bool() != Some(true);
+                self.center_task = None;
+                self.center_generation = self.center_generation.wrapping_add(1);
                 self.snap_task = None;
                 self.scroll_start = None;
             }
@@ -414,6 +425,13 @@ impl StageProgramRailPane {
                 self.pressed_card = None;
                 self.projection_cache.borrow_mut().clear();
                 self.focus_handles.clear();
+            }
+            if snapshot["reduceMotion"].as_bool() == Some(true)
+                && self.snapshot["reduceMotion"].as_bool() != Some(true)
+            {
+                self.center_task = None;
+                self.center_generation = self.center_generation.wrapping_add(1);
+                self.animate_center = false;
             }
             self.snapshot = snapshot;
             cx.notify();
@@ -849,15 +867,48 @@ impl Render for StageProgramRailPane {
                         .iter()
                         .position(|card| card["isCurrent"].as_bool() == Some(true))
                 }) {
-                    let scroll = self.scroll.clone();
-                    window.on_next_frame(move |window, _| {
-                        let viewport: f32 = scroll.bounds().size.height.into();
-                        let maximum: f32 = scroll.max_offset().y.into();
-                        scroll.set_offset(point(
-                            px(0.),
-                            px(active_center_offset(index, viewport, maximum.abs())),
-                        ));
-                        window.refresh();
+                    let view = cx.entity().downgrade();
+                    let generation = self.center_generation;
+                    window.on_next_frame(move |window, cx| {
+                        _ = view.update(cx, |this, cx| {
+                            if generation != this.center_generation {
+                                return;
+                            }
+                            let viewport: f32 = this.scroll.bounds().size.height.into();
+                            let maximum: f32 = this.scroll.max_offset().y.into();
+                            let target = active_center_offset(index, viewport, maximum.abs());
+                            let start: f32 = this.scroll.offset().y.into();
+                            if !this.animate_center || (target - start).abs() < 0.01 {
+                                this.scroll.set_offset(point(px(0.), px(target)));
+                                window.refresh();
+                                return;
+                            }
+                            this.center_task = Some(cx.spawn_in(window, async move |view, cx| {
+                                let began = std::time::Instant::now();
+                                loop {
+                                    cx.background_executor()
+                                        .timer(std::time::Duration::from_millis(16))
+                                        .await;
+                                    let progress = (began.elapsed().as_secs_f64() / 0.24).min(1.);
+                                    let offset = start
+                                        + (target - start) * ease_out_progress(progress) as f32;
+                                    let keep = view
+                                        .update_in(cx, |this, window, cx| {
+                                            if this.center_generation != generation {
+                                                return false;
+                                            }
+                                            this.scroll.set_offset(point(px(0.), px(offset)));
+                                            window.refresh();
+                                            cx.notify();
+                                            true
+                                        })
+                                        .unwrap_or(false);
+                                    if !keep || progress >= 1. {
+                                        break;
+                                    }
+                                }
+                            }));
+                        });
                     });
                 }
                 self.center_active = false;
@@ -969,6 +1020,9 @@ impl Render for StageProgramRailPane {
                             if !tracks {
                                 return;
                             }
+                            this.center_task = None;
+                            this.center_generation = this.center_generation.wrapping_add(1);
+                            this.center_active = false;
                             if this.scroll_start.is_none()
                                 || event.touch_phase == TouchPhase::Started
                             {
@@ -1007,6 +1061,26 @@ impl Render for StageProgramRailPane {
 fn active_center_offset(index: usize, viewport: f32, maximum: f32) -> f32 {
     -(18. + index as f32 * (TRACK_HEIGHT + TRACK_SPACING) + TRACK_HEIGHT / 2. - viewport / 2.)
         .clamp(0., maximum)
+}
+// SwiftUI's easeOut timing curve: cubic Bezier (0, 0, 0.58, 1).
+// Solve time (x) first; applying the y polynomial directly would change timing.
+fn ease_out_progress(time: f64) -> f64 {
+    let time = time.clamp(0., 1.);
+    if time == 0. || time == 1. {
+        return time;
+    }
+    let (mut lo, mut hi) = (0., 1.);
+    for _ in 0..32 {
+        let t = (lo + hi) / 2.;
+        let x = 3. * (1. - t) * t * t * 0.58 + t * t * t;
+        if x < time {
+            lo = t;
+        } else {
+            hi = t;
+        }
+    }
+    let t = (lo + hi) / 2.;
+    3. * (1. - t) * t * t + t * t * t
 }
 
 #[cfg(test)]
@@ -1078,6 +1152,37 @@ mod tests {
         });
         cx.update_window(projected.into(), |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
+        cx.update_window(tracks.into(), |_, window, cx| {
+            let pane = track_pane.borrow().as_ref().unwrap().clone();
+            pane.update(cx, |pane, cx| {
+                assert!(!pane.animate_center, "first appearance must remain immediate");
+                let original_generation = pane.center_generation;
+                pane.update_snapshot(json!({"route":"tracks","tracks":[{"slotIndex":1,"isCurrent":true}]}), window, cx);
+                assert!(pane.animate_center, "active change uses the original .24s animation");
+                assert!(pane.center_generation > original_generation);
+                pane.update_snapshot(json!({"route":"tracks","reduceMotion":true,"tracks":[{"slotIndex":2,"isCurrent":true}]}), window, cx);
+                assert!(!pane.animate_center);
+                assert!(pane.center_task.is_none());
+                let generation = pane.center_generation;
+                pane.update_snapshot(json!({"route":"programs","tracks":[]}), window, cx);
+                assert!(!pane.animate_center, "route appearance is not an active-change animation");
+                assert!(pane.center_generation > generation);
+                assert!(pane.center_task.is_none());
+            });
+        }).unwrap();
+    }
+    #[test]
+    fn ease_out_matches_original_curve_and_240ms_endpoints() {
+        assert_eq!(super::ease_out_progress(0.), 0.);
+        assert_eq!(super::ease_out_progress(0.24 / 0.24), 1.);
+        assert!((super::ease_out_progress(0.5) - 0.684643187).abs() < 1e-8);
+        assert!(super::ease_out_progress(0.25) > 0.25);
+        for i in 0..100 {
+            assert!(
+                super::ease_out_progress(i as f64 / 100.)
+                    <= super::ease_out_progress((i + 1) as f64 / 100.)
+            );
+        }
     }
     #[test]
     fn playlist_pagination_uses_real_busy_and_last_four_visibility_without_repeating() {

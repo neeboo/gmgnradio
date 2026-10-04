@@ -403,6 +403,7 @@ extension AppDelegate {
             "loadedTrackCount": playlist?.tracks.count ?? model.cards.count,
             "totalTrackCount": playlist?.trackCount ?? model.cards.count,
             "playlistLoading": playlist.map { musicLibraryStore.loadingPlaylistIDs.contains($0.id) } ?? false,
+            "reduceMotion": NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
             "planning": programStore.status == .planning,
             "audioFeatures": gpuiAudioFeaturesSnapshot(),
             "emptyMessage": programStore.status == .planning ? "DJ 正在排歌" : playlist != nil ? "正在加载歌曲…" : "暂无节目",
