@@ -11,6 +11,9 @@ namespace GMGN.UnityPlayer
         UIDocument document;
         bool active, dragging;
         float yaw, pitch;
+        const float WalkSpeed = 3f;
+        const float FastSpeed = 8f;
+        const float LookSensitivity = .24f;
         public void Configure(Camera camera, UIDocument ui) { view = camera; document = ui; }
         public void SetActive(bool value)
         {
@@ -34,7 +37,9 @@ namespace GMGN.UnityPlayer
             if (mouse.rightButton.wasPressedThisFrame) dragging = true;
             if (dragging && mouse.rightButton.isPressed) {
                 var delta = mouse.delta.ReadValue();
-                yaw += delta.x * .12f; pitch = Mathf.Clamp(pitch - delta.y * .12f, -85, 85);
+                // Mouse delta is already accumulated for this frame; do not
+                // multiply it by deltaTime and make dragging frame-rate dependent.
+                yaw += delta.x * LookSensitivity; pitch = Mathf.Clamp(pitch - delta.y * LookSensitivity, -85, 85);
                 view.transform.rotation = Quaternion.Euler(pitch, yaw, 0);
             }
             var movement = Vector3.zero;
@@ -44,9 +49,9 @@ namespace GMGN.UnityPlayer
                 if (keyboard.sKey.isPressed) movement -= view.transform.forward;
                 if (keyboard.dKey.isPressed) movement += view.transform.right;
                 if (keyboard.aKey.isPressed) movement -= view.transform.right;
-                if (movement.sqrMagnitude > 0) movement = movement.normalized * Time.unscaledDeltaTime * (keyboard.shiftKey.isPressed ? 4 : 1.5f);
+                if (movement.sqrMagnitude > 0) movement = movement.normalized * Time.unscaledDeltaTime * (keyboard.shiftKey.isPressed ? FastSpeed : WalkSpeed);
             }
-            movement += view.transform.forward * Mathf.Clamp(mouse.scroll.ReadValue().y / 120f, -4, 4) * .4f;
+            movement += view.transform.forward * Mathf.Clamp(mouse.scroll.ReadValue().y / 120f, -4, 4) * 1.2f;
             view.transform.position += movement;
         }
 
