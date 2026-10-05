@@ -15,8 +15,8 @@ namespace GMGN.UnityPlayer
         static StringTable table;
         static string requestedLocale;
         static bool started;
-        public static string LocaleCode => table?.LocaleIdentifier.Code;
-        public static string Get(string key) => table?.GetEntry(key)?.LocalizedValue ?? "";
+        public static string LocaleCode => table == null ? null : table.LocaleIdentifier.Code;
+        public static string Get(string key) => table == null ? "" : table.GetEntry(key)?.LocalizedValue ?? "";
         // Existing panel callers may pass the host preference; selection is centralized above.
         public static string Get(string key, string locale) => Get(key);
 
@@ -26,6 +26,10 @@ namespace GMGN.UnityPlayer
             requestedLocale = code;
             if (!started) {
                 started = true;
+                LocalizationSettings.StartupLocaleSelectors.Clear();
+                LocalizationSettings.StartupLocaleSelectors.Add(new SpecificLocaleSelector {
+                    LocaleId = new LocaleIdentifier(code)
+                });
                 LocalizationSettings.SelectedLocaleChanged += LoadTable;
                 LocalizationSettings.InitializationOperation.Completed += operation => {
                     if (operation.Status != AsyncOperationStatus.Succeeded) {
@@ -46,6 +50,9 @@ namespace GMGN.UnityPlayer
 
         static void LoadTable(Locale selected)
         {
+            // Locale changes release the previous Addressables table. Do not
+            // read that Unity object while the replacement is loading.
+            table = null;
             LocalizationSettings.StringDatabase.GetTableAsync(TableName, selected).Completed += operation => {
                 if (LocalizationSettings.SelectedLocale != selected) return;
                 if (operation.Status != AsyncOperationStatus.Succeeded || operation.Result == null) {

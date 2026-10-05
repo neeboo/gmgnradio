@@ -14,6 +14,7 @@
 - v60 Release/package/签名验证通过并替换独立 v59；直接启动打包的专用 GPUI helper（同隔离 endpoint），实际截图确认语言下拉与侧栏左右边界对齐，字重/字号不再独立放大，并显示该设置窗口。直接启动不代表工具栏设置点击验收；真实拖放与回复输出音频仍待验证。
 - v62：Unity 使用官方 Localization 1.5.13、SelectedLocale 和 String Tables，40 键×3语言共120项校验通过，Addressables 内容生成与 Host/Player Release、签名通过。实际窗口确认英文 Settings/Space、日文 設定/空間，随后恢复中文；设置留在 GPUI，补音乐账号/语音/居民人格正文三语，4项 i18n 和11项设置测试通过。尚未全量翻译音乐库及所有设置正文。
 - 通知接入正式 Rust inbox state_read/state_commit，不另建数据库；打开列表不标读，点击具体事件需 CAS 保存并权威读回才更新已读。模拟传输回归覆盖冲突、读回失败、旧事件、缺 scope、关闭取消待执行任务及重新创建桥恢复；真实 App 点击、真实 taskd 重启仍待验收。通知背景已屏蔽空间鼠标穿透。v62 隔离实例已替换 v60，保持有声测试；CUA 点击返回 noWindowsAvailable，未把构建和截图计为交互通过。
+- v64 替换 v62/v63：实际运行发现并修复语言表释放后读取异常，以及启动 selector 反序列化空引用；初始化前显式配置官方 SpecificLocaleSelector，切换时清除旧表并使用 Unity 对象空值语义。Release/签名通过，连续6次中英日 Host API切换返回200，最终中文截图正常，当前日志无本地化异常；窗口空间+歌词场景约73fps、采样 framesOver50ms=0，未覆盖所有点阵或全屏。通知生产桥/存储/客户端源码的模拟传输回归由主代理复跑退出0。
 
 ## 已实现
 
