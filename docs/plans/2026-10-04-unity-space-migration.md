@@ -104,4 +104,6 @@ v21 同时运行旧测试版时出现 33–39fps，关闭全部已验证临时�
 - v46 全屏稳定 Update 73.7–74.4fps；v47 全屏稳定 73.0–73.8fps，稳定采样 framesOver50ms=0，启动仍有长帧。这是 Update 日志，未当作 GPU 呈现耗时或全部性能验收通过。实际日志：tmp/unity-space-runtime-v46.log、tmp/unity-space-runtime-v47.log、tmp/unity-space-runtime-v47b.log。
 - v49 Release 再次构建通过。浮名补回原受限文字框、左右对齐、三行限制及视距模糊；实际 descriptor 检查覆盖 720/1440 宽左右边界，实际窗口右侧上下文已完整显示，后续继续核对左侧/长文本与镜头过渡。辉光透明目标独立 alpha blending 修正，避免覆盖率被乘两次；流光实际画面无重影、无多余气泡框、空间保持显示。运行日志 tmp/unity-space-runtime-v49.log，构建日志 tmp/unity-player-build-v49.log；目前窗口 1440×900，测试静音。
 
+- v49 随真实歌曲继续播放后补验左侧：同一“君の胸には しっかり”上一句在左边保留完整文字及边距，不再出现 v47 的左侧裁切；左右样例本轮均已可读。长文本三行/镜头过渡、原主题精确比对仍未全量通过。
+
 运行入口：GMGN_UNITY_WORLD_PACKAGE、GMGN_UNITY_WORLD_ID；背景引用通过 GMGN_UNITY_WORLD_SCENE_REFERENCE 指向备份 referenceBindings 的原始引用。不写入备份，不启动自主行动，不覆盖已装 App。
