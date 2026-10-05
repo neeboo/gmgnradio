@@ -313,9 +313,11 @@ struct LivingWorldBootstrapTests {
         #expect(Set(anchorsByEntry.keys) == Set(manifest.waypoints.map(\.id)))
 
         for anchor in manifest.activities.sorted(by: { $0.id < $1.id }) {
+            let entryWaypointID = try #require(anchor.entryWaypointID)
+            let anchorTransform = try #require(anchor.transform)
             let path = try router.route(
                 from: spawn,
-                to: anchor.entryWaypointID
+                to: entryWaypointID
             )
             if anchor.entryWaypointID != "wp.spawn" {
                 #expect(
@@ -338,7 +340,7 @@ struct LivingWorldBootstrapTests {
                 cursor = destination
             }
 
-            let anchorPosition = Self.simd(anchor.transform.position)
+            let anchorPosition = Self.simd(anchorTransform.position)
             #expect(
                 simdDistance(cursor, anchorPosition) <= 0.08,
                 "Entry transform is outside the 8 cm tolerance for \(anchor.id)"
@@ -360,11 +362,12 @@ struct LivingWorldBootstrapTests {
         // make sure the anchors agree with their entries so the world context
         // activity executor can park the avatar at the anchor.
         for anchor in manifest.activities {
+            let anchorTransform = try #require(anchor.transform)
             let entry = try #require(
                 manifest.waypoints.first(where: { $0.id == anchor.entryWaypointID })
             )
             let distance = simdDistance(
-                Self.simd(anchor.transform.position),
+                Self.simd(anchorTransform.position),
                 Self.simd(entry.position)
             )
             #expect(

@@ -20,6 +20,7 @@ namespace GMGN.UnityPlayer.Editor
                 PlayerSettings.SetScriptingDefineSymbols(NamedBuildTarget.Standalone, string.IsNullOrEmpty(meshSymbols) ? "GLTFAST_KEEP_MESH_DATA" : meshSymbols + ";GLTFAST_KEEP_MESH_DATA");
             PlayerSettings.SetApplicationIdentifier(NamedBuildTarget.Standalone, "ai.gmgn.unity-sample.player");
             PlayerSettings.fullScreenMode = FullScreenMode.Windowed;
+            PlayerSettings.enableFrameTimingStats = true;
             PlayerSettings.defaultScreenWidth = 1440;
             PlayerSettings.defaultScreenHeight = 900;
             const string materialPath = "Assets/GMGN/Resources/AudioMaterial.mat";

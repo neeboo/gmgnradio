@@ -1199,6 +1199,9 @@ impl AgentSettingsPane {
                     }
                     services = services.child(row);
                 }
+                if self.unity_external {
+                    services = services.child(div().text_xs().child("账号操作只影响当前 Unity 会话；同步完成后，音乐库会显示最新歌单。"));
+                }
                 form = form.child(services);
             }
             2 => {

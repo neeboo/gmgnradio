@@ -34,6 +34,10 @@ extension MusicProviderWebAuthenticating {
 @MainActor
 final class MusicProviderWebLoginController: MusicProviderWebAuthenticating {
     private var activeSession: MusicProviderWebLoginSession?
+    private let dataStore: WKWebsiteDataStore
+
+    init(dataStore: WKWebsiteDataStore = .default()) { self.dataStore = dataStore }
+    func cancel() { activeSession?.cancel() }
 
     func login(providerID: MusicProviderID) async throws -> String {
         guard activeSession == nil else {
@@ -46,7 +50,8 @@ final class MusicProviderWebLoginController: MusicProviderWebAuthenticating {
         return try await withCheckedThrowingContinuation { continuation in
             let session = MusicProviderWebLoginSession(
                 providerID: providerID,
-                url: url
+                url: url,
+                dataStore: dataStore
             ) { [weak self] result in
                 self?.activeSession = nil
                 continuation.resume(with: result)
@@ -57,7 +62,7 @@ final class MusicProviderWebLoginController: MusicProviderWebAuthenticating {
     }
 
     func clearSession(providerID: MusicProviderID) async {
-        let cookieStore = WKWebsiteDataStore.default().httpCookieStore
+        let cookieStore = dataStore.httpCookieStore
         let cookies = await withCheckedContinuation { continuation in
             cookieStore.getAllCookies { continuation.resume(returning: $0) }
         }
@@ -89,22 +94,25 @@ private final class MusicProviderWebLoginSession:
     private var webView: WKWebView?
     private var pollTimer: Timer?
     private var isFinished = false
+    private let dataStore: WKWebsiteDataStore
 
     init(
         providerID: MusicProviderID,
         url: URL,
+        dataStore: WKWebsiteDataStore,
         completion: @escaping (Result<String, Error>) -> Void
     ) {
         self.providerID = providerID
         initialURL = url
+        self.dataStore = dataStore
         self.completion = completion
-        cookieStore = WKWebsiteDataStore.default().httpCookieStore
+        cookieStore = dataStore.httpCookieStore
         super.init()
     }
 
     func start() {
         let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
+        configuration.websiteDataStore = dataStore
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
@@ -299,6 +307,8 @@ private final class MusicProviderWebLoginSession:
         """
         webView.evaluateJavaScript(script)
     }
+
+    func cancel() { finish(.failure(MusicProviderWebLoginError.cancelled)) }
 
     private func finish(
         _ result: Result<String, Error>,

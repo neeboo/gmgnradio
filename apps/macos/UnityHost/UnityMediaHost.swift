@@ -22,7 +22,7 @@ final class UnityMediaHost {
     private let visualDirection: StageVisualDirectionStore
     private let visualTimeline = StageVisualPresetTimeline()
     private let visualEpoch = ProcessInfo.processInfo.systemUptime
-    private let lyricsStore = StageLyricsStore()
+    private let lyricsStore: StageLyricsStore
     private var visualRevision: UInt64 = 0
     private var settingsBridge: UnitySettingsBridge?
     private var session: UInt64 = 0
@@ -42,6 +42,7 @@ final class UnityMediaHost {
 
     init(root: URL, defaults: UserDefaults) throws {
         self.root = root
+        lyricsStore = StageLyricsStore(defaults: defaults)
         productSettings = UnityProductSettings(root: root, defaults: defaults)
         visualDirection = StageVisualDirectionStore(defaults: defaults)
         world = UnityWorldBridge(root: root)
@@ -271,6 +272,10 @@ final class UnityMediaHost {
     private func settingsCommand(_ value: [String: Any]) -> Bool {
         guard !closed, let op = value["op"] as? String else { return false }
         switch op {
+        case "settings.load":
+            _ = musicLibrary.settingsCommand(["op": "music.load"])
+            return productSettings.command(value)
+        case "music.load", "music.connect", "music.disconnect", "music.sync": return musicLibrary.settingsCommand(value)
         case "stage.load": return true
         case "stage.player.lyrics": return command(value)
         case "stage.player.cloud":
@@ -286,10 +291,11 @@ final class UnityMediaHost {
 
     private func settingsSnapshot() -> [String: Any] {
         var settings = productSettings.snapshot
-        settings["unity"] = ["availableSections": ["歌词", "视觉效果", "语音播放", "按住说话", "自主行动"],
+        settings["music"] = musicLibrary.settingsSnapshot
+        settings["unity"] = ["availableSections": ["歌词", "视觉效果", "语音播放", "按住说话", "自主行动", "音乐账号与歌单同步"],
                              "availableAgentGroups": ["回复语音", "按住说话", "居民人格"],
                              "autoSpeakSupported": false,
-                             "unavailableMessage": "此设置尚未接入 Unity；角色、快捷键、视频、空间活动与音乐账号仍由原应用管理。"]
+                             "unavailableMessage": "此设置尚未接入 Unity；角色、快捷键、视频与空间活动仍由原应用管理。"]
         return ["version": 1, "revision": visualRevision, "settings": settings,
                 "stage": ["mode": "player", "stageRadioPluginEnabled": true,
                           "player": ["lyrics": StageLyricsVisualMode.allCases.map { ["id": $0.agentValue, "name": $0.displayName] },
@@ -299,7 +305,8 @@ final class UnityMediaHost {
                                      "particleScale": visualDirection.particleSizeMultiplier]],
                 "supportedCommands": ["settings.load", "speech.settings.load", "speech.settings.cancel", "stage.load",
                                       "stage.player.lyrics", "stage.player.cloud", "stage.player.particles", "agent.save",
-                                      "tts.provider", "tts.refresh", "tts.save", "tts.preview", "tts.stop", "asr.provider", "asr.save"]]
+                                      "tts.provider", "tts.refresh", "tts.save", "tts.preview", "tts.stop", "asr.provider", "asr.save",
+                                      "music.load", "music.connect", "music.disconnect", "music.sync"]]
     }
 
     private func pointCloudSnapshot() -> [String: Any] {

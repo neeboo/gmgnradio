@@ -40,8 +40,8 @@ namespace GMGN.UnityPlayer
             detailTitle = new Label(); detailTitle.AddToClassList("music-library-name"); detailSubtitle = new Label(); detailSubtitle.AddToClassList("music-library-secondary");
             info.Add(detailTitle); info.Add(detailSubtitle); detail.Add(info); Element.Add(detail);
             status = new Label("正在读取歌单…"); status.AddToClassList("music-library-status"); Element.Add(status);
-            playlistList = BuildList(playlists, false); trackList = BuildList(tracks, true); trackList.AddToClassList("hidden"); Element.Add(playlistList); Element.Add(trackList);
-            var local = new Button(backend.ChooseMusic) { text = "打开本地音乐…" }; local.AddToClassList("music-library-local"); Element.Add(local);
+            var listRegion = new VisualElement(); listRegion.AddToClassList("music-library-list-region"); Element.Add(listRegion);
+            playlistList = BuildList(playlists, false); trackList = BuildList(tracks, true); trackList.AddToClassList("hidden"); listRegion.Add(playlistList); listRegion.Add(trackList);
             // Resolve the actual toolbar parent: caller may have passed shell.
             var toolbar = parent.Q(className: "player");
             if (toolbar?.parent != null) toolbar.parent.Insert(toolbar.parent.IndexOf(toolbar), Element);
@@ -50,9 +50,18 @@ namespace GMGN.UnityPlayer
         }
         ListView BuildList(List<JObject> items, bool isTrack)
         {
-            var list = new ListView { itemsSource = items, fixedItemHeight = isTrack ? 64 : 84, selectionType = SelectionType.None }; list.AddToClassList("music-library-list");
+            var list = new ListView { itemsSource = items, fixedItemHeight = isTrack ? 64 : 84,
+                virtualizationMethod = CollectionVirtualizationMethod.FixedHeight, selectionType = SelectionType.None }; list.AddToClassList("music-library-list");
+            var scroll = list.Q<ScrollView>();
+            scroll.mode = ScrollViewMode.Vertical;
+            scroll.horizontalScrollerVisibility = ScrollerVisibility.Hidden;
+            scroll.verticalScrollerVisibility = ScrollerVisibility.Auto;
+            scroll.contentViewport.AddToClassList("music-library-viewport");
+            scroll.contentContainer.AddToClassList("music-library-content");
             list.makeItem = () => {
+                var slot = new VisualElement(); slot.AddToClassList(isTrack ? "music-library-track-slot" : "music-library-playlist-slot");
                 var row = new Button(); row.AddToClassList(isTrack ? "music-library-track" : "music-library-playlist");
+                slot.Add(row);
                 if (isTrack) { var number = new Label { name = "number" }; number.AddToClassList("music-library-number"); row.Add(number); }
                 else { var cover = new Image { name = "cover", scaleMode = ScaleMode.ScaleAndCrop }; cover.AddToClassList("music-library-cover"); row.Add(cover); }
                 var info = new VisualElement(); info.AddToClassList("music-library-info");
@@ -67,10 +76,10 @@ namespace GMGN.UnityPlayer
                         BindCover(detailCover, (string)item["artworkURL"]); tracks.Clear(); trackList.RefreshItems(); ShowTracks(true); status.text = "正在读取歌单歌曲…";
                         if (!backend.RequestMusicPlaylist(playlistID)) status.text = "歌单正在忙，请返回后重试。";
                     }
-                }; return row;
+                }; return slot;
             };
             list.bindItem = (element, i) => {
-                var row = (Button)element; var item = items[i]; row.userData = item;
+                var row = element.Q<Button>(); var item = items[i]; row.userData = item;
                 var active = isTrack && !string.IsNullOrEmpty(currentTrackID) && (string)item["id"] == currentTrackID;
                 row.EnableInClassList("music-library-current", active); row.Q<Label>("title").text = (string)item[isTrack ? "title" : "name"];
                 row.Q<Label>("subtitle").text = isTrack ? (string)item["artist"] : Provider((string)item["provider"]) + " · " + item["count"] + " 首";

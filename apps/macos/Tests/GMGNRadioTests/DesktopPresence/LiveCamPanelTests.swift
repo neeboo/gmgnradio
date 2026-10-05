@@ -169,23 +169,24 @@ func liveCamPanelCanReplaceItsEnterSpaceHandler() {
 
 @Test
 @MainActor
-func liveCamExposesFiveParallelNavigationButtonsWithChineseLabels() {
+func liveCamExposesFiveParallelNavigationButtonsWithChineseLabels() throws {
     let panel = LiveCamPanel(
         frame: CGRect(x: 0, y: 0, width: 224, height: 336),
         contentView: NSView()
     )
     let view = panel.interactionView
+    let voiceButton = try #require(liveCamVoiceButton(in: view))
 
     #expect(view.spaceButton.accessibilityIdentifier() == "livecam.button.space")
     #expect(view.playerButton.accessibilityIdentifier() == "livecam.button.player")
     #expect(view.chatButton.accessibilityIdentifier() == "livecam.button.chat")
-    #expect(view.voiceButton.accessibilityIdentifier() == "livecam.button.voice")
+    #expect(voiceButton.accessibilityIdentifier() == "livecam.button.voice")
     #expect(view.settingsButton.accessibilityIdentifier() == "livecam.button.settings")
 
     #expect(view.spaceButton.accessibilityLabel() == "进入空间")
     #expect(view.playerButton.accessibilityLabel() == "播放器")
     #expect(view.chatButton.accessibilityLabel() == "文字聊天")
-    #expect(view.voiceButton.accessibilityLabel()?.isEmpty == false)
+    #expect(voiceButton.accessibilityLabel()?.isEmpty == false)
     #expect(view.settingsButton.accessibilityLabel() == "设置")
 
     #expect(view.spaceButton.toolTip == "进入空间")
@@ -565,7 +566,7 @@ func liveCamComposerSendsTrimmedTextAndReturnsToObservation() {
 
 @Test
 @MainActor
-func liveCamVoiceEntryAndAgentReplyStayInsideThePortal() {
+func liveCamVoiceEntryAndAgentReplyStayInsideThePortal() throws {
     var voiceRequests = 0
     let panel = LiveCamPanel(
         frame: CGRect(x: 0, y: 0, width: 224, height: 336),
@@ -573,13 +574,26 @@ func liveCamVoiceEntryAndAgentReplyStayInsideThePortal() {
         onToggleVoice: { voiceRequests += 1 }
     )
 
-    panel.interactionView.voiceButton.performClick(nil)
+    let voiceButton = try #require(liveCamVoiceButton(in: panel.interactionView))
+    voiceButton.performClick(nil)
     panel.showAgentReply("我找到一张很适合夜晚的唱片。")
     panel.setVoiceState(.connected)
 
     #expect(voiceRequests == 1)
     #expect(panel.interactionView.replyText == "我找到一张很适合夜晚的唱片。")
     #expect(!panel.interactionView.isReplyHidden)
+}
+
+@MainActor
+private func liveCamVoiceButton(in view: NSView) -> NSButton? {
+    if let button = view as? NSButton,
+       button.accessibilityIdentifier() == "livecam.button.voice" {
+        return button
+    }
+    for child in view.subviews {
+        if let button = liveCamVoiceButton(in: child) { return button }
+    }
+    return nil
 }
 
 @Test

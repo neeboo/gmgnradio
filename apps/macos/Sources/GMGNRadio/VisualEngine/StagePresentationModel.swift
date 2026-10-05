@@ -1008,12 +1008,24 @@ enum StageLyricSectionClassifier {
 
 @MainActor
 final class StageLyricsStore: ObservableObject {
-    static let shared = StageLyricsStore()
+    static let shared = StageLyricsStore(defaults: .standard)
+    static let visualModePreferenceKey = "stage.lyrics.visualMode"
+    private let defaults: UserDefaults?
 
     @Published private(set) var trackID: String?
     @Published private(set) var lines: [StageLyricLine] = []
     @Published private(set) var visualMode: StageLyricsVisualMode = .automatic
     @Published private(set) var activeTheme: StageAITheme?
+
+    /// Explicit injection keeps test stores and isolated render hosts from
+    /// reading or writing the installed application's preference domain.
+    init(defaults: UserDefaults? = nil) {
+        self.defaults = defaults
+        if let stored = defaults?.string(forKey: Self.visualModePreferenceKey),
+           let mode = StageLyricsVisualMode.allCases.first(where: { $0.agentValue == stored }) {
+            visualMode = mode
+        }
+    }
 
     func publish(
         _ lyrics: MusicLyrics,
@@ -1032,6 +1044,7 @@ final class StageLyricsStore: ObservableObject {
 
     func setVisualMode(_ mode: StageLyricsVisualMode) {
         visualMode = mode
+        defaults?.set(mode.agentValue, forKey: Self.visualModePreferenceKey)
     }
 
     @discardableResult

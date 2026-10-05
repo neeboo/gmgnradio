@@ -20,6 +20,7 @@ namespace GMGN.UnityPlayer
         public string Status { get; private set; } = "Not initialized";
         public bool IsGpuReady => compute != null && material != null;
         public bool StageRendering { get; set; }
+        public Quaternion StageRotation { get; set; } = Quaternion.identity;
         GraphicsBuffer seeds, points;
         ComputeShader compute;
         Material material;
@@ -80,15 +81,16 @@ namespace GMGN.UnityPlayer
         {
             if (!IsGpuReady || PointCount == 0) return;
             if(StageRendering&&primaryVisibility<=0&&ambientVisibility<=0)return;
+            var submitStart = System.Diagnostics.Stopwatch.GetTimestamp();
             compute.SetInt("_PointCount", PointCount);
             compute.SetFloat("_Clock", clock);
             compute.SetVector("_Features", features);
             if(StageRendering){compute.SetVector("_Preset",preset);compute.SetVector("_Rhythm",rhythm);compute.SetVector("_WaveA",waveA);compute.SetVector("_WaveB",waveB);compute.SetFloat("_Intensity",intensity);compute.SetFloat("_ParticleScale",Mathf.Clamp(Screen.height/1080f,.72f,2)*particleSize);compute.SetVector("_Layering",new Vector4(primaryVisibility,ambientVisibility,0,0));compute.SetInt("_HasArtwork",artwork!=null?1:0);compute.SetTexture(kernel,"_Artwork",artwork!=null?artwork:Texture2D.grayTexture);}
             compute.Dispatch(kernel, (PointCount + 63) / 64, 1, 1);
-            properties.SetMatrix("_CloudToWorld", transform.localToWorldMatrix);
+            var matrix = transform.localToWorldMatrix * Matrix4x4.Rotate(StageRendering ? StageRotation : Quaternion.identity);
+            properties.SetMatrix("_CloudToWorld", matrix);
             properties.SetInt("_PixelSizing",StageRendering?1:0);
             properties.SetFloat("_StageParticleScale",Mathf.Clamp(Screen.height/1080f,.72f,2)*particleSize);
-            var matrix = transform.localToWorldMatrix;
             var ext = localBounds.extents;
             var x = matrix.MultiplyVector(new Vector3(ext.x, 0, 0));
             var y = matrix.MultiplyVector(new Vector3(0, ext.y, 0));
@@ -102,6 +104,8 @@ namespace GMGN.UnityPlayer
             };
             if(StageRendering)parameters.camera=Camera.main;
             Graphics.RenderPrimitives(parameters, MeshTopology.Triangles, 6, PointCount);
+            if (StageRendering) GpuFrameDiagnostics.RecordStageSubmit(PointCount,
+                (System.Diagnostics.Stopwatch.GetTimestamp() - submitStart) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
         }
 
         void ReleaseBuffers() { seeds?.Dispose(); points?.Dispose(); seeds = null; points = null; PointCount = 0; }

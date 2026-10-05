@@ -102,8 +102,12 @@ endpoint under the explicit Unity root's `TaskService` directory. They do not
 load the original app's speech preferences or endpoint. Only credential presence
 crosses the snapshot; replacement credentials are command inputs.
 The persona is reread and injected into the isolated DSH prompt on every turn.
-Reply reading and microphone capture are not connected to Unity yet. Avatar,
-account management, shortcuts, videos, space activities and generated-space
+Music accounts reuse the real account clients and official web login. Unity
+uses a nonpersistent web cookie store and an isolated session overlay; disconnect
+persists a Unity-only tombstone, leaving original sessions intact. Synchronization
+fetches provider libraries and verifies the isolated `music-library.json` before
+publishing the new library to Unity. Reply reading and microphone capture are not
+connected to Unity yet. Avatar, shortcuts, videos, space activities and generated-space
 settings remain explicitly unavailable in this external window; the original
 GPUI product continues to own their complete settings.
 

@@ -1,19 +1,5 @@
 import Foundation
-
-/// Existing account sessions and library are read-only. Downloads belong to the
-/// isolated Unity root; this adapter does not migrate or mutate account storage.
-private actor UnityReadOnlyMusicSessions: MusicProviderSessionStore {
-    let directory: URL
-    init(directory: URL) { self.directory = directory }
-    func session(for providerID: MusicProviderID) throws -> MusicProviderSession? {
-        let name = providerID.rawValue.utf8.map { String(format: "%02x", $0) }.joined() + ".json"
-        let url = directory.appendingPathComponent(name)
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        return try JSONDecoder().decode(MusicProviderSession.self, from: Data(contentsOf: url))
-    }
-    func save(_ session: MusicProviderSession, for providerID: MusicProviderID) throws { throw MusicProviderClientError.playbackUnavailable }
-    func removeSession(for providerID: MusicProviderID) throws { throw MusicProviderClientError.playbackUnavailable }
-}
+import WebKit
 
 @MainActor
 final class UnityMusicLibraryBridge {
@@ -21,6 +7,17 @@ final class UnityMusicLibraryBridge {
     private let source: URL
     private let root: URL
     private let runtime: MusicRuntime
+    private let accounts: MusicAccountCommandService
+    private let sessions: UnityMusicSessions
+    private let webLogin = MusicProviderWebLoginController(dataStore: .nonPersistent())
+    private let appleMusic = AppleMusicSource()
+    private let libraryStore: SyncedMusicLibraryStore
+    private var accountTask: Task<Void, Never>?
+    private var accountStates: [MusicProviderID: MusicAccountAuthorizationState] = [:]
+    private var syncingProvider: MusicProviderID?
+    private var accountNotice: String?
+    private var accountError = false
+    private var disconnectedProviders = Set<MusicProviderID>()
     private var playlists: [MusicPlaylistSnapshot] = []
     private var generation: UInt64 = 0
     private var emitted: UInt64?
@@ -37,10 +34,109 @@ final class UnityMusicLibraryBridge {
         self.root = root
         source = ProcessInfo.processInfo.environment["GMGN_UNITY_MUSIC_LIBRARY_ROOT"].map { URL(fileURLWithPath: $0) }
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/ai.gmgn.radio")
-        let sessions = UnityReadOnlyMusicSessions(directory: source.appendingPathComponent("secrets/music-sessions"))
+        let sessions = UnityMusicSessions(directory: source.appendingPathComponent("secrets/music-sessions"), root: root)
+        self.sessions = sessions
+        accounts = MusicAccountCommandService(sessions: sessions, neteaseClient: NeteaseMusicProviderClient(), qqMusicClient: QQMusicProviderClient())
+        libraryStore = SyncedMusicLibraryStore(cacheURL: root.appendingPathComponent("music-library.json"))
         runtime = MusicRuntime(netease: NeteaseMusicSource(sessions: sessions, client: NeteaseMusicProviderClient()),
             qqMusic: QQMusicSource(sessions: sessions, client: QQMusicProviderClient()),
             appleMusic: AppleMusicSource(), cache: StreamingMusicCache(rootURL: root.appendingPathComponent("music-cache")))
+        if FileManager.default.fileExists(atPath: root.appendingPathComponent("apple-music-disconnected").path) { disconnectedProviders.insert(.appleMusic) }
+    }
+    var settingsSnapshot: [String: Any] {
+        ["providers": [MusicProviderID.netease, .qqMusic, .appleMusic].map { provider in
+            ["id": provider.rawValue, "name": provider == .netease ? "网易云音乐" : provider == .qqMusic ? "QQ 音乐" : "Apple Music",
+             "connected": accountStates[provider] == .connected, "syncing": syncingProvider == provider,
+             "status": (accountStates[provider] ?? .disconnected).rawValue] as [String: Any]
+        }, "working": accountTask != nil || task != nil, "notice": accountNotice as Any? ?? NSNull(), "hasError": accountError]
+    }
+    func settingsCommand(_ value: [String: Any]) -> Bool {
+        guard !closed, let op = value["op"] as? String, ["music.load", "music.connect", "music.disconnect", "music.sync"].contains(op), accountTask == nil, op == "music.load" || task == nil else { return false }
+        let provider = MusicProviderID(rawValue: value["id"] as? String ?? "")
+        guard op == "music.load" || [MusicProviderID.netease, .qqMusic, .appleMusic].contains(provider) else { return false }
+        accountTask = Task { [weak self] in
+            guard let self else { return }
+            defer { accountTask = nil; syncingProvider = nil }
+            if op == "music.load" {
+                for provider in [MusicProviderID.netease, .qqMusic] {
+                    accountStates[provider] = await accounts.status(providerID: provider)
+                    if (try? await sessions.isDisabled(provider)) == true { disconnectedProviders.insert(provider) }
+                }
+                if FileManager.default.fileExists(atPath: root.appendingPathComponent("apple-music-disconnected").path) { disconnectedProviders.insert(.appleMusic) }
+                accountStates[.appleMusic] = disconnectedProviders.contains(.appleMusic) ? .disconnected : appleState(await appleMusic.access())
+                return
+            }
+            do {
+                accountError = false
+                if op == "music.disconnect" {
+                    if provider != .appleMusic { try await accounts.disconnect(providerID: provider); await webLogin.clearSession(providerID: provider) }
+                    disconnectedProviders.insert(provider); accountStates[provider] = .disconnected
+                    if provider == .appleMusic { try Data().write(to: root.appendingPathComponent("apple-music-disconnected"), options: .atomic) }
+                    try await seedLibrary()
+                    libraryStore.remove(providerID: provider)
+                    let readback = try JSONDecoder().decode(Cache.self, from: Data(contentsOf: root.appendingPathComponent("music-library.json")))
+                    guard readback.version == 1, readback.playlists == libraryStore.playlists else { throw MusicProviderClientError.playbackUnavailable }
+                    playlists = libraryStore.playlists
+                    publishLibrary()
+                    accountNotice = "已断开 Unity 会话中的音乐账号。"; return
+                }
+                if op == "music.connect" {
+                    if provider == .appleMusic {
+                        let state = appleState(await appleMusic.requestAuthorization())
+                        guard state == .connected else { throw MusicProviderClientError.playbackUnavailable }
+                        accountStates[provider] = state
+                    } else {
+                        accountStates[provider] = .authorizing
+                        accountNotice = "请在官方页面完成登录。"
+                        await webLogin.clearSession(providerID: provider)
+                        let cookie = try await webLogin.login(providerID: provider)
+                        try await accounts.connect(providerID: provider, cookie: cookie)
+                        accountStates[provider] = .connected
+                    }
+                    disconnectedProviders.remove(provider)
+                    if provider == .appleMusic, FileManager.default.fileExists(atPath: root.appendingPathComponent("apple-music-disconnected").path) {
+                        try FileManager.default.removeItem(at: root.appendingPathComponent("apple-music-disconnected"))
+                    }
+                }
+                guard accountStates[provider] == .connected else { throw MusicProviderClientError.playbackUnavailable }
+                syncingProvider = provider; accountNotice = "正在同步歌单…"
+                let library = try await runtime.fetchLibrary(providerID: provider)
+                guard !closed, !Task.isCancelled else { return }
+                try await seedLibrary()
+                guard await libraryStore.mergeAndVerifyInBackground(playlists: library.playlists) else { throw MusicProviderClientError.playbackUnavailable }
+                playlists = libraryStore.playlists
+                publishLibrary()
+                accountNotice = "已同步 \(library.playlists.count) 个歌单。"
+            } catch MusicProviderWebLoginError.cancelled {
+                guard !Task.isCancelled else { return }
+                accountStates[provider] = await accounts.status(providerID: provider)
+                accountError = false; accountNotice = "已取消登录。"
+            } catch {
+                guard !Task.isCancelled else { return }
+                if op == "music.connect", provider != .appleMusic { accountStates[provider] = await accounts.status(providerID: provider) }
+                accountError = true; accountNotice = "音乐账号操作未完成，请检查登录状态与网络后重试。"
+            }
+        }
+        return true
+    }
+    private func appleState(_ access: MusicSourceAccess) -> MusicAccountAuthorizationState {
+        switch access { case .local: .connected; case let .accountRequired(state): state }
+    }
+    private func seedLibrary() async throws {
+        guard libraryStore.playlists.isEmpty else { return }
+        let file = source.appendingPathComponent("music-library.json")
+        let inherited = await Task.detached(priority: .utility) { () -> [MusicPlaylistSnapshot] in
+            guard let bytes = try? Data(contentsOf: file), bytes.count <= 32 * 1024 * 1024,
+                  let cache = try? JSONDecoder().decode(Cache.self, from: bytes), cache.version == 1 else { return [] }
+            return cache.playlists
+        }.value
+        guard await libraryStore.mergeAndVerifyInBackground(playlists: inherited.filter { !disconnectedProviders.contains($0.providerID) }) else { throw MusicProviderClientError.playbackUnavailable }
+    }
+    private func publishLibrary() {
+        publish(["status": "completed", "operation": "library", "playlists": playlists.map {
+            ["id": $0.id, "name": $0.name, "provider": $0.providerID.rawValue, "count": $0.trackCount,
+             "artworkURL": $0.artworkURL?.absoluteString ?? ""]
+        }])
     }
     private func publish(_ value: [String: Any]) { response = value; generation &+= 1 }
     func snapshot() -> [String: Any] {
@@ -51,8 +147,9 @@ final class UnityMusicLibraryBridge {
         return value
     }
     func refresh() -> Bool {
-        guard task == nil, !closed else { return false }
-        let file = source.appendingPathComponent("music-library.json")
+        guard task == nil, accountTask == nil, !closed else { return false }
+        let isolated = root.appendingPathComponent("music-library.json")
+        let file = FileManager.default.fileExists(atPath: isolated.path) ? isolated : source.appendingPathComponent("music-library.json")
         task = Task { [weak self] in
             let cache = await Task.detached(priority: .utility) { () -> Cache? in
                 guard let data = try? Data(contentsOf: file), data.count <= 32 * 1024 * 1024 else { return nil }
@@ -63,8 +160,11 @@ final class UnityMusicLibraryBridge {
             guard let cache, cache.version == 1 else {
                 self.publish(["status": "failed", "operation": "library", "code": "library_unavailable", "message": "还没有可读取的歌单，请先在音乐账户中同步歌单。"]); return
             }
-            self.playlists = cache.playlists
-            self.publish(["status": "completed", "operation": "library", "playlists": cache.playlists.map {
+            for provider in [MusicProviderID.netease, .qqMusic] {
+                if (try? await self.sessions.isDisabled(provider)) == true { self.disconnectedProviders.insert(provider) }
+            }
+            self.playlists = cache.playlists.filter { !self.disconnectedProviders.contains($0.providerID) }
+            self.publish(["status": "completed", "operation": "library", "playlists": self.playlists.map {
                 ["id": $0.id, "name": $0.name, "provider": $0.providerID.rawValue, "count": $0.trackCount,
                  "artworkURL": $0.artworkURL?.absoluteString ?? ""]
             }])
@@ -143,5 +243,5 @@ final class UnityMusicLibraryBridge {
         return true
     }
     func clearQueue() { selection?.cancel(); selection = nil; playback.clear() }
-    func close() { closed = true; task?.cancel(); selection?.cancel() }
+    func close() { closed = true; task?.cancel(); selection?.cancel(); accountTask?.cancel(); webLogin.cancel() }
 }

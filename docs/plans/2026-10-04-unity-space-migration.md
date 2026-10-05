@@ -124,3 +124,16 @@ v21 同时运行旧测试版时出现 33–39fps，关闭全部已验证临时�
 - 外部 GPUI 改为真实 Host settings/stage/capabilities 投影，补居民人格与 Rust TTS/ASR 配置/声音目录/试听服务打包；四项 Rust 测试及隔离 taskd 能力查询通过。回复朗读、按住说话消费、角色、账户管理、快捷键、视频、空间活动仍未接入，完整设置不通过。
 - v51 输出音频按 PID 采样为 SILENT；当时真实截图显示暂停，因此不能据此判定播放音频链路失败或通过。启动取消静音；系统音量未改。v52 当前运行。
 - v51/v52 后段自动化输入反复返回 `noWindowsAvailable`，AX/截图与进程仍存在；重绑精确路径、Raise、重置 CUA 后同样失败。未将环境阻断计作验收通过，真实视觉/操作验证继续待办。
+
+### 2026-10-05 真实窗口返工断点
+
+- 保留 v52 构建，另复制到独立 `v52-cua` 测试包并使用唯一 bundle identifier，重新签名验证；只结束原独立测试进程，未修改已安装产品。真实截图出现封面歌单卡片，用户滚动复现水平灰条、底部入口重叠、卡片越过头部及抖动，因此列表验收失败。
+- 已移除用户不需要的本地音乐入口；新增独立列表区域与 ScrollView viewport 裁剪，禁用水平滚动，固定虚拟化 slot 与卡片总行高。源码检查通过，下一 Release 真实滚动与详情验收待办。
+- 对当前独立进程 62559 的六秒 CoreAudio 按进程采样为 AUDIBLE，RMS 0.2315、nonSilentRatio 0.9982，globalTap=false；证据 `tmp/unity-v52-cua-output-audio.jsonl`。仅确认当前播放输出，不代表远端选歌、完整换歌流程通过。
+- 用户固定歌词主题为个人偏好：共享 Store 新增可注入 UserDefaults 保存/恢复；Unity Host 使用原有隔离 defaults。publish/clear 不重置用户主题，显式自动才恢复自动变化。正式 Host 构建退出 0，回归及真实重启 readback 待完成。
+- 用户全屏点阵反馈卡顿：源码为 GPU compute/单次 procedural draw，但现有 UI fps 指标不可作为性能验收；截图尺寸与 Screen 日志不同，已采样当前进程，补充真实 CPU/GPU 帧时序与 render surface 诊断后继续复验。
+- v54 独立 FrameTimingManager 真实读回：全屏 4096×2304、22536 点，若干五秒样本 GPU 3.537–6.044 ms、CPU 13.128–14.025 ms，窗口样本 GPU 0.847–1.459 ms。全屏切换段有 60.8 fps/3 帧超过 50 ms，另一个段 68.9 fps/1 慢帧；不能报告卡顿修复完成，也不能归因 CPU 点阵。证据 `tmp/unity-space-runtime-v54.log`。
+- v55 加播放器点阵鼠标左右键拖动旋转，只更新 GPU 绘制矩阵；聊天、文本框、歌单、滚动区域与按钮阻挡拖动，不改变空间相机。Release 构建/package/签名验证退出 0，已结束前一独立实例并启动 v55；实际拖动、滚动、歌曲切换仍待验收。
+- 歌词偏好三项 Swift Testing 实际通过（exit 0），日志 `tmp/lyrics-preference-tests-isolated.log`；命令级排除使用过期 API 的 AgentConversationServiceTests，完整测试目标未通过。为编译新增 suite 最小修正 LiveCamPanelTests/LivingWorldBootstrapTests/MusicAccountsModelTests，不删除断言或旧 API 测试。
+- GPUI 音乐账号与同步已接真实服务：生产 session 只读回退，连接/断开仅写隔离 overlay/tombstone，官网使用非持久 cookie store，同步后台保存隔离音乐库并验证 readback。Host 与 GPUI Release、隔离账号/库回归通过；真实官网授权与远端同步 UI 流程尚未验收。
+- 用户实际试用 v55 指出鼠标旋转方向反了；v56 反转 yaw/pitch 的拖动符号，保留灵敏度与 UI 阻挡。v56 Release/package/签名验证成功并启动，未据此声称方向或全部交互验收通过。
