@@ -42,3 +42,4 @@ __pycache__/
 # already ignored by that package's own .gitignore; the root one is new with the
 # workspace (the Xcode helper still passes its own explicit --target-dir).
 /target/
+.worktrees

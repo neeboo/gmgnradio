@@ -22,6 +22,9 @@ namespace GMGN.UnityPlayer
         double duration;
         bool follow = true, dirty, refreshing;
         ScrollView chatScroll;
+        ResidentThinkingCloud thinkingCloud;
+        bool userScrolling;
+        int bottomPasses;
         IVisualElementScheduledItem followScroll;
         AudioSculpture sculpture;
         PointCloudArtworkLoader pointArtwork;
@@ -128,15 +131,19 @@ namespace GMGN.UnityPlayer
                 chatScroll.contentContainer.style.minWidth = 0;
             });
             chatScroll.verticalScroller.valueChanged += value => {
-                if (refreshing) return;
+                if (refreshing || !userScrolling) return;
                 follow = value >= chatScroll.verticalScroller.highValue - 36;
                 if (follow) newMessages.AddToClassList("hidden");
             };
+            chatScroll.RegisterCallback<WheelEvent>(_ => { userScrolling = true; followScroll?.Pause(); follow = false; }, TrickleDown.TrickleDown);
+            chatScroll.verticalScroller.RegisterCallback<PointerDownEvent>(_ => { userScrolling = true; followScroll?.Pause(); follow = false; }, TrickleDown.TrickleDown);
+            chatScroll.RegisterCallback<PointerUpEvent>(_ => userScrolling = false, TrickleDown.TrickleDown);
+            chatScroll.contentContainer.RegisterCallback<GeometryChangedEvent>(_ => { if (follow && !refreshing) ScrollToLatest(); });
             newMessages.clicked += () => { follow = true; ScrollToLatest(); };
             send.clicked += Send;
             draft.RegisterValueChangedCallback(_ => UpdateComposer());
             cancel.clicked += () => { if (pending == null) return;
-                try { backend?.Cancel(pending); }
+                try { backend?.Cancel(pending); thinkingCloud.SetPending(false); }
                 catch (Exception) { status.text = "暂时无法停止回复，请稍后重试。"; } };
             draft.RegisterCallback<KeyDownEvent>(e => {
                 if ((e.keyCode != KeyCode.Return && e.keyCode != KeyCode.KeypadEnter) || e.shiftKey) return;
@@ -149,6 +156,8 @@ namespace GMGN.UnityPlayer
             volume.RegisterValueChangedCallback(e => backend?.SetVolume(e.newValue));
             UiLocalization.Changed += ApplyLocale;
             UiLocalization.SelectHostLocale("zh-CN");
+            thinkingCloud = gameObject.AddComponent<ResidentThinkingCloud>();
+            thinkingCloud.Initialize(root);
             sculpture = gameObject.AddComponent<AudioSculpture>();
             pointArtwork = gameObject.AddComponent<PointCloudArtworkLoader>();
             gpuLyrics = gameObject.AddComponent<GpuLyricsView>();
@@ -252,6 +261,7 @@ namespace GMGN.UnityPlayer
             GetComponent<UIDocument>().rootVisualElement.Q<Label>("emptyChat").AddToClassList("hidden");
             indices[pending] = messages.Count; messages.Add(new Message { id = pending, role = "角色", text = "正在回复…", requestText = text });
             dirty = true; draft.SetValueWithoutNotify(""); UpdateComposer();
+            thinkingCloud.SetPending(true);
             try { backend.Send(pending, text); }
             catch (Exception) { OnChat(new ChatUpdate { messageId = pending, error = "消息未发送，请重试。", complete = true }); }
         }
@@ -265,12 +275,13 @@ namespace GMGN.UnityPlayer
             if (message.text == text && !update.complete) return;
             message.text = text;
             dirty = true;
-            if (update.complete && pending == update.messageId) { pending = null; UpdateComposer(); }
+            if (update.complete && pending == update.messageId) { pending = null; thinkingCloud.SetPending(false); UpdateComposer(); }
         }
         void Update()
         {
             BindKeyboard();
             backend?.Tick();
+            userScrolling = false;
             if (!dirty) return;
             dirty = false;
             var offset = chatScroll.scrollOffset;
@@ -282,8 +293,15 @@ namespace GMGN.UnityPlayer
         {
             newMessages.AddToClassList("hidden");
             followScroll?.Pause();
-            followScroll = list.schedule.Execute(() => { if (!follow || chatPanel.ClassListContains("hidden")) return;
-                refreshing = true; list.ScrollToItem(-1); refreshing = false; });
+            bottomPasses = 0;
+            followScroll = list.schedule.Execute(() => {
+                if (!follow || chatPanel.ClassListContains("hidden")) { followScroll?.Pause(); return; }
+                refreshing = true;
+                if (bottomPasses == 0) list.ScrollToItem(-1);
+                chatScroll.scrollOffset = new Vector2(0, Mathf.Max(0, chatScroll.verticalScroller.highValue));
+                refreshing = false;
+                if (++bottomPasses >= 8) followScroll?.Pause();
+            }).Every(16);
         }
         void RestoreDraft(Message message)
         {

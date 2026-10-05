@@ -46,7 +46,8 @@ final class UnityMediaHost {
     init(root: URL, defaults: UserDefaults) throws {
         self.root = root
         lyricsStore = StageLyricsStore(defaults: defaults)
-        productSettings = UnityProductSettings(root: root, defaults: defaults)
+        productSettings = UnityProductSettings(root: root, defaults: defaults,
+            productVoiceDefaults: UserDefaults(suiteName: "ai.gmgn.radio"))
         visualDirection = StageVisualDirectionStore(defaults: defaults)
         world = UnityWorldBridge(root: root)
         musicLibrary = UnityMusicLibraryBridge(root: root)
@@ -57,6 +58,19 @@ final class UnityMediaHost {
         }
         player = LocalMusicPlayer(graph: graph)
         chat = try RenderHostResidentConversation(backend: "dsh", dataRoot: root, defaults: defaults)
+        chat.setMusicStateProvider { [weak self] in
+            guard let self, !self.closed else { return ["hasTrack": false] }
+            return ["hasTrack": self.player.track != nil,
+                    "title": self.libraryTrack?.title ?? self.player.track?.title ?? "",
+                    "artist": self.libraryTrack?.artist ?? "",
+                    "trackID": self.libraryTrack?.id ?? "",
+                    "provider": self.libraryTrack?.providerID.rawValue ?? "local",
+                    "isPlaying": self.player.isGraphPlaying,
+                    "position": self.pausedPosition ?? self.player.playbackPosition,
+                    "duration": self.player.track?.duration ?? 0,
+                    "queueIndex": self.libraryQueueActive ? self.musicLibrary.index : self.queueIndex,
+                    "queueCount": self.libraryQueueActive ? self.musicLibrary.queue.count : self.queue.count]
+        }
         player.setCompletionHandler { [weak self] in
             guard let self else { return }
             _ = self.command(["op": "music.next"])

@@ -50,6 +50,139 @@ pub fn language_command(locale: UiLocale) -> Value {
 // Product-owned UI copy only. Provider/model/voice names and service errors
 // remain original data and are never passed through this catalog.
 const SETTINGS_COPY: &[(&str, &str, &str)] = &[
+    ("Unity 设置连接不可用，请从 Unity 重新打开。", "Unity settings connection unavailable. Reopen settings from Unity.", "Unity 設定接続が利用できません。Unity から設定を開き直してください。"),
+    ("请从 Unity 播放器打开设置。", "Open settings from the Unity player.", "Unity プレーヤーから設定を開いてください。"),
+    ("版本", "Version", "バージョン"),
+    ("秒", "s", "秒"),
+    ("等待渲染", "Waiting for rendering", "描画待ち"),
+    ("当前可管理语音配置、试听与回复朗读；Unity 按住说话尚未接入。", "Voice configuration, preview and reply reading are connected. Unity push-to-talk is not connected yet.", "音声設定、試聴、返信読み上げは接続済みです。Unity の押して話す機能はまだ未接続です。"),
+    ("内置动态", "Built-in motion", "組み込みモーション"),
+    ("内置", "Built-in", "組み込み"),
+    ("更多操作", "More actions", "その他の操作"),
+    ("公开空间 · 无需生成", "Public space · No generation needed", "公開空間 · 生成不要"),
+    ("公开空间", "Public spaces", "公開空間"),
+    ("生成场景", "Generated scenes", "生成シーン"),
+    ("人物位置", "Character position", "キャラクターの位置"),
+    ("人物位置会按当前空间保存", "Character position is saved per space", "キャラクターの位置は空間ごとに保存されます"),
+    ("重置", "Reset", "リセット"),
+    ("W/S 沿视线前后移动，A/D 左右移动", "W/S moves forward/back along the view; A/D moves sideways", "W/S で視線方向に前後移動、A/D で左右移動"),
+    ("镜头复位", "Reset camera", "カメラをリセット"),
+    ("尚未选择角色", "No character selected", "キャラクター未選択"),
+    ("刷新", "Refresh", "更新"),
+    ("选择已安装动作；自然待机可结束当前表演。", "Choose an installed motion; natural idle ends the current performance.", "インストール済みモーションを選択。自然な待機で現在の演技を終了します。"),
+    ("暂无可用动作，请在资产管理中安装。", "No motions available. Install them in asset management.", "利用できるモーションがありません。アセット管理でインストールしてください。"),
+    ("管理角色与动作…", "Manage characters and motions…", "キャラクターとモーションを管理…"),
+    ("活动来自当前空间，角色会走到对应位置再开始。", "Activities belong to this space. The character walks to the location before starting.", "活動は現在の空間に属します。キャラクターは指定位置に移動してから開始します。"),
+    ("这个空间还没有配置生活活动。", "No activities configured for this space.", "この空間には活動が設定されていません。"),
+    ("停止活动", "Stop activity", "活動を停止"),
+    ("空间载入完成后可选择活动。", "Choose an activity after the space loads.", "空間の読み込み後に活動を選択できます。"),
+    ("进入空间后可选择生活活动。", "Enter a space to choose activities.", "空間に入ると活動を選択できます。"),
+    ("导入 MP4", "Import MP4", "MP4 をインポート"),
+    ("关闭", "Close", "閉じる"),
+    ("视频亮度", "Video brightness", "動画の明るさ"),
+    ("未加载视频", "No video loaded", "動画未読み込み"),
+    ("已加载", "Loaded", "読み込み済み"),
+    ("段", "clips", "本"),
+    ("取消加载", "Unload", "読み込み解除"),
+    ("加载", "Load", "読み込み"),
+    ("解除当前歌曲绑定", "Unbind from current track", "現在の曲との関連付けを解除"),
+    ("绑定到当前歌曲", "Bind to current track", "現在の曲に関連付け"),
+    ("移出素材库", "Remove from library", "ライブラリから削除"),
+    ("设置 · Unity 播放器", "Settings · Unity Player", "設定 · Unity プレーヤー"),
+    ("字幕、3D 点阵与视频效果", "Lyrics, 3D particles and video effects", "歌詞、3D パーティクルと動画効果"),
+    ("字幕特效", "Lyric effects", "歌詞エフェクト"),
+    ("3D 点阵", "3D particles", "3D パーティクル"),
+    ("MV 场景", "Music video scene", "ミュージックビデオのシーン"),
+    ("颗粒大小", "Particle size", "粒子サイズ"),
+    ("这些效果用于播放器画面，切回播放器后可查看", "These effects apply to the player view. Switch back to see them.", "効果はプレーヤー画面に適用されます。プレーヤーに戻ると確認できます。"),
+    ("已选择", "Selected", "選択済み"),
+    ("角色内核", "Character engine", "キャラクターエンジン"),
+    ("聊天模型", "Chat model", "チャットモデル"),
+    ("自主行动", "Autonomy", "自律行動"),
+    ("gmgn 角色", "gmgn character", "gmgn キャラクター"),
+    ("策划引擎未登录", "Planning engine signed out", "企画エンジンは未ログインです"),
+    ("退出登录", "Sign out", "ログアウト"),
+    ("登录", "Sign in", "ログイン"),
+    ("Codex 提供策划和推理能力；它与下面的声音共同属于同一个角色。", "Codex provides planning and reasoning, paired with the voice below as one character.", "Codex は企画と推論を担当し、下の音声と同じキャラクターを構成します。"),
+    ("允许角色自动接管", "Allow character control", "キャラクターの自動操作を許可"),
+    ("可以自主切歌、暂停、继续、重排节目和调整视觉。", "May change tracks, pause, resume, reorder programs and adjust visuals.", "曲の変更、一時停止、再開、番組の並べ替え、ビジュアルの調整を行えます。"),
+    ("策划模型", "Planning model", "企画モデル"),
+    ("空间和 Live Cam 共用这里选定的 Agent；文字和语音转写进入同一个会话。", "Spaces and Live Cam share this Agent. Text and voice transcripts enter the same conversation.", "空間と Live Cam はこの Agent を共有します。文字と音声の文字起こしは同じ会話に入ります。"),
+    ("允许居民自主安排活动", "Allow resident autonomous activities", "住人の自律的な活動を許可"),
+    ("打开后，居民会自己观察和行动，会消耗模型额度。设为 0 就不再新起一轮，要先停下请按停止。", "When enabled, the resident observes and acts independently, using model quota. Set 0 to prevent new turns; use Stop to halt the current turn.", "有効にすると住人は自ら観察して行動し、モデルの利用枠を消費します。0 で新しい思考を止め、現在の思考は停止ボタンで止めます。"),
+    ("每小时后台思考预算", "Background thinking budget per hour", "1 時間あたりのバックグラウンド思考枠"),
+    ("按最近一小时算，默认 6。这只数后台思考的次数，不等于请求次数或费用。", "Counts background thinking turns over the last hour; default 6. This is not a request count or cost estimate.", "直近 1 時間のバックグラウンド思考回数です。既定値は 6。リクエスト数や料金とは異なります。"),
+    ("自动朗读 Agent 回复", "Read Agent replies aloud", "Agent の返信を自動読み上げ"),
+    ("0 轮（不再新起）", "0 turns (no new turns)", "0 回（新規思考なし）"),
+    ("轮", "turns", "回"),
+    ("支持 HTTPS 地址指向 VRM、ZIP 或 gmgnpet 模型包。", "Use an HTTPS URL to a VRM, ZIP or gmgnpet model package.", "VRM、ZIP、gmgnpet モデルパッケージの HTTPS URL を指定してください。"),
+    ("从链接导入角色", "Import character from URL", "URL からキャラクターをインポート"),
+    ("从链接导入角色…", "Import character from URL…", "URL からキャラクターをインポート…"),
+    ("取消", "Cancel", "キャンセル"),
+    ("正在下载…", "Downloading…", "ダウンロード中…"),
+    ("下载并安装", "Download and install", "ダウンロードしてインストール"),
+    ("使用 Codex 默认模型", "Use the default Codex model", "Codex の既定モデルを使用"),
+    ("新的 Marble API Key", "New Marble API Key", "新しい Marble API Key"),
+    ("生成服务地址", "Generation service URL", "生成サービスの URL"),
+    ("生成服务密钥", "Generation service key", "生成サービスのキー"),
+    ("粘贴新的 API Key 可覆盖现有配置", "Paste a new API Key to replace the saved one", "新しい API Key を貼り付けて置き換え"),
+    ("粘贴 API Key", "Paste API Key", "API Key を貼り付け"),
+    ("填写新密钥可替换；留空保留现有密钥", "Enter a new key to replace it; leave blank to keep the saved key", "新しいキーで置き換え。空欄なら既存キーを保持"),
+    ("角色", "Character", "キャラクター"),
+    ("呼吸球样式", "Breathing orb style", "呼吸オーブのスタイル"),
+    ("动作", "Motions", "モーション"),
+    ("动作库", "Motion library", "モーションライブラリ"),
+    ("默认空间", "Default space", "既定の空間"),
+    ("当前角色", "Current character", "現在のキャラクター"),
+    ("呼吸球", "Breathing orb", "呼吸オーブ"),
+    ("当前引擎", "Current engine", "現在のエンジン"),
+    ("选择", "Select", "選択"),
+    ("移除角色", "Remove character", "キャラクターを削除"),
+    ("未命名角色", "Untitled character", "名前のないキャラクター"),
+    ("全部", "All", "すべて"),
+    ("这个分类下暂无当前角色可用的动作。", "No motions for this character in this category.", "このカテゴリには現在のキャラクターで使えるモーションがありません。"),
+    ("当前动作", "Current motion", "現在のモーション"),
+    ("移除动作", "Remove motion", "モーションを削除"),
+    ("未命名动作", "Untitled motion", "名前のないモーション"),
+    ("两种角色各有自己的动作列表，切换时会分别记住你选的。", "Each character type has its own motion list and remembers its selection.", "キャラクターの種類ごとにモーション一覧があり、それぞれの選択を保持します。"),
+    ("获取动作列表", "Fetch motions", "モーション一覧を取得"),
+    ("已安装", "Installed", "インストール済み"),
+    ("安装", "Install", "インストール"),
+    ("流光颜色", "Glow color", "発光色"),
+    ("流光强度", "Glow intensity", "発光の強さ"),
+    ("启动时进入", "Open on startup", "起動時に開く"),
+    ("修改后下次启动生效。", "Changes apply on the next launch.", "変更は次回起動時に適用されます。"),
+    ("Marble 空间", "Marble spaces", "Marble の空間"),
+    ("用于同步和生成可探索的 3D 空间", "Sync and generate explorable 3D spaces", "探索できる 3D 空間の同期と生成"),
+    ("已配置", "Configured", "設定済み"),
+    ("未配置", "Not configured", "未設定"),
+    ("只保存在本机，不使用钥匙串。", "Stored locally without Keychain.", "ローカル保存のみ。キーチェーンは使用しません。"),
+    ("清除", "Clear", "消去"),
+    ("保存 Key", "Save Key", "キーを保存"),
+    ("许愿机", "Wish generator", "願いの生成サービス"),
+    ("检测中…", "Checking…", "確認中…"),
+    ("检测连接", "Check connection", "接続を確認"),
+    ("地址和密钥只存在这台电脑上，保存后不会立刻开始生成。", "URL and key are stored only on this computer. Saving does not start generation.", "URL とキーはこのコンピュータだけに保存されます。保存しても生成は始まりません。"),
+    ("功能", "Action", "機能"),
+    ("应用内", "In app", "アプリ内"),
+    ("全局", "Global", "グローバル"),
+    ("请按快捷键", "Press a shortcut", "ショートカットを押してください"),
+    ("未设置", "Not set", "未設定"),
+    ("启用全局快捷键", "Enable global shortcuts", "グローバルショートカットを有効化"),
+    ("gmgn radio 在后台时也能响应。", "Works while gmgn radio is in the background.", "gmgn radio がバックグラウンドでも反応します。"),
+    ("使用系统媒体快捷键", "Use system media keys", "システムのメディアキーを使用"),
+    ("响应键盘上的播放、暂停、上一首和下一首。", "Respond to keyboard play, pause, previous and next keys.", "キーボードの再生、一時停止、前の曲、次の曲キーに反応します。"),
+    ("恢复默认", "Restore defaults", "既定値に戻す"),
+    ("选择角色的形象与表演动作", "Choose character appearance and motions", "キャラクターの外見とモーションを選択"),
+    ("选择默认空间，并管理空间生成服务", "Choose the default space and manage generation services", "既定の空間を選び、空間生成サービスを管理"),
+    ("点击按键框，再按下新的组合键", "Click a key field, then press a new shortcut", "キー欄をクリックして新しい組み合わせを押してください"),
+    ("选择生活空间，调整空间功能", "Choose a living space and adjust its features", "生活空間を選び、機能を調整"),
+    ("选择与控制空间生活活动", "Choose and control activities in the space", "空間での活動を選択・操作"),
+    ("正在读取 Unity 设置能力…", "Loading Unity settings capabilities…", "Unity の設定機能を読み込み中…"),
+    ("导入", "Import", "インポート"),
+    ("角色模型…", "Character model…", "キャラクターモデル…"),
+    ("动作文件…", "Motion file…", "モーションファイル…"),
+    ("此设置尚未接入 Unity；角色、快捷键、视频与空间活动仍由原应用管理。", "This setting is not connected to Unity yet. Characters, shortcuts, video and space activities are still managed by the original app.", "この設定はまだ Unity に未接続です。キャラクター、ショートカット、動画、空間の活動は元のアプリで管理します。"),
     ("音乐服务", "Music services", "音楽サービス"),
     ("居民人格", "Resident persona", "住人の人格"),
     ("角色人格与偏好", "Character persona & preferences", "キャラクターの人格と好み"),
@@ -133,9 +266,41 @@ pub fn settings_notice(locale: UiLocale, source: &str) -> String {
     settings_copy(locale, source).to_owned()
 }
 
+const PLAYER_CHOICES: &[(&str, &str, &str, &str, &str)] = &[
+    ("lyrics", "automatic", "自动", "Automatic", "自動"),
+    ("lyrics", "luminous", "流光", "Luminous", "流光"),
+    ("lyrics", "mindscape", "心象", "Mindscape", "心象"),
+    ("lyrics", "cloud_steps", "云阶", "Cloud Steps", "雲の階段"),
+    ("lyrics", "article", "浮名", "Editorial", "浮名"),
+    ("lyrics", "chorus_chat", "群唱", "Chorus", "合唱"),
+    ("lyrics", "confession", "倾诉", "Confession", "語り"),
+    ("lyrics", "claddagh", "回环", "Orbit", "巡り"),
+    ("lyrics", "monet_poster", "莫奈", "Monet", "モネ"),
+    ("lyrics", "pendulum", "时计", "Pendulum", "時計"),
+    ("lyrics", "diorama", "镜台", "Diorama", "鏡台"),
+    ("lyrics", "folding_verse", "折章", "Folding Verse", "折り詩"),
+    ("clouds", "automatic", "自动", "Automatic", "自動"),
+    ("clouds", "flowingCanvas", "流幕", "Flowing Canvas", "流れる幕"),
+    ("clouds", "orbitalShell", "星球", "Orbital Shell", "惑星"),
+    ("clouds", "openRibbon", "光带", "Light Ribbon", "光の帯"),
+    ("clouds", "vinylRecord", "封面", "Album Cover", "ジャケット"),
+    ("clouds", "galaxyField", "星河", "Galaxy", "銀河"),
+    ("clouds", "tunnel", "滚筒", "Tunnel", "トンネル"),
+    ("clouds", "void", "留白", "Void", "余白"),
+    ("videoModes", "once", "单次", "Once", "1 回"),
+    ("videoModes", "loop", "循环", "Loop", "ループ"),
+    ("videoModes", "randomSequence", "随机拼接", "Random Sequence", "ランダム連結"),
+];
+
+pub fn player_choice_label<'a>(locale: UiLocale, kind: &str, id: &str, original: &'a str) -> &'a str {
+    let Some((_, _, zh, en, ja)) = PLAYER_CHOICES.iter().find(|(k, i, _, _, _)| *k == kind && *i == id) else { return original };
+    // Only known built-in entries are translated, never arbitrary user names.
+    match locale { UiLocale::ZhCn => zh, UiLocale::En => en, UiLocale::Ja => ja }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{NAVIGATION, SETTINGS_COPY, UiLocale, language_command, settings_navigation_label, settings_copy, settings_notice};
+    use super::{NAVIGATION, SETTINGS_COPY, PLAYER_CHOICES, UiLocale, language_command, settings_navigation_label, settings_copy, settings_notice, player_choice_label};
     use serde_json::json;
     #[test]
     fn all_categories_and_secondary_pages_have_three_languages() {
@@ -191,5 +356,25 @@ mod tests {
         assert_eq!(settings_notice(UiLocale::En, "已同步 12 个歌单。"), "Synced 12 playlists.");
         assert_eq!(settings_notice(UiLocale::Ja, "已同步 12 个歌单。"), "12 件のプレイリストを同期しました。");
         assert_eq!(settings_notice(UiLocale::ZhCn, "已同步 12 个歌单。"), "已同步 12 个歌单。");
+    }
+    #[test]
+    fn player_catalogs_translate_all_builtin_modes_without_touching_custom_names() {
+        assert_eq!(PLAYER_CHOICES.iter().filter(|(kind, _, _, _, _)| *kind == "lyrics").count(), 12);
+        assert_eq!(PLAYER_CHOICES.iter().filter(|(kind, _, _, _, _)| *kind == "clouds").count(), 8);
+        let mut keys = std::collections::HashSet::new();
+        for (kind, id, zh, en, ja) in PLAYER_CHOICES {
+            assert!(keys.insert((kind, id)));
+            assert!(!en.is_empty() && !ja.is_empty());
+            assert_eq!(player_choice_label(UiLocale::ZhCn, kind, id, zh), *zh);
+            assert_eq!(player_choice_label(UiLocale::En, kind, id, zh), *en);
+            assert_eq!(player_choice_label(UiLocale::Ja, kind, id, zh), *ja);
+        }
+        for locale in UiLocale::ALL {
+            assert_eq!(player_choice_label(locale, "lyrics", "user-custom", "我的主题"), "我的主题");
+            assert_eq!(settings_navigation_label(locale, "stage.player.lyrics"), "stage.player.lyrics");
+        }
+        assert_eq!(settings_copy(UiLocale::En, "设置 · Unity 播放器"), "Settings · Unity Player");
+        assert_eq!(settings_copy(UiLocale::Ja, "字幕特效"), "歌詞エフェクト");
+        assert_ne!(settings_copy(UiLocale::En, "字幕、3D 点阵与视频效果"), "字幕、3D 点阵与视频效果");
     }
 }

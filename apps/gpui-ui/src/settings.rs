@@ -268,6 +268,7 @@ pub struct AgentSettingsPane {
 }
 impl AgentSettingsPane {
     fn open_import_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let locale = UiLocale::from_settings(&self.snapshot);
         self.import_link_open = true;
         self.import_link_pending = false;
         self.import_link_revision = self.snapshot["presence"]["downloadRevision"]
@@ -284,15 +285,15 @@ impl AgentSettingsPane {
                 .capture_key_down(move|event,window,cx|{
                     if event.keystroke.key=="escape"{_=escape_input.update(cx,|this,cx|{this.import_link_open=false;cx.notify();});window.close_dialog(cx);cx.stop_propagation();}
                 })
-                .child(div().text_sm().child("支持 HTTPS 地址指向 VRM、ZIP 或 gmgnpet 模型包。"))
+                .child(div().text_sm().child(settings_copy(locale, "支持 HTTPS 地址指向 VRM、ZIP 或 gmgnpet 模型包。")))
                 .child(Input::new(&input));
             if let Some(notice)=notice{body=body.child(div().flex().items_center().gap_1().text_xs().text_color(cx.theme().danger).child(Icon::new(IconName::CircleAlert).size(px(14.))).child(notice));}
-            dialog.w(px(460.)).h(px(230.)).p(px(24.)).title("从链接导入角色").close_button(false).overlay_closable(false).child(body)
+            dialog.w(px(460.)).h(px(230.)).p(px(24.)).title(settings_copy(locale, "从链接导入角色")).close_button(false).overlay_closable(false).child(body)
                 .footer(div().flex().justify_end().items_center().gap_2().capture_key_down(move|event,window,cx|{
                     if event.keystroke.key=="escape"{_=escape_footer.update(cx,|this,cx|{this.import_link_open=false;cx.notify();});window.close_dialog(cx);cx.stop_propagation();}
                 })
-                    .child(Button::new("cancel-link").label("取消").on_click(move|_,window,cx|{_=cancel.update(cx,|this,cx|{this.import_link_open=false;cx.notify();});window.close_dialog(cx);} ))
-                    .child(Button::new("import-link").label(if working{"正在下载…"}else{"下载并安装"}).disabled(disabled).on_click(move|_,_,cx|{_=submit.update(cx,|this,cx|{
+                    .child(Button::new("cancel-link").label(settings_copy(locale, "取消")).on_click(move|_,window,cx|{_=cancel.update(cx,|this,cx|{this.import_link_open=false;cx.notify();});window.close_dialog(cx);} ))
+                    .child(Button::new("import-link").label(settings_copy(locale, if working{"正在下载…"}else{"下载并安装"})).disabled(disabled).on_click(move|_,_,cx|{_=submit.update(cx,|this,cx|{
                         this.commands.push(json!({"op":"presence.import.link","url":this.extra_inputs[4].read(cx).value().to_string()}));this.import_link_pending=true;this.import_link_revision=this.snapshot["presence"]["downloadRevision"].as_u64().unwrap_or(0);cx.notify();
                     });})))
                 .on_cancel(move|_,window,cx|{_=escape_action.update(cx,|this,cx|{this.import_link_open=false;cx.notify();});window.close_dialog(cx);true})
@@ -309,7 +310,10 @@ impl AgentSettingsPane {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let weak = cx.entity().downgrade();
-        let (role,name)=presence_more_accessibility(label,asset_name);
+        let locale = UiLocale::from_settings(&self.snapshot);
+        let (role, mut name)=presence_more_accessibility(label,asset_name);
+        if locale != UiLocale::ZhCn { name = format!("{}: {asset_name}", settings_copy(locale, "更多操作")); }
+        let label = settings_copy(locale, label);
         Button::new(id)
             .role(role).accessibility_label(name)
             .icon(IconName::Ellipsis)
@@ -496,8 +500,10 @@ impl AgentSettingsPane {
         for (index, source) in [(0, "居民人格"), (1, "角色人格与偏好")] {
             self.personas[index].update(cx, |input, cx| input.set_placeholder(settings_copy(locale, source), window, cx));
         }
-        self.extra_inputs[2].update(cx,|input,cx|input.set_placeholder(if snapshot["space"]["credentialConfigured"].as_bool()==Some(true){"粘贴新的 API Key 可覆盖现有配置"}else{"粘贴 API Key"},window,cx));
-        self.extra_inputs[6].update(cx,|input,cx|input.set_placeholder(if snapshot["space"]["propCredentialConfigured"].as_bool()==Some(true){"填写新密钥可替换；留空保留现有密钥"}else{"生成服务密钥"},window,cx));
+        self.inputs[2].update(cx,|input,cx|input.set_placeholder(settings_copy(locale, "使用 Codex 默认模型"),window,cx));
+        self.extra_inputs[5].update(cx,|input,cx|input.set_placeholder(settings_copy(locale, "生成服务地址"),window,cx));
+        self.extra_inputs[2].update(cx,|input,cx|input.set_placeholder(settings_copy(locale, if snapshot["space"]["credentialConfigured"].as_bool()==Some(true){"粘贴新的 API Key 可覆盖现有配置"}else{"粘贴 API Key"}),window,cx));
+        self.extra_inputs[6].update(cx,|input,cx|input.set_placeholder(settings_copy(locale, if snapshot["space"]["propCredentialConfigured"].as_bool()==Some(true){"填写新密钥可替换；留空保留现有密钥"}else{"生成服务密钥"}),window,cx));
         if let Some((revision,submitted))=&self.pending_marble{
             if snapshot["space"]["marbleMutationRevision"].as_u64().is_some_and(|ack|ack>*revision){
                 if save_ack_clear(*revision,snapshot["space"]["marbleMutationRevision"].as_u64().unwrap_or(0),submitted,self.extra_inputs[2].read(cx).value().as_str()){self.extra_inputs[2].update(cx,|input,cx|input.set_value("",window,cx));}
@@ -637,9 +643,9 @@ impl AgentSettingsPane {
                     Some((
                         json!(n),
                         if n == 0 {
-                            "0 轮（不再新起）".to_owned()
+                            settings_copy(UiLocale::from_settings(&self.snapshot), "0 轮（不再新起）").to_owned()
                         } else {
-                            format!("{n} 轮")
+                            format!("{n} {}", settings_copy(UiLocale::from_settings(&self.snapshot), "轮"))
                         },
                     ))
                 } else {
@@ -760,14 +766,14 @@ impl AgentSettingsPane {
         let group = |title: &'static str| SettingsGroup::new(t(title), border).visible((!self.unity_external || unity_agent_group_available(&self.snapshot, title)) && match self.section.as_str(){"语音播放"=>title=="回复语音","按住说话"=>title=="按住说话","自主行动"=>matches!(title,"角色人格与偏好"|"居民人格"|"自主行动"),_=>matches!(title,"角色内核"|"聊天模型")});
         form=form.child(group("角色内核")
             .child(div().flex().items_center().gap(px(12.)).child(div().size(px(32.)).rounded_lg().bg(cx.theme().muted).flex().items_center().justify_center().child(Icon::new(IconName::Terminal).size(px(20.))))
-                .child(div().flex_1().flex().flex_col().child("gmgn 角色").child(self.snapshot["agent"]["codexStatus"].as_str().unwrap_or("策划引擎未登录").to_owned()))
-                .child(Button::new("codex-login").label(if self.snapshot["agent"]["codexState"].as_str()==Some("signedIn"){"退出登录"}else{"登录"})
+                .child(div().flex_1().flex().flex_col().child(settings_copy(locale, "gmgn 角色")).child(self.snapshot["agent"]["codexStatus"].as_str().unwrap_or(settings_copy(locale, "策划引擎未登录")).to_owned()))
+                .child(Button::new("codex-login").label(t(if self.snapshot["agent"]["codexState"].as_str()==Some("signedIn"){"退出登录"}else{"登录"}))
                     .disabled(self.snapshot["agent"]["working"].as_bool()==Some(true)||self.snapshot["agent"]["codexState"].as_str()==Some("unavailable"))
                     .on_click(cx.listener(|this,_,_,_|this.commands.push(json!({"op":if this.snapshot["agent"]["codexState"].as_str()==Some("signedIn"){"agent.logout"}else{"agent.login"}}))))))
-            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child("Codex 提供策划和推理能力；它与下面的声音共同属于同一个角色。"))
+            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(settings_copy(locale, "Codex 提供策划和推理能力；它与下面的声音共同属于同一个角色。")))
             .child(self.toggle("takeover","允许角色自动接管","takeoverEnabled",cx))
-            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child("可以自主切歌、暂停、继续、重排节目和调整视觉。"))
-            .child(div().flex().justify_between().items_center().child("策划模型").child(div().w(px(220.)).child(Input::new(&self.inputs[2])))))
+            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(settings_copy(locale, "可以自主切歌、暂停、继续、重排节目和调整视觉。")))
+            .child(div().flex().justify_between().items_center().child(settings_copy(locale, "策划模型")).child(div().w(px(220.)).child(Input::new(&self.inputs[2])))))
             .child(group("角色人格与偏好").child(div().h(px(150.)).min_h(px(150.)).flex_shrink_0()
                 .child(Textarea::new(&self.personas[1]).h(px(150.)).aria_label(t("角色人格与偏好")).accessibility_id("dj-host-prompt")))
             .child(div().flex().justify_between().items_center().gap(px(ui::SPACING_12)).child(div().flex_1().min_w(px(0.)).text_size(px(ui::BODY)).line_height(px(ui::BODY_LINE_HEIGHT)).child(t("用自然语言告诉角色怎么策划和主持。")))
@@ -779,12 +785,12 @@ impl AgentSettingsPane {
             .child(group("聊天模型")
             .child(self.dropdown("backend","模型","agent","backendID",self.options("agent","backends"),cx))
             .children(self.snapshot["agent"]["backendStatus"].as_str().map(|status|div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(status.to_owned())))
-            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child("空间和 Live Cam 共用这里选定的 Agent；文字和语音转写进入同一个会话。")))
+            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(settings_copy(locale, "空间和 Live Cam 共用这里选定的 Agent；文字和语音转写进入同一个会话。"))))
             .child(group("自主行动")
             .child(self.toggle("autonomy","允许居民自主安排活动","autonomyEnabled",cx))
-            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child("打开后，居民会自己观察和行动，会消耗模型额度。设为 0 就不再新起一轮，要先停下请按停止。"))
+            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(settings_copy(locale, "打开后，居民会自己观察和行动，会消耗模型额度。设为 0 就不再新起一轮，要先停下请按停止。")))
             .child(self.dropdown("budget","每小时后台思考预算","agent","backgroundTurnsPerHour",self.options("agent","budgetOptions"),cx))
-            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child("按最近一小时算，默认 6。这只数后台思考的次数，不等于请求次数或费用。")))
+            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(settings_copy(locale, "按最近一小时算，默认 6。这只数后台思考的次数，不等于请求次数或费用。"))))
             .child(group("回复语音")
             .children((!self.unity_external || self.snapshot["unity"]["autoSpeakSupported"].as_bool() == Some(true)).then(||self.toggle("auto-speak","自动朗读 Agent 回复","autoSpeak",cx)))
             .child(self.dropdown("tts-provider","服务","tts","providerID",self.options("tts","providers"),cx))
@@ -815,7 +821,7 @@ impl AgentSettingsPane {
             .child(Button::new("save-asr").label(t("保存配置")).disabled(!self.snapshot["asr"]["models"].as_array().is_some_and(|models|models.iter().any(|model|model["id"]==self.draft["asr"]["modelID"]))).on_click(cx.listener(|this,_,_,cx|{
                 let mut value=this.draft["asr"].clone();value["op"]=json!("asr.save");value["apiKey"]=json!(this.extra_inputs[1].read(cx).value().to_string());this.commands.push(value);
             })))
-            .child(if self.unity_external { t("当前可管理语音配置和试听；Unity 按住说话及回复朗读尚未接入。") } else { t("在空间或 Live Cam 按住麦克风录音，松开后将完整转写交给当前 Agent。没有双向实时通话。") })
+            .child(if self.unity_external { t("当前可管理语音配置、试听与回复朗读；Unity 按住说话尚未接入。") } else { t("在空间或 Live Cam 按住麦克风录音，松开后将完整转写交给当前 Agent。没有双向实时通话。") })
             .children(self.snapshot["asr"]["notice"].as_str().map(|notice|div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(settings_notice(locale, notice)))));
         form.into_any_element()
     }
@@ -829,6 +835,8 @@ impl AgentSettingsPane {
         command: Value,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let label: SharedString = label.into();
+        let label = settings_copy(UiLocale::from_settings(&self.snapshot), label.as_ref()).to_owned();
         Button::new(id)
             .label(label)
             .when(command["op"]=="space.key.clear",|button|button.danger())
@@ -873,7 +881,9 @@ impl AgentSettingsPane {
                                     div()
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child(avatar_detail(package)),
+                                        .child(if package["isBuiltIn"].as_bool()==Some(true) && package["displayDetail"].is_null() {
+                                            format!("{} · {}", t("内置"), t(match package["engine"].as_str(){Some("orb")=>"呼吸球",Some("pmx")=>"PMX",Some("vrm")=>"VRM",Some("live2D"|"live2d")=>"Live2D",_=>""}))
+                                        } else { avatar_detail(package) }),
                                 ),
                         );
                     if package["isActive"].as_bool() == Some(true) {
@@ -884,16 +894,16 @@ impl AgentSettingsPane {
                                 .gap_1()
                                 .text_xs()
                                 .child(Icon::new(IconName::CircleCheck).size(px(14.)))
-                                .child("当前角色"),
+                                .child(settings_copy(locale, "当前角色")),
                         );
                     } else if package["rendererAvailable"].as_bool() == Some(false) {
                         row = row.child(div().text_xs().child(format!(
-                            "等待 {} 渲染",
-                            match package["engine"].as_str(){Some("orb")=>"呼吸球",Some("pmx")=>"PMX",Some("vrm")=>"VRM",Some("live2d")=>"Live2D",_=>"当前引擎"}
+                            "{} · {}", t("等待渲染"),
+                            t(match package["engine"].as_str(){Some("orb")=>"呼吸球",Some("pmx")=>"PMX",Some("vrm")=>"VRM",Some("live2d")=>"Live2D",_=>"当前引擎"})
                         )));
                     } else {
                         row =
-                            row.child(Button::new(format!("avatar-{id}")).label("选择").on_click(
+                            row.child(Button::new(format!("avatar-{id}")).label(settings_copy(locale, "选择")).on_click(
                                 cx.listener({
                                     let id = id.clone();
                                     move |this, _, _, cx| {
@@ -908,7 +918,7 @@ impl AgentSettingsPane {
                         row = row.child(self.remove_menu(
                             format!("remove-avatar-{id}"),
                             "移除角色",
-                            package["name"].as_str().unwrap_or("未命名角色"),
+                            package["name"].as_str().unwrap_or(settings_copy(locale, "未命名角色")),
                             json!({"op":"presence.remove","id":id}),
                             cx,
                         ));
@@ -919,7 +929,7 @@ impl AgentSettingsPane {
                 let mut motions = group("动作");
                 let categories = self.options("presence", "categories");
                 let weak = cx.entity().downgrade();
-                let category_values: Vec<_> = std::iter::once((json!(""), "全部".to_owned()))
+                let category_values: Vec<_> = std::iter::once((json!(""), t("全部").to_owned()))
                     .chain(categories)
                     .collect();
                 let selected = category_values
@@ -951,7 +961,7 @@ impl AgentSettingsPane {
                 }
                 if !self.motion_category.is_empty()&&self.snapshot["presence"]["motionNotice"].is_null()
                     &&!self.snapshot["presence"]["motions"].as_array().into_iter().flatten().any(|m|m["category"].as_str()==Some(&self.motion_category)){
-                    motions=motions.child(div().text_xs().child("这个分类下暂无当前角色可用的动作。"));
+                    motions=motions.child(div().text_xs().child(settings_copy(locale, "这个分类下暂无当前角色可用的动作。")));
                 }
                 for motion in self.snapshot["presence"]["motions"]
                     .as_array()
@@ -997,7 +1007,7 @@ impl AgentSettingsPane {
                                         .text_color(if compatible{cx.theme().muted_foreground}else{cx.theme().warning})
                                         .child(format!(
                                             "{}{}",
-                                            motion_format(motion["format"].as_str().unwrap_or("")),
+                                            settings_copy(locale, motion_format(motion["format"].as_str().unwrap_or(""))),
                                             motion["reason"]
                                                 .as_str()
                                                 .filter(|s| !s.is_empty())
@@ -1014,12 +1024,12 @@ impl AgentSettingsPane {
                                 .gap_1()
                                 .text_xs()
                                 .child(Icon::new(IconName::CircleCheck).size(px(14.)))
-                                .child("当前动作"),
+                                .child(settings_copy(locale, "当前动作")),
                         );
                     } else {
                         row = row.child(
                             Button::new(format!("motion-{id}"))
-                                .label("选择")
+                                .label(settings_copy(locale, "选择"))
                                 .disabled(!compatible)
                                 .on_click(cx.listener({
                                     let id = id.clone();
@@ -1033,7 +1043,7 @@ impl AgentSettingsPane {
                         row = row.child(self.remove_menu(
                             format!("remove-motion-{id}"),
                             "移除动作",
-                            motion["name"].as_str().unwrap_or("未命名动作"),
+                            motion["name"].as_str().unwrap_or(settings_copy(locale, "未命名动作")),
                             json!({"op":"presence.motion.remove","id":id}),
                             cx,
                         ));
@@ -1043,10 +1053,10 @@ impl AgentSettingsPane {
                 form = form.child(motions).child(
                     div()
                         .text_xs()
-                        .child("两种角色各有自己的动作列表，切换时会分别记住你选的。"),
+                        .child(settings_copy(locale, "两种角色各有自己的动作列表，切换时会分别记住你选的。")),
                 );
                 let mut catalog=group("动作库").child(div().flex().items_center().gap(px(10.)).child(div().flex_1().min_w(px(0.)).child(Input::new(&self.extra_inputs[3])))
-                    .child(Button::new("catalog-refresh").label("获取动作列表").disabled(self.snapshot["presence"]["working"].as_bool()==Some(true)||self.extra_inputs[3].read(cx).value().trim().is_empty()).on_click(cx.listener(|this,_,_,cx|this.commands.push(json!({"op":"presence.catalog","url":this.extra_inputs[3].read(cx).value().to_string()}))))));
+                    .child(Button::new("catalog-refresh").label(settings_copy(locale, "获取动作列表")).disabled(self.snapshot["presence"]["working"].as_bool()==Some(true)||self.extra_inputs[3].read(cx).value().trim().is_empty()).on_click(cx.listener(|this,_,_,cx|this.commands.push(json!({"op":"presence.catalog","url":this.extra_inputs[3].read(cx).value().to_string()}))))));
                 for motion in self.snapshot["presence"]["publishedMotions"]
                     .as_array()
                     .into_iter()
@@ -1080,9 +1090,9 @@ impl AgentSettingsPane {
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
                                         .child(format!(
-                                            "版本 {} · {:.1} 秒",
+                                            "{} {} · {:.1} {}", t("版本"),
                                             motion["version"].as_str().unwrap_or(""),
-                                            motion["duration"].as_f64().unwrap_or(0.)
+                                            motion["duration"].as_f64().unwrap_or(0.), t("秒")
                                         )),
                                 ),
                         );
@@ -1094,12 +1104,12 @@ impl AgentSettingsPane {
                                 .gap_1()
                                 .text_xs()
                                 .child(Icon::new(IconName::CircleCheck).size(px(14.)))
-                                .child("已安装"),
+                                .child(settings_copy(locale, "已安装")),
                         );
                     } else {
                         row = row.child(
                             Button::new(format!("install-motion-{identity}"))
-                                .label(motion["installLabel"].as_str().unwrap_or("安装").to_owned())
+                                .label(settings_copy(locale, motion["installLabel"].as_str().unwrap_or("安装")).to_owned())
                                 .disabled(
                                     self.snapshot["presence"]["working"].as_bool() == Some(true),
                                 )
@@ -1115,13 +1125,13 @@ impl AgentSettingsPane {
                 if self.snapshot["presence"]["activeEngine"].as_str() == Some("orb") {
                     form = form.child(
                         group("呼吸球样式")
-                            .child(ColorPicker::new(&self.orb_color).label("流光颜色"))
+                            .child(ColorPicker::new(&self.orb_color).label(settings_copy(locale, "流光颜色")))
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
                                     .gap_3()
-                                    .child("流光强度")
+                                    .child(settings_copy(locale, "流光强度"))
                                     .child(div().flex_1().child(Slider::new(&self.orb_intensity)))
                                     .child(div().w(px(42.)).child(format!(
                                         "{}%",
@@ -1232,28 +1242,28 @@ impl AgentSettingsPane {
                     .and_then(|value| value["detail"].as_str())
                     .unwrap_or("");
                 form=form.child(group("默认空间").child(self.dropdown("default-space","启动时进入","space","defaultSpace",self.options("space","options"),cx))
-                    .child(div().text_xs().child(detail.to_owned())).child(div().text_xs().child("修改后下次启动生效。")))
+                    .child(div().text_xs().child(detail.to_owned())).child(div().text_xs().child(settings_copy(locale, "修改后下次启动生效。"))))
                     .child(group("Marble 空间")
                         .child(div().flex().items_center().gap(px(12.)).child(div().w(px(28.)).flex_shrink_0().child(Icon::new(IconName::Box).size(px(22.))))
-                            .child(div().flex_1().flex().flex_col().gap(px(2.)).child("World Labs Marble").child(div().text_xs().child("用于同步和生成可探索的 3D 空间")))
+                            .child(div().flex_1().flex().flex_col().gap(px(2.)).child("World Labs Marble").child(div().text_xs().child(settings_copy(locale, "用于同步和生成可探索的 3D 空间"))))
                             .child(div().flex().items_center().gap_1().text_sm().text_color(if configured{cx.theme().success}else{cx.theme().muted_foreground})
-                                .child(Icon::new(if configured{IconName::CircleCheck}else{IconName::Circle}).size(px(14.))).child(if configured{"已配置"}else{"未配置"})))
+                                .child(Icon::new(if configured{IconName::CircleCheck}else{IconName::Circle}).size(px(14.))).child(t(if configured{"已配置"}else{"未配置"}))))
                         .child(div().flex().items_center().gap_3().child("API Key").child(div().flex_1().min_w(px(0.)).child(Input::new(&self.extra_inputs[2]))))
-                        .child(div().flex().items_center().gap_2().child(div().flex_1().text_xs().child("只保存在本机，不使用钥匙串。"))
+                        .child(div().flex().items_center().gap_2().child(div().flex_1().text_xs().child(settings_copy(locale, "只保存在本机，不使用钥匙串。")))
                             .when(configured,|row|row.child(self.command_button("marble-clear","清除",json!({"op":"space.key.clear"}),cx)))
-                            .child(Button::new("marble-save").primary().label("保存 Key").disabled(self.extra_inputs[2].read(cx).value().trim().is_empty()).on_click(cx.listener(|this,_,_,cx|{
+                            .child(Button::new("marble-save").primary().label(settings_copy(locale, "保存 Key")).disabled(self.extra_inputs[2].read(cx).value().trim().is_empty()).on_click(cx.listener(|this,_,_,cx|{
                                 let key=this.extra_inputs[2].read(cx).value().to_string();this.pending_marble=Some((this.snapshot["space"]["marbleMutationRevision"].as_u64().unwrap_or(0),key.clone()));this.commands.push(json!({"op":"space.key.save","apiKey":key}));
                             })))))
                     .child(group("许愿机").child(Input::new(&self.extra_inputs[5])).child(Input::new(&self.extra_inputs[6]))
                     .child(div().flex().items_center().gap_2()
                         .child(div().flex_1().flex().items_center().gap_1().text_sm().text_color(cx.theme().muted_foreground)
                             .child(Icon::new(if self.snapshot["space"]["propCredentialConfigured"].as_bool()==Some(true){IconName::CircleCheck}else{IconName::Circle}).size(px(14.)))
-                            .child(if self.snapshot["space"]["propCredentialConfigured"].as_bool()==Some(true){"已配置"}else{"未配置"}))
-                        .child(Button::new("prop-check").label(if self.snapshot["space"]["propChecking"].as_bool()==Some(true){"检测中…"}else{"检测连接"}).disabled(self.snapshot["space"]["propCredentialConfigured"].as_bool()!=Some(true)||self.snapshot["space"]["propChecking"].as_bool()==Some(true)||!self.extra_inputs[6].read(cx).value().is_empty()).on_click(cx.listener(|this,_,_,cx|this.commands.push(json!({"op":"space.prop.check","endpoint":this.extra_inputs[5].read(cx).value().to_string()})))))
-                        .child(Button::new("prop-save").primary().label("保存").disabled(self.extra_inputs[5].read(cx).value().trim().is_empty()).on_click(cx.listener(|this,_,_,cx|{
+                            .child(t(if self.snapshot["space"]["propCredentialConfigured"].as_bool()==Some(true){"已配置"}else{"未配置"})))
+                        .child(Button::new("prop-check").label(t(if self.snapshot["space"]["propChecking"].as_bool()==Some(true){"检测中…"}else{"检测连接"})).disabled(self.snapshot["space"]["propCredentialConfigured"].as_bool()!=Some(true)||self.snapshot["space"]["propChecking"].as_bool()==Some(true)||!self.extra_inputs[6].read(cx).value().is_empty()).on_click(cx.listener(|this,_,_,cx|this.commands.push(json!({"op":"space.prop.check","endpoint":this.extra_inputs[5].read(cx).value().to_string()})))))
+                        .child(Button::new("prop-save").primary().label(settings_copy(locale, "保存")).disabled(self.extra_inputs[5].read(cx).value().trim().is_empty()).on_click(cx.listener(|this,_,_,cx|{
                             let endpoint=this.extra_inputs[5].read(cx).value().to_string();let key=this.extra_inputs[6].read(cx).value().to_string();this.pending_prop=Some((this.snapshot["space"]["propSaveRevision"].as_u64().unwrap_or(0),endpoint.clone(),key.clone()));this.commands.push(json!({"op":"space.prop.save","endpoint":endpoint,"apiKey":key}));
                         })))))
-                    .child(div().text_xs().child("地址和密钥只存在这台电脑上，保存后不会立刻开始生成。"));
+                    .child(div().text_xs().child(settings_copy(locale, "地址和密钥只存在这台电脑上，保存后不会立刻开始生成。")));
             }
             3 => {
                 let mut shortcuts = group("")
@@ -1263,9 +1273,9 @@ impl AgentSettingsPane {
                             .items_center()
                             .gap(px(16.))
                             .text_xs()
-                            .child(div().flex_1().child("功能"))
-                            .child(div().w(px(136.)).child("应用内"))
-                            .child(div().w(px(136.)).child("全局")),
+                            .child(div().flex_1().child(settings_copy(locale, "功能")))
+                            .child(div().w(px(136.)).child(settings_copy(locale, "应用内")))
+                            .child(div().w(px(136.)).child(settings_copy(locale, "全局"))),
                     )
                     .child(div().h(px(1.)).bg(border));
                 for item in self.snapshot["shortcuts"]["assignments"]
@@ -1283,7 +1293,7 @@ impl AgentSettingsPane {
                     for scope in ["local", "global"] {
                         let recording = self.snapshot["shortcuts"]["recordingID"] == id
                             && self.snapshot["shortcuts"]["recordingScope"].as_str() == Some(scope);
-                        let label=if recording{"请按快捷键"}else{item[scope].as_str().unwrap_or("未设置")}.to_owned();
+                        let label=if recording{t("请按快捷键")}else{item[scope].as_str().unwrap_or(t("未设置"))}.to_owned();
                         let tint=gpui_kit::component::button::ButtonCustomVariant::new(cx).color(rgb(0x32d3e8).opacity(0.14).into())
                             .foreground(rgb(0x32d3e8).into()).hover(rgb(0x32d3e8).opacity(0.22).into()).active(rgb(0x32d3e8).opacity(0.3).into());
                         row=row.child(div().w(px(136.)).flex_shrink_0().child(Button::new(format!("shortcut-{id}-{scope}")).w(px(136.)).px(px(12.))
@@ -1299,7 +1309,7 @@ impl AgentSettingsPane {
                         group("")
                             .child(
                                 Switch::new("global-shortcuts")
-                                    .label("启用全局快捷键")
+                                    .label(settings_copy(locale, "启用全局快捷键"))
                                     .checked(
                                         self.snapshot["shortcuts"]["globalEnabled"]
                                             .as_bool()
@@ -1310,10 +1320,10 @@ impl AgentSettingsPane {
                                             .push(json!({"op":"shortcuts.global","value":value}))
                                     })),
                             )
-                            .child(div().text_xs().child("gmgn radio 在后台时也能响应。"))
+                            .child(div().text_xs().child(settings_copy(locale, "gmgn radio 在后台时也能响应。")))
                             .child(
                                 Switch::new("media-shortcuts")
-                                    .label("使用系统媒体快捷键")
+                                    .label(settings_copy(locale, "使用系统媒体快捷键"))
                                     .checked(
                                         self.snapshot["shortcuts"]["mediaKeysEnabled"]
                                             .as_bool()
@@ -1327,7 +1337,7 @@ impl AgentSettingsPane {
                             .child(
                                 div()
                                     .text_xs()
-                                    .child("响应键盘上的播放、暂停、上一首和下一首。"),
+                                    .child(settings_copy(locale, "响应键盘上的播放、暂停、上一首和下一首。")),
                             ),
                     )
                     .child(
@@ -1365,15 +1375,15 @@ impl Render for AgentSettingsPane {
         let content = if self.unity_external && !unity_section_available(&self.snapshot, &self.section) {
             div().px(px(20.)).py(px(16.)).text_size(px(ui::BODY))
                 .text_color(cx.theme().muted_foreground)
-                .child(self.snapshot["unity"]["unavailableMessage"].as_str().unwrap_or("正在读取 Unity 设置能力…").to_owned())
+                .child(settings_notice(locale, self.snapshot["unity"]["unavailableMessage"].as_str().unwrap_or("正在读取 Unity 设置能力…")))
                 .into_any_element()
         } else if self.page>=5 {
             self.stage_pane.as_ref().map(|pane| {
                 let mut content=div().flex().flex_col().gap_4().child(div().h(px(380.)).child(pane.clone()));
-                if self.page==6{content=content.child(SettingsGroup::new("默认空间",cx.theme().border)
+                if self.page==6{content=content.child(SettingsGroup::new(settings_copy(locale, "默认空间"),cx.theme().border)
                     .child(self.dropdown("default-space","启动时进入","space","defaultSpace",self.options("space","options"),cx))
                     .child(div().text_xs().child(self.snapshot["space"]["options"].as_array().into_iter().flatten().find(|value|value["id"]==self.draft["space"]["defaultSpace"]).and_then(|value|value["detail"].as_str()).unwrap_or("").to_owned()))
-                    .child(div().text_xs().child("修改后下次启动生效。")));}
+                    .child(div().text_xs().child(settings_copy(locale, "修改后下次启动生效。"))));}
                 content.into_any_element()
             })
                 .unwrap_or_else(|| div().into_any_element())
@@ -1401,26 +1411,26 @@ impl Render for AgentSettingsPane {
             let weak = cx.entity().downgrade();
             header = header.child(
                 Button::new("presence-import")
-                    .label("导入")
+                    .label(settings_copy(locale, "导入"))
                     .dropdown_caret(true)
                     .dropdown_menu(move |menu, _, _| {
                         let a = weak.clone();
                         let b = weak.clone();
                         let c = weak.clone();
-                        menu.item(PopupMenuItem::new("角色模型…").on_click(move |_, _, cx| {
+                        menu.item(PopupMenuItem::new(settings_copy(locale, "角色模型…")).on_click(move |_, _, cx| {
                             _ = a.update(cx, |this, cx| {
                                 this.commands.push(json!({"op":"presence.import"}));
                                 cx.notify();
                             });
                         }))
-                        .item(PopupMenuItem::new("动作文件…").on_click(move |_, _, cx| {
+                        .item(PopupMenuItem::new(settings_copy(locale, "动作文件…")).on_click(move |_, _, cx| {
                             _ = b.update(cx, |this, cx| {
                                 this.commands.push(json!({"op":"presence.motion.import"}));
                                 cx.notify();
                             });
                         }))
                         .item(
-                            PopupMenuItem::new("从链接导入角色…").on_click(move |_, window, cx| {
+                            PopupMenuItem::new(settings_copy(locale, "从链接导入角色…")).on_click(move |_, window, cx| {
                                 _ = c.update(cx, |this, cx| this.open_import_link(window, cx));
                             }),
                         )

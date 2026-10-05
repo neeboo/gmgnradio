@@ -1,5 +1,6 @@
 //! Native stage panels. Catalogs, availability and every mutation belong to the host.
 use crate::ui_tokens as ui;
+use crate::i18n::{UiLocale, settings_copy, player_choice_label};
 use gpui_kit::component::{
     button::*,
     menu::*,
@@ -170,6 +171,8 @@ impl StagePanelsPane {
         disabled: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let label: SharedString = label.into();
+        let label = settings_copy(UiLocale::from_settings(&self.snapshot), label.as_ref()).to_owned();
         Button::new(id)
             .small()
             .label(label)
@@ -181,6 +184,7 @@ impl StagePanelsPane {
             .into_any_element()
     }
     fn space(&self, cx: &mut Context<Self>) -> AnyElement {
+        let locale = UiLocale::from_settings(&self.snapshot);
         let space = &self.snapshot["space"];
         let weak = cx.entity().downgrade();
         let catalog = space.clone();
@@ -191,7 +195,7 @@ impl StagePanelsPane {
             .label(
                 space["worldLabel"]
                     .as_str()
-                    .unwrap_or("公开空间 · 无需生成")
+                    .unwrap_or(settings_copy(locale, "公开空间 · 无需生成"))
                     .to_owned(),
             )
             .dropdown_caret(true)
@@ -236,7 +240,7 @@ impl StagePanelsPane {
             div()
                 .text_size(px(14.))
                 .font_weight(FontWeight::SEMIBOLD)
-                .child("人物位置"),
+                .child(settings_copy(locale, "人物位置")),
         );
         let mut axes = div().flex().flex_col().gap(px(5.));
         for (i, label) in ["X", "Y", "Z"].into_iter().enumerate() {
@@ -276,7 +280,7 @@ impl StagePanelsPane {
                     .flex()
                     .justify_between()
                     .items_center()
-                    .child("人物位置会按当前空间保存")
+                    .child(settings_copy(locale, "人物位置会按当前空间保存"))
                     .child(self.button(
                         "avatar-reset",
                         "重置",
@@ -290,7 +294,7 @@ impl StagePanelsPane {
                     .flex()
                     .justify_between()
                     .items_center()
-                    .child("W/S 沿视线前后移动，A/D 左右移动")
+                    .child(settings_copy(locale, "W/S 沿视线前后移动，A/D 左右移动"))
                     .child(self.button(
                         "camera-reset",
                         "镜头复位",
@@ -305,6 +309,7 @@ impl StagePanelsPane {
         form.into_any_element()
     }
     fn motions(&self, cx: &mut Context<Self>) -> AnyElement {
+        let locale = UiLocale::from_settings(&self.snapshot);
         let motions = &self.snapshot["motions"];
         let mut form = div()
             .flex()
@@ -317,7 +322,7 @@ impl StagePanelsPane {
                     .child(
                         motions["avatarName"]
                             .as_str()
-                            .unwrap_or("尚未选择角色")
+                            .unwrap_or(settings_copy(locale, "尚未选择角色"))
                             .to_owned(),
                     )
                     .child(self.button(
@@ -328,9 +333,9 @@ impl StagePanelsPane {
                         cx,
                     )),
             )
-            .child("选择已安装动作；自然待机可结束当前表演。");
+            .child(settings_copy(locale, "选择已安装动作；自然待机可结束当前表演。"));
         let mut categories = div().flex().flex_wrap().gap_1();
-        categories = categories.child(Button::new("all-motion-categories").small().label("全部").on_click(
+        categories = categories.child(Button::new("all-motion-categories").small().label(settings_copy(locale, "全部")).on_click(
             cx.listener(|this, _, _, cx| {
                 this.motion_category.clear();
                 cx.notify();
@@ -383,11 +388,11 @@ impl StagePanelsPane {
             }
         }
         if count == 0 {
-            form = form.child(if self.motion_category.is_empty() {
+            form = form.child(settings_copy(locale, if self.motion_category.is_empty() {
                 "暂无可用动作，请在资产管理中安装。"
             } else {
                 "这个分类下暂无当前角色可用的动作。"
-            });
+            }));
         }
         for key in ["notice", "message"] {
             if let Some(message) = motions[key].as_str().filter(|s| !s.is_empty()) {
@@ -404,12 +409,13 @@ impl StagePanelsPane {
         .into_any_element()
     }
     fn activities(&self, cx: &mut Context<Self>) -> AnyElement {
+        let locale = UiLocale::from_settings(&self.snapshot);
         let activity = &self.snapshot["activities"];
         let mut form = div()
             .flex()
             .flex_col()
             .gap(px(10.))
-            .child("活动来自当前空间，角色会走到对应位置再开始。");
+            .child(settings_copy(locale, "活动来自当前空间，角色会走到对应位置再开始。"));
         if activity["canRun"].as_bool() == Some(true) {
             for item in activity["items"].as_array().into_iter().flatten() {
                 let id = item["id"].as_str().unwrap_or("");
@@ -430,24 +436,24 @@ impl StagePanelsPane {
                 ));
             }
             if activity["items"].as_array().is_none_or(|a| a.is_empty()) {
-                form = form.child("这个空间还没有配置生活活动。");
+                form = form.child(settings_copy(locale, "这个空间还没有配置生活活动。"));
             }
             form = form.child(self.button(
                 "activity-stop",
-                "停止活动",
+                settings_copy(locale, "停止活动"),
                 json!({"op":"stage.activity.stop"}),
                 activity["activeID"].as_str().is_none_or(|s| s.is_empty()),
                 cx,
             ));
         } else {
             form = form.child(
-                if self.snapshot["space"]["isVisible"].as_bool() == Some(true) {
+                settings_copy(locale, if self.snapshot["space"]["isVisible"].as_bool() == Some(true) {
                     "这个空间还没有配置生活活动。"
                 } else if self.snapshot["space"]["isRequested"].as_bool() == Some(true) {
                     "空间载入完成后可选择活动。"
                 } else {
                     "进入空间后可选择生活活动。"
-                },
+                }),
             );
         }
         if let Some(message) = activity["message"].as_str().filter(|s| !s.is_empty()) {
@@ -456,10 +462,11 @@ impl StagePanelsPane {
         form.into_any_element()
     }
     fn player(&self, cx: &mut Context<Self>) -> AnyElement {
+        let locale = UiLocale::from_settings(&self.snapshot);
         let player = &self.snapshot["player"];
         let mut form = div().flex().flex_col().gap_3();
         if self.snapshot["space"]["isRequested"].as_bool() == Some(true) {
-            form = form.child("这些效果用于播放器画面，切回播放器后可查看");
+            form = form.child(settings_copy(locale, "这些效果用于播放器画面，切回播放器后可查看"));
         }
         for (key, title, op, selected) in [
             ("lyrics", "字幕特效", "stage.player.lyrics", "lyricID"),
@@ -474,7 +481,10 @@ impl StagePanelsPane {
                 let id = item["id"].as_str().unwrap_or("");
                 let is_selected = player[selected] == item["id"];
                 let command = json!({"op":op,"id":id});
-                let (role, label) = style_choice_accessibility(title, item["name"].as_str().unwrap_or(""), is_selected);
+                let name = player_choice_label(locale, key, id, item["name"].as_str().unwrap_or(""));
+                let (role, _) = style_choice_accessibility(title, name, is_selected);
+                let label = format!("{}: {name}{}", settings_copy(locale, title),
+                    if is_selected { format!(", {}", settings_copy(locale, "已选择")) } else { String::new() });
                 let mut tile = div()
                     .id(format!("{key}-{id}"))
                     .role(role)
@@ -515,14 +525,14 @@ impl StagePanelsPane {
                     _ => gpui_kit::assets::IconName::Video,
                 };
                 tile = tile.child(Icon::new(icon).size(px(14.)));
-                choices = choices.child(tile.child(item["name"].as_str().unwrap_or("").to_owned()));
+                choices = choices.child(tile.child(name.to_owned()));
             }
             form = form
                 .child(
                     div()
                         .text_size(px(14.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(title),
+                        .child(settings_copy(locale, title)),
                 )
                 .child(choices);
             if key == "clouds" {
@@ -531,7 +541,7 @@ impl StagePanelsPane {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child("颗粒大小")
+                        .child(settings_copy(locale, "颗粒大小"))
                         .child(div().flex_1().child(Slider::new(&self.sliders[3])))
                         .child(format!(
                             "{}%",
@@ -547,14 +557,14 @@ impl StagePanelsPane {
                 .gap_2()
                 .child(self.button(
                     "video-import",
-                    "导入 MP4",
+                    settings_copy(locale, "导入 MP4"),
                     json!({"op":"stage.video.import"}),
                     false,
                     cx,
                 ))
                 .child(self.button(
                     "video-stop",
-                    "关闭",
+                    settings_copy(locale, "关闭"),
                     json!({"op":"stage.video.stop"}),
                     false,
                     cx,
@@ -570,13 +580,13 @@ impl StagePanelsPane {
                     .items_center()
                     .gap(px(10.)).px(px(10.)).min_h(px(36.))
                     .child(Icon::new(gpui_kit::assets::IconName::SunDim).size(px(14.)))
-                    .child(div().id("video-brightness").role(Role::Slider).aria_label("视频亮度").flex_1().min_w(px(0.)).child(Slider::new(&self.sliders[4])))
+                    .child(div().id("video-brightness").role(Role::Slider).aria_label(settings_copy(locale, "视频亮度")).flex_1().min_w(px(0.)).child(Slider::new(&self.sliders[4])))
                     .child(div().w(px(38.)).flex_shrink_0().font_family("Menlo").text_size(px(12.)).child(format!("{}%",(self.sliders[4].read(cx).value().start()*100.)as u32))),
             );
             let assets=player["videoAssets"].as_array().cloned().unwrap_or_default();
             let active=player["videoActive"].as_bool()==Some(true);
-            let name=assets.iter().find(|asset|asset["id"]==player["videoAssetID"]).and_then(|asset|asset["name"].as_str()).unwrap_or("未加载视频").to_owned();
-            let status=if active{"已加载".to_owned()}else{format!("{} 段",assets.len())};
+            let name=assets.iter().find(|asset|asset["id"]==player["videoAssetID"]).and_then(|asset|asset["name"].as_str()).unwrap_or(settings_copy(locale, "未加载视频")).to_owned();
+            let status=if active{settings_copy(locale, "已加载").to_owned()}else{format!("{} {}",assets.len(),settings_copy(locale, "段"))};
             let weak=cx.entity().downgrade();let menu_player=player.clone();
             form=form.child(Button::new("video-assets-menu").ghost().small().w_full().rounded_full()
                 .bg(rgba(0xffffff0b)).accessibility_label(format!("{name}，{status}"))
@@ -591,7 +601,7 @@ impl StagePanelsPane {
                             for(label,command,dangerous)in &actions{
                                 if *dangerous{sub=sub.separator();}
                                 let weak=weak.clone();let command=command.clone();
-                                let item=if *dangerous{PopupMenuItem::element(|_,cx|div().id("video-remove-menu-label").role(Role::MenuItem).aria_label("移出素材库").text_color(cx.theme().danger).child("移出素材库"))}else{PopupMenuItem::new(*label)};
+                                let item=if *dangerous{PopupMenuItem::element(move |_,cx|div().id("video-remove-menu-label").role(Role::MenuItem).aria_label(settings_copy(locale, "移出素材库")).text_color(cx.theme().danger).child(settings_copy(locale, "移出素材库")))}else{PopupMenuItem::new(settings_copy(locale, label))};
                                 sub=sub.item(item.on_click(move|_,_,cx|{_=weak.update(cx,|this,cx|{this.commands.push(command.clone());cx.notify();});}));
                             }
                             sub

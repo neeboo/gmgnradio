@@ -1,11 +1,14 @@
 import Foundation
 
 /// Settings for the actual Unity session. Reuses the product's Rust speech
-/// models, but never constructs AppDelegate or reads the product preferences.
+/// models without constructing AppDelegate. Product voice preferences are only
+/// read when the host explicitly supplies them; isolated tests omit that source.
 @MainActor
 final class UnityProductSettings {
     private let defaults: UserDefaults
     private let speech: RustSpeechPreferences
+    private let productSpeech: RustSpeechPreferences?
+    private let productVoiceDefaults: UserDefaults?
     private let client: RustVoiceClient
     private let previewStatus = AgentSpeechStatusStore()
     private let replyStatus = AgentSpeechStatusStore()
@@ -26,19 +29,23 @@ final class UnityProductSettings {
     private var notice: String?
     private var generation: UInt64 = 0
 
-    init(root: URL, defaults: UserDefaults) {
+    init(root: URL, defaults: UserDefaults, productVoiceDefaults: UserDefaults? = nil) {
         self.defaults = defaults
+        self.productVoiceDefaults = productVoiceDefaults
+        productSpeech = productVoiceDefaults.map { RustSpeechPreferences(defaults: $0) }
         speech = RustSpeechPreferences(defaults: defaults)
-        client = RustVoiceClient(root: root.appendingPathComponent("TaskService", isDirectory: true))
-        let saved = RustSpeechPreferences(defaults: defaults).configuration(for: "tts", includesEnvironment: false)
+        // `root` is the authority's Application Support base, shared with the
+        // world/inbox bridges. Voice must not create a second taskd authority.
+        client = RustVoiceClient(root: root.appendingPathComponent("gmgn radio/TaskService", isDirectory: true), allowsLaunching: false)
+        let saved = Self.resolveVoiceConfiguration(for: "tts", defaults: defaults, speech: speech, productSpeech: productSpeech)
         provider = saved.provider; model = saved.model ?? ""; voiceID = saved.voiceID
     }
 
     var snapshot: [String: Any] {
         let resident = ResidentPreferences(defaults: defaults)
         let caps = capabilities?.providers.first { $0.id == provider.rawValue }
-        let asr = asrProvider.map { speech.configuration(provider: $0, for: "asr", includesEnvironment: false) }
-            ?? speech.configuration(for: "asr", includesEnvironment: false)
+        let asr = asrProvider.map { voiceConfiguration(provider: $0, for: "asr") }
+            ?? voiceConfiguration(for: "asr")
         let asrCaps = capabilities?.providers.first { $0.id == asr.provider.rawValue }
         return [
             "locale": locale,
@@ -53,8 +60,8 @@ final class UnityProductSettings {
                     "loading": loadingCapabilities || loadingVoices, "catalogLoaded": capabilities != nil,
                     "defaultModelID": caps?.defaultTTSModel as Any? ?? NSNull(),
                     "isSpeaking": previewStatus.isSpeaking || replyStatus.isSpeaking,
-                    "credentialConfigured": !speech.configuration(provider: provider, for: "tts", includesEnvironment: false).apiKey.isEmpty,
-                    "notice": previewStatus.lastErrorMessage ?? notice as Any? ?? NSNull()],
+                    "credentialConfigured": !voiceConfiguration(provider: provider, for: "tts").apiKey.isEmpty,
+                    "notice": replyStatus.lastErrorMessage ?? previewStatus.lastErrorMessage ?? notice as Any? ?? NSNull()],
             "asr": ["providerID": asr.provider.rawValue, "modelID": asr.model ?? asrCaps?.defaultASRModel ?? "",
                     "providers": (capabilities?.providers.filter { !$0.asrModels.isEmpty } ?? []).map { ["id": $0.id, "name": providerName($0.id)] },
                     "models": (asrCaps?.asrModels ?? []).map { ["id": $0.id, "name": $0.name] },
@@ -86,7 +93,7 @@ final class UnityProductSettings {
             guard let id = value["id"] as? String, let selected = RustVoiceProvider(rawValue: id),
                   capabilities?.providers.contains(where: { $0.id == id && !$0.ttsModels.isEmpty }) == true else { return false }
             stopVoiceWork(); provider = selected
-            let saved = speech.configuration(provider: selected, for: "tts", includesEnvironment: false)
+            let saved = voiceConfiguration(provider: selected, for: "tts")
             model = saved.model ?? capabilities?.providers.first(where: { $0.id == id })?.defaultTTSModel ?? ""
             voiceID = saved.voiceID; voices = []; notice = nil
         case "asr.provider":
@@ -97,7 +104,7 @@ final class UnityProductSettings {
             guard let id = value["providerID"] as? String, let selected = RustVoiceProvider(rawValue: id),
                   let model = value["modelID"] as? String,
                   capabilities?.providers.first(where: { $0.id == id })?.asrModels.contains(where: { $0.id == model }) == true else { return false }
-            let old = speech.configuration(provider: selected, for: "asr", includesEnvironment: false)
+            let old = voiceConfiguration(provider: selected, for: "asr")
             speech.save(RustVoiceConfiguration(provider: selected, apiKey: replacementKey(value, old: old.apiKey), voiceID: old.voiceID, model: model), for: "asr")
             asrProvider = selected
         case "tts.refresh":
@@ -133,7 +140,7 @@ final class UnityProductSettings {
               capabilities?.providers.first(where: { $0.id == id })?.ttsModels.contains(where: { $0.id == model }) == true else {
             notice = "请先加载模型列表并选择有效模型。"; return nil
         }
-        let old = speech.configuration(provider: selected, for: "tts", includesEnvironment: false)
+        let old = voiceConfiguration(provider: selected, for: "tts")
         return RustVoiceConfiguration(provider: selected, apiKey: replacementKey(value, old: old.apiKey), voiceID: voice, model: model)
     }
     private func loadCapabilities() {
@@ -144,7 +151,7 @@ final class UnityProductSettings {
                 let loaded = try await client.capabilities(); try Task.checkCancellation()
                 capabilities = loaded; loadingCapabilities = false
                 if model.isEmpty { model = loaded.providers.first(where: { $0.id == provider.rawValue })?.defaultTTSModel ?? "" }
-                let saved = speech.configuration(provider: provider, for: "tts", includesEnvironment: false)
+                let saved = voiceConfiguration(provider: provider, for: "tts")
                 refreshVoices(RustVoiceConfiguration(provider: provider, apiKey: saved.apiKey, voiceID: voiceID, model: model))
             } catch {
                 guard !Task.isCancelled else { return }
@@ -170,14 +177,36 @@ final class UnityProductSettings {
         generation &+= 1; voicesTask?.cancel(); voicesTask = nil; loadingVoices = false
         preview?.stopSpeaking(); preview = nil; previewStatus.lastErrorMessage = nil
     }
-    var autoSpeakReplies: Bool { defaults.object(forKey: Self.autoSpeakKey) as? Bool ?? true }
+    /// Presence of a local choice/key is authoritative even when empty. A user
+    /// revocation must never resurrect a key or silently select another provider.
+    private static func resolveVoiceConfiguration(for purpose: String, defaults: UserDefaults,
+        speech: RustSpeechPreferences, productSpeech: RustSpeechPreferences?) -> RustVoiceConfiguration {
+        let local = speech.configuration(for: purpose, includesEnvironment: false)
+        let hasLocalChoice = defaults.object(forKey: "speech.rust.\(purpose).provider") != nil
+        let hasLocalKey = defaults.object(forKey: "speech.rust.\(local.provider.rawValue).apiKey") != nil
+            || (local.provider == .bailian && defaults.object(forKey: "voice.bailian.apiKey") != nil)
+        guard !hasLocalChoice, !hasLocalKey, let productSpeech else { return local }
+        return productSpeech.configuration(for: purpose, includesEnvironment: false)
+    }
+    func voiceConfiguration(for purpose: String) -> RustVoiceConfiguration {
+        Self.resolveVoiceConfiguration(for: purpose, defaults: defaults, speech: speech, productSpeech: productSpeech)
+    }
+    private func voiceConfiguration(provider: RustVoiceProvider, for purpose: String) -> RustVoiceConfiguration {
+        let effective = voiceConfiguration(for: purpose)
+        guard effective.provider != provider else { return effective }
+        return speech.configuration(provider: provider, for: purpose, includesEnvironment: false)
+    }
+    var autoSpeakReplies: Bool {
+        defaults.object(forKey: Self.autoSpeakKey) as? Bool
+            ?? productVoiceDefaults?.object(forKey: "agentConversation.autoSpeakReplies") as? Bool ?? true
+    }
     var locale: String { defaults.string(forKey: Self.localeKey).flatMap { ["zh-CN", "en", "ja"].contains($0) ? $0 : nil } ?? "zh-CN" }
     func speakReply(_ text: String) {
         stopReplySpeech()
         guard autoSpeakReplies, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         preview?.stopSpeaking(); preview = nil
         replyStatus.lastErrorMessage = nil
-        let configuration = speech.configuration(for: "tts", includesEnvironment: false)
+        let configuration = voiceConfiguration(for: "tts")
         let synthesizer = RustSpeechSynthesizer(configuration: { configuration }, statusStore: replyStatus, client: client)
         replySpeech = synthesizer
         synthesizer.speak(text)

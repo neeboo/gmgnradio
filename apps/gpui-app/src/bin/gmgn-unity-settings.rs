@@ -1,4 +1,5 @@
 use gmgn_gpui_ui::{settings::AgentSettingsPane, stage_panels::StagePanelsPane, ui_tokens};
+use gmgn_gpui_ui::i18n::{UiLocale, settings_copy, settings_notice};
 use gpui_kit::{*, prelude::FluentBuilder};
 use gpui_kit::component::{ActiveTheme, Theme, ThemeMode};
 use std::time::Duration;
@@ -7,7 +8,7 @@ use std::time::Duration;
 struct UnitySettings {
     pane: Entity<AgentSettingsPane>, stage: Entity<StagePanelsPane>,
     transport: Option<unity_settings_transport::SettingsTransport>,
-    notice: Option<String>, _poll: Task<()>,
+    notice: Option<String>, locale: UiLocale, _poll: Task<()>,
 }
 impl UnitySettings {
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -23,8 +24,13 @@ impl UnitySettings {
         if let Some(update) = latest {
             match update {
                 Ok(state) => {
+                    let locale = UiLocale::from_settings(&state["settings"]);
+                    self.locale = locale;
+                    window.set_window_title(settings_copy(locale, "设置 · Unity 播放器"));
                     self.pane.update(cx, |pane, cx| pane.update_snapshot(state["settings"].clone(), window, cx));
-                    self.stage.update(cx, |stage, cx| stage.update_snapshot(state["stage"].clone(), window, cx));
+                    let mut stage_state = state["stage"].clone();
+                    stage_state["locale"] = serde_json::json!(locale.id());
+                    self.stage.update(cx, |stage, cx| stage.update_snapshot(stage_state, window, cx));
                     self.notice = None;
                 }
                 Err(error) => self.notice = Some(error),
@@ -37,7 +43,7 @@ impl Render for UnitySettings {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div().size_full().flex().flex_col().bg(cx.theme().background).text_color(cx.theme().foreground)
             .font_family(ui_tokens::FONT_FAMILY).text_size(px(ui_tokens::BODY))
-            .when_some(self.notice.clone(), |view, notice| view.child(div().px_4().py_2().text_size(px(ui_tokens::CAPTION)).text_color(cx.theme().danger).child(notice)))
+            .when_some(self.notice.clone(), |view, notice| view.child(div().px_4().py_2().text_size(px(ui_tokens::CAPTION)).text_color(cx.theme().danger).child(settings_notice(self.locale, &notice))))
             .child(div().flex_1().min_h_0().child(self.pane.clone()))
     }
 }
@@ -62,7 +68,7 @@ fn main() {
                         if view.update_in(cx, |view: &mut UnitySettings, window, cx| view.tick(window, cx)).is_err() { break; }
                     }
                 });
-                UnitySettings { pane, stage, transport, notice, _poll: poll }
+                UnitySettings { pane, stage, transport, notice, locale: UiLocale::default(), _poll: poll }
             });
             window.on_window_should_close(cx, |_, cx| { cx.quit(); true });
             cx.new(|cx| gpui_kit::base::Root::new(view, window, cx))

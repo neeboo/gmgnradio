@@ -22,6 +22,14 @@ final class RenderHostResidentConversation {
     private var draft = ""
     private var reply = ""
     private var statusNotice: String?
+    private var musicStateProvider: (@MainActor () -> [String: Any])?
+
+    /// The playback owner supplies a fresh read on every native tool call.
+    /// No file paths, credentials or frozen prompt snapshots belong here.
+    func setMusicStateProvider(_ provider: @escaping @MainActor () -> [String: Any]) {
+        musicStateProvider = provider
+        connector.musicStateProvider = provider
+    }
 
     init(backend: String, dataRoot: URL, defaults: UserDefaults) throws {
         self.backend = backend
@@ -63,6 +71,7 @@ final class RenderHostResidentConversation {
         if rebuildConnection {
             do {
                 let replacement = try RenderHostDSHConnector(dataRoot: dataRoot)
+                replacement.musicStateProvider = musicStateProvider
                 connector = replacement
                 service = Self.makeService(connector: replacement, defaults: defaults)
                 rebuildConnection = false
@@ -205,11 +214,13 @@ private struct RenderHostForbiddenHeadlessRunner: CodexCommandRunning {
 @MainActor
 private final class RenderHostDSHConnector: ResidentDSHImageConnecting {
     var onTextDelta: (@MainActor (String) -> Void)?
+    var musicStateProvider: (@MainActor () -> [String: Any])?
     private let node: URL
     private let entry: URL
     private let dataRoot: URL
     private var native: ResidentDSHConnector?
     private var sandbox: ResidentDSHSandbox?
+    private var musicTools: ResidentDSHHostToolsChannel?
 
     init(dataRoot: URL) throws {
         guard let transport = ResidentDSHComposition.locateNativeTransport(using: AgentExecutableLocator()) else {
@@ -225,7 +236,38 @@ private final class RenderHostDSHConnector: ResidentDSHImageConnecting {
     func openSession(cwd: URL) async throws -> ResidentDSHSessionHandle {
         close()
         try Task.checkCancellation()
-        let box = try ResidentDSHComposition.makeResidentSandbox(resolvingFrom: entry, rootDirectory: dataRoot)
+        if musicStateProvider != nil {
+            let schema = Data(#"{"type":"object","properties":{},"additionalProperties":false}"#.utf8)
+            let registrations = ["read_current_track", "read_radio_state"].map { name in
+                ResidentDSHHostToolRegistration(canonicalName: name, declaredName: "gmgn_" + name,
+                    description: "读取应用播放器此刻的真实歌曲、播放状态和进度。询问正在播放的音乐时必须调用此工具；没有歌曲时明确返回空状态。只读，不控制播放。",
+                    originalSchemaJSON: schema)
+            }
+            musicTools = try ResidentDSHHostToolsChannel.start(configuration: .init(
+                scope: "unity-player-music", worldID: "player", registrations: registrations,
+                handler: { [weak self] request in
+                    guard let provider = self?.musicStateProvider,
+                          ["read_current_track", "read_radio_state"].contains(request.canonicalName),
+                          let args = try? JSONSerialization.jsonObject(with: request.argumentsJSON) as? [String: Any],
+                          args.isEmpty else {
+                        return .init(resultJSON: Data(#"{"ok":false,"code":"music_state_unavailable"}"#.utf8), isError: true)
+                    }
+                    // Read-only public playback facts only. A host accidentally
+                    // returning its full snapshot must not expose paths/tokens.
+                    let allowed: Set<String> = ["title", "artist", "trackID", "provider", "isPlaying", "position", "duration", "queueIndex", "queueCount", "hasTrack"]
+                    let state = provider().filter { allowed.contains($0.key) }
+                    guard let result = try? JSONSerialization.data(withJSONObject: ["ok": true, "state": state], options: [.sortedKeys]) else {
+                        return .init(resultJSON: Data(#"{"ok":false,"code":"invalid_music_state"}"#.utf8), isError: true)
+                    }
+                    return .init(resultJSON: result, isError: false)
+                }))
+            musicTools?.revoke()
+        }
+        let box: ResidentDSHSandbox
+        do {
+            box = try ResidentDSHComposition.makeResidentSandbox(resolvingFrom: entry, rootDirectory: dataRoot,
+                hostToolsPluginPath: musicTools?.pluginFileURL.path)
+        } catch { close(); throw error }
         let connection = ResidentDSHConnector(nodeExecutable: node, entryPoint: entry,
             compositionFileURL: box.compositionFileURL, requestTimeout: 120)
         sandbox = box
@@ -251,11 +293,16 @@ private final class RenderHostDSHConnector: ResidentDSHImageConnecting {
 
     func prompt(sessionID: String, blocks: [ResidentDSHPromptBlock]) async throws -> String {
         guard let native else { throw ResidentDSHTransportError.notConnected }
+        let turnTools = musicTools
+        try turnTools?.arm(worldRevision: nil)
+        defer { turnTools?.revoke() }
         return try await native.prompt(sessionID: sessionID, blocks: blocks, onTextDelta: onTextDelta)
     }
-    func cancelActivePrompt() { native?.cancelActivePrompt() }
+    func cancelActivePrompt() { musicTools?.revoke(); native?.cancelActivePrompt() }
     func awaitCancellationSettled() async { await native?.awaitCancellationSettled() }
     func close() {
+        musicTools?.stop()
+        musicTools = nil
         native?.close()
         native = nil
         sandbox?.removeAll()
