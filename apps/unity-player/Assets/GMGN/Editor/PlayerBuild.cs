@@ -85,6 +85,7 @@ namespace GMGN.UnityPlayer.Editor
         {
             Prepare();
             GpuLyricsValidation.Validate();
+            StagePointsValidation.Validate();
             if (AssetDatabase.LoadAssetAtPath<GameObject>("Assets/GMGN/GaussianWorld/Resources/GaussianWorld/Cabin.prefab") == null)
                 throw new System.InvalidOperationException("Prepare the Gaussian cabin with GaussianWorldBootstrap.PrepareCabin before building; missing assets must not produce an empty space.");
             var output = System.Environment.GetEnvironmentVariable("GMGN_UNITY_BUILD_PATH");

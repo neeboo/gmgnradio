@@ -24,6 +24,7 @@ namespace GMGN.UnityPlayer
         ScrollView chatScroll;
         IVisualElementScheduledItem followScroll;
         AudioSculpture sculpture;
+        PointCloudArtworkLoader pointArtwork;
         GpuLyricsView gpuLyrics;
         string gpuLyricStatus;
         VisualElement root, chatPanel;
@@ -32,6 +33,7 @@ namespace GMGN.UnityPlayer
         Keyboard keyboard;
         string composition = "";
         QueuePanel queuePanel;
+        MusicLibraryPanel musicLibraryPanel;
         int compositionEndedFrame = -10;
 
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
@@ -55,7 +57,16 @@ namespace GMGN.UnityPlayer
             status = root.Q<Label>("status");
             lyric = root.Q<Label>("lyric"); translation = root.Q<Label>("translation");
             draft = root.Q<TextField>("draft"); draft.textEdition.placeholder = "和角色聊聊…";
+            draft.isDelayed = false;
             BindKeyboard();
+            draft.RegisterCallback<FocusInEvent>(_ => {
+                BindKeyboard();
+                keyboard?.SetIMEEnabled(true);
+            });
+            draft.RegisterCallback<FocusOutEvent>(_ => {
+                composition = "";
+                compositionEndedFrame = Time.frameCount;
+            });
             send = root.Q<Button>("send"); cancel = root.Q<Button>("cancel"); play = root.Q<Button>("play");
             chatPanel = root.Q("chatPanel");
             root.Q<Button>("chatToggle").clicked += () => ToggleChat(chatPanel.ClassListContains("hidden"));
@@ -82,6 +93,15 @@ namespace GMGN.UnityPlayer
                 row.EnableInClassList("message-error", message.failed);
                 var retry = (Button)row[2]; retry.userData = message; retry.EnableInClassList("hidden", !message.failed); };
             chatScroll = list.Q<ScrollView>();
+            chatScroll.mode = ScrollViewMode.Vertical;
+            chatScroll.horizontalScrollerVisibility = ScrollerVisibility.Hidden;
+            chatScroll.verticalScrollerVisibility = ScrollerVisibility.Auto;
+            chatScroll.contentViewport.RegisterCallback<GeometryChangedEvent>(e => {
+                // Dynamic-height virtual rows need a finite wrapping width;
+                // otherwise their intrinsic text width creates horizontal scroll.
+                chatScroll.contentContainer.style.width = e.newRect.width;
+                chatScroll.contentContainer.style.minWidth = 0;
+            });
             chatScroll.verticalScroller.valueChanged += value => {
                 if (refreshing) return;
                 follow = value >= chatScroll.verticalScroller.highValue - 36;
@@ -100,9 +120,10 @@ namespace GMGN.UnityPlayer
             }, TrickleDown.TrickleDown);
             play.clicked += () => backend?.PlayPause(); root.Q<Button>("next").clicked += () => backend?.Next();
             root.Q<Button>("previous").clicked += () => backend?.Previous();
-            root.Q<Button>("chooseMusic").clicked += () => { ToggleChat(false); queuePanel?.Toggle(); };
+            root.Q<Button>("chooseMusic").clicked += () => { ToggleChat(false); queuePanel?.SetVisible(false); musicLibraryPanel?.Toggle(); };
             volume.RegisterValueChangedCallback(e => backend?.SetVolume(e.newValue));
             sculpture = gameObject.AddComponent<AudioSculpture>();
+            pointArtwork = gameObject.AddComponent<PointCloudArtworkLoader>();
             gpuLyrics = gameObject.AddComponent<GpuLyricsView>();
             root.Q<Button>("settings").clicked += () => { Debug.Log("External settings clicked"); backend?.OpenSettings(); };
             try { backend = PlayerBackend.Create?.Invoke(); }
@@ -110,6 +131,7 @@ namespace GMGN.UnityPlayer
             if (backend == null) { status.text = "音乐与对话服务未连接"; SetConnected(false); return; }
             backend.Snapshot += OnSnapshot; backend.Chat += OnChat; backend.Status += OnStatus;
             queuePanel = QueuePanel.Attach(root.Q(className: "body"), backend);
+            if (backend is NativePlayerBackend nativeMusic) musicLibraryPanel = new MusicLibraryPanel(root.Q(className: "body"), nativeMusic, () => queuePanel.SetVisible(true));
             if (backend is NativePlayerBackend native) {
                 var world = gameObject.AddComponent<WorldRuntimeBridge>();
                 world.Initialize(native, sculpture);
@@ -133,7 +155,7 @@ namespace GMGN.UnityPlayer
             SetConnected(true); status.text = "音乐与角色已连接";
         }
         void SetConnected(bool ready) { connected = ready; play.SetEnabled(ready); volume.SetEnabled(ready); root.Q<Button>("next").SetEnabled(false); root.Q<Button>("previous").SetEnabled(false); root.Q<Button>("chooseMusic").SetEnabled(ready); root.Q<Button>("settings").SetEnabled(ready); UpdateComposer(); }
-        void ToggleChat(bool visible) { if (visible) queuePanel?.SetVisible(false); chatPanel.EnableInClassList("hidden", !visible); root.Q<Button>("chatToggle").EnableInClassList("selected", visible); if (visible) { draft.Focus(); if (follow) ScrollToLatest(); } }
+        void ToggleChat(bool visible) { if (visible) queuePanel?.SetVisible(false); chatPanel.EnableInClassList("hidden", !visible); root.Q<Button>("chatToggle").EnableInClassList("selected", visible); if (visible) { draft.schedule.Execute(() => draft.Focus()); if (follow) ScrollToLatest(); } }
         void UpdateComposer() { send.SetEnabled(connected && pending == null && !string.IsNullOrWhiteSpace(draft.value)); send.EnableInClassList("hidden", pending != null); cancel.EnableInClassList("hidden", pending == null); cancel.SetEnabled(connected && pending != null); }
         void OnStatus(string value) => status.text = value;
         void OnSnapshot(PlayerSnapshot snapshot)
@@ -163,11 +185,27 @@ namespace GMGN.UnityPlayer
             play.tooltip = snapshot.playing ? "暂停" : "播放";
             playIcon.Kind = snapshot.playing ? "pause" : "play";
             sculpture.SetFeatures(snapshot.playing, snapshot.bass, snapshot.vocal, snapshot.treble);
+            if (snapshot.pointCloud is { } points) {
+                var weights = Components(points.presetWeights);
+                sculpture.SetVisual(points.choice, points.intensity, points.particleSize,
+                    new Vector3(weights.x, weights.y, weights.z), points.composition);
+                sculpture.SetRhythm(Components(points.rhythm), Components(points.waveA), Components(points.waveB));
+                pointArtwork.Load(points.artworkURL);
+            }
         }
+        static Vector4 Components(float[] values) => new Vector4(
+            values != null && values.Length > 0 ? values[0] : 0,
+            values != null && values.Length > 1 ? values[1] : 0,
+            values != null && values.Length > 2 ? values[2] : 0,
+            values != null && values.Length > 3 ? values[3] : 0);
         static string Format(double seconds) { var span = TimeSpan.FromSeconds(Math.Max(0, seconds)); return $"{(int)span.TotalMinutes}:{span.Seconds:00}"; }
         void Send()
         {
-            if (backend == null || pending != null || string.IsNullOrWhiteSpace(draft.value)) return;
+            if (backend == null || pending != null || string.IsNullOrWhiteSpace(draft.value)) {
+                Debug.Log($"[UnityChat] send_blocked backend={backend != null} pending={pending != null} hasText={!string.IsNullOrWhiteSpace(draft.value)}");
+                return;
+            }
+            Debug.Log("[UnityChat] send_clicked");
             pending = Guid.NewGuid().ToString("N"); var text = draft.value.Trim();
             messages.Add(new Message { role = "你", text = text });
             GetComponent<UIDocument>().rootVisualElement.Q<Label>("emptyChat").AddToClassList("hidden");
@@ -178,6 +216,7 @@ namespace GMGN.UnityPlayer
         }
         void OnChat(ChatUpdate update)
         {
+            if (update.complete) Debug.Log($"[UnityChat] completed failed={!string.IsNullOrEmpty(update.error)} hasText={!string.IsNullOrEmpty(update.text)}");
             if (!indices.TryGetValue(update.messageId, out var index)) return;
             var message = messages[index];
             message.failed = !string.IsNullOrEmpty(update.error);
@@ -212,7 +251,7 @@ namespace GMGN.UnityPlayer
         }
         void BindKeyboard() { if (keyboard == Keyboard.current) return; if (keyboard != null) keyboard.onIMECompositionChange -= OnComposition; keyboard = Keyboard.current; if (keyboard != null) keyboard.onIMECompositionChange += OnComposition; }
         void OnComposition(IMECompositionString value) { var next = value.ToString(); if (composition.Length > 0 && next.Length == 0) compositionEndedFrame = Time.frameCount; composition = next; }
-        void OnDestroy() { followScroll?.Pause(); queuePanel?.Dispose(); if (keyboard != null) keyboard.onIMECompositionChange -= OnComposition; if (backend == null) return; backend.Snapshot -= OnSnapshot; backend.Chat -= OnChat; backend.Status -= OnStatus; backend.Dispose(); }
+        void OnDestroy() { followScroll?.Pause(); queuePanel?.Dispose(); musicLibraryPanel?.Dispose(); if (keyboard != null) keyboard.onIMECompositionChange -= OnComposition; if (backend == null) return; backend.Snapshot -= OnSnapshot; backend.Chat -= OnChat; backend.Status -= OnStatus; backend.Dispose(); }
 
         ToolbarIcon AddIcon(string name, string kind)
         {

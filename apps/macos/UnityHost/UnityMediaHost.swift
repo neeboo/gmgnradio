@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import UniformTypeIdentifiers
+import AVFoundation
 
 /// Unity owns the window and renderer. This host constructs only the actual
 /// audio graph and isolated DSH conversation, never AppDelegate or a scene.
@@ -11,7 +12,16 @@ final class UnityMediaHost {
     let player: LocalMusicPlayer
     let chat: RenderHostResidentConversation
     let world: UnityWorldBridge
+    let musicLibrary: UnityMusicLibraryBridge
+    private var libraryQueueActive = false
+    private var libraryTrack: MusicCandidate?
+    private var musicQueueRevision: UInt64 = 0
+    private var emittedMusicQueueRevision: UInt64?
     private let root: URL
+    private let productSettings: UnityProductSettings
+    private let visualDirection: StageVisualDirectionStore
+    private let visualTimeline = StageVisualPresetTimeline()
+    private let visualEpoch = ProcessInfo.processInfo.systemUptime
     private let lyricsStore = StageLyricsStore()
     private var visualRevision: UInt64 = 0
     private var settingsBridge: UnitySettingsBridge?
@@ -32,7 +42,10 @@ final class UnityMediaHost {
 
     init(root: URL, defaults: UserDefaults) throws {
         self.root = root
+        productSettings = UnityProductSettings(root: root, defaults: defaults)
+        visualDirection = StageVisualDirectionStore(defaults: defaults)
         world = UnityWorldBridge(root: root)
+        musicLibrary = UnityMusicLibraryBridge(root: root)
         graph = AudioGraphController(visualStore: features)
         if ProcessInfo.processInfo.environment["GMGN_UNITY_TEST_MUTED"] == "1" {
             graph.musicVolume = 0
@@ -40,14 +53,33 @@ final class UnityMediaHost {
         player = LocalMusicPlayer(graph: graph)
         chat = try RenderHostResidentConversation(backend: "dsh", dataRoot: root, defaults: defaults)
         player.setCompletionHandler { [weak self] in
-            guard let self, self.queueIndex + 1 < self.queue.count else { return }
+            guard let self else { return }
             _ = self.command(["op": "music.next"])
         }
+        musicLibrary.onPrepared = { [weak self] url, lyrics, candidate in
+            guard let self, !self.closed else { return false }
+            do {
+                // Validate the file before the shared graph stops its old node.
+                _ = try AVAudioFile(forReading: url)
+                try self.player.load(url)
+                try self.player.play()
+                self.session &+= 1; self.pausedPosition = nil
+                self.queue = [self.entry(path: url.path)]; self.queueIndex = 0
+                self.lyricsStore.clear(); self.lines = []; self.lyricRevision &+= 1
+                self.libraryQueueActive = true; self.libraryTrack = candidate
+                self.musicQueueRevision &+= 1
+                if let lyrics {
+                    self.lyricsStore.publish(lyrics, trackID: candidate.id, trackDuration: candidate.duration)
+                    self.lines = self.lyricsStore.lines; self.lyricRevision &+= 1
+                }
+                return true
+            } catch { self.notice = "这首歌未能开始播放，请选择另一首重试。"; return false }
+        }
         settingsBridge = try? UnitySettingsBridge(root: root,
-            command: { [weak self] value in self?.command(value) ?? false },
+            command: { [weak self] value in self?.settingsCommand(value) ?? false },
             snapshot: { [weak self] in
                 guard let self else { return [:] }
-                return ["version": 1, "lyricVisual": self.playerVisualSettingsSnapshot()]
+                return self.settingsSnapshot()
             })
     }
 
@@ -92,8 +124,16 @@ final class UnityMediaHost {
                       let mode = StageLyricsVisualMode.allCases.first(where: { $0.agentValue == id }) else { return false }
                 lyricsStore.setVisualMode(mode)
                 visualRevision &+= 1
+            case "stage.player.cloud", "stage.player.particles": return settingsCommand(value)
             case "world.snapshot", "world.commit", "world.placement.evaluate", "world.placement.derive":
                 return world.command(value)
+            case "music.library": return musicLibrary.refresh()
+            case "music.playlist":
+                guard let id = value["playlistID"] as? String else { return false }
+                return musicLibrary.readPlaylist(id)
+            case "music.playlist.play":
+                guard let id = value["playlistID"] as? String, let index = value["index"] as? Int else { return false }
+                return musicLibrary.play(playlistID: id, index: index)
             case "music.choose":
                 guard openPanel == nil else { return false }
                 let panel = NSOpenPanel()
@@ -117,6 +157,8 @@ final class UnityMediaHost {
                 let rawLyric = value["lyricPath"] as? String
                 let lyric = rawLyric.flatMap { $0.isEmpty ? nil : $0 }
                 guard lyric == nil || lyric!.hasPrefix("/") else { return false }
+                musicLibrary.clearQueue(); libraryQueueActive = false; libraryTrack = nil
+                musicQueueRevision &+= 1
                 queue = [entry(path: path, lyricPath: lyric)]
                 queueIndex = 0
                 try loadQueueEntry(autoplay: value["autoplay"] as? Bool == true)
@@ -125,18 +167,23 @@ final class UnityMediaHost {
                       paths.allSatisfy({ $0.hasPrefix("/") }) else { return false }
                 let index = value["index"] as? Int ?? 0
                 guard paths.indices.contains(index) else { return false }
+                musicLibrary.clearQueue(); libraryQueueActive = false; libraryTrack = nil
+                musicQueueRevision &+= 1
                 queue = paths.map { entry(path: $0) }
                 queueIndex = index
                 try loadQueueEntry(autoplay: value["autoplay"] as? Bool == true)
             case "music.next":
+                if libraryQueueActive { return musicLibrary.select(musicLibrary.index + 1) }
                 guard queueIndex + 1 < queue.count else { return false }
                 queueIndex += 1
                 try loadQueueEntry(autoplay: true)
             case "music.select":
+                if libraryQueueActive, let index = value["index"] as? Int { return musicLibrary.select(index) }
                 guard let index = value["index"] as? Int, queue.indices.contains(index) else { return false }
                 queueIndex = index
                 try loadQueueEntry(autoplay: true)
             case "music.previous":
+                if libraryQueueActive { return musicLibrary.select(musicLibrary.index - 1) }
                 guard queueIndex > 0 else { return false }
                 queueIndex -= 1
                 try loadQueueEntry(autoplay: true)
@@ -169,18 +216,29 @@ final class UnityMediaHost {
     func snapshot() -> [String: Any] {
         let f = features.current
         var music: [String: Any] = ["playbackSessionID": session,
-            "title": player.track?.title ?? "", "duration": player.track?.duration ?? 0,
+            "title": libraryTrack?.title ?? player.track?.title ?? "", "duration": player.track?.duration ?? 0,
             "position": pausedPosition ?? player.playbackPosition, "isPlaying": player.isGraphPlaying,
             "volume": graph.musicVolume, "seekSupported": false,
             "canNext": queueIndex + 1 < queue.count, "canPrevious": queueIndex > 0,
             "queueIndex": queueIndex, "queueCount": queue.count,
-            "queue": queue.enumerated().map { ["index": $0.offset, "title": $0.element.url.deletingPathExtension().lastPathComponent] },
             "features": ["amplitude": f.amplitude, "low": f.low, "mid": f.mid,
                          "high": f.high, "bass": f.bass, "vocal": f.vocal, "treble": f.treble,
                          "beat": f.beat, "onset": f.onset],
             "lyricRevision": lyricRevision,
             "lyricVisual": playerVisualSettingsSnapshot(),
+            "pointCloud": pointCloudSnapshot(),
             "notice": notice as Any? ?? NSNull()]
+        if libraryQueueActive {
+            music["canNext"] = musicLibrary.index + 1 < musicLibrary.queue.count
+            music["canPrevious"] = musicLibrary.index > 0
+            music["queueIndex"] = musicLibrary.index; music["queueCount"] = musicLibrary.queue.count
+        }
+        if emittedMusicQueueRevision != musicQueueRevision {
+            music["queue"] = libraryQueueActive
+                ? musicLibrary.queue.enumerated().map { ["index": $0.offset, "title": $0.element.title] }
+                : queue.enumerated().map { ["index": $0.offset, "title": $0.element.url.deletingPathExtension().lastPathComponent] }
+            emittedMusicQueueRevision = musicQueueRevision
+        }
         // Raw timeline is sent once per song; no per-frame style layout or
         // full timeline retransmission. An empty lines array clears old lyrics.
         if emittedLyricRevision != lyricRevision {
@@ -195,7 +253,7 @@ final class UnityMediaHost {
         conversation["capabilities"] = ["streamingReplies": true, "deltaTextMode": "replace",
             "cancelActiveReply": true, "cancellationAcknowledgement": "local-turn-invalidated",
             "providerCancellationAcknowledgement": false]
-        return ["version": 1, "music": music, "chat": conversation, "world": world.snapshot()]
+        return ["version": 1, "music": music, "musicLibrary": musicLibrary.snapshot(), "chat": conversation, "world": world.snapshot()]
     }
 
     func close() {
@@ -205,7 +263,56 @@ final class UnityMediaHost {
         player.stop()
         chat.close()
         world.close()
+        musicLibrary.close()
         settingsBridge?.close()
+        productSettings.close()
+    }
+
+    private func settingsCommand(_ value: [String: Any]) -> Bool {
+        guard !closed, let op = value["op"] as? String else { return false }
+        switch op {
+        case "stage.load": return true
+        case "stage.player.lyrics": return command(value)
+        case "stage.player.cloud":
+            guard let raw = value["id"] as? String, let choice = StagePointCloudChoice(rawValue: raw) else { return false }
+            visualDirection.selectPointCloud(choice); visualRevision &+= 1; return true
+        case "stage.player.particles":
+            guard let number = value["value"] as? NSNumber, number.floatValue.isFinite,
+                  StageParticleSizing.manualRange.contains(number.floatValue) else { return false }
+            visualDirection.setParticleSizeMultiplier(number.floatValue); visualRevision &+= 1; return true
+        default: return productSettings.command(value)
+        }
+    }
+
+    private func settingsSnapshot() -> [String: Any] {
+        var settings = productSettings.snapshot
+        settings["unity"] = ["availableSections": ["歌词", "视觉效果", "语音播放", "按住说话", "自主行动"],
+                             "availableAgentGroups": ["回复语音", "按住说话", "居民人格"],
+                             "autoSpeakSupported": false,
+                             "unavailableMessage": "此设置尚未接入 Unity；角色、快捷键、视频、空间活动与音乐账号仍由原应用管理。"]
+        return ["version": 1, "revision": visualRevision, "settings": settings,
+                "stage": ["mode": "player", "stageRadioPluginEnabled": true,
+                          "player": ["lyrics": StageLyricsVisualMode.allCases.map { ["id": $0.agentValue, "name": $0.displayName] },
+                                     "lyricID": lyricsStore.visualMode.agentValue,
+                                     "clouds": StagePointCloudChoice.allCases.map { ["id": $0.rawValue, "name": $0.title] },
+                                     "cloudID": visualDirection.currentPointCloudChoice.rawValue,
+                                     "particleScale": visualDirection.particleSizeMultiplier]],
+                "supportedCommands": ["settings.load", "speech.settings.load", "speech.settings.cancel", "stage.load",
+                                      "stage.player.lyrics", "stage.player.cloud", "stage.player.particles", "agent.save",
+                                      "tts.provider", "tts.refresh", "tts.save", "tts.preview", "tts.stop", "asr.provider", "asr.save"]]
+    }
+
+    private func pointCloudSnapshot() -> [String: Any] {
+        let automatic = visualTimeline.sample(at: Float(ProcessInfo.processInfo.systemUptime - visualEpoch))
+        let frame = visualDirection.currentPointCloudChoice.resolvedPresetFrame(automatic: automatic)
+        return ["choice": visualDirection.currentPointCloudChoice.rawValue,
+                "intensity": visualDirection.currentIntensity, "particleSize": visualDirection.particleSizeMultiplier,
+                "presetWeights": [frame.weights.x, frame.weights.y, frame.weights.z], "composition": frame.composition,
+                "artworkURL": libraryTrack?.artworkURL?.absoluteString as Any? ?? NSNull(),
+                "rhythm": [features.current.beat, features.current.onset, features.current.amplitude,
+                           (0..<8).reduce(Float.zero) { $0 + features.current.waveform[$1] } / 8],
+                "waveA": (0..<4).map { features.current.waveform[$0] },
+                "waveB": (4..<8).map { features.current.waveform[$0] }]
     }
 
     private func playerVisualSettingsSnapshot() -> [String: Any] {

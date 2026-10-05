@@ -56,6 +56,27 @@ fn music_sync_command(provider:&Value,working:bool)->Option<Value>{
     if working||provider["syncing"].as_bool()==Some(true)||provider["connected"].as_bool()!=Some(true){return None;}
     Some(json!({"op":"music.sync","id":provider["id"]}))
 }
+fn unity_section_available(snapshot: &Value, section: &str) -> bool {
+    snapshot["unity"]["availableSections"].as_array().is_some_and(|sections| sections.iter().any(|value| value.as_str() == Some(section)))
+}
+fn unity_agent_group_available(snapshot: &Value, title: &str) -> bool {
+    snapshot["unity"]["availableAgentGroups"].as_array().is_some_and(|groups| groups.iter().any(|value| value.as_str() == Some(title)))
+}
+
+#[cfg(test)]
+mod unity_settings_capability_tests {
+    use super::{unity_agent_group_available, unity_section_available};
+    use serde_json::{Value, json};
+    #[test]
+    fn host_capabilities_enable_real_groups_and_keep_missing_groups_explicit() {
+        let snapshot = json!({"unity":{"availableSections":["歌词","视觉效果","语音播放","自主行动"],"availableAgentGroups":["回复语音","居民人格"]}});
+        assert!(unity_section_available(&snapshot, "视觉效果"));
+        assert!(unity_agent_group_available(&snapshot, "居民人格"));
+        assert!(!unity_agent_group_available(&snapshot, "自主行动"));
+        assert!(!unity_section_available(&snapshot, "音乐账号与歌单同步"));
+        assert!(!unity_section_available(&Value::Null, "歌词"));
+    }
+}
 
 fn orb_preview() -> impl IntoElement {
     div()
@@ -722,7 +743,7 @@ impl AgentSettingsPane {
                 .child("正在读取原应用配置与 Rust 服务能力…")
                 .into_any_element();
         }
-        let group = |title: &'static str| SettingsGroup::new(title, border).visible(match self.section.as_str(){"语音播放"=>title=="回复语音","按住说话"=>title=="按住说话","自主行动"=>matches!(title,"角色人格与偏好"|"居民人格"|"自主行动"),_=>matches!(title,"角色内核"|"聊天模型")});
+        let group = |title: &'static str| SettingsGroup::new(title, border).visible((!self.unity_external || unity_agent_group_available(&self.snapshot, title)) && match self.section.as_str(){"语音播放"=>title=="回复语音","按住说话"=>title=="按住说话","自主行动"=>matches!(title,"角色人格与偏好"|"居民人格"|"自主行动"),_=>matches!(title,"角色内核"|"聊天模型")});
         form=form.child(group("角色内核")
             .child(div().flex().items_center().gap(px(12.)).child(div().size(px(32.)).rounded_lg().bg(cx.theme().muted).flex().items_center().justify_center().child(Icon::new(IconName::Terminal).size(px(20.))))
                 .child(div().flex_1().flex().flex_col().child("gmgn 角色").child(self.snapshot["agent"]["codexStatus"].as_str().unwrap_or("策划引擎未登录").to_owned()))
@@ -751,7 +772,7 @@ impl AgentSettingsPane {
             .child(self.dropdown("budget","每小时后台思考预算","agent","backgroundTurnsPerHour",self.options("agent","budgetOptions"),cx))
             .child(div().text_xs().child("按最近一小时算，默认 6。这只数后台思考的次数，不等于请求次数或费用。")))
             .child(group("回复语音")
-            .child(self.toggle("auto-speak","自动朗读 Agent 回复","autoSpeak",cx))
+            .children((!self.unity_external || self.snapshot["unity"]["autoSpeakSupported"].as_bool() == Some(true)).then(||self.toggle("auto-speak","自动朗读 Agent 回复","autoSpeak",cx)))
             .child(self.dropdown("tts-provider","服务","tts","providerID",self.options("tts","providers"),cx))
             .child(div().flex().items_center().justify_between().child("API Key").child(div().w(px(280.)).child(Input::new(&self.extra_inputs[0]).aria_label("新的 TTS API Key"))))
             .child(self.dropdown("tts-voice","声音","tts","voiceID",self.options("tts","voices"),cx))
@@ -766,7 +787,7 @@ impl AgentSettingsPane {
                     .children((self.draft["tts"]["providerID"].as_str()==Some("bailian")).then(||div().text_xs().child("百炼复刻音色需要在模型列表选择对应的 VC Realtime 快照；创建音色时的 target_model 必须匹配。")))))
             .child(self.dropdown("tts-model","模型","tts","modelID",self.options("tts","models"),cx))
             .children((self.snapshot["tts"]["catalogLoaded"].as_bool()==Some(true)&&!valid_model).then(||div().text_xs().child("原配置模型不在当前支持列表中，请选择后保存；不会自动改用其他模型。")))
-            .child(if self.snapshot["tts"]["credentialConfigured"].as_bool()==Some(true) { "沿用原应用已配置凭据" } else { "该服务尚未配置凭据，请填写后保存" })
+            .child(if self.snapshot["tts"]["credentialConfigured"].as_bool()==Some(true) { if self.unity_external { "已配置 Unity 会话凭据" } else { "沿用原应用已配置凭据" } } else { "该服务尚未配置凭据，请填写后保存" })
             .child(div().flex().flex_wrap().gap_2()
                 .child(Button::new("save-tts").label("保存配置").disabled(!valid_model).on_click(cx.listener(|this,_,_,cx|this.tts_action("tts.save",cx)))))
             .child(div().text_xs().child("传输：本机 TCP → Rust → 服务商；录放音留在系统设备层。"))
@@ -780,7 +801,7 @@ impl AgentSettingsPane {
             .child(Button::new("save-asr").label("保存配置").disabled(!self.snapshot["asr"]["models"].as_array().is_some_and(|models|models.iter().any(|model|model["id"]==self.draft["asr"]["modelID"]))).on_click(cx.listener(|this,_,_,cx|{
                 let mut value=this.draft["asr"].clone();value["op"]=json!("asr.save");value["apiKey"]=json!(this.extra_inputs[1].read(cx).value().to_string());this.commands.push(value);
             })))
-            .child("在空间或 Live Cam 按住麦克风录音，松开后将完整转写交给当前 Agent。没有双向实时通话。")
+            .child(if self.unity_external { "当前可管理语音配置和试听；Unity 按住说话及回复朗读尚未接入。" } else { "在空间或 Live Cam 按住麦克风录音，松开后将完整转写交给当前 Agent。没有双向实时通话。" })
             .children(self.snapshot["asr"]["notice"].as_str().map(|notice|div().text_xs().child(notice.to_owned()))));
         form.into_any_element()
     }
@@ -1320,10 +1341,10 @@ impl Render for AgentSettingsPane {
             7 => ("活动", "选择与控制空间生活活动"),
             _ => ("Agent 与语音", "文字和语音共用同一会话，回答后再朗读"),
         };
-        let content = if self.unity_external && !(self.page == 5 && (self.section == "歌词" || (self.section == "视觉效果" && self.snapshot["unity"]["visualEffectsSupported"].as_bool() == Some(true)))) {
+        let content = if self.unity_external && !unity_section_available(&self.snapshot, &self.section) {
             div().px(px(20.)).py(px(16.)).text_size(px(ui::BODY))
                 .text_color(cx.theme().muted_foreground)
-                .child("此功能尚未接入 Unity。原有应用的数据和配置保持不变。")
+                .child(self.snapshot["unity"]["unavailableMessage"].as_str().unwrap_or("正在读取 Unity 设置能力…").to_owned())
                 .into_any_element()
         } else if self.page>=5 {
             self.stage_pane.as_ref().map(|pane| {
@@ -1355,7 +1376,7 @@ impl Render for AgentSettingsPane {
                     .child(div().text_size(px(ui::TITLE)).font_weight(FontWeight::SEMIBOLD).child(self.section.clone()))
                     .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(subtitle)),
             );
-        if self.page == 0 {
+        if self.page == 0 && (!self.unity_external || unity_section_available(&self.snapshot, &self.section)) {
             let weak = cx.entity().downgrade();
             header = header.child(
                 Button::new("presence-import")

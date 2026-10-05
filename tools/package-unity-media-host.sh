@@ -18,6 +18,12 @@ settings_binary="$repo_root/tools/gpui-scenekit-probe/target/release/gmgn-unity-
 settings_app="$app/Contents/Helpers/GMGN Unity Settings.app"
 [[ ! -e "$settings_app" && ! -e "$app/Contents/MacOS/gmgn-unity-settings" ]] || { echo 'Settings already packaged; use a fresh App build' >&2; exit 2; }
 [[ ! -L "$app/Contents/Helpers" ]] || { echo 'Refusing symlinked settings destination' >&2; exit 2; }
+taskd_binary="$repo_root/target/release/gmgn-taskd"
+[[ ! -e "$app/Contents/Helpers/gmgn-taskd" ]] || { echo 'Task service already packaged; use a fresh App build' >&2; exit 2; }
+# Reuse the product Rust service. UnityProductSettings supplies its isolated
+# root/endpoint explicitly; packaging never discovers an installed service.
+cargo +1.95.0 build --release --manifest-path "$repo_root/Cargo.toml" -p gmgn-taskd --locked --offline
+[[ -x "$taskd_binary" ]] || { echo 'Task service build did not produce the helper' >&2; exit 1; }
 [[ ! -e "$plugins/UnityMediaHost.dylib" ]] || { echo 'Host already packaged; use a fresh App build' >&2; exit 2; }
 for framework in LiveKitWebRTC.framework RustLiveKitUniFFI.framework; do
   [[ -d "$products/$framework" ]] || { echo "Missing required framework: $framework" >&2; exit 1; }
@@ -47,6 +53,8 @@ if ! otool -l "$plugins/UnityMediaHost.dylib" | rg 'path @loader_path ' >/dev/nu
 fi
 codesign --force --sign - "$plugins/UnityMediaHost.dylib"
 mkdir -p "$settings_app/Contents/MacOS"
+cp "$taskd_binary" "$app/Contents/Helpers/gmgn-taskd"
+codesign --force --sign - "$app/Contents/Helpers/gmgn-taskd"
 cp "$repo_root/tools/unity-settings-info.plist" "$settings_app/Contents/Info.plist"
 cp "$settings_binary" "$settings_app/Contents/MacOS/gmgn-unity-settings"
 codesign --force --sign - "$settings_app"
@@ -57,5 +65,6 @@ for framework in LiveKitWebRTC.framework RustLiveKitUniFFI.framework; do
 done
 codesign --verify --strict "$plugins/UnityMediaHost.dylib"
 codesign --verify --deep --strict "$settings_app"
+codesign --verify --strict "$app/Contents/Helpers/gmgn-taskd"
 codesign --verify --deep --strict "$app"
 printf 'Packaged independent Unity host: %s\n' "$app"

@@ -1,6 +1,14 @@
 # GPU 点阵接入与验收边界
 
-此目录提供通用 GPU 更新/绘制模块。AudioSculpture 已接入 48 个环形点的 GPU 更新及批量绘制，移除了旧的逐柱 GameObject/Transform 更新。仍不表示原有歌词风格已迁移。
+此前 AudioSculpture 的 48 点圆环只是一段接入探针，未迁移原播放器，不能作为完整点阵。最新候选已经替换为原 StageRenderer 实际使用的 albumCanvas144²（20736点）及 ambientField1800（1170 dust/324 shard/306 floor），共22536点；种子按原SplitMix64及数值生成一次，拓扑、音频形变、真实封面采样、色彩传播、环境浮动由GPU更新。原 djTotem 仅留在Swift几何工具，StageRenderer未使用，不能把它误当当前播放器主体。
+
+模式映射：flowingCanvas流幕、orbitalShell星球、openRibbon光带、vinylRecord封面浅浮雕、galaxyField六层星河、tunnel滚筒、void留白；automatic消费宿主真实timeline.weights/composition，不在Unity伪造轮播。原Stage.metal的折幕/双螺旋/bloom复合形通过composition0..1连续混合，三个手动变体使用composition2。所有模式共用GPU buffer，切模式不逐点上传。
+
+当前仍是源码候选：原多层bloom、palette主题混色、视频porous/compositing/背景渐变、完整摄像机轨道与环境shape fragment的细节尚未逐像素移植；空间world可见性由WorldBridge控制，不从点阵模块擅自改。不能把22536点或编译通过当作8模式视觉/帧率全部验收。
+
+集成接口：AudioSculpture.SetVisual(choice,intensity,particleSize,automaticWeights,automaticComposition)，SetRhythm真实beat/onset/amplitude/均值和8波形，SetArtwork真实Texture。PointCloudArtworkLoader.Load(artworkURL)异步读取真实library封面，URL变化才请求；失败/空元数据不使用假图。Intensity0..1，particleSize.6..1.6，按原ScreenHeight/1080缩放（.72..2）并在pixel billboard绘制中应用。默认场景中心与Camera看向0，移除旧小环左偏镜头。
+
+独立构建检查入口StagePointsValidation.Validate：48-byte stride、22536精确区域数量、确定性种子、所有手动模式ID与Compute/Draw shader错误。主代理还须真实静音逐模式截图、封面/音频关联、切模式/切歌/窗口全屏/空间恢复及CPU/GPU帧时间验收。
 
 ## 接口
 

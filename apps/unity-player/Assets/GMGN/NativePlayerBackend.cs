@@ -19,9 +19,9 @@ namespace GMGN.UnityPlayer
         [DllImport(Library)] static extern IntPtr gmgn_unity_host_snapshot(IntPtr host);
         [DllImport(Library)] static extern void gmgn_unity_host_string_free(IntPtr value);
         [DllImport(Library)] static extern int gmgn_unity_host_destroy(IntPtr host);
-        [Serializable] sealed class Envelope { public Music music; public Conversation chat; public WorldPulse world; }
+        [Serializable] sealed class Envelope { public Music music; public Conversation chat; public WorldPulse world, musicLibrary; }
         [Serializable] sealed class WorldPulse { public ulong generation; public bool pending; public string status; }
-        [Serializable] sealed class Music { public ulong playbackSessionID; public string title, notice; public double duration, position; public bool isPlaying, canNext, canPrevious, seekSupported; public int queueIndex, queueCount; public QueueItem[] queue; public float volume; public Features features; public long lyricRevision; public LyricVisualSnapshot lyricVisual; public LyricPointLine[] lines; }
+        [Serializable] sealed class Music { public ulong playbackSessionID; public string title, notice; public double duration, position; public bool isPlaying, canNext, canPrevious, seekSupported; public int queueIndex, queueCount; public QueueItem[] queue; public float volume; public Features features; public long lyricRevision; public LyricVisualSnapshot lyricVisual; public PointCloudSnapshot pointCloud; public LyricPointLine[] lines; }
         [Serializable] sealed class Features { public float low, mid, high, bass, vocal, treble; }
         [Serializable] sealed class Conversation { public Event[] events; }
         [Serializable] sealed class Event { public string kind, text, message; public ulong requestID; }
@@ -30,11 +30,17 @@ namespace GMGN.UnityPlayer
         IntPtr host;
         ulong sequence;
         LyricPointLine[] lyrics = Array.Empty<LyricPointLine>();
+        QueueItem[] musicQueue = Array.Empty<QueueItem>();
         ulong? lyricSession;
         long lyricRevision = -1;
         float nextPoll;
         bool playing;
         ulong? worldGeneration;
+        ulong? musicLibraryGeneration;
+        public event Action<JObject> MusicLibraryUpdated;
+        public bool RequestMusicLibrary() => ExecuteWorld(new JObject { ["op"] = "music.library" });
+        public bool RequestMusicPlaylist(string id) => ExecuteWorld(new JObject { ["op"] = "music.playlist", ["playlistID"] = id });
+        public bool PlayMusicPlaylistTrack(string id, int index) => ExecuteWorld(new JObject { ["op"] = "music.playlist.play", ["playlistID"] = id, ["index"] = index });
         public JObject WorldProjection { get; private set; }
         public event Action<JObject> WorldUpdated;
         public event Action<JObject> PlacementEvaluated;
@@ -114,6 +120,11 @@ namespace GMGN.UnityPlayer
             Envelope value; string json;
             try { json = Marshal.PtrToStringUTF8(pointer); value = JsonUtility.FromJson<Envelope>(json); }
             finally { gmgn_unity_host_string_free(pointer); }
+            if (value.musicLibrary != null && musicLibraryGeneration != value.musicLibrary.generation) {
+                musicLibraryGeneration = value.musicLibrary.generation;
+                var library = JObject.Parse(json)["musicLibrary"] as JObject;
+                if (library != null) MusicLibraryUpdated?.Invoke(library);
+            }
             if (value.world != null && worldGeneration != value.world.generation) {
                 worldGeneration = value.world.generation;
                 var update = JObject.Parse(json)["world"] as JObject;
@@ -130,6 +141,7 @@ namespace GMGN.UnityPlayer
             }
             if (value.music != null) {
                 var music = value.music; playing = music.isPlaying;
+                if (music.queue != null) musicQueue = music.queue;
                 if (lyricSession != music.playbackSessionID || lyricRevision != music.lyricRevision) {
                     // Clear old track data even when a new timeline is not ready.
                     lyricSession = music.playbackSessionID; lyricRevision = music.lyricRevision;
@@ -137,13 +149,16 @@ namespace GMGN.UnityPlayer
                 } else if (music.lines != null) lyrics = music.lines;
                 string lyric = "", translation = "";
                 foreach (var line in lyrics) { if (music.position >= line.startsAt && music.position < line.endsAt) { lyric = line.text; translation = line.translation; break; } }
-                Snapshot?.Invoke(new PlayerSnapshot { sessionId = music.playbackSessionID.ToString(), title = music.title, duration = music.duration, position = music.position, playing = music.isPlaying, nextSupported = music.canNext, previousSupported = music.canPrevious, seekSupported = music.seekSupported, volume = music.volume, lyric = lyric, translation = translation, lyricRevision = music.lyricRevision, lyricLines = lyrics, lyricVisual = music.lyricVisual, queueIndex = music.queueIndex, queueCount = music.queueCount, queue = music.queue ?? Array.Empty<QueueItem>(), bass = music.features?.bass ?? 0, vocal = music.features?.vocal ?? 0, treble = music.features?.treble ?? 0 });
+                Snapshot?.Invoke(new PlayerSnapshot { sessionId = music.playbackSessionID.ToString(), title = music.title, duration = music.duration, position = music.position, playing = music.isPlaying, nextSupported = music.canNext, previousSupported = music.canPrevious, seekSupported = music.seekSupported, volume = music.volume, lyric = lyric, translation = translation, lyricRevision = music.lyricRevision, lyricLines = lyrics, lyricVisual = music.lyricVisual, pointCloud = music.pointCloud, queueIndex = music.queueIndex, queueCount = music.queueCount, queue = musicQueue, bass = music.features?.bass ?? 0, vocal = music.features?.vocal ?? 0, treble = music.features?.treble ?? 0 });
                 if (!string.IsNullOrEmpty(music.notice)) Status?.Invoke(music.notice);
             }
             if (value.chat?.events == null) return;
             foreach (var item in value.chat.events) {
-                if (!requestIds.TryGetValue(item.requestID, out var id)) continue;
-                if (item.kind == "delta") {
+                if (!requestIds.TryGetValue(item.requestID, out var id)) { Debug.LogWarning($"[UnityChat] unmatched_event kind={item.kind} request={item.requestID}"); continue; }
+                if (item.kind != "delta") Debug.Log($"[UnityChat] event kind={item.kind} request={item.requestID}");
+                if (item.kind == "accepted") {
+                    Chat?.Invoke(new ChatUpdate { messageId = id, text = "已发送，正在等待角色回复…", complete = false });
+                } else if (item.kind == "delta") {
                     Chat?.Invoke(new ChatUpdate { messageId = id, text = item.text ?? "", complete = false });
                 } else if (item.kind == "reply" || item.kind == "failure" || item.kind == "cancelled") {
                     Chat?.Invoke(new ChatUpdate { messageId = id, text = item.text ?? item.message ?? "", error = item.kind == "failure" ? item.message : null, complete = true });
@@ -159,7 +174,7 @@ namespace GMGN.UnityPlayer
         public void OpenSettings() { if (!Execute(new Command { op = "settings.open" })) Status?.Invoke("设置面板暂时无法打开。"); }
         public void Seek(double seconds) => Status?.Invoke("当前音乐后端尚未提供跳转。");
         public void SetVolume(float volume) => Execute(new Command { op = "music.volume", value = volume });
-        public void Send(string messageId, string text) { var id = ++sequence; requestIds[id] = messageId; if (!Execute(new Command { op = "chat.send", requestID = id, text = text })) { requestIds.Remove(id); Chat?.Invoke(new ChatUpdate { messageId = messageId, error = "消息未发送，请重试。", complete = true }); } }
+        public void Send(string messageId, string text) { var id = ++sequence; requestIds[id] = messageId; var accepted = Execute(new Command { op = "chat.send", requestID = id, text = text }); Debug.Log($"[UnityChat] native_command accepted={accepted} request={id}"); if (!accepted) { requestIds.Remove(id); Chat?.Invoke(new ChatUpdate { messageId = messageId, error = "消息未发送，请重试。", complete = true }); } }
         public void Cancel(string messageId) { foreach (var pair in requestIds) if (pair.Value == messageId) { Execute(new Command { op = "chat.cancel", requestID = pair.Key }); break; } }
         public void Dispose() { if (host != IntPtr.Zero) gmgn_unity_host_destroy(host); host = IntPtr.Zero; }
     }

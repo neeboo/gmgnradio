@@ -18,6 +18,13 @@ namespace GMGN.UnityPlayer
         public long lyricRevision;
         public LyricPointLine[] lyricLines = Array.Empty<LyricPointLine>();
         public LyricVisualSnapshot lyricVisual;
+        public PointCloudSnapshot pointCloud;
+    }
+    [Serializable] public sealed class PointCloudSnapshot
+    {
+        public string choice, artworkURL;
+        public float intensity, particleSize, composition;
+        public float[] presetWeights, rhythm, waveA, waveB;
     }
     [Serializable] public sealed class LyricVisualSnapshot
     {

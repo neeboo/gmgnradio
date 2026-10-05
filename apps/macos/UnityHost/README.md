@@ -95,6 +95,18 @@ mode through authenticated external GPUI settings, not a duplicate Unity toggle.
 `settings.open` opens that independent settings process. Its read-only snapshot
 does not drain chat events or single-publication lyric timelines.
 
+The GPUI window also receives the live eight-mode point-cloud catalog and size
+setting, the Unity session's resident persona, and Rust TTS/ASR configuration.
+Speech catalogs and voice previews use the packaged `gmgn-taskd`, with a TCP
+endpoint under the explicit Unity root's `TaskService` directory. They do not
+load the original app's speech preferences or endpoint. Only credential presence
+crosses the snapshot; replacement credentials are command inputs.
+The persona is reread and injected into the isolated DSH prompt on every turn.
+Reply reading and microphone capture are not connected to Unity yet. Avatar,
+account management, shortcuts, videos, space activities and generated-space
+settings remain explicitly unavailable in this external window; the original
+GPUI product continues to own their complete settings.
+
 Unity caches the complete timeline only at session/lyric-revision boundaries and
 passes it to `GpuLyricsView`; it drives playback from the authoritative native
 audio clock. Unsupported GPU modes remain explicitly reported as unmigrated.

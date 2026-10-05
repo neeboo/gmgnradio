@@ -1,0 +1,101 @@
+#pragma kernel UpdatePoints
+// Topology equations ported from VisualEngine/Shaders/Stage.metal.
+struct Point{float4 position;float4 color;float4 timing;};
+StructuredBuffer<Point> _Seeds;RWStructuredBuffer<Point> _Points;
+Texture2D<float4> _Artwork;SamplerState sampler_Artwork;
+uint _PointCount;int _HasArtwork;float _Clock,_Intensity,_ParticleScale;
+float4 _Features,_Preset,_Rhythm,_WaveA,_WaveB,_Layering;
+float WaveValue(int i){return i<4?_WaveA[i]:_WaveB[i-4];}
+float Wave(float coordinate){float scaled=clamp(frac(coordinate),0,.9999)*8;int left=(int)floor(scaled);return lerp(WaveValue(left),WaveValue(min(left+1,7)),frac(scaled));}
+float3 Prism(float hue){return .52+.48*cos(6.2831853*(frac(hue)+float3(0,.6666667,.3333333)));}
+[numthreads(64,1,1)]void UpdatePoints(uint3 id:SV_DispatchThreadID){
+ if(id.x>=_PointCount)return;
+ Point p=_Seeds[id.x];float3 initial=p.position.xyz;float size=p.position.w,phase=p.timing.w;
+ float time=_Clock,low=_Features.x*_Features.w,mid=_Features.y*_Features.w,high=_Features.z*_Features.w;
+ float beat=_Rhythm.x*_Features.w,onset=_Rhythm.y*_Features.w,amplitude=_Rhythm.z*_Features.w;
+ float3 preset=_Preset.xyz;float compositionBase=saturate(_Preset.w),manualVariant=saturate(_Preset.w-1),mass=saturate(dot(preset,float3(1,1,1)));
+ if(p.timing.z>4.5){
+  float sizeClass=smoothstep(1.18,2.55,size),hero=smoothstep(2.75,4.2,size),floorClass=1-smoothstep(-2.68,-1.84,initial.y);
+  float3 position=initial;
+  position.x+=sin(time*.075+phase*1.37)*lerp(.1,.32,sizeClass);
+  position.y+=cos(time*.093+phase*.91)*lerp(.07,.22,sizeClass)+floorClass*(low*.16+beat*.32)*(.4+.6*sin(phase*2));
+  position.z+=sin(time*.052+phase*1.71)*lerp(.08,.28,sizeClass);
+  float twinkle=pow(.5+.5*sin(time*(.42+high*.8)+phase*3.1),5);
+  float3 color=lerp(p.color.rgb,Prism(frac(position.x*.035+position.z*.022+phase/6.2831853-time*.018)),.48);
+  color*=.55+twinkle*.72+beat*.24;
+  p.position=float4(position.x,position.y,-position.z,size*(1+amplitude*.16+high*.24+beat*lerp(.12,.34,sizeClass)+onset*.18)*lerp(1,3.8,hero));
+  p.color=float4(min(color,float3(1.42,1.42,1.42)),lerp(.26,.72,sizeClass)*(.72+twinkle*.28)*_Layering.y);
+  p.timing=float4(max(hero,floorClass*.72),.18,5,phase+time*lerp(.035,.12,hero)*(.45+.55*sin(phase*1.7)));
+  _Points[id.x]=p;return;
+ }
+ float2 uv=saturate(initial.xy/6+.5),sampleUV=float2(uv.x,1-uv.y);
+ float3 artwork=_Artwork.SampleLevel(sampler_Artwork,sampleUV,0).rgb;
+ uint texWidth,texHeight;_Artwork.GetDimensions(texWidth,texHeight);float2 texel=1/float2(max(texWidth,1u),max(texHeight,1u));
+ float3 lumaWeights=float3(.2126,.7152,.0722);float luma=dot(artwork,lumaWeights);
+ float left=dot(_Artwork.SampleLevel(sampler_Artwork,sampleUV-float2(texel.x*2,0),0).rgb,lumaWeights);
+ float right=dot(_Artwork.SampleLevel(sampler_Artwork,sampleUV+float2(texel.x*2,0),0).rgb,lumaWeights);
+ float up=dot(_Artwork.SampleLevel(sampler_Artwork,sampleUV-float2(0,texel.y*2),0).rgb,lumaWeights);
+ float down=dot(_Artwork.SampleLevel(sampler_Artwork,sampleUV+float2(0,texel.y*2),0).rgb,lumaWeights);
+ float edge=saturate(length(float2(right-left,down-up))*2.4);
+ float curtainNoise=sin(uv.x*18+uv.y*11-time*1.45+phase);
+ float3 curtain=float3(initial.xy,curtainNoise*(.1+mid*.34));
+ float foldAngle=(uv.x-.5)*1.34;float foldDepth=sin(uv.x*8*3.14159265+time*.16)*(.34+mid*.24);
+ curtain=lerp(curtain,float3(sin(foldAngle)*4.25,initial.y*.92,cos(foldAngle)*2.1-1.65+foldDepth),compositionBase);
+ float bias=1-saturate(length((uv-.5)*1.34));
+ float relief=(luma-.5)*.34+edge*.28+(bias-.5)*.1;
+ float column=(Wave(uv.x)-_Rhythm.w)*(.28+amplitude*.68)*(.72+_Intensity*.28);
+ column+=beat*(.08+low*.18)*(.4+.6*sin(uv.x*18+phase));
+ curtain=lerp(curtain,float3(initial.xy*.88,relief+column),manualVariant);
+ float theta=uv.x*6.2831853+time*.12,phi=(uv.y-.5)*3.14159265;
+ float radius=2.46+low*.24+beat*.14+sin(theta*3+phi*2.2)*cos(phi*4-theta)*.18+cos(theta*5-phi*1.5)*.1+(luma-.5)*.32;
+ float3 sphere=float3(radius*cos(phi)*cos(theta)*(1+cos(phi*2)*.12),radius*sin(phi)*(.94+sin(theta*2+phi)*.06),radius*cos(phi)*sin(theta)*(1.04-cos(phi*3)*.08));
+ float strand=floor(uv.x*2),helixWidth=frac(uv.x*2)-.5,helixAngle=(uv.y-.5)*8*3.14159265+strand*3.14159265+time*.22;
+ float helixRadius=1.34+helixWidth*.72;
+ sphere=lerp(sphere,float3(cos(helixAngle)*helixRadius,(uv.y-.5)*6.7,sin(helixAngle)*helixRadius),compositionBase);
+ float tunnelFlow=frac(uv.y-time*.032),tunnelAngle=uv.x*6.2831853+time*.09,tunnelDepth=(tunnelFlow-.5)*8.8;
+ float tunnelRadius=2.16+sin(tunnelAngle*5+tunnelDepth*1.2)*(.055+mid*.16)-low*.14;
+ sphere=lerp(sphere,float3(cos(tunnelAngle)*tunnelRadius,sin(tunnelAngle)*tunnelRadius,tunnelDepth),manualVariant);
+ float along=(uv.y-.5)*7.2,across=(uv.x-.5)*4.8;
+ float coherentSpeed=dot(preset,float3(1,1,.34)),ribbonTime=time*coherentSpeed;
+ float twist=along*(.68+sin(ribbonTime*.18)*.08)+ribbonTime*.1;
+ float width=.82+sin(along*1.16-ribbonTime*.42)*.07;
+ float3 center=float3(sin(along*.58+ribbonTime*.16)*.82,along*.7,cos(along*.46-ribbonTime*.12)*.62);
+ float3 axis=normalize(float3(cos(twist),sin(along*.92+ribbonTime*.18)*.08,sin(twist)));
+ float3 ribbon=center+axis*across*width+normalize(float3(-sin(twist),.22,cos(twist)))*sin(along*1.34-ribbonTime*.72)*.025;
+ float azimuth=(uv.x-.5)*6.2831853,latitude=(uv.y-.5)*3.14159265;
+ float bloomRadius=2.15+sin(azimuth*5+time*.14)*.46+cos(latitude*4-time*.11)*.26;
+ ribbon=lerp(ribbon,float3(bloomRadius*cos(latitude)*cos(azimuth),bloomRadius*sin(latitude)*1.18,bloomRadius*cos(latitude)*sin(azimuth)),compositionBase);
+ float laneCoordinate=uv.y*6,lane=floor(laneCoordinate),local=frac(laneCoordinate)-.5,laneUnit=(lane+.5)/6;
+ float galaxyAlong=(uv.x-.5)*10.8,galaxyPhase=galaxyAlong*(.42+laneUnit*.18)+lane*1.37-time*(.055+laneUnit*.025);
+ float broad=sin(galaxyPhase),fine=sin(galaxyPhase*2.4+phase)*.11;
+ ribbon=lerp(ribbon,float3(galaxyAlong+broad*(.36+laneUnit*.3),(laneUnit-.5)*5.7+broad*.72+local*.48,(laneUnit-.5)*6.4+cos(galaxyPhase*.76)*1.18+fine),manualVariant);
+ float3 position=curtain*preset.x+sphere*preset.y+ribbon*preset.z;
+ float reliefAmount=preset.x*manualVariant;
+ radius=max(length(position),.001);float3 direction=position/radius;
+ float waveform=Wave(phase/6.2831853+position.y*.075-time*.12),waveCentered=waveform-_Rhythm.w;
+ float motion=dot(preset,float3(.88,1.18,1.02))*lerp(.72,1.18,_Intensity);
+ float breathing=sin(time*1.25+phase)*(.012+low*.045)*motion;
+ float ripple=sin(radius*6-time*2.6+phase)*mid*(.045+waveform*.075)*motion;
+ float shock=beat*(.15+low*.17)*(.58+.42*sin(phase*2+radius*2.4));
+ float waveformDepth=waveCentered*(.1+amplitude*.22)*motion;
+ float3 tangent=normalize(cross(direction,float3(.17,1,.29))+float3(.001,0,0));
+ float gain=preset.x+preset.y;
+ float jitter=sin(phase*17+time*(13+high*18))*high*(.018+onset*.055)*gain;
+ float3 reactive=lerp(direction,float3(0,0,1),reliefAmount);reactive/=max(length(reactive),.001);
+ position+=reactive*(breathing+ripple+shock+waveformDepth)*gain+tangent*jitter*(1-reliefAmount);
+ float propagation=frac(uv.y*.72+uv.x*.34+radius*.065-time*(.055+coherentSpeed*.052)-waveform*.14);
+ float beatWave=(1-smoothstep(.018,.145,min(propagation,1-propagation)))*beat;
+ float echo=frac(propagation+.17),echoWave=(1-smoothstep(.025,.19,min(echo,1-echo)))*(beat*.58+onset*.42);
+ float hue=frac(uv.x*.46+uv.y*.31+position.z*.055+phase*.014+sin(position.y*.82+position.x*.31-time*.07)*.045+time*.014);
+ float3 prism=lerp(Prism(hue),Prism(hue+propagation*.72+beat*.08),.4+beatWave*.5);prism=lerp(prism,Prism(hue-.18+echo*.36),.12+echoWave*.42);
+ float3 source=_HasArtwork!=0?artwork:p.color.rgb;
+ float liftAmount=.28+(1-smoothstep(.06,.48,luma))*.38;
+ float3 readable=min(lerp(artwork,sqrt(max(artwork,float3(0,0,0))),liftAmount)*(1.04+edge*.32),float3(1.32,1.32,1.32));
+ source=lerp(source,readable,reliefAmount*_HasArtwork);
+ float presence=clamp(.58+_Intensity*.13+amplitude*.09,.58,.82);presence=lerp(presence,.14,reliefAmount);presence=lerp(presence,.92,preset.z*manualVariant);
+ float3 color=lerp(source,prism,presence)*lerp(.58,1.08,saturate(.5+position.z*.12))*(.92+amplitude*.16+beat*.2+onset*.12+beatWave*.36+echoWave*.16);
+ float coverAlpha=lerp(.18,1,smoothstep(.012,.17,luma+edge*.72))*(_HasArtwork!=0?1:.055);
+ float pointSize=size*(2.1+_Intensity*.55+high*1.1+beat*1.18+onset*.65)*dot(preset,float3(1,.92,1.12))*lerp(1,1.42,reliefAmount);
+ p.position=float4(position.x,position.y,-position.z,pointSize);p.color=float4(color,mass*_Layering.x*lerp(1,coverAlpha,reliefAmount));p.timing=float4(0,.18,4,phase);
+ _Points[id.x]=p;
+}

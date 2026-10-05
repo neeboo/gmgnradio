@@ -1,4 +1,4 @@
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{io::{Read, Write}, net::{Ipv4Addr, SocketAddrV4, TcpStream}, sync::mpsc, time::Duration};
 
 pub struct SettingsTransport {
@@ -16,10 +16,15 @@ pub fn start(path: &str) -> Result<SettingsTransport, String> {
     let (sender, receiver) = mpsc::channel::<Value>();
     let (updates, events) = mpsc::channel();
     std::thread::spawn(move || {
+        let mut supported = Value::Null;
         loop {
+            match request(port, &token, "GET", "/snapshot", None).and_then(project_snapshot) {
+                Ok(state) => { supported = state["supportedCommands"].clone(); if updates.send(Ok(state)).is_err() { break; } }
+                Err(error) => { if updates.send(Err(error)).is_err() { break; } }
+            }
             match receiver.recv_timeout(Duration::from_millis(250)) {
                 Ok(command) => {
-                    if command["op"].as_str() != Some("stage.player.lyrics") {
+                    if !supported.as_array().is_some_and(|ops| ops.iter().any(|op| op == &command["op"])) {
                         if updates.send(Err("此功能尚未接入 Unity，原设置保持不变。".into())).is_err() { break; }
                         continue;
                     }
@@ -32,8 +37,6 @@ pub fn start(path: &str) -> Result<SettingsTransport, String> {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
-            let result = request(port, &token, "GET", "/snapshot", None).map(project_snapshot);
-            if updates.send(result).is_err() { break; }
         }
     });
     Ok(SettingsTransport { commands: sender, updates: events })
@@ -57,24 +60,28 @@ fn request(port: u16, token: &str, method: &str, path: &str, value: Option<&Valu
 
 /// Every selected value and catalog comes from the live Unity host, never a
 /// persisted ProductHost snapshot or a second settings authority.
-pub fn project_snapshot(value: Value) -> Value {
-    let visual = &value["lyricVisual"];
-    json!({"settings": {"unity": {"visualEffectsSupported": false}, "notice": {"message": "当前连接 Unity 播放器；其他应用功能尚未接入此窗口。", "hasError": false}},
-        "stage": {"mode":"player", "stageRadioPluginEnabled":true, "player": {
-            "lyrics": visual["availableModes"], "lyricID": visual["configuredMode"],
-            "clouds": [], "videoModes": [] }},
-        "hostRevision": value["revision"]})
+pub fn project_snapshot(value: Value) -> Result<Value, String> {
+    if value["version"] != 1 || !value["settings"].is_object() || !value["stage"].is_object() || !value["supportedCommands"].is_array() {
+        return Err("Unity 设置接口版本不完整，请更新播放器与设置应用。".into());
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     #[test] fn projection_uses_live_selection_and_catalog() {
-        let state = project_snapshot(json!({"lyricVisual":{"configuredMode":"monet_poster","availableModes":[{"id":"monet_poster","name":"莫奈"}]},"visualMode":"sphere","cloudModes":[{"id":"sphere","name":"球体"}],"particleScale":1.2}));
+        let input = json!({"version":1,"settings":{"agent":{"residentPersona":"真实设置"}},"supportedCommands":["agent.save"],"stage":{"player":{"lyricID":"monet_poster","lyrics":[{"id":"monet_poster","name":"莫奈"}],"clouds":[{"id":"orbitalShell","name":"星球"}],"cloudID":"orbitalShell","particleScale":1.2}}});
+        let state = project_snapshot(input.clone()).unwrap();
+        assert_eq!(state, input);
         assert_eq!(state["stage"]["player"]["lyricID"], "monet_poster");
-        assert!(state["stage"]["player"]["clouds"].as_array().unwrap().is_empty());
-        assert_eq!(state["settings"]["unity"]["visualEffectsSupported"], false);
+        assert_eq!(state["settings"]["agent"]["residentPersona"], "真实设置");
+        assert_eq!(state["stage"]["player"]["cloudID"], "orbitalShell");
         assert_eq!(state["stage"]["player"]["lyrics"][0]["name"], "莫奈");
+    }
+    #[test] fn incomplete_host_cannot_fabricate_settings() {
+        assert!(project_snapshot(json!({"lyricVisual":{"configuredMode":"monet_poster"}})).is_err());
     }
     #[test] fn http_contract_authenticates_and_reads_actual_response() {
         let server = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();

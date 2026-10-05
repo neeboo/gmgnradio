@@ -1,0 +1,19 @@
+.music-library { width: 440px; max-width: 100%; height: 470px; max-height: 84%; min-height: 0; flex-shrink: 1; margin-bottom: 16px; padding: 16px; overflow: hidden; }
+.music-library-header { flex-direction: row; align-items: center; margin-bottom: 12px; flex-shrink: 0; }
+.music-library-title { flex-grow: 1; font-size: var(--subtitle); -unity-font-style: bold; }
+.music-library-status { font-size: var(--caption); color: var(--muted); white-space: normal; margin-bottom: 10px; flex-shrink: 0; }
+.music-library-list { height: 0; flex-grow: 1; min-height: 0; min-width: 0; }
+.music-library-playlist { height: 76px; padding: 12px; margin-bottom: 8px; flex-direction: row; align-items: center; border-radius: 18px; border-width: 1px; border-color: var(--line); background-color: rgba(40, 44, 50, 0.86); }
+.music-library-track { height: 58px; padding: 8px 12px; margin-bottom: 6px; flex-direction: row; align-items: center; border-radius: 12px; background-color: rgba(40, 44, 50, 0.65); }
+.music-library-cover { width: 44px; height: 44px; margin-right: 12px; border-radius: 12px; overflow: hidden; background-color: rgba(120, 70, 70, 0.2); flex-shrink: 0; }
+.music-library-info { flex-grow: 1; flex-shrink: 1; min-width: 0; }
+.music-library-name { font-size: var(--body); -unity-font-style: bold; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.music-library-secondary { font-size: var(--caption); color: var(--muted); margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.music-library-trailing { font-size: var(--caption); color: var(--muted); margin-left: 8px; flex-shrink: 0; }
+.music-library-playlist > .music-library-trailing { font-size: 22px; }
+.music-library-number { width: 24px; margin-right: 8px; color: var(--muted); font-size: var(--caption); flex-shrink: 0; }
+.music-library-current { background-color: #083b51; }
+.music-library-current .music-library-name, .music-library-current .music-library-trailing { color: var(--accent); }
+.music-library-detail { flex-direction: row; align-items: center; margin-bottom: 12px; flex-shrink: 0; }
+.music-library-local { margin-top: 12px; align-self: flex-start; font-size: var(--caption); }
+.compact .music-library { height: 330px; margin-bottom: 8px; }

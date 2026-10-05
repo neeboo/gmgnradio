@@ -98,7 +98,12 @@ final class RenderHostResidentConversation {
         task = Task { [weak self] in
             guard let self else { return }
             do {
-                let response = try await turnService.send(submission.text, history: previous, userMessage: submission.text)
+                // This isolated text session has no worldContext (the product's
+                // normal persona injection point). Read the same settings suite
+                // on every turn so a GPUI persona save affects the next message.
+                let persona = ResidentPreferences(defaults: defaults).persona
+                let prompt = (ResidentPreferences.personaInjection(persona) ?? "") + submission.text
+                let response = try await turnService.send(prompt, history: previous, userMessage: submission.text)
                 guard lease == generation, !Task.isCancelled else { return }
                 reply = response
                 turnConnector.onTextDelta = nil

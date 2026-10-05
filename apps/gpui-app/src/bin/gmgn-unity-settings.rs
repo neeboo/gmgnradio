@@ -14,11 +14,6 @@ impl UnitySettings {
         let commands = self.pane.update(cx, |pane, _| pane.take_commands());
         let stage_commands = self.stage.update(cx, |stage, _| stage.take_commands());
         for command in commands.into_iter().chain(stage_commands) {
-            let op = command["op"].as_str().unwrap_or("");
-            if matches!(op, "settings.load" | "stage.load" | "presence.load" | "speech.settings.load") { continue; }
-            if op != "stage.player.lyrics" {
-                self.notice = Some("此功能尚未接入 Unity，原设置保持不变。".into()); cx.notify(); continue;
-            }
             if !self.transport.as_ref().is_some_and(|transport| transport.commands.send(command).is_ok()) {
                 self.notice = Some("Unity 设置连接不可用，请从 Unity 重新打开。".into()); cx.notify();
             }

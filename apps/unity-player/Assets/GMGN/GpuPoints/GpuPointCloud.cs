@@ -19,6 +19,7 @@ namespace GMGN.UnityPlayer
         public int PointCount { get; private set; }
         public string Status { get; private set; } = "Not initialized";
         public bool IsGpuReady => compute != null && material != null;
+        public bool StageRendering { get; set; }
         GraphicsBuffer seeds, points;
         ComputeShader compute;
         Material material;
@@ -26,13 +27,19 @@ namespace GMGN.UnityPlayer
         int kernel;
         float clock;
         Vector4 features;
+        Vector4 preset=new(1,0,0,0),rhythm,waveA,waveB;
+        float intensity=1,particleSize=1,primaryVisibility=1,ambientVisibility=.72f;
+        Texture artwork;
+        public void SetStageVisual(Vector3 weights,float composition,float amount,float size,float primary=1,float ambient=.72f){preset=new Vector4(weights.x,weights.y,weights.z,Mathf.Clamp(composition,0,2));intensity=Mathf.Clamp01(amount);particleSize=Mathf.Clamp(size,.6f,1.6f);primaryVisibility=primary;ambientVisibility=ambient;}
+        public void SetArtwork(Texture texture){artwork=texture;}
+        public void SetRhythm(Vector4 value,Vector4 waveformA,Vector4 waveformB){rhythm=value;waveA=waveformA;waveB=waveformB;}
 
         public bool Initialize()
         {
             if (IsGpuReady) return true;
             if (!SystemInfo.supportsComputeShaders || SystemInfo.graphicsShaderLevel < 45)
                 return Fail("GPU point rendering unavailable on this graphics device");
-            var source = Resources.Load<ComputeShader>("GpuPointsUpdate");
+            var source = Resources.Load<ComputeShader>(StageRendering?"GpuStagePointsUpdate":"GpuPointsUpdate");
             var shader = Resources.Load<Shader>("GpuPointsDraw");
             if (source == null || shader == null || !shader.isSupported)
                 return Fail("GPU point shaders missing or unsupported");
@@ -72,11 +79,15 @@ namespace GMGN.UnityPlayer
         void LateUpdate()
         {
             if (!IsGpuReady || PointCount == 0) return;
+            if(StageRendering&&primaryVisibility<=0&&ambientVisibility<=0)return;
             compute.SetInt("_PointCount", PointCount);
             compute.SetFloat("_Clock", clock);
             compute.SetVector("_Features", features);
+            if(StageRendering){compute.SetVector("_Preset",preset);compute.SetVector("_Rhythm",rhythm);compute.SetVector("_WaveA",waveA);compute.SetVector("_WaveB",waveB);compute.SetFloat("_Intensity",intensity);compute.SetFloat("_ParticleScale",Mathf.Clamp(Screen.height/1080f,.72f,2)*particleSize);compute.SetVector("_Layering",new Vector4(primaryVisibility,ambientVisibility,0,0));compute.SetInt("_HasArtwork",artwork!=null?1:0);compute.SetTexture(kernel,"_Artwork",artwork!=null?artwork:Texture2D.grayTexture);}
             compute.Dispatch(kernel, (PointCount + 63) / 64, 1, 1);
             properties.SetMatrix("_CloudToWorld", transform.localToWorldMatrix);
+            properties.SetInt("_PixelSizing",StageRendering?1:0);
+            properties.SetFloat("_StageParticleScale",Mathf.Clamp(Screen.height/1080f,.72f,2)*particleSize);
             var matrix = transform.localToWorldMatrix;
             var ext = localBounds.extents;
             var x = matrix.MultiplyVector(new Vector3(ext.x, 0, 0));
@@ -89,6 +100,7 @@ namespace GMGN.UnityPlayer
                 shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off,
                 receiveShadows = false
             };
+            if(StageRendering)parameters.camera=Camera.main;
             Graphics.RenderPrimitives(parameters, MeshTopology.Triangles, 6, PointCount);
         }
 

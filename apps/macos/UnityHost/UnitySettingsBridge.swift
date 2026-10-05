@@ -119,8 +119,7 @@ final class UnitySettingsBridge: @unchecked Sendable {
                 }
             } else if line[0] == "POST", line[1] == "/command",
                       let value = try? JSONSerialization.jsonObject(with: Data(body.prefix(length))) as? [String: Any],
-                      let op = value["op"] as? String,
-                      op == "stage.player.lyrics" {
+                      value["op"] is String {
                 let commandData = Data(body.prefix(length))
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
