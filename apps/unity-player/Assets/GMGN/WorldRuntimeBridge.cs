@@ -69,7 +69,7 @@ namespace GMGN.UnityPlayer
             if (!Configured) { Status?.Invoke("请先指定空间备份目录和空间编号，再打开空间。"); return; }
             if (worldRoot != null) { SetVisible(!visible); return; }
             loading = true;
-            Status?.Invoke("正在读取空间备份…");
+            Status?.Invoke("");
             try
             {
                 var token = lifetime.Token;
@@ -121,9 +121,7 @@ namespace GMGN.UnityPlayer
                 Debug.Log($"World recovery completed: restored={restored}; items={items.Count}");
                 SetVisible(true);
                 worldRoot.AddComponent<WorldLighting>().Initialize(Camera.main.transform.position);
-                Status?.Invoke(backgroundEnabled
-                    ? $"空间背景已启用，已恢复 {restored} 个真实物件；人物与设备功能仍在迁移。"
-                    : $"已恢复 {restored} 个真实物件；空间背景未成功载入，人物与设备功能仍在迁移。");
+                if (!backgroundEnabled) Status?.Invoke("空间背景未能载入，已恢复的物件仍保留。");
             }
             catch (OperationCanceledException) { }
             catch (Exception error)
@@ -247,7 +245,6 @@ namespace GMGN.UnityPlayer
                 placementView.ShowPreview(result, (float)placementGrid["spacing"], height);
             };
             interactions.PreviewEnded += placementView.Hide;
-            Status?.Invoke("空间摆放已就绪：左键拖动，右键旋转，松开校验保存，Esc取消。");
         }
     }
 }

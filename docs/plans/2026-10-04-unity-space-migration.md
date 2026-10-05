@@ -137,3 +137,4 @@ v21 同时运行旧测试版时出现 33–39fps，关闭全部已验证临时�
 - 歌词偏好三项 Swift Testing 实际通过（exit 0），日志 `tmp/lyrics-preference-tests-isolated.log`；命令级排除使用过期 API 的 AgentConversationServiceTests，完整测试目标未通过。为编译新增 suite 最小修正 LiveCamPanelTests/LivingWorldBootstrapTests/MusicAccountsModelTests，不删除断言或旧 API 测试。
 - GPUI 音乐账号与同步已接真实服务：生产 session 只读回退，连接/断开仅写隔离 overlay/tombstone，官网使用非持久 cookie store，同步后台保存隔离音乐库并验证 readback。Host 与 GPUI Release、隔离账号/库回归通过；真实官网授权与远端同步 UI 流程尚未验收。
 - 用户实际试用 v55 指出鼠标旋转方向反了；v56 反转 yaw/pitch 的拖动符号，保留灵敏度与 UI 阻挡。v56 Release/package/签名验证成功并启动，未据此声称方向或全部交互验收通过。
+- v57 移除左上角连接成功、空间加载/恢复成功与摆放操作常驻说明，保留真实错误。Release 构建退出 0，签名验证通过；仅关闭独立 v56 后启动 v57，真实空间窗口截图确认左上角提示已消失。整体迁移及性能验收仍未完成。

@@ -152,7 +152,7 @@ namespace GMGN.UnityPlayer
                 if (Environment.GetEnvironmentVariable("GMGN_UNITY_OPEN_SPACE") == "1")
                     root.schedule.Execute(() => { Debug.Log("World explicit startup requested; not a click acceptance"); world.Toggle(); });
             }
-            SetConnected(true); status.text = "音乐与角色已连接";
+            SetConnected(true); status.text = "";
         }
         void SetConnected(bool ready) { connected = ready; play.SetEnabled(ready); volume.SetEnabled(ready); root.Q<Button>("next").SetEnabled(false); root.Q<Button>("previous").SetEnabled(false); root.Q<Button>("chooseMusic").SetEnabled(ready); root.Q<Button>("settings").SetEnabled(ready); UpdateComposer(); }
         void ToggleChat(bool visible) { if (visible) queuePanel?.SetVisible(false); chatPanel.EnableInClassList("hidden", !visible); root.Q<Button>("chatToggle").EnableInClassList("selected", visible); if (visible) { draft.schedule.Execute(() => draft.Focus()); if (follow) ScrollToLatest(); } }
