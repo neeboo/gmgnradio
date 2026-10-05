@@ -68,7 +68,7 @@ namespace GMGN.UnityPlayer
             var point = RuntimePanelUtils.ScreenToPanel(root.panel, new Vector2(screen.x, Screen.height - screen.y));
             for (var hit = root.panel.Pick(point); hit != null; hit = hit.parent)
                 if (hit is Button || hit is TextField || hit is Slider || hit is ScrollView || hit is ListView ||
-                    hit.name == "chatPanel" || hit.name == "worldInteraction" || hit.ClassListContains("queue-panel")) return true;
+                    hit.name == "chatPanel" || hit.name == "inboxPanel" || hit.name == "worldInteraction" || hit.ClassListContains("queue-panel")) return true;
             return false;
         }
     }

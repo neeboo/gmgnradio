@@ -9,4 +9,6 @@ EditorBuildSettings:
     path: Assets/GMGN/Player.unity
     guid: 32d8d304bb60f481e8a95c3552a2f386
   m_configObjects:
+    com.unity.addressableassets: {fileID: 11400000, guid: f5df7a5604fe84f1a8779aa7cd4e0516, type: 2}
     com.unity.input.settings.actions: {fileID: -944628639613478452, guid: 052faaac586de48259a63d0c4782560b, type: 3}
+    com.unity.localization.settings: {fileID: 11400000, guid: 82d49fc66ef904efcb9bec4ed2d48ff7, type: 2}

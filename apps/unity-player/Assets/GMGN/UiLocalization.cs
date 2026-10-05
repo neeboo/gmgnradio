@@ -1,45 +1,59 @@
-using System.Collections.Generic;
+using System;
+using UnityEngine;
+using UnityEngine.Localization;
+using UnityEngine.Localization.Settings;
+using UnityEngine.Localization.Tables;
+using UnityEngine.ResourceManagement.AsyncOperations;
 
 namespace GMGN.UnityPlayer
 {
+    // UI Toolkit consumes official String Tables; the host owns the persisted preference.
     public static class UiLocalization
     {
-        static readonly Dictionary<string, string[]> Strings = new()
-        {
-            ["chat"] = new[] { "与角色聊天", "Chat with character", "キャラクターとチャット" },
-            ["placeholder"] = new[] { "和角色聊聊…", "Talk to your character…", "キャラクターに話しかける…" },
-            ["empty"] = new[] { "可以聊音乐，也可以说说今天的事。", "Talk about music or how your day went.", "音楽や今日の出来事を話しましょう。" },
-            ["hint"] = new[] { "Enter 发送 · Shift+Enter 换行", "Enter to send · Shift+Enter for a new line", "Enter で送信 · Shift+Enter で改行" },
-            ["new"] = new[] { "查看新消息", "View new messages", "新しいメッセージを見る" },
-            ["send"] = new[] { "发送消息", "Send message", "メッセージを送信" },
-            ["cancel"] = new[] { "停止回复", "Stop response", "応答を停止" },
-            ["close"] = new[] { "收起聊天", "Close chat", "チャットを閉じる" },
-            ["settings"] = new[] { "设置", "Settings", "設定" },
-            ["settingsTip"] = new[] { "打开统一设置", "Open settings", "設定を開く" },
-            ["player"] = new[] { "播放器", "Player", "プレイヤー" },
-            ["space"] = new[] { "空间", "Space", "空間" },
-            ["mode"] = new[] { "切换播放器与空间", "Switch player and space", "プレイヤーと空間を切り替え" },
-            ["noSpace"] = new[] { "尚未指定空间备份", "No space backup selected", "空間のバックアップが未選択です" },
-            ["music"] = new[] { "打开音乐库", "Open music library", "音楽ライブラリを開く" },
-            ["previous"] = new[] { "上一首", "Previous track", "前の曲" },
-            ["noPrevious"] = new[] { "当前队列没有上一首", "No previous track in queue", "キューに前の曲がありません" },
-            ["next"] = new[] { "下一首", "Next track", "次の曲" },
-            ["noNext"] = new[] { "当前队列没有下一首", "No next track in queue", "キューに次の曲がありません" },
-            ["play"] = new[] { "播放", "Play", "再生" },
-            ["pause"] = new[] { "暂停", "Pause", "一時停止" },
-            ["volume"] = new[] { "音量", "Volume", "音量" },
-            ["fullscreen"] = new[] { "切换全屏", "Toggle fullscreen", "全画面を切り替え" },
-            ["microphone"] = new[] { "按住说话尚未迁移", "Push-to-talk is not available yet", "プッシュ・トゥ・トークは未対応です" },
-            ["inbox"] = new[] { "通知尚未迁移", "Notifications are not available yet", "通知は未対応です" },
-            ["props"] = new[] { "物件与摆放尚未迁移", "Object placement is not available yet", "オブジェクト配置は未対応です" },
-            ["screen"] = new[] { "空间播放器尚未迁移", "Space player is not available yet", "空間プレイヤーは未対応です" },
-            ["retry"] = new[] { "重新编辑并发送", "Edit and resend", "編集して再送信" }
-        };
+        public const string TableName = "GMGN UI";
+        public static event Action Changed;
+        static StringTable table;
+        static string requestedLocale;
+        static bool started;
+        public static string LocaleCode => table?.LocaleIdentifier.Code;
+        public static string Get(string key) => table?.GetEntry(key)?.LocalizedValue ?? "";
+        // Existing panel callers may pass the host preference; selection is centralized above.
+        public static string Get(string key, string locale) => Get(key);
 
-        public static string Get(string key, string locale)
+        public static void SelectHostLocale(string code)
         {
-            int index = locale == "en" ? 1 : locale == "ja" ? 2 : 0;
-            return Strings.TryGetValue(key, out var values) ? values[index] : key;
+            if (code != "en" && code != "ja") code = "zh-CN";
+            requestedLocale = code;
+            if (!started) {
+                started = true;
+                LocalizationSettings.SelectedLocaleChanged += LoadTable;
+                LocalizationSettings.InitializationOperation.Completed += operation => {
+                    if (operation.Status != AsyncOperationStatus.Succeeded) {
+                        Debug.LogError("Localization initialization failed"); return;
+                    }
+                    SelectRequestedLocale();
+                };
+            } else if (LocalizationSettings.InitializationOperation.IsDone) SelectRequestedLocale();
+        }
+
+        static void SelectRequestedLocale()
+        {
+            var selected = LocalizationSettings.AvailableLocales.GetLocale(requestedLocale);
+            if (selected == null) { Debug.LogError($"Locale is unavailable: {requestedLocale}"); return; }
+            if (LocalizationSettings.SelectedLocale == selected) { if (table == null) LoadTable(selected); }
+            else LocalizationSettings.SelectedLocale = selected;
+        }
+
+        static void LoadTable(Locale selected)
+        {
+            LocalizationSettings.StringDatabase.GetTableAsync(TableName, selected).Completed += operation => {
+                if (LocalizationSettings.SelectedLocale != selected) return;
+                if (operation.Status != AsyncOperationStatus.Succeeded || operation.Result == null) {
+                    Debug.LogError("UI String Table could not be loaded"); return;
+                }
+                table = operation.Result;
+                Changed?.Invoke();
+            };
         }
     }
 }

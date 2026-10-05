@@ -19,7 +19,7 @@ namespace GMGN.UnityPlayer
         [DllImport(Library)] static extern IntPtr gmgn_unity_host_snapshot(IntPtr host);
         [DllImport(Library)] static extern void gmgn_unity_host_string_free(IntPtr value);
         [DllImport(Library)] static extern int gmgn_unity_host_destroy(IntPtr host);
-        [Serializable] sealed class Envelope { public string locale; public Music music; public Conversation chat; public WorldPulse world, musicLibrary; }
+        [Serializable] sealed class Envelope { public string locale; public Music music; public Conversation chat; public WorldPulse world, musicLibrary, inbox; }
         [Serializable] sealed class WorldPulse { public ulong generation; public bool pending; public string status; }
         [Serializable] sealed class Music { public ulong playbackSessionID; public string title, notice; public double duration, position; public bool isPlaying, canNext, canPrevious, seekSupported; public int queueIndex, queueCount; public QueueItem[] queue; public float volume; public Features features; public long lyricRevision; public LyricVisualSnapshot lyricVisual; public PointCloudSnapshot pointCloud; public LyricPointLine[] lines; }
         [Serializable] sealed class Features { public float low, mid, high, bass, vocal, treble; }
@@ -38,6 +38,12 @@ namespace GMGN.UnityPlayer
         bool nextSupported, previousSupported;
         ulong? worldGeneration;
         ulong? musicLibraryGeneration;
+        ulong? inboxGeneration;
+        public event Action<JObject> InboxUpdated;
+        public bool RequestInbox() => ExecuteWorld(new JObject { ["op"] = "inbox.list", ["requestID"] = "unity-inbox:" + Guid.NewGuid().ToString("D") });
+        public bool MarkInboxRead(string taskKey, string expectedEventID) => ExecuteWorld(new JObject {
+            ["op"] = "inbox.read", ["requestID"] = "unity-inbox:" + Guid.NewGuid().ToString("D"),
+            ["taskKey"] = taskKey, ["expectedEventID"] = expectedEventID });
         public event Action<JObject> MusicLibraryUpdated;
         public bool RequestMusicLibrary() => ExecuteWorld(new JObject { ["op"] = "music.library" });
         public bool RequestMusicPlaylist(string id) => ExecuteWorld(new JObject { ["op"] = "music.playlist", ["playlistID"] = id });
@@ -121,6 +127,11 @@ namespace GMGN.UnityPlayer
             Envelope value; string json;
             try { json = Marshal.PtrToStringUTF8(pointer); value = JsonUtility.FromJson<Envelope>(json); }
             finally { gmgn_unity_host_string_free(pointer); }
+            if (value.inbox != null && inboxGeneration != value.inbox.generation) {
+                inboxGeneration = value.inbox.generation;
+                var notification = JObject.Parse(json)["inbox"] as JObject;
+                if (notification != null) InboxUpdated?.Invoke(notification);
+            }
             if (value.musicLibrary != null && musicLibraryGeneration != value.musicLibrary.generation) {
                 musicLibraryGeneration = value.musicLibrary.generation;
                 var library = JObject.Parse(json)["musicLibrary"] as JObject;

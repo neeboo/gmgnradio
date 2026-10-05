@@ -34,14 +34,13 @@ namespace GMGN.UnityPlayer
         string composition = "";
         QueuePanel queuePanel;
         MusicLibraryPanel musicLibraryPanel;
+        InboxPanel inboxPanel;
         int compositionEndedFrame = -10;
-        string locale = "zh-CN";
         bool spaceVisible, spaceConfigured, lastPlaying, lastPrevious, lastNext;
-        string L(string key) => UiLocalization.Get(key, locale);
+        string L(string key) => UiLocalization.Get(key);
 
-        void ApplyLocale(string value)
+        void ApplyLocale()
         {
-            locale = value == "en" || value == "ja" ? value : "zh-CN";
             root.Q<Label>("chatTitle").text = L("chat");
             root.Q<Label>("chatHint").text = L("hint");
             root.Q<Label>("emptyChat").text = L("empty");
@@ -58,6 +57,7 @@ namespace GMGN.UnityPlayer
             play.tooltip = L(lastPlaying ? "pause" : "play");
             root.Q<Button>("previous").tooltip = L(lastPrevious ? "previous" : "noPrevious");
             root.Q<Button>("next").tooltip = L(lastNext ? "next" : "noNext");
+            if (inboxPanel != null) { root.Q<Button>("inbox").tooltip = L("inboxTitle"); inboxPanel.SetLocale(UiLocalization.LocaleCode); }
             list.RefreshItems();
         }
 
@@ -145,9 +145,10 @@ namespace GMGN.UnityPlayer
             }, TrickleDown.TrickleDown);
             play.clicked += () => backend?.PlayPause(); root.Q<Button>("next").clicked += () => backend?.Next();
             root.Q<Button>("previous").clicked += () => backend?.Previous();
-            root.Q<Button>("chooseMusic").clicked += () => { ToggleChat(false); queuePanel?.SetVisible(false); musicLibraryPanel?.Toggle(); };
+            root.Q<Button>("chooseMusic").clicked += () => { ToggleChat(false); inboxPanel?.Hide(); queuePanel?.SetVisible(false); musicLibraryPanel?.Toggle(); };
             volume.RegisterValueChangedCallback(e => backend?.SetVolume(e.newValue));
-            ApplyLocale(locale);
+            UiLocalization.Changed += ApplyLocale;
+            UiLocalization.SelectHostLocale("zh-CN");
             sculpture = gameObject.AddComponent<AudioSculpture>();
             pointArtwork = gameObject.AddComponent<PointCloudArtworkLoader>();
             gpuLyrics = gameObject.AddComponent<GpuLyricsView>();
@@ -157,8 +158,18 @@ namespace GMGN.UnityPlayer
             if (backend == null) { status.text = "音乐与对话服务未连接"; SetConnected(false); return; }
             backend.Snapshot += OnSnapshot; backend.Chat += OnChat; backend.Status += OnStatus;
             queuePanel = QueuePanel.Attach(root.Q(className: "body"), backend);
-            if (backend is NativePlayerBackend nativeMusic) musicLibraryPanel = new MusicLibraryPanel(root.Q(className: "body"), nativeMusic, () => queuePanel.SetVisible(true));
+            if (backend is NativePlayerBackend nativeMusic) musicLibraryPanel = new MusicLibraryPanel(root.Q(className: "body"), nativeMusic, () => { inboxPanel?.Hide(); queuePanel.SetVisible(true); });
             if (backend is NativePlayerBackend native) {
+                inboxPanel = new InboxPanel(root.Q(className: "body"), native);
+                var inboxButton = root.Q<Button>("inbox");
+                inboxButton.SetEnabled(true);
+                inboxButton.tooltip = L("inboxTitle");
+                inboxButton.clicked += () => {
+                    var wasHidden = inboxPanel.Element.ClassListContains("hidden");
+                    if (!wasHidden) { inboxPanel.Hide(); return; }
+                    ToggleChat(false); queuePanel?.SetVisible(false); musicLibraryPanel?.SetVisible(false);
+                    inboxPanel.Show();
+                };
                 var world = gameObject.AddComponent<WorldRuntimeBridge>();
                 world.Initialize(native, sculpture);
                 world.Status += OnStatus;
@@ -183,12 +194,12 @@ namespace GMGN.UnityPlayer
             SetConnected(true); status.text = "";
         }
         void SetConnected(bool ready) { connected = ready; play.SetEnabled(ready); volume.SetEnabled(ready); root.Q<Button>("next").SetEnabled(false); root.Q<Button>("previous").SetEnabled(false); root.Q<Button>("chooseMusic").SetEnabled(ready); root.Q<Button>("settings").SetEnabled(ready); UpdateComposer(); }
-        void ToggleChat(bool visible) { if (visible) queuePanel?.SetVisible(false); chatPanel.EnableInClassList("hidden", !visible); root.Q<Button>("chatToggle").EnableInClassList("selected", visible); if (visible) { draft.schedule.Execute(() => draft.Focus()); if (follow) ScrollToLatest(); } }
+        void ToggleChat(bool visible) { if (visible) { inboxPanel?.Hide(); queuePanel?.SetVisible(false); musicLibraryPanel?.SetVisible(false); } chatPanel.EnableInClassList("hidden", !visible); root.Q<Button>("chatToggle").EnableInClassList("selected", visible); if (visible) { draft.schedule.Execute(() => draft.Focus()); if (follow) ScrollToLatest(); } }
         void UpdateComposer() { send.SetEnabled(connected && pending == null && !string.IsNullOrWhiteSpace(draft.value)); send.EnableInClassList("hidden", pending != null); cancel.EnableInClassList("hidden", pending == null); cancel.SetEnabled(connected && pending != null); }
         void OnStatus(string value) => status.text = value;
         void OnSnapshot(PlayerSnapshot snapshot)
         {
-            if (!string.IsNullOrEmpty(snapshot.locale) && snapshot.locale != locale) ApplyLocale(snapshot.locale);
+            if (!string.IsNullOrEmpty(snapshot.locale) && snapshot.locale != UiLocalization.LocaleCode) UiLocalization.SelectHostLocale(snapshot.locale);
             lyric.text = snapshot.lyric ?? ""; translation.text = snapshot.translation ?? "";
             var lyricMode = snapshot.lyricVisual?.mode;
             gpuLyrics.SetTheme(snapshot.lyricVisual?.theme);
@@ -281,7 +292,7 @@ namespace GMGN.UnityPlayer
         }
         void BindKeyboard() { if (keyboard == Keyboard.current) return; if (keyboard != null) keyboard.onIMECompositionChange -= OnComposition; keyboard = Keyboard.current; if (keyboard != null) keyboard.onIMECompositionChange += OnComposition; }
         void OnComposition(IMECompositionString value) { var next = value.ToString(); if (composition.Length > 0 && next.Length == 0) compositionEndedFrame = Time.frameCount; composition = next; }
-        void OnDestroy() { followScroll?.Pause(); queuePanel?.Dispose(); musicLibraryPanel?.Dispose(); if (keyboard != null) keyboard.onIMECompositionChange -= OnComposition; if (backend == null) return; backend.Snapshot -= OnSnapshot; backend.Chat -= OnChat; backend.Status -= OnStatus; backend.Dispose(); }
+        void OnDestroy() { UiLocalization.Changed -= ApplyLocale; followScroll?.Pause(); inboxPanel?.Dispose(); queuePanel?.Dispose(); musicLibraryPanel?.Dispose(); if (keyboard != null) keyboard.onIMECompositionChange -= OnComposition; if (backend == null) return; backend.Snapshot -= OnSnapshot; backend.Chat -= OnChat; backend.Status -= OnStatus; backend.Dispose(); }
 
         ToolbarIcon AddIcon(string name, string kind)
         {

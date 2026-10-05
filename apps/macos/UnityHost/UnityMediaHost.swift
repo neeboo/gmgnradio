@@ -13,6 +13,7 @@ final class UnityMediaHost {
     let chat: RenderHostResidentConversation
     let world: UnityWorldBridge
     let musicLibrary: UnityMusicLibraryBridge
+    let inbox: UnityInboxBridge
     private var libraryQueueActive = false
     private var libraryTrack: MusicCandidate?
     private var musicQueueRevision: UInt64 = 0
@@ -49,6 +50,7 @@ final class UnityMediaHost {
         visualDirection = StageVisualDirectionStore(defaults: defaults)
         world = UnityWorldBridge(root: root)
         musicLibrary = UnityMusicLibraryBridge(root: root)
+        inbox = UnityInboxBridge(root: root)
         graph = AudioGraphController(visualStore: features)
         if ProcessInfo.processInfo.environment["GMGN_UNITY_TEST_MUTED"] == "1" {
             graph.musicVolume = 0
@@ -121,6 +123,7 @@ final class UnityMediaHost {
         do {
             switch value["op"] as? String {
             case "settings.open": return settingsBridge?.open() ?? false
+            case "inbox.list", "inbox.read": return inbox.command(value)
             case "stage.load": return true
             case "stage.player.lyrics":
                 guard let id = value["id"] as? String,
@@ -282,7 +285,7 @@ final class UnityMediaHost {
         conversation["capabilities"] = ["streamingReplies": true, "deltaTextMode": "replace",
             "cancelActiveReply": true, "cancellationAcknowledgement": "local-turn-invalidated",
             "providerCancellationAcknowledgement": false]
-        return ["version": 1, "locale": productSettings.locale, "music": music, "musicLibrary": musicLibrary.snapshot(), "chat": conversation, "world": world.snapshot()]
+        return ["version": 1, "locale": productSettings.locale, "music": music, "musicLibrary": musicLibrary.snapshot(), "chat": conversation, "world": world.snapshot(), "inbox": inbox.snapshot()]
     }
 
     func close() {
@@ -295,6 +298,7 @@ final class UnityMediaHost {
         chat.close()
         world.close()
         musicLibrary.close()
+        inbox.close()
         settingsBridge?.close()
         productSettings.close()
     }

@@ -1,0 +1,16 @@
+.inbox-panel { width: 440px; max-width: 100%; height: 420px; max-height: 80%; min-height: 0; flex-shrink: 1; margin-bottom: 16px; padding: 16px; overflow: hidden; }
+.inbox-header { flex-direction: row; align-items: center; margin-bottom: 12px; flex-shrink: 0; }
+.inbox-title { flex-grow: 1; font-size: var(--subtitle); -unity-font-style: bold; }
+.inbox-header .unity-button { height: 32px; margin-left: 6px; padding: 4px 8px; font-size: var(--caption); }
+.inbox-status { font-size: var(--caption); color: var(--muted); white-space: normal; margin-bottom: 10px; flex-shrink: 0; }
+.inbox-list { height: 0; flex-grow: 1; flex-shrink: 1; min-height: 0; min-width: 0; overflow: hidden; }
+.inbox-list .unity-scroll-view { flex-grow: 1; flex-shrink: 1; min-height: 0; overflow: hidden; }
+.inbox-row { height: 68px; margin: 0 0 8px 0; padding: 10px 12px; flex-direction: row; align-items: center; border-radius: 12px; background-color: rgba(40,44,50,0.65); }
+.inbox-info { flex-grow: 1; flex-shrink: 1; min-width: 0; }
+.inbox-row-title { font-size: var(--body); -unity-font-style: bold; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.inbox-secondary { font-size: var(--caption); color: var(--muted); margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.inbox-read { font-size: var(--caption); color: var(--muted); margin-left: 8px; flex-shrink: 0; }
+.inbox-unread .inbox-read { color: var(--accent); }
+.inbox-detail { flex-grow: 1; min-height: 0; overflow: hidden; }
+.inbox-detail-text { font-size: var(--body); color: var(--text); white-space: normal; margin-top: 12px; }
+.compact .inbox-panel { height: 320px; margin-bottom: 8px; }

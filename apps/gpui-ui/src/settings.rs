@@ -1,6 +1,6 @@
 //! Product settings controls. Catalogs and all side effects come from ProductHost.
 use crate::ui_tokens as ui;
-use crate::i18n::{UiLocale, language_command, settings_navigation_label};
+use crate::i18n::{UiLocale, language_command, settings_copy, settings_navigation_label, settings_notice};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::InputEvent;
 use gpui_kit::component::{button::*, input::*, menu::*, switch::Switch, *};
@@ -488,6 +488,14 @@ impl AgentSettingsPane {
         if snapshot.is_null() || self.snapshot == snapshot {
             return;
         }
+        let locale = UiLocale::from_settings(&snapshot);
+        for (index, source) in [(0, "新的 TTS API Key"), (1, "新的 ASR API Key")] {
+            self.extra_inputs[index].update(cx, |input, cx| input.set_placeholder(settings_copy(locale, source), window, cx));
+        }
+        self.inputs[3].update(cx, |input, cx| input.set_placeholder(settings_copy(locale, "自定义音色 ID"), window, cx));
+        for (index, source) in [(0, "居民人格"), (1, "角色人格与偏好")] {
+            self.personas[index].update(cx, |input, cx| input.set_placeholder(settings_copy(locale, source), window, cx));
+        }
         self.extra_inputs[2].update(cx,|input,cx|input.set_placeholder(if snapshot["space"]["credentialConfigured"].as_bool()==Some(true){"粘贴新的 API Key 可覆盖现有配置"}else{"粘贴 API Key"},window,cx));
         self.extra_inputs[6].update(cx,|input,cx|input.set_placeholder(if snapshot["space"]["propCredentialConfigured"].as_bool()==Some(true){"填写新密钥可替换；留空保留现有密钥"}else{"生成服务密钥"},window,cx));
         if let Some((revision,submitted))=&self.pending_marble{
@@ -636,9 +644,9 @@ impl AgentSettingsPane {
                     ))
                 } else {
                     let mut name = v.get("name")?.as_str()?.to_owned();
-                    if key=="models"&&v["id"]==self.snapshot[section]["defaultModelID"]{name.push_str("（默认）");}
+                    if key=="models"&&v["id"]==self.snapshot[section]["defaultModelID"]{name.push_str(settings_copy(UiLocale::from_settings(&self.snapshot), "（默认）"));}
                     if v.get("installed").and_then(Value::as_bool) == Some(false) {
-                        name.push_str("（未安装）");
+                        name.push_str(settings_copy(UiLocale::from_settings(&self.snapshot), "（未安装）"));
                     }
                     Some((v.get("id")?.clone(), name))
                 }
@@ -654,6 +662,8 @@ impl AgentSettingsPane {
         items: Vec<(Value, String)>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let locale = UiLocale::from_settings(&self.snapshot);
+        let t = |source: &'static str| settings_copy(locale, source);
         let value = self.draft[section][field].clone();
         let selected = items
             .iter()
@@ -663,8 +673,8 @@ impl AgentSettingsPane {
                 value
                     .as_str()
                     .filter(|s| !s.is_empty())
-                    .map(|raw|if field=="modelID"{"旧模型不受支持，请重新选择".to_owned()}else if field=="voiceID"{format!("当前声音（{raw}）")}else{raw.to_owned()})
-                    .unwrap_or_else(||if field=="modelID"{"正在加载模型选项".to_owned()}else{"请选择".to_owned()})
+                    .map(|raw|if field=="modelID"{t("旧模型不受支持，请重新选择").to_owned()}else if field=="voiceID"{format!("{} ({raw})", t("当前声音"))}else{raw.to_owned()})
+                    .unwrap_or_else(||if field=="modelID"{t("正在加载模型选项").to_owned()}else{t("请选择").to_owned()})
             });
         let weak = cx.entity().downgrade();
         div()
@@ -672,7 +682,7 @@ impl AgentSettingsPane {
             .items_center()
             .justify_between()
             .gap_3()
-            .child(label)
+            .child(t(label))
             .child(
                 Button::new(id)
                     .label(selected)
@@ -703,7 +713,7 @@ impl AgentSettingsPane {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         Switch::new(id)
-            .label(label)
+            .label(settings_copy(UiLocale::from_settings(&self.snapshot), label))
             .checked(self.draft["agent"][field].as_bool().unwrap_or(false))
             .on_change(cx.listener(move |this, value: &bool, _, cx| {
                 this.draft["agent"][field] = json!(*value);
@@ -724,6 +734,8 @@ impl AgentSettingsPane {
 }
 impl AgentSettingsPane {
     fn dj_form(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let locale = UiLocale::from_settings(&self.snapshot);
+        let t = |source: &'static str| settings_copy(locale, source);
         let theme = cx.theme();
         let border = theme.border;
         let valid_model = self.snapshot["tts"]["models"]
@@ -736,74 +748,75 @@ impl AgentSettingsPane {
         let mut form = div()
             .flex()
             .flex_col()
-            .gap_3()
+            .gap(px(ui::SPACING_12))
+            .text_size(px(ui::BODY)).line_height(px(ui::BODY_LINE_HEIGHT))
             .bg(theme.tokens.background)
             .text_color(theme.foreground);
         if !self.initialized {
             return form
-                .child("正在读取原应用配置与 Rust 服务能力…")
+                .child(t("正在读取原应用配置与 Rust 服务能力…"))
                 .into_any_element();
         }
-        let group = |title: &'static str| SettingsGroup::new(title, border).visible((!self.unity_external || unity_agent_group_available(&self.snapshot, title)) && match self.section.as_str(){"语音播放"=>title=="回复语音","按住说话"=>title=="按住说话","自主行动"=>matches!(title,"角色人格与偏好"|"居民人格"|"自主行动"),_=>matches!(title,"角色内核"|"聊天模型")});
+        let group = |title: &'static str| SettingsGroup::new(t(title), border).visible((!self.unity_external || unity_agent_group_available(&self.snapshot, title)) && match self.section.as_str(){"语音播放"=>title=="回复语音","按住说话"=>title=="按住说话","自主行动"=>matches!(title,"角色人格与偏好"|"居民人格"|"自主行动"),_=>matches!(title,"角色内核"|"聊天模型")});
         form=form.child(group("角色内核")
             .child(div().flex().items_center().gap(px(12.)).child(div().size(px(32.)).rounded_lg().bg(cx.theme().muted).flex().items_center().justify_center().child(Icon::new(IconName::Terminal).size(px(20.))))
                 .child(div().flex_1().flex().flex_col().child("gmgn 角色").child(self.snapshot["agent"]["codexStatus"].as_str().unwrap_or("策划引擎未登录").to_owned()))
                 .child(Button::new("codex-login").label(if self.snapshot["agent"]["codexState"].as_str()==Some("signedIn"){"退出登录"}else{"登录"})
                     .disabled(self.snapshot["agent"]["working"].as_bool()==Some(true)||self.snapshot["agent"]["codexState"].as_str()==Some("unavailable"))
                     .on_click(cx.listener(|this,_,_,_|this.commands.push(json!({"op":if this.snapshot["agent"]["codexState"].as_str()==Some("signedIn"){"agent.logout"}else{"agent.login"}}))))))
-            .child(div().text_xs().child("Codex 提供策划和推理能力；它与下面的声音共同属于同一个角色。"))
+            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child("Codex 提供策划和推理能力；它与下面的声音共同属于同一个角色。"))
             .child(self.toggle("takeover","允许角色自动接管","takeoverEnabled",cx))
-            .child(div().text_xs().child("可以自主切歌、暂停、继续、重排节目和调整视觉。"))
+            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child("可以自主切歌、暂停、继续、重排节目和调整视觉。"))
             .child(div().flex().justify_between().items_center().child("策划模型").child(div().w(px(220.)).child(Input::new(&self.inputs[2])))))
             .child(group("角色人格与偏好").child(div().h(px(150.)).min_h(px(150.)).flex_shrink_0()
-                .child(Textarea::new(&self.personas[1]).h(px(150.)).aria_label("角色人格与偏好").accessibility_id("dj-host-prompt")))
-            .child(div().flex().justify_between().items_center().gap_3().child(div().flex_1().min_w(px(0.)).text_sm().child("用自然语言告诉角色怎么策划和主持。"))
-                .child(Button::new("save-dj").flex_shrink_0().primary().label("保存").on_click(cx.listener(|this,_,_,cx|this.commands.push(json!({"op":"agent.save","hostPrompt":this.personas[1].read(cx).value().to_string()})))))))
+                .child(Textarea::new(&self.personas[1]).h(px(150.)).aria_label(t("角色人格与偏好")).accessibility_id("dj-host-prompt")))
+            .child(div().flex().justify_between().items_center().gap(px(ui::SPACING_12)).child(div().flex_1().min_w(px(0.)).text_size(px(ui::BODY)).line_height(px(ui::BODY_LINE_HEIGHT)).child(t("用自然语言告诉角色怎么策划和主持。")))
+                .child(Button::new("save-dj").flex_shrink_0().primary().label(t("保存")).on_click(cx.listener(|this,_,_,cx|this.commands.push(json!({"op":"agent.save","hostPrompt":this.personas[1].read(cx).value().to_string()})))))))
             .child(group("居民人格").child(div().h(px(120.)).min_h(px(120.)).flex_shrink_0()
-                .child(Textarea::new(&self.personas[0]).h(px(120.)).aria_label("居民人格").accessibility_id("resident-persona")))
-            .child(div().flex().justify_between().items_center().gap_3().child(div().flex_1().min_w(px(0.)).text_sm().child("只影响居民，和上面的角色偏好分开。人格只改语气和关注点，不改变它能做什么。"))
-                .child(Button::new("save-resident").flex_shrink_0().primary().label("保存").on_click(cx.listener(|this,_,_,cx|this.commands.push(json!({"op":"agent.save","residentPersona":this.personas[0].read(cx).value().to_string()})))))))
+                .child(Textarea::new(&self.personas[0]).h(px(120.)).aria_label(t("居民人格")).accessibility_id("resident-persona")))
+            .child(div().flex().justify_between().items_center().gap(px(ui::SPACING_12)).child(div().flex_1().min_w(px(0.)).text_size(px(ui::BODY)).line_height(px(ui::BODY_LINE_HEIGHT)).child(t("只影响居民，和上面的角色偏好分开。人格只改语气和关注点，不改变它能做什么。")))
+                .child(Button::new("save-resident").flex_shrink_0().primary().label(t("保存")).on_click(cx.listener(|this,_,_,cx|this.commands.push(json!({"op":"agent.save","residentPersona":this.personas[0].read(cx).value().to_string()})))))))
             .child(group("聊天模型")
             .child(self.dropdown("backend","模型","agent","backendID",self.options("agent","backends"),cx))
-            .children(self.snapshot["agent"]["backendStatus"].as_str().map(|status|div().text_xs().child(status.to_owned())))
-            .child(div().text_xs().child("空间和 Live Cam 共用这里选定的 Agent；文字和语音转写进入同一个会话。")))
+            .children(self.snapshot["agent"]["backendStatus"].as_str().map(|status|div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(status.to_owned())))
+            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child("空间和 Live Cam 共用这里选定的 Agent；文字和语音转写进入同一个会话。")))
             .child(group("自主行动")
             .child(self.toggle("autonomy","允许居民自主安排活动","autonomyEnabled",cx))
-            .child(div().text_xs().child("打开后，居民会自己观察和行动，会消耗模型额度。设为 0 就不再新起一轮，要先停下请按停止。"))
+            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child("打开后，居民会自己观察和行动，会消耗模型额度。设为 0 就不再新起一轮，要先停下请按停止。"))
             .child(self.dropdown("budget","每小时后台思考预算","agent","backgroundTurnsPerHour",self.options("agent","budgetOptions"),cx))
-            .child(div().text_xs().child("按最近一小时算，默认 6。这只数后台思考的次数，不等于请求次数或费用。")))
+            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child("按最近一小时算，默认 6。这只数后台思考的次数，不等于请求次数或费用。")))
             .child(group("回复语音")
             .children((!self.unity_external || self.snapshot["unity"]["autoSpeakSupported"].as_bool() == Some(true)).then(||self.toggle("auto-speak","自动朗读 Agent 回复","autoSpeak",cx)))
             .child(self.dropdown("tts-provider","服务","tts","providerID",self.options("tts","providers"),cx))
-            .child(div().flex().items_center().justify_between().child("API Key").child(div().w(px(280.)).child(Input::new(&self.extra_inputs[0]).aria_label("新的 TTS API Key"))))
+            .child(div().flex().items_center().justify_between().child("API Key").child(div().w(px(280.)).child(Input::new(&self.extra_inputs[0]).aria_label(t("新的 TTS API Key")))))
             .child(self.dropdown("tts-voice","声音","tts","voiceID",self.options("tts","voices"),cx))
-            .child(div().flex().items_center().gap_2()
-                .child(Button::new("refresh-voices").label("刷新声音").disabled(self.snapshot["tts"]["loading"].as_bool()==Some(true)).on_click(cx.listener(|this,_,_,cx|this.tts_action("tts.refresh",cx))))
-                .child(Button::new("preview-tts").label(if self.snapshot["tts"]["isSpeaking"].as_bool()==Some(true){"停止试听"}else{"试听声音"}).disabled(!valid_model||self.inputs[3].read(cx).value().trim().is_empty()).on_click(cx.listener(|this,_,_,cx|this.tts_action(if this.snapshot["tts"]["isSpeaking"].as_bool()==Some(true){"tts.stop"}else{"tts.preview"},cx)))))
+            .child(div().flex().items_center().gap(px(ui::SPACING_8))
+                .child(Button::new("refresh-voices").label(t("刷新声音")).disabled(self.snapshot["tts"]["loading"].as_bool()==Some(true)).on_click(cx.listener(|this,_,_,cx|this.tts_action("tts.refresh",cx))))
+                .child(Button::new("preview-tts").label(if self.snapshot["tts"]["isSpeaking"].as_bool()==Some(true){t("停止试听")}else{t("试听声音")}).disabled(!valid_model||self.inputs[3].read(cx).value().trim().is_empty()).on_click(cx.listener(|this,_,_,cx|this.tts_action(if this.snapshot["tts"]["isSpeaking"].as_bool()==Some(true){"tts.stop"}else{"tts.preview"},cx)))))
             .child(gpui_kit::component::collapsible::Collapsible::new().open(self.custom_voice_open)
-                .child(Button::new("custom-voice-disclosure").label("自定义音色 ID").icon(if self.custom_voice_open{IconName::ChevronDown}else{IconName::ChevronRight}).on_click(cx.listener(|this,_,_,cx|{this.custom_voice_open=!this.custom_voice_open;cx.notify();})))
-                .content(div().flex().flex_col().gap_2()
-                    .child(div().text_xs().child(if self.draft["tts"]["providerID"].as_str()==Some("fish"){"自定义 Reference ID"}else{"自定义 Voice ID"}))
-                    .child(Input::new(&self.inputs[3])).child(div().text_xs().child("填写该服务已有的音色 ID，无需重新上传；账号、模型及服务区域须与创建音色时一致。"))
-                    .children((self.draft["tts"]["providerID"].as_str()==Some("bailian")).then(||div().text_xs().child("百炼复刻音色需要在模型列表选择对应的 VC Realtime 快照；创建音色时的 target_model 必须匹配。")))))
+                .child(Button::new("custom-voice-disclosure").label(t("自定义音色 ID")).icon(if self.custom_voice_open{IconName::ChevronDown}else{IconName::ChevronRight}).on_click(cx.listener(|this,_,_,cx|{this.custom_voice_open=!this.custom_voice_open;cx.notify();})))
+                .content(div().flex().flex_col().gap(px(ui::SPACING_8))
+                    .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(if self.draft["tts"]["providerID"].as_str()==Some("fish"){t("自定义 Reference ID")}else{t("自定义 Voice ID")}))
+                    .child(Input::new(&self.inputs[3])).child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(t("填写该服务已有的音色 ID，无需重新上传；账号、模型及服务区域须与创建音色时一致。")))
+                    .children((self.draft["tts"]["providerID"].as_str()==Some("bailian")).then(||div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(t("百炼复刻音色需要在模型列表选择对应的 VC Realtime 快照；创建音色时的 target_model 必须匹配。"))))))
             .child(self.dropdown("tts-model","模型","tts","modelID",self.options("tts","models"),cx))
-            .children((self.snapshot["tts"]["catalogLoaded"].as_bool()==Some(true)&&!valid_model).then(||div().text_xs().child("原配置模型不在当前支持列表中，请选择后保存；不会自动改用其他模型。")))
-            .child(if self.snapshot["tts"]["credentialConfigured"].as_bool()==Some(true) { if self.unity_external { "已配置 Unity 会话凭据" } else { "沿用原应用已配置凭据" } } else { "该服务尚未配置凭据，请填写后保存" })
-            .child(div().flex().flex_wrap().gap_2()
-                .child(Button::new("save-tts").label("保存配置").disabled(!valid_model).on_click(cx.listener(|this,_,_,cx|this.tts_action("tts.save",cx)))))
-            .child(div().text_xs().child("传输：本机 TCP → Rust → 服务商；录放音留在系统设备层。"))
-            .child(div().text_xs().child("Rust 流式合成，开麦停止旧朗读；失败保留文字，不自动切换服务。"))
-            .children(self.snapshot["tts"]["notice"].as_str().map(|notice|div().text_xs().child(notice.to_owned()))))
+            .children((self.snapshot["tts"]["catalogLoaded"].as_bool()==Some(true)&&!valid_model).then(||div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(t("原配置模型不在当前支持列表中，请选择后保存；不会自动改用其他模型。"))))
+            .child(if self.snapshot["tts"]["credentialConfigured"].as_bool()==Some(true) { if self.unity_external { t("已配置 Unity 会话凭据") } else { t("沿用原应用已配置凭据") } } else { t("该服务尚未配置凭据，请填写后保存") })
+            .child(div().flex().flex_wrap().gap(px(ui::SPACING_8))
+                .child(Button::new("save-tts").label(t("保存配置")).disabled(!valid_model).on_click(cx.listener(|this,_,_,cx|this.tts_action("tts.save",cx)))))
+            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(t("传输：本机 TCP → Rust → 服务商；录放音留在系统设备层。")))
+            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(t("Rust 流式合成，开麦停止旧朗读；失败保留文字，不自动切换服务。")))
+            .children(self.snapshot["tts"]["notice"].as_str().map(|notice|div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(settings_notice(locale, notice)))))
             .child(group("按住说话")
             .child(self.dropdown("asr-provider","服务","asr","providerID",self.options("asr","providers"),cx))
-            .child(div().flex().items_center().justify_between().child("API Key").child(div().w(px(280.)).child(Input::new(&self.extra_inputs[1]).aria_label("新的 ASR API Key"))))
+            .child(div().flex().items_center().justify_between().child("API Key").child(div().w(px(280.)).child(Input::new(&self.extra_inputs[1]).aria_label(t("新的 ASR API Key")))))
             .child(self.dropdown("asr-model","模型","asr","modelID",self.options("asr","models"),cx))
-            .children((self.snapshot["asr"]["catalogLoaded"].as_bool()==Some(true)&&!self.snapshot["asr"]["models"].as_array().is_some_and(|models|models.iter().any(|model|model["id"]==self.draft["asr"]["modelID"]))).then(||div().text_xs().child("原配置模型不在当前支持列表中，请选择后保存；不会自动改用其他模型。")))
-            .child(Button::new("save-asr").label("保存配置").disabled(!self.snapshot["asr"]["models"].as_array().is_some_and(|models|models.iter().any(|model|model["id"]==self.draft["asr"]["modelID"]))).on_click(cx.listener(|this,_,_,cx|{
+            .children((self.snapshot["asr"]["catalogLoaded"].as_bool()==Some(true)&&!self.snapshot["asr"]["models"].as_array().is_some_and(|models|models.iter().any(|model|model["id"]==self.draft["asr"]["modelID"]))).then(||div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(t("原配置模型不在当前支持列表中，请选择后保存；不会自动改用其他模型。"))))
+            .child(Button::new("save-asr").label(t("保存配置")).disabled(!self.snapshot["asr"]["models"].as_array().is_some_and(|models|models.iter().any(|model|model["id"]==self.draft["asr"]["modelID"]))).on_click(cx.listener(|this,_,_,cx|{
                 let mut value=this.draft["asr"].clone();value["op"]=json!("asr.save");value["apiKey"]=json!(this.extra_inputs[1].read(cx).value().to_string());this.commands.push(value);
             })))
-            .child(if self.unity_external { "当前可管理语音配置和试听；Unity 按住说话及回复朗读尚未接入。" } else { "在空间或 Live Cam 按住麦克风录音，松开后将完整转写交给当前 Agent。没有双向实时通话。" })
-            .children(self.snapshot["asr"]["notice"].as_str().map(|notice|div().text_xs().child(notice.to_owned()))));
+            .child(if self.unity_external { t("当前可管理语音配置和试听；Unity 按住说话及回复朗读尚未接入。") } else { t("在空间或 Live Cam 按住麦克风录音，松开后将完整转写交给当前 Agent。没有双向实时通话。") })
+            .children(self.snapshot["asr"]["notice"].as_str().map(|notice|div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(settings_notice(locale, notice)))));
         form.into_any_element()
     }
 }
@@ -827,9 +840,12 @@ impl AgentSettingsPane {
             .into_any_element()
     }
     fn basic_form(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut form = div().flex().flex_col().gap_3();
+        let locale = UiLocale::from_settings(&self.snapshot);
+        let t = |source: &'static str| settings_copy(locale, source);
+        let mut form = div().flex().flex_col().gap(px(ui::SPACING_12))
+            .text_size(px(ui::BODY)).line_height(px(ui::BODY_LINE_HEIGHT));
         let border = cx.theme().border;
-        let group = |title: &'static str| SettingsGroup::new(title, border).visible(match self.section.as_str(){"角色管理"=>matches!(title,"角色"|"呼吸球样式"),"动作管理"=>matches!(title,"动作"|"动作库"),"我的空间"=>title=="默认空间","生成服务"=>title!="默认空间",_=>true});
+        let group = |title: &'static str| SettingsGroup::new(t(title), border).visible(match self.section.as_str(){"角色管理"=>matches!(title,"角色"|"呼吸球样式"),"动作管理"=>matches!(title,"动作"|"动作库"),"我的空间"=>title=="默认空间","生成服务"=>title!="默认空间",_=>true});
         match self.page {
             0 => {
                 let mut roles = group("角色");
@@ -1163,27 +1179,27 @@ impl AgentSettingsPane {
                                 .child(provider["name"].as_str().unwrap_or("").to_owned())
                                 .child(
                                     div()
-                                        .text_xs()
+                                        .text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT))
                                         .text_color(cx.theme().muted_foreground)
                                         .child(match provider["status"].as_str() {
-                                            Some("connected") => "已连接",
-                                            Some("authorizing") => "正在连接",
-                                            Some("expired") => "登录已过期",
-                                            Some("denied") => "未授权",
-                                            Some("unavailable") => "当前不可用",
-                                            _ => "未连接",
+                                            Some("connected") => t("已连接"),
+                                            Some("authorizing") => t("正在连接"),
+                                            Some("expired") => t("登录已过期"),
+                                            Some("denied") => t("未授权"),
+                                            Some("unavailable") => t("当前不可用"),
+                                            _ => t("未连接"),
                                         }),
                                 ),
                         );
                     if provider["status"].as_str() == Some("authorizing") {
-                        row = row.child("正在连接…");
+                        row = row.child(t("正在连接…"));
                     } else {
-                        let mut buttons = div().flex().items_center().gap_2().flex_shrink_0();
+                        let mut buttons = div().flex().items_center().gap(px(ui::SPACING_8)).flex_shrink_0();
                         if connected {
                             buttons = buttons.child(
                                 Button::new(format!("sync-{id}"))
                                     .ghost().small()
-                                    .label(if syncing{"正在同步…"}else{"同步"})
+                                    .label(if syncing{t("正在同步…")}else{t("同步")})
                                     .disabled(working||syncing)
                                     .on_click(cx.listener({
                                         let id = id.clone();
@@ -1195,13 +1211,13 @@ impl AgentSettingsPane {
                                     })),
                             );
                         }
-                        buttons=buttons.child(Button::new(format!("account-{id}")).small().when(connected,|button|button.ghost()).label(if connected{"断开"}else{"连接"}).disabled(working).on_click(cx.listener({let id=id.clone();move|this,_,_,_|this.commands.push(json!({"op":if connected{"music.disconnect"}else{"music.connect"},"id":id}))})));
+                        buttons=buttons.child(Button::new(format!("account-{id}")).small().when(connected,|button|button.ghost()).label(if connected{t("断开")}else{t("连接")}).disabled(working).on_click(cx.listener({let id=id.clone();move|this,_,_,_|this.commands.push(json!({"op":if connected{"music.disconnect"}else{"music.connect"},"id":id}))})));
                         row = row.child(buttons);
                     }
                     services = services.child(row);
                 }
                 if self.unity_external {
-                    services = services.child(div().text_xs().child("账号操作只影响当前 Unity 会话；同步完成后，音乐库会显示最新歌单。"));
+                    services = services.child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(t("账号操作只影响当前 Unity 会话；同步完成后，音乐库会显示最新歌单。")));
                 }
                 form = form.child(services);
             }
@@ -1379,7 +1395,7 @@ impl Render for AgentSettingsPane {
                     .flex_col()
                     .gap(px(3.))
                     .child(div().text_size(px(ui::TITLE)).font_weight(FontWeight::SEMIBOLD).child(settings_navigation_label(locale, &self.section).to_owned()))
-                    .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(subtitle)),
+                    .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(settings_copy(locale, subtitle))),
             );
         if self.page == 0 && (!self.unity_external || unity_section_available(&self.snapshot, &self.section)) {
             let weak = cx.entity().downgrade();
@@ -1449,7 +1465,7 @@ impl Render for AgentSettingsPane {
                     .text_xs()
                     .text_color(if error{cx.theme().danger}else{cx.theme().muted_foreground})
                     .child(Icon::new(if error{IconName::CircleAlert}else{IconName::CircleCheck}).size(px(14.)))
-                    .child(notice.to_owned()),
+                    .child(settings_notice(locale, notice)),
             );
         }
         let mut menu=SidebarMenu::new();

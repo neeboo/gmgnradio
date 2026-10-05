@@ -12,6 +12,8 @@
 - 无损几何回归编译实际 Swift 桥通过：22,100,215 → 6,800,460 bytes；保持 12MiB 限制、闭合标记及绕序，拒绝 malformed nested mesh。真实拖放请求及完整保存/读回/重启仍未复验。回执后释放相机锁并有限重试，未确认时禁止新写。
 - 语言控件返工：Kit small 按钮 32 逻辑 px、BODY14/CAPTION12，移除重复左右 padding，宽度/圆角沿用侧栏规范；GPUI 两项单测及 Release 再次通过，实际新窗口尺寸尚待核对。
 - v60 Release/package/签名验证通过并替换独立 v59；直接启动打包的专用 GPUI helper（同隔离 endpoint），实际截图确认语言下拉与侧栏左右边界对齐，字重/字号不再独立放大，并显示该设置窗口。直接启动不代表工具栏设置点击验收；真实拖放与回复输出音频仍待验证。
+- v62：Unity 使用官方 Localization 1.5.13、SelectedLocale 和 String Tables，40 键×3语言共120项校验通过，Addressables 内容生成与 Host/Player Release、签名通过。实际窗口确认英文 Settings/Space、日文 設定/空間，随后恢复中文；设置留在 GPUI，补音乐账号/语音/居民人格正文三语，4项 i18n 和11项设置测试通过。尚未全量翻译音乐库及所有设置正文。
+- 通知接入正式 Rust inbox state_read/state_commit，不另建数据库；打开列表不标读，点击具体事件需 CAS 保存并权威读回才更新已读。模拟传输回归覆盖冲突、读回失败、旧事件、缺 scope、关闭取消待执行任务及重新创建桥恢复；真实 App 点击、真实 taskd 重启仍待验收。通知背景已屏蔽空间鼠标穿透。v62 隔离实例已替换 v60，保持有声测试；CUA 点击返回 noWindowsAvailable，未把构建和截图计为交互通过。
 
 ## 已实现
 
