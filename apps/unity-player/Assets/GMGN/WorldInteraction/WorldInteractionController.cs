@@ -23,6 +23,10 @@ namespace GMGN.UnityPlayer
         JObject authority, submitted;
         ulong savedRevision;
         bool active, saving, awaitingReadback;
+        string savedObjectID;
+        bool readbackUnconfirmed;
+        int readbackAttempts;
+        float nextReadback;
         VisualElement inputRoot;
         public event Action<string> Status;
         public Func<string, Vector3, Quaternion, JObject, JObject> BuildPlacementRequest;
@@ -78,6 +82,7 @@ namespace GMGN.UnityPlayer
         public void SetActive(bool value)
         {
             active = value;
+            if (value && readbackUnconfirmed) backend.RequestWorldSnapshot(worldID);
             if (!value) manipulator?.Abort();
             if (!value && !saving) Cancel();
         }
@@ -137,14 +142,14 @@ namespace GMGN.UnityPlayer
             requestID = "unity-layout:" + Guid.NewGuid().ToString("D");
             saving = backend.CommitWorld(worldID, requestID, (ulong)authority["recordRevision"], submitted,
                 new JObject { ["kind"] = "move-preview-confirm", ["objectID"] = selected.ObjectID });
-            if (!saving) { message.text = "空间服务忙，这次尚未保存。请稍后确认。"; return; }
+            if (!saving) { Cancel(); message.text = "空间服务忙，这次调整未保存，请稍后重试。"; Status?.Invoke(message.text); return; }
             message.text = "正在保存，等待空间服务确认…";
             Status?.Invoke(message.text);
         }
 
         internal bool BeginGesture(PointerDownEvent e)
         {
-            if (!active || saving || releasePending || (e.button != 0 && e.button != 1)) return false;
+            if (!active || saving || awaitingReadback || readbackUnconfirmed || releasePending || (e.button != 0 && e.button != 1)) return false;
             var focused = inputRoot.focusController?.focusedElement as VisualElement;
             for (; focused != null; focused = focused.parent) if (focused is TextField) return false;
             // Reuse the proven panel-to-framebuffer selection boundary.
@@ -219,6 +224,12 @@ namespace GMGN.UnityPlayer
             if (evaluationID == null || (string)update["requestID"] != evaluationID || selected == null) return;
             evaluationID = null;
             if (poseVersion != evaluatedPoseVersion) return;
+            if ((string)update["status"] == "failed") {
+                PreviewChanged?.Invoke(null);
+                Status?.Invoke((string)update["message"] ?? "摆放校验服务未能确认，这次调整未保存。");
+                if (releasePending) Cancel();
+                return;
+            }
             var result = update["result"] as JObject;
             if (result != null && evaluatedSupportHeight.HasValue) result["previewSupportHeight"] = evaluatedSupportHeight.Value;
             if ((bool?)result?["canPlace"] == true) ApplyValidatedPreview?.Invoke(result, selected.Instance.transform);
@@ -236,6 +247,12 @@ namespace GMGN.UnityPlayer
         void Update()
         {
             if (Keyboard.current?.escapeKey.wasPressedThisFrame == true) manipulator?.Abort();
+            if (awaitingReadback && Time.unscaledTime >= nextReadback) {
+                if (readbackAttempts >= 3) {
+                    awaitingReadback = false; readbackUnconfirmed = true;
+                    Status?.Invoke("保存回执已收到，但最终状态尚未确认；可以查看空间，重新打开空间会再次读取。");
+                } else RequestSaveReadback();
+            }
             if (!releasePending || evaluationID != null) return;
             if (Time.unscaledTime >= releaseDeadline) { Status?.Invoke("空间校验未完成，这次调整未保存。"); Cancel(); return; }
             Evaluate(true);
@@ -246,17 +263,17 @@ namespace GMGN.UnityPlayer
             if ((string)update["worldID"] != worldID) return;
             if (update["result"]?["record"] is JObject record) {
                 authority = (JObject)record.DeepClone();
-                if (awaitingReadback && (ulong)record["recordRevision"] >= savedRevision) {
-                    var persisted = record["state"]?["objectStates"]?[selected.ObjectID]?["transform"];
-                    var expected = submitted["objectStates"]?[selected.ObjectID]?["transform"];
-                    saving = false; awaitingReadback = false;
+                if ((awaitingReadback || readbackUnconfirmed) && (ulong)record["recordRevision"] >= savedRevision) {
+                    var persisted = record["state"]?["objectStates"]?[savedObjectID]?["transform"];
+                    var expected = submitted["objectStates"]?[savedObjectID]?["transform"];
+                    saving = false; awaitingReadback = false; readbackUnconfirmed = false;
                     var matches = MatchesTransform(persisted, expected);
                     Debug.Log($"World save readback: receiptRevision={savedRevision}; recordRevision={record["recordRevision"]}; geometryMatches={matches}; actual={persisted?.ToString(Newtonsoft.Json.Formatting.None)}; expected={expected?.ToString(Newtonsoft.Json.Formatting.None)}");
                     if (matches) {
                         PreviewEnded?.Invoke();
                         selected = null; message.text = "物件位置已保存，并已从空间服务重新读取确认。";
                         Status?.Invoke(message.text);
-                    } else { Cancel(); message.text = "空间已有其他更新，预览已撤销，请重新操作。"; }
+                    } else { message.text = "空间已有其他更新，当前画面已采用最新状态。"; Status?.Invoke(message.text); }
                 }
                 foreach (var item in items) {
                     if (item.Instance == null || selected == item) continue;
@@ -269,7 +286,8 @@ namespace GMGN.UnityPlayer
                 return;
             }
             if (awaitingReadback && (string)update["operation"] == "world.snapshot" && (string)update["status"] == "failed") {
-                message.text = "保存回执已收到，读回确认失败；尚不能确认最终位置。"; Status?.Invoke(message.text); return;
+                nextReadback = Time.unscaledTime + 1;
+                message.text = "保存回执已收到，正在重试读取最终状态。"; Status?.Invoke(message.text); return;
             }
             if (!saving || (string)update["requestID"] != requestID) return;
             if ((string)update["status"] == "failed") {
@@ -279,9 +297,19 @@ namespace GMGN.UnityPlayer
             }
             if ((string)update["operation"] == "world.commit" && update["result"]?["revision"] != null) {
                 savedRevision = (ulong)update["result"]["revision"];
+                savedObjectID = selected.ObjectID;
+                // The write has a receipt. Never turn subsequent read failures
+                // into a fictitious cancelled write or keep camera input locked.
+                saving = false; selected = null; PreviewEnded?.Invoke();
                 awaitingReadback = true;
-                if (!backend.RequestWorldSnapshot(worldID)) message.text = "已收到保存回执，但读回确认尚未完成。";
+                readbackAttempts = 0; RequestSaveReadback();
             }
+        }
+        void RequestSaveReadback()
+        {
+            readbackAttempts++;
+            nextReadback = Time.unscaledTime + 6;
+            if (!backend.RequestWorldSnapshot(worldID)) nextReadback = Time.unscaledTime + 1;
         }
 
         static bool MatchesTransform(JToken actual, JToken expected)

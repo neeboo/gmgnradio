@@ -35,6 +35,31 @@ namespace GMGN.UnityPlayer
         QueuePanel queuePanel;
         MusicLibraryPanel musicLibraryPanel;
         int compositionEndedFrame = -10;
+        string locale = "zh-CN";
+        bool spaceVisible, spaceConfigured, lastPlaying, lastPrevious, lastNext;
+        string L(string key) => UiLocalization.Get(key, locale);
+
+        void ApplyLocale(string value)
+        {
+            locale = value == "en" || value == "ja" ? value : "zh-CN";
+            root.Q<Label>("chatTitle").text = L("chat");
+            root.Q<Label>("chatHint").text = L("hint");
+            root.Q<Label>("emptyChat").text = L("empty");
+            draft.textEdition.placeholder = L("placeholder");
+            newMessages.text = L("new");
+            foreach (var entry in new[] { ("send", "send"), ("cancel", "cancel"), ("closeChat", "close"),
+                ("chatToggle", "chat"), ("chooseMusic", "music"), ("settings", "settingsTip"),
+                ("fullscreen", "fullscreen"), ("microphone", "microphone"), ("inbox", "inbox"),
+                ("props", "props"), ("screen", "screen") }) root.Q<Button>(entry.Item1).tooltip = L(entry.Item2);
+            root.Q<Slider>("volume").tooltip = L("volume");
+            root.Q<Button>("settings").Q<Label>().text = L("settings");
+            root.Q<Button>("mode").Q<Label>().text = L(spaceVisible ? "space" : "player");
+            root.Q<Button>("mode").tooltip = L(spaceConfigured ? "mode" : "noSpace");
+            play.tooltip = L(lastPlaying ? "pause" : "play");
+            root.Q<Button>("previous").tooltip = L(lastPrevious ? "previous" : "noPrevious");
+            root.Q<Button>("next").tooltip = L(lastNext ? "next" : "noNext");
+            list.RefreshItems();
+        }
 
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
         static void Boot()
@@ -86,12 +111,12 @@ namespace GMGN.UnityPlayer
                 var role = new Label(); role.AddToClassList("message-role"); box.Add(role);
                 var body = new Label { enableRichText = false }; body.AddToClassList("message-text");
                 body.selection.isSelectable = true; box.Add(body);
-                var retry = new Button { text = "重新编辑并发送" }; retry.AddToClassList("retry-message");
+                var retry = new Button { text = L("retry") }; retry.AddToClassList("retry-message");
                 retry.clicked += () => { if (retry.userData is Message message) RestoreDraft(message); };
                 box.Add(retry); return box; };
             list.bindItem = (row, i) => { var message = messages[i]; ((Label)row[0]).text = message.role; ((Label)row[1]).text = message.text;
                 row.EnableInClassList("message-error", message.failed);
-                var retry = (Button)row[2]; retry.userData = message; retry.EnableInClassList("hidden", !message.failed); };
+                var retry = (Button)row[2]; retry.text = L("retry"); retry.userData = message; retry.EnableInClassList("hidden", !message.failed); };
             chatScroll = list.Q<ScrollView>();
             chatScroll.mode = ScrollViewMode.Vertical;
             chatScroll.horizontalScrollerVisibility = ScrollerVisibility.Hidden;
@@ -122,6 +147,7 @@ namespace GMGN.UnityPlayer
             root.Q<Button>("previous").clicked += () => backend?.Previous();
             root.Q<Button>("chooseMusic").clicked += () => { ToggleChat(false); queuePanel?.SetVisible(false); musicLibraryPanel?.Toggle(); };
             volume.RegisterValueChangedCallback(e => backend?.SetVolume(e.newValue));
+            ApplyLocale(locale);
             sculpture = gameObject.AddComponent<AudioSculpture>();
             pointArtwork = gameObject.AddComponent<PointCloudArtworkLoader>();
             gpuLyrics = gameObject.AddComponent<GpuLyricsView>();
@@ -138,7 +164,8 @@ namespace GMGN.UnityPlayer
                 world.Status += OnStatus;
                 var mode = root.Q<Button>("mode");
                 mode.SetEnabled(world.Configured);
-                mode.tooltip = world.Configured ? "切换播放器与空间" : "尚未指定空间备份";
+                spaceConfigured = world.Configured;
+                mode.tooltip = L(spaceConfigured ? "mode" : "noSpace");
                 Debug.Log($"World mode initialized: configured={world.Configured}; enabled={mode.enabledInHierarchy}");
                 mode.RegisterCallback<PointerDownEvent>(e => Debug.Log($"World mode pointer down: button={e.button}; position={e.position}; enabled={mode.enabledInHierarchy}"), TrickleDown.TrickleDown);
                 mode.RegisterCallback<PointerUpEvent>(e => Debug.Log($"World mode pointer up: button={e.button}; position={e.position}"), TrickleDown.TrickleDown);
@@ -146,8 +173,9 @@ namespace GMGN.UnityPlayer
                 mode.clicked += () => { Debug.Log("World mode clicked"); world.Toggle(); };
                 root.RegisterCallback<PointerDownEvent>(e => Debug.Log($"UI pointer down: target={(e.target as VisualElement)?.name}; position={e.position}; button={e.button}"), TrickleDown.TrickleDown);
                 world.ModeChanged += visible => {
+                    spaceVisible = visible;
                     // Preserve the vector icon created above; change only its label.
-                    var label = mode.Q<Label>(); if (label != null) label.text = visible ? "空间" : "播放器";
+                    var label = mode.Q<Label>(); if (label != null) label.text = L(visible ? "space" : "player");
                 };
                 if (Environment.GetEnvironmentVariable("GMGN_UNITY_OPEN_SPACE") == "1")
                     root.schedule.Execute(() => { Debug.Log("World explicit startup requested; not a click acceptance"); world.Toggle(); });
@@ -160,6 +188,7 @@ namespace GMGN.UnityPlayer
         void OnStatus(string value) => status.text = value;
         void OnSnapshot(PlayerSnapshot snapshot)
         {
+            if (!string.IsNullOrEmpty(snapshot.locale) && snapshot.locale != locale) ApplyLocale(snapshot.locale);
             lyric.text = snapshot.lyric ?? ""; translation.text = snapshot.translation ?? "";
             var lyricMode = snapshot.lyricVisual?.mode;
             gpuLyrics.SetTheme(snapshot.lyricVisual?.theme);
@@ -179,10 +208,11 @@ namespace GMGN.UnityPlayer
             duration = snapshot.duration;
             GetComponent<UIDocument>().rootVisualElement.Q<Button>("next").SetEnabled(snapshot.nextSupported);
             root.Q<Button>("previous").SetEnabled(snapshot.previousSupported);
-            root.Q<Button>("previous").tooltip = snapshot.previousSupported ? "上一首" : "当前队列没有上一首";
-            root.Q<Button>("next").tooltip = snapshot.nextSupported ? "下一首" : "当前队列没有下一首";
+            lastPrevious = snapshot.previousSupported; lastNext = snapshot.nextSupported; lastPlaying = snapshot.playing;
+            root.Q<Button>("previous").tooltip = L(lastPrevious ? "previous" : "noPrevious");
+            root.Q<Button>("next").tooltip = L(lastNext ? "next" : "noNext");
             volume.SetValueWithoutNotify(snapshot.volume);
-            play.tooltip = snapshot.playing ? "暂停" : "播放";
+            play.tooltip = L(snapshot.playing ? "pause" : "play");
             playIcon.Kind = snapshot.playing ? "pause" : "play";
             sculpture.SetFeatures(snapshot.playing, snapshot.bass, snapshot.vocal, snapshot.treble);
             if (snapshot.pointCloud is { } points) {
@@ -264,7 +294,7 @@ namespace GMGN.UnityPlayer
             return icon;
         }
 
-        sealed class ToolbarIcon : VisualElement
+        public sealed class ToolbarIcon : VisualElement
         {
             string kind;
             public string Kind { set { if (kind == value) return; kind = value; MarkDirtyRepaint(); } }
@@ -292,6 +322,8 @@ namespace GMGN.UnityPlayer
                     case "send": Path(4,9,10,3,16,9); Path(10,3,10,17); break;
                     case "stop": Path(4,4,16,4,16,16,4,16,4,4); break;
                     case "close": Path(4,4,16,16); Path(16,4,4,16); break;
+                    case "back": Path(13,4,7,10,13,16); break;
+                    case "refresh": p.BeginPath(); p.Arc(new Vector2(10,10), 6, Angle.Degrees(35), Angle.Degrees(320), ArcDirection.Clockwise); p.Stroke(); Path(13,4,17,4,17,8); break;
                 }
             }
         }

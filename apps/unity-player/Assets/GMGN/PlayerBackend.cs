@@ -10,6 +10,7 @@ namespace GMGN.UnityPlayer
     [Serializable] public sealed class PlayerSnapshot
     {
         public string sessionId, title, artist, lyric, translation;
+        public string locale = "zh-CN";
         public double position, duration;
         public bool playing, seekSupported, nextSupported, previousSupported;
         public float volume, bass, vocal, treble;

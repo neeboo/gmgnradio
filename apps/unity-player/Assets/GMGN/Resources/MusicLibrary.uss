@@ -1,6 +1,7 @@
 .music-library { width: 440px; max-width: 100%; height: 470px; max-height: 84%; min-height: 0; flex-shrink: 1; margin-bottom: 16px; padding: 16px; overflow: hidden; }
 .music-library-header { flex-direction: row; align-items: center; margin-bottom: 12px; flex-shrink: 0; }
 .music-library-title { flex-grow: 1; font-size: var(--subtitle); -unity-font-style: bold; }
+.music-library-action { width: 32px; height: 32px; padding: 6px; margin: 0 0 0 4px; align-items: center; justify-content: center; }
 .music-library-status { font-size: var(--caption); color: var(--muted); white-space: normal; margin-bottom: 10px; flex-shrink: 0; }
 .music-library-list-region { height: 0; flex-grow: 1; flex-shrink: 1; min-height: 0; min-width: 0; overflow: hidden; }
 .music-library-list { height: 0; flex-grow: 1; flex-shrink: 1; min-height: 0; min-width: 0; overflow: hidden; }

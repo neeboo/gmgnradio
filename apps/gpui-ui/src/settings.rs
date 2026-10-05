@@ -1,5 +1,6 @@
 //! Product settings controls. Catalogs and all side effects come from ProductHost.
 use crate::ui_tokens as ui;
+use crate::i18n::{UiLocale, language_command, settings_navigation_label};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::InputEvent;
 use gpui_kit::component::{button::*, input::*, menu::*, switch::Switch, *};
@@ -1333,6 +1334,7 @@ impl AgentSettingsPane {
 
 impl Render for AgentSettingsPane {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let locale = UiLocale::from_settings(&self.snapshot);
         use gpui_kit::component::sidebar::{Sidebar, SidebarMenu, SidebarMenuItem};
         let (_title, subtitle) = match self.page {
             0 => ("角色与动作", "选择角色的形象与表演动作"),
@@ -1376,7 +1378,7 @@ impl Render for AgentSettingsPane {
                     .flex()
                     .flex_col()
                     .gap(px(3.))
-                    .child(div().text_size(px(ui::TITLE)).font_weight(FontWeight::SEMIBOLD).child(self.section.clone()))
+                    .child(div().text_size(px(ui::TITLE)).font_weight(FontWeight::SEMIBOLD).child(settings_navigation_label(locale, &self.section).to_owned()))
                     .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(subtitle)),
             );
         if self.page == 0 && (!self.unity_external || unity_section_available(&self.snapshot, &self.section)) {
@@ -1460,13 +1462,36 @@ impl Render for AgentSettingsPane {
             ("应用",vec![("shortcuts","快捷键")]),
         ] {
             let active=items.iter().any(|(_,section)|*section==self.section);
-            let children=items.into_iter().map(|(key,section)|SidebarMenuItem::new(section).active(self.section==section)
+            let children=items.into_iter().map(|(key,section)|SidebarMenuItem::new(settings_navigation_label(locale, section)).active(self.section==section)
                 .on_click(cx.listener(move|this,_,_,cx|this.select_section(key,section,cx)))).collect::<Vec<_>>();
-            menu=menu.child(SidebarMenuItem::new(label).active(active)
+            menu=menu.child(SidebarMenuItem::new(settings_navigation_label(locale, label)).active(active)
                 .default_open(active).click_to_toggle(true).children(children));
         }
+        let weak = cx.entity().downgrade();
+        // Sidebar supplies the same horizontal inset as its navigation content.
+        let language = div().w_full().pb(px(ui::SPACING_8)).flex().flex_col().gap(px(ui::SPACING_4))
+            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT))
+                .text_color(cx.theme().muted_foreground).child(locale.language_label()))
+            .child(Button::new("settings-language").small().w_full().h(px(32.))
+                .text_size(px(ui::BODY)).line_height(px(ui::BODY_LINE_HEIGHT))
+                .label(locale.name()).dropdown_caret(true)
+                .disabled(self.snapshot["locale"].as_str().and_then(UiLocale::parse).is_none())
+                .dropdown_menu(move |mut menu, _, _| {
+                    for language in UiLocale::ALL {
+                        let weak = weak.clone();
+                        menu = menu.item(PopupMenuItem::new(language.name()).on_click(move |_, _, cx| {
+                            _ = weak.update(cx, |this, cx| {
+                                // Readback owns the visible locale. A rejected
+                                // command must not optimistically switch copy.
+                                this.commands.push(language_command(language));
+                                cx.notify();
+                            });
+                        }));
+                    }
+                    menu
+                }));
         div().size_full().flex().bg(cx.theme().background).text_color(cx.theme().foreground)
-            .child(Sidebar::new("settings-sidebar").w(px(200.)).child(menu))
+            .child(Sidebar::new("settings-sidebar").w(px(200.)).header(language).child(menu))
             .child(div().flex_1().min_w(px(0.)).h_full().child(root))
     }
 }

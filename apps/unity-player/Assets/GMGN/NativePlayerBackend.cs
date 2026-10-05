@@ -19,7 +19,7 @@ namespace GMGN.UnityPlayer
         [DllImport(Library)] static extern IntPtr gmgn_unity_host_snapshot(IntPtr host);
         [DllImport(Library)] static extern void gmgn_unity_host_string_free(IntPtr value);
         [DllImport(Library)] static extern int gmgn_unity_host_destroy(IntPtr host);
-        [Serializable] sealed class Envelope { public Music music; public Conversation chat; public WorldPulse world, musicLibrary; }
+        [Serializable] sealed class Envelope { public string locale; public Music music; public Conversation chat; public WorldPulse world, musicLibrary; }
         [Serializable] sealed class WorldPulse { public ulong generation; public bool pending; public string status; }
         [Serializable] sealed class Music { public ulong playbackSessionID; public string title, notice; public double duration, position; public bool isPlaying, canNext, canPrevious, seekSupported; public int queueIndex, queueCount; public QueueItem[] queue; public float volume; public Features features; public long lyricRevision; public LyricVisualSnapshot lyricVisual; public PointCloudSnapshot pointCloud; public LyricPointLine[] lines; }
         [Serializable] sealed class Features { public float low, mid, high, bass, vocal, treble; }
@@ -35,6 +35,7 @@ namespace GMGN.UnityPlayer
         long lyricRevision = -1;
         float nextPoll;
         bool playing;
+        bool nextSupported, previousSupported;
         ulong? worldGeneration;
         ulong? musicLibraryGeneration;
         public event Action<JObject> MusicLibraryUpdated;
@@ -141,6 +142,7 @@ namespace GMGN.UnityPlayer
             }
             if (value.music != null) {
                 var music = value.music; playing = music.isPlaying;
+                nextSupported = music.canNext; previousSupported = music.canPrevious;
                 if (music.queue != null) musicQueue = music.queue;
                 if (lyricSession != music.playbackSessionID || lyricRevision != music.lyricRevision) {
                     // Clear old track data even when a new timeline is not ready.
@@ -149,7 +151,7 @@ namespace GMGN.UnityPlayer
                 } else if (music.lines != null) lyrics = music.lines;
                 string lyric = "", translation = "";
                 foreach (var line in lyrics) { if (music.position >= line.startsAt && music.position < line.endsAt) { lyric = line.text; translation = line.translation; break; } }
-                Snapshot?.Invoke(new PlayerSnapshot { sessionId = music.playbackSessionID.ToString(), title = music.title, duration = music.duration, position = music.position, playing = music.isPlaying, nextSupported = music.canNext, previousSupported = music.canPrevious, seekSupported = music.seekSupported, volume = music.volume, lyric = lyric, translation = translation, lyricRevision = music.lyricRevision, lyricLines = lyrics, lyricVisual = music.lyricVisual, pointCloud = music.pointCloud, queueIndex = music.queueIndex, queueCount = music.queueCount, queue = musicQueue, bass = music.features?.bass ?? 0, vocal = music.features?.vocal ?? 0, treble = music.features?.treble ?? 0 });
+                Snapshot?.Invoke(new PlayerSnapshot { locale = value.locale ?? "zh-CN", sessionId = music.playbackSessionID.ToString(), title = music.title, duration = music.duration, position = music.position, playing = music.isPlaying, nextSupported = music.canNext, previousSupported = music.canPrevious, seekSupported = music.seekSupported, volume = music.volume, lyric = lyric, translation = translation, lyricRevision = music.lyricRevision, lyricLines = lyrics, lyricVisual = music.lyricVisual, pointCloud = music.pointCloud, queueIndex = music.queueIndex, queueCount = music.queueCount, queue = musicQueue, bass = music.features?.bass ?? 0, vocal = music.features?.vocal ?? 0, treble = music.features?.treble ?? 0 });
                 if (!string.IsNullOrEmpty(music.notice)) Status?.Invoke(music.notice);
             }
             if (value.chat?.events == null) return;
@@ -168,8 +170,13 @@ namespace GMGN.UnityPlayer
         }
         public void PlayPause() => Execute(new Command { op = playing ? "music.pause" : "music.play" });
         public void ChooseMusic() => Execute(new Command { op = "music.choose" });
-        public void Next() => Execute(new Command { op = "music.next" });
-        public void Previous() => Execute(new Command { op = "music.previous" });
+        public void Next() => Navigate("music.next", nextSupported, "当前歌单没有下一首。");
+        public void Previous() => Navigate("music.previous", previousSupported, "当前歌单没有上一首。");
+        void Navigate(string operation, bool supported, string unavailable)
+        {
+            if (!supported) { Status?.Invoke(unavailable); return; }
+            if (!Execute(new Command { op = operation })) Status?.Invoke("暂时无法切换歌曲，请稍后重试。");
+        }
         public void SelectQueueItem(int index) { if (!Execute(new Command { op = "music.select", index = index })) Status?.Invoke("这首音乐暂时无法播放，请重新选择音乐。"); }
         public void OpenSettings() { if (!Execute(new Command { op = "settings.open" })) Status?.Invoke("设置面板暂时无法打开。"); }
         public void Seek(double seconds) => Status?.Invoke("当前音乐后端尚未提供跳转。");

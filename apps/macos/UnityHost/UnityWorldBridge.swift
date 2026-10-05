@@ -16,8 +16,8 @@ final class UnityWorldBridge: @unchecked Sendable {
     private var emittedGeneration: UInt64?
     private var resultData = Data("{\"status\":\"idle\",\"version\":1}".utf8)
     // Accessed only on the serial authority queue. One immutable geometry cached.
-    private var indexedGeometryDigest: Data?
-    private var indexedGeometry: [String: Any]?
+    private var indexedGeometryCache: [Data: [String: Any]] = [:]
+    private var indexedGeometryOrder: [Data] = []
 
     init(root: URL) {
         endpoint = WorldAuthorityEndpoint(applicationSupportBase: root)
@@ -76,9 +76,7 @@ final class UnityWorldBridge: @unchecked Sendable {
                     // Pure read-only evaluation, through the same authenticated
                     // taskd transport. The renderer cannot supply its own verdict.
                     let deriving = operation == "world.placement.derive"
-                    if let triangles = payload["triangles"] as? [[[NSNumber]]] {
-                        payload["triangles"] = try indexedTriangles(triangles)
-                    }
+                    payload = try preparePlacementGeometry(payload)
                     payloadByteCount = try JSONSerialization.data(withJSONObject: payload).count
                     // Keep the authenticated transport's 12 MiB limit unchanged.
                     // Leave bounded headroom for method/id/auth envelope.
@@ -173,10 +171,28 @@ final class UnityWorldBridge: @unchecked Sendable {
     }
 
     private struct VertexBits: Hashable { let x: UInt32; let y: UInt32; let z: UInt32 }
+    // Internal so the boundary regression compiles this exact production code.
+    // Preserve every face, winding, obstacle identity and closed-mesh flag.
+    func preparePlacementGeometry(_ input: [String: Any]) throws -> [String: Any] {
+        var payload = input
+        if let triangles = payload["triangles"] as? [[[NSNumber]]] {
+            payload["triangles"] = try indexedTriangles(triangles)
+        }
+        for key in ["blockingVolumes", "placedObstacles"] {
+            guard var obstacles = payload[key] as? [[String: Any]] else { continue }
+            for index in obstacles.indices {
+                guard obstacles[index]["shape"] as? String == "mesh",
+                      let triangles = obstacles[index]["triangles"] as? [[[NSNumber]]] else { continue }
+                obstacles[index]["triangles"] = try indexedTriangles(triangles)
+            }
+            payload[key] = obstacles
+        }
+        return payload
+    }
     private func indexedTriangles(_ triangles: [[[NSNumber]]]) throws -> [String: Any] {
         let source = try JSONSerialization.data(withJSONObject: triangles)
         let digest = Data(SHA256.hash(data: source))
-        if digest == indexedGeometryDigest, let indexedGeometry { return indexedGeometry }
+        if let cached = indexedGeometryCache[digest] { return cached }
         var lookup: [VertexBits: UInt32] = [:]
         var vertices: [[Float]] = []
         var indices: [[UInt32]] = []
@@ -201,7 +217,12 @@ final class UnityWorldBridge: @unchecked Sendable {
             indices.append(face)
         }
         let result: [String: Any] = ["vertices": vertices, "indices": indices]
-        indexedGeometryDigest = digest; indexedGeometry = result
+        // One collider and a handful of restored obstacles; never retain an
+        // unbounded history of moved meshes. The authority owns no new state.
+        if indexedGeometryOrder.count >= 8 {
+            indexedGeometryCache.removeValue(forKey: indexedGeometryOrder.removeFirst())
+        }
+        indexedGeometryOrder.append(digest); indexedGeometryCache[digest] = result
         return result
     }
 

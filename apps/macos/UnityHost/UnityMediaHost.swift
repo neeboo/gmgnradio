@@ -32,6 +32,8 @@ final class UnityMediaHost {
     private var notice: String?
     private var openPanel: NSOpenPanel?
     private var closed = false
+    private var replySpeechRequestID: UInt64?
+    private var announcedReplyRequestID: UInt64?
     private var pausedPosition: TimeInterval?
     private struct QueueEntry {
         let url: URL
@@ -203,10 +205,20 @@ final class UnityMediaHost {
             case "music.seek": notice = "当前音乐后端尚未提供跳转。"; return false
             case "chat.send":
                 guard let id = value["requestID"] as? NSNumber, let text = value["text"] as? String else { return false }
-                return chat.send(requestID: id.uint64Value, text: text)
+                guard chat.send(requestID: id.uint64Value, text: text) else { return false }
+                productSettings.stopReplySpeech()
+                replySpeechRequestID = id.uint64Value
+                announcedReplyRequestID = nil
+                return true
             case "chat.cancel":
                 guard let id = value["requestID"] as? NSNumber else { return false }
-                return chat.cancel(requestID: id.uint64Value)
+                let cancelled = chat.cancel(requestID: id.uint64Value)
+                if replySpeechRequestID == id.uint64Value {
+                    replySpeechRequestID = nil
+                    productSettings.stopReplySpeech()
+                    return true
+                }
+                return cancelled
             default: return false
             }
             notice = nil
@@ -251,14 +263,32 @@ final class UnityMediaHost {
             emittedLyricRevision = lyricRevision
         }
         var conversation = chat.poll()
+        if let events = conversation["events"] as? [[String: Any]] {
+            for event in events {
+                guard let request = event["requestID"] as? NSNumber,
+                      request.uint64Value == replySpeechRequestID else { continue }
+                switch event["kind"] as? String {
+                case "reply":
+                    guard announcedReplyRequestID != request.uint64Value else { continue }
+                    announcedReplyRequestID = request.uint64Value
+                    if let text = event["text"] as? String { productSettings.speakReply(text) }
+                case "failure", "cancelled":
+                    replySpeechRequestID = nil
+                    productSettings.stopReplySpeech()
+                default: break
+                }
+            }
+        }
         conversation["capabilities"] = ["streamingReplies": true, "deltaTextMode": "replace",
             "cancelActiveReply": true, "cancellationAcknowledgement": "local-turn-invalidated",
             "providerCancellationAcknowledgement": false]
-        return ["version": 1, "music": music, "musicLibrary": musicLibrary.snapshot(), "chat": conversation, "world": world.snapshot()]
+        return ["version": 1, "locale": productSettings.locale, "music": music, "musicLibrary": musicLibrary.snapshot(), "chat": conversation, "world": world.snapshot()]
     }
 
     func close() {
         closed = true
+        replySpeechRequestID = nil
+        announcedReplyRequestID = nil
         openPanel?.cancel(nil)
         openPanel = nil
         player.stop()
@@ -294,7 +324,7 @@ final class UnityMediaHost {
         settings["music"] = musicLibrary.settingsSnapshot
         settings["unity"] = ["availableSections": ["歌词", "视觉效果", "语音播放", "按住说话", "自主行动", "音乐账号与歌单同步"],
                              "availableAgentGroups": ["回复语音", "按住说话", "居民人格"],
-                             "autoSpeakSupported": false,
+                             "autoSpeakSupported": true,
                              "unavailableMessage": "此设置尚未接入 Unity；角色、快捷键、视频与空间活动仍由原应用管理。"]
         return ["version": 1, "revision": visualRevision, "settings": settings,
                 "stage": ["mode": "player", "stageRadioPluginEnabled": true,
@@ -303,7 +333,7 @@ final class UnityMediaHost {
                                      "clouds": StagePointCloudChoice.allCases.map { ["id": $0.rawValue, "name": $0.title] },
                                      "cloudID": visualDirection.currentPointCloudChoice.rawValue,
                                      "particleScale": visualDirection.particleSizeMultiplier]],
-                "supportedCommands": ["settings.load", "speech.settings.load", "speech.settings.cancel", "stage.load",
+                "supportedCommands": ["app.language", "settings.load", "speech.settings.load", "speech.settings.cancel", "stage.load",
                                       "stage.player.lyrics", "stage.player.cloud", "stage.player.particles", "agent.save",
                                       "tts.provider", "tts.refresh", "tts.save", "tts.preview", "tts.stop", "asr.provider", "asr.save",
                                       "music.load", "music.connect", "music.disconnect", "music.sync"]]

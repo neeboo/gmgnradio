@@ -1,5 +1,6 @@
 //! First reusable GPUI Kit migration slice; no network or production configuration access.
 pub mod inbox;
+pub mod i18n;
 pub mod lyrics;
 pub mod projective_card;
 pub mod settings;

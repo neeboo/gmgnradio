@@ -28,6 +28,7 @@ namespace GMGN.UnityPlayer
         readonly IReadOnlyList<RecoveryItem> items;
         readonly Dictionary<string, Geometry> geometry = new();
         readonly Dictionary<string, JObject> obstacleCache = new();
+        readonly Dictionary<string, string> obstacleJSON = new();
         readonly Dictionary<string, Matrix4x4> obstacleMatrices = new();
         string gridJSON, triangleJSON, blockingJSON;
         readonly Dictionary<string, string> unavailable = new();
@@ -111,19 +112,27 @@ namespace GMGN.UnityPlayer
             var placed = new JArray();
             foreach (var entry in matrices) {
                 if (!obstacleMatrices.TryGetValue(entry.Key, out var old) || old != entry.Value) {
-                    var mesh = geometry[entry.Key]; var faces = new JArray();
-                    for (var i = 0; i + 2 < mesh.Indices.Length; i += 3) {
-                        var face = new JArray();
-                        foreach (var index in new[] { mesh.Indices[i], mesh.Indices[i+2], mesh.Indices[i+1] }) {
-                            var p = entry.Value.MultiplyPoint3x4(mesh.LocalVertices[index]);
-                            face.Add(new JArray(p.x, p.y, -p.z));
+                    var mesh = geometry[entry.Key]; var faces = new JArray(); var vertices = new JArray();
+                    var lookup = new Dictionary<(int x, int y, int z), int>();
+                    var vertexIndices = new int[mesh.LocalVertices.Length];
+                    for (var i = 0; i < mesh.LocalVertices.Length; i++) {
+                        var p = entry.Value.MultiplyPoint3x4(mesh.LocalVertices[i]);
+                        var key = (BitConverter.SingleToInt32Bits(p.x), BitConverter.SingleToInt32Bits(p.y), BitConverter.SingleToInt32Bits(-p.z));
+                        if (!lookup.TryGetValue(key, out var index)) {
+                            index = vertices.Count; lookup[key] = index;
+                            vertices.Add(new JArray(p.x, p.y, -p.z));
                         }
-                        faces.Add(face);
+                        vertexIndices[i] = index;
                     }
-                    obstacleCache[entry.Key] = new JObject { ["shape"] = "mesh", ["id"] = entry.Key, ["triangles"] = faces };
+                    for (var i = 0; i + 2 < mesh.Indices.Length; i += 3) {
+                        faces.Add(new JArray(vertexIndices[mesh.Indices[i]], vertexIndices[mesh.Indices[i+2]], vertexIndices[mesh.Indices[i+1]]));
+                    }
+                    obstacleCache[entry.Key] = new JObject { ["shape"] = "mesh", ["id"] = entry.Key,
+                        ["triangles"] = new JObject { ["vertices"] = vertices, ["indices"] = faces } };
+                    obstacleJSON[entry.Key] = obstacleCache[entry.Key].ToString(Newtonsoft.Json.Formatting.None);
                     obstacleMatrices[entry.Key] = entry.Value;
                 }
-                placed.Add(obstacleCache[entry.Key].DeepClone());
+                placed.Add(new JRaw(obstacleJSON[entry.Key]));
             }
             return new JObject { ["grid"] = new JRaw(gridJSON), ["anchor"] = anchor.DeepClone(),
                 ["footprint"] = new JObject { ["size"] = new JArray(bounds.size.x, bounds.size.z), ["yaw"] = yaw },

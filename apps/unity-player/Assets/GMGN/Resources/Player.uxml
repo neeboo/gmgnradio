@@ -12,7 +12,7 @@
       </ui:VisualElement>
       <ui:VisualElement name="chatPanel" class="chat-column card hidden">
         <ui:VisualElement class="chat-header row">
-          <ui:Label text="与角色聊天" class="subtitle" />
+          <ui:Label name="chatTitle" text="与角色聊天" class="subtitle" />
           <ui:Button name="closeChat" tooltip="收起聊天" class="icon-button" />
         </ui:VisualElement>
         <ui:Label name="emptyChat" text="可以聊音乐，也可以说说今天的事。" class="empty-chat muted" />
@@ -20,7 +20,7 @@
         <ui:Button name="newMessages" text="查看新消息" class="hidden new-messages" />
         <ui:TextField name="draft" multiline="true" class="draft" />
         <ui:VisualElement class="composer-footer row">
-          <ui:Label text="Enter 发送 · Shift+Enter 换行" class="hint muted" />
+          <ui:Label name="chatHint" text="Enter 发送 · Shift+Enter 换行" class="hint muted" />
           <ui:Button name="cancel" tooltip="停止回复" class="icon-button hidden" />
           <ui:Button name="send" tooltip="发送消息" class="icon-button primary" />
         </ui:VisualElement>

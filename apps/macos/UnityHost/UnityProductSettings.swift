@@ -8,6 +8,10 @@ final class UnityProductSettings {
     private let speech: RustSpeechPreferences
     private let client: RustVoiceClient
     private let previewStatus = AgentSpeechStatusStore()
+    private let replyStatus = AgentSpeechStatusStore()
+    private var replySpeech: (any SpeechSynthesizing)?
+    private static let autoSpeakKey = "unity.agent.autoSpeakReplies"
+    private static let localeKey = "unity.ui.locale"
     private var preview: RustSpeechSynthesizer?
     private var capabilities: RustVoiceCapabilities?
     private var capabilitiesTask: Task<Void, Never>?
@@ -37,16 +41,18 @@ final class UnityProductSettings {
             ?? speech.configuration(for: "asr", includesEnvironment: false)
         let asrCaps = capabilities?.providers.first { $0.id == asr.provider.rawValue }
         return [
+            "locale": locale,
             "agent": ["backendID": "dsh", "backends": [["id": "dsh", "name": "DSH"]],
                       "backendStatus": "当前 Unity 聊天使用 DSH。", "residentPersona": resident.persona,
-                      "notice": "居民人格保存后下一轮聊天生效。回复朗读、按住说话与自主行动尚未接入 Unity。", "hasError": false],
+                      "autoSpeak": autoSpeakReplies,
+                      "notice": replyStatus.lastErrorMessage ?? "居民人格保存后下一轮聊天生效。按住说话与自主行动尚未接入 Unity。", "hasError": replyStatus.lastErrorMessage != nil],
             "tts": ["providerID": provider.rawValue, "modelID": model, "voiceID": voiceID,
                     "providers": (capabilities?.providers.filter { !$0.ttsModels.isEmpty } ?? []).map { ["id": $0.id, "name": providerName($0.id)] },
                     "models": (caps?.ttsModels ?? []).map { ["id": $0.id, "name": $0.name] },
                     "voices": voices.map { ["id": $0.id, "name": $0.name] },
                     "loading": loadingCapabilities || loadingVoices, "catalogLoaded": capabilities != nil,
                     "defaultModelID": caps?.defaultTTSModel as Any? ?? NSNull(),
-                    "isSpeaking": previewStatus.isSpeaking,
+                    "isSpeaking": previewStatus.isSpeaking || replyStatus.isSpeaking,
                     "credentialConfigured": !speech.configuration(provider: provider, for: "tts", includesEnvironment: false).apiKey.isEmpty,
                     "notice": previewStatus.lastErrorMessage ?? notice as Any? ?? NSNull()],
             "asr": ["providerID": asr.provider.rawValue, "modelID": asr.model ?? asrCaps?.defaultASRModel ?? "",
@@ -61,10 +67,20 @@ final class UnityProductSettings {
     func command(_ value: [String: Any]) -> Bool {
         guard let op = value["op"] as? String else { return false }
         switch op {
+        case "app.language":
+            guard let locale = value["locale"] as? String, ["zh-CN", "en", "ja"].contains(locale) else { return false }
+            defaults.set(locale, forKey: Self.localeKey)
         case "settings.load", "speech.settings.load": loadCapabilities()
         case "agent.save":
-            guard let persona = value["residentPersona"] as? String, value.keys.allSatisfy({ ["op", "residentPersona"].contains($0) }) else { return false }
-            ResidentPreferences(defaults: defaults).savePersona(persona)
+            guard value.keys.allSatisfy({ ["op", "residentPersona", "autoSpeak"].contains($0) }),
+                  value["residentPersona"] != nil || value["autoSpeak"] != nil,
+                  value["residentPersona"] == nil || value["residentPersona"] is String,
+                  value["autoSpeak"] == nil || value["autoSpeak"] is Bool else { return false }
+            if let persona = value["residentPersona"] as? String { ResidentPreferences(defaults: defaults).savePersona(persona) }
+            if let enabled = value["autoSpeak"] as? Bool {
+                defaults.set(enabled, forKey: Self.autoSpeakKey)
+                if !enabled { stopReplySpeech() }
+            }
         case "agent.backend", "agent.status": return false
         case "tts.provider":
             guard let id = value["id"] as? String, let selected = RustVoiceProvider(rawValue: id),
@@ -91,12 +107,13 @@ final class UnityProductSettings {
             guard let configuration = selectedConfiguration(value) else { return false }
             provider = configuration.provider; model = configuration.model ?? ""; voiceID = configuration.voiceID
             preview?.stopSpeaking()
+            stopReplySpeech()
             if op == "tts.save" { speech.save(configuration, for: "tts"); notice = "已保存 Unity 语音配置。" }
             else {
                 let synthesizer = RustSpeechSynthesizer(configuration: { configuration }, statusStore: previewStatus, client: client)
                 preview = synthesizer; synthesizer.speak("你好，这是当前选中的声音。")
             }
-        case "tts.stop": preview?.stopSpeaking(); preview = nil
+        case "tts.stop": preview?.stopSpeaking(); preview = nil; stopReplySpeech()
         case "speech.settings.cancel":
             stopVoiceWork()
             if value["cancelCapabilities"] as? Bool != false { capabilitiesTask?.cancel(); capabilitiesTask = nil; loadingCapabilities = false }
@@ -153,7 +170,20 @@ final class UnityProductSettings {
         generation &+= 1; voicesTask?.cancel(); voicesTask = nil; loadingVoices = false
         preview?.stopSpeaking(); preview = nil; previewStatus.lastErrorMessage = nil
     }
-    func close() { stopVoiceWork(); capabilitiesTask?.cancel(); capabilitiesTask = nil }
+    var autoSpeakReplies: Bool { defaults.object(forKey: Self.autoSpeakKey) as? Bool ?? true }
+    var locale: String { defaults.string(forKey: Self.localeKey).flatMap { ["zh-CN", "en", "ja"].contains($0) ? $0 : nil } ?? "zh-CN" }
+    func speakReply(_ text: String) {
+        stopReplySpeech()
+        guard autoSpeakReplies, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        preview?.stopSpeaking(); preview = nil
+        replyStatus.lastErrorMessage = nil
+        let configuration = speech.configuration(for: "tts", includesEnvironment: false)
+        let synthesizer = RustSpeechSynthesizer(configuration: { configuration }, statusStore: replyStatus, client: client)
+        replySpeech = synthesizer
+        synthesizer.speak(text)
+    }
+    func stopReplySpeech() { replySpeech?.stopSpeaking(); replySpeech = nil }
+    func close() { stopReplySpeech(); stopVoiceWork(); capabilitiesTask?.cancel(); capabilitiesTask = nil }
     private func providerName(_ id: String) -> String {
         switch id { case "bailian": "百炼"; case "elevenlabs": "ElevenLabs"; case "fish": "Fish Audio"; default: id }
     }

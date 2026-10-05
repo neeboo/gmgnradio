@@ -17,6 +17,7 @@ namespace GMGN.UnityPlayer
         readonly Label status, title, detailTitle, detailSubtitle;
         readonly VisualElement detail;
         readonly Image detailCover;
+        readonly Button back;
         readonly Dictionary<string, Texture2D> covers = new();
         readonly Dictionary<string, Task<Texture2D>> downloads = new();
         readonly CancellationTokenSource lifetime = new();
@@ -29,12 +30,11 @@ namespace GMGN.UnityPlayer
             Element.AddToClassList("card"); Element.AddToClassList("music-library"); Element.AddToClassList("hidden");
             var stylesheet = Resources.Load<StyleSheet>("MusicLibrary"); if (stylesheet != null) Element.styleSheets.Add(stylesheet);
             var header = new VisualElement(); header.AddToClassList("music-library-header");
+            back = IconButton("back", "返回歌单", () => ShowTracks(false)); back.AddToClassList("hidden"); header.Add(back);
             title = new Label("歌单"); title.AddToClassList("music-library-title"); header.Add(title);
-            header.Add(new Button(() => { status.text = "正在读取歌单…"; if (!backend.RequestMusicLibrary()) status.text = "音乐库正在忙，请稍后重试。"; }) { text = "刷新" });
-            header.Add(new Button(() => { SetVisible(false); showQueue(); }) { text = "队列" });
-            header.Add(new Button(() => SetVisible(false)) { text = "关闭" }); Element.Add(header);
+            header.Add(IconButton("refresh", "刷新歌单", () => { status.text = "正在读取歌单…"; if (!backend.RequestMusicLibrary()) status.text = "音乐库正在忙，请稍后重试。"; }));
+            header.Add(IconButton("close", "关闭音乐库", () => SetVisible(false))); Element.Add(header);
             detail = new VisualElement(); detail.AddToClassList("music-library-detail"); detail.AddToClassList("hidden");
-            detail.Add(new Button(() => ShowTracks(false)) { text = "‹ 返回", tooltip = "返回歌单" });
             detailCover = new Image { scaleMode = ScaleMode.ScaleAndCrop }; detailCover.AddToClassList("music-library-cover"); detail.Add(detailCover);
             var info = new VisualElement(); info.AddToClassList("music-library-info");
             detailTitle = new Label(); detailTitle.AddToClassList("music-library-name"); detailSubtitle = new Label(); detailSubtitle.AddToClassList("music-library-secondary");
@@ -47,6 +47,12 @@ namespace GMGN.UnityPlayer
             if (toolbar?.parent != null) toolbar.parent.Insert(toolbar.parent.IndexOf(toolbar), Element);
             else parent.Add(Element);
             backend.MusicLibraryUpdated += Update;
+        }
+        static Button IconButton(string kind, string tooltip, Action clicked)
+        {
+            var button = new Button(clicked) { tooltip = tooltip };
+            button.AddToClassList("icon-button"); button.AddToClassList("music-library-action");
+            button.Add(new PlayerScreen.ToolbarIcon(kind)); return button;
         }
         ListView BuildList(List<JObject> items, bool isTrack)
         {
@@ -114,7 +120,7 @@ namespace GMGN.UnityPlayer
                 var texture = DownloadHandlerTexture.GetContent(request); covers[url] = texture; return texture;
             } finally { downloads.Remove(url); }
         }
-        void ShowTracks(bool show) { playlistList.EnableInClassList("hidden", show); trackList.EnableInClassList("hidden", !show); detail.EnableInClassList("hidden", !show); title.text = show ? "歌曲" : $"歌单 · {playlists.Count}"; }
+        void ShowTracks(bool show) { playlistList.EnableInClassList("hidden", show); trackList.EnableInClassList("hidden", !show); detail.EnableInClassList("hidden", !show); back.EnableInClassList("hidden", !show); title.text = show ? "歌曲" : $"歌单 · {playlists.Count}"; }
         void Update(JObject value)
         {
             if (value["currentTrackID"] != null) { var next = (string)value["currentTrackID"]; if (currentTrackID != next) { currentTrackID = next; trackList.RefreshItems(); } }
