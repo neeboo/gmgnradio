@@ -1,0 +1,37 @@
+name: Cross-platform client
+
+on:
+  push:
+    paths:
+      - 'apps/cross-platform/**'
+      - '.github/workflows/cross-platform-client.yml'
+  pull_request:
+    paths:
+      - 'apps/cross-platform/**'
+      - '.github/workflows/cross-platform-client.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  client:
+    name: Client (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/cross-platform
+      - name: Check client
+        run: cargo check --locked --manifest-path apps/cross-platform/Cargo.toml
+      - name: Test client
+        run: cargo test --locked --manifest-path apps/cross-platform/Cargo.toml
+      - name: Headless smoke
+        run: cargo run --locked --manifest-path apps/cross-platform/Cargo.toml -- --headless-smoke
