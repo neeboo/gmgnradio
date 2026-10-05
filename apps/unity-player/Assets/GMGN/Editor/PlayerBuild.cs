@@ -4,6 +4,7 @@ using UnityEditor.SceneManagement;
 using UnityEngine;
 using UnityEngine.UIElements;
 using UnityEngine.TextCore.Text;
+using UnityEngine.TextCore.LowLevel;
 
 namespace GMGN.UnityPlayer.Editor
 {
@@ -50,10 +51,35 @@ namespace GMGN.UnityPlayer.Editor
                 settings.defaultFontAsset = fontAsset; panel.textSettings = settings;
                 EditorUtility.SetDirty(settings);
             }
+            PrepareLyricsFonts();
             EditorUtility.SetDirty(panel); AssetDatabase.SaveAssets();
             var scene = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Single);
             EditorSceneManager.SaveScene(scene, "Assets/GMGN/Player.unity");
             EditorBuildSettings.scenes = new[] { new EditorBuildSettingsScene("Assets/GMGN/Player.unity", true) };
+        }
+        static void PrepareLyricsFonts()
+        {
+            foreach (var style in new[] { "Light", "Medium", "Semibold", "Bold", "Black" }) {
+                var sourcePath = $"Assets/GMGN/Fonts/GMGNLyricsSansSC-{style}.ttf";
+                var source = AssetDatabase.LoadAssetAtPath<Font>(sourcePath);
+                if (source == null) throw new System.InvalidOperationException("Missing lyric font source: " + sourcePath);
+                var path = $"Assets/GMGN/Resources/PlayerLyrics{style}Font.asset";
+                var asset = AssetDatabase.LoadAssetAtPath<FontAsset>(path);
+                if (asset == null) {
+                    asset = FontAsset.CreateFontAsset(source, 90, 9, GlyphRenderMode.SDFAA, 1024, 1024, AtlasPopulationMode.Dynamic, true);
+                    if (asset == null) throw new System.InvalidOperationException("Failed to create lyric font: " + style);
+                    asset.name = "PlayerLyrics" + style + "Font";
+                    AssetDatabase.CreateAsset(asset, path);
+                    if (asset.material != null) AssetDatabase.AddObjectToAsset(asset.material, asset);
+                    foreach (var texture in asset.atlasTextures) if (texture != null) AssetDatabase.AddObjectToAsset(texture, asset);
+                }
+                asset.isMultiAtlasTexturesEnabled = true;
+                // TextCore exposes this build-cleanup setting in serialized data.
+                var serialized = new SerializedObject(asset);
+                var clear = serialized.FindProperty("m_ClearDynamicDataOnBuild");
+                if (clear != null) { clear.boolValue = true; serialized.ApplyModifiedPropertiesWithoutUndo(); }
+                EditorUtility.SetDirty(asset);
+            }
         }
         public static void BuildMac()
         {

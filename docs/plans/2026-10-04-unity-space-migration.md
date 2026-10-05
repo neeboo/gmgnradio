@@ -93,4 +93,15 @@ v21 同时运行旧测试版时出现 33–39fps，关闭全部已验证临时�
 
 - v43 针对 Retina 逻辑宽 720 的流光上下文复验通过：真实截图前后文不再贴边裁切，保留 24 逻辑像素边距；1440 宽保持原 680 框与 ±42 偏移。构建内实际 descriptor 顶点检查覆盖两种宽度的前后文四组边界，全部通过。该结果仅覆盖边界修复，字体、辉光、长翻译两行和其余主题仍待完整逐项对照。
 
+### v44–v47 字重、辉光与主题布局静音返工
+
+- v44/v45 稀疏采样辉光实图出现多重字形和块状边带，判定失败，未作为验收结果。v46 改为四分之一 backing 尺寸的 GPU 离屏字形遮罩、双向 Gaussian 模糊和透明合成，实际画面重影消失，无 CPU 像素读回；窗口分配 360×225，全屏 960×540，均为 ARGBHalf。
+- 引入 OFL Noto Sans SC 的 Light/Medium/Semibold/Bold/Black 实际静态字重，来源与生成脚本保存在 Fonts。UI 原字体未改；这些字形不等同于 Swift 系统 rounded 字体，轮廓一致性仍有差异。构建创建五个动态 SDF 字体资产，歌曲边界预热，不在帧内逐字生成。
+- v47 Release 实际构建通过，包括 144-byte descriptor、五个字体、实际 descriptor 边界、两行翻译和 displayUnit 整组搬移检查。日志：tmp/unity-player-build-v47.log；构建包装日志：tmp/unity-migration-player-v47-build.log。
+- 同隔离数据根、真实 PMX/动作、真实世界/碰撞和 netease-22727532 音乐/LRC 静音复验；只重启独立测试 App，未调整系统音量。窗口指定 1440×900，实际截图包括标题栏；全屏 backing 3840×2160。
+- 实际菜单切换及截图已覆盖十一种主题的显示：流光、莫奈、心象、云阶、回环、群唱、倾诉、浮名、时计、镜台、折章。流光无气泡边框，莫奈渐变轨道恢复，倾诉细体/折章粗体、镜台三卡片可见，底层空间保持显示。可显示不代表精确视觉对齐通过。
+- v47 浮名上一句实际超出左边界，继续返工；镜台透视、部分程序轨道/粒子、全主题间距/动画和字体 rounded 轮廓仍需逐项验收。真实长翻译两行与真实换歌边界尚未在本轮完整验证，不能用构建检查替代。
+- v46 全屏稳定 Update 73.7–74.4fps；v47 全屏稳定 73.0–73.8fps，稳定采样 framesOver50ms=0，启动仍有长帧。这是 Update 日志，未当作 GPU 呈现耗时或全部性能验收通过。实际日志：tmp/unity-space-runtime-v46.log、tmp/unity-space-runtime-v47.log、tmp/unity-space-runtime-v47b.log。
+- v49 Release 再次构建通过。浮名补回原受限文字框、左右对齐、三行限制及视距模糊；实际 descriptor 检查覆盖 720/1440 宽左右边界，实际窗口右侧上下文已完整显示，后续继续核对左侧/长文本与镜头过渡。辉光透明目标独立 alpha blending 修正，避免覆盖率被乘两次；流光实际画面无重影、无多余气泡框、空间保持显示。运行日志 tmp/unity-space-runtime-v49.log，构建日志 tmp/unity-player-build-v49.log；目前窗口 1440×900，测试静音。
+
 运行入口：GMGN_UNITY_WORLD_PACKAGE、GMGN_UNITY_WORLD_ID；背景引用通过 GMGN_UNITY_WORLD_SCENE_REFERENCE 指向备份 referenceBindings 的原始引用。不写入备份，不启动自主行动，不覆盖已装 App。

@@ -1,5 +1,5 @@
 #pragma kernel UpdateLyrics
-struct Glyph { float4 rectangle; float4 atlas; float4 timing; float4 color; float4 metadata; float4 transform; float4 transition; float4 motion; };
+struct Glyph { float4 rectangle; float4 atlas; float4 timing; float4 color; float4 metadata; float4 transform; float4 transition; float4 motion; float4 effects; };
 struct Point { float4 position; float4 color; float4 timing; };
 StructuredBuffer<Glyph> _Glyphs;
 RWStructuredBuffer<Point> _Points;
@@ -52,8 +52,14 @@ void UpdateLyrics(uint3 id : SV_DispatchThreadID)
             pos+=float2(g.transition.z*.29*_Viewport.x,-.07*_Viewport.y)*t;opacity=1-.5*t;
         } else {pos+=float2(g.transition.z*.035*_Viewport.x,.68*_Viewport.y)*(1-t);opacity=.16+.84*t;}
     }
-    pos = center+(pos-center)*(1+active*(.04+sin(progress*3.14159)*.035));
     float motionAmount=waiting*.08+active*.18+passed*.04;
+    bool grouped=g.metadata.x!=0 && (g.metadata.y==0 || g.metadata.y==1 || g.metadata.y==4 || g.metadata.y==5 || g.metadata.y==7);
+    float phaseScale=1+active*(.04+sin(progress*3.14159)*.035)-waiting*.02;
+    if(grouped){
+        float2 delta=(pos-g.timing.zw)*phaseScale*g.motion.w;
+        float angle=g.motion.z*motionAmount;
+        pos=g.timing.zw+float2(cos(angle)*delta.x-sin(angle)*delta.y,sin(angle)*delta.x+cos(angle)*delta.y);
+    }else pos = center+(pos-center)*(1+active*(.04+sin(progress*3.14159)*.035));
     pos+=g.motion.xy*motionAmount;
     pos.y += waiting*3-active*(2+sin(progress*3.14159)*4);
     if(g.metadata.y==0)pos.y+=g.metadata.x*sin(_AnimationClock*.72)*2.2;
@@ -63,6 +69,7 @@ void UpdateLyrics(uint3 id : SV_DispatchThreadID)
     p.color.rgb = lerp(p.color.rgb,_Primary.rgb,waiting);
     p.color.a *= smoothstep(.48,.56,sdf)*(1-waiting*.8128-passed*.1552)*opacity;
     if(g.metadata.z<0) {p.position=float4(g.rectangle.xy+uv*g.rectangle.zw,0,max(.6,g.rectangle.z*.6));p.color=lerp(_Accent,_Secondary,uv.y);p.color.a*=.65;}
+    if(g.metadata.z==-1)p.position.w=3+_Audio.z*2;
     if(g.metadata.z==-2){
         float angle=(float)cell/575*3.14159-1.570796;
         p.position=float4(g.rectangle.xy+float2(cos(angle),sin(angle))*g.rectangle.z,0,1+_Audio.z*.7);p.color=g.color;p.color.a*=.4;
@@ -80,10 +87,17 @@ void UpdateLyrics(uint3 id : SV_DispatchThreadID)
         p.position=float4(g.rectangle.xy+uv*g.rectangle.zw,0,1.5);p.color=g.color;p.color.a*=perimeter;
     }
     if(g.metadata.z<=-5){p.position=float4(g.rectangle.xy+uv*g.rectangle.zw,0,1);p.color=g.color;}
+    if(g.metadata.z==-7){
+        float2 delta=p.position.xy-g.transform.xy;float angle=g.transform.z;
+        float depth=-sin(angle)*delta.x;
+        delta.x*=cos(angle);delta/=max(.4,1+depth/max(1,_Viewport.x)*.7);
+        p.position.xy=g.transform.xy+delta*g.transform.w;
+    }
     float glyphScale=(g.metadata.z>=0 && g.metadata.y>=3?g.transform.w:1)*(1+active*(.04+sin(progress*3.14159)*.035)-waiting*.02)*(g.metadata.x!=0?g.motion.w:1);
     float glyphAngle=g.metadata.z>=0 && g.metadata.y>=3?g.transform.z:0;
     glyphAngle+=g.motion.z*motionAmount;
     if(g.metadata.y==2 && g.transition.w>.5){float fold=saturate((_Clock-g.transition.x)/max(.01,g.transition.y));fold=fold*fold*(3-2*fold);glyphAngle=g.transition.z*1.570796*fold;glyphScale*=1-.18*fold;}
     p.timing=float4(g.metadata.z>=0?active*(.7+sin(progress*3.14159)*.5):0,glyphScale,glyphAngle,g.metadata.z<0?-g.metadata.z:0);
+    if(g.metadata.z==-7)p.timing.yz=g.transform.wz;
     _Points[id.x]=p;
 }
