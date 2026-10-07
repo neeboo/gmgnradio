@@ -172,7 +172,7 @@ actor ScreenMediaCacheClient: ScreenMediaCaching {
                 streams.append(try audio.native(endpoint: endpoint))
             }
             return NativeScreenMediaDescriptor(pageURL: pageURL, title: title, site: site, isLive: isLive,
-                streams: streams, note: "Rust local media cache")
+                streams: streams, note: "Rust local media cache", durationSeconds: durationSeconds)
         }
     }
     private struct StreamDTO: Decodable {

@@ -24,6 +24,8 @@ struct NativeScreenMediaDescriptor: Equatable, Sendable {
     let title: String
     let site: ScreenLinkSite
     let isLive: Bool
+    /// Finite source duration from the resolver/cache receipt. Live streams never use it.
+    let durationSeconds: Double?
     let streams: [NativeScreenMediaStream]
     /// 解析回执里的工程口径（不含地址）。
     let note: String
@@ -40,6 +42,7 @@ struct NativeScreenMediaDescriptor: Equatable, Sendable {
         self.title = resolution.title
         self.site = resolution.site
         self.isLive = resolution.isLive
+        self.durationSeconds = resolution.durationSeconds
         self.note = resolution.note
         var streams: [NativeScreenMediaStream] = [
             NativeScreenMediaStream(
@@ -60,12 +63,13 @@ struct NativeScreenMediaDescriptor: Equatable, Sendable {
 
     init(
         pageURL: String, title: String, site: ScreenLinkSite, isLive: Bool,
-        streams: [NativeScreenMediaStream], note: String
+        streams: [NativeScreenMediaStream], note: String, durationSeconds: Double? = nil
     ) {
         self.pageURL = pageURL
         self.title = title
         self.site = site
         self.isLive = isLive
+        self.durationSeconds = durationSeconds
         self.streams = streams
         self.note = note
     }

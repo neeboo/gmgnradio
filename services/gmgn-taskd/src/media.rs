@@ -260,8 +260,9 @@ struct State {
     protected: HashSet<String>,
     playlist_pins: HashMap<String, HashSet<String>>,
     owners: HashMap<String, HashSet<String>>,
-    active: Option<(String, watch::Sender<bool>)>,
-    running: bool,
+    active: HashMap<String, watch::Sender<bool>>,
+    running: usize,
+    reserved_bytes: HashMap<String, u64>,
     helpers: Option<Helpers>,
     foreground_burst: usize,
     next_order: u64,
@@ -1062,8 +1063,10 @@ impl Media {
         } else {
             state.queue.push_back(item.clone());
         }
-        if !state.running {
-            state.running = true;
+        // A current progressive download must not serialize the next item's
+        // extraction and buffering behind its entire remaining file.
+        if state.running < 2 {
+            state.running += 1;
             let media = self.clone();
             tokio::spawn(async move {
                 media.worker().await;
@@ -1104,15 +1107,13 @@ impl Media {
         }
         let queued_cancel = state.queue.iter().any(|e| e.key == k);
         state.queue.retain(|e| e.key != k);
-        let active_cancel = state.active.as_ref().is_some_and(|(active, _)| active == k);
+        let active_cancel = state.active.contains_key(k);
         if !active_cancel {
             state.known.remove(k);
             state.enqueued.remove(k);
         }
-        if let Some((active, tx)) = &state.active {
-            if active == k {
-                tx.send_replace(true);
-            }
+        if let Some(tx) = state.active.get(k) {
+            tx.send_replace(true);
         }
         // Only cancel work actually owned by the scheduler. Keep completed
         // failure diagnostics intact when a consumer releases its session.
@@ -1130,15 +1131,15 @@ impl Media {
                 let mut s = self.state.lock().await;
                 let item = s.next();
                 let Some(item) = item else {
-                    s.running = false;
+                    s.running -= 1;
                     return;
                 };
                 let Some(helpers) = s.helpers.clone() else {
-                    s.running = false;
+                    s.running -= 1;
                     return;
                 };
                 let (tx, rx) = watch::channel(false);
-                s.active = Some((item.key.clone(), tx));
+                s.active.insert(item.key.clone(), tx);
                 (item, helpers, rx)
             };
             let result = tokio::select! {
@@ -1155,7 +1156,7 @@ impl Media {
                 self.cleanup_finished(&item.key);
                 self.playback_sources.lock().await.remove(&item.key);
             }
-            s.active = None;
+            s.active.remove(&item.key);
             s.known.remove(&item.key);
             if cancelled || result == Err("media_cancelled") {
                 let _ = self.set_state(&item.key, "cancelled", None).await;
@@ -1180,6 +1181,9 @@ impl Media {
                     }
                 }
             }
+            // Ready DB publication and reservation removal share the scheduler
+            // lock, so another worker never sees an unaccounted completed file.
+            s.reserved_bytes.remove(&item.key);
         }
     }
     fn cleanup_parts(&self, key: &str) {
@@ -1208,6 +1212,19 @@ impl Media {
         Ok(result)
     }
     async fn playlist_read(&self, id: &str) -> Result<Value> {
+        let mut result = self.playlist_record(id).await?;
+        let index = result["currentIndex"].as_u64().unwrap_or(0) as usize;
+        let items = result["items"].clone();
+        for (name, at) in [("current", index), ("next", index + 1)] {
+            if let Some(item) = items.get(at) {
+                result[name] = self.status(&entry(item)?.key).await?;
+            }
+        }
+        Ok(result)
+    }
+    // CAS only needs durable queue metadata, not hashing two completed media
+    // files. The explicit read API retains its full cache-health projection.
+    async fn playlist_record(&self, id: &str) -> Result<Value> {
         let id_owned = id.to_owned();
         let row = self
             .db
@@ -1232,19 +1249,12 @@ impl Media {
             return Ok(json!({"playlistID":id,"revision":0,"currentIndex":0,"items":[]}));
         };
         let items: Value = serde_json::from_str(&payload).map_err(|_| "media_storage_corrupt")?;
-        let mut result =
-            json!({"playlistID":id,"revision":revision,"currentIndex":index,"items":items});
-        for (name, at) in [("current", index), ("next", index + 1)] {
-            if let Some(item) = items.get(at) {
-                result[name] = self.status(&entry(item)?.key).await?;
-            }
-        }
-        Ok(result)
+        Ok(json!({"playlistID":id,"revision":revision,"currentIndex":index,"items":items}))
     }
     async fn playlist_change(self: &Arc<Self>, method: &str, input: Value) -> Result<Value> {
         let _playlist_guard = self.playlist_lock.lock().await;
         let id = list_id(&input)?;
-        let previous = self.playlist_read(&id).await?;
+        let previous = self.playlist_record(&id).await?;
         let base = input["baseRevision"]
             .as_i64()
             .filter(|n| *n >= 0)
@@ -1286,14 +1296,41 @@ impl Media {
             tx.execute("INSERT INTO video_playlists VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,current_index=excluded.current_index,payload=excluded.payload",params![id_save,next,index as i64,payload]).map_err(|_|"storage_unavailable")?;
             tx.commit().map_err(|_|"storage_unavailable")?;Ok(())
         }).await?;
-        let prepared = self.prefetch(&id, &items, index).await;
-        let mut response = self.playlist_read(&id).await?;
-        if let Err(code) = prepared {
-            response["prefetchError"] = json!(code);
-        }
-        Ok(response)
+        self.pin_playlist_window(&id, &items, index).await?;
+        let media = self.clone();
+        let scheduled_id = id.clone();
+        let scheduled_items = items.clone();
+        let expected_revision = base + 1;
+        // Return the committed queue immediately. Preparing the item after
+        // the next one must not postpone switching to the already-buffered next.
+        tokio::spawn(async move {
+            let _guard = media.playlist_lock.lock().await;
+            if media.state.lock().await.playlist_pins.contains_key(&scheduled_id)
+                && media.playlist_record(&scheduled_id).await
+                .is_ok_and(|record| record["revision"] == expected_revision) {
+                let _ = media.prefetch(&scheduled_id, &scheduled_items, index).await;
+            }
+        });
+        Ok(json!({"playlistID":id,"revision":expected_revision,"currentIndex":index,"items":items}))
     }
     async fn prefetch(self: &Arc<Self>, id: &str, items: &Value, index: usize) -> Result<()> {
+        self.pin_playlist_window(id, items, index).await?;
+        // Current goes first; next is the only speculative item.
+        for at in [index, index + 1] {
+            if let Some(v) = items.get(at) {
+                let item = entry(v)?;
+                // Both members of the two-item rolling window outrank unrelated
+                // background imports; State::next still enforces bounded fairness.
+                match self.prepare(item, true).await {
+                    Ok(_) => {}
+                    Err("media_helper_unavailable") => {}
+                    Err(code) => return Err(code),
+                }
+            }
+        }
+        Ok(())
+    }
+    async fn pin_playlist_window(&self, id: &str, items: &Value, index: usize) -> Result<()> {
         let mut pins = HashSet::new();
         for at in [index, index + 1] {
             if let Some(v) = items.get(at) {
@@ -1308,17 +1345,6 @@ impl Media {
                 .values()
                 .flat_map(|set| set.iter().cloned())
                 .collect();
-        }
-        // Current goes first; next is the only speculative item.
-        for at in [index, index + 1] {
-            if let Some(v) = items.get(at) {
-                let item = entry(v)?;
-                match self.prepare(item, at == index).await {
-                    Ok(_) => {}
-                    Err("media_helper_unavailable") => {}
-                    Err(code) => return Err(code),
-                }
-            }
         }
         Ok(())
     }
@@ -1438,7 +1464,7 @@ impl Media {
     }
     async fn evict(&self, incoming: u64, current: &str) -> Result<()> {
         let _playlist_guard = self.playlist_lock.lock().await;
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
         let mut protected = state.protected.clone();
         protected.extend(
             state
@@ -1464,6 +1490,12 @@ impl Media {
                 }
             })
             .ok_or("media_cache_limit")?;
+        for (key, reserved) in &state.reserved_bytes {
+            if key != current {
+                let recorded = rows.iter().find(|(k, _, _)| k == key).map(|(_, n, _)| *n).unwrap_or(0);
+                used = used.checked_add(reserved.saturating_sub(recorded)).ok_or("media_cache_limit")?;
+            }
+        }
         for (key, bytes, payload) in rows {
             if used <= self.cache_limit {
                 break;
@@ -1497,6 +1529,7 @@ impl Media {
         if used > self.cache_limit {
             return Err("media_cache_limit");
         }
+        state.reserved_bytes.insert(current.into(), incoming);
         Ok(())
     }
     async fn fetch(
@@ -3217,6 +3250,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn playlist_advance_returns_without_waiting_for_later_preparation() {
+        let f = Fixture::new("normal", 64, ITEM_LIMIT, CACHE_LIMIT).await;
+        let list = f.media.request("media_playlist_commit", json!({"playlistID":"quick-advance","baseRevision":0,
+            "items":[{"pageURL":"https://youtu.be/aaaaaaaaaaa"},{"pageURL":"https://youtu.be/bbbbbbbbbbb"},
+                     {"pageURL":"https://youtu.be/ccccccccccc"}]})).await.unwrap();
+        for item in list["items"].as_array().unwrap().iter().take(2) {
+            assert_eq!(f.terminal(item["cacheKey"].as_str().unwrap()).await["state"], "ready");
+        }
+        let later = list["items"][2]["cacheKey"].as_str().unwrap();
+        let later_guard = f.media.entry_lock(later).await.lock_owned().await;
+        let result = tokio::time::timeout(Duration::from_millis(500), f.media.request("media_playlist_advance",
+            json!({"playlistID":"quick-advance","baseRevision":1}))).await
+            .expect("EOF advance waited for the item after next").unwrap();
+        assert_eq!(result["currentIndex"], 1);
+        assert_eq!(result["revision"], 2);
+        drop(later_guard);
+        assert_eq!(f.terminal(later).await["state"], "ready");
+    }
+
+    #[tokio::test]
+    async fn released_playlist_never_restarts_detached_prefetch() {
+        let f = Fixture::new("slow", 128 * 1024, ITEM_LIMIT, CACHE_LIMIT).await;
+        f.media.request("media_playlist_commit", json!({"playlistID":"release-background","baseRevision":0,
+            "items":[{"pageURL":"https://youtu.be/aaaaaaaaaaa"},{"pageURL":"https://youtu.be/bbbbbbbbbbb"}]})).await.unwrap();
+        f.media.request("media_playlist_release", json!({"playlistID":"release-background"})).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let state = f.media.state.lock().await;
+        assert!(!state.playlist_pins.contains_key("release-background"));
+        assert!(state.active.is_empty());
+        assert!(state.queue.is_empty());
+        assert!(state.reserved_bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn playlist_next_resolves_while_current_is_still_downloading() {
+        let f = Fixture::new("slow", 4 * 1024 * 1024, ITEM_LIMIT, CACHE_LIMIT).await;
+        let list = f.media.request("media_playlist_commit", json!({"playlistID":"parallel-next","baseRevision":0,
+            "items":[{"pageURL":"https://youtu.be/aaaaaaaaaaa"},{"pageURL":"https://youtu.be/bbbbbbbbbbb"},
+                     {"pageURL":"https://youtu.be/ccccccccccc"}]})).await.unwrap();
+        let current = list["items"][0]["cacheKey"].as_str().unwrap();
+        let next = list["items"][1]["cacheKey"].as_str().unwrap();
+        let later = list["items"][2]["cacheKey"].as_str().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if f.helper_calls() == 2 && f.media.status(current).await.unwrap()["state"] == "downloading"
+                && f.media.status(next).await.unwrap()["state"] == "downloading" { break; }
+            assert!(tokio::time::Instant::now() < deadline, "next extraction waited for current full download");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(f.media.status(current).await.unwrap()["state"], "downloading");
+        assert_ne!(f.media.status(next).await.unwrap()["state"], "queued");
+        assert_eq!(f.media.status(later).await.unwrap()["state"], "missing");
+        assert!(f.media.state.lock().await.active.len() <= 2);
+        f.media.request("media_playlist_release", json!({"playlistID":"parallel-next"})).await.unwrap();
+        assert_eq!(f.terminal(current).await["state"], "cancelled");
+        assert_eq!(f.terminal(next).await["state"], "cancelled");
+        assert!(f.media.state.lock().await.reserved_bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_downloads_share_cache_budget_without_overcommit() {
+        let f = Fixture::new("slow", 128 * 1024, ITEM_LIMIT, 192 * 1024).await;
+        let list = f.media.request("media_playlist_commit", json!({"playlistID":"parallel-budget","baseRevision":0,
+            "items":[{"pageURL":"https://youtu.be/aaaaaaaaaaa"},{"pageURL":"https://youtu.be/bbbbbbbbbbb"}]})).await.unwrap();
+        let a = f.terminal(list["items"][0]["cacheKey"].as_str().unwrap()).await;
+        let b = f.terminal(list["items"][1]["cacheKey"].as_str().unwrap()).await;
+        assert!(a["state"] == "ready" || b["state"] == "ready");
+        assert!(a["state"] == "failed" || b["state"] == "failed");
+        let ready_bytes = f.media.db.call(|s| s.connection.query_row(
+            "SELECT COALESCE(SUM(bytes),0) FROM media_cache WHERE state='ready'", [], |r| r.get::<_,u64>(0))
+            .map_err(|_| "storage_unavailable")).await.unwrap();
+        assert!(ready_bytes <= 192 * 1024);
+        assert!(f.media.state.lock().await.reserved_bytes.is_empty());
+    }
+
+    #[tokio::test]
     async fn playlist_is_durable_prefetches_only_next_and_cas_wins_once() {
         let f = Fixture::new("normal", 64, ITEM_LIMIT, CACHE_LIMIT).await;
         let input = json!({"playlistID":"main","baseRevision":0,"currentIndex":0,"items":[
@@ -3348,7 +3457,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_playlist_reports_prefetch_failure_without_false_cas_failure() {
+    async fn committed_playlist_returns_metadata_without_waiting_for_prefetch() {
         let f = Fixture::new("normal", 64, ITEM_LIMIT, CACHE_LIMIT).await;
         // Simulate a full persisted scheduler boundary without launching 64
         // network workers; the actual commit and readback still use SQLite.
@@ -3358,7 +3467,7 @@ mod tests {
         }
         let result=f.media.request("media_playlist_commit",json!({"playlistID":"full","baseRevision":0,"items":[{"pageURL":"https://youtu.be/abcdefghijk"}]})).await.unwrap();
         assert_eq!(result["revision"], 1);
-        assert_eq!(result["prefetchError"], "media_queue_full");
+        assert!(result.get("prefetchError").is_none());
         let read = f
             .media
             .request("media_playlist_read", json!({"playlistID":"full"}))

@@ -113,6 +113,8 @@ final class NativeLinkPlayer: NativeScreenMediaPlaying {
     private(set) var playbackEndCount = 0
     var durationSeconds: Double? {
         guard let item = player?.currentItem else { return nil }
+        let end = CMTimeGetSeconds(item.forwardPlaybackEndTime)
+        if end.isFinite && end > 0 { return end }
         let seconds = CMTimeGetSeconds(item.duration)
         return seconds.isFinite && seconds > 0 ? seconds : nil
     }
@@ -305,6 +307,19 @@ final class NativeLinkPlayer: NativeScreenMediaPlaying {
 
     // MARK: 组装
 
+    /// YouTube fragmented MP4 can report its complete duration twice in AVFoundation
+    /// (movie duration plus fragment duration). Keep the finite source receipt's timeline
+    /// when the AVAsset duration exceeds it substantially; do not truncate ordinary rounding
+    /// differences, unknown-duration media, or live streams.
+    static func compositionSourceDuration(_ duration: CMTime, descriptor: NativeScreenMediaDescriptor) -> CMTime {
+        guard !descriptor.isLive, let expected = descriptor.durationSeconds,
+              expected.isFinite, expected > 0 else { return duration }
+        let actual = CMTimeGetSeconds(duration)
+        guard actual.isFinite, actual > expected + max(2, expected * 0.01) else { return duration }
+        NSLog("[ScreenPlayback] event=finite_timeline_corrected asset_duration=%.3f source_duration=%.3f", actual, expected)
+        return CMTime(seconds: expected, preferredTimescale: 60000)
+    }
+
     private func install(_ prepared: PreparedItem) {
         self.hasAudio = prepared.hasAudio
         self.assetLoaders = prepared.loaders
@@ -417,8 +432,15 @@ final class NativeLinkPlayer: NativeScreenMediaPlaying {
             // 合流单文件且没有独立音频流：直接用这份 asset。
             if descriptor.audioStream == nil {
                 phase("muxed-item")
+                let item = AVPlayerItem(asset: videoAsset)
+                if !descriptor.isLive, let expected = descriptor.durationSeconds,
+                   expected.isFinite, expected > 0 {
+                    let duration = try await videoAsset.load(.duration)
+                    let sourceDuration = compositionSourceDuration(duration, descriptor: descriptor)
+                    if sourceDuration != duration { item.forwardPlaybackEndTime = sourceDuration }
+                }
                 return PreparedItem(
-                    item: AVPlayerItem(asset: videoAsset), hasAudio: audioTrack != nil,
+                    item: item, hasAudio: audioTrack != nil,
                     audioTrack: audioTrack, loaders: loaders
                 )
             }
@@ -432,7 +454,7 @@ final class NativeLinkPlayer: NativeScreenMediaPlaying {
             let videoDuration = try await videoAsset.load(.duration)
             phase("video-insert")
             try compositionVideo.insertTimeRange(
-                CMTimeRange(start: .zero, duration: videoDuration), of: videoTrack, at: .zero
+                CMTimeRange(start: .zero, duration: compositionSourceDuration(videoDuration, descriptor: descriptor)), of: videoTrack, at: .zero
             )
             let compositionAudio = composition.addMutableTrack(
                 withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid
@@ -442,7 +464,7 @@ final class NativeLinkPlayer: NativeScreenMediaPlaying {
                 let audioDuration = try await audioAsset.load(.duration)
                 phase("audio-insert")
                 try compositionAudio.insertTimeRange(
-                    CMTimeRange(start: .zero, duration: audioDuration), of: audioTrack, at: .zero
+                    CMTimeRange(start: .zero, duration: compositionSourceDuration(audioDuration, descriptor: descriptor)), of: audioTrack, at: .zero
                 )
             } else {
                 throw NativeScreenPlaybackFailure.noAudioTrack
