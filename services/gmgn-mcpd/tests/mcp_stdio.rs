@@ -26,7 +26,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::TcpListener;
 
 const CONTRACT_CANARY: &str = "AUTHORITY-CONTRACT-CANARY-9f3a";
@@ -69,7 +69,7 @@ impl Seen {
     }
 }
 
-/// The fake daemon: same framing, same envelope, same error shape as
+/// The fake daemon: HTTP /rpc, bearer authentication, and the same error shape as
 /// `services/gmgn-taskd/src/daemon.rs` (`{"id":..,"error":{"code":..,"message":..}}`).
 fn spawn_authority(socket: PathBuf, seen: Arc<Seen>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -79,7 +79,7 @@ fn spawn_authority(socket: PathBuf, seen: Arc<Seen>) -> std::thread::JoinHandle<
             .unwrap();
         runtime.block_on(async move {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            std::fs::write(&socket, serde_json::to_vec(&json!({"version":1,"address":listener.local_addr().unwrap().to_string(),"token":ENDPOINT_TOKEN})).unwrap()).unwrap();
+            std::fs::write(&socket, serde_json::to_vec(&json!({"version":2,"address":listener.local_addr().unwrap().to_string(),"token":ENDPOINT_TOKEN})).unwrap()).unwrap();
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
@@ -89,14 +89,28 @@ fn spawn_authority(socket: PathBuf, seen: Arc<Seen>) -> std::thread::JoinHandle<
                     let (read_half, mut write_half) = stream.into_split();
                     let mut reader = TokioBufReader::new(read_half);
                     let mut line = String::new();
-                    while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
-                        let trimmed = line.trim();
-                        if trimmed.is_empty() {
+                    {
+                        reader.read_line(&mut line).await.unwrap();
+                        assert_eq!(line.trim(), "POST /rpc HTTP/1.1");
+                        let mut content_length = None;
+                        let mut authenticated = false;
+                        loop {
                             line.clear();
-                            continue;
+                            reader.read_line(&mut line).await.unwrap();
+                            if line == "\r\n" { break; }
+                            let (name, value) = line.trim().split_once(':').unwrap();
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = Some(value.trim().parse::<usize>().unwrap());
+                            }
+                            if name.eq_ignore_ascii_case("authorization") {
+                                authenticated = value.trim() == format!("Bearer {ENDPOINT_TOKEN}");
+                            }
                         }
-                        let request: Value = serde_json::from_str(trimmed).unwrap();
-                        assert!(request["auth"].as_str() == Some(ENDPOINT_TOKEN), "every authority call must authenticate");
+                        assert!(authenticated, "every authority call must authenticate");
+                        let mut body = vec![0; content_length.unwrap()];
+                        reader.read_exact(&mut body).await.unwrap();
+                        let request: Value = serde_json::from_slice(&body).unwrap();
+                        assert!(request.get("auth").is_none(), "token belongs in HTTP header only");
                         let id = request["id"].clone();
                         let method = request["method"].as_str().unwrap_or("").to_owned();
                         let params = request["params"].clone();
@@ -110,17 +124,16 @@ fn spawn_authority(socket: PathBuf, seen: Arc<Seen>) -> std::thread::JoinHandle<
                             .as_str()
                             .is_some_and(|value| (1..=200).contains(&value.len()));
                         if !id_is_valid {
-                            let mut bytes = serde_json::to_vec(&json!({
+                            let bytes = serde_json::to_vec(&json!({
                                 "id": null,
                                 "error": {"code": "invalid_request_id", "message": "invalid_request_id"},
                             }))
                             .unwrap();
-                            bytes.push(b'\n');
+                            write_half.write_all(format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).as_bytes()).await.unwrap();
                             if write_half.write_all(&bytes).await.is_err() {
                                 return;
                             }
-                            line.clear();
-                            continue;
+                            return;
                         }
                         seen.record(&method, &params);
                         let reply = match method.as_str() {
@@ -176,8 +189,8 @@ fn spawn_authority(socket: PathBuf, seen: Arc<Seen>) -> std::thread::JoinHandle<
                                 "message": other,
                             }}),
                         };
-                        let mut bytes = serde_json::to_vec(&reply).unwrap();
-                        bytes.push(b'\n');
+                        let bytes = serde_json::to_vec(&reply).unwrap();
+                        write_half.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).as_bytes()).await.unwrap();
                         if write_half.write_all(&bytes).await.is_err() {
                             return;
                         }
@@ -200,7 +213,7 @@ impl Session {
     fn start(socket: &Path, grant: Option<&Path>) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_gmgn-mcpd"));
         command
-            .arg("--socket")
+            .arg("--endpoint-file")
             .arg(socket)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -349,7 +362,7 @@ impl Fixture {
         let path = self.root.join("gmgn-host-tools.grant.json");
         let body = json!({
             "state": state,
-            "socketPath": self.socket.display().to_string(),
+            "endpointFile": self.socket.display().to_string(),
             "secret": "not-used-by-the-mcp-face",
             "tools": tools.iter().map(|name| json!({"name": name})).collect::<Vec<_>>(),
         });
@@ -670,7 +683,7 @@ fn a_grant_for_another_daemon_is_refused() {
         &path,
         serde_json::to_vec(&json!({
             "state": "armed",
-            "socketPath": "/tmp/some-other-private-root/taskd.sock",
+            "endpointFile": "/tmp/some-other-private-root/taskd.endpoint.json",
             "tools": [{"name": "gmgn_world_commit"}],
         }))
         .unwrap(),
@@ -682,7 +695,7 @@ fn a_grant_for_another_daemon_is_refused() {
         json!({"worldID": "w", "requestID": "r", "expectedRevision": 0,
                "ops": [{"op": "setWorldFacts", "facts": {}}]}),
     );
-    assert_eq!(result_of(&commit)["code"], json!("mcp_grant_socket_mismatch"));
+    assert_eq!(result_of(&commit)["code"], json!("mcp_grant_endpoint_mismatch"));
     assert_eq!(fixture.seen.count("world_commit"), 0);
 }
 
@@ -729,13 +742,22 @@ fn the_server_starts_without_an_authority_and_says_so() {
 }
 
 #[test]
+fn legacy_socket_argument_is_rejected() {
+    let output = Command::new(env!("CARGO_BIN_EXE_gmgn-mcpd"))
+        .args(["--socket", "/tmp/legacy.sock"])
+        .output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("未知参数 --socket"));
+}
+
+#[test]
 fn invalid_endpoint_never_reaches_the_authority() {
     let fixture = Fixture::new("invalid-endpoint");
     let original: Value = serde_json::from_slice(&std::fs::read(&fixture.socket).unwrap()).unwrap();
     for (field, value) in [
         ("address", json!("192.168.1.1:1234")),
         ("address", json!("127.0.0.1:0")),
-        ("version", json!(2)),
+        ("version", json!(1)),
         ("token", json!("not-a-token")),
     ] {
         let mut endpoint = original.clone();

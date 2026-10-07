@@ -9,6 +9,27 @@ private func layoutSimulation() -> WorldSimulation {
 }
 private let coffee = WorldGeneratedProp(objectID: "wish.object.1", sourceWishID: "wish1", assetID: "asset1", displayName: "咖啡机", size: .init(x: 0.3,y: 0.42,z: 0.4), sourceHeight: 2)
 
+@Test func builtinDevicesRemainModelledBlockingObstacles() throws {
+    var state = layoutSimulation().state
+    let declaration = WorldProceduralPropDeclaration(objectID:"prop.jukebox",renderer:"builtin.jukebox",
+        seedPosition:.init(x:0,y:0,z:0),seedYaw:0,size:.init(x:0.5,y:0.7,z:0.4))
+    let raw = String(data:try JSONEncoder().encode(declaration),encoding:.utf8)!
+    var item = WorldObjectState(isEnabled:true,transform:WorldTransform(
+        position:.init(x:2,y:0.1,z:-3),rotation:.init(x:0,y:0.70710677,z:0,w:0.70710677),
+        scale:.init(x:2,y:1,z:1)),metadata:["gmgn.builtin-device.v1":raw])
+    state.objectStates[declaration.objectID] = item
+    let resolved = WorldLayoutObstacles.resolve(state)
+    #expect(resolved.unmodelledObjectIDs.isEmpty)
+    let volume = try #require(resolved.volumes.first)
+    #expect(volume.isBlocking && volume.id == declaration.objectID)
+    #expect(abs(volume.center.y-0.45)<0.0001)
+    #expect(volume.halfExtents.x == 0.5)
+    #expect(volume.rotation == item.transform.rotation)
+    item.metadata["gmgn.builtin-device.v1"] = "{}"
+    state.objectStates[declaration.objectID] = item
+    #expect(WorldLayoutObstacles.resolve(state).unmodelledObjectIDs == [declaration.objectID])
+}
+
 /// 原意：**物件判定比角色胶囊更严** —— 胶囊能过去的低矮几何，仍可能挡住物件。
 ///
 /// 2026-09-28 按 §13 的实测重新推导：真实舱体的地面是生成出来的起伏网格，
@@ -292,6 +313,44 @@ private let rightHandGrip = WorldPropGripCalibration(
         #expect(error.errorDescription?.contains("物件") == true || error.errorDescription?.contains("活动") == true || error.errorDescription?.contains("握持") == true)
     }
     #expect(WorldSimulationError.propIsHeld(objectID: "prop").errorDescription?.contains("手持") == true)
+}
+
+@Test func heldAvatarRebindingIsAtomicAndPreservesSourceGripAndReturnState() throws {
+    var sim = layoutSimulation()
+    try sim.applyPropLayout(.register(coffee), expectedLayoutRevision: 0, requestID: "register")
+    try sim.applyPropLayout(.hold(objectID: coffee.objectID, avatarAssetID: "avatar.2b", calibration: rightHandGrip), expectedLayoutRevision: 1, requestID: "hold")
+    let before = sim.state
+    let target = WorldPropGripCalibration(avatarAssetID: "avatar.vrm", hand: rightHandGrip.hand,
+        normalizedGrip: rightHandGrip.normalizedGrip, localOffset: .init(x: 0.02, y: 0.03, z: 0.04),
+        localRotation: .init(x: 0, y: 0, z: 1, w: 0))
+    let command = WorldPropLayoutCommand.rebindHeldAvatar(objectID: coffee.objectID, previousAvatarAssetID: "avatar.2b", calibration: target)
+    try sim.applyPropLayout(command, expectedLayoutRevision: 2, requestID: "rebind")
+    #expect(sim.state.heldProp?.avatarAssetID == "avatar.vrm")
+    #expect(sim.state.heldProp?.objectID == before.heldProp?.objectID)
+    #expect(sim.state.heldProp?.returnState.transform == before.heldProp?.returnState.transform)
+    #expect(sim.state.heldProp?.returnState.isEnabled == before.heldProp?.returnState.isEnabled)
+    #expect(sim.state.objectStates[coffee.objectID]?.isEnabled == false)
+    #expect(sim.state.objectStates[coffee.objectID]?.gripCalibration == target)
+    #expect(sim.state.heldProp?.returnState.gripCalibration == target)
+    let after = sim.state
+    try sim.applyPropLayout(command, expectedLayoutRevision: 2, requestID: "rebind")
+    #expect(sim.state == after)
+    #expect(try JSONDecoder().decode(WorldState.self, from: JSONEncoder().encode(after)) == after)
+    #expect(throws: WorldPropLayoutError.heldPropMismatch) {
+        try sim.applyPropLayout(command, expectedLayoutRevision: 3, requestID: "stale-rebind")
+    }
+    #expect(sim.state == after)
+    let wrongGrip = WorldPropGripCalibration(avatarAssetID: "avatar.2b", hand: target.hand,
+        normalizedGrip: .init(x: 0.1, y: 0.2, z: 0.3), localOffset: target.localOffset, localRotation: target.localRotation)
+    #expect(throws: WorldPropLayoutError.invalidGripCalibration) {
+        try sim.applyPropLayout(.rebindHeldAvatar(objectID: coffee.objectID, previousAvatarAssetID: "avatar.vrm", calibration: wrongGrip), expectedLayoutRevision: 3, requestID: "changed-source")
+    }
+    #expect(sim.state == after)
+    try sim.applyPropLayout(.rebindHeldAvatar(objectID: coffee.objectID, previousAvatarAssetID: "avatar.vrm", calibration: rightHandGrip), expectedLayoutRevision: 3, requestID: "switch-back")
+    #expect(sim.state.heldProp?.avatarAssetID == "avatar.2b")
+    try sim.applyPropLayout(.returnHeld(objectID: coffee.objectID, avatarAssetID: "avatar.2b"), expectedLayoutRevision: 4, requestID: "return")
+    #expect(sim.state.objectStates[coffee.objectID]?.transform == before.heldProp?.returnState.transform)
+    #expect(sim.state.objectStates[coffee.objectID]?.isEnabled == before.heldProp?.returnState.isEnabled)
 }
 
 @Test func generatedLayoutPlacesThirtyItemsAndPersistsThem() throws {

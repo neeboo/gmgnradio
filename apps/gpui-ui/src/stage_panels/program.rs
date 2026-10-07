@@ -1769,7 +1769,7 @@ mod tests {
             *entity.borrow_mut()=Some(pane.clone());
             gpui_kit::base::Root::new(pane,window,cx)
         });
-        cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))
+        cx.update_window(handle.into(), |_, window, cx| { window.refresh(); window.draw(cx).clear(cx) })
             .unwrap();
         let cold_elapsed = cold.elapsed();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1792,7 +1792,7 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))
+        cx.update_window(handle.into(), |_, window, cx| { window.refresh(); window.draw(cx).clear(cx) })
             .unwrap();
         let initial = cx.update(|cx| {
             let pane = stored.borrow().as_ref().unwrap().read(cx);
@@ -1814,7 +1814,7 @@ mod tests {
                 .collect::<HashMap<_, _>>()
         });
         let warm = std::time::Instant::now();
-        cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))
+        cx.update_window(handle.into(), |_, window, cx| { window.refresh(); window.draw(cx).clear(cx) })
             .unwrap();
         let warm_elapsed = warm.elapsed();
         cx.update(|cx| {
@@ -1835,7 +1835,7 @@ mod tests {
                 pane.scroll.set_offset(point(px(0.), px(-1200.)));
                 cx.notify();
             });
-            window.draw(cx).clear(cx);
+            { window.refresh(); window.draw(cx).clear(cx) };
         })
         .unwrap();
         let scroll_elapsed = scrolled.elapsed();
@@ -1871,8 +1871,10 @@ mod tests {
             *entity.borrow_mut() = Some(pane.clone());
             gpui_kit::base::Root::new(pane, window, cx)
         });
+        // Manual fixture frames must invalidate Fast's cached entity tree;
+        // the production event loop does this through on_next_frame/notify.
         let draw = |cx: &mut TestAppContext| {
-            cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))
+            cx.update_window(handle.into(), |_, window, cx| { window.refresh(); window.draw(cx).clear(cx) })
                 .unwrap();
         };
         draw(&mut cx);
@@ -2039,7 +2041,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .update(cx, |pane, cx| pane.set_native_material_renderer(None, cx));
-            window.draw(cx).clear(cx);
+            { window.refresh(); window.draw(cx).clear(cx) };
         })
         .unwrap();
         assert!(
@@ -2066,7 +2068,7 @@ mod tests {
             );
         })
         .unwrap();
-        cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))
+        cx.update_window(handle.into(), |_, window, cx| { window.refresh(); window.draw(cx).clear(cx) })
             .unwrap();
         // Real production pane/layout/paint paths, not an extracted math probe.
         let projected=cx.add_window(|window,cx|{
@@ -2077,7 +2079,7 @@ mod tests {
             });
             gpui_kit::base::Root::new(pane,window,cx)
         });
-        cx.update_window(projected.into(), |_, window, cx| window.draw(cx).clear(cx))
+        cx.update_window(projected.into(), |_, window, cx| { window.refresh(); window.draw(cx).clear(cx) })
             .unwrap();
         let track_pane = std::rc::Rc::new(std::cell::RefCell::new(None));
         let stored = track_pane.clone();
@@ -2090,7 +2092,7 @@ mod tests {
             *stored.borrow_mut()=Some(pane.clone());
             gpui_kit::base::Root::new(pane,window,cx)
         });
-        cx.update_window(tracks.into(), |_, window, cx| window.draw(cx).clear(cx))
+        cx.update_window(tracks.into(), |_, window, cx| { window.refresh(); window.draw(cx).clear(cx) })
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
@@ -2112,10 +2114,10 @@ mod tests {
                 "real track background projection must complete"
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
-            cx.update_window(tracks.into(), |_, window, cx| window.draw(cx).clear(cx))
+            cx.update_window(tracks.into(), |_, window, cx| { window.refresh(); window.draw(cx).clear(cx) })
                 .unwrap();
         }
-        cx.update_window(tracks.into(), |_, window, cx| window.draw(cx).clear(cx))
+        cx.update_window(tracks.into(), |_, window, cx| { window.refresh(); window.draw(cx).clear(cx) })
             .unwrap();
         cx.update(|cx| {
             assert!(
@@ -2130,7 +2132,7 @@ mod tests {
                 "real track draw must render the full projected image, not an empty canvas"
             )
         });
-        cx.update_window(projected.into(), |_, window, cx| window.draw(cx).clear(cx))
+        cx.update_window(projected.into(), |_, window, cx| { window.refresh(); window.draw(cx).clear(cx) })
             .unwrap();
         cx.update_window(tracks.into(), |_, window, cx| {
             let pane = track_pane.borrow().as_ref().unwrap().clone();

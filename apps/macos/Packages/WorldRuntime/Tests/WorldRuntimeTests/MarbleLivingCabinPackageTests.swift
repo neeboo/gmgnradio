@@ -15,7 +15,7 @@ func marbleCabinPackageUsesGeneratedAssets() throws {
     let manifest = try JSONDecoder().decode(WorldManifest.self, from: data)
     #expect(UUID(uuidString: manifest.worldID) != nil)
     #expect(manifest.packageID == "marble-living-cabin")
-    #expect(manifest.packageVersion == "1.2.0", "Wish-machine package uses its versioned state migration")
+    #expect(manifest.packageVersion == "1.2.2", "Device functions are versioned without rewriting retained world state")
     #expect(manifest.calibration.metersPerUnit == 1)
     #expect(WorldPackageValidator().validate(manifest, packageRoot: root).isEmpty)
     #expect(Set(manifest.activities.map(\.id)) == ["home.idle", "home.walk", "music.listen", "wish_machine.collect", "performance.backflip", "performance.jumping_jacks", "chair.sit"])
@@ -30,8 +30,13 @@ func marbleCabinPackageUsesGeneratedAssets() throws {
     let wish = try #require(manifest.activities.first { $0.id == "wish_machine.collect" })
     #expect(wish.entry == .functionPoint(propID: "wish_machine.device"))
     #expect(manifest.activityDefinitions.first { $0.id == "music.listen" }?.activity.typeID == "listenMusic")
-    let enterDuration = try #require(manifest.activityDefinitions.first { $0.id == "music.listen" }?.contract(for: .enter)?.durationSeconds)
-    #expect(enterDuration > 0 && enterDuration < 3)
+    for (activityID, motionPrefix) in [("music.listen", "gmgn.motion.device.jukebox-low-button"),
+                                      ("wish_machine.collect", "gmgn.motion.bones.arpg.pickup-standing")] {
+        let operation = try #require(manifest.activityDefinitions.first { $0.id == activityID }?.contract(for: .enter))
+        #expect(operation.durationSeconds == nil,
+                "设备操作必须等待真实动作回执，不能用固定时长替代")
+        #expect(Set(operation.motionIDs) == Set(["\(motionPrefix)-pmx", "\(motionPrefix)-vrm"]))
+    }
 
     // 声明 × 种子摆放必须**逐位重现**旧的烘焙几何：`wp.jukebox` 就是锚点本身。
     let sources = try marbleCabinFunctionSources(in: manifest, root: root)

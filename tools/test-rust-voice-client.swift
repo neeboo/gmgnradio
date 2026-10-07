@@ -1,52 +1,58 @@
 import Foundation
 
 let fixture = #"""
-import socket,threading,json,os,sys,uuid,base64,time
-path=sys.argv[1]; token=str(uuid.uuid4())
-server=socket.socket(socket.AF_INET,socket.SOCK_STREAM);server.bind(('127.0.0.1',0));server.listen()
-with open(path,'w') as f:json.dump({'version':1,'address':'127.0.0.1:'+str(server.getsockname()[1]),'token':token},f)
-os.chmod(path,0o600)
-def serve(c):
- def send(o):c.sendall((json.dumps(o)+'\n').encode())
- sid=None
- try:
-  for line in c.makefile('rb'):
-   q=json.loads(line)
-   if q.get('auth')!=token:send({'id':q.get('id'),'error':{'code':'unauthorized'}});return
-   p=q['params']; m=q['method']; i=q['id']
-   if not isinstance(i,str):raise ValueError('id must be string')
-   if m in ['voice_tts_start','voice_asr_start']:
-    sid=p['sessionID'];uuid.UUID(sid)
+import threading,json,os,sys,uuid,base64,time,queue
+from http.server import ThreadingHTTPServer,BaseHTTPRequestHandler
+path=sys.argv[1];token=str(uuid.uuid4());sessions={};lock=threading.Lock()
+class Handler(BaseHTTPRequestHandler):
+ protocol_version='HTTP/1.1'
+ def log_message(self,*args):pass
+ def do_GET(self):
+  assert self.path=='/health' and self.headers.get('Authorization')=='Bearer '+token
+  raw=json.dumps({'version':2,'transport':'http'}).encode()
+  self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
+ def do_POST(self):
+  q=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+  assert self.headers.get('Authorization')=='Bearer '+token and 'auth' not in q
+  p=q['params'];m=q['method'];i=q['id'];client=self.headers.get('X-GMGN-Client-ID')
+  assert isinstance(i,str) and client
+  def send(o):
+   raw=json.dumps(o).encode()
+   if self.path=='/events':self.wfile.write(b'data: '+raw+b'\n\n');self.wfile.flush()
+   else:
+    self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
+  try:
+   if self.path=='/events':
+    assert m in ['voice_tts_start','voice_asr_start']
+    sid=p['sessionID'];uuid.UUID(sid);events=queue.Queue()
+    with lock:sessions[client]=(sid,events)
+    self.send_response(200);self.send_header('Content-Type','text/event-stream');self.send_header('Connection','close');self.end_headers()
     send({'id':i,'result':{'started':True,'sessionID':sid}})
     if p.get('text')=='drop':return
-    if m=='voice_asr_start':
-     if p.get('voiceID')=='never-ready':time.sleep(2);return
-     if p.get('voiceID')=='ready-error':send({'voice_event':{'sessionID':sid,'type':'error','code':'voice_provider_error'}});return
-     time.sleep(.15)
-     try:
-      early=c.recv(1,socket.MSG_PEEK|socket.MSG_DONTWAIT)
-      if early:raise ValueError('audio sent before cloud readiness')
-     except BlockingIOError:pass
-     send({'voice_event':{'sessionID':sid,'type':'ready'}})
     if m=='voice_tts_start':
-     for chunk in [bytes([255]),bytes([127,0,128])]:
-      send({'voice_event':{'sessionID':sid,'type':'audio','audioBase64':base64.b64encode(chunk).decode(),'sampleRate':24000,'channels':1,'encoding':'pcm16le'}})
-     send({'voice_event':{'sessionID':sid,'type':'finished'}})
-   elif m=='voice_audio_append':
-    assert p['sessionID']==sid
-    pcm=base64.b64decode(p['audioBase64']);assert len(pcm)%2==0 and len(pcm)<=32768
-    send({'id':i,'result':{'accepted':True}})
-    send({'voice_event':{'sessionID':sid,'type':'partial','text':'hello'}})
-   elif m=='voice_asr_commit':
-    assert p['sessionID']==sid
-    send({'id':i,'result':{'committed':True}})
-    send({'voice_event':{'sessionID':sid,'type':'final','text':'hello world'}})
-    send({'voice_event':{'sessionID':sid,'type':'finished'}})
-   elif m=='voice_cancel':return
- except (OSError,ValueError):pass
- finally:c.close()
-while True:
- c,_=server.accept();threading.Thread(target=serve,args=(c,),daemon=True).start()
+     for chunk in [bytes([255]),bytes([127,0,128])]:send({'voice_event':{'sessionID':sid,'type':'audio','audioBase64':base64.b64encode(chunk).decode(),'sampleRate':24000,'channels':1,'encoding':'pcm16le'}})
+     send({'voice_event':{'sessionID':sid,'type':'finished'}});return
+    if p.get('voiceID')=='never-ready':time.sleep(2);return
+    if p.get('voiceID')=='ready-error':send({'voice_event':{'sessionID':sid,'type':'error','code':'voice_provider_error'}});return
+    time.sleep(.15);send({'voice_event':{'sessionID':sid,'type':'ready'}})
+    while True:
+     event=events.get(timeout=3);send({'voice_event':dict(sessionID=sid,**event)})
+     if event['type']=='finished':return
+   else:
+    sid,events=sessions[client];assert p['sessionID']==sid
+    if m=='voice_audio_append':
+     pcm=base64.b64decode(p['audioBase64']);assert len(pcm)%2==0 and len(pcm)<=32768
+     send({'id':i,'result':{'accepted':True}});events.put({'type':'partial','text':'hello'})
+    elif m=='voice_asr_commit':
+     send({'id':i,'result':{'committed':True}});events.put({'type':'final','text':'hello world'});events.put({'type':'finished'})
+    else:assert False
+  except (OSError,ValueError,queue.Empty):pass
+  finally:
+   if self.path=='/events':
+    with lock:sessions.pop(client,None)
+server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
+with open(path,'w') as f:json.dump({'version':2,'address':'127.0.0.1:'+str(server.server_port),'token':token},f)
+os.chmod(path,0o600);server.serve_forever()
 """#
 let program = #"""
 import Foundation
@@ -107,7 +113,7 @@ defer {try? FileManager.default.removeItem(at:scratch)}
 let driver=scratch.appendingPathComponent("main.swift"),binary=scratch.appendingPathComponent("checks"),endpoint=scratch.appendingPathComponent("taskd.endpoint.json")
 try program.write(to:driver,atomically:true,encoding:.utf8)
 let build=Process();build.executableURL=URL(fileURLWithPath:"/usr/bin/env")
-build.arguments=["swiftc","-swift-version","6","-parse-as-library","apps/macos/Sources/GMGNRadio/Agent/RustVoiceClient.swift",driver.path,"-o",binary.path]
+build.arguments=["swiftc","-swift-version","6","-parse-as-library","apps/macos/Sources/GMGNRadio/Presence/TaskdHTTPTransport.swift","apps/macos/Sources/GMGNRadio/Agent/RustVoiceClient.swift",driver.path,"-o",binary.path]
 try build.run();build.waitUntilExit();guard build.terminationStatus==0 else {exit(build.terminationStatus)}
 let server=Process();server.executableURL=URL(fileURLWithPath:"/usr/bin/python3");server.arguments=["-u","-c",fixture,endpoint.path]
 server.standardOutput=FileHandle.nullDevice

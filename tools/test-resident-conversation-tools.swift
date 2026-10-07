@@ -40,6 +40,10 @@ struct TextRunner: CodexCommandRunning {
         })
         service.selectBackend(.codex)
         check(service.supportsWorldTools, "installed Codex with formal sender supports tools")
+        var externalRejected = false
+        do { _ = try await service.send("invalid external tools", nativeToolsAvailable: true) }
+        catch AgentConversationError.worldToolsUnavailable { externalRejected = true }
+        check(externalRejected, "native external tools require DSH connector and world context")
         let world = ResidentWorldContext(selectedWorldID: "room", worldID: "room", displayName: "房间", revision: 1, residentPosition: [0,0,0], activeActivity: nil, activityPhase: nil, objects: [], availableActivities: [])
         let tools = ResidentConversationTools(worldID: "room", schemasJSON: Data("[]".utf8), call: { _,_,_ in ResidentCodexToolReply(resultJSON: Data("{}".utf8), isError: false) }, cancel: { captured.cancelled += 1 })
         service.preferenceStore.saveSessionID("old-readonly-thread", for: .codex, scope: world.sessionScope)
@@ -109,6 +113,7 @@ for agentName in ["CodexCLI", "AgentConversationService", "ResidentCodexTranspor
     compileArguments.append(root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/\(agentName).swift").path)
 }
 compileArguments.append(contentsOf: [
+    root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift").path,
     root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/ResidentVisionCapture.swift").path,
     main.path, "-o", binary.path,
 ])

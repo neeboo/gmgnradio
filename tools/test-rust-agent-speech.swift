@@ -1,6 +1,6 @@
 import Foundation
 
-let production = ["AgentSpeech.swift", "RustVoiceClient.swift", "StreamingPCMPlayer.swift"].map {
+let production = ["AgentSpeech.swift", "RustVoiceClient.swift", "StreamingPCMPlayer.swift", "../Presence/TaskdHTTPTransport.swift"].map {
     "apps/macos/Sources/GMGNRadio/Agent/\($0)"
 }
 let playerSource = try String(contentsOfFile: production[2], encoding: .utf8)
@@ -164,6 +164,27 @@ final class CallbackState: @unchecked Sendable {
         _ = reject.speak("wrong format", completion: { failed.append($0) })
         try await until("invalid format") { failed == [.failed] }
         check(malformed.closed, "invalid stream closes without fallback")
+        if ProcessInfo.processInfo.environment["GMGN_PCM_ACTUAL_SILENT"] == "1" {
+            check(ProcessInfo.processInfo.environment["GMGN_UNITY_TEST_MUTED"] == "1",
+                  "real output test requires per-app mute")
+            let actualStream = Stream()
+            for _ in 0..<12 { actualStream.audio(Data(repeating: 0, count: 8_000)) }
+            actualStream.end()
+            var actualOutcomes: [AgentSpeechOutcome] = []
+            let actual = RustSpeechSynthesizer(configuration: { .init(apiKey: "fixture") },
+                statusStore: AgentSpeechStatusStore(), player: StreamingPCMPlayer(),
+                start: { _, _ in actualStream })
+            let began = Date()
+            _ = actual.speak("silent device drain", completion: { actualOutcomes.append($0) })
+            while actualOutcomes.isEmpty && Date().timeIntervalSince(began) < 8 {
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            check(actualOutcomes == [.finished] && actualStream.closed,
+                  "real AVAudioEngine must finish and close after every PCM block played back")
+            check(Date().timeIntervalSince(began) >= 1.9,
+                  "48,000 real PCM frames at 24 kHz cannot complete early")
+            print("PASS actual AVAudioEngine silent 48,000-frame drained completion; no network or global audio changes")
+        }
         print("PASS: \(checks) production Rust speech / bounded PCM / drained completion / cancellation checks")
     }
 }
@@ -175,7 +196,7 @@ defer { try? FileManager.default.removeItem(at: scratch) }
 let driver = scratch.appendingPathComponent("main.swift"), binary = scratch.appendingPathComponent("checks")
 try program.write(to: driver, atomically: true, encoding: .utf8)
 let compiler = Process(); compiler.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-compiler.arguments = ["swiftc", "-swift-version", "6", "-parse-as-library"] + production + [driver.path, "-o", binary.path]
+compiler.arguments = ["swiftc", "-j1", "-swift-version", "6", "-parse-as-library"] + production + [driver.path, "-o", binary.path]
 try compiler.run(); compiler.waitUntilExit(); guard compiler.terminationStatus == 0 else { exit(compiler.terminationStatus) }
 let checks = Process(); checks.executableURL = binary
 try checks.run(); checks.waitUntilExit(); exit(checks.terminationStatus)

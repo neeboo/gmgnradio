@@ -751,6 +751,8 @@ compile.arguments = ["-swift-version", "6", "-j1", "-parse-as-library"]
     sources.appendingPathComponent("Presence/ResidentOwnershipProjection.swift").path,
     sources.appendingPathComponent("Presence/WishMachineCoordinator.swift").path,
     sources.appendingPathComponent("Presence/PropTaskDaemonClient.swift").path,
+    sources.appendingPathComponent("Presence/TaskdHTTPTransport.swift").path,
+    sources.appendingPathComponent("Presence/RetryBackoff.swift").path,
     sources.appendingPathComponent("Agent/WishMachineContract.swift").path,
     sources.appendingPathComponent("Agent/ResidentWishMachineTools.swift").path,
     sessionSource.path,

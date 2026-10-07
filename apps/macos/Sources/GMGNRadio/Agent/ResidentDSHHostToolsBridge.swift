@@ -13,10 +13,10 @@
 //      现有的 `--patch` insert 机制挂进 headless/ACP composition；插件在 DSH 进程内
 //      `ctx.tools.register(...)` 原生注册（schema 自动进入模型工具列表）。
 //    · 模型在 DSH 里**原生函数调用** gmgn_* 工具 → DSH 工具运行时派发到插件
-//      execute → 插件经**受限本地 IPC**（127.0.0.1 随机端口 + 每轮随机
+//      execute → 插件经**受限本地 HTTP /rpc**（127.0.0.1 随机端口 + 每轮随机
 //      secret）把 {callId, name, arguments} 送回宿主 → 宿主做「名称边界 + 原 schema
 //      复核 + 每轮/世界授权闸」后调用本轮 worldTools（tools.call）→ 规范 JSON 结果
-//      经 IPC 回到插件 execute → DSH agent loop 在同一运行里把结果回灌模型并继续，
+//      经 HTTP 回到插件 execute → DSH agent loop 在同一运行里把结果回灌模型并继续，
 //      直到真实 final 正文。整个过程中正文永远是正文，宿主绝不解析自然语言成动作。
 //    · 每轮授权不跨轮复用：取消即撤销（grant 文件删除 + secret 轮换 + 闸置假），
 //      迟到/未知/未授权调用一律拒绝；保留 worldTools 自身的权限/租约/校验。
@@ -198,11 +198,24 @@ public struct ResidentDSHHostToolReply: Sendable, Equatable {
     }
 }
 
-// MARK: - Wire framing helpers (newline-delimited JSON over private loopback TCP)
+// MARK: - Bounded HTTP framing helpers (private loopback HTTP /rpc)
 
 enum ResidentDSHHostWire {
     static let protocolVersion = 1
     static let maximumFrameBytes = 2 * 1_048_576
+    static let maximumHeaderBytes = 8_192
+    static let maximumReplyBytes = 8 * 1_048_576
+
+    struct HTTPRequest {
+        let body: Data
+        let bearerToken: String?
+    }
+
+    enum HTTPReadResult {
+        case request(HTTPRequest)
+        case refused(status: Int, code: String)
+        case closed
+    }
 
     static func object(_ data: Data) -> [String: Any]? {
         guard let object = try? JSONSerialization.jsonObject(with: data),
@@ -215,17 +228,95 @@ enum ResidentDSHHostWire {
         return try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
 
-    /// 读一行（到 \n，含上限），返回去掉结尾换行的帧。
-    static func readFrame(from fd: Int32, maximumBytes: Int) -> Data? {
-        var buffer = Data()
-        var byte = 0 as UInt8
-        while buffer.count <= maximumBytes {
-            let count = read(fd, &byte, 1)
-            if count <= 0 { return nil }
-            if byte == 0x0A { return buffer }
-            buffer.append(byte)
+    private static func waitForRead(_ fd: Int32, until deadline: DispatchTime) -> Bool {
+        while DispatchTime.now() < deadline {
+            let now = DispatchTime.now()
+            guard now < deadline else { return false }
+            let remaining = deadline.uptimeNanoseconds - now.uptimeNanoseconds
+            var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let timeout = Int32(max(1, min(remaining / 1_000_000, UInt64(Int32.max))))
+            let ready = poll(&descriptor, 1, timeout)
+            if ready < 0 && errno == EINTR { continue }
+            return ready > 0 && descriptor.revents & Int16(POLLIN) != 0
         }
-        return nil
+        return false
+    }
+
+    /// Exactly one HTTP/1.1 POST with a fixed Content-Length. No chunked,
+    /// duplicate headers, upgrades, pipelining or legacy NDJSON dispatch.
+    static func readHTTPRequest(from fd: Int32, authority: String, timeout: TimeInterval) -> HTTPReadResult {
+        let deadline = DispatchTime.now() + .milliseconds(Int(timeout * 1_000))
+        var header = Data()
+        while header.count < maximumHeaderBytes {
+            guard waitForRead(fd, until: deadline) else { return .closed }
+            var byte: UInt8 = 0
+            guard read(fd, &byte, 1) == 1 else { return .closed }
+            if byte == 0x0A && header.last != 0x0D { return .refused(status: 400, code: "invalid_http_request") }
+            header.append(byte)
+            if header.suffix(4) == Data([13, 10, 13, 10]) { break }
+        }
+        guard header.suffix(4) == Data([13, 10, 13, 10]),
+              let text = String(data: header, encoding: .ascii) else {
+            return .refused(status: 431, code: "http_headers_too_large")
+        }
+        let lines = text.components(separatedBy: "\r\n")
+        let first = lines[0].split(separator: " ", omittingEmptySubsequences: false)
+        guard first.count == 3, first[2] == "HTTP/1.1" else { return .refused(status: 400, code: "invalid_http_request") }
+        guard first[1] == "/rpc" else { return .refused(status: 404, code: "http_route_not_found") }
+        guard first[0] == "POST" else { return .refused(status: 405, code: "http_method_not_allowed") }
+        var headers: [String: String] = [:]
+        for line in lines.dropFirst().dropLast(2) {
+            guard let separator = line.firstIndex(of: ":"), separator != line.startIndex else {
+                return .refused(status: 400, code: "invalid_http_request")
+            }
+            let name = String(line[..<separator]).lowercased()
+            guard name.utf8.allSatisfy({ (97...122).contains($0) || (48...57).contains($0) || $0 == 45 }),
+                  headers[name] == nil else { return .refused(status: 400, code: "invalid_http_request") }
+            let value = String(line[line.index(after: separator)...]).trimmingCharacters(in: .whitespaces)
+            guard value.utf8.allSatisfy({ $0 >= 32 && $0 < 127 }) else { return .refused(status: 400, code: "invalid_http_request") }
+            headers[name] = value
+        }
+        guard headers["host"] == authority, headers["transfer-encoding"] == nil,
+              headers["upgrade"] == nil, headers["origin"] == nil else {
+            return .refused(status: 400, code: "invalid_http_request")
+        }
+        guard headers["content-type"]?.split(separator: ";", maxSplits: 1).first?
+            .trimmingCharacters(in: .whitespaces).lowercased() == "application/json" else {
+            return .refused(status: 415, code: "http_json_required")
+        }
+        guard let length = headers["content-length"], !length.isEmpty,
+              length.utf8.allSatisfy({ (48...57).contains($0) }), let count = Int(length) else {
+            return .refused(status: 400, code: "http_content_length_required")
+        }
+        guard count <= maximumFrameBytes else { return .refused(status: 413, code: "http_request_too_large") }
+        var body = Data()
+        var bytes = [UInt8](repeating: 0, count: 8_192)
+        while body.count < count {
+            guard waitForRead(fd, until: deadline) else { return .closed }
+            let size = min(bytes.count, count - body.count)
+            let received = read(fd, &bytes, size)
+            guard received > 0 else { return .closed }
+            body.append(contentsOf: bytes.prefix(received))
+        }
+        let authorization = headers["authorization"]
+        let token = authorization?.hasPrefix("Bearer ") == true ? String(authorization!.dropFirst(7)) : nil
+        return .request(HTTPRequest(body: body, bearerToken: token))
+    }
+
+    static func httpResponse(status: Int, body: Data) -> Data {
+        let reason: String
+        switch status {
+        case 200: reason = "OK"
+        case 403: reason = "Forbidden"
+        case 404: reason = "Not Found"
+        case 405: reason = "Method Not Allowed"
+        case 413: reason = "Payload Too Large"
+        case 415: reason = "Unsupported Media Type"
+        case 431: reason = "Request Header Fields Too Large"
+        case 500: reason = "Internal Server Error"
+        default: reason = "Bad Request"
+        }
+        return Data("HTTP/1.1 \(status) \(reason)\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: \(body.count)\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n".utf8) + body
     }
 
     static func writeAll(_ fd: Int32, _ data: Data) -> Bool {
@@ -244,20 +335,19 @@ enum ResidentDSHHostWire {
 
 /// 真实 DSH 原生工具插件（gmgn-host-tools）源码。运行期写入私有目录并以
 /// `--patch` 的 insert 行加载；插件在 DSH 进程内 `ctx.tools.register` 原生注册
-/// 宿主本轮正式工具，execute 经 loopback TCP + 每轮 token 回宿主，宿主复核后执行
+/// 宿主本轮正式工具，execute 经 loopback HTTP /rpc + 每轮 token 回宿主，宿主复核后执行
 /// worldTools，规范结果回到同一 DSH 运行继续。
 ///
 /// 插件每次 execute 都重读 grant 文件：授权以「调用时」快照为准——取消/世界切换
 /// 即撤销（文件删除或 state 非 armed 时拒绝），每轮 secret 不跨轮复用；未知工具/
-/// 非法参数由宿主在 IPC 侧拒绝。正文永不产生动作。
+/// 非法参数由宿主在 HTTP 侧拒绝。正文永不产生动作。
 public enum ResidentDSHHostToolsPlugin {
     public static let moduleID = "gmgn-host-tools"
     public static let filename = "gmgn-host-tools.mjs"
     public static let grantFilename = "gmgn-host-tools.grant.json"
-    public static let socketFilename = "gmgn-host-tools.sock"
 
     public static let source = #"""
-    import net from 'node:net'
+    import http from 'node:http'
     import fs from 'node:fs'
     import { fileURLToPath } from 'node:url'
 
@@ -266,7 +356,8 @@ public enum ResidentDSHHostToolsPlugin {
 
     // grant 文件与插件同目录（宿主通道自建私有目录）：不依赖插件 config，
     // 便于 `--patch`/composition 只以 name 挂载并继续通过 `--dump-config` 认证。
-    const bootstrapPath = fileURLToPath(new URL('gmgn-host-tools.grant.json', import.meta.url))
+    const bootstrapPath = fileURLToPath(new URL('gmgn-host-tools.bootstrap.json', import.meta.url))
+    const grantPath = fileURLToPath(new URL('gmgn-host-tools.grant.json', import.meta.url))
 
     function readGrant(path) {
       let raw
@@ -276,7 +367,13 @@ public enum ResidentDSHHostToolsPlugin {
 
     function rpc(endpoint, secret, payload, signal) {
       return new Promise((resolve, reject) => {
-        const socket = net.connect({ host: '127.0.0.1', port: Number(endpoint.address.split(':')[1]) })
+        const body = JSON.stringify({ v: 1, callId: payload.callId, name: payload.name, arguments: payload.arguments || {} })
+        if (Buffer.byteLength(body) > 2097152) { reject(new Error('gmgn-host-tools: oversized host request')); return }
+        const request = http.request(endpoint.url, { method: 'POST', agent: false, headers: {
+          'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body),
+          'Authorization': 'Bearer ' + secret, 'Connection': 'close'
+        } })
+        request.on('error', function () { finish(new Error('gmgn-host-tools: host HTTP connection failed')) })
         let settled = false
         let buffer = Buffer.alloc(0)
         const deadline = setTimeout(onTimeout, 120000)
@@ -285,7 +382,7 @@ public enum ResidentDSHHostToolsPlugin {
           settled = true
           clearTimeout(deadline)
           if (signal && typeof signal.removeEventListener === 'function') signal.removeEventListener('abort', onAbort)
-          socket.destroy()
+          request.destroy()
           if (err) reject(err); else resolve(value)
         }
         function onTimeout() { finish(new Error('gmgn-host-tools: host call timed out')) }
@@ -294,28 +391,24 @@ public enum ResidentDSHHostToolsPlugin {
           if (signal.aborted) { onAbort(); return }
           signal.addEventListener('abort', onAbort, { once: true })
         }
-        socket.on('connect', function () {
-          const body = JSON.stringify({ v: 1, secret: secret, callId: payload.callId, name: payload.name, arguments: payload.arguments || {} })
-          socket.write(body + '\n')
-        })
-        socket.on('data', function (chunk) {
-          buffer = Buffer.concat([buffer, chunk])
-          const newline = buffer.indexOf(10)
-          if (newline < 0) {
-            if (buffer.length > 8388608) finish(new Error('gmgn-host-tools: oversized host reply'))
-            return
+        request.on('response', function (response) {
+          if ((response.statusCode !== 200 && response.statusCode !== 403) ||
+              String(response.headers['content-type'] || '').split(';')[0].trim() !== 'application/json') {
+            response.destroy(); finish(new Error('gmgn-host-tools: invalid host HTTP reply')); return
           }
-          const line = buffer.subarray(0, newline).toString('utf8')
-          let parsed
-          try { parsed = JSON.parse(line) } catch (_) { finish(new Error('gmgn-host-tools: malformed host reply')); return }
-          finish(null, parsed)
+          response.on('data', function (chunk) {
+            if (buffer.length + chunk.length > 8388608) { response.destroy(); finish(new Error('gmgn-host-tools: oversized host reply')); return }
+            buffer = Buffer.concat([buffer, chunk])
+          })
+          response.on('end', function () {
+            let parsed
+            try { parsed = JSON.parse(buffer.toString('utf8')) } catch (_) { finish(new Error('gmgn-host-tools: malformed host reply')); return }
+            finish(null, parsed)
+          })
+          response.on('error', function () { finish(new Error('gmgn-host-tools: host HTTP response failed')) })
+          response.on('aborted', function () { finish(new Error('gmgn-host-tools: host HTTP response aborted')) })
         })
-        socket.on('error', function (error) {
-          finish(new Error('gmgn-host-tools: host connection failed: ' + String((error && error.message) || error)))
-        })
-        socket.on('close', function () {
-          finish(new Error('gmgn-host-tools: host closed connection before reply'))
-        })
+        request.end(body)
       })
     }
 
@@ -374,7 +467,7 @@ public enum ResidentDSHHostToolsPlugin {
             render: fallbackFor
           },
           async execute(args, exec) {
-            const current = readGrant(bootstrapPath)
+            const current = readGrant(grantPath)
             if (!current || current.state !== 'armed') throw new Error('gmgn-host-tools: host 授权未生效或已撤销，拒绝执行')
             let allowed = false
             const tools = current.tools && Array.isArray(current.tools) ? current.tools : []
@@ -383,7 +476,7 @@ public enum ResidentDSHHostToolsPlugin {
             }
             if (!allowed) throw new Error('gmgn-host-tools: 本轮未开放工具 ' + declared)
             const endpoint = current.endpoint
-            if (!endpoint || endpoint.version !== 1 || typeof endpoint.address !== 'string' || !/^127\.0\.0\.1:([1-9][0-9]{0,4})$/.test(endpoint.address) || Number(endpoint.address.split(':')[1]) > 65535 || typeof endpoint.token !== 'string' || endpoint.token.length === 0) throw new Error('gmgn-host-tools: invalid private endpoint')
+            if (!endpoint || endpoint.version !== 2 || typeof endpoint.url !== 'string' || !/^http:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})\/rpc$/.test(endpoint.url) || Number(new URL(endpoint.url).port) > 65535 || typeof endpoint.token !== 'string' || endpoint.token.length === 0) throw new Error('gmgn-host-tools: invalid private endpoint')
             const secret = endpoint.token
             if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(secret) || secret !== current.secret) throw new Error('gmgn-host-tools: invalid private authorization')
             const callId = exec && typeof exec.callId === 'string' ? exec.callId : ''
@@ -422,7 +515,7 @@ public enum ResidentDSHHostToolsPlugin {
 // MARK: - Host channel
 
 /// 宿主侧原生工具通道。负责：
-///  1. 在私有目录写插件文件与 grant 文件（0600）、启动 UDS 监听（受 secret 保护）；
+///  1. 在私有目录写插件文件与 grant 文件（0600）、启动 HTTP 监听（受 token 保护）；
 ///  2. 每轮 arm()：新 secret + state=armed；revoke()/stop()：删除 grant、关闸、撤听；
 ///  3. 连接处理：secret 校验 → 名称边界 → 原 schema 复核 → 授权闸 →
 ///     调用宿主 handler（生产 = worldTools.call）→ 规范 JSON 回写。
@@ -470,11 +563,9 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
     public let directoryURL: URL
     public let pluginFileURL: URL
     public let grantFileURL: URL
-    public private(set) var address: String = ""
-    /// Source compatibility for existing callers; this is a TCP address, never a file path.
-    public var socketPath: String { address }
+    public private(set) var rpcURL: String = ""
     public func endpoint(token: String) -> [String: Any] {
-        ["version": 1, "address": address, "token": token]
+        ["version": 2, "url": rpcURL, "token": token]
     }
 
     private var listenerFD: Int32 = -1
@@ -550,6 +641,13 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
             try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: pluginURL.path)
             try channel.startListener()
             try channel.arm(worldRevision: nil)
+            // Definitions must survive revoke during the ACP handshake. This
+            // bootstrap contains no endpoint, secret or execution authority.
+            let grant = try JSONSerialization.jsonObject(with: Data(contentsOf: grantURL)) as? [String: Any]
+            let bootstrap = directoryURL.appendingPathComponent("gmgn-host-tools.bootstrap.json")
+            let definitions = try JSONSerialization.data(withJSONObject: ["tools": grant?["tools"] ?? []])
+            try definitions.write(to: bootstrap, options: [.atomic])
+            try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: bootstrap.path)
         } catch {
             // 启动中途失败也必须回收：监听 fd/accept 线程与任何半开连接都要停掉，
             // 否则强引用会一直留住通道。
@@ -692,7 +790,7 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
         }
     }
 
-    // MARK: Private loopback TCP listener
+    // MARK: Private loopback HTTP listener
 
     private func startListener() throws {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
@@ -729,7 +827,7 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
             close(fd)
             throw ResidentDSHHostToolsError.startupFailed("无法读取私有端口")
         }
-        self.address = "127.0.0.1:\(UInt16(bigEndian: address.sin_port))"
+        self.rpcURL = "http://127.0.0.1:\(UInt16(bigEndian: address.sin_port))/rpc"
 
         lock.lock()
         listenerFD = fd
@@ -843,10 +941,30 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
         setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &receive, socklen_t(MemoryLayout<timeval>.size))
         var send = timeval(tv_sec: Int(Self.clientWriteTimeout), tv_usec: 0)
         setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &send, socklen_t(MemoryLayout<timeval>.size))
-        guard let frame = ResidentDSHHostWire.readFrame(from: client, maximumBytes: ResidentDSHHostWire.maximumFrameBytes),
-              let request = ResidentDSHHostWire.object(frame) else { return }
-        guard let replyData = self.authorizeAndExecute(request) else { return }
-        _ = ResidentDSHHostWire.writeAll(client, replyData + Data([0x0A]))
+        func refusal(_ status: Int, _ code: String, _ message: String) {
+            let body = ResidentDSHHostWire.jsonData(["v": ResidentDSHHostWire.protocolVersion, "ok": false,
+                "error": ["code": code, "message": message]])!
+            _ = ResidentDSHHostWire.writeAll(client, ResidentDSHHostWire.httpResponse(status: status, body: body))
+        }
+        let url = URL(string: rpcURL)!
+        switch ResidentDSHHostWire.readHTTPRequest(from: client, authority: "127.0.0.1:\(url.port!)", timeout: Self.clientReadTimeout) {
+        case .closed: return
+        case let .refused(status, code):
+            refusal(status, code, "宿主工具 HTTP 请求无效，未执行")
+        case let .request(http):
+            lock.lock()
+            let authorized = !stopped && armed && !currentSecret.isEmpty && http.bearerToken == currentSecret
+            lock.unlock()
+            guard authorized else { refusal(403, "grant_revoked", "本轮授权已撤销或未生效，拒绝执行"); return }
+            guard let request = ResidentDSHHostWire.object(http.body) else {
+                refusal(400, "invalid_json", "宿主工具参数必须是 JSON 对象"); return
+            }
+            guard let replyData = self.authorizeAndExecute(request, bearerToken: http.bearerToken) else { return }
+            guard replyData.count <= ResidentDSHHostWire.maximumReplyBytes else {
+                refusal(500, "host_reply_too_large", "宿主工具回执超过上界，未确认结果"); return
+            }
+            _ = ResidentDSHHostWire.writeAll(client, ResidentDSHHostWire.httpResponse(status: 200, body: replyData))
+        }
     }
 
     // MARK: Authorization epoch / bounded timeouts
@@ -888,7 +1006,7 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
     /// 连接线程侧的同步壳：分类在本地完成；真正的 handler 调用永远在 @MainActor
     /// 上执行（`executeOnMainActor` 先复核授权再调用），结果经锁+信号量配对的
     /// HostExecutionBox 回传。等待有 handlerExecutionTimeout 上界；stop 时立即退出。
-    private func authorizeAndExecute(_ request: [String: Any]) -> Data? {
+    private func authorizeAndExecute(_ request: [String: Any], bearerToken: String?) -> Data? {
         func refusalFrame(_ code: String, _ message: String) -> Data? {
             ResidentDSHHostWire.jsonData([
                 "v": ResidentDSHHostWire.protocolVersion,
@@ -896,7 +1014,7 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
                 "error": ["code": code, "message": message],
             ])
         }
-        switch classify(request) {
+        switch classify(request, bearerToken: bearerToken) {
         case let .refusal(code, message):
             return refusalFrame(code, message)
         case let .accepted(call):
@@ -941,9 +1059,9 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
         return .reply(Self.successResponse(result))
     }
 
-    private func classify(_ request: [String: Any]) -> RequestVerdict {
+    private func classify(_ request: [String: Any], bearerToken: String?) -> RequestVerdict {
         guard (request["v"] as? Int) == ResidentDSHHostWire.protocolVersion else {
-            return .refusal(code: "protocol_mismatch", message: "宿主工具 IPC 协议版本不匹配")
+            return .refusal(code: "protocol_mismatch", message: "宿主工具请求协议版本不匹配")
         }
         // 分类只抓「当前授权代 + secret」快照；它不是执行许可。真正的执行前复核
         // 在 MainActor 边界（executeOnMainActor）用同一快照再做一次。
@@ -952,7 +1070,7 @@ public final class ResidentDSHHostToolsChannel: @unchecked Sendable {
             ? AuthorizationSnapshot(epoch: authorizationEpoch, secret: currentSecret)
             : nil
         lock.unlock()
-        guard let snapshot, (request["secret"] as? String) == snapshot.secret else {
+        guard let snapshot, bearerToken == snapshot.secret else {
             return .refusal(code: "grant_revoked", message: "本轮授权已撤销或未生效，拒绝执行")
         }
         guard let callID = request["callId"] as? String, !callID.isEmpty else {

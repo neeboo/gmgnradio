@@ -6,7 +6,7 @@ edition = "2024"
 [workspace]
 
 [dependencies]
-gpui-kit = "=0.7.0"
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "c1bda59e67f46266991a230ae94f749af496af2a", features = ["gpui-fast"] }
 gmgn-gpui-ui = { path = "../../apps/gpui-ui" }
 raw-window-handle = "0.6"
 serde_json = "=1.0.151"

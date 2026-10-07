@@ -17,6 +17,8 @@ namespace GMGN.UnityPlayer
         static bool started;
         public static string LocaleCode => table == null ? null : table.LocaleIdentifier.Code;
         public static string Get(string key) => table == null ? "" : table.GetEntry(key)?.LocalizedValue ?? "";
+        public static string VoiceStatus(string state, string errorCode) =>
+            Get(string.IsNullOrEmpty(errorCode) ? "pttState_" + state : "pttError_" + errorCode);
         // Existing panel callers may pass the host preference; selection is centralized above.
         public static string Get(string key, string locale) => Get(key);
 

@@ -66,6 +66,13 @@ struct MarbleOperation: Decodable, Equatable, Sendable {
     let isDone: Bool
     let progressPercentage: Int?
     let errorMessage: String?
+    /// Exact result identity; display-name matches do not establish provenance.
+    let worldID: String?
+
+    private struct Response: Decodable {
+        let worldID: String?
+        private enum CodingKeys: String, CodingKey { case worldID = "world_id" }
+    }
 
     private struct OperationError: Decodable {
         let message: String?
@@ -84,6 +91,7 @@ struct MarbleOperation: Decodable, Equatable, Sendable {
         case isDone = "done"
         case metadata
         case error
+        case response
     }
 
     init(from decoder: Decoder) throws {
@@ -101,6 +109,7 @@ struct MarbleOperation: Decodable, Equatable, Sendable {
             OperationError.self,
             forKey: .error
         )?.message
+        worldID = try container.decodeIfPresent(Response.self, forKey: .response)?.worldID
     }
 }
 

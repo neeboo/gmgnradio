@@ -232,22 +232,25 @@ enum PropAttachmentSlots {
     static func calibration(
         avatarAssetID: String,
         prop: WorldGeneratedProp,
-        point: PropAttachmentPoint
+        point: PropAttachmentPoint,
+        geometry: [WorldTriangle]? = nil
     ) -> WorldPropGripCalibration? {
         guard prop.isValid, !avatarAssetID.isEmpty, avatarAssetID.count <= 256 else { return nil }
         // 净空不够（物件自己就吞掉了整个偏移）⇒ 这里就拒绝，绝不让它穿进身体之后再"看起来像挂了"。
         guard clearanceRejection(for: prop, point: point) == nil else { return nil }
-        let suggestion = PropGripInference.suggestion(for: prop)
+        let suggestion = PropGripInference.suggestion(for: prop, geometry: geometry)
         let calibration: WorldPropGripCalibration
         switch point {
         case .rightHand:
+            guard suggestion.origin != .unknownHandle else { return nil }
             // 手：握点、偏移、朝向**全部**照旧由推断给出（`localOffset` 恒为 0）。
             calibration = WorldPropGripCalibration(
                 avatarAssetID: avatarAssetID,
                 hand: point.worldSlot,
                 normalizedGrip: suggestion.normalizedGrip,
                 localOffset: suggestion.localOffset,
-                localRotation: suggestion.localRotation
+                localRotation: PropGripInference.verifiedForwardFacingSwordRotation(for: prop, avatarAssetID: avatarAssetID)
+                    ?? suggestion.localRotation
             )
         case .back, .waist:
             // 背后/腰间：握点与偏移由挂点定义给出，朝向 = 把"推断出来的刃轴"转到挂点要的方向。

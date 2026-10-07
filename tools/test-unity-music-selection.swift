@@ -2,6 +2,13 @@ import Foundation
 
 @main struct MusicSelectionRegression {
     static func main() {
+        precondition(UnityMusicTrackSelection.resolve(ids: ["a", "b"], trackID: "b", slotIndex: nil) == 1)
+        precondition(UnityMusicTrackSelection.resolve(ids: ["a", "b"], trackID: nil, slotIndex: 1) == 1)
+        precondition(UnityMusicTrackSelection.resolve(ids: ["a", "b"], trackID: "a", slotIndex: 1) == nil)
+        precondition(UnityMusicTrackSelection.resolve(ids: ["a", "b"], trackID: "missing", slotIndex: nil) == nil)
+        precondition(UnityMusicTrackSelection.resolve(ids: ["a", "a"], trackID: "a", slotIndex: nil) == nil)
+        precondition(UnityMusicTrackSelection.resolve(ids: ["a", "a"], trackID: "a", slotIndex: 1) == 1)
+        precondition(UnityMusicTrackSelection.resolve(ids: ["a"], trackID: nil, slotIndex: -1) == nil)
         var state = UnityMusicSelectionState<String>()
         let large = (0..<1940).map { "track-\($0)" }
         let first = state.begin(queue: large, index: 4)!

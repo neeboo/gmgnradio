@@ -13,6 +13,66 @@ namespace GMGN.UnityPlayer.WorldPlacementGeometry
     public sealed class PlacementGeometry
     {
         public JObject DeriveRequest { get; private set; }
+        public static async Task<PlacementGeometry> LoadFormalPackage(FormalWorldPackage package, CancellationToken cancellation)
+        {
+            var world = package.Manifest;
+            var resources = world["resources"] as JArray ?? throw new InvalidDataException("空间包缺少资源清单。");
+            JObject collision = null, configuration = null;
+            var runtimeMarble = package.ReadMarbleRuntime();
+            foreach (JObject resource in resources)
+            {
+                if ((string)resource["kind"] == "collision.glb" || (string)resource["kind"] == "environment.collider") {
+                    if (collision != null) throw new InvalidDataException("空间包包含多个碰撞模型，尚未指定组合规则。");
+                    collision = resource;
+                }
+                if ((string)resource["kind"] == "scene.configuration") {
+                    if (configuration != null) throw new InvalidDataException("空间包包含多个场景校准配置。");
+                    configuration = resource;
+                }
+            }
+            if (collision == null) throw new InvalidDataException("空间包缺少真实碰撞模型，暂时不能摆放。");
+            Matrix4x4 matrix;
+            if (runtimeMarble != null)
+            {
+                var scale = (float)runtimeMarble["uniformScale"];
+                var origin = UnityPoint(runtimeMarble["origin"]);
+                var axes = (string)runtimeMarble["colliderAxisConversion"] == "identity" ? Vector3.one : new Vector3(1, -1, -1);
+                matrix = Matrix4x4.TRS(-origin * scale, Quaternion.identity, axes * scale);
+                if ((string)collision["path"] != (string)runtimeMarble["colliderPath"])
+                    throw new InvalidDataException("Marble 碰撞资源与环境配置不一致。");
+            }
+            else if ((string)world["packageID"] == "marble-living-cabin")
+            {
+                if (configuration == null) throw new InvalidDataException("生活舱碰撞模型缺少校准配置。");
+                var marble = JObject.Parse(await Task.Run(() => File.ReadAllText(package.ResolveResource((string)configuration["id"])), cancellation));
+                if ((string)world["worldID"] != (string)marble["world"]?["world_id"])
+                    throw new InvalidDataException("碰撞包与生活舱编号不一致。");
+                var scale = (float)marble["framing"]["scale"];
+                var origin = UnityPoint(marble["framing"]["origin"]);
+                if (!float.IsFinite(scale) || scale <= 0) throw new InvalidDataException("碰撞包校准比例无效。");
+                matrix = Matrix4x4.TRS(-origin * scale, Quaternion.identity, new Vector3(scale, -scale, -scale));
+            }
+            else
+            {
+                var values = world["calibration"]?["visualToGameplay"] as JArray;
+                var units = (float?)world["calibration"]?["metersPerUnit"] ?? 0;
+                if (values == null || values.Count != 16 || !float.IsFinite(units) || units <= 0)
+                    throw new InvalidDataException("空间碰撞模型缺少有效校准。");
+                var source = new Matrix4x4();
+                for (int i = 0; i < 16; i++) {
+                    var value = (float)values[i];
+                    if (!float.IsFinite(value)) throw new InvalidDataException("空间碰撞校准包含无效坐标。");
+                    source[i % 4, i / 4] = value;
+                }
+                // Manifest uses Swift's column-major right-handed matrix.
+                var reflectZ = Matrix4x4.Scale(new Vector3(1,1,-1));
+                matrix = reflectZ * source * Matrix4x4.Scale(Vector3.one * units) * reflectZ;
+            }
+            var geometry = await LoadPath(package.ResolveResource((string)collision["id"]), matrix,
+                WorldCoordinates.Position(world["spawn"]?["position"]), cancellation);
+            geometry.AddManifestBlockingVolumes(world["collisionVolumes"] as JArray ?? new JArray());
+            return geometry;
+        }
         public static async Task<PlacementGeometry> LoadBundledCabin(PortableWorldPackage package, CancellationToken cancellation)
         {
             const string root = "assets/cabin/";
@@ -40,6 +100,11 @@ namespace GMGN.UnityPlayer.WorldPlacementGeometry
                 throw new InvalidDataException("空间备份缺少真实碰撞模型，暂时不能摆放。");
             var path = colliderReference.StartsWith("assets/", StringComparison.Ordinal)
                 ? package.ResolvePackageFile(colliderReference) : package.ResolveReference(colliderReference);
+            return await LoadPath(path, unityColliderToGameplay, seedUnity, cancellation);
+        }
+        static async Task<PlacementGeometry> LoadPath(string path, Matrix4x4 unityColliderToGameplay,
+            Vector3 seedUnity, CancellationToken cancellation)
+        {
             var model = await new GltfWorldAssetLoader().LoadCollisionAsset(path, cancellation);
             try
             {

@@ -129,6 +129,12 @@ struct LivingWorldBootstrapTests {
         #expect(approved[walkPMX.id]?.url == walkPMX.url)
         #expect(approved[walkVRM.id]?.url == walkVRM.url)
         #expect(approved[coffeeButton.id] == coffeeButton)
+        for (suffix, format) in [("pmx", StageMotionFormat.vmd), ("vrm", .vrma)] {
+            let pickup = StageMotionAsset(id: "gmgn.motion.bones.arpg.pickup-standing-\(suffix)",
+                name: "Pickup", format: format, url: URL(filePath: "/tmp/pickup.\(format.rawValue)"))
+            #expect(LivingWorldBootstrap.approvedInstalledMotions([pickup])[pickup.id] == pickup,
+                    "托盘拾取动作必须进入正式活动动作库")
+        }
     }
 
     @Test

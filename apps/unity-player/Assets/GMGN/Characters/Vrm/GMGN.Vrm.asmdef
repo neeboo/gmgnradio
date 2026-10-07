@@ -1,0 +1,14 @@
+{
+  "name": "GMGN.Vrm",
+  "rootNamespace": "GMGN.UnityPlayer.Characters",
+  "references": ["UniGLTF", "UniGLTF.Utils", "VRM10", "Unity.Timeline", "GMGN.GraspPose"],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": ["GMGN_UNIVRM"],
+  "versionDefines": [],
+  "noEngineReferences": false
+}

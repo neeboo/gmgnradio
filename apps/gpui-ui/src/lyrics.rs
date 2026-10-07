@@ -3448,7 +3448,7 @@ mod tests {
             *entity.borrow_mut() = Some(pane.clone());
             gpui_kit::base::Root::new(pane, window, cx)
         });
-        cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))
+        cx.update_window(handle.into(), |_, window, cx| { window.refresh(); window.draw(cx).clear(cx) })
             .unwrap();
         let pane = stored.borrow().clone().unwrap();
         let previous = calls.borrow().last().unwrap().0;
@@ -3456,7 +3456,7 @@ mod tests {
             pane.update(cx, |pane, cx| {
                 pane.update_snapshot(json!({"trackID":"second","mode":"mindscape"}), window, cx)
             });
-            window.draw(cx).clear(cx);
+            { window.refresh(); window.draw(cx).clear(cx) };
         })
         .unwrap();
         let generation = calls.borrow().last().unwrap().0;
@@ -3469,6 +3469,8 @@ mod tests {
         cx.update_window(handle.into(), |_, window, cx| {
             pane.update(cx, |pane, _| {
                 let mut queue = pane.worker.as_ref().unwrap().shared.0.lock().unwrap();
+                // This fixture injects a worker result without its normal wakeup.
+                // The manual frame below refreshes Fast's cached entity tree.
                 queue.completed = Some((
                     generation,
                     Ok(super::LyricOutput::Gpu(super::GpuLyricsFrame {
@@ -3488,7 +3490,7 @@ mod tests {
                     })),
                 ));
             });
-            window.draw(cx).clear(cx);
+            { window.refresh(); window.draw(cx).clear(cx) };
             pane.update(cx, |pane, cx| {
                 let error = pane.render_error().unwrap();
                 assert!(error.contains("mode=mindscape"));

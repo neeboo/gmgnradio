@@ -1,0 +1,16 @@
+.screen-video-panel { position: absolute; right: 0; bottom: 96px; width: 480px; max-width: 100%; height: auto; max-height: 500px; min-height: 0; padding: 12px; background-color: rgba(13, 16, 22, 0.98); border-radius: 16px; overflow: hidden; }
+.screen-video-header { flex-direction: row; align-items: center; justify-content: space-between; flex-shrink: 0; margin-bottom: 8px; }
+.screen-video-header .icon-button { width: 28px; height: 28px; padding: 4px; margin-right: 0; }
+.screen-video-controls { flex-shrink: 0; }
+.screen-video-choice { flex-shrink: 0; margin-bottom: 8px; }
+.screen-video-url { flex-direction: column; align-items: stretch; flex-shrink: 0; }
+.screen-video-url .unity-base-field__label { margin-bottom: 4px; }
+.screen-video-choice .unity-base-field__input, .screen-video-url .unity-base-field__input { height: 36px; min-width: 0; padding: 6px 10px; color: var(--text); background-color: #13161b; border-width: 1px; border-color: var(--line); border-radius: 8px; }
+.screen-video-url .unity-text-field__input { white-space: nowrap; overflow: hidden; }
+.screen-video-url .unity-text-element { white-space: nowrap; }
+.screen-video-actions { flex-direction: row; height: 36px; flex-shrink: 0; margin-top: 8px; }
+.screen-video-actions Button { flex-grow: 1; }
+.screen-video-play { margin-right: 8px; }
+.screen-video-status { white-space: normal; flex-shrink: 0; min-height: 20px; color: #ff9c94; font-size: var(--body); margin-top: 8px; }
+.screen-video-rows { flex-shrink: 0; min-height: 20px; margin-top: 8px; }
+.screen-video-rows Label { white-space: normal; min-height: 20px; color: var(--text); font-size: var(--body); flex-shrink: 0; }

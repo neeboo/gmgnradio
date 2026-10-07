@@ -29,6 +29,7 @@ let dto = ["struct DJAgentMusicTrack:", "struct DJAgentMusicPlaylist:", "struct 
 let harness = #"""
 import Foundation
 import os
+\#(try String(contentsOf: root.appendingPathComponent("tools/fixtures/MusicStorageRPCFixture.swift"), encoding: .utf8))
 \#(planTypes)
 \#(declaration("struct AgentVisualDirection:", in: try read("DJCore/AgentShowProposal.swift")))
 \#(dto)
@@ -95,19 +96,19 @@ func playlist(_ id: String = "netease:cozy", name: String = "Cozy 爵士", provi
 }
 @main struct Tests {
     @MainActor static func main() async throws {
-        let cacheRoot = FileManager.default.temporaryDirectory.appendingPathComponent("gmgn-background-library-\(UUID())")
-        defer { try? FileManager.default.removeItem(at: cacheRoot) }
-        let cacheURL = cacheRoot.appendingPathComponent("library.json")
-        let backgroundStore = SyncedMusicLibraryStore(cacheURL: cacheURL)
+        let backend = MusicStorageRPCFixture()
+        let backgroundStore = SyncedMusicLibraryStore(storage: backend.client)
         let firstMerge = await backgroundStore.mergeAndVerifyInBackground(playlists: [playlist()])
         check(firstMerge && backgroundStore.playlists.count == 1, "background merge publishes verified data")
-        check(SyncedMusicLibraryStore(cacheURL: cacheURL).playlists == backgroundStore.playlists, "background cache is reopenable")
+        let reopened = SyncedMusicLibraryStore(storage: backend.client)
+        try await reopened.reload()
+        check(reopened.playlists == backgroundStore.playlists, "background library is reopenable")
         let replacement = await backgroundStore.mergeAndVerifyInBackground(playlists: [playlist(name: "Updated", tracks: [], total: 3)])
         check(replacement && backgroundStore.playlists.first?.tracks.count == 1, "background replacement retains cached tracks")
-        check(SyncedMusicLibraryStore(cacheURL: cacheURL).playlists == backgroundStore.playlists, "atomic replacement publishes verified readback")
-        let blockedURL = cacheRoot.appendingPathComponent("blocked")
-        try Data().write(to: blockedURL)
-        let blockedStore = SyncedMusicLibraryStore(cacheURL: blockedURL.appendingPathComponent("library.json"))
+        try await reopened.reload()
+        check(reopened.playlists == backgroundStore.playlists, "database replacement publishes confirmed readback")
+        let blockedBackend = MusicStorageRPCFixture(); blockedBackend.rejected = true
+        let blockedStore = SyncedMusicLibraryStore(storage: blockedBackend.client)
         let blockedMerge = await blockedStore.mergeAndVerifyInBackground(playlists: [playlist()])
         check(!blockedMerge && blockedStore.playlists.isEmpty, "background write failure cannot publish unverified library")
         let f = Fixture()
@@ -206,7 +207,7 @@ func run(_ binary: String, _ args: [String]) throws -> Int32 {
     let process = Process(); process.executableURL = URL(fileURLWithPath: binary); process.arguments = args
     try process.run(); process.waitUntilExit(); return process.terminationStatus
 }
-let sourceFiles = ["MusicSources/MusicSource.swift", "MusicSources/SyncedMusicLibraryStore.swift",
+let sourceFiles = ["MusicSources/MusicSource.swift", "MusicSources/MusicStorageClient.swift", "DJCore/DJProgramStore.swift", "MusicSources/SyncedMusicLibraryStore.swift",
     "Domain/PlaybackContext.swift", "AudioEngine/PlaybackPreflight.swift", "Agent/MusicLibraryAgentService.swift"]
 let arguments = ["-j1", "-parse-as-library"] + sourceFiles.map { sources.appendingPathComponent($0).path } +
     [program.path, "-o", temp.appendingPathComponent("test").path]

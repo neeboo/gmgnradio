@@ -3,7 +3,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 revision="${1:?Pass a fresh sample revision, e.g. v5}"
 [[ "$revision" =~ ^[a-zA-Z0-9-]+$ ]] || { echo 'Invalid sample revision' >&2; exit 2; }
-app="$repo_root/tmp/unity-player-release-$revision.app"
+mkdir -p "$repo_root/tmp/ReleaseArtifacts.noindex"
+app="$repo_root/tmp/ReleaseArtifacts.noindex/unity-player-release-$revision.app"
 [[ ! -e "$app" ]] || { echo 'Use a fresh revision; refusing to overwrite an App' >&2; exit 2; }
 export GMGN_UNITY_BUILD_PATH="$app"
 unity build "$repo_root/apps/unity-player" \

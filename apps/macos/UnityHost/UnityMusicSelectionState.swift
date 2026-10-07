@@ -25,3 +25,17 @@ enum UnityMusicPageBoundary {
             && (returnedCount == 0 || offset + returnedCount <= total)
     }
 }
+
+enum UnityMusicTrackSelection {
+    /// A supplied identity must match the requested slot. Unknown tracks never
+    /// silently resume another song; ambiguous IDs require an explicit slot.
+    static func resolve(ids: [String], trackID: String?, slotIndex: Int?) -> Int? {
+        if let index = slotIndex {
+            guard ids.indices.contains(index), trackID == nil || ids[index] == trackID else { return nil }
+            return index
+        }
+        guard let id = trackID else { return nil }
+        let matches = ids.indices.filter { ids[$0] == id }
+        return matches.count == 1 ? matches[0] : nil
+    }
+}

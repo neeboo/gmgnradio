@@ -32,6 +32,8 @@ let productionSources: [(dir: URL, name: String)] = [
     (resolverRoot, "ScreenLinkHelperLocator.swift"),
     (resolverRoot, "ScreenLinkResolverService.swift"),
     (nativeRoot, "NativeScreenMediaDescriptor.swift"),
+    (nativeRoot, "ScreenMediaCacheClient.swift"),
+    (root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence"), "TaskdHTTPTransport.swift"),
     (nativeRoot, "ScreenLinkAssetLoader.swift"),
     (nativeRoot, "NativeLinkPlayer.swift"),
     (nativeRoot, "WorldScreenNativeVideoRegistry.swift"),
@@ -54,17 +56,40 @@ import Metal
 // MARK: 离线判据
 
 /// 受控的假解析器：按 `pageURL` 给（延迟, 回执）。用来驱动"换片 / 停 / 删"的作废判据。
-final class ScriptedFakeResolver: ScreenLinkResolving, @unchecked Sendable {
+final class ScriptedFakeResolver: ScreenMediaCaching, @unchecked Sendable {
     struct Entry: Sendable {
         let delay: Duration
         let outcome: ScreenLinkResolution
+        var queued: Bool = false
     }
     private let script: [String: Entry]
+    private let requestLock = NSLock()
+    private var recordedHeights: [Int] = []
+    private var recordedReleases: [String] = []
+    private var recordedCancels: [String] = []
+    var heights: [Int] { requestLock.withLock { recordedHeights } }
+    var releases: [String] { requestLock.withLock { recordedReleases } }
+    var cancels: [String] { requestLock.withLock { recordedCancels } }
     init(script: [String: Entry]) { self.script = script }
-    func resolve(_ request: ScreenLinkRequest) async -> ScreenLinkResolution {
-        guard let entry = script[request.pageURL] else { return .failed(.unsupportedSite("")) }
+    func prepare(pageURL: String, maxHeight: Int, consumerID: String) async throws -> ScreenMediaCacheStatus {
+        requestLock.withLock { recordedHeights.append(maxHeight) }
+        guard let entry = script[pageURL] else { throw ScreenMediaCacheError.invalidResponse }
         try? await Task.sleep(for: entry.delay)
-        return entry.outcome
+        if entry.queued { return ScreenMediaCacheStatus(cacheKey: pageURL, state: .queued, descriptor: nil, errorCode: nil) }
+        switch entry.outcome {
+        case let .resolved(value):
+            return ScreenMediaCacheStatus(cacheKey: pageURL, state: .ready,
+                descriptor: NativeScreenMediaDescriptor(resolution: value), errorCode: nil)
+        case .failed:
+            return ScreenMediaCacheStatus(cacheKey: pageURL, state: .failed, descriptor: nil, errorCode: "media_cache_failed")
+        }
+    }
+    func status(cacheKey: String) async throws -> ScreenMediaCacheStatus { throw ScreenMediaCacheError.invalidResponse }
+    func release(cacheKey: String, consumerID: String) async throws {
+        requestLock.withLock { recordedReleases.append(cacheKey) }
+    }
+    func cancel(cacheKey: String, consumerID: String) async throws {
+        requestLock.withLock { recordedCancels.append(cacheKey) }
     }
 }
 
@@ -89,6 +114,72 @@ func runOfflineChecks() async -> Int32 {
     func expect(_ condition: Bool, _ message: String) {
         print(condition ? "PASS \(message)" : "FAIL \(message)")
         if !condition { failures += 1 }
+    }
+    let canonical = "https://www.youtube.com/watch?v=0w-nL_Qr_Do"
+    expect(ScreenMediaCacheClient.samePage(canonical, "https://youtu.be/0w-nL_Qr_Do?si=share"), "缓存：YouTube分享链接保留同一视频身份")
+    expect(ScreenMediaCacheClient.samePage(canonical, canonical + "&t=12"), "缓存：跟踪及播放时间参数不改变视频身份")
+    expect(ScreenMediaCacheClient.samePage("https://www.youtube.com/watch?v=xc7yzjCwH5g", "https://www.youtube.com/watch?v=xc7yzjCwH5g&list=RDNrsQHYM9hT4&index=2"), "缓存：用户实际播放列表链接匹配当前视频回执")
+    expect(!ScreenMediaCacheClient.samePage(canonical, "https://youtu.be/abcdefghijk"), "缓存：拒绝不同视频回执")
+    expect(!ScreenMediaCacheClient.samePage(canonical, "https://evil.invalid/watch?v=0w-nL_Qr_Do"), "缓存：拒绝未授权站点")
+    expect(!ScreenMediaCacheClient.samePage("https://www.bilibili.com/video/BV1234567890?p=1", "https://m.bilibili.com/video/BV1234567890?p=2"), "缓存：不同分P保留身份隔离")
+
+    // The audio item may retain its tap after the owning player is stopped/released.
+    // Exercise actual MTAudioProcessingTap init/finalize without any network or playback.
+    do {
+        weak var weakSampler: NativeAudioSampleTap?
+        autoreleasepool {
+        let asset = AVMutableComposition()
+        let track = asset.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)!
+        let item = AVPlayerItem(asset: asset)
+        var sampler: NativeAudioSampleTap? = NativeAudioSampleTap()
+        weakSampler = sampler
+        sampler!.install(on: item, track: track)
+        expect(sampler!.isAttached, "离线：实际音频 tap 创建成功")
+        sampler = nil
+        expect(weakSampler != nil, "离线：owner释放后后台 tap 仍保活采样器")
+        item.audioMix = nil
+        }
+        try? await Task.sleep(for: .milliseconds(100))
+        expect(weakSampler == nil, "离线：tap finalize 释放采样器，没有额外保活泄漏")
+        let item = AVPlayerItem(asset: AVMutableComposition())
+        var unavailable: NativeAudioSampleTap? = NativeAudioSampleTap()
+        weak var weakUnavailable = unavailable
+        unavailable!.install(on: item, track: nil)
+        unavailable = nil
+        expect(weakUnavailable == nil, "离线：未创建 tap 的失败路径不增加 sampler retain")
+        let failingAsset = AVMutableComposition()
+        let failingTrack = failingAsset.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)!
+        var failingSampler: NativeAudioSampleTap? = NativeAudioSampleTap()
+        weak var weakFailingSampler = failingSampler
+        failingSampler!.install(on: item, track: failingTrack, allocator: kCFAllocatorNull)
+        expect(!failingSampler!.isAttached && failingSampler!.installDetail.hasPrefix("create_failed:"),
+            "离线：实际tap分配失败路径被记录")
+        failingSampler = nil
+        expect(weakFailingSampler == nil, "离线：tap创建失败未保活sampler")
+    }
+    if let fixture = ProcessInfo.processInfo.environment["GMGN_NATIVE_LINK_LIFECYCLE_FIXTURE"],
+       let device = MTLCreateSystemDefaultDevice() {
+        let file = URL(fileURLWithPath: fixture).absoluteString
+        let streams = [
+            NativeScreenMediaStream(url: file, formatID: "fixture-video", headers: [:], isVideo: true, isAudio: false, isManifest: false),
+            NativeScreenMediaStream(url: file, formatID: "fixture-audio", headers: [:], isVideo: false, isAudio: true, isManifest: false)
+        ]
+        let descriptor = NativeScreenMediaDescriptor(pageURL: "fixture", title: "fixture", site: .youtube,
+            isLive: false, streams: streams, note: "offline composition lifecycle")
+        let player = NativeLinkPlayer(device: device, descriptor: descriptor)!
+        for cycle in 0..<2 {
+            player.start()
+            let deadline = Date().addingTimeInterval(5)
+            let priorFrames = player.decodedFrameCount
+            while player.decodedFrameCount < priorFrames + 10 && Date() < deadline {
+                _ = player.copyFrameTexture()
+                try? await Task.sleep(for: .milliseconds(33))
+            }
+            expect(player.retainedSourceAssetCount == 2 && player.decodedFrameCount >= priorFrames + 10,
+                "离线：分轨播放保活两份实际源资产并连续供帧 cycle=\(cycle)")
+            player.stop()
+            expect(player.retainedSourceAssetCount == 0, "离线：stop释放分轨源资产 cycle=\(cycle)")
+        }
     }
     let video = ScreenLinkStream(
         url: "https://media.example/v?expire=9999999999", formatID: "137", container: "mp4",
@@ -143,7 +234,7 @@ func runOfflineChecks() async -> Int32 {
         ),
     ])
     let stopCoordinator = NativeScreenPlaybackCoordinator(
-        resolver: stopResolver, registry: registry, device: device
+        cache: stopResolver, registry: registry, device: device
     )
     let stopTask = Task { @MainActor in
         await stopCoordinator.play(
@@ -151,13 +242,16 @@ func runOfflineChecks() async -> Int32 {
         )
     }
     try? await Task.sleep(for: .milliseconds(150))
+    _ = await stopCoordinator.play(objectID: "tv-stop", pageURL: "https://www.twitch.tv/a", quadProvider: { nil })
     stopCoordinator.stop("tv-stop")
     _ = await stopTask.value
+    expect(stopResolver.heights == [2160], "离线：缓存请求保持 2160 高度目标")
     try? await Task.sleep(for: .milliseconds(800))
     expect(stopCoordinator.snapshot(for: "tv-stop")?.state == .stopped,
         "离线：stop 之后回来的过期解析结果不许发布（状态仍是 stopped，实测 \(String(describing: stopCoordinator.snapshot(for: "tv-stop")?.state))）")
     expect(stopCoordinator.snapshot(for: "tv-stop")?.isPlaying == false,
         "离线：stop 之后 isPlaying 仍为 false")
+    expect(stopResolver.releases == ["https://www.twitch.tv/a"], "离线：stop 后晚到 ready 的 pin 只释放一次")
 
     // ② 删电视之后回来的结果不许复活会话 / 留下取帧登记。
     let removeResolver = ScriptedFakeResolver(script: [
@@ -166,7 +260,7 @@ func runOfflineChecks() async -> Int32 {
         ),
     ])
     let removeCoordinator = NativeScreenPlaybackCoordinator(
-        resolver: removeResolver, registry: registry, device: device
+        cache: removeResolver, registry: registry, device: device
     )
     let removeTask = Task { @MainActor in
         await removeCoordinator.play(
@@ -181,6 +275,22 @@ func runOfflineChecks() async -> Int32 {
         "离线：删电视之后回来的过期解析结果不许复活会话")
     expect(!registry.frames().contains { $0.objectID == "tv-remove" },
         "离线：删电视之后渲染器取帧表里也不许留下它")
+    expect(removeResolver.releases == ["https://www.twitch.tv/a"], "离线：remove 后晚到 ready 的 pin 被释放")
+
+    let queuedCache = ScriptedFakeResolver(script: [
+        "https://www.youtube.com/watch?v=abcdefghijk": .init(delay: .milliseconds(600),
+            outcome: .failed(.drmProtected), queued: true),
+    ])
+    let queuedCoordinator = NativeScreenPlaybackCoordinator(cache: queuedCache, registry: registry, device: device)
+    let queuedTask = Task { @MainActor in
+        await queuedCoordinator.play(objectID: "tv-queued", pageURL: "https://www.youtube.com/watch?v=abcdefghijk", quadProvider: { nil })
+    }
+    try? await Task.sleep(for: .milliseconds(100))
+    queuedCoordinator.stop("tv-queued")
+    _ = await queuedTask.value
+    try? await Task.sleep(for: .milliseconds(100))
+    expect(queuedCache.releases.count == 1 && queuedCache.cancels.count == 1,
+        "离线：stop 后晚到 queued 回执释放 owner 并取消无消费者任务")
 
     // ③ 换片：旧片（慢）先发起、新片（快）后发起；旧片的失败**不许**覆盖新片。
     let swapResolver = ScriptedFakeResolver(script: [
@@ -190,7 +300,7 @@ func runOfflineChecks() async -> Int32 {
         ),
     ])
     let swapCoordinator = NativeScreenPlaybackCoordinator(
-        resolver: swapResolver, registry: registry, device: device
+        cache: swapResolver, registry: registry, device: device
     )
     let slowTask = Task { @MainActor in
         await swapCoordinator.play(
@@ -319,21 +429,30 @@ func scrubURLs(_ text: String) -> String {
     return String(scrubbed.suffix(300))
 }
 
+@MainActor var cachedResolvedValue: ScreenLinkResolutionValue?
+
 @MainActor
-func runLive(pageURL: String, observationSeconds: Double) -> Int32 {
+func runLive(pageURL: String, observationSeconds: Double, audioSamplingOverride: Bool? = nil, videoOnlyOverride: Bool? = nil) -> Int32 {
     guard let device = MTLCreateSystemDefaultDevice() else {
         print("{\"verdict\":\"FAILED\",\"reason\":\"no_metal_device\"}")
         return 2
     }
     // 受控定位：只认显式开发覆盖（`GMGN_SCREEN_LINK_HELPER`），不查 PATH。
+    let diagnosticDeno = ProcessInfo.processInfo.environment["GMGN_SCREEN_LINK_DENO"]
     let resolver = ScreenLinkResolverService.live(
-        bundleHelpersDirectory: nil,
+        bundleHelpersDirectory: ProcessInfo.processInfo.environment["GMGN_SCREEN_LINK_HELPERS_DIRECTORY"],
         managedHelpersDirectory: nil,
-        allowDevOverride: true
+        allowDevOverride: true,
+        javascriptRuntimeName: diagnosticDeno == nil ? nil : "deno",
+        javascriptRuntimePath: diagnosticDeno
     )
     // 小高度：探针只证明"真解码出帧"，不下载 4K。
-    let request = ScreenLinkRequest(pageURL: pageURL, preferredMaximumHeight: 360, timeout: .seconds(60))
-    guard let resolution = pump(timeout: 75, { await resolver.resolve(request) }) else {
+    let diagnosticHeight = ProcessInfo.processInfo.environment["GMGN_SCREEN_LINK_MAX_HEIGHT"]
+        .flatMap(Int.init) ?? 360
+    let request = ScreenLinkRequest(pageURL: pageURL, preferredMaximumHeight: diagnosticHeight, timeout: .seconds(120))
+    let resolved = cachedResolvedValue.map { ScreenLinkResolution.resolved($0) }
+        ?? pump(timeout: 135, { await resolver.resolve(request) })
+    guard let resolution = resolved else {
         print("{\"verdict\":\"FAILED\",\"reason\":\"resolve_timeout\"}")
         return 2
     }
@@ -341,6 +460,8 @@ func runLive(pageURL: String, observationSeconds: Double) -> Int32 {
         print("{\"verdict\":\"FAILED\",\"reason\":\"resolve_failed\",\"failure\":\"\(String(describing: resolution.failure))\"}")
         return 2
     }
+    cachedResolvedValue = value
+    FileHandle.standardError.write(Data("PROBE resolved format=\(value.video.formatID) tapOverride=\(audioSamplingOverride.map(String.init) ?? "default") videoOnly=\(videoOnlyOverride.map(String.init) ?? "default")\n".utf8))
     // 真机 2026-10-03 实测：一个签名地址只允许约 5 次 Range 请求（~20 MB），之后 403。
     // 所以**直链**走"受控辅助程序取到临时文件再本地解码"；**HLS / 直播**（Twitch 那一类）
     // 的清单本身允许多次请求，`AVPlayer` 原生支持，直接流式播放。
@@ -349,7 +470,7 @@ func runLive(pageURL: String, observationSeconds: Double) -> Int32 {
     try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
     let descriptor: NativeScreenMediaDescriptor
-    if value.isLive || value.video.isManifest {
+    if value.isLive || value.video.isManifest || ProcessInfo.processInfo.environment["GMGN_NATIVE_LINK_DIRECT_STREAM"] == "1" {
         descriptor = NativeScreenMediaDescriptor(resolution: value)
     } else {
         guard let helper = ProcessInfo.processInfo.environment["GMGN_SCREEN_LINK_HELPER"],
@@ -366,16 +487,32 @@ func runLive(pageURL: String, observationSeconds: Double) -> Int32 {
         }
         descriptor = local
     }
-    guard let player = NativeLinkPlayer(device: device, descriptor: descriptor) else {
+    // Diagnostic-only isolation of the video asset; never changes production stream selection.
+    let videoOnly = videoOnlyOverride ?? (ProcessInfo.processInfo.environment["GMGN_NATIVE_LINK_VIDEO_ONLY"] == "1")
+    let playbackDescriptor = videoOnly ? NativeScreenMediaDescriptor(
+        pageURL: descriptor.pageURL, title: descriptor.title, site: descriptor.site,
+        isLive: descriptor.isLive, streams: descriptor.streams.filter { $0.isVideo }, note: descriptor.note
+    ) : descriptor
+    guard let player = NativeLinkPlayer(device: device, descriptor: playbackDescriptor, audioSamplingOverride: audioSamplingOverride) else {
         print("{\"verdict\":\"FAILED\",\"reason\":\"player_init\"}")
         return 2
     }
     player.start()
+    // Track loading/network preparation is separate from the playback observation window.
+    let preparationDeadline = Date().addingTimeInterval(90)
+    while player.itemStatus == -1 && player.lastErrorDescription == nil && Date() < preparationDeadline {
+        RunLoop.current.run(until: Date().addingTimeInterval(1.0 / 30.0))
+    }
     var timeAdvanced = 0.0
     var firstSeconds: Double?
+    var observedFailure = false
     let deadline = Date().addingTimeInterval(observationSeconds)
     while Date() < deadline {
         _ = player.copyFrameTexture()
+        if player.itemStatus == AVPlayerItem.Status.failed.rawValue || player.lastErrorDescription != nil
+            || !player.sourceHTTPFailureStatuses.isEmpty {
+            observedFailure = true
+        }
         let seconds = player.currentSeconds
         if firstSeconds == nil, seconds > 0 { firstSeconds = seconds }
         timeAdvanced = max(timeAdvanced, seconds - (firstSeconds ?? 0))
@@ -400,14 +537,24 @@ func runLive(pageURL: String, observationSeconds: Double) -> Int32 {
     let waitingReasonBeforeStop = player.waitingReason
     let likelyToKeepUpBeforeStop = player.isPlaybackLikelyToKeepUp
     let bufferEmptyBeforeStop = player.isPlaybackBufferEmpty
+    let sourceHTTPFailuresBeforeStop = player.sourceHTTPFailureStatuses
+    let outputMappedSeconds = player.outputHostMappedSeconds
+    let loadedRanges = player.loadedTimeRangeSeconds
+    let retainedSourceAssetCount = player.retainedSourceAssetCount
     player.stop()
+    let releasedSourcesOnStop = player.retainedSourceAssetCount == 0
     // 画面判据与声音判据分开：HLS（`videoIsManifest`）平台**不支持**
     // `AVPlayerItem.audioMix`（Apple 文档原文："An audio mix can only be used with
     // file-based media and is not supported for use with media served using HTTP Live
     // Streaming."），所以 HLS 上 tap 一定挂不上。只要画面真的在放，就不能把
     // "平台不支持声音采样"误报成"播放停滞"，也不能反过来把没采样当声音通过。
-    let videoPassed = value.hasAudio && player.hasAudio && player.decodedFrameCount >= 2
-        && player.gpuCopyCount >= 2 && timeAdvanced >= 0.5
+    let requiredAdvance = min(20, max(0.5, observationSeconds - 5))
+    // A running audio clock and two initial video frames do not establish continuing video output.
+    let requiredFrames = max(2, Int(requiredAdvance * 10))
+    let videoPassed = !observedFailure && errorBeforeStop.isEmpty
+        && itemStatusBeforeStop == AVPlayerItem.Status.readyToPlay.rawValue
+        && rateBeforeStop > 0 && value.hasAudio && player.hasAudio && player.decodedFrameCount >= requiredFrames
+        && player.gpuCopyCount >= requiredFrames && timeAdvanced >= requiredAdvance
     let audioPassed = audioTapAttached && sampledAudioBuffers > 0 && sampledAudioFrames > 0
         && audioPeakAmplitude > 0
     let verdict: String
@@ -420,9 +567,11 @@ func runLive(pageURL: String, observationSeconds: Double) -> Int32 {
     }
     let report: [String: Any] = [
         "verdict": verdict,
+        "diagnosticVideoOnly": videoOnly,
         "site": value.site.rawValue,
         "splitStreams": value.audio != nil,
         "videoFormatID": value.video.formatID,
+        "preferredMaximumHeight": diagnosticHeight,
         "videoIsManifest": value.video.isManifest,
         "videoHeaderCount": value.video.headers.count,
         "audioHeaderCount": value.audio?.headers.count ?? -1,
@@ -439,10 +588,23 @@ func runLive(pageURL: String, observationSeconds: Double) -> Int32 {
         "sampledAudioFrames": sampledAudioFrames,
         "audioPeakAmplitude": Double(audioPeakAmplitude),
         "decodedFrames": player.decodedFrameCount,
+        "framePolls": player.framePollCount,
+        "frameNoNew": player.frameNoNewCount,
+        "frameCopyNil": player.frameCopyNilCount,
+        "frameInFlightSkips": player.frameInFlightSkipCount,
+        "lastVideoFrameSeconds": player.lastVideoFrameSeconds.isFinite ? player.lastVideoFrameSeconds : -1,
+        "outputHostMappedSeconds": outputMappedSeconds.isFinite ? outputMappedSeconds : -1,
+        "loadedTimeRanges": loadedRanges,
+        "retainedSourceAssets": retainedSourceAssetCount,
+        "releasedSourcesOnStop": releasedSourcesOnStop,
         "gpuCopies": player.gpuCopyCount,
         "pixelWidth": player.pixelWidth,
         "pixelHeight": player.pixelHeight,
         "timeAdvancedSeconds": timeAdvanced,
+        "requiredAdvanceSeconds": requiredAdvance,
+        "requiredFrames": requiredFrames,
+        "observedFailure": observedFailure,
+        "sourceHTTPFailureStatuses": sourceHTTPFailuresBeforeStop,
         "itemStatus": itemStatusBeforeStop,
         "timeControlStatus": timeControlStatusBeforeStop,
         "waitingReason": waitingReasonBeforeStop,
@@ -457,8 +619,134 @@ func runLive(pageURL: String, observationSeconds: Double) -> Int32 {
     if let data = try? JSONSerialization.data(withJSONObject: report, options: [.sortedKeys]),
        let json = String(data: data, encoding: .utf8) {
         print(json)
+        fflush(stdout)
     }
     return verdict == "FAILED_OR_STALLED" ? 2 : 0
+}
+
+@MainActor
+func runPlaylistFailureRaces(cache:any ScreenMediaCaching,endpoint:String) async -> Bool {
+    let registry=WorldScreenNativeVideoRegistry()
+    let coordinator=NativeScreenPlaybackCoordinator(cache:cache,registry:registry)
+    _ = await coordinator.play(objectID:"advance-failure",pageURL:"https://youtube.com/watch?v=bbbbbbbbbbb&list=PLadvanceFail",quadProvider:{nil})
+    let deadline=ContinuousClock.now + .seconds(12)
+    while ContinuousClock.now < deadline {
+        if case .failed = coordinator.snapshot(for:"advance-failure")?.state {break}
+        try? await Task.sleep(for:.milliseconds(50))
+    }
+    let advanceFailed:Bool
+    if case .failed = coordinator.snapshot(for:"advance-failure")?.state {advanceFailed=true} else {advanceFailed=false}
+    let advanceStopped=advanceFailed && coordinator.metrics(for:"advance-failure") == nil && registry.isEmpty
+    coordinator.remove("advance-failure")
+    guard let file=ProcessInfo.processInfo.environment["GMGN_PLAYLIST_FIXTURE_FILE"] else {return false}
+    let descriptor=NativeScreenMediaDescriptor(pageURL:"https://www.youtube.com/watch?v=bbbbbbbbbbb",title:"failure race",site:.youtube,isLive:false,
+        streams:[NativeScreenMediaStream(url:URL(fileURLWithPath:file).absoluteString,formatID:"file",headers:[:],isVideo:true,isAudio:true,isManifest:false)],note:"isolated fault injection")
+    let delayed=DelayedReadyFailureCache(descriptor:descriptor)
+    let failing=NativeScreenPlaybackCoordinator(cache:delayed,registry:registry)
+    _ = await failing.play(objectID:"item-failure",pageURL:descriptor.pageURL,quadProvider:{nil})
+    let pollingDeadline=ContinuousClock.now + .seconds(5)
+    while !(await delayed.statusStarted),ContinuousClock.now < pollingDeadline {try? await Task.sleep(for:.milliseconds(20))}
+    let oldCallback=failing.sessions["item-failure"]?.player?.onStateChange
+    let oldEnd=failing.sessions["item-failure"]?.player?.onPlaybackEnded
+    oldCallback?(.failed(.noVideoTrack))
+    // Deliver the already-captured pre-failure frame callback and late cache ready.
+    oldCallback?(.playing)
+    oldEnd?()
+    try? await Task.sleep(for:.seconds(1))
+    let itemFailed:Bool
+    if case .failed = failing.snapshot(for:"item-failure")?.state {itemFailed=true} else {itemFailed=false}
+    let itemStopped=itemFailed && failing.metrics(for:"item-failure") == nil && registry.isEmpty
+        && failing.snapshot(for:"item-failure")?.isPlaying == false && oldCallback != nil
+    failing.remove("item-failure")
+    print("PLAYLIST_RACES advance_rpc_failure_stopped=\(advanceStopped) item_failure_late_ready_frame_stopped=\(itemStopped)")
+    return advanceStopped && itemStopped
+}
+
+actor DelayedReadyFailureCache: ScreenMediaCaching {
+    let descriptor:NativeScreenMediaDescriptor
+    var statusStarted=false
+    init(descriptor:NativeScreenMediaDescriptor) {self.descriptor=descriptor}
+    func prepare(pageURL:String,maxHeight:Int,consumerID:String) async throws -> ScreenMediaCacheStatus {
+        ScreenMediaCacheStatus(cacheKey:"late-ready",state:.downloading,descriptor:descriptor,errorCode:nil)
+    }
+    func status(cacheKey:String) async throws -> ScreenMediaCacheStatus {
+        statusStarted=true
+        try? await Task.sleep(for:.milliseconds(800))
+        return ScreenMediaCacheStatus(cacheKey:cacheKey,state:.ready,descriptor:descriptor,errorCode:nil)
+    }
+    func release(cacheKey:String,consumerID:String) async throws {}
+    func cancel(cacheKey:String,consumerID:String) async throws {}
+}
+
+@MainActor
+func runCachedPlaylist(pageURL:String,endpoint:String) async -> Int32 {
+    let cache=ScreenMediaCacheClient(endpointFile:URL(fileURLWithPath:endpoint))
+    let coordinator=NativeScreenPlaybackCoordinator(cache:cache,registry:WorldScreenNativeVideoRegistry())
+    _ = await coordinator.play(objectID:"playlist-probe",pageURL:pageURL,quadProvider:{nil})
+    let deadline=ContinuousClock.now + .seconds(20)
+    var first=false,advanced=false,silent=true
+    while ContinuousClock.now < deadline {
+        let session=coordinator.snapshot(for:"playlist-probe"),metric=coordinator.metrics(for:"playlist-probe")
+        if let metric,metric.decodedFrames > 0 {silent = silent && metric.isMuted && metric.volume == 0}
+        if session?.playlist?.currentIndex == 1,(metric?.decodedFrames ?? 0) >= 5 {first=true}
+        if first,session?.playlist?.currentIndex == 2,(metric?.decodedFrames ?? 0) >= 5 {advanced=true;break}
+        try? await Task.sleep(for:.milliseconds(50))
+    }
+    coordinator.stop("playlist-probe")
+    try? await Task.sleep(for:.seconds(3))
+    let stopped=coordinator.snapshot(for:"playlist-probe")?.state == .stopped
+    let late=Task { await coordinator.play(objectID:"late-playlist",pageURL:"https://youtube.com/playlist?list=PLlate",quadProvider:{nil}) }
+    try? await Task.sleep(for:.milliseconds(100))
+    coordinator.stop("late-playlist")
+    _ = await late.value
+    try? await Task.sleep(for:.milliseconds(300))
+    let lateStopped=coordinator.snapshot(for:"late-playlist")?.state == .stopped
+    let races=await runPlaylistFailureRaces(cache:cache,endpoint:endpoint)
+    print("PLAYLIST_PROBE first_requested_video=\(first) actual_ended_advanced=\(advanced) stopped=\(stopped) late_import_stopped=\(lateStopped) failure_races=\(races) silent=\(silent) verdict=\(first && advanced && stopped && lateStopped && races && silent ? "PASS" : "FAIL")")
+    return first && advanced && stopped && lateStopped && races && silent ? 0 : 2
+}
+
+@MainActor
+func runCached(pageURL: String, endpoint: String, observationSeconds: Double) async -> Int32 {
+    let cache = ScreenMediaCacheClient(endpointFile: URL(fileURLWithPath: endpoint))
+    let registry = WorldScreenNativeVideoRegistry()
+    let coordinator = NativeScreenPlaybackCoordinator(cache: cache, registry: registry, device: MTLCreateSystemDefaultDevice())
+    let began = ContinuousClock.now
+    _ = await coordinator.play(objectID: "cache-probe", pageURL: pageURL, quadProvider: { nil })
+    let firstFrameLimit = Double(ProcessInfo.processInfo.environment["GMGN_CACHE_FIRST_FRAME_TIMEOUT"] ?? "630") ?? 630
+    let readyDeadline = ContinuousClock.now + .seconds(firstFrameLimit)
+    while coordinator.metrics(for: "cache-probe")?.decodedFrames ?? 0 == 0, ContinuousClock.now < readyDeadline {
+        if case .failed = coordinator.snapshot(for: "cache-probe")?.state { break }
+        try? await Task.sleep(for: .milliseconds(100))
+    }
+    let initialSeconds = coordinator.metrics(for: "cache-probe")?.currentSeconds ?? 0
+    if (coordinator.metrics(for: "cache-probe")?.decodedFrames ?? 0) > 0 {
+        let firstFrameCacheState = coordinator.snapshot(for: "cache-probe")?.cacheState?.rawValue ?? "missing"
+        let firstFrameMetrics = coordinator.metrics(for: "cache-probe")
+        print("CACHE_FIRST_FRAME elapsed=\(began.duration(to: .now)) cacheState=\(firstFrameCacheState) frames=\(firstFrameMetrics?.decodedFrames ?? 0) gpuCopies=\(firstFrameMetrics?.gpuCopies ?? 0)")
+        fflush(stdout)
+    }
+    if (coordinator.metrics(for: "cache-probe")?.decodedFrames ?? 0) > 0,
+       !ScreenMediaCacheClient.isYouTubePlaylist(pageURL) {
+        _ = await coordinator.play(objectID: "cache-probe", pageURL: pageURL, quadProvider: { nil })
+    }
+    try? await Task.sleep(for: .seconds(observationSeconds))
+    let metric = coordinator.metrics(for: "cache-probe")
+    let liveFixture = ProcessInfo.processInfo.environment["GMGN_CACHE_LIVE_FIXTURE"] == "1"
+    let silenceRequired = ProcessInfo.processInfo.environment["GMGN_NATIVE_LINK_SILENT"] == "1"
+    let audioValid = liveFixture ? (metric?.isLive == true && metric?.hasAudio == true) :
+        (metric?.sampledAudioFrames ?? 0) > 0 || (metric?.isManifest == true && metric?.hasAudio == true
+            && metric?.audioTapInstallDetail == "unsupported:hls-manifest")
+    let silent = !silenceRequired || (metric?.isMuted == true && metric?.volume == 0)
+    let advanced = (metric?.currentSeconds ?? 0) - initialSeconds
+    let passed = (metric?.decodedFrames ?? 0) >= 200 && (metric?.gpuCopies ?? 0) >= 200 && audioValid && silent
+        && advanced >= 19
+    print("CACHE_PROBE frames=\(metric?.decodedFrames ?? 0) gpuCopies=\(metric?.gpuCopies ?? 0) audioFrames=\(metric?.sampledAudioFrames ?? 0) advanced=\(advanced) silent=\(silent) live=\(metric?.isLive ?? false) cacheState=\(coordinator.snapshot(for: "cache-probe")?.cacheState?.rawValue ?? "missing") verdict=\(passed ? "PASS" : "FAIL")")
+    print("CACHE_PROBE itemStatus=\(metric?.itemStatus ?? -1) timeControl=\(metric?.timeControlStatus ?? -1) hasAudio=\(metric?.hasAudio ?? false) bufferEmpty=\(metric?.isPlaybackBufferEmpty ?? true) bufferFull=\(metric?.isPlaybackBufferFull ?? false)")
+    print("CACHE_PROBE preparationPhase=\(metric?.preparationPhase ?? "missing") httpStatuses=\(metric?.sourceHTTPFailureStatuses ?? []) isManifest=\(metric?.isManifest ?? false)")
+    coordinator.stop("cache-probe")
+    try? await Task.sleep(for: .milliseconds(500))
+    return passed ? 0 : 2
 }
 
 @main struct Probe {
@@ -468,6 +756,17 @@ func runLive(pageURL: String, observationSeconds: Double) -> Int32 {
             let pageURL = arguments[1]
             let seconds = arguments.count >= 3 ? (Double(arguments[2]) ?? 20) : 20
             let clamped = min(max(seconds, 5), 180)
+            if let endpoint = ProcessInfo.processInfo.environment["GMGN_MEDIA_CACHE_ENDPOINT"] {
+                if ProcessInfo.processInfo.environment["GMGN_CACHE_PLAYLIST_FIXTURE"] == "1" {
+                    exit(await runCachedPlaylist(pageURL:pageURL,endpoint:endpoint))
+                }
+                exit(await runCached(pageURL: pageURL, endpoint: endpoint, observationSeconds: clamped))
+            }
+            if ProcessInfo.processInfo.environment["GMGN_NATIVE_LINK_COMPARE_VARIANTS"] == "1" {
+                _ = runLive(pageURL: pageURL, observationSeconds: clamped, audioSamplingOverride: true, videoOnlyOverride: false)
+                _ = runLive(pageURL: pageURL, observationSeconds: clamped, audioSamplingOverride: false, videoOnlyOverride: false)
+                exit(runLive(pageURL: pageURL, observationSeconds: clamped, audioSamplingOverride: false, videoOnlyOverride: true))
+            }
             exit(runLive(pageURL: pageURL, observationSeconds: clamped))
         } else {
             exit(await runOfflineChecks())
@@ -487,6 +786,25 @@ for source in productionSources {
     try FileManager.default.copyItem(
         at: source.dir.appendingPathComponent(source.name), to: destination
     )
+    if source.name == "NativeScreenPlaybackCoordinator.swift" {
+        // Access-only fixture seam in a temporary copy, not a production API or behavior change.
+        let original=try String(contentsOf:destination,encoding:.utf8)
+        guard original.components(separatedBy:"private struct Session").count == 2,
+              original.components(separatedBy:"private var sessions:").count == 2 else {fatalError("Session fixture seam changed")}
+        try original.replacingOccurrences(of:"private struct Session",with:"struct Session")
+            .replacingOccurrences(of:"private var sessions:",with:"var sessions:")
+            .write(to:destination,atomically:true,encoding:.utf8)
+    }
+    if source.name == "NativeLinkPlayer.swift",
+       ProcessInfo.processInfo.environment["GMGN_NATIVE_LINK_SILENT"] == "1" {
+        let original = try String(contentsOf: destination, encoding: .utf8)
+        let marker = "player.isMuted = false"
+        guard original.components(separatedBy: marker).count == 2 else {
+            fatalError("Silent fixture requires exactly one native player mute installation point")
+        }
+        try original.replacingOccurrences(of: marker, with: "player.isMuted = true; player.volume = 0")
+            .write(to: destination, atomically: true, encoding: .utf8)
+    }
     sources.append(destination.path)
 }
 let program = temporary.appendingPathComponent("Probe.swift")
@@ -513,6 +831,11 @@ guard compile.status == 0 else {
     exit(70)
 }
 let forwarded = Array(CommandLine.arguments.dropFirst())
-let run = try runCapturing(binary.path, forwarded)
-FileHandle.standardOutput.write(Data(run.output.utf8))
-exit(run.status)
+let run = Process()
+run.executableURL = binary
+run.arguments = forwarded
+run.standardOutput = FileHandle.standardOutput
+run.standardError = FileHandle.standardError
+try run.run()
+run.waitUntilExit()
+exit(run.terminationStatus)

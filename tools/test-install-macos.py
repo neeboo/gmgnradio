@@ -8,7 +8,8 @@ import plistlib
 from pathlib import Path
 import tempfile
 import json
-import socket
+import http.server
+import uuid
 import shutil
 import subprocess
 import sys
@@ -190,7 +191,7 @@ class InstallTests(unittest.TestCase):
 
     def test_helper_spawned_during_app_stop_is_stopped(self):
         self.runtime.rows = [(1, str(self.dest / 'Contents/MacOS/gmgn radio'))]
-        self.runtime.after_stop = [(2, f'{self.dest}/Contents/Helpers/gmgn-taskd --root {self.root} --socket {self.root}/taskd.sock --concurrency 2')]
+        self.runtime.after_stop = [(2, f'{self.dest}/Contents/Helpers/gmgn-taskd --root {self.root} --endpoint-file {self.root}/taskd.endpoint.json --concurrency 2')]
         self.run_install()
         self.assertEqual(self.runtime.events[:2], [('stop', 1), ('stop', 2)])
 
@@ -204,75 +205,67 @@ class InstallTests(unittest.TestCase):
         self.run_install()
         self.assertTrue((self.dest / 'Contents/link').is_symlink())
 
-    def test_probe_checks_actual_socket_response(self):
+    def test_probe_checks_actual_authenticated_http_response(self):
         class Child:
             pid = os.getpid()
+            args = ['/test/gmgn-taskd']
             def poll(self):
                 return None
         secret = 'fixture-secret'
         sensitive = 'https://memory.example/v1/status?token=fixture-secret&scope=install'
         fixed = module.DAEMON_VERIFY_FAILED
         cases = {
-            # A well-formed reply with the expected error shape is the only
-            # outcome that verifies the probe.
-            'invalid_memory_status': (
-                lambda rid: {'id': rid, 'error': {'code': 'invalid_memory_status'}}, None),
-            # Any other reply shape is a fixed, sanitized failure that never
-            # echoes the service payload.
-            'unknown_method': (
-                lambda rid: {'id': rid, 'error': {'code': 'unknown_method'}}, fixed),
-            'error_array': (lambda rid: {'id': rid, 'error': []}, fixed),
-            'error_null': (lambda rid: {'id': rid, 'error': None}, fixed),
-            'response_array': (lambda rid: [], fixed),
-            'response_null': (lambda rid: None, fixed),
-            'malformed_frame': (lambda rid: b'not-a-json-frame\n', fixed),
-            'unknown_method_with_secret': (
-                lambda rid: {'id': rid, 'error': {
-                    'code': 'unknown_method', 'message': f'{secret} {sensitive}'}}, fixed),
-            'wrong_peer': (
-                lambda rid: {'id': rid, 'error': {'code': 'invalid_memory_status'}},
-                'different process'),
+            'http_health': ({'version': 2, 'transport': 'http'}, None),
+            'old_health': ({'version': 1, 'transport': 'tcp'}, fixed),
+            'response_array': ([], fixed),
+            'response_null': (None, fixed),
+            'malformed_body': (b'not-json', fixed),
+            'health_with_secret': ({'version': 2, 'transport': sensitive + secret}, fixed),
+            'wrong_peer': ({'version': 2, 'transport': 'http'}, 'different process'),
+            'wrong_command': ({'version': 2, 'transport': 'http'}, 'different process'),
+            'unauthorized': ({'version': 2, 'transport': 'http'}, fixed),
         }
         for name, (reply, expected) in cases.items():
             with self.subTest(case=name):
+                token = str(uuid.uuid4())
+                class Handler(http.server.BaseHTTPRequestHandler):
+                    def log_message(self, *args):
+                        pass
+                    def do_GET(handler):
+                        self.assertEqual(handler.path, '/health')
+                        self.assertEqual(handler.headers['Authorization'], 'Bearer ' + token)
+                        payload = reply if isinstance(reply, bytes) else json.dumps(reply).encode()
+                        handler.send_response(401 if name == 'unauthorized' else 200)
+                        handler.send_header('Content-Length', str(len(payload)))
+                        handler.end_headers()
+                        handler.wfile.write(payload)
+                server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+                thread = threading.Thread(target=server.serve_forever)
+                thread.start()
+                path = Path(self.temp.name) / 'probe.endpoint.json'
+                path.write_text(json.dumps({'version': 2, 'address': '127.0.0.1:' + str(server.server_port), 'token': token}))
                 child = Child()
-                if name == 'wrong_peer':
-                    child.pid += 1
-                path = str(Path(self.temp.name) / 'probe.sock')
+                command = next(iter(module._daemon_commands(Path(child.args[0]), path.parent, path)))
+                rows = [(child.pid, command + (' --foreign' if name == 'wrong_command' else ''))]
+                owners = str(child.pid + (1 if name == 'wrong_peer' else 0)) + '\n'
                 try:
-                    with socket.socket(socket.AF_UNIX) as server:
-                        server.bind(path)
-                        server.listen(1)
-                        def serve():
-                            connection, _ = server.accept()
-                            with connection:
-                                request = json.loads(connection.recv(4096))
-                                self.assertEqual(request['method'], 'memory_status')
-                                self.assertEqual(request['params'], {})
-                                payload = reply(request['id'])
-                                if not isinstance(payload, bytes):
-                                    payload = json.dumps(payload).encode() + b'\n'
-                                connection.sendall(payload)
-                        thread = threading.Thread(target=serve)
-                        thread.start()
-                        try:
-                            if expected is None:
+                    with mock.patch.object(module.Runtime, 'processes', return_value=rows), mock.patch.object(module.subprocess, 'check_output', return_value=owners):
+                        if expected is None:
+                            module.Runtime().verify(child, path, 1)
+                        else:
+                            with self.assertRaises(RuntimeError) as raised:
                                 module.Runtime().verify(child, path, 1)
+                            message = str(raised.exception)
+                            if expected == fixed:
+                                self.assertEqual(fixed, message)
                             else:
-                                with self.assertRaises(RuntimeError) as raised:
-                                    module.Runtime().verify(child, path, 1)
-                                message = str(raised.exception)
-                                if expected == fixed:
-                                    self.assertEqual(fixed, message)
-                                else:
-                                    self.assertIn(expected, message)
-                                for leaked in [secret, 'memory.example', '?token=', 'scope=install']:
-                                    self.assertNotIn(leaked, message)
-                        finally:
-                            thread.join(timeout=2)
+                                self.assertIn(expected, message)
+                            for leaked in [secret, 'memory.example', '?token=', 'scope=install']:
+                                self.assertNotIn(leaked, message)
                 finally:
-                    if os.path.exists(path):
-                        os.unlink(path)
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=2)
 
     def test_real_scoped_process_term_and_identity_recheck(self):
         child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)'])
@@ -303,8 +296,8 @@ class InstallTests(unittest.TestCase):
     def test_scoped_order_without_launching_app(self):
         helper = self.dest / 'Contents/Helpers/gmgn-taskd'
         self.runtime.rows = [(1, str(self.dest / 'Contents/MacOS/gmgn radio')),
-                             (2, f'{helper} --root {self.root} --socket {self.root}/taskd.sock --concurrency 2'),
-                             (3, f'{helper} --root /other --socket /other/taskd.sock --concurrency 2')]
+                             (2, f'{helper} --root {self.root} --endpoint-file {self.root}/taskd.endpoint.json --concurrency 2'),
+                             (3, f'{helper} --root /other --endpoint-file /other/taskd.endpoint.json --concurrency 2')]
         self.run_install()
         self.assertEqual([e[0] for e in self.runtime.events], ['stop', 'stop', 'start', 'verify'])
         self.assertEqual(self.runtime.events[:2], [('stop', 1), ('stop', 2)])

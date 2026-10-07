@@ -80,6 +80,15 @@ func json(_ object: [String: Any]) -> Data {
         let joined = invocation.arguments.joined(separator: " ")
         expect(joined.contains("--ignore-config"), "断言2：不读用户配置（`--ignore-config`）")
         expect(joined.contains("--no-playlist"), "断言2：只处理这一个视频（`--no-playlist`）")
+        expect(invocation.arguments.contains("--no-js-runtimes"),
+            "断言2：清空辅助程序默认 JS 运行时发现，未接受控运行时也不查 PATH")
+        let controlledJS = YtDlpInvocation.make(request: request, executablePath: "/controlled/yt-dlp",
+            javascriptRuntimeName: "deno", javascriptRuntimePath: "/controlled/deno")
+        let resetIndex = controlledJS.arguments.firstIndex(of: "--no-js-runtimes")
+        let explicitIndex = controlledJS.arguments.firstIndex(of: "--js-runtimes")
+        expect(resetIndex != nil && explicitIndex != nil && resetIndex! < explicitIndex!
+            && controlledJS.arguments[explicitIndex! + 1] == "deno:/controlled/deno",
+            "断言2：仅在清空默认运行时后添加显式受控 Deno 路径")
         expect(joined.contains("--no-cache-dir") && joined.contains("--no-update"),
             "断言2：不写缓存、不联网自更新")
         expect(joined.contains("--dump-single-json"), "断言2：只打印信息、不下载")
@@ -89,7 +98,7 @@ func json(_ object: [String: Any]) -> Data {
             expect(!joined.contains(token), "断言2：参数表里没有「\(token)」")
         }
         // 格式选择器：分轨优先、有合流兜底、带上高度上限。
-        expect(YtDlpInvocation.formatSelector(for: request).contains("+ba"),
+        expect(YtDlpInvocation.formatSelector(for: request).contains("+ba") && YtDlpInvocation.formatSelector(for: request).hasPrefix("bv["),
             "断言2：默认走「最佳视频 + 最佳音频」（分轨）")
         let capped = ScreenLinkRequest(
             pageURL: request.pageURL, preferredMaximumHeight: 1080, allowsSeparateStreams: false
@@ -150,6 +159,13 @@ func json(_ object: [String: Any]) -> Data {
             "url": "https://media.example/muxed?expire=9999999999",
             "http_headers": ["User-Agent": "UA"],
         ])
+        let duplicateAudio = json(["extractor": "youtube", "requested_formats": [
+            ["format_id": "18", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a", "url": "https://media.example/v"],
+            ["format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a", "url": "https://media.example/a"]
+        ]])
+        if case let .resolved(combined) = YtDlpResultParser.parse(standardOutput: duplicateAudio, pageURL: request.pageURL) {
+            expect(combined.video.hasAudio && combined.audio == nil, "断言4：合流视频后面的音频不能重复播放")
+        } else { expect(false, "断言4：合流加额外音频回执应可解析") }
         if case let .resolved(mux) = YtDlpResultParser.parse(
             standardOutput: muxed, pageURL: request.pageURL
         ) {
@@ -244,6 +260,14 @@ func json(_ object: [String: Any]) -> Data {
         try? FileManager.default.createDirectory(at: fakeHelperDir, withIntermediateDirectories: true)
         let fakeHelper = fakeHelperDir.appendingPathComponent("yt-dlp")
         try? FileManager.default.copyItem(atPath: "/bin/echo", toPath: fakeHelper.path)
+        expect(ScreenLinkResolverService.bundledDenoPath(
+            bundleHelpersDirectory: nil, managedHelpersDirectory: nil) == nil,
+            "断言6：缺少受控 Deno 时不会从 PATH 发现运行时")
+        let fakeDeno = fakeHelperDir.appendingPathComponent("deno")
+        try? FileManager.default.copyItem(atPath: "/bin/echo", toPath: fakeDeno.path)
+        expect(ScreenLinkResolverService.bundledDenoPath(
+            bundleHelpersDirectory: fakeHelperDir.path, managedHelpersDirectory: nil) == nil,
+            "断言6：Deno 哈希不匹配时不会执行运行时")
 
         let missing = ScreenLinkHelperLocator(
             bundleHelpersDirectory: nil, managedHelpersDirectory: nil,

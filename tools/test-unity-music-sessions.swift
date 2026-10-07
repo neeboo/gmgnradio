@@ -1,4 +1,7 @@
 import Foundation
+#if GMGN_STORAGE_FULL_MODULE
+@testable import UnityMediaHost
+#endif
 
 @main struct UnityMusicSessionsRegression {
     @MainActor static func main() async throws {
@@ -33,8 +36,8 @@ import Foundation
         let after = try files.attributesOfItem(atPath: originalFile.path)[.posixPermissions] as! NSNumber
         precondition(before == after)
         print("PASS inherited session read-only; disconnect survives restart; reconnect uses isolated session; source bytes/mode unchanged")
-        let libraryFile = root.appendingPathComponent("music-library.json")
-        let library = SyncedMusicLibraryStore(cacheURL: libraryFile)
+        let backend = MusicStorageRPCFixture()
+        let library = SyncedMusicLibraryStore(storage: backend.client)
         let netease = MusicPlaylistSnapshot(id: "netease-list", providerID: .netease, name: "Fixture NetEase", artworkURL: nil, tracks: [])
         let qq = MusicPlaylistSnapshot(id: "qq-list", providerID: .qqMusic, name: "Fixture QQ", artworkURL: nil, tracks: [])
         let seedSaved = await library.mergeAndVerifyInBackground(playlists: [netease, qq])
@@ -42,10 +45,13 @@ import Foundation
         let updated = MusicPlaylistSnapshot(id: "netease-new", providerID: .netease, name: "Fixture New", artworkURL: nil, tracks: [])
         let updateSaved = await library.mergeAndVerifyInBackground(playlists: [updated])
         precondition(updateSaved)
-        let readback = SyncedMusicLibraryStore(cacheURL: libraryFile)
+        let readback = SyncedMusicLibraryStore(storage: backend.client)
+        try await readback.reload()
         precondition(Set(readback.playlists.map(\.id)) == ["netease-new", "qq-list"])
         readback.remove(providerID: .netease)
-        let disconnectedReadback = SyncedMusicLibraryStore(cacheURL: libraryFile)
+        try await readback.flush()
+        let disconnectedReadback = SyncedMusicLibraryStore(storage: backend.client)
+        try await disconnectedReadback.reload()
         precondition(disconnectedReadback.playlists.map(\.id) == ["qq-list"])
         print("PASS verified isolated library publication/readback preserves other providers across sync and disconnect")
     }

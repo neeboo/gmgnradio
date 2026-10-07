@@ -12,16 +12,20 @@ namespace GMGN.UnityPlayer
     public sealed class MusicLibraryPanel : IDisposable
     {
         readonly NativePlayerBackend backend;
-        readonly List<JObject> playlists = new(), tracks = new();
-        readonly ListView playlistList, trackList;
-        readonly Label status, title, detailTitle, detailSubtitle;
+        readonly List<JObject> playlists = new(), tracks = new(), programs = new();
+        readonly ListView playlistList, trackList, programList;
+        readonly Label status, title, count, detailTitle, detailSubtitle;
         readonly VisualElement detail;
         readonly Image detailCover;
-        readonly Button back;
+        readonly Button back, history, refresh, close;
         readonly Dictionary<string, Texture2D> covers = new();
         readonly Dictionary<string, Task<Texture2D>> downloads = new();
         readonly CancellationTokenSource lifetime = new();
-        string playlistID, currentTrackID;
+        string playlistID, currentTrackID, selectedProgramID;
+        string statusKey = "libraryLoading", statusArgument, statusExternal, detailProvider, detailCount;
+        PlayerSnapshot playback;
+        bool showingTracks, historyView;
+        static string Text(string key) => UiLocalization.Get(key);
         public VisualElement Element { get; }
         public MusicLibraryPanel(VisualElement parent, NativePlayerBackend backend, Action showQueue)
         {
@@ -30,23 +34,28 @@ namespace GMGN.UnityPlayer
             Element.AddToClassList("card"); Element.AddToClassList("music-library"); Element.AddToClassList("hidden");
             var stylesheet = Resources.Load<StyleSheet>("MusicLibrary"); if (stylesheet != null) Element.styleSheets.Add(stylesheet);
             var header = new VisualElement(); header.AddToClassList("music-library-header");
-            back = IconButton("back", "返回歌单", () => ShowTracks(false)); back.AddToClassList("hidden"); header.Add(back);
-            title = new Label("歌单"); title.AddToClassList("music-library-title"); header.Add(title);
-            header.Add(IconButton("refresh", "刷新歌单", () => { status.text = "正在读取歌单…"; if (!backend.RequestMusicLibrary()) status.text = "音乐库正在忙，请稍后重试。"; }));
-            header.Add(IconButton("close", "关闭音乐库", () => SetVisible(false))); Element.Add(header);
+            back = IconButton("back", Text("libraryBack"), () => ShowTracks(false)); back.AddToClassList("hidden"); header.Add(back);
+            title = new Label(Text("libraryPlaylists")); title.AddToClassList("music-library-title"); header.Add(title);
+            count = new Label(); count.AddToClassList("music-library-count"); header.Add(count);
+            history = IconButton("music", "浏览历史节目", () => SetHistoryView(!historyView)); history.name = "programHistoryToggle"; header.Add(history);
+            refresh = IconButton("refresh", Text("libraryRefresh"), () => { SetStatus("libraryLoading"); if (!(historyView ? RequestProgramHistory() : backend.RequestMusicLibrary())) SetStatus("libraryBusy"); }); header.Add(refresh);
+            close = IconButton("close", Text("libraryClose"), () => SetVisible(false)); header.Add(close); Element.Add(header);
             detail = new VisualElement(); detail.AddToClassList("music-library-detail"); detail.AddToClassList("hidden");
             detailCover = new Image { scaleMode = ScaleMode.ScaleAndCrop }; detailCover.AddToClassList("music-library-cover"); detail.Add(detailCover);
             var info = new VisualElement(); info.AddToClassList("music-library-info");
             detailTitle = new Label(); detailTitle.AddToClassList("music-library-name"); detailSubtitle = new Label(); detailSubtitle.AddToClassList("music-library-secondary");
             info.Add(detailTitle); info.Add(detailSubtitle); detail.Add(info); Element.Add(detail);
-            status = new Label("正在读取歌单…"); status.AddToClassList("music-library-status"); Element.Add(status);
+            status = new Label(Text("libraryLoading")); status.AddToClassList("music-library-status"); Element.Add(status);
             var listRegion = new VisualElement(); listRegion.AddToClassList("music-library-list-region"); Element.Add(listRegion);
             playlistList = BuildList(playlists, false); trackList = BuildList(tracks, true); trackList.AddToClassList("hidden"); listRegion.Add(playlistList); listRegion.Add(trackList);
+            programList = BuildProgramList(); programList.AddToClassList("hidden"); listRegion.Add(programList);
             // Resolve the actual toolbar parent: caller may have passed shell.
             var toolbar = parent.Q(className: "player");
             if (toolbar?.parent != null) toolbar.parent.Insert(toolbar.parent.IndexOf(toolbar), Element);
             else parent.Add(Element);
             backend.MusicLibraryUpdated += Update;
+            backend.Snapshot += UpdatePlayback;
+            UiLocalization.Changed += RefreshLocale;
         }
         static Button IconButton(string kind, string tooltip, Action clicked)
         {
@@ -76,11 +85,15 @@ namespace GMGN.UnityPlayer
                 var trailing = new Label { name = "trailing" }; trailing.AddToClassList("music-library-trailing"); row.Add(trailing);
                 row.clicked += () => {
                     if (row.userData is not JObject item) return;
-                    if (isTrack) { status.text = "正在准备播放…"; if (!backend.PlayMusicPlaylistTrack(playlistID, (int)item["index"])) status.text = "这首歌未能开始准备，请重试。"; }
+                    if (isTrack) { SetStatus("libraryPreparing");
+                        bool accepted = historyView
+                            ? backend.SendCommand(new JObject { ["op"] = "music.program.play", ["programID"] = selectedProgramID, ["slotIndex"] = (int)item["index"] })
+                            : backend.PlayMusicPlaylistTrack(playlistID, (int)item["index"]);
+                        if (!accepted) SetStatus("libraryPrepareFailed"); }
                     else {
-                        playlistID = (string)item["id"]; detailTitle.text = (string)item["name"]; detailSubtitle.text = Provider((string)item["provider"]) + " · " + item["count"] + " 首";
-                        BindCover(detailCover, (string)item["artworkURL"]); tracks.Clear(); trackList.RefreshItems(); ShowTracks(true); status.text = "正在读取歌单歌曲…";
-                        if (!backend.RequestMusicPlaylist(playlistID)) status.text = "歌单正在忙，请返回后重试。";
+                        playlistID = (string)item["id"]; detailTitle.text = (string)item["name"]; SetDetail((string)item["provider"], item["count"].ToString());
+                        BindCover(detailCover, (string)item["artworkURL"]); tracks.Clear(); trackList.RefreshItems(); ShowTracks(true); SetStatus("libraryTracksLoading");
+                        if (!backend.RequestMusicPlaylist(playlistID)) SetStatus("libraryPlaylistBusy");
                     }
                 }; return slot;
             };
@@ -88,14 +101,63 @@ namespace GMGN.UnityPlayer
                 var row = element.Q<Button>(); var item = items[i]; row.userData = item;
                 var active = isTrack && !string.IsNullOrEmpty(currentTrackID) && (string)item["id"] == currentTrackID;
                 row.EnableInClassList("music-library-current", active); row.Q<Label>("title").text = (string)item[isTrack ? "title" : "name"];
-                row.Q<Label>("subtitle").text = isTrack ? (string)item["artist"] : Provider((string)item["provider"]) + " · " + item["count"] + " 首";
-                row.Q<Label>("trailing").text = isTrack ? (active ? "正在播放" : Duration((double?)item["duration"] ?? 0)) : "›";
+                row.Q<Label>("subtitle").text = isTrack ? (string)item["artist"] : Provider((string)item["provider"]) + " · " + Count(item["count"].ToString());
+                row.Q<Label>("trailing").text = isTrack ? (active ? Text("libraryPlaying") : Duration((double?)item["duration"] ?? 0)) : "›";
                 if (isTrack) row.Q<Label>("number").text = (i + 1).ToString(); else BindCover(row.Q<Image>("cover"), (string)item["artworkURL"]);
                 row.tooltip = row.Q<Label>("title").text;
             };
             list.unbindItem = (element, _) => { var image = element.Q<Image>("cover"); if (image != null) { image.userData = null; image.image = null; } }; return list;
         }
-        static string Provider(string id) => id switch { "netease" => "网易云", "qq-music" => "QQ 音乐", "apple-music" => "Apple Music", _ => "音乐库" };
+        bool RequestProgramHistory() => backend.SendCommand(new JObject { ["op"] = "music.program.history" });
+        void SetHistoryView(bool history) {
+            historyView = history; selectedProgramID = null; ShowTracks(false);
+            SetStatus("libraryLoading");
+            if (!(history ? RequestProgramHistory() : backend.RequestMusicLibrary())) SetStatus("libraryBusy");
+        }
+        ListView BuildProgramList() {
+            var list = new ListView { itemsSource = programs, fixedItemHeight = 84, selectionType = SelectionType.None };
+            list.AddToClassList("music-library-list");
+            list.makeItem = () => {
+                var row = new Button(); row.AddToClassList("music-library-playlist");
+                row.clicked += () => {
+                    if (row.userData is not JObject item) return;
+                    selectedProgramID = (string)item["id"];
+                    tracks.Clear(); if (item["tracks"] is JArray savedTracks) foreach (var track in savedTracks) tracks.Add((JObject)track);
+                    detailTitle.text = (string)item["name"]; detailCount = null;
+                    detailSubtitle.text = "DJ 节目 · " + tracks.Count + " 首";
+                    detailCover.image = null; detailCover.userData = null;
+                    trackList.RefreshItems(); ShowTracks(true); SetStatus("libraryPlayHint");
+                };
+                return row;
+            };
+            list.bindItem = (element, index) => {
+                var row = (Button)element; var item = programs[index]; row.userData = item;
+                string badge = (bool?)item["active"] == true ? "当前 · " : (bool?)item["pending"] == true ? "待切换 · " : "";
+                row.text = badge + (string)item["name"] + " · " + (int?)item["count"] + " 首";
+                row.tooltip = (string)item["name"];
+            };
+            return list;
+        }
+        static string Provider(string id) => id switch { "netease" => Text("libraryProviderNetease"), "qq-music" => Text("libraryProviderQQ"), "apple-music" => "Apple Music", _ => Text("libraryTitle") };
+        static string Count(string count) => string.Format(Text("libraryTrackCount"), count);
+        void SetDetail(string provider, string count) { detailProvider = provider; detailCount = count; detailSubtitle.text = Provider(provider) + " · " + Count(count); }
+        void SetStatus(string key, string argument = null) { statusKey = key; statusArgument = argument; statusExternal = null; RefreshStatus(); }
+        void RefreshStatus() { status.text = statusExternal ?? (statusArgument == null ? Text(statusKey) : string.Format(Text(statusKey), statusArgument)); }
+        void UpdatePlayback(PlayerSnapshot snapshot) {
+            playback = snapshot;
+            if (statusKey == "libraryPlayingTitle" || (snapshot.playing && statusKey == "libraryPlayHint")) RefreshPlaybackStatus();
+        }
+        void RefreshPlaybackStatus() {
+            if (playback == null) return;
+            if (playback.playing && !string.IsNullOrEmpty(playback.title)) SetStatus("libraryPlayingTitle", playback.title);
+            else SetStatus("libraryPlayHint");
+        }
+        void RefreshLocale() {
+            back.tooltip = Text("libraryBack"); refresh.tooltip = Text("libraryRefresh"); close.tooltip = Text("libraryClose");
+            ShowTracks(showingTracks); RefreshStatus();
+            if (detailCount != null) SetDetail(detailProvider, detailCount);
+            playlistList.RefreshItems(); trackList.RefreshItems();
+        }
         static string Duration(double seconds) => seconds > 0 ? $"{(int)seconds / 60}:{(int)seconds % 60:00}" : "";
         async void BindCover(Image image, string url)
         {
@@ -120,23 +182,31 @@ namespace GMGN.UnityPlayer
                 var texture = DownloadHandlerTexture.GetContent(request); covers[url] = texture; return texture;
             } finally { downloads.Remove(url); }
         }
-        void ShowTracks(bool show) { playlistList.EnableInClassList("hidden", show); trackList.EnableInClassList("hidden", !show); detail.EnableInClassList("hidden", !show); back.EnableInClassList("hidden", !show); title.text = show ? "歌曲" : $"歌单 · {playlists.Count}"; }
+        void ShowTracks(bool show) { showingTracks = show; playlistList.EnableInClassList("hidden", show || historyView); programList.EnableInClassList("hidden", show || !historyView); trackList.EnableInClassList("hidden", !show); detail.EnableInClassList("hidden", !show); back.EnableInClassList("hidden", !show); title.text = show ? Text("libraryTracks") : historyView ? "历史节目" : Text("libraryPlaylists"); count.text = "· " + (historyView ? programs.Count : playlists.Count); count.EnableInClassList("hidden", show); history.tooltip = historyView ? "返回音乐歌单" : "浏览历史节目"; history.EnableInClassList("selected", historyView); }
         void Update(JObject value)
         {
             if (value["currentTrackID"] != null) { var next = (string)value["currentTrackID"]; if (currentTrackID != next) { currentTrackID = next; trackList.RefreshItems(); } }
-            if ((string)value["status"] == "failed") { status.text = (string)value["message"] ?? "音乐库暂时不可用。"; return; }
+            if ((string)value["status"] == "failed") { SetStatus("libraryUnavailable"); statusExternal = (string)value["message"]; RefreshStatus(); return; }
             switch ((string)value["operation"]) {
-                case "library": playlists.Clear(); foreach (var row in (JArray)value["playlists"]) playlists.Add((JObject)row); playlistList.RefreshItems(); ShowTracks(false); status.text = playlists.Count == 0 ? "还没有已同步歌单。" : "选择一个歌单查看歌曲"; break;
+                case "program-history":
+                    programs.Clear(); if (value["programs"] is JArray saved) foreach (var row in saved) programs.Add((JObject)row);
+                    programList.RefreshItems(); if (historyView) { ShowTracks(false); SetStatus(programs.Count == 0 ? "libraryEmpty" : "librarySelectPlaylist"); }
+                    break;
+                case "library": playlists.Clear(); foreach (var row in (JArray)value["playlists"]) playlists.Add((JObject)row); playlistList.RefreshItems(); if (!historyView) { ShowTracks(false); SetStatus(playlists.Count == 0 ? "libraryEmpty" : "librarySelectPlaylist"); } break;
                 case "playlist":
-                    if ((string)value["playlistID"] != playlistID) return;
+                    if (historyView || (string)value["playlistID"] != playlistID) return;
                     tracks.Clear(); foreach (var row in (JArray)value["tracks"]) tracks.Add((JObject)row);
-                    detailTitle.text = (string)value["name"]; detailSubtitle.text = Provider((string)value["provider"]) + " · " + value["loaded"] + " / " + value["total"] + " 首";
-                    BindCover(detailCover, (string)value["artworkURL"]); trackList.RefreshItems(); ShowTracks(true); status.text = "点击歌曲开始播放"; break;
-                case "play": status.text = "正在播放 · " + (string)value["title"]; break;
+                    detailTitle.text = (string)value["name"]; SetDetail((string)value["provider"], value["loaded"] + " / " + value["total"]);
+                    BindCover(detailCover, (string)value["artworkURL"]); trackList.RefreshItems(); ShowTracks(true); SetStatus("libraryPlayHint"); break;
+                case "play": case "program":
+                    // Selection replies can arrive after a next-track snapshot.
+                    // Only the live playback projection supplies the playing title.
+                    SetStatus("libraryPlayHint");
+                    RefreshPlaybackStatus(); break;
             }
         }
-        public void SetVisible(bool visible) { Element.EnableInClassList("hidden", !visible); if (visible && playlists.Count == 0) backend.RequestMusicLibrary(); }
+        public void SetVisible(bool visible) { Element.EnableInClassList("hidden", !visible); if (visible) Element.schedule.Execute(() => Debug.Log($"[Popup] music visible hidden={Element.ClassListContains("hidden")} display={Element.resolvedStyle.display} bounds={Element.worldBound} parent={Element.parent?.name}")); if (visible) { if (historyView) RequestProgramHistory(); else if (playlists.Count == 0) backend.RequestMusicLibrary(); } }
         public void Toggle() => SetVisible(Element.ClassListContains("hidden"));
-        public void Dispose() { lifetime.Cancel(); backend.MusicLibraryUpdated -= Update; Element.RemoveFromHierarchy(); foreach (var texture in covers.Values) UnityEngine.Object.Destroy(texture); covers.Clear(); }
+        public void Dispose() { lifetime.Cancel(); backend.MusicLibraryUpdated -= Update; backend.Snapshot -= UpdatePlayback; UiLocalization.Changed -= RefreshLocale; Element.RemoveFromHierarchy(); foreach (var texture in covers.Values) UnityEngine.Object.Destroy(texture); covers.Clear(); }
     }
 }

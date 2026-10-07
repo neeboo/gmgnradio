@@ -92,10 +92,10 @@ struct BundledHelperManifest: Equatable, Sendable {
         helpers: [
             Helper(
                 name: "yt-dlp",
-                version: "2026.06.09",
-                sha256: "b82c3626952e6c14eaf654cc565866775ffd0b9ffb7021628ac59b42c2f4f244",
+                version: "2026.08.19",
+                sha256: "0f192b7ec147ab6288885d6351d9ab67367640029b4377576ef46dd79cf7b202",
                 distribution: .pyinstallerStandalone,
-                sourceURL: "https://github.com/yt-dlp/yt-dlp/releases/download/2026.06.09/yt-dlp_macos",
+                sourceURL: "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_macos",
                 upstreamLicenseSPDX: "Unlicense",
                 combinedWorkLicenseSPDX: "GPL-3.0-or-later",
                 licenseNote:

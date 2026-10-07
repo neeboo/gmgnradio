@@ -6,13 +6,13 @@
 //
 //  目标：给 Claude Code `--mcp-config` 一个**受限 Node stdio MCP adapter**，让模型能
 //  以 MCP tools/list / tools/call 调用「本轮正式世界工具」，同时不引入任何新的全权限
-//  IPC、shell、文件读写或第二套授权：
+//  通道、shell、文件读写或第二套授权；标准 MCP stdio 仅连接模型进程与 adapter：
 //
 //    · 复用既有会话级宿主通道 ResidentDSHHostToolsChannel：同一个短名 0700 私有目录、
-//      同一个私有 TCP loopback、同一把每轮随机 token、同一套名称边界 + 原 schema 复核 +
-//      授权代（epoch）复核。本文件不新建 IPC、不新增 daemon、不注册 shell/read/write。
+//      同一个私有 HTTP loopback、同一把每轮随机 token、同一套名称边界 + 原 schema 复核 +
+//      授权代（epoch）复核。本文件复用 HTTP 宿主端点、不新增 daemon、不注册 shell/read/write。
 //    · adapter 源码在会话启动时写入该私有目录（0600），`--mcp-config` 以绝对路径引用；
-//      adapter 只作 MCP↔TCP 的受限翻译，未在正式 schema 中的名字（含 shell/read/write）
+//      adapter 只作 MCP↔HTTP 的受限翻译，未在正式 schema 中的名字（含 shell/read/write）
 //      在 adapter 侧即被拒绝。
 //    · adapter 进程启动时**钉住**当时的 grant 身份（secret + round），之后每次
 //      tools/call 前与宿主回包前都重读同目录授权文件（0600，读取有界）并要求身份
@@ -210,10 +210,10 @@ public enum ResidentClaudeMCPAdapter {
         return text
     }
 
-    // MARK: Adapter template (restricted; stdio MCP ↔ reused private TCP session)
+    // MARK: Adapter template (restricted; stdio MCP ↔ reused private HTTP session)
 
     static let template = #"""
-import net from 'node:net'
+import http from 'node:http'
 import fs from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
@@ -355,38 +355,43 @@ function grantAllows(grant, name) {
 
 function hostCall(endpoint, secret, name, args) {
   return new Promise(function (resolve) {
-    const socket = net.connect({ host: '127.0.0.1', port: Number(endpoint.address.split(':')[1]) })
+    const port = Number(new URL(endpoint.url).port)
     let settled = false
     let buffer = Buffer.alloc(0)
+    let request = null
     const deadline = setTimeout(function () { finish(null) }, REQUEST_TIMEOUT_MS)
     function finish(value) {
       if (settled) return
       settled = true
       clearTimeout(deadline)
-      try { socket.destroy() } catch (_) { /* ignore */ }
+      try { if (request) request.destroy() } catch (_) { /* ignore */ }
       resolve(value)
     }
-    socket.on('connect', function () {
-      const body = JSON.stringify({
-        v: 1,
-        secret: secret,
-        callId: 'mcp-' + randomUUID(),
-        name: name,
-        arguments: args
+    const body = JSON.stringify({ v: 1, callId: 'mcp-' + randomUUID(), name: name, arguments: args })
+    request = http.request({
+      hostname: '127.0.0.1', port: port, path: '/rpc', method: 'POST', agent: false, maxHeaderSize: 8192,
+      headers: {
+        'Content-Type': 'application/json', 'Content-Length': byteLength(body),
+        'Authorization': 'Bearer ' + secret, 'Connection': 'close'
+      }
+    }, function (response) {
+      // Native http.request never follows redirects; only the private RPC endpoint is used.
+      if (response.statusCode !== 200 && response.statusCode !== 403) { finish(null); return }
+      if (!/^application\/json(?:\s*;|$)/i.test(String(response.headers['content-type'] || ''))) { finish(null); return }
+      response.on('data', function (chunk) {
+        if (buffer.length + chunk.length > MAX_HOST_REPLY_BYTES) { finish(null); return }
+        buffer = Buffer.concat([buffer, chunk])
       })
-      socket.write(body + '\n')
+      response.on('end', function () {
+        let parsed = null
+        try { parsed = JSON.parse(buffer.toString('utf8')) } catch (_) { parsed = null }
+        finish(parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null)
+      })
+      response.on('error', function () { finish(null) })
+      response.on('aborted', function () { finish(null) })
     })
-    socket.on('data', function (chunk) {
-      buffer = Buffer.concat([buffer, chunk])
-      if (buffer.length > MAX_HOST_REPLY_BYTES) { finish(null); return }
-      const newline = buffer.indexOf(10)
-      if (newline < 0) return
-      let parsed = null
-      try { parsed = JSON.parse(buffer.subarray(0, newline).toString('utf8')) } catch (_) { parsed = null }
-      finish(parsed && typeof parsed === 'object' ? parsed : null)
-    })
-    socket.on('error', function () { finish(null) })
-    socket.on('close', function () { finish(null) })
+    request.on('error', function () { finish(null) })
+    request.end(body)
   })
 }
 
@@ -424,7 +429,7 @@ async function handleToolsCall(id, params) {
   }
   if (!grantAllows(before.grant, name)) { respondResult(id, toolErrorResult('unknown tool')); return }
   const endpoint = before.grant.endpoint
-  if (!endpoint || endpoint.version !== 1 || typeof endpoint.address !== 'string' || !/^127\.0\.0\.1:([1-9][0-9]{0,4})$/.test(endpoint.address) || Number(endpoint.address.split(':')[1]) > 65535 || typeof endpoint.token !== 'string' || endpoint.token.length === 0) { respondResult(id, toolErrorResult('tool bridge unavailable')); return }
+  if (!endpoint || endpoint.version !== 2 || typeof endpoint.url !== 'string' || !/^http:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})\/rpc$/.test(endpoint.url) || Number(new URL(endpoint.url).port) > 65535 || typeof endpoint.token !== 'string' || endpoint.token.length === 0) { respondResult(id, toolErrorResult('tool bridge unavailable')); return }
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(endpoint.token) || endpoint.token !== before.grant.secret) { respondResult(id, toolErrorResult('tool bridge unavailable')); return }
   const reply = await hostCall(endpoint, endpoint.token, name, args)
   // 回包前复核：授权在等待宿主期间被撤销/轮换/过期时，迟到的结果绝不回给模型。
@@ -557,7 +562,7 @@ process.stdin.on('error', function () { process.exit(0) })
 // MARK: - Host session (reuses ResidentDSHHostToolsChannel)
 
 /// 一次 Claude Code 工具轮次的宿主会话：复用既有 `ResidentDSHHostToolsChannel`
-/// （会话级 UDS + 每轮 secret + 授权代），并在同一私有目录准备受限 adapter、
+/// （会话级 HTTP + 每轮 secret + 授权代），并在同一私有目录准备受限 adapter、
 /// 授权文件与 `--mcp-config`。
 ///
 /// 生产接线（`AgentConversationService.sendViaClaude`，已完成）：
@@ -619,7 +624,7 @@ public final class ResidentClaudeMCPHostSession: @unchecked Sendable {
     public let adapterFileURL: URL
     public let grantFileURL: URL
     public let configFileURL: URL
-    public var socketPath: String { channel.socketPath }
+    public var rpcURL: String { channel.rpcURL }
 
     /// 本会话 `--allowedTools` 的逐项精确放行名（每轮正式工具一条）。
     public var allowedToolNames: [String] {
@@ -662,7 +667,7 @@ public final class ResidentClaudeMCPHostSession: @unchecked Sendable {
             return session
         } catch {
             // 配置启动的通道不整目录自删（removesDirectoryOnStop == false）：stop() 只
-            // 回收 grant/socket。start 抛错时调用方拿不到 session，无法走其 defer 的整目录
+            // 回收 grant/listener。start 抛错时调用方拿不到 session，无法走其 defer 的整目录
             // 回收，因此这里必须显式删除本次自建私有目录，避免 prepare/arm 失败泄漏。
             channel.stop()
             try? FileManager.default.removeItem(at: channel.directoryURL)
@@ -707,7 +712,7 @@ public final class ResidentClaudeMCPHostSession: @unchecked Sendable {
     }
 
     /// 本轮授权生效：推进通道授权代/轮换 secret，并重写 adapter 侧的 0600 授权文件
-    /// （state=armed、expiresAt、socketPath、secret、round、本轮工具名单）。
+    /// （state=armed、expiresAt、HTTP endpoint、secret、round、本轮工具名单）。
     ///
     /// 注意：adapter 进程在**启动时**钉住其 grant 身份（secret + round），因此 re-arm
     /// 之后必须重新 spawn 新的 adapter 进程；旧进程即使重读到新 secret 也不会复活。

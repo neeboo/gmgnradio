@@ -2,7 +2,7 @@
 //! plugin rather than re-invented.
 //!
 //! The Swift side already writes one grant document per armed round
-//! (`Agent/ResidentDSHHostToolsBridge.swift`: `{state, tools:[{name}], socketPath,
+//! (`Agent/ResidentDSHHostToolsBridge.swift`: `{state, tools:[{name}], endpointFile,
 //! secret, worldRevision}`) and its private plugin refuses every call whose tool
 //! is not in `tools` while `state != "armed"`. The MCP face reads the same
 //! document: read-only tools are safe in any direction, action tools require an
@@ -26,7 +26,7 @@ pub enum Refusal {
     /// The round is armed, but not for this tool.
     ToolNotGranted(String),
     /// The grant points at a different daemon than the one this process serves.
-    SocketMismatch { grant: String, configured: String },
+    EndpointMismatch { grant: String, configured: String },
 }
 
 impl Refusal {
@@ -38,7 +38,7 @@ impl Refusal {
             Refusal::Unreadable(_) => "mcp_grant_unreadable",
             Refusal::NotArmed(_) => "mcp_grant_not_armed",
             Refusal::ToolNotGranted(_) => "mcp_tool_not_granted",
-            Refusal::SocketMismatch { .. } => "mcp_grant_socket_mismatch",
+            Refusal::EndpointMismatch { .. } => "mcp_grant_endpoint_mismatch",
         }
     }
 
@@ -54,7 +54,7 @@ impl Refusal {
             Refusal::ToolNotGranted(name) => {
                 format!("本轮没有开放工具 `{name}`；动作工具已拒绝。")
             }
-            Refusal::SocketMismatch { grant, configured } => format!(
+            Refusal::EndpointMismatch { grant, configured } => format!(
                 "授权文件指向 {grant}，本进程服务的是 {configured}；拒绝沿用一份不属于本权威的授权。"
             ),
         }
@@ -84,7 +84,7 @@ impl GrantSource {
 
     /// Whether `tool` may act on the world right now. Read-only tools do not
     /// consult this at all.
-    pub fn authorize(&self, tool: &str, configured_socket: &Path) -> Result<(), Refusal> {
+    pub fn authorize(&self, tool: &str, configured_endpoint: &Path) -> Result<(), Refusal> {
         let Some(path) = self.path() else {
             return Err(Refusal::NotConfigured);
         };
@@ -102,21 +102,23 @@ impl GrantSource {
         // A grant written for a different daemon must not authorize this one:
         // otherwise a stale document from another private root would silently
         // widen this process's reach.
-        if let Some(grant_socket) = document.get("socketPath").and_then(Value::as_str) {
-            if Path::new(grant_socket) != configured_socket {
-                return Err(Refusal::SocketMismatch {
-                    grant: grant_socket.to_owned(),
-                    configured: configured_socket.display().to_string(),
-                });
-            }
+        let grant_endpoint = document
+            .get("endpointFile")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Refusal::Unreadable("missing endpointFile".to_owned()))?;
+        if Path::new(grant_endpoint) != configured_endpoint {
+            return Err(Refusal::EndpointMismatch {
+                grant: grant_endpoint.to_owned(),
+                configured: configured_endpoint.display().to_string(),
+            });
         }
         let granted = document
             .get("tools")
             .and_then(Value::as_array)
             .map(|tools| {
-                tools.iter().any(|entry| {
-                    entry.get("name").and_then(Value::as_str) == Some(tool)
-                })
+                tools
+                    .iter()
+                    .any(|entry| entry.get("name").and_then(Value::as_str) == Some(tool))
             })
             .unwrap_or(false);
         if !granted {
@@ -148,14 +150,14 @@ mod tests {
         format!("{nanos}-{}-{sequence}", std::process::id())
     }
 
-    const SOCKET: &str = "/tmp/gmgn-test/taskd.sock";
+    const ENDPOINT_FILE: &str = "/tmp/gmgn-test/taskd.endpoint.json";
 
     #[test]
     fn no_grant_configured_is_a_refusal_not_a_permission() {
         let source = GrantSource::none();
         assert!(source.path().is_none());
         assert_eq!(
-            source.authorize("gmgn_prop_submit", Path::new(SOCKET)),
+            source.authorize("gmgn_prop_submit", Path::new(ENDPOINT_FILE)),
             Err(Refusal::NotConfigured)
         );
     }
@@ -163,12 +165,12 @@ mod tests {
     #[test]
     fn an_unarmed_round_refuses_every_action() {
         let path = write_grant(&format!(
-            r#"{{"state":"revoked","tools":[{{"name":"gmgn_prop_submit"}}],"socketPath":"{SOCKET}"}}"#
+            r#"{{"state":"revoked","tools":[{{"name":"gmgn_prop_submit"}}],"endpointFile":"{ENDPOINT_FILE}"}}"#
         ));
         let source = GrantSource::at(&path);
         assert_eq!(source.path(), Some(path.as_path()));
         assert_eq!(
-            source.authorize("gmgn_prop_submit", Path::new(SOCKET)),
+            source.authorize("gmgn_prop_submit", Path::new(ENDPOINT_FILE)),
             Err(Refusal::NotArmed("revoked".to_owned()))
         );
     }
@@ -176,12 +178,15 @@ mod tests {
     #[test]
     fn an_armed_round_only_opens_the_tools_it_names() {
         let path = write_grant(&format!(
-            r#"{{"state":"armed","tools":[{{"name":"gmgn_world_commit"}}],"socketPath":"{SOCKET}"}}"#
+            r#"{{"state":"armed","tools":[{{"name":"gmgn_world_commit"}}],"endpointFile":"{ENDPOINT_FILE}"}}"#
         ));
         let source = GrantSource::at(&path);
-        assert_eq!(source.authorize("gmgn_world_commit", Path::new(SOCKET)), Ok(()));
         assert_eq!(
-            source.authorize("gmgn_prop_submit", Path::new(SOCKET)),
+            source.authorize("gmgn_world_commit", Path::new(ENDPOINT_FILE)),
+            Ok(())
+        );
+        assert_eq!(
+            source.authorize("gmgn_prop_submit", Path::new(ENDPOINT_FILE)),
             Err(Refusal::ToolNotGranted("gmgn_prop_submit".to_owned()))
         );
     }
@@ -189,29 +194,43 @@ mod tests {
     #[test]
     fn a_grant_for_another_daemon_does_not_authorize_this_one() {
         let path = write_grant(
-            r#"{"state":"armed","tools":[{"name":"gmgn_prop_submit"}],"socketPath":"/tmp/other/taskd.sock"}"#,
+            r#"{"state":"armed","tools":[{"name":"gmgn_prop_submit"}],"endpointFile":"/tmp/other/taskd.endpoint.json"}"#,
         );
         let source = GrantSource::at(&path);
         assert_eq!(
-            source.authorize("gmgn_prop_submit", Path::new(SOCKET)),
-            Err(Refusal::SocketMismatch {
-                grant: "/tmp/other/taskd.sock".to_owned(),
-                configured: SOCKET.to_owned(),
+            source.authorize("gmgn_prop_submit", Path::new(ENDPOINT_FILE)),
+            Err(Refusal::EndpointMismatch {
+                grant: "/tmp/other/taskd.endpoint.json".to_owned(),
+                configured: ENDPOINT_FILE.to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn an_armed_grant_without_endpoint_binding_is_refused() {
+        for body in [
+            r#"{"state":"armed","tools":[{"name":"gmgn_prop_submit"}]}"#,
+            r#"{"state":"armed","tools":[{"name":"gmgn_prop_submit"}],"socketPath":"/tmp/gmgn-test/taskd.endpoint.json"}"#,
+        ] {
+            let path = write_grant(body);
+            assert!(matches!(
+                GrantSource::at(&path).authorize("gmgn_prop_submit", Path::new(ENDPOINT_FILE)),
+                Err(Refusal::Unreadable(_))
+            ));
+        }
     }
 
     #[test]
     fn an_unreadable_or_malformed_grant_is_a_refusal() {
         let missing = GrantSource::at("/tmp/gmgn-mcpd-does-not-exist.json");
         assert!(matches!(
-            missing.authorize("gmgn_prop_submit", Path::new(SOCKET)),
+            missing.authorize("gmgn_prop_submit", Path::new(ENDPOINT_FILE)),
             Err(Refusal::Unreadable(_))
         ));
         let path = write_grant("not json");
         let source = GrantSource::at(&path);
         assert!(matches!(
-            source.authorize("gmgn_prop_submit", Path::new(SOCKET)),
+            source.authorize("gmgn_prop_submit", Path::new(ENDPOINT_FILE)),
             Err(Refusal::Unreadable(_))
         ));
     }
@@ -225,7 +244,7 @@ mod tests {
             Refusal::Unreadable(String::new()).code(),
             Refusal::NotArmed(String::new()).code(),
             Refusal::ToolNotGranted(String::new()).code(),
-            Refusal::SocketMismatch {
+            Refusal::EndpointMismatch {
                 grant: String::new(),
                 configured: String::new(),
             }

@@ -1,5 +1,4 @@
 import Foundation
-import Network
 import Darwin
 
 enum RustVoiceProvider: String, Sendable, CaseIterable { case bailian, elevenlabs, fish }
@@ -54,7 +53,7 @@ struct RustVoiceEvent: Decodable, Sendable {
     let code: String?
 }
 
-/// Cloud protocols live in Rust. This macOS adapter reads one bounded IPC frame
+/// Cloud protocols live in Rust. This macOS adapter reads one bounded HTTP SSE frame
 /// at a time; callers naturally backpressure taskd by delaying nextEvent().
 @MainActor final class RustVoiceClient {
     private let root: URL
@@ -138,6 +137,7 @@ struct RustVoiceEvent: Decodable, Sendable {
                 guard FileManager.default.isExecutableFile(atPath: helperURL.path) else { throw RustVoiceError.unavailable }
                 let process = Process(); process.executableURL = helperURL
                 process.arguments = ["--root", root.path, "--endpoint-file", endpointURL.path, "--concurrency", "2"]
+                    + TaskdBundledMediaConfiguration.arguments(nextTo: helperURL)
                 process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
                 try process.run(); helper = process
             }
@@ -164,15 +164,15 @@ struct RustVoiceEvent: Decodable, Sendable {
 @MainActor final class RustVoiceSession: RustVoiceStreaming {
     private struct Endpoint: Decodable { let version: Int; let address: String; let token: String }
     let sessionID = UUID().uuidString
-    private let connection: NWConnection
+    private let endpoint: URL
+    private let clientID = UUID().uuidString
+    private var stream: TaskdHTTPTransport?
+    private let inbox = TaskdVoiceHTTPInbox()
     private let token: String
-    private var ready = false
     private var closed = false
-    private var explicitlyClosed = false
-    private var buffer = Data()
     private static let frameLimit = 256 * 1024
 
-    private init(connection: NWConnection, token: String) { self.connection = connection; self.token = token }
+    private init(endpoint: URL, token: String) { self.endpoint = endpoint; self.token = token }
 
     /// The token descriptor is a small owner-only regular file, not arbitrary
     /// Foundation URL input. Open the final component without following links.
@@ -208,37 +208,31 @@ struct RustVoiceEvent: Decodable, Sendable {
         catch let error as RustVoiceError { throw error }
         catch { throw RustVoiceError.invalidFrame }
         let parts = endpoint.address.split(separator: ":")
-        guard endpoint.version == 1, parts.count == 2, parts[0] == "127.0.0.1",
+        guard endpoint.version == 2, parts.count == 2, parts[0] == "127.0.0.1",
               let portNumber = UInt16(parts[1]), portNumber > 0,
-              let port = NWEndpoint.Port(rawValue: portNumber),
               let identity = UUID(uuidString: endpoint.token), identity.uuidString.dropFirst(14).first == "4" else {
             throw RustVoiceError.invalidFrame
         }
-        let session = RustVoiceSession(connection: NWConnection(host: "127.0.0.1", port: port, using: .tcp), token: endpoint.token)
-        session.connection.stateUpdateHandler = { [weak session] state in
-            Task { @MainActor in
-                guard let session else { return }
-                switch state {
-                case .ready: session.ready = true
-                case .failed, .cancelled: session.closed = true
-                default: break
-                }
-            }
-        }
-        session.connection.start(queue: DispatchQueue(label: "gmgn.voice.ipc"))
-        do {
-            let deadline = Date().addingTimeInterval(1)
-            while !session.ready {
-                try Task.checkCancellation()
-                guard !session.closed, Date() < deadline else { throw RustVoiceError.unavailable }
-                try await Task.sleep(for: .milliseconds(10))
-            }
-            return session
-        } catch { session.close(); throw error }
+        let session = RustVoiceSession(endpoint: URL(string: "http://\(endpoint.address)")!, token: endpoint.token)
+        var request = URLRequest(url: session.endpoint.appendingPathComponent("health"), timeoutInterval: 1)
+        request.setValue("Bearer \(endpoint.token)", forHTTPHeaderField: "Authorization")
+        let inbox = TaskdVoiceHTTPInbox()
+        let transport = TaskdHTTPTransport(streaming: false, maximumBytes: frameLimit, receive: { inbox.body($0) }, completion: { if let error = $0 { inbox.finish(error) } })
+        transport.start(request)
+        let data = try await withTaskCancellationHandler { try await inbox.next() } onCancel: { transport.cancel() }
+        guard let health = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              health["version"] as? Int == 2, health["transport"] as? String == "http" else { throw RustVoiceError.invalidFrame }
+        return session
     }
 
     fileprivate func start(method: String, params: [String: Any]) async throws {
-        let id = try await send(method: method, params: params)
+        let id = UUID().uuidString
+        let request = try request(path: "events", id: id, method: method, params: params)
+        let inbox = self.inbox
+        let transport = TaskdHTTPTransport(streaming: true, maximumBytes: Self.frameLimit, receive: { inbox.receive($0) }, completion: { inbox.finish($0 ?? RustVoiceError.unavailable) })
+        stream = transport
+        inbox.setTransport(transport)
+        transport.start(request)
         let reply = try await readObject()
         guard reply["id"] as? String == id else { throw RustVoiceError.invalidFrame }
         try checkError(reply)
@@ -247,8 +241,8 @@ struct RustVoiceEvent: Decodable, Sendable {
     }
 
     fileprivate func listVoices(configuration: RustVoiceConfiguration) async throws -> [RustVoiceOption] {
-        let id = try await send(method: "voice_list", params: ["provider": configuration.provider.rawValue, "apiKey": configuration.apiKey])
-        let reply = try await readObject()
+        let id = UUID().uuidString
+        let reply = try await rpc(id: id, method: "voice_list", params: ["provider": configuration.provider.rawValue, "apiKey": configuration.apiKey])
         guard reply["id"] as? String == id else { throw RustVoiceError.invalidFrame }
         try checkError(reply)
         guard let result = reply["result"] as? [String: Any],
@@ -261,8 +255,8 @@ struct RustVoiceEvent: Decodable, Sendable {
     }
 
     fileprivate func capabilities() async throws -> RustVoiceCapabilities {
-        let id = try await send(method: "voice_capabilities", params: [:])
-        let reply = try await readObject()
+        let id = UUID().uuidString
+        let reply = try await rpc(id: id, method: "voice_capabilities", params: [:])
         guard reply["id"] as? String == id else { throw RustVoiceError.invalidFrame }
         try checkError(reply)
         guard let result = reply["result"] as? [String: Any] else { throw RustVoiceError.invalidFrame }
@@ -297,69 +291,117 @@ struct RustVoiceEvent: Decodable, Sendable {
         _ = try await send(method: "voice_audio_append", params: ["sessionID": sessionID, "audioBase64": pcm16LE.base64EncodedString()])
     }
     func commit() async throws { _ = try await send(method: "voice_asr_commit", params: ["sessionID": sessionID]) }
-    func cancel() {
-        guard !closed else { return }
-        // Session ownership is connection-local; closing guarantees cancellation
-        // even when the cancel frame cannot be delivered.
-        let request: [String: Any] = ["id": UUID().uuidString, "auth": token, "method": "voice_cancel", "params": ["sessionID": sessionID]]
-        if var frame = try? JSONSerialization.data(withJSONObject: request) {
-            frame.append(10); connection.send(content: frame, completion: .contentProcessed { _ in })
-        }
-        close()
+    func cancel() { close() }
+    func close() {
+        closed = true
+        stream?.cancel(); stream = nil
+        inbox.finish(CancellationError())
     }
-    func close() { explicitlyClosed = true; closed = true; ready = false; buffer.removeAll(); connection.cancel() }
 
+    private func request(path: String, id: String, method: String, params: [String: Any]) throws -> URLRequest {
+        guard !closed else { throw CancellationError() }
+        let body = try JSONSerialization.data(withJSONObject: ["id": id, "method": method, "params": params])
+        guard body.count < Self.frameLimit else { throw RustVoiceError.invalidFrame }
+        var request = URLRequest(url: endpoint.appendingPathComponent(path), timeoutInterval: 10)
+        request.httpMethod = "POST"; request.httpBody = body
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue(clientID, forHTTPHeaderField: "X-GMGN-Client-ID")
+        return request
+    }
     @discardableResult private func send(method: String, params: [String: Any]) async throws -> String {
-        guard ready, !closed else { throw RustVoiceError.unavailable }
-        try Task.checkCancellation()
         let id = UUID().uuidString
-        var frame = try JSONSerialization.data(withJSONObject: ["id": id, "auth": token, "method": method, "params": params])
-        guard frame.count < Self.frameLimit else { throw RustVoiceError.invalidFrame }
-        frame.append(10)
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                connection.send(content: frame, completion: .contentProcessed { error in
-                    if error != nil { continuation.resume(throwing: RustVoiceError.unavailable) }
-                    else { continuation.resume() }
-                })
-            }
-        } onCancel: { Task { @MainActor [weak self] in self?.close() } }
-        try Task.checkCancellation()
+        let reply = try await rpc(id: id, method: method, params: params)
+        try checkError(reply)
         return id
     }
-
+    private func rpc(id: String, method: String, params: [String: Any]) async throws -> [String: Any] {
+        let queue = TaskdVoiceHTTPInbox()
+        let transport = TaskdHTTPTransport(streaming: false, maximumBytes: Self.frameLimit, receive: { queue.body($0) }, completion: { if let error = $0 { queue.finish(error) } })
+        let request = try request(path: "rpc", id: id, method: method, params: params)
+        transport.start(request)
+        let data = try await withTaskCancellationHandler { try await queue.next() } onCancel: { transport.cancel() }
+        guard data.count <= Self.frameLimit, let reply = try JSONSerialization.jsonObject(with: data) as? [String: Any], reply["id"] as? String == id else { throw RustVoiceError.invalidFrame }
+        return reply
+    }
     private func readObject() async throws -> [String: Any] {
-        while true {
-            try Task.checkCancellation()
-            if closed {
-                if explicitlyClosed { throw CancellationError() }
-                throw RustVoiceError.unavailable
-            }
-            if let newline = buffer.firstIndex(of: 10) {
-                let line = Data(buffer[..<newline]); buffer.removeSubrange(...newline)
-                guard let object = try JSONSerialization.jsonObject(with: line) as? [String: Any] else { throw RustVoiceError.invalidFrame }
-                return object
-            }
-            guard buffer.count < Self.frameLimit else { throw RustVoiceError.invalidFrame }
-            let data: Data = try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { continuation in
-                    connection.receive(minimumIncompleteLength: 1, maximumLength: 16_384) { data, _, _, error in
-                        guard error == nil, let data, !data.isEmpty else {
-                            continuation.resume(throwing: RustVoiceError.unavailable); return
-                        }
-                        continuation.resume(returning: data)
-                    }
-                }
-            } onCancel: { Task { @MainActor [weak self] in self?.close() } }
-            if closed {
-                if explicitlyClosed { throw CancellationError() }
-                throw RustVoiceError.unavailable
-            }
-            buffer.append(data)
-            guard buffer.count <= Self.frameLimit else { throw RustVoiceError.invalidFrame }
-        }
+        let stream = self.stream
+        let data = try await withTaskCancellationHandler { try await inbox.next() } onCancel: { stream?.cancel() }
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw RustVoiceError.invalidFrame }
+        return object
     }
     private func checkError(_ reply: [String: Any]) throws {
         if let error = reply["error"] as? [String: Any] { throw RustVoiceError.rejected(error["code"] as? String ?? "voice_failed") }
+    }
+}
+
+/// Bounded SSE inbox. No provider credentials are retained or logged.
+private final class TaskdVoiceHTTPInbox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: [Data] = []
+    private var bytes = 0
+    private var event = Data()
+    private var error: Error?
+    private var waiter: CheckedContinuation<Data, Error>?
+    private weak var transport: TaskdHTTPTransport?
+    private var paused = false
+    func setTransport(_ transport: TaskdHTTPTransport) { lock.lock(); self.transport = transport; lock.unlock() }
+    func receive(_ line: Data) {
+        var line = line
+        if line.last == 13 { line.removeLast() }
+        lock.lock()
+        if line.isEmpty {
+            let data = event; event.removeAll(); lock.unlock()
+            if !data.isEmpty { body(data) }
+            return
+        }
+        if line.starts(with: Data("data:".utf8)) {
+            var value = line.dropFirst(5)
+            if value.first == 32 { value = value.dropFirst() }
+            if !event.isEmpty { event.append(10) }
+            event.append(contentsOf: value)
+        }
+        let overflow = event.count > 256 * 1024
+        lock.unlock()
+        if overflow { finish(RustVoiceError.invalidFrame) }
+    }
+    func body(_ data: Data) {
+        lock.lock()
+        guard error == nil else { lock.unlock(); return }
+        if let waiter { self.waiter = nil; lock.unlock(); waiter.resume(returning: data); return }
+        guard bytes + data.count <= 256 * 1024 else { lock.unlock(); finish(RustVoiceError.invalidFrame); return }
+        pending.append(data); bytes += data.count
+        if !paused, bytes >= 128 * 1024 { paused = true; transport?.pause() }
+        lock.unlock()
+    }
+    func finish(_ error: Error) {
+        let error: Error = {
+            if error is CancellationError { return error }
+            if let http = error as? TaskdHTTPError {
+                if case .invalidFrame = http { return RustVoiceError.invalidFrame }
+                if case .rejected(let code) = http { return RustVoiceError.rejected(code) }
+                return RustVoiceError.unavailable
+            }
+            if error is URLError { return RustVoiceError.unavailable }
+            return error
+        }()
+        lock.lock()
+        if self.error == nil { self.error = error }
+        if error is CancellationError { pending.removeAll(); bytes = 0; event.removeAll() }
+        let waiter = waiter; self.waiter = nil; lock.unlock()
+        waiter?.resume(throwing: error)
+    }
+    func next() async throws -> Data {
+        try Task.checkCancellation()
+        return try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            if !pending.isEmpty {
+                let data = pending.removeFirst(); bytes -= data.count
+                if paused, bytes < 128 * 1024 { paused = false; transport?.resume() }
+                lock.unlock(); continuation.resume(returning: data)
+            }
+            else if let error { lock.unlock(); continuation.resume(throwing: error) }
+            else { waiter = continuation; lock.unlock() }
+        }
     }
 }

@@ -1,6 +1,6 @@
 # gmgn-taskd
 
-Rust 后台独立承接许愿任务。客户端连接断开后继续执行；进程重启后恢复已知远端任务，无回执的不确定提交等待用户显式重试。凭据只通过本机 socket 配置，按完整 origin 保存在进程内存。
+Rust 后台承接许愿任务、世界状态和音乐存储。客户端统一通过鉴权本机 HTTP 访问；不提供 Unix socket 或裸 TCP JSON 业务入口。SQLite 只由后台单写入线程管理。进程重启后恢复已知远端任务，无回执的不确定提交等待用户显式重试；生成凭据按完整 origin 保存在进程内存。
 
 ## 构建与离线验证
 
@@ -8,7 +8,9 @@ Rust 后台独立承接许愿任务。客户端连接断开后继续执行；进
 cargo build --locked --release --manifest-path services/gmgn-taskd/Cargo.toml
 cargo test --locked --manifest-path services/gmgn-taskd/Cargo.toml
 cargo clippy --locked --manifest-path services/gmgn-taskd/Cargo.toml --all-targets -- -D warnings
-TASKD_BIN="$PWD/services/gmgn-taskd/target/release/gmgn-taskd" python3 services/gmgn-taskd/tests/process.py -v
+TASKD_BIN="$PWD/target/release/gmgn-taskd" python3 services/gmgn-taskd/tests/process.py -v
+TASKD_BIN="$PWD/target/release/gmgn-taskd" python3 services/gmgn-taskd/tests/http_transport_process.py -v
+TASKD_BIN="$PWD/target/release/gmgn-taskd" python3 services/gmgn-taskd/tests/music_storage_process.py -v
 ```
 
 进程回归仅创建自己的临时目录、Rust 子进程和 loopback 假 HTTP 服务；不启动 macOS 宿主，不访问钥匙串或生产生成服务。`TASKD_BIN` 可指向独立构建目录内的可执行文件。
@@ -16,10 +18,14 @@ TASKD_BIN="$PWD/services/gmgn-taskd/target/release/gmgn-taskd" python3 services/
 ## 启动
 
 ```text
-gmgn-taskd --root <absolute-private-directory> --socket <absolute-socket-path> --concurrency 2 [--legacy-root <absolute-PropGeneration-directory>]
+gmgn-taskd --root <absolute-private-directory> --endpoint-file <absolute-descriptor-path> --concurrency 2 [--legacy-root <absolute-PropGeneration-directory>]
 ```
 
-默认 root 为 `~/Library/Application Support/gmgn radio/TaskService`，socket 必须位于该私有根目录；默认并发为 2，可配置 1—32。任务调度只限制提交、查询、取消和下载请求的并发，不改变远端 GPU 的资源策略。目录为 0700，文件与 socket 为 0600；独占进程锁保护根目录，第二实例不会移除正在使用的 socket。
+默认 root 为 `~/Library/Application Support/gmgn radio/TaskService`，端点描述文件必须位于该私有根目录。后台仅监听 `127.0.0.1` 随机端口，描述文件为 `{version:2,address,token}`。目录为 0700，描述文件和 SQLite 文件为 0600；独占进程锁保护根目录。默认任务并发为 2，可配置 1—32，不改变远端 GPU 的资源策略。
+
+所有路由需要 `Authorization: Bearer <token>`，拒绝浏览器 Origin，不开放 CORS。`GET /health` 返回 `{version:2,transport:"http"}`；`POST /rpc` 接收 `{id,method,params}`，返回 `{id,result}` 或 `{id,error}`；`POST /events` 以 SSE 返回订阅确认与后续事件。普通请求/回复限制为 12 MiB，SSE 有界发送。语音开始通过 `/events` 建立流，追加音频、提交和取消通过 `/rpc`，使用相同随机 `X-GMGN-Client-ID`；断流取消所属语音会话。客户端拒绝旧协议、代理和 HTTP 重定向，无旧传输回退。
+
+节目与歌单使用同一个 `tasks.sqlite3`：schema v5 新增音乐表，`music_program_save/list` 保存节目和 pending 草案，`music_library_read/commit` 以 revision 检查并发更新，`music_import` 按来源幂等迁入旧数据且不覆盖已有同 ID 记录。Unity 和原生端共用后端；旧音乐 JSON 文件仅作为只读迁移源保留。迁移及读取合同见 [HTTP 与音乐存储](../../docs/plans/2026-10-07-taskd-http-music-storage.md)。
 
 SQLite 由专属存储线程单写。任务变更、事件和具有明确 scope 的 `task.stateChanged` 消息在同一事务提交后通知订阅者。慢订阅者从数据库继续按序读取，不依赖内存广播保存内容。world、ui、agent 独立确认消息，重连时重新投递该消费者未确认的消息。
 
@@ -33,7 +39,7 @@ VoiceMem 选择性移植的长期记忆层留在 Rust daemon 内：`memory_statu
 - 界面上**不再**出现任何「长期记忆暂不可用 / 等压缩接上后自动恢复」之类的提示——既然不做，就不该宣传一个不会有的能力。
 - 判据：`swift tools/test-no-long-term-memory-capability.swift`（把能力类型或面向用户的文案注入回来 ⇒ **FAIL**）。
 - **不影响对话连续性**：驻留 agent 的**会话内连续性来自 DSH 自己的 session**（以及 Claude 那条路的内存历史），**不来自**这套记忆库。所以"不做长期记忆"不需要为了对话再补任何东西。
-- **存储范围（最终口径）**：只持久化**空间状态**（世界 + 物件 + 资产引用）到本地 Rust 权威；长期记忆、消息投递迁移、云端同步均**不在计划内**。
+- **存储范围**：空间状态（世界、物件、资产引用）持久化到本地 Rust 权威；2026-10-07 用户另行授权节目和歌单共用该 SQLite。长期记忆、消息投递迁移、云端同步仍不在计划内。
 
 **原文层（volatile pending turns）也已整体移除**（2026-10-01）：`memory_turn` / `memory_pending` / `memory_ingest` 三个方法连同 `Buffer`/`VolatileTurn`/`clear_covered` 与三个上限常量一起删除，调用它们得到专门的 **`memory_original_text_layer_removed`**（不是含糊的 `unknown_method`——老客户端仍会调用，而"回合原文没能进记忆"必须说得出口；也**不是**接受后丢弃，静默成功正是要消灭的形状）。移除依据：真机 `pendingTurns` 恒为 0、三张记忆表 0 行、`memory_compact` 从未有 dispatch 分支，原文层唯一的生产用途（`freshSession` 恢复段）在 pending=0 时**恒为空转**，保留死代码 + 死合同本身就是负担。**压缩层不受影响**：`memory_snapshots`/`memory_requests` 与 `memory::commit` 原样保留。`memory_recall` 的 `pendingTurns` 保留在返回里但**恒为 0**（只为不改客户端解码契约，值已无来源）。进程级回归：`TASKD_BIN="$PWD/services/gmgn-taskd/target/debug/gmgn-taskd" python3 services/gmgn-taskd/tests/local_memory_process.py -v`（无任何 provider fixture：三个原文方法的**可见失败** + "原文绝不落盘"的逐字节搜索 + scope 隔离 + read 的显式 null + query/recall 的如实「语义检索不可用」应答）。注意：`tools/test-resident-state-daemon.py` 中的 v1 升级断言仍写死版本 2，v3 迁移后需改为 3（tools 归 Swift/tools owner，待其更新）。
 

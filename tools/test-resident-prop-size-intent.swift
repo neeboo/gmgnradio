@@ -6,7 +6,7 @@
 //
 // 这里跑的是**真的**那几份实现：真的 `ResidentWishMachineTools`、真的
 // `WishMachineCoordinator`、真的 `PropGenerationStore`、真的 `PropTaskDaemonClient`
-// —— 对面是一个只认 unix socket 的 Python 替身，它把收到的 `submit` 参数**原样记下来**，
+// —— 对面是一个鉴权 HTTP / SSE 的 Python 替身，它把收到的 `submit` 参数**原样记下来**，
 // 于是「线上到底发了什么」可以逐字节断言（而不是读源码猜）。
 //
 // 每一条断言都对应一种「悄悄变坏」的方式：
@@ -34,7 +34,7 @@ func worldRuntimeHarnessFlags() -> [String] {
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let sources = root.appendingPathComponent("apps/macos/Sources/GMGNRadio")
 let required = ["Presence/PropGenerationClient.swift", "Presence/PropGenerationStore.swift",
-                "Presence/PropImagePreparation.swift", "Presence/PropTaskDaemonClient.swift",
+                "Presence/PropImagePreparation.swift", "Presence/PropTaskDaemonClient.swift", "Presence/TaskdHTTPTransport.swift",
                 "Presence/WishMachineOutputDescriptor.swift", "Presence/WishMachineTaskPresentation.swift",
                 // 任务行那一句委托给唯一投影（`OwnershipSentence` 是唯一出口），一起编。
                 "Presence/ResidentOwnershipProjection.swift",
@@ -817,13 +817,21 @@ guard contractSource.contains("static let toolName = \"read_wish_machine_contrac
 }
 
 let fixture = #"""
-import socket,threading,json,os,sys
+import http.server,threading,json,os,sys,uuid,time
 root,path=sys.argv[1:]
-server=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);server.bind(path);os.chmod(path,0o600);server.listen()
+token=str(uuid.uuid4())
 lock=threading.RLock();jobs={}
 def send(c,value):
  try:
-  with lock: c.sendall((json.dumps(value)+'\n').encode())
+  payload=json.dumps(value).encode()
+  if c.path=='/events':
+   c.send_response(200);c.send_header('Content-Type','text/event-stream');c.end_headers()
+   c.wfile.write(b'data: '+payload+b'\n\n');c.wfile.flush()
+   while True:
+    time.sleep(.2);c.wfile.write(b': heartbeat\n\n');c.wfile.flush()
+  else:
+   c.send_response(200);c.send_header('Content-Type','application/json');c.send_header('Content-Length',str(len(payload)));c.end_headers()
+   c.wfile.write(payload)
  except OSError: pass
 def record(params):
  with open(root+'/submits.jsonl','a') as f: f.write(json.dumps(params,sort_keys=True)+'\n')
@@ -844,13 +852,25 @@ def handle(c,q):
  else:
   send(c,{'id':q['id'],'error':{'code':'unknown','message':'unsupported'}});return
  send(c,{'id':q['id'],'result':r})
-def serve(c):
- try:
-  for line in c.makefile('rb'):
-   q=json.loads(line);threading.Thread(target=handle,args=(c,q),daemon=True).start()
- except (OSError,ValueError): pass
-while True:
- c,_=server.accept();threading.Thread(target=serve,args=(c,),daemon=True).start()
+class Handler(http.server.BaseHTTPRequestHandler):
+ def log_message(self,*args): pass
+ def do_GET(self):
+  assert self.headers.get('Authorization')=='Bearer '+token
+  assert self.path=='/health'
+  payload=json.dumps({'version':2,'transport':'http'}).encode()
+  self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(payload)));self.end_headers()
+  self.wfile.write(payload)
+ def do_POST(self):
+  assert self.headers.get('Authorization')=='Bearer '+token
+  assert self.headers.get('Content-Type')=='application/json'
+  assert self.path in ('/rpc','/events')
+  q=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+  handle(self,q)
+server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
+with open(path,'w') as f:
+ json.dump({'version':2,'address':'127.0.0.1:'+str(server.server_port),'token':token},f)
+os.chmod(path,0o600)
+server.serve_forever()
 """#
 
 let program = #"""
@@ -957,10 +977,10 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
 
   let scratch = URL(fileURLWithPath: "/tmp/gmgn-size-intent-" + UUID().uuidString)
   try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-  let socket = scratch.appendingPathComponent("taskd.sock")
+  let endpoint = scratch.appendingPathComponent("taskd.endpoint.json")
   let server = Process()
   server.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-  server.arguments = ["-u", "-c", try String(contentsOfFile: CommandLine.arguments[1], encoding: .utf8), scratch.path, socket.path]
+  server.arguments = ["-u", "-c", try String(contentsOfFile: CommandLine.arguments[1], encoding: .utf8), scratch.path, endpoint.path]
   server.standardOutput = FileHandle.nullDevice
   server.standardError = FileHandle.nullDevice
   try server.run()
@@ -972,7 +992,7 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
       print("PASS: \(checks) size-intent checks")
       exit(0)
   }
-  try await until("fixture socket") { FileManager.default.fileExists(atPath: socket.path) }
+  try await until("fixture HTTP endpoint") { FileManager.default.fileExists(atPath: endpoint.path) }
 
   // 一张真的 2×2 PNG：`PropImagePreparation` 与守护进程契约都只认真 PNG。
   let pixels = Data(repeating: 255, count: 16)
@@ -985,7 +1005,7 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
   CGImageDestinationAddImage(destination, image, nil)
   check(CGImageDestinationFinalize(destination), "fixture PNG")
 
-  let daemon = PropTaskDaemonClient(root: scratch, socketURL: socket, allowsLaunching: false, requestTimeout: 2)
+  let daemon = PropTaskDaemonClient(root: scratch, endpointFileURL: endpoint, allowsLaunching: false, requestTimeout: 2)
   let store = PropGenerationStore(directory: scratch, daemonClient: daemon)
   try store.configure(endpoint: URL(string: "http://127.0.0.1:8765")!, token: "fixture-secret-only-memory")
 

@@ -66,7 +66,7 @@ public extension WorldState {
             // 消失（见 `canRedoInventoryRegistration` 的说明）。把它算进来，会让
             // "重新入库成功了"之后的重放**永远去不了重** —— 那正好是幂等性的反面。
             return objectStates[prop.objectID] != nil
-        case .place, .withdraw, .resize, .rebase, .hold, .adjustGrip, .returnHeld,
+        case .place, .withdraw, .resize, .rebase, .hold, .adjustGrip, .rebindHeldAvatar, .returnHeld, .dropHeld,
              .enableCapability, .delete, .undo:
             // 今天的行为：回执存在即去重。理由见上面的函数说明（就地改动的"还立不立"
             // 无法在不引入回滚风险的前提下判定）。
@@ -339,10 +339,39 @@ public struct WorldSimulation: Sendable {
             item.metadata["gmgn.prop-grip.v1"] = json
             held.returnState.metadata["gmgn.prop-grip.v1"] = json
             // 挂点跟着标定走：`.adjustGrip` 就是"把这件东西挪到另一个挂点/微调它的姿势"
-            // 那条既有命令。`returnState` 一个字不改 —— 放回哪儿仍然是拿起前那一处。
+            // 那条既有命令。放回 transform / isEnabled 保持；握点 metadata 同步更新。
             held.hand = calibration.hand
             next.objectStates[id] = item
             next.heldProp = held
+        case let .rebindHeldAvatar(id, previousAvatarAssetID, calibration):
+            objectID = id
+            if let active = state.activeActivity {
+                throw WorldPropLayoutError.activeActivityConflict(activityID: active.activityID)
+            }
+            guard let held = state.heldProp, held.objectID == id,
+                  held.avatarAssetID == previousAvatarAssetID else {
+                throw WorldPropLayoutError.heldPropMismatch
+            }
+            guard var item = state.objectStates[id], item.generatedProp?.objectID == id,
+                  !item.isEnabled, let previous = item.gripCalibration,
+                  previous.avatarAssetID == previousAvatarAssetID,
+                  previous.hand == held.hand,
+                  held.returnState.generatedProp == item.generatedProp else {
+                throw WorldPropLayoutError.invalidObject
+            }
+            guard calibration.isValid, calibration.avatarAssetID != previousAvatarAssetID,
+                  calibration.hand == held.hand,
+                  calibration.normalizedGrip == previous.normalizedGrip else {
+                throw WorldPropLayoutError.invalidGripCalibration
+            }
+            let json = String(decoding: try JSONEncoder().encode(calibration), as: UTF8.self)
+            item.metadata["gmgn.prop-grip.v1"] = json
+            var returnState = held.returnState
+            returnState.metadata["gmgn.prop-grip.v1"] = json
+            next.objectStates[id] = item
+            next.heldProp = WorldHeldProp(objectID: id, avatarAssetID: calibration.avatarAssetID,
+                hand: held.hand, returnState: returnState)
+            next.layoutUndo = nil
         case let .returnHeld(id, avatarAssetID):
             objectID = id
             guard let held = state.heldProp,
@@ -356,6 +385,29 @@ public struct WorldSimulation: Sendable {
             next.layoutUndo = nil
             next.objectStates[id] = held.returnState
             next.heldProp = nil
+        case let .dropHeld(id, avatarAssetID, placement):
+            objectID = id
+            guard let held = state.heldProp, held.objectID == id, held.avatarAssetID == avatarAssetID else {
+                throw WorldPropLayoutError.heldPropMismatch
+            }
+            guard var item = state.objectStates[id], let prop = item.generatedProp,
+                  prop.objectID == id, held.returnState.generatedProp == prop else {
+                throw WorldPropLayoutError.invalidObject
+            }
+            guard !placement.surfaceID.isEmpty,
+                  [placement.position.x,placement.position.y,placement.position.z,placement.yaw].allSatisfy(\.isFinite),
+                  hypot(placement.position.x-state.agentTransform.position.x,
+                        placement.position.z-state.agentTransform.position.z) <= WorldPropActivityTemplate.interactionReach + 0.00001 else {
+                throw WorldPropLayoutError.invalidPlacement
+            }
+            item.isEnabled = true
+            item.transform = .init(position:placement.position,
+                rotation:.init(x:0,y:sin(placement.yaw/2),z:0,w:cos(placement.yaw/2)),
+                scale:item.transform.scale)
+            item.metadata["gmgn.support-surface.v1"] = placement.surfaceID
+            next.objectStates[id] = item
+            next.heldProp = nil
+            next.layoutUndo = nil
         case let .enableCapability(id, templateID):
             objectID = id
             guard var item = state.objectStates[id], item.generatedProp?.objectID == id else {

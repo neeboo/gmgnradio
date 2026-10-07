@@ -1,20 +1,21 @@
 import Foundation
 
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-let sources = ["PropGenerationClient", "PropImagePreparation", "PropGenerationStore", "PropTaskDaemonClient"].map {
+let sources = ["PropGenerationClient", "PropImagePreparation", "PropGenerationStore", "TaskdHTTPTransport", "PropTaskDaemonClient"].map {
     root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/\($0).swift").path
 }
 let fixture = #"""
-import socket,threading,json,os,time,sys,uuid
+import socket,threading,json,os,time,sys,uuid,http.server
 root,path=sys.argv[1:]
-server=socket.socket(socket.AF_INET,socket.SOCK_STREAM);server.bind(('127.0.0.1',0));server.listen()
 auth=str(uuid.uuid4())
-with open(path,'w') as f:json.dump({'version':1,'address':'127.0.0.1:'+str(server.getsockname()[1]),'token':auth},f)
-os.chmod(path,0o600)
 lock=threading.RLock(); jobs={};events=[]; messages={};acks=set();connections=[];subscriptions=[];snapshots={};seq=0;msgseq=0
 def send(c,value):
  try:
-  with lock: c.sendall((json.dumps(value)+'\n').encode())
+  with lock:
+   data=json.dumps(value).encode()
+   if c.path=='/events':c.wfile.write(b'data: '+data+b'\n\n');c.wfile.flush()
+   else:
+    c.send_response(200);c.send_header('Content-Type','application/json');c.send_header('Content-Length',str(len(data)));c.end_headers();c.wfile.write(data);c.wfile.flush()
  except OSError: pass
 def event(job):
  global seq
@@ -23,7 +24,7 @@ def event(job):
   for c in connections: send(c,{'event':e})
 def handle(c,q):
  global msgseq
- assert q.get('auth')==auth,'request authentication missing'
+ assert 'auth' not in q,'body auth forbidden'
  p=q['params'];m=q['method'];r={}
  if m=='configure': r={'configured':True}
  elif m=='snapshot':
@@ -57,6 +58,10 @@ def handle(c,q):
   time.sleep(.18);r={'job':queued}
  elif m=='retry':
   if os.path.exists(root+'/hang'):return
+  if os.path.exists(root+'/oversize'):
+   send(c,{'id':q['id'],'result':{'padding':'x'*(12*1024*1024)}});return
+  if os.path.exists(root+'/wrong-id'):
+   send(c,{'id':'unrelated','result':{'job':jobs[p['id']]}});return
   if os.path.exists(root+'/reject'):
    send(c,{'id':q['id'],'error':{'code':'fixture_reject','message':'fixture-secret-only-memory'}});return
   r={'job':jobs[p['id']]}
@@ -79,11 +84,31 @@ def handle(c,q):
   acks.add((p['id'],p['consumer']));r={'acknowledged':True}
  else: send(c,{'id':q['id'],'error':{'code':'unknown','message':'secret must not escape'}});return
  send(c,{'id':q['id'],'result':r})
-def serve(c):
- try:
-  for line in c.makefile('rb'):
-   q=json.loads(line);threading.Thread(target=handle,args=(c,q),daemon=True).start()
- except (OSError,ValueError):pass
+class Handler(http.server.BaseHTTPRequestHandler):
+ protocol_version='HTTP/1.1'
+ def log_message(self,*args):pass
+ def authorized(self):
+  assert self.headers.get('Authorization')=='Bearer '+auth,'bearer missing'
+ def do_GET(self):
+  self.authorized();assert self.path=='/health'
+  data=json.dumps({'version':2,'transport':'http'}).encode()
+  self.send_response(200);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
+ def do_POST(self):
+  self.authorized();assert self.headers.get('Content-Type')=='application/json'
+  q=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+  if self.path=='/rpc' and os.path.exists(root+'/redirect'):
+   self.send_response(307);self.send_header('Location','http://127.0.0.1:'+str(sink.server_port)+'/leak');self.send_header('Content-Length','0');self.end_headers();return
+  if self.path=='/rpc' and os.path.exists(root+'/http-reject'):
+   data=json.dumps({'id':None,'error':{'code':'http_unauthorized','message':'fixture-secret-only-memory'}}).encode()
+   self.send_response(401);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data);return
+  if self.path=='/events':
+   assert q['method'] in ['subscribe','subscribe_messages']
+   self.send_response(200);self.send_header('Content-Type','text/event-stream');self.end_headers()
+  else:assert self.path=='/rpc'
+  handle(self,q)
+  if self.path=='/events':
+   while self in connections or any(c is self for c,_ in subscriptions):time.sleep(.02)
+  elif q['method']=='retry' and os.path.exists(root+'/hang'):time.sleep(5)
 def drop():
  while True:
   time.sleep(.02)
@@ -92,13 +117,24 @@ def drop():
    os.unlink(marker)
    with lock:
     for c in set(connections+[x[0] for x in subscriptions]):
-     try:c.shutdown(socket.SHUT_RDWR)
+     try:c.connection.shutdown(socket.SHUT_RDWR)
      except OSError:pass
-     c.close()
+     c.connection.close()
     connections.clear();subscriptions.clear()
-threading.Thread(target=drop,daemon=True).start()
-while True:
- c,_=server.accept();threading.Thread(target=serve,args=(c,),daemon=True).start()
+class Server(http.server.ThreadingHTTPServer):
+ def handle_error(self,request,address):
+  if not isinstance(sys.exc_info()[1],(ConnectionResetError,BrokenPipeError)):super().handle_error(request,address)
+class Sink(http.server.BaseHTTPRequestHandler):
+ def log_message(self,*args):pass
+ def do_POST(self):
+  with open(root+'/redirect-leaked','w') as f:f.write('received')
+  self.send_response(200);self.send_header('Content-Length','0');self.end_headers()
+sink=Server(('127.0.0.1',0),Sink);sink.daemon_threads=True
+threading.Thread(target=sink.serve_forever,daemon=True).start()
+server=Server(('127.0.0.1',0),Handler);server.daemon_threads=True
+with open(path,'w') as f:json.dump({'version':2,'address':'127.0.0.1:'+str(server.server_port),'token':auth},f)
+os.chmod(path,0o600)
+threading.Thread(target=drop,daemon=True).start();server.serve_forever()
 """#
 let program = #"""
 import Foundation
@@ -114,16 +150,16 @@ import UniformTypeIdentifiers
    let deadline=Date().addingTimeInterval(6)
    while !predicate() { guard Date()<deadline else { fatalError("FAIL timeout: "+label) }; try await Task.sleep(for:.milliseconds(20)) }
   }
-  let scratch=URL(fileURLWithPath:"/tmp/gmgn-ipc-"+UUID().uuidString)
+  let scratch=URL(fileURLWithPath:"/private/tmp/gmgn-http-"+UUID().uuidString)
   try FileManager.default.createDirectory(at:scratch,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
   defer { try? FileManager.default.removeItem(at:scratch) }
-  let socket=scratch.appendingPathComponent("taskd.sock")
+  let endpointFile=scratch.appendingPathComponent("taskd.endpoint.json")
   let server=Process();server.executableURL=URL(fileURLWithPath:"/usr/bin/python3")
-  server.arguments=["-u","-c",try String(contentsOfFile:CommandLine.arguments[1],encoding:.utf8),scratch.path,socket.path]
+  server.arguments=["-u","-c",try String(contentsOfFile:CommandLine.arguments[1],encoding:.utf8),scratch.path,endpointFile.path]
   server.standardOutput=FileHandle.nullDevice
   try server.run();defer { server.terminate();server.waitUntilExit() }
-  try await until("fixture socket") { FileManager.default.fileExists(atPath:socket.path) }
-  let client=PropTaskDaemonClient(root:scratch,socketURL:socket,allowsLaunching:false,requestTimeout:2)
+  try await until("fixture endpointFile") { FileManager.default.fileExists(atPath:endpointFile.path) }
+  let client=PropTaskDaemonClient(root:scratch,endpointFileURL:endpointFile,allowsLaunching:false,requestTimeout:2)
   let normalized=try PropTaskDaemonClient.normalizedEndpoint(URL(string:"https://EXAMPLE.COM:443/")!)
   check(normalized.absoluteString=="https://example.com","origin normalization matches Rust for slash, case, and default port")
   defer { client.disconnect() }
@@ -189,15 +225,42 @@ import UniformTypeIdentifiers
   try Data().write(to:scratch.appendingPathComponent("hang"))
   let held=Task { try await client.retry(id:id1) }
   try await Task.sleep(for:.milliseconds(50));held.cancel()
-  do { _ = try await held.value;fatalError("FAIL cancelled IPC request accepted") }
+  do { _ = try await held.value;fatalError("FAIL cancelled HTTP request accepted") }
   catch is CancellationError { checks+=1 }
-  do { _ = try await client.retry(id:id1);fatalError("FAIL unbounded IPC request") }
+  do { _ = try await client.retry(id:id1);fatalError("FAIL unbounded HTTP request") }
   catch PropTaskDaemonError.timedOut { checks+=1 }
   try FileManager.default.removeItem(at:scratch.appendingPathComponent("hang"))
   try Data().write(to:scratch.appendingPathComponent("reject"))
-  do { _ = try await client.retry(id:id1);fatalError("FAIL rejected IPC request accepted") }
+  do { _ = try await client.retry(id:id1);fatalError("FAIL rejected HTTP request accepted") }
   catch { check(!error.localizedDescription.contains("fixture-secret"),"daemon error bodies never leak credentials into UI") }
   try FileManager.default.removeItem(at:scratch.appendingPathComponent("reject"))
+  try Data().write(to:scratch.appendingPathComponent("oversize"))
+  do { _ = try await client.retry(id:id1);fatalError("FAIL oversized HTTP response accepted") }
+  catch PropTaskDaemonError.invalidFrame { checks+=1 }
+  try FileManager.default.removeItem(at:scratch.appendingPathComponent("oversize"))
+  try Data().write(to:scratch.appendingPathComponent("wrong-id"))
+  do { _ = try await client.retry(id:id1);fatalError("FAIL mismatched HTTP response id accepted") }
+  catch PropTaskDaemonError.invalidFrame { checks+=1 }
+  try FileManager.default.removeItem(at:scratch.appendingPathComponent("wrong-id"))
+  do { _ = try await client.call(method:"oversized",params:["padding":.string(String(repeating:"x",count:12*1024*1024))]);fatalError("FAIL oversized HTTP request accepted") }
+  catch PropTaskDaemonError.invalidFrame { checks+=1 }
+  let oldEndpoint=scratch.appendingPathComponent("old.endpoint.json")
+  var old=try JSONSerialization.jsonObject(with:Data(contentsOf:endpointFile)) as! [String:Any]
+  old["version"]=1
+  try JSONSerialization.data(withJSONObject:old).write(to:oldEndpoint)
+  let incompatible=PropTaskDaemonClient(root:scratch,endpointFileURL:oldEndpoint,allowsLaunching:false)
+  do { _ = try await incompatible.snapshot();fatalError("FAIL legacy TCP endpoint accepted") }
+  catch PropTaskDaemonError.unavailable { checks+=1 }
+  incompatible.disconnect()
+  try Data().write(to:scratch.appendingPathComponent("redirect"))
+  do { _ = try await client.retry(id:id1);fatalError("FAIL HTTP redirect accepted") }
+  catch PropTaskDaemonError.unavailable { checks+=1 }
+  check(!FileManager.default.fileExists(atPath:scratch.appendingPathComponent("redirect-leaked").path),"307 cannot send local token or request body to a second HTTP peer")
+  try FileManager.default.removeItem(at:scratch.appendingPathComponent("redirect"))
+  try Data().write(to:scratch.appendingPathComponent("http-reject"))
+  do { _ = try await client.retry(id:id1);fatalError("FAIL HTTP unauthorized accepted") }
+  catch PropTaskDaemonError.requestRejectedWith(let code) { check(code=="http_unauthorized","HTTP failure with null id preserves daemon code") }
+  try FileManager.default.removeItem(at:scratch.appendingPathComponent("http-reject"))
   for consumer in ["world","ui","agent"] { try await store.subscribeMessages(consumer:consumer,worldID:context.worldID,residentScope:context.residentScope) }
   let messageID=UUID()
   _ = try await store.publishMessage(id:messageID,taskId:id1,worldID:context.worldID,residentScope:context.residentScope,kind:"wish.outputReady",payload:["name":.string("cup")])
@@ -206,7 +269,7 @@ import UniformTypeIdentifiers
   try await store.acknowledgeMessage(id:messageID,consumer:"ui",worldID:context.worldID,residentScope:context.residentScope)
   let uiBefore=messages["ui"]!.count,agentBefore=messages["agent"]!.count,worldBefore=messages["world"]!.count
   try Data().write(to:scratch.appendingPathComponent("drop"))
-  try await until("unacked agent and world replay after socket loss") { messages["agent"]!.count>agentBefore && messages["world"]!.count>worldBefore }
+  try await until("unacked agent and world replay after HTTP connection loss") { messages["agent"]!.count>agentBefore && messages["world"]!.count>worldBefore }
   check(messages["ui"]!.count==uiBefore,"UI ACK never consumes world or agent inbox")
   store.unsubscribeMessages(consumer:"agent",worldID:context.worldID,residentScope:context.residentScope)
   let unsubscribed=messages["agent"]!.count
@@ -228,7 +291,7 @@ import UniformTypeIdentifiers
   missing.disconnect()
   if CommandLine.arguments.count > 2 {
    let realRoot=scratch.appendingPathComponent("rust")
-   let realSocket=realRoot.appendingPathComponent("taskd.sock")
+   let realEndpointFile=realRoot.appendingPathComponent("taskd.endpoint.json")
    let legacy=scratch.appendingPathComponent("legacy")
    try FileManager.default.createDirectory(at:legacy,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
    let legacyPNG=legacy.appendingPathComponent("input.png")
@@ -243,11 +306,11 @@ import UniformTypeIdentifiers
    let legacyData=try JSONEncoder().encode(legacyJobs)
    try legacyData.write(to:legacy.appendingPathComponent("tasks.json"))
    let process=Process();process.executableURL=URL(fileURLWithPath:CommandLine.arguments[2])
-   process.arguments=["--root",realRoot.path,"--socket",realSocket.path,"--concurrency","2","--legacy-root",legacy.path]
+   process.arguments=["--root",realRoot.path,"--endpoint-file",realEndpointFile.path,"--concurrency","2","--legacy-root",legacy.path]
    process.standardOutput=FileHandle.nullDevice
    try process.run();defer { process.terminate();process.waitUntilExit() }
-   try await until("real Rust fixture socket") { FileManager.default.fileExists(atPath:realSocket.path) }
-   let real=PropTaskDaemonClient(root:realRoot,socketURL:realSocket,allowsLaunching:false)
+   try await until("real Rust fixture endpointFile") { FileManager.default.fileExists(atPath:realEndpointFile.path) }
+   let real=PropTaskDaemonClient(root:realRoot,endpointFileURL:realEndpointFile,allowsLaunching:false)
    let migrated=try await real.snapshot()
    let migratedBytes=try JSONEncoder().encode(migrated).count
    check(migrated.jobs.count==13 && migratedBytes>12*1024*1024,"real Rust fixed-sequence pagination carries more than 12MiB through Swift")
@@ -261,7 +324,7 @@ import UniformTypeIdentifiers
    let same=try await real.submit(id:identity,endpoint:endpoint,name:"real fixture",png:png,source:PropGenerationSource(author:"fixture",license:"own"),heightMeters:0.2,context:context)
    check(same.id==record.id,"real Rust idempotent resubmit remains one task")
    real.disconnect()
-   let resumed=PropTaskDaemonClient(root:realRoot,socketURL:realSocket,allowsLaunching:false)
+   let resumed=PropTaskDaemonClient(root:realRoot,endpointFileURL:realEndpointFile,allowsLaunching:false)
    defer { resumed.disconnect() }
    let restored=try await resumed.snapshot()
    check(restored.jobs.count==14 && restored.jobs.contains(where:{$0.id==identity}),"real Rust retains jobs after Swift disconnect")
@@ -274,7 +337,7 @@ import UniformTypeIdentifiers
    check(deliveries.count==3,"real Rust message wire schema compatible")
    check(!realEvents.isEmpty,"real Rust event wire schema compatible")
   }
-  print("PASS: \(checks) Swift daemon facade/socket/message checks")
+  print("PASS: \(checks) Swift daemon facade/HTTP/SSE/message checks")
  }
 }
 """#

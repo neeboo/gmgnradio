@@ -104,9 +104,9 @@ extension ResidentPropDelegationError: LocalizedError {
 
     var tools: [ResidentWorldToolSession.AdditionalTool] {
         ["read_owned_props", "list_placement_surfaces", "preview_prop_placement", "apply_prop_placement", "withdraw_prop", "undo_prop_placement",
-         "hold_prop", "adjust_held_prop_grip", "return_held_prop", "enable_prop_capability", "delete_prop"].map { name in
+         "hold_prop", "adjust_held_prop_grip", "return_held_prop", "drop_held_prop", "enable_prop_capability", "delete_prop"].map { name in
             var properties: [String: Any] = [:]
-            if ["preview_prop_placement", "apply_prop_placement", "withdraw_prop", "hold_prop", "adjust_held_prop_grip", "return_held_prop", "enable_prop_capability", "delete_prop"].contains(name) {
+            if ["preview_prop_placement", "apply_prop_placement", "withdraw_prop", "hold_prop", "adjust_held_prop_grip", "return_held_prop", "drop_held_prop", "enable_prop_capability", "delete_prop"].contains(name) {
                 properties["object_id"] = ["type": "string", "description": "read_owned_props 返回的已拥有物件编号"]
             }
             if name == "delete_prop" {
@@ -155,14 +155,18 @@ extension ResidentPropDelegationError: LocalizedError {
                 "undo_prop_placement": "仅按本轮人类要求撤销最近一次摆放或收回；只能撤销一步。",
                 // 工具描述是 agent 真正读到的"能拿多大"：与判据**同源**（插值同一份上限），
                 // 否则提示词说 1.6 m、工具描述说另一个数，agent 会照着错的那一份拒绝用户。
-                "hold_prop": "仅按本轮人类明确要求，让当前已适配居民拿起 / 挂上一件最长边不超过\(ResidentPropAttachmentEligibility.holdableLongestEdgeText)的小道具展示。**必填两个**：object_id（read_owned_props 回执里的物件编号）与 layout_revision（**同一份**回执里的布局版本，原样填）。**挂点由 slot 决定，可省**：取值只有 \(Self.slotChoicesText)；用户说「挂背后 / 挂腰上 / 拿手里」就选对应项，**不写就是 rightHand（拿在右手）**，已经拿在手上的同一件物件换挂点也用它。物件保持同一身份并保留原放回位置。read_owned_props 的回执里 `hold_slots` **逐挂点**给出可用性与各自的原因：右手不行**不代表**背后或腰间不行，别拿一个挂点的答案替用户回答另一个挂点；失败回执里的 slot/slot_name 是这次**真正**按哪个挂点算的（没给 slot 时就是省缺的右手）。",
-                "adjust_held_prop_grip": "仅按本轮人类要求，微调**当前挂点**上那件道具相对该挂点骨骼的米制偏移和局部旋转。**必填**：object_id（read_owned_props 回执里的物件编号）、layout_revision（同一份回执里的布局版本，原样填）、以及 offset_x / offset_y / offset_z（米）与 rotation_yaw（弧度）—— 四个都是**绝对值**，不是增量。先读取当前握点再给。它不会改变挂点本身（换挂点用 hold_prop 的 slot）。",
+                "hold_prop": "仅按本轮人类明确要求，让当前已适配居民拿起 / 挂上一件最长边不超过\(ResidentPropAttachmentEligibility.holdableLongestEdgeText)的小道具展示。**必填两个**：object_id（read_owned_props 回执里的物件编号）与 layout_revision（**同一份**回执里的布局版本，原样填）。**挂点由 slot 决定，可省**：取值只有 \(Self.slotChoicesText)；用户说「挂背后 / 挂腰上 / 拿手里」就选对应项，**不写就是 rightHand（拿在右手）**，已经拿在手上的同一件物件换挂点也用它。用户说「重新握好 / 握把位置不对 / 拿住剑柄」时，先用最新 read_owned_props 确认该物件仍由当前居民持有；已放回时报告现状，不重放旧拿取。仍持有时，同一 object_id、slot=rightHand 会按经验证网格重新计算 normalizedGrip 与朝向，走 adjustGrip 原地保存，不先放回、不重新生成；offset 微调无法完成这件事。物件保持同一身份并保留原放回位置。read_owned_props 的回执里 `hold_slots` **逐挂点**给出可用性与各自的原因：右手不行**不代表**背后或腰间不行，别拿一个挂点的答案替用户回答另一个挂点；失败回执里的 slot/slot_name 是这次**真正**按哪个挂点算的（没给 slot 时就是省缺的右手）。",
+                "adjust_held_prop_grip": "仅按本轮人类要求，微调**当前挂点**上那件道具相对该挂点骨骼的米制偏移和局部旋转。**必填**：object_id（read_owned_props 回执里的物件编号）、layout_revision（同一份回执里的布局版本，原样填）、以及 offset_x / offset_y / offset_z（米）与 rotation_yaw（弧度）—— 四个都是**绝对值**，不是增量。先读取当前握点再给。它保留 normalizedGrip，无法纠正握在剑尖或重新选择柄部。用户说「重新握好 / 握把位置不对 / 拿住剑柄」时，调用 hold_prop，对已持有的同一 object_id 设置 slot=rightHand，按经验证网格重新标定完整握点；不要用本工具替代。换挂点也用 hold_prop 的 slot。",
                 "return_held_prop": "仅按本轮人类要求把当前挂载的道具精确放回拿起前的位置。**必填**：object_id（read_owned_props 回执里的物件编号）与 layout_revision（同一份回执里的布局版本，原样填）。原来在库存则回库存，不接受放回坐标。",
+                "drop_held_prop": "仅按本轮人类要求就近放下当前手持道具。服务自动选择居民身边0.6米内最近的合法真实承托位置，验证地面、整块占地、角色及其他物件碰撞和通路；没有安全位置时仍拿在手中。用户说「放下/放身边」优先用这个；说「放回原位」用return_held_prop。必填object_id与最新layout_revision，不接受远处坐标，不收进库存。",
                 "enable_prop_capability": "仅按本轮人类明确要求使用某物件时，为已拥有摆件启用受支持的使用能力模板（当前仅支持 coffee.brew 冲泡模板）。能力持久化；启用后通过 start_activity 走到物件前面向它执行按钮动作并等待播放完成，属于空间内模拟使用，不宣称物理冲煮结构。按名字猜想的物件不得启用。",
                 // 删除是**永久**的：描述里逐字写出来，agent 才不会把它当成又一次"收回"。
                 "delete_prop": "仅按本轮人类明确要求，**永久删除**一件已拥有的生成资产（不可恢复，没有撤销）。先用 read_owned_props 确认是哪一件。删除会自动收场：正在房间里摆着的、正拿在居民手里的或挂在身上的，都会在同一次提交里先收回/放回再删掉，不需要先调用 withdraw_prop 或 return_held_prop。回执里会说明删了什么、做了哪种收场、以及释放了哪些共享内容（还被别的物件引用的内容一律保留，不会误删）。只有这一件物件独占的内容才会进入可回收集合。删除后该物件不再出现在库存与回执的 objects 里，而是出现在 deleted 里。"
             ]
-            return .init(name: name, description: descriptions[name]!, inputSchema: [
+            let description = descriptions[name]! + (name == "hold_prop"
+                ? " 已摆物件首次拿取必须在真实占地外缘 \(WorldPropActivityTemplate.interactionReach) 米内；远处先 move_to(place_id: object_id)，等 inspect_world 确认到达，再读取最新 read_owned_props 的 layout_revision 后拿取。prop_out_of_reach 是需要走近，不能用撤回库存来绕过距离。库存取出与当前持有同件的重新握持无需再次走近。"
+                : "")
+            return .init(name: name, description: description, inputSchema: [
                 "type": "object", "properties": properties,
                 // `slot` 是 hold_prop 上**唯一可省**的参数：不写就是右手。
                 "required": properties.keys.filter { !(name == "hold_prop" && $0 == "slot") }.sorted(),
@@ -172,7 +176,7 @@ extension ResidentPropDelegationError: LocalizedError {
     }
 
     private static func isMutation(_ name: String) -> Bool {
-        ["apply_prop_placement", "withdraw_prop", "undo_prop_placement", "hold_prop", "adjust_held_prop_grip", "return_held_prop", "enable_prop_capability", "delete_prop"].contains(name)
+        ["apply_prop_placement", "withdraw_prop", "undo_prop_placement", "hold_prop", "adjust_held_prop_grip", "return_held_prop", "drop_held_prop", "enable_prop_capability", "delete_prop"].contains(name)
     }
     /// 挂点那三个取值的**人话名**（"rightHand（右手） / back（背后） / waist（腰间）"）。
     ///
@@ -205,7 +209,7 @@ extension ResidentPropDelegationError: LocalizedError {
     /// 这个工具的**必填**参数 —— 与 schema 的 `required` 是同一份（见 `tools` 里那行 filter）。
     private static func declaredKeys(_ name: String) -> Set<String> {
         var keys = Set<String>()
-        if ["preview_prop_placement", "apply_prop_placement", "withdraw_prop", "hold_prop", "adjust_held_prop_grip", "return_held_prop", "enable_prop_capability", "delete_prop"].contains(name) { keys.insert("object_id") }
+        if ["preview_prop_placement", "apply_prop_placement", "withdraw_prop", "hold_prop", "adjust_held_prop_grip", "return_held_prop", "drop_held_prop", "enable_prop_capability", "delete_prop"].contains(name) { keys.insert("object_id") }
         if name == "enable_prop_capability" { keys.insert("capability") }
         if name == "delete_prop" { keys.insert("reason") }
         if ["preview_prop_placement", "apply_prop_placement"].contains(name) { keys.formUnion(["surface_id", "x", "y", "z", "yaw"]) }
@@ -383,6 +387,11 @@ extension ResidentPropDelegationError: LocalizedError {
                 try await prepareMutation(command)
                 guard !Task.isCancelled, isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
                 try service.commit(command, expectedLayoutRevision: (values["layout_revision"] as! NSNumber).uint64Value, requestID: callID)
+            } else if name == "drop_held_prop" {
+                let command = try service.dropHeldCommand(objectID:values["object_id"] as! String)
+                try await prepareMutation(command)
+                guard !Task.isCancelled, isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
+                try service.commit(command,expectedLayoutRevision:(values["layout_revision"] as! NSNumber).uint64Value,requestID:callID)
             } else if name == "enable_prop_capability" {
                 let command = WorldPropLayoutCommand.enableCapability(
                     objectID: values["object_id"] as! String,
@@ -430,6 +439,12 @@ extension ResidentPropDelegationError: LocalizedError {
             var payload: [String: Any] = ["ok": true, "layout_revision": service.context.state.layoutRevision,
                 "objects": objects, "can_undo": service.context.state.layoutUndo != nil,
                 "mutation_authorized": allowsMutation, "interaction_status": interactionStatus]
+            if name == "return_held_prop" || name == "drop_held_prop",
+               let id = values["object_id"] as? String,let item = service.context.state.objectStates[id] {
+                payload["release_disposition"] = name == "drop_held_prop" ? "dropped_nearby" : (item.isEnabled ? "returned_to_origin" : "returned_to_inventory")
+                payload["released_object_id"] = id
+                payload["released_position"] = ["x":item.transform.position.x,"y":item.transform.position.y,"z":item.transform.position.z]
+            }
             // 墓碑是**只读入口的答案**："这件东西去哪了" —— 已经删掉的不会出现在 objects 里，
             // 但它必须查得到（否则用户与 agent 只会看到"少了一件"，与"意外丢了"分不开）。
             let tombstones = (service.context.state.propTombstones ?? [:]).values
@@ -467,10 +482,17 @@ extension ResidentPropDelegationError: LocalizedError {
             switch error {
             case WorldPropLayoutError.objectNotFound: code = "object_not_found"
             case WorldPropLayoutError.objectAlreadyDeleted: code = "object_already_deleted"
+            case ResidentPropPlacementError.objectOutOfReach: code = "prop_out_of_reach"
             default: code = "placement_rejected"
             }
             var failure: [String: Any] = ["ok": false, "code": code, "message": error.localizedDescription,
                            "layout_revision": service.context.state.layoutRevision]
+            if case let ResidentPropPlacementError.objectOutOfReach(objectID, distance) = error {
+                failure["required_place_id"] = objectID
+                failure["distance_to_edge_meters"] = distance
+                failure["maximum_edge_distance_meters"] = WorldPropActivityTemplate.interactionReach
+                failure["next_step"] = "move_to(place_id: required_place_id)，等 inspect_world 确认到达后再用最新布局版本 hold_prop。"
+            }
             // 失败回执**总是**带上挂点名 —— 包括调用方**没给** `slot` 的时候（那时省缺是右手）。
             // 只带一半（传了才带）会让"系统在按右手算"这件事在回执与日志里都看不见。
             if name == "hold_prop" {

@@ -4,7 +4,7 @@ import argparse
 import copy
 import json
 import pathlib
-import socket
+import http.client
 import subprocess
 import tempfile
 import time
@@ -44,11 +44,17 @@ def run(args):
     def rpc(method, params):
         e = json.loads(endpoint.read_text())
         host, port = e["address"].split(":")
-        assert host == "127.0.0.1"
-        with socket.create_connection((host, int(port)), timeout=5) as stream:
-            stream.sendall((json.dumps({"id": str(uuid.uuid4()), "auth": e["token"],
-                                       "method": method, "params": params}) + "\n").encode())
-            reply = json.loads(stream.makefile("rb").readline())
+        assert host == "127.0.0.1" and e["version"] == 2
+        connection = http.client.HTTPConnection(host, int(port), timeout=5)
+        try:
+            connection.request("POST", "/rpc", json.dumps({"id": str(uuid.uuid4()),
+                               "method": method, "params": params}).encode(),
+                               {"Authorization": "Bearer " + e["token"], "Content-Type": "application/json"})
+            response = connection.getresponse()
+            reply = json.loads(response.read())
+            assert response.status == 200, reply
+        finally:
+            connection.close()
         return reply
 
     def snapshot():

@@ -4,13 +4,13 @@ import Foundation
 
 enum WorldAuthorityError: Error { case daemon(String), invalidResponse, unavailable(String) }
 struct WorldAuthorityEndpoint {
-    let socketPath = "unused", helperPath = "unused"
+    let endpointFile = "unused", helperPath = "unused"
     init(applicationSupportBase: URL) {}
 }
 struct WorldAuthorityClient { static func decodeState(_ state: [String: Any]) throws {} }
-struct LoopbackJSONClient {
+struct TaskdHTTPAuthorityClient {
     static let maximumFrame = 12 * 1024 * 1024
-    init(socketPath: String, helperPath: String, allowsLaunching: Bool, timeout: Double) {}
+    init(endpointFile: String, helperPath: String, allowsLaunching: Bool, timeout: Double) {}
     func call(method: String, params: [String: Any]) throws -> [String: Any] { fatalError("test must not call transport") }
 }
 
@@ -43,6 +43,11 @@ struct LoopbackJSONClient {
                 ["shape": "box", "id": "box", "volume": ["center": [0, 0, 0]]]]]
         let compact = try bridge.preparePlacementGeometry(input)
         try require(equalBits(faces, try expanded(compact["triangles"]!)), "top-level winding and vertex bits")
+        let precise: [[[NSNumber]]] = [[[0.12345678, -2.1234567, 3.1415927], [1.2345678, 0.000012345678, -5.7654321], [0, 0, 1]]]
+        let preciseWire = try bridge.preparePlacementGeometry(["triangles": precise])
+        let serialized = try JSONSerialization.data(withJSONObject: preciseWire)
+        let decoded = try JSONSerialization.jsonObject(with: serialized) as! [String: Any]
+        try require(equalBits(precise, try expanded(decoded["triangles"]!)), "serialized shortest decimal preserves exact f32 bits")
         let placed = compact["placedObstacles"] as! [[String: Any]]
         try require(equalBits(faces, try expanded(placed[0]["triangles"]!)), "nested prop winding and vertex bits")
         try require(placed[0]["id"] as? String == "prop" && placed[0]["isClosed"] as? Bool == true, "identity and closedness")
@@ -63,8 +68,8 @@ struct LoopbackJSONClient {
         let before = try JSONSerialization.data(withJSONObject: dense).count
         let shrunk = try bridge.preparePlacementGeometry(dense)
         let after = try JSONSerialization.data(withJSONObject: shrunk).count
-        try require(before > LoopbackJSONClient.maximumFrame, "fixture must exceed old frame limit")
-        try require(after < LoopbackJSONClient.maximumFrame - 4096, "indexed nested payload must fit unchanged frame limit")
+        try require(before > TaskdHTTPAuthorityClient.maximumFrame, "fixture must exceed old frame limit")
+        try require(after < TaskdHTTPAuthorityClient.maximumFrame - 4096, "indexed nested payload must fit unchanged frame limit")
         try require(try expanded(shrunk["triangles"]!).count == large.count, "no collider faces lost")
         for obstacle in shrunk["placedObstacles"] as! [[String: Any]] {
             try require(equalBits(large, try expanded(obstacle["triangles"]!)), "no obstacle faces lost")

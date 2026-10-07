@@ -5,8 +5,10 @@ import WorldRuntime
 
 @MainActor
 @Test
-func worldAgentCapabilityManifestExposesElevenAtomicTools() {
+func worldAgentCapabilityManifestExposesAtomicWorldAndMotionTools() {
     #expect(WorldAgentToolContract.capabilities.map(\.name) == [
+        "list_available_motions",
+        "play_motion",
         "inspect_world",
         "list_places",
         "list_available_activities",
@@ -23,6 +25,7 @@ func worldAgentCapabilityManifestExposesElevenAtomicTools() {
         WorldAgentToolContract.capabilities
             .filter { $0.requiresTakeover }
             .map(\.name) == [
+                "play_motion",
                 "move_to",
                 "start_activity",
                 "stop_activity",

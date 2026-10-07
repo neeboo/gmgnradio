@@ -296,6 +296,19 @@ func usageStatus(_ result: RealtimeDJToolResult) -> String? {
 
 @main struct Tests {
     @MainActor static func main() async throws {
+        // A fresh authority load may discard an uncommitted simulation tick;
+        // ordinary external projections remain monotonic and cannot roll back.
+        do {
+            let context = try makeContext()
+            let durable = context.state
+            try context.tick(deltaTime: 0.1)
+            let speculative = context.state
+            check(speculative.revision > durable.revision, "tick advances disposable projection")
+            try context.adoptAuthorityState(durable, propFunctionSources: [])
+            check(context.state == speculative, "ordinary older projection cannot discard live state")
+            try context.adoptAuthorityState(durable, propFunctionSources: [], replacingUncommittedProjection: true)
+            check(context.state == durable, "explicit authority reload restores exact durable state without replay")
+        }
         // 1. Binding requires a human round; the bound readback is exact.
         do {
             let arguments = try JSONSerialization.data(withJSONObject: [

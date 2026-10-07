@@ -23,3 +23,12 @@ python3 apps/unity-player/Assets/GMGN/Fonts/generate-lyrics-fonts.py
 song loading, not performed every frame; adding weights multiplies potential
 atlas memory. The GPU renderer must associate each glyph with its actual font
 atlas layer rather than assuming all weights share one texture.
+
+Missing characters use same-weight **GMGN Lyrics Latin** instances of the
+checked-in `NotoSansLatin.ttf`, obtained from Google's Noto Sans source:
+https://github.com/google/fonts/tree/main/ofl/notosans . Its accompanying
+`NOTO-LATIN-OFL.txt` must ship with derivatives. Regenerate these with
+`generate-lyrics-latin-fonts.py`. Fallback applies only when the SC face lacks
+a character; all existing CJK/Latin outlines and eleven theme roles stay intact.
+GPU glyph descriptors and width measurement use the selected glyph's actual
+font metrics and atlas layer, including Polish ł/Ł.

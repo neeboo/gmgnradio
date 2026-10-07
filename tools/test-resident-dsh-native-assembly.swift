@@ -9,7 +9,7 @@
 //
 //   宿主按本轮正式 schemas 生成 grant + 真实 JS 插件 → dsh 单进程启动（受限
 //   overlay，与生产同款禁用集）→ 插件 ctx.tools.register 原生注册 gmgn_* →
-//   模型原生 function call → DSH 派发插件 execute → 私有 UDS IPC 回宿主 →
+//   模型原生 function call → DSH 派发插件 execute → 私有 HTTP /rpc 回宿主 →
 //   宿主 secret/名称边界/原 schema 复核/授权闸后执行测试宿主工具 → 规范 JSON 回
 //   插件 → DSH agent loop 在同一运行内把工具结果回灌模型 → 真实 final 正文。
 //

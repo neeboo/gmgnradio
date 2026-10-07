@@ -44,7 +44,7 @@ namespace GMGN.UnityPlayer
             }
             var camera = Camera.main;
             if (character == null || !character.gameObject.activeInHierarchy || camera == null) { cloud.style.display = DisplayStyle.None; return; }
-            var top = character.transform.TransformPoint(new Vector3(0, 1.65f, 0));
+            var top = character.HeadPosition;
             var projected = camera.WorldToViewportPoint(top);
             var head = RuntimePanelUtils.CameraTransformWorldToPanel(root.panel, top, camera);
             var foot = RuntimePanelUtils.CameraTransformWorldToPanel(root.panel, character.transform.position, camera);

@@ -111,11 +111,11 @@ MonoBehaviour:
     m_Metadata:
       m_Items: []
   - m_Id: 540008469
-    m_Localized: Push-to-talk is not available yet
+    m_Localized: Hold to talk
     m_Metadata:
       m_Items: []
   - m_Id: 540008470
-    m_Localized: Notifications are not available yet
+    m_Localized: Notifications
     m_Metadata:
       m_Items: []
   - m_Id: 540008471
@@ -176,6 +176,594 @@ MonoBehaviour:
       m_Items: []
   - m_Id: 664083095561
     m_Localized: Notification service is disconnected
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000000
+    m_Localized: Basic objects
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000001
+    m_Localized: Wish machine
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000002
+    m_Localized: Jukebox
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000003
+    m_Localized: Wish machine
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000004
+    m_Localized: Create a wish in chat
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000005
+    m_Localized: No wishes yet. Create a wish in chat.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000006
+    m_Localized: Wish operation failed. Please retry.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000007
+    m_Localized: Wishes updated
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000008
+    m_Localized: "Processing wish\u2026"
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000009
+    m_Localized: Added to inventory
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000010
+    m_Localized: Retry adding to inventory
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000011
+    m_Localized: Claim object
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000012
+    m_Localized: Awaiting generation
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000013
+    m_Localized: Generation submitted
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000014
+    m_Localized: Generating
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000015
+    m_Localized: Ready to claim
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000016
+    m_Localized: Claimed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000017
+    m_Localized: Generation failed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000018
+    m_Localized: Cancelled
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000019
+    m_Localized: Queued
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000020
+    m_Localized: Generating
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000021
+    m_Localized: "Sent. Waiting for the character\u2019s reply\u2026"
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000022
+    m_Localized: Character response failed. Please retry.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000023
+    m_Localized: Response stopped
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000024
+    m_Localized: Chat service is disconnected
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000025
+    m_Localized: Music and chat services could not connect
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000026
+    m_Localized: Hold to talk
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000027
+    m_Localized: "Connecting speech recognition\u2026"
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000028
+    m_Localized: Listening. Release to finish.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000029
+    m_Localized: "Transcribing\u2026"
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000030
+    m_Localized: Voice input failed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000031
+    m_Localized: Speech transcribed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000032
+    m_Localized: Allow microphone access in system settings.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000033
+    m_Localized: Waiting for microphone permission. Allow access and retry.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000034
+    m_Localized: No speech recognized. Please retry.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000035
+    m_Localized: Speech recognition failed. Please retry.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000036
+    m_Localized: Could not send voice data.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000037
+    m_Localized: Could not connect to speech recognition. Check your configuration.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000038
+    m_Localized: Could not finish the speech recognition request.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000039
+    m_Localized: Speech recognition timed out. Please retry.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000040
+    m_Localized: No audio recorded. Check your microphone.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000041
+    m_Localized: Recording failed. Check your microphone.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000042
+    m_Localized: Audio processing is too slow. Please retry.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000100
+    m_Localized: Submitting
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000101
+    m_Localized: Submission awaiting confirmation
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000102
+    m_Localized: Generated. Validating.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 700000000103
+    m_Localized: Generation interrupted
+    m_Metadata:
+      m_Items: []
+  - m_Id: 24109056
+    m_Localized: Basic objects
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691968
+    m_Localized: Wish machine
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691969
+    m_Localized: Jukebox
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691970
+    m_Localized: Wish machine
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691971
+    m_Localized: Create a wish in chat
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691972
+    m_Localized: No wishes yet. Create a wish in chat.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691973
+    m_Localized: Wish operation failed. Please retry.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691974
+    m_Localized: Wishes updated
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691975
+    m_Localized: "Processing wish\u2026"
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691976
+    m_Localized: Added to inventory
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691977
+    m_Localized: Retry adding to inventory
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691978
+    m_Localized: Claim object
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691979
+    m_Localized: Awaiting generation
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691980
+    m_Localized: Generation submitted
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691981
+    m_Localized: Generating
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691982
+    m_Localized: Ready to claim
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691983
+    m_Localized: Claimed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691984
+    m_Localized: Generation failed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691985
+    m_Localized: Cancelled
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691986
+    m_Localized: Queued
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691987
+    m_Localized: Generating
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691988
+    m_Localized: "Sent. Waiting for the character\u2019s reply\u2026"
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691989
+    m_Localized: Character response failed. Please retry.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691990
+    m_Localized: Response stopped
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691991
+    m_Localized: Chat service is disconnected
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691992
+    m_Localized: Music and chat services could not connect
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691993
+    m_Localized: Hold to talk
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691994
+    m_Localized: "Connecting speech recognition\u2026"
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691995
+    m_Localized: Listening. Release to finish.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691996
+    m_Localized: "Transcribing\u2026"
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691997
+    m_Localized: Voice input failed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691998
+    m_Localized: Speech transcribed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691999
+    m_Localized: Allow microphone access in system settings.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692000
+    m_Localized: Waiting for microphone permission. Allow access and retry.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692001
+    m_Localized: No speech recognized. Please retry.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692002
+    m_Localized: Speech recognition failed. Please retry.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692003
+    m_Localized: Could not send voice data.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692004
+    m_Localized: Could not connect to speech recognition. Check your configuration.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692005
+    m_Localized: Could not finish the speech recognition request.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692006
+    m_Localized: Speech recognition timed out. Please retry.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692007
+    m_Localized: No audio recorded. Check your microphone.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692008
+    m_Localized: Recording failed. Check your microphone.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692009
+    m_Localized: Audio processing is too slow. Please retry.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692010
+    m_Localized: Submitting
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692011
+    m_Localized: Submission awaiting confirmation
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692012
+    m_Localized: Generated. Validating.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692013
+    m_Localized: Generation interrupted
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692014
+    m_Localized: Generation service is not configured
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692015
+    m_Localized: Generation configuration loaded
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692016
+    m_Localized: Could not read generation configuration. Check local file permissions.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692017
+    m_Localized: Generation configuration saved
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692018
+    m_Localized: Could not save configuration. Check the URL and key.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692019
+    m_Localized: Enter a new key when changing the service URL.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692020
+    m_Localized: Generation service connection verified
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692021
+    m_Localized: Generation connection failed. Check the URL and key.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 15853666951168
+    m_Localized: Space screen
+    m_Metadata:
+      m_Items: []
+  - m_Id: 15853679534080
+    m_Localized: Video URL
+    m_Metadata:
+      m_Items: []
+  - m_Id: 15853679534081
+    m_Localized: Play URL
+    m_Metadata:
+      m_Items: []
+  - m_Id: 15853679534082
+    m_Localized: Stop playback
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061047664640
+    m_Localized: Mini player
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219072
+    m_Localized: Restore window
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219073
+    m_Localized: Reply history
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219074
+    m_Localized: "Responding\u2026"
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219075
+    m_Localized: Could not stop the reply. Please retry.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219076
+    m_Localized: Music and chat services are disconnected
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219077
+    m_Localized: You
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219078
+    m_Localized: Character
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219079
+    m_Localized: Message was not sent. Please retry.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219080
+    m_Localized: 'Reply incomplete: '
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219081
+    m_Localized: Send or clear the current draft before editing this message.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219082
+    m_Localized: "Connecting music and character\u2026"
+    m_Metadata:
+      m_Items: []
+  - m_Id: 321916169609216
+    m_Localized: Refresh wishes
+    m_Metadata:
+      m_Items: []
+  - m_Id: 321916182192128
+    m_Localized: Close wish machine
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304766791680
+    m_Localized: Music library
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763200
+    m_Localized: Back to playlists
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763201
+    m_Localized: Refresh playlists
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763202
+    m_Localized: Close music library
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763203
+    m_Localized: Playlists
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763204
+    m_Localized: Tracks
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763205
+    m_Localized: "Loading playlists\u2026"
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763206
+    m_Localized: Music library is busy. Please retry shortly.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763207
+    m_Localized: "Preparing playback\u2026"
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763208
+    m_Localized: Could not prepare this track. Please retry.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763209
+    m_Localized: "Loading playlist tracks\u2026"
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763210
+    m_Localized: Playlist is busy. Go back and retry.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763211
+    m_Localized: '{0} tracks'
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763212
+    m_Localized: Playing
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763213
+    m_Localized: "Playing \xB7 {0}"
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763214
+    m_Localized: NetEase Cloud Music
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763215
+    m_Localized: QQ Music
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763216
+    m_Localized: Music library is unavailable.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763217
+    m_Localized: No synced playlists yet.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763218
+    m_Localized: Choose a playlist to view tracks
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763219
+    m_Localized: Select a track to play
+    m_Metadata:
+      m_Items: []
+  - m_Id: 350953789186048
+    m_Localized: "Voice input \xB7 review before sending"
+    m_Metadata:
+      m_Items: []
+  - m_Id: 350953801768960
+    m_Localized: "Recording \xB7 click to stop"
+    m_Metadata:
+      m_Items: []
+  - m_Id: 363351027736576
+    m_Localized: Local speech service is unavailable. Reopen the app.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 363351040319488
+    m_Localized: Configure a service key in voice input settings first.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 363351040319489
+    m_Localized: Speech service returned an invalid response. Recording did not start. Please retry.
+    m_Metadata:
+      m_Items: []
+  - m_Id: 363351040319490
+    m_Localized: The speech provider rejected the request. Check configuration and quota.
     m_Metadata:
       m_Items: []
   references:

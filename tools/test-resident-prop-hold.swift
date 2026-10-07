@@ -743,7 +743,8 @@ import simd
 \#(slotTableDeclaration)
 """#
 
-let gripSlice = gripSource.replacingOccurrences(of: "import WorldRuntime", with: "")
+let triangleDeclaration = declaration(try readSource("apps/macos/Packages/WorldRuntime/Sources/WorldRuntime/TriangleMeshCollisionWorld.swift"), "public struct WorldTriangle")!
+let gripSlice = triangleDeclaration.replacingOccurrences(of: "public ", with: "") + "\n" + gripSource.replacingOccurrences(of: "import WorldRuntime", with: "")
 
 let checks = #"""
 import Foundation
@@ -757,6 +758,14 @@ import simd
         // 最终世界尺寸是 0.1462 × 1.1 × 0.0624（1.1 m 的剑）。
         let swordSize = WorldVector3(x: 0.1462, y: 1.1, z: 0.0624)
         let upright = WorldPropRotation.axisAngle(axis: SIMD3<Float>(0, 0, 1), angle: .pi / 2)
+        // Explicit source geometry: round handle at low X, narrow flat blade at high X.
+        func box(_ x0: Float, _ x1: Float, _ y: Float, _ z: Float) -> [WorldTriangle] {
+            let p = [SIMD3<Float>(x0,-y,-z), SIMD3<Float>(x0,y,-z), SIMD3<Float>(x0,y,z), SIMD3<Float>(x0,-y,z),
+                     SIMD3<Float>(x1,-y,-z), SIMD3<Float>(x1,y,-z), SIMD3<Float>(x1,y,z), SIMD3<Float>(x1,-y,z)]
+            let faces = [(0,1,2),(0,2,3),(4,6,5),(4,7,6),(0,4,5),(0,5,1),(1,5,6),(1,6,2),(2,6,7),(2,7,3),(3,7,4),(3,4,0)]
+            return faces.map { WorldTriangle(p[$0.0],p[$0.1],p[$0.2]) }
+        }
+        let geometry = box(0,0.18,0.015,0.012) + box(0.18,0.2,0.0665,0.0285) + box(0.2,1,0.025,0.005)
 
         // ---- 方向正确性：摆正旋转确实把原始 X 转到世界 Y ----
         let rotatedX = WorldPropRotation.rotate(SIMD3<Float>(1, 0, 0), by: upright)
@@ -765,10 +774,10 @@ import simd
               "摆正后最长的那根轴（Y）必须翻回原始网格的 X 轴")
 
         // ---- 推断出来的握点 ----
-        let suggestion = PropGripInference.suggestion(size: swordSize, orientation: upright)
-        check(suggestion.origin == .meshPrincipalAxis,
+        let suggestion = PropGripInference.suggestion(size: swordSize, orientation: upright, geometry: geometry)
+        check(suggestion.origin == .meshHandleSection,
               "1.1 m 的剑（比值 7.52）必须走「按网格主轴推断」，实测 \(suggestion.origin.rawValue)")
-        check(abs(suggestion.normalizedGrip.x - 0.054545) < 0.001,
+        check(suggestion.normalizedGrip.x > 0.04 && suggestion.normalizedGrip.x < 0.18,
               "握点必须落在**剑柄那一端**（X ≈ 0.055），实测 \(suggestion.normalizedGrip.x)")
         check(suggestion.normalizedGrip.y == 0.5 && suggestion.normalizedGrip.z == 0.5,
               "两个次轴必须在中间")
@@ -894,8 +903,8 @@ import simd
 
         // (e) 负对照「打横」：网格躺着且**没有**被摆正（就是改造前那把剑）时，
         //     若刃朝向不校准，剑身会横在手里 —— 与骨轴夹角 90°。
-        let lying = PropGripInference.suggestion(size: WorldVector3(x: 1.1, y: 0.1462, z: 0.0624))
-        check(lying.origin == .meshPrincipalAxis, "躺着的细长物件同样要走主轴那条路")
+        let lying = PropGripInference.suggestion(size: WorldVector3(x: 1.1, y: 0.1462, z: 0.0624), geometry: geometry)
+        check(lying.origin == .meshHandleSection, "躺着的细长物件同样需要柄部截面证据")
         let alignedAxis = PropGripInference.bladeAxisInHandSpace(
             size: WorldVector3(x: 1.1, y: 0.1462, z: 0.0624),
             orientation: PropGripInference.identityRotation,
@@ -1054,8 +1063,11 @@ import simd
         let swordProp = WorldGeneratedProp(
             objectID: "sword", assetID: "sha", displayName: "2B 白色长剑",
             size: swordSize, sourceHeight: 1.1, orientationRotation: upright)
+        check(PropAttachmentSlots.calibration(avatarAssetID: "pmx.2b-miss-0414-standard",
+            prop: swordProp, point: .rightHand) == nil,
+            "只有细长AABB不能确定柄端，缺几何证据必须拒绝自动手持")
         guard let handCalibration = PropAttachmentSlots.calibration(
-            avatarAssetID: "pmx.2b-miss-0414-standard", prop: swordProp, point: .rightHand) else {
+            avatarAssetID: "pmx.2b-miss-0414-standard", prop: swordProp, point: .rightHand, geometry: geometry) else {
             check(false, "手那个挂点必须能造出标定"); return
         }
         check(handCalibration.normalizedGrip == suggestion.normalizedGrip

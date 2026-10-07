@@ -1,7 +1,9 @@
 #if GMGN_UMT
 using System.Collections.Generic;
+using System.Text;
 using UnityEngine;
 using Unity.Mathematics;
+using Unity.Collections;
 using UMT;
 
 namespace GMGN.UnityPlayer.Characters
@@ -56,6 +58,40 @@ namespace GMGN.UnityPlayer.Characters
                 adapted++;
             }
             Debug.Log($"[CharacterRetarget] generatedBindFrames={bases.Count} adaptedKeys={adapted}");
+            PreserveGeneratedFkFeet(animation, model);
+        }
+
+        // Generated humanoid clips contain authored FK leg/ankle rotations but
+        // no MMD foot-IK targets. The default model IK otherwise pulls both feet
+        // back to static bind targets while baking, erasing lateral leg motion.
+        // Add clip-local toggles: never modify the shared PMX rig configuration.
+        static void PreserveGeneratedFkFeet(VMDAnimation animation, PMXModel model)
+        {
+            if (animation.showIKFrames.Length != 0) return;
+            var indices = new Dictionary<string,int>();
+            for(var i=0;i<model.bones.Length;i++)
+                indices[model.bones[i].originalName.ToString().Normalize(NormalizationForm.FormKC)]=i;
+            var source = new HashSet<int>();
+            foreach(var frame in animation.boneFrames)
+                if(indices.TryGetValue(frame.boneName.ToString().Normalize(NormalizationForm.FormKC),out var index))source.Add(index);
+            // Preserve clips with any authored IK driver track. These have a
+            // different contract from generated FK-only humanoid animation.
+            foreach(var index in source)if(model.bones[index].ik!=null)return;
+            var ankles = new HashSet<int>();
+            foreach(var name in new[]{"左足首","右足首"})
+                if(indices.TryGetValue(name,out var index)&&source.Contains(index))ankles.Add(index);
+            if(ankles.Count==0)return;
+            var toggles = new List<VMDIKToggleFrame>();
+            for(var i=0;i<model.bones.Length;i++) {
+                var ik=model.bones[i].ik;if(ik==null)continue;
+                var controlsFoot=ankles.Contains(ik.targetBoneIndex);
+                foreach(var link in ik.links)controlsFoot|=ankles.Contains(link.boneIndex);
+                if(!controlsFoot)continue;
+                toggles.Add(new VMDIKToggleFrame{boneName=new FixedString32Bytes(model.bones[i].originalName.ToString()),frame=0,enabled=false});
+            }
+            if(toggles.Count==0)return;
+            animation.showIKFrames=new[]{new VMDShowIKFrame{frame=0,show=true,ikToggles=toggles.ToArray()}};
+            Debug.Log($"[CharacterRetarget] generatedFKFootIKDisabled={toggles.Count} clipLocal=true");
         }
     }
 }

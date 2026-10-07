@@ -69,6 +69,7 @@ final class MusicLibraryAgentService {
                     throw DJAgentMusicLibraryError.libraryUnavailable
                 }
                 store.append(page)
+                try await store.flush()
                 playlist = try supportedPlaylist(id: playlistID)
             }
         }

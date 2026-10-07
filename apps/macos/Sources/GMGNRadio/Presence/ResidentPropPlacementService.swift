@@ -17,6 +17,7 @@ enum ResidentPropHoldStep: String, CaseIterable, Sendable {
     case otherPropHeld = "other-prop-held"
     case propTooLarge = "prop-too-large"
     case gripCalibration = "grip-calibration"
+    case objectOutOfReach = "object-out-of-reach"
 
     /// 屏幕/回执上那句人话（拒绝文案由**判据自己**给，这里只说"是哪一步"）。
     var label: String {
@@ -29,6 +30,7 @@ enum ResidentPropHoldStep: String, CaseIterable, Sendable {
         case .otherPropHeld: "居民手里已经有别的东西"
         case .propTooLarge: "物件超过手持上限"
         case .gripCalibration: "挂点标定算不出来（角色/资产/骨骼/净空之一不成立）"
+        case .objectOutOfReach: "需要先走到物件近前"
         }
     }
 }
@@ -69,15 +71,17 @@ enum ResidentPropPlacementError: Error, Equatable, LocalizedError {
     case inactiveContext, environmentNotReady, unknownSurface, outsideSurface, collision(String), blockedRoute(String)
     case blockedBySupport(PropSupportBlockReason)
     case avatarUnavailable, avatarChanged, attachmentUnsupported(String), propTooLarge(String), activityActive, notHeld
+    case objectOutOfReach(objectID: String, distance: Float)
     /// 判据分层的**类型前提**被违反：一次被当成"入库登记"的提交，候选状态里那件东西却在空间里。
     /// 分类错了就必须 fail-closed 拒绝，而不是悄悄跳过空间判据（见 `ResidentPropLayoutIntent`）。
     case inventoryRegistrationInSpace(String)
+    case noNearbyDropPosition
     var errorDescription: String? {
         switch self {
         case .inactiveContext: "当前空间或编辑操作已结束。"
         case .environmentNotReady: "空间碰撞数据尚未准备好，请稍后再摆放。"
         case .unknownSurface: "这里不是可以摆放的承托面。"
-        case .blockedBySupport(let reason): reason.errorDescription
+        case .blockedBySupport(let reason): reason.localizedDescription
         case .outsideSurface: "物件超出了支撑面的范围。"
         case .collision(let name): "这里会碰到居民或物件：\(name)。"
         case .blockedRoute(let name): "摆在这里居民就走不到 \(name) 了。"
@@ -89,7 +93,10 @@ enum ResidentPropPlacementError: Error, Equatable, LocalizedError {
         case .propTooLarge(let name): "\(name) 最长边超过 \(ResidentPropAttachmentEligibility.holdableLongestEdgeText)，只能摆放，暂时不能拿在手里。"
         case .activityActive: "居民正在进行正式活动，请先停止活动再拿起物件。"
         case .notHeld: "这个物件当前没有拿在手里。"
+        case let .objectOutOfReach(objectID, distance):
+            String(format: "距离物件外缘 %.2f 米，超过可拿取距离 %.2f 米。请先 move_to(place_id: %@)，等到达后再 hold_prop。", distance, WorldPropActivityTemplate.interactionReach, objectID)
         case .inventoryRegistrationInSpace(let name): "入库登记只收未摆出的物件，\(name) 现在在空间里。"
+        case .noNearbyDropPosition: "居民身边 0.6 米内没有安全的承托位置，物件仍保留在手中。可以走到空地再放下，或选择放回原位。"
         }
     }
 }
@@ -106,10 +113,12 @@ enum ResidentPropLayoutIntent: Equatable {
     /// 判据只有归属与资产：物件身份 / 尺寸合法 / 资产存在且哈希自洽 / 请求幂等。
     /// **不得**要求承托面、可达、通道、与已摆物件不重叠 —— 库存里的东西不在空间里。
     case inventoryRegistration(objectID: String)
-    /// **空间变更**：候选状态里"空间里有什么、它在哪"变了（新摆 / 移动 / 收起 / 手持 /
+    /// **空间变更**：候选状态里"空间里有什么、它在哪"变了（新摆 / 移动 / 收起 / 放回 /
     /// 改尺寸 / 加能力 / 撤销）。判据是**全部**空间判据（`ResidentPropPlacementService.validate(_:)`，
     /// 一个字不放宽）。
     case spatialChange(objectID: String)
+    /// 持握仅改变骨骼挂载和握点，不新增地面占用。旧放回位保持不变；实际放回仍走空间校验。
+    case attachmentChange(objectID: String)
     /// **删除**：这一件离开世界，留下一条墓碑。
     ///
     /// 为什么它是**第三层**、而不是"又一种 spatialChange"：删除也会改变"空间里有什么"，
@@ -167,12 +176,12 @@ extension ResidentPropLayoutIntent {
                   state.heldProp?.objectID != objectID
             else { return .spatialChange(objectID: objectID) }
             return .inventoryRegistration(objectID: objectID)
-        case let .place(objectID, _), let .withdraw(objectID), let .hold(objectID, _, _),
-             let .adjustGrip(objectID, _, _), let .returnHeld(objectID, _),
+        case let .hold(objectID, _, _), let .adjustGrip(objectID, _, _), let .rebindHeldAvatar(objectID, _, _):
+            return .attachmentChange(objectID: objectID)
+        case let .place(objectID, _), let .withdraw(objectID), let .returnHeld(objectID, _), let .dropHeld(objectID, _, _),
              let .enableCapability(objectID, _):
-            // 全部会改变"空间里有什么 / 它在哪"：place/hold/returnHeld 让物件进出空间，
+            // 全部会改变"空间里有什么 / 它在哪"：place/returnHeld 让物件进出空间，
             // withdraw 把它收起来，enableCapability 增删功能点锚点（通路判据的输入），
-            // adjustGrip 只动手里那一份状态 —— 但它与 `returnState` 同族，一并保守处理。
             return .spatialChange(objectID: objectID)
         case let .delete(objectID, _):
             // 删除走它自己那一层（见 `.removal` 的说明）。默认方向仍然是 fail-closed：
@@ -302,7 +311,7 @@ final class ResidentPropPlacementService {
     /// 拿起来（默认右手）**或**把这件已经在手上的物件换到别的挂点。
     ///
     /// 换挂点走的还是 `.hold` 那条世界命令族里既有的 `.adjustGrip`：同一条归属轴、同一份
-    /// `returnState`（放回哪儿仍然是拿起前那一处），所以"换挂点"不会顺手改掉"从哪儿来回哪儿去"。
+    /// 放回位（transform / isEnabled 不变；握点 metadata 同步更新），所以"换挂点"不会改掉原放回位置。
     ///
     /// **每一条 guard 都走 `rejectHold`**（具名 + 统一日志），一条静默的都没有。
     /// 这条纪律由 `tools/test-resident-prop-hold.swift` 逐条钉住：把任何一处的
@@ -344,6 +353,8 @@ final class ResidentPropPlacementService {
             throw rejectHold(.propTooLarge,
                 ResidentPropPlacementError.propTooLarge(prop.displayName), objectID, point)
         }
+        do { try validatePickupReach(objectID: objectID) }
+        catch { throw rejectHold(.objectOutOfReach, error, objectID, point) }
         // 标定那一步的拒绝在 `makeGripCalibration` 里（宿主注入），这里只包一层具名日志：
         // 它抛出的原因（角色未适配 / 资产没备好 / 没有骨骼 / 挂点检查没接线 / 没有挂点建议）
         // 必须**带步骤名**落日志，否则又回到"用户说挂不上、日志里什么都没有"。
@@ -357,7 +368,7 @@ final class ResidentPropPlacementService {
 
     /// 就地把这件已挂载的物件换到另一个挂点：新标定整份由**挂点定义**给出
     /// （偏移/朝向/握点都是那个挂点的默认值，不是把手的默认值套上去），
-    /// 走 `.adjustGrip` —— 既有命令，不动摆放轴与归属轴，`returnState` 一个字不改。
+    /// 走 `.adjustGrip`：不动摆放轴与归属轴，保留放回位，returnState 的握点 metadata 同步更新。
     private func remountCommand(objectID: String, point: PropAttachmentPoint,
                                 avatarID: String, prop: WorldGeneratedProp) throws -> WorldPropLayoutCommand {
         do {
@@ -420,6 +431,71 @@ final class ResidentPropPlacementService {
         return .returnHeld(objectID: objectID, avatarAssetID: avatarID)
     }
 
+    /// Search only the resident's nearby floor. Every candidate runs the same
+    /// real footprint, mesh, resident collision and navigation checks as commit.
+    func dropHeldCommand(objectID: String) throws -> WorldPropLayoutCommand {
+        _ = try returnHeldCommand(objectID: objectID)
+        guard let support = support(), let held = context.state.heldProp,
+              let prop = context.state.objectStates[objectID]?.generatedProp else {
+            throw ResidentPropPlacementError.environmentNotReady
+        }
+        let agent = context.state.agentTransform.position
+        let q = held.returnState.transform.rotation
+        let yaw = atan2(2*q.w*q.y,1-2*q.y*q.y)
+        let size = prop.effectiveSize
+        let nearby = support.grid.layers.filter {
+            hypot($0.center.x-agent.x,$0.center.z-agent.z) <= WorldPropActivityTemplate.interactionReach
+                && abs($0.supportHeight-agent.y) <= 0.25
+        }.sorted {
+            let a = hypot($0.center.x-agent.x,$0.center.z-agent.z)
+            let b = hypot($1.center.x-agent.x,$1.center.z-agent.z)
+            return a == b ? ($0.column.x,$0.column.z,$0.layer.layer) < ($1.column.x,$1.column.z,$1.layer.layer) : a < b
+        }
+        for layer in nearby {
+            let center = WorldVector3(x:layer.center.x,y:layer.supportHeight,z:layer.center.z)
+            let footprint = Self.footprint(at:center,size:SIMD2(size.x,size.z),yaw:yaw,spacing:support.grid.spacing)
+            guard let height = PropPlacementEvaluator.resolvedSupportHeight(footprint:footprint,at:layer,grid:support.grid) else {continue}
+            let placement = WorldPropPlacement(surfaceID:"grid.layer.\(layer.layer.layer)",
+                position:.init(x:center.x,y:height,z:center.z),yaw:yaw)
+            let command = WorldPropLayoutCommand.dropHeld(objectID:objectID,avatarAssetID:held.avatarAssetID,placement:placement)
+            var candidate = WorldSimulation(restoring:context.state)
+            do {
+                try candidate.applyPropLayout(command,expectedLayoutRevision:context.state.layoutRevision,requestID:"drop.preview.\(UUID())")
+                try validate(candidate.state,baseline:context.state)
+                return command
+            } catch { continue }
+        }
+        throw ResidentPropPlacementError.noNearbyDropPosition
+    }
+
+    /// Rebind after an acknowledged character selection. Existing source grip and
+    /// physical slot remain authoritative; the target character supplies local pose.
+    func rebindHeldAvatarCommand(objectID: String, previousAvatarAssetID: String) throws -> WorldPropLayoutCommand {
+        guard isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
+        guard let avatarID = currentAvatarAssetID(), avatarID != previousAvatarAssetID else {
+            throw ResidentPropPlacementError.avatarChanged
+        }
+        guard context.state.activeActivity == nil else { throw ResidentPropPlacementError.activityActive }
+        guard let held = context.state.heldProp, held.objectID == objectID,
+              held.avatarAssetID == previousAvatarAssetID else { throw ResidentPropPlacementError.notHeld }
+        guard let item = context.state.objectStates[objectID], let prop = item.generatedProp,
+              let existing = item.gripCalibration, existing.avatarAssetID == previousAvatarAssetID,
+              existing.hand == held.hand else { throw WorldPropLayoutError.invalidGripCalibration }
+        guard let point = PropAttachmentPoint(rawValue: held.hand.rawValue) else {
+            throw WorldPropLayoutError.invalidGripCalibration
+        }
+        let target = try makeGripCalibration(prop, avatarID, point)
+        guard target.avatarAssetID == avatarID, target.hand == held.hand else {
+            throw WorldPropLayoutError.invalidGripCalibration
+        }
+        let calibration = WorldPropGripCalibration(avatarAssetID: avatarID, hand: held.hand,
+            normalizedGrip: existing.normalizedGrip, localOffset: target.localOffset,
+            localRotation: target.localRotation)
+        guard calibration.isValid else { throw WorldPropLayoutError.invalidGripCalibration }
+        return .rebindHeldAvatar(objectID: objectID, previousAvatarAssetID: previousAvatarAssetID,
+            calibration: calibration)
+    }
+
     /// 删掉一件生成资产（**永久**）。
     ///
     /// 这里只做"命令构造"那一半（归属 + 命名），判据在 `commit` → `validateDeletion` ——
@@ -479,7 +555,7 @@ final class ResidentPropPlacementService {
         var candidate = WorldSimulation(restoring: context.state)
         try candidate.applyPropLayout(.place(objectID: objectID, placement: placement),
             expectedLayoutRevision: context.state.layoutRevision, requestID: "preview.\(UUID())")
-        try validate(candidate.state)
+        try validate(candidate.state, baseline: context.state)
         return candidate.state
     }
 
@@ -506,11 +582,15 @@ final class ResidentPropPlacementService {
             case let .inventoryRegistration(objectID):
                 // 入库登记：**不**跑空间判据（见该函数的说明）。
                 try validateInventoryRegistration(objectID: objectID, in: state, baseline: baseline)
-            case .spatialChange:
-                // 摆放/移动/收起/手持/能力/撤销：**今天全部**判据，一个字不放宽。
-                try validate(state)
-                for item in state.objectStates.values where item.isEnabled || state.heldProp?.objectID == item.generatedProp?.objectID {
-                    if let prop = item.generatedProp { try prepare(prop) }
+            case let .attachmentChange(objectID):
+                try validateAttachmentChange(objectID: objectID, in: state, baseline: baseline)
+            case let .spatialChange(objectID):
+                // 摆放/移动/收起/放回/能力/撤销：保留全部空间判据。
+                try validate(state, baseline: baseline)
+                if let item = state.objectStates[objectID],
+                   item.isEnabled || state.heldProp?.objectID == objectID,
+                   let prop = item.generatedProp {
+                    try prepare(prop)
                 }
             case let .removal(objectID):
                 // 删除：只判"记录 + 资产身份"，**不跑空间判据**（见 `.removal` 的单调性说明），
@@ -536,7 +616,9 @@ final class ResidentPropPlacementService {
         case .undo: "undo"
         case .hold: "hold"
         case .adjustGrip: "adjustGrip"
+        case .rebindHeldAvatar: "rebindHeldAvatar"
         case .returnHeld: "returnHeld"
+        case .dropHeld: "dropHeld"
         case .enableCapability: "enableCapability"
         case .resize: "resize"
         case .rebase: "rebase"
@@ -579,11 +661,46 @@ final class ResidentPropPlacementService {
         try prepare(prop)
     }
 
+    /// 挂载仍验证真实物件、标定、当前角色和资产。既有放回位不能被挂载命令移动，
+    /// 其他已摆物件也不能改变；无需把旧存档地面再按新网格规则验一遍。
+    private func validateAttachmentChange(objectID: String, in state: WorldState, baseline: WorldState) throws {
+        guard let previous = baseline.objectStates[objectID], let prop = previous.generatedProp,
+              prop.objectID == objectID, let item = state.objectStates[objectID],
+              item.generatedProp == prop, !item.isEnabled,
+              let held = state.heldProp, held.objectID == objectID,
+              let calibration = item.gripCalibration, calibration.isValid,
+              calibration.avatarAssetID == held.avatarAssetID, calibration.hand == held.hand,
+              currentAvatarAssetID() == held.avatarAssetID,
+              held.returnState.gripCalibration == calibration else {
+            throw WorldPropLayoutError.invalidGripCalibration
+        }
+        // .hold 保存原摆放状态；换挂点/换角色保留上一份 returnState。
+        let previousReturn = baseline.heldProp?.returnState ?? previous
+        guard baseline.heldProp == nil || baseline.heldProp?.objectID == objectID else {
+            throw WorldPropLayoutError.invalidObject
+        }
+        func withoutGrip(_ value: WorldObjectState) -> WorldObjectState {
+            var value = value
+            value.metadata.removeValue(forKey: "gmgn.prop-grip.v1")
+            return value
+        }
+        var expectedItem = previous
+        expectedItem.isEnabled = false
+        guard withoutGrip(item) == withoutGrip(expectedItem),
+              withoutGrip(held.returnState) == withoutGrip(previousReturn),
+              state.objectStates.filter({ $0.key != objectID }) == baseline.objectStates.filter({ $0.key != objectID }) else {
+            throw WorldPropLayoutError.invalidObject
+        }
+        try prepare(prop)
+    }
+
     private func validateAttachmentAuthorization(_ command: WorldPropLayoutCommand) throws {
         let submittedAvatarID: String?
         switch command {
-        case .hold(_, let avatarAssetID, _), .adjustGrip(_, let avatarAssetID, _), .returnHeld(_, let avatarAssetID):
+        case .hold(_, let avatarAssetID, _), .adjustGrip(_, let avatarAssetID, _), .returnHeld(_, let avatarAssetID), .dropHeld(_, let avatarAssetID, _):
             submittedAvatarID = avatarAssetID
+        case .rebindHeldAvatar(_, _, let calibration):
+            submittedAvatarID = calibration.avatarAssetID
         // `.delete` 不携带角色身份：它删的是**世界里的记录**，与"此刻是谁在拿"
         // 无关（在手上的那一件由世界层自己先放回再删，见 `WorldSimulation`）。
         case .register, .place, .withdraw, .undo, .enableCapability, .resize, .rebase, .delete:
@@ -591,6 +708,28 @@ final class ResidentPropPlacementService {
         }
         if let submittedAvatarID {
             guard currentAvatarAssetID() == submittedAvatarID else { throw ResidentPropPlacementError.avatarChanged }
+        }
+        // Recheck after asynchronous asset preparation; the actor/object may have moved.
+        if case let .hold(objectID, _, _) = command { try validatePickupReach(objectID: objectID) }
+    }
+
+    /// The same scaled/yawed footprint and edge reach used by generated-object destinations.
+    /// Inventory retrieval and changing the currently held object's grip do not involve a remote pickup.
+    private func validatePickupReach(objectID: String) throws {
+        guard let item = context.state.objectStates[objectID], let prop = item.generatedProp,
+              prop.objectID == objectID else { throw WorldPropLayoutError.invalidObject }
+        guard item.isEnabled, context.state.heldProp?.objectID != objectID else { return }
+        let rotation = item.transform.rotation
+        let yaw = atan2(2 * (rotation.w * rotation.y), 1 - 2 * rotation.y * rotation.y)
+        let size = prop.effectiveSize
+        let scale = item.transform.scale
+        let distance = WorldPropActivityTemplate.footprintEdgeDistance(from: context.state.agentTransform.position,
+            propCenter: item.transform.position, propYaw: yaw,
+            propHalfExtents: .init(x: size.x * abs(scale.x) / 2, y: size.y * abs(scale.y) / 2,
+                                  z: size.z * abs(scale.z) / 2))
+        guard distance.isFinite else { throw WorldPropLayoutError.invalidObject }
+        guard distance <= WorldPropActivityTemplate.interactionReach + 0.00001 else {
+            throw ResidentPropPlacementError.objectOutOfReach(objectID: objectID, distance: distance)
         }
     }
 
@@ -623,7 +762,7 @@ final class ResidentPropPlacementService {
         }
     }
 
-    private func validate(_ state: WorldState) throws {
+    private func validate(_ state: WorldState, baseline: WorldState) throws {
         // 「世界障碍」只有一条来源：`WorldLayoutObstacles`（与运行时 `WorldAgentContext`
         // 消费的是同一份换算）。解不出碰撞体积的已摆物件**必须可见地拒绝**：
         // `compactMap` 的旧写法会把它静默丢掉，让它对这条判据（也对运行时）变成"无敌"。
@@ -648,7 +787,15 @@ final class ResidentPropPlacementService {
         // 外加手持物的保留放回位）。入库登记（`.register`）根本走不到这里 ——
         // 它走的是 `ResidentPropLayoutIntent.inventoryRegistration` 那一层，判据只有
         // 归属与资产（见 `validateInventoryRegistration`）。
-        for (id,item,obstacle) in placed {
+        for (id,item,_) in placed {
+            // Built-in devices have their own validated placement transaction.
+            // Keep their real obstacle above for overlap and route checks; this
+            // loop validates inventory props' support, ownership and assets.
+            if item.builtinDeviceCollisionVolume?.id == id { continue }
+            // Existing props still participate in collision and route checks,
+            // but moving/returning one prop must not reclassify another old pose.
+            // A held return reservation is checked when it actually becomes visible.
+            if item == baseline.objectStates[id] { continue }
             guard item.generatedProp?.objectID == id, let prop = item.generatedProp else {
                 throw WorldPropLayoutError.invalidObject
             }
@@ -656,19 +803,21 @@ final class ResidentPropPlacementService {
             // 摆放校验 = 「格子 + footprint」：物件必须坐在**某一层格子**上，整块 footprint
             // 在该层放得下。网格、阻挡体积、已放物件、净空、越界全部由评估器判定。
             // 因此状态里的 surfaceID 现在只是一个随状态存下来的标签，不再参与校验。
-            guard let layerRef = Self.supportLayer(at: item.transform.position, grid: support.grid) else {
-                throw ResidentPropPlacementError.unknownSurface
-            }
             // footprint 的朝向取**物件自己的** yaw（权威、与代理/盒子的形状无关）；
             // 尺寸取 `effectiveSize`（有权威尺寸时以它为准，没有就是 app 量的那一份）。
             let rotation = item.transform.rotation
             let yaw = atan2(2*(rotation.w*rotation.y),1-2*rotation.y*rotation.y)
             let size = prop.effectiveSize
-            let footprint = WorldPlanarFootprint(size: SIMD2(size.x, size.z), yaw: yaw)
+            let footprint = Self.footprint(at: item.transform.position,
+                size: SIMD2(size.x, size.z), yaw: yaw, spacing: support.grid.spacing)
+            guard let resolvedLayerRef = Self.supportLayer(at: item.transform.position,
+                footprint: footprint, grid: support.grid) else {
+                throw ResidentPropPlacementError.unknownSurface
+            }
             if let reason = PropPlacementEvaluator.evaluate(
                 footprint: footprint,
                 height: size.y,
-                at: layerRef,
+                at: resolvedLayerRef,
                 grid: support.grid,
                 collision: support.collision,
                 blockingVolumes: context.manifest.collisionVolumes.filter(\.isBlocking),
@@ -771,18 +920,42 @@ final class ResidentPropPlacementService {
 
     /// 从摆放位置反查它坐在哪一层格子上。
     ///
-    /// 位置来自 `PropSupportGridMapping.snappedPlacementPosition`，也就是**格心**
-    /// （列最小角 + 半格），所以列号必须先把半格减掉再取整。高度必须与该层的承托高度
-    /// 一致（容差 0.005，与旧的摆放面校验同口径）。
-    private static func supportLayer(at position: WorldVector3, grid: PropSupportGrid) -> PropSupportLayerRef? {
+    /// 位置是持久化的物件中心，可以来自旧存档的非格心摆放。
+    /// 最近列只用于选定承托层；footprint.centerOffset 保留真正的物件中心。
+    /// 高度匹配整块家具的
+    /// 实测最高合法支撑平面，不能先按单个低角采样拒绝。仍保留 5 mm 位置匹配，
+    /// 拒绝悬空或压低的提交，不把任意高度吸附成合法摆放。
+    private static func supportLayer(at position: WorldVector3, footprint: WorldPlanarFootprint,
+                                     grid: PropSupportGrid) -> PropSupportLayerRef? {
         let spacing = grid.spacing
-        guard spacing.isFinite, spacing > 0 else { return nil }
+        guard spacing.isFinite, spacing > 0, position.x.isFinite, position.y.isFinite,
+              position.z.isFinite, footprint.isValid else { return nil }
         let column = PropSupportColumn(
             x: Int(((position.x - spacing * 0.5) / spacing).rounded()),
             z: Int(((position.z - spacing * 0.5) / spacing).rounded())
         )
-        return grid.layers.first {
-            $0.column == column && abs($0.supportHeight - position.y) < 0.005
+        for candidate in grid.layers where candidate.column == column {
+            guard let plane = PropPlacementEvaluator.resolvedSupportHeight(
+                footprint: footprint, at: candidate, grid: grid
+            ), abs(plane - position.y) < 0.005 else { continue }
+            return PropSupportLayerRef(column: column, layer: PropSupportLayer(
+                layer: candidate.layer.layer, supportHeight: plane,
+                center: WorldVector3(x: candidate.center.x, y: plane, z: candidate.center.z)
+            ))
         }
+        return nil
+    }
+
+    /// The persisted transform is the prop center. The evaluator's anchor is a
+    /// grid corner; retain the exact center rather than evaluating a shifted box.
+    private static func footprint(at position: WorldVector3, size: SIMD2<Float>, yaw: Float,
+                                  spacing: Float) -> WorldPlanarFootprint {
+        let base = WorldPlanarFootprint(size: size, yaw: yaw)
+        guard spacing.isFinite, spacing > 0 else { return base }
+        let column = PropSupportColumn(
+            x: Int(((position.x - spacing * 0.5) / spacing).rounded()),
+            z: Int(((position.z - spacing * 0.5) / spacing).rounded()))
+        let offset = SIMD2(position.x, position.z) - base.center(anchoredAt: column, spacing: spacing)
+        return WorldPlanarFootprint(size: size, yaw: yaw, centerOffset: offset)
     }
 }

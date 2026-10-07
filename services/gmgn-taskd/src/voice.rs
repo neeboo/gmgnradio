@@ -384,9 +384,18 @@ fn asr_error(error: gmgn_voice_core::asr_stream::AsrStreamError) -> &'static str
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use tokio::net::{TcpListener, TcpStream};
+    pub(crate) fn active_asr(id: &str) -> (Connection, tokio::sync::oneshot::Receiver<()>) {
+        let (sender, receiver) = mpsc::channel(8);
+        let (dropped, observed) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _receiver = receiver;
+            let _dropped = dropped;
+            std::future::pending::<()>().await;
+        });
+        (Connection {active:Some(Active {id:id.into(),commands:Some(sender),task,ready:Arc::new(AtomicBool::new(true))})},observed)
+    }
     #[test]
     fn ready_contract_and_asr_errors_are_explicit_and_sanitized() {
         use gmgn_voice_core::asr_stream::AsrStreamError::*;
@@ -398,13 +407,12 @@ mod tests {
     }
     #[tokio::test]
     async fn input_is_bounded_cancel_discards_queue_and_stale_ids_are_rejected() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let _client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (server, _) = listener.accept().await.unwrap();
-        let (_, writer) = server.into_split();
-        let (writer, _writer_guard) = crate::daemon::writer_queue(writer);
+        let (writer, mut frames) = crate::daemon::response_queue(false);
+        let _drain = tokio::spawn(async move {
+            while let Some(frame) = frames.recv().await {
+                let _ = frame.completion.send(Ok(()));
+            }
+        });
         let (sender, receiver) = mpsc::channel(8);
         let (dropped, mut observed) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {

@@ -6,11 +6,10 @@
 //   · ResidentClaudeMCPChecks：断言计数；
 //   · ResidentClaudeMCPFixture：生产同形 schemas（3 工具）与 33 工具合成集；
 //   · ResidentClaudeMCPCallLog / residentClaudeMCPHandler：确定性宿主执行者；
-//   · residentClaudeMCPUDSClient：直连复用通道的 UDS 客户端（绕过 adapter 验证宿主侧过期）；
+//   · residentClaudeMCPHTTPFrameAsync：直连私有 HTTP 通道（绕过 adapter 验证宿主侧过期）；
 //   · ResidentClaudeMCPStdioClient：以真实 node 子进程驱动 stdio MCP。
 //
 import Foundation
-import Darwin
 
 // MARK: - Checks
 
@@ -198,71 +197,40 @@ func residentClaudeMCPHandler(
     }
 }
 
-// MARK: - Direct UDS client (bypasses the adapter; mirrors the host wire)
+// MARK: - Direct HTTP client (bypasses the adapter; mirrors the host wire)
 
-func residentClaudeMCPUDSClient(
-    socketPath: String,
-    secret: String,
-    name: String,
-    argumentsJSON: Data,
-    callID: String = "direct"
-) -> Data? {
-    let fd = socket(AF_INET, SOCK_STREAM, 0)
-    guard fd >= 0 else { return nil }
-    defer { close(fd) }
-    guard let port = UInt16(socketPath.split(separator: ":").last ?? "") else { return nil }
-    var address = sockaddr_in()
-    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    address.sin_family = sa_family_t(AF_INET)
-    address.sin_addr.s_addr = inet_addr("127.0.0.1")
-    address.sin_port = port.bigEndian
-    let connected = withUnsafePointer(to: &address) { pointer in
-        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-        }
-    }
-    guard connected == 0 else { return nil }
-    var noSignal: Int32 = 1
-    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
-    var timeout = timeval(tv_sec: 10, tv_usec: 0)
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-    guard let arguments = try? JSONSerialization.jsonObject(with: argumentsJSON) else { return nil }
-    let body: [String: Any] = [
-        "v": 1, "secret": secret, "callId": callID, "name": name, "arguments": arguments,
-    ]
-    guard let encoded = try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys]) else {
-        return nil
-    }
-    var written = 0
-    let bytes = [UInt8](encoded)
-    while written < bytes.count {
-        let count = write(fd, Array(bytes[written...]), bytes.count - written)
-        if count <= 0 { return nil }
-        written += count
-    }
-    if write(fd, [0x0A], 1) != 1 { return nil }
-    return ResidentDSHHostWire.readFrame(
-        from: fd, maximumBytes: ResidentDSHHostWire.maximumFrameBytes
-    )
-}
-
-/// 在后台队列上直连复用通道（不让阻塞读占住 MainActor：宿主执行者在 MainActor 上）。
-func residentClaudeMCPUDSFrameAsync(
-    socketPath: String,
+func residentClaudeMCPHTTPFrameAsync(
+    rpcURL: String,
     secret: String,
     name: String,
     arguments: [String: Any],
     callID: String = "direct"
 ) async -> Data? {
-    let argumentsJSON = (try? JSONSerialization.data(withJSONObject: arguments)) ?? Data("{}".utf8)
-    return await withCheckedContinuation { continuation in
-        DispatchQueue.global().async {
-            continuation.resume(returning: residentClaudeMCPUDSClient(
-                socketPath: socketPath, secret: secret, name: name,
-                argumentsJSON: argumentsJSON, callID: callID
-            ))
-        }
+    guard let url = URL(string: rpcURL),
+          url.scheme == "http", url.host == "127.0.0.1", url.path == "/rpc",
+          url.query == nil, url.fragment == nil,
+          let port = url.port, (1...65535).contains(port) else { return nil }
+    let body: [String: Any] = [
+        "v": 1, "callId": callID, "name": name, "arguments": arguments,
+    ]
+    guard let encoded = try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys]) else {
+        return nil
     }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.httpBody = encoded
+    request.timeoutInterval = 10
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.connectionProxyDictionary = [:]
+    let session = URLSession(configuration: configuration)
+    defer { session.invalidateAndCancel() }
+    guard let (data, response) = try? await session.data(for: request),
+          let http = response as? HTTPURLResponse,
+          http.statusCode == 200 || http.statusCode == 403,
+          data.count <= ResidentClaudeMCPAdapter.maximumHostReplyBytes else { return nil }
+    return data
 }
 
 // MARK: - MCP stdio client (real node child process)
@@ -475,7 +443,7 @@ func residentClaudeMCPStandaloneAdapter(
 func residentClaudeMCPCraftedGrant(
     secret: String,
     round: String,
-    socketPath: String,
+    rpcURL: String,
     declaredName: String,
     expiresAtLiteral: String?,
     paddingBytes: Int = 0
@@ -485,7 +453,7 @@ func residentClaudeMCPCraftedGrant(
         ? "\"pad\":\"" + String(repeating: "a", count: paddingBytes) + "\","
         : ""
     return "{\"protocol\":1,\"state\":\"armed\",\(expires)\(padding)"
-        + "\"secret\":\"\(secret)\",\"round\":\"\(round)\",\"endpoint\":{\"version\":1,\"address\":\"\(socketPath)\",\"token\":\"\(secret)\"},"
+        + "\"secret\":\"\(secret)\",\"round\":\"\(round)\",\"endpoint\":{\"version\":2,\"url\":\"\(rpcURL)\",\"token\":\"\(secret)\"},"
         + "\"tools\":[{\"name\":\"\(declaredName)\",\"canonical\":\"read_wish_generation\"}]}"
 }
 
@@ -520,6 +488,9 @@ struct ResidentClaudeMCPBridgeTests {
         let adapterSource = try ResidentClaudeMCPAdapter.source(registrations: registrations)
         checks.expectContains(adapterSource, "node:crypto", "R0b adapter 引入 node:crypto")
         checks.expectContains(adapterSource, "randomUUID", "R0b adapter 用 randomUUID 生成 callId")
+        checks.expectContains(adapterSource, "node:http", "R0c adapter 使用 HTTP")
+        checks.check(!adapterSource.contains("node:net") && !adapterSource.contains("net.connect"), "R0c 无裸 TCP adapter")
+        checks.expectContains(adapterSource, "'Authorization': 'Bearer '", "R0c HTTP Bearer 鉴权")
 
         // 1) 会话启动：私有文件、权限、MCP 配置形状。
         let log = ResidentClaudeMCPCallLog()
@@ -537,6 +508,10 @@ struct ResidentClaudeMCPBridgeTests {
         // 首次 arm 的 secret：用于 R16 泄露语料覆盖（后续 arm 会轮换）。
         let initialGrant = ResidentClaudeMCPFixture.object(try Data(contentsOf: session.grantFileURL))
         let initialSecret = initialGrant?["secret"] as? String ?? ""
+        let initialEndpoint = initialGrant?["endpoint"] as? [String: Any]
+        checks.expectEqual(initialEndpoint?["version"] as? Int, 2, "R1 HTTP endpoint version=2")
+        checks.expectEqual(initialEndpoint?["url"] as? String, session.rpcURL, "R1 HTTP RPC URL 一致")
+        checks.check(initialEndpoint?["address"] == nil, "R1 不保留旧裸 TCP address")
 
         checks.check(FileManager.default.fileExists(atPath: session.adapterFileURL.path), "R1 adapter 文件已写")
         checks.check(FileManager.default.fileExists(atPath: session.grantFileURL.path), "R1 grant 文件已写")
@@ -851,9 +826,9 @@ struct ResidentClaudeMCPBridgeTests {
         checks.expectContains(textContent(expiredResponse), "expired", "R15 过期通用文本")
         let grantObject = ResidentClaudeMCPFixture.object(try Data(contentsOf: session.grantFileURL))
         let secret = grantObject?["secret"] as? String ?? ""
-        let socketPath = (grantObject?["endpoint"] as? [String: Any])?["address"] as? String ?? ""
-        let directFrame = await residentClaudeMCPUDSFrameAsync(
-            socketPath: socketPath, secret: secret,
+        let rpcURL = (grantObject?["endpoint"] as? [String: Any])?["url"] as? String ?? ""
+        let directFrame = await residentClaudeMCPHTTPFrameAsync(
+            rpcURL: rpcURL, secret: secret,
             name: "gmgn_read_wish_generation", arguments: [:]
         )
         let direct = directFrame.flatMap {
@@ -877,7 +852,7 @@ struct ResidentClaudeMCPBridgeTests {
         let grantText = (try? String(contentsOf: session.grantFileURL, encoding: .utf8)) ?? ""
         let secrets = [
             initialSecret, secret,
-            session.socketPath, session.directoryURL.path,
+            session.rpcURL, session.directoryURL.path,
             session.grantFileURL.path, session.adapterFileURL.path,
         ]
         for candidate in secrets where !candidate.isEmpty {
@@ -952,8 +927,8 @@ struct ResidentClaudeMCPBridgeTests {
             let probeGrant = ResidentClaudeMCPFixture.object(try Data(contentsOf: probeSession.grantFileURL))
             let probeSecret = probeGrant?["secret"] as? String ?? ""
             let probeRound = probeGrant?["round"] as? String ?? ""
-            let probeSocket = (probeGrant?["endpoint"] as? [String: Any])?["address"] as? String ?? ""
-            checks.check(!probeSecret.isEmpty && !probeRound.isEmpty && !probeSocket.isEmpty, "R18 probe grant 完整")
+            let probeRPCURL = (probeGrant?["endpoint"] as? [String: Any])?["url"] as? String ?? ""
+            checks.check(!probeSecret.isEmpty && !probeRound.isEmpty && !probeRPCURL.isEmpty, "R18 probe grant 完整")
 
             let futureExpiry = "\(Int64((Date().addingTimeInterval(120).timeIntervalSince1970 * 1000).rounded()))"
 
@@ -986,18 +961,22 @@ struct ResidentClaudeMCPBridgeTests {
             try await probeCall(
                 label: "R18 合法 future expiresAt",
                 grantJSON: residentClaudeMCPCraftedGrant(
-                    secret: probeSecret, round: probeRound, socketPath: probeSocket,
+                    secret: probeSecret, round: probeRound, rpcURL: probeRPCURL,
                     declaredName: "gmgn_read_wish_generation", expiresAtLiteral: futureExpiry
                 ),
                 expectError: false, expectedText: "wish_id"
             )
             let validEndpointGrant = residentClaudeMCPCraftedGrant(
-                secret: probeSecret, round: probeRound, socketPath: probeSocket,
+                secret: probeSecret, round: probeRound, rpcURL: probeRPCURL,
                 declaredName: "gmgn_read_wish_generation", expiresAtLiteral: futureExpiry
             )
             for (label, invalidGrant) in [
                 ("非 loopback", validEndpointGrant.replacingOccurrences(of: "127.0.0.1:", with: "192.0.2.1:")),
-                ("协议版本", validEndpointGrant.replacingOccurrences(of: "\"version\":1", with: "\"version\":2")),
+                ("旧传输协议版本", validEndpointGrant.replacingOccurrences(of: "\"version\":2", with: "\"version\":1")),
+                ("HTTPS", validEndpointGrant.replacingOccurrences(of: "http://", with: "https://")),
+                ("凭据 URL", validEndpointGrant.replacingOccurrences(of: "http://", with: "http://user:password@")),
+                ("其他路由", validEndpointGrant.replacingOccurrences(of: "/rpc", with: "/other")),
+                ("查询参数", validEndpointGrant.replacingOccurrences(of: "/rpc", with: "/rpc?token=invalid")),
                 ("鉴权不匹配", validEndpointGrant.replacingOccurrences(of: "\"token\":\"\(probeSecret)\"", with: "\"token\":\"\(UUID().uuidString.lowercased())\"")),
             ] {
                 try await probeCall(label: "R18 endpoint \(label)", grantJSON: invalidGrant,
@@ -1007,7 +986,7 @@ struct ResidentClaudeMCPBridgeTests {
                 try await probeCall(
                     label: "R18 非法 expiresAt #\(offset)",
                     grantJSON: residentClaudeMCPCraftedGrant(
-                        secret: probeSecret, round: probeRound, socketPath: probeSocket,
+                        secret: probeSecret, round: probeRound, rpcURL: probeRPCURL,
                         declaredName: "gmgn_read_wish_generation", expiresAtLiteral: literal
                     ),
                     expectError: true, expectedText: "not authorized"
@@ -1022,7 +1001,7 @@ struct ResidentClaudeMCPBridgeTests {
             let (sizeClient, sizeGrantURL) = try residentClaudeMCPStandaloneAdapter(
                 in: sizeDirectory, nodeExecutable: nodeExecutable, registrations: registrations,
                 grantJSON: residentClaudeMCPCraftedGrant(
-                    secret: probeSecret, round: probeRound, socketPath: probeSocket,
+                    secret: probeSecret, round: probeRound, rpcURL: probeRPCURL,
                     declaredName: "gmgn_read_wish_generation", expiresAtLiteral: futureExpiry
                 )
             )
@@ -1037,7 +1016,7 @@ struct ResidentClaudeMCPBridgeTests {
             )
             let afterControl = probeLog.count
             let oversizedGrant = residentClaudeMCPCraftedGrant(
-                secret: probeSecret, round: probeRound, socketPath: probeSocket,
+                secret: probeSecret, round: probeRound, rpcURL: probeRPCURL,
                 declaredName: "gmgn_read_wish_generation", expiresAtLiteral: futureExpiry,
                 paddingBytes: ResidentClaudeMCPAdapter.maximumGrantBytes * 2
             )

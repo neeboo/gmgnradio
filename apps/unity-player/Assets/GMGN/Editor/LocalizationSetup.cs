@@ -15,6 +15,11 @@ namespace GMGN.UnityPlayer.Editor
     {
         public static void Prepare()
         {
+            PrepareContent(true);
+        }
+        public static void PrepareForBuild() => PrepareContent(false);
+        static void PrepareContent(bool exitWhenDone)
+        {
             try {
                 var type = Type.GetType("UnityEngine.Localization.Settings.LocalizationSettings, Unity.Localization");
                 if (type == null) throw new Exception("Localization assemblies are not loaded");
@@ -27,6 +32,9 @@ namespace GMGN.UnityPlayer.Editor
                     LocalizationEditorSettings.ActiveLocalizationSettings = settings;
                 }
                 var codes = new[] { "zh-CN", "en", "ja" };
+                foreach (var entry in LocalizationTableSeed.Strings)
+                    if (entry.Value.Length != codes.Length || entry.Value.Any(string.IsNullOrWhiteSpace))
+                        throw new Exception($"Incomplete localization seed: {entry.Key}");
                 foreach (var code in codes) {
                     if (LocalizationEditorSettings.GetLocales().Any(locale => locale.Identifier.Code == code)) continue;
                     var locale = Locale.CreateLocale(code);
@@ -59,8 +67,11 @@ namespace GMGN.UnityPlayer.Editor
                 AddressableAssetSettings.BuildPlayerContent(out var build);
                 if (!string.IsNullOrEmpty(build.Error)) throw new Exception(build.Error);
                 Debug.Log("Localization Addressables content prepared");
-                EditorApplication.Exit(0);
-            } catch (Exception error) { Debug.LogException(error); EditorApplication.Exit(1); }
+                if (exitWhenDone) EditorApplication.Exit(0);
+            } catch (Exception error) {
+                if (!exitWhenDone) throw;
+                Debug.LogException(error); EditorApplication.Exit(1);
+            }
         }
     }
 }

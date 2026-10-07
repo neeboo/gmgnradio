@@ -1,5 +1,5 @@
 //  ResidentDSHHostToolsBridge 的离线测试辅助模块（仅编译进测试，不进 App）。
-//  提供：检查计数、生产同形 schemasJSON 样例、宿主调用日志、UDS IPC 客户端。
+//  提供：检查计数、生产同形 schemasJSON 样例、宿主调用日志、HTTP 客户端。
 //  与 apps/.../ResidentDSHHostToolsBridge.swift 同模块编译，可访问其 internal API。
 
 import Foundation
@@ -162,40 +162,37 @@ public func residentDSHHostToolsTestHandler(
     }
 }
 
-// MARK: - UDS IPC client (mirrors the DSH plugin's wire behaviour)
+// MARK: - HTTP client (mirrors the DSH plugin's /rpc contract)
+
+private final class HTTPClientResult: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: (payload: NSDictionary?, error: String?) = (nil, nil)
+    func store(data: Data?, response: URLResponse?, error: Error?) {
+        lock.lock(); defer { lock.unlock() }
+        guard error == nil, let data, let response = response as? HTTPURLResponse,
+              [200, 403].contains(response.statusCode), data.count <= ResidentDSHHostWire.maximumReplyBytes,
+              let object = ResidentDSHHostSupportSchema.object(data) else {
+            result = (nil, "HTTP 请求未收到有效回执"); return
+        }
+        result = (NSDictionary(dictionary: object), nil)
+    }
+    var value: (payload: NSDictionary?, error: String?) {
+        lock.lock(); defer { lock.unlock() }; return result
+    }
+}
 
 public func residentDSHHostClientCall(
-    socketPath: String,
+    rpcURL: String,
     secret: String,
     name: String,
     arguments: [String: Any],
     callID: String = "test-call"
 ) -> (payload: NSDictionary?, error: String?) {
-    let fd = socket(AF_INET, SOCK_STREAM, 0)
-    guard fd >= 0 else { return (nil, "socket() 失败") }
-    defer { close(fd) }
-    guard let port = UInt16(socketPath.split(separator: ":").last ?? "") else { return (nil, "invalid endpoint") }
-    var address = sockaddr_in()
-    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    address.sin_family = sa_family_t(AF_INET)
-    address.sin_addr.s_addr = inet_addr("127.0.0.1")
-    address.sin_port = port.bigEndian
-    let connectResult = withUnsafePointer(to: &address) { pointer in
-        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-        }
-    }
-    guard connectResult == 0 else { return (nil, "connect() 失败 errno=\(errno)") }
-
-    // peer 提前关闭时 write 返回 EPIPE 而不是 SIGPIPE 杀死调用进程。
-    var noSignal: Int32 = 1
-    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
-    var timeout = timeval(tv_sec: 8, tv_usec: 0)
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+    guard let url = URL(string: rpcURL), url.scheme == "http", url.host == "127.0.0.1",
+          url.path == "/rpc", url.port != nil else { return (nil, "invalid HTTP endpoint") }
 
     let body: [String: Any] = [
         "v": 1,
-        "secret": secret,
         "callId": callID,
         "name": name,
         "arguments": arguments,
@@ -203,17 +200,18 @@ public func residentDSHHostClientCall(
     guard let data = try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys]) else {
         return (nil, "请求序列化失败")
     }
-    var written = 0
-    let bytes = [UInt8](data)
-    while written < bytes.count {
-        let count = write(fd, Array(bytes[written...]), bytes.count - written)
-        if count <= 0 { return (nil, "write() 失败") }
-        written += count
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"; request.timeoutInterval = 8
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
+    request.httpBody = data
+    let completed = DispatchSemaphore(value: 0), box = HTTPClientResult()
+    let task = URLSession.shared.dataTask(with: request) { data, response, error in
+        box.store(data: data, response: response, error: error); completed.signal()
     }
-    if write(fd, [0x0A], 1) != 1 { return (nil, "write(\\n) 失败") }
-    guard let frame = ResidentDSHHostWire.readFrame(from: fd, maximumBytes: ResidentDSHHostWire.maximumFrameBytes) else {
-        return (nil, "未收到回复帧")
+    task.resume()
+    guard completed.wait(timeout: .now() + .seconds(10)) == .success else {
+        task.cancel(); return (nil, "HTTP 请求超时")
     }
-    let object = ResidentDSHHostSupportSchema.object(frame)
-    return (object.map { NSDictionary(dictionary: $0) }, nil)
+    return box.value
 }

@@ -1,29 +1,28 @@
 use crate::{
-    contract, files, memory, messages,
+    contract, files, memory, messages, music,
     model::{self, Result, Stored, Submit, FRAME_LIMIT},
     provider, resident,
     store::Database,
     world,
 };
-use gmgn_protocol::{failure, valid_request_id, Request};
+use gmgn_protocol::Request;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
-    sync::{RwLock, Semaphore},
+    sync::RwLock,
     task::JoinSet,
 };
 
 #[derive(Clone)]
 pub struct Service {
     pub db: Database,
+    pub media: Arc<crate::media::Media>,
     credentials: Arc<RwLock<HashMap<String, String>>>,
     memory: Arc<memory::Memory>,
     /// The generation backend this daemon is bound to. Scheduling, cancellation
@@ -49,10 +48,11 @@ impl Service {
     }
 
     /// Binds the daemon to an explicit backend. Tests use it to drive the same
-    /// scheduler and IPC surface without a network.
+    /// scheduler and HTTP surface without an external network.
     pub fn with_provider(db: Database, provider: Arc<dyn provider::PropProvider>) -> Result<Self> {
         Ok(Self {
             db: db.clone(),
+            media: crate::media::Media::new(db.clone()),
             credentials: Arc::new(RwLock::new(HashMap::new())),
             memory: Arc::new(memory::Memory::new(db)),
             provider,
@@ -69,8 +69,22 @@ impl Service {
             .iter()
             .any(|token| provider::contains_secret(params, token))
     }
-    async fn request(&self, method: &str, params: Value) -> Result<Value> {
+    pub(crate) async fn request(&self, method: &str, params: Value) -> Result<Value> {
         match method {
+            "media_prepare" | "media_status" | "media_cancel" | "media_release"
+            | "media_playlist_commit" | "media_playlist_read" | "media_playlist_advance"
+            | "media_playlist_import" | "media_playlist_release" => {
+                if self.has_configured_secret(&params).await {return Err("secret_in_input");}
+                self.media.request(method, params).await
+            }
+            "music_program_save" | "music_program_list" | "music_library_read"
+            | "music_library_commit" | "music_import" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                let method = method.to_owned();
+                self.db.call(move |s| music::request(&mut s.connection, &method, params)).await
+            }
             "configure" => {
                 let origin =
                     model::endpoint(params["endpoint"].as_str().ok_or("invalid_endpoint")?)?;
@@ -494,229 +508,27 @@ impl Service {
         }
     }
 
-    async fn serve_connection(&self, stream: TcpStream, token: &str) -> Result<()> {
-        let (reader, writer) = stream.into_split();
-        let (writer, _writer_guard) = writer_queue(writer);
-        let mut reader = BufReader::new(reader);
-        // A dedicated reader task assembles request frames and pushes them over
-        // a channel. Request handling is decoupled from frame assembly so
-        // aborting an in-flight request never drops a partially read pipelined
-        // frame, while EOF is still observed concurrently with a running
-        // request (a client that vanished stops waiting for a reply it can no
-        // longer read).
-        enum ReaderEvent {
-            Frame(Vec<u8>),
-            End,
-            Error(&'static str),
+    /// SSE subscriptions share the committed-database replay/watermark logic.
+    /// Install the watch before the initial read, so commits cannot fall in a gap.
+    pub(crate) async fn stream_events(&self, request: Request, writer: Writer) -> Result<()> {
+        let changed = self.db.changed.subscribe();
+        if request.method == "world_subscribe" {
+            let world_id = request.params["worldID"].as_str().ok_or("invalid_world_id")?.to_owned();
+            let after = request.params["after"].as_i64().filter(|n| *n >= 0).ok_or("invalid_cursor")?;
+            if world_id.is_empty() || world_id.len() > world::TOKEN_LIMIT { return Err("invalid_world_id"); }
+            self.world_pending(world_id.clone(), after).await?;
+            write(&writer, &json!({"id":request.id,"result":{"subscribed":true}})).await?;
+            return self.world_stream(world_id, after, changed, writer).await;
         }
-        let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel::<ReaderEvent>(8);
-        let reader_task = tokio::spawn(async move {
-            loop {
-                match frame(&mut reader).await {
-                    Ok(Some(line)) => {
-                        if frames_tx.send(ReaderEvent::Frame(line)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => {
-                        let _ = frames_tx.send(ReaderEvent::End).await;
-                        break;
-                    }
-                    Err(code) => {
-                        let _ = frames_tx.send(ReaderEvent::Error(code)).await;
-                        break;
-                    }
-                }
-            }
-        });
-        struct ReaderGuard {
-            task: tokio::task::JoinHandle<()>,
-        }
-        impl Drop for ReaderGuard {
-            fn drop(&mut self) {
-                self.task.abort();
-            }
-        }
-        let _reader_guard = ReaderGuard { task: reader_task };
-        // Subscriptions and request replies share one serialized writer, while the
-        // reader task remains available for subsequent commands on this connection.
-        let mut subscriptions = JoinSet::new();
-        let mut voice = crate::voice::Connection::default();
-        // Frames the client pipelined while an earlier request was still in
-        // flight; they are processed in order after it completes.
-        let mut queued: VecDeque<Vec<u8>> = VecDeque::new();
-        loop {
-            // Make sure a request frame is pending (read more only when the
-            // queue drained, so pipelined frames keep their order).
-            while queued.is_empty() {
-                let line = tokio::select! {
-                    received = frames_rx.recv() => match received {
-                        Some(ReaderEvent::Frame(line)) => Some(line),
-                        Some(ReaderEvent::End) => return Ok(()),
-                        Some(ReaderEvent::Error(code)) => return Err(code),
-                        None => return Err("client_disconnected"),
-                    },
-                    Some(result) = subscriptions.join_next(), if !subscriptions.is_empty() => {
-                        result.map_err(|_| "subscription_failed")??;
-                        continue;
-                    }
-                };
-                let Some(line) = line else {
-                    continue;
-                };
-                queued.push_back(line);
-            }
-            let line = queued.pop_front().expect("queue is non-empty");
-            // Authenticate every frame before parsing or dispatching business
-            // methods, including configure and subscriptions.
-            let envelope: Value = match serde_json::from_slice(&line) {
-                Ok(value) => value,
-                Err(_) => {
-                    write(&writer, &failure(Value::Null, "invalid_request")).await?;
-                    continue;
-                }
-            };
-            if envelope.get("auth").and_then(Value::as_str) != Some(token) {
-                write(&writer, &failure(Value::Null, "ipc_unauthorized")).await?;
-                return Err("ipc_unauthorized");
-            }
-            let request: Request = match serde_json::from_slice(&line) {
-                Ok(r) => r,
-                Err(_) => {
-                    write(&writer, &failure(Value::Null, "invalid_request")).await?;
-                    continue;
-                }
-            };
-            if !valid_request_id(&request.id) {
-                write(&writer, &failure(Value::Null, "invalid_request_id")).await?;
-                continue;
-            }
-            if request.method.starts_with("voice_") {
-                voice
-                    .handle(&request.method, request.params, request.id, &writer)
-                    .await?;
-                continue;
-            }
-            if request.method == "world_subscribe" {
-                let world_id = request.params["worldID"].as_str().map(str::to_owned);
-                let after = request.params["after"].as_i64().filter(|n| *n >= 0);
-                let (Some(world_id), Some(after)) = (world_id, after) else {
-                    write(&writer, &failure(request.id, "invalid_cursor")).await?;
-                    continue;
-                };
-                if world_id.is_empty() || world_id.len() > world::TOKEN_LIMIT {
-                    write(&writer, &failure(request.id, "invalid_world_id")).await?;
-                    continue;
-                }
-                let changed = self.db.changed.subscribe();
-                // Read once before accepting the subscription: the watch receiver
-                // is already installed, so the replay and the live stream cannot
-                // leave a gap. Everything after this point reads the committed
-                // database, never this read.
-                if let Err(code) = self.world_pending(world_id.clone(), after).await {
-                    write(&writer, &failure(request.id, code)).await?;
-                    continue;
-                }
-                write(
-                    &writer,
-                    &json!({"id":request.id,"result":{"subscribed":true}}),
-                )
-                .await?;
-                let service = self.clone();
-                let writer = writer.clone();
-                subscriptions.spawn(async move {
-                    service.world_stream(world_id, after, changed, writer).await
-                });
-                continue;
-            }
-            if request.method == "subscribe" || request.method == "subscribe_messages" {
-                let changed = self.db.changed.subscribe();
-                let scope: Option<MessageScope> = if request.method == "subscribe_messages" {
-                    match serde_json::from_value(request.params.clone()) {
-                        Ok(v) => Some(v),
-                        Err(_) => {
-                            write(&writer, &failure(request.id, "invalid_message_scope")).await?;
-                            continue;
-                        }
-                    }
-                } else {
-                    None
-                };
-                let cursor = if scope.is_some() {
-                    0
-                } else {
-                    match request.params["after"].as_i64().filter(|n| *n >= 0) {
-                        Some(n) => n,
-                        None => {
-                            write(&writer, &failure(request.id, "invalid_cursor")).await?;
-                            continue;
-                        }
-                    }
-                };
-                // Validate scope and read once before accepting a subscription. The watch receiver
-                // is already installed; subsequent reads always use the committed database.
-                let initial = self.pending(scope.clone(), cursor).await;
-                if let Err(code) = initial {
-                    write(&writer, &failure(request.id, code)).await?;
-                    continue;
-                }
-                write(
-                    &writer,
-                    &json!({"id":request.id,"result":{"subscribed":true}}),
-                )
-                .await?;
-                let service = self.clone();
-                let writer = writer.clone();
-                subscriptions
-                    .spawn(async move { service.stream(scope, cursor, changed, writer).await });
-                continue;
-            }
-            // Run the request on a spawned task so a client disconnect can
-            // abort it instead of leaving the connection waiting on a reply
-            // nobody will read. While it runs, the reader task's EOF or
-            // pipelined frames are observed so later frames keep their order.
-            let service = self.clone();
-            let method = request.method.clone();
-            let params = request.params.clone();
-            let mut task = tokio::spawn(async move { service.request(&method, params).await });
-            let outcome = loop {
-                tokio::select! {
-                    outcome = &mut task => break outcome,
-                    // Stop draining the bounded reader into the pending deque
-                    // once eight frames are queued. The reader and ultimately
-                    // TCP then apply backpressure while this request finishes.
-                    received = frames_rx.recv(), if queued.len() < 8 => match received {
-                        Some(ReaderEvent::Frame(line)) => queued.push_back(line),
-                        Some(ReaderEvent::End) => {
-                            // Client disconnected while the request was in
-                            // flight: drop the reply and the connection.
-                            task.abort();
-                            let _ = task.await;
-                            return Ok(());
-                        }
-                        Some(ReaderEvent::Error(code)) => {
-                            task.abort();
-                            let _ = task.await;
-                            return Err(code);
-                        }
-                        None => {
-                            task.abort();
-                            let _ = task.await;
-                            return Err("client_disconnected");
-                        }
-                    },
-                }
-            };
-            let result = match outcome {
-                Ok(result) => result,
-                Err(_) => return Err("worker_failed"),
-            };
-            let response = match result {
-                Ok(result) => json!({"id": request.id, "result": result}),
-                Err(code) => failure(request.id, code),
-            };
-            write(&writer, &response).await?;
-        }
+        let scope: Option<MessageScope> = if request.method == "subscribe_messages" {
+            Some(serde_json::from_value(request.params.clone()).map_err(|_| "invalid_message_scope")?)
+        } else { None };
+        let cursor = if scope.is_some() { 0 } else {
+            request.params["after"].as_i64().filter(|n| *n >= 0).ok_or("invalid_cursor")?
+        };
+        self.pending(scope.clone(), cursor).await?;
+        write(&writer, &json!({"id":request.id,"result":{"subscribed":true}})).await?;
+        self.stream(scope, cursor, changed, writer).await
     }
     async fn stream(
         &self,
@@ -922,7 +734,7 @@ impl Service {
         Ok(())
     }
 
-    async fn schedule(self, concurrency: usize) -> Result<()> {
+    pub(crate) async fn schedule(self, concurrency: usize) -> Result<()> {
         let mut running = JoinSet::new();
         let mut active = HashSet::new();
         let mut due = HashMap::new();
@@ -981,128 +793,65 @@ impl Service {
     }
 }
 
-pub async fn run(
-    listener: TcpListener,
-    db: Database,
-    concurrency: usize,
-    token: String,
-) -> Result<()> {
-    let service = Service::new(db)?;
-    let mut scheduler = tokio::spawn(service.clone().schedule(concurrency));
-    let clients = Arc::new(Semaphore::new(64));
-    loop {
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => return result.map_err(|_| "signal_unavailable"),
-            result = &mut scheduler => return result.map_err(|_| "worker_failed")?,
-            accepted = listener.accept() => {
-                let (stream, _) = accepted.map_err(|_| "socket_unavailable")?;
-                let Ok(permit) = clients.clone().try_acquire_owned() else { drop(stream); continue; };
-                let service = service.clone();
-                let token = token.clone();
-                tokio::spawn(async move { let _permit = permit; let _ = service.serve_connection(stream, &token).await; });
-            }
-        }
-    }
-}
-struct OutboundFrame {
-    bytes: Vec<u8>,
-    completion: tokio::sync::oneshot::Sender<Result<()>>,
+/// Bounded response producer. HTTP owns serialization/flow control, including
+/// cancellation-safe complete SSE messages. Completion is signalled only when
+/// the HTTP body consumer takes this frame.
+pub(crate) struct OutboundFrame {
+    pub bytes: Vec<u8>,
+    pub completion: tokio::sync::oneshot::Sender<Result<()>>,
 }
 #[derive(Clone)]
 pub(crate) struct Writer {
     frames: tokio::sync::mpsc::Sender<OutboundFrame>,
+    sse: bool,
 }
-pub(crate) struct WriterGuard(tokio::task::JoinHandle<()>);
-impl Drop for WriterGuard {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-/// Connection-owned bounded writer. A producer cancellation cannot interrupt
-/// a partially transmitted frame and splice its next reply into that frame.
-pub(crate) fn writer_queue(mut socket: tokio::net::tcp::OwnedWriteHalf) -> (Writer, WriterGuard) {
-    let (frames, mut receiver) = tokio::sync::mpsc::channel::<OutboundFrame>(8);
-    let task = tokio::spawn(async move {
-        while let Some(frame) = receiver.recv().await {
-            let result =
-                tokio::time::timeout(Duration::from_secs(60), socket.write_all(&frame.bytes))
-                    .await
-                    .map_err(|_| "client_timeout")
-                    .and_then(|result| result.map_err(|_| "client_disconnected"));
-            let failed = result.is_err();
-            let _ = frame.completion.send(result);
-            // A partial write failure closes this half. No next frame follows.
-            if failed {
-                break;
-            }
-        }
-    });
-    (Writer { frames }, WriterGuard(task))
+pub(crate) fn response_queue(sse: bool) -> (Writer, tokio::sync::mpsc::Receiver<OutboundFrame>) {
+    let (frames, receiver) = tokio::sync::mpsc::channel(8);
+    (Writer { frames, sse }, receiver)
 }
 pub(crate) async fn write(writer: &Writer, value: &Value) -> Result<()> {
-    let mut bytes = serde_json::to_vec(value).map_err(|_| "invalid_response")?;
-    bytes.push(b'\n');
-    if bytes.len() > FRAME_LIMIT {
-        return Err("frame_too_large");
-    }
+    let payload = serde_json::to_vec(value).map_err(|_| "invalid_response")?;
+    if payload.len() > FRAME_LIMIT { return Err("frame_too_large"); }
+    let bytes = if writer.sse {
+        let mut bytes = b"data: ".to_vec();
+        bytes.extend(payload);
+        bytes.extend(b"\n\n");
+        bytes
+    } else { payload };
     let (completion, completed) = tokio::sync::oneshot::channel();
     tokio::time::timeout(Duration::from_secs(60), async {
-        writer
-            .frames
-            .send(OutboundFrame { bytes, completion })
-            .await
-            .map_err(|_| "client_disconnected")?;
+        writer.frames.send(OutboundFrame { bytes, completion }).await.map_err(|_| "client_disconnected")?;
         completed.await.map_err(|_| "client_disconnected")?
-    })
-    .await
-    .map_err(|_| "client_timeout")?
-}
-async fn frame(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Result<Option<Vec<u8>>> {
-    let mut frame = Vec::new();
-    loop {
-        let buffer = reader.fill_buf().await.map_err(|_| "client_disconnected")?;
-        if buffer.is_empty() {
-            return if frame.is_empty() {
-                Ok(None)
-            } else {
-                Err("incomplete_frame")
-            };
-        }
-        let count = buffer
-            .iter()
-            .position(|b| *b == b'\n')
-            .map(|n| n + 1)
-            .unwrap_or(buffer.len());
-        if frame.len() + count > FRAME_LIMIT {
-            return Err("frame_too_large");
-        }
-        let done = buffer[count - 1] == b'\n';
-        frame.extend_from_slice(&buffer[..count]);
-        reader.consume(count);
-        if done {
-            return Ok(Some(frame));
-        }
-    }
+    }).await.map_err(|_| "client_timeout")?
 }
 
 pub struct Options {
     pub root: PathBuf,
-    pub socket: PathBuf,
+    pub endpoint_file: PathBuf,
     pub legacy: Option<PathBuf>,
     pub concurrency: usize,
+    pub media: Option<crate::media::Helpers>,
 }
 pub fn options() -> Result<Options> {
     let mut root = None;
-    let mut socket = None;
+    let mut endpoint_file = None;
     let mut legacy = None;
     let mut concurrency = 2;
+    let mut media_helper = None;
+    let mut media_helper_hash = None;
+    let mut media_deno = None;
+    let mut media_deno_hash = None;
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         let next = args.next().ok_or("invalid_arguments")?;
         match arg.to_str() {
             Some("--root") => root = Some(PathBuf::from(next)),
-            Some("--socket" | "--endpoint-file") => socket = Some(PathBuf::from(next)),
+            Some("--endpoint-file") => endpoint_file = Some(PathBuf::from(next)),
             Some("--legacy-root") => legacy = Some(PathBuf::from(next)),
+            Some("--media-helper") => media_helper = Some(PathBuf::from(next)),
+            Some("--media-helper-sha256") => media_helper_hash = next.to_str().map(str::to_owned),
+            Some("--media-deno") => media_deno = Some(PathBuf::from(next)),
+            Some("--media-deno-sha256") => media_deno_hash = next.to_str().map(str::to_owned),
             Some("--concurrency") => {
                 concurrency = next
                     .to_str()
@@ -1114,18 +863,25 @@ pub fn options() -> Result<Options> {
         }
     }
     let root = root.or_else(default_root).ok_or("missing_root")?;
-    let socket = socket.unwrap_or_else(|| root.join("taskd.endpoint.json"));
+    let endpoint_file = endpoint_file.unwrap_or_else(|| root.join("taskd.endpoint.json"));
     if !root.is_absolute()
-        || !socket.is_absolute()
+        || !endpoint_file.is_absolute()
         || legacy.as_ref().is_some_and(|p| !p.is_absolute())
     {
         return Err("absolute_path_required");
     }
+    let media = match (media_helper, media_helper_hash, media_deno, media_deno_hash) {
+        (None, None, None, None) => None,
+        (Some(helper), Some(helper_sha256), Some(deno), Some(deno_sha256)) =>
+            Some(crate::media::Helpers { helper, helper_sha256, deno, deno_sha256 }),
+        _ => return Err("invalid_media_helper_config"),
+    };
     Ok(Options {
         root,
-        socket,
+        endpoint_file,
         legacy,
         concurrency,
+        media,
     })
 }
 
@@ -1155,247 +911,8 @@ fn default_root() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[tokio::test]
-    async fn bounded_pipeline_replies_remain_ordered_after_slow_request() {
-        let dir = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("gmgn-pipeline-{}", uuid::Uuid::new_v4()));
-        crate::files::directory(&dir).unwrap();
-        let service = Service::new(Database::open(dir.clone(), None).unwrap()).unwrap();
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let db = service.db.clone();
-        let blocker = tokio::spawn(async move {
-            db.call(move |_store| {
-                let _ = entered_tx.send(());
-                release_rx.recv().unwrap();
-                Ok(json!({}))
-            })
-            .await
-        });
-        entered_rx.await.unwrap();
-        let (server, mut client) = tcp_pair().await;
-        let serving = service.clone();
-        let connection =
-            tokio::spawn(async move { serving.serve_connection(server, "pipeline-auth").await });
-        let mut batch = Vec::new();
-        for index in 0..64 {
-            batch.extend(serde_json::to_vec(&json!({"auth":"pipeline-auth","id":index.to_string(),"method":"snapshot","params":{}})).unwrap());
-            batch.push(b'\n');
-        }
-        client.write_all(&batch).await.unwrap();
-        for _ in 0..32 {
-            tokio::task::yield_now().await;
-        }
-        release_tx.send(()).unwrap();
-        blocker.await.unwrap().unwrap();
-        let mut reader = BufReader::new(client);
-        for index in 0..64 {
-            let mut line = String::new();
-            tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
-                .await
-                .unwrap()
-                .unwrap();
-            let response: Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(response["id"], index.to_string());
-            assert!(response.get("result").is_some());
-        }
-        drop(reader);
-        assert_eq!(connection.await.unwrap(), Ok(()));
-        drop(service);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-    #[tokio::test]
-    async fn writer_cancellation_preserves_complete_frames_with_slow_reader() {
-        use tokio::io::AsyncReadExt;
-        let (server, mut client) = tcp_pair().await;
-        let (_, half) = server.into_split();
-        let (writer, _guard) = writer_queue(half);
-        for generation in 0..4 {
-            let sender = writer.clone();
-            let large = tokio::spawn(async move {
-                write(
-                    &sender,
-                    &json!({"generation":generation,"payload":"x".repeat(8*1024*1024)}),
-                )
-                .await
-            });
-            // Reading the first byte proves a frame is in progress. Leave the
-            // remainder unread so write_all cannot finish into the small TCP buffer.
-            let mut first = [0; 1];
-            tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut first))
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(
-                !large.is_finished(),
-                "large frame must still be backpressured"
-            );
-            large.abort();
-            let _ = large.await;
-            let sender = writer.clone();
-            let next = tokio::spawn(async move {
-                write(
-                    &sender,
-                    &json!({"id":"replacement","generation":generation}),
-                )
-                .await
-            });
-            let mut reader = BufReader::new(&mut client);
-            let mut line = vec![first[0]];
-            tokio::time::timeout(Duration::from_secs(5), reader.read_until(b'\n', &mut line))
-                .await
-                .unwrap()
-                .unwrap();
-            let frame: Value = serde_json::from_slice(&line).unwrap();
-            assert_eq!(frame["generation"], generation);
-            assert_eq!(frame["payload"].as_str().unwrap().len(), 8 * 1024 * 1024);
-            line.clear();
-            reader.read_until(b'\n', &mut line).await.unwrap();
-            let ack: Value = serde_json::from_slice(&line).unwrap();
-            assert_eq!(ack["id"], "replacement");
-            assert_eq!(next.await.unwrap(), Ok(()));
-            // Do not discard BufReader's read-ahead between frame pairs.
-            assert!(reader.buffer().is_empty());
-        }
-    }
-
-    #[tokio::test]
-    async fn voice_rpc_uses_authenticated_tcp_and_separate_events() {
-        let dir = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("gmgn-voice-rpc-{}", uuid::Uuid::new_v4()));
-        crate::files::directory(&dir).unwrap();
-        let service = Service::new(Database::open(dir.clone(), None).unwrap()).unwrap();
-        let (server, client) = tcp_pair().await;
-        let serving = service.clone();
-        let task =
-            tokio::spawn(async move { serving.serve_connection(server, "voice-auth").await });
-        let (read, mut write_half) = client.into_split();
-        let mut reader = BufReader::new(read);
-        let mut bytes = serde_json::to_vec(
-            &json!({"auth":"voice-auth","id":"c","method":"voice_capabilities"}),
-        )
-        .unwrap();
-        bytes.push(b'\n');
-        write_half.write_all(&bytes).await.unwrap();
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
-        let result: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(result["result"]["providers"][2]["asrStreaming"], false);
-        assert_eq!(result["result"]["providers"][2]["defaultTTSModel"], "s2.1-pro-free");
-        assert_eq!(result["result"]["providers"][2]["ttsModels"].as_array().unwrap().len(), 3);
-        assert_eq!(result["result"]["providers"][2]["defaultASRModel"], Value::Null);
-        for (params, expected) in [
-            (json!({"provider":"bailian"}), "catalog"),
-            (json!({"provider":"fish","apiKey":""}), "invalid_voice_input"),
-            (json!({"provider":"unknown"}), "unsupported_voice_provider"),
-            (json!({"provider":"bailian","unexpected":"secret-never-echoed"}), "invalid_voice_input"),
-        ] {
-            let mut bytes = serde_json::to_vec(&json!({"auth":"voice-auth","id":"list","method":"voice_list","params":params})).unwrap();
-            bytes.push(b'\n');
-            write_half.write_all(&bytes).await.unwrap();
-            line.clear();
-            reader.read_line(&mut line).await.unwrap();
-            assert!(!line.contains("secret-never-echoed"));
-            let reply: Value = serde_json::from_str(&line).unwrap();
-            if expected == "catalog" {
-                assert_eq!(reply["result"]["provider"], "bailian");
-                assert_eq!(reply["result"]["voices"].as_array().unwrap().len(), 4);
-            } else {
-                assert_eq!(reply["error"]["code"], expected);
-            }
-        }
-        // The voice ID is invalid locally: exercise asynchronous failure without cloud calls.
-        let key = "secret-never-echoed";
-        let mut bytes=serde_json::to_vec(&json!({"auth":"voice-auth","id":"s","method":"voice_tts_start","params":{"sessionID":"speech-1","provider":"elevenlabs","apiKey":key,"voiceID":"invalid voice","text":"hello"}})).unwrap();
-        bytes.push(b'\n');
-        write_half.write_all(&bytes).await.unwrap();
-        line.clear();
-        reader.read_line(&mut line).await.unwrap();
-        let ack: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(ack["id"], "s");
-        assert_eq!(ack["result"]["started"], true);
-        line.clear();
-        reader.read_line(&mut line).await.unwrap();
-        assert!(!line.contains(key));
-        let event: Value = serde_json::from_str(&line).unwrap();
-        assert!(event.get("id").is_none());
-        assert_eq!(event["voice_event"]["sessionID"], "speech-1");
-        assert_eq!(event["voice_event"]["type"], "error");
-        assert_eq!(event["voice_event"]["code"], "voice_provider_error");
-        assert!(service.credentials.read().await.is_empty());
-        drop(reader);
-        drop(write_half);
-        assert_eq!(task.await.unwrap(), Ok(()));
-        drop(service);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    async fn tcp_pair() -> (TcpStream, TcpStream) {
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (server, address) = listener.accept().await.unwrap();
-        assert!(address.ip().is_loopback());
-        (server, client)
-    }
-
-    #[tokio::test]
-    async fn tcp_authentication_precedes_configure_and_subscriptions() {
-        let dir = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("gmgn-auth-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let service = Service::new(Database::open(dir.clone(), None).unwrap()).unwrap();
-        for method in ["configure", "subscribe", "world_subscribe", "snapshot"] {
-            for auth in [Value::Null, json!("wrong-token")] {
-                let (server, mut client) = tcp_pair().await;
-                let serving = service.clone();
-                let task =
-                    tokio::spawn(
-                        async move { serving.serve_connection(server, "correct-token").await },
-                    );
-                let mut request = serde_json::to_vec(&json!({"id":"auth-test","auth":auth,"method":method,"params":{"endpoint":"https://example.invalid","token":"should-not-be-stored"}})).unwrap();
-                request.push(b'\n');
-                client.write_all(&request).await.unwrap();
-                let mut reply = String::new();
-                BufReader::new(client).read_line(&mut reply).await.unwrap();
-                assert_eq!(
-                    serde_json::from_str::<Value>(&reply).unwrap()["error"]["code"],
-                    "ipc_unauthorized"
-                );
-                assert_eq!(task.await.unwrap(), Err("ipc_unauthorized"));
-                assert!(service.credentials.read().await.is_empty());
-            }
-        }
-        // A valid first frame does not authorize a subsequent frame lacking auth.
-        let (server, mut client) = tcp_pair().await;
-        let serving = service.clone();
-        let task =
-            tokio::spawn(async move { serving.serve_connection(server, "correct-token").await });
-        client.write_all(b"{\"id\":\"1\",\"auth\":\"correct-token\",\"method\":\"snapshot\"}\n{\"id\":\"2\",\"method\":\"configure\",\"params\":{\"endpoint\":\"https://example.invalid\",\"token\":\"never-stored\"}}\n").await.unwrap();
-        let mut reader = BufReader::new(client);
-        let mut reply = String::new();
-        reader.read_line(&mut reply).await.unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&reply).unwrap()["id"], "1");
-        reply.clear();
-        reader.read_line(&mut reply).await.unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&reply).unwrap()["error"]["code"],
-            "ipc_unauthorized"
-        );
-        assert_eq!(task.await.unwrap(), Err("ipc_unauthorized"));
-        assert!(service.credentials.read().await.is_empty());
-        drop(service);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
+    // Transport authentication, independent replies, cancellation and voice
+    // events are exercised through real HTTP connections in http.rs tests.
 
     use crate::provider::testwire::serve_once;
 
@@ -1726,7 +1243,7 @@ mod tests {
     /// The fallback half of the "one wish, one artifact" gate: a drifting
     /// fingerprint is refused, an identical one opens exactly one replacement.
     #[tokio::test]
-    async fn failover_ipc_refuses_profile_drift_and_keeps_one_active_job() {
+    async fn failover_http_refuses_profile_drift_and_keeps_one_active_job() {
         let (service, dir) = service().await;
         let submitted = service
             .request("submit", submission("wish-1"))
@@ -1791,26 +1308,29 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_outbound_frames_are_rejected_before_writing() {
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (socket, _) = listener.accept().await.unwrap();
-        let (_, writer) = socket.into_split();
-        let (writer, writer_guard) = writer_queue(writer);
-        let drain = tokio::spawn(async move {
-            tokio::io::copy(&mut peer, &mut tokio::io::sink())
-                .await
-                .unwrap()
-        });
+        let (writer, mut receiver) = response_queue(true);
         let result = write(&writer, &json!({"value":"x".repeat(FRAME_LIMIT)})).await;
         drop(writer);
-        drop(writer_guard);
-        let count = drain.await.unwrap();
         assert_eq!(result, Err("frame_too_large"));
-        assert_eq!(count, 0);
+        assert!(receiver.recv().await.is_none());
+    }
+    #[tokio::test]
+    async fn canceled_sse_producer_cannot_splice_the_next_event() {
+        let (writer,mut receiver) = response_queue(true);
+        let first = writer.clone();
+        let producer = tokio::spawn(async move {write(&first,&json!({"event":{"payload":"x".repeat(8*1024*1024)}})).await});
+        let frame = receiver.recv().await.unwrap();
+        producer.abort();
+        let _ = producer.await;
+        let second = tokio::spawn(async move {write(&writer,&json!({"id":"next","result":true})).await});
+        assert!(frame.bytes.starts_with(b"data: ") && frame.bytes.ends_with(b"\n\n"));
+        let payload: Value = serde_json::from_slice(&frame.bytes[6..frame.bytes.len()-2]).unwrap();
+        assert_eq!(payload["event"]["payload"].as_str().unwrap().len(),8*1024*1024);
+        let next = receiver.recv().await.unwrap();
+        let payload: Value = serde_json::from_slice(&next.bytes[6..next.bytes.len()-2]).unwrap();
+        assert_eq!(payload["id"],"next");
+        let _ = next.completion.send(Ok(()));
+        assert_eq!(second.await.unwrap(),Ok(()));
     }
 
     /// 本地记忆方法仍然可用，并且只汇报本地字段：没有 provider 配置、没有压缩

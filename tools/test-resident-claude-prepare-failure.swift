@@ -40,6 +40,7 @@ let productionBridge = root.appendingPathComponent(
     "apps/macos/Sources/GMGNRadio/Agent/ResidentClaudeToolBridge.swift"
 )
 let dependencySources = [
+    "apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift",
     "apps/macos/Sources/GMGNRadio/Agent/ResidentDSHAgentToolBridge.swift",
     "apps/macos/Sources/GMGNRadio/Agent/ResidentDSHHostToolsBridge.swift",
 ].map { root.appendingPathComponent($0) }

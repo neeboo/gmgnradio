@@ -1,5 +1,5 @@
 //! The one channel into authority: a private authenticated loopback endpoint,
-//! with newline-delimited JSON. No storage access belongs in this process.
+//! over HTTP. No storage access belongs in this process.
 //!
 //! There is deliberately no other backend here. The MCP process never opens the
 //! taskd private root, never links SQLite, and never takes `taskd.lock` — see
@@ -9,8 +9,7 @@
 use gmgn_protocol::{is_reply_to, reply_error_code, Endpoint};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use std::time::Duration;
 
 /// Shared ceiling the daemon enforces on both directions.
 /// A client that reads a longer frame than the authority would ever write is
@@ -52,18 +51,18 @@ impl TaskdError {
 
 #[derive(Clone)]
 pub struct Client {
-    socket: PathBuf,
+    endpoint_file: PathBuf,
 }
 
 impl Client {
-    pub fn new(socket: impl Into<PathBuf>) -> Self {
+    pub fn new(endpoint_file: impl Into<PathBuf>) -> Self {
         Self {
-            socket: socket.into(),
+            endpoint_file: endpoint_file.into(),
         }
     }
 
-    pub fn socket(&self) -> &Path {
-        &self.socket
+    pub fn endpoint_file(&self) -> &Path {
+        &self.endpoint_file
     }
 
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, TaskdError> {
@@ -85,88 +84,65 @@ impl Client {
         id: u64,
     ) -> Result<Value, TaskdError> {
         let wire_id = id.to_string();
-        let bytes = std::fs::read(&self.socket).map_err(|error| {
-            TaskdError::Unavailable(format!("read endpoint: {error}"))
-        })?;
+        let bytes = std::fs::read(&self.endpoint_file)
+            .map_err(|error| TaskdError::Unavailable(format!("read endpoint: {error}")))?;
         let endpoint: Endpoint = serde_json::from_slice(&bytes)
             .map_err(|_| TaskdError::Protocol("invalid endpoint".to_owned()))?;
-        let address = endpoint.validate()
+        let address = endpoint
+            .validate()
             .map_err(|_| TaskdError::Protocol("invalid loopback endpoint".to_owned()))?;
-        let stream = TcpStream::connect(address).await.map_err(|error| {
-            TaskdError::Unavailable(format!("connect {}: {error}", self.socket.display()))
-        })?;
-        let (read_half, mut write_half) = stream.into_split();
-        let request = json!({"id": wire_id, "auth": endpoint.token, "method": method, "params": params});
-        let mut bytes = serde_json::to_vec(&request)
+        let request = json!({"id": wire_id, "method": method, "params": params});
+        let bytes = serde_json::to_vec(&request)
             .map_err(|error| TaskdError::Protocol(format!("encode request: {error}")))?;
-        bytes.push(b'\n');
-        write_half
-            .write_all(&bytes)
+        if bytes.len() > FRAME_LIMIT {
+            return Err(TaskdError::Protocol("request too large".to_owned()));
+        }
+        // No proxy or redirect may forward the bearer token outside this
+        // validated daemon-owned loopback address. Dropping this future cancels
+        // the outstanding request; the timeout covers headers and body.
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|error| TaskdError::Unavailable(format!("HTTP client: {error}")))?;
+        let mut response = client
+            .post(format!("http://{address}/rpc"))
+            .bearer_auth(&endpoint.token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(bytes)
+            .send()
             .await
-            .map_err(|error| TaskdError::Unavailable(format!("write: {error}")))?;
-        write_half
-            .flush()
+            .map_err(|error| TaskdError::Unavailable(format!("HTTP request: {error}")))?;
+        let status = response.status();
+        if response
+            .content_length()
+            .is_some_and(|length| length > FRAME_LIMIT as u64)
+        {
+            return Err(TaskdError::Protocol("reply too large".to_owned()));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|error| TaskdError::Unavailable(format!("flush: {error}")))?;
-
-        let mut reader = BufReader::new(read_half);
-        loop {
-            let frame = read_frame(&mut reader).await?;
-            let Some(frame) = frame else {
-                return Err(TaskdError::Protocol(
-                    "authority closed before replying".to_owned(),
-                ));
-            };
-            let value: Value = serde_json::from_slice(&frame)
-                .map_err(|error| TaskdError::Protocol(format!("decode reply: {error}")))?;
-            // Events and business messages are pushed on the same connection for
-            // subscribers. This client never subscribes, but a reply that is not
-            // addressed to this request must never be mistaken for one.
-            if !is_reply_to(&value, &wire_id) {
-                continue;
+            .map_err(|error| TaskdError::Unavailable(format!("HTTP body: {error}")))?
+        {
+            if body.len() + chunk.len() > FRAME_LIMIT {
+                return Err(TaskdError::Protocol("reply too large".to_owned()));
             }
-            if let Some(code) = reply_error_code(&value) {
-                return Err(TaskdError::Code(code.to_owned()));
-            }
-            return Ok(value);
+            body.extend_from_slice(&chunk);
         }
-    }
-}
-
-async fn read_frame(
-    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
-) -> Result<Option<Vec<u8>>, TaskdError> {
-    let mut frame = Vec::new();
-    loop {
-        let buffer = reader
-            .fill_buf()
-            .await
-            .map_err(|error| TaskdError::Unavailable(format!("read: {error}")))?;
-        if buffer.is_empty() {
-            return if frame.is_empty() {
-                Ok(None)
-            } else {
-                Err(TaskdError::Protocol("incomplete frame".to_owned()))
-            };
+        let value: Value = serde_json::from_slice(&body)
+            .map_err(|error| TaskdError::Protocol(format!("decode reply: {error}")))?;
+        if let Some(code) = reply_error_code(&value) {
+            return Err(TaskdError::Code(code.to_owned()));
         }
-        let count = buffer
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map(|at| at + 1)
-            .unwrap_or(buffer.len());
-        if frame.len() + count > FRAME_LIMIT {
-            return Err(TaskdError::Protocol("frame too large".to_owned()));
+        if !status.is_success() {
+            return Err(TaskdError::Protocol(format!("HTTP status {status}")));
         }
-        let done = buffer[count - 1] == b'\n';
-        frame.extend_from_slice(&buffer[..count]);
-        let consumed = count;
-        reader.consume(consumed);
-        if done {
-            frame.pop();
-            if frame.last() == Some(&b'\r') {
-                frame.pop();
-            }
-            return Ok(Some(frame));
+        if !is_reply_to(&value, &wire_id) {
+            return Err(TaskdError::Protocol("reply id mismatch".to_owned()));
         }
+        Ok(value)
     }
 }

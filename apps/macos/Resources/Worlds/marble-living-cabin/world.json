@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "packageID": "marble-living-cabin",
-  "packageVersion": "1.2.0",
+  "packageVersion": "1.2.2",
   "worldID": "84503420-3010-4944-8fde-2f383cd08ebe",
   "displayName": "Marble 生活舱",
   "calibration": {
@@ -48,12 +48,12 @@
       "id": "wish_machine.collision",
       "center": {
         "x": 0.8,
-        "y": 0.232,
+        "y": 0.042,
         "z": -2.6
       },
       "halfExtents": {
         "x": 0.45,
-        "y": 0.25,
+        "y": 0.06,
         "z": 0.4
       },
       "rotation": {
@@ -27853,32 +27853,6 @@
       "motionID": null,
       "propIDs": [],
       "interruptible": true
-    },
-    {
-      "id": "chair.sit",
-      "action": "sit",
-      "entryWaypointID": "wp.spawn",
-      "transform": {
-        "position": {
-          "x": -1,
-          "y": -0.067853548,
-          "z": -5
-        },
-        "rotation": {
-          "x": 0,
-          "y": 0,
-          "z": 0,
-          "w": 1
-        },
-        "scale": {
-          "x": 1,
-          "y": 1,
-          "z": 1
-        }
-      },
-      "motionID": "gmgn.motion.bones.chair-sit-loop-pmx",
-      "propIDs": [],
-      "interruptible": true
     }
   ],
   "activityDefinitions": [
@@ -27902,9 +27876,12 @@
         {
           "phase": "enter",
           "requiredAnchorIDs": [],
-          "motionIDs": [],
+          "motionIDs": [
+            "gmgn.motion.bones.arpg.pickup-standing-pmx",
+            "gmgn.motion.bones.arpg.pickup-standing-vrm"
+          ],
           "propIDs": [],
-          "durationSeconds": 0.6
+          "durationSeconds": null
         },
         {
           "phase": "loop",
@@ -28078,9 +28055,12 @@
         {
           "phase": "enter",
           "requiredAnchorIDs": [],
-          "motionIDs": [],
+          "motionIDs": [
+            "gmgn.motion.device.jukebox-low-button-pmx",
+            "gmgn.motion.device.jukebox-low-button-vrm"
+          ],
           "propIDs": [],
-          "durationSeconds": 0.6
+          "durationSeconds": null
         },
         {
           "phase": "loop",
@@ -28239,68 +28219,6 @@
       ],
       "interruptible": true,
       "cooldownSeconds": 5
-    },
-    {
-      "id": "chair.sit",
-      "displayName": "在原地坐下休息",
-      "activity": {
-        "type": "sit",
-        "anchorID": "chair.sit"
-      },
-      "phases": [
-        {
-          "phase": "approach",
-          "requiredAnchorIDs": [
-            "chair.sit"
-          ],
-          "motionIDs": [
-            "gmgn.motion.bones.walk-loop-pmx",
-            "gmgn.motion.bones.walk-loop-vrm"
-          ],
-          "propIDs": [],
-          "durationSeconds": null
-        },
-        {
-          "phase": "enter",
-          "requiredAnchorIDs": [],
-          "motionIDs": [],
-          "propIDs": [],
-          "durationSeconds": 0.2
-        },
-        {
-          "phase": "loop",
-          "requiredAnchorIDs": [],
-          "motionIDs": [
-            "gmgn.motion.bones.chair-sit-loop-pmx",
-            "gmgn.motion.bones.chair-sit-loop-vrm"
-          ],
-          "propIDs": [],
-          "durationSeconds": null
-        },
-        {
-          "phase": "exit",
-          "requiredAnchorIDs": [],
-          "motionIDs": [],
-          "propIDs": [],
-          "durationSeconds": 0.2
-        },
-        {
-          "phase": "interrupt",
-          "requiredAnchorIDs": [],
-          "motionIDs": [],
-          "propIDs": [],
-          "durationSeconds": null
-        },
-        {
-          "phase": "failed",
-          "requiredAnchorIDs": [],
-          "motionIDs": [],
-          "propIDs": [],
-          "durationSeconds": null
-        }
-      ],
-      "interruptible": true,
-      "cooldownSeconds": 5
     }
   ],
   "cameras": [
@@ -28336,8 +28254,7 @@
     "activity:music.listen",
     "camera:living.establishing",
     "activity:performance.backflip",
-    "activity:performance.jumping_jacks",
-    "activity:chair.sit"
+    "activity:performance.jumping_jacks"
   ],
   "resources": [
     {
@@ -28362,13 +28279,13 @@
       "id": "prop.jukebox",
       "path": "jukebox.json",
       "kind": "prop.procedural",
-      "sha256": "13e6bce3919c04d1b71f6c632734879f5019e065ff43d152352600891887544b"
+      "sha256": "db0d9de732fe237ef01baaab9e1d9be7bd8b5d16f59991574e2f6db79b2f429e"
     },
     {
       "id": "wish_machine.device",
       "path": "wish-machine.json",
       "kind": "prop.procedural",
-      "sha256": "ba0dcd16ca59ddfc8e6c8625eed9ee8b53de1ab2a5079d53f26f7eb3d7524b6a"
+      "sha256": "191aa91e8a722be0201060336cb46aeb01bd0d42c6feece0caa2c87e9af7e21b"
     }
   ]
 }

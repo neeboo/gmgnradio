@@ -2,74 +2,24 @@ import Foundation
 import simd
 import WorldRuntime
 
-// ===========================================================================
-// 「攥在哪儿、刃朝哪边」—— 手持握点（grip）的**唯一**一份推断策略
-// ===========================================================================
-//
-// ## 为什么要有这一份
-//
-// 手持这条链早就通了：`WorldPropGripCalibration`（`WorldPropLayout.swift:167`）是标定本身，
-// `.hold` / `.adjustGrip` 是命令，`PropAttachmentMatrix.transform`
-// （`PropAttachment.swift:160`）每帧算的就是 `手骨世界变换 × grip`。缺的从来不是绑定，
-// 而是**标定从哪来**：`ResidentPropAttachmentEligibility.suggestedCalibration` 今天给
-// 所有物件同一个硬编码的 `normalizedGrip (0.5, 0.2, 0.5)` —— 那是"原始 AABB 的中点偏下"。
-//
-// 对饭盒、咖啡杯这类接近方的东西，中点是对的。对**细长**的东西是错的：真机那把
-// 「2B 白色长剑」原始 AABB 是 1.005(X) × 0.133(Y) × 0.057(Z) 米，`x = 0.5` 就是
-// **握在剑身正中间**。屏幕上一眼能看出那不是"用手拿"，是"穿在手上"。
-//
-// ## 输入刻意只有两样，都是世界状态里已有的
-//
-//   `WorldGeneratedProp.effectiveSize`（摆正**之后**的最终世界尺寸，米）
-//   `WorldGeneratedProp.orientationRotation`（资产级摆正旋转）
-//
-// 不引入任何新的量取：`normalizedGrip` 的语义是"原始网格 AABB 的比例"，而原始 AABB 与
-// 摆正后的 AABB 只差一次**带符号的轴置换**，所以"哪根原始轴最长""它最终有多长"这两件事
-// 都能从上面两样精确反推出来（见 `rawAxisCarrying(_:orientation:)`）。于是接线处只需要
-// 一个 `WorldGeneratedProp`，既不用碰渲染器，也不用把 `worldBounds` 从渲染层搬上来。
-//
-// ## 判据只有两条，都不许猜
-//
-//   ① 网格说得清自己是细长的（最长边 / 次长边 ≥ `axisAspectLimit`）⇒ 握点落在**最长轴的一端**，
-//      并把刃轴转到手骨骨轴上（`meshPrincipalAxis`）。
-//   ② 说不清（接近方/矮的物件）⇒ **逐字节沿用今天的缺省**（`inheritedDefault`）：
-//      同一组数字、同一个单位四元数。这一份刻意"不顺手优化"别的物件 —— 既有物件的手感
-//      一个都不许因为这次改动而变。
-//
-// ## 与 `WorldPropOrientationPolicy` 的分工（是两份东西，不是两份朝向）
-//
-//   `WorldPropOrientationPolicy` 管的是**摆在房间里**的朝向（让躺着生成的网格立起来）；
-//   这一套管的是**攥在手里**时刃相对手骨往哪指。两者作用在同一份网格上，所以这里的推导
-//   **必须**先过一遍 `orientation` 再谈刃轴 —— 否则会出现"放在地上立着、拿在手里躺着"。
-//
-//   换算次序与 `PropAttachmentMatrix.transform` 的矩阵乘法次序
-//   （`pose * localRotation * scale * anchor * uprightMatrix`）逐项对齐：
-//
-//     网格顶点 ──[orientation]──► 摆正后的网格 ──[localRotation]──► 手骨局部空间 ──[手骨世界]──► 世界
-//
-//   于是"网格主轴在**手骨局部空间**里的方向" = `R_localRotation · R_orientation · â`，
-//   这一份要做的就是让这个方向等于 `bladeDirectionInHandSpace`。**只有这一处**做这个换算：
-//   渲染端读到的永远是同一条 `WorldPropGripCalibration`，不存在第二份刃朝向。
-//
-// ## ⚠️ 需要在真机上确认的唯一一个假设
-//
-// `bladeDirectionInHandSpace = (0, 1, 0)` 读作"MMD 骨轴"：PMX 骨骼的局部 +Y 是骨从根到梢的
-// 方向，于是 `右手首` 的局部 +Y = 腕→指尖。攥拳握剑时剑身正是沿这条轴出拳（前伸还是上举由
-// 动作决定，这一份不碰动画）。**这个假设没有在真机上量过。** 2B 那把 `右手首` 的局部轴若与
-// MMD 常规不同，改这一个常量即可，其余判据不受影响。
+// Grip coordinates always describe source-mesh AABB proportions. Size and orientation
+// identify the principal axis, but do not identify which end has a handle. A verified
+// GLB's actual section geometry must establish the guard/round-handle/flat-blade
+// relationship. Ambiguous elongated meshes require explicit calibration.
+// No saved calibration is changed during rendering or inference.
 
-/// 「这份握点是**怎么来的**」。与 `WorldPropOrientationSource` / `WorldPropSizeProvenance`
-/// 同一个手法：面板与回执读它，两态一一对应上面那两条路。
+/// Provenance of a proposed grip; unknownHandle is not an automatic hand calibration.
 enum PropGripOrigin: String, Equatable, Sendable {
-    /// ① 网格自己说得清是细长的 ⇒ 柄端握点 + 刃轴对齐手骨骨轴。
-    case meshPrincipalAxis = "mesh-principal-axis"
     /// ② 说不清 ⇒ **逐字节**沿用今天的缺省。
     case inheritedDefault = "inherited-default"
+    case meshHandleSection = "mesh-handle-section"
+    case unknownHandle = "unknown-handle"
 
     var label: String {
         switch self {
-        case .meshPrincipalAxis: return "按网格主轴推断（握最长轴的一端）"
         case .inheritedDefault: return "沿用缺省握点（物件不细长，无需推断）"
+        case .meshHandleSection: return "网格截面证据（护手旁的圆柄）"
+        case .unknownHandle: return "柄部位置未确认，需要显式标定"
         }
     }
 }
@@ -103,28 +53,17 @@ struct PropGripSuggestion: Equatable, Sendable {
 
 /// 「摆正后的世界尺寸 + 摆正旋转 → 握点」的**唯一**一份策略。纯函数、无副作用、可离线逐项断言。
 enum PropGripInference {
-    /// 手骨局部空间里"剑尖应该指的方向"。MMD/PMX 骨骼的局部 +Y 是骨从根到梢的方向，
-    /// 于是 `右手首` 的局部 +Y = 腕→指尖；攥拳握剑时剑身正沿这条轴出拳。
-    ///
-    /// **这是本文件唯一一个"没有在真机上量过"的数**。若 2B 的 `右手首` 局部轴与 MMD 常规
-    /// 不同，改这一个常量即可，别的判据不会跟着分叉。
+    /// 掌心挂点局部空间里的柄→剑尖方向。运行时掌心框架的 +Y 是掌面法向，
+    /// +X 是腕→中指；这根长轴不表示刀刃侧，也不能独自决定刀刃朝向。
     static let bladeDirectionInHandSpace = SIMD3<Float>(0, 1, 0)
 
-    /// 「最长边 / 次长边」到多少才算"这件东西有柄可握"。
+    /// 仅识别细长外形；不能据此认定有柄或确定柄端。
     ///
     /// **刻意复用** `WorldPropSizePolicy.longThinAspectLimit`（= 4）：那个数在仓库里已经是
     /// "多细算细长"的唯一定义（`WorldPropOrientationPolicy.lyingDownAspectLimit` 也引用它）。
     /// 若这里另立一个数，就会出现"尺寸/朝向按细长算、握点却按方算"的自相矛盾。
     /// 真机数据：剑是 1.005 / 0.133 = 7.56（≥ 4，走推断）；咖啡机、斧头这类 ≤ 1.4（走缺省）。
     static let axisAspectLimit: Float = WorldPropSizePolicy.longThinAspectLimit
-
-    /// 握点从柄端往里缩多少米。一次攥拳的半个掌宽量级：太小会握在剑首尾端的棱上，
-    /// 太大会又滑回剑身中间。
-    static let gripInsetMeters: Float = 0.06
-
-    /// 内缩占主轴长度的比例上限。短物件上 `0.06 m` 可能已经过半，必须夹住 ——
-    /// 否则"柄端握点"会变成"越过中点的另一端"。
-    static let maximumGripInsetRatio: Float = 0.25
 
     static let identityRotation = WorldQuaternion(x: 0, y: 0, z: 0, w: 1)
 
@@ -148,7 +87,8 @@ enum PropGripInference {
     ///     缺省 = 单位四元数 ⇒ 与改造前逐字节相同。
     static func suggestion(
         size: WorldVector3,
-        orientation: WorldQuaternion = WorldQuaternion(x: 0, y: 0, z: 0, w: 1)
+        orientation: WorldQuaternion = WorldQuaternion(x: 0, y: 0, z: 0, w: 1),
+        geometry: [WorldTriangle]? = nil
     ) -> PropGripSuggestion {
         let fallback = PropGripSuggestion(
             normalizedGrip: inheritedNormalizedGrip,
@@ -160,7 +100,7 @@ enum PropGripInference {
         guard let extents = finitePositiveExtents(size) else {
             return replacing(fallback, notice: unreadableSizeNotice)
         }
-        // 摆正后的三轴按大到小排：最长的那一根就是"刃"那一根。
+        // 长轴仅用于寻找柄→尖方向；刀刃侧必须另有实际模型证据。
         let ranked = [0, 1, 2].sorted { extents[$0] > extents[$1] }
         let orientedPrincipalIndex = ranked[0]
         let longest = extents[orientedPrincipalIndex]
@@ -172,16 +112,16 @@ enum PropGripInference {
         guard let rawPrincipalIndex = rawAxisCarrying(orientedPrincipalIndex, orientation: orientation)
         else { return replacing(fallback, notice: rejectedNotice) }
 
-        var components: [Float] = [0.5, 0.5, 0.5]
+        guard let geometry, let handle = handleSection(in: geometry, axis: rawPrincipalIndex) else {
+            return PropGripSuggestion(normalizedGrip: inheritedNormalizedGrip,
+                localOffset: fallback.localOffset, localRotation: identityRotation,
+                origin: .unknownHandle,
+                notice: "细长外形不能确定柄部位置；需要网格柄部证据或显式握点标定。")
+        }
+        let components = [handle.grip.x, handle.grip.y, handle.grip.z]
         var rawUnitAxis = SIMD3<Float>(0, 0, 0)
-        rawUnitAxis[rawPrincipalIndex] = 1
+        rawUnitAxis[rawPrincipalIndex] = handle.bladeSign
         let orientedAxis = WorldPropRotation.rotate(rawUnitAxis, by: orientation)
-        // "哪一端是柄"只有网格主轴能说话，而主轴不带把手标记。取**摆正之后最靠下**的那一端：
-        // 生成器交回来的网格是躺在原点上的，摆正后贴地的那一头就是它原来生根的那一头
-        // （剑的护手/柄侧）。选错了也不需要重做 —— 用户用 adjustGrip 一次就能翻过来。
-        let inset = min(gripInsetMeters / longest, maximumGripInsetRatio)
-        let carriesUpward = orientedAxis[orientedPrincipalIndex] >= 0
-        components[rawPrincipalIndex] = carriesUpward ? inset : 1 - inset
         let normalizedGrip = WorldVector3(x: components[0], y: components[1], z: components[2])
         let localRotation = rotationAligning(orientedAxis, to: bladeDirectionInHandSpace)
         let axisName = ["X", "Y", "Z"][rawPrincipalIndex]
@@ -189,14 +129,8 @@ enum PropGripInference {
             normalizedGrip: normalizedGrip,
             localOffset: WorldVector3(x: 0, y: 0, z: 0),
             localRotation: localRotation,
-            origin: .meshPrincipalAxis,
-            notice: String(
-                format: "网格最长边在 %@ 轴（%.3f m，次长 %.3f m，比值 %.2f ≥ %.0f）⇒ 判定为细长物件，"
-                    + "握点放在 %@ 轴 %@ 端往里 %.3f m（比例 %.3f），刃轴对齐手骨骨轴。"
-                    + "握点与朝向都可用握点微调覆盖。",
-                axisName, longest, second, longest / second, axisAspectLimit,
-                axisName, carriesUpward ? "最小" : "最大", gripInsetMeters, inset
-            )
+            origin: .meshHandleSection,
+            notice: String(format: "网格%@轴截面确认护手与连续圆柄，握点比例 %.3f，刃朝柄部反方向。", axisName, components[rawPrincipalIndex])
         )
         // 推断出来的东西自己也得过一遍边界；过不了就**可见地**退回缺省，不许悄悄交一份坏的出去。
         guard suggestion.isValid else { return replacing(fallback, notice: rejectedNotice) }
@@ -205,8 +139,93 @@ enum PropGripInference {
 
     /// 便利入口：直接用世界状态里的那件物件。**没有第二个尺寸来源** —— 读的就是
     /// `effectiveSize` 与 `orientationRotation` 这两个既有出口。
-    static func suggestion(for prop: WorldGeneratedProp) -> PropGripSuggestion {
-        suggestion(size: prop.effectiveSize, orientation: prop.orientationRotation)
+    static func suggestion(for prop: WorldGeneratedProp, geometry: [WorldTriangle]? = nil) -> PropGripSuggestion {
+        suggestion(size: prop.effectiveSize, orientation: prop.orientationRotation, geometry: geometry)
+    }
+
+    /// Bounded evidence profile for the actual inspected white sword and measured PMX holding pose.
+    /// Other assets/avatars have no verified cutting-edge frame; retain their existing calibration.
+    /// This computes a new proposal only. Saved user grips are not migrated during rendering.
+    static func verifiedForwardFacingSwordRotation(for prop: WorldGeneratedProp, avatarAssetID: String) -> WorldQuaternion? {
+        guard prop.assetID == "sha256:e9dda009e47ca4c1ace5e8a6e4ccf18645a109556b4f4772e410815c2be05529",
+              avatarAssetID == "pmx.2b-miss-0414-standard" else { return nil }
+        // Actual GLB ±Z views and tip-section thickness confirm -Y cutting edge and -X handle→tip.
+        // glTFast reflects source X. The persisted quaternion is then reflected through world Z.
+        let axis = preparedSourceDirection(SIMD3<Float>(-1, 0, 0), orientation: prop.orientationRotation)
+        let edge = preparedSourceDirection(SIMD3<Float>(0, -1, 0), orientation: prop.orientationRotation)
+        // Actual hold-display PMX palm frame at t=0, measured in Unity, converted to persisted Z convention.
+        let up = SIMD3<Float>(0.3697862, -0.2558435, -0.8931977)
+        let forward = SIMD3<Float>(0.8843164, 0.3918314, 0.2538750)
+        return rotationAligningFrame(primary: axis, edge: edge, toPrimary: up, toEdge: forward)
+    }
+
+    /// Source GLB direction → prepared prop local direction in persisted right-handed coordinates.
+    /// Distinct X (glTFast) and Z (WorldCoordinates) reflections must not be conflated.
+    static func preparedSourceDirection(_ raw: SIMD3<Float>, orientation: WorldQuaternion) -> SIMD3<Float> {
+        WorldPropRotation.rotate(SIMD3<Float>(-raw.x, raw.y, -raw.z), by: orientation)
+    }
+
+    /// Source-space triangle intersections, including GLB node transforms. AABB alone cannot name a handle.
+    /// Accept only one short round run beside a wide guard, opposite a substantially longer flat blade.
+    static func handleSection(in triangles: [WorldTriangle], axis: Int) -> (grip: SIMD3<Float>, bladeSign: Float)? {
+        guard (0..<3).contains(axis), !triangles.isEmpty else { return nil }
+        let vertices = triangles.flatMap { [$0.first, $0.second, $0.third] }
+        guard vertices.allSatisfy({ $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }) else { return nil }
+        var minimum = vertices[0], maximum = vertices[0]
+        for vertex in vertices { minimum = simd_min(minimum, vertex); maximum = simd_max(maximum, vertex) }
+        let extent = maximum - minimum
+        guard extent.x > 0, extent.y > 0, extent.z > 0 else { return nil }
+        let transverse = (0..<3).filter { $0 != axis }
+        var sections: [(low: SIMD3<Float>, high: SIMD3<Float>)] = []
+        let count = 40
+        for index in 0..<count {
+            let plane = minimum[axis] + extent[axis] * (Float(index) + 0.5) / Float(count)
+            var points: [SIMD3<Float>] = []
+            for triangle in triangles {
+                let corners = [triangle.first, triangle.second, triangle.third]
+                for edge in 0..<3 {
+                    let a = corners[edge], b = corners[(edge + 1) % 3]
+                    let delta = b[axis] - a[axis]
+                    guard abs(delta) > 0.0000001 else { continue }
+                    let t = (plane - a[axis]) / delta
+                    if t >= 0 && t <= 1 { points.append(a + (b - a) * t) }
+                }
+            }
+            guard var low = points.first else { return nil }
+            var high = low
+            for point in points { low = simd_min(low, point); high = simd_max(high, point) }
+            sections.append((low, high))
+        }
+        func width(_ index: Int) -> Float {
+            let s = sections[index]; return max(s.high[transverse[0]] - s.low[transverse[0]], s.high[transverse[1]] - s.low[transverse[1]])
+        }
+        func ratio(_ index: Int) -> Float {
+            let s = sections[index]
+            return min(s.high[transverse[0]] - s.low[transverse[0]], s.high[transverse[1]] - s.low[transverse[1]]) / max(width(index), 0.000001)
+        }
+        guard let guardIndex = (0..<count).max(by: { width($0) < width($1) }),
+              guardIndex >= 6, guardIndex < count - 6 else { return nil }
+        var candidates: [(grip: SIMD3<Float>, bladeSign: Float)] = []
+        for direction in [-1, 1] {
+            var run: [Int] = []
+            for distance in 1..<count {
+                let index = guardIndex + direction * distance
+                guard sections.indices.contains(index) else { break }
+                let round = ratio(index) >= 0.5 && width(index) < width(guardIndex) * 0.5
+                if round { run.append(index) }
+                else if !run.isEmpty { break }
+                else if distance > 3 { break }
+            }
+            guard run.count >= 4, run.count <= 13, let first = run.first, let last = run.last else { continue }
+            let opposite = (0..<count).filter { direction > 0 ? $0 < guardIndex - 2 : $0 > guardIndex + 2 }
+            let flat = opposite.filter { ratio($0) < 0.4 && width($0) < width(guardIndex) * 0.8 }
+            guard flat.count >= run.count * 2, flat.count >= 12 else { continue }
+            let centerIndex = (first + last) / 2
+            let center = (sections[centerIndex].low + sections[centerIndex].high) * 0.5
+            let grip = (center - minimum) / extent
+            candidates.append((grip, Float(-direction)))
+        }
+        return candidates.count == 1 ? candidates[0] : nil
     }
 
     /// 「摆正后第 `orientedIndex` 根轴，是**原始网格**的哪一根」。
@@ -278,6 +297,32 @@ enum PropGripInference {
         let axis = simd_cross(a, b)
         guard simd_length(axis) > 0.000_001 else { return identityRotation }
         return WorldPropRotation.axisAngle(axis: axis, angle: acos(max(-1, min(1, cosine))))
+    }
+
+    /// 完整双轴标定：先对齐柄轴，再绕柄轴对齐经确认的刃侧，补上单轴旋转缺失的 roll。
+    /// 输入与目标必须是同一空间内的正交方向；不接受把刀尖或宽面法线当作刃侧。
+    static func rotationAligningFrame(
+        primary: SIMD3<Float>, edge: SIMD3<Float>,
+        toPrimary targetPrimary: SIMD3<Float>, toEdge targetEdge: SIMD3<Float>
+    ) -> WorldQuaternion? {
+        func unit(_ value: SIMD3<Float>) -> SIMD3<Float>? {
+            let length = simd_length(value)
+            guard length.isFinite, length > 0.000001 else { return nil }
+            return value / length
+        }
+        guard let axis = unit(primary), let edge = unit(edge),
+              let targetAxis = unit(targetPrimary), let targetEdge = unit(targetEdge),
+              abs(simd_dot(axis, edge)) < 0.001,
+              abs(simd_dot(targetAxis, targetEdge)) < 0.001 else { return nil }
+        let first = rotationAligning(axis, to: targetAxis)
+        let alignedEdge = WorldPropRotation.rotate(edge, by: first)
+        let angle = atan2(simd_dot(targetAxis, simd_cross(alignedEdge, targetEdge)),
+                          simd_dot(alignedEdge, targetEdge))
+        let twist = WorldPropRotation.axisAngle(axis: targetAxis, angle: angle)
+        let result = WorldPropRotation.multiply(first, twist)
+        guard simd_dot(WorldPropRotation.rotate(axis, by: result), targetAxis) > 0.9999,
+              simd_dot(WorldPropRotation.rotate(edge, by: result), targetEdge) > 0.9999 else { return nil }
+        return result
     }
 
     /// 同一份缺省，只换那句**可见的**说明。

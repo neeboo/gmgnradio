@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Threading.Tasks;
+using System.Threading;
 using UnityEngine;
 #if GMGN_UMT
 using UMT;
@@ -14,7 +15,158 @@ namespace GMGN.UnityPlayer.Characters
         public event Action<string> MotionCompleted;
         public string CharacterId { get; private set; }
         public string MotionId { get; private set; }
+        public bool IsMotionPlaying =>
+#if GMGN_UMT
+            MotionId != null && !completed;
+#else
+            false;
+#endif
         public bool PhysicsSupported => false;
+        Vector3? interactionContact;
+        Vector3 measuredContactHand;
+        float measuredContactDistance = float.PositiveInfinity;
+        int measuredContactFrame = -1;
+        Transform rightPalmAttachment;
+        CharacterGripPose heldFingerPose;
+        public int HeldFingerContactCount => heldFingerPose?.ContactCount ?? 0;
+        public float HeldFingerMaximumContactError => heldFingerPose?.MaximumContactError ?? float.PositiveInfinity;
+        public string[] HeldFingerDiagnostics => heldFingerPose?.ContactDiagnostics.ToArray() ?? Array.Empty<string>();
+        public void ClearHeldFingerPose() { heldFingerPose?.Clear(); }
+        public void ApplyHeldFingerPose(Vector3 centre,Vector3 axis,float radius)
+        {
+#if GMGN_UMT
+            if(imported==null)return;
+            if(heldFingerPose==null) {
+                heldFingerPose=new CharacterGripPose();
+                foreach(var name in new[]{"右人指","右中指","右薬指","右小指"}) {
+                    var chain=new Transform[4];var lastIndex=-1;
+                    for(var number=0;number<3;number++)for(var index=0;index<imported.model.bones.Length;index++)
+                        if(imported.model.bones[index].originalName.ToString()==name+new[]{"１","２","３"}[number]) {
+                            chain[number]=imported.bones[index];if(number==2)lastIndex=index;break;
+                        }
+                    if(lastIndex<0)continue;
+                    var end=imported.model.bones[lastIndex];
+                    if(end.connectionBoneIndex>=0&&end.connectionBoneIndex<imported.bones.Length)
+                        chain[3]=imported.bones[end.connectionBoneIndex];
+                    else {
+                        var tip=new GameObject("Grip fingertip "+name).transform;tip.SetParent(chain[2],false);
+                        tip.localPosition=(Vector3)end.positionOffset;chain[3]=tip;
+                    }
+                    heldFingerPose.Add(chain);
+                }
+            }
+            heldFingerPose.Set(centre,axis,radius);heldFingerPose.Apply();
+#endif
+        }
+        public void SetInteractionContact(Vector3? target) {
+            if (interactionContact != target) { measuredContactFrame = -1; measuredContactDistance = float.PositiveInfinity; }
+            interactionContact = target;
+        }
+        public bool TryReadInteractionContact(out Vector3 hand, out float distance) {
+            hand = measuredContactHand; distance = measuredContactDistance;
+            return interactionContact.HasValue && measuredContactFrame >= Time.frameCount-1
+                && float.IsFinite(distance) && distance <= .1f;
+        }
+        void ApplyInteractionContact() {
+            measuredContactDistance = float.PositiveInfinity; measuredContactFrame = Time.frameCount;
+#if GMGN_UMT
+            if (!interactionContact.HasValue || imported == null) return;
+            Transform upper = null, lower = null, hand = null;
+            for (int i=0; i<imported.model.bones.Length; i++) {
+                var name = imported.model.bones[i].originalName.ToString();
+                if (name == "右腕") upper = imported.bones[i];
+                if (name == "右ひじ") lower = imported.bones[i];
+                if (name == "右手首") hand = imported.bones[i];
+            }
+            if (upper == null || lower == null || hand == null) return;
+            var target = interactionContact.Value;
+            var offset = Vector3.Distance(hand.position,target);
+            var a=upper.position; var b=lower.position; var c=hand.position;
+            var first=Vector3.Distance(a,b); var second=Vector3.Distance(b,c);
+            // Imported PMX arms differ from the VRM authored button pose.
+            // Refine only its nearby press pose, bounded by half this arm's
+            // actual reach; retain bone lengths and the real 10 cm receipt.
+            if (offset <= Mathf.Max(.2f, (first+second)*.5f) && offset > .001f) {
+                var direction=target-a; var length=direction.magnitude;
+                // Match the VRM refinement: a nearly extended arm aims at its
+                // closest reachable point, without stretching either segment.
+                // The receipt measures distance to the original device target.
+                var reachableLength=Mathf.Min(length,(first+second)*.999f);
+                if (first > .001f && second > .001f && length > .001f &&
+                    reachableLength > Mathf.Abs(first-second)) {
+                    var axis=direction/length; var bend=Vector3.ProjectOnPlane(b-a,axis);
+                    if (bend.sqrMagnitude > .000001f) {
+                        var reachableTarget=a+axis*reachableLength;
+                        var along=(first*first+reachableLength*reachableLength-second*second)/(2*reachableLength);
+                        var height=Mathf.Sqrt(Mathf.Max(0,first*first-along*along));
+                        var elbow=a+axis*along+bend.normalized*height;
+                        upper.rotation=Quaternion.FromToRotation(b-a,elbow-a)*upper.rotation;
+                        lower.rotation=Quaternion.FromToRotation(hand.position-lower.position,reachableTarget-lower.position)*lower.rotation;
+                    }
+                }
+            }
+            measuredContactHand=hand.position;
+            measuredContactDistance=Vector3.Distance(hand.position,target);
+#endif
+        }
+        public bool TryGetAttachmentBone(string slot, out Transform bone)
+        {
+            bone = null;
+#if GMGN_UMT
+            if (imported == null) return false;
+            var candidates = slot switch {
+                "rightHand" => new[] { "右手首", "bone009" },
+                "back" => new[] { "上半身2", "bone002", "上半身", "bone001" },
+                "waist" => new[] { "腰", "下半身", "bone014", "センター", "bone000" },
+                _ => Array.Empty<string>()
+            };
+            foreach (var name in candidates)
+                for (var i = 0; i < imported.model.bones.Length; i++)
+                    if (imported.model.bones[i].originalName.ToString() == name) {
+                        bone = imported.bones[i];
+                        if (slot == "rightHand") {
+                            Transform middle = null,indexFinger=null,littleFinger=null;
+                            for (var finger = 0; finger < imported.model.bones.Length; finger++)
+                                if (imported.model.bones[finger].originalName.ToString() == "右中指１") {
+                                    middle = imported.bones[finger];
+                                }else if(imported.model.bones[finger].originalName.ToString()=="右人指１")indexFinger=imported.bones[finger];
+                                else if(imported.model.bones[finger].originalName.ToString()=="右小指１")littleFinger=imported.bones[finger];
+                            if (middle != null) {
+                                if (rightPalmAttachment == null || rightPalmAttachment.parent != bone) {
+                                    if (rightPalmAttachment != null) Destroy(rightPalmAttachment.gameObject);
+                                    rightPalmAttachment = new GameObject("Right palm attachment").transform;
+                                    rightPalmAttachment.SetParent(bone,false);
+                                    if(indexFinger!=null&&littleFinger!=null)
+                                        rightPalmAttachment.localRotation=CharacterGripPose.PalmLocalRotation(bone,indexFinger,middle,littleFinger,transform.up);
+                                }
+                                // Wrist and proximal middle-finger joint bound
+                                // the palm. Place the calibrated handle at its
+                                // anatomical centre, retaining authored wrist
+                                // rotation and world-metre prop dimensions.
+                                rightPalmAttachment.localPosition = bone.InverseTransformPoint((bone.position+middle.position)*.5f);
+                                bone = rightPalmAttachment;
+                            }
+                        }
+                        return true;
+                    }
+#endif
+            return false;
+        }
+        public bool TryGetHeadPosition(out Vector3 position)
+        {
+            position = default;
+#if GMGN_UMT
+            if (imported == null) return false;
+            for (var i = 0; i < imported.model.bones.Length; i++) {
+                var bone = imported.model.bones[i];
+                if (bone.originalName.ToString() != "頭" &&
+                    !string.Equals(bone.originalNameEN.ToString(), "head", StringComparison.OrdinalIgnoreCase)) continue;
+                position = imported.bones[i].position;
+                return true;
+            }
+#endif
+            return false;
+        }
         public bool IsLoaded { get; private set; }
         bool loading;
         int generation;
@@ -30,10 +182,20 @@ namespace GMGN.UnityPlayer.Characters
         float elapsed, motionDuration, playbackRate = 1;
         bool looping, completed;
         bool poseDiagnosticPending;
+        SkinnedMeshRenderer[] speechTargets = Array.Empty<SkinnedMeshRenderer>();
+        int[] speechIndices = Array.Empty<int>();
+        bool speechPlaying, speechResetPending;
+        float speechWeight;
+        int speechDiagnosticFrames;
+        bool speechDiagnosticStopPending;
+        float speechDiagnosticRawLevel, speechDiagnosticMaxRawLevel, speechDiagnosticMaxAppliedPercent;
+        public float SpeechDiagnosticMaxRawLevel => speechDiagnosticMaxRawLevel;
+        public float SpeechDiagnosticMaxAppliedPercent => speechDiagnosticMaxAppliedPercent;
 #endif
 
         public async Task LoadAsync(string characterId, string modelPath, float heightMeters = 1.65f)
         {
+            heldFingerPose?.Clear();heldFingerPose=null;
             if (loading) throw new InvalidOperationException("角色正在载入，请等待完成。");
             if (!File.Exists(modelPath) || !string.Equals(Path.GetExtension(modelPath), ".pmx", StringComparison.OrdinalIgnoreCase))
                 throw new FileNotFoundException("请选择有效的 PMX 角色文件。", modelPath);
@@ -53,8 +215,15 @@ namespace GMGN.UnityPlayer.Characters
             try
             {
                 Notice?.Invoke("正在载入角色…");
-                var budget = new UMTFrameBudget(4);
+                // NextFrameAsync needs the game loop. Editor import/preview
+                // must finish without waiting for a frame that never arrives.
+                var budget = new UMTFrameBudget(Application.isPlaying ? 4 : double.PositiveInfinity);
                 using (var stream = File.OpenRead(modelPath)) model = await PMXReader.ReadAsync(budget, stream, false);
+                if (request != generation) { Destroy(staging); Destroy(model); return; }
+                var umtResources = Resources.Load<UMTResources>("UMTResources");
+                if (umtResources == null) throw new InvalidDataException("MMD 名称映射资源缺失。");
+                var renameLists = PMXRenameUtilities.LoadRenameListsJson(umtResources.GetPMXRenameListsJson());
+                await PMXRenameUtilities.RenameAsync(budget, model, renameLists, umtResources);
                 if (request != generation) { Destroy(staging); Destroy(model); return; }
                 var resourceRoot = Path.GetFullPath(Path.GetDirectoryName(modelPath)) + Path.DirectorySeparatorChar;
                 foreach (var texture in model.texturePaths) {
@@ -78,6 +247,7 @@ namespace GMGN.UnityPlayer.Characters
                 bindPositions = new Vector3[next.bones.Length]; bindRotations = new Quaternion[next.bones.Length];
                 for (var i = 0; i < next.bones.Length; i++) { bindPositions[i] = next.bones[i].localPosition; bindRotations[i] = next.bones[i].localRotation; }
                 CharacterId = characterId; MotionId = null; IsLoaded = true;
+                CacheSpeechTargets();
                 staging.SetActive(true);
                 LogSkinningBounds("bind");
                 Notice?.Invoke("角色已载入；MMD 物理尚未接入。");
@@ -95,7 +265,7 @@ namespace GMGN.UnityPlayer.Characters
 #endif
         }
 
-        public async Task PlayMotionAsync(string motionId, string vmdPath, bool loop, float rate = 1)
+        public async Task PlayMotionAsync(string motionId, string vmdPath, bool loop, float rate = 1, CancellationToken cancellation = default)
         {
             if (loading) throw new InvalidOperationException("角色正在载入，请等待完成。");
             if (!IsLoaded) throw new InvalidOperationException("请先载入角色。");
@@ -105,7 +275,7 @@ namespace GMGN.UnityPlayer.Characters
 #if GMGN_UMT
             var request = ++generation;
             var model = imported.model;
-            var budget = new UMTFrameBudget(4);
+            var budget = new UMTFrameBudget(Application.isPlaying ? 4 : double.PositiveInfinity);
             var animation = await VMDReader.ReadAsync(budget, File.ReadAllBytesAsync(vmdPath));
             try
             {
@@ -113,6 +283,7 @@ namespace GMGN.UnityPlayer.Characters
                     GeneratedHumanoidRetarget.Apply(animation, model);
                 var converted = await VMDAnimationClipConverter.ConvertAsync(budget, animation, model, null,
                     new VMDAnimationClipOptions { bakeIKToFK = true, bakePhysicsToFK = false });
+                cancellation.ThrowIfCancellationRequested();
                 if (request != generation || imported?.model != model) return;
                 var nextTargets = new Transform[converted.bones.paths.Length];
                 var bound = 0;
@@ -212,6 +383,7 @@ namespace GMGN.UnityPlayer.Characters
         }
         void Update()
         {
+            heldFingerPose?.Restore();
             if (motion == null || completed) return;
             elapsed += Time.deltaTime * playbackRate;
             var t = looping ? elapsed % motionDuration : Mathf.Min(elapsed, motionDuration);
@@ -227,6 +399,52 @@ namespace GMGN.UnityPlayer.Characters
             if (!looping && elapsed >= motionDuration) { completed = true; MotionCompleted?.Invoke(MotionId); }
         }
         float Evaluate(int index, float t, float fallback) => motion.bones.curves[index]?.Evaluate(t) ?? fallback;
+        void CacheSpeechTargets()
+        {
+            var renderers = new System.Collections.Generic.List<SkinnedMeshRenderer>();
+            var indices = new System.Collections.Generic.List<int>();
+            var names = new System.Collections.Generic.List<string>();
+            foreach (var sourceName in new[] { "あ", "aa", "Aa", "mouth_a", "vrc.v.aa" }) {
+                foreach (var morph in imported.model.morphs)
+                    if (morph.originalName.ToString() == sourceName) names.Add(morph.renamedName.ToString());
+            }
+            foreach (var skin in imported.root.GetComponentsInChildren<SkinnedMeshRenderer>(true)) {
+                foreach (var name in names) {
+                    var index = skin.sharedMesh.GetBlendShapeIndex(name);
+                    if (index < 0) continue;
+                    renderers.Add(skin); indices.Add(index); break;
+                }
+            }
+            speechTargets = renderers.ToArray(); speechIndices = indices.ToArray();
+        }
+        // Apply after the VMD morph curves so speech is visible while a motion plays.
+        // Once speech stops, clear its mouth weight then let authored curves resume.
+        void LateUpdate()
+        {
+            ApplyInteractionContact();
+            if (!speechPlaying && !speechResetPending) return;
+            for (var i = 0; i < speechTargets.Length; i++)
+                if (speechTargets[i] != null) speechTargets[i].SetBlendShapeWeight(speechIndices[i], speechPlaying ? speechWeight : 0);
+            LogSpeechDiagnosticAfterMorph();
+            speechResetPending = false;
+        }
+        void LogSpeechDiagnosticAfterMorph()
+        {
+            var shouldLog = speechDiagnosticStopPending || (speechPlaying && speechDiagnosticFrames > 0);
+            var actual = "";
+            for (var i = 0; i < speechTargets.Length; ++i) {
+                var skin = speechTargets[i];
+                var applied = skin != null ? skin.GetBlendShapeWeight(speechIndices[i]) : 0f;
+                if (speechPlaying && skin != null) speechDiagnosticMaxAppliedPercent = Mathf.Max(speechDiagnosticMaxAppliedPercent, applied);
+                if (!shouldLog) continue;
+                if (actual.Length > 0) actual += ",";
+                actual += skin != null ? applied.ToString("F5", System.Globalization.CultureInfo.InvariantCulture) : "missing";
+            }
+            if (!shouldLog) return;
+            Debug.Log($"[PmxSpeechFrameDiagnostic] frame={Time.frameCount} playing={speechPlaying} rawLevel={speechDiagnosticRawLevel:F6} aaTarget={speechWeight / 100f:F6} runtimePercent={speechWeight:F5} bindingCount={speechTargets.Length} appliedPercent=[{actual}] maxRawLevel={speechDiagnosticMaxRawLevel:F6} maxAppliedPercent={speechDiagnosticMaxAppliedPercent:F5}");
+            speechDiagnosticStopPending = false;
+            if (speechDiagnosticFrames > 0) --speechDiagnosticFrames;
+        }
         void LogSkinningBounds(string stage)
         {
             if (imported == null) return;
@@ -272,6 +490,22 @@ namespace GMGN.UnityPlayer.Characters
             if (value.model != null) Destroy(value.model);
         }
 #endif
+        public void SetSpeechLevel(bool playing, float level)
+        {
+#if GMGN_UMT
+            if (playing && !speechPlaying) {
+                speechDiagnosticFrames = 12;
+                speechDiagnosticMaxRawLevel = 0f;
+                speechDiagnosticMaxAppliedPercent = 0f;
+            }
+            if (!playing && speechPlaying) speechDiagnosticStopPending = true;
+            speechDiagnosticRawLevel = level;
+            if (playing && float.IsFinite(level)) speechDiagnosticMaxRawLevel = Mathf.Max(speechDiagnosticMaxRawLevel, level);
+            if (speechPlaying || playing) speechResetPending = true;
+            speechPlaying = playing;
+            speechWeight = playing && float.IsFinite(level) ? Mathf.Clamp01(level * 2f) * 100f : 0;
+#endif
+        }
         void OnDestroy()
         {
             ++generation;

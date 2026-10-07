@@ -13,7 +13,7 @@
 //     field names would be a composition the loader ignores.
 //   * **The paths are the ones the host wrote.** `command` and `args` must be
 //     the exact absolute facts the caller passed. Swapping either one — pointing
-//     the face at another binary, another socket, or another authorization file
+//     the face at another binary, another endpoint file, or another authorization file
 //     — fails closed, because read-back validation compares against the
 //     caller's own facts rather than trusting the text.
 //   * **An unrequested row is fatal, not ignored.** A `gmgn-mcp` row that
@@ -27,10 +27,10 @@ let work = FileManager.default.temporaryDirectory.appendingPathComponent("gmgn-d
 try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
 defer { try? FileManager.default.removeItem(at: work) }
 
-// The real path shape on this machine: the socket lives inside the daemon's
+// The real path shape on this machine: the endpoint file lives inside the daemon's
 // private root, which contains a space. A mounting scheme that cannot carry a
 // space is not a scheme that works here.
-let realSocket = "/Users/fixture/Library/Application Support/gmgn radio/TaskService/taskd.sock"
+let realEndpointFile = "/Users/fixture/Library/Application Support/gmgn radio/TaskService/taskd.endpoint.json"
 let realGrant = "/Users/fixture/Library/Application Support/gmgn radio/TaskService/gmgn-host-tools.grant.json"
 let binary = "/Applications/GMGN Radio.app/Contents/Helpers/gmgn-mcpd"
 
@@ -59,7 +59,7 @@ var failures: [String] = []
 
 let work = URL(fileURLWithPath: CommandLine.arguments[1])
 let binary = CommandLine.arguments[2]
-let realSocket = CommandLine.arguments[3]
+let realEndpointFile = CommandLine.arguments[3]
 let realGrant = CommandLine.arguments[4]
 
 let attachmentHome = work.appendingPathComponent("home")
@@ -67,7 +67,7 @@ let persistenceRoot = work.appendingPathComponent("sessions")
 let persona = "你是生活空间的居民。"
 
 let server = ResidentDSHComposition.ResidentDSHMCPServer(
-    command: binary, socketPath: realSocket, grantPath: realGrant)
+    command: binary, endpointFile: realEndpointFile, grantPath: realGrant)
 
 // ── 1. Default off: no row, no new package, same bytes. ──────────────────
 let plain = ResidentDSHComposition.residentYAML(
@@ -93,7 +93,7 @@ let expectedRow = """
     serverName: gmgn
     transport: stdio
     command: '\(binary)'
-    args: [--socket, \(realSocket), --grant, \(realGrant)]
+    args: [--endpoint-file, \(realEndpointFile), --grant, \(realGrant)]
 """
 check(mounted.contains(expectedRow), "the MCP row is emitted in the official field vocabulary")
 check(ResidentDSHComposition.validateComposedConfig(mounted, mcpServer: server),
@@ -105,7 +105,7 @@ check(!ResidentDSHComposition.validateComposedConfig(mounted),
 check(ResidentDSHComposition.privateMCPServer(in: mounted) == server,
       "the emitted row round-trips back to the facts it was built from")
 
-// A socket path with a space has to survive both the emitter and the reading
+// An endpoint file path with a space has to survive both the emitter and the reading
 // validator; otherwise the real private root could never be mounted.
 check(server.argumentsText.contains("Application Support/gmgn radio"),
       "a space-containing private root survives the argument list text")
@@ -113,12 +113,14 @@ check(server.isWellFormed, "the real private-root paths are accepted as well for
 
 // ── 3. Tampering fails closed. ───────────────────────────────────────────
 let tampered: [(String, String)] = [
+    ("obsolete socket flag",
+     mounted.replacingOccurrences(of: "--endpoint-file", with: "--socket")),
     ("pointed at another binary",
      mounted.replacingOccurrences(of: "command: '\(binary)'",
                                   with: "command: '/tmp/other-mcpd'")),
-    ("pointed at another socket",
-     mounted.replacingOccurrences(of: "--socket, \(realSocket)",
-                                  with: "--socket, /tmp/other.sock")),
+    ("pointed at another endpoint file",
+     mounted.replacingOccurrences(of: "--endpoint-file, \(realEndpointFile)",
+                                  with: "--endpoint-file, /tmp/other.endpoint.json")),
     ("pointed at another grant file",
      mounted.replacingOccurrences(of: "--grant, \(realGrant)",
                                   with: "--grant, /tmp/other.grant.json")),
@@ -165,14 +167,14 @@ check(!ResidentDSHComposition.declaresImageInput(
 
 // A malformed request is not a request: it must not emit a half-valid row.
 let relativeBinary = ResidentDSHComposition.ResidentDSHMCPServer(
-    command: "gmgn-mcpd", socketPath: realSocket, grantPath: nil)
+    command: "gmgn-mcpd", endpointFile: realEndpointFile, grantPath: nil)
 check(!relativeBinary.isWellFormed, "a relative command path is not well formed")
-let commaSocket = ResidentDSHComposition.ResidentDSHMCPServer(
-    command: binary, socketPath: "/tmp/a,b.sock", grantPath: nil)
-check(!commaSocket.isWellFormed, "a socket path containing a comma is not well formed")
-let quotedSocket = ResidentDSHComposition.ResidentDSHMCPServer(
-    command: binary, socketPath: "/tmp/o'brien.sock", grantPath: nil)
-check(!quotedSocket.isWellFormed, "a socket path containing a quote is not well formed")
+let commaEndpoint = ResidentDSHComposition.ResidentDSHMCPServer(
+    command: binary, endpointFile: "/tmp/a,b.endpoint.json", grantPath: nil)
+check(!commaEndpoint.isWellFormed, "an endpoint file path containing a comma is not well formed")
+let quotedEndpoint = ResidentDSHComposition.ResidentDSHMCPServer(
+    command: binary, endpointFile: "/tmp/o'brien.endpoint.json", grantPath: nil)
+check(!quotedEndpoint.isWellFormed, "an endpoint file path containing a quote is not well formed")
 let refusedEmit = ResidentDSHComposition.residentYAML(
     attachmentHome: attachmentHome, persistenceRoot: persistenceRoot, persona: persona,
     mcpServer: relativeBinary)
@@ -269,5 +271,5 @@ compile.arguments = arguments
 try compile.run(); compile.waitUntilExit()
 guard compile.terminationStatus == 0 else { exit(compile.terminationStatus) }
 let test = Process(); test.executableURL = binaryURL
-test.arguments = [work.path, binary, realSocket, realGrant]
+test.arguments = [work.path, binary, realEndpointFile, realGrant]
 try test.run(); test.waitUntilExit(); exit(test.terminationStatus)

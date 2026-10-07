@@ -1,6 +1,6 @@
-"""Offline process tests for the local VoiceMem memory IPC.
+"""Offline process tests for the local VoiceMem memory HTTP API.
 
-Drives the real gmgn-taskd child over authenticated loopback TCP with **no provider at
+Drives the real gmgn-taskd child over authenticated loopback HTTP with **no provider at
 all**: the external compaction/embedding service layer has been removed, and so
 has the **原文层** (volatile pending turns / delivered-pair ingest). What this
 suite proves end to end is therefore:
@@ -19,9 +19,9 @@ Private temp roots and local loopback endpoints only: never starts the macOS app
 never touches the keychain, never opens a network fixture.
 """
 import json
+from http_transport import Connection
 import os
 from pathlib import Path
-import socket
 import subprocess
 import sys
 import tempfile
@@ -61,23 +61,13 @@ class Daemon:
                 time.sleep(.02)
         if self.p.poll() is None:
             self.p.kill()
-        raise AssertionError("daemon did not expose its TCP endpoint: " +
+        raise AssertionError("daemon did not expose its HTTP endpoint: " +
                              self.p.communicate(timeout=2)[1].decode())
 
     def connect(self):
-        endpoint = json.loads(Path(self.path).read_text())
-        host, port = endpoint["address"].rsplit(":", 1)
-        if endpoint["version"] != 1 or host != "127.0.0.1" or not 0 < int(port) < 65536:
-            raise OSError("invalid local endpoint")
-        self.auth = endpoint["token"]
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(8)
-        try:
-            s.connect((host, int(port)))
-        except Exception:
-            s.close()
-            raise
-        return s
+        connection = Connection(self.path)
+        self.auth = connection.auth
+        return connection
 
     def request(self, method, params=None, request_id="t"):
         params = params or {}

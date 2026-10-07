@@ -18,7 +18,9 @@ Shader "GMGN/PlacementGrid"
             Varyings vert(Attributes v) { Varyings o; o.positionCS=TransformObjectToHClip(v.positionOS.xyz); o.uv=v.uv; return o; }
             half4 frag(Varyings i) : SV_Target {
                 float edge=min(min(i.uv.x,1-i.uv.x),min(i.uv.y,1-i.uv.y));
-                return half4(_Color.rgb,_Color.a * (edge < 0.035 ? 1 : 0.13));
+                float smoothing=max(fwidth(edge),0.001);
+                float gridLine=1-smoothstep(0.035-smoothing,0.035+smoothing,edge);
+                return half4(_Color.rgb,_Color.a * lerp(0.18,1,gridLine));
             }
             ENDHLSL
         }

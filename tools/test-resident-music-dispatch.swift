@@ -220,7 +220,7 @@ func worldRuntimeHarnessFlags() -> [String] {
     return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         .split(separator: "\n").map(String.init)
 }
-var arguments = ["-j1", "-parse-as-library"] + worldRuntimeHarnessFlags()
+var arguments = ["-j1", "-parse-as-library", sources.appendingPathComponent("Presence/RetryBackoff.swift").path] + worldRuntimeHarnessFlags()
 for name in files {
     arguments.append(sources.appendingPathComponent("Agent/\(name).swift").path)
 }

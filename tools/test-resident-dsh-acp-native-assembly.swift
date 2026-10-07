@@ -130,6 +130,13 @@ struct ResidentDSHACPNativeAssembly {
             printResult(checks)
             return
         }
+        // Match Unity's production lifecycle: tools are unarmed during the
+        // handshake, then armed only for the admitted foreground prompt.
+        channel.revoke()
+        let bootstrapURL = channel.pluginFileURL.deletingLastPathComponent().appendingPathComponent("gmgn-host-tools.bootstrap.json")
+        let bootstrap = try JSONSerialization.jsonObject(with: Data(contentsOf: bootstrapURL)) as? [String: Any]
+        checks.check(Set(bootstrap?.keys.map { $0 } ?? []) == ["tools"], "B2 bootstrap 只含定义，不含密钥/端点/授权")
+        checks.check(!FileManager.default.fileExists(atPath: channel.grantFileURL.path), "B2 握手前授权已撤销，定义仍可读")
         let sandbox = try ResidentDSHComposition.makeResidentSandbox(
             resolvingFrom: transport.entry,
             hostToolsPluginPath: channel.pluginFileURL.path
@@ -176,6 +183,7 @@ struct ResidentDSHACPNativeAssembly {
         let round1Prompt = "请用许愿机正式工具查询当前许愿任务状态，然后用一句话把结果告诉我。"
         let round1Reply: String
         do {
+            try channel.arm(worldRevision: 7)
             round1Reply = try await connector.prompt(sessionID: handle.sessionID, blocks: [ResidentDSHPromptBlock.text(round1Prompt)])
         } catch {
             checks.check(false, "B4 R1 prompt 失败：\(error)")
@@ -302,9 +310,10 @@ let hostBridge = root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent
 let configuration = root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/ResidentDSHConfiguration.swift").path
 let transport = root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/ResidentDSHTransport.swift").path
 let support = root.appendingPathComponent("tools/resident-dsh-host-tools-support.swift").path
+let retry = root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift").path
 // 编译门与主代理验收一致：`-swift-version 6 -parse-as-library` 真实编译并运行。
 compile.arguments = ["-swift-version", "6", "-parse-as-library", "-j1",
-                     agentBridge, hostBridge, configuration, transport, support,
+                     agentBridge, hostBridge, configuration, transport, support, retry,
                      main.path, "-o", binary.path]
 compile.currentDirectoryURL = work
 try compile.run()

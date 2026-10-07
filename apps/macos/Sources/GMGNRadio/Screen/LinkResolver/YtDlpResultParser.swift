@@ -65,6 +65,8 @@ enum YtDlpResultParser {
         guard let videoStream else {
             return .failed(.noPlayableStream)
         }
+        // A muxed video already owns its soundtrack; a later audio candidate must not duplicate it.
+        if videoStream.hasAudio { audioStream = nil }
         // `vcodec`/`acodec` 在顶层可能只是"这种站点声称的"；以实际选中的流为准。
         _ = video
         _ = audio

@@ -6,13 +6,13 @@
     {
       "name": "yt-dlp",
       "required": true,
-      "version": "2026.06.09",
+      "version": "2026.08.19",
       "distribution": "pyinstaller_standalone",
       "format": "raw_binary",
       "arch": "universal",
-      "source_url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.06.09/yt-dlp_macos",
-      "source_checksums_url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.06.09/SHA2-256SUMS",
-      "sha256": "b82c3626952e6c14eaf654cc565866775ffd0b9ffb7021628ac59b42c2f4f244",
+      "source_url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_macos",
+      "source_checksums_url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/SHA2-256SUMS",
+      "sha256": "0f192b7ec147ab6288885d6351d9ab67367640029b4377576ef46dd79cf7b202",
       "upstream_license_spdx": "Unlicense",
       "combined_work_license_spdx": "GPL-3.0-or-later",
       "license_note": "yt-dlp 上游是 Unlicense；PyInstaller 独立二进制内含 GPLv3+ 代码，组合作品按 GPLv3+ 分发，必须随包带第三方许可声明。"

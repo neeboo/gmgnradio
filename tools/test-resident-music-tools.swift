@@ -18,13 +18,15 @@ enum SpatialCameraCommandDirection: String, CaseIterable { case reset }
 struct RealtimeDJToolCall { let id: String; let name: String; let argumentsJSON: Data }
 struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isError: Bool }
 @MainActor final class Actions: DJAgentRadioActions {
+    var unavailable: Set<String> = []
     var calls: [String] = []
     var failure: Error?
     var hold = false
     var pending: CheckedContinuation<Void, Never>?
     func snapshot(takeoverEnabled: Bool) -> DJAgentRadioState {
         .init(takeoverEnabled: takeoverEnabled, playbackState: "idle", activeTrackID: nil, activeSlotIndex: nil,
-              program: (0..<75).map { .init(index: $0, id: "track-\($0)", title: "Title", artist: "Artist") })
+              program: (0..<75).map { .init(index: $0, id: "track-\($0)", title: "Title", artist: "Artist") },
+              capabilities: DJAgentCapabilityManifest.capabilities.filter { !unavailable.contains($0.name) })
     }
     func currentTrackSnapshot() -> DJAgentCurrentTrackSnapshot? { calls.append("current"); return nil }
     func playProgramTrack(trackID: String?, slotIndex: Int?) async throws { fatalError("forbidden playback") }
@@ -32,7 +34,7 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
     func playPreviousTrack() async throws { fatalError("forbidden playback") }
     func pauseMusic() async throws { fatalError("forbidden playback") }
     func resumeMusic() async throws { fatalError("forbidden playback") }
-    func replanProgram(immediateInstruction: String?) async throws { fatalError("forbidden replan") }
+    func replanProgram(immediateInstruction: String?) async throws { calls.append("replan") }
     func activatePreparedProgram() async throws { fatalError("forbidden playback") }
     func insertTrack(immediateInstruction: String) async throws { fatalError("forbidden insert") }
     func setVisualMood(_ mood: StageVisualMood) async throws { fatalError("forbidden visual") }
@@ -66,11 +68,34 @@ func json(_ result: RealtimeDJToolResult) -> [String: Any] { try! JSONSerializat
     @MainActor static func main() async throws {
         let manifest = try JSONDecoder().decode(WorldManifest.self, from: Data(contentsOf: URL(fileURLWithPath: "apps/macos/Resources/Worlds/marble-living-cabin/world.json")))
         let context = try WorldAgentContext(manifest: manifest)
+        // Match production: the per-turn wrapper has no owner outside its bridge.
+        let temporaryBridge = ResidentMusicToolBridge(actions: Actions(), isCurrent: { true })
+        let temporaryState = temporaryBridge.tools.first { $0.name == "read_radio_state" }!
+        let retainedResult = await temporaryState.handle("temporary-owner", Data("{}".utf8))
+        check(!retainedResult.isError, "bridge retains temporary music actions for the tool lease")
         let actions = Actions()
+        actions.unavailable = ["set_visual_mood", "set_spatial_environment"]
+        let restricted = DJAgentToolDispatcher(takeoverEnabled: { true }, actions: actions)
+        check(!restricted.providerTools.contains { ($0["function"] as? [String: Any])?["name"] as? String == "set_visual_mood" }, "unimplemented visual tool is not exported")
+        let unsupported = await restricted.handle(.init(id: "unsupported-mood", name: "set_visual_mood", argumentsJSON: Data(#"{"mood":"pulse"}"#.utf8)))
+        check(unsupported.isError && json(unsupported)["code"] as? String == "unsupported_tool", "direct unimplemented visual call is refused before actions")
+        let unavailableSpatial = ResidentMusicToolBridge(actions: actions, isCurrent: { true }, exportedNames: ResidentMusicToolBridge.spatialNames)
+        check(!unavailableSpatial.tools.contains { $0.name == "set_spatial_environment" }, "unavailable spatial hook is not exported")
+        actions.unavailable = []
         var current = true
         let bridge = ResidentMusicToolBridge(actions: actions, isCurrent: { current })
         let expected: Set<String> = ["read_radio_state", "read_current_track", "list_music_playlists", "read_music_playlist", "prepare_music_track"]
         check(Set(bridge.tools.map(\.name)) == expected, "exactly five resident music capabilities")
+        var takeover = false
+        let planning = ResidentMusicToolBridge(actions: actions, isCurrent: { true },
+            exportedNames: ResidentMusicToolBridge.planningNames, takeoverEnabled: { takeover })
+        check(Set(planning.tools.map(\.name)) == ResidentMusicToolBridge.planningNames, "planning is explicitly opt-in")
+        let replan = planning.tools.first { $0.name == "replan_program" }!
+        let denied = await replan.handle("planning-denied", Data("{}".utf8))
+        check(denied.isError && !actions.calls.contains("replan"), "disabled takeover prevents planning")
+        takeover = true
+        let allowed = await replan.handle("planning-allowed", Data("{}".utf8))
+        check(!allowed.isError && actions.calls.contains("replan"), "takeover change is consumed without rebuilding bridge")
         let session = ResidentWorldToolSession(scopeID: UUID(), worldID: manifest.worldID,
             dispatcher: WorldAgentToolDispatcher(takeoverEnabled: { true }, context: context),
             deadline: Date().addingTimeInterval(30), isCurrent: { current }, additionalTools: bridge.tools)
@@ -167,7 +192,7 @@ let worldRuntimeFlags = worldRuntimeHarnessFlags()
 let objects = Array(worldRuntimeFlags.dropFirst(2))
 let files = ["WorldAgentContext", "WorldAgentToolContract", "WorldAgentToolDispatcher", "ResidentWorldToolSession", "DJAgentToolDispatcher", "ResidentMusicToolBridge"]
 let compile = Process(); compile.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
-compile.arguments = ["-j1", "-parse-as-library", "-I", worldRuntimeFlags[1]] + files.map { sources.appendingPathComponent($0 + ".swift").path } + objects + [main.path, "-o", binary.path]
+compile.arguments = ["-j1", "-parse-as-library", "-I", worldRuntimeFlags[1]] + files.map { sources.appendingPathComponent($0 + ".swift").path } + [root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift").path] + objects + [main.path, "-o", binary.path]
 try compile.run(); compile.waitUntilExit()
 guard compile.terminationStatus == 0 else { exit(compile.terminationStatus) }
 let test = Process(); test.executableURL = binary

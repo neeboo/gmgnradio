@@ -6,6 +6,16 @@ let source = try String(contentsOfFile: "apps/macos/Sources/GMGNRadio/Settings/A
 let start = source.range(of: "final class RustSpeechPreferences {")!.lowerBound
 let end = source.range(of: "\nstruct BailianRealtimeModelOption", range: start..<source.endIndex)!.lowerBound
 let preferences = String(source[start..<end])
+let host = try String(contentsOfFile: "apps/macos/UnityHost/UnityProductSettings.swift", encoding: .utf8)
+let resolverStart = host.range(of: "    private func voiceConfiguration(provider:")!.lowerBound
+let resolverEnd = host.range(of: "    var autoSpeakReplies:", range: resolverStart..<host.endIndex)!.lowerBound
+let providerResolver = String(host[resolverStart..<resolverEnd])
+let effectiveStart = host.range(of: "    private static func resolveVoiceConfiguration(for")!.lowerBound
+let effectiveEnd = host.range(of: "    func voiceConfiguration(for", range: effectiveStart..<host.endIndex)!.lowerBound
+let effectiveResolver = String(host[effectiveStart..<effectiveEnd])
+let microphoneStart = host.range(of: "    var microphoneDeviceID: String?")!.lowerBound
+let microphoneEnd = host.range(of: "\n    init(root:", range: microphoneStart..<host.endIndex)!.lowerBound
+let microphoneResolver = String(host[microphoneStart..<microphoneEnd])
 let checks = #"""
 import Foundation
 enum RustVoiceProvider: String { case bailian, elevenlabs, fish }
@@ -13,8 +23,17 @@ struct RustVoiceConfiguration {
  let provider: RustVoiceProvider; let apiKey: String; let voiceID: String; let model: String?
 }
 enum E2ERuntime { static let defaults = UserDefaults.standard }
-enum RealtimeVoicePreferences { static let replyVoiceIDKey = "speech.bailian.voiceID" }
+enum RealtimeVoicePreferences { static let replyVoiceIDKey = "speech.bailian.voiceID"; static let microphoneDeviceIDKey = "voice.microphoneDeviceID" }
 """# + "\n" + preferences + #"""
+
+final class HostProviderProbe {
+ let defaults: UserDefaults; let speech: RustSpeechPreferences; let productSpeech: RustSpeechPreferences?; let productVoiceDefaults: UserDefaults?
+ init(_ defaults: UserDefaults, _ product: RustSpeechPreferences, _ productDefaults: UserDefaults) {
+  self.defaults = defaults; self.speech = RustSpeechPreferences(defaults: defaults); self.productSpeech = product; self.productVoiceDefaults = productDefaults
+ }
+ func voiceConfiguration(for purpose: String) -> RustVoiceConfiguration { Self.resolveVoiceConfiguration(for: purpose, defaults: defaults, speech: speech, productSpeech: productSpeech) }
+ func probe(_ provider: RustVoiceProvider) -> RustVoiceConfiguration { voiceConfiguration(provider: provider, for: "tts") }
+"""# + "\n" + effectiveResolver + "\n" + providerResolver + "\n" + microphoneResolver + "\n}\n" + #"""
 
 let name = "gmgn-voice-preferences-check-" + UUID().uuidString
 let defaults = UserDefaults(suiteName: name)!
@@ -22,6 +41,27 @@ defer { defaults.removePersistentDomain(forName: name) }
 let prefs = RustSpeechPreferences(defaults: defaults)
 var checks = 0
 func check(_ value: Bool) { guard value else { fatalError("voice preference behavior check failed") }; checks += 1 }
+let productName = name + "-product"
+let productDefaults = UserDefaults(suiteName: productName)!
+defer { productDefaults.removePersistentDomain(forName: productName) }
+let product = RustSpeechPreferences(defaults: productDefaults)
+product.save(.init(provider: .fish, apiKey: "fixture-product-key", voiceID: "fish-selected", model: "s1"), for: "tts")
+let probe = HostProviderProbe(defaults, product, productDefaults)
+check(probe.probe(.fish).apiKey == "fixture-product-key")
+defaults.set("", forKey: "speech.rust.fish.apiKey")
+check(probe.probe(.fish).apiKey.isEmpty)
+check(probe.voiceConfiguration(for: "tts").apiKey.isEmpty)
+defaults.removeObject(forKey: "speech.rust.fish.apiKey")
+check(probe.probe(.fish).voiceID == "fish-selected")
+defaults.set("fish", forKey: "speech.rust.tts.provider")
+check(probe.probe(.fish).apiKey == "fixture-product-key")
+defaults.removeObject(forKey: "speech.rust.tts.provider")
+productDefaults.set("fixture-product-mic", forKey: "voice.microphoneDeviceID")
+check(probe.microphoneDeviceID == "fixture-product-mic")
+defaults.set("", forKey: "voice.microphoneDeviceID")
+check(probe.microphoneDeviceID == nil)
+defaults.set("fixture-local-mic", forKey: "voice.microphoneDeviceID")
+check(probe.microphoneDeviceID == "fixture-local-mic")
 let before = prefs.configuration(provider: .elevenlabs, for: "tts")
 check(before.apiKey == "fixture-env-key")
 prefs.save(RustVoiceConfiguration(provider: .elevenlabs, apiKey: "", voiceID: "chosen-voice", model: nil), for: "tts")

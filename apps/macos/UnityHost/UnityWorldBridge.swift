@@ -64,7 +64,7 @@ final class UnityWorldBridge: @unchecked Sendable {
             var response: [String: Any] = ["version": 1, "worldID": worldID, "operation": operation]
             do {
                 let request = try JSONSerialization.jsonObject(with: data) as! [String: Any]
-                let client = LoopbackJSONClient(socketPath: endpoint.socketPath,
+                let client = TaskdHTTPAuthorityClient(endpointFile: endpoint.endpointFile,
                     helperPath: endpoint.helperPath, allowsLaunching: false,
                     timeout: operation == "world.placement.derive" ? 60 : 5)
                 if operation == "world.placement.evaluate" || operation == "world.placement.derive" {
@@ -78,9 +78,17 @@ final class UnityWorldBridge: @unchecked Sendable {
                     let deriving = operation == "world.placement.derive"
                     payload = try preparePlacementGeometry(payload)
                     payloadByteCount = try JSONSerialization.data(withJSONObject: payload).count
+                    if !deriving, let anchor = payload["anchor"] as? [String: Any],
+                       let column = anchor["column"] as? [String: Any],
+                       let footprint = payload["footprint"] as? [String: Any] {
+                        NSLog("[UnityPlacement] column=(%@,%@) support=%@ size=%@ height=%@",
+                            String(describing: column["x"] ?? "unknown"), String(describing: column["z"] ?? "unknown"),
+                            String(describing: anchor["supportHeight"] ?? "unknown"), String(describing: footprint["size"] ?? "unknown"),
+                            String(describing: payload["height"] ?? "unknown"))
+                    }
                     // Keep the authenticated transport's 12 MiB limit unchanged.
                     // Leave bounded headroom for method/id/auth envelope.
-                    guard payloadByteCount <= LoopbackJSONClient.maximumFrame - 4096 else {
+                    guard payloadByteCount <= TaskdHTTPAuthorityClient.maximumFrame - 4096 else {
                         throw WorldAuthorityError.daemon("frame_too_large")
                     }
                     let reply = try client.call(method: deriving ? "placement_derive" : "placement_evaluate", params: payload)
@@ -140,6 +148,12 @@ final class UnityWorldBridge: @unchecked Sendable {
                 let safeCodes: Set<String> = ["completed", "authority_unavailable", "invalid_world_state", "invalid_request", "invalid_placement_request", "invalid_placement_result", "frame_too_large", "placement_timeout", "method_not_found", "unauthorized"]
                 NSLog("[UnityPlacement] code=%@ payloadByteCount=%d durationMs=%d", safeCodes.contains(code) ? code : "daemon_rejected",
                     payloadByteCount, Int(Date().timeIntervalSince(started) * 1000))
+                if let result = response["result"] as? [String: Any] {
+                    let reason = result["reason"] as? [String: Any]
+                    let reasonCode = reason?["code"] as? String ?? "none"
+                    let safeReason = reasonCode.range(of: "^[A-Za-z0-9_]+$", options: .regularExpression) != nil ? reasonCode : "unknown"
+                    NSLog("[UnityPlacement] canPlace=%@ reason=%@", String(describing: result["canPlace"] ?? "unknown"), safeReason)
+                }
             }
             let encoded = (try? JSONSerialization.data(withJSONObject: response))
                 ?? Data("{\"status\":\"failed\",\"code\":\"invalid_response\"}".utf8)
@@ -216,7 +230,13 @@ final class UnityWorldBridge: @unchecked Sendable {
             }
             indices.append(face)
         }
-        let result: [String: Any] = ["vertices": vertices, "indices": indices]
+        // JSONSerialization promotes Float to Double and expands its binary
+        // tail. Shortest Float decimal round-trips to the exact same f32 bits
+        // used by the authority without growing every vertex coordinate.
+        let wireVertices = vertices.map { point in
+            point.map { NSNumber(value: Double(String($0))!) }
+        }
+        let result: [String: Any] = ["vertices": wireVertices, "indices": indices]
         // One collider and a handful of restored obstacles; never retain an
         // unbounded history of moved meshes. The authority owns no new state.
         if indexedGeometryOrder.count >= 8 {

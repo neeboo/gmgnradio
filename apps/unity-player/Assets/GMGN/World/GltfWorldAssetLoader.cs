@@ -16,6 +16,8 @@ namespace GMGN.UnityPlayer.World
 {
     public sealed class GltfWorldAssetLoader : IWorldAssetLoader
     {
+        readonly IDeferAgent deferAgent;
+        public GltfWorldAssetLoader(IDeferAgent deferAgent = null) { this.deferAgent = deferAgent; }
         public Task<GameObject> LoadPreparedAsset(string packageLocalPath, JObject prop, CancellationToken cancellation)
             => Load(packageLocalPath, prop ?? throw new ArgumentNullException(nameof(prop)), cancellation);
 
@@ -37,7 +39,7 @@ namespace GMGN.UnityPlayer.World
             var logger = new CollectingLogger();
             var pipeline = (QualitySettings.renderPipeline != null ? QualitySettings.renderPipeline : GraphicsSettings.defaultRenderPipeline) as UniversalRenderPipelineAsset;
             if (pipeline == null) { UnityEngine.Object.Destroy(root); throw new InvalidDataException("空间模型需要启用 URP 渲染管线。"); }
-            var importer = new GltfImport(materialGenerator: new WorldUrpMaterialGenerator(pipeline), logger: logger);
+            var importer = new GltfImport(deferAgent: deferAgent, materialGenerator: new WorldUrpMaterialGenerator(pipeline), logger: logger);
             try
             {
                 if (!await importer.LoadFile(packageLocalPath, cancellationToken: cancellation) ||
@@ -69,6 +71,7 @@ namespace GMGN.UnityPlayer.World
 
         public static void Prepare(Transform root, Transform content, JObject prop)
         {
+            var sourceBounds = BoundsIn(content, content);
             if (prop["orientation"]?["rotation"] is JObject rotation) content.localRotation = WorldCoordinates.Rotation(rotation);
             var sizeToken = (bool?)prop["sizeLocked"] == true || (prop["sizeIntent"] != null && prop["sizeIntent"].Type != JTokenType.Null)
                 ? prop["size"] : prop["authoritativeSize"]?["dimensions"] ?? prop["size"];
@@ -85,6 +88,7 @@ namespace GMGN.UnityPlayer.World
             content.SetParent(normalization, false);
             normalization.localScale = new Vector3(target.x / extent.x, target.y / extent.y, target.z / extent.z);
             normalization.localPosition = -Vector3.Scale(new Vector3(bounds.center.x, bounds.min.y, bounds.center.z), normalization.localScale);
+            root.gameObject.AddComponent<PreparedPropGrip>().Initialize(content, sourceBounds);
         }
 
         static Bounds BoundsIn(Transform root, Transform content)

@@ -17,18 +17,20 @@ namespace GMGN.UnityPlayer.WorldPlacementGeometry
             display = gameObject.AddComponent<MeshRenderer>(); display.sharedMaterial = material;
             display.shadowCastingMode = ShadowCastingMode.Off; display.receiveShadows = false;
         }
-        public void ShowGrid(JObject grid)
-        {
-            var spacing = (float)grid["spacing"]; var cells = new List<Vector3>();
-            foreach (var layer in (JArray)grid["layers"])
-                cells.Add(new Vector3((int)layer["column"]["x"] * spacing, (float)layer["supportHeight"], -(int)layer["column"]["z"] * spacing));
-            Upload(cells, spacing, new Color(.1f,.8f,.6f,.45f));
-        }
         public void ShowPreview(JObject result, float spacing, float supportHeight)
         {
+            // A single-cell border keeps the grid local to the complete item
+            // footprint. Every cell reflects the same authoritative verdict.
+            var nearby = new HashSet<Vector2Int>();
+            foreach (var column in (JArray)result["columns"]) {
+                var x = (int)column["x"]; var z = (int)column["z"];
+                for (var dx = -1; dx <= 1; dx++)
+                    for (var dz = -1; dz <= 1; dz++)
+                        nearby.Add(new Vector2Int(x + dx, z + dz));
+            }
             var cells = new List<Vector3>();
-            foreach (var column in (JArray)result["columns"])
-                cells.Add(new Vector3((int)column["x"] * spacing, supportHeight, -(int)column["z"] * spacing));
+            foreach (var column in nearby)
+                cells.Add(new Vector3(column.x * spacing, supportHeight, -column.y * spacing));
             Upload(cells, spacing, (bool?)result["canPlace"] == true ? new Color(.2f,1,.45f,.7f) : new Color(1,.15f,.15f,.7f));
         }
         void Upload(List<Vector3> cells, float spacing, Color color)

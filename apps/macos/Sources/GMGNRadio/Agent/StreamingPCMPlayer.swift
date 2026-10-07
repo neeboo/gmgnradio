@@ -132,6 +132,7 @@ enum StreamingPCMCallbacks {
     func start(onLevel: @escaping @Sendable (Float) -> Void) throws {
         try StreamingPCMOutputRoute.apply(to: engine)
         let mixer = engine.mainMixerNode
+        if ProcessInfo.processInfo.environment["GMGN_UNITY_TEST_MUTED"] == "1" { mixer.outputVolume = 0 }
         mixer.installTap(onBus: 0, bufferSize: 1024, format: nil,
                          block: StreamingPCMCallbacks.tap(onLevel: onLevel))
         tapInstalled = true

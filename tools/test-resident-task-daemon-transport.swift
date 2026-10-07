@@ -140,12 +140,12 @@ func propDouble(_ value: PropTaskJSON?) -> Double? {
         check(outbound["expectedRevision"] == .number(3),
             "expectedRevision stays an integer number")
 
-        // 5. Client failures propagate untouched: an unconnectable socket
+        // 5. Client failures propagate untouched: an unavailable HTTP endpoint
         //    surfaces as the daemon error itself, never as a conversion error.
         let scratch = URL(fileURLWithPath: "\#(work.path)")
-        let missingSocket = scratch.appendingPathComponent("missing").appendingPathComponent("taskd.sock")
+        let missingEndpointFile = scratch.appendingPathComponent("missing").appendingPathComponent("taskd.endpoint.json")
         let client = PropTaskDaemonClient(root: scratch.appendingPathComponent("root"),
-            socketURL: missingSocket, allowsLaunching: false, requestTimeout: 1)
+            endpointFileURL: missingEndpointFile, allowsLaunching: false, requestTimeout: 1)
         let transport = ResidentTaskDaemonStateTransport(client: client)
         var propagated: Error?
         do {
@@ -172,7 +172,7 @@ let main = work.appendingPathComponent("Main.swift")
 try harness.write(to: main, atomically: true, encoding: .utf8)
 let binary = work.appendingPathComponent("test")
 let compiled = ["Presence/PropGenerationClient.swift", "Presence/PropGenerationStore.swift",
-    "Presence/PropImagePreparation.swift", "Presence/PropTaskDaemonClient.swift",
+    "Presence/PropImagePreparation.swift", "Presence/PropTaskDaemonClient.swift", "Presence/TaskdHTTPTransport.swift",
     "Agent/ResidentStateClient.swift",
     "Presence/ResidentTaskDaemonStateTransport.swift"].map { sources.appendingPathComponent($0).path }
 let process = Process()

@@ -2,8 +2,8 @@
 // 编译并运行生产文件
 //   apps/macos/Sources/GMGNRadio/Agent/ResidentDSHAgentToolBridge.swift
 //   apps/macos/Sources/GMGNRadio/Agent/ResidentDSHHostToolsBridge.swift
-// 与 tools/resident-dsh-host-tools-support.swift 的真实逻辑，经本机 UDS 全链路验证：
-//   grant(armed) → IPC 调用 → 宿主 secret 校验 → 名称边界 → 原 schema 复核 →
+// 与 tools/resident-dsh-host-tools-support.swift 的真实逻辑，经本机 HTTP 全链路验证：
+//   grant(armed) → HTTP 调用 → 宿主 token 校验 → 名称边界 → 原 schema 复核 →
 //   授权闸 → 宿主 handler → 规范 JSON 回插件形态客户端。
 // 覆盖：每轮授权不复用（revoke 即撤销、旧 secret 失效、re-arm 后新 secret 生效）、
 // 未知工具/非法参数/无法核验 schema → 拒绝且宿主零执行、宿主工具错误与成功分开、
@@ -56,7 +56,7 @@ final class ClientResultBox: @unchecked Sendable {
         func rawConnect(path: String) -> Int32 {
             let fd = socket(AF_INET, SOCK_STREAM, 0)
             guard fd >= 0 else { return -1 }
-            guard let port = UInt16(path.split(separator: ":").last ?? "") else { close(fd); return -1 }
+            guard let parsed = URL(string: path)?.port, let port = UInt16(exactly: parsed) else { close(fd); return -1 }
             var address = sockaddr_in()
             address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
             address.sin_family = sa_family_t(AF_INET)
@@ -126,7 +126,7 @@ final class ClientResultBox: @unchecked Sendable {
         do {
             let dirAttrs = try FileManager.default.attributesOfItem(atPath: channel.directoryURL.path)
             checks.expectEqual((dirAttrs[.posixPermissions] as? NSNumber)?.intValue, 0o700, "C2 通道目录 0700")
-            checks.check(channel.directoryURL.path.count < 100, "C2 私有目录短路径（socket 需 <104）")
+            checks.check(channel.directoryURL.path.count < 100, "C2 私有插件目录短路径")
         } catch { checks.check(false, "C2 目录属性读取失败") }
         checks.check(FileManager.default.fileExists(atPath: channel.pluginFileURL.path), "C2 插件文件已写")
         checks.check(FileManager.default.fileExists(atPath: channel.grantFileURL.path), "C2 grant 文件已写")
@@ -141,20 +141,20 @@ final class ClientResultBox: @unchecked Sendable {
             checks.expectEqual((grantAttrs[.posixPermissions] as? NSNumber)?.intValue, 0o600, "C2 grant 0600")
         } catch { checks.check(false, "C2 权限属性读取失败") }
 
-        // grant 状态：armed + secret/socket 存在（插件视角）。
+        // grant 状态：armed + token/HTTP URL 存在（插件视角）。
         let grantObject = ResidentDSHHostSupportSchema.object(try Data(contentsOf: channel.grantFileURL))
         checks.expectEqual(grantObject?["state"] as? String, "armed", "C2 grant state=armed")
         let secret = grantObject?["secret"] as? String ?? ""
         checks.check(!secret.isEmpty, "C2 grant 有 secret")
-        let socketFromGrant = (grantObject?["endpoint"] as? [String: Any])?["address"] as? String ?? ""
-        checks.expectEqual(socketFromGrant, channel.socketPath, "C2 grant socketPath 与通道一致")
+        let urlFromGrant = (grantObject?["endpoint"] as? [String: Any])?["url"] as? String ?? ""
+        checks.expectEqual(urlFromGrant, channel.rpcURL, "C2 grant HTTP URL 与通道一致")
         let toolsInGrant = grantObject?["tools"] as? [[String: Any]] ?? []
         checks.expectEqual(toolsInGrant.count, 2, "C2 grant 携带两个工具")
 
         // 3) 正常调用：宿主执行、结果回插件形态客户端。
         do {
             let result = await runClient {
-                residentDSHHostClientCall(socketPath: channel.socketPath, secret: secret, name: "gmgn_read_wish_generation", arguments: [:], callID: UUID().uuidString)
+                residentDSHHostClientCall(rpcURL: channel.rpcURL, secret: secret, name: "gmgn_read_wish_generation", arguments: [:], callID: UUID().uuidString)
             }
             guard let payload = result.payload else {
                 checks.check(false, "C3 正常调用应得到回复：\(result.error ?? "")"); return
@@ -169,7 +169,7 @@ final class ClientResultBox: @unchecked Sendable {
         // 4) 非法 secret → 拒绝；宿主零执行。
         do {
             let result = await runClient {
-                residentDSHHostClientCall(socketPath: channel.socketPath, secret: "wrong", name: "gmgn_read_wish_generation", arguments: [:], callID: UUID().uuidString)
+                residentDSHHostClientCall(rpcURL: channel.rpcURL, secret: "wrong", name: "gmgn_read_wish_generation", arguments: [:], callID: UUID().uuidString)
             }
             let error = result.payload?["error"] as? [String: Any]
             checks.expectEqual(error?["code"] as? String, "grant_revoked", "C4 错误 secret 拒绝")
@@ -180,7 +180,7 @@ final class ClientResultBox: @unchecked Sendable {
         do {
             for declared in ["gmgn_nonexistent", "read_wish_generation", "web_search"] {
                 let result = await runClient {
-                    residentDSHHostClientCall(socketPath: channel.socketPath, secret: secret, name: declared, arguments: [:], callID: UUID().uuidString)
+                    residentDSHHostClientCall(rpcURL: channel.rpcURL, secret: secret, name: declared, arguments: [:], callID: UUID().uuidString)
                 }
                 let error = result.payload?["error"] as? [String: Any]
                 checks.expectEqual(error?["code"] as? String, "tool_not_allowed", "C5 \(declared) 拒绝")
@@ -191,12 +191,12 @@ final class ClientResultBox: @unchecked Sendable {
         // 6) 非法参数（缺必需/未声明属性）→ invalid_arguments，宿主零执行。
         do {
             let missing = await runClient {
-                residentDSHHostClientCall(socketPath: channel.socketPath, secret: secret, name: "gmgn_submit_wish_generation", arguments: ["attachment_id": "uuid"], callID: UUID().uuidString)
+                residentDSHHostClientCall(rpcURL: channel.rpcURL, secret: secret, name: "gmgn_submit_wish_generation", arguments: ["attachment_id": "uuid"], callID: UUID().uuidString)
             }
             let error = missing.payload?["error"] as? [String: Any]
             checks.expectEqual(error?["code"] as? String, "invalid_arguments", "C6 缺必需属性拒绝")
             let extra = await runClient {
-                residentDSHHostClientCall(socketPath: channel.socketPath, secret: secret, name: "gmgn_submit_wish_generation", arguments: ["attachment_id": "uuid", "name": "月光大剑", "height_meters": 1.2, "evil": true], callID: UUID().uuidString)
+                residentDSHHostClientCall(rpcURL: channel.rpcURL, secret: secret, name: "gmgn_submit_wish_generation", arguments: ["attachment_id": "uuid", "name": "月光大剑", "height_meters": 1.2, "evil": true], callID: UUID().uuidString)
             }
             let error2 = extra.payload?["error"] as? [String: Any]
             checks.expectEqual(error2?["code"] as? String, "invalid_arguments", "C6 未声明属性拒绝")
@@ -206,12 +206,12 @@ final class ClientResultBox: @unchecked Sendable {
         // 7) 合法 submit → 执行；宿主报错（isError）与成功分开（tool_error + data）。
         do {
             let good = await runClient {
-                residentDSHHostClientCall(socketPath: channel.socketPath, secret: secret, name: "gmgn_submit_wish_generation", arguments: ["attachment_id": "550e8400-e29b-41d4-a716-446655440000", "name": "月光大剑", "height_meters": 1.2], callID: UUID().uuidString)
+                residentDSHHostClientCall(rpcURL: channel.rpcURL, secret: secret, name: "gmgn_submit_wish_generation", arguments: ["attachment_id": "550e8400-e29b-41d4-a716-446655440000", "name": "月光大剑", "height_meters": 1.2], callID: UUID().uuidString)
             }
             checks.expectEqual(good.payload?["ok"] as? Bool, true, "C7 合法 submit 成功")
             checks.expectEqual(log.count, 2, "C7 submit 已执行")
             let failed = await runClient {
-                residentDSHHostClientCall(socketPath: channel.socketPath, secret: secret, name: "gmgn_submit_wish_generation", arguments: ["attachment_id": "x", "name": "fail", "height_meters": 1.0], callID: UUID().uuidString)
+                residentDSHHostClientCall(rpcURL: channel.rpcURL, secret: secret, name: "gmgn_submit_wish_generation", arguments: ["attachment_id": "x", "name": "fail", "height_meters": 1.0], callID: UUID().uuidString)
             }
             checks.expectEqual(failed.payload?["ok"] as? Bool, false, "C7 工具错误 ok=false")
             let error = failed.payload?["error"] as? [String: Any]
@@ -235,7 +235,7 @@ final class ClientResultBox: @unchecked Sendable {
             let oddGrant = ResidentDSHHostSupportSchema.object(try Data(contentsOf: oddChannel.grantFileURL))
             let oddSecret = oddGrant?["secret"] as? String ?? ""
             let result = await runClient {
-                residentDSHHostClientCall(socketPath: oddChannel.socketPath, secret: oddSecret, name: "gmgn_odd_tool", arguments: ["p": "abc"], callID: UUID().uuidString)
+                residentDSHHostClientCall(rpcURL: oddChannel.rpcURL, secret: oddSecret, name: "gmgn_odd_tool", arguments: ["p": "abc"], callID: UUID().uuidString)
             }
             let error = result.payload?["error"] as? [String: Any]
             checks.expectEqual(error?["code"] as? String, "schema_unsupported", "C8 无法核验约束拒绝")
@@ -246,7 +246,7 @@ final class ClientResultBox: @unchecked Sendable {
         do {
             channel.revoke()
             let afterRevoke = await runClient {
-                residentDSHHostClientCall(socketPath: channel.socketPath, secret: secret, name: "gmgn_read_wish_generation", arguments: [:], callID: UUID().uuidString)
+                residentDSHHostClientCall(rpcURL: channel.rpcURL, secret: secret, name: "gmgn_read_wish_generation", arguments: [:], callID: UUID().uuidString)
             }
             let error = afterRevoke.payload?["error"] as? [String: Any]
             checks.expectEqual(error?["code"] as? String, "grant_revoked", "C9 撤销后拒绝（旧 secret）")
@@ -258,11 +258,11 @@ final class ClientResultBox: @unchecked Sendable {
             let newSecret = grant2?["secret"] as? String ?? ""
             checks.check(!newSecret.isEmpty && newSecret != secret, "C9 re-arm 轮换 secret")
             let oldSecretCall = await runClient {
-                residentDSHHostClientCall(socketPath: channel.socketPath, secret: secret, name: "gmgn_read_wish_generation", arguments: [:], callID: UUID().uuidString)
+                residentDSHHostClientCall(rpcURL: channel.rpcURL, secret: secret, name: "gmgn_read_wish_generation", arguments: [:], callID: UUID().uuidString)
             }
             checks.expectEqual((oldSecretCall.payload?["error"] as? [String: Any])?["code"] as? String, "grant_revoked", "C9 上一轮 secret 不再可用")
             let newSecretCall = await runClient {
-                residentDSHHostClientCall(socketPath: channel.socketPath, secret: newSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: UUID().uuidString)
+                residentDSHHostClientCall(rpcURL: channel.rpcURL, secret: newSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: UUID().uuidString)
             }
             checks.expectEqual(newSecretCall.payload?["ok"] as? Bool, true, "C9 本轮新 secret 生效")
             checks.check(log.count == before + 1, "C9 撤销期调用零执行、新轮一次执行")
@@ -283,7 +283,7 @@ final class ClientResultBox: @unchecked Sendable {
             let imgGrant = ResidentDSHHostSupportSchema.object(try Data(contentsOf: imageChannel.grantFileURL))
             let imgSecret = imgGrant?["secret"] as? String ?? ""
             let result = await runClient {
-                residentDSHHostClientCall(socketPath: imageChannel.socketPath, secret: imgSecret, name: "gmgn_capture_space_photo", arguments: [:], callID: UUID().uuidString)
+                residentDSHHostClientCall(rpcURL: imageChannel.rpcURL, secret: imgSecret, name: "gmgn_capture_space_photo", arguments: [:], callID: UUID().uuidString)
             }
             checks.expectEqual(result.payload?["ok"] as? Bool, true, "C10 拍照成功")
             let image = result.payload?["image"] as? [String: Any]
@@ -299,9 +299,9 @@ final class ClientResultBox: @unchecked Sendable {
             )
             stopChannel.stop()
             checks.check(!FileManager.default.fileExists(atPath: stopChannel.grantFileURL.path), "C11 stop 删除 grant")
-            checks.check(!FileManager.default.fileExists(atPath: stopChannel.socketPath), "C11 stop 删除 socket")
+            checks.check(!FileManager.default.fileExists(atPath: stopChannel.grantFileURL.path), "C11 stop 删除授权文件")
             let result = await runClient {
-                residentDSHHostClientCall(socketPath: stopChannel.socketPath, secret: "x", name: "gmgn_read_wish_generation", arguments: [:], callID: UUID().uuidString)
+                residentDSHHostClientCall(rpcURL: stopChannel.rpcURL, secret: "x", name: "gmgn_read_wish_generation", arguments: [:], callID: UUID().uuidString)
             }
             checks.check(result.payload == nil, "C11 stop 后新连接无回复（拒绝）")
             checks.expectEqual(stopLog.count, 0, "C11 stop 后零执行")
@@ -338,7 +338,7 @@ final class ClientResultBox: @unchecked Sendable {
             Thread.detachNewThread {
                 started.signal()
                 clientBox.set(residentDSHHostClientCall(
-                    socketPath: raceChannel.socketPath, secret: raceSecret,
+                    rpcURL: raceChannel.rpcURL, secret: raceSecret,
                     name: "gmgn_read_wish_generation", arguments: [:],
                     callID: "queued-before-revoke"))
                 clientDone.signal()
@@ -379,7 +379,7 @@ final class ClientResultBox: @unchecked Sendable {
             Thread.detachNewThread {
                 started.signal()
                 clientBox.set(residentDSHHostClientCall(
-                    socketPath: roundChannel.socketPath, secret: oldSecret,
+                    rpcURL: roundChannel.rpcURL, secret: oldSecret,
                     name: "gmgn_read_wish_generation", arguments: [:],
                     callID: "queued-before-rearm"))
                 clientDone.signal()
@@ -398,7 +398,7 @@ final class ClientResultBox: @unchecked Sendable {
             let newSecret = newGrant?["secret"] as? String ?? ""
             checks.check(newSecret != oldSecret, "C14 re-arm 轮换 secret")
             let fresh = await runClient {
-                residentDSHHostClientCall(socketPath: roundChannel.socketPath, secret: newSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: "fresh-after-rearm")
+                residentDSHHostClientCall(rpcURL: roundChannel.rpcURL, secret: newSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: "fresh-after-rearm")
             }
             checks.expectEqual(fresh.payload?["ok"] as? Bool, true, "C14 新轮调用成功")
             checks.expectEqual(calls.current, 1, "C14 新轮恰好执行一次")
@@ -429,7 +429,7 @@ final class ClientResultBox: @unchecked Sendable {
             let clientBox = ClientResultBox()
             Thread.detachNewThread {
                 clientBox.set(residentDSHHostClientCall(
-                    socketPath: execChannel.socketPath, secret: execSecret,
+                    rpcURL: execChannel.rpcURL, secret: execSecret,
                     name: "gmgn_read_wish_generation", arguments: [:],
                     callID: "inflight-before-revoke"))
                 clientDone.signal()
@@ -448,7 +448,7 @@ final class ClientResultBox: @unchecked Sendable {
                 true, "C15a 回执来自该次执行")
             // 撤销后的新请求拒绝、零执行。
             let refused = await runClient {
-                residentDSHHostClientCall(socketPath: execChannel.socketPath, secret: execSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: "after-revoke")
+                residentDSHHostClientCall(rpcURL: execChannel.rpcURL, secret: execSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: "after-revoke")
             }
             checks.expectEqual((refused.payload?["error"] as? [String: Any])?["code"] as? String, "grant_revoked", "C15a revoke 后新请求拒绝")
             checks.expectEqual(calls.current, 1, "C15a revoke 后零新增执行")
@@ -476,7 +476,7 @@ final class ClientResultBox: @unchecked Sendable {
             Thread.detachNewThread {
                 started.signal()
                 clientBox.set(residentDSHHostClientCall(
-                    socketPath: stopRace.socketPath, secret: stopSecret,
+                    rpcURL: stopRace.rpcURL, secret: stopSecret,
                     name: "gmgn_read_wish_generation", arguments: [:],
                     callID: "queued-before-stop"))
                 clientDone.signal()
@@ -508,7 +508,7 @@ final class ClientResultBox: @unchecked Sendable {
             catch ResidentDSHHostToolsError.notStarted { checks.check(true, "C15b stop 后 arm 抛 notStarted") }
             catch { checks.check(false, "C15b stop 后 arm 抛错类型不符") }
             let afterStop = await runClient {
-                residentDSHHostClientCall(socketPath: stopRace.socketPath, secret: stopSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: "after-stop")
+                residentDSHHostClientCall(rpcURL: stopRace.rpcURL, secret: stopSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: "after-stop")
             }
             checks.check(afterStop.payload == nil, "C15b stop 后新连接无回复")
             checks.expectEqual(calls.current, 0, "C15b stop 后零执行")
@@ -528,14 +528,14 @@ final class ClientResultBox: @unchecked Sendable {
             // 三个只连不发的挂死客户端。
             var stuck: [Int32] = []
             for _ in 0..<3 {
-                let fd = rawConnect(path: stuckChannel.socketPath)
+                let fd = rawConnect(path: stuckChannel.rpcURL)
                 if fd >= 0 { stuck.append(fd) }
                 usleep(50_000)
             }
             checks.expectEqual(stuck.count, 3, "C16 三个挂死客户端已连上")
             // 挂死期间，正常调用仍被服务（独立连接线程，不堵死后续调用）。
             let healthy = await runClient {
-                residentDSHHostClientCall(socketPath: stuckChannel.socketPath, secret: stuckSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: "while-stuck")
+                residentDSHHostClientCall(rpcURL: stuckChannel.rpcURL, secret: stuckSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: "while-stuck")
             }
             checks.expectEqual(healthy.payload?["ok"] as? Bool, true, "C16 挂死客户端不堵死正常调用")
             checks.expectEqual(stuckLog.count, 1, "C16 正常调用执行一次")
@@ -543,13 +543,13 @@ final class ClientResultBox: @unchecked Sendable {
             // 无回执）而不是无限排队。
             var extra: [Int32] = []
             for _ in 0..<6 {
-                let fd = rawConnect(path: stuckChannel.socketPath)
+                let fd = rawConnect(path: stuckChannel.rpcURL)
                 if fd >= 0 { extra.append(fd) }
                 usleep(50_000)
             }
             let start = Date()
             let overflow = await runClient {
-                residentDSHHostClientCall(socketPath: stuckChannel.socketPath, secret: stuckSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: "overflow")
+                residentDSHHostClientCall(rpcURL: stuckChannel.rpcURL, secret: stuckSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: "overflow")
             }
             let overflowElapsed = Date().timeIntervalSince(start)
             checks.check(overflow.payload == nil || (overflow.payload?["ok"] as? Bool) == false,
@@ -560,7 +560,7 @@ final class ClientResultBox: @unchecked Sendable {
             // 全部挂死客户端断开后，正常调用恢复可用。
             try await Task.sleep(nanoseconds: 150_000_000)
             let recovered = await runClient {
-                residentDSHHostClientCall(socketPath: stuckChannel.socketPath, secret: stuckSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: "after-unstick")
+                residentDSHHostClientCall(rpcURL: stuckChannel.rpcURL, secret: stuckSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: "after-unstick")
             }
             checks.expectEqual(recovered.payload?["ok"] as? Bool, true, "C16 挂死断开后通道恢复可用")
             checks.expectEqual(stuckLog.count, 2, "C16 恢复后正常执行")
@@ -584,7 +584,7 @@ final class ClientResultBox: @unchecked Sendable {
             // 未绑定：请求会通过授权闸但执行者未绑定 → 诚实工具错误、宿主零调用。
             let unboundSecret = try grantSecret()
             let unbound = await runClient {
-                residentDSHHostClientCall(socketPath: bindChannel.socketPath, secret: unboundSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: "unbound")
+                residentDSHHostClientCall(rpcURL: bindChannel.rpcURL, secret: unboundSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: "unbound")
             }
             checks.expectEqual(unbound.payload?["ok"] as? Bool, false, "C17 未绑定 handler 返回工具错误")
             checks.expectEqual((unbound.payload?["error"] as? [String: Any])?["code"] as? String, "tool_error", "C17 未绑定错误 code=tool_error")
@@ -593,7 +593,7 @@ final class ClientResultBox: @unchecked Sendable {
             let firstLog = ResidentDSHHostCallLog()
             binding.bind(residentDSHHostToolsTestHandler(log: firstLog, scope: "round-1"))
             let first = await runClient {
-                residentDSHHostClientCall(socketPath: bindChannel.socketPath, secret: unboundSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: "round1")
+                residentDSHHostClientCall(rpcURL: bindChannel.rpcURL, secret: unboundSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: "round1")
             }
             checks.expectEqual(first.payload?["ok"] as? Bool, true, "C17 第一轮绑定执行成功")
             checks.expectEqual(firstLog.count, 1, "C17 第一轮 handler 恰执行一次")
@@ -604,7 +604,7 @@ final class ClientResultBox: @unchecked Sendable {
             let secondLog = ResidentDSHHostCallLog()
             binding.bind(residentDSHHostToolsTestHandler(log: secondLog, scope: "round-2"))
             let second = await runClient {
-                residentDSHHostClientCall(socketPath: bindChannel.socketPath, secret: secondSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: "round2")
+                residentDSHHostClientCall(rpcURL: bindChannel.rpcURL, secret: secondSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: "round2")
             }
             checks.expectEqual(second.payload?["ok"] as? Bool, true, "C17 第二轮绑定执行成功")
             checks.expectEqual(secondLog.count, 1, "C17 第二轮 handler 执行一次")
@@ -612,7 +612,7 @@ final class ClientResultBox: @unchecked Sendable {
             // 会话关闭：clear 后即使授权仍 armed 也诚实拒绝，不执行已取消轮的 tools。
             binding.clear()
             let afterClear = await runClient {
-                residentDSHHostClientCall(socketPath: bindChannel.socketPath, secret: secondSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: "after-clear")
+                residentDSHHostClientCall(rpcURL: bindChannel.rpcURL, secret: secondSecret, name: "gmgn_read_wish_generation", arguments: [:], callID: "after-clear")
             }
             checks.expectEqual(afterClear.payload?["ok"] as? Bool, false, "C17 clear 后调用被拒（handler_unbound）")
             checks.expectEqual(bindLog.count, 0, "C17 clear 后零 worldTools 调用")

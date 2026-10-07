@@ -3,6 +3,14 @@ import Foundation
 public protocol WorldStatePersisting: Sendable {
     func save(_ state: WorldState) throws
     func load() throws -> WorldState?
+    /// Readback must not renew a writer's revision lease without adopting its state.
+    func readSnapshot() throws -> WorldState?
+    func acceptSnapshot(_ state: WorldState) throws
+}
+
+public extension WorldStatePersisting {
+    func readSnapshot() throws -> WorldState? { try load() }
+    func acceptSnapshot(_ state: WorldState) throws {}
 }
 
 public struct AtomicJSONWorldStatePersistence: WorldStatePersisting, Sendable {

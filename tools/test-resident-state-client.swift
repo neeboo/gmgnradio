@@ -1,6 +1,6 @@
 // ResidentStateClient 与 docs/plans/2026-09-08-resident-storage-contract.md 的
 // 直接核对：真实 gmgn-taskd 临时 daemon（明确临时 root/socket，绝不启动用户的
-// TaskService）走 Unix socket，覆盖 nested scope、record:null、CAS/revision、
+// TaskService）走鉴权 HTTP，覆盖 nested scope、record:null、CAS/revision、
 // requestID 幂等（含跨重启回放）、event_read 无 domain、nextCursor 整数水位、
 // message_read/ack、跨 scope 隔离；另有只做客户端解析校验的畸形响应用例
 // （record 缺字段、item 缺字段、nextCursor 非整数、acknowledged 缺失等一律拒绝，
@@ -24,45 +24,63 @@ import Darwin
 }
 
 let binaryPath = ProcessInfo.processInfo.environment["TASKD_BIN"]
-    ?? "services/gmgn-taskd/target/debug/gmgn-taskd"
+    ?? "target/debug/gmgn-taskd"
 
 // MARK: - 真实 daemon 进程与 socket 运输
 
+enum FakeError: Error { case message(String) }
+
+final class HTTPFixtureResult: @unchecked Sendable {
+    let lock = NSLock()
+    var response: Data?
+    var failure: Error?
+    func set(_ data: Data) { lock.lock(); response = data; lock.unlock() }
+    func set(_ error: Error) { lock.lock(); failure = error; lock.unlock() }
+}
+private func fixtureRequest(socketPath: String, path: String, body: Data?) throws -> URLRequest {
+    struct Endpoint: Decodable { let version: Int; let address: String; let token: String }
+    let descriptor = try JSONDecoder().decode(Endpoint.self, from: Data(contentsOf: URL(fileURLWithPath: socketPath)))
+    let parts = descriptor.address.split(separator: ":")
+    guard descriptor.version == 2, parts.count == 2, parts[0] == "127.0.0.1",
+          let port = UInt16(parts[1]), port > 0, let token = UUID(uuidString: descriptor.token),
+          token.uuidString.dropFirst(14).first == "4",
+          let origin = URL(string: "http://\(descriptor.address)") else { throw FakeError.message("invalid HTTP endpoint") }
+    var request = URLRequest(url: origin.appendingPathComponent(path), timeoutInterval: 8)
+    request.httpMethod = body == nil ? "GET" : "POST"
+    request.setValue("Bearer \(descriptor.token)", forHTTPHeaderField: "Authorization")
+    if let body {
+        guard body.count <= TaskdHTTPTransport.maxBytes else { throw FakeError.message("request exceeds limit") }
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type"); request.httpBody = body
+    }
+    return request
+}
 final class TaskdProcess {
     let root: String
     let socketPath: String
     private var process: Process?
-    init(root: String) {
-        self.root = root
-        self.socketPath = root + "/taskd.sock"
-    }
+    init(root: String) { self.root = root; self.socketPath = root + "/taskd.endpoint.json" }
     func start() throws {
+        try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binaryPath)
-        process.arguments = ["--root", root, "--socket", socketPath, "--concurrency", "2"]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try process.run()
-        self.process = process
-        var ready = false
-        for _ in 0..<500 {
-            if process.isRunning == false { break }
-            if FileManager.default.fileExists(atPath: socketPath) {
-                let probe = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-                if probe >= 0 {
-                    var address = sockaddr_un()
-                    address.sun_family = sa_family_t(AF_UNIX)
-                    _ = socketPath.withCString { bytes in
-                        memcpy(&address.sun_path, bytes, min(strlen(bytes), MemoryLayout.size(ofValue: address.sun_path) - 1))
-                    }
-                    let ok = Darwin.connect(probe, withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { $0 } }, socklen_t(MemoryLayout<sockaddr_un>.size))
-                    Darwin.close(probe)
-                    if ok == 0 { ready = true; break }
-                }
+        process.arguments = ["--root", root, "--endpoint-file", socketPath, "--concurrency", "2"]
+        process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
+        try process.run(); self.process = process
+        let deadline = Date().addingTimeInterval(10)
+        while process.isRunning && Date() < deadline {
+            if let request = try? fixtureRequest(socketPath: socketPath, path: "health", body: nil) {
+                let semaphore = DispatchSemaphore(value: 0), result = HTTPFixtureResult()
+                let transport = TaskdHTTPTransport(streaming: false, receive: { result.set($0) },
+                    completion: { error in if let error { result.set(error) }; semaphore.signal() })
+                transport.start(request)
+                if semaphore.wait(timeout: .now() + 8) != .success { transport.cancel(); throw FakeError.message("health timed out") }
+                if let data = result.response,
+                   let health = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   health["version"] as? Int == 2, health["transport"] as? String == "http" { return }
             }
             Thread.sleep(forTimeInterval: 0.02)
         }
-        guard ready else { throw FakeError.message("daemon did not expose socket at \(socketPath)") }
+        throw FakeError.message("daemon did not expose HTTP at \(socketPath)")
     }
     func stop() {
         if let process, process.isRunning { process.terminate(); process.waitUntilExit() }
@@ -70,77 +88,29 @@ final class TaskdProcess {
     }
     deinit { stop() }
 }
-
-enum FakeError: Error { case message(String) }
-
-/// 每次 call 一条独立 Unix socket 连接，I/O 放到后台队列，MainActor 让出等待：
-/// 与真实 daemon 逐条往返，不改动合同形状。
-@MainActor final class TaskdTransport: ResidentStateTransport, @unchecked Sendable {
+@MainActor class TaskdTransport: ResidentStateTransport, @unchecked Sendable {
     struct Request: Encodable { let id: String; let method: String; let params: [String: ResidentStateJSON] }
     private struct Envelope: Decodable {
         struct Err: Decodable { let code: String }
+        let id: String?
         let result: [String: ResidentStateJSON]?
         let error: Err?
     }
     let socketPath: String
-
     init(socketPath: String) { self.socketPath = socketPath }
-
     func call(method: String, params: [String: ResidentStateJSON]) async throws -> [String: ResidentStateJSON] {
         let id = UUID().uuidString
-        var request = try JSONEncoder().encode(Request(id: id, method: method, params: params))
-        request.append(10)  // 一帧一行 JSON，Unix socket 以换行分帧
-        return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global().async {
-                do {
-                    let line = try Self.roundTrip(socketPath: self.socketPath, frame: request)
-                    let envelope = try JSONDecoder().decode(Envelope.self, from: line)
-                    if let error = envelope.error { throw ResidentStateError.daemon(error.code) }
-                    guard let result = envelope.result else { throw ResidentStateError.invalidResponse }
-                    continuation.resume(returning: result)
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
+        let body = try JSONEncoder().encode(Request(id: id, method: method, params: params))
+        let request = try fixtureRequest(socketPath: socketPath, path: "rpc", body: body)
+        let response: Data = try await withCheckedThrowingContinuation { continuation in
+            let transport = TaskdHTTPTransport(streaming: false, receive: { continuation.resume(returning: $0) },
+                completion: { error in if let error { continuation.resume(throwing: error) } })
+            transport.start(request)
         }
-    }
-
-    private nonisolated static func roundTrip(socketPath: String, frame: Data) throws -> Data {
-        let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard descriptor >= 0 else { throw FakeError.message("socket() failed") }
-        defer { Darwin.close(descriptor) }
-        var timeout = timeval(tv_sec: 5, tv_usec: 0)
-        _ = withUnsafePointer(to: &timeout) {
-            Darwin.setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, $0, socklen_t(MemoryLayout<timeval>.size))
-        }
-        var address = sockaddr_un()
-        address.sun_family = sa_family_t(AF_UNIX)
-        _ = socketPath.withCString { bytes in
-            memcpy(&address.sun_path, bytes, min(strlen(bytes), MemoryLayout.size(ofValue: address.sun_path) - 1))
-        }
-        let connected = Darwin.connect(descriptor, withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { $0 }
-        }, socklen_t(MemoryLayout<sockaddr_un>.size))
-        guard connected == 0 else { throw FakeError.message("connect to \(socketPath) failed") }
-        var sent = 0
-        while sent < frame.count {
-            let written = frame.withUnsafeBytes { raw in
-                Darwin.send(descriptor, raw.baseAddress!.advanced(by: sent), frame.count - sent, 0)
-            }
-            guard written > 0 else { throw FakeError.message("send failed") }
-            sent += written
-        }
-        var buffer = Data()
-        var chunk = [UInt8](repeating: 0, count: 65536)
-        while true {
-            let received = Darwin.recv(descriptor, &chunk, chunk.count, 0)
-            if received <= 0 { throw FakeError.message("recv ended before newline") }
-            buffer.append(contentsOf: chunk[..<received])
-            if buffer.contains(10) { break }
-            if buffer.count > 8 * 1024 * 1024 { throw FakeError.message("frame too large") }
-        }
-        guard let newline = buffer.firstIndex(of: 10) else { throw FakeError.message("no newline") }
-        return buffer[..<newline]
+        let envelope = try JSONDecoder().decode(Envelope.self, from: response)
+        if let error = envelope.error { throw ResidentStateError.daemon(error.code) }
+        guard envelope.id == id, let result = envelope.result else { throw ResidentStateError.invalidResponse }
+        return result
     }
 }
 
@@ -444,6 +414,7 @@ let compile = Process()
 compile.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
 compile.arguments = ["-j1", "-parse-as-library",
     root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/ResidentStateClient.swift").path,
+    root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/TaskdHTTPTransport.swift").path,
     main.path, "-o", binary.path]
 try compile.run()
 compile.waitUntilExit()

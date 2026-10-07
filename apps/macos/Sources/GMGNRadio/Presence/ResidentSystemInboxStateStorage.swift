@@ -27,6 +27,12 @@ final class ResidentSystemInboxStateStorage {
         self.client = client
     }
 
+    /// Agent reads must not recalibrate a writer's CAS revision or retry identity.
+    func readOnly(scope: ResidentStateScope) async throws -> [ResidentSystemInboxEntry]? {
+        guard let record = try await client.stateRead(scope: scope, domain: .inbox, key: Self.domainKey) else { return nil }
+        return try Self.decodeEntries(record.value)
+    }
+
     /// 读取已保存的收件箱条目；无记录返回 nil（不是错误）。恢复同时校准该
     /// 作用域的 CAS revision，使后续提交基于最新版本。记录损坏/畸形时如实
     /// 抛出，不注入任何条目。
@@ -43,9 +49,11 @@ final class ResidentSystemInboxStateStorage {
         return entries
     }
 
-    func persist(scope: ResidentStateScope, entries: [ResidentSystemInboxEntry]) async throws {
+    func persist(scope: ResidentStateScope, entries: [ResidentSystemInboxEntry], messages: [ResidentStateFact] = []) async throws {
         let value = try Self.stateValue(entries)
-        let fingerprint = try Self.fingerprint(value)
+        var attemptValue = value
+        if !messages.isEmpty { attemptValue["messages"] = .array(messages.map { .object($0.object) }) }
+        let fingerprint = try Self.fingerprint(attemptValue)
         let requestID: String
         if let last = lastAttempts[scope], last.fingerprint == fingerprint {
             requestID = last.requestID
@@ -56,7 +64,7 @@ final class ResidentSystemInboxStateStorage {
         do {
             let result = try await client.stateCommit(scope: scope, domain: .inbox,
                 key: Self.domainKey, expectedRevision: revisions[scope] ?? 0,
-                requestID: requestID, value: value)
+                requestID: requestID, value: value, messages: messages)
             // 回放返回的是该 requestID 当初的 revision，可能低于已知值
             // （他人已推进）；已知值只来自成功回执/读取，恒 ≤ 实际值，取
             // max 保证记账单调不回退。

@@ -4,7 +4,7 @@
 设计纪律（与仓库其它门禁一致）
 --------------------------------
 * **真进程、真协议、真存储**：本脚本不 import 生产 Swift/Rust 源码，也不手抄替身来
-  顶替权威。它启动仓库里编出来的 `gmgn-taskd` 二进制（临时私有 root + Unix socket），
+  顶替权威。它启动仓库里编出来的 `gmgn-taskd` 二进制（临时私有 root + 鉴权 HTTP），
   用一个**真的 HTTP 服务器**充当生成后端，再启动真的 `gmgn-mcpd`，全程走线上 JSON
   协议。世界状态只在 taskd 的 `world_records/world_facts` 里落地。
 * **每个边界都记证据**：每一次 request/params、每一个 job/request/event/object id、
@@ -32,8 +32,8 @@ import base64
 import hashlib
 import http.server
 import json
+import http.client
 import os
-import socket
 import struct
 import subprocess
 import sys
@@ -296,31 +296,35 @@ class Provider:
 class Taskd:
     def __init__(self, binary: Path, root: Path) -> None:
         self.binary = binary
-        self.root = root
-        self.socket_path = root / "taskd.sock"
+        self.root = root.resolve()
+        self.endpoint_file = self.root / "taskd.endpoint.json"
         self.process: subprocess.Popen | None = None
         self.stderr = b""
 
     def start(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         self.process = subprocess.Popen(
-            [str(self.binary), "--root", str(self.root), "--socket",
-             str(self.socket_path), "--concurrency", "2"],
+            [str(self.binary), "--root", str(self.root), "--endpoint-file",
+             str(self.endpoint_file), "--concurrency", "2"],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
                 break
             try:
-                with socket.socket(socket.AF_UNIX) as probe:
-                    probe.settimeout(1)
-                    probe.connect(str(self.socket_path))
+                endpoint = json.loads(self.endpoint_file.read_text())
+                host, port = endpoint["address"].rsplit(":", 1)
+                if endpoint["version"] != 2 or host != "127.0.0.1":
+                    raise OSError("invalid HTTP endpoint")
+                probe = http.client.HTTPConnection(host, int(port), timeout=1)
+                probe.connect()
+                probe.close()
                 return
             except OSError:
                 time.sleep(0.02)
         if self.process.poll() is None:
             self.process.kill()
-        raise RuntimeError("taskd 没有暴露出 socket: " + self._drain_stderr())
+        raise RuntimeError("taskd 没有暴露出 HTTP endpoint: " + self._drain_stderr())
 
     def _drain_stderr(self) -> str:
         if self.process and self.process.stderr:
@@ -332,21 +336,21 @@ class Taskd:
 
     def request(self, method: str, params: dict | None = None, request_id: str | None = None):
         rid = request_id or str(uuid.uuid4())
-        frame = json.dumps({"id": rid, "method": method, "params": params or {}})
-        with socket.socket(socket.AF_UNIX) as connection:
-            connection.settimeout(20)
-            connection.connect(str(self.socket_path))
-            connection.sendall(frame.encode() + b"\n")
-            buffer = b""
-            while b"\n" not in buffer:
-                chunk = connection.recv(65536)
-                if not chunk:
-                    break
-                buffer += chunk
-                if len(buffer) > 8 * 1024 * 1024:
-                    raise RuntimeError("taskd 回帧过大")
-        line = buffer.split(b"\n", 1)[0]
-        return json.loads(line)
+        endpoint = json.loads(self.endpoint_file.read_text())
+        host, port = endpoint["address"].rsplit(":", 1)
+        if endpoint["version"] != 2 or host != "127.0.0.1":
+            raise RuntimeError("invalid HTTP endpoint")
+        connection = http.client.HTTPConnection(host, int(port), timeout=20)
+        try:
+            connection.request("POST", "/rpc", json.dumps({"id": rid, "method": method, "params": params or {}}).encode(),
+                               {"Authorization": "Bearer " + endpoint["token"], "Content-Type": "application/json"})
+            response = connection.getresponse()
+            body = response.read(8 * 1024 * 1024 + 1)
+            if len(body) > 8 * 1024 * 1024:
+                raise RuntimeError("taskd response exceeds limit")
+            return json.loads(body)
+        finally:
+            connection.close()
 
     def stop(self) -> None:
         if self.process and self.process.poll() is None:
@@ -370,15 +374,15 @@ class Taskd:
 
 
 class Mcp:
-    def __init__(self, binary: Path, socket_path: Path, grant: Path | None = None) -> None:
+    def __init__(self, binary: Path, endpoint_file: Path, grant: Path | None = None) -> None:
         self.binary = binary
-        self.socket_path = socket_path
+        self.endpoint_file = endpoint_file
         self.grant = grant
         self.process: subprocess.Popen | None = None
         self.next_id = 1
 
     def start(self) -> None:
-        args = [str(self.binary), "--socket", str(self.socket_path)]
+        args = [str(self.binary), "--endpoint-file", str(self.endpoint_file)]
         if self.grant is not None:
             args += ["--grant", str(self.grant)]
         self.process = subprocess.Popen(
@@ -742,7 +746,7 @@ def run_mcp_layer(ledger: Ledger, taskd: Taskd, mcpd_binary: Path, work: Path) -
         ledger.check(False, f"gmgn-mcpd 不存在：{mcpd_binary}")
         return
     # 只读会话（无授权文件）。
-    read_session = Mcp(mcpd_binary, taskd.socket_path)
+    read_session = Mcp(mcpd_binary, taskd.endpoint_file)
     read_session.start()
     tools = read_session.request("tools/list", {})
     names = sorted(t["name"] for t in tools["result"]["tools"])
@@ -775,10 +779,10 @@ def run_mcp_layer(ledger: Ledger, taskd: Taskd, mcpd_binary: Path, work: Path) -
     # 授权动作：armed + 点名 gmgn_world_commit。
     grant = work / "grant.json"
     grant.write_text(json.dumps({
-        "state": "armed", "socketPath": str(taskd.socket_path), "secret": "not-used",
+        "state": "armed", "endpointFile": str(taskd.endpoint_file), "secret": "not-used",
         "tools": [{"name": "gmgn_world_commit"}],
     }))
-    armed = Mcp(mcpd_binary, taskd.socket_path, grant=grant)
+    armed = Mcp(mcpd_binary, taskd.endpoint_file, grant=grant)
     armed.start()
     committed = armed.call("gmgn_world_commit", {
         "worldID": "e2e-mcp-world", "requestID": "mcp-armed", "expectedRevision": 0,
@@ -792,19 +796,19 @@ def run_mcp_layer(ledger: Ledger, taskd: Taskd, mcpd_binary: Path, work: Path) -
     ledger.check(committed_ok, "armed 且点名后动作工具真的落到权威", reply=committed)
     armed.stop()
 
-    # 负对照：授权文件指向别的 socket ⇒ 拒绝沿用（防串权威）。
+    # 负对照：授权文件指向别的 endpoint ⇒ 拒绝沿用（防串权威）。
     foreign = work / "foreign-grant.json"
     foreign.write_text(json.dumps({
-        "state": "armed", "socketPath": str(work / "other.sock"), "secret": "not-used",
+        "state": "armed", "endpointFile": str(work / "other.endpoint.json"), "secret": "not-used",
         "tools": [{"name": "gmgn_world_commit"}],
     }))
-    foreign_session = Mcp(mcpd_binary, taskd.socket_path, grant=foreign)
+    foreign_session = Mcp(mcpd_binary, taskd.endpoint_file, grant=foreign)
     foreign_session.start()
     mismatch = foreign_session.call("gmgn_world_commit", {
         "worldID": "e2e-wish-world", "requestID": "mcp-foreign", "expectedRevision": 2,
         "ops": [{"op": "setWorldFacts", "facts": {"layoutRevision": 6}}]})
     ledger.record("mcp_result", tool="gmgn_world_commit", result=mismatch)
-    ledger.check("mcp_grant_socket_mismatch" in json.dumps(mismatch),
+    ledger.check("mcp_grant_endpoint_mismatch" in json.dumps(mismatch),
                  "负对照：授权文件指向别的权威 ⇒ 拒绝沿用", reply=mismatch)
     foreign_session.stop()
 
@@ -924,7 +928,7 @@ def main() -> int:
     try:
         taskd.start()
         ledger.record("process", name="gmgn-taskd", pid=taskd.process.pid,
-                      socket=str(taskd.socket_path))
+                      endpointFile=str(taskd.endpoint_file))
         ctx = run_authority_layer(ledger, taskd, work)
         if want("placement"):
             run_placement_layer(ledger, taskd, ctx)

@@ -9,7 +9,7 @@ struct NativeScreenMediaStream: Equatable, Sendable {
     let url: String
     /// 解析器给的格式 id（诊断用，**不是地址**）。
     let formatID: String
-    /// 服务端要求的请求头（逐字带上；不含 cookie / Authorization）。
+    /// 源站请求头不含凭据；认证本机媒体代理使用内存中的 Bearer。
     let headers: [String: String]
     let isVideo: Bool
     let isAudio: Bool

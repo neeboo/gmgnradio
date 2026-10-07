@@ -30,10 +30,10 @@ namespace GMGN.UnityPlayer
             Element.AddToClassList("card"); Element.AddToClassList("inbox-panel"); Element.AddToClassList("hidden");
             var sheet = Resources.Load<StyleSheet>("Inbox"); if (sheet != null) Element.styleSheets.Add(sheet);
             var header = new VisualElement(); header.AddToClassList("inbox-header");
-            back = new Button(() => ShowDetail(null)); back.AddToClassList("hidden"); header.Add(back);
+            back = HeaderButton("back", () => ShowDetail(null)); back.AddToClassList("hidden"); header.Add(back);
             title = new Label { enableRichText = false }; title.AddToClassList("inbox-title"); header.Add(title);
-            refresh = new Button(Refresh); header.Add(refresh);
-            close = new Button(Hide); header.Add(close); Element.Add(header);
+            refresh = HeaderButton("refresh", Refresh); header.Add(refresh);
+            close = HeaderButton("close", Hide); header.Add(close); Element.Add(header);
             status = new Label { enableRichText = false }; status.AddToClassList("inbox-status"); Element.Add(status);
             list = new ListView { itemsSource = entries, fixedItemHeight = 76,
                 virtualizationMethod = CollectionVirtualizationMethod.FixedHeight, selectionType = SelectionType.None };
@@ -56,8 +56,12 @@ namespace GMGN.UnityPlayer
                 element.EnableInClassList("inbox-unread", unread);
             };
             Element.Add(list);
-            detail = new VisualElement(); detail.AddToClassList("inbox-detail"); detail.AddToClassList("hidden");
-            detailTitle = new Label { enableRichText = false }; detailTitle.AddToClassList("inbox-row-title"); detail.Add(detailTitle);
+            var detailScroll = new ScrollView(ScrollViewMode.Vertical) {
+                horizontalScrollerVisibility = ScrollerVisibility.Hidden,
+                verticalScrollerVisibility = ScrollerVisibility.Auto
+            };
+            detail = detailScroll; detail.AddToClassList("inbox-detail"); detail.AddToClassList("hidden");
+            detailTitle = new Label { enableRichText = false }; detailTitle.AddToClassList("inbox-detail-title"); detail.Add(detailTitle);
             detailText = new Label { enableRichText = false }; detailText.AddToClassList("inbox-detail-text"); detail.Add(detailText); Element.Add(detail);
             var toolbar = parent.Q(className: "player");
             if (toolbar?.parent != null) toolbar.parent.Insert(toolbar.parent.IndexOf(toolbar), Element); else parent.Add(Element);
@@ -66,10 +70,19 @@ namespace GMGN.UnityPlayer
             RefreshLocale();
         }
         public void SetLocale(string value) => RefreshLocale();
+        static Button HeaderButton(string icon, Action clicked)
+        {
+            var button = new Button(clicked);
+            button.AddToClassList("icon-button");
+            button.style.width = 32; button.style.height = 32; button.style.flexShrink = 0;
+            button.style.paddingLeft = 4; button.style.paddingRight = 4;
+            button.Add(new PlayerScreen.ToolbarIcon(icon));
+            return button;
+        }
         void RefreshLocale()
         {
-            title.text = Text("inboxTitle"); refresh.text = Text("inboxRefresh");
-            close.text = Text("inboxClose"); back.text = Text("inboxBack"); list.RefreshItems();
+            title.text = Text("inboxTitle"); refresh.tooltip = Text("inboxRefresh");
+            close.tooltip = Text("inboxClose"); back.tooltip = Text("inboxBack"); list.RefreshItems();
             status.text = Text(statusKey);
         }
         public void Show() { Element.RemoveFromClassList("hidden"); Refresh(); }

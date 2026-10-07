@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../apps/unity-player/Assets/GMGN/World/GeneratedAssetResolver.cs" />
+    <Compile Include="../../apps/unity-player/Assets/GMGN/World/FormalWorldPackage.cs" />
+    <Compile Include="Program.cs" />
+    <Reference Include="Newtonsoft.Json"><HintPath>../../apps/unity-player/Library/PackageCache/com.unity.nuget.newtonsoft-json@4dfd81071c64/Runtime/Newtonsoft.Json.dll</HintPath></Reference>
+  </ItemGroup>
+</Project>

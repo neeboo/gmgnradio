@@ -8,6 +8,35 @@ import Testing
 @Suite
 struct PresenceSettingsModelTests {
     @Test
+    func rendererSpecificCompatibilityDropsOldVMDWhenSwitchingToUnityVRM() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: "gmgn-unity-motion-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let motions = MotionPackageStore(rootURL: root.appending(path: "motions"), bundledStudioGrooveURL: nil)
+        var bytes = Data("Vocaloid Motion Data 0002".utf8)
+        bytes.append(Data(repeating: 0, count: 54 - bytes.count))
+        let source = root.appending(path: "old.vmd")
+        try bytes.write(to: source)
+        let old = try motions.installMotion(from: source)
+        try motions.activate(id: old.id)
+        let runtime = StageAvatarRuntimeStore(packageStore: nil, motionPackageStore: motions)
+        let model = PresenceSettingsModel(defaults: UserDefaults(suiteName: UUID().uuidString)!,
+            avatarRuntime: runtime, presenceStore: PresencePackageStore(rootURL: root.appending(path: "presence"), builtInVRMs: []),
+            motionStore: motions, playbackCompatibility: { engine, format in
+                if engine == .vrm && format == .vmd { return .incompatible("VRMA required") }
+                return PresenceSettingsModel.motionCompatibility(avatarEngine: engine, motionFormat: format)
+            })
+        model.packages = [package(engine: .vrm)]
+        try model.refreshEffectiveMotionForActiveAvatar()
+        #expect(try motions.activeMotion().id == MotionPackageStore.naturalIdleID)
+        model.activateMotion(old)
+        #expect(try motions.activeMotion().id == MotionPackageStore.naturalIdleID)
+        #expect(model.motionCompatibility(old) == .incompatible("VRMA required"))
+        // Original SceneKit compatibility is deliberately unchanged.
+        #expect(PresenceSettingsModel.motionCompatibility(avatarEngine: .vrm, motionFormat: .vmd) == .compatible)
+    }
+
+    @Test
     func exposesTheRequestedAvatarMotionCompatibilityMatrix() {
         #expect(
             PresenceSettingsModel.motionCompatibility(

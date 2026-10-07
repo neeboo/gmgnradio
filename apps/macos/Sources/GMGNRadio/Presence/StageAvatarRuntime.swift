@@ -456,10 +456,9 @@ final class StageAvatarRuntimeStore {
             motion = nil
         }
 
-        if motion?.id.hasPrefix("gmgn.motion.bones.") != true,
-           motion?.id != "builtin.motion.iluvslapbass",
-           motion?.id != "gmgn.motion.ardy-backflip"
-        {
+        // Preserve the user's verified selection, including VRMA and imported
+        // clips. Only natural/procedural idle needs a humanoid idle resource.
+        if motion == nil || motion?.format == .procedural {
             motion = residentLoopMotion("idle-loop", avatarFormat: avatar?.format)
         }
 

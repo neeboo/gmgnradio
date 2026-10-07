@@ -98,6 +98,20 @@ namespace GMGN.UnityPlayer.Editor
             if (asset == null) throw new InvalidOperationException("Missing Gaussian shader: " + path);
             data.FindProperty(field).objectReferenceValue = asset;
         }
+        public static void ValidateRenderPath()
+        {
+            var pipeline = GraphicsSettings.defaultRenderPipeline as UniversalRenderPipelineAsset;
+            if (pipeline == null) throw new InvalidOperationException("Gaussian cabin requires active URP");
+            var renderers = new SerializedObject(pipeline).FindProperty("m_RendererDataList");
+            for (var i = 0; i < renderers.arraySize; i++) {
+                var renderer = renderers.GetArrayElementAtIndex(i).objectReferenceValue as UniversalRendererData;
+                if (renderer == null || !renderer.rendererFeatures.Any(f => f != null && f.GetType().FullName == "GaussianSplatting.Runtime.GaussianSplatURPFeature")) continue;
+                // The pinned upstream splat pass assumes an intermediate color target.
+                // Direct backbuffer rendering on Metal flips the Gaussian scene vertically.
+                if (renderer.intermediateTextureMode != IntermediateTextureMode.Always)
+                    throw new InvalidOperationException("Gaussian renderer requires Intermediate Texture = Always: " + renderer.name);
+            }
+        }
         static void ConfigureUrp()
         {
             var pipeline = GraphicsSettings.defaultRenderPipeline as UniversalRenderPipelineAsset;
@@ -109,7 +123,12 @@ namespace GMGN.UnityPlayer.Editor
             var featureType = Find("GaussianSplatting.Runtime.GaussianSplatURPFeature");
             for (var i = 0; i < renderers.arraySize; i++) {
                 var renderer = renderers.GetArrayElementAtIndex(i).objectReferenceValue as ScriptableRendererData;
-                if (renderer == null || renderer.rendererFeatures.Any(f => f != null && f.GetType() == featureType)) continue;
+                if (renderer == null) continue;
+                if (renderer is UniversalRendererData universal) {
+                    universal.intermediateTextureMode = IntermediateTextureMode.Always;
+                    EditorUtility.SetDirty(universal);
+                }
+                if (renderer.rendererFeatures.Any(f => f != null && f.GetType() == featureType)) continue;
                 var feature = (ScriptableRendererFeature)ScriptableObject.CreateInstance(featureType);
                 feature.name = "Cabin Gaussian Splats";
                 AssetDatabase.AddObjectToAsset(feature, renderer);

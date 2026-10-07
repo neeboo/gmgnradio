@@ -1,0 +1,8 @@
+{
+  "name": "GMGN.MusicExport.Editor",
+  "rootNamespace": "GMGN.UnityPlayer.Editor",
+  "references": ["UMT.Runtime", "UniGLTF", "UniGLTF.Utils", "VRM10", "Unity.Newtonsoft.Json", "GMGN.Vrm", "Unity.Timeline"],
+  "includePlatforms": ["Editor"],
+  "autoReferenced": true,
+  "defineConstraints": ["GMGN_UMT", "GMGN_UNIVRM"]
+}

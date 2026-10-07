@@ -498,9 +498,25 @@ enum ResidentDSHTransport {
         }
         if let error = object["error"] as? [String: Any] {
             // Provider diagnostics can embed credentials; classify, never echo.
-            let message = error["message"] as? String
+            let message = error["message"] as? String ?? ""
+            // ACP's RequestError.internalError(undefined, detail) carries the
+            // provider failure in data, with only a generic message on the wire.
+            // Keep raw detail transient and emit only the fixed classification.
+            let detail: String
+            if let text = error["data"] as? String { detail = text }
+            else if let value = error["data"],
+                    let bytes = try? JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed]) {
+                detail = String(decoding: bytes, as: UTF8.self)
+            } else { detail = "" }
+            let diagnostic = (message + "\n" + detail).lowercased()
+            // Only fixed diagnostic tags leave this scope; never print provider
+            // payloads, paths, prompts or credential-bearing exception text.
+            let tags = ["turn failed", "prompt settlement failed", "assistant output delivery failed",
+                        "disposed", "abort", "400", "401", "403", "429", "tool", "schema",
+                        "context", "model", "timeout", "fetch", "connection"].filter(diagnostic.contains)
+            NSLog("[ResidentACP] error method=%@ tags=%@", waiting.method, tags.joined(separator: ","))
             waiting.continuation.resume(throwing: AgentConversationError.dshNativeTurnFailed(
-                DSHExecutionFailureReason(diagnostic: message ?? "")
+                DSHExecutionFailureReason(diagnostic: diagnostic)
             ))
         } else if let result = object["result"] {
             let data = try? JSONSerialization.data(

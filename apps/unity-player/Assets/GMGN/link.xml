@@ -1,0 +1,9 @@
+<linker>
+  <assembly fullname="UnityEngine.UIElementsModule">
+    <type fullname="UnityEngine.UIElements.BaseVisualElementPanel" preserve="all" />
+    <type fullname="UnityEngine.UIElements.IMEEvent" preserve="all" />
+    <type fullname="UnityEngine.UIElements.TextElement" preserve="all" />
+    <type fullname="UnityEngine.UIElements.TextEditingManipulator" preserve="all" />
+    <type fullname="UnityEngine.UIElements.KeyboardTextEditorEventHandler" preserve="all" />
+  </assembly>
+</linker>

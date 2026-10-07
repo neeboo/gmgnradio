@@ -72,6 +72,8 @@ pub struct EvaluateRequest {
     #[serde(default = "default_tolerance")]
     pub resting_tolerance: f32,
     #[serde(default = "default_tolerance")]
+    /// Compatibility wire name: near-resting-plane contact band only.
+    /// Adjacent floor sample heights have no rejection threshold.
     pub support_height_deviation: f32,
 }
 fn default_tolerance() -> f32 {
@@ -301,6 +303,30 @@ fn obstacle_id(o: &Obstacle) -> String {
         Obstacle::Box { id, .. } | Obstacle::Mesh { id, .. } => id.clone(),
     }
 }
+fn support_encloses_center(points: &mut Vec<[f32; 2]>, center: [f32; 2]) -> bool {
+    fn turn(a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> f32 {
+        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    }
+    points.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+    points.dedup();
+    let mut hull = Vec::new();
+    for &p in points.iter() {
+        while hull.len() >= 2 && turn(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0. {
+            hull.pop();
+        }
+        hull.push(p);
+    }
+    let lower_len = hull.len();
+    for &p in points.iter().rev().skip(1) {
+        while hull.len() > lower_len && turn(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0. {
+            hull.pop();
+        }
+        hull.push(p);
+    }
+    hull.pop();
+    hull.len() >= 3
+        && (0..hull.len()).all(|i| turn(hull[i], hull[(i + 1) % hull.len()], center) > 0.0001)
+}
 pub fn evaluate(r: EvaluateRequest) -> EvaluateResult {
     let columns = r.footprint.columns(r.anchor.column, r.grid.spacing);
     let mut result = EvaluateResult {
@@ -334,6 +360,7 @@ pub fn evaluate(r: EvaluateRequest) -> EvaluateResult {
             yaw: r.footprint.yaw,
         };
         result.volume = Some(b.clone());
+        let mut heights = Vec::new();
         for col in &result.columns {
             if col.x < r.grid.minimum.x
                 || col.x > r.grid.maximum.x
@@ -342,15 +369,37 @@ pub fn evaluate(r: EvaluateRequest) -> EvaluateResult {
             {
                 return Some(BlockReason::OutsideBounds);
             }
-            if !r.grid.layers.iter().any(|l| {
-                l.column == *col
-                    && l.layer == r.anchor.layer
-                    && l.support_height.is_finite()
-                    && (l.support_height - r.anchor.support_height).abs()
-                        <= r.support_height_deviation
-            }) {
+            let layer = r.grid.layers.iter().find(|l| {
+                l.column == *col && l.layer == r.anchor.layer && l.support_height.is_finite()
+            });
+            let Some(layer) = layer else {
                 return Some(BlockReason::NoSupport);
+            };
+            heights.push((*col, layer.support_height));
+        }
+        let plane = heights
+            .iter()
+            .map(|(_, h)| *h)
+            .fold(f32::NEG_INFINITY, f32::max);
+        if (plane - r.anchor.support_height).abs() > 0.0001 {
+            return Some(BlockReason::NoSupport);
+        }
+        let mut contacts = Vec::new();
+        for (col, height) in &heights {
+            // The wire field is the contact band, not an adjacent floor-height limit.
+            if *height >= plane - r.support_height_deviation - 0.0001 {
+                let x = col.x as f32 * r.grid.spacing;
+                let z = col.z as f32 * r.grid.spacing;
+                contacts.extend([
+                    [x, z],
+                    [x + r.grid.spacing, z],
+                    [x, z + r.grid.spacing],
+                    [x + r.grid.spacing, z + r.grid.spacing],
+                ]);
             }
+        }
+        if !support_encloses_center(&mut contacts, center) {
+            return Some(BlockReason::NoSupport);
         }
         if r.triangles.is_empty() {
             return Some(BlockReason::NoSupport);
@@ -443,6 +492,83 @@ mod tests {
         let mut r = request();
         r.grid.layers.retain(|l| l.column != Column { x: 1, z: 1 });
         assert_eq!(evaluate(r).reason, Some(BlockReason::NoSupport));
+    }
+    fn uneven_request() -> EvaluateRequest {
+        let mut r = request();
+        r.footprint.size = [1.75, 1.75];
+        for l in &mut r.grid.layers {
+            let edge_distance = l
+                .column
+                .x
+                .min(l.column.z)
+                .min(6 - l.column.x)
+                .min(6 - l.column.z);
+            l.support_height = -(edge_distance.max(0) as f32 * 0.012).min(0.035);
+        }
+        r
+    }
+    #[test]
+    fn smooth_recess_bridges_between_surrounding_contacts() {
+        assert!(evaluate(uneven_request()).can_place);
+    }
+    #[test]
+    fn one_sided_contacts_do_not_support_center() {
+        let mut r = uneven_request();
+        for l in &mut r.grid.layers {
+            l.support_height = -(l.column.x.max(0) as f32 * 0.012).min(0.06);
+        }
+        assert_eq!(evaluate(r).reason, Some(BlockReason::NoSupport));
+    }
+    #[test]
+    fn five_centimeter_step_is_not_continuous_floor() {
+        let mut r = uneven_request();
+        for l in &mut r.grid.layers {
+            l.support_height = if l.column.x >= 3 { -0.05 } else { 0. };
+        }
+        assert_eq!(evaluate(r).reason, Some(BlockReason::NoSupport));
+    }
+    #[test]
+    fn resting_plane_must_be_highest_covered_height() {
+        let mut r = uneven_request();
+        r.anchor.support_height = -0.012;
+        assert_eq!(evaluate(r).reason, Some(BlockReason::NoSupport));
+    }
+    #[test]
+    fn smooth_recess_still_rejects_wall() {
+        let mut r = uneven_request();
+        r.triangles
+            .push([[0.8, 0., 0.], [0.8, 1., 0.], [0.8, 0., 2.]]);
+        assert_eq!(evaluate(r).reason, Some(BlockReason::BlockedByMesh));
+    }
+    #[test]
+    fn single_cell_contact_supports_small_footprint() {
+        let mut r = request();
+        r.footprint.size = [0.1, 0.1];
+        assert!(evaluate(r).can_place);
+    }
+    #[test]
+    fn contact_hull_boundary_is_not_stable_support() {
+        let mut points = vec![[0., 0.], [1., 0.], [1., 1.], [0., 1.]];
+        assert!(!support_encloses_center(&mut points, [0., 0.5]));
+        assert!(support_encloses_center(&mut points, [0.5, 0.5]));
+    }
+    #[test]
+    fn adjacent_height_difference_is_not_a_rejection_rule() {
+        let mut r = request();
+        r.grid
+            .layers
+            .iter_mut()
+            .filter(|l| l.column.x == 1)
+            .for_each(|l| l.support_height = -0.02005);
+        assert!(evaluate(r).can_place);
+        let mut r = request();
+        r.grid
+            .layers
+            .iter_mut()
+            .filter(|l| l.column.x == 1)
+            .for_each(|l| l.support_height = -0.16);
+        r.triangles.push([[0.25, 0., 0.], [0.25, -0.16, 0.], [0.25, -0.16, 1.]]);
+        assert!(evaluate(r).can_place);
     }
     #[test]
     fn cross_layer_rejected() {

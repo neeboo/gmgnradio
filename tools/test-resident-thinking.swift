@@ -50,6 +50,7 @@ struct MotionPackageStore {
     var storedMotions: [StageMotionAsset] = []
     var selected: StageMotionAsset? = nil
     static let naturalIdleID = "idle"
+    static let iluvSlapBassVRMID = "builtin.motion.iluvslapbass-vrm"
     static func liveStore() throws -> Self { Self() }
     func activeMotion() throws -> StageMotionAsset? { selected }
     func activate(id: String) throws {}
@@ -59,13 +60,20 @@ struct MotionPackageStore {
 \#(performance)
 \#(String(playback[playback.range(of: "enum StageAvatarResolvedMotion:")!.lowerBound..<playback.range(of: "struct StageAvatarMotionFallback:")!.lowerBound]))
 enum LivingWorldBootstrap {
+    static let fallbackWalkingSpeed: Float = 1.2
     \#(installedIDs)
     static let bonesWalkCompatibility = StageMotionLocomotion(strideSpeed: 0.75, playbackRate: 1, inPlace: true)
     static let ardyWalkCompatibility = StageMotionLocomotion(strideSpeed: 0.45, playbackRate: 4, inPlace: true)
     \#(declaration("static func approvedInstalledMotions(", in: bootstrap))
+    \#(declaration("static func walkingSpeed(", in: bootstrap))
 }
 @MainActor final class RefreshHost {
-    struct Context { let snapshot = "snapshot" }
+    final class Context {
+        let snapshot = "snapshot"
+        var walkingSpeed: Float = 0
+        func updateWalkingSpeed(_ speed: Float) { walkingSpeed = speed }
+    }
+    let avatarRuntime = StageAvatarRuntimeStore(packageStore: nil, motionPackageStore: nil)
     var motionPackageStore: MotionPackageStore? = MotionPackageStore()
     var livingWorldApprovedMotions: [String: StageMotionAsset] = [:]
     var livingWorldContext: Context? = Context()
@@ -93,7 +101,9 @@ enum LivingWorldBootstrap {
         let rejected = StageMotionAsset(id: "gmgn.motion.ardy-walk-loop-pmx", name: "ARDY", format: .vmd, url: modelURL)
         let rejectedStore = StageAvatarRuntimeStore(packageStore: PresencePackageStore(avatar: avatar), motionPackageStore: MotionPackageStore(storedMotions: [bonesIdle, rejected], selected: rejected))
         rejectedStore.refresh()
-        precondition(rejectedStore.snapshot.motion == bonesIdle, "non-BONES selection must not bypass the source requirement")
+        precondition(rejectedStore.snapshot.motion == rejected, "verified manual motion selection must remain unchanged")
+        precondition(LivingWorldBootstrap.approvedInstalledMotions([rejected])[rejected.id] == nil,
+            "manual selection must not bypass the automatic resident activity allow-list")
         for id in ["builtin.motion.iluvslapbass", "gmgn.motion.ardy-backflip"] {
             let kept = StageMotionAsset(id: id, name: id, format: .vmd, url: modelURL)
             let exceptionStore = StageAvatarRuntimeStore(packageStore: PresencePackageStore(avatar: avatar), motionPackageStore: MotionPackageStore(storedMotions: [bonesIdle, kept], selected: kept))

@@ -99,8 +99,8 @@ let commitSource = declaration(serviceSource, "func commit(_ command: WorldPropL
 check(commitSource?.contains("case let .removal(objectID):") == true
       && commitSource?.contains("validateDeletion(objectID: objectID, in: state, baseline: baseline)") == true,
       "删除那一层必须跑它自己的判据（validateDeletion）")
-check(commitSource?.contains("case .spatialChange:") == true
-      && commitSource?.contains("try validate(state)") == true,
+check(commitSource?.contains("case let .spatialChange(objectID):") == true
+      && commitSource?.contains("try validate(state, baseline: baseline)") == true,
       "空间那一层必须原样保留（一个字不放宽）")
 let deletionSource = declaration(serviceSource, "private func validateDeletion(objectID: String, in state: WorldState, baseline: WorldState) throws")
 check(deletionSource?.contains("try validate(") == false,

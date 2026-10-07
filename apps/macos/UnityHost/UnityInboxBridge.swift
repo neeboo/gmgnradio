@@ -1,6 +1,6 @@
 import Foundation
 
-/// Human-read projection only. Never ACKs the task delivery consumer, imports
+/// Shared human and agent inbox access. Never ACKs the task delivery consumer, imports
 /// legacy files, starts taskd, or creates a second inbox database.
 @MainActor
 final class UnityInboxBridge {
@@ -30,13 +30,135 @@ final class UnityInboxBridge {
         self.scope = scope
     }
 
+    /// Reads authority directly without changing the human projection or read flags.
+    func readForAgent() async throws -> [ResidentSystemInboxEntry] {
+        guard !closed else { throw CancellationError() }
+        guard let scope, !scope.worldID.isEmpty, !scope.residentScope.isEmpty else {
+            throw InboxFailure(code: "scope_not_configured", message: "尚未指定当前角色的通知范围。")
+        }
+        let durable = try await storage.readOnly(scope: scope) ?? []
+        try Task.checkCancellation()
+        guard !closed else { throw CancellationError() }
+        return durable.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    /// Publishes the notice and its agent wake-up message in one authority commit.
+    func postForAgent(id: UUID, title: String, detail: String) async throws -> Bool {
+        guard !closed else { throw CancellationError() }
+        guard let scope, !scope.worldID.isEmpty, !scope.residentScope.isEmpty else {
+            throw InboxFailure(code: "scope_not_configured", message: "尚未指定当前角色的通知范围。")
+        }
+        guard !pending else { return false }
+        pending = true
+        defer { pending = false }
+        let taskKey = "agent-message:" + id.uuidString
+        var durable = try await storage.restore(scope: scope) ?? []
+        if let existing = durable.first(where: { $0.taskKey == taskKey }) {
+            guard existing.title == title, existing.detail == detail else {
+                throw InboxFailure(code: "request_id_conflict", message: "同一消息标识已有不同内容。")
+            }
+        } else {
+            let now = Date()
+            let entry = ResidentSystemInboxEntry(taskKey: taskKey, lastEventID: id.uuidString,
+                kind: "agent_message", title: title, status: "pending", detail: detail,
+                terminal: false, isRead: false, readAt: nil, deliveredAt: now, updatedAt: now)
+            durable.append(entry)
+            try Task.checkCancellation()
+            guard !closed else { throw CancellationError() }
+            try await storage.persist(scope: scope, entries: durable, messages: [
+                ResidentStateFact(id: id.uuidString, kind: "system_inbox", payload: [
+                    "taskKey": .string(taskKey), "eventID": .string(id.uuidString)])])
+            durable = try await storage.restore(scope: scope) ?? []
+            guard durable.contains(where: { $0.taskKey == taskKey && $0.lastEventID == id.uuidString && $0.title == title && $0.detail == detail && $0.kind == "agent_message" && !$0.isRead }) else {
+                throw InboxFailure(code: "readback_not_confirmed", message: "通知保存尚未确认。")
+            }
+        }
+        try Task.checkCancellation()
+        guard !closed else { throw CancellationError() }
+        entries = durable; loaded = true; generation &+= 1
+        response = ["version": 1, "status": "completed", "operation": "inbox.post"]
+        return true
+    }
+
+    /// Durable producer shares the same scope/CAS owner as list and read.
+    /// A busy reader leaves the event pending with its caller for a later sync.
+    func deliver(_ deliveries: [ResidentSystemDelivery]) async throws -> Bool {
+        guard !closed, !pending, let scope else { return false }
+        pending = true
+        defer { pending = false }
+        var durable = try await storage.restore(scope: scope) ?? []
+        var proposed = durable
+        for delivery in deliveries {
+            if let index = proposed.firstIndex(where: { $0.taskKey == delivery.taskID }) {
+                let old = proposed[index]
+                guard old.lastEventID != delivery.eventID else { continue }
+                guard old.title != delivery.title || old.status != delivery.status || old.detail != delivery.detail || old.kind != delivery.kind || old.terminal != delivery.terminal else { continue }
+                proposed[index].lastEventID = delivery.eventID
+                proposed[index].kind = delivery.kind; proposed[index].title = delivery.title
+                proposed[index].status = delivery.status; proposed[index].detail = delivery.detail
+                proposed[index].terminal = delivery.terminal; proposed[index].isRead = false
+                proposed[index].readAt = nil; proposed[index].updatedAt = Date()
+            } else {
+                let now = Date()
+                proposed.append(.init(taskKey: delivery.taskID, lastEventID: delivery.eventID,
+                    kind: delivery.kind, title: delivery.title, status: delivery.status,
+                    detail: delivery.detail, terminal: delivery.terminal, isRead: false,
+                    readAt: nil, deliveredAt: now, updatedAt: now))
+            }
+        }
+        try Task.checkCancellation()
+        guard !closed else { return false }
+        if proposed != durable {
+            try await storage.persist(scope: scope, entries: proposed)
+            durable = try await storage.restore(scope: scope) ?? []
+            guard proposed.allSatisfy({ expected in durable.contains { actual in
+                var normalized = expected
+                normalized.deliveredAt = actual.deliveredAt; normalized.updatedAt = actual.updatedAt
+                normalized.readAt = actual.readAt
+                let readTimeMatches = expected.readAt == nil ? actual.readAt == nil : actual.readAt.map { abs($0.timeIntervalSince(expected.readAt!)) < 0.000001 } == true
+                return normalized == actual && readTimeMatches &&
+                    abs(expected.deliveredAt.timeIntervalSince(actual.deliveredAt)) < 0.000001 &&
+                    abs(expected.updatedAt.timeIntervalSince(actual.updatedAt)) < 0.000001
+            } }) else {
+                throw InboxFailure(code: "readback_not_confirmed", message: "通知保存尚未确认。")
+            }
+        }
+        guard !closed else { return false }
+        entries = durable; loaded = true; generation &+= 1
+        response = ["version": 1, "status": "completed", "operation": "inbox.deliver"]
+        return true
+    }
+
     /// Accepted is not read: only persist plus authoritative readback may
     /// change the entries exposed by snapshot().
     func command(_ value: [String: Any]) -> Bool {
         guard !closed, !pending, let operation = value["op"] as? String,
-              ["inbox.list", "inbox.read"].contains(operation) else { return false }
+              ["inbox.list", "inbox.read", "inbox.post"].contains(operation) else { return false }
         let requestID = value["requestID"] as? String ?? UUID().uuidString
         guard requestID.utf8.count <= 256 else { return false }
+        if operation == "inbox.post" {
+            guard let rawID = value["messageID"] as? String, let id = UUID(uuidString: rawID),
+                  let title = value["title"] as? String, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, title.utf8.count <= 512,
+                  let detail = value["detail"] as? String, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, detail.utf8.count <= 16_384 else { return false }
+            pending = true
+            work = Task { [weak self] in
+                guard let self, !closed else { return }
+                // Transfer the command reservation to the shared producer on this actor.
+                pending = false
+                do {
+                    guard try await postForAgent(id: id, title: title, detail: detail) else { return }
+                    response["requestID"] = requestID
+                    response["messageID"] = id.uuidString
+                } catch {
+                    guard !closed else { return }
+                    response = ["version": 1, "operation": operation, "requestID": requestID,
+                        "status": "failed", "code": (error as? InboxFailure)?.code ?? "inbox_unavailable",
+                        "message": "通知状态未能确认，请稍后重试。"]
+                    generation &+= 1
+                }
+            }
+            return true
+        }
         pending = true
         work = Task { [weak self] in
             guard let self else { return }

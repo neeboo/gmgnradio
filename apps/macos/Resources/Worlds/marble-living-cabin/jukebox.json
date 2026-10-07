@@ -2,6 +2,7 @@
   "id": "prop.jukebox",
   "kind": "prop.procedural",
   "renderer": "builtin.jukebox",
+  "effectiveVisualSize": [0.5, 0.68210784, 0.37967568],
   "position": [
     2,
     0.024776516,
@@ -14,11 +15,18 @@
     {
       "role": "interact",
       "kind": "standingSpot",
+      "yaw": -1.5707963267948966,
       "position": [
         -0.7,
         0.006824641,
         0
       ],
+      "activityID": "music.listen"
+    },
+    {
+      "role": "button",
+      "kind": "interaction",
+      "position": [-0.24, 0.40983208, -0.00358971],
       "activityID": "music.listen"
     }
   ]

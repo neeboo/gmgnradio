@@ -88,11 +88,11 @@ final class AuthorityWorldStatePersistence: WorldStatePersisting, @unchecked Sen
     }
 
     init(manifest: WorldManifest, preImage: LegacyWorldStatePreImage,
-         socketPath: String, helperPath: String, allowsLaunching: Bool = true) {
+         endpointFile: String, helperPath: String, allowsLaunching: Bool = true) {
         self.packageID = manifest.packageID
         self.packageVersion = manifest.packageVersion
         self.preImage = preImage
-        self.client = WorldAuthorityClient(worldID: manifest.worldID, socketPath: socketPath,
+        self.client = WorldAuthorityClient(worldID: manifest.worldID, endpointFile: endpointFile,
                                            helperPath: helperPath, allowsLaunching: allowsLaunching)
     }
 
@@ -134,6 +134,25 @@ final class AuthorityWorldStatePersistence: WorldStatePersisting, @unchecked Sen
         }
     }
 
+    /// Verification read only: keep the checkpoint owner's CAS revision tied
+    /// to the state its simulation actually adopted.
+    func readSnapshot() throws -> WorldState? {
+        try client.snapshot()?.state
+    }
+
+    /// Renew only for a state the caller has successfully adopted. Recheck the
+    /// document so an intervening external commit cannot grant a newer lease.
+    func acceptSnapshot(_ state: WorldState) throws {
+        guard let record = try client.snapshot() else { throw WorldAuthorityError.noAuthorityRecord }
+        guard record.state == state else {
+            throw WorldAuthorityError.projectionBehind(local: lastAppliedRevision, authority: record.recordRevision)
+        }
+        lock.lock()
+        authorityRevision = record.recordRevision
+        readOnlyReason = nil
+        lock.unlock()
+    }
+
     // MARK: - 写（意图）
 
     func save(_ state: WorldState) throws {
@@ -144,10 +163,22 @@ final class AuthorityWorldStatePersistence: WorldStatePersisting, @unchecked Sen
         if let reason {
             throw WorldAuthorityError.unavailable(reason)
         }
-        let result = try client.commit(state: state, expectedRevision: expected,
+        let result: WorldAuthorityCommitResult
+        do {
+            result = try client.commit(state: state, expectedRevision: expected,
                                        intent: ["kind": "world.checkpoint",
                                                 "packageID": packageID,
                                                 "packageVersion": packageVersion])
+        } catch {
+            let code: String
+            if case let WorldAuthorityError.daemon(detail) = error,
+               detail.range(of: "^[a-z0-9_]{1,64}$", options: .regularExpression) != nil {
+                code = detail
+            } else if case WorldAuthorityError.staleProjection = error { code = "stale_projection" }
+            else { code = String(describing: type(of: error)) }
+            NSLog("[WorldCheckpoint] failed code=%@ expectedRevision=%llu", code, expected)
+            throw error
+        }
         lock.lock()
         authorityRevision = max(authorityRevision, result.revision)
         lock.unlock()
@@ -170,21 +201,22 @@ final class AuthorityWorldStatePersistence: WorldStatePersisting, @unchecked Sen
 }
 
 /// 生产接线用的路径解析：与 `PropTaskDaemonClient` 的默认值**同一口径**
-/// （Application Support/gmgn radio/TaskService/taskd.sock + 应用内 helper）。
+/// （Application Support/gmgn radio/TaskService/taskd.endpoint.json + 应用内 helper）。
 ///
 /// `applicationSupportBase` 只给测试/夹具换根用；生产传 nil。
 ///
-/// **唯一根**：`taskServiceRoot` 是 taskd 状态/socket 根的唯一拼接口。世界权威端点、
+/// **唯一根**：`taskServiceRoot` 是 taskd 数据库和 HTTP 端点描述文件的唯一根目录。
+/// 世界权威端点和
 /// `PropTaskDaemonClient` 的 E2E 显式注入都从这里取。上一轮 E2E 的拒收项正是这里：
-/// 端点以为传进来的 base 已经是 `.../gmgn radio`，于是把 socket 落在
-/// `<base>/TaskService/taskd.sock`，而 `PropTaskDaemonClient(root:)` 落在
-/// `<base>/gmgn radio/TaskService/taskd.sock` —— 同一个测试根里出现两个 taskd，
+/// 端点以为传进来的 base 已经是 `.../gmgn radio`，于是把端点描述文件落在
+/// `<base>/TaskService/taskd.endpoint.json`，而 `PropTaskDaemonClient(root:)` 落在
+/// `<base>/gmgn radio/TaskService/taskd.endpoint.json` —— 同一个测试根里出现两个 taskd，
 /// 世界权威与生成服务各连各的。现在只有一个函数能拼这个根。
 struct WorldAuthorityEndpoint {
-    let socketPath: String
+    let endpointFile: String
     let helperPath: String
 
-    /// taskd 的 socket/状态根：`<Application Support>/gmgn radio/TaskService`。
+    /// taskd 的数据库和 HTTP 端点描述文件根：`<Application Support>/gmgn radio/TaskService`。
     /// 传 nil 时用真实用户 Application Support（生产）；传 base 时只换最外层根。
     static func taskServiceRoot(
         applicationSupportBase: URL? = nil,
@@ -204,7 +236,7 @@ struct WorldAuthorityEndpoint {
 
     init(applicationSupportBase: URL? = nil, bundle: Bundle = .main) {
         let root = Self.taskServiceRoot(applicationSupportBase: applicationSupportBase)
-        socketPath = root.appendingPathComponent("taskd.endpoint.json").path
+        endpointFile = root.appendingPathComponent("taskd.endpoint.json").path
         helperPath = bundle.bundleURL
             .appendingPathComponent("Contents/Helpers/gmgn-taskd").path
     }

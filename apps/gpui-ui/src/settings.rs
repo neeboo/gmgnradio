@@ -12,6 +12,30 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use serde_json::{Value, json};
 
+// macOS virtual key codes used by the original shortcut authority. GPUI lives
+// in another process, so key recording must cross the settings transport.
+fn shortcut_capture_command(key: &str, modifiers: u64) -> Option<Value> {
+    let key = key.to_ascii_lowercase();
+    if key == "escape" { return Some(json!({"op":"shortcuts.cancel"})); }
+    let (code, label) = match key.as_str() {
+        "space" => (49, "Space".to_owned()),
+        "left" => (123, "←".to_owned()), "right" => (124, "→".to_owned()),
+        "down" => (125, "↓".to_owned()), "up" => (126, "↑".to_owned()),
+        "enter" => (36, "Return".to_owned()), "tab" => (48, "Tab".to_owned()),
+        "backspace" => (51, "Delete".to_owned()),
+        other => {
+            let codes = [("a",0),("s",1),("d",2),("f",3),("h",4),("g",5),("z",6),("x",7),("c",8),("v",9),("b",11),
+                ("q",12),("w",13),("e",14),("r",15),("y",16),("t",17),("1",18),("2",19),("3",20),("4",21),("6",22),("5",23),
+                ("=",24),("9",25),("7",26),("-",27),("8",28),("0",29),("]",30),("o",31),("u",32),("[",33),("i",34),("p",35),
+                ("l",37),("j",38),("'",39),("k",40),(";",41),("\\",42),(",",43),("/",44),("n",45),("m",46),(".",47),("`",50),
+                ("f1",122),("f2",120),("f3",99),("f4",118),("f5",96),("f6",97),("f7",98),("f8",100),("f9",101),("f10",109),("f11",103),("f12",111)];
+            let (_, code) = codes.iter().find(|(name,_)|*name==other)?;
+            (*code, other.to_uppercase())
+        }
+    };
+    Some(json!({"op":"shortcuts.capture","keyCode":code,"keyLabel":label,"modifiers":modifiers}))
+}
+
 fn avatar_detail(package: &Value) -> String {
     if let Some(detail) = package["displayDetail"].as_str() {
         return detail.to_owned();
@@ -62,6 +86,36 @@ fn unity_section_available(snapshot: &Value, section: &str) -> bool {
 }
 fn unity_agent_group_available(snapshot: &Value, title: &str) -> bool {
     snapshot["unity"]["availableAgentGroups"].as_array().is_some_and(|groups| groups.iter().any(|value| value.as_str() == Some(title)))
+}
+fn marble_command(library: &Value, op: &str, value: &str) -> Option<Value> {
+    let working = library["marbleWorking"].as_bool() == Some(true);
+    let pending = library["marbleOperationID"].as_str().is_some_and(|id| !id.is_empty());
+    if op == "space.marble.cancel" {
+        return working.then(|| json!({"op": op}));
+    }
+    if library["generationSupported"].as_bool() != Some(true) || working { return None; }
+    match op {
+        "space.marble.generate" if !pending && library["marblePresets"].as_array()
+            .is_some_and(|presets| presets.iter().any(|preset| preset["id"].as_str() == Some(value))) =>
+            Some(json!({"op": op, "presetID": value})),
+        "space.marble.resume" if pending => Some(json!({"op": op})),
+        "space.marble.import" if !pending && !value.trim().is_empty() => Some(json!({"op": op, "worldID": value.trim()})),
+        _ => None,
+    }
+}
+fn marble_phase_label(phase: &str) -> &'static str {
+    match phase {
+        "generating" => "正在生成空间",
+        "downloading" => "正在下载空间资产",
+        "validating" => "正在校验空间运行包",
+        "registering" => "正在注册空间",
+        "registered" => "空间已导入",
+        "resume_available" => "已有待恢复的生成任务",
+        "cancelled" => "本机任务已取消",
+        "cancelled_remote_operation_may_continue" => "本机等待已取消，远端生成可能继续；可恢复原任务。",
+        "failed" => "空间任务失败",
+        _ => "",
+    }
 }
 
 #[cfg(test)]
@@ -257,6 +311,15 @@ pub struct AgentSettingsPane {
     motion_category: String,
     orb_color: Entity<ColorPickerState>,
     orb_intensity: Entity<SliderState>,
+    position_inputs: Vec<Entity<InputState>>,
+    position_dirty: bool,
+    syncing_position: bool,
+    position_world: String,
+    position_revision: u64,
+    position_layout_revision: u64,
+    position_notice: Option<String>,
+    video_brightness: Entity<SliderState>,
+    syncing_video: bool,
     _subscriptions: Vec<Subscription>,
     import_link_open: bool,
     custom_voice_open: bool,
@@ -359,6 +422,7 @@ impl AgentSettingsPane {
             "https://…/avatar.vrm",
             "生成服务地址",
             "生成服务密钥",
+            "Marble World ID",
         ]
         .into_iter()
         .enumerate()
@@ -374,6 +438,9 @@ impl AgentSettingsPane {
         .collect();
         let orb_color = cx.new(|cx| ColorPickerState::new(window, cx));
         let orb_intensity = cx.new(|_| SliderState::new().min(0.35).max(1.5).step(0.01));
+        let position_inputs: Vec<_> = ["X", "Y", "Z"].into_iter()
+            .map(|axis| cx.new(|cx| InputState::new(window, cx).placeholder(axis))).collect();
+        let video_brightness = cx.new(|_| SliderState::new().min(0.).max(1.).step(0.01));
         let weak=cx.entity().downgrade();
         let escape_subscription=cx.intercept_keystrokes(move|event,window,cx|{
             if event.keystroke.key!="escape"{return;}
@@ -384,7 +451,7 @@ impl AgentSettingsPane {
                 }
             });
         });
-        let subscriptions=vec![escape_subscription,cx.subscribe(&inputs[3],|this,input,event:&InputEvent,cx|{
+        let mut subscriptions=vec![escape_subscription,cx.subscribe(&inputs[3],|this,input,event:&InputEvent,cx|{
             if matches!(event,InputEvent::Change)&&this.initialized{
                 let current=json!(input.read(cx).value().to_string());
                 if tts_draft_change_requires_stop("tts","voiceID",&this.draft["tts"]["voiceID"],&current){
@@ -398,16 +465,27 @@ impl AgentSettingsPane {
                 let url=input.read(cx).value().to_string();if !url.trim().is_empty(){this.commands.push(json!({"op":"presence.catalog","url":url}));cx.notify();}
             }
         }),cx.subscribe(&extra_inputs[5],|this,_,event:&InputEvent,cx|{
-            if matches!(event,InputEvent::Change)&&this.initialized{this.commands.push(json!({"op":"space.prop.cancel","clearNotice":true}));cx.notify();}
+            if matches!(event,InputEvent::Change)&&this.initialized&&!this.unity_external{this.commands.push(json!({"op":"space.prop.cancel","clearNotice":true}));cx.notify();}
         }),cx.subscribe(&extra_inputs[6],|this,_,event:&InputEvent,cx|{
-            if matches!(event,InputEvent::Change)&&this.initialized{this.commands.push(json!({"op":"space.prop.cancel","clearNotice":true}));cx.notify();}
+            if matches!(event,InputEvent::Change)&&this.initialized&&!this.unity_external{this.commands.push(json!({"op":"space.prop.cancel","clearNotice":true}));cx.notify();}
+        }),cx.subscribe(&extra_inputs[7],|_,_,event:&InputEvent,cx|{
+            if matches!(event,InputEvent::Change){cx.notify();}
         }),cx.subscribe(&inputs[2],|this,input,event:&InputEvent,cx|{
             if matches!(event,InputEvent::Change) && this.initialized {this.commands.push(json!({"op":"agent.save","planningModel":input.read(cx).value().to_string()}));}
         }),cx.subscribe(&orb_color,|this,_,event:&ColorPickerEvent,cx|{
             if let ColorPickerEvent::Change(Some(color))=event{let color=color.to_rgb();this.commands.push(json!({"op":"presence.orb.color","red":color.r,"green":color.g,"blue":color.b}));cx.notify();}
         }),cx.subscribe(&orb_intensity,|this,_,event:&SliderEvent,cx|{
             if let SliderEvent::Change(value)=event{this.commands.push(json!({"op":"presence.orb.intensity","value":value.start()}));cx.notify();}
+        }),cx.subscribe(&video_brightness,|this,_,event:&SliderEvent,cx|{
+            if !this.syncing_video { if let SliderEvent::Change(value)=event { this.commands.push(json!({"op":"video.brightness","value":value.start()}));cx.notify(); } }
         })];
+        for input in &position_inputs {
+            subscriptions.push(cx.subscribe(input, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) && !this.syncing_position {
+                    this.position_dirty = true; this.position_notice = None; cx.notify();
+                }
+            }));
+        }
         Self {
             snapshot: Value::Null,
             draft: Value::Null,
@@ -423,7 +501,16 @@ impl AgentSettingsPane {
             motion_category: String::new(),
             orb_color,
             orb_intensity,
+            position_inputs,
+            position_dirty: false,
+            syncing_position: false,
+            position_world: String::new(),
+            position_revision: 0,
+            position_layout_revision: 0,
+            position_notice: None,
             _subscriptions: subscriptions,
+            video_brightness,
+            syncing_video: false,
             import_link_open: false,
             custom_voice_open: false,
             import_link_window: None,
@@ -438,7 +525,7 @@ impl AgentSettingsPane {
     }
     pub fn select_page(&mut self, page: &str, cx: &mut Context<Self>) {
         if self.page==4&&!matches!(page,"agent"|"dj"){self.commands.push(json!({"op":"speech.settings.cancel"}));}
-        if self.page==2{self.commands.push(json!({"op":"space.prop.cancel"}));}
+        if self.page==2&&!self.unity_external{self.commands.push(json!({"op":"space.prop.cancel"}));}
         if self.page == 3 {
             self.commands.push(json!({"op":"shortcuts.cancel"}));
         }
@@ -452,6 +539,7 @@ impl AgentSettingsPane {
             "agent" | "dj" => 4,
             _ => 0,
         };
+        if self.unity_external && self.page == 6 { self.commands.push(json!({"op":"space.library.load"})); }
         let valid=match self.page {0=>matches!(self.section.as_str(),"角色管理"|"动作管理"),1=>self.section=="音乐账号与歌单同步",2=>self.section=="生成服务",3=>self.section=="快捷键",4=>matches!(self.section.as_str(),"Agent 连接"|"语音播放"|"按住说话"|"自主行动"),5=>matches!(self.section.as_str(),"歌词"|"视觉效果"|"视频"),6=>self.section=="我的空间",_=>true};
         if !valid{self.section=match self.page{0=>"角色管理",1=>"音乐账号与歌单同步",2=>"生成服务",3=>"快捷键",4=>"Agent 连接",5=>"歌词",6=>"我的空间",_=>"活动"}.into();}
         if self.page == 0 {
@@ -475,10 +563,11 @@ impl AgentSettingsPane {
     }
     pub fn select_section(&mut self,page:&str,section:&str,cx:&mut Context<Self>){
         self.section=section.into();self.select_page(page,cx);
+        if self.unity_external && section == "视频" { self.commands.push(json!({"op":"video.load"})); }
         if let Some(stage)=&self.stage_pane{stage.update(cx,|stage,cx|stage.select_section(section,cx));}
     }
     pub fn dismissed(&mut self, cx: &mut Context<Self>) {
-        self.commands.push(json!({"op":"space.prop.cancel"}));
+        if !self.unity_external { self.commands.push(json!({"op":"space.prop.cancel"})); }
         self.commands.push(json!({"op":"shortcuts.cancel"}));
         self.commands.push(json!({"op":"speech.settings.cancel"}));
         cx.notify();
@@ -502,8 +591,12 @@ impl AgentSettingsPane {
         }
         self.inputs[2].update(cx,|input,cx|input.set_placeholder(settings_copy(locale, "使用 Codex 默认模型"),window,cx));
         self.extra_inputs[5].update(cx,|input,cx|input.set_placeholder(settings_copy(locale, "生成服务地址"),window,cx));
+        self.extra_inputs[7].update(cx,|input,cx|input.set_placeholder(settings_copy(locale, "Marble World ID"),window,cx));
         self.extra_inputs[2].update(cx,|input,cx|input.set_placeholder(settings_copy(locale, if snapshot["space"]["credentialConfigured"].as_bool()==Some(true){"粘贴新的 API Key 可覆盖现有配置"}else{"粘贴 API Key"}),window,cx));
         self.extra_inputs[6].update(cx,|input,cx|input.set_placeholder(settings_copy(locale, if snapshot["space"]["propCredentialConfigured"].as_bool()==Some(true){"填写新密钥可替换；留空保留现有密钥"}else{"生成服务密钥"}),window,cx));
+        if self.unity_external {
+            self.extra_inputs[6].update(cx, |input, cx| input.set_placeholder(settings_copy(locale, if snapshot["generation"]["configured"].as_bool() == Some(true) { "填写新密钥可替换；留空保留现有密钥" } else { "生成服务密钥" }), window, cx));
+        }
         if let Some((revision,submitted))=&self.pending_marble{
             if snapshot["space"]["marbleMutationRevision"].as_u64().is_some_and(|ack|ack>*revision){
                 if save_ack_clear(*revision,snapshot["space"]["marbleMutationRevision"].as_u64().unwrap_or(0),submitted,self.extra_inputs[2].read(cx).value().as_str()){self.extra_inputs[2].update(cx,|input,cx|input.set_value("",window,cx));}
@@ -536,7 +629,7 @@ impl AgentSettingsPane {
             for (index, section, field) in
                 [(3, "presence", "catalogURL"), (5, "space", "propEndpoint")]
             {
-                let value = snapshot[section][field].as_str().unwrap_or("").to_owned();
+                let value = if self.unity_external && index == 5 { snapshot["generation"]["endpoint"].as_str() } else { snapshot[section][field].as_str() }.unwrap_or("").to_owned();
                 self.extra_inputs[index].update(cx, |input, cx| input.set_value(value, window, cx));
             }
             let orb = &snapshot["presence"]["orb"];
@@ -598,6 +691,25 @@ impl AgentSettingsPane {
                 self.import_link_open = false;
             }
         }
+        if let Some(value) = snapshot["video"]["brightness"].as_f64().filter(|value| value.is_finite()) {
+            self.syncing_video = true;
+            self.video_brightness.update(cx, |slider, cx| slider.set_value(value as f32, window, cx));
+            self.syncing_video = false;
+        }
+        let position = &snapshot["characterPosition"];
+        let world = position["worldID"].as_str().unwrap_or("");
+        if world != self.position_world || !self.position_dirty {
+            self.syncing_position = true;
+            for (index, input) in self.position_inputs.iter().enumerate() {
+                let value = position["position"][index].as_f64().map(|v| format!("{v:.3}")).unwrap_or_default();
+                input.update(cx, |input, cx| input.set_value(value, window, cx));
+            }
+            self.syncing_position = false; self.position_dirty = false;
+            self.position_world = world.to_owned();
+            self.position_revision = position["revision"].as_u64().unwrap_or(0);
+            self.position_layout_revision = position["layoutRevision"].as_u64().unwrap_or(0);
+            self.position_notice = None;
+        }
         self.snapshot = snapshot;
         cx.notify();
     }
@@ -649,7 +761,10 @@ impl AgentSettingsPane {
                         },
                     ))
                 } else {
-                    let mut name = v.get("name")?.as_str()?.to_owned();
+                    let raw = v.get("name")?.as_str()?;
+                    let mut name = if (section == "presence" && key == "categories") || (section == "asr" && key == "microphoneDevices") {
+                        settings_copy(UiLocale::from_settings(&self.snapshot), raw).to_owned()
+                    } else { raw.to_owned() };
                     if key=="models"&&v["id"]==self.snapshot[section]["defaultModelID"]{name.push_str(settings_copy(UiLocale::from_settings(&self.snapshot), "（默认）"));}
                     if v.get("installed").and_then(Value::as_bool) == Some(false) {
                         name.push_str(settings_copy(UiLocale::from_settings(&self.snapshot), "（未安装）"));
@@ -760,20 +875,21 @@ impl AgentSettingsPane {
             .text_color(theme.foreground);
         if !self.initialized {
             return form
-                .child(t("正在读取原应用配置与 Rust 服务能力…"))
+                .child(t("加载中…"))
                 .into_any_element();
         }
         let group = |title: &'static str| SettingsGroup::new(t(title), border).visible((!self.unity_external || unity_agent_group_available(&self.snapshot, title)) && match self.section.as_str(){"语音播放"=>title=="回复语音","按住说话"=>title=="按住说话","自主行动"=>matches!(title,"角色人格与偏好"|"居民人格"|"自主行动"),_=>matches!(title,"角色内核"|"聊天模型")});
         form=form.child(group("角色内核")
             .child(div().flex().items_center().gap(px(12.)).child(div().size(px(32.)).rounded_lg().bg(cx.theme().muted).flex().items_center().justify_center().child(Icon::new(IconName::Terminal).size(px(20.))))
-                .child(div().flex_1().flex().flex_col().child(settings_copy(locale, "gmgn 角色")).child(self.snapshot["agent"]["codexStatus"].as_str().unwrap_or(settings_copy(locale, "策划引擎未登录")).to_owned()))
+                .child(div().flex_1().flex().flex_col().child(settings_copy(locale, "gmgn 角色")).child(settings_notice(locale, self.snapshot["agent"]["codexStatus"].as_str().unwrap_or("策划引擎未登录"))))
                 .child(Button::new("codex-login").label(t(if self.snapshot["agent"]["codexState"].as_str()==Some("signedIn"){"退出登录"}else{"登录"}))
                     .disabled(self.snapshot["agent"]["working"].as_bool()==Some(true)||self.snapshot["agent"]["codexState"].as_str()==Some("unavailable"))
                     .on_click(cx.listener(|this,_,_,_|this.commands.push(json!({"op":if this.snapshot["agent"]["codexState"].as_str()==Some("signedIn"){"agent.logout"}else{"agent.login"}}))))))
-            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(settings_copy(locale, "Codex 提供策划和推理能力；它与下面的声音共同属于同一个角色。")))
+            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(settings_copy(locale, if self.unity_external { "Codex 账号用于选择 Codex 后端；当前聊天后端以下方选择为准。" } else { "Codex 提供策划和推理能力；它与下面的声音共同属于同一个角色。" })))
+            .when(!self.unity_external || self.snapshot["unity"]["planningSupported"].as_bool()==Some(true), |group| group
             .child(self.toggle("takeover","允许角色自动接管","takeoverEnabled",cx))
             .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(settings_copy(locale, "可以自主切歌、暂停、继续、重排节目和调整视觉。")))
-            .child(div().flex().justify_between().items_center().child(settings_copy(locale, "策划模型")).child(div().w(px(220.)).child(Input::new(&self.inputs[2])))))
+            .child(div().flex().justify_between().items_center().child(settings_copy(locale, "策划模型")).child(div().w(px(220.)).child(Input::new(&self.inputs[2]))))))
             .child(group("角色人格与偏好").child(div().h(px(150.)).min_h(px(150.)).flex_shrink_0()
                 .child(Textarea::new(&self.personas[1]).h(px(150.)).aria_label(t("角色人格与偏好")).accessibility_id("dj-host-prompt")))
             .child(div().flex().justify_between().items_center().gap(px(ui::SPACING_12)).child(div().flex_1().min_w(px(0.)).text_size(px(ui::BODY)).line_height(px(ui::BODY_LINE_HEIGHT)).child(t("用自然语言告诉角色怎么策划和主持。")))
@@ -784,7 +900,7 @@ impl AgentSettingsPane {
                 .child(Button::new("save-resident").flex_shrink_0().primary().label(t("保存")).on_click(cx.listener(|this,_,_,cx|this.commands.push(json!({"op":"agent.save","residentPersona":this.personas[0].read(cx).value().to_string()})))))))
             .child(group("聊天模型")
             .child(self.dropdown("backend","模型","agent","backendID",self.options("agent","backends"),cx))
-            .children(self.snapshot["agent"]["backendStatus"].as_str().map(|status|div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(status.to_owned())))
+            .children(self.snapshot["agent"]["backendStatus"].as_str().map(|status|div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(settings_notice(locale, status))))
             .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(settings_copy(locale, "空间和 Live Cam 共用这里选定的 Agent；文字和语音转写进入同一个会话。"))))
             .child(group("自主行动")
             .child(self.toggle("autonomy","允许居民自主安排活动","autonomyEnabled",cx))
@@ -795,25 +911,24 @@ impl AgentSettingsPane {
             .children((!self.unity_external || self.snapshot["unity"]["autoSpeakSupported"].as_bool() == Some(true)).then(||self.toggle("auto-speak","自动朗读 Agent 回复","autoSpeak",cx)))
             .child(self.dropdown("tts-provider","服务","tts","providerID",self.options("tts","providers"),cx))
             .child(div().flex().items_center().justify_between().child("API Key").child(div().w(px(280.)).child(Input::new(&self.extra_inputs[0]).aria_label(t("新的 TTS API Key")))))
-            .child(self.dropdown("tts-voice","声音","tts","voiceID",self.options("tts","voices"),cx))
             .child(div().flex().items_center().gap(px(ui::SPACING_8))
-                .child(Button::new("refresh-voices").label(t("刷新声音")).disabled(self.snapshot["tts"]["loading"].as_bool()==Some(true)).on_click(cx.listener(|this,_,_,cx|this.tts_action("tts.refresh",cx))))
+                .child(div().flex_1().child(self.dropdown("tts-voice","声音","tts","voiceID",self.options("tts","voices"),cx)))
+                .child(Button::new("refresh-voices").icon(IconName::RefreshCw).accessibility_label(t("刷新声音")).disabled(self.snapshot["tts"]["loading"].as_bool()==Some(true)).on_click(cx.listener(|this,_,_,cx|this.tts_action("tts.refresh",cx))))
                 .child(Button::new("preview-tts").label(if self.snapshot["tts"]["isSpeaking"].as_bool()==Some(true){t("停止试听")}else{t("试听声音")}).disabled(!valid_model||self.inputs[3].read(cx).value().trim().is_empty()).on_click(cx.listener(|this,_,_,cx|this.tts_action(if this.snapshot["tts"]["isSpeaking"].as_bool()==Some(true){"tts.stop"}else{"tts.preview"},cx)))))
             .child(gpui_kit::component::collapsible::Collapsible::new().open(self.custom_voice_open)
-                .child(Button::new("custom-voice-disclosure").label(t("自定义音色 ID")).icon(if self.custom_voice_open{IconName::ChevronDown}else{IconName::ChevronRight}).on_click(cx.listener(|this,_,_,cx|{this.custom_voice_open=!this.custom_voice_open;cx.notify();})))
+                .child(Button::new("custom-voice-disclosure").label(t("高级设置")).icon(if self.custom_voice_open{IconName::ChevronDown}else{IconName::ChevronRight}).on_click(cx.listener(|this,_,_,cx|{this.custom_voice_open=!this.custom_voice_open;cx.notify();})))
                 .content(div().flex().flex_col().gap(px(ui::SPACING_8))
+                    .child(self.dropdown("tts-model","模型","tts","modelID",self.options("tts","models"),cx))
                     .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(if self.draft["tts"]["providerID"].as_str()==Some("fish"){t("自定义 Reference ID")}else{t("自定义 Voice ID")}))
                     .child(Input::new(&self.inputs[3])).child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(t("填写该服务已有的音色 ID，无需重新上传；账号、模型及服务区域须与创建音色时一致。")))
-                    .children((self.draft["tts"]["providerID"].as_str()==Some("bailian")).then(||div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(t("百炼复刻音色需要在模型列表选择对应的 VC Realtime 快照；创建音色时的 target_model 必须匹配。"))))))
-            .child(self.dropdown("tts-model","模型","tts","modelID",self.options("tts","models"),cx))
+                    .children((self.draft["tts"]["providerID"].as_str()==Some("bailian")).then(||div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(t("复刻音色请选择创建时使用的模型。"))))))
             .children((self.snapshot["tts"]["catalogLoaded"].as_bool()==Some(true)&&!valid_model).then(||div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(t("原配置模型不在当前支持列表中，请选择后保存；不会自动改用其他模型。"))))
-            .child(if self.snapshot["tts"]["credentialConfigured"].as_bool()==Some(true) { if self.unity_external { t("已配置 Unity 会话凭据") } else { t("沿用原应用已配置凭据") } } else { t("该服务尚未配置凭据，请填写后保存") })
+            .child(if self.snapshot["tts"]["credentialConfigured"].as_bool()==Some(true) { t("已配置") } else { t("该服务尚未配置凭据，请填写后保存") })
             .child(div().flex().flex_wrap().gap(px(ui::SPACING_8))
                 .child(Button::new("save-tts").label(t("保存配置")).disabled(!valid_model).on_click(cx.listener(|this,_,_,cx|this.tts_action("tts.save",cx)))))
-            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(t("传输：本机 TCP → Rust → 服务商；录放音留在系统设备层。")))
-            .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(t("Rust 流式合成，开麦停止旧朗读；失败保留文字，不自动切换服务。")))
             .children(self.snapshot["tts"]["notice"].as_str().map(|notice|div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(settings_notice(locale, notice)))))
             .child(group("按住说话")
+            .child(self.dropdown("asr-microphone","麦克风","asr","microphoneDeviceID",self.options("asr","microphoneDevices"),cx))
             .child(self.dropdown("asr-provider","服务","asr","providerID",self.options("asr","providers"),cx))
             .child(div().flex().items_center().justify_between().child("API Key").child(div().w(px(280.)).child(Input::new(&self.extra_inputs[1]).aria_label(t("新的 ASR API Key")))))
             .child(self.dropdown("asr-model","模型","asr","modelID",self.options("asr","models"),cx))
@@ -821,13 +936,53 @@ impl AgentSettingsPane {
             .child(Button::new("save-asr").label(t("保存配置")).disabled(!self.snapshot["asr"]["models"].as_array().is_some_and(|models|models.iter().any(|model|model["id"]==self.draft["asr"]["modelID"]))).on_click(cx.listener(|this,_,_,cx|{
                 let mut value=this.draft["asr"].clone();value["op"]=json!("asr.save");value["apiKey"]=json!(this.extra_inputs[1].read(cx).value().to_string());this.commands.push(value);
             })))
-            .child(if self.unity_external { t("当前可管理语音配置、试听与回复朗读；Unity 按住说话尚未接入。") } else { t("在空间或 Live Cam 按住麦克风录音，松开后将完整转写交给当前 Agent。没有双向实时通话。") })
             .children(self.snapshot["asr"]["notice"].as_str().map(|notice|div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(settings_notice(locale, notice)))));
         form.into_any_element()
     }
 }
 
 impl AgentSettingsPane {
+    fn character_position_form(&self, cx: &mut Context<Self>) -> AnyElement {
+        let locale = UiLocale::from_settings(&self.snapshot);
+        let position = &self.snapshot["characterPosition"];
+        let unavailable = position["available"].as_bool() != Some(true);
+        let working = position["working"].as_bool() == Some(true);
+        let mut coordinates = div().flex().items_center().gap_2();
+        for (index, axis) in ["X", "Y", "Z"].into_iter().enumerate() {
+            coordinates = coordinates.child(axis).child(div().flex_1().min_w(px(0.))
+                .child(Input::new(&self.position_inputs[index]).disabled(unavailable || working)
+                    .aria_label(format!("{} {axis}", settings_copy(locale, "人物位置")))));
+        }
+        let mut group = SettingsGroup::new(settings_copy(locale, "人物位置"), cx.theme().border)
+            .child(coordinates)
+            .child(div().text_size(px(ui::CAPTION)).child(settings_copy(locale, "坐标以米计；人物会沿可通行地面移动，Y 必须贴合目标地面。")))
+            .child(div().flex().items_center().gap_2()
+                .child(Button::new("character-position-apply").label(settings_copy(locale, "移动到坐标"))
+                    .disabled(unavailable || working).on_click(cx.listener(|this, _, _, cx| {
+                        let values: Option<Vec<f64>> = this.position_inputs.iter()
+                            .map(|input| input.read(cx).value().trim().parse::<f64>().ok().filter(|v| v.is_finite())).collect();
+                        if let Some(values) = values {
+                            let id = format!("position-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+                            this.commands.push(json!({"op":"presence.position", "worldID":this.position_world,
+                                "expectedRevision":this.position_revision, "expectedLayoutRevision":this.position_layout_revision,
+                                "requestID":id, "position":values}));
+                            this.position_dirty = false; this.position_notice = None;
+                        } else { this.position_notice = Some("请输入有效的 X、Y、Z 坐标。".into()); }
+                        cx.notify();
+                    })))
+                .child(Button::new("character-position-reset").label(settings_copy(locale, "重置"))
+                    .disabled(unavailable || working).on_click(cx.listener(|this, _, _, cx| {
+                        let id = format!("position-reset-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+                        this.commands.push(json!({"op":"presence.position.reset", "worldID":this.snapshot["characterPosition"]["worldID"],
+                            "expectedRevision":this.snapshot["characterPosition"]["revision"],
+                            "expectedLayoutRevision":this.snapshot["characterPosition"]["layoutRevision"], "requestID":id}));
+                        this.position_dirty = false; this.position_notice = None; cx.notify();
+                    }))));
+        if let Some(notice) = self.position_notice.as_deref().or_else(|| position["notice"].as_str()) {
+            group = group.child(div().text_size(px(ui::CAPTION)).child(settings_notice(locale, notice)));
+        }
+        group.into_any_element()
+    }
     fn command_button(
         &self,
         id: impl Into<ElementId>,
@@ -856,6 +1011,9 @@ impl AgentSettingsPane {
         let group = |title: &'static str| SettingsGroup::new(t(title), border).visible(match self.section.as_str(){"角色管理"=>matches!(title,"角色"|"呼吸球样式"),"动作管理"=>matches!(title,"动作"|"动作库"),"我的空间"=>title=="默认空间","生成服务"=>title!="默认空间",_=>true});
         match self.page {
             0 => {
+                if self.unity_external && self.section == "角色管理" {
+                    form = form.child(self.character_position_form(cx));
+                }
                 let mut roles = group("角色");
                 for package in self.snapshot["presence"]["packages"]
                     .as_array()
@@ -881,7 +1039,7 @@ impl AgentSettingsPane {
                                     div()
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child(if package["isBuiltIn"].as_bool()==Some(true) && package["displayDetail"].is_null() {
+                                        .child(if package["isBuiltIn"].as_bool()==Some(true) {
                                             format!("{} · {}", t("内置"), t(match package["engine"].as_str(){Some("orb")=>"呼吸球",Some("pmx")=>"PMX",Some("vrm")=>"VRM",Some("live2D"|"live2d")=>"Live2D",_=>""}))
                                         } else { avatar_detail(package) }),
                                 ),
@@ -940,9 +1098,9 @@ impl AgentSettingsPane {
                     gpui_kit::component::tab::TabBar::new("motion-category")
                         .segmented()
                         .small()
-                        .w(px(235.))
-                        .h(px(24.))
-                        .max_width(px(44.))
+                        .w(px(360.))
+                        .h(px(28.))
+                        .max_width(px(80.))
                         .selected_index(selected)
                         .children(category_values.iter().map(|(_, name)| {
                             gpui_kit::component::tab::Tab::new().flex_1().min_w(px(0.)).aria_label(name.clone())
@@ -957,7 +1115,7 @@ impl AgentSettingsPane {
                         }),
                 );
                 if let Some(notice) = self.snapshot["presence"]["motionNotice"].as_str() {
-                    motions = motions.child(div().text_xs().child(notice.to_owned()));
+                    motions = motions.child(div().text_xs().child(settings_notice(locale, notice)));
                 }
                 if !self.motion_category.is_empty()&&self.snapshot["presence"]["motionNotice"].is_null()
                     &&!self.snapshot["presence"]["motions"].as_array().into_iter().flatten().any(|m|m["category"].as_str()==Some(&self.motion_category)){
@@ -1000,7 +1158,9 @@ impl AgentSettingsPane {
                                 .flex()
                                 .flex_col()
                                 .gap(px(3.))
-                                .child(motion["name"].as_str().unwrap_or("").to_owned())
+                                .child(if motion["id"].as_str() == Some("builtin.motion.natural-idle") {
+                                    t("自然待机").to_owned()
+                                } else { motion["name"].as_str().unwrap_or("").to_owned() })
                                 .child(
                                     div()
                                         .text_xs()
@@ -1011,7 +1171,7 @@ impl AgentSettingsPane {
                                             motion["reason"]
                                                 .as_str()
                                                 .filter(|s| !s.is_empty())
-                                                .map(|s| format!(" · {s}"))
+                                                .map(|s| format!(" · {}", settings_notice(locale, s)))
                                                 .unwrap_or_default()
                                         )),
                                 ),
@@ -1227,9 +1387,24 @@ impl AgentSettingsPane {
                     services = services.child(row);
                 }
                 if self.unity_external {
-                    services = services.child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(t("账号操作只影响当前 Unity 会话；同步完成后，音乐库会显示最新歌单。")));
+                    services = services.child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(t("同步完成后，音乐库会显示最新歌单。")));
                 }
                 form = form.child(services);
+            }
+            2 if self.unity_external => {
+                let generation = &self.snapshot["generation"];
+                let configured = generation["configured"].as_bool() == Some(true);
+                let checking = generation["checking"].as_bool() == Some(true);
+                form = form.child(group("许愿机")
+                    .child(Input::new(&self.extra_inputs[5])).child(Input::new(&self.extra_inputs[6]))
+                    .child(div().flex().items_center().gap_2()
+                        .child(div().flex_1().child(t(if configured { "已配置" } else { "未配置" })))
+                        .child(Button::new("generation-check").small().label(t(if checking { "检测中…" } else { "检测连接" })).disabled(!configured || checking || !self.extra_inputs[6].read(cx).value().is_empty()).on_click(cx.listener(|this, _, _, cx| { this.commands.push(json!({"op":"generation.check"})); cx.notify(); })))
+                        .child(Button::new("generation-save").small().primary().label(t("保存")).disabled(checking || self.extra_inputs[5].read(cx).value().trim().is_empty()).on_click(cx.listener(|this, _, _, cx| {
+                            this.commands.push(json!({"op":"generation.save","endpoint":this.extra_inputs[5].read(cx).value().to_string(),"token":this.extra_inputs[6].read(cx).value().to_string()})); cx.notify();
+                        }))))
+                    .children(generation["noticeCode"].as_str().map(|code| div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(settings_notice(locale, code))))
+                    .child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(t("地址和密钥只存在这台电脑上，保存后不会立刻开始生成。"))));
             }
             2 => {
                 let configured =
@@ -1249,7 +1424,7 @@ impl AgentSettingsPane {
                             .child(div().flex().items_center().gap_1().text_sm().text_color(if configured{cx.theme().success}else{cx.theme().muted_foreground})
                                 .child(Icon::new(if configured{IconName::CircleCheck}else{IconName::Circle}).size(px(14.))).child(t(if configured{"已配置"}else{"未配置"}))))
                         .child(div().flex().items_center().gap_3().child("API Key").child(div().flex_1().min_w(px(0.)).child(Input::new(&self.extra_inputs[2]))))
-                        .child(div().flex().items_center().gap_2().child(div().flex_1().text_xs().child(settings_copy(locale, "只保存在本机，不使用钥匙串。")))
+                        .child(div().flex().items_center().justify_end().gap_2()
                             .when(configured,|row|row.child(self.command_button("marble-clear","清除",json!({"op":"space.key.clear"}),cx)))
                             .child(Button::new("marble-save").primary().label(settings_copy(locale, "保存 Key")).disabled(self.extra_inputs[2].read(cx).value().trim().is_empty()).on_click(cx.listener(|this,_,_,cx|{
                                 let key=this.extra_inputs[2].read(cx).value().to_string();this.pending_marble=Some((this.snapshot["space"]["marbleMutationRevision"].as_u64().unwrap_or(0),key.clone()));this.commands.push(json!({"op":"space.key.save","apiKey":key}));
@@ -1288,7 +1463,7 @@ impl AgentSettingsPane {
                         div()
                             .flex_1()
                             .min_w(px(0.))
-                            .child(item["title"].as_str().unwrap_or("").to_owned()),
+                            .child(settings_copy(locale, item["title"].as_str().unwrap_or("")).to_owned()),
                     );
                     for scope in ["local", "global"] {
                         let recording = self.snapshot["shortcuts"]["recordingID"] == id
@@ -1342,7 +1517,7 @@ impl AgentSettingsPane {
                     )
                     .child(
                         group("").child(div().flex().items_center().gap_3()
-                            .children(self.snapshot["shortcuts"]["validationMessage"].as_str().map(|message|div().min_w(px(0.)).text_xs().text_color(rgb(0xff9f0a)).child(message.to_owned())))
+                            .children(self.snapshot["shortcuts"]["validationMessage"].as_str().map(|message|div().min_w(px(0.)).text_xs().text_color(rgb(0xff9f0a)).child(settings_notice(locale, message))))
                             .child(div().flex_1().min_w(px(0.)))
                             .child(self.command_button(
                             "shortcuts-reset",
@@ -1375,8 +1550,169 @@ impl Render for AgentSettingsPane {
         let content = if self.unity_external && !unity_section_available(&self.snapshot, &self.section) {
             div().px(px(20.)).py(px(16.)).text_size(px(ui::BODY))
                 .text_color(cx.theme().muted_foreground)
-                .child(settings_notice(locale, self.snapshot["unity"]["unavailableMessage"].as_str().unwrap_or("正在读取 Unity 设置能力…")))
+                .child(settings_copy(locale, "加载中…"))
                 .into_any_element()
+        } else if self.unity_external && self.page == 5 && self.section == "视频" {
+            let video = &self.snapshot["video"];
+            let mut videos = SettingsGroup::new(settings_copy(locale, "视频"), cx.theme().border)
+                .child(div().flex().gap_2()
+                    .child(self.command_button("unity-video-choose", "导入视频", json!({"op":"video.choose"}), cx))
+                    .child(Button::new("unity-video-play").small().label(settings_copy(locale, if video["playing"].as_bool()==Some(true) { "暂停" } else { "播放" })).disabled(video["selectedID"].is_null() && video["activeID"].is_null()).on_click(cx.listener(|this,_,_,cx|{this.commands.push(json!({"op":if this.snapshot["video"]["playing"].as_bool()==Some(true) { "video.pause" } else { "video.play" }}));cx.notify();})))
+                    .child(self.command_button("unity-video-stop", "停止", json!({"op":"video.stop"}), cx)));
+            if let Some(title) = video["currentTrackTitle"].as_str() {
+                videos = videos.child(div().text_color(cx.theme().muted_foreground)
+                    .child(format!("{}: {}", settings_copy(locale, "当前歌曲"), title)));
+            }
+            for asset in video["assets"].as_array().into_iter().flatten() {
+                let Some(id) = asset["id"].as_str() else { continue };
+                let selected = video["selectedID"].as_str()==Some(id);
+                let mut row = div().flex().items_center().gap_2()
+                    .child(div().flex_1().child(asset["name"].as_str().unwrap_or(id).to_owned()))
+                    .child(Button::new(format!("unity-video-select-{id}")).small().label(settings_copy(locale, if selected { "使用中" } else { "选择并播放" })).disabled(selected).on_click(cx.listener({let id=id.to_owned();move|this,_,_,cx|{this.commands.push(json!({"op":"video.select","id":id}));cx.notify();}})))
+                    .child(self.remove_menu(format!("unity-video-remove-{id}"), "移出素材库", asset["name"].as_str().unwrap_or(id), json!({"op":"video.remove","id":id}), cx));
+                if let Some(track_id) = video["currentTrackID"].as_str() {
+                    let bound = video["boundAssetID"].as_str() == Some(id);
+                    row = row.child(self.command_button(format!("unity-video-bind-{id}"),
+                        if bound { "解除当前歌曲绑定" } else { "绑定到当前歌曲" },
+                        json!({"op": if bound { "video.unbind" } else { "video.bind" }, "id": id, "trackID": track_id}), cx));
+                }
+                videos = videos.child(row);
+            }
+            if let Some(prompt_id) = video["pendingBoundVideo"]["id"].as_str() {
+                videos = videos.child(div().flex().items_center().gap_2()
+                    .child(div().flex_1().child(settings_copy(locale, "当前歌曲有绑定视频")))
+                    .child(self.command_button("unity-video-bound-play", "播放绑定视频", json!({"op":"video.bound.play","id":prompt_id}), cx))
+                    .child(self.command_button("unity-video-bound-dismiss", "关闭", json!({"op":"video.bound.dismiss","id":prompt_id}), cx)));
+            }
+            let mut modes = div().flex().gap_2();
+            for (id, label) in [("once", "单次"), ("loop", "循环"), ("randomSequence", "随机拼接")] {
+                modes = modes.child(Button::new(format!("unity-video-mode-{id}")).small().label(settings_copy(locale, label)).disabled(video["mode"].as_str()==Some(id)).on_click(cx.listener(move|this,_,_,cx|{this.commands.push(json!({"op":"video.mode","value":id}));cx.notify();})));
+            }
+            videos.child(modes)
+                .child(div().flex().items_center().gap_2().child(settings_copy(locale, "视频亮度")).child(div().flex_1().child(Slider::new(&self.video_brightness))))
+                .into_any_element()
+        } else if self.unity_external && self.page == 6 {
+            let library = &self.snapshot["spaceLibrary"];
+            let working = library["working"].as_bool() == Some(true);
+            let mut spaces = SettingsGroup::new(settings_copy(locale, "我的空间"), cx.theme().border)
+                .child(self.command_button("space-library-refresh", "刷新", json!({"op":"space.library.load"}), cx));
+            for world in library["worlds"].as_array().into_iter().flatten() {
+                let Some(id) = world["id"].as_str() else { continue };
+                let selected = world["selected"].as_bool() == Some(true);
+                let id = id.to_owned();
+                spaces = spaces.child(div().flex().items_center().gap_2()
+                    .child(div().flex_1().text_size(px(ui::BODY)).child(world["name"].as_str().unwrap_or(&id).to_owned()))
+                    .child(Button::new(format!("space-library-{id}")).small().label(settings_copy(locale, if selected { "使用中" } else { "选择" })).disabled(working || selected).on_click(cx.listener(move |this, _, _, cx| {
+                        this.commands.push(json!({"op":"space.library.select","id":id})); cx.notify();
+                    }))));
+            }
+            if let Some(code) = library["noticeCode"].as_str() {
+                spaces = spaces.child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(settings_notice(locale, code)));
+            }
+            for world in library["marbleWorlds"].as_array().into_iter().flatten() {
+                spaces = spaces.child(div().text_size(px(ui::BODY)).child(world["name"].as_str().unwrap_or("").to_owned()));
+            }
+            if let Some(code) = library["marbleNoticeCode"].as_str() {
+                spaces = spaces.child(div().text_size(px(ui::CAPTION)).line_height(px(ui::CAPTION_LINE_HEIGHT)).child(settings_notice(locale, code)));
+            }
+            let configured = self.snapshot["space"]["credentialConfigured"].as_bool() == Some(true);
+            let default_space = SettingsGroup::new(settings_copy(locale, "默认空间"), cx.theme().border)
+                .child(self.dropdown("unity-default-space", "启动时进入", "space", "defaultSpace", self.options("space", "options"), cx))
+                .child(div().text_xs().child(self.snapshot["space"]["options"].as_array().into_iter().flatten()
+                    .find(|value| value["id"] == self.draft["space"]["defaultSpace"])
+                    .and_then(|value| value["detail"].as_str()).unwrap_or("").to_owned()))
+                .child(div().text_xs().child(settings_copy(locale, "修改后下次启动生效。")));
+            let mut credential = SettingsGroup::new(settings_copy(locale, "Marble 空间"), cx.theme().border)
+                .child(div().flex().items_center().justify_between().child("World Labs Marble")
+                    .child(settings_copy(locale, if configured { "已配置" } else { "未配置" })))
+                .child(div().flex().items_center().gap_3().child("API Key")
+                    .child(div().flex_1().min_w(px(0.)).child(Input::new(&self.extra_inputs[2]))))
+                .child(div().flex().items_center().justify_end().gap_2()
+                    .when(configured, |row| row.child(self.command_button("unity-marble-clear", "清除", json!({"op":"space.key.clear"}), cx)))
+                    .child(Button::new("unity-marble-save").primary().label(settings_copy(locale, "保存 Key"))
+                        .disabled(self.extra_inputs[2].read(cx).value().trim().is_empty())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let key = this.extra_inputs[2].read(cx).value().to_string();
+                            this.pending_marble = Some((this.snapshot["space"]["marbleMutationRevision"].as_u64().unwrap_or(0), key.clone()));
+                            this.commands.push(json!({"op":"space.key.save","apiKey":key}));
+                            cx.notify();
+                        }))));
+            if let Some(message) = self.snapshot["space"]["marbleMessage"].as_str() {
+                credential = credential.child(div().text_xs().text_color(
+                    if self.snapshot["space"]["marbleHasError"].as_bool() == Some(true) { cx.theme().danger } else { cx.theme().muted_foreground })
+                    .child(message.to_owned()));
+            }
+            let supported = library["generationSupported"].as_bool() == Some(true);
+            let marble_working = library["marbleWorking"].as_bool() == Some(true);
+            let pending = library["marbleOperationID"].as_str().filter(|id| !id.is_empty());
+            let mut marble = SettingsGroup::new(settings_copy(locale, "生成与导入空间"), cx.theme().border)
+                .child(div().text_xs().text_color(cx.theme().muted_foreground)
+                    .child(settings_copy(locale, "生成会调用付费 Marble API；仅点击生成按钮时提交。")));
+            if !supported {
+                marble = marble.child(div().text_xs().child(settings_copy(locale, "当前运行时不支持 Marble 空间生成与导入。")));
+            }
+            if let Some(id) = pending {
+                marble = marble.child(div().text_xs().child(format!("{}: {id}", settings_copy(locale, "生成任务 ID"))))
+                    .child(div().text_xs().child(settings_copy(locale, "已有生成回执，请恢复原任务；不会重复提交付费生成。")));
+            }
+            for preset in library["marblePresets"].as_array().into_iter().flatten() {
+                let Some(id) = preset["id"].as_str() else { continue };
+                let enabled = configured && marble_command(library, "space.marble.generate", id).is_some();
+                let id = id.to_owned();
+                marble = marble.child(div().flex().items_center().gap_2()
+                    .child(div().flex_1().child(preset["name"].as_str().unwrap_or(&id).to_owned()))
+                    .child(Button::new(format!("unity-marble-generate-{id}")).small()
+                        .label(settings_copy(locale, "生成（付费）")).disabled(!enabled)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(command) = marble_command(&this.snapshot["spaceLibrary"], "space.marble.generate", &id) {
+                                this.commands.push(command); cx.notify();
+                            }
+                        }))));
+            }
+            marble = marble.child(div().flex().items_center().gap_2()
+                .child(div().flex_1().min_w(px(0.)).child(Input::new(&self.extra_inputs[7])))
+                .child(Button::new("unity-marble-import").label(settings_copy(locale, "按 World ID 导入"))
+                    .disabled(!configured || marble_command(library, "space.marble.import", self.extra_inputs[7].read(cx).value().as_str()).is_none())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let id = this.extra_inputs[7].read(cx).value().to_string();
+                        if let Some(command) = marble_command(&this.snapshot["spaceLibrary"], "space.marble.import", &id) {
+                            this.commands.push(command); cx.notify();
+                        }
+                    }))));
+            let mut controls = div().flex().gap_2();
+            if pending.is_some() {
+                controls = controls.child(Button::new("unity-marble-resume").label(settings_copy(locale, "恢复原任务"))
+                    .disabled(!configured || marble_command(library, "space.marble.resume", "").is_none())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(command) = marble_command(&this.snapshot["spaceLibrary"], "space.marble.resume", "") {
+                            this.commands.push(command); cx.notify();
+                        }
+                    })));
+            }
+            if marble_working {
+                controls = controls.child(Button::new("unity-marble-cancel").label(settings_copy(locale, "取消本机等待"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(command) = marble_command(&this.snapshot["spaceLibrary"], "space.marble.cancel", "") {
+                            this.commands.push(command); cx.notify();
+                        }
+                    })));
+                marble = marble.child(div().text_xs().child(settings_copy(locale, "取消仅停止本机等待，远端生成可能继续并计费。")));
+            }
+            marble = marble.child(controls);
+            let phase = marble_phase_label(library["marblePhase"].as_str().unwrap_or(""));
+            if !phase.is_empty() {
+                marble = marble.child(div().text_xs().child(settings_copy(locale, phase)));
+            }
+            if let Some(progress) = library["marbleProgress"].as_f64().filter(|value| value.is_finite()) {
+                marble = marble.child(div().text_xs().child(format!("{}: {:.0}%", settings_copy(locale, "生成进度"), progress.clamp(0., 100.))));
+            }
+            if let Some(id) = library["marbleWorldID"].as_str().filter(|id| !id.is_empty()) {
+                marble = marble.child(div().text_xs().child(format!("World ID: {id}")));
+            }
+            if let Some(error) = library["marbleError"].as_str().filter(|error| !error.is_empty()) {
+                marble = marble.child(div().text_xs().text_color(cx.theme().danger).child(error.to_owned()));
+            }
+            div().flex().flex_col().gap_4().child(default_space).child(credential).child(marble).child(spaces).into_any_element()
         } else if self.page>=5 {
             self.stage_pane.as_ref().map(|pane| {
                 let mut content=div().flex().flex_col().gap_4().child(div().h(px(380.)).child(pane.clone()));
@@ -1516,7 +1852,16 @@ impl Render for AgentSettingsPane {
                     }
                     menu
                 }));
-        div().size_full().flex().bg(cx.theme().background).text_color(cx.theme().foreground)
+        div().id("settings-root").size_full().flex().bg(cx.theme().background).text_color(cx.theme().foreground)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if this.snapshot["shortcuts"]["recordingID"].as_str().is_none() { return; }
+                let modifiers = event.keystroke.modifiers;
+                let flags = u64::from(modifiers.platform) | (u64::from(modifiers.alt)<<1)
+                    | (u64::from(modifiers.control)<<2) | (u64::from(modifiers.shift)<<3);
+                if let Some(command) = shortcut_capture_command(&event.keystroke.key, flags) {
+                    this.commands.push(command); cx.stop_propagation(); cx.notify();
+                }
+            }))
             .child(Sidebar::new("settings-sidebar").w(px(200.)).header(language).child(menu))
             .child(div().flex_1().min_w(px(0.)).h_full().child(root))
     }
@@ -1526,6 +1871,39 @@ impl Render for AgentSettingsPane {
 mod settings_display_tests {
     use super::{avatar_detail, motion_format, tts_draft_change_requires_stop,save_ack_clear,presence_more_accessibility,music_sync_command};
     use serde_json::json;
+    #[test]
+    fn marble_commands_require_runtime_and_preserve_paid_receipts() {
+        let ready = json!({"generationSupported":true,"marbleWorking":false,"marblePresets":[{"id":"room","name":"Room"}]});
+        assert_eq!(super::marble_command(&ready, "space.marble.generate", "room"), Some(json!({"op":"space.marble.generate","presetID":"room"})));
+        assert_eq!(super::marble_command(&ready, "space.marble.import", " world-1 "), Some(json!({"op":"space.marble.import","worldID":"world-1"})));
+        assert!(super::marble_command(&ready, "space.marble.generate", "unknown").is_none());
+        assert!(super::marble_command(&ready, "space.marble.import", " ").is_none());
+        assert!(super::marble_command(&ready, "space.marble.resume", "").is_none());
+        let mut unsupported = ready.clone(); unsupported["generationSupported"] = json!(false);
+        assert!(super::marble_command(&unsupported, "space.marble.generate", "room").is_none());
+        assert!(super::marble_command(&unsupported, "space.marble.import", "world-1").is_none());
+        let mut pending = ready.clone(); pending["marbleOperationID"] = json!("operation-1");
+        assert!(super::marble_command(&pending, "space.marble.generate", "room").is_none());
+        assert!(super::marble_command(&pending, "space.marble.import", "world-2").is_none());
+        assert_eq!(super::marble_command(&pending, "space.marble.resume", ""), Some(json!({"op":"space.marble.resume"})));
+        pending["marbleWorking"] = json!(true);
+        assert!(super::marble_command(&pending, "space.marble.resume", "").is_none());
+        assert_eq!(super::marble_command(&pending, "space.marble.cancel", ""), Some(json!({"op":"space.marble.cancel"})));
+        pending["generationSupported"] = json!(false);
+        assert!(super::marble_command(&pending, "space.marble.generate", "room").is_none());
+        assert_eq!(super::marble_command(&pending, "space.marble.cancel", ""), Some(json!({"op":"space.marble.cancel"})));
+        pending["marbleWorking"] = json!(false);
+        assert!(super::marble_command(&pending, "space.marble.resume", "").is_none());
+        assert!(super::marble_command(&pending, "space.marble.import", "world-2").is_none());
+    }
+    #[test]
+    fn shortcut_capture_preserves_native_codes_and_modifiers() {
+        assert_eq!(super::shortcut_capture_command("space", 1), Some(json!({"op":"shortcuts.capture","keyCode":49,"keyLabel":"Space","modifiers":1})));
+        assert_eq!(super::shortcut_capture_command("K", 9).unwrap()["keyCode"], 40);
+        assert_eq!(super::shortcut_capture_command("right", 7).unwrap()["modifiers"], 7);
+        assert_eq!(super::shortcut_capture_command("escape", 0), Some(json!({"op":"shortcuts.cancel"})));
+        assert!(super::shortcut_capture_command("unsupported-key", 0).is_none());
+    }
     #[test]
     fn built_in_character_detail_matches_original_display() {
         assert_eq!(

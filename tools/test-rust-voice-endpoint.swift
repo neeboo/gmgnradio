@@ -38,20 +38,43 @@ print("PASS: Rust-owned model picker wiring with two negative controls")
 // This harness exercises TTS and endpoint validation only. It never starts ASR,
 // recording, an audio device, or the application.
 let fixture = #"""
-import socket,threading,json,os,sys,uuid
+import threading,json,os,sys,uuid
+from http.server import ThreadingHTTPServer,BaseHTTPRequestHandler
 path,marker=sys.argv[1:];token=str(uuid.uuid4());connections=0
-server=socket.socket(socket.AF_INET,socket.SOCK_STREAM);server.bind(('127.0.0.1',0));server.listen()
-with open(path,'w') as f:json.dump({'version':1,'address':'127.0.0.1:'+str(server.getsockname()[1]),'token':token},f)
-os.chmod(path,0o600)
 with open(marker,'w') as f:f.write('0')
-def serve(c):
- try:
-  for line in c.makefile('rb'):
-   q=json.loads(line)
-   assert q.get('auth')==token
+class Handler(BaseHTTPRequestHandler):
+ protocol_version='HTTP/1.1'
+ def log_message(self,*args):pass
+ def do_GET(self):
+  assert self.path=='/health' and self.headers.get('Authorization')=='Bearer '+token
+  raw=json.dumps({'version':2,'transport':'http'}).encode()
+  self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
+ def do_POST(self):
+  global connections
+  connections+=1
+  with open(marker,'w') as f:f.write(str(connections))
+  q=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+  assert self.headers.get('Authorization')=='Bearer '+token and 'auth' not in q
+  key=q['params'].get('apiKey')
+  if key=='http-status':
+   raw=json.dumps({'error':{'code':'http_fixture_rejected','message':'never expose provider detail'}}).encode()
+   self.send_response(403);self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw);return
+  if key=='wrong-media':
+   self.send_response(200);self.send_header('Content-Type','text/plain');self.send_header('Connection','close');self.end_headers();return
+  if key=='oversize-event':
+   self.send_response(200);self.send_header('Content-Type','text/event-stream');self.send_header('Connection','close');self.end_headers()
+   self.wfile.write(b'data: '+b'x'*262145+b'\n\n');self.wfile.flush();return
+  if self.path=='/events':
+   self.send_response(200);self.send_header('Content-Type','text/event-stream');self.send_header('Connection','close');self.end_headers()
+  def send(o):
+   raw=json.dumps(o).encode()
+   if self.path=='/events':self.wfile.write(b'data: '+raw+b'\n\n');self.wfile.flush()
+   else:
+    self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
+  for q in [q]:
    if q['method']=='voice_capabilities':
     caps={'version':1,'providers':[{'id':'fish','ttsModels':[{'id':'s2.1-pro-free','name':'S2.1 Pro · 免费'},{'id':'s2-pro','name':'S2 Pro · 付费'}],'asrModels':[],'defaultTTSModel':'s2.1-pro-free','defaultASRModel':None}]}
-    c.sendall((json.dumps({'id':q['id'],'result':caps})+'\n').encode());continue
+    send({'id':q['id'],'result':caps});continue
    if q['method']=='voice_list':
     p=q['params'];key=p['apiKey'];voices=[{'id':'v1','name':'自然女声'},{'id':'v2','name':'清晰男声'}]
     provider=p['provider']
@@ -61,7 +84,7 @@ def serve(c):
     if key=='too-many':voices=[{'id':str(i),'name':'声线'} for i in range(201)]
     reply={'id':q['id'],'result':{'provider':provider,'voices':voices}}
     if key=='provider-failure':reply={'id':q['id'],'error':{'code':'voice_provider_error'}}
-    c.sendall((json.dumps(reply)+'\n').encode());continue
+    send(reply);continue
    assert q['method']=='voice_tts_start'
    if q['params'].get('text','').startswith('custom-'):
     assert q['params']['voiceID']=='custom_voice_id'
@@ -69,13 +92,11 @@ def serve(c):
     assert q['params']['model'] in ['qwen3-tts-vc-realtime-2026-01-15','eleven_flash_v2_5','s2.1-pro-free']
    sid=q['params']['sessionID']
    for reply in [{'id':q['id'],'result':{'started':True,'sessionID':sid}}, {'voice_event':{'sessionID':sid,'type':'finished'}}]:
-    c.sendall((json.dumps(reply)+'\n').encode())
- except (OSError,ValueError):pass
- finally:c.close()
-while True:
- c,_=server.accept();connections+=1
- with open(marker,'w') as f:f.write(str(connections))
- threading.Thread(target=serve,args=(c,),daemon=True).start()
+    send(reply)
+
+server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
+with open(path,'w') as f:json.dump({'version':2,'address':'127.0.0.1:'+str(server.server_port),'token':token},f)
+os.chmod(path,0o600);server.serve_forever()
 """#
 let program = #"""
 import Foundation
@@ -107,8 +128,14 @@ import Foundation
   catch RustVoiceError.rejected {check(true,"provider failure surfaced without remote error text")}
   let capabilities=try await valid.capabilities()
   check(capabilities.providers[0].defaultTTSModel=="s2.1-pro-free" && capabilities.providers[0].ttsModels.count==2,"models and default read from authenticated Rust metadata RPC without API key")
+  do {_ = try await valid.startTTS(text:"reject",configuration:.init(apiKey:"http-status"));fatalError("HTTP failure accepted")}
+  catch RustVoiceError.rejected(let code) {check(code=="http_fixture_rejected","HTTP error preserves safe code only")}
+  for key in ["wrong-media","oversize-event"] {
+   do {_ = try await valid.startTTS(text:"reject",configuration:.init(apiKey:key));fatalError("invalid SSE accepted")}
+   catch RustVoiceError.invalidFrame {check(true,"SSE MIME and bounded event validation")}
+  }
   let initial=try String(contentsOf:marker,encoding:.utf8)
-  check(initial=="11","four TTS and six catalog plus model metadata requests connect independently")
+  check(initial=="14","four TTS and six catalog plus metadata and three HTTP failures connect independently")
   let link=root.appendingPathComponent("linked.endpoint.json")
   try manager.createSymbolicLink(at:link,withDestinationURL:endpoint)
   let large=root.appendingPathComponent("large.endpoint.json")
@@ -120,7 +147,11 @@ import Foundation
   try manager.setAttributes([.posixPermissions:0o644],ofItemAtPath:publicFile.path)
   let directory=root.appendingPathComponent("directory.endpoint.json",isDirectory:true)
   try manager.createDirectory(at:directory,withIntermediateDirectories:false,attributes:[.posixPermissions:0o700])
-  for unsafe in [link,large,publicFile,directory] {
+  let oldEndpoint=root.appendingPathComponent("v1.endpoint.json")
+  var old=try JSONSerialization.jsonObject(with:original) as! [String:Any];old["version"]=1
+  try JSONSerialization.data(withJSONObject:old).write(to:oldEndpoint)
+  try manager.setAttributes([.posixPermissions:0o600],ofItemAtPath:oldEndpoint.path)
+  for unsafe in [link,large,publicFile,directory,oldEndpoint] {
    let client=RustVoiceClient(root:root,endpointURL:unsafe,allowsLaunching:false)
    do {_ = try await client.startTTS(text:"reject",configuration:.init(apiKey:"must-never-be-sent"));fatalError("unsafe endpoint accepted")}
    catch RustVoiceError.invalidFrame {check(true,"unsafe endpoint rejected before transport")}
@@ -138,7 +169,7 @@ defer {try? FileManager.default.removeItem(at:scratch)}
 let driver=scratch.appendingPathComponent("main.swift"),binary=scratch.appendingPathComponent("checks"),endpoint=scratch.appendingPathComponent("taskd.endpoint.json"),marker=scratch.appendingPathComponent("connections")
 try program.write(to:driver,atomically:true,encoding:.utf8)
 let build=Process();build.executableURL=URL(fileURLWithPath:"/usr/bin/env")
-build.arguments=["swiftc","-swift-version","6","-parse-as-library","apps/macos/Sources/GMGNRadio/Agent/RustVoiceClient.swift",driver.path,"-o",binary.path]
+build.arguments=["swiftc","-swift-version","6","-parse-as-library","apps/macos/Sources/GMGNRadio/Presence/TaskdHTTPTransport.swift","apps/macos/Sources/GMGNRadio/Agent/RustVoiceClient.swift",driver.path,"-o",binary.path]
 try build.run();build.waitUntilExit();guard build.terminationStatus==0 else {exit(build.terminationStatus)}
 let server=Process();server.executableURL=URL(fileURLWithPath:"/usr/bin/python3");server.arguments=["-u","-c",fixture,endpoint.path,marker.path]
 server.standardOutput=FileHandle.nullDevice

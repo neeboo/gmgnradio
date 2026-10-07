@@ -1,8 +1,10 @@
 using System;
+using System.Collections.Generic;
 using UnityEditor;
 using UnityEditor.Build;
 using UnityEditor.Build.Reporting;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace GMGN.UnityPlayer.World.Editor
 {
@@ -57,8 +59,54 @@ namespace GMGN.UnityPlayer.World.Editor
                 EditorUtility.SetDirty(material);
             }
             AssetDatabase.SaveAssets();
+#if GMGN_UNIVRM
+            RetainVrmShaders(folder);
+#endif
             Debug.Log("[WorldShaderBuild] Retained official glTFast shader graphs and opaque occlusion/emission variants.");
         }
+#if GMGN_UNIVRM
+        static void RetainVrmShaders(string folder)
+        {
+            var mtoon = Shader.Find("VRM10/Universal Render Pipeline/MToon10");
+            var pbr = Shader.Find("Universal Render Pipeline/Lit");
+            var uniUnlit = Shader.Find("UniGLTF/UniUnlit");
+            if (mtoon == null || pbr == null || uniUnlit == null)
+                throw new BuildFailedException("Official UniVRM runtime material shaders are missing.");
+            var path = folder + "/VrmRuntimeVariants.shadervariants";
+            var variants = AssetDatabase.LoadAssetAtPath<ShaderVariantCollection>(path);
+            if (variants == null) { variants = new ShaderVariantCollection(); AssetDatabase.CreateAsset(variants,path); }
+            variants.Clear();
+            var alphaKeywords = new[] { "", "_ALPHATEST_ON", "_ALPHABLEND_ON" };
+            var outlineKeywords = new[] { "", "_MTOON_OUTLINE_WORLD", "_MTOON_OUTLINE_SCREEN" };
+            var featureKeywords = new[] { "_NORMALMAP", "_MTOON_EMISSIVEMAP", "_MTOON_RIMMAP", "_MTOON_PARAMETERMAP" };
+            foreach (var alpha in alphaKeywords)
+                foreach (var outline in outlineKeywords)
+                    for (var features=0; features<16; features++) {
+                        var keywords=new List<string>();
+                        if(alpha.Length!=0) keywords.Add(alpha);
+                        if(outline.Length!=0) keywords.Add(outline);
+                        for(var bit=0;bit<4;bit++)if((features&(1<<bit))!=0)keywords.Add(featureKeywords[bit]);
+                        variants.Add(new ShaderVariantCollection.ShaderVariant(mtoon,PassType.ScriptableRenderPipeline,keywords.ToArray()));
+                    }
+            for(var alpha=0;alpha<3;alpha++)for(var features=0;features<8;features++) {
+                var keywords=new List<string>();
+                if(alpha==1)keywords.Add("_ALPHATEST_ON");
+                if(alpha==2)keywords.Add("_SURFACE_TYPE_TRANSPARENT");
+                if((features&1)!=0)keywords.Add("_NORMALMAP");
+                if((features&2)!=0)keywords.Add("_EMISSION");
+                if((features&4)!=0)keywords.Add("_METALLICSPECGLOSSMAP");
+                variants.Add(new ShaderVariantCollection.ShaderVariant(pbr,PassType.ScriptableRenderPipeline,keywords.ToArray()));
+            }
+            foreach(var shader in new[]{mtoon,pbr,uniUnlit}) {
+                var materialPath=folder+"/VrmRetention-"+(shader==mtoon?"MToon10":shader==pbr?"Pbr":"UniUnlit")+".mat";
+                var material=AssetDatabase.LoadAssetAtPath<Material>(materialPath);
+                if(material==null){material=new Material(shader);AssetDatabase.CreateAsset(material,materialPath);}
+                material.shader=shader;EditorUtility.SetDirty(material);
+            }
+            EditorUtility.SetDirty(variants);AssetDatabase.SaveAssets();
+            Debug.Log("[WorldShaderBuild] Retained UniVRM URP MToon10 alpha/outline/map variants and PBR/UniUnlit shaders.");
+        }
+#endif
         static void EnsureFolder(string parent, string name)
         { if (!AssetDatabase.IsValidFolder(parent + "/" + name)) AssetDatabase.CreateFolder(parent, name); }
     }

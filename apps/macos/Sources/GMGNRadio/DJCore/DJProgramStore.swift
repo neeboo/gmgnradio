@@ -96,87 +96,36 @@ enum DJProgramEditor {
 
 @MainActor
 final class DJProgramArchive {
-    private struct Storage: Codable {
-        var version = 1
-        var programs: [SavedDJProgram] = []
-    }
-
-    private let fileURL: URL
-    private let capacity: Int
-    private let fileManager: FileManager
-
-    init(
-        fileURL: URL,
-        capacity: Int = 20,
-        fileManager: FileManager = .default
-    ) {
-        self.fileURL = fileURL
-        self.capacity = max(1, capacity)
-        self.fileManager = fileManager
-    }
+    private let storage: MusicStorageClient
 
     static func live() -> DJProgramArchive {
-        let applicationSupport = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first ?? FileManager.default.temporaryDirectory
-        return DJProgramArchive(
-            fileURL: applicationSupport
-                .appendingPathComponent("ai.gmgn.radio", isDirectory: true)
-                .appendingPathComponent("programs.json")
-        )
+        DJProgramArchive(storage: .shared)
+    }
+
+    init(storage: MusicStorageClient) {
+        self.storage = storage
     }
 
     func save(
         plan: ProgramPlan,
         activeSlotIndex: Int?,
-        updatedAt: Date = Date()
-    ) throws {
-        var storage = try readStorage()
-        storage.programs.removeAll {
-            $0.plan.brief.id == plan.brief.id
-        }
-        storage.programs.append(
-            SavedDJProgram(
-                plan: plan,
-                activeSlotIndex: activeSlotIndex,
-                updatedAt: updatedAt
-            )
-        )
-        storage.programs.sort { $0.updatedAt > $1.updatedAt }
-        storage.programs = Array(storage.programs.prefix(capacity))
-        try write(storage)
+        updatedAt: Date = Date(),
+        pending: Bool = false
+    ) async throws {
+        try await storage.save(SavedDJProgram(plan: plan, activeSlotIndex: activeSlotIndex, updatedAt: updatedAt), pending: pending)
     }
 
-    func latest() throws -> SavedDJProgram? {
-        try recent().first
+    func latest() async throws -> SavedDJProgram? {
+        try await recent().first
     }
 
-    func recent() throws -> [SavedDJProgram] {
-        try readStorage().programs.sorted { $0.updatedAt > $1.updatedAt }
+    func recent() async throws -> [SavedDJProgram] {
+        try await snapshot().programs
     }
 
-    private func readStorage() throws -> Storage {
-        guard fileManager.fileExists(atPath: fileURL.path) else {
-            return Storage()
-        }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return try decoder.decode(
-            Storage.self,
-            from: Data(contentsOf: fileURL)
-        )
-    }
-
-    private func write(_ storage: Storage) throws {
-        try fileManager.createDirectory(
-            at: fileURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.sortedKeys]
-        try encoder.encode(storage).write(to: fileURL, options: .atomic)
+    func snapshot() async throws -> MusicStorageClient.Programs {
+        let snapshot = try await storage.programs()
+        return .init(programs: snapshot.programs.sorted { $0.updatedAt > $1.updatedAt }, pendingIDs: snapshot.pendingIDs)
     }
 }
 
@@ -191,6 +140,9 @@ final class DJProgramStore {
     private(set) var activeSlotIndex: Int?
     private(set) var recentPrograms: [SavedDJProgram] = []
     private let archive: DJProgramArchive?
+    private var persistence: Task<Void, Error>?
+    private(set) var isLoaded = false
+    private var pendingIDs = Set<String>()
 
     init(archive: DJProgramArchive? = nil) {
         self.archive = archive
@@ -233,6 +185,7 @@ final class DJProgramStore {
             $0.plan.brief.id == plan.brief.id
         }
         recentPrograms.insert(saved, at: 0)
+        enqueue(saved, pending: true)
     }
 
     @discardableResult
@@ -267,9 +220,10 @@ final class DJProgramStore {
         return saved.plan
     }
 
-    func restoreLatest() {
-        refreshRecentPrograms()
-        guard let saved = recentPrograms.first else {
+    func restoreLatest() async {
+        do { try await refreshRecentPrograms() }
+        catch { fail("节目存储读取失败：\(error.localizedDescription)"); return }
+        guard let saved = recentPrograms.first(where: { !pendingIDs.contains($0.plan.brief.id) }) else {
             return
         }
         plan = saved.plan
@@ -301,32 +255,37 @@ final class DJProgramStore {
             $0.plan.brief.id == plan.brief.id
         }
         recentPrograms.insert(saved, at: 0)
-        guard let archive else {
+        guard archive != nil else {
             return
         }
-        try? archive.save(
-            plan: saved.plan,
-            activeSlotIndex: saved.activeSlotIndex,
-            updatedAt: saved.updatedAt
-        )
-        refreshRecentPrograms()
+        enqueue(saved, pending: false)
     }
 
-    private func refreshRecentPrograms() {
-        guard let archive, let saved = try? archive.recent() else {
-            return
-        }
-        if let pendingPlan {
-            let draft = SavedDJProgram(
-                plan: pendingPlan,
-                activeSlotIndex: nil,
-                updatedAt: pendingPlan.generatedAt
-            )
-            recentPrograms = [draft] + saved.filter {
-                $0.plan.brief.id != pendingPlan.brief.id
+    func refreshRecentPrograms() async throws {
+        do { try await flush() } catch { persistence = nil }
+        guard let archive else { isLoaded = true; return }
+        let snapshot = try await archive.snapshot()
+        recentPrograms = snapshot.programs
+        pendingIDs = Set(snapshot.pendingIDs)
+        pendingPlan = snapshot.programs.first { snapshot.pendingIDs.contains($0.plan.brief.id) }?.plan
+        isLoaded = true
+    }
+
+    func flush() async throws { try await persistence?.value }
+
+    private func enqueue(_ saved: SavedDJProgram, pending: Bool) {
+        guard let archive else { return }
+        let previous = persistence
+        persistence = Task { [weak self] in
+            // A failed prior write remains visible but does not prevent retrying newer state.
+            do { try await previous?.value } catch { }
+            do {
+                try await archive.save(plan: saved.plan, activeSlotIndex: saved.activeSlotIndex,
+                                       updatedAt: saved.updatedAt, pending: pending)
+            } catch {
+                self?.fail("节目保存失败：\(error.localizedDescription)")
+                throw error
             }
-        } else {
-            recentPrograms = saved
         }
     }
 }

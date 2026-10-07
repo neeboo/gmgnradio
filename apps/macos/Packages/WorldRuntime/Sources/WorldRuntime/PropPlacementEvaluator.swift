@@ -9,19 +9,24 @@ import Foundation
 public struct WorldPlanarFootprint: Equatable, Sendable {
     public let size: SIMD2<Float>
     public let yaw: Float
+    /// Offset from the grid-anchored center, for validating an existing world pose
+    /// without silently snapping the object to a different location.
+    public let centerOffset: SIMD2<Float>
 
     /// 单次 footprint 允许覆盖的格子数上限（防御病态输入；超出即视为不成立）。
     public static let maximumColumnCount = 4096
     /// 相切是否算相交的容差：小于这个重叠量按"分开"处理，避免浮点误差制造假重叠。
     static let overlapTolerance: Float = 0.0001
 
-    public init(size: SIMD2<Float>, yaw: Float = 0) {
+    public init(size: SIMD2<Float>, yaw: Float = 0, centerOffset: SIMD2<Float> = .zero) {
         self.size = size
         self.yaw = yaw
+        self.centerOffset = centerOffset
     }
 
     public var isValid: Bool {
         size.x.isFinite && size.y.isFinite && size.x > 0 && size.y > 0 && yaw.isFinite
+            && centerOffset.x.isFinite && centerOffset.y.isFinite
     }
 
     /// footprint 在 yaw 下的轴对齐包围半径（x / z 方向）。
@@ -46,7 +51,7 @@ public struct WorldPlanarFootprint: Equatable, Sendable {
         let localX = size.x / 2
         let localZ = size.y / 2
         // 本地 → 世界：与 `WorldPropMeshClearance.canPlace` 的 local() 互逆。
-        return anchor + SIMD2(
+        return anchor + centerOffset + SIMD2(
             cosine * localX + sine * localZ,
             -sine * localX + cosine * localZ
         )
@@ -144,7 +149,7 @@ extension PropSupportBlockReason: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .outsideBounds: "这里超出了可摆放的范围。"
-        case .noSupport: "这里没有承托面，或者整块占地的高度不一致。"
+        case .noSupport: "这里缺少连续地面，或支撑位置不足以托住物件。"
         case .blockedByMesh: "这里会插进墙或家具。"
         case let .blockedByBlockingVolume(id): "这里会碰到 \(id)。"
         case let .blockedByPlacedProp(id): "这里会和已经放好的 \(id) 重叠。"
@@ -166,10 +171,61 @@ extension PropSupportBlockReason: LocalizedError {
 ///
 /// **性能**：`canPlace` 是 O(传入三角形数)，所以这里先用 `triangles(in:)` 按 footprint 的
 /// 包围范围取局部三角形再调用，绝不把全量三角形（真实房间 161,600 个）传进去。
-/// footprint 跨列时是"整块判定"：每一列都必须有同一层承托面，任一处失败就返回对应原因。
+/// footprint 跨列时检查连续承托层与稳定支撑区域，允许家具跨接小凹处。
 public enum PropPlacementEvaluator {
-    /// 同一个 footprint 覆盖的各列，承托高度允许的最大差值（米）。
-    /// 超过它说明这块地不平（例如一半在桌面、一半在地面），物件会悬空或陷进去。
+    /// A complete floor may dip below the resting plane without an adjacent-height
+    /// limit. The near-plane contact polygon must still strictly contain the center.
+    public static func resolvedSupportHeight(
+        footprint: WorldPlanarFootprint,
+        at anchor: PropSupportLayerRef,
+        grid: PropSupportGrid,
+        supportHeightDeviation: Float = maximumSupportHeightDeviation
+    ) -> Float? {
+        guard supportHeightDeviation.isFinite, supportHeightDeviation >= 0 else { return nil }
+        let columns = footprint.columns(anchoredAt: anchor.column, spacing: grid.spacing)
+        guard !columns.isEmpty else { return nil }
+        var heights: [PropSupportColumn: Float] = [:]
+        for column in columns {
+            guard grid.contains(column),
+                  let layer = grid.layers(at: column).first(where: { $0.layer == anchor.layer.layer }),
+                  layer.supportHeight.isFinite else { return nil }
+            heights[column] = layer.supportHeight
+        }
+        guard let plane = heights.values.max() else { return nil }
+        var points: [SIMD2<Float>] = []
+        for (column, height) in heights where height >= plane - supportHeightDeviation - 0.0001 {
+            let corner = column.worldPosition(spacing: grid.spacing)
+            points += [corner, corner + SIMD2(grid.spacing, 0),
+                       corner + SIMD2(0, grid.spacing), corner + SIMD2(grid.spacing, grid.spacing)]
+        }
+        points.sort { $0.x == $1.x ? $0.y < $1.y : $0.x < $1.x }
+        var unique: [SIMD2<Float>] = []
+        for point in points where unique.last != point { unique.append(point) }
+        func cross(_ a: SIMD2<Float>, _ b: SIMD2<Float>, _ c: SIMD2<Float>) -> Float {
+            let ab = b - a, ac = c - a
+            return ab.x * ac.y - ab.y * ac.x
+        }
+        func halfHull(_ values: [SIMD2<Float>]) -> [SIMD2<Float>] {
+            var hull: [SIMD2<Float>] = []
+            for point in values {
+                while hull.count >= 2 && cross(hull[hull.count - 2], hull[hull.count - 1], point) <= 0 {
+                    hull.removeLast()
+                }
+                hull.append(point)
+            }
+            return hull
+        }
+        let lower = halfHull(unique), upper = halfHull(unique.reversed())
+        let hull = Array(lower.dropLast()) + Array(upper.dropLast())
+        guard hull.count >= 3 else { return nil }
+        let center = footprint.center(anchoredAt: anchor.column, spacing: grid.spacing)
+        for i in hull.indices where cross(hull[i], hull[(i + 1) % hull.count], center) <= 0.0001 {
+            return nil
+        }
+        return plane
+    }
+    /// 最高平面附近的接触带宽（米），仅用于稳定接触区域。
+    /// 保留既有参数名以兼容调用方；不限制相邻地面列高差。
     public static let maximumSupportHeightDeviation: Float = 0.02
 
     /// 局部三角形范围查询的外扩余量（米）：`canPlace` 自己会做精确的 AABB 与 SAT 判定，
@@ -210,18 +266,13 @@ public enum PropPlacementEvaluator {
         )
         guard !columns.isEmpty else { return .insufficientClearance }
 
-        // 1. 整块占地都要有"同一层"的承托面，且高度一致（§5.2 整块一起变绿/红）。
         for column in columns {
             guard grid.contains(column) else { return .outsideBounds }
-            guard let layer = grid.layers(at: column).first(where: {
-                $0.layer == anchor.layer.layer
-            }),
-                abs(layer.supportHeight - anchor.layer.supportHeight)
-                    <= supportHeightDeviation
-            else {
-                return .noSupport
-            }
         }
+        guard let plane = resolvedSupportHeight(footprint: footprint, at: anchor, grid: grid,
+            supportHeightDeviation: supportHeightDeviation),
+            anchor.layer.supportHeight.isFinite,
+            abs(plane - anchor.layer.supportHeight) <= 0.0001 else { return .noSupport }
 
         let supportHeight = anchor.layer.supportHeight
         let box = placementVolume(

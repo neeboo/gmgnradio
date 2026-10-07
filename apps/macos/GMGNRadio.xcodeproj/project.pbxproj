@@ -105,6 +105,7 @@
 		49C04625C4FC1B15B33833CE /* ProgramPlannerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 091F9A1DA278A0DA5C8E4A4E /* ProgramPlannerTests.swift */; };
 		49C7B5D35F11343E00DC2941 /* VRMMetalKit in Frameworks */ = {isa = PBXBuildFile; productRef = F7717EA97B3663C2EB2BA124 /* VRMMetalKit */; };
 		49CF26C41737F0892F222A5D /* PropTaskDaemonClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC7A4B6E567E74C7977C92ED /* PropTaskDaemonClient.swift */; };
+		E6AA91460EA1144400000003 /* TaskdHTTPTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6AA91460EA1144400000004 /* TaskdHTTPTransport.swift */; };
 		4A028323AC8B8CC8BC49939F /* OrbUniformTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4C1A38CFE1FE5149D76CC08 /* OrbUniformTests.swift */; };
 		4AAB471D551D8A088912E7A4 /* QQMusicProviderClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 63B9090B88216BD89FF23432 /* QQMusicProviderClient.swift */; };
 		4BDE6D37F193BB73180033BB /* MusicLibraryAgentService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C97C78D7E28F17F0C5C3362B /* MusicLibraryAgentService.swift */; };
@@ -175,6 +176,7 @@
 		8165062A44C13B7D0CC9C197 /* AgentConversationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4800268796D4A3A5E20CB6F8 /* AgentConversationService.swift */; };
 		81914E27C318E7EA8BFA390B /* MusicProviderWebLoginController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E8EACB41344613111F39DD0 /* MusicProviderWebLoginController.swift */; };
 		82499DDB42EA6A9343435C01 /* NativeLinkPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4841A1C9777A9C01E1242759 /* NativeLinkPlayer.swift */; };
+		E6AA91460EA1144400000005 /* ScreenMediaCacheClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6AA91460EA1144400000006 /* ScreenMediaCacheClient.swift */; };
 		8352C05514134BE9053C4B73 /* ResidentImageAttachment.swift in Sources */ = {isa = PBXBuildFile; fileRef = C12A593D2E39AA38BDE94F2C /* ResidentImageAttachment.swift */; };
 		8573E115B6C4C7AB8C10C1B8 /* ElevenLabsSDKConversationTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0F3CB58D63948E17D4EC76C /* ElevenLabsSDKConversationTransport.swift */; };
 		85AA0A77C6D0654E55BB05CE /* WishMachineScene.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5059330FDA14A7DEE4D57E5 /* WishMachineScene.swift */; };
@@ -235,6 +237,7 @@
 		AC9B9EFB9BD89EE723266DA5 /* ElevenLabsRealtimeSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E442A4484F6338F0288177A4 /* ElevenLabsRealtimeSessionTests.swift */; };
 		AD473CDA80FF3D2D2D266FC6 /* RealtimeDJSessionController.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB1A15690B115ECC57F64F9E /* RealtimeDJSessionController.swift */; };
 		ADBCA5536133900F3591140C /* AudioGraphController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0731ECA7F42B473582325F9B /* AudioGraphController.swift */; };
+		CCD710573D034A6BB203DC2F /* MicrophoneAuthorizationGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = D17FBD491DA84B608514DE63 /* MicrophoneAuthorizationGate.swift */; };
 		AF1441539464E4D2EF837CCD /* LocalMusicPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FF24F42B5B2AAA879E95FC5 /* LocalMusicPlayer.swift */; };
 		B388D26A0C8A9CFC0FDE7946 /* ResidentPropEditorState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B883AB50613AABC30AE090C /* ResidentPropEditorState.swift */; };
 		B38CAD275CF9668811068E88 /* ResidentWorldToolSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B3D886F759F9B2EBE61D14B /* ResidentWorldToolSession.swift */; };
@@ -278,6 +281,7 @@
 		DD0E1B235354B4FFCA244364 /* VMDBezierSampler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 72746C2E884A529073F5550A /* VMDBezierSampler.swift */; };
 		DD34674AE84A35C15E3EB4A7 /* CodexAgentAccountService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A961113D1516220877214877 /* CodexAgentAccountService.swift */; };
 		DDDEBAB15217CC1A60061CDE /* SyncedMusicLibraryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F7B6F4B8014DFB9AD76A24A /* SyncedMusicLibraryStore.swift */; };
+		E6AA91460EA1144400000001 /* MusicStorageClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6AA91460EA1144400000002 /* MusicStorageClient.swift */; };
 		DDF647CA9001A4919EA82834 /* ProgramVisualDirector.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C25006F47A0D72758A7B6B0 /* ProgramVisualDirector.swift */; };
 		DFBB39349649A969874CAEEE /* ResidentPropGridEditorModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2AFE7612BD0C88006DB3BDC2 /* ResidentPropGridEditorModel.swift */; };
 		E07CACC669D4A648231EE3A0 /* VisualAudioFeatureExtractor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36C707778632484C921F090C /* VisualAudioFeatureExtractor.swift */; };
@@ -361,6 +365,7 @@
 		06098ED46674F874E30028A5 /* AgentShowProposal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentShowProposal.swift; sourceTree = "<group>"; };
 		071333C574638BF4EC7C23D0 /* VMDBezierSamplerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VMDBezierSamplerTests.swift; sourceTree = "<group>"; };
 		0731ECA7F42B473582325F9B /* AudioGraphController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioGraphController.swift; sourceTree = "<group>"; };
+		D17FBD491DA84B608514DE63 /* MicrophoneAuthorizationGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MicrophoneAuthorizationGate.swift; sourceTree = "<group>"; };
 		07A8377E0830ED4ED8D57DB6 /* PresenceSettingsModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceSettingsModel.swift; sourceTree = "<group>"; };
 		07DE01676AC401339B9DCC2F /* OrbMotionModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbMotionModel.swift; sourceTree = "<group>"; };
 		091F9A1DA278A0DA5C8E4A4E /* ProgramPlannerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgramPlannerTests.swift; sourceTree = "<group>"; };
@@ -397,6 +402,7 @@
 		1F1ADE95832BAA10492DBF2F /* ResidentSystemInbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentSystemInbox.swift; sourceTree = "<group>"; };
 		1F341732E30CC1C3F05A7532 /* CodexTrackRankingAgentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexTrackRankingAgentTests.swift; sourceTree = "<group>"; };
 		1F7B6F4B8014DFB9AD76A24A /* SyncedMusicLibraryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncedMusicLibraryStore.swift; sourceTree = "<group>"; };
+		E6AA91460EA1144400000002 /* MusicStorageClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicStorageClient.swift; sourceTree = "<group>"; };
 		1FD1926B5A45F72788B602FF /* ScreenLinkResolverService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenLinkResolverService.swift; sourceTree = "<group>"; };
 		203CBBE0129344348DB2ECF3 /* ResidentAgentLoop.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentAgentLoop.swift; sourceTree = "<group>"; };
 		20C65C2BD0FD2417BAFBD387 /* PresenceCommandService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceCommandService.swift; sourceTree = "<group>"; };
@@ -449,6 +455,7 @@
 		47876636EF21649388CE59E3 /* OrbUniforms.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbUniforms.swift; sourceTree = "<group>"; };
 		4800268796D4A3A5E20CB6F8 /* AgentConversationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentConversationService.swift; sourceTree = "<group>"; };
 		4841A1C9777A9C01E1242759 /* NativeLinkPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeLinkPlayer.swift; sourceTree = "<group>"; };
+		E6AA91460EA1144400000006 /* ScreenMediaCacheClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenMediaCacheClient.swift; sourceTree = "<group>"; };
 		49673EC0B6CB3CED267C02E9 /* AgentSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentSettingsView.swift; sourceTree = "<group>"; };
 		4979C002BFA7259332C1AF5A /* WorldAgentToolContract.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldAgentToolContract.swift; sourceTree = "<group>"; };
 		4A2303EC6757768CBCDC8C43 /* RemoteMotionLibraryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteMotionLibraryTests.swift; sourceTree = "<group>"; };
@@ -556,6 +563,7 @@
 		ABCECE81B89991B2CE5556C5 /* MMDMotions */ = {isa = PBXFileReference; lastKnownFileType = folder; name = MMDMotions; path = Resources/MMDMotions; sourceTree = SOURCE_ROOT; };
 		AC10161C41BE8EB05A51FC8D /* AppSmokeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSmokeTests.swift; sourceTree = "<group>"; };
 		AC7A4B6E567E74C7977C92ED /* PropTaskDaemonClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PropTaskDaemonClient.swift; sourceTree = "<group>"; };
+		E6AA91460EA1144400000004 /* TaskdHTTPTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TaskdHTTPTransport.swift; sourceTree = "<group>"; };
 		ACAAB0C3BB4344BA3E26C9BF /* StageAvatarMotionPlayback.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageAvatarMotionPlayback.swift; sourceTree = "<group>"; };
 		AD9A423733002E2F92069AD9 /* VisualAudioInputPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VisualAudioInputPolicyTests.swift; sourceTree = "<group>"; };
 		ADCDD69074759DA56FC91BBF /* WorldScreenNativeVideoRegistry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldScreenNativeVideoRegistry.swift; sourceTree = "<group>"; };
@@ -741,6 +749,7 @@
 				63B9090B88216BD89FF23432 /* QQMusicProviderClient.swift */,
 				FF4EF80770D71D3EC6B0D33D /* StreamingMusicCache.swift */,
 				1F7B6F4B8014DFB9AD76A24A /* SyncedMusicLibraryStore.swift */,
+				E6AA91460EA1144400000002 /* MusicStorageClient.swift */,
 				96E6D962FE7287F48210926F /* UnifiedMusicSearch.swift */,
 			);
 			path = MusicSources;
@@ -990,6 +999,7 @@
 				2598E4800DAB1870BB2DBC4A /* AudioDeviceMonitor.swift */,
 				9AE1C62891D06F5AAEE8F1BD /* AudioFeatureFrame.swift */,
 				0731ECA7F42B473582325F9B /* AudioGraphController.swift */,
+				D17FBD491DA84B608514DE63 /* MicrophoneAuthorizationGate.swift */,
 				D25733DF25D5A2B074A49C2F /* DuckingEnvelope.swift */,
 				6F9A8C301E3E7F635CC216D7 /* InterruptionCoordinator.swift */,
 				8FF24F42B5B2AAA879E95FC5 /* LocalMusicPlayer.swift */,
@@ -1077,6 +1087,7 @@
 				3ECC82D2CA5287308B9ACA45 /* PropSupportGridPresentation.swift */,
 				652898977757565954C3204B /* PropSupportGridRenderer.swift */,
 				AC7A4B6E567E74C7977C92ED /* PropTaskDaemonClient.swift */,
+				E6AA91460EA1144400000004 /* TaskdHTTPTransport.swift */,
 				0E16B502423D8CB2B119C833 /* RemoteMotionLibrary.swift */,
 				C12A593D2E39AA38BDE94F2C /* ResidentImageAttachment.swift */,
 				30C49D1F8B1D6E86CA04C0B3 /* ResidentLocomotionMotionPolicy.swift */,
@@ -1205,6 +1216,7 @@
 			isa = PBXGroup;
 			children = (
 				4841A1C9777A9C01E1242759 /* NativeLinkPlayer.swift */,
+				E6AA91460EA1144400000006 /* ScreenMediaCacheClient.swift */,
 				9306F9AD136568C9974B38D2 /* NativeScreenMediaDescriptor.swift */,
 				94EF8BBDE34F3EEC8C7BB951 /* NativeScreenPlaybackCoordinator.swift */,
 				83913B862F16163BD66685A7 /* ScreenLinkAssetLoader.swift */,
@@ -1606,6 +1618,7 @@
 				F9E9274E334132FE64AFC6B0 /* AudioDeviceMonitor.swift in Sources */,
 				BC40F7C048A99BA508438443 /* AudioFeatureFrame.swift in Sources */,
 				ADBCA5536133900F3591140C /* AudioGraphController.swift in Sources */,
+				CCD710573D034A6BB203DC2F /* MicrophoneAuthorizationGate.swift in Sources */,
 				665EEC63C06CE7E466CA359F /* AuthorityWorldStatePersistence.swift in Sources */,
 				F7389A2ED65FC4849A86CEC4 /* BailianRealtimeEventMapper.swift in Sources */,
 				F66F9B159683C48A01489F6E /* BundledHelperManifest.swift in Sources */,
@@ -1663,6 +1676,7 @@
 				ABDB36FE110EDF6A739619DD /* MusicSource.swift in Sources */,
 				93C46E6E2725D1F073DE8E8E /* NanoemVMDLoader.swift in Sources */,
 				82499DDB42EA6A9343435C01 /* NativeLinkPlayer.swift in Sources */,
+				E6AA91460EA1144400000005 /* ScreenMediaCacheClient.swift in Sources */,
 				61ABC189E9DBDC3215A809C3 /* NativeScreenMediaDescriptor.swift in Sources */,
 				A887E479D3C4F5AE4084CF2C /* NativeScreenPlaybackCoordinator.swift in Sources */,
 				0A096E97516270FB01A843FE /* NeteaseMusicProviderClient.swift in Sources */,
@@ -1705,6 +1719,7 @@
 				3FB43FFEC22AAD70D446E154 /* PropSupportGridPresentation.swift in Sources */,
 				BD7A533625344B6740D9529A /* PropSupportGridRenderer.swift in Sources */,
 				49CF26C41737F0892F222A5D /* PropTaskDaemonClient.swift in Sources */,
+				E6AA91460EA1144400000003 /* TaskdHTTPTransport.swift in Sources */,
 				4AAB471D551D8A088912E7A4 /* QQMusicProviderClient.swift in Sources */,
 				B3D5D78DF1FC2D95AE00D4DA /* RadioPluginAvailability.swift in Sources */,
 				E1E72C29EB3D2A8256F43741 /* RealtimeDJSession.swift in Sources */,
@@ -1792,6 +1807,7 @@
 				119696923E6727DCFC6373AD /* StreamingMusicCache.swift in Sources */,
 				C291DC6978A8AF9ECE627079 /* StreamingPCMPlayer.swift in Sources */,
 				DDDEBAB15217CC1A60061CDE /* SyncedMusicLibraryStore.swift in Sources */,
+				E6AA91460EA1144400000001 /* MusicStorageClient.swift in Sources */,
 				5DF23352AF4CE0DD0F99380E /* TrackKnowledge.swift in Sources */,
 				583709DB2BCEF0293ECDCD8B /* UnifiedMusicSearch.swift in Sources */,
 				DD0E1B235354B4FFCA244364 /* VMDBezierSampler.swift in Sources */,

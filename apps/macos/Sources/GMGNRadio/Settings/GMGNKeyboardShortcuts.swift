@@ -377,7 +377,8 @@ final class GMGNShortcutSettingsStore: ObservableObject {
         )
         if let conflictIndex = assignments.firstIndex(where: {
             $0.action != action
-                && combination(for: $0, scope: scope) == newCombination
+                && combination(for: $0, scope: scope).keyCode == newCombination.keyCode
+                && combination(for: $0, scope: scope).modifiers == newCombination.modifiers
         }) {
             setCombination(previous, at: conflictIndex, scope: scope)
         }
@@ -399,7 +400,8 @@ final class GMGNShortcutSettingsStore: ObservableObject {
         scope: GMGNShortcutScope
     ) -> GMGNShortcutAction? {
         assignments.first {
-            self.combination(for: $0, scope: scope) == combination
+            self.combination(for: $0, scope: scope).keyCode == combination.keyCode
+                && self.combination(for: $0, scope: scope).modifiers == combination.modifiers
         }?.action
     }
 
@@ -442,6 +444,20 @@ final class GMGNShortcutCoordinator {
     private var registeredHotKeys: [EventHotKeyRef] = []
     private var actionByHotKeyID: [UInt32: GMGNShortcutAction] = [:]
     private var mediaCommandTargets: [(MPRemoteCommand, Any)] = []
+    private var textInputActive = false
+    private var applicationObservers: [NSObjectProtocol] = []
+
+    static func suppressKeyboardShortcuts(textInputActive: Bool, applicationActive: Bool) -> Bool {
+        textInputActive && applicationActive
+    }
+    private var suppressKeyboardShortcuts: Bool {
+        Self.suppressKeyboardShortcuts(textInputActive: textInputActive, applicationActive: NSApplication.shared.isActive)
+    }
+    func setTextInputActive(_ value: Bool) {
+        guard textInputActive != value else { return }
+        textInputActive = value
+        if localMonitor != nil { refreshRegistrations() }
+    }
 
     init(
         settings: GMGNShortcutSettingsStore,
@@ -468,6 +484,7 @@ final class GMGNShortcutCoordinator {
                 guard self.settings.recordingTarget == nil else {
                     return false
                 }
+                guard !self.suppressKeyboardShortcuts else { return false }
                 if NSApplication.shared.keyWindow?.firstResponder
                     is NSTextView
                 {
@@ -489,6 +506,11 @@ final class GMGNShortcutCoordinator {
         settings.onChange = { [weak self] in
             self?.refreshRegistrations()
         }
+        applicationObservers = [NSApplication.didBecomeActiveNotification, NSApplication.didResignActiveNotification].map { name in
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.refreshRegistrations() }
+            }
+        }
         refreshRegistrations()
     }
 
@@ -498,11 +520,15 @@ final class GMGNShortcutCoordinator {
             self.localMonitor = nil
         }
         settings.onChange = nil
+        applicationObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        applicationObservers.removeAll()
+        textInputActive = false
         unregisterGlobalHotKeys()
         unregisterMediaCommands()
     }
 
     fileprivate func performGlobalHotKey(id: UInt32) {
+        guard !suppressKeyboardShortcuts else { return }
         guard let action = actionByHotKeyID[id] else {
             return
         }
@@ -512,7 +538,9 @@ final class GMGNShortcutCoordinator {
     private func refreshRegistrations() {
         unregisterGlobalHotKeys()
         unregisterMediaCommands()
-        if settings.globalEnabled && settings.recordingTarget == nil {
+        // Carbon grabs keys before the Unity view receives them. Unregister while
+        // this app edits text; restore on blur or switching to another app.
+        if settings.globalEnabled && settings.recordingTarget == nil && !suppressKeyboardShortcuts {
             registerGlobalHotKeys()
         }
         if settings.mediaKeysEnabled {

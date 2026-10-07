@@ -1034,7 +1034,7 @@ private final class PlaybackVisualFeatureBridge: @unchecked Sendable {
         let frame = analyzer.analyze(sampleBuffer, hostTime: hostTime)
         var features = frame.visualFeatures
         features.waveform = WaveformEnvelopeSampler.sample(sampleBuffer)
-        store.update(features)
+        store.updateFromAudioTap(features)
     }
 
     func reset() {

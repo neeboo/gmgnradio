@@ -70,9 +70,10 @@ impl GmgnMcpServer {
                 // uses to decide whether a grant is required.
                 let annotations = match spec.kind {
                     Kind::ReadOnly => ToolAnnotations::new().read_only(true),
-                    Kind::Action => ToolAnnotations::new().read_only(false).idempotent(
-                        matches!(spec.name, "gmgn_prop_submit" | "gmgn_world_commit"),
-                    ),
+                    Kind::Action => ToolAnnotations::new().read_only(false).idempotent(matches!(
+                        spec.name,
+                        "gmgn_prop_submit" | "gmgn_world_commit"
+                    )),
                 };
                 tool.with_annotations(annotations)
             })
@@ -91,7 +92,7 @@ impl GmgnMcpServer {
         };
 
         if spec.kind == Kind::Action {
-            if let Err(refusal) = self.grant.authorize(spec.name, self.client.socket()) {
+            if let Err(refusal) = self.grant.authorize(spec.name, self.client.endpoint_file()) {
                 return CallToolResult::structured_error(json!({
                     "ok": false,
                     "code": refusal.code(),
@@ -311,8 +312,7 @@ fn schema_object(value: Value) -> Map<String, Value> {
 
 impl ServerHandler for GmgnMcpServer {
     fn get_info(&self) -> InitializeResult {
-        let mut info =
-            InitializeResult::new(ServerCapabilities::builder().enable_tools().build());
+        let mut info = InitializeResult::new(ServerCapabilities::builder().enable_tools().build());
         info.server_info = Implementation::new("gmgn-mcpd", env!("CARGO_PKG_VERSION"));
         info.instructions = Some(
             "这是 gmgn 生活空间的权威面。工具定义在 Rust 侧，数据由 gmgn-taskd 校验并落盘。\
@@ -341,4 +341,3 @@ impl ServerHandler for GmgnMcpServer {
         Ok(self.dispatch(&request.name, &args).await.into())
     }
 }
-

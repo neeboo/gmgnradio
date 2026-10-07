@@ -10,9 +10,15 @@ namespace GMGN.UnityPlayer.World
     {
         ReflectionProbe probe;
         int captureID = -1;
-        SphericalHarmonicsL2 previousAmbient;
-        AmbientMode previousAmbientMode;
+        SphericalHarmonicsL2 roomAmbient;
         bool changedAmbient;
+        public bool ApplyCapturedAmbient()
+        {
+            if (!changedAmbient) return false;
+            RenderSettings.ambientMode = AmbientMode.Custom;
+            RenderSettings.ambientProbe = roomAmbient;
+            return true;
+        }
         public void Initialize(Vector3 worldPosition)
         {
             if (probe != null) return;
@@ -110,11 +116,11 @@ namespace GMGN.UnityPlayer.World
                         if (integrated == 0) { Debug.LogWarning("[WorldLighting] diffuse_no_valid_samples"); return; }
                         for (var channel = 0; channel < 3; channel++) for (var coefficient = 0; coefficient < 9; coefficient++)
                             if (!Finite(harmonics[channel, coefficient])) { Debug.LogWarning("[WorldLighting] diffuse_nonfinite_coefficients"); return; }
-                        previousAmbient = RenderSettings.ambientProbe;
-                        previousAmbientMode = RenderSettings.ambientMode;
-                        RenderSettings.ambientMode = AmbientMode.Custom;
-                        RenderSettings.ambientProbe = harmonics;
+                        roomAmbient = harmonics;
                         changedAmbient = true;
+                        // A readback may complete after switching to Player.
+                        // Cache it without changing the currently visible mode.
+                        if (gameObject.activeInHierarchy) ApplyCapturedAmbient();
                         Debug.Log("[WorldLighting] room_diffuse_irradiance_ready validSamples=" + integrated);
                     }
                 });
@@ -131,10 +137,6 @@ namespace GMGN.UnityPlayer.World
                 case 4: return new Vector3(u, -v, 1);
                 default: return new Vector3(-u, -v, -1);
             }
-        }
-        void OnDestroy()
-        {
-            if (changedAmbient) { RenderSettings.ambientProbe = previousAmbient; RenderSettings.ambientMode = previousAmbientMode; }
         }
     }
 }

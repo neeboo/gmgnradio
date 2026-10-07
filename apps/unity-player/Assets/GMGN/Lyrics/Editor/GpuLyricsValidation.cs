@@ -21,6 +21,10 @@ namespace GMGN.UnityPlayer.Editor
             foreach(var resource in new[]{"PlayerLyricsBoldFont","PlayerLyricsMediumFont","PlayerLyricsSemiboldFont","PlayerLyricsBlackFont","PlayerLyricsLightFont"}){
                 var font=Resources.Load<UnityEngine.TextCore.Text.FontAsset>(resource);
                 if(font==null||font.atlasWidth!=1024||font.atlasHeight!=1024)throw new InvalidOperationException("GPU weighted lyric font missing or atlas size mismatch: "+resource);
+                var fallback=Resources.Load<UnityEngine.TextCore.Text.FontAsset>(resource.Replace("Font","LatinFont"));
+                if(fallback==null||fallback.atlasWidth!=font.atlasWidth||fallback.atlasHeight!=font.atlasHeight)throw new InvalidOperationException("GPU Latin fallback missing or atlas size mismatch: "+resource);
+                fallback.TryAddCharacters("łŁ",out _);
+                if(!fallback.characterLookupTable.ContainsKey('ł')||!fallback.characterLookupTable.ContainsKey('Ł'))throw new InvalidOperationException("GPU Latin fallback does not cover Polish subtitle characters: "+resource);
             }
             var compute = Resources.Load<ComputeShader>("GpuLyricsUpdate");
             var shader = Resources.Load<Shader>("GpuLyricsGlyphDraw");

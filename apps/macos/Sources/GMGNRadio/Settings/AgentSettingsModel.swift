@@ -482,7 +482,7 @@ final class AgentSettingsModel {
 
         let conversationService = AgentConversationService.shared
         installedConversationBackendIDs = Set(
-            conversationService.installedBackends().map(\.kind)
+            conversationService.installedBackends(refresh: true).map(\.kind)
         )
         selectedConversationBackendID =
             conversationService.effectiveBackendID
@@ -493,7 +493,7 @@ final class AgentSettingsModel {
     func refreshConversationBackends() {
         let conversationService = AgentConversationService.shared
         installedConversationBackendIDs = Set(
-            conversationService.installedBackends().map(\.kind)
+            conversationService.installedBackends(refresh: true).map(\.kind)
         )
     }
 

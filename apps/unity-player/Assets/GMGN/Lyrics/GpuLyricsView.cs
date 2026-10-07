@@ -31,6 +31,9 @@ namespace GMGN.UnityPlayer
     {
         public string Status { get; private set; } = "Not initialized";
         public int PointCapacity { get; private set; }
+        public int AtlasUploadCount { get; private set; }
+        public int LayoutRebuildCount { get; private set; }
+        public int GlowTargetAllocationCount { get; private set; }
         public bool IsGpuReady => compute != null && material != null;
         public bool EnsureGpuReady() => Initialize();
         public string Mode { get; private set; } = "luminous";
@@ -45,6 +48,7 @@ namespace GMGN.UnityPlayer
         FontAsset font;
         ComputeShader compute;
         readonly Dictionary<FontAsset,int> fontPages=new();
+        readonly Dictionary<FontAsset,FontAsset> fontFallbacks=new();
         FontAsset boldFont,mediumFont,semiboldFont,lightFont,blackFont;
         string warmedSession;long warmedRevision=long.MinValue;
         Material material,backgroundMaterial,effectMaterial,blurMaterial,glowCompositeMaterial;
@@ -53,6 +57,15 @@ namespace GMGN.UnityPlayer
         CommandBuffer glowCommands;
         GraphicsBuffer glyphs, points;
         Texture2DArray atlasPages;
+        readonly List<Texture2D> uploadedAtlasSources = new();
+        readonly List<uint> uploadedAtlasVersions = new();
+        bool atlasDirty = true;
+        int pendingWidth, pendingHeight;
+        float pendingScale;
+        double viewportChangedAt;
+        float blurRadius = -1;
+        readonly float[] blurWeights = new float[7], blurOffsets = new float[7];
+        readonly float[] blurDirectWeights = new float[13];
         int kernel;
         bool shown = true;
         bool currentChorus;
@@ -103,6 +116,11 @@ namespace GMGN.UnityPlayer
             if (!SystemInfo.supportsComputeShaders) { Status = "GPU lyrics require Compute Shader"; return false; }
             boldFont=Resources.Load<FontAsset>("PlayerLyricsBoldFont");mediumFont=Resources.Load<FontAsset>("PlayerLyricsMediumFont");semiboldFont=Resources.Load<FontAsset>("PlayerLyricsSemiboldFont");font=boldFont;
             lightFont=Resources.Load<FontAsset>("PlayerLyricsLightFont");blackFont=Resources.Load<FontAsset>("PlayerLyricsBlackFont");
+            foreach(var role in new[]{boldFont,mediumFont,semiboldFont,lightFont,blackFont}) {
+                if(role==null)continue;
+                var fallback=Resources.Load<FontAsset>(role.name.Replace("Font","LatinFont"));
+                if(fallback!=null)fontFallbacks[role]=fallback;
+            }
             var cs = Resources.Load<ComputeShader>("GpuLyricsUpdate");
             var shader = Resources.Load<Shader>("GpuLyricsGlyphDraw");
             var blurShader=Resources.Load<Shader>("GpuLyricsBlur");var compositeShader=Resources.Load<Shader>("GpuLyricsGlowComposite");
@@ -120,8 +138,9 @@ namespace GMGN.UnityPlayer
             var document = GetComponent<UnityEngine.UIElements.UIDocument>();
             var panelScale = document != null && document.panelSettings != null ? document.panelSettings.scale : 1;
             var index = ActiveLineIndex(clock);
-            if (index != activeIndex || width != Screen.width || height != Screen.height || !Mathf.Approximately(panelScale, scale)) {
-                activeIndex = index; width = Screen.width; height = Screen.height; scale = panelScale;
+            var layoutChanged = SettleViewport(Screen.width, Screen.height, panelScale, Time.realtimeSinceStartupAsDouble);
+            if (index != activeIndex || layoutChanged) {
+                activeIndex = index;
                 Rebuild();
             }
             if (PointCapacity == 0) return;
@@ -158,18 +177,34 @@ namespace GMGN.UnityPlayer
             parameters.material=material;parameters.matProps=properties;
             Graphics.RenderPrimitives(parameters, MeshTopology.Triangles, 6, PointCapacity);
         }
+        // Keep the last complete layout during AppKit's intermediate resize
+        // frames. Neither native framebuffer resolution nor Retina UI changes.
+        bool SettleViewport(int nextWidth, int nextHeight, float nextScale, double now)
+        {
+            if (nextWidth <= 0 || nextHeight <= 0 || nextScale <= 0) return false;
+            if (pendingWidth != nextWidth || pendingHeight != nextHeight || !Mathf.Approximately(pendingScale, nextScale)) {
+                pendingWidth = nextWidth; pendingHeight = nextHeight; pendingScale = nextScale; viewportChangedAt = now;
+            }
+            if (width == nextWidth && height == nextHeight && Mathf.Approximately(scale, nextScale)) return false;
+            if (width > 0 && now - viewportChangedAt < .15) return false;
+            width = nextWidth; height = nextHeight; scale = nextScale;
+            return true;
+        }
         bool RenderGlow(){
             if(!hasGlow)return false;
-            var targetWidth=Mathf.Max(1,Screen.width/4);var targetHeight=Mathf.Max(1,Screen.height/4);
+            var targetWidth=Mathf.Max(1,width/4);var targetHeight=Mathf.Max(1,height/4);
             if(glowA==null||glowA.width!=targetWidth||glowA.height!=targetHeight){
+                var allocationStarted=System.Diagnostics.Stopwatch.GetTimestamp();
                 ReleaseGlowTargets();
                 var format=SystemInfo.SupportsRenderTextureFormat(RenderTextureFormat.ARGBHalf)?RenderTextureFormat.ARGBHalf:RenderTextureFormat.ARGB32;
                 glowA=new RenderTexture(targetWidth,targetHeight,0,format,RenderTextureReadWrite.Linear){name="GMGN lyrics glow horizontal",filterMode=FilterMode.Bilinear,wrapMode=TextureWrapMode.Clamp};
                 glowB=new RenderTexture(targetWidth,targetHeight,0,format,RenderTextureReadWrite.Linear){name="GMGN lyrics glow vertical",filterMode=FilterMode.Bilinear,wrapMode=TextureWrapMode.Clamp};
                 if(!glowA.Create()||!glowB.Create()){Status="GPU lyric glow render target unavailable";ReleaseGlowTargets();Debug.LogError(Status,this);return false;}
-                Debug.Log($"GPU lyric glow targets: {targetWidth}x{targetHeight} {format}; no CPU readback",this);
+                GlowTargetAllocationCount++;
+                var allocationMs=(System.Diagnostics.Stopwatch.GetTimestamp()-allocationStarted)*1000d/System.Diagnostics.Stopwatch.Frequency;
+                Debug.Log($"GPU lyric glow targets: {targetWidth}x{targetHeight} {format}; allocations={GlowTargetAllocationCount}; allocationMs={allocationMs:F3}; no CPU readback",this);
             }
-            blurMaterial.SetFloat("_Radius",(styleCode==1?22:18)*scale*.25f);
+            ConfigureGaussianBlur(blurMaterial,(styleCode==1?22:18)*scale*.25f);
             glowCommands.Clear();glowCommands.SetRenderTarget(glowA);glowCommands.SetViewport(new Rect(0,0,targetWidth,targetHeight));
             glowCommands.ClearRenderTarget(false,true,Color.clear);
             glowCommands.DrawProcedural(Matrix4x4.identity,effectMaterial,0,MeshTopology.Triangles,6,PointCapacity,effectProperties);
@@ -178,6 +213,36 @@ namespace GMGN.UnityPlayer
             glowCompositeProperties.SetTexture("_GlowTexture",glowA);
             glowCompositeProperties.SetVector("_Viewport",new Vector4(width/scale,height/scale,0,0));
             return true;
+        }
+        void ConfigureGaussianBlur(Material target, float radius)
+        {
+            if(Mathf.Approximately(radius,blurRadius))return;
+            blurRadius=radius;
+            var sigma=Mathf.Max(.5f,radius*.5f);var stride=Mathf.Max(1,radius/12);
+            float sum=1;blurWeights[0]=1;blurOffsets[0]=0;
+            blurDirectWeights[0]=1;
+            // Linear filtering exactly combines each adjacent positive/negative
+            // Gaussian tap pair. The original 25-tap kernel becomes 13 samples,
+            // preserving radius and weights; only rebuild uniforms on change.
+            for(int pair=1;pair<=6;pair++){
+                int n=pair*2-1;
+                float a=Mathf.Exp(-n*n*stride*stride/(2*sigma*sigma));
+                float b=Mathf.Exp(-(n+1)*(n+1)*stride*stride/(2*sigma*sigma));
+                blurWeights[pair]=a+b;
+                blurOffsets[pair]=(n+(a+b>0?b/(a+b):0))*stride;
+                blurDirectWeights[n]=a;blurDirectWeights[n+1]=b;
+                sum+=2*(a+b);
+            }
+            for(int i=0;i<7;i++)blurWeights[i]/=sum;
+            for(int i=0;i<13;i++)blurDirectWeights[i]/=sum;
+            target.SetFloatArray("_GaussianWeights",blurWeights);
+            target.SetFloatArray("_GaussianOffsets",blurOffsets);
+            target.SetFloatArray("_GaussianDirectWeights",blurDirectWeights);
+            target.SetFloat("_GaussianStride",stride);
+            // Non-unit stride samples are not adjacent texels and cannot be
+            // paired exactly. Preserve the original kernel on those displays.
+            target.SetInt("_GaussianPaired",Mathf.Approximately(stride,1)?1:0);
+            Debug.Log($"GPU lyric Gaussian: radius={radius:F3}; samplesPerPass={(Mathf.Approximately(stride,1)?13:25)}; unchanged kernel",this);
         }
         void ReleaseGlowTargets(){if(glowA!=null){glowA.Release();Destroy(glowA);glowA=null;}if(glowB!=null){glowB.Release();Destroy(glowB);glowB=null;}}
         int ActiveLineIndex(float seconds)
@@ -192,10 +257,13 @@ namespace GMGN.UnityPlayer
         }
         void Rebuild()
         {
-            ReleaseBuffers(); descriptors.Clear();
+            var rebuildStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            PointCapacity=0;hasGlow=false;descriptors.Clear();
             if (activeIndex < 0) return;
             var line = lines[activeIndex];
+            var warmStarted=System.Diagnostics.Stopwatch.GetTimestamp();
             WarmFonts();font=boldFont;
+            var warmFinished=System.Diagnostics.Stopwatch.GetTimestamp();
             currentChorus=IsChorus(line);
             var logicalWidth = width/scale; var logicalHeight = height/scale;
             styleCode = StyleCode(Mode);
@@ -253,35 +321,97 @@ namespace GMGN.UnityPlayer
             if (descriptors.Count == 0) return;
             foreach(var seed in descriptors)if((seed.effects.y>0&&seed.effects.z>0&&seed.metadata.z>=0)||(seed.metadata.x!=0&&UsesFlowingGlyphStyle(styleCode))){hasGlow=true;break;}
             if (descriptors.Count > MaximumGlyphs) { Status = "GPU lyric glyph limit exceeded"; descriptors.Clear(); return; }
-            glyphs = new GraphicsBuffer(GraphicsBuffer.Target.Structured, descriptors.Count, 144);
-            points = new GraphicsBuffer(GraphicsBuffer.Target.Structured, descriptors.Count, 48);
+            var layoutFinished=System.Diagnostics.Stopwatch.GetTimestamp();
+            glyphs ??= new GraphicsBuffer(GraphicsBuffer.Target.Structured, MaximumGlyphs, 144);
+            points ??= new GraphicsBuffer(GraphicsBuffer.Target.Structured, MaximumGlyphs, 48);
             glyphs.SetData(descriptors.ToArray()); PointCapacity = descriptors.Count;
             compute.SetBuffer(kernel,"_Glyphs",glyphs); compute.SetBuffer(kernel,"_Points",points);
-            var firstAtlas=boldFont.atlasTextures[0];
-            var pageCount=0;foreach(var entry in fontPages)pageCount+=AtlasCount(entry.Key);
-            atlasPages=new Texture2DArray(firstAtlas.width,firstAtlas.height,pageCount,firstAtlas.format,false){filterMode=FilterMode.Bilinear,wrapMode=TextureWrapMode.Clamp};
-            foreach(var entry in fontPages)for(var page=0;page<AtlasCount(entry.Key);page++){
-                var source=entry.Key.atlasTextures[page];
-                if(source==null||source.width!=firstAtlas.width||source.height!=firstAtlas.height||source.format!=firstAtlas.format){Status="GPU lyric atlas dimensions differ";ReleaseBuffers();return;}
-                Graphics.CopyTexture(source,0,0,atlasPages,entry.Value+page,0);
-            }
+            var uploadFinished=System.Diagnostics.Stopwatch.GetTimestamp();
+            if (!EnsureAtlasPages()) { PointCapacity=0; return; }
+            var atlasFinished=System.Diagnostics.Stopwatch.GetTimestamp();
             compute.SetTexture(kernel,"_FontAtlas",atlasPages);
             properties.SetBuffer("_Points",points);
             properties.SetBuffer("_Glyphs",glyphs);properties.SetTexture("_FontAtlas",atlasPages);
             backgroundProperties.SetBuffer("_Points",points);backgroundProperties.SetBuffer("_Glyphs",glyphs);backgroundProperties.SetTexture("_FontAtlas",atlasPages);
             effectProperties.SetBuffer("_Points",points);effectProperties.SetBuffer("_Glyphs",glyphs);effectProperties.SetTexture("_FontAtlas",atlasPages);
             Status = "GPU " + Mode + " lyrics: " + descriptors.Count + " glyphs";
-            Debug.Log(Status + "; procedural glyph quads=" + PointCapacity + "; graphics=" + SystemInfo.graphicsDeviceType, this);
+            LayoutRebuildCount++;
+            var rebuildMs=(System.Diagnostics.Stopwatch.GetTimestamp()-rebuildStarted)*1000d/System.Diagnostics.Stopwatch.Frequency;
+            Debug.Log(Status + "; procedural glyph quads=" + PointCapacity + "; graphics=" + SystemInfo.graphicsDeviceType
+                + $"; rebuilds={LayoutRebuildCount}; atlasUploads={AtlasUploadCount}; rebuildMs={rebuildMs:F3}"
+                + $"; warmFontsMs={(warmFinished-warmStarted)*1000d/System.Diagnostics.Stopwatch.Frequency:F3}"
+                + $"; glyphLayoutMs={(layoutFinished-warmFinished)*1000d/System.Diagnostics.Stopwatch.Frequency:F3}"
+                + $"; bufferUploadMs={(uploadFinished-layoutFinished)*1000d/System.Diagnostics.Stopwatch.Frequency:F3}"
+                + $"; atlasBindMs={(atlasFinished-uploadFinished)*1000d/System.Diagnostics.Stopwatch.Frequency:F3}", this);
+        }
+        bool EnsureAtlasPages()
+        {
+            var firstAtlas=boldFont.atlasTextures[0];
+            var pageCount=0;foreach(var entry in fontPages)pageCount+=AtlasCount(entry.Key);
+            bool changed=atlasDirty||atlasPages==null||uploadedAtlasSources.Count!=pageCount;
+            int slice=0;
+            foreach(var entry in fontPages)for(var page=0;page<AtlasCount(entry.Key);page++){
+                var source=entry.Key.atlasTextures[page];
+                if(source==null||source.width!=firstAtlas.width||source.height!=firstAtlas.height||source.format!=firstAtlas.format){Status="GPU lyric atlas dimensions differ";return false;}
+                if(slice>=uploadedAtlasSources.Count||uploadedAtlasSources[slice]!=source||uploadedAtlasVersions[slice]!=source.updateCount)changed=true;
+                slice++;
+            }
+            if(!changed)return true;
+            var uploadStarted=System.Diagnostics.Stopwatch.GetTimestamp();
+            if(atlasPages==null||atlasPages.depth!=pageCount||atlasPages.width!=firstAtlas.width||atlasPages.height!=firstAtlas.height||atlasPages.format!=firstAtlas.format){
+                if(atlasPages!=null)Destroy(atlasPages);
+                atlasPages=new Texture2DArray(firstAtlas.width,firstAtlas.height,pageCount,firstAtlas.format,false){filterMode=FilterMode.Bilinear,wrapMode=TextureWrapMode.Clamp};
+            }
+            uploadedAtlasSources.Clear();uploadedAtlasVersions.Clear();
+            foreach(var entry in fontPages)for(var page=0;page<AtlasCount(entry.Key);page++){
+                var source=entry.Key.atlasTextures[page];
+                Graphics.CopyTexture(source,0,0,atlasPages,entry.Value+page,0);
+                uploadedAtlasSources.Add(source);uploadedAtlasVersions.Add(source.updateCount);
+            }
+            atlasDirty=false;AtlasUploadCount++;
+            var uploadMs=(System.Diagnostics.Stopwatch.GetTimestamp()-uploadStarted)*1000d/System.Diagnostics.Stopwatch.Frequency;
+            Debug.Log($"GPU lyric font atlas: {firstAtlas.width}x{firstAtlas.height} pages={pageCount}; uploads={AtlasUploadCount}; uploadMs={uploadMs:F3}",this);
+            return true;
         }
         static int AtlasCount(FontAsset asset){var count=0;while(count<asset.atlasTextures.Length&&asset.atlasTextures[count]!=null)count++;return count;}
         static bool UsesFlowingGlyphStyle(int style)=>style==0||style==1||style==4||style==5||style==6||style==7||style==9||style==10;
         void WarmFonts(){
             if(warmedSession!=session||warmedRevision!=revision){
+                atlasDirty=true;
                 var text=new StringBuilder();foreach(var lyric in lines){text.Append(lyric.text);text.Append(lyric.translation);if(lyric.words!=null)foreach(var word in lyric.words)text.Append(word.text);}text.Append('…');
-                foreach(var asset in new[]{boldFont,mediumFont,semiboldFont,lightFont,blackFont})if(!asset.TryAddCharacters(text.ToString(),out var missing)&&!string.IsNullOrEmpty(missing))Debug.LogWarning($"GPU lyrics missing {asset.name} glyphs: {missing}",this);
+                foreach(var asset in new[]{boldFont,mediumFont,semiboldFont,lightFont,blackFont})WarmFont(asset,text.ToString());
                 warmedSession=session;warmedRevision=revision;
             }
-            fontPages.Clear();var offset=0;foreach(var asset in new[]{boldFont,mediumFont,semiboldFont,lightFont,blackFont}){fontPages.Add(asset,offset);offset+=AtlasCount(asset);}
+            fontPages.Clear();var offset=0;foreach(var asset in new[]{boldFont,mediumFont,semiboldFont,lightFont,blackFont}){
+                fontPages.Add(asset,offset);offset+=AtlasCount(asset);
+                // Unused dynamic fallback fonts keep a 1x1 placeholder atlas.
+                // Only allocated glyph atlases belong in the shared texture array.
+                if(fontFallbacks.TryGetValue(asset,out var fallback) && fallback.glyphTable.Count > 0){fontPages.Add(fallback,offset);offset+=AtlasCount(fallback);}
+            }
+        }
+        void WarmFont(FontAsset role,string text){
+            role.TryAddCharacters(text,out _);
+            var missing=new StringBuilder();
+            for(var i=0;i<text.Length;i++){
+                var scalar=(uint)char.ConvertToUtf32(text,i);if(char.IsHighSurrogate(text[i]))i++;
+                if(!role.characterLookupTable.ContainsKey(scalar))missing.Append(char.ConvertFromUtf32((int)scalar));
+            }
+            if(missing.Length==0)return;
+            fontFallbacks.TryGetValue(role,out var fallback);
+            var missingText=missing.ToString();
+            fallback?.TryAddCharacters(missingText,out _);
+            var unresolved=new StringBuilder();
+            for(var i=0;i<missing.Length;i++){
+                var scalar=(uint)char.ConvertToUtf32(missingText,i);if(char.IsHighSurrogate(missing[i]))i++;
+                if(fallback==null||!fallback.characterLookupTable.ContainsKey(scalar))unresolved.Append(char.ConvertFromUtf32((int)scalar));
+            }
+            if(unresolved.Length>0)Debug.LogWarning($"GPU lyrics missing {role.name} glyphs: {unresolved}",this);
+        }
+        bool ResolveGlyph(uint scalar,out Character character,out FontAsset owner){
+            owner=font;
+            if(font.characterLookupTable.TryGetValue(scalar,out character))return true;
+            if(fontFallbacks.TryGetValue(font,out var fallback)&&fallback.characterLookupTable.TryGetValue(scalar,out character)){owner=fallback;return true;}
+            return false;
         }
         static Color WithAlpha(Color color,float alpha){color.a=alpha;return color;}
         static float TypographySize(string text,float availableWidth){var visible=0;var elements=System.Globalization.StringInfo.GetTextElementEnumerator(text??"");while(elements.MoveNext())if(!string.IsNullOrWhiteSpace((string)elements.Current))visible++;return Mathf.Clamp(availableWidth*.78f/Mathf.Max(visible,6)*.92f,18,112);}
@@ -406,7 +536,7 @@ namespace GMGN.UnityPlayer
             AddTranslationRows(translated,translationSize,w*.5f,top+28+size+14+translationSize,.54f,false);
             for(var i=0;i<180;i++)descriptors.Add(new LyricGlyphSeed{rectangle=new Vector4(0,0,w,h),metadata=new Vector4(0,10,-3,i),color=i%3==0?accent:i%3==1?secondary:primary});
         }
-        float Measure(string text,float size){font.TryAddCharacters(text??"",out _);var result=0f;for(var i=0;i<(text??"").Length;i++){var code=(uint)char.ConvertToUtf32(text,i);if(char.IsHighSurrogate(text[i]))i++;if(font.characterLookupTable.TryGetValue(code,out var character))result+=character.glyph.metrics.horizontalAdvance*size/font.faceInfo.pointSize;}return result;}
+        float Measure(string text,float size){WarmFont(font,text??"");var result=0f;for(var i=0;i<(text??"").Length;i++){var code=(uint)char.ConvertToUtf32(text,i);if(char.IsHighSurrogate(text[i]))i++;if(ResolveGlyph(code,out var character,out var owner))result+=character.glyph.metrics.horizontalAdvance*size/owner.faceInfo.pointSize;}return result;}
         void Bubble(float x,float y,float width,float height,Color stroke,Color fill,bool context){descriptors.Add(new LyricGlyphSeed{rectangle=new Vector4(x,y,width,height),metadata=new Vector4(0,7,-4,context?1:0),color=stroke,transform=fill});}
         void VoiceMarker(float x,float y,float diameter,bool active,int voice){
             descriptors.Add(new LyricGlyphSeed{rectangle=new Vector4(x-diameter*.5f,y-diameter*.5f,diameter,diameter),metadata=new Vector4(0,7,-5,active?1:0),color=active?accent:WithAlpha(secondary,.12f)});
@@ -550,8 +680,7 @@ namespace GMGN.UnityPlayer
         {
             var text = line.text ?? "";
             if (text.Length == 0) return;
-            var added=font.TryAddCharacters(text, out var missing);
-            if (!added&&!string.IsNullOrEmpty(missing)) { Status = "Missing lyric glyphs: " + missing; Debug.LogWarning(Status,this); }
+            WarmFont(font,text);
             units.Clear();
             var motionIndex=0;
             var words = line.words != null && line.words.Length > 0 ? line.words : new[]{new LyricPointWord{text=text,startsAt=line.startsAt,endsAt=line.endsAt}};
@@ -568,26 +697,26 @@ namespace GMGN.UnityPlayer
                     motionIndex++;
                 }
             }
-            var ratio = size/font.faceInfo.pointSize;
             var advance = 0f;
             var grouped=animated&&(styleCode==0||styleCode==1||styleCode==4||styleCode==5||styleCode==7);
             var unitGap=size*(styleCode==0?.015f:.012f);var innerTracking=-size*.018f;
-            for(var i=0;i<units.Count;i++)if(font.characterLookupTable.TryGetValue(units[i].value,out var character)){
-                advance+=character.glyph.metrics.horizontalAdvance*ratio;
+            for(var i=0;i<units.Count;i++)if(ResolveGlyph(units[i].value,out var character,out var owner)){
+                advance+=character.glyph.metrics.horizontalAdvance*size/owner.faceInfo.pointSize;
                 if(grouped&&i+1<units.Count)advance+=units[i].motionIndex==units[i+1].motionIndex?innerTracking:unitGap;
             }
             var x = centerX-advance*.5f;
             var atlas = font.atlasTextures[0];
             var groupRanges=new Dictionary<int,Vector4>();var descriptorStart=descriptors.Count;
             for(var unitIndex=0;unitIndex<units.Count;unitIndex++) {var unit=units[unitIndex];
-                if (!font.characterLookupTable.TryGetValue(unit.value,out var character)) continue;
+                if (!ResolveGlyph(unit.value,out var character,out var owner)) continue;
+                var ratio=size/owner.faceInfo.pointSize;
                 var glyph = character.glyph; var metrics = glyph.metrics; var rect = glyph.glyphRect;
-                atlas=font.atlasTextures[glyph.atlasIndex];
+                atlas=owner.atlasTextures[glyph.atlasIndex];
                 descriptors.Add(new LyricGlyphSeed {
                     rectangle = new Vector4(x+metrics.horizontalBearingX*ratio,centerY-metrics.horizontalBearingY*ratio,metrics.width*ratio,metrics.height*ratio),
                     atlas = new Vector4((float)rect.x/atlas.width,(float)rect.y/atlas.height,(float)rect.width/atlas.width,(float)rect.height/atlas.height),
                     timing = animated ? new Vector4(unit.start,unit.end,0,0) : new Vector4(1,-1,0,0),
-                    color = unit.color, metadata = new Vector4(animated?1:0, styleCode,fontPages[font]+glyph.atlasIndex,grouped?unit.motionIndex:0), transform=currentTransform, transition=currentTransition,effects=currentEffects,
+                    color = unit.color, metadata = new Vector4(animated?1:0, styleCode,fontPages[owner]+glyph.atlasIndex,grouped?unit.motionIndex:0), transform=currentTransform, transition=currentTransition,effects=currentEffects,
                     motion=animated?new Vector4(-3+StableUnit(line.id,unit.motionIndex,11)*6,-8+StableUnit(line.id,unit.motionIndex,23)*16,(-2.8f+StableUnit(line.id,unit.motionIndex,37)*5.6f)*Mathf.Deg2Rad,.94f+StableUnit(line.id,unit.motionIndex,53)*.1f):new Vector4(0,0,0,1)
                 });
                 if(grouped){
@@ -612,7 +741,7 @@ namespace GMGN.UnityPlayer
             }
             if(word.Length>0)result.Add(word.ToString());return result;
         }
-        public void Clear() { ReleaseBuffers(); lines=Array.Empty<LyricPointLine>(); activeIndex=-2; session=null;revision=long.MinValue; }
+        public void Clear() { PointCapacity=0;hasGlow=false;lines=Array.Empty<LyricPointLine>(); activeIndex=-2; session=null;revision=long.MinValue; }
         void ReleaseBuffers() { glyphs?.Dispose(); points?.Dispose(); glyphs=null;points=null;PointCapacity=0;hasGlow=false;if(atlasPages!=null)Destroy(atlasPages);atlasPages=null; }
         void OnDestroy() { ReleaseBuffers();ReleaseGlowTargets();glowCommands?.Release();if(blurMaterial!=null)Destroy(blurMaterial);if(glowCompositeMaterial!=null)Destroy(glowCompositeMaterial);if(material!=null)Destroy(material);if(backgroundMaterial!=null)Destroy(backgroundMaterial);if(effectMaterial!=null)Destroy(effectMaterial);if(compute!=null)Destroy(compute); }
     }

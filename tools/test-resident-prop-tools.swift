@@ -65,7 +65,9 @@ let flatWorld=FlatSupport(minimumX:-3.7,maximumX:-1.7,minimumZ:-6,maximumZ:-4,he
  let heights=[resident.y]+anchorCandidates.map(\.y)
  guard let lowest=heights.min(), let highest=heights.max(),
        anchorCandidates.allSatisfy(usable), usable(resident) else { return nil }
- let map=WorldPlacementRouteMap(grid:grid,lowerHeight:lowest-0.6,upperHeight:highest+0.6)
+ // The declared synthetic walking floor is y=0. Its y=.52 table is a
+ // placement surface, not a second walking floor; it exceeds the .25m step.
+ let map=WorldPlacementRouteMap(grid:grid,lowerHeight:lowest-0.25,upperHeight:highest+0.25)
  guard map.nearestNode(to:resident) != nil else { return nil }
  var positions:[String:WorldVector3]=[:]
  for candidate in anchorCandidates where map.node(at:candidate) != nil {
@@ -121,18 +123,52 @@ struct FlatRoomAndTable: WorldPropSupportQuerying {
 @main struct Tests {
     @MainActor static func main() async throws {
         let data=try Data(contentsOf:URL(fileURLWithPath:"apps/macos/Resources/Worlds/marble-living-cabin/world.json"))
-        let manifest=try JSONDecoder().decode(WorldManifest.self,from:data)
+        // This harness uses a y=0 synthetic floor, not the original cabin's
+        // uneven negative-height floor. Keep its real graph IDs/XY layout,
+        // but place the spawn and graph nodes on the floor actually installed.
+        var fixtureJSON = try JSONSerialization.jsonObject(with:data) as! [String:Any]
+        var fixtureSpawn = fixtureJSON["spawn"] as! [String:Any]
+        var fixtureSpawnPosition = fixtureSpawn["position"] as! [String:Any]
+        fixtureSpawnPosition["y"] = 0
+        fixtureSpawn["position"] = fixtureSpawnPosition
+        fixtureJSON["spawn"] = fixtureSpawn
+        fixtureJSON["waypoints"] = (fixtureJSON["waypoints"] as! [[String:Any]]).map { waypoint in
+            var waypoint = waypoint
+            var position = waypoint["position"] as! [String:Any]
+            position["y"] = 0
+            waypoint["position"] = position
+            return waypoint
+        }
+        let manifest=try JSONDecoder().decode(WorldManifest.self,
+            from:JSONSerialization.data(withJSONObject:fixtureJSON))
         let context=try WorldAgentContext(manifest:manifest)
+        // Production built-ins are not generated inventory props. Keep one
+        // enabled through the real placement/hold tool sequence below.
+        let deviceID = "prop.jukebox"
+        let deviceDeclaration = WorldProceduralPropDeclaration(objectID:deviceID,
+            renderer:"builtin.jukebox",seedPosition:.init(x:6,y:0,z:-8),seedYaw:0,
+            size:.init(x:0.5,y:0.7,z:0.4))
+        var withDevice = context.state
+        withDevice.objectStates[deviceID] = WorldObjectState(isEnabled:true,
+            transform:WorldTransform(position:.init(x:6,y:0,z:-8),
+                rotation:.init(x:0,y:0,z:0,w:1),scale:.init(x:1,y:1,z:1)),
+            metadata:["gmgn.builtin-device.v1":String(data:try JSONEncoder().encode(deviceDeclaration),encoding:.utf8)!])
+        try context.adoptAuthorityState(withDevice,propFunctionSources:context.propFunctionSources)
         // 承托层由几何派生：范围与旧的具名面 `test` 相同（展示台桌面高度 0.52 m）。
         let flat=flatSupport()
+        // Movement must consume the same synthetic floor/table used by placement,
+        // rather than an uninstalled environment with no grounding query.
+        context.installCollisionWorld(flat.collision)
         // 真机那把 **2B 白色长剑（外形摆件）** 的权威身份（逐字段取自 2026-10-02 的
         // `world_records.objects/wish-prop-4210db95-…`）：端到端那一条断言要的就是"对它说
         // 挂到背后，真的挂得上"，所以夹具用**真身份**，不用一个抽象名字。
         let swordID="wish-prop-4210db95-9253-4caf-83a3-3c45f090b099"
         let swordName="2B 白色长剑（外形摆件）"
         let current=Current()
+        var verifiedHandGripX: Float = 0.5
+        var avatarID=ProcessInfo.processInfo.environment["GMGN_PROP_TOOL_TEST_AVATAR_ID"] ?? "pmx.2b-miss-0414-standard"
         let service=ResidentPropPlacementService(context:context,support:{flat},isCurrent:{current.value},
-            currentAvatarAssetID:{"pmx.2b-miss-0414-standard"},makeGripCalibration:{ prop, avatarID, point in
+            currentAvatarAssetID:{avatarID},makeGripCalibration:{ prop, avatarID, point in
                 // 挂点跟着调用方给的那一个走（`point.worldSlot`）：换挂点时标定里的挂点必须跟着变，
                 // 否则世界那条 `.adjustGrip` 会以"标定说的挂点不是它"为由拒绝。
                 //
@@ -144,7 +180,7 @@ struct FlatRoomAndTable: WorldPropSupportQuerying {
                         + "期望=一条已准备的资产记录 实际=nil（这一刻资产准备还没轮到它）")
                 }
                 return WorldPropGripCalibration(avatarAssetID:avatarID,hand:point.worldSlot,
-                    normalizedGrip:.init(x:0.5,y:0.5,z:0.5),localOffset:.init(x:0,y:0,z:0),
+                    normalizedGrip:.init(x:point == .rightHand ? verifiedHandGripX : 0.5,y:0.5,z:0.5),localOffset:.init(x:0,y:0,z:0),
                     localRotation:.init(x:0,y:0,z:0,w:1))
             })
         let prop=WorldGeneratedProp(objectID:"owned",sourceWishID:"wish",assetID:"sha256:fixture",displayName:"摆件",size:.init(x:0.2,y:0.3,z:0.2),sourceHeight:1)
@@ -160,7 +196,7 @@ struct FlatRoomAndTable: WorldPropSupportQuerying {
         func payload(_ result:RealtimeDJToolResult)->[String:Any]{(try! JSONSerialization.jsonObject(with:result.resultJSON)) as! [String:Any]}
         // `delete_prop`（永久删除一件生成资产）是第十一个原语工具：它和别的原语一样
         // 走同一条 grant/白名单与同一份契约，所以这里钉住"工具面就是这十一件、不多不少"。
-        check(Set(human.tools.map(\.name)) == ["read_owned_props","list_placement_surfaces","preview_prop_placement","apply_prop_placement","withdraw_prop","undo_prop_placement","hold_prop","adjust_held_prop_grip","return_held_prop","enable_prop_capability","delete_prop"],"eleven primitive tools")
+        check(Set(human.tools.map(\.name)) == ["read_owned_props","list_placement_surfaces","preview_prop_placement","apply_prop_placement","withdraw_prop","undo_prop_placement","hold_prop","adjust_held_prop_grip","return_held_prop","drop_held_prop","enable_prop_capability","delete_prop"],"twelve primitive tools including nearby release")
         let schemas=try JSONSerialization.data(withJSONObject:human.tools.map{$0.inputSchema},options:.sortedKeys)
         check(schemas == (try JSONSerialization.data(withJSONObject:readonly.tools.map{$0.inputSchema},options:.sortedKeys)),"human/background schema stable")
         let read=try await invoke(readonly,"read_owned_props",[:])
@@ -189,6 +225,13 @@ struct FlatRoomAndTable: WorldPropSupportQuerying {
         let before=context.state
         let preview=try await invoke(readonly,"preview_prop_placement",place)
         check(!preview.isError && context.state == before,"background preview has no mutation")
+        let overlap = try await invoke(readonly,"preview_prop_placement",
+            ["object_id":"owned","surface_id":"floor","x":6,"y":0,"z":-8,"yaw":0],"builtin-overlap")
+        check(overlap.isError,"real built-in overlap remains rejected")
+        check(String(decoding:overlap.resultJSON,as:UTF8.self).contains(deviceID),
+              "overlap rejection names the real built-in obstacle")
+        check(!String(decoding:overlap.resultJSON,as:UTF8.self).contains("unmodelled"),
+              "valid built-in collision is modelled through placement service")
         place["layout_revision"]=1
         check(try await invoke(readonly,"apply_prop_placement",place).isError && context.state == before,"background placement denied")
         check(!(try await invoke(human,"apply_prop_placement",place,"place")).isError && context.state.objectStates["owned"]?.isEnabled == true,"human same service placement")
@@ -200,6 +243,8 @@ struct FlatRoomAndTable: WorldPropSupportQuerying {
         check(context.state.objectStates["owned"]?.isEnabled == false,"withdraw keeps inventory")
         check(!(try await invoke(human,"undo_prop_placement",["layout_revision":3],"undo")).isError && context.state.objectStates["owned"]?.isEnabled == true,"one undo restores")
         check(try await invoke(human,"undo_prop_placement",["layout_revision":4],"undo2").isError,"second undo rejected")
+        _ = try context.move(to:"owned")
+        for _ in 0..<100 { try context.tick(deltaTime:0.1) }
         let placedBeforeHold=context.state.objectStates["owned"]!
         check(try await invoke(readonly,"hold_prop",["object_id":"owned","layout_revision":4],"background-hold").isError,"background hold denied")
         check(!(try await invoke(human,"hold_prop",["object_id":"owned","layout_revision":4],"hold")).isError,"human hold accepted")
@@ -209,7 +254,13 @@ struct FlatRoomAndTable: WorldPropSupportQuerying {
         let grip:[String:Any]=["object_id":"owned","layout_revision":5,"offset_x":0.02,"offset_y":0.01,"offset_z":-0.03,"rotation_yaw":0.2]
         check(!(try await invoke(human,"adjust_held_prop_grip",grip,"grip")).isError,"human grip adjustment accepted")
         check(context.state.objectStates["owned"]?.gripCalibration?.localOffset.x == 0.02,"grip saved on same object")
-        check(!(try await invoke(human,"return_held_prop",["object_id":"owned","layout_revision":6],"return")).isError,"human return accepted")
+        let humanReturn = try await invoke(human,"return_held_prop",["object_id":"owned","layout_revision":6],"return")
+        if humanReturn.isError {
+            // This fixture contains no credentials, paths or transport headers.
+            let failure = payload(humanReturn)
+            print("return failure code=\(failure["code"] ?? "nil") message=\(failure["message"] ?? "nil") actor=\(context.state.agentTransform.position) originalLanding=\(placedBeforeHold.transform.position)")
+        }
+        check(!humanReturn.isError,"human return accepted")
         check(context.state.heldProp == nil && context.state.objectStates["owned"]?.transform == placedBeforeHold.transform,"return restores exact placement")
         let stable=context.state
         current.value=false
@@ -294,6 +345,35 @@ struct FlatRoomAndTable: WorldPropSupportQuerying {
         check(!(try await invoke(human, "hold_prop", ["object_id": "owned", "layout_revision": context.state.layoutRevision], "hold-default-slot")).isError,
               "不带 slot 的 hold_prop 必须照旧成功（省缺 = 右手）")
         check(context.state.heldProp?.hand == .rightHand, "省缺挂点还是 rightHand（旧行为逐字节不变）")
+        let heldBeforeRegrip = context.state.heldProp!
+        let objectCountBeforeRegrip = context.state.objectStates.count
+        verifiedHandGripX = 0.8375 // explicit revised fixture evidence, no production asset special case
+        check(!(try await invoke(human, "adjust_held_prop_grip",
+            ["object_id": "owned", "layout_revision": context.state.layoutRevision,
+             "offset_x": 0, "offset_y": -0.05, "offset_z": 0, "rotation_yaw": 0], "offset-only-before-regrip")).isError,
+              "偏移微调仍可用")
+        check(context.state.objectStates["owned"]?.gripCalibration?.normalizedGrip.x == 0.5,
+              "偏移微调保留旧normalizedGrip，不能冒充柄部重标定")
+        check(!(try await invoke(human, "hold_prop",
+            ["object_id": "owned", "layout_revision": context.state.layoutRevision, "slot": "rightHand"], "same-slot-regrip")).isError,
+              "同一物件同一挂点重新握好必须走完整标定")
+        check(context.state.objectStates["owned"]?.gripCalibration?.normalizedGrip.x == verifiedHandGripX,
+              "同挂点hold_prop必须持久更新normalizedGrip，不能只改offset")
+        check(context.state.heldProp?.objectID == heldBeforeRegrip.objectID
+              && context.state.heldProp?.avatarAssetID == heldBeforeRegrip.avatarAssetID
+              && context.state.heldProp?.returnState.transform == heldBeforeRegrip.returnState.transform
+              && context.state.heldProp?.returnState.isEnabled == heldBeforeRegrip.returnState.isEnabled
+              && context.state.heldProp?.returnState.generatedProp == heldBeforeRegrip.returnState.generatedProp
+              && context.state.objectStates.count == objectCountBeforeRegrip,
+              "重新握好保留同一身份、放回位置及物件数量，不放回重拿或生成新物件")
+        var oldReturnMetadata = heldBeforeRegrip.returnState.metadata
+        var newReturnMetadata = context.state.heldProp!.returnState.metadata
+        oldReturnMetadata.removeValue(forKey: "gmgn.prop-grip.v1")
+        newReturnMetadata.removeValue(forKey: "gmgn.prop-grip.v1")
+        check(oldReturnMetadata == newReturnMetadata
+              && context.state.heldProp?.returnState.gripCalibration == context.state.objectStates["owned"]?.gripCalibration,
+              "放回位非grip metadata不变；grip metadata与当前物件同步更新")
+        verifiedHandGripX = 0.5
         // 说"挂背后" ⇒ 就地换挂点，回执里必须有挂点名。
         let switched = try await invoke(human, "hold_prop",
             ["object_id": "owned", "layout_revision": context.state.layoutRevision, "slot": "背后"], "hold-back")
@@ -470,7 +550,7 @@ struct FlatRoomAndTable: WorldPropSupportQuerying {
         }
         // ⑤ 描述要**教得会**：挂点那一族（hold / adjust / return）的描述必须点名自己的必填参数；
         //    `hold_prop` 还要把**每一个**挂点取值、人话名与"不传会怎样"写出来。
-        for name in ["hold_prop", "adjust_held_prop_grip", "return_held_prop"] {
+        for name in ["hold_prop", "adjust_held_prop_grip", "return_held_prop", "drop_held_prop"] {
             let tool = human.tools.first { $0.name == name }!
             for key in (tool.inputSchema["required"] as? [String]) ?? [] {
                 check(tool.description.contains(key),
@@ -487,6 +567,10 @@ struct FlatRoomAndTable: WorldPropSupportQuerying {
         }
         check(holdTool.description.contains("省缺") || holdTool.description.contains("不写就是"),
               "hold_prop 的描述必须说清「不传 slot 会怎样」（省缺 = rightHand）")
+        let adjustTool = human.tools.first { $0.name == "adjust_held_prop_grip" }!
+        check(holdTool.description.contains("重新握好") && holdTool.description.contains("normalizedGrip")
+              && adjustTool.description.contains("保留 normalizedGrip") && adjustTool.description.contains("hold_prop"),
+              "工具路由契约必须明确：重新握好用同挂点hold_prop，offset微调不能纠正剑尖握点")
         let slotDescription = (slotSchema?["description"] as? String) ?? ""
         check((slotDescription.contains("省缺") || slotDescription.contains("不写就是")) && PropAttachmentSlots.acceptedNames.allSatisfy { slotDescription.contains($0) },
               "slot 参数自己的 description 也必须说清三个取值与省缺行为（实测「\(slotDescription)」）")
@@ -559,6 +643,39 @@ struct FlatRoomAndTable: WorldPropSupportQuerying {
         _ = await protocolTool.handle(protocolCall.callID, protocolCall.argumentsJSON)
         check(context.state == protocolState && context.state.layoutRevision == protocolRevision + 1,
               "协议层同一个 callID 重放绝不产生第二条（权威逐位不变、revision 不再涨）")
+        let originalAvatar = avatarID
+        avatarID = "avatar.vrm.rebind-test"
+        let pending = UnityHeldAvatarRebinding.pending(state: context.state, targetAvatarID: avatarID, selectionRevision: 7)!
+        check(pending.isCurrent(state: context.state, targetAvatarID: avatarID, selectionRevision: 7), "当前角色重绑意图有效")
+        check(!pending.isCurrent(state: context.state, targetAvatarID: avatarID, selectionRevision: 8), "更新选择 revision 丢弃旧重绑意图")
+        check(!pending.isCurrent(state: context.state, targetAvatarID: "avatar.third", selectionRevision: 7), "再次切角色丢弃旧重绑意图")
+        let transfer = try service.rebindHeldAvatarCommand(objectID: swordID, previousAvatarAssetID: originalAvatar)
+        try service.commit(transfer, expectedLayoutRevision: context.state.layoutRevision, requestID: "rebind-character")
+        check(context.state.heldProp?.avatarAssetID == avatarID, "换角色原子更新挂载 avatar")
+        check(context.state.heldProp?.objectID == protocolState.heldProp?.objectID && context.state.heldProp?.hand == .back, "换角色保留原物件和槽位")
+        check(context.state.heldProp?.returnState.transform == protocolState.heldProp?.returnState.transform && context.state.heldProp?.returnState.isEnabled == protocolState.heldProp?.returnState.isEnabled, "换角色保留放回位置与 enabled")
+        check(context.state.objectStates[swordID]?.gripCalibration?.normalizedGrip == protocolState.objectStates[swordID]?.gripCalibration?.normalizedGrip, "换角色保留来源握点")
+        let rebound = context.state
+        check(!pending.isCurrent(state: rebound, targetAvatarID: avatarID, selectionRevision: 7), "完成重绑后旧意图失效")
+        do {
+            _ = try service.rebindHeldAvatarCommand(objectID: swordID, previousAvatarAssetID: originalAvatar)
+            check(false, "过期角色不能重绑")
+        } catch { check(context.state == rebound, "过期角色重绑不改状态") }
+        avatarID = originalAvatar
+        let reverse = try service.rebindHeldAvatarCommand(objectID: swordID, previousAvatarAssetID: "avatar.vrm.rebind-test")
+        try service.commit(reverse, expectedLayoutRevision: context.state.layoutRevision, requestID: "rebind-back")
+        check(context.state.heldProp?.avatarAssetID == originalAvatar && context.state.heldProp?.objectID == swordID, "反向切换继续持有同物件")
+        let beforeDrop = context.state
+        let nearbyArguments:[String:Any] = ["object_id":swordID,"layout_revision":beforeDrop.layoutRevision]
+        let deniedDrop = try await invoke(readonly,"drop_held_prop",nearbyArguments,"background-drop")
+        check(deniedDrop.isError && context.state == beforeDrop,"nearby drop needs current human authorization")
+        let dropped = try await invoke(human,"drop_held_prop",nearbyArguments,"human-nearby-drop")
+        check(!dropped.isError,"human nearby drop follows the same verified placement service")
+        check(payload(dropped)["release_disposition"] as? String == "dropped_nearby","drop receipt distinguishes nearby floor from original/inventory return")
+        check(context.state.heldProp == nil && context.state.objectStates[swordID]?.isEnabled == true,"nearby drop releases to visible room object")
+        let landing=context.state.objectStates[swordID]!.transform.position
+        check(hypot(landing.x-beforeDrop.agentTransform.position.x,landing.z-beforeDrop.agentTransform.position.z)<=WorldPropActivityTemplate.interactionReach,
+          "tool cannot drop the sword remotely")
         print("PASS: \(checks) resident prop tool checks")
     }
 }
@@ -590,7 +707,7 @@ func buildHarness(bridgePath:String,executable:URL)throws->Int32{
     // 工具面那一段断言要的是**真的宿主校验器**（`ResidentDSHOriginalSchemaValidator`），
     // 不是它的第二份抄写：原 schema 被挡回（真机 2026-10-02 `minimum`）必须由本文件编出的
     // 生产文件自己回答。它自包含（只依赖 Foundation），可以直接编进来。
-    sources.appendingPathComponent("Agent/ResidentDSHAgentToolBridge.swift").path,file.path,"-o",executable.path]+objects)
+    sources.appendingPathComponent("Agent/ResidentDSHAgentToolBridge.swift").path,root.appendingPathComponent("apps/macos/UnityHost/UnityHeldAvatarRebinding.swift").path,file.path,"-o",executable.path]+objects)
 }
 /// 跑内层程序并**收走**它的输出。负对照那两次跑必须收走：注入之后内层程序会打自己的
 /// `FAIL:` 行 —— 那是**注入生效的证据**，不是这次门禁失败。让它直接落到 stdout 上，
@@ -712,4 +829,10 @@ try negativeControl("把可省的 slot 标成必填",
     replacing: "\"required\": properties.keys.filter { !(name == \"hold_prop\" && $0 == \"slot\") }.sorted(),",
     with: "\"required\": properties.keys.sorted(),",
     fileName: "ResidentPropToolBridge.required.swift")
+// ⑦ Remove the crucial distinction that offset adjustment preserves the old anchor.
+try negativeControl("删除重新握好与offset微调的路由区分",
+    from: productionBridgeSource,
+    replacing: "它保留 normalizedGrip，无法纠正握在剑尖或重新选择柄部。",
+    with: "可以微调道具。",
+    fileName: "ResidentPropToolBridge.regrip-routing.swift")
 exit(0)

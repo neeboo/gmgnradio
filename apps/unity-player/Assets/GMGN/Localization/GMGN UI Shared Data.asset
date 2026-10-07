@@ -175,14 +175,414 @@ MonoBehaviour:
     m_Key: inboxNotConnected
     m_Metadata:
       m_Items: []
+  - m_Id: 24109056
+    m_Key: basicDevices
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691968
+    m_Key: wishMachine
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691969
+    m_Key: jukebox
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691970
+    m_Key: wishTitle
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691971
+    m_Key: wishCreateInChat
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691972
+    m_Key: wishEmpty
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691973
+    m_Key: wishFailed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691974
+    m_Key: wishUpdated
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691975
+    m_Key: wishWorking
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691976
+    m_Key: wishInInventory
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691977
+    m_Key: wishRetryInventory
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691978
+    m_Key: wishClaim
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691979
+    m_Key: wishStage_pending
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691980
+    m_Key: wishStage_submitted
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691981
+    m_Key: wishStage_generating
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691982
+    m_Key: wishStage_ready
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691983
+    m_Key: wishStage_claimed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691984
+    m_Key: wishStage_failed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691985
+    m_Key: wishStage_cancelled
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691986
+    m_Key: wishStage_queued
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691987
+    m_Key: wishStage_running
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691988
+    m_Key: chatAccepted
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691989
+    m_Key: chatFailed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691990
+    m_Key: chatCancelled
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691991
+    m_Key: chatNotConnected
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691992
+    m_Key: serviceConnectionFailed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691993
+    m_Key: pttState_idle
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691994
+    m_Key: pttState_connecting
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691995
+    m_Key: pttState_listening
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691996
+    m_Key: pttState_transcribing
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691997
+    m_Key: pttState_error
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691998
+    m_Key: pttState_completed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36691999
+    m_Key: pttError_microphone_permission
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692000
+    m_Key: pttError_microphone_permission_pending
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692001
+    m_Key: pttError_asr_empty
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692002
+    m_Key: pttError_asr_failed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692003
+    m_Key: pttError_asr_send_failed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692004
+    m_Key: pttError_asr_connect_failed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692005
+    m_Key: pttError_asr_commit_failed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692006
+    m_Key: pttError_asr_timeout
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692007
+    m_Key: pttError_capture_empty
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692008
+    m_Key: pttError_capture_failed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692009
+    m_Key: pttError_capture_backpressure
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692010
+    m_Key: wishStage_submitting
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692011
+    m_Key: wishStage_submissionUncertain
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692012
+    m_Key: wishStage_generated
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692013
+    m_Key: wishStage_interrupted
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692014
+    m_Key: generation_not_configured
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692015
+    m_Key: generation_configuration_loaded
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692016
+    m_Key: generation_configuration_unreadable
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692017
+    m_Key: generation_configuration_saved
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692018
+    m_Key: generation_configuration_save_failed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692019
+    m_Key: generation_endpoint_requires_token
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692020
+    m_Key: generation_connection_ok
+    m_Metadata:
+      m_Items: []
+  - m_Id: 36692021
+    m_Key: generation_connection_failed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 15853666951168
+    m_Key: screenTitle
+    m_Metadata:
+      m_Items: []
+  - m_Id: 15853679534080
+    m_Key: screenURL
+    m_Metadata:
+      m_Items: []
+  - m_Id: 15853679534081
+    m_Key: screenPlay
+    m_Metadata:
+      m_Items: []
+  - m_Id: 15853679534082
+    m_Key: screenStop
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061047664640
+    m_Key: compactWindow
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219072
+    m_Key: restoreWindow
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219073
+    m_Key: replyHistory
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219074
+    m_Key: chatResponding
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219075
+    m_Key: chatStopFailed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219076
+    m_Key: serviceNotConnected
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219077
+    m_Key: chatRoleUser
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219078
+    m_Key: chatRoleResident
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219079
+    m_Key: chatSendFailed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219080
+    m_Key: chatIncomplete
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219081
+    m_Key: chatDraftNotEmpty
+    m_Metadata:
+      m_Items: []
+  - m_Id: 55061081219082
+    m_Key: serviceConnecting
+    m_Metadata:
+      m_Items: []
+  - m_Id: 321916169609216
+    m_Key: wishRefresh
+    m_Metadata:
+      m_Items: []
+  - m_Id: 321916182192128
+    m_Key: wishClose
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304766791680
+    m_Key: libraryTitle
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763200
+    m_Key: libraryBack
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763201
+    m_Key: libraryRefresh
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763202
+    m_Key: libraryClose
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763203
+    m_Key: libraryPlaylists
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763204
+    m_Key: libraryTracks
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763205
+    m_Key: libraryLoading
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763206
+    m_Key: libraryBusy
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763207
+    m_Key: libraryPreparing
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763208
+    m_Key: libraryPrepareFailed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763209
+    m_Key: libraryTracksLoading
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763210
+    m_Key: libraryPlaylistBusy
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763211
+    m_Key: libraryTrackCount
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763212
+    m_Key: libraryPlaying
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763213
+    m_Key: libraryPlayingTitle
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763214
+    m_Key: libraryProviderNetease
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763215
+    m_Key: libraryProviderQQ
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763216
+    m_Key: libraryUnavailable
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763217
+    m_Key: libraryEmpty
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763218
+    m_Key: librarySelectPlaylist
+    m_Metadata:
+      m_Items: []
+  - m_Id: 331304787763219
+    m_Key: libraryPlayHint
+    m_Metadata:
+      m_Items: []
+  - m_Id: 350953789186048
+    m_Key: chatVoiceReady
+    m_Metadata:
+      m_Items: []
+  - m_Id: 350953801768960
+    m_Key: chatVoiceListening
+    m_Metadata:
+      m_Items: []
+  - m_Id: 363351027736576
+    m_Key: pttError_asr_service_unavailable
+    m_Metadata:
+      m_Items: []
+  - m_Id: 363351040319488
+    m_Key: pttError_asr_configuration_missing
+    m_Metadata:
+      m_Items: []
+  - m_Id: 363351040319489
+    m_Key: pttError_asr_protocol_failed
+    m_Metadata:
+      m_Items: []
+  - m_Id: 363351040319490
+    m_Key: pttError_asr_provider_failed
+    m_Metadata:
+      m_Items: []
   m_Metadata:
     m_Items: []
   m_KeyGenerator:
-    rid: 7999650898074927128
+    rid: 7999650900425310209
   references:
     version: 2
     RefIds:
-    - rid: 7999650898074927128
+    - rid: 7999650900425310209
       type: {class: DistributedUIDGenerator, ns: UnityEngine.Localization.Tables, asm: Unity.Localization}
       data:
-        m_CustomEpoch: 1791178682894
+        m_CustomEpoch: 1791187647820

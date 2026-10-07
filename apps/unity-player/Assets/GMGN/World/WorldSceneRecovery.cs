@@ -21,6 +21,7 @@ namespace GMGN.UnityPlayer.World
         public string Status;
         public string Message;
         public GameObject Instance;
+        public string AssetMetadata;
     }
 
     public static class WorldCoordinates
@@ -57,29 +58,43 @@ namespace GMGN.UnityPlayer.World
         public async Task<IReadOnlyList<RecoveryItem>> Restore(PortableWorldPackage package, string worldID, Transform parent, CancellationToken cancellation)
         {
             var state = package.State(worldID);
+            return await RestoreState(state, parent, (prop, token) => Task.FromResult(assetReference == null
+                ? package.ResolveAssetID((string)prop["assetID"]) : package.ResolveReference(assetReference((string)prop["assetID"]))), cancellation);
+        }
+
+        public async Task<IReadOnlyList<RecoveryItem>> RestoreState(JObject state, Transform parent,
+            Func<JObject, CancellationToken, Task<string>> resolveAsset, CancellationToken cancellation,
+            bool includeInventory = false)
+        {
             var objects = state["objectStates"] as JObject ?? throw new InvalidDataException("空间缺少物件状态。");
             var heldID = (string)state["heldProp"]?["objectID"];
             var result = new List<RecoveryItem>();
             foreach (var entry in objects.Properties())
             {
                 cancellation.ThrowIfCancellationRequested();
+                if (includeInventory && entry.Value["metadata"]?["gmgn.builtin-device.v1"] != null) continue;
                 var item = new RecoveryItem { ObjectID = entry.Name };
                 result.Add(item);
-                if ((bool?)entry.Value["isEnabled"] != true) { item.Status = "disabled"; item.Message = "物件仍在库存中。"; continue; }
-                if (entry.Name == heldID) { item.Status = "unsupported"; item.Message = "已保留手持状态，人物挂点尚未迁移。"; continue; }
+                var enabled = (bool?)entry.Value["isEnabled"] == true;
+                var held = entry.Name == heldID;
+                if (!enabled && !includeInventory && !held) { item.Status = "disabled"; item.Message = "物件仍在库存中。"; continue; }
                 GameObject loaded = null;
+                var phase = "metadata";
                 try
                 {
                     var raw = (string)entry.Value["metadata"]?["gmgn.generated-prop.v1"];
                     if (raw == null) { item.Status = "unsupported"; item.Message = "空间包自带设备尚未接入资产恢复。"; continue; }
                     var prop = JObject.Parse(raw);
+                    item.AssetMetadata = raw;
                     if ((string)prop["objectID"] != entry.Name) throw new InvalidDataException("物件资产身份不一致。");
                     if (loader == null) { item.Status = "unsupported"; item.Message = "物件数据已保留，模型加载器尚未接入。"; continue; }
-                    var id = (string)prop["assetID"];
-                    var path = assetReference == null ? package.ResolveAssetID(id) : package.ResolveReference(assetReference(id));
+                    phase = "resolve";
+                    var path = await resolveAsset(prop, cancellation);
+                    phase = "transform";
                     var transform = entry.Value["transform"];
                     var position = WorldCoordinates.Position(transform?["position"]);
                     var rotation = WorldCoordinates.Rotation(transform?["rotation"]);
+                    phase = "load";
                     loaded = await loader.LoadPreparedAsset(path, prop, cancellation);
                     cancellation.ThrowIfCancellationRequested();
                     if (loaded == null) throw new InvalidDataException("模型没有成功加载。");
@@ -89,7 +104,9 @@ namespace GMGN.UnityPlayer.World
                     // Generated props are already normalized to effectiveSize by
                     // the loader. Legacy transform.scale encodes that same size.
                     loaded.name = entry.Name;
-                    item.Instance = loaded; item.Status = "restored"; item.Message = "物件模型和位置已恢复。";
+                    loaded.SetActive(enabled && !held);
+                    item.Instance = loaded; item.Status = held ? "attachment_pending" : enabled ? "restored" : "inventory";
+                    item.Message = held ? "手持模型已准备，等待角色挂点。" : enabled ? "物件模型和位置已恢复。" : "模型已准备，可以从库存开始摆放。";
                 }
                 catch (OperationCanceledException) { if (loaded != null) UnityEngine.Object.Destroy(loaded); throw; }
                 catch (Exception error)
@@ -99,8 +116,8 @@ namespace GMGN.UnityPlayer.World
                     item.Message = error is InvalidDataException || error is WorldMaterialException ? error.Message : "这个物件恢复失败，原数据仍保留在备份中。";
                     // No exception stack/message here: IO errors can contain a
                     // user's absolute path. IDs and bounded codes are sufficient.
-                    var code = error is WorldMaterialException material ? material.Code : error is InvalidDataException ? "invalid_asset" : error.GetType().Name;
-                    Debug.LogWarning("[WorldRecoveryFailure] object=" + entry.Name + " code=" + code);
+                    var code = error is WorldMaterialException material ? material.Code : WorldAssetFailureDiagnostics.Code(error);
+                    Debug.LogWarning("[WorldRecoveryFailure] object=" + entry.Name + " phase=" + phase + " code=" + code);
                 }
             }
             return result;

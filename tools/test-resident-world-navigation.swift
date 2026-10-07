@@ -10,6 +10,17 @@ struct Floor: WorldCollisionQuerying {
     func groundHeight(at position: SIMD3<Float>) -> Float? { 0 }
     func canOccupy(_ capsule: WorldCapsule, at position: SIMD3<Float>) -> Bool { true }
 }
+final class RestoredState: WorldStatePersisting, @unchecked Sendable {
+    let value: WorldState
+    init(_ value: WorldState) { self.value=value }
+    func load() throws -> WorldState? { value }
+    func save(_ state: WorldState) throws { }
+}
+final class CheckpointCounter: WorldStatePersisting, @unchecked Sendable {
+    var saves = 0
+    func load() throws -> WorldState? { nil }
+    func save(_ state: WorldState) throws { saves += 1 }
+}
 final class ClosingFloor: WorldCollisionQuerying, @unchecked Sendable {
     var closed = false
     func groundHeight(at position: SIMD3<Float>) -> Float? { 0 }
@@ -29,6 +40,34 @@ final class DoorFloor: WorldCollisionQuerying, @unchecked Sendable {
 @main struct Tests {
     @MainActor static func main() throws {
         let worldURL = URL(fileURLWithPath: "apps/macos/Resources/Worlds/marble-living-cabin/world.json")
+        let cabinManifest = try JSONDecoder().decode(WorldManifest.self, from: Data(contentsOf: worldURL))
+        let jukebox = try JSONDecoder().decode(WorldProceduralPropDeclaration.self,
+            from: Data(contentsOf: worldURL.deletingLastPathComponent().appendingPathComponent("jukebox.json")))
+        var restored = WorldSimulation(manifest:cabinManifest,startedAt:Date()).state
+        restored.objectStates[jukebox.objectID] = WorldObjectState(transform:WorldTransform(
+            position:jukebox.seedPosition,rotation:WorldQuaternion(x:0,y:0,z:0,w:1),scale:WorldVector3(x:1,y:1,z:1)))
+        restored.activeActivity = WorldActivityState(activityID:"music.listen",status:.running,startedAt:restored.worldTime)
+        let resumed = try WorldAgentContext(manifest:cabinManifest,persistence:RestoredState(restored),
+            propFunctionSources:[jukebox.functionSource!],initialCollisionWorld:Floor())
+        check(resumed.currentActivityRequestID != nil,"persisted device activity restores after floor is installed at construction")
+        try resumed.adoptAuthorityState(resumed.state,propFunctionSources:resumed.propFunctionSources)
+        check(resumed.currentActivityRequestID != nil,"initial projection adoption retains restored activity renderer lease")
+        let cabinContext = try WorldAgentContext(manifest: cabinManifest)
+        let spawnPosition = cabinManifest.spawn.position
+        let cabinSpawn = SIMD3(spawnPosition.x, spawnPosition.y, spawnPosition.z)
+        check(cabinContext.collisionWorld.groundHeight(at: cabinSpawn) == nil,
+              "furniture-only package cannot supply the cabin floor")
+        let marble = try JSONSerialization.jsonObject(with: Data(contentsOf: worldURL.deletingLastPathComponent().appendingPathComponent("marble.json"))) as! [String: Any]
+        let framing = marble["framing"] as! [String: Any]
+        let origin = framing["origin"] as! [NSNumber]
+        let transform = WorldMeshTransform(axisConversion: .flipYAndZ,
+            origin: SIMD3(origin[0].floatValue, origin[1].floatValue, origin[2].floatValue),
+            uniformScale: (framing["scale"] as! NSNumber).floatValue)
+        let triangles = try GLBColliderDecoder().decode(data: Data(contentsOf: worldURL.deletingLastPathComponent().appendingPathComponent("collider.glb")), transform: transform)
+        cabinContext.installCollisionWorld(TriangleMeshCollisionWorld(triangles: triangles))
+        check(cabinContext.collisionWorld.groundHeight(at: cabinSpawn) != nil,
+              "real cabin collider supplies the measured floor")
+        _ = try cabinContext.planRoute(to: "wp.jukebox")
         var json = try JSONSerialization.jsonObject(with: Data(contentsOf: worldURL)) as! [String: Any]
         let ids = ["wp.spawn", "wp.center", "wp.jukebox", "wish_machine.pickup"]
         json["waypoints"] = ids.enumerated().map { i, id in
@@ -40,7 +79,15 @@ final class DoorFloor: WorldCollisionQuerying, @unchecked Sendable {
         json["routes"] = [["id": "tour", "waypointIDs": ids + [ids[0]], "bidirectional": true, "enabled": true]]
         json["collisionVolumes"] = []
         let manifest = try JSONDecoder().decode(WorldManifest.self, from: JSONSerialization.data(withJSONObject: json))
+        let checkpoints = CheckpointCounter()
+        let retiring = try WorldAgentContext(manifest: manifest, persistence: checkpoints)
+        retiring.stopTicking(checkpoint: false)
+        check(checkpoints.saves == 0, "retired Unity projection does not invalidate successor authority revision")
+        retiring.stopTicking()
+        check(checkpoints.saves == 1, "ordinary stop retains its checkpoint behavior")
         let context = try WorldAgentContext(manifest: manifest, walkingSpeed: 1)
+        var rendererStops = 0
+        context.onActivityStopped = { rendererStops += 1 }
         context.installCollisionWorld(Floor())
         _ = try context.move(to: "wp.center")
         try context.tick(deltaTime: 0.25)
@@ -48,6 +95,9 @@ final class DoorFloor: WorldCollisionQuerying, @unchecked Sendable {
         let stopped = context.state.agentTransform.position
         try context.tick(deltaTime: 1)
         check(context.snapshot.movement == nil && context.state.agentTransform.position == stopped, "stop cancels ordinary movement")
+        check(rendererStops == 1, "movement stop clears renderer-owned manual motion")
+        try context.stopActivity()
+        check(rendererStops == 2, "idle stop still clears a manually selected rendered loop")
         let walking = try WorldAgentContext(manifest: manifest, walkingSpeed: 1)
         walking.installCollisionWorld(Floor())
         try walking.startActivity(id: "home.walk")
@@ -130,6 +180,12 @@ final class DoorFloor: WorldCollisionQuerying, @unchecked Sendable {
         check(activity.state.activeActivity == nil && activity.state.agentTransform.position == failurePosition, "failed activity cannot keep patrolling")
         check(activity.events.contains { if case .activityFailed(activityID: "home.walk", reason: "missingMotion") = $0.kind { true } else { false } }, "missing animation emits activity failure")
         check(!activity.events.contains { if case .activityCompleted(activityID: "home.walk") = $0.kind { true } else { false } }, "failed activity never turns into timer success")
+        let timedPerformance = try WorldAgentContext(manifest: manifest)
+        timedPerformance.installCollisionWorld(Floor())
+        try timedPerformance.startActivity(id: "performance.backflip")
+        timedPerformance.waitsForRenderedActivityCompletion = { true }
+        for _ in 0..<100 { try timedPerformance.tick(deltaTime: 0.1) }
+        check(timedPerformance.snapshot.activeActivity?.phase == .loop, "empty enter advances despite renderer completion gate")
         try activity.startActivity(id: "performance.backflip")
         let performanceID = activity.currentActivityRequestID!
         try activity.completeActivityPlayback(requestID: "old", phase: .enter)

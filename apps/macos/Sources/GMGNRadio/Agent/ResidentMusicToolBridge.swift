@@ -9,17 +9,35 @@ final class ResidentMusicToolBridge {
         "read_radio_state", "read_current_track", "list_music_playlists",
         "read_music_playlist", "prepare_music_track",
     ]
+    /// Explicitly supplied by a host implementing the existing radio actions.
+    /// Program planning and spatial mutation are deliberately separate services.
+    static let playbackNames: Set<String> = names.union([
+        "search_music", "play_program_track", "next_track", "previous_track",
+        "pause_music", "resume_music", "set_lyrics_mode",
+    ])
+    static let planningNames: Set<String> = ["replan_program", "activate_prepared_program", "insert_track"]
+    static let spatialNames: Set<String> = ["set_spatial_environment", "move_spatial_camera"]
 
     private let dispatcher: DJAgentToolDispatcher
+    private let actions: any DJAgentRadioActions
     private let isCurrent: @MainActor () -> Bool
+    private let exportedNames: Set<String>
+    private let permitsWorldTransitionResult: Bool
 
-    init(actions: any DJAgentRadioActions, isCurrent: @escaping @MainActor () -> Bool) {
-        dispatcher = DJAgentToolDispatcher(takeoverEnabled: { true }, actions: actions)
+    init(actions: any DJAgentRadioActions, isCurrent: @escaping @MainActor () -> Bool,
+         exportedNames: Set<String> = ResidentMusicToolBridge.names,
+         permitsWorldTransitionResult: Bool = false,
+         takeoverEnabled: @escaping @MainActor () -> Bool = { true }) {
+        self.actions = actions
+        dispatcher = DJAgentToolDispatcher(takeoverEnabled: takeoverEnabled, actions: actions)
         self.isCurrent = isCurrent
+        self.permitsWorldTransitionResult = permitsWorldTransitionResult
+        self.exportedNames = exportedNames.intersection(Self.playbackNames.union(Self.planningNames).union(Self.spatialNames))
     }
 
     var tools: [ResidentWorldToolSession.AdditionalTool] {
-        let capabilities = DJAgentCapabilityManifest.capabilities.filter { Self.names.contains($0.name) }
+        let available = Set(actions.snapshot(takeoverEnabled: true).capabilities.map(\.name))
+        let capabilities = DJAgentCapabilityManifest.capabilities.filter { exportedNames.contains($0.name) && available.contains($0.name) }
         return DJAgentCapabilityManifest.providerTools(for: capabilities).compactMap { entry in
             guard let function = entry["function"] as? [String: Any],
                   let name = function["name"] as? String,
@@ -46,6 +64,9 @@ final class ResidentMusicToolBridge {
             case "integer":
                 guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
                       number.doubleValue.isFinite, number.doubleValue.rounded() == number.doubleValue else { return false }
+            case "number":
+                guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                      number.doubleValue.isFinite else { return false }
             default: return false
             }
         }
@@ -59,14 +80,24 @@ final class ResidentMusicToolBridge {
             return failure(id, code: "invalid_arguments", message: "音乐工具参数不符合当前契约")
         }
         let result = await dispatcher.handle(RealtimeDJToolCall(id: id, name: capability.name, argumentsJSON: argumentsJSON))
-        guard !Task.isCancelled, isCurrent() else { return stale(id) }
+        guard !Task.isCancelled else { return stale(id) }
         guard var response = (try? JSONSerialization.jsonObject(with: result.resultJSON)) as? [String: Any] else {
             return failure(id, code: "invalid_music_result", message: "音乐工具返回的数据无效")
+        }
+        let worldChanged = !isCurrent()
+        if worldChanged {
+            // A verified scene switch retires this tool's old world lease.
+            // Preserve only its already-applied result, never another old-world call.
+            guard permitsWorldTransitionResult, capability.name == "set_spatial_environment",
+                  arguments["scene"] is String, !result.isError, response["ok"] as? Bool == true else { return stale(id) }
+            response["worldChanged"] = true
+            response["message"] = "空间已切换"
+            response["instruction"] = "空间已切换，本轮旧空间操作租约已结束。请报告结果，后续操作在下一轮使用新空间。"
         }
         if var state = response["state"] as? [String: Any] {
             if let capabilities = state["capabilities"] as? [[String: Any]] {
                 state["capabilities"] = capabilities.filter {
-                    ($0["name"] as? String).map(Self.names.contains) ?? false
+                    ($0["name"] as? String).map(exportedNames.contains) ?? false
                 }
             }
             if let program = state["program"] as? [Any] {

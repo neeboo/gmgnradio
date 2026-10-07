@@ -49,6 +49,7 @@ namespace GMGN.UnityPlayer
         event Action<PlayerSnapshot> Snapshot;
         event Action<ChatUpdate> Chat;
         event Action<string> Status;
+        event Action<string> Error;
         void Tick();
         void PlayPause();
         void ChooseMusic();

@@ -51,6 +51,7 @@ struct YtDlpInvocation: Equatable, Sendable {
             "--no-cache-dir",
             "--no-update",
             "--no-cookies",
+            "--no-js-runtimes",
             "--no-playlist",
             "--simulate",
             "--dump-single-json",
@@ -80,7 +81,9 @@ struct YtDlpInvocation: Equatable, Sendable {
     static func formatSelector(for request: ScreenLinkRequest) -> String {
         let limit = request.preferredMaximumHeight.map { "[height<=\(max($0, 144))]" } ?? ""
         if request.allowsSeparateStreams {
-            return "bv*\(limit)[vcodec^=avc1]+ba[acodec^=mp4a]/bv*\(limit)+ba/b\(limit)/b"
+            // bv* may select a muxed format (YouTube 18) and pair it with audio again.
+            // Prefer actual separate AVC/AAC streams; keep the muxed fallback for sites without them.
+            return "bv\(limit)[vcodec^=avc1]+ba[acodec^=mp4a]/bv*\(limit)+ba/b\(limit)/b"
         }
         return "b\(limit)/b"
     }

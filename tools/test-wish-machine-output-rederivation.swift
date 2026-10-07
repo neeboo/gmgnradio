@@ -351,7 +351,7 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
             .write(to: wishes.appendingPathComponent("wishes.json"))
         let store = PropGenerationStore(directory: scratch,
             daemonClient: PropTaskDaemonClient(root: scratch,
-                socketURL: scratch.appendingPathComponent("taskd.sock"),
+                endpointFileURL: scratch.appendingPathComponent("taskd.endpoint.json"),
                 allowsLaunching: false, requestTimeout: 1))
         let coordinator = WishMachineCoordinator(store: store, directory: wishes, canClaim: { _ in nil })
         check(coordinator.residentJobs(worldID: world, residentScope: scope).count == 1,
@@ -439,7 +439,7 @@ let binary = directory.appendingPathComponent("check")
 try behavior.write(to: program, atomically: true, encoding: .utf8)
 
 let inputs = ["Presence/PropGenerationClient", "Presence/PropGenerationStore",
-              "Presence/PropTaskDaemonClient", "Presence/PropImagePreparation",
+              "Presence/PropTaskDaemonClient", "Presence/TaskdHTTPTransport", "Presence/PropImagePreparation",
               "Presence/PropGenerationConfiguration", "Presence/WishMachineCoordinator",
               "Presence/WishMachineOutputDescriptor", "Presence/WishMachineTaskPresentation",
               // 任务行那一句委托给唯一投影（`OwnershipSentence` 是唯一出口），一起编。

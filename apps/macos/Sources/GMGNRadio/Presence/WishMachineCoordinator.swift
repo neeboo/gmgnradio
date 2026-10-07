@@ -1035,8 +1035,12 @@ enum WishMachineError: LocalizedError {
     func markEventPublished(id: UUID) throws {
         guard readable else { throw WishMachineError.unavailable }
         guard let index = events.firstIndex(where: { $0.id == id }), events[index].forwardedToDaemon != true else { return }
+        let previous = events[index].forwardedToDaemon
         events[index].forwardedToDaemon = true
-        try persist()
+        do { try persist() } catch {
+            events[index].forwardedToDaemon = previous
+            throw error
+        }
     }
 
     func automaticContinuationEvents(worldID: String, residentScope: String) -> [WishMachineEvent] {
@@ -1200,8 +1204,25 @@ enum WishMachineError: LocalizedError {
     func acknowledgeEvent(id: UUID) throws {
         guard readable else { throw WishMachineError.unavailable }
         guard let index = events.firstIndex(where: { $0.id == id }) else { return }
+        guard !events[index].acknowledged else { return }
         events[index].acknowledged = true
-        try persist()
+        do { try persist() } catch {
+            events[index].acknowledged = false
+            throw error
+        }
+    }
+
+    func isEventAcknowledged(id: UUID, worldID: String, residentScope: String) -> Bool {
+        guard readable else { return false }
+        return events.contains { $0.id == id && $0.worldID == worldID
+            && $0.residentScope == residentScope && $0.acknowledged }
+    }
+
+    func acknowledgeEvent(id: UUID, worldID: String, residentScope: String) throws {
+        guard readable else { throw WishMachineError.unavailable }
+        guard events.contains(where: { $0.id == id && $0.worldID == worldID
+            && $0.residentScope == residentScope }) else { throw WishMachineError.wrongScope }
+        try acknowledgeEvent(id: id)
     }
 
     /// Durable backend subscription updates drive the same world/UI/agent facts as a manual read.

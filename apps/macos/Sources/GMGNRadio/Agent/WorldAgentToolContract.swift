@@ -41,6 +41,14 @@ struct WorldAgentToolParameter: Codable, Equatable, Sendable {
 
 enum WorldAgentToolContract {
     static let capabilities: [WorldAgentCapability] = [
+        WorldAgentCapability(name: "list_available_motions",
+            description: "列出当前角色已安装且兼容的全部动作，返回精确 motion_id 和名称；人物切换后重新读取",
+            requiresTakeover: false),
+        WorldAgentCapability(name: "play_motion",
+            description: "在角色当前位置播放 list_available_motions 返回的动作。动作本身不代表走到沙发或坐到物件上；需先移动或执行物件活动",
+            requiresTakeover: true,
+            parameters: ["motion_id": WorldAgentToolParameter(type: "string", description: "list_available_motions 返回的精确动作 ID，不使用名称代替")],
+            requiredParameters: ["motion_id"]),
         WorldAgentCapability(
             name: "inspect_world",
             description: "读取世界、角色、天气、活动、移动和镜头的当前快照",
@@ -63,7 +71,7 @@ enum WorldAgentToolContract {
             parameters: [
                 "place_id": WorldAgentToolParameter(
                     type: "string",
-                    description: "世界清单中的地点 ID"
+                    description: "list_places 或 inspect_world 返回的地点 ID；走到生成物件近前时使用该物件的 objectID"
                 ),
             ],
             requiredParameters: ["place_id"]
@@ -75,7 +83,7 @@ enum WorldAgentToolContract {
             parameters: [
                 "place_id": WorldAgentToolParameter(
                     type: "string",
-                    description: "世界清单中的地点 ID"
+                    description: "list_places 或 inspect_world 返回的地点 ID；走到生成物件近前时使用该物件的 objectID"
                 ),
             ],
             requiredParameters: ["place_id"]
@@ -159,7 +167,6 @@ enum WorldAgentToolContract {
     ]
 
     static func capabilities(for manifest: WorldManifest) -> [WorldAgentCapability] {
-        let placeIDs = manifest.waypoints.filter(\.enabled).map(\.id).sorted()
         let activityIDs = manifest.activities.map(\.id).sorted()
         let cameraIDs = manifest.cameras.map(\.id).sorted()
 
@@ -169,8 +176,7 @@ enum WorldAgentToolContract {
             case "plan_route", "move_to", "look_at":
                 parameters["place_id"] = WorldAgentToolParameter(
                     type: "string",
-                    description: "世界清单中的地点 ID",
-                    allowedValues: placeIDs
+                    description: "list_places 或 inspect_world 返回的地点 ID；生成物件使用 objectID，目标随真实摆放位置更新"
                 )
             case "start_activity":
                 parameters["activity_id"] = WorldAgentToolParameter(

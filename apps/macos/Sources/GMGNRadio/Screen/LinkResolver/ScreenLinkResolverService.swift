@@ -46,6 +46,11 @@ final class ScreenLinkResolverService: ScreenLinkResolving, ScreenLinkCancelling
                 ? ScreenLinkHelperLocator.devOverridePath() : nil,
             allowDevOverride: allowDevOverride
         )
+        // Only a hash-verified bundled/managed runtime may be discovered automatically.
+        // Explicit diagnostic runtime arguments retain their existing behavior; never search PATH.
+        let bundledDeno = javascriptRuntimeName == nil && javascriptRuntimePath == nil
+            ? bundledDenoPath(bundleHelpersDirectory: bundleHelpersDirectory,
+                managedHelpersDirectory: managedHelpersDirectory) : nil
         #if os(Windows)
         let runner: ScreenLinkProcessRunning = WindowsScreenLinkProcessRunner()
         #else
@@ -53,9 +58,19 @@ final class ScreenLinkResolverService: ScreenLinkResolving, ScreenLinkCancelling
         #endif
         return ScreenLinkResolverService(
             locator: locator, runner: runner,
-            javascriptRuntimeName: javascriptRuntimeName,
-            javascriptRuntimePath: javascriptRuntimePath
+            javascriptRuntimeName: javascriptRuntimeName ?? (bundledDeno == nil ? nil : "deno"),
+            javascriptRuntimePath: javascriptRuntimePath ?? bundledDeno
         )
+    }
+
+    static func bundledDenoPath(bundleHelpersDirectory: String?, managedHelpersDirectory: String?) -> String? {
+        let locator = ScreenLinkHelperLocator(
+            helperName: "deno", bundleHelpersDirectory: bundleHelpersDirectory,
+            managedHelpersDirectory: managedHelpersDirectory,
+            devOverridePath: nil, allowDevOverride: false
+        )
+        guard case let .found(location) = locator.locate() else { return nil }
+        return location.path
     }
 
     // MARK: 解析

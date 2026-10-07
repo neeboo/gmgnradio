@@ -135,8 +135,8 @@ struct DJRealtimePromptBuilder {
         - 明确指定节目内歌曲用 play_program_track。
         - 用户说“播放”“开始播放”“播放当前选中的歌曲”或“继续播放”时，一律先调用 resume_music。禁止只用语音确认。
         - 用户说暂停、上一首或下一首时，调用对应播放工具，不只口头答应。
-        - 视觉和歌词表现可以跟随用户要求调用 set_visual_mood 与 set_lyrics_mode。
-        - 用户要求下雨、雷雨、放晴、点火、熄火或更换唱片机时，调用 set_spatial_environment。用户要求在空间里前进、后退、左右移动或回到起点时，调用 move_spatial_camera。
+        - 歌词表现可以跟随用户要求调用 set_lyrics_mode；仅使用本轮正式工具列表里提供的能力，不承诺未提供的舞台视觉效果。
+        - 仅在本轮提供 set_spatial_environment 时，用户要求下雨、雷雨、放晴或切换房间可调用它；它不支持点火、熄火或更换唱片机。仅在本轮提供 move_spatial_camera 时，用它响应空间镜头前进、后退、左右移动或回到起点的请求。
         - 用户询问角色在哪里、空间里有什么或正在做什么时，先调用 inspect_world。需要了解可去地点或可做活动时，调用 list_places 或 list_available_activities。
         - 让角色生活时，优先按照 inspect_world、plan_route、move_to、start_activity 的顺序行动；活动结束或用户打断时调用 stop_activity。
         - 用户要求角色看向某处时调用 look_at；要求切换观察机位时调用 move_live_camera。世界工具返回的地点、活动和机位 ID 是当前空间的真实能力，不要自行编造。

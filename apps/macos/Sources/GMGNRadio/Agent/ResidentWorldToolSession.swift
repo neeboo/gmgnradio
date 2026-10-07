@@ -30,6 +30,7 @@ final class ResidentWorldToolSession {
     static let allowedToolNames: Set<String> = [
         "inspect_world", "list_places", "list_available_activities", "plan_route", "move_to",
         "start_activity", "stop_activity", "look_at",
+        "list_available_motions", "play_motion",
     ]
 
     let scopeID: UUID
@@ -187,6 +188,11 @@ final class ResidentWorldToolSession {
             ok: !result.isError,
             replayed: replayed
         ))
+        let payload = (try? JSONSerialization.jsonObject(with: result.resultJSON)) as? [String: Any]
+        let rawCode = payload?["code"] as? String ?? "none"
+        let code = rawCode.range(of: #"^[a-z0-9_]{1,64}$"#, options: .regularExpression) != nil ? rawCode : "unclassified"
+        NSLog("[ResidentTool] name=%@ ok=%d code=%@ replayed=%d",
+              registeredNames.contains(name) ? name : "unsupported", !result.isError ? 1 : 0, code, replayed ? 1 : 0)
         return result
     }
 

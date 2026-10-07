@@ -13,7 +13,7 @@ import Foundation
 //   边界并推进 generation，供调用方安排"每会话只整段恢复一次"。
 //
 // **原文层已整体移除（2026-10-01）**：本类原先还负责
-// `recordDeliveredTurn` → 有界 IPC 队列 → `memory_ingest`，以及 `onStatus`/`onError`
+// `recordDeliveredTurn` → 有界 HTTP 请求队列 → `memory_ingest`，以及 `onStatus`/`onError`
 // 回调与 `cancelPending`。这些都删了，理由与出处见
 // `docs/plans/2026-09-08-voicemem-rust-contract.md` 的「已移除」一节：真机
 // `pendingTurns` 恒为 0、三张记忆表 0 行、`memory_compact` 从未有 dispatch，

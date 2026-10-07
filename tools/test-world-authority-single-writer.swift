@@ -151,8 +151,8 @@ do {
 }
 require(fileManager.fileExists(atPath: daemon), "gmgn-taskd binary missing at \(daemon)")
 
-let exported = "backups/world-state-migration/20261001T061021Z/state/marble-living-cabin/1.2.0/state.json"
-require(fileManager.fileExists(atPath: exported), "exported pre-image missing at \(exported)")
+let exported = CommandLine.arguments.dropFirst().first ?? ""
+require(exported.isEmpty || fileManager.fileExists(atPath: exported), "exported pre-image missing at \(exported)")
 
 // ---------------------------------------------------------------------------
 // 编译并跑行为断言
@@ -167,6 +167,11 @@ let driver = #"""
 import Foundation
 import Darwin
 import WorldRuntime
+
+struct ResidentLeaseFloor: WorldCollisionQuerying {
+    func groundHeight(at position: SIMD3<Float>) -> Float? { 0 }
+    func canOccupy(_ capsule: WorldCapsule, at position: SIMD3<Float>) -> Bool { true }
+}
 
 // Independent S2/S3 verification probe. Drives the production Swift sources
 // against a real `gmgn-taskd` in a throwaway root. Never touches app state.
@@ -214,7 +219,7 @@ func canonical(_ value: [String: Any]) -> String {
 
     struct World {
         let root: URL
-        let socketPath: String
+        let endpointFile: String
         let legacyURL: URL
         let process: Process
     }
@@ -222,14 +227,14 @@ func canonical(_ value: [String: Any]) -> String {
     static func startWorld(tag: String, legacyText: String) throws -> World {
         let root = base.appendingPathComponent("root-\(tag)/TaskService", isDirectory: true)
         try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
-        let socketPath = root.appendingPathComponent("taskd.endpoint.json").path
+        let endpointFile = root.appendingPathComponent("taskd.endpoint.json").path
         let support = base.appendingPathComponent("support-\(tag)", isDirectory: true)
         try fileManager.createDirectory(at: support, withIntermediateDirectories: true)
         let legacyURL = support.appendingPathComponent("state.json")
         try Data(legacyText.utf8).write(to: legacyURL)
         let process = Process()
         process.executableURL = daemonBinary
-        process.arguments = ["--root", root.path, "--endpoint-file", socketPath, "--concurrency", "2"]
+        process.arguments = ["--root", root.path, "--endpoint-file", endpointFile, "--concurrency", "2"]
         let logURL = base.appendingPathComponent("daemon-\(tag).log")
         fileManager.createFile(atPath: logURL.path, contents: nil)
         let log = try FileHandle(forWritingTo: logURL)
@@ -238,21 +243,21 @@ func canonical(_ value: [String: Any]) -> String {
         try process.run()
         daemons.append(process)
         let deadline = Date().addingTimeInterval(15)
-        while !fileManager.fileExists(atPath: socketPath) {
+        while !fileManager.fileExists(atPath: endpointFile) {
             if Date() > deadline {
                 let text = (try? String(contentsOf: logURL, encoding: .utf8)) ?? "<no log>"
                 throw NSError(domain: "probe", code: 1, userInfo: [
                     NSLocalizedDescriptionKey:
-                        "daemon socket never appeared for \(tag); running=\(process.isRunning) status=\(process.terminationStatus) log=\(text)"])
+                        "daemon HTTP endpoint never appeared for \(tag); running=\(process.isRunning) status=\(process.terminationStatus) log=\(text)"])
             }
             Thread.sleep(forTimeInterval: 0.05)
         }
         Thread.sleep(forTimeInterval: 0.2)
-        return World(root: root, socketPath: socketPath, legacyURL: legacyURL, process: process)
+        return World(root: root, endpointFile: endpointFile, legacyURL: legacyURL, process: process)
     }
 
     static func client(_ world: World) -> WorldAuthorityClient {
-        WorldAuthorityClient(worldID: manifest.worldID, socketPath: world.socketPath,
+        WorldAuthorityClient(worldID: manifest.worldID, endpointFile: world.endpointFile,
                              helperPath: "/nonexistent/gmgn-taskd", allowsLaunching: false)
     }
 
@@ -261,7 +266,7 @@ func canonical(_ value: [String: Any]) -> String {
             archive: AtomicJSONWorldStatePersistence(fileURL: world.legacyURL),
             candidateURLs: [world.legacyURL])
         return AuthorityWorldStatePersistence(
-            manifest: manifest, preImage: preImage, socketPath: world.socketPath,
+            manifest: manifest, preImage: preImage, endpointFile: world.endpointFile,
             helperPath: "/nonexistent/gmgn-taskd", allowsLaunching: false)
     }
 
@@ -273,7 +278,7 @@ func canonical(_ value: [String: Any]) -> String {
     static var exportStateURL = URL(fileURLWithPath:
         "backups/world-state-migration/20261001T061021Z/state/marble-living-cabin/1.2.0/state.json")
 
-    static func main() throws {
+    @MainActor static func main() async throws {
         try fileManager.createDirectory(at: base, withIntermediateDirectories: true)
         defer {
             for process in daemons where process.isRunning { process.terminate() }
@@ -290,7 +295,20 @@ func canonical(_ value: [String: Any]) -> String {
             WorldManifest.self,
             from: Data(contentsOf: URL(fileURLWithPath:
                 "apps/macos/Resources/Worlds/marble-living-cabin/world.json")))
-        let exportedText = try String(contentsOf: exportStateURL, encoding: .utf8)
+        let exportedText: String
+        if arguments.count > 2 && !arguments[2].isEmpty {
+            exportedText = try String(contentsOf: exportStateURL, encoding: .utf8)
+        } else {
+            // Deterministic isolated pre-image; no production backup is required.
+            var state = WorldState(revision: 1, worldID: manifest.worldID,
+                worldTime: Date(timeIntervalSince1970: 1788821988294.7507 / 1000),
+                lastObservedWallTime: Date(timeIntervalSince1970: 1788821988294.7507 / 1000), weather: .clear,
+                agentTransform: WorldTransform(position: WorldVector3(x: 0, y: 0, z: 0),
+                    rotation: WorldQuaternion(x: 0, y: 0, z: 0, w: 1), scale: WorldVector3(x: 1, y: 1, z: 1)))
+            state.objectStates["http-probe-object"] = WorldObjectState(transform: state.agentTransform)
+            let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .millisecondsSince1970
+            exportedText = String(decoding: try encoder.encode(state), as: UTF8.self)
+        }
         setvbuf(stdout, nil, _IOLBF, 0)
         print("daemon=\(daemonBinary.path)")
         print("pre-image=\(exportStateURL.path)")
@@ -356,6 +374,179 @@ func canonical(_ value: [String: Any]) -> String {
         check(afterStale.recordRevision == revisionBeforeStale,
               "rejected commit did not advance the authority (still \(afterStale.recordRevision))")
         check(afterStale.state == readBack.state, "rejected commit did not overwrite the document")
+
+        // Device edits use a different authority client. Reading their returned
+        // state does not renew the resident owner's CAS lease; its own load does.
+        let residentOwner = persistence(world1)
+        _ = try residentOwner.load()
+        let deviceOwner = persistence(world1)
+        var deviceState = try deviceOwner.load()!
+        deviceState.revision += 1
+        deviceState.weather = .rain
+        try deviceOwner.save(deviceState)
+        var residentState = deviceState
+        residentState.revision += 1
+        do {
+            try residentOwner.save(residentState)
+            check(false, "external device readback cannot implicitly renew another CAS owner")
+        } catch let error as WorldAuthorityError {
+            if case .staleProjection = error { check(true, "external device commit leaves resident lease stale") }
+            else { check(false, "unexpected external commit rejection") }
+        }
+        let durableAfterDevice = try residentOwner.load()!
+        check(durableAfterDevice == deviceState, "resident owner reload preserves committed device edit")
+        residentState = durableAfterDevice
+        residentState.revision += 1
+        try residentOwner.save(residentState)
+        check(try client(world1).snapshot()!.state == residentState,
+              "owner reload renews CAS and next checkpoint succeeds without replaying device edit")
+
+        // Exercise the production Context's owner refresh, not merely the
+        // persistence API: a device edit must survive subsequent stop/move.
+        let seed = WorldSimulation(manifest: manifest, startedAt: Date()).state
+        let seedEncoder = JSONEncoder()
+        seedEncoder.dateEncodingStrategy = .millisecondsSince1970
+        let contextWorld = try startWorld(tag: "resident-lease", legacyText:
+            String(decoding: seedEncoder.encode(seed), as: UTF8.self))
+        let contextOwner = persistence(contextWorld)
+        let residentContext = try WorldAgentContext(manifest: manifest, persistence: contextOwner,
+            initialCollisionWorld: ResidentLeaseFloor())
+        try residentContext.startActivity(id: "home.walk")
+        let contextDevice = persistence(contextWorld)
+        var contextDeviceState = try contextDevice.load()!
+        contextDeviceState.weather = .rain
+        contextDeviceState.revision += 1
+        contextDeviceState.layoutRevision += 1
+        try contextDevice.save(contextDeviceState)
+        let leaseBeforeReadback = contextOwner.lastAppliedRevision
+        let projectionBeforeReadback = residentContext.state
+        let verification = try await residentContext.readAuthoritySnapshot()!
+        check(verification == contextDeviceState, "verification reads the external authority state")
+        check(contextOwner.lastAppliedRevision == leaseBeforeReadback,
+              "verification read does not renew the checkpoint CAS lease")
+        check(residentContext.state == projectionBeforeReadback,
+              "verification read preserves the active simulation projection")
+        do {
+            try contextOwner.save(projectionBeforeReadback)
+            check(false, "verification must not admit a checkpoint from the older simulation")
+        } catch let error as WorldAuthorityError {
+            if case .staleProjection = error {
+                check(true, "checkpoint remains rejected until the authority state is adopted")
+            } else { check(false, "unexpected checkpoint rejection after verification") }
+        }
+        var foreignActivity = contextDeviceState
+        foreignActivity.revision += 1
+        foreignActivity.activeActivity?.startedAt.addTimeInterval(1)
+        try contextDevice.save(foreignActivity)
+        let rejectedSnapshot = try await residentContext.readPersistedAuthorityState()!
+        do {
+            try residentContext.adoptAuthorityState(rejectedSnapshot, propFunctionSources: [],
+                replacingUncommittedProjection: true)
+            check(false, "external activity without the renderer lease must be rejected")
+        } catch WorldAgentContextError.activityRejected {
+            check(contextOwner.lastAppliedRevision == leaseBeforeReadback,
+                  "failed activity adoption preserves the original checkpoint lease")
+            check(residentContext.state == projectionBeforeReadback,
+                  "failed activity adoption preserves the simulation")
+        }
+        do {
+            try contextOwner.save(projectionBeforeReadback)
+            check(false, "failed adoption must not admit the stale layout checkpoint")
+        } catch WorldAuthorityError.staleProjection {
+            check(true, "failed adoption leaves stale checkpoints rejected")
+        }
+        contextDeviceState.revision = foreignActivity.revision + 1
+        try contextDevice.save(contextDeviceState)
+        let refreshed = try await residentContext.readPersistedAuthorityState()!
+        try residentContext.adoptAuthorityState(refreshed, propFunctionSources: [],
+            replacingUncommittedProjection: true)
+        var interveningState = contextDeviceState
+        interveningState.revision += 1
+        interveningState.layoutRevision += 1
+        try contextDevice.save(interveningState)
+        do {
+            try await residentContext.acceptAuthoritySnapshot(refreshed)
+            check(false, "an intervening authority edit must reject snapshot acceptance")
+        } catch WorldAuthorityError.staleProjection {
+            check(contextOwner.lastAppliedRevision == leaseBeforeReadback,
+                  "snapshot acceptance never renews a lease for an unadopted edit")
+        }
+        let latest = try await residentContext.readPersistedAuthorityState()!
+        try residentContext.adoptAuthorityState(latest, propFunctionSources: [],
+            replacingUncommittedProjection: true)
+        try await residentContext.acceptAuthoritySnapshot(latest)
+        check(contextOwner.lastAppliedRevision == contextDevice.lastAppliedRevision,
+              "successful adoption renews the lease for exactly the adopted layout")
+        try residentContext.stopActivity()
+        _ = try residentContext.move(to: "wp.spawn")
+        let afterResidentControl = try client(contextWorld).snapshot()!.state
+        check(afterResidentControl.weather == .rain && afterResidentControl.activeActivity == nil,
+              "external device edit survives owner refresh followed by real Context stop and move")
+        check(contextOwner.lastAppliedRevision > contextDevice.lastAppliedRevision,
+              "stop and move successfully commit through the refreshed resident CAS owner")
+
+        // Reproduce a confirmed inventory document retaining collect while the
+        // current actor has already stopped. Full adoption must still reject it.
+        let inventoryWorld = try startWorld(tag: "inventory-actor", legacyText:
+            String(decoding: seedEncoder.encode(seed), as: UTF8.self))
+        let inventoryOwner = persistence(inventoryWorld)
+        let inventoryContext = try WorldAgentContext(manifest: manifest, persistence: inventoryOwner,
+            initialCollisionWorld: ResidentLeaseFloor())
+        try inventoryContext.startActivity(id: "home.walk")
+        let inventoryWriter = persistence(inventoryWorld)
+        var inventoryDocument = try inventoryWriter.load()!
+        inventoryDocument.activeActivity?.activityID = "wish_machine.collect"
+        inventoryDocument.layoutRevision = 48
+        let sofa = WorldGeneratedProp(objectID: "wish-prop-confirmed-sofa", sourceWishID: "confirmed-sofa",
+            assetID: "asset-confirmed-sofa", displayName: "沙发",
+            size: WorldVector3(x: 2, y: 1, z: 1), sourceHeight: 1)
+        var registration = WorldSimulation(restoring: inventoryDocument)
+        try registration.applyPropLayout(.register(sofa), expectedLayoutRevision: 48,
+            requestID: "claimed.confirmed-sofa")
+        try inventoryWriter.save(registration.state)
+        do { try inventoryContext.stopActivity() }
+        catch WorldAuthorityError.staleProjection {}
+        let stoppedPosition = inventoryContext.state.agentTransform
+        let confirmedSnapshot = try await inventoryContext.readPersistedAuthorityState()!
+        check(confirmedSnapshot.activeActivity?.activityID == "wish_machine.collect"
+              && confirmedSnapshot.layoutRevision == 49, "fixture retains formal collect and registered layout 49")
+        do {
+            try inventoryContext.adoptAuthorityState(confirmedSnapshot, propFunctionSources: [],
+                replacingUncommittedProjection: true)
+            check(false, "full adoption cannot resurrect the stopped collection")
+        } catch WorldAgentContextError.activityRejected {}
+        try inventoryContext.adoptAuthorityInventoryLayout(confirmedSnapshot, propFunctionSources: [])
+        try await inventoryContext.acceptAuthoritySnapshot(confirmedSnapshot)
+        check(inventoryContext.state.activeActivity == nil
+              && inventoryContext.state.agentTransform == stoppedPosition,
+              "inventory adoption preserves the stopped actor and its position")
+        check(inventoryContext.state.objectStates[sofa.objectID]?.generatedProp == sofa
+              && inventoryContext.state.objectStates[sofa.objectID]?.isEnabled == false
+              && inventoryContext.state.layoutRevision == 49,
+              "inventory adoption exposes the confirmed sofa without placing it")
+        try inventoryOwner.save(inventoryContext.state)
+        let inventoryCheckpoint = try client(inventoryWorld).snapshot()!.state
+        check(inventoryCheckpoint.activeActivity == nil
+              && inventoryCheckpoint.objectStates[sofa.objectID]?.generatedProp == sofa,
+              "checkpoint preserves the confirmed inventory and stopped actor")
+        let inventoryLease = inventoryOwner.lastAppliedRevision
+        var laterInventory = try inventoryWriter.load()!
+        laterInventory.revision += 1
+        laterInventory.layoutRevision += 1
+        try inventoryWriter.save(laterInventory)
+        do {
+            try await inventoryContext.acceptAuthoritySnapshot(inventoryCheckpoint)
+            check(false, "inventory acceptance must reject an intervening layout update")
+        } catch WorldAuthorityError.staleProjection {
+            check(inventoryOwner.lastAppliedRevision == inventoryLease,
+                  "intervening inventory update preserves the previous checkpoint lease")
+        }
+        do {
+            try inventoryOwner.save(inventoryContext.state)
+            check(false, "unadopted inventory update must keep old checkpoint rejected")
+        } catch WorldAuthorityError.staleProjection {
+            check(true, "unadopted inventory update keeps old checkpoint rejected")
+        }
 
         // MARK: D. the legacy write path must throw
 
@@ -552,12 +743,12 @@ func canonical(_ value: [String: Any]) -> String {
         // MARK: J. authority unreachable ⇒ read-only downgrade, never a local write
 
         section("J. 权威不可达：只读降级 / fail-closed")
-        let deadSocket = base.appendingPathComponent("dead/taskd.endpoint.json").path
+        let deadEndpointFile = base.appendingPathComponent("dead/taskd.endpoint.json").path
         let orphan = LegacyWorldStatePreImage(
             archive: AtomicJSONWorldStatePersistence(fileURL: world1.legacyURL),
             candidateURLs: [world1.legacyURL])
         let downgraded = AuthorityWorldStatePersistence(
-            manifest: manifest, preImage: orphan, socketPath: deadSocket,
+            manifest: manifest, preImage: orphan, endpointFile: deadEndpointFile,
             helperPath: "/nonexistent/gmgn-taskd", allowsLaunching: false)
         let degradedState = try downgraded.load()
         check(degradedState != nil, "authority unreachable + pre-image present ⇒ world still renders (read-only)")
@@ -580,7 +771,7 @@ func canonical(_ value: [String: Any]) -> String {
             preImage: LegacyWorldStatePreImage(
                 archive: AtomicJSONWorldStatePersistence(fileURL: missingURL),
                 candidateURLs: [missingURL]),
-            socketPath: deadSocket, helperPath: "/nonexistent/gmgn-taskd", allowsLaunching: false)
+            endpointFile: deadEndpointFile, helperPath: "/nonexistent/gmgn-taskd", allowsLaunching: false)
         do {
             _ = try coldStart.load()
             check(false, "cold start without authority and without a pre-image invented a world")
@@ -592,13 +783,13 @@ func canonical(_ value: [String: Any]) -> String {
 
         section("K. 生产端点")
         let endpoint = WorldAuthorityEndpoint(applicationSupportBase: nil, bundle: Bundle.main)
-        print("       socket=\(endpoint.socketPath)")
+        print("       endpointFile=\(endpoint.endpointFile)")
         print("       helper=\(endpoint.helperPath)")
-        check(endpoint.socketPath.hasSuffix("gmgn radio/TaskService/taskd.endpoint.json"),
-              "production socket path matches PropTaskDaemonClient's default")
-        let liveSocket = ("~/Library/Application Support/gmgn radio/TaskService/taskd.endpoint.json" as NSString)
+        check(endpoint.endpointFile.hasSuffix("gmgn radio/TaskService/taskd.endpoint.json"),
+              "production HTTP endpoint file matches PropTaskDaemonClient's default")
+        let liveEndpointFile = ("~/Library/Application Support/gmgn radio/TaskService/taskd.endpoint.json" as NSString)
             .expandingTildeInPath
-        check(endpoint.socketPath == liveSocket, "endpoint resolves to the live daemon socket")
+        check(endpoint.endpointFile == liveEndpointFile, "endpoint descriptor resolves to the live daemon")
 
         // MARK: L. duplicate no-op checkpoint (same document, new expectedRevision)
 
@@ -627,8 +818,9 @@ let driverURL = temporary.appendingPathComponent("main.swift")
 try driver.write(to: driverURL, atomically: true, encoding: .utf8)
 let executable = temporary.appendingPathComponent("probe")
 let compile = run("/usr/bin/nice", ["-n", "15", "/usr/bin/swiftc", "-j1", "-parse-as-library",
-                                    "-I", "\(buildRoot)/Modules", clientPath, persistencePath,
-                                    backoffPath, driverURL.path] + objects + ["-o", executable.path])
+                                    "-I", "\(buildRoot)/Modules", "apps/macos/Sources/GMGNRadio/Presence/TaskdHTTPTransport.swift", clientPath, persistencePath,
+                                    backoffPath, "apps/macos/Sources/GMGNRadio/Agent/WorldAgentContext.swift",
+                                    driverURL.path] + objects + ["-o", executable.path])
 require(compile == 0, "the authority probe failed to compile (\(compile))")
 let status = runVisible(executable.path, [daemon, exported])
 guard status == 0 else { exit(status) }

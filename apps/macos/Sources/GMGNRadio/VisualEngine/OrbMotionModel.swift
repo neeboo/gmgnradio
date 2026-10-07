@@ -63,6 +63,15 @@ final class VisualAudioFeatureStore {
             current = features
         }
     }
+
+    /// The audio tap must never wait for a renderer reading visual features.
+    /// A busy visual consumer can miss this visualization frame; PCM playback
+    /// continues independently and the next tap publishes fresh features.
+    func updateFromAudioTap(_ features: VisualAudioFeatures) {
+        storage.withLockIfAvailable { current in
+            current = features
+        }
+    }
 }
 
 struct OrbMotionFrame: Equatable, Sendable {

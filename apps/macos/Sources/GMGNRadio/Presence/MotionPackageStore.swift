@@ -38,6 +38,7 @@ struct BuiltInMotionResource: Sendable {
     let name: String
     let format: StageMotionFormat
     let url: URL
+    var loop: Bool = true
 }
 
 struct InstalledPublishedMotion: Equatable, Sendable {
@@ -52,6 +53,7 @@ struct MotionPackageStore: Sendable {
     static let naturalIdleID = "builtin.motion.natural-idle"
     static let studioGrooveID = "builtin.motion.studio-groove"
     static let iluvSlapBassID = "builtin.motion.iluvslapbass"
+    static let iluvSlapBassVRMID = "builtin.motion.iluvslapbass-vrm"
     private static let retiredBuiltInMotionIDs: Set<String> = [
         studioGrooveID,
         "builtin.motion.2b-full",
@@ -72,7 +74,8 @@ struct MotionPackageStore: Sendable {
                 id: $0.id,
                 name: $0.name,
                 format: $0.format,
-                url: $0.url.standardizedFileURL
+                url: $0.url.standardizedFileURL,
+                loop: $0.loop
             )
         }
     }
@@ -138,7 +141,8 @@ struct MotionPackageStore: Sendable {
                     id: resource.id,
                     name: resource.name,
                     format: resource.format,
-                    url: resource.url
+                    url: resource.url,
+                    loop: resource.loop
                 )
             )
         }
@@ -164,7 +168,7 @@ struct MotionPackageStore: Sendable {
             else {
                 continue
             }
-            installed.append(asset)
+            if !motions.contains(where: { $0.id == asset.id }) { installed.append(asset) }
         }
         installed.sort {
             $0.name.localizedStandardCompare($1.name) == .orderedAscending
@@ -595,21 +599,23 @@ struct MotionPackageStore: Sendable {
     private static func bundledMMDMotions(
         bundle: Bundle = .main
     ) -> [BuiltInMotionResource] {
-        guard let url = bundle.url(
-            forResource: "iluvslapbass_motion",
-            withExtension: "vmd",
-            subdirectory: "MMDMotions"
-        ) else {
-            return []
+        let music = [(iluvSlapBassID, StageMotionFormat.vmd), (iluvSlapBassVRMID, .vrma)].compactMap { id, format -> BuiltInMotionResource? in
+            guard let url = bundle.url(forResource: "iluvslapbass_motion",
+                withExtension: format.rawValue, subdirectory: "MMDMotions") else { return nil }
+            return BuiltInMotionResource(id: id, name: "I Love Slap Bass", format: format, url: url)
         }
-        return [
-            BuiltInMotionResource(
-                id: iluvSlapBassID,
-                name: "I Love Slap Bass",
-                format: .vmd,
-                url: url
-            ),
-        ]
+        let buttons = [("gmgn.motion.device.jukebox-low-button-pmx", StageMotionFormat.vmd),
+                       ("gmgn.motion.device.jukebox-low-button-vrm", .vrma)].compactMap { id, format -> BuiltInMotionResource? in
+            guard let url = bundle.url(forResource: id, withExtension: format.rawValue, subdirectory: "MMDMotions"),
+                  let manifestURL = bundle.url(forResource: id, withExtension: "json", subdirectory: "MMDMotions"),
+                  let manifest = try? JSONDecoder().decode(MotionManifest.self, from: Data(contentsOf: manifestURL)),
+                  manifest.id == id, manifest.format == format, manifest.entry == url.lastPathComponent,
+                  manifest.loop == false, let data = try? Data(contentsOf: url),
+                  manifest.sha256 == SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined()
+            else { return nil }
+            return BuiltInMotionResource(id: id, name: manifest.name, format: format, url: url, loop: false)
+        }
+        return music + buttons
     }
 }
 

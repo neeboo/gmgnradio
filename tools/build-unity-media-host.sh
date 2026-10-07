@@ -9,7 +9,7 @@ mkdir -p "$resolved_dir"
 cp "$repo_root/apps/macos/GMGNRadio.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved" "$resolved_dir/Package.resolved"
 python3 "$repo_root/tools/with-build-lock.py" --lock "$repo_root/apps/macos/Build.noindex/.xcodebuild.lock" -- \
   xcodebuild build -project "$build_root/project/UnityMediaHost.xcodeproj" -scheme UnityMediaHost \
-  -configuration Release -destination 'platform=macOS' -derivedDataPath "$build_root/DerivedData" \
+  -configuration Release -destination 'platform=macOS' -jobs 1 -derivedDataPath "$build_root/DerivedData" \
   -clonedSourcePackagesDirPath "$repo_root/apps/macos/Packages" \
   -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates \
   ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO

@@ -115,7 +115,7 @@ guard serviceText.contains("enum ResidentPropLayoutIntent") else {
     exit(1)
 }
 guard let inventoryBranch = serviceText.range(of: "case let .inventoryRegistration(objectID):"),
-      let spatialBranch = serviceText.range(of: "case .spatialChange:") else {
+      let spatialBranch = serviceText.range(of: "case let .spatialChange(objectID):") else {
     print("FAIL: `commit` must dispatch on the typed intent (inventory vs spatial)")
     exit(1)
 }
@@ -128,7 +128,7 @@ guard inventoryBody.contains("validateInventoryRegistration(") else {
     print("FAIL: the inventory layer must run its own judgement (`validateInventoryRegistration`)")
     exit(1)
 }
-guard serviceText[spatialBranch.upperBound...].contains("try validate(state)") else {
+guard serviceText[spatialBranch.upperBound...].contains("try validate(state, baseline: baseline)") else {
     print("FAIL: the spatial layer must still run the full spatial judgement (`validate(state)`)")
     exit(1)
 }
@@ -297,8 +297,13 @@ let flatWorld=FlatSupport(minimumX:-1,maximumX:5.5,minimumZ:-1,maximumZ:10,heigh
   let fixture=WorldManifest(schemaVersion:manifest.schemaVersion,packageID:"test",packageVersion:"1",worldID:"test",displayName:"test",calibration:manifest.calibration,
    spawn:.init(position:.init(x:0,y:0,z:0),rotation:identity,scale:unit),
    collisionVolumes:[.init(id:"fixed",center:.init(x:4,y:0.5,z:0),halfExtents:.init(x:0.5,y:0.5,z:0.5),rotation:identity,isBlocking:true)],
-   waypoints:[.init(id:"a",position:.init(x:1,y:0,z:2),arrivalRadius:0.2,enabled:true),.init(id:"b",position:.init(x:3,y:0,z:2),arrivalRadius:0.2,enabled:true)],
-   routes:[.init(id:"route",waypointIDs:["a","b"],bidirectional:true,enabled:true)],
+   waypoints:[.init(id:"a",position:.init(x:1,y:0,z:2),arrivalRadius:0.2,enabled:true),
+     .init(id:"b",position:.init(x:3,y:0,z:2),arrivalRadius:0.2,enabled:true),
+     .init(id:"pickup.coffee",position:.init(x:5,y:0,z:4),arrivalRadius:0.05,enabled:true),
+     .init(id:"pickup.sword",position:.init(x:2,y:0,z:-4),arrivalRadius:0.05,enabled:true)],
+   routes:[.init(id:"route",waypointIDs:["a","b"],bidirectional:true,enabled:true),
+     .init(id:"pickup.coffee.route",waypointIDs:["b","pickup.coffee"],bidirectional:true,enabled:true),
+     .init(id:"pickup.sword.route",waypointIDs:["b","pickup.sword"],bidirectional:true,enabled:true)],
    // 收窄后的判据要的是**活动锚点**：这条 sit 让 `routeConstraint` 有目标，"挡住入口"
    // 才有一条真的判据可验（没有活动 ⇒ 拿不到判据 ⇒ fail-closed 拒绝一切）。
    activities:[.init(id:"sit",action:"sit",entryWaypointID:"a",
@@ -335,6 +340,8 @@ let flatWorld=FlatSupport(minimumX:-1,maximumX:5.5,minimumZ:-1,maximumZ:10,heigh
   require(!restored.collisionWorld.canOccupy(.init(radius:0.1,height:1),at:SIMD3(5,0,5)),"restore lost object collision")
   do { _ = try service.preview(objectID:"prop1",placement:.init(surfaceID:"floor",position:.init(x:5.9,y:0,z:5),yaw:.pi/4)); fatalError("edge crossing accepted") }
   catch let error as ResidentPropPlacementError { require(error == .unknownSurface,"wrong edge-crossing rejection: \(error)") }
+  _ = try context.move(to:"prop1")
+  for _ in 0..<100 { try context.tick(deltaTime:0.1) }
   let placed=context.state
   var savedAvatarID = "pmx.2b-miss-0414-standard"
   let failingHold=ResidentPropPlacementService(context:context,support:{flat},
@@ -410,6 +417,8 @@ let flatWorld=FlatSupport(minimumX:-1,maximumX:5.5,minimumZ:-1,maximumZ:10,heigh
       .init(avatarAssetID:avatarID,hand:.rightHand,normalizedGrip:.init(x:0.5,y:0.2,z:0.5),
         localOffset:.init(x:0,y:0,z:0),localRotation:identity)
     })
+  _ = try routeContext.move(to:"prop1")
+  for _ in 0..<100 { try routeContext.tick(deltaTime:0.1) }
   _ = try holding.commit(holding.holdCommand(objectID:"prop1"),expectedLayoutRevision:3,requestID:"hold-footprint")
   do { _ = try holding.preview(objectID:"prop2",placement:.init(surfaceID:"floor",position:.init(x:5,y:0,z:5),yaw:0));fatalError("held return footprint was reused") }
   catch let error as ResidentPropPlacementError { require(error == .blockedBySupport(.blockedByPlacedProp("prop1")) || error == .blockedBySupport(.blockedByPlacedProp("prop2")),"wrong held-footprint rejection: \(error)") }
@@ -542,15 +551,125 @@ let flatWorld=FlatSupport(minimumX:-1,maximumX:5.5,minimumZ:-1,maximumZ:10,heigh
   }
   require(offGridContext.state.objectStates["prop-sword2"]?.generatedProp != nil,
           "the second sword must be in inventory even though the room holds an off-grid placed prop")
-  // 同一条路、同一份几何：**摆放**仍然按今天全部判据拒绝（空间判据一个字没放宽）。
-  do {
-    _ = try offGridService.commit(.place(objectID:"prop-sword2",
+  // 无关旧物件仍参与碰撞/通路，但它自己的旧承托位置不拦本次合法目标。
+  _ = try offGridService.commit(.place(objectID:"prop-sword2",
         placement:.init(surfaceID:"floor", position:.init(x:5,y:0,z:5), yaw:0)),
         expectedLayoutRevision:offGridContext.state.layoutRevision, requestID:"offgrid-place-sword")
-    require(false, "a placement must still be judged against every placed prop (off-grid one included)")
+  require(offGridContext.state.objectStates["prop-sword2"]?.isEnabled == true,
+    "unrelated old off-grid support must not reject a legal target")
+  let releaseService = ResidentPropPlacementService(context:offGridContext, support:{flatSupport(fixture)},
+    currentAvatarAssetID:{"pmx.2b-miss-0414-standard"},
+    makeGripCalibration:{_,avatar,_ in .init(avatarAssetID:avatar,hand:.rightHand,
+      normalizedGrip:.init(x:0.5,y:0.5,z:0.5),localOffset:.init(x:0,y:0,z:0),localRotation:identity)})
+  _ = try offGridContext.move(to:"prop-sword2")
+  for _ in 0..<100 {try offGridContext.tick(deltaTime:0.1)}
+  _ = try releaseService.commit(releaseService.holdCommand(objectID:"prop-sword2"),
+    expectedLayoutRevision:offGridContext.state.layoutRevision,requestID:"old-neighbour-hold")
+  _ = try releaseService.commit(releaseService.returnHeldCommand(objectID:"prop-sword2"),
+    expectedLayoutRevision:offGridContext.state.layoutRevision,requestID:"old-neighbour-return")
+  require(offGridContext.state.heldProp == nil && offGridContext.state.objectStates["prop-sword2"]?.isEnabled == true,
+    "return must validate its own floor and preserve unrelated off-grid neighbour")
+  _ = try releaseService.commit(releaseService.holdCommand(objectID:"prop-sword2"),
+    expectedLayoutRevision:offGridContext.state.layoutRevision,requestID:"nearby-hold")
+  let beforeNearDrop = offGridContext.state
+  do {
+    _ = try releaseService.commit(.dropHeld(objectID:"prop-sword2",avatarAssetID:"pmx.2b-miss-0414-standard",
+      placement:.init(surfaceID:"floor",position:.init(x:40,y:0,z:40),yaw:0)),
+      expectedLayoutRevision:offGridContext.state.layoutRevision,requestID:"far-drop")
+    fatalError("remote drop accepted")
+  } catch WorldPropLayoutError.invalidPlacement {}
+  require(offGridContext.state == beforeNearDrop,"remote drop released the held item")
+  let drop = try releaseService.dropHeldCommand(objectID:"prop-sword2")
+  guard case let .dropHeld(_,_,dropPlacement) = drop else {fatalError("wrong drop command")}
+  require(hypot(dropPlacement.position.x-beforeNearDrop.agentTransform.position.x,
+    dropPlacement.position.z-beforeNearDrop.agentTransform.position.z) <= WorldPropActivityTemplate.interactionReach,
+    "drop must choose a nearby pose")
+  _ = try releaseService.commit(drop,expectedLayoutRevision:offGridContext.state.layoutRevision,requestID:"nearby-drop")
+  require(offGridContext.state.heldProp == nil && offGridContext.state.objectStates["prop-sword2"]!.isEnabled,
+    "drop must remain visible in the room, never disappear into inventory")
+  require(offGridContext.state.objectStates["prop-offgrid"] == beforeNearDrop.objectStates["prop-offgrid"],
+    "dropping may not move an unrelated old prop")
+  print("PASS original return and nearby drop: unrelated legacy support preserved, real placement checked, far drop rejected atomically")
+  // 手持不重新验旧地面：复现白剑旧位置不是格心、y 与地面层差 5.9 mm。
+  let attachmentContext = try WorldAgentContext(manifest:fixture)
+  attachmentContext.installCollisionWorld(Floor())
+  var attachmentAvatar = "pmx.2b-miss-0414-standard"
+  var rejectAttachmentAsset = false
+  let attachmentService = ResidentPropPlacementService(context:attachmentContext, support:{nil},
+    prepare:{ _ in if rejectAttachmentAsset { throw NSError(domain:"attachment-asset",code:1) } },
+    currentAvatarAssetID:{attachmentAvatar}, makeGripCalibration:{ _,avatarID,_ in
+      .init(avatarAssetID:avatarID,hand:.rightHand,normalizedGrip:.init(x:0.5,y:0.2,z:0.5),
+        localOffset:.init(x:0,y:0,z:0),localRotation:identity)
+    })
+  _ = try attachmentService.commit(.register(holdSword),expectedLayoutRevision:0,requestID:"attachment-register")
+  _ = try attachmentContext.commitPropLayout(.place(objectID:holdSword.objectID,
+    placement:.init(surfaceID:"legacy",position:.init(x:2.0297556,y:0.0226565,z:-4.6764836),yaw:0)),
+    expectedLayoutRevision:1,requestID:"attachment-legacy-place") { _ in }
+  let originalAttachmentItem = attachmentContext.state.objectStates[holdSword.objectID]!
+  let distantAttachmentState = attachmentContext.state
+  do {
+    _ = try attachmentService.holdCommand(objectID:holdSword.objectID)
+    fatalError("a placed sword was picked up remotely")
   } catch let error as ResidentPropPlacementError {
-    require(error == .unknownSurface, "the placement refusal must still be the support-surface judgement: \(error)")
+    guard case let .objectOutOfReach(objectID, distance) = error else { fatalError("wrong distant-pickup error") }
+    require(objectID == holdSword.objectID && distance > WorldPropActivityTemplate.interactionReach,
+      "distant pickup refusal must carry the object destination and true footprint-edge distance")
   }
+  require(attachmentContext.state == distantAttachmentState,"remote pickup refusal moved or withdrew the object")
+  _ = try attachmentContext.move(to:holdSword.objectID)
+  for _ in 0..<100 { try attachmentContext.tick(deltaTime:0.1) }
+  let originalAttachmentState = attachmentContext.state
+  let attachCommand = try attachmentService.holdCommand(objectID:holdSword.objectID)
+  rejectAttachmentAsset = true
+  do {
+    _ = try attachmentService.commit(attachCommand,expectedLayoutRevision:2,requestID:"attachment-bad-asset")
+    fatalError("holding bypassed the real asset validation")
+  } catch {}
+  require(attachmentContext.state == originalAttachmentState,"rejected attachment changed persistent state")
+  rejectAttachmentAsset = false
+  _ = try attachmentContext.move(to:"a")
+  for _ in 0..<100 { try attachmentContext.tick(deltaTime:0.1) }
+  let movedBeforeCommit = attachmentContext.state
+  do {
+    _ = try attachmentService.commit(attachCommand,expectedLayoutRevision:2,requestID:"attachment-moved-before-commit")
+    fatalError("actor movement after preparation bypassed the pickup-distance recheck")
+  } catch let error as ResidentPropPlacementError {
+    guard case .objectOutOfReach = error else { fatalError("wrong delayed pickup refusal") }
+  }
+  require(attachmentContext.state == movedBeforeCommit,"delayed remote pickup changed the world")
+  _ = try attachmentContext.move(to:holdSword.objectID)
+  for _ in 0..<100 { try attachmentContext.tick(deltaTime:0.1) }
+  _ = try attachmentService.commit(attachCommand,expectedLayoutRevision:2,requestID:"attachment-hold")
+  require(attachmentContext.state.heldProp?.objectID == holdSword.objectID,
+    "a verified hold must not require the legacy landing position to match today's floor grid")
+  require(attachmentContext.state.heldProp?.returnState.transform == originalAttachmentItem.transform,
+    "holding must retain the exact original return position")
+  // Regrip/rebind of the same held sword are not a second pickup.
+  _ = try attachmentContext.move(to:"a")
+  for _ in 0..<100 { try attachmentContext.tick(deltaTime:0.1) }
+  let regrip = try attachmentService.holdCommand(objectID:holdSword.objectID)
+  _ = try attachmentService.commit(regrip,expectedLayoutRevision:3,requestID:"attachment-regrip")
+  let previousCalibration = attachmentContext.state.objectStates[holdSword.objectID]!.gripCalibration!
+  attachmentAvatar = "pmx.test-new-avatar"
+  let rebound = WorldPropGripCalibration(avatarAssetID:attachmentAvatar,hand:previousCalibration.hand,
+    normalizedGrip:previousCalibration.normalizedGrip,localOffset:previousCalibration.localOffset,
+    localRotation:previousCalibration.localRotation)
+  _ = try attachmentService.commit(.rebindHeldAvatar(objectID:holdSword.objectID,
+    previousAvatarAssetID:"pmx.2b-miss-0414-standard",calibration:rebound),
+    expectedLayoutRevision:4,requestID:"attachment-rebind")
+  require(attachmentContext.state.heldProp?.returnState.transform == originalAttachmentItem.transform,
+    "regrip and avatar rebinding must not alter the return position")
+  let beforeBlockedReturn = attachmentContext.state
+  do {
+    _ = try attachmentService.commit(attachmentService.returnHeldCommand(objectID:holdSword.objectID),
+      expectedLayoutRevision:5,requestID:"attachment-blocked-return")
+    fatalError("returning a held prop bypassed missing ground geometry")
+  } catch let error as ResidentPropPlacementError {
+    require(error == .environmentNotReady,"actual return must still run spatial validation")
+  }
+  require(attachmentContext.state == beforeBlockedReturn,"blocked return released or moved the held sword")
+  print("PASS: attachment hold/regrip/rebind preserve legacy return pose without floor revalidation; asset refusal remains atomic and actual return requires floor geometry")
+
   // (D) 入库那一层**不是空判据**：资产/归属判据（宿主注入的 `prepare`）拒绝时登记必须跟着拒绝。
   let assetRejecting = ResidentPropPlacementService(context:offGridContext,
     support:{flatSupport(fixture)}, prepare:{ _ in throw NSError(domain:"asset", code:1) })

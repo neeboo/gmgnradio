@@ -1,5 +1,4 @@
 import Foundation
-import Network
 
 struct PropTaskDaemonSnapshot: Codable, Sendable {
     let jobs: [PropGenerationRecord]
@@ -100,26 +99,27 @@ enum PropTaskDaemonError: LocalizedError {
     }
 }
 
-/// One local socket only. Remote HTTP, task files and persistence belong to Rust.
+/// Local HTTP only. Task files and persistence belong to Rust.
 @MainActor final class PropTaskDaemonClient: PropTaskDaemonConnecting, PropTaskMessageConnecting {
     var onEvent: ((PropTaskDaemonEvent) -> Void)?
     var onSnapshot: ((PropTaskDaemonSnapshot) -> Void)?
     var onDisconnect: ((String) -> Void)?
     var onMessage: ((String, PropTaskMessage) -> Void)?
     private let root: URL
-    private let socketURL: URL
+    private let endpointFileURL: URL
     private let helperURL: URL
     private let legacyRoot: URL?
     private let allowsLaunching: Bool
     private let requestTimeout: TimeInterval
-    private var connection: NWConnection?
+    private var connection: TaskdHTTPTransport?
+    private var origin: URL?
+    private var requests: [String: TaskdHTTPTransport] = [:]
+    private var eventData = Data()
     private var connectionID = UUID()
     private var connectionReady = false
     private var connecting: Task<Void, Error>?
     private var reconnect: Task<Void, Never>?
     private var stopped = false
-    private var buffer = Data()
-    private var scannedBytes = 0
     private var pending: [String: CheckedContinuation<Data, Error>] = [:]
     private var deadlines: [String: Task<Void, Never>] = [:]
     private var configuration: Configuration?
@@ -136,10 +136,11 @@ enum PropTaskDaemonError: LocalizedError {
     private var helperProcess: Process?
     private static let maxFrame = 12 * 1024 * 1024
     private struct Configuration: Codable, Equatable { let endpoint: URL; let token: String }
-    private struct Request<P: Encodable>: Encodable { let id: String; let auth: String; let method: String; let params: P }
+    private struct Request<P: Encodable>: Encodable { let id: String; let method: String; let params: P }
     private struct Endpoint: Decodable { let version: Int; let address: String; let token: String }
     private var endpointToken: String?
     private struct Empty: Codable {}
+    private struct Acknowledgement: Decodable { let subscribed: Bool }
     private struct ID: Codable { let id: UUID }
     private struct JobResult: Decodable { let job: PropGenerationRecord }
     private struct SnapshotPage: Decodable {
@@ -158,17 +159,17 @@ enum PropTaskDaemonError: LocalizedError {
         let message: PropTaskMessage?
     }
 
-    init(root: URL? = nil, socketURL: URL? = nil, helperURL: URL? = nil, legacyRoot: URL? = nil,
+    init(root: URL? = nil, endpointFileURL: URL? = nil, helperURL: URL? = nil, legacyRoot: URL? = nil,
          allowsLaunching: Bool = true, requestTimeout: TimeInterval = 10) {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("gmgn radio", isDirectory: true)
         self.root = root ?? support.appendingPathComponent("TaskService", isDirectory: true)
-        self.socketURL = socketURL ?? self.root.appendingPathComponent("taskd.endpoint.json")
+        self.endpointFileURL = endpointFileURL ?? self.root.appendingPathComponent("taskd.endpoint.json")
         self.helperURL = helperURL ?? Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/gmgn-taskd")
         self.legacyRoot = legacyRoot ?? (root == nil ? support.appendingPathComponent("PropGeneration", isDirectory: true) : nil)
         self.allowsLaunching = allowsLaunching
         self.requestTimeout = requestTimeout
-        // Construction never launches a process or contacts a socket.
+        // Construction never launches a process or contacts the HTTP service.
     }
 
     static func validateConfiguration(endpoint: URL, token: String) throws {
@@ -250,7 +251,7 @@ enum PropTaskDaemonError: LocalizedError {
     func subscribeMessages(consumer: String, worldID: String, residentScope: String) async throws {
         let subscription = MessageSubscription(consumer: consumer, worldID: worldID, residentScope: residentScope)
         guard messageConnections[subscription] == nil else { return }
-        let child = PropTaskDaemonClient(root: root, socketURL: socketURL, helperURL: helperURL,
+        let child = PropTaskDaemonClient(root: root, endpointFileURL: endpointFileURL, helperURL: helperURL,
             legacyRoot: legacyRoot, allowsLaunching: allowsLaunching, requestTimeout: requestTimeout)
         child.messageConsumer = consumer
         child.mode = .message
@@ -271,7 +272,7 @@ enum PropTaskDaemonError: LocalizedError {
         let _: Empty = try await request("ack_message", Ack(id: id, consumer: consumer, worldID: worldID, residentScope: residentScope))
     }
     /// gmgn-taskd 统一状态合同（state_* / event_read / message_*）的共享运输口：
-    /// 复用既有 socket 帧、超时与重连；daemon 错误码原样透传给调用方。
+    /// 复用 HTTP 请求、超时与重连；daemon 错误码原样透传给调用方。
     func call(method: String, params: [String: PropTaskJSON]) async throws -> [String: PropTaskJSON] {
         try await ensureConnected()
         return try await request(method, params)
@@ -299,15 +300,15 @@ enum PropTaskDaemonError: LocalizedError {
         try await task.value
     }
     private func connectAndSubscribe() async throws {
-        guard socketURL.isFileURL else { throw PropTaskDaemonError.unavailable }
-        do { try await openSocket() }
+        guard endpointFileURL.isFileURL else { throw PropTaskDaemonError.unavailable }
+        do { try await openHTTP() }
         catch {
             guard allowsLaunching else { throw error }
             try launchHelper()
             let limit = Date().addingTimeInterval(5)
             while true {
                 try Task.checkCancellation()
-                do { try await openSocket(); break }
+                do { try await openHTTP(); break }
                 catch { if Date() >= limit { throw PropTaskDaemonError.unavailable } }
                 try await Task.sleep(for: .milliseconds(100))
             }
@@ -316,7 +317,7 @@ enum PropTaskDaemonError: LocalizedError {
         case .command:
             if let configuration { let _: Empty = try await request("configure", configuration) }
             if stateConnection == nil {
-                let child = PropTaskDaemonClient(root: root, socketURL: socketURL, helperURL: helperURL,
+                let child = PropTaskDaemonClient(root: root, endpointFileURL: endpointFileURL, helperURL: helperURL,
                     legacyRoot: legacyRoot, allowsLaunching: allowsLaunching, requestTimeout: requestTimeout)
                 child.mode = .state
                 child.onSnapshot = { [weak self] in self?.accept($0) }
@@ -335,9 +336,9 @@ enum PropTaskDaemonError: LocalizedError {
                 accept(initial)
             }
             struct Subscribe: Encodable { let after: UInt64 }
-            let _: Empty = try await request("subscribe", Subscribe(after: sequence))
+            try await subscribe("subscribe", Subscribe(after: sequence))
         case .message:
-            for subscription in subscriptions { let _: Empty = try await request("subscribe_messages", subscription) }
+            for subscription in subscriptions { try await subscribe("subscribe_messages", subscription) }
         }
         hasConnected = true
     }
@@ -346,7 +347,8 @@ enum PropTaskDaemonError: LocalizedError {
         if helperProcess?.isRunning == true { return }
         let process = Process()
         process.executableURL = helperURL
-        process.arguments = ["--root", root.path, "--endpoint-file", socketURL.path, "--concurrency", "2"]
+        process.arguments = ["--root", root.path, "--endpoint-file", endpointFileURL.path, "--concurrency", "2"]
+            + TaskdBundledMediaConfiguration.arguments(nextTo: helperURL)
         if let legacyRoot { process.arguments! += ["--legacy-root", legacyRoot.path] }
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
@@ -376,104 +378,152 @@ enum PropTaskDaemonError: LocalizedError {
         } while cursor != nil
         return PropTaskDaemonSnapshot(jobs: jobs, sequence: version ?? 0)
     }
-    private func openSocket() async throws {
+    private func openHTTP() async throws {
         tearDown()
-        let identity = UUID(); connectionID = identity
-        let endpoint = try JSONDecoder().decode(Endpoint.self, from: Data(contentsOf: socketURL))
-        let parts = endpoint.address.split(separator: ":")
-        guard endpoint.version == 1, parts.count == 2, parts[0] == "127.0.0.1",
-              let portNumber = UInt16(parts[1]), portNumber > 0,
-              let port = NWEndpoint.Port(rawValue: portNumber),
-              let token = UUID(uuidString: endpoint.token), token.uuidString.dropFirst(14).first == "4" else {
+        guard let data = try? Data(contentsOf: endpointFileURL), data.count <= 64 * 1024,
+              let endpoint = try? JSONDecoder().decode(Endpoint.self, from: data) else {
             throw PropTaskDaemonError.unavailable
         }
-        endpointToken = endpoint.token
-        let socket = NWConnection(host: "127.0.0.1", port: port, using: .tcp)
-        connection = socket
-        socket.stateUpdateHandler = { [weak self] state in
-            Task { @MainActor in
-                guard let self, self.connectionID == identity else { return }
-                switch state {
-                case .ready: self.connectionReady = true; self.receive(socket, identity: identity)
-                case .failed, .cancelled: self.lostConnection(identity: identity)
-                default: break
-                }
-            }
+        let parts = endpoint.address.split(separator: ":")
+        guard endpoint.version == 2, parts.count == 2, parts[0] == "127.0.0.1",
+              let port = UInt16(parts[1]), port > 0,
+              let token = UUID(uuidString: endpoint.token), token.uuidString.dropFirst(14).first == "4",
+              let url = URL(string: "http://\(endpoint.address)") else { throw PropTaskDaemonError.unavailable }
+        endpointToken = endpoint.token; origin = url
+        let response = try await http(path: "health", id: UUID().uuidString, body: nil)
+        struct Health: Decodable { let version: Int; let transport: String }
+        guard let health = try? JSONDecoder().decode(Health.self, from: response),
+              health.version == 2, health.transport == "http" else { tearDown(); throw PropTaskDaemonError.unavailable }
+        connectionReady = true
+    }
+    private func consumeLine(_ line: Data, identity: UUID) {
+        guard connectionID == identity else { return }
+        var line = line
+        if line.last == 13 { line.removeLast() }
+        if line.isEmpty {
+            guard !eventData.isEmpty else { return }
+            let frame = eventData; eventData.removeAll()
+            do { try consumeEnvelope(frame) }
+            catch { lostConnection(identity: identity) }
+        } else if line.starts(with: Data("data:".utf8)) {
+            var payload = Data(line.dropFirst(5)); if payload.first == 32 { payload.removeFirst() }
+            if !eventData.isEmpty { eventData.append(10) }
+            guard eventData.count + payload.count <= Self.maxFrame else { lostConnection(identity: identity); return }
+            eventData.append(payload)
         }
-        socket.start(queue: DispatchQueue(label: "gmgn.taskd.socket"))
-        let limit = Date().addingTimeInterval(1)
-        while !connectionReady {
+    }
+    private func consumeEnvelope(_ data: Data) throws {
+        let envelope = try JSONDecoder().decode(Envelope.self, from: data)
+        if let event = envelope.event {
+            if event.sequence > sequence { sequence = event.sequence; onEvent?(event) }
+        } else if let message = envelope.message {
+            if let consumer = messageConsumer { onMessage?(consumer, message) }
+        } else if let id = envelope.id, let continuation = pending.removeValue(forKey: id) {
+            deadlines.removeValue(forKey: id)?.cancel()
+            if let error = envelope.error { continuation.resume(throwing: PropTaskDaemonError.requestRejectedWith(code: error.code)) }
+            else { continuation.resume(returning: data) }
+        }
+    }
+    private func urlRequest(path: String, body: Data?) throws -> URLRequest {
+        guard let origin, let endpointToken else { throw PropTaskDaemonError.unavailable }
+        var request = URLRequest(url: origin.appendingPathComponent(path), timeoutInterval: requestTimeout)
+        request.httpMethod = body == nil ? "GET" : "POST"
+        request.setValue("Bearer \(endpointToken)", forHTTPHeaderField: "Authorization")
+        if let body {
+            guard body.count <= Self.maxFrame else { throw PropTaskDaemonError.invalidFrame }
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = body
+        }
+        return request
+    }
+    private func http(path: String, id: String, body: Data?) async throws -> Data {
+        let request = try urlRequest(path: path, body: body)
+        let identity = connectionID
+        return try await withTaskCancellationHandler {
             try Task.checkCancellation()
-            guard connection != nil, Date() < limit else { tearDown(); throw PropTaskDaemonError.unavailable }
-            try await Task.sleep(for: .milliseconds(20))
-        }
-    }
-    private func receive(_ socket: NWConnection, identity: UUID) {
-        socket.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, complete, error in
-            Task { @MainActor in
-                guard let self, self.connectionID == identity else { return }
-                if let data { self.consume(data, identity: identity) }
-                if complete || error != nil { self.lostConnection(identity: identity) }
-                else if self.connectionID == identity { self.receive(socket, identity: identity) }
-            }
-        }
-    }
-    private func consume(_ data: Data, identity: UUID) {
-        buffer.append(data)
-        let newline = Data([10])
-        while let range = buffer.range(of: newline, in: buffer.index(buffer.startIndex, offsetBy: scannedBytes)..<buffer.endIndex) {
-            let end = range.lowerBound
-            guard buffer.distance(from: buffer.startIndex, to: end) <= Self.maxFrame else { lostConnection(identity: identity); return }
-            let line = Data(buffer[..<end]); buffer.removeSubrange(...end)
-            scannedBytes = 0
-            do {
-                let envelope = try JSONDecoder().decode(Envelope.self, from: line)
-                if let event = envelope.event {
-                    if event.sequence > sequence { sequence = event.sequence; onEvent?(event) }
-                } else if let message = envelope.message {
-                    // Rust owns ACK/replay; each consumer decides whether it has handled this message.
-                    if let consumer = messageConsumer { onMessage?(consumer, message) }
-                } else if let id = envelope.id, let continuation = pending.removeValue(forKey: id) {
-                    deadlines.removeValue(forKey: id)?.cancel()
-                    if let error = envelope.error {
-                        continuation.resume(throwing: PropTaskDaemonError.requestRejectedWith(code: error.code))
+            return try await withCheckedThrowingContinuation { continuation in
+                pending[id] = continuation
+                let transport = TaskdHTTPTransport(streaming: false, receive: { [weak self] data in
+                    Task { @MainActor in
+                        guard let self, self.connectionID == identity else { return }
+                        self.requests.removeValue(forKey: id)
+                        self.pending.removeValue(forKey: id)?.resume(returning: data)
                     }
-                    else { continuation.resume(returning: line) }
-                }
-            } catch { lostConnection(identity: identity); return }
+                }, completion: { [weak self] error in
+                    guard let error else { return }
+                    Task { @MainActor in
+                        guard let self, self.connectionID == identity else { return }
+                        self.finish(id: id, error: Self.transportError(error))
+                    }
+                })
+                requests[id] = transport; transport.start(request)
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in self?.finish(id: id, error: CancellationError()) }
         }
-        scannedBytes = buffer.count
-        if buffer.count > Self.maxFrame { lostConnection(identity: identity) }
     }
-    private func request<P: Encodable, R: Decodable>(_ method: String, _ params: P) async throws -> R {
-        guard let socket = connection, connectionReady, let endpointToken else { throw PropTaskDaemonError.unavailable }
+    private func subscribe<P: Encodable>(_ method: String, _ params: P) async throws {
         let id = UUID().uuidString
-        var data = try JSONEncoder().encode(Request(id: id, auth: endpointToken, method: method, params: params))
-        guard data.count <= Self.maxFrame else { throw PropTaskDaemonError.invalidFrame }
-        data.append(10)
+        let body = try JSONEncoder().encode(Request(id: id, method: method, params: params))
+        var request = try urlRequest(path: "events", body: body)
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         let identity = connectionID
         let response: Data = try await withTaskCancellationHandler {
             try Task.checkCancellation()
             return try await withCheckedThrowingContinuation { continuation in
                 pending[id] = continuation
                 deadlines[id] = Task { [weak self] in
-                    do { try await Task.sleep(for: .seconds(self?.requestTimeout ?? 10)) }
-                    catch { return }
+                    do { try await Task.sleep(for: .seconds(self?.requestTimeout ?? 10)) } catch { return }
                     self?.finish(id: id, error: PropTaskDaemonError.timedOut)
+                    self?.lostConnection(identity: identity)
                 }
-                socket.send(content: data, completion: .contentProcessed { [weak self] error in
-                    if error != nil { Task { @MainActor in self?.lostConnection(identity: identity) } }
+                let transport = TaskdHTTPTransport(streaming: true, receive: { [weak self] line in
+                    // The serial delegate queue enqueues these in SSE wire order.
+                    DispatchQueue.main.async { self?.consumeLine(line, identity: identity) }
+                }, completion: { [weak self] error in
+                    DispatchQueue.main.async {
+                        guard let self, self.connectionID == identity else { return }
+                        if let error { self.finish(id: id, error: Self.transportError(error)) }
+                        self.lostConnection(identity: identity)
+                    }
                 })
+                connection = transport; transport.start(request)
             }
         } onCancel: {
-            Task { @MainActor [weak self] in self?.finish(id: id, error: CancellationError()) }
+            Task { @MainActor [weak self] in
+                self?.finish(id: id, error: CancellationError())
+                self?.lostConnection(identity: identity)
+            }
         }
-        do { return try JSONDecoder().decode(Result<R>.self, from: response).result }
+        guard (try? JSONDecoder().decode(Result<Acknowledgement>.self, from: response).result.subscribed) == true
+        else { tearDown(); throw PropTaskDaemonError.invalidFrame }
+    }
+    private func request<P: Encodable, R: Decodable>(_ method: String, _ params: P) async throws -> R {
+        guard connectionReady else { throw PropTaskDaemonError.unavailable }
+        let id = UUID().uuidString
+        let body = try JSONEncoder().encode(Request(id: id, method: method, params: params))
+        let response = try await http(path: "rpc", id: id, body: body)
+        do {
+            let envelope = try JSONDecoder().decode(Envelope.self, from: response)
+            guard envelope.id == id else { throw PropTaskDaemonError.invalidFrame }
+            if let error = envelope.error { throw PropTaskDaemonError.requestRejectedWith(code: error.code) }
+            return try JSONDecoder().decode(Result<R>.self, from: response).result
+        } catch let error as PropTaskDaemonError { throw error }
         catch { throw PropTaskDaemonError.invalidFrame }
     }
     private func finish(id: String, error: Error) {
         deadlines.removeValue(forKey: id)?.cancel()
+        requests.removeValue(forKey: id)?.cancel()
         pending.removeValue(forKey: id)?.resume(throwing: error)
+    }
+    private static func transportError(_ error: Error) -> Error {
+        switch error {
+        case TaskdHTTPError.invalidFrame: return PropTaskDaemonError.invalidFrame
+        case TaskdHTTPError.timedOut: return PropTaskDaemonError.timedOut
+        case TaskdHTTPError.unavailable: return PropTaskDaemonError.unavailable
+        case TaskdHTTPError.rejected(let code): return PropTaskDaemonError.requestRejectedWith(code: code)
+        default: return error
+        }
     }
     private func accept(_ snapshot: PropTaskDaemonSnapshot) {
         guard !hasSnapshot || snapshot.sequence >= sequence else { return }
@@ -482,11 +532,14 @@ enum PropTaskDaemonError: LocalizedError {
     }
     private func tearDown() {
         endpointToken = nil
+        origin = nil
         connectionID = UUID()
-        connection?.cancel(); connection = nil; connectionReady = false; buffer.removeAll(); scannedBytes = 0
-        let requests = pending; pending.removeAll()
+        connection?.cancel(); connection = nil; connectionReady = false; eventData.removeAll()
+        let transports = requests; requests.removeAll()
+        for transport in transports.values { transport.cancel() }
+        let waiting = pending; pending.removeAll()
         for deadline in deadlines.values { deadline.cancel() }; deadlines.removeAll()
-        for continuation in requests.values { continuation.resume(throwing: PropTaskDaemonError.unavailable) }
+        for continuation in waiting.values { continuation.resume(throwing: PropTaskDaemonError.unavailable) }
     }
     private func lostConnection(identity: UUID) {
         guard connectionID == identity else { return }

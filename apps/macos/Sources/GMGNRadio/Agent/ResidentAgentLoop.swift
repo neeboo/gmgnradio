@@ -462,6 +462,7 @@ enum ResidentToolProgressNarration {
         case "hold_prop": Phrase(action: "拿起物件", request: "拿取请求")
         case "adjust_held_prop_grip": Phrase(action: "调整握持姿势", request: "握持调整")
         case "return_held_prop": Phrase(action: "把手里的物件放回去", request: "归还请求")
+        case "drop_held_prop": Phrase(action: "把手里的物件放到身边", request: "就近放下请求")
         case "enable_prop_capability": Phrase(action: "开启物件能力", request: "能力开启")
         case "delete_prop": Phrase(action: "删除物件", request: "删除请求")
         default: fallback

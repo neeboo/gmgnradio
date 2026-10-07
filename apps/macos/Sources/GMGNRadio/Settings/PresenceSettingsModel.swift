@@ -42,7 +42,9 @@ final class PresenceSettingsModel {
     private let defaults: UserDefaults
     private let avatarRuntime: StageAvatarRuntimeStore
     private let onWillActivateMotion: (String) -> Void
+    private let playbackCompatibility: (PresenceEngine?, StageMotionFormat) -> MotionCompatibility
     private var remoteMotionLibrary: RemoteMotionLibrary?
+    private var importPanel: NSOpenPanel?
 
     private enum MotionPreferenceKey {
         static let vrm = "gmgn.presence.motion.preferred.vrm"
@@ -57,6 +59,7 @@ final class PresenceSettingsModel {
         presenceStore: PresencePackageStore? = nil,
         motionStore: MotionPackageStore? = nil,
         remoteMotionLibrary: RemoteMotionLibrary? = nil,
+        playbackCompatibility: ((PresenceEngine?, StageMotionFormat) -> MotionCompatibility)? = nil,
         onWillActivateMotion: @escaping (String) -> Void = { motionID in
             NotificationCenter.default.post(
                 name: .gmgnManualMotionWillActivate,
@@ -67,6 +70,9 @@ final class PresenceSettingsModel {
         self.defaults = defaults
         self.avatarRuntime = avatarRuntime
         self.onWillActivateMotion = onWillActivateMotion
+        self.playbackCompatibility = playbackCompatibility ?? {
+            Self.motionCompatibility(avatarEngine: $0, motionFormat: $1)
+        }
         self.remoteMotionLibrary = remoteMotionLibrary
         remoteMotionCatalogURL = remoteMotionLibrary?.catalogURL.absoluteString
             ?? MotionServiceConfiguration.resolvedCatalogURLString(
@@ -187,10 +193,7 @@ final class PresenceSettingsModel {
     }
 
     func motionCompatibility(_ motion: StageMotionAsset) -> MotionCompatibility {
-        Self.motionCompatibility(
-            avatarEngine: activeAvatarEngine,
-            motionFormat: motion.format
-        )
+        playbackCompatibility(activeAvatarEngine, motion.format)
     }
 
     func isBuiltInMotion(_ motion: StageMotionAsset) -> Bool {
@@ -201,6 +204,7 @@ final class PresenceSettingsModel {
     }
 
     func importModel() {
+        guard importPanel == nil else { return }
         let panel = NSOpenPanel()
         panel.title = "导入角色模型"
         panel.prompt = "安装"
@@ -214,11 +218,17 @@ final class PresenceSettingsModel {
             UTType(filenameExtension: "gmgnpet") ?? .data,
             UTType(filenameExtension: "vrm") ?? .data,
         ]
-        guard panel.runModal() == .OK, let sourceURL = panel.url else { return }
-        install(from: sourceURL)
+        importPanel = panel
+        panel.begin { [weak self] response in
+            guard let self else { return }
+            self.importPanel = nil
+            guard response == .OK, let sourceURL = panel.url else { return }
+            self.install(from: sourceURL)
+        }
     }
 
     func importMotion() {
+        guard importPanel == nil else { return }
         let panel = NSOpenPanel()
         panel.title = "导入动作"
         panel.prompt = "安装"
@@ -230,8 +240,13 @@ final class PresenceSettingsModel {
             UTType(filenameExtension: "vrma") ?? .data,
             UTType(filenameExtension: "vmd") ?? .data,
         ]
-        guard panel.runModal() == .OK, let sourceURL = panel.url else { return }
-        installMotion(from: sourceURL)
+        importPanel = panel
+        panel.begin { [weak self] response in
+            guard let self else { return }
+            self.importPanel = nil
+            guard response == .OK, let sourceURL = panel.url else { return }
+            self.installMotion(from: sourceURL)
+        }
     }
 
     func activateMotion(_ motion: StageMotionAsset) {
@@ -500,16 +515,10 @@ final class PresenceSettingsModel {
             if
                 let preferredID = defaults.string(forKey: preferenceKey),
                 let preferred = motions.first(where: { $0.id == preferredID }),
-                Self.motionCompatibility(
-                    avatarEngine: engine,
-                    motionFormat: preferred.format
-                ) == .compatible
+                playbackCompatibility(engine, preferred.format) == .compatible
             {
                 effective = preferred
-            } else if Self.motionCompatibility(
-                avatarEngine: engine,
-                motionFormat: current.format
-            ) == .compatible {
+            } else if playbackCompatibility(engine, current.format) == .compatible {
                 effective = current
                 defaults.set(current.id, forKey: preferenceKey)
             } else {

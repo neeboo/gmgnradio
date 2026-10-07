@@ -2,15 +2,13 @@ import Foundation
 import Metal
 import simd
 
-// MARK: - 网站链接原生播放的**会话管理**（解析 → 原生播放器 → 场景纹理登记）
+// MARK: - 网站链接原生播放的会话管理（Rust 缓存 → 原生播放器 → 场景纹理登记）
 
 /// 一台电视上「网站链接原生播放」的**唯一**会话管理者。
 ///
 /// 三件事，一件都不许含糊：
-/// 1. **换片 / 停 / 删都会作废在途的解析**：每次 `play` 递增 generation 并取消上一个 Task；
-///    解析回来时 generation 不对就**直接丢弃**（过期结果不可发布，更不许复活已删电视）；
-/// 2. **解析地址只在内存**：`ScreenLinkResolutionValue` 不落盘；落盘的是用户粘的原始链接
-///    （由 `WorldScreenStore` 走 `WorldScreenContent(kind: .nativeLink)` 写）；
+/// 1. 换片 / 停 / 删作废 generation 并释放该代缓存 pin；晚到 prepare 回执仍必须清理 pin。
+/// 2. Rust 拥有解析、下载、缓存和淘汰；本地描述只交给原生播放器，Swift 不取远程媒体。
 /// 3. **渲染器只读已发布帧**：帧泵产出纹理，登记的 provider 每帧只读
 ///    `currentFrameTexture`，不在 draw 中索取视频输出。没有渲染器消费时帧泵仍运行。
 @MainActor
@@ -20,7 +18,7 @@ final class NativeScreenPlaybackCoordinator {
     /// 解析完成后等"出第一帧 / item 就绪"的上限。到点仍没出画就如实说"正在出画"。
     static let readinessWindow: Duration = .seconds(10)
 
-    private let resolver: any ScreenLinkResolving
+    private let cache: any ScreenMediaCaching
     private let registry: WorldScreenNativeVideoRegistry
     private let device: MTLDevice?
 
@@ -30,18 +28,27 @@ final class NativeScreenPlaybackCoordinator {
         var player: NativeLinkPlayer?
         var state: WorldScreenSurfaceState
         var task: Task<Void, Never>?
+        var consumerID = UUID().uuidString
+        var cacheKey: String?
+        var cacheState: ScreenMediaCacheState?
+        var isLive = false
+        var playlistID: String?
+        var playlist: ScreenVideoPlaylist?
+        var advancing = false
+        var failedGeneration: UInt64?
     }
 
     private var sessions: [String: Session] = [:]
+    private var nextGeneration: UInt64 = 0
     /// 状态变了（会话内状态或 `read_screen` 读到的内容）。
     var onChange: (@MainActor () -> Void)?
 
     init(
-        resolver: any ScreenLinkResolving,
+        cache: any ScreenMediaCaching,
         registry: WorldScreenNativeVideoRegistry,
         device: MTLDevice? = MTLCreateSystemDefaultDevice()
     ) {
-        self.resolver = resolver
+        self.cache = cache
         self.registry = registry
         self.device = device
     }
@@ -52,6 +59,13 @@ final class NativeScreenPlaybackCoordinator {
         let state: WorldScreenSurfaceState
         let isPlaying: Bool
         let contentURL: String
+        let cacheState: ScreenMediaCacheState?
+        let playlist: ScreenVideoPlaylist?
+        var playlistText: String? {
+            guard let playlist else {return nil}
+            let bounded = playlist.truncated == true ? "（本次载入前\(playlist.itemLimit ?? playlist.items.count)条）" : ""
+            return "播放列表 \(playlist.currentIndex + 1)/\(playlist.items.count)\(bounded)"
+        }
     }
 
     /// 原生播放器**真实解码**的只读度量（E2E / 诊断用）。没有原生会话时 `nil`，
@@ -82,6 +96,9 @@ final class NativeScreenPlaybackCoordinator {
         let isPlaybackLikelyToKeepUp: Bool
         let isPlaybackBufferEmpty: Bool
         let isPlaybackBufferFull: Bool
+        let preparationPhase: String
+        let sourceHTTPFailureStatuses: [Int]
+        let isManifest: Bool
     }
 
     func metrics(for objectID: String) -> Metrics? {
@@ -93,7 +110,7 @@ final class NativeScreenPlaybackCoordinator {
             pixelHeight: player.pixelHeight,
             currentSeconds: player.currentSeconds,
             itemStatus: player.itemStatus,
-            isLive: false,
+            isLive: session.isLive,
             hasAudio: player.hasAudio,
             isMuted: player.isMuted,
             volume: player.volume,
@@ -107,7 +124,10 @@ final class NativeScreenPlaybackCoordinator {
             waitingReason: player.waitingReason,
             isPlaybackLikelyToKeepUp: player.isPlaybackLikelyToKeepUp,
             isPlaybackBufferEmpty: player.isPlaybackBufferEmpty,
-            isPlaybackBufferFull: player.isPlaybackBufferFull
+            isPlaybackBufferFull: player.isPlaybackBufferFull,
+            preparationPhase: player.preparationPhase,
+            sourceHTTPFailureStatuses: player.sourceHTTPFailureStatuses,
+            isManifest: player.descriptor.videoStream?.isManifest ?? false
         )
     }
 
@@ -116,7 +136,9 @@ final class NativeScreenPlaybackCoordinator {
         return Snapshot(
             state: session.state,
             isPlaying: session.player.map { $0.decodedFrameCount > 0 || $0.state.isPlaying } ?? false,
-            contentURL: session.originalURL
+            contentURL: session.originalURL,
+            cacheState: session.cacheState,
+            playlist: session.playlist
         )
     }
 
@@ -134,14 +156,25 @@ final class NativeScreenPlaybackCoordinator {
     func play(
         objectID: String,
         pageURL: String,
-        quadProvider: @escaping @MainActor () -> [SIMD3<Float>]?
+        quadProvider: @escaping @MainActor () -> [SIMD3<Float>]?,
+        continuingPlaylist: ScreenVideoPlaylist? = nil
     ) async -> WorldScreenCommandOutcome {
+        if continuingPlaylist == nil, let session = sessions[objectID], session.originalURL == pageURL,
+           session.state.isLoading || session.state.isPlaying {
+            return Self.outcome(for: session.state, objectID: objectID)
+        }
         invalidate(objectID)
-        let generation = (sessions[objectID]?.generation ?? 0) + 1
+        let generation = allocateGeneration()
         sessions[objectID] = Session(
             generation: generation, originalURL: pageURL, player: nil,
             state: .loading(url: pageURL), task: nil
         )
+        if let continuingPlaylist {
+            sessions[objectID]?.playlistID = continuingPlaylist.playlistID
+            sessions[objectID]?.playlist = continuingPlaylist
+        } else if ScreenMediaCacheClient.isYouTubePlaylist(pageURL) {
+            sessions[objectID]?.playlistID = "screen-" + UUID().uuidString
+        }
         onChange?()
 
         guard let device else {
@@ -153,29 +186,83 @@ final class NativeScreenPlaybackCoordinator {
             )
         }
 
-        let resolver = self.resolver
-        let request = ScreenLinkRequest(pageURL: pageURL, timeout: .seconds(60))
+        let cache = self.cache
+        let consumerID = sessions[objectID]!.consumerID
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
-            let resolution = await resolver.resolve(request)
-            // **过期结果不可发布**：换片 / 停 / 删之后 generation 已变。
-            guard self.isCurrent(objectID, generation) else { return }
-            switch resolution {
-            case let .failed(failure):
-                self.publish(objectID, generation, .failed(.nativeLink(Self.mapScreenLinkFailure(failure))))
-            case let .resolved(value):
-                self.install(
-                    objectID: objectID, generation: generation, device: device,
-                    value: value, quadProvider: quadProvider
-                )
+            do {
+                var playbackURL = pageURL
+                if let id=self.sessions[objectID]?.playlistID, continuingPlaylist == nil {
+                    let playlist=try await cache.importPlaylist(pageURL:pageURL,playlistID:id)
+                    guard self.isCurrent(objectID,generation) else {
+                        try? await cache.releasePlaylist(playlistID:id)
+                        return
+                    }
+                    self.sessions[objectID]?.playlist=playlist
+                    playbackURL=playlist.currentURL!
+                    self.sessions[objectID]?.originalURL=playbackURL
+                    self.onChange?()
+                }
+                var status = try await cache.prepare(pageURL: playbackURL, maxHeight: 2160, consumerID: consumerID)
+                guard self.isCurrent(objectID, generation) else {
+                    self.releaseCache(status.cacheKey, consumerID: consumerID, cancel: status.state != .ready)
+                    return
+                }
+                self.sessions[objectID]?.cacheKey = status.cacheKey
+                self.sessions[objectID]?.cacheState = status.state
+                self.onChange?()
+                while self.isCurrent(objectID, generation) {
+                    let previousState = self.sessions[objectID]?.cacheState
+                    self.sessions[objectID]?.cacheState = status.state
+                    if previousState != status.state { self.onChange?() }
+                    if status.state == .downloading, status.descriptor == nil, let errorCode = status.errorCode {
+                        throw ScreenMediaCacheError.server(errorCode)
+                    }
+                    if self.sessions[objectID]?.player == nil, let descriptor = status.descriptor,
+                       status.state == .downloading || status.state == .streaming || status.state == .ready {
+                        guard ScreenMediaCacheClient.samePage(descriptor.pageURL, playbackURL) else { throw ScreenMediaCacheError.invalidDescriptor }
+                        self.install(objectID: objectID, generation: generation, device: device,
+                            descriptor: descriptor, quadProvider: quadProvider)
+                    }
+                    switch status.state {
+                    case .streaming:
+                        guard status.descriptor != nil else {
+                            throw ScreenMediaCacheError.server(status.errorCode ?? "media_cache_invalid_descriptor")
+                        }
+                    case .ready:
+                        guard let descriptor = status.descriptor else {
+                            throw ScreenMediaCacheError.server(status.errorCode ?? "media_cache_invalid_descriptor")
+                        }
+                        guard ScreenMediaCacheClient.samePage(descriptor.pageURL, playbackURL) else { throw ScreenMediaCacheError.invalidDescriptor }
+                        self.sessions[objectID]?.task = nil
+                        return
+                    case .failed: throw ScreenMediaCacheError.server(status.errorCode ?? "media_cache_failed")
+                    case .missing, .interrupted, .evicted:
+                        throw ScreenMediaCacheError.server(status.errorCode ?? "media_cache_\(status.state.rawValue)")
+                    case .cancelled: throw CancellationError()
+                    case .queued, .resolving, .downloading: break
+                    }
+                    try await Task.sleep(for: status.state == .streaming ? .seconds(1) : .milliseconds(250))
+                    let updated = try await cache.status(cacheKey: status.cacheKey)
+                    guard self.isCurrent(objectID, generation) else { return }
+                    guard updated.cacheKey == status.cacheKey else { throw ScreenMediaCacheError.invalidResponse }
+                    status = updated
+                }
+            } catch {
+                // Natural EOF transfers polling ownership to advance. Its cancelled
+                // old downloading poll must not tear down the still-owned queue.
+                guard self.isCurrent(objectID, generation),self.sessions[objectID]?.advancing == false else { return }
+                let failure = (error as? ScreenMediaCacheError) ?? .unavailable
+                self.finishFailure(objectID,generation,.nativeLink(NativeLinkFailureInfo(
+                    panelText: failure.panelText, technicalDescription: failure.code)))
             }
         }
         sessions[objectID]?.task = task
 
-        // 当场等一小段：缺 helper / 网络立即失败 / 立刻出画都能在这次调用里说清楚。
+        // 当场等一小段；下载任务的 600 秒上限由 Rust 执行，排队期间持续读状态。
         let deadline = ContinuousClock.now + Self.immediateFailureWindow
         while ContinuousClock.now < deadline {
-            if let session = sessions[objectID], session.generation == generation {
+            if let session = sessions[objectID], session.generation == generation || session.failedGeneration == generation {
                 if case .failed = session.state {
                     return Self.outcome(for: session.state, objectID: objectID)
                 }
@@ -220,7 +307,7 @@ final class NativeScreenPlaybackCoordinator {
         quadProvider: @escaping @MainActor () -> [SIMD3<Float>]?
     ) async -> WorldScreenCommandOutcome {
         invalidate(objectID)
-        let generation = (sessions[objectID]?.generation ?? 0) + 1
+        let generation = allocateGeneration()
         sessions[objectID] = Session(
             generation: generation, originalURL: fileURL, player: nil,
             state: .loading(url: fileURL), task: nil
@@ -260,6 +347,7 @@ final class NativeScreenPlaybackCoordinator {
         quadProvider: @escaping @MainActor () -> [SIMD3<Float>]?
     ) {
         guard let player = NativeLinkPlayer(device: device, descriptor: descriptor) else {
+            releaseSessionCache(objectID)
             publish(objectID, generation, .failed(.nativeLink(Self.mapScreenLinkFailure(.outputUnreadable("player_init")))))
             return
         }
@@ -274,12 +362,42 @@ final class NativeScreenPlaybackCoordinator {
             )
         }
         sessions[objectID]?.player = player
+        sessions[objectID]?.isLive = descriptor.isLive
         player.onStateChange = { [weak self] state in
             guard let self, self.isCurrent(objectID, generation) else { return }
             if case let .failed(failure) = state {
-                self.publish(objectID, generation, .failed(.nativeLink(Self.linkFailure(failure))))
+                self.finishFailure(objectID,generation,.nativeLink(Self.linkFailure(failure)))
             } else if state.isPlaying {
                 self.publish(objectID, generation, .playing(url: descriptor.pageURL))
+            }
+        }
+        player.onPlaybackEnded = { [weak self] in
+            guard let self,self.isCurrent(objectID,generation),!descriptor.isLive,
+                  self.sessions[objectID]?.advancing == false else {return}
+            guard let playlist=self.sessions[objectID]?.playlist,playlist.hasNext else {
+                self.stop(objectID)
+                return
+            }
+            self.sessions[objectID]?.advancing=true
+            self.sessions[objectID]?.task?.cancel()
+            self.sessions[objectID]?.task=Task { @MainActor [weak self] in
+                guard let self else {return}
+                do {
+                    let advanced=try await self.cache.advancePlaylist(playlistID:playlist.playlistID,revision:playlist.revision)
+                    let next=ScreenVideoPlaylist(playlistID:advanced.playlistID,revision:advanced.revision,
+                        currentIndex:advanced.currentIndex,items:advanced.items,
+                        truncated:playlist.truncated,itemLimit:playlist.itemLimit)
+                    guard self.isCurrent(objectID,generation) else {try? await self.cache.releasePlaylist(playlistID:playlist.playlistID);return}
+                    // Transfer queue ownership to the next generation; invalidate only the old video pin.
+                    self.sessions[objectID]?.playlistID=nil
+                    self.sessions[objectID]?.playlist=nil
+                    self.sessions[objectID]?.task=nil
+                    _ = await self.play(objectID:objectID,pageURL:next.currentURL!,quadProvider:quadProvider,continuingPlaylist:next)
+                } catch {
+                    guard self.isCurrent(objectID,generation) else {return}
+                    self.finishFailure(objectID,generation,.nativeLink(NativeLinkFailureInfo(
+                        panelText:"播放列表下一条打不开。",technicalDescription:(error as? ScreenMediaCacheError)?.code ?? "media_playlist_failed")))
+                }
             }
         }
         player.start()
@@ -291,7 +409,7 @@ final class NativeScreenPlaybackCoordinator {
             while ContinuousClock.now < deadline {
                 guard let self, self.isCurrent(objectID, generation) else { return }
                 guard let session = sessions[objectID], let current = session.player else { return }
-                if current.decodedFrameCount > 0 || current.state.isPlaying || current.itemStatus == 1 {
+                if current.decodedFrameCount > 0 || current.state.isPlaying {
                     self.publish(objectID, generation, .playing(url: descriptor.pageURL))
                     return
                 }
@@ -310,11 +428,13 @@ final class NativeScreenPlaybackCoordinator {
         guard let session = sessions[objectID] else { return }
         session.task?.cancel()
         session.player?.stop()
+        releaseSessionCache(objectID)
+        releaseSessionPlaylist(objectID)
         registry.unregister(objectID)
         // 会话留着（`stop_screen` 之后 `read_screen` 仍读得到"上次放的是什么、已停"），
         // 但把 generation 推一格：任何在途解析的结果都不会再发布。
         sessions[objectID] = Session(
-            generation: session.generation + 1, originalURL: session.originalURL,
+            generation: allocateGeneration(), originalURL: session.originalURL,
             player: nil, state: .stopped, task: nil
         )
         onChange?()
@@ -322,9 +442,12 @@ final class NativeScreenPlaybackCoordinator {
 
     /// 物件被收回 / 世界切换：**彻底**清掉会话（过期结果不许复活它）。
     func remove(_ objectID: String) {
-        guard let session = sessions.removeValue(forKey: objectID) else { return }
+        guard let session = sessions[objectID] else { return }
         session.task?.cancel()
         session.player?.stop()
+        releaseSessionCache(objectID)
+        releaseSessionPlaylist(objectID)
+        sessions.removeValue(forKey: objectID)
         registry.unregister(objectID)
         onChange?()
     }
@@ -352,7 +475,52 @@ final class NativeScreenPlaybackCoordinator {
         guard let session = sessions[objectID] else { return }
         session.task?.cancel()
         session.player?.stop()
+        releaseSessionCache(objectID)
+        releaseSessionPlaylist(objectID)
         registry.unregister(objectID)
+    }
+
+    private func allocateGeneration() -> UInt64 { nextGeneration &+= 1; return nextGeneration }
+    private func finishFailure(_ objectID:String,_ generation:UInt64,_ failure:WorldScreenFailure) {
+        guard isCurrent(objectID,generation) else {return}
+        let failedGeneration=allocateGeneration()
+        sessions[objectID]?.failedGeneration=generation
+        sessions[objectID]?.generation=failedGeneration
+        sessions[objectID]?.task?.cancel()
+        sessions[objectID]?.task=nil
+        let player=sessions[objectID]?.player
+        sessions[objectID]?.player=nil
+        player?.stop()
+        registry.unregister(objectID)
+        releaseSessionCache(objectID)
+        releaseSessionPlaylist(objectID)
+        publish(objectID,failedGeneration,.failed(failure))
+    }
+    private func releaseSessionPlaylist(_ objectID:String) {
+        guard let id=sessions[objectID]?.playlistID else {return}
+        sessions[objectID]?.playlistID=nil
+        sessions[objectID]?.playlist=nil
+        let cache=self.cache
+        Task {try? await cache.releasePlaylist(playlistID:id)}
+    }
+
+    private func releaseSessionCache(_ objectID: String) {
+        guard let session = sessions[objectID], let key = session.cacheKey else { return }
+        sessions[objectID]?.cacheKey = nil
+        releaseCache(key, consumerID: session.consumerID, cancel: session.cacheState != .ready)
+    }
+
+    private func releaseCache(_ key: String, consumerID: String, cancel: Bool) {
+        let cache = self.cache
+        Task {
+            do {
+                try await cache.release(cacheKey: key, consumerID: consumerID)
+                if cancel { try await cache.cancel(cacheKey: key, consumerID: consumerID) }
+            } catch {
+                let code = (error as? ScreenMediaCacheError)?.code ?? "media_cache_release_failed"
+                NSLog("[ScreenMediaCache] cleanup_failure=%@", code)
+            }
+        }
     }
 
     private func isCurrent(_ objectID: String, _ generation: UInt64) -> Bool {

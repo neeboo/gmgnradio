@@ -59,6 +59,12 @@ guard preferencesCode.contains("var backgroundTurnsPerHour: Int") else {
 // MARK: - prompt 统一注入（Codex/DSH 共用同一处）
 
 let context = declaration("struct ResidentWorldContext", in: serviceCode)
+guard context.contains("replySpeechEnabled") else {
+    fail("resident prompt does not receive the host's current reply speech setting")
+}
+guard context.contains("musicPlayback") else {
+    fail("resident prompt lacks the current playback owner's state")
+}
 guard context.contains("persona: String?") else {
     fail("resident prompt builder must accept the resident persona")
 }
@@ -187,6 +193,23 @@ struct Tests {
 
         let withoutPersona = try cabin.prompt(for: "x", toolsAvailable: true, persona: nil)
         check(!withoutPersona.contains("不是工具授权"), "no persona leaves the prompt without an injection block")
+
+        var voiced = cabin
+        voiced.replySpeechEnabled = true
+        let spokenPrompt = try voiced.prompt(for: "读出来", toolsAvailable: true)
+        check(spokenPrompt.contains("宿主已开启回复自动朗读"), "enabled host speech is visible to the resident")
+        check(spokenPrompt.contains("不能据此保证声音已经播放成功"), "speech setting does not claim successful playback")
+        voiced.replySpeechEnabled = false
+        let silentPrompt = try voiced.prompt(for: "读出来", toolsAvailable: true)
+        check(silentPrompt.contains("宿主已关闭回复自动朗读") && !silentPrompt.contains("宿主已开启回复自动朗读"), "disabled setting replaces enabled state on the next turn")
+        check(!withoutPersona.contains("宿主已开启回复自动朗读") && !withoutPersona.contains("宿主已关闭回复自动朗读"), "unknown hosts do not claim a speech capability")
+        voiced.musicPlayback = .init(hasTrack: false, isPlaying: false, title: nil, artist: nil)
+        let unloaded = try voiced.prompt(for: "现在放什么", toolsAvailable: true)
+        check(unloaded.contains("\"hasTrack\":false") && unloaded.contains("\"isPlaying\":false"), "empty player state overrides an active music activity")
+        check(unloaded.contains("musicPlayback 来自本轮播放器") && unloaded.contains("活动状态不能替代播放状态"), "prompt explains the playback authority boundary")
+        voiced.musicPlayback = .init(hasTrack: true, isPlaying: true, title: "Real Song", artist: "Real Artist")
+        let playingPrompt = try voiced.prompt(for: "现在放什么", toolsAvailable: true)
+        check(playingPrompt.contains("Real Song") && playingPrompt.contains("\"isPlaying\":true"), "next turn uses the current real song")
 
         print("PASS: \(checks) resident persona and background-budget checks; isolated suite, no host")
     }

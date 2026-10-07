@@ -1,14 +1,14 @@
 // 单一 taskd 根的门禁（2026-10-03 E2E 拒收项）：
 //
 //   同一个测试根里曾经出现**两个** taskd：
-//     · 世界权威 `WorldAuthorityEndpoint` 落在 `<base>/TaskService/taskd.sock`；
+//     · 世界权威 `WorldAuthorityEndpoint` 落在 `<base>/TaskService/taskd.endpoint.json`；
 //     · 生成服务 `PropTaskDaemonClient(root:)` 落在
-//       `<base>/gmgn radio/TaskService/taskd.sock`。
+//       `<base>/gmgn radio/TaskService/taskd.endpoint.json`。
 //   于是"世界加载"和"生成任务"各连各的 taskd，生成/入库永远对不上。
 //
 // 本 harness 把生产 `AuthorityWorldStatePersistence.swift` 里最后那段自包含的
 // `WorldAuthorityEndpoint` **原文**切出来，用真 `swiftc` 编起来跑：显式 base 必须得到
-// `<base>/gmgn radio/TaskService/taskd.sock`，且 `taskServiceRoot` 与 `socketPath` 同源。
+// `<base>/gmgn radio/TaskService/taskd.endpoint.json`，且 `taskServiceRoot` 与 `endpointFile` 同源。
 // 再做一条注入负对照：把 `gmgn radio` 那一层抽掉后同一判据必须红。
 //
 // 另外做来源扫描：App 的 E2E 注入必须走 `WorldAuthorityEndpoint.taskServiceRoot`，
@@ -67,15 +67,15 @@ let expectedRoot = base.appendingPathComponent("gmgn radio", isDirectory: true)
     .appendingPathComponent("TaskService", isDirectory: true)
 check(WorldAuthorityEndpoint.taskServiceRoot(applicationSupportBase: base).path == expectedRoot.path,
       "explicit base keeps the gmgn radio/TaskService level")
-check(endpoint.socketPath == expectedRoot.appendingPathComponent("taskd.sock").path,
-      "socket path is rooted at gmgn radio/TaskService")
-check(!endpoint.socketPath.contains("/TaskService/taskd.sock") ||
-      endpoint.socketPath.contains("/gmgn radio/TaskService/taskd.sock"),
+check(endpoint.endpointFile == expectedRoot.appendingPathComponent("taskd.endpoint.json").path,
+      "HTTP descriptor path is rooted at gmgn radio/TaskService")
+check(!endpoint.endpointFile.contains("/TaskService/taskd.endpoint.json") ||
+      endpoint.endpointFile.contains("/gmgn radio/TaskService/taskd.endpoint.json"),
       "there is exactly one gmgn radio level before TaskService")
 check(endpoint.helperPath.hasSuffix("Contents/Helpers/gmgn-taskd"),
       "helper stays inside the app bundle")
 
-print("\(failures == 0 ? "PASS" : "FAIL"): \(checks) socket-root checks, \(failures) failures")
+print("\(failures == 0 ? "PASS" : "FAIL"): \(checks) HTTP-descriptor-root checks, \(failures) failures")
 exit(failures == 0 ? 0 : 1)
 """#
 

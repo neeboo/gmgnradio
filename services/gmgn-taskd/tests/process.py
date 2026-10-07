@@ -1,11 +1,12 @@
 """Offline contract tests: real taskd child, private temp roots, loopback HTTP only."""
 import base64
 import hashlib
+import http.client
 import http.server
 import json
+from http_transport import Connection
 import os
 from pathlib import Path
-import socket
 import sqlite3
 import struct
 import subprocess
@@ -167,22 +168,12 @@ class Daemon:
                 time.sleep(.02)
         if self.p.poll() is None:
             self.p.kill()
-        raise AssertionError("daemon did not expose its TCP endpoint: " + self.p.communicate(timeout=2)[1].decode())
+        raise AssertionError("daemon did not expose its HTTP endpoint: " + self.p.communicate(timeout=2)[1].decode())
 
     def connect(self):
-        endpoint = json.loads(Path(self.path).read_text())
-        host, port = endpoint["address"].rsplit(":", 1)
-        if endpoint["version"] != 1 or host != "127.0.0.1" or not 0 < int(port) < 65536:
-            raise OSError("invalid local endpoint")
-        self.auth = endpoint["token"]
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(8)
-        try:
-            s.connect((host, int(port)))
-        except Exception:
-            s.close()
-            raise
-        return s
+        connection = Connection(self.path)
+        self.auth = connection.auth
+        return connection
 
     def frame(self, value):
         return json.dumps(dict(value, auth=self.auth)).encode() + b"\n"
@@ -257,7 +248,7 @@ class ProcessTests(unittest.TestCase):
                 ready.add(event["job"]["id"])
         stream.close()
         sub.close()
-        second_process = subprocess.run([BIN, "--root", self.temp.name, "--socket", d.path], capture_output=True, timeout=3)
+        second_process = subprocess.run([BIN, "--root", self.temp.name, "--endpoint-file", d.path], capture_output=True, timeout=3)
         self.assertNotEqual(second_process.returncode, 0)
         self.assertEqual(len(d.request("snapshot")["result"]["jobs"]), 2)
         d.stop()
@@ -285,7 +276,7 @@ class ProcessTests(unittest.TestCase):
         self.remote.release.set()
         self.assertEqual(d.wait_stage(identity, {"cancelled"})["receipt"]["state"], "cancelled")
 
-    def test_tcp_endpoint_authentication_and_restart_rotation(self):
+    def test_http_endpoint_authentication_and_restart_rotation(self):
         d = self.start()
         previous = d.auth
         for auth in (None, "wrong-local-token"):
@@ -296,7 +287,7 @@ class ProcessTests(unittest.TestCase):
                 connection.sendall(json.dumps(frame).encode() + b"\n")
                 with connection.makefile("rb") as stream:
                     response = json.loads(stream.readline())
-                self.assertEqual(response.get("error", {}).get("code"), "ipc_unauthorized")
+                self.assertEqual(response.get("error", {}).get("code"), "http_unauthorized")
         providers = d.request("providers_status")["result"]["endpoints"]
         self.assertFalse(any(p["endpoint"] == "https://blocked.invalid" for p in providers))
         d.stop()
@@ -306,7 +297,7 @@ class ProcessTests(unittest.TestCase):
             connection.sendall(json.dumps(dict(auth=previous,id="old",method="snapshot",params={})).encode()+b"\n")
             with connection.makefile("rb") as stream:
                 response=json.loads(stream.readline())
-            self.assertEqual(response.get("error",{}).get("code"),"ipc_unauthorized")
+            self.assertEqual(response.get("error",{}).get("code"),"http_unauthorized")
         self.assertIn("result",d.request("snapshot"))
 
     def test_restart_running_waits_for_credentials(self):
@@ -468,17 +459,14 @@ class ProcessTests(unittest.TestCase):
         self.assertTrue(job["cancelRequested"])
         self.assertEqual(d.wait_stage(identity, {"cancelled"})["receipt"]["state"], "cancelled")
 
-    def test_requests_continue_on_an_event_subscription_connection(self):
+    def test_rpc_continues_while_event_subscription_is_open(self):
         d = self.start()
         with d.connect() as connection:
             with connection.makefile("rb") as stream:
                 connection.sendall(d.frame(dict(id="subscribe", method="subscribe", params=dict(after=0))))
                 self.assertTrue(json.loads(stream.readline())["result"]["subscribed"])
-                connection.sendall(d.frame(dict(id="snapshot", method="snapshot", params={})))
-                line = stream.readline()
-                self.assertTrue(line, "daemon closed multiplexed connection after subscribe")
-                response = json.loads(line)
-                self.assertEqual(response["id"], "snapshot")
+                response = d.request("snapshot")
+                self.assertEqual(response["id"], "test")
                 self.assertEqual(response["result"]["jobs"], [])
 
     def test_message_cannot_persist_a_token_with_json_escapes(self):
@@ -598,6 +586,29 @@ class ProcessTests(unittest.TestCase):
                 response = json.loads(raw)
                 self.assertEqual(response.get("error", {}).get("code"), "invalid_request_id")
                 self.assertIsNone(response["id"])
+
+    def test_http_routes_origin_and_declared_body_limit(self):
+        d = self.start()
+        endpoint = json.loads(Path(d.path).read_text())
+        host, port = endpoint["address"].rsplit(":", 1)
+        for route, headers, body, status, code in (
+            ("/rpc", {"Origin": "https://example.invalid"}, b"{}", 403, "http_origin_forbidden"),
+            ("/unknown", {}, b"{}", 404, "http_route_not_found"),
+            ("/rpc", {"Content-Type": "text/plain"}, b"{}", 415, "http_content_type_required"),
+            ("/rpc", {"Content-Length": str(32 * 1024 * 1024)}, b"", 413, "frame_too_large"),
+            ("/rpc", {}, b"not-json", 400, "invalid_request"),
+            ("/rpc", {}, json.dumps({"id": "s", "method": "subscribe", "params": {}}).encode(), 400, "http_events_route_required"),
+        ):
+            connection = http.client.HTTPConnection(host, int(port), timeout=8)
+            try:
+                connection.request("POST", route, body, {"Authorization": "Bearer " + endpoint["token"],
+                                   "Content-Type": "application/json", **headers})
+                response = connection.getresponse()
+                self.assertEqual(response.status, status)
+                self.assertEqual(json.loads(response.read())["error"]["code"], code)
+            finally:
+                connection.close()
+        self.assertIn("result", d.request("snapshot"))
 
 
 if __name__ == "__main__":

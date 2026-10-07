@@ -137,6 +137,7 @@ for agentName in [
     compileArguments.append(root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/\(agentName).swift").path)
 }
 compileArguments.append(contentsOf: [
+    root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift").path,
     root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/ResidentVisionCapture.swift").path,
     main.path, "-o", binary.path,
 ])

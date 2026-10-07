@@ -50,12 +50,44 @@ pub fn language_command(locale: UiLocale) -> Value {
 // Product-owned UI copy only. Provider/model/voice names and service errors
 // remain original data and are never passed through this catalog.
 const SETTINGS_COPY: &[(&str, &str, &str)] = &[
+    ("生活", "Daily life", "日常"),
+    ("工作", "Work", "仕事"),
+    ("运动", "Exercise", "運動"),
+    ("戏剧", "Drama", "演技"),
+    ("自然待机", "Natural idle", "自然な待機"),
+    ("活动", "Activities", "活動"),
+    ("角色与动作", "Character and motions", "キャラクターとモーション"),
+    ("Agent 与语音", "Agent and voice", "エージェントと音声"),
+    ("导入视频", "Import video", "動画を読み込む"),
+    ("选择并播放", "Select and play", "選択して再生"),
+    ("播放", "Play", "再生"),
+    ("暂停", "Pause", "一時停止"),
+    ("停止", "Stop", "停止"),
+    ("单次", "Once", "1 回"),
+    ("循环", "Loop", "ループ"),
+    ("随机拼接", "Random sequence", "ランダム連結"),
+    ("使用中", "Active", "使用中"),
+    ("该页面尚未完成 Unity 运行时接线。", "This page is not connected to the Unity runtime yet.", "このページはまだ Unity ランタイムに未接続です。"),
+    ("Codex 账号用于选择 Codex 后端；当前聊天后端以下方选择为准。", "The Codex account is used by the Codex backend. The selection below determines the current chat backend.", "Codex アカウントは Codex バックエンドで使用します。現在のチャットは下の選択に従います。"),
+    ("播放 / 暂停", "Play / Pause", "再生 / 一時停止"),
+    ("上一首", "Previous track", "前の曲"),
+    ("下一首", "Next track", "次の曲"),
+    ("音量增加", "Volume up", "音量を上げる"),
+    ("音量降低", "Volume down", "音量を下げる"),
+    ("开麦 / 关麦", "Microphone on / off", "マイク オン / オフ"),
+    ("显示 / 隐藏舞台", "Show / hide stage", "ステージを表示 / 非表示"),
+    ("切换歌词视觉", "Cycle lyric style", "歌詞スタイルを切り替え"),
+    ("全局快捷键至少需要一个修饰键。", "Global shortcuts require at least one modifier key.", "グローバルショートカットには修飾キーが必要です。"),
+    ("Codex CLI 不可用", "Codex CLI unavailable", "Codex CLI が利用できません"),
+    ("Codex 未登录", "Codex signed out", "Codex は未ログインです"),
+    ("账号操作失败，请检查 Codex CLI 后重试。", "Account operation failed. Check Codex CLI and retry.", "アカウント操作に失敗しました。Codex CLI を確認して再試行してください。"),
+    ("角色或动作加载失败，已恢复原选择。", "Character or motion failed to load. Previous selection restored.", "キャラクターまたはモーションの読み込みに失敗しました。以前の選択に戻しました。"),
     ("Unity 设置连接不可用，请从 Unity 重新打开。", "Unity settings connection unavailable. Reopen settings from Unity.", "Unity 設定接続が利用できません。Unity から設定を開き直してください。"),
     ("请从 Unity 播放器打开设置。", "Open settings from the Unity player.", "Unity プレーヤーから設定を開いてください。"),
     ("版本", "Version", "バージョン"),
     ("秒", "s", "秒"),
     ("等待渲染", "Waiting for rendering", "描画待ち"),
-    ("当前可管理语音配置、试听与回复朗读；Unity 按住说话尚未接入。", "Voice configuration, preview and reply reading are connected. Unity push-to-talk is not connected yet.", "音声設定、試聴、返信読み上げは接続済みです。Unity の押して話す機能はまだ未接続です。"),
+    ("按住麦克风录音，松开后将完整转写交给当前角色。没有双向实时通话。", "Hold the microphone to record. Release to send the complete transcript to the current character. This is not a two-way live call.", "マイクを押して録音します。離すと全文の文字起こしを現在のキャラクターに送信します。双方向のリアルタイム通話ではありません。"),
     ("内置动态", "Built-in motion", "組み込みモーション"),
     ("内置", "Built-in", "組み込み"),
     ("更多操作", "More actions", "その他の操作"),
@@ -63,6 +95,19 @@ const SETTINGS_COPY: &[(&str, &str, &str)] = &[
     ("公开空间", "Public spaces", "公開空間"),
     ("生成场景", "Generated scenes", "生成シーン"),
     ("人物位置", "Character position", "キャラクターの位置"),
+    ("移动到坐标", "Move to coordinates", "指定座標へ移動"),
+    ("坐标以米计；人物会沿可通行地面移动，Y 必须贴合目标地面。", "Coordinates are in meters. The character follows walkable ground; Y must match the destination ground.", "座標はメートル単位です。キャラクターは通行可能な地面を移動します。Y は目的地の地面と一致させてください。"),
+    ("请输入有效的 X、Y、Z 坐标。", "Enter valid X, Y and Z coordinates.", "有効な X、Y、Z 座標を入力してください。"),
+    ("人物正在移动，等待空间与画面确认。", "Moving the character; waiting for world and rendered-frame confirmation.", "キャラクターを移動中です。空間と描画の確認を待っています。"),
+    ("人物位置已更新。", "Character position updated.", "キャラクターの位置を更新しました。"),
+    ("人物坐标请求无效。", "Invalid character-coordinate request.", "キャラクター座標の要求が無効です。"),
+    ("空间状态已变化，请重新读取坐标。", "World state changed. Reload the coordinates.", "空間の状態が変わりました。座標を再取得してください。"),
+    ("空间布局已变化，请重新读取坐标。", "World layout changed. Reload the coordinates.", "空間の配置が変わりました。座標を再取得してください。"),
+    ("人物位置尚未完成空间持久确认。", "The character position has not been confirmed in durable world state.", "キャラクター位置の永続的な空間状態での確認が完了していません。"),
+    ("人物移动或画面确认超时，请重试。", "Character movement or rendered-frame confirmation timed out. Retry.", "移動または描画の確認がタイムアウトしました。再試行してください。"),
+    ("人物移动已被新的请求替换。", "Character movement was replaced by a new request.", "キャラクターの移動が新しい要求に置き換えられました。"),
+    ("人物未到达指定位置。", "The character did not reach the requested position.", "キャラクターが指定した位置に到着していません。"),
+    ("空间未确认合法的地面目标。", "The world did not confirm a valid grounded destination.", "空間が有効な接地先を確認できませんでした。"),
     ("人物位置会按当前空间保存", "Character position is saved per space", "キャラクターの位置は空間ごとに保存されます"),
     ("重置", "Reset", "リセット"),
     ("W/S 沿视线前后移动，A/D 左右移动", "W/S moves forward/back along the view; A/D moves sideways", "W/S で視線方向に前後移動、A/D で左右移動"),
@@ -87,6 +132,9 @@ const SETTINGS_COPY: &[(&str, &str, &str)] = &[
     ("加载", "Load", "読み込み"),
     ("解除当前歌曲绑定", "Unbind from current track", "現在の曲との関連付けを解除"),
     ("绑定到当前歌曲", "Bind to current track", "現在の曲に関連付け"),
+    ("当前歌曲", "Current track", "現在の曲"),
+    ("当前歌曲有绑定视频", "This track has a linked video", "この曲には関連付けられた動画があります"),
+    ("播放绑定视频", "Play linked video", "関連付けられた動画を再生"),
     ("移出素材库", "Remove from library", "ライブラリから削除"),
     ("设置 · Unity 播放器", "Settings · Unity Player", "設定 · Unity プレーヤー"),
     ("字幕、3D 点阵与视频效果", "Lyrics, 3D particles and video effects", "歌詞、3D パーティクルと動画効果"),
@@ -153,8 +201,39 @@ const SETTINGS_COPY: &[(&str, &str, &str)] = &[
     ("启动时进入", "Open on startup", "起動時に開く"),
     ("修改后下次启动生效。", "Changes apply on the next launch.", "変更は次回起動時に適用されます。"),
     ("Marble 空间", "Marble spaces", "Marble の空間"),
+    ("Marble World ID", "Marble World ID", "Marble World ID"),
+    ("生成与导入空间", "Generate and import spaces", "空間の生成とインポート"),
+    ("生成会调用付费 Marble API；仅点击生成按钮时提交。", "Generation uses the paid Marble API and is submitted only when you click Generate.", "生成は有料の Marble API を使用し、生成ボタンを押した時だけ送信します。"),
+    ("当前运行时不支持 Marble 空间生成与导入。", "This runtime does not support Marble space generation or import.", "現在のランタイムは Marble 空間の生成とインポートに対応していません。"),
+    ("生成任务 ID", "Generation operation ID", "生成タスク ID"),
+    ("已有生成回执，请恢复原任务；不会重复提交付费生成。", "A generation receipt exists. Resume the original task without submitting another paid generation.", "生成タスクの記録があります。元のタスクを再開し、有料生成を重複送信しません。"),
+    ("生成（付费）", "Generate (paid)", "生成（有料）"),
+    ("按 World ID 导入", "Import by World ID", "World ID でインポート"),
+    ("恢复原任务", "Resume original task", "元のタスクを再開"),
+    ("取消本机等待", "Cancel local waiting", "ローカルの待機を中止"),
+    ("取消仅停止本机等待，远端生成可能继续并计费。", "Cancellation stops local waiting only. Remote generation may continue and incur charges.", "中止はローカルの待機だけを停止します。リモート生成は継続し、料金が発生する場合があります。"),
+    ("正在生成空间", "Generating space", "空間を生成中"),
+    ("正在下载空间资产", "Downloading space assets", "空間アセットをダウンロード中"),
+    ("正在校验空间运行包", "Validating space package", "空間パッケージを検証中"),
+    ("正在注册空间", "Registering space", "空間を登録中"),
+    ("空间已导入", "Space imported", "空間をインポートしました"),
+    ("已有待恢复的生成任务", "Generation task available to resume", "再開できる生成タスクがあります"),
+    ("本机任务已取消", "Local task cancelled", "ローカルタスクを中止しました"),
+    ("本机等待已取消，远端生成可能继续；可恢复原任务。", "Local waiting cancelled. Remote generation may continue; you can resume the original task.", "ローカルの待機を中止しました。リモート生成は継続する場合があります。元のタスクを再開できます。"),
+    ("空间任务失败", "Space task failed", "空間タスクに失敗しました"),
+    ("生成进度", "Generation progress", "生成の進捗"),
     ("用于同步和生成可探索的 3D 空间", "Sync and generate explorable 3D spaces", "探索できる 3D 空間の同期と生成"),
     ("已配置", "Configured", "設定済み"),
+    ("加载中…", "Loading…", "読み込み中…"),
+    ("高级设置", "Advanced", "詳細設定"),
+    ("复刻音色请选择创建时使用的模型。", "For a cloned voice, select its original model.", "複製音声には作成時のモデルを選択してください。"),
+    ("麦克风", "Microphone", "マイク"),
+    ("系统默认", "System default", "システム既定"),
+    ("所选麦克风已断开，请重新选择。", "The selected microphone disconnected. Choose another.", "選択したマイクが切断されました。選び直してください。"),
+    ("已保存。", "Saved.", "保存しました。"),
+    ("请先填写 API Key，再刷新声音。", "Enter an API key, then refresh voices.", "API キーを入力して音声を更新してください。"),
+    ("该账号暂无可用声音，可填写自定义音色 ID。", "No voices are available. You can enter a custom voice ID.", "利用できる音声がありません。カスタム音声 ID を入力できます。"),
+    ("同步完成后，音乐库会显示最新歌单。", "Playlists appear after sync completes.", "同期後に最新のプレイリストが表示されます。"),
     ("未配置", "Not configured", "未設定"),
     ("只保存在本机，不使用钥匙串。", "Stored locally without Keychain.", "ローカル保存のみ。キーチェーンは使用しません。"),
     ("清除", "Clear", "消去"),
@@ -234,8 +313,7 @@ const SETTINGS_COPY: &[(&str, &str, &str)] = &[
     ("账号操作只影响当前 Unity 会话；同步完成后，音乐库会显示最新歌单。", "Account changes affect only this Unity session. After sync, the library shows the latest playlists.", "アカウント操作は現在の Unity セッションだけに適用されます。同期後、ライブラリに最新のプレイリストが表示されます。"),
     ("角色可以使用的账号", "Accounts available to the character", "キャラクターが利用できるアカウント"),
     ("文字和语音共用同一会话，回答后再朗读", "Text and voice share one conversation; replies can be read aloud", "文字と音声は同じ会話を使用し、返信を読み上げます"),
-    ("居民人格保存后下一轮聊天生效。按住说话与自主行动尚未接入 Unity。", "Saved persona applies to the next chat turn. Push-to-talk and autonomous actions are not connected to Unity yet.", "保存した人格は次の会話から適用されます。押して話す機能と自律行動はまだ Unity に未接続です。"),
-    ("可保存语音识别配置；Unity 按住说话尚未接入。", "Speech recognition settings can be saved. Unity push-to-talk is not connected yet.", "音声認識設定を保存できます。Unity の押して話す機能はまだ未接続です。"),
+    ("居民人格保存后下一轮聊天生效。", "Saved persona applies to the next chat turn.", "保存した人格は次の会話から適用されます。"),
     ("已保存 Unity 语音配置。", "Unity voice settings saved.", "Unity の音声設定を保存しました。"),
     ("请先加载模型列表并选择有效模型。", "Load the model list and select a supported model first.", "モデル一覧を読み込み、対応モデルを選択してください。"),
     ("模型列表暂时无法加载，已有配置已保留。", "Unable to load models. Existing settings are preserved.", "モデル一覧を読み込めません。既存設定は保持されています。"),
@@ -254,6 +332,43 @@ pub fn settings_copy<'a>(locale: UiLocale, source: &'a str) -> &'a str {
 }
 
 pub fn settings_notice(locale: UiLocale, source: &str) -> String {
+    for (prefix, suffix, english, japanese) in [
+        ("已切换为 ", "。", "Switched to", "切り替えました"),
+        ("正在加载 ", "…", "Loading", "読み込み中"),
+    ] {
+        if let Some(name) = source.strip_prefix(prefix).and_then(|s| s.strip_suffix(suffix)).filter(|s| !s.is_empty()) {
+            return match locale {
+                UiLocale::ZhCn => source.to_owned(),
+                UiLocale::En => format!("{english} {name}."),
+                UiLocale::Ja => format!("{name}：{japanese}。"),
+            };
+        }
+    }
+    const SPACE_NOTICES: &[(&str, &str, &str, &str)] = &[
+        ("space_library_loaded", "空间库已读取", "Space library loaded", "空間ライブラリを読み込みました"),
+        ("space_library_switching", "正在切换空间…", "Switching space…", "空間を切り替えています…"),
+        ("space_library_switch_failed", "空间切换未完成，保留当前空间", "Space switch failed. Current space retained.", "空間を切り替えられませんでした。現在の空間を保持します"),
+        ("space_library_selected", "空间已切换", "Space switched", "空間を切り替えました"),
+        ("space_library_invalid_packages", "部分空间包无效，未加入可用列表", "Invalid space packages were excluded.", "無効な空間パッケージを一覧から除外しました"),
+        ("space_marble_requires_package", "Marble 空间需要发布完整运行包后才能切换", "Marble spaces require a complete runtime package before switching.", "Marble 空間を切り替えるには完全な実行パッケージの公開が必要です"),
+        ("space_marble_read_failed", "Marble 空间库读取失败，请检查服务配置", "Could not load Marble spaces. Check service configuration.", "Marble 空間を読み込めませんでした。サービス設定を確認してください"),
+    ];
+    if let Some((_, zh, en, ja)) = SPACE_NOTICES.iter().find(|(code, _, _, _)| *code == source) {
+        return match locale { UiLocale::ZhCn => zh, UiLocale::En => en, UiLocale::Ja => ja }.to_string();
+    }
+    const GENERATION_NOTICES: &[(&str, &str, &str, &str)] = &[
+        ("generation_not_configured", "尚未配置生成服务", "Generation service is not configured", "生成サービスが未設定です"),
+        ("generation_configuration_loaded", "已读取生成服务配置", "Generation configuration loaded", "生成サービスの設定を読み込みました"),
+        ("generation_configuration_unreadable", "无法读取生成配置，请检查本机文件权限", "Could not read generation configuration. Check local file permissions.", "生成設定を読み込めません。ローカルファイルの権限を確認してください"),
+        ("generation_configuration_saved", "生成服务配置已保存", "Generation configuration saved", "生成サービスの設定を保存しました"),
+        ("generation_configuration_save_failed", "配置保存失败，请检查地址和密钥", "Could not save configuration. Check the URL and key.", "設定を保存できませんでした。URL とキーを確認してください"),
+        ("generation_endpoint_requires_token", "修改服务地址时需要填写新密钥", "Enter a new key when changing the service URL.", "サービス URL を変更する場合は新しいキーを入力してください"),
+        ("generation_connection_ok", "生成服务连接正常", "Generation service connection verified", "生成サービスへの接続を確認しました"),
+        ("generation_connection_failed", "生成服务连接失败，请检查地址和密钥", "Generation connection failed. Check the URL and key.", "生成サービスに接続できませんでした。URL とキーを確認してください"),
+    ];
+    if let Some((_, zh, en, ja)) = GENERATION_NOTICES.iter().find(|(code, _, _, _)| *code == source) {
+        return match locale { UiLocale::ZhCn => zh, UiLocale::En => en, UiLocale::Ja => ja }.to_string();
+    }
     // This is a known Host-owned status template, not a service error or name.
     if let Some(count) = source.strip_prefix("已同步 ").and_then(|s| s.strip_suffix(" 个歌单。"))
         .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())) {
@@ -303,6 +418,17 @@ mod tests {
     use super::{NAVIGATION, SETTINGS_COPY, PLAYER_CHOICES, UiLocale, language_command, settings_navigation_label, settings_copy, settings_notice, player_choice_label};
     use serde_json::json;
     #[test]
+    fn generation_bridge_status_codes_have_three_translations() {
+        for code in ["generation_not_configured", "generation_configuration_loaded", "generation_configuration_unreadable", "generation_configuration_saved", "generation_configuration_save_failed", "generation_endpoint_requires_token", "generation_connection_ok", "generation_connection_failed"] {
+            for locale in [UiLocale::ZhCn, UiLocale::En, UiLocale::Ja] {
+                let translated = settings_notice(locale, code);
+                assert!(!translated.is_empty());
+                assert_ne!(translated, code);
+            }
+        }
+    }
+
+    #[test]
     fn all_categories_and_secondary_pages_have_three_languages() {
         assert_eq!(NAVIGATION.len(), 6 + 13);
         let mut keys = std::collections::HashSet::new();
@@ -340,7 +466,7 @@ mod tests {
         // Core controls, help and Host status for each available page.
         for key in ["音乐服务", "连接", "断开", "同步", "账号操作只影响当前 Unity 会话；同步完成后，音乐库会显示最新歌单。",
             "回复语音", "刷新声音", "试听声音", "停止试听", "自定义音色 ID", "保存配置", "服务", "模型", "声音",
-            "按住说话", "新的 ASR API Key", "可保存语音识别配置；Unity 按住说话尚未接入。",
+            "按住说话", "新的 ASR API Key", "按住麦克风录音，松开后将完整转写交给当前角色。没有双向实时通话。",
             "居民人格", "保存", "只影响居民，和上面的角色偏好分开。人格只改语气和关注点，不改变它能做什么。"] {
             assert!(keys.contains(&key), "missing available-page copy: {key}");
         }
@@ -356,6 +482,12 @@ mod tests {
         assert_eq!(settings_notice(UiLocale::En, "已同步 12 个歌单。"), "Synced 12 playlists.");
         assert_eq!(settings_notice(UiLocale::Ja, "已同步 12 个歌单。"), "12 件のプレイリストを同期しました。");
         assert_eq!(settings_notice(UiLocale::ZhCn, "已同步 12 个歌单。"), "已同步 12 个歌单。");
+        assert_eq!(settings_notice(UiLocale::En, "已切换为 I Love Slap Bass。"), "Switched to I Love Slap Bass.");
+        assert_eq!(settings_notice(UiLocale::Ja, "已切换为 私のダンス。"), "私のダンス：切り替えました。");
+        for key in ["生活", "工作", "运动", "戏剧", "自然待机", "角色与动作", "Agent 与语音"] {
+            assert_ne!(settings_copy(UiLocale::En, key), key);
+            assert!(!settings_copy(UiLocale::Ja, key).is_empty());
+        }
     }
     #[test]
     fn player_catalogs_translate_all_builtin_modes_without_touching_custom_names() {

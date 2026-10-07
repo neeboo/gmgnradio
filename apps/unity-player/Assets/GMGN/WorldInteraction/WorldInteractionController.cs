@@ -16,13 +16,32 @@ namespace GMGN.UnityPlayer
         NativePlayerBackend backend;
         string worldID, requestID;
         IReadOnlyList<RecoveryItem> items;
+        List<RecoveryItem> mutableItems;
+        JObject deviceTemplate, lastPlacementPayload, placementGrid;
+        JArray placementTriangles, placementBlocking;
+        public Func<JObject, bool> PlaceDevice;
+        public event Action<BuiltinWorldDevice> DeviceRestored;
+        bool inventoryPreview;
+        bool deviceExistingPreview;
+        bool deviceRelocationPreview;
+        JArray deviceTemplates;
+        public void ConfigureDeviceTemplates(JArray templates) => deviceTemplates = templates == null ? new JArray() : (JArray)templates.DeepClone();
         Label message;
         RecoveryItem selected;
         Vector3 initialPosition;
+        Vector3 gesturePosition;
+        Quaternion gestureRotation;
         Quaternion initialRotation;
         JObject authority, submitted;
         ulong savedRevision;
         bool active, saving, awaitingReadback;
+        bool editing;
+        public bool IsEditing => active && editing;
+        public void SetEditing(bool value)
+        {
+            editing = value && active;
+            if (!editing) { manipulator?.Abort(); Cancel(); }
+        }
         string savedObjectID;
         bool readbackUnconfirmed;
         int readbackAttempts;
@@ -42,13 +61,22 @@ namespace GMGN.UnityPlayer
         int poseVersion, evaluatedPoseVersion;
         float nextEvaluation, releaseDeadline;
         bool buildingEvaluation;
+        int pendingEscapeFrame = -1;
         float? evaluatedSupportHeight;
-        public bool OwnsPointer => manipulator?.Dragging == true || releasePending || saving;
+        public bool OwnsPointer => manipulator?.Dragging == true || releasePending || saving || deviceTemplate != null || deviceRelocationPreview || inventoryPreview;
+        PlacementRequestBuilder placementBuilder;
         public void ConfigurePlacementGeometry(JObject grid, JArray triangles, JArray blockingVolumes)
         {
-            var builder = new PlacementRequestBuilder(grid, triangles, blockingVolumes, items);
-            BuildPlacementRequestAsync = builder.BuildAsync;
-            ApplyValidatedPreview = builder.Apply;
+            bool sameGeometry = ReferenceEquals(placementGrid, grid) && ReferenceEquals(placementTriangles, triangles) &&
+                ReferenceEquals(placementBlocking, blockingVolumes);
+            placementGrid = grid; placementTriangles = triangles; placementBlocking = blockingVolumes;
+            // An in-flight request owns its builder's dictionaries until assembly
+            // finishes; changing recovered objects must not mutate that snapshot.
+            if (!sameGeometry || placementBuilder == null || buildingEvaluation)
+                placementBuilder = new PlacementRequestBuilder(grid, triangles, blockingVolumes, items);
+            else placementBuilder.UpdateItems(items);
+            BuildPlacementRequestAsync = placementBuilder.BuildAsync;
+            ApplyValidatedPreview = placementBuilder.Apply;
         }
         public bool BlocksCameraAt(Vector2 screen)
         {
@@ -57,6 +85,7 @@ namespace GMGN.UnityPlayer
             var ray = Camera.main.ScreenPointToRay(screen);
             foreach (var item in items) {
                 if (item.Instance == null || !item.Instance.activeInHierarchy || item.Status != "restored") continue;
+                if (!IsEditing && item.Instance.GetComponent<BuiltinWorldDevice>() == null) continue;
                 foreach (var renderer in item.Instance.GetComponentsInChildren<Renderer>())
                     if (renderer.bounds.IntersectRay(ray)) return true;
             }
@@ -65,7 +94,7 @@ namespace GMGN.UnityPlayer
 
         public void Configure(NativePlayerBackend native, string identity, IReadOnlyList<RecoveryItem> recovered, VisualElement root)
         {
-            backend = native; worldID = identity; items = recovered;
+            backend = native; worldID = identity; mutableItems = new List<RecoveryItem>(recovered); items = mutableItems;
             backend.WorldUpdated += OnWorld;
             backend.PlacementEvaluated += OnPlacement;
             message = new Label();
@@ -82,6 +111,7 @@ namespace GMGN.UnityPlayer
         public void SetActive(bool value)
         {
             active = value;
+            if (!value) editing = false;
             if (value && readbackUnconfirmed) backend.RequestWorldSnapshot(worldID);
             if (!value) manipulator?.Abort();
             if (!value && !saving) Cancel();
@@ -96,10 +126,7 @@ namespace GMGN.UnityPlayer
                     hit.name == "chatPanel" || hit.name == "worldInteraction" || hit.ClassListContains("queue-panel")) {
                     Debug.Log($"World selection blocked by UI: {hit.name}"); return;
                 }
-            var scale = GetComponent<UIDocument>().panelSettings.scale;
-            var screen = new Vector2(point.x * scale, Screen.height - point.y * scale);
-            Debug.Log($"World selection pointer: panel={point}; scale={scale}; framebuffer={screen}; focused={Application.isFocused}");
-            var ray = Camera.main.ScreenPointToRay(screen);
+            var ray = PointerRay(point);
             RecoveryItem nearest = null; var distance = float.PositiveInfinity;
             foreach (var item in items) {
                 if (item.Instance == null || !item.Instance.activeInHierarchy || item.Status != "restored") continue;
@@ -117,6 +144,7 @@ namespace GMGN.UnityPlayer
                 return;
             }
             Debug.Log($"World selection hit: objectID={nearest.ObjectID}; depth={distance}");
+            if ((deviceTemplate != null || inventoryPreview) && nearest == selected) return;
             Cancel(); selected = nearest;
             initialPosition = selected.Instance.transform.position; initialRotation = selected.Instance.transform.rotation;
         }
@@ -125,13 +153,137 @@ namespace GMGN.UnityPlayer
         {
             if (saving) return;
             evaluationID = null; releasePending = false; PreviewEnded?.Invoke();
-            if (selected?.Instance != null) selected.Instance.transform.SetPositionAndRotation(initialPosition, initialRotation);
-            selected = null;
+            if (selected?.Instance != null) {
+                var persisted = authority?["state"]?["objectStates"]?[selected.ObjectID]?["transform"];
+                if (persisted?["position"] != null && persisted["rotation"] != null)
+                    selected.Instance.transform.SetPositionAndRotation(WorldCoordinates.Position(persisted["position"]), WorldCoordinates.Rotation(persisted["rotation"]));
+                else selected.Instance.transform.SetPositionAndRotation(initialPosition, initialRotation);
+            }
+            if (inventoryPreview && selected?.Instance != null) {
+                bool placed = (bool?)authority?["state"]?["objectStates"]?[selected.ObjectID]?["isEnabled"] == true &&
+                    authority?["state"]?["propTombstones"]?[selected.ObjectID] == null &&
+                    (string)authority?["state"]?["heldProp"]?["objectID"] != selected.ObjectID;
+                selected.Instance.SetActive(placed); selected.Status = placed ? "restored" : "inventory";
+            }
+            if (deviceTemplate != null && selected != null) {
+                if (!deviceExistingPreview) {
+                    mutableItems.Remove(selected);
+                    if (selected.Instance != null) Destroy(selected.Instance);
+                }
+                deviceTemplate = null;
+                deviceExistingPreview = false;
+                RebuildDeviceGeometry();
+            }
+            inventoryPreview = false; deviceTemplate = null; deviceExistingPreview = false;
+            selected = null; deviceRelocationPreview = false;
+        }
+
+        void RebuildDeviceGeometry()
+        {
+            if (placementGrid != null) ConfigurePlacementGeometry(placementGrid, placementTriangles, placementBlocking);
+        }
+        public void UpdateRecoveredItems(IReadOnlyList<RecoveryItem> recovered)
+        {
+            if (saving) return;
+            var replacement = selected == null ? null : new List<RecoveryItem>(recovered).Find(item => item.ObjectID == selected.ObjectID);
+            bool retain = replacement?.Instance != null && selected?.Instance != null &&
+                replacement.Instance == selected.Instance &&
+                authority?["state"]?["objectStates"]?[selected.ObjectID] != null &&
+                authority?["state"]?["propTombstones"]?[selected.ObjectID] == null &&
+                (string)authority?["state"]?["heldProp"]?["objectID"] != selected.ObjectID;
+            if (!retain) Cancel();
+            else { selected = replacement; if (inventoryPreview) { selected.Instance.SetActive(true); selected.Status = "restored"; } }
+            mutableItems = new List<RecoveryItem>(recovered); items = mutableItems; RebuildDeviceGeometry();
+        }
+        public bool BeginInventoryPlacement(string objectID, Vector3? position = null)
+        {
+            if (!IsEditing || saving || authority == null || placementGrid == null) return false;
+            if ((string)authority["state"]?["heldProp"]?["objectID"] == objectID) return false;
+            var item = mutableItems.Find(value => value.ObjectID == objectID && (value.Status == "inventory" || value.Status == "restored") && value.Instance != null);
+            if (item == null) return false;
+            Cancel(); selected = item; inventoryPreview = true; initialPosition = item.Instance.transform.position;
+            initialRotation = item.Instance.transform.rotation; item.Instance.SetActive(true); item.Status = "restored";
+            if (position.HasValue) item.Instance.transform.position = position.Value;
+            // The host seeds previews in front of the camera. Inventory props
+            // belong on actual support geometry, never on a camera-height plane.
+            ProjectPreviewToSurface(new Ray(item.Instance.transform.position, Vector3.down));
+            active = true; RebuildDeviceGeometry(); PreviewStarted?.Invoke(); return true;
+        }
+        // Selection creates only a cancellable preview. No backend command runs
+        // until the released pointer pose passes authority placement evaluation.
+        public bool BeginDevicePlacement(JObject template, Vector3 position)
+        {
+            if (!IsEditing || saving || authority == null || placementGrid == null || PlaceDevice == null) return false;
+            var id = (string)template?["id"];
+            if (string.IsNullOrEmpty(id)) return false;
+            var existing = authority["state"]?["objectStates"]?[id];
+            if ((bool?)existing?["isEnabled"] == true && existing["metadata"]?["gmgn.builtin-device.v1"] != null) {
+                var item = mutableItems.Find(value => value.ObjectID == id && value.Instance != null && value.Status == "restored");
+                if (item == null) return false;
+                Cancel(); selected = item;
+                initialPosition = item.Instance.transform.position; initialRotation = item.Instance.transform.rotation;
+                deviceRelocationPreview = true; item.Instance.transform.position = position;
+                active = true; RebuildDeviceGeometry(); PreviewStarted?.Invoke(); return true;
+            }
+            Cancel();
+            deviceTemplate = (JObject)template.DeepClone();
+            selected = mutableItems.Find(item => item.ObjectID == id && item.Instance != null);
+            deviceExistingPreview = selected != null;
+            if (selected == null) {
+                var marker = BuiltinWorldDevice.CreateMarker(template, transform);
+                selected = new RecoveryItem { ObjectID = id, Status = "restored", Instance = marker.gameObject };
+                mutableItems.Add(selected);
+            }
+            initialPosition = selected.Instance.transform.position; initialRotation = selected.Instance.transform.rotation;
+            selected.Instance.transform.position = position;
+            active = true; RebuildDeviceGeometry(); PreviewStarted?.Invoke(); return true;
+        }
+
+        public void ApplyDevicePlacement(JObject update)
+        {
+            if (!saving || deviceTemplate == null || (string)update["requestID"] != requestID) return;
+            if ((string)update["status"] == "failed") { saving = false; Cancel(); backend.RequestWorldSnapshot(worldID); return; }
+            if (update["result"]?["record"] is not JObject record) return;
+            var saved = record["state"]?["objectStates"]?[selected.ObjectID];
+            if ((bool?)saved?["isEnabled"] != true || saved["metadata"]?["gmgn.builtin-device.v1"] == null) return;
+            selected.Instance.transform.SetPositionAndRotation(WorldCoordinates.Position(saved["transform"]["position"]), WorldCoordinates.Rotation(saved["transform"]["rotation"]));
+            authority = (JObject)record.DeepClone(); saving = false; deviceTemplate = null;
+            deviceExistingPreview = false;
+            DeviceRestored?.Invoke(selected.Instance.GetComponent<BuiltinWorldDevice>());
+            selected = null; PreviewEnded?.Invoke(); RebuildDeviceGeometry();
+        }
+
+        public void RestoreDevices(JObject record, Transform parent)
+        {
+            if (record?["state"]?["objectStates"] is not JObject states) return;
+            foreach (var entry in states.Properties()) {
+                var raw = (string)entry.Value["metadata"]?["gmgn.builtin-device.v1"];
+                if ((bool?)entry.Value["isEnabled"] != true || mutableItems.Exists(item => item.ObjectID == entry.Name)) continue;
+                JObject declaration = raw == null ? null : JObject.Parse(raw);
+                if (declaration == null && deviceTemplates != null)
+                    foreach (var template in deviceTemplates) if ((string)template["id"] == entry.Name) { declaration = template as JObject; break; }
+                if (declaration == null) continue;
+                if ((string)declaration["id"] != entry.Name) continue;
+                var marker = BuiltinWorldDevice.CreateMarker(declaration, parent);
+                marker.transform.SetPositionAndRotation(WorldCoordinates.Position(entry.Value["transform"]["position"]), WorldCoordinates.Rotation(entry.Value["transform"]["rotation"]));
+                mutableItems.Add(new RecoveryItem { ObjectID = entry.Name, Status = "restored", Instance = marker.gameObject });
+                DeviceRestored?.Invoke(marker);
+            }
+            RebuildDeviceGeometry();
         }
         void Confirm()
         {
-            if (selected == null || authority?["state"] is not JObject state || saving) return;
+            if (!IsEditing || selected == null || authority?["state"] is not JObject state || saving) return;
+            if (deviceTemplate != null) {
+                requestID = "unity-device:" + Guid.NewGuid().ToString("D");
+                saving = PlaceDevice?.Invoke(new JObject { ["op"] = "world.device.place", ["worldID"] = worldID,
+                    ["requestID"] = requestID, ["templateID"] = (string)deviceTemplate["id"],
+                    ["expectedRevision"] = (ulong)authority["recordRevision"], ["placementPayload"] = lastPlacementPayload }) == true;
+                if (!saving) Status?.Invoke("空间服务忙，摆放预览已保留，请稍后再确认。");
+                return;
+            }
             submitted = (JObject)state.DeepClone();
+            if (inventoryPreview) submitted["objectStates"][selected.ObjectID]["isEnabled"] = true;
             if (submitted["objectStates"]?[selected.ObjectID]?["transform"] is not JObject transform) {
                 message.text = "这个物件不在当前空间数据中，请刷新后重试。"; return;
             }
@@ -142,52 +294,115 @@ namespace GMGN.UnityPlayer
             requestID = "unity-layout:" + Guid.NewGuid().ToString("D");
             saving = backend.CommitWorld(worldID, requestID, (ulong)authority["recordRevision"], submitted,
                 new JObject { ["kind"] = "move-preview-confirm", ["objectID"] = selected.ObjectID });
-            if (!saving) { Cancel(); message.text = "空间服务忙，这次调整未保存，请稍后重试。"; Status?.Invoke(message.text); return; }
+            if (!saving) { message.text = "空间服务忙，调整预览已保留，请稍后重试。"; Status?.Invoke(message.text); return; }
             message.text = "正在保存，等待空间服务确认…";
             Status?.Invoke(message.text);
         }
 
         internal bool BeginGesture(PointerDownEvent e)
         {
-            if (!active || saving || awaitingReadback || readbackUnconfirmed || releasePending || (e.button != 0 && e.button != 1)) return false;
+            if (!active || saving || awaitingReadback || readbackUnconfirmed || (e.button != 0 && e.button != 1)) return false;
+            for (var hit = e.target as VisualElement; hit != null; hit = hit.parent)
+                if (hit is Button || hit is TextField || hit is Slider || hit is ScrollView ||
+                    hit.name == "chatPanel" || hit.name == "worldInteraction" || hit.ClassListContains("queue-panel")) return false;
             var focused = inputRoot.focusController?.focusedElement as VisualElement;
             for (; focused != null; focused = focused.parent) if (focused is TextField) return false;
+            // A new gesture supersedes a released pose still being evaluated.
+            // Otherwise a right-drag's async validation locks out the following
+            // left-drag; stale evaluation receipts must not commit its old pose.
+            if (releasePending) { releasePending = false; evaluationID = null; poseVersion++; }
             // Reuse the proven panel-to-framebuffer selection boundary.
             OnPointerDownForGesture(e);
-            if (selected != null) PreviewStarted?.Invoke();
+            if (!IsEditing && (e.button != 0 || selected?.Instance?.GetComponent<BuiltinWorldDevice>() == null)) {
+                Cancel(); return false;
+            }
+            if (selected != null) {
+                // Keep cancellation's original pose separate from the visible
+                // preview pose used as the origin of this pointer gesture.
+                gesturePosition = selected.Instance.transform.position;
+                gestureRotation = selected.Instance.transform.rotation;
+                if (IsEditing) PreviewStarted?.Invoke();
+            }
             return selected != null;
         }
         void OnPointerDownForGesture(PointerDownEvent e)
         {
+            // A catalog preview already owns the gesture. Rotation can start
+            // anywhere in the world viewport without reselecting its mesh.
+            if ((deviceTemplate != null || deviceRelocationPreview || inventoryPreview) && selected != null && e.button == 1) return;
+            if ((deviceTemplate != null || deviceRelocationPreview || inventoryPreview) && selected != null && e.button == 0) {
+                var ray = PointerRay(e.position);
+                // The initial preview can be at camera height. Project onto the
+                // actual room surface, so lowering to the validated support
+                // height does not move the object away from the clicked point.
+                ProjectPreviewToSurface(ray);
+                return;
+            }
             // Selection handles either button; rotation is performed by the manipulator.
             SelectAt(e.position, e.target as VisualElement);
         }
+        bool ProjectPreviewToSurface(Ray ray)
+        {
+            if (selected?.Instance == null || !PlacementRequestBuilder.TryPickEnvironment(placementTriangles, ray,
+                out var point, supportOnly: inventoryPreview)) return false;
+            selected.Instance.transform.position = point;
+            return true;
+        }
         internal void MoveGesture(Vector2 start, Vector2 point, int button)
         {
-            if (selected == null || saving) return;
+            if (!IsEditing || selected == null || saving) return;
             poseVersion++;
-            if (button == 1) selected.Instance.transform.rotation = initialRotation * Quaternion.Euler(0, (point.x - start.x) * .5f, 0);
+            if (button == 1) selected.Instance.transform.rotation = gestureRotation * Quaternion.Euler(0, (point.x - start.x) * .5f, 0);
+            else if (inventoryPreview) {
+                // A plane through the initial camera-height preview can send
+                // near-horizontal pointer rays tens of metres outside the room.
+                if (!ProjectPreviewToSurface(PointerRay(point))) return;
+            }
             else {
-                var plane = new Plane(Vector3.up, initialPosition);
+                var plane = new Plane(Vector3.up, gesturePosition);
                 if (plane.Raycast(PointerRay(start), out var a) && plane.Raycast(PointerRay(point), out var b))
-                    selected.Instance.transform.position = initialPosition + PointerRay(point).GetPoint(b) - PointerRay(start).GetPoint(a);
+                    selected.Instance.transform.position = gesturePosition + PointerRay(point).GetPoint(b) - PointerRay(start).GetPoint(a);
             }
             Evaluate(false);
         }
-        internal void EndGesture(bool changed)
+        internal void EndGesture(bool changed, int button = 0)
         {
-            if (!changed) { Cancel(); return; }
+            if (!IsEditing) {
+                var device = !changed ? selected?.Instance?.GetComponent<BuiltinWorldDevice>() : null;
+                Cancel(); device?.Activate(); return;
+            }
+            if (button == 1 && (deviceTemplate != null || deviceRelocationPreview || inventoryPreview)) {
+                // Catalog rotation changes the preview; only a left release
+                // confirms placement. A right click must not hide its item.
+                releasePending = false; Evaluate(false); return;
+            }
+            if (!changed && (deviceTemplate != null || deviceRelocationPreview || inventoryPreview)) {
+                poseVersion++;
+                releasePending = true; releaseDeadline = Time.unscaledTime + 5; Evaluate(true);
+                return;
+            }
+            if (!changed) {
+                var device = deviceTemplate == null && !inventoryPreview ? selected?.Instance?.GetComponent<BuiltinWorldDevice>() : null;
+                Cancel(); device?.Activate(); return;
+            }
             releasePending = true; releaseDeadline = Time.unscaledTime + 5; Evaluate(true);
         }
         internal void AbortGesture() { Cancel(); }
         Ray PointerRay(Vector2 point)
         {
-            var scale = GetComponent<UIDocument>().panelSettings.scale;
-            return Camera.main.ScreenPointToRay(new Vector2(point.x * scale, Screen.height - point.y * scale));
+            var panel = GetComponent<UIDocument>().rootVisualElement.panel;
+            var origin = RuntimePanelUtils.ScreenToPanel(panel, Vector2.zero);
+            var end = RuntimePanelUtils.ScreenToPanel(panel, new Vector2(Screen.width, Screen.height));
+            var screen = PanelPointToScreen(point, origin, end, new Vector2(Screen.width, Screen.height));
+            Debug.Log($"Placement pointer: panel={point}; mappedScreen={screen}; panelOrigin={origin}; panelEnd={end}; framebuffer={Screen.width}x{Screen.height}");
+            return Camera.main.ScreenPointToRay(screen);
         }
+        public static Vector2 PanelPointToScreen(Vector2 point, Vector2 origin, Vector2 end, Vector2 framebuffer)
+            => new Vector2((point.x-origin.x)/(end.x-origin.x)*framebuffer.x,
+                framebuffer.y-(point.y-origin.y)/(end.y-origin.y)*framebuffer.y);
         async void Evaluate(bool final)
         {
-            if (selected == null || authority == null) return;
+            if (!IsEditing || selected == null || authority == null) return;
             if (buildingEvaluation || evaluationID != null || Time.unscaledTime < nextEvaluation) return;
             nextEvaluation = Time.unscaledTime + .12f;
             evaluatedRevision = (ulong)authority["recordRevision"];
@@ -212,9 +427,10 @@ namespace GMGN.UnityPlayer
                 evaluationID = null;
                 Status?.Invoke(rejectionMessage ?? "空间摆放校验尚未连接，这次调整不会保存。");
                 PreviewChanged?.Invoke(new JObject { ["canPlace"] = false, ["columns"] = new JArray() });
-                if (final) Cancel(); return;
+                if (final) releasePending = false; return;
             }
             evaluatedSupportHeight = (float?)payload["anchor"]?["supportHeight"];
+            lastPlacementPayload = payload;
             if (!backend.RequestPlacementEvaluation(payload, evaluationID)) {
                 evaluationID = null;
             }
@@ -225,9 +441,8 @@ namespace GMGN.UnityPlayer
             evaluationID = null;
             if (poseVersion != evaluatedPoseVersion) return;
             if ((string)update["status"] == "failed") {
-                PreviewChanged?.Invoke(null);
                 Status?.Invoke((string)update["message"] ?? "摆放校验服务未能确认，这次调整未保存。");
-                if (releasePending) Cancel();
+                releasePending = false;
                 return;
             }
             var result = update["result"] as JObject;
@@ -238,7 +453,8 @@ namespace GMGN.UnityPlayer
             releasePending = false;
             if ((string)update["status"] != "completed" || (bool?)result?["canPlace"] != true ||
                 (ulong)authority["recordRevision"] != evaluatedRevision) {
-                Status?.Invoke("当前位置不能摆放，调整已取消。"); Cancel(); return;
+                Debug.Log($"Placement release rejected: status={update["status"]}; canPlace={result?["canPlace"]}; reason={result?["reason"]?["code"]}; evaluatedRevision={evaluatedRevision}; currentRevision={authority["recordRevision"]}");
+                Status?.Invoke("当前位置不能摆放，请移动到绿色区域后再确认。"); return;
             }
             // Only the latest released pose, validated against this revision, may write.
             Confirm();
@@ -246,7 +462,13 @@ namespace GMGN.UnityPlayer
         void OnApplicationFocus(bool focused) { if (!focused) manipulator?.Abort(); }
         void Update()
         {
-            if (Keyboard.current?.escapeKey.wasPressedThisFrame == true) manipulator?.Abort();
+            // UI Toolkit may dispatch KeyDown after this MonoBehaviour's Update.
+            // Resolve on the following frame so popup dismissal gets first refusal.
+            if (pendingEscapeFrame >= 0 && Time.frameCount > pendingEscapeFrame) {
+                if (PlayerScreen.PopupDismissedFrame < pendingEscapeFrame) manipulator?.Abort();
+                pendingEscapeFrame = -1;
+            }
+            if (Keyboard.current?.escapeKey.wasPressedThisFrame == true) pendingEscapeFrame = Time.frameCount;
             if (awaitingReadback && Time.unscaledTime >= nextReadback) {
                 if (readbackAttempts >= 3) {
                     awaitingReadback = false; readbackUnconfirmed = true;
@@ -254,7 +476,7 @@ namespace GMGN.UnityPlayer
                 } else RequestSaveReadback();
             }
             if (!releasePending || evaluationID != null) return;
-            if (Time.unscaledTime >= releaseDeadline) { Status?.Invoke("空间校验未完成，这次调整未保存。"); Cancel(); return; }
+            if (Time.unscaledTime >= releaseDeadline) { Status?.Invoke("空间校验未完成，请调整位置或再次确认。"); releasePending = false; evaluationID = null; return; }
             Evaluate(true);
         }
 
@@ -262,21 +484,27 @@ namespace GMGN.UnityPlayer
         {
             if ((string)update["worldID"] != worldID) return;
             if (update["result"]?["record"] is JObject record) {
+                if ((ulong?)record["recordRevision"] < (ulong?)authority?["recordRevision"]) return;
                 authority = (JObject)record.DeepClone();
+                if (!saving && selected != null && ((record["state"]?["objectStates"]?[selected.ObjectID] == null && (deviceTemplate == null || deviceExistingPreview)) ||
+                    record["state"]?["propTombstones"]?[selected.ObjectID] != null ||
+                    (string)record["state"]?["heldProp"]?["objectID"] == selected.ObjectID)) Cancel();
                 if ((awaitingReadback || readbackUnconfirmed) && (ulong)record["recordRevision"] >= savedRevision) {
                     var persisted = record["state"]?["objectStates"]?[savedObjectID]?["transform"];
                     var expected = submitted["objectStates"]?[savedObjectID]?["transform"];
                     saving = false; awaitingReadback = false; readbackUnconfirmed = false;
-                    var matches = MatchesTransform(persisted, expected);
+                    var matches = MatchesTransform(persisted, expected) && (!inventoryPreview || (bool?)record["state"]?["objectStates"]?[savedObjectID]?["isEnabled"] == true);
                     Debug.Log($"World save readback: receiptRevision={savedRevision}; recordRevision={record["recordRevision"]}; geometryMatches={matches}; actual={persisted?.ToString(Newtonsoft.Json.Formatting.None)}; expected={expected?.ToString(Newtonsoft.Json.Formatting.None)}");
                     if (matches) {
                         PreviewEnded?.Invoke();
-                        selected = null; message.text = "物件位置已保存，并已从空间服务重新读取确认。";
+                        inventoryPreview = false;
+                        selected = null; deviceRelocationPreview = false; message.text = "物件位置已保存，并已从空间服务重新读取确认。";
                         Status?.Invoke(message.text);
-                    } else { message.text = "空间已有其他更新，当前画面已采用最新状态。"; Status?.Invoke(message.text); }
+                    } else { Cancel(); message.text = "空间已有其他更新，当前画面已采用最新状态。"; Status?.Invoke(message.text); }
                 }
                 foreach (var item in items) {
-                    if (item.Instance == null || selected == item) continue;
+                    if (item.Instance == null || selected == item ||
+                        (awaitingReadback && item.ObjectID == savedObjectID)) continue;
                     var objectState = record["state"]?["objectStates"]?[item.ObjectID];
                     if (objectState?["transform"] == null) continue;
                     item.Instance.SetActive((bool?)objectState["isEnabled"] == true);
@@ -292,7 +520,7 @@ namespace GMGN.UnityPlayer
             if (!saving || (string)update["requestID"] != requestID) return;
             if ((string)update["status"] == "failed") {
                 saving = false; awaitingReadback = false;
-                Cancel(); message.text = (string)update["message"] ?? "这次没有保存，请刷新后重试。";
+                message.text = (string)update["message"] ?? "这次没有保存，调整预览已保留，请重新确认。";
                 backend.RequestWorldSnapshot(worldID); return;
             }
             if ((string)update["operation"] == "world.commit" && update["result"]?["revision"] != null) {

@@ -30,6 +30,10 @@ apps/macos/Packages/workspace-state.json
 
 # Local working output. Never inputs to a build, test or package.
 tmp/
+tools/generated-asset-regression/bin/
+tools/generated-asset-regression/obj/
+apps/unity-player/Assets/Resources/PerformanceTestRunInfo.json*
+apps/unity-player/Assets/Resources/PerformanceTestRunSettings.json*
 backups/
 dist/
 .sessions/

@@ -152,6 +152,6 @@ func run(_ path: String, _ arguments: [String]) throws -> Int32 {
 
 let compile = try run("/usr/bin/nice", ["-n", "15", "/usr/bin/swiftc", "-j1", "-parse-as-library",
     "-I", build.appendingPathComponent("Modules").path,
-    clientPath, persistencePath, backoffPath, driverURL.path] + objects.map(\.path) + ["-o", executable.path])
+    clientPath, "apps/macos/Sources/GMGNRadio/Presence/TaskdHTTPTransport.swift", persistencePath, backoffPath, driverURL.path] + objects.map(\.path) + ["-o", executable.path])
 guard compile == 0 else { fail("投影/预像那段编译不过") }
 exit(try run(executable.path, []))

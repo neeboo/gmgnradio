@@ -44,7 +44,7 @@ namespace GMGN.UnityPlayer
         void Up(PointerUpEvent e)
         {
             if (!Dragging || e.pointerId != pointerID || e.button != button) return;
-            Release(); owner.EndGesture(changed); e.StopPropagation();
+            Release(); owner.EndGesture(changed, button); e.StopPropagation();
         }
         void Lost(PointerCaptureOutEvent e) { if (!releasing && Dragging) Abort(); }
         void Release()

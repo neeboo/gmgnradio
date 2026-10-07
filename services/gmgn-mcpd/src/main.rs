@@ -4,8 +4,8 @@
 //!
 //! * **stdio** towards the MCP client (the agent host). The client spawns it on
 //!   demand and may kill it at any time.
-//! * **authenticated loopback TCP** towards `gmgn-taskd`, newline-delimited JSON, the daemon's
-//!   existing protocol, untouched.
+//! * **authenticated loopback HTTP** towards `gmgn-taskd`, with one JSON
+//!   request and reply per POST /rpc.
 //!
 //! It is deliberately **not** part of `gmgn-taskd`. The daemon holds an exclusive
 //! lock on its private root (`services/gmgn-taskd/src/main.rs`), so a second
@@ -36,7 +36,6 @@ USAGE:
 
 OPTIONS:
     --endpoint-file <path> Private gmgn-taskd connection descriptor. Required.
-    --socket <path>       Compatibility alias for --endpoint-file; no Unix socket.
                           other way to reach the world, by design.
     --grant <path>        Armed-round grant document written by the host. When it
                           is absent the read-only tools still work and every
@@ -44,13 +43,13 @@ OPTIONS:
     --server-name <name>  MCP server namespace, default `gmgn`. Clients see the
                           tools as `mcp__<name>__<tool>`.
     --list-tools          Print this build's tool catalog as JSON and exit. No
-                          socket, no session: it answers where the tool
+                          endpoint, no session: it answers where the tool
                           definitions live, from the single place they exist.
     -h, --help            Print this text.
 ";
 
 fn main() -> ExitCode {
-    let mut socket: Option<PathBuf> = None;
+    let mut endpoint_file: Option<PathBuf> = None;
     let mut grant: Option<PathBuf> = None;
     let mut server_name = "gmgn".to_owned();
 
@@ -87,9 +86,9 @@ fn main() -> ExitCode {
                 );
                 return ExitCode::SUCCESS;
             }
-            "--socket" | "--endpoint-file" => match args.next() {
-                Some(value) => socket = Some(PathBuf::from(value)),
-                None => return usage_error("--socket 需要一个路径"),
+            "--endpoint-file" => match args.next() {
+                Some(value) => endpoint_file = Some(PathBuf::from(value)),
+                None => return usage_error("--endpoint-file 需要一个路径"),
             },
             "--grant" => match args.next() {
                 Some(value) => grant = Some(PathBuf::from(value)),
@@ -103,15 +102,15 @@ fn main() -> ExitCode {
         }
     }
 
-    let Some(socket) = socket else {
-        return usage_error("必须给 --socket：本进程没有第二条通往世界的路");
+    let Some(endpoint_file) = endpoint_file else {
+        return usage_error("必须给 --endpoint-file：本进程没有第二条通往世界的路");
     };
-    if !socket.is_absolute() {
-        return usage_error("--socket 必须是绝对路径");
+    if !endpoint_file.is_absolute() {
+        return usage_error("--endpoint-file 必须是绝对路径");
     }
 
-    let client = Client::new(socket);
-    // The authority socket is resolved once, at startup, and never from the
+    let client = Client::new(endpoint_file);
+    // The authority endpoint file is resolved once, at startup, and never from the
     // grant: a grant may only *narrow* what this process does, never widen it.
     let grant_source = match grant {
         Some(path) => GrantSource::at(path),

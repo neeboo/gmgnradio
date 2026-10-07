@@ -23,7 +23,7 @@ CHANNEL="$ROOT/apps/macos/Sources/GMGNRadio/Agent/ResidentDSHHostToolsBridge.swi
 SUPPORT="$ROOT/tools/resident-dsh-host-tools-support.swift"
 ASSEMBLY="$ROOT/tools/test-resident-dsh-native-assembly.swift"
 BIN="$TMP/assembly"
-/usr/bin/swiftc -parse-as-library -j1 "$BRIDGE" "$CHANNEL" "$SUPPORT" "$ASSEMBLY" -o "$BIN"
+/usr/bin/swiftc -swift-version 6 -parse-as-library -j1 "$ROOT/apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift" "$BRIDGE" "$CHANNEL" "$SUPPORT" "$ASSEMBLY" -o "$BIN"
 if [ $? -ne 0 ]; then echo "COMPILE FAILED"; exit 1; fi
 
 run_phase() {

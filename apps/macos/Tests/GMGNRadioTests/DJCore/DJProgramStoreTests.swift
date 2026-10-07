@@ -107,23 +107,18 @@ func programEditorInsertsOneSongAndKeepsTheExistingRun() {
 
 @MainActor
 @Test
-func programArchivePersistsThePlanAndPlaybackPosition() throws {
-    let location = temporaryProgramArchiveURL()
-    defer {
-        try? FileManager.default.removeItem(
-            at: location.deletingLastPathComponent()
-        )
-    }
-    let archive = DJProgramArchive(fileURL: location)
+func programArchivePersistsThePlanAndPlaybackPosition() async throws {
+    let backend = ProgramStorageRPCFixture()
+    let archive = DJProgramArchive(storage: backend.client)
     let plan = programPlan(trackIDs: ["one", "two", "three"])
 
-    try archive.save(
+    try await archive.save(
         plan: plan,
         activeSlotIndex: 1,
         updatedAt: Date(timeIntervalSince1970: 2_000)
     )
 
-    let latest = try archive.latest()
+    let latest = try await archive.latest()
     let restored = try #require(latest)
     #expect(restored.plan == plan)
     #expect(restored.activeSlotIndex == 1)
@@ -132,14 +127,9 @@ func programArchivePersistsThePlanAndPlaybackPosition() throws {
 
 @MainActor
 @Test
-func programStoreRestoresTheLatestSavedProgramOnRelaunch() {
-    let location = temporaryProgramArchiveURL()
-    defer {
-        try? FileManager.default.removeItem(
-            at: location.deletingLastPathComponent()
-        )
-    }
-    let archive = DJProgramArchive(fileURL: location)
+func programStoreRestoresTheLatestSavedProgramOnRelaunch() async throws {
+    let backend = ProgramStorageRPCFixture()
+    let archive = DJProgramArchive(storage: backend.client)
     let original = DJProgramStore(archive: archive)
     let plan = programPlan(trackIDs: ["one", "two"])
 
@@ -147,7 +137,8 @@ func programStoreRestoresTheLatestSavedProgramOnRelaunch() {
     original.activateSlot(at: 1)
 
     let relaunched = DJProgramStore(archive: archive)
-    relaunched.restoreLatest()
+    try await original.flush()
+    await relaunched.restoreLatest()
 
     #expect(relaunched.status == .ready)
     #expect(relaunched.plan == plan)
@@ -157,29 +148,24 @@ func programStoreRestoresTheLatestSavedProgramOnRelaunch() {
 
 @MainActor
 @Test
-func programStoreExposesRecentProgramsForTheStageLibrary() throws {
-    let location = temporaryProgramArchiveURL()
-    defer {
-        try? FileManager.default.removeItem(
-            at: location.deletingLastPathComponent()
-        )
-    }
-    let archive = DJProgramArchive(fileURL: location)
+func programStoreExposesRecentProgramsForTheStageLibrary() async throws {
+    let backend = ProgramStorageRPCFixture()
+    let archive = DJProgramArchive(storage: backend.client)
     let first = programPlan(id: "first", trackIDs: ["one"])
     let second = programPlan(id: "second", trackIDs: ["two"])
-    try archive.save(
+    try await archive.save(
         plan: first,
         activeSlotIndex: nil,
         updatedAt: Date(timeIntervalSince1970: 1_000)
     )
-    try archive.save(
+    try await archive.save(
         plan: second,
         activeSlotIndex: 0,
         updatedAt: Date(timeIntervalSince1970: 2_000)
     )
 
     let store = DJProgramStore(archive: archive)
-    store.restoreLatest()
+    await store.restoreLatest()
 
     #expect(store.recentPrograms.map(\.plan.brief.id) == [
         "second", "first",
@@ -189,14 +175,9 @@ func programStoreExposesRecentProgramsForTheStageLibrary() throws {
 
 @MainActor
 @Test
-func programArchiveKeepsRecentProgramsAndUpdatesTheSameProgram() throws {
-    let location = temporaryProgramArchiveURL()
-    defer {
-        try? FileManager.default.removeItem(
-            at: location.deletingLastPathComponent()
-        )
-    }
-    let archive = DJProgramArchive(fileURL: location, capacity: 2)
+func programArchiveKeepsRecentProgramsAndUpdatesTheSameProgram() async throws {
+    let backend = ProgramStorageRPCFixture()
+    let archive = DJProgramArchive(storage: backend.client)
     let first = programPlan(trackIDs: ["one"])
     let second = programPlan(
         id: "second",
@@ -207,29 +188,30 @@ func programArchiveKeepsRecentProgramsAndUpdatesTheSameProgram() throws {
         trackIDs: ["three"]
     )
 
-    try archive.save(
+    try await archive.save(
         plan: first,
         activeSlotIndex: nil,
         updatedAt: Date(timeIntervalSince1970: 1_000)
     )
-    try archive.save(
+    try await archive.save(
         plan: second,
         activeSlotIndex: nil,
         updatedAt: Date(timeIntervalSince1970: 2_000)
     )
-    try archive.save(
+    try await archive.save(
         plan: first,
         activeSlotIndex: 0,
         updatedAt: Date(timeIntervalSince1970: 3_000)
     )
-    try archive.save(
+    try await archive.save(
         plan: third,
         activeSlotIndex: nil,
         updatedAt: Date(timeIntervalSince1970: 4_000)
     )
 
-    let recent = try archive.recent()
-    #expect(recent.map(\.plan.brief.id) == ["third", "test"])
+    let recent = try await archive.recent()
+    #expect(recent.map(\.plan.brief.id) == ["third", "test", "second"])
+    #expect(recent.filter { $0.plan.brief.id == "test" }.count == 1)
     #expect(recent[1].activeSlotIndex == 0)
 }
 
@@ -290,11 +272,61 @@ private func programPlan(
     )
 }
 
-private func temporaryProgramArchiveURL() -> URL {
-    FileManager.default.temporaryDirectory
-        .appendingPathComponent(
-            "gmgn-radio-program-tests-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        .appendingPathComponent("programs.json")
+
+@MainActor
+private final class ProgramStorageRPCFixture {
+    var programs: [SavedDJProgram] = []
+    var pendingIDs: [String] = []
+    var unavailable = false
+    lazy var client = MusicStorageClient(includeDefaultLegacy: false, call: call)
+    func json<T: Encodable>(_ value: T) throws -> PropTaskJSON {
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+        return try JSONDecoder().decode(PropTaskJSON.self, from: encoder.encode(value))
+    }
+    func call(_ method: String, _ params: [String: PropTaskJSON]) async throws -> [String: PropTaskJSON] {
+        if unavailable { throw PropTaskDaemonError.unavailable }
+        switch method {
+        case "music_program_save":
+            let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+            let saved = try decoder.decode(SavedDJProgram.self, from: JSONEncoder().encode(params["program"]!))
+            programs.removeAll { $0.plan.brief.id == saved.plan.brief.id }; programs.append(saved)
+            pendingIDs.removeAll { $0 == saved.plan.brief.id }
+            if params["pending"] == .bool(true) { pendingIDs.append(saved.plan.brief.id) }
+            return ["saved": .bool(true)]
+        case "music_program_list": return ["programs": try json(programs), "pendingIDs": try json(pendingIDs)]
+        default: Issue.record("Unexpected RPC or attempted legacy-file import"); throw PropTaskDaemonError.invalidFrame
+        }
+    }
+}
+
+@MainActor
+@Test
+func programStoragePersistsPendingWithoutSelectingItOnRelaunch() async throws {
+    let backend = ProgramStorageRPCFixture()
+    let archive = DJProgramArchive(storage: backend.client)
+    let original = DJProgramStore(archive: archive)
+    let active = programPlan(id: "active", trackIDs: ["one"])
+    let pending = programPlan(id: "pending", trackIDs: ["two"])
+    original.publish(active)
+    original.publishDraft(pending)
+    try await original.flush()
+    let reopened = DJProgramStore(archive: archive)
+    await reopened.restoreLatest()
+    #expect(reopened.plan == active)
+    #expect(reopened.pendingPlan == pending)
+    #expect(reopened.activeSlotIndex == nil)
+}
+
+@MainActor
+@Test
+func programStorageReadCanRecoverAfterVisibleSaveFailure() async throws {
+    let backend = ProgramStorageRPCFixture()
+    let store = DJProgramStore(archive: DJProgramArchive(storage: backend.client))
+    backend.unavailable = true
+    store.publish(programPlan(id: "unsaved", trackIDs: ["one"]))
+    do { try await store.flush(); Issue.record("Unavailable save cannot succeed") } catch { }
+    if case .failed = store.status { } else { Issue.record("Save failure must be visible") }
+    backend.unavailable = false
+    try await store.refreshRecentPrograms()
+    #expect(store.recentPrograms.isEmpty)
 }

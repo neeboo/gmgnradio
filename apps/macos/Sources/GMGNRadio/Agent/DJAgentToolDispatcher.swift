@@ -811,8 +811,9 @@ final class DJAgentToolDispatcher {
 
     var providerTools: [[String: Any]] {
         let worldNames = Set(WorldAgentToolContract.capabilities.map(\.name))
+        let available = Set(actions?.snapshot(takeoverEnabled: takeoverEnabled()).capabilities.map(\.name) ?? [])
         let radioCapabilities = DJAgentCapabilityManifest.capabilities.filter {
-            !worldNames.contains($0.name)
+            !worldNames.contains($0.name) && available.contains($0.name)
         }
         return DJAgentCapabilityManifest.providerTools(for: radioCapabilities)
             + (worldDispatcher()?.providerTools ?? [])
@@ -880,6 +881,10 @@ final class DJAgentToolDispatcher {
                 state: actions.snapshot(takeoverEnabled: enabled),
                 tracks: nil
             )
+        }
+        guard actions.snapshot(takeoverEnabled: enabled).capabilities.contains(where: { $0.name == call.name }) else {
+            return makeResult(callID: call.id, ok: false, code: "unsupported_tool",
+                message: "当前播放器未实现此工具", state: nil, tracks: nil)
         }
         guard enabled || !capability.requiresTakeover else {
             return makeResult(

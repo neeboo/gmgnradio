@@ -58,18 +58,18 @@ namespace GMGN.UnityPlayer.Editor
             EditorSceneManager.SaveScene(scene, "Assets/GMGN/Player.unity");
             EditorBuildSettings.scenes = new[] { new EditorBuildSettingsScene("Assets/GMGN/Player.unity", true) };
         }
-        static void PrepareLyricsFonts()
+        public static void PrepareLyricsFonts()
         {
-            foreach (var style in new[] { "Light", "Medium", "Semibold", "Bold", "Black" }) {
-                var sourcePath = $"Assets/GMGN/Fonts/GMGNLyricsSansSC-{style}.ttf";
+            foreach (var style in new[] { "Light", "Medium", "Semibold", "Bold", "Black" }) foreach(var latin in new[]{false,true}) {
+                var sourcePath = $"Assets/GMGN/Fonts/{(latin?"GMGNLyricsLatin":"GMGNLyricsSansSC")}-{style}.ttf";
                 var source = AssetDatabase.LoadAssetAtPath<Font>(sourcePath);
                 if (source == null) throw new System.InvalidOperationException("Missing lyric font source: " + sourcePath);
-                var path = $"Assets/GMGN/Resources/PlayerLyrics{style}Font.asset";
+                var path = $"Assets/GMGN/Resources/PlayerLyrics{style}{(latin?"Latin":"")}Font.asset";
                 var asset = AssetDatabase.LoadAssetAtPath<FontAsset>(path);
                 if (asset == null) {
                     asset = FontAsset.CreateFontAsset(source, 90, 9, GlyphRenderMode.SDFAA, 1024, 1024, AtlasPopulationMode.Dynamic, true);
                     if (asset == null) throw new System.InvalidOperationException("Failed to create lyric font: " + style);
-                    asset.name = "PlayerLyrics" + style + "Font";
+                    asset.name = "PlayerLyrics" + style + (latin?"Latin":"") + "Font";
                     AssetDatabase.CreateAsset(asset, path);
                     if (asset.material != null) AssetDatabase.AddObjectToAsset(asset.material, asset);
                     foreach (var texture in asset.atlasTextures) if (texture != null) AssetDatabase.AddObjectToAsset(texture, asset);
@@ -84,9 +84,11 @@ namespace GMGN.UnityPlayer.Editor
         }
         public static void BuildMac()
         {
+            LocalizationSetup.PrepareForBuild();
             Prepare();
             GpuLyricsValidation.Validate();
             StagePointsValidation.Validate();
+            GaussianWorldBootstrap.ValidateRenderPath();
             if (AssetDatabase.LoadAssetAtPath<GameObject>("Assets/GMGN/GaussianWorld/Resources/GaussianWorld/Cabin.prefab") == null)
                 throw new System.InvalidOperationException("Prepare the Gaussian cabin with GaussianWorldBootstrap.PrepareCabin before building; missing assets must not produce an empty space.");
             var output = System.Environment.GetEnvironmentVariable("GMGN_UNITY_BUILD_PATH");

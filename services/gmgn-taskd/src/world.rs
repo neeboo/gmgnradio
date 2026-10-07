@@ -472,6 +472,57 @@ fn validate_document(state: &Value) -> Result<(Value, Vec<(String, Value)>)> {
     Ok((Value::Object(world), objects))
 }
 
+/// Layout remains Swift-owned. Independently check the new atomic nearby-drop
+/// receipt against the current holder before accepting its replacement document.
+fn validate_drop_held(previous: &Map<String, Value>, objects: &std::collections::BTreeMap<String, RecordRow>, next: &Value) -> Result<()> {
+    let Some(receipts) = next.get("layoutReceipts").and_then(Value::as_object) else { return Ok(()); };
+    for (id, receipt) in receipts {
+        if previous.get("layoutReceipts").and_then(Value::as_object).and_then(|r| r.get(id)) == Some(receipt) {
+            continue;
+        }
+        let Some(drop) = receipt.get("dropHeld") else { continue; };
+        let held = previous.get("heldProp").filter(|v| v.is_object()).ok_or("invalid_drop_held")?;
+        let object_id = drop.get("objectID").and_then(Value::as_str).ok_or("invalid_drop_held")?;
+        let holder = held.get("avatarAssetID").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("invalid_drop_held")?;
+        if held.get("objectID").and_then(Value::as_str) != Some(object_id)
+            || drop.get("avatarAssetID").and_then(Value::as_str) != Some(holder)
+            || next.get("heldProp").is_some_and(|v| !v.is_null())
+            || next.get("layoutUndo").is_some_and(|v| !v.is_null()) {
+            return Err("invalid_drop_held");
+        }
+        let placement = drop.get("placement").ok_or("invalid_drop_held")?;
+        let position = placement.get("position").ok_or("invalid_drop_held")?;
+        validate_vector(position, &["x", "y", "z"])?;
+        let yaw = finite_number(placement.get("yaw").ok_or("invalid_drop_held")?).ok_or("invalid_drop_held")?;
+        let surface = placement.get("surfaceID").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("invalid_drop_held")?;
+        let agent = previous.get("agentTransform").and_then(|v| v.get("position")).ok_or("invalid_drop_held")?;
+        let coordinate = |v: &Value, axis: &str| -> Result<f64> { finite_number(v.get(axis).ok_or("invalid_drop_held")?).ok_or("invalid_drop_held") };
+        let dx = coordinate(position, "x")? - coordinate(agent, "x")?;
+        let dz = coordinate(position, "z")? - coordinate(agent, "z")?;
+        if dx * dx + dz * dz > 0.6001_f64.powi(2) { return Err("prop_out_of_reach"); }
+        let old = objects.get(object_id).filter(|r| !r.tombstone).ok_or("invalid_drop_held")?;
+        let new = next.get("objectStates").and_then(|v| v.get(object_id)).ok_or("invalid_drop_held")?;
+        if new.get("isEnabled").and_then(Value::as_bool) != Some(true)
+            || new.pointer("/transform/position") != Some(position)
+            || new.pointer("/transform/scale") != old.value.pointer("/transform/scale")
+            || new.pointer("/metadata/gmgn.support-surface.v1").and_then(Value::as_str) != Some(surface) {
+            return Err("invalid_drop_held");
+        }
+        let rotation = new.pointer("/transform/rotation").ok_or("invalid_drop_held")?;
+        let expected_rotation = [0.0, (yaw / 2.0).sin(), 0.0, (yaw / 2.0).cos()];
+        for (axis, expected) in ["x", "y", "z", "w"].into_iter().zip(expected_rotation) {
+            if (coordinate(rotation, axis)? - expected).abs() > 0.00001 { return Err("invalid_drop_held"); }
+        }
+        // The support key changes; asset identity, dimensions and grip must not.
+        let old_metadata = old.value.get("metadata").and_then(Value::as_object).ok_or("invalid_drop_held")?;
+        let new_metadata = new.get("metadata").and_then(Value::as_object).ok_or("invalid_drop_held")?;
+        for (key, value) in old_metadata {
+            if key != "gmgn.support-surface.v1" && new_metadata.get(key) != Some(value) { return Err("invalid_drop_held"); }
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // rows
 // ---------------------------------------------------------------------------
@@ -1135,6 +1186,7 @@ fn apply(
             "replaceState" => {
                 let state = op.state.as_ref().ok_or("invalid_op")?;
                 let (next_world, next_objects) = validate_document(state)?;
+                validate_drop_held(&world_value, &objects, state)?;
                 let next_revision = state.get("revision").and_then(Value::as_u64).unwrap_or(0);
                 if next_revision < current_simulation_revision {
                     return Err("subject_revision_regression");
@@ -1896,6 +1948,57 @@ mod tests {
 
     fn reload() -> Op {
         Op { op: "replaceState".into(), state: None, ..Op::default() }
+    }
+
+    #[test]
+    fn nearby_drop_is_atomic_identity_preserving_and_replayable() {
+        let mut connection = setup();
+        let mut before = fixture();
+        let object_id = "wish-prop-ebfc07be";
+        let return_state = before["objectStates"][object_id].clone();
+        before["objectStates"][object_id]["isEnabled"] = json!(false);
+        before["heldProp"] = json!({"objectID":object_id,"avatarAssetID":"avatar-test","hand":"rightHand","returnState":return_state});
+        import(&mut connection, "drop-import", before.clone()).unwrap();
+        let revision = snapshot(&connection, &SnapshotRequest {world_id:WORLD.into(), include_state:Some(true)}).unwrap()["record"]["recordRevision"].as_i64().unwrap();
+        let mut after = before.clone();
+        after.as_object_mut().unwrap().remove("heldProp");
+        after["layoutRevision"] = json!(17);
+        let position = json!({"x":1.1,"y":0.0,"z":-3.55});
+        after["objectStates"][object_id]["isEnabled"] = json!(true);
+        after["objectStates"][object_id]["transform"]["position"] = position.clone();
+        after["objectStates"][object_id]["transform"]["rotation"] = json!({"x":0.0,"y":0.0,"z":0.0,"w":1.0});
+        after["objectStates"][object_id]["metadata"][SUPPORT_SURFACE_KEY] = json!("floor");
+        after["layoutReceipts"]["nearby-drop"] = json!({"dropHeld":{"objectID":object_id,"avatarAssetID":"avatar-test","placement":{"surfaceID":"floor","position":position,"yaw":0.0}}});
+        let operation = |state:Value| Op {state:Some(state), ..reload()};
+        for (case, mut invalid, error) in [
+            ("far", after.clone(), "prop_out_of_reach"),
+            ("holder", after.clone(), "invalid_drop_held"),
+            ("asset", after.clone(), "invalid_drop_held"),
+            ("still-held", after.clone(), "invalid_drop_held"),
+            ("missing", after.clone(), "invalid_drop_held"),
+            ("rotation", after.clone(), "invalid_drop_held"),
+        ] {
+            match case {
+                "far" => invalid["layoutReceipts"]["nearby-drop"]["dropHeld"]["placement"]["position"]["x"] = json!(9.0),
+                "holder" => invalid["layoutReceipts"]["nearby-drop"]["dropHeld"]["avatarAssetID"] = json!("other"),
+                "asset" => invalid["objectStates"][object_id]["metadata"][GENERATED_PROP_KEY] = json!(prop_blob(object_id, (1.0,1.0,1.0))),
+                "still-held" => invalid["heldProp"] = before["heldProp"].clone(),
+                "missing" => { invalid["objectStates"].as_object_mut().unwrap().remove(object_id); },
+                "rotation" => invalid["objectStates"][object_id]["transform"]["rotation"]["x"] = json!(0.5),
+                _ => unreachable!(),
+            }
+            assert_eq!(commit_err(&mut connection, case, revision, vec![operation(invalid)]), error, "{case}");
+            assert_eq!(snapshot_state(&connection), before);
+        }
+        let result = commit(&mut connection, "nearby-drop", revision, vec![operation(after.clone())]).unwrap();
+        let replay = commit(&mut connection, "nearby-drop", revision, vec![operation(after.clone())]).unwrap();
+        assert_eq!(replay["replayed"], json!(true));
+        assert_eq!(replay["revision"], result["revision"]);
+        assert_eq!(snapshot_state(&connection), after);
+        assert_eq!(commit_err(&mut connection, "stale-drop", revision, vec![operation(after.clone())]), "revision_conflict");
+        let mut changed = after;
+        changed["weather"] = json!("rain");
+        assert_eq!(commit_err(&mut connection, "nearby-drop", revision, vec![operation(changed)]), "request_id_conflict");
     }
 
     fn fact_kinds(connection: &Connection) -> Vec<String> {

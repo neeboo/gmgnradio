@@ -28,7 +28,8 @@ float3 Prism(float hue){return .52+.48*cos(6.2831853*(frac(hue)+float3(0,.666666
   p.timing=float4(max(hero,floorClass*.72),.18,5,phase+time*lerp(.035,.12,hero)*(.45+.55*sin(phase*1.7)));
   _Points[id.x]=p;return;
  }
- float2 uv=saturate(initial.xy/6+.5),sampleUV=float2(uv.x,1-uv.y);
+ // Unity Texture2D and world Y share the bottom-left origin.
+ float2 uv=saturate(initial.xy/6+.5),sampleUV=uv;
  float3 artwork=_Artwork.SampleLevel(sampler_Artwork,sampleUV,0).rgb;
  uint texWidth,texHeight;_Artwork.GetDimensions(texWidth,texHeight);float2 texel=1/float2(max(texWidth,1u),max(texHeight,1u));
  float3 lumaWeights=float3(.2126,.7152,.0722);float luma=dot(artwork,lumaWeights);

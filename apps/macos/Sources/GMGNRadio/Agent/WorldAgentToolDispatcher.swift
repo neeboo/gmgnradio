@@ -1,16 +1,37 @@
 import Foundation
 import WorldRuntime
 
+struct WorldAgentMotionOption: Codable, Equatable, Sendable {
+    let id: String
+    let displayName: String
+    let format: String
+    let loop: Bool
+}
+
 struct WorldAgentToolResponse: Codable, Equatable, Sendable {
+    struct ActivityRequest: Codable, Equatable, Sendable {
+        let requestID: String
+        let activityID: String
+        let status: String
+        let phase: LifeActivityPhase?
+    }
     let ok: Bool
     let code: String?
     let message: String
     let snapshot: WorldAgentSnapshot
     let route: WorldPath?
+    var activityRequest: ActivityRequest? = nil
+    var motions: [WorldAgentMotionOption]? = nil
 }
 
 @MainActor
 final class WorldAgentToolDispatcher {
+    var availableMotions: @MainActor () -> [WorldAgentMotionOption] = { [] }
+    var selectMotion: @MainActor (String) -> Bool = { _ in false }
+    private struct MotionArguments: Decodable {
+        let motionID: String
+        enum CodingKeys: String, CodingKey { case motionID = "motion_id" }
+    }
     private struct PlaceArguments: Decodable {
         let placeID: String
 
@@ -130,8 +151,19 @@ final class WorldAgentToolDispatcher {
 
         do {
             var route: WorldPath?
+            var activityRequest: WorldAgentToolResponse.ActivityRequest?
             let message: String
             switch call.name {
+            case "list_available_motions":
+                message = "已读取当前角色全部可播放动作，使用 motions 中的精确 ID"
+            case "play_motion":
+                let arguments = try decode(MotionArguments.self, from: call.argumentsJSON)
+                guard availableMotions().contains(where: { $0.id == arguments.motionID }),
+                      selectMotion(arguments.motionID) else {
+                    return makeResult(callID: call.id, ok: false, code: "motion_unavailable",
+                        message: "动作未安装、不兼容当前角色或角色仍在载入；请重新读取 list_available_motions")
+                }
+                message = "已提交动作 \(arguments.motionID) 的载入请求；保持人物当前位置，尚未确认渲染器开始播放"
             case "inspect_world":
                 message = "已读取当前世界状态"
             case "list_places":
@@ -155,8 +187,10 @@ final class WorldAgentToolDispatcher {
                 try context.startActivity(id: arguments.activityID)
                 if let requestID = context.currentActivityRequestID {
                     onActivityStarted(context, requestID)
+                    activityRequest = .init(requestID: requestID, activityID: arguments.activityID,
+                        status: "accepted", phase: context.snapshot.activeActivity?.phase)
                 }
-                message = "角色开始执行 \(arguments.activityID)"
+                message = "已接受活动请求 \(arguments.activityID)，尚未确认角色动作开始；当前阶段见 snapshot，不代表动作已播放或完成"
             case "stop_activity":
                 let arguments = try decode(
                     StopActivityArguments.self,
@@ -194,7 +228,9 @@ final class WorldAgentToolDispatcher {
                 ok: true,
                 code: nil,
                 message: message,
-                route: route
+                route: route,
+                activityRequest: activityRequest,
+                includeMotions: call.name == "list_available_motions" || call.name == "inspect_world"
             )
         } catch {
             return makeResult(
@@ -222,7 +258,9 @@ final class WorldAgentToolDispatcher {
         ok: Bool,
         code: String?,
         message: String,
-        route: WorldPath? = nil
+        route: WorldPath? = nil,
+        activityRequest: WorldAgentToolResponse.ActivityRequest? = nil,
+        includeMotions: Bool = false
     ) -> RealtimeDJToolResult {
         let snapshot = context.snapshot
         let visibleSnapshot = WorldAgentSnapshot(
@@ -240,7 +278,9 @@ final class WorldAgentToolDispatcher {
             code: code,
             message: message,
             snapshot: visibleSnapshot,
-            route: route
+            route: route,
+            activityRequest: activityRequest,
+            motions: includeMotions ? availableMotions() : nil
         )
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .millisecondsSince1970
@@ -264,8 +304,10 @@ final class WorldAgentToolDispatcher {
         case WorldAgentContextError.unknownCamera: "unknown_camera"
         case WorldAgentContextError.invalidGoalID: "invalid_goal_id"
         case WorldAgentContextError.activityRejected: "activity_rejected"
+        case WorldAgentContextError.activityStartRejected: "activity_rejected"
         case WorldAgentContextError.routeBlocked: "route_blocked"
         case WorldSimulationError.goalAlreadyCompleted: "goal_already_completed"
+        case WorldSimulationError.propIsHeld: "held_prop_conflict"
         default: "world_tool_failed"
         }
     }
@@ -286,10 +328,23 @@ final class WorldAgentToolDispatcher {
             "目标 ID 不能为空"
         case let WorldAgentContextError.activityRejected(id):
             "当前状态无法开始活动 \(id)"
+        case let WorldAgentContextError.activityStartRejected(id, reason):
+            switch reason {
+            case .notInterruptible:
+                "当前活动尚不能中断，暂时无法开始 \(id)"
+            case .lowerPriority:
+                "当前活动的优先级更高，暂时无法开始 \(id)"
+            case .definitionMismatch:
+                "活动 \(id) 的定义与请求不匹配"
+            case .cooldownActive:
+                "活动 \(id) 仍在冷却中，请稍后重试"
+            }
         case let WorldAgentContextError.routeBlocked(id):
             "前往 \(id) 的路线被阻挡"
         case let WorldSimulationError.goalAlreadyCompleted(goalID):
             "目标 \(goalID) 已经完成"
+        case WorldSimulationError.propIsHeld:
+            "居民正持有物件。需要人类在本轮明确授权放回后，才能开始活动。"
         default:
             // 绝不回显 `String(describing:)`：枚举 error 的关联值可能含退出码、
             // 路径或原始诊断；这类信息只能进日志，不能上屏/回灌模型。

@@ -22,6 +22,7 @@ let sources = ["Presence/PropGenerationClient", "Presence/PropGenerationStore", 
                "Agent/WishMachineContract", "Agent/ResidentWishMachineTools"]
     .map { root.appendingPathComponent("apps/macos/Sources/GMGNRadio/\($0).swift") }
     + [root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/PropTaskDaemonClient.swift"),
+       root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/TaskdHTTPTransport.swift"),
        root.appendingPathComponent("tools/fixtures/WishMachineDaemonFixture.swift"),
        // 连通性词汇只有**一份**：coordinator 的 `isNetworkClassSubmissionError` 现在
        // 委托给 `ResidentConnectivityFact`，所以那份生产文件必须一起编进来 ——
@@ -340,6 +341,25 @@ extension WishMachineCoordinator {
         let afterStoppedClaim = try coordinator.read(id: job.id, worldID: "world", residentScope: "resident")
         check(stoppedClaim.isError && afterStoppedClaim.stage == .ready,
               "stop during arrival wait leaves output unclaimed")
+        let arrivingDirectory = dir.appendingPathComponent("arriving-claim")
+        try FileManager.default.createDirectory(at: arrivingDirectory, withIntermediateDirectories: true)
+        try Data(contentsOf: dir.appendingPathComponent("wishes/wishes.json")).write(to: arrivingDirectory.appendingPathComponent("wishes.json"))
+        var arrivingChecks = 0
+        let arrivingCoordinator = WishMachineCoordinator(store: store, directory: arrivingDirectory, canClaim: { _ in
+            arrivingChecks += 1; return evidence
+        })
+        evidence = .init(worldID: "world", activityID: "wish_machine.collect", phase: "approach", distanceMeters: 2, outputAvailable: true)
+        let arrivingTool = ResidentWishMachineTools(coordinator: arrivingCoordinator, worldID: "world", residentScope: "resident", authorizationID: nil, isCurrent: { true }).tools.first { $0.name == "claim_wish_output" }!
+        let arrivingClaim = Task { await arrivingTool.handle("arrival-readback", try! JSONSerialization.data(withJSONObject: ["wish_id": job.id.uuidString])) }
+        for _ in 0..<10000 { if arrivingChecks > 0 { break }; await Task.yield() }
+        let approachingState = try arrivingCoordinator.read(id: job.id, worldID: "world", residentScope: "resident")
+        check(arrivingChecks > 0 && approachingState.stage == .ready,
+              "real tool preserves ready output while actual collect approach is in progress")
+        evidence = .init(worldID: "world", activityID: "wish_machine.collect", phase: "loop", distanceMeters: 0.1, outputAvailable: true)
+        let arrivedResult = await arrivingClaim.value
+        let arrivedState = try arrivingCoordinator.read(id: job.id, worldID: "world", residentScope: "resident")
+        check(!arrivedResult.isError && arrivedState.stage == .claimed,
+              "same real claim call completes only after arrival and rendered loop evidence")
         // ── 领取判据：站在注册锚点上 ⇒ 通过；越容差 / 托盘没东西 / 没有真的在跑 ⇒ 仍然拒绝 ──
         // 位置判据只有注册锚点一个来源（宿主用 `propAnchorRegistry.entry(activityID:)` 供口径），
         // 这里逐条把边界钉住：既不许"站在锚点上还不通过"，也不许把门禁拆掉。

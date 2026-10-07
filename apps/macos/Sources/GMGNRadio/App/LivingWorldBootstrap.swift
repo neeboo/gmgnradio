@@ -196,6 +196,12 @@ enum LivingWorldBootstrap {
     /// bundled living pod, which needs no network download to render.
     static let defaultWorldID = LivingPodScene.worldID
     static let installedLivingMotionIDs: Set<String> = [
+        MotionPackageStore.iluvSlapBassVRMID,
+        "gmgn.motion.bones.idle-loop-pmx",
+        "gmgn.motion.bones.idle-loop-vrm",
+        "gmgn.motion.bones.jumping-jacks-vrm",
+        "gmgn.motion.bones.hold-display-pmx",
+        "gmgn.motion.bones.hold-display-vrm",
         "gmgn.motion.bones.chair-sit-loop-pmx",
         "gmgn.motion.bones.chair-sit-loop-vrm",
         "gmgn.motion.bones.cross-legged-loop-pmx",
@@ -207,6 +213,10 @@ enum LivingWorldBootstrap {
         "gmgn.motion.bones.coffee-button-pmx",
         "gmgn.motion.bones.arpg.interact-button-mid-vrm",
         "gmgn.motion.bones.arpg.interact-button-mid-pmx",
+        "gmgn.motion.bones.arpg.pickup-standing-vrm",
+        "gmgn.motion.bones.arpg.pickup-standing-pmx",
+        "gmgn.motion.device.jukebox-low-button-pmx",
+        "gmgn.motion.device.jukebox-low-button-vrm",
     ]
 
     static func loadBundledCanary(
@@ -430,6 +440,9 @@ enum LivingWorldBootstrap {
             id.hasPrefix("gmgn.motion.bones.")
                 || id == "gmgn.motion.ardy-backflip"
                 || id == MotionPackageStore.iluvSlapBassID
+                || id == MotionPackageStore.iluvSlapBassVRMID
+                || id == "gmgn.motion.device.jukebox-low-button-pmx"
+                || id == "gmgn.motion.device.jukebox-low-button-vrm"
         }
         // Keep the explicit music alias, but do not let an old world package
         // or supplemental entry restore a retired non-BONES resident motion.
@@ -590,7 +603,8 @@ enum LivingWorldBootstrap {
         package: BundledLivingWorldPackage,
         walkingSpeed: Float? = nil,
         fileManager: FileManager = .default,
-        applicationSupportBase: URL? = nil
+        applicationSupportBase: URL? = nil,
+        initialCollisionWorld: (any WorldCollisionQuerying)? = nil
     ) throws -> WorldAgentContext {
         // 权威边界（docs/plans/2026-10-02-rust-world-authority-and-mcp.md）：
         // `gmgn-taskd` 是**唯一**写世界状态的进程；`state.json` 降级成只读预像
@@ -612,7 +626,7 @@ enum LivingWorldBootstrap {
         let persistence = AuthorityWorldStatePersistence(
             manifest: package.manifest,
             preImage: preImage,
-            socketPath: endpoint.socketPath,
+            endpointFile: endpoint.endpointFile,
             helperPath: endpoint.helperPath
         )
         // 许愿机的视觉放置与取物/出货点也来自声明：App 里不再有第二份数字。
@@ -624,7 +638,8 @@ enum LivingWorldBootstrap {
             persistence: persistence,
             walkingSpeed: walkingSpeed ?? fallbackWalkingSpeed,
             capsule: collisionCapsule(worldID: package.manifest.worldID),
-            propFunctionSources: propFunctionSources(in: package, fileManager: fileManager)
+            propFunctionSources: propFunctionSources(in: package, fileManager: fileManager),
+            initialCollisionWorld: initialCollisionWorld
         )
         // 事件通道（推送）：权威一变就推进本地投影的 `basedOnRevision`。
         // 渲染路径仍然只读内存里的投影，**永不同步 RPC**（设计 §4.1）。

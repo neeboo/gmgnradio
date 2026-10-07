@@ -13,13 +13,17 @@ public final class ReplaceableCollisionWorld: WorldCollisionQuerying,
 {
     private let lock = NSLock()
     private var current: any WorldCollisionQuerying
+    private var generation: UInt64 = 0
+
+    /// Changes even when replacement geometry has the same bounds.
+    public var revision: UInt64 { lock.withLock { generation } }
 
     public init(initial: any WorldCollisionQuerying) {
         current = initial
     }
 
     public func replace(with collisionWorld: any WorldCollisionQuerying) {
-        lock.withLock { current = collisionWorld }
+        lock.withLock { current = collisionWorld; generation &+= 1 }
     }
 
     /// 只在内部 world 真的提供三角形几何时交出它，否则返回 nil。

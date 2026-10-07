@@ -13,10 +13,10 @@ import os
 ///    冲突**可见地抛出**，绝不静默覆盖。
 ///
 /// 为什么是同步阻塞：它替换掉的正是今天那条**同步的文件写**（`state.json` 的
-/// `Data.write(.atomic)`），而一次本地 UDS 往返（毫秒级）比一次原子文件写更便宜。
+/// `Data.write(.atomic)`），而一次本地 HTTP 往返（毫秒级）比一次原子文件写更便宜。
 /// 调用点是"意图"（拖动结束、领取、每秒一次的检查点），不是渲染路径。
 enum WorldAuthorityError: LocalizedError, Equatable {
-    /// 权威不可达（socket 不在、启动失败、超时）。**不允许**降级成写本地文件。
+    /// 权威不可达（HTTP 端点未就绪、启动失败、超时）。**不允许**降级成写本地文件。
     case unavailable(String)
     /// 权威原样透传的错误码（`revision_conflict` / `request_id_conflict` / ...）。
     case daemon(String)
@@ -182,195 +182,151 @@ struct WorldAuthorityProjection: Equatable, Sendable {
     }
 }
 
-/// 行分隔 JSON over authenticated loopback TCP 的 macOS 同步运输。
-///
-/// 同一份合同（`{id, method, params}` → `{id, result|error}`），与
-/// `PropTaskDaemonClient` 走的是同一个 socket、同一帧上限（12 MiB）。
-final class LoopbackJSONClient: @unchecked Sendable {
+/// Local HTTP authority transport, configured by the authenticated endpoint descriptor.
+final class TaskdHTTPAuthorityClient: @unchecked Sendable {
     static let maximumFrame = 12 * 1024 * 1024
     private struct Endpoint: Decodable { let version: Int; let address: String; let token: String }
-
-    let socketPath: String
+    let endpointFile: String
     let helperPath: String
     let allowsLaunching: Bool
     let timeout: TimeInterval
-
-    private let lock = NSLock()
-    private var nextIdentifier: UInt64 = 1
-
-    init(socketPath: String, helperPath: String, allowsLaunching: Bool = true,
-         timeout: TimeInterval = 5) {
-        self.socketPath = socketPath
-        self.helperPath = helperPath
-        self.allowsLaunching = allowsLaunching
-        self.timeout = timeout
+    init(endpointFile: String, helperPath: String, allowsLaunching: Bool = true, timeout: TimeInterval = 5) {
+        self.endpointFile = endpointFile; self.helperPath = helperPath
+        self.allowsLaunching = allowsLaunching; self.timeout = timeout
     }
-
-    /// 连接并调用一次。**不会**自动重试：写意图的重试必须复用同一个 `requestID`，
-    /// 由调用方决定，运输层只如实报错。
+    private func endpoint() throws -> Endpoint {
+        for attempt in 0..<(allowsLaunching ? 50 : 1) {
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: endpointFile)),
+               let endpoint = try? JSONDecoder().decode(Endpoint.self, from: data) {
+                let parts = endpoint.address.split(separator: ":")
+                guard endpoint.version == 2, parts.count == 2, parts[0] == "127.0.0.1",
+                      let port = UInt16(parts[1]), port > 0,
+                      let token = UUID(uuidString: endpoint.token), token.uuidString.dropFirst(14).first == "4" else {
+                    throw WorldAuthorityError.invalidResponse
+                }
+                if try isHealthy(endpoint) { return endpoint }
+            }
+            if attempt == 1 { launchHelper() }
+            if allowsLaunching { Thread.sleep(forTimeInterval: 0.1) }
+        }
+        throw WorldAuthorityError.unreachable("HTTP endpoint unavailable")
+    }
+    private func isHealthy(_ endpoint: Endpoint) throws -> Bool {
+        let response = WorldHTTPResponse()
+        let transport = TaskdHTTPTransport(streaming: false, maximumBytes: 64 * 1024,
+            receive: { response.receive($0) }, completion: { response.finish($0) })
+        var request = URLRequest(url: URL(string: "http://\(endpoint.address)/health")!, timeoutInterval: min(timeout, 1))
+        request.setValue("Bearer \(endpoint.token)", forHTTPHeaderField: "Authorization")
+        transport.start(request); defer { transport.cancel() }
+        let data: Data
+        do { data = try response.wait(timeout: min(timeout, 1)) }
+        catch WorldAuthorityError.unavailable { return false }
+        guard let health = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              health["version"] as? Int == 2, health["transport"] as? String == "http" else {
+            throw WorldAuthorityError.invalidResponse
+        }
+        return true
+    }
+    private func request(path: String, method: String, params: [String: Any]) throws -> (URLRequest, String) {
+        let endpoint = try endpoint()
+        let id = UUID().uuidString
+        let data = try JSONSerialization.data(withJSONObject: ["id": id, "method": method, "params": params])
+        guard data.count <= Self.maximumFrame else { throw WorldAuthorityError.invalidResponse }
+        var request = URLRequest(url: URL(string: "http://\(endpoint.address)/\(path)")!, timeoutInterval: timeout)
+        request.httpMethod = "POST"; request.httpBody = data
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(endpoint.token)", forHTTPHeaderField: "Authorization")
+        return (request, id)
+    }
+    /// Delegate callbacks run outside the main actor, including when a legacy synchronous caller is on it.
     func call(method: String, params: [String: Any]) throws -> [String: Any] {
-        let identifier = withLock { () -> UInt64 in
-            defer { nextIdentifier += 1 }
-            return nextIdentifier
-        }
-        let request: [String: Any] = ["id": "world-\(identifier)", "method": method, "params": params]
-        let reply = try exchange(request)
-        guard let object = try JSONSerialization.jsonObject(with: reply) as? [String: Any] else {
-            throw WorldAuthorityError.invalidResponse
-        }
-        if let error = object["error"] as? [String: Any], let code = error["code"] as? String {
-            throw WorldAuthorityError.daemonCode(code)
-        }
-        guard let result = object["result"] as? [String: Any] else {
-            throw WorldAuthorityError.invalidResponse
-        }
+        let (request, id) = try request(path: "rpc", method: method, params: params)
+        let response = WorldHTTPResponse()
+        let transport = TaskdHTTPTransport(streaming: false, receive: { response.receive($0) }, completion: { response.finish($0) })
+        transport.start(request)
+        defer { transport.cancel() }
+        let data = try response.wait(timeout: timeout)
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["id"] as? String == id else { throw WorldAuthorityError.invalidResponse }
+        if let error = object["error"] as? [String: Any], let code = error["code"] as? String { throw WorldAuthorityError.daemonCode(code) }
+        guard let result = object["result"] as? [String: Any] else { throw WorldAuthorityError.invalidResponse }
         return result
     }
-
-    private func withLock<T>(_ body: () -> T) -> T {
-        lock.lock()
-        defer { lock.unlock() }
-        return body()
-    }
-
-    /// 订阅：打开一条长连接，写一帧订阅请求，然后逐帧回调直到 `stop` 为真。
-    /// 读超时不是错误（没有新事件时读会超时），由 `stop` 与下一轮读决定何时退出。
-    func stream(method: String, params: [String: Any], stop: () -> Bool,
-                onFrame: ([String: Any]) -> Void) throws {
-        let identifier = withLock { () -> UInt64 in
-            defer { nextIdentifier += 1 }
-            return nextIdentifier
-        }
-        let request: [String: Any] = ["id": "world-\(identifier)", "method": method, "params": params]
-        let (descriptor, token) = try connectDescriptor()
-        defer { close(descriptor) }
-        var authenticated = request
-        authenticated["auth"] = token
-        let body = try JSONSerialization.data(withJSONObject: authenticated)
-        guard body.count <= Self.maximumFrame else { throw WorldAuthorityError.invalidResponse }
-        try writeFrame(descriptor, body)
-        var frame = Data()
-        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+    func stream(method: String, params: [String: Any], stop: () -> Bool, onFrame: ([String: Any]) -> Void) throws {
+        let (request, _) = try request(path: "events", method: method, params: params)
+        let response = WorldHTTPResponse()
+        let transport = TaskdHTTPTransport(streaming: true, receive: { response.receive($0) }, completion: { response.finish($0) })
+        transport.start(request)
+        defer { transport.cancel() }
+        var event = Data()
         while !stop() {
-            let count = read(descriptor, &buffer, buffer.count)
-            if count < 0 {
-                if errno == EAGAIN || errno == EWOULDBLOCK { continue }
-                throw WorldAuthorityError.unreachable("subscription read failed")
-            }
-            if count == 0 { throw WorldAuthorityError.unreachable("authority closed the subscription") }
-            frame.append(contentsOf: buffer[0..<count])
-            if frame.count > Self.maximumFrame { throw WorldAuthorityError.invalidResponse }
-            while let newline = frame.firstIndex(of: 0x0A) {
-                let line = frame[frame.startIndex..<newline]
-                frame = frame[frame.index(after: newline)...]
-                guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
-                    continue
+            guard var line = try response.poll(timeout: 0.1) else { continue }
+            if line.last == 13 { line.removeLast() }
+            if line.isEmpty {
+                if !event.isEmpty {
+                    guard let object = try JSONSerialization.jsonObject(with: event) as? [String: Any] else { throw WorldAuthorityError.invalidResponse }
+                    onFrame(object); event.removeAll()
                 }
-                onFrame(object)
+            } else if line.starts(with: Data("data:".utf8)) {
+                var value = line.dropFirst(5)
+                if value.first == 32 { value = value.dropFirst() }
+                if !event.isEmpty { event.append(10) }
+                event.append(contentsOf: value)
+                guard event.count <= Self.maximumFrame else { throw WorldAuthorityError.invalidResponse }
             }
         }
     }
-
-    /// 打开一条连接、写一帧、读一帧、关掉。短连接让"没有订阅"的语义简单：
-    /// 权威随时可用，Swift 不持有任何需要恢复的长连接状态。
-    private func exchange(_ request: [String: Any]) throws -> Data {
-        let (descriptor, token) = try connectDescriptor()
-        defer { close(descriptor) }
-        var authenticated = request
-        authenticated["auth"] = token
-        let body = try JSONSerialization.data(withJSONObject: authenticated)
-        guard body.count <= Self.maximumFrame else { throw WorldAuthorityError.invalidResponse }
-        try writeFrame(descriptor, body)
-        return try readFrame(descriptor)
-    }
-
-    private func connectDescriptor() throws -> (Int32, String) {
-        var lastError = "socket unavailable"
-        let attempts = allowsLaunching ? 50 : 1
-        var launched = false
-        for attempt in 0..<attempts {
-            if let descriptor = openSocket() { return descriptor }
-            if !launched, allowsLaunching, attempt > 0 {
-                launchHelper()
-                launched = true
-            }
-            if !FileManager.default.fileExists(atPath: socketPath), !allowsLaunching {
-                lastError = "no socket at \(socketPath)"
-                break
-            }
-            lastError = "connect failed"
-            Thread.sleep(forTimeInterval: 0.1)
-        }
-        throw WorldAuthorityError.unreachable(lastError)
-    }
-
-    private func openSocket() -> (Int32, String)? {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: socketPath)),
-              let endpoint = try? JSONDecoder().decode(Endpoint.self, from: data) else { return nil }
-        let parts = endpoint.address.split(separator: ":")
-        guard endpoint.version == 1, parts.count == 2, parts[0] == "127.0.0.1",
-              let port = UInt16(parts[1]), port > 0,
-              let token = UUID(uuidString: endpoint.token), token.uuidString.dropFirst(14).first == "4" else { return nil }
-        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
-        guard descriptor >= 0 else { return nil }
-        var address = sockaddr_in()
-        address.sin_family = sa_family_t(AF_INET)
-        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        address.sin_port = port.bigEndian
-        address.sin_addr.s_addr = inet_addr("127.0.0.1")
-        var tv = timeval(tv_sec: Int(self.timeout), tv_usec: 0)
-        setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-        setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-        let connected = withUnsafePointer(to: &address) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
-                connect(descriptor, socketAddress, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard connected == 0 else {
-            close(descriptor)
-            return nil
-        }
-        return (descriptor, endpoint.token)
-    }
-
     private func launchHelper() {
         guard FileManager.default.isExecutableFile(atPath: helperPath) else { return }
-        let root = URL(fileURLWithPath: socketPath).deletingLastPathComponent()
         let process = Process()
         process.executableURL = URL(fileURLWithPath: helperPath)
-        process.arguments = ["--root", root.path, "--endpoint-file", socketPath, "--concurrency", "2"]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
+        process.arguments = ["--root", URL(fileURLWithPath: endpointFile).deletingLastPathComponent().path,
+                             "--endpoint-file", endpointFile, "--concurrency", "2"]
+            + TaskdBundledMediaConfiguration.arguments(nextTo: URL(fileURLWithPath: helperPath))
+        process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
         try? process.run()
     }
-
-    private func writeFrame(_ descriptor: Int32, _ body: Data) throws {
-        var frame = body
-        frame.append(0x0A)
-        try frame.withUnsafeBytes { raw in
-            guard let base = raw.baseAddress else { throw WorldAuthorityError.invalidResponse }
-            var offset = 0
-            while offset < raw.count {
-                let written = write(descriptor, base.advanced(by: offset), raw.count - offset)
-                guard written > 0 else { throw WorldAuthorityError.unreachable("write failed") }
-                offset += written
-            }
+}
+private final class WorldHTTPResponse: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var frames: [Data] = []
+    private var bytes = 0
+    private var complete = false
+    private var error: Error?
+    func receive(_ data: Data) {
+        condition.lock(); defer { condition.unlock() }
+        guard !complete else { return }
+        guard bytes + data.count <= TaskdHTTPAuthorityClient.maximumFrame else {
+            error = WorldAuthorityError.invalidResponse; complete = true; condition.broadcast(); return
         }
+        frames.append(data); bytes += data.count; condition.signal()
     }
-
-    private func readFrame(_ descriptor: Int32) throws -> Data {
-        var frame = Data()
-        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
-        while true {
-            let count = read(descriptor, &buffer, buffer.count)
-            if count < 0 { throw WorldAuthorityError.unreachable("read timed out") }
-            if count == 0 { throw WorldAuthorityError.unreachable("authority closed the connection") }
-            frame.append(contentsOf: buffer[0..<count])
-            if frame.count > Self.maximumFrame { throw WorldAuthorityError.invalidResponse }
-            if let newline = frame.firstIndex(of: 0x0A) {
-                return frame[frame.startIndex..<newline]
+    func finish(_ error: Error?) {
+        condition.lock(); self.error = self.error ?? error; complete = true; condition.broadcast(); condition.unlock()
+    }
+    func poll(timeout: TimeInterval) throws -> Data? {
+        condition.lock(); defer { condition.unlock() }
+        if frames.isEmpty && !complete { _ = condition.wait(until: Date().addingTimeInterval(timeout)) }
+        if !frames.isEmpty { let data = frames.removeFirst(); bytes -= data.count; return data }
+        if complete {
+            if let error = error as? WorldAuthorityError { throw error }
+            if let error = error as? TaskdHTTPError {
+                switch error {
+                case .rejected(let code): throw WorldAuthorityError.daemonCode(code)
+                case .invalidFrame: throw WorldAuthorityError.invalidResponse
+                case .unavailable, .timedOut: break
+                }
             }
+            throw WorldAuthorityError.unreachable("HTTP connection ended")
         }
+        return nil
+    }
+    func wait(timeout: TimeInterval) throws -> Data {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let data = try poll(timeout: max(0, deadline.timeIntervalSinceNow)) { return data }
+        }
+        throw WorldAuthorityError.unreachable("HTTP request timed out")
     }
 }
 
@@ -380,7 +336,7 @@ final class WorldAuthorityClient: @unchecked Sendable {
     static let producer = "swift"
 
     let worldID: String
-    private let transport: LoopbackJSONClient
+    private let transport: TaskdHTTPAuthorityClient
     private let lock = NSLock()
     private var _projection = WorldAuthorityProjection()
 
@@ -398,9 +354,9 @@ final class WorldAuthorityClient: @unchecked Sendable {
         },
         onFact: { [weak self] fact in self?.apply(fact) })
 
-    init(worldID: String, socketPath: String, helperPath: String, allowsLaunching: Bool = true) {
+    init(worldID: String, endpointFile: String, helperPath: String, allowsLaunching: Bool = true) {
         self.worldID = worldID
-        self.transport = LoopbackJSONClient(socketPath: socketPath, helperPath: helperPath,
+        self.transport = TaskdHTTPAuthorityClient(endpointFile: endpointFile, helperPath: helperPath,
                                               allowsLaunching: allowsLaunching)
     }
 
@@ -641,7 +597,7 @@ final class WorldAuthorityClient: @unchecked Sendable {
 /// （`after = projection.lastAppliedSequence`），所以掉线期间的事实不会丢，
 /// 已经应用过的也不会二次应用（投影按 seq 去重）。
 final class WorldAuthoritySubscription: @unchecked Sendable {
-    private let transport: LoopbackJSONClient
+    private let transport: TaskdHTTPAuthorityClient
     private let params: @Sendable () -> [String: Any]
     private let onFact: @Sendable (WorldAuthorityFact) -> Void
     private let lock = NSLock()
@@ -654,7 +610,7 @@ final class WorldAuthoritySubscription: @unchecked Sendable {
         return running
     }
 
-    init(transport: LoopbackJSONClient, params: @escaping @Sendable () -> [String: Any],
+    init(transport: TaskdHTTPAuthorityClient, params: @escaping @Sendable () -> [String: Any],
          onFact: @escaping @Sendable (WorldAuthorityFact) -> Void) {
         self.transport = transport
         self.params = params

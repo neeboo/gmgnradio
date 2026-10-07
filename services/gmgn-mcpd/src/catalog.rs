@@ -354,7 +354,10 @@ mod tests {
             .map(|entry| entry["name"].as_str().unwrap())
             .collect();
         assert_eq!(listed, names());
-        assert_eq!(block["naming"].as_str().unwrap(), "tools appear to the client as mcp__gmgn__<tool>");
+        assert_eq!(
+            block["naming"].as_str().unwrap(),
+            "tools appear to the client as mcp__gmgn__<tool>"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -367,7 +370,9 @@ mod tests {
 
     /// 仓库根：`CARGO_MANIFEST_DIR` = `<root>/services/gmgn-mcpd`。
     fn workspace_root() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
     }
 
     fn host_allowed_schema_keys() -> BTreeSet<String> {
@@ -427,7 +432,9 @@ mod tests {
         allowed: &BTreeSet<String>,
         hits: &mut Vec<String>,
     ) {
-        let Some(object) = schema.as_object() else { return };
+        let Some(object) = schema.as_object() else {
+            return;
+        };
         for key in object.keys() {
             if !allowed.contains(key) {
                 hits.push(format!("{path}: {key}"));
@@ -453,8 +460,12 @@ mod tests {
         let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) else {
             return false;
         };
-        let Some((_, first)) = properties.iter_mut().next() else { return false };
-        let Some(object) = first.as_object_mut() else { return false };
+        let Some((_, first)) = properties.iter_mut().next() else {
+            return false;
+        };
+        let Some(object) = first.as_object_mut() else {
+            return false;
+        };
         object.insert(key.to_owned(), value);
         true
     }
@@ -501,7 +512,10 @@ mod tests {
                 tool.name
             );
         }
-        assert!(injected >= 8, "注入覆盖面缩水：只有 {injected} 个工具的 schema 带参数");
+        assert!(
+            injected >= 8,
+            "注入覆盖面缩水：只有 {injected} 个工具的 schema 带参数"
+        );
 
         // 嵌套位置必须也被抓到（`items` 下面的属性）——递归坏了就是漏检。
         let commit = find("gmgn_world_commit").expect("gmgn_world_commit 必须在 catalog 里");
@@ -519,7 +533,9 @@ mod tests {
         let mut top = (find("gmgn_world_read").unwrap().input_schema)();
         top["oneOf"] = json!([]);
         assert!(
-            unsupported_schema_keys(&top, &allowed).iter().any(|hit| hit == "$: oneOf"),
+            unsupported_schema_keys(&top, &allowed)
+                .iter()
+                .any(|hit| hit == "$: oneOf"),
             "往 schema 顶层注入 oneOf 没有被抓到（顶层漏检 = 门禁失效）"
         );
 
@@ -559,7 +575,8 @@ mod tests {
         let anchor = format!("pub const {name}: usize =");
         let start = text
             .find(&anchor)
-            .unwrap_or_else(|| panic!("权威源码里找不到 `{anchor}`")) + anchor.len();
+            .unwrap_or_else(|| panic!("权威源码里找不到 `{anchor}`"))
+            + anchor.len();
         let digits: String = text[start..]
             .trim_start()
             .chars()
@@ -579,9 +596,24 @@ mod tests {
     #[test]
     fn ranged_parameters_explain_their_range_and_rejection() {
         let expectations = [
-            ("gmgn_world_facts_read", "after", "invalid_cursor", ["0", "负数"]),
-            ("gmgn_world_facts_read", "limit", "invalid_limit", ["1", "500"]),
-            ("gmgn_world_commit", "expectedRevision", "invalid_revision", ["0", "负数"]),
+            (
+                "gmgn_world_facts_read",
+                "after",
+                "invalid_cursor",
+                ["0", "负数"],
+            ),
+            (
+                "gmgn_world_facts_read",
+                "limit",
+                "invalid_limit",
+                ["1", "500"],
+            ),
+            (
+                "gmgn_world_commit",
+                "expectedRevision",
+                "invalid_revision",
+                ["0", "负数"],
+            ),
         ];
         for (tool_name, parameter, code, evidence) in expectations {
             let schema = (find(tool_name)

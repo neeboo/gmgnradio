@@ -213,6 +213,39 @@ func unboundPropStaysInertUntilCapabilityIsExplicitlyBound() throws {
 
 @MainActor
 @Test
+func renderedFiniteOperationWaitsAndStartsNextPhaseWithFreshTimer() throws {
+    let encoded = try JSONEncoder().encode(WorldManifest.propCapabilityFixture)
+    var document = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+    var definitions = try #require(document["activityDefinitions"] as? [[String: Any]])
+    var phases = try #require(definitions[0]["phases"] as? [[String: Any]])
+    for index in phases.indices {
+        if phases[index]["phase"] as? String == "enter" {
+            phases[index]["motionIDs"] = ["operation.finite"]
+            phases[index]["durationSeconds"] = 0.1
+        } else if phases[index]["phase"] as? String == "loop" {
+            phases[index]["durationSeconds"] = 1.0
+        }
+    }
+    definitions[0]["phases"] = phases
+    document["activityDefinitions"] = definitions
+    let manifest = try JSONDecoder().decode(WorldManifest.self,
+        from: JSONSerialization.data(withJSONObject: document))
+    let context = try WorldAgentContext(manifest: manifest,
+        startedAt: Date(timeIntervalSince1970: 1_000), walkingSpeed: 4)
+    context.waitsForRenderedActivityCompletion = { true }
+    try context.startActivity(id: "sit-chair")
+    try advanceToEnterPhase(context)
+    try context.tick(deltaTime: 2)
+    #expect(context.snapshot.activeActivity?.phase == .enter)
+    try context.completeActivityPlayback(requestID: context.currentActivityRequestID!, phase: .enter)
+    context.waitsForRenderedActivityCompletion = { false }
+    try context.tick(deltaTime: 0.1)
+    #expect(context.snapshot.activeActivity?.phase == .loop,
+            "操作阶段的两秒不能抵扣下一阶段的一秒时长")
+}
+
+@MainActor
+@Test
 func boundPropUsageWalksFacesAndCompletesOnlyThroughMatchingPlaybackReceipt() throws {
     let context = try makeCapabilityContext()
     try bindPlacedCoffeeMachine(in: context)
@@ -247,8 +280,13 @@ func boundPropUsageWalksFacesAndCompletesOnlyThroughMatchingPlaybackReceipt() th
     })
 
     // 冷却期内重启必须被拒绝；冷却过后同一能力可再次使用。
-    #expect(throws: WorldAgentContextError.activityRejected(coffeeActivityID)) {
+    #expect {
         try context.startActivity(id: coffeeActivityID)
+    } throws: { error in
+        guard case let WorldAgentContextError.activityStartRejected(id, reason) = error,
+              id == coffeeActivityID,
+              case .cooldownActive = reason else { return false }
+        return true
     }
     try context.tick(deltaTime: 46)
     try context.startActivity(id: coffeeActivityID)

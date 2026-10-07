@@ -369,6 +369,12 @@ func residentActivityAvailable(
                   "\(role) anchor must have moved away from its local coordinates")
         }
         let movedPickup = try unwrap(context.propAnchorRegistry.entry(activityID: "wish_machine.collect"))
+        let movedPlace = try unwrap(context.snapshot.places.first { $0.id == "wish_machine.pickup" })
+        check(distance(movedPlace.position, movedPickup.position) < 0.0001,
+              "discoverable device place must follow its saved placement rather than the baked waypoint")
+        let movedRoute = try context.planRoute(to: "wish_machine.pickup")
+        check(movedRoute.points.last.map { planarDistance($0, movedPickup.position) < 0.05 } == true,
+              "move_to must route to the moved pickup function point")
         check(distance(movedPickup.position, bakedPickup) > 1.0,
               "the moved pickup anchor must not be the baked value (\(describe(movedPickup.position)) vs \(describe(bakedPickup)))")
         check(context.propAnchorRegistry.registeredActivityIDs == ["music.listen", "wish_machine.collect"],
@@ -417,9 +423,23 @@ func residentActivityAvailable(
         check(entryPlaceAfterMove != "wp.spawn" && entryPlaceAfterMove != "wp.center",
               "planning must resolve a real approach waypoint, got \(entryPlaceAfterMove)")
 
+        _ = try context.move(to: "wish_machine.pickup")
+        for _ in 0..<1800 {
+            try context.tick(deltaTime: 1.0 / 30)
+            if context.snapshot.movement == nil { break }
+        }
+        check(planarDistance(context.state.agentTransform.position, movedPickup.position) < 0.05,
+              "the move_to executor must arrive at the saved device function point")
+
         try context.startActivity(id: "wish_machine.collect")
         for _ in 0..<1800 {
             try context.tick(deltaTime: 1.0 / 30)
+            if context.snapshot.activeActivity?.phase == .enter,
+               let request = context.currentActivityRequestID {
+                // Finite authored pickup motion now advances on a matching
+                // renderer receipt; this geometry harness has no renderer.
+                try context.completeActivityPlayback(requestID: request, phase: .enter)
+            }
             if context.snapshot.activeActivity?.phase == .loop { break }
         }
         let phase = context.snapshot.activeActivity?.phase
@@ -442,6 +462,11 @@ func residentActivityAvailable(
               "the withdrawn machine must not keep an activity entry")
         check(!context.snapshot.activities.contains { $0.id == "wish_machine.collect" },
               "the activity must disappear from discovery once its anchors are unregistered")
+        check(!context.snapshot.places.contains { $0.id == "wish_machine.pickup" },
+              "withdrawing the device must remove its obsolete place from discovery")
+        var routeRejected = false
+        do { _ = try context.planRoute(to: "wish_machine.pickup") } catch { routeRejected = true }
+        check(routeRejected, "a withdrawn device must not route to the old baked place")
         var startRejected = false
         do { try context.startActivity(id: "wish_machine.collect") } catch { startRejected = true }
         check(startRejected, "the withdrawn machine's activity must not start")
@@ -471,8 +496,8 @@ func residentActivityAvailable(
         check(!seedContext.isPropCapabilityActivity("music.listen"),
               "the jukebox's activity must not be classified as a generated-prop capability activity")
         check(seedContext.activityCatalog.definition(id: "wish_machine.collect")?
-                .contract(for: .enter)?.motionIDs.isEmpty == true,
-              "the machine's enter phase declares no motion, so no motion can be missing")
+                .contract(for: .enter)?.motionIDs.isEmpty == false,
+              "the machine's enter phase declares the authored finite pickup motion")
         let installed: [String: StageMotionAsset] = [:] // 一个动作都没装：最少假设
         for avatarFormat in [StageAvatarFormat.pmx, StageAvatarFormat.vrm] {
             check(residentActivityAvailable(seedContext, "wish_machine.collect",

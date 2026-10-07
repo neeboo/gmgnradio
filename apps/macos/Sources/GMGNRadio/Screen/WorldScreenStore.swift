@@ -118,16 +118,11 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
         self.overlay = overlay
         self.source = source
         self.projectionProvider = projectionProvider
-        // 链接优先、原生播放：生产走内置 helper（未钉哈希时 fail-closed）；显式给了
-        // `GMGN_SCREEN_LINK_HELPER` 的开发覆盖路径才允许跑未钉副本。
+        // Rust owns fetching and cache files; the player consumes its local progressive streams.
         let registry = WorldScreenNativeVideoRegistry()
         self.nativeRegistry = registry
-        let resolver = ScreenLinkResolverService.live(
-            allowDevOverride: ProcessInfo.processInfo
-                .environment["GMGN_SCREEN_LINK_HELPER"]?.isEmpty == false
-        )
         self.nativeCoordinator = NativeScreenPlaybackCoordinator(
-            resolver: resolver, registry: registry
+            cache: ScreenMediaCacheClient(), registry: registry
         )
         nativeCoordinator.onChange = { [weak self] in
             guard let self else { return }
@@ -493,7 +488,12 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
             let surface = overlay.surfaces[objectID]
             let native = nativeCoordinator.snapshot(for: objectID)
             let nativeState = native?.state
+            let preparationText: String? = {
+                guard let nativeState, case .loading = nativeState else { return nil }
+                return native?.cacheState?.panelText
+            }()
             let stateText = issues[objectID]?.errorDescription
+                ?? preparationText
                 ?? nativeState?.displayText
                 ?? surface?.state.displayText
                 ?? "未开始"

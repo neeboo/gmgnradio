@@ -60,7 +60,49 @@ func code(_ result: RealtimeDJToolResult) -> String? { payload(result)["code"] a
     @MainActor static func main() async throws {
         let manifest = try JSONDecoder().decode(WorldManifest.self, from: Data(contentsOf:
             URL(fileURLWithPath: "apps/macos/Resources/Worlds/marble-living-cabin/world.json")))
-        let context = try WorldAgentContext(manifest: manifest)
+        let worldRoot = URL(fileURLWithPath: "apps/macos/Resources/Worlds/marble-living-cabin")
+        let functionSources: [WorldPropFunctionSource] = try manifest.resources
+            .filter { $0.kind == "prop.procedural" }
+            .sorted { $0.id < $1.id }
+            .compactMap { resource in
+                try JSONDecoder().decode(WorldProceduralPropDeclaration.self,
+                    from: Data(contentsOf: worldRoot.appendingPathComponent(resource.path))).functionSource
+            }
+        let context = try WorldAgentContext(manifest: manifest, propFunctionSources: functionSources)
+        let motionDispatcher = WorldAgentToolDispatcher(takeoverEnabled: { true }, context: context)
+        var motionID = "builtin.motion.iluvslapbass"
+        var selectedMotion: String?
+        motionDispatcher.availableMotions = {
+            [.init(id: motionID, displayName: "I Love Slap Bass", format: motionID.hasSuffix("-vrm") ? "vrma" : "vmd", loop: true)]
+        }
+        motionDispatcher.selectMotion = { selectedMotion = $0; return true }
+        let motionList = payload(await motionDispatcher.handle(.init(id: "motion-list", name: "list_available_motions", argumentsJSON: Data("{}".utf8))))
+        check((motionList["motions"] as? [[String: Any]])?.first?["id"] as? String == motionID, "all compatible motions expose exact Slap Bass ID")
+        check((motionList["motions"] as? [[String: Any]])?.first?["displayName"] as? String == "I Love Slap Bass", "motion display name is discoverable")
+        let motionSession = ResidentWorldToolSession(scopeID: UUID(), worldID: manifest.worldID,
+            dispatcher: motionDispatcher, deadline: Date.distantFuture, isCurrent: { true })
+        let motionSchemas = try JSONSerialization.jsonObject(with: motionSession.toolSchemasJSON) as! [[String: Any]]
+        check(motionSchemas.contains { $0["name"] as? String == "list_available_motions" } &&
+              motionSchemas.contains { $0["name"] as? String == "play_motion" }, "resident provider transport advertises both motion tools")
+        let leasedMotionList = await motionSession.call(requestID: "leased-motion-list", name: "list_available_motions", argumentsJSON: Data("{}".utf8))
+        check(!leasedMotionList.isError && (payload(leasedMotionList)["motions"] as? [[String: Any]])?.first?["id"] as? String == motionID, "resident lease exposes actual motion catalog")
+        let leasedMotionPlay = await motionSession.call(requestID: "leased-motion-play", name: "play_motion", argumentsJSON: Data(#"{"motion_id":"builtin.motion.iluvslapbass"}"#.utf8))
+        check(!leasedMotionPlay.isError && selectedMotion == motionID, "resident lease executes discovered Slap Bass motion")
+        motionSession.cancel()
+        check(code(await motionSession.call(requestID: "leased-motion-cancelled", name: "play_motion", argumentsJSON: Data(#"{"motion_id":"builtin.motion.iluvslapbass"}"#.utf8))) == "tool_session_cancelled", "cancelled resident lease cannot select motion")
+        let beforeMotion = context.snapshot.agentTransform
+        let motionResult = await motionDispatcher.handle(.init(id: "motion-play", name: "play_motion", argumentsJSON: Data(#"{"motion_id":"builtin.motion.iluvslapbass"}"#.utf8)))
+        check(!motionResult.isError && selectedMotion == motionID, "agent selects exact discovered motion")
+        check(context.snapshot.agentTransform == beforeMotion, "manual motion selection never teleports to authored activity spawn")
+        let missingMotion = await motionDispatcher.handle(.init(id: "motion-missing", name: "play_motion", argumentsJSON: Data(#"{"motion_id":"missing"}"#.utf8)))
+        check(code(missingMotion) == "motion_unavailable" && selectedMotion == motionID, "missing motion rejected before selection")
+        motionID = "builtin.motion.iluvslapbass-vrm"
+        let changedList = payload(await motionDispatcher.handle(.init(id: "motion-changed", name: "list_available_motions", argumentsJSON: Data("{}".utf8))))
+        check((changedList["motions"] as? [[String: Any]])?.first?["id"] as? String == motionID, "character switch refreshes catalog without stale enum")
+        let staleMotion = await motionDispatcher.handle(.init(id: "motion-stale", name: "play_motion", argumentsJSON: Data(#"{"motion_id":"builtin.motion.iluvslapbass"}"#.utf8)))
+        check(code(staleMotion) == "motion_unavailable", "old character motion rejected after switch")
+        motionDispatcher.availableMotions = { [] }
+        check((payload(await motionDispatcher.handle(.init(id: "motion-empty", name: "list_available_motions", argumentsJSON: Data("{}".utf8))))["motions"] as? [[String: Any]])?.isEmpty == true, "no installed compatible actions means empty catalog")
         let restricted = WorldAgentToolDispatcher(takeoverEnabled: { true }, context: context,
             availableActivity: { $0 != "music.listen" })
         let unavailableList = await restricted.handle(RealtimeDJToolCall(id: "restricted-list", name: "list_available_activities", argumentsJSON: Data("{}".utf8)))
@@ -79,7 +121,6 @@ func code(_ result: RealtimeDJToolResult) -> String? { payload(result)["code"] a
         let restrictedBefore = context.snapshot
         let rejectedMotion = await restricted.handle(RealtimeDJToolCall(id: "restricted-start", name: "start_activity", argumentsJSON: Data(#"{"activity_id":"music.listen"}"#.utf8)))
         check(code(rejectedMotion) == "activity_unavailable" && context.snapshot == restrictedBefore, "unavailable start fails before world mutation")
-        let worldRoot = URL(fileURLWithPath: "apps/macos/Resources/Worlds/marble-living-cabin")
         let config = try JSONDecoder().decode(Config.self, from: Data(contentsOf: worldRoot.appendingPathComponent("marble.json")))
         let origin = SIMD3(config.framing.origin[0], config.framing.origin[1], config.framing.origin[2])
         let triangles = try GLBColliderDecoder().decode(data: Data(contentsOf: worldRoot.appendingPathComponent("collider.glb")),
@@ -97,6 +138,44 @@ func code(_ result: RealtimeDJToolResult) -> String? { payload(result)["code"] a
             check(abs(performanceContext.state.agentTransform.position.x-performancePosition.x) < 0.1 && abs(performanceContext.state.agentTransform.position.z-performancePosition.z) < 0.1, "performance never translates world position: \(activityID)")
         }
         _ = try context.installCollisionWorldAndReconcilePlacement(physics)
+        let heldContext = try WorldAgentContext(manifest: manifest, propFunctionSources: functionSources)
+        let sensitiveHeldObjectID = "/private/user/secret-held-prop.glb"
+        var heldState = heldContext.state
+        let heldReturnState = WorldObjectState(isEnabled: true, transform: manifest.spawn)
+        heldState.objectStates[sensitiveHeldObjectID] = WorldObjectState(
+            isEnabled: false,
+            transform: manifest.spawn
+        )
+        heldState.heldProp = WorldHeldProp(
+            objectID: sensitiveHeldObjectID,
+            avatarAssetID: "avatar.fixture",
+            hand: .rightHand,
+            returnState: heldReturnState
+        )
+        try heldContext.adoptAuthorityState(heldState, propFunctionSources: functionSources)
+        let heldDispatcher = WorldAgentToolDispatcher(takeoverEnabled: { true }, context: heldContext)
+        let heldStart = await heldDispatcher.handle(RealtimeDJToolCall(
+            id: "held-start",
+            name: "start_activity",
+            argumentsJSON: Data(#"{"activity_id":"home.idle"}"#.utf8)
+        ))
+        let heldMessage = payload(heldStart)["message"] as? String ?? ""
+        check(
+            heldStart.isError && code(heldStart) == "held_prop_conflict",
+            "held prop conflict has a stable actionable code"
+        )
+        check(
+            heldMessage == "居民正持有物件。需要人类在本轮明确授权放回后，才能开始活动。",
+            "held prop conflict asks for explicit current-turn human authorization"
+        )
+        check(
+            !heldMessage.contains(sensitiveHeldObjectID) && !heldMessage.contains("重启"),
+            "held prop conflict does not expose object identity or suggest a retry loop"
+        )
+        check(
+            heldContext.state.activeActivity == nil,
+            "rejected held-prop start never reports an activity as started"
+        )
         let patrolContext = try WorldAgentContext(manifest: manifest, walkingSpeed: 1.2)
         _ = try patrolContext.installCollisionWorldAndReconcilePlacement(physics)
         check(Set(patrolContext.snapshot.places.map(\.id)) == ["wp.spawn", "wp.center", "wp.jukebox", "wish_machine.pickup"], "only four semantic places are exposed; generated navigation stays internal")
@@ -124,6 +203,16 @@ func code(_ result: RealtimeDJToolResult) -> String? { payload(result)["code"] a
         let internalPath = try patrolContext.planRoute(to: internalTarget.id)
         check(internalPath.destinationID == internalTarget.id && !internalPath.points.isEmpty, "known generated waypoint remains navigable internally")
         let dispatcher = WorldAgentToolDispatcher(takeoverEnabled: { true }, context: context)
+        let acceptanceContext = try WorldAgentContext(manifest: manifest)
+        let acceptanceDispatcher = WorldAgentToolDispatcher(takeoverEnabled: { true }, context: acceptanceContext)
+        let missingDeviceSnapshot = acceptanceContext.snapshot
+        let missingDevice = await acceptanceDispatcher.handle(RealtimeDJToolCall(id: "missing-device", name: "start_activity", argumentsJSON: Data(#"{"activity_id":"music.listen"}"#.utf8)))
+        check(code(missingDevice) == "unknown_activity" && acceptanceContext.snapshot == missingDeviceSnapshot,
+            "manifest-only baseline has no registered jukebox and rejects without mutation")
+        let acceptedIdle = await acceptanceDispatcher.handle(RealtimeDJToolCall(id: "accepted-idle", name: "start_activity", argumentsJSON: Data(#"{"activity_id":"home.idle"}"#.utf8)))
+        let idleRequest = payload(acceptedIdle)["activityRequest"] as? [String: Any]
+        check(!acceptedIdle.isError && idleRequest?["status"] as? String == "accepted", "formal idle request is accepted without renderer success claim")
+        check(idleRequest?["requestID"] as? String == acceptanceContext.currentActivityRequestID, "formal idle acceptance uses actual request identity")
         let clock = Clock()
         let current = Current()
         let scope = UUID()
@@ -133,7 +222,7 @@ func code(_ result: RealtimeDJToolResult) -> String? { payload(result)["code"] a
         let schemas = try JSONSerialization.jsonObject(with: session.toolSchemasJSON) as! [[String: Any]]
         check(Set(schemas.compactMap { $0["name"] as? String }) ==
               ["inspect_world", "list_places", "list_available_activities", "plan_route", "move_to",
-               "start_activity", "stop_activity", "look_at"], "resident life tools are advertised")
+               "start_activity", "stop_activity", "look_at", "list_available_motions", "play_motion"], "resident life tools are advertised")
         for schema in schemas {
             let input = schema["inputSchema"] as? [String: Any]
             check(input?["type"] as? String == "object", "tool arguments are objects")
@@ -172,7 +261,11 @@ func code(_ result: RealtimeDJToolResult) -> String? { payload(result)["code"] a
         let started = await session.call(requestID: "start", name: "start_activity", argumentsJSON: args)
         check(!started.isError, "actual runtime accepts music activity")
         check(context.state.activeActivity?.activityID == "music.listen", "real context starts activity")
-        check((payload(started)["message"] as? String)?.contains("开始执行") == true, "start only reports accepted activity")
+        check((payload(started)["message"] as? String)?.contains("已接受活动请求") == true, "start only reports accepted activity")
+        let acceptedRequest = payload(started)["activityRequest"] as? [String: Any]
+        check(acceptedRequest?["status"] as? String == "accepted", "acceptance never claims renderer performing")
+        check(acceptedRequest?["requestID"] as? String == context.currentActivityRequestID, "accepted request exposes formal executor identity")
+        check(acceptedRequest?["activityID"] as? String == "music.listen", "accepted request identifies the requested activity")
         check((payload(started)["message"] as? String)?.contains("播放成功") != true, "start does not fabricate playback success")
         let startSnapshot = context.snapshot
         let duplicate = await session.call(requestID: "start", name: "start_activity", argumentsJSON: Data("{ \"activity_id\" : \"music.listen\" }".utf8))
@@ -185,7 +278,13 @@ func code(_ result: RealtimeDJToolResult) -> String? { payload(result)["code"] a
             try context.tick(deltaTime: 1.0 / 30)
             if context.snapshot.activeActivity?.phase == .loop { break }
         }
-        check(context.snapshot.activeActivity?.phase == .loop, "real resident reaches jukebox through actual collision route")
+        check(context.snapshot.activeActivity?.phase == .enter, "real resident reaches jukebox and waits for operation completion")
+        try context.completeActivityPlayback(requestID: "wrong-request", phase: .enter)
+        check(context.snapshot.activeActivity?.phase == .enter, "unrelated completion cannot acknowledge the device operation")
+        try context.completeActivityPlayback(requestID: context.currentActivityRequestID!, phase: .enter)
+        check(context.snapshot.activeActivity?.phase == .loop, "matching formal completion advances device operation; this is a hostless receipt fixture")
+        let acceptedReplay = await session.call(requestID: "start", name: "start_activity", argumentsJSON: args)
+        check(acceptedReplay == started, "request replay preserves accepted result and never upgrades it to renderer success")
         let stopped = await session.call(requestID: "stop", name: "stop_activity", argumentsJSON: Data(#"{"reason":"private user words"}"#.utf8))
         check(!stopped.isError && context.state.activeActivity == nil, "actual runtime stops activity")
         let fresh = await session.call(requestID: "fresh", name: "inspect_world", argumentsJSON: Data("{}".utf8))
@@ -252,7 +351,7 @@ func code(_ result: RealtimeDJToolResult) -> String? { payload(result)["code"] a
             now: { clock.value }, isCurrent: { current.value },
             additionalTools: [extensionTool], maximumCalls: 2)
         let extendedSchemas = try JSONSerialization.jsonObject(with: extended.toolSchemasJSON) as! [[String: Any]]
-        check(extendedSchemas.count == 9, "only registered extension is advertised alongside world tools")
+        check(extendedSchemas.count == ResidentWorldToolSession.allowedToolNames.count + 1, "only registered extension is advertised alongside world tools")
         let extensionFirst = await extended.call(requestID: "extension", name: "read_resident_state", argumentsJSON: Data("{}".utf8))
         let extensionDuplicate = await extended.call(requestID: "extension", name: "read_resident_state", argumentsJSON: Data("{}".utf8))
         check(!extensionFirst.isError && extensionFirst == extensionDuplicate && extensionCalls == 1, "registered capability shares call deduplication")
@@ -313,6 +412,7 @@ let compiled = try run("/usr/bin/swiftc", ["-j1", "-parse-as-library",
     sources.appendingPathComponent("Agent/WorldAgentContext.swift").path,
     sources.appendingPathComponent("Agent/WorldAgentToolContract.swift").path,
     sources.appendingPathComponent("Agent/WorldAgentToolDispatcher.swift").path,
+    sources.appendingPathComponent("Presence/RetryBackoff.swift").path,
     bridge.path, program.path, "-o", executable.path] + FileManager.default.contentsOfDirectory(
         at: worldRuntimeObjects,
         includingPropertiesForKeys: nil).filter { $0.pathExtension == "o" }.map(\.path))

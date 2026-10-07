@@ -3,9 +3,12 @@ mod cli;
 mod contract;
 mod daemon;
 mod files;
+mod http;
 mod memory;
+mod media;
 mod messages;
 mod model;
+mod music;
 mod placement;
 mod provider;
 mod resident;
@@ -18,7 +21,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|s| s == "--help" || s == "-h") {
         println!("gmgn-taskd --root <absolute-directory> --endpoint-file <absolute-file> --concurrency 2 [--legacy-root <absolute-directory>]");
-        println!("--socket remains an alias for --endpoint-file; it now stores authenticated TCP endpoint JSON, not a Unix socket.");
+        println!("The endpoint file stores the authenticated HTTP endpoint descriptor.");
+        println!("Public video caching: --media-helper <absolute-yt-dlp> --media-helper-sha256 <pinned-hex> --media-deno <absolute-deno> --media-deno-sha256 <pinned-hex>. No PATH discovery.");
         println!("gmgn-taskd world-import --root <absolute-directory> --bundle <worlds.json> [--producer <name>] [--out <file>]");
         println!("gmgn-taskd world-dump --root <absolute-directory> [--out <file>]");
         return;
@@ -64,25 +68,25 @@ fn start() -> model::Result<()> {
         .canonicalize()
         .map_err(|_| "storage_unavailable")?;
     if options
-        .socket
+        .endpoint_file
         .parent()
         .and_then(|p| p.canonicalize().ok())
         .as_ref()
         != Some(&root)
     {
-        return Err("socket_outside_private_root");
+        return Err("endpoint_outside_private_root");
     }
     let lock = files::open_private(&root.join("taskd.lock"))?;
     fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| "already_running")?;
-    if let Ok(metadata) = std::fs::symlink_metadata(&options.socket) {
+    if let Ok(metadata) = std::fs::symlink_metadata(&options.endpoint_file) {
         if !metadata.file_type().is_file() {
             return Err("unsafe_endpoint_path");
         }
         // Never overwrite an arbitrary user file at the endpoint location.
-        let previous = files::read(&options.socket, 4096)?;
+        let previous = files::read(&options.endpoint_file, 4096)?;
         let endpoint: gmgn_protocol::Endpoint =
             serde_json::from_slice(&previous).map_err(|_| "unsafe_endpoint_path")?;
-        endpoint.validate().map_err(|_| "unsafe_endpoint_path")?;
+        endpoint.validate_previous_descriptor().map_err(|_| "unsafe_endpoint_path")?;
     }
     let db = store::Database::open(root, options.legacy)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -95,7 +99,7 @@ fn start() -> model::Result<()> {
             .await
             .map_err(|_| "endpoint_unavailable")?;
         let endpoint = gmgn_protocol::Endpoint {
-            version: 1,
+            version: 2,
             address: listener
                 .local_addr()
                 .map_err(|_| "endpoint_unavailable")?
@@ -103,7 +107,7 @@ fn start() -> model::Result<()> {
             token: uuid::Uuid::new_v4().to_string(),
         };
         let bytes = serde_json::to_vec(&endpoint).map_err(|_| "endpoint_unavailable")?;
-        files::publish(&options.socket, &bytes)?;
-        daemon::run(listener, db, options.concurrency, endpoint.token).await
+        files::publish(&options.endpoint_file, &bytes)?;
+        http::run_with_media(listener, db, options.concurrency, endpoint.token, options.media).await
     })
 }

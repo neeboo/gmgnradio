@@ -365,6 +365,7 @@ typealias RealConversationService = AgentConversationService
     // service; the method itself is compiled unchanged, UI/TTS are inert sinks.
     enum AgentConversationService { static var shared: RealConversationService! }
     private var liveCamMessageID: UUID?
+    private var e2eWorldToolLeaseIDs: Set<UUID> = []
     // 原文层已移除：原先这里还桩着 `residentTurnSourceByRunID` /
     // `residentMemoryTurnSlot` / `presentResidentMemoryDeliveryFailure` 与
     // `memoryDeliveryResults`。生产里那一整条链（登记交付凭据 → 显示/语音完成后
@@ -1180,6 +1181,7 @@ let compilerArguments: [String] = ["-disable-sandbox", "-j1", "-parse-as-library
     sources.appendingPathComponent("Presence/PropGenerationConfiguration.swift").path,
     sources.appendingPathComponent("Presence/PropGenerationStore.swift").path,
     sources.appendingPathComponent("Presence/PropTaskDaemonClient.swift").path,
+    sources.appendingPathComponent("Presence/TaskdHTTPTransport.swift").path,
     root.appendingPathComponent("tools/fixtures/WishMachineDaemonFixture.swift").path,
     sources.appendingPathComponent("Presence/PropImagePreparation.swift").path,
     sources.appendingPathComponent("Presence/WishMachineOutputDescriptor.swift").path,

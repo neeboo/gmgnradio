@@ -1,16 +1,19 @@
 """Offline resident storage contract tests.
 
-Exercises the real gmgn-taskd helper process over its Unix socket: scope
+Exercises the real gmgn-taskd helper process over its HTTP endpoint: scope
 isolation, CAS revisions, requestID idempotent replay across restarts, event
 stream pagination, per-consumer message acks that survive restarts, whole
 transaction rollback on failure, and upgrade compatibility of a pre-made v1
 (tasks.sqlite3 without resident tables) database.
 
 Only touches its own temporary directories, the taskd child process and the
-local Unix socket; it never starts the macOS app, never touches the keychain,
+local HTTP endpoint; it never starts the macOS app, never touches the keychain,
 production services or business databases.
 """
 import json
+import sys
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "services/gmgn-taskd/tests"))
+from http_transport import Connection
 import os
 from pathlib import Path
 import socket
@@ -28,13 +31,13 @@ BIN = os.environ.get("TASKD_BIN", "/tmp/gmgn-taskd-target-rust-worker/debug/gmgn
 
 class Daemon:
     def __init__(self, root):
-        self.root = Path(root)
-        self.path = str(self.root / "taskd.sock")
+        self.root = Path(root).resolve()
+        self.path = str(self.root / "taskd.endpoint.json")
         self.start()
 
     def start(self, extra=()):
         self.p = subprocess.Popen(
-            [BIN, "--root", str(self.root), "--socket", self.path, "--concurrency", "2", *extra],
+            [BIN, "--root", str(self.root), "--endpoint-file", self.path, "--concurrency", "2", *extra],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         for _ in range(500):
             if self.p.poll() is not None:
@@ -46,22 +49,17 @@ class Daemon:
                 time.sleep(.02)
         if self.p.poll() is None:
             self.p.kill()
-        raise AssertionError("daemon did not expose its socket: " + self.p.communicate(timeout=2)[1].decode())
+        raise AssertionError("daemon did not expose its HTTP endpoint: " + self.p.communicate(timeout=2)[1].decode())
 
     def connect(self):
-        s = socket.socket(socket.AF_UNIX)
-        s.settimeout(8)
-        try:
-            s.connect(self.path)
-        except Exception:
-            s.close()
-            raise
-        return s
+        connection = Connection(self.path)
+        self.auth = connection.auth
+        return connection
 
     def request(self, method, params=None, request_id="test"):
         params = {} if params is None else params
         with self.connect() as s:
-            s.sendall(json.dumps(dict(id=request_id, method=method, params=params)).encode() + b"\n")
+            s.sendall(json.dumps(dict(auth=self.auth, id=request_id, method=method, params=params)).encode() + b"\n")
             with s.makefile("rb") as stream:
                 return json.loads(stream.readline())
 
@@ -72,7 +70,7 @@ class Daemon:
 
     def subscribe(self, method, params):
         s = self.connect()
-        s.sendall(json.dumps(dict(id="sub", method=method, params=params)).encode() + b"\n")
+        s.sendall(json.dumps(dict(auth=self.auth, id="sub", method=method, params=params)).encode() + b"\n")
         return s, s.makefile("rb")
 
 
@@ -286,7 +284,7 @@ class ResidentStateTests(unittest.TestCase):
         self.assertEqual(len(later), 1)
         self.assertEqual(later[0]["id"], "dddddddd-dddd-4ddd-8ddd-dddddddddddd")
 
-    def test_failed_commit_rolls_back_everything_over_the_socket(self):
+    def test_failed_commit_rolls_back_everything_over_http(self):
         d = self.start()
         self.commit(d, events=[item(seed="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")],
                     value={"state": "first"})
@@ -554,8 +552,8 @@ class UpgradeCompatibilityTests(unittest.TestCase):
         with sqlite3.connect(Path(self.temp.name) / "tasks.sqlite3") as connection:
             version = connection.execute(
                 "SELECT COALESCE(MAX(version),0) FROM schema_migrations").fetchone()[0]
-            # VoiceMem memory orchestration added one additive schema migration.
-            self.assertEqual(version, 3)
+            # Resident, memory, world and music migrations preserve v1 data.
+            self.assertEqual(version, 5)
             states = connection.execute("SELECT COUNT(*) FROM resident_states").fetchone()[0]
             self.assertEqual(states, 1)
 

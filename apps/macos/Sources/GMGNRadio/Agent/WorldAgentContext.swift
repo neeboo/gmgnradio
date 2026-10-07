@@ -1,4 +1,5 @@
 import Foundation
+import simd
 import os
 import WorldRuntime
 
@@ -10,14 +11,33 @@ enum WorldAgentContextError: Error, Equatable {
     case invalidGoalID
     case invalidTickDuration
     case activityRejected(String)
+    case activityStartRejected(String, ActivityExecutionRejection)
     case routeBlocked(String)
     case noWalkablePlacement
+}
+
+enum WorldCoordinateMovementError: Error, LocalizedError {
+    case invalidPosition, missingGround, offGround, occupied, blocked
+    var errorDescription: String? {
+        switch self {
+        case .invalidPosition: "人物位置或请求编号无效。"
+        case .missingGround: "目标位置没有可验证的真实地面。"
+        case .offGround: "目标高度偏离地面，请使用该位置的地面高度。"
+        case .occupied: "目标位置没有足够空间容纳人物。"
+        case .blocked: "人物无法沿合法地面到达目标位置。"
+        }
+    }
 }
 
 struct WorldAgentPlaceSnapshot: Codable, Equatable, Sendable {
     let id: String
     let position: WorldVector3
     let arrivalRadius: Float
+    let displayName: String?
+
+    init(id: String, position: WorldVector3, arrivalRadius: Float, displayName: String? = nil) {
+        self.id = id; self.position = position; self.arrivalRadius = arrivalRadius; self.displayName = displayName
+    }
 }
 
 struct WorldAgentActivityOption: Codable, Equatable, Sendable {
@@ -25,6 +45,7 @@ struct WorldAgentActivityOption: Codable, Equatable, Sendable {
     let action: String
     let entryPlaceID: String
     let interruptible: Bool
+    var seat: WorldPropSeatProjection? = nil
 }
 
 struct WorldAgentCameraOption: Codable, Equatable, Sendable {
@@ -37,6 +58,7 @@ struct WorldAgentActiveActivitySnapshot: Codable, Equatable, Sendable {
     let id: String
     let activity: LifeActivity
     let phase: LifeActivityPhase
+    var seat: WorldPropSeatProjection? = nil
 }
 
 struct WorldAgentMovementSnapshot: Codable, Equatable, Sendable {
@@ -64,11 +86,14 @@ struct WorldAgentSnapshot: Codable, Equatable, Sendable {
 
 @MainActor
 final class WorldAgentContext {
+    /// Successful stop intent also clears renderer-owned manual motion.
+    var onActivityStopped: (() -> Void)?
     private struct MovementRun {
         let requestID: String
         var path: WorldPath
         var nextPointIndex: Int
         var replansRemaining = 1
+        var coordinateTarget: WorldVector3? = nil
     }
 
     private struct PatrolRun {
@@ -103,7 +128,7 @@ final class WorldAgentContext {
         ///
         /// 这两类以前被同一个"在 `propActivities` 里"的判据混在一起，于是世界设备活动
         /// 被按生成物件能力活动审查。来源必须是**显式**的，不能靠"在哪里出现过"推断。
-        enum Origin { case boundCapability, functionPointAnchor }
+        enum Origin { case boundCapability, functionPointAnchor, seatCalibration }
 
         let definition: LifeActivityDefinition
         let objectID: String
@@ -121,10 +146,11 @@ final class WorldAgentContext {
     }
 
     private var propActivities: [String: PropActivity] = [:]
+    private var seatProjections: [String: WorldPropSeatProjection] = [:]
     private var combinedActivityCatalog: ActivityCatalog?
     /// 世界包/资产声明的道具功能点来源。**锚点不落盘**：每次布局变化都从
     /// （声明 × 摆放）重新派生。
-    let propFunctionSources: [WorldPropFunctionSource]
+    private(set) var propFunctionSources: [WorldPropFunctionSource]
     /// 当前已注册出来的道具功能点世界锚点。纯值、每次重建、永不落盘。
     private(set) var propAnchorRegistry: WorldPropAnchorRegistry = .empty
     /// 最近一次派生失败的原因（诊断用）。派生失败时**保留旧注册表**，
@@ -144,12 +170,20 @@ final class WorldAgentContext {
     private let executionScopeID = UUID().uuidString
     // Only planning uses this cache. Each actual movement step is checked again.
     private var navigationTraversalCache: [NavigationSegment: Bool] = [:]
+    // Discovery is read many times per rendered frame. Object layout/metadata and
+    // installed collision geometry determine these spots; time and actor movement
+    // do not. Manifest waypoints, world ID, capsule and step height are immutable
+    // for this context. Actual navigation still resolves and validates its target.
+    private var generatedPlacesCache: (objects: [String: WorldObjectState], collisionRevision: UInt64,
+                                       places: [WorldAgentPlaceSnapshot])?
     private var activityPhaseElapsed: TimeInterval = 0
+    var waitsForRenderedActivityCompletion: (() -> Bool)?
     private let persistence: (any WorldStatePersisting)?
     private var walkingSpeed: Float
     private let capsule: WorldCapsule
     private let maximumStepHeight: Float
     private var tickingTask: Task<Void, Never>?
+    var isTicking: Bool { tickingTask != nil }
     private var lastCheckpointWorldTime: Date?
     /// Monotonic observation cursor over the retained event window: the `sequence`
     /// of the last retained event this context has scanned, or `nil` before the
@@ -170,14 +204,15 @@ final class WorldAgentContext {
         walkingSpeed: Float = 1.2,
         capsule: WorldCapsule = WorldCapsule(radius: 0.2, height: 1.8),
         maximumStepHeight: Float = 0.3,
-        propFunctionSources: [WorldPropFunctionSource] = []
+        propFunctionSources: [WorldPropFunctionSource] = [],
+        initialCollisionWorld: (any WorldCollisionQuerying)? = nil
     ) throws {
         self.manifest = manifest
         self.propFunctionSources = propFunctionSources
         navigationGraph = WaypointNavigationGraph(manifest: manifest)
-        baseCollisionWorld = CollisionVolumeWorld(manifest: manifest)
+        baseCollisionWorld = initialCollisionWorld ?? CollisionVolumeWorld(manifest: manifest)
         collisionWorld = ReplaceableCollisionWorld(
-            initial: CollisionVolumeWorld(manifest: manifest)
+            initial: baseCollisionWorld
         )
         authoredActivityCatalog = try ActivityCatalog(manifest: manifest)
         self.persistence = persistence
@@ -296,6 +331,7 @@ final class WorldAgentContext {
     private func rebuildPropActivities() {
         rebuildPropAnchorRegistry()
         var rebuilt: [String: PropActivity] = [:]
+        var seats: [String: WorldPropSeatProjection] = [:]
         for (objectID, item) in simulation.state.objectStates {
             guard item.isEnabled,
                   let prop = item.generatedProp, prop.objectID == objectID,
@@ -344,6 +380,29 @@ final class WorldAgentContext {
                 origin: .functionPointAnchor
             )
         }
+        for (objectID, item) in simulation.state.objectStates {
+            guard let seat = item.seatCalibration?.resolve(objectID: objectID, state: item),
+                  let entry = resolvedSeatEntry(seat, in: collisionWorld) else { continue }
+            let definition = LifeActivityDefinition(id: seat.activityID,
+                displayName: "坐到\(item.generatedProp?.displayName ?? objectID)上休息",
+                activity: .sit(anchorID: seat.activityID),
+                phases: LifeActivityPhase.allCases.map { phase in
+                    ActivityPhaseContract(phase: phase,
+                        requiredAnchorIDs: phase == .approach ? [seat.activityID] : [],
+                        motionIDs: phase == .approach
+                            ? ["gmgn.motion.bones.walk-loop-pmx", "gmgn.motion.bones.walk-loop-vrm"]
+                            : phase == .loop
+                                ? ["gmgn.motion.bones.chair-sit-loop-pmx", "gmgn.motion.bones.chair-sit-loop-vrm"] : [],
+                        propIDs: phase == .loop ? [objectID] : [],
+                        durationSeconds: phase == .enter || phase == .exit ? 0.2 : nil)
+                }, interruptible: true, cooldownSeconds: 0)
+            rebuilt[seat.activityID] = PropActivity(definition: definition, objectID: objectID,
+                templateID: "seat.sit", entryWaypointID: entry.waypointID,
+                approachPoint: entry.approachPoint, targetYaw: seat.facingYaw,
+                functionPointAnchorID: nil, functionPointPosition: nil, origin: .seatCalibration)
+            seats[seat.activityID] = seat
+        }
+        seatProjections = seats
         propActivities = rebuilt
         combinedActivityCatalog = try? ActivityCatalog(
             definitions: authoredActivityCatalog.definitions + rebuilt.values.map(\.definition)
@@ -407,6 +466,25 @@ final class WorldAgentContext {
 
     private static let log = Logger(subsystem: "gmgn.world", category: "prop-anchors")
 
+    private func resolvedSeatEntry(_ seat: WorldPropSeatProjection,
+        in world: any WorldCollisionQuerying
+    ) -> (waypointID: String, approachPoint: WorldVector3?, standPoint: WorldVector3)? {
+        resolvedFunctionPointSpot(anchor: WorldPropFunctionAnchor(
+            id: seat.activityID, objectID: seat.objectID, role: "seat.approach", kind: .standingSpot,
+            position: seat.approachPoint, yaw: seat.facingYaw, activityID: seat.activityID), in: world)
+    }
+
+    /// Contact point stays explicit; agentTransform is the safe approach capsule.
+    /// Unity projects the actual animated pelvis onto this calibrated seat.
+    var activeSeatProjection: WorldPropSeatProjection? {
+        guard let active = runningActivity, active.phase == .loop,
+              let seat = seatProjections[active.id],
+              let item = state.objectStates[seat.objectID],
+              item.seatCalibration?.resolve(objectID: seat.objectID, state: item) == seat
+        else { return nil }
+        return seat
+    }
+
     /// Resolves where the resident actually stands to operate the machine:
     /// the nearest standable anchor waypoint, and — when that waypoint lies
     /// outside arm's reach — a short final leg marched toward the footprint and
@@ -417,6 +495,7 @@ final class WorldAgentContext {
         propCenter: WorldVector3,
         propYaw: Float,
         propHalfExtents: WorldVector3,
+        minimumEdgeDistance: Float = 0,
         in world: any WorldCollisionQuerying
     ) -> (waypointID: String, approachPoint: WorldVector3?, standPoint: WorldVector3)? {
         func occupiable(_ position: WorldVector3) -> WorldVector3? {
@@ -432,13 +511,16 @@ final class WorldAgentContext {
                 propYaw: propYaw, propHalfExtents: propHalfExtents
             )
             guard waypointEdge > WorldPropActivityTemplate.interactionReach else {
+                guard waypointEdge >= minimumEdgeDistance else { continue }
                 return (waypoint.id, nil, waypoint.position)
             }
             if let approachPoint = WorldPropActivityTemplate.finalApproachPoint(
                 from: waypoint.position, propCenter: propCenter,
                 propYaw: propYaw, propHalfExtents: propHalfExtents,
                 resolve: occupiable
-            ), world.canTraverse(
+            ), WorldPropActivityTemplate.footprintEdgeDistance(from: approachPoint,
+                propCenter: propCenter, propYaw: propYaw, propHalfExtents: propHalfExtents) >= minimumEdgeDistance,
+            world.canTraverse(
                 capsule, from: waypoint.position.simd, to: approachPoint.simd,
                 maximumStepHeight: maximumStepHeight
             ) {
@@ -484,6 +566,91 @@ final class WorldAgentContext {
         activityExecutor.updateWalkingSpeed(speed)
     }
 
+    /// Adopt a verified Rust readback after another owned service commits layout.
+    /// This method never persists or replays a command. The old movement executor
+    /// is discarded so it cannot continue writing from a replaced revision.
+    func readPersistedAuthorityState() async throws -> WorldState? {
+        guard let persistence else { return nil }
+        // Adoption can reject an external activity. Reading must leave the
+        // checkpoint lease unchanged until that validation has succeeded.
+        return try await Task.detached(priority: .utility) { try persistence.readSnapshot() }.value
+    }
+
+    /// Verify durable facts without accepting a newer checkpoint lease.
+    func readAuthoritySnapshot() async throws -> WorldState? {
+        guard let persistence else { return nil }
+        return try await Task.detached(priority: .utility) { try persistence.readSnapshot() }.value
+    }
+
+    func acceptAuthoritySnapshot(_ adopted: WorldState) async throws {
+        guard let persistence else { return }
+        try await Task.detached(priority: .utility) { try persistence.acceptSnapshot(adopted) }.value
+    }
+
+    func adoptAuthorityState(_ restored: WorldState, propFunctionSources sources: [WorldPropFunctionSource],
+                             replacingUncommittedProjection: Bool = false) throws {
+        guard restored.worldID == manifest.worldID else {
+            throw WorldAgentContextError.restoredWorldMismatch(expected: manifest.worldID, actual: restored.worldID)
+        }
+        guard replacingUncommittedProjection || restored.revision >= state.revision else { return }
+        let preservesActivity = restored.activeActivity == state.activeActivity
+            && currentActivityRequestID != nil
+        if let active = restored.activeActivity, !preservesActivity {
+            // An external active run has no renderer lease in this context.
+            // It must be restored by the normal bootstrap, not invented here.
+            throw WorldAgentContextError.activityRejected(active.activityID)
+        }
+        let registered = sources.filter { restored.objectStates[$0.declaration.objectID]?.isEnabled == true }
+        let registry = try WorldPropAnchorRegistry.derive(sources: registered, objectStates: restored.objectStates)
+        simulation = WorldSimulation(restoring: restored)
+        propFunctionSources = registered
+        propAnchorRegistry = registry
+        propAnchorRegistryFault = nil
+        movement = nil
+        patrol = nil
+        activityPhaseElapsed = 0
+        collisionWorld.replace(with: layoutCollisionWorld(for: restored))
+        if !preservesActivity {
+            activityExecutor = ActivityExecutor(position: restored.agentTransform.position,
+                yaw: Self.yaw(of: restored.agentTransform.rotation), walkingSpeed: walkingSpeed,
+                collisionQuery: collisionWorld, capsule: capsule, maximumStepHeight: maximumStepHeight)
+        }
+        rebuildPropActivities()
+        navigationTraversalCache.removeAll(keepingCapacity: true)
+        lastCheckpointWorldTime = restored.worldTime
+        onSnapshotChanged?(snapshot)
+    }
+
+    /// Inventory confirmation adopts durable layout, never an archived actor run.
+    /// Keep the current renderer lease, movement and activity executor intact.
+    func adoptAuthorityInventoryLayout(_ restored: WorldState,
+                                      propFunctionSources sources: [WorldPropFunctionSource]) throws {
+        guard restored.worldID == manifest.worldID else {
+            throw WorldAgentContextError.restoredWorldMismatch(expected: manifest.worldID, actual: restored.worldID)
+        }
+        guard restored.layoutRevision >= state.layoutRevision else {
+            throw WorldPropLayoutError.staleRevision(submitted: restored.layoutRevision, current: state.layoutRevision)
+        }
+        var merged = state
+        merged.revision = max(state.revision, restored.revision)
+        merged.objectStates = restored.objectStates
+        merged.layoutRevision = restored.layoutRevision
+        merged.layoutReceipts = restored.layoutReceipts
+        merged.layoutUndo = restored.layoutUndo
+        merged.heldProp = restored.heldProp
+        merged.propTombstones = restored.propTombstones
+        let registered = sources.filter { merged.objectStates[$0.declaration.objectID]?.isEnabled == true }
+        let registry = try WorldPropAnchorRegistry.derive(sources: registered, objectStates: merged.objectStates)
+        simulation = WorldSimulation(restoring: merged)
+        propFunctionSources = registered
+        propAnchorRegistry = registry
+        propAnchorRegistryFault = nil
+        collisionWorld.replace(with: layoutCollisionWorld(for: merged))
+        rebuildPropActivities()
+        navigationTraversalCache.removeAll(keepingCapacity: true)
+        onSnapshotChanged?(snapshot)
+    }
+
     func completeActivityPlayback(requestID: String, phase: LifeActivityPhase) throws {
         guard currentActivityRequestID == requestID, state.activeActivity != nil,
               activityExecutor.status.phase == phase, phase != .approach else { return }
@@ -492,6 +659,7 @@ final class WorldAgentContext {
            activityCatalog.definition(id: activityExecutor.status.activityID ?? "")?
             .contract(for: .loop)?.durationSeconds == nil { return }
         guard patrol == nil else { return }
+        activityPhaseElapsed = 0
         try applyActivityEffects(activityExecutor.advancePhase(at: state.worldTime),
             usageRequestID: requestID)
         try publish(forcePersistence: true)
@@ -590,7 +758,17 @@ final class WorldAgentContext {
         var executorStopped = false
         if let activeID = state.activeActivity?.activityID,
            let active = propActivities[activeID] {
-            if active.isFunctionPoint {
+            if active.origin == .seatCalibration {
+                let seat = candidate.state.objectStates[active.objectID].flatMap {
+                    $0.seatCalibration?.resolve(objectID: active.objectID, state: $0)
+                }
+                if seat == nil || seat != seatProjections[activeID]
+                    || seat.flatMap({ resolvedSeatEntry($0, in: candidateCollision) }) == nil {
+                    _ = try candidate.cancelActivity(reason: "座位已收回或移动，坐下中止",
+                        expectedRevision: candidate.state.revision)
+                    executorStopped = true
+                }
+            } else if active.isFunctionPoint {
                 // 道具功能点锚点：新位置由**候选状态**派生。锚点移动了、消失了、
                 // 或者在新位置上站不住，正在跑的那一次就必须中止 —— 否则居民会继续
                 // 在一个已经不存在的入口上等回执。
@@ -736,18 +914,25 @@ final class WorldAgentContext {
     var runningActivity: WorldAgentActiveActivitySnapshot? {
         let status = activityExecutor.status
         guard let id = status.activityID else { return nil }
-        return WorldAgentActiveActivitySnapshot(id: id, activity: status.activity, phase: status.phase)
+        return WorldAgentActiveActivitySnapshot(id: id, activity: status.activity, phase: status.phase,
+            seat: seatProjections[id])
     }
 
-    var snapshot: WorldAgentSnapshot {
+    /// The same simulation/executor projection as the full snapshot, without
+    /// resolving discovery places for callers that only need activity state.
+    var activeActivitySnapshot: WorldAgentActiveActivitySnapshot? {
         let status = activityExecutor.status
-        let activeActivity = simulation.state.activeActivity.map { activity in
+        return simulation.state.activeActivity.map { activity in
             WorldAgentActiveActivitySnapshot(
                 id: activity.activityID,
                 activity: patrol.map { .walk(destinationID: $0.targetID) } ?? status.activity,
-                phase: status.phase
+                phase: status.phase, seat: seatProjections[activity.activityID]
             )
         }
+    }
+
+    var snapshot: WorldAgentSnapshot {
+        let activeActivity = activeActivitySnapshot
         return WorldAgentSnapshot(
             revision: state.revision,
             worldID: state.worldID,
@@ -766,16 +951,21 @@ final class WorldAgentContext {
                 )
             },
             completedGoalIDs: state.completedGoals.keys.sorted(),
-            places: manifest.waypoints
+            places: (manifest.waypoints
                 .filter { $0.enabled && !$0.id.hasPrefix("wp.auto.") }
-                .map {
-                    WorldAgentPlaceSnapshot(
-                        id: $0.id,
-                        position: $0.position,
-                        arrivalRadius: $0.arrivalRadius
+                .compactMap { waypoint -> WorldAgentPlaceSnapshot? in
+                    let position: WorldVector3
+                    if let anchorID = devicePlaceAnchorID(waypoint.id) {
+                        guard let anchor = propAnchorRegistry.anchors.first(where: { $0.id == anchorID }) else { return nil }
+                        position = anchor.position
+                    } else { position = waypoint.position }
+                    return WorldAgentPlaceSnapshot(
+                        id: waypoint.id,
+                        position: position,
+                        arrivalRadius: waypoint.arrivalRadius
                     )
                 }
-                .sorted { $0.id < $1.id },
+                + generatedPlaceSnapshots()).sorted { $0.id < $1.id },
             activities: (manifest.activities.compactMap { anchor -> WorldAgentActivityOption? in
                 // 道具功能点锚点**不在**这里出现：它们的几何来自运行时注册表，
                 // 由下面的 `propActivities` 提供。这里只出世界固有锚点。
@@ -791,7 +981,8 @@ final class WorldAgentContext {
                     id: propActivity.definition.id,
                     action: propActivity.definition.activity.typeID,
                     entryPlaceID: propActivity.entryWaypointID,
-                    interruptible: propActivity.definition.interruptible
+                    interruptible: propActivity.definition.interruptible,
+                    seat: seatProjections[propActivity.definition.id]
                 )
             })
             .sorted { $0.id < $1.id },
@@ -808,6 +999,84 @@ final class WorldAgentContext {
     }
 
     func planRoute(to placeID: String) throws -> WorldPath {
+        if let item = state.objectStates[placeID], item.isEnabled, item.generatedProp != nil {
+            guard let spot = generatedObjectSpot(placeID) else { throw WorldAgentContextError.routeBlocked(placeID) }
+            let path = try waypointRoute(to: spot.waypointID)
+            var points = path.points
+            var ids = path.waypointIDs
+            var length = path.totalLength
+            if let approach = spot.approachPoint {
+                let prior = points.last ?? state.agentTransform.position
+                length += simd_distance(prior.simd, approach.simd)
+                points.append(approach); ids.append(placeID)
+            }
+            return WorldPath(destinationID: placeID, waypointIDs: ids, points: points,
+                             totalLength: length, arrivalTolerance: 0.05)
+        }
+        if let anchorID = devicePlaceAnchorID(placeID) {
+            guard let anchor = propAnchorRegistry.anchors.first(where: { $0.id == anchorID }),
+                  let spot = resolvedFunctionPointSpot(anchor: anchor, in: collisionWorld) else {
+                throw WorldAgentContextError.routeBlocked(placeID)
+            }
+            let path = try waypointRoute(to: spot.waypointID)
+            var points = path.points
+            var ids = path.waypointIDs
+            var length = path.totalLength
+            if let approach = spot.approachPoint {
+                let prior = points.last ?? state.agentTransform.position
+                length += simd_distance(prior.simd, approach.simd)
+                points.append(approach)
+                ids.append(placeID)
+            }
+            return WorldPath(destinationID: placeID, waypointIDs: ids, points: points,
+                totalLength: length, arrivalTolerance: min(path.arrivalTolerance, 0.05))
+        }
+        return try waypointRoute(to: placeID)
+    }
+
+    private func generatedPlaceSnapshots() -> [WorldAgentPlaceSnapshot] {
+        let revision = collisionWorld.revision
+        let objects = state.objectStates
+        if let cached = generatedPlacesCache,
+           cached.collisionRevision == revision, cached.objects == objects {
+            return cached.places
+        }
+        let places = objects.compactMap { objectID, item -> WorldAgentPlaceSnapshot? in
+            guard item.isEnabled, let prop = item.generatedProp,
+                  let spot = generatedObjectSpot(objectID) else { return nil }
+            return WorldAgentPlaceSnapshot(id: objectID, position: spot.standPoint,
+                                          arrivalRadius: 0.05, displayName: prop.displayName)
+        }
+        generatedPlacesCache = (objects, revision, places)
+        return places
+    }
+
+    /// Dynamic object destinations use the saved transform and scaled footprint.
+    /// A distant manifest waypoint is only a route leg, never the final destination.
+    private func generatedObjectSpot(_ objectID: String)
+        -> (waypointID: String, approachPoint: WorldVector3?, standPoint: WorldVector3)? {
+        guard let item = state.objectStates[objectID], item.isEnabled,
+              let prop = item.generatedProp, prop.objectID == objectID else { return nil }
+        let size = prop.effectiveSize
+        return resolvedOperationSpot(propCenter: item.transform.position,
+            propYaw: Self.yaw(of: item.transform.rotation),
+            propHalfExtents: WorldVector3(x: size.x * abs(item.transform.scale.x) / 2,
+                y: size.y * abs(item.transform.scale.y) / 2,
+                z: size.z * abs(item.transform.scale.z) / 2),
+            minimumEdgeDistance: capsule.radius + 0.05, in: collisionWorld)
+    }
+
+    /// Keep authored place IDs stable, but resolve device geometry from the saved placement.
+    /// Seed declarations identify the original waypoint without hard-coded device IDs.
+    private func devicePlaceAnchorID(_ placeID: String) -> String? {
+        guard let waypoint = manifest.waypoints.first(where: { $0.id == placeID && $0.enabled }),
+              let seed = try? WorldPropAnchorRegistry.derive(sources: propFunctionSources, objectStates: [:]) else { return nil }
+        return seed.anchors.first {
+            $0.kind == .standingSpot && simd_distance_squared($0.position.simd, waypoint.position.simd) < 0.0001
+        }?.id
+    }
+
+    private func waypointRoute(to placeID: String) throws -> WorldPath {
         guard manifest.waypoints.contains(where: { $0.id == placeID && $0.enabled }) else {
             throw WorldAgentContextError.unknownPlace(placeID)
         }
@@ -849,6 +1118,51 @@ final class WorldAgentContext {
         return path
     }
 
+    /// Human XYZ editing shares the same grounded movement and durable owner as
+    /// ordinary navigation. It never teleports a renderer or invents a floor.
+    @discardableResult
+    func move(to position: WorldVector3, requestID: String, expectedRevision: UInt64) throws -> WorldPath {
+        guard expectedRevision == state.revision else {
+            throw WorldSimulationError.staleRevision(submitted: expectedRevision, current: state.revision)
+        }
+        guard !requestID.isEmpty, requestID.utf8.count <= 256 else { throw WorldCoordinateMovementError.invalidPosition }
+        let path = try coordinateRoute(to: position, destinationID: "coordinate." + requestID)
+        if state.activeActivity != nil { try stopActivity() }
+        let priorMovement = movement, priorPatrol = patrol
+        patrol = nil
+        movement = MovementRun(requestID: requestID, path: path, nextPointIndex: 0, coordinateTarget: path.points.last)
+        do { try recordControlChange() }
+        catch { movement = priorMovement; patrol = priorPatrol; throw error }
+        return path
+    }
+
+    private func coordinateRoute(to position: WorldVector3, destinationID: String) throws -> WorldPath {
+        guard position.x.isFinite, position.y.isFinite, position.z.isFinite else { throw WorldCoordinateMovementError.invalidPosition }
+        guard let ground = collisionWorld.groundHeight(at: position.simd), ground.isFinite else { throw WorldCoordinateMovementError.missingGround }
+        guard abs(position.y - ground) <= 0.05 else { throw WorldCoordinateMovementError.offGround }
+        let target = WorldVector3(x: position.x, y: ground, z: position.z)
+        guard collisionWorld.canOccupy(capsule, at: target.simd) else { throw WorldCoordinateMovementError.occupied }
+        let start = state.agentTransform.position
+        guard canTraverse(from: start.simd, to: start.simd) else { throw WorldCoordinateMovementError.blocked }
+        if canTraverse(from: start.simd, to: target.simd) {
+            return WorldPath(destinationID: destinationID, waypointIDs: [], points: [target],
+                totalLength: simd_distance(start.simd, target.simd), arrivalTolerance: 0.02)
+        }
+        var best: WorldPath?
+        for waypoint in manifest.waypoints where waypoint.enabled {
+            guard let route = try? waypointRoute(to: waypoint.id) else { continue }
+            let last = route.points.last ?? start
+            guard canTraverse(from: last.simd, to: target.simd) else { continue }
+            let length = route.totalLength + simd_distance(last.simd, target.simd)
+            if best == nil || length < best!.totalLength {
+                best = WorldPath(destinationID: destinationID, waypointIDs: route.waypointIDs,
+                    points: route.points + [target], totalLength: length, arrivalTolerance: 0.02)
+            }
+        }
+        guard let best else { throw WorldCoordinateMovementError.blocked }
+        return best
+    }
+
     func startActivity(id: String, requestedAt: Date? = nil) throws {
         guard let plan = resolvedActivityPlan(activityID: id) else {
             throw WorldAgentContextError.unknownActivity(id)
@@ -870,13 +1184,18 @@ final class WorldAgentContext {
         preparedExecutor.synchronizePlacement(position: state.agentTransform.position,
             yaw: Self.yaw(of: state.agentTransform.rotation))
         var effects = preparedExecutor.start(request, definition: definition, at: date)
+        for effect in effects {
+            if case let .rejected(_, reason) = effect {
+                throw WorldAgentContextError.activityStartRejected(id, reason)
+            }
+        }
         if effects.contains(where: \.isRejectedOrFailed) {
             throw WorldAgentContextError.activityRejected(id)
         }
 
         if effects.contains(where: \.requestsPath) {
             do {
-                let path = try planRoute(to: entryWaypointID)
+                let path = try waypointRoute(to: entryWaypointID)
                 var points = path.points
                 if let approachPoint = plan.approachPoint { points.append(approachPoint) }
                 effects += try preparedExecutor.supplyApproach(
@@ -918,6 +1237,7 @@ final class WorldAgentContext {
         let effects = activityExecutor.stop(at: state.worldTime)
         guard state.activeActivity != nil else {
             if wasMoving || !effects.isEmpty { try recordControlChange() }
+            onActivityStopped?()
             return
         }
         _ = try simulation.cancelActivity(
@@ -930,14 +1250,27 @@ final class WorldAgentContext {
         }
         activityPhaseElapsed = 0
         try publish(forcePersistence: true)
+        onActivityStopped?()
     }
 
     func look(at placeID: String) throws {
+        if let item = state.objectStates[placeID], item.isEnabled, item.generatedProp != nil {
+            let origin = state.agentTransform.position
+            try updateTransform(position: origin,
+                yaw: atan2(item.transform.position.x - origin.x, item.transform.position.z - origin.z))
+            return
+        }
         guard let place = manifest.waypoints.first(where: { $0.id == placeID && $0.enabled }) else {
             throw WorldAgentContextError.unknownPlace(placeID)
         }
         let origin = state.agentTransform.position
-        let target = place.position
+        let target: WorldVector3
+        if let anchorID = devicePlaceAnchorID(placeID) {
+            guard let anchor = propAnchorRegistry.anchors.first(where: { $0.id == anchorID }) else {
+                throw WorldAgentContextError.unknownPlace(placeID)
+            }
+            target = anchor.position
+        } else { target = place.position }
         let yaw = atan2(target.x - origin.x, target.z - origin.z)
         try updateTransform(position: origin, yaw: yaw)
     }
@@ -1018,9 +1351,10 @@ final class WorldAgentContext {
         }
     }
 
-    func stopTicking() {
+    func stopTicking(checkpoint: Bool = true) {
         tickingTask?.cancel()
         tickingTask = nil
+        guard checkpoint else { return }
         do {
             try saveCheckpoint()
         } catch {
@@ -1090,7 +1424,11 @@ final class WorldAgentContext {
         }
 
         movement = run.nextPointIndex >= run.path.points.count ? nil : run
-        if position != state.agentTransform.position {
+        if movement == nil, let item = state.objectStates[run.path.destinationID], item.isEnabled,
+           item.generatedProp != nil {
+            yaw = atan2(item.transform.position.x - position.x, item.transform.position.z - position.z)
+        }
+        if position != state.agentTransform.position || movement == nil {
             try updateTransform(position: position, yaw: yaw, notify: false)
         }
         if movement == nil {
@@ -1104,7 +1442,9 @@ final class WorldAgentContext {
         if position != state.agentTransform.position {
             try updateTransform(position: position, yaw: yaw, notify: false)
         }
-        if run.replansRemaining > 0, let path = try? planRoute(to: run.path.destinationID), !path.points.isEmpty {
+        let replacement = run.coordinateTarget.map { try? coordinateRoute(to: $0, destinationID: run.path.destinationID) }
+            ?? (try? planRoute(to: run.path.destinationID))
+        if run.replansRemaining > 0, let path = replacement, !path.points.isEmpty {
             var retry = run
             retry.path = path
             retry.nextPointIndex = 0
@@ -1147,6 +1487,12 @@ final class WorldAgentContext {
             return
         }
         activityPhaseElapsed += deltaTime
+        // Unity's authored operation clips complete through a matching render
+        // receipt. Wall time cannot skip loading or finish a hand operation.
+        if waitsForRenderedActivityCompletion?() == true,
+           let id = status.activityID,
+           let contract = activityCatalog.definition(id: id)?.contract(for: status.phase),
+           !contract.motionIDs.isEmpty { return }
         guard let definition = status.activityID.flatMap(activityCatalog.definition),
               let duration = definition.contract(for: status.phase)?.durationSeconds,
               activityPhaseElapsed >= duration
@@ -1194,6 +1540,7 @@ final class WorldAgentContext {
     private func syncPropUsage(_ activityID: String, status: WorldPropUsageState.Status,
                                requestID: String, reason: String? = nil) {
         guard !requestID.isEmpty, let propActivity = propActivities[activityID] else { return }
+        guard propActivity.origin != .seatCalibration else { return }
         // 使用状态只能写在**生成物件**的库存记录上（`recordPropUsage` 要求
         // `objectStates[objectID].generatedProp`）。世界包声明的设备（点唱机）没有
         // 生成物件记录，于是过去这里对每一次点唱机开始/结束都抛 `invalidObject`，

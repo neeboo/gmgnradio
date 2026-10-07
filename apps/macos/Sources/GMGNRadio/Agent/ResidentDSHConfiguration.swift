@@ -78,7 +78,7 @@ enum ResidentDSHComposition {
     /// 这个进程只被启动，不接受来自 agent 的参数。
     struct ResidentDSHMCPServer: Equatable {
         let command: String
-        let socketPath: String
+        let endpointFile: String
         let grantPath: String?
 
         /// 畸形（相对路径、含引号或逗号）一律拒绝：`args` 是一段行内列表文本，
@@ -90,15 +90,15 @@ enum ResidentDSHComposition {
                     && !path.contains(",")
                     && !path.contains("\n")
             }
-            guard absoluteAndSafe(command), absoluteAndSafe(socketPath) else { return false }
+            guard absoluteAndSafe(command), absoluteAndSafe(endpointFile) else { return false }
             if let grantPath, !absoluteAndSafe(grantPath) { return false }
             return true
         }
 
         /// 行内列表的**原文**。零空格写法（`, `）与 emit 的一字不差才能通过校验，
-        /// 因此读回时无法把另一个 socket/授权文件偷渡进来。
+        /// 因此读回时无法把另一个 HTTP endpoint 描述文件或授权文件偷渡进来。
         var argumentsText: String {
-            var tokens = ["--socket", socketPath]
+            var tokens = ["--endpoint-file", endpointFile]
             if let grantPath {
                 tokens.append("--grant")
                 tokens.append(grantPath)
@@ -723,7 +723,7 @@ enum ResidentDSHComposition {
         let tokens = String(argsText.dropFirst().dropLast())
             .split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespaces) }
-        guard tokens.count == 2 || tokens.count == 4, tokens.first == "--socket" else { return nil }
+        guard tokens.count == 2 || tokens.count == 4, tokens.first == "--endpoint-file" else { return nil }
         let grant: String?
         if tokens.count == 4 {
             guard tokens[2] == "--grant" else { return nil }
@@ -731,7 +731,7 @@ enum ResidentDSHComposition {
         } else {
             grant = nil
         }
-        let server = ResidentDSHMCPServer(command: command, socketPath: tokens[1], grantPath: grant)
+        let server = ResidentDSHMCPServer(command: command, endpointFile: tokens[1], grantPath: grant)
         // Round trip: what we would emit for these facts must be what is on disk.
         guard server.isWellFormed, server.argumentsText == argsText else { return nil }
         return server

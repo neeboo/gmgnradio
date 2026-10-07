@@ -112,7 +112,7 @@ fn the_mcp_process_never_opens_the_authoritys_storage() {
             assert!(
                 !text.contains(needle),
                 "{} 里出现了 `{needle}`：MCP 进程一旦能直接碰权威存储，\
-                 「杀掉 MCP 不影响权威」就不再成立。所有访问都必须走 taskd 的 socket。",
+                 「杀掉 MCP 不影响权威」就不再成立。所有访问都必须走 taskd 的 HTTP。",
                 path.display()
             );
         }
@@ -128,23 +128,25 @@ fn the_manifest_does_not_depend_on_the_storage_stack() {
             "gmgn-mcpd 的依赖里出现了 `{forbidden}`：它不该有能力直接碰权威存储"
         );
     }
-    // It needs one loopback transport; no HTTP server/client stack belongs here.
+    // HTTP client only; the MCP face remains a stdio server.
     assert!(manifest.contains("rmcp"));
-    for forbidden in ["reqwest", "hyper", "axum", "tiny_http", "warp"] {
+    assert!(manifest.contains("reqwest"));
+    for forbidden in ["hyper", "axum", "tiny_http", "warp"] {
         assert!(
             !manifest.contains(forbidden),
-            "gmgn-mcpd 引入了 HTTP 栈 `{forbidden}`：仅允许 taskd 的 loopback 通道"
+            "gmgn-mcpd 引入了 HTTP 服务栈 `{forbidden}`：仅允许 taskd 的 HTTP 客户端"
         );
     }
 }
 
 #[test]
-fn the_only_way_into_the_world_is_the_daemon_socket() {
+fn the_only_way_into_the_world_is_the_daemon_http_endpoint() {
     // Every world access in this crate goes through `taskd::Client`, and that
     // client has exactly one constructor and one call path.
     let client = std::fs::read_to_string(crate_root().join("src/taskd.rs")).unwrap();
     assert!(
-        client.contains("TcpStream::connect") && client.contains("Endpoint"),
+        client.contains(".post(format!(\"http://{address}/rpc\"))") && client.contains("Endpoint")
+            && client.contains(".no_proxy()") && client.contains("Policy::none()"),
         "the transport must use the daemon-owned authenticated endpoint"
     );
     assert!(

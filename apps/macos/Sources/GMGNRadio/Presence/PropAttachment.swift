@@ -137,10 +137,11 @@ enum ResidentPropAttachmentEligibility {
     static func suggestedCalibration(
         for prop: WorldGeneratedProp,
         avatar: StageAvatarAsset?,
-        point: PropAttachmentPoint = .rightHand
+        point: PropAttachmentPoint = .rightHand,
+        geometry: [WorldTriangle]? = nil
     ) -> WorldPropGripCalibration? {
         guard prop.isValid, isEligible(avatar), let avatar else { return nil }
-        return PropAttachmentSlots.calibration(avatarAssetID: avatar.id, prop: prop, point: point)
+        return PropAttachmentSlots.calibration(avatarAssetID: avatar.id, prop: prop, point: point, geometry: geometry)
     }
 
     /// 握点那句给用户看的话的**唯一**出口（就是 `PropGripSuggestion.notice`）。

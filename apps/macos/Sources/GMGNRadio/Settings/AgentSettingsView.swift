@@ -114,7 +114,7 @@ private struct RustSpeechConfigurationFields: View {
             .disabled(!modelSelectionIsValid)
             if saved { Text("已保存").font(.caption).foregroundStyle(.secondary) }
         }
-        Text("传输：本机 TCP → Rust → 服务商；录放音留在系统设备层。")
+        Text("传输：本机 HTTP → Rust → 服务商；录放音留在系统设备层。")
             .font(.caption).foregroundStyle(.secondary)
             .task { loadCapabilities(); if purpose == "tts" { refreshVoices() } }
             .onDisappear { cancelPreviewAndList(); capabilityTask?.cancel(); capabilityTask = nil }

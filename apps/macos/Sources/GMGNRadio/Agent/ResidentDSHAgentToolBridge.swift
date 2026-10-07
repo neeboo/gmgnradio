@@ -26,12 +26,12 @@
 //  DSH 的**工具面是 composition 插件的 `ctx.tools.register`**（docs/cookbook/
 //  adding-a-tool.zh.md；packages/mcp/mcp-client/src/tools.ts 的 syncTools 同源），
 //  宿主可用现有 `--patch` insert 挂载一个私有 JS 插件把 gmgn 正式工具原生注册进
-//  DSH，由 ResidentDSHHostToolsBridge.swift 提供跨本地 IPC 的宿主执行/授权链。
+//  DSH，由 ResidentDSHHostToolsBridge.swift 提供本地 HTTP 的宿主执行/授权链。
 //  因此：模型的**文字永远是普通文字**；**空间工具只通过 DSH 原生函数调用派发**，
-//  由插件 execute 跨受限本地 IPC 调用宿主 worldTools；正文（含 web/工具结果文字）
+//  由插件 execute 经受限本地 HTTP 调用宿主 worldTools；正文（含 web/工具结果文字）
 //  永远是惰性数据，绝无「从正文提取 JSON 执行」的路径。下面的类型化事件机器/裁决
 //  逻辑与注册表/原 schema 校验器继续作为宿主侧语义层被真实通道复用（分类器与
-//  校验器由 ResidentDSHHostToolsBridge 在每次 IPC 调用时驱动）。
+//  校验器由 ResidentDSHHostToolsBridge 在每次 HTTP 调用时驱动）。
 
 import Foundation
 

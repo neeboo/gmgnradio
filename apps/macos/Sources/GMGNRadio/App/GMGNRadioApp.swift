@@ -142,147 +142,7 @@ enum ApplicationLaunchPolicy {
     }
 }
 
-enum RealtimeVoiceSetupError: LocalizedError {
-    case microphoneDenied
-    case providerUnavailable
-    /// 系统权限弹窗仍未被回答（有界等待结束），不是连接或图片能力故障。
-    case microphoneAuthorizationPending
 
-    var errorDescription: String? {
-        switch self {
-        case .microphoneDenied:
-            "没有麦克风权限，请在系统设置里允许 gmgn radio 使用麦克风。"
-        case .providerUnavailable:
-            "这个实时语音服务尚未接通。"
-        case .microphoneAuthorizationPending:
-            "还在等待系统权限弹窗：请点「允许」后再点一次麦克风；"
-                + "若没有看到弹窗，请在系统设置里允许 gmgn radio 使用麦克风。"
-        }
-    }
-}
-
-/// 麦克风授权的可注入纯逻辑闸门（2026-09-22 P0-4）。
-///
-/// 根因：`AVCaptureDevice.requestAccess` 没有超时、不响应 `Task` 取消，系统弹窗
-/// 未回答时它的 continuation 永不恢复。旧实现把它直接 `await` 在语音连接任务里，
-/// 于是 12 秒连接超时取消连接任务后，`enqueueResidentVoiceShutdown` 里的
-/// `await connectingTask.value` 永远不落地，`residentVoiceShutdownTask` 从不清零，
-/// 下一次连接被 `await previousShutdown?.value` 挡住，重试实际失效。
-///
-/// 本闸门把系统授权收敛成**有界、可取消、可复用**的结果，不靠延长超时：
-/// - 已授权 / 已拒绝：立即返回，不再触碰系统请求；
-/// - 首次未决定：只在真正发起系统请求时回调 `onSystemPrompt`，最多等待 `deadline`；
-///   等待被取消或超时都立即返回，但系统请求**继续存在**；
-/// - 迟到的系统结果写入缓存，下一次 `resolve` 直接复用，绝不弹第二次。
-/// 绝不吞掉结果：无论用户先/后回答，闸门都记住答案。
-@MainActor
-final class MicrophoneAuthorizationGate {
-    enum Status: Equatable {
-        case notDetermined
-        case authorized
-        case denied
-    }
-
-    enum Outcome: Equatable {
-        case authorized
-        case denied
-        /// 有界等待结束但系统弹窗仍未回答；request 仍在等待迟到结果。
-        case awaitingSystemPrompt
-        /// 等待方被取消（用户取消录音 / 新请求取代）；request 仍在等待迟到结果。
-        case cancelled
-    }
-
-    private let currentStatus: @MainActor () -> Status
-    private let requestAccess: @MainActor () async -> Bool
-    private var requestTask: Task<Void, Never>?
-    private var settled: Outcome?
-    private var waiters: [UUID: CheckedContinuation<Outcome, Never>] = [:]
-
-    init(
-        status: @escaping @MainActor () -> Status,
-        requestAccess: @escaping @MainActor () async -> Bool
-    ) {
-        self.currentStatus = status
-        self.requestAccess = requestAccess
-    }
-
-    /// 是否还有一次系统授权请求在等用户回答（只读诊断，不触发请求）。
-    var hasPendingSystemRequest: Bool { requestTask != nil }
-
-    /// 有界等待一次授权结论。`onSystemPrompt` 只在**本次真正发起**系统请求时调用一次。
-    func resolve(
-        deadline: Duration,
-        onSystemPrompt: @MainActor () -> Void = {}
-    ) async -> Outcome {
-        switch currentStatus() {
-        case .authorized:
-            return .authorized
-        case .denied:
-            return .denied
-        case .notDetermined:
-            break
-        }
-        // 迟到的系统答案：即便系统状态尚未回流也直接复用，绝不二次弹窗。
-        if let settled { return settled }
-        let token = UUID()
-        return await withTaskCancellationHandler {
-            await withCheckedContinuation { (continuation: CheckedContinuation<Outcome, Never>) in
-                waiters[token] = continuation
-                startSystemRequestIfNeeded(onSystemPrompt: onSystemPrompt)
-                if Task.isCancelled {
-                    finishWaiter(token, with: .cancelled)
-                    return
-                }
-                Task { @MainActor [weak self] in
-                    do { try await Task.sleep(for: deadline) } catch { return }
-                    self?.finishWaiter(token, with: .awaitingSystemPrompt)
-                }
-            }
-        } onCancel: {
-            Task { @MainActor [weak self] in
-                self?.finishWaiter(token, with: .cancelled)
-            }
-        }
-    }
-
-    /// 连接链路共用的分类：授权成功静默通过，其余各自映射到固定用户文案。
-    func resolveOrFail(
-        deadline: Duration,
-        onSystemPrompt: @MainActor () -> Void = {}
-    ) async throws {
-        switch await resolve(deadline: deadline, onSystemPrompt: onSystemPrompt) {
-        case .authorized: return
-        case .cancelled: throw CancellationError()
-        case .denied: throw RealtimeVoiceSetupError.microphoneDenied
-        case .awaitingSystemPrompt: throw RealtimeVoiceSetupError.microphoneAuthorizationPending
-        }
-    }
-
-    private func startSystemRequestIfNeeded(onSystemPrompt: @MainActor () -> Void) {
-        guard requestTask == nil else { return }
-        onSystemPrompt()
-        requestTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            let granted = await self.requestAccess()
-            self.settle(granted ? .authorized : .denied)
-        }
-    }
-
-    private func settle(_ outcome: Outcome) {
-        requestTask = nil
-        settled = outcome
-        let pending = waiters
-        waiters.removeAll()
-        for (_, continuation) in pending {
-            continuation.resume(returning: outcome)
-        }
-    }
-
-    private func finishWaiter(_ token: UUID, with outcome: Outcome) {
-        guard let continuation = waiters.removeValue(forKey: token) else { return }
-        continuation.resume(returning: outcome)
-    }
-}
 
 @MainActor
 final class ApplicationActivationCoordinator {
@@ -1623,7 +1483,7 @@ final class AppDelegate:
     /// 生产为 `nil`，`PropTaskDaemonClient` 自己回落到真实 Application Support。
     ///
     /// 根口径**只有一处**：`WorldAuthorityEndpoint.taskServiceRoot`。世界权威端点用的
-    /// 是同一个函数，所以生成服务与世界权威一定连到同一个 `taskd.sock`
+    /// 是同一个函数，所以生成服务与世界权威一定连到同一个 taskd HTTP endpoint
     /// （上一轮 E2E 的拒收项：同一测试根里出现两个 taskd）。
     private var injectedTaskDaemonRoot: URL? {
         guard let base = E2ERuntime.applicationSupportBase else { return nil }
@@ -1856,8 +1716,13 @@ final class AppDelegate:
         if ApplicationLaunchPolicy.shouldRestoreUserState(
             environment: environment
         ) {
-            programStore.restoreLatest()
-            restoreSavedProgramPresentation()
+            Task { [weak self] in
+                guard let self else { return }
+                await programStore.restoreLatest()
+                restoreSavedProgramPresentation()
+                do { try await musicLibraryStore.reload() }
+                catch { programStore.fail("歌单读取失败：\(error.localizedDescription)") }
+            }
             playbackLogger.info(
                 "已恢复本地节目；等待用户明确播放或同步后再读取音乐账号"
             )
@@ -3704,7 +3569,7 @@ final class AppDelegate:
                     approvedMotions: livingWorldApprovedMotions,
                     avatarFormat: avatarRuntime.snapshot.avatar?.format
                 ),
-                // 显式 root 注入：E2E 下世界预像与 taskd socket/helper 全部落在测试根，
+                // 显式 root 注入：E2E 下世界预像与 taskd endpoint/helper 全部落在测试根，
                 // 不靠 `CFFIXED_USER_HOME`（Foundation 可能已经缓存了真实 home）。
                 applicationSupportBase: E2ERuntime.applicationSupportBase
             )
@@ -4594,6 +4459,7 @@ final class AppDelegate:
                     limit: 20
                 )
                 musicLibraryStore.append(page)
+                try await musicLibraryStore.flush()
                 playbackLogger.info(
                     "歌单渐进加载：playlist=\(playlistID, privacy: .public)，offset=\(offset)，loaded=\(page.tracks.count)，total=\(page.totalTrackCount)"
                 )
@@ -5043,7 +4909,8 @@ final class AppDelegate:
                     throw ResidentPropPlacementError.attachmentUnsupported(reason)
                 }
                 guard let calibration = ResidentPropAttachmentEligibility.suggestedCalibration(
-                    for: prop, avatar: avatar, point: point) else {
+                    for: prop, avatar: avatar, point: point,
+                    geometry: point == .rightHand ? try GLBColliderDecoder().decode(data: Data(contentsOf: asset.descriptor.modelURL, options: .mappedIfSafe)) : nil) else {
                     self.livingWorldLogger.notice("挂点拒绝 step=no-calibration 挂点=\(slotName, privacy: .public) 物件=\(prop.objectID, privacy: .public) 角色=\(avatar.id, privacy: .public)")
                     throw ResidentPropPlacementError.attachmentUnsupported(
                         "这个物件还没有当前居民的\(slotName)挂点建议。")
@@ -5588,9 +5455,10 @@ final class AppDelegate:
         var ids = Set(context.state.objectStates.compactMap { $0.value.isEnabled && $0.value.generatedProp != nil ? $0.key : nil })
         switch command {
         case .place(let id, _): ids.insert(id)
-        case .hold(let id, _, _), .adjustGrip(let id, _, _): ids.insert(id)
+        case .hold(let id, _, _), .adjustGrip(let id, _, _), .rebindHeldAvatar(let id, _, _): ids.insert(id)
         case .returnHeld(let id, _):
             if context.state.heldProp?.returnState.isEnabled == true { ids.insert(id) }
+        case .dropHeld(let id, _, _): ids.insert(id)
         case .undo: if let previous = context.state.layoutUndo?.previous, previous.isEnabled, let prop = previous.generatedProp { ids.insert(prop.objectID) }
         // `.rebase`（历史存档自愈）不改变"空间里有什么"：位置/朝向/是否摆出/手持状态逐位不变，
         // 所以这里与 `.register` 同列 —— 它不需要额外把哪一件模型再备一次（自愈发生在
@@ -7787,7 +7655,7 @@ final class AppDelegate:
     /// "两边都放一半"。站内提示的 30 秒窗口仍然读收件箱那一个锚点（`promptExpiry`），
     /// 所以锚点只有一个来源。
     ///
-    /// 同步的呈现路径不被 IPC 阻塞，带代次守卫避免旧一轮的迟到推送覆盖新一轮的任务列表。
+    /// 同步的呈现路径不被 HTTP 请求阻塞，带代次守卫避免旧一轮的迟到推送覆盖新一轮的任务列表。
     private func pushWishTaskPrompts(_ tasks: [WishMachineTaskPresentation], worldID: String, scope: String) {
         wishTaskPromptGeneration += 1
         let generation = wishTaskPromptGeneration
@@ -7977,7 +7845,7 @@ final class AppDelegate:
     ///
     /// 这里**不**把 `propGenerationStore.errorMessage` 也折进来：那条通道同时承载
     /// "缺令牌""配置变更"这类与连通性无关的原因（`PropGenerationError`），
-    /// 把它们统一说成"连不上后台"就是换一种假话；本地任务后台 IPC 的原因本来
+    /// 把它们统一说成"连不上后台"就是换一种假话；本地任务后台 HTTP 的原因本来
     /// 已有自己的可见面（`showFailureStatus` / `refreshResidentBackendGuidance`）。
     private func pushResidentConnectivityNotice(worldID: String?, scope: String?) {
         guard let worldID, let scope else {
@@ -8810,11 +8678,13 @@ final class AppDelegate:
     }
 
     func listMusicPlaylists(query: String?, offset: Int, limit: Int) async throws -> DJAgentMusicPlaylistsPage {
-        try makeMusicLibraryAgentService().list(query: query, offset: offset, limit: limit)
+        try await musicLibraryStore.reload()
+        return try makeMusicLibraryAgentService().list(query: query, offset: offset, limit: limit)
     }
 
     func readMusicPlaylist(playlistID: String, offset: Int, limit: Int) async throws -> DJAgentMusicPlaylistPage {
-        try await makeMusicLibraryAgentService().read(playlistID: playlistID, offset: offset, limit: limit)
+        try await musicLibraryStore.reload()
+        return try await makeMusicLibraryAgentService().read(playlistID: playlistID, offset: offset, limit: limit)
     }
 
     func prepareMusicTrack(playlistID: String, trackID: String) async throws -> DJAgentMusicPreparation {

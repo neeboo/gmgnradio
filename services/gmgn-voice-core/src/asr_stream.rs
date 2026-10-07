@@ -106,9 +106,10 @@ impl AsrStream {
                     .await
                     .map_err(|_| AsrStreamError::Transport)?;
                 let event = wait_handshake(&mut socket, "type", "session.updated").await?;
-                if event["session"].get("turn_detection").is_none()
-                    || !event["session"]["turn_detection"].is_null()
-                {
+                // Qwen manual-mode acknowledgements omit the disabled/null
+                // field. A non-null VAD configuration still violates PTT.
+                if !event["session"].is_object()
+                    || event["session"].get("turn_detection").is_some_and(|value| !value.is_null()) {
                     return Err(AsrStreamError::Protocol);
                 }
             }
@@ -314,6 +315,41 @@ mod tests {
                 .await
                 .unwrap();
         (stream, server.await.unwrap())
+    }
+    #[tokio::test]
+    async fn bailian_manual_ack_omits_null_turn_detection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            send(&mut socket, json!({"type":"session.created"})).await;
+            let update = receive(&mut socket).await;
+            assert!(update["session"]["turn_detection"].is_null());
+            send(&mut socket, json!({"type":"session.updated","session":{"model":"qwen3-asr-flash-realtime","input_audio_format":"pcm"}})).await;
+            socket
+        });
+        let stream = AsrStream::connect_endpoint(AsrConfig::new(AsrProvider::Bailian, "test-key").unwrap(), &endpoint).await;
+        assert!(stream.is_ok(), "Manual-mode acknowledgement may omit null turn_detection");
+        let mut stream = stream.unwrap(); stream.cancel();
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn bailian_manual_ack_rejects_vad_and_missing_session() {
+        for ack in [json!({"type":"session.updated","session":{"turn_detection":{"type":"server_vad"}}}), json!({"type":"session.updated"})] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                send(&mut socket, json!({"type":"session.created"})).await;
+                receive(&mut socket).await;
+                send(&mut socket, ack).await;
+            });
+            let result = AsrStream::connect_endpoint(AsrConfig::new(AsrProvider::Bailian,"test-key").unwrap(), &endpoint).await;
+            assert!(matches!(result, Err(AsrStreamError::Protocol)));
+            server.await.unwrap();
+        }
     }
     #[tokio::test]
     async fn bailian_streams_pcm_and_commits_before_final() {

@@ -287,7 +287,12 @@ public enum WorldPropLayoutCommand: Codable, Equatable, Sendable {
     case rebase(WorldGeneratedProp)
     case hold(objectID: String, avatarAssetID: String, calibration: WorldPropGripCalibration)
     case adjustGrip(objectID: String, avatarAssetID: String, calibration: WorldPropGripCalibration)
+    /// Switch only the avatar binding of the same held prop. The previous avatar
+    /// is an explicit precondition; source grip, slot and return placement stay fixed.
+    case rebindHeldAvatar(objectID: String, previousAvatarAssetID: String, calibration: WorldPropGripCalibration)
     case returnHeld(objectID: String, avatarAssetID: String)
+    /// Release to a verified nearby support pose, atomically preserving the prop.
+    case dropHeld(objectID: String, avatarAssetID: String, placement: WorldPropPlacement)
     case enableCapability(objectID: String, templateID: String)
     /// **删掉一件生成资产**（永久，不可恢复）。
     ///
@@ -339,6 +344,23 @@ public struct WorldPropLayoutUndo: Codable, Equatable, Sendable {
 }
 
 public extension WorldObjectState {
+    /// Authored built-in devices use the same durable pose and dimensions as
+    /// their render/click proxy. They remain obstacles without pretending to be
+    /// inventory-owned generated props.
+    var builtinDeviceCollisionVolume: WorldCollisionVolume? {
+        guard isEnabled, let raw = metadata["gmgn.builtin-device.v1"],
+              let declaration = try? JSONDecoder().decode(WorldProceduralPropDeclaration.self, from: Data(raw.utf8)),
+              ["builtin.jukebox", "builtin.wish_machine"].contains(declaration.renderer ?? ""),
+              let size = declaration.size,
+              [size.x,size.y,size.z].allSatisfy({ $0.isFinite && $0 > 0 }),
+              [transform.scale.x,transform.scale.y,transform.scale.z].allSatisfy({ $0.isFinite && $0 > 0 }) else { return nil }
+        let dimensions = WorldVector3(x:size.x*transform.scale.x,y:size.y*transform.scale.y,z:size.z*transform.scale.z)
+        let p = transform.position
+        return WorldCollisionVolume(id:declaration.objectID,
+            center:.init(x:p.x,y:p.y+dimensions.y/2,z:p.z),
+            halfExtents:.init(x:dimensions.x/2,y:dimensions.y/2,z:dimensions.z/2),
+            rotation:transform.rotation,isBlocking:true)
+    }
     var generatedProp: WorldGeneratedProp? {
         guard let json = metadata["gmgn.generated-prop.v1"], let data = json.data(using: .utf8),
               let value = try? JSONDecoder().decode(WorldGeneratedProp.self, from: data), value.isValid else { return nil }
@@ -467,7 +489,9 @@ public enum WorldLayoutObstacles {
             guard item.isEnabled else { continue }
             // `generatedCollisionObstacle` 在"元数据坏了"**和**"声明了代理但代理解不出来"
             // 两种情形下都返回 nil。两种都必须可见 —— 后者是本轮新增的 fail-closed 落点。
-            if let obstacle = item.generatedCollisionObstacle {
+            if let volume = item.builtinDeviceCollisionVolume, volume.id == id {
+                obstacles.append(WorldPropObstacle(volume:volume))
+            } else if let obstacle = item.generatedCollisionObstacle {
                 obstacles.append(obstacle)
             } else {
                 unmodelled.append(id)

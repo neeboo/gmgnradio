@@ -41,22 +41,26 @@ const ERROR_CODES: &[&str] = &[
     "authoritative_size_conflicts_with_intent", "blob_hash_mismatch",
     "blob_outside_private_root", "client_disconnected", "client_timeout",
     "collision_integrity_failed", "collision_not_supported", "compaction_rejected",
-    "duplicate_active_source_wish", "embedding_dimension_mismatch", "endpoint_unavailable", "fact_payload_too_large",
+    "duplicate_active_source_wish", "duplicate_music_id", "embedding_dimension_mismatch", "endpoint_outside_private_root", "endpoint_unavailable", "fact_payload_too_large",
     "fallback_profile_mismatch_would_change_collision_box", "frame_too_large",
     "generation_not_ready", "history_record_too_large", "history_unavailable",
-    "http_unavailable", "idempotency_conflict", "image_integrity_failed", "import_conflict",
-    "import_hash_mismatch", "incomplete_frame", "invalid_arguments",
+    "http_content_type_required", "http_events_route_required", "http_method_not_allowed",
+    "http_origin_forbidden", "http_route_not_found", "http_stream_method_required",
+    "http_unauthorized", "http_unavailable", "idempotency_conflict", "image_integrity_failed", "import_conflict",
+    "import_hash_mismatch", "invalid_arguments",
     "invalid_authoritative_size", "invalid_blob", "invalid_blob_hash", "invalid_blob_mime",
-    "invalid_blob_path", "invalid_collision_descriptor", "invalid_concurrency",
+    "invalid_blob_path", "invalid_client_id", "invalid_collision_descriptor", "invalid_concurrency",
     "invalid_consumer", "invalid_context", "invalid_cursor", "invalid_domain",
     "invalid_endpoint", "invalid_event_id", "invalid_event_kind", "invalid_event_payload",
     "invalid_event_read", "invalid_file", "invalid_generated_prop",
     "invalid_generation_profile", "invalid_glb", "invalid_id", "invalid_import_hash",
     "invalid_input", "invalid_input_px", "invalid_legacy_identity", "invalid_limit",
+    "invalid_media_helper_config", "invalid_media_input", "invalid_media_revision",
     "invalid_memory_query", "invalid_memory_read", "invalid_memory_recall",
     "invalid_memory_status", "invalid_message", "invalid_message_ack",
     "invalid_message_cursor", "invalid_message_id", "invalid_message_kind",
     "invalid_message_payload", "invalid_message_read", "invalid_message_scope",
+    "invalid_music_count", "invalid_music_date", "invalid_music_input", "invalid_music_revision", "invalid_music_slot",
     "invalid_object_id", "invalid_op", "invalid_op_count", "invalid_package_id",
     "invalid_package_version", "invalid_placement_request", "invalid_placement_result", "invalid_png", "invalid_producer",
     "invalid_provider_capabilities", "invalid_query", "invalid_request", "invalid_request_id",
@@ -68,25 +72,30 @@ const ERROR_CODES: &[&str] = &[
     "invalid_world_facts", "invalid_world_facts_read", "invalid_world_id",
     "invalid_world_import", "invalid_world_records", "invalid_world_snapshot",
     "invalid_world_state",
-    "ipc_unauthorized", "legacy_integrity_failed", "legacy_unavailable", "limit_exceeded",
+    "legacy_integrity_failed", "legacy_unavailable", "limit_exceeded",
+    "media_cache_corrupt", "media_cache_limit", "media_cache_missing", "media_cancelled",
+    "media_disk_full", "media_download_failed", "media_download_timeout", "media_helper_integrity_failed",
+    "media_helper_unavailable", "media_interrupted", "media_invalid_content", "media_invalid_range", "media_live_unsupported",
+    "media_queue_full", "media_resolve_failed", "media_resolve_timeout", "media_restricted",
+    "media_revision_conflict", "media_storage_corrupt", "media_unsupported_format", "media_unsupported_site",
     "memory_conflict", "memory_history_unavailable", "memory_original_text_layer_removed",
     "memory_request_conflict", "memory_snapshot_too_large", "memory_storage_failed",
     "message_id_conflict", "message_not_found", "message_payload_too_large",
     "message_scope_mismatch", "message_storage_failed", "missing_collision_descriptor",
     "missing_receipt", "missing_root", "missing_task", "missing_workflow_profile",
-    "model_integrity_failed", "model_too_large", "network_unavailable", "object_not_found",
+    "model_integrity_failed", "model_too_large", "music_capacity_exceeded",
+    "music_revision_conflict", "music_revision_exhausted", "music_storage_corrupt", "network_unavailable", "object_not_found",
     "object_record_too_large", "object_revision_conflict", "provider_not_ready",
     "remote_id_mismatch", "report_unserializable", "request_id_conflict", "request_rejected",
     "resident_history_unavailable", "resident_storage_failed", "response_too_large_or_unsafe",
-    "retry_unavailable", "revision_conflict", "runtime_unavailable", "signal_unavailable",
+    "retry_unavailable", "revision_conflict", "runtime_unavailable", "secret_in_input", "signal_unavailable",
     "size_intent_conflict", "size_intent_echo_conflict", "size_intent_shape_conflict",
-    "socket_outside_private_root",
     "socket_unavailable", "source_task_still_active", "state_value_too_large",
-    "storage_unavailable", "subject_revision_regression", "subscription_failed",
+    "storage_unavailable", "stream_limit_exceeded", "subject_revision_regression",
     "task_not_found", "terminal_remote_task", "too_many_facts", "unknown_method",
     "unsafe_download",
     "unsafe_endpoint_path", "unsafe_legacy_path", "unsafe_path", "unsupported_voice_provider",
-    "voice_backpressure", "voice_not_ready", "voice_protocol_error", "voice_provider_error",
+    "voice_backpressure", "voice_client_busy", "voice_not_ready", "voice_protocol_error", "voice_provider_error",
     "voice_session_not_found", "voice_timeout", "voice_transport_error",
     "worker_failed", "world_fact_unreadable", "world_id_mismatch", "world_record_too_large",
     "world_record_unreadable", "world_request_unreadable"
@@ -157,7 +166,6 @@ const ERROR_REASONS: &[(&str, &str)] = &[
     ("invalid_arguments", "参数不符合方法本身的要求"),
     ("storage_unavailable", "存储层不可用"),
     ("frame_too_large", "帧超过上限"),
-    ("incomplete_frame", "连接关闭时留下了半帧"),
     ("client_timeout", "写回超时"),
     ("client_disconnected", "客户端在写回前断开"),
     ("unknown_method", "请求的方法名不存在"),
@@ -188,8 +196,11 @@ pub fn describe() -> Value {
     json!({
         "authority": "gmgn-taskd",
         "note": "本契约由权威进程按自己的常量生成，MCP 面原样转述；这里没有任何一处是转述者写死的。错误码表是权威**全部**的错误词汇，reason 只给 MCP 面可能触及的那些，其余为 null（不替权威编一个含义）。",
-        "ipc": {
-            "framing": "newline-delimited JSON, one object per line",
+        "http_transport": {
+            "transport": "http",
+            "endpoint_version": 2,
+            "framing": "POST /rpc JSON; POST /events server-sent events",
+            "authentication": "Authorization: Bearer",
             "frame_limit_bytes": model::FRAME_LIMIT,
             "id_limit_bytes": world::TOKEN_LIMIT,
             "request_id_is_a_string": true,
@@ -256,10 +267,13 @@ mod tests {
         ("cli.rs", include_str!("cli.rs")),
         ("daemon.rs", include_str!("daemon.rs")),
         ("files.rs", include_str!("files.rs")),
+        ("http.rs", include_str!("http.rs")),
         ("main.rs", include_str!("main.rs")),
+        ("media.rs", include_str!("media.rs")),
         ("memory.rs", include_str!("memory.rs")),
         ("messages.rs", include_str!("messages.rs")),
         ("model.rs", include_str!("model.rs")),
+        ("music.rs", include_str!("music.rs")),
         ("provider.rs", include_str!("provider.rs")),
         ("resident.rs", include_str!("resident.rs")),
         ("store.rs", include_str!("store.rs")),
@@ -286,8 +300,10 @@ mod tests {
         "glb_container(",
         "object_text(",
         "failure(",
+        "reject(",
         "code:",
         "code =",
+        "set_state(",
     ];
 
     /// Every `"…"` on this line that looks like a code: lowercase snake_case,
@@ -322,10 +338,9 @@ mod tests {
     fn codes_the_authority_returns() -> BTreeSet<String> {
         let mut codes = BTreeSet::new();
         for (_, text) in AUTHORITY_SOURCES {
-            // Test-only literals are not part of the wire contract; the first
-            // `#[cfg(test)]` marks where the tests begin in every one of these
-            // files.
-            let text = match text.find("#[cfg(test)]") {
+            // Inline cfg(test) fields may precede production methods. Only the
+            // actual test module marks the end of the production vocabulary.
+            let text = match text.find("#[cfg(test)]\nmod tests") {
                 Some(at) => &text[..at],
                 None => text,
             };
@@ -335,6 +350,35 @@ mod tests {
                 }
                 for literal in shaped_literals(line) {
                     codes.insert(literal);
+                }
+            }
+            // HTTP status + error-code helpers are formatted across lines.
+            // Extract only the balanced reject(...) arguments (not surrounding
+            // branches), so rustfmt cannot hide a published HTTP error code.
+            for (start, _) in text.match_indices("reject(") {
+                let mut depth = 1usize;
+                let mut quoted = false;
+                let mut escaped = false;
+                let arguments = start + "reject(".len();
+                for (offset, byte) in text.as_bytes()[arguments..].iter().enumerate() {
+                    if quoted {
+                        if escaped { escaped = false; }
+                        else if *byte == b'\\' { escaped = true; }
+                        else if *byte == b'"' { quoted = false; }
+                        continue;
+                    }
+                    match byte {
+                        b'"' => quoted = true,
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                codes.extend(shaped_literals(&text[arguments..arguments + offset]));
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             // ASR maps typed core errors through a single static match helper;
@@ -361,7 +405,7 @@ mod tests {
             Some(model::SIZE_INTENT_MAX_METERS)
         );
         assert_eq!(
-            contract["ipc"]["frame_limit_bytes"].as_u64(),
+            contract["http_transport"]["frame_limit_bytes"].as_u64(),
             Some(model::FRAME_LIMIT as u64)
         );
         assert_eq!(

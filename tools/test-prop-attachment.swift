@@ -66,9 +66,12 @@ let geometrySource = try String(contentsOf: root.appendingPathComponent(
 let orientationSource = try String(contentsOf: root.appendingPathComponent(
     "apps/macos/Packages/WorldRuntime/Sources/WorldRuntime/WorldPropOrientation.swift"), encoding: .utf8)
     .replacingOccurrences(of: "import WorldRuntime", with: "")
-let gripInferenceSource = try String(contentsOf: root.appendingPathComponent(
+let triangleSource = try String(contentsOf: root.appendingPathComponent(
+    "apps/macos/Packages/WorldRuntime/Sources/WorldRuntime/TriangleMeshCollisionWorld.swift"), encoding: .utf8)
+    .components(separatedBy: "public struct TriangleMeshCollisionWorld")[0]
+let gripInferenceSource = triangleSource + "\n" + (try String(contentsOf: root.appendingPathComponent(
     "apps/macos/Sources/GMGNRadio/Presence/PropGripInference.swift"), encoding: .utf8)
-    .replacingOccurrences(of: "import WorldRuntime", with: "")
+    .replacingOccurrences(of: "import WorldRuntime", with: ""))
 // 被引用的那几个常量**逐字**从生产源码里抽出来：数字只有一个出处，那边改了这里立刻跟着变。
 let sizePolicySource = try String(contentsOf: root.appendingPathComponent(
     "apps/macos/Packages/WorldRuntime/Sources/WorldRuntime/WorldPropSizePolicy.swift"), encoding: .utf8)

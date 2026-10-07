@@ -23,8 +23,9 @@ func declaration(_ signature: String, _ text: String) -> String {
 }
 
 let app = try String(contentsOf: sources.appendingPathComponent("App/GMGNRadioApp.swift"), encoding: .utf8)
-let gate = "@MainActor\n" + declaration("final class MicrophoneAuthorizationGate", app)
-let setupError = declaration("enum RealtimeVoiceSetupError", app)
+let authorizationSource = try String(contentsOf: sources.appendingPathComponent("AudioEngine/MicrophoneAuthorizationGate.swift"), encoding: .utf8)
+let gate = "@MainActor\n" + declaration("final class MicrophoneAuthorizationGate", authorizationSource)
+let setupError = declaration("enum RealtimeVoiceSetupError", authorizationSource)
 let shutdown = declaration("func disconnectRealtimeVoice()", app)
 
 let harness = #"""

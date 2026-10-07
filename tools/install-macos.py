@@ -8,7 +8,8 @@ from pathlib import Path
 import plistlib
 import shutil
 import signal
-import socket
+import http.client
+import uuid
 import subprocess
 import sys
 import tempfile
@@ -31,13 +32,8 @@ def stage(timings, name):
             timings[name] = round(time.monotonic() - started, 3)
 
 
-# The daemon verification probe (see Runtime.verify) answers an empty
-# ``memory_status`` request with ``invalid_memory_status``. That is a
-# daemon-identity check — it proves the socket belongs to the freshly started
-# helper — not a memory-provider check, so it survives the removal of the
-# external VoiceMem provider layer. Fixed, safe failure string: a raw service
-# payload must never reach a log, an exception or a receipt.
-DAEMON_VERIFY_FAILED = 'New daemon memory interface verification failed'
+# Probe the authenticated HTTP authority, without logging service payloads.
+DAEMON_VERIFY_FAILED = 'New daemon HTTP interface verification failed'
 
 
 def _daemon_command_tails(root, sock):
@@ -45,10 +41,10 @@ def _daemon_command_tails(root, sock):
 
     Process replacement accepts these command lines and nothing else. A command
     that merely shares this prefix but adds any argument (including a duplicate
-    --root/--socket) is a different, untrusted process and must never be
+    --root/--endpoint-file) is a different, untrusted process and must never be
     signalled.
     """
-    base = f' --root {root} --socket {sock}'
+    base = f' --root {root} --endpoint-file {sock}'
     return (base,
             base + ' --concurrency 2',
             base + f' --concurrency 2 --legacy-root {root.parent / "PropGeneration"}')
@@ -58,18 +54,8 @@ def _daemon_commands(helper, root, sock):
     return {f'{helper}{tail}' for tail in _daemon_command_tails(root, sock)}
 
 
-def _valid_memory_probe_response(response):
-    """Whether a probe reply is the strict shape this installer expects.
-
-    The daemon under verification must answer the empty ``memory_status``
-    probe with the ``invalid_memory_status`` error object. Anything else --
-    top-level arrays/null/scalars, a missing or non-object ``error``, a wrong
-    id -- is an untrusted reply and must fail with a fixed, safe message.
-    """
-    if not isinstance(response, dict) or response.get('id') != 'install-probe':
-        return False
-    error = response.get('error')
-    return isinstance(error, dict) and error.get('code') == 'invalid_memory_status'
+def _valid_health_probe_response(response):
+    return isinstance(response, dict) and response == {"version": 2, "transport": "http"}
 
 
 class Runtime:
@@ -89,43 +75,56 @@ class Runtime:
             time.sleep(.1)
 
     def start(self, helper, root, sock):
-        return subprocess.Popen([str(helper), '--root', str(root), '--socket', str(sock),
+        return subprocess.Popen([str(helper), '--root', str(root), '--endpoint-file', str(sock),
                                  '--concurrency', '2', '--legacy-root', str(root.parent / 'PropGeneration')], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 start_new_session=True)
 
     def verify(self, child, sock, timeout):
         deadline = time.monotonic() + timeout
+        descriptor = Path(sock)
         while time.monotonic() < deadline:
             if child.poll() is not None:
                 raise RuntimeError('New daemon exited before verification')
+            connection = None
             try:
-                with socket.socket(socket.AF_UNIX) as connection:
-                    connection.settimeout(min(1, max(.01, deadline - time.monotonic())))
-                    connection.connect(str(sock))
-                    # Darwin sys/un.h: SOL_LOCAL=0, LOCAL_PEERPID=0x002.
-                    # Read before the peer can close after its reply.
-                    peer_pid = connection.getsockopt(0, 0x002)
-                    connection.sendall(b'{"id":"install-probe","method":"memory_status","params":{}}\n')
-                    with connection.makefile('rb') as stream:
-                        line = stream.readline(65536)
-                    try:
-                        response = json.loads(line)
-                    except ValueError:
-                        # A malformed frame is a fixed failure; the raw payload
-                        # must never reach an exception.
-                        raise RuntimeError(DAEMON_VERIFY_FAILED) from None
-                    # A live child alone does not prove it owns this socket.
-                    if peer_pid != child.pid:
-                        raise RuntimeError('Daemon socket belongs to a different process')
-                if not _valid_memory_probe_response(response):
+                endpoint = json.loads(descriptor.read_text())
+                host, port = endpoint['address'].rsplit(':', 1)
+                if endpoint.get('version') != 2 or host != '127.0.0.1' or not 0 < int(port) < 65536:
+                    raise RuntimeError(DAEMON_VERIFY_FAILED)
+                if uuid.UUID(endpoint['token']).version != 4:
+                    raise RuntimeError(DAEMON_VERIFY_FAILED)
+                # Retain exact process scope checks; a PID alone cannot prove
+                # that the installed helper owns this root and descriptor.
+                rows = self.processes()
+                expected = _daemon_commands(Path(child.args[0]), descriptor.parent, descriptor)
+                if not any(pid == child.pid and command in expected for pid, command in rows):
+                    raise RuntimeError('Daemon HTTP endpoint belongs to a different process')
+                owners = subprocess.check_output(['/usr/sbin/lsof', '-nP', '-a', '-iTCP:' + port,
+                                                  '-sTCP:LISTEN', '-t'], text=True).splitlines()
+                if str(child.pid) not in owners:
+                    raise RuntimeError('Daemon HTTP endpoint belongs to a different process')
+                connection = http.client.HTTPConnection(host, int(port), timeout=min(1, max(.01, deadline - time.monotonic())))
+                connection.request('GET', '/health', headers={'Authorization': 'Bearer ' + endpoint['token']})
+                response = connection.getresponse()
+                body = response.read(65537)
+                if response.status != 200 or len(body) > 65536:
+                    raise RuntimeError(DAEMON_VERIFY_FAILED)
+                if not _valid_health_probe_response(json.loads(body)):
                     raise RuntimeError(DAEMON_VERIFY_FAILED)
                 if child.poll() is not None:
                     raise RuntimeError('New daemon exited after verification')
                 return
-            except OSError:
+            except FileNotFoundError:
                 time.sleep(.1)
-        raise RuntimeError('New daemon socket verification timed out')
+            except (ValueError, KeyError, TypeError, http.client.HTTPException):
+                raise RuntimeError(DAEMON_VERIFY_FAILED) from None
+            except (OSError, subprocess.CalledProcessError):
+                time.sleep(.1)
+            finally:
+                if connection is not None:
+                    connection.close()
+        raise RuntimeError('New daemon HTTP verification timed out')
 
     def stop_child(self, child, timeout):
         if child.poll() is None:
@@ -437,7 +436,7 @@ def install(source, destination, root, runtime=None, timeout=15, timings=None, l
         with stage(timings, 'validate_destination'):
             validate(destination, require_helper=False)
     runtime = runtime or Runtime()
-    sock = root / 'taskd.sock'
+    sock = root / 'taskd.endpoint.json'
     destination.parent.mkdir(parents=True, exist_ok=True)
     workspace = Path(tempfile.mkdtemp(prefix='.gmgn-install-', dir=destination.parent))
     staged, backup = workspace / 'staged.backup', workspace / 'previous.backup'

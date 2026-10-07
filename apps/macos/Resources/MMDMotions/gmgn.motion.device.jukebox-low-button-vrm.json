@@ -1,0 +1,23 @@
+{
+  "id": "gmgn.motion.device.jukebox-low-button-vrm",
+  "name": "低位按钮操作",
+  "format": "vrma",
+  "entry": "gmgn.motion.device.jukebox-low-button-vrm.vrma",
+  "version": "1.0.0",
+  "loop": false,
+  "playbackRate": 1,
+  "inPlace": false,
+  "sha256": "21fd47e1196992bda62d879e02f049b9264dc37128e67397f384a1f8f034703d",
+  "derivation": {
+    "sourceID": "gmgn.motion.bones.arpg.pickup-standing-vrm",
+    "sourceSHA256": "5e6533db48408a08f8ecd6d49dd6d387259b38b52d18193d74a49881ff93031f",
+    "contactSeconds": 1.54,
+    "pressEndSeconds": 1.84,
+    "durationSeconds": 3.38,
+    "phases": [
+      "reach",
+      "press-hold",
+      "retract"
+    ]
+  }
+}

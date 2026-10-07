@@ -1,116 +1,108 @@
-# Unity macOS media / chat host
+# Unity macOS host
 
-Build with `bash tools/build-unity-media-host.sh` from the repository root.
-Output: `tmp/unity-media-host/DerivedData/Build/Products/Release/UnityMediaHost.dylib`.
-The build reuses the existing package lock and never installs an application.
+Unity owns rendering and simple chat/playback controls. The independent GPUI settings
+window owns product configuration; `settings.open` opens it. The host reuses original
+music, conversation, presence, shortcuts, speech, screens and world services. It does
+not start a second AppDelegate/GPUI product host/SceneKit renderer. The resident loop
+is connected to the shared world session; construction alone does not prove activity.
 
-This host constructs `AudioGraphController`, `LocalMusicPlayer`, and the real
-`RenderHostResidentConversation` DSH adapter. It does not construct `AppDelegate`,
-`GPUIProductHost`, `GPUIRenderHost`, SceneKit surfaces, or world autonomy loops.
-Existing renderer sources remain compile-time dependencies in this first sample.
+## Build and data boundaries
 
-Call the C ABI in `UnityMediaHost.h` on the macOS main thread. Supply an explicit
-absolute sample data root and a dedicated `ai.gmgn.unity-sample.*` defaults suite.
-No production music session store or Keychain is constructed. DSH uses its existing
-managed native transport and credentials; the UI accepts no API key.
+Run `bash tools/build-unity-media-host.sh` from the repository root. Output:
+`tmp/unity-media-host/DerivedData/Build/Products/Release/UnityMediaHost.dylib`.
+Package only a fresh sample App with `bash tools/package-unity-media-host.sh <absolute-app-path>`.
+This includes newly built GPUI settings and Rust `gmgn-taskd`, reuses resolved packages,
+rejects installed/non-sample Apps and repeated host overwrites, preserves Unity
+provenance before signing, and does not launch the App.
 
-Commands are UTF-8 JSON, at most 256 KiB:
+macOS Unity now defaults to the product Application Support base
+(`~/Library/Application Support`), not a per-build world tree. Services retain their
+own existing subdirectories. `GMGN_UNITY_DATA_ROOT` explicitly overrides this base.
+The ABI requires an absolute non-root path and an `ai.gmgn.unity-sample.*` defaults
+suite. The current UI uses `ai.gmgn.unity-sample.player.preferences`. A dedicated
+defaults suite does **not** isolate filesystem data. Tests must use a fresh explicit
+root and must not connect production sockets or replay production jobs.
 
-- `music.load`: absolute `path`, optional real local `lyricPath` (LRC), `autoplay`.
-- `music.choose`: nonblocking native audio-file picker; automatically loads and
-  plays selected real files as a queue and adjacent same-basename `.lrc` files.
-- `music.queue`: `paths` of absolute real files, optional `index` (default 0),
-  `autoplay`. `music.next` and `music.previous` switch this retained queue.
-- `music.play`, `music.pause`, `music.stop`.
-- `music.volume`: numeric `value` in 0–1.
-- `chat.send`: integer `requestID`, string `text`.
-- `chat.cancel`: integer `requestID`.
+Music reads existing account/library sources (optionally
+`GMGN_UNITY_MUSIC_LIBRARY_ROOT`) with a Unity session overlay and nonpersistent web
+cookies. Explicit Unity disconnects preserve original sessions. Speech reads original
+TTS/ASR preferences only as fallback when no local override exists; explicit saves
+use the supplied defaults. Snapshot credentials are presence-only. DSH uses its
+existing native credentials; Codex uses the formal installed adapter and current CLI
+identity. Backend selection neither logs in nor copies identity; login/logout are
+explicit GPUI actions. No second production write authority or Keychain-backed
+account store is created by the Unity host.
 
-Snapshot shape: `{version:1,music:{playbackSessionID,title,duration,position,
-isPlaying,volume,seekSupported,lyricRevision,features,notice},chat:{events,state}}`.
-Music features are `amplitude/low/mid/high/beat/onset`. Position comes from the
-actual AVAudioPlayerNode sample clock. `lines:[{id,text,start,end}]` appears once
-per lyric revision, including an empty array to clear the previous song. Unity
-must retain the timeline until the next revision. Every snapshot consumes chat
-events; use one polling owner and dispatch to UI consumers. Free every returned
-UTF-8 snapshot with `gmgn_unity_host_string_free`.
+## ABI and connected interfaces
 
-Known sample gaps: seeking is explicitly unsupported; provider library/search selection
-is not implemented here. Chat reports accepted/delta/final reply/failure/
-cancelled with request IDs and sequence numbers. These gaps are not represented
-as successful or simulated functionality.
+Call `UnityMediaHost.h` on the macOS main thread. Commands are UTF-8 JSON, at most
+256 KiB. Free returned strings with `gmgn_unity_host_string_free`. Use one native
+snapshot polling owner: chat events and changed lyric timelines are consumed on
+publication. Retain/distribute them to consumers. GPUI's separate settings snapshot
+does not drain these events.
 
-Chat capabilities explicitly expose `streamingReplies:true`, `deltaTextMode:"replace"`,
-`cancelActiveReply:true`, `cancellationAcknowledgement:"local-turn-invalidated"`
-and `providerCancellationAcknowledgement:false`. The cancellation event confirms
-the local turn was invalidated and its native connector closed; it does not claim
-a remote provider cancellation acknowledgement or that the child process has
-already exited. UI should finish the matching request on `cancelled`, preserve
-the recovered draft from `chat.state.draft`, and reject late replies by request ID.
-Each `delta` event contains the cumulative genuine ACP text received so far;
-replace the matching message text, do not append. Final `reply` carries the
-complete response and ends the request. Cumulative text preserves correctness
-when bounded event polling drops intermediate updates. No final response is
-split into invented deltas. Native transport filters active session and prompt
-ownership; the bridge additionally filters request ID and generation after cancel.
+- Music: local load/file picker/queue/play/pause/stop/volume/next/previous, actual
+  provider library/playlist selection and playback, account connection and sync.
+  Provider libraries are no longer placeholders. Queue bounds fail without wrapping.
+  Seeking remains unsupported.
+- Chat: `chat.send {requestID,text}`, `chat.cancel {requestID}`; DSH/Codex selection
+  changes the real backend. Installed choices are probed; unavailable saved choices
+  are not reported active. Genuine cumulative deltas replace current message text.
+  Cancellation confirms local invalidation, not remote acknowledgement/process exit.
+  Read actual streamed/final delivery capabilities; do not invent streamed deltas.
+- Speech: Rust TTS/ASR settings/catalog/preview, reply reading and microphone
+  `voice.press/release/cancel`. Permission/capture/recognition failures are explicit.
+  Transcript delivery is not evidence of completed resident action.
+- Presence: original package/motion import/select/remove/catalog/download and orb
+  appearance. `selection` carries revision, actual avatar/motion paths and appearance;
+  Unity returns `presence.runtime.result {revision,success}`. Pending failures restore
+  original selection. Orb, PMX/VMD and official UniVRM VRM/VRMA adapters are present;
+  successful Unity compilation does not establish visual correctness for user assets.
+- Shortcuts: formal coordinator/capture/reset/global/media controls. Music actions
+  use the real player. Ordered UI toggles use `uiIntents` and `ui.intent.ack`.
+- Lyrics/visuals: original parser/12 themes/eight point-cloud choices, actual rhythm,
+  artwork and particle scale. Retain real translated/word-timed data only when present.
+  Lyrics use the actual AVAudioPlayerNode clock, not a synthetic playback clock.
+- Video/screens: `video.load/choose/select/remove/play/pause/stop/mode/brightness` and
+  `screen.list/play/stop`. Select starts playback through the original video store.
+  GPUI reads `settings.video`; Unity reads `screenVideo` with borrowed Metal textures.
+  Screens must be placed/enabled in the current authoritative world. Original native
+  link resolution is reused. Destroy Unity texture consumers before host teardown.
+- Basic objects/wishes: formal device templates/authority placement, wish coordinator,
+  generation configuration and inventory receipts. `generation.load/save/check`
+  configures the same store as the wish machine; save/check does not start generation.
+  Generated output, claim, inventory registration, resident arrival and rendered-loop
+  receipts remain distinct stages.
 
-Validation: Release host build passed. `abi-smoke.c` passed real dylib load,
-creation, isolated snapshot, volume bounds, unsupported-seek rejection and
-destruction. It sends no chat request and plays no audio, so this check does not
-replace real Unity playback/chat acceptance. Compile the smoke executable with
-`clang apps/macos/UnityHost/abi-smoke.c -o tmp/unity-media-host/abi-smoke`; pass the
-absolute dylib path and a fresh isolated root, with `DYLD_FRAMEWORK_PATH` set to
-the Release products directory.
+## Authority and remaining gaps
 
-Package a fresh sample App using `bash tools/package-unity-media-host.sh` followed
-by its absolute path inside this repository's `tmp` directory. The script rejects
-installed/non-sample Apps and repeated host overwrites. Unity CLI's optional
-`unity-build.provenance.json` at the App root is preserved byte-for-byte in a
-unique adjacent `tmp/unity-build.provenance.*.json` before signing; root-level
-extra files otherwise cause Apple's unsealed-bundle signature rejection.
+Rust remains the sole world persistence authority. Swift adopts/projects its real
+state and Unity renders it; there is no parallel writable world archive. Resident
+music/wish/screen/autonomy tools share the same world context and current-session
+leases. A tool success or authority commit does not prove visible arrival/placement.
 
-Optional fourth smoke-test argument is a real local audio path. It validates the
-actual audio graph play/pause/resume/stop clock, briefly producing audio. The
-pause regression check passed with the existing real music cache: 0.673 seconds
-before pause, 0.673 while paused, 0.998 after resume, 0 after stop. Unity window
-acceptance remains a separate check.
+The space bridge accepts explicit registered complete package roots and uses formal
+`WorldPackageValidator` manifest/resource hash/path validation. A selection request
+does not persist preference; actual world-session and renderer success must acknowledge
+the matching revision. Host switch/ack and GPUI capability/key alignment are still
+being integrated, and arbitrary user-world switching is not runtime-accepted here.
 
-Snapshot also exposes `canNext`, `canPrevious`, `queueIndex`, `queueCount` and
-`queue:[{index,title}]`; boundary commands fail without wrapping. Each queue
-switch increments playback session and lyric revision and clears previous lyrics.
-Actual-component smoke tests with two different existing music-cache MP3s passed
-next/previous, real sample-clock advancement, session changes and boundaries.
+Old `MarbleWorldLibrary` public/account SPZ caches are not complete authority packages.
+`LivingWorldBootstrap` reads an already-adopted Marble cabin, but provides no automatic
+SPZ-to-complete-package exporter. Full old Marble selection/generation parity remains
+incomplete until conversion, validation, registration and renderer acknowledgement are
+implemented. Screen geometry calibration also lacks formal metadata/CAS persistence;
+the bridge reports failure rather than saving a private in-memory override.
 
-Full lyric transport preserves Swift `StageLyricsParser` output: each line has
-`id/text/translation/startsAt/endsAt/words`, each word has `id/text/startsAt/endsAt`.
-Legacy line `start/end` fields remain alongside canonical timing fields.
-Optional neighboring `<basename>.translation.lrc` and `<basename>.yrc` supply
-real translated / word-timed lyric inputs when present. Missing inputs stay absent;
-the existing LRC parser's timing behavior is preserved.
+## Verification boundaries
 
-`music.lyricVisual` projects the original configured/resolved mode and actual
-`StageAITheme` colors, with `revision`, `configuredMode`, `mode`, `theme` and
-`availableModes`. Existing `stage.player.lyrics` with `id` changes the configured
-mode through authenticated external GPUI settings, not a duplicate Unity toggle.
-`settings.open` opens that independent settings process. Its read-only snapshot
-does not drain chat events or single-publication lyric timelines.
+Bridge regressions, GPUI tests and Release builds passed during migration; these are
+source/service checks, not acceptance of the latest packaged App. Earlier ABI/audio
+clock smoke results are historical. Current integration is debugging startup and still
+requires fresh runtime evidence for world/GPU/speech/VRM/screen/resident workflows.
 
-The GPUI window also receives the live eight-mode point-cloud catalog and size
-setting, the Unity session's resident persona, and Rust TTS/ASR configuration.
-Speech catalogs and voice previews use the packaged `gmgn-taskd`, with a TCP
-endpoint under the explicit Unity root's `TaskService` directory. They do not
-load the original app's speech preferences or endpoint. Only credential presence
-crosses the snapshot; replacement credentials are command inputs.
-The persona is reread and injected into the isolated DSH prompt on every turn.
-Music accounts reuse the real account clients and official web login. Unity
-uses a nonpersistent web cookie store and an isolated session overlay; disconnect
-persists a Unity-only tombstone, leaving original sessions intact. Synchronization
-fetches provider libraries and verifies the isolated `music-library.json` before
-publishing the new library to Unity. Reply reading and microphone capture are not
-connected to Unity yet. Avatar, shortcuts, videos, space activities and generated-space
-settings remain explicitly unavailable in this external window; the original
-GPUI product continues to own their complete settings.
-
-Unity caches the complete timeline only at session/lyric-revision boundaries and
-passes it to `GpuLyricsView`; it drives playback from the authoritative native
-audio clock. Unsupported GPU modes remain explicitly reported as unmigrated.
+Compile `abi-smoke.c` with
+`clang apps/macos/UnityHost/abi-smoke.c -o tmp/unity-media-host/abi-smoke`.
+Pass the absolute dylib path and fresh explicit root with `DYLD_FRAMEWORK_PATH` set to
+Release products. Ordinary smoke sends no chat and plays no audio; its optional real
+audio argument produces sound and requires deliberate runtime-test authorization.

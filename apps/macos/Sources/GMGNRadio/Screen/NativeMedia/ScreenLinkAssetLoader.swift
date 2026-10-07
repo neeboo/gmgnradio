@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import UniformTypeIdentifiers
 
 // MARK: - 给 AVPlayer 的媒体请求带上**服务端要求的请求头**
 
@@ -27,10 +28,18 @@ final class ScreenLinkAssetLoader: NSObject, AVAssetResourceLoaderDelegate, URLS
     /// 给 AVFoundation 看的自定义 scheme。它只活在内存里，永不落盘。
     static let scheme = "gmgnstream"
     /// 每次向源站取的有界块大小。见类型注释：整文件 Range 会被 403。
-    static let chunkSize: Int64 = 4 * 1024 * 1024
+    // Fresh public YouTube AVC/AAC streams accept 1 MiB but reject 4 MiB with HTTP 403.
+    static let chunkSize: Int64 = 1024 * 1024
+    static func boundedChunkLength(offset: Int64, remaining: Int64, total: Int64?) -> Int64 {
+        min(max(0, remaining), min(chunkSize, total.map { max(0, $0 - offset) } ?? chunkSize))
+    }
 
     private let originalURL: URL
     private let headers: [String: String]
+    private let failureLock = NSLock()
+    private var failedHTTPStatus: Int?
+    private var knownContentLength: Int64?
+    var lastHTTPStatus: Int? { failureLock.withLock { failedHTTPStatus } }
     /// 诊断标签（格式 id）。**不是地址**。
     private let tag: String
     private var session: URLSession!
@@ -38,12 +47,11 @@ final class ScreenLinkAssetLoader: NSObject, AVAssetResourceLoaderDelegate, URLS
     private let debugEnabled =
         ProcessInfo.processInfo.environment["GMGN_SCREEN_LINK_DEBUG"] == "1"
 
-    init(originalURL: URL, headers: [String: String], tag: String = "") {
+    init(originalURL: URL, headers: [String: String], tag: String = "", configuration: URLSessionConfiguration = .ephemeral) {
         self.originalURL = originalURL
         self.headers = headers
         self.tag = tag
         super.init()
-        let configuration = URLSessionConfiguration.ephemeral
         configuration.httpShouldSetCookies = false
         configuration.httpCookieAcceptPolicy = .never
         configuration.httpCookieStorage = nil
@@ -61,11 +69,11 @@ final class ScreenLinkAssetLoader: NSObject, AVAssetResourceLoaderDelegate, URLS
         return components.url
     }
 
-    private static func originalURL(from custom: URL) -> URL? {
+    private func originalURL(from custom: URL) -> URL? {
         guard var components = URLComponents(url: custom, resolvingAgainstBaseURL: false) else {
             return nil
         }
-        components.scheme = "https"
+        components.scheme = originalURL.scheme
         return components.url
     }
 
@@ -86,15 +94,23 @@ final class ScreenLinkAssetLoader: NSObject, AVAssetResourceLoaderDelegate, URLS
         shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
     ) -> Bool {
         guard let requestURL = loadingRequest.request.url,
-              let target = Self.originalURL(from: requestURL)
+              let target = originalURL(from: requestURL)
         else { return false }
         let box = RequestBox(loadingRequest, target: target)
         if let info = loadingRequest.contentInformationRequest {
             // 先用 2 字节探内容信息（Content-Type / 总长度 / 是否支持 Range）。
-            fetch(target: target, offset: 0, length: 2) { [weak self] response, _ in
+            fetch(target: target, offset: 0, length: 2) { [weak self] response, _, failure in
                 guard let self else { return }
+                if let failure { loadingRequest.finishLoading(with: failure); return }
                 if let response {
-                    if let mime = response.mimeType { info.contentType = mime }
+                    guard let mime = response.mimeType, let type = UTType(mimeType: mime),
+                          !type.isDynamic, (type.conforms(to: .audiovisualContent) || type == .m3uPlaylist) else {
+                        loadingRequest.finishLoading(with: NSError(domain: AVFoundationErrorDomain,
+                            code: AVError.Code.fileFormatNotRecognized.rawValue))
+                        return
+                    }
+                    // AVFoundation requires a UTI here, not the HTTP MIME string.
+                    info.contentType = type.identifier
                     info.isByteRangeAccessSupported = response.statusCode == 206
                         || (response.value(forHTTPHeaderField: "Accept-Ranges")?.contains("bytes") ?? false)
                     info.contentLength = Self.totalLength(from: response) ?? response.expectedContentLength
@@ -130,6 +146,11 @@ final class ScreenLinkAssetLoader: NSObject, AVAssetResourceLoaderDelegate, URLS
         newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
+        if headers.keys.contains(where: { $0.caseInsensitiveCompare("Authorization") == .orderedSame }),
+           request.url?.scheme != originalURL.scheme || request.url?.host != originalURL.host || request.url?.port != originalURL.port {
+            completionHandler(nil)
+            return
+        }
         var redirected = request
         for (key, value) in headers { redirected.setValue(value, forHTTPHeaderField: key) }
         completionHandler(redirected)
@@ -158,13 +179,18 @@ final class ScreenLinkAssetLoader: NSObject, AVAssetResourceLoaderDelegate, URLS
             request.finishLoading()
             return
         }
-        let length = min(remaining == Int64.max ? Self.chunkSize : remaining, Self.chunkSize)
-        fetch(target: box.target, offset: offset, length: length) { [weak self] response, data in
+        let total = failureLock.withLock { knownContentLength }
+        let length = Self.boundedChunkLength(offset: offset, remaining: remaining, total: total)
+        guard length > 0 else { request.finishLoading(); return }
+        fetch(target: box.target, offset: offset, length: length) { [weak self] response, data, failure in
             guard let self else { return }
             guard !request.isCancelled else { request.finishLoading(); return }
+            if let failure { request.finishLoading(with: failure); return }
+            let total = response.flatMap { Self.totalLength(from: $0)
+                ?? ($0.statusCode == 200 && $0.expectedContentLength >= 0 ? $0.expectedContentLength : nil) }
             guard let data, !data.isEmpty else {
-                // 源站没有更多字节（或出错）：按 AVFoundation 的语义就是到此为止。
-                request.finishLoading()
+                if let total, offset >= total { request.finishLoading() }
+                else { request.finishLoading(with: NSError(domain: NSURLErrorDomain, code: NSURLErrorNetworkConnectionLost)) }
                 return
             }
             // 200（服务器忽略 Range）时只有第一块能直接用；后续块需要自己切片。
@@ -175,10 +201,15 @@ final class ScreenLinkAssetLoader: NSObject, AVAssetResourceLoaderDelegate, URLS
             } else {
                 slice = data
             }
-            guard !slice.isEmpty else { request.finishLoading(); return }
+            guard !slice.isEmpty else {
+                if let total, offset >= total { request.finishLoading() }
+                else { request.finishLoading(with: NSError(domain: NSURLErrorDomain, code: NSURLErrorNetworkConnectionLost)) }
+                return
+            }
             dataRequest.respond(with: slice)
             let advanced = Int64(slice.count)
             let nextRemaining = remaining == Int64.max ? Int64.max : remaining - advanced
+            if let total, offset + advanced >= total { request.finishLoading(); return }
             self.serveChunk(
                 box, dataRequest: dataRequest, offset: offset + advanced, remaining: nextRemaining
             )
@@ -188,13 +219,14 @@ final class ScreenLinkAssetLoader: NSObject, AVAssetResourceLoaderDelegate, URLS
     @discardableResult
     private func fetch(
         target: URL, offset: Int64, length: Int64,
-        completion: @escaping @Sendable (HTTPURLResponse?, Data?) -> Void
+        completion: @escaping @Sendable (HTTPURLResponse?, Data?, NSError?) -> Void
     ) -> URLSessionDataTask {
         var request = URLRequest(url: target)
         for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
         let end = offset + max(length, 1) - 1
         request.setValue("bytes=\(offset)-\(end)", forHTTPHeaderField: "Range")
-        let task = session.dataTask(with: request) { [debugEnabled, tag] data, response, error in
+        if debugEnabled { NSLog("[ScreenLinkRequest] originalTarget=%d offset=%lld length=%lld headers=%ld", target.absoluteString == originalURL.absoluteString ? 1 : 0, offset, length, headers.count) }
+        let task = session.dataTask(with: request) { [weak self, debugEnabled, tag] data, response, error in
             if debugEnabled {
                 let status = (response as? HTTPURLResponse)?.statusCode ?? -1
                 let mime = (response as? HTTPURLResponse)?.mimeType ?? "-"
@@ -203,7 +235,23 @@ final class ScreenLinkAssetLoader: NSObject, AVAssetResourceLoaderDelegate, URLS
                     + "error=\((error as NSError?)?.code ?? 0)\n"
                 FileHandle.standardError.write(Data(message.utf8))
             }
-            completion(response as? HTTPURLResponse, data)
+            let http = response as? HTTPURLResponse
+            if let http, let total = Self.totalLength(from: http), total > 0 {
+                self?.failureLock.withLock { self?.knownContentLength = total }
+            }
+            let failure: NSError?
+            if let http, http.statusCode != 200 && http.statusCode != 206 {
+                let status = (100...599).contains(http.statusCode) ? http.statusCode : -1
+                self?.failureLock.withLock { self?.failedHTTPStatus = status }
+                NSLog("[ScreenLinkHTTP] status=%ld", status)
+                failure = NSError(domain: "GMGNScreenLinkHTTPErrorDomain", code: status)
+            } else if let error = error as NSError? {
+                failure = NSError(domain: NSURLErrorDomain,
+                    code: error.domain == NSURLErrorDomain ? error.code : NSURLErrorUnknown)
+            } else if http == nil {
+                failure = NSError(domain: NSURLErrorDomain, code: NSURLErrorBadServerResponse)
+            } else { failure = nil }
+            completion(http, data, failure)
         }
         task.resume()
         return task

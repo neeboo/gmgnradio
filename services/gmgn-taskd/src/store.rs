@@ -1,5 +1,5 @@
 use crate::{
-    files, memory, messages,
+    files, memory, messages, music,
     model::{self, Job, Result, Stored, Submit, MODEL_LIMIT, PNG_LIMIT},
     resident, world,
 };
@@ -17,6 +17,7 @@ type Command = Box<dyn FnOnce(&mut Store) + Send>;
 pub struct Database {
     tx: mpsc::Sender<Command>,
     pub changed: watch::Sender<u64>,
+    pub root: PathBuf,
 }
 pub struct Store {
     pub connection: Connection,
@@ -26,6 +27,7 @@ pub struct Store {
 
 impl Database {
     pub fn open(root: PathBuf, legacy: Option<PathBuf>) -> Result<Self> {
+        let database_root = root.clone();
         let (tx, rx) = mpsc::channel::<Command>();
         let (changed, _) = watch::channel(0);
         let change = changed.clone();
@@ -52,7 +54,7 @@ impl Database {
             })
             .map_err(|_| "storage_unavailable")?;
         ready_rx.recv().map_err(|_| "storage_unavailable")??;
-        Ok(Self { tx, changed })
+        Ok(Self { tx, changed, root: database_root })
     }
     pub async fn call<T: Send + 'static>(
         &self,
@@ -73,7 +75,9 @@ impl Database {
 /// Version 1 is the original job/event/message schema. Its DDL is idempotent
 /// (`IF NOT EXISTS`) so opening an existing install records version 1 without
 /// touching any row. Version 2 adds the resident state/event/message tables.
-/// Version 3 adds the memory storage tables (memory-storage-v1). Every step
+/// Version 3 adds memory, version 4 world authority, and version 5 music
+/// programs/playlists/import markers; version 6 adds public-video media cache
+/// metadata and persistent playback lists on the same connection. Every step
 /// commits inside its own transaction; a failed step rolls back and leaves the
 /// database at its previous version, so an upgrade failure never corrupts an
 /// existing store.
@@ -113,6 +117,12 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     }
     if applied < 4 {
         apply_step(connection, 4, "world-authority-v1", world::schema)?;
+    }
+    if applied < 5 {
+        apply_step(connection, 5, "music-storage-v1", music::schema)?;
+    }
+    if applied < 6 {
+        apply_step(connection, 6, "public-video-cache-v1", crate::media::schema)?;
     }
     Ok(())
 }
@@ -1069,8 +1079,8 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        // v4 adds world-authority-v1 (world_records/world_facts/world_blobs/...).
-        assert_eq!(version, 4);
+        // v5 adds music authority without changing previous stored rows.
+        assert_eq!(version, 6);
         // v1 rows and the full old message contract survive untouched.
         let jobs: i64 = connection
             .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))
