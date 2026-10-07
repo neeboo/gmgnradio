@@ -30,6 +30,9 @@ class Handler(BaseHTTPRequestHandler):
     send({'id':i,'result':{'started':True,'sessionID':sid}})
     if p.get('text')=='drop':return
     if m=='voice_tts_start':
+     if p.get('text')=='burst':
+      for index in range(64):send({'voice_event':{'sessionID':sid,'type':'audio','audioBase64':base64.b64encode(bytes([index,0])*16384).decode(),'sampleRate':24000,'channels':1,'encoding':'pcm16le'}})
+      send({'voice_event':{'sessionID':sid,'type':'finished'}});return
      for chunk in [bytes([255]),bytes([127,0,128])]:send({'voice_event':{'sessionID':sid,'type':'audio','audioBase64':base64.b64encode(chunk).decode(),'sampleRate':24000,'channels':1,'encoding':'pcm16le'}})
      send({'voice_event':{'sessionID':sid,'type':'finished'}});return
     if p.get('voiceID')=='never-ready':time.sleep(2);return
@@ -68,6 +71,20 @@ import Foundation
   check(a.sessionID==tts.sessionID && a.sampleRate==24000 && a.channels==1 && a.encoding=="pcm16le","session and format")
   check(Data(base64Encoded:a.audioBase64!)==Data([255]) && Data(base64Encoded:b.audioBase64!)==Data([127,0,128]),"odd chunk remains lossless")
   tts.close()
+  let burst=try await client.startTTS(text:"burst",configuration:.init(apiKey:"fixture-memory-only"))
+  try await Task.sleep(for:.milliseconds(150))
+  for index in 0..<64 {
+   let event=try await burst.nextEvent()
+   check(event.type=="audio" && Data(base64Encoded:event.audioBase64!)==Data(Array(repeating:[UInt8(index),UInt8(0)],count:16384).flatMap{$0}),"fast synthesis survives slow PCM consumption losslessly")
+   try await Task.sleep(for:.milliseconds(10))
+  }
+  check(try await burst.nextEvent().type=="finished","burst terminal is retained behind audio")
+  burst.close()
+  let blocked=try await client.startTTS(text:"burst",configuration:.init(apiKey:"fixture-memory-only"))
+  try await Task.sleep(for:.milliseconds(150))
+  let cancelStarted=Date();blocked.close()
+  do {_ = try await blocked.nextEvent();fatalError("cancelled burst returned queued PCM")}
+  catch {check(error is CancellationError && Date().timeIntervalSince(cancelStarted)<1,"cancellation releases producer pressure and discards buffered PCM")}
   let dropped=try await client.startTTS(text:"drop",configuration:.init(apiKey:"fixture"))
   do {_ = try await dropped.nextEvent();fatalError("closed provider accepted")}
   catch {check(!(error is CancellationError),"remote failure must not masquerade as user cancellation")}

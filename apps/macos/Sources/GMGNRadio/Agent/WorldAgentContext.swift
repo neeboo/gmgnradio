@@ -404,8 +404,12 @@ final class WorldAgentContext {
         }
         seatProjections = seats
         propActivities = rebuilt
+        // Registered device anchors intentionally replace their authored
+        // definitions. Including both copies makes ActivityCatalog reject the
+        // entire merge, silently dropping dynamic seat/capability contracts.
         combinedActivityCatalog = try? ActivityCatalog(
-            definitions: authoredActivityCatalog.definitions + rebuilt.values.map(\.definition)
+            definitions: authoredActivityCatalog.definitions.filter { rebuilt[$0.id] == nil }
+                + rebuilt.values.map(\.definition)
         )
     }
 

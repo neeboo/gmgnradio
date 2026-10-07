@@ -231,7 +231,6 @@ struct RustVoiceEvent: Decodable, Sendable {
         let inbox = self.inbox
         let transport = TaskdHTTPTransport(streaming: true, maximumBytes: Self.frameLimit, receive: { inbox.receive($0) }, completion: { inbox.finish($0 ?? RustVoiceError.unavailable) })
         stream = transport
-        inbox.setTransport(transport)
         transport.start(request)
         let reply = try await readObject()
         guard reply["id"] as? String == id else { throw RustVoiceError.invalidFrame }
@@ -337,15 +336,12 @@ struct RustVoiceEvent: Decodable, Sendable {
 
 /// Bounded SSE inbox. No provider credentials are retained or logged.
 private final class TaskdVoiceHTTPInbox: @unchecked Sendable {
-    private let lock = NSLock()
+    private let lock = NSCondition()
     private var pending: [Data] = []
     private var bytes = 0
     private var event = Data()
     private var error: Error?
     private var waiter: CheckedContinuation<Data, Error>?
-    private weak var transport: TaskdHTTPTransport?
-    private var paused = false
-    func setTransport(_ transport: TaskdHTTPTransport) { lock.lock(); self.transport = transport; lock.unlock() }
     func receive(_ line: Data) {
         var line = line
         if line.last == 13 { line.removeLast() }
@@ -369,9 +365,17 @@ private final class TaskdVoiceHTTPInbox: @unchecked Sendable {
         lock.lock()
         guard error == nil else { lock.unlock(); return }
         if let waiter { self.waiter = nil; lock.unlock(); waiter.resume(returning: data); return }
-        guard bytes + data.count <= 256 * 1024 else { lock.unlock(); finish(RustVoiceError.invalidFrame); return }
+        guard data.count <= 256 * 1024 else { lock.unlock(); finish(RustVoiceError.invalidFrame); return }
+        // URLSession suspend is asynchronous: its current delegate callback can
+        // already contain many SSE events. Apply pressure at this producer
+        // boundary so a synthesis burst cannot overflow or discard valid PCM.
+        // The delegate queue is separate from the main-actor playback consumer.
+        while error == nil && bytes + data.count > 256 * 1024 { lock.wait() }
+        guard error == nil else { lock.unlock(); return }
+        // A consumer can drain the queue and install its next continuation
+        // while this producer is waiting to reacquire the condition lock.
+        if let waiter { self.waiter = nil; lock.unlock(); waiter.resume(returning: data); return }
         pending.append(data); bytes += data.count
-        if !paused, bytes >= 128 * 1024 { paused = true; transport?.pause() }
         lock.unlock()
     }
     func finish(_ error: Error) {
@@ -387,6 +391,7 @@ private final class TaskdVoiceHTTPInbox: @unchecked Sendable {
         }()
         lock.lock()
         if self.error == nil { self.error = error }
+        lock.broadcast()
         if error is CancellationError { pending.removeAll(); bytes = 0; event.removeAll() }
         let waiter = waiter; self.waiter = nil; lock.unlock()
         waiter?.resume(throwing: error)
@@ -397,7 +402,7 @@ private final class TaskdVoiceHTTPInbox: @unchecked Sendable {
             lock.lock()
             if !pending.isEmpty {
                 let data = pending.removeFirst(); bytes -= data.count
-                if paused, bytes < 128 * 1024 { paused = false; transport?.resume() }
+                lock.broadcast()
                 lock.unlock(); continuation.resume(returning: data)
             }
             else if let error { lock.unlock(); continuation.resume(throwing: error) }

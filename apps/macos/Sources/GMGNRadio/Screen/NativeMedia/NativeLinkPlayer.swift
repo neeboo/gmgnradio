@@ -110,6 +110,12 @@ final class NativeLinkPlayer: NativeScreenMediaPlaying {
     var onStateChange: (@MainActor (NativeScreenPlaybackState) -> Void)?
     var onPlaybackEnded: (@MainActor () -> Void)?
     private var endObserver: NSObjectProtocol?
+    private(set) var playbackEndCount = 0
+    var durationSeconds: Double? {
+        guard let item = player?.currentItem else { return nil }
+        let seconds = CMTimeGetSeconds(item.duration)
+        return seconds.isFinite && seconds > 0 ? seconds : nil
+    }
 
     let descriptor: NativeScreenMediaDescriptor
 
@@ -309,6 +315,9 @@ final class NativeLinkPlayer: NativeScreenMediaPlaying {
             object: item, queue: .main) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self,self.frameGeneration == generation else {return}
+                self.playbackEndCount += 1
+                NSLog("[ScreenPlayback] event=natural_end position=%.3f duration=%.3f live=%d", self.currentSeconds,
+                      self.durationSeconds ?? -1, self.descriptor.isLive)
                 self.onPlaybackEnded?()
             }
         }

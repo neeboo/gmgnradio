@@ -38,6 +38,7 @@ final class SeatSnapshot: WorldStatePersisting, @unchecked Sendable {
         }
         var state = try decoder.decode(WorldState.self, from: stateData)
         state.activeActivity = nil // An isolated test cannot adopt a running renderer lease.
+        state.agentTransform = manifest.spawn // Local copy only: verify actual approach from a different position.
         let sofaID = "wish-prop-72c0e260-3789-4bd7-8fc3-0ecbcb3867b1"
         var sofa = state.objectStates[sofaID]!
         sofa.isEnabled = true
@@ -62,7 +63,34 @@ final class SeatSnapshot: WorldStatePersisting, @unchecked Sendable {
         precondition(moved.seatCalibration!.resolve(objectID: sofaID, state: moved) == nil)
         let collision = MarbleLivingCabinCollisionWorld(environment: TriangleMeshCollisionWorld(triangles: triangles),
             props: CollisionVolumeWorld(volumes: manifest.collisionVolumes))
-        let context = try WorldAgentContext(manifest: manifest, persistence: SeatSnapshot(state), initialCollisionWorld: collision)
+        // Use the actual production function-point sources. These device
+        // activities are also authored in the manifest; merging duplicates
+        // previously discarded the dynamic seat catalog and froze enter.
+        let sources = try ["jukebox.json","wish-machine.json"].compactMap { file in
+            try JSONDecoder().decode(WorldProceduralPropDeclaration.self,
+                from: Data(contentsOf: package.appendingPathComponent(file))).functionSource
+        }
+        let context = try WorldAgentContext(manifest: manifest, persistence: SeatSnapshot(state),
+            propFunctionSources: sources, initialCollisionWorld: collision)
+        precondition(context.isRegisteredFunctionPointActivity("music.listen")
+            || context.isRegisteredFunctionPointActivity("wish_machine.collect"),
+            "Regression must include a real registered device that duplicates an authored activity ID")
+        precondition(context.activityCatalog.definition(id: calibrated.activityID)?.contract(for: .enter)?.durationSeconds == 0.2,
+            "Dynamic seat enter contract must survive registered device merge")
+        precondition(context.activityCatalog.definition(id: calibrated.activityID)?.contract(for: .loop)?.motionIDs
+            .contains("gmgn.motion.bones.chair-sit-loop-pmx") == true)
+        let authored = try ActivityCatalog(manifest: manifest)
+        let registered = context.propAnchorRegistry.registeredActivityIDs.compactMap { authored.definition(id: $0) }
+        precondition(!registered.isEmpty)
+        for _ in 0..<2 {
+            do {
+                _ = try ActivityCatalog(definitions: authored.definitions + registered
+                    + [context.activityCatalog.definition(id: calibrated.activityID)!])
+                fatalError("The previous concatenation must reproduce the duplicate-device catalog rejection")
+            } catch ActivityCatalogError.duplicateActivityID(let id) {
+                precondition(registered.contains { $0.id == id })
+            }
+        }
         precondition(context.snapshot.activities.contains { $0.id == calibrated.activityID && $0.seat == calibrated })
         let start = context.state.agentTransform.position
         try context.startActivity(id: calibrated.activityID)
@@ -86,8 +114,17 @@ final class SeatSnapshot: WorldStatePersisting, @unchecked Sendable {
         precondition(bridge.acknowledgeProjection(receipt))
         try context.stopActivity()
         precondition(context.activeSeatProjection == nil)
+        let alreadyArrived = try WorldAgentContext(manifest: manifest, persistence: SeatSnapshot(context.state),
+            propFunctionSources: sources, initialCollisionWorld: collision)
+        try alreadyArrived.startActivity(id: calibrated.activityID)
+        precondition(alreadyArrived.runningActivity?.phase == .enter)
+        for _ in 0..<12 { try alreadyArrived.tick(deltaTime: 1.0/30) }
+        precondition(alreadyArrived.runningActivity?.phase == .loop,
+            "The formal already-arrived case must leave enter instead of remaining at idle indefinitely")
+        try alreadyArrived.stopActivity()
         state.objectStates[sofaID]!.isEnabled = false
-        let withdrawn = try WorldAgentContext(manifest: manifest, persistence: SeatSnapshot(state), initialCollisionWorld: collision)
+        let withdrawn = try WorldAgentContext(manifest: manifest, persistence: SeatSnapshot(state),
+            propFunctionSources: sources, initialCollisionWorld: collision)
         precondition(!withdrawn.snapshot.activities.contains { $0.id == calibrated.activityID })
         do { try withdrawn.startActivity(id: calibrated.activityID); fatalError("Withdrawn sofa must reject") }
         catch WorldAgentContextError.unknownActivity(_) { }

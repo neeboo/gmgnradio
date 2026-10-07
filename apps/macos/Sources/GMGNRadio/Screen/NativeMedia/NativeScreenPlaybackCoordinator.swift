@@ -76,6 +76,8 @@ final class NativeScreenPlaybackCoordinator {
         let pixelWidth: Int
         let pixelHeight: Int
         let currentSeconds: Double
+        let durationSeconds: Double?
+        let playbackEndCount: Int
         let itemStatus: Int
         let isLive: Bool
         /// 声音链的真实读数：静音开关 / 音量 / 速率 + 解码 PCM 采样（tap）。
@@ -109,6 +111,8 @@ final class NativeScreenPlaybackCoordinator {
             pixelWidth: player.pixelWidth,
             pixelHeight: player.pixelHeight,
             currentSeconds: player.currentSeconds,
+            durationSeconds: player.durationSeconds,
+            playbackEndCount: player.playbackEndCount,
             itemStatus: player.itemStatus,
             isLive: session.isLive,
             hasAudio: player.hasAudio,
@@ -378,12 +382,14 @@ final class NativeScreenPlaybackCoordinator {
                 self.stop(objectID)
                 return
             }
+            NSLog("[ScreenPlaylist] event=advance_requested index=%ld count=%ld revision=%ld", playlist.currentIndex, playlist.items.count, playlist.revision)
             self.sessions[objectID]?.advancing=true
             self.sessions[objectID]?.task?.cancel()
             self.sessions[objectID]?.task=Task { @MainActor [weak self] in
                 guard let self else {return}
                 do {
                     let advanced=try await self.cache.advancePlaylist(playlistID:playlist.playlistID,revision:playlist.revision)
+                    NSLog("[ScreenPlaylist] event=advance_received index=%ld count=%ld revision=%ld", advanced.currentIndex, advanced.items.count, advanced.revision)
                     let next=ScreenVideoPlaylist(playlistID:advanced.playlistID,revision:advanced.revision,
                         currentIndex:advanced.currentIndex,items:advanced.items,
                         truncated:playlist.truncated,itemLimit:playlist.itemLimit)
@@ -395,6 +401,7 @@ final class NativeScreenPlaybackCoordinator {
                     _ = await self.play(objectID:objectID,pageURL:next.currentURL!,quadProvider:quadProvider,continuingPlaylist:next)
                 } catch {
                     guard self.isCurrent(objectID,generation) else {return}
+                    NSLog("[ScreenPlaylist] event=advance_failed code=%@", (error as? ScreenMediaCacheError)?.code ?? "media_playlist_failed")
                     self.finishFailure(objectID,generation,.nativeLink(NativeLinkFailureInfo(
                         panelText:"播放列表下一条打不开。",technicalDescription:(error as? ScreenMediaCacheError)?.code ?? "media_playlist_failed")))
                 }

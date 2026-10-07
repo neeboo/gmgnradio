@@ -345,6 +345,21 @@ import simd
          "brightness": videos.brightness, "notice": notice,
          "currentTrackID": track?.id as Any? ?? NSNull(), "currentTrackTitle": track?.title as Any? ?? NSNull(),
          "boundAssetID": track.flatMap { videos.boundAsset(for: $0.id)?.id } as Any? ?? NSNull(),
+         "screens": screens.objectIDs.map { id -> [String: Any] in
+             let session = screens.snapshot(for: id), metric = screens.metrics(for: id)
+             return ["objectID": id, "state": Self.safeStateText(session?.state ?? .idle),
+                     "currentSeconds": metric?.currentSeconds as Any? ?? NSNull(),
+                     "durationSeconds": metric?.durationSeconds as Any? ?? NSNull(),
+                     "playbackRate": metric?.playbackRate as Any? ?? NSNull(),
+                     "timeControlStatus": metric?.timeControlStatus as Any? ?? NSNull(),
+                     "waitingReason": metric?.waitingReason as Any? ?? NSNull(),
+                     "decodedFrames": metric?.decodedFrames as Any? ?? NSNull(),
+                     "playbackEndCount": metric?.playbackEndCount as Any? ?? NSNull(),
+                     "isLive": metric?.isLive as Any? ?? NSNull(),
+                     "playlistIndex": session?.playlist?.currentIndex as Any? ?? NSNull(),
+                     "playlistCount": session?.playlist?.items.count as Any? ?? NSNull(),
+                     "playlistRevision": session?.playlist?.revision as Any? ?? NSNull()]
+         },
          "pendingBoundVideo": prompt.map { ["id": $0.id, "trackID": $0.trackID, "trackTitle": $0.trackTitle,
                                               "assetID": $0.asset.id, "assetName": $0.asset.displayName] } as Any? ?? NSNull()]
     }

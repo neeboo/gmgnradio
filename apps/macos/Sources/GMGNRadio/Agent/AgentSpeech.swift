@@ -293,6 +293,8 @@ final class AgentSpeechAnnouncer {
                     isSpeaking = false; operation = nil
                 }
             }
+            var receivedAudioFrames = 0
+            var receivedPCMBytes = 0
             do {
                 let opened = try await start(text, settings)
                 stream = opened
@@ -309,6 +311,8 @@ final class AgentSpeechAnnouncer {
                               let pcm = Data(base64Encoded: encoded), !pcm.isEmpty, pcm.count <= 32_768 else {
                             throw RustVoiceError.invalidFrame
                         }
+                        receivedAudioFrames += 1
+                        receivedPCMBytes += pcm.count
                         if !beganPlayback {
                             try player.begin { [weak self] state in
                                 guard let self, self.generation == identity else { return }
@@ -329,12 +333,31 @@ final class AgentSpeechAnnouncer {
                 }
             } catch {
                 guard generation == identity, !Task.isCancelled, !(error is CancellationError) else { return }
+                NSLog("[RustSpeech] failure=%@ audioFrames=%d audioSeconds=%.3f",
+                      Self.failureDiagnostic(error), receivedAudioFrames, Double(receivedPCMBytes) / 48_000)
                 statusStore.lastErrorMessage = (error as? LocalizedError)?.errorDescription
                     ?? "语音朗读失败，请检查语音设置；文字回复不受影响。"
                 resolve(identity, .failed)
             }
         }
         return true
+    }
+    /// Only protocol categories and bounded machine codes can enter logs;
+    /// provider payloads, text, URLs and credential-bearing error messages cannot.
+    static func failureDiagnostic(_ error: Error) -> String {
+        switch error {
+        case RustVoiceError.invalidFrame: return "voice_invalid_frame"
+        case RustVoiceError.unavailable: return "voice_unavailable"
+        case RustVoiceError.rejected(let code):
+            let safe = !code.isEmpty && code.utf8.count <= 64 && code.utf8.allSatisfy {
+                (97...122).contains($0) || (48...57).contains($0) || $0 == 95
+            }
+            return "voice_rejected_" + (safe ? code : "redacted")
+        case TaskdHTTPError.invalidFrame: return "http_invalid_frame"
+        case TaskdHTTPError.timedOut: return "http_timed_out"
+        case TaskdHTTPError.unavailable: return "http_unavailable"
+        default: return "speech_output_failure"
+        }
     }
     func stopSpeaking() {
         generation = UUID()

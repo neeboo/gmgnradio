@@ -6,6 +6,7 @@ are covered independently. No installed app, formal DB or system audio access.
 Compile is the existing probe's single-job swiftc, never SwiftPM.
 """
 import http.server
+import argparse
 import json
 import os
 import pathlib
@@ -17,6 +18,10 @@ import uuid
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--split", action="store_true", help="Exercise the real separate-track composition EOF path")
+    parser.add_argument("--hls", action="store_true", help="Exercise finite VOD HLS natural EOF")
+    options = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="gmgn-screen-playlist-") as temporary:
         private = pathlib.Path(temporary)
         video = private / "short.mp4"
@@ -27,6 +32,25 @@ def main():
                         "-c:a", "aac", "-movflags", "+faststart", str(video)], check=True)
         token = str(uuid.uuid4())
         ids = ["aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc", "ddddddddddd"]
+        live_resources = {}
+        manifests = {}
+        if options.hls:
+            manifest_file = private / "vod.m3u8"
+            subprocess.run(["/opt/homebrew/bin/ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "1",
+                            "-i", str(video), "-c", "copy", "-hls_time", "1", "-hls_playlist_type", "vod",
+                            str(manifest_file)], check=True)
+            for video_id in ids:
+                capability, resource = str(uuid.uuid4()), str(uuid.uuid4())
+                path = f"/media-live/{capability}/{resource}"
+                rows = []
+                for line in manifest_file.read_text().splitlines():
+                    if line and not line.startswith("#"):
+                        segment = f"/media-live/{capability}/{uuid.uuid4()}"
+                        live_resources[segment] = ((private / line).read_bytes(), "video/mp2t")
+                        line = segment
+                    rows.append(line)
+                live_resources[path] = (("\n".join(rows) + "\n").encode(), "application/vnd.apple.mpegurl")
+                manifests[video_id] = path
         pages = ["https://www.youtube.com/watch?v=" + video_id for video_id in ids]
         calls, queues = [], {}
         lock = threading.Lock()
@@ -72,6 +96,13 @@ def main():
                             url="/media/" + video_id + "/video", formatID="fixture", container="mp4",
                             videoCodec="avc1", audioCodec="mp4a", width=320, height=180,
                             isManifest=False, hasVideo=True, hasAudio=True, headers={})))
+                    if options.split:
+                        result["streamingDescriptor"]["audio"] = dict(
+                            result["streamingDescriptor"]["video"],
+                            url="/media/" + video_id + "/audio", hasVideo=False)
+                    if options.hls:
+                        result["streamingDescriptor"]["video"].update(
+                            url=manifests[video_id], isManifest=True, container="m3u8")
                 elif method in ("media_release", "media_cancel"):
                     result = dict(released=True)
                 else:
@@ -84,6 +115,14 @@ def main():
                 self.wfile.write(payload)
 
             def do_GET(self):
+                if self.path in live_resources:
+                    data, content_type = live_resources[self.path]
+                    self.send_response(200)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
                 assert self.headers.get("Authorization") == "Bearer " + token
                 assert self.path.startswith("/media/")
                 size = video.stat().st_size
