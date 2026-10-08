@@ -1,71 +1,383 @@
-//! Native stage panels. Catalogs, availability and every mutation belong to the host.
-use crate::ui_tokens as ui;
-use crate::i18n::{UiLocale, settings_copy, player_choice_label};
+//! Native stage panels. Catalogs, availability and every mutation belong to the
+//! host; this layer only presents them.
+//!
+//! The stage settings surface is the original `StageVisualPickerView`
+//! (`apps/macos/Sources/GMGNRadio/VisualEngine/StageOverlayView.swift:2716-3351`,
+//! plus `StageControlPanelLayout` / `StageVisualPickerGroup` /
+//! `StageControlPanelTab` / `StageActivityAvailability` at `:2629-2713`)
+//! rebuilt on gpui-kit.
+//!
+//! Shape of the surface, and why it is split this way:
+//!
+//! - **Four partitions, in the original order** — 播放器 / 空间 / 角色 / 活动.
+//!   The set and the order live in [`STAGE_TABS`], the initial choice in
+//!   [`initial_tab`]; the render reads them instead of spelling its own list.
+//! - **The grouping order inside a partition is the original's**, not the order
+//!   the widgets happen to be written in: [`visible_groups`] returns the
+//!   `StageVisualPickerGroup` sequence for a mode, and the render iterates it.
+//! - **This is the right-hand popup.** One fixed header row (title + mode), the
+//!   segmented partition picker, then exactly one scrolling content area, so no
+//!   amount of scrolling can push the partition choice or the mode readout out of
+//!   the panel. The host already clamps the popup to the original 590×458
+//!   (`StageControlPanelLayout.maximumWidth/.maximumHeight`); the pane fills the
+//!   frame it is given and never grows past those maxima, so a smaller window
+//!   shrinks the panel instead of clipping it.
+//! - **Nothing here reads `cx.theme()`.** Every colour, size and gap is a token:
+//!   [`crate::ui_tokens::scene`] for chrome the overlay panels share,
+//!   [`crate::primitives`] for type roles, and [`crate::ui_tokens::stage`] for
+//!   the numbers that only exist in the original picker. A light system theme can
+//!   never invert a panel that floats over the rendered space.
+//! - Controls are kit components: `Button` with an explicit custom variant (so
+//!   resting/hover/pressed chrome is fixed rather than theme-derived), kit
+//!   `Slider`, kit segmented `TabBar`/`Tab`, kit `Icon`, kit `PopupMenu` for the
+//!   world and video submenus. Nothing here is a bare `div` pretending to be a
+//!   control.
+use crate::i18n::{UiLocale, player_choice_label, settings_copy};
+use crate::primitives as ui;
+use crate::ui_tokens as doc;
+use crate::ui_tokens::scene as s;
+use gpui_kit::assets::IconName as AssetIcon;
 use gpui_kit::component::{
     button::*,
     menu::*,
     slider::{Slider, SliderEvent, SliderState},
+    tab::{Tab, TabBar},
     *,
 };
+use gpui_kit::prelude::{FluentBuilder as _, InteractiveElement as _, StatefulInteractiveElement as _};
 use gpui_kit::*;
 use serde_json::{Value, json};
 
 mod program;
 mod props;
-pub use program::{StageProgramRailPane, ProgramMaterialFrame, ProgramMaterialCard};
+pub use program::{ProgramMaterialCard, ProgramMaterialFrame, StageProgramRailPane};
 pub use props::ResidentPropEditorPane;
 
-pub const STAGE_PANEL_WIDTH: f32 = 590.;
-pub const STAGE_PANEL_HEIGHT: f32 = 458.;
+/// The stage panels' surface readings now live in [`crate::ui_tokens::stage`]
+/// (with [`crate::ui_tokens::props`] and [`crate::ui_tokens::program`] for the
+/// two sub-panels). They were moved there verbatim from this file's local
+/// `metrics` module on 2026-10-08 so each surface has **one** copy: `ui_tokens`
+/// carries the numbers together with their Swift source, and this file only
+/// references them through the alias below.
+use crate::ui_tokens::stage as metrics;
+
+/// The original's panel width/height ceilings (`StageControlPanelLayout`). The
+/// host clamps the popup to these; the pane only ever shrinks below them.
+pub const STAGE_PANEL_WIDTH: f32 = metrics::PANEL_MAX_WIDTH;
+pub const STAGE_PANEL_HEIGHT: f32 = metrics::PANEL_MAX_HEIGHT;
+
+/// The four partitions, in `StageControlPanelTab.allCases` order
+/// (`StageOverlayView.swift:2659-2681`). These are the original's own labels and
+/// stay literal.
+pub const STAGE_TABS: [&str; 4] = ["播放器", "空间", "角色", "活动"];
+
+/// One icon per [`STAGE_TABS`] entry, in the same order. The partition picker is
+/// a control, and controls in this layer are icon-only: the words live in the
+/// tab's accessibility label and tooltip, never on its face.
+pub const STAGE_TAB_ICONS: [AssetIcon; 4] = [
+    AssetIcon::Play,
+    AssetIcon::Globe,
+    AssetIcon::CircleUser,
+    AssetIcon::Calendar,
+];
+
+/// `StageVisualPickerMode` (`:2629-2636`): derived from whether the world
+/// presentation was requested, never stored locally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StageMode {
+    Player,
+    Space,
+}
+
+impl StageMode {
+    pub fn resolve(is_world_requested: bool) -> Self {
+        if is_world_requested {
+            Self::Space
+        } else {
+            Self::Player
+        }
+    }
+
+    /// Index into [`STAGE_TABS`].
+    pub fn tab(self) -> usize {
+        match self {
+            Self::Player => 0,
+            Self::Space => 1,
+        }
+    }
+}
+
+/// `StageVisualPickerGroup` (`:2638-2657`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VisualGroup {
+    WorldSelection,
+    AvatarPlacement,
+    LoadingStatus,
+    LyricsEffects,
+    PointCloud,
+    ParticleSize,
+    MusicVideo,
+}
+
+/// `StageVisualPickerGroup.visibleGroups(for:)`: the groups a mode shows, **in
+/// the original's order**. A local reordering renders a different panel.
+pub fn visible_groups(mode: StageMode) -> &'static [VisualGroup] {
+    match mode {
+        StageMode::Space => &[
+            VisualGroup::WorldSelection,
+            VisualGroup::AvatarPlacement,
+            VisualGroup::LoadingStatus,
+        ],
+        StageMode::Player => &[
+            VisualGroup::LyricsEffects,
+            VisualGroup::PointCloud,
+            VisualGroup::ParticleSize,
+            VisualGroup::MusicVideo,
+        ],
+    }
+}
+
+/// `StageControlPanelTab.initial(for:isRadioPluginEnabled:)` (`:2665-2671`).
+///
+/// With the radio plugin off (the default) **every** entry point lands on
+/// 「空间」; with it on, space mode lands on space and everything else on the
+/// player. The four partitions stay selectable either way.
+pub fn initial_tab(is_radio_plugin_enabled: bool, mode: StageMode) -> usize {
+    if !is_radio_plugin_enabled {
+        return StageMode::Space.tab();
+    }
+    mode.tab()
+}
+
+/// `StageControlPanelTab` from a host tab name (`select_tab`). Unknown names keep
+/// the original default: 「空间」.
+pub fn tab_for_name(name: &str) -> usize {
+    match name {
+        "player" => 0,
+        "motions" => 2,
+        "activities" => 3,
+        _ => 1,
+    }
+}
+
+/// `StageActivityAvailability.canRun(isWorldVisible:selectedWorldID:activityWorldID:)`
+/// (`:2706-2712`): the world must be visible **and** be the world the activity
+/// belongs to. A world that is merely requested does not qualify.
+pub fn activity_can_run(
+    is_world_visible: bool,
+    selected_world_id: Option<&str>,
+    activity_world_id: Option<&str>,
+) -> bool {
+    is_world_visible && selected_world_id.is_some() && selected_world_id == activity_world_id
+}
+
+/// `StageActivityAvailability.unavailableMessage` (`:2697-2704`).
+pub fn activity_unavailable_message(
+    is_world_visible: bool,
+    is_world_requested: bool,
+) -> &'static str {
+    if is_world_visible {
+        "这个空间还没有配置生活活动。"
+    } else if is_world_requested {
+        "空间载入完成后可选择活动。"
+    } else {
+        "进入空间后可选择生活活动。"
+    }
+}
+
+/// The mode readout under the title (`:2747`).
+pub fn mode_readout(mode: StageMode) -> &'static str {
+    match mode {
+        StageMode::Space => "正在空间中",
+        StageMode::Player => "正在播放器中",
+    }
+}
+
+/// `GridItem(.adaptive(minimum:))`: how many equal columns fit in `available`
+/// with `spacing` between them. SwiftUI picks the largest count whose minimum
+/// still fits; at least one column always exists.
+pub fn adaptive_columns(minimum: f32, available: f32, spacing: f32) -> usize {
+    if minimum <= 0. || !available.is_finite() || !spacing.is_finite() || available <= 0. {
+        return 1;
+    }
+    (((available + spacing) / (minimum + spacing)).floor() as usize).max(1)
+}
+
+/// The width one adaptive column gets, so a tile fills the grid exactly.
+pub fn adaptive_tile_width(minimum: f32, available: f32, spacing: f32) -> f32 {
+    let columns = adaptive_columns(minimum, available, spacing) as f32;
+    ((available - spacing * (columns - 1.)) / columns).max(1.)
+}
+
+/// The grid width the original lays tiles into: the panel minus the outer 7 pt
+/// (:2792) and inner 16 pt (:2780) insets.
+pub fn grid_width() -> f32 {
+    metrics::PANEL_MAX_WIDTH - 2. * metrics::PANEL_OUTER_PADDING - 2. * metrics::PANEL_PADDING
+}
+
+/// `loadingStatusGroup` (`:3012-3032`), in the original's evaluation order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorldStatus<'a> {
+    /// `isWorldPresentationRequested && !isWorldVisible`.
+    Loading,
+    /// `marbleLibrary.generationMessage`.
+    Generating(&'a str),
+    /// `marbleLibrary.errorMessage`.
+    Failed(&'a str),
+}
+
+/// The first of the three states that applies. A requested-but-invisible world
+/// wins over both messages — otherwise a failed load would render as a
+/// successful one.
+pub fn world_loading_status<'a>(
+    is_world_requested: bool,
+    is_world_visible: bool,
+    generation_message: Option<&'a str>,
+    error_message: Option<&'a str>,
+) -> Option<WorldStatus<'a>> {
+    if is_world_requested && !is_world_visible {
+        return Some(WorldStatus::Loading);
+    }
+    if let Some(message) = generation_message.filter(|s| !s.trim().is_empty()) {
+        return Some(WorldStatus::Generating(message));
+    }
+    if let Some(message) = error_message.filter(|s| !s.trim().is_empty()) {
+        return Some(WorldStatus::Failed(message));
+    }
+    None
+}
+
+/// Whether a motion belongs to the selected category. An empty selection is
+/// 「全部」 and keeps every motion.
+pub fn motion_in_category(motion: &Value, category: &str) -> bool {
+    category.is_empty() || motion["category"].as_str() == Some(category)
+}
+
+/// The selected index of the category picker: 0 is 「全部」, then the categories
+/// in the host's order. A category the host no longer lists falls back to 全部
+/// rather than selecting a different category.
+pub fn motion_category_index(category: &str, categories: &[Value]) -> usize {
+    if category.is_empty() {
+        return 0;
+    }
+    categories
+        .iter()
+        .position(|entry| entry["id"].as_str() == Some(category))
+        .map_or(0, |index| index + 1)
+}
+
+/// Which notice — if any — the motion list shows. The original checks the
+/// unfiltered list first, then the loader's notice, and only then the empty
+/// category (`:2862-2868`); getting that order wrong hides a real failure.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MotionNotice<'a> {
+    Empty,
+    ListNotice(&'a str),
+    CategoryEmpty,
+    None,
+}
+
+pub fn motion_notice<'a>(
+    total: usize,
+    visible: usize,
+    category: &str,
+    list_notice: Option<&'a str>,
+) -> MotionNotice<'a> {
+    if total == 0 {
+        return MotionNotice::Empty;
+    }
+    if let Some(notice) = list_notice.filter(|s| !s.is_empty()) {
+        return MotionNotice::ListNotice(notice);
+    }
+    if visible == 0 && !category.is_empty() {
+        return MotionNotice::CategoryEmpty;
+    }
+    MotionNotice::None
+}
 
 pub(crate) fn style_choice_accessibility(title: &str, name: &str, selected: bool) -> (Role, String) {
-    (Role::Button, format!("{title}：{name}{}", if selected { "，已选择" } else { "" }))
+    (
+        Role::Button,
+        format!("{title}：{name}{}", if selected { "，已选择" } else { "" }),
+    )
 }
-pub(crate) fn player_section_includes(section:&str,key:&str)->bool{
-    match section{"歌词"=>key=="lyrics","视觉效果"=>key=="clouds","视频"=>key=="videoModes",_=>true}
+pub(crate) fn player_section_includes(section: &str, key: &str) -> bool {
+    match section {
+        "歌词" => key == "lyrics",
+        "视觉效果" => key == "clouds",
+        "视频" => key == "videoModes",
+        _ => true,
+    }
 }
 
-fn video_asset_actions(player:&Value,asset:&Value)->Vec<(&'static str,Value,bool)>{
-    let id=asset["id"].clone();
-    let active=player["videoActive"].as_bool()==Some(true)&&player["videoAssetID"]==id;
-    let mut actions=vec![(if active{"取消加载"}else{"加载"},json!({"op":"stage.video.toggle","id":id}),false)];
-    if player["trackID"].as_str().is_some_and(|s|!s.is_empty()){
-        let bound=player["boundVideoID"]==id;
-        actions.push((if bound{"解除当前歌曲绑定"}else{"绑定到当前歌曲"},json!({"op":if bound{"stage.video.unbind"}else{"stage.video.bind"},"id":id}),false));
+fn video_asset_actions(player: &Value, asset: &Value) -> Vec<(&'static str, Value, bool)> {
+    let id = asset["id"].clone();
+    let active = player["videoActive"].as_bool() == Some(true) && player["videoAssetID"] == id;
+    let mut actions = vec![(
+        if active { "取消加载" } else { "加载" },
+        json!({"op":"stage.video.toggle","id":id}),
+        false,
+    )];
+    if player["trackID"].as_str().is_some_and(|s| !s.is_empty()) {
+        let bound = player["boundVideoID"] == id;
+        actions.push((
+            if bound {
+                "解除当前歌曲绑定"
+            } else {
+                "绑定到当前歌曲"
+            },
+            json!({"op":if bound{"stage.video.unbind"}else{"stage.video.bind"},"id":id}),
+            false,
+        ));
     }
-    actions.push(("移出素材库",json!({"op":"stage.video.remove","id":id}),true));
+    actions.push(("移出素材库", json!({"op":"stage.video.remove","id":id}), true));
     actions
 }
-pub(crate) fn video_authority_notice(player:&Value)->Option<&str> {
-    player["videoNotice"].as_str().filter(|s|!s.trim().is_empty())
+pub(crate) fn video_authority_notice(player: &Value) -> Option<&str> {
+    player["videoNotice"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
 }
+
 #[cfg(test)]
-mod video_menu_tests{
-    use super::{video_asset_actions,video_authority_notice};
+mod video_menu_tests {
+    use super::{video_asset_actions, video_authority_notice};
     use serde_json::json;
     #[test]
-    fn asset_submenu_preserves_active_toggle_and_bound_track_commands(){
-        let actions=video_asset_actions(&json!({"videoActive":true,"videoAssetID":"asset","trackID":"track","boundVideoID":"asset"}),&json!({"id":"asset"}));
-        assert_eq!(actions[0].0,"取消加载");
-        assert_eq!(actions[0].1,json!({"op":"stage.video.toggle","id":"asset"}));
-        assert_eq!(actions[1].0,"解除当前歌曲绑定");
-        assert_eq!(actions[1].1["op"],"stage.video.unbind");
-        assert_eq!(actions[2].0,"移出素材库");assert!(actions[2].2);
+    fn asset_submenu_preserves_active_toggle_and_bound_track_commands() {
+        let actions = video_asset_actions(
+            &json!({"videoActive":true,"videoAssetID":"asset","trackID":"track","boundVideoID":"asset"}),
+            &json!({"id":"asset"}),
+        );
+        assert_eq!(actions[0].0, "取消加载");
+        assert_eq!(actions[0].1, json!({"op":"stage.video.toggle","id":"asset"}));
+        assert_eq!(actions[1].0, "解除当前歌曲绑定");
+        assert_eq!(actions[1].1["op"], "stage.video.unbind");
+        assert_eq!(actions[2].0, "移出素材库");
+        assert!(actions[2].2);
     }
     #[test]
-    fn no_track_omits_binding_and_inactive_asset_loads(){
-        let actions=video_asset_actions(&json!({"videoActive":false}),&json!({"id":"asset"}));
-        assert_eq!(actions.len(),2);assert_eq!(actions[0].0,"加载");
-        assert_eq!(actions[1].1,json!({"op":"stage.video.remove","id":"asset"}));
-        let actions=video_asset_actions(&json!({"trackID":"track","boundVideoID":"other"}),&json!({"id":"asset"}));
-        assert_eq!(actions[1].0,"绑定到当前歌曲");assert_eq!(actions[1].1["op"],"stage.video.bind");
+    fn no_track_omits_binding_and_inactive_asset_loads() {
+        let actions = video_asset_actions(&json!({"videoActive":false}), &json!({"id":"asset"}));
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].0, "加载");
+        assert_eq!(actions[1].1, json!({"op":"stage.video.remove","id":"asset"}));
+        let actions = video_asset_actions(
+            &json!({"trackID":"track","boundVideoID":"other"}),
+            &json!({"id":"asset"}),
+        );
+        assert_eq!(actions[1].0, "绑定到当前歌曲");
+        assert_eq!(actions[1].1["op"], "stage.video.bind");
     }
     #[test]
-    fn video_authority_failure_is_projected_without_inventing_success(){
-        let waiting=json!({"videoNotice":"视频执行状态待核验；未重放旧动作。"});
-        assert_eq!(video_authority_notice(&waiting),Some("视频执行状态待核验；未重放旧动作。"));
-        assert_eq!(video_authority_notice(&json!({"videoNotice":null})),None);
-        assert_eq!(video_authority_notice(&json!({"videoNotice":"  "})),None);
+    fn video_authority_failure_is_projected_without_inventing_success() {
+        let waiting = json!({"videoNotice":"视频执行状态待核验；未重放旧动作。"});
+        assert_eq!(
+            video_authority_notice(&waiting),
+            Some("视频执行状态待核验；未重放旧动作。")
+        );
+        assert_eq!(video_authority_notice(&json!({"videoNotice":null})), None);
+        assert_eq!(video_authority_notice(&json!({"videoNotice":"  "})), None);
     }
 }
 
@@ -88,21 +400,30 @@ impl StagePanelsPane {
             .into_iter()
             .map(|(min, max)| cx.new(|_| SliderState::new().min(min).max(max).step(0.01)))
             .collect();
-        let subscriptions = sliders.iter().enumerate().map(|(i,slider)|cx.subscribe(slider,move|this,_,event:&SliderEvent,cx| {
-            if this.syncing { return; }
-            if let SliderEvent::Change(value) = event {
-                let command = match i {
-                    0..=2=>json!({"op":"stage.avatar.position","axis":(["X","Y","Z"][i]),"value":value.start()}),
-                    3=>json!({"op":"stage.player.particles","value":value.start()}),
-                    _=>json!({"op":"stage.video.brightness","value":value.start()}),
-                };
-                this.commands.push(command); cx.notify();
-            }
-        })).collect();
+        let subscriptions = sliders
+            .iter()
+            .enumerate()
+            .map(|(i, slider)| {
+                cx.subscribe(slider, move |this, _, event: &SliderEvent, cx| {
+                    if this.syncing {
+                        return;
+                    }
+                    if let SliderEvent::Change(value) = event {
+                        let command = match i {
+                            0..=2 => json!({"op":"stage.avatar.position","axis":(["X","Y","Z"][i]),"value":value.start()}),
+                            3 => json!({"op":"stage.player.particles","value":value.start()}),
+                            _ => json!({"op":"stage.video.brightness","value":value.start()}),
+                        };
+                        this.commands.push(command);
+                        cx.notify();
+                    }
+                })
+            })
+            .collect();
         Self {
             snapshot: Value::Null,
             commands: vec![json!({"op":"stage.load"})],
-            tab: 1,
+            tab: StageMode::Space.tab(),
             embedded: false,
             section: String::new(),
             initialized: false,
@@ -119,14 +440,12 @@ impl StagePanelsPane {
         self.embedded = embedded;
         cx.notify();
     }
-    pub fn select_section(&mut self, section:&str,cx:&mut Context<Self>){self.section=section.into();cx.notify();}
+    pub fn select_section(&mut self, section: &str, cx: &mut Context<Self>) {
+        self.section = section.into();
+        cx.notify();
+    }
     pub fn select_tab(&mut self, tab: &str, cx: &mut Context<Self>) {
-        self.tab = match tab {
-            "player" => 0,
-            "motions" => 2,
-            "activities" => 3,
-            _ => 1,
-        };
+        self.tab = tab_for_name(tab);
         if self.tab == 2 {
             self.commands.push(json!({"op":"stage.motion.refresh"}));
         }
@@ -142,13 +461,12 @@ impl StagePanelsPane {
             return;
         }
         if !self.initialized {
-            self.tab = if snapshot["stageRadioPluginEnabled"].as_bool() == Some(true)
-                && snapshot["mode"].as_str() == Some("player")
-            {
-                0
-            } else {
-                1
-            };
+            // The partition is chosen once, by the original's rule; a later mode
+            // change keeps whatever the person selected (`didChooseInitialTab`).
+            self.tab = initial_tab(
+                snapshot["stageRadioPluginEnabled"].as_bool() == Some(true),
+                stage_mode(&snapshot),
+            );
             self.initialized = true;
         }
         self.syncing = true;
@@ -173,42 +491,202 @@ impl StagePanelsPane {
         self.snapshot = snapshot;
         cx.notify();
     }
-    fn button(
+
+    /// The original's `Button("…").buttonStyle(.plain)` inside a group: no
+    /// resting fill, one step up while hovered, dimmed instead of themed when
+    /// disabled.
+    fn plain_button(
         &self,
         id: impl Into<ElementId>,
         label: impl Into<SharedString>,
+        icon: AssetIcon,
         command: Value,
         disabled: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let locale = UiLocale::from_settings(&self.snapshot);
         let label: SharedString = label.into();
-        let label = settings_copy(UiLocale::from_settings(&self.snapshot), label.as_ref()).to_owned();
+        let label = settings_copy(locale, label.as_ref()).to_owned();
+        let text = if disabled { s::TEXT_DIM } else { s::TEXT };
         Button::new(id)
+            .custom(scene_variant(cx, 0x00000000, 0xffffff14, text))
             .small()
-            .label(label)
-            .disabled(disabled)
+            .icon(icon)
+            .rounded(px(metrics::ROW_RADIUS))
+            .text_color(rgba(text))
+            .tooltip(label.clone())
+            .accessibility_label(label)
+            .disabled(disabled || self.snapshot["isSaving"].as_bool() == Some(true))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.commands.push(command.clone());
                 cx.notify();
             }))
             .into_any_element()
     }
+
+    /// The original's group row: a full-width plain button with a
+    /// `white.opacity(0.05)` fill, radius 10, leading symbol, and the active one
+    /// carrying a check mark.
+    fn row(
+        &self,
+        id: impl Into<ElementId>,
+        body: AnyElement,
+        aria: String,
+        active: bool,
+        disabled: bool,
+        command: Value,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let text = if disabled {
+            s::TEXT_DIM
+        } else if active {
+            s::ACCENT
+        } else {
+            s::TEXT
+        };
+        Button::new(id)
+            .custom(scene_variant(
+                cx,
+                metrics::ROW_FILL,
+                metrics::ROW_FILL_HOVER,
+                text,
+            ))
+            .w_full()
+            .min_h(px(metrics::TILE_MIN_HEIGHT))
+            .px(px(metrics::ROW_PADDING))
+            .rounded(px(metrics::ROW_RADIUS))
+            .text_color(rgba(text))
+            .accessibility_label(aria)
+            .disabled(disabled)
+            .child(body)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.commands.push(command.clone());
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    /// `pickerButton`: one tile of a `LazyVGrid`. `导入 MP4` / `关闭` are tiles in
+    /// the original too, not a separate button row.
+    fn tile(
+        &self,
+        key: &str,
+        id: &str,
+        title: &str,
+        aria: String,
+        symbol: AssetIcon,
+        is_selected: bool,
+        width: f32,
+        command: Value,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        let text = if is_selected {
+            metrics::TILE_TEXT_SELECTED
+        } else {
+            metrics::TILE_TEXT
+        };
+        Button::new(format!("{key}-{id}"))
+            .custom(scene_variant(
+                cx,
+                if is_selected {
+                    metrics::TILE_FILL_SELECTED
+                } else {
+                    metrics::TILE_FILL
+                },
+                metrics::TILE_FILL_HOVER,
+                text,
+            ))
+            .w(px(width))
+            .min_h(px(metrics::TILE_MIN_HEIGHT))
+            .rounded(px(metrics::TILE_RADIUS))
+            .border(px(if is_selected {
+                metrics::TILE_BORDER_WIDTH_SELECTED
+            } else {
+                metrics::TILE_BORDER_WIDTH
+            }))
+            .border_color(rgba(if is_selected {
+                metrics::TILE_BORDER_SELECTED
+            } else {
+                metrics::TILE_BORDER
+            }))
+            .text_color(rgba(text))
+            .tooltip(aria.clone())
+            .accessibility_label(aria)
+            .child(
+                v_flex()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(metrics::TILE_GAP))
+                    .child(Icon::new(symbol).size(px(metrics::TILE_ICON_SIZE)))
+                    .child(title.to_owned()),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.commands.push(command.clone());
+                cx.notify();
+            }))
+    }
+
+    /// The original's integer-percent readout beside a slider (`Int(value*100)`).
+    fn slider_readout(value: f32) -> String {
+        format!("{}%", (value * 100.).round() as i32)
+    }
+
+    // ---------------------------------------------------------------- 空间 ----
+
     fn space(&self, cx: &mut Context<Self>) -> AnyElement {
         let locale = UiLocale::from_settings(&self.snapshot);
-        let space = &self.snapshot["space"];
+        let mut group = v_flex().w_full().gap(px(metrics::PANEL_GROUP_GAP));
+        for entry in visible_groups(StageMode::Space) {
+            match entry {
+                VisualGroup::WorldSelection => group = group.child(self.world_selection(locale, cx)),
+                VisualGroup::AvatarPlacement => {
+                    group = group.child(self.avatar_placement(locale, cx))
+                }
+                VisualGroup::LoadingStatus => {
+                    if let Some(status) = world_loading_status(
+                        self.snapshot["space"]["isRequested"].as_bool() == Some(true),
+                        self.snapshot["space"]["isVisible"].as_bool() == Some(true),
+                        self.snapshot["space"]["generationMessage"]
+                            .as_str()
+                            .or_else(|| self.snapshot["space"]["notice"].as_str()),
+                        self.snapshot["space"]["errorMessage"].as_str(),
+                    ) {
+                        group = group.child(status_element(status));
+                    }
+                }
+                _ => {}
+            }
+        }
+        group.into_any_element()
+    }
+
+    /// `worldSelectionGroup`: the public-world / generated-scene menu, with the
+    /// selected world check-marked inside its section.
+    fn world_selection(&self, locale: UiLocale, cx: &mut Context<Self>) -> AnyElement {
+        let catalog = self.snapshot["space"].clone();
+        let label = catalog["worldLabel"]
+            .as_str()
+            .unwrap_or(settings_copy(locale, "公开空间 · 无需生成"))
+            .to_owned();
         let weak = cx.entity().downgrade();
-        let catalog = space.clone();
+        let menu_label = label.clone();
         let menu = Button::new("stage-world-menu")
+            .custom(scene_variant(
+                cx,
+                metrics::TILE_FILL,
+                metrics::TILE_FILL_HOVER,
+                metrics::MENU_TEXT,
+            ))
             .w_full()
             .small()
-            .rounded(px(12.))
-            .label(
-                space["worldLabel"]
-                    .as_str()
-                    .unwrap_or(settings_copy(locale, "公开空间 · 无需生成"))
-                    .to_owned(),
-            )
+            .min_h(px(metrics::MENU_MIN_HEIGHT))
+            .rounded(px(metrics::MENU_RADIUS))
+            .icon(AssetIcon::Globe)
+            .label(menu_label)
             .dropdown_caret(true)
+            .text_color(rgba(metrics::MENU_TEXT))
+            .tooltip(label.clone())
+            .accessibility_label(label)
             .dropdown_menu(move |mut menu, _, _| {
                 for (key, title, op) in [
                     ("worlds", "公开空间", "stage.world.enter"),
@@ -241,407 +719,846 @@ impl StagePanelsPane {
                 }
                 menu
             });
-        let mut form = div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(div().h(px(36.)).child(menu));
-        form = form.child(
-            div()
-                .text_size(px(14.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(settings_copy(locale, "人物位置")),
-        );
-        let mut axes = div().flex().flex_col().gap(px(5.));
+        v_flex().w_full().child(menu).into_any_element()
+    }
+
+    /// `avatarPlacementGroup`: the three axes, then the two original footers.
+    fn avatar_placement(&self, locale: UiLocale, cx: &mut Context<Self>) -> AnyElement {
+        let group = v_flex()
+            .w_full()
+            .gap(px(metrics::PANEL_GROUP_GAP))
+            .child(
+                ui::section_title(settings_copy(locale, "人物位置"))
+                    .text_size(px(metrics::SECTION_TITLE_SIZE))
+                    .text_color(rgba(s::TEXT)),
+            );
+        let mut axes = v_flex().w_full().gap(px(metrics::AXIS_STACK_GAP));
         for (i, label) in ["X", "Y", "Z"].into_iter().enumerate() {
+            let value = self.snapshot["space"]["position"][label]
+                .as_f64()
+                .unwrap_or(0.);
             axes = axes.child(
-                div()
-                    .flex()
+                h_flex()
+                    .w_full()
                     .items_center()
-                    .gap(px(9.))
-                    .min_h(px(36.))
+                    .gap(px(metrics::AXIS_ROW_GAP))
+                    .min_h(px(metrics::AXIS_ROW_MIN_HEIGHT))
                     .child(
                         div()
-                            .w(px(12.))
-                            .font_family("Menlo")
+                            .w(px(metrics::AXIS_LABEL_WIDTH))
+                            .font_family(doc::FONT_FAMILY)
                             .font_weight(FontWeight::BOLD)
-                            .text_color(rgba(0xffffff85))
+                            .text_color(rgba(metrics::AXIS_LABEL_TEXT))
                             .child(label),
                     )
-                    .child(div().flex_1().child(Slider::new(&self.sliders[i])))
                     .child(
                         div()
-                            .w(px(42.))
+                            .id(format!("stage-avatar-{label}"))
+                            .flex_1()
+                            .min_w(px(0.))
+                            .role(Role::Slider)
+                            .aria_label(match label {
+                                "X" => "人物左右位置",
+                                "Y" => "人物上下位置",
+                                _ => "人物前后位置",
+                            })
+                            .child(Slider::new(&self.sliders[i])),
+                    )
+                    .child(
+                        div()
+                            .w(px(metrics::AXIS_READOUT_WIDTH))
                             .text_right()
-                            .font_family("Menlo")
+                            .font_family(doc::FONT_FAMILY)
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgba(0xffffffad))
-                            .child(format!(
-                                "{:.2}",
-                                space["position"][["X", "Y", "Z"][i]].as_f64().unwrap_or(0.)
-                            )),
+                            .text_color(rgba(metrics::AXIS_READOUT_TEXT))
+                            .child(format!("{value:.2}")),
                     ),
             );
         }
-        form = form
+        group
             .child(axes)
             .child(
-                div()
-                    .flex()
+                h_flex()
+                    .w_full()
                     .justify_between()
                     .items_center()
-                    .child(settings_copy(locale, "人物位置会按当前空间保存"))
-                    .child(self.button(
+                    .child(ui::muted(settings_copy(locale, "人物位置会按当前空间保存")))
+                    .child(self.plain_button(
                         "avatar-reset",
                         "重置",
+                        AssetIcon::Undo2,
                         json!({"op":"stage.avatar.reset"}),
                         false,
                         cx,
                     )),
             )
             .child(
-                div()
-                    .flex()
+                h_flex()
+                    .w_full()
                     .justify_between()
                     .items_center()
-                    .child(settings_copy(locale, "W/S 沿视线前后移动，A/D 左右移动"))
-                    .child(self.button(
+                    .child(ui::muted(settings_copy(
+                        locale,
+                        "W/S 沿视线前后移动，A/D 左右移动",
+                    )))
+                    .child(self.plain_button(
                         "camera-reset",
                         "镜头复位",
+                        AssetIcon::RotateCw,
                         json!({"op":"stage.camera.reset"}),
                         false,
                         cx,
                     )),
-            );
-        if let Some(message) = space["notice"].as_str().filter(|s| !s.is_empty()) {
-            form = form.child(div().text_color(rgb(0x80dce4)).child(message.to_owned()));
-        }
-        form.into_any_element()
+            )
+            .into_any_element()
     }
+
+    // ---------------------------------------------------------------- 角色 ----
+
     fn motions(&self, cx: &mut Context<Self>) -> AnyElement {
         let locale = UiLocale::from_settings(&self.snapshot);
         let motions = &self.snapshot["motions"];
-        let mut form = div()
-            .flex()
-            .flex_col()
-            .gap(px(10.))
+        let mut group = v_flex()
+            .w_full()
+            .gap(px(metrics::GROUP_ROW_GAP))
+            .text_size(px(metrics::GROUP_TEXT_SIZE))
             .child(
-                div()
-                    .flex()
-                    .justify_between()
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap(px(metrics::ROW_GAP))
                     .child(
+                        Icon::new(AssetIcon::CircleUser)
+                            .size(px(metrics::TILE_ICON_SIZE))
+                            .text_color(rgba(s::TEXT)),
+                    )
+                    .child(div().child(
                         motions["avatarName"]
                             .as_str()
                             .unwrap_or(settings_copy(locale, "尚未选择角色"))
                             .to_owned(),
-                    )
-                    .child(self.button(
+                    ))
+                    .child(div().flex_1())
+                    .child(self.plain_button(
                         "motion-refresh",
                         "刷新",
+                        AssetIcon::RefreshCw,
                         json!({"op":"stage.motion.refresh"}),
                         false,
                         cx,
                     )),
             )
-            .child(settings_copy(locale, "选择已安装动作；自然待机可结束当前表演。"));
-        let mut categories = div().flex().flex_wrap().gap_1();
-        categories = categories.child(Button::new("all-motion-categories").small().label(settings_copy(locale, "全部")).on_click(
-            cx.listener(|this, _, _, cx| {
-                this.motion_category.clear();
-                cx.notify();
-            }),
-        ));
-        for category in motions["categories"].as_array().into_iter().flatten() {
-            let id = category["id"].as_str().unwrap_or("").to_owned();
-            categories = categories.child(
-                Button::new(format!("motion-category-{id}"))
-                    .small().label(category["name"].as_str().unwrap_or("").to_owned())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.motion_category = id.clone();
-                        cx.notify();
-                    })),
-            );
-        }
-        form = form.child(categories);
-        let mut count = 0;
-        for motion in motions["items"].as_array().into_iter().flatten() {
-            if !self.motion_category.is_empty()
-                && motion["category"].as_str() != Some(&self.motion_category)
-            {
-                continue;
-            }
-            count += 1;
+            .child(ui::muted(settings_copy(
+                locale,
+                "选择已安装动作；自然待机可结束当前表演。",
+            )));
+        let items = motions["items"].as_array().cloned().unwrap_or_default();
+        let categories = motions["categories"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let visible: Vec<&Value> = items
+            .iter()
+            .filter(|motion| motion_in_category(motion, &self.motion_category))
+            .collect();
+        group = group.child(
+            TabBar::new("motion-categories")
+                .segmented()
+                .small()
+                .w_full()
+                .selected_index(motion_category_index(&self.motion_category, &categories))
+                .children(
+                    std::iter::once("全部".to_owned())
+                        .chain(
+                            categories
+                                .iter()
+                                .map(|category| category["name"].as_str().unwrap_or("").to_owned()),
+                        )
+                        .map(|label| Tab::new().label(label).flex_1().min_w_0()),
+                )
+                .on_click(cx.listener(move |this, index: &usize, _, cx| {
+                    this.motion_category = if *index == 0 {
+                        String::new()
+                    } else {
+                        this.snapshot["motions"]["categories"]
+                            .as_array()
+                            .and_then(|categories| categories.get(index - 1))
+                            .and_then(|category| category["id"].as_str())
+                            .unwrap_or("")
+                            .to_owned()
+                    };
+                    cx.notify();
+                })),
+        );
+        let saving = motions["isWorking"].as_bool() == Some(true);
+        for motion in &visible {
             let id = motion["id"].as_str().unwrap_or("");
-            form = form.child(self.button(
+            let active = motions["activeID"] == motion["id"];
+            let compatible = motion["compatible"].as_bool() == Some(true);
+            let mut body = v_flex()
+                .items_start()
+                .gap(px(metrics::ROW_STACK_GAP))
+                .child(div().child(motion["name"].as_str().unwrap_or("").to_owned()));
+            if let Some(reason) = motion["reason"].as_str().filter(|s| !s.is_empty()) {
+                body = body.child(ui::muted(reason).text_size(px(metrics::REASON_SIZE)));
+            }
+            group = group.child(self.row(
                 format!("motion-{id}"),
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap(px(metrics::ROW_GAP))
+                    .child(
+                        Icon::new(if active {
+                            AssetIcon::CircleCheck
+                        } else {
+                            AssetIcon::PersonStanding
+                        })
+                        .size(px(metrics::TILE_ICON_SIZE)),
+                    )
+                    .child(body)
+                    .child(div().flex_1())
+                    .when(active, |row| {
+                        row.child(
+                            Icon::new(AssetIcon::Check)
+                                .size(px(metrics::TILE_ICON_SIZE))
+                                .text_color(rgba(s::ACCENT)),
+                        )
+                    })
+                    .into_any_element(),
                 format!(
-                    "{}{}",
-                    if motions["activeID"] == motion["id"] {
-                        "✓ "
+                    "{}，{}{}",
+                    motion["name"].as_str().unwrap_or(""),
+                    settings_copy(locale, "动作"),
+                    if active {
+                        settings_copy(locale, "，已选择")
                     } else {
                         ""
-                    },
-                    motion["name"].as_str().unwrap_or("")
+                    }
                 ),
+                active,
+                !compatible || saving,
                 json!({"op":"stage.motion.activate","id":id}),
-                motion["compatible"].as_bool() != Some(true)
-                    || motions["isWorking"].as_bool() == Some(true),
                 cx,
             ));
-            if let Some(reason) = motion["reason"].as_str().filter(|s| !s.is_empty()) {
-                form = form.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0xa1a7b0))
-                        .child(reason.to_owned()),
-                );
-            }
         }
-        if count == 0 {
-            form = form.child(settings_copy(locale, if self.motion_category.is_empty() {
-                "暂无可用动作，请在资产管理中安装。"
+        group = group.child(
+            match motion_notice(
+                items.len(),
+                visible.len(),
+                &self.motion_category,
+                motions["notice"].as_str(),
+            ) {
+                MotionNotice::Empty => ui::muted(settings_copy(
+                    locale,
+                    "暂无可用动作，请在资产管理中安装。",
+                )),
+                MotionNotice::ListNotice(text) => ui::muted(text),
+                MotionNotice::CategoryEmpty => ui::muted(settings_copy(
+                    locale,
+                    "这个分类下暂无当前角色可用的动作。",
+                )),
+                MotionNotice::None => div(),
+            },
+        );
+        if let Some(message) = motions["message"].as_str().filter(|s| !s.is_empty()) {
+            group = group.child(if motions["hasError"].as_bool() == Some(true) {
+                ui::notice(message)
             } else {
-                "这个分类下暂无当前角色可用的动作。"
-            }));
+                ui::muted(message)
+            });
         }
-        for key in ["notice", "message"] {
-            if let Some(message) = motions[key].as_str().filter(|s| !s.is_empty()) {
-                form = form.child(message.to_owned());
-            }
-        }
-        form.child(self.button(
-            "manage-motion-assets",
-            "管理角色与动作…",
-            json!({"op":"stage.assets.manage"}),
-            false,
-            cx,
-        ))
-        .into_any_element()
+        group
+            .child(self.plain_button(
+                "manage-motion-assets",
+                "管理角色与动作…",
+                AssetIcon::Settings,
+                // 原版 `StageOverlayView` 的这个按钮走 `onManageAssets` →
+                // `openPresenceSettings()`，即打开设置的角色页；宿主
+                // `GPUIProductHost.settingsCommand` 用真实存在的
+                // `settings.open.presence` 承接（`stage.assets.manage` 从无处理者）。
+                json!({"op":"settings.open.presence"}),
+                false,
+                cx,
+            ))
+            .into_any_element()
     }
+
+    // ---------------------------------------------------------------- 活动 ----
+
     fn activities(&self, cx: &mut Context<Self>) -> AnyElement {
         let locale = UiLocale::from_settings(&self.snapshot);
         let activity = &self.snapshot["activities"];
-        let mut form = div()
-            .flex()
-            .flex_col()
-            .gap(px(10.))
-            .child(settings_copy(locale, "活动来自当前空间，角色会走到对应位置再开始。"));
-        if activity["canRun"].as_bool() == Some(true) {
-            for item in activity["items"].as_array().into_iter().flatten() {
+        let mut group = v_flex()
+            .w_full()
+            .gap(px(metrics::GROUP_ROW_GAP))
+            .text_size(px(metrics::GROUP_TEXT_SIZE))
+            .child(ui::muted(settings_copy(
+                locale,
+                "活动来自当前空间，角色会走到对应位置再开始。",
+            )));
+        let is_visible = self.snapshot["space"]["isVisible"].as_bool() == Some(true);
+        let is_requested = self.snapshot["space"]["isRequested"].as_bool() == Some(true);
+        let can_run = activity["canRun"].as_bool().unwrap_or_else(|| {
+            activity_can_run(
+                is_visible,
+                self.snapshot["space"]["selectedWorldID"].as_str(),
+                activity["worldID"].as_str(),
+            )
+        });
+        if can_run {
+            let items = activity["items"].as_array().cloned().unwrap_or_default();
+            for item in &items {
                 let id = item["id"].as_str().unwrap_or("");
-                form = form.child(self.button(
+                let active = activity["activeID"] == item["id"];
+                group = group.child(self.row(
                     format!("activity-{id}"),
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap(px(metrics::ROW_GAP))
+                        .child(
+                            Icon::new(if active {
+                                AssetIcon::CircleCheck
+                            } else {
+                                AssetIcon::CirclePlay
+                            })
+                            .size(px(metrics::TILE_ICON_SIZE)),
+                        )
+                        .child(div().child(item["name"].as_str().unwrap_or("").to_owned()))
+                        .child(div().flex_1())
+                        .into_any_element(),
                     format!(
-                        "{}{}",
-                        if activity["activeID"] == item["id"] {
-                            "✓ "
+                        "{}，{}{}",
+                        item["name"].as_str().unwrap_or(""),
+                        settings_copy(locale, "活动"),
+                        if active {
+                            settings_copy(locale, "，正在进行")
                         } else {
                             ""
-                        },
-                        item["name"].as_str().unwrap_or("")
+                        }
                     ),
-                    json!({"op":"stage.activity.run","id":id}),
+                    active,
                     false,
+                    json!({"op":"stage.activity.run","id":id}),
                     cx,
                 ));
             }
-            if activity["items"].as_array().is_none_or(|a| a.is_empty()) {
-                form = form.child(settings_copy(locale, "这个空间还没有配置生活活动。"));
+            if items.is_empty() {
+                group = group.child(ui::muted(settings_copy(
+                    locale,
+                    "这个空间还没有配置生活活动。",
+                )));
             }
-            form = form.child(self.button(
+            group = group.child(self.plain_button(
                 "activity-stop",
-                settings_copy(locale, "停止活动"),
+                "停止活动",
+                AssetIcon::Square,
                 json!({"op":"stage.activity.stop"}),
                 activity["activeID"].as_str().is_none_or(|s| s.is_empty()),
                 cx,
             ));
+            if let Some(message) = activity["message"].as_str().filter(|s| !s.is_empty()) {
+                group = group.child(ui::muted(message));
+            }
         } else {
-            form = form.child(
-                settings_copy(locale, if self.snapshot["space"]["isVisible"].as_bool() == Some(true) {
-                    "这个空间还没有配置生活活动。"
-                } else if self.snapshot["space"]["isRequested"].as_bool() == Some(true) {
-                    "空间载入完成后可选择活动。"
-                } else {
-                    "进入空间后可选择生活活动。"
-                }),
-            );
+            group = group.child(ui::muted(settings_copy(
+                locale,
+                activity_unavailable_message(is_visible, is_requested),
+            )));
         }
-        if let Some(message) = activity["message"].as_str().filter(|s| !s.is_empty()) {
-            form = form.child(message.to_owned());
-        }
-        form.into_any_element()
+        group.into_any_element()
     }
+
+    // -------------------------------------------------------------- 播放器 ----
+
     fn player(&self, cx: &mut Context<Self>) -> AnyElement {
         let locale = UiLocale::from_settings(&self.snapshot);
-        let player = &self.snapshot["player"];
-        let mut form = div().flex().flex_col().gap_3();
-        if self.snapshot["space"]["isRequested"].as_bool() == Some(true) {
-            form = form.child(settings_copy(locale, "这些效果用于播放器画面，切回播放器后可查看"));
-        }
-        for (key, title, op, selected) in [
-            ("lyrics", "字幕特效", "stage.player.lyrics", "lyricID"),
-            ("clouds", "3D 点阵", "stage.player.cloud", "cloudID"),
-            ("videoModes", "MV 场景", "stage.video.mode", "videoMode"),
-        ] {
-            if self.embedded && !player_section_includes(&self.section,key){continue;}
-            let columns = if key == "lyrics" { 5 } else { 4 };
-            let tile_width = (544. - 6. * (columns as f32 - 1.)) / columns as f32;
-            let mut choices = div().flex().flex_wrap().gap(px(6.));
-            for item in player[key].as_array().into_iter().flatten() {
-                let id = item["id"].as_str().unwrap_or("");
-                let is_selected = player[selected] == item["id"];
-                let command = json!({"op":op,"id":id});
-                let name = player_choice_label(locale, key, id, item["name"].as_str().unwrap_or(""));
-                let (role, _) = style_choice_accessibility(title, name, is_selected);
-                let label = format!("{}: {name}{}", settings_copy(locale, title),
-                    if is_selected { format!(", {}", settings_copy(locale, "已选择")) } else { String::new() });
-                let mut tile = div()
-                    .id(format!("{key}-{id}"))
-                    .role(role)
-                    .aria_label(label)
-                    .w(px(tile_width))
-                    .min_h(px(48.))
-                    .rounded(px(13.))
-                    .border_1()
-                    .border_color(if is_selected {
-                        rgba(0x00ffff85)
-                    } else {
-                        rgba(0xffffff12)
-                    })
-                    .bg(if is_selected {
-                        rgba(0x00ffff29)
-                    } else {
-                        rgba(0xffffff0b)
-                    })
-                    .flex()
-                    .flex_col()
+        let mut group = v_flex().w_full().gap(px(metrics::PANEL_GROUP_GAP));
+        if stage_mode(&self.snapshot) == StageMode::Space {
+            group = group.child(
+                h_flex()
                     .items_center()
-                    .justify_center()
-                    .gap(px(5.))
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(if is_selected {
-                        rgb(0x7af2ff)
-                    } else {
-                        rgba(0xffffff9e)
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.commands.push(command.clone());
-                        cx.notify();
-                    }));
-                let icon = match key {
-                    "lyrics" => gpui_kit::assets::IconName::Captions,
-                    "clouds" => gpui_kit::assets::IconName::Grid3x3,
-                    _ => gpui_kit::assets::IconName::Video,
-                };
-                tile = tile.child(Icon::new(icon).size(px(14.)));
-                choices = choices.child(tile.child(name.to_owned()));
+                    .gap(px(metrics::TILE_GAP))
+                    .child(
+                        Icon::new(AssetIcon::Info)
+                            .size(px(metrics::TILE_ICON_SIZE))
+                            .text_color(rgba(metrics::INFO_TEXT)),
+                    )
+                    .child(ui::muted(settings_copy(
+                        locale,
+                        "这些效果用于播放器画面，切回播放器后可查看",
+                    ))),
+            );
+        }
+        for entry in visible_groups(StageMode::Player) {
+            match entry {
+                VisualGroup::LyricsEffects => {
+                    if let Some(grid) = self.effect_grid(
+                        locale,
+                        "lyrics",
+                        "字幕特效",
+                        AssetIcon::Captions,
+                        "lyricID",
+                        "stage.player.lyrics",
+                        metrics::GRID_MIN_LYRICS,
+                        cx,
+                    ) {
+                        group = group.child(grid);
+                    }
+                }
+                VisualGroup::PointCloud => {
+                    if let Some(grid) = self.effect_grid(
+                        locale,
+                        "clouds",
+                        "3D 点阵",
+                        AssetIcon::Grid3x3,
+                        "cloudID",
+                        "stage.player.cloud",
+                        metrics::GRID_MIN_POINT_CLOUD,
+                        cx,
+                    ) {
+                        group = group.child(grid);
+                    }
+                }
+                VisualGroup::ParticleSize => {
+                    if !self.embedded || player_section_includes(&self.section, "clouds") {
+                        group = group.child(self.particle_size(locale, cx));
+                    }
+                }
+                VisualGroup::MusicVideo => {
+                    if let Some(video) = self.music_video(locale, cx) {
+                        group = group.child(video);
+                    }
+                }
+                _ => {}
             }
-            form = form
-                .child(
-                    div()
-                        .text_size(px(14.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(settings_copy(locale, title)),
+        }
+        group.into_any_element()
+    }
+
+    /// One `LazyVGrid` of `pickerButton` tiles plus its `pickerHeader`. Returns
+    /// `None` when the embedded settings page is showing a different section.
+    #[allow(clippy::too_many_arguments)]
+    fn effect_grid(
+        &self,
+        locale: UiLocale,
+        key: &str,
+        title: &str,
+        symbol: AssetIcon,
+        selected_key: &str,
+        op: &'static str,
+        minimum: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.embedded && !player_section_includes(&self.section, key) {
+            return None;
+        }
+        let player = &self.snapshot["player"];
+        let width = adaptive_tile_width(minimum, grid_width(), metrics::GRID_SPACING);
+        let mut tiles = Vec::new();
+        for item in player[key].as_array().into_iter().flatten() {
+            let id = item["id"].as_str().unwrap_or("");
+            let is_selected = player[selected_key] == item["id"];
+            let name = player_choice_label(locale, key, id, item["name"].as_str().unwrap_or(""));
+            let (_, aria) = style_choice_accessibility(settings_copy(locale, title), name, is_selected);
+            tiles.push(
+                self.tile(
+                    key,
+                    id,
+                    name,
+                    aria,
+                    symbol,
+                    is_selected,
+                    width,
+                    json!({"op":op,"id":id}),
+                    cx,
                 )
-                .child(choices);
-            if key == "clouds" {
-                form = form.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(settings_copy(locale, "颗粒大小"))
-                        .child(div().flex_1().child(Slider::new(&self.sliders[3])))
-                        .child(format!(
-                            "{}%",
-                            (player["particleScale"].as_f64().unwrap_or(1.) * 100.).round()
-                        )),
+                .into_any_element(),
+            );
+        }
+        Some(
+            v_flex()
+                .w_full()
+                .gap(px(metrics::PANEL_GROUP_GAP))
+                .child(section_heading(settings_copy(locale, title), symbol))
+                .child(
+                    h_flex()
+                        .flex_wrap()
+                        .w_full()
+                        .gap(px(metrics::GRID_SPACING))
+                        .children(tiles),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// `particleSizeGroup`: symbol, slider, trailing 38 pt readout.
+    fn particle_size(&self, locale: UiLocale, cx: &mut Context<Self>) -> AnyElement {
+        let value = self.sliders[3].read(cx).value().start();
+        h_flex()
+            .w_full()
+            .items_center()
+            .gap(px(metrics::ROW_GAP))
+            .px(px(metrics::SLIDER_ROW_H_PADDING))
+            .min_h(px(metrics::SLIDER_ROW_MIN_HEIGHT))
+            .child(
+                Icon::new(AssetIcon::Grid3x3)
+                    .size(px(metrics::TILE_ICON_SIZE))
+                    .text_color(rgba(s::TEXT)),
+            )
+            .child(
+                div()
+                    .id("stage-particle-size")
+                    .flex_1()
+                    .min_w(px(0.))
+                    .role(Role::Slider)
+                    .aria_label(settings_copy(locale, "颗粒大小"))
+                    .child(Slider::new(&self.sliders[3])),
+            )
+            .child(
+                div()
+                    .w(px(metrics::READOUT_WIDTH))
+                    .text_right()
+                    .font_family(doc::FONT_FAMILY)
+                    .text_color(rgba(metrics::READOUT_TEXT))
+                    .child(Self::slider_readout(value)),
+            )
+            .into_any_element()
+    }
+
+    /// `musicVideoGroup`: the mode tiles **including** 导入 MP4 and 关闭, then the
+    /// brightness row and the asset menu.
+    fn music_video(&self, locale: UiLocale, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.embedded && !player_section_includes(&self.section, "videoModes") {
+            return None;
+        }
+        let player = &self.snapshot["player"];
+        let width =
+            adaptive_tile_width(metrics::GRID_MIN_VIDEO, grid_width(), metrics::GRID_SPACING);
+        let mut group = v_flex().w_full().gap(px(metrics::PANEL_GROUP_GAP));
+        group = group.child(section_heading(
+            settings_copy(locale, "MV 场景"),
+            AssetIcon::Film,
+        ));
+        let mut tiles: Vec<AnyElement> = Vec::new();
+        {
+            tiles.push(
+                self.tile(
+                    "videoModes",
+                    "import",
+                    settings_copy(locale, "导入 MP4"),
+                    settings_copy(locale, "导入 MP4").to_owned(),
+                    AssetIcon::Plus,
+                    false,
+                    width,
+                    json!({"op":"stage.video.import"}),
+                    cx,
+                )
+                .into_any_element(),
+            );
+            for item in player["videoModes"].as_array().into_iter().flatten() {
+                let id = item["id"].as_str().unwrap_or("");
+                let name = player_choice_label(
+                    locale,
+                    "videoModes",
+                    id,
+                    item["name"].as_str().unwrap_or(""),
+                );
+                let active = player["videoActive"].as_bool() == Some(true)
+                    && player["videoMode"] == item["id"];
+                let (_, aria) =
+                    style_choice_accessibility(settings_copy(locale, "MV 场景"), name, active);
+                tiles.push(
+                    self.tile(
+                        "videoModes",
+                        id,
+                        name,
+                        aria,
+                        AssetIcon::Film,
+                        active,
+                        width,
+                        json!({"op":"stage.video.mode","id":id}),
+                        cx,
+                    )
+                    .into_any_element(),
                 );
             }
-        }
-        if !self.embedded || self.section=="视频" {
-        if let Some(notice)=video_authority_notice(player) {
-            form=form.child(div().id("stage-video-authority-notice").text_xs()
-                .text_color(cx.theme().danger).child(notice.to_owned()));
-        }
-        if player["videoCanRecoverStop"].as_bool()==Some(true) {
-            form=form.child(self.button("stage-video-recover-stop","停止并核验",json!({"op":"stage.video.recoverStop"}),false,cx));
-        }
-        form = form.child(
-            div()
-                .flex()
-                .gap_2()
-                .child(self.button(
-                    "video-import",
-                    settings_copy(locale, "导入 MP4"),
-                    json!({"op":"stage.video.import"}),
-                    false,
-                    cx,
-                ))
-                .child(self.button(
-                    "video-stop",
+            let assets = player["videoAssets"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let idle = player["videoActive"].as_bool() != Some(true);
+            let (_, aria) =
+                style_choice_accessibility(settings_copy(locale, "MV 场景"), "关闭", idle);
+            tiles.push(
+                self.tile(
+                    "videoModes",
+                    "stop",
                     settings_copy(locale, "关闭"),
+                    aria,
+                    AssetIcon::X,
+                    idle && !assets.is_empty(),
+                    width,
                     json!({"op":"stage.video.stop"}),
-                    false,
                     cx,
-                )),
-        );
-        if player["videoAssets"]
-            .as_array()
-            .is_some_and(|a| !a.is_empty())
-        {
-            form = form.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(10.)).px(px(10.)).min_h(px(36.))
-                    .child(Icon::new(gpui_kit::assets::IconName::SunDim).size(px(14.)))
-                    .child(div().id("video-brightness").role(Role::Slider).aria_label(settings_copy(locale, "视频亮度")).flex_1().min_w(px(0.)).child(Slider::new(&self.sliders[4])))
-                    .child(div().w(px(38.)).flex_shrink_0().font_family("Menlo").text_size(px(12.)).child(format!("{}%",(self.sliders[4].read(cx).value().start()*100.)as u32))),
+                )
+                .into_any_element(),
             );
-            let assets=player["videoAssets"].as_array().cloned().unwrap_or_default();
-            let active=player["videoActive"].as_bool()==Some(true);
-            let name=assets.iter().find(|asset|asset["id"]==player["videoAssetID"]).and_then(|asset|asset["name"].as_str()).unwrap_or(settings_copy(locale, "未加载视频")).to_owned();
-            let status=if active{settings_copy(locale, "已加载").to_owned()}else{format!("{} {}",assets.len(),settings_copy(locale, "段"))};
-            let weak=cx.entity().downgrade();let menu_player=player.clone();
-            form=form.child(Button::new("video-assets-menu").ghost().small().w_full().rounded_full()
-                .bg(rgba(0xffffff0b)).accessibility_label(format!("{name}，{status}"))
-                .child(div().flex().items_center().gap(px(ui::SPACING_8)).w_full().text_sm()
-                    .child(Icon::new(if active{gpui_kit::assets::IconName::Video}else{gpui_kit::assets::IconName::VideoOff}).size(px(14.)))
-                    .child(div().flex_1().min_w(px(0.)).overflow_hidden().whitespace_nowrap().child(name))
-                    .child(div().flex_shrink_0().child(status)))
-                .dropdown_menu(move|mut menu,window,cx|{
-                    for asset in &assets{
-                        let actions=video_asset_actions(&menu_player,asset);let weak=weak.clone();
-                        menu=menu.submenu(asset["name"].as_str().unwrap_or("").to_owned(),window,cx,move|mut sub,_,_|{
-                            for(label,command,dangerous)in &actions{
-                                if *dangerous{sub=sub.separator();}
-                                let weak=weak.clone();let command=command.clone();
-                                let item=if *dangerous{PopupMenuItem::element(move |_,cx|div().id("video-remove-menu-label").role(Role::MenuItem).aria_label(settings_copy(locale, "移出素材库")).text_color(cx.theme().danger).child(settings_copy(locale, "移出素材库")))}else{PopupMenuItem::new(settings_copy(locale, label))};
-                                sub=sub.item(item.on_click(move|_,_,cx|{_=weak.update(cx,|this,cx|{this.commands.push(command.clone());cx.notify();});}));
-                            }
-                            sub
-                        });
-                    }
-                    menu
-                }));
         }
+        group = group.child(
+            h_flex()
+                .flex_wrap()
+                .w_full()
+                .gap(px(metrics::GRID_SPACING))
+                .children(tiles),
+        );
+        if let Some(notice) = video_authority_notice(player) {
+            group = group.child(
+                ui::notice(notice)
+                    .id("stage-video-authority-notice")
+                    .text_size(px(metrics::GROUP_TEXT_SIZE)),
+            );
         }
-        form.into_any_element()
+        if player["videoCanRecoverStop"].as_bool() == Some(true) {
+            group = group.child(self.plain_button(
+                "stage-video-recover-stop",
+                "停止并核验",
+                AssetIcon::CircleCheck,
+                json!({"op":"stage.video.recoverStop"}),
+                false,
+                cx,
+            ));
+        }
+        let assets = player["videoAssets"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if !assets.is_empty() {
+            group = group.child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap(px(metrics::ROW_GAP))
+                    .px(px(metrics::SLIDER_ROW_H_PADDING))
+                    .min_h(px(metrics::SLIDER_ROW_MIN_HEIGHT))
+                    .child(
+                        Icon::new(AssetIcon::SunDim)
+                            .size(px(metrics::TILE_ICON_SIZE))
+                            .text_color(rgba(s::TEXT)),
+                    )
+                    .child(
+                        div()
+                            .id("stage-video-brightness")
+                            .flex_1()
+                            .min_w(px(0.))
+                            .role(Role::Slider)
+                            .aria_label(settings_copy(locale, "视频亮度"))
+                            .child(Slider::new(&self.sliders[4])),
+                    )
+                    .child(
+                        div()
+                            .w(px(metrics::READOUT_WIDTH))
+                            .text_right()
+                            .font_family(doc::FONT_FAMILY)
+                            .text_color(rgba(metrics::READOUT_TEXT))
+                            .child(Self::slider_readout(
+                                self.sliders[4].read(cx).value().start(),
+                            )),
+                    ),
+            );
+            let active = player["videoActive"].as_bool() == Some(true);
+            let name = assets
+                .iter()
+                .find(|asset| asset["id"] == player["videoAssetID"])
+                .and_then(|asset| asset["name"].as_str())
+                .unwrap_or(settings_copy(locale, "未加载视频"))
+                .to_owned();
+            let status = if active {
+                settings_copy(locale, "已加载").to_owned()
+            } else {
+                format!("{} {}", assets.len(), settings_copy(locale, "段"))
+            };
+            let weak = cx.entity().downgrade();
+            let menu_player = player.clone();
+            group = group.child(
+                Button::new("video-assets-menu")
+                    .custom(scene_variant(
+                        cx,
+                        metrics::TILE_FILL,
+                        metrics::TILE_FILL_HOVER,
+                        metrics::MENU_TEXT,
+                    ))
+                    .w_full()
+                    .small()
+                    .min_h(px(metrics::MENU_MIN_HEIGHT))
+                    .rounded(px(metrics::MENU_MIN_HEIGHT / 2.))
+                    .text_color(rgba(metrics::MENU_TEXT))
+                    .accessibility_label(format!("{name}，{status}"))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap(px(doc::SPACING_8))
+                            .child(
+                                Icon::new(if active {
+                                    AssetIcon::Video
+                                } else {
+                                    AssetIcon::VideoOff
+                                })
+                                .size(px(metrics::TILE_ICON_SIZE)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .child(name),
+                            )
+                            .child(div().flex_shrink_0().child(status)),
+                    )
+                    .dropdown_menu(move |mut menu, window, cx| {
+                        for asset in &assets {
+                            let actions = video_asset_actions(&menu_player, asset);
+                            let weak = weak.clone();
+                            menu = menu.submenu(
+                                asset["name"].as_str().unwrap_or("").to_owned(),
+                                window,
+                                cx,
+                                move |mut sub, _, _| {
+                                    for (label, command, dangerous) in &actions {
+                                        if *dangerous {
+                                            sub = sub.separator();
+                                        }
+                                        let weak = weak.clone();
+                                        let command = command.clone();
+                                        let item = if *dangerous {
+                                            PopupMenuItem::element(move |_, _| {
+                                                div()
+                                                    .id("video-remove-menu-label")
+                                                    .role(Role::MenuItem)
+                                                    .aria_label(settings_copy(
+                                                        locale,
+                                                        "移出素材库",
+                                                    ))
+                                                    .text_color(rgba(metrics::DANGER_TEXT))
+                                                    .child(settings_copy(locale, "移出素材库"))
+                                            })
+                                        } else {
+                                            PopupMenuItem::new(settings_copy(locale, label))
+                                        };
+                                        sub = sub.item(item.on_click(move |_, _, cx| {
+                                            _ = weak.update(cx, |this, cx| {
+                                                this.commands.push(command.clone());
+                                                cx.notify();
+                                            });
+                                        }));
+                                    }
+                                    sub
+                                },
+                            );
+                        }
+                        menu
+                    }),
+            );
+        }
+        Some(group.into_any_element())
     }
 }
+
+/// The custom variant every stage-panel control wears.
+///
+/// Kit's default/ghost/danger variants read `cx.theme()` for the resting and
+/// hover surfaces; that is precisely the theme dependency this layer exists to
+/// remove, so controls carry explicit resting/hover/pressed colours — the same
+/// pattern [`crate::primitives::primary_circle_button`] uses for the send
+/// button. Shared by all three stage panel surfaces.
+pub(crate) fn scene_variant(cx: &App, fill: u32, hover: u32, text: u32) -> ButtonCustomVariant {
+    ButtonCustomVariant::new(cx)
+        .color(rgba(fill).into())
+        .foreground(rgba(text).into())
+        .hover(rgba(hover).into())
+        .active(rgba(hover).into())
+        .shadow(false)
+}
+
+/// The mode the panel renders for (`StageVisualPickerMode.resolve`).
+fn stage_mode(snapshot: &Value) -> StageMode {
+    StageMode::resolve(snapshot["space"]["isRequested"].as_bool() == Some(true))
+}
+
+/// A `pickerHeader`: leading symbol plus a 14 pt semibold title.
+fn section_heading(title: &str, symbol: AssetIcon) -> AnyElement {
+    h_flex()
+        .items_center()
+        .gap(px(metrics::TILE_GAP))
+        .child(
+            Icon::new(symbol)
+                .size(px(metrics::TILE_ICON_SIZE))
+                .text_color(rgba(s::TEXT)),
+        )
+        .child(
+            ui::section_title(title)
+                .text_size(px(metrics::SECTION_TITLE_SIZE))
+                .text_color(rgba(s::TEXT)),
+        )
+        .into_any_element()
+}
+
+/// `loadingStatusGroup`'s chrome for the winning state.
+fn status_element(status: WorldStatus<'_>) -> AnyElement {
+    let (symbol, color, text) = match status {
+        WorldStatus::Loading => (
+            AssetIcon::Package,
+            metrics::LOADING_TEXT,
+            "正在载入空间，完成后自动进入…".to_owned(),
+        ),
+        WorldStatus::Generating(message) => {
+            (AssetIcon::Sparkles, metrics::LOADING_TEXT, message.to_owned())
+        }
+        WorldStatus::Failed(message) => (
+            AssetIcon::TriangleAlert,
+            metrics::FAILURE_TEXT,
+            message.to_owned(),
+        ),
+    };
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap(px(metrics::TILE_GAP))
+        .text_size(px(metrics::GROUP_TEXT_SIZE))
+        .child(
+            Icon::new(symbol)
+                .size(px(metrics::TILE_ICON_SIZE))
+                .text_color(rgba(color)),
+        )
+        .child(div().flex_1().min_w(px(0.)).child(text))
+        .into_any_element()
+}
+
 impl Render for StagePanelsPane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        use gpui_kit::component::tab::{Tab, TabBar};
+        let mode = stage_mode(&self.snapshot);
         let tabs = TabBar::new("stage-tabs")
             .segmented()
             .small()
             .w_full()
             .selected_index(self.tab)
             .children(
-                ["播放器", "空间", "角色", "活动"]
-                    .map(|label| Tab::new().label(label).flex_1().min_w_0()),
+                STAGE_TABS
+                    .into_iter()
+                    .zip(STAGE_TAB_ICONS)
+                    .map(|(label, icon)| {
+                        Tab::new()
+                            .icon(icon)
+                            .aria_label(label)
+                            .flex_1()
+                            .min_w_0()
+                            .tooltip(move |window, cx| {
+                                gpui_kit::component::tooltip::Tooltip::new(label).build(window, cx)
+                            })
+                    }),
             )
             .on_click(cx.listener(|this, index: &usize, _, cx| {
                 this.tab = *index;
@@ -656,58 +1573,378 @@ impl Render for StagePanelsPane {
             3 => self.activities(cx),
             _ => self.space(cx),
         };
+        // One panel, one scroll area: the title row and the partition picker stay
+        // fixed, so no amount of scrolling can push the partition choice or the
+        // mode readout out of the panel.
+        let surface = v_flex()
+            .size_full()
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .gap(px(metrics::PANEL_GROUP_GAP))
+            .p(px(metrics::PANEL_PADDING))
+            .rounded(px(metrics::PANEL_RADIUS))
+            .bg(rgba(s::CARD_BG))
+            .border_1()
+            .border_color(rgba(s::BORDER))
+            .text_color(rgba(s::TEXT))
+            .text_size(px(metrics::GROUP_TEXT_SIZE))
+            .font_family(doc::FONT_FAMILY)
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_size(px(metrics::TITLE_SIZE))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("舞台设置"),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(px(metrics::MODE_SIZE))
+                            .text_color(rgba(metrics::MODE_TEXT))
+                            .child(mode_readout(mode)),
+                    ),
+            )
+            .child(tabs)
+            .child(
+                div()
+                    .id("stage-panel-scroll")
+                    .w_full()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .pb(px(metrics::CONTENT_BOTTOM_PADDING))
+                    .child(body),
+            );
         if self.embedded {
-            return div().size_full().min_h(px(0.)).font_family(cx.theme().font_family.clone())
-                .text_size(px(ui::BODY)).text_color(cx.theme().foreground)
-                .child(div().id("embedded-stage-scroll").size_full().overflow_y_scroll().child(body))
+            // The settings window gives the pane its own frame and page chrome;
+            // only the outer 7 pt shadow padding is dropped.
+            return div()
+                .size_full()
+                .min_h(px(0.))
+                .child(surface)
                 .into_any_element();
         }
         div()
-            .font_family(cx.theme().font_family.clone())
-            .text_size(px(ui::BODY))
-            .line_height(px(ui::BODY_LINE_HEIGHT))
-            .w(px(STAGE_PANEL_WIDTH))
-            .h(px(STAGE_PANEL_HEIGHT))
-            .p(px(7.))
-            .child(
-                div()
-                    .size_full()
-                    .flex()
-                    .flex_col()
-                    .gap(px(ui::SPACING_12))
-                    .p(px(ui::SPACING_16))
-                    .rounded(px(18.))
-                    .bg(rgb(0x13161b))
-                    .border_1()
-                    .border_color(rgb(0x34373c))
-                    .text_color(rgb(0xe5e7ea))
-                    .text_size(px(ui::CAPTION))
-                    .child(
-                        div()
-                            .flex()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(ui::SUBTITLE))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("舞台设置"),
-                            )
-                            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(
-                                if self.snapshot["space"]["isRequested"].as_bool() == Some(true) {
-                                    "正在空间中"
-                                } else {
-                                    "正在播放器中"
-                                },
-                            )),
-                    )
-                    .child(tabs)
-                    .child(
-                        div()
-                            .id("stage-panel-scroll")
-                            .flex_1()
-                            .overflow_y_scroll()
-                            .child(body),
-                    ),
-            ).into_any_element()
+            .w_full()
+            .h_full()
+            .max_w(px(STAGE_PANEL_WIDTH))
+            .max_h(px(STAGE_PANEL_HEIGHT))
+            .p(px(metrics::PANEL_OUTER_PADDING))
+            .child(surface)
+            .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // gpui re-exports a `test` attribute macro; `super::*` would shadow the
+    // built-in one, so name it explicitly like the rest of this crate does.
+    use core::prelude::v1::test;
+    use serde_json::json;
+
+    use super::*;
+
+    /// The four partitions and their order are the original `CaseIterable`
+    /// order; renaming or reordering a partition fails here.
+    #[test]
+    fn partitions_are_the_original_four_in_original_order() {
+        assert_eq!(STAGE_TABS, ["播放器", "空间", "角色", "活动"]);
+        assert_eq!(tab_for_name("player"), 0);
+        assert_eq!(tab_for_name("space"), 1);
+        assert_eq!(tab_for_name("motions"), 2);
+        assert_eq!(tab_for_name("activities"), 3);
+        // An unknown host name must not land on 播放器.
+        assert_eq!(tab_for_name("nonsense"), StageMode::Space.tab());
+    }
+
+    /// `StageControlPanelTab.initial`: with the radio plugin off — the default —
+    /// every entry point lands on 「空间」.
+    #[test]
+    fn initial_partition_follows_the_original_radio_plugin_rule() {
+        assert_eq!(initial_tab(false, StageMode::Player), 1);
+        assert_eq!(initial_tab(false, StageMode::Space), 1);
+        assert_eq!(initial_tab(true, StageMode::Player), 0);
+        assert_eq!(initial_tab(true, StageMode::Space), 1);
+        assert_ne!(
+            initial_tab(true, StageMode::Player),
+            initial_tab(false, StageMode::Player)
+        );
+    }
+
+    /// The group set and order per mode must match `visibleGroups`, which is not
+    /// the order the widgets are written in.
+    #[test]
+    fn group_order_matches_the_original_per_mode() {
+        assert_eq!(
+            visible_groups(StageMode::Space),
+            [
+                VisualGroup::WorldSelection,
+                VisualGroup::AvatarPlacement,
+                VisualGroup::LoadingStatus,
+            ]
+        );
+        assert_eq!(
+            visible_groups(StageMode::Player),
+            [
+                VisualGroup::LyricsEffects,
+                VisualGroup::PointCloud,
+                VisualGroup::ParticleSize,
+                VisualGroup::MusicVideo,
+            ]
+        );
+        assert_ne!(
+            visible_groups(StageMode::Space),
+            visible_groups(StageMode::Player)
+        );
+        // Particle size sits between the point cloud and the music video, not
+        // inside the point-cloud group.
+        let player = visible_groups(StageMode::Player);
+        assert_eq!(player[1], VisualGroup::PointCloud);
+        assert_eq!(player[2], VisualGroup::ParticleSize);
+        assert_eq!(player[3], VisualGroup::MusicVideo);
+    }
+
+    #[test]
+    fn mode_readout_and_resolution_come_from_the_requested_world() {
+        assert_eq!(StageMode::resolve(true), StageMode::Space);
+        assert_eq!(StageMode::resolve(false), StageMode::Player);
+        assert_eq!(mode_readout(StageMode::Space), "正在空间中");
+        assert_eq!(mode_readout(StageMode::Player), "正在播放器中");
+        assert_eq!(
+            stage_mode(&json!({"space":{"isRequested":true}})),
+            StageMode::Space
+        );
+        assert_eq!(stage_mode(&json!({"space":{}})), StageMode::Player);
+    }
+
+    #[test]
+    fn activity_availability_matches_the_original_three_messages() {
+        assert!(activity_can_run(true, Some("world"), Some("world")));
+        assert!(!activity_can_run(true, Some("world"), Some("other")));
+        assert!(!activity_can_run(true, None, Some("world")));
+        assert!(!activity_can_run(true, Some("world"), None));
+        assert!(!activity_can_run(false, Some("world"), Some("world")));
+        assert_eq!(
+            activity_unavailable_message(true, false),
+            "这个空间还没有配置生活活动。"
+        );
+        assert_eq!(
+            activity_unavailable_message(false, true),
+            "空间载入完成后可选择活动。"
+        );
+        assert_eq!(
+            activity_unavailable_message(false, false),
+            "进入空间后可选择生活活动。"
+        );
+    }
+
+    /// The adaptive grid must reproduce SwiftUI's `GridItem(.adaptive(minimum:))`
+    /// counts inside the original 544 pt grid width; the SwiftUI panel measures
+    /// lyrics at 5 columns and point cloud / video at 4.
+    #[test]
+    fn adaptive_grid_reproduces_the_original_column_counts() {
+        let width = grid_width();
+        assert_eq!(width, 544.);
+        assert_eq!(adaptive_columns(metrics::GRID_MIN_LYRICS, width, 6.), 5);
+        assert_eq!(adaptive_columns(metrics::GRID_MIN_POINT_CLOUD, width, 6.), 4);
+        assert_eq!(adaptive_columns(metrics::GRID_MIN_VIDEO, width, 6.), 4);
+        assert_eq!(
+            adaptive_tile_width(metrics::GRID_MIN_LYRICS, width, 6.),
+            104.
+        );
+        assert_eq!(
+            adaptive_tile_width(metrics::GRID_MIN_POINT_CLOUD, width, 6.),
+            131.5
+        );
+        assert_eq!(
+            adaptive_tile_width(metrics::GRID_MIN_VIDEO, width, 6.),
+            131.5
+        );
+        // A narrower grid degrades to one column instead of zero or a negative
+        // tile width.
+        assert_eq!(adaptive_columns(90., 40., 6.), 1);
+        assert!(adaptive_tile_width(90., 40., 6.) > 0.);
+        assert_eq!(adaptive_columns(90., 0., 6.), 1);
+        assert_ne!(
+            adaptive_columns(metrics::GRID_MIN_LYRICS, width, 6.),
+            adaptive_columns(metrics::GRID_MIN_POINT_CLOUD, width, 6.)
+        );
+    }
+
+    #[test]
+    fn loading_status_order_and_colours_match_the_original() {
+        assert_eq!(
+            world_loading_status(true, false, None, None),
+            Some(WorldStatus::Loading)
+        );
+        // A requested-but-invisible world wins over both messages.
+        assert_eq!(
+            world_loading_status(true, false, Some("生成中"), Some("失败")),
+            Some(WorldStatus::Loading)
+        );
+        assert_eq!(world_loading_status(false, true, None, None), None);
+        // A whitespace-only host message is not a status, so it must not become
+        // an empty status line with a busy icon.
+        assert_eq!(world_loading_status(false, true, Some(""), Some("  ")), None);
+        assert_eq!(world_loading_status(false, true, Some("  "), None), None);
+        // The generation message wins over the error message.
+        assert_eq!(
+            world_loading_status(false, true, Some("生成中"), Some("失败")),
+            Some(WorldStatus::Generating("生成中"))
+        );
+        assert_eq!(
+            world_loading_status(false, true, None, Some("生成失败")),
+            Some(WorldStatus::Failed("生成失败"))
+        );
+        assert_ne!(
+            metrics::FAILURE_TEXT,
+            metrics::LOADING_TEXT,
+            "a failed generation must not read in the loading colour"
+        );
+    }
+
+    #[test]
+    fn motion_notice_priority_matches_the_original() {
+        assert_eq!(motion_notice(0, 0, "", None), MotionNotice::Empty);
+        assert_eq!(motion_notice(3, 0, "", None), MotionNotice::None);
+        assert_eq!(
+            motion_notice(3, 0, "dance", Some("列表暂不可用")),
+            MotionNotice::ListNotice("列表暂不可用")
+        );
+        assert_eq!(
+            motion_notice(3, 0, "dance", None),
+            MotionNotice::CategoryEmpty
+        );
+        // An empty notice string must not suppress the empty-category message.
+        assert_eq!(
+            motion_notice(3, 0, "dance", Some("")),
+            MotionNotice::CategoryEmpty
+        );
+        assert_eq!(motion_notice(3, 2, "dance", None), MotionNotice::None);
+        assert_ne!(motion_notice(0, 0, "dance", None), MotionNotice::CategoryEmpty);
+    }
+
+    #[test]
+    fn motion_category_filter_and_picker_index_select_and_clear() {
+        let motion = json!({"id":"m","category":"dance"});
+        assert!(motion_in_category(&motion, ""));
+        assert!(motion_in_category(&motion, "dance"));
+        assert!(!motion_in_category(&motion, "idle"));
+        let categories = vec![json!({"id":"dance"}), json!({"id":"idle"})];
+        assert_eq!(motion_category_index("", &categories), 0);
+        assert_eq!(motion_category_index("dance", &categories), 1);
+        assert_eq!(motion_category_index("idle", &categories), 2);
+        // A category the host no longer lists must not silently select another.
+        assert_eq!(motion_category_index("gone", &categories), 0);
+    }
+
+    /// The readout the original prints beside a slider: `Int(value * 100)` with a
+    /// percent sign, trailing-aligned in 38 pt.
+    #[test]
+    fn slider_readout_is_the_original_integer_percent() {
+        assert_eq!(StagePanelsPane::slider_readout(1.), "100%");
+        assert_eq!(StagePanelsPane::slider_readout(0.6), "60%");
+        assert_eq!(StagePanelsPane::slider_readout(0.155), "16%");
+        assert_eq!(StagePanelsPane::slider_readout(0.15), "15%");
+        assert_ne!(StagePanelsPane::slider_readout(0.5), "0.5%");
+    }
+
+    /// The panel draws in a real GPUI window in all four partitions, so a broken
+    /// layout or an unreachable partition shows up as a failed draw.
+    #[test]
+    fn pane_draws_every_partition_in_a_real_window() {
+        use gpui_kit::{AppContext, TestAppContext};
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let stored = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let entity = stored.clone();
+        let handle = cx.add_window(move |window, cx| {
+            let pane = cx.new(|cx| {
+                let mut pane = super::StagePanelsPane::new(window, cx);
+                let snapshot = json!({
+                    "stageRadioPluginEnabled": true,
+                    "space": {
+                        "isRequested": true,
+                        "isVisible": true,
+                        "selectedWorldID": "world",
+                        "worldLabel": "公开空间 · 示例",
+                        "position": {"X": 0.5, "Y": -1.0, "Z": 2.0},
+                        "worlds": [{"id":"world","name":"示例"}],
+                        "presets": [{"id":"preset","name":"雪原"}],
+                        "errorMessage": "生成失败"
+                    },
+                    "player": {
+                        "lyricID": "classic",
+                        "cloudID": "soft",
+                        "videoMode": "full",
+                        "particleScale": 1.2,
+                        "videoBrightness": 0.4,
+                        "lyrics": [{"id":"classic","name":"经典"}],
+                        "clouds": [{"id":"soft","name":"柔光"}],
+                        "videoModes": [{"id":"full","name":"全屏"}],
+                        "videoAssets": [{"id":"a","name":"片段"}],
+                        "videoActive": true,
+                        "videoAssetID": "a"
+                    },
+                    "motions": {
+                        "avatarName": "小满",
+                        "activeID": "wave",
+                        "isWorking": false,
+                        "categories": [{"id":"dance","name":"舞蹈"}],
+                        "items": [{"id":"wave","name":"挥手","category":"dance","compatible": true}],
+                        "notice": null,
+                        "message": "已载入"
+                    },
+                    "activities": {
+                        "canRun": true,
+                        "activeID": "walk",
+                        "items": [{"id":"walk","name":"散步"}],
+                        "message": "进行中"
+                    }
+                });
+                pane.update_snapshot(snapshot, window, cx);
+                pane
+            });
+            *entity.borrow_mut() = Some(pane.clone());
+            gpui_kit::base::Root::new(pane, window, cx)
+        });
+        for tab in 0..4 {
+            cx.update_window(handle.into(), |_, window, cx| {
+                stored
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |pane, cx| {
+                        pane.tab = tab;
+                        cx.notify();
+                    });
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        }
+        // Space mode with the plugin on selects the space partition, and a later
+        // snapshot must not reset the person's choice.
+        cx.update_window(handle.into(), |_, window, cx| {
+            let pane = stored.borrow().as_ref().unwrap().clone();
+            assert_eq!(pane.read(cx).tab, 3, "the loop left the last partition up");
+            pane.update(cx, |pane, cx| {
+                // A mode change re-renders the same partition: the person's
+                // choice is not reset by `update_snapshot`.
+                pane.update_snapshot(
+                    json!({"space":{"isRequested":false},"player":{"lyricID":"classic"}}),
+                    window,
+                    cx,
+                );
+                assert_eq!(pane.tab, 3, "a mode change keeps the chosen partition");
+                assert!(pane.snapshot["player"]["lyricID"] == "classic");
+            });
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
     }
 }

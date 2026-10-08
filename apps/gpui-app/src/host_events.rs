@@ -30,7 +30,11 @@ pub fn parse(bytes: &[u8]) -> Result<Batch, ()> {
     let mut transcript = Vec::new();
     for line in state.get("transcript").and_then(Value::as_array).ok_or(())? {
         let role = line.get("role").and_then(Value::as_str).ok_or(())?;
-        let speaker = match role { "user" => "你", "agent" => "居民", "notice" => "系统", _ => return Err(()) };
+        // A notice has **no** speaker label; the chat layer recognises it by the
+        // empty label plus the warning colour (`chat.rs::speaker_label`,
+        // `StageOverlayView.swift:248-263`). Projecting a "系统" label would make
+        // the same line render as a labelled person somewhere else.
+        let speaker = match role { "user" => "你", "agent" => "居民", "notice" => "", _ => return Err(()) };
         transcript.push(TranscriptLine {
             speaker: speaker.into(),
             text: line.get("text").and_then(Value::as_str).ok_or(())?.into(),
@@ -58,7 +62,16 @@ mod tests {
         let batch = parse(br#"{"events":[{"kind":"completed","requestID":2}],"state":{"contextID":"world:a","transcript":[{"role":"notice","text":"done"}]}}"#).unwrap();
         assert_eq!(batch.events[0].kind, "completed");
         assert!(batch.events[0].text.is_none());
-        assert_eq!(batch.transcript[0].speaker, "系统");
+        // A notice is unlabelled, exactly as `chat.rs::speaker_label` expects.
+        assert_eq!(batch.transcript[0].speaker, "");
+        assert!(gmgn_gpui_ui::chat::speaker_label(&batch.transcript[0].speaker).notice);
+        assert_eq!(gmgn_gpui_ui::chat::plain_text(&batch.transcript), "done");
         assert_eq!(batch.state["contextID"], "world:a");
+    }
+    #[test]
+    fn notice_labels_never_leak_onto_the_other_speakers() {
+        let batch = parse(r#"{"events":[],"state":{"transcript":[{"role":"user","text":"问"},{"role":"agent","text":"答"},{"role":"notice","text":"提示"}]}}"#.as_bytes()).unwrap();
+        assert_eq!(batch.transcript.iter().map(|line|line.speaker.as_str()).collect::<Vec<_>>(), ["你","居民",""]);
+        assert_eq!(gmgn_gpui_ui::chat::plain_text(&batch.transcript), "你：问\n\n居民：答\n\n提示");
     }
 }

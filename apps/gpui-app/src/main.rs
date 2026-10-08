@@ -6,7 +6,15 @@ use gmgn_gpui_ui::inbox::InboxPane;
 use gmgn_gpui_ui::stage_panels::{StagePanelsPane,StageProgramRailPane,ResidentPropEditorPane};
 use gmgn_gpui_ui::lyrics::{StageLyricsPane,StageBoundVideoPromptPane};
 use gpui_kit::*;
+use gpui_kit::assets::IconName;
 use gpui_kit::prelude::FluentBuilder;
+use gmgn_gpui_ui::primitives as ui;
+use gmgn_gpui_ui::shell::{self, TransportControl};
+use gmgn_gpui_ui::ui_tokens::chat as chat_metrics;
+use gmgn_gpui_ui::ui_tokens::scene as scene_tokens;
+use gmgn_gpui_ui::ui_tokens::shell as shell_metrics;
+use gmgn_gpui_ui::ui_tokens::stage as stage_metrics;
+use gmgn_gpui_ui::ui_tokens::{BODY as BODY_SIZE, BODY_LINE_HEIGHT, CAPTION as CAPTION_SIZE, FONT_FAMILY};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{cell::RefCell, rc::Rc, time::Duration,ffi::{c_void,c_char,CStr}};
 mod host_events;
@@ -52,10 +60,108 @@ unsafe extern "C" {
     fn gmgn_gpui_bitmap_drop_string_free(value:*mut c_char);
 }
 
-fn composer_frame(compact:bool,width:f32,height:f32)->[f32;4] {
-    if compact {[10.,height-80.,(width-58.).max(0.),70.]} else {
-        let w=(width-44.).clamp(0.,620.);let h=(height-108.).clamp(0.,320.);
-        [width-22.-w,height-86.-h,w,h]
+/// The only two shell values the shared foundation deliberately does **not**
+/// own.
+///
+/// Everything else this module used to carry now lives in `ui_tokens::shell`
+/// (transport bar + divider, destination frame/border/tint/glyph size, task
+/// banners, unread badge, screen banner and the Live Cam control column) and is
+/// referenced through `shell_metrics`; `ui_tokens::stage`/`scene` keep the shared
+/// control row and fixed dark palette. Each entry below names why it cannot move:
+mod chrome {
+    /// Cleared window background: the scene is composited natively underneath,
+    /// so the GPUI root must stay fully transparent. This is a GPUI/AppKit
+    /// compositing fact with no Swift `Color` to copy, so it has no
+    /// `ui_tokens` source to cite.
+    pub const WINDOW_CLEAR: u32 = 0x00000000;
+
+    /// Scroll ceiling of the whole notice stack (host-side; the original's
+    /// `maximumHeight: 132` is unused by the current `WishMachineTaskStatusView`).
+    /// This is host scroll policy rather than an original reading, so it stays
+    /// out of the foundation's original-sourced metrics.
+    pub const TASK_MAX_HEIGHT: f32 = 220.;
+}
+
+/// The original transport row, in order (`StageWindowController.swift:2823-2828`):
+/// 节目 ｜ 上首 ｜ 播放 ｜ 下首 ｜ ⋮ ｜ 语音 ｜ 聊天 ｜ 通知 ｜ 装修 ｜ 屏幕操作 ｜
+/// 舞台设置 ｜ 窗口. The divider sits after 下首 (`:2868`).
+const TRANSPORT_CONTROLS: [(&str, &str, &str); 11] = [
+    ("program", "节目", "program"),
+    ("previous", "上首", "previousTrack"),
+    ("play", "播放", "togglePlayback"),
+    ("next", "下首", "nextTrack"),
+    ("voice", "语音", "voice"),
+    ("chat", "聊天", "chat"),
+    ("inbox", "通知", "showNotifications"),
+    ("props", "装修", "toggleDecoration"),
+    ("screen", "屏幕操作", "screen"),
+    ("visual", "舞台设置", "visual"),
+    ("mode", "窗口", "mode"),
+];
+
+/// The Live Cam entries, in order (`LiveCamPanel.swift:689-712`): 空间 ｜ 播放器
+/// ｜ 文字聊天 ｜ 通知 ｜ 语音 ｜ 设置.
+const COMPACT_CONTROLS: [(&str, &str, &str); 6] = [
+    ("space", "空间", "showStage"),
+    ("player", "音乐", "showPlayer"),
+    ("chat", "聊天", "chat"),
+    ("inbox", "通知", "showNotifications"),
+    ("voice", "语音", "voice"),
+    ("settings", "设置", "settings"),
+];
+
+/// One transport control's width (`StageOverlayView.swift:2686-2689`).
+///
+/// The host no longer derives this itself: [`TransportControl::slot_width`] in
+/// `gmgn_gpui_ui::shell` is the one derivation, and `shell::transport_width`
+/// sums it to place the bar.
+
+/// The Live Cam composer height, read through the shared chat surface so the
+/// host and the pane cannot answer this differently
+/// (`apps/gpui-ui/src/chat.rs::compact_composer_height`, from
+/// `LiveCamPanel.swift:744-749`: 70 pt idle, 140 pt with a pending attachment).
+fn compact_composer_height(runtime_state: &serde_json::Value) -> f32 {
+    let mut state = gmgn_gpui_ui::state::ChatState::default();
+    if runtime_state["attachments"].as_array().is_some_and(|images| !images.is_empty()) {
+        state.attachments.push(gmgn_gpui_ui::state::ChatAttachment {
+            id: String::new(),
+            file_name: String::new(),
+            preview_path: None,
+            thumbnail_png: None,
+        });
+    }
+    state.attachments_preparing = runtime_state["attachmentsPreparing"].as_bool() == Some(true);
+    state.attachments_error = runtime_state["attachmentError"]
+        .as_str()
+        .filter(|error| !error.is_empty())
+        .map(str::to_owned);
+    gmgn_gpui_ui::chat::compact_composer_height(&state)
+}
+
+/// Where the resident composer sits, as `[x, y, width, height]`.
+///
+/// Every number comes from the shared tokens and the shared compact height; the
+/// host keeps no second copy of the composer's size, and the pane itself caps at
+/// `chat_metrics::PANEL_MAX_WIDTH/MAX_HEIGHT`. Anchors in the original:
+/// trailing/leading 22, bottom = transport top − 16, top ≥ 22
+/// (`StageWindowController.swift:1526-1531`), and in the Live Cam window
+/// leading 10, bottom 10, trailing at the reserved control column
+/// (`LiveCamPanel.swift:880-890`).
+fn composer_frame(compact: bool, width: f32, height: f32, compact_height: f32) -> [f32; 4] {
+    if compact {
+        let right = shell_metrics::COMPACT_CONTENT_RIGHT;
+        let available = (height - shell_metrics::COMPACT_MARGIN - compact_height).max(0.);
+        [
+            shell_metrics::COMPACT_MARGIN,
+            available,
+            (width - right - shell_metrics::COMPACT_MARGIN).max(0.),
+            compact_height,
+        ]
+    } else {
+        let bottom = shell_metrics::TRANSPORT_INSET + shell_metrics::TRANSPORT_HEIGHT + shell_metrics::COMPOSER_GAP;
+        let w = (width - 2. * shell_metrics::TRANSPORT_INSET).clamp(0., chat_metrics::PANEL_MAX_WIDTH);
+        let h = (height - bottom - shell_metrics::TASK_FEEDBACK_INSET).clamp(0., chat_metrics::PANEL_MAX_HEIGHT);
+        [width - shell_metrics::TRANSPORT_INSET - w, height - bottom - h, w, h]
     }
 }
 fn inbox_unread(state:&serde_json::Value)->usize {
@@ -72,24 +178,58 @@ fn compact_reply_text(state:&serde_json::Value, transcript:&[TranscriptLine])->O
     state["reply"].as_str().map(str::trim).filter(|text|!text.is_empty()).map(str::to_owned)
         .or_else(||transcript.iter().rev().find(|line|line.speaker=="居民").map(|line|line.text.clone()))
 }
+/// The expanded Live Cam reply: the whole history, plus the background reply
+/// when it is not already the history's last resident line. Both decisions come
+/// from the shared chat surface (`chat::plain_text`/`chat::standalone_reply`),
+/// so the host and the pane label a notice exactly the same way.
 fn expanded_reply_text(transcript:&[TranscriptLine], latest:&str)->String {
-    let mut content=transcript.iter().map(|line|if line.speaker.is_empty(){line.text.clone()}else{format!("{}：{}",line.speaker,line.text)}).collect::<Vec<_>>().join("\n\n");
-    let normalized=latest.trim();
-    if !normalized.is_empty() && transcript.iter().rev().find(|line|line.speaker=="居民").map(|line|line.text.as_str())!=Some(normalized) {
-        if !content.is_empty(){content.push_str("\n\n");}
-        content.push_str(normalized);
+    let content=gmgn_gpui_ui::chat::plain_text(transcript);
+    match gmgn_gpui_ui::chat::standalone_reply(latest,transcript) {
+        Some(standalone) if content.is_empty()=>standalone,
+        Some(standalone)=>{let mut content=content;content.push_str("\n\n");content.push_str(&standalone);content}
+        None=>content,
     }
-    content
 }
-fn control_icon(id:&str)->gpui_kit::assets::IconName {
-    use gpui_kit::assets::IconName;
+/// Kit icons for the transport and Live Cam entries.
+///
+/// Kit ships the whole Lucide set, so each kit icon names the original SF Symbol
+/// it replaces (`StageWindowController.swift:2955-3760`, `LiveCamPanel.swift:689-712`).
+/// `props`/`screen` used to fall back to `Package`/`Monitor`, which describe a
+/// box and a display rather than the original `square.stack.3d.up`/`hand.tap`.
+fn control_icon(id:&str)->IconName {
     match id {
-        "space"=>IconName::House,"player"=>IconName::Music,"program"=>IconName::ListMusic,
-        "previous"=>IconName::SkipBack,"next"=>IconName::SkipForward,"play"=>IconName::Play,
-        "voice"=>IconName::Mic,"chat"=>IconName::MessageCircle,"inbox"=>IconName::Mail,
-        "props"=>IconName::Package,"screen"=>IconName::Monitor,"visual"=>IconName::SlidersHorizontal,
+        // cube.transparent · music.note · music.note.list
+        "space"=>IconName::Globe,"player"=>IconName::Music,"program"=>IconName::FileText,
+        // backward.end.fill · forward.end.fill · play.fill/pause.fill
+        "previous"=>IconName::ChevronLeft,"next"=>IconName::ChevronRight,"play"=>IconName::Play,
+        // mic.fill · bubble.left · envelope.badge
+        "voice"=>IconName::Mic,"chat"=>IconName::Bot,"inbox"=>IconName::Bell,
+        // square.stack.3d.up · hand.tap · slider.horizontal.3 · window mode
+        "props"=>IconName::SquareStack,"screen"=>IconName::MousePointerClick,"visual"=>IconName::Settings,
         "mode"=>IconName::Maximize,_=>IconName::Settings,
     }
+}
+/// `StageVoiceButton.setState` (`StageWindowController.swift:3547-3576`): the
+/// glyph follows the realtime voice state, not only the local press.
+fn voice_icon(state:Option<&str>)->IconName {
+    match state.unwrap_or("disconnected") {
+        // hourglass
+        state if state.starts_with("connecting")=>IconName::Hourglass,
+        // waveform.circle.fill
+        state if state.starts_with("listening")=>IconName::AudioWaveform,
+        // speaker.wave.2.fill
+        state if state.starts_with("speaking")=>IconName::Volume2,
+        // exclamationmark.triangle.fill
+        state if state.starts_with("failed")=>IconName::TriangleAlert,
+        _=>IconName::Mic,
+    }
+}
+/// The 窗口 entry is a two-state control (`StageWindowMode.swift:5-21`):
+/// `arrow.up.left.and.arrow.down.right` + "进入全屏" while windowed,
+/// `arrow.down.right.and.arrow.up.left` + "退出全屏" while full screen. Kit has
+/// the Lucide `maximize`/`minimize` pair for exactly that.
+fn window_mode_content(fullscreen:bool)->(IconName,&'static str) {
+    if fullscreen {(IconName::Minimize,"退出全屏")} else {(IconName::Maximize,"进入全屏")}
 }
 
 struct GMGNProductUI {
@@ -507,7 +647,7 @@ impl GMGNProductUI {
         App::defer(cx,move |cx| {
         let content=entity.clone();
         let handle=cx.open_window(WindowOptions {
-            window_bounds:Some(WindowBounds::Windowed(Bounds::new(location,if compact{size(px(224.),px(336.))}else{size(px(1180.),px(760.))}))),
+            window_bounds:Some(WindowBounds::Windowed(Bounds::new(location,if compact{size(px(shell_metrics::COMPACT_WIDTH),px(shell_metrics::COMPACT_HEIGHT))}else{size(px(1180.),px(760.))}))),
             window_min_size:if compact{None}else{Some(size(px(760.),px(520.)))},
             kind:if compact{WindowKind::PopUp}else{WindowKind::Normal},
             titlebar:if compact{None}else{Some(TitlebarOptions{appears_transparent:true,..Default::default()})},
@@ -515,7 +655,7 @@ impl GMGNProductUI {
             ..Default::default()
         },move |window,cx| {
             window.set_window_title("gmgn radio");
-            cx.new(|cx|gpui_kit::base::Root::new(content,window,cx).bg(rgba(0x00000000)))
+            cx.new(|cx|gpui_kit::base::Root::new(content,window,cx).bg(rgba(chrome::WINDOW_CLEAR)))
         });
         let Ok(handle)=handle else {entity.update(cx,|ui,cx|{ui.profile_switch_pending=false;ui.core_notice=Some("窗口切换未完成。".into());cx.notify();});return;};
         entity.update(cx,|ui,cx| {
@@ -540,32 +680,24 @@ impl GMGNProductUI {
         eprintln!("GMGN_GPUI_PROFILE_WINDOW compact={compact} created=true previous_closed={closed}");
         });
     }
-    fn control(&self,id:&'static str,label:&'static str,action:&'static str,width:f32,height:f32,cx:&mut Context<Self>)->impl IntoElement {
-        let label=if id=="chat"&&!self.compact&&self.runtime_state["stage"]["presentation"]["chatAvailable"].as_bool()!=Some(true){"进入空间后与居民聊天"}else if id=="visual" {if self.stage_panel_open{"收起设置"}else{"舞台设置：播放器、空间、角色与活动"}}else if id=="screen" {
-            if self.runtime_state["screenOperation"]["active"].as_bool()==Some(true){"完成操作（Esc）"}
-            else if self.runtime_state["screenOperation"]["available"].as_bool()==Some(true){"操作电视"}
-            else {"这块空间里还没有在放的电视"}
-        }else if id=="chat"&&!self.compact {if self.chat_open{"收起聊天"}else{"与居民聊天"}}else{label};
-        let button=Button::new(id).ghost();
-        let button=if id=="chat"&&!self.compact {
-            button.when_some(system_symbol::tinted_image(if self.chat_open{"bubble.left.fill"}else{"bubble.left"},if self.chat_open{1}else{2}),|button,image|button.child(img(image).w(px(16.)).h(px(16.)).object_fit(ObjectFit::Contain)))
-                .when(self.chat_open,|button|button.bg(rgba(system_symbol::system_blue_background())))
-        }else{button.icon(if id=="visual"&&self.stage_panel_open {gpui_kit::assets::IconName::X}else if id=="play"&&self.runtime_state["playbackState"].as_str()==Some("playing"){gpui_kit::assets::IconName::Pause}else{control_icon(id)})};
-        let button=button
-            .accessibility_label(label).tooltip(label).w(px(width)).h(px(height));
-        let button=if id=="visual"{button.px(px(6.)).child(div().text_size(px(12.)).whitespace_nowrap().child(if self.stage_panel_open{"收起"}else{"设置"}))}else{button};
-        let button=if self.compact {button.rounded(px(15.)).bg(rgba(0x1f1f1ff0)).border_1().border_color(rgba(0xffffff2e)).text_color(rgb(0xffffff))}else{button};
-        let button=if id=="screen"{button.disabled(self.runtime_state["screenOperation"]["available"].as_bool()!=Some(true))}else{button};
-        let button=if id=="chat"&&!self.compact{button.disabled(self.runtime_state["stage"]["presentation"]["chatAvailable"].as_bool()!=Some(true))}else if id=="props"{button.disabled(self.runtime_state["stage"]["presentation"]["propsAvailable"].as_bool()!=Some(true))}else{button};
-        let button=if !self.compact {
-            match id {
-                "previous"=>button.disabled(self.runtime_state["liveCamPlayerMenu"]["canSelectPrevious"].as_bool()!=Some(true)),
-                "play"=>button.disabled(self.runtime_state["liveCamPlayerMenu"]["canTogglePlayback"].as_bool()!=Some(true)),
-                "next"=>button.disabled(self.runtime_state["liveCamPlayerMenu"]["canSelectNext"].as_bool()!=Some(true)),
-                _=>button
-            }
-        }else{button};
-        let button=if id=="player"&&self.compact {
+    /// One Live Cam column control, built from the shared primitive
+    /// (`primitives::icon_button`); the host adds only the Live Cam surface the
+    /// original draws (`LiveCamPanel.swift:945-950`). No control here is a
+    /// hand-rolled `div`.
+    ///
+    /// The bottom transport bar is **not** built here: the host supplies state
+    /// and semantics through [`Self::transport_controls`] and `shell::transport_bar`
+    /// owns its rendering.
+    fn compact_control(&self,id:&'static str,label:&'static str,action:&'static str,cx:&mut Context<Self>)->AnyElement {
+        let icon=if id=="voice" {voice_icon(self.runtime_state["voiceState"].as_str())} else {control_icon(id)};
+        let active=match id {"chat"=>self.chat_open,"props"=>self.props_open,_=>false};
+        let button=ui::icon_button(id,icon,label,active)
+            .w(px(shell_metrics::COMPACT_CONTROL)).h(px(shell_metrics::COMPACT_CONTROL))
+            .rounded(px(scene_tokens::CONTROL_RADIUS))
+            .bg(rgba(shell_metrics::COMPACT_CONTROL_BG))
+            .border_1().border_color(rgba(shell_metrics::COMPACT_CONTROL_BORDER))
+            .text_color(rgba(shell_metrics::COMPACT_TINT));
+        let mut control=if id=="player" {
             let snapshot=self.runtime_state["liveCamPlayerMenu"].clone();let weak=cx.entity().downgrade();let popup_weak=weak.clone();
             button.dropdown_menu(move |menu,_,_| {
                 let mut menu=menu.item(PopupMenuItem::new(snapshot["menuTitle"].as_str().unwrap_or("播放器尚未准备好").to_owned()).disabled(true)).separator();
@@ -575,7 +707,7 @@ impl GMGNProductUI {
                 }
                 let weak=weak.clone();menu.separator().item(PopupMenuItem::new("进入播放器").on_click(move |_,_,cx|{let _=weak.update(cx,|ui,cx|ui.native_action("showPlayer",cx));}))
             }).on_open_change(move |open,_,cx|{let _=popup_weak.update(cx,|ui,cx|{ui.player_menu_open=*open;cx.notify();});}).into_any_element()
-        }else if action=="voice" {
+        } else if action=="voice" {
             button.on_mouse_down(MouseButton::Left,cx.listener(|this,_,_,cx|this.voice_gesture(true,cx)))
                 .on_mouse_up(MouseButton::Left,cx.listener(|this,_,_,cx|this.voice_gesture(false,cx)))
                 .on_mouse_up_out(MouseButton::Left,cx.listener(|this,_,_,cx|this.voice_gesture(false,cx))).into_any_element()
@@ -585,12 +717,134 @@ impl GMGNProductUI {
             else if action=="showPlayer" {this.switch_profile(false,Some("player"),window,cx);}
             else {this.overlay_action(action,cx);}
         })).into_any_element()};
-        let mut control=div().relative().w(px(width)).h(px(height)).child(button);
         let count=inbox_unread(&self.runtime_state);
         if id=="inbox"&&count>0 {
-            control=control.child(div().absolute().top(px(1.)).left(px(width/2.+4.)).min_w(px(14.)).h(px(14.)).rounded(px(7.)).bg(rgba(0xff453ae6)).text_color(rgb(0xffffff)).text_size(px(9.)).flex().items_center().justify_center().child(if count>99{"99+".into()}else{count.to_string()}));
+            control=div().relative().w(px(shell_metrics::COMPACT_CONTROL)).h(px(shell_metrics::COMPACT_CONTROL)).child(control)
+                .child(div().absolute().top(px(shell_metrics::BADGE_TOP)).left(px(shell_metrics::COMPACT_CONTROL/2.+shell_metrics::BADGE_OFFSET))
+                    .min_w(px(shell_metrics::BADGE_SIZE)).h(px(shell_metrics::BADGE_SIZE)).rounded(px(shell_metrics::BADGE_RADIUS))
+                    .bg(rgba(shell_metrics::BADGE_BG)).text_color(rgba(shell_metrics::BADGE_TEXT)).text_size(px(shell_metrics::BADGE_FONT))
+                    .flex().items_center().justify_center().child(if count>99{"99+".into()}else{count.to_string()})).into_any_element();
         }
-        control
+        control.into_any_element()
+    }
+
+    /// The bottom transport row's **state and semantics** — the original order,
+    /// each entry's action name, its enabled condition, its live label/icon and
+    /// whether it toggles, holds or badged. `shell::transport_bar` owns how that
+    /// becomes pixels (`StageWindowController.swift:2823-2884`).
+    fn transport_controls(&self,fullscreen:bool)->Vec<TransportControl> {
+        let chat_available=self.runtime_state["stage"]["presentation"]["chatAvailable"].as_bool();
+        let screen=self.runtime_state["screenOperation"].clone();
+        let player=self.runtime_state["liveCamPlayerMenu"].clone();
+        let mut controls=Vec::with_capacity(TRANSPORT_CONTROLS.len());
+        for (id,label,action) in TRANSPORT_CONTROLS {
+            // The original tints the *asserted* entry cyan and, for 聊天, fills
+            // it with system blue (`StageWindowController.swift:3058-3066,3141-3152`).
+            let active=match id {
+                "chat"=>self.chat_open,"props"=>self.props_open,"visual"=>self.stage_panel_open,"program"=>self.program_open,
+                "screen"=>screen["active"].as_bool()==Some(true),_=>false,
+            };
+            let enabled=match id {
+                "chat"=>chat_available==Some(true),
+                "props"=>self.runtime_state["stage"]["presentation"]["propsAvailable"].as_bool()==Some(true),
+                "screen"=>screen["available"].as_bool()==Some(true),
+                "previous"=>player["canSelectPrevious"].as_bool()==Some(true),
+                "play"=>player["canTogglePlayback"].as_bool()==Some(true),
+                "next"=>player["canSelectNext"].as_bool()==Some(true),
+                _=>true,
+            };
+            let label:String=if id=="chat"&&chat_available!=Some(true) {"进入空间后与居民聊天".into()}
+                else if id=="visual" {if self.stage_panel_open{"收起设置".into()}else{"舞台设置：播放器、空间、角色与活动".into()}}
+                else if id=="screen" {
+                    if screen["active"].as_bool()==Some(true) {"完成操作（Esc）".into()}
+                    else if screen["available"].as_bool()==Some(true) {"操作电视".into()}
+                    else {"这块空间里还没有在放的电视".into()}
+                } else if id=="chat" {if self.chat_open{"收起聊天".into()}else{"与居民聊天".into()}}
+                else {label.to_owned()};
+            let icon=if id=="visual"&&self.stage_panel_open {IconName::X}
+                else if id=="play"&&self.runtime_state["playbackState"].as_str()==Some("playing") {IconName::Pause}
+                else if id=="voice" {voice_icon(self.runtime_state["voiceState"].as_str())}
+                else if id=="mode" {window_mode_content(fullscreen).0}
+                else {control_icon(id)};
+            let label=if id=="mode" {window_mode_content(fullscreen).1.to_owned()} else {label};
+            let mut control=TransportControl::new(id,action,icon,label)
+                .active(active).enabled(enabled).ends_group(id=="next").hold(id=="voice");
+            if id=="visual" {control=control.face_text(if self.stage_panel_open{"收起"}else{"设置"});}
+            if id=="chat"&&self.chat_open {control=control.active_fill(system_symbol::system_blue_background());}
+            if id=="inbox" {
+                let count=inbox_unread(&self.runtime_state);
+                if count>0 {control=control.badge(if count>99{"99+".to_owned()}else{count.to_string()});}
+            }
+            controls.push(control);
+        }
+        controls
+    }
+}
+
+/// One slot of the overlay stack, in the order the children are added.
+///
+/// `on_children_prepainted` returns one bounds per *grown child* in that order,
+/// so the hit-region indices are derived from this list rather than written out
+/// by hand: a hand-written index silently points at the wrong rectangle the
+/// moment a child moves, and the drop target or the scene passthrough would be
+/// wrong without failing loudly. `layout_tests` pins the same list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverlaySlot {
+    Lyrics,
+    Transport,
+    Destination,
+    ScreenBanner,
+    Notices,
+    Composer,
+    StagePanel,
+    Program,
+    Props,
+    BoundVideo,
+    CompactControls,
+    CompactReply,
+}
+
+impl OverlaySlot {
+    /// Regions the original never forwards to the scene: the GPU lyrics layer
+    /// and the screen-operation banner (`StageScreenOperationBanner.hitTest`
+    /// returns nil; `LiveCamPanel.isPassiveDecoration`).
+    fn passive(self) -> bool {
+        matches!(self, Self::Lyrics | Self::ScreenBanner)
+    }
+}
+
+/// What the current window shows, in the order the shell draws it.
+struct OverlayState {
+    compact: bool,
+    chat_open: bool,
+    stage_panel_open: bool,
+    program_open: bool,
+    props_open: bool,
+    bound_video: bool,
+    notices: bool,
+    screen_active: bool,
+    reply: bool,
+}
+
+/// The child order of the overlay root. One function so the render and the
+/// prepaint indices cannot disagree.
+fn overlay_plan(state: &OverlayState) -> Vec<OverlaySlot> {
+    if state.compact {
+        let mut slots = vec![OverlaySlot::CompactControls];
+        if state.notices { slots.push(OverlaySlot::Notices); }
+        if state.chat_open { slots.push(OverlaySlot::Composer); }
+        if state.reply { slots.push(OverlaySlot::CompactReply); }
+        slots
+    } else {
+        let mut slots = vec![OverlaySlot::Lyrics, OverlaySlot::Transport, OverlaySlot::Destination];
+        if state.screen_active { slots.push(OverlaySlot::ScreenBanner); }
+        if state.notices { slots.push(OverlaySlot::Notices); }
+        if state.chat_open { slots.push(OverlaySlot::Composer); }
+        if state.stage_panel_open { slots.push(OverlaySlot::StagePanel); }
+        if state.program_open { slots.push(OverlaySlot::Program); }
+        if state.props_open { slots.push(OverlaySlot::Props); }
+        if state.bound_video { slots.push(OverlaySlot::BoundVideo); }
+        slots
     }
 }
 
@@ -603,11 +857,9 @@ impl Render for GMGNProductUI {
             let pane=self.pane.downgrade();
             window.on_next_frame(move |window,cx| { let _=pane.update(cx, |pane,cx|pane.focus_composer(window,cx)); });
         }
-        let background = cx.theme().tokens.background;
-        let foreground = cx.theme().foreground;
         let mut notices = if self.compact {
-            div().id("product-runtime-notices").flex().flex_col().gap(px(6.)).text_size(px(10.))
-        }else{div().id("product-runtime-notices").max_h(px(220.)).overflow_y_scroll().p_2().text_sm().line_height(relative(1.4))};
+            div().id("product-runtime-notices").flex().flex_col().gap(px(shell_metrics::BANNER_STACK_GAP)).text_size(px(shell_metrics::NOTICE_FONT_COMPACT))
+        }else{div().id("product-runtime-notices").max_h(px(chrome::TASK_MAX_HEIGHT)).overflow_y_scroll().p_2().text_size(px(CAPTION_SIZE)).line_height(relative(1.4))};
         let mut notice_count=0;
         let task_feedback_visible=self.compact||self.runtime_state["stage"]["presentation"]["taskFeedbackVisible"].as_bool()==Some(true);
         let mut seen_notices=Vec::new();
@@ -617,111 +869,208 @@ impl Render for GMGNProductUI {
                 if seen_notices.contains(&notice){continue;}
                 seen_notices.push(notice);
                 let item=if self.compact {
-                    let item=div().min_h(px(24.)).px(px(8.)).py(px(8.)).rounded(px(10.)).bg(rgba(0x1f1f1ff0)).text_size(px(if field=="statusNotice"{10.}else{11.})).text_color(rgb(0xff9f0a)).child(notice.to_owned());
+                    // Live Cam banner: `Color(white: 0.1).opacity(0.96)` with a
+                    // 10 pt radius and orange 0.95 text (`StageOverlayView.swift:96-108`,
+                    // `LiveCamPanel.swift:785-790`).
+                    let item=div().px(px(shell_metrics::BANNER_PADDING)).py(px(shell_metrics::BANNER_PADDING)).rounded(px(shell_metrics::BANNER_RADIUS))
+                        .bg(rgba(scene_tokens::PANEL_BG))
+                        .text_size(px(if field=="statusNotice"{shell_metrics::DELIVERY_FONT}else{shell_metrics::NOTICE_FONT}))
+                        .text_color(rgba(scene_tokens::WARNING)).child(notice.to_owned());
                     if field=="statusNotice"{item}else{item.line_clamp(3)}
-                }else{div().text_xs().text_color(cx.theme().muted_foreground).child(user_status_notice(notice))};
+                }else{div().text_size(px(CAPTION_SIZE)).text_color(rgba(scene_tokens::TEXT_MUTED)).child(user_status_notice(notice))};
                 notices = notices.child(item);
                 notice_count+=1;
             }
         }
         if let Some(message)=self.runtime_state["autonomy"]["connectivityNotice"].as_str().filter(|s|task_feedback_visible&&!s.is_empty()) {
-            notices=notices.child(div().id("resident.connectivity-banner").rounded(px(10.)).p(px(if self.compact{6.}else{10.})).bg(rgba(0x1a1a1af5)).text_size(px(if self.compact{9.}else{11.})).text_color(rgb(0xff9f0a)).line_clamp(if self.compact{2}else{3}).child(message.to_owned()));notice_count+=1;
+            // `WishMachineTaskStatusView.connectivityBanner` (`StageOverlayView.swift:151-165`):
+            // wifi.exclamationmark, orange 0.95 on `Color(white: 0.1).opacity(0.96)`.
+            notices=notices.child(div().id("resident.connectivity-banner").flex().items_center().gap(px(shell_metrics::BANNER_STACK_GAP))
+                .rounded(px(shell_metrics::BANNER_RADIUS)).p(px(if self.compact{shell_metrics::BANNER_PADDING_COMPACT}else{shell_metrics::BANNER_PADDING}))
+                .bg(rgba(scene_tokens::PANEL_BG)).text_size(px(if self.compact{shell_metrics::NOTICE_FONT_COMPACT}else{shell_metrics::NOTICE_FONT}))
+                .text_color(rgba(scene_tokens::WARNING)).line_clamp(if self.compact{2}else{3})
+                .child(Icon::new(IconName::WifiOff).small()).child(message.to_owned()));notice_count+=1;
         }
         let autonomy=self.runtime_state["autonomy"]["switchOn"].as_bool();
         if task_feedback_visible&&(autonomy==Some(false)||self.runtime_state["autonomy"]["stopped"].as_bool()==Some(true)) {
             let enabled=autonomy==Some(true);
-            let mut banner=div().id("resident.autonomy-banner").flex().flex_col().gap_1().rounded_lg().p_2().bg(cx.theme().muted).text_xs().child(div().flex().items_center().justify_between().text_color(cx.theme().warning)
-                .child(if enabled{"自主行动已停止"}else{"居民自主行动已关闭"})
-                .child(Button::new("resident.autonomy.resume").ghost().xsmall().flex_shrink_0().label(if enabled{"恢复自主行动"}else{"打开自主行动"}).on_click(cx.listener(|this,_,_,cx|this.overlay_action("resume-autonomy",cx)))));
-            if !self.compact {banner=banner.child(div().text_xs().line_height(relative(1.4)).text_color(cx.theme().muted_foreground).child("关闭后，居民暂停自主安排；你发送的指令仍会执行。"));}
+            // `WishMachineTaskStatusView.autonomyBanner` (`StageOverlayView.swift:184-215`):
+            // pause.circle / hand.raised, orange 0.95 title, one resume action.
+            let mut banner=div().id("resident.autonomy-banner").flex().flex_col().gap_1()
+                .rounded(px(shell_metrics::BANNER_RADIUS)).p(px(if self.compact{shell_metrics::BANNER_PADDING_COMPACT}else{shell_metrics::BANNER_PADDING}))
+                .bg(rgba(scene_tokens::PANEL_BG)).text_size(px(if self.compact{shell_metrics::BANNER_TITLE_COMPACT}else{shell_metrics::BANNER_TITLE}))
+                .child(div().flex().items_center().justify_between().gap(px(shell_metrics::BANNER_STACK_GAP)).text_color(rgba(scene_tokens::WARNING))
+                    .child(div().flex().items_center().gap(px(shell_metrics::BANNER_STACK_GAP))
+                        .child(Icon::new(if enabled{IconName::CirclePause}else{IconName::Hand}).small())
+                        .child(if enabled{"自主行动已停止"}else{"居民自主行动已关闭"}))
+                    .child(Button::new("resident.autonomy.resume").ghost().xsmall().flex_shrink_0()
+                        // Icon-only face; the words live in the tooltip and the
+                        // accessibility label (`primitives::icon_button`'s rule).
+                        .icon(if enabled{IconName::Play}else{IconName::Settings})
+                        .tooltip(if enabled{"恢复自主行动"}else{"打开自主行动"})
+                        .accessibility_label(if enabled{"恢复自主行动"}else{"打开自主行动"})
+                        .on_click(cx.listener(|this,_,_,cx|this.overlay_action("resume-autonomy",cx)))));
+            if !self.compact {banner=banner.child(div().text_size(px(shell_metrics::BANNER_BODY)).line_height(relative(1.4)).text_color(rgba(scene_tokens::TEXT_MUTED)).child("不自主不等于不听话：直接下达的指令在任何开关状态下都会执行。"));}
             if let Some(message)=self.runtime_state["autonomy"]["resumeFailure"].as_str().filter(|s|!s.is_empty()) {
-                banner=banner.child(div().id("resident.autonomy.resume-failure").text_size(px(9.)).text_color(rgb(0xff9f0a)).child(message.to_owned()));
+                banner=banner.child(div().id("resident.autonomy.resume-failure").text_size(px(shell_metrics::STATUS_DETAIL_FONT)).text_color(rgba(scene_tokens::WARNING)).child(message.to_owned()));
             }
             notices=notices.child(banner);
             notice_count+=1;
         }
         if let Some(notice)=&self.core_notice {
-            notices=if self.compact{notices.child(div().rounded(px(10.)).p(px(8.)).bg(rgba(0x1f1f1ff0)).text_size(px(10.)).text_color(rgb(0xff9f0a)).child(notice.clone()))}else{notices.child(notice.clone())};notice_count+=1;
+            notices=if self.compact{notices.child(div().px(px(shell_metrics::BANNER_PADDING)).py(px(shell_metrics::BANNER_PADDING)).rounded(px(shell_metrics::BANNER_RADIUS)).bg(rgba(scene_tokens::PANEL_BG)).text_size(px(shell_metrics::NOTICE_FONT_COMPACT)).text_color(rgba(scene_tokens::WARNING)).child(notice.clone()))}else{notices.child(notice.clone())};notice_count+=1;
         }
-        let viewport=window.viewport_size();let width=viewport.width.as_f32();let height=viewport.height.as_f32();
-        let compact_composer_height=if self.runtime_state["attachments"].as_array().is_some_and(|images|!images.is_empty()) || self.runtime_state["attachmentsPreparing"].as_bool()==Some(true) || self.runtime_state["attachmentError"].as_str().is_some_and(|error|!error.is_empty()){140.}else{70.};
-        let mut root=div().size_full().relative().font_family(cx.theme().font_family.clone()).text_size(px(gmgn_gpui_ui::ui_tokens::BODY)).line_height(px(gmgn_gpui_ui::ui_tokens::BODY_LINE_HEIGHT)).text_color(foreground);
+        // The stack is moved into its one child slot below; the slot may be
+        // absent, so it is optioned rather than cloned (a `Stateful<Div>` is not
+        // `Clone`).
+        let mut notices=Some(notices);
+        let viewport=window.viewport_size();let width=viewport.width.as_f32();let height=viewport.height.as_f32();let fullscreen=window.is_fullscreen();
+        let compact_height=compact_composer_height(&self.runtime_state);
+        let mut root=div().size_full().relative().font_family(FONT_FAMILY).text_size(px(BODY_SIZE)).line_height(px(BODY_LINE_HEIGHT)).text_color(rgba(scene_tokens::TEXT));
         self.lyrics_pane.update(cx,|pane,cx|pane.set_visible(!self.compact,cx));
         if !self.compact {
             self.lyrics_pane.update(cx,|pane,_|pane.set_viewport_size(width,height));
-            root=root.child(div().absolute().size_full().child(self.lyrics_pane.clone()));
         }
-        if self.compact {
-            let mut controls=div().absolute().top(px(10.)).right(px(10.)).w(px(30.)).flex().flex_col().gap(px(6.));
-            for (id,label,action) in [("space","空间","showStage"),("player","音乐","showPlayer"),("chat","聊天","chat"),("inbox","通知","showNotifications"),("voice","语音","voice"),("settings","设置","settings")] {
-                controls=controls.child(self.control(id,label,action,30.,30.,cx));
-            }
-            root=root.child(controls);
-            if notice_count>0 {
-                root=root.child(notices.absolute().left(px(10.)).right(px(48.)).bottom(px(compact_composer_height+16.)));
-            }
-            if self.chat_open {
-                root=root.child(div().absolute().left(px(10.)).right(px(48.)).bottom(px(10.)).h(px(compact_composer_height)).child(self.pane.clone()));
-            }
-            if let Some(reply)=compact_reply_text(&self.runtime_state,&self.transcript).filter(|_|latest_reply_revision(&self.runtime_state)!=self.dismissed_reply_revision) {
-                let content=if self.chat_open{div().id("livecam.full-reply").flex_1().min_w(px(0.)).min_h(px(0.)).overflow_y_scroll().text_size(px(12.)).child(expanded_reply_text(&self.transcript,&reply)).into_any_element()}else{div().flex_1().min_w(px(0.)).text_size(px(12.)).line_clamp(3).child(reply).into_any_element()};
-                let bubble=div().id("compact-reply-bubble").absolute().left(px(10.)).right(px(48.)).top(px(10.)).p_2().rounded(px(10.)).bg(background).flex().items_start().gap(px(5.));
-                let bubble=if self.chat_open{bubble.h(px(136.))}else{bubble.max_h(px(74.))};
-                root=root.child(bubble
-                    .on_click(cx.listener(|this,_,_,cx|{this.chat_open=true;this.composer_focus_pending=true;cx.notify();}))
-                    .child(content)
-                    .child(Button::new("livecam.reply-dismiss").ghost().icon(gpui_kit::assets::IconName::X).w(px(20.)).h(px(20.)).accessibility_label("关闭回复气泡").tooltip("关闭回复气泡").on_click(cx.listener(|this,_,_,cx|{cx.stop_propagation();this.dismissed_reply_revision=latest_reply_revision(&this.runtime_state);cx.notify();}))));
-            }
-        } else {
-            let mut transport=div().absolute().right(px(22.)).bottom(px(22.)).w(px(529.)).h(px(48.)).flex().items_center().px(px(4.)).rounded_xl().bg(background);
-            for (id,label,action) in [("program","节目","program"),("previous","上首","previousTrack"),("play","播放","togglePlayback"),("next","下首","nextTrack"),("voice","语音","voice"),("chat","聊天","chat"),("inbox","通知","showNotifications"),("props","装修","toggleDecoration"),("screen","屏幕操作","screen"),("visual","舞台设置","visual"),("mode","窗口","mode")] {
-                transport=transport.child(self.control(id,label,action,if id=="visual"{68.}else{44.},44.,cx));
-                if id=="next" {transport=transport.child(div().w(px(13.)).flex_shrink_0().flex().items_center().justify_center().child(div().w(px(1.)).h(px(20.)).bg(rgba(0xffffff1f))));}
-            }
-            let in_space=self.runtime_state["stage"]["mode"].as_str()==Some("space");
-            root=root.child(transport).child(Button::new("destination").ghost()
-                .child(div().flex().items_center().gap(px(4.)).when_some(system_symbol::image(if in_space{"circle.hexagongrid.fill"}else{"cube.transparent"}),|view,image|view.child(img(image).w(px(12.)).h(px(12.)).object_fit(ObjectFit::Contain))).child(if in_space{"播放器"}else{"空间"}))
-                .accessibility_label(if in_space{"切换到播放器"}else{"进入空间"})
-                .tooltip(if in_space{"返回播放器"}else{"进入空间"})
-                .w(px(112.)).h(px(38.)).rounded(px(19.)).bg(rgba(0x0a0a0ab8))
-                .border_1().border_color(rgba(0x47dbff7a)).text_color(rgb(0x7af2ff)).text_size(px(gmgn_gpui_ui::ui_tokens::BODY)).font_weight(FontWeight::SEMIBOLD)
-                .absolute().right(px(22.)).top(px(28.)).on_click(cx.listener(|this,_,_,cx|this.overlay_action("destination",cx))));
-            if self.runtime_state["screenOperation"]["active"].as_bool()==Some(true) {
-                root=root.child(div().id("stage.screen-operation-banner").absolute().right(px(173.5)).bottom(px(82.)).w(px(226.)).h(px(30.)).flex().items_center().justify_center().rounded_xl().bg(rgba(0x0a4d6beb)).text_sm().child("正在操作电视，按 Esc 退出"));
-            }
-            if notice_count>0 {
-                root=root.child(notices.absolute().left(px(22.)).top(px(22.)).w(px(280.)).bg(background));
-            }
-            if self.chat_open {
-                let frame=composer_frame(false,width,height);let composer_width=frame[2];let composer_height=frame[3];
-                root=root.child(div().absolute().right(px(22.)).bottom(px(86.)).w(px(composer_width)).max_h(px(composer_height)).overflow_hidden().bg(background).rounded_xl().child(self.pane.clone()));
-            }
-            if self.stage_panel_open {
-                let panel_width=(width-36.).clamp(0.,590.);let panel_height=(height-92.).clamp(0.,458.);
-                root=root.child(div().absolute().right(px(18.)).bottom(px(80.)).w(px(panel_width)).h(px(panel_height)).child(self.stage_pane.clone()));
-            }
-            if self.program_open {
-                let w=350_f32.min(width-36.);let h=430_f32.min(height-80.);
-                root=root.child(div().absolute().right(px(18.)).bottom(px(80.)).w(px(w)).h(px(h)).child(self.program_pane.clone()));
-            }
-            if self.props_open {
-                let h=390_f32.min(height-98.);
-                root=root.child(div().absolute().right(px(22.)).bottom(px(82.)).w(px(340.)).h(px(h)).child(self.prop_pane.clone()));
-            }
-            if self.bound_video_pane.read(cx).is_visible() {
-                root=root.child(div().absolute().top(px(28.)).right(px(32.)).w(px(330.)).h(px(58.)).child(self.bound_video_pane.clone()));
-            }
+        let bound_video=self.bound_video_pane.read(cx).is_visible();
+        let reply=compact_reply_text(&self.runtime_state,&self.transcript)
+            .filter(|_|self.compact)
+            .filter(|_|latest_reply_revision(&self.runtime_state)!=self.dismissed_reply_revision);
+        let screen_active=self.runtime_state["screenOperation"]["active"].as_bool()==Some(true);
+        let plan=overlay_plan(&OverlayState{compact:self.compact,chat_open:self.chat_open,stage_panel_open:self.stage_panel_open,
+            program_open:self.program_open,props_open:self.props_open,bound_video,notices:notice_count>0,screen_active,reply:reply.is_some()});
+        for slot in &plan {
+            root=match slot {
+                OverlaySlot::Lyrics=>root.child(div().absolute().size_full().child(self.lyrics_pane.clone())),
+                OverlaySlot::CompactControls=>{
+                    // Live Cam control column (`LiveCamPanel.swift:700,860-877`):
+                    // 30 pt entries, 6 pt apart, 10 pt from the top/right edge.
+                    let mut controls=div().absolute().top(px(shell_metrics::COMPACT_MARGIN)).right(px(shell_metrics::COMPACT_MARGIN))
+                        .w(px(shell_metrics::COMPACT_CONTROL)).flex().flex_col().gap(px(shell_metrics::COMPACT_CONTROL_GAP));
+                    for (id,label,action) in COMPACT_CONTROLS { controls=controls.child(self.compact_control(id,label,action,cx)); }
+                    root.child(controls)
+                }
+                OverlaySlot::Transport=>{
+                    // `StageWindowController.swift:2835-2884`: the bar, its row
+                    // and the 1×20 divider are rendered by
+                    // `shell::transport_bar`; this host supplies only each
+                    // control's state and semantics.
+                    let controls=self.transport_controls(fullscreen);
+                    let click=cx.entity().downgrade();
+                    let hold=click.clone();
+                    root.child(shell::transport_bar(controls,
+                        move |action,window,cx|{
+                            let _=click.update(cx,|this,cx|{
+                                if action=="mode" {window.toggle_fullscreen();cx.notify();}
+                                else if action=="showStage" {this.switch_profile(false,Some("space"),window,cx);}
+                                else if action=="showPlayer" {this.switch_profile(false,Some("player"),window,cx);}
+                                else {this.overlay_action(action,cx);}
+                            });
+                        },
+                        move |action,pressed,_window,cx|{
+                            let _=hold.update(cx,|this,cx|{if action=="voice"{this.voice_gesture(pressed,cx);}});
+                        }))
+                }
+                OverlaySlot::Destination=>{
+                    // `StageWindowController.swift:3165-3185`: the two-state
+                    // `circle.hexagongrid.fill` / `cube.transparent` SF Symbol,
+                    // which the host renders through `system_symbol` (gpui-kit
+                    // has no equivalent glyph); `shell::destination_button`
+                    // owns the round 38 pt frame, surface and hairline.
+                    let in_space=self.runtime_state["stage"]["mode"].as_str()==Some("space");
+                    let icon=div().flex().items_center().justify_center().when_some(
+                        system_symbol::image(if in_space{"circle.hexagongrid.fill"}else{"cube.transparent"}),
+                        |view,image|view.child(img(image).w(px(shell_metrics::DESTINATION_ICON)).h(px(shell_metrics::DESTINATION_ICON)).object_fit(ObjectFit::Contain)));
+                    root.child(shell::destination_button(icon,
+                        if in_space{"返回播放器"}else{"进入空间"},true,
+                        cx.listener(|this,_,_,cx|this.overlay_action("destination",cx))))
+                }
+                OverlaySlot::ScreenBanner=>{
+                    // `StageWindowController.swift:3003-3030` + `:1544-1548`:
+                    // centred over the transport bar, 12 pt above it, 12 pt
+                    // radius, 0.04/0.30/0.42 at 0.92, systemCyan 0.45 hairline.
+                    let right=shell_metrics::TRANSPORT_INSET+(shell_metrics::TRANSPORT_WIDTH-shell_metrics::SCREEN_BANNER_WIDTH)/2.;
+                    let bottom=shell_metrics::TRANSPORT_INSET+shell_metrics::TRANSPORT_HEIGHT+shell_metrics::SCREEN_BANNER_GAP;
+                    root.child(div().id("stage.screen-operation-banner").absolute().right(px(right)).bottom(px(bottom))
+                        .w(px(shell_metrics::SCREEN_BANNER_WIDTH)).h(px(shell_metrics::SCREEN_BANNER_HEIGHT))
+                        .flex().items_center().justify_center().rounded(px(shell_metrics::SCREEN_BANNER_RADIUS))
+                        .bg(rgba(shell_metrics::SCREEN_BANNER)).border_1().border_color(rgba(shell_metrics::SCREEN_BANNER_BORDER))
+                        .text_size(px(shell_metrics::SCREEN_BANNER_FONT)).font_weight(FontWeight::MEDIUM)
+                        .child("正在操作电视，按 Esc 退出"))
+                }
+                OverlaySlot::Notices=>match notices.take() {
+                    // 任务状态区: top-left 280 pt at 22/22 in the stage window,
+                    // above the Live Cam composer in the compact window
+                    // (`StageWindowController.swift:1533-1535`, `LiveCamPanel.swift:849-857`).
+                    // No host background: every banner draws its own surface.
+                    Some(notices)=>root.child(if self.compact {
+                        notices.absolute().left(px(shell_metrics::COMPACT_MARGIN)).right(px(shell_metrics::COMPACT_CONTENT_RIGHT))
+                            .bottom(px(compact_height+shell_metrics::COMPACT_MARGIN+shell_metrics::COMPACT_NOTICE_GAP))
+                    }else{
+                        notices.absolute().left(px(shell_metrics::TASK_FEEDBACK_INSET)).top(px(shell_metrics::TASK_FEEDBACK_INSET)).w(px(shell_metrics::TASK_FEEDBACK_WIDTH))
+                    }),
+                    None=>root,
+                }
+                OverlaySlot::Composer=>{
+                    // The pane draws its own card (radius 20, its own surface and
+                    // max width/height); the host only places it. The former
+                    // The former `bg + rounded_xl + overflow_hidden` wrapper
+                    // doubled the chrome chat.rs already paints and clipped the
+                    // card shadow.
+                    let [left,top,w,h]=composer_frame(self.compact,width,height,compact_height);
+                    let overlay=div().absolute().right(px(width-left-w)).bottom(px(height-top-h)).w(px(w));
+                    // The Live Cam composer is an exact 70/140 pt surface the pane
+                    // fills (`LiveCamPanel.swift:748`); the stage composer is a
+                    // ceiling, because it hugs its content (`:1530`).
+                    let overlay=if self.compact{overlay.h(px(h))}else{overlay.max_h(px(h))};
+                    root.child(overlay.child(self.pane.clone()))
+                }
+                OverlaySlot::StagePanel=>{
+                    let panel_width=(width-36.).clamp(0.,stage_metrics::PANEL_MAX_WIDTH);let panel_height=(height-92.).clamp(0.,stage_metrics::PANEL_MAX_HEIGHT);
+                    root.child(div().absolute().right(px(18.)).bottom(px(80.)).w(px(panel_width)).h(px(panel_height)).child(self.stage_pane.clone()))
+                }
+                OverlaySlot::Program=>{
+                    let panel_width=stage_metrics::PROGRAM_RAIL_WIDTH.min(width-36.);let panel_height=stage_metrics::PROGRAM_RAIL_HEIGHT.min(height-80.);
+                    root.child(div().absolute().right(px(18.)).bottom(px(80.)).w(px(panel_width)).h(px(panel_height)).child(self.program_pane.clone()))
+                }
+                OverlaySlot::Props=>{
+                    let panel_height=390_f32.min(height-98.);
+                    root.child(div().absolute().right(px(22.)).bottom(px(82.)).w(px(stage_metrics::PROP_EDITOR_WIDTH)).h(px(panel_height)).child(self.prop_pane.clone()))
+                }
+                OverlaySlot::BoundVideo=>root.child(div().absolute().top(px(28.)).right(px(32.)).w(px(330.)).h(px(58.)).child(self.bound_video_pane.clone())),
+                OverlaySlot::CompactReply=>match &reply {
+                    Some(reply)=>{
+                        // `LiveCamPanel.swift:828-834,902-918`: 12 pt radius,
+                        // 136 pt while the composer is open, ≤74 pt collapsed,
+                        // a 20×20 dismiss button and the same dedup rule
+                        // (`shouldPresentReply`: one bubble per turn).
+                        let content=if self.chat_open{div().id("livecam.full-reply").flex_1().min_w(px(0.)).min_h(px(0.)).overflow_y_scroll().text_size(px(shell_metrics::COMPACT_BUBBLE_FONT)).child(expanded_reply_text(&self.transcript,reply)).into_any_element()}else{div().flex_1().min_w(px(0.)).text_size(px(shell_metrics::COMPACT_BUBBLE_FONT)).line_clamp(3).child(reply.clone()).into_any_element()};
+                        let bubble=div().id("compact-reply-bubble").absolute().left(px(shell_metrics::COMPACT_MARGIN)).right(px(shell_metrics::COMPACT_CONTENT_RIGHT)).top(px(shell_metrics::COMPACT_MARGIN))
+                            .px(px(shell_metrics::COMPACT_BUBBLE_PADDING.0)).py(px(shell_metrics::COMPACT_BUBBLE_PADDING.1))
+                            .rounded(px(shell_metrics::COMPACT_REPLY_RADIUS)).bg(rgba(scene_tokens::PANEL_BG))
+                            .flex().items_start().gap(px(shell_metrics::COMPACT_BUBBLE_GAP));
+                        let bubble=if self.chat_open{bubble.h(px(shell_metrics::COMPACT_REPLY_EXPANDED))}else{bubble.max_h(px(shell_metrics::COMPACT_REPLY_COLLAPSED))};
+                        root.child(bubble
+                            .on_click(cx.listener(|this,_,_,cx|{this.chat_open=true;this.composer_focus_pending=true;cx.notify();}))
+                            .child(content)
+                            .child(ui::icon_button("livecam.reply-dismiss",IconName::X,"关闭回复气泡",false)
+                                .w(px(shell_metrics::COMPACT_DISMISS)).h(px(shell_metrics::COMPACT_DISMISS))
+                                .on_click(cx.listener(|this,_,_,cx|{cx.stop_propagation();this.dismissed_reply_revision=latest_reply_revision(&this.runtime_state);cx.notify();}))))
+                    }
+                    None=>root,
+                },
+            };
         }
         let host=self.host.clone();
         let menu_open=self.player_menu_open;
-        let composer_index=if self.chat_open {
-            Some(if self.compact{1+usize::from(notice_count>0)}else{3+usize::from(self.runtime_state["screenOperation"]["active"].as_bool()==Some(true))+usize::from(notice_count>0)})
-        }else{None};
-        // The original screen-operation banner never takes scene pointer
-        // events. All other overlay hit regions use actual computed bounds,
-        // including wrapped notices and the complete autonomy card.
-        let mut passive_indices=Vec::new();
-        if !self.compact {passive_indices.push(0);if self.runtime_state["screenOperation"]["active"].as_bool()==Some(true){passive_indices.push(3);}}
+        // Both indices come from the same plan the children were built from, so
+        // a moved child can never leave them pointing at another rectangle.
+        let composer_index=plan.iter().position(|slot|*slot==OverlaySlot::Composer);
+        // The original screen-operation banner never takes scene pointer events
+        // (`StageScreenOperationBanner.hitTest` returns nil); the lyrics layer
+        // is GPU-composited and likewise eats nothing. All other overlay hit
+        // regions use actual computed bounds, including wrapped notices and the
+        // complete autonomy card.
+        let passive_indices:Vec<usize>=plan.iter().enumerate().filter(|(_,slot)|slot.passive()).map(|(index,_)|index).collect();
         root.on_children_prepainted(move |bounds,window,cx| {
             // Read Kit's real modal stack at paint time: all close routes
             // restore passthrough without maintaining a second modal flag.
@@ -823,32 +1172,161 @@ mod layout_tests {
         ]}})),2);
         assert_eq!(super::inbox_unread(&serde_json::Value::Null),0);
     }
-    use super::{composer_frame,control_icon};
+    use super::{compact_composer_height,composer_frame,control_icon,overlay_plan,voice_icon,window_mode_content,COMPACT_CONTROLS,OverlaySlot,OverlayState,TransportControl,TRANSPORT_CONTROLS};
+    use super::{scene_tokens,shell_metrics,stage_metrics};
+    use super::IconName;
+    fn overlay_state(compact:bool,chat_open:bool,notices:bool,screen_active:bool,reply:bool)->OverlayState {
+        OverlayState{compact,chat_open,stage_panel_open:false,program_open:false,props_open:false,bound_video:false,notices,screen_active,reply}
+    }
     #[test]
     fn stage_composer_preserves_original_margins_and_maximums() {
-        assert_eq!(composer_frame(false,1100.,760.),[458.,354.,620.,320.]);
-        let frame=composer_frame(false,600.,400.);
+        assert_eq!(composer_frame(false,1100.,760.,70.),[458.,354.,620.,320.]);
+        let frame=composer_frame(false,600.,400.,70.);
         assert_eq!(frame,[22.,22.,556.,292.]);
         assert_eq!(600.-frame[0]-frame[2],22.);
         assert_eq!(400.-frame[1]-frame[3],86.);
     }
     #[test]
     fn compact_composer_never_enters_the_original_control_column() {
-        let frame=composer_frame(true,224.,336.);
+        let frame=composer_frame(true,224.,336.,compact_composer_height(&serde_json::json!({})));
         assert_eq!(frame,[10.,256.,166.,70.]);
         assert_eq!(184.-frame[0]-frame[2],8.);
         assert_eq!(336.-frame[1]-frame[3],10.);
+        // The attached strip grows upward from the same bottom edge.
+        let frame=composer_frame(true,224.,336.,compact_composer_height(&serde_json::json!({"attachments":[{"id":"a"}]})));
+        assert_eq!(frame,[10.,186.,166.,140.]);
+        assert_eq!(336.-frame[1]-frame[3],10.);
     }
+    /// The Live Cam height is the shared chat surface's answer, not a second
+    /// copy of the 70/140 rule kept in this file.
     #[test]
-    fn every_production_toolbar_icon_has_embedded_svg_bytes() {
+    fn compact_composer_height_reads_the_shared_chat_surface() {
+        assert_eq!(compact_composer_height(&serde_json::json!({})),70.);
+        for state in [serde_json::json!({"attachments":[{"id":"a"}]}),serde_json::json!({"attachmentsPreparing":true}),serde_json::json!({"attachmentError":"读取失败"})] {
+            assert_eq!(compact_composer_height(&state),140.);
+        }
+        assert_eq!(compact_composer_height(&serde_json::json!({"attachmentError":""})),70.);
+        let mut chat=gmgn_gpui_ui::state::ChatState::default();
+        assert_eq!(gmgn_gpui_ui::chat::compact_composer_height(&chat),70.);
+        chat.attachments_preparing=true;
+        assert_eq!(gmgn_gpui_ui::chat::compact_composer_height(&chat),140.);
+    }
+    /// The transport row is the original 11 controls and its 529×48 bar; the
+    /// divider is 1×20 and sits after 下首 (`StageWindowController.swift:2851-2884`).
+    #[test]
+    fn transport_controls_pin_the_original_order_widths_and_divider() {
+        assert_eq!(TRANSPORT_CONTROLS.map(|(id,_,_)|id),["program","previous","play","next","voice","chat","inbox","props","screen","visual","mode"]);
+        assert_eq!(TRANSPORT_CONTROLS[3].0,"next");
+        assert_eq!(COMPACT_CONTROLS.map(|(id,_,_)|id),["space","player","chat","inbox","voice","settings"]);
+        // 窗口 is a two-state entry, not a fixed glyph (`StageWindowMode.swift:5-21`).
+        assert_eq!(window_mode_content(false),(IconName::Maximize,"进入全屏"));
+        assert_eq!(window_mode_content(true),(IconName::Minimize,"退出全屏"));
+        assert_eq!(shell_metrics::TRANSPORT_DIVIDER,(1.,20.));
+        // The slot widths come from the shared shell control, not a second
+        // host-side derivation (`StageOverlayView.swift:2686-2689`).
+        let next=TransportControl::new("next","nextTrack",IconName::ChevronRight,"下首").ends_group(true);
+        let visual=TransportControl::new("visual","visual",IconName::Settings,"舞台设置");
+        assert_eq!(next.slot_width(),44.);
+        assert_eq!(visual.slot_width(),68.);
+        assert_eq!([next.slot_width(),visual.slot_width()],[stage_metrics::CONTROL_SIZE,stage_metrics::SETTINGS_WIDTH]);
+        assert_eq!([stage_metrics::SIDE_INSET,stage_metrics::GROUP_GAP],[4.,6.]);
+        // The bar width the shell places is the foundation's own derivation:
+        // 9 regular buttons + the settings slot + the extra control slot +
+        // two 4 pt insets + two 6 pt gaps + the rounding term.
+        let derived=stage_metrics::CONTROL_SIZE*(shell_metrics::REGULAR_BUTTONS as f32+1.)+stage_metrics::SETTINGS_WIDTH
+            +2.*stage_metrics::SIDE_INSET+2.*stage_metrics::GROUP_GAP+shell_metrics::TRANSPORT_ROUNDING;
+        assert_eq!(derived,shell_metrics::TRANSPORT_WIDTH);
+        let mut controls=(0..10).map(|_|TransportControl::new("regular","regular",IconName::Music,"regular")).collect::<Vec<_>>();
+        controls.push(visual);
+        assert_eq!(gmgn_gpui_ui::shell::transport_width(&controls),shell_metrics::TRANSPORT_WIDTH);
+        assert_eq!([shell_metrics::TRANSPORT_WIDTH,shell_metrics::TRANSPORT_HEIGHT,scene_tokens::PANEL_RADIUS_SMALL],[529.,48.,16.]);
+        assert_eq!(shell_metrics::TRANSPORT_INSET,22.);
+    }
+    /// 目的地 and 任务状态区 keep the original frames; 小窗 keeps 224×336.
+    #[test]
+    fn destination_task_status_and_compact_window_pin_the_original_frames() {
+        assert_eq!([shell_metrics::DESTINATION_WIDTH,shell_metrics::DESTINATION_HEIGHT,shell_metrics::DESTINATION_RADIUS],[112.,38.,19.]);
+        assert_eq!([shell_metrics::TRANSPORT_INSET,shell_metrics::DESTINATION_TOP,shell_metrics::DESTINATION_FONT],[22.,28.,11.]);
+        assert_eq!([shell_metrics::TASK_FEEDBACK_WIDTH,shell_metrics::TASK_FEEDBACK_INSET],[280.,22.]);
+        assert_eq!([shell_metrics::COMPACT_WIDTH,shell_metrics::COMPACT_HEIGHT],[224.,336.]);
+        assert_eq!([shell_metrics::COMPACT_MARGIN,shell_metrics::COMPACT_CONTROL,shell_metrics::COMPACT_CONTROL_GAP],[10.,30.,6.]);
+        assert_eq!(shell_metrics::COMPACT_CONTENT_RIGHT,48.);
+        assert_eq!([shell_metrics::COMPACT_REPLY_COLLAPSED,shell_metrics::COMPACT_REPLY_EXPANDED,shell_metrics::COMPACT_DISMISS],[74.,136.,20.]);
+    }
+    /// `on_children_prepainted` indexes the grown children, so the composer's
+    /// drop region is only correct while the plan is the real child order. A
+    /// reordered child fails here instead of pointing the region elsewhere.
+    #[test]
+    fn overlay_plan_pins_the_composer_index_to_the_real_child_order() {
+        use OverlaySlot::*;
+        let plan=overlay_plan(&overlay_state(false,true,true,true,false));
+        assert_eq!(plan.iter().position(|slot|*slot==Composer),Some(5));
+        assert_eq!(plan,[Lyrics,Transport,Destination,ScreenBanner,Notices,Composer]);
+        let plan=overlay_plan(&overlay_state(true,true,true,false,true));
+        assert_eq!(plan.iter().position(|slot|*slot==Composer),Some(2));
+        assert_eq!(plan,[CompactControls,Notices,Composer,CompactReply]);
+        // The stage/program/props panels come after the composer and never move it.
+        let mut state=overlay_state(false,true,true,false,false);
+        state.stage_panel_open=true;state.program_open=true;state.props_open=true;state.bound_video=true;
+        let plan=overlay_plan(&state);
+        assert_eq!(plan.iter().position(|slot|*slot==Composer),Some(4));
+        assert_eq!(plan,[Lyrics,Transport,Destination,Notices,Composer,StagePanel,Program,Props,BoundVideo]);
+        // No chat panel, no drop region.
+        assert_eq!(overlay_plan(&overlay_state(false,false,false,false,false)).iter().position(|slot|*slot==Composer),None);
+        assert_eq!(overlay_plan(&overlay_state(true,false,false,false,false)),[CompactControls]);
+    }
+    /// The passthrough regions are the same indices as before, now derived from
+    /// the plan instead of hand-written (the old `[0]`/`[3]` literals).
+    #[test]
+    fn passive_hit_regions_are_the_lyrics_layer_and_the_screen_banner() {
+        let plan=overlay_plan(&overlay_state(false,true,true,true,false));
+        let passive:Vec<usize>=plan.iter().enumerate().filter(|(_,slot)|slot.passive()).map(|(index,_)|index).collect();
+        assert_eq!(passive,[0,3]);
+        let plan=overlay_plan(&overlay_state(true,true,true,false,true));
+        assert!(plan.iter().all(|slot|!slot.passive()));
+    }
+    /// Every surface the shell paints is a fixed original literal, so a light
+    /// system theme can never invert a panel that floats over the scene.
+    #[test]
+    fn overlay_colours_are_fixed_scene_surfaces_not_theme_colours() {
+        use gmgn_gpui_ui::ui_tokens::scene as s;
+        assert_eq!(s::PANEL_BG,0x1a1a1af5);
+        assert_eq!(s::BAR_BG,0x0a0a0ab8);
+        assert_eq!(s::WARNING,0xff9500f2);
+        assert_eq!(shell_metrics::TRANSPORT_BG,0x13161bfa);
+        assert_eq!(shell_metrics::COMPACT_CONTROL_BG,0x1f1f1ff0);
+        assert_eq!(shell_metrics::COMPACT_CONTROL_BORDER,0xffffff2e);
+        assert_eq!(shell_metrics::DESTINATION_TEXT,0x7af2ffff);
+        assert_eq!(shell_metrics::DESTINATION_BORDER,0x47dbff7a);
+        assert_eq!(shell_metrics::SCREEN_BANNER,0x0a4d6beb);
+        assert_eq!(shell_metrics::SCREEN_BANNER_BORDER,0x22d3ee73);
+        assert_eq!(shell_metrics::BADGE_BG,0xff453ae6);
+    }
+    fn assert_embedded_icon(icon:gpui_kit::assets::IconName) {
         use gpui_kit::AssetSource;
         let assets=gpui_kit::assets::AllAssets;
+        let path=icon.path();
+        let bytes=assets.load(path.as_ref()).unwrap().expect("embedded icon");
+        assert!(matches!(bytes,std::borrow::Cow::Borrowed(_)),"debug product must embed icons");
+        assert!(std::str::from_utf8(&bytes).unwrap().contains("<svg"));
+    }
+    #[test]
+    fn every_production_icon_has_embedded_svg_bytes() {
         for id in ["space","player","program","previous","next","play","voice","chat","inbox","props","screen","visual","mode","settings"] {
-            let path=control_icon(id).path();
-            let bytes=assets.load(path.as_ref()).unwrap().expect("embedded icon");
-            assert!(matches!(bytes,std::borrow::Cow::Borrowed(_)),"debug product must embed icons");
-            assert!(std::str::from_utf8(&bytes).unwrap().contains("<svg"));
+            assert_embedded_icon(control_icon(id));
         }
+        // The realtime voice glyph (`StageVoiceButton.setState`) and the task
+        // status symbols (`WishMachineTaskStatusView`) live in the same row.
+        for state in ["disconnected","connecting","listening","speaking","failed(boom)"] {
+            assert_embedded_icon(voice_icon(Some(state)));
+        }
+        assert_embedded_icon(gpui_kit::assets::IconName::WifiOff);
+        assert_embedded_icon(gpui_kit::assets::IconName::CirclePause);
+        assert_embedded_icon(gpui_kit::assets::IconName::Hand);
+        assert_embedded_icon(window_mode_content(false).0);
+        assert_embedded_icon(window_mode_content(true).0);
+        assert_embedded_icon(gpui_kit::assets::IconName::SquareStack);
+        assert_embedded_icon(gpui_kit::assets::IconName::MousePointerClick);
     }
 }
 
@@ -921,7 +1399,7 @@ fn main() {
         let compact = false;
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::new(point(px(80.), px(80.)),
-                if compact { size(px(224.), px(336.)) } else { size(px(1180.), px(760.)) }))),
+                if compact { size(px(shell_metrics::COMPACT_WIDTH), px(shell_metrics::COMPACT_HEIGHT)) } else { size(px(1180.), px(760.)) }))),
             window_min_size: if compact {None}else{Some(size(px(760.),px(520.)))},
             kind: if compact { WindowKind::PopUp } else { WindowKind::Normal },
             titlebar: if compact { None } else { Some(TitlebarOptions{appears_transparent:true,..Default::default()}) },
@@ -955,7 +1433,7 @@ fn main() {
                     surface_mounted: false,navigation_revision:0,error_notice_revision:0,main_window:main_window.clone(),profile_switch_pending:false,dismissed_reply_revision:None,player_menu_open:false,program_visibility_reported:None, _poll: poll }
             });
             *main_ui.borrow_mut()=Some(view.clone());
-            cx.new(|cx| gpui_kit::base::Root::new(view, window, cx).bg(rgba(0x00000000)))
+            cx.new(|cx| gpui_kit::base::Root::new(view, window, cx).bg(rgba(chrome::WINDOW_CLEAR)))
         }).expect("open gmgn product window");
     });
 }

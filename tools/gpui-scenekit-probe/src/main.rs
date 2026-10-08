@@ -133,7 +133,7 @@ impl Probe {
         let commands = chat.update(cx, |chat, _| chat.take_commands());
         for command in commands {
             match command {
-                ChatCommand::Send { request_id, text } => {
+                ChatCommand::Send { request_id, text, .. } => {
                     if self.chat_backend {
                         self.chat_pending = Some(request_id);
                         self.chat_accepted = false;
@@ -173,6 +173,13 @@ impl Probe {
                         continue;
                     }
                     eprintln!("PROBE_CHAT_CANCEL_NO_TRANSPORT request_id={request_id}");
+                }
+                other => {
+                    // This window only exercises send/cancel; the remaining chat
+                    // commands (attachments, push-to-talk, focus) belong to the
+                    // product host and are named here so nothing is swallowed
+                    // silently.
+                    eprintln!("PROBE_CHAT_UNHANDLED {other:?}");
                 }
             }
         }

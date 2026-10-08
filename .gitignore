@@ -47,3 +47,6 @@ __pycache__/
 # workspace (the Xcode helper still passes its own explicit --target-dir).
 /target/
 .worktrees
+
+# Local probe build output (never source).
+tools/fixtures/gpui-unity-overlay-probe/target/

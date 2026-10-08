@@ -13,3 +13,10 @@ base64 = "=0.22.1"
 
 [dev-dependencies]
 gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "c1bda59e67f46266991a230ae94f749af496af2a", features = ["gpui-fast", "test-support"] }
+
+# GPUI's macOS backend must run on the main thread, so the screenshot harness is
+# a `harness = false` binary test: it renders the real panes and asserts that they
+# painted visible content (and writes a PNG when GMGN_SHOTS_DIR is set).
+[[test]]
+name = "ui_shots"
+harness = false

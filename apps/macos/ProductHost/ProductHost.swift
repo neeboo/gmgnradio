@@ -292,6 +292,12 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
             return runtime.gpuiStageCommand(value)
         }
         switch value["op"] as? String {
+        // 原版 `StageOverlayView` 的「管理角色与动作…」＝ `onManageAssets` →
+        // `openPresenceSettings()`：先把设置定位到角色页，再经 `gpuiOpenSettings`
+        // （`showSettings`）打开它。（改动前的 UI op 在任何宿主源码里都没有处理者。）
+        case "settings.open.presence":
+            runtime.openPresenceSettings()
+            return true
         case "chat.send":
             guard let id = value["requestID"] as? NSNumber, let text = value["text"] as? String,
                   let ids = value["attachmentIDs"] as? [String] else { return false }

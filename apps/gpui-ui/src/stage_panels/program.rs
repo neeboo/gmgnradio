@@ -1,6 +1,10 @@
+use crate::ui_tokens::program as m;
+use super::scene_variant;
 use crate::projective_card::{
     CardEffects, CardShadow, CardTransform, ProjectedCard, RailMask, RgbaTexture, ScrollTransition,
 };
+use crate::ui_tokens as doc;
+use crate::ui_tokens::scene as s;
 
 fn scroll_phase(card_top: f64, card_height: f64, viewport_top: f64, viewport_height: f64) -> f64 {
     if card_height <= 0. || viewport_height <= 0. {
@@ -69,9 +73,12 @@ fn icon_svg(icon: gpui_kit::assets::IconName, x: f64, y: f64, size: f64, color: 
     )
 }
 use base64::Engine as _;
+use gpui_kit::assets::IconName as AssetIcon;
 use gpui_kit::base::Disableable;
 use gpui_kit::component::button::*;
-use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::Sizable as _;
+use gpui_kit::prelude::InteractiveElement as _;
 use gpui_kit::*;
 use serde_json::{Value, json};
 use std::{
@@ -388,9 +395,15 @@ fn empty_card_width(card: &Value) -> f64 {
             crate::lyrics::shaped_text_svg(text, 16., 600, 0.)
                 .map_or(text.chars().count() as f64 * 16., |line| line.width)
         });
-    // Original horizontal padding20, spacing12 and SF waveform.path intrinsic
-    // width26 at font18 medium (actual AppKit SymbolConfiguration readback).
-    40. + 12. + card["emptySymbol"]["logicalWidth"].as_f64().unwrap_or(26.) + text_width
+    // Original horizontal padding 20, spacing 12 and the SF `waveform.path`
+    // intrinsic width 26 at font 18 medium (actual AppKit
+    // SymbolConfiguration readback), from `emptyState` (:4030-4048).
+    2. * m::EMPTY_H_PADDING
+        + m::EMPTY_GAP
+        + card["emptySymbol"]["logicalWidth"]
+            .as_f64()
+            .unwrap_or(m::EMPTY_SYMBOL_WIDTH)
+        + text_width
 }
 
 #[allow(dead_code)] // System-symbol migration is explicitly paused during perf repair.
@@ -603,24 +616,35 @@ fn card_svg_content(
     if card["isEmpty"].as_bool() == Some(true) {
         let width = empty_card_width(card);
         let inner_width = width - 1.;
+        let symbol_width = card["emptySymbol"]["logicalWidth"]
+            .as_f64()
+            .unwrap_or(m::EMPTY_SYMBOL_WIDTH);
         let label = svg_text(
             card["title"].as_str().unwrap_or("暂无节目"),
-            32. + card["emptySymbol"]["logicalWidth"].as_f64().unwrap_or(26.),
+            // `HStack(spacing: 12)` + `.padding(.horizontal, 20)`: 20 + 12 + the
+            // symbol's own width.
+            m::EMPTY_H_PADDING + m::EMPTY_GAP + symbol_width,
             card["emptySymbol"]["labelBaseline"].as_f64().unwrap_or(38.),
-            16.,
+            m::EMPTY_TEXT_SIZE,
             600,
-            "#ffffffd6",
-            width - 52. - card["emptySymbol"]["logicalWidth"].as_f64().unwrap_or(26.),
+            m::EMPTY_TEXT,
+            width - 52. - symbol_width,
         );
         return format!(
-            r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="64" viewBox="0 0 {width} 64"><rect x=".5" y=".5" width="{inner_width}" height="63" rx="22" fill="#1c252d"/><rect x=".5" y=".5" width="{inner_width}" height="63" rx="22" fill="none" stroke="#00ffff" stroke-opacity=".24"/><path d="M20 32h3l2-6 3 12 3-18 3 20 2-8h2" transform="translate(-8.8889 0) scale(1.444444 1)" fill="none" stroke="#00ffff" stroke-opacity=".9" stroke-width="1.5"/>{label}</svg>"##
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{}" viewBox="0 0 {width} {}"><rect x=".5" y=".5" width="{inner_width}" height="{}" rx="{}" fill="#1c252d"/><rect x=".5" y=".5" width="{inner_width}" height="{}" rx="{}" fill="none" stroke="{}" stroke-opacity="{}"/><path d="M20 32h3l2-6 3 12 3-18 3 20 2-8h2" transform="translate(-8.8889 0) scale(1.444444 1)" fill="none" stroke="{}" stroke-opacity=".9" stroke-width="1.5"/>{label}</svg>"##,
+            m::EMPTY_HEIGHT,
+            m::EMPTY_HEIGHT,
+            m::EMPTY_HEIGHT - 1.,
+            m::EMPTY_RADIUS,
+            m::EMPTY_HEIGHT - 1.,
+            m::EMPTY_RADIUS,
+            m::EMPTY_STROKE,
+            m::EMPTY_STROKE_OPACITY,
+            m::EMPTY_STROKE,
         );
     }
-    let (w, h, r) = if catalog {
-        (306., 74., 22.)
-    } else {
-        (294., 76., 23.)
-    };
+    let geometry = card_geometry(catalog);
+    let (w, h, r) = (geometry.width, geometry.height, geometry.radius);
     let current = card["isCurrent"].as_bool() == Some(true);
     let border = if current { "#68d6e8" } else { "#ffffff" };
     let border_alpha = if current { 0.52 } else { 0.12 };
@@ -634,7 +658,11 @@ fn card_svg_content(
         if current { 1.2 } else { 0.8 }
     );
     let circle = if playlist { "#ff5151" } else { "#7af2ff" };
-    let icon_edge = if catalog { 42 } else { 44 };
+    let icon_edge = if catalog {
+        m::CARD_PLATE_CATALOG
+    } else {
+        m::CARD_PLATE_TRACK
+    };
     body.push_str(&format!(r#"<rect x="14" y="16" width="{icon_edge}" height="{icon_edge}" rx="{}" fill="{circle}" fill-opacity="{}"/>"#,if playlist {12}else{22},if playlist {0.1}else{0.12}));
     if current && !catalog {
         for i in 0..5 {
@@ -672,25 +700,35 @@ fn card_svg_content(
             circle,
         ));
     }
-    let title_size = if current && !catalog { 17. } else { 16. };
+    let title_size = if current && !catalog {
+        m::CARD_TITLE_CURRENT_SIZE
+    } else {
+        m::CARD_TITLE_SIZE
+    };
+    // The original `HStack(spacing: 13)` starts its text column after the
+    // 14 pt leading inset and the 42/44 pt artwork plate.
     body.push_str(&svg_text(
         card["title"].as_str().unwrap_or(""),
-        if catalog { 69. } else { 71. },
+        m::CARD_H_PADDING as f64 + icon_edge + m::CARD_GAP as f64,
         33.,
         title_size,
         600,
-        "#ebeff2",
+        m::CARD_TITLE_COLOR,
         if catalog { 207. } else { 209. },
     ));
     body.push_str(&svg_text(
         card[if catalog { "subtitle" } else { "artist" }]
             .as_str()
             .unwrap_or(""),
-        if catalog { 69. } else { 71. },
+        m::CARD_H_PADDING as f64 + icon_edge + m::CARD_GAP as f64,
         54.,
-        if catalog { 13. } else { 14. },
+        if catalog {
+            m::CARD_SUBTITLE_SIZE
+        } else {
+            m::CARD_ARTIST_SIZE
+        },
         500,
-        "#ffffff7a",
+        m::CARD_SUBTITLE_COLOR,
         if catalog { 207. } else { 164. },
     ));
     if catalog {
@@ -700,9 +738,14 @@ fn card_svg_content(
             body.push_str(r##"<path d="M284 32l5 6-5 6" fill="none" stroke="#ffffff" stroke-opacity=".34" stroke-width="1.8"/>"##);
         }
     } else {
-        for i in 0..7 {
+        for i in 0..m::ENERGY_BARS {
             let height = energy_height(card["energy"].as_f64().unwrap_or(0.) as f32, i);
-            body.push_str(&format!(r##"<rect x="{}" y="{}" width="2" height="{height}" rx="1" fill="#00ffff" fill-opacity=".42"/>"##,252+i*4,49.-height/2.));
+            body.push_str(&format!(
+                r##"<rect x="{}" y="{}" width="{}" height="{height}" rx="1" fill="#00ffff" fill-opacity=".42"/>"##,
+                252. + i as f64 * 4.,
+                49. - height / 2.,
+                m::ENERGY_BAR_WIDTH,
+            ));
         }
         if current && card["hasBoundVideo"].as_bool() == Some(true) {
             body.push_str(r##"<circle cx="272" cy="21" r="13" fill="#263641"/><path d="M265 17h10v8h-10z M275 19l5-2v8l-5-2z" fill="#a3b3bb"/>"##);
@@ -717,39 +760,87 @@ fn card_transform(card: &Value, catalog: bool) -> CardTransform {
     if card["isEmpty"].as_bool() == Some(true) {
         return CardTransform {
             width: empty_card_width(card),
-            height: 64.,
+            height: m::EMPTY_HEIGHT,
             scale: 1.,
             y_degrees: 0.,
-            perspective: 0.72,
+            perspective: m::PERSPECTIVE,
         };
     }
     let focused = card["isFocused"]
         .as_bool()
         .unwrap_or(card["isCurrent"].as_bool() == Some(true));
+    let geometry = card_geometry(catalog);
     CardTransform {
-        width: if catalog { 306. } else { 294. },
-        height: if catalog { 74. } else { 76. },
+        width: geometry.width,
+        height: geometry.height,
         scale: if catalog {
             1.
         } else {
-            card["scale"].as_f64().unwrap_or(1.) + if focused { 0.055 } else { 0. }
+            card["scale"].as_f64().unwrap_or(1.)
+                + if focused { m::FOCUS_SCALE_BUMP } else { 0. }
         },
         y_degrees: if catalog {
-            -7.
+            m::CATALOG_ROTATION
         } else if focused {
-            -4.
+            m::TRACK_ROTATION_FOCUSED
         } else {
-            -10. - card["relativeIndex"].as_i64().unwrap_or(0).clamp(-2, 2) as f64 * 2.5
+            m::TRACK_ROTATION_BASE
+                - card["relativeIndex"].as_i64().unwrap_or(0).clamp(-2, 2) as f64
+                    * m::TRACK_ROTATION_STEP
         },
-        perspective: 0.72,
+        perspective: m::PERSPECTIVE,
     }
 }
 fn energy_height(energy: f32, index: usize) -> f32 {
-    5. + 13. * energy * (0.36 + ((index + 1) as f32 * 1.7).sin().abs() * 0.64)
+    m::ENERGY_BASE
+        + m::ENERGY_SWING
+            * energy
+            * (m::ENERGY_WAVE_BASE + ((index + 1) as f32 * 1.7).sin().abs() * m::ENERGY_WAVE_SWING)
 }
 
-const TRACK_HEIGHT: f32 = 76.;
-const TRACK_SPACING: f32 = -7.;
+/// Card geometry, transcribed from `StageProgramRailView` (`:3724`, `:3942`,
+/// `:4122`): a catalog card is 306×74 r22, a track card is 294×76 r23. The two
+/// are **constant** — depth, focus and audio never resize a card.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CardGeometry {
+    pub width: f64,
+    pub height: f64,
+    pub radius: f64,
+}
+
+pub fn card_geometry(catalog: bool) -> CardGeometry {
+    if catalog {
+        CardGeometry {
+            width: m::CATALOG_CARD_WIDTH as f64,
+            height: m::CATALOG_CARD_HEIGHT as f64,
+            radius: m::CATALOG_CARD_RADIUS as f64,
+        }
+    } else {
+        CardGeometry {
+            width: m::TRACK_CARD_WIDTH as f64,
+            height: m::TRACK_CARD_HEIGHT as f64,
+            radius: m::TRACK_CARD_RADIUS as f64,
+        }
+    }
+}
+
+/// `StageProgramRailCardLayout.horizontalOffset(relativeIndex:isFocused:)`
+/// (`:3370-3380`): the focused card sits 30 pt left, every other card is pushed
+/// out by `min(2, |relativeIndex|) * 9`. The host may project its own
+/// `horizontalOffset`; this is the original's rule and the fallback.
+pub fn card_horizontal_offset(relative_index: i64, focused: bool) -> f64 {
+    if focused {
+        m::CARD_OFFSET_FOCUSED
+    } else {
+        relative_index
+            .unsigned_abs()
+            .min(m::CARD_OFFSET_LIMIT as u64) as f64
+            * m::CARD_OFFSET_STEP
+    }
+}
+
+const TRACK_HEIGHT: f32 = m::TRACK_CARD_HEIGHT;
+const TRACK_SPACING: f32 = m::TRACK_SPACING;
 fn pagination_key(
     state: &Value,
     viewport: f32,
@@ -767,7 +858,78 @@ fn pagination_key(
         && requested != Some(&key))
     .then_some(key)
 }
-const PROGRAM_SPACING: f32 = 4.;
+const PROGRAM_SPACING: f32 = m::CATALOG_SPACING;
+
+/// The bound-video glyph's touch target: `ZStack(alignment: .topTrailing)` with
+/// the control `.frame(width: 26, height: 26).offset(x: -9, y: 8)` inside the
+/// 294 pt track card (`:4159-4187`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VideoHitBox {
+    pub x: f64,
+    pub y: f64,
+    pub size: f64,
+}
+
+pub fn video_hit_box() -> VideoHitBox {
+    VideoHitBox {
+        x: m::TRACK_CARD_WIDTH as f64 - m::VIDEO_BUTTON as f64 - m::VIDEO_OFFSET_RIGHT as f64,
+        y: m::VIDEO_OFFSET_TOP as f64,
+        size: m::VIDEO_BUTTON as f64,
+    }
+}
+
+/// Whether a point inside the card's own (unprojected) coordinates lands on the
+/// bound-video control. The same test is used for press and release, so a press
+/// that drifts off the control cannot still fire it.
+pub fn video_hit_test(local: [f64; 2]) -> bool {
+    let hit = video_hit_box();
+    local[0] >= hit.x && local[0] <= hit.x + hit.size && local[1] >= hit.y && local[1] <= hit.y + hit.size
+}
+
+/// `StageProgramRailRoute` (`:3468-3473`): which of the three lists is on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RailRoute {
+    Programs,
+    Tracks,
+    PlaylistTracks,
+}
+
+pub fn rail_route(snapshot: &Value) -> RailRoute {
+    match snapshot["route"].as_str() {
+        Some("programs") | None => RailRoute::Programs,
+        Some(_) if snapshot["isPlaylist"].as_bool() == Some(true) => RailRoute::PlaylistTracks,
+        Some(_) => RailRoute::Tracks,
+    }
+}
+
+/// What the rail shows when it has no cards (`:3646-3660`, `:3759-3782`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RailEmpty {
+    /// The 142×64 `emptyState` card, `.padding(.top, 96)`, no header.
+    Card,
+    /// `ProgressView` + 「正在加载歌曲…」 for a playlist with no tracks yet.
+    LoadingPlaylist,
+}
+
+/// The original's own empty decision: a catalog with no programs **and** no
+/// playlists, or a track list with no cards at all, is an empty state — never a
+/// header over an empty scroll.
+pub fn rail_empty(route: RailRoute, catalog_items: usize, track_count: usize) -> Option<RailEmpty> {
+    match route {
+        RailRoute::Programs => (catalog_items == 0).then_some(RailEmpty::Card),
+        RailRoute::Tracks => (track_count == 0).then_some(RailEmpty::Card),
+        RailRoute::PlaylistTracks => (track_count == 0).then_some(RailEmpty::LoadingPlaylist),
+    }
+}
+
+/// `Text(programStore.status == .planning ? "DJ 正在排歌" : "暂无节目")` (`:4036`).
+pub fn rail_empty_title(planning: bool) -> &'static str {
+    if planning {
+        "DJ 正在排歌"
+    } else {
+        "暂无节目"
+    }
+}
 
 fn card_priority(card: &Value, distance_bias: usize) -> usize {
     if card["isFocused"]
@@ -1025,7 +1187,9 @@ impl StageProgramRailPane {
         let offset = if catalog {
             0.
         } else {
-            card["horizontalOffset"].as_f64().unwrap_or(0.)
+            card["horizontalOffset"]
+                .as_f64()
+                .unwrap_or_else(|| card_horizontal_offset(card["relativeIndex"].as_i64().unwrap_or(0), focused))
         };
         let video = !catalog
             && card["isCurrent"].as_bool() == Some(true)
@@ -1164,11 +1328,7 @@ impl StageProgramRailPane {
                     ];
                     if let Some(local) = down_projected.inverse_hit_shifted(point,delta) {
                         window.focus(&mouse_focus, cx);
-                        let video_hit = video
-                            && local[0] >= 259.
-                            && local[0] <= 285.
-                            && local[1] >= 8.
-                            && local[1] <= 34.;
+                        let video_hit = video && video_hit_test(local);
                         _ = down_view.update(cx, |this, _| {
                             this.pressed_card = Some((down_id.clone(), video_hit))
                         });
@@ -1184,11 +1344,7 @@ impl StageProgramRailPane {
                         f64::from(f32::from(event.position.y)),
                     ];
                     if let Some(local) = projected.inverse_hit_shifted(point,delta) {
-                        let video_hit = video
-                            && local[0] >= 259.
-                            && local[0] <= 285.
-                            && local[1] >= 8.
-                            && local[1] <= 34.;
+                        let video_hit = video && video_hit_test(local);
                         _ = view.update(cx, |this, cx| {
                             if this.pressed_card.take() == Some((id.clone(), video_hit)) {
                                 this.commands.push(if video_hit {
@@ -1249,49 +1405,65 @@ impl StageProgramRailPane {
             }))
             .child(canvas);
         if video {
-            let video_focus = self
-                .focus_handles
-                .entry(format!("video-{}", card["trackID"]))
-                .or_insert_with(|| cx.focus_handle())
-                .clone();
             let command = json!({"op":"stage.program.video","trackID":card["trackID"]});
             wrapper = wrapper.child(
-                div()
-                    .id(format!("video-{}", card["trackID"]))
+                Button::new(format!("video-{}", card["trackID"]))
+                    .custom(scene_variant(
+                        cx,
+                        0xffffff26,
+                        m::REPLAN_FILL,
+                        s::ICON_ACTIVE,
+                    ))
                     .absolute()
-                    .right(px(9.))
-                    .top(px(8.))
-                    .w(px(26.))
-                    .h(px(26.))
-                    .role(Role::Button)
-                    .aria_label("播放绑定视频")
-                    .track_focus(&video_focus)
-                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                        if !event.keystroke.modifiers.modified()
-                            && matches!(event.keystroke.key.as_str(), "enter" | "space")
-                        {
-                            this.commands.push(command.clone());
-                            cx.stop_propagation();
-                            cx.notify();
-                        }
+                    .right(px(m::VIDEO_OFFSET_RIGHT))
+                    .top(px(m::VIDEO_OFFSET_TOP))
+                    .w(px(m::VIDEO_BUTTON))
+                    .h(px(m::VIDEO_BUTTON))
+                    .rounded(px(m::VIDEO_BUTTON / 2.))
+                    .text_color(rgba(s::ICON_ACTIVE))
+                    .icon(AssetIcon::Video)
+                    .tooltip("播放这首歌绑定的视频")
+                    .accessibility_label("播放绑定视频")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.commands.push(command.clone());
+                        cx.notify();
                     })),
             );
         }
         wrapper.into_any_element()
     }
+    /// The rail header's round controls: the 28 pt replan/planning button
+    /// (`:3975-4001`) and the plain 12 pt back chevron (`:3785-3793`).
     fn icon_button(
         &self,
         id: impl Into<ElementId>,
-        icon: gpui_kit::assets::IconName,
+        icon: AssetIcon,
         tooltip: &'static str,
         command: Value,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let replan = command["op"].as_str() == Some("stage.program.replan");
         let planning = replan && self.snapshot["planning"].as_bool() == Some(true);
+        let back = command["op"].as_str() == Some("stage.program.back");
+        let size = if back {
+            m::BACK_ICON
+        } else {
+            m::REPLAN_BUTTON
+        };
+        let text = if planning { s::WARNING } else { s::ACCENT };
         Button::new(id)
+            .custom(scene_variant(
+                cx,
+                if back { 0x00000000 } else { m::REPLAN_FILL },
+                m::REPLAN_FILL,
+                if back { s::ICON_ACTIVE } else { text },
+            ))
+            .w(px(size))
+            .h(px(size))
+            .rounded(px(size / 2.))
+            .text_color(rgba(if back { s::ICON_ACTIVE } else { text }))
             .icon(if planning {
-                gpui_kit::assets::IconName::Hourglass
+                AssetIcon::Hourglass
             } else {
                 icon
             })
@@ -1305,9 +1477,15 @@ impl StageProgramRailPane {
             } else {
                 tooltip
             })
-            .w(px(26.))
-            .h(px(26.))
-            .rounded_full()
+            .accessibility_label(if replan {
+                if planning {
+                    "DJ 正在重新编排"
+                } else {
+                    m::REPLAN_LABEL
+                }
+            } else {
+                tooltip
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.commands.push(command.clone());
                 cx.notify();
@@ -1328,11 +1506,14 @@ impl Render for StageProgramRailPane {
         }
         self.material_ready.set(true);
         self.material_applied.set(false);
-        let tracks = self.snapshot["route"]
-            .as_str()
-            .is_some_and(|r| r != "programs");
+        let route = rail_route(&self.snapshot);
+        let tracks = route != RailRoute::Programs;
         let track_count = self.snapshot["tracks"].as_array().map_or(0, Vec::len);
-        let empty_tracks = tracks && track_count == 0;
+        let catalog_items = self.snapshot["programs"]
+            .as_array()
+            .map_or(0, Vec::len)
+            + self.snapshot["playlists"].as_array().map_or(0, Vec::len);
+        let empty = rail_empty(route, catalog_items, track_count);
         if tracks && self.snapshot["isPlaylist"].as_bool() == Some(true) {
             let view = cx.entity().downgrade();
             window.on_next_frame(move |window, cx| {
@@ -1353,42 +1534,46 @@ impl Render for StageProgramRailPane {
                 let _ = window;
             });
         }
-        let empty_catalog = !tracks
-            && self.snapshot["programs"]
-                .as_array()
-                .is_none_or(Vec::is_empty)
-            && self.snapshot["playlists"]
-                .as_array()
-                .is_none_or(Vec::is_empty);
-        if empty_catalog || empty_tracks {
+        if let Some(empty) = empty {
+            // The empty state replaces the whole rail: no header, no refresh
+            // control, no content margins, and no scroll rail mask — only the
+            // waveform card (or the playlist spinner), 96 pt below the top inset.
             self.material_frame.borrow_mut().fade_fraction = 0.;
-            let playlist = tracks && self.snapshot["isPlaylist"].as_bool() == Some(true);
-            let state: AnyElement = if playlist {
-                div()
+            let state: AnyElement = match empty {
+                RailEmpty::LoadingPlaylist => div()
                     .flex()
                     .flex_col()
                     .items_center()
-                    .gap(px(10.))
-                    .text_size(px(13.))
-                    .child(gpui_kit::component::spinner::Spinner::new())
+                    .gap(px(m::LOADING_GAP))
+                    .text_size(px(m::LOADING_SIZE))
+                    .text_color(rgba(m::LOADING_TEXT))
+                    .child(Spinner::new().small())
                     .child("正在加载歌曲…")
-                    .into_any_element()
-            } else {
-                let card = json!({"id":"empty-state","isEmpty":true,"title":if self.snapshot["planning"].as_bool()==Some(true){"DJ 正在排歌"}else{"暂无节目"}});
-                self.projected_card(&card, true, false, "", window, cx)
+                    .into_any_element(),
+                RailEmpty::Card => {
+                    let card = json!({
+                        "id": "empty-state",
+                        "isEmpty": true,
+                        "title": rail_empty_title(self.snapshot["planning"].as_bool() == Some(true)),
+                    });
+                    self.projected_card(&card, true, false, "", window, cx)
+                }
             };
             return div()
                 .id("stage-program-rail")
                 .capture_any_mouse_down(cx.listener(|this, _, _, _| this.pressed_card = None))
-                .w(px(350.))
-                .h(px(430.))
-                .pt(px(42.))
-                .pr(px(10.))
+                .w_full()
+                .h_full()
+                .max_w(px(m::RAIL_WIDTH))
+                .max_h(px(m::RAIL_HEIGHT))
+                .pt(px(m::RAIL_TOP))
+                .pr(px(m::RAIL_TRAILING))
                 .flex()
                 .flex_col()
                 .items_end()
-                .text_color(rgb(0xe5e7ea))
-                .child(div().mt(px(96.)).child(state))
+                .font_family(doc::FONT_FAMILY)
+                .text_color(rgba(s::TEXT))
+                .child(div().mt(px(m::EMPTY_TOP_PADDING)).child(state))
                 .child(self.material_publisher(cx));
         }
         let mut content = div()
@@ -1400,8 +1585,23 @@ impl Render for StageProgramRailPane {
             } else {
                 PROGRAM_SPACING
             }))
-            .py(px(18.));
-        let mut header = div().flex().items_center().gap(px(8.)).px(px(14.)).w_full();
+            .py(px(m::CONTENT_MARGIN));
+        // The original header hugs the trailing edge (the rail is a trailing
+        // `VStack`): it is sized by its content, never stretched across the rail,
+        // so the back control sits next to the title instead of at the far left.
+        let mut header = div()
+            .flex()
+            .items_center()
+            .gap(px(if tracks {
+                m::HEADER_TRACK_GAP
+            } else {
+                m::HEADER_CATALOG_GAP
+            }))
+            .px(px(m::HEADER_H_PADDING))
+            .text_size(px(m::HEADER_SIZE))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgba(m::HEADER_TEXT))
+            .self_end();
         if tracks {
             // Preserve negative Swift zIndex values by shifting every priority
             // equally, rather than collapsing all distant cards to zero.
@@ -1415,8 +1615,8 @@ impl Render for StageProgramRailPane {
             header = header
                 .child(self.icon_button(
                     "program-back",
-                    gpui_kit::assets::IconName::ChevronLeft,
-                    "返回节目单",
+                    AssetIcon::ChevronLeft,
+                    m::BACK_LABEL,
                     json!({"op":"stage.program.back"}),
                     cx,
                 ))
@@ -1438,7 +1638,7 @@ impl Render for StageProgramRailPane {
             if self.snapshot["isPlaylist"].as_bool() != Some(true) {
                 header = header.child(self.icon_button(
                     "program-replan",
-                    gpui_kit::assets::IconName::RefreshCw,
+                    AssetIcon::RefreshCw,
                     "重新编排",
                     json!({"op":"stage.program.replan"}),
                     cx,
@@ -1510,57 +1710,24 @@ impl Render for StageProgramRailPane {
             if track_count > 0 && self.snapshot["hasMore"].as_bool() == Some(true) {
                 content = content.child(
                     div()
-                        .w(px(306.))
-                        .h(px(44.))
+                        .w(px(m::PAGING_WIDTH))
+                        .h(px(m::PAGING_HEIGHT))
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(gpui_kit::component::spinner::Spinner::new()),
+                        .child(Spinner::new().small()),
                 );
-            }
-            if self.snapshot["tracks"]
-                .as_array()
-                .is_none_or(|a| a.is_empty())
-            {
-                if self.snapshot["isPlaylist"].as_bool() == Some(true) {
-                    content = content.child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .justify_center()
-                            .child(gpui_kit::component::spinner::Spinner::new()),
-                    );
-                }
-                content = content.pt(px(96.)).gap(px(10.)).items_center();
-                if self.snapshot["isPlaylist"].as_bool() != Some(true) {
-                    let empty_card = json!({"id":"empty-state","isEmpty":true,"title":self.snapshot["emptyMessage"].as_str().unwrap_or("暂无节目")});
-                    content = content.child(self.projected_card(
-                        &empty_card,
-                        true,
-                        false,
-                        "",
-                        window,
-                        cx,
-                    ));
-                } else {
-                    content = content.child(
-                        self.snapshot["emptyMessage"]
-                            .as_str()
-                            .unwrap_or("正在加载歌曲…")
-                            .to_owned(),
-                    );
-                }
             }
         } else {
             header = header
                 .child(self.icon_button(
                     "program-replan",
-                    gpui_kit::assets::IconName::RefreshCw,
+                    AssetIcon::RefreshCw,
                     "重新编排",
                     json!({"op":"stage.program.replan"}),
                     cx,
                 ))
-                .child(div().flex_1())
+                .child(div().w(px(doc::SPACING_4)))
                 .child(format!(
                     "歌单 · {}",
                     self.snapshot["programs"].as_array().map_or(0, Vec::len)
@@ -1576,30 +1743,23 @@ impl Render for StageProgramRailPane {
                     content = content.child(row);
                 }
             }
-            if self.snapshot["programs"]
-                .as_array()
-                .is_none_or(|a| a.is_empty())
-                && self.snapshot["playlists"]
-                    .as_array()
-                    .is_none_or(|a| a.is_empty())
-            {
-                let empty_card = json!({"id":"empty-state","isEmpty":true,"title":self.snapshot["emptyMessage"].as_str().unwrap_or("暂无节目")});
-                content =
-                    content.child(self.projected_card(&empty_card, true, false, "", window, cx));
-            }
         }
         div()
             .id("stage-program-rail")
             .capture_any_mouse_down(cx.listener(|this, _, _, _| this.pressed_card = None))
-            .w(px(350.))
-            .h(px(430.))
-            .pt(px(42.))
-            .pr(px(10.))
+            .w_full()
+            .h_full()
+            .max_w(px(m::RAIL_WIDTH))
+            .max_h(px(m::RAIL_HEIGHT))
+            .pt(px(m::RAIL_TOP))
+            .pr(px(m::RAIL_TRAILING))
             .flex()
             .flex_col()
-            .gap(px(8.))
-            .text_color(rgb(0xe5e7ea))
-            .when(!empty_tracks, |pane| pane.child(header))
+            .items_end()
+            .gap(px(m::RAIL_GAP))
+            .font_family(doc::FONT_FAMILY)
+            .text_color(rgba(s::TEXT))
+            .child(header)
             .child(
                 div()
                     .id("stage-program-scroll")
@@ -1665,7 +1825,10 @@ impl Render for StageProgramRailPane {
 }
 
 fn active_center_offset(index: usize, viewport: f32, maximum: f32) -> f32 {
-    -(18. + index as f32 * (TRACK_HEIGHT + TRACK_SPACING) + TRACK_HEIGHT / 2. - viewport / 2.)
+    -(m::CONTENT_MARGIN
+        + index as f32 * (TRACK_HEIGHT + TRACK_SPACING)
+        + TRACK_HEIGHT / 2.
+        - viewport / 2.)
         .clamp(0., maximum)
 }
 // SwiftUI's easeOut timing curve: cubic Bezier (0, 0, 0.58, 1).
@@ -1692,10 +1855,241 @@ fn ease_out_progress(time: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        PROGRAM_SPACING, TRACK_SPACING, active_center_offset, card_effects, card_priority,
-        card_svg, card_transform, energy_height, pagination_key, scroll_phase, snap_offset,
+        PROGRAM_SPACING, TRACK_SPACING, active_center_offset, card_effects, card_geometry,
+        card_horizontal_offset, card_priority, card_svg, card_transform, empty_card_width,
+        RailEmpty, RailRoute, energy_height, pagination_key, rail_empty, rail_empty_title,
+        rail_route, scroll_phase, snap_offset, video_hit_box, video_hit_test,
     };
+    use super::m;
     use serde_json::json;
+
+    /// The rail's own geometry, transcribed from `StageProgramRailView`: a
+    /// catalog card is 306×74 r22, a track card 294×76 r23, and neither number
+    /// depends on depth, focus or audio.
+    #[test]
+    fn card_geometry_is_constant_at_the_original_sizes() {
+        let catalog = card_geometry(true);
+        let track = card_geometry(false);
+        assert_eq!(
+            (catalog.width, catalog.height, catalog.radius),
+            (306., 74., 22.)
+        );
+        assert_eq!((track.width, track.height, track.radius), (294., 76., 23.));
+        assert_ne!(catalog.width, track.width);
+        assert_ne!(catalog.height, track.height);
+        for card in [
+            json!({"isCurrent":true,"scale":1.4,"relativeIndex":0,"depth":-72}),
+            json!({"isCurrent":false,"scale":0.78,"relativeIndex":-5,"depth":-144}),
+        ] {
+            assert_eq!(card_transform(&card, false).width, track.width);
+            assert_eq!(card_transform(&card, false).height, track.height);
+            assert_eq!(card_transform(&card, true).width, catalog.width);
+            assert_eq!(card_transform(&card, true).height, catalog.height);
+        }
+    }
+
+    /// The empty state is the original's measured ~142×64 card (`HStack(spacing:
+    /// 12)` + `.padding(.horizontal, 20)` + the 26 pt symbol + the 16 pt label):
+    /// it must never grow into a 306×64 catalog card.
+    #[test]
+    fn empty_state_is_the_original_intrinsic_card_not_a_catalog_card() {
+        let empty = json!({"id":"empty-state","isEmpty":true,"title":"暂无节目"});
+        let width = empty_card_width(&empty);
+        assert!(
+            (width - 142.).abs() < 1.,
+            "the live measured empty width is ~142, got {width}"
+        );
+        assert_ne!(width, card_geometry(true).width);
+        let transform = card_transform(&empty, true);
+        assert_eq!(transform.width, width);
+        assert_eq!(transform.height, 64.);
+        assert_ne!(transform.height, card_geometry(true).height);
+        let svg = card_svg(&empty, &serde_json::Value::Null, true, false);
+        assert!(
+            svg.starts_with(&format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"64\""
+            )),
+            "the rasterized card must be the intrinsic empty size: {svg}"
+        );
+        assert!(
+            svg.contains("scale(1.444444 1)"),
+            "the empty card carries the original waveform glyph (18 pt source): {svg}"
+        );
+        // The label is shaped text (`lyrics::shaped_text_svg`), so it is the
+        // second path in the card: the waveform glyph and the label, nothing else.
+        assert!(svg.contains(m::EMPTY_TEXT));
+        assert_eq!(
+            svg.matches("<path").count(),
+            2,
+            "the empty card is the waveform plus one label: {svg}"
+        );
+        assert!(
+            !svg.contains("fill-opacity=\".42\""),
+            "the empty card has no energy trace"
+        );
+        assert!(!svg.contains("#028ce0"), "the empty card has no card gradient");
+    }
+
+    /// The header is the original's: the catalog header uses a 10 pt gap, the
+    /// track header 8, both inset 14 pt, and the replan control is the original
+    /// 28 pt circle — not the 26 pt video control.
+    #[test]
+    fn header_geometry_matches_the_original_rail_header() {
+        assert_eq!(m::HEADER_CATALOG_GAP, 10.);
+        assert_eq!(m::HEADER_TRACK_GAP, 8.);
+        assert_ne!(m::HEADER_CATALOG_GAP, m::HEADER_TRACK_GAP);
+        assert_eq!(m::HEADER_H_PADDING, 14.);
+        assert_eq!(m::HEADER_SIZE, 14.);
+        assert_eq!(m::REPLAN_BUTTON, 28.);
+        assert_ne!(m::REPLAN_BUTTON, m::VIDEO_BUTTON);
+        assert_eq!(m::RAIL_TOP, 42.);
+        assert_eq!(m::RAIL_TRAILING, 10.);
+        assert_eq!(m::CONTENT_MARGIN, 18.);
+    }
+
+    /// `rail_empty` is the original's own empty decision: a catalog is empty only
+    /// when programs **and** playlists are; a playlist with no tracks shows the
+    /// spinner instead of the waveform card.
+    #[test]
+    fn rail_empty_decision_matches_the_original_routes() {
+        assert_eq!(rail_empty(RailRoute::Programs, 0, 0), Some(RailEmpty::Card));
+        assert_eq!(rail_empty(RailRoute::Programs, 1, 0), None);
+        assert_eq!(rail_empty(RailRoute::Tracks, 0, 0), Some(RailEmpty::Card));
+        assert_eq!(rail_empty(RailRoute::Tracks, 0, 3), None);
+        assert_eq!(
+            rail_empty(RailRoute::PlaylistTracks, 0, 0),
+            Some(RailEmpty::LoadingPlaylist)
+        );
+        assert_eq!(rail_empty(RailRoute::PlaylistTracks, 0, 3), None);
+        assert_ne!(
+            rail_empty(RailRoute::PlaylistTracks, 0, 0),
+            rail_empty(RailRoute::Tracks, 0, 0)
+        );
+        assert_eq!(rail_empty_title(false), "暂无节目");
+        assert_eq!(rail_empty_title(true), "DJ 正在排歌");
+        assert_ne!(rail_empty_title(false), rail_empty_title(true));
+    }
+
+    #[test]
+    fn rail_route_reads_the_host_route_and_never_invents_tracks() {
+        assert_eq!(rail_route(&json!({"route":"programs"})), RailRoute::Programs);
+        assert_eq!(rail_route(&json!({})), RailRoute::Programs);
+        assert_eq!(rail_route(&json!({"route":"tracks"})), RailRoute::Tracks);
+        assert_eq!(
+            rail_route(&json!({"route":"tracks","isPlaylist":true})),
+            RailRoute::PlaylistTracks
+        );
+        assert_ne!(
+            rail_route(&json!({"route":"tracks","isPlaylist":false})),
+            RailRoute::PlaylistTracks
+        );
+    }
+
+    /// `StageProgramRailCardLayout.horizontalOffset`: the focused card sits
+    /// 30 pt left, neighbours are pushed out by `min(2, |relativeIndex|) * 9`.
+    #[test]
+    fn card_horizontal_offset_matches_the_original_layout() {
+        assert_eq!(card_horizontal_offset(0, true), -30.);
+        assert_eq!(card_horizontal_offset(3, true), -30.);
+        assert_eq!(card_horizontal_offset(0, false), 0.);
+        assert_eq!(card_horizontal_offset(1, false), 9.);
+        assert_eq!(card_horizontal_offset(2, false), 18.);
+        assert_eq!(card_horizontal_offset(-5, false), 18.);
+        assert_ne!(
+            card_horizontal_offset(0, true),
+            card_horizontal_offset(0, false)
+        );
+    }
+
+    /// The bound-video control is the original's 26 pt glyph offset 9 pt from the
+    /// card's trailing edge and 8 pt from its top — inside the track card.
+    #[test]
+    fn bound_video_hit_target_matches_the_original_offset_button() {
+        let hit = video_hit_box();
+        assert_eq!((hit.x, hit.y, hit.size), (259., 8., 26.));
+        assert_eq!(hit.x + hit.size, 294. - 9.);
+        assert!(video_hit_test([259., 8.]));
+        assert!(video_hit_test([272., 21.]));
+        assert!(video_hit_test([285., 34.]));
+        assert!(!video_hit_test([258.9, 21.]));
+        assert!(!video_hit_test([285.1, 21.]));
+        assert!(!video_hit_test([272., 7.9]));
+        assert!(!video_hit_test([272., 34.1]));
+    }
+
+    /// Scroll settling must honour both ends: never a negative offset at the top,
+    /// never past `maximum` at the bottom, and a zero-length rail cannot move.
+    #[test]
+    fn snapping_honours_the_scroll_boundaries() {
+        assert_eq!(snap_offset(0., 0.), 0.);
+        assert_eq!(snap_offset(-300., 0.), 0.);
+        assert_eq!(snap_offset(0., 900.), 0.);
+        assert_eq!(snap_offset(-900., 900.), -900.);
+        assert_eq!(snap_offset(-901., 900.), -900.);
+        // Half a 69 pt stride rounds to the nearer card, at the top boundary.
+        assert_eq!(snap_offset(-34., 900.), 0.);
+        assert_eq!(snap_offset(-35., 900.), -69.);
+        assert_ne!(snap_offset(-34., 900.), snap_offset(-35., 900.));
+    }
+
+    /// The active track centres with the original 18 pt content margin, and the
+    /// centring clamps at both ends of the rail.
+    #[test]
+    fn active_card_centering_clamps_at_both_ends() {
+        assert_eq!(active_center_offset(0, 300., 900.), 0.);
+        assert_eq!(active_center_offset(0, 900., 900.), 0.);
+        // A card whose centre is already at or above the viewport centre needs no
+        // scroll; only once it is below does the offset become negative.
+        assert_eq!(active_center_offset(1, 300., 900.), 0.);
+        assert_eq!(active_center_offset(2, 300., 900.), -44.);
+        assert_eq!(active_center_offset(30, 300., 900.), -900.);
+        assert_ne!(
+            active_center_offset(0, 300., 900.),
+            active_center_offset(2, 300., 900.)
+        );
+    }
+
+    /// The energy trace is the original's seven-bar waveform: a fixed 5 pt base
+    /// plus `13 * energy * (0.36 + |sin((index + 1) * 1.7)| * 0.64)`, so two bars
+    /// of the same track are never the same height.
+    #[test]
+    fn energy_trace_uses_the_original_wave_shape() {
+        for index in 0..m::ENERGY_BARS {
+            assert_eq!(energy_height(0., index), 5.);
+            let expected = 5.
+                + 13. * (0.36 + (((index + 1) as f32) * 1.7).sin().abs() * 0.64);
+            assert!(
+                (energy_height(1., index) - expected).abs() < 1e-5,
+                "bar {index} must follow the original wave, got {}",
+                energy_height(1., index)
+            );
+        }
+        assert_ne!(energy_height(1., 0), energy_height(1., 1));
+        assert_ne!(energy_height(1., 2), energy_height(1., 3));
+        // Index 1 is the trough of the original wave (|sin(3.4)| ≈ 0.26), so it
+        // must read below both of its neighbours.
+        assert!(energy_height(1., 1) < energy_height(1., 0));
+        assert!(energy_height(1., 1) < energy_height(1., 2));
+        assert!(energy_height(0., 3) < energy_height(1., 3));
+    }
+
+    /// Paint priority never reorders the list: the current/focused card paints
+    /// above every neighbour, and among neighbours a nearer card always paints
+    /// above a farther one.
+    #[test]
+    fn paint_priority_keeps_the_original_order_and_raises_activations() {
+        let current = card_priority(&json!({"isCurrent":true,"relativeIndex":0}), 4);
+        for relative in [-4, -2, -1, 1, 2, 4] {
+            assert!(
+                current > card_priority(&json!({"relativeIndex":relative}), 4),
+                "the current card must paint above relativeIndex {relative}"
+            );
+        }
+        let near = card_priority(&json!({"relativeIndex":1}), 4);
+        let far = card_priority(&json!({"relativeIndex":3}), 4);
+        assert!(near > far);
+        assert_ne!(near, far);
+    }
     #[test]
     fn background_queue_bounds_replaces_latest_and_rejects_old_generation() {
         use super::*;
