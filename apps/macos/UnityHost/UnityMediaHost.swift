@@ -1084,7 +1084,13 @@ final class UnityMediaHost {
                 uiIntents.removeAll { ($0["revision"] as? UInt64 ?? 0) <= revision }
                 return true
             case "inbox.list", "inbox.read", "inbox.post": return inbox?.command(value) ?? false
-            case "stage.load": return true
+            // `stage.load` has no production action: the stage/space state is
+            // published by the snapshot projection every poll, and there is no
+            // separate load step to run here. It stays in the settings
+            // whitelist so the request reaches this handler, and it answers
+            // `false` so the caller gets `settings_command_rejected` instead of
+            // a fake accepted result (docs/plans/2026-10-08-ui-function-verification.md §4.2).
+            case "stage.load": return false
             case "stage.player.lyrics":
                 return settingsVisualCommand(value)
             case "stage.player.cloud", "stage.player.particles": return settingsVisualCommand(value)
@@ -1472,7 +1478,11 @@ final class UnityMediaHost {
             return presenceSettings.command(value)
         case _ where UnityPresenceSettingsBridge.supportedCommands.contains(op): return presenceSettings.command(value)
         case "music.load", "music.connect", "music.disconnect", "music.sync": return musicLibrary.settingsCommand(value)
-        case "stage.load": return true
+        // Same as the `command(_:)` arm: no production action exists behind
+        // `stage.load`, so do not accept it. `false` becomes
+        // `settingsCommandResult.status=failed` (code `settings_command_rejected`)
+        // instead of a success the UI cannot observe.
+        case "stage.load": return false
         case "stage.player.lyrics": return command(value)
         case "stage.player.cloud":
             return settingsVisualCommand(value)

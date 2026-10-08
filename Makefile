@@ -1,6 +1,14 @@
 .PHONY: generate test test-all test-install test-worlds test-daemon test-python test-harnesses _test-harnesses e2e-acceptance build release build-native build-gpui-experimental install install-debug install-universal unregister-product test-icon dedupe verify-registrations verify-helper-manifest verify-screen-link-helper bundle-screen-link-helper
 .DEFAULT_GOAL := build
 
+# Make-compatible environment file; override with BUILD_ENV=/absolute/path.env.
+BUILD_ENV ?= config/release.env
+include $(BUILD_ENV)
+export GMGN_RELEASE_BUILD GMGN_RELEASE_VERSION CARGO_INCREMENTAL CARGO_BUILD_JOBS CARGO_NET_OFFLINE
+INSTALL_DESTINATION ?= $(HOME)/Applications/gmgn radio.app
+TASK_SERVICE_ROOT ?= $(HOME)/Library/Application Support/gmgn radio/TaskService
+.PHONY: release-install install-built
+
 # 默认 Release：只有 -O 下"承托网格派生"才是 0.5 s 量级（-Onone 是 6.6 s，
 # 真机一次要六秒多，用户等不了）。想最快编译走 make install-debug。
 CONFIGURATION ?= Release
@@ -175,6 +183,11 @@ build-gpui-experimental: build-native
 release: CONFIGURATION := Release
 release: build
 
+# Build/sign first, then install; never launch the application or run audio tests.
+release-install: CONFIGURATION := Release
+release-install: release
+	$(MAKE) install-built CONFIGURATION="$(CONFIGURATION)"
+
 # 可单独执行（`make unregister-product`，例如 daemon/网关之外另跑了一次 xcodebuild）；
 # `build` 末尾调用的就是上面同一条命令。想核对别的配置：CONFIGURATION=Debug。
 unregister-product:
@@ -188,9 +201,12 @@ test-icon:
 # 日常迭代就用这一条：Release 的 -O 手感 + 单架构 + 增量编译。
 # Unity 正式候选保持已封印的彩色图标；安装前不修改签名资源。
 install: build
+	$(MAKE) install-built CONFIGURATION="$(CONFIGURATION)"
+
+# Install an already sealed candidate without compiling again.
+install-built:
 	$(PYTHON) tools/unity-product-metadata.py --verify "$(PRODUCT_APP)"
-	python3 tools/install-macos.py --source "$(PRODUCT_APP)"
-	rm -rf "$(PRODUCT_APP)"
+	$(PYTHON) tools/install-macos.py --source "$(PRODUCT_APP)" --destination "$(INSTALL_DESTINATION)" --root "$(TASK_SERVICE_ROOT)" --timing
 
 # 分发形状：通用二进制（arm64 + x86_64）+ 整模块优化 —— 也就是改造前
 # `make install CONFIGURATION=Release` 的行为。给别人的机器用这条。

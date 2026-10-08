@@ -1,6 +1,7 @@
 //! Generation configuration authority. SQL contains metadata only; secrets remain private files.
 use crate::{
     canonical_json,
+    files,
     model::{self, Result},
 };
 use rusqlite::{params, Connection, OptionalExtension};
@@ -9,7 +10,6 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -21,18 +21,13 @@ fn secret_root(root: &Path) -> Result<PathBuf> {
         .parent()
         .ok_or("generation_configuration_invalid_request")?;
     let directory = parent.join("secrets");
-    if directory.exists() {
-        if !fs::symlink_metadata(&directory)
-            .map_err(|_| "generation_configuration_secret_unavailable")?
-            .is_dir()
-        {
-            return Err("generation_configuration_secret_unavailable");
-        }
-    } else {
-        fs::create_dir(&directory).map_err(|_| "generation_configuration_secret_unavailable")?;
-    }
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
-        .map_err(|_| "generation_configuration_secret_unavailable")?;
+    // Delegate to the crate-wide private-storage policy instead of hand-rolling
+    // one here. unix: create/re-secure with mode 0700 behind an
+    // `O_NOFOLLOW|O_DIRECTORY` handle, and reject symlinked ancestors. Windows:
+    // create it with a protected DACL granting only the current user. Windows
+    // has no mode bits, so 0700 has no literal equivalent there — the protected
+    // DACL is the equivalent control.
+    files::directory(&directory).map_err(|_| "generation_configuration_secret_unavailable")?;
     Ok(directory)
 }
 fn identifier(v: &Value) -> Result<&str> {
@@ -47,25 +42,25 @@ fn read_leaf(root: &Path, reference: &str, limit: u64) -> Result<Vec<u8>> {
     let path = secret_root(root)?.join(format!("generation-{reference}.secret"));
     let metadata =
         fs::symlink_metadata(&path).map_err(|_| "generation_configuration_secret_unavailable")?;
-    if !metadata.is_file() || metadata.len() > limit || metadata.permissions().mode() & 0o077 != 0 {
+    if !metadata.is_file() || metadata.len() > limit {
         return Err("generation_configuration_secret_unavailable");
     }
-    // O_NOFOLLOW fences replacement with a symlink between metadata and open.
-    use std::io::Read;
-    let mut file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|_| "generation_configuration_secret_unavailable")?;
-    let mut bytes = Vec::new();
-    std::io::Read::by_ref(&mut file)
-        .take(limit + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "generation_configuration_secret_unavailable")?;
-    if bytes.len() as u64 > limit {
-        return Err("generation_configuration_secret_unavailable");
+    // unix: a secret that group or other can touch at all is not private, no
+    // matter who wrote it — re-check the mode here instead of trusting the
+    // writer. Windows has no mode bits, so nothing is checked from metadata
+    // there; confidentiality is the file's protected DACL and `files::read`
+    // additionally refuses reparse points and hard-linked leaves.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err("generation_configuration_secret_unavailable");
+        }
     }
-    Ok(bytes)
+    // `files::read` opens with `O_NOFOLLOW` (unix) or `FILE_FLAG_OPEN_REPARSE_POINT`
+    // plus a link-count check (Windows), so swapping the leaf for a symlink
+    // between the metadata read above and the open cannot redirect the read.
+    files::read(&path, limit as usize).map_err(|_| "generation_configuration_secret_unavailable")
 }
 fn token(bytes: Vec<u8>) -> Result<String> {
     let value = String::from_utf8(bytes).map_err(|_| "invalid_token")?;
@@ -83,12 +78,11 @@ fn store_secret(root: &Path, id: &str, token: &str) -> Result<String> {
     )
     .to_string();
     let path = secret_root(root)?.join(format!("generation-{reference}.secret"));
-    match fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&path)
-    {
+    // `create_new_private` keeps create-new semantics on both platforms (unix
+    // `O_CREAT|O_EXCL` mode 0600; Windows `CREATE_NEW` + protected DACL) so the
+    // `AlreadyExists` arm below stays reachable, which is what makes a retried
+    // identical request idempotent while a different token is a conflict.
+    match files::create_new_private(&path) {
         Ok(mut file) => {
             file.write_all(token.as_bytes())
                 .and_then(|_| file.sync_all())
@@ -262,12 +256,7 @@ mod tests {
             let file = secret_root(&self.root)
                 .unwrap()
                 .join(format!("generation-{id}.secret"));
-            let mut f = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .open(file)
-                .unwrap();
+            let mut f = files::create_new_private(&file).unwrap();
             f.write_all(bytes).unwrap();
             id
         }
@@ -354,6 +343,12 @@ mod tests {
         );
         assert_eq!(snapshot(&reopened).unwrap(), output);
     }
+    // Unix-only: creating the symlink needs `std::os::unix::fs::symlink`, and on
+    // Windows an unprivileged process cannot create one at all. The equivalent
+    // Windows attack surface (reparse points / hard links) is covered by
+    // `files::reject_links`, `files::read` and `files::directory`, but cannot be
+    // exercised from a normal Windows test process.
+    #[cfg(unix)]
     #[test]
     fn symlink_and_outside_ref_rejected_without_state_change() {
         let mut f = Fixture::new();

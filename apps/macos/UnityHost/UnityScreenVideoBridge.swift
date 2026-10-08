@@ -287,7 +287,12 @@ import simd
             guard let mode = value["value"] as? String, let selected = StageVideoPlaybackMode(rawValue: mode) else { return false }
             videos.setMode(selected)
         case "video.brightness":
-            guard let v = value["value"] as? Double, v.isFinite, (0...1).contains(v) else { return false }
+            // Same band as the product host (`GMGNRadioApp` `case
+            // "stage.video.brightness"`) and as the GPUI sliders' own domain
+            // (`AgentSettingsPane::new`, `StagePanelsPane::new`). `0...1`
+            // accepted values the product host rejects, so the same
+            // `value=0.2` used to succeed here and fail there for one op.
+            guard let v = value["value"] as? Double, v.isFinite, (0.15...1).contains(v) else { return false }
             videos.setBrightness(Float(v))
         case "video.bind":
             guard let track = currentTrack(), value["trackID"] as? String == track.id,

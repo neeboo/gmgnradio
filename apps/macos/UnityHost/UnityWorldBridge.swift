@@ -184,7 +184,16 @@ final class UnityWorldBridge: @unchecked Sendable {
                       expected.doubleValue <= 9_007_199_254_740_991, layout.doubleValue <= 9_007_199_254_740_991,
                       let requestID = request["requestID"] as? String, !requestID.isEmpty, requestID.utf8.count <= 256,
                       let command = request["command"] as? [String: Any],
-                      ["place", "withdraw", "hold", "adjustGrip", "returnHeld", "dropHeld", "delete", "undo"].contains(command["op"] as? String ?? "") else {
+                      // `resize` is the Rust reducer's own `resize` arm
+                      // (`services/gmgn-taskd/src/world_prop.rs`,
+                      // `apply_command` `"resize" => …`); `validate_command`
+                      // accepts it and caps `targetLongestEdge` to 0.02…3 m,
+                      // the same domain the GPUI size slider exposes
+                      // (`ui_tokens::props::SIZE_MIN/SIZE_MAX`). It is the
+                      // object's own manual resize, so it travels the same
+                      // UI-intent path as `adjustGrip`; without it here the UI
+                      // command is refused before the daemon ever sees it.
+                      ["place", "withdraw", "hold", "adjustGrip", "returnHeld", "dropHeld", "delete", "undo", "resize"].contains(command["op"] as? String ?? "") else {
                     throw RustWorldPropError.rejected("world_prop_native_not_ready")
                 }
                 let client = RustWorldPropClient(endpointFile: URL(fileURLWithPath: endpoint.endpointFile))

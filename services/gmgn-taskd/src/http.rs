@@ -592,6 +592,9 @@ mod tests {
             .json(&json!({"id":"test","method":method,"params":params}))
     }
 
+    // unix-only: the fixture marks a private mock executable with
+    // `Permissions::from_mode(0o700)`, which Windows has no equivalent of.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires explicitly compiled GMGN_TEST_SWIFT_CONSUMER; mock PCM only"]
     async fn speech_delivery_http_actual_swift_pcm_fifo_stop_and_generation() {
@@ -799,6 +802,9 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
         let count=server.http.service.db.call(|store|store.connection.query_row("SELECT count(*) FROM agent_tool_calls",[],|r|r.get::<_,i64>(0)).map_err(|_|"storage_unavailable")).await.unwrap();assert_eq!(count,0);
     }
 
+    // unix-only: the params come from `agent_dsh::tests::fixture`, a
+    // `#!/usr/bin/python3` peer that needs the POSIX execute bit.
+    #[cfg(unix)]
     #[tokio::test]
     async fn dsh_flat_grant_is_scoped_revocable_and_not_main_auth() {
         let server = server().await;

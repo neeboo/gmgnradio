@@ -14,6 +14,9 @@ double probe_native_backing_scale(void);
 int32_t probe_native_owns_input(void);
 int32_t probe_native_text_input_focused(void);
 void probe_native_wake_frames(void);
+// Main-thread only. Rectangles are viewport logical points, top-left origin.
+// Each rectangle contains x, y, width, height. count=0 clears all hit regions.
+void probe_native_set_hit_regions(const float *rects, int32_t count);
 // Local UI layout only; native 1 success/0 unavailable or invalid argument.
 int32_t probe_native_set_panel_expanded(int32_t expanded);
 int32_t probe_native_normalize_chat_rect(float x, float y, float width, float height,

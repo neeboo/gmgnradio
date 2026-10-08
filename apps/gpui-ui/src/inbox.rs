@@ -372,10 +372,18 @@ impl InboxPane {
             .into_any_element()
     }
 
-    /// The 300 pt list column. It is the window's only scrolling region and it
+    /// The list column. It is the window's only scrolling region and it
     /// carries the original accessible name, `系统消息列表` (`:128`). The kit
     /// scrollbar overlays the same element that owns the scroll handle, so
     /// `scroll_to_item` keeps working for keyboard selection.
+    ///
+    /// 300 pt is the **preferred** width, not a floor: the same pane is also
+    /// mounted in the 590 pt media panel
+    /// (`ui_tokens::stage::PANEL_MAX_WIDTH`) minus its insets, where a rigid
+    /// 300 pt list plus the detail's 320 pt floor overflows and the detail's
+    /// trailing 8 pt is clipped by the panel's `overflow_hidden`
+    /// (`shell_ui.rs:panel_container`). The list shrinks first and the detail
+    /// keeps its floor, so the standalone 720×460 window is unchanged.
     fn list(&self, cx: &mut Context<Self>) -> AnyElement {
         let now = now_epoch_seconds();
         let mut list = div()
@@ -384,8 +392,8 @@ impl InboxPane {
             .accessibility_id("resident.system-inbox.list")
             .aria_label("系统消息列表")
             .w(px(m::LIST_WIDTH))
+            .min_w(px(m::LIST_MIN_WIDTH))
             .h_full()
-            .flex_shrink_0()
             .flex()
             .flex_col()
             .overflow_y_scroll()
@@ -516,11 +524,30 @@ impl Focusable for InboxPane {
         self.focus.clone()
     }
 }
+/// The split's two columns. The list keeps its 300 pt preferred width but is
+/// allowed to shrink to [`m::LIST_MIN_WIDTH`], so the detail column's
+/// [`m::DETAIL_MIN_WIDTH`] floor always fits the narrowest surface the pane is
+/// mounted in (the 590 pt media panel) instead of being clipped by its
+/// `overflow_hidden`. In the pane's own 720 pt window there is room for both,
+/// so the split is unchanged there.
+fn inbox_row(list: AnyElement, detail: AnyElement) -> Div {
+    div()
+        .size_full()
+        .p(px(m::PANEL_INSET))
+        .flex()
+        .flex_row()
+        .font_family(crate::ui_tokens::FONT_FAMILY)
+        .text_color(rgba(s::TEXT))
+        .bg(rgba(s::PANEL_BG))
+        .child(list)
+        .child(detail)
+}
+
 impl Render for InboxPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let list = self.list(cx);
         let detail = self.detail_column(window, cx);
-        div()
+        inbox_row(list, detail)
             .key_context("ResidentInbox")
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &OpenSelected, _, cx| {
@@ -533,15 +560,6 @@ impl Render for InboxPane {
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| {
                 this.move_selection(1, cx);
             }))
-            .size_full()
-            .p(px(m::PANEL_INSET))
-            .flex()
-            .flex_row()
-            .font_family(crate::ui_tokens::FONT_FAMILY)
-            .text_color(rgba(s::TEXT))
-            .bg(rgba(s::PANEL_BG))
-            .child(list)
-            .child(detail)
     }
 }
 
@@ -741,7 +759,9 @@ mod tests {
     }
 
     /// The original window numbers, pinned one by one so a local edit cannot
-    /// quietly move the surface off 720×460 / 300 pt / 44 pt rows.
+    /// quietly move the surface off 720×460 / 300 pt / 44 pt rows. The list's
+    /// floor is pinned against the narrowest surface it is actually mounted in
+    /// (the 590 pt media panel), so the detail column can never be clipped.
     #[test]
     fn inbox_metrics_match_the_original_window() {
         assert_eq!(
@@ -754,6 +774,43 @@ mod tests {
             m::ROW_HEIGHT
         );
         assert_eq!([m::DETAIL_MIN_WIDTH, m::DETAIL_MIN_HEIGHT], [320., 220.]);
+        assert_eq!(m::LIST_MIN_WIDTH, 240.);
+        // The media panel is the narrow host of this pane; its inner width is
+        // `stage::PANEL_MAX_WIDTH` minus the inset on both sides and the
+        // detail's trailing gap.
+        let media_inner =
+            crate::ui_tokens::stage::PANEL_MAX_WIDTH - 2. * m::PANEL_INSET - m::DETAIL_TRAILING;
+        assert_eq!(media_inner, 562.);
+        assert!(
+            m::LIST_MIN_WIDTH + m::DETAIL_MIN_WIDTH <= media_inner,
+            "the list floor ({} pt) + the detail floor ({} pt) must fit the media panel's \
+             {media_inner} pt inner width, otherwise the detail column is clipped",
+            m::LIST_MIN_WIDTH,
+            m::DETAIL_MIN_WIDTH
+        );
+        assert!(
+            m::LIST_WIDTH + m::DETAIL_MIN_WIDTH <= m::WINDOW_WIDTH - 2. * m::PANEL_INSET,
+            "the pane's own window must still show the full list width"
+        );
+        // The two columns really carry those constraints into layout: the list
+        // has a 300 pt preferred width and a 240 pt floor, so it shrinks
+        // instead of pushing the detail column past the panel edge. (The
+        // constants and the live style are asserted together, so editing only
+        // one of them still fails.)
+        let mut list = div()
+            .w(px(m::LIST_WIDTH))
+            .min_w(px(m::LIST_MIN_WIDTH));
+        let style = list.style();
+        assert_eq!(
+            (
+                style.size.width.map(|width| format!("{width:?}")),
+                style.min_size.width.map(|width| format!("{width:?}")),
+            ),
+            (
+                Some(format!("{:?}", px(m::LIST_WIDTH))),
+                Some(format!("{:?}", px(m::LIST_MIN_WIDTH))),
+            )
+        );
         assert_eq!(m::UNREAD_DOT, 0x0a84ffff);
         assert_ne!(m::TITLE_TEXT, m::STATUS_TEXT);
         assert_ne!(m::STATUS_TEXT, m::PLACEHOLDER_TEXT);

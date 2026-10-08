@@ -46,6 +46,7 @@ impl Database {
                     crate::marble_control::recover(&s.connection)?;
                     crate::music_cache::recover(&s.connection)?;
                     crate::jukebox::recover(&s.connection)?;
+                    crate::music_account::recover(&s.connection)?;
                     Ok(s)
                 });
                 match initialized {
@@ -222,6 +223,12 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<()> {
     }
     if applied < 34 {
         apply_step(connection, 34, "chat-speech-v1", crate::chat_speech::schema)?;
+    }
+    if applied < 35 {
+        apply_step(connection, 35, "music-account-v1", crate::music_account::schema)?;
+    }
+    if applied < 36 {
+        apply_step(connection, 36, "generation-configuration-v1", crate::generation_configuration::schema)?;
     }
     Ok(())
 }
@@ -843,7 +850,7 @@ mod tests {
         let version: i64 = connection.query_row(
             "SELECT MAX(version) FROM schema_migrations", [], |row| row.get(0),
         ).unwrap();
-        assert_eq!(version, 34);
+        assert_eq!(version, 36);
     }
 
     #[test]
@@ -865,7 +872,7 @@ mod tests {
         let version: i64 = connection.query_row(
             "SELECT MAX(version) FROM schema_migrations", [], |r| r.get(0),
         ).unwrap();
-        assert_eq!(version, 34);
+        assert_eq!(version, 36);
         let controls: i64 = connection.query_row(
             "SELECT COUNT(*) FROM agent_loop_human_messages", [], |r| r.get(0),
         ).unwrap();
@@ -1237,7 +1244,7 @@ mod tests {
             )
             .unwrap();
         // v5 adds music authority without changing previous stored rows.
-        assert_eq!(version, 34);
+        assert_eq!(version, 36);
         // v1 rows and the full old message contract survive untouched.
         let jobs: i64 = connection
             .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))

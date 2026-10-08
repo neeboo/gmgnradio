@@ -17,11 +17,21 @@
 @end
 
 // Experimental native mount only. The child must be a real GPUI view supplied by Rust.
+static NSArray<NSValue *> *hitRegions;
+static void releaseOutsideFocus(NSView *view);
+static BOOL hitsUI(NSView *view, NSPoint local) {
+    if (!NSPointInRect(local, view.bounds)) return NO;
+    if (!view.flipped) local.y = NSMaxY(view.bounds) - local.y;
+    for (NSValue *value in hitRegions) if (NSPointInRect(local, value.rectValue)) return YES;
+    return NO;
+}
 @interface GMGNProbeContainer : NSView
 @end
 @implementation GMGNProbeContainer
 - (NSView *)hitTest:(NSPoint)point {
-    if (self.hidden || !NSPointInRect(point, self.frame)) return nil;
+    NSPoint local = [self convertPoint:point fromView:self.superview];
+    if (self.hidden) return nil;
+    if (!hitsUI(self, local)) { releaseOutsideFocus(self); return nil; }
     return [super hitTest:point];
 }
 @end
@@ -31,13 +41,57 @@ static GMGNProbeContainer *container;
 static NSView *mountedView;
 static NSArray *observers;
 static uint64_t geometryRevision;
-static NSSize requestedSize;
 static NSWindow *donorWindow;
 static Class originalViewClass;
+static Class originalDonorClass;
 static NSTimer *frameTimer;
 static NSTimeInterval frameUntil;
+static BOOL frameQueued;
+static void drawMountedFrame(void) {
+    if (!mountedView || !originalViewClass || !registeredWindow.visible || registeredWindow.miniaturized) return;
+    Method method = class_getInstanceMethod(originalViewClass, @selector(displayLayer:));
+    if (method) ((void (*)(id, SEL, id))method_getImplementation(method))(mountedView, @selector(displayLayer:), mountedView.layer);
+}
 static unsigned inputTraceCount;
 static BOOL inputDiagnostics;
+static void wakeFrames(void);
+// GPUI retains its original window as its activation authority after its view
+// is embedded. Reflect the real host's key state without activating or showing
+// the hidden donor, which would steal focus from Unity or the settings window.
+static BOOL mountedDonorIsKey(id window, SEL selector) {
+    (void)window; (void)selector;
+    return registeredWindow.isKeyWindow;
+}
+static void syncHostActivation(void) {
+    if (!donorWindow || !mountedView) return;
+    SEL selector = registeredWindow.isKeyWindow ? @selector(windowDidBecomeKey:) : @selector(windowDidResignKey:);
+    id delegate = donorWindow.delegate;
+    if (![delegate respondsToSelector:selector]) return;
+    NSNotificationName name = registeredWindow.isKeyWindow ? NSWindowDidBecomeKeyNotification : NSWindowDidResignKeyNotification;
+    ((void (*)(id, SEL, id))objc_msgSend)(delegate, selector,
+        [NSNotification notificationWithName:name object:donorWindow]);
+    wakeFrames();
+}
+static BOOL installDonorActivationAdapter(void) {
+    originalDonorClass = object_getClass(donorWindow);
+    NSString *name = [NSString stringWithFormat:@"GMGNMountedWindow_%@", NSStringFromClass(originalDonorClass)];
+    Class adapter = NSClassFromString(name);
+    if (!adapter) {
+        adapter = objc_allocateClassPair(originalDonorClass, name.UTF8String, 0);
+        if (!adapter) return NO;
+        Method method = class_getInstanceMethod(originalDonorClass, @selector(isKeyWindow));
+        class_addMethod(adapter, @selector(isKeyWindow), (IMP)mountedDonorIsKey, method_getTypeEncoding(method));
+        objc_registerClassPair(adapter);
+    }
+    object_setClass(donorWindow, adapter);
+    return YES;
+}
+static void transparentMountedLayer(void) {
+    mountedView.layer.opaque = NO;
+    mountedView.layer.backgroundColor = NSColor.clearColor.CGColor;
+    donorWindow.opaque = NO;
+    donorWindow.backgroundColor = NSColor.clearColor;
+}
 static void traceInput(id view, const char *phase, NSEvent *event, NSUInteger length) {
     if (!inputDiagnostics || inputTraceCount >= 128) return;
     inputTraceCount++;
@@ -46,7 +100,37 @@ static void traceInput(id view, const char *phase, NSEvent *event, NSUInteger le
         inputTraceCount, phase, focused, event ? event.keyCode : 0,
         (unsigned long)(event ? event.type : 0), (unsigned long)length);
 }
-static void wakeFrames(void) { frameUntil = NSProcessInfo.processInfo.systemUptime + 2; }
+static void wakeFrames(void) {
+    frameUntil = NSProcessInfo.processInfo.systemUptime + 2;
+    if (frameQueued) return;
+    frameQueued = YES;
+    // GPUI may call wake while rendering. Defer to avoid a nested frame callback.
+    dispatch_async(dispatch_get_main_queue(), ^{ frameQueued = NO; drawMountedFrame(); });
+}
+static NSView *unityResponder(NSView *view) {
+    Class playerView = NSClassFromString(@"PlayerWindowView");
+    if (playerView && [view isKindOfClass:playerView] && view.acceptsFirstResponder) return view;
+    for (NSView *child in view.subviews) {
+        if (child == container) continue;
+        NSView *responder = unityResponder(child);
+        if (responder) return responder;
+    }
+    return nil;
+}
+static void releaseOutsideFocus(NSView *view) {
+    NSEvent *event = NSApp.currentEvent;
+    // Hit tests also occur during pointer motion. Keep text/IME focus until an
+    // actual outside click, matching normal AppKit text-field behavior.
+    if (event.window != view.window ||
+        (event.type != NSEventTypeLeftMouseDown && event.type != NSEventTypeRightMouseDown &&
+         event.type != NSEventTypeOtherMouseDown)) return;
+    NSResponder *focus = registeredWindow.firstResponder;
+    if (focus != mountedView && !([focus isKindOfClass:NSView.class] &&
+        [(NSView *)focus isDescendantOf:mountedView])) return;
+    NSView *target = unityResponder(registeredWindow.contentView) ?: registeredWindow.contentView;
+    [registeredWindow makeFirstResponder:target];
+    wakeFrames();
+}
 static void mountedMouse(id view, SEL selector, NSEvent *event) {
     BOOL focusing = event.type == NSEventTypeLeftMouseDown;
     if (focusing) {
@@ -158,22 +242,29 @@ static BOOL installAdapter(NSView *view) {
 static void updateGeometry(void) {
     if (!registeredWindow || !container) return;
     NSRect bounds = registeredWindow.contentView.bounds;
-    NSRect frame = container.frame;
-    frame.size.width = MIN(requestedSize.width, MAX(0, bounds.size.width - 32));
-    frame.size.height = MIN(requestedSize.height, MAX(0, bounds.size.height - 32));
-    frame.origin = NSMakePoint(MAX(16, bounds.size.width - frame.size.width - 16), 16);
+    NSRect frame = bounds;
     container.frame = frame;
     // Resize the real donor's viewport too, so GPUI receives its native resize
     // callback and Metal drawable dimensions match the visible mounted view.
-    if (!NSEqualSizes(donorWindow.contentView.bounds.size, frame.size)) [donorWindow setContentSize:frame.size];
-    mountedView.frame = NSMakeRect(0, 0, frame.size.width, frame.size.height);
+    if (!NSEqualSizes(donorWindow.contentView.frame.size, frame.size)) [donorWindow setContentSize:frame.size];
+    donorWindow.contentView.frame = NSMakeRect(0, 0, frame.size.width, frame.size.height);
+    [mountedView setFrameOrigin:NSZeroPoint];
+    // GPUI's callback reads donor.contentView.frame, and its override updates
+    // the Metal drawable. Invoke that override explicitly after donor sizing.
+    Method resize = class_getInstanceMethod(originalViewClass, @selector(setFrameSize:));
+    if (resize) ((void (*)(id, SEL, NSSize))method_getImplementation(resize))(mountedView, @selector(setFrameSize:), frame.size);
+    else [mountedView setFrameSize:frame.size];
+    transparentMountedLayer();
+    if (inputDiagnostics) NSLog(@"[GPUIOverlay] geometry host=%@ donor=%@ mounted=%@ layerOpaque=%d scale=%.2f",
+        NSStringFromSize(frame.size), NSStringFromSize(donorWindow.contentView.frame.size),
+        NSStringFromSize(mountedView.frame.size), mountedView.layer.opaque, registeredWindow.backingScaleFactor);
     wakeFrames();
     geometryRevision++;
 }
 int32_t probe_native_set_panel_expanded(int32_t expanded) {
     if (![NSThread isMainThread] || !mountedView || !registeredWindow || (expanded != 0 && expanded != 1)) return 0;
-    requestedSize = NSMakeSize(620, expanded ? 760 : 240);
-    updateGeometry();
+    // Panel expansion belongs to GPUI layout; the native viewport stays full size.
+    wakeFrames();
     return 1;
 }
 int32_t probe_native_register_unity_window(void *pointer) {
@@ -220,8 +311,8 @@ int32_t probe_attach_view(void *parentPointer, void *childPointer, float width, 
     NSView *child = (__bridge NSView *)childPointer;
     if (parent != registeredWindow.contentView || ![child isKindOfClass:NSView.class] ||
         child == parent || [parent isDescendantOf:child]) return 0;
-    container = [[GMGNProbeContainer alloc] initWithFrame:NSMakeRect(20, 20, width, height)];
-    requestedSize = NSMakeSize(width, height);
+    container = [[GMGNProbeContainer alloc] initWithFrame:parent.bounds];
+    hitRegions = @[];
     container.wantsLayer = YES;
     container.layer.masksToBounds = YES;
     container.layer.backgroundColor = NSColor.clearColor.CGColor;
@@ -230,6 +321,17 @@ int32_t probe_attach_view(void *parentPointer, void *childPointer, float width, 
     inputDiagnostics = [NSProcessInfo.processInfo.environment[@"GMGN_GPUI_INPUT_DIAGNOSTICS"] isEqualToString:@"1"];
     donorWindow = child.window;
     if (!donorWindow || !installAdapter(child)) { mountedView = nil; container = nil; donorWindow = nil; return 0; }
+    if (!installDonorActivationAdapter()) {
+        object_setClass(child, originalViewClass);
+        originalViewClass = Nil; mountedView = nil; container = nil; donorWindow = nil;
+        originalDonorClass = Nil;
+        return 0;
+    }
+    // Preserve a donor viewport for GPUI's MacWindowState after moving its real
+    // drawing view into Unity. Do not let a stale original 1280x720 root survive.
+    if (donorWindow.contentView == child) {
+        donorWindow.contentView = [[NSView alloc] initWithFrame:child.frame];
+    }
     [child removeFromSuperview];
     [container addSubview:child];
     [parent addSubview:container positioned:NSWindowAbove relativeTo:nil];
@@ -239,16 +341,23 @@ int32_t probe_attach_view(void *parentPointer, void *childPointer, float width, 
         [tokens addObject:[NSNotificationCenter.defaultCenter addObserverForName:name object:registeredWindow
             queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) { (void)note; updateGeometry(); }]];
     }
+    for (NSNotificationName name in @[NSWindowDidBecomeKeyNotification, NSWindowDidResignKeyNotification]) {
+        [tokens addObject:[NSNotificationCenter.defaultCenter addObserverForName:name object:registeredWindow
+            queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) { (void)note; syncHostActivation(); }]];
+    }
     observers = tokens;
-    updateGeometry();
-    // Local-echo probe only: bounded activity pulses; no permanent 60fps redraw.
+    // attach is called from inside GPUI Window::update. Its native resize
+    // callback re-enters handle.update(bounds_changed), so resize only after
+    // the outer GPUI update has returned and the window is available again.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (mountedView == child) { updateGeometry(); syncHostActivation(); }
+    });
+    // Bounded activity pulses; use the visible host, not the hidden donor's occlusion.
     frameTimer = [NSTimer timerWithTimeInterval:1.0/30 repeats:YES block:^(NSTimer *timer) {
         (void)timer;
         if (mountedView && registeredWindow.visible && !registeredWindow.miniaturized &&
-            (registeredWindow.occlusionState & NSWindowOcclusionStateVisible) &&
-            NSProcessInfo.processInfo.systemUptime < frameUntil &&
-            [mountedView respondsToSelector:@selector(displayLayer:)]) {
-            ((void (*)(id,SEL,id))objc_msgSend)(mountedView,@selector(displayLayer:),mountedView.layer);
+            NSProcessInfo.processInfo.systemUptime < frameUntil) {
+            drawMountedFrame();
         }
     }];
     [NSRunLoop.mainRunLoop addTimer:frameTimer forMode:NSRunLoopCommonModes];
@@ -265,10 +374,13 @@ int32_t probe_detach_view(void *pointer) {
     observers = nil;
     [mountedView removeFromSuperview];
     if (originalViewClass) object_setClass(mountedView, originalViewClass);
+    if (originalDonorClass && donorWindow) object_setClass(donorWindow, originalDonorClass);
+    originalDonorClass = Nil;
     originalViewClass = Nil; donorWindow = nil;
     [container removeFromSuperview];
     mountedView = nil;
     container = nil;
+    hitRegions = @[];
     geometryRevision++;
     return 1;
 }
@@ -276,11 +388,9 @@ uint64_t probe_native_geometry_revision(void) { return [NSThread isMainThread] ?
 double probe_native_backing_scale(void) { return [NSThread isMainThread] ? registeredWindow.backingScaleFactor : 0; }
 int32_t probe_native_owns_input(void) {
     if (![NSThread isMainThread] || !mountedView || !registeredWindow.visible || container.hidden) return 0;
-    NSResponder *focus = registeredWindow.firstResponder;
-    if (focus == mountedView || ([focus isKindOfClass:NSView.class] && [(NSView *)focus isDescendantOf:mountedView])) return 1;
     NSPoint point = [registeredWindow convertPointFromScreen:NSEvent.mouseLocation];
     point = [container convertPoint:point fromView:nil];
-    return NSPointInRect(point, container.bounds) ? 1 : 0;
+    return hitsUI(container, point) ? 1 : 0;
 }
 int32_t probe_native_text_input_focused(void) {
     if (![NSThread isMainThread] || !mountedView || !registeredWindow.visible ||
@@ -290,6 +400,16 @@ int32_t probe_native_text_input_focused(void) {
 }
 void probe_native_wake_frames(void) {
     if ([NSThread isMainThread] && mountedView && registeredWindow.visible) wakeFrames();
+}
+void probe_native_set_hit_regions(const float *rects, int32_t count) {
+    if (![NSThread isMainThread] || count < 0 || (count > 0 && !rects)) return;
+    NSMutableArray<NSValue *> *regions = [NSMutableArray array];
+    for (int32_t i = 0; i < count; i++) {
+        const float *r = rects + (size_t)i * 4;
+        if (!isfinite(r[0]) || !isfinite(r[1]) || !isfinite(r[2]) || !isfinite(r[3]) || r[2] <= 0 || r[3] <= 0) continue;
+        [regions addObject:[NSValue valueWithRect:NSMakeRect(r[0], r[1], r[2], r[3])]];
+    }
+    hitRegions = regions;
 }
 int32_t probe_native_normalize_chat_rect(float x, float y, float width, float height,
     float *nx, float *ny, float *nw, float *nh) {

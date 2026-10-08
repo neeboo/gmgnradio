@@ -446,6 +446,8 @@ mod tests {
             Self {
                 c,
                 root: std::env::temp_dir()
+                    .canonicalize()
+                    .unwrap()
                     .join(format!("gmgn-music-account-{}", uuid::Uuid::new_v4())),
             }
         }

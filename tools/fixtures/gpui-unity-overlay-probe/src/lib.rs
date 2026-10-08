@@ -93,9 +93,7 @@ impl Platform for EmbeddedPlatform {
     fn delete_credentials(&self,_:&str)->Task<anyhow::Result<()>> {
         Task::ready(Err(anyhow::anyhow!("platform_credentials_disabled")))
     }
-    fn open_window(&self, handle:AnyWindowHandle, mut options:WindowParams)->anyhow::Result<Box<dyn PlatformWindow>> {
-        options.show=false;
-        options.focus=false;
+    fn open_window(&self, handle:AnyWindowHandle, options:WindowParams)->anyhow::Result<Box<dyn PlatformWindow>> {
         self.0.open_window(handle, options)
     }
 }
@@ -108,6 +106,7 @@ thread_local! {
     static INVENTORY:RefCell<Option<Entity<InventoryPane>>>=const { RefCell::new(None) };
     static SHELL:RefCell<Option<Entity<ShellPane>>>=const { RefCell::new(None) };
     static SETTINGS:RefCell<Option<Entity<SettingsPane>>>=const { RefCell::new(None) };
+    static SETTINGS_WINDOW:RefCell<Option<WindowHandle<gpui_kit::base::Root>>>=const { RefCell::new(None) };
     static MEDIA:RefCell<Option<Entity<MediaPane>>>=const { RefCell::new(None) };
     static COMMANDS:UiCommandQueue=Rc::new(RefCell::new(VecDeque::new()));
     static SNAPSHOT:RefCell<Value>=const { RefCell::new(Value::Null) };
@@ -179,6 +178,7 @@ unsafe extern "C" {
     fn probe_native_wake_frames();
     fn probe_native_text_input_focused()->i32;
     fn probe_native_set_panel_expanded(expanded:i32)->i32;
+    fn probe_native_set_hit_regions(rects:*const f32,count:i32);
     fn probe_native_normalize_chat_rect(x:f32,y:f32,w:f32,h:f32,nx:*mut f32,ny:*mut f32,nw:*mut f32,nh:*mut f32)->i32;
 }
 #[unsafe(no_mangle)]
@@ -213,6 +213,35 @@ pub(crate) fn report_chat_drop_bounds(bounds:Option<Bounds<Pixels>>) {
     });
 }
 
+/// Only painted interactive UI intercepts the underlying Unity scene.
+pub(crate) fn report_ui_hit_bounds(bounds:&[Bounds<Pixels>]) {
+    let rects:Vec<f32>=bounds.iter().flat_map(|b|[
+        b.origin.x.as_f32(),b.origin.y.as_f32(),
+        b.size.width.as_f32(),b.size.height.as_f32(),
+    ]).collect();
+    unsafe {probe_native_set_hit_regions(rects.as_ptr(),bounds.len() as i32);}
+}
+
+pub(crate) fn select_media_section(section:&str,cx:&mut App) {
+    MEDIA.with(|slot| {
+        if let Some(media)=slot.borrow().as_ref() {
+            media.update(cx,|view,cx|view.select_section(section,cx));
+        }
+    });
+}
+
+/// Collapse the overlay panel from a component that does not own the shell
+/// (`inventory_ui.rs` 物品 面板's ×). Deferred by the caller, never called
+/// while the shell is rendering. The `ui.overlay.panel` command stays in the
+/// queue so the Unity probe still shrinks the native hit region.
+pub(crate) fn close_overlay_panel(cx:&mut App) {
+    SHELL.with(|slot| {
+        if let Some(shell)=slot.borrow().as_ref() {
+            shell.update(cx,|view,cx| {view.close_panel_without_window(cx);});
+        }
+    });
+}
+
 /// Host must call on its main thread after registering its NSWindow. Returns -1
 /// if a panel is already mounted. The single application runtime remains alive
 /// across unmount: native close and foreground callbacks hold weak app handles.
@@ -224,7 +253,7 @@ pub extern "C" fn gmgn_gpui_probe_mount(parent:*mut c_void)->i32 {
         if MOUNTED.with(|v|!v.borrow().is_null()) { return -1; }
         if slot.borrow().is_none() {
             let app=Application::with_platform(Rc::new(EmbeddedPlatform(gpui_macos::MacPlatform::new(false))))
-                .with_assets(gpui_kit::assets::Assets);
+                .with_assets(gpui_kit::assets::AllAssets);
             let handle=app.run_embedded(|cx| {
                 gpui_kit::init(cx);
                 Theme::change(ThemeMode::Dark,None,cx);
@@ -235,30 +264,28 @@ pub extern "C" fn gmgn_gpui_probe_mount(parent:*mut c_void)->i32 {
         let runtime=slot.borrow();
         let handle=runtime.as_ref().expect("application runtime initialized");
         handle.update(move |cx| {
-            let result=cx.open_window(WindowOptions { window_bounds:Some(WindowBounds::Windowed(Bounds::new(point(px(0.),px(0.)),size(px(620.),px(240.))))), show:false, focus:false, ..Default::default() },|window,cx| {
+            let result=cx.open_window(WindowOptions { window_bounds:Some(WindowBounds::Windowed(Bounds::new(point(px(0.),px(0.)),size(px(1280.),px(720.))))), window_background:WindowBackgroundAppearance::Transparent, show:false, focus:false, ..Default::default() },|window,cx| {
                 let chat=cx.new(|cx|ResidentChatPane::new(window,cx));
                 PANE.with(|v|*v.borrow_mut()=Some(chat.clone()));
                 let commands=COMMANDS.with(Clone::clone);
                 let inventory=cx.new(|cx|InventoryPane::new(window,cx,commands.clone()));
                 INVENTORY.with(|v|*v.borrow_mut()=Some(inventory.clone()));
-                let settings=cx.new(|cx|SettingsPane::new(window,cx,commands.clone()));
-                SETTINGS.with(|v|*v.borrow_mut()=Some(settings.clone()));
                 let media=cx.new(|cx|MediaPane::new(window,cx,commands.clone()));
                 MEDIA.with(|v|*v.borrow_mut()=Some(media.clone()));
                 let panes=vec![("聊天".into(),chat.into()),("物品".into(),inventory.into()),
-                    ("设置".into(),settings.into()),("音乐与空间".into(),media.into())];
+                    ("音乐与空间".into(),media.into())];
                 let panel=cx.new(|cx|ShellPane::new(window,cx,commands,panes));
                 SHELL.with(|v|*v.borrow_mut()=Some(panel.clone()));
                 SNAPSHOT.with(|v|*v.borrow_mut()=Value::Null);
                 // Match the product's kit root contract: styled component font,
                 // window presentation plugin and standard input key context.
-                cx.new(|cx|gpui_kit::base::Root::new(panel,window,cx))
+                cx.new(|cx|gpui_kit::base::Root::new(panel,window,cx).bg(rgba(0x00000000)))
             });
             // Keep the donor registered in GPUI. Its native NSView is moved, not
             // copied or displayed in an independent transparent overlay window.
             if let Ok(window)=result { DONOR.with(|v|*v.borrow_mut()=Some(window)); let _=window.update(cx,|_,window,_| {
                 if let Ok(raw)=HasWindowHandle::window_handle(window) { if let RawWindowHandle::AppKit(h)=raw.as_raw() {
-                    if unsafe { probe_attach_view(parent,h.ns_view.as_ptr(),620.,240.) } == 1 {
+                    if unsafe { probe_attach_view(parent,h.ns_view.as_ptr(),1280.,720.) } == 1 {
                         MOUNTED.with(|v|*v.borrow_mut()=h.ns_view.as_ptr());
                     }
                 }}
@@ -277,6 +304,8 @@ pub extern "C" fn gmgn_gpui_probe_unmount() {
     MOUNTED.with(|v| { let view=v.replace(std::ptr::null_mut()); if !view.is_null() { unsafe { probe_detach_view(view); } } });
     APPLICATION.with(|slot| {
         if let Some(handle)=slot.borrow().as_ref() {
+            let settings_window=SETTINGS_WINDOW.with(|v|v.borrow_mut().take());
+            if let Some(window)=settings_window { handle.update(|cx| { let _=window.update(cx,|_,w,_|w.remove_window()); }); }
             DONOR.with(|v| { if let Some(window)=v.borrow_mut().take() { handle.update(|cx| { let _=window.update(cx,|_,w,_|w.remove_window()); }); } });
         }
     });
@@ -343,7 +372,58 @@ pub(crate) fn shell_projection(value:&Value)->Value {
     for key in ["position","duration"] {
         music.insert(key.into(),value["music"][key].as_f64().filter(|v|v.is_finite()).map(|v|json!(v.floor())).unwrap_or(Value::Null));
     }
-    json!({"music":music,"ui":value["ui"]})
+    let mut ui=value["ui"].as_object().cloned().unwrap_or_default();
+    ui.insert("settingsWindowOpen".into(),json!(SETTINGS_WINDOW.with(|v|v.borrow().is_some())));
+    json!({"music":music,"ui":ui})
+}
+
+fn refresh_shell(cx:&mut App) {
+    let snapshot=SNAPSHOT.with(|v|v.borrow().clone());
+    let donor=DONOR.with(|v|*v.borrow());
+    let shell=SHELL.with(|v|v.borrow().clone());
+    if let (Some(donor),Some(shell))=(donor,shell) {
+        let _=donor.update(cx,|_,window,cx|shell.update(cx,|view,cx|view.update_snapshot(&snapshot,window,cx)));
+    }
+}
+
+fn open_settings_window(cx:&mut App) {
+    let existing=SETTINGS_WINDOW.with(|v|*v.borrow());
+    if let Some(handle)=existing {
+        if handle.update(cx,|_,window,_|window.activate_window()).is_ok() {return;}
+        SETTINGS_WINDOW.with(|v|v.borrow_mut().take());
+    }
+    let commands=COMMANDS.with(Clone::clone);
+    let snapshot=SNAPSHOT.with(|v|v.borrow().clone());
+    let result=cx.open_window(WindowOptions {
+        window_bounds:Some(WindowBounds::Windowed(Bounds::centered(None,size(px(860.),px(700.)),cx))),
+        window_min_size:Some(size(px(760.),px(540.))),
+        titlebar:Some(TitlebarOptions {title:Some("设置".into()),..Default::default()}),
+        show:true,focus:true,..Default::default()
+    },|window,cx| {
+        let settings=cx.new(|cx|SettingsPane::new(window,cx,commands));
+        settings.update(cx,|view,cx|view.update_snapshot(&snapshot,window,cx));
+        SETTINGS.with(|v|*v.borrow_mut()=Some(settings.clone()));
+        window.on_window_should_close(cx,|window,cx| {
+            let snapshot=SNAPSHOT.with(|v|v.borrow().clone());
+            let settings=SETTINGS.with(|v|v.borrow().clone());
+            if let Some(settings)=settings {
+                let can_close=settings.update(cx,|view,cx| {
+                    view.update_snapshot(&snapshot,window,cx);
+                    view.can_close(cx)
+                });
+                if !can_close {return false;}
+            }
+            SETTINGS_WINDOW.with(|v|v.borrow_mut().take());
+            cx.defer(refresh_shell);
+            unsafe {probe_native_wake_frames();}
+            true
+        });
+        cx.new(|cx|gpui_kit::base::Root::new(settings,window,cx))
+    });
+    if let Ok(handle)=result {
+        SETTINGS_WINDOW.with(|v|*v.borrow_mut()=Some(handle));
+        refresh_shell(cx);
+    }
 }
 fn visual_projection(value:&Value)->Value {
     let screens:Vec<_>=value["screenVideo"]["screens"].as_array().into_iter().flatten()
@@ -457,8 +537,6 @@ pub unsafe extern "C" fn gmgn_gpui_chat_snapshot(bytes:*const u8,len:usize)->i32
         let runtime=app.borrow();
         if let (Some(app),Some(donor))=(runtime.as_ref(),*donor.borrow()) {
             app.update(|cx| {let _=donor.update(cx,|_,window,cx| {
-                // Always drain retained settings commands, even when hidden.
-                SETTINGS.with(|v| {if let Some(view)=v.borrow().as_ref() {view.update(cx,|v,cx|v.update_snapshot(&value,window,cx));}});
                 MEDIA.with(|v| {if let Some(view)=v.borrow().as_ref() {view.update(cx,|v,cx|v.update_snapshot(&value,window,cx));}});
                 SHELL.with(|v| {if let Some(view)=v.borrow().as_ref() {view.update(cx,|v,cx| {
                     v.update_snapshot(&value,window,cx);
@@ -468,6 +546,15 @@ pub unsafe extern "C" fn gmgn_gpui_chat_snapshot(bytes:*const u8,len:usize)->i32
             });});
         }
     }));
+    APPLICATION.with(|app| {
+        if let Some(app)=app.borrow().as_ref() {
+            let handle=SETTINGS_WINDOW.with(|v|*v.borrow());
+            let settings=SETTINGS.with(|v|v.borrow().clone());
+            if let (Some(handle),Some(settings))=(handle,settings) {
+                app.update(|cx| {let _=handle.update(cx,|_,window,cx|settings.update(cx,|view,cx|view.update_snapshot(&value,window,cx)));});
+            }
+        }
+    });
     SNAPSHOT.with(|v|*v.borrow_mut()=value);
     if applied { if changed || has_events || inventory_changed || visual_changed || voice_text.is_some() {unsafe {probe_native_wake_frames();}} 0 } else {-2}
 }
@@ -513,6 +600,10 @@ pub unsafe extern "C" fn gmgn_gpui_chat_take_command(out:*mut u8,capacity:usize)
             if q.front().is_some_and(|v|matches!(v["op"].as_str(),Some("ui.chat.open"|"ui.settings.open"|"ui.wish.open"|"ui.music.open"))) {q.pop_front()} else {None}
         });
         let Some(navigation)=navigation else {break;};
+        if navigation["op"]=="ui.settings.open" {
+            APPLICATION.with(|app|if let Some(app)=app.borrow().as_ref() {app.update(open_settings_window);});
+            continue;
+        }
         let label=match navigation["op"].as_str() {Some("ui.settings.open")=>"设置",Some("ui.wish.open"|"ui.music.open")=>"音乐与空间",_=>"聊天"};
         APPLICATION.with(|app|DONOR.with(|donor|SHELL.with(|shell| {
             let runtime=app.borrow();

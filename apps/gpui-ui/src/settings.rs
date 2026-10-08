@@ -885,6 +885,11 @@ pub struct AgentSettingsPane {
     import_link_revision: u64,
     pending_marble: Option<(u64, String)>,
     pending_prop: Option<(u64, String, String)>,
+    /// The host's `settings.supportedCommands` whitelist, pushed by the Unity
+    /// settings window (`settings_ui.rs`). It is not part of the `settings`
+    /// sub-root the three host snapshot producers write, so it cannot be read
+    /// off [`Self::snapshot`]. See [`Self::op_supported`].
+    supported_ops: Vec<String>,
 }
 
 impl AgentSettingsPane {
@@ -1085,7 +1090,13 @@ impl AgentSettingsPane {
             .into_iter()
             .map(|axis| cx.new(|cx| InputState::new(window, cx).placeholder(axis)))
             .collect();
-        let video_brightness = cx.new(|_| SliderState::new().min(0.).max(1.).step(0.01));
+        // The brightness authority's floor is the product host's own accepted
+        // range, `(0.15...1)` (`GMGNRadioApp.swift` `case "stage.video.brightness"`,
+        // the same band `StagePanelsPane::new`'s brightness slider uses). A
+        // 0-based slider here let the UI emit 0…0.15, which the Unity host
+        // rejects (`UnityScreenVideoBridge` `case "video.brightness"`, aligned
+        // to the same band), so the control's own domain is the authority's.
+        let video_brightness = cx.new(|_| SliderState::new().min(0.15).max(1.).step(0.01));
         let weak = cx.entity().downgrade();
         let escape_subscription = cx.intercept_keystrokes(move |event, window, cx| {
             if event.keystroke.key != "escape" {
@@ -1225,11 +1236,32 @@ impl AgentSettingsPane {
             import_link_revision: 0,
             pending_marble: None,
             pending_prop: None,
+            supported_ops: Vec::new(),
         }
     }
 
     pub fn take_commands(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.commands)
+    }
+
+    /// Whether the host's `supportedCommands` declares this op. It is the same
+    /// list `SettingsPane`'s dispatch whitelist enforces
+    /// (`gpui-unity-overlay-probe/src/settings_ui.rs`), so an op missing here
+    /// would be refused after the click; those controls are not drawn. An
+    /// unpublished list keeps every control (see `StagePanelsPane::op_supported`).
+    fn op_supported(&self, op: &str) -> bool {
+        self.supported_ops.is_empty()
+            || self.supported_ops.iter().any(|supported| supported == op)
+    }
+
+    /// The host's settings whitelist, applied whenever the settings window
+    /// receives a new snapshot.
+    pub fn set_supported_ops(&mut self, supported: Vec<String>, cx: &mut Context<Self>) {
+        if self.supported_ops == supported {
+            return;
+        }
+        self.supported_ops = supported;
+        cx.notify();
     }
 
     pub fn select_page(&mut self, page: &str, cx: &mut Context<Self>) {
@@ -1526,6 +1558,9 @@ impl AgentSettingsPane {
             .as_f64()
             .filter(|value| value.is_finite())
         {
+            // An older host (or a restored preference written below the floor)
+            // must not drive the control outside its own emitted domain.
+            let value = value.clamp(0.15, 1.);
             self.syncing_video = true;
             self.video_brightness
                 .update(cx, |slider, cx| slider.set_value(value as f32, window, cx));
@@ -2020,6 +2055,15 @@ impl AgentSettingsPane {
                 ));
             if let Some(track_id) = video["currentTrackID"].as_str() {
                 let bound = video["boundAssetID"].as_str() == Some(id);
+                // `video.unbind` acts on the current track only: the Unity
+                // handler validates `trackID` and derives the binding itself
+                // (`UnityScreenVideoBridge` `case "video.unbind"`), so it
+                // carries no `id`. `video.bind` is the one that names the asset.
+                let command = if bound {
+                    json!({"op":"video.unbind","trackID":track_id})
+                } else {
+                    json!({"op":"video.bind","id":id,"trackID":track_id})
+                };
                 row = row.child(self.command_button(
                     format!("unity-video-bind-{id}"),
                     if bound {
@@ -2027,7 +2071,7 @@ impl AgentSettingsPane {
                     } else {
                         "绑定到当前歌曲"
                     },
-                    json!({"op": if bound { "video.unbind" } else { "video.bind" }, "id": id, "trackID": track_id}),
+                    command,
                     cx,
                 ));
             }
@@ -2190,6 +2234,87 @@ impl AgentSettingsPane {
         let configured_prop =
             self.snapshot["space"]["propCredentialConfigured"].as_bool() == Some(true);
         let prop_checking = self.snapshot["space"]["propChecking"].as_bool() == Some(true);
+        let prop_save_supported = self.op_supported("space.prop.save");
+        let prop_check_supported = self.op_supported("space.prop.check");
+        // `space.prop.save` / `space.prop.check` / `space.prop.cancel` are only
+        // handled by the product host (`ProductSettingsParity.swift`); in the
+        // Unity settings window the whitelist refuses them, so the credential
+        // form and its two buttons are not drawn there instead of being drawn
+        // and answered with 「当前运行时不支持此操作」.
+        if !prop_save_supported && !prop_check_supported {
+            return SettingsSection::new(settings_copy(locale, "许愿机")).child(ui::muted(
+                settings_copy(locale, "当前运行时不提供许愿机配置。"),
+            ));
+        }
+        let prop_row = h_flex()
+            .items_center()
+            .gap(px(metrics::ROW_GAP))
+            .w_full()
+            .child(
+                h_flex()
+                    .flex_1()
+                    .items_center()
+                    .gap(px(tokens::SPACING_4))
+                    .text_color(rgba(if configured_prop {
+                        s::ACCENT
+                    } else {
+                        s::TEXT_MUTED
+                    }))
+                    .child(check_icon(configured_prop))
+                    .child(ui::muted(settings_copy(
+                        locale,
+                        if configured_prop { "已配置" } else { "未配置" },
+                    ))),
+            )
+            .when(prop_check_supported, |row| {
+                row.child(
+                    Button::new("prop-check")
+                        .icon(IconName::Network)
+                        .tooltip(settings_copy(
+                            locale,
+                            if prop_checking { "检测中…" } else { "检测连接" },
+                        ))
+                        .accessibility_label(settings_copy(
+                            locale,
+                            if prop_checking { "检测中…" } else { "检测连接" },
+                        ))
+                        .small()
+                        .accessibility_id("settings.space.prop.check")
+                        .disabled(!prop_check_enabled(
+                            configured_prop,
+                            prop_checking,
+                            self.extra_inputs[6].read(cx).value().is_empty(),
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.commands.push(json!({"op":"space.prop.check","endpoint":this.extra_inputs[5].read(cx).value().to_string()}))
+                        })),
+                )
+            })
+            .when(prop_save_supported, |row| {
+                row.child(
+                    Button::new("prop-save")
+                        .primary()
+                        .icon(IconName::Check)
+                        .tooltip(settings_copy(locale, "保存"))
+                        .accessibility_label(settings_copy(locale, "保存"))
+                        .accessibility_id("settings.space.prop.save")
+                        .disabled(!prop_save_enabled(
+                            self.extra_inputs[5].read(cx).value().as_str(),
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let endpoint = this.extra_inputs[5].read(cx).value().to_string();
+                            let key = this.extra_inputs[6].read(cx).value().to_string();
+                            this.pending_prop = Some((
+                                this.snapshot["space"]["propSaveRevision"]
+                                    .as_u64()
+                                    .unwrap_or(0),
+                                endpoint.clone(),
+                                key.clone(),
+                            ));
+                            this.commands.push(json!({"op":"space.prop.save","endpoint":endpoint,"apiKey":key}));
+                        })),
+                )
+            });
         SettingsSection::new(settings_copy(locale, "许愿机"))
             .child(
                 Input::new(&self.extra_inputs[5])
@@ -2201,73 +2326,7 @@ impl AgentSettingsPane {
                     .accessibility_id("settings.space.prop.key")
                     .aria_label(settings_copy(locale, "生成服务密钥")),
             )
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap(px(metrics::ROW_GAP))
-                    .w_full()
-                    .child(
-                        h_flex()
-                            .flex_1()
-                            .items_center()
-                            .gap(px(tokens::SPACING_4))
-                            .text_color(rgba(if configured_prop {
-                                s::ACCENT
-                            } else {
-                                s::TEXT_MUTED
-                            }))
-                            .child(check_icon(configured_prop))
-                            .child(ui::muted(settings_copy(
-                                locale,
-                                if configured_prop { "已配置" } else { "未配置" },
-                            ))),
-                    )
-                    .child(
-                        Button::new("prop-check")
-                            .icon(IconName::Network)
-                            .tooltip(settings_copy(
-                                locale,
-                                if prop_checking { "检测中…" } else { "检测连接" },
-                            ))
-                            .accessibility_label(settings_copy(
-                                locale,
-                                if prop_checking { "检测中…" } else { "检测连接" },
-                            ))
-                            .small()
-                            .accessibility_id("settings.space.prop.check")
-                            .disabled(!prop_check_enabled(
-                                configured_prop,
-                                prop_checking,
-                                self.extra_inputs[6].read(cx).value().is_empty(),
-                            ))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.commands.push(json!({"op":"space.prop.check","endpoint":this.extra_inputs[5].read(cx).value().to_string()}))
-                            })),
-                    )
-                    .child(
-                        Button::new("prop-save")
-                            .primary()
-                            .icon(IconName::Check)
-                            .tooltip(settings_copy(locale, "保存"))
-                            .accessibility_label(settings_copy(locale, "保存"))
-                            .accessibility_id("settings.space.prop.save")
-                            .disabled(!prop_save_enabled(
-                                self.extra_inputs[5].read(cx).value().as_str(),
-                            ))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let endpoint = this.extra_inputs[5].read(cx).value().to_string();
-                                let key = this.extra_inputs[6].read(cx).value().to_string();
-                                this.pending_prop = Some((
-                                    this.snapshot["space"]["propSaveRevision"]
-                                        .as_u64()
-                                        .unwrap_or(0),
-                                    endpoint.clone(),
-                                    key.clone(),
-                                ));
-                                this.commands.push(json!({"op":"space.prop.save","endpoint":endpoint,"apiKey":key}));
-                            })),
-                    ),
-            )
+            .child(prop_row)
             .child(row_detail(settings_copy(
                 locale,
                 "地址和密钥只存在这台电脑上，保存后不会立刻开始生成。",

@@ -1044,7 +1044,10 @@ async fn drive(
     })
 }
 
-#[cfg(test)]
+// unix-only test module: the mock CLI is a `#!/usr/bin/python3` script that must
+// carry the execute bit (`Permissions::from_mode(0o700)`), which Windows has no
+// equivalent of. Skipped there instead of compiled into a test that could not run.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

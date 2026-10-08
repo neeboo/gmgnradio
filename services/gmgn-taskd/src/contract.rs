@@ -253,6 +253,10 @@ const ERROR_CODES: &[&str] = &[
     "fact_payload_too_large",
     "fallback_profile_mismatch_would_change_collision_box",
     "frame_too_large",
+    "generation_configuration_invalid_request",
+    "generation_configuration_legacy_unreadable",
+    "generation_configuration_secret_unavailable",
+    "generation_endpoint_requires_token",
     "generation_not_ready",
     "held_prop_conflict",
     "history_record_too_large",
@@ -462,6 +466,27 @@ const ERROR_CODES: &[&str] = &[
     "model_image_input_unsupported",
     "model_integrity_failed",
     "model_too_large",
+    "music_account_account_cannot_play",
+    "music_account_attempt_identity",
+    "music_account_attempt_not_replayable",
+    "music_account_capacity",
+    "music_account_encoding_failed",
+    "music_account_invalid_authorization",
+    "music_account_invalid_clock",
+    "music_account_invalid_cookie",
+    "music_account_invalid_input",
+    "music_account_invalid_response",
+    "music_account_invalid_secret_identity",
+    "music_account_invalid_stored_session",
+    "music_account_missing_required_cookie",
+    "music_account_receipt_conflict",
+    "music_account_request_conflict",
+    "music_account_response_capacity",
+    "music_account_response_identity",
+    "music_account_revision_conflict",
+    "music_account_transport_failed",
+    "music_account_unknown_attempt",
+    "music_account_unsupported_provider",
     "music_cache_claim_unknown",
     "music_cache_identity_mismatch",
     "music_cache_invalid_audio",
@@ -598,6 +623,7 @@ const ERROR_CODES: &[&str] = &[
     "reference_search_unparseable",
     "remote_id_mismatch",
     "report_unserializable",
+    "request_conflict",
     "request_id_conflict",
     "request_rejected",
     "resident_history_unavailable",
@@ -973,6 +999,7 @@ mod tests {
         ("cli.rs", include_str!("cli.rs")),
         ("daemon.rs", include_str!("daemon.rs")),
         ("files.rs", include_str!("files.rs")),
+        ("generation_configuration.rs", include_str!("generation_configuration.rs")),
         ("http.rs", include_str!("http.rs")),
         ("inbox_control.rs", include_str!("inbox_control.rs")),
         ("jukebox.rs", include_str!("jukebox.rs")),
@@ -981,6 +1008,8 @@ mod tests {
         ("marble_geometry.rs", include_str!("marble_geometry.rs")),
         ("stage_video.rs", include_str!("stage_video.rs")),
         ("music_cache.rs", include_str!("music_cache.rs")),
+        ("music_account.rs", include_str!("music_account.rs")),
+        ("music_account_http.rs", include_str!("music_account_http.rs")),
         ("media.rs", include_str!("media.rs")),
         ("memory.rs", include_str!("memory.rs")),
         ("messages.rs", include_str!("messages.rs")),
@@ -1094,7 +1123,7 @@ mod tests {
                 }
                 continue;
             }
-            if *name == "stage_video.rs" || matches!(*name, "activity.rs" | "agent_cli.rs" | "agent_claude.rs" | "agent_chat.rs" | "agent_dsh.rs" | "agent_scheduler.rs" | "agent_tools.rs" | "chat_attachments.rs" | "inbox_control.rs" | "marble_control.rs" | "marble_geometry.rs" | "music_library.rs" | "music_playback.rs" | "music_program.rs" | "music_program_rules.rs" | "presence_selection.rs" | "product_settings.rs" | "resident_intent.rs" | "screen_playback.rs" | "screen_state.rs" | "speech_delivery.rs" | "wish_control.rs" | "world_activity.rs" | "world_activity_approach.rs" | "world_control.rs" | "world_device.rs" | "world_prop_capability.rs") {
+            if *name == "stage_video.rs" || matches!(*name, "activity.rs" | "agent_cli.rs" | "agent_claude.rs" | "agent_chat.rs" | "agent_dsh.rs" | "agent_scheduler.rs" | "agent_tools.rs" | "chat_attachments.rs" | "generation_configuration.rs" | "inbox_control.rs" | "marble_control.rs" | "marble_geometry.rs" | "music_account.rs" | "music_account_http.rs" | "music_library.rs" | "music_playback.rs" | "music_program.rs" | "music_program_rules.rs" | "presence_selection.rs" | "product_settings.rs" | "resident_intent.rs" | "screen_playback.rs" | "screen_state.rs" | "speech_delivery.rs" | "wish_control.rs" | "world_activity.rs" | "world_activity_approach.rs" | "world_control.rs" | "world_device.rs" | "world_prop_capability.rs") {
                 let production = without_test_modules(text);
                 let production = if *name == "agent_cli.rs" {
                     // CLI drive/probe and executor queue failures settle state;
@@ -1128,9 +1157,11 @@ mod tests {
                         }
                     }
                 }
-                if matches!(*name, "agent_dsh.rs" | "agent_claude.rs") {
+                if matches!(*name, "agent_dsh.rs" | "agent_claude.rs" | "music_account.rs") {
                     // Flat-plugin failures are structured result observations,
                     // still real wire error codes, with no control capability grant.
+                    // `music_account_begin` reports an account that cannot play in
+                    // the same shape: a receipt body with a `code` field.
                     for line in production.lines().filter(|line| line.contains("\"code\":")) {
                         codes.extend(shaped_literals(line));
                     }

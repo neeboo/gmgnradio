@@ -2,6 +2,7 @@
 //! No second transport, preference writer, credential store, or optimistic ACK.
 use crate::{enqueue_ui_command, UiCommandQueue};
 use gmgn_gpui_ui::{settings::AgentSettingsPane, stage_panels::StagePanelsPane};
+use gmgn_gpui_ui::{primitives as ui, ui_tokens::{self as tokens, scene as s}};
 use gpui_kit::{component::{button::Button, Disableable}, *};
 use serde_json::{json, Value};
 use std::{
@@ -128,9 +129,11 @@ impl SettingsPane {
                 })
                 .unwrap_or_default();
             self.controls.update(cx, |view, cx| {
+                view.set_supported_ops(self.supported.clone(), cx);
                 view.update_snapshot(envelope["settings"].clone(), window, cx)
             });
             self.stage.update(cx, |view, cx| {
+                view.set_supported_ops(self.supported.clone(), cx);
                 view.update_snapshot(envelope["stage"].clone(), window, cx)
             });
         }
@@ -147,7 +150,15 @@ impl SettingsPane {
                 }
                 Some("failed") => {
                     self.pending = None;
-                    self.notice = "设置未保存，请检查对应项目的错误提示后重试。".into();
+                    // The host names the rejected reason (`settings_command_rejected`,
+                    // `camera_reset_unavailable`, …). Showing it keeps an
+                    // ordinary failure distinguishable from "no handler exists
+                    // for this op in this runtime" instead of one generic line.
+                    let reason = receipt["code"]
+                        .as_str()
+                        .filter(|code| !code.is_empty())
+                        .unwrap_or("settings_command_rejected");
+                    self.notice = format!("设置未保存（{reason}），请检查对应项目的错误提示后重试。");
                 }
                 _ => {} // Accepted/pending/unknown never become success.
             }
@@ -161,6 +172,17 @@ impl SettingsPane {
         self.controls.update(cx, |view, cx| view.dismissed(cx));
         self.collect(cx);
         self.dispatch();
+    }
+
+    /// Already dispatched commands live in the host transport. Keep this
+    /// window alive while later edits still depend on their acknowledgements.
+    pub fn can_close(&mut self, cx: &mut Context<Self>) -> bool {
+        self.collect(cx);
+        self.dispatch();
+        if self.waiting.is_empty() {return true;}
+        self.notice = "还有设置正在保存，请稍后关闭窗口。".into();
+        cx.notify();
+        false
     }
 }
 
@@ -184,8 +206,10 @@ impl Render for SettingsPane {
             .min_w(px(0.))
             .flex()
             .flex_col()
-            .bg(rgb(0x202226))
-            .text_color(rgb(0xe6e7e9))
+            .font_family(tokens::FONT_FAMILY)
+            .text_size(px(tokens::BODY))
+            .bg(rgba(s::PANEL_BG))
+            .text_color(rgba(s::TEXT))
             .child(
                 div()
                     .flex_1()
@@ -202,8 +226,8 @@ impl Render for SettingsPane {
                     .px_3()
                     .py_2()
                     .border_t_1()
-                    .border_color(rgb(0x35383e))
-                    .child(div().flex_1().text_sm().child(self.notice.clone()))
+                    .border_color(rgba(s::BORDER))
+                    .child(div().flex_1().min_w_0().child(ui::notice(self.notice.clone())))
                     .child(
                         Button::new("settings-refresh")
                             .label("重新读取")

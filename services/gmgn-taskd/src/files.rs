@@ -60,6 +60,29 @@ pub fn open_private(path: &Path) -> Result<File> {
         Ok(f)
     }
 }
+/// Create a brand new private file, preserving `create_new` semantics so a
+/// caller can treat `ErrorKind::AlreadyExists` as an idempotent retry.
+///
+/// unix: `O_CREAT|O_EXCL` with mode `0600` and `O_NOFOLLOW|O_CLOEXEC`.
+/// Windows: `CREATE_NEW` with a protected DACL granting only the current user.
+/// Windows has no mode bits, so `0600` has no literal equivalent there; the
+/// protected DACL is the control that keeps the file private.
+pub fn create_new_private(path: &Path) -> std::io::Result<File> {
+    reject_links(path).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "unsafe_path"))?;
+    #[cfg(unix)]
+    {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+    }
+    #[cfg(windows)]
+    {
+        windows_private::create_new_io(path)
+    }
+}
 pub fn read(path: &Path, limit: usize) -> Result<Vec<u8>> {
     reject_links(path)?;
     #[cfg(unix)]
@@ -361,8 +384,19 @@ mod windows_private {
             Ok(())
         }
     }
+    fn acl_error() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::Other, "storage_unavailable")
+    }
+    /// `open` with the OS error preserved, so `CREATE_NEW` against an existing
+    /// path stays distinguishable as `ErrorKind::AlreadyExists`.
+    pub fn create_new_io(path: &Path) -> std::io::Result<File> {
+        open_io(path, true, true)
+    }
     pub fn open(path: &Path, writable: bool, exclusive: bool) -> Result<File> {
-        let sd = descriptor()?;
+        open_io(path, writable, exclusive).map_err(|_| "unsafe_path")
+    }
+    fn open_io(path: &Path, writable: bool, exclusive: bool) -> std::io::Result<File> {
+        let sd = descriptor().map_err(|_| acl_error())?;
         unsafe {
             let attrs = SECURITY_ATTRIBUTES {
                 nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -392,12 +426,12 @@ mod windows_private {
                 std::ptr::null_mut(),
             );
             if handle == INVALID_HANDLE_VALUE {
-                return Err("unsafe_path");
+                return Err(std::io::Error::last_os_error());
             }
             let file = File::from_raw_handle(handle);
-            check_handle(handle, false)?;
+            check_handle(handle, false).map_err(|_| acl_error())?;
             if writable {
-                secure(handle, &sd)?;
+                secure(handle, &sd).map_err(|_| acl_error())?;
             }
             Ok(file)
         }

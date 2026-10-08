@@ -55,6 +55,12 @@ mod marble_geometry;
 mod stage_video;
 mod music_cache;
 mod jukebox;
+mod music_account;
+mod music_account_http;
+mod generation_configuration;
+
+#[cfg(test)]
+mod rpc_wiring_tests;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

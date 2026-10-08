@@ -2793,7 +2793,9 @@ impl Render for StageBoundVideoPromptPane {
                     .child(div().flex_1())
                     .child(
                         Button::new("bound-video-play")
-                            .label("播放")
+                            .icon(gpui_kit::assets::IconName::Play)
+                            .tooltip("播放")
+                            .accessibility_label("播放")
                             .with_size(gpui_kit::component::Size::Small)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.commands
@@ -2805,7 +2807,10 @@ impl Render for StageBoundVideoPromptPane {
             .child(
                 div().absolute().top(px(7.)).right(px(7.)).child(
                     Button::new("bound-video-dismiss")
-                        .label("×")
+                        .icon(gpui_kit::assets::IconName::Close)
+                        .tooltip("忽略绑定视频")
+                        .accessibility_label("忽略绑定视频")
+                        .with_size(gpui_kit::component::Size::XSmall)
                         .w(px(20.))
                         .h(px(20.))
                         .on_click(cx.listener(move |this, _, _, cx| {

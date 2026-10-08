@@ -71,6 +71,13 @@ pub const STAGE_PANEL_HEIGHT: f32 = metrics::PANEL_MAX_HEIGHT;
 /// stay literal.
 pub const STAGE_TABS: [&str; 4] = ["播放器", "空间", "角色", "活动"];
 
+/// The stage panel's bootstrap request. The Unity host has **no** load step
+/// behind it — the stage projection arrives with every snapshot — and its
+/// handler answers `false` (`UnityMediaHost.command` /
+/// `UnityMediaHost.settingsCommand`), so [`StagePanelsPane::new`] does not emit
+/// it. The name is kept here so the op surface stays documented in one place.
+pub const STAGE_LOAD_OP: &str = "stage.load";
+
 /// One icon per [`STAGE_TABS`] entry, in the same order. The partition picker is
 /// a control, and controls in this layer are icon-only: the words live in the
 /// tab's accessibility label and tooltip, never on its face.
@@ -320,13 +327,22 @@ fn video_asset_actions(player: &Value, asset: &Value) -> Vec<(&'static str, Valu
     )];
     if player["trackID"].as_str().is_some_and(|s| !s.is_empty()) {
         let bound = player["boundVideoID"] == id;
+        // Unbinding acts on the current track, not on a named asset: both hosts
+        // derive the track themselves (`GMGNRadioApp` `case "stage.video.unbind"`
+        // uses `programStore.activeSlot?.track`; `UnityScreenVideoBridge`
+        // injects `trackID` from `currentTrack()`), so the unbind action
+        // carries no `id`/payload. `bind` is the one that names the asset.
         actions.push((
             if bound {
                 "解除当前歌曲绑定"
             } else {
                 "绑定到当前歌曲"
             },
-            json!({"op":if bound{"stage.video.unbind"}else{"stage.video.bind"},"id":id}),
+            if bound {
+                json!({"op":"stage.video.unbind"})
+            } else {
+                json!({"op":"stage.video.bind","id":id})
+            },
             false,
         ));
     }
@@ -391,6 +407,16 @@ pub struct StagePanelsPane {
     motion_category: String,
     sliders: Vec<Entity<SliderState>>,
     syncing: bool,
+    /// The host's `settings.supportedCommands` whitelist
+    /// (`UnityMediaHost.swift` `supportedCommands`, forwarded by
+    /// `SettingsPane::update_snapshot`). The Unity settings window refuses any
+    /// op that is not in it (`settings_ui.rs` dispatch), so a control whose op
+    /// is missing from the list is not drawn at all instead of being drawn and
+    /// then refused with 「当前运行时不支持此操作」.
+    ///
+    /// An empty/absent list keeps every control: a host that does not publish
+    /// the whitelist must not blank the pane.
+    supported_ops: Vec<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -412,7 +438,12 @@ impl StagePanelsPane {
                         let command = match i {
                             0..=2 => json!({"op":"stage.avatar.position","axis":(["X","Y","Z"][i]),"value":value.start()}),
                             3 => json!({"op":"stage.player.particles","value":value.start()}),
-                            _ => json!({"op":"stage.video.brightness","value":value.start()}),
+                            // Clamped to the authority's own band: the product
+                            // host rejects `(0.15...1)` outside it
+                            // (`GMGNRadioApp` `case "stage.video.brightness"`)
+                            // and the Unity host now enforces the same band
+                            // (`UnityScreenVideoBridge` `case "video.brightness"`).
+                            _ => json!({"op":"stage.video.brightness","value":value.start().clamp(0.15, 1.)}),
                         };
                         this.commands.push(command);
                         cx.notify();
@@ -422,7 +453,13 @@ impl StagePanelsPane {
             .collect();
         Self {
             snapshot: Value::Null,
-            commands: vec![json!({"op":"stage.load"})],
+            // No `stage.load` request is sent: the Unity host has no load step
+            // behind it (it is not a second snapshot source — the whole stage
+            // state arrives through the normal projection — and its handler
+            // answers `false`, `UnityMediaHost.command`/`settingsCommand`), so
+            // emitting it would only manufacture a rejected settings command on
+            // open. [`STAGE_LOAD_OP`] keeps the name documented.
+            commands: Vec::new(),
             tab: StageMode::Space.tab(),
             embedded: false,
             section: String::new(),
@@ -430,11 +467,61 @@ impl StagePanelsPane {
             motion_category: String::new(),
             sliders,
             syncing: false,
+            supported_ops: Vec::new(),
             _subscriptions: subscriptions,
         }
     }
     pub fn take_commands(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.commands)
+    }
+    /// The host's settings whitelist (`supportedCommands`), applied whenever the
+    /// settings window receives a new snapshot. See [`Self::op_supported`].
+    pub fn set_supported_ops(&mut self, supported: Vec<String>, cx: &mut Context<Self>) {
+        if self.supported_ops == supported {
+            return;
+        }
+        self.supported_ops = supported;
+        cx.notify();
+    }
+    /// Whether the host declares this op supported. `false` means the settings
+    /// window would refuse it (`settings_ui.rs` dispatch whitelist), so the
+    /// control that would emit it is not drawn.
+    pub(crate) fn op_supported(&self, op: &str) -> bool {
+        self.supported_ops.is_empty() || self.supported_ops.iter().any(|supported| supported == op)
+    }
+
+    /// The ops each [`STAGE_TABS`] partition is built from. A partition with no
+    /// host whitelist entry would open on a body of refused controls.
+    fn tab_ops(tab: usize) -> &'static [&'static str] {
+        match tab {
+            0 => &[
+                "stage.player.lyrics",
+                "stage.player.cloud",
+                "stage.player.particles",
+                "stage.video.toggle",
+                "stage.video.bind",
+                "stage.video.unbind",
+            ],
+            2 => &["stage.motion.refresh", "stage.motion.activate"],
+            3 => &["stage.activity.run", "stage.activity.stop"],
+            _ => &[],
+        }
+    }
+
+    fn choose_available_tab(&self, preferred: usize) -> usize {
+        if self.supported_ops.is_empty() || self.op_supported_any(Self::tab_ops(preferred)) {
+            return preferred;
+        }
+        for tab in 0..STAGE_TABS.len() {
+            if self.op_supported_any(Self::tab_ops(tab)) {
+                return tab;
+            }
+        }
+        preferred
+    }
+
+    fn op_supported_any(&self, ops: &[&str]) -> bool {
+        ops.is_empty() || ops.iter().any(|op| self.op_supported(op))
     }
     pub fn set_embedded(&mut self, embedded: bool, cx: &mut Context<Self>) {
         self.embedded = embedded;
@@ -446,7 +533,7 @@ impl StagePanelsPane {
     }
     pub fn select_tab(&mut self, tab: &str, cx: &mut Context<Self>) {
         self.tab = tab_for_name(tab);
-        if self.tab == 2 {
+        if self.tab == 2 && self.op_supported("stage.motion.refresh") {
             self.commands.push(json!({"op":"stage.motion.refresh"}));
         }
         cx.notify();
@@ -463,10 +550,12 @@ impl StagePanelsPane {
         if !self.initialized {
             // The partition is chosen once, by the original's rule; a later mode
             // change keeps whatever the person selected (`didChooseInitialTab`).
-            self.tab = initial_tab(
+            // If that partition's controls are not in the host whitelist, the
+            // first partition that does have them is used instead.
+            self.tab = self.choose_available_tab(initial_tab(
                 snapshot["stageRadioPluginEnabled"].as_bool() == Some(true),
                 stage_mode(&snapshot),
-            );
+            ));
             self.initialized = true;
         }
         self.syncing = true;
@@ -522,6 +611,24 @@ impl StagePanelsPane {
                 cx.notify();
             }))
             .into_any_element()
+    }
+
+    /// [`Self::plain_button`] only when the host declares the op. A button whose
+    /// command the settings window refuses is not drawn.
+    fn supported_button(
+        &self,
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
+        icon: AssetIcon,
+        command: Value,
+        op: &str,
+        disabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if !self.op_supported(op) {
+            return v_flex().into_any_element();
+        }
+        self.plain_button(id, label, icon, command, disabled, cx)
     }
 
     /// The original's group row: a full-width plain button with a
@@ -661,65 +768,78 @@ impl StagePanelsPane {
     }
 
     /// `worldSelectionGroup`: the public-world / generated-scene menu, with the
-    /// selected world check-marked inside its section.
+    /// selected world check-marked inside its section. A section is drawn only
+    /// when its op is in the host whitelist: 公开空间 (`stage.world.enter`) and
+    /// 生成场景 (`stage.scene.activate`) have no Unity host handler
+    /// (`settings_ui.rs` would refuse them), and a menu whose only actions are
+    /// refused is not a menu.
     fn world_selection(&self, locale: UiLocale, cx: &mut Context<Self>) -> AnyElement {
         let catalog = self.snapshot["space"].clone();
         let label = catalog["worldLabel"]
             .as_str()
             .unwrap_or(settings_copy(locale, "公开空间 · 无需生成"))
             .to_owned();
+        let sections: Vec<(&'static str, &'static str, &'static str)> =
+            [("worlds", "公开空间", "stage.world.enter"), ("presets", "生成场景", "stage.scene.activate")]
+                .into_iter()
+                .filter(|(_, _, op)| self.op_supported(op))
+                .collect();
+        if sections.is_empty() {
+            return v_flex().w_full().into_any_element();
+        }
         let weak = cx.entity().downgrade();
         let menu_label = label.clone();
-        let menu = Button::new("stage-world-menu")
-            .custom(scene_variant(
-                cx,
-                metrics::TILE_FILL,
-                metrics::TILE_FILL_HOVER,
-                metrics::MENU_TEXT,
-            ))
+        v_flex()
             .w_full()
-            .small()
-            .min_h(px(metrics::MENU_MIN_HEIGHT))
-            .rounded(px(metrics::MENU_RADIUS))
-            .icon(AssetIcon::Globe)
-            .label(menu_label)
-            .dropdown_caret(true)
-            .text_color(rgba(metrics::MENU_TEXT))
-            .tooltip(label.clone())
-            .accessibility_label(label)
-            .dropdown_menu(move |mut menu, _, _| {
-                for (key, title, op) in [
-                    ("worlds", "公开空间", "stage.world.enter"),
-                    ("presets", "生成场景", "stage.scene.activate"),
-                ] {
-                    menu = menu.item(PopupMenuItem::label(title));
-                    for world in catalog[key].as_array().into_iter().flatten() {
-                        let id = world["id"].as_str().unwrap_or("").to_owned();
-                        if id.is_empty() {
-                            continue;
+            .child(
+                Button::new("stage-world-menu")
+                    .custom(scene_variant(
+                        cx,
+                        metrics::TILE_FILL,
+                        metrics::TILE_FILL_HOVER,
+                        metrics::MENU_TEXT,
+                    ))
+                    .w_full()
+                    .small()
+                    .min_h(px(metrics::MENU_MIN_HEIGHT))
+                    .rounded(px(metrics::MENU_RADIUS))
+                    .icon(AssetIcon::Globe)
+                    .label(menu_label)
+                    .dropdown_caret(true)
+                    .text_color(rgba(metrics::MENU_TEXT))
+                    .tooltip(label.clone())
+                    .accessibility_label(label)
+                    .dropdown_menu(move |mut menu, _, _| {
+                        for &(key, title, op) in &sections {
+                            menu = menu.item(PopupMenuItem::label(title));
+                            for world in catalog[key].as_array().into_iter().flatten() {
+                                let id = world["id"].as_str().unwrap_or("").to_owned();
+                                if id.is_empty() {
+                                    continue;
+                                }
+                                let handle = weak.clone();
+                                let command = json!({"op":op,"id":id});
+                                let selected = catalog["selectedWorldID"] == world["id"];
+                                menu = menu.item(
+                                    PopupMenuItem::new(format!(
+                                        "{}{}",
+                                        if selected { "✓ " } else { "" },
+                                        world["name"].as_str().unwrap_or("")
+                                    ))
+                                    .on_click(move |_, _, cx| {
+                                        _ = handle.update(cx, |this, cx| {
+                                            this.commands.push(command.clone());
+                                            cx.notify();
+                                        });
+                                    }),
+                                );
+                            }
+                            menu = menu.separator();
                         }
-                        let handle = weak.clone();
-                        let command = json!({"op":op,"id":id});
-                        let selected = catalog["selectedWorldID"] == world["id"];
-                        menu = menu.item(
-                            PopupMenuItem::new(format!(
-                                "{}{}",
-                                if selected { "✓ " } else { "" },
-                                world["name"].as_str().unwrap_or("")
-                            ))
-                            .on_click(move |_, _, cx| {
-                                _ = handle.update(cx, |this, cx| {
-                                    this.commands.push(command.clone());
-                                    cx.notify();
-                                });
-                            }),
-                        );
-                    }
-                    menu = menu.separator();
-                }
-                menu
-            });
-        v_flex().w_full().child(menu).into_any_element()
+                        menu
+                    }),
+            )
+            .into_any_element()
     }
 
     /// `avatarPlacementGroup`: the three axes, then the two original footers.
@@ -733,47 +853,53 @@ impl StagePanelsPane {
                     .text_color(rgba(s::TEXT)),
             );
         let mut axes = v_flex().w_full().gap(px(metrics::AXIS_STACK_GAP));
-        for (i, label) in ["X", "Y", "Z"].into_iter().enumerate() {
-            let value = self.snapshot["space"]["position"][label]
-                .as_f64()
-                .unwrap_or(0.);
-            axes = axes.child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .gap(px(metrics::AXIS_ROW_GAP))
-                    .min_h(px(metrics::AXIS_ROW_MIN_HEIGHT))
-                    .child(
-                        div()
-                            .w(px(metrics::AXIS_LABEL_WIDTH))
-                            .font_family(doc::FONT_FAMILY)
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(rgba(metrics::AXIS_LABEL_TEXT))
-                            .child(label),
-                    )
-                    .child(
-                        div()
-                            .id(format!("stage-avatar-{label}"))
-                            .flex_1()
-                            .min_w(px(0.))
-                            .role(Role::Slider)
-                            .aria_label(match label {
-                                "X" => "人物左右位置",
-                                "Y" => "人物上下位置",
-                                _ => "人物前后位置",
-                            })
-                            .child(Slider::new(&self.sliders[i])),
-                    )
-                    .child(
-                        div()
-                            .w(px(metrics::AXIS_READOUT_WIDTH))
-                            .text_right()
-                            .font_family(doc::FONT_FAMILY)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgba(metrics::AXIS_READOUT_TEXT))
-                            .child(format!("{value:.2}")),
-                    ),
-            );
+        // `stage.avatar.position` has no Unity host handler
+        // (`settings_ui.rs` refuses it), so the three axis sliders are not
+        // drawn there at all. The 镜头复位 button below stays: `stage.camera.reset`
+        // is served by the Unity player itself (`GPUIChat2Probe.cs`).
+        if self.op_supported("stage.avatar.position") {
+            for (i, label) in ["X", "Y", "Z"].into_iter().enumerate() {
+                let value = self.snapshot["space"]["position"][label]
+                    .as_f64()
+                    .unwrap_or(0.);
+                axes = axes.child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap(px(metrics::AXIS_ROW_GAP))
+                        .min_h(px(metrics::AXIS_ROW_MIN_HEIGHT))
+                        .child(
+                            div()
+                                .w(px(metrics::AXIS_LABEL_WIDTH))
+                                .font_family(doc::FONT_FAMILY)
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgba(metrics::AXIS_LABEL_TEXT))
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .id(format!("stage-avatar-{label}"))
+                                .flex_1()
+                                .min_w(px(0.))
+                                .role(Role::Slider)
+                                .aria_label(match label {
+                                    "X" => "人物左右位置",
+                                    "Y" => "人物上下位置",
+                                    _ => "人物前后位置",
+                                })
+                                .child(Slider::new(&self.sliders[i])),
+                        )
+                        .child(
+                            div()
+                                .w(px(metrics::AXIS_READOUT_WIDTH))
+                                .text_right()
+                                .font_family(doc::FONT_FAMILY)
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgba(metrics::AXIS_READOUT_TEXT))
+                                .child(format!("{value:.2}")),
+                        ),
+                );
+            }
         }
         group
             .child(axes)
@@ -783,11 +909,12 @@ impl StagePanelsPane {
                     .justify_between()
                     .items_center()
                     .child(ui::muted(settings_copy(locale, "人物位置会按当前空间保存")))
-                    .child(self.plain_button(
+                    .child(self.supported_button(
                         "avatar-reset",
                         "重置",
                         AssetIcon::Undo2,
                         json!({"op":"stage.avatar.reset"}),
+                        "stage.avatar.reset",
                         false,
                         cx,
                     )),
@@ -801,6 +928,9 @@ impl StagePanelsPane {
                         locale,
                         "W/S 沿视线前后移动，A/D 左右移动",
                     )))
+                    // The Unity player serves this one itself
+                    // (`GPUIChat2Probe.cs` `stage.camera.reset`), so it is not
+                    // part of the host whitelist and stays drawn.
                     .child(self.plain_button(
                         "camera-reset",
                         "镜头复位",
@@ -839,11 +969,12 @@ impl StagePanelsPane {
                             .to_owned(),
                     ))
                     .child(div().flex_1())
-                    .child(self.plain_button(
+                    .child(self.supported_button(
                         "motion-refresh",
                         "刷新",
                         AssetIcon::RefreshCw,
                         json!({"op":"stage.motion.refresh"}),
+                        "stage.motion.refresh",
                         false,
                         cx,
                     )),
@@ -891,6 +1022,17 @@ impl StagePanelsPane {
                 })),
         );
         let saving = motions["isWorking"].as_bool() == Some(true);
+        // `stage.motion.activate` has no Unity host handler; the whole motion
+        // list would be a wall of refused rows, so it is not drawn there.
+        // `stage.motion.refresh` (the header button) is gated separately.
+        if !self.op_supported("stage.motion.activate") {
+            return group
+                .child(ui::muted(settings_copy(
+                    locale,
+                    "当前运行时不提供动作选择。",
+                )))
+                .into_any_element();
+        }
         for motion in &visible {
             let id = motion["id"].as_str().unwrap_or("");
             let active = motions["activeID"] == motion["id"];
@@ -969,7 +1111,10 @@ impl StagePanelsPane {
             });
         }
         group
-            .child(self.plain_button(
+            // `settings.open.presence` is registered only by the product host
+            // (`ProductHost.swift`); the Unity settings window would refuse it,
+            // so the button is not drawn there.
+            .child(self.supported_button(
                 "manage-motion-assets",
                 "管理角色与动作…",
                 AssetIcon::Settings,
@@ -978,6 +1123,7 @@ impl StagePanelsPane {
                 // `GPUIProductHost.settingsCommand` 用真实存在的
                 // `settings.open.presence` 承接（`stage.assets.manage` 从无处理者）。
                 json!({"op":"settings.open.presence"}),
+                "settings.open.presence",
                 false,
                 cx,
             ))
@@ -999,6 +1145,17 @@ impl StagePanelsPane {
             )));
         let is_visible = self.snapshot["space"]["isVisible"].as_bool() == Some(true);
         let is_requested = self.snapshot["space"]["isRequested"].as_bool() == Some(true);
+        // Neither `stage.activity.run` nor `stage.activity.stop` has a Unity
+        // host handler (`settings_ui.rs` refuses both), so the activity list
+        // and its stop control are not drawn there.
+        if !self.op_supported("stage.activity.run") && !self.op_supported("stage.activity.stop") {
+            return group
+                .child(ui::muted(settings_copy(
+                    locale,
+                    "当前运行时不提供生活活动控制。",
+                )))
+                .into_any_element();
+        }
         let can_run = activity["canRun"].as_bool().unwrap_or_else(|| {
             activity_can_run(
                 is_visible,
@@ -1008,41 +1165,45 @@ impl StagePanelsPane {
         });
         if can_run {
             let items = activity["items"].as_array().cloned().unwrap_or_default();
-            for item in &items {
-                let id = item["id"].as_str().unwrap_or("");
-                let active = activity["activeID"] == item["id"];
-                group = group.child(self.row(
-                    format!("activity-{id}"),
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .gap(px(metrics::ROW_GAP))
-                        .child(
-                            Icon::new(if active {
-                                AssetIcon::CircleCheck
+            // Each run row emits `stage.activity.run`; stop stays a separate
+            // control so the two ops are gated independently.
+            if self.op_supported("stage.activity.run") {
+                for item in &items {
+                    let id = item["id"].as_str().unwrap_or("");
+                    let active = activity["activeID"] == item["id"];
+                    group = group.child(self.row(
+                        format!("activity-{id}"),
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap(px(metrics::ROW_GAP))
+                            .child(
+                                Icon::new(if active {
+                                    AssetIcon::CircleCheck
+                                } else {
+                                    AssetIcon::CirclePlay
+                                })
+                                .size(px(metrics::TILE_ICON_SIZE)),
+                            )
+                            .child(div().child(item["name"].as_str().unwrap_or("").to_owned()))
+                            .child(div().flex_1())
+                            .into_any_element(),
+                        format!(
+                            "{}，{}{}",
+                            item["name"].as_str().unwrap_or(""),
+                            settings_copy(locale, "活动"),
+                            if active {
+                                settings_copy(locale, "，正在进行")
                             } else {
-                                AssetIcon::CirclePlay
-                            })
-                            .size(px(metrics::TILE_ICON_SIZE)),
-                        )
-                        .child(div().child(item["name"].as_str().unwrap_or("").to_owned()))
-                        .child(div().flex_1())
-                        .into_any_element(),
-                    format!(
-                        "{}，{}{}",
-                        item["name"].as_str().unwrap_or(""),
-                        settings_copy(locale, "活动"),
-                        if active {
-                            settings_copy(locale, "，正在进行")
-                        } else {
-                            ""
-                        }
-                    ),
-                    active,
-                    false,
-                    json!({"op":"stage.activity.run","id":id}),
-                    cx,
-                ));
+                                ""
+                            }
+                        ),
+                        active,
+                        false,
+                        json!({"op":"stage.activity.run","id":id}),
+                        cx,
+                    ));
+                }
             }
             if items.is_empty() {
                 group = group.child(ui::muted(settings_copy(
@@ -1050,11 +1211,12 @@ impl StagePanelsPane {
                     "这个空间还没有配置生活活动。",
                 )));
             }
-            group = group.child(self.plain_button(
+            group = group.child(self.supported_button(
                 "activity-stop",
                 "停止活动",
                 AssetIcon::Square,
                 json!({"op":"stage.activity.stop"}),
+                "stage.activity.stop",
                 activity["activeID"].as_str().is_none_or(|s| s.is_empty()),
                 cx,
             ));
@@ -1562,7 +1724,7 @@ impl Render for StagePanelsPane {
             )
             .on_click(cx.listener(|this, index: &usize, _, cx| {
                 this.tab = *index;
-                if *index == 2 {
+                if *index == 2 && this.op_supported("stage.motion.refresh") {
                     this.commands.push(json!({"op":"stage.motion.refresh"}));
                 }
                 cx.notify();

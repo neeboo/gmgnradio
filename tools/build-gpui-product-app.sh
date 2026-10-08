@@ -85,13 +85,13 @@ if [[ "$signing" == adhoc ]]; then
 fi
 python3 "$root/tools/verify-helper-manifest.py" --app "$destination" --require-screen-link
 for architecture in $architectures; do
-  /usr/bin/lipo -verify_arch "$architecture" "$destination/Contents/MacOS/gmgn-gpui-app"
-  /usr/bin/lipo -verify_arch "$architecture" "$dylib"
+  /usr/bin/lipo "$destination/Contents/MacOS/gmgn-gpui-app" -verify_arch "$architecture"
+  /usr/bin/lipo "$dylib" -verify_arch "$architecture"
   for helper in gmgn-taskd gmgn-mcpd; do
-    /usr/bin/lipo -verify_arch "$architecture" "$destination/Contents/Helpers/$helper"
+    /usr/bin/lipo "$destination/Contents/Helpers/$helper" -verify_arch "$architecture"
   done
   for framework in LiveKitWebRTC RustLiveKitUniFFI; do
-    /usr/bin/lipo -verify_arch "$architecture" "$destination/Contents/Frameworks/$framework.framework/$framework"
+    /usr/bin/lipo "$destination/Contents/Frameworks/$framework.framework/$framework" -verify_arch "$architecture"
   done
 done
 if [[ -e "$final_destination" ]]; then

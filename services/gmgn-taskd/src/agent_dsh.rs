@@ -878,7 +878,12 @@ async fn drive(s: Arc<Session>, config: Configuration) -> Result<(DshState, Stri
     })
 }
 
-#[cfg(test)]
+// unix-only test module: the private ACP peer is a `#!/usr/bin/python3` script
+// that must carry the execute bit (`Permissions::from_mode(0o700)`). Windows has
+// no POSIX execute bit and an unprivileged Windows process cannot run that
+// fixture, so the module is skipped there rather than compiled into a test that
+// could never pass.
+#[cfg(all(test, unix))]
 pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

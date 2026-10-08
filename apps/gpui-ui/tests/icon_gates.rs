@@ -342,24 +342,13 @@ const DATA_TAB_BARS: &[(&str, &str)] = &[
 /// Sites the gate must not fail on, matched by file **and** contiguous code line
 /// and enclosing function, so the exemption cannot silently widen.
 ///
-/// The lyrics overlay is outside this change's editable set (a parallel
-/// workstream owns it), so its two control labels are recorded here instead of
-/// being silently skipped; `primitives::capsule_button` is the original's
+/// The bind-prompt controls in the lyrics overlay no longer draw words: they are
+/// icon-only (`IconName::Play` / `IconName::Close`) with 播放 / 忽略绑定视频 in the
+/// tooltip and the accessibility label, so no lyrics site is exempt any more.
+/// `primitives::capsule_button` is the original's
 /// "停止说话" text pill, retained by design (a separate assertion below proves it
 /// has no call sites outside its own module).
 const EXEMPT_SITES: &[(&str, &str, &str, &str)] = &[
-    (
-        "apps/gpui-ui/src/lyrics.rs",
-        "render",
-        ".label(\"播放\")",
-        "hard constraint: lyrics.rs is not editable in this change",
-    ),
-    (
-        "apps/gpui-ui/src/lyrics.rs",
-        "render",
-        ".label(\"×\")",
-        "hard constraint: lyrics.rs is not editable in this change",
-    ),
     (
         "apps/gpui-ui/src/primitives.rs",
         "capsule_button",

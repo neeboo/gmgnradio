@@ -517,7 +517,16 @@ pub mod program {
 pub mod inbox {
     pub const WINDOW_WIDTH: f32 = 720.;
     pub const WINDOW_HEIGHT: f32 = 460.;
+    /// The list column's preferred width in the pane's own 720×460 window.
     pub const LIST_WIDTH: f32 = 300.;
+    /// Its floor when the pane is mounted in a narrower surface than that
+    /// window — the 590 pt media panel. The detail column keeps its
+    /// [`DETAIL_MIN_WIDTH`] floor, so the two floors have to sum to at most
+    /// the media panel's inner width
+    /// (`stage::PANEL_MAX_WIDTH` − 2 × [`PANEL_INSET`] − [`DETAIL_TRAILING`]
+    /// = 562 pt): 240 + 320 = 560 ≤ 562. The standalone window still shows the
+    /// full [`LIST_WIDTH`], because 720 pt has room for both.
+    pub const LIST_MIN_WIDTH: f32 = 240.;
 
     /// The split's insets inside the content view (`:170-173`).
     pub const PANEL_INSET: f32 = 10.;
@@ -875,6 +884,13 @@ mod tests {
         assert_eq!([stage::PROGRAM_CARD_WIDTH, stage::PROGRAM_CARD_HEIGHT], [294., 76.]);
         assert_eq!([stage::PROGRAM_EMPTY_WIDTH, stage::PROGRAM_EMPTY_HEIGHT], [142., 64.]);
         assert_eq!([inbox::WINDOW_WIDTH, inbox::WINDOW_HEIGHT, inbox::LIST_WIDTH], [720., 460., 300.]);
+        // InboxPane is also mounted in the 590 pt media panel; its two column
+        // floors must fit that panel's inner width.
+        assert_eq!(inbox::LIST_MIN_WIDTH, 240.);
+        assert!(
+            inbox::LIST_MIN_WIDTH + inbox::DETAIL_MIN_WIDTH
+                <= stage::PANEL_MAX_WIDTH - 2. * inbox::PANEL_INSET - inbox::DETAIL_TRAILING
+        );
         assert_eq!([settings::WINDOW_WIDTH, settings::WINDOW_HEIGHT], [580., 500.]);
         assert_eq!([settings::MIN_WIDTH, settings::MIN_HEIGHT], [540., 440.]);
         assert_eq!(settings::SEGMENT_WIDTH, 330.);

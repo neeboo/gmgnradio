@@ -1,107 +1,1305 @@
-//! Inventory UI consumes Unity's recovery projection. It never infers model
-//! readiness from durable metadata or creates a second placement authority.
+//! 「物品」 — the Unity overlay's inventory surface, now the product component
+//! [`ResidentPropEditorPane`] driven by the facts the Unity host already
+//! publishes, with the component's commands translated back into the ops the
+//! Unity host already dispatches.
+//!
+//! Why an adapter file instead of a second surface:
+//!
+//! - **One inventory, one queue.** The list is a pure function of
+//!   `unityInventory` / `unityWorldAuthority` / `wish` / `inventoryMutation` /
+//!   `unityUICommandResult` (the same keys `lib.rs` retains); every command
+//!   leaves through the single shared `UiCommandQueue` the Unity player polls.
+//! - **The component owns the look.** `ResidentPropEditorPane` paints the panel,
+//!   the rows, the kit delete dialog and the tokens. This file owns the
+//!   projection in and the translation out, nothing else.
+//! - **The built-in device strip stays.** 音乐播放器 / 许愿机 placement was an
+//!   operation of the old adapter (`ui.device.place`); the component has no slot
+//!   for it, so it is drawn above the panel with the same shared primitives and
+//!   the same op/payload.
+//! - **Local state stays local.** The scope (我的物件 / 房间里), the 已结束 fold,
+//!   the selected row and the hold point are this click's UI state. They never
+//!   travel as invented host commands — only as a re-projection.
+use crate::{UiCommandQueue, enqueue_ui_command};
+use gmgn_gpui_ui::stage_panels::ResidentPropEditorPane;
+use gmgn_gpui_ui::{
+    primitives as ui,
+    ui_tokens::{self as tokens, props as prop_metrics, scene as s},
+};
+use gpui_kit::assets::IconName;
 use gpui_kit::*;
-use gpui_kit::component::{button::Button, ActiveTheme, Disableable, scroll::ScrollableElement};
 use serde_json::{Value, json};
-use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+use std::{cell::RefCell, rc::Rc};
+
+/// `ResidentOwnershipProjection.visibleRowBudget` — rows shown before 「还有 N 件」.
+const ROW_BUDGET: usize = 6;
+/// The product's hold-point vocabulary (`PropAttachmentPoint.allCases` +
+/// `PropAttachmentSlots.displayName`); the ids are the Rust `slot` names
+/// (`world_prop.rs` `"hold"` validates `f.avatar.slots`).
+const HOLD_POINTS: [(&str, &str); 3] = [("rightHand", "右手"), ("back", "背后"), ("waist", "腰间")];
+/// One rotation click is the original `左转/右转 15°` (`pi / 12`).
+const ROTATE_RADIANS: f32 = std::f32::consts::PI / 12.;
+const QUEUE_FULL: &str = "操作队列已满，请稍后再试";
+
+/// The panel state the component cannot know: it is decided by this click only.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LocalState {
+    /// 「房间里」 = `showsPlacedOnly`.
+    pub placed_only: bool,
+    /// 「已结束」 folded. The original defaults to folded, never hidden.
+    pub ended_folded: bool,
+    /// The row whose controls are on screen.
+    pub selected: Option<String>,
+    /// The hold point the picker last chose.
+    pub hold_point: String,
+}
+impl Default for LocalState {
+    fn default() -> Self {
+        Self {
+            placed_only: false,
+            ended_folded: true,
+            selected: None,
+            hold_point: "rightHand".into(),
+        }
+    }
+}
+
+/// One ownership row, before it becomes the component's JSON.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Row {
+    pub id: String,
+    pub object_id: String,
+    pub job_id: Option<String>,
+    pub name: String,
+    pub state: &'static str,
+    pub status: String,
+    pub actions: Vec<&'static str>,
+    pub group: &'static str,
+}
+
+fn group_of(state: &str) -> &'static str {
+    match state {
+        "awaitingClaim" | "failed" | "generating" => "needsYou",
+        "inInventory" => "inInventory",
+        "placed" => "inRoom",
+        _ => "ended",
+    }
+}
+fn group_title(group: &str) -> &'static str {
+    match group {
+        "needsYou" => "待你处理",
+        "inInventory" => "在库里",
+        "inRoom" => "在房间里",
+        _ => "已结束",
+    }
+}
+fn section_title(group: &str, count: usize) -> String {
+    format!("{} ({count})", group_title(group))
+}
+
+fn text(value: &Value) -> Option<&str> {
+    value.as_str().filter(|v| !v.is_empty())
+}
+
+/// The whole list: world objects, tombstones and wish jobs, one row each.
+///
+/// A world object always wins over its wish job (the object is the ownership
+/// authority), so a job whose object is present is never repeated.
+pub fn rows(snapshot: &Value) -> Vec<Row> {
+    let state = &snapshot["unityWorldAuthority"]["state"];
+    let held_id = text(&state["heldProp"]["objectID"]);
+    let mut out = Vec::new();
+    let mut present: Vec<String> = Vec::new();
+    for item in snapshot["unityInventory"].as_array().into_iter().flatten() {
+        let Some(object_id) = text(&item["objectID"]) else {
+            continue;
+        };
+        present.push(object_id.to_owned());
+        let name = text(&item["name"]).unwrap_or(object_id).to_owned();
+        let held = item["held"].as_bool() == Some(true) || held_id == Some(object_id);
+        let placed = item["placed"].as_bool() == Some(true);
+        let ready = item["modelReady"].as_bool() == Some(true);
+        let (state, status, actions): (&'static str, String, Vec<&'static str>) = if held {
+            ("placed", "在居民手里".into(), vec!["withdraw", "delete"])
+        } else if placed {
+            ("placed", "已摆放".into(), vec!["withdraw", "delete"])
+        } else if ready {
+            (
+                "inInventory",
+                "在库里（没摆）".into(),
+                vec!["place", "delete"],
+            )
+        } else {
+            // The old adapter disabled 摆放 until the model was loaded; the row
+            // is not selectable, so no control promises a placement it cannot do.
+            (
+                "inInventory",
+                "在库里（没摆）· 模型尚未载入".into(),
+                vec!["delete"],
+            )
+        };
+        out.push(Row {
+            id: format!("object:{object_id}"),
+            object_id: object_id.to_owned(),
+            job_id: None,
+            name,
+            state,
+            status,
+            actions,
+            group: group_of(state),
+        });
+    }
+    // Deleted objects leave `objectStates` and become tombstones; that is the
+    // only place 「已结束」 can still name them.
+    for (id, tombstone) in state["propTombstones"].as_object().into_iter().flatten() {
+        if present.iter().any(|p| p == id) {
+            continue;
+        }
+        let name = text(&tombstone["displayName"]).unwrap_or(id).to_owned();
+        out.push(Row {
+            id: format!("ended:{id}"),
+            object_id: id.clone(),
+            job_id: None,
+            name,
+            state: "ended",
+            status: "已删除".into(),
+            actions: Vec::new(),
+            group: "ended",
+        });
+    }
+    // Newest wish first (the array is append-ordered), and only jobs whose object
+    // is not in the world — otherwise the world row already speaks for it.
+    for entry in snapshot["wish"]["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .rev()
+    {
+        let Some(wish_id) = text(&entry["wishID"]) else {
+            continue;
+        };
+        let object_id = entry["objectID"].as_str().unwrap_or("").to_owned();
+        if !object_id.is_empty() && present.iter().any(|p| p == &object_id) {
+            continue;
+        }
+        let claimable = entry["claimAvailable"].as_bool() == Some(true);
+        let (state, status, actions): (&'static str, &str, Vec<&'static str>) =
+            match entry["stage"].as_str().unwrap_or("") {
+                "claimed" => (
+                    "failed",
+                    "已领取，入库尚未保存",
+                    vec!["retryInventoryRegistration"],
+                ),
+                // `claim_when_arrived` (让居民去取) has no Unity host op, so an
+                // unreachable tray shows the row without inventing a channel.
+                "ready" => (
+                    "awaitingClaim",
+                    "未领取",
+                    if claimable { vec!["claim"] } else { Vec::new() },
+                ),
+                "failed" => ("failed", "生成失败", vec!["retry"]),
+                "submissionUncertain" => ("generating", "提交结果待确认", vec!["retry"]),
+                "submitting" => ("generating", "正在提交后台", Vec::new()),
+                "generated" | "generating" => ("generating", "生成中", Vec::new()),
+                "cancelled" => ("ended", "已取消", Vec::new()),
+                "interrupted" => ("ended", "任务已中断", Vec::new()),
+                _ => continue,
+            };
+        out.push(Row {
+            id: format!("wish:{wish_id}"),
+            object_id,
+            job_id: Some(wish_id.to_owned()),
+            name: text(&entry["name"]).unwrap_or(wish_id).to_owned(),
+            state,
+            status: status.to_owned(),
+            actions,
+            group: group_of(state),
+        });
+    }
+    out
+}
+
+fn row_json(row: &Row) -> Value {
+    json!({
+        "id": row.id,
+        "objectID": row.object_id,
+        "jobID": row.job_id,
+        "name": row.name,
+        "state": row.state,
+        "statusText": row.status,
+        "actions": row.actions,
+    })
+}
+
+/// The component's snapshot, derived from the Unity host's facts only.
+pub fn project(snapshot: &Value, local: &LocalState) -> Value {
+    let state = &snapshot["unityWorldAuthority"]["state"];
+    let mut all = rows(snapshot);
+    if local.placed_only {
+        all.retain(|row| row.group == "inRoom");
+    }
+    let row_count = all.len();
+    let mut sections = Vec::new();
+    let mut remaining = 0usize;
+    let mut budget = ROW_BUDGET;
+    for group in ["needsYou", "inInventory", "inRoom"] {
+        let in_group: Vec<&Row> = all.iter().filter(|row| row.group == group).collect();
+        if in_group.is_empty() {
+            continue;
+        }
+        let shown: Vec<&Row> = in_group.iter().copied().take(budget).collect();
+        if shown.is_empty() {
+            remaining += in_group.len();
+            continue;
+        }
+        budget -= shown.len();
+        remaining += in_group.len() - shown.len();
+        sections.push(json!({
+            "group": group,
+            "title": section_title(group, in_group.len()),
+            "isFolded": false,
+            "rows": shown.iter().map(|row| row_json(row)).collect::<Vec<_>>(),
+        }));
+    }
+    let ended: Vec<&Row> = all.iter().filter(|row| row.group == "ended").collect();
+    if !ended.is_empty() {
+        if local.ended_folded || budget == 0 {
+            // A folded group states its count and occupies no row budget.
+            sections.push(json!({
+                "group": "ended",
+                "title": section_title("ended", ended.len()),
+                "isFolded": true,
+                "rows": [],
+            }));
+        } else {
+            let shown: Vec<&Row> = ended.iter().copied().take(budget).collect();
+            remaining += ended.len() - shown.len();
+            sections.push(json!({
+                "group": "ended",
+                "title": section_title("ended", ended.len()),
+                "isFolded": false,
+                "rows": shown.iter().map(|row| row_json(row)).collect::<Vec<_>>(),
+            }));
+        }
+    }
+    let selected = local
+        .selected
+        .as_deref()
+        .and_then(|id| selected_json(snapshot, local, id))
+        .unwrap_or(Value::Null);
+    let mut projection = json!({
+        "placedOnly": local.placed_only,
+        // The wish bridge is the only thing that knows a host operation is in
+        // flight; `inventoryMutation` carries no pending flag.
+        "isSaving": snapshot["wish"]["pending"].as_bool() == Some(true),
+        "canUndo": state["layoutUndo"].is_object(),
+        "rowCount": row_count,
+        "remainingCount": remaining,
+        "holdPoints": HOLD_POINTS.iter().map(|(id, name)| json!({"id": id, "name": name})).collect::<Vec<_>>(),
+        "sections": sections,
+        "selected": selected,
+        // The Unity host publishes no wall faces / legend for this surface;
+        // saying nothing is better than the standalone fallback's claim about a
+        // room this layer never measured.
+        "wallPlacementText": "",
+        "notice": notice(snapshot),
+    });
+    // `unityInventory` absent is the old adapter's "waiting for the space" state;
+    // with no rows yet the component would otherwise say "nothing has been wished
+    // for", which is a different claim.
+    if snapshot["unityInventory"].is_null() {
+        projection["emptyMessage"] = json!("等待空间物品载入状态");
+    }
+    projection
+}
+
+fn selected_json(snapshot: &Value, local: &LocalState, id: &str) -> Option<Value> {
+    let item = snapshot["unityInventory"]
+        .as_array()?
+        .iter()
+        .find(|item| item["objectID"].as_str() == Some(id))?;
+    let state = &snapshot["unityWorldAuthority"]["state"];
+    let held = item["held"].as_bool() == Some(true) || state["heldProp"]["objectID"].as_str() == Some(id);
+    let ready = item["modelReady"].as_bool() == Some(true);
+    Some(json!({
+        "objectID": id,
+        "name": text(&item["name"]).unwrap_or(id),
+        "held": held,
+        "enabled": item["placed"].as_bool() == Some(true),
+        "holdPoint": local.hold_point,
+        // 拿着看 enters placement; a model that is not loaded cannot.
+        "holdUnavailableReason": if !held && !ready { json!("模型正在载入，物品已保留") } else { Value::Null },
+    }))
+}
+
+/// The one notice the panel shows, read from the receipts the host publishes.
+pub fn notice(snapshot: &Value) -> String {
+    let mutation = &snapshot["inventoryMutation"];
+    if mutation["status"] == "failed" {
+        return text(&mutation["message"])
+            .unwrap_or("删除失败，请查看空间状态")
+            .to_owned();
+    }
+    let receipt = &snapshot["unityUICommandResult"];
+    if matches!(
+        receipt["op"].as_str(),
+        Some("ui.inventory.place" | "ui.device.place")
+    ) {
+        match receipt["status"].as_str() {
+            Some("rejected") => {
+                return "当前无法开始摆放，请等待模型与场景准备完成后重试。".into();
+            }
+            Some("started") => return "已进入摆放预览；请在场景中确认位置。".into(),
+            _ => {}
+        }
+    }
+    let wish = &snapshot["wish"];
+    match wish["status"].as_str() {
+        Some("failed") => text(&wish["message"]).unwrap_or("操作未完成，请重试。").to_owned(),
+        Some("completed") => match wish["operation"].as_str() {
+            Some("wish.claim") => "已领取，入库完成后会出现在「我的物件」里。".into(),
+            Some("wish.retry") => "已重新提交生成。".into(),
+            Some("wish.inventory.retry") => "正在补做入库。".into(),
+            Some("wish.status") => String::new(),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
+fn request_id(sequence: &mut u64) -> String {
+    *sequence += 1;
+    format!("gpui-prop-{sequence}")
+}
+
+/// The object the command addresses: its own payload, else the selected row.
+fn target(command: &Value, local: &LocalState) -> Option<String> {
+    text(&command["objectID"])
+        .map(str::to_owned)
+        .or_else(|| local.selected.clone())
+}
+
+fn world_id(snapshot: &Value) -> Option<&str> {
+    text(&snapshot["unityWorldAuthority"]["state"]["worldID"])
+}
+
+/// `world.prop.command` ({UnityWorldBridge.swift:187} accepted vocabulary),
+/// carrying the same revisions the Unity player sends.
+fn prop_command(snapshot: &Value, request: String, command: Value) -> Option<Value> {
+    let world = world_id(snapshot)?;
+    let revision = snapshot["unityWorldAuthority"]["recordRevision"].as_u64()?;
+    let layout = snapshot["unityWorldAuthority"]["state"]["layoutRevision"].as_u64()?;
+    Some(json!({
+        "op": "world.prop.command",
+        "worldID": world,
+        "requestID": request,
+        "expectedRevision": revision,
+        "expectedLayoutRevision": layout,
+        "command": command,
+    }))
+}
+
+/// The held prop's persisted grip calibration (`gmgn.prop-grip.v1`).
+fn grip(snapshot: &Value, object_id: &str) -> Option<Value> {
+    let raw = snapshot["unityWorldAuthority"]["state"]["objectStates"][object_id]["metadata"]
+        ["gmgn.prop-grip.v1"]
+        .as_str()?;
+    serde_json::from_str(raw).ok()
+}
+
+fn vec3(value: &Value) -> Option<[f32; 3]> {
+    let items = value.as_array()?;
+    let mut out = [0f32; 3];
+    for (index, slot) in out.iter_mut().enumerate() {
+        *slot = items.get(index)?.as_f64()? as f32;
+        if !slot.is_finite() {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+fn quat(value: &Value) -> Option<[f32; 4]> {
+    let items = value.as_array()?;
+    let mut out = [0f32; 4];
+    for (index, slot) in out.iter_mut().enumerate() {
+        *slot = items.get(index)?.as_f64()? as f32;
+        if !slot.is_finite() {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// The component's command → the Unity host's op. `None` means the command was
+/// local state (already applied to `local`) or has no existing host op.
+pub fn translate(
+    command: &Value,
+    snapshot: &Value,
+    local: &mut LocalState,
+    sequence: &mut u64,
+) -> Option<Value> {
+    match command["op"].as_str()? {
+        // Read/refresh the wish projection through the bridge that owns it.
+        "stage.props.load" => Some(json!({"op": "wish.status", "requestID": request_id(sequence)})),
+        "stage.props.filter" => {
+            local.placed_only = command["placedOnly"].as_bool() == Some(true);
+            None
+        }
+        "stage.props.fold" => {
+            local.ended_folded = command["folded"].as_bool() == Some(true);
+            None
+        }
+        "stage.props.select" => {
+            local.selected = text(&command["objectID"]).map(str::to_owned);
+            None
+        }
+        "stage.props.claim" | "stage.props.retry" | "stage.props.retryInventoryRegistration" => {
+            let wish = match command["op"].as_str()? {
+                "stage.props.claim" => "wish.claim",
+                "stage.props.retry" => "wish.retry",
+                _ => "wish.inventory.retry",
+            };
+            let wish_id = text(&command["jobID"])?;
+            Some(json!({"op": wish, "requestID": request_id(sequence), "wishID": wish_id}))
+        }
+        // Permanent delete: the existing world-session mutation and its payload.
+        "stage.props.delete" => {
+            let id = target(command, local)?;
+            let world = world_id(snapshot)?;
+            let layout = snapshot["unityWorldAuthority"]["state"]["layoutRevision"].as_u64()?;
+            Some(json!({
+                "op": "inventory.delete",
+                "worldID": world,
+                "objectID": id,
+                "layoutRevision": layout,
+            }))
+        }
+        "stage.props.withdraw" => {
+            let id = target(command, local)?;
+            prop_command(snapshot, request_id(sequence), json!({"op": "withdraw", "objectID": id}))
+        }
+        "stage.props.hold" => match text(&command["point"]) {
+            // A hold point: the existing `hold` command, same slot vocabulary.
+            Some(point) => {
+                local.hold_point = point.to_owned();
+                let id = target(command, local)?;
+                prop_command(
+                    snapshot,
+                    request_id(sequence),
+                    json!({"op": "hold", "objectID": id, "slot": point}),
+                )
+            }
+            // 拿着看 is the placement entry the old adapter exposed.
+            None => {
+                let id = target(command, local)?;
+                Some(json!({"op": "ui.inventory.place", "objectID": id}))
+            }
+        },
+        "stage.props.return" => {
+            let id = target(command, local)?;
+            prop_command(snapshot, request_id(sequence), json!({"op": "returnHeld", "objectID": id}))
+        }
+        "stage.props.nudge" => {
+            let id = target(command, local)?;
+            let current = grip(snapshot, &id)?;
+            let offset = vec3(&current["localOffset"])?;
+            let rotation = quat(&current["localRotation"])?;
+            let y = command["y"].as_f64()? as f32;
+            let z = command["z"].as_f64()? as f32;
+            if !y.is_finite() || !z.is_finite() {
+                return None;
+            }
+            prop_command(
+                snapshot,
+                request_id(sequence),
+                json!({
+                    "op": "adjustGrip",
+                    "objectID": id,
+                    "offset": [offset[0], offset[1] + y, offset[2] + z],
+                    "rotation": rotation,
+                }),
+            )
+        }
+        "stage.props.rotate" => {
+            let id = target(command, local)?;
+            let direction = command["direction"].as_f64()? as f32;
+            if !matches!(direction, -1.0 | 1.0) {
+                return None;
+            }
+            let current = grip(snapshot, &id)?;
+            let offset = vec3(&current["localOffset"])?;
+            let q = quat(&current["localRotation"])?;
+            // Same yaw derivation as the original `rotateHeld`.
+            let yaw = (2. * (q[3] * q[1] + q[0] * q[2])).atan2(1. - 2. * (q[1] * q[1] + q[2] * q[2]))
+                + direction * ROTATE_RADIANS;
+            prop_command(
+                snapshot,
+                request_id(sequence),
+                json!({
+                    "op": "adjustGrip",
+                    "objectID": id,
+                    "offset": offset,
+                    "rotation": [0., (yaw / 2.).sin(), 0., (yaw / 2.).cos()],
+                }),
+            )
+        }
+        "stage.props.undo" => prop_command(snapshot, request_id(sequence), json!({"op": "undo"})),
+        // Manual size: the Rust reducer's own `resize` arm
+        // (`services/gmgn-taskd/src/world_prop.rs` `apply_command`), which the
+        // Unity world bridge now forwards (`UnityWorldBridge.submitProp`).
+        // `targetLongestEdge` is the UI slider's value and is validated against
+        // the same 0.02…3 m the component's own slider exposes
+        // (`world_prop.rs` `validate_command`,
+        // `ui_tokens::props::SIZE_MIN/SIZE_MAX`).
+        "stage.props.resize" => {
+            let id = target(command, local)?;
+            let value = command["value"].as_f64()?;
+            if !value.is_finite()
+                || !(prop_metrics::SIZE_MIN as f64..=prop_metrics::SIZE_MAX as f64).contains(&value)
+            {
+                return None;
+            }
+            prop_command(
+                snapshot,
+                request_id(sequence),
+                json!({"op": "resize", "objectID": id, "targetLongestEdge": value}),
+            )
+        }
+        // The panel's × is not an object mutation: it asks the overlay to
+        // collapse the 物品 panel. That is exactly the shell's own toggle
+        // (`ShellPane::set_panel`, `ui.overlay.panel {expanded:false}`), the op
+        // the Unity probe already turns into `gmgn_overlay_set_panel_expanded`
+        // (`GPUIChat2Probe.Update`), so the native hit region and the GPUI
+        // panel state change together instead of the click being dropped.
+        "stage.props.close" => Some(json!({"op": "ui.overlay.panel", "expanded": false})),
+        // `askResidentToFetch` has no Unity host op (claim is the agent's
+        // lease), so it is not invented here. `toggle` / `escape` are not
+        // emitted by the component.
+        _ => None,
+    }
+}
+
+/// The built-in device placement the old adapter exposed, kept verbatim.
+pub fn device_place_command(template: &Value) -> Option<Value> {
+    let id = text(&template["id"])?;
+    Some(json!({"op": "ui.device.place", "templateID": id}))
+}
 
 pub struct InventoryPane {
+    editor: Entity<ResidentPropEditorPane>,
+    commands: UiCommandQueue,
+    /// A projection that still needs a `Window`; the deferred pass takes it, the
+    /// render fallback takes it when the window was busy.
+    pending: Rc<RefCell<Option<Value>>>,
     snapshot: Value,
-    commands: Rc<RefCell<VecDeque<Value>>>,
-    confirm_delete: Option<String>,
+    local: LocalState,
+    sequence: u64,
     notice: String,
+    device_templates: Vec<Value>,
+    _observation: Subscription,
 }
 
 impl InventoryPane {
-    pub fn new(_: &mut Window, _: &mut Context<Self>, commands: Rc<RefCell<VecDeque<Value>>>) -> Self {
-        Self { snapshot: Value::Null, commands, confirm_delete: None, notice: String::new() }
+    pub fn new(window: &mut Window, cx: &mut Context<Self>, commands: UiCommandQueue) -> Self {
+        let editor = cx.new(|cx| ResidentPropEditorPane::new(window, cx));
+        // The component pushes a command and then notifies; that notify is the
+        // only signal a click happened, so the queue is drained from it.
+        let observation = cx.observe(&editor, |this, _, cx| this.collect(cx));
+        Self {
+            editor,
+            commands,
+            pending: Rc::new(RefCell::new(None)),
+            snapshot: Value::Null,
+            local: LocalState::default(),
+            sequence: 0,
+            notice: String::new(),
+            device_templates: Vec::new(),
+            _observation: observation,
+        }
     }
 
     pub fn update_snapshot(&mut self, snapshot: &Value, cx: &mut Context<Self>) {
         self.snapshot = snapshot.clone();
-        let mutation = &snapshot["inventoryMutation"];
-        if mutation["status"] == "failed" {
-            self.notice = mutation["message"].as_str().unwrap_or("删除失败，请查看空间状态").into();
+        self.device_templates = snapshot["builtinDevices"]["templates"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        self.notice = notice(snapshot);
+        if self.local.selected.as_deref().is_some_and(|id| {
+            !snapshot["unityInventory"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|item| item["objectID"].as_str() == Some(id))
+        }) {
+            self.local.selected = None;
         }
-        let receipt=&snapshot["unityUICommandResult"];
-        if matches!(receipt["op"].as_str(),Some("ui.inventory.place"|"ui.device.place")) {
-            if receipt["status"]=="rejected" {
-                self.notice="当前无法开始摆放，请等待模型与场景准备完成后重试。".into();
-            } else if receipt["status"]=="started" {
-                self.notice="已进入摆放预览；请在场景中确认位置。".into();
+        self.publish(cx);
+        self.collect(cx);
+        cx.notify();
+    }
+
+    /// Hand the projection to the component. `with_window` resolves the window
+    /// seeded at creation, so a closed panel still keeps its facts current.
+    fn publish(&mut self, cx: &mut Context<Self>) {
+        let mut projection = project(&self.snapshot, &self.local);
+        // A local problem (a full queue) outranks the host's last receipt until
+        // the next snapshot replaces it.
+        if !self.notice.is_empty() {
+            projection["notice"] = json!(self.notice);
+        }
+        *self.pending.borrow_mut() = Some(projection.clone());
+        let editor = self.editor.clone();
+        let pending = self.pending.clone();
+        cx.defer(move |cx| {
+            let Some(projection) = pending.borrow_mut().take() else {
+                return;
+            };
+            let fallback = projection.clone();
+            let applied = cx
+                .with_window(editor.entity_id(), |window, cx| {
+                    editor.update(cx, |pane, cx| pane.update_snapshot(projection, window, cx));
+                })
+                .is_some();
+            if !applied {
+                *pending.borrow_mut() = Some(fallback);
+            }
+        });
+    }
+
+    fn apply_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(projection) = self.pending.borrow_mut().take() {
+            self.editor
+                .update(cx, |pane, cx| pane.update_snapshot(projection, window, cx));
+        }
+    }
+
+    /// Drain the component's commands into the one shared transport queue.
+    fn collect(&mut self, cx: &mut Context<Self>) {
+        let incoming = self.editor.update(cx, |pane, _| pane.take_commands());
+        if incoming.is_empty() {
+            return;
+        }
+        let before = self.local.clone();
+        // The panel's × is the overlay shell's own panel toggle. The shell owns
+        // that state, and we are inside the shell's render, so the update is
+        // deferred instead of called here. The command is still left in the
+        // queue on purpose: the Unity probe answers `ui.overlay.panel` locally
+        // (`GPUIChat2Probe.Update` → `gmgn_overlay_set_panel_expanded`), so
+        // the native hit region and the GPUI panel collapse in the same tick.
+        let mut closed_panel = false;
+        for command in incoming {
+            if command["op"].as_str() == Some("stage.props.close") {
+                closed_panel = true;
+            }
+            if let Some(op) = translate(&command, &self.snapshot, &mut self.local, &mut self.sequence)
+            {
+                if !enqueue_ui_command(&self.commands, op) {
+                    self.notice = QUEUE_FULL.into();
+                }
             }
         }
+        if closed_panel {
+            cx.defer(|cx| crate::close_overlay_panel(cx));
+        }
+        // A local state change (scope, fold, selection, hold point) is only
+        // visible after the component gets the re-projection.
+        if self.local != before {
+            self.publish(cx);
+        }
+    }
+
+    fn submit(&mut self, command: Value, cx: &mut Context<Self>) {
+        if !enqueue_ui_command(&self.commands, command) {
+            self.notice = QUEUE_FULL.into();
+        }
         cx.notify();
     }
 
-    fn enqueue(&mut self, command: Value, cx: &mut Context<Self>) {
-        let mut queue = self.commands.borrow_mut();
-        if queue.len() >= 32 { self.notice = "操作队列已满，请稍后重试".into(); }
-        else { queue.push_back(command); self.notice = "请求已发送，等待空间回执".into(); }
-        cx.notify();
-    }
-}
-
-impl Render for InventoryPane {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let templates = self.snapshot["builtinDevices"]["templates"].as_array().cloned().unwrap_or_default();
-        // C# must publish the very same InventoryUpdated payload used by the
-        // existing catalog, including actual loaded-model readiness.
-        let inventory = self.snapshot["unityInventory"].as_array().cloned();
-        let mut rows = vec![div().text_color(cx.theme().muted_foreground).child("基本设备 · 保留").into_any_element()];
-        for template in templates {
-            let Some(id) = template["id"].as_str().filter(|id| !id.is_empty()).map(str::to_owned) else { continue };
+    fn device_section(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let mut card = ui::scene_card()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p(px(s::PANEL_PADDING))
+            .min_w_0()
+            .child(ui::section_title("基本设备 · 保留"));
+        let mut any = false;
+        for template in &self.device_templates {
+            let Some(command) = device_place_command(template) else {
+                continue;
+            };
             let title = match template["renderer"].as_str() {
                 Some("builtin.jukebox") => "音乐播放器",
                 Some("builtin.wish_machine") => "许愿机",
                 _ => continue,
             };
-            let key = SharedString::from(format!("device-place-{id}"));
-            rows.push(div().flex().items_center().gap_3().p_3().rounded_md().bg(cx.theme().group_box)
-                .child(div().flex_1().child(title))
-                .child(Button::new(key).label("摆放").on_click(cx.listener(move |this, _, _, cx| {
-                    this.enqueue(json!({"op":"ui.device.place", "templateID":id}), cx);
-                }))).into_any_element());
+            let id = command["templateID"].as_str().unwrap_or_default().to_owned();
+            any = true;
+            card = card.child(
+                ui::scene_inset()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .p_3()
+                    .min_w_0()
+                    .child(div().flex_1().min_w_0().child(ui::body(title)))
+                    .child(
+                        ui::icon_button(
+                            SharedString::from(format!("device-place-{id}")),
+                            IconName::Box,
+                            "摆放",
+                            false,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.submit(command.clone(), cx);
+                        })),
+                    ),
+            );
         }
-        rows.push(div().mt_3().text_color(cx.theme().muted_foreground).child("我的物品").into_any_element());
-        match inventory {
-            None => rows.push(div().child("等待空间物品载入状态").into_any_element()),
-            Some(items) if items.is_empty() => rows.push(div().child("还没有物品，生成的物品会收在这里。").into_any_element()),
-            Some(items) => for item in items {
-                let Some(id) = item["objectID"].as_str().filter(|id| !id.is_empty()).map(str::to_owned) else { continue };
-                let name = item["name"].as_str().unwrap_or(&id).to_owned();
-                let held = item["held"].as_bool() == Some(true);
-                let placed = item["placed"].as_bool() == Some(true);
-                let ready = item["modelReady"].as_bool() == Some(true);
-                let state = if held { "手持中" } else if placed { "已摆放" } else { "未摆放" };
-                let detail = if held { "让角色放下后，再移动或删除" } else if !ready { "模型正在载入，物品已保留" } else { "选择位置即可摆放；旋转与落地由空间操作处理" };
-                let place_id = id.clone();
-                let delete_id = id.clone();
-                let world_id = self.snapshot["unityWorldAuthority"]["state"]["worldID"].clone();
-                let revision = self.snapshot["unityWorldAuthority"]["state"]["layoutRevision"].clone();
-                let confirmed = self.confirm_delete.as_deref() == Some(id.as_str());
-                rows.push(div().flex().flex_col().gap_2().p_3().rounded_md().bg(cx.theme().group_box)
-                    .child(div().flex().gap_2().child(div().flex_1().child(name)).child(state))
-                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child(detail))
-                    .child(div().flex().gap_2()
-                        .child(Button::new(SharedString::from(format!("place-{id}"))).label(if placed { "重新摆放" } else { "摆放" }).disabled(held || !ready)
-                            .on_click(cx.listener(move |this, _, _, cx| this.enqueue(json!({"op":"ui.inventory.place", "objectID":place_id}), cx))))
-                        .child(Button::new(SharedString::from(format!("delete-{id}"))).label(if confirmed { "确认删除" } else { "删除" })
-                            .disabled(held || !world_id.is_string() || !revision.is_u64())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if this.confirm_delete.as_deref() != Some(delete_id.as_str()) {
-                                    this.confirm_delete = Some(delete_id.clone()); cx.notify(); return;
-                                }
-                                this.confirm_delete = None;
-                                this.enqueue(json!({"op":"inventory.delete", "objectID":delete_id,
-                                    "worldID":world_id,"layoutRevision":revision}), cx);
-                            }))))
-                    .into_any_element());
+        any.then(|| card.into_any_element())
+    }
+}
+
+impl Render for InventoryPane {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.apply_pending(window, cx);
+        self.collect(cx);
+        let devices = self.device_section(cx);
+        let mut root = div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h_0()
+            .min_w_0()
+            .gap(px(s::PANEL_GAP))
+            .font_family(tokens::FONT_FAMILY)
+            .text_size(px(tokens::BODY))
+            .text_color(rgba(s::TEXT));
+        if let Some(devices) = devices {
+            root = root.child(devices);
+        }
+        root = root.child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .child(self.editor.clone()),
+        );
+        root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // gpui re-exports a `test` attribute macro and `super::*` shadows the
+    // built-in one, so name it explicitly like the rest of this crate does.
+    use core::prelude::v1::test;
+    use serde_json::json;
+
+    /// The Unity host facts, in the shape `WorldRuntimeBridge.PublishInventory`,
+    /// `UnityWorldSessionComposition.snapshot` and `UnityWishMachineBridge.snapshot`
+    /// publish them.
+    fn production() -> Value {
+        json!({
+            "unityInventory": [
+                {"objectID":"prop-placed","name":"落地灯","modelReady":true,"held":false,"placed":true,"status":"restored"},
+                {"objectID":"prop-bag","name":"背包","modelReady":true,"held":false,"placed":false,"status":"inventory"},
+                {"objectID":"prop-loading","name":"未载入","modelReady":false,"held":false,"placed":false,"status":"pending"},
+                {"objectID":"prop-hand","name":"长剑","modelReady":true,"held":true,"placed":false,"status":"attachment_pending"},
+            ],
+            "unityWorldAuthority": {
+                "recordRevision": 12,
+                "state": {
+                    "worldID":"world-a",
+                    "layoutRevision": 4,
+                    "heldProp": {"objectID":"prop-hand","avatarAssetID":"2b","hand":"rightHand"},
+                    "layoutUndo": {},
+                    "propTombstones": {"prop-gone":{"objectID":"prop-gone","displayName":"旧花瓶"}},
+                    "objectStates": {
+                        "prop-hand": {"metadata": {"gmgn.prop-grip.v1": "{\"avatarAssetID\":\"2b\",\"hand\":\"rightHand\",\"normalizedGrip\":[0.5,0.5,0.5],\"localOffset\":[0.0,0.0,0.0],\"localRotation\":[0.0,0.0,0.0,1.0]}"}}
+                    }
+                }
             },
+            "wish": {
+                "pending": false,
+                "status": "idle",
+                "entries": [
+                    {"wishID":"w-claim","objectID":"prop-claim","name":"许愿剑","stage":"ready","claimAvailable":true,"inventoryRegistered":false},
+                    {"wishID":"w-far","objectID":"prop-far","name":"够不到","stage":"ready","claimAvailable":false,"inventoryRegistered":false},
+                    {"wishID":"w-fail","objectID":"prop-fail","name":"失败的","stage":"failed","claimAvailable":false,"inventoryRegistered":false},
+                    {"wishID":"w-pending","objectID":"prop-pending","name":"生成中","stage":"generating","claimAvailable":false,"inventoryRegistered":false},
+                    {"wishID":"w-lost","objectID":"prop-lost","name":"入库未保存","stage":"claimed","claimAvailable":false,"inventoryRegistered":false},
+                    {"wishID":"w-cancelled","objectID":"prop-cancelled","name":"已取消","stage":"cancelled","claimAvailable":false,"inventoryRegistered":false},
+                    {"wishID":"w-done","objectID":"prop-placed","name":"落地灯","stage":"claimed","claimAvailable":false,"inventoryRegistered":true}
+                ]
+            },
+            "inventoryMutation": {"generation": 3},
+            "unityUICommandResult": {"op":"ui.inventory.place","status":"started"},
+            "builtinDevices": {"templates": [{"id":"builtin-jukebox","renderer":"builtin.jukebox"}]}
+        })
+    }
+
+    fn local() -> LocalState {
+        LocalState::default()
+    }
+
+    #[test]
+    fn rows_are_grouped_from_the_production_facts_only() {
+        let all = rows(&production());
+        let find = |id: &str| all.iter().find(|row| row.object_id == id).unwrap();
+        assert_eq!(find("prop-placed").group, "inRoom");
+        assert_eq!(find("prop-placed").status, "已摆放");
+        assert_eq!(find("prop-bag").group, "inInventory");
+        assert_eq!(find("prop-bag").actions, vec!["place", "delete"]);
+        // A model that is not loaded cannot promise 摆放.
+        assert_eq!(find("prop-loading").actions, vec!["delete"]);
+        assert_eq!(find("prop-hand").status, "在居民手里");
+        assert_eq!(find("prop-gone").state, "ended");
+        assert_eq!(find("prop-gone").status, "已删除");
+        assert_eq!(find("prop-claim").state, "awaitingClaim");
+        assert_eq!(find("prop-far").actions, Vec::<&str>::new());
+        assert_eq!(find("prop-fail").actions, vec!["retry"]);
+        assert_eq!(find("prop-lost").actions, vec!["retryInventoryRegistration"]);
+        assert_eq!(find("prop-cancelled").group, "ended");
+        // The claimed job whose object is in the world is never a second row.
+        assert_eq!(
+            all.iter().filter(|row| row.object_id == "prop-placed").count(),
+            1
+        );
+        assert!(all.iter().all(|row| !row.object_id.is_empty()));
+    }
+
+    #[test]
+    fn the_room_scope_keeps_only_placed_rows() {
+        let mut only_room = local();
+        only_room.placed_only = true;
+        let projection = project(&production(), &only_room);
+        assert_eq!(projection["placedOnly"], true);
+        let sections = projection["sections"].as_array().unwrap();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0]["group"], "inRoom");
+        // 房间里 = the placed rows, including one the resident is carrying.
+        assert_eq!(projection["rowCount"], 2);
+
+        let mine = project(&production(), &local());
+        assert_eq!(mine["placedOnly"], false);
+        assert!(mine["rowCount"].as_u64().unwrap() > 1);
+        assert!(
+            mine["sections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|section| section["group"] == "needsYou")
+        );
+        // The component owns the empty sentence (`ownership_scope`), so the
+        // adapter never spells a second copy of it.
+        assert!(projection.get("emptyMessage").is_none());
+        // Until the space publishes an inventory the old adapter's "waiting"
+        // state is kept, instead of claiming nothing was ever wished for.
+        let mut waiting = production();
+        waiting["unityInventory"] = Value::Null;
+        assert_eq!(
+            project(&waiting, &local())["emptyMessage"],
+            "等待空间物品载入状态"
+        );
+    }
+
+    #[test]
+    fn ended_is_folded_with_its_count_and_never_hidden() {
+        let folded = project(&production(), &local());
+        let ended = folded["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|section| section["group"] == "ended")
+            .unwrap()
+            .clone();
+        assert_eq!(ended["isFolded"], true);
+        assert_eq!(ended["rows"].as_array().unwrap().len(), 0);
+        assert!(ended["title"].as_str().unwrap().starts_with("已结束 ("));
+        let mut open = local();
+        open.ended_folded = false;
+        // Only an ended row, so the row budget cannot fold it back.
+        let mut only_ended = production();
+        only_ended["unityInventory"] = json!([]);
+        only_ended["wish"] = json!({"pending": false, "entries": []});
+        let unfolded = project(&only_ended, &open);
+        let ended = unfolded["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|section| section["group"] == "ended")
+            .unwrap();
+        assert_eq!(ended["isFolded"], false);
+        assert!(!ended["rows"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_row_budget_becomes_the_remaining_count() {
+        let mut snapshot = production();
+        snapshot["unityInventory"] = json!((0..9)
+            .map(|index| json!({"objectID": format!("prop-{index}"), "name": format!("物件{index}"),
+                "modelReady": true, "held": false, "placed": true, "status": "restored"}))
+            .collect::<Vec<_>>());
+        snapshot["wish"] = json!({"pending": false, "entries": []});
+        snapshot["unityWorldAuthority"]["state"]["propTombstones"] = json!({});
+        let projection = project(&snapshot, &local());
+        let rows = projection["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|section| section["rows"].as_array().cloned().unwrap_or_default())
+            .count();
+        assert_eq!(rows, ROW_BUDGET);
+        assert_eq!(projection["remainingCount"], 3);
+        assert_eq!(projection["rowCount"], 9);
+    }
+
+    #[test]
+    fn selected_follows_the_world_hold_and_disables_the_claim_of_a_loading_model() {
+        let mut state = local();
+        state.selected = Some("prop-hand".into());
+        state.hold_point = "back".into();
+        let projection = project(&production(), &state);
+        assert_eq!(projection["selected"]["held"], true);
+        assert_eq!(projection["selected"]["holdPoint"], "back");
+        assert_eq!(projection["selected"]["holdUnavailableReason"], Value::Null);
+
+        state.selected = Some("prop-bag".into());
+        let projection = project(&production(), &state);
+        assert_eq!(projection["selected"]["held"], false);
+        assert_eq!(projection["selected"]["enabled"], false);
+        assert_eq!(projection["holdPoints"][0]["id"], "rightHand");
+        assert_eq!(projection["holdPoints"][0]["name"], "右手");
+    }
+
+    #[test]
+    fn notice_reads_the_receipts_the_host_already_publishes() {
+        let mut snapshot = production();
+        assert_eq!(notice(&snapshot), "已进入摆放预览；请在场景中确认位置。");
+        snapshot["unityUICommandResult"] = json!({"op":"ui.inventory.place","status":"rejected"});
+        assert_eq!(notice(&snapshot), "当前无法开始摆放，请等待模型与场景准备完成后重试。");
+        snapshot["inventoryMutation"] = json!({"status":"failed","message":"空间忙"});
+        assert_eq!(notice(&snapshot), "空间忙");
+        snapshot["inventoryMutation"] = json!({"status":"idle"});
+        snapshot["unityUICommandResult"] = json!({"op":"","status":"idle"});
+        snapshot["wish"] = json!({"status":"failed","message":"没有确认"});
+        assert_eq!(notice(&snapshot), "没有确认");
+        snapshot["wish"] = json!({"status":"completed","operation":"wish.claim"});
+        assert_eq!(notice(&snapshot), "已领取，入库完成后会出现在「我的物件」里。");
+    }
+
+    #[test]
+    fn claim_retry_and_inventory_retry_use_the_existing_wish_ops() {
+        let snapshot = production();
+        let mut local = local();
+        let mut sequence = 0;
+        let claim = translate(
+            &json!({"op":"stage.props.claim","objectID":"prop-claim","jobID":"w-claim"}),
+            &snapshot,
+            &mut local,
+            &mut sequence,
+        )
+        .unwrap();
+        assert_eq!(claim["op"], "wish.claim");
+        assert_eq!(claim["wishID"], "w-claim");
+        assert!(claim["requestID"].as_str().unwrap().starts_with("gpui-prop-"));
+        let retry = translate(
+            &json!({"op":"stage.props.retry","jobID":"w-fail"}),
+            &snapshot,
+            &mut local,
+            &mut sequence,
+        )
+        .unwrap();
+        assert_eq!(retry["op"], "wish.retry");
+        let inventory = translate(
+            &json!({"op":"stage.props.retryInventoryRegistration","jobID":"w-lost"}),
+            &snapshot,
+            &mut local,
+            &mut sequence,
+        )
+        .unwrap();
+        assert_eq!(inventory["op"], "wish.inventory.retry");
+        // Distinct request ids, so the bridge can tell the replies apart.
+        assert_ne!(claim["requestID"], retry["requestID"]);
+        // Without the job identity no wish op can be addressed.
+        assert!(
+            translate(&json!({"op":"stage.props.claim"}), &snapshot, &mut local, &mut sequence)
+                .is_none()
+        );
+        // Load is the existing read/refresh.
+        assert_eq!(
+            translate(&json!({"op":"stage.props.load"}), &snapshot, &mut local, &mut sequence)
+                .unwrap()["op"],
+            "wish.status"
+        );
+    }
+
+    #[test]
+    fn delete_and_withdraw_use_the_existing_world_ops_and_payloads() {
+        let snapshot = production();
+        let mut local = local();
+        let mut sequence = 0;
+        let delete = translate(
+            &json!({"op":"stage.props.delete","objectID":"prop-bag"}),
+            &snapshot,
+            &mut local,
+            &mut sequence,
+        )
+        .unwrap();
+        assert_eq!(delete["op"], "inventory.delete");
+        assert_eq!(delete["objectID"], "prop-bag");
+        assert_eq!(delete["worldID"], "world-a");
+        assert_eq!(delete["layoutRevision"], 4);
+
+        let withdraw = translate(
+            &json!({"op":"stage.props.withdraw","objectID":"prop-placed"}),
+            &snapshot,
+            &mut local,
+            &mut sequence,
+        )
+        .unwrap();
+        assert_eq!(withdraw["op"], "world.prop.command");
+        assert_eq!(withdraw["command"]["op"], "withdraw");
+        assert_eq!(withdraw["command"]["objectID"], "prop-placed");
+        assert_eq!(withdraw["expectedRevision"], 12);
+        assert_eq!(withdraw["expectedLayoutRevision"], 4);
+
+        let undo = translate(
+            &json!({"op":"stage.props.undo"}),
+            &snapshot,
+            &mut local,
+            &mut sequence,
+        )
+        .unwrap();
+        assert_eq!(undo["command"]["op"], "undo");
+    }
+
+    /// 拿到手上就是旧的摆放入口，点挂点才是既有的 `hold`。
+    #[test]
+    fn hold_maps_to_the_placement_entry_and_the_slot_to_the_hold_command() {
+        let snapshot = production();
+        let mut local = local();
+        local.selected = Some("prop-bag".into());
+        let mut sequence = 0;
+        let place = translate(
+            &json!({"op":"stage.props.hold"}),
+            &snapshot,
+            &mut local,
+            &mut sequence,
+        )
+        .unwrap();
+        assert_eq!(place["op"], "ui.inventory.place");
+        assert_eq!(place["objectID"], "prop-bag");
+
+        let hold = translate(
+            &json!({"op":"stage.props.hold","point":"waist"}),
+            &snapshot,
+            &mut local,
+            &mut sequence,
+        )
+        .unwrap();
+        assert_eq!(hold["op"], "world.prop.command");
+        assert_eq!(hold["command"]["op"], "hold");
+        assert_eq!(hold["command"]["slot"], "waist");
+        assert_eq!(local.hold_point, "waist");
+
+        let back = translate(
+            &json!({"op":"stage.props.return"}),
+            &snapshot,
+            &mut local,
+            &mut sequence,
+        )
+        .unwrap();
+        assert_eq!(back["command"]["op"], "returnHeld");
+    }
+
+    #[test]
+    fn held_nudge_and_rotate_use_the_persisted_grip_calibration() {
+        let snapshot = production();
+        let mut local = local();
+        local.selected = Some("prop-hand".into());
+        let mut sequence = 0;
+        let nudge = translate(
+            &json!({"op":"stage.props.nudge","y":0.02,"z":-0.02}),
+            &snapshot,
+            &mut local,
+            &mut sequence,
+        )
+        .unwrap();
+        assert_eq!(nudge["command"]["op"], "adjustGrip");
+        let offset = nudge["command"]["offset"].as_array().unwrap();
+        assert_eq!(offset[0].as_f64().unwrap(), 0.0);
+        assert!((offset[1].as_f64().unwrap() - 0.02).abs() < 1e-6);
+        assert!((offset[2].as_f64().unwrap() + 0.02).abs() < 1e-6);
+        assert_eq!(nudge["command"]["rotation"], json!([0.0, 0.0, 0.0, 1.0]));
+
+        let rotate = translate(
+            &json!({"op":"stage.props.rotate","direction":1}),
+            &snapshot,
+            &mut local,
+            &mut sequence,
+        )
+        .unwrap();
+        assert_eq!(rotate["command"]["op"], "adjustGrip");
+        let yaw = ROTATE_RADIANS;
+        let rotation = rotate["command"]["rotation"].as_array().unwrap();
+        assert!((rotation[1].as_f64().unwrap() - (yaw / 2.).sin() as f64).abs() < 1e-6);
+        assert!((rotation[3].as_f64().unwrap() - (yaw / 2.).cos() as f64).abs() < 1e-6);
+        // A direction the original never emits is refused, not guessed.
+        assert!(
+            translate(
+                &json!({"op":"stage.props.rotate","direction":2}),
+                &snapshot,
+                &mut local,
+                &mut sequence
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn local_state_commands_never_become_host_ops() {
+        let snapshot = production();
+        let mut local = local();
+        let mut sequence = 0;
+        assert!(
+            translate(
+                &json!({"op":"stage.props.filter","placedOnly":true}),
+                &snapshot,
+                &mut local,
+                &mut sequence
+            )
+            .is_none()
+        );
+        assert_eq!(local.placed_only, true);
+        assert!(
+            translate(
+                &json!({"op":"stage.props.fold","group":"ended","folded":false}),
+                &snapshot,
+                &mut local,
+                &mut sequence
+            )
+            .is_none()
+        );
+        assert_eq!(local.ended_folded, false);
+        assert!(
+            translate(
+                &json!({"op":"stage.props.select","objectID":"prop-bag"}),
+                &snapshot,
+                &mut local,
+                &mut sequence
+            )
+            .is_none()
+        );
+        assert_eq!(local.selected.as_deref(), Some("prop-bag"));
+        assert_eq!(sequence, 0);
+    }
+
+    /// Ops the Unity host does not accept are refused instead of invented.
+    /// `resize` and `close` are no longer in this list: `resize` is the Rust
+    /// reducer's own op (see `size_commands_use_the_reducer_and_the_shell`),
+    /// and `close` is the shell's `ui.overlay.panel`.
+    #[test]
+    fn unsupported_component_commands_are_refused_not_invented() {
+        let snapshot = production();
+        let mut local = local();
+        local.selected = Some("prop-bag".into());
+        let mut sequence = 0;
+        for op in [
+            json!({"op":"stage.props.askResidentToFetch","jobID":"w-far"}),
+            json!({"op":"stage.props.toggle"}),
+            json!({"op":"stage.props.escape"}),
+            json!({"op":"stage.props.invented"}),
+        ] {
+            assert!(
+                translate(&op, &snapshot, &mut local, &mut sequence).is_none(),
+                "{op} must not become a host op"
+            );
         }
-        div().flex().flex_col().size_full().min_h_0().p_4().gap_3().text_color(cx.theme().foreground)
-            .child("物品")
-            .child(div().id("inventory-scroll").flex_1().min_h_0().overflow_y_scrollbar().flex().flex_col().gap_2().children(rows))
-            .child(div().text_sm().child(self.notice.clone()))
+        assert_eq!(sequence, 0);
+    }
+
+    /// The size slider and the panel's × are wired, not dropped: the slider
+    /// emits the reducer's `resize` (with the value the Rust side validates
+    /// against the same 0.02…3 m domain), and the × is the shell's existing
+    /// panel toggle.
+    #[test]
+    fn size_commands_use_the_reducer_and_the_shell() {
+        let snapshot = production();
+        let mut local = local();
+        local.selected = Some("prop-bag".into());
+        let mut sequence = 0;
+        let resize = translate(
+            &json!({"op":"stage.props.resize","value":1.2}),
+            &snapshot,
+            &mut local,
+            &mut sequence,
+        )
+        .expect("the size slider must reach the reducer");
+        assert_eq!(resize["op"], "world.prop.command");
+        assert_eq!(resize["command"]["op"], "resize");
+        assert_eq!(resize["command"]["objectID"], "prop-bag");
+        assert_eq!(resize["command"]["targetLongestEdge"], 1.2);
+        // The component's own slider domain, refused locally so the host never
+        // sees a value its validator rejects.
+        for rejected in [0.001, 10.] {
+            assert!(
+                translate(
+                    &json!({"op":"stage.props.resize","value":rejected}),
+                    &snapshot,
+                    &mut local,
+                    &mut sequence,
+                )
+                .is_none(),
+                "resize {rejected} is outside the reducer's domain and must not be sent"
+            );
+        }
+        let close = translate(
+            &json!({"op":"stage.props.close"}),
+            &snapshot,
+            &mut local,
+            &mut sequence,
+        )
+        .expect("the panel × must reach the shell");
+        assert_eq!(close, json!({"op":"ui.overlay.panel","expanded":false}));
+    }
+
+    #[test]
+    fn device_placement_keeps_the_old_op_and_payload() {
+        let command = device_place_command(&json!({"id":"builtin-jukebox","renderer":"builtin.jukebox"})).unwrap();
+        assert_eq!(command["op"], "ui.device.place");
+        assert_eq!(command["templateID"], "builtin-jukebox");
+        assert!(device_place_command(&json!({"renderer":"builtin.jukebox"})).is_none());
+    }
+
+    /// Nothing in this adapter is drawn outside the panel it is given.
+    #[test]
+    fn the_panel_still_projects_the_production_revisions_for_delete() {
+        let mut snapshot = production();
+        snapshot["unityWorldAuthority"]["state"]["layoutRevision"] = json!(9);
+        let mut local = local();
+        let mut sequence = 0;
+        let delete = translate(
+            &json!({"op":"stage.props.delete","objectID":"prop-bag"}),
+            &snapshot,
+            &mut local,
+            &mut sequence,
+        )
+        .unwrap();
+        assert_eq!(delete["layoutRevision"], 9);
+        // Without a world revision the delete is not sent at all.
+        snapshot["unityWorldAuthority"] = json!({});
+        assert!(
+            translate(
+                &json!({"op":"stage.props.delete","objectID":"prop-bag"}),
+                &snapshot,
+                &mut local,
+                &mut sequence
+            )
+            .is_none()
+        );
     }
 }

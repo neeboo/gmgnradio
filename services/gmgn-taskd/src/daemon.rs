@@ -444,6 +444,37 @@ impl Service {
                 }
                 crate::music_cache::request(&self.db, &method, params).await
             }
+            // Music-account authority. `connect` is the one arm that owns the
+            // provider round-trip itself (`music_account_http`); every other
+            // method is a pure storage decision.
+            "music_account_session_state" | "music_account_session" | "music_account_import"
+            | "music_account_disconnect" | "music_account_apple_authorization" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                let method = method.to_owned();
+                let root = self.db.root.clone();
+                self.db.call(move |s| {
+                    crate::music_account::request(&mut s.connection, &root, &method, &params)
+                }).await
+            }
+            "music_account_connect" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                crate::music_account::connect(&self.db, params).await
+            }
+            "generation_configuration_read" | "generation_configuration_save"
+            | "generation_configuration_import" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                let method = method.to_owned();
+                let root = self.db.root.clone();
+                self.db.call(move |s| {
+                    crate::generation_configuration::dispatch(&mut s.connection, &root, &method, &params)
+                }).await
+            }
             "music_program_save" | "music_library_commit" => {
                 Err("invalid_music_input")
             }
